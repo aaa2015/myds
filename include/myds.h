@@ -56,7 +56,24 @@ void            myds_context_free(myds_context_t *ctx);
 myds_config_t   myds_context_get_config(const myds_context_t *ctx);
 void            myds_context_set_config(myds_context_t *ctx, const myds_config_t *cfg);
 
+/* Generation termination reasons */
+typedef enum {
+    MYDS_STOP_EOS = 0,
+    MYDS_STOP_LENGTH,
+    MYDS_STOP_CTX_FULL,
+    MYDS_STOP_ERROR,
+    MYDS_STOP_CANCELLED
+} myds_stop_reason_t;
+
 /* Generation */
+int             myds_generate_ex(myds_context_t *ctx,
+                                 const char     *prompt,
+                                 myds_stream_callback_t cb,
+                                 void           *user_data,
+                                 myds_stop_reason_t *out_reason,
+                                 uint32_t       *out_prompt_tokens,
+                                 volatile int   *cancel_flag);
+
 int             myds_generate(myds_context_t *ctx,
                               const char     *prompt,
                               myds_stream_callback_t cb,

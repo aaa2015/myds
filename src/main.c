@@ -25,10 +25,33 @@ static void print_usage(const char *prog) {
     printf("  -h, --help              Show this help message\n");
 }
 
+static inline double myds_now_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+typedef struct {
+    uint32_t token_count;
+    double t_start;
+    double t_first;
+    double t_last;
+    bool print_tokens;
+    int32_t *tokens;
+    size_t tokens_cap;
+} cli_stream_ctx_t;
+
 static void token_stream_printer(const char *piece, int32_t token_id, void *user_data) {
-    (void)token_id;
-    uint32_t *token_counter = (uint32_t *)user_data;
-    (*token_counter)++;
+    cli_stream_ctx_t *sctx = (cli_stream_ctx_t *)user_data;
+    double now = myds_now_s();
+    if (sctx->token_count == 0) {
+        sctx->t_first = now;
+    }
+    sctx->t_last = now;
+    if (sctx->print_tokens && sctx->tokens && sctx->token_count < sctx->tokens_cap) {
+        sctx->tokens[sctx->token_count] = token_id;
+    }
+    sctx->token_count++;
     fputs(piece, stdout);
     fflush(stdout);
 }
@@ -39,6 +62,7 @@ int main(int argc, char *argv[]) {
     const char *host = "0.0.0.0";
     const char *alias = "myds";
     int port = 0;
+    bool print_tokens = false;
 
     myds_config_t cfg = {
         .max_seq_len = 4096,
@@ -70,6 +94,8 @@ int main(int argc, char *argv[]) {
             cfg.top_p = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
             cfg.seed = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--print-tokens") == 0) {
+            print_tokens = true;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -91,14 +117,14 @@ int main(int argc, char *argv[]) {
                cfg.max_seq_len, cfg.max_new_tokens, cfg.temperature, cfg.top_p);
     MYDS_LOG_I("Loading model file: %s", model_path);
 
-    clock_t t0 = clock();
+    double load_t0 = myds_now_s();
     myds_model_t *model = myds_model_load(model_path);
     if (!model) {
         MYDS_LOG_E("Failed to load model from %s", model_path);
         return 1;
     }
-    clock_t t1 = clock();
-    double load_sec = (double)(t1 - t0) / CLOCKS_PER_SEC;
+    double load_t1 = myds_now_s();
+    double load_sec = load_t1 - load_t0;
     printf("Model loaded in %.2f s\n", load_sec);
     MYDS_LOG_I("Model loaded successfully in %.2fs", load_sec);
 
@@ -124,18 +150,44 @@ int main(int argc, char *argv[]) {
         /* Single prompt generation */
         MYDS_LOG_I("Generating response for prompt (%zu chars)...", strlen(prompt));
         printf("\n[Prompt]: %s\n\n[Response]: ", prompt);
-        uint32_t token_count = 0;
-        clock_t gen_t0 = clock();
+        int32_t *tokens_buf = print_tokens ? (int32_t *)malloc(cfg.max_new_tokens * sizeof(int32_t)) : NULL;
+        cli_stream_ctx_t sctx = {
+            .token_count = 0,
+            .t_start = myds_now_s(),
+            .t_first = 0.0,
+            .t_last = 0.0,
+            .print_tokens = print_tokens,
+            .tokens = tokens_buf,
+            .tokens_cap = cfg.max_new_tokens,
+        };
 
-        myds_generate(ctx, prompt, token_stream_printer, &token_count);
+        myds_stop_reason_t stop_reason = MYDS_STOP_EOS;
+        uint32_t prompt_tokens = 0;
+        myds_generate_ex(ctx, prompt, token_stream_printer, &sctx, &stop_reason, &prompt_tokens, NULL);
 
-        clock_t gen_t1 = clock();
-        double elapsed = (double)(gen_t1 - gen_t0) / CLOCKS_PER_SEC;
-        double speed = (elapsed > 0) ? ((double)token_count / elapsed) : 0.0;
+        double t_end = myds_now_s();
+        double wall_s = t_end - sctx.t_start;
+        double prefill_s = (sctx.token_count > 0 && sctx.t_first > sctx.t_start) ? (sctx.t_first - sctx.t_start) : wall_s;
+        double ttft_s = prefill_s;
+        double decode_s = (sctx.token_count > 1 && sctx.t_last > sctx.t_first) ? (sctx.t_last - sctx.t_first) : 0.0;
+        double decode_tps = (decode_s > 0.0 && sctx.token_count > 1) ? ((double)(sctx.token_count - 1) / decode_s) : ((wall_s > 0.0) ? ((double)sctx.token_count / wall_s) : 0.0);
+
+        if (print_tokens && tokens_buf && sctx.token_count > 0) {
+            uint32_t n_print = sctx.token_count < cfg.max_new_tokens ? sctx.token_count : cfg.max_new_tokens;
+            printf("\nTOKEN_IDS: [");
+            for (uint32_t ti = 0; ti < n_print; ti++) {
+                printf("%d%s", tokens_buf[ti], (ti + 1 < n_print) ? "," : "");
+            }
+            printf("]\n");
+            free(tokens_buf);
+        }
+
         printf("\n\n----------------------------------------------------\n");
-        printf("Generated %u tokens in %.2f s (%.2f tokens/sec)\n", token_count, elapsed, speed);
+        printf("load %.2f s | prefill %.2f s (prompt %u tok, TTFT %.2f s) | decode %u tok in %.2f s = %.2f t/s | wall %.2f s\n",
+               load_sec, prefill_s, prompt_tokens, ttft_s, sctx.token_count, decode_s, decode_tps, wall_s);
         printf("----------------------------------------------------\n");
-        MYDS_LOG_I("Generation completed: %u tokens in %.2fs (%.2f tokens/s)", token_count, elapsed, speed);
+        MYDS_LOG_I("Generation metrics: load %.2fs | prefill %.2fs (%u tok, TTFT %.2fs) | decode %u tok in %.2fs = %.2f t/s | wall %.2fs | stop_reason: %d",
+                   load_sec, prefill_s, prompt_tokens, ttft_s, sctx.token_count, decode_s, decode_tps, wall_s, (int)stop_reason);
     } else {
         /* Interactive Chat Mode */
         printf("\nEntering interactive chat mode (type 'exit' or Ctrl+D to quit):\n\n");
@@ -150,15 +202,25 @@ int main(int argc, char *argv[]) {
             if (strlen(line) == 0) continue;
 
             printf("\nDeepSeek >>> ");
-            uint32_t token_count = 0;
-            clock_t gen_t0 = clock();
+            cli_stream_ctx_t sctx = {
+                .token_count = 0,
+                .t_start = myds_now_s(),
+                .t_first = 0.0,
+                .t_last = 0.0,
+            };
 
-            myds_generate(ctx, line, token_stream_printer, &token_count);
+            myds_stop_reason_t stop_reason = MYDS_STOP_EOS;
+            uint32_t prompt_tokens = 0;
+            myds_generate_ex(ctx, line, token_stream_printer, &sctx, &stop_reason, &prompt_tokens, NULL);
 
-            clock_t gen_t1 = clock();
-            double elapsed = (double)(gen_t1 - gen_t0) / CLOCKS_PER_SEC;
-            double speed = (elapsed > 0) ? ((double)token_count / elapsed) : 0.0;
-            printf("\n  [%.1f tokens/s]\n", speed);
+            double t_end = myds_now_s();
+            double wall_s = t_end - sctx.t_start;
+            double prefill_s = (sctx.token_count > 0 && sctx.t_first > sctx.t_start) ? (sctx.t_first - sctx.t_start) : wall_s;
+            double decode_s = (sctx.token_count > 1 && sctx.t_last > sctx.t_first) ? (sctx.t_last - sctx.t_first) : 0.0;
+            double decode_tps = (decode_s > 0.0 && sctx.token_count > 1) ? ((double)(sctx.token_count - 1) / decode_s) : ((wall_s > 0.0) ? ((double)sctx.token_count / wall_s) : 0.0);
+
+            printf("\n  [decode %.1f t/s | TTFT %.2fs | %u prompt tok | %u gen tok | wall %.2fs]\n",
+                   decode_tps, prefill_s, prompt_tokens, sctx.token_count, wall_s);
         }
     }
 

@@ -327,29 +327,33 @@ void parse_chat_prompt(const char *body, char *out_prompt, size_t max_prompt_len
         if (!obj_end) break;
 
         size_t obj_len = (size_t)(obj_end - obj_start + 1);
-        char obj_buf[16384];
-        if (obj_len >= sizeof(obj_buf)) obj_len = sizeof(obj_buf) - 1;
+        char *obj_buf = (char *)malloc(obj_len + 1);
+        if (!obj_buf) break;
         memcpy(obj_buf, obj_start, obj_len);
         obj_buf[obj_len] = '\0';
 
         char role[64] = "user";
-        char content[8192] = "";
+        char *content = (char *)malloc(obj_len + 1);
+        if (content) {
+            content[0] = '\0';
+            json_extract_string_field(obj_buf, "role", role, sizeof(role));
+            extract_message_text(obj_buf, content, obj_len + 1);
 
-        json_extract_string_field(obj_buf, "role", role, sizeof(role));
-        extract_message_text(obj_buf, content, sizeof(content));
-
-        if (content[0]) {
-            if (strcmp(role, "system") == 0) {
-                cur_len += snprintf(out_prompt + cur_len, max_prompt_len - cur_len,
-                                    "<｜User｜>[System: %s]\n", content);
-            } else if (strcmp(role, "assistant") == 0) {
-                cur_len += snprintf(out_prompt + cur_len, max_prompt_len - cur_len,
-                                    "<｜Assistant｜>%s\n", content);
-            } else {
-                cur_len += snprintf(out_prompt + cur_len, max_prompt_len - cur_len,
-                                    "<｜User｜>%s\n", content);
+            if (content[0]) {
+                if (strcmp(role, "system") == 0) {
+                    cur_len += snprintf(out_prompt + cur_len, max_prompt_len - cur_len,
+                                        "<｜User｜>[System: %s]\n", content);
+                } else if (strcmp(role, "assistant") == 0) {
+                    cur_len += snprintf(out_prompt + cur_len, max_prompt_len - cur_len,
+                                        "<｜Assistant｜>%s\n", content);
+                } else {
+                    cur_len += snprintf(out_prompt + cur_len, max_prompt_len - cur_len,
+                                        "<｜User｜>%s\n", content);
+                }
             }
+            free(content);
         }
+        free(obj_buf);
 
         p = obj_end + 1;
     }
@@ -358,16 +362,30 @@ void parse_chat_prompt(const char *body, char *out_prompt, size_t max_prompt_len
     cur_len += snprintf(out_prompt + cur_len, max_prompt_len - cur_len, "<｜Assistant｜>");
 }
 
+static inline double myds_server_now_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
 /* Chat completion streaming context */
 typedef struct {
     int client_fd;
     const char *model_alias;
     uint32_t token_count;
+    double t_first;
+    double t_last;
+    volatile int cancel_flag;
 } sse_stream_ctx_t;
 
 static void sse_token_callback(const char *piece, int32_t token_id, void *user_data) {
     (void)token_id;
     sse_stream_ctx_t *sctx = (sse_stream_ctx_t *)user_data;
+    double now = myds_server_now_s();
+    if (sctx->token_count == 0) {
+        sctx->t_first = now;
+    }
+    sctx->t_last = now;
     sctx->token_count++;
 
     char escaped[2048];
@@ -377,7 +395,10 @@ static void sse_token_callback(const char *piece, int32_t token_id, void *user_d
     int len = snprintf(chunk, sizeof(chunk),
                        "data: {\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"},\"finish_reason\":null}]}\n\n",
                        escaped);
-    send(sctx->client_fd, chunk, len, 0);
+    ssize_t sent = send(sctx->client_fd, chunk, len, 0);
+    if (sent < 0) {
+        sctx->cancel_flag = 1;
+    }
 }
 
 /* Responses API streaming context */
@@ -385,11 +406,19 @@ typedef struct {
     int client_fd;
     const char *model_alias;
     uint32_t token_count;
+    double t_first;
+    double t_last;
+    volatile int cancel_flag;
 } responses_sse_stream_ctx_t;
 
 static void responses_sse_token_callback(const char *piece, int32_t token_id, void *user_data) {
     (void)token_id;
     responses_sse_stream_ctx_t *sctx = (responses_sse_stream_ctx_t *)user_data;
+    double now = myds_server_now_s();
+    if (sctx->token_count == 0) {
+        sctx->t_first = now;
+    }
+    sctx->t_last = now;
     sctx->token_count++;
 
     char escaped[2048];
@@ -400,7 +429,10 @@ static void responses_sse_token_callback(const char *piece, int32_t token_id, vo
                        "event: response.output_text.delta\n"
                        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"%s\"}\n\n",
                        escaped);
-    send(sctx->client_fd, chunk, len, 0);
+    ssize_t sent = send(sctx->client_fd, chunk, len, 0);
+    if (sent < 0) {
+        sctx->cancel_flag = 1;
+    }
 }
 
 /* Non-streaming buffer context */
@@ -409,11 +441,18 @@ typedef struct {
     size_t cap;
     size_t len;
     uint32_t token_count;
+    double t_first;
+    double t_last;
 } non_stream_ctx_t;
 
 static void non_stream_callback(const char *piece, int32_t token_id, void *user_data) {
     (void)token_id;
     non_stream_ctx_t *ns = (non_stream_ctx_t *)user_data;
+    double now = myds_server_now_s();
+    if (ns->token_count == 0) {
+        ns->t_first = now;
+    }
+    ns->t_last = now;
     ns->token_count++;
     size_t plen = strlen(piece);
     if (ns->len + plen + 1 > ns->cap) {
@@ -519,8 +558,9 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
     int is_responses_endpoint = (strcmp(path, "/v1/responses") == 0 || strcmp(path, "/responses") == 0);
 
     if (is_chat_endpoint || is_responses_endpoint) {
-        struct timeval t_start, t_end;
-        gettimeofday(&t_start, NULL);
+        double t_start = myds_server_now_s();
+        double t_first = 0.0;
+        double t_last = 0.0;
 
         /* Find body start and read complete body */
         char *body = strstr(req_buf, "\r\n\r\n");
@@ -556,8 +596,9 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         }
         float temp = json_extract_float_field(body, "temperature", -1.0f);
         float top_p = json_extract_float_field(body, "top_p", -1.0f);
+        int include_usage = (strstr(body, "\"include_usage\":true") != NULL || strstr(body, "\"include_usage\": true") != NULL);
 
-        size_t prompt_cap = (total_read * 2 > 65536) ? (total_read * 2 + 8192) : 65536;
+        size_t prompt_cap = (total_read * 4 > 65536) ? (total_read * 4 + 8192) : 65536;
         char *prompt = malloc(prompt_cap);
         if (!prompt) {
             MYDS_LOG_E("[%s:%d] Out of memory allocating prompt buffer (%zu bytes)", client_ip, client_port, prompt_cap);
@@ -585,6 +626,8 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         if (top_p >= 0.0f) req_cfg.top_p = top_p;
         myds_context_set_config(ctx, &req_cfg);
 
+        myds_stop_reason_t stop_reason = MYDS_STOP_EOS;
+        uint32_t prompt_tokens = 0;
         uint32_t final_tokens = 0;
 
         if (is_responses_endpoint) {
@@ -612,10 +655,15 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                     .client_fd = client_fd,
                     .model_alias = model_alias ? model_alias : "myds",
                     .token_count = 0,
+                    .t_first = 0.0,
+                    .t_last = 0.0,
+                    .cancel_flag = 0,
                 };
 
-                myds_generate(ctx, prompt, responses_sse_token_callback, &sctx);
+                myds_generate_ex(ctx, prompt, responses_sse_token_callback, &sctx, &stop_reason, &prompt_tokens, &sctx.cancel_flag);
                 final_tokens = sctx.token_count;
+                t_first = sctx.t_first;
+                t_last = sctx.t_last;
 
                 const char *ev_part_done =
                     "event: response.content_part.done\n"
@@ -630,45 +678,55 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 char ev_completed[1024];
                 int clen = snprintf(ev_completed, sizeof(ev_completed),
                                     "event: response.completed\n"
-                                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_myds\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"%s\",\"usage\":{\"input_tokens\":10,\"output_tokens\":%u,\"total_tokens\":%u}}}\n\n",
+                                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_myds\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"%s\",\"usage\":{\"input_tokens\":%u,\"output_tokens\":%u,\"total_tokens\":%u}}}\n\n",
                                     model_alias ? model_alias : "myds",
+                                    prompt_tokens,
                                     sctx.token_count,
-                                    10 + sctx.token_count);
+                                    prompt_tokens + sctx.token_count);
                 send(client_fd, ev_completed, clen, 0);
             } else {
                 non_stream_ctx_t ns = {
                     .cap = 4096,
                     .len = 0,
                     .token_count = 0,
+                    .t_first = 0.0,
+                    .t_last = 0.0,
                 };
                 ns.buf = malloc(ns.cap);
                 ns.buf[0] = '\0';
 
-                myds_generate(ctx, prompt, non_stream_callback, &ns);
+                myds_generate_ex(ctx, prompt, non_stream_callback, &ns, &stop_reason, &prompt_tokens, NULL);
                 final_tokens = ns.token_count;
+                t_first = ns.t_first;
+                t_last = ns.t_last;
 
-                char *escaped = malloc(ns.len * 2 + 1024);
-                json_escape(ns.buf, escaped, ns.len * 2 + 1024);
+                if (stop_reason == MYDS_STOP_ERROR) {
+                    send_response(client_fd, 500, "Internal Server Error", "application/json", "{\"error\":{\"message\":\"Inference failed\",\"type\":\"server_error\"}}");
+                } else {
+                    char *escaped = malloc(ns.len * 2 + 1024);
+                    json_escape(ns.buf, escaped, ns.len * 2 + 1024);
 
-                size_t resp_cap = strlen(escaped) + 2048;
-                char *resp_json = malloc(resp_cap);
-                long now = (long)time(NULL);
-                snprintf(resp_json, resp_cap,
-                         "{\"id\":\"resp_myds_%ld\",\"object\":\"response\",\"created_at\":%ld,"
-                         "\"status\":\"completed\",\"model\":\"%s\","
-                         "\"output\":[{\"type\":\"message\",\"id\":\"msg_myds_1\",\"role\":\"assistant\",\"status\":\"completed\","
-                         "\"content\":[{\"type\":\"output_text\",\"text\":\"%s\"}]}],"
-                         "\"usage\":{\"input_tokens\":10,\"output_tokens\":%u,\"total_tokens\":%u}}",
-                         now, now,
-                         model_alias ? model_alias : "myds",
-                         escaped,
-                         ns.token_count,
-                         10 + ns.token_count);
+                    size_t resp_cap = strlen(escaped) + 2048;
+                    char *resp_json = malloc(resp_cap);
+                    long now = (long)time(NULL);
+                    snprintf(resp_json, resp_cap,
+                             "{\"id\":\"resp_myds_%ld\",\"object\":\"response\",\"created_at\":%ld,"
+                             "\"status\":\"completed\",\"model\":\"%s\","
+                             "\"output\":[{\"type\":\"message\",\"id\":\"msg_myds_1\",\"role\":\"assistant\",\"status\":\"completed\","
+                             "\"content\":[{\"type\":\"output_text\",\"text\":\"%s\"}]}],"
+                             "\"usage\":{\"input_tokens\":%u,\"output_tokens\":%u,\"total_tokens\":%u}}",
+                             now, now,
+                             model_alias ? model_alias : "myds",
+                             escaped,
+                             prompt_tokens,
+                             ns.token_count,
+                             prompt_tokens + ns.token_count);
 
-                send_response(client_fd, 200, "OK", "application/json", resp_json);
+                    send_response(client_fd, 200, "OK", "application/json", resp_json);
 
-                free(resp_json);
-                free(escaped);
+                    free(resp_json);
+                    free(escaped);
+                }
                 free(ns.buf);
             }
         } else {
@@ -691,57 +749,94 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                     .client_fd = client_fd,
                     .model_alias = model_alias ? model_alias : "myds",
                     .token_count = 0,
+                    .t_first = 0.0,
+                    .t_last = 0.0,
+                    .cancel_flag = 0,
                 };
 
-                myds_generate(ctx, prompt, sse_token_callback, &sctx);
+                myds_generate_ex(ctx, prompt, sse_token_callback, &sctx, &stop_reason, &prompt_tokens, &sctx.cancel_flag);
                 final_tokens = sctx.token_count;
+                t_first = sctx.t_first;
+                t_last = sctx.t_last;
 
-                const char *stop_chunk =
-                    "data: {\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
-                    "data: [DONE]\n\n";
+                const char *finish_reason_str = (stop_reason == MYDS_STOP_LENGTH || stop_reason == MYDS_STOP_CTX_FULL) ? "length" : "stop";
+
+                char stop_chunk[512];
+                snprintf(stop_chunk, sizeof(stop_chunk),
+                         "data: {\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"%s\"}]}\n\n",
+                         finish_reason_str);
                 send(client_fd, stop_chunk, strlen(stop_chunk), 0);
+
+                /* P0-4: support stream_options.include_usage = true */
+                if (include_usage) {
+                    char usage_chunk[512];
+                    snprintf(usage_chunk, sizeof(usage_chunk),
+                             "data: {\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u}}\n\n",
+                             prompt_tokens, final_tokens, prompt_tokens + final_tokens);
+                    send(client_fd, usage_chunk, strlen(usage_chunk), 0);
+                }
+
+                const char *done_chunk = "data: [DONE]\n\n";
+                send(client_fd, done_chunk, strlen(done_chunk), 0);
             } else {
                 non_stream_ctx_t ns = {
                     .cap = 4096,
                     .len = 0,
                     .token_count = 0,
+                    .t_first = 0.0,
+                    .t_last = 0.0,
                 };
                 ns.buf = malloc(ns.cap);
                 ns.buf[0] = '\0';
 
-                myds_generate(ctx, prompt, non_stream_callback, &ns);
+                myds_generate_ex(ctx, prompt, non_stream_callback, &ns, &stop_reason, &prompt_tokens, NULL);
                 final_tokens = ns.token_count;
+                t_first = ns.t_first;
+                t_last = ns.t_last;
 
-                char *escaped = malloc(ns.len * 2 + 1024);
-                json_escape(ns.buf, escaped, ns.len * 2 + 1024);
+                if (stop_reason == MYDS_STOP_ERROR) {
+                    send_response(client_fd, 500, "Internal Server Error", "application/json", "{\"error\":{\"message\":\"Inference failed\",\"type\":\"server_error\"}}");
+                } else {
+                    const char *finish_reason_str = (stop_reason == MYDS_STOP_LENGTH || stop_reason == MYDS_STOP_CTX_FULL) ? "length" : "stop";
 
-                size_t resp_cap = strlen(escaped) + 1024;
-                char *resp_json = malloc(resp_cap);
-                snprintf(resp_json, resp_cap,
-                         "{\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion\",\"created\":%ld,"
-                         "\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\"},\"finish_reason\":\"stop\"}],"
-                         "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":%u,\"total_tokens\":%u}}",
-                         time(NULL),
-                         model_alias ? model_alias : "myds",
-                         escaped,
-                         ns.token_count,
-                         10 + ns.token_count);
+                    char *escaped = malloc(ns.len * 2 + 1024);
+                    json_escape(ns.buf, escaped, ns.len * 2 + 1024);
 
-                send_response(client_fd, 200, "OK", "application/json", resp_json);
+                    size_t resp_cap = strlen(escaped) + 1024;
+                    char *resp_json = malloc(resp_cap);
+                    snprintf(resp_json, resp_cap,
+                             "{\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion\",\"created\":%ld,"
+                             "\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\"},\"finish_reason\":\"%s\"}],"
+                             "\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u}}",
+                             time(NULL),
+                             model_alias ? model_alias : "myds",
+                             escaped,
+                             finish_reason_str,
+                             prompt_tokens,
+                             ns.token_count,
+                             prompt_tokens + ns.token_count);
 
-                free(resp_json);
-                free(escaped);
+                    send_response(client_fd, 200, "OK", "application/json", resp_json);
+
+                    free(resp_json);
+                    free(escaped);
+                }
                 free(ns.buf);
             }
         }
 
-        gettimeofday(&t_end, NULL);
-        double elapsed = (t_end.tv_sec - t_start.tv_sec) + (t_end.tv_usec - t_start.tv_usec) / 1e6;
-        double speed = (elapsed > 0.0) ? (final_tokens / elapsed) : 0.0;
-        MYDS_LOG_I("[%s:%d] Completed %s %s 200 OK - %u tokens in %.2fs (%.2f tokens/s)",
+        double t_end = myds_server_now_s();
+        double wall_s = t_end - t_start;
+        double prefill_s = (final_tokens > 0 && t_first > t_start) ? (t_first - t_start) : wall_s;
+        double ttft_s = prefill_s;
+        double decode_s = (final_tokens > 1 && t_last > t_first) ? (t_last - t_first) : 0.0;
+        double decode_tps = (decode_s > 0.0 && final_tokens > 1) ? ((double)(final_tokens - 1) / decode_s) : ((wall_s > 0.0) ? ((double)final_tokens / wall_s) : 0.0);
+        const char *final_finish_str = (stop_reason == MYDS_STOP_LENGTH || stop_reason == MYDS_STOP_CTX_FULL) ? "length" : (stop_reason == MYDS_STOP_CANCELLED ? "cancelled" : (stop_reason == MYDS_STOP_ERROR ? "error" : "stop"));
+
+        MYDS_LOG_I("[%s:%d] Completed %s %s 200 OK - prompt: %u tok, ttft: %.3fs, decode: %u tok in %.3fs = %.2f t/s, wall: %.3fs, finish_reason: %s",
                    client_ip, client_port,
                    is_responses_endpoint ? "Responses" : "ChatCompletions",
-                   path, final_tokens, elapsed, speed);
+                   path, prompt_tokens, ttft_s, final_tokens, decode_s, decode_tps, wall_s, final_finish_str);
 
         myds_context_set_config(ctx, &prev_cfg);
         pthread_mutex_unlock(&g_infer_mutex);
@@ -757,6 +852,21 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
     send_response(client_fd, 404, "Not Found", "application/json", "{\"error\":\"Not found\"}");
     free(req_buf);
     close(client_fd);
+}
+
+typedef struct {
+    int client_fd;
+    myds_context_t *ctx;
+    char model_alias[64];
+    char client_ip[INET_ADDRSTRLEN];
+    int client_port;
+} server_client_job_t;
+
+static void *server_client_thread(void *arg) {
+    server_client_job_t *job = (server_client_job_t *)arg;
+    handle_client(job->client_fd, job->ctx, job->model_alias, job->client_ip, job->client_port);
+    free(job);
+    return NULL;
 }
 
 int myds_server_start(myds_context_t *ctx, const char *host, int port, const char *model_alias) {
@@ -825,7 +935,26 @@ int myds_server_start(myds_context_t *ctx, const char *host, int port, const cha
         inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
         int client_port = ntohs(client_addr.sin_port);
 
-        handle_client(client_fd, ctx, model_alias, client_ip, client_port);
+        server_client_job_t *job = (server_client_job_t *)malloc(sizeof(server_client_job_t));
+        if (!job) {
+            handle_client(client_fd, ctx, model_alias, client_ip, client_port);
+            continue;
+        }
+        job->client_fd = client_fd;
+        job->ctx = ctx;
+        strncpy(job->model_alias, model_alias ? model_alias : "myds", sizeof(job->model_alias) - 1);
+        job->model_alias[sizeof(job->model_alias) - 1] = '\0';
+        strncpy(job->client_ip, client_ip, sizeof(job->client_ip) - 1);
+        job->client_ip[sizeof(job->client_ip) - 1] = '\0';
+        job->client_port = client_port;
+
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, server_client_thread, job) == 0) {
+            pthread_detach(tid);
+        } else {
+            handle_client(client_fd, ctx, model_alias, client_ip, client_port);
+            free(job);
+        }
     }
 
     if (g_server_fd >= 0) {

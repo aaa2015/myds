@@ -11,6 +11,8 @@
 #include <time.h>
 #include <sys/time.h>
 #include <sys/mman.h>
+#include <mach/mach.h>
+#include <dispatch/dispatch.h>
 
 typedef struct {
     uint16_t d;
@@ -151,6 +153,50 @@ static void rope_tail_inplace(
     }
 }
 
+typedef struct {
+    float             *out_heads;
+    const float       *sinks;
+    const float       *q;
+    const float       *kv_rows;
+    uint32_t           n_kv;
+    uint32_t           head_dim;
+    float              kq_scale;
+} attn_sinks_job_t;
+
+static void layer_attention_sinks_head_worker(void *context, size_t h) {
+    const attn_sinks_job_t *job = (const attn_sinks_job_t *)context;
+    uint32_t head_dim = job->head_dim;
+    uint32_t n_kv = job->n_kv;
+    const float *qh = job->q + h * head_dim;
+
+    float score_stack[512];
+    float *score = (n_kv <= 512) ? score_stack : (float *)malloc((size_t)n_kv * sizeof(float));
+    if (!score) return;
+
+    float max_score = job->sinks ? job->sinks[h] : -INFINITY;
+    for (uint32_t r = 0; r < n_kv; r++) {
+        const float *kv = job->kv_rows + (size_t)r * head_dim;
+        score[r] = dot_f32(qh, kv, head_dim) * job->kq_scale;
+        if (score[r] > max_score) max_score = score[r];
+    }
+
+    float *oh = job->out_heads + h * head_dim;
+    memset(oh, 0, (size_t)head_dim * sizeof(float));
+
+    float denom = job->sinks ? expf(job->sinks[h] - max_score) : 0.0f;
+    for (uint32_t r = 0; r < n_kv; r++) {
+        const float weight = expf(score[r] - max_score);
+        const float *kv = job->kv_rows + (size_t)r * head_dim;
+        denom += weight;
+        axpy_f32(oh, kv, weight, head_dim);
+    }
+
+    const float inv = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
+    scale_f32(oh, inv, head_dim);
+
+    if (score != score_stack) free(score);
+}
+
 static void layer_attention_sinks(
         float             *out_heads,
         const float       *sinks,
@@ -160,35 +206,17 @@ static void layer_attention_sinks(
         uint32_t           n_heads,
         uint32_t           head_dim) {
     const float kq_scale = 1.0f / sqrtf((float)head_dim);
-    float score_stack[512];
-    float *score = n_kv <= 512 ? score_stack : (float *)malloc((size_t)n_kv * sizeof(score[0]));
-
-    for (uint32_t h = 0; h < n_heads; h++) {
-        const float *qh = q + (size_t)h * head_dim;
-
-        float max_score = sinks ? sinks[h] : -INFINITY;
-        for (uint32_t r = 0; r < n_kv; r++) {
-            const float *kv = kv_rows + (size_t)r * head_dim;
-            score[r] = dot_f32(qh, kv, head_dim) * kq_scale;
-            if (score[r] > max_score) max_score = score[r];
-        }
-
-        float *oh = out_heads + (size_t)h * head_dim;
-        memset(oh, 0, (size_t)head_dim * sizeof(oh[0]));
-
-        float denom = sinks ? expf(sinks[h] - max_score) : 0.0f;
-        for (uint32_t r = 0; r < n_kv; r++) {
-            const float weight = expf(score[r] - max_score);
-            const float *kv = kv_rows + (size_t)r * head_dim;
-            denom += weight;
-            axpy_f32(oh, kv, weight, head_dim);
-        }
-
-        const float inv = denom > 0.0f ? 1.0f / denom : 0.0f;
-        scale_f32(oh, inv, head_dim);
-    }
-
-    if (score != score_stack) free(score);
+    attn_sinks_job_t job = {
+        .out_heads = out_heads,
+        .sinks = sinks,
+        .q = q,
+        .kv_rows = kv_rows,
+        .n_kv = n_kv,
+        .head_dim = head_dim,
+        .kq_scale = kq_scale,
+    };
+    dispatch_queue_t q_concurrent = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
+    dispatch_apply_f((size_t)n_heads, q_concurrent, &job, layer_attention_sinks_head_worker);
 }
 
 #include "myds_internal.h"
@@ -943,6 +971,16 @@ void myds_model_print_info(const myds_model_t *m) {
         printf(" MoE Shared   : %u experts\n", m->n_shared_experts);
     } else {
         printf(" MoE          : Dense model\n");
+    }
+    if (m->gf) {
+        mach_task_basic_info_data_t task_info_data;
+        mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+        double resident_gb = 0.0;
+        if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&task_info_data, &count) == KERN_SUCCESS) {
+            resident_gb = (double)task_info_data.resident_size / (1024.0 * 1024.0 * 1024.0);
+        }
+        double file_gb = (double)m->gf->mmap_size / (1024.0 * 1024.0 * 1024.0);
+        printf(" Memory (mmap): %.2f GB mapped, %.2f GB resident (strategy: demand paged)\n", file_gb, resident_gb);
     }
     printf("====================================================\n");
 }
@@ -1712,39 +1750,88 @@ int32_t myds_forward_token(myds_context_t *ctx, int32_t token_id, uint32_t pos) 
     return next_token;
 }
 
-int myds_generate(myds_context_t *ctx, const char *prompt, myds_stream_callback_t cb, void *user_data) {
-    if (!ctx || !prompt) return 0;
+int myds_generate_ex(myds_context_t *ctx,
+                     const char     *prompt,
+                     myds_stream_callback_t cb,
+                     void           *user_data,
+                     myds_stop_reason_t *out_reason,
+                     uint32_t       *out_prompt_tokens,
+                     volatile int   *cancel_flag) {
+    if (!ctx || !prompt) {
+        if (out_reason) *out_reason = MYDS_STOP_ERROR;
+        return 0;
+    }
     myds_model_t *m = ctx->model;
 
-    /* 1. Tokenize prompt */
-    int32_t prompt_tokens[4096];
-    int32_t n_prompt = myds_tokenizer_encode(m->tokenizer, prompt, prompt_tokens, 4096, true);
-    if (n_prompt <= 0) return 0;
+    /* 1. Tokenize prompt with dynamic allocation based on max_seq_len (P1-2) */
+    size_t prompt_alloc_tokens = ctx->cfg.max_seq_len > 4096 ? ctx->cfg.max_seq_len : 4096;
+    int32_t *prompt_tokens = (int32_t *)malloc(prompt_alloc_tokens * sizeof(int32_t));
+    if (!prompt_tokens) {
+        MYDS_LOG_E("Out of memory allocating prompt token buffer");
+        if (out_reason) *out_reason = MYDS_STOP_ERROR;
+        return 0;
+    }
+
+    int32_t n_prompt = myds_tokenizer_encode(m->tokenizer, prompt, prompt_tokens, (uint32_t)prompt_alloc_tokens, true);
+    if (n_prompt <= 0) {
+        free(prompt_tokens);
+        if (out_reason) *out_reason = MYDS_STOP_ERROR;
+        return 0;
+    }
+
+    if (out_prompt_tokens) {
+        *out_prompt_tokens = (uint32_t)n_prompt;
+    }
+
+    if ((uint32_t)n_prompt >= ctx->cfg.max_seq_len) {
+        MYDS_LOG_E("Prompt length (%d tokens) exceeds maximum sequence context (%u)", n_prompt, ctx->cfg.max_seq_len);
+        free(prompt_tokens);
+        if (out_reason) *out_reason = MYDS_STOP_CTX_FULL;
+        return 0;
+    }
 
     ctx->pos = 0;
     int32_t cur_token = prompt_tokens[0];
 
     /* 2. Prefill phase */
     for (int32_t i = 0; i < n_prompt - 1; i++) {
+        if (cancel_flag && *cancel_flag) {
+            free(prompt_tokens);
+            if (out_reason) *out_reason = MYDS_STOP_CANCELLED;
+            return 1;
+        }
         if (myds_forward_token(ctx, prompt_tokens[i], ctx->pos) < 0) {
             MYDS_LOG_E("Prefill step %d failed", i);
+            free(prompt_tokens);
+            if (out_reason) *out_reason = MYDS_STOP_ERROR;
             return 0;
         }
         ctx->pos++;
     }
     cur_token = prompt_tokens[n_prompt - 1];
+    free(prompt_tokens);
 
     /* 3. Decode phase */
+    myds_stop_reason_t stop_reason = MYDS_STOP_LENGTH;
     uint32_t max_gen = ctx->cfg.max_new_tokens;
+    int success = 1;
+
     for (uint32_t step = 0; step < max_gen; step++) {
+        if (cancel_flag && *cancel_flag) {
+            stop_reason = MYDS_STOP_CANCELLED;
+            break;
+        }
         int32_t next_token = myds_forward_token(ctx, cur_token, ctx->pos);
         if (next_token < 0) {
             MYDS_LOG_E("Generation step %u failed", step);
-            return 0;
+            stop_reason = MYDS_STOP_ERROR;
+            success = 0;
+            break;
         }
         ctx->pos++;
 
         if (next_token == m->tokenizer->eos_id) {
+            stop_reason = MYDS_STOP_EOS;
             break;
         }
 
@@ -1754,8 +1841,16 @@ int myds_generate(myds_context_t *ctx, const char *prompt, myds_stream_callback_
         }
 
         cur_token = next_token;
-        if (ctx->pos >= ctx->cfg.max_seq_len) break;
+        if (ctx->pos >= ctx->cfg.max_seq_len) {
+            stop_reason = MYDS_STOP_CTX_FULL;
+            break;
+        }
     }
 
-    return 1;
+    if (out_reason) *out_reason = stop_reason;
+    return success;
+}
+
+int myds_generate(myds_context_t *ctx, const char *prompt, myds_stream_callback_t cb, void *user_data) {
+    return myds_generate_ex(ctx, prompt, cb, user_data, NULL, NULL, NULL);
 }

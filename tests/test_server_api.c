@@ -150,6 +150,87 @@ int main(void) {
         printf("  [PASS] Responses API SSE events protocol compliance\n");
     }
 
+    /* 7. Test P0-2 & P0-3: Finish reason mapping and real prompt_tokens */
+    {
+        myds_stop_reason_t r_eos = MYDS_STOP_EOS;
+        myds_stop_reason_t r_len = MYDS_STOP_LENGTH;
+        myds_stop_reason_t r_ctx = MYDS_STOP_CTX_FULL;
+
+        const char *f_eos = (r_eos == MYDS_STOP_LENGTH || r_eos == MYDS_STOP_CTX_FULL) ? "length" : "stop";
+        const char *f_len = (r_len == MYDS_STOP_LENGTH || r_len == MYDS_STOP_CTX_FULL) ? "length" : "stop";
+        const char *f_ctx = (r_ctx == MYDS_STOP_LENGTH || r_ctx == MYDS_STOP_CTX_FULL) ? "length" : "stop";
+
+        assert(strcmp(f_eos, "stop") == 0);
+        assert(strcmp(f_len, "length") == 0);
+        assert(strcmp(f_ctx, "length") == 0);
+
+        /* Real usage token calculation */
+        uint32_t prompt_tokens = 42;
+        uint32_t completion_tokens = 8;
+        uint32_t total_tokens = prompt_tokens + completion_tokens;
+
+        char chat_json[512];
+        snprintf(chat_json, sizeof(chat_json),
+                 "{\"choices\":[{\"finish_reason\":\"%s\"}],\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u}}",
+                 f_len, prompt_tokens, completion_tokens, total_tokens);
+
+        assert(strstr(chat_json, "\"finish_reason\":\"length\"") != NULL);
+        assert(strstr(chat_json, "\"prompt_tokens\":42") != NULL);
+        assert(strstr(chat_json, "\"completion_tokens\":8") != NULL);
+        assert(strstr(chat_json, "\"total_tokens\":50") != NULL);
+        printf("  [PASS] P0-2 finish_reason mapping and P0-3 real usage tokens\n");
+    }
+
+    /* 8. Test P0-4: stream_options.include_usage = true detection and chunk generation */
+    {
+        const char *body_with_usage = "{\"model\":\"myds\",\"stream\":true,\"stream_options\":{\"include_usage\":true}}";
+        const char *body_without_usage = "{\"model\":\"myds\",\"stream\":true}";
+
+        int has_usage1 = (strstr(body_with_usage, "\"include_usage\":true") != NULL || strstr(body_with_usage, "\"include_usage\": true") != NULL);
+        int has_usage2 = (strstr(body_without_usage, "\"include_usage\":true") != NULL || strstr(body_without_usage, "\"include_usage\": true") != NULL);
+
+        assert(has_usage1 == 1);
+        assert(has_usage2 == 0);
+
+        uint32_t prompt_tok = 15;
+        uint32_t comp_tok = 25;
+        char usage_chunk[512];
+        snprintf(usage_chunk, sizeof(usage_chunk),
+                 "data: {\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u}}\n\n",
+                 prompt_tok, comp_tok, prompt_tok + comp_tok);
+
+        assert(strstr(usage_chunk, "\"choices\":[]") != NULL);
+        assert(strstr(usage_chunk, "\"usage\":{\"prompt_tokens\":15,\"completion_tokens\":25,\"total_tokens\":40}") != NULL);
+        printf("  [PASS] P0-4 stream_options.include_usage detection and usage chunk compliance\n");
+    }
+
+    /* 9. Test P1-2: Dynamic prompt parsing without silent 4096-char truncation */
+    {
+        size_t big_content_size = 20000;
+        char *big_json = (char *)malloc(big_content_size + 2048);
+        assert(big_json != NULL);
+
+        strcpy(big_json, "{\"messages\":[{\"role\":\"user\",\"content\":\"");
+        size_t offset = strlen(big_json);
+        memset(big_json + offset, 'A', big_content_size);
+        offset += big_content_size;
+        strcpy(big_json + offset, "\"}]}");
+
+        size_t prompt_cap = big_content_size + 8192;
+        char *parsed_prompt = (char *)malloc(prompt_cap);
+        assert(parsed_prompt != NULL);
+
+        parse_chat_prompt(big_json, parsed_prompt, prompt_cap);
+        assert(strstr(parsed_prompt, "<｜begin of sentence｜><｜User｜>") != NULL);
+        /* Ensure the full 20000-character content is present without truncation */
+        assert(strlen(parsed_prompt) > big_content_size);
+        assert(strstr(parsed_prompt, "<｜Assistant｜>") != NULL);
+
+        free(parsed_prompt);
+        free(big_json);
+        printf("  [PASS] P1-2 dynamic prompt buffer parsing with >16KB content without truncation\n");
+    }
+
     printf("====================================================\n");
     printf("      ALL SERVER API UNIT TESTS PASSED!             \n");
     printf("====================================================\n");

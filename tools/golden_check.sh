@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# tools/golden_check.sh - Deterministic Token ID Exact Alignment Gate
+# Conforms to METRIC_FIX_SPEC.md P0-GATE specifications.
+
+set -euo pipefail
+
+usage() {
+    cat <<EOF
+Usage: $0 <old_bin> <new_bin> [model.gguf]
+
+Parameters:
+  <old_bin>     Path to baseline myds binary (or reference binary)
+  <new_bin>     Path to candidate myds binary
+  [model.gguf]  Optional path to GGUF model (default: auto-detect or env MODEL_PATH)
+
+Verification:
+  - Runs >= 3 diverse prompts at temperature=0.0 (greedy) with fixed seed=42
+  - Includes at least 1 deterministic verbatim recall prompt
+  - Verifies bit-exact token ID sequence equivalence via SHA256 hashes
+EOF
+    exit 1
+}
+
+if [[ $# -lt 2 ]]; then
+    usage
+fi
+
+OLD_BIN="$1"
+NEW_BIN="$2"
+MODEL="${3:-${MODEL_PATH:-}}"
+
+if [[ ! -x "$OLD_BIN" ]]; then
+    echo "Error: old_bin '$OLD_BIN' not executable" >&2
+    exit 1
+fi
+
+if [[ ! -x "$NEW_BIN" ]]; then
+    echo "Error: new_bin '$NEW_BIN' not executable" >&2
+    exit 1
+fi
+
+if [[ -z "$MODEL" ]]; then
+    CANDIDATES=(
+        "~/.lmstudio/models/antirez/deepseek-v4.1-flash-gguf/DeepSeek-V4.1-Flash-Q2.gguf"
+        "/tmp/test_myds_mla_forward.gguf"
+    )
+    for c in "${CANDIDATES[@]}"; do
+        if [[ -f "$c" ]]; then
+            MODEL="$c"
+            break
+        fi
+    done
+fi
+
+if [[ ! -f "$MODEL" ]]; then
+    echo "Error: model file '$MODEL' not found" >&2
+    exit 1
+fi
+
+echo "========================================================="
+echo "  P0-GATE Deterministic Golden Alignment Check"
+echo "========================================================="
+echo "Baseline Bin  : $OLD_BIN"
+echo "Candidate Bin : $NEW_BIN"
+echo "Model         : $MODEL"
+echo "========================================================="
+
+PROMPTS=(
+    "Repeat the following text verbatim: DeepSeek-V4.1-Flash is an open-source Mixture-of-Experts language model."
+    "Calculate 127 * 43 step by step and provide the final answer."
+    "Write a concise C function that computes the square of an integer."
+)
+
+ALL_PASSED=1
+
+for idx in "${!PROMPTS[@]}"; do
+    p_num=$((idx + 1))
+    p_text="${PROMPTS[$idx]}"
+    
+    echo -n "Test Prompt $p_num: \"${p_text:0:50}...\" -> "
+
+    TMP_OLD=$(mktemp)
+    TMP_NEW=$(mktemp)
+
+    "$OLD_BIN" -m "$MODEL" -p "$p_text" -n 64 --temp 0.0 --seed 42 --print-tokens > "$TMP_OLD" 2>&1 || {
+        echo "FAIL (old_bin execution error)"
+        cat "$TMP_OLD" >&2
+        rm -f "$TMP_OLD" "$TMP_NEW"
+        exit 1
+    }
+
+    "$NEW_BIN" -m "$MODEL" -p "$p_text" -n 64 --temp 0.0 --seed 42 --print-tokens > "$TMP_NEW" 2>&1 || {
+        echo "FAIL (new_bin execution error)"
+        cat "$TMP_NEW" >&2
+        rm -f "$TMP_OLD" "$TMP_NEW"
+        exit 1
+    }
+
+    OLD_TOKENS=$(grep -E "^TOKEN_IDS: " "$TMP_OLD" | head -n 1 || true)
+    NEW_TOKENS=$(grep -E "^TOKEN_IDS: " "$TMP_NEW" | head -n 1 || true)
+
+    if [[ -z "$OLD_TOKENS" || -z "$NEW_TOKENS" ]]; then
+        echo "FAIL (TOKEN_IDS line missing from output)"
+        ALL_PASSED=0
+        rm -f "$TMP_OLD" "$TMP_NEW"
+        continue
+    fi
+
+    OLD_HASH=$(echo "$OLD_TOKENS" | shasum -a 256 | awk '{print $1}')
+    NEW_HASH=$(echo "$NEW_TOKENS" | shasum -a 256 | awk '{print $1}')
+
+    if [[ "$OLD_HASH" == "$NEW_HASH" ]]; then
+        echo "PASS [sha256=${OLD_HASH:0:16}...]"
+    else
+        echo "FAIL"
+        echo "  Baseline Hash : $OLD_HASH"
+        echo "  Candidate Hash: $NEW_HASH"
+        echo "  Diff in token IDs:"
+        diff -u <(echo "$OLD_TOKENS") <(echo "$NEW_TOKENS") || true
+        ALL_PASSED=0
+    fi
+
+    rm -f "$TMP_OLD" "$TMP_NEW"
+done
+
+echo "========================================================="
+if [[ $ALL_PASSED -eq 1 ]]; then
+    echo "  ALL GOLDEN CHECK TESTS PASSED! Bit-exact alignment verified."
+    echo "========================================================="
+    exit 0
+else
+    echo "  GOLDEN CHECK FAILED! Token ID divergence detected."
+    echo "========================================================="
+    exit 1
+fi
