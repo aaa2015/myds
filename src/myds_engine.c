@@ -2473,6 +2473,11 @@ static int myds_prefill_tokens(myds_context_t *ctx, const int32_t *tokens, int32
     }
 
     ctx->pos = base_pos + (uint32_t)n_tokens;
+    if (ctx && ctx->cfg.temperature > 0.0f) {
+        for (int32_t i = 0; i < n_tokens; i++) {
+            ctx->rng_state = ctx->rng_state * 6364136223846793005ULL + 1ULL;
+        }
+    }
     free(prompt_x);
     free_prefill_chunk(chunk);
     return 1;
