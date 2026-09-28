@@ -1,0 +1,7 @@
+build/
+bin/
+*.o
+*.dSYM
+.DS_Store
+tests/verify_metal
+tests/test_metal
