@@ -17,6 +17,26 @@ int main(int argc, char **argv) {
            (unsigned long long)gf->tensor_count,
            (unsigned long long)gf->metadata_kv_count);
 
+    printf("--- Model Architecture Metadata ---\n");
+    for (uint64_t k = 0; k < gf->metadata_kv_count; k++) {
+        const char *key = gf->kvs[k].key;
+        gguf_type type = gf->kvs[k].type;
+        if (strstr(key, "general") || strstr(key, "attention") || strstr(key, "rope") ||
+            strstr(key, "expert") || strstr(key, "block_count") || strstr(key, "embedding_length") ||
+            strstr(key, "feed_forward")) {
+            if (type == GGUF_TYPE_UINT32) {
+                printf("  %-40s = %u (u32)\n", key, gf->kvs[k].value.val_u32);
+            } else if (type == GGUF_TYPE_FLOAT32) {
+                printf("  %-40s = %f (f32)\n", key, gf->kvs[k].value.val_f32);
+            } else if (type == GGUF_TYPE_STRING) {
+                printf("  %-40s = %s (str)\n", key, gf->kvs[k].value.val_str);
+            } else if (type == GGUF_TYPE_BOOL) {
+                printf("  %-40s = %s (bool)\n", key, gf->kvs[k].value.val_bool ? "true" : "false");
+            }
+        }
+    }
+    printf("\n");
+
     printf("--- Sample Tensors (blk.0.* and top-level) ---\n");
     for (uint64_t i = 0; i < gf->tensor_count; i++) {
         const char *name = gf->tensors[i].name;

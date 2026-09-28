@@ -1,5 +1,6 @@
 #include "myds.h"
 #include "myds_gguf.h"
+#include "myds_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -101,6 +102,12 @@ static const char *create_gate_test_gguf(
         size_t sz = ggml_type_row_size(tensors[i].type, n_el);
         size_t sz_padded = (sz + 31) / 32 * 32;
         uint8_t *dummy = (uint8_t *)calloc(1, sz_padded);
+        if (tensors[i].type == GGML_TYPE_F32) {
+            float *fvals = (float *)dummy;
+            for (size_t k = 0; k < n_el; k++) {
+                fvals[k] = 0.05f * (float)((k % 7) + 1);
+            }
+        }
         fwrite(dummy, 1, sz_padded, f);
         free(dummy);
     }
@@ -339,6 +346,79 @@ int main(void) {
         assert(m == NULL); /* Must be rejected by T0-3 missing tensor gate */
         unlink(path);
         printf("  [PASS] T0-3 gate: Missing required attention/FFN tensors rejected fail-fast\n");
+    }
+
+    /* 11. MLA End-to-End: Full Multi-Head Latent Attention forward execution & latent KV cache verification */
+    {
+        const char *path = "/tmp/test_myds_mla_forward.gguf";
+        synth_tensor_desc_t tensors[] = {
+            { "token_embd.weight",          GGML_TYPE_F32, 64, 16 },
+            { "output_norm.weight",         GGML_TYPE_F32, 64, 0 },
+            { "output.weight",              GGML_TYPE_F32, 64, 16 },
+            { "blk.0.attn_norm.weight",      GGML_TYPE_F32, 64, 0 },
+            { "blk.0.attn_q_a.weight",       GGML_TYPE_F32, 64, 16 },
+            { "blk.0.attn_q_a_norm.weight",  GGML_TYPE_F32, 16, 0 },
+            { "blk.0.attn_q_b.weight",       GGML_TYPE_F32, 16, 32 }, /* 2 heads * head_dim 16 = 32 */
+            { "blk.0.attn_kv.weight",        GGML_TYPE_F32, 64, 16 }, /* head_dim 16 */
+            { "blk.0.attn_kv_a_norm.weight", GGML_TYPE_F32, 16, 0 },
+            { "blk.0.attn_sinks.weight",     GGML_TYPE_F32, 2, 0 },   /* 2 heads */
+            { "blk.0.attn_output_a.weight",  GGML_TYPE_F32, 16, 16 }, /* 2 groups of rank 8, group_dim 16 */
+            { "blk.0.attn_output_b.weight",  GGML_TYPE_F32, 16, 64 }, /* 16 -> 64 */
+            { "blk.0.ffn_norm.weight",       GGML_TYPE_F32, 64, 0 },
+            { "blk.0.ffn_gate.weight",       GGML_TYPE_F32, 64, 64 },
+            { "blk.0.ffn_up.weight",         GGML_TYPE_F32, 64, 64 },
+            { "blk.0.ffn_down.weight",       GGML_TYPE_F32, 64, 64 },
+        };
+        create_gate_test_gguf(path, "deepseek41", 1, 0, tensors, sizeof(tensors)/sizeof(tensors[0]));
+
+        myds_model_t *m = myds_model_load(path);
+        assert(m != NULL);
+        assert(m->is_mla == true);
+        assert(m->dim == 64);
+        assert(m->head_dim == 16);
+        assert(m->q_lora_rank == 16);
+        assert(m->kv_lora_rank == 16);
+        assert(m->n_heads == 2);
+
+        myds_config_t cfg = {
+            .max_seq_len = 32,
+            .max_new_tokens = 4,
+            .temperature = 0.0f, /* greedy */
+            .top_p = 1.0f,
+            .seed = 42,
+            .stream = false
+        };
+        myds_context_t *ctx = myds_context_create(m, &cfg);
+        assert(ctx != NULL);
+        assert(ctx->k_cache != NULL);
+        assert(ctx->v_cache == NULL); /* In MLA, v_cache is not needed */
+
+        /* Forward token at pos 0 */
+        int32_t next_t0 = myds_forward_token(ctx, 1, 0);
+        assert(next_t0 >= 0 && next_t0 < 16);
+
+        /* Verify latent KV cache is populated at pos 0 */
+        bool kv0_nonzero = false;
+        for (uint32_t i = 0; i < m->head_dim; i++) {
+            if (ctx->k_cache[0][i] != 0.0f) kv0_nonzero = true;
+        }
+        assert(kv0_nonzero);
+
+        /* Forward token at pos 1 (cross-attention over pos 0) */
+        int32_t next_t1 = myds_forward_token(ctx, next_t0, 1);
+        assert(next_t1 >= 0 && next_t1 < 16);
+
+        /* Verify latent KV cache is populated at pos 1 */
+        bool kv1_nonzero = false;
+        for (uint32_t i = 0; i < m->head_dim; i++) {
+            if (ctx->k_cache[0][m->head_dim + i] != 0.0f) kv1_nonzero = true;
+        }
+        assert(kv1_nonzero);
+
+        myds_context_free(ctx);
+        myds_model_free(m);
+        unlink(path);
+        printf("  [PASS] MLA forward pass & latent KV cache cross-attention verified\n");
     }
 
     printf("====================================================\n");

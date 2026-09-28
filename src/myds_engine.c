@@ -11,85 +11,240 @@
 #include <time.h>
 
 typedef struct {
-    myds_metal_buffer_t *attn_norm;
-    myds_metal_buffer_t *attn_q;
-    myds_metal_buffer_t *attn_k;
-    myds_metal_buffer_t *attn_v;
-    myds_metal_buffer_t *attn_o;
+    uint16_t d;
+    int8_t   qs[32];
+} engine_block_q8_0_t;
 
-    myds_metal_buffer_t *ffn_norm;
-    myds_metal_buffer_t *ffn_gate;
-    myds_metal_buffer_t *ffn_up;
-    myds_metal_buffer_t *ffn_down;
+static inline float fp16_to_fp32(uint16_t h) {
+#if defined(__arm64__) || defined(__aarch64__)
+    return (float)(*(_Float16 *)&h);
+#else
+    uint32_t sign = ((uint32_t)(h & 0x8000)) << 16;
+    int32_t exp  = (h >> 10) & 0x1f;
+    uint32_t mant = h & 0x3ff;
+    if (exp == 0) {
+        if (mant == 0) {
+            float zero;
+            memcpy(&zero, &sign, sizeof(float));
+            return zero;
+        }
+        while ((mant & 0x400) == 0) {
+            mant <<= 1;
+            exp--;
+        }
+        exp++;
+        mant &= ~0x400;
+    } else if (exp == 31) {
+        exp = 255;
+    } else {
+        exp += (127 - 15);
+    }
+    uint32_t f = sign | ((uint32_t)exp << 23) | (mant << 13);
+    float val;
+    memcpy(&val, &f, sizeof(float));
+    return val;
+#endif
+}
 
-    /* DeepSeek MoE router */
-    myds_metal_buffer_t *router_gate;
-    myds_metal_buffer_t *shared_gate;
-    myds_metal_buffer_t *shared_up;
-    myds_metal_buffer_t *shared_down;
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 
-    /* Weight types */
-    ggml_type attn_q_type, attn_k_type, attn_v_type, attn_o_type;
-    ggml_type ffn_gate_type, ffn_up_type, ffn_down_type;
-} myds_layer_t;
+static inline float dot_f32(const float *a, const float *b, uint32_t n) {
+#if defined(__ARM_NEON)
+    uint32_t i = 0;
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    for (; i + 8 <= n; i += 8) {
+        acc0 = vfmaq_f32(acc0, vld1q_f32(a + i),     vld1q_f32(b + i));
+        acc1 = vfmaq_f32(acc1, vld1q_f32(a + i + 4), vld1q_f32(b + i + 4));
+    }
+    float acc = vaddvq_f32(vaddq_f32(acc0, acc1));
+    for (; i < n; i++) acc += a[i] * b[i];
+    return acc;
+#else
+    float acc = 0.0f;
+    for (uint32_t i = 0; i < n; i++) acc += a[i] * b[i];
+    return acc;
+#endif
+}
 
-struct myds_model {
-    gguf_file_t         *gf;
-    myds_tokenizer_t    *tokenizer;
+static inline void axpy_f32(float *y, const float *x, float a, uint32_t n) {
+#if defined(__ARM_NEON)
+    uint32_t i = 0;
+    const float32x4_t av = vdupq_n_f32(a);
+    for (; i + 8 <= n; i += 8) {
+        vst1q_f32(y + i,     vfmaq_f32(vld1q_f32(y + i),     av, vld1q_f32(x + i)));
+        vst1q_f32(y + i + 4, vfmaq_f32(vld1q_f32(y + i + 4), av, vld1q_f32(x + i + 4)));
+    }
+    for (; i < n; i++) y[i] += a * x[i];
+#else
+    for (uint32_t i = 0; i < n; i++) y[i] += a * x[i];
+#endif
+}
 
-    char                 arch[64];
-    uint32_t             dim;
-    uint32_t             n_layers;
-    uint32_t             n_heads;
-    uint32_t             n_kv_heads;
-    uint32_t             head_dim;
-    uint32_t             vocab_size;
-    uint32_t             hidden_dim;
+static inline void scale_f32(float *x, float a, uint32_t n) {
+#if defined(__ARM_NEON)
+    uint32_t i = 0;
+    const float32x4_t av = vdupq_n_f32(a);
+    for (; i + 8 <= n; i += 8) {
+        vst1q_f32(x + i,     vmulq_f32(vld1q_f32(x + i),     av));
+        vst1q_f32(x + i + 4, vmulq_f32(vld1q_f32(x + i + 4), av));
+    }
+    for (; i < n; i++) x[i] *= a;
+#else
+    for (uint32_t i = 0; i < n; i++) x[i] *= a;
+#endif
+}
 
-    /* DeepSeek MoE parameters */
-    uint32_t             n_routed_experts;
-    uint32_t             n_activated_experts;
-    uint32_t             n_shared_experts;
-    float                routed_scaling_factor;
+static void rms_norm_weight(float *out, const float *x, const float *weight, uint64_t n, float eps) {
+    double ss = 0.0;
+    for (uint64_t i = 0; i < n; i++) ss += (double)x[i] * x[i];
 
-    float                norm_eps;
-    float                freq_base;
-    float                freq_scale;
+    const float scale = 1.0f / sqrtf((float)(ss / (double)n) + eps);
+    for (uint64_t i = 0; i < n; i++) out[i] = x[i] * scale * (weight ? weight[i] : 1.0f);
+}
 
-    myds_metal_buffer_t *tok_embeddings;
-    ggml_type            tok_embeddings_type;
+static void head_rms_norm_inplace(float *x, uint32_t n_head, uint32_t head_dim, float eps) {
+    for (uint32_t h = 0; h < n_head; h++) {
+        float *head = x + (size_t)h * head_dim;
+        double ss = 0.0;
+        for (uint32_t i = 0; i < head_dim; i++) ss += (double)head[i] * head[i];
 
-    myds_layer_t        *layers;
+        const float scale = 1.0f / sqrtf((float)(ss / (double)head_dim) + eps);
+        for (uint32_t i = 0; i < head_dim; i++) head[i] *= scale;
+    }
+}
 
-    myds_metal_buffer_t *output_norm;
-    myds_metal_buffer_t *output;
-    ggml_type            output_type;
-};
+static void rope_tail_inplace(
+        float    *x,
+        uint32_t  n_head,
+        uint32_t  head_dim,
+        uint32_t  n_rot,
+        uint32_t  pos,
+        float     freq_base,
+        float     freq_scale,
+        bool      inverse) {
+    if (n_rot == 0 || n_rot > head_dim) return;
+    const uint32_t n_nope = head_dim - n_rot;
+    const float theta_scale = powf(freq_base, -2.0f / (float)n_rot);
+    const float sin_sign = inverse ? -1.0f : 1.0f;
 
-struct myds_context {
-    myds_model_t        *model;
-    myds_config_t        cfg;
-    uint32_t             pos;
+    for (uint32_t h = 0; h < n_head; h++) {
+        float *tail = x + (size_t)h * head_dim + n_nope;
+        float theta_extrap = (float)pos;
 
-    /* Metal activation buffers */
-    myds_metal_buffer_t *x;
-    myds_metal_buffer_t *x_norm;
-    myds_metal_buffer_t *q;
-    myds_metal_buffer_t *k;
-    myds_metal_buffer_t *v;
-    myds_metal_buffer_t *attn_scores;
-    myds_metal_buffer_t *attn_out;
-    myds_metal_buffer_t *ffn_norm_out;
-    myds_metal_buffer_t *gate_out;
-    myds_metal_buffer_t *up_out;
-    myds_metal_buffer_t *swiglu_out;
-    myds_metal_buffer_t *ffn_out;
-    myds_metal_buffer_t *logits;
+        for (uint32_t i = 0; i < n_rot; i += 2) {
+            const float theta = freq_scale * theta_extrap;
+            const float c = cosf(theta);
+            const float s = sin_sign * sinf(theta);
+            const float x0 = tail[i + 0];
+            const float x1 = tail[i + 1];
 
-    /* DeepSeek KV Cache */
-    float              **k_cache; /* [n_layers][max_seq_len * n_kv_heads * head_dim] */
-    float              **v_cache; /* [n_layers][max_seq_len * n_kv_heads * head_dim] */
-};
+            tail[i + 0] = x0 * c - x1 * s;
+            tail[i + 1] = x0 * s + x1 * c;
+
+            theta_extrap *= theta_scale;
+        }
+    }
+}
+
+static void layer_attention_sinks(
+        float             *out_heads,
+        const float       *sinks,
+        const float       *q,
+        const float       *kv_rows,
+        uint32_t           n_kv,
+        uint32_t           n_heads,
+        uint32_t           head_dim) {
+    const float kq_scale = 1.0f / sqrtf((float)head_dim);
+    float score_stack[512];
+    float *score = n_kv <= 512 ? score_stack : (float *)malloc((size_t)n_kv * sizeof(score[0]));
+
+    for (uint32_t h = 0; h < n_heads; h++) {
+        const float *qh = q + (size_t)h * head_dim;
+
+        float max_score = sinks ? sinks[h] : -INFINITY;
+        for (uint32_t r = 0; r < n_kv; r++) {
+            const float *kv = kv_rows + (size_t)r * head_dim;
+            score[r] = dot_f32(qh, kv, head_dim) * kq_scale;
+            if (score[r] > max_score) max_score = score[r];
+        }
+
+        float *oh = out_heads + (size_t)h * head_dim;
+        memset(oh, 0, (size_t)head_dim * sizeof(oh[0]));
+
+        float denom = sinks ? expf(sinks[h] - max_score) : 0.0f;
+        for (uint32_t r = 0; r < n_kv; r++) {
+            const float weight = expf(score[r] - max_score);
+            const float *kv = kv_rows + (size_t)r * head_dim;
+            denom += weight;
+            axpy_f32(oh, kv, weight, head_dim);
+        }
+
+        const float inv = denom > 0.0f ? 1.0f / denom : 0.0f;
+        scale_f32(oh, inv, head_dim);
+    }
+
+    if (score != score_stack) free(score);
+}
+
+#include "myds_internal.h"
+
+static void matvec_grouped_rows(
+        float                     *out,
+        const myds_metal_buffer_t *W,
+        const float               *x,
+        uint32_t                   n_groups,
+        uint64_t                   group_dim,
+        uint64_t                   rank,
+        ggml_type                  type) {
+    if (!out || !W || !x || n_groups == 0 || group_dim == 0 || rank == 0) return;
+
+    uint64_t total_rows = (uint64_t)n_groups * rank;
+
+    if (type == GGML_TYPE_Q8_0) {
+        const engine_block_q8_0_t *blocks = (const engine_block_q8_0_t *)myds_metal_buffer_data((myds_metal_buffer_t *)W);
+        uint64_t blocks_per_row = group_dim / 32;
+
+        for (uint64_t r = 0; r < total_rows; r++) {
+            uint32_t group = (uint32_t)(r / rank);
+            const float *xg = x + (size_t)group * group_dim;
+            const engine_block_q8_0_t *row_blocks = blocks + r * blocks_per_row;
+
+            float sum = 0.0f;
+            for (uint64_t b = 0; b < blocks_per_row; b++) {
+                float d = fp16_to_fp32(row_blocks[b].d);
+                const int8_t *qs = row_blocks[b].qs;
+                const float *xb = xg + b * 32;
+                for (int k = 0; k < 32; k++) {
+                    sum += d * (float)qs[k] * xb[k];
+                }
+            }
+            out[r] = sum;
+        }
+    } else if (type == GGML_TYPE_F32) {
+        const float *w_f32 = (const float *)myds_metal_buffer_data((myds_metal_buffer_t *)W);
+        for (uint64_t r = 0; r < total_rows; r++) {
+            uint32_t group = (uint32_t)(r / rank);
+            const float *xg = x + (size_t)group * group_dim;
+            const float *row = w_f32 + r * group_dim;
+            out[r] = dot_f32(row, xg, (uint32_t)group_dim);
+        }
+    } else if (type == GGML_TYPE_F16) {
+        const uint16_t *w_f16 = (const uint16_t *)myds_metal_buffer_data((myds_metal_buffer_t *)W);
+        for (uint64_t r = 0; r < total_rows; r++) {
+            uint32_t group = (uint32_t)(r / rank);
+            const float *xg = x + (size_t)group * group_dim;
+            const uint16_t *row = w_f16 + r * group_dim;
+            float sum = 0.0f;
+            for (uint64_t i = 0; i < group_dim; i++) {
+                sum += fp16_to_fp32(row[i]) * xg[i];
+            }
+            out[r] = sum;
+        }
+    }
+}
 
 /* Helper: verify supported quantization types for GEMV operations */
 static bool is_supported_quant_type(ggml_type type) {
@@ -180,35 +335,77 @@ myds_model_t *myds_model_load(const char *model_path) {
     snprintf(key_buf, sizeof(key_buf), "%s.rope.scale_linear", arch);
     m->freq_scale = gguf_get_f32(gf, key_buf, 1.0f);
 
-    /* MoE parameters */
-    snprintf(key_buf, sizeof(key_buf), "%s.expert_count", arch);
+    /* MoE parameters: DeepSeek V4.1 uses .n_routed_experts, .num_experts_per_tok, .n_shared_experts */
+    snprintf(key_buf, sizeof(key_buf), "%s.n_routed_experts", arch);
     m->n_routed_experts = gguf_get_u32(gf, key_buf, 0);
+    if (m->n_routed_experts == 0) {
+        snprintf(key_buf, sizeof(key_buf), "%s.expert_count", arch);
+        m->n_routed_experts = gguf_get_u32(gf, key_buf, 0);
+    }
 
-    snprintf(key_buf, sizeof(key_buf), "%s.expert_used_count", arch);
+    snprintf(key_buf, sizeof(key_buf), "%s.num_experts_per_tok", arch);
     m->n_activated_experts = gguf_get_u32(gf, key_buf, 0);
+    if (m->n_activated_experts == 0) {
+        snprintf(key_buf, sizeof(key_buf), "%s.expert_used_count", arch);
+        m->n_activated_experts = gguf_get_u32(gf, key_buf, 0);
+    }
 
-    snprintf(key_buf, sizeof(key_buf), "%s.expert_shared_count", arch);
+    snprintf(key_buf, sizeof(key_buf), "%s.n_shared_experts", arch);
     m->n_shared_experts = gguf_get_u32(gf, key_buf, 0);
+    if (m->n_shared_experts == 0) {
+        snprintf(key_buf, sizeof(key_buf), "%s.expert_shared_count", arch);
+        m->n_shared_experts = gguf_get_u32(gf, key_buf, 0);
+    }
 
     snprintf(key_buf, sizeof(key_buf), "%s.expert_weights_scale", arch);
     m->routed_scaling_factor = gguf_get_f32(gf, key_buf, 1.0f);
 
     m->vocab_size = m->tokenizer ? m->tokenizer->vocab_size : 32000;
 
-    /* T0-3 / T0-4 Gates: Verify architecture compatibility before loading weights */
+    /* Check whether model uses MLA (Multi-Head Latent Attention) */
     const gguf_tensor_t *t_mla_sample = gguf_find_tensor(gf, "blk.0.attn_q_a.weight");
     if (!t_mla_sample) t_mla_sample = gguf_find_tensor(gf, "blk.0.attn_kv.weight");
-    const gguf_tensor_t *t_mha_sample = gguf_find_tensor(gf, "blk.0.attn_q.weight");
+    m->is_mla = (t_mla_sample != NULL);
 
-    if (t_mla_sample && !t_mha_sample) {
-        MYDS_LOG_E("Model uses Multi-Head Latent Attention (MLA) tensors (e.g. 'blk.0.attn_q_a.weight'), which requires Phase 2 MLA forward support. Standard MHA tensors ('blk.0.attn_q.weight') are missing. Refusing to run to prevent silent failure (T0-3 gate).");
-        goto fail;
+    if (m->is_mla) {
+        /* Default MLA parameters for DeepSeek V4 / V4.1 */
+        m->q_lora_rank = 1280;
+        m->kv_lora_rank = 512;
+        m->qk_rope_head_dim = 64;
+        m->n_out_groups = 8;
+        m->out_group_rank = 1024;
+
+        const gguf_tensor_t *t_q_norm = gguf_find_tensor(gf, "blk.0.attn_q_a_norm.weight");
+        if (t_q_norm && t_q_norm->dims[0] > 0) m->q_lora_rank = (uint32_t)t_q_norm->dims[0];
+
+        const gguf_tensor_t *t_kv_norm = gguf_find_tensor(gf, "blk.0.attn_kv_a_norm.weight");
+        if (t_kv_norm && t_kv_norm->dims[0] > 0) m->kv_lora_rank = (uint32_t)t_kv_norm->dims[0];
+
+        const gguf_tensor_t *t_sinks = gguf_find_tensor(gf, "blk.0.attn_sinks.weight");
+        if (t_sinks && t_sinks->dims[0] > 0) m->n_heads = (uint32_t)t_sinks->dims[0];
+
+        m->qk_rope_head_dim = gguf_get_u32(gf, "deepseek41.qk_rope_head_dim", 64);
+
+        m->head_dim = m->kv_lora_rank;
+        if (m->qk_rope_head_dim > m->head_dim) m->qk_rope_head_dim = m->head_dim;
+
+        const gguf_tensor_t *t_out_a = gguf_find_tensor(gf, "blk.0.attn_output_a.weight");
+        if (t_out_a && t_out_a->dims[0] > 0) {
+            uint64_t gdim = t_out_a->dims[0];
+            uint64_t total_r = t_out_a->dims[1];
+            if (gdim <= (uint64_t)m->n_heads * m->head_dim) {
+                m->n_out_groups = (uint32_t)((m->n_heads * m->head_dim) / gdim);
+                if (m->n_out_groups == 0) m->n_out_groups = 1;
+                m->out_group_rank = (uint32_t)(total_r / m->n_out_groups);
+            }
+        }
     }
 
     const gguf_tensor_t *t_routed_exps = gguf_find_tensor(gf, "blk.0.ffn_gate_exps.weight");
-    if (m->n_routed_experts > 0 && t_routed_exps) {
+    if (m->n_routed_experts > 0 || t_routed_exps != NULL) {
+        uint32_t num_exps = m->n_routed_experts > 0 ? m->n_routed_experts : (t_routed_exps && t_routed_exps->n_dims >= 3 ? (uint32_t)t_routed_exps->dims[2] : 1);
         MYDS_LOG_E("Model has %u routed experts ('blk.0.ffn_gate_exps.weight'). Routed expert execution is not yet implemented. Refusing to run to prevent silent corruption (T0-4 gate).",
-                   m->n_routed_experts);
+                   num_exps);
         goto fail;
     }
 
@@ -279,61 +476,155 @@ myds_model_t *myds_model_load(const char *model_path) {
         }
         m->layers[i].attn_norm = create_metal_buffer_from_tensor(tan);
 
-        snprintf(name, sizeof(name), "blk.%u.attn_q.weight", i);
-        const gguf_tensor_t *tq = gguf_find_tensor(gf, name);
-        if (!tq) {
-            MYDS_LOG_E("Layer %u missing required attention Q tensor '%s' (T0-3 gate)", i, name);
-            goto fail;
-        }
-        if (!is_supported_quant_type(tq->type)) {
-            MYDS_LOG_E("Layer %u attention Q tensor '%s' has unsupported quant type %d (%s). Expected F32, F16, or Q8_0 (T0-1 gate).",
-                       i, name, (int)tq->type, ggml_type_name(tq->type));
-            goto fail;
-        }
-        m->layers[i].attn_q = create_metal_buffer_from_tensor(tq);
-        m->layers[i].attn_q_type = tq->type;
+        if (m->is_mla) {
+            snprintf(name, sizeof(name), "blk.%u.attn_q_a.weight", i);
+            const gguf_tensor_t *tqa = gguf_find_tensor(gf, name);
+            if (!tqa) {
+                MYDS_LOG_E("Layer %u missing required MLA attention Q_A tensor '%s' (T0-3 gate)", i, name);
+                goto fail;
+            }
+            if (!is_supported_quant_type(tqa->type)) {
+                MYDS_LOG_E("Layer %u attn_q_a tensor '%s' has unsupported quant type %d (%s) (T0-1 gate)",
+                           i, name, (int)tqa->type, ggml_type_name(tqa->type));
+                goto fail;
+            }
+            m->layers[i].attn_q_a = create_metal_buffer_from_tensor(tqa);
+            m->layers[i].attn_q_a_type = tqa->type;
 
-        snprintf(name, sizeof(name), "blk.%u.attn_k.weight", i);
-        const gguf_tensor_t *tk = gguf_find_tensor(gf, name);
-        if (!tk) {
-            MYDS_LOG_E("Layer %u missing required attention K tensor '%s' (T0-3 gate)", i, name);
-            goto fail;
-        }
-        if (!is_supported_quant_type(tk->type)) {
-            MYDS_LOG_E("Layer %u attention K tensor '%s' has unsupported quant type %d (%s). Expected F32, F16, or Q8_0 (T0-1 gate).",
-                       i, name, (int)tk->type, ggml_type_name(tk->type));
-            goto fail;
-        }
-        m->layers[i].attn_k = create_metal_buffer_from_tensor(tk);
-        m->layers[i].attn_k_type = tk->type;
+            snprintf(name, sizeof(name), "blk.%u.attn_q_a_norm.weight", i);
+            const gguf_tensor_t *tqan = gguf_find_tensor(gf, name);
+            if (!tqan) {
+                MYDS_LOG_E("Layer %u missing required MLA attention Q_A norm tensor '%s' (T0-3 gate)", i, name);
+                goto fail;
+            }
+            m->layers[i].attn_q_a_norm = create_metal_buffer_from_tensor(tqan);
 
-        snprintf(name, sizeof(name), "blk.%u.attn_v.weight", i);
-        const gguf_tensor_t *tv = gguf_find_tensor(gf, name);
-        if (!tv) {
-            MYDS_LOG_E("Layer %u missing required attention V tensor '%s' (T0-3 gate)", i, name);
-            goto fail;
-        }
-        if (!is_supported_quant_type(tv->type)) {
-            MYDS_LOG_E("Layer %u attention V tensor '%s' has unsupported quant type %d (%s). Expected F32, F16, or Q8_0 (T0-1 gate).",
-                       i, name, (int)tv->type, ggml_type_name(tv->type));
-            goto fail;
-        }
-        m->layers[i].attn_v = create_metal_buffer_from_tensor(tv);
-        m->layers[i].attn_v_type = tv->type;
+            snprintf(name, sizeof(name), "blk.%u.attn_q_b.weight", i);
+            const gguf_tensor_t *tqb = gguf_find_tensor(gf, name);
+            if (!tqb) {
+                MYDS_LOG_E("Layer %u missing required MLA attention Q_B tensor '%s' (T0-3 gate)", i, name);
+                goto fail;
+            }
+            if (!is_supported_quant_type(tqb->type)) {
+                MYDS_LOG_E("Layer %u attn_q_b tensor '%s' has unsupported quant type %d (%s) (T0-1 gate)",
+                           i, name, (int)tqb->type, ggml_type_name(tqb->type));
+                goto fail;
+            }
+            m->layers[i].attn_q_b = create_metal_buffer_from_tensor(tqb);
+            m->layers[i].attn_q_b_type = tqb->type;
 
-        snprintf(name, sizeof(name), "blk.%u.attn_output.weight", i);
-        const gguf_tensor_t *to = gguf_find_tensor(gf, name);
-        if (!to) {
-            MYDS_LOG_E("Layer %u missing required attention output tensor '%s' (T0-3 gate)", i, name);
-            goto fail;
+            snprintf(name, sizeof(name), "blk.%u.attn_kv.weight", i);
+            const gguf_tensor_t *tkv = gguf_find_tensor(gf, name);
+            if (!tkv) {
+                MYDS_LOG_E("Layer %u missing required MLA attention KV tensor '%s' (T0-3 gate)", i, name);
+                goto fail;
+            }
+            if (!is_supported_quant_type(tkv->type)) {
+                MYDS_LOG_E("Layer %u attn_kv tensor '%s' has unsupported quant type %d (%s) (T0-1 gate)",
+                           i, name, (int)tkv->type, ggml_type_name(tkv->type));
+                goto fail;
+            }
+            m->layers[i].attn_kv = create_metal_buffer_from_tensor(tkv);
+            m->layers[i].attn_kv_type = tkv->type;
+
+            snprintf(name, sizeof(name), "blk.%u.attn_kv_a_norm.weight", i);
+            const gguf_tensor_t *tkvan = gguf_find_tensor(gf, name);
+            if (!tkvan) {
+                MYDS_LOG_E("Layer %u missing required MLA attention KV_A norm tensor '%s' (T0-3 gate)", i, name);
+                goto fail;
+            }
+            m->layers[i].attn_kv_a_norm = create_metal_buffer_from_tensor(tkvan);
+
+            snprintf(name, sizeof(name), "blk.%u.attn_sinks.weight", i);
+            const gguf_tensor_t *tsinks = gguf_find_tensor(gf, name);
+            if (tsinks) {
+                m->layers[i].attn_sinks = create_metal_buffer_from_tensor(tsinks);
+            }
+
+            snprintf(name, sizeof(name), "blk.%u.attn_output_a.weight", i);
+            const gguf_tensor_t *toa = gguf_find_tensor(gf, name);
+            if (!toa) {
+                MYDS_LOG_E("Layer %u missing required MLA attention output_a tensor '%s' (T0-3 gate)", i, name);
+                goto fail;
+            }
+            if (!is_supported_quant_type(toa->type)) {
+                MYDS_LOG_E("Layer %u attn_output_a tensor '%s' has unsupported quant type %d (%s) (T0-1 gate)",
+                           i, name, (int)toa->type, ggml_type_name(toa->type));
+                goto fail;
+            }
+            m->layers[i].attn_output_a = create_metal_buffer_from_tensor(toa);
+            m->layers[i].attn_output_a_type = toa->type;
+
+            snprintf(name, sizeof(name), "blk.%u.attn_output_b.weight", i);
+            const gguf_tensor_t *tob = gguf_find_tensor(gf, name);
+            if (!tob) {
+                MYDS_LOG_E("Layer %u missing required MLA attention output_b tensor '%s' (T0-3 gate)", i, name);
+                goto fail;
+            }
+            if (!is_supported_quant_type(tob->type)) {
+                MYDS_LOG_E("Layer %u attn_output_b tensor '%s' has unsupported quant type %d (%s) (T0-1 gate)",
+                           i, name, (int)tob->type, ggml_type_name(tob->type));
+                goto fail;
+            }
+            m->layers[i].attn_output_b = create_metal_buffer_from_tensor(tob);
+            m->layers[i].attn_output_b_type = tob->type;
+        } else {
+            snprintf(name, sizeof(name), "blk.%u.attn_q.weight", i);
+            const gguf_tensor_t *tq = gguf_find_tensor(gf, name);
+            if (!tq) {
+                MYDS_LOG_E("Layer %u missing required attention Q tensor '%s' (T0-3 gate)", i, name);
+                goto fail;
+            }
+            if (!is_supported_quant_type(tq->type)) {
+                MYDS_LOG_E("Layer %u attention Q tensor '%s' has unsupported quant type %d (%s). Expected F32, F16, or Q8_0 (T0-1 gate).",
+                           i, name, (int)tq->type, ggml_type_name(tq->type));
+                goto fail;
+            }
+            m->layers[i].attn_q = create_metal_buffer_from_tensor(tq);
+            m->layers[i].attn_q_type = tq->type;
+
+            snprintf(name, sizeof(name), "blk.%u.attn_k.weight", i);
+            const gguf_tensor_t *tk = gguf_find_tensor(gf, name);
+            if (!tk) {
+                MYDS_LOG_E("Layer %u missing required attention K tensor '%s' (T0-3 gate)", i, name);
+                goto fail;
+            }
+            if (!is_supported_quant_type(tk->type)) {
+                MYDS_LOG_E("Layer %u attention K tensor '%s' has unsupported quant type %d (%s). Expected F32, F16, or Q8_0 (T0-1 gate).",
+                           i, name, (int)tk->type, ggml_type_name(tk->type));
+                goto fail;
+            }
+            m->layers[i].attn_k = create_metal_buffer_from_tensor(tk);
+            m->layers[i].attn_k_type = tk->type;
+
+            snprintf(name, sizeof(name), "blk.%u.attn_v.weight", i);
+            const gguf_tensor_t *tv = gguf_find_tensor(gf, name);
+            if (!tv) {
+                MYDS_LOG_E("Layer %u missing required attention V tensor '%s' (T0-3 gate)", i, name);
+                goto fail;
+            }
+            if (!is_supported_quant_type(tv->type)) {
+                MYDS_LOG_E("Layer %u attention V tensor '%s' has unsupported quant type %d (%s). Expected F32, F16, or Q8_0 (T0-1 gate).",
+                           i, name, (int)tv->type, ggml_type_name(tv->type));
+                goto fail;
+            }
+            m->layers[i].attn_v = create_metal_buffer_from_tensor(tv);
+            m->layers[i].attn_v_type = tv->type;
+
+            snprintf(name, sizeof(name), "blk.%u.attn_output.weight", i);
+            const gguf_tensor_t *to = gguf_find_tensor(gf, name);
+            if (!to) {
+                MYDS_LOG_E("Layer %u missing required attention output tensor '%s' (T0-3 gate)", i, name);
+                goto fail;
+            }
+            if (!is_supported_quant_type(to->type)) {
+                MYDS_LOG_E("Layer %u attention output tensor '%s' has unsupported quant type %d (%s). Expected F32, F16, or Q8_0 (T0-1 gate).",
+                           i, name, (int)to->type, ggml_type_name(to->type));
+                goto fail;
+            }
+            m->layers[i].attn_o = create_metal_buffer_from_tensor(to);
+            m->layers[i].attn_o_type = to->type;
         }
-        if (!is_supported_quant_type(to->type)) {
-            MYDS_LOG_E("Layer %u attention output tensor '%s' has unsupported quant type %d (%s). Expected F32, F16, or Q8_0 (T0-1 gate).",
-                       i, name, (int)to->type, ggml_type_name(to->type));
-            goto fail;
-        }
-        m->layers[i].attn_o = create_metal_buffer_from_tensor(to);
-        m->layers[i].attn_o_type = to->type;
 
         snprintf(name, sizeof(name), "blk.%u.ffn_norm.weight", i);
         const gguf_tensor_t *tfn = gguf_find_tensor(gf, name);
@@ -343,42 +634,48 @@ myds_model_t *myds_model_load(const char *model_path) {
         }
         m->layers[i].ffn_norm = create_metal_buffer_from_tensor(tfn);
 
-        /* FFN: check dense vs shared experts */
+        /* FFN: dense layers require ffn_gate, ffn_up, ffn_down */
         snprintf(name, sizeof(name), "blk.%u.ffn_gate.weight", i);
         const gguf_tensor_t *fg = gguf_find_tensor(gf, name);
-        if (fg) {
-            if (!is_supported_quant_type(fg->type)) {
-                MYDS_LOG_E("Layer %u ffn_gate tensor '%s' has unsupported quant type %d (%s) (T0-1 gate)",
-                           i, name, (int)fg->type, ggml_type_name(fg->type));
-                goto fail;
-            }
-            m->layers[i].ffn_gate = create_metal_buffer_from_tensor(fg);
-            m->layers[i].ffn_gate_type = fg->type;
+        if (!fg) {
+            MYDS_LOG_E("Layer %u missing required FFN gate tensor '%s' (T0-3 gate)", i, name);
+            goto fail;
         }
+        if (!is_supported_quant_type(fg->type)) {
+            MYDS_LOG_E("Layer %u ffn_gate tensor '%s' has unsupported quant type %d (%s) (T0-1 gate)",
+                       i, name, (int)fg->type, ggml_type_name(fg->type));
+            goto fail;
+        }
+        m->layers[i].ffn_gate = create_metal_buffer_from_tensor(fg);
+        m->layers[i].ffn_gate_type = fg->type;
 
         snprintf(name, sizeof(name), "blk.%u.ffn_up.weight", i);
         const gguf_tensor_t *fu = gguf_find_tensor(gf, name);
-        if (fu) {
-            if (!is_supported_quant_type(fu->type)) {
-                MYDS_LOG_E("Layer %u ffn_up tensor '%s' has unsupported quant type %d (%s) (T0-1 gate)",
-                           i, name, (int)fu->type, ggml_type_name(fu->type));
-                goto fail;
-            }
-            m->layers[i].ffn_up = create_metal_buffer_from_tensor(fu);
-            m->layers[i].ffn_up_type = fu->type;
+        if (!fu) {
+            MYDS_LOG_E("Layer %u missing required FFN up tensor '%s' (T0-3 gate)", i, name);
+            goto fail;
         }
+        if (!is_supported_quant_type(fu->type)) {
+            MYDS_LOG_E("Layer %u ffn_up tensor '%s' has unsupported quant type %d (%s) (T0-1 gate)",
+                       i, name, (int)fu->type, ggml_type_name(fu->type));
+            goto fail;
+        }
+        m->layers[i].ffn_up = create_metal_buffer_from_tensor(fu);
+        m->layers[i].ffn_up_type = fu->type;
 
         snprintf(name, sizeof(name), "blk.%u.ffn_down.weight", i);
         const gguf_tensor_t *fd = gguf_find_tensor(gf, name);
-        if (fd) {
-            if (!is_supported_quant_type(fd->type)) {
-                MYDS_LOG_E("Layer %u ffn_down tensor '%s' has unsupported quant type %d (%s) (T0-1 gate)",
-                           i, name, (int)fd->type, ggml_type_name(fd->type));
-                goto fail;
-            }
-            m->layers[i].ffn_down = create_metal_buffer_from_tensor(fd);
-            m->layers[i].ffn_down_type = fd->type;
+        if (!fd) {
+            MYDS_LOG_E("Layer %u missing required FFN down tensor '%s' (T0-3 gate)", i, name);
+            goto fail;
         }
+        if (!is_supported_quant_type(fd->type)) {
+            MYDS_LOG_E("Layer %u ffn_down tensor '%s' has unsupported quant type %d (%s) (T0-1 gate)",
+                       i, name, (int)fd->type, ggml_type_name(fd->type));
+            goto fail;
+        }
+        m->layers[i].ffn_down = create_metal_buffer_from_tensor(fd);
+        m->layers[i].ffn_down_type = fd->type;
 
         /* MoE router & shared experts */
         snprintf(name, sizeof(name), "blk.%u.ffn_gate_inp.weight", i);
@@ -447,19 +744,27 @@ void myds_model_free(myds_model_t *m) {
 
     if (m->layers) {
         for (uint32_t i = 0; i < m->n_layers; i++) {
-            if (m->layers[i].attn_norm)   myds_metal_buffer_free(m->layers[i].attn_norm);
-            if (m->layers[i].attn_q)      myds_metal_buffer_free(m->layers[i].attn_q);
-            if (m->layers[i].attn_k)      myds_metal_buffer_free(m->layers[i].attn_k);
-            if (m->layers[i].attn_v)      myds_metal_buffer_free(m->layers[i].attn_v);
-            if (m->layers[i].attn_o)      myds_metal_buffer_free(m->layers[i].attn_o);
-            if (m->layers[i].ffn_norm)    myds_metal_buffer_free(m->layers[i].ffn_norm);
-            if (m->layers[i].ffn_gate)    myds_metal_buffer_free(m->layers[i].ffn_gate);
-            if (m->layers[i].ffn_up)      myds_metal_buffer_free(m->layers[i].ffn_up);
-            if (m->layers[i].ffn_down)    myds_metal_buffer_free(m->layers[i].ffn_down);
-            if (m->layers[i].router_gate) myds_metal_buffer_free(m->layers[i].router_gate);
-            if (m->layers[i].shared_gate) myds_metal_buffer_free(m->layers[i].shared_gate);
-            if (m->layers[i].shared_up)   myds_metal_buffer_free(m->layers[i].shared_up);
-            if (m->layers[i].shared_down) myds_metal_buffer_free(m->layers[i].shared_down);
+            if (m->layers[i].attn_norm)      myds_metal_buffer_free(m->layers[i].attn_norm);
+            if (m->layers[i].attn_q)         myds_metal_buffer_free(m->layers[i].attn_q);
+            if (m->layers[i].attn_k)         myds_metal_buffer_free(m->layers[i].attn_k);
+            if (m->layers[i].attn_v)         myds_metal_buffer_free(m->layers[i].attn_v);
+            if (m->layers[i].attn_o)         myds_metal_buffer_free(m->layers[i].attn_o);
+            if (m->layers[i].attn_q_a)       myds_metal_buffer_free(m->layers[i].attn_q_a);
+            if (m->layers[i].attn_q_a_norm)  myds_metal_buffer_free(m->layers[i].attn_q_a_norm);
+            if (m->layers[i].attn_q_b)       myds_metal_buffer_free(m->layers[i].attn_q_b);
+            if (m->layers[i].attn_kv)        myds_metal_buffer_free(m->layers[i].attn_kv);
+            if (m->layers[i].attn_kv_a_norm) myds_metal_buffer_free(m->layers[i].attn_kv_a_norm);
+            if (m->layers[i].attn_sinks)     myds_metal_buffer_free(m->layers[i].attn_sinks);
+            if (m->layers[i].attn_output_a)  myds_metal_buffer_free(m->layers[i].attn_output_a);
+            if (m->layers[i].attn_output_b)  myds_metal_buffer_free(m->layers[i].attn_output_b);
+            if (m->layers[i].ffn_norm)       myds_metal_buffer_free(m->layers[i].ffn_norm);
+            if (m->layers[i].ffn_gate)       myds_metal_buffer_free(m->layers[i].ffn_gate);
+            if (m->layers[i].ffn_up)         myds_metal_buffer_free(m->layers[i].ffn_up);
+            if (m->layers[i].ffn_down)       myds_metal_buffer_free(m->layers[i].ffn_down);
+            if (m->layers[i].router_gate)    myds_metal_buffer_free(m->layers[i].router_gate);
+            if (m->layers[i].shared_gate)    myds_metal_buffer_free(m->layers[i].shared_gate);
+            if (m->layers[i].shared_up)      myds_metal_buffer_free(m->layers[i].shared_up);
+            if (m->layers[i].shared_down)    myds_metal_buffer_free(m->layers[i].shared_down);
         }
         free(m->layers);
     }
@@ -477,7 +782,12 @@ void myds_model_print_info(const myds_model_t *m) {
     printf(" Architecture : %s\n", m->arch);
     printf(" Layers       : %u\n", m->n_layers);
     printf(" Hidden Dim   : %u\n", m->dim);
-    printf(" Attention    : %u heads (%u KV), head_dim=%u\n", m->n_heads, m->n_kv_heads, m->head_dim);
+    if (m->is_mla) {
+        printf(" Attention    : MLA (%u heads, head_dim=%u, q_rank=%u, kv_rank=%u, rope_dim=%u)\n",
+               m->n_heads, m->head_dim, m->q_lora_rank, m->kv_lora_rank, m->qk_rope_head_dim);
+    } else {
+        printf(" Attention    : %u heads (%u KV), head_dim=%u\n", m->n_heads, m->n_kv_heads, m->head_dim);
+    }
     printf(" FFN Dim      : %u\n", m->hidden_dim);
     printf(" Vocab Size   : %u\n", m->vocab_size);
     if (m->n_routed_experts > 0) {
@@ -515,10 +825,6 @@ myds_context_t *myds_context_create(myds_model_t *model, const myds_config_t *cf
 
     ctx->x            = myds_metal_buffer_alloc(dim * sizeof(float));
     ctx->x_norm       = myds_metal_buffer_alloc(dim * sizeof(float));
-    ctx->q            = myds_metal_buffer_alloc(model->n_heads * model->head_dim * sizeof(float));
-    ctx->k            = myds_metal_buffer_alloc(model->n_kv_heads * model->head_dim * sizeof(float));
-    ctx->v            = myds_metal_buffer_alloc(model->n_kv_heads * model->head_dim * sizeof(float));
-    ctx->attn_scores  = myds_metal_buffer_alloc(ctx->cfg.max_seq_len * sizeof(float));
     ctx->attn_out     = myds_metal_buffer_alloc(dim * sizeof(float));
     ctx->ffn_norm_out = myds_metal_buffer_alloc(dim * sizeof(float));
     ctx->gate_out     = myds_metal_buffer_alloc(hidden_dim * sizeof(float));
@@ -527,13 +833,34 @@ myds_context_t *myds_context_create(myds_model_t *model, const myds_config_t *cf
     ctx->ffn_out      = myds_metal_buffer_alloc(dim * sizeof(float));
     ctx->logits       = myds_metal_buffer_alloc(vocab_size * sizeof(float));
 
-    /* Allocate KV cache */
-    ctx->k_cache = (float **)calloc(model->n_layers, sizeof(float *));
-    ctx->v_cache = (float **)calloc(model->n_layers, sizeof(float *));
-    size_t kv_layer_size = (size_t)ctx->cfg.max_seq_len * model->n_kv_heads * model->head_dim;
-    for (uint32_t l = 0; l < model->n_layers; l++) {
-        ctx->k_cache[l] = (float *)calloc(kv_layer_size, sizeof(float));
-        ctx->v_cache[l] = (float *)calloc(kv_layer_size, sizeof(float));
+    if (model->is_mla) {
+        ctx->qr         = myds_metal_buffer_alloc(model->q_lora_rank * sizeof(float));
+        ctx->qr_norm    = myds_metal_buffer_alloc(model->q_lora_rank * sizeof(float));
+        ctx->q          = myds_metal_buffer_alloc(model->n_heads * model->head_dim * sizeof(float));
+        ctx->kv_act     = myds_metal_buffer_alloc(model->head_dim * sizeof(float));
+        ctx->attn_heads = myds_metal_buffer_alloc(model->n_heads * model->head_dim * sizeof(float));
+        ctx->attn_low   = myds_metal_buffer_alloc((size_t)model->n_out_groups * model->out_group_rank * sizeof(float));
+
+        /* In MLA, latent KV cache stores only 1 latent vector of width head_dim per token */
+        ctx->k_cache = (float **)calloc(model->n_layers, sizeof(float *));
+        ctx->v_cache = NULL;
+        size_t kv_layer_size = (size_t)ctx->cfg.max_seq_len * model->head_dim;
+        for (uint32_t l = 0; l < model->n_layers; l++) {
+            ctx->k_cache[l] = (float *)calloc(kv_layer_size, sizeof(float));
+        }
+    } else {
+        ctx->q            = myds_metal_buffer_alloc(model->n_heads * model->head_dim * sizeof(float));
+        ctx->k            = myds_metal_buffer_alloc(model->n_kv_heads * model->head_dim * sizeof(float));
+        ctx->v            = myds_metal_buffer_alloc(model->n_kv_heads * model->head_dim * sizeof(float));
+        ctx->attn_scores  = myds_metal_buffer_alloc(ctx->cfg.max_seq_len * sizeof(float));
+
+        ctx->k_cache = (float **)calloc(model->n_layers, sizeof(float *));
+        ctx->v_cache = (float **)calloc(model->n_layers, sizeof(float *));
+        size_t kv_layer_size = (size_t)ctx->cfg.max_seq_len * model->n_kv_heads * model->head_dim;
+        for (uint32_t l = 0; l < model->n_layers; l++) {
+            ctx->k_cache[l] = (float *)calloc(kv_layer_size, sizeof(float));
+            ctx->v_cache[l] = (float *)calloc(kv_layer_size, sizeof(float));
+        }
     }
 
     ctx->pos = 0;
@@ -547,6 +874,11 @@ void myds_context_free(myds_context_t *ctx) {
     if (ctx->q)            myds_metal_buffer_free(ctx->q);
     if (ctx->k)            myds_metal_buffer_free(ctx->k);
     if (ctx->v)            myds_metal_buffer_free(ctx->v);
+    if (ctx->qr)           myds_metal_buffer_free(ctx->qr);
+    if (ctx->qr_norm)      myds_metal_buffer_free(ctx->qr_norm);
+    if (ctx->kv_act)       myds_metal_buffer_free(ctx->kv_act);
+    if (ctx->attn_heads)   myds_metal_buffer_free(ctx->attn_heads);
+    if (ctx->attn_low)     myds_metal_buffer_free(ctx->attn_low);
     if (ctx->attn_scores)  myds_metal_buffer_free(ctx->attn_scores);
     if (ctx->attn_out)     myds_metal_buffer_free(ctx->attn_out);
     if (ctx->ffn_norm_out) myds_metal_buffer_free(ctx->ffn_norm_out);
@@ -655,102 +987,176 @@ int32_t myds_forward_token(myds_context_t *ctx, int32_t token_id, uint32_t pos) 
     for (uint32_t l = 0; l < m->n_layers; l++) {
         myds_layer_t *layer = &m->layers[l];
 
-        /* Pre-Attention RMSNorm */
-        if (layer->attn_norm) {
-            myds_metal_rmsnorm(ctx->x_norm, ctx->x, layer->attn_norm, dim, m->norm_eps);
+        if (m->is_mla) {
+            /* =========================================================
+             * Multi-Head Latent Attention (MLA)
+             * ========================================================= */
+
+            /* 1. Pre-Attention RMSNorm */
+            if (layer->attn_norm) {
+                myds_metal_rmsnorm(ctx->x_norm, ctx->x, layer->attn_norm, dim, m->norm_eps);
+            } else {
+                memcpy(myds_metal_buffer_data(ctx->x_norm), xv, dim * sizeof(float));
+            }
+
+            /* 2. Query LoRA down-projection: x_norm (dim) -> qr (q_lora_rank) */
+            if (!myds_metal_gemv(ctx->qr, layer->attn_q_a, ctx->x_norm, m->q_lora_rank, dim, layer->attn_q_a_type)) {
+                MYDS_LOG_E("Forward failed: GEMV for attn_q_a at layer %u failed", l);
+                return -1;
+            }
+
+            /* 3. Query LoRA RMSNorm: qr -> qr_norm */
+            const float *qr_v = (const float *)myds_metal_buffer_data(ctx->qr);
+            float *qr_norm_v = (float *)myds_metal_buffer_data(ctx->qr_norm);
+            const float *q_a_norm_w = (const float *)myds_metal_buffer_data(layer->attn_q_a_norm);
+            rms_norm_weight(qr_norm_v, qr_v, q_a_norm_w, m->q_lora_rank, m->norm_eps);
+
+            /* 4. Query up-projection: qr_norm (q_lora_rank) -> q (n_heads * head_dim) */
+            if (!myds_metal_gemv(ctx->q, layer->attn_q_b, ctx->qr_norm, m->n_heads * m->head_dim, m->q_lora_rank, layer->attn_q_b_type)) {
+                MYDS_LOG_E("Forward failed: GEMV for attn_q_b at layer %u failed", l);
+                return -1;
+            }
+            float *qv = (float *)myds_metal_buffer_data(ctx->q);
+            head_rms_norm_inplace(qv, m->n_heads, m->head_dim, m->norm_eps);
+
+            /* 5. Latent KV projection: x_norm (dim) -> kv_act (head_dim) */
+            if (!myds_metal_gemv(ctx->kv_act, layer->attn_kv, ctx->x_norm, m->head_dim, dim, layer->attn_kv_type)) {
+                MYDS_LOG_E("Forward failed: GEMV for attn_kv at layer %u failed", l);
+                return -1;
+            }
+            float *kv_v = (float *)myds_metal_buffer_data(ctx->kv_act);
+            const float *kv_a_norm_w = (const float *)myds_metal_buffer_data(layer->attn_kv_a_norm);
+            rms_norm_weight(kv_v, kv_v, kv_a_norm_w, m->head_dim, m->norm_eps);
+
+            /* 6. Tail RoPE on Q (all heads) and KV (1 head) */
+            rope_tail_inplace(qv, m->n_heads, m->head_dim, m->qk_rope_head_dim, pos, m->freq_base, m->freq_scale, false);
+            rope_tail_inplace(kv_v, 1, m->head_dim, m->qk_rope_head_dim, pos, m->freq_base, m->freq_scale, false);
+
+            /* 7. Push to latent KV cache: 512 floats per token per layer */
+            memcpy(ctx->k_cache[l] + (size_t)pos * m->head_dim, kv_v, m->head_dim * sizeof(float));
+
+            /* 8. Sink-aware Multi-Head Attention over latent KV cache */
+            float *heads_v = (float *)myds_metal_buffer_data(ctx->attn_heads);
+            const float *sinks_w = layer->attn_sinks ? (const float *)myds_metal_buffer_data(layer->attn_sinks) : NULL;
+            layer_attention_sinks(heads_v, sinks_w, qv, ctx->k_cache[l], pos + 1, m->n_heads, m->head_dim);
+
+            /* 9. Inverse RoPE on attention output heads tail */
+            rope_tail_inplace(heads_v, m->n_heads, m->head_dim, m->qk_rope_head_dim, pos, m->freq_base, m->freq_scale, true);
+
+            /* 10. Grouped attention output down-projection: heads -> attn_low */
+            float *low_v = (float *)myds_metal_buffer_data(ctx->attn_low);
+            uint32_t group_dim = (m->n_heads / m->n_out_groups) * m->head_dim;
+            matvec_grouped_rows(low_v, layer->attn_output_a, heads_v, m->n_out_groups, group_dim, m->out_group_rank, layer->attn_output_a_type);
+
+            /* 11. Attention output up-projection: attn_low -> attn_out (dim) */
+            if (!myds_metal_gemv(ctx->attn_out, layer->attn_output_b, ctx->attn_low, dim, m->n_out_groups * m->out_group_rank, layer->attn_output_b_type)) {
+                MYDS_LOG_E("Forward failed: GEMV for attn_output_b at layer %u failed", l);
+                return -1;
+            }
+
+            /* Residual connection: x = x + attn_out */
+            myds_metal_add(ctx->x, ctx->x, ctx->attn_out, dim);
         } else {
-            memcpy(myds_metal_buffer_data(ctx->x_norm), xv, dim * sizeof(float));
-        }
-
-        /* Q, K, V projections */
-        if (layer->attn_q) {
-            if (!myds_metal_gemv(ctx->q, layer->attn_q, ctx->x_norm, n_heads * head_dim, dim, layer->attn_q_type)) {
-                MYDS_LOG_E("Forward failed: GEMV for attn_q at layer %u failed", l);
-                return -1;
-            }
-        }
-        if (layer->attn_k) {
-            if (!myds_metal_gemv(ctx->k, layer->attn_k, ctx->x_norm, n_kv_heads * head_dim, dim, layer->attn_k_type)) {
-                MYDS_LOG_E("Forward failed: GEMV for attn_k at layer %u failed", l);
-                return -1;
-            }
-        }
-        if (layer->attn_v) {
-            if (!myds_metal_gemv(ctx->v, layer->attn_v, ctx->x_norm, n_kv_heads * head_dim, dim, layer->attn_v_type)) {
-                MYDS_LOG_E("Forward failed: GEMV for attn_v at layer %u failed", l);
-                return -1;
-            }
-        }
-
-        /* Decoupled RoPE on Q & K */
-        myds_metal_rope(ctx->q, ctx->k, n_heads, head_dim, pos, m->freq_base, m->freq_scale);
-
-        /* Write into KV Cache */
-        float *cur_k = (float *)myds_metal_buffer_data(ctx->k);
-        float *cur_v = (float *)myds_metal_buffer_data(ctx->v);
-        size_t kv_stride = n_kv_heads * head_dim;
-        memcpy(ctx->k_cache[l] + (size_t)pos * kv_stride, cur_k, kv_stride * sizeof(float));
-        memcpy(ctx->v_cache[l] + (size_t)pos * kv_stride, cur_v, kv_stride * sizeof(float));
-
-        /* Multi-Head Attention computation */
-        float *qv = (float *)myds_metal_buffer_data(ctx->q);
-        float *attn_out_v = (float *)myds_metal_buffer_data(ctx->attn_out);
-        memset(attn_out_v, 0, dim * sizeof(float));
-
-        float scale_attn = 1.0f / sqrtf((float)head_dim);
-        uint32_t kv_mul = n_heads / n_kv_heads;
-
-        for (uint32_t h = 0; h < n_heads; h++) {
-            uint32_t kv_h = h / kv_mul;
-            float *q_head = qv + h * head_dim;
-
-            /* Attention scores */
-            float *scores = (float *)myds_metal_buffer_data(ctx->attn_scores);
-            float max_s = -INFINITY;
-            for (uint32_t t = 0; t <= pos; t++) {
-                const float *k_head = ctx->k_cache[l] + (size_t)t * kv_stride + kv_h * head_dim;
-                float dot = 0.0f;
-                for (uint32_t d = 0; d < head_dim; d++) {
-                    dot += q_head[d] * k_head[d];
-                }
-                scores[t] = dot * scale_attn;
-                if (scores[t] > max_s) max_s = scores[t];
+            /* =========================================================
+             * Multi-Head Attention (MHA / GQA)
+             * ========================================================= */
+            /* Pre-Attention RMSNorm */
+            if (layer->attn_norm) {
+                myds_metal_rmsnorm(ctx->x_norm, ctx->x, layer->attn_norm, dim, m->norm_eps);
+            } else {
+                memcpy(myds_metal_buffer_data(ctx->x_norm), xv, dim * sizeof(float));
             }
 
-            /* Softmax */
-            float sum_exp = 0.0f;
-            for (uint32_t t = 0; t <= pos; t++) {
-                scores[t] = expf(scores[t] - max_s);
-                sum_exp += scores[t];
-            }
-            float inv_sum = 1.0f / sum_exp;
-            for (uint32_t t = 0; t <= pos; t++) {
-                scores[t] *= inv_sum;
-            }
-
-            /* Value weighted sum */
-            float *out_head = attn_out_v + h * head_dim;
-            for (uint32_t t = 0; t <= pos; t++) {
-                const float *v_head = ctx->v_cache[l] + (size_t)t * kv_stride + kv_h * head_dim;
-                float weight = scores[t];
-                for (uint32_t d = 0; d < head_dim; d++) {
-                    out_head[d] += weight * v_head[d];
+            /* Q, K, V projections */
+            if (layer->attn_q) {
+                if (!myds_metal_gemv(ctx->q, layer->attn_q, ctx->x_norm, n_heads * head_dim, dim, layer->attn_q_type)) {
+                    MYDS_LOG_E("Forward failed: GEMV for attn_q at layer %u failed", l);
+                    return -1;
                 }
             }
-        }
+            if (layer->attn_k) {
+                if (!myds_metal_gemv(ctx->k, layer->attn_k, ctx->x_norm, n_kv_heads * head_dim, dim, layer->attn_k_type)) {
+                    MYDS_LOG_E("Forward failed: GEMV for attn_k at layer %u failed", l);
+                    return -1;
+                }
+            }
+            if (layer->attn_v) {
+                if (!myds_metal_gemv(ctx->v, layer->attn_v, ctx->x_norm, n_kv_heads * head_dim, dim, layer->attn_v_type)) {
+                    MYDS_LOG_E("Forward failed: GEMV for attn_v at layer %u failed", l);
+                    return -1;
+                }
+            }
 
-        /* Output projection */
-        if (layer->attn_o) {
-            myds_metal_buffer_t *tmp_out = myds_metal_buffer_alloc(dim * sizeof(float));
-            if (!tmp_out) return -1;
-            if (!myds_metal_gemv(tmp_out, layer->attn_o, ctx->attn_out, dim, n_heads * head_dim, layer->attn_o_type)) {
-                MYDS_LOG_E("Forward failed: GEMV for attn_o at layer %u failed", l);
+            /* Decoupled RoPE on Q & K */
+            myds_metal_rope(ctx->q, ctx->k, n_heads, head_dim, pos, m->freq_base, m->freq_scale);
+
+            /* Write into KV Cache */
+            float *cur_k = (float *)myds_metal_buffer_data(ctx->k);
+            float *cur_v = (float *)myds_metal_buffer_data(ctx->v);
+            size_t kv_stride = n_kv_heads * head_dim;
+            memcpy(ctx->k_cache[l] + (size_t)pos * kv_stride, cur_k, kv_stride * sizeof(float));
+            memcpy(ctx->v_cache[l] + (size_t)pos * kv_stride, cur_v, kv_stride * sizeof(float));
+
+            /* Multi-Head Attention computation */
+            float *qv = (float *)myds_metal_buffer_data(ctx->q);
+            float *attn_out_v = (float *)myds_metal_buffer_data(ctx->attn_out);
+            memset(attn_out_v, 0, dim * sizeof(float));
+
+            float scale_attn = 1.0f / sqrtf((float)head_dim);
+            uint32_t kv_mul = n_heads / n_kv_heads;
+
+            for (uint32_t h = 0; h < n_heads; h++) {
+                uint32_t kv_h = h / kv_mul;
+                float *q_head = qv + h * head_dim;
+
+                /* Attention scores */
+                float *scores = (float *)myds_metal_buffer_data(ctx->attn_scores);
+                float max_s = -INFINITY;
+                for (uint32_t t = 0; t <= pos; t++) {
+                    const float *k_head = ctx->k_cache[l] + (size_t)t * kv_stride + kv_h * head_dim;
+                    float dot = 0.0f;
+                    for (uint32_t d = 0; d < head_dim; d++) {
+                        dot += q_head[d] * k_head[d];
+                    }
+                    scores[t] = dot * scale_attn;
+                    if (scores[t] > max_s) max_s = scores[t];
+                }
+
+                /* Softmax */
+                float sum_exp = 0.0f;
+                for (uint32_t t = 0; t <= pos; t++) {
+                    scores[t] = expf(scores[t] - max_s);
+                    sum_exp += scores[t];
+                }
+                float inv_sum = 1.0f / sum_exp;
+                for (uint32_t t = 0; t <= pos; t++) {
+                    scores[t] *= inv_sum;
+                }
+
+                /* Value weighted sum */
+                float *out_head = attn_out_v + h * head_dim;
+                for (uint32_t t = 0; t <= pos; t++) {
+                    const float *v_head = ctx->v_cache[l] + (size_t)t * kv_stride + kv_h * head_dim;
+                    float weight = scores[t];
+                    for (uint32_t d = 0; d < head_dim; d++) {
+                        out_head[d] += weight * v_head[d];
+                    }
+                }
+            }
+
+            /* Output projection */
+            if (layer->attn_o) {
+                myds_metal_buffer_t *tmp_out = myds_metal_buffer_alloc(dim * sizeof(float));
+                if (!tmp_out) return -1;
+                if (!myds_metal_gemv(tmp_out, layer->attn_o, ctx->attn_out, dim, n_heads * head_dim, layer->attn_o_type)) {
+                    MYDS_LOG_E("Forward failed: GEMV for attn_o at layer %u failed", l);
+                    myds_metal_buffer_free(tmp_out);
+                    return -1;
+                }
+                /* Residual connection: x = x + attn_output */
+                myds_metal_add(ctx->x, ctx->x, tmp_out, dim);
                 myds_metal_buffer_free(tmp_out);
-                return -1;
             }
-            /* Residual connection: x = x + attn_output */
-            myds_metal_add(ctx->x, ctx->x, tmp_out, dim);
-            myds_metal_buffer_free(tmp_out);
         }
 
         /* Pre-FFN RMSNorm */
