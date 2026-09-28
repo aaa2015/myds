@@ -1225,15 +1225,12 @@ int32_t myds_sample_next_token(
         return best_id;
     }
 
-    /* 2. Buffer acquisition (zero malloc churn when ctx is provided) */
-    float *probs = (ctx && ctx->sample_probs) ? ctx->sample_probs : (float *)malloc(vocab_size * sizeof(float));
-    int32_t *indices = (ctx && ctx->sample_indices) ? ctx->sample_indices : (int32_t *)malloc(vocab_size * sizeof(int32_t));
-
-    /* 3. Copy logits and apply repetition penalty */
+    /* 2. Repetition penalty check & max logit search in single linear pass */
     float max_l = -INFINITY;
+    bool has_rep_pen = (rep_pen > 1.0f && prev_tokens && n_prev_tokens > 0);
     for (uint32_t i = 0; i < vocab_size; i++) {
         float l = logits[i];
-        if (rep_pen > 1.0f && prev_tokens && n_prev_tokens > 0) {
+        if (has_rep_pen) {
             for (size_t p = 0; p < n_prev_tokens; p++) {
                 if (prev_tokens[p] == (int32_t)i) {
                     l = (l > 0.0f) ? (l / rep_pen) : (l * rep_pen);
@@ -1241,45 +1238,32 @@ int32_t myds_sample_next_token(
                 }
             }
         }
-        probs[i] = l;
         if (l > max_l) max_l = l;
-        indices[i] = (int32_t)i;
     }
 
-    /* 4. Temperature scaling and Softmax with -20.0f cutoff threshold */
+    /* 3. Buffer acquisition and single-pass candidate collection (diff >= -20.0f) */
+    float *probs = (ctx && ctx->sample_probs) ? ctx->sample_probs : (float *)malloc(vocab_size * sizeof(float));
+    int32_t *indices = (ctx && ctx->sample_indices) ? ctx->sample_indices : (int32_t *)malloc(vocab_size * sizeof(int32_t));
+
     float inv_temp = 1.0f / temp;
     float sum_exp = 0.0f;
-    for (uint32_t i = 0; i < vocab_size; i++) {
-        float diff = (probs[i] - max_l) * inv_temp;
-        if (diff < -20.0f) {
-            probs[i] = 0.0f;
-        } else {
-            float e = expf(diff);
-            probs[i] = e;
-            sum_exp += e;
-        }
-    }
-    float inv_sum = 1.0f / (sum_exp > 0.0f ? sum_exp : 1.0f);
-    float max_prob = 0.0f;
-    for (uint32_t i = 0; i < vocab_size; i++) {
-        probs[i] *= inv_sum;
-        if (probs[i] > max_prob) max_prob = probs[i];
-    }
-
-    /* 5. Min-P filtering */
-    if (min_p > 0.0f && min_p <= 1.0f) {
-        float min_thresh = max_prob * min_p;
-        for (uint32_t i = 0; i < vocab_size; i++) {
-            if (probs[i] < min_thresh) probs[i] = 0.0f;
-        }
-    }
-
-    /* 6. Collect non-zero candidate items for Top-K / Top-P */
     uint32_t n_cands = 0;
     for (uint32_t i = 0; i < vocab_size; i++) {
-        if (probs[i] > 1e-8f) {
+        float l = logits[i];
+        if (has_rep_pen) {
+            for (size_t p = 0; p < n_prev_tokens; p++) {
+                if (prev_tokens[p] == (int32_t)i) {
+                    l = (l > 0.0f) ? (l / rep_pen) : (l * rep_pen);
+                    break;
+                }
+            }
+        }
+        float diff = (l - max_l) * inv_temp;
+        if (diff >= -20.0f) {
+            float e = expf(diff);
+            probs[n_cands] = e;
             indices[n_cands] = (int32_t)i;
-            probs[n_cands] = probs[i];
+            sum_exp += e;
             n_cands++;
         }
     }
@@ -1287,6 +1271,32 @@ int32_t myds_sample_next_token(
     if (n_cands == 0) {
         if (!ctx || !ctx->sample_probs) { free(probs); free(indices); }
         return 0;
+    }
+
+    /* 4. Normalize candidate probabilities */
+    float inv_sum = 1.0f / (sum_exp > 0.0f ? sum_exp : 1.0f);
+    float max_prob = 0.0f;
+    for (uint32_t i = 0; i < n_cands; i++) {
+        probs[i] *= inv_sum;
+        if (probs[i] > max_prob) max_prob = probs[i];
+    }
+
+    /* 5. Min-P filtering on candidate pool */
+    if (min_p > 0.0f && min_p <= 1.0f) {
+        float min_thresh = max_prob * min_p;
+        uint32_t kept = 0;
+        for (uint32_t i = 0; i < n_cands; i++) {
+            if (probs[i] >= min_thresh) {
+                probs[kept] = probs[i];
+                indices[kept] = indices[i];
+                kept++;
+            }
+        }
+        n_cands = kept;
+        if (n_cands == 0) {
+            if (!ctx || !ctx->sample_probs) { free(probs); free(indices); }
+            return 0;
+        }
     }
 
     myds_cand_t stack_cands[1024];
