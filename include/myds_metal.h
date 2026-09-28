@@ -145,6 +145,11 @@ uint64_t myds_metal_get_commit_count(void);
 void     myds_metal_barrier(void);
 void     myds_metal_set_auto_barrier(int enable);
 
+/* Shared Event management for overlapping router gate with shared expert */
+int      myds_metal_signal_event(uint64_t *out_val);
+int      myds_metal_wait_event(uint64_t val);
+int      myds_metal_commit_and_wait_event(uint64_t val);
+
 /* Synchronize GPU command queue */
 int myds_metal_synchronize(void);
 

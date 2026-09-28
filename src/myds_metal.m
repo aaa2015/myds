@@ -40,6 +40,8 @@ static id<MTLComputePipelineState> g_pso_moe_sum6_q2_k = nil;
 static id<MTLComputePipelineState> g_pso_moe_slots6_pair_swiglu_iq2_xxs = nil;
 static id<MTLComputePipelineState> g_pso_moe_slots6_sum6_q2_k = nil;
 static id<MTLComputePipelineState> g_pso_attn_out_low_q8_0 = nil;
+static id<MTLSharedEvent>          g_shared_event = nil;
+static uint64_t                    g_shared_event_val = 0;
 static bool                        g_initialized = false;
 static NSCache                    *g_exact_view_cache = nil;
 
@@ -390,12 +392,15 @@ void myds_metal_cleanup(void) {
     g_pso_moe_slots6_pair_swiglu_iq2_xxs = nil;
     g_pso_moe_slots6_sum6_q2_k = nil;
     g_pso_attn_out_low_q8_0 = nil;
+    g_shared_event = nil;
+    g_shared_event_val = 0;
     g_library = nil;
     g_queue = nil;
     g_device = nil;
     g_exact_view_cache = nil;
     g_initialized = false;
 }
+
 
 int myds_metal_begin_batch(void) {
     if (!g_queue && !myds_metal_init(NULL)) return 0;
@@ -413,6 +418,42 @@ int myds_metal_commit_batch(void) {
     [cb commit];
     [cb waitUntilCompleted];
     g_batch_commit_count++;
+    return 1;
+}
+
+int myds_metal_signal_event(uint64_t *out_val) {
+    if (!g_batch_cb) return 0;
+    close_compute_encoder();
+    if (!g_shared_event) {
+        g_shared_event = [g_device newSharedEvent];
+        if (!g_shared_event) return 0;
+    }
+    uint64_t val = ++g_shared_event_val;
+    [g_batch_cb encodeSignalEvent:g_shared_event value:val];
+    if (out_val) *out_val = val;
+    return 1;
+}
+
+int myds_metal_wait_event(uint64_t val) {
+    if (!g_batch_cb || !g_shared_event || val == 0) return 0;
+    close_compute_encoder();
+    [g_batch_cb encodeWaitForEvent:g_shared_event value:val];
+    return 1;
+}
+
+int myds_metal_commit_and_wait_event(uint64_t val) {
+    if (!g_batch_cb) return 0;
+    close_compute_encoder();
+    id<MTLCommandBuffer> cb = g_batch_cb;
+    g_batch_cb = nil;
+    [cb commit];
+    g_batch_commit_count++;
+    if (!g_shared_event) return 0;
+    BOOL signaled = [g_shared_event waitUntilSignaledValue:val timeoutMS:60000];
+    if (!signaled) {
+        fprintf(stderr, "myds_metal: timeout waiting for shared event value %llu\n", (unsigned long long)val);
+        return 0;
+    }
     return 1;
 }
 

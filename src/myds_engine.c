@@ -59,15 +59,11 @@ static inline float dot_f32(const float *a, const float *b, uint32_t n) {
     uint32_t i = 0;
     float32x4_t acc0 = vdupq_n_f32(0.0f);
     float32x4_t acc1 = vdupq_n_f32(0.0f);
-    float32x4_t acc2 = vdupq_n_f32(0.0f);
-    float32x4_t acc3 = vdupq_n_f32(0.0f);
-    for (; i + 16 <= n; i += 16) {
-        acc0 = vfmaq_f32(acc0, vld1q_f32(a + i + 0),  vld1q_f32(b + i + 0));
-        acc1 = vfmaq_f32(acc1, vld1q_f32(a + i + 4),  vld1q_f32(b + i + 4));
-        acc2 = vfmaq_f32(acc2, vld1q_f32(a + i + 8),  vld1q_f32(b + i + 8));
-        acc3 = vfmaq_f32(acc3, vld1q_f32(a + i + 12), vld1q_f32(b + i + 12));
+    for (; i + 8 <= n; i += 8) {
+        acc0 = vfmaq_f32(acc0, vld1q_f32(a + i),     vld1q_f32(b + i));
+        acc1 = vfmaq_f32(acc1, vld1q_f32(a + i + 4), vld1q_f32(b + i + 4));
     }
-    float acc = vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
+    float acc = vaddvq_f32(vaddq_f32(acc0, acc1));
     for (; i < n; i++) acc += a[i] * b[i];
     return acc;
 #else
@@ -81,11 +77,9 @@ static inline void axpy_f32(float *y, const float *x, float a, uint32_t n) {
 #if defined(__ARM_NEON)
     uint32_t i = 0;
     const float32x4_t av = vdupq_n_f32(a);
-    for (; i + 16 <= n; i += 16) {
-        vst1q_f32(y + i + 0,  vfmaq_f32(vld1q_f32(y + i + 0),  av, vld1q_f32(x + i + 0)));
-        vst1q_f32(y + i + 4,  vfmaq_f32(vld1q_f32(y + i + 4),  av, vld1q_f32(x + i + 4)));
-        vst1q_f32(y + i + 8,  vfmaq_f32(vld1q_f32(y + i + 8),  av, vld1q_f32(x + i + 8)));
-        vst1q_f32(y + i + 12, vfmaq_f32(vld1q_f32(y + i + 12), av, vld1q_f32(x + i + 12)));
+    for (; i + 8 <= n; i += 8) {
+        vst1q_f32(y + i,     vfmaq_f32(vld1q_f32(y + i),     av, vld1q_f32(x + i)));
+        vst1q_f32(y + i + 4, vfmaq_f32(vld1q_f32(y + i + 4), av, vld1q_f32(x + i + 4)));
     }
     for (; i < n; i++) y[i] += a * x[i];
 #else
@@ -1391,8 +1385,17 @@ static int execute_ffn_layer(
             return 0;
         }
 
-        /* If shared expert is present, also enqueue shared_gate, shared_up, and swiglu into Batch 2 */
-        if (layer->shared_gate && layer->shared_up && ctx->shared_out) {
+        /* Signal router_event immediately after router_gate is queued */
+        uint64_t router_event = 0;
+        if (!myds_metal_signal_event(&router_event)) {
+            MYDS_LOG_E("Forward failed: signal router_event at layer %u failed", l);
+            myds_metal_commit_batch();
+            return 0;
+        }
+
+        /* In the SAME command buffer, enqueue the entire shared expert: gate, up, swiglu, and down */
+        uint64_t shexp_event = 0;
+        if (layer->shared_gate && layer->shared_up && layer->shared_down && ctx->shared_out) {
             if (!myds_metal_gemv(ctx->shared_gate_out, layer->shared_gate, ctx->ffn_norm_out, exp_dim, dim, layer->shared_gate_type) ||
                 !myds_metal_gemv(ctx->shared_up_out, layer->shared_up, ctx->ffn_norm_out, exp_dim, dim, layer->shared_up_type)) {
                 MYDS_LOG_E("Forward failed: GEMV for shared_gate/up at layer %u failed", l);
@@ -1400,10 +1403,19 @@ static int execute_ffn_layer(
                 return 0;
             }
             myds_metal_swiglu(ctx->shared_swiglu_out, ctx->shared_gate_out, ctx->shared_up_out, exp_dim);
+            if (!myds_metal_gemv(ctx->shared_out, layer->shared_down, ctx->shared_swiglu_out, dim, exp_dim, layer->shared_down_type)) {
+                MYDS_LOG_E("Forward failed: GEMV for shared_down at layer %u failed", l);
+                myds_metal_commit_batch();
+                return 0;
+            }
+            myds_metal_signal_event(&shexp_event);
         }
 
-        /* Commit Batch 2: attn_out_a, attn_out_b, residual add, ffn_norm, router_gate, and shared gate/up/swiglu in ONE command buffer */
-        myds_metal_commit_batch();
+        /* Commit Batch 2 and wait ONLY for router_event (~8 us GEMV math), eliminating full GPU drain bubble */
+        if (!myds_metal_commit_and_wait_event(router_event)) {
+            MYDS_LOG_E("Forward failed: commit and wait for router_event at layer %u failed", l);
+            return 0;
+        }
         if (do_ffn_prof) gettimeofday(&tf1, NULL);
 
         int32_t *sel_ids = (int32_t *)myds_metal_buffer_data(ctx->selected_ids);
@@ -1421,8 +1433,11 @@ static int execute_ffn_layer(
         }
         if (do_ffn_prof) gettimeofday(&tf2, NULL);
 
-        /* Dispatch GPU MoE execution: gate/up (IQ2_XXS) -> SwiGLU -> down (Q2_K) -> sum6 */
+        /* Begin Batch 3: routed MoE + combine with shared expert */
         myds_metal_begin_batch();
+        if (shexp_event > 0) {
+            myds_metal_wait_event(shexp_event);
+        }
         if (!myds_metal_routed_moe(
                 ctx->moe_out,
                 ctx->ffn_norm_out,
@@ -1448,13 +1463,8 @@ static int execute_ffn_layer(
             return 0;
         }
 
-        /* Complete shared expert down-projection in Batch 3 */
+        /* Combine shared expert output with routed expert output */
         if (layer->shared_gate && layer->shared_up && layer->shared_down && ctx->shared_out) {
-            if (!myds_metal_gemv(ctx->shared_out, layer->shared_down, ctx->shared_swiglu_out, dim, exp_dim, layer->shared_down_type)) {
-                MYDS_LOG_E("Forward failed: GEMV for shared_down at layer %u failed", l);
-                myds_metal_commit_batch();
-                return 0;
-            }
             myds_metal_add(ctx->moe_out, ctx->moe_out, ctx->shared_out, dim);
         }
 
