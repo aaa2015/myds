@@ -119,7 +119,23 @@ myds_model_t *myds_model_load(const char *model_path) {
     m->gf = gf;
     m->tokenizer = myds_tokenizer_load(gf);
 
-    const char *arch = gguf_get_str(gf, "general.architecture", "deepseek2");
+    const char *arch = gguf_get_str(gf, "general.architecture", "deepseek41");
+
+    /* Validate architecture: exclusively supports DeepSeek V4 / V4.1 (V2/V3 removed) */
+    if (!myds_is_supported_arch(arch)) {
+        if (strcmp(arch, "deepseek2") == 0 || strcmp(arch, "deepseek3") == 0 ||
+            strcmp(arch, "deepseek") == 0 || strcmp(arch, "deepseek-v2") == 0 ||
+            strcmp(arch, "deepseek-v3") == 0) {
+            MYDS_LOG_E("Architecture '%s' rejected: DeepSeek V2 and V3 support has been removed. myds exclusively supports DeepSeek V4 / V4.1.", arch);
+        } else {
+            MYDS_LOG_E("Architecture '%s' rejected: myds exclusively supports DeepSeek V4 / V4.1 (expected 'deepseek41' or 'deepseek4*').", arch);
+        }
+        if (m->tokenizer) myds_tokenizer_free(m->tokenizer);
+        free(m);
+        gguf_close(gf);
+        return NULL;
+    }
+
     strncpy(m->arch, arch, sizeof(m->arch) - 1);
 
     char key_buf[128];
@@ -292,7 +308,7 @@ void myds_model_free(myds_model_t *m) {
 void myds_model_print_info(const myds_model_t *m) {
     if (!m) return;
     printf("====================================================\n");
-    printf(" DeepSeek Model Information\n");
+    printf(" DeepSeek V4 / V4.1 Model Information\n");
     printf("====================================================\n");
     printf(" Architecture : %s\n", m->arch);
     printf(" Layers       : %u\n", m->n_layers);

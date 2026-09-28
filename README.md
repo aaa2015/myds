@@ -1,17 +1,18 @@
-# myds: Minimal DeepSeek Inference Engine on Apple Silicon Metal
+# myds: Minimal DeepSeek V4 / V4.1 Inference Engine on Apple Silicon Metal
 
-`myds` 是一个专为 **DeepSeek** 系列模型量身打造的极简、高性能本地推理引擎。它完全基于 C / Objective-C 编写，去除了非 DeepSeek 架构的一切冗余代码，直接调用 Apple Silicon 原生 **Metal** 图形与计算框架加速，具备毫秒级冷启动、零拷贝内存映射与流式生成能力。
+`myds` 是一个专为 **DeepSeek V4 / V4.1** 系列模型量身打造的极简、高性能本地推理引擎（已移除对早期 DeepSeek V2、V3 架构的兼容支持，专注 V4/V4.1 极致算子调优）。它完全基于 C / Objective-C 编写，去除了非 DeepSeek 架构的一切冗余代码，直接调用 Apple Silicon 原生 **Metal** 图形与计算框架加速，具备毫秒级冷启动、零拷贝内存映射与流式生成能力。
 
 ---
 
 ## 核心特性
 
-- **专注于 DeepSeek 架构**：
+- **专注于 DeepSeek V4 / V4.1 架构（严格校验，拒绝 V2/V3）**：
   - **RMSNorm** 归一化加速
   - **MLA (Multi-head Latent Attention)** 解耦多头潜在注意力与低秩压缩 KV Cache
   - **Decoupled RoPE** 解耦旋转位置编码
   - **DeepSeekMoE** 混合专家网络（Shared Experts 共享专家 + Top-K 路由专家，Sigmoid 门控与权重重整化）
   - **SwiGLU** 激活函数融合计算
+  - **严格架构拦截**：原生仅支持 `deepseek41`、`deepseek4`、`deepseek4-dspark` 等 V4 系列，严格拦截并显式报错 legacy V2/V3 模型
 - **纯正 Apple Silicon Metal 驱动**：
   - 从 `ds4` 迁移并提炼出 20 个 DeepSeek 专有 `.metal` 着色器核函数
   - 利用统一内存架构（Unified Memory）通过 `MTLResourceStorageModeShared` 实现 CPU 与 GPU 之间零拷贝
@@ -52,18 +53,28 @@ myds/
 │   ├── sum_rows.metal                # 行求和归约
 │   └── unary.metal                   # 一元运算
 ├── include/                          # 头文件定义
-│   ├── myds.h                        # 推理引擎主接口 (模型加载、上下文、生成)
+│   ├── myds.h                        # 推理引擎主接口与 V4/V4.1 架构判定
 │   ├── myds_metal.h                  # Metal GPU 运行时与算子声明
 │   ├── myds_gguf.h                   # 极简 GGUF 格式解析器
-│   └── myds_tokenizer.h              # DeepSeek BPE 分词器
+│   ├── myds_tokenizer.h              # DeepSeek BPE 分词器
+│   ├── myds_server.h                 # HTTP 服务端
+│   └── myds_log.h                    # 微秒级线程安全结构化日志
 ├── src/                              # 核心源码
-│   ├── main.c                        # 极简命令行与交互终端入口
-│   ├── myds_engine.c                 # DeepSeek Transformer 前向传播流程
+│   ├── main.c                        # 命令行与交互终端入口
+│   ├── myds_engine.c                 # DeepSeek Transformer 前向传播流程与模型加载
 │   ├── myds_metal.m                  # Metal 运行时与 GPU 算子分发
 │   ├── myds_gguf.c                   # GGUF 格式解析与 mmap 内存映射
-│   └── myds_tokenizer.c              # BPE 编码与流式解码
+│   ├── myds_tokenizer.c              # BPE 编码与流式解码
+│   ├── myds_server.c                 # POSIX HTTP Server (OpenAI Responses / Chat)
+│   └── myds_log.c                    # 结构化日志实现
 └── tests/
-    └── test_metal.c                  # GPU 核心算子金标对齐与正确性测试
+    ├── test_metal.c                  # GPU 核心算子金标对齐测试
+    ├── test_gguf.c                   # GGUF 解析与 V4/V4.1 架构校验/V2/V3 拦截测试
+    ├── test_tokenizer.c              # BPE 分词与特殊 Token 测试
+    ├── test_server.c                 # HTTP 端点与并发连接测试
+    ├── test_server_api.c             # Responses API 与协议解析金标测试
+    ├── test_engine.c                 # 采样算法与 V4 架构判定单元测试
+    └── test_log.c                    # 结构化日志线程安全与过滤测试
 ```
 
 ---
@@ -78,7 +89,7 @@ myds/
 make
 ```
 
-将在 `bin/` 目录下生成 `myds` 主程序以及 `test_metal` 算子测试程序。
+将在 `bin/` 目录下生成 `myds` 主程序以及 7 个独立的测试程序。
 
 ### 2. 运行单元测试套件
 
@@ -86,12 +97,13 @@ make
 make test
 ```
 
-测试流程将自动编译并依次运行 3 个独立的单元测试套件，共计 17 项金标对齐测试：
+测试流程将自动编译并依次运行 7 个独立的单元测试套件：
 
 1. **GGUF 模型解析器测试套件 (`bin/test_gguf`)**：
    - [x] GGUF v2/v3 标量、字符串、布尔及动态数组元数据提取
    - [x] 张量描述信息校验与 32 字节对齐 mmap 内存映射验证
    - [x] 非法魔数（Magic）、损坏文件及不存在文件的容错处理
+   - [x] **DeepSeek V2 & V3 架构拦截校验**（严格拒绝 legacy V2/V3 模型）
 
 2. **DeepSeek BPE 分词器测试套件 (`bin/test_tokenizer`)**：
    - [x] 词表加载与 BOS/EOS 特殊 Token 识别
@@ -111,6 +123,23 @@ make test
    - [x] **Add** 残差加法与广播
    - [x] **Softmax** 归一化与单调性校验
    - [x] **Buffer R/W** 统一内存边界读写安全测试
+
+4. **HTTP 服务器并发测试套件 (`bin/test_server`)**：
+   - [x] Socket 生命周期与 HTTP 报文收发
+   - [x] 并发非阻塞请求测试
+
+5. **微秒级结构化日志测试套件 (`bin/test_log`)**：
+   - [x] 日志级别过滤 (DEBUG / INFO / WARN / ERROR)
+   - [x] 多线程并发无锁写入安全性测试
+
+6. **OpenAI Responses API 协议测试套件 (`bin/test_server_api`)**：
+   - [x] 端点路由匹配 (`/responses`, `/chat/completions`, `/health`, `/models`)
+   - [x] 复杂输入参数优先级解析 (`max_output_tokens` 优先于 `max_tokens`)
+   - [x] Responses API 流式 SSE 事件与非流式 JSON 响应规范金标对齐
+
+7. **推理引擎采样与架构判定测试套件 (`bin/test_engine`)**：
+   - [x] Greedy Argmax / Temperature / Softmax / Top-p 采样算法测试
+   - [x] **DeepSeek V4/V4.1 架构专有支持与 V2/V3 拦截测试**（`myds_is_supported_arch`）
 
 ---
 

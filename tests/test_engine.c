@@ -1,3 +1,4 @@
+#include "myds.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -143,6 +144,31 @@ int main(void) {
         float f_last = calculate_rope_freq(32, 64, 10000.0f);
         assert(fabsf(f_last - 0.0001f) < 1e-6f); /* 1.0 / (10000 ^ 1) == 0.0001 */
         printf("  [PASS] RoPE decoupled angular frequency calculation\n");
+    }
+
+    /* 6. DeepSeek V4/V4.1 Architecture Enforcement & V2/V3 Rejection */
+    {
+        /* DeepSeek V4 and V4.1 accepted architectures */
+        assert(myds_is_supported_arch("deepseek41") == true);
+        assert(myds_is_supported_arch("deepseek4") == true);
+        assert(myds_is_supported_arch("deepseek4-dspark") == true);
+        assert(myds_is_supported_arch("deepseek-v4") == true);
+        assert(myds_is_supported_arch("deepseek-v4.1") == true);
+
+        /* DeepSeek V2, V3, and legacy architectures explicitly rejected */
+        assert(myds_is_supported_arch("deepseek2") == false);
+        assert(myds_is_supported_arch("deepseek3") == false);
+        assert(myds_is_supported_arch("deepseek") == false);
+        assert(myds_is_supported_arch("deepseek-v2") == false);
+        assert(myds_is_supported_arch("deepseek-v3") == false);
+
+        /* Non-DeepSeek architectures rejected */
+        assert(myds_is_supported_arch("llama") == false);
+        assert(myds_is_supported_arch("qwen2") == false);
+        assert(myds_is_supported_arch("") == false);
+        assert(myds_is_supported_arch(NULL) == false);
+
+        printf("  [PASS] DeepSeek V4/V4.1 architecture enforcement & V2/V3 rejection\n");
     }
 
     printf("====================================================\n");

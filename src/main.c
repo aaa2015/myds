@@ -8,11 +8,11 @@
 #include <unistd.h>
 
 static void print_usage(const char *prog) {
-    printf("myds - Minimal DeepSeek Inference Engine on Apple Silicon Metal\n\n");
+    printf("myds - Minimal DeepSeek V4 / V4.1 Inference Engine on Apple Silicon Metal\n\n");
     printf("Usage:\n");
     printf("  %s -m <model.gguf> [options]\n\n", prog);
     printf("Options:\n");
-    printf("  -m, --model <path>      Path to DeepSeek GGUF model (required)\n");
+    printf("  -m, --model <path>      Path to DeepSeek V4/V4.1 GGUF model (required)\n");
     printf("  --port <port>           Run HTTP server on specified port\n");
     printf("  --host <host>           Host to listen on (default: 0.0.0.0)\n");
     printf("  --alias <name>          Model alias for API responses (default: myds)\n");
@@ -83,7 +83,7 @@ int main(int argc, char *argv[]) {
     }
 
     printf("====================================================\n");
-    printf("       myds: Minimal DeepSeek Inference Engine      \n");
+    printf("    myds: Minimal DeepSeek V4 / V4.1 Inference Engine   \n");
     printf("         Accelerated by Apple Silicon Metal         \n");
     printf("====================================================\n");
 

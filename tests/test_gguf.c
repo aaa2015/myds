@@ -1,3 +1,4 @@
+#include "myds.h"
 #include "myds_gguf.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,7 +37,8 @@ static void write_str(FILE *f, const char *s) {
 }
 
 /* Helper to generate a minimal valid synthetic GGUF v3 file */
-static const char *create_synthetic_gguf(const char *path) {
+static const char *create_synthetic_gguf(const char *path, const char *arch) {
+    if (!arch) arch = "deepseek41";
     FILE *f = fopen(path, "wb");
     if (!f) return NULL;
 
@@ -52,23 +54,27 @@ static const char *create_synthetic_gguf(const char *path) {
     write_u64(f, n_kvs);
 
     /* 2. Key-Values */
-    // kv 0: general.architecture (string) = "deepseek2"
+    // kv 0: general.architecture (string) = arch
     write_str(f, "general.architecture");
     write_u32(f, GGUF_TYPE_STRING);
-    write_str(f, "deepseek2");
+    write_str(f, arch);
 
-    // kv 1: deepseek2.embedding_length (u32) = 2048
-    write_str(f, "deepseek2.embedding_length");
+    char key_buf[128];
+    // kv 1: <arch>.embedding_length (u32) = 2048
+    snprintf(key_buf, sizeof(key_buf), "%s.embedding_length", arch);
+    write_str(f, key_buf);
     write_u32(f, GGUF_TYPE_UINT32);
     write_u32(f, 2048);
 
-    // kv 2: deepseek2.block_count (u32) = 28
-    write_str(f, "deepseek2.block_count");
+    // kv 2: <arch>.block_count (u32) = 28
+    snprintf(key_buf, sizeof(key_buf), "%s.block_count", arch);
+    write_str(f, key_buf);
     write_u32(f, GGUF_TYPE_UINT32);
     write_u32(f, 28);
 
-    // kv 3: deepseek2.rope.freq_base (f32) = 10000.0f
-    write_str(f, "deepseek2.rope.freq_base");
+    // kv 3: <arch>.rope.freq_base (f32) = 10000.0f
+    snprintf(key_buf, sizeof(key_buf), "%s.rope.freq_base", arch);
+    write_str(f, key_buf);
     write_u32(f, GGUF_TYPE_FLOAT32);
     write_f32(f, 10000.0f);
 
@@ -140,15 +146,16 @@ static int test_gguf_metadata_parsing(const char *path) {
 
     /* Test key lookups */
     const char *arch = gguf_get_str(gf, "general.architecture", "");
-    ASSERT_STR_EQ(arch, "deepseek2");
+    ASSERT_STR_EQ(arch, "deepseek41");
+    ASSERT_TRUE(myds_is_supported_arch(arch) == true);
 
-    uint32_t emb_len = gguf_get_u32(gf, "deepseek2.embedding_length", 0);
+    uint32_t emb_len = gguf_get_u32(gf, "deepseek41.embedding_length", 0);
     ASSERT_TRUE(emb_len == 2048);
 
-    uint32_t n_layers = gguf_get_u32(gf, "deepseek2.block_count", 0);
+    uint32_t n_layers = gguf_get_u32(gf, "deepseek41.block_count", 0);
     ASSERT_TRUE(n_layers == 28);
 
-    float freq_base = gguf_get_f32(gf, "deepseek2.rope.freq_base", 0.0f);
+    float freq_base = gguf_get_f32(gf, "deepseek41.rope.freq_base", 0.0f);
     ASSERT_NEAR(freq_base, 10000.0f, 1e-4f);
 
     bool flag = gguf_get_bool(gf, "test.flag", false);
@@ -222,13 +229,40 @@ static int test_gguf_error_handling(void) {
     return 1;
 }
 
+static int test_gguf_legacy_v2_v3_rejection(void) {
+    const char *v2_path = "/tmp/test_myds_v2.gguf";
+    const char *v3_path = "/tmp/test_myds_v3.gguf";
+
+    if (!create_synthetic_gguf(v2_path, "deepseek2")) return 0;
+    if (!create_synthetic_gguf(v3_path, "deepseek3")) return 0;
+
+    gguf_file_t *gf2 = gguf_open(v2_path);
+    ASSERT_TRUE(gf2 != NULL);
+    const char *arch2 = gguf_get_str(gf2, "general.architecture", "");
+    ASSERT_STR_EQ(arch2, "deepseek2");
+    ASSERT_TRUE(myds_is_supported_arch(arch2) == false);
+    gguf_close(gf2);
+    unlink(v2_path);
+
+    gguf_file_t *gf3 = gguf_open(v3_path);
+    ASSERT_TRUE(gf3 != NULL);
+    const char *arch3 = gguf_get_str(gf3, "general.architecture", "");
+    ASSERT_STR_EQ(arch3, "deepseek3");
+    ASSERT_TRUE(myds_is_supported_arch(arch3) == false);
+    gguf_close(gf3);
+    unlink(v3_path);
+
+    printf("  [PASS] GGUF DeepSeek V2 & V3 architecture rejection verification\n");
+    return 1;
+}
+
 int main(void) {
     printf("====================================================\n");
     printf("        Running myds GGUF Parser Unit Tests         \n");
     printf("====================================================\n");
 
     const char *temp_file = "/tmp/test_myds_synthetic.gguf";
-    if (!create_synthetic_gguf(temp_file)) {
+    if (!create_synthetic_gguf(temp_file, "deepseek41")) {
         fprintf(stderr, "Failed to create synthetic test GGUF file\n");
         return 1;
     }
@@ -237,16 +271,17 @@ int main(void) {
     passed += test_gguf_metadata_parsing(temp_file);
     passed += test_gguf_tensor_parsing(temp_file);
     passed += test_gguf_error_handling();
+    passed += test_gguf_legacy_v2_v3_rejection();
 
     unlink(temp_file);
 
     printf("====================================================\n");
-    if (passed == 3) {
+    if (passed == 4) {
         printf("  ALL GGUF PARSER UNIT TESTS PASSED!\n");
         printf("====================================================\n");
         return 0;
     } else {
-        printf("  GGUF TESTS FAILED (passed %d/3)\n", passed);
+        printf("  GGUF TESTS FAILED (passed %d/4)\n", passed);
         return 1;
     }
 }

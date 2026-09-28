@@ -4,10 +4,29 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* Architecture compatibility check: exclusively supports DeepSeek V4 / V4.1; V2 and V3 are rejected */
+static inline bool myds_is_supported_arch(const char *arch) {
+    if (!arch) return false;
+    /* Explicitly reject legacy DeepSeek V2 and V3 models */
+    if (strcmp(arch, "deepseek2") == 0 || strcmp(arch, "deepseek3") == 0 ||
+        strcmp(arch, "deepseek") == 0 || strcmp(arch, "deepseek-v2") == 0 ||
+        strcmp(arch, "deepseek-v3") == 0) {
+        return false;
+    }
+    /* Exclusively accept DeepSeek V4 / V4.1 architecture variants */
+    if (strncmp(arch, "deepseek4", 9) == 0 ||
+        strcmp(arch, "deepseek-v4") == 0 ||
+        strcmp(arch, "deepseek-v4.1") == 0) {
+        return true;
+    }
+    return false;
+}
 
 typedef struct myds_model myds_model_t;
 typedef struct myds_context myds_context_t;
