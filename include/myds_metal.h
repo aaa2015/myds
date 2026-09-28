@@ -142,6 +142,8 @@ int myds_metal_softmax(
 int      myds_metal_begin_batch(void);
 int      myds_metal_commit_batch(void);
 uint64_t myds_metal_get_commit_count(void);
+void     myds_metal_barrier(void);
+void     myds_metal_set_auto_barrier(int enable);
 
 /* Synchronize GPU command queue */
 int myds_metal_synchronize(void);

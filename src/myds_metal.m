@@ -76,6 +76,11 @@ static id<MTLBuffer> get_exact_buffer_view(const void *base_ptr, uint64_t offset
 static id<MTLCommandBuffer>         g_batch_cb = nil;
 static id<MTLComputeCommandEncoder> g_batch_enc = nil;
 static uint64_t                     g_batch_commit_count = 0;
+static int                          g_auto_barrier = 1;
+
+void myds_metal_set_auto_barrier(int enable) {
+    g_auto_barrier = enable;
+}
 
 static id<MTLComputeCommandEncoder> get_compute_encoder(id<MTLCommandBuffer> cb) {
     if (cb == g_batch_cb && g_batch_enc) {
@@ -86,6 +91,13 @@ static id<MTLComputeCommandEncoder> get_compute_encoder(id<MTLCommandBuffer> cb)
         g_batch_enc = enc;
     }
     return enc;
+}
+
+void myds_metal_barrier(void) {
+    if (g_batch_cb) {
+        id<MTLComputeCommandEncoder> enc = get_compute_encoder(g_batch_cb);
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    }
 }
 
 static void close_compute_encoder(void) {
@@ -549,7 +561,9 @@ int myds_metal_rmsnorm(
                 threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
 
             if (g_batch_cb) {
-                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                if (g_auto_barrier) {
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                }
             } else {
                 [enc endEncoding];
                 [cb commit];
@@ -665,7 +679,9 @@ int myds_metal_swiglu(
                 threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
 
             if (g_batch_cb) {
-                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                if (g_auto_barrier) {
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                }
             } else {
                 [enc endEncoding];
                 [cb commit];
@@ -791,7 +807,9 @@ int myds_metal_gemv(
                     threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
 
                 if (g_batch_cb) {
-                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                    if (g_auto_barrier) {
+                        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                    }
                 } else {
                     [enc endEncoding];
                     [cb commit];
@@ -871,7 +889,9 @@ int myds_metal_gemv(
                     threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
 
                 if (g_batch_cb) {
-                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                    if (g_auto_barrier) {
+                        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                    }
                 } else {
                     [enc endEncoding];
                     [cb commit];
@@ -937,7 +957,9 @@ int myds_metal_gemv(
                     threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
 
                 if (g_batch_cb) {
-                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                    if (g_auto_barrier) {
+                        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                    }
                 } else {
                     [enc endEncoding];
                     [cb commit];
@@ -1046,11 +1068,13 @@ int myds_metal_moe_route_biased(
     const float *logits = (const float *)router_logits->ptr;
     const float *bias = router_bias ? (const float *)router_bias->ptr : NULL;
 
-    float *probs = (float *)malloc(n_routed_experts * sizeof(float));
-    float *selection = (float *)malloc(n_routed_experts * sizeof(float));
+    float probs_stack[512];
+    float selection_stack[512];
+    float *probs = (n_routed_experts <= 512) ? probs_stack : (float *)malloc(n_routed_experts * sizeof(float));
+    float *selection = (n_routed_experts <= 512) ? selection_stack : (float *)malloc(n_routed_experts * sizeof(float));
     if (!probs || !selection) {
-        if (probs) free(probs);
-        if (selection) free(selection);
+        if (probs && probs != probs_stack) free(probs);
+        if (selection && selection != selection_stack) free(selection);
         return 0;
     }
 
@@ -1073,8 +1097,8 @@ int myds_metal_moe_route_biased(
         out_expert_weights[k] *= norm_factor;
     }
 
-    free(selection);
-    free(probs);
+    if (selection != selection_stack) free(selection);
+    if (probs != probs_stack) free(probs);
     return 1;
 }
 
@@ -1277,7 +1301,9 @@ int myds_metal_routed_moe(
                 threadsPerThreadgroup:MTLSizeMake(32, nsg_down, 1)];
 
             if (g_batch_cb) {
-                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                if (g_auto_barrier) {
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                }
             } else {
                 [enc endEncoding];
                 [cb commit];
@@ -1613,7 +1639,9 @@ int myds_metal_add(
                 threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
 
             if (g_batch_cb) {
-                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                if (g_auto_barrier) {
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                }
             } else {
                 [enc endEncoding];
                 [cb commit];
