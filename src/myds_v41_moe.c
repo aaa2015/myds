@@ -99,7 +99,7 @@ int myds_v41_moe(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t p
         l->ffn_gate_exps_type!=GGML_TYPE_IQ2_XXS ||
         l->ffn_up_exps_type!=GGML_TYPE_IQ2_XXS ||
         l->ffn_down_exps_type!=GGML_TYPE_Q2_K) return 0;
-    if (!myds_metal_gemv(ctx->router_logits,l->router_gate,ctx->ffn_norm_out,
+    if (!myds_metal_v41_gemv(ctx->router_logits,l->router_gate,ctx->ffn_norm_out,
                          m->n_routed_experts,dim,l->router_gate_type) ||
         !myds_trace_f32("route_logits",layer,pos,ctx->router_logits,m->n_routed_experts) ||
         !myds_v41_route(ctx->selected_ids,ctx->selected_weights,ctx->moe_gate,ctx->moe_up,

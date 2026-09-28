@@ -265,7 +265,7 @@ static int project(myds_metal_buffer_t *out, const myds_metal_buffer_t *w,
                    const myds_metal_buffer_t *in, uint32_t rows, uint32_t width,
                    ggml_type type, bool round) {
     myds_metal_barrier();
-    return (type == GGML_TYPE_F16
+    return ((type == GGML_TYPE_F16 || type == GGML_TYPE_F32)
         ? myds_metal_v41_gemv(out,w,in,rows,width,type)
         : myds_metal_gemv(out,w,in,rows,width,type)) &&
         (!round || myds_metal_v41_bf16(out,rows));

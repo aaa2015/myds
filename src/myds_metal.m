@@ -1239,13 +1239,27 @@ int myds_metal_gemv_batch(
         out_dim > INT32_MAX || in_dim > INT32_MAX || n_tok > INT32_MAX) return 0;
 
     id<MTLComputePipelineState> pipeline = nil;
-    uint64_t row_bytes;
-    uint64_t block_bytes;
+    uint64_t row_bytes = 0;
+    uint64_t block_bytes = 0;
+    uint32_t nsg = 4u;
     if (weight_type == GGML_TYPE_Q8_0) {
         if (in_dim % 32u) return 0;
-        pipeline = g_pso_mul_mv_q8_0;
         block_bytes = 34;
         row_bytes = (uint64_t)(in_dim / 32u) * block_bytes;
+        if (out_dim > 65536u) nsg = 8u;
+        NSString *key = [NSString stringWithFormat:@"q8_0_%u", nsg];
+        pipeline = g_native_pipelines[key];
+        if (!pipeline) {
+            MTLFunctionConstantValues *mv_constants = [MTLFunctionConstantValues new];
+            short short_nsg = (short)nsg;
+            [mv_constants setConstantValue:&short_nsg type:MTLDataTypeShort atIndex:600];
+            id<MTLFunction> fn = [g_library newFunctionWithName:@"kernel_mul_mv_q8_0_f32" constantValues:mv_constants error:nil];
+            if (fn) {
+                pipeline = [g_device newComputePipelineStateWithFunction:fn error:nil];
+                if (!g_native_pipelines) g_native_pipelines = [NSMutableDictionary new];
+                g_native_pipelines[key] = pipeline;
+            }
+        }
     } else if (weight_type == GGML_TYPE_F32) {
         pipeline = g_pso_mul_mv_f32;
         block_bytes = sizeof(float);
@@ -1298,7 +1312,7 @@ int myds_metal_gemv_batch(
             [enc setThreadgroupMemoryLength:32 * 2 * sizeof(float) atIndex:0];
             /* Each token retains the single-vector lane assignment/reduction. */
             [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + 1) / 2, n_tok, 1)
-                threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+                threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
             if (g_batch_cb) {
                 if (g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             } else {
@@ -1354,18 +1368,21 @@ int myds_metal_v41_gemv(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *weight, const myds_metal_buffer_t *input,
     uint32_t out_dim, uint32_t in_dim, ggml_type weight_type) {
     if (!out || !weight || !input || !out_dim || !in_dim ||
-        weight_type != GGML_TYPE_F16 || out_dim > INT32_MAX || in_dim > INT32_MAX ||
-        in_dim % 4u || weight->size / ((uint64_t)in_dim * 2u) < out_dim ||
+        (weight_type != GGML_TYPE_F16 && weight_type != GGML_TYPE_F32) ||
+        out_dim > INT32_MAX || in_dim > INT32_MAX ||
+        in_dim % 4u ||
         input->size / sizeof(float) < in_dim || out->size / sizeof(float) < out_dim)
         return 0;
+    const uint64_t elem_bytes = weight_type == GGML_TYPE_F32 ? sizeof(float) : 2u;
+    if (weight->size / ((uint64_t)in_dim * elem_bytes) < out_dim) return 0;
     struct ds4_metal_args_mul_mv args;
     memset(&args, 0, sizeof(args));
     const uint32_t nsg = (in_dim + 127u) / 128u > 8u ? 8u : (in_dim + 127u) / 128u;
     args.ne00 = (int32_t)in_dim;
     args.ne01 = (int32_t)out_dim;
     args.ne02 = 1;
-    args.nb00 = 2;
-    args.nb01 = (uint64_t)in_dim * 2u;
+    args.nb00 = elem_bytes;
+    args.nb01 = (uint64_t)in_dim * elem_bytes;
     args.nb02 = args.nb01 * out_dim;
     args.nb03 = args.nb02;
     args.ne10 = (int32_t)in_dim;
@@ -1381,24 +1398,25 @@ int myds_metal_v41_gemv(myds_metal_buffer_t *out,
     args.r2 = 1;
     args.r3 = 1;
     @autoreleasepool {
-        NSString *key = [NSString stringWithFormat:@"v41_f16_4_%u", nsg];
+        NSString *funcName = weight_type == GGML_TYPE_F32 ? @"kernel_mul_mv_f32_f32_4" : @"kernel_mul_mv_f16_f32_4";
+        NSString *key = [NSString stringWithFormat:@"%@_%u", funcName, nsg];
         id<MTLComputePipelineState> pipeline = g_native_pipelines[key];
         if (!pipeline) {
             MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
             short short_nsg = (short)nsg;
             [values setConstantValue:&short_nsg type:MTLDataTypeShort atIndex:600];
-            id<MTLFunction> fn = [g_library newFunctionWithName:@"kernel_mul_mv_f16_f32_4"
+            id<MTLFunction> fn = [g_library newFunctionWithName:funcName
                                                    constantValues:values error:nil];
-            if (!fn) { fprintf(stderr, "myds_metal: v41 F16 function unavailable\n"); return 0; }
+            if (!fn) { fprintf(stderr, "myds_metal: v41 %s function unavailable\n", [funcName UTF8String]); return 0; }
             pipeline = [g_device newComputePipelineStateWithFunction:fn error:nil];
-            if (!pipeline) { fprintf(stderr, "myds_metal: v41 F16 pipeline unavailable\n"); return 0; }
+            if (!pipeline) { fprintf(stderr, "myds_metal: v41 %s pipeline unavailable\n", [funcName UTF8String]); return 0; }
             if (!g_native_pipelines) g_native_pipelines = [NSMutableDictionary new];
             g_native_pipelines[key] = pipeline;
         }
         id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
         if (!enc || 32u * nsg > pipeline.maxTotalThreadsPerThreadgroup) {
-            fprintf(stderr, "myds_metal: v41 F16 encoder unavailable (nsg=%u)\n", nsg);
+            fprintf(stderr, "myds_metal: v41 %s encoder unavailable (nsg=%u)\n", [funcName UTF8String], nsg);
             return 0;
         }
         [enc setComputePipelineState:pipeline];
