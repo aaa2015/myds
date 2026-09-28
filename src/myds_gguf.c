@@ -137,6 +137,7 @@ size_t ggml_type_row_size(ggml_type type, size_t row_len) {
         case GGML_TYPE_F32:   return row_len * sizeof(float);
         case GGML_TYPE_F16:   return row_len * sizeof(uint16_t);
         case GGML_TYPE_BF16:  return row_len * sizeof(uint16_t);
+        case GGML_TYPE_I8:    return row_len;
         case GGML_TYPE_Q8_0:  return (row_len / 32) * (sizeof(uint16_t) + 32);
         case GGML_TYPE_Q4_0:  return (row_len / 32) * (sizeof(uint16_t) + 16);
         case GGML_TYPE_Q4_K:  return (row_len / 256) * 144;
@@ -154,6 +155,7 @@ const char *ggml_type_name(ggml_type type) {
         case GGML_TYPE_F32:   return "F32";
         case GGML_TYPE_F16:   return "F16";
         case GGML_TYPE_BF16:  return "BF16";
+        case GGML_TYPE_I8:    return "I8";
         case GGML_TYPE_Q8_0:  return "Q8_0";
         case GGML_TYPE_Q4_0:  return "Q4_0";
         case GGML_TYPE_Q4_K:  return "Q4_K";

@@ -65,13 +65,12 @@ DS4_METAL_GRAPH_DUMP_POS=0 \
 ```
 
 Replace `42` with the exact agreed token. Additional space-separated token IDs
-are supported. The harness uses at least 128 context slots, prints the final
-argmax/logit and finite-value count, and fails if any final logit is nonfinite.
+are supported. The harness uses at least 128 context slots, prints each token frontier
+argmax/logit and finite-value count, and fails if any frontier logit is nonfinite.
 The `DS4_METAL_DISABLE_V41_LAYER_PREFILL=1` switch makes the trace use the scalar
 V4.1 path, which the patch instruments. This diagnostic mode deliberately
 synchronizes the GPU between captures and must not be used for timing results.
-The harness writes final logits directly through `ds4_session_copy_logits` at
-`tokens.len - 1`; the graph may already have advanced its internal position when
+The harness writes each frontier's logits directly through `ds4_session_copy_logits`; the graph may already have advanced its internal position when
 it calculates the output head, so the graph hook alone is not sufficient for a
 position-filtered final capture.
 
@@ -83,7 +82,7 @@ without it every listed stage is captured. For a single token, layer 0, position
 
 | Stage | Float values | Meaning |
 |---|---:|---|
-| `embedding` | 20,480 | Four repeated 5,120-element HC streams; compare myds embedding to the first stream |
+| `embedding` | 20,480 | Four repeated 5,120-element HC streams; compare all four native streams individually |
 | `hc_attn_input` | 5,120 | Previous sublayer's weighted HC reduction; initial weights are `[1,0,0,0]` |
 | `attn_norm` | 5,120 | Weighted RMSNorm, epsilon `1e-20`, then BF16 round |
 | `q_a_raw` | 1,280 | Q_A projection **after** the model's mandatory BF16 round |
@@ -95,7 +94,7 @@ without it every listed stage is captured. For a single token, layer 0, position
 | `kv_quant` | 512 | FP8 E8M0 raw-cache values represented as F32 |
 | `q_rope` | 32,768 | Query after V4.1 RoPE |
 | `attn_out` | 5,120 | Attention output projection, BF16 round, before HC residual expansion |
-| `layer_out` | 20,480 | All four HC residual streams after the FFN; not directly comparable to one myds vector |
+| `layer_out` | 20,480 | All four HC residual streams after the FFN; compare all four native streams; one-vector outputs fail |
 | `logits` | 129,280 | Full vocabulary logits, without a BF16 rounding step at the output head |
 
 The reference's generic V4 path already had dump helpers, but its V4.1 graph did
@@ -117,71 +116,85 @@ CLI also provides:
 for inference. Do not substitute `--first-token-test` or the legacy
 `--metal-graph-test`: the V4.1 loader explicitly rejects those legacy diagnostics.
 
-## Maintaining a native ds4 backend in myds
+## Multi-position native-engine probes
 
-Static linking through `ds4.h` is the smallest practical integration boundary.
-The build's eight core objects are `ds4.o`, `ds4_image.o`, `ds4_distributed.o`,
-`ds4_tp.o`, `ds4_ssd.o`, `ds4_metal.o`, `ds4_layer_pack.o` and `ds4_engram.o`.
-The build tool already archives and links these for `trace_ds4`. Required macOS
-libraries are Foundation, Metal, libm and pthread; no Python package is required
-at inference time.
+The selected project direction is the independent myds native engine. This
+pinned ds4 executable is an external correctness oracle only; it is not linked
+into myds and is not a production backend.
 
-| myds responsibility | Public ds4 API |
-|---|---|
-| Model lifetime | `ds4_engine_open`, `ds4_engine_close` |
-| Inference context | `ds4_session_create`, `ds4_session_free` |
-| Rendered prompt tokenization | `ds4_tokenize_rendered_chat` |
-| Native chat construction | `ds4_chat_begin`, `ds4_chat_append_message`, `ds4_chat_append_assistant_prefix` |
-| Prefill and prefix reuse | `ds4_session_sync` with the full token prefix |
-| One-token decode | `ds4_session_eval` |
-| Logit inspection | `ds4_session_copy_logits`, `ds4_session_top_logprobs` |
-| Sampling | `ds4_session_sample`, `ds4_sample_logits`, `ds4_session_argmax` |
-| Decode text bytes | `ds4_token_text` returns allocated bytes plus explicit length; caller frees them |
-| Stop detection | `ds4_token_is_stop` or think-mode-specific variant |
-| Prefill cancellation | `ds4_session_set_cancel`, with interrupted return code 2 |
-| Prefill progress | `ds4_session_set_progress` |
+Both harnesses accept `MODEL --tokens-file PATH`. The file contains decimal,
+nonnegative token IDs separated by whitespace; `#` starts a line comment. It
+must contain at least one ID and at most 1,048,576 IDs. Invalid text, overflow,
+missing files and empty sequences fail before any model loads. No tokenizer,
+automatic BOS, chat template, sampling or generated continuation participates.
+Keep the token file with the resulting traces and record its SHA256.
 
-Integration constraints established from the pinned source:
+Use at least 130 exact input tokens to capture zero-based positions 1, 8, 64
+and 129. More than 128 inputs exercise the sliding-window boundary; this is a
+necessary coverage point, not evidence that compression/indexer logic is correct.
+Run the two engines sequentially on the designated inference machine, in
+isolated directories and without replacing production port 8181:
 
-* V4.1 supports Metal and single-GPU CUDA per rank, with optional network tensor
-  parallelism. CPU, distributed layer slices, legacy graph diagnostics and
-  directional steering are rejected. Maximum context is 1,048,576 and power
-  must be 100 for this model path. macOS integration should select Metal.
-* Keep one active engine/backend and serialize GPU execution. ds4 uses global
-  shape and GPU state; it is not a general independent multi-model library.
-  Initializing both myds Metal and ds4 Metal for the same request is unnecessary.
-* Bind the 26 `DS4_METAL_*_SOURCE` paths to the **vendored** kernel directory, or
-  patch its source-root resolver. Reading myds's unrelated `metal/` directory
-  would silently mix kernel versions. Avoid process-wide `chdir` in the server.
-* For repetition penalties, copy logits and apply myds policy before calling
-  `ds4_sample_logits`. Preserve explicit token fragment lengths through UTF-8
-  assembly and JSON escaping. Some fragments contain incomplete UTF-8 bytes.
-* `ds4_encode_chat_prompt` correctly handles a single system/user turn. The
-  public append functions are primitives, not the complete multi-turn renderer:
-  they do not automatically merge consecutive users or terminate historical
-  assistant messages with EOS. The full renderer is the static
-  `render_deepseek41_chat_ordered` in `ds4_server.c`; extract it as a reusable
-  module or validate a port against its known-answer fixtures. Reusing a
-  V3-style rendered string is not a correctness oracle.
-* A changed prompt that is not a prefix is rebuilt by `session_sync`. Single-step
-  `myds_forward_token(..., pos)` needs adapter-owned history/reset semantics,
-  since `ds4_session_eval` advances the current session position.
-* Some malformed model/config paths call `ds4_die`/`exit`; embedding does not
-  provide a fully recoverable loader boundary. A process adapter provides crash
-  isolation but adds IPC, cancellation, startup and token/logit transport work.
-  The current controlled single-model deployment can use static linking; a
-  multi-tenant loader should reconsider isolation.
+```sh
+cd /tmp/myds-ds4-reference
+DS4_METAL_DISABLE_V41_LAYER_PREFILL=1 \
+DS4_METAL_GRAPH_DUMP_PREFIX=/tmp/native-probe/reference \
+DS4_METAL_GRAPH_DUMP_LAYER=0,1,14 \
+DS4_METAL_GRAPH_DUMP_POS=1,8,64,129 \
+./trace_ds4 "$MODEL" --tokens-file /tmp/native-probe/tokens.txt
 
-A vendored source archive plus SHA256 manifest gives a standalone reproducible
-build. Alternatively, pin a published Git commit/submodule. This particular
-commit exists in the local source repository and is not assumed published; do
-not depend on `../ds4`, its branch name, its dirty files or its existing objects.
-The archive does not contain model weights. ds4 and the included Iris image
-reader are MIT licensed; retain both `LICENSE` and `third_party/iris/LICENSE`.
+cd /tmp/myds-native-candidate
+MYDS_TRACE_PREFIX=/tmp/native-probe/myds \
+MYDS_TRACE_LAYER=0,1,14 MYDS_TRACE_POS=1,8,64,129 \
+./bin/trace_model "$MODEL" --tokens-file /tmp/native-probe/tokens.txt
 
-Validation completed here: pinned Git export, patch application, Metal CLI
-compilation, static-library/harness linking, help invocation, and verified
-archive-based extraction. The direct logit-writer's frontier position, byte
-output and position filtering were checked without loading a model. Actual
-model traces are collected separately by the
-operator of the inference machine.
+python3 tools/compare_traces.py /tmp/native-probe \
+  --positions 1,8,64,129 --layers 0,1,14 \
+  --tokens-file /tmp/native-probe/tokens.txt \
+  --output /tmp/native-probe/comparison.json
+```
+
+`*_LAYER` and `*_POS` accept a single decimal index, a comma-separated list, or
+`all`. Unset filters capture every index. The reference synchronizes the first
+input token to initialize its checkpoint, then evaluates every supplied token
+one at a time. Logits are copied through the public API after **each** supplied
+token, with that token's actual position; the ambiguous internal graph head
+position is no longer used. JSONL progress lines report every input ID and
+argmax, regardless of which positions are selected for binary dumps.
+
+Additional HC stage files are `hc_attn_mix` / `hc_ffn_mix` (24 raw projection
+values), `hc_attn_split` / `hc_ffn_split` (24 values: pre4, post4, comb4x4),
+`hc_attn_pre` (the four carried weights consumed by attention), `after_attn`
+(four residual streams), `hc_ffn_input` and `ffn_norm` (one 5120-element row).
+The attention reduction consumes the previous FFN's pre weights, initialized
+as `[1,0,0,0]`; the FFN reduction consumes the current attention split's pre
+weights. These are different from each block's own post/comb expansion.
+
+The comparator reports each selected position/layer separately. Equal-shaped
+`embedding`, `after_attn` and `layer_out` tensors receive per-stream max absolute
+error, RMSE and mismatch counts. A native single-stream tensor against a
+four-stream reference remains a **shape failure**; the comparator never repeats
+or averages it to manufacture a pass. At positions >= 1, `layer_out` must also
+contain pairwise-distinct streams on both sides. This assertion does **not**
+apply to embedding: every token starts with four identical embedding streams,
+including later positions. Layer 0's first pre-reduction can therefore still be
+an identity even far into the input. The roadmap's original general assertion
+about later positions is only valid for post-HC residual outputs.
+
+Missing stages, nonfinite values, differing shapes and numerical differences
+are failures. Use `--stages attn_norm,q_a_raw,...` for a named partial milestone;
+the selected list is evident in the report. Defaults remain `atol=0, rtol=0`.
+Nonzero tolerance requires an explicit `--tolerance-reason`, chosen from the
+numerical contract before inspecting the comparison. This records a choice;
+it does not establish that the choice is justified.
+
+No-model regression checks:
+
+```sh
+python3 -m unittest discover -s tools/reference -p test_trace_tools.py -v
+```
+
+These cover malformed token inputs/filters, all four requested positions and
+three layers, missing artifacts, shape mismatches, per-stream errors, duplicated
+post-HC streams, repeated valid embeddings and nonfinite values. Actual model
+traces remain separate evidence and must be collected on the inference machine.

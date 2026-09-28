@@ -28,6 +28,21 @@ size_t               myds_metal_buffer_offset(const myds_metal_buffer_t *buf);
 bool                 myds_metal_buffer_is_view(const myds_metal_buffer_t *buf);
 int                  myds_metal_buffer_write(myds_metal_buffer_t *buf, size_t offset, const void *src, size_t bytes);
 int                  myds_metal_buffer_read(const myds_metal_buffer_t *buf, size_t offset, void *dst, size_t bytes);
+/* GPU-ordered copy; overlapping source/destination ranges are rejected. */
+int myds_metal_buffer_copy(myds_metal_buffer_t *dst, size_t dst_offset,
+    const myds_metal_buffer_t *src, size_t src_offset, size_t bytes);
+/* Internal native-graph bridge. args occupies slot0, buffers slots1..N.
+ * The caller validates the selected kernel's tensor shapes/strides. The bridge
+ * validates dispatch limits and encodes an unconditional dependency barrier. */
+int myds_metal_dispatch_kernel(const char *name, const void *args, size_t args_size,
+    const myds_metal_buffer_t *const *buffers, size_t n_buffers,
+    const uint32_t groups[3], const uint32_t threads[3], size_t threadgroup_memory);
+typedef struct { uint32_t index; bool is_bool; int32_t value; } myds_metal_constant_t;
+uint32_t myds_metal_kernel_max_threads(const char *name);
+int myds_metal_dispatch_kernel_constants(const char *name, const void *args, size_t args_size,
+    const myds_metal_buffer_t *const *buffers, size_t n_buffers,
+    const uint32_t groups[3], const uint32_t threads[3], size_t threadgroup_memory,
+    const myds_metal_constant_t *constants, size_t n_constants);
 
 /* =========================================================================
  * Core DeepSeek GPU Operators
@@ -40,6 +55,43 @@ int myds_metal_rmsnorm(
     const myds_metal_buffer_t *weight,
     uint32_t                   dim,
     float                      eps);
+
+/* V4.1 numerical/HC primitives. All activation buffers contain float32 words;
+ * BF16 results are stored as exactly representable float32 values. These
+ * helpers enforce their own GPU dependencies even with auto barriers disabled.
+ * RMSNorm accepts NULL weight for an unweighted norm. Width must be a multiple
+ * of 128 (a complete SIMD group of float4 values); its reduction matches ds4.
+ */
+int myds_metal_v41_bf16(myds_metal_buffer_t *x, uint32_t count);
+int myds_metal_v41_rmsnorm(myds_metal_buffer_t *out,
+    const myds_metal_buffer_t *x, const myds_metal_buffer_t *weight,
+    uint32_t dim, float eps, bool round_bf16);
+
+/* One token, four stream-major residual rows [4, dim]. The mixer projection
+ * fn is [24, 4*dim], scale is F32[3], base is F32[24]. Scratch flat_norm is
+ * F32[4*dim], mix is F32[24]. split receives [pre4, post4, comb4x4] using
+ * 20 Sinkhorn iterations. HC normalization/projection remain F32.
+ * V4.1 attention consumes the PREVIOUS FFN pre4 (initially {1,0,0,0});
+ * FFN consumes the current attention pre4. The current split is used for
+ * post/comb expansion, and FFN pre4 is carried into the next layer/head.
+ */
+int myds_metal_v41_hc_mix(myds_metal_buffer_t *split,
+    const myds_metal_buffer_t *residual, const myds_metal_buffer_t *fn,
+    ggml_type fn_type, const myds_metal_buffer_t *scale,
+    const myds_metal_buffer_t *base, myds_metal_buffer_t *flat_norm,
+    myds_metal_buffer_t *mix, uint32_t dim, float eps, float hc_eps);
+int myds_metal_v41_hc_weighted_sum(myds_metal_buffer_t *out,
+    const myds_metal_buffer_t *residual, const myds_metal_buffer_t *weights,
+    uint32_t dim);
+/* out may equal residual: the specialized four-stream kernel loads all four
+ * source stream values before writing. Other input/output overlap is invalid. */
+int myds_metal_v41_hc_expand(myds_metal_buffer_t *out,
+    const myds_metal_buffer_t *block, const myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *split, uint32_t dim);
+/* projected is F32[5,dim]; q/k weights and residual are F32[4,dim]. */
+int myds_metal_v41_engram_add(myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *projected, const myds_metal_buffer_t *q_weight,
+    const myds_metal_buffer_t *k_weight, uint32_t dim, float eps);
 
 /* Decoupled RoPE (Rotary Position Embedding) for DeepSeek Q and K */
 int myds_metal_rope(
@@ -59,6 +111,13 @@ int myds_metal_gemv(
     uint32_t                   out_dim,
     uint32_t                   in_dim,
     ggml_type                  weight_type);
+
+/* V4.1 F16 projection dispatch. The reference graph uses the four-wide
+ * matvec kernel with its input-width-dependent eight-simdgroup reduction;
+ * this is deliberately separate from the legacy GEMV defaults. */
+int myds_metal_v41_gemv(myds_metal_buffer_t *out,
+    const myds_metal_buffer_t *weight, const myds_metal_buffer_t *input,
+    uint32_t out_dim, uint32_t in_dim, ggml_type weight_type);
 
 /* Multiple independent GEMVs in one dispatch. Uses the same arithmetic and
  * reduction as gemv, with contiguous input/output rows in token order. */

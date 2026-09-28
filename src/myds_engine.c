@@ -15,7 +15,7 @@
 #include <mach/mach.h>
 #include <dispatch/dispatch.h>
 
-static bool trace_f32(const char *stage, uint32_t layer, uint32_t pos,
+bool myds_trace_f32(const char *stage, uint32_t layer, uint32_t pos,
                       const myds_metal_buffer_t *buffer, size_t count);
 
 typedef struct {
@@ -266,14 +266,14 @@ static myds_model_t *model_load_internal(const char *model_path, bool diagnostic
 
     const char *missing_feature = unimplemented_graph_feature(gf);
     if (missing_feature && !diagnostic) {
-        MYDS_LOG_E("Cannot run this model correctly: native graph lacks %s. "
+        MYDS_LOG_E("Cannot run this model correctly: native graph has not passed the correctness gate for %s. "
                    "Refusing inference rather than silently skipping model operations. "
                    "See docs/CORRECTNESS_STATUS.md.", missing_feature);
         gguf_close(gf);
         return NULL;
     }
     if (missing_feature) {
-        MYDS_LOG_W("DIAGNOSTIC ONLY: incomplete graph (%s); resulting logits are not correct inference",
+        MYDS_LOG_W("DIAGNOSTIC ONLY: unvalidated graph (%s); logits require independent comparison",
                    missing_feature);
     }
     if (!myds_metal_init("metal")) {
@@ -849,6 +849,11 @@ static myds_model_t *model_load_internal(const char *model_path, bool diagnostic
         }
     }
 
+    if (missing_feature && !strcmp(m->arch, "deepseek41")) {
+        m->v41 = myds_v41_model_create(m, model_path);
+        if (!m->v41) goto fail;
+    }
+
     /* Pre-warm resident weights (embeddings, output, attention, shared experts) */
     myds_metal_warm_buffer(m->tok_embeddings);
     myds_metal_warm_buffer(m->output_norm);
@@ -914,6 +919,7 @@ void myds_model_free(myds_model_t *m) {
     if (!m) return;
     /* An error may leave shared-expert commands in flight over mmap weights. */
     (void)myds_metal_synchronize();
+    myds_v41_model_free(m->v41);
     if (m->tok_embeddings) myds_metal_buffer_free(m->tok_embeddings);
     if (m->output_norm)    myds_metal_buffer_free(m->output_norm);
     if (m->output && m->output != m->tok_embeddings) myds_metal_buffer_free(m->output);
@@ -1035,6 +1041,7 @@ myds_context_t *myds_context_create(myds_model_t *model, const myds_config_t *cf
     if (!model) return NULL;
 
     myds_context_t *ctx = (myds_context_t *)calloc(1, sizeof(myds_context_t));
+    if (!ctx) return NULL;
     ctx->model = model;
     if (cfg) {
         ctx->cfg = *cfg;
@@ -1075,11 +1082,13 @@ myds_context_t *myds_context_create(myds_model_t *model, const myds_config_t *cf
         ctx->attn_low   = myds_metal_buffer_alloc((size_t)model->n_out_groups * model->out_group_rank * sizeof(float));
 
         /* In MLA, latent KV cache stores only 1 latent vector of width head_dim per token */
+        if (!model->v41) {
         ctx->k_cache = (float **)calloc(model->n_layers, sizeof(float *));
         ctx->v_cache = NULL;
         size_t kv_layer_size = (size_t)ctx->cfg.max_seq_len * model->head_dim;
         for (uint32_t l = 0; l < model->n_layers; l++) {
             ctx->k_cache[l] = (float *)calloc(kv_layer_size, sizeof(float));
+        }
         }
     } else {
         ctx->q            = myds_metal_buffer_alloc(model->n_heads * model->head_dim * sizeof(float));
@@ -1124,12 +1133,17 @@ myds_context_t *myds_context_create(myds_model_t *model, const myds_config_t *cf
     ctx->rng_state = ((uint64_t)ctx->cfg.seed ^ 0x5DEECE66DULL) | 1ULL;
 
     ctx->pos = 0;
+    if (model->v41) {
+        ctx->v41 = myds_v41_context_create(ctx);
+        if (!ctx->v41) { myds_context_free(ctx); return NULL; }
+    }
     return ctx;
 }
 
 void myds_context_free(myds_context_t *ctx) {
     if (!ctx) return;
     (void)myds_metal_synchronize();
+    myds_v41_context_free(ctx->v41);
     free_prefill_chunk(ctx->prefill_chunk);
     if (ctx->x)            myds_metal_buffer_free(ctx->x);
     if (ctx->x_norm)       myds_metal_buffer_free(ctx->x_norm);
@@ -1623,11 +1637,11 @@ static int execute_transformer_layer(myds_context_t *ctx, uint32_t l, uint32_t p
         if (!myds_metal_commit_batch()) return 0;
         if (do_prof) gettimeofday(&t1, NULL);
 
-        if (!trace_f32("attn_norm", l, pos, ctx->x_norm, dim) ||
-            !trace_f32("q_a_raw", l, pos, ctx->qr, m->q_lora_rank) ||
-            !trace_f32("q_a_norm", l, pos, ctx->qr_norm, m->q_lora_rank) ||
-            !trace_f32("q_b", l, pos, ctx->q, m->n_heads * m->head_dim) ||
-            !trace_f32("kv_norm", l, pos, ctx->kv_act, m->head_dim)) return 0;
+        if (!myds_trace_f32("attn_norm", l, pos, ctx->x_norm, dim) ||
+            !myds_trace_f32("q_a_raw", l, pos, ctx->qr, m->q_lora_rank) ||
+            !myds_trace_f32("q_a_norm", l, pos, ctx->qr_norm, m->q_lora_rank) ||
+            !myds_trace_f32("q_b", l, pos, ctx->q, m->n_heads * m->head_dim) ||
+            !myds_trace_f32("kv_norm", l, pos, ctx->kv_act, m->head_dim)) return 0;
 
         float *qv = (float *)myds_metal_buffer_data(ctx->q);
         /* V4.1 Q_B feeds RoPE directly; V4's per-head RMSNorm is absent. */
@@ -1640,8 +1654,8 @@ static int execute_transformer_layer(myds_context_t *ctx, uint32_t l, uint32_t p
         /* Tail RoPE on Q (all heads) and KV (1 head) */
         myds_rope_tail_inplace(qv, m->n_heads, m->head_dim, m->qk_rope_head_dim, pos, m->freq_base, m->freq_scale, false);
         myds_rope_tail_inplace(kv_v, 1, m->head_dim, m->qk_rope_head_dim, pos, m->freq_base, m->freq_scale, false);
-        if (!trace_f32("q_rope", l, pos, ctx->q, m->n_heads * m->head_dim) ||
-            !trace_f32("kv_rope", l, pos, ctx->kv_act, m->head_dim)) return 0;
+        if (!myds_trace_f32("q_rope", l, pos, ctx->q, m->n_heads * m->head_dim) ||
+            !myds_trace_f32("kv_rope", l, pos, ctx->kv_act, m->head_dim)) return 0;
 
         /* Push to latent KV cache: 512 floats per token per layer */
         memcpy(ctx->k_cache[l] + (size_t)pos * m->head_dim, kv_v, m->head_dim * sizeof(float));
@@ -1838,16 +1852,32 @@ static bool embedding_lookup_row(const myds_model_t *m, int32_t token_id, float 
     return true;
 }
 
+/* Decimal CSV/all filter shared by every native graph's trace stages. */
+static bool trace_selected(const char *filter, uint32_t value) {
+    if (!filter || !*filter) return value == 0;
+    if (!strcmp(filter, "all")) return true;
+    while (*filter) {
+        if (*filter < '0' || *filter > '9') return false;
+        char *end = NULL;
+        unsigned long n = strtoul(filter, &end, 10);
+        if (n > UINT32_MAX || (*end && *end != ',')) return false;
+        if (n == value) return true;
+        if (!*end) break;
+        filter = end + 1;
+    }
+    return false;
+}
+
 /* Opt-in numerical diagnostics, independent of sampling/text decoding. Files
  * contain native little-endian F32 on Apple Silicon. Never enabled by default. */
-static bool trace_f32(const char *stage, uint32_t layer, uint32_t pos,
+bool myds_trace_f32(const char *stage, uint32_t layer, uint32_t pos,
                       const myds_metal_buffer_t *buffer, size_t count) {
     const char *prefix = getenv("MYDS_TRACE_PREFIX");
     if (!prefix || !*prefix) return true;
     const char *layer_env = getenv("MYDS_TRACE_LAYER");
     const char *pos_env = getenv("MYDS_TRACE_POS");
-    if (layer != (uint32_t)(layer_env ? strtoul(layer_env, NULL, 10) : 0) ||
-        pos != (uint32_t)(pos_env ? strtoul(pos_env, NULL, 10) : 0)) return true;
+    if (!trace_selected(layer_env, layer) || !trace_selected(pos_env, pos)) return true;
+    if (!buffer || count > myds_metal_buffer_size(buffer) / sizeof(float)) return false;
     if (!myds_metal_commit_batch()) return false;
     char path[4096];
     int n = snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, stage, layer, pos);
@@ -1864,21 +1894,22 @@ static bool trace_f32(const char *stage, uint32_t layer, uint32_t pos,
 }
 
 static int32_t myds_forward_token_internal(myds_context_t *ctx, int32_t token_id, uint32_t pos, bool need_logits) {
+    if (ctx->v41) return myds_v41_forward(ctx, token_id, pos, need_logits);
     myds_model_t *m = ctx->model;
     uint32_t dim = m->dim;
 
     /* 1. Embedding lookup */
     float *xv = (float *)myds_metal_buffer_data(ctx->x);
     if (!embedding_lookup_row(m, token_id, xv)) return -1;
-    if (!trace_f32("embedding", 0, pos, ctx->x, dim)) return -1;
+    if (!myds_trace_f32("embedding", 0, pos, ctx->x, dim)) return -1;
 
     /* 2. Transformer layers */
     for (uint32_t l = 0; l < m->n_layers; l++) {
         if (!execute_transformer_layer(ctx, l, pos)) {
             return -1;
         }
-        if (!trace_f32("layer_out", l, pos, ctx->x, dim)) return -1;
-        if (m->is_mla && !trace_f32("attn_out", l, pos, ctx->attn_out, dim)) return -1;
+        if (!myds_trace_f32("layer_out", l, pos, ctx->x, dim)) return -1;
+        if (m->is_mla && !myds_trace_f32("attn_out", l, pos, ctx->attn_out, dim)) return -1;
     }
 
     if (!need_logits) {
@@ -1907,7 +1938,7 @@ static int32_t myds_forward_token_internal(myds_context_t *ctx, int32_t token_id
         }
     }
     if (!myds_metal_commit_batch()) return -1;
-    if (!trace_f32("logits", 0, pos, ctx->logits, m->vocab_size)) return -1;
+    if (!myds_trace_f32("logits", 0, pos, ctx->logits, m->vocab_size)) return -1;
     if (do_head_prof) {
         gettimeofday(&t_lm1, NULL);
         gettimeofday(&t_sp0, NULL);
@@ -2541,7 +2572,7 @@ static int myds_prefill_tokens(myds_context_t *ctx, const int32_t *tokens, int32
     uint32_t dim = m->dim;
 
     /* For very short prompts (<= 4 tokens), standard sequential forward has virtually zero overhead */
-    if (n_tokens <= 4 || getenv("MYDS_TRACE_PREFIX") || !model_supports_chunk_prefill(m)) {
+    if (m->v41 || n_tokens <= 4 || getenv("MYDS_TRACE_PREFIX") || !model_supports_chunk_prefill(m)) {
         for (int32_t i = 0; i < n_tokens; i++) {
             if (cancel_flag && *cancel_flag) return -2;
             if (myds_forward_token_internal(ctx, tokens[i], ctx->pos, false) < 0) return -1;

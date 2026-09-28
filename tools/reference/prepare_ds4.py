@@ -72,12 +72,14 @@ def main():
     patch = here / "ds4-v41-trace.patch"
     subprocess.run(["patch", "--batch", "-p1", "-i", str(patch)], cwd=out, check=True)
     shutil.copy2(here / "trace_ds4.c", out / "trace_ds4.c")
+    shutil.copy2(here / "trace_input.h", out / "trace_input.h")
     manifest = {
         "revision": REVISION,
         "source": "Git objects; working-tree modifications excluded",
         "archive_sha256": hashlib.sha256(archive).hexdigest(),
         "trace_patch_sha256": hashlib.sha256(patch.read_bytes()).hexdigest(),
         "trace_harness_sha256": hashlib.sha256((out / "trace_ds4.c").read_bytes()).hexdigest(),
+        "trace_input_sha256": hashlib.sha256((out / "trace_input.h").read_bytes()).hexdigest(),
         "source_files": len(paths),
         "files": {name: hashlib.sha256((out / name).read_bytes()).hexdigest() for name in paths},
     }

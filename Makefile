@@ -6,7 +6,7 @@ LDFLAGS ?= -framework Foundation -framework Metal -lm -lpthread
 BIN_DIR = bin
 BUILD_DIR = build
 
-SRCS_C = src/myds_cpu.c src/myds_log.c src/myds_gguf.c src/myds_tokenizer.c src/myds_engine.c src/myds_server.c
+SRCS_C = src/myds_cpu.c src/myds_log.c src/myds_gguf.c src/myds_tokenizer.c src/myds_engine.c src/myds_v41.c src/myds_v41_gpu.c src/myds_v41_moe.c src/myds_engram.c src/myds_server.c
 SRCS_M = src/myds_metal.m
 OBJS_C = $(patsubst src/%.c, $(BUILD_DIR)/%.o, $(SRCS_C))
 OBJS_M = $(patsubst src/%.m, $(BUILD_DIR)/%.o, $(SRCS_M))
@@ -20,11 +20,12 @@ TEST_LOG = $(BIN_DIR)/test_log
 TEST_SERVER_API = $(BIN_DIR)/test_server_api
 TEST_ENGINE = $(BIN_DIR)/test_engine
 TEST_CPU = $(BIN_DIR)/test_cpu
+TEST_ENGRAM = $(BIN_DIR)/test_engram
 BENCH_SYNTHETIC = $(BIN_DIR)/bench_synthetic
 BENCH_METAL = $(BIN_DIR)/bench_metal
 DUMP_TENSORS = $(BIN_DIR)/dump_tensors
 
-ALL_TESTS = $(TEST_METAL) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE) $(TEST_CPU)
+ALL_TESTS = $(TEST_METAL) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE) $(TEST_CPU) $(TEST_ENGRAM)
 
 .PHONY: all test clean bench
 
@@ -82,16 +83,16 @@ $(TEST_GGUF): $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/test_gguf.o | $(BIN_DIR)
 $(TEST_TOKENIZER): $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/test_tokenizer.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@
 
-$(TEST_SERVER): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_server.o | $(BIN_DIR)
+$(TEST_SERVER): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_server.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@
 
 $(TEST_LOG): $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_log.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@
 
-$(TEST_SERVER_API): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_server_api.o | $(BIN_DIR)
+$(TEST_SERVER_API): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_server_api.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@
 
-$(TEST_ENGINE): $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_engine.o | $(BIN_DIR)
+$(TEST_ENGINE): $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_engine.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@
 
 $(BUILD_DIR)/dump_tensors.o: tools/dump_tensors.c | $(BUILD_DIR)
@@ -105,6 +106,12 @@ $(BUILD_DIR)/trace_model.o: tools/trace_model.c | $(BUILD_DIR)
 
 $(BIN_DIR)/trace_model: $(filter-out $(BUILD_DIR)/myds_server.o,$(OBJS_C)) $(OBJS_M) $(BUILD_DIR)/trace_model.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@
+
+$(BUILD_DIR)/test_engram.o: tests/test_engram.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+$(TEST_ENGRAM): $(BUILD_DIR)/test_engram.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_gguf.o | $(BIN_DIR)
+	$(CC) $^ -lm -o $@
 
 $(BUILD_DIR)/test_cpu.o: tests/test_cpu.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
@@ -147,6 +154,7 @@ test: $(ALL_TESTS)
 	@echo ""
 	@./$(TEST_ENGINE)
 	@./$(TEST_CPU)
+	@./$(TEST_ENGRAM)
 	@echo "\n========================================================"
 	@echo "      ALL TEST SUITES PASSED CLEANLY & SUCCESSFULLY!    "
 	@echo "========================================================"

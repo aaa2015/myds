@@ -1,6 +1,90 @@
 --- a/ds4.c
 +++ b/ds4.c
-@@ -41162,8 +41162,13 @@
+@@ -42,6 +42,7 @@
+ #include <unistd.h>
+ 
+ #include "ds4.h"
++#include "trace_input.h"
+ #include "ds4_tool_text.h"
+ #include "ds4_distributed.h"
+ #include "ds4_image.h"
+@@ -18470,10 +18471,8 @@
+     int init;
+     const char *prefix;
+     const char *name;
+-    int layer_set;
+-    uint32_t layer;
+-    int pos_set;
+-    uint32_t pos;
++    const char *layers;
++    const char *positions;
+ } metal_graph_debug_config;
+ 
+ static const metal_graph_debug_config *metal_graph_debug_get_config(void) {
+@@ -18487,19 +18486,10 @@
+                                        "DS4_METAL_GRAPH_DUMP_NAME");
+         if (cfg.name && !cfg.name[0]) cfg.name = NULL;
+ 
+-        const char *layer_env = glm_graph_env_value("DS4_ROCM_GRAPH_DUMP_LAYER",
+-                                                    "DS4_METAL_GRAPH_DUMP_LAYER");
+-        if (layer_env && layer_env[0] && strcmp(layer_env, "all") != 0) {
+-            cfg.layer_set = 1;
+-            cfg.layer = (uint32_t)strtoul(layer_env, NULL, 10);
+-        }
+-
+-        const char *pos_env = glm_graph_env_value("DS4_ROCM_GRAPH_DUMP_POS",
+-                                                  "DS4_METAL_GRAPH_DUMP_POS");
+-        if (pos_env && pos_env[0]) {
+-            cfg.pos_set = 1;
+-            cfg.pos = (uint32_t)strtoul(pos_env, NULL, 10);
+-        }
++        cfg.layers = glm_graph_env_value("DS4_ROCM_GRAPH_DUMP_LAYER",
++                                           "DS4_METAL_GRAPH_DUMP_LAYER");
++        cfg.positions = glm_graph_env_value("DS4_ROCM_GRAPH_DUMP_POS",
++                                              "DS4_METAL_GRAPH_DUMP_POS");
+     }
+     return &cfg;
+ }
+@@ -18508,8 +18498,8 @@
+     const metal_graph_debug_config *cfg = metal_graph_debug_get_config();
+     if (!cfg->prefix) return NULL;
+     if (cfg->name && strstr(cfg->name, name) == NULL) return NULL;
+-    if (cfg->layer_set && cfg->layer != il) return NULL;
+-    if (cfg->pos_set && cfg->pos != pos) return NULL;
++    if (!trace_filter_matches(cfg->layers, il)) return NULL;
++    if (!trace_filter_matches(cfg->positions, pos)) return NULL;
+     return cfg->prefix;
+ }
+ 
+@@ -18549,6 +18539,27 @@
+     if (ds4_gpu_begin_commands() == 0) {
+         fprintf(stderr, "ds4: failed to resume Metal command batch after dumping %s layer %u pos %u\n", name, il, pos);
+     }
++}
++
++/* Integer selection IDs are serialized as exact F32 values so the shared
++ * stage comparator reports IDs numerically, not as float bit reinterpretations. */
++static void metal_graph_debug_dump_ids(const char *name, ds4_gpu_tensor *t,
++                                      uint32_t count, uint32_t il, uint32_t pos) {
++    const char *prefix = metal_graph_debug_prefix_for(name, il, pos);
++    if (!prefix || !t || !count) return;
++    if (!ds4_gpu_synchronize()) return;
++    int32_t *ids = xmalloc((size_t)count * sizeof(*ids));
++    float *values = xmalloc((size_t)count * sizeof(*values));
++    if (ds4_gpu_tensor_read(t, 0, ids, (uint64_t)count * sizeof(*ids))) {
++        for (uint32_t i = 0; i < count; i++) values[i] = (float)ids[i];
++        char path[1024];
++        snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, name, il, pos);
++        if (!write_f32_binary_file(path, values, count))
++            fprintf(stderr, "ds4: cannot write ID trace %s\n", path);
++    }
++    free(ids); free(values);
++    if (!ds4_gpu_begin_commands())
++        fprintf(stderr, "ds4: cannot resume after ID trace\n");
+ }
+ 
+ static void metal_graph_debug_dump_f16_tensor(
+@@ -41162,8 +41173,13 @@
  static bool ds41_embed(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                          ds4_gpu_tensor *out, ds4_gpu_tensor *scratch, int token, uint32_t pos) {
      const ds4_vision_span *image = ds41_image_at(g, pos);
@@ -16,7 +100,7 @@
      const float *data = image->embedding.data + (uint64_t)(pos - image->token_start) * DS4_N_EMBD;
      return ds4_gpu_tensor_write(scratch, 0, data, (uint64_t)DS4_N_EMBD * sizeof(float)) &&
          ds4_gpu_repeat_hc_tensor(out, scratch, DS4_N_EMBD, DS4_N_HC);
-@@ -41366,14 +41371,20 @@
+@@ -41366,14 +41382,20 @@
  }
  
  static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
@@ -44,7 +128,7 @@
  }
  
  static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
-@@ -41383,13 +41394,17 @@
+@@ -41383,13 +41405,17 @@
      const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
      const uint32_t heads = DS4_N_HEAD / g->tp_world;
      const uint32_t head0 = g->tp_rank * heads;
@@ -65,7 +149,7 @@
      const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
      if (n_comp && !ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
                                           g->selected_comp, n_comp, attended)) return false;
-@@ -41402,9 +41417,11 @@
+@@ -41402,9 +41428,11 @@
          !ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) ||
          !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true)) return false;
      if (projected) return true;
@@ -80,25 +164,58 @@
  }
  
  static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
-@@ -41494,6 +41511,9 @@
+@@ -41422,6 +41450,10 @@
+             m->map, m->size, bias->abs_offset, 0, 0, token,
+             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
+             g->route_logits)) return false;
++    metal_graph_debug_dump_tensor("route_logits", g->route_logits, DS4_N_EXPERT, il, g->pos);
++    metal_graph_debug_dump_tensor("route_probs", g->route_probs, DS4_N_EXPERT, il, g->pos);
++    metal_graph_debug_dump_ids("route_ids", g->selected, DS4_N_EXPERT_USED, il, g->pos);
++    metal_graph_debug_dump_tensor("route_weights", g->route_weights, DS4_N_EXPERT_USED, il, g->pos);
+     const bool shared_here = !shared_owner || g->tp_rank == (il & 1u);
+     bool shared_queued = false;
+ #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+@@ -41466,6 +41498,8 @@
+     if (shared_queued && !ds4_gpu_dsv41_shared_join()) return false;
+ #endif
+     if (!routed_ok) return false;
++    if (shared_here) metal_graph_debug_dump_tensor("shared_out", g->shared, DS4_N_EMBD, il, g->pos);
++    metal_graph_debug_dump_tensor("routed_out", routed, DS4_N_EMBD, il, g->pos);
+     /* Keep the shared expert's BF16 boundary, then include it exactly once
+      * in the existing F32 reduction. Alternate ownership across layers. */
+     if (shared_owner && g->tp_rank == (il & 1u) &&
+@@ -41484,7 +41518,9 @@
+ 
+ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
+                      const ds4_layer_weights *l, uint32_t il, uint32_t token) {
+-    return ds41_moe_partial(g, m, l, il, token) && ds41_moe_finish(g, il);
++    if (!ds41_moe_partial(g, m, l, il, token) || !ds41_moe_finish(g, il)) return false;
++    metal_graph_debug_dump_tensor("ffnblock", g->block, DS4_N_EMBD, il, g->pos);
++    return true;
+ }
+ 
+ static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
+@@ -41494,6 +41530,8 @@
                ds41_norm(g->norm, g->x, m, w->output_norm) &&
                ds41_output_projection(g, g->tp_logits_half ? g->tp_logits_half : g->logits,
                                       m, w, g->norm, 1);
-+    /* Global tensors use layer 0 so a first-layer trace also includes the head. */
-+    if (ok) metal_graph_debug_dump_tensor("logits", g->logits,
-+        DS4_N_VOCAB, 0, g->pos);
++    /* Logits are captured by the exact-token harness through the public API.
++     * g->pos may already denote the next token; it is not the output frontier. */
      if (!ds4_gpu_end_commands()) ok = false;
      return ok && ds4_gpu_tensor_read(g->logits, 0, logits,
                                       (uint64_t)DS4_N_VOCAB * sizeof(float));
-@@ -41508,9 +41528,12 @@
+@@ -41508,23 +41546,36 @@
                  g->engram_q_norm[i], g->engram_k_norm[i], NULL, DS4_N_EMBD, 1, DS4_RMS_EPS))
              return false;
      }
 -    return ds41_hc_mix(g, m, l, false) &&
 -        ds41_hc_ws_round(g->x, g->residual, g->pre, DS4_N_HC, false) &&
 -        ds41_norm(g->norm, g->x, m, l->attn_norm);
-+    if (!ds41_hc_mix(g, m, l, false) ||
-+        !ds41_hc_ws_round(g->x, g->residual, g->pre, DS4_N_HC, false)) return false;
++    if (!ds41_hc_mix(g, m, l, false)) return false;
++    metal_graph_debug_dump_tensor("hc_attn_mix", g->mix, 24u, il, g->pos);
++    metal_graph_debug_dump_tensor("hc_attn_split", g->attn_split, 24u, il, g->pos);
++    metal_graph_debug_dump_tensor("hc_attn_pre", g->pre, DS4_N_HC, il, g->pos);
++    if (!ds41_hc_ws_round(g->x, g->residual, g->pre, DS4_N_HC, false)) return false;
 +    metal_graph_debug_dump_tensor("hc_attn_input", g->x, DS4_N_EMBD, il, g->pos);
 +    if (!ds41_norm(g->norm, g->x, m, l->attn_norm)) return false;
 +    metal_graph_debug_dump_tensor("attn_norm", g->norm, DS4_N_EMBD, il, g->pos);
@@ -106,7 +223,34 @@
  }
  
  static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
-@@ -41818,8 +41841,11 @@
+-                                      const ds4_layer_weights *l) {
+-    return ds41_hc_expand_round(g->after_attn, g->block, g->residual, g->attn_split, DS4_N_HC) &&
+-        ds41_hc_mix(g, m, l, true) &&
+-        ds41_hc_ws_round(g->x, g->after_attn, g->attn_split, DS4_N_HC, true) &&
+-        ds41_norm(g->norm, g->x, m, l->ffn_norm);
++                                      const ds4_layer_weights *l, uint32_t il) {
++    if (!ds41_hc_expand_round(g->after_attn, g->block, g->residual, g->attn_split, DS4_N_HC)) return false;
++    metal_graph_debug_dump_tensor("after_attn", g->after_attn,
++        (uint64_t)DS4_N_HC * DS4_N_EMBD, il, g->pos);
++    if (!ds41_hc_mix(g, m, l, true)) return false;
++    metal_graph_debug_dump_tensor("hc_ffn_mix", g->mix, 24u, il, g->pos);
++    metal_graph_debug_dump_tensor("hc_ffn_split", g->ffn_split, 24u, il, g->pos);
++    if (!ds41_hc_ws_round(g->x, g->after_attn, g->attn_split, DS4_N_HC, true)) return false;
++    metal_graph_debug_dump_tensor("hc_ffn_input", g->x, DS4_N_EMBD, il, g->pos);
++    if (!ds41_norm(g->norm, g->x, m, l->ffn_norm)) return false;
++    metal_graph_debug_dump_tensor("ffn_norm", g->norm, DS4_N_EMBD, il, g->pos);
++    return true;
+ }
+ 
+ static bool ds41_graph_before_moe(ds41_gpu_graph *g, const ds4_model *m,
+                                  const ds4_layer_weights *l, uint32_t il) {
+     return ds41_graph_before_attention(g, m, l, il) && ds41_attention(g, m, l, il, false) &&
+-        ds41_graph_after_attention(g, m, l);
++        ds41_graph_after_attention(g, m, l, il);
+ }
+ 
+ static bool ds41_norm_batch(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
+@@ -41818,8 +41869,11 @@
  
  static bool ds41_graph_layer(ds41_gpu_graph *g, const ds4_model *m,
                              const ds4_layer_weights *l, uint32_t il, int token) {
@@ -120,12 +264,24 @@
  }
  
  #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-@@ -41837,7 +41863,7 @@
+@@ -41837,9 +41891,9 @@
          const int state = ds4_gpu_decode_graph_begin(&key);
          if (state == 1) return true;
          const bool ok = island == 0 ?
 -            ds41_graph_before_attention(g, m, l, il) && ds41_attention_project(g, m, l) :
 +            ds41_graph_before_attention(g, m, l, il) && ds41_attention_project(g, m, l, il) :
              island == 2 ? ds41_attention_output(g, m, l) :
-             ds41_graph_after_attention(g, m, l) && ds41_moe_partial(g, m, l, il, 0);
+-            ds41_graph_after_attention(g, m, l) && ds41_moe_partial(g, m, l, il, 0);
++            ds41_graph_after_attention(g, m, l, il) && ds41_moe_partial(g, m, l, il, 0);
          if (state != 0) return ok;
+         if (!ok) ds4_gpu_decode_graph_abort(&key);
+         else if (ds4_gpu_decode_graph_end(&key) == 0) return true;
+@@ -42950,7 +43004,7 @@
+ #define DS41_USE_FFN_ROW(name, width) row.name = g->rows_view[t].name;
+                     DS41_PREFILL_ROWS(DS41_USE_FFN_ROW)
+ #undef DS41_USE_FFN_ROW
+-                    ok = ds41_graph_after_attention(&row, m, l);
++                    ok = ds41_graph_after_attention(&row, m, l, il);
+                     if (ok && !batch_moe) ok = ds41_moe(&row, m, l, il, (uint32_t)tokens[off + t]) &&
+                         ds41_graph_after_moe(&row);
+                 }

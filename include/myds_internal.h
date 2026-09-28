@@ -5,6 +5,7 @@
 #include "myds_gguf.h"
 #include "myds_tokenizer.h"
 #include "myds_metal.h"
+#include "myds_v41.h"
 #include <stdbool.h>
 
 #ifdef __cplusplus
@@ -56,6 +57,7 @@ typedef struct {
 struct myds_model {
     gguf_file_t         *gf;
     myds_tokenizer_t    *tokenizer;
+    myds_v41_model_t    *v41;
 
     char                 arch[64];
     uint32_t             dim;
@@ -100,6 +102,7 @@ typedef struct myds_prefill_chunk myds_prefill_chunk_t;
 
 struct myds_context {
     myds_model_t        *model;
+    myds_v41_context_t  *v41;
     myds_config_t        cfg;
     uint32_t             pos;
     uint32_t             kv_capacity; /* Allocated KV rows; cfg may request a smaller limit. */
@@ -157,6 +160,8 @@ struct myds_context {
 /* Allows incomplete graphs solely to diagnose tensor/logit mismatches.
  * Never use for user-facing generation or service readiness. */
 myds_model_t *myds_model_load_diagnostic(const char *model_path);
+bool myds_trace_f32(const char *stage, uint32_t layer, uint32_t pos,
+                    const myds_metal_buffer_t *buffer, size_t count);
 
 int32_t myds_sample_next_token(
     const float         *logits,

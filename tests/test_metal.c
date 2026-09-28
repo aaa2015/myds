@@ -750,6 +750,142 @@ static int test_event_tail_completion(int cleanup) {
     return 1;
 }
 
+/* Independent known-answer cases: BF16 expected words are literal IEEE
+ * encodings; HC oracle uses double arithmetic and analytical projection inputs. */
+static float v41_test_bf16(double x) {
+    if (x == 0) return (float)x;
+    int exponent;
+    frexp(fabs(x), &exponent);
+    double quantum = ldexp(1.0, exponent-8);
+    return (float)(nearbyint(x/quantum)*quantum);
+}
+
+static int test_v41_bf16_norm(void) {
+    const uint32_t input[] = {0x3f808000,0x3f818000,0xbf808000,0xbf818000,
+        0x00008000,0x00018000,0x007fffff,0x7f7fffff,0x7f800000,
+        0xff800000,0x7fc12345,0x80000000,0x3f800001};
+    const uint32_t expected[] = {0x3f800000,0x3f820000,0xbf800000,0xbf820000,
+        0x00000000,0x00020000,0x00800000,0x7f800000,0x7f800000,
+        0xff800000,0x7fc10000,0x80000000,0x3f800000};
+    myds_metal_buffer_t *storage=myds_metal_buffer_alloc(sizeof(input)+32);
+    myds_metal_buffer_t *b=myds_metal_buffer_sub_view(storage,16,sizeof(input));
+    ASSERT_TRUE(storage && b);
+    memset(myds_metal_buffer_data(storage),0xa5,sizeof(input)+32);
+    ASSERT_TRUE(myds_metal_buffer_write(b,0,input,sizeof(input)));
+    ASSERT_TRUE(myds_metal_v41_bf16(b,sizeof(input)/4));
+    ASSERT_TRUE(!memcmp(myds_metal_buffer_data(b),expected,sizeof(expected)));
+    const unsigned char *guard=myds_metal_buffer_data(storage);
+    for(unsigned i=0;i<16;i++) ASSERT_TRUE(guard[i]==0xa5 && guard[16+sizeof(input)+i]==0xa5);
+    ASSERT_TRUE(!myds_metal_v41_bf16(b,sizeof(input)/4+1));
+    myds_metal_buffer_free(b); myds_metal_buffer_free(storage);
+    const uint32_t sizes[]={128,512,5120,20480};
+    for(unsigned k=0;k<sizeof(sizes)/sizeof(sizes[0]);k++) {
+        uint32_t n=sizes[k];
+        myds_metal_buffer_t *x=myds_metal_buffer_alloc(n*4),*w=myds_metal_buffer_alloc(n*4),*o=myds_metal_buffer_alloc(n*4);
+        ASSERT_TRUE(x&&w&&o);
+        float *xp=myds_metal_buffer_data(x),*wp=myds_metal_buffer_data(w),*op=myds_metal_buffer_data(o);
+        for(uint32_t i=0;i<n;i++){xp[i]=(i&1)?-2:2;uint32_t bits=(i&2)?0x3f818000:0x3f808000;memcpy(&wp[i],&bits,4);}
+        ASSERT_TRUE(myds_metal_v41_rmsnorm(o,x,w,n,1e-20f,true));
+        for(uint32_t i=0;i<n;i++) ASSERT_NEAR(op[i],((i&1)?-1:1)*((i&2)?1.015625f:1.0f),0);
+        ASSERT_TRUE(myds_metal_v41_rmsnorm(o,x,NULL,n,1e-20f,false));
+        for(uint32_t i=0;i<n;i++) ASSERT_NEAR(op[i],(i&1)?-1:1,0);
+        ASSERT_TRUE(!myds_metal_v41_rmsnorm(o,x,w,n+128,1e-20f,true));
+        ASSERT_TRUE(!myds_metal_v41_rmsnorm(o,x,w,64,1e-20f,true));
+        myds_metal_buffer_free(x);myds_metal_buffer_free(w);myds_metal_buffer_free(o);
+    }
+    printf("  [PASS] V4.1 BF16 literal bits, ties, subnormals, tails and reference RMS reductions\n");
+    return 1;
+}
+
+static void v41_test_split(double out[24],const float base[24],const float scale[3]) {
+    for(unsigned i=0;i<4;i++) out[i]=.5*tanh(.5*((double)((int)i-12)/8*scale[0]+base[i]))+.5+1e-6;
+    for(unsigned i=4;i<8;i++) out[i]=tanh(.5*((double)((int)i-12)/8*scale[1]+base[i]))+1;
+    for(unsigned r=0;r<4;r++) {
+        double peak=-INFINITY,sum=0;
+        for(unsigned c=0;c<4;c++){unsigned i=8+r*4+c;out[i]=(double)((int)i-12)/8*scale[2]+base[i];if(out[i]>peak)peak=out[i];}
+        for(unsigned c=0;c<4;c++){unsigned i=8+r*4+c;out[i]=exp(out[i]-peak);sum+=out[i];}
+        for(unsigned c=0;c<4;c++){unsigned i=8+r*4+c;out[i]=out[i]/sum+1e-6;}
+    }
+    for(unsigned iter=0;iter<20;iter++) {
+        if(iter)for(unsigned r=0;r<4;r++){double sum=1e-6;for(unsigned c=0;c<4;c++)sum+=out[8+r*4+c];for(unsigned c=0;c<4;c++)out[8+r*4+c]/=sum;}
+        for(unsigned c=0;c<4;c++){double sum=1e-6;for(unsigned r=0;r<4;r++)sum+=out[8+r*4+c];for(unsigned r=0;r<4;r++)out[8+r*4+c]/=sum;}
+    }
+}
+
+static int test_v41_hc(void) {
+    enum {D=128};
+    myds_metal_buffer_t *res=myds_metal_buffer_alloc(4*D*4),*fn=myds_metal_buffer_alloc(24*4*D*2),
+        *scale=myds_metal_buffer_alloc(12),*base=myds_metal_buffer_alloc(96),*flat=myds_metal_buffer_alloc(4*D*4),
+        *mix=myds_metal_buffer_alloc(96),*split=myds_metal_buffer_alloc(96),*block=myds_metal_buffer_alloc(D*4),
+        *out=myds_metal_buffer_alloc(4*D*4),*pre=myds_metal_buffer_alloc(16);
+    ASSERT_TRUE(res&&fn&&scale&&base&&flat&&mix&&split&&block&&out&&pre);
+    float *r=myds_metal_buffer_data(res),*s=myds_metal_buffer_data(scale),*b=myds_metal_buffer_data(base);
+    _Float16 *f=myds_metal_buffer_data(fn);
+    for(unsigned i=0;i<4*D;i++)r[i]=2;
+    memset(f,0,24*4*D*2);for(unsigned i=0;i<24;i++)f[i*4*D]=(_Float16)((float)((int)i-12)/8);
+    s[0]=.75f;s[1]=.5f;s[2]=1.25f;
+    for(unsigned i=0;i<24;i++)b[i]=((int)((i*7)%11)-5)*.25f;
+    myds_metal_set_auto_barrier(0);
+    ASSERT_TRUE(myds_metal_begin_batch());
+    ASSERT_TRUE(myds_metal_v41_hc_mix(split,res,fn,GGML_TYPE_F16,scale,base,flat,mix,D,1e-20f,1e-6f));
+    ASSERT_TRUE(myds_metal_commit_batch());
+    const float *m=myds_metal_buffer_data(mix),*sp=myds_metal_buffer_data(split);
+    double oracle[24];v41_test_split(oracle,b,s);
+    for(unsigned i=0;i<24;i++){ASSERT_NEAR(m[i],(float)((int)i-12)/8,0);ASSERT_NEAR(sp[i],oracle[i],2e-6f);}
+    for(unsigned h=0;h<4;h++)for(unsigned i=0;i<D;i++)r[h*D+i]=(float)(h+1)+(float)(i%7)/8;
+    float *p=myds_metal_buffer_data(pre);p[0]=1;p[1]=p[2]=p[3]=0;
+    ASSERT_TRUE(myds_metal_v41_hc_weighted_sum(block,res,pre,D));
+    float *bl=myds_metal_buffer_data(block);for(unsigned i=0;i<D;i++)ASSERT_NEAR(bl[i],r[i],0);
+    p[0]=.5f;p[1]=.25f;p[2]=p[3]=.125f;
+    ASSERT_TRUE(myds_metal_v41_hc_weighted_sum(block,res,pre,D));
+    for(unsigned i=0;i<D;i++)ASSERT_NEAR(bl[i],v41_test_bf16(1.875+(double)(i%7)/8),0);
+    /* Non-symmetric combination matrix catches the source/destination order. */
+    float *splitp=myds_metal_buffer_data(split);
+    for(unsigned i=0;i<24;i++)splitp[i]=0;
+    for(unsigned h=0;h<4;h++){splitp[4+h]=(float)(h+1)/4;splitp[8+((h+1)%4)*4+h]=1;}
+    ASSERT_TRUE(myds_metal_v41_hc_expand(out,block,res,split,D));
+    float *o=myds_metal_buffer_data(out);
+    for(unsigned h=0;h<4;h++)for(unsigned i=0;i<D;i++)ASSERT_NEAR(o[h*D+i],v41_test_bf16((double)bl[i]*(h+1)/4+r[((h+1)%4)*D+i]),0);
+    ASSERT_TRUE(myds_metal_v41_hc_expand(res,block,res,split,D));
+    ASSERT_TRUE(!memcmp(r,o,4*D*4));
+    ASSERT_TRUE(!myds_metal_v41_hc_weighted_sum(block,res,pre,D+1));
+    myds_metal_set_auto_barrier(1);
+    myds_metal_buffer_free(res);myds_metal_buffer_free(fn);myds_metal_buffer_free(scale);myds_metal_buffer_free(base);
+    myds_metal_buffer_free(flat);myds_metal_buffer_free(mix);myds_metal_buffer_free(split);myds_metal_buffer_free(block);
+    myds_metal_buffer_free(out);myds_metal_buffer_free(pre);
+    printf("  [PASS] V4.1 HC F16 projection, independent Sinkhorn oracle, carried pre, expansion orientation/in-place\n");
+    return 1;
+}
+
+static int test_v41_engram_dispatch_copy(void) {
+    enum {D=128};
+    myds_metal_buffer_t *r=myds_metal_buffer_alloc(4*D*4),*p=myds_metal_buffer_alloc(5*D*4),
+        *q=myds_metal_buffer_alloc(4*D*4),*k=myds_metal_buffer_alloc(4*D*4),*copy=myds_metal_buffer_alloc(4*D*4);
+    ASSERT_TRUE(r&&p&&q&&k&&copy);
+    float *rv=myds_metal_buffer_data(r),*pv=myds_metal_buffer_data(p),*qv=myds_metal_buffer_data(q),*kv=myds_metal_buffer_data(k);
+    for(unsigned i=0;i<4*D;i++){rv[i]=2;pv[i]=1;qv[i]=i/D<2?.25f:-.25f;kv[i]=1;}
+    for(unsigned i=0;i<D;i++)pv[4*D+i]=(float)(i%7)/4;
+    ASSERT_TRUE(myds_metal_begin_batch());
+    ASSERT_TRUE(myds_metal_v41_engram_add(r,p,q,k,D,1e-20f));
+    ASSERT_TRUE(myds_metal_buffer_copy(copy,0,r,0,4*D*4));
+    uint64_t count=4*D;uint32_t groups[]={4,1,1},threads[]={32,1,1};const myds_metal_buffer_t *buffers[]={copy};
+    ASSERT_TRUE(myds_metal_dispatch_kernel("kernel_dsv41_bf16_linear",&count,sizeof(count),buffers,1,groups,threads,0));
+    ASSERT_TRUE(myds_metal_commit_batch());
+    for(unsigned h=0;h<4;h++) {
+        double dot=(h<2?.25:-.25)*sqrt(D), gate=1/(1+exp(-copysign(sqrt(fabs(dot)),dot)));
+        for(unsigned i=0;i<D;i++)ASSERT_NEAR(rv[h*D+i],v41_test_bf16(2+gate*pv[4*D+i]),0);
+    }
+    ASSERT_TRUE(!memcmp(rv,myds_metal_buffer_data(copy),4*D*4));
+    ASSERT_TRUE(!myds_metal_buffer_copy(copy,1,copy,0,16));
+    ASSERT_TRUE(!myds_metal_buffer_copy(copy,0,r,0,4*D*4+1));
+    ASSERT_TRUE(!myds_metal_dispatch_kernel("no_such_kernel",&count,sizeof(count),buffers,1,groups,threads,0));
+    threads[0]=UINT32_MAX;
+    ASSERT_TRUE(!myds_metal_dispatch_kernel("kernel_dsv41_bf16_linear",&count,sizeof(count),buffers,1,groups,threads,0));
+    myds_metal_buffer_free(r);myds_metal_buffer_free(p);myds_metal_buffer_free(q);myds_metal_buffer_free(k);myds_metal_buffer_free(copy);
+    printf("  [PASS] V4.1 Engram analytic gates and ordered native dispatch/copy bridge\n");
+    return 1;
+}
+
 int main(void) {
     printf("====================================================\n");
     printf("   Running myds Metal GPU Kernel Verification\n");
@@ -763,6 +899,9 @@ int main(void) {
     int passed = 0;
     int total = 0;
 #define RUN_TEST(test) do { total++; passed += (test); } while (0)
+    RUN_TEST(test_v41_bf16_norm());
+    RUN_TEST(test_v41_hc());
+    RUN_TEST(test_v41_engram_dispatch_copy());
     RUN_TEST(test_rmsnorm());
     RUN_TEST(test_swiglu());
     RUN_TEST(test_rope());
