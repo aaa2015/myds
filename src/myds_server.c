@@ -388,6 +388,15 @@ static void sse_token_callback(const char *piece, int32_t token_id, void *user_d
     sctx->t_last = now;
     sctx->token_count++;
 
+    if (sctx->client_fd >= 0) {
+        char peek_b[1];
+        ssize_t r = recv(sctx->client_fd, peek_b, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+            sctx->cancel_flag = 1;
+            return;
+        }
+    }
+
     char escaped[2048];
     json_escape(piece, escaped, sizeof(escaped));
 
@@ -421,6 +430,15 @@ static void responses_sse_token_callback(const char *piece, int32_t token_id, vo
     sctx->t_last = now;
     sctx->token_count++;
 
+    if (sctx->client_fd >= 0) {
+        char peek_b[1];
+        ssize_t r = recv(sctx->client_fd, peek_b, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+            sctx->cancel_flag = 1;
+            return;
+        }
+    }
+
     char escaped[2048];
     json_escape(piece, escaped, sizeof(escaped));
 
@@ -437,6 +455,8 @@ static void responses_sse_token_callback(const char *piece, int32_t token_id, vo
 
 /* Non-streaming buffer context */
 typedef struct {
+    int client_fd;
+    volatile int cancel_flag;
     char *buf;
     size_t cap;
     size_t len;
@@ -454,6 +474,16 @@ static void non_stream_callback(const char *piece, int32_t token_id, void *user_
     }
     ns->t_last = now;
     ns->token_count++;
+
+    if (ns->client_fd >= 0) {
+        char peek_b[1];
+        ssize_t r = recv(ns->client_fd, peek_b, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+            ns->cancel_flag = 1;
+            return;
+        }
+    }
+
     size_t plen = strlen(piece);
     if (ns->len + plen + 1 > ns->cap) {
         ns->cap = (ns->cap + plen + 4096) * 2;
@@ -686,6 +716,8 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 send(client_fd, ev_completed, clen, 0);
             } else {
                 non_stream_ctx_t ns = {
+                    .client_fd = client_fd,
+                    .cancel_flag = 0,
                     .cap = 4096,
                     .len = 0,
                     .token_count = 0,
@@ -695,7 +727,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 ns.buf = malloc(ns.cap);
                 ns.buf[0] = '\0';
 
-                myds_generate_ex(ctx, prompt, non_stream_callback, &ns, &stop_reason, &prompt_tokens, NULL);
+                myds_generate_ex(ctx, prompt, non_stream_callback, &ns, &stop_reason, &prompt_tokens, &ns.cancel_flag);
                 final_tokens = ns.token_count;
                 t_first = ns.t_first;
                 t_last = ns.t_last;
@@ -780,6 +812,8 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 send(client_fd, done_chunk, strlen(done_chunk), 0);
             } else {
                 non_stream_ctx_t ns = {
+                    .client_fd = client_fd,
+                    .cancel_flag = 0,
                     .cap = 4096,
                     .len = 0,
                     .token_count = 0,
@@ -789,7 +823,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 ns.buf = malloc(ns.cap);
                 ns.buf[0] = '\0';
 
-                myds_generate_ex(ctx, prompt, non_stream_callback, &ns, &stop_reason, &prompt_tokens, NULL);
+                myds_generate_ex(ctx, prompt, non_stream_callback, &ns, &stop_reason, &prompt_tokens, &ns.cancel_flag);
                 final_tokens = ns.token_count;
                 t_first = ns.t_first;
                 t_last = ns.t_last;
