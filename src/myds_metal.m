@@ -40,6 +40,12 @@ static id<MTLComputePipelineState> g_pso_moe_sum6_q2_k = nil;
 static id<MTLComputePipelineState> g_pso_moe_slots6_pair_swiglu_iq2_xxs = nil;
 static id<MTLComputePipelineState> g_pso_moe_slots6_sum6_q2_k = nil;
 static id<MTLComputePipelineState> g_pso_attn_out_low_q8_0 = nil;
+static id<MTLComputePipelineState> g_pso_mul_mm_q8_0 = nil;
+static id<MTLComputePipelineState> g_pso_mul_mm_q8_0_bco = nil;
+static id<MTLComputePipelineState> g_pso_mul_mm_f16 = nil;
+static id<MTLComputePipelineState> g_pso_mul_mm_f16_bco = nil;
+static id<MTLComputePipelineState> g_pso_mul_mm_f32 = nil;
+static id<MTLComputePipelineState> g_pso_mul_mm_f32_bco = nil;
 static id<MTLSharedEvent>          g_shared_event = nil;
 static uint64_t                    g_shared_event_val = 0;
 static bool                        g_initialized = false;
@@ -358,6 +364,32 @@ int myds_metal_init(const char *shader_dir) {
             g_pso_attn_out_low_q8_0 = [g_device newComputePipelineStateWithFunction:fn error:nil];
         }
 
+        /* 11. Build Batched MatMul (GEMM) pipelines with function constants 700/701 */
+        MTLFunctionConstantValues *mm_c_bco0 = [[MTLFunctionConstantValues alloc] init];
+        bool b_false = false;
+        bool b_true = true;
+        [mm_c_bco0 setConstantValue:&b_false type:MTLDataTypeBool atIndex:700];
+        [mm_c_bco0 setConstantValue:&b_false type:MTLDataTypeBool atIndex:701];
+
+        MTLFunctionConstantValues *mm_c_bco1 = [[MTLFunctionConstantValues alloc] init];
+        [mm_c_bco1 setConstantValue:&b_false type:MTLDataTypeBool atIndex:700];
+        [mm_c_bco1 setConstantValue:&b_true type:MTLDataTypeBool atIndex:701];
+
+        fn = [g_library newFunctionWithName:@"kernel_mul_mm_q8_0_f32" constantValues:mm_c_bco0 error:nil];
+        if (fn) g_pso_mul_mm_q8_0 = [g_device newComputePipelineStateWithFunction:fn error:nil];
+        fn = [g_library newFunctionWithName:@"kernel_mul_mm_q8_0_f32" constantValues:mm_c_bco1 error:nil];
+        if (fn) g_pso_mul_mm_q8_0_bco = [g_device newComputePipelineStateWithFunction:fn error:nil];
+
+        fn = [g_library newFunctionWithName:@"kernel_mul_mm_f16_f32" constantValues:mm_c_bco0 error:nil];
+        if (fn) g_pso_mul_mm_f16 = [g_device newComputePipelineStateWithFunction:fn error:nil];
+        fn = [g_library newFunctionWithName:@"kernel_mul_mm_f16_f32" constantValues:mm_c_bco1 error:nil];
+        if (fn) g_pso_mul_mm_f16_bco = [g_device newComputePipelineStateWithFunction:fn error:nil];
+
+        fn = [g_library newFunctionWithName:@"kernel_mul_mm_f32_f32_full" constantValues:mm_c_bco0 error:nil];
+        if (fn) g_pso_mul_mm_f32 = [g_device newComputePipelineStateWithFunction:fn error:nil];
+        fn = [g_library newFunctionWithName:@"kernel_mul_mm_f32_f32_full" constantValues:mm_c_bco1 error:nil];
+        if (fn) g_pso_mul_mm_f32_bco = [g_device newComputePipelineStateWithFunction:fn error:nil];
+
         g_initialized = true;
         printf("myds_metal: Initialized successfully on GPU: %s\n", [[g_device name] UTF8String]);
         return 1;
@@ -513,6 +545,18 @@ myds_metal_buffer_t *myds_metal_buffer_from_ptr(const void *ptr, size_t bytes) {
         buf->is_view = true;
         return buf;
     }
+}
+
+myds_metal_buffer_t *myds_metal_buffer_sub_view(const myds_metal_buffer_t *parent, size_t offset, size_t bytes) {
+    if (!parent || !parent->mtl_buf || (offset + bytes) > parent->size) return NULL;
+    myds_metal_buffer_t *buf = (myds_metal_buffer_t *)calloc(1, sizeof(myds_metal_buffer_t));
+    if (!buf) return NULL;
+    buf->mtl_buf = parent->mtl_buf;
+    buf->size = bytes;
+    buf->offset = parent->offset + offset;
+    buf->ptr = (void *)((uintptr_t)parent->ptr + offset);
+    buf->is_view = true;
+    return buf;
 }
 
 void myds_metal_buffer_free(myds_metal_buffer_t *buf) {
@@ -1029,6 +1073,117 @@ int myds_metal_gemv(
     MYDS_LOG_E("myds_metal_gemv: unsupported GGML quantization type %d (%s) for GEMV out_dim=%u, in_dim=%u",
                (int)weight_type, ggml_type_name(weight_type), out_dim, in_dim);
     return 0;
+}
+
+struct ds4_metal_args_mul_mm {
+    int32_t  ne00;
+    int32_t  ne02;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  ne12;
+    uint64_t nb10;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    int32_t  ne0;
+    int32_t  ne1;
+    int16_t  r2;
+    int16_t  r3;
+};
+
+int myds_metal_mul_mm(
+    myds_metal_buffer_t       *dst,
+    const myds_metal_buffer_t *W,
+    const myds_metal_buffer_t *src1,
+    uint32_t                   out_dim,
+    uint32_t                   in_dim,
+    uint32_t                   n_tok,
+    ggml_type                  weight_type) {
+    if (!dst || !W || !src1 || out_dim == 0 || in_dim == 0 || n_tok == 0) return 0;
+    if (n_tok == 1) {
+        return myds_metal_gemv(dst, W, src1, out_dim, in_dim, weight_type);
+    }
+
+    const bool bc_inp = (in_dim % 32u) != 0;
+    const bool bc_out = (out_dim % 64u) != 0 || (n_tok % 32u) != 0;
+
+    id<MTLComputePipelineState> pipeline = nil;
+    uint64_t row_bytes = 0;
+
+    if (weight_type == GGML_TYPE_Q8_0) {
+        pipeline = bc_out ? g_pso_mul_mm_q8_0_bco : g_pso_mul_mm_q8_0;
+        row_bytes = (in_dim / 32u) * 34u;
+    } else if (weight_type == GGML_TYPE_F16) {
+        pipeline = bc_out ? g_pso_mul_mm_f16_bco : g_pso_mul_mm_f16;
+        row_bytes = in_dim * sizeof(uint16_t);
+    } else if (weight_type == GGML_TYPE_F32) {
+        pipeline = bc_out ? g_pso_mul_mm_f32_bco : g_pso_mul_mm_f32;
+        row_bytes = in_dim * sizeof(float);
+    }
+
+    if (pipeline && W->mtl_buf && src1->mtl_buf && dst->mtl_buf && !bc_inp) {
+        @autoreleasepool {
+            struct ds4_metal_args_mul_mm args;
+            memset(&args, 0, sizeof(args));
+            args.ne00 = (int32_t)in_dim;
+            args.ne02 = 1;
+            args.nb01 = row_bytes;
+            args.nb02 = row_bytes * out_dim;
+            args.nb03 = row_bytes * out_dim;
+            args.ne12 = 1;
+            args.nb10 = sizeof(float);
+            args.nb11 = in_dim * sizeof(float);
+            args.nb12 = (uint64_t)in_dim * n_tok * sizeof(float);
+            args.nb13 = (uint64_t)in_dim * n_tok * sizeof(float);
+            args.ne0 = (int32_t)out_dim;
+            args.ne1 = (int32_t)n_tok;
+            args.r2 = 1;
+            args.r3 = 1;
+
+            id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
+            [enc setComputePipelineState:pipeline];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:W->mtl_buf offset:(W ? W->offset : 0) atIndex:1];
+            [enc setBuffer:src1->mtl_buf offset:(src1 ? src1->offset : 0) atIndex:2];
+            [enc setBuffer:dst->mtl_buf offset:(dst ? dst->offset : 0) atIndex:3];
+            [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
+                                                  ((NSUInteger)out_dim + 63u) / 64u,
+                                                  1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+            if (g_batch_cb) {
+                if (g_auto_barrier) {
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                }
+            } else {
+                [enc endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+            }
+            return 1;
+        }
+    }
+
+    /* Fallback to per-vector GEMV */
+    for (uint32_t t = 0; t < n_tok; t++) {
+        myds_metal_buffer_t x_t = *src1;
+        x_t.offset += (size_t)t * in_dim * sizeof(float);
+        x_t.ptr = (char *)src1->ptr + (size_t)t * in_dim * sizeof(float);
+        x_t.size = in_dim * sizeof(float);
+
+        myds_metal_buffer_t y_t = *dst;
+        y_t.offset += (size_t)t * out_dim * sizeof(float);
+        y_t.ptr = (char *)dst->ptr + (size_t)t * out_dim * sizeof(float);
+        y_t.size = out_dim * sizeof(float);
+
+        if (!myds_metal_gemv(&y_t, W, &x_t, out_dim, in_dim, weight_type)) {
+            return 0;
+        }
+    }
+    return 1;
 }
 
 struct ds4_metal_args_mul_mv_id {

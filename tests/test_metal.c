@@ -237,6 +237,82 @@ static int test_gemv_q8_0(void) {
     return 1;
 }
 
+static int test_mul_mm_q8_0(void) {
+    const uint32_t out_dim = 64;
+    const uint32_t in_dim = 256;
+    const uint32_t n_tok = 4;
+
+    typedef struct {
+        uint16_t d;
+        int8_t   qs[32];
+    } block_q8_0_t;
+
+    size_t q8_bytes = (size_t)out_dim * (in_dim / 32) * sizeof(block_q8_0_t);
+    myds_metal_buffer_t *W = myds_metal_buffer_alloc(q8_bytes);
+    myds_metal_buffer_t *x = myds_metal_buffer_alloc(n_tok * in_dim * sizeof(float));
+    myds_metal_buffer_t *y = myds_metal_buffer_alloc(n_tok * out_dim * sizeof(float));
+    ASSERT_TRUE(W && x && y);
+
+    block_q8_0_t *blocks = (block_q8_0_t *)myds_metal_buffer_data(W);
+    float *xv = (float *)myds_metal_buffer_data(x);
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t i = 0; i < in_dim; i++) {
+            xv[t * in_dim + i] = (float)(t + 1);
+        }
+    }
+
+    uint16_t half_half = 0x3800; // 0.5f
+    uint32_t n_blocks = out_dim * (in_dim / 32);
+    for (uint32_t b = 0; b < n_blocks; b++) {
+        blocks[b].d = half_half;
+        for (int i = 0; i < 32; i++) {
+            blocks[b].qs[i] = 2; // 0.5 * 2 = 1.0
+        }
+    }
+
+    ASSERT_TRUE(myds_metal_mul_mm(y, W, x, out_dim, in_dim, n_tok, GGML_TYPE_Q8_0));
+
+    float *yv = (float *)myds_metal_buffer_data(y);
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t r = 0; r < out_dim; r++) {
+            float expected = (float)(t + 1) * (float)in_dim;
+            ASSERT_NEAR(yv[t * out_dim + r], expected, 1e-1f);
+        }
+    }
+
+    myds_metal_buffer_free(x);
+    myds_metal_buffer_free(y);
+
+    /* Also test unaligned token count across tile boundaries: n_tok = 35 */
+    const uint32_t n_tok_odd = 35;
+    x = myds_metal_buffer_alloc(n_tok_odd * in_dim * sizeof(float));
+    y = myds_metal_buffer_alloc(n_tok_odd * out_dim * sizeof(float));
+    ASSERT_TRUE(x && y);
+
+    xv = (float *)myds_metal_buffer_data(x);
+    for (uint32_t t = 0; t < n_tok_odd; t++) {
+        for (uint32_t i = 0; i < in_dim; i++) {
+            xv[t * in_dim + i] = (float)(t + 1);
+        }
+    }
+
+    ASSERT_TRUE(myds_metal_mul_mm(y, W, x, out_dim, in_dim, n_tok_odd, GGML_TYPE_Q8_0));
+
+    yv = (float *)myds_metal_buffer_data(y);
+    for (uint32_t t = 0; t < n_tok_odd; t++) {
+        for (uint32_t r = 0; r < out_dim; r++) {
+            float expected = (float)(t + 1) * (float)in_dim;
+            ASSERT_NEAR(yv[t * out_dim + r], expected, 1e-1f);
+        }
+    }
+
+    myds_metal_buffer_free(W);
+    myds_metal_buffer_free(x);
+    myds_metal_buffer_free(y);
+    printf("  [PASS] Batched Matrix-Matrix Q8_0 test (out_dim=%u, in_dim=%u, n_tok=%u and %u)\n", out_dim, in_dim, n_tok, n_tok_odd);
+    return 1;
+}
+
 static int test_moe_sum(void) {
     const uint32_t n_activated = 4;
     const uint32_t dim = 512;
@@ -499,6 +575,7 @@ int main(void) {
     passed += test_moe_routing();
     passed += test_gemv_f32();
     passed += test_gemv_q8_0();
+    passed += test_mul_mm_q8_0();
     passed += test_moe_sum();
     passed += test_add();
     passed += test_softmax();
@@ -510,12 +587,12 @@ int main(void) {
     myds_metal_cleanup();
 
     printf("====================================================\n");
-    if (passed == 13) {
-        printf("  ALL 13 METAL OPERATOR & BATCH TESTS PASSED! (Apple Silicon GPU)\n");
+    if (passed == 14) {
+        printf("  ALL 14 METAL OPERATOR & BATCH TESTS PASSED! (Apple Silicon GPU)\n");
         printf("====================================================\n");
         return 0;
     } else {
-        printf("  TESTS FAILED (passed %d/13)\n", passed);
+        printf("  TESTS FAILED (passed %d/14)\n", passed);
         return 1;
     }
 }

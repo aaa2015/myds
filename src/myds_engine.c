@@ -1867,6 +1867,25 @@ int32_t myds_forward_token(myds_context_t *ctx, int32_t token_id, uint32_t pos) 
 #define MYDS_PREFILL_CHUNK_SIZE 512
 
 typedef struct {
+    /* Contiguous unified chunk buffers for batched GEMM */
+    myds_metal_buffer_t *x_buf;
+    myds_metal_buffer_t *x_norm_buf;
+    myds_metal_buffer_t *qr_buf;
+    myds_metal_buffer_t *qr_norm_buf;
+    myds_metal_buffer_t *q_buf;
+    myds_metal_buffer_t *kv_act_buf;
+    myds_metal_buffer_t *attn_heads_buf;
+    myds_metal_buffer_t *attn_low_buf;
+    myds_metal_buffer_t *attn_out_buf;
+    myds_metal_buffer_t *ffn_norm_out_buf;
+    myds_metal_buffer_t *router_logits_buf;
+    myds_metal_buffer_t *shared_gate_out_buf;
+    myds_metal_buffer_t *shared_up_out_buf;
+    myds_metal_buffer_t *shared_swiglu_out_buf;
+    myds_metal_buffer_t *shared_out_buf;
+    myds_metal_buffer_t *moe_out_buf;
+
+    /* Per-token slice views for token workers */
     myds_metal_buffer_t *x[MYDS_PREFILL_CHUNK_SIZE];
     myds_metal_buffer_t *x_norm[MYDS_PREFILL_CHUNK_SIZE];
     myds_metal_buffer_t *qr[MYDS_PREFILL_CHUNK_SIZE];
@@ -1898,26 +1917,49 @@ static myds_prefill_chunk_t *create_prefill_chunk(myds_model_t *model) {
     uint32_t exp_dim = model->moe_expert_dim > 0 ? model->moe_expert_dim : 2304;
     uint32_t n_routed = model->n_routed_experts > 0 ? model->n_routed_experts : 384;
     uint32_t n_active = model->n_activated_experts > 0 ? model->n_activated_experts : 6;
+    size_t C = MYDS_PREFILL_CHUNK_SIZE;
 
-    for (int t = 0; t < MYDS_PREFILL_CHUNK_SIZE; t++) {
-        chunk->x[t] = myds_metal_buffer_alloc(dim * sizeof(float));
-        chunk->x_norm[t] = myds_metal_buffer_alloc(dim * sizeof(float));
-        chunk->attn_out[t] = myds_metal_buffer_alloc(dim * sizeof(float));
-        chunk->ffn_norm_out[t] = myds_metal_buffer_alloc(dim * sizeof(float));
+    /* 1. Allocate contiguous chunk tensors */
+    chunk->x_buf = myds_metal_buffer_alloc(C * dim * sizeof(float));
+    chunk->x_norm_buf = myds_metal_buffer_alloc(C * dim * sizeof(float));
+    chunk->attn_out_buf = myds_metal_buffer_alloc(C * dim * sizeof(float));
+    chunk->ffn_norm_out_buf = myds_metal_buffer_alloc(C * dim * sizeof(float));
+    if (model->is_mla) {
+        chunk->qr_buf = myds_metal_buffer_alloc(C * model->q_lora_rank * sizeof(float));
+        chunk->qr_norm_buf = myds_metal_buffer_alloc(C * model->q_lora_rank * sizeof(float));
+        chunk->q_buf = myds_metal_buffer_alloc(C * model->n_heads * model->head_dim * sizeof(float));
+        chunk->kv_act_buf = myds_metal_buffer_alloc(C * model->head_dim * sizeof(float));
+        chunk->attn_heads_buf = myds_metal_buffer_alloc(C * model->n_heads * model->head_dim * sizeof(float));
+        chunk->attn_low_buf = myds_metal_buffer_alloc(C * model->n_out_groups * model->out_group_rank * sizeof(float));
+    }
+    chunk->router_logits_buf = myds_metal_buffer_alloc(C * n_routed * sizeof(float));
+    chunk->shared_gate_out_buf = myds_metal_buffer_alloc(C * exp_dim * sizeof(float));
+    chunk->shared_up_out_buf = myds_metal_buffer_alloc(C * exp_dim * sizeof(float));
+    chunk->shared_swiglu_out_buf = myds_metal_buffer_alloc(C * exp_dim * sizeof(float));
+    chunk->shared_out_buf = myds_metal_buffer_alloc(C * dim * sizeof(float));
+    chunk->moe_out_buf = myds_metal_buffer_alloc(C * dim * sizeof(float));
+
+    /* 2. Create subviews for per-token workers and allocate scratch buffers */
+    for (size_t t = 0; t < C; t++) {
+        chunk->x[t] = myds_metal_buffer_sub_view(chunk->x_buf, t * dim * sizeof(float), dim * sizeof(float));
+        chunk->x_norm[t] = myds_metal_buffer_sub_view(chunk->x_norm_buf, t * dim * sizeof(float), dim * sizeof(float));
+        chunk->attn_out[t] = myds_metal_buffer_sub_view(chunk->attn_out_buf, t * dim * sizeof(float), dim * sizeof(float));
+        chunk->ffn_norm_out[t] = myds_metal_buffer_sub_view(chunk->ffn_norm_out_buf, t * dim * sizeof(float), dim * sizeof(float));
         if (model->is_mla) {
-            chunk->qr[t] = myds_metal_buffer_alloc(model->q_lora_rank * sizeof(float));
-            chunk->qr_norm[t] = myds_metal_buffer_alloc(model->q_lora_rank * sizeof(float));
-            chunk->q[t] = myds_metal_buffer_alloc(model->n_heads * model->head_dim * sizeof(float));
-            chunk->kv_act[t] = myds_metal_buffer_alloc(model->head_dim * sizeof(float));
-            chunk->attn_heads[t] = myds_metal_buffer_alloc(model->n_heads * model->head_dim * sizeof(float));
-            chunk->attn_low[t] = myds_metal_buffer_alloc((size_t)model->n_out_groups * model->out_group_rank * sizeof(float));
+            chunk->qr[t] = myds_metal_buffer_sub_view(chunk->qr_buf, t * model->q_lora_rank * sizeof(float), model->q_lora_rank * sizeof(float));
+            chunk->qr_norm[t] = myds_metal_buffer_sub_view(chunk->qr_norm_buf, t * model->q_lora_rank * sizeof(float), model->q_lora_rank * sizeof(float));
+            chunk->q[t] = myds_metal_buffer_sub_view(chunk->q_buf, t * model->n_heads * model->head_dim * sizeof(float), model->n_heads * model->head_dim * sizeof(float));
+            chunk->kv_act[t] = myds_metal_buffer_sub_view(chunk->kv_act_buf, t * model->head_dim * sizeof(float), model->head_dim * sizeof(float));
+            chunk->attn_heads[t] = myds_metal_buffer_sub_view(chunk->attn_heads_buf, t * model->n_heads * model->head_dim * sizeof(float), model->n_heads * model->head_dim * sizeof(float));
+            chunk->attn_low[t] = myds_metal_buffer_sub_view(chunk->attn_low_buf, t * model->n_out_groups * model->out_group_rank * sizeof(float), model->n_out_groups * model->out_group_rank * sizeof(float));
         }
-        chunk->router_logits[t] = myds_metal_buffer_alloc(n_routed * sizeof(float));
-        chunk->shared_gate_out[t] = myds_metal_buffer_alloc(exp_dim * sizeof(float));
-        chunk->shared_up_out[t] = myds_metal_buffer_alloc(exp_dim * sizeof(float));
-        chunk->shared_swiglu_out[t] = myds_metal_buffer_alloc(exp_dim * sizeof(float));
-        chunk->shared_out[t] = myds_metal_buffer_alloc(dim * sizeof(float));
-        chunk->moe_out[t] = myds_metal_buffer_alloc(dim * sizeof(float));
+        chunk->router_logits[t] = myds_metal_buffer_sub_view(chunk->router_logits_buf, t * n_routed * sizeof(float), n_routed * sizeof(float));
+        chunk->shared_gate_out[t] = myds_metal_buffer_sub_view(chunk->shared_gate_out_buf, t * exp_dim * sizeof(float), exp_dim * sizeof(float));
+        chunk->shared_up_out[t] = myds_metal_buffer_sub_view(chunk->shared_up_out_buf, t * exp_dim * sizeof(float), exp_dim * sizeof(float));
+        chunk->shared_swiglu_out[t] = myds_metal_buffer_sub_view(chunk->shared_swiglu_out_buf, t * exp_dim * sizeof(float), exp_dim * sizeof(float));
+        chunk->shared_out[t] = myds_metal_buffer_sub_view(chunk->shared_out_buf, t * dim * sizeof(float), dim * sizeof(float));
+        chunk->moe_out[t] = myds_metal_buffer_sub_view(chunk->moe_out_buf, t * dim * sizeof(float), dim * sizeof(float));
+
         chunk->selected_ids[t] = myds_metal_buffer_alloc(n_active * sizeof(int32_t));
         chunk->selected_weights[t] = myds_metal_buffer_alloc(n_active * sizeof(float));
         chunk->moe_gate[t] = myds_metal_buffer_alloc(n_active * exp_dim * sizeof(float));
@@ -1954,6 +1996,22 @@ static void free_prefill_chunk(myds_prefill_chunk_t *chunk) {
         if (chunk->moe_mid[t]) myds_metal_buffer_free(chunk->moe_mid[t]);
         if (chunk->moe_down[t]) myds_metal_buffer_free(chunk->moe_down[t]);
     }
+    if (chunk->x_buf) myds_metal_buffer_free(chunk->x_buf);
+    if (chunk->x_norm_buf) myds_metal_buffer_free(chunk->x_norm_buf);
+    if (chunk->attn_out_buf) myds_metal_buffer_free(chunk->attn_out_buf);
+    if (chunk->ffn_norm_out_buf) myds_metal_buffer_free(chunk->ffn_norm_out_buf);
+    if (chunk->qr_buf) myds_metal_buffer_free(chunk->qr_buf);
+    if (chunk->qr_norm_buf) myds_metal_buffer_free(chunk->qr_norm_buf);
+    if (chunk->q_buf) myds_metal_buffer_free(chunk->q_buf);
+    if (chunk->kv_act_buf) myds_metal_buffer_free(chunk->kv_act_buf);
+    if (chunk->attn_heads_buf) myds_metal_buffer_free(chunk->attn_heads_buf);
+    if (chunk->attn_low_buf) myds_metal_buffer_free(chunk->attn_low_buf);
+    if (chunk->router_logits_buf) myds_metal_buffer_free(chunk->router_logits_buf);
+    if (chunk->shared_gate_out_buf) myds_metal_buffer_free(chunk->shared_gate_out_buf);
+    if (chunk->shared_up_out_buf) myds_metal_buffer_free(chunk->shared_up_out_buf);
+    if (chunk->shared_swiglu_out_buf) myds_metal_buffer_free(chunk->shared_swiglu_out_buf);
+    if (chunk->shared_out_buf) myds_metal_buffer_free(chunk->shared_out_buf);
+    if (chunk->moe_out_buf) myds_metal_buffer_free(chunk->moe_out_buf);
     free(chunk);
 }
 
@@ -2097,14 +2155,12 @@ static int execute_prefill_chunk_layer(
     myds_metal_barrier();
 
     /* 1.2 Q_a and KV projections */
-    for (uint32_t t = 0; t < chunk_len; t++) {
-        if (!myds_metal_gemv(chunk->qr[t], layer->attn_q_a, chunk->x_norm[t], m->q_lora_rank, dim, layer->attn_q_a_type) ||
-            !myds_metal_gemv(chunk->kv_act[t], layer->attn_kv, chunk->x_norm[t], m->head_dim, dim, layer->attn_kv_type)) {
-            MYDS_LOG_E("Prefill chunk Batch 1 Q_a/KV failed at layer %u", l);
-            myds_metal_set_auto_barrier(1);
-            myds_metal_commit_batch();
-            return 0;
-        }
+    if (!myds_metal_mul_mm(chunk->qr_buf, layer->attn_q_a, chunk->x_norm_buf, m->q_lora_rank, dim, chunk_len, layer->attn_q_a_type) ||
+        !myds_metal_mul_mm(chunk->kv_act_buf, layer->attn_kv, chunk->x_norm_buf, m->head_dim, dim, chunk_len, layer->attn_kv_type)) {
+        MYDS_LOG_E("Prefill chunk Batch 1 Q_a/KV failed at layer %u", l);
+        myds_metal_set_auto_barrier(1);
+        myds_metal_commit_batch();
+        return 0;
     }
     myds_metal_barrier();
 
@@ -2121,13 +2177,11 @@ static int execute_prefill_chunk_layer(
     myds_metal_barrier();
 
     /* 1.4 Q_b projection */
-    for (uint32_t t = 0; t < chunk_len; t++) {
-        if (!myds_metal_gemv(chunk->q[t], layer->attn_q_b, chunk->qr_norm[t], m->n_heads * m->head_dim, m->q_lora_rank, layer->attn_q_b_type)) {
-            MYDS_LOG_E("Prefill chunk Batch 1 Q_b failed at layer %u", l);
-            myds_metal_set_auto_barrier(1);
-            myds_metal_commit_batch();
-            return 0;
-        }
+    if (!myds_metal_mul_mm(chunk->q_buf, layer->attn_q_b, chunk->qr_norm_buf, m->n_heads * m->head_dim, m->q_lora_rank, chunk_len, layer->attn_q_b_type)) {
+        MYDS_LOG_E("Prefill chunk Batch 1 Q_b failed at layer %u", l);
+        myds_metal_set_auto_barrier(1);
+        myds_metal_commit_batch();
+        return 0;
     }
     myds_metal_commit_batch();
     if (do_prof) gettimeofday(&tp1, NULL);
@@ -2181,20 +2235,16 @@ static int execute_prefill_chunk_layer(
     myds_metal_barrier();
 
     /* 2.2 Attn out B */
-    for (uint32_t t = 0; t < chunk_len; t++) {
-        if (!myds_metal_gemv(chunk->attn_out[t], layer->attn_output_b, chunk->attn_low[t], dim, m->n_out_groups * m->out_group_rank, layer->attn_output_b_type)) {
-            MYDS_LOG_E("Prefill chunk Batch 2 out_b failed at layer %u", l);
-            myds_metal_set_auto_barrier(1);
-            myds_metal_commit_batch();
-            return 0;
-        }
+    if (!myds_metal_mul_mm(chunk->attn_out_buf, layer->attn_output_b, chunk->attn_low_buf, dim, m->n_out_groups * m->out_group_rank, chunk_len, layer->attn_output_b_type)) {
+        MYDS_LOG_E("Prefill chunk Batch 2 out_b failed at layer %u", l);
+        myds_metal_set_auto_barrier(1);
+        myds_metal_commit_batch();
+        return 0;
     }
     myds_metal_barrier();
 
     /* 2.3 Residual add */
-    for (uint32_t t = 0; t < chunk_len; t++) {
-        myds_metal_add(chunk->x[t], chunk->x[t], chunk->attn_out[t], dim);
-    }
+    myds_metal_add(chunk->x_buf, chunk->x_buf, chunk->attn_out_buf, chunk_len * dim);
     myds_metal_barrier();
 
     /* 2.4 FFN RMSNorm */
@@ -2208,21 +2258,19 @@ static int execute_prefill_chunk_layer(
     myds_metal_barrier();
 
     /* 2.5 Router gate + Shared gate/up */
-    for (uint32_t t = 0; t < chunk_len; t++) {
-        if (!myds_metal_gemv(chunk->router_logits[t], layer->router_gate, chunk->ffn_norm_out[t], n_routed, dim, layer->router_gate_type)) {
-            MYDS_LOG_E("Prefill chunk router_gate failed at layer %u", l);
+    if (!myds_metal_mul_mm(chunk->router_logits_buf, layer->router_gate, chunk->ffn_norm_out_buf, n_routed, dim, chunk_len, layer->router_gate_type)) {
+        MYDS_LOG_E("Prefill chunk router_gate failed at layer %u", l);
+        myds_metal_set_auto_barrier(1);
+        myds_metal_commit_batch();
+        return 0;
+    }
+    if (layer->shared_gate && layer->shared_up && chunk->shared_out_buf) {
+        if (!myds_metal_mul_mm(chunk->shared_gate_out_buf, layer->shared_gate, chunk->ffn_norm_out_buf, exp_dim, dim, chunk_len, layer->shared_gate_type) ||
+            !myds_metal_mul_mm(chunk->shared_up_out_buf, layer->shared_up, chunk->ffn_norm_out_buf, exp_dim, dim, chunk_len, layer->shared_up_type)) {
+            MYDS_LOG_E("Prefill chunk shared_gate/up failed at layer %u", l);
             myds_metal_set_auto_barrier(1);
             myds_metal_commit_batch();
             return 0;
-        }
-        if (layer->shared_gate && layer->shared_up && chunk->shared_out[t]) {
-            if (!myds_metal_gemv(chunk->shared_gate_out[t], layer->shared_gate, chunk->ffn_norm_out[t], exp_dim, dim, layer->shared_gate_type) ||
-                !myds_metal_gemv(chunk->shared_up_out[t], layer->shared_up, chunk->ffn_norm_out[t], exp_dim, dim, layer->shared_up_type)) {
-                MYDS_LOG_E("Prefill chunk shared_gate/up failed at layer %u", l);
-                myds_metal_set_auto_barrier(1);
-                myds_metal_commit_batch();
-                return 0;
-            }
         }
     }
     myds_metal_barrier();
@@ -2278,25 +2326,21 @@ static int execute_prefill_chunk_layer(
     myds_metal_barrier();
 
     /* 3.2 Shared down */
-    for (uint32_t t = 0; t < chunk_len; t++) {
-        if (layer->shared_gate && layer->shared_up && layer->shared_down && chunk->shared_out[t]) {
-            if (!myds_metal_gemv(chunk->shared_out[t], layer->shared_down, chunk->shared_swiglu_out[t], dim, exp_dim, layer->shared_down_type)) {
-                MYDS_LOG_E("Prefill chunk shared_down failed at layer %u", l);
-                myds_metal_set_auto_barrier(1);
-                myds_metal_commit_batch();
-                return 0;
-            }
+    if (layer->shared_gate && layer->shared_up && layer->shared_down && chunk->shared_out_buf) {
+        if (!myds_metal_mul_mm(chunk->shared_out_buf, layer->shared_down, chunk->shared_swiglu_out_buf, dim, exp_dim, chunk_len, layer->shared_down_type)) {
+            MYDS_LOG_E("Prefill chunk shared_down failed at layer %u", l);
+            myds_metal_set_auto_barrier(1);
+            myds_metal_commit_batch();
+            return 0;
         }
     }
     myds_metal_barrier();
 
     /* 3.3 Final residual addition */
-    for (uint32_t t = 0; t < chunk_len; t++) {
-        if (layer->shared_gate && layer->shared_up && layer->shared_down && chunk->shared_out[t]) {
-            myds_metal_add(chunk->moe_out[t], chunk->moe_out[t], chunk->shared_out[t], dim);
-        }
-        myds_metal_add(chunk->x[t], chunk->x[t], chunk->moe_out[t], dim);
+    if (layer->shared_gate && layer->shared_up && layer->shared_down && chunk->shared_out_buf) {
+        myds_metal_add(chunk->moe_out_buf, chunk->moe_out_buf, chunk->shared_out_buf, chunk_len * dim);
     }
+    myds_metal_add(chunk->x_buf, chunk->x_buf, chunk->moe_out_buf, chunk_len * dim);
     myds_metal_commit_batch();
     myds_metal_set_auto_barrier(1);
 
@@ -2389,9 +2433,7 @@ static int myds_prefill_tokens(myds_context_t *ctx, const int32_t *tokens, int32
             uint32_t chunk_pos = base_pos + (uint32_t)c_start;
 
             /* Load chunk activations from prompt_x */
-            for (uint32_t t = 0; t < chunk_len; t++) {
-                memcpy(myds_metal_buffer_data(chunk->x[t]), prompt_x + (size_t)(c_start + t) * dim, dim * sizeof(float));
-            }
+            memcpy(myds_metal_buffer_data(chunk->x_buf), prompt_x + (size_t)c_start * dim, (size_t)chunk_len * dim * sizeof(float));
 
             /* Pass chunk through layer l */
             if (!execute_prefill_chunk_layer(ctx, chunk, l, chunk_pos, chunk_len)) {
@@ -2401,9 +2443,7 @@ static int myds_prefill_tokens(myds_context_t *ctx, const int32_t *tokens, int32
             }
 
             /* Store chunk updated activations back to prompt_x */
-            for (uint32_t t = 0; t < chunk_len; t++) {
-                memcpy(prompt_x + (size_t)(c_start + t) * dim, myds_metal_buffer_data(chunk->x[t]), dim * sizeof(float));
-            }
+            memcpy(prompt_x + (size_t)c_start * dim, myds_metal_buffer_data(chunk->x_buf), (size_t)chunk_len * dim * sizeof(float));
         }
     }
 

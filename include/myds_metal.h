@@ -20,6 +20,7 @@ void myds_metal_cleanup(void);
 /* Buffer allocation and memory mapping */
 myds_metal_buffer_t *myds_metal_buffer_alloc(size_t bytes);
 myds_metal_buffer_t *myds_metal_buffer_from_ptr(const void *ptr, size_t bytes);
+myds_metal_buffer_t *myds_metal_buffer_sub_view(const myds_metal_buffer_t *parent, size_t offset, size_t bytes);
 void                 myds_metal_buffer_free(myds_metal_buffer_t *buf);
 void                *myds_metal_buffer_data(myds_metal_buffer_t *buf);
 size_t               myds_metal_buffer_size(const myds_metal_buffer_t *buf);
@@ -57,6 +58,16 @@ int myds_metal_gemv(
     const myds_metal_buffer_t *x,
     uint32_t                   out_dim,
     uint32_t                   in_dim,
+    ggml_type                  weight_type);
+
+/* Batched Matrix-Matrix Multiplication (GEMM): dst [n_tok, out_dim] = src1 [n_tok, in_dim] * W^T [out_dim, in_dim] */
+int myds_metal_mul_mm(
+    myds_metal_buffer_t       *dst,
+    const myds_metal_buffer_t *W,
+    const myds_metal_buffer_t *src1,
+    uint32_t                   out_dim,
+    uint32_t                   in_dim,
+    uint32_t                   n_tok,
     ggml_type                  weight_type);
 
 /* SwiGLU activation: out = (x0 / (1 + exp(-x0))) * x1 */
