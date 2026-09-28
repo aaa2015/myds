@@ -426,6 +426,9 @@ myds_model_t *myds_model_load(const char *model_path) {
         MYDS_LOG_E("Failed to create buffer for 'token_embd.weight'");
         goto fail;
     }
+    if (t_embd->n_dims >= 2 && t_embd->dims[1] > 0) {
+        m->vocab_size = (uint32_t)t_embd->dims[1];
+    }
 
     /* Load Output Norm & Output (LM Head) */
     const gguf_tensor_t *t_out_norm = gguf_find_tensor(gf, "output_norm.weight");
@@ -455,6 +458,9 @@ myds_model_t *myds_model_load(const char *model_path) {
         if (!m->output) {
             MYDS_LOG_E("Failed to create buffer for 'output.weight'");
             goto fail;
+        }
+        if (t_out->n_dims >= 2 && t_out->dims[1] > 0) {
+            m->vocab_size = (uint32_t)t_out->dims[1];
         }
     }
 
@@ -863,6 +869,10 @@ myds_context_t *myds_context_create(myds_model_t *model, const myds_config_t *cf
         }
     }
 
+    ctx->sample_probs = (float *)malloc(vocab_size * sizeof(float));
+    ctx->sample_indices = (int32_t *)malloc(vocab_size * sizeof(int32_t));
+    ctx->rng_state = ((uint64_t)ctx->cfg.seed ^ 0x5DEECE66DULL) | 1ULL;
+
     ctx->pos = 0;
     return ctx;
 }
@@ -896,6 +906,8 @@ void myds_context_free(myds_context_t *ctx) {
         for (uint32_t l = 0; l < ctx->model->n_layers; l++) free(ctx->v_cache[l]);
         free(ctx->v_cache);
     }
+    if (ctx->sample_probs)   free(ctx->sample_probs);
+    if (ctx->sample_indices) free(ctx->sample_indices);
     free(ctx);
 }
 
@@ -912,49 +924,181 @@ void myds_context_set_config(myds_context_t *ctx, const myds_config_t *cfg) {
     ctx->cfg = *cfg;
 }
 
-/* Sampler */
-static int32_t sample_next_token(const float *logits, uint32_t vocab_size, float temp, float top_p) {
+/* Production Sampler: greedy, temperature, top-k, min-p, top-p, repetition penalty */
+typedef struct {
+    float prob;
+    int32_t id;
+} myds_cand_t;
+
+static int compare_cand_desc(const void *a, const void *b) {
+    const myds_cand_t *ca = (const myds_cand_t *)a;
+    const myds_cand_t *cb = (const myds_cand_t *)b;
+    if (ca->prob < cb->prob) return 1;
+    if (ca->prob > cb->prob) return -1;
+    return 0;
+}
+
+int32_t myds_sample_next_token(
+    const float         *logits,
+    uint32_t             vocab_size,
+    const myds_config_t *cfg,
+    myds_context_t      *ctx,
+    const int32_t       *prev_tokens,
+    size_t               n_prev_tokens) {
+
+    if (!logits || vocab_size == 0) return 0;
+
+    float temp = cfg ? cfg->temperature : 0.0f;
+    float top_p = cfg ? cfg->top_p : 0.9f;
+    uint32_t top_k = cfg ? cfg->top_k : 0;
+    float min_p = cfg ? cfg->min_p : 0.0f;
+    float rep_pen = (cfg && cfg->repetition_penalty > 0.0f) ? cfg->repetition_penalty : 1.0f;
+
+    /* 1. Greedy argmax check (if temp <= 0) */
     if (temp <= 0.0f) {
-        /* Greedy argmax */
         int32_t best_id = 0;
         float max_l = logits[0];
+        if (rep_pen > 1.0f && prev_tokens && n_prev_tokens > 0) {
+            for (size_t p = 0; p < n_prev_tokens; p++) {
+                if (prev_tokens[p] == 0) {
+                    max_l = (max_l > 0.0f) ? (max_l / rep_pen) : (max_l * rep_pen);
+                    break;
+                }
+            }
+        }
         for (uint32_t i = 1; i < vocab_size; i++) {
-            if (logits[i] > max_l) {
-                max_l = logits[i];
+            float l = logits[i];
+            if (rep_pen > 1.0f && prev_tokens && n_prev_tokens > 0) {
+                for (size_t p = 0; p < n_prev_tokens; p++) {
+                    if (prev_tokens[p] == (int32_t)i) {
+                        l = (l > 0.0f) ? (l / rep_pen) : (l * rep_pen);
+                        break;
+                    }
+                }
+            }
+            if (l > max_l) {
+                max_l = l;
                 best_id = (int32_t)i;
             }
         }
         return best_id;
     }
 
-    /* Softmax with temperature */
-    float *probs = (float *)malloc(vocab_size * sizeof(float));
+    /* 2. Buffer acquisition (zero malloc churn when ctx is provided) */
+    float *probs = (ctx && ctx->sample_probs) ? ctx->sample_probs : (float *)malloc(vocab_size * sizeof(float));
+    int32_t *indices = (ctx && ctx->sample_indices) ? ctx->sample_indices : (int32_t *)malloc(vocab_size * sizeof(int32_t));
+
+    /* 3. Copy logits and apply repetition penalty */
     float max_l = -INFINITY;
     for (uint32_t i = 0; i < vocab_size; i++) {
-        if (logits[i] > max_l) max_l = logits[i];
-    }
-    float sum = 0.0f;
-    for (uint32_t i = 0; i < vocab_size; i++) {
-        probs[i] = expf((logits[i] - max_l) / temp);
-        sum += probs[i];
-    }
-    float inv_sum = 1.0f / sum;
-    for (uint32_t i = 0; i < vocab_size; i++) {
-        probs[i] *= inv_sum;
+        float l = logits[i];
+        if (rep_pen > 1.0f && prev_tokens && n_prev_tokens > 0) {
+            for (size_t p = 0; p < n_prev_tokens; p++) {
+                if (prev_tokens[p] == (int32_t)i) {
+                    l = (l > 0.0f) ? (l / rep_pen) : (l * rep_pen);
+                    break;
+                }
+            }
+        }
+        probs[i] = l;
+        if (l > max_l) max_l = l;
+        indices[i] = (int32_t)i;
     }
 
-    /* Nucleus (top-p) sampling */
-    float r = ((float)rand() / (float)RAND_MAX) * top_p;
-    float cum = 0.0f;
-    int32_t sampled_id = 0;
+    /* 4. Temperature scaling and Softmax */
+    float inv_temp = 1.0f / temp;
+    float sum_exp = 0.0f;
     for (uint32_t i = 0; i < vocab_size; i++) {
-        cum += probs[i];
+        probs[i] = expf((probs[i] - max_l) * inv_temp);
+        sum_exp += probs[i];
+    }
+    float inv_sum = 1.0f / (sum_exp > 0.0f ? sum_exp : 1.0f);
+    float max_prob = 0.0f;
+    for (uint32_t i = 0; i < vocab_size; i++) {
+        probs[i] *= inv_sum;
+        if (probs[i] > max_prob) max_prob = probs[i];
+    }
+
+    /* 5. Min-P filtering */
+    if (min_p > 0.0f && min_p <= 1.0f) {
+        float min_thresh = max_prob * min_p;
+        for (uint32_t i = 0; i < vocab_size; i++) {
+            if (probs[i] < min_thresh) probs[i] = 0.0f;
+        }
+    }
+
+    /* 6. Collect non-zero candidate items for Top-K / Top-P */
+    uint32_t n_cands = 0;
+    for (uint32_t i = 0; i < vocab_size; i++) {
+        if (probs[i] > 1e-8f) {
+            indices[n_cands] = (int32_t)i;
+            probs[n_cands] = probs[i];
+            n_cands++;
+        }
+    }
+
+    if (n_cands == 0) {
+        if (!ctx || !ctx->sample_probs) { free(probs); free(indices); }
+        return 0;
+    }
+
+    myds_cand_t stack_cands[1024];
+    myds_cand_t *cands = (n_cands <= 1024) ? stack_cands : (myds_cand_t *)malloc(n_cands * sizeof(myds_cand_t));
+    for (uint32_t i = 0; i < n_cands; i++) {
+        cands[i].prob = probs[i];
+        cands[i].id = indices[i];
+    }
+    qsort(cands, n_cands, sizeof(myds_cand_t), compare_cand_desc);
+
+    /* Apply top_k truncation */
+    if (top_k > 0 && top_k < n_cands) {
+        n_cands = top_k;
+    }
+
+    /* Apply top_p truncation */
+    if (top_p > 0.0f && top_p < 1.0f) {
+        float cum = 0.0f;
+        uint32_t keep = 0;
+        for (uint32_t i = 0; i < n_cands; i++) {
+            cum += cands[i].prob;
+            keep++;
+            if (cum >= top_p) break;
+        }
+        n_cands = keep;
+    }
+
+    /* Re-normalize remaining candidates */
+    float norm_sum = 0.0f;
+    for (uint32_t i = 0; i < n_cands; i++) norm_sum += cands[i].prob;
+    float inv_norm = 1.0f / (norm_sum > 0.0f ? norm_sum : 1.0f);
+    for (uint32_t i = 0; i < n_cands; i++) cands[i].prob *= inv_norm;
+
+    /* 7. Sample using per-context RNG or fallback */
+    float r;
+    if (ctx) {
+        ctx->rng_state = ctx->rng_state * 6364136223846793005ULL + 1ULL;
+        r = (float)((ctx->rng_state >> 33) & 0x7FFFFFFF) / (float)0x7FFFFFFF;
+    } else {
+        r = (float)rand() / (float)RAND_MAX;
+    }
+
+    float cum = 0.0f;
+    int32_t sampled_id = cands[0].id;
+    for (uint32_t i = 0; i < n_cands; i++) {
+        cum += cands[i].prob;
         if (cum >= r) {
-            sampled_id = (int32_t)i;
+            sampled_id = cands[i].id;
             break;
         }
     }
-    free(probs);
+
+    if (cands != stack_cands) {
+        free(cands);
+    }
+    if (!ctx || !ctx->sample_probs) {
+        free(probs);
+        free(indices);
+    }
     return sampled_id;
 }
 
@@ -992,26 +1136,34 @@ int32_t myds_forward_token(myds_context_t *ctx, int32_t token_id, uint32_t pos) 
              * Multi-Head Latent Attention (MLA)
              * ========================================================= */
 
-            /* 1. Pre-Attention RMSNorm */
+            /* Batch 1: Pre-Attention RMSNorm + Query LoRA down-proj + Latent KV proj */
+            myds_metal_begin_batch();
             if (layer->attn_norm) {
                 myds_metal_rmsnorm(ctx->x_norm, ctx->x, layer->attn_norm, dim, m->norm_eps);
             } else {
                 memcpy(myds_metal_buffer_data(ctx->x_norm), xv, dim * sizeof(float));
             }
 
-            /* 2. Query LoRA down-projection: x_norm (dim) -> qr (q_lora_rank) */
             if (!myds_metal_gemv(ctx->qr, layer->attn_q_a, ctx->x_norm, m->q_lora_rank, dim, layer->attn_q_a_type)) {
                 MYDS_LOG_E("Forward failed: GEMV for attn_q_a at layer %u failed", l);
+                myds_metal_commit_batch();
                 return -1;
             }
 
-            /* 3. Query LoRA RMSNorm: qr -> qr_norm */
+            if (!myds_metal_gemv(ctx->kv_act, layer->attn_kv, ctx->x_norm, m->head_dim, dim, layer->attn_kv_type)) {
+                MYDS_LOG_E("Forward failed: GEMV for attn_kv at layer %u failed", l);
+                myds_metal_commit_batch();
+                return -1;
+            }
+            myds_metal_commit_batch();
+
+            /* CPU intermediate processing: Query LoRA RMSNorm */
             const float *qr_v = (const float *)myds_metal_buffer_data(ctx->qr);
             float *qr_norm_v = (float *)myds_metal_buffer_data(ctx->qr_norm);
             const float *q_a_norm_w = (const float *)myds_metal_buffer_data(layer->attn_q_a_norm);
             rms_norm_weight(qr_norm_v, qr_v, q_a_norm_w, m->q_lora_rank, m->norm_eps);
 
-            /* 4. Query up-projection: qr_norm (q_lora_rank) -> q (n_heads * head_dim) */
+            /* Query up-projection: qr_norm (q_lora_rank) -> q (n_heads * head_dim) */
             if (!myds_metal_gemv(ctx->q, layer->attn_q_b, ctx->qr_norm, m->n_heads * m->head_dim, m->q_lora_rank, layer->attn_q_b_type)) {
                 MYDS_LOG_E("Forward failed: GEMV for attn_q_b at layer %u failed", l);
                 return -1;
@@ -1019,73 +1171,98 @@ int32_t myds_forward_token(myds_context_t *ctx, int32_t token_id, uint32_t pos) 
             float *qv = (float *)myds_metal_buffer_data(ctx->q);
             head_rms_norm_inplace(qv, m->n_heads, m->head_dim, m->norm_eps);
 
-            /* 5. Latent KV projection: x_norm (dim) -> kv_act (head_dim) */
-            if (!myds_metal_gemv(ctx->kv_act, layer->attn_kv, ctx->x_norm, m->head_dim, dim, layer->attn_kv_type)) {
-                MYDS_LOG_E("Forward failed: GEMV for attn_kv at layer %u failed", l);
-                return -1;
-            }
             float *kv_v = (float *)myds_metal_buffer_data(ctx->kv_act);
             const float *kv_a_norm_w = (const float *)myds_metal_buffer_data(layer->attn_kv_a_norm);
             rms_norm_weight(kv_v, kv_v, kv_a_norm_w, m->head_dim, m->norm_eps);
 
-            /* 6. Tail RoPE on Q (all heads) and KV (1 head) */
+            /* Tail RoPE on Q (all heads) and KV (1 head) */
             rope_tail_inplace(qv, m->n_heads, m->head_dim, m->qk_rope_head_dim, pos, m->freq_base, m->freq_scale, false);
             rope_tail_inplace(kv_v, 1, m->head_dim, m->qk_rope_head_dim, pos, m->freq_base, m->freq_scale, false);
 
-            /* 7. Push to latent KV cache: 512 floats per token per layer */
+            /* Push to latent KV cache: 512 floats per token per layer */
             memcpy(ctx->k_cache[l] + (size_t)pos * m->head_dim, kv_v, m->head_dim * sizeof(float));
 
-            /* 8. Sink-aware Multi-Head Attention over latent KV cache */
+            /* Sink-aware Multi-Head Attention over latent KV cache */
             float *heads_v = (float *)myds_metal_buffer_data(ctx->attn_heads);
             const float *sinks_w = layer->attn_sinks ? (const float *)myds_metal_buffer_data(layer->attn_sinks) : NULL;
             layer_attention_sinks(heads_v, sinks_w, qv, ctx->k_cache[l], pos + 1, m->n_heads, m->head_dim);
 
-            /* 9. Inverse RoPE on attention output heads tail */
+            /* Inverse RoPE on attention output heads tail */
             rope_tail_inplace(heads_v, m->n_heads, m->head_dim, m->qk_rope_head_dim, pos, m->freq_base, m->freq_scale, true);
 
-            /* 10. Grouped attention output down-projection: heads -> attn_low */
+            /* Grouped attention output down-projection: heads -> attn_low */
             float *low_v = (float *)myds_metal_buffer_data(ctx->attn_low);
             uint32_t group_dim = (m->n_heads / m->n_out_groups) * m->head_dim;
             matvec_grouped_rows(low_v, layer->attn_output_a, heads_v, m->n_out_groups, group_dim, m->out_group_rank, layer->attn_output_a_type);
 
-            /* 11. Attention output up-projection: attn_low -> attn_out (dim) */
+            /* Batch 2: Attention output up-projection + residual add + Pre-FFN RMSNorm + FFN */
+            myds_metal_begin_batch();
             if (!myds_metal_gemv(ctx->attn_out, layer->attn_output_b, ctx->attn_low, dim, m->n_out_groups * m->out_group_rank, layer->attn_output_b_type)) {
                 MYDS_LOG_E("Forward failed: GEMV for attn_output_b at layer %u failed", l);
+                myds_metal_commit_batch();
                 return -1;
             }
-
-            /* Residual connection: x = x + attn_out */
             myds_metal_add(ctx->x, ctx->x, ctx->attn_out, dim);
+
+            /* Pre-FFN RMSNorm */
+            if (layer->ffn_norm) {
+                myds_metal_rmsnorm(ctx->ffn_norm_out, ctx->x, layer->ffn_norm, dim, m->norm_eps);
+            } else {
+                memcpy(myds_metal_buffer_data(ctx->ffn_norm_out), xv, dim * sizeof(float));
+            }
+
+            /* FFN: Dense SwiGLU */
+            if (layer->ffn_gate && layer->ffn_up && layer->ffn_down) {
+                if (!myds_metal_gemv(ctx->gate_out, layer->ffn_gate, ctx->ffn_norm_out, m->hidden_dim, dim, layer->ffn_gate_type) ||
+                    !myds_metal_gemv(ctx->up_out, layer->ffn_up, ctx->ffn_norm_out, m->hidden_dim, dim, layer->ffn_up_type)) {
+                    MYDS_LOG_E("Forward failed: GEMV for ffn_gate/up at layer %u failed", l);
+                    myds_metal_commit_batch();
+                    return -1;
+                }
+                myds_metal_swiglu(ctx->swiglu_out, ctx->gate_out, ctx->up_out, m->hidden_dim);
+                if (!myds_metal_gemv(ctx->ffn_out, layer->ffn_down, ctx->swiglu_out, dim, m->hidden_dim, layer->ffn_down_type)) {
+                    MYDS_LOG_E("Forward failed: GEMV for ffn_down at layer %u failed", l);
+                    myds_metal_commit_batch();
+                    return -1;
+                }
+                myds_metal_add(ctx->x, ctx->x, ctx->ffn_out, dim);
+            }
+            myds_metal_commit_batch();
         } else {
             /* =========================================================
              * Multi-Head Attention (MHA / GQA)
              * ========================================================= */
-            /* Pre-Attention RMSNorm */
+
+            /* Batch 1: Pre-Attention RMSNorm + Q, K, V projections */
+            myds_metal_begin_batch();
             if (layer->attn_norm) {
                 myds_metal_rmsnorm(ctx->x_norm, ctx->x, layer->attn_norm, dim, m->norm_eps);
             } else {
                 memcpy(myds_metal_buffer_data(ctx->x_norm), xv, dim * sizeof(float));
             }
 
-            /* Q, K, V projections */
             if (layer->attn_q) {
                 if (!myds_metal_gemv(ctx->q, layer->attn_q, ctx->x_norm, n_heads * head_dim, dim, layer->attn_q_type)) {
                     MYDS_LOG_E("Forward failed: GEMV for attn_q at layer %u failed", l);
+                    myds_metal_commit_batch();
                     return -1;
                 }
             }
             if (layer->attn_k) {
                 if (!myds_metal_gemv(ctx->k, layer->attn_k, ctx->x_norm, n_kv_heads * head_dim, dim, layer->attn_k_type)) {
                     MYDS_LOG_E("Forward failed: GEMV for attn_k at layer %u failed", l);
+                    myds_metal_commit_batch();
                     return -1;
                 }
             }
             if (layer->attn_v) {
                 if (!myds_metal_gemv(ctx->v, layer->attn_v, ctx->x_norm, n_kv_heads * head_dim, dim, layer->attn_v_type)) {
                     MYDS_LOG_E("Forward failed: GEMV for attn_v at layer %u failed", l);
+                    myds_metal_commit_batch();
                     return -1;
                 }
             }
+            myds_metal_commit_batch();
 
             /* Decoupled RoPE on Q & K */
             myds_metal_rope(ctx->q, ctx->k, n_heads, head_dim, pos, m->freq_base, m->freq_scale);
@@ -1144,96 +1321,65 @@ int32_t myds_forward_token(myds_context_t *ctx, int32_t token_id, uint32_t pos) 
                 }
             }
 
-            /* Output projection */
+            /* Batch 2: Output projection + residual add + Pre-FFN RMSNorm + FFN */
+            myds_metal_begin_batch();
             if (layer->attn_o) {
-                myds_metal_buffer_t *tmp_out = myds_metal_buffer_alloc(dim * sizeof(float));
-                if (!tmp_out) return -1;
-                if (!myds_metal_gemv(tmp_out, layer->attn_o, ctx->attn_out, dim, n_heads * head_dim, layer->attn_o_type)) {
+                if (!myds_metal_gemv(ctx->ffn_out, layer->attn_o, ctx->attn_out, dim, n_heads * head_dim, layer->attn_o_type)) {
                     MYDS_LOG_E("Forward failed: GEMV for attn_o at layer %u failed", l);
-                    myds_metal_buffer_free(tmp_out);
+                    myds_metal_commit_batch();
                     return -1;
                 }
                 /* Residual connection: x = x + attn_output */
-                myds_metal_add(ctx->x, ctx->x, tmp_out, dim);
-                myds_metal_buffer_free(tmp_out);
-            }
-        }
-
-        /* Pre-FFN RMSNorm */
-        if (layer->ffn_norm) {
-            myds_metal_rmsnorm(ctx->ffn_norm_out, ctx->x, layer->ffn_norm, dim, m->norm_eps);
-        } else {
-            memcpy(myds_metal_buffer_data(ctx->ffn_norm_out), xv, dim * sizeof(float));
-        }
-
-        /* FFN: MoE or Dense */
-        if (m->n_routed_experts > 0 && layer->router_gate) {
-            /* DeepSeek MoE routing */
-            myds_metal_buffer_t *router_logits = myds_metal_buffer_alloc(m->n_routed_experts * sizeof(float));
-            if (!router_logits) return -1;
-            if (!myds_metal_gemv(router_logits, layer->router_gate, ctx->ffn_norm_out, m->n_routed_experts, dim, GGML_TYPE_F32)) {
-                MYDS_LOG_E("Forward failed: GEMV for router_gate at layer %u failed", l);
-                myds_metal_buffer_free(router_logits);
-                return -1;
+                myds_metal_add(ctx->x, ctx->x, ctx->ffn_out, dim);
             }
 
-            int32_t exp_ids[32];
-            float exp_weights[32];
-            uint32_t k_used = (m->n_activated_experts < 32) ? m->n_activated_experts : 32;
+            /* Pre-FFN RMSNorm */
+            if (layer->ffn_norm) {
+                myds_metal_rmsnorm(ctx->ffn_norm_out, ctx->x, layer->ffn_norm, dim, m->norm_eps);
+            } else {
+                memcpy(myds_metal_buffer_data(ctx->ffn_norm_out), xv, dim * sizeof(float));
+            }
 
-            myds_metal_moe_route(exp_ids, exp_weights, router_logits, m->n_routed_experts, k_used, m->routed_scaling_factor);
-            myds_metal_buffer_free(router_logits);
-
-            /* Shared expert forward if present */
-            if (layer->shared_gate && layer->shared_up && layer->shared_down) {
-                if (!myds_metal_gemv(ctx->gate_out, layer->shared_gate, ctx->ffn_norm_out, m->hidden_dim, dim, GGML_TYPE_Q8_0) ||
-                    !myds_metal_gemv(ctx->up_out, layer->shared_up, ctx->ffn_norm_out, m->hidden_dim, dim, GGML_TYPE_Q8_0)) {
-                    MYDS_LOG_E("Forward failed: GEMV for shared expert gate/up at layer %u failed", l);
+            /* Dense SwiGLU FFN */
+            if (layer->ffn_gate && layer->ffn_up && layer->ffn_down) {
+                if (!myds_metal_gemv(ctx->gate_out, layer->ffn_gate, ctx->ffn_norm_out, m->hidden_dim, dim, layer->ffn_gate_type) ||
+                    !myds_metal_gemv(ctx->up_out, layer->ffn_up, ctx->ffn_norm_out, m->hidden_dim, dim, layer->ffn_up_type)) {
+                    MYDS_LOG_E("Forward failed: GEMV for ffn_gate/up at layer %u failed", l);
+                    myds_metal_commit_batch();
                     return -1;
                 }
                 myds_metal_swiglu(ctx->swiglu_out, ctx->gate_out, ctx->up_out, m->hidden_dim);
-                if (!myds_metal_gemv(ctx->ffn_out, layer->shared_down, ctx->swiglu_out, dim, m->hidden_dim, GGML_TYPE_Q8_0)) {
-                    MYDS_LOG_E("Forward failed: GEMV for shared expert down at layer %u failed", l);
+                if (!myds_metal_gemv(ctx->ffn_out, layer->ffn_down, ctx->swiglu_out, dim, m->hidden_dim, layer->ffn_down_type)) {
+                    MYDS_LOG_E("Forward failed: GEMV for ffn_down at layer %u failed", l);
+                    myds_metal_commit_batch();
                     return -1;
                 }
                 myds_metal_add(ctx->x, ctx->x, ctx->ffn_out, dim);
             }
-        } else if (layer->ffn_gate && layer->ffn_up && layer->ffn_down) {
-            /* Dense SwiGLU FFN */
-            if (!myds_metal_gemv(ctx->gate_out, layer->ffn_gate, ctx->ffn_norm_out, m->hidden_dim, dim, layer->ffn_gate_type) ||
-                !myds_metal_gemv(ctx->up_out, layer->ffn_up, ctx->ffn_norm_out, m->hidden_dim, dim, layer->ffn_up_type)) {
-                MYDS_LOG_E("Forward failed: GEMV for ffn_gate/up at layer %u failed", l);
-                return -1;
-            }
-            myds_metal_swiglu(ctx->swiglu_out, ctx->gate_out, ctx->up_out, m->hidden_dim);
-            if (!myds_metal_gemv(ctx->ffn_out, layer->ffn_down, ctx->swiglu_out, dim, m->hidden_dim, layer->ffn_down_type)) {
-                MYDS_LOG_E("Forward failed: GEMV for ffn_down at layer %u failed", l);
-                return -1;
-            }
-
-            /* Residual connection: x = x + ffn_output */
-            myds_metal_add(ctx->x, ctx->x, ctx->ffn_out, dim);
+            myds_metal_commit_batch();
         }
     }
 
-    /* 3. Final RMSNorm */
+    /* 3. Final RMSNorm & LM Head Logits Batch */
+    myds_metal_begin_batch();
     if (m->output_norm) {
         myds_metal_rmsnorm(ctx->x_norm, ctx->x, m->output_norm, dim, m->norm_eps);
     } else {
         memcpy(myds_metal_buffer_data(ctx->x_norm), xv, dim * sizeof(float));
     }
 
-    /* 4. LM Head Logits */
     if (m->output) {
         if (!myds_metal_gemv(ctx->logits, m->output, ctx->x_norm, m->vocab_size, dim, m->output_type)) {
             MYDS_LOG_E("Forward failed: LM head GEMV failed");
+            myds_metal_commit_batch();
             return -1;
         }
     }
+    myds_metal_commit_batch();
 
-    /* 5. Sample next token */
+    /* 4. Sample next token */
     const float *logits_v = (const float *)myds_metal_buffer_data(ctx->logits);
-    int32_t next_token = sample_next_token(logits_v, m->vocab_size, ctx->cfg.temperature, ctx->cfg.top_p);
+    int32_t next_token = myds_sample_next_token(logits_v, m->vocab_size, &ctx->cfg, ctx, NULL, 0);
 
     return next_token;
 }

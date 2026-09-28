@@ -32,10 +32,13 @@ typedef struct myds_model myds_model_t;
 typedef struct myds_context myds_context_t;
 
 typedef struct {
-    uint32_t max_seq_len;      /* Maximum context window (default: 4096) */
+    uint32_t max_seq_len;       /* Maximum context window (default: 4096) */
     uint32_t max_new_tokens;    /* Maximum generated tokens (default: 256) */
     float    temperature;       /* Sampling temperature (0.0 = greedy argmax) */
     float    top_p;             /* Nucleus top-p sampling (default: 0.9) */
+    uint32_t top_k;             /* Top-k sampling (0 = disabled, default: 40) */
+    float    min_p;             /* Min-p sampling (0.0 = disabled, default: 0.0) */
+    float    repetition_penalty; /* Repetition penalty (1.0 = disabled, default: 1.0) */
     int32_t  seed;              /* Random seed */
     bool     stream;            /* Stream output tokens to callback */
 } myds_config_t;

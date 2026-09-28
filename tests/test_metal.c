@@ -425,6 +425,63 @@ static int test_gemv_unsupported_quant_failfast(void) {
     return 1;
 }
 
+static int test_batch_command_buffer(void) {
+    const uint32_t dim = 256;
+    myds_metal_buffer_t *x = myds_metal_buffer_alloc(dim * sizeof(float));
+    myds_metal_buffer_t *w = myds_metal_buffer_alloc(dim * sizeof(float));
+    myds_metal_buffer_t *norm_out = myds_metal_buffer_alloc(dim * sizeof(float));
+    myds_metal_buffer_t *W_gemv = myds_metal_buffer_alloc(dim * dim * sizeof(float));
+    myds_metal_buffer_t *gemv_out = myds_metal_buffer_alloc(dim * sizeof(float));
+    myds_metal_buffer_t *res_out = myds_metal_buffer_alloc(dim * sizeof(float));
+    ASSERT_TRUE(x && w && norm_out && W_gemv && gemv_out && res_out);
+
+    float *xv = (float *)myds_metal_buffer_data(x);
+    float *wv = (float *)myds_metal_buffer_data(w);
+    float *Wv = (float *)myds_metal_buffer_data(W_gemv);
+    for (uint32_t i = 0; i < dim; i++) {
+        xv[i] = 1.0f;
+        wv[i] = 1.0f;
+        for (uint32_t c = 0; c < dim; c++) {
+            Wv[i * dim + c] = 0.005f;
+        }
+    }
+
+    uint64_t c0 = myds_metal_get_commit_count();
+    ASSERT_TRUE(myds_metal_begin_batch());
+
+    /* Dispatch 3 chained operations: RMSNorm -> GEMV -> Add */
+    ASSERT_TRUE(myds_metal_rmsnorm(norm_out, x, w, dim, 1e-5f));
+    ASSERT_TRUE(myds_metal_gemv(gemv_out, W_gemv, norm_out, dim, dim, GGML_TYPE_F32));
+    ASSERT_TRUE(myds_metal_add(res_out, norm_out, gemv_out, dim));
+
+    /* Inside batch, commit count MUST not increase */
+    ASSERT_TRUE(myds_metal_get_commit_count() == c0);
+
+    /* Single commit for the entire batch */
+    ASSERT_TRUE(myds_metal_commit_batch());
+    ASSERT_TRUE(myds_metal_get_commit_count() == c0 + 1);
+
+    /* Verify math:
+     * x is all 1.0f, dim=256 -> mean(x^2)=1.0f -> norm_out = all 1.0f.
+     * W_gemv is all 0.005f -> gemv_out = 256 * 0.005f = 1.28f.
+     * res_out = 1.0f + 1.28f = 2.28f.
+     */
+    float *rv = (float *)myds_metal_buffer_data(res_out);
+    for (uint32_t i = 0; i < dim; i++) {
+        ASSERT_NEAR(rv[i], 2.28f, 1e-3f);
+    }
+
+    myds_metal_buffer_free(x);
+    myds_metal_buffer_free(w);
+    myds_metal_buffer_free(norm_out);
+    myds_metal_buffer_free(W_gemv);
+    myds_metal_buffer_free(gemv_out);
+    myds_metal_buffer_free(res_out);
+
+    printf("  [PASS] Batch command buffer: multi-operator chaining with single commit (T1-1)\n");
+    return 1;
+}
+
 int main(void) {
     printf("====================================================\n");
     printf("   Running myds Metal GPU Kernel Verification\n");
@@ -448,16 +505,17 @@ int main(void) {
     passed += test_buffer_read_write();
     passed += test_buffer_from_ptr_zerocopy();
     passed += test_gemv_unsupported_quant_failfast();
+    passed += test_batch_command_buffer();
 
     myds_metal_cleanup();
 
     printf("====================================================\n");
-    if (passed == 12) {
-        printf("  ALL 12 METAL OPERATOR TESTS PASSED! (Apple Silicon GPU)\n");
+    if (passed == 13) {
+        printf("  ALL 13 METAL OPERATOR & BATCH TESTS PASSED! (Apple Silicon GPU)\n");
         printf("====================================================\n");
         return 0;
     } else {
-        printf("  TESTS FAILED (passed %d/12)\n", passed);
+        printf("  TESTS FAILED (passed %d/13)\n", passed);
         return 1;
     }
 }

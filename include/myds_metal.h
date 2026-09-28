@@ -96,6 +96,11 @@ int myds_metal_softmax(
     const myds_metal_buffer_t *x,
     uint32_t                   count);
 
+/* Batch command buffer management */
+int      myds_metal_begin_batch(void);
+int      myds_metal_commit_batch(void);
+uint64_t myds_metal_get_commit_count(void);
+
 /* Synchronize GPU command queue */
 int myds_metal_synchronize(void);
 

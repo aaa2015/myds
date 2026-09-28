@@ -117,7 +117,21 @@ struct myds_context {
     /* DeepSeek KV Cache */
     float              **k_cache; /* [n_layers][max_seq_len * stride] */
     float              **v_cache; /* [n_layers][max_seq_len * stride] (MHA only) */
+
+    /* Sampler persistent scratch buffers (zero malloc churn per token) */
+    float               *sample_probs;
+    int32_t             *sample_indices;
+    uint64_t             rng_state;
 };
+
+/* Unified production sampler: greedy, temperature, top-k, min-p, top-p, repetition penalty */
+int32_t myds_sample_next_token(
+    const float         *logits,
+    uint32_t             vocab_size,
+    const myds_config_t *cfg,
+    myds_context_t      *ctx,
+    const int32_t       *prev_tokens,
+    size_t               n_prev_tokens);
 
 #ifdef __cplusplus
 }

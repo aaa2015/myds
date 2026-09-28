@@ -1,4 +1,5 @@
 #include "myds_server.h"
+#include "myds_server_internal.h"
 #include "myds_log.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,7 +29,7 @@ static void handle_signal(int sig) {
 }
 
 /* Helper to JSON-escape a string */
-static void json_escape(const char *src, char *dst, size_t dst_size) {
+void json_escape(const char *src, char *dst, size_t dst_size) {
     size_t di = 0;
     for (size_t si = 0; src[si] && di + 6 < dst_size; si++) {
         unsigned char c = (unsigned char)src[si];
@@ -52,7 +53,7 @@ static void json_escape(const char *src, char *dst, size_t dst_size) {
 }
 
 /* Helper to unescape JSON string slice into normal text */
-static void json_unescape_slice(const char *src, size_t len, char *dst, size_t dst_size) {
+void json_unescape_slice(const char *src, size_t len, char *dst, size_t dst_size) {
     if (!src || !dst || dst_size == 0) return;
     size_t di = 0;
     for (size_t si = 0; si < len && di + 1 < dst_size; si++) {
@@ -99,7 +100,7 @@ static void json_unescape_slice(const char *src, size_t len, char *dst, size_t d
 }
 
 /* Standard HTTP header integer parser (e.g. Content-Length: 1234) */
-static int extract_http_header_int(const char *headers, const char *header_name) {
+int extract_http_header_int(const char *headers, const char *header_name) {
     if (!headers || !header_name) return 0;
     const char *p = headers;
     size_t name_len = strlen(header_name);
@@ -117,7 +118,7 @@ static int extract_http_header_int(const char *headers, const char *header_name)
 }
 
 /* Very simple JSON string value finder: searches for "key"\s*:\s*"value" */
-static int json_extract_string_field(const char *json, const char *key, char *out, size_t out_size) {
+int json_extract_string_field(const char *json, const char *key, char *out, size_t out_size) {
     if (!json || !key || !out || out_size == 0) return 0;
     char needle[128];
     snprintf(needle, sizeof(needle), "\"%s\"", key);
@@ -145,7 +146,7 @@ static int json_extract_string_field(const char *json, const char *key, char *ou
 }
 
 /* Search for boolean field: "key"\s*:\s*(true|false) */
-static int json_extract_bool_field(const char *json, const char *key, int default_val) {
+int json_extract_bool_field(const char *json, const char *key, int default_val) {
     if (!json || !key) return default_val;
     char needle[128];
     snprintf(needle, sizeof(needle), "\"%s\"", key);
@@ -159,7 +160,7 @@ static int json_extract_bool_field(const char *json, const char *key, int defaul
 }
 
 /* Search for number field */
-static int json_extract_int_field(const char *json, const char *key, int default_val) {
+int json_extract_int_field(const char *json, const char *key, int default_val) {
     if (!json || !key) return default_val;
     char needle[128];
     snprintf(needle, sizeof(needle), "\"%s\"", key);
@@ -170,7 +171,7 @@ static int json_extract_int_field(const char *json, const char *key, int default
     return atoi(p);
 }
 
-static float json_extract_float_field(const char *json, const char *key, float default_val) {
+float json_extract_float_field(const char *json, const char *key, float default_val) {
     if (!json || !key) return default_val;
     char needle[128];
     snprintf(needle, sizeof(needle), "\"%s\"", key);
@@ -182,7 +183,7 @@ static float json_extract_float_field(const char *json, const char *key, float d
 }
 
 /* Find matching closing brace '}' considering nested braces and string literals */
-static const char *find_matching_brace(const char *start) {
+const char *find_matching_brace(const char *start) {
     if (!start || *start != '{') return NULL;
     int depth = 0;
     int in_quote = 0;
@@ -217,7 +218,7 @@ static const char *find_matching_brace(const char *start) {
  *  - "text": "text"
  *  - "output": "text" (for function_call_output items)
  */
-static void extract_message_text(const char *obj_buf, char *out, size_t out_size) {
+void extract_message_text(const char *obj_buf, char *out, size_t out_size) {
     out[0] = '\0';
     if (json_extract_string_field(obj_buf, "content", out, out_size) && out[0] != '\0') {
         return;
@@ -247,7 +248,7 @@ static void extract_message_text(const char *obj_buf, char *out, size_t out_size
 }
 
 /* Parse chat completion messages or Responses API input and format into DeepSeek prompt */
-static void parse_chat_prompt(const char *body, char *out_prompt, size_t max_prompt_len) {
+void parse_chat_prompt(const char *body, char *out_prompt, size_t max_prompt_len) {
     out_prompt[0] = '\0';
     if (!body || !body[0]) {
         snprintf(out_prompt, max_prompt_len, "Hello");

@@ -116,72 +116,6 @@ static const char *create_gate_test_gguf(
     return path;
 }
 
-/* Test greedy argmax */
-static int32_t sample_greedy(const float *logits, int vocab_size) {
-    int32_t best_id = 0;
-    float best_val = logits[0];
-    for (int i = 1; i < vocab_size; i++) {
-        if (logits[i] > best_val) {
-            best_val = logits[i];
-            best_id = i;
-        }
-    }
-    return best_id;
-}
-
-/* Test temperature scaling */
-static void apply_temperature(float *logits, int vocab_size, float temp) {
-    if (temp <= 0.0f) return;
-    float inv_temp = 1.0f / temp;
-    for (int i = 0; i < vocab_size; i++) {
-        logits[i] *= inv_temp;
-    }
-}
-
-/* Test softmax */
-static void apply_softmax(float *logits, int vocab_size) {
-    float max_val = logits[0];
-    for (int i = 1; i < vocab_size; i++) {
-        if (logits[i] > max_val) max_val = logits[i];
-    }
-    float sum = 0.0f;
-    for (int i = 0; i < vocab_size; i++) {
-        logits[i] = expf(logits[i] - max_val);
-        sum += logits[i];
-    }
-    float inv_sum = 1.0f / sum;
-    for (int i = 0; i < vocab_size; i++) {
-        logits[i] *= inv_sum;
-    }
-}
-
-/* Pair for top-p sorting */
-typedef struct {
-    int32_t id;
-    float prob;
-} prob_pair_t;
-
-static int compare_prob_desc(const void *a, const void *b) {
-    float pa = ((const prob_pair_t *)a)->prob;
-    float pb = ((const prob_pair_t *)b)->prob;
-    if (pb > pa) return 1;
-    if (pb < pa) return -1;
-    return 0;
-}
-
-/* Test top-p filtering */
-static int apply_top_p_filter(prob_pair_t *pairs, int vocab_size, float top_p) {
-    qsort(pairs, vocab_size, sizeof(prob_pair_t), compare_prob_desc);
-    float cumsum = 0.0f;
-    int cutoff = 0;
-    for (int i = 0; i < vocab_size; i++) {
-        cumsum += pairs[i].prob;
-        cutoff = i + 1;
-        if (cumsum >= top_p) break;
-    }
-    return cutoff;
-}
-
 /* Test RoPE frequency formula */
 static float calculate_rope_freq(uint32_t dim_idx, uint32_t total_dim, float freq_base) {
     float exponent = (float)(2 * dim_idx) / (float)total_dim;
@@ -193,58 +127,46 @@ int main(void) {
     printf("       Running myds Engine Sampling Unit Tests      \n");
     printf("====================================================\n");
 
-    /* 1. Greedy Argmax Sampling */
+    /* 1. Production Greedy Argmax Sampling */
     {
         float logits[8] = {-2.5f, 0.1f, 10.5f, 3.2f, -1.0f, 8.9f, 2.0f, -0.5f};
-        int32_t picked = sample_greedy(logits, 8);
+        myds_config_t cfg = {.temperature = 0.0f, .top_p = 1.0f, .repetition_penalty = 1.0f};
+        int32_t picked = myds_sample_next_token(logits, 8, &cfg, NULL, NULL, 0);
         assert(picked == 2); /* 10.5f is maximum at index 2 */
-        printf("  [PASS] Greedy argmax token selection (index 2 picked)\n");
+        printf("  [PASS] Production greedy argmax token selection (index 2 picked)\n");
     }
 
-    /* 2. Temperature Scaling */
+    /* 2. Production Repetition Penalty */
     {
-        float logits[4] = {2.0f, 4.0f, 6.0f, 8.0f};
-        apply_temperature(logits, 4, 2.0f);
-        assert(fabsf(logits[0] - 1.0f) < 1e-5f);
-        assert(fabsf(logits[1] - 2.0f) < 1e-5f);
-        assert(fabsf(logits[2] - 3.0f) < 1e-5f);
-        assert(fabsf(logits[3] - 4.0f) < 1e-5f);
-        printf("  [PASS] Logits temperature scaling (temp = 2.0 scaling)\n");
+        float logits[8] = {-2.5f, 0.1f, 10.5f, 3.2f, -1.0f, 8.9f, 2.0f, -0.5f};
+        /* Penalize token 2 with rep_pen = 2.0 -> 10.5 / 2.0 = 5.25, so token 5 (8.9f) becomes argmax */
+        int32_t prev[1] = {2};
+        myds_config_t cfg = {.temperature = 0.0f, .top_p = 1.0f, .repetition_penalty = 2.0f};
+        int32_t picked = myds_sample_next_token(logits, 8, &cfg, NULL, prev, 1);
+        assert(picked == 5);
+        printf("  [PASS] Production repetition penalty: token 2 penalized -> token 5 selected\n");
     }
 
-    /* 3. Softmax Normalization */
+    /* 3. Production Top-K Truncation */
     {
-        float logits[4] = {1.0f, 2.0f, 3.0f, 4.0f};
-        apply_softmax(logits, 4);
-        float sum = 0.0f;
-        for (int i = 0; i < 4; i++) {
-            assert(logits[i] > 0.0f && logits[i] < 1.0f);
-            sum += logits[i];
+        float logits[6] = {0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f};
+        /* With top_k = 2, only indices 4 and 5 are eligible */
+        myds_config_t cfg = {.temperature = 1.0f, .top_k = 2, .top_p = 1.0f, .repetition_penalty = 1.0f, .seed = 123};
+        for (int iter = 0; iter < 20; iter++) {
+            int32_t picked = myds_sample_next_token(logits, 6, &cfg, NULL, NULL, 0);
+            assert(picked == 4 || picked == 5);
         }
-        assert(fabsf(sum - 1.0f) < 1e-5f);
-        assert(logits[3] > logits[2] && logits[2] > logits[1] && logits[1] > logits[0]);
-        printf("  [PASS] Softmax probability distribution and sum-to-one constraint\n");
+        printf("  [PASS] Production top-k truncation constraint (only top 2 candidate tokens sampled)\n");
     }
 
-    /* 4. Top-P (Nucleus) Filtering */
+    /* 4. Production Min-P Filtering */
     {
-        prob_pair_t pairs[5] = {
-            {0, 0.40f},
-            {1, 0.30f},
-            {2, 0.15f},
-            {3, 0.10f},
-            {4, 0.05f}
-        };
-        /* At top_p = 0.70, top 2 tokens (0.40 + 0.30 = 0.70) are retained */
-        int cutoff = apply_top_p_filter(pairs, 5, 0.70f);
-        assert(cutoff == 2);
-        assert(pairs[0].id == 0);
-        assert(pairs[1].id == 1);
-
-        /* At top_p = 0.80, top 3 tokens (0.40 + 0.30 + 0.15 = 0.85 >= 0.80) are retained */
-        cutoff = apply_top_p_filter(pairs, 5, 0.80f);
-        assert(cutoff == 3);
-        printf("  [PASS] Top-p nucleus filtering with cumulative probability threshold\n");
+        /* Logits: token 0 dominant, token 1 tiny */
+        float logits[3] = {10.0f, 0.0f, -5.0f};
+        myds_config_t cfg = {.temperature = 1.0f, .min_p = 0.1f, .top_p = 1.0f, .seed = 42};
+        int32_t picked = myds_sample_next_token(logits, 3, &cfg, NULL, NULL, 0);
+        assert(picked == 0);
+        printf("  [PASS] Production min-p probability threshold filtering\n");
     }
 
     /* 5. Decoupled RoPE Frequency Calculation */
