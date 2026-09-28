@@ -251,6 +251,16 @@ static bool is_supported_quant_type(ggml_type type) {
     return (type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_Q8_0);
 }
 
+/* Helper: verify supported quantization types for MoE gate & up expert projections */
+static bool is_supported_moe_gate_up_quant(ggml_type type) {
+    return (type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_F32 || type == GGML_TYPE_F16);
+}
+
+/* Helper: verify supported quantization types for MoE down expert projections */
+static bool is_supported_moe_down_quant(ggml_type type) {
+    return (type == GGML_TYPE_Q2_K || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_F32 || type == GGML_TYPE_F16);
+}
+
 /* Helper: wrap GGUF tensor memory into Metal buffer using zero-copy mapping */
 static myds_metal_buffer_t *create_metal_buffer_from_tensor(const gguf_tensor_t *t) {
     if (!t || !t->data) return NULL;
@@ -305,23 +315,45 @@ myds_model_t *myds_model_load(const char *model_path) {
 
     char key_buf[128];
     snprintf(key_buf, sizeof(key_buf), "%s.embedding_length", arch);
-    m->dim = gguf_get_u32(gf, key_buf, 2048);
+    m->dim = gguf_get_u32(gf, key_buf, 0);
+    if (m->dim == 0) {
+        snprintf(key_buf, sizeof(key_buf), "%s.hidden_size", arch);
+        m->dim = gguf_get_u32(gf, key_buf, 2048);
+    }
 
     snprintf(key_buf, sizeof(key_buf), "%s.block_count", arch);
-    m->n_layers = gguf_get_u32(gf, key_buf, 28);
+    m->n_layers = gguf_get_u32(gf, key_buf, 0);
+    if (m->n_layers == 0) {
+        snprintf(key_buf, sizeof(key_buf), "%s.num_hidden_layers", arch);
+        m->n_layers = gguf_get_u32(gf, key_buf, 28);
+    }
 
     snprintf(key_buf, sizeof(key_buf), "%s.attention.head_count", arch);
-    m->n_heads = gguf_get_u32(gf, key_buf, 16);
+    m->n_heads = gguf_get_u32(gf, key_buf, 0);
+    if (m->n_heads == 0) {
+        snprintf(key_buf, sizeof(key_buf), "%s.num_attention_heads", arch);
+        m->n_heads = gguf_get_u32(gf, key_buf, 16);
+    }
 
     snprintf(key_buf, sizeof(key_buf), "%s.attention.head_count_kv", arch);
-    m->n_kv_heads = gguf_get_u32(gf, key_buf, m->n_heads);
+    m->n_kv_heads = gguf_get_u32(gf, key_buf, 0);
+    if (m->n_kv_heads == 0) {
+        snprintf(key_buf, sizeof(key_buf), "%s.num_key_value_heads", arch);
+        m->n_kv_heads = gguf_get_u32(gf, key_buf, m->n_heads);
+    }
 
     if (m->n_heads == 0 || m->dim == 0) {
         MYDS_LOG_E("Invalid model dimensions: dim=%u, n_heads=%u", m->dim, m->n_heads);
         goto fail;
     }
 
-    m->head_dim = m->dim / m->n_heads;
+    snprintf(key_buf, sizeof(key_buf), "%s.head_dim", arch);
+    uint32_t explicit_head_dim = gguf_get_u32(gf, key_buf, 0);
+    if (explicit_head_dim > 0) {
+        m->head_dim = explicit_head_dim;
+    } else {
+        m->head_dim = m->dim / m->n_heads;
+    }
 
     snprintf(key_buf, sizeof(key_buf), "%s.feed_forward_length", arch);
     m->hidden_dim = gguf_get_u32(gf, key_buf, m->dim * 4);
@@ -357,8 +389,38 @@ myds_model_t *myds_model_load(const char *model_path) {
         m->n_shared_experts = gguf_get_u32(gf, key_buf, 0);
     }
 
-    snprintf(key_buf, sizeof(key_buf), "%s.expert_weights_scale", arch);
-    m->routed_scaling_factor = gguf_get_f32(gf, key_buf, 1.0f);
+    snprintf(key_buf, sizeof(key_buf), "%s.routed_scaling_factor", arch);
+    m->routed_scaling_factor = gguf_get_f32(gf, key_buf, 0.0f);
+    if (m->routed_scaling_factor == 0.0f) {
+        snprintf(key_buf, sizeof(key_buf), "%s.expert_weights_scale", arch);
+        m->routed_scaling_factor = gguf_get_f32(gf, key_buf, 1.0f);
+    }
+
+    snprintf(key_buf, sizeof(key_buf), "%s.moe_intermediate_size", arch);
+    m->moe_expert_dim = gguf_get_u32(gf, key_buf, 2304);
+
+    snprintf(key_buf, sizeof(key_buf), "%s.swiglu_limit", arch);
+    m->swiglu_clamp_exp = gguf_get_f32(gf, key_buf, 10.0f);
+
+    /* Detect routed experts presence from tensors if not set via KV */
+    const gguf_tensor_t *t_routed_exps = gguf_find_tensor(gf, "blk.0.ffn_gate_exps.weight");
+    if (t_routed_exps != NULL) {
+        if (m->n_routed_experts == 0 && t_routed_exps->n_dims >= 3) {
+            m->n_routed_experts = (uint32_t)t_routed_exps->dims[2];
+        }
+        if (m->n_activated_experts == 0) {
+            m->n_activated_experts = 6;
+        }
+        if (m->moe_expert_dim == 0 && t_routed_exps->n_dims >= 2) {
+            m->moe_expert_dim = (uint32_t)t_routed_exps->dims[1];
+        }
+    }
+
+    if (m->n_routed_experts > 0) {
+        MYDS_LOG_I("MoE enabled: %u routed experts (top-%u active, scale=%.2f, exp_dim=%u, clamp=%.1f), %u shared experts",
+                   m->n_routed_experts, m->n_activated_experts, m->routed_scaling_factor,
+                   m->moe_expert_dim, m->swiglu_clamp_exp, m->n_shared_experts);
+    }
 
     m->vocab_size = m->tokenizer ? m->tokenizer->vocab_size : 32000;
 
@@ -399,14 +461,6 @@ myds_model_t *myds_model_load(const char *model_path) {
                 m->out_group_rank = (uint32_t)(total_r / m->n_out_groups);
             }
         }
-    }
-
-    const gguf_tensor_t *t_routed_exps = gguf_find_tensor(gf, "blk.0.ffn_gate_exps.weight");
-    if (m->n_routed_experts > 0 || t_routed_exps != NULL) {
-        uint32_t num_exps = m->n_routed_experts > 0 ? m->n_routed_experts : (t_routed_exps && t_routed_exps->n_dims >= 3 ? (uint32_t)t_routed_exps->dims[2] : 1);
-        MYDS_LOG_E("Model has %u routed experts ('blk.0.ffn_gate_exps.weight'). Routed expert execution is not yet implemented. Refusing to run to prevent silent corruption (T0-4 gate).",
-                   num_exps);
-        goto fail;
     }
 
     /* Load Embedding */
@@ -640,56 +694,99 @@ myds_model_t *myds_model_load(const char *model_path) {
         }
         m->layers[i].ffn_norm = create_metal_buffer_from_tensor(tfn);
 
-        /* FFN: dense layers require ffn_gate, ffn_up, ffn_down */
-        snprintf(name, sizeof(name), "blk.%u.ffn_gate.weight", i);
-        const gguf_tensor_t *fg = gguf_find_tensor(gf, name);
-        if (!fg) {
-            MYDS_LOG_E("Layer %u missing required FFN gate tensor '%s' (T0-3 gate)", i, name);
-            goto fail;
-        }
-        if (!is_supported_quant_type(fg->type)) {
-            MYDS_LOG_E("Layer %u ffn_gate tensor '%s' has unsupported quant type %d (%s) (T0-1 gate)",
-                       i, name, (int)fg->type, ggml_type_name(fg->type));
-            goto fail;
-        }
-        m->layers[i].ffn_gate = create_metal_buffer_from_tensor(fg);
-        m->layers[i].ffn_gate_type = fg->type;
+        /* FFN: Check for routed MoE experts, dense FFN, and shared experts */
+        snprintf(name, sizeof(name), "blk.%u.ffn_gate_exps.weight", i);
+        const gguf_tensor_t *t_ge = gguf_find_tensor(gf, name);
+        if (t_ge) {
+            /* Routed MoE gate experts (IQ2_XXS / Q8_0) */
+            if (!is_supported_moe_gate_up_quant(t_ge->type)) {
+                MYDS_LOG_E("Layer %u ffn_gate_exps tensor '%s' has unsupported quant type %d (%s) (T0-1 gate)",
+                           i, name, (int)t_ge->type, ggml_type_name(t_ge->type));
+                goto fail;
+            }
+            m->layers[i].ffn_gate_exps = create_metal_buffer_from_tensor(t_ge);
+            m->layers[i].ffn_gate_exps_type = t_ge->type;
 
-        snprintf(name, sizeof(name), "blk.%u.ffn_up.weight", i);
-        const gguf_tensor_t *fu = gguf_find_tensor(gf, name);
-        if (!fu) {
-            MYDS_LOG_E("Layer %u missing required FFN up tensor '%s' (T0-3 gate)", i, name);
-            goto fail;
-        }
-        if (!is_supported_quant_type(fu->type)) {
-            MYDS_LOG_E("Layer %u ffn_up tensor '%s' has unsupported quant type %d (%s) (T0-1 gate)",
-                       i, name, (int)fu->type, ggml_type_name(fu->type));
-            goto fail;
-        }
-        m->layers[i].ffn_up = create_metal_buffer_from_tensor(fu);
-        m->layers[i].ffn_up_type = fu->type;
+            /* Routed MoE up experts (IQ2_XXS / Q8_0) */
+            snprintf(name, sizeof(name), "blk.%u.ffn_up_exps.weight", i);
+            const gguf_tensor_t *t_ue = gguf_find_tensor(gf, name);
+            if (!t_ue) {
+                MYDS_LOG_E("Layer %u missing required MoE ffn_up_exps tensor '%s' (T0-3 gate)", i, name);
+                goto fail;
+            }
+            if (!is_supported_moe_gate_up_quant(t_ue->type)) {
+                MYDS_LOG_E("Layer %u ffn_up_exps tensor '%s' has unsupported quant type %d (%s) (T0-1 gate)",
+                           i, name, (int)t_ue->type, ggml_type_name(t_ue->type));
+                goto fail;
+            }
+            m->layers[i].ffn_up_exps = create_metal_buffer_from_tensor(t_ue);
+            m->layers[i].ffn_up_exps_type = t_ue->type;
 
-        snprintf(name, sizeof(name), "blk.%u.ffn_down.weight", i);
-        const gguf_tensor_t *fd = gguf_find_tensor(gf, name);
-        if (!fd) {
-            MYDS_LOG_E("Layer %u missing required FFN down tensor '%s' (T0-3 gate)", i, name);
-            goto fail;
-        }
-        if (!is_supported_quant_type(fd->type)) {
-            MYDS_LOG_E("Layer %u ffn_down tensor '%s' has unsupported quant type %d (%s) (T0-1 gate)",
-                       i, name, (int)fd->type, ggml_type_name(fd->type));
-            goto fail;
-        }
-        m->layers[i].ffn_down = create_metal_buffer_from_tensor(fd);
-        m->layers[i].ffn_down_type = fd->type;
+            /* Routed MoE down experts (Q2_K / Q8_0) */
+            snprintf(name, sizeof(name), "blk.%u.ffn_down_exps.weight", i);
+            const gguf_tensor_t *t_de = gguf_find_tensor(gf, name);
+            if (!t_de) {
+                MYDS_LOG_E("Layer %u missing required MoE ffn_down_exps tensor '%s' (T0-3 gate)", i, name);
+                goto fail;
+            }
+            if (!is_supported_moe_down_quant(t_de->type)) {
+                MYDS_LOG_E("Layer %u ffn_down_exps tensor '%s' has unsupported quant type %d (%s) (T0-1 gate)",
+                           i, name, (int)t_de->type, ggml_type_name(t_de->type));
+                goto fail;
+            }
+            m->layers[i].ffn_down_exps = create_metal_buffer_from_tensor(t_de);
+            m->layers[i].ffn_down_exps_type = t_de->type;
 
-        /* MoE router & shared experts */
-        snprintf(name, sizeof(name), "blk.%u.ffn_gate_inp.weight", i);
-        const gguf_tensor_t *t_rg = gguf_find_tensor(gf, name);
-        if (t_rg) {
+            /* Router gate projection (ffn_gate_inp) */
+            snprintf(name, sizeof(name), "blk.%u.ffn_gate_inp.weight", i);
+            const gguf_tensor_t *t_rg = gguf_find_tensor(gf, name);
+            if (!t_rg) {
+                MYDS_LOG_E("Layer %u missing required MoE router gate tensor '%s' (T0-3 gate)", i, name);
+                goto fail;
+            }
             m->layers[i].router_gate = create_metal_buffer_from_tensor(t_rg);
+            m->layers[i].router_gate_type = t_rg->type;
+
+            /* Router bias (exp_probs_b.bias) */
+            snprintf(name, sizeof(name), "blk.%u.exp_probs_b.bias", i);
+            const gguf_tensor_t *t_rb = gguf_find_tensor(gf, name);
+            if (t_rb) {
+                m->layers[i].router_bias = create_metal_buffer_from_tensor(t_rb);
+            }
+        } else {
+            /* Dense FFN */
+            snprintf(name, sizeof(name), "blk.%u.ffn_gate.weight", i);
+            const gguf_tensor_t *fg = gguf_find_tensor(gf, name);
+            if (fg) {
+                if (!is_supported_quant_type(fg->type)) {
+                    MYDS_LOG_E("Layer %u ffn_gate tensor '%s' has unsupported quant type %d (%s) (T0-1 gate)",
+                               i, name, (int)fg->type, ggml_type_name(fg->type));
+                    goto fail;
+                }
+                m->layers[i].ffn_gate = create_metal_buffer_from_tensor(fg);
+                m->layers[i].ffn_gate_type = fg->type;
+
+                snprintf(name, sizeof(name), "blk.%u.ffn_up.weight", i);
+                const gguf_tensor_t *fu = gguf_find_tensor(gf, name);
+                if (!fu || !is_supported_quant_type(fu->type)) {
+                    MYDS_LOG_E("Layer %u missing or invalid ffn_up (T0-3 / T0-1 gate)", i);
+                    goto fail;
+                }
+                m->layers[i].ffn_up = create_metal_buffer_from_tensor(fu);
+                m->layers[i].ffn_up_type = fu->type;
+
+                snprintf(name, sizeof(name), "blk.%u.ffn_down.weight", i);
+                const gguf_tensor_t *fd = gguf_find_tensor(gf, name);
+                if (!fd || !is_supported_quant_type(fd->type)) {
+                    MYDS_LOG_E("Layer %u missing or invalid ffn_down (T0-3 / T0-1 gate)", i);
+                    goto fail;
+                }
+                m->layers[i].ffn_down = create_metal_buffer_from_tensor(fd);
+                m->layers[i].ffn_down_type = fd->type;
+            }
         }
 
+        /* Shared expert FFN */
         snprintf(name, sizeof(name), "blk.%u.ffn_gate_shexp.weight", i);
         const gguf_tensor_t *t_sg = gguf_find_tensor(gf, name);
         if (t_sg) {
@@ -699,34 +796,32 @@ myds_model_t *myds_model_load(const char *model_path) {
                 goto fail;
             }
             m->layers[i].shared_gate = create_metal_buffer_from_tensor(t_sg);
-        }
+            m->layers[i].shared_gate_type = t_sg->type;
 
-        snprintf(name, sizeof(name), "blk.%u.ffn_up_shexp.weight", i);
-        const gguf_tensor_t *t_su = gguf_find_tensor(gf, name);
-        if (t_su) {
-            if (!is_supported_quant_type(t_su->type)) {
-                MYDS_LOG_E("Layer %u shared up tensor '%s' has unsupported quant type %d (%s) (T0-1 gate)",
-                           i, name, (int)t_su->type, ggml_type_name(t_su->type));
+            snprintf(name, sizeof(name), "blk.%u.ffn_up_shexp.weight", i);
+            const gguf_tensor_t *t_su = gguf_find_tensor(gf, name);
+            if (!t_su || !is_supported_quant_type(t_su->type)) {
+                MYDS_LOG_E("Layer %u missing or invalid shared up tensor '%s' (T0-3 / T0-1 gate)", i, name);
                 goto fail;
             }
             m->layers[i].shared_up = create_metal_buffer_from_tensor(t_su);
-        }
+            m->layers[i].shared_up_type = t_su->type;
 
-        snprintf(name, sizeof(name), "blk.%u.ffn_down_shexp.weight", i);
-        const gguf_tensor_t *t_sd = gguf_find_tensor(gf, name);
-        if (t_sd) {
-            if (!is_supported_quant_type(t_sd->type)) {
-                MYDS_LOG_E("Layer %u shared down tensor '%s' has unsupported quant type %d (%s) (T0-1 gate)",
-                           i, name, (int)t_sd->type, ggml_type_name(t_sd->type));
+            snprintf(name, sizeof(name), "blk.%u.ffn_down_shexp.weight", i);
+            const gguf_tensor_t *t_sd = gguf_find_tensor(gf, name);
+            if (!t_sd || !is_supported_quant_type(t_sd->type)) {
+                MYDS_LOG_E("Layer %u missing or invalid shared down tensor '%s' (T0-3 / T0-1 gate)", i, name);
                 goto fail;
             }
             m->layers[i].shared_down = create_metal_buffer_from_tensor(t_sd);
+            m->layers[i].shared_down_type = t_sd->type;
         }
 
         bool has_dense_ffn = (m->layers[i].ffn_gate && m->layers[i].ffn_up && m->layers[i].ffn_down);
+        bool has_routed_ffn = (m->layers[i].ffn_gate_exps && m->layers[i].ffn_up_exps && m->layers[i].ffn_down_exps && m->layers[i].router_gate);
         bool has_shared_ffn = (m->layers[i].shared_gate && m->layers[i].shared_up && m->layers[i].shared_down);
-        if (!has_dense_ffn && !has_shared_ffn) {
-            MYDS_LOG_E("Layer %u missing FFN tensors (neither complete dense FFN nor shared expert FFN found) (T0-3 gate)", i);
+        if (!has_dense_ffn && !has_routed_ffn && !has_shared_ffn) {
+            MYDS_LOG_E("Layer %u missing FFN tensors (neither complete dense FFN, routed MoE, nor shared expert found) (T0-3 gate)", i);
             goto fail;
         }
     }
@@ -768,6 +863,10 @@ void myds_model_free(myds_model_t *m) {
             if (m->layers[i].ffn_up)         myds_metal_buffer_free(m->layers[i].ffn_up);
             if (m->layers[i].ffn_down)       myds_metal_buffer_free(m->layers[i].ffn_down);
             if (m->layers[i].router_gate)    myds_metal_buffer_free(m->layers[i].router_gate);
+            if (m->layers[i].router_bias)    myds_metal_buffer_free(m->layers[i].router_bias);
+            if (m->layers[i].ffn_gate_exps)  myds_metal_buffer_free(m->layers[i].ffn_gate_exps);
+            if (m->layers[i].ffn_up_exps)    myds_metal_buffer_free(m->layers[i].ffn_up_exps);
+            if (m->layers[i].ffn_down_exps)  myds_metal_buffer_free(m->layers[i].ffn_down_exps);
             if (m->layers[i].shared_gate)    myds_metal_buffer_free(m->layers[i].shared_gate);
             if (m->layers[i].shared_up)      myds_metal_buffer_free(m->layers[i].shared_up);
             if (m->layers[i].shared_down)    myds_metal_buffer_free(m->layers[i].shared_down);
@@ -869,6 +968,28 @@ myds_context_t *myds_context_create(myds_model_t *model, const myds_config_t *cf
         }
     }
 
+    if (model->n_routed_experts > 0) {
+        uint32_t n_routed = model->n_routed_experts;
+        uint32_t n_active = model->n_activated_experts;
+        uint32_t exp_dim = model->moe_expert_dim > 0 ? model->moe_expert_dim : 2304;
+
+        ctx->router_logits    = myds_metal_buffer_alloc(n_routed * sizeof(float));
+        ctx->selected_ids     = myds_metal_buffer_alloc(n_active * sizeof(int32_t));
+        ctx->selected_weights = myds_metal_buffer_alloc(n_active * sizeof(float));
+        ctx->moe_gate         = myds_metal_buffer_alloc(n_active * exp_dim * sizeof(float));
+        ctx->moe_up           = myds_metal_buffer_alloc(n_active * exp_dim * sizeof(float));
+        ctx->moe_mid          = myds_metal_buffer_alloc(n_active * exp_dim * sizeof(float));
+        ctx->moe_down         = myds_metal_buffer_alloc(n_active * dim * sizeof(float));
+        ctx->moe_out          = myds_metal_buffer_alloc(dim * sizeof(float));
+
+        if (model->n_shared_experts > 0) {
+            ctx->shared_gate_out   = myds_metal_buffer_alloc(exp_dim * sizeof(float));
+            ctx->shared_up_out     = myds_metal_buffer_alloc(exp_dim * sizeof(float));
+            ctx->shared_swiglu_out = myds_metal_buffer_alloc(exp_dim * sizeof(float));
+            ctx->shared_out        = myds_metal_buffer_alloc(dim * sizeof(float));
+        }
+    }
+
     ctx->sample_probs = (float *)malloc(vocab_size * sizeof(float));
     ctx->sample_indices = (int32_t *)malloc(vocab_size * sizeof(int32_t));
     ctx->rng_state = ((uint64_t)ctx->cfg.seed ^ 0x5DEECE66DULL) | 1ULL;
@@ -897,6 +1018,19 @@ void myds_context_free(myds_context_t *ctx) {
     if (ctx->swiglu_out)   myds_metal_buffer_free(ctx->swiglu_out);
     if (ctx->ffn_out)      myds_metal_buffer_free(ctx->ffn_out);
     if (ctx->logits)       myds_metal_buffer_free(ctx->logits);
+
+    if (ctx->router_logits)    myds_metal_buffer_free(ctx->router_logits);
+    if (ctx->selected_ids)     myds_metal_buffer_free(ctx->selected_ids);
+    if (ctx->selected_weights) myds_metal_buffer_free(ctx->selected_weights);
+    if (ctx->moe_gate)         myds_metal_buffer_free(ctx->moe_gate);
+    if (ctx->moe_up)           myds_metal_buffer_free(ctx->moe_up);
+    if (ctx->moe_mid)          myds_metal_buffer_free(ctx->moe_mid);
+    if (ctx->moe_down)         myds_metal_buffer_free(ctx->moe_down);
+    if (ctx->moe_out)          myds_metal_buffer_free(ctx->moe_out);
+    if (ctx->shared_gate_out)   myds_metal_buffer_free(ctx->shared_gate_out);
+    if (ctx->shared_up_out)     myds_metal_buffer_free(ctx->shared_up_out);
+    if (ctx->shared_swiglu_out) myds_metal_buffer_free(ctx->shared_swiglu_out);
+    if (ctx->shared_out)        myds_metal_buffer_free(ctx->shared_out);
 
     if (ctx->k_cache) {
         for (uint32_t l = 0; l < ctx->model->n_layers; l++) free(ctx->k_cache[l]);
@@ -1102,6 +1236,124 @@ int32_t myds_sample_next_token(
     return sampled_id;
 }
 
+static int execute_ffn_layer(
+    myds_context_t *ctx,
+    myds_layer_t   *layer,
+    uint32_t        l,
+    uint32_t        dim,
+    uint32_t        hidden_dim) {
+    myds_model_t *m = ctx->model;
+
+    if (layer->ffn_gate_exps && layer->ffn_up_exps && layer->ffn_down_exps && layer->router_gate) {
+        /* Commit batch so ffn_norm_out is complete on GPU/CPU */
+        myds_metal_commit_batch();
+
+        const float *norm_out = (const float *)myds_metal_buffer_data(ctx->ffn_norm_out);
+        const float *gate_weights = (const float *)myds_metal_buffer_data(layer->router_gate);
+        float *r_logits = (float *)myds_metal_buffer_data(ctx->router_logits);
+        uint32_t n_routed = m->n_routed_experts;
+        uint32_t n_active = m->n_activated_experts;
+        uint32_t exp_dim = m->moe_expert_dim > 0 ? m->moe_expert_dim : 2304;
+
+        for (uint32_t e = 0; e < n_routed; e++) {
+            r_logits[e] = dot_f32(norm_out, gate_weights + (size_t)e * dim, dim);
+        }
+
+        int32_t *sel_ids = (int32_t *)myds_metal_buffer_data(ctx->selected_ids);
+        float *sel_weights = (float *)myds_metal_buffer_data(ctx->selected_weights);
+        if (!myds_metal_moe_route_biased(
+                sel_ids,
+                sel_weights,
+                ctx->router_logits,
+                layer->router_bias,
+                n_routed,
+                n_active,
+                m->routed_scaling_factor)) {
+            MYDS_LOG_E("Forward failed: MoE biased routing failed at layer %u", l);
+            return 0;
+        }
+
+        /* Dispatch GPU MoE execution: gate/up (IQ2_XXS) -> SwiGLU -> down (Q2_K) -> sum6 */
+        myds_metal_begin_batch();
+        if (!myds_metal_routed_moe(
+                ctx->moe_out,
+                ctx->ffn_norm_out,
+                layer->ffn_gate_exps,
+                layer->ffn_up_exps,
+                layer->ffn_down_exps,
+                ctx->selected_ids,
+                ctx->selected_weights,
+                ctx->moe_gate,
+                ctx->moe_up,
+                ctx->moe_mid,
+                ctx->moe_down,
+                dim,
+                exp_dim,
+                n_routed,
+                n_active,
+                layer->ffn_gate_exps_type,
+                layer->ffn_up_exps_type,
+                layer->ffn_down_exps_type,
+                m->swiglu_clamp_exp)) {
+            MYDS_LOG_E("Forward failed: routed MoE execution failed at layer %u", l);
+            myds_metal_commit_batch();
+            return 0;
+        }
+
+        /* If shared expert is present, compute and add to moe_out */
+        if (layer->shared_gate && layer->shared_up && layer->shared_down && ctx->shared_out) {
+            if (!myds_metal_gemv(ctx->shared_gate_out, layer->shared_gate, ctx->ffn_norm_out, exp_dim, dim, layer->shared_gate_type) ||
+                !myds_metal_gemv(ctx->shared_up_out, layer->shared_up, ctx->ffn_norm_out, exp_dim, dim, layer->shared_up_type)) {
+                MYDS_LOG_E("Forward failed: GEMV for shared_gate/up at layer %u failed", l);
+                myds_metal_commit_batch();
+                return 0;
+            }
+            myds_metal_swiglu(ctx->shared_swiglu_out, ctx->shared_gate_out, ctx->shared_up_out, exp_dim);
+            if (!myds_metal_gemv(ctx->shared_out, layer->shared_down, ctx->shared_swiglu_out, dim, exp_dim, layer->shared_down_type)) {
+                MYDS_LOG_E("Forward failed: GEMV for shared_down at layer %u failed", l);
+                myds_metal_commit_batch();
+                return 0;
+            }
+            myds_metal_add(ctx->moe_out, ctx->moe_out, ctx->shared_out, dim);
+        }
+
+        /* Add MoE output to residual */
+        myds_metal_add(ctx->x, ctx->x, ctx->moe_out, dim);
+    } else if (layer->ffn_gate && layer->ffn_up && layer->ffn_down) {
+        if (!myds_metal_gemv(ctx->gate_out, layer->ffn_gate, ctx->ffn_norm_out, hidden_dim, dim, layer->ffn_gate_type) ||
+            !myds_metal_gemv(ctx->up_out, layer->ffn_up, ctx->ffn_norm_out, hidden_dim, dim, layer->ffn_up_type)) {
+            MYDS_LOG_E("Forward failed: GEMV for ffn_gate/up at layer %u failed", l);
+            myds_metal_commit_batch();
+            return 0;
+        }
+        myds_metal_swiglu(ctx->swiglu_out, ctx->gate_out, ctx->up_out, hidden_dim);
+        if (!myds_metal_gemv(ctx->ffn_out, layer->ffn_down, ctx->swiglu_out, dim, hidden_dim, layer->ffn_down_type)) {
+            MYDS_LOG_E("Forward failed: GEMV for ffn_down at layer %u failed", l);
+            myds_metal_commit_batch();
+            return 0;
+        }
+        myds_metal_add(ctx->x, ctx->x, ctx->ffn_out, dim);
+    } else if (layer->shared_gate && layer->shared_up && layer->shared_down && ctx->shared_out) {
+        uint32_t exp_dim = m->moe_expert_dim > 0 ? m->moe_expert_dim : 2304;
+        if (!myds_metal_gemv(ctx->shared_gate_out, layer->shared_gate, ctx->ffn_norm_out, exp_dim, dim, layer->shared_gate_type) ||
+            !myds_metal_gemv(ctx->shared_up_out, layer->shared_up, ctx->ffn_norm_out, exp_dim, dim, layer->shared_up_type)) {
+            MYDS_LOG_E("Forward failed: GEMV for shared_gate/up at layer %u failed", l);
+            myds_metal_commit_batch();
+            return 0;
+        }
+        myds_metal_swiglu(ctx->shared_swiglu_out, ctx->shared_gate_out, ctx->shared_up_out, exp_dim);
+        if (!myds_metal_gemv(ctx->shared_out, layer->shared_down, ctx->shared_swiglu_out, dim, exp_dim, layer->shared_down_type)) {
+            MYDS_LOG_E("Forward failed: GEMV for shared_down at layer %u failed", l);
+            myds_metal_commit_batch();
+            return 0;
+        }
+        myds_metal_add(ctx->x, ctx->x, ctx->shared_out, dim);
+    }
+
+    myds_metal_commit_batch();
+    return 1;
+}
+
 int32_t myds_forward_token(myds_context_t *ctx, int32_t token_id, uint32_t pos) {
     myds_model_t *m = ctx->model;
     uint32_t dim = m->dim;
@@ -1211,23 +1463,9 @@ int32_t myds_forward_token(myds_context_t *ctx, int32_t token_id, uint32_t pos) 
                 memcpy(myds_metal_buffer_data(ctx->ffn_norm_out), xv, dim * sizeof(float));
             }
 
-            /* FFN: Dense SwiGLU */
-            if (layer->ffn_gate && layer->ffn_up && layer->ffn_down) {
-                if (!myds_metal_gemv(ctx->gate_out, layer->ffn_gate, ctx->ffn_norm_out, m->hidden_dim, dim, layer->ffn_gate_type) ||
-                    !myds_metal_gemv(ctx->up_out, layer->ffn_up, ctx->ffn_norm_out, m->hidden_dim, dim, layer->ffn_up_type)) {
-                    MYDS_LOG_E("Forward failed: GEMV for ffn_gate/up at layer %u failed", l);
-                    myds_metal_commit_batch();
-                    return -1;
-                }
-                myds_metal_swiglu(ctx->swiglu_out, ctx->gate_out, ctx->up_out, m->hidden_dim);
-                if (!myds_metal_gemv(ctx->ffn_out, layer->ffn_down, ctx->swiglu_out, dim, m->hidden_dim, layer->ffn_down_type)) {
-                    MYDS_LOG_E("Forward failed: GEMV for ffn_down at layer %u failed", l);
-                    myds_metal_commit_batch();
-                    return -1;
-                }
-                myds_metal_add(ctx->x, ctx->x, ctx->ffn_out, dim);
+            if (!execute_ffn_layer(ctx, layer, l, dim, m->hidden_dim)) {
+                return -1;
             }
-            myds_metal_commit_batch();
         } else {
             /* =========================================================
              * Multi-Head Attention (MHA / GQA)
@@ -1340,23 +1578,9 @@ int32_t myds_forward_token(myds_context_t *ctx, int32_t token_id, uint32_t pos) 
                 memcpy(myds_metal_buffer_data(ctx->ffn_norm_out), xv, dim * sizeof(float));
             }
 
-            /* Dense SwiGLU FFN */
-            if (layer->ffn_gate && layer->ffn_up && layer->ffn_down) {
-                if (!myds_metal_gemv(ctx->gate_out, layer->ffn_gate, ctx->ffn_norm_out, m->hidden_dim, dim, layer->ffn_gate_type) ||
-                    !myds_metal_gemv(ctx->up_out, layer->ffn_up, ctx->ffn_norm_out, m->hidden_dim, dim, layer->ffn_up_type)) {
-                    MYDS_LOG_E("Forward failed: GEMV for ffn_gate/up at layer %u failed", l);
-                    myds_metal_commit_batch();
-                    return -1;
-                }
-                myds_metal_swiglu(ctx->swiglu_out, ctx->gate_out, ctx->up_out, m->hidden_dim);
-                if (!myds_metal_gemv(ctx->ffn_out, layer->ffn_down, ctx->swiglu_out, dim, m->hidden_dim, layer->ffn_down_type)) {
-                    MYDS_LOG_E("Forward failed: GEMV for ffn_down at layer %u failed", l);
-                    myds_metal_commit_batch();
-                    return -1;
-                }
-                myds_metal_add(ctx->x, ctx->x, ctx->ffn_out, dim);
+            if (!execute_ffn_layer(ctx, layer, l, dim, m->hidden_dim)) {
+                return -1;
             }
-            myds_metal_commit_batch();
         }
     }
 

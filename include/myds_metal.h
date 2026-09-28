@@ -66,7 +66,7 @@ int myds_metal_swiglu(
     const myds_metal_buffer_t *up,
     uint32_t                   dim);
 
-/* DeepSeek-MoE Router: selects top-k experts using sigmoid gating & scaling */
+/* DeepSeek-MoE Router: selects top-k experts using sigmoid/softplus gating & scaling */
 int myds_metal_moe_route(
     int32_t                   *out_expert_ids,
     float                     *out_expert_weights,
@@ -74,6 +74,38 @@ int myds_metal_moe_route(
     uint32_t                   n_routed_experts,
     uint32_t                   n_activated_experts,
     float                      routed_scaling_factor);
+
+/* DeepSeek V4.1 Biased Router: softplus + router_bias addition + top-k + normalized router weights */
+int myds_metal_moe_route_biased(
+    int32_t                   *out_expert_ids,
+    float                     *out_expert_weights,
+    const myds_metal_buffer_t *router_logits,
+    const myds_metal_buffer_t *router_bias,
+    uint32_t                   n_routed_experts,
+    uint32_t                   n_activated_experts,
+    float                      routed_scaling_factor);
+
+/* DeepSeek Routed MoE execution on GPU: gate/up (IQ2_XXS) -> SwiGLU -> down (Q2_K) -> sum6 */
+int myds_metal_routed_moe(
+    myds_metal_buffer_t       *moe_out,
+    const myds_metal_buffer_t *x_in,
+    const myds_metal_buffer_t *gate_exps,
+    const myds_metal_buffer_t *up_exps,
+    const myds_metal_buffer_t *down_exps,
+    const myds_metal_buffer_t *selected_ids,
+    const myds_metal_buffer_t *selected_weights,
+    myds_metal_buffer_t       *scratch_gate,
+    myds_metal_buffer_t       *scratch_up,
+    myds_metal_buffer_t       *scratch_mid,
+    myds_metal_buffer_t       *scratch_down,
+    uint32_t                   dim,
+    uint32_t                   expert_dim,
+    uint32_t                   n_routed_experts,
+    uint32_t                   n_activated_experts,
+    ggml_type                  gate_type,
+    ggml_type                  up_type,
+    ggml_type                  down_type,
+    float                      clamp_val);
 
 /* DeepSeek-MoE Expert Output Accumulation: y = sum(w_i * expert_out_i) */
 int myds_metal_moe_sum(

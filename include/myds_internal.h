@@ -33,8 +33,12 @@ typedef struct {
     myds_metal_buffer_t *ffn_up;
     myds_metal_buffer_t *ffn_down;
 
-    /* DeepSeek MoE router */
+    /* DeepSeek MoE router & experts */
     myds_metal_buffer_t *router_gate;
+    myds_metal_buffer_t *router_bias;
+    myds_metal_buffer_t *ffn_gate_exps;
+    myds_metal_buffer_t *ffn_up_exps;
+    myds_metal_buffer_t *ffn_down_exps;
     myds_metal_buffer_t *shared_gate;
     myds_metal_buffer_t *shared_up;
     myds_metal_buffer_t *shared_down;
@@ -44,6 +48,9 @@ typedef struct {
     ggml_type attn_q_a_type, attn_q_b_type, attn_kv_type;
     ggml_type attn_output_a_type, attn_output_b_type;
     ggml_type ffn_gate_type, ffn_up_type, ffn_down_type;
+    ggml_type router_gate_type;
+    ggml_type ffn_gate_exps_type, ffn_up_exps_type, ffn_down_exps_type;
+    ggml_type shared_gate_type, shared_up_type, shared_down_type;
 } myds_layer_t;
 
 struct myds_model {
@@ -71,7 +78,9 @@ struct myds_model {
     uint32_t             n_routed_experts;
     uint32_t             n_activated_experts;
     uint32_t             n_shared_experts;
+    uint32_t             moe_expert_dim;     /* default: 2304 */
     float                routed_scaling_factor;
+    float                swiglu_clamp_exp;   /* default: 10.0f */
 
     float                norm_eps;
     float                freq_base;
@@ -113,6 +122,20 @@ struct myds_context {
     myds_metal_buffer_t *kv_act;     /* [head_dim] */
     myds_metal_buffer_t *attn_heads; /* [n_heads * head_dim] */
     myds_metal_buffer_t *attn_low;   /* [n_out_groups * out_group_rank] */
+
+    /* MoE scratch activation buffers */
+    myds_metal_buffer_t *router_logits;    /* [n_routed_experts] */
+    myds_metal_buffer_t *selected_ids;     /* [n_activated_experts] int32 */
+    myds_metal_buffer_t *selected_weights; /* [n_activated_experts] float */
+    myds_metal_buffer_t *moe_gate;         /* [n_activated_experts * expert_dim] */
+    myds_metal_buffer_t *moe_up;           /* [n_activated_experts * expert_dim] */
+    myds_metal_buffer_t *moe_mid;          /* [n_activated_experts * expert_dim] */
+    myds_metal_buffer_t *moe_down;         /* [n_activated_experts * dim] */
+    myds_metal_buffer_t *moe_out;          /* [dim] */
+    myds_metal_buffer_t *shared_gate_out;  /* [expert_dim] */
+    myds_metal_buffer_t *shared_up_out;    /* [expert_dim] */
+    myds_metal_buffer_t *shared_swiglu_out;/* [expert_dim] */
+    myds_metal_buffer_t *shared_out;       /* [dim] */
 
     /* DeepSeek KV Cache */
     float              **k_cache; /* [n_layers][max_seq_len * stride] */

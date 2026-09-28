@@ -142,6 +142,8 @@ size_t ggml_type_row_size(ggml_type type, size_t row_len) {
         case GGML_TYPE_Q4_K:  return (row_len / 256) * 144;
         case GGML_TYPE_Q5_K:  return (row_len / 256) * 176;
         case GGML_TYPE_Q6_K:  return (row_len / 256) * 210;
+        case GGML_TYPE_Q2_K:  return (row_len / 256) * 84;
+        case GGML_TYPE_IQ2_XXS: return (row_len / 256) * 66;
         case GGML_TYPE_MXFP4: return (row_len / 32) * 17;
         default:              return row_len * 2; /* fallback */
     }
@@ -157,6 +159,8 @@ const char *ggml_type_name(ggml_type type) {
         case GGML_TYPE_Q4_K:  return "Q4_K";
         case GGML_TYPE_Q5_K:  return "Q5_K";
         case GGML_TYPE_Q6_K:  return "Q6_K";
+        case GGML_TYPE_Q2_K:  return "Q2_K";
+        case GGML_TYPE_IQ2_XXS: return "IQ2_XXS";
         case GGML_TYPE_MXFP4: return "MXFP4";
         default:              return "UNKNOWN";
     }
