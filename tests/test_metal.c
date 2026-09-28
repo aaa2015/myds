@@ -257,7 +257,7 @@ static int test_mul_mm_q8_0(void) {
     float *xv = (float *)myds_metal_buffer_data(x);
     for (uint32_t t = 0; t < n_tok; t++) {
         for (uint32_t i = 0; i < in_dim; i++) {
-            xv[t * in_dim + i] = (float)(t + 1);
+            xv[t * in_dim + i] = sinf((float)(t * in_dim + i + 1));
         }
     }
 
@@ -266,20 +266,31 @@ static int test_mul_mm_q8_0(void) {
     for (uint32_t b = 0; b < n_blocks; b++) {
         blocks[b].d = half_half;
         for (int i = 0; i < 32; i++) {
-            blocks[b].qs[i] = 2; // 0.5 * 2 = 1.0
+            blocks[b].qs[i] = (int8_t)((b * 7 + i) % 15 - 7);
         }
+    }
+
+    /* Compute baseline per-token using myds_metal_gemv */
+    myds_metal_buffer_t *y_gemv = myds_metal_buffer_alloc(n_tok * out_dim * sizeof(float));
+    for (uint32_t t = 0; t < n_tok; t++) {
+        myds_metal_buffer_t *xt = myds_metal_buffer_sub_view(x, t * in_dim * sizeof(float), in_dim * sizeof(float));
+        myds_metal_buffer_t *yt = myds_metal_buffer_sub_view(y_gemv, t * out_dim * sizeof(float), out_dim * sizeof(float));
+        ASSERT_TRUE(myds_metal_gemv(yt, W, xt, out_dim, in_dim, GGML_TYPE_Q8_0));
+        myds_metal_buffer_free(xt);
+        myds_metal_buffer_free(yt);
     }
 
     ASSERT_TRUE(myds_metal_mul_mm(y, W, x, out_dim, in_dim, n_tok, GGML_TYPE_Q8_0));
 
     float *yv = (float *)myds_metal_buffer_data(y);
+    float *y_expected = (float *)myds_metal_buffer_data(y_gemv);
     for (uint32_t t = 0; t < n_tok; t++) {
         for (uint32_t r = 0; r < out_dim; r++) {
-            float expected = (float)(t + 1) * (float)in_dim;
-            ASSERT_NEAR(yv[t * out_dim + r], expected, 1e-1f);
+            ASSERT_NEAR(yv[t * out_dim + r], y_expected[t * out_dim + r], 1e-2f);
         }
     }
 
+    myds_metal_buffer_free(y_gemv);
     myds_metal_buffer_free(x);
     myds_metal_buffer_free(y);
 
@@ -287,24 +298,34 @@ static int test_mul_mm_q8_0(void) {
     const uint32_t n_tok_odd = 35;
     x = myds_metal_buffer_alloc(n_tok_odd * in_dim * sizeof(float));
     y = myds_metal_buffer_alloc(n_tok_odd * out_dim * sizeof(float));
-    ASSERT_TRUE(x && y);
+    y_gemv = myds_metal_buffer_alloc(n_tok_odd * out_dim * sizeof(float));
+    ASSERT_TRUE(x && y && y_gemv);
 
     xv = (float *)myds_metal_buffer_data(x);
     for (uint32_t t = 0; t < n_tok_odd; t++) {
         for (uint32_t i = 0; i < in_dim; i++) {
-            xv[t * in_dim + i] = (float)(t + 1);
+            xv[t * in_dim + i] = sinf((float)(t * in_dim + i + 1));
         }
+    }
+
+    for (uint32_t t = 0; t < n_tok_odd; t++) {
+        myds_metal_buffer_t *xt = myds_metal_buffer_sub_view(x, t * in_dim * sizeof(float), in_dim * sizeof(float));
+        myds_metal_buffer_t *yt = myds_metal_buffer_sub_view(y_gemv, t * out_dim * sizeof(float), out_dim * sizeof(float));
+        ASSERT_TRUE(myds_metal_gemv(yt, W, xt, out_dim, in_dim, GGML_TYPE_Q8_0));
+        myds_metal_buffer_free(xt);
+        myds_metal_buffer_free(yt);
     }
 
     ASSERT_TRUE(myds_metal_mul_mm(y, W, x, out_dim, in_dim, n_tok_odd, GGML_TYPE_Q8_0));
 
     yv = (float *)myds_metal_buffer_data(y);
+    y_expected = (float *)myds_metal_buffer_data(y_gemv);
     for (uint32_t t = 0; t < n_tok_odd; t++) {
         for (uint32_t r = 0; r < out_dim; r++) {
-            float expected = (float)(t + 1) * (float)in_dim;
-            ASSERT_NEAR(yv[t * out_dim + r], expected, 1e-1f);
+            ASSERT_NEAR(yv[t * out_dim + r], y_expected[t * out_dim + r], 2e-2f);
         }
     }
+    myds_metal_buffer_free(y_gemv);
 
     myds_metal_buffer_free(W);
     myds_metal_buffer_free(x);

@@ -1148,7 +1148,8 @@ int myds_metal_mul_mm(
             [enc setBuffer:W->mtl_buf offset:(W ? W->offset : 0) atIndex:1];
             [enc setBuffer:src1->mtl_buf offset:(src1 ? src1->offset : 0) atIndex:2];
             [enc setBuffer:dst->mtl_buf offset:(dst ? dst->offset : 0) atIndex:3];
-            [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u) atIndex:0];
+            uint32_t tg_mem = (weight_type == GGML_TYPE_F32) ? 12288u : (bc_out ? 8192u : 6144u);
+            [enc setThreadgroupMemoryLength:tg_mem atIndex:0];
             [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
                                                   ((NSUInteger)out_dim + 63u) / 64u,
                                                   1)
