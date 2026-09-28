@@ -36,7 +36,7 @@ static const char *create_gate_test_gguf(
 
     uint32_t magic = GGUF_MAGIC;
     uint32_t version = 3;
-    uint64_t n_kvs = 8;
+    uint64_t n_kvs = 10;
 
     fwrite(&magic, 4, 1, f);
     write_u32(f, version);
@@ -81,6 +81,23 @@ static const char *create_gate_test_gguf(
     write_str(f, "general.alignment");
     write_u32(f, GGUF_TYPE_UINT32);
     write_u32(f, 32);
+
+    snprintf(key_buf, sizeof(key_buf), "%s.rms_norm_eps", arch);
+    write_str(f, key_buf);
+    write_u32(f, GGUF_TYPE_FLOAT32);
+    float reference_epsilon = 1e-20f;
+    fwrite(&reference_epsilon, sizeof(reference_epsilon), 1, f);
+
+    /* Match the fixture's 16 embedding/output rows explicitly. Falling back
+     * to a synthetic 256-token vocabulary would hide a loader contract bug. */
+    write_str(f, "tokenizer.ggml.tokens");
+    write_u32(f, GGUF_TYPE_ARRAY);
+    write_u32(f, GGUF_TYPE_STRING);
+    write_u64(f, 16);
+    for (unsigned i = 0; i < 16; i++) {
+        char token[] = {(char)('a' + i), 0};
+        write_str(f, token);
+    }
 
     uint64_t cur_offset = 0;
     for (size_t i = 0; i < n_tensors; i++) {
@@ -225,8 +242,9 @@ static void assert_prefill_matches_sequential(myds_context_t *batched, myds_cont
     }
 }
 
-static void test_prefill_workspace_reuse(void) {
+static void test_prefill_workspace_reuse(const char *arch) {
     myds_model_t *m = test_prefill_model();
+    snprintf(m->arch, sizeof(m->arch), "%s", arch);
     myds_config_t cfg = {.max_seq_len = 1024, .max_new_tokens = 1, .temperature = 0.0f,
                          .top_p = 1.0f, .seed = 42};
     myds_context_t *ctx = myds_context_create(m, &cfg);
@@ -269,6 +287,148 @@ static void test_prefill_workspace_reuse(void) {
     myds_context_free(ctx);
     myds_model_free(m);
     printf("  [PASS] Prefill short/long/short workspace reuse, 512-token boundary, output equivalence, cancellation and KV capacity\n");
+}
+
+static void test_f16_embedding(void) {
+    /* Literal binary16 inputs and exact mathematical values, deliberately
+     * independent of the production converter. Normal, subnormal and signed
+     * values catch BF16 interpretation even if prefill/decode share a bug. */
+    static const uint16_t half[] = {
+        0x0000, 0x8000, 0x3c00, 0xbc00, 0x3800, 0xb800, 0x4000, 0xc000,
+        0x0001, 0x8001, 0x03ff, 0x83ff, 0x0400, 0x8400, 0x3555, 0xb555
+    };
+    static const float values[] = {
+        0.0f, -0.0f, 1.0f, -1.0f, 0.5f, -0.5f, 2.0f, -2.0f,
+        0x1p-24f, -0x1p-24f, 1023.0f * 0x1p-24f, -1023.0f * 0x1p-24f,
+        0x1p-14f, -0x1p-14f, 1365.0f / 4096.0f, -1365.0f / 4096.0f
+    };
+    myds_model_t *f16 = test_prefill_model();
+    myds_model_t *f32 = test_prefill_model();
+    size_t elements = (size_t)f16->vocab_size * f16->dim;
+    myds_metal_buffer_free(f16->tok_embeddings);
+    f16->tok_embeddings = myds_metal_buffer_alloc(elements * sizeof(uint16_t));
+    f16->tok_embeddings_type = GGML_TYPE_F16;
+    assert(f16->tok_embeddings != NULL);
+    uint16_t *half_rows = myds_metal_buffer_data(f16->tok_embeddings);
+    float *float_rows = myds_metal_buffer_data(f32->tok_embeddings);
+    for (uint32_t t = 0; t < f16->vocab_size; t++) {
+        for (uint32_t i = 0; i < f16->dim; i++) {
+            size_t index = (size_t)t * f16->dim + i;
+            unsigned pattern = (t * 7 + i) % 16;
+            half_rows[index] = half[pattern];
+            float_rows[index] = values[pattern];
+        }
+    }
+    myds_config_t cfg = {.max_seq_len = 64, .max_new_tokens = 1, .temperature = 0.0f,
+                         .top_p = 1.0f, .seed = 42};
+    myds_context_t *decode = myds_context_create(f16, &cfg);
+    myds_context_t *batched = myds_context_create(f16, &cfg);
+    myds_context_t *reference = myds_context_create(f32, &cfg);
+    assert(decode && batched && reference);
+
+    /* No transformer layers: x exposes the embedding values directly. */
+    f16->n_layers = 0;
+    assert(myds_forward_token(decode, 37, 0) >= 0);
+    assert(memcmp(myds_metal_buffer_data(decode->x), float_rows + 37 * f16->dim,
+                  f16->dim * sizeof(float)) == 0);
+    assert(myds_forward_token(decode, -1, 0) == -1);
+    assert(myds_forward_token(decode, (int32_t)f16->vocab_size, 0) == -1);
+    f16->n_layers = 1;
+
+    /* Five prefill tokens plus BOS force the chunk path; two tokens exercise
+     * sequential prefill. Both compare complete logits and KV rows against
+     * a separate F32 model populated with the values above. */
+    assert_prefill_matches_sequential(batched, reference, "abcde");
+    assert(batched->prefill_chunk != NULL);
+    assert_prefill_matches_sequential(decode, reference, "ab");
+    assert(decode->prefill_chunk == NULL);
+
+    myds_context_free(reference);
+    myds_context_free(batched);
+    myds_context_free(decode);
+    myds_model_free(f32);
+    myds_model_free(f16);
+    printf("  [PASS] F16 embedding known values, bounds, decode and chunk prefill against independent F32 weights\n");
+}
+
+static void test_model_vocabulary_shapes(void) {
+    const char *path = "/tmp/test_myds_vocabulary_shapes.gguf";
+    const synth_tensor_desc_t valid[] = {
+        {"token_embd.weight", GGML_TYPE_F32, 64, 16},
+        {"output_norm.weight", GGML_TYPE_F32, 64, 0},
+        {"output.weight", GGML_TYPE_F32, 64, 16},
+        {"blk.0.attn_norm.weight", GGML_TYPE_F32, 64, 0},
+        {"blk.0.attn_q.weight", GGML_TYPE_F32, 64, 64},
+        {"blk.0.attn_k.weight", GGML_TYPE_F32, 64, 64},
+        {"blk.0.attn_v.weight", GGML_TYPE_F32, 64, 64},
+        {"blk.0.attn_output.weight", GGML_TYPE_F32, 64, 64},
+        {"blk.0.ffn_norm.weight", GGML_TYPE_F32, 64, 0},
+        {"blk.0.ffn_gate.weight", GGML_TYPE_F32, 64, 64},
+        {"blk.0.ffn_up.weight", GGML_TYPE_F32, 64, 64},
+        {"blk.0.ffn_down.weight", GGML_TYPE_F32, 64, 64},
+    };
+    const size_t tensor_count = sizeof(valid) / sizeof(valid[0]);
+    assert(create_gate_test_gguf(path, "deepseek41", 1, 0, valid, tensor_count));
+    myds_model_t *m = myds_model_load(path);
+    assert(m && m->vocab_size == 16 && m->tokenizer->vocab_size == 16);
+    myds_model_free(m);
+    const struct { unsigned tensor; uint64_t dim0, dim1; ggml_type type; } invalid[] = {
+        {0, 64, 15, GGML_TYPE_F32}, /* Embedding vocabulary mismatch. */
+        {0, 32, 16, GGML_TYPE_F32}, /* Embedding width mismatch. */
+        {0, 64, 0, GGML_TYPE_F32},  /* Embedding is not a matrix. */
+        {2, 64, 15, GGML_TYPE_F32}, /* Output vocabulary mismatch. */
+        {2, 32, 16, GGML_TYPE_F32}, /* Output width mismatch. */
+        {2, 64, 0, GGML_TYPE_F32},  /* Output is not a matrix. */
+        {1, 32, 0, GGML_TYPE_F32},  /* Norm width mismatch. */
+        {1, 64, 1, GGML_TYPE_F32},  /* Norm is not a vector. */
+        {1, 64, 0, GGML_TYPE_F16},  /* Norm kernel expects F32. */
+    };
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        synth_tensor_desc_t tensors[sizeof(valid) / sizeof(valid[0])];
+        memcpy(tensors, valid, sizeof(tensors));
+        tensors[invalid[i].tensor].dim0 = invalid[i].dim0;
+        tensors[invalid[i].tensor].dim1 = invalid[i].dim1;
+        tensors[invalid[i].tensor].type = invalid[i].type;
+        assert(create_gate_test_gguf(path, "deepseek41", 1, 0, tensors, tensor_count));
+        assert(myds_model_load(path) == NULL);
+    }
+    unlink(path);
+    printf("  [PASS] Tokenizer/embedding/output vocabulary, dimensions and norm type/shape loader contracts\n");
+}
+
+static void count_byte_callback(const char *bytes, size_t length, int32_t token_id, void *opaque) {
+    (void)bytes; (void)length; (void)token_id;
+    (*(unsigned *)opaque)++;
+}
+
+static void test_invalid_generated_token(void) {
+    /* Deliberately corrupt an otherwise valid in-memory model after loading:
+     * sampling 200 is possible, but tokenizer vocabulary has only 128 rows.
+     * decode_bytes() returns an empty piece for invalid IDs, so generation
+     * must check the ID rather than relying on a NULL decoder return. */
+    myds_model_t *m = test_prefill_model();
+    m->n_layers = 0;
+    m->tokenizer->vocab_size = 128;
+    float *embeddings = myds_metal_buffer_data(m->tok_embeddings);
+    for (size_t i = 0; i < (size_t)m->dim * m->vocab_size; i++) embeddings[i] = 1.0f;
+    float *output = myds_metal_buffer_data(m->output);
+    memset(output, 0, (size_t)m->dim * m->vocab_size * sizeof(float));
+    for (uint32_t i = 0; i < m->dim; i++) output[200 * m->dim + i] = 1.0f;
+    myds_config_t cfg = {.max_seq_len = 64, .max_new_tokens = 1, .temperature = 0.0f,
+                         .top_p = 1.0f, .seed = 42};
+    myds_context_t *ctx = myds_context_create(m, &cfg);
+    assert(ctx);
+    assert(myds_forward_token(ctx, 97, 0) == 200);
+    unsigned callback_count = 0;
+    myds_stop_reason_t reason = MYDS_STOP_LENGTH;
+    assert(!myds_generate_bytes_ex(ctx, "a", count_byte_callback, &callback_count,
+                                   &reason, NULL, NULL));
+    assert(reason == MYDS_STOP_ERROR && callback_count == 0);
+    myds_context_free(ctx);
+    m->tokenizer->vocab_size = 256;
+    m->n_layers = 1;
+    myds_model_free(m);
+    printf("  [PASS] Invalid sampled token returns generation error without an empty success callback\n");
 }
 
 int main(void) {
@@ -328,7 +488,19 @@ int main(void) {
         printf("  [PASS] RoPE decoupled angular frequency calculation\n");
     }
 
-    /* 6. DeepSeek V4/V4.1 Architecture Enforcement & V2/V3 Rejection */
+    /* A family label does not establish support for the model's graph. */
+    {
+        const char *path = "/tmp/test_myds_unsupported_hc.gguf";
+        synth_tensor_desc_t required[] = {
+            {"blk.0.hc_attn_fn.weight", GGML_TYPE_F16, 64, 24}
+        };
+        assert(create_gate_test_gguf(path, "deepseek41", 1, 0, required, 1));
+        assert(myds_model_load(path) == NULL);
+        unlink(path);
+        printf("  [PASS] Required unimplemented HC graph is rejected before inference\n");
+    }
+
+    /* 6. DeepSeek V4/V4.1 family recognition & V2/V3 Rejection */
     {
         /* DeepSeek V4 and V4.1 accepted architectures */
         assert(myds_is_supported_arch("deepseek41") == true);
@@ -445,6 +617,7 @@ int main(void) {
         myds_model_t *m = myds_model_load(path);
         assert(m != NULL);
         assert(m->is_mla == true);
+        assert(m->norm_eps == 1e-20f);
         assert(m->dim == 64);
         assert(m->head_dim == 16);
         assert(m->q_lora_rank == 16);
@@ -491,7 +664,7 @@ int main(void) {
         cfg.max_new_tokens = 1;
         myds_context_set_config(ctx, &cfg);
         myds_stop_reason_t reason = MYDS_STOP_ERROR;
-        assert(myds_generate_ex(ctx, "\1\2\3\4\5", NULL, NULL, &reason, NULL, NULL));
+        assert(myds_generate_ex(ctx, "defgh", NULL, NULL, &reason, NULL, NULL));
         assert(reason == MYDS_STOP_LENGTH || reason == MYDS_STOP_EOS);
         assert(ctx->pos == 6 && ctx->prefill_chunk == NULL);
 
@@ -501,7 +674,13 @@ int main(void) {
         printf("  [PASS] MLA forward pass & latent KV cache cross-attention verified\n");
     }
 
-    test_prefill_workspace_reuse();
+    test_prefill_workspace_reuse("deepseek4");
+    /* Exercise the scalar/chunk Q-no-head-norm branch as a scheduling
+     * regression as well; this synthetic model is not a V4.1 quality oracle. */
+    test_prefill_workspace_reuse("deepseek41");
+    test_f16_embedding();
+    test_model_vocabulary_shapes();
+    test_invalid_generated_token();
 
     printf("====================================================\n");
     printf("   ALL ENGINE UNIT & GATE TESTS PASSED!             \n");

@@ -154,6 +154,10 @@ struct myds_context {
 };
 
 /* Unified production sampler: greedy, temperature, top-k, min-p, top-p, repetition penalty */
+/* Allows incomplete graphs solely to diagnose tensor/logit mismatches.
+ * Never use for user-facing generation or service readiness. */
+myds_model_t *myds_model_load_diagnostic(const char *model_path);
+
 int32_t myds_sample_next_token(
     const float         *logits,
     uint32_t             vocab_size,

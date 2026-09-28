@@ -41,7 +41,7 @@ typedef struct {
     size_t tokens_cap;
 } cli_stream_ctx_t;
 
-static void token_stream_printer(const char *piece, int32_t token_id, void *user_data) {
+static void token_stream_printer(const char *piece, size_t length, int32_t token_id, void *user_data) {
     cli_stream_ctx_t *sctx = (cli_stream_ctx_t *)user_data;
     double now = myds_now_s();
     if (sctx->token_count == 0) {
@@ -52,7 +52,7 @@ static void token_stream_printer(const char *piece, int32_t token_id, void *user
         sctx->tokens[sctx->token_count] = token_id;
     }
     sctx->token_count++;
-    fputs(piece, stdout);
+    fwrite(piece, 1, length, stdout);
     fflush(stdout);
 }
 
@@ -149,6 +149,7 @@ int main(int argc, char *argv[]) {
         return rc;
     }
 
+    int exit_code = 0;
     if (prompt) {
         /* Single prompt generation */
         MYDS_LOG_I("Generating response for prompt (%zu chars)...", strlen(prompt));
@@ -166,7 +167,8 @@ int main(int argc, char *argv[]) {
 
         myds_stop_reason_t stop_reason = MYDS_STOP_EOS;
         uint32_t prompt_tokens = 0;
-        myds_generate_ex(ctx, prompt, token_stream_printer, &sctx, &stop_reason, &prompt_tokens, NULL);
+        int generated = myds_generate_bytes_ex(ctx, prompt, token_stream_printer, &sctx,
+                                               &stop_reason, &prompt_tokens, NULL);
 
         double t_end = myds_now_s();
         double wall_s = t_end - sctx.t_start;
@@ -182,8 +184,8 @@ int main(int argc, char *argv[]) {
                 printf("%d%s", tokens_buf[ti], (ti + 1 < n_print) ? "," : "");
             }
             printf("]\n");
-            free(tokens_buf);
         }
+        free(tokens_buf);
 
         printf("\n\n----------------------------------------------------\n");
         printf("load %.2f s | prefill %.2f s (prompt %u tok, TTFT %.2f s) | decode %u tok in %.2f s = %.2f t/s | wall %.2f s\n",
@@ -191,6 +193,10 @@ int main(int argc, char *argv[]) {
         printf("----------------------------------------------------\n");
         MYDS_LOG_I("Generation metrics: load %.2fs | prefill %.2fs (%u tok, TTFT %.2fs) | decode %u tok in %.2fs = %.2f t/s | wall %.2fs | stop_reason: %d",
                    load_sec, prefill_s, prompt_tokens, ttft_s, sctx.token_count, decode_s, decode_tps, wall_s, (int)stop_reason);
+        if (!generated) {
+            MYDS_LOG_E("Generation failed (stop_reason: %d)", (int)stop_reason);
+            exit_code = 1;
+        }
     } else {
         /* Interactive Chat Mode */
         printf("\nEntering interactive chat mode (type 'exit' or Ctrl+D to quit):\n\n");
@@ -214,7 +220,8 @@ int main(int argc, char *argv[]) {
 
             myds_stop_reason_t stop_reason = MYDS_STOP_EOS;
             uint32_t prompt_tokens = 0;
-            myds_generate_ex(ctx, line, token_stream_printer, &sctx, &stop_reason, &prompt_tokens, NULL);
+            int generated = myds_generate_bytes_ex(ctx, line, token_stream_printer, &sctx,
+                                                   &stop_reason, &prompt_tokens, NULL);
 
             double t_end = myds_now_s();
             double wall_s = t_end - sctx.t_start;
@@ -224,10 +231,15 @@ int main(int argc, char *argv[]) {
 
             printf("\n  [decode %.1f t/s | TTFT %.2fs | %u prompt tok | %u gen tok | wall %.2fs]\n",
                    decode_tps, prefill_s, prompt_tokens, sctx.token_count, wall_s);
+            if (!generated) {
+                MYDS_LOG_E("Generation failed (stop_reason: %d)", (int)stop_reason);
+                exit_code = 1;
+                break;
+            }
         }
     }
 
     myds_context_free(ctx);
     myds_model_free(model);
-    return 0;
+    return exit_code;
 }

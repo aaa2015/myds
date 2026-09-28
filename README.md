@@ -1,27 +1,29 @@
-# myds: Minimal DeepSeek V4 / V4.1 Inference Engine on Apple Silicon Metal
+# myds: Apple Silicon Metal 推理引擎实验
 
-`myds` 是一个专为 **DeepSeek V4 / V4.1** 系列模型量身打造的极简、高性能本地推理引擎（已移除对早期 DeepSeek V2、V3 架构的兼容支持，专注 V4/V4.1 极致算子调优）。它完全基于 C / Objective-C 编写，去除了非 DeepSeek 架构的一切冗余代码，直接调用 Apple Silicon 原生 **Metal** 图形与计算框架加速，具备毫秒级冷启动、零拷贝内存映射与流式生成能力。
+**当前 native engine 尚不能正确运行完整 DeepSeek V4 / V4.1 模型。** 分词器和 F16 embedding 已修复并经独立参考验证；完整 V4.1 所需的 HC、Engram、压缩 KV、indexer 及若干数值路径仍未实现。模型包含这些必要特性时，普通 CLI / HTTP 服务会明确拒绝加载。
+
+项目保留 C / Objective-C、Metal 算子、GGUF 映射、BPE、HTTP 与合成模型测试基础，继续用于实现和验证完整推理图。请先阅读 [正确性修复与验证状态](docs/CORRECTNESS_STATUS.md)；单元测试通过或历史速度提升不能证明当前目标模型可用。
 
 ---
 
-## 核心特性
+## 已有算子与实验基础
 
-- **专注于 DeepSeek V4 / V4.1 架构（严格校验，拒绝 V2/V3）**：
+- **围绕 DeepSeek V4 / V4.1 构建的算子基础（完整计算图尚未实现）**：
   - **RMSNorm** 归一化加速
   - **MLA (Multi-head Latent Attention)** 解耦多头潜在注意力与低秩压缩 KV Cache
   - **Decoupled RoPE** 解耦旋转位置编码
   - **DeepSeekMoE** 混合专家网络（Shared Experts 共享专家 + Top-K 路由专家，Sigmoid 门控与权重重整化）
   - **SwiGLU** 激活函数融合计算
-  - **严格架构拦截**：原生仅支持 `deepseek41`、`deepseek4`、`deepseek4-dspark` 等 V4 系列，严格拦截并显式报错 legacy V2/V3 模型
-- **纯正 Apple Silicon Metal 驱动**：
-  - 从 `ds4` 迁移并提炼出 20 个 DeepSeek 专有 `.metal` 着色器核函数
+  - **模型加载检查**：架构名称仅用于识别模型家族；另外检查必要操作和词表维度，遇到未实现的 HC、Engram、压缩 KV、indexer 会拒绝推理
+- **Apple Silicon Metal 算子**：
+  - 仓库包含从 `ds4` 迁移的 `.metal` 源文件；文件存在不代表相应模型步骤已接入计算图
   - 利用统一内存架构（Unified Memory）通过 `MTLResourceStorageModeShared` 实现 CPU 与 GPU 之间零拷贝
   - 运行时即时编译优化，原生发挥 M 系列芯片（M1/M2/M3/M4/M5 等）的最大能效
 - **极简架构与零依赖**：
   - 核心推理引擎仅由几个高内聚、低耦合的模块组成，无需任何外部第三方库（仅依赖系统级 Foundation 与 Metal 框架）
   - 内置极简 GGUF v2/v3 解析器，支持 `mmap` 秒级映射大模型权重
-  - 内置 DeepSeek BPE 分词器，支持流式文本解码与交互式 Chat 模式
-  - `make` 2 秒内完成全量构建，内置完整的单元测试套件
+  - 内置 merge-rank byte BPE、JoyAI 预分词、显式字节长度解码与 UTF-8 流式输出
+  - `make` 构建本地程序与测试；另有独立 HF tokenizer 与 ds4 tensor 对照工具
 
 ---
 
@@ -37,7 +39,7 @@ myds/
 │   ├── concat.metal                  # 张量拼接
 │   ├── cpy.metal                     # 快速连续内存与格式转换
 │   ├── dense.metal                   # 量化矩阵向量/矩阵乘法 (Q8_0, Q4_K, F16, F32)
-│   ├── dsv4_hc.metal                 # DeepSeek 混合缓存矩阵运算
+│   ├── dsv4_hc.metal                 # HC 多路残差算子源码（未接入 native 计算图）
 │   ├── dsv4_kv.metal                 # DeepSeek KV Cache 状态操作
 │   ├── dsv4_misc.metal               # DeepSeek 辅助算子
 │   ├── dsv4_rope.metal               # 解耦 RoPE 旋转位置编码
@@ -113,7 +115,7 @@ make test
 
 2. **DeepSeek BPE 分词器测试套件 (`bin/test_tokenizer`)**：
    - [x] 词表加载与 BOS/EOS 特殊 Token 识别
-   - [x] BPE 贪婪分词与前缀最长匹配
+   - [x] Byte BPE 映射、merge rank、JoyAI 预分词与已知答案
    - [x] Byte-Fallback `<0xHH>` 未登录字节回退处理
    - [x] 逐 Token 还原文本与字节 Token 还原
    - [x] 缺失词表时的 256 字节兜底模式验证
@@ -168,7 +170,7 @@ make bench
 
 ### 命令行生成
 
-指定 DeepSeek GGUF 模型文件并输入提示词：
+以下展示 CLI 接口。当前完整目标模型会因缺少必要计算图而被拒绝；请勿将这些命令示例理解为完整 V4.1 已可用：
 
 ```bash
 ./bin/myds -m /path/to/deepseek.gguf -p "你好，请介绍一下你自己。"
@@ -184,7 +186,7 @@ make bench
 
 ### HTTP 服务器模式 (OpenAI 兼容 API)
 
-`myds` 内置轻量级、低延迟的 POSIX HTTP 服务端，可直接接入算力舰队或作为 OpenAI 兼容端点：
+`myds` 内置 POSIX HTTP 服务端。只有模型加载通过后才会启动监听；当前完整 V4.1 模型不满足这一条件：
 
 ```bash
 ./bin/myds -m /path/to/deepseek.gguf --port 8181 --host 0.0.0.0 --alias local-myds
@@ -198,6 +200,8 @@ make bench
 - 请求体参数兼容性：全面支持 `instructions`（系统指令）、`input`（消息数组或纯文本，自动展开 `input_text` 复杂结构）、`messages`、`max_output_tokens` / `max_tokens`、`temperature` 与 `top_p`
 
 ### 算力舰队部署与启动
+
+当前版本会拒绝实际 V4.1 模型；完成完整图的正确性验收前，不应通过自动部署替换现有生产实例。
 
 `deploy` 中已集成 `myds` 算力引擎支持：
 - `start_fleet.sh`：定义 `SERVER_TYPE=15` 或 `SERVER_TYPE=myds` 即可调度 `myds` 作为后端引擎

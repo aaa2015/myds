@@ -100,6 +100,12 @@ $(BUILD_DIR)/dump_tensors.o: tools/dump_tensors.c | $(BUILD_DIR)
 $(DUMP_TENSORS): $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/dump_tensors.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@
 
+$(BUILD_DIR)/trace_model.o: tools/trace_model.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+$(BIN_DIR)/trace_model: $(filter-out $(BUILD_DIR)/myds_server.o,$(OBJS_C)) $(OBJS_M) $(BUILD_DIR)/trace_model.o | $(BIN_DIR)
+	$(CC) $^ $(LDFLAGS) -o $@
+
 $(BUILD_DIR)/test_cpu.o: tests/test_cpu.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 

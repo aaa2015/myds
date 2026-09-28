@@ -7,6 +7,48 @@
 #include <string.h>
 #include <time.h>
 
+static uint32_t float_bits(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static void test_fp16_conversion(void) {
+    static const struct { uint16_t half; uint32_t single; } known[] = {
+        {0x0000, 0x00000000}, {0x8000, 0x80000000}, /* Signed zero. */
+        {0x3c00, 0x3f800000}, {0xbc00, 0xbf800000}, /* +/- 1. */
+        {0x3800, 0x3f000000}, {0x4000, 0x40000000}, /* 0.5, 2. */
+        {0x0001, 0x33800000}, {0x8001, 0xb3800000}, /* Minimum subnormal. */
+        {0x03ff, 0x387fc000}, {0x0400, 0x38800000}, /* Subnormal/normal boundary. */
+        {0x7bff, 0x477fe000}, {0xfbff, 0xc77fe000}, /* Maximum finite. */
+        {0x7c00, 0x7f800000}, {0xfc00, 0xff800000}, /* Infinities. */
+        {0x7e00, 0x7fc00000}, {0xfe55, 0xffcaa000}, /* Quiet NaN payload/sign. */
+        {0x7c01, 0x7f802000},                     /* Signaling NaN payload. */
+    };
+    for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
+        assert(float_bits(myds_fp16_to_fp32(known[i].half)) == known[i].single);
+    }
+    /* Independent mathematical oracle for every binary16 representation.
+     * This does not reuse the implementation's bit rebiasing algorithm. */
+    for (uint32_t bits = 0; bits <= UINT16_MAX; bits++) {
+        unsigned exponent = (bits >> 10) & 31;
+        unsigned fraction = bits & 1023;
+        float actual = myds_fp16_to_fp32((uint16_t)bits);
+        if (exponent == 31 && fraction != 0) {
+            assert(isnan(actual));
+            assert((float_bits(actual) & 0x7fffffu) == fraction * 8192u);
+        } else {
+            float expected;
+            if (exponent == 31) expected = INFINITY;
+            else if (exponent == 0) expected = ldexpf((float)fraction, -24);
+            else expected = ldexpf(1.0f + (float)fraction / 1024.0f, (int)exponent - 15);
+            if (bits & 0x8000) expected = -expected;
+            assert(float_bits(actual) == float_bits(expected));
+        }
+    }
+    printf("CPU FP16: known bit patterns and all 65536 representations passed\n");
+}
+
 /* Frozen head-major reference from the original inference path. */
 static void reference_rope(float *x, uint32_t heads, uint32_t dim,
                            uint32_t rot, uint32_t pos, float base,
@@ -40,6 +82,7 @@ static int compare_double(const void *a, const void *b) {
 }
 
 int main(int argc, char **argv) {
+    test_fp16_conversion();
     const uint32_t dims[] = {16, 64, 512};
     const uint32_t heads[] = {1, 2, 64};
     const uint32_t positions[] = {0, 1, 4095, 262143};

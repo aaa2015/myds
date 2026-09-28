@@ -49,9 +49,9 @@ int main(void) {
             "}";
 
         char prompt[4096];
-        parse_chat_prompt(req_body, prompt, sizeof(prompt));
-        assert(strstr(prompt, "<｜User｜>[System: You are an expert systems programmer.]\n") != NULL);
-        assert(strstr(prompt, "<｜User｜>Write a C queue.\n") != NULL);
+        assert(parse_chat_prompt(req_body, prompt, sizeof(prompt)));
+        assert(strstr(prompt, "<｜System｜>You are an expert systems programmer.") != NULL);
+        assert(strstr(prompt, "<｜User｜>Write a C queue.") != NULL);
         assert(strstr(prompt, "<｜Assistant｜>") != NULL);
         printf("  [PASS] OpenAI Responses API input array with instructions\n");
     }
@@ -62,9 +62,9 @@ int main(void) {
             "{\"instructions\": \"Be concise.\", \"input\": \"What is 1+1?\"}";
 
         char prompt[4096];
-        parse_chat_prompt(req_body, prompt, sizeof(prompt));
-        assert(strstr(prompt, "<｜User｜>[System: Be concise.]\n") != NULL);
-        assert(strstr(prompt, "<｜User｜>What is 1+1?\n") != NULL);
+        assert(parse_chat_prompt(req_body, prompt, sizeof(prompt)));
+        assert(strstr(prompt, "<｜System｜>Be concise.") != NULL);
+        assert(strstr(prompt, "<｜User｜>What is 1+1?") != NULL);
         assert(strstr(prompt, "<｜Assistant｜>") != NULL);
         printf("  [PASS] OpenAI Responses API string input\n");
     }
@@ -75,9 +75,9 @@ int main(void) {
             "{\"messages\": [{\"role\":\"system\",\"content\":\"sys\"},{\"role\":\"user\",\"content\":\"usr\"}]}";
 
         char prompt[4096];
-        parse_chat_prompt(req_body, prompt, sizeof(prompt));
-        assert(strstr(prompt, "<｜User｜>[System: sys]\n") != NULL);
-        assert(strstr(prompt, "<｜User｜>usr\n") != NULL);
+        assert(parse_chat_prompt(req_body, prompt, sizeof(prompt)));
+        assert(strstr(prompt, "<｜System｜>sys") != NULL);
+        assert(strstr(prompt, "<｜User｜>usr") != NULL);
         assert(strstr(prompt, "<｜Assistant｜>") != NULL);
         printf("  [PASS] OpenAI Chat Completions messages compatibility\n");
     }

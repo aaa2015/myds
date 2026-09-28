@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# tools/golden_check.sh - Deterministic Token ID Exact Alignment Gate
+# tools/golden_check.sh - Deterministic behavior regression comparison ONLY.
+# Matching an old myds binary cannot establish model correctness. Numerical
+# semantics fixes require an independent reference and tensor/logit comparison.
 # Conforms to METRIC_FIX_SPEC.md P0-GATE specifications.
 
 set -euo pipefail
@@ -9,11 +11,13 @@ usage() {
 Usage: $0 <old_bin> <new_bin> [model.gguf]
 
 Parameters:
-  <old_bin>     Path to baseline myds binary (or reference binary)
+  <old_bin>     Path to baseline myds binary
   <new_bin>     Path to candidate myds binary
   [model.gguf]  Optional path to GGUF model (default: auto-detect or env MODEL_PATH)
 
 Verification:
+  - BEHAVIOR ONLY: this is not a model correctness or generation-quality gate
+  - Do not use it to reject a numerical fix merely because broken output changes
   - Runs >= 3 diverse prompts at temperature=0.0 (greedy) with fixed seed=42
   - Includes at least 1 deterministic verbatim recall prompt
   - Verifies bit-exact token ID sequence equivalence via SHA256 hashes
@@ -58,7 +62,7 @@ if [[ ! -f "$MODEL" ]]; then
 fi
 
 echo "========================================================="
-echo "  P0-GATE Deterministic Golden Alignment Check"
+echo "  Behavior regression comparison (NOT a correctness oracle)"
 echo "========================================================="
 echo "Baseline Bin  : $OLD_BIN"
 echo "Candidate Bin : $NEW_BIN"
@@ -184,7 +188,7 @@ run_sampling_check "top-k=40 (standard pool)" 40 || true
 
 echo "========================================================="
 if [[ $ALL_PASSED -eq 1 ]]; then
-    echo "  ALL GOLDEN CHECK TESTS PASSED! Bit-exact alignment verified."
+    echo "  Token ID sequences match. Model correctness remains unverified."
     echo "========================================================="
     exit 0
 else

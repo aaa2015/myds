@@ -1,0 +1,131 @@
+--- a/ds4.c
++++ b/ds4.c
+@@ -41162,8 +41162,13 @@
+ static bool ds41_embed(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                         ds4_gpu_tensor *out, ds4_gpu_tensor *scratch, int token, uint32_t pos) {
+     const ds4_vision_span *image = ds41_image_at(g, pos);
+-    if (!image) return ds4_gpu_embed_token_hc_tensor(out, m->map, m->size,
+-        w->token_embd->abs_offset, DS4_N_VOCAB, (uint32_t)token, DS4_N_EMBD, DS4_N_HC);
++    if (!image) {
++        const bool ok = ds4_gpu_embed_token_hc_tensor(out, m->map, m->size,
++            w->token_embd->abs_offset, DS4_N_VOCAB, (uint32_t)token, DS4_N_EMBD, DS4_N_HC);
++        if (ok) metal_graph_debug_dump_tensor("embedding", out,
++            (uint64_t)DS4_N_EMBD * DS4_N_HC, 0, pos);
++        return ok;
++    }
+     const float *data = image->embedding.data + (uint64_t)(pos - image->token_start) * DS4_N_EMBD;
+     return ds4_gpu_tensor_write(scratch, 0, data, (uint64_t)DS4_N_EMBD * sizeof(float)) &&
+         ds4_gpu_repeat_hc_tensor(out, scratch, DS4_N_EMBD, DS4_N_HC);
+@@ -41366,14 +41371,20 @@
+ }
+ 
+ static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
+-                                    const ds4_layer_weights *l) {
++                                    const ds4_layer_weights *l, uint32_t il) {
+     const uint32_t q_dim = DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM;
+-    return ds41_matmul(g->qr, m, l->attn_q_a, g->norm, true) &&
+-        ds41_norm(g->qr, g->qr, m, l->attn_q_a_norm) &&
+-        ds41_matmul_rows(g->q, m, l->attn_q_b, g->qr,
+-                         g->tp_rank * q_dim, q_dim) &&
+-        ds41_matmul(g->kv, m, l->attn_kv, g->norm, true) &&
+-        ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm);
++    if (!ds41_matmul(g->qr, m, l->attn_q_a, g->norm, true)) return false;
++    metal_graph_debug_dump_tensor("q_a_raw", g->qr, DS4_N_LORA_Q, il, g->pos);
++    if (!ds41_norm(g->qr, g->qr, m, l->attn_q_a_norm)) return false;
++    metal_graph_debug_dump_tensor("q_a_norm", g->qr, DS4_N_LORA_Q, il, g->pos);
++    if (!ds41_matmul_rows(g->q, m, l->attn_q_b, g->qr,
++                          g->tp_rank * q_dim, q_dim)) return false;
++    metal_graph_debug_dump_tensor("q_b", g->q, q_dim, il, g->pos);
++    if (!ds41_matmul(g->kv, m, l->attn_kv, g->norm, true)) return false;
++    metal_graph_debug_dump_tensor("kv_raw", g->kv, DS4_N_HEAD_DIM, il, g->pos);
++    if (!ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm)) return false;
++    metal_graph_debug_dump_tensor("kv_norm", g->kv, DS4_N_HEAD_DIM, il, g->pos);
++    return true;
+ }
+ 
+ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
+@@ -41383,13 +41394,17 @@
+     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
+     const uint32_t heads = DS4_N_HEAD / g->tp_world;
+     const uint32_t head0 = g->tp_rank * heads;
+-    if (!projected && !ds41_attention_project(g, m, l)) return false;
++    if (!projected && !ds41_attention_project(g, m, l, il)) return false;
+     if (!ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false) ||
+-        !ds41_rope(g->kv, 1, DS4_N_HEAD_DIM, il, pos, false) ||
+-        !ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0) ||
++        !ds41_rope(g->kv, 1, DS4_N_HEAD_DIM, il, pos, false)) return false;
++    metal_graph_debug_dump_tensor("kv_rope", g->kv, DS4_N_HEAD_DIM, il, pos);
++    if (!ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0) ||
+         !ds4_gpu_tensor_copy(g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
+                              g->kv, 0, 512u * 4u) ||
+         !ds41_attention_select(g, m, l, il)) return false;
++    metal_graph_debug_dump_tensor("q_rope", g->q,
++        (uint64_t)heads * DS4_N_HEAD_DIM, il, pos);
++    metal_graph_debug_dump_tensor("kv_quant", g->kv, DS4_N_HEAD_DIM, il, pos);
+     const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
+     if (n_comp && !ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
+                                          g->selected_comp, n_comp, attended)) return false;
+@@ -41402,9 +41417,11 @@
+         !ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) ||
+         !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true)) return false;
+     if (projected) return true;
+-    return ds41_attention_output(g, m, l) &&
+-           ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
+-           ds41_bf16(g->block, DS4_N_EMBD);
++    if (!ds41_attention_output(g, m, l) ||
++        !ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) ||
++        !ds41_bf16(g->block, DS4_N_EMBD)) return false;
++    metal_graph_debug_dump_tensor("attn_out", g->block, DS4_N_EMBD, il, pos);
++    return true;
+ }
+ 
+ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
+@@ -41494,6 +41511,9 @@
+               ds41_norm(g->norm, g->x, m, w->output_norm) &&
+               ds41_output_projection(g, g->tp_logits_half ? g->tp_logits_half : g->logits,
+                                      m, w, g->norm, 1);
++    /* Global tensors use layer 0 so a first-layer trace also includes the head. */
++    if (ok) metal_graph_debug_dump_tensor("logits", g->logits,
++        DS4_N_VOCAB, 0, g->pos);
+     if (!ds4_gpu_end_commands()) ok = false;
+     return ok && ds4_gpu_tensor_read(g->logits, 0, logits,
+                                      (uint64_t)DS4_N_VOCAB * sizeof(float));
+@@ -41508,9 +41528,12 @@
+                 g->engram_q_norm[i], g->engram_k_norm[i], NULL, DS4_N_EMBD, 1, DS4_RMS_EPS))
+             return false;
+     }
+-    return ds41_hc_mix(g, m, l, false) &&
+-        ds41_hc_ws_round(g->x, g->residual, g->pre, DS4_N_HC, false) &&
+-        ds41_norm(g->norm, g->x, m, l->attn_norm);
++    if (!ds41_hc_mix(g, m, l, false) ||
++        !ds41_hc_ws_round(g->x, g->residual, g->pre, DS4_N_HC, false)) return false;
++    metal_graph_debug_dump_tensor("hc_attn_input", g->x, DS4_N_EMBD, il, g->pos);
++    if (!ds41_norm(g->norm, g->x, m, l->attn_norm)) return false;
++    metal_graph_debug_dump_tensor("attn_norm", g->norm, DS4_N_EMBD, il, g->pos);
++    return true;
+ }
+ 
+ static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
+@@ -41818,8 +41841,11 @@
+ 
+ static bool ds41_graph_layer(ds41_gpu_graph *g, const ds4_model *m,
+                             const ds4_layer_weights *l, uint32_t il, int token) {
+-    return ds41_graph_before_moe(g, m, l, il) && ds41_moe(g, m, l, il, (uint32_t)token) &&
+-        ds41_graph_after_moe(g);
++    if (!ds41_graph_before_moe(g, m, l, il) || !ds41_moe(g, m, l, il, (uint32_t)token) ||
++        !ds41_graph_after_moe(g)) return false;
++    metal_graph_debug_dump_tensor("layer_out", g->residual,
++        (uint64_t)DS4_N_HC * DS4_N_EMBD, il, g->pos);
++    return true;
+ }
+ 
+ #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+@@ -41837,7 +41863,7 @@
+         const int state = ds4_gpu_decode_graph_begin(&key);
+         if (state == 1) return true;
+         const bool ok = island == 0 ?
+-            ds41_graph_before_attention(g, m, l, il) && ds41_attention_project(g, m, l) :
++            ds41_graph_before_attention(g, m, l, il) && ds41_attention_project(g, m, l, il) :
+             island == 2 ? ds41_attention_output(g, m, l) :
+             ds41_graph_after_attention(g, m, l) && ds41_moe_partial(g, m, l, il, 0);
+         if (state != 0) return ok;

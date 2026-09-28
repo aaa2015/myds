@@ -15,41 +15,13 @@
 #include <mach/mach.h>
 #include <dispatch/dispatch.h>
 
+static bool trace_f32(const char *stage, uint32_t layer, uint32_t pos,
+                      const myds_metal_buffer_t *buffer, size_t count);
+
 typedef struct {
     uint16_t d;
     int8_t   qs[32];
 } engine_block_q8_0_t;
-
-static inline float fp16_to_fp32(uint16_t h) {
-#if defined(__arm64__) || defined(__aarch64__)
-    return (float)(*(_Float16 *)&h);
-#else
-    uint32_t sign = ((uint32_t)(h & 0x8000)) << 16;
-    int32_t exp  = (h >> 10) & 0x1f;
-    uint32_t mant = h & 0x3ff;
-    if (exp == 0) {
-        if (mant == 0) {
-            float zero;
-            memcpy(&zero, &sign, sizeof(float));
-            return zero;
-        }
-        while ((mant & 0x400) == 0) {
-            mant <<= 1;
-            exp--;
-        }
-        exp++;
-        mant &= ~0x400;
-    } else if (exp == 31) {
-        exp = 255;
-    } else {
-        exp += (127 - 15);
-    }
-    uint32_t f = sign | ((uint32_t)exp << 23) | (mant << 13);
-    float val;
-    memcpy(&val, &f, sizeof(float));
-    return val;
-#endif
-}
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -206,7 +178,7 @@ static __attribute__((unused)) void matvec_grouped_rows(
 
             float sum = 0.0f;
             for (uint64_t b = 0; b < blocks_per_row; b++) {
-                float d = fp16_to_fp32(row_blocks[b].d);
+                float d = myds_fp16_to_fp32(row_blocks[b].d);
                 const int8_t *qs = row_blocks[b].qs;
                 const float *xb = xg + b * 32;
                 for (int k = 0; k < 32; k++) {
@@ -231,7 +203,7 @@ static __attribute__((unused)) void matvec_grouped_rows(
             const uint16_t *row = w_f16 + r * group_dim;
             float sum = 0.0f;
             for (uint64_t i = 0; i < group_dim; i++) {
-                sum += fp16_to_fp32(row[i]) * xg[i];
+                sum += myds_fp16_to_fp32(row[i]) * xg[i];
             }
             out[r] = sum;
         }
@@ -267,11 +239,24 @@ static myds_metal_buffer_t *create_metal_buffer_from_tensor(const gguf_tensor_t 
     return buf;
 }
 
-myds_model_t *myds_model_load(const char *model_path) {
-    if (!myds_metal_init("metal")) {
-        MYDS_LOG_E("Failed to initialize Metal backend (check Apple Silicon GPU & shaders)");
-        return NULL;
+static const char *unimplemented_graph_feature(const gguf_file_t *gf) {
+    for (uint64_t i = 0; i < gf->tensor_count; i++) {
+        const char *name = gf->tensors[i].name;
+        if (strstr(name, "hc_attn_") || strstr(name, "hc_ffn_") ||
+            strstr(name, "hc_head")) return "HC multi-stream residual connections";
+        if (strstr(name, "engram")) return "Engram";
+        if (strstr(name, "attn_compress")) return "compressed KV";
+        if (strstr(name, ".indexer.")) return "KV indexer";
     }
+    /* These metadata keys distinguish the full V4.1 graph even if its
+     * required feature tensors have been omitted from an invalid file. */
+    if (gguf_find_key(gf, "deepseek41.hc_mult") ||
+        gguf_find_key(gf, "deepseek41.kv_source_layer_ids") ||
+        gguf_find_key(gf, "deepseek41.engram.layer_ids")) return "DeepSeek V4.1 graph";
+    return NULL;
+}
+
+static myds_model_t *model_load_internal(const char *model_path, bool diagnostic) {
 
     gguf_file_t *gf = gguf_open(model_path);
     if (!gf) {
@@ -279,12 +264,37 @@ myds_model_t *myds_model_load(const char *model_path) {
         return NULL;
     }
 
+    const char *missing_feature = unimplemented_graph_feature(gf);
+    if (missing_feature && !diagnostic) {
+        MYDS_LOG_E("Cannot run this model correctly: native graph lacks %s. "
+                   "Refusing inference rather than silently skipping model operations. "
+                   "See docs/CORRECTNESS_STATUS.md.", missing_feature);
+        gguf_close(gf);
+        return NULL;
+    }
+    if (missing_feature) {
+        MYDS_LOG_W("DIAGNOSTIC ONLY: incomplete graph (%s); resulting logits are not correct inference",
+                   missing_feature);
+    }
+    if (!myds_metal_init("metal")) {
+        MYDS_LOG_E("Failed to initialize Metal backend (check Apple Silicon GPU & shaders)");
+        gguf_close(gf);
+        return NULL;
+    }
+
     MYDS_LOG_I("Opened GGUF model: %s (tensors: %llu, kv_pairs: %llu)",
                model_path, (unsigned long long)gf->tensor_count, (unsigned long long)gf->metadata_kv_count);
 
     myds_model_t *m = (myds_model_t *)calloc(1, sizeof(myds_model_t));
+    if (!m) { gguf_close(gf); return NULL; }
     m->gf = gf;
     m->tokenizer = myds_tokenizer_load(gf);
+    if (!m->tokenizer) {
+        MYDS_LOG_E("Unable to load the model tokenizer");
+        gguf_close(gf);
+        free(m);
+        return NULL;
+    }
 
     const char *arch = gguf_get_str(gf, "general.architecture", "deepseek41");
 
@@ -352,6 +362,10 @@ myds_model_t *myds_model_load(const char *model_path) {
 
     snprintf(key_buf, sizeof(key_buf), "%s.attention.layer_norm_rms_epsilon", arch);
     m->norm_eps = gguf_get_f32(gf, key_buf, 1e-6f);
+    if (strcmp(arch, "deepseek41") == 0 || strcmp(arch, "deepseek-v4.1") == 0) {
+        snprintf(key_buf, sizeof(key_buf), "%s.rms_norm_eps", arch);
+        m->norm_eps = gguf_get_f32(gf, key_buf, m->norm_eps);
+    }
 
     snprintf(key_buf, sizeof(key_buf), "%s.rope.freq_base", arch);
     m->freq_base = gguf_get_f32(gf, key_buf, 10000.0f);
@@ -461,6 +475,12 @@ myds_model_t *myds_model_load(const char *model_path) {
         MYDS_LOG_E("Missing required embedding tensor 'token_embd.weight' (T0-3 gate)");
         goto fail;
     }
+    if (t_embd->n_dims != 2 || t_embd->dims[0] != m->dim ||
+        t_embd->dims[1] != m->tokenizer->vocab_size) {
+        MYDS_LOG_E("Embedding shape must match hidden dimension %u and tokenizer vocabulary %u",
+                   m->dim, m->tokenizer->vocab_size);
+        goto fail;
+    }
     if (t_embd->type != GGML_TYPE_F32 && t_embd->type != GGML_TYPE_F16) {
         MYDS_LOG_E("Embedding tensor 'token_embd.weight' has unsupported type %d (%s). Expected F32 or F16 (T0-1 gate).",
                    (int)t_embd->type, ggml_type_name(t_embd->type));
@@ -482,6 +502,11 @@ myds_model_t *myds_model_load(const char *model_path) {
         MYDS_LOG_E("Missing required norm tensor 'output_norm.weight' (T0-3 gate)");
         goto fail;
     }
+    if (t_out_norm->type != GGML_TYPE_F32 || t_out_norm->n_dims != 1 ||
+        t_out_norm->dims[0] != m->dim) {
+        MYDS_LOG_E("Output norm must be a one-dimensional F32 tensor of length %u", m->dim);
+        goto fail;
+    }
     m->output_norm = create_metal_buffer_from_tensor(t_out_norm);
     if (!m->output_norm) {
         MYDS_LOG_E("Failed to create buffer for 'output_norm.weight'");
@@ -494,6 +519,12 @@ myds_model_t *myds_model_load(const char *model_path) {
         m->output = m->tok_embeddings;
         m->output_type = m->tok_embeddings_type;
     } else {
+        if (t_out->n_dims != 2 || t_out->dims[0] != m->dim ||
+            t_out->dims[1] != m->vocab_size) {
+            MYDS_LOG_E("LM head shape must match embedding dimension %u and vocabulary %u",
+                       m->dim, m->vocab_size);
+            goto fail;
+        }
         if (!is_supported_quant_type(t_out->type)) {
             MYDS_LOG_E("Output projection tensor 'output.weight' has unsupported quant type %d (%s). Expected F32, F16, or Q8_0 (T0-1 gate).",
                        (int)t_out->type, ggml_type_name(t_out->type));
@@ -867,6 +898,16 @@ fail:
         gguf_close(gf);
     }
     return NULL;
+}
+
+myds_model_t *myds_model_load(const char *model_path) {
+    return model_load_internal(model_path, false);
+}
+
+/* Internal diagnostic harness only. The CLI/server always use the validated
+ * loader above, so a trace cannot accidentally enable unsupported production. */
+myds_model_t *myds_model_load_diagnostic(const char *model_path) {
+    return model_load_internal(model_path, true);
 }
 
 void myds_model_free(myds_model_t *m) {
@@ -1582,8 +1623,16 @@ static int execute_transformer_layer(myds_context_t *ctx, uint32_t l, uint32_t p
         if (!myds_metal_commit_batch()) return 0;
         if (do_prof) gettimeofday(&t1, NULL);
 
+        if (!trace_f32("attn_norm", l, pos, ctx->x_norm, dim) ||
+            !trace_f32("q_a_raw", l, pos, ctx->qr, m->q_lora_rank) ||
+            !trace_f32("q_a_norm", l, pos, ctx->qr_norm, m->q_lora_rank) ||
+            !trace_f32("q_b", l, pos, ctx->q, m->n_heads * m->head_dim) ||
+            !trace_f32("kv_norm", l, pos, ctx->kv_act, m->head_dim)) return 0;
+
         float *qv = (float *)myds_metal_buffer_data(ctx->q);
-        head_rms_norm_inplace(qv, m->n_heads, m->head_dim, m->norm_eps);
+        /* V4.1 Q_B feeds RoPE directly; V4's per-head RMSNorm is absent. */
+        if (strcmp(m->arch, "deepseek41") != 0 && strcmp(m->arch, "deepseek-v4.1") != 0)
+            head_rms_norm_inplace(qv, m->n_heads, m->head_dim, m->norm_eps);
 
         float *kv_v = (float *)myds_metal_buffer_data(ctx->kv_act);
         if (do_prof) gettimeofday(&t2, NULL);
@@ -1591,6 +1640,8 @@ static int execute_transformer_layer(myds_context_t *ctx, uint32_t l, uint32_t p
         /* Tail RoPE on Q (all heads) and KV (1 head) */
         myds_rope_tail_inplace(qv, m->n_heads, m->head_dim, m->qk_rope_head_dim, pos, m->freq_base, m->freq_scale, false);
         myds_rope_tail_inplace(kv_v, 1, m->head_dim, m->qk_rope_head_dim, pos, m->freq_base, m->freq_scale, false);
+        if (!trace_f32("q_rope", l, pos, ctx->q, m->n_heads * m->head_dim) ||
+            !trace_f32("kv_rope", l, pos, ctx->kv_act, m->head_dim)) return 0;
 
         /* Push to latent KV cache: 512 floats per token per layer */
         memcpy(ctx->k_cache[l] + (size_t)pos * m->head_dim, kv_v, m->head_dim * sizeof(float));
@@ -1765,35 +1816,69 @@ static int execute_transformer_layer(myds_context_t *ctx, uint32_t l, uint32_t p
     return 1;
 }
 
+/* Keep prefill and decode on one typed embedding path. F16 rows must be
+ * converted as IEEE binary16; shifting their bits into float's high half
+ * instead interprets them as BF16 and corrupts every activation. */
+static bool embedding_lookup_row(const myds_model_t *m, int32_t token_id, float *dest) {
+    if (!m->tok_embeddings || token_id < 0 || (uint32_t)token_id >= m->vocab_size) {
+        MYDS_LOG_E("Embedding lookup failed for token %d (vocab %u)", token_id, m->vocab_size);
+        return false;
+    }
+    const void *data = myds_metal_buffer_data(m->tok_embeddings);
+    if (m->tok_embeddings_type == GGML_TYPE_F32) {
+        const float *row = (const float *)data + (size_t)token_id * m->dim;
+        memcpy(dest, row, m->dim * sizeof(float));
+    } else if (m->tok_embeddings_type == GGML_TYPE_F16) {
+        const uint16_t *row = (const uint16_t *)data + (size_t)token_id * m->dim;
+        for (uint32_t i = 0; i < m->dim; i++) dest[i] = myds_fp16_to_fp32(row[i]);
+    } else {
+        MYDS_LOG_E("Embedding lookup failed: unsupported type %d", (int)m->tok_embeddings_type);
+        return false;
+    }
+    return true;
+}
+
+/* Opt-in numerical diagnostics, independent of sampling/text decoding. Files
+ * contain native little-endian F32 on Apple Silicon. Never enabled by default. */
+static bool trace_f32(const char *stage, uint32_t layer, uint32_t pos,
+                      const myds_metal_buffer_t *buffer, size_t count) {
+    const char *prefix = getenv("MYDS_TRACE_PREFIX");
+    if (!prefix || !*prefix) return true;
+    const char *layer_env = getenv("MYDS_TRACE_LAYER");
+    const char *pos_env = getenv("MYDS_TRACE_POS");
+    if (layer != (uint32_t)(layer_env ? strtoul(layer_env, NULL, 10) : 0) ||
+        pos != (uint32_t)(pos_env ? strtoul(pos_env, NULL, 10) : 0)) return true;
+    if (!myds_metal_commit_batch()) return false;
+    char path[4096];
+    int n = snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, stage, layer, pos);
+    if (n < 0 || (size_t)n >= sizeof(path)) return false;
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        MYDS_LOG_E("Cannot create trace '%s'", path);
+        return false;
+    }
+    size_t written = fwrite(myds_metal_buffer_data((myds_metal_buffer_t *)buffer),
+                            sizeof(float), count, f);
+    int closed = fclose(f);
+    return written == count && closed == 0;
+}
+
 static int32_t myds_forward_token_internal(myds_context_t *ctx, int32_t token_id, uint32_t pos, bool need_logits) {
     myds_model_t *m = ctx->model;
     uint32_t dim = m->dim;
 
     /* 1. Embedding lookup */
     float *xv = (float *)myds_metal_buffer_data(ctx->x);
-    if (m->tok_embeddings) {
-        if (m->tok_embeddings_type == GGML_TYPE_F32) {
-            const float *emb = (const float *)myds_metal_buffer_data(m->tok_embeddings);
-            memcpy(xv, emb + (size_t)token_id * dim, dim * sizeof(float));
-        } else if (m->tok_embeddings_type == GGML_TYPE_F16) {
-            const uint16_t *emb = (const uint16_t *)myds_metal_buffer_data(m->tok_embeddings);
-            const uint16_t *row = emb + (size_t)token_id * dim;
-            /* TODO: the legacy path interprets these bits as BF16. Validate a
-             * true F16 conversion against model reference outputs separately. */
-            for (uint32_t i = 0; i < dim; i++) {
-                uint32_t w = (uint32_t)row[i] << 16;
-                memcpy(&xv[i], &w, sizeof(float));
-            }
-        } else {
-            memset(xv, 0, dim * sizeof(float));
-        }
-    }
+    if (!embedding_lookup_row(m, token_id, xv)) return -1;
+    if (!trace_f32("embedding", 0, pos, ctx->x, dim)) return -1;
 
     /* 2. Transformer layers */
     for (uint32_t l = 0; l < m->n_layers; l++) {
         if (!execute_transformer_layer(ctx, l, pos)) {
             return -1;
         }
+        if (!trace_f32("layer_out", l, pos, ctx->x, dim)) return -1;
+        if (m->is_mla && !trace_f32("attn_out", l, pos, ctx->attn_out, dim)) return -1;
     }
 
     if (!need_logits) {
@@ -1822,6 +1907,7 @@ static int32_t myds_forward_token_internal(myds_context_t *ctx, int32_t token_id
         }
     }
     if (!myds_metal_commit_batch()) return -1;
+    if (!trace_f32("logits", 0, pos, ctx->logits, m->vocab_size)) return -1;
     if (do_head_prof) {
         gettimeofday(&t_lm1, NULL);
         gettimeofday(&t_sp0, NULL);
@@ -2062,13 +2148,14 @@ typedef struct {
     float                 freq_base;
     float                 freq_scale;
     float                 norm_eps;
+    bool                  q_head_norm;
 } chunk_prep_job_t;
 
 static void chunk_prep_worker(void *context, size_t t) {
     const chunk_prep_job_t *job = (const chunk_prep_job_t *)context;
     uint32_t pos = job->cur_pos + (uint32_t)t;
     float *qv = (float *)myds_metal_buffer_data(job->chunk->q[t]);
-    head_rms_norm_inplace(qv, job->n_heads, job->head_dim, job->norm_eps);
+    if (job->q_head_norm) head_rms_norm_inplace(qv, job->n_heads, job->head_dim, job->norm_eps);
 
     float *kv_v = (float *)myds_metal_buffer_data(job->chunk->kv_act[t]);
     myds_rope_tail_inplace(qv, job->n_heads, job->head_dim, job->qk_rope_head_dim, pos, job->freq_base, job->freq_scale, false);
@@ -2268,6 +2355,7 @@ static int execute_prefill_chunk_layer(
         .freq_base = m->freq_base,
         .freq_scale = m->freq_scale,
         .norm_eps = m->norm_eps,
+        .q_head_norm = strcmp(m->arch, "deepseek41") != 0 && strcmp(m->arch, "deepseek-v4.1") != 0,
     };
     dispatch_apply_f((size_t)chunk_len, q_concurrent, &pjob, chunk_prep_worker);
 
@@ -2453,7 +2541,7 @@ static int myds_prefill_tokens(myds_context_t *ctx, const int32_t *tokens, int32
     uint32_t dim = m->dim;
 
     /* For very short prompts (<= 4 tokens), standard sequential forward has virtually zero overhead */
-    if (n_tokens <= 4 || !model_supports_chunk_prefill(m)) {
+    if (n_tokens <= 4 || getenv("MYDS_TRACE_PREFIX") || !model_supports_chunk_prefill(m)) {
         for (int32_t i = 0; i < n_tokens; i++) {
             if (cancel_flag && *cancel_flag) return -2;
             if (myds_forward_token_internal(ctx, tokens[i], ctx->pos, false) < 0) return -1;
@@ -2497,25 +2585,9 @@ static int myds_prefill_tokens(myds_context_t *ctx, const int32_t *tokens, int32
     /* 1. Embedding lookup for all prefill tokens */
     for (int32_t i = 0; i < n_tokens; i++) {
         float *dest = prompt_x + (size_t)i * dim;
-        int32_t tid = tokens[i];
-        if (m->tok_embeddings) {
-            if (m->tok_embeddings_type == GGML_TYPE_F32) {
-                const float *emb = (const float *)myds_metal_buffer_data(m->tok_embeddings);
-                memcpy(dest, emb + (size_t)tid * dim, dim * sizeof(float));
-            } else if (m->tok_embeddings_type == GGML_TYPE_F16) {
-                const uint16_t *emb = (const uint16_t *)myds_metal_buffer_data(m->tok_embeddings);
-                const uint16_t *row = emb + (size_t)tid * dim;
-                /* TODO: preserve the same legacy BF16 interpretation as
-                 * decode until true F16 conversion is validated separately. */
-                for (uint32_t j = 0; j < dim; j++) {
-                    uint32_t w = (uint32_t)row[j] << 16;
-                    memcpy(&dest[j], &w, sizeof(float));
-                }
-            } else {
-                memset(dest, 0, dim * sizeof(float));
-            }
-        } else {
-            memset(dest, 0, dim * sizeof(float));
+        if (!embedding_lookup_row(m, tokens[i], dest)) {
+            free(prompt_x);
+            return -1;
         }
     }
 
@@ -2559,9 +2631,10 @@ static int myds_prefill_tokens(myds_context_t *ctx, const int32_t *tokens, int32
     return 1;
 }
 
-int myds_generate_ex(myds_context_t *ctx,
+static int myds_generate_internal(myds_context_t *ctx,
                      const char     *prompt,
                      myds_stream_callback_t cb,
+                     myds_stream_bytes_callback_t bytes_cb,
                      void           *user_data,
                      myds_stop_reason_t *out_reason,
                      uint32_t       *out_prompt_tokens,
@@ -2630,7 +2703,7 @@ int myds_generate_ex(myds_context_t *ctx,
             break;
         }
         int32_t next_token = myds_forward_token(ctx, cur_token, ctx->pos);
-        if (next_token < 0) {
+        if (next_token < 0 || (uint32_t)next_token >= m->tokenizer->vocab_size) {
             MYDS_LOG_E("Generation step %u failed", step);
             stop_reason = MYDS_STOP_ERROR;
             success = 0;
@@ -2643,8 +2716,16 @@ int myds_generate_ex(myds_context_t *ctx,
             break;
         }
 
-        const char *piece = myds_tokenizer_decode_piece(m->tokenizer, next_token);
-        if (cb) {
+        size_t piece_len = 0;
+        const char *piece = myds_tokenizer_decode_bytes(m->tokenizer, next_token, &piece_len);
+        if (!piece) {
+            stop_reason = MYDS_STOP_ERROR;
+            success = 0;
+            break;
+        }
+        if (bytes_cb) {
+            bytes_cb(piece, piece_len, next_token, user_data);
+        } else if (cb) {
             cb(piece, next_token, user_data);
         }
 
@@ -2657,6 +2738,22 @@ int myds_generate_ex(myds_context_t *ctx,
 
     if (out_reason) *out_reason = stop_reason;
     return success;
+}
+
+int myds_generate_bytes_ex(myds_context_t *ctx, const char *prompt,
+                          myds_stream_bytes_callback_t cb, void *user_data,
+                          myds_stop_reason_t *out_reason, uint32_t *out_prompt_tokens,
+                          volatile int *cancel_flag) {
+    return myds_generate_internal(ctx, prompt, NULL, cb, user_data,
+                                  out_reason, out_prompt_tokens, cancel_flag);
+}
+
+int myds_generate_ex(myds_context_t *ctx, const char *prompt,
+                     myds_stream_callback_t cb, void *user_data,
+                     myds_stop_reason_t *out_reason, uint32_t *out_prompt_tokens,
+                     volatile int *cancel_flag) {
+    return myds_generate_internal(ctx, prompt, cb, NULL, user_data,
+                                  out_reason, out_prompt_tokens, cancel_flag);
 }
 
 int myds_generate(myds_context_t *ctx, const char *prompt, myds_stream_callback_t cb, void *user_data) {

@@ -3,5 +3,7 @@ bin/
 *.o
 *.dSYM
 .DS_Store
+__pycache__/
+*.py[cod]
 tests/verify_metal
 tests/test_metal

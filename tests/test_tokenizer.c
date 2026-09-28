@@ -129,6 +129,7 @@ static int test_tokenizer_encode(const char *path) {
     ASSERT_TRUE(n == 1);
     ASSERT_TRUE(tokens[0] == 8); /* <0x41> */
 
+    ASSERT_TRUE(myds_tokenizer_encode(tok, "?", tokens, 32, false) == MYDS_TOKENIZER_ERROR_UNKNOWN_BYTE);
     myds_tokenizer_free(tok);
     gguf_close(gf);
     printf("  [PASS] Tokenizer BPE encoding and byte-fallback\n");
@@ -200,7 +201,143 @@ static int test_tokenizer_fallback_mode(void) {
     return 1;
 }
 
-int main(void) {
+
+/* A synthetic byte-BPE vocabulary with independently assigned byte IDs and
+ * deliberately conflicting merge ranks. It does not depend on encode output. */
+static int create_byte_bpe_gguf(const char *path, bool missing_byte, bool gpt2) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return 0;
+    write_u32(f, GGUF_MAGIC); write_u32(f, 3); write_u64(f, 0); write_u64(f, 7);
+    write_str(f, "tokenizer.ggml.model"); write_u32(f, GGUF_TYPE_STRING); write_str(f, "gpt2");
+    write_str(f, "tokenizer.ggml.pre"); write_u32(f, GGUF_TYPE_STRING); write_str(f, gpt2 ? "gpt-2" : "joyai-llm");
+    write_str(f, "tokenizer.ggml.tokens"); write_u32(f, GGUF_TYPE_ARRAY); write_u32(f, GGUF_TYPE_STRING); write_u64(f, 273);
+    unsigned extra = 256;
+    for (unsigned b = 0; b < 256; ++b) {
+        unsigned cp = ((b >= 33 && b <= 126) || (b >= 161 && b <= 172) || b >= 174) ? b : extra++;
+        char bytes[3] = {0};
+        if (cp < 128) bytes[0] = (char)cp;
+        else { bytes[0] = (char)(0xc0 | (cp >> 6)); bytes[1] = (char)(0x80 | (cp & 63)); }
+        write_str(f, missing_byte && b == 'Z' ? "notZ" : bytes);
+    }
+    const char *extra_tokens[] = {"<S>", "</S>", "<P>", "Ġb", "bc", "ab", "12", "123", "1234"};
+    for (size_t i = 0; i < sizeof(extra_tokens)/sizeof(extra_tokens[0]); ++i) write_str(f, extra_tokens[i]);
+    char long_token[257]; memset(long_token, 'a', sizeof(long_token));
+    for (int n = 2; n <= 256; n *= 2) { long_token[n] = 0; write_str(f, long_token); long_token[n] = 'a'; }
+    write_str(f, "tokenizer.ggml.merges"); write_u32(f, GGUF_TYPE_ARRAY); write_u32(f, GGUF_TYPE_STRING); write_u64(f, 14);
+    const char *merges[] = {"Ġ b", "b c", "a b", "1 2", "12 3", "123 4"};
+    for (size_t i = 0; i < sizeof(merges)/sizeof(merges[0]); ++i) write_str(f, merges[i]);
+    for (int n = 1; n <= 128; n *= 2) {
+        char merge[258]; memset(merge, 'a', (size_t)n * 2 + 1); merge[n] = ' '; merge[n * 2 + 1] = 0; write_str(f, merge);
+    }
+    write_str(f, "tokenizer.ggml.token_type"); write_u32(f, GGUF_TYPE_ARRAY); write_u32(f, GGUF_TYPE_INT32); write_u64(f, 273);
+    for (unsigned i = 0; i < 273; ++i) write_u32(f, i >= 256 && i <= 257 ? 3 : 1);
+    write_str(f, "tokenizer.ggml.bos_token_id"); write_u32(f, GGUF_TYPE_UINT32); write_u32(f, 256);
+    write_str(f, "tokenizer.ggml.eos_token_id"); write_u32(f, GGUF_TYPE_UINT32); write_u32(f, 257);
+    fclose(f); return 1;
+}
+static int test_byte_bpe_known_answers(void) {
+    const char *path = "/tmp/test_myds_byte_bpe.gguf";
+    ASSERT_TRUE(create_byte_bpe_gguf(path, false, false));
+    gguf_file_t *gf = gguf_open(path); ASSERT_TRUE(gf != NULL);
+    myds_tokenizer_t *tok = myds_tokenizer_load(gf); ASSERT_TRUE(tok != NULL);
+    int32_t ids[512];
+    ASSERT_TRUE(myds_tokenizer_encode(tok, "a b", ids, 512, false) == 2);
+    ASSERT_TRUE(ids[0] == 'a' && ids[1] == 259); /* Ġb, never drop the space. */
+    ASSERT_TRUE(myds_tokenizer_encode(tok, "abc", ids, 512, false) == 2);
+    ASSERT_TRUE(ids[0] == 'a' && ids[1] == 260); /* b+c outranks a+b. */
+    const int32_t chinese[] = {0xe4, 0xb8, 0xad, 0xe6, 0x96, 0x87};
+    ASSERT_TRUE(myds_tokenizer_encode(tok, "中文", ids, 512, false) == 6);
+    ASSERT_TRUE(!memcmp(ids, chinese, sizeof(chinese)));
+    ASSERT_TRUE(myds_tokenizer_encode(tok, "1234", ids, 512, false) == 2);
+    ASSERT_TRUE(ids[0] == 263 && ids[1] == '4'); /* JoyAI splits digits in threes. */
+    ASSERT_TRUE(myds_tokenizer_encode(tok, "<S>a b", ids, 512, true) == 3);
+    ASSERT_TRUE(ids[0] == 256 && ids[1] == 'a' && ids[2] == 259); /* BOS once. */
+    ASSERT_TRUE(myds_tokenizer_encode(tok, "a</S>", ids, 512, false) == 2);
+    ASSERT_TRUE(ids[0] == 'a' && ids[1] == 257);
+    ASSERT_TRUE(myds_tokenizer_encode(tok, "<P>", ids, 512, false) == 1);
+    ASSERT_TRUE(ids[0] == 258); /* Added token mislabeled NORMAL in GGUF. */
+    char long_word[257]; memset(long_word, 'a', 256); long_word[256] = 0;
+    ASSERT_TRUE(myds_tokenizer_encode(tok, long_word, ids, 512, false) == 1);
+    ASSERT_TRUE(ids[0] == 272); /* No arbitrary 64-byte longest-match limit. */
+    ASSERT_TRUE(myds_tokenizer_encode(tok, "a b", NULL, 0, false) == 2);
+    ids[1] = -999;
+    ASSERT_TRUE(myds_tokenizer_encode(tok, "a b", ids, 1, false) == 2);
+    ASSERT_TRUE(ids[0] == 'a' && ids[1] == -999);
+    myds_tokenizer_free(tok); gguf_close(gf); unlink(path);
+    printf("  [PASS] Byte-BPE known IDs, rank order, pre-tokenization, and special tokens\n");
+    return 1;
+}
+static int test_byte_bpe_binary_decode(void) {
+    const char *path = "/tmp/test_myds_binary_bpe.gguf";
+    ASSERT_TRUE(create_byte_bpe_gguf(path, false, false));
+    gguf_file_t *gf = gguf_open(path); ASSERT_TRUE(gf != NULL);
+    myds_tokenizer_t *tok = myds_tokenizer_load(gf); ASSERT_TRUE(tok != NULL);
+    size_t len = 99;
+    const char *zero = myds_tokenizer_decode_bytes(tok, 0, &len);
+    ASSERT_TRUE(len == 1 && zero[0] == 0);
+    const char *lead = myds_tokenizer_decode_bytes(tok, 0xe4, &len);
+    ASSERT_TRUE(len == 1 && (unsigned char)lead[0] == 0xe4); /* Incomplete UTF-8. */
+    const char *other = myds_tokenizer_decode_bytes(tok, 0xff, &len);
+    ASSERT_TRUE(len == 1 && (unsigned char)other[0] == 0xff);
+    ASSERT_TRUE((unsigned char)lead[0] == 0xe4 && zero[0] == 0); /* No mutable static buffer. */
+    const char *space_b = myds_tokenizer_decode_bytes(tok, 259, &len);
+    ASSERT_TRUE(len == 2 && !memcmp(space_b, " b", 2));
+    char bytes[256]; for (int i = 0; i < 256; ++i) bytes[i] = (char)i;
+    int32_t ids[512];
+    int32_t n = myds_tokenizer_encode_bytes(tok, bytes, sizeof(bytes), ids, 512, false);
+    ASSERT_TRUE(n > 0 && n <= 256);
+    size_t offset = 0;
+    for (int32_t i = 0; i < n; ++i) {
+        const char *piece = myds_tokenizer_decode_bytes(tok, ids[i], &len);
+        ASSERT_TRUE(offset + len <= sizeof(bytes) && !memcmp(piece, bytes + offset, len));
+        offset += len;
+    }
+    ASSERT_TRUE(offset == sizeof(bytes));
+    ASSERT_TRUE(myds_tokenizer_decode_bytes(tok, -1, &len)[0] == 0 && len == 0);
+    myds_tokenizer_free(tok); gguf_close(gf); unlink(path);
+    printf("  [PASS] Binary decoding preserves all 256 bytes, NUL, and split UTF-8\n");
+    return 1;
+}
+static int test_byte_bpe_unknown_and_gpt2(void) {
+    const char *path = "/tmp/test_myds_missing_bpe.gguf";
+    ASSERT_TRUE(create_byte_bpe_gguf(path, true, true));
+    gguf_file_t *gf = gguf_open(path); ASSERT_TRUE(gf != NULL);
+    myds_tokenizer_t *tok = myds_tokenizer_load(gf); ASSERT_TRUE(tok != NULL);
+    int32_t ids[16];
+    ASSERT_TRUE(myds_tokenizer_encode(tok, "aZ", ids, 16, false) == MYDS_TOKENIZER_ERROR_UNKNOWN_BYTE);
+    ASSERT_TRUE(myds_tokenizer_encode(tok, "aZ", NULL, 0, false) == MYDS_TOKENIZER_ERROR_UNKNOWN_BYTE);
+    ASSERT_TRUE(myds_tokenizer_encode(tok, "1234", ids, 16, false) == 1);
+    ASSERT_TRUE(ids[0] == 264); /* GPT-2 numbers are not split every three digits. */
+    myds_tokenizer_free(tok); gguf_close(gf); unlink(path);
+    printf("  [PASS] Missing-byte errors are explicit; GPT-2 metadata selects its split rules\n");
+    return 1;
+}
+
+/* Metadata-only reference probe: no model tensors or GPU are evaluated. */
+static int dump_reference(const char *path, const char *text) {
+    gguf_file_t *gf = gguf_open(path);
+    if (!gf) return 1;
+    myds_tokenizer_t *tok = myds_tokenizer_load(gf);
+    if (!tok) { gguf_close(gf); return 1; }
+    int32_t count = myds_tokenizer_encode(tok, text, NULL, 0, false);
+    int32_t *ids = count >= 0 ? malloc(((size_t)count + 1) * sizeof(*ids)) : NULL;
+    if (!ids) { myds_tokenizer_free(tok); gguf_close(gf); return 1; }
+    int32_t result = myds_tokenizer_encode(tok, text, ids, count, false);
+    printf("{\"ids\":[");
+    for (int32_t i = 0; i < result; ++i) printf("%s%d", i ? "," : "", ids[i]);
+    printf("],\"decoded_hex\":\"");
+    for (int32_t i = 0; i < result; ++i) {
+        size_t len; const char *piece = myds_tokenizer_decode_bytes(tok, ids[i], &len);
+        for (size_t j = 0; j < len; ++j) printf("%02x", (unsigned char)piece[j]);
+    }
+    printf("\"}\n");
+    free(ids); myds_tokenizer_free(tok); gguf_close(gf);
+    return result < 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc == 4 && !strcmp(argv[1], "--dump")) return dump_reference(argv[2], argv[3]);
+
     printf("====================================================\n");
     printf("      Running myds BPE Tokenizer Unit Tests         \n");
     printf("====================================================\n");
@@ -216,16 +353,19 @@ int main(void) {
     passed += test_tokenizer_encode(temp_file);
     passed += test_tokenizer_decode(temp_file);
     passed += test_tokenizer_fallback_mode();
+    passed += test_byte_bpe_known_answers();
+    passed += test_byte_bpe_binary_decode();
+    passed += test_byte_bpe_unknown_and_gpt2();
 
     unlink(temp_file);
 
     printf("====================================================\n");
-    if (passed == 4) {
+    if (passed == 7) {
         printf("  ALL TOKENIZER UNIT TESTS PASSED!\n");
         printf("====================================================\n");
         return 0;
     } else {
-        printf("  TOKENIZER TESTS FAILED (passed %d/4)\n", passed);
+        printf("  TOKENIZER TESTS FAILED (passed %d/7)\n", passed);
         return 1;
     }
 }

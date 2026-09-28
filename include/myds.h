@@ -10,7 +10,9 @@
 extern "C" {
 #endif
 
-/* Architecture compatibility check: exclusively supports DeepSeek V4 / V4.1; V2 and V3 are rejected */
+/* Architecture-family recognition only, NOT proof of graph completeness.
+ * myds_model_load additionally rejects required operations not implemented by
+ * this native engine (HC, Engram, compressed KV and indexer). */
 static inline bool myds_is_supported_arch(const char *arch) {
     if (!arch) return false;
     /* Explicitly reject legacy DeepSeek V2 and V3 models */
@@ -44,6 +46,10 @@ typedef struct {
 } myds_config_t;
 
 typedef void (*myds_stream_callback_t)(const char *piece, int32_t token_id, void *user_data);
+/* Token fragments are bytes: they may contain NUL or an incomplete UTF-8
+ * character. Text transports must assemble UTF-8 across callbacks. */
+typedef void (*myds_stream_bytes_callback_t)(const char *piece, size_t length,
+                                            int32_t token_id, void *user_data);
 
 /* Model lifecycle */
 myds_model_t   *myds_model_load(const char *model_path);
@@ -66,6 +72,15 @@ typedef enum {
 } myds_stop_reason_t;
 
 /* Generation */
+int             myds_generate_bytes_ex(myds_context_t *ctx,
+                                       const char *prompt,
+                                       myds_stream_bytes_callback_t cb,
+                                       void *user_data,
+                                       myds_stop_reason_t *out_reason,
+                                       uint32_t *out_prompt_tokens,
+                                       volatile int *cancel_flag);
+
+/* Legacy C-string callback: use myds_generate_bytes_ex for lossless output. */
 int             myds_generate_ex(myds_context_t *ctx,
                                  const char     *prompt,
                                  myds_stream_callback_t cb,

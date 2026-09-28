@@ -6,6 +6,213 @@
 #include <assert.h>
 #include <stdbool.h>
 #include <time.h>
+#include <pthread.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <errno.h>
+
+/* Exercise the production byte encoder and socket callbacks directly. */
+static const char binary_text[] = {
+    'A', 0, '"', '\\', '\n', '\r', '\t', 1,
+    (char)0xe4, (char)0xb8, (char)0xad, /* 中 */
+    (char)0xf0, (char)0x9f, (char)0x98, (char)0x80, /* 😀 */
+    (char)0xff, (char)0xe4, (char)0xb8 /* Invalid byte and incomplete 中. */
+};
+static const char escaped_binary_text[] = "A\\u0000\\\"\\\\\\n\\r\\t\\u0001中😀��";
+
+static void test_json_bytes(void) {
+    char escaped[sizeof(binary_text) * 6 + 1];
+    size_t length = 0;
+    assert(json_escape_bytes(binary_text, sizeof(binary_text), escaped, sizeof(escaped), &length));
+    assert(length == strlen(escaped_binary_text));
+    assert(strcmp(escaped, escaped_binary_text) == 0);
+    const char *invalid[] = {"\xc0\xaf", "\xed\xa0\x80", "\xf4\x90\x80\x80", "\xe2(\xa1", "\xe4\xb8"};
+    const char *replacement[] = {"��", "���", "����", "�(�", "�"};
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        assert(json_escape_bytes(invalid[i], strlen(invalid[i]), escaped, sizeof(escaped), NULL));
+        assert(strcmp(escaped, replacement[i]) == 0);
+    }
+    char small[4] = "xxx";
+    assert(!json_escape_bytes(binary_text, sizeof(binary_text), small, sizeof(small), &length));
+    assert(small[0] == 0 && length == 0); /* Never silently return truncated JSON text. */
+    assert(json_escape_bytes("abc", 3, small, sizeof(small), &length));
+    assert(length == 3 && strcmp(small, "abc") == 0);
+    assert(!json_escape_bytes("abc", 3, small, 0, NULL));
+    printf("  [PASS] JSON byte escaping: NUL, known UTF-8, invalid sequences, truncated code points and capacity errors\n");
+}
+
+typedef struct {
+    int fd;
+    char *bytes;
+    size_t length;
+    size_t capacity;
+} socket_capture_t;
+
+static void *capture_socket(void *opaque) {
+    socket_capture_t *capture = opaque;
+    for (;;) {
+        if (capture->capacity - capture->length < 4097) {
+            capture->capacity = capture->capacity ? capture->capacity * 2 : 8192;
+            capture->bytes = realloc(capture->bytes, capture->capacity);
+            assert(capture->bytes);
+        }
+        ssize_t count = recv(capture->fd, capture->bytes + capture->length,
+                             capture->capacity - capture->length - 1, 0);
+        if (count < 0 && errno == EINTR) continue;
+        assert(count >= 0);
+        if (count == 0) break;
+        capture->length += (size_t)count;
+    }
+    capture->bytes[capture->length] = 0;
+    return NULL;
+}
+
+static char *collect_sse_escaped_text(const char *events, bool responses_api, size_t *out_length) {
+    const char *key = responses_api ? "\"delta\":\"" : "\"content\":\"";
+    char *result = malloc(strlen(events) + 1);
+    assert(result);
+    size_t used = 0;
+    const char *p = events;
+    while ((p = strstr(p, key)) != NULL) {
+        p += strlen(key);
+        const char *start = p;
+        while (*p && *p != '"') {
+            if (*p == '\\') {
+                assert(p[1]);
+                p++;
+            }
+            p++;
+        }
+        assert(*p == '"');
+        size_t length = (size_t)(p - start);
+        memcpy(result + used, start, length);
+        used += length;
+        p++;
+    }
+    result[used] = 0;
+    *out_length = used;
+    return result;
+}
+
+static void assert_valid_utf8(const char *bytes, size_t length) {
+    for (size_t i = 0; i < length;) {
+        unsigned char lead = (unsigned char)bytes[i++];
+        if (lead < 0x80) continue;
+        unsigned trailing;
+        uint32_t codepoint, minimum;
+        if (lead >= 0xc2 && lead <= 0xdf) {
+            trailing = 1; codepoint = lead & 31; minimum = 0x80;
+        } else if (lead >= 0xe0 && lead <= 0xef) {
+            trailing = 2; codepoint = lead & 15; minimum = 0x800;
+        } else {
+            assert(lead >= 0xf0 && lead <= 0xf4);
+            trailing = 3; codepoint = lead & 7; minimum = 0x10000;
+        }
+        assert(length - i >= trailing);
+        while (trailing--) {
+            unsigned char continuation = (unsigned char)bytes[i++];
+            assert(continuation >= 0x80 && continuation <= 0xbf);
+            codepoint = codepoint * 64 + (continuation & 63);
+        }
+        assert(codepoint >= minimum && codepoint <= 0x10ffff);
+        assert(codepoint < 0xd800 || codepoint > 0xdfff);
+    }
+}
+
+static void test_stream_and_non_stream_bytes(void) {
+    /* A single token of 8192 control bytes expands to 49152 JSON bytes. This
+     * exceeds both former 2048-byte token limits and the small socket buffer. */
+    const size_t controls_length = 8192;
+    char *controls = malloc(controls_length);
+    assert(controls);
+    memset(controls, 1, controls_length);
+    size_t expected_length = strlen(escaped_binary_text) + controls_length * 6 + 3;
+    char *expected = malloc(expected_length + 1);
+    assert(expected);
+    strcpy(expected, escaped_binary_text);
+    size_t offset = strlen(escaped_binary_text);
+    for (size_t i = 0; i < controls_length; i++) {
+        memcpy(expected + offset, "\\u0001", 6);
+        offset += 6;
+    }
+    memcpy(expected + offset, "�", 4); /* Replacement plus trailing NUL. */
+
+    for (unsigned variant = 0; variant < 2; variant++) {
+        int sockets[2];
+        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+        int send_size = 1024;
+        assert(setsockopt(sockets[0], SOL_SOCKET, SO_SNDBUF, &send_size, sizeof(send_size)) == 0);
+        socket_capture_t capture = {.fd = sockets[1]};
+        pthread_t reader;
+        assert(pthread_create(&reader, NULL, capture_socket, &capture) == 0);
+        myds_sse_stream_ctx_t stream = {.client_fd = sockets[0], .responses_api = variant != 0};
+        for (size_t i = 0; i < sizeof(binary_text); i++) {
+            myds_server_sse_callback(binary_text + i, 1, (int32_t)i, &stream);
+        }
+        myds_server_sse_callback(controls, controls_length, 50, &stream);
+        myds_server_sse_callback("\xf0\x9f", 2, 51, &stream);
+        assert(myds_server_sse_finish(&stream));
+        assert(!stream.cancel_flag && !stream.failed && stream.utf8.pending_length == 0);
+        assert(stream.token_count == sizeof(binary_text) + 2);
+        assert(stream.t_first > 0 && stream.t_last >= stream.t_first);
+        assert(shutdown(sockets[0], SHUT_WR) == 0);
+        assert(pthread_join(reader, NULL) == 0);
+        /* Validate the wire including JSON punctuation between events. A
+         * code point split across SSE events would fail here even if joining
+         * the extracted content happened to recover the original bytes. */
+        assert_valid_utf8(capture.bytes, capture.length);
+        size_t collected_length = 0;
+        char *collected = collect_sse_escaped_text(capture.bytes, variant != 0, &collected_length);
+        assert(collected_length == expected_length);
+        assert(memcmp(collected, expected, expected_length + 1) == 0);
+        assert(strstr(capture.bytes, variant ? "event: response.output_text.delta" : "chat.completion.chunk"));
+        free(collected);
+        free(capture.bytes);
+        close(sockets[0]);
+        close(sockets[1]);
+    }
+
+    myds_non_stream_ctx_t nonstream = {.client_fd = -1};
+    for (size_t i = 0; i < sizeof(binary_text); i++) {
+        myds_server_non_stream_callback(binary_text + i, 1, (int32_t)i, &nonstream);
+    }
+    myds_server_non_stream_callback(controls, controls_length, 50, &nonstream);
+    myds_server_non_stream_callback("\xf0\x9f", 2, 51, &nonstream);
+    assert(!nonstream.failed && !nonstream.cancel_flag);
+    assert(nonstream.len == sizeof(binary_text) + controls_length + 2);
+    assert(nonstream.token_count == sizeof(binary_text) + 2);
+    assert(memcmp(nonstream.buf, binary_text, sizeof(binary_text)) == 0);
+    char *escaped = malloc(nonstream.len * 6 + 1);
+    assert(escaped);
+    size_t escaped_length = 0;
+    assert(json_escape_bytes(nonstream.buf, nonstream.len, escaped, nonstream.len * 6 + 1, &escaped_length));
+    assert(escaped_length == expected_length);
+    assert(memcmp(escaped, expected, expected_length + 1) == 0);
+    free(escaped);
+    free(nonstream.buf);
+
+    /* Allocation-size overflow must become explicit cancellation/error, and
+     * must preserve an existing allocation rather than overwrite its pointer. */
+    nonstream = (myds_non_stream_ctx_t){.client_fd = -1};
+    myds_server_non_stream_callback("old", 3, 1, &nonstream);
+    char *original = nonstream.buf;
+    myds_server_non_stream_callback("x", SIZE_MAX, 2, &nonstream);
+    assert(nonstream.failed && nonstream.cancel_flag && nonstream.buf == original);
+    assert(nonstream.len == 3 && strcmp(nonstream.buf, "old") == 0);
+    free(nonstream.buf);
+    myds_sse_stream_ctx_t oversized = {.client_fd = -1};
+    myds_server_sse_callback("x", SIZE_MAX, 1, &oversized);
+    assert(oversized.failed && oversized.cancel_flag);
+    int closed_pair[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, closed_pair) == 0);
+    close(closed_pair[1]);
+    assert(!myds_server_send_all(closed_pair[0], "x", 1));
+    close(closed_pair[0]);
+    free(expected);
+    free(controls);
+    printf("  [PASS] Production SSE/Responses callbacks and collection: split UTF-8, NUL, invalid/truncated UTF-8, long controls, socket short writes and allocation overflow\n");
+}
 
 /* Simulated response generator for testing format compliance */
 static void generate_responses_api_json(const char *model_alias, const char *generated_text, uint32_t token_count, char *out_buf, size_t out_cap) {
@@ -25,10 +232,102 @@ static void generate_responses_api_json(const char *model_alias, const char *gen
              10 + token_count);
 }
 
-int main(void) {
+static void test_deepseek41_chat_templates(void) {
+    const struct { const char *body; const char *expected; } cases[] = {
+        {"{\"input\":\"Hello\"}", "<｜begin▁of▁sentence｜><｜User｜>Hello<｜Assistant｜></think>"},
+        {"{\"instructions\":\"Be concise.\",\"prompt\":\"Hello\"}", "<｜begin▁of▁sentence｜><｜System｜>Be concise.<｜User｜>Hello<｜Assistant｜></think>"},
+        {"{\"messages\":[{\"role\":\"developer\",\"content\":\"Guide\"},{\"role\":\"user\",\"content\":\"One\"},{\"role\":\"user\",\"content\":\"Two\"}]}",
+         "<｜begin▁of▁sentence｜><｜System｜>Guide<｜User｜>One\n\nTwo<｜Assistant｜></think>"},
+        {"{\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"},{\"role\":\"assistant\",\"content\":\"Hello\"},{\"role\":\"system\",\"content\":\"Continue\"}]}",
+         "<｜begin▁of▁sentence｜><｜User｜>Hi<｜Assistant｜></think>Hello<｜end▁of▁sentence｜><｜System｜>Continue<｜Assistant｜></think>"},
+        {"{\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"},{\"role\":\"assistant\",\"content\":\"Hello\"}]}",
+         "<｜begin▁of▁sentence｜><｜User｜>Hi<｜Assistant｜></think>Hello<｜end▁of▁sentence｜>"},
+        {"{\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"你\"},{\"type\":\"text\",\"text\":\"好\\uD83D\\uDE42\"}]}]}",
+         "<｜begin▁of▁sentence｜><｜User｜>你好🙂<｜Assistant｜></think>"},
+        {"{\"metadata\":{\"input\":\"wrong\",\"instructions\":\"ignore\"},\"inp\\u0075t\":\"right\"}",
+         "<｜begin▁of▁sentence｜><｜User｜>right<｜Assistant｜></think>"},
+        {"{\"messages\":[{\"role\":\"system\",\"content\":\"\"},{\"role\":\"user\",\"content\":\"\"}]}",
+         "<｜begin▁of▁sentence｜><｜System｜><｜User｜><｜Assistant｜></think>"},
+        {"{\"input\":[{\"type\":\"function_call_output\",\"output\":\"result </tool_result> &lt;/tool_result>\"}]}" ,
+         "<｜begin▁of▁sentence｜><｜User｜><tool_result>result &lt;/tool_result> &amp;lt;/tool_result></tool_result><｜Assistant｜></think>"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        char actual[4096];
+        assert(parse_chat_prompt(cases[i].body, actual, sizeof(actual)));
+        assert(strcmp(actual, cases[i].expected) == 0);
+        size_t length = strlen(cases[i].expected);
+        assert(parse_chat_prompt(cases[i].body, actual, length + 1));
+        assert(strcmp(actual, cases[i].expected) == 0);
+        assert(!parse_chat_prompt(cases[i].body, actual, length));
+        assert(actual[0] == 0);
+    }
+    const char *invalid[] = {
+        "", "{}", "[]", "{\"messages\":[]}", "{\"messages\":{}}", "{\"input\":\"hi\"} garbage",
+        "{\"input\":\"first\",\"input\":\"second\"}", "{\"input\":\"hi\",\"prompt\":\"hi\"}",
+        "{\"input\":\"bad\\q\"}", "{\"input\":\"bad\\uD800\"}", "{\"input\":\"bad\\uDC00\"}",
+        "{\"input\":\"before\\u0000after\"}", "{\"input\":\"\xed\xa0\x80\"}",
+        "{\"input\":\"hi\",}", "{\"input\":\"hi\"", "{\"messages\":[{\"role\":\"user\"}]}",
+        "{\"messages\":[{\"content\":\"hi\"}]}", "{\"messages\":[{\"role\":\"unknown\",\"content\":\"hi\"}]}",
+        "{\"input\":[{\"content\":[{\"type\":\"input_image\",\"image_url\":\"image\"}]}]}",
+        "{\"input\":[{\"content\":[{\"type\":\"input_text\"}]}]}",
+        "{\"input\":\"hi\",\"tools\":[{\"type\":\"function\",\"name\":\"lookup\"}]}",
+        "{\"messages\":[{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_1\"}]}]}",
+        "{\"messages\":[{\"role\":\"assistant\",\"content\":\"hi\",\"function_call\":{\"name\":\"lookup\"}}]}",
+    };
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+        char output[4096] = "previous";
+        assert(!parse_chat_prompt(invalid[i], output, sizeof(output)));
+        assert(output[0] == 0);
+    }
+    struct { char before[16], output[4], after[16]; } guard;
+    memset(&guard, 'X', sizeof(guard));
+    assert(!parse_chat_prompt(cases[0].body, guard.output, sizeof(guard.output)));
+    assert(guard.output[0] == 0);
+    for (size_t i = 0; i < sizeof(guard.before); ++i) assert(guard.before[i] == 'X' && guard.after[i] == 'X');
+    assert(!parse_chat_prompt(cases[0].body, NULL, 100));
+    assert(!parse_chat_prompt(cases[0].body, guard.output, 0));
+
+    /* Every accepted string path preserves the full input, including large
+     * instructions and direct Responses input that formerly stopped at 4/8 KB. */
+    for (int mode = 0; mode < 3; ++mode) {
+        const size_t length = 20000;
+        char *request = malloc(length * 2 + 128), *output = malloc(length * 2 + 256);
+        assert(request && output);
+        const char *key = mode == 0 ? "input" : mode == 1 ? "prompt" : "instructions";
+        int prefix = snprintf(request, length * 2 + 128, "{\"%s\":\"", key);
+        memset(request + prefix, 'A', length);
+        strcpy(request + prefix + length, mode == 2 ? "\",\"input\":\"End\"}" : "\"}");
+        assert(parse_chat_prompt(request, output, length * 2 + 256));
+        const char *start = strstr(output, mode == 2 ? "<｜System｜>" : "<｜User｜>");
+        assert(start); start += strlen(mode == 2 ? "<｜System｜>" : "<｜User｜>");
+        for (size_t i = 0; i < length; ++i) assert(start[i] == 'A');
+        assert(start[length] == '<');
+        free(request); free(output);
+    }
+    printf("  [PASS] V4.1 exact chat templates, Unicode input, structured text parts, large input and explicit parse/capacity errors\n");
+}
+
+int main(int argc, char **argv) {
+    if (argc == 3 && !strcmp(argv[1], "--render")) {
+        size_t capacity = strlen(argv[2]) * 4 + 1024;
+        char *output = malloc(capacity);
+        if (!output) return 1;
+        bool ok = parse_chat_prompt(argv[2], output, capacity);
+        if (ok) fputs(output, stdout);
+        free(output); return ok ? 0 : 1;
+    }
+    test_deepseek41_chat_templates();
     printf("====================================================\n");
     printf("       Running myds Server API Unit Tests           \n");
     printf("====================================================\n");
+
+    signal(SIGPIPE, SIG_IGN);
+    test_json_bytes();
+    test_stream_and_non_stream_bytes();
+    assert(myds_server_default_max_tokens(256) == 256);
+    assert(myds_server_default_max_tokens(4096) == 4096);
+    assert(myds_server_default_max_tokens(262144) == 4096);
+    printf("  [PASS] Omitted API token limits cap at 4096 while smaller server defaults are preserved\n");
 
     /* 1. Test Endpoint Route Recognition */
     {
@@ -82,13 +381,12 @@ int main(void) {
             "}";
 
         char prompt[8192];
-        parse_chat_prompt(multi_turn, prompt, sizeof(prompt));
+        assert(parse_chat_prompt(multi_turn, prompt, sizeof(prompt)));
 
-        assert(strstr(prompt, "<｜begin of sentence｜><｜User｜>[System: You are a coding tutor.]\n") != NULL);
-        assert(strstr(prompt, "<｜User｜>What is a pointer?\n") != NULL);
-        assert(strstr(prompt, "<｜Assistant｜>A pointer holds a memory address.\n") != NULL);
-        assert(strstr(prompt, "<｜User｜>How do I dereference it?\n") != NULL);
-        assert(strstr(prompt, "<｜Assistant｜>") != NULL);
+        assert(strcmp(prompt,
+            "<｜begin▁of▁sentence｜><｜System｜>You are a coding tutor."
+            "<｜User｜>What is a pointer?<｜Assistant｜></think>A pointer holds a memory address."
+            "<｜end▁of▁sentence｜><｜User｜>How do I dereference it?<｜Assistant｜></think>") == 0);
         printf("  [PASS] Multi-turn conversation prompt construction with instructions\n");
     }
 
@@ -220,8 +518,8 @@ int main(void) {
         char *parsed_prompt = (char *)malloc(prompt_cap);
         assert(parsed_prompt != NULL);
 
-        parse_chat_prompt(big_json, parsed_prompt, prompt_cap);
-        assert(strstr(parsed_prompt, "<｜begin of sentence｜><｜User｜>") != NULL);
+        assert(parse_chat_prompt(big_json, parsed_prompt, prompt_cap));
+        assert(strstr(parsed_prompt, "<｜begin▁of▁sentence｜><｜User｜>") != NULL);
         /* Ensure the full 20000-character content is present without truncation */
         assert(strlen(parsed_prompt) > big_content_size);
         assert(strstr(parsed_prompt, "<｜Assistant｜>") != NULL);
