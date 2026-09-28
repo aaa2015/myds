@@ -1035,6 +1035,7 @@ myds_context_t *myds_context_create(myds_model_t *model, const myds_config_t *cf
         ctx->cfg.max_new_tokens = 256;
         ctx->cfg.temperature = 0.7f;
         ctx->cfg.top_p = 0.9f;
+        ctx->cfg.top_k = 40;
         ctx->cfg.seed = (int32_t)time(NULL);
         ctx->cfg.stream = true;
     }
@@ -1245,12 +1246,18 @@ int32_t myds_sample_next_token(
         indices[i] = (int32_t)i;
     }
 
-    /* 4. Temperature scaling and Softmax */
+    /* 4. Temperature scaling and Softmax with -20.0f cutoff threshold */
     float inv_temp = 1.0f / temp;
     float sum_exp = 0.0f;
     for (uint32_t i = 0; i < vocab_size; i++) {
-        probs[i] = expf((probs[i] - max_l) * inv_temp);
-        sum_exp += probs[i];
+        float diff = (probs[i] - max_l) * inv_temp;
+        if (diff < -20.0f) {
+            probs[i] = 0.0f;
+        } else {
+            float e = expf(diff);
+            probs[i] = e;
+            sum_exp += e;
+        }
     }
     float inv_sum = 1.0f / (sum_exp > 0.0f ? sum_exp : 1.0f);
     float max_prob = 0.0f;
@@ -1291,9 +1298,13 @@ int32_t myds_sample_next_token(
     }
 
     /* Apply top_k truncation with O(N) quickselect before qsort */
-    if (top_k > 0 && top_k < n_cands) {
-        quickselect_cand_desc(cands, 0, (int)n_cands - 1, (int)top_k - 1);
-        n_cands = top_k;
+    uint32_t target_k = top_k;
+    if (target_k == 0 && top_p > 0.0f && top_p < 1.0f && n_cands > 1024) {
+        target_k = 1024;
+    }
+    if (target_k > 0 && target_k < n_cands) {
+        quickselect_cand_desc(cands, 0, (int)n_cands - 1, (int)target_k - 1);
+        n_cands = target_k;
     }
     qsort(cands, n_cands, sizeof(myds_cand_t), compare_cand_desc);
 

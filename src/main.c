@@ -69,6 +69,7 @@ int main(int argc, char *argv[]) {
         .max_new_tokens = 256,
         .temperature = 0.7f,
         .top_p = 0.9f,
+        .top_k = 40,
         .seed = (int32_t)time(NULL),
         .stream = true,
     };
@@ -92,6 +93,8 @@ int main(int argc, char *argv[]) {
             cfg.temperature = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--top-p") == 0 && i + 1 < argc) {
             cfg.top_p = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--top-k") == 0 && i + 1 < argc) {
+            cfg.top_k = (uint32_t)atoi(argv[++i]);
         } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
             cfg.seed = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--print-tokens") == 0) {

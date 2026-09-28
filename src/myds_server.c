@@ -626,6 +626,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         }
         float temp = json_extract_float_field(body, "temperature", -1.0f);
         float top_p = json_extract_float_field(body, "top_p", -1.0f);
+        int top_k = json_extract_int_field(body, "top_k", -1);
         int include_usage = (strstr(body, "\"include_usage\":true") != NULL || strstr(body, "\"include_usage\": true") != NULL);
 
         size_t prompt_cap = (total_read * 4 > 65536) ? (total_read * 4 + 8192) : 65536;
@@ -639,11 +640,11 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         }
         parse_chat_prompt(body, prompt, prompt_cap);
 
-        MYDS_LOG_I("[%s:%d] %s %s (protocol=%s, stream=%s, max_tokens=%d, temp=%.2f, top_p=%.2f, prompt_chars=%zu)",
+        MYDS_LOG_I("[%s:%d] %s %s (protocol=%s, stream=%s, max_tokens=%d, temp=%.2f, top_p=%.2f, top_k=%d, prompt_chars=%zu)",
                    client_ip, client_port, method, path,
                    is_responses_endpoint ? "Responses" : "ChatCompletions",
                    stream ? "true" : "false",
-                   max_tokens, temp, top_p,
+                   max_tokens, temp, top_p, top_k,
                    strlen(prompt));
 
         pthread_mutex_lock(&g_infer_mutex);
@@ -654,6 +655,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         if (max_tokens > 0) req_cfg.max_new_tokens = (uint32_t)max_tokens;
         if (temp >= 0.0f) req_cfg.temperature = temp;
         if (top_p >= 0.0f) req_cfg.top_p = top_p;
+        if (top_k >= 0) req_cfg.top_k = (uint32_t)top_k;
         myds_context_set_config(ctx, &req_cfg);
 
         myds_stop_reason_t stop_reason = MYDS_STOP_EOS;
