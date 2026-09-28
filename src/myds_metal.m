@@ -1190,10 +1190,11 @@ int myds_metal_routed_moe(
         const NSUInteger row_groups_gate = (expert_dim + rows_per_group_gate - 1) / rows_per_group_gate;
         const NSUInteger pairs = n_activated_experts; /* 6 */
         const NSUInteger smem_iq2 = 256u * sizeof(uint64_t) + 128u * sizeof(uint8_t); /* 2176 */
+        bool force_id_mode = (getenv("MYDS_MOE_ID") != NULL);
         static bool logged_moe_mode = false;
         if (!logged_moe_mode) {
             printf("myds_metal: routed_moe mode = %s\n",
-                   (g_pso_moe_slots6_pair_swiglu_iq2_xxs && g_pso_moe_slots6_sum6_q2_k) ? "SLOTS6 (2-step)" :
+                   (!force_id_mode && g_pso_moe_slots6_pair_swiglu_iq2_xxs && g_pso_moe_slots6_sum6_q2_k) ? "SLOTS6 (2-step)" :
                    (g_pso_moe_pair_swiglu_iq2_xxs && g_pso_moe_sum6_q2_k) ? "FUSED (2-step)" : "FALLBACK (5-step)");
             fflush(stdout);
             logged_moe_mode = true;
@@ -1244,7 +1245,7 @@ int myds_metal_routed_moe(
             .clamp_value = clamp_val,
         };
 
-        if (g_pso_moe_slots6_pair_swiglu_iq2_xxs && g_pso_moe_slots6_sum6_q2_k) {
+        if (!force_id_mode && g_pso_moe_slots6_pair_swiglu_iq2_xxs && g_pso_moe_slots6_sum6_q2_k) {
             const int32_t *sel_ids = (const int32_t *)selected_ids->ptr;
 
             /* 1. Slots6 Fused Gate + Up + SwiGLU + Scaling dispatch (IQ2_XXS) */
