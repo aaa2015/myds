@@ -221,7 +221,7 @@ static void layer_attention_sinks(
 
 #include "myds_internal.h"
 
-static void matvec_grouped_rows(
+static __attribute__((unused)) void matvec_grouped_rows(
         float                     *out,
         const myds_metal_buffer_t *W,
         const float               *x,
