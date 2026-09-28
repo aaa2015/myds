@@ -1760,6 +1760,10 @@ static int32_t myds_forward_token_internal(myds_context_t *ctx, int32_t token_id
     }
 
     /* 3. Final RMSNorm & LM Head Logits Batch */
+    struct timeval t_lm0, t_lm1, t_sp0, t_sp1;
+    bool do_head_prof = (getenv("MYDS_PROF") != NULL);
+    if (do_head_prof) gettimeofday(&t_lm0, NULL);
+
     myds_metal_begin_batch();
     if (m->output_norm) {
         myds_metal_rmsnorm(ctx->x_norm, ctx->x, m->output_norm, dim, m->norm_eps);
@@ -1777,10 +1781,21 @@ static int32_t myds_forward_token_internal(myds_context_t *ctx, int32_t token_id
         }
     }
     myds_metal_commit_batch();
+    if (do_head_prof) {
+        gettimeofday(&t_lm1, NULL);
+        gettimeofday(&t_sp0, NULL);
+    }
 
     /* 4. Sample next token */
     const float *logits_v = (const float *)myds_metal_buffer_data(ctx->logits);
     int32_t next_token = myds_sample_next_token(logits_v, m->vocab_size, &ctx->cfg, ctx, NULL, 0);
+    if (do_head_prof) {
+        gettimeofday(&t_sp1, NULL);
+        double ms_lm = (t_lm1.tv_sec - t_lm0.tv_sec)*1000.0 + (t_lm1.tv_usec - t_lm0.tv_usec)/1000.0;
+        double ms_sp = (t_sp1.tv_sec - t_sp0.tv_sec)*1000.0 + (t_sp1.tv_usec - t_sp0.tv_usec)/1000.0;
+        printf("[PROF HEAD] lm_head=%.2f ms, sampler=%.2f ms\n", ms_lm, ms_sp);
+        fflush(stdout);
+    }
 
     return next_token;
 }
