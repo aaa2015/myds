@@ -107,6 +107,16 @@ int myds_metal_routed_moe(
     ggml_type                  down_type,
     float                      clamp_val);
 
+/* Grouped attention output down-projection on GPU: heads -> attn_low */
+int myds_metal_attn_output_a(
+    myds_metal_buffer_t       *low,
+    const myds_metal_buffer_t *out_a,
+    const myds_metal_buffer_t *heads,
+    uint32_t                   n_groups,
+    uint32_t                   group_dim,
+    uint32_t                   rank,
+    ggml_type                  weight_type);
+
 /* DeepSeek-MoE Expert Output Accumulation: y = sum(w_i * expert_out_i) */
 int myds_metal_moe_sum(
     myds_metal_buffer_t       *out,
@@ -135,6 +145,10 @@ uint64_t myds_metal_get_commit_count(void);
 
 /* Synchronize GPU command queue */
 int myds_metal_synchronize(void);
+
+/* Pre-warm memory pages in unified RAM */
+void myds_metal_warm_memory(const void *addr, size_t size);
+void myds_metal_warm_buffer(const myds_metal_buffer_t *buf);
 
 #ifdef __cplusplus
 }
