@@ -2,6 +2,7 @@
 #include "myds_metal.h"
 #include "myds_gguf.h"
 #include "myds_tokenizer.h"
+#include "myds_log.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -101,15 +102,18 @@ static myds_metal_buffer_t *create_metal_buffer_from_tensor(const gguf_tensor_t 
 
 myds_model_t *myds_model_load(const char *model_path) {
     if (!myds_metal_init("metal")) {
-        fprintf(stderr, "myds_model_load: failed to initialize Metal backend\n");
+        MYDS_LOG_E("Failed to initialize Metal backend (check Apple Silicon GPU & shaders)");
         return NULL;
     }
 
     gguf_file_t *gf = gguf_open(model_path);
     if (!gf) {
-        fprintf(stderr, "myds_model_load: failed to open GGUF file '%s'\n", model_path);
+        MYDS_LOG_E("Failed to open GGUF file '%s'", model_path);
         return NULL;
     }
+
+    MYDS_LOG_I("Opened GGUF model: %s (tensors: %llu, kv_pairs: %llu)",
+               model_path, (unsigned long long)gf->tensor_count, (unsigned long long)gf->metadata_kv_count);
 
     myds_model_t *m = (myds_model_t *)calloc(1, sizeof(myds_model_t));
     m->gf = gf;

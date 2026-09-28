@@ -1,5 +1,6 @@
 #include "myds.h"
 #include "myds_server.h"
+#include "myds_log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -86,23 +87,30 @@ int main(int argc, char *argv[]) {
     printf("         Accelerated by Apple Silicon Metal         \n");
     printf("====================================================\n");
 
+    MYDS_LOG_I("Starting myds (ctx_size=%u, max_new_tokens=%u, temp=%.2f, top_p=%.2f)",
+               cfg.max_seq_len, cfg.max_new_tokens, cfg.temperature, cfg.top_p);
+    MYDS_LOG_I("Loading model file: %s", model_path);
+
     clock_t t0 = clock();
     myds_model_t *model = myds_model_load(model_path);
     if (!model) {
-        fprintf(stderr, "Failed to load model from %s\n", model_path);
+        MYDS_LOG_E("Failed to load model from %s", model_path);
         return 1;
     }
     clock_t t1 = clock();
-    printf("Model loaded in %.2f s\n", (double)(t1 - t0) / CLOCKS_PER_SEC);
+    double load_sec = (double)(t1 - t0) / CLOCKS_PER_SEC;
+    printf("Model loaded in %.2f s\n", load_sec);
+    MYDS_LOG_I("Model loaded successfully in %.2fs", load_sec);
 
     myds_model_print_info(model);
 
     myds_context_t *ctx = myds_context_create(model, &cfg);
     if (!ctx) {
-        fprintf(stderr, "Failed to create inference context\n");
+        MYDS_LOG_E("Failed to create inference context");
         myds_model_free(model);
         return 1;
     }
+    MYDS_LOG_I("Inference context initialized");
 
     if (port > 0) {
         /* HTTP Server Mode for Fleet deployment */
@@ -114,6 +122,7 @@ int main(int argc, char *argv[]) {
 
     if (prompt) {
         /* Single prompt generation */
+        MYDS_LOG_I("Generating response for prompt (%zu chars)...", strlen(prompt));
         printf("\n[Prompt]: %s\n\n[Response]: ", prompt);
         uint32_t token_count = 0;
         clock_t gen_t0 = clock();
@@ -126,6 +135,7 @@ int main(int argc, char *argv[]) {
         printf("\n\n----------------------------------------------------\n");
         printf("Generated %u tokens in %.2f s (%.2f tokens/sec)\n", token_count, elapsed, speed);
         printf("----------------------------------------------------\n");
+        MYDS_LOG_I("Generation completed: %u tokens in %.2fs (%.2f tokens/s)", token_count, elapsed, speed);
     } else {
         /* Interactive Chat Mode */
         printf("\nEntering interactive chat mode (type 'exit' or Ctrl+D to quit):\n\n");

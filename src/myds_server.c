@@ -1,4 +1,5 @@
 #include "myds_server.h"
+#include "myds_log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,6 +10,7 @@
 #include <pthread.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -422,10 +424,11 @@ static void send_response(int fd, int code, const char *status, const char *cont
     }
 }
 
-static void handle_client(int client_fd, myds_context_t *ctx, const char *model_alias) {
+static void handle_client(int client_fd, myds_context_t *ctx, const char *model_alias, const char *client_ip, int client_port) {
     size_t req_cap = 65536;
     char *req_buf = malloc(req_cap);
     if (!req_buf) {
+        MYDS_LOG_E("[%s:%d] Failed to allocate %zu bytes for request buffer", client_ip, client_port, req_cap);
         close(client_fd);
         return;
     }
@@ -452,6 +455,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
 
     /* CORS preflight */
     if (strcmp(method, "OPTIONS") == 0) {
+        MYDS_LOG_D("[%s:%d] OPTIONS %s (CORS preflight)", client_ip, client_port, path);
         const char *cors_res =
             "HTTP/1.1 204 No Content\r\n"
             "Access-Control-Allow-Origin: *\r\n"
@@ -466,6 +470,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
 
     /* GET /health or GET / */
     if (strcmp(path, "/health") == 0 || strcmp(path, "/") == 0) {
+        MYDS_LOG_D("[%s:%d] GET %s -> 200 OK", client_ip, client_port, path);
         send_response(client_fd, 200, "OK", "application/json", "{\"status\":\"ok\"}");
         free(req_buf);
         close(client_fd);
@@ -474,6 +479,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
 
     /* GET /v1/models */
     if (strcmp(path, "/v1/models") == 0) {
+        MYDS_LOG_I("[%s:%d] GET /v1/models -> 200 OK (alias: %s)", client_ip, client_port, model_alias ? model_alias : "myds");
         char resp[512];
         snprintf(resp, sizeof(resp),
                  "{\"object\":\"list\",\"data\":[{\"id\":\"%s\",\"object\":\"model\",\"owned_by\":\"myds\"}]}",
@@ -489,6 +495,9 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
     int is_responses_endpoint = (strcmp(path, "/v1/responses") == 0 || strcmp(path, "/responses") == 0);
 
     if (is_chat_endpoint || is_responses_endpoint) {
+        struct timeval t_start, t_end;
+        gettimeofday(&t_start, NULL);
+
         /* Find body start and read complete body */
         char *body = strstr(req_buf, "\r\n\r\n");
         if (body) {
@@ -527,12 +536,20 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         size_t prompt_cap = (total_read * 2 > 65536) ? (total_read * 2 + 8192) : 65536;
         char *prompt = malloc(prompt_cap);
         if (!prompt) {
+            MYDS_LOG_E("[%s:%d] Out of memory allocating prompt buffer (%zu bytes)", client_ip, client_port, prompt_cap);
             send_response(client_fd, 500, "Internal Server Error", "application/json", "{\"error\":\"Out of memory\"}");
             free(req_buf);
             close(client_fd);
             return;
         }
         parse_chat_prompt(body, prompt, prompt_cap);
+
+        MYDS_LOG_I("[%s:%d] %s %s (protocol=%s, stream=%s, max_tokens=%d, temp=%.2f, top_p=%.2f, prompt_chars=%zu)",
+                   client_ip, client_port, method, path,
+                   is_responses_endpoint ? "Responses" : "ChatCompletions",
+                   stream ? "true" : "false",
+                   max_tokens, temp, top_p,
+                   strlen(prompt));
 
         pthread_mutex_lock(&g_infer_mutex);
 
@@ -543,6 +560,8 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         if (temp >= 0.0f) req_cfg.temperature = temp;
         if (top_p >= 0.0f) req_cfg.top_p = top_p;
         myds_context_set_config(ctx, &req_cfg);
+
+        uint32_t final_tokens = 0;
 
         if (is_responses_endpoint) {
             /* OpenAI Responses API format */
@@ -572,6 +591,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 };
 
                 myds_generate(ctx, prompt, responses_sse_token_callback, &sctx);
+                final_tokens = sctx.token_count;
 
                 const char *ev_part_done =
                     "event: response.content_part.done\n"
@@ -601,6 +621,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 ns.buf[0] = '\0';
 
                 myds_generate(ctx, prompt, non_stream_callback, &ns);
+                final_tokens = ns.token_count;
 
                 char *escaped = malloc(ns.len * 2 + 1024);
                 json_escape(ns.buf, escaped, ns.len * 2 + 1024);
@@ -649,6 +670,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 };
 
                 myds_generate(ctx, prompt, sse_token_callback, &sctx);
+                final_tokens = sctx.token_count;
 
                 const char *stop_chunk =
                     "data: {\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
@@ -664,6 +686,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 ns.buf[0] = '\0';
 
                 myds_generate(ctx, prompt, non_stream_callback, &ns);
+                final_tokens = ns.token_count;
 
                 char *escaped = malloc(ns.len * 2 + 1024);
                 json_escape(ns.buf, escaped, ns.len * 2 + 1024);
@@ -688,6 +711,14 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             }
         }
 
+        gettimeofday(&t_end, NULL);
+        double elapsed = (t_end.tv_sec - t_start.tv_sec) + (t_end.tv_usec - t_start.tv_usec) / 1e6;
+        double speed = (elapsed > 0.0) ? (final_tokens / elapsed) : 0.0;
+        MYDS_LOG_I("[%s:%d] Completed %s %s 200 OK - %u tokens in %.2fs (%.2f tokens/s)",
+                   client_ip, client_port,
+                   is_responses_endpoint ? "Responses" : "ChatCompletions",
+                   path, final_tokens, elapsed, speed);
+
         myds_context_set_config(ctx, &prev_cfg);
         pthread_mutex_unlock(&g_infer_mutex);
 
@@ -698,6 +729,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
     }
 
     /* Not found */
+    MYDS_LOG_W("[%s:%d] %s %s -> 404 Not Found", client_ip, client_port, method, path);
     send_response(client_fd, 404, "Not Found", "application/json", "{\"error\":\"Not found\"}");
     free(req_buf);
     close(client_fd);
@@ -710,7 +742,7 @@ int myds_server_start(myds_context_t *ctx, const char *host, int port, const cha
 
     g_server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (g_server_fd < 0) {
-        perror("socket");
+        MYDS_LOG_E("Failed to create server socket: %s", strerror(errno));
         return 1;
     }
 
@@ -728,13 +760,13 @@ int myds_server_start(myds_context_t *ctx, const char *host, int port, const cha
     }
 
     if (bind(g_server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind");
+        MYDS_LOG_E("Failed to bind socket to %s:%d: %s", host ? host : "0.0.0.0", port, strerror(errno));
         close(g_server_fd);
         return 1;
     }
 
     if (listen(g_server_fd, 64) < 0) {
-        perror("listen");
+        MYDS_LOG_E("Failed to listen on socket: %s", strerror(errno));
         close(g_server_fd);
         return 1;
     }
@@ -748,6 +780,12 @@ int myds_server_start(myds_context_t *ctx, const char *host, int port, const cha
            model_alias ? model_alias : "myds");
     fflush(stdout);
 
+    MYDS_LOG_I("HTTP server listening on http://%s:%d (model_alias: %s)",
+               (host && strlen(host) > 0) ? host : "0.0.0.0",
+               port,
+               model_alias ? model_alias : "myds");
+    MYDS_LOG_I("Protocols active: OpenAI Responses API (/v1/responses) & Chat Completions (/v1/chat/completions)");
+
     while (g_running) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
@@ -755,11 +793,15 @@ int myds_server_start(myds_context_t *ctx, const char *host, int port, const cha
         if (client_fd < 0) {
             if (!g_running) break;
             if (errno == EINTR) continue;
-            perror("accept");
+            MYDS_LOG_E("Socket accept error: %s", strerror(errno));
             break;
         }
 
-        handle_client(client_fd, ctx, model_alias);
+        char client_ip[INET_ADDRSTRLEN] = "127.0.0.1";
+        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
+        int client_port = ntohs(client_addr.sin_port);
+
+        handle_client(client_fd, ctx, model_alias, client_ip, client_port);
     }
 
     if (g_server_fd >= 0) {
@@ -769,5 +811,6 @@ int myds_server_start(myds_context_t *ctx, const char *host, int port, const cha
 
     printf("\nmyds: server stopped gracefully\n");
     fflush(stdout);
+    MYDS_LOG_I("Server stopped gracefully");
     return 0;
 }
