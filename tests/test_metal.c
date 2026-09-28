@@ -4,6 +4,7 @@
 #include <math.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #define ASSERT_TRUE(cond) do { \
     if (!(cond)) { \
@@ -350,6 +351,80 @@ static int test_buffer_read_write(void) {
     return 1;
 }
 
+static int test_buffer_from_ptr_zerocopy(void) {
+    size_t page_sz = (size_t)getpagesize();
+    size_t alloc_bytes = page_sz * 4;
+    void *raw_mem = NULL;
+    int rc = posix_memalign(&raw_mem, page_sz, alloc_bytes);
+    ASSERT_TRUE(rc == 0 && raw_mem != NULL);
+
+    /* Fill memory with recognizable pattern */
+    uint8_t *byte_ptr = (uint8_t *)raw_mem;
+    for (size_t i = 0; i < alloc_bytes; i++) {
+        byte_ptr[i] = (uint8_t)((i * 31) ^ 0xA5);
+    }
+
+    /* Wrap aligned buffer */
+    myds_metal_buffer_t *buf_aligned = myds_metal_buffer_from_ptr(raw_mem, alloc_bytes);
+    ASSERT_TRUE(buf_aligned != NULL);
+    ASSERT_TRUE(myds_metal_buffer_is_view(buf_aligned) == true);
+    ASSERT_TRUE(myds_metal_buffer_offset(buf_aligned) == 0);
+    ASSERT_TRUE(myds_metal_buffer_data(buf_aligned) == raw_mem);
+
+    /* Wrap unaligned slice inside the memory */
+    size_t sub_offset = 128;
+    size_t sub_bytes = 1024;
+    void *unaligned_ptr = (void *)(byte_ptr + sub_offset);
+    myds_metal_buffer_t *buf_unaligned = myds_metal_buffer_from_ptr(unaligned_ptr, sub_bytes);
+    ASSERT_TRUE(buf_unaligned != NULL);
+    ASSERT_TRUE(myds_metal_buffer_is_view(buf_unaligned) == true);
+    ASSERT_TRUE(myds_metal_buffer_offset(buf_unaligned) == sub_offset);
+    ASSERT_TRUE(myds_metal_buffer_data(buf_unaligned) == unaligned_ptr);
+    ASSERT_TRUE(myds_metal_buffer_size(buf_unaligned) == sub_bytes);
+
+    /* Verify data matches directly without copying */
+    uint8_t *view_data = (uint8_t *)myds_metal_buffer_data(buf_unaligned);
+    ASSERT_TRUE(memcmp(view_data, unaligned_ptr, sub_bytes) == 0);
+
+    /* Modify source memory and ensure zero-copy view reflects change immediately */
+    byte_ptr[sub_offset] ^= 0xFF;
+    ASSERT_TRUE(view_data[0] == byte_ptr[sub_offset]);
+
+    myds_metal_buffer_free(buf_aligned);
+    myds_metal_buffer_free(buf_unaligned);
+    free(raw_mem);
+
+    printf("  [PASS] Metal zero-copy buffer wrapping (newBufferWithBytesNoCopy) and slice offsets\n");
+    return 1;
+}
+
+static int test_gemv_unsupported_quant_failfast(void) {
+    const uint32_t out_dim = 32;
+    const uint32_t in_dim = 64;
+
+    myds_metal_buffer_t *x = myds_metal_buffer_alloc(in_dim * sizeof(float));
+    myds_metal_buffer_t *y = myds_metal_buffer_alloc(out_dim * sizeof(float));
+    myds_metal_buffer_t *W = myds_metal_buffer_alloc(out_dim * in_dim);
+    ASSERT_TRUE(x && y && W);
+
+    /* GGML_TYPE_Q4_K (12), GGML_TYPE_Q6_K (14), GGML_TYPE_IQ4_NL (20) must fail fast and return 0 */
+    int rc_q4 = myds_metal_gemv(y, W, x, out_dim, in_dim, GGML_TYPE_Q4_K);
+    ASSERT_TRUE(rc_q4 == 0);
+
+    int rc_q6 = myds_metal_gemv(y, W, x, out_dim, in_dim, GGML_TYPE_Q6_K);
+    ASSERT_TRUE(rc_q6 == 0);
+
+    int rc_iq4 = myds_metal_gemv(y, W, x, out_dim, in_dim, GGML_TYPE_IQ4_NL);
+    ASSERT_TRUE(rc_iq4 == 0);
+
+    myds_metal_buffer_free(x);
+    myds_metal_buffer_free(y);
+    myds_metal_buffer_free(W);
+
+    printf("  [PASS] myds_metal_gemv fail-fast rejection for unsupported quantization types (Q4_K, Q6_K, IQ4_NL)\n");
+    return 1;
+}
+
 int main(void) {
     printf("====================================================\n");
     printf("   Running myds Metal GPU Kernel Verification\n");
@@ -371,16 +446,18 @@ int main(void) {
     passed += test_add();
     passed += test_softmax();
     passed += test_buffer_read_write();
+    passed += test_buffer_from_ptr_zerocopy();
+    passed += test_gemv_unsupported_quant_failfast();
 
     myds_metal_cleanup();
 
     printf("====================================================\n");
-    if (passed == 10) {
-        printf("  ALL 10 METAL OPERATOR TESTS PASSED! (Apple Silicon GPU)\n");
+    if (passed == 12) {
+        printf("  ALL 12 METAL OPERATOR TESTS PASSED! (Apple Silicon GPU)\n");
         printf("====================================================\n");
         return 0;
     } else {
-        printf("  TESTS FAILED (passed %d/10)\n", passed);
+        printf("  TESTS FAILED (passed %d/12)\n", passed);
         return 1;
     }
 }

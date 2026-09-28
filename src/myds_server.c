@@ -98,6 +98,24 @@ static void json_unescape_slice(const char *src, size_t len, char *dst, size_t d
     dst[di] = '\0';
 }
 
+/* Standard HTTP header integer parser (e.g. Content-Length: 1234) */
+static int extract_http_header_int(const char *headers, const char *header_name) {
+    if (!headers || !header_name) return 0;
+    const char *p = headers;
+    size_t name_len = strlen(header_name);
+    while (*p) {
+        if (strncasecmp(p, header_name, name_len) == 0 && p[name_len] == ':') {
+            p += name_len + 1;
+            while (*p == ' ' || *p == '\t') p++;
+            return atoi(p);
+        }
+        p = strchr(p, '\n');
+        if (!p) break;
+        p++;
+    }
+    return 0;
+}
+
 /* Very simple JSON string value finder: searches for "key"\s*:\s*"value" */
 static int json_extract_string_field(const char *json, const char *key, char *out, size_t out_size) {
     if (!json || !key || !out || out_size == 0) return 0;
@@ -425,6 +443,11 @@ static void send_response(int fd, int code, const char *status, const char *cont
 }
 
 static void handle_client(int client_fd, myds_context_t *ctx, const char *model_alias, const char *client_ip, int client_port) {
+    /* Protect against slowloris and stalled connections */
+    struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
     size_t req_cap = 65536;
     char *req_buf = malloc(req_cap);
     if (!req_buf) {
@@ -502,7 +525,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         char *body = strstr(req_buf, "\r\n\r\n");
         if (body) {
             body += 4;
-            int content_len = json_extract_int_field(req_buf, "Content-Length", 0);
+            int content_len = extract_http_header_int(req_buf, "Content-Length");
             size_t header_len = (size_t)(body - req_buf);
             size_t needed = header_len + (content_len > 0 ? (size_t)content_len : 0) + 1;
             if (needed > req_cap) {

@@ -19,12 +19,13 @@ TEST_SERVER = $(BIN_DIR)/test_server
 TEST_LOG = $(BIN_DIR)/test_log
 TEST_SERVER_API = $(BIN_DIR)/test_server_api
 TEST_ENGINE = $(BIN_DIR)/test_engine
+DUMP_TENSORS = $(BIN_DIR)/dump_tensors
 
 ALL_TESTS = $(TEST_METAL) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE)
 
 .PHONY: all test clean
 
-all: $(TARGET) $(ALL_TESTS)
+all: $(TARGET) $(ALL_TESTS) $(DUMP_TENSORS)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -65,7 +66,7 @@ $(BUILD_DIR)/test_engine.o: tests/test_engine.c | $(BUILD_DIR)
 $(TARGET): $(OBJS_C) $(OBJS_M) $(BUILD_DIR)/main.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@
 
-$(TEST_METAL): $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/test_metal.o | $(BIN_DIR)
+$(TEST_METAL): $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_metal.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@
 
 $(TEST_GGUF): $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/test_gguf.o | $(BIN_DIR)
@@ -83,7 +84,13 @@ $(TEST_LOG): $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_log.o | $(BIN_DIR)
 $(TEST_SERVER_API): $(BUILD_DIR)/test_server_api.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@
 
-$(TEST_ENGINE): $(BUILD_DIR)/test_engine.o | $(BIN_DIR)
+$(TEST_ENGINE): $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_engine.o | $(BIN_DIR)
+	$(CC) $^ $(LDFLAGS) -o $@
+
+$(BUILD_DIR)/dump_tensors.o: tools/dump_tensors.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(DUMP_TENSORS): $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/dump_tensors.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@
 
 test: $(ALL_TESTS)

@@ -176,7 +176,9 @@ gguf_file_t *gguf_open(const char *path) {
     }
 
     size_t size = (size_t)st.st_size;
-    uint8_t *addr = (uint8_t *)mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+    size_t page_sz = (size_t)getpagesize();
+    size_t mmap_size = ((size + page_sz - 1) / page_sz) * page_sz;
+    uint8_t *addr = (uint8_t *)mmap(NULL, mmap_size, PROT_READ, MAP_SHARED, fd, 0);
     if (addr == MAP_FAILED) {
         perror("gguf_open: mmap");
         close(fd);
@@ -210,7 +212,7 @@ gguf_file_t *gguf_open(const char *path) {
     gguf_file_t *gf = (gguf_file_t *)calloc(1, sizeof(gguf_file_t));
     gf->fd = fd;
     gf->mmap_addr = addr;
-    gf->mmap_size = size;
+    gf->mmap_size = mmap_size;
     gf->version = version;
     gf->tensor_count = tensor_count;
     gf->metadata_kv_count = kv_count;

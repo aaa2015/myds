@@ -1,9 +1,113 @@
 #include "myds.h"
+#include "myds_gguf.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <assert.h>
+#include <unistd.h>
+
+static void write_u32(FILE *f, uint32_t v) { fwrite(&v, sizeof(v), 1, f); }
+static void write_u64(FILE *f, uint64_t v) { fwrite(&v, sizeof(v), 1, f); }
+static void write_str(FILE *f, const char *s) {
+    uint64_t len = strlen(s);
+    write_u64(f, len);
+    fwrite(s, 1, len, f);
+}
+
+typedef struct {
+    const char *name;
+    ggml_type   type;
+    uint64_t    dim0;
+    uint64_t    dim1;
+} synth_tensor_desc_t;
+
+static const char *create_gate_test_gguf(
+    const char *path,
+    const char *arch,
+    uint32_t n_layers,
+    uint32_t n_routed_experts,
+    const synth_tensor_desc_t *tensors,
+    size_t n_tensors) {
+
+    FILE *f = fopen(path, "wb");
+    if (!f) return NULL;
+
+    uint32_t magic = GGUF_MAGIC;
+    uint32_t version = 3;
+    uint64_t n_kvs = 7;
+
+    fwrite(&magic, 4, 1, f);
+    write_u32(f, version);
+    write_u64(f, n_tensors);
+    write_u64(f, n_kvs);
+
+    write_str(f, "general.architecture");
+    write_u32(f, GGUF_TYPE_STRING);
+    write_str(f, arch);
+
+    char key_buf[128];
+    snprintf(key_buf, sizeof(key_buf), "%s.embedding_length", arch);
+    write_str(f, key_buf);
+    write_u32(f, GGUF_TYPE_UINT32);
+    write_u32(f, 64);
+
+    snprintf(key_buf, sizeof(key_buf), "%s.block_count", arch);
+    write_str(f, key_buf);
+    write_u32(f, GGUF_TYPE_UINT32);
+    write_u32(f, n_layers);
+
+    snprintf(key_buf, sizeof(key_buf), "%s.attention.head_count", arch);
+    write_str(f, key_buf);
+    write_u32(f, GGUF_TYPE_UINT32);
+    write_u32(f, 2);
+
+    snprintf(key_buf, sizeof(key_buf), "%s.attention.head_count_kv", arch);
+    write_str(f, key_buf);
+    write_u32(f, GGUF_TYPE_UINT32);
+    write_u32(f, 2);
+
+    snprintf(key_buf, sizeof(key_buf), "%s.expert_count", arch);
+    write_str(f, key_buf);
+    write_u32(f, GGUF_TYPE_UINT32);
+    write_u32(f, n_routed_experts);
+
+    write_str(f, "general.alignment");
+    write_u32(f, GGUF_TYPE_UINT32);
+    write_u32(f, 32);
+
+    uint64_t cur_offset = 0;
+    for (size_t i = 0; i < n_tensors; i++) {
+        write_str(f, tensors[i].name);
+        uint32_t n_dims = (tensors[i].dim1 > 0) ? 2 : 1;
+        write_u32(f, n_dims);
+        write_u64(f, tensors[i].dim0);
+        if (n_dims == 2) write_u64(f, tensors[i].dim1);
+        write_u32(f, (uint32_t)tensors[i].type);
+        write_u64(f, cur_offset);
+
+        size_t n_el = tensors[i].dim0 * (tensors[i].dim1 > 0 ? tensors[i].dim1 : 1);
+        size_t sz = ggml_type_row_size(tensors[i].type, n_el);
+        sz = (sz + 31) / 32 * 32;
+        cur_offset += sz;
+    }
+
+    long pos = ftell(f);
+    long pad = (32 - (pos % 32)) % 32;
+    for (long i = 0; i < pad; i++) fputc(0, f);
+
+    for (size_t i = 0; i < n_tensors; i++) {
+        size_t n_el = tensors[i].dim0 * (tensors[i].dim1 > 0 ? tensors[i].dim1 : 1);
+        size_t sz = ggml_type_row_size(tensors[i].type, n_el);
+        size_t sz_padded = (sz + 31) / 32 * 32;
+        uint8_t *dummy = (uint8_t *)calloc(1, sz_padded);
+        fwrite(dummy, 1, sz_padded, f);
+        free(dummy);
+    }
+
+    fclose(f);
+    return path;
+}
 
 /* Test greedy argmax */
 static int32_t sample_greedy(const float *logits, int vocab_size) {
@@ -171,8 +275,74 @@ int main(void) {
         printf("  [PASS] DeepSeek V4/V4.1 architecture enforcement & V2/V3 rejection\n");
     }
 
+    /* 7. Gate T0-3: Multi-Head Latent Attention (MLA) without MHA fail-fast rejection */
+    {
+        const char *path = "/tmp/test_myds_gate_mla.gguf";
+        synth_tensor_desc_t tensors[] = {
+            { "token_embd.weight", GGML_TYPE_F32, 64, 16 },
+            { "output_norm.weight", GGML_TYPE_F32, 64, 0 },
+            { "blk.0.attn_q_a.weight", GGML_TYPE_F32, 64, 16 }
+        };
+        create_gate_test_gguf(path, "deepseek41", 1, 0, tensors, sizeof(tensors)/sizeof(tensors[0]));
+
+        myds_model_t *m = myds_model_load(path);
+        assert(m == NULL); /* Must be rejected by T0-3 MLA gate */
+        unlink(path);
+        printf("  [PASS] T0-3 gate: MLA model without MHA tensors rejected fail-fast\n");
+    }
+
+    /* 8. Gate T0-4: MoE with routed experts fail-fast rejection */
+    {
+        const char *path = "/tmp/test_myds_gate_moe.gguf";
+        synth_tensor_desc_t tensors[] = {
+            { "token_embd.weight", GGML_TYPE_F32, 64, 16 },
+            { "output_norm.weight", GGML_TYPE_F32, 64, 0 },
+            { "blk.0.ffn_gate_exps.weight", GGML_TYPE_Q8_0, 64, 64 }
+        };
+        create_gate_test_gguf(path, "deepseek41", 1, 64, tensors, sizeof(tensors)/sizeof(tensors[0]));
+
+        myds_model_t *m = myds_model_load(path);
+        assert(m == NULL); /* Must be rejected by T0-4 MoE gate */
+        unlink(path);
+        printf("  [PASS] T0-4 gate: MoE model with routed experts rejected fail-fast\n");
+    }
+
+    /* 9. Gate T0-1: Unsupported quantization type fail-fast rejection */
+    {
+        const char *path = "/tmp/test_myds_gate_quant.gguf";
+        synth_tensor_desc_t tensors[] = {
+            { "token_embd.weight", GGML_TYPE_F32, 64, 16 },
+            { "output_norm.weight", GGML_TYPE_F32, 64, 0 },
+            { "output.weight", GGML_TYPE_F32, 64, 16 },
+            { "blk.0.attn_norm.weight", GGML_TYPE_F32, 64, 0 },
+            { "blk.0.attn_q.weight", GGML_TYPE_Q4_K, 64, 64 } /* Q4_K is unsupported for GEMV */
+        };
+        create_gate_test_gguf(path, "deepseek41", 1, 0, tensors, sizeof(tensors)/sizeof(tensors[0]));
+
+        myds_model_t *m = myds_model_load(path);
+        assert(m == NULL); /* Must be rejected by T0-1 unsupported quant gate */
+        unlink(path);
+        printf("  [PASS] T0-1 gate: Unsupported quantization (Q4_K) rejected fail-fast\n");
+    }
+
+    /* 10. Gate T0-3: Missing required attention tensors fail-fast rejection */
+    {
+        const char *path = "/tmp/test_myds_gate_missing.gguf";
+        synth_tensor_desc_t tensors[] = {
+            { "token_embd.weight", GGML_TYPE_F32, 64, 16 },
+            { "output_norm.weight", GGML_TYPE_F32, 64, 0 }
+            /* blk.0 attention tensors completely missing */
+        };
+        create_gate_test_gguf(path, "deepseek41", 1, 0, tensors, sizeof(tensors)/sizeof(tensors[0]));
+
+        myds_model_t *m = myds_model_load(path);
+        assert(m == NULL); /* Must be rejected by T0-3 missing tensor gate */
+        unlink(path);
+        printf("  [PASS] T0-3 gate: Missing required attention/FFN tensors rejected fail-fast\n");
+    }
+
     printf("====================================================\n");
-    printf("   ALL ENGINE SAMPLING UNIT TESTS PASSED!           \n");
+    printf("   ALL ENGINE UNIT & GATE TESTS PASSED!             \n");
     printf("====================================================\n");
     return 0;
 }

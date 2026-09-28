@@ -2,15 +2,19 @@
 #import <Metal/Metal.h>
 
 #include "myds_metal.h"
+#include "myds_log.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 struct myds_metal_buffer {
     id<MTLBuffer> mtl_buf;
     size_t        size;
+    size_t        offset;
     void         *ptr;
+    bool          is_view;
 };
 
 static id<MTLDevice>               g_device = nil;
@@ -218,7 +222,38 @@ myds_metal_buffer_t *myds_metal_buffer_alloc(size_t bytes) {
         myds_metal_buffer_t *buf = (myds_metal_buffer_t *)calloc(1, sizeof(myds_metal_buffer_t));
         buf->mtl_buf = mtl_buf;
         buf->size = bytes;
+        buf->offset = 0;
         buf->ptr = [mtl_buf contents];
+        buf->is_view = false;
+        return buf;
+    }
+}
+
+myds_metal_buffer_t *myds_metal_buffer_from_ptr(const void *ptr, size_t bytes) {
+    if (!g_device && !myds_metal_init(NULL)) return NULL;
+    if (!ptr || bytes == 0) return NULL;
+
+    @autoreleasepool {
+        size_t page_sz = (size_t)getpagesize();
+        uintptr_t target_ptr = (uintptr_t)ptr;
+        uintptr_t page_aligned_ptr = target_ptr & ~(page_sz - 1);
+        size_t page_offset = target_ptr - page_aligned_ptr;
+        size_t page_len = ((bytes + page_offset + page_sz - 1) / page_sz) * page_sz;
+
+        id<MTLBuffer> mtl_buf = [g_device newBufferWithBytesNoCopy:(void *)page_aligned_ptr
+                                                            length:page_len
+                                                           options:MTLResourceStorageModeShared
+                                                       deallocator:nil];
+        if (!mtl_buf) {
+            return NULL;
+        }
+
+        myds_metal_buffer_t *buf = (myds_metal_buffer_t *)calloc(1, sizeof(myds_metal_buffer_t));
+        buf->mtl_buf = mtl_buf;
+        buf->size = bytes;
+        buf->offset = page_offset;
+        buf->ptr = (void *)((uintptr_t)[mtl_buf contents] + page_offset);
+        buf->is_view = true;
         return buf;
     }
 }
@@ -235,6 +270,14 @@ void *myds_metal_buffer_data(myds_metal_buffer_t *buf) {
 
 size_t myds_metal_buffer_size(const myds_metal_buffer_t *buf) {
     return buf ? buf->size : 0;
+}
+
+size_t myds_metal_buffer_offset(const myds_metal_buffer_t *buf) {
+    return buf ? buf->offset : 0;
+}
+
+bool myds_metal_buffer_is_view(const myds_metal_buffer_t *buf) {
+    return buf ? buf->is_view : false;
 }
 
 int myds_metal_buffer_write(myds_metal_buffer_t *buf, size_t offset, const void *src, size_t bytes) {
@@ -291,10 +334,10 @@ int myds_metal_rmsnorm(
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
             [enc setComputePipelineState:g_pso_rms_norm];
             [enc setBytes:&args length:sizeof(args) atIndex:0];
-            [enc setBuffer:x->mtl_buf offset:0 atIndex:1];
-            [enc setBuffer:weight->mtl_buf offset:0 atIndex:2];
-            [enc setBuffer:weight->mtl_buf offset:0 atIndex:3];
-            [enc setBuffer:out->mtl_buf offset:0 atIndex:4];
+            [enc setBuffer:x->mtl_buf offset:(x ? x->offset : 0) atIndex:1];
+            [enc setBuffer:weight->mtl_buf offset:(weight ? weight->offset : 0) atIndex:2];
+            [enc setBuffer:weight->mtl_buf offset:(weight ? weight->offset : 0) atIndex:3];
+            [enc setBuffer:out->mtl_buf offset:(out ? out->offset : 0) atIndex:4];
             [enc setThreadgroupMemoryLength:32 * sizeof(float) atIndex:0];
 
             NSUInteger threads = (dim / 4 < 32) ? 32 : (dim / 4 > 256 ? 256 : dim / 4);
@@ -404,9 +447,9 @@ int myds_metal_swiglu(
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
             [enc setComputePipelineState:g_pso_swiglu];
             [enc setBytes:&args length:sizeof(args) atIndex:0];
-            [enc setBuffer:gate->mtl_buf offset:0 atIndex:1];
-            [enc setBuffer:up->mtl_buf offset:0 atIndex:2];
-            [enc setBuffer:out->mtl_buf offset:0 atIndex:3];
+            [enc setBuffer:gate->mtl_buf offset:(gate ? gate->offset : 0) atIndex:1];
+            [enc setBuffer:up->mtl_buf offset:(up ? up->offset : 0) atIndex:2];
+            [enc setBuffer:out->mtl_buf offset:(out ? out->offset : 0) atIndex:3];
 
             NSUInteger threads = (dim < 256) ? dim : 256;
             [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
@@ -531,6 +574,8 @@ int myds_metal_gemv(
         return 1;
     }
 
+    MYDS_LOG_E("myds_metal_gemv: unsupported GGML quantization type %d (%s) for GEMV out_dim=%u, in_dim=%u",
+               (int)weight_type, ggml_type_name(weight_type), out_dim, in_dim);
     return 0;
 }
 

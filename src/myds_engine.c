@@ -91,12 +91,22 @@ struct myds_context {
     float              **v_cache; /* [n_layers][max_seq_len * n_kv_heads * head_dim] */
 };
 
-/* Helper: wrap GGUF tensor memory into Metal buffer */
+/* Helper: verify supported quantization types for GEMV operations */
+static bool is_supported_quant_type(ggml_type type) {
+    return (type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_Q8_0);
+}
+
+/* Helper: wrap GGUF tensor memory into Metal buffer using zero-copy mapping */
 static myds_metal_buffer_t *create_metal_buffer_from_tensor(const gguf_tensor_t *t) {
     if (!t || !t->data) return NULL;
-    myds_metal_buffer_t *buf = myds_metal_buffer_alloc(t->size_bytes);
-    if (!buf) return NULL;
-    myds_metal_buffer_write(buf, 0, t->data, t->size_bytes);
+    myds_metal_buffer_t *buf = myds_metal_buffer_from_ptr(t->data, t->size_bytes);
+    if (!buf) {
+        /* Fallback if no-copy wrapper cannot be created */
+        buf = myds_metal_buffer_alloc(t->size_bytes);
+        if (buf) {
+            myds_metal_buffer_write(buf, 0, t->data, t->size_bytes);
+        }
+    }
     return buf;
 }
 
@@ -151,6 +161,11 @@ myds_model_t *myds_model_load(const char *model_path) {
     snprintf(key_buf, sizeof(key_buf), "%s.attention.head_count_kv", arch);
     m->n_kv_heads = gguf_get_u32(gf, key_buf, m->n_heads);
 
+    if (m->n_heads == 0 || m->dim == 0) {
+        MYDS_LOG_E("Invalid model dimensions: dim=%u, n_heads=%u", m->dim, m->n_heads);
+        goto fail;
+    }
+
     m->head_dim = m->dim / m->n_heads;
 
     snprintf(key_buf, sizeof(key_buf), "%s.feed_forward_length", arch);
@@ -180,66 +195,163 @@ myds_model_t *myds_model_load(const char *model_path) {
 
     m->vocab_size = m->tokenizer ? m->tokenizer->vocab_size : 32000;
 
+    /* T0-3 / T0-4 Gates: Verify architecture compatibility before loading weights */
+    const gguf_tensor_t *t_mla_sample = gguf_find_tensor(gf, "blk.0.attn_q_a.weight");
+    if (!t_mla_sample) t_mla_sample = gguf_find_tensor(gf, "blk.0.attn_kv.weight");
+    const gguf_tensor_t *t_mha_sample = gguf_find_tensor(gf, "blk.0.attn_q.weight");
+
+    if (t_mla_sample && !t_mha_sample) {
+        MYDS_LOG_E("Model uses Multi-Head Latent Attention (MLA) tensors (e.g. 'blk.0.attn_q_a.weight'), which requires Phase 2 MLA forward support. Standard MHA tensors ('blk.0.attn_q.weight') are missing. Refusing to run to prevent silent failure (T0-3 gate).");
+        goto fail;
+    }
+
+    const gguf_tensor_t *t_routed_exps = gguf_find_tensor(gf, "blk.0.ffn_gate_exps.weight");
+    if (m->n_routed_experts > 0 && t_routed_exps) {
+        MYDS_LOG_E("Model has %u routed experts ('blk.0.ffn_gate_exps.weight'). Routed expert execution is not yet implemented. Refusing to run to prevent silent corruption (T0-4 gate).",
+                   m->n_routed_experts);
+        goto fail;
+    }
+
     /* Load Embedding */
     const gguf_tensor_t *t_embd = gguf_find_tensor(gf, "token_embd.weight");
-    if (t_embd) {
-        m->tok_embeddings = create_metal_buffer_from_tensor(t_embd);
-        m->tok_embeddings_type = t_embd->type;
+    if (!t_embd) {
+        MYDS_LOG_E("Missing required embedding tensor 'token_embd.weight' (T0-3 gate)");
+        goto fail;
+    }
+    if (t_embd->type != GGML_TYPE_F32 && t_embd->type != GGML_TYPE_F16) {
+        MYDS_LOG_E("Embedding tensor 'token_embd.weight' has unsupported type %d (%s). Expected F32 or F16 (T0-1 gate).",
+                   (int)t_embd->type, ggml_type_name(t_embd->type));
+        goto fail;
+    }
+    m->tok_embeddings = create_metal_buffer_from_tensor(t_embd);
+    m->tok_embeddings_type = t_embd->type;
+    if (!m->tok_embeddings) {
+        MYDS_LOG_E("Failed to create buffer for 'token_embd.weight'");
+        goto fail;
     }
 
     /* Load Output Norm & Output (LM Head) */
     const gguf_tensor_t *t_out_norm = gguf_find_tensor(gf, "output_norm.weight");
-    if (t_out_norm) m->output_norm = create_metal_buffer_from_tensor(t_out_norm);
+    if (!t_out_norm) {
+        MYDS_LOG_E("Missing required norm tensor 'output_norm.weight' (T0-3 gate)");
+        goto fail;
+    }
+    m->output_norm = create_metal_buffer_from_tensor(t_out_norm);
+    if (!m->output_norm) {
+        MYDS_LOG_E("Failed to create buffer for 'output_norm.weight'");
+        goto fail;
+    }
 
     const gguf_tensor_t *t_out = gguf_find_tensor(gf, "output.weight");
-    if (!t_out) t_out = t_embd; /* weight tying */
-    if (t_out) {
+    if (!t_out) {
+        /* Weight tying with embedding */
+        m->output = m->tok_embeddings;
+        m->output_type = m->tok_embeddings_type;
+    } else {
+        if (!is_supported_quant_type(t_out->type)) {
+            MYDS_LOG_E("Output projection tensor 'output.weight' has unsupported quant type %d (%s). Expected F32, F16, or Q8_0 (T0-1 gate).",
+                       (int)t_out->type, ggml_type_name(t_out->type));
+            goto fail;
+        }
         m->output = create_metal_buffer_from_tensor(t_out);
         m->output_type = t_out->type;
+        if (!m->output) {
+            MYDS_LOG_E("Failed to create buffer for 'output.weight'");
+            goto fail;
+        }
     }
 
     /* Load Layers */
     m->layers = (myds_layer_t *)calloc(m->n_layers, sizeof(myds_layer_t));
+    if (!m->layers) {
+        MYDS_LOG_E("Failed to allocate memory for %u layers", m->n_layers);
+        goto fail;
+    }
+
     for (uint32_t i = 0; i < m->n_layers; i++) {
         char name[128];
 
         snprintf(name, sizeof(name), "blk.%u.attn_norm.weight", i);
-        m->layers[i].attn_norm = create_metal_buffer_from_tensor(gguf_find_tensor(gf, name));
+        const gguf_tensor_t *tan = gguf_find_tensor(gf, name);
+        if (!tan) {
+            MYDS_LOG_E("Layer %u missing required attention norm tensor '%s' (T0-3 gate)", i, name);
+            goto fail;
+        }
+        m->layers[i].attn_norm = create_metal_buffer_from_tensor(tan);
 
         snprintf(name, sizeof(name), "blk.%u.attn_q.weight", i);
         const gguf_tensor_t *tq = gguf_find_tensor(gf, name);
-        if (tq) {
-            m->layers[i].attn_q = create_metal_buffer_from_tensor(tq);
-            m->layers[i].attn_q_type = tq->type;
+        if (!tq) {
+            MYDS_LOG_E("Layer %u missing required attention Q tensor '%s' (T0-3 gate)", i, name);
+            goto fail;
         }
+        if (!is_supported_quant_type(tq->type)) {
+            MYDS_LOG_E("Layer %u attention Q tensor '%s' has unsupported quant type %d (%s). Expected F32, F16, or Q8_0 (T0-1 gate).",
+                       i, name, (int)tq->type, ggml_type_name(tq->type));
+            goto fail;
+        }
+        m->layers[i].attn_q = create_metal_buffer_from_tensor(tq);
+        m->layers[i].attn_q_type = tq->type;
 
         snprintf(name, sizeof(name), "blk.%u.attn_k.weight", i);
         const gguf_tensor_t *tk = gguf_find_tensor(gf, name);
-        if (tk) {
-            m->layers[i].attn_k = create_metal_buffer_from_tensor(tk);
-            m->layers[i].attn_k_type = tk->type;
+        if (!tk) {
+            MYDS_LOG_E("Layer %u missing required attention K tensor '%s' (T0-3 gate)", i, name);
+            goto fail;
         }
+        if (!is_supported_quant_type(tk->type)) {
+            MYDS_LOG_E("Layer %u attention K tensor '%s' has unsupported quant type %d (%s). Expected F32, F16, or Q8_0 (T0-1 gate).",
+                       i, name, (int)tk->type, ggml_type_name(tk->type));
+            goto fail;
+        }
+        m->layers[i].attn_k = create_metal_buffer_from_tensor(tk);
+        m->layers[i].attn_k_type = tk->type;
 
         snprintf(name, sizeof(name), "blk.%u.attn_v.weight", i);
         const gguf_tensor_t *tv = gguf_find_tensor(gf, name);
-        if (tv) {
-            m->layers[i].attn_v = create_metal_buffer_from_tensor(tv);
-            m->layers[i].attn_v_type = tv->type;
+        if (!tv) {
+            MYDS_LOG_E("Layer %u missing required attention V tensor '%s' (T0-3 gate)", i, name);
+            goto fail;
         }
+        if (!is_supported_quant_type(tv->type)) {
+            MYDS_LOG_E("Layer %u attention V tensor '%s' has unsupported quant type %d (%s). Expected F32, F16, or Q8_0 (T0-1 gate).",
+                       i, name, (int)tv->type, ggml_type_name(tv->type));
+            goto fail;
+        }
+        m->layers[i].attn_v = create_metal_buffer_from_tensor(tv);
+        m->layers[i].attn_v_type = tv->type;
 
         snprintf(name, sizeof(name), "blk.%u.attn_output.weight", i);
         const gguf_tensor_t *to = gguf_find_tensor(gf, name);
-        if (to) {
-            m->layers[i].attn_o = create_metal_buffer_from_tensor(to);
-            m->layers[i].attn_o_type = to->type;
+        if (!to) {
+            MYDS_LOG_E("Layer %u missing required attention output tensor '%s' (T0-3 gate)", i, name);
+            goto fail;
         }
+        if (!is_supported_quant_type(to->type)) {
+            MYDS_LOG_E("Layer %u attention output tensor '%s' has unsupported quant type %d (%s). Expected F32, F16, or Q8_0 (T0-1 gate).",
+                       i, name, (int)to->type, ggml_type_name(to->type));
+            goto fail;
+        }
+        m->layers[i].attn_o = create_metal_buffer_from_tensor(to);
+        m->layers[i].attn_o_type = to->type;
 
         snprintf(name, sizeof(name), "blk.%u.ffn_norm.weight", i);
-        m->layers[i].ffn_norm = create_metal_buffer_from_tensor(gguf_find_tensor(gf, name));
+        const gguf_tensor_t *tfn = gguf_find_tensor(gf, name);
+        if (!tfn) {
+            MYDS_LOG_E("Layer %u missing required FFN norm tensor '%s' (T0-3 gate)", i, name);
+            goto fail;
+        }
+        m->layers[i].ffn_norm = create_metal_buffer_from_tensor(tfn);
 
+        /* FFN: check dense vs shared experts */
         snprintf(name, sizeof(name), "blk.%u.ffn_gate.weight", i);
         const gguf_tensor_t *fg = gguf_find_tensor(gf, name);
         if (fg) {
+            if (!is_supported_quant_type(fg->type)) {
+                MYDS_LOG_E("Layer %u ffn_gate tensor '%s' has unsupported quant type %d (%s) (T0-1 gate)",
+                           i, name, (int)fg->type, ggml_type_name(fg->type));
+                goto fail;
+            }
             m->layers[i].ffn_gate = create_metal_buffer_from_tensor(fg);
             m->layers[i].ffn_gate_type = fg->type;
         }
@@ -247,6 +359,11 @@ myds_model_t *myds_model_load(const char *model_path) {
         snprintf(name, sizeof(name), "blk.%u.ffn_up.weight", i);
         const gguf_tensor_t *fu = gguf_find_tensor(gf, name);
         if (fu) {
+            if (!is_supported_quant_type(fu->type)) {
+                MYDS_LOG_E("Layer %u ffn_up tensor '%s' has unsupported quant type %d (%s) (T0-1 gate)",
+                           i, name, (int)fu->type, ggml_type_name(fu->type));
+                goto fail;
+            }
             m->layers[i].ffn_up = create_metal_buffer_from_tensor(fu);
             m->layers[i].ffn_up_type = fu->type;
         }
@@ -254,25 +371,72 @@ myds_model_t *myds_model_load(const char *model_path) {
         snprintf(name, sizeof(name), "blk.%u.ffn_down.weight", i);
         const gguf_tensor_t *fd = gguf_find_tensor(gf, name);
         if (fd) {
+            if (!is_supported_quant_type(fd->type)) {
+                MYDS_LOG_E("Layer %u ffn_down tensor '%s' has unsupported quant type %d (%s) (T0-1 gate)",
+                           i, name, (int)fd->type, ggml_type_name(fd->type));
+                goto fail;
+            }
             m->layers[i].ffn_down = create_metal_buffer_from_tensor(fd);
             m->layers[i].ffn_down_type = fd->type;
         }
 
         /* MoE router & shared experts */
         snprintf(name, sizeof(name), "blk.%u.ffn_gate_inp.weight", i);
-        m->layers[i].router_gate = create_metal_buffer_from_tensor(gguf_find_tensor(gf, name));
+        const gguf_tensor_t *t_rg = gguf_find_tensor(gf, name);
+        if (t_rg) {
+            m->layers[i].router_gate = create_metal_buffer_from_tensor(t_rg);
+        }
 
         snprintf(name, sizeof(name), "blk.%u.ffn_gate_shexp.weight", i);
-        m->layers[i].shared_gate = create_metal_buffer_from_tensor(gguf_find_tensor(gf, name));
+        const gguf_tensor_t *t_sg = gguf_find_tensor(gf, name);
+        if (t_sg) {
+            if (!is_supported_quant_type(t_sg->type)) {
+                MYDS_LOG_E("Layer %u shared gate tensor '%s' has unsupported quant type %d (%s) (T0-1 gate)",
+                           i, name, (int)t_sg->type, ggml_type_name(t_sg->type));
+                goto fail;
+            }
+            m->layers[i].shared_gate = create_metal_buffer_from_tensor(t_sg);
+        }
 
         snprintf(name, sizeof(name), "blk.%u.ffn_up_shexp.weight", i);
-        m->layers[i].shared_up = create_metal_buffer_from_tensor(gguf_find_tensor(gf, name));
+        const gguf_tensor_t *t_su = gguf_find_tensor(gf, name);
+        if (t_su) {
+            if (!is_supported_quant_type(t_su->type)) {
+                MYDS_LOG_E("Layer %u shared up tensor '%s' has unsupported quant type %d (%s) (T0-1 gate)",
+                           i, name, (int)t_su->type, ggml_type_name(t_su->type));
+                goto fail;
+            }
+            m->layers[i].shared_up = create_metal_buffer_from_tensor(t_su);
+        }
 
         snprintf(name, sizeof(name), "blk.%u.ffn_down_shexp.weight", i);
-        m->layers[i].shared_down = create_metal_buffer_from_tensor(gguf_find_tensor(gf, name));
+        const gguf_tensor_t *t_sd = gguf_find_tensor(gf, name);
+        if (t_sd) {
+            if (!is_supported_quant_type(t_sd->type)) {
+                MYDS_LOG_E("Layer %u shared down tensor '%s' has unsupported quant type %d (%s) (T0-1 gate)",
+                           i, name, (int)t_sd->type, ggml_type_name(t_sd->type));
+                goto fail;
+            }
+            m->layers[i].shared_down = create_metal_buffer_from_tensor(t_sd);
+        }
+
+        bool has_dense_ffn = (m->layers[i].ffn_gate && m->layers[i].ffn_up && m->layers[i].ffn_down);
+        bool has_shared_ffn = (m->layers[i].shared_gate && m->layers[i].shared_up && m->layers[i].shared_down);
+        if (!has_dense_ffn && !has_shared_ffn) {
+            MYDS_LOG_E("Layer %u missing FFN tensors (neither complete dense FFN nor shared expert FFN found) (T0-3 gate)", i);
+            goto fail;
+        }
     }
 
     return m;
+
+fail:
+    if (m) {
+        myds_model_free(m);
+    } else if (gf) {
+        gguf_close(gf);
+    }
+    return NULL;
 }
 
 void myds_model_free(myds_model_t *m) {
@@ -500,13 +664,22 @@ int32_t myds_forward_token(myds_context_t *ctx, int32_t token_id, uint32_t pos) 
 
         /* Q, K, V projections */
         if (layer->attn_q) {
-            myds_metal_gemv(ctx->q, layer->attn_q, ctx->x_norm, n_heads * head_dim, dim, layer->attn_q_type);
+            if (!myds_metal_gemv(ctx->q, layer->attn_q, ctx->x_norm, n_heads * head_dim, dim, layer->attn_q_type)) {
+                MYDS_LOG_E("Forward failed: GEMV for attn_q at layer %u failed", l);
+                return -1;
+            }
         }
         if (layer->attn_k) {
-            myds_metal_gemv(ctx->k, layer->attn_k, ctx->x_norm, n_kv_heads * head_dim, dim, layer->attn_k_type);
+            if (!myds_metal_gemv(ctx->k, layer->attn_k, ctx->x_norm, n_kv_heads * head_dim, dim, layer->attn_k_type)) {
+                MYDS_LOG_E("Forward failed: GEMV for attn_k at layer %u failed", l);
+                return -1;
+            }
         }
         if (layer->attn_v) {
-            myds_metal_gemv(ctx->v, layer->attn_v, ctx->x_norm, n_kv_heads * head_dim, dim, layer->attn_v_type);
+            if (!myds_metal_gemv(ctx->v, layer->attn_v, ctx->x_norm, n_kv_heads * head_dim, dim, layer->attn_v_type)) {
+                MYDS_LOG_E("Forward failed: GEMV for attn_v at layer %u failed", l);
+                return -1;
+            }
         }
 
         /* Decoupled RoPE on Q & K */
@@ -569,7 +742,12 @@ int32_t myds_forward_token(myds_context_t *ctx, int32_t token_id, uint32_t pos) 
         /* Output projection */
         if (layer->attn_o) {
             myds_metal_buffer_t *tmp_out = myds_metal_buffer_alloc(dim * sizeof(float));
-            myds_metal_gemv(tmp_out, layer->attn_o, ctx->attn_out, dim, n_heads * head_dim, layer->attn_o_type);
+            if (!tmp_out) return -1;
+            if (!myds_metal_gemv(tmp_out, layer->attn_o, ctx->attn_out, dim, n_heads * head_dim, layer->attn_o_type)) {
+                MYDS_LOG_E("Forward failed: GEMV for attn_o at layer %u failed", l);
+                myds_metal_buffer_free(tmp_out);
+                return -1;
+            }
             /* Residual connection: x = x + attn_output */
             myds_metal_add(ctx->x, ctx->x, tmp_out, dim);
             myds_metal_buffer_free(tmp_out);
@@ -586,7 +764,12 @@ int32_t myds_forward_token(myds_context_t *ctx, int32_t token_id, uint32_t pos) 
         if (m->n_routed_experts > 0 && layer->router_gate) {
             /* DeepSeek MoE routing */
             myds_metal_buffer_t *router_logits = myds_metal_buffer_alloc(m->n_routed_experts * sizeof(float));
-            myds_metal_gemv(router_logits, layer->router_gate, ctx->ffn_norm_out, m->n_routed_experts, dim, GGML_TYPE_F32);
+            if (!router_logits) return -1;
+            if (!myds_metal_gemv(router_logits, layer->router_gate, ctx->ffn_norm_out, m->n_routed_experts, dim, GGML_TYPE_F32)) {
+                MYDS_LOG_E("Forward failed: GEMV for router_gate at layer %u failed", l);
+                myds_metal_buffer_free(router_logits);
+                return -1;
+            }
 
             int32_t exp_ids[32];
             float exp_weights[32];
@@ -597,18 +780,30 @@ int32_t myds_forward_token(myds_context_t *ctx, int32_t token_id, uint32_t pos) 
 
             /* Shared expert forward if present */
             if (layer->shared_gate && layer->shared_up && layer->shared_down) {
-                myds_metal_gemv(ctx->gate_out, layer->shared_gate, ctx->ffn_norm_out, m->hidden_dim, dim, GGML_TYPE_Q8_0);
-                myds_metal_gemv(ctx->up_out, layer->shared_up, ctx->ffn_norm_out, m->hidden_dim, dim, GGML_TYPE_Q8_0);
+                if (!myds_metal_gemv(ctx->gate_out, layer->shared_gate, ctx->ffn_norm_out, m->hidden_dim, dim, GGML_TYPE_Q8_0) ||
+                    !myds_metal_gemv(ctx->up_out, layer->shared_up, ctx->ffn_norm_out, m->hidden_dim, dim, GGML_TYPE_Q8_0)) {
+                    MYDS_LOG_E("Forward failed: GEMV for shared expert gate/up at layer %u failed", l);
+                    return -1;
+                }
                 myds_metal_swiglu(ctx->swiglu_out, ctx->gate_out, ctx->up_out, m->hidden_dim);
-                myds_metal_gemv(ctx->ffn_out, layer->shared_down, ctx->swiglu_out, dim, m->hidden_dim, GGML_TYPE_Q8_0);
+                if (!myds_metal_gemv(ctx->ffn_out, layer->shared_down, ctx->swiglu_out, dim, m->hidden_dim, GGML_TYPE_Q8_0)) {
+                    MYDS_LOG_E("Forward failed: GEMV for shared expert down at layer %u failed", l);
+                    return -1;
+                }
                 myds_metal_add(ctx->x, ctx->x, ctx->ffn_out, dim);
             }
         } else if (layer->ffn_gate && layer->ffn_up && layer->ffn_down) {
             /* Dense SwiGLU FFN */
-            myds_metal_gemv(ctx->gate_out, layer->ffn_gate, ctx->ffn_norm_out, m->hidden_dim, dim, layer->ffn_gate_type);
-            myds_metal_gemv(ctx->up_out, layer->ffn_up, ctx->ffn_norm_out, m->hidden_dim, dim, layer->ffn_up_type);
+            if (!myds_metal_gemv(ctx->gate_out, layer->ffn_gate, ctx->ffn_norm_out, m->hidden_dim, dim, layer->ffn_gate_type) ||
+                !myds_metal_gemv(ctx->up_out, layer->ffn_up, ctx->ffn_norm_out, m->hidden_dim, dim, layer->ffn_up_type)) {
+                MYDS_LOG_E("Forward failed: GEMV for ffn_gate/up at layer %u failed", l);
+                return -1;
+            }
             myds_metal_swiglu(ctx->swiglu_out, ctx->gate_out, ctx->up_out, m->hidden_dim);
-            myds_metal_gemv(ctx->ffn_out, layer->ffn_down, ctx->swiglu_out, dim, m->hidden_dim, layer->ffn_down_type);
+            if (!myds_metal_gemv(ctx->ffn_out, layer->ffn_down, ctx->swiglu_out, dim, m->hidden_dim, layer->ffn_down_type)) {
+                MYDS_LOG_E("Forward failed: GEMV for ffn_down at layer %u failed", l);
+                return -1;
+            }
 
             /* Residual connection: x = x + ffn_output */
             myds_metal_add(ctx->x, ctx->x, ctx->ffn_out, dim);
@@ -624,7 +819,10 @@ int32_t myds_forward_token(myds_context_t *ctx, int32_t token_id, uint32_t pos) 
 
     /* 4. LM Head Logits */
     if (m->output) {
-        myds_metal_gemv(ctx->logits, m->output, ctx->x_norm, m->vocab_size, dim, m->output_type);
+        if (!myds_metal_gemv(ctx->logits, m->output, ctx->x_norm, m->vocab_size, dim, m->output_type)) {
+            MYDS_LOG_E("Forward failed: LM head GEMV failed");
+            return -1;
+        }
     }
 
     /* 5. Sample next token */
@@ -648,7 +846,10 @@ int myds_generate(myds_context_t *ctx, const char *prompt, myds_stream_callback_
 
     /* 2. Prefill phase */
     for (int32_t i = 0; i < n_prompt - 1; i++) {
-        myds_forward_token(ctx, prompt_tokens[i], ctx->pos);
+        if (myds_forward_token(ctx, prompt_tokens[i], ctx->pos) < 0) {
+            MYDS_LOG_E("Prefill step %d failed", i);
+            return 0;
+        }
         ctx->pos++;
     }
     cur_token = prompt_tokens[n_prompt - 1];
@@ -657,6 +858,10 @@ int myds_generate(myds_context_t *ctx, const char *prompt, myds_stream_callback_
     uint32_t max_gen = ctx->cfg.max_new_tokens;
     for (uint32_t step = 0; step < max_gen; step++) {
         int32_t next_token = myds_forward_token(ctx, cur_token, ctx->pos);
+        if (next_token < 0) {
+            MYDS_LOG_E("Generation step %u failed", step);
+            return 0;
+        }
         ctx->pos++;
 
         if (next_token == m->tokenizer->eos_id) {

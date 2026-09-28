@@ -19,9 +19,12 @@ void myds_metal_cleanup(void);
 
 /* Buffer allocation and memory mapping */
 myds_metal_buffer_t *myds_metal_buffer_alloc(size_t bytes);
+myds_metal_buffer_t *myds_metal_buffer_from_ptr(const void *ptr, size_t bytes);
 void                 myds_metal_buffer_free(myds_metal_buffer_t *buf);
 void                *myds_metal_buffer_data(myds_metal_buffer_t *buf);
 size_t               myds_metal_buffer_size(const myds_metal_buffer_t *buf);
+size_t               myds_metal_buffer_offset(const myds_metal_buffer_t *buf);
+bool                 myds_metal_buffer_is_view(const myds_metal_buffer_t *buf);
 int                  myds_metal_buffer_write(myds_metal_buffer_t *buf, size_t offset, const void *src, size_t bytes);
 int                  myds_metal_buffer_read(const myds_metal_buffer_t *buf, size_t offset, void *dst, size_t bytes);
 
