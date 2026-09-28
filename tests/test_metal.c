@@ -15,7 +15,7 @@
 
 #define ASSERT_NEAR(a, b, tol) do { \
     float diff = fabsf((float)(a) - (float)(b)); \
-    if (diff > (tol)) { \
+    if (!isfinite((float)(a)) || !isfinite((float)(b)) || diff > (tol)) { \
         fprintf(stderr, "[FAIL] %s:%d: %s (%.6f) != %s (%.6f), diff=%.6f > tol=%.6f\n", \
                 __FILE__, __LINE__, #a, (float)(a), #b, (float)(b), diff, (float)(tol)); \
         return 0; \
@@ -579,6 +579,177 @@ static int test_batch_command_buffer(void) {
     return 1;
 }
 
+static int test_swiglu_flat_shapes(void) {
+    const uint32_t shapes[] = { 1, 31, 257, 1025, 32769 };
+    for (size_t shape = 0; shape < sizeof(shapes) / sizeof(shapes[0]); shape++) {
+        uint32_t dim = shapes[shape];
+        size_t bytes = (size_t)dim * sizeof(float);
+        myds_metal_buffer_t *gate = myds_metal_buffer_alloc(bytes);
+        myds_metal_buffer_t *up = myds_metal_buffer_alloc(bytes);
+        myds_metal_buffer_t *storage = myds_metal_buffer_alloc(bytes + 2 * sizeof(float));
+        ASSERT_TRUE(gate && up && storage);
+        myds_metal_buffer_t *out = myds_metal_buffer_sub_view(storage, sizeof(float), bytes);
+        ASSERT_TRUE(out);
+        float *gv = myds_metal_buffer_data(gate);
+        float *uv = myds_metal_buffer_data(up);
+        float *sv = myds_metal_buffer_data(storage);
+        float *ov = myds_metal_buffer_data(out);
+        float *ref = malloc(bytes);
+        ASSERT_TRUE(ref);
+        sv[0] = sv[dim + 1] = -9876.0f;
+        for (uint32_t i = 0; i < dim; i++) {
+            gv[i] = ((int)(i % 101) - 50) * 0.125f;
+            uv[i] = ((int)(i % 37) - 18) * 0.0625f;
+            ref[i] = gv[i] / (1.0f + expf(-gv[i])) * uv[i];
+        }
+        ASSERT_TRUE(!myds_metal_swiglu(out, gate, up, dim + 1));
+        uint64_t commits = myds_metal_get_commit_count();
+        ASSERT_TRUE(myds_metal_begin_batch());
+        ASSERT_TRUE(myds_metal_swiglu(out, gate, up, dim));
+        ASSERT_TRUE(myds_metal_add(out, out, up, dim));
+        ASSERT_TRUE(myds_metal_commit_batch());
+        ASSERT_TRUE(myds_metal_get_commit_count() == commits + 1);
+        for (uint32_t i = 0; i < dim; i++) ASSERT_NEAR(ov[i], ref[i] + uv[i], 1e-5f);
+        ASSERT_NEAR(sv[0], -9876.0f, 0.0f);
+        ASSERT_NEAR(sv[dim + 1], -9876.0f, 0.0f);
+        ASSERT_TRUE(myds_metal_swiglu(gate, gate, up, dim));
+        for (uint32_t i = 0; i < dim; i++) ASSERT_NEAR(gv[i], ref[i], 1e-5f);
+        free(ref);
+        myds_metal_buffer_free(out);
+        myds_metal_buffer_free(storage);
+        myds_metal_buffer_free(gate);
+        myds_metal_buffer_free(up);
+    }
+    printf("  [PASS] Flat SwiGLU tails, subviews, in-place output and batched dependency\n");
+    return 1;
+}
+
+static int test_gemv_batch_exact(void) {
+    const ggml_type types[] = { GGML_TYPE_Q8_0, GGML_TYPE_F32, GGML_TYPE_F16 };
+    typedef struct { uint16_t d; int8_t qs[32]; } block_q8_0_t;
+    for (size_t type_idx = 0; type_idx < 3; type_idx++) {
+        ggml_type type = types[type_idx];
+        for (int shape = 0; shape < 3; shape++) {
+            uint32_t in_dim = shape == 0 ? 256 : (shape == 1 || type == GGML_TYPE_Q8_0 ? 64 : 35);
+            uint32_t out_dim = shape == 0 ? 64 : 5;
+            uint32_t n_tok = shape == 0 ? 7 : 3;
+            size_t row_bytes = ggml_type_row_size(type, in_dim);
+            size_t w_bytes = row_bytes * out_dim;
+            size_t x_bytes = (size_t)n_tok * in_dim * sizeof(float);
+            size_t y_bytes = (size_t)n_tok * out_dim * sizeof(float);
+            myds_metal_buffer_t *wp = myds_metal_buffer_alloc(w_bytes + 16);
+            myds_metal_buffer_t *xp = myds_metal_buffer_alloc(x_bytes + 16);
+            myds_metal_buffer_t *yp = myds_metal_buffer_alloc(y_bytes + 32);
+            myds_metal_buffer_t *ref = myds_metal_buffer_alloc(y_bytes);
+            ASSERT_TRUE(wp && xp && yp && ref);
+            myds_metal_buffer_t *w = myds_metal_buffer_sub_view(wp, 16, w_bytes);
+            myds_metal_buffer_t *x = myds_metal_buffer_sub_view(xp, 16, x_bytes);
+            myds_metal_buffer_t *y = myds_metal_buffer_sub_view(yp, 16, y_bytes);
+            ASSERT_TRUE(w && x && y);
+            memset(myds_metal_buffer_data(yp), 0xA5, y_bytes + 32);
+            float *xv = myds_metal_buffer_data(x);
+            for (size_t i = 0; i < (size_t)n_tok * in_dim; i++) xv[i] = sinf((float)i * 0.17f);
+            if (type == GGML_TYPE_Q8_0) {
+                block_q8_0_t *blocks = myds_metal_buffer_data(w);
+                for (size_t b = 0; b < w_bytes / sizeof(*blocks); b++) {
+                    blocks[b].d = 0x3000; /* 0.125 */
+                    for (int i = 0; i < 32; i++) blocks[b].qs[i] = (int8_t)((b * 7 + i) % 15) - 7;
+                }
+            } else {
+                for (size_t i = 0; i < (size_t)out_dim * in_dim; i++) {
+                    float value = ((int)(i % 17) - 8) * 0.125f;
+                    if (type == GGML_TYPE_F32) ((float *)myds_metal_buffer_data(w))[i] = value;
+                    else ((_Float16 *)myds_metal_buffer_data(w))[i] = (_Float16)value;
+                }
+            }
+            ASSERT_TRUE(myds_metal_begin_batch());
+            for (uint32_t t = 0; t < n_tok; t++) {
+                myds_metal_buffer_t *xt = myds_metal_buffer_sub_view(x, (size_t)t * in_dim * sizeof(float), in_dim * sizeof(float));
+                myds_metal_buffer_t *yt = myds_metal_buffer_sub_view(ref, (size_t)t * out_dim * sizeof(float), out_dim * sizeof(float));
+                ASSERT_TRUE(xt && yt && myds_metal_gemv(yt, w, xt, out_dim, in_dim, type));
+                myds_metal_buffer_free(xt);
+                myds_metal_buffer_free(yt);
+            }
+            ASSERT_TRUE(myds_metal_commit_batch());
+            uint64_t commits = myds_metal_get_commit_count();
+            ASSERT_TRUE(myds_metal_begin_batch());
+            ASSERT_TRUE(myds_metal_gemv_batch(y, w, x, out_dim, in_dim, n_tok, type));
+            ASSERT_TRUE(myds_metal_get_commit_count() == commits);
+            ASSERT_TRUE(myds_metal_commit_batch());
+            ASSERT_TRUE(myds_metal_get_commit_count() == commits + 1);
+            ASSERT_TRUE(memcmp(myds_metal_buffer_data(y), myds_metal_buffer_data(ref), y_bytes) == 0);
+            float *yv = myds_metal_buffer_data(y);
+            for (uint32_t t = 0; t < n_tok; t++) {
+                for (uint32_t r = 0; r < out_dim; r++) {
+                    double expected = 0.0;
+                    for (uint32_t c = 0; c < in_dim; c++) {
+                        float weight;
+                        if (type == GGML_TYPE_Q8_0) {
+                            block_q8_0_t *blocks = myds_metal_buffer_data(w);
+                            weight = 0.125f * blocks[(size_t)r * (in_dim / 32) + c / 32].qs[c % 32];
+                        } else if (type == GGML_TYPE_F32) weight = ((float *)myds_metal_buffer_data(w))[(size_t)r * in_dim + c];
+                        else weight = (float)((_Float16 *)myds_metal_buffer_data(w))[(size_t)r * in_dim + c];
+                        expected += (double)weight * xv[(size_t)t * in_dim + c];
+                    }
+                    ASSERT_NEAR(yv[(size_t)t * out_dim + r], expected, 1e-4f);
+                }
+            }
+            const uint8_t *guards = myds_metal_buffer_data(yp);
+            for (size_t i = 0; i < 16; i++) {
+                ASSERT_TRUE(guards[i] == 0xA5 && guards[16 + y_bytes + i] == 0xA5);
+            }
+            ASSERT_TRUE(!myds_metal_gemv_batch(y, w, x, out_dim, in_dim, n_tok + 1, type));
+            ASSERT_TRUE(!myds_metal_gemv_batch(y, w, x, UINT32_MAX, in_dim, n_tok, type));
+            if (type == GGML_TYPE_Q8_0) ASSERT_TRUE(!myds_metal_gemv_batch(y, w, x, out_dim, in_dim - 1, n_tok, type));
+            myds_metal_buffer_free(w);
+            myds_metal_buffer_free(x);
+            myds_metal_buffer_free(y);
+            myds_metal_buffer_free(wp);
+            myds_metal_buffer_free(xp);
+            myds_metal_buffer_free(yp);
+            myds_metal_buffer_free(ref);
+        }
+    }
+    printf("  [PASS] Batched GEMV is bit-exact to single-token Q8/F32/F16 (tails, subviews, bounds)\n");
+    return 1;
+}
+
+static int test_event_validation(void) {
+    uint64_t commits = myds_metal_get_commit_count();
+    ASSERT_TRUE(myds_metal_begin_batch());
+    ASSERT_TRUE(!myds_metal_commit_and_wait_event(0));
+    ASSERT_TRUE(!myds_metal_wait_event(UINT64_MAX));
+    ASSERT_TRUE(!myds_metal_commit_and_wait_event(UINT64_MAX));
+    ASSERT_TRUE(myds_metal_get_commit_count() == commits);
+    ASSERT_TRUE(myds_metal_commit_batch());
+    ASSERT_TRUE(myds_metal_get_commit_count() == commits + 1);
+    printf("  [PASS] Invalid event values preserve the unsubmitted batch\n");
+    return 1;
+}
+
+static int test_event_tail_completion(int cleanup) {
+    const uint32_t dim = 1u << 18;
+    const uint32_t repetitions = 64;
+    myds_metal_buffer_t *input = myds_metal_buffer_alloc((size_t)dim * sizeof(float));
+    myds_metal_buffer_t *out = myds_metal_buffer_alloc((size_t)dim * sizeof(float));
+    ASSERT_TRUE(input && out);
+    float *iv = myds_metal_buffer_data(input);
+    float *ov = myds_metal_buffer_data(out);
+    for (uint32_t i = 0; i < dim; i++) { iv[i] = 0.125f; ov[i] = 0.0f; }
+    ASSERT_TRUE(myds_metal_begin_batch());
+    uint64_t event = 0;
+    ASSERT_TRUE(myds_metal_signal_event(&event));
+    for (uint32_t i = 0; i < repetitions; i++) ASSERT_TRUE(myds_metal_add(out, out, input, dim));
+    ASSERT_TRUE(myds_metal_commit_and_wait_event(event));
+    if (cleanup) myds_metal_cleanup();
+    else ASSERT_TRUE(myds_metal_synchronize());
+    for (uint32_t i = 0; i < dim; i++) ASSERT_NEAR(ov[i], repetitions * 0.125f, 0.0f);
+    myds_metal_buffer_free(input);
+    myds_metal_buffer_free(out);
+    printf("  [PASS] %s waits for GPU work after the shared-event signal\n", cleanup ? "Cleanup" : "Synchronize");
+    return 1;
+}
+
 int main(void) {
     printf("====================================================\n");
     printf("   Running myds Metal GPU Kernel Verification\n");
@@ -590,30 +761,38 @@ int main(void) {
     }
 
     int passed = 0;
-    passed += test_rmsnorm();
-    passed += test_swiglu();
-    passed += test_rope();
-    passed += test_moe_routing();
-    passed += test_gemv_f32();
-    passed += test_gemv_q8_0();
-    passed += test_mul_mm_q8_0();
-    passed += test_moe_sum();
-    passed += test_add();
-    passed += test_softmax();
-    passed += test_buffer_read_write();
-    passed += test_buffer_from_ptr_zerocopy();
-    passed += test_gemv_unsupported_quant_failfast();
-    passed += test_batch_command_buffer();
+    int total = 0;
+#define RUN_TEST(test) do { total++; passed += (test); } while (0)
+    RUN_TEST(test_rmsnorm());
+    RUN_TEST(test_swiglu());
+    RUN_TEST(test_rope());
+    RUN_TEST(test_moe_routing());
+    RUN_TEST(test_gemv_f32());
+    RUN_TEST(test_gemv_q8_0());
+    RUN_TEST(test_mul_mm_q8_0());
+    RUN_TEST(test_moe_sum());
+    RUN_TEST(test_add());
+    RUN_TEST(test_softmax());
+    RUN_TEST(test_buffer_read_write());
+    RUN_TEST(test_buffer_from_ptr_zerocopy());
+    RUN_TEST(test_gemv_unsupported_quant_failfast());
+    RUN_TEST(test_batch_command_buffer());
+    RUN_TEST(test_swiglu_flat_shapes());
+    RUN_TEST(test_gemv_batch_exact());
+    RUN_TEST(test_event_validation());
+    RUN_TEST(test_event_tail_completion(0));
+    RUN_TEST(test_event_tail_completion(1));
+#undef RUN_TEST
 
     myds_metal_cleanup();
 
     printf("====================================================\n");
-    if (passed == 14) {
-        printf("  ALL 14 METAL OPERATOR & BATCH TESTS PASSED! (Apple Silicon GPU)\n");
+    if (passed == total) {
+        printf("  ALL %d METAL OPERATOR & BATCH TESTS PASSED! (Apple Silicon GPU)\n", total);
         printf("====================================================\n");
         return 0;
     } else {
-        printf("  TESTS FAILED (passed %d/14)\n", passed);
+        printf("  TESTS FAILED (passed %d/%d)\n", passed, total);
         return 1;
     }
 }

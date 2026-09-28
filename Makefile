@@ -6,7 +6,7 @@ LDFLAGS ?= -framework Foundation -framework Metal -lm -lpthread
 BIN_DIR = bin
 BUILD_DIR = build
 
-SRCS_C = src/myds_log.c src/myds_gguf.c src/myds_tokenizer.c src/myds_engine.c src/myds_server.c
+SRCS_C = src/myds_cpu.c src/myds_log.c src/myds_gguf.c src/myds_tokenizer.c src/myds_engine.c src/myds_server.c
 SRCS_M = src/myds_metal.m
 OBJS_C = $(patsubst src/%.c, $(BUILD_DIR)/%.o, $(SRCS_C))
 OBJS_M = $(patsubst src/%.m, $(BUILD_DIR)/%.o, $(SRCS_M))
@@ -19,11 +19,18 @@ TEST_SERVER = $(BIN_DIR)/test_server
 TEST_LOG = $(BIN_DIR)/test_log
 TEST_SERVER_API = $(BIN_DIR)/test_server_api
 TEST_ENGINE = $(BIN_DIR)/test_engine
+TEST_CPU = $(BIN_DIR)/test_cpu
+BENCH_SYNTHETIC = $(BIN_DIR)/bench_synthetic
+BENCH_METAL = $(BIN_DIR)/bench_metal
 DUMP_TENSORS = $(BIN_DIR)/dump_tensors
 
-ALL_TESTS = $(TEST_METAL) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE)
+ALL_TESTS = $(TEST_METAL) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE) $(TEST_CPU)
 
-.PHONY: all test clean
+.PHONY: all test clean bench
+
+# Rebuild consumers when public or internal layouts change.
+-include $(wildcard $(BUILD_DIR)/*.d)
+.DEFAULT_GOAL := all
 
 all: $(TARGET) $(ALL_TESTS) $(DUMP_TENSORS)
 
@@ -34,34 +41,34 @@ $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
 
 $(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 $(BUILD_DIR)/%.o: src/%.m | $(BUILD_DIR)
-	$(CC) $(OBJCFLAGS) -c $< -o $@
+	$(CC) $(OBJCFLAGS) -MMD -MP -c $< -o $@
 
 $(BUILD_DIR)/main.o: src/main.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 $(BUILD_DIR)/test_metal.o: tests/test_metal.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 $(BUILD_DIR)/test_gguf.o: tests/test_gguf.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 $(BUILD_DIR)/test_tokenizer.o: tests/test_tokenizer.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 $(BUILD_DIR)/test_server.o: tests/test_server.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 $(BUILD_DIR)/test_log.o: tests/test_log.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 $(BUILD_DIR)/test_server_api.o: tests/test_server_api.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 $(BUILD_DIR)/test_engine.o: tests/test_engine.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 $(TARGET): $(OBJS_C) $(OBJS_M) $(BUILD_DIR)/main.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@
@@ -75,23 +82,46 @@ $(TEST_GGUF): $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/test_gguf.o | $(BIN_DIR)
 $(TEST_TOKENIZER): $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/test_tokenizer.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@
 
-$(TEST_SERVER): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_server.o | $(BIN_DIR)
+$(TEST_SERVER): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_server.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@
 
 $(TEST_LOG): $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_log.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@
 
-$(TEST_SERVER_API): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_server_api.o | $(BIN_DIR)
+$(TEST_SERVER_API): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_server_api.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@
 
-$(TEST_ENGINE): $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_engine.o | $(BIN_DIR)
+$(TEST_ENGINE): $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_engine.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@
 
 $(BUILD_DIR)/dump_tensors.o: tools/dump_tensors.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 $(DUMP_TENSORS): $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/dump_tensors.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@
+
+$(BUILD_DIR)/test_cpu.o: tests/test_cpu.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+$(TEST_CPU): $(BUILD_DIR)/test_cpu.o $(BUILD_DIR)/myds_cpu.o | $(BIN_DIR)
+	$(CC) $^ -lm -o $@
+
+$(BUILD_DIR)/bench_synthetic.o: tools/bench_synthetic.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+$(BENCH_SYNTHETIC): $(BUILD_DIR)/bench_synthetic.o $(OBJS_C) $(OBJS_M) | $(BIN_DIR)
+	$(CC) $^ $(LDFLAGS) -o $@
+
+$(BUILD_DIR)/bench_metal.o: tools/bench_metal.m | $(BUILD_DIR)
+	$(CC) $(OBJCFLAGS) -MMD -MP -c $< -o $@
+
+$(BENCH_METAL): $(BUILD_DIR)/bench_metal.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o | $(BIN_DIR)
+	$(CC) $^ $(LDFLAGS) -o $@
+
+bench: $(TEST_CPU) $(BENCH_METAL) $(BENCH_SYNTHETIC)
+	./$(TEST_CPU) --bench
+	./$(BENCH_METAL)
+	./$(BENCH_SYNTHETIC)
 
 test: $(ALL_TESTS)
 	@echo "\n========================================================"
@@ -110,6 +140,7 @@ test: $(ALL_TESTS)
 	@./$(TEST_SERVER_API)
 	@echo ""
 	@./$(TEST_ENGINE)
+	@./$(TEST_CPU)
 	@echo "\n========================================================"
 	@echo "      ALL TEST SUITES PASSED CLEANLY & SUCCESSFULLY!    "
 	@echo "========================================================"

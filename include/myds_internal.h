@@ -96,10 +96,15 @@ struct myds_model {
     ggml_type            output_type;
 };
 
+typedef struct myds_prefill_chunk myds_prefill_chunk_t;
+
 struct myds_context {
     myds_model_t        *model;
     myds_config_t        cfg;
     uint32_t             pos;
+    uint32_t             kv_capacity; /* Allocated KV rows; cfg may request a smaller limit. */
+    myds_prefill_chunk_t *prefill_chunk; /* Lazily allocated, reused between requests. */
+    uint32_t             prefill_capacity;
 
     /* Metal activation buffers */
     myds_metal_buffer_t *x;

@@ -60,6 +60,17 @@ int myds_metal_gemv(
     uint32_t                   in_dim,
     ggml_type                  weight_type);
 
+/* Multiple independent GEMVs in one dispatch. Uses the same arithmetic and
+ * reduction as gemv, with contiguous input/output rows in token order. */
+int myds_metal_gemv_batch(
+    myds_metal_buffer_t       *y,
+    const myds_metal_buffer_t *W,
+    const myds_metal_buffer_t *x,
+    uint32_t                   out_dim,
+    uint32_t                   in_dim,
+    uint32_t                   n_tok,
+    ggml_type                  weight_type);
+
 /* Batched Matrix-Matrix Multiplication (GEMM): dst [n_tok, out_dim] = src1 [n_tok, in_dim] * W^T [out_dim, in_dim] */
 int myds_metal_mul_mm(
     myds_metal_buffer_t       *dst,
@@ -156,12 +167,15 @@ uint64_t myds_metal_get_commit_count(void);
 void     myds_metal_barrier(void);
 void     myds_metal_set_auto_barrier(int enable);
 
-/* Shared Event management for overlapping router gate with shared expert */
+/* Shared Event management for overlapping router gate with shared expert.
+ * commit_and_wait_event waits only through the signal point; subsequent work
+ * remains in flight until commit_batch, synchronize, or cleanup waits for it. */
 int      myds_metal_signal_event(uint64_t *out_val);
 int      myds_metal_wait_event(uint64_t val);
 int      myds_metal_commit_and_wait_event(uint64_t val);
 
-/* Synchronize GPU command queue */
+/* Submit an active batch and wait for all submissions, including work after
+ * shared-event signals. Returns 0 if any command buffer failed. */
 int myds_metal_synchronize(void);
 
 /* Pre-warm memory pages in unified RAM */

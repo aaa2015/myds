@@ -62,6 +62,7 @@ myds/
 ├── src/                              # 核心源码
 │   ├── main.c                        # 命令行与交互终端入口
 │   ├── myds_engine.c                 # DeepSeek Transformer 前向传播流程与模型加载
+│   ├── myds_cpu.c                    # CPU 数值算子（复用 RoPE 角度计算）
 │   ├── myds_metal.m                  # Metal 运行时与 GPU 算子分发
 │   ├── myds_gguf.c                   # GGUF 格式解析与 mmap 内存映射
 │   ├── myds_tokenizer.c              # BPE 编码与流式解码
@@ -74,12 +75,17 @@ myds/
     ├── test_server.c                 # HTTP 端点与并发连接测试
     ├── test_server_api.c             # Responses API 与协议解析金标测试
     ├── test_engine.c                 # 采样算法与 V4 架构判定单元测试
+    ├── test_cpu.c                    # CPU RoPE 逐位回归与微基准
     └── test_log.c                    # 结构化日志线程安全与过滤测试
 ```
 
 ---
 
 ## 编译与测试
+
+本轮推理优化、验证方法与 Mac Studio 实测记录见
+[性能与架构优化说明](docs/PERFORMANCE.md)。默认预填充使用批量 GEMV，保留单 token GEMV
+的归约顺序；`MYDS_PREFILL_MODE` 的实验性 GEMM 档位仍需独立验证。
 
 ### 1. 编译项目
 
@@ -89,7 +95,7 @@ myds/
 make
 ```
 
-将在 `bin/` 目录下生成 `myds` 主程序以及 7 个独立的测试程序。
+将在 `bin/` 目录下生成 `myds` 主程序以及 8 个独立的测试程序。
 
 ### 2. 运行单元测试套件
 
@@ -97,7 +103,7 @@ make
 make test
 ```
 
-测试流程将自动编译并依次运行 7 个独立的单元测试套件：
+测试流程将自动编译并依次运行 8 个独立的单元测试套件：
 
 1. **GGUF 模型解析器测试套件 (`bin/test_gguf`)**：
    - [x] GGUF v2/v3 标量、字符串、布尔及动态数组元数据提取
@@ -140,6 +146,21 @@ make test
 7. **推理引擎采样与架构判定测试套件 (`bin/test_engine`)**：
    - [x] Greedy Argmax / Temperature / Softmax / Top-p 采样算法测试
    - [x] **DeepSeek V4/V4.1 架构专有支持与 V2/V3 拦截测试**（`myds_is_supported_arch`）
+   - [x] Prefill 工作区扩容/复用、跨 512-token 边界、取消与恢复、KV 容量检查
+
+8. **CPU 数值回归 (`bin/test_cpu`)**：
+   - [x] RoPE 在 288 组形状/位置/缩放/正反向组合下与原实现逐位一致
+   - [x] 逆旋转还原、无旋转及非法形状边界
+
+运行可复现的算子与合成模型基准：
+
+```bash
+make bench
+```
+
+其中 `bench_metal` 在同一进程比较逐 token 与批量 GEMV，并检查逐位一致；
+`bench_synthetic` 生成小型 MLA + MoE GGUF，测量真实加载、预填充和解码路径。
+合成模型用于验证调度开销，真实模型性能请使用 `tools/bench.sh` 或 HTTP 基准。
 
 ---
 

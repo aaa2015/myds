@@ -144,7 +144,9 @@ void kernel_mul_mv_q8_0_f32_impl(
     FOR_UNROLL (short row = 0; row < NR0; ++row) {
         const uint64_t offset0 = (r0 + row)*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
 
-        ax[row] = (device const block_q8_0 *) ((device char *) src0 + offset0);
+        // The last group may contain only one row. Alias its inactive lane to
+        // row zero so even speculative loads stay inside the weight buffer.
+        ax[row] = (device const block_q8_0 *) ((device char *) src0 + ((r0 + row < args.ne01) ? offset0 : 0));
     }
 
     float sumf[NR0] = { 0.f };
@@ -1163,7 +1165,7 @@ void kernel_mul_mv_t_t_impl(
     FOR_UNROLL (short row = 0; row < NR0; ++row) {
         const uint64_t offset0 = (r0 + row)*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
 
-        ax[row] = (device const T0 *) ((device char *) src0 + offset0);
+        ax[row] = (device const T0 *) ((device char *) src0 + ((r0 + row < args.ne01) ? offset0 : 0));
     }
 
     float sumf[NR0] = { 0.f };

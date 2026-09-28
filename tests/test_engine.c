@@ -36,7 +36,7 @@ static const char *create_gate_test_gguf(
 
     uint32_t magic = GGUF_MAGIC;
     uint32_t version = 3;
-    uint64_t n_kvs = 7;
+    uint64_t n_kvs = 8;
 
     fwrite(&magic, 4, 1, f);
     write_u32(f, version);
@@ -49,6 +49,11 @@ static const char *create_gate_test_gguf(
 
     char key_buf[128];
     snprintf(key_buf, sizeof(key_buf), "%s.embedding_length", arch);
+    write_str(f, key_buf);
+    write_u32(f, GGUF_TYPE_UINT32);
+    write_u32(f, 64);
+
+    snprintf(key_buf, sizeof(key_buf), "%s.feed_forward_length", arch);
     write_str(f, key_buf);
     write_u32(f, GGUF_TYPE_UINT32);
     write_u32(f, 64);
@@ -120,6 +125,150 @@ static const char *create_gate_test_gguf(
 static float calculate_rope_freq(uint32_t dim_idx, uint32_t total_dim, float freq_base) {
     float exponent = (float)(2 * dim_idx) / (float)total_dim;
     return 1.0f / powf(freq_base, exponent);
+}
+
+/* Small nonzero MLA model with a real routed-expert path and shared FFN.
+ * Construct weights directly so lifecycle tests are independent of model files. */
+static myds_metal_buffer_t *test_f32_buffer(size_t n, bool norm, uint32_t salt) {
+    myds_metal_buffer_t *buf = myds_metal_buffer_alloc(n * sizeof(float));
+    assert(buf != NULL);
+    float *v = (float *)myds_metal_buffer_data(buf);
+    for (size_t i = 0; i < n; i++) {
+        v[i] = norm ? 1.0f : (float)((int)((i * 17 + salt) % 31) - 15) * 0.002f;
+    }
+    return buf;
+}
+
+static myds_metal_buffer_t *test_zero_experts(ggml_type type, size_t n) {
+    size_t bytes = ggml_type_row_size(type, n);
+    myds_metal_buffer_t *buf = myds_metal_buffer_alloc(bytes);
+    assert(buf != NULL);
+    memset(myds_metal_buffer_data(buf), 0, bytes);
+    return buf;
+}
+
+static myds_model_t *test_prefill_model(void) {
+    myds_model_t *m = (myds_model_t *)calloc(1, sizeof(*m));
+    assert(m != NULL);
+    m->dim = m->hidden_dim = m->moe_expert_dim = 256;
+    m->vocab_size = 256;
+    m->n_layers = 1;
+    m->n_heads = m->n_out_groups = 2;
+    m->n_kv_heads = 1;
+    m->head_dim = m->kv_lora_rank = m->q_lora_rank = 32;
+    m->out_group_rank = 16;
+    m->qk_rope_head_dim = 16;
+    m->n_routed_experts = 8;
+    m->n_activated_experts = 6;
+    m->n_shared_experts = 1;
+    m->norm_eps = 1e-6f;
+    m->freq_base = 10000.0f;
+    m->freq_scale = m->routed_scaling_factor = 1.0f;
+    m->swiglu_clamp_exp = 10.0f;
+    m->is_mla = true;
+    gguf_file_t empty = {0};
+    m->tokenizer = myds_tokenizer_load(&empty);
+    assert(m->tokenizer != NULL);
+    m->tok_embeddings_type = GGML_TYPE_F32;
+    m->tok_embeddings = test_f32_buffer((size_t)m->vocab_size * m->dim, false, 5);
+    m->output_norm = test_f32_buffer(m->dim, true, 0);
+    m->output = test_f32_buffer((size_t)m->vocab_size * m->dim, false, 3);
+    m->output_type = GGML_TYPE_F32;
+    m->layers = (myds_layer_t *)calloc(1, sizeof(*m->layers));
+    assert(m->layers != NULL);
+    myds_layer_t *l = m->layers;
+    l->attn_norm = test_f32_buffer(m->dim, true, 0);
+    l->attn_q_a = test_f32_buffer((size_t)m->dim * m->q_lora_rank, false, 7);
+    l->attn_q_a_norm = test_f32_buffer(m->q_lora_rank, true, 0);
+    l->attn_q_b = test_f32_buffer((size_t)m->q_lora_rank * m->n_heads * m->head_dim, false, 11);
+    l->attn_kv = test_f32_buffer((size_t)m->dim * m->head_dim, false, 13);
+    l->attn_kv_a_norm = test_f32_buffer(m->head_dim, true, 0);
+    l->attn_sinks = test_f32_buffer(m->n_heads, false, 17);
+    l->attn_output_a = test_f32_buffer((size_t)m->head_dim * m->n_out_groups * m->out_group_rank, false, 19);
+    l->attn_output_b = test_f32_buffer((size_t)m->n_out_groups * m->out_group_rank * m->dim, false, 23);
+    l->ffn_norm = test_f32_buffer(m->dim, true, 0);
+    l->router_gate = test_f32_buffer((size_t)m->dim * m->n_routed_experts, false, 29);
+    l->ffn_gate_exps_type = l->ffn_up_exps_type = GGML_TYPE_IQ2_XXS;
+    l->ffn_down_exps_type = GGML_TYPE_Q2_K;
+    size_t n_expert_weights = (size_t)m->n_routed_experts * m->dim * m->moe_expert_dim;
+    l->ffn_gate_exps = test_zero_experts(GGML_TYPE_IQ2_XXS, n_expert_weights);
+    l->ffn_up_exps = test_zero_experts(GGML_TYPE_IQ2_XXS, n_expert_weights);
+    l->ffn_down_exps = test_zero_experts(GGML_TYPE_Q2_K, n_expert_weights);
+    l->shared_gate = test_f32_buffer((size_t)m->dim * m->moe_expert_dim, false, 31);
+    l->shared_up = test_f32_buffer((size_t)m->dim * m->moe_expert_dim, false, 37);
+    l->shared_down = test_f32_buffer((size_t)m->dim * m->moe_expert_dim, false, 41);
+    return m;
+}
+
+static void assert_prefill_matches_sequential(myds_context_t *batched, myds_context_t *reference, const char *prompt) {
+    int32_t tokens[1024];
+    int32_t n = myds_tokenizer_encode(reference->model->tokenizer, prompt, tokens, 1024, true);
+    assert(n > 0);
+    for (int32_t i = 0; i < n; i++) {
+        assert(myds_forward_token(reference, tokens[i], (uint32_t)i) >= 0);
+    }
+    uint32_t n_prompt = 0;
+    myds_stop_reason_t reason = MYDS_STOP_ERROR;
+    assert(myds_generate_ex(batched, prompt, NULL, NULL, &reason, &n_prompt, NULL));
+    assert(reason == MYDS_STOP_LENGTH || reason == MYDS_STOP_EOS);
+    assert(n_prompt == (uint32_t)n && batched->pos == (uint32_t)n);
+    const float *a = (const float *)myds_metal_buffer_data(batched->logits);
+    const float *b = (const float *)myds_metal_buffer_data(reference->logits);
+    for (uint32_t i = 0; i < batched->model->vocab_size; i++) {
+        assert(isfinite(a[i]) && isfinite(b[i]));
+        assert(fabsf(a[i] - b[i]) < 1e-5f);
+    }
+    for (uint32_t l = 0; l < batched->model->n_layers; l++) {
+        for (size_t i = 0; i < (size_t)n * batched->model->head_dim; i++) {
+            assert(fabsf(batched->k_cache[l][i] - reference->k_cache[l][i]) < 1e-5f);
+        }
+    }
+}
+
+static void test_prefill_workspace_reuse(void) {
+    myds_model_t *m = test_prefill_model();
+    myds_config_t cfg = {.max_seq_len = 1024, .max_new_tokens = 1, .temperature = 0.0f,
+                         .top_p = 1.0f, .seed = 42};
+    myds_context_t *ctx = myds_context_create(m, &cfg);
+    myds_context_t *reference = myds_context_create(m, &cfg);
+    assert(ctx && reference && ctx->prefill_chunk == NULL && ctx->prefill_capacity == 0);
+    assert_prefill_matches_sequential(ctx, reference, "abcde");
+    assert(ctx->prefill_capacity == 5);
+    myds_prefill_chunk_t *first = ctx->prefill_chunk;
+    assert_prefill_matches_sequential(ctx, reference, "abcde");
+    assert(ctx->prefill_chunk == first && ctx->prefill_capacity == 5);
+    assert_prefill_matches_sequential(ctx, reference, "abcdefghijklmnopq");
+    assert(ctx->prefill_capacity == 17 && ctx->prefill_chunk != first);
+    myds_prefill_chunk_t *larger = ctx->prefill_chunk;
+    assert_prefill_matches_sequential(ctx, reference, "abcde");
+    assert(ctx->prefill_chunk == larger && ctx->prefill_capacity == 17);
+
+    volatile int cancel = 1;
+    myds_stop_reason_t reason = MYDS_STOP_ERROR;
+    assert(myds_generate_ex(ctx, "abcdefghijklmnopqrstuv", NULL, NULL, &reason, NULL, &cancel));
+    assert(reason == MYDS_STOP_CANCELLED && ctx->pos == 0);
+    assert(ctx->prefill_chunk == larger && ctx->prefill_capacity == 17);
+    assert_prefill_matches_sequential(ctx, reference, "abcde");
+
+    char long_prompt[514];
+    memset(long_prompt, 'a', sizeof(long_prompt) - 1);
+    long_prompt[sizeof(long_prompt) - 1] = '\0';
+    assert_prefill_matches_sequential(ctx, reference, long_prompt);
+    assert(ctx->prefill_capacity == 512);
+
+    cfg.max_seq_len = 16;
+    myds_context_set_config(ctx, &cfg);
+    assert(myds_context_get_config(ctx).max_seq_len == 16);
+    cfg.max_seq_len = 2048;
+    myds_context_set_config(ctx, &cfg);
+    assert(myds_context_get_config(ctx).max_seq_len == 1024);
+    cfg.max_seq_len = 0;
+    myds_context_set_config(ctx, &cfg);
+    assert(myds_context_get_config(ctx).max_seq_len == 1024);
+    myds_context_free(reference);
+    myds_context_free(ctx);
+    myds_model_free(m);
+    printf("  [PASS] Prefill short/long/short workspace reuse, 512-token boundary, output equivalence, cancellation and KV capacity\n");
 }
 
 int main(void) {
@@ -337,11 +486,22 @@ int main(void) {
         }
         assert(kv1_nonzero);
 
+        /* Dense MLA prompts longer than four prefill tokens must use the
+         * sequential path, since chunk FFN currently requires routed MoE. */
+        cfg.max_new_tokens = 1;
+        myds_context_set_config(ctx, &cfg);
+        myds_stop_reason_t reason = MYDS_STOP_ERROR;
+        assert(myds_generate_ex(ctx, "\1\2\3\4\5", NULL, NULL, &reason, NULL, NULL));
+        assert(reason == MYDS_STOP_LENGTH || reason == MYDS_STOP_EOS);
+        assert(ctx->pos == 6 && ctx->prefill_chunk == NULL);
+
         myds_context_free(ctx);
         myds_model_free(m);
         unlink(path);
         printf("  [PASS] MLA forward pass & latent KV cache cross-attention verified\n");
     }
+
+    test_prefill_workspace_reuse();
 
     printf("====================================================\n");
     printf("   ALL ENGINE UNIT & GATE TESTS PASSED!             \n");

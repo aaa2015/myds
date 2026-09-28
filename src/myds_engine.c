@@ -3,6 +3,7 @@
 #include "myds_gguf.h"
 #include "myds_tokenizer.h"
 #include "myds_log.h"
+#include "myds_cpu.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -113,38 +114,6 @@ static void head_rms_norm_inplace(float *x, uint32_t n_head, uint32_t head_dim, 
     }
 }
 
-static void rope_tail_inplace(
-        float    *x,
-        uint32_t  n_head,
-        uint32_t  head_dim,
-        uint32_t  n_rot,
-        uint32_t  pos,
-        float     freq_base,
-        float     freq_scale,
-        bool      inverse) {
-    if (n_rot == 0 || n_rot > head_dim) return;
-    const uint32_t n_nope = head_dim - n_rot;
-    const float theta_scale = powf(freq_base, -2.0f / (float)n_rot);
-    const float sin_sign = inverse ? -1.0f : 1.0f;
-
-    for (uint32_t h = 0; h < n_head; h++) {
-        float *tail = x + (size_t)h * head_dim + n_nope;
-        float theta_extrap = (float)pos;
-
-        for (uint32_t i = 0; i < n_rot; i += 2) {
-            const float theta = freq_scale * theta_extrap;
-            const float c = cosf(theta);
-            const float s = sin_sign * sinf(theta);
-            const float x0 = tail[i + 0];
-            const float x1 = tail[i + 1];
-
-            tail[i + 0] = x0 * c - x1 * s;
-            tail[i + 1] = x0 * s + x1 * c;
-
-            theta_extrap *= theta_scale;
-        }
-    }
-}
 
 typedef struct {
     float             *out_heads;
@@ -902,6 +871,8 @@ fail:
 
 void myds_model_free(myds_model_t *m) {
     if (!m) return;
+    /* An error may leave shared-expert commands in flight over mmap weights. */
+    (void)myds_metal_synchronize();
     if (m->tok_embeddings) myds_metal_buffer_free(m->tok_embeddings);
     if (m->output_norm)    myds_metal_buffer_free(m->output_norm);
     if (m->output && m->output != m->tok_embeddings) myds_metal_buffer_free(m->output);
@@ -1017,6 +988,8 @@ static void quickselect_cand_desc(myds_cand_t *arr, int l, int r, int k) {
     }
 }
 
+static void free_prefill_chunk(myds_prefill_chunk_t *chunk);
+
 myds_context_t *myds_context_create(myds_model_t *model, const myds_config_t *cfg) {
     if (!model) return NULL;
 
@@ -1035,6 +1008,7 @@ myds_context_t *myds_context_create(myds_model_t *model, const myds_config_t *cf
     }
     if (ctx->cfg.max_seq_len == 0) ctx->cfg.max_seq_len = 4096;
 
+    ctx->kv_capacity = ctx->cfg.max_seq_len;
     srand(ctx->cfg.seed);
 
     uint32_t dim = model->dim;
@@ -1114,6 +1088,8 @@ myds_context_t *myds_context_create(myds_model_t *model, const myds_config_t *cf
 
 void myds_context_free(myds_context_t *ctx) {
     if (!ctx) return;
+    (void)myds_metal_synchronize();
+    free_prefill_chunk(ctx->prefill_chunk);
     if (ctx->x)            myds_metal_buffer_free(ctx->x);
     if (ctx->x_norm)       myds_metal_buffer_free(ctx->x_norm);
     if (ctx->q)            myds_metal_buffer_free(ctx->q);
@@ -1171,6 +1147,10 @@ myds_config_t myds_context_get_config(const myds_context_t *ctx) {
 void myds_context_set_config(myds_context_t *ctx, const myds_config_t *cfg) {
     if (!ctx || !cfg) return;
     ctx->cfg = *cfg;
+    /* Changing sampling options cannot grow the already allocated KV buffers. */
+    if (ctx->cfg.max_seq_len == 0 || ctx->cfg.max_seq_len > ctx->kv_capacity) {
+        ctx->cfg.max_seq_len = ctx->kv_capacity;
+    }
 }
 
 int32_t myds_sample_next_token(
@@ -1381,7 +1361,7 @@ static int execute_ffn_layer(
         /* Enqueue router_gate in Batch 2 (takes ffn_norm_out as input) */
         if (!myds_metal_gemv(ctx->router_logits, layer->router_gate, ctx->ffn_norm_out, n_routed, dim, layer->router_gate_type)) {
             MYDS_LOG_E("Forward failed: GEMV for router_gate at layer %u failed", l);
-            myds_metal_commit_batch();
+            (void)myds_metal_commit_batch();
             return 0;
         }
 
@@ -1389,7 +1369,7 @@ static int execute_ffn_layer(
         uint64_t router_event = 0;
         if (!myds_metal_signal_event(&router_event)) {
             MYDS_LOG_E("Forward failed: signal router_event at layer %u failed", l);
-            myds_metal_commit_batch();
+            (void)myds_metal_commit_batch();
             return 0;
         }
 
@@ -1399,13 +1379,13 @@ static int execute_ffn_layer(
             if (!myds_metal_gemv(ctx->shared_gate_out, layer->shared_gate, ctx->ffn_norm_out, exp_dim, dim, layer->shared_gate_type) ||
                 !myds_metal_gemv(ctx->shared_up_out, layer->shared_up, ctx->ffn_norm_out, exp_dim, dim, layer->shared_up_type)) {
                 MYDS_LOG_E("Forward failed: GEMV for shared_gate/up at layer %u failed", l);
-                myds_metal_commit_batch();
+                (void)myds_metal_commit_batch();
                 return 0;
             }
             myds_metal_swiglu(ctx->shared_swiglu_out, ctx->shared_gate_out, ctx->shared_up_out, exp_dim);
             if (!myds_metal_gemv(ctx->shared_out, layer->shared_down, ctx->shared_swiglu_out, dim, exp_dim, layer->shared_down_type)) {
                 MYDS_LOG_E("Forward failed: GEMV for shared_down at layer %u failed", l);
-                myds_metal_commit_batch();
+                (void)myds_metal_commit_batch();
                 return 0;
             }
             myds_metal_signal_event(&shexp_event);
@@ -1459,7 +1439,7 @@ static int execute_ffn_layer(
                 layer->ffn_down_exps_type,
                 m->swiglu_clamp_exp)) {
             MYDS_LOG_E("Forward failed: routed MoE execution failed at layer %u", l);
-            myds_metal_commit_batch();
+            (void)myds_metal_commit_batch();
             return 0;
         }
 
@@ -1474,7 +1454,7 @@ static int execute_ffn_layer(
          * layer l FFN residual add and layer l+1 pre-attention RMSNorm + QKV projections
          * execute in the same Metal command buffer without CPU roundtrip. */
         if (do_ffn_prof) {
-            myds_metal_commit_batch();
+            if (!myds_metal_commit_batch()) return 0;
             struct timeval tf3;
             gettimeofday(&tf3, NULL);
             double ms_gate = (tf1.tv_sec - tf0.tv_sec)*1000.0 + (tf1.tv_usec - tf0.tv_usec)/1000.0;
@@ -1490,13 +1470,13 @@ static int execute_ffn_layer(
         if (!myds_metal_gemv(ctx->gate_out, layer->ffn_gate, ctx->ffn_norm_out, hidden_dim, dim, layer->ffn_gate_type) ||
             !myds_metal_gemv(ctx->up_out, layer->ffn_up, ctx->ffn_norm_out, hidden_dim, dim, layer->ffn_up_type)) {
             MYDS_LOG_E("Forward failed: GEMV for ffn_gate/up at layer %u failed", l);
-            myds_metal_commit_batch();
+            (void)myds_metal_commit_batch();
             return 0;
         }
         myds_metal_swiglu(ctx->swiglu_out, ctx->gate_out, ctx->up_out, hidden_dim);
         if (!myds_metal_gemv(ctx->ffn_out, layer->ffn_down, ctx->swiglu_out, dim, hidden_dim, layer->ffn_down_type)) {
             MYDS_LOG_E("Forward failed: GEMV for ffn_down at layer %u failed", l);
-            myds_metal_commit_batch();
+            (void)myds_metal_commit_batch();
             return 0;
         }
         myds_metal_add(ctx->x, ctx->x, ctx->ffn_out, dim);
@@ -1505,20 +1485,20 @@ static int execute_ffn_layer(
         if (!myds_metal_gemv(ctx->shared_gate_out, layer->shared_gate, ctx->ffn_norm_out, exp_dim, dim, layer->shared_gate_type) ||
             !myds_metal_gemv(ctx->shared_up_out, layer->shared_up, ctx->ffn_norm_out, exp_dim, dim, layer->shared_up_type)) {
             MYDS_LOG_E("Forward failed: GEMV for shared_gate/up at layer %u failed", l);
-            myds_metal_commit_batch();
+            (void)myds_metal_commit_batch();
             return 0;
         }
         myds_metal_swiglu(ctx->shared_swiglu_out, ctx->shared_gate_out, ctx->shared_up_out, exp_dim);
         if (!myds_metal_gemv(ctx->shared_out, layer->shared_down, ctx->shared_swiglu_out, dim, exp_dim, layer->shared_down_type)) {
             MYDS_LOG_E("Forward failed: GEMV for shared_down at layer %u failed", l);
-            myds_metal_commit_batch();
+            (void)myds_metal_commit_batch();
             return 0;
         }
         myds_metal_add(ctx->x, ctx->x, ctx->shared_out, dim);
     }
 
     if (do_ffn_prof) {
-        myds_metal_commit_batch();
+        if (!myds_metal_commit_batch()) return 0;
     }
 
     if (do_ffn_prof && tf1.tv_sec > 0) {
@@ -1569,37 +1549,37 @@ static int execute_transformer_layer(myds_context_t *ctx, uint32_t l, uint32_t p
 
         if (!myds_metal_gemv(ctx->qr, layer->attn_q_a, ctx->x_norm, m->q_lora_rank, dim, layer->attn_q_a_type)) {
             MYDS_LOG_E("Forward failed: GEMV for attn_q_a at layer %u failed", l);
-            myds_metal_commit_batch();
+            (void)myds_metal_commit_batch();
             return 0;
         }
 
         if (!myds_metal_gemv(ctx->kv_act, layer->attn_kv, ctx->x_norm, m->head_dim, dim, layer->attn_kv_type)) {
             MYDS_LOG_E("Forward failed: GEMV for attn_kv at layer %u failed", l);
-            myds_metal_commit_batch();
+            (void)myds_metal_commit_batch();
             return 0;
         }
 
         /* GPU Query LoRA RMSNorm */
         if (!myds_metal_rmsnorm(ctx->qr_norm, ctx->qr, layer->attn_q_a_norm, m->q_lora_rank, m->norm_eps)) {
             MYDS_LOG_E("Forward failed: rmsnorm for qr_norm at layer %u failed", l);
-            myds_metal_commit_batch();
+            (void)myds_metal_commit_batch();
             return 0;
         }
 
         /* Query up-projection: qr_norm (q_lora_rank) -> q (n_heads * head_dim) */
         if (!myds_metal_gemv(ctx->q, layer->attn_q_b, ctx->qr_norm, m->n_heads * m->head_dim, m->q_lora_rank, layer->attn_q_b_type)) {
             MYDS_LOG_E("Forward failed: GEMV for attn_q_b at layer %u failed", l);
-            myds_metal_commit_batch();
+            (void)myds_metal_commit_batch();
             return 0;
         }
 
         /* GPU Key/Value RMSNorm */
         if (!myds_metal_rmsnorm(ctx->kv_act, ctx->kv_act, layer->attn_kv_a_norm, m->head_dim, m->norm_eps)) {
             MYDS_LOG_E("Forward failed: rmsnorm for kv_act at layer %u failed", l);
-            myds_metal_commit_batch();
+            (void)myds_metal_commit_batch();
             return 0;
         }
-        myds_metal_commit_batch();
+        if (!myds_metal_commit_batch()) return 0;
         if (do_prof) gettimeofday(&t1, NULL);
 
         float *qv = (float *)myds_metal_buffer_data(ctx->q);
@@ -1609,8 +1589,8 @@ static int execute_transformer_layer(myds_context_t *ctx, uint32_t l, uint32_t p
         if (do_prof) gettimeofday(&t2, NULL);
 
         /* Tail RoPE on Q (all heads) and KV (1 head) */
-        rope_tail_inplace(qv, m->n_heads, m->head_dim, m->qk_rope_head_dim, pos, m->freq_base, m->freq_scale, false);
-        rope_tail_inplace(kv_v, 1, m->head_dim, m->qk_rope_head_dim, pos, m->freq_base, m->freq_scale, false);
+        myds_rope_tail_inplace(qv, m->n_heads, m->head_dim, m->qk_rope_head_dim, pos, m->freq_base, m->freq_scale, false);
+        myds_rope_tail_inplace(kv_v, 1, m->head_dim, m->qk_rope_head_dim, pos, m->freq_base, m->freq_scale, false);
 
         /* Push to latent KV cache: 512 floats per token per layer */
         memcpy(ctx->k_cache[l] + (size_t)pos * m->head_dim, kv_v, m->head_dim * sizeof(float));
@@ -1622,7 +1602,7 @@ static int execute_transformer_layer(myds_context_t *ctx, uint32_t l, uint32_t p
         if (do_prof) gettimeofday(&t3, NULL);
 
         /* Inverse RoPE on attention output heads tail */
-        rope_tail_inplace(heads_v, m->n_heads, m->head_dim, m->qk_rope_head_dim, pos, m->freq_base, m->freq_scale, true);
+        myds_rope_tail_inplace(heads_v, m->n_heads, m->head_dim, m->qk_rope_head_dim, pos, m->freq_base, m->freq_scale, true);
 
         /* Batch 2: Attention output down-projection + up-projection + residual add + Pre-FFN RMSNorm + Router GEMV */
         myds_metal_begin_batch();
@@ -1630,14 +1610,14 @@ static int execute_transformer_layer(myds_context_t *ctx, uint32_t l, uint32_t p
         if (!myds_metal_attn_output_a(ctx->attn_low, layer->attn_output_a, ctx->attn_heads,
                                       m->n_out_groups, group_dim, m->out_group_rank, layer->attn_output_a_type)) {
             MYDS_LOG_E("Forward failed: attn_output_a at layer %u failed", l);
-            myds_metal_commit_batch();
+            (void)myds_metal_commit_batch();
             return 0;
         }
         if (do_prof) gettimeofday(&t4, NULL);
 
         if (!myds_metal_gemv(ctx->attn_out, layer->attn_output_b, ctx->attn_low, dim, m->n_out_groups * m->out_group_rank, layer->attn_output_b_type)) {
             MYDS_LOG_E("Forward failed: GEMV for attn_output_b at layer %u failed", l);
-            myds_metal_commit_batch();
+            (void)myds_metal_commit_batch();
             return 0;
         }
         myds_metal_add(ctx->x, ctx->x, ctx->attn_out, dim);
@@ -1682,25 +1662,25 @@ static int execute_transformer_layer(myds_context_t *ctx, uint32_t l, uint32_t p
         if (layer->attn_q) {
             if (!myds_metal_gemv(ctx->q, layer->attn_q, ctx->x_norm, n_heads * head_dim, dim, layer->attn_q_type)) {
                 MYDS_LOG_E("Forward failed: GEMV for attn_q at layer %u failed", l);
-                myds_metal_commit_batch();
+                (void)myds_metal_commit_batch();
                 return 0;
             }
         }
         if (layer->attn_k) {
             if (!myds_metal_gemv(ctx->k, layer->attn_k, ctx->x_norm, n_kv_heads * head_dim, dim, layer->attn_k_type)) {
                 MYDS_LOG_E("Forward failed: GEMV for attn_k at layer %u failed", l);
-                myds_metal_commit_batch();
+                (void)myds_metal_commit_batch();
                 return 0;
             }
         }
         if (layer->attn_v) {
             if (!myds_metal_gemv(ctx->v, layer->attn_v, ctx->x_norm, n_kv_heads * head_dim, dim, layer->attn_v_type)) {
                 MYDS_LOG_E("Forward failed: GEMV for attn_v at layer %u failed", l);
-                myds_metal_commit_batch();
+                (void)myds_metal_commit_batch();
                 return 0;
             }
         }
-        myds_metal_commit_batch();
+        if (!myds_metal_commit_batch()) return 0;
 
         /* Decoupled RoPE on Q & K */
         myds_metal_rope(ctx->q, ctx->k, n_heads, head_dim, pos, m->freq_base, m->freq_scale);
@@ -1764,7 +1744,7 @@ static int execute_transformer_layer(myds_context_t *ctx, uint32_t l, uint32_t p
         if (layer->attn_o) {
             if (!myds_metal_gemv(ctx->ffn_out, layer->attn_o, ctx->attn_out, dim, n_heads * head_dim, layer->attn_o_type)) {
                 MYDS_LOG_E("Forward failed: GEMV for attn_o at layer %u failed", l);
-                myds_metal_commit_batch();
+                (void)myds_metal_commit_batch();
                 return 0;
             }
             /* Residual connection: x = x + attn_output */
@@ -1798,6 +1778,8 @@ static int32_t myds_forward_token_internal(myds_context_t *ctx, int32_t token_id
         } else if (m->tok_embeddings_type == GGML_TYPE_F16) {
             const uint16_t *emb = (const uint16_t *)myds_metal_buffer_data(m->tok_embeddings);
             const uint16_t *row = emb + (size_t)token_id * dim;
+            /* TODO: the legacy path interprets these bits as BF16. Validate a
+             * true F16 conversion against model reference outputs separately. */
             for (uint32_t i = 0; i < dim; i++) {
                 uint32_t w = (uint32_t)row[i] << 16;
                 memcpy(&xv[i], &w, sizeof(float));
@@ -1815,8 +1797,7 @@ static int32_t myds_forward_token_internal(myds_context_t *ctx, int32_t token_id
     }
 
     if (!need_logits) {
-        myds_metal_commit_batch();
-        return 0;
+        return myds_metal_commit_batch() ? 0 : -1;
     }
 
     /* 3. Final RMSNorm & LM Head Logits Batch */
@@ -1828,7 +1809,7 @@ static int32_t myds_forward_token_internal(myds_context_t *ctx, int32_t token_id
     if (m->output_norm) {
         myds_metal_rmsnorm(ctx->x_norm, ctx->x, m->output_norm, dim, m->norm_eps);
     } else {
-        myds_metal_commit_batch();
+        if (!myds_metal_commit_batch()) return -1;
         memcpy(myds_metal_buffer_data(ctx->x_norm), xv, dim * sizeof(float));
         myds_metal_begin_batch();
     }
@@ -1836,11 +1817,11 @@ static int32_t myds_forward_token_internal(myds_context_t *ctx, int32_t token_id
     if (m->output) {
         if (!myds_metal_gemv(ctx->logits, m->output, ctx->x_norm, m->vocab_size, dim, m->output_type)) {
             MYDS_LOG_E("Forward failed: LM head GEMV failed");
-            myds_metal_commit_batch();
+            (void)myds_metal_commit_batch();
             return -1;
         }
     }
-    myds_metal_commit_batch();
+    if (!myds_metal_commit_batch()) return -1;
     if (do_head_prof) {
         gettimeofday(&t_lm1, NULL);
         gettimeofday(&t_sp0, NULL);
@@ -1866,7 +1847,8 @@ int32_t myds_forward_token(myds_context_t *ctx, int32_t token_id, uint32_t pos) 
 
 #define MYDS_PREFILL_CHUNK_SIZE 512
 
-typedef struct {
+struct myds_prefill_chunk {
+    uint32_t capacity;
     /* Contiguous unified chunk buffers for batched GEMM */
     myds_metal_buffer_t *x_buf;
     myds_metal_buffer_t *x_norm_buf;
@@ -1908,71 +1890,115 @@ typedef struct {
     myds_metal_buffer_t *moe_up[MYDS_PREFILL_CHUNK_SIZE];
     myds_metal_buffer_t *moe_mid[MYDS_PREFILL_CHUNK_SIZE];
     myds_metal_buffer_t *moe_down[MYDS_PREFILL_CHUNK_SIZE];
-} myds_prefill_chunk_t;
+};
 
-static myds_prefill_chunk_t *create_prefill_chunk(myds_model_t *model) {
+static myds_prefill_chunk_t *create_prefill_chunk(myds_model_t *model, uint32_t capacity) {
+    if (!model || capacity == 0 || capacity > MYDS_PREFILL_CHUNK_SIZE) return NULL;
     myds_prefill_chunk_t *chunk = (myds_prefill_chunk_t *)calloc(1, sizeof(myds_prefill_chunk_t));
     if (!chunk) return NULL;
     uint32_t dim = model->dim;
     uint32_t exp_dim = model->moe_expert_dim > 0 ? model->moe_expert_dim : 2304;
     uint32_t n_routed = model->n_routed_experts > 0 ? model->n_routed_experts : 384;
     uint32_t n_active = model->n_activated_experts > 0 ? model->n_activated_experts : 6;
-    size_t C = MYDS_PREFILL_CHUNK_SIZE;
+    size_t C = capacity;
+    chunk->capacity = capacity;
 
     /* 1. Allocate contiguous chunk tensors */
     chunk->x_buf = myds_metal_buffer_alloc(C * dim * sizeof(float));
+    if (!chunk->x_buf) goto fail;
     chunk->x_norm_buf = myds_metal_buffer_alloc(C * dim * sizeof(float));
+    if (!chunk->x_norm_buf) goto fail;
     chunk->attn_out_buf = myds_metal_buffer_alloc(C * dim * sizeof(float));
+    if (!chunk->attn_out_buf) goto fail;
     chunk->ffn_norm_out_buf = myds_metal_buffer_alloc(C * dim * sizeof(float));
+    if (!chunk->ffn_norm_out_buf) goto fail;
     if (model->is_mla) {
         chunk->qr_buf = myds_metal_buffer_alloc(C * model->q_lora_rank * sizeof(float));
+        if (!chunk->qr_buf) goto fail;
         chunk->qr_norm_buf = myds_metal_buffer_alloc(C * model->q_lora_rank * sizeof(float));
+        if (!chunk->qr_norm_buf) goto fail;
         chunk->q_buf = myds_metal_buffer_alloc(C * model->n_heads * model->head_dim * sizeof(float));
+        if (!chunk->q_buf) goto fail;
         chunk->kv_act_buf = myds_metal_buffer_alloc(C * model->head_dim * sizeof(float));
+        if (!chunk->kv_act_buf) goto fail;
         chunk->attn_heads_buf = myds_metal_buffer_alloc(C * model->n_heads * model->head_dim * sizeof(float));
+        if (!chunk->attn_heads_buf) goto fail;
         chunk->attn_low_buf = myds_metal_buffer_alloc(C * model->n_out_groups * model->out_group_rank * sizeof(float));
+        if (!chunk->attn_low_buf) goto fail;
     }
     chunk->router_logits_buf = myds_metal_buffer_alloc(C * n_routed * sizeof(float));
+    if (!chunk->router_logits_buf) goto fail;
     chunk->shared_gate_out_buf = myds_metal_buffer_alloc(C * exp_dim * sizeof(float));
+    if (!chunk->shared_gate_out_buf) goto fail;
     chunk->shared_up_out_buf = myds_metal_buffer_alloc(C * exp_dim * sizeof(float));
+    if (!chunk->shared_up_out_buf) goto fail;
     chunk->shared_swiglu_out_buf = myds_metal_buffer_alloc(C * exp_dim * sizeof(float));
+    if (!chunk->shared_swiglu_out_buf) goto fail;
     chunk->shared_out_buf = myds_metal_buffer_alloc(C * dim * sizeof(float));
+    if (!chunk->shared_out_buf) goto fail;
     chunk->moe_out_buf = myds_metal_buffer_alloc(C * dim * sizeof(float));
+    if (!chunk->moe_out_buf) goto fail;
 
     /* 2. Create subviews for per-token workers and allocate scratch buffers */
     for (size_t t = 0; t < C; t++) {
         chunk->x[t] = myds_metal_buffer_sub_view(chunk->x_buf, t * dim * sizeof(float), dim * sizeof(float));
+        if (!chunk->x[t]) goto fail;
         chunk->x_norm[t] = myds_metal_buffer_sub_view(chunk->x_norm_buf, t * dim * sizeof(float), dim * sizeof(float));
+        if (!chunk->x_norm[t]) goto fail;
         chunk->attn_out[t] = myds_metal_buffer_sub_view(chunk->attn_out_buf, t * dim * sizeof(float), dim * sizeof(float));
+        if (!chunk->attn_out[t]) goto fail;
         chunk->ffn_norm_out[t] = myds_metal_buffer_sub_view(chunk->ffn_norm_out_buf, t * dim * sizeof(float), dim * sizeof(float));
+        if (!chunk->ffn_norm_out[t]) goto fail;
         if (model->is_mla) {
             chunk->qr[t] = myds_metal_buffer_sub_view(chunk->qr_buf, t * model->q_lora_rank * sizeof(float), model->q_lora_rank * sizeof(float));
+            if (!chunk->qr[t]) goto fail;
             chunk->qr_norm[t] = myds_metal_buffer_sub_view(chunk->qr_norm_buf, t * model->q_lora_rank * sizeof(float), model->q_lora_rank * sizeof(float));
+            if (!chunk->qr_norm[t]) goto fail;
             chunk->q[t] = myds_metal_buffer_sub_view(chunk->q_buf, t * model->n_heads * model->head_dim * sizeof(float), model->n_heads * model->head_dim * sizeof(float));
+            if (!chunk->q[t]) goto fail;
             chunk->kv_act[t] = myds_metal_buffer_sub_view(chunk->kv_act_buf, t * model->head_dim * sizeof(float), model->head_dim * sizeof(float));
+            if (!chunk->kv_act[t]) goto fail;
             chunk->attn_heads[t] = myds_metal_buffer_sub_view(chunk->attn_heads_buf, t * model->n_heads * model->head_dim * sizeof(float), model->n_heads * model->head_dim * sizeof(float));
+            if (!chunk->attn_heads[t]) goto fail;
             chunk->attn_low[t] = myds_metal_buffer_sub_view(chunk->attn_low_buf, t * model->n_out_groups * model->out_group_rank * sizeof(float), model->n_out_groups * model->out_group_rank * sizeof(float));
+            if (!chunk->attn_low[t]) goto fail;
         }
         chunk->router_logits[t] = myds_metal_buffer_sub_view(chunk->router_logits_buf, t * n_routed * sizeof(float), n_routed * sizeof(float));
+        if (!chunk->router_logits[t]) goto fail;
         chunk->shared_gate_out[t] = myds_metal_buffer_sub_view(chunk->shared_gate_out_buf, t * exp_dim * sizeof(float), exp_dim * sizeof(float));
+        if (!chunk->shared_gate_out[t]) goto fail;
         chunk->shared_up_out[t] = myds_metal_buffer_sub_view(chunk->shared_up_out_buf, t * exp_dim * sizeof(float), exp_dim * sizeof(float));
+        if (!chunk->shared_up_out[t]) goto fail;
         chunk->shared_swiglu_out[t] = myds_metal_buffer_sub_view(chunk->shared_swiglu_out_buf, t * exp_dim * sizeof(float), exp_dim * sizeof(float));
+        if (!chunk->shared_swiglu_out[t]) goto fail;
         chunk->shared_out[t] = myds_metal_buffer_sub_view(chunk->shared_out_buf, t * dim * sizeof(float), dim * sizeof(float));
+        if (!chunk->shared_out[t]) goto fail;
         chunk->moe_out[t] = myds_metal_buffer_sub_view(chunk->moe_out_buf, t * dim * sizeof(float), dim * sizeof(float));
+        if (!chunk->moe_out[t]) goto fail;
 
         chunk->selected_ids[t] = myds_metal_buffer_alloc(n_active * sizeof(int32_t));
+        if (!chunk->selected_ids[t]) goto fail;
         chunk->selected_weights[t] = myds_metal_buffer_alloc(n_active * sizeof(float));
+        if (!chunk->selected_weights[t]) goto fail;
         chunk->moe_gate[t] = myds_metal_buffer_alloc(n_active * exp_dim * sizeof(float));
+        if (!chunk->moe_gate[t]) goto fail;
         chunk->moe_up[t] = myds_metal_buffer_alloc(n_active * exp_dim * sizeof(float));
+        if (!chunk->moe_up[t]) goto fail;
         chunk->moe_mid[t] = myds_metal_buffer_alloc(n_active * exp_dim * sizeof(float));
-        chunk->moe_down[t] = myds_metal_buffer_alloc(dim * sizeof(float));
+        if (!chunk->moe_mid[t]) goto fail;
+        chunk->moe_down[t] = myds_metal_buffer_alloc((size_t)n_active * dim * sizeof(float));
+        if (!chunk->moe_down[t]) goto fail;
     }
     return chunk;
+
+fail:
+    free_prefill_chunk(chunk);
+    return NULL;
 }
 
 static void free_prefill_chunk(myds_prefill_chunk_t *chunk) {
     if (!chunk) return;
-    for (int t = 0; t < MYDS_PREFILL_CHUNK_SIZE; t++) {
+    for (uint32_t t = 0; t < chunk->capacity; t++) {
         if (chunk->x[t]) myds_metal_buffer_free(chunk->x[t]);
         if (chunk->x_norm[t]) myds_metal_buffer_free(chunk->x_norm[t]);
         if (chunk->attn_out[t]) myds_metal_buffer_free(chunk->attn_out[t]);
@@ -2045,8 +2071,8 @@ static void chunk_prep_worker(void *context, size_t t) {
     head_rms_norm_inplace(qv, job->n_heads, job->head_dim, job->norm_eps);
 
     float *kv_v = (float *)myds_metal_buffer_data(job->chunk->kv_act[t]);
-    rope_tail_inplace(qv, job->n_heads, job->head_dim, job->qk_rope_head_dim, pos, job->freq_base, job->freq_scale, false);
-    rope_tail_inplace(kv_v, 1, job->head_dim, job->qk_rope_head_dim, pos, job->freq_base, job->freq_scale, false);
+    myds_rope_tail_inplace(qv, job->n_heads, job->head_dim, job->qk_rope_head_dim, pos, job->freq_base, job->freq_scale, false);
+    myds_rope_tail_inplace(kv_v, 1, job->head_dim, job->qk_rope_head_dim, pos, job->freq_base, job->freq_scale, false);
 
     memcpy(job->ctx->k_cache[job->l] + (size_t)pos * job->head_dim, kv_v, job->head_dim * sizeof(float));
 }
@@ -2055,7 +2081,7 @@ static void chunk_post_rope_worker(void *context, size_t t) {
     const chunk_prep_job_t *job = (const chunk_prep_job_t *)context;
     uint32_t pos = job->cur_pos + (uint32_t)t;
     float *heads_v = (float *)myds_metal_buffer_data(job->chunk->attn_heads[t]);
-    rope_tail_inplace(heads_v, job->n_heads, job->head_dim, job->qk_rope_head_dim, pos, job->freq_base, job->freq_scale, true);
+    myds_rope_tail_inplace(heads_v, job->n_heads, job->head_dim, job->qk_rope_head_dim, pos, job->freq_base, job->freq_scale, true);
 }
 
 typedef struct {
@@ -2132,11 +2158,10 @@ static inline bool chunk_linear_proj(
     uint32_t chunk_len,
     int type,
     bool force_gemv) {
+    (void)dst_vecs;
+    (void)src_vecs;
     if (force_gemv) {
-        for (uint32_t t = 0; t < chunk_len; t++) {
-            if (!myds_metal_gemv(dst_vecs[t], W, src_vecs[t], d_out, d_in, type)) return false;
-        }
-        return true;
+        return myds_metal_gemv_batch(dst_buf, W, src_buf, d_out, d_in, chunk_len, type);
     }
     return myds_metal_mul_mm(dst_buf, W, src_buf, d_out, d_in, chunk_len, type);
 }
@@ -2199,7 +2224,7 @@ static int execute_prefill_chunk_layer(
         !chunk_linear_proj(chunk->kv_act, chunk->kv_act_buf, layer->attn_kv, chunk->x_norm, chunk->x_norm_buf, m->head_dim, dim, chunk_len, layer->attn_kv_type, !use_mm_qa)) {
         MYDS_LOG_E("Prefill chunk Batch 1 Q_a/KV failed at layer %u", l);
         myds_metal_set_auto_barrier(1);
-        myds_metal_commit_batch();
+        (void)myds_metal_commit_batch();
         return 0;
     }
     myds_metal_barrier();
@@ -2210,7 +2235,7 @@ static int execute_prefill_chunk_layer(
             !myds_metal_rmsnorm(chunk->kv_act[t], chunk->kv_act[t], layer->attn_kv_a_norm, m->head_dim, m->norm_eps)) {
             MYDS_LOG_E("Prefill chunk Batch 1 norm failed at layer %u", l);
             myds_metal_set_auto_barrier(1);
-            myds_metal_commit_batch();
+            (void)myds_metal_commit_batch();
             return 0;
         }
     }
@@ -2220,10 +2245,13 @@ static int execute_prefill_chunk_layer(
     if (!chunk_linear_proj(chunk->q, chunk->q_buf, layer->attn_q_b, chunk->qr_norm, chunk->qr_norm_buf, m->n_heads * m->head_dim, m->q_lora_rank, chunk_len, layer->attn_q_b_type, !use_mm_qb)) {
         MYDS_LOG_E("Prefill chunk Batch 1 Q_b failed at layer %u", l);
         myds_metal_set_auto_barrier(1);
-        myds_metal_commit_batch();
+        (void)myds_metal_commit_batch();
         return 0;
     }
-    myds_metal_commit_batch();
+    if (!myds_metal_commit_batch()) {
+        myds_metal_set_auto_barrier(1);
+        return 0;
+    }
     if (do_prof) gettimeofday(&tp1, NULL);
 
     /* Step 2: CPU Attention & RoPE across chunk tokens (parallelized across tokens with full core cache locality) */
@@ -2268,7 +2296,7 @@ static int execute_prefill_chunk_layer(
                                       m->n_out_groups, group_dim, m->out_group_rank, layer->attn_output_a_type)) {
             MYDS_LOG_E("Prefill chunk Batch 2 out_a failed at layer %u", l);
             myds_metal_set_auto_barrier(1);
-            myds_metal_commit_batch();
+            (void)myds_metal_commit_batch();
             return 0;
         }
     }
@@ -2278,7 +2306,7 @@ static int execute_prefill_chunk_layer(
     if (!chunk_linear_proj(chunk->attn_out, chunk->attn_out_buf, layer->attn_output_b, chunk->attn_low, chunk->attn_low_buf, dim, m->n_out_groups * m->out_group_rank, chunk_len, layer->attn_output_b_type, !use_mm_outb)) {
         MYDS_LOG_E("Prefill chunk Batch 2 out_b failed at layer %u", l);
         myds_metal_set_auto_barrier(1);
-        myds_metal_commit_batch();
+        (void)myds_metal_commit_batch();
         return 0;
     }
     myds_metal_barrier();
@@ -2301,7 +2329,7 @@ static int execute_prefill_chunk_layer(
     if (!chunk_linear_proj(chunk->router_logits, chunk->router_logits_buf, layer->router_gate, chunk->ffn_norm_out, chunk->ffn_norm_out_buf, n_routed, dim, chunk_len, layer->router_gate_type, !use_mm_router)) {
         MYDS_LOG_E("Prefill chunk router_gate failed at layer %u", l);
         myds_metal_set_auto_barrier(1);
-        myds_metal_commit_batch();
+        (void)myds_metal_commit_batch();
         return 0;
     }
     if (layer->shared_gate && layer->shared_up && chunk->shared_out_buf) {
@@ -2309,7 +2337,7 @@ static int execute_prefill_chunk_layer(
             !chunk_linear_proj(chunk->shared_up_out, chunk->shared_up_out_buf, layer->shared_up, chunk->ffn_norm_out, chunk->ffn_norm_out_buf, exp_dim, dim, chunk_len, layer->shared_up_type, !use_mm_sh_up)) {
             MYDS_LOG_E("Prefill chunk shared_gate/up failed at layer %u", l);
             myds_metal_set_auto_barrier(1);
-            myds_metal_commit_batch();
+            (void)myds_metal_commit_batch();
             return 0;
         }
     }
@@ -2321,7 +2349,10 @@ static int execute_prefill_chunk_layer(
             myds_metal_swiglu(chunk->shared_swiglu_out[t], chunk->shared_gate_out[t], chunk->shared_up_out[t], exp_dim);
         }
     }
-    myds_metal_commit_batch();
+    if (!myds_metal_commit_batch()) {
+        myds_metal_set_auto_barrier(1);
+        return 0;
+    }
     if (do_prof) gettimeofday(&tp3, NULL);
 
     /* Step 4: CPU Router Top-6 selection for all chunk tokens (parallel across 24 cores) */
@@ -2359,7 +2390,7 @@ static int execute_prefill_chunk_layer(
                 m->swiglu_clamp_exp)) {
             MYDS_LOG_E("Prefill chunk routed MoE failed at layer %u", l);
             myds_metal_set_auto_barrier(1);
-            myds_metal_commit_batch();
+            (void)myds_metal_commit_batch();
             return 0;
         }
     }
@@ -2370,7 +2401,7 @@ static int execute_prefill_chunk_layer(
         if (!chunk_linear_proj(chunk->shared_out, chunk->shared_out_buf, layer->shared_down, chunk->shared_swiglu_out, chunk->shared_swiglu_out_buf, dim, exp_dim, chunk_len, layer->shared_down_type, !use_mm_sh_down)) {
             MYDS_LOG_E("Prefill chunk shared_down failed at layer %u", l);
             myds_metal_set_auto_barrier(1);
-            myds_metal_commit_batch();
+            (void)myds_metal_commit_batch();
             return 0;
         }
     }
@@ -2379,9 +2410,13 @@ static int execute_prefill_chunk_layer(
     /* 3.3 Final residual addition */
     if (layer->shared_gate && layer->shared_up && layer->shared_down && chunk->shared_out_buf) {
         myds_metal_add(chunk->moe_out_buf, chunk->moe_out_buf, chunk->shared_out_buf, chunk_len * dim);
+        myds_metal_barrier();
     }
     myds_metal_add(chunk->x_buf, chunk->x_buf, chunk->moe_out_buf, chunk_len * dim);
-    myds_metal_commit_batch();
+    if (!myds_metal_commit_batch()) {
+        myds_metal_set_auto_barrier(1);
+        return 0;
+    }
     myds_metal_set_auto_barrier(1);
 
     if (do_prof) {
@@ -2398,13 +2433,27 @@ static int execute_prefill_chunk_layer(
     return 1;
 }
 
+/* The batched implementation requires routed MLA in every layer. Mixed/dense
+ * models retain the general sequential path instead of dispatching absent weights. */
+static bool model_supports_chunk_prefill(const myds_model_t *m) {
+    if (!m->is_mla || m->n_routed_experts == 0 || m->n_activated_experts == 0) return false;
+    for (uint32_t l = 0; l < m->n_layers; l++) {
+        const myds_layer_t *layer = &m->layers[l];
+        if (!layer->attn_q_a || !layer->attn_q_a_norm || !layer->attn_q_b ||
+            !layer->attn_kv || !layer->attn_kv_a_norm || !layer->attn_output_a ||
+            !layer->attn_output_b || !layer->router_gate || !layer->ffn_gate_exps ||
+            !layer->ffn_up_exps || !layer->ffn_down_exps) return false;
+    }
+    return true;
+}
+
 static int myds_prefill_tokens(myds_context_t *ctx, const int32_t *tokens, int32_t n_tokens, volatile int *cancel_flag) {
     if (n_tokens <= 0) return 1;
     myds_model_t *m = ctx->model;
     uint32_t dim = m->dim;
 
     /* For very short prompts (<= 4 tokens), standard sequential forward has virtually zero overhead */
-    if (n_tokens <= 4 || !m->is_mla) {
+    if (n_tokens <= 4 || !model_supports_chunk_prefill(m)) {
         for (int32_t i = 0; i < n_tokens; i++) {
             if (cancel_flag && *cancel_flag) return -2;
             if (myds_forward_token_internal(ctx, tokens[i], ctx->pos, false) < 0) return -1;
@@ -2413,7 +2462,19 @@ static int myds_prefill_tokens(myds_context_t *ctx, const int32_t *tokens, int32
         return 1;
     }
 
-    myds_prefill_chunk_t *chunk = create_prefill_chunk(m);
+    if (cancel_flag && *cancel_flag) return -2;
+    uint32_t requested_capacity = (uint32_t)n_tokens;
+    if (requested_capacity > MYDS_PREFILL_CHUNK_SIZE) requested_capacity = MYDS_PREFILL_CHUNK_SIZE;
+    if (ctx->prefill_capacity < requested_capacity) {
+        /* Allocate before swapping so an allocation failure preserves the prior workspace. */
+        myds_prefill_chunk_t *larger = create_prefill_chunk(m, requested_capacity);
+        if (larger) {
+            free_prefill_chunk(ctx->prefill_chunk);
+            ctx->prefill_chunk = larger;
+            ctx->prefill_capacity = requested_capacity;
+        }
+    }
+    myds_prefill_chunk_t *chunk = ctx->prefill_chunk;
     if (!chunk) {
         for (int32_t i = 0; i < n_tokens; i++) {
             if (cancel_flag && *cancel_flag) return -2;
@@ -2425,7 +2486,6 @@ static int myds_prefill_tokens(myds_context_t *ctx, const int32_t *tokens, int32
 
     float *prompt_x = (float *)malloc((size_t)n_tokens * dim * sizeof(float));
     if (!prompt_x) {
-        free_prefill_chunk(chunk);
         for (int32_t i = 0; i < n_tokens; i++) {
             if (cancel_flag && *cancel_flag) return -2;
             if (myds_forward_token_internal(ctx, tokens[i], ctx->pos, false) < 0) return -1;
@@ -2445,6 +2505,8 @@ static int myds_prefill_tokens(myds_context_t *ctx, const int32_t *tokens, int32
             } else if (m->tok_embeddings_type == GGML_TYPE_F16) {
                 const uint16_t *emb = (const uint16_t *)myds_metal_buffer_data(m->tok_embeddings);
                 const uint16_t *row = emb + (size_t)tid * dim;
+                /* TODO: preserve the same legacy BF16 interpretation as
+                 * decode until true F16 conversion is validated separately. */
                 for (uint32_t j = 0; j < dim; j++) {
                     uint32_t w = (uint32_t)row[j] << 16;
                     memcpy(&dest[j], &w, sizeof(float));
@@ -2459,17 +2521,17 @@ static int myds_prefill_tokens(myds_context_t *ctx, const int32_t *tokens, int32
 
     uint32_t base_pos = ctx->pos;
 
-    /* 2. Layer-major prefill: each layer's weights are loaded ONCE across the entire prompt */
+    /* 2. Layer-major prefill improves weight locality across prompt chunks.
+     * GEMV still reads weights for each token; only GEMM tiles share those loads. */
     for (uint32_t l = 0; l < m->n_layers; l++) {
-        for (int32_t c_start = 0; c_start < n_tokens; c_start += MYDS_PREFILL_CHUNK_SIZE) {
+        for (int32_t c_start = 0; c_start < n_tokens; c_start += (int32_t)chunk->capacity) {
             if (cancel_flag && *cancel_flag) {
                 free(prompt_x);
-                free_prefill_chunk(chunk);
                 return -2;
             }
 
             uint32_t chunk_len = (uint32_t)(n_tokens - c_start);
-            if (chunk_len > MYDS_PREFILL_CHUNK_SIZE) chunk_len = MYDS_PREFILL_CHUNK_SIZE;
+            if (chunk_len > chunk->capacity) chunk_len = chunk->capacity;
             uint32_t chunk_pos = base_pos + (uint32_t)c_start;
 
             /* Load chunk activations from prompt_x */
@@ -2478,7 +2540,6 @@ static int myds_prefill_tokens(myds_context_t *ctx, const int32_t *tokens, int32
             /* Pass chunk through layer l */
             if (!execute_prefill_chunk_layer(ctx, chunk, l, chunk_pos, chunk_len)) {
                 free(prompt_x);
-                free_prefill_chunk(chunk);
                 return -1;
             }
 
@@ -2488,13 +2549,13 @@ static int myds_prefill_tokens(myds_context_t *ctx, const int32_t *tokens, int32
     }
 
     ctx->pos = base_pos + (uint32_t)n_tokens;
-    if (ctx && ctx->cfg.temperature > 0.0f) {
+    /* Preserve the existing random stream for reproducible generation. */
+    if (ctx->cfg.temperature > 0.0f) {
         for (int32_t i = 0; i < n_tokens; i++) {
             ctx->rng_state = ctx->rng_state * 6364136223846793005ULL + 1ULL;
         }
     }
     free(prompt_x);
-    free_prefill_chunk(chunk);
     return 1;
 }
 
