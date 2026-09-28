@@ -144,6 +144,7 @@ struct myds_context {
     /* Sampler persistent scratch buffers (zero malloc churn per token) */
     float               *sample_probs;
     int32_t             *sample_indices;
+    void                *sample_cands;
     uint64_t             rng_state;
 };
 

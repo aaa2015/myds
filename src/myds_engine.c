@@ -984,6 +984,45 @@ void myds_model_print_info(const myds_model_t *m) {
     printf("====================================================\n");
 }
 
+/* Production Sampler: greedy, temperature, top-k, min-p, top-p, repetition penalty */
+typedef struct {
+    float prob;
+    int32_t id;
+} myds_cand_t;
+
+static int compare_cand_desc(const void *a, const void *b) {
+    const myds_cand_t *ca = (const myds_cand_t *)a;
+    const myds_cand_t *cb = (const myds_cand_t *)b;
+    if (ca->prob < cb->prob) return 1;
+    if (ca->prob > cb->prob) return -1;
+    return 0;
+}
+
+static void quickselect_cand_desc(myds_cand_t *arr, int l, int r, int k) {
+    while (l < r) {
+        int i = l, j = r;
+        float pivot = arr[l + (r - l) / 2].prob;
+        while (i <= j) {
+            while (arr[i].prob > pivot) i++;
+            while (arr[j].prob < pivot) j--;
+            if (i <= j) {
+                myds_cand_t tmp = arr[i];
+                arr[i] = arr[j];
+                arr[j] = tmp;
+                i++;
+                j--;
+            }
+        }
+        if (k <= j) {
+            r = j;
+        } else if (k >= i) {
+            l = i;
+        } else {
+            break;
+        }
+    }
+}
+
 myds_context_t *myds_context_create(myds_model_t *model, const myds_config_t *cfg) {
     if (!model) return NULL;
 
@@ -1071,6 +1110,7 @@ myds_context_t *myds_context_create(myds_model_t *model, const myds_config_t *cf
 
     ctx->sample_probs = (float *)malloc(vocab_size * sizeof(float));
     ctx->sample_indices = (int32_t *)malloc(vocab_size * sizeof(int32_t));
+    ctx->sample_cands = malloc(vocab_size * sizeof(myds_cand_t));
     ctx->rng_state = ((uint64_t)ctx->cfg.seed ^ 0x5DEECE66DULL) | 1ULL;
 
     ctx->pos = 0;
@@ -1121,6 +1161,7 @@ void myds_context_free(myds_context_t *ctx) {
     }
     if (ctx->sample_probs)   free(ctx->sample_probs);
     if (ctx->sample_indices) free(ctx->sample_indices);
+    if (ctx->sample_cands)   free(ctx->sample_cands);
     free(ctx);
 }
 
@@ -1135,20 +1176,6 @@ myds_config_t myds_context_get_config(const myds_context_t *ctx) {
 void myds_context_set_config(myds_context_t *ctx, const myds_config_t *cfg) {
     if (!ctx || !cfg) return;
     ctx->cfg = *cfg;
-}
-
-/* Production Sampler: greedy, temperature, top-k, min-p, top-p, repetition penalty */
-typedef struct {
-    float prob;
-    int32_t id;
-} myds_cand_t;
-
-static int compare_cand_desc(const void *a, const void *b) {
-    const myds_cand_t *ca = (const myds_cand_t *)a;
-    const myds_cand_t *cb = (const myds_cand_t *)b;
-    if (ca->prob < cb->prob) return 1;
-    if (ca->prob > cb->prob) return -1;
-    return 0;
 }
 
 int32_t myds_sample_next_token(
@@ -1256,17 +1283,19 @@ int32_t myds_sample_next_token(
     }
 
     myds_cand_t stack_cands[1024];
-    myds_cand_t *cands = (n_cands <= 1024) ? stack_cands : (myds_cand_t *)malloc(n_cands * sizeof(myds_cand_t));
+    myds_cand_t *cands = (ctx && ctx->sample_cands) ? (myds_cand_t *)ctx->sample_cands :
+                         (n_cands <= 1024) ? stack_cands : (myds_cand_t *)malloc(n_cands * sizeof(myds_cand_t));
     for (uint32_t i = 0; i < n_cands; i++) {
         cands[i].prob = probs[i];
         cands[i].id = indices[i];
     }
-    qsort(cands, n_cands, sizeof(myds_cand_t), compare_cand_desc);
 
-    /* Apply top_k truncation */
+    /* Apply top_k truncation with O(N) quickselect before qsort */
     if (top_k > 0 && top_k < n_cands) {
+        quickselect_cand_desc(cands, 0, (int)n_cands - 1, (int)top_k - 1);
         n_cands = top_k;
     }
+    qsort(cands, n_cands, sizeof(myds_cand_t), compare_cand_desc);
 
     /* Apply top_p truncation */
     if (top_p > 0.0f && top_p < 1.0f) {
@@ -1305,7 +1334,7 @@ int32_t myds_sample_next_token(
         }
     }
 
-    if (cands != stack_cands) {
+    if ((!ctx || !ctx->sample_cands) && cands != stack_cands) {
         free(cands);
     }
     if (!ctx || !ctx->sample_probs) {
