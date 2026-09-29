@@ -2039,10 +2039,26 @@ int myds_metal_routed_moe_batch(
         const NSUInteger smem_iq2 = 256u * sizeof(uint64_t) + 128u * sizeof(uint8_t); /* 2176 */
         static bool logged_moe_mode = false;
         if (!logged_moe_mode) {
-            printf("myds_metal: routed_moe mode = %s (batch_capable)\n",
-                   (g_pso_moe_pair_swiglu_iq2_xxs && g_pso_moe_sum6_q2_k) ? "FUSED (2-step)" :
-                   (g_pso_moe_slots6_pair_swiglu_iq2_xxs && g_pso_moe_slots6_sum6_q2_k) ? "SLOTS6 (2-step)" : "FALLBACK (5-step)");
-            fflush(stdout);
+            /* 2026-09-29 参谋长: 原来的标签是误导的 ——
+             *   · 它把"两个 PSO 都不可用"叫成 "FALLBACK (5-step)", 但代码里根本没有
+             *     5-step 回退路径, 那条分支直接 `return 0` 失败。
+             *   · SLOTS6 实测【能跑但输出错误】(16:03 实测: 15.94 t/s + 乱码; FUSED 27.07 t/s + 逐位正确)。
+             *     ⇒ 它是条会静默产出错误结果的路径, 不能用作自动回退。
+             * 现改为: 只在 MYDS_ALLOW_SLOTS6_MOE=1 显式要求时才用 SLOTS6, 且响亮告警。
+             * 依据: docs/verification/2026-09-29-gpu-bottleneck-ablation.md §3 */
+            const bool fused_ok  = g_pso_moe_pair_swiglu_iq2_xxs && g_pso_moe_sum6_q2_k;
+            const bool slots6_ok = g_pso_moe_slots6_pair_swiglu_iq2_xxs && g_pso_moe_slots6_sum6_q2_k;
+            const bool slots6_opt_in = getenv("MYDS_ALLOW_SLOTS6_MOE") != NULL;
+            if (fused_ok) {
+                MYDS_LOG_I("MoE path: FUSED (2-step) — verified bit-exact");
+            } else if (slots6_ok && slots6_opt_in) {
+                MYDS_LOG_E("MoE path: SLOTS6 (2-step) — UNVERIFIED AND KNOWN WRONG. "
+                           "Enabled only because MYDS_ALLOW_SLOTS6_MOE is set; do NOT trust the output.");
+            } else {
+                MYDS_LOG_E("MoE path: FUSED kernels unavailable; refusing MoE rather than silently "
+                           "degrading to the known-wrong SLOTS6 path. "
+                           "(Debug override: MYDS_ALLOW_SLOTS6_MOE=1 — output will be wrong.)");
+            }
             logged_moe_mode = true;
         }
 
@@ -2131,7 +2147,8 @@ int myds_metal_routed_moe_batch(
                 if (!wait_command_buffer(cb)) return 0;
             }
             return 1;
-        } else if (n_tok == 1 && g_pso_moe_slots6_pair_swiglu_iq2_xxs && g_pso_moe_slots6_sum6_q2_k) {
+        } else if (n_tok == 1 && g_pso_moe_slots6_pair_swiglu_iq2_xxs && g_pso_moe_slots6_sum6_q2_k &&
+                   getenv("MYDS_ALLOW_SLOTS6_MOE") != NULL) {
             const int32_t *sel_ids = (const int32_t *)selected_ids->ptr;
 
             /* 1. Slots6 Fused Gate + Up + SwiGLU + Scaling dispatch (IQ2_XXS) */
