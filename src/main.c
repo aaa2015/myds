@@ -85,6 +85,22 @@ int main(int argc, char *argv[]) {
             alias = argv[++i];
         } else if ((strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--prompt") == 0) && i + 1 < argc) {
             prompt = argv[++i];
+        } else if (strcmp(argv[i], "--prompt-file") == 0 && i + 1 < argc) {
+            const char *pfile = argv[++i];
+            FILE *f = fopen(pfile, "rb");
+            if (!f) {
+                fprintf(stderr, "Error: cannot open prompt file '%s'\n", pfile);
+                return 1;
+            }
+            fseek(f, 0, SEEK_END);
+            long sz = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            char *buf = malloc(sz + 1);
+            if (!buf) { fclose(f); return 1; }
+            if (fread(buf, 1, sz, f) != (size_t)sz) { free(buf); fclose(f); return 1; }
+            buf[sz] = '\0';
+            fclose(f);
+            prompt = buf;
         } else if ((strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--max-tokens") == 0) && i + 1 < argc) {
             cfg.max_new_tokens = (uint32_t)atoi(argv[++i]);
         } else if ((strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--ctx-size") == 0 || strcmp(argv[i], "--ctx") == 0) && i + 1 < argc) {
