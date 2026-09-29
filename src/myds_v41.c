@@ -484,6 +484,9 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         return -1;
     }
 
+    uint32_t il = 0;
+    const char *phase = "engram prepare";
+
     for (uint32_t t = 0; t < n_tokens; t++) {
         uint32_t pos = base_pos + t;
         if (!myds_engram_prepare_token(g->engram, tokens[t], (uint64_t)pos)) {
@@ -496,6 +499,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                g->engram->row_values[1], MYDS_ENGRAM_INPUT_DIM * sizeof(float));
     }
 
+    phase = "embedding lookup";
     const uint16_t *embd_table = (const uint16_t *)myds_metal_buffer_data(m->tok_embeddings);
     for (uint32_t t = 0; t < n_tokens; t++) {
         int32_t tok = tokens[t];
@@ -520,8 +524,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         }
     }
 
-    uint32_t il = 0;
-    const char *phase = "layer loop";
+    phase = "layer loop";
 #define CHECK(x) do { if (!(x)) goto fail; } while (0)
 #define TRACE(stage,buf,n) CHECK(myds_trace_f32(stage,il,pos,buf,n))
 
