@@ -21,6 +21,14 @@
 #define V41_INDEX_DIM 128u
 #define V41_WINDOW 128u
 #define V41_TOPK 512u
+/* Per-token workspace arrays below are sized by this, NOT by 512.  They used to
+ * be hardcoded 512-wide while the scalar fields (cur_res_view, cur_pre_view,
+ * hc_flat_norm_buf, hc_mix_buf) sat after them in the struct, so any capacity
+ * above 512 made the assembly loop write arr[t] past the arrays and silently
+ * overwrite those fields -- hc_flat_norm_buf came back as size 0 and prefill
+ * died at layer 0 with "HC attention input".  Raising the cap therefore needs
+ * this sizing, not just a relaxed clamp. */
+#define V41_MAX_CHUNK 4096u
 
 typedef struct {
     myds_metal_buffer_t *attn_fn, *attn_scale, *attn_base;
@@ -523,41 +531,41 @@ typedef struct {
     myds_metal_buffer_t *ffn_out_buf;
     myds_metal_buffer_t *layer_out_buf;
 
-    myds_metal_buffer_t *x[512];
-    myds_metal_buffer_t *x_norm[512];
-    myds_metal_buffer_t *qr[512];
-    myds_metal_buffer_t *qr_norm[512];
-    myds_metal_buffer_t *q[512];
-    myds_metal_buffer_t *kv_act[512];
-    myds_metal_buffer_t *attn_heads[512];
-    myds_metal_buffer_t *attn_low[512];
-    myds_metal_buffer_t *attn_out[512];
-    myds_metal_buffer_t *after_attn[512];
-    myds_metal_buffer_t *attn_split[512];
-    myds_metal_buffer_t *ffn_split[512];
-    myds_metal_buffer_t *ffn_norm[512];
-    myds_metal_buffer_t *router_logits[512];
-    myds_metal_buffer_t *shared_out[512];
-    myds_metal_buffer_t *engram_rows[2][512];
-    myds_metal_buffer_t *selected_ids[512];
-    myds_metal_buffer_t *selected_weights[512];
-    myds_metal_buffer_t *route_probs[512];
-    myds_metal_buffer_t *route_scores[512];
-    myds_metal_buffer_t *route_ids_f32[512];
-    myds_metal_buffer_t *pool_kv[512];
-    myds_metal_buffer_t *pool_score[512];
-    myds_metal_buffer_t *index_q[512];
-    myds_metal_buffer_t *index_weights[512];
-    myds_metal_buffer_t *moe_gate[512];
-    myds_metal_buffer_t *moe_up[512];
-    myds_metal_buffer_t *moe_mid[512];
-    myds_metal_buffer_t *moe_down[512];
-    myds_metal_buffer_t *moe_out[512];
-    myds_metal_buffer_t *ffn_out[512];
-    myds_metal_buffer_t *layer_out[512];
+    myds_metal_buffer_t *x[V41_MAX_CHUNK];
+    myds_metal_buffer_t *x_norm[V41_MAX_CHUNK];
+    myds_metal_buffer_t *qr[V41_MAX_CHUNK];
+    myds_metal_buffer_t *qr_norm[V41_MAX_CHUNK];
+    myds_metal_buffer_t *q[V41_MAX_CHUNK];
+    myds_metal_buffer_t *kv_act[V41_MAX_CHUNK];
+    myds_metal_buffer_t *attn_heads[V41_MAX_CHUNK];
+    myds_metal_buffer_t *attn_low[V41_MAX_CHUNK];
+    myds_metal_buffer_t *attn_out[V41_MAX_CHUNK];
+    myds_metal_buffer_t *after_attn[V41_MAX_CHUNK];
+    myds_metal_buffer_t *attn_split[V41_MAX_CHUNK];
+    myds_metal_buffer_t *ffn_split[V41_MAX_CHUNK];
+    myds_metal_buffer_t *ffn_norm[V41_MAX_CHUNK];
+    myds_metal_buffer_t *router_logits[V41_MAX_CHUNK];
+    myds_metal_buffer_t *shared_out[V41_MAX_CHUNK];
+    myds_metal_buffer_t *engram_rows[2][V41_MAX_CHUNK];
+    myds_metal_buffer_t *selected_ids[V41_MAX_CHUNK];
+    myds_metal_buffer_t *selected_weights[V41_MAX_CHUNK];
+    myds_metal_buffer_t *route_probs[V41_MAX_CHUNK];
+    myds_metal_buffer_t *route_scores[V41_MAX_CHUNK];
+    myds_metal_buffer_t *route_ids_f32[V41_MAX_CHUNK];
+    myds_metal_buffer_t *pool_kv[V41_MAX_CHUNK];
+    myds_metal_buffer_t *pool_score[V41_MAX_CHUNK];
+    myds_metal_buffer_t *index_q[V41_MAX_CHUNK];
+    myds_metal_buffer_t *index_weights[V41_MAX_CHUNK];
+    myds_metal_buffer_t *moe_gate[V41_MAX_CHUNK];
+    myds_metal_buffer_t *moe_up[V41_MAX_CHUNK];
+    myds_metal_buffer_t *moe_mid[V41_MAX_CHUNK];
+    myds_metal_buffer_t *moe_down[V41_MAX_CHUNK];
+    myds_metal_buffer_t *moe_out[V41_MAX_CHUNK];
+    myds_metal_buffer_t *ffn_out[V41_MAX_CHUNK];
+    myds_metal_buffer_t *layer_out[V41_MAX_CHUNK];
 
-    myds_metal_buffer_t *res_view[512];
-    myds_metal_buffer_t *pre_view[512];
+    myds_metal_buffer_t *res_view[V41_MAX_CHUNK];
+    myds_metal_buffer_t *pre_view[V41_MAX_CHUNK];
     myds_metal_buffer_t *cur_res_view;
     myds_metal_buffer_t *cur_pre_view;
     myds_metal_buffer_t *cur_selected_view;
@@ -651,7 +659,7 @@ static void v41_chunk_workspace_free(v41_chunk_workspace_t *cw) {
 }
 
 static v41_chunk_workspace_t *v41_chunk_workspace_create(uint32_t capacity, uint32_t exp_dim) {
-    if (!capacity || capacity > 512) return NULL;
+    if (!capacity || capacity > V41_MAX_CHUNK) return NULL;
     v41_chunk_workspace_t *cw = calloc(1, sizeof(*cw));
     if (!cw) return NULL;
     cw->capacity = capacity;
@@ -801,12 +809,12 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     uint32_t chunk_size = chunk_env ? (uint32_t)atoi(chunk_env) : 256u;
     if (chunk_size < 2u) chunk_size = 2u;
     if (chunk_size % 2u != 0) chunk_size = (chunk_size / 2u) * 2u;
-    if (chunk_size > 512u) chunk_size = 512u;
+    if (chunk_size > V41_MAX_CHUNK) chunk_size = V41_MAX_CHUNK;
     if (n_tokens < chunk_size) {
         chunk_size = n_tokens;
         if (chunk_size % 2u != 0) chunk_size++;
         if (chunk_size < 2u) chunk_size = 2u;
-        if (chunk_size > 512u) chunk_size = 512u;
+        if (chunk_size > V41_MAX_CHUNK) chunk_size = V41_MAX_CHUNK;
     }
 
     size_t res_size = (size_t)n_tokens * 4u * V41_DIM;
