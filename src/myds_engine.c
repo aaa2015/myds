@@ -934,6 +934,10 @@ static myds_model_t *model_load_internal(const char *model_path, bool diagnostic
         }
     }
 
+    /* 模型已全部映射：装配 residency set 并启动保活心跳。
+     * 放在这里（而不是首个请求）是为了把那一次性逐页校验付在加载期。 */
+    myds_metal_residency_activate();
+
     return m;
 
 fail:

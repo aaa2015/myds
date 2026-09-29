@@ -11,6 +11,8 @@
 #include <sys/time.h>
 #include <sys/sysctl.h>
 #include <sys/mman.h>
+#include <stdatomic.h>
+#include <TargetConditionals.h>
 
 struct myds_metal_buffer {
     id<MTLBuffer> mtl_buf;
@@ -78,6 +80,150 @@ static id<MTLComputeCommandEncoder> g_batch_enc = nil;
 static NSMutableArray<id<MTLCommandBuffer>> *g_inflight_cbs = nil;
 static uint64_t                     g_batch_commit_count = 0;
 static int                          g_auto_barrier = 1;
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Residency keep-alive —— llama.cpp PR #17766 (ggerganov) 的移植
+ * ══════════════════════════════════════════════════════════════════════════
+ *
+ * 上游结论（PR 正文原文）：
+ *   "something changed in MacOS recently ... the memory wiring/unwiring
+ *    (a.k.a. throttling) after 1 second of being idle is back."
+ *   "Just attaching the residency sets to the Metal queue is not enough.
+ *    Ended up implementing a background thread that periodically calls
+ *    requestResidency() in order to keep the memory buffers wired."
+ *
+ * 本舰队的实测（macstudio, 151 GB, 2026-09-29）：
+ *   无驻留            空闲 170 s 后首请求 5.56 s（热态 0.11 s）
+ *   只挂 queue        6.99 s → 每次请求都付 ~2.9 s（= 心跳已停的等价状态）
+ *   挂 queue + 5 ms 心跳   0.19 s
+ *   心跳保活 30 s < 空闲   2.92 s（因果对照：心跳停 ⇒ 又冷）
+ *   → 详见 docs/verification/2026-09-29-per-request-latency-root-cause.md §14
+ *
+ * 开关：
+ *   MYDS_NO_RESIDENCY_HB=1        整体关闭（应急回退，无需重编译）
+ *   MYDS_RESIDENCY_KEEP_ALIVE_S   空闲多久后心跳停止（默认 180）
+ *   MYDS_RESIDENCY_HB_MS          心跳周期（默认 5 ms，与上游一致）
+ * ══════════════════════════════════════════════════════════════════════════ */
+static id<MTLResidencySet> g_res_set = nil;
+static NSLock             *g_res_lock = nil;
+static int                 g_res_count = 0;
+static int                 g_res_keep_alive_s = 180;
+static int                 g_res_hb_ms = 5;
+static bool                g_res_off = false;   /* 环境变量或建集失败 */
+static bool                g_res_ready = false; /* 已 requestResidency + 挂队 */
+static atomic_bool         g_res_stop = false;
+static atomic_int          g_res_ticks = 0;     /* 剩余心跳次数 */
+
+static bool myds_metal_residency_disabled(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("MYDS_NO_RESIDENCY_HB") ? 1 : 0;
+    return cached == 1;
+}
+
+/* 每个按字节包裹的模型 view 登记进同一个 residency set。
+ * 必须在 g_res_ready 之前完成（即模型加载期间）。 */
+static void myds_metal_residency_register(id<MTLBuffer> buf) {
+    if (!buf || g_res_off || myds_metal_residency_disabled()) return;
+#if TARGET_OS_OSX
+    if (@available(macOS 15.0, *)) {
+        if (!g_res_lock) g_res_lock = [[NSLock alloc] init];
+        [g_res_lock lock];
+        if (!g_res_set) {
+            const char *ka = getenv("MYDS_RESIDENCY_KEEP_ALIVE_S");
+            if (ka && atoi(ka) > 0) g_res_keep_alive_s = atoi(ka);
+            const char *ms = getenv("MYDS_RESIDENCY_HB_MS");
+            if (ms && atoi(ms) > 0) g_res_hb_ms = atoi(ms);
+            MTLResidencySetDescriptor *d = [[MTLResidencySetDescriptor alloc] init];
+            d.label = @"myds_model";
+            d.initialCapacity = 4096;
+            NSError *err = nil;
+            g_res_set = [g_device newResidencySetWithDescriptor:d error:&err];
+            if (!g_res_set) {
+                MYDS_LOG_E("residency set creation failed (%s) — keep-alive disabled",
+                           [[err localizedDescription] UTF8String]);
+                g_res_off = true;
+                [g_res_lock unlock];
+                return;
+            }
+        }
+        [g_res_set addAllocation:buf];
+        [g_res_set commit];
+        g_res_count++;
+        [g_res_lock unlock];
+    }
+#endif
+}
+
+void myds_metal_residency_activate(void) {
+#if TARGET_OS_OSX
+    if (@available(macOS 15.0, *)) {
+        if (g_res_off || g_res_ready || !g_res_set ||
+            myds_metal_residency_disabled()) return;
+
+        [g_res_lock lock];
+        if (g_res_ready) { [g_res_lock unlock]; return; }
+
+        /* ① 一次性把「逐页校验」付在这里（加载期），而不是留给第一个请求。
+         *    实测这就是那 ~2.9 s。 */
+        [g_res_set requestResidency];
+        /* ② 挂到队列：此后每次提交都自带该驻留集（上游：单靠这一步不够） */
+        if (g_queue && [g_queue respondsToSelector:@selector(addResidencySet:)]) {
+            [g_queue addResidencySet:g_res_set];
+        }
+        g_res_ready = true;
+        atomic_store_explicit(&g_res_ticks,
+                              g_res_keep_alive_s * (1000 / g_res_hb_ms),
+                              memory_order_relaxed);
+        [g_res_lock unlock];
+
+        /* ③ llama.cpp #26082：从未被任何 GPU 工作引用过的 residency set
+         *    会直到进程退出才释放其 wired 内存。一次极小的 blit 即可规避。 */
+        if (g_queue && g_device) {
+            id<MTLBuffer> tmp = [g_device newBufferWithLength:1
+                                                     options:MTLResourceStorageModePrivate];
+            id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+            if (tmp && cb) {
+                id<MTLBlitCommandEncoder> enc = [cb blitCommandEncoder];
+                [enc fillBuffer:tmp range:NSMakeRange(0, 1) value:0];
+                [enc endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+            }
+        }
+
+        MYDS_LOG_I("Residency keep-alive: %d allocations, queue-attached, keep_alive=%ds, period=%dms",
+                   g_res_count, g_res_keep_alive_s, g_res_hb_ms);
+
+        /* ④ 心跳线程：周期性 requestResidency，把 wired 状态钉住。
+         *    （等价于上游循环；不占用主线程，不产生 GPU 负载） */
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+            while (!atomic_load_explicit(&g_res_stop, memory_order_relaxed)) {
+                if (atomic_load_explicit(&g_res_ticks, memory_order_relaxed) > 0) {
+                    [g_res_lock lock];
+                    [g_res_set requestResidency];
+                    [g_res_lock unlock];
+                    atomic_fetch_sub_explicit(&g_res_ticks, 1, memory_order_relaxed);
+                }
+                usleep((useconds_t)g_res_hb_ms * 1000);
+            }
+        });
+    }
+#endif
+}
+
+/* 每次向 GPU 提交真实工作时重置保活倒计时
+ * （对应上游 ggml_metal_device_rsets_keep_alive） */
+void myds_metal_residency_keep_alive(void) {
+    if (g_res_ready) {
+        atomic_store_explicit(&g_res_ticks,
+                              g_res_keep_alive_s * (1000 / g_res_hb_ms),
+                              memory_order_relaxed);
+    }
+}
+
+void myds_metal_residency_stop(void) {
+    atomic_store_explicit(&g_res_stop, true, memory_order_relaxed);
+}
 
 void myds_metal_set_auto_barrier(int enable) {
     g_auto_barrier = enable;
@@ -542,6 +688,7 @@ int myds_metal_commit_batch(void) {
     close_compute_encoder();
     id<MTLCommandBuffer> cb = g_batch_cb;
     g_batch_cb = nil;
+    myds_metal_residency_keep_alive();
     [cb commit];
     g_batch_commit_count++;
     return wait_command_buffer(cb);
@@ -554,6 +701,7 @@ int myds_metal_flush_batch(void) {
     g_batch_cb = nil;
     if (!g_inflight_cbs) g_inflight_cbs = [NSMutableArray new];
     [g_inflight_cbs addObject:cb];
+    myds_metal_residency_keep_alive();
     [cb commit];
     g_batch_commit_count++;
     return 1;
@@ -586,6 +734,7 @@ int myds_metal_commit_and_wait_event(uint64_t val) {
     g_batch_cb = nil;
     if (!g_inflight_cbs) g_inflight_cbs = [NSMutableArray new];
     [g_inflight_cbs addObject:cb];
+    myds_metal_residency_keep_alive();
     [cb commit];
     g_batch_commit_count++;
     BOOL signaled = [g_shared_event waitUntilSignaledValue:val timeoutMS:60000];
@@ -643,6 +792,7 @@ myds_metal_buffer_t *myds_metal_buffer_from_ptr(const void *ptr, size_t bytes) {
         if (!mtl_buf) {
             return NULL;
         }
+        myds_metal_residency_register(mtl_buf);
 
         myds_metal_buffer_t *buf = (myds_metal_buffer_t *)calloc(1, sizeof(myds_metal_buffer_t));
         buf->mtl_buf = mtl_buf;

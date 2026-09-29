@@ -281,6 +281,17 @@ int myds_metal_synchronize(void);
 void myds_metal_warm_memory(const void *addr, size_t size);
 void myds_metal_warm_buffer(const myds_metal_buffer_t *buf);
 
+/* Residency keep-alive (llama.cpp PR #17766 的移植).
+ *
+ * 在 macOS 上，驻留集的 wired 状态会在进程空闲后退化，空闲后的第一条命令缓冲
+ * 要为每个已绑定字节付一次逐页重校验。activate() 在【模型映射完成后】调用一次，
+ * 把这次一次性开销付在加载期并启动 5 ms 心跳；keep_alive() 在每次真实提交时重置
+ * 倒计时；stop() 用于收尾。MYDS_NO_RESIDENCY_HB=1 可整体关闭。
+ * 依据与实测：docs/verification/2026-09-29-per-request-latency-root-cause.md §14 */
+void myds_metal_residency_activate(void);
+void myds_metal_residency_keep_alive(void);
+void myds_metal_residency_stop(void);
+
 /* Batched V4.1 HC and RMSNorm primitives across multiple tokens */
 int myds_metal_v41_rmsnorm_batch(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *x, const myds_metal_buffer_t *weight,
