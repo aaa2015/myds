@@ -458,6 +458,7 @@ typedef struct {
     myds_metal_buffer_t *shared_up_buf;
     myds_metal_buffer_t *shared_swiglu_buf;
     myds_metal_buffer_t *shared_out_buf;
+    myds_metal_buffer_t *engram_rows_buf[2];
 
     myds_metal_buffer_t *x[512];
     myds_metal_buffer_t *x_norm[512];
@@ -473,6 +474,7 @@ typedef struct {
     myds_metal_buffer_t *ffn_norm[512];
     myds_metal_buffer_t *router_logits[512];
     myds_metal_buffer_t *shared_out[512];
+    myds_metal_buffer_t *engram_rows[2][512];
 } v41_chunk_workspace_t;
 
 static void v41_chunk_workspace_free(v41_chunk_workspace_t *cw) {
@@ -492,6 +494,8 @@ static void v41_chunk_workspace_free(v41_chunk_workspace_t *cw) {
         if (cw->ffn_norm[t]) myds_metal_buffer_free(cw->ffn_norm[t]);
         if (cw->router_logits[t]) myds_metal_buffer_free(cw->router_logits[t]);
         if (cw->shared_out[t]) myds_metal_buffer_free(cw->shared_out[t]);
+        if (cw->engram_rows[0][t]) myds_metal_buffer_free(cw->engram_rows[0][t]);
+        if (cw->engram_rows[1][t]) myds_metal_buffer_free(cw->engram_rows[1][t]);
     }
     if (cw->x_buf) myds_metal_buffer_free(cw->x_buf);
     if (cw->x_norm_buf) myds_metal_buffer_free(cw->x_norm_buf);
@@ -510,6 +514,8 @@ static void v41_chunk_workspace_free(v41_chunk_workspace_t *cw) {
     if (cw->shared_up_buf) myds_metal_buffer_free(cw->shared_up_buf);
     if (cw->shared_swiglu_buf) myds_metal_buffer_free(cw->shared_swiglu_buf);
     if (cw->shared_out_buf) myds_metal_buffer_free(cw->shared_out_buf);
+    if (cw->engram_rows_buf[0]) myds_metal_buffer_free(cw->engram_rows_buf[0]);
+    if (cw->engram_rows_buf[1]) myds_metal_buffer_free(cw->engram_rows_buf[1]);
     free(cw);
 }
 
@@ -538,6 +544,8 @@ static v41_chunk_workspace_t *v41_chunk_workspace_create(uint32_t capacity, uint
     ALLOC_BUF(shared_up_buf, C * exp_dim * sizeof(float));
     ALLOC_BUF(shared_swiglu_buf, C * exp_dim * sizeof(float));
     ALLOC_BUF(shared_out_buf, C * V41_DIM * sizeof(float));
+    ALLOC_BUF(engram_rows_buf[0], C * MYDS_ENGRAM_INPUT_DIM * sizeof(float));
+    ALLOC_BUF(engram_rows_buf[1], C * MYDS_ENGRAM_INPUT_DIM * sizeof(float));
 #undef ALLOC_BUF
 
     for (size_t t = 0; t < C; t++) {
@@ -560,6 +568,9 @@ static v41_chunk_workspace_t *v41_chunk_workspace_create(uint32_t capacity, uint
         SUB_V(router_logits, router_logits_buf, 384, 384);
         SUB_V(shared_out, shared_out_buf, V41_DIM, V41_DIM);
 #undef SUB_V
+        cw->engram_rows[0][t] = myds_metal_buffer_sub_view(cw->engram_rows_buf[0], (t * MYDS_ENGRAM_INPUT_DIM) * sizeof(float), MYDS_ENGRAM_INPUT_DIM * sizeof(float));
+        cw->engram_rows[1][t] = myds_metal_buffer_sub_view(cw->engram_rows_buf[1], (t * MYDS_ENGRAM_INPUT_DIM) * sizeof(float), MYDS_ENGRAM_INPUT_DIM * sizeof(float));
+        if (!cw->engram_rows[0][t] || !cw->engram_rows[1][t]) goto fail;
     }
     return cw;
 fail:
@@ -691,6 +702,13 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             uint32_t c_len = n_tokens - c_start;
             if (c_len > chunk_size) c_len = chunk_size;
 
+            if (il == 1 || il == 14) {
+                uint32_t e = (il == 1 ? 0 : 1);
+                CHECK(myds_metal_buffer_write(cw->engram_rows_buf[e], 0,
+                    engram_all[e] + (size_t)c_start * MYDS_ENGRAM_INPUT_DIM,
+                    (size_t)c_len * MYDS_ENGRAM_INPUT_DIM * sizeof(float)));
+            }
+
             CHECK(myds_metal_begin_batch());
 
             /* Step 1: HC Attention Inputs for all tokens in chunk */
@@ -704,9 +722,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 
                 if (il == 1 || il == 14) {
                     uint32_t e = (il == 1 ? 0 : 1);
-                    float *erow = engram_all[e] + (size_t)idx * MYDS_ENGRAM_INPUT_DIM;
-                    CHECK(myds_metal_buffer_write(g->engram_rows[e], 0, erow, MYDS_ENGRAM_INPUT_DIM * 4u));
-                    CHECK(project(g->engram_kv, v->engram_proj[e], g->engram_rows[e], 5 * V41_DIM, MYDS_ENGRAM_INPUT_DIM, GGML_TYPE_F16, true));
+                    CHECK(project(g->engram_kv, v->engram_proj[e], cw->engram_rows[e][t], 5 * V41_DIM, MYDS_ENGRAM_INPUT_DIM, GGML_TYPE_F16, true));
                     CHECK(myds_metal_v41_engram_add(g->residual, g->engram_kv, v->engram_q[e], v->engram_k[e], V41_DIM, m->norm_eps));
                     TRACE("engram_out", g->residual, 4 * V41_DIM);
                     CHECK(myds_metal_buffer_copy(prompt_res, (size_t)idx * res_tok_bytes, g->residual, 0, res_tok_bytes));
