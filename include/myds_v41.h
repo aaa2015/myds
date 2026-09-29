@@ -15,5 +15,7 @@ myds_v41_context_t *myds_v41_context_create(myds_context_t *context);
 void myds_v41_context_free(myds_v41_context_t *context);
 int32_t myds_v41_forward(myds_context_t *context, int32_t token,
                         uint32_t position, bool need_logits);
+int myds_v41_prefill_tokens(myds_context_t *context, const int32_t *tokens,
+                            uint32_t n_tokens, volatile int *cancel_flag);
 
 #endif

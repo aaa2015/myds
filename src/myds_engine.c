@@ -1873,6 +1873,7 @@ static bool trace_selected(const char *filter, uint32_t value) {
 bool myds_trace_f32(const char *stage, uint32_t layer, uint32_t pos,
                       const myds_metal_buffer_t *buffer, size_t count) {
     const char *prefix = getenv("MYDS_TRACE_PREFIX");
+    if (!prefix || !*prefix) prefix = getenv("MYDS_BATCH_TRACE_PREFIX");
     if (!prefix || !*prefix) return true;
     const char *layer_env = getenv("MYDS_TRACE_LAYER");
     const char *pos_env = getenv("MYDS_TRACE_POS");
@@ -2571,8 +2572,21 @@ static int myds_prefill_tokens(myds_context_t *ctx, const int32_t *tokens, int32
     myds_model_t *m = ctx->model;
     uint32_t dim = m->dim;
 
+    /* For V4.1, use native batched prefill unless tracing or explicitly disabled. */
+    if (m->v41) {
+        if (getenv("MYDS_DISABLE_V41_PREFILL") || getenv("MYDS_TRACE_PREFIX")) {
+            for (int32_t i = 0; i < n_tokens; i++) {
+                if (cancel_flag && *cancel_flag) return -2;
+                if (myds_forward_token_internal(ctx, tokens[i], ctx->pos, false) < 0) return -1;
+                ctx->pos++;
+            }
+            return 1;
+        }
+        return myds_v41_prefill_tokens(ctx, tokens, (uint32_t)n_tokens, cancel_flag);
+    }
+
     /* For very short prompts (<= 4 tokens), standard sequential forward has virtually zero overhead */
-    if (m->v41 || n_tokens <= 4 || getenv("MYDS_TRACE_PREFIX") || !model_supports_chunk_prefill(m)) {
+    if (n_tokens <= 4 || getenv("MYDS_TRACE_PREFIX") || !model_supports_chunk_prefill(m)) {
         for (int32_t i = 0; i < n_tokens; i++) {
             if (cancel_flag && *cancel_flag) return -2;
             if (myds_forward_token_internal(ctx, tokens[i], ctx->pos, false) < 0) return -1;

@@ -36,12 +36,29 @@ int main(int argc, char **argv) {
     if (!ctx) { myds_model_free(model); free(tokens.ids); return 1; }
     fprintf(stderr, "TRACE_CONTEXT_READY\n");
     int result = 0;
-    for (size_t i = 0; i < tokens.count; i++) {
-        fprintf(stderr, "TRACE_FORWARD_BEGIN pos=%zu\n", i);
-        int next = myds_forward_token(ctx, tokens.ids[i], (uint32_t)i);
-        if (next < 0) { result = 1; break; }
-        printf("TRACE_TOKEN pos=%zu input=%d argmax=%d\n", i, tokens.ids[i], next);
-        fflush(stdout);
+    const char *use_prefill = getenv("MYDS_USE_PREFILL");
+    if (use_prefill && atoi(use_prefill) && tokens.count > 1) {
+        fprintf(stderr, "TRACE_PREFILL_BEGIN tokens=%zu\n", tokens.count - 1);
+        if (myds_v41_prefill_tokens(ctx, tokens.ids, (uint32_t)(tokens.count - 1), NULL) < 0) {
+            result = 1;
+        } else {
+            size_t last = tokens.count - 1;
+            fprintf(stderr, "TRACE_FORWARD_BEGIN pos=%zu\n", last);
+            int next = myds_forward_token(ctx, tokens.ids[last], (uint32_t)last);
+            if (next < 0) { result = 1; }
+            else {
+                printf("TRACE_TOKEN pos=%zu input=%d argmax=%d\n", last, tokens.ids[last], next);
+                fflush(stdout);
+            }
+        }
+    } else {
+        for (size_t i = 0; i < tokens.count; i++) {
+            fprintf(stderr, "TRACE_FORWARD_BEGIN pos=%zu\n", i);
+            int next = myds_forward_token(ctx, tokens.ids[i], (uint32_t)i);
+            if (next < 0) { result = 1; break; }
+            printf("TRACE_TOKEN pos=%zu input=%d argmax=%d\n", i, tokens.ids[i], next);
+            fflush(stdout);
+        }
     }
     myds_context_free(ctx);
     myds_model_free(model);
