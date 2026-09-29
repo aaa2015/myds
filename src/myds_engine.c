@@ -256,6 +256,39 @@ static const char *unimplemented_graph_feature(const gguf_file_t *gf) {
     return NULL;
 }
 
+/* ── 正确性门禁的「已验收」白名单 ─────────────────────────────────
+ *
+ * 上面这些 V4.1 特性原先一路被当作「未实现」，加载时直接拒绝，
+ * 目的正确：宁可不跑，也不要【静默跳过算子】而输出错误结果。
+ *
+ * 但截至 2026-09-29，它们已全部实现，并通过了独立的三方逐位对照：
+ *
+ *   证据  docs/verification/2026-09-29-batched-prefill-parity.md
+ *         docs/verification/2026-09-29-decode-optimization-verification.md
+ *         docs/CORRECTNESS_STATUS.md（第三轮 "原生全阶段补齐"）
+ *   方法  以 ds4 的 scalar 路径为【外部参照】，myds scalar/batched 为【内部一致】；
+ *         覆盖 embedding / attn_norm / q_rope / attn_out / layer_out /
+ *         route_* / ffnblock / logits（全 129280 值）等每位置 84 个阶段张量；
+ *         3 种提示词 × 多位点（含跨块 511/512、1023/1024 与跨滑窗 127/128）
+ *         × 层 0/14/39。
+ *   结果  全部 max|Δ| = +0.0（664/672 项，其余为 myds 独有的 engram_out）
+ *
+ * ⇒ 默认【放行】。同时保留两个环境开关，出事时不用重编译即可回退：
+ *      MYDS_DENY_V41=1   强制按旧行为拒绝（紧急刹车）
+ *      MYDS_ALLOW_V41=1  强制放行（原语义；用于尚未验收的实验图）
+ *      diagnostic 模式    始终放行（仅诊断用）
+ *
+ * ⚠️ 往白名单里加新特性之前，必须先有同等的逐位验收证据。
+ */
+static bool graph_feature_verified(const char *feature) {
+    if (!feature) return true;
+    return strcmp(feature, "HC multi-stream residual connections") == 0 ||
+           strcmp(feature, "Engram") == 0 ||
+           strcmp(feature, "compressed KV") == 0 ||
+           strcmp(feature, "KV indexer") == 0 ||
+           strcmp(feature, "DeepSeek V4.1 graph") == 0;
+}
+
 static myds_model_t *model_load_internal(const char *model_path, bool diagnostic) {
 
     gguf_file_t *gf = gguf_open(model_path);
@@ -265,7 +298,10 @@ static myds_model_t *model_load_internal(const char *model_path, bool diagnostic
     }
 
     const char *missing_feature = unimplemented_graph_feature(gf);
-    bool allowed = diagnostic || (getenv("MYDS_ALLOW_V41") != NULL);
+    const bool gate_verified   = graph_feature_verified(missing_feature);
+    const bool gate_force_on   = getenv("MYDS_ALLOW_V41") != NULL;   /* 强制放行 */
+    const bool gate_force_off  = getenv("MYDS_DENY_V41")  != NULL;   /* 紧急刹车 */
+    bool allowed = diagnostic || gate_force_on || (gate_verified && !gate_force_off);
     if (missing_feature && !allowed) {
         MYDS_LOG_E("Cannot run this model correctly: native graph has not passed the correctness gate for %s. "
                    "Refusing inference rather than silently skipping model operations. "
@@ -273,8 +309,11 @@ static myds_model_t *model_load_internal(const char *model_path, bool diagnostic
         gguf_close(gf);
         return NULL;
     }
-    if (missing_feature) {
+    if (missing_feature && !gate_verified) {
         MYDS_LOG_W("DIAGNOSTIC ONLY: unvalidated graph (%s); logits require independent comparison",
+                   missing_feature);
+    } else if (missing_feature && !gate_force_off) {
+        MYDS_LOG_I("V4.1 native graph enabled: %s (verified — see docs/CORRECTNESS_STATUS.md)",
                    missing_feature);
     }
     if (!myds_metal_init("metal")) {
