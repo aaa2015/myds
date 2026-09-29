@@ -43,6 +43,12 @@ static id<MTLComputePipelineState> g_pso_moe_swiglu_weight = nil;
 static id<MTLComputePipelineState> g_pso_moe_sum6 = nil;
 static id<MTLComputePipelineState> g_pso_moe_pair_swiglu_iq2_xxs = nil;
 static id<MTLComputePipelineState> g_pso_moe_sum6_q2_k = nil;
+static id<MTLComputePipelineState> g_pso_moe_mm_map0_ne20_6 = nil;
+static id<MTLComputePipelineState> g_pso_moe_mm_iq2_pair_swiglu_f16 = nil;
+static id<MTLComputePipelineState> g_pso_moe_mm_q2_k_f16 = nil;
+static id<MTLComputePipelineState> g_pso_moe_mm_q2_k_f32 = nil;
+static id<MTLBuffer>               g_moe_id_map_buffer = nil;
+static NSUInteger                  g_moe_id_map_bytes = 0;
 static id<MTLComputePipelineState> g_pso_attn_out_low_q8_0 = nil;
 static id<MTLComputePipelineState> g_pso_mul_mm_q8_0 = nil;
 static id<MTLComputePipelineState> g_pso_mul_mm_q8_0_bco = nil;
@@ -411,9 +417,14 @@ int myds_metal_init(const char *shader_dir) {
             printf("myds_metal: kernel_mul_mv_id_q2_K_sum6_f32 fn error: %s\n", [[pso_err localizedDescription] UTF8String]);
         }
 
-        fn = [g_library newFunctionWithName:@"kernel_dsv4_attn_out_low_q8_0_f32" constantValues:mv_constants error:nil];
+        fn = [g_library newFunctionWithName:@"kernel_mul_mm_id_map0_ne20_6"];
         if (fn) {
-            g_pso_attn_out_low_q8_0 = [g_device newComputePipelineStateWithFunction:fn error:nil];
+            g_pso_moe_mm_map0_ne20_6 = [g_device newComputePipelineStateWithFunction:fn error:nil];
+        }
+
+        fn = [g_library newFunctionWithName:@"kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16"];
+        if (fn) {
+            g_pso_moe_mm_iq2_pair_swiglu_f16 = [g_device newComputePipelineStateWithFunction:fn error:nil];
         }
 
         /* 11. Build Batched MatMul (GEMM) pipelines with function constants 700/701 */
@@ -422,6 +433,21 @@ int myds_metal_init(const char *shader_dir) {
         bool b_true = true;
         [mm_c_bco0 setConstantValue:&b_false type:MTLDataTypeBool atIndex:700];
         [mm_c_bco0 setConstantValue:&b_false type:MTLDataTypeBool atIndex:701];
+
+        fn = [g_library newFunctionWithName:@"kernel_mul_mm_id_q2_K_f16" constantValues:mm_c_bco0 error:nil];
+        if (fn) {
+            g_pso_moe_mm_q2_k_f16 = [g_device newComputePipelineStateWithFunction:fn error:nil];
+        }
+
+        fn = [g_library newFunctionWithName:@"kernel_mul_mm_id_q2_K_f32" constantValues:mm_c_bco0 error:nil];
+        if (fn) {
+            g_pso_moe_mm_q2_k_f32 = [g_device newComputePipelineStateWithFunction:fn error:nil];
+        }
+
+        fn = [g_library newFunctionWithName:@"kernel_dsv4_attn_out_low_q8_0_f32" constantValues:mv_constants error:nil];
+        if (fn) {
+            g_pso_attn_out_low_q8_0 = [g_device newComputePipelineStateWithFunction:fn error:nil];
+        }
 
         MTLFunctionConstantValues *mm_c_bco1 = [[MTLFunctionConstantValues alloc] init];
         [mm_c_bco1 setConstantValue:&b_false type:MTLDataTypeBool atIndex:700];
@@ -471,6 +497,12 @@ void myds_metal_cleanup(void) {
     g_pso_moe_sum6 = nil;
     g_pso_moe_pair_swiglu_iq2_xxs = nil;
     g_pso_moe_sum6_q2_k = nil;
+    g_pso_moe_mm_map0_ne20_6 = nil;
+    g_pso_moe_mm_iq2_pair_swiglu_f16 = nil;
+    g_pso_moe_mm_q2_k_f16 = nil;
+    g_pso_moe_mm_q2_k_f32 = nil;
+    g_moe_id_map_buffer = nil;
+    g_moe_id_map_bytes = 0;
     g_pso_attn_out_low_q8_0 = nil;
     g_pso_mul_mm_q8_0 = nil;
     g_pso_mul_mm_q8_0_bco = nil;
@@ -1825,6 +1857,71 @@ struct ds4_metal_dsv4_moe_sum6_args {
     uint64_t dst_token_stride;
 };
 
+struct ds4_metal_args_mul_mm_id_map0 {
+    int32_t  ne02;
+    int32_t  ne10;
+    int32_t  ne11;
+    uint64_t nb11;
+    uint64_t nb12;
+    int32_t  ne21;
+    int32_t  ne20;
+    uint64_t nb21;
+};
+
+struct ds4_metal_args_mul_mm_id {
+    int32_t  ne00;
+    int32_t  ne02;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  ne11;
+    uint64_t nb10;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    int32_t  ne20;
+    int32_t  ne21;
+    int32_t  ne0;
+    int32_t  ne1;
+    int16_t  r2;
+    int16_t  r3;
+    int32_t  tp_rank;
+    int32_t  tp_world;
+    int32_t  tp_expert_base;
+};
+
+static int ensure_moe_id_map_buffer(NSUInteger total_bytes) {
+    if (g_moe_id_map_buffer && g_moe_id_map_bytes >= total_bytes) {
+        return 1;
+    }
+    g_moe_id_map_buffer = nil;
+    NSUInteger alloc_bytes = 1048576u;
+    while (alloc_bytes < total_bytes) {
+        alloc_bytes *= 2;
+    }
+    g_moe_id_map_buffer = [g_device newBufferWithLength:alloc_bytes options:MTLResourceStorageModeShared];
+    if (!g_moe_id_map_buffer) {
+        g_moe_id_map_bytes = 0;
+        return 0;
+    }
+    g_moe_id_map_bytes = alloc_bytes;
+    return 1;
+}
+
+static int get_moe_mm_min_tokens(void) {
+    static int min_tokens = -2;
+    if (min_tokens == -2) {
+        const char *disable = getenv("MYDS_DISABLE_MOE_MM");
+        if (disable && atoi(disable) != 0) {
+            min_tokens = -1;
+        } else {
+            const char *env = getenv("MYDS_MOE_MM_MIN_TOKENS");
+            min_tokens = env ? atoi(env) : 32;
+        }
+    }
+    return min_tokens;
+}
+
 static inline float softplus_stable(float x) {
     if (x > 20.0f) return x;
     if (x < -20.0f) return expf(x);
@@ -1924,10 +2021,6 @@ int myds_metal_routed_moe_batch(
     ggml_type                  up_type,
     ggml_type                  down_type,
     float                      clamp_val) {
-    (void)gate_type;
-    (void)up_type;
-    (void)down_type;
-
     if (!moe_out || !x_in || !gate_exps || !up_exps || !down_exps ||
         !selected_ids || !selected_weights || !scratch_gate || !scratch_up ||
         !scratch_mid || !scratch_down || n_tok == 0) {
@@ -1945,9 +2038,191 @@ int myds_metal_routed_moe_batch(
         id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
 
-        /* 1. Gate experts dispatch (IQ2_XXS) */
         uint64_t gate_row_bytes = (dim / 256u) * 66u;
         uint64_t gate_exp_bytes = (uint64_t)expert_dim * gate_row_bytes;
+        uint64_t down_row_bytes = (expert_dim / 256u) * 84u;
+        uint64_t down_exp_bytes = (uint64_t)dim * down_row_bytes;
+
+        int min_mm_tokens = get_moe_mm_min_tokens();
+        bool can_use_mm = (min_mm_tokens > 0) &&
+                          ((int)n_tok >= min_mm_tokens) &&
+                          (gate_type == GGML_TYPE_IQ2_XXS) &&
+                          (up_type == GGML_TYPE_IQ2_XXS) &&
+                          (down_type == GGML_TYPE_Q2_K) &&
+                          g_pso_moe_mm_map0_ne20_6 &&
+                          g_pso_moe_mm_iq2_pair_swiglu_f16 &&
+                          g_pso_moe_mm_q2_k_f16 &&
+                          g_pso_moe_sum6;
+
+        if (can_use_mm) {
+            const NSUInteger tpe_bytes = (NSUInteger)n_routed_experts * sizeof(int32_t);
+            const NSUInteger hids_bytes = (NSUInteger)n_routed_experts * (NSUInteger)n_tok * sizeof(int32_t);
+            const NSUInteger work_offset = (tpe_bytes + hids_bytes + 7u) & ~7u;
+            const uint64_t pair_rows = (uint64_t)n_activated_experts * (uint64_t)n_tok;
+            const uint64_t work_cap = (pair_rows + 31u * (uint32_t)n_routed_experts + 31u) / 32u;
+            const NSUInteger work_item_bytes = 2u * sizeof(uint32_t);
+            const NSUInteger total_bytes = work_offset + 8u + (NSUInteger)work_cap * work_item_bytes;
+
+            if (!ensure_moe_id_map_buffer(total_bytes)) {
+                return 0;
+            }
+
+            static bool logged_moe_mm = false;
+            if (!logged_moe_mm) {
+                MYDS_LOG_I("MoE batch path: MM (kernel_mul_mm_id pair_swiglu + q2_k_f16 + sum6) — active for n_tok >= %d", min_mm_tokens);
+                logged_moe_mm = true;
+            }
+
+            struct ds4_metal_args_mul_mm_id_map0 map_args = {
+                .ne02 = (int32_t)n_routed_experts,
+                .ne10 = (int32_t)dim,
+                .ne11 = 1,
+                .nb11 = (uint64_t)dim * sizeof(float),
+                .nb12 = (uint64_t)dim * sizeof(float),
+                .ne21 = (int32_t)n_tok,
+                .ne20 = (int32_t)n_activated_experts,
+                .nb21 = (uint64_t)n_activated_experts * sizeof(int32_t),
+            };
+
+            const uint64_t x_row_bytes = (uint64_t)dim * sizeof(float);
+            struct ds4_metal_args_mul_mm_id gate_mm_args = {
+                .ne00 = (int32_t)dim,
+                .ne02 = (int32_t)n_routed_experts,
+                .nb01 = gate_row_bytes,
+                .nb02 = gate_exp_bytes,
+                .nb03 = (uint64_t)n_routed_experts * gate_exp_bytes,
+                .ne11 = 1,
+                .nb10 = sizeof(float),
+                .nb11 = x_row_bytes,
+                .nb12 = x_row_bytes,
+                .nb13 = (uint64_t)n_tok * x_row_bytes,
+                .ne20 = (int32_t)n_activated_experts,
+                .ne21 = (int32_t)n_tok,
+                .ne0 = (int32_t)expert_dim,
+                .ne1 = (int32_t)n_activated_experts,
+                .r2 = 1,
+                .r3 = 1,
+                .tp_rank = 0,
+                .tp_world = 1,
+                .tp_expert_base = 0,
+            };
+
+            struct ds4_metal_dsv4_moe_swiglu_weight_args swiglu_mm_args = {
+                .width = expert_dim,
+                .rows = pair_rows,
+                .gate_row_stride = (uint64_t)expert_dim * sizeof(float),
+                .up_row_stride = (uint64_t)expert_dim * sizeof(float),
+                .mid_row_stride = (uint64_t)expert_dim * sizeof(uint16_t),
+                .weight_stride = sizeof(float),
+                .write_clamped = 0,
+                .clamp_value = clamp_val,
+            };
+
+            const uint64_t mid_row_bytes = (uint64_t)expert_dim * sizeof(uint16_t);
+            struct ds4_metal_args_mul_mm_id down_mm_args = {
+                .ne00 = (int32_t)expert_dim,
+                .ne02 = (int32_t)n_routed_experts,
+                .nb01 = down_row_bytes,
+                .nb02 = down_exp_bytes,
+                .nb03 = (uint64_t)n_routed_experts * down_exp_bytes,
+                .ne11 = (int32_t)n_activated_experts,
+                .nb10 = sizeof(uint16_t),
+                .nb11 = mid_row_bytes,
+                .nb12 = (uint64_t)n_activated_experts * mid_row_bytes,
+                .nb13 = (uint64_t)n_tok * (uint64_t)n_activated_experts * mid_row_bytes,
+                .ne20 = (int32_t)n_activated_experts,
+                .ne21 = (int32_t)n_tok,
+                .ne0 = (int32_t)dim,
+                .ne1 = (int32_t)n_activated_experts,
+                .r2 = 1,
+                .r3 = 1,
+                .tp_rank = 0,
+                .tp_world = 1,
+                .tp_expert_base = 0,
+            };
+
+            struct ds4_metal_dsv4_moe_sum6_args sum_args = {
+                .width = dim,
+                .tokens = n_tok,
+                .src_token_stride = 6u * (uint64_t)dim * sizeof(float),
+                .dst_token_stride = (uint64_t)dim * sizeof(float),
+            };
+
+            /* Step 1: Map dispatch */
+            [enc setComputePipelineState:g_pso_moe_mm_map0_ne20_6];
+            [enc setBytes:&map_args length:sizeof(map_args) atIndex:0];
+            [enc setBuffer:selected_ids->mtl_buf offset:selected_ids->offset atIndex:1];
+            [enc setBuffer:g_moe_id_map_buffer offset:0 atIndex:2];
+            [enc setBuffer:g_moe_id_map_buffer offset:tpe_bytes atIndex:3];
+            [enc setBuffer:g_moe_id_map_buffer offset:work_offset atIndex:4];
+            [enc setThreadgroupMemoryLength:(NSUInteger)n_routed_experts * (NSUInteger)n_activated_experts * sizeof(uint16_t) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake((NSUInteger)n_routed_experts, 1, 1)];
+
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+            /* Step 2: Gate + Up Pair SwiGLU dispatch */
+            [enc setComputePipelineState:g_pso_moe_mm_iq2_pair_swiglu_f16];
+            [enc setBytes:&gate_mm_args length:sizeof(gate_mm_args) atIndex:0];
+            [enc setBytes:&swiglu_mm_args length:sizeof(swiglu_mm_args) atIndex:1];
+            [enc setBuffer:gate_exps->mtl_buf offset:gate_exps->offset atIndex:2];
+            [enc setBuffer:up_exps->mtl_buf offset:up_exps->offset atIndex:3];
+            [enc setBuffer:x_in->mtl_buf offset:x_in->offset atIndex:4];
+            [enc setBuffer:g_moe_id_map_buffer offset:0 atIndex:5];
+            [enc setBuffer:g_moe_id_map_buffer offset:tpe_bytes atIndex:6];
+            [enc setBuffer:scratch_mid->mtl_buf offset:scratch_mid->offset atIndex:7];
+            [enc setBuffer:selected_weights->mtl_buf offset:selected_weights->offset atIndex:8];
+            [enc setBuffer:g_moe_id_map_buffer offset:work_offset atIndex:9];
+            [enc setThreadgroupMemoryLength:16384u atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)work_cap,
+                                                  ((NSUInteger)expert_dim + 63u) / 64u,
+                                                  1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+            /* Step 3: Down Projection dispatch */
+            [enc setComputePipelineState:g_pso_moe_mm_q2_k_f16];
+            [enc setBytes:&down_mm_args length:sizeof(down_mm_args) atIndex:0];
+            [enc setBuffer:down_exps->mtl_buf offset:down_exps->offset atIndex:1];
+            [enc setBuffer:scratch_mid->mtl_buf offset:scratch_mid->offset atIndex:2];
+            [enc setBuffer:g_moe_id_map_buffer offset:0 atIndex:3];
+            [enc setBuffer:g_moe_id_map_buffer offset:tpe_bytes atIndex:4];
+            [enc setBuffer:scratch_down->mtl_buf offset:scratch_down->offset atIndex:5];
+            [enc setBuffer:g_moe_id_map_buffer offset:work_offset atIndex:6];
+            [enc setThreadgroupMemoryLength:8192u atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)work_cap,
+                                                  ((NSUInteger)dim + 63u) / 64u,
+                                                  1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+            /* Step 4: Sum Experts dispatch */
+            NSUInteger nth = g_pso_moe_sum6.maxTotalThreadsPerThreadgroup;
+            if (nth > 256u) nth = 256u;
+            if (nth > dim) nth = dim;
+            if (nth == 0) nth = 1u;
+            [enc setComputePipelineState:g_pso_moe_sum6];
+            [enc setBytes:&sum_args length:sizeof(sum_args) atIndex:0];
+            [enc setBuffer:scratch_down->mtl_buf offset:scratch_down->offset atIndex:1];
+            [enc setBuffer:moe_out->mtl_buf offset:moe_out->offset atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tok, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+
+            if (g_batch_cb) {
+                if (g_auto_barrier) {
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                }
+            } else {
+                [enc endEncoding];
+                [cb commit];
+                if (!wait_command_buffer(cb)) return 0;
+            }
+            return 1;
+        }
+
+        /* 1. Gate experts dispatch (IQ2_XXS) */
         struct ds4_metal_args_mul_mv_id gate_args = {
             .nei0 = (int32_t)n_activated_experts,
             .nei1 = (int32_t)n_tok,
@@ -1999,8 +2274,6 @@ int myds_metal_routed_moe_batch(
             logged_moe_mode = true;
         }
 
-        uint64_t down_row_bytes = (expert_dim / 256u) * 84u;
-        uint64_t down_exp_bytes = (uint64_t)dim * down_row_bytes;
         struct ds4_metal_args_mul_mv_id down_args = {
             .nei0 = (int32_t)n_activated_experts,
             .nei1 = (int32_t)n_tok,

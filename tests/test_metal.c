@@ -939,6 +939,89 @@ static int test_v41_engram_dispatch_copy(void) {
     return 1;
 }
 
+static int test_moe_batch_mm(void) {
+    const uint32_t dim = 256;
+    const uint32_t expert_dim = 256;
+    const uint32_t n_routed_experts = 8;
+    const uint32_t n_activated_experts = 6;
+    const uint32_t n_tok = 32;
+
+    uint64_t gate_bytes = (uint64_t)n_routed_experts * expert_dim * (dim / 256u) * 66u;
+    uint64_t down_bytes = (uint64_t)n_routed_experts * dim * (expert_dim / 256u) * 84u;
+
+    myds_metal_buffer_t *moe_out = myds_metal_buffer_alloc(n_tok * dim * sizeof(float));
+    myds_metal_buffer_t *x_in = myds_metal_buffer_alloc(n_tok * dim * sizeof(float));
+    myds_metal_buffer_t *gate_exps = myds_metal_buffer_alloc(gate_bytes);
+    myds_metal_buffer_t *up_exps = myds_metal_buffer_alloc(gate_bytes);
+    myds_metal_buffer_t *down_exps = myds_metal_buffer_alloc(down_bytes);
+    myds_metal_buffer_t *selected_ids = myds_metal_buffer_alloc(n_tok * 6 * sizeof(int32_t));
+    myds_metal_buffer_t *selected_weights = myds_metal_buffer_alloc(n_tok * 6 * sizeof(float));
+    myds_metal_buffer_t *scratch_gate = myds_metal_buffer_alloc(n_tok * 6 * expert_dim * sizeof(float));
+    myds_metal_buffer_t *scratch_up = myds_metal_buffer_alloc(n_tok * 6 * expert_dim * sizeof(float));
+    myds_metal_buffer_t *scratch_mid = myds_metal_buffer_alloc(n_tok * 6 * expert_dim * sizeof(float));
+    myds_metal_buffer_t *scratch_down = myds_metal_buffer_alloc(n_tok * 6 * dim * sizeof(float));
+
+    ASSERT_TRUE(moe_out && x_in && gate_exps && up_exps && down_exps &&
+                selected_ids && selected_weights && scratch_gate && scratch_up &&
+                scratch_mid && scratch_down);
+
+    memset(myds_metal_buffer_data(gate_exps), 0, gate_bytes);
+    memset(myds_metal_buffer_data(up_exps), 0, gate_bytes);
+    memset(myds_metal_buffer_data(down_exps), 0, down_bytes);
+
+    float *x = (float *)myds_metal_buffer_data(x_in);
+    for (uint32_t i = 0; i < n_tok * dim; i++) x[i] = 1.0f;
+
+    int32_t *ids = (int32_t *)myds_metal_buffer_data(selected_ids);
+    float *w = (float *)myds_metal_buffer_data(selected_weights);
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t k = 0; k < 6; k++) {
+            ids[t * 6 + k] = (int32_t)(k % n_routed_experts);
+            w[t * 6 + k] = 1.0f / 6.0f;
+        }
+    }
+
+    /* Test 1: n_tok = 32 exercises the MM path */
+    ASSERT_TRUE(myds_metal_routed_moe_batch(
+        moe_out, x_in, gate_exps, up_exps, down_exps,
+        selected_ids, selected_weights,
+        scratch_gate, scratch_up, scratch_mid, scratch_down,
+        dim, expert_dim, n_routed_experts, n_activated_experts, n_tok,
+        GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_K, 10.0f));
+
+    float *out = (float *)myds_metal_buffer_data(moe_out);
+    for (uint32_t i = 0; i < n_tok * dim; i++) {
+        ASSERT_TRUE(isfinite(out[i]));
+    }
+
+    /* Test 2: n_tok = 1 exercises the decode MV path */
+    ASSERT_TRUE(myds_metal_routed_moe_batch(
+        moe_out, x_in, gate_exps, up_exps, down_exps,
+        selected_ids, selected_weights,
+        scratch_gate, scratch_up, scratch_mid, scratch_down,
+        dim, expert_dim, n_routed_experts, n_activated_experts, 1,
+        GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_K, 10.0f));
+
+    for (uint32_t i = 0; i < dim; i++) {
+        ASSERT_TRUE(isfinite(out[i]));
+    }
+
+    myds_metal_buffer_free(moe_out);
+    myds_metal_buffer_free(x_in);
+    myds_metal_buffer_free(gate_exps);
+    myds_metal_buffer_free(up_exps);
+    myds_metal_buffer_free(down_exps);
+    myds_metal_buffer_free(selected_ids);
+    myds_metal_buffer_free(selected_weights);
+    myds_metal_buffer_free(scratch_gate);
+    myds_metal_buffer_free(scratch_up);
+    myds_metal_buffer_free(scratch_mid);
+    myds_metal_buffer_free(scratch_down);
+
+    printf("  [PASS] MoE batch MM path (n_tok=32) and decode MV path (n_tok=1) verification\n");
+    return 1;
+}
+
 int main(void) {
     printf("====================================================\n");
     printf("   Running myds Metal GPU Kernel Verification\n");
@@ -955,6 +1038,7 @@ int main(void) {
     RUN_TEST(test_v41_bf16_norm());
     RUN_TEST(test_v41_hc());
     RUN_TEST(test_v41_engram_dispatch_copy());
+    RUN_TEST(test_moe_batch_mm());
     RUN_TEST(test_rmsnorm());
     RUN_TEST(test_swiglu());
     RUN_TEST(test_rope());
