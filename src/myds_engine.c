@@ -1871,6 +1871,12 @@ static bool trace_selected(const char *filter, uint32_t value) {
 
 /* Opt-in numerical diagnostics, independent of sampling/text decoding. Files
  * contain native little-endian F32 on Apple Silicon. Never enabled by default. */
+bool myds_trace_active(void) {
+    const char *prefix = getenv("MYDS_TRACE_PREFIX");
+    if (!prefix || !*prefix) prefix = getenv("MYDS_BATCH_TRACE_PREFIX");
+    return (prefix && *prefix);
+}
+
 bool myds_trace_f32(const char *stage, uint32_t layer, uint32_t pos,
                       const myds_metal_buffer_t *buffer, size_t count) {
     const char *prefix = getenv("MYDS_TRACE_PREFIX");

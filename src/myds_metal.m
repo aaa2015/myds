@@ -60,6 +60,12 @@ static uint64_t                    g_shared_event_val = 0;
 static bool                        g_initialized = false;
 static NSCache                    *g_exact_view_cache = nil;
 static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *g_native_pipelines = nil;
+struct native_kernel_cache_entry {
+    char name[64];
+    id<MTLComputePipelineState> pso;
+};
+static struct native_kernel_cache_entry g_native_pso_cache[64];
+static size_t g_native_pso_cache_count = 0;
 
 static id<MTLBuffer> get_exact_buffer_view(const void *base_ptr, uint64_t offset, uint64_t len, NSUInteger *out_offset) {
     if (!g_device || !base_ptr || len == 0) return nil;
@@ -536,6 +542,11 @@ void myds_metal_cleanup(void) {
     g_library = nil;
     g_native_pipelines = nil;
     g_queue = nil;
+    for (size_t i = 0; i < g_native_pso_cache_count; i++) {
+        g_native_pso_cache[i].pso = nil;
+        g_native_pso_cache[i].name[0] = '\0';
+    }
+    g_native_pso_cache_count = 0;
     g_device = nil;
     g_exact_view_cache = nil;
     g_initialized = false;
@@ -558,6 +569,18 @@ int myds_metal_commit_batch(void) {
     [cb commit];
     g_batch_commit_count++;
     return wait_command_buffer(cb);
+}
+
+int myds_metal_flush_batch(void) {
+    if (!g_batch_cb) return 1;
+    close_compute_encoder();
+    id<MTLCommandBuffer> cb = g_batch_cb;
+    g_batch_cb = nil;
+    if (!g_inflight_cbs) g_inflight_cbs = [NSMutableArray new];
+    [g_inflight_cbs addObject:cb];
+    [cb commit];
+    g_batch_commit_count++;
+    return 1;
 }
 
 int myds_metal_signal_event(uint64_t *out_val) {
@@ -862,27 +885,44 @@ int myds_metal_dispatch_kernel_constants(const char *name, const void *args, siz
     for (size_t i = 0; i < n_buffers; ++i)
         if (!buffers[i] || !buffers[i]->mtl_buf || !buffers[i]->size) return 0;
     @autoreleasepool {
-        NSString *function_name = [NSString stringWithUTF8String:name];
-        if (!function_name) return 0;
-        NSMutableString *key = [function_name mutableCopy];
-        for (size_t i=0;i<n_constants;i++)
-            [key appendFormat:@":%u:%d:%d",constants[i].index,constants[i].is_bool,constants[i].value];
-        if (!g_native_pipelines) g_native_pipelines = [NSMutableDictionary new];
-        id<MTLComputePipelineState> pipeline = g_native_pipelines[key];
-        if (!pipeline) {
-            MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
-            for (size_t i=0;i<n_constants;i++) {
-                bool bv=constants[i].value!=0;
-                int32_t iv=constants[i].value;
-                [values setConstantValue:constants[i].is_bool ? (const void *)&bv : (const void *)&iv
-                    type:constants[i].is_bool ? MTLDataTypeBool : MTLDataTypeInt atIndex:constants[i].index];
+        id<MTLComputePipelineState> pipeline = nil;
+        if (n_constants == 0) {
+            for (size_t i = 0; i < g_native_pso_cache_count; i++) {
+                if (strcmp(g_native_pso_cache[i].name, name) == 0) {
+                    pipeline = g_native_pso_cache[i].pso;
+                    break;
+                }
             }
-            id<MTLFunction> fn = n_constants ? [g_library newFunctionWithName:function_name constantValues:values error:nil]
-                                           : [g_library newFunctionWithName:function_name];
-            if (!fn) return 0;
-            pipeline = [g_device newComputePipelineStateWithFunction:fn error:nil];
-            if (!pipeline) return 0;
-            g_native_pipelines[key] = pipeline;
+        }
+        if (!pipeline) {
+            NSString *function_name = [NSString stringWithUTF8String:name];
+            if (!function_name) return 0;
+            NSMutableString *key = [function_name mutableCopy];
+            for (size_t i=0;i<n_constants;i++)
+                [key appendFormat:@":%u:%d:%d",constants[i].index,constants[i].is_bool,constants[i].value];
+            if (!g_native_pipelines) g_native_pipelines = [NSMutableDictionary new];
+            pipeline = g_native_pipelines[key];
+            if (!pipeline) {
+                MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
+                for (size_t i=0;i<n_constants;i++) {
+                    bool bv=constants[i].value!=0;
+                    int32_t iv=constants[i].value;
+                    [values setConstantValue:constants[i].is_bool ? (const void *)&bv : (const void *)&iv
+                        type:constants[i].is_bool ? MTLDataTypeBool : MTLDataTypeInt atIndex:constants[i].index];
+                }
+                id<MTLFunction> fn = n_constants ? [g_library newFunctionWithName:function_name constantValues:values error:nil]
+                                               : [g_library newFunctionWithName:function_name];
+                if (!fn) return 0;
+                pipeline = [g_device newComputePipelineStateWithFunction:fn error:nil];
+                if (!pipeline) return 0;
+                g_native_pipelines[key] = pipeline;
+            }
+            if (n_constants == 0 && g_native_pso_cache_count < 64 && strlen(name) < 64) {
+                strncpy(g_native_pso_cache[g_native_pso_cache_count].name, name, 63);
+                g_native_pso_cache[g_native_pso_cache_count].name[63] = '\0';
+                g_native_pso_cache[g_native_pso_cache_count].pso = pipeline;
+                g_native_pso_cache_count++;
+            }
         }
         if (n_threads > pipeline.maxTotalThreadsPerThreadgroup ||
             threadgroup_memory > g_device.maxThreadgroupMemoryLength ||
@@ -2000,8 +2040,8 @@ int myds_metal_routed_moe_batch(
         static bool logged_moe_mode = false;
         if (!logged_moe_mode) {
             printf("myds_metal: routed_moe mode = %s (batch_capable)\n",
-                   (g_pso_moe_slots6_pair_swiglu_iq2_xxs && g_pso_moe_slots6_sum6_q2_k) ? "SLOTS6 (2-step)" :
-                   (g_pso_moe_pair_swiglu_iq2_xxs && g_pso_moe_sum6_q2_k) ? "FUSED (2-step)" : "FALLBACK (5-step)");
+                   (g_pso_moe_pair_swiglu_iq2_xxs && g_pso_moe_sum6_q2_k) ? "FUSED (2-step)" :
+                   (g_pso_moe_slots6_pair_swiglu_iq2_xxs && g_pso_moe_slots6_sum6_q2_k) ? "SLOTS6 (2-step)" : "FALLBACK (5-step)");
             fflush(stdout);
             logged_moe_mode = true;
         }
@@ -2051,7 +2091,47 @@ int myds_metal_routed_moe_batch(
             .clamp_value = clamp_val,
         };
 
-        if (n_tok == 1 && g_pso_moe_slots6_pair_swiglu_iq2_xxs && g_pso_moe_slots6_sum6_q2_k) {
+        if (g_pso_moe_pair_swiglu_iq2_xxs && g_pso_moe_sum6_q2_k) {
+            /* Fused Gate + Up + SwiGLU + Scaling dispatch (IQ2_XXS) across all tokens */
+            [enc setComputePipelineState:g_pso_moe_pair_swiglu_iq2_xxs];
+            [enc setBytes:&gate_args length:sizeof(gate_args) atIndex:0];
+            [enc setBytes:&swiglu_args length:sizeof(swiglu_args) atIndex:1];
+            [enc setBuffer:gate_exps->mtl_buf offset:gate_exps->offset atIndex:2];
+            [enc setBuffer:up_exps->mtl_buf offset:up_exps->offset atIndex:3];
+            [enc setBuffer:x_in->mtl_buf offset:x_in->offset atIndex:4];
+            [enc setBuffer:scratch_gate->mtl_buf offset:scratch_gate->offset atIndex:5];
+            [enc setBuffer:scratch_up->mtl_buf offset:scratch_up->offset atIndex:6];
+            [enc setBuffer:scratch_mid->mtl_buf offset:scratch_mid->offset atIndex:7];
+            [enc setBuffer:selected_ids->mtl_buf offset:selected_ids->offset atIndex:8];
+            [enc setBuffer:selected_weights->mtl_buf offset:selected_weights->offset atIndex:9];
+            [enc setThreadgroupMemoryLength:smem_iq2 atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(row_groups_gate, 1, pairs)
+                threadsPerThreadgroup:MTLSizeMake(32, nsg_gate, 1)];
+
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+            /* Fused Down + Sum6 direct accumulation dispatch (Q2_K) across all tokens */
+            [enc setComputePipelineState:g_pso_moe_sum6_q2_k];
+            [enc setBytes:&down_args length:sizeof(down_args) atIndex:0];
+            [enc setBuffer:down_exps->mtl_buf offset:down_exps->offset atIndex:1];
+            [enc setBuffer:scratch_mid->mtl_buf offset:scratch_mid->offset atIndex:2];
+            [enc setBuffer:moe_out->mtl_buf offset:moe_out->offset atIndex:3];
+            [enc setBuffer:selected_ids->mtl_buf offset:selected_ids->offset atIndex:4];
+            [enc setBuffer:moe_out->mtl_buf offset:moe_out->offset atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake(row_groups_down, (NSUInteger)n_tok, 1)
+                threadsPerThreadgroup:MTLSizeMake(32, nsg_down, 1)];
+
+            if (g_batch_cb) {
+                if (g_auto_barrier) {
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                }
+            } else {
+                [enc endEncoding];
+                [cb commit];
+                if (!wait_command_buffer(cb)) return 0;
+            }
+            return 1;
+        } else if (n_tok == 1 && g_pso_moe_slots6_pair_swiglu_iq2_xxs && g_pso_moe_slots6_sum6_q2_k) {
             const int32_t *sel_ids = (const int32_t *)selected_ids->ptr;
 
             /* 1. Slots6 Fused Gate + Up + SwiGLU + Scaling dispatch (IQ2_XXS) */
@@ -2105,46 +2185,6 @@ int myds_metal_routed_moe_batch(
             [enc setBuffer:scratch_mid->mtl_buf offset:scratch_mid->offset atIndex:7];
             [enc setBuffer:moe_out->mtl_buf offset:moe_out->offset atIndex:8];
             [enc dispatchThreadgroups:MTLSizeMake(row_groups_down, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(32, nsg_down, 1)];
-
-            if (g_batch_cb) {
-                if (g_auto_barrier) {
-                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-                }
-            } else {
-                [enc endEncoding];
-                [cb commit];
-                if (!wait_command_buffer(cb)) return 0;
-            }
-            return 1;
-        } else if (g_pso_moe_pair_swiglu_iq2_xxs && g_pso_moe_sum6_q2_k) {
-            /* Fused Gate + Up + SwiGLU + Scaling dispatch (IQ2_XXS) across all tokens */
-            [enc setComputePipelineState:g_pso_moe_pair_swiglu_iq2_xxs];
-            [enc setBytes:&gate_args length:sizeof(gate_args) atIndex:0];
-            [enc setBytes:&swiglu_args length:sizeof(swiglu_args) atIndex:1];
-            [enc setBuffer:gate_exps->mtl_buf offset:gate_exps->offset atIndex:2];
-            [enc setBuffer:up_exps->mtl_buf offset:up_exps->offset atIndex:3];
-            [enc setBuffer:x_in->mtl_buf offset:x_in->offset atIndex:4];
-            [enc setBuffer:scratch_gate->mtl_buf offset:scratch_gate->offset atIndex:5];
-            [enc setBuffer:scratch_up->mtl_buf offset:scratch_up->offset atIndex:6];
-            [enc setBuffer:scratch_mid->mtl_buf offset:scratch_mid->offset atIndex:7];
-            [enc setBuffer:selected_ids->mtl_buf offset:selected_ids->offset atIndex:8];
-            [enc setBuffer:selected_weights->mtl_buf offset:selected_weights->offset atIndex:9];
-            [enc setThreadgroupMemoryLength:smem_iq2 atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake(row_groups_gate, 1, pairs)
-                threadsPerThreadgroup:MTLSizeMake(32, nsg_gate, 1)];
-
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-            /* Fused Down + Sum6 direct accumulation dispatch (Q2_K) across all tokens */
-            [enc setComputePipelineState:g_pso_moe_sum6_q2_k];
-            [enc setBytes:&down_args length:sizeof(down_args) atIndex:0];
-            [enc setBuffer:down_exps->mtl_buf offset:down_exps->offset atIndex:1];
-            [enc setBuffer:scratch_mid->mtl_buf offset:scratch_mid->offset atIndex:2];
-            [enc setBuffer:moe_out->mtl_buf offset:moe_out->offset atIndex:3];
-            [enc setBuffer:selected_ids->mtl_buf offset:selected_ids->offset atIndex:4];
-            [enc setBuffer:moe_out->mtl_buf offset:moe_out->offset atIndex:5];
-            [enc dispatchThreadgroups:MTLSizeMake(row_groups_down, (NSUInteger)n_tok, 1)
                 threadsPerThreadgroup:MTLSizeMake(32, nsg_down, 1)];
 
             if (g_batch_cb) {

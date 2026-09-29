@@ -398,12 +398,12 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
     const float initial_pre[4]={1,0,0,0};
     CHECK(myds_metal_buffer_write(g->pre,0,initial_pre,sizeof(initial_pre)));
     TRACE("embedding",g->residual,4*V41_DIM);
+    CHECK(myds_metal_begin_batch());
     for (il=0;il<V41_LAYERS;il++) {
         const myds_layer_t *base=&m->layers[il];
         const v41_layer_t *l=&v->layers[il];
         const bool compressed=ratio_for(il)!=0;
         phase="HC attention input";
-        CHECK(myds_metal_begin_batch());
         if (il==1 || il==14) {
             uint32_t e=il==1?0:1;
             CHECK(project(g->engram_kv,v->engram_proj[e],g->engram_rows[e],5*V41_DIM,MYDS_ENGRAM_INPUT_DIM,GGML_TYPE_F16,true));
@@ -462,12 +462,10 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
         CHECK(myds_metal_v41_hc_expand(g->residual,ctx->ffn_out,g->after_attn,g->ffn_split,V41_DIM));
         CHECK(myds_metal_buffer_copy(g->pre,0,g->ffn_split,0,4*4u));
         TRACE("layer_out",g->residual,4*V41_DIM);
-        /* A bounded command batch per layer retains all scratch dependencies. */
-        CHECK(myds_metal_commit_batch());
+        myds_metal_barrier();
     }
     phase="output head";
     if (need_logits) {
-        CHECK(myds_metal_begin_batch());
         CHECK(myds_metal_v41_hc_weighted_sum(ctx->x,g->residual,g->pre,V41_DIM));
         CHECK(myds_metal_v41_rmsnorm(ctx->x_norm,ctx->x,m->output_norm,V41_DIM,m->norm_eps,true));
         CHECK(project(ctx->logits,m->output,ctx->x_norm,m->vocab_size,V41_DIM,m->output_type,false));
@@ -475,6 +473,8 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
         CHECK(myds_trace_f32("logits",0,pos,ctx->logits,m->vocab_size));
         const float *logits=myds_metal_buffer_data(ctx->logits);
         for (uint32_t i=0;i<m->vocab_size;i++) if (!isfinite(logits[i])) goto fail;
+    } else {
+        CHECK(myds_metal_commit_batch());
     }
     g->next_position=pos+1u;
     return need_logits ? myds_sample_next_token(myds_metal_buffer_data(ctx->logits),m->vocab_size,&ctx->cfg,ctx,NULL,0) : 0;

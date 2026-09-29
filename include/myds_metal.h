@@ -260,9 +260,11 @@ int myds_metal_softmax(
 /* Batch command buffer management */
 int      myds_metal_begin_batch(void);
 int      myds_metal_commit_batch(void);
+int      myds_metal_flush_batch(void);
 uint64_t myds_metal_get_commit_count(void);
 void     myds_metal_barrier(void);
 void     myds_metal_set_auto_barrier(int enable);
+bool     myds_trace_active(void);
 
 /* Shared Event management for overlapping router gate with shared expert.
  * commit_and_wait_event waits only through the signal point; subsequent work

@@ -105,11 +105,11 @@ int myds_v41_moe_eval(myds_context_t *ctx, uint32_t layer, uint32_t pos,
                         router_logits,l->router_bias,m->n_routed_experts,k,m->routed_scaling_factor) ||
         !myds_trace_f32("route_probs",layer,pos,ctx->moe_gate,m->n_routed_experts) ||
         !myds_trace_f32("route_weights",layer,pos,ctx->selected_weights,k)) return 0;
-    const myds_metal_buffer_t *id_buffers[] = {ctx->selected_ids,ctx->moe_up};
-    if (!dispatch("kernel_myds_v41_ids_f32",&k,sizeof(k),id_buffers,2,1,32,0) ||
-        !myds_trace_f32("route_ids",layer,pos,ctx->moe_up,k)) return 0;
-    // Complete the router before inspecting unified-memory values.
-    if (!myds_metal_commit_batch() || !myds_metal_begin_batch()) return 0;
+    if (myds_trace_active()) {
+        const myds_metal_buffer_t *id_buffers[] = {ctx->selected_ids,ctx->moe_up};
+        if (!dispatch("kernel_myds_v41_ids_f32",&k,sizeof(k),id_buffers,2,1,32,0) ||
+            !myds_trace_f32("route_ids",layer,pos,ctx->moe_up,k)) return 0;
+    }
     if (!myds_trace_f32("shared_out",layer,pos,shared_out,dim)) return 0;
     myds_metal_barrier();
     if (!myds_metal_routed_moe(ctx->moe_out,ffn_norm,l->ffn_gate_exps,
