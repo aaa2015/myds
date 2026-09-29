@@ -463,11 +463,15 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     if (chunk_size > 2048u) chunk_size = 2048u;
 
     size_t res_size = (size_t)n_tokens * 4u * V41_DIM;
-    float *prompt_res = (float *)malloc(res_size * sizeof(float));
-    float *prompt_pre = (float *)malloc((size_t)n_tokens * 4u * sizeof(float));
-    int32_t *prompt_selected = (int32_t *)malloc((size_t)n_tokens * V41_TOPK * sizeof(int32_t));
+    size_t res_tok_bytes = 4u * V41_DIM * sizeof(float);
+    size_t pre_tok_bytes = 4u * sizeof(float);
+    size_t sel_bytes = V41_TOPK * sizeof(int32_t);
     size_t mask_bytes = (size_t)myds_metal_buffer_size(g->block_mask);
-    uint8_t *prompt_block_mask = (uint8_t *)malloc((size_t)n_tokens * mask_bytes);
+
+    myds_metal_buffer_t *prompt_res = myds_metal_buffer_alloc(res_size * sizeof(float));
+    myds_metal_buffer_t *prompt_pre = myds_metal_buffer_alloc((size_t)n_tokens * pre_tok_bytes);
+    myds_metal_buffer_t *prompt_selected = myds_metal_buffer_alloc((size_t)n_tokens * sel_bytes);
+    myds_metal_buffer_t *prompt_block_mask = myds_metal_buffer_alloc((size_t)n_tokens * mask_bytes);
     float *engram_all[2] = {NULL, NULL};
     engram_all[0] = (float *)malloc((size_t)n_tokens * MYDS_ENGRAM_INPUT_DIM * sizeof(float));
     engram_all[1] = (float *)malloc((size_t)n_tokens * MYDS_ENGRAM_INPUT_DIM * sizeof(float));
@@ -475,10 +479,10 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     if (!prompt_res || !prompt_pre || !prompt_selected || !prompt_block_mask ||
         !engram_all[0] || !engram_all[1]) {
         MYDS_LOG_E("V4.1 prefill failed to allocate workspace buffers");
-        free(prompt_res);
-        free(prompt_pre);
-        free(prompt_selected);
-        free(prompt_block_mask);
+        myds_metal_buffer_free(prompt_res);
+        myds_metal_buffer_free(prompt_pre);
+        myds_metal_buffer_free(prompt_selected);
+        myds_metal_buffer_free(prompt_block_mask);
         free(engram_all[0]);
         free(engram_all[1]);
         return -1;
@@ -508,18 +512,20 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             goto fail;
         }
         const uint16_t *row = embd_table + (size_t)tok * V41_DIM;
-        float *r = prompt_res + (size_t)t * 4u * V41_DIM;
+        float r[4 * V41_DIM];
         for (uint32_t j = 0; j < V41_DIM; j++) {
-            r[j] = myds_fp16_to_fp32(row[j]);
+            float v_emb = myds_fp16_to_fp32(row[j]);
+            r[j] = v_emb;
+            r[j + V41_DIM] = v_emb;
+            r[j + 2 * V41_DIM] = v_emb;
+            r[j + 3 * V41_DIM] = v_emb;
         }
-        for (uint32_t s = 1; s < 4; s++) {
-            memcpy(r + s * V41_DIM, r, V41_DIM * sizeof(float));
-        }
-        float *p = prompt_pre + (size_t)t * 4u;
-        p[0] = 1.0f; p[1] = 0.0f; p[2] = 0.0f; p[3] = 0.0f;
+        const float initial_pre[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+        if (!myds_metal_buffer_write(prompt_res, (size_t)t * res_tok_bytes, r, res_tok_bytes)) goto fail;
+        if (!myds_metal_buffer_write(prompt_pre, (size_t)t * pre_tok_bytes, initial_pre, pre_tok_bytes)) goto fail;
 
         if (getenv("MYDS_BATCH_TRACE_PREFIX")) {
-            memcpy(myds_metal_buffer_data(g->residual), r, 4u * V41_DIM * sizeof(float));
+            memcpy(myds_metal_buffer_data(g->residual), r, res_tok_bytes);
             if (!myds_trace_f32("embedding", 0, base_pos + t, g->residual, 4 * V41_DIM)) goto fail;
         }
     }
@@ -542,14 +548,12 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             for (uint32_t t = 0; t < c_len; t++) {
                 uint32_t idx = c_start + t;
                 uint32_t pos = base_pos + idx;
-                float *tok_res = prompt_res + (size_t)idx * 4u * V41_DIM;
-                float *tok_pre = prompt_pre + (size_t)idx * 4u;
-
-                memcpy(myds_metal_buffer_data(g->residual), tok_res, 4u * V41_DIM * sizeof(float));
-                memcpy(myds_metal_buffer_data(g->pre), tok_pre, 4u * sizeof(float));
 
                 phase = "HC attention input";
                 CHECK(myds_metal_begin_batch());
+
+                CHECK(myds_metal_buffer_copy(g->residual, 0, prompt_res, (size_t)idx * res_tok_bytes, res_tok_bytes));
+                CHECK(myds_metal_buffer_copy(g->pre, 0, prompt_pre, (size_t)idx * pre_tok_bytes, pre_tok_bytes));
 
                 if (il == 1 || il == 14) {
                     uint32_t e = (il == 1 ? 0 : 1);
@@ -589,23 +593,19 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 
                 phase = "compressed KV / indexer";
                 if (il > 20 && index_source(il)) {
-                    uint8_t *src_mask = prompt_block_mask + (size_t)idx * mask_bytes;
-                    CHECK(myds_metal_buffer_write(g->block_mask, 0, src_mask, mask_bytes));
+                    CHECK(myds_metal_buffer_copy(g->block_mask, 0, prompt_block_mask, (size_t)idx * mask_bytes, mask_bytes));
                 }
                 CHECK(publish_and_select(ctx, il, pos));
                 if (il == 20) {
-                    uint8_t *dst_mask = prompt_block_mask + (size_t)idx * mask_bytes;
-                    memcpy(dst_mask, myds_metal_buffer_data(g->block_mask), mask_bytes);
+                    CHECK(myds_metal_buffer_copy(prompt_block_mask, (size_t)idx * mask_bytes, g->block_mask, 0, mask_bytes));
                 }
-                if (index_source(il)) {
-                    int32_t *dst_sel = prompt_selected + (size_t)idx * V41_TOPK;
-                    memcpy(dst_sel, myds_metal_buffer_data(g->selected), V41_TOPK * sizeof(int32_t));
-                } else if (compressed) {
-                    int32_t *src_sel = prompt_selected + (size_t)idx * V41_TOPK;
-                    memcpy(myds_metal_buffer_data(g->selected), src_sel, V41_TOPK * sizeof(int32_t));
+                uint32_t count = compressed ? (pos + 1u) / ratio_for(il) : 0;
+                if (count && index_source(il)) {
+                    CHECK(myds_metal_buffer_copy(prompt_selected, (size_t)idx * sel_bytes, g->selected, 0, sel_bytes));
+                } else if (count && compressed) {
+                    CHECK(myds_metal_buffer_copy(g->selected, 0, prompt_selected, (size_t)idx * sel_bytes, sel_bytes));
                 }
 
-                uint32_t count = compressed ? (pos + 1u) / ratio_for(il) : 0;
                 uint32_t top = count < V41_TOPK ? count : V41_TOPK;
                 if (count) {
                     CHECK(myds_v41_gpu_gather(g->selected_kv, g->compressed[owner_for(il)], g->selected, count, top));
@@ -637,24 +637,24 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 CHECK(myds_metal_buffer_copy(g->pre, 0, g->ffn_split, 0, 4 * 4u));
                 TRACE("layer_out", g->residual, 4 * V41_DIM);
 
-                CHECK(myds_metal_commit_batch());
+                CHECK(myds_metal_buffer_copy(prompt_res, (size_t)idx * res_tok_bytes, g->residual, 0, res_tok_bytes));
+                CHECK(myds_metal_buffer_copy(prompt_pre, (size_t)idx * pre_tok_bytes, g->pre, 0, pre_tok_bytes));
 
-                memcpy(tok_res, myds_metal_buffer_data(g->residual), 4u * V41_DIM * sizeof(float));
-                memcpy(tok_pre, myds_metal_buffer_data(g->pre), 4u * sizeof(float));
+                CHECK(myds_metal_commit_batch());
             }
         }
     }
-#undef CHECK
-#undef TRACE
 
     ctx->pos = base_pos + n_tokens;
     g->next_position = ctx->pos;
     g->valid = true;
 
-    float *last_res = prompt_res + (size_t)(n_tokens - 1) * 4u * V41_DIM;
-    float *last_pre = prompt_pre + (size_t)(n_tokens - 1) * 4u;
-    memcpy(myds_metal_buffer_data(g->residual), last_res, 4u * V41_DIM * sizeof(float));
-    memcpy(myds_metal_buffer_data(g->pre), last_pre, 4u * sizeof(float));
+    size_t last_idx = n_tokens - 1;
+    CHECK(myds_metal_buffer_copy(g->residual, 0, prompt_res, last_idx * res_tok_bytes, res_tok_bytes));
+    CHECK(myds_metal_buffer_copy(g->pre, 0, prompt_pre, last_idx * pre_tok_bytes, pre_tok_bytes));
+    CHECK(myds_metal_commit_batch());
+#undef CHECK
+#undef TRACE
 
     if (ctx->cfg.temperature > 0.0f) {
         for (uint32_t i = 0; i < n_tokens; i++) {
@@ -662,19 +662,20 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         }
     }
 
-    free(prompt_res);
-    free(prompt_pre);
-    free(prompt_selected);
-    free(prompt_block_mask);
+    myds_metal_buffer_free(prompt_res);
+    myds_metal_buffer_free(prompt_pre);
+    myds_metal_buffer_free(prompt_selected);
+    myds_metal_buffer_free(prompt_block_mask);
     free(engram_all[0]);
     free(engram_all[1]);
     return 1;
 
 cancelled:
-    free(prompt_res);
-    free(prompt_pre);
-    free(prompt_selected);
-    free(prompt_block_mask);
+    (void)myds_metal_commit_batch();
+    myds_metal_buffer_free(prompt_res);
+    myds_metal_buffer_free(prompt_pre);
+    myds_metal_buffer_free(prompt_selected);
+    myds_metal_buffer_free(prompt_block_mask);
     free(engram_all[0]);
     free(engram_all[1]);
     return -2;
@@ -683,10 +684,10 @@ fail:
     MYDS_LOG_E("V4.1 prefill failed at layer %u: %s", il, phase);
     (void)myds_metal_commit_batch();
     g->valid = false;
-    free(prompt_res);
-    free(prompt_pre);
-    free(prompt_selected);
-    free(prompt_block_mask);
+    myds_metal_buffer_free(prompt_res);
+    myds_metal_buffer_free(prompt_pre);
+    myds_metal_buffer_free(prompt_selected);
+    myds_metal_buffer_free(prompt_block_mask);
     free(engram_all[0]);
     free(engram_all[1]);
     return -1;
