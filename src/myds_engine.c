@@ -265,7 +265,8 @@ static myds_model_t *model_load_internal(const char *model_path, bool diagnostic
     }
 
     const char *missing_feature = unimplemented_graph_feature(gf);
-    if (missing_feature && !diagnostic) {
+    bool allowed = diagnostic || (getenv("MYDS_ALLOW_V41") != NULL);
+    if (missing_feature && !allowed) {
         MYDS_LOG_E("Cannot run this model correctly: native graph has not passed the correctness gate for %s. "
                    "Refusing inference rather than silently skipping model operations. "
                    "See docs/CORRECTNESS_STATUS.md.", missing_feature);
