@@ -9,6 +9,8 @@ myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp);
 void myds_v41_gpu_scratch_free(myds_v41_gpu_scratch_t *scratch);
 int myds_v41_gpu_rope(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
     uint32_t pos,bool compressed,bool inverse);
+int myds_v41_gpu_rope_batch(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
+    uint32_t start_pos,uint32_t rows,bool compressed,bool inverse);
 /* 0 BF16, 1 FP8 E8M0 scales, 2 FP4 E8M0 scales, 3 FP4 E4M3 scales. */
 int myds_v41_gpu_quant(myds_metal_buffer_t *x,uint32_t width,uint32_t rows,uint32_t mode);
 /* Even positions cache kv/scores; odd positions write the pooled output. */

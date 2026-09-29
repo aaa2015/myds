@@ -8,6 +8,7 @@
 struct myds_v41_gpu_scratch {
     uint32_t max_comp;
     myds_metal_buffer_t *sort_a, *sort_b, *kv_f16, *mask, *pad, *partial;
+    myds_metal_buffer_t *sv_view, *dv_view;
 };
 static int floats(const myds_metal_buffer_t *b,uint64_t n) {
     return b && n && n<=myds_metal_buffer_size(b)/4 && myds_metal_buffer_offset(b)%4==0;
@@ -36,7 +37,9 @@ myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp) {
     s->mask=myds_metal_buffer_alloc(640u*2u);
     s->pad=myds_metal_buffer_alloc(2u*32u*512u*2u+32u*2u);
     s->partial=myds_metal_buffer_alloc(64u*(512u+2u)*32u*4u);
-    if(!s->sort_a||!s->sort_b||!s->kv_f16||!s->mask||!s->pad||!s->partial){myds_v41_gpu_scratch_free(s);return NULL;}
+    s->sv_view=myds_metal_buffer_create_view();
+    s->dv_view=myds_metal_buffer_create_view();
+    if(!s->sort_a||!s->sort_b||!s->kv_f16||!s->mask||!s->pad||!s->partial||!s->sv_view||!s->dv_view){myds_v41_gpu_scratch_free(s);return NULL;}
     memset(myds_metal_buffer_data(s->mask),0,640u*2u);
     return s;
 }
@@ -44,7 +47,8 @@ void myds_v41_gpu_scratch_free(myds_v41_gpu_scratch_t *s) {
     if(!s)return;
     myds_metal_buffer_free(s->sort_a);myds_metal_buffer_free(s->sort_b);
     myds_metal_buffer_free(s->kv_f16);myds_metal_buffer_free(s->mask);
-    myds_metal_buffer_free(s->pad);myds_metal_buffer_free(s->partial);free(s);
+    myds_metal_buffer_free(s->pad);myds_metal_buffer_free(s->partial);
+    myds_metal_buffer_free(s->sv_view);myds_metal_buffer_free(s->dv_view);free(s);
 }
 static float rope_frequencies[2][32];
 static pthread_once_t rope_once=PTHREAD_ONCE_INIT;
@@ -69,14 +73,18 @@ static void init_rope(void) {
     }
 }
 #pragma float_control(pop)
-int myds_v41_gpu_rope(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
-    uint32_t pos,bool compressed,bool inverse) {
-    if(width<64||!heads||pos>=1048576||!floats(x,(uint64_t)width*heads))return 0;
+int myds_v41_gpu_rope_batch(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
+    uint32_t start_pos,uint32_t rows,bool compressed,bool inverse) {
+    if(width<64||!heads||!rows||start_pos>=1048576||!floats(x,(uint64_t)width*heads*rows))return 0;
     pthread_once(&rope_once,init_rope);
-    struct {uint32_t width,heads,rows,start,inverse,stride;float frequencies[32];} a={width,heads,1,pos,inverse,1,{0}};
+    struct {uint32_t width,heads,rows,start,inverse,stride;float frequencies[32];} a={width,heads,rows,start_pos,inverse,1,{0}};
     memcpy(a.frequencies,rope_frequencies[compressed?1:0],sizeof(a.frequencies));
     const myds_metal_buffer_t *b[]={x};
-    return dispatch("kernel_dsv41_rope",&a,sizeof(a),b,1,heads,1,1,32,1,1,0);
+    return dispatch("kernel_dsv41_rope",&a,sizeof(a),b,1,heads,rows,1,32,1,1,0);
+}
+int myds_v41_gpu_rope(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
+    uint32_t pos,bool compressed,bool inverse) {
+    return myds_v41_gpu_rope_batch(x,width,heads,pos,1,compressed,inverse);
 }
 int myds_v41_gpu_quant(myds_metal_buffer_t *x,uint32_t width,uint32_t rows,uint32_t mode) {
     uint32_t block=mode==3?16:32;
@@ -178,13 +186,11 @@ int myds_v41_gpu_gather(myds_metal_buffer_t *out,const myds_metal_buffer_t *cach
 
 /* Use transient subviews only as binding handles; Metal retains the underlying
  * resources until queued dispatches finish. No CPU readback or synchronization. */
-static int stage_f16(myds_metal_buffer_t *dst,size_t dstoff,const myds_metal_buffer_t *src,size_t srcoff,uint32_t count) {
-    myds_metal_buffer_t *sv=myds_metal_buffer_sub_view(src,srcoff,(size_t)count*4);
-    myds_metal_buffer_t *dv=myds_metal_buffer_sub_view(dst,dstoff,(size_t)count*2);
-    if(!sv||!dv){myds_metal_buffer_free(sv);myds_metal_buffer_free(dv);return 0;}
-    const myds_metal_buffer_t *b[]={sv,dv};
-    int ok=dispatch("kernel_cpy_contig_f32_f16_4",&count,sizeof(count),b,2,(count+1023u)/1024,1,1,256,1,1,0);
-    myds_metal_buffer_free(sv);myds_metal_buffer_free(dv);return ok;
+static int stage_f16(myds_metal_buffer_t *dst,size_t dstoff,const myds_metal_buffer_t *src,size_t srcoff,uint32_t count,myds_v41_gpu_scratch_t *s) {
+    if(!s||!src||!dst||!myds_metal_buffer_update_sub_view(s->sv_view,src,srcoff,(size_t)count*4)||
+       !myds_metal_buffer_update_sub_view(s->dv_view,dst,dstoff,(size_t)count*2)) return 0;
+    const myds_metal_buffer_t *b[]={s->sv_view,s->dv_view};
+    return dispatch("kernel_cpy_contig_f32_f16_4",&count,sizeof(count),b,2,(count+1023u)/1024,1,1,256,1,1,0);
 }
 struct flash_pad_args {
     int32_t ne11,ne_12_2,ne_12_3;uint64_t nb11,nb12,nb13,nb21,nb22,nb23;
@@ -203,9 +209,9 @@ int myds_v41_gpu_attention(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
         !floats(heads,64u*512)||!floats(q,64u*512)||!floats(sinks,64)||!floats(window,128u*512)||
         (selected_rows&&!floats(selected_kv,(uint64_t)selected_rows*512)))return 0;
     uint32_t tail=128-raw_start<n_raw?128-raw_start:n_raw;
-    if(!stage_f16(s->kv_f16,0,window,(size_t)raw_start*2048,tail*512))return 0;
-    if(n_raw>tail&&!stage_f16(s->kv_f16,(size_t)tail*1024,window,0,(n_raw-tail)*512))return 0;
-    if(selected_rows&&!stage_f16(s->kv_f16,(size_t)n_raw*1024,selected_kv,0,selected_rows*512))return 0;
+    if(!stage_f16(s->kv_f16,0,window,(size_t)raw_start*2048,tail*512,s))return 0;
+    if(n_raw>tail&&!stage_f16(s->kv_f16,(size_t)tail*1024,window,0,(n_raw-tail)*512,s))return 0;
+    if(selected_rows&&!stage_f16(s->kv_f16,(size_t)n_raw*1024,selected_kv,0,selected_rows*512,s))return 0;
     uint32_t keys=n_raw+selected_rows;uint64_t kvbytes=(uint64_t)keys*1024,maskbytes=(uint64_t)keys*2;
     if(keys%32) {
         struct flash_pad_args a={.ne11=keys,.ne_12_2=1,.ne_12_3=1,.nb11=1024,.nb12=kvbytes,.nb13=kvbytes,

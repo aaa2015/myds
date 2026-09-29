@@ -126,7 +126,9 @@ bool myds_engram_table_open(myds_engram_table_t *table, const char *path,
         goto error;
     }
 #ifdef __APPLE__
-    if (fcntl(fd, F_NOCACHE, 1) != 0 || fcntl(fd, F_RDAHEAD, 0) != 0) goto error;
+    if (getenv("MYDS_ENGRAM_NOCACHE")) {
+        if (fcntl(fd, F_NOCACHE, 1) != 0 || fcntl(fd, F_RDAHEAD, 0) != 0) goto error;
+    }
 #endif
     *table = (myds_engram_table_t){.fd = fd, .offset = offset, .rows = rows};
     return true;

@@ -21,6 +21,8 @@ void myds_metal_cleanup(void);
 myds_metal_buffer_t *myds_metal_buffer_alloc(size_t bytes);
 myds_metal_buffer_t *myds_metal_buffer_from_ptr(const void *ptr, size_t bytes);
 myds_metal_buffer_t *myds_metal_buffer_sub_view(const myds_metal_buffer_t *parent, size_t offset, size_t bytes);
+myds_metal_buffer_t *myds_metal_buffer_create_view(void);
+int                  myds_metal_buffer_update_sub_view(myds_metal_buffer_t *view, const myds_metal_buffer_t *parent, size_t offset, size_t bytes);
 void                 myds_metal_buffer_free(myds_metal_buffer_t *buf);
 void                *myds_metal_buffer_data(myds_metal_buffer_t *buf);
 size_t               myds_metal_buffer_size(const myds_metal_buffer_t *buf);
@@ -192,6 +194,28 @@ int myds_metal_routed_moe(
     ggml_type                  down_type,
     float                      clamp_val);
 
+int myds_metal_routed_moe_batch(
+    myds_metal_buffer_t       *moe_out,
+    const myds_metal_buffer_t *x_in,
+    const myds_metal_buffer_t *gate_exps,
+    const myds_metal_buffer_t *up_exps,
+    const myds_metal_buffer_t *down_exps,
+    const myds_metal_buffer_t *selected_ids,
+    const myds_metal_buffer_t *selected_weights,
+    myds_metal_buffer_t       *scratch_gate,
+    myds_metal_buffer_t       *scratch_up,
+    myds_metal_buffer_t       *scratch_mid,
+    myds_metal_buffer_t       *scratch_down,
+    uint32_t                   dim,
+    uint32_t                   expert_dim,
+    uint32_t                   n_routed_experts,
+    uint32_t                   n_activated_experts,
+    uint32_t                   n_tok,
+    ggml_type                  gate_type,
+    ggml_type                  up_type,
+    ggml_type                  down_type,
+    float                      clamp_val);
+
 /* Grouped attention output down-projection on GPU: heads -> attn_low */
 int myds_metal_attn_output_a(
     myds_metal_buffer_t       *low,
@@ -200,6 +224,16 @@ int myds_metal_attn_output_a(
     uint32_t                   n_groups,
     uint32_t                   group_dim,
     uint32_t                   rank,
+    ggml_type                  weight_type);
+
+int myds_metal_attn_output_a_batch(
+    myds_metal_buffer_t       *low,
+    const myds_metal_buffer_t *out_a,
+    const myds_metal_buffer_t *heads,
+    uint32_t                   n_groups,
+    uint32_t                   group_dim,
+    uint32_t                   rank,
+    uint32_t                   n_tok,
     ggml_type                  weight_type);
 
 /* DeepSeek-MoE Expert Output Accumulation: y = sum(w_i * expert_out_i) */
@@ -244,6 +278,23 @@ int myds_metal_synchronize(void);
 /* Pre-warm memory pages in unified RAM */
 void myds_metal_warm_memory(const void *addr, size_t size);
 void myds_metal_warm_buffer(const myds_metal_buffer_t *buf);
+
+/* Batched V4.1 HC and RMSNorm primitives across multiple tokens */
+int myds_metal_v41_rmsnorm_batch(myds_metal_buffer_t *out,
+    const myds_metal_buffer_t *x, const myds_metal_buffer_t *weight,
+    uint32_t dim, uint32_t n_tok, float eps, bool round_bf16);
+
+int myds_metal_v41_hc_weighted_sum_batch(myds_metal_buffer_t *out,
+    const myds_metal_buffer_t *residual, const myds_metal_buffer_t *weights,
+    uint32_t dim, uint32_t n_tok, uint64_t weight_stride_bytes);
+
+int myds_metal_v41_hc_expand_batch(myds_metal_buffer_t *out,
+    const myds_metal_buffer_t *block, const myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *split, uint32_t dim, uint32_t n_tok);
+
+int myds_metal_v41_hc_split_batch(myds_metal_buffer_t *split,
+    const myds_metal_buffer_t *mix, const myds_metal_buffer_t *scale,
+    const myds_metal_buffer_t *base, uint32_t n_tokens, float hc_eps);
 
 #ifdef __cplusplus
 }

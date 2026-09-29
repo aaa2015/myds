@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 
 #define V41_LAYERS 40u
 #define V41_DIM 5120u
@@ -275,13 +276,35 @@ static int project_batch(myds_metal_buffer_t *out, const myds_metal_buffer_t *w,
                          const myds_metal_buffer_t *in, uint32_t rows, uint32_t width,
                          uint32_t n_tok, ggml_type type, bool round) {
     myds_metal_barrier();
-    return ((type == GGML_TYPE_F16 || type == GGML_TYPE_F32)
-        ? myds_metal_v41_gemv_batch(out, w, in, rows, width, n_tok, type)
-        : myds_metal_gemv_batch(out, w, in, rows, width, n_tok, type)) &&
-        (!round || myds_metal_v41_bf16(out, rows * n_tok));
+    int use_mm = (n_tok >= 32 && getenv("MYDS_DISABLE_MUL_MM") == NULL);
+    int ok = 0;
+    if (use_mm) {
+        ok = myds_metal_mul_mm(out, w, in, rows, width, n_tok, type);
+    }
+    if (!ok) {
+        ok = ((type == GGML_TYPE_F16 || type == GGML_TYPE_F32)
+            ? myds_metal_v41_gemv_batch(out, w, in, rows, width, n_tok, type)
+            : myds_metal_gemv_batch(out, w, in, rows, width, n_tok, type));
+    }
+    return ok && (!round || myds_metal_v41_bf16(out, rows * n_tok));
 }
 
-static int publish_and_select(myds_context_t *ctx, uint32_t il, uint32_t pos) {
+static int dispatch_k(const char *kernel, const void *args, size_t size,
+                      const myds_metal_buffer_t *const *buffers, size_t count,
+                      uint32_t groups, uint32_t threads, size_t scratch) {
+    const uint32_t grid[3] = {groups, 1, 1}, block[3] = {threads, 1, 1};
+    return myds_metal_dispatch_kernel(kernel, args, size, buffers, count, grid, block, scratch);
+}
+
+static int publish_and_select(myds_context_t *ctx, uint32_t il, uint32_t pos,
+                              const myds_metal_buffer_t *x_norm, const myds_metal_buffer_t *qr_norm,
+                              const myds_metal_buffer_t *pre_pool_kv,
+                              const myds_metal_buffer_t *pre_pool_score,
+                              myds_metal_buffer_t *pre_index_q,
+                              const myds_metal_buffer_t *pre_index_weights,
+                              myds_metal_buffer_t *out_selected,
+                              const myds_metal_buffer_t *in_block_mask,
+                              myds_metal_buffer_t *out_block_mask) {
     myds_v41_context_t *g=ctx->v41;
     const v41_layer_t *l=&ctx->model->v41->layers[il];
     const uint32_t ratio=ratio_for(il), owner=owner_for(il);
@@ -289,12 +312,20 @@ static int publish_and_select(myds_context_t *ctx, uint32_t il, uint32_t pos) {
     const uint32_t count=(pos+1u)/ratio;
 #define CHECK(x) do { if (!(x)) return 0; } while (0)
     if (kv_source(il)) {
-        CHECK(project(g->pool_kv,l->compressor_kv,ctx->x_norm,512,V41_DIM,GGML_TYPE_F16,ratio==1));
+        const myds_metal_buffer_t *p_kv = pre_pool_kv;
+        if (!p_kv) {
+            CHECK(project(g->pool_kv,l->compressor_kv,x_norm,512,V41_DIM,GGML_TYPE_F16,ratio==1));
+            p_kv = g->pool_kv;
+        }
         if (ratio==2) {
-            CHECK(project(g->pool_score,l->compressor_gate,ctx->x_norm,512,V41_DIM,GGML_TYPE_F16,false));
-            CHECK(myds_v41_gpu_pool2(g->latent,g->pool_kv,g->pool_score,
+            const myds_metal_buffer_t *p_score = pre_pool_score;
+            if (!p_score) {
+                CHECK(project(g->pool_score,l->compressor_gate,x_norm,512,V41_DIM,GGML_TYPE_F16,false));
+                p_score = g->pool_score;
+            }
+            CHECK(myds_v41_gpu_pool2(g->latent,p_kv,p_score,
                 g->previous_kv[owner],g->previous_score[owner],512,pos));
-        } else CHECK(myds_metal_buffer_copy(g->latent,0,g->pool_kv,0,512*4u));
+        } else CHECK(myds_metal_buffer_copy(g->latent,0,p_kv,0,512*4u));
         if ((pos+1u)%ratio==0) {
             const uint32_t start=pos+1u-ratio;
             CHECK(myds_metal_v41_rmsnorm(g->latent,g->latent,l->compressor_norm,512,ctx->model->norm_eps,true));
@@ -309,18 +340,33 @@ static int publish_and_select(myds_context_t *ctx, uint32_t il, uint32_t pos) {
         }
     }
     if (count && index_source(il)) {
-        CHECK(project(g->index_q,l->index_q,ctx->qr_norm,V41_INDEX_HEADS*128,1280,GGML_TYPE_F16,true));
-        CHECK(myds_v41_gpu_rope(g->index_q,128,V41_INDEX_HEADS,pos,true,false));
-        CHECK(myds_v41_gpu_quant(g->index_q,128,V41_INDEX_HEADS,2));
-        CHECK(project(g->index_weights,l->index_proj,ctx->x_norm,V41_INDEX_HEADS,V41_DIM,GGML_TYPE_F16,true));
-        CHECK(myds_v41_gpu_indexscores(g->index_scores,g->index_q,g->index_weights,g->index_cache[owner],count,V41_INDEX_HEADS));
+        myds_metal_buffer_t *q_buf = pre_index_q;
+        if (!q_buf) {
+            CHECK(project(g->index_q,l->index_q,qr_norm,V41_INDEX_HEADS*128,1280,GGML_TYPE_F16,true));
+            q_buf = g->index_q;
+        }
+        CHECK(myds_v41_gpu_rope(q_buf,128,V41_INDEX_HEADS,pos,true,false));
+        CHECK(myds_v41_gpu_quant(q_buf,128,V41_INDEX_HEADS,2));
+
+        const myds_metal_buffer_t *w_buf = pre_index_weights;
+        if (!w_buf) {
+            CHECK(project(g->index_weights,l->index_proj,x_norm,V41_INDEX_HEADS,V41_DIM,GGML_TYPE_F16,true));
+            w_buf = g->index_weights;
+        }
+
+        CHECK(myds_v41_gpu_indexscores(g->index_scores,q_buf,w_buf,g->index_cache[owner],count,V41_INDEX_HEADS));
         if (il==20) {
             uint32_t blocks=(count+7)/8,top=blocks<2048?blocks:2048;
             CHECK(myds_v41_gpu_candidates(g->block_scores,g->index_scores,count,pos,ratio));
             CHECK(myds_v41_gpu_topk(g->block_selected,g->block_scores,blocks,top,g->gpu));
-            CHECK(myds_v41_gpu_topkmask(g->block_mask,g->block_selected,blocks,top));
-        } else if (il>20) CHECK(myds_v41_gpu_filter(g->index_scores,g->block_mask,count,pos,ratio));
-        CHECK(myds_v41_gpu_topk(g->selected,g->index_scores,count,count<V41_TOPK?count:V41_TOPK,g->gpu));
+            myds_metal_buffer_t *b_mask = out_block_mask ? out_block_mask : g->block_mask;
+            CHECK(myds_v41_gpu_topkmask(b_mask,g->block_selected,blocks,top));
+        } else if (il>20) {
+            const myds_metal_buffer_t *b_mask = in_block_mask ? in_block_mask : g->block_mask;
+            CHECK(myds_v41_gpu_filter(g->index_scores,b_mask,count,pos,ratio));
+        }
+        myds_metal_buffer_t *sel = out_selected ? out_selected : g->selected;
+        CHECK(myds_v41_gpu_topk(sel,g->index_scores,count,count<V41_TOPK?count:V41_TOPK,g->gpu));
     }
 #undef CHECK
     return 1;
@@ -389,7 +435,7 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
         TRACE("kv_quant",ctx->kv_act,512);
         CHECK(myds_metal_buffer_copy(g->window[il],(size_t)(pos%128)*512*4u,ctx->kv_act,0,512*4u));
         phase="compressed KV / indexer";
-        CHECK(publish_and_select(ctx,il,pos));
+        CHECK(publish_and_select(ctx,il,pos,ctx->x_norm,ctx->qr_norm,NULL,NULL,NULL,NULL,NULL,NULL,NULL));
         uint32_t count=compressed?(pos+1u)/ratio_for(il):0;
         uint32_t top=count<V41_TOPK?count:V41_TOPK;
         if (count) CHECK(myds_v41_gpu_gather(g->selected_kv,g->compressed[owner_for(il)],g->selected,count,top));
@@ -447,6 +493,7 @@ typedef struct {
     myds_metal_buffer_t *qr_norm_buf;
     myds_metal_buffer_t *q_buf;
     myds_metal_buffer_t *kv_act_buf;
+    myds_metal_buffer_t *attn_heads_buf;
     myds_metal_buffer_t *attn_low_buf;
     myds_metal_buffer_t *attn_out_buf;
     myds_metal_buffer_t *after_attn_buf;
@@ -459,6 +506,22 @@ typedef struct {
     myds_metal_buffer_t *shared_swiglu_buf;
     myds_metal_buffer_t *shared_out_buf;
     myds_metal_buffer_t *engram_rows_buf[2];
+    myds_metal_buffer_t *selected_ids_buf;
+    myds_metal_buffer_t *selected_weights_buf;
+    myds_metal_buffer_t *route_probs_buf;
+    myds_metal_buffer_t *route_scores_buf;
+    myds_metal_buffer_t *route_ids_f32_buf;
+    myds_metal_buffer_t *pool_kv_buf;
+    myds_metal_buffer_t *pool_score_buf;
+    myds_metal_buffer_t *index_q_buf;
+    myds_metal_buffer_t *index_weights_buf;
+    myds_metal_buffer_t *moe_gate_buf;
+    myds_metal_buffer_t *moe_up_buf;
+    myds_metal_buffer_t *moe_mid_buf;
+    myds_metal_buffer_t *moe_down_buf;
+    myds_metal_buffer_t *moe_out_buf;
+    myds_metal_buffer_t *ffn_out_buf;
+    myds_metal_buffer_t *layer_out_buf;
 
     myds_metal_buffer_t *x[512];
     myds_metal_buffer_t *x_norm[512];
@@ -466,6 +529,7 @@ typedef struct {
     myds_metal_buffer_t *qr_norm[512];
     myds_metal_buffer_t *q[512];
     myds_metal_buffer_t *kv_act[512];
+    myds_metal_buffer_t *attn_heads[512];
     myds_metal_buffer_t *attn_low[512];
     myds_metal_buffer_t *attn_out[512];
     myds_metal_buffer_t *after_attn[512];
@@ -475,6 +539,31 @@ typedef struct {
     myds_metal_buffer_t *router_logits[512];
     myds_metal_buffer_t *shared_out[512];
     myds_metal_buffer_t *engram_rows[2][512];
+    myds_metal_buffer_t *selected_ids[512];
+    myds_metal_buffer_t *selected_weights[512];
+    myds_metal_buffer_t *route_probs[512];
+    myds_metal_buffer_t *route_scores[512];
+    myds_metal_buffer_t *route_ids_f32[512];
+    myds_metal_buffer_t *pool_kv[512];
+    myds_metal_buffer_t *pool_score[512];
+    myds_metal_buffer_t *index_q[512];
+    myds_metal_buffer_t *index_weights[512];
+    myds_metal_buffer_t *moe_gate[512];
+    myds_metal_buffer_t *moe_up[512];
+    myds_metal_buffer_t *moe_mid[512];
+    myds_metal_buffer_t *moe_down[512];
+    myds_metal_buffer_t *moe_out[512];
+    myds_metal_buffer_t *ffn_out[512];
+    myds_metal_buffer_t *layer_out[512];
+
+    myds_metal_buffer_t *res_view[512];
+    myds_metal_buffer_t *pre_view[512];
+    myds_metal_buffer_t *cur_res_view;
+    myds_metal_buffer_t *cur_pre_view;
+    myds_metal_buffer_t *cur_selected_view;
+    myds_metal_buffer_t *cur_mask_view;
+    myds_metal_buffer_t *hc_flat_norm_buf;
+    myds_metal_buffer_t *hc_mix_buf;
 } v41_chunk_workspace_t;
 
 static void v41_chunk_workspace_free(v41_chunk_workspace_t *cw) {
@@ -486,6 +575,7 @@ static void v41_chunk_workspace_free(v41_chunk_workspace_t *cw) {
         if (cw->qr_norm[t]) myds_metal_buffer_free(cw->qr_norm[t]);
         if (cw->q[t]) myds_metal_buffer_free(cw->q[t]);
         if (cw->kv_act[t]) myds_metal_buffer_free(cw->kv_act[t]);
+        if (cw->attn_heads[t]) myds_metal_buffer_free(cw->attn_heads[t]);
         if (cw->attn_low[t]) myds_metal_buffer_free(cw->attn_low[t]);
         if (cw->attn_out[t]) myds_metal_buffer_free(cw->attn_out[t]);
         if (cw->after_attn[t]) myds_metal_buffer_free(cw->after_attn[t]);
@@ -496,6 +586,24 @@ static void v41_chunk_workspace_free(v41_chunk_workspace_t *cw) {
         if (cw->shared_out[t]) myds_metal_buffer_free(cw->shared_out[t]);
         if (cw->engram_rows[0][t]) myds_metal_buffer_free(cw->engram_rows[0][t]);
         if (cw->engram_rows[1][t]) myds_metal_buffer_free(cw->engram_rows[1][t]);
+        if (cw->selected_ids[t]) myds_metal_buffer_free(cw->selected_ids[t]);
+        if (cw->selected_weights[t]) myds_metal_buffer_free(cw->selected_weights[t]);
+        if (cw->route_probs[t]) myds_metal_buffer_free(cw->route_probs[t]);
+        if (cw->route_scores[t]) myds_metal_buffer_free(cw->route_scores[t]);
+        if (cw->route_ids_f32[t]) myds_metal_buffer_free(cw->route_ids_f32[t]);
+        if (cw->pool_kv[t]) myds_metal_buffer_free(cw->pool_kv[t]);
+        if (cw->pool_score[t]) myds_metal_buffer_free(cw->pool_score[t]);
+        if (cw->index_q[t]) myds_metal_buffer_free(cw->index_q[t]);
+        if (cw->index_weights[t]) myds_metal_buffer_free(cw->index_weights[t]);
+        if (cw->moe_gate[t]) myds_metal_buffer_free(cw->moe_gate[t]);
+        if (cw->moe_up[t]) myds_metal_buffer_free(cw->moe_up[t]);
+        if (cw->moe_mid[t]) myds_metal_buffer_free(cw->moe_mid[t]);
+        if (cw->moe_down[t]) myds_metal_buffer_free(cw->moe_down[t]);
+        if (cw->moe_out[t]) myds_metal_buffer_free(cw->moe_out[t]);
+        if (cw->ffn_out[t]) myds_metal_buffer_free(cw->ffn_out[t]);
+        if (cw->layer_out[t]) myds_metal_buffer_free(cw->layer_out[t]);
+        if (cw->res_view[t]) myds_metal_buffer_free(cw->res_view[t]);
+        if (cw->pre_view[t]) myds_metal_buffer_free(cw->pre_view[t]);
     }
     if (cw->x_buf) myds_metal_buffer_free(cw->x_buf);
     if (cw->x_norm_buf) myds_metal_buffer_free(cw->x_norm_buf);
@@ -503,6 +611,7 @@ static void v41_chunk_workspace_free(v41_chunk_workspace_t *cw) {
     if (cw->qr_norm_buf) myds_metal_buffer_free(cw->qr_norm_buf);
     if (cw->q_buf) myds_metal_buffer_free(cw->q_buf);
     if (cw->kv_act_buf) myds_metal_buffer_free(cw->kv_act_buf);
+    if (cw->attn_heads_buf) myds_metal_buffer_free(cw->attn_heads_buf);
     if (cw->attn_low_buf) myds_metal_buffer_free(cw->attn_low_buf);
     if (cw->attn_out_buf) myds_metal_buffer_free(cw->attn_out_buf);
     if (cw->after_attn_buf) myds_metal_buffer_free(cw->after_attn_buf);
@@ -516,6 +625,28 @@ static void v41_chunk_workspace_free(v41_chunk_workspace_t *cw) {
     if (cw->shared_out_buf) myds_metal_buffer_free(cw->shared_out_buf);
     if (cw->engram_rows_buf[0]) myds_metal_buffer_free(cw->engram_rows_buf[0]);
     if (cw->engram_rows_buf[1]) myds_metal_buffer_free(cw->engram_rows_buf[1]);
+    if (cw->selected_ids_buf) myds_metal_buffer_free(cw->selected_ids_buf);
+    if (cw->selected_weights_buf) myds_metal_buffer_free(cw->selected_weights_buf);
+    if (cw->route_probs_buf) myds_metal_buffer_free(cw->route_probs_buf);
+    if (cw->route_scores_buf) myds_metal_buffer_free(cw->route_scores_buf);
+    if (cw->route_ids_f32_buf) myds_metal_buffer_free(cw->route_ids_f32_buf);
+    if (cw->pool_kv_buf) myds_metal_buffer_free(cw->pool_kv_buf);
+    if (cw->pool_score_buf) myds_metal_buffer_free(cw->pool_score_buf);
+    if (cw->index_q_buf) myds_metal_buffer_free(cw->index_q_buf);
+    if (cw->index_weights_buf) myds_metal_buffer_free(cw->index_weights_buf);
+    if (cw->moe_gate_buf) myds_metal_buffer_free(cw->moe_gate_buf);
+    if (cw->moe_up_buf) myds_metal_buffer_free(cw->moe_up_buf);
+    if (cw->moe_mid_buf) myds_metal_buffer_free(cw->moe_mid_buf);
+    if (cw->moe_down_buf) myds_metal_buffer_free(cw->moe_down_buf);
+    if (cw->moe_out_buf) myds_metal_buffer_free(cw->moe_out_buf);
+    if (cw->ffn_out_buf) myds_metal_buffer_free(cw->ffn_out_buf);
+    if (cw->layer_out_buf) myds_metal_buffer_free(cw->layer_out_buf);
+    if (cw->cur_res_view) myds_metal_buffer_free(cw->cur_res_view);
+    if (cw->cur_pre_view) myds_metal_buffer_free(cw->cur_pre_view);
+    if (cw->cur_selected_view) myds_metal_buffer_free(cw->cur_selected_view);
+    if (cw->cur_mask_view) myds_metal_buffer_free(cw->cur_mask_view);
+    if (cw->hc_flat_norm_buf) myds_metal_buffer_free(cw->hc_flat_norm_buf);
+    if (cw->hc_mix_buf) myds_metal_buffer_free(cw->hc_mix_buf);
     free(cw);
 }
 
@@ -533,6 +664,7 @@ static v41_chunk_workspace_t *v41_chunk_workspace_create(uint32_t capacity, uint
     ALLOC_BUF(qr_norm_buf, C * 1280 * sizeof(float));
     ALLOC_BUF(q_buf, C * V41_HEADS * 512 * sizeof(float));
     ALLOC_BUF(kv_act_buf, C * 512 * sizeof(float));
+    ALLOC_BUF(attn_heads_buf, C * V41_HEADS * 512 * sizeof(float));
     ALLOC_BUF(attn_low_buf, C * 8192 * sizeof(float));
     ALLOC_BUF(attn_out_buf, C * V41_DIM * sizeof(float));
     ALLOC_BUF(after_attn_buf, C * 4 * V41_DIM * sizeof(float));
@@ -546,6 +678,24 @@ static v41_chunk_workspace_t *v41_chunk_workspace_create(uint32_t capacity, uint
     ALLOC_BUF(shared_out_buf, C * V41_DIM * sizeof(float));
     ALLOC_BUF(engram_rows_buf[0], C * MYDS_ENGRAM_INPUT_DIM * sizeof(float));
     ALLOC_BUF(engram_rows_buf[1], C * MYDS_ENGRAM_INPUT_DIM * sizeof(float));
+    ALLOC_BUF(selected_ids_buf, C * 6 * sizeof(int32_t));
+    ALLOC_BUF(selected_weights_buf, C * 6 * sizeof(float));
+    ALLOC_BUF(route_probs_buf, C * 384 * sizeof(float));
+    ALLOC_BUF(route_scores_buf, C * 384 * sizeof(float));
+    ALLOC_BUF(route_ids_f32_buf, C * 6 * sizeof(float));
+    ALLOC_BUF(pool_kv_buf, C * 512 * sizeof(float));
+    ALLOC_BUF(pool_score_buf, C * 512 * sizeof(float));
+    ALLOC_BUF(index_q_buf, C * V41_INDEX_HEADS * 128 * sizeof(float));
+    ALLOC_BUF(index_weights_buf, C * V41_INDEX_HEADS * sizeof(float));
+    ALLOC_BUF(moe_gate_buf, C * 6 * exp_dim * sizeof(float));
+    ALLOC_BUF(moe_up_buf, C * 6 * exp_dim * sizeof(float));
+    ALLOC_BUF(moe_mid_buf, C * 6 * exp_dim * sizeof(float));
+    ALLOC_BUF(moe_down_buf, C * 6 * V41_DIM * sizeof(float));
+    ALLOC_BUF(moe_out_buf, C * V41_DIM * sizeof(float));
+    ALLOC_BUF(ffn_out_buf, C * V41_DIM * sizeof(float));
+    ALLOC_BUF(layer_out_buf, C * 4 * V41_DIM * sizeof(float));
+    ALLOC_BUF(hc_flat_norm_buf, C * 4 * V41_DIM * sizeof(float));
+    ALLOC_BUF(hc_mix_buf, C * 24 * sizeof(float));
 #undef ALLOC_BUF
 
     for (size_t t = 0; t < C; t++) {
@@ -559,6 +709,7 @@ static v41_chunk_workspace_t *v41_chunk_workspace_create(uint32_t capacity, uint
         SUB_V(qr_norm, qr_norm_buf, 1280, 1280);
         SUB_V(q, q_buf, V41_HEADS * 512, V41_HEADS * 512);
         SUB_V(kv_act, kv_act_buf, 512, 512);
+        SUB_V(attn_heads, attn_heads_buf, V41_HEADS * 512, V41_HEADS * 512);
         SUB_V(attn_low, attn_low_buf, 8192, 8192);
         SUB_V(attn_out, attn_out_buf, V41_DIM, V41_DIM);
         SUB_V(after_attn, after_attn_buf, 4 * V41_DIM, 4 * V41_DIM);
@@ -571,7 +722,48 @@ static v41_chunk_workspace_t *v41_chunk_workspace_create(uint32_t capacity, uint
         cw->engram_rows[0][t] = myds_metal_buffer_sub_view(cw->engram_rows_buf[0], (t * MYDS_ENGRAM_INPUT_DIM) * sizeof(float), MYDS_ENGRAM_INPUT_DIM * sizeof(float));
         cw->engram_rows[1][t] = myds_metal_buffer_sub_view(cw->engram_rows_buf[1], (t * MYDS_ENGRAM_INPUT_DIM) * sizeof(float), MYDS_ENGRAM_INPUT_DIM * sizeof(float));
         if (!cw->engram_rows[0][t] || !cw->engram_rows[1][t]) goto fail;
+
+        cw->selected_ids[t] = myds_metal_buffer_sub_view(cw->selected_ids_buf, t * 6 * sizeof(int32_t), 6 * sizeof(int32_t));
+        if (!cw->selected_ids[t]) goto fail;
+        cw->selected_weights[t] = myds_metal_buffer_sub_view(cw->selected_weights_buf, t * 6 * sizeof(float), 6 * sizeof(float));
+        if (!cw->selected_weights[t]) goto fail;
+        cw->route_probs[t] = myds_metal_buffer_sub_view(cw->route_probs_buf, t * 384 * sizeof(float), 384 * sizeof(float));
+        if (!cw->route_probs[t]) goto fail;
+        cw->route_scores[t] = myds_metal_buffer_sub_view(cw->route_scores_buf, t * 384 * sizeof(float), 384 * sizeof(float));
+        if (!cw->route_scores[t]) goto fail;
+        cw->route_ids_f32[t] = myds_metal_buffer_sub_view(cw->route_ids_f32_buf, t * 6 * sizeof(float), 6 * sizeof(float));
+        if (!cw->route_ids_f32[t]) goto fail;
+
+        cw->pool_kv[t] = myds_metal_buffer_sub_view(cw->pool_kv_buf, t * 512 * sizeof(float), 512 * sizeof(float));
+        if (!cw->pool_kv[t]) goto fail;
+        cw->pool_score[t] = myds_metal_buffer_sub_view(cw->pool_score_buf, t * 512 * sizeof(float), 512 * sizeof(float));
+        if (!cw->pool_score[t]) goto fail;
+        cw->index_q[t] = myds_metal_buffer_sub_view(cw->index_q_buf, t * V41_INDEX_HEADS * 128 * sizeof(float), V41_INDEX_HEADS * 128 * sizeof(float));
+        if (!cw->index_q[t]) goto fail;
+        cw->index_weights[t] = myds_metal_buffer_sub_view(cw->index_weights_buf, t * V41_INDEX_HEADS * sizeof(float), V41_INDEX_HEADS * sizeof(float));
+        if (!cw->index_weights[t]) goto fail;
+
+        cw->moe_gate[t] = myds_metal_buffer_sub_view(cw->moe_gate_buf, t * 6 * exp_dim * sizeof(float), 6 * exp_dim * sizeof(float));
+        if (!cw->moe_gate[t]) goto fail;
+        cw->moe_up[t] = myds_metal_buffer_sub_view(cw->moe_up_buf, t * 6 * exp_dim * sizeof(float), 6 * exp_dim * sizeof(float));
+        if (!cw->moe_up[t]) goto fail;
+        cw->moe_mid[t] = myds_metal_buffer_sub_view(cw->moe_mid_buf, t * 6 * exp_dim * sizeof(float), 6 * exp_dim * sizeof(float));
+        if (!cw->moe_mid[t]) goto fail;
+        cw->moe_down[t] = myds_metal_buffer_sub_view(cw->moe_down_buf, t * 6 * V41_DIM * sizeof(float), 6 * V41_DIM * sizeof(float));
+        if (!cw->moe_down[t]) goto fail;
+
+        cw->moe_out[t] = myds_metal_buffer_sub_view(cw->moe_out_buf, (t * V41_DIM) * sizeof(float), V41_DIM * sizeof(float));
+        cw->ffn_out[t] = myds_metal_buffer_sub_view(cw->ffn_out_buf, (t * V41_DIM) * sizeof(float), V41_DIM * sizeof(float));
+        cw->layer_out[t] = myds_metal_buffer_sub_view(cw->layer_out_buf, (t * 4 * V41_DIM) * sizeof(float), 4 * V41_DIM * sizeof(float));
+        cw->res_view[t] = myds_metal_buffer_create_view();
+        cw->pre_view[t] = myds_metal_buffer_create_view();
+        if (!cw->moe_out[t] || !cw->ffn_out[t] || !cw->layer_out[t] || !cw->res_view[t] || !cw->pre_view[t]) goto fail;
     }
+    cw->cur_res_view = myds_metal_buffer_create_view();
+    cw->cur_pre_view = myds_metal_buffer_create_view();
+    cw->cur_selected_view = myds_metal_buffer_create_view();
+    cw->cur_mask_view = myds_metal_buffer_create_view();
+    if (!cw->cur_res_view || !cw->cur_pre_view || !cw->cur_selected_view || !cw->cur_mask_view) goto fail;
     return cw;
 fail:
     v41_chunk_workspace_free(cw);
@@ -619,7 +811,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 
     size_t res_size = (size_t)n_tokens * 4u * V41_DIM;
     size_t res_tok_bytes = 4u * V41_DIM * sizeof(float);
-    size_t pre_tok_bytes = 4u * sizeof(float);
+    size_t pre_tok_bytes = 24u * sizeof(float);
     size_t sel_bytes = V41_TOPK * sizeof(int32_t);
     size_t mask_bytes = (size_t)myds_metal_buffer_size(g->block_mask);
 
@@ -645,9 +837,19 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         return -1;
     }
 
+    int do_prof = getenv("MYDS_PROFILE_PREFILL") ? 1 : 0;
+    double prof_engram = 0, prof_embedding = 0, prof_total_layers = 0;
+    double prof_step1 = 0, prof_step2 = 0, prof_step3 = 0, prof_step4 = 0, prof_step5 = 0;
+    double prof_step6 = 0, prof_step7 = 0, prof_step8 = 0;
+    double prof_wait_qkv = 0, prof_wait_swa = 0, prof_wait_ffn_router = 0, prof_wait_moe = 0;
+    struct timeval ptv0, ptv1, ptv_all0, ptv_all1;
+#define TIME_START() do { if (do_prof) gettimeofday(&ptv0, NULL); } while(0)
+#define TIME_ACC(acc) do { if (do_prof) { gettimeofday(&ptv1, NULL); acc += (ptv1.tv_sec - ptv0.tv_sec) * 1000.0 + (ptv1.tv_usec - ptv0.tv_usec) / 1000.0; } } while(0)
+
     uint32_t il = 0;
     const char *phase = "engram prepare";
 
+    TIME_START();
     for (uint32_t t = 0; t < n_tokens; t++) {
         uint32_t pos = base_pos + t;
         if (!myds_engram_prepare_token(g->engram, tokens[t], (uint64_t)pos)) {
@@ -659,8 +861,10 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         memcpy(engram_all[1] + (size_t)t * MYDS_ENGRAM_INPUT_DIM,
                g->engram->row_values[1], MYDS_ENGRAM_INPUT_DIM * sizeof(float));
     }
+    TIME_ACC(prof_engram);
 
     phase = "embedding lookup";
+    TIME_START();
     const uint16_t *embd_table = (const uint16_t *)myds_metal_buffer_data(m->tok_embeddings);
     for (uint32_t t = 0; t < n_tokens; t++) {
         int32_t tok = tokens[t];
@@ -677,7 +881,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             r[j + 2 * V41_DIM] = v_emb;
             r[j + 3 * V41_DIM] = v_emb;
         }
-        const float initial_pre[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+        const float initial_pre[24] = {1.0f, 0.0f, 0.0f, 0.0f};
         if (!myds_metal_buffer_write(prompt_res, (size_t)t * res_tok_bytes, r, res_tok_bytes)) goto fail;
         if (!myds_metal_buffer_write(prompt_pre, (size_t)t * pre_tok_bytes, initial_pre, pre_tok_bytes)) goto fail;
 
@@ -686,10 +890,13 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             if (!myds_trace_f32("embedding", 0, base_pos + t, g->residual, 4 * V41_DIM)) goto fail;
         }
     }
+    TIME_ACC(prof_embedding);
 
     phase = "layer loop";
 #define CHECK(x) do { if (!(x)) goto fail; } while (0)
 #define TRACE(stage,buf,n) CHECK(myds_trace_f32(stage,il,pos,buf,n))
+
+    if (do_prof) gettimeofday(&ptv_all0, NULL);
 
     for (il = 0; il < V41_LAYERS; il++) {
         if (cancel_flag && *cancel_flag) goto cancelled;
@@ -711,161 +918,304 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 
             CHECK(myds_metal_begin_batch());
 
-            /* Step 1: HC Attention Inputs for all tokens in chunk */
+            myds_metal_buffer_update_sub_view(cw->cur_res_view, prompt_res, (size_t)c_start * res_tok_bytes, (size_t)c_len * res_tok_bytes);
+            myds_metal_buffer_update_sub_view(cw->cur_pre_view, prompt_pre, (size_t)c_start * pre_tok_bytes, (size_t)c_len * pre_tok_bytes);
+
             for (uint32_t t = 0; t < c_len; t++) {
                 uint32_t idx = c_start + t;
-                uint32_t pos = base_pos + idx;
-                phase = "HC attention input";
-
-                CHECK(myds_metal_buffer_copy(g->residual, 0, prompt_res, (size_t)idx * res_tok_bytes, res_tok_bytes));
-                CHECK(myds_metal_buffer_copy(g->pre, 0, prompt_pre, (size_t)idx * pre_tok_bytes, pre_tok_bytes));
-
-                if (il == 1 || il == 14) {
-                    uint32_t e = (il == 1 ? 0 : 1);
-                    CHECK(project(g->engram_kv, v->engram_proj[e], cw->engram_rows[e][t], 5 * V41_DIM, MYDS_ENGRAM_INPUT_DIM, GGML_TYPE_F16, true));
-                    CHECK(myds_metal_v41_engram_add(g->residual, g->engram_kv, v->engram_q[e], v->engram_k[e], V41_DIM, m->norm_eps));
-                    TRACE("engram_out", g->residual, 4 * V41_DIM);
-                    CHECK(myds_metal_buffer_copy(prompt_res, (size_t)idx * res_tok_bytes, g->residual, 0, res_tok_bytes));
-                }
-
-                CHECK(myds_metal_v41_hc_mix(cw->attn_split[t], g->residual, l->attn_fn, GGML_TYPE_F16, l->attn_scale, l->attn_base, g->flat_norm, g->mix, V41_DIM, m->norm_eps, v->hc_eps));
-                TRACE("hc_attn_mix", g->mix, 24); TRACE("hc_attn_split", cw->attn_split[t], 24);
-                TRACE("hc_attn_pre", g->pre, 4);
-
-                CHECK(myds_metal_v41_hc_weighted_sum(cw->x[t], g->residual, g->pre, V41_DIM));
-                TRACE("hc_attn_input", cw->x[t], V41_DIM);
-                CHECK(myds_metal_v41_rmsnorm(cw->x_norm[t], cw->x[t], base->attn_norm, V41_DIM, m->norm_eps, true));
-                TRACE("attn_norm", cw->x_norm[t], V41_DIM);
+                myds_metal_buffer_update_sub_view(cw->res_view[t], prompt_res, (size_t)idx * res_tok_bytes, res_tok_bytes);
+                myds_metal_buffer_update_sub_view(cw->pre_view[t], prompt_pre, (size_t)idx * pre_tok_bytes, 4 * sizeof(float));
             }
 
+            /* Step 1: HC Attention Inputs for all tokens in chunk */
+            TIME_START();
+            phase = "HC attention input";
+
+            if (il == 1 || il == 14) {
+                uint32_t e = (il == 1 ? 0 : 1);
+                for (uint32_t t = 0; t < c_len; t++) {
+                    uint32_t pos = base_pos + c_start + t;
+                    CHECK(project(g->engram_kv, v->engram_proj[e], cw->engram_rows[e][t], 5 * V41_DIM, MYDS_ENGRAM_INPUT_DIM, GGML_TYPE_F16, true));
+                    CHECK(myds_metal_v41_engram_add(cw->res_view[t], g->engram_kv, v->engram_q[e], v->engram_k[e], V41_DIM, m->norm_eps));
+                    TRACE("engram_out", cw->res_view[t], 4 * V41_DIM);
+                }
+            }
+
+            /* Batched HC Mix: RMSNorm + GEMM + Split across the entire chunk */
+            CHECK(myds_metal_v41_rmsnorm_batch(cw->hc_flat_norm_buf, cw->cur_res_view, NULL, 4 * V41_DIM, c_len, m->norm_eps, false));
+            CHECK(project_batch(cw->hc_mix_buf, l->attn_fn, cw->hc_flat_norm_buf, 24, 4 * V41_DIM, c_len, GGML_TYPE_F16, false));
+            CHECK(myds_metal_v41_hc_split_batch(cw->attn_split_buf, cw->hc_mix_buf, l->attn_scale, l->attn_base, c_len, v->hc_eps));
+
+            if (getenv("MYDS_BATCH_TRACE_PREFIX")) {
+                for (uint32_t t = 0; t < c_len; t++) {
+                    uint32_t pos = base_pos + c_start + t;
+                    TRACE("hc_attn_split", cw->attn_split[t], 24);
+                    TRACE("hc_attn_pre", cw->pre_view[t], 4);
+                }
+            }
+
+            CHECK(myds_metal_v41_hc_weighted_sum_batch(cw->x_buf, cw->cur_res_view, cw->cur_pre_view, V41_DIM, c_len, pre_tok_bytes));
+            CHECK(myds_metal_v41_rmsnorm_batch(cw->x_norm_buf, cw->x_buf, base->attn_norm, V41_DIM, c_len, m->norm_eps, true));
+
+            if (getenv("MYDS_BATCH_TRACE_PREFIX")) {
+                for (uint32_t t = 0; t < c_len; t++) {
+                    uint32_t pos = base_pos + c_start + t;
+                    TRACE("hc_attn_input", cw->x[t], V41_DIM);
+                    TRACE("attn_norm", cw->x_norm[t], V41_DIM);
+                }
+            }
+            TIME_ACC(prof_step1);
+
             /* Step 2: Batched Q_A and KV projections (reads weights ONCE for all c_len tokens) */
+            TIME_START();
             phase = "batched attention projections";
             CHECK(project_batch(cw->qr_buf, base->attn_q_a, cw->x_norm_buf, 1280, V41_DIM, c_len, base->attn_q_a_type, true));
             CHECK(project_batch(cw->kv_act_buf, base->attn_kv, cw->x_norm_buf, 512, V41_DIM, c_len, base->attn_kv_type, true));
+
+            CHECK(myds_metal_v41_rmsnorm_batch(cw->qr_norm_buf, cw->qr_buf, base->attn_q_a_norm, 1280, c_len, m->norm_eps, true));
+            CHECK(myds_metal_v41_rmsnorm_batch(cw->kv_act_buf, cw->kv_act_buf, base->attn_kv_a_norm, 512, c_len, m->norm_eps, true));
+
+            /* Batched RoPE & Quant for KV */
+            CHECK(myds_v41_gpu_rope_batch(cw->kv_act_buf, 512, 1, base_pos + c_start, c_len, compressed, false));
+            CHECK(myds_v41_gpu_quant(cw->kv_act_buf, 512, c_len, 1));
 
             for (uint32_t t = 0; t < c_len; t++) {
                 uint32_t idx = c_start + t;
                 uint32_t pos = base_pos + idx;
                 TRACE("q_a_raw", cw->qr[t], 1280);
-                CHECK(myds_metal_v41_rmsnorm(cw->qr_norm[t], cw->qr[t], base->attn_q_a_norm, 1280, m->norm_eps, true));
                 TRACE("q_a_norm", cw->qr_norm[t], 1280);
-
                 TRACE("kv_raw", cw->kv_act[t], 512);
-                CHECK(myds_metal_v41_rmsnorm(cw->kv_act[t], cw->kv_act[t], base->attn_kv_a_norm, 512, m->norm_eps, true));
                 TRACE("kv_norm", cw->kv_act[t], 512);
-
-                CHECK(myds_v41_gpu_rope(cw->kv_act[t], 512, 1, pos, compressed, false));
                 TRACE("kv_rope", cw->kv_act[t], 512);
-                CHECK(myds_v41_gpu_quant(cw->kv_act[t], 512, 1, 1));
                 TRACE("kv_quant", cw->kv_act[t], 512);
                 CHECK(myds_metal_buffer_copy(g->window[il], (size_t)(pos % 128) * 512 * 4u, cw->kv_act[t], 0, 512 * 4u));
             }
+            TIME_ACC(prof_step2);
 
             /* Step 3: Batched Q_B projection (reads 21 MB weight ONCE for all c_len tokens) */
+            TIME_START();
             CHECK(project_batch(cw->q_buf, base->attn_q_b, cw->qr_norm_buf, V41_HEADS * 512, 1280, c_len, base->attn_q_b_type, true));
 
-            for (uint32_t t = 0; t < c_len; t++) {
-                uint32_t idx = c_start + t;
-                uint32_t pos = base_pos + idx;
-                TRACE("q_b", cw->q[t], V41_HEADS * 512);
-                CHECK(myds_v41_gpu_rope(cw->q[t], 512, V41_HEADS, pos, compressed, false));
-                TRACE("q_rope", cw->q[t], V41_HEADS * 512);
+            /* Batched RoPE for Q */
+            CHECK(myds_v41_gpu_rope_batch(cw->q_buf, 512, V41_HEADS, base_pos + c_start, c_len, compressed, false));
+
+            if (getenv("MYDS_BATCH_TRACE_PREFIX")) {
+                for (uint32_t t = 0; t < c_len; t++) {
+                    uint32_t pos = base_pos + c_start + t;
+                    TRACE("q_b", cw->q[t], V41_HEADS * 512);
+                    TRACE("q_rope", cw->q[t], V41_HEADS * 512);
+                }
+            }
+            TIME_ACC(prof_step3);
+
+            if (do_prof) {
+                TIME_START();
+                CHECK(myds_metal_commit_batch());
+                TIME_ACC(prof_wait_qkv);
+                CHECK(myds_metal_begin_batch());
             }
 
             /* Step 4: SWA Attention reduction & indexer */
+            TIME_START();
+            uint32_t ratio = ratio_for(il);
+            if (ratio) {
+                if (kv_source(il)) {
+                    CHECK(project_batch(cw->pool_kv_buf, l->compressor_kv, cw->x_norm_buf, 512, V41_DIM, c_len, GGML_TYPE_F16, ratio == 1));
+                    if (ratio == 2) {
+                        CHECK(project_batch(cw->pool_score_buf, l->compressor_gate, cw->x_norm_buf, 512, V41_DIM, c_len, GGML_TYPE_F16, false));
+                    }
+                }
+                if (index_source(il)) {
+                    CHECK(project_batch(cw->index_q_buf, l->index_q, cw->qr_norm_buf, V41_INDEX_HEADS * 128, 1280, c_len, GGML_TYPE_F16, true));
+                    CHECK(project_batch(cw->index_weights_buf, l->index_proj, cw->x_norm_buf, V41_INDEX_HEADS, V41_DIM, c_len, GGML_TYPE_F16, true));
+                }
+            }
+
             for (uint32_t t = 0; t < c_len; t++) {
                 uint32_t idx = c_start + t;
                 uint32_t pos = base_pos + idx;
+                uint32_t count = compressed ? (pos + 1u) / ratio_for(il) : 0;
+                uint32_t top = count < V41_TOPK ? count : V41_TOPK;
 
                 phase = "compressed KV / indexer";
-                CHECK(myds_metal_buffer_copy(ctx->x_norm, 0, cw->x_norm[t], 0, V41_DIM * 4u));
-                CHECK(myds_metal_buffer_copy(ctx->qr_norm, 0, cw->qr_norm[t], 0, 1280 * 4u));
-
-                if (il > 20 && index_source(il)) {
-                    CHECK(myds_metal_buffer_copy(g->block_mask, 0, prompt_block_mask, (size_t)idx * mask_bytes, mask_bytes));
-                }
-                CHECK(publish_and_select(ctx, il, pos));
-                if (il == 20) {
-                    CHECK(myds_metal_buffer_copy(prompt_block_mask, (size_t)idx * mask_bytes, g->block_mask, 0, mask_bytes));
-                }
-                uint32_t count = compressed ? (pos + 1u) / ratio_for(il) : 0;
-                if (count && index_source(il)) {
-                    CHECK(myds_metal_buffer_copy(prompt_selected, (size_t)idx * sel_bytes, g->selected, 0, sel_bytes));
-                } else if (count && compressed) {
-                    CHECK(myds_metal_buffer_copy(g->selected, 0, prompt_selected, (size_t)idx * sel_bytes, sel_bytes));
+                if (!myds_metal_buffer_update_sub_view(cw->cur_selected_view, prompt_selected, (size_t)idx * sel_bytes, sel_bytes) ||
+                    !myds_metal_buffer_update_sub_view(cw->cur_mask_view, prompt_block_mask, (size_t)idx * mask_bytes, mask_bytes)) {
+                    goto fail;
                 }
 
-                uint32_t top = count < V41_TOPK ? count : V41_TOPK;
+                CHECK(publish_and_select(ctx, il, pos, cw->x_norm[t], cw->qr_norm[t],
+                                         kv_source(il) ? cw->pool_kv[t] : NULL,
+                                         (kv_source(il) && ratio == 2) ? cw->pool_score[t] : NULL,
+                                         index_source(il) ? cw->index_q[t] : NULL,
+                                         index_source(il) ? cw->index_weights[t] : NULL,
+                                         (count && index_source(il)) ? cw->cur_selected_view : NULL,
+                                         (il > 20 && index_source(il)) ? cw->cur_mask_view : NULL,
+                                         (il == 20) ? cw->cur_mask_view : NULL));
+
                 if (count) {
-                    CHECK(myds_v41_gpu_gather(g->selected_kv, g->compressed[owner_for(il)], g->selected, count, top));
+                    CHECK(myds_v41_gpu_gather(g->selected_kv, g->compressed[owner_for(il)], cw->cur_selected_view, count, top));
                 }
                 uint32_t nraw = pos + 1u < 128 ? pos + 1u : 128;
 
                 phase = "attention reduction";
-                CHECK(myds_v41_gpu_attention(ctx->attn_heads, base->attn_sinks, cw->q[t], g->window[il], nraw, (pos + 1u - nraw) % 128, g->selected_kv, top, g->gpu));
-                CHECK(myds_metal_v41_bf16(ctx->attn_heads, V41_HEADS * 512));
-                CHECK(myds_v41_gpu_rope(ctx->attn_heads, 512, V41_HEADS, pos, compressed, true));
-                CHECK(myds_metal_attn_output_a(cw->attn_low[t], base->attn_output_a, ctx->attn_heads, 8, 4096, 1024, base->attn_output_a_type));
-                CHECK(myds_metal_v41_bf16(cw->attn_low[t], 8192));
+                CHECK(myds_v41_gpu_attention(cw->attn_heads[t], base->attn_sinks, cw->q[t], g->window[il], nraw, (pos + 1u - nraw) % 128, g->selected_kv, top, g->gpu));
+                CHECK(myds_metal_v41_bf16(cw->attn_heads[t], V41_HEADS * 512));
+                CHECK(myds_v41_gpu_rope(cw->attn_heads[t], 512, V41_HEADS, pos, compressed, true));
+            }
+
+            /* Batched Attention Output A for all c_len tokens in chunk (reads 4.2 MB weight ONCE) */
+            CHECK(myds_metal_attn_output_a_batch(cw->attn_low_buf, base->attn_output_a, cw->attn_heads_buf, 8, 4096, 1024, c_len, base->attn_output_a_type));
+            CHECK(myds_metal_v41_bf16(cw->attn_low_buf, 8192 * c_len));
+            TIME_ACC(prof_step4);
+
+            if (do_prof) {
+                TIME_START();
+                CHECK(myds_metal_commit_batch());
+                TIME_ACC(prof_wait_swa);
+                CHECK(myds_metal_begin_batch());
             }
 
             /* Step 5: Batched Attention Output B (reads 17.8 MB weight ONCE for all c_len tokens) */
+            TIME_START();
             phase = "batched attention output b";
             CHECK(project_batch(cw->attn_out_buf, base->attn_output_b, cw->attn_low_buf, V41_DIM, 8192, c_len, base->attn_output_b_type, true));
+            TIME_ACC(prof_step5);
 
             /* Step 6: HC FFN Input for all tokens in chunk */
-            for (uint32_t t = 0; t < c_len; t++) {
-                uint32_t idx = c_start + t;
-                uint32_t pos = base_pos + idx;
-                phase = "HC FFN input";
-                TRACE("attn_out", cw->attn_out[t], V41_DIM);
+            TIME_START();
+            phase = "HC FFN input";
+            CHECK(myds_metal_v41_hc_expand_batch(cw->after_attn_buf, cw->attn_out_buf, cw->cur_res_view, cw->attn_split_buf, V41_DIM, c_len));
 
-                CHECK(myds_metal_buffer_copy(g->residual, 0, prompt_res, (size_t)idx * res_tok_bytes, res_tok_bytes));
-                CHECK(myds_metal_v41_hc_expand(cw->after_attn[t], cw->attn_out[t], g->residual, cw->attn_split[t], V41_DIM));
-                TRACE("after_attn", cw->after_attn[t], 4 * V41_DIM);
+            /* Batched HC Mix: RMSNorm + GEMM + Split across the entire chunk */
+            CHECK(myds_metal_v41_rmsnorm_batch(cw->hc_flat_norm_buf, cw->after_attn_buf, NULL, 4 * V41_DIM, c_len, m->norm_eps, false));
+            CHECK(project_batch(cw->hc_mix_buf, l->ffn_fn, cw->hc_flat_norm_buf, 24, 4 * V41_DIM, c_len, GGML_TYPE_F16, false));
+            CHECK(myds_metal_v41_hc_split_batch(cw->ffn_split_buf, cw->hc_mix_buf, l->ffn_scale, l->ffn_base, c_len, v->hc_eps));
 
-                CHECK(myds_metal_v41_hc_mix(cw->ffn_split[t], cw->after_attn[t], l->ffn_fn, GGML_TYPE_F16, l->ffn_scale, l->ffn_base, g->flat_norm, g->mix, V41_DIM, m->norm_eps, v->hc_eps));
-                TRACE("hc_ffn_mix", g->mix, 24); TRACE("hc_ffn_split", cw->ffn_split[t], 24);
-
-                CHECK(myds_metal_v41_hc_weighted_sum(ctx->x, cw->after_attn[t], cw->attn_split[t], V41_DIM));
-                TRACE("hc_ffn_input", ctx->x, V41_DIM);
-
-                CHECK(myds_metal_v41_rmsnorm(cw->ffn_norm[t], ctx->x, base->ffn_norm, V41_DIM, m->norm_eps, true));
-                TRACE("ffn_norm", cw->ffn_norm[t], V41_DIM);
+            if (getenv("MYDS_BATCH_TRACE_PREFIX")) {
+                for (uint32_t t = 0; t < c_len; t++) {
+                    uint32_t pos = base_pos + c_start + t;
+                    TRACE("attn_out", cw->attn_out[t], V41_DIM);
+                    TRACE("after_attn", cw->after_attn[t], 4 * V41_DIM);
+                    TRACE("hc_ffn_split", cw->ffn_split[t], 24);
+                }
             }
+
+            CHECK(myds_metal_v41_hc_weighted_sum_batch(cw->x_buf, cw->after_attn_buf, cw->attn_split_buf, V41_DIM, c_len, 96));
+            CHECK(myds_metal_v41_rmsnorm_batch(cw->ffn_norm_buf, cw->x_buf, base->ffn_norm, V41_DIM, c_len, m->norm_eps, true));
+
+            if (getenv("MYDS_BATCH_TRACE_PREFIX")) {
+                for (uint32_t t = 0; t < c_len; t++) {
+                    uint32_t pos = base_pos + c_start + t;
+                    TRACE("hc_ffn_input", cw->x[t], V41_DIM);
+                    TRACE("ffn_norm", cw->ffn_norm[t], V41_DIM);
+                }
+            }
+            TIME_ACC(prof_step6);
 
             /* Step 7: Batched Router Gate & Shared Experts (reads 10 MB shared weights + 1.5 MB router ONCE) */
+            TIME_START();
             phase = "batched MoE shared and router";
             uint32_t width = m->moe_expert_dim;
-            CHECK(myds_metal_v41_gemv_batch(cw->router_logits_buf, base->router_gate, cw->ffn_norm_buf, m->n_routed_experts, V41_DIM, c_len, base->router_gate_type));
-            CHECK(myds_metal_gemv_batch(cw->shared_gate_buf, base->shared_gate, cw->ffn_norm_buf, width, V41_DIM, c_len, base->shared_gate_type));
-            CHECK(myds_metal_v41_bf16(cw->shared_gate_buf, width * c_len));
-            CHECK(myds_metal_gemv_batch(cw->shared_up_buf, base->shared_up, cw->ffn_norm_buf, width, V41_DIM, c_len, base->shared_up_type));
-            CHECK(myds_metal_v41_bf16(cw->shared_up_buf, width * c_len));
+            CHECK(project_batch(cw->router_logits_buf, base->router_gate, cw->ffn_norm_buf, m->n_routed_experts, V41_DIM, c_len, base->router_gate_type, false));
+            CHECK(project_batch(cw->shared_gate_buf, base->shared_gate, cw->ffn_norm_buf, width, V41_DIM, c_len, base->shared_gate_type, true));
+            CHECK(project_batch(cw->shared_up_buf, base->shared_up, cw->ffn_norm_buf, width, V41_DIM, c_len, base->shared_up_type, true));
             CHECK(myds_v41_shared_swiglu(cw->shared_swiglu_buf, cw->shared_gate_buf, cw->shared_up_buf, width * c_len, m->swiglu_clamp_exp));
-            CHECK(myds_metal_gemv_batch(cw->shared_out_buf, base->shared_down, cw->shared_swiglu_buf, V41_DIM, width, c_len, base->shared_down_type));
-            CHECK(myds_metal_v41_bf16(cw->shared_out_buf, V41_DIM * c_len));
+            CHECK(project_batch(cw->shared_out_buf, base->shared_down, cw->shared_swiglu_buf, V41_DIM, width, c_len, base->shared_down_type, true));
 
-            CHECK(myds_metal_commit_batch());
-            CHECK(myds_metal_begin_batch());
-
-            /* Step 8: Routed MoE & Layer output */
+            /* Step 7b: Batched MoE routing for all tokens in chunk on GPU */
+            phase = "batched MoE routing";
+            uint32_t k = m->n_activated_experts;
             for (uint32_t t = 0; t < c_len; t++) {
                 uint32_t idx = c_start + t;
                 uint32_t pos = base_pos + idx;
-                phase = "MoE routed experts";
-
-                CHECK(myds_v41_moe_eval(ctx, il, pos, cw->ffn_norm[t], cw->router_logits[t], cw->shared_out[t]));
-
-                CHECK(myds_metal_v41_hc_expand(g->residual, ctx->ffn_out, cw->after_attn[t], cw->ffn_split[t], V41_DIM));
-                CHECK(myds_metal_buffer_copy(g->pre, 0, cw->ffn_split[t], 0, 4 * 4u));
-                TRACE("layer_out", g->residual, 4 * V41_DIM);
-
-                CHECK(myds_metal_buffer_copy(prompt_res, (size_t)idx * res_tok_bytes, g->residual, 0, res_tok_bytes));
-                CHECK(myds_metal_buffer_copy(prompt_pre, (size_t)idx * pre_tok_bytes, g->pre, 0, pre_tok_bytes));
+                TRACE("route_logits", cw->router_logits[t], m->n_routed_experts);
+                CHECK(myds_v41_route(cw->selected_ids[t], cw->selected_weights[t],
+                                     cw->route_probs[t], cw->route_scores[t],
+                                     cw->router_logits[t], base->router_bias,
+                                     m->n_routed_experts, k, m->routed_scaling_factor));
+                TRACE("route_probs", cw->route_probs[t], m->n_routed_experts);
+                TRACE("route_weights", cw->selected_weights[t], k);
+                if (getenv("MYDS_BATCH_TRACE_PREFIX")) {
+                    const myds_metal_buffer_t *id_buffers[] = {cw->selected_ids[t], cw->route_ids_f32[t]};
+                    CHECK(dispatch_k("kernel_myds_v41_ids_f32", &k, sizeof(k), id_buffers, 2, 1, 32, 0));
+                    TRACE("route_ids", cw->route_ids_f32[t], k);
+                }
             }
+            TIME_ACC(prof_step7);
+
+            /* Single commit for all Attention + FFN + Shared + Routing in the chunk */
+            if (do_prof) {
+                TIME_START();
+                CHECK(myds_metal_commit_batch());
+                TIME_ACC(prof_wait_ffn_router);
+                CHECK(myds_metal_begin_batch());
+            } else {
+                myds_metal_barrier();
+            }
+
+            /* Step 8: Routed MoE & Layer output across all tokens in chunk */
+            TIME_START();
+            CHECK(myds_metal_routed_moe_batch(cw->moe_out_buf, cw->ffn_norm_buf,
+                base->ffn_gate_exps, base->ffn_up_exps, base->ffn_down_exps,
+                cw->selected_ids_buf, cw->selected_weights_buf,
+                cw->moe_gate_buf, cw->moe_up_buf, cw->moe_mid_buf, cw->moe_down_buf,
+                V41_DIM, width, m->n_routed_experts, k, c_len,
+                base->ffn_gate_exps_type, base->ffn_up_exps_type, base->ffn_down_exps_type,
+                m->swiglu_clamp_exp));
+
+            myds_metal_barrier();
+            CHECK(myds_metal_add(cw->ffn_out_buf, cw->moe_out_buf, cw->shared_out_buf, V41_DIM * c_len));
+            CHECK(myds_metal_v41_bf16(cw->ffn_out_buf, V41_DIM * c_len));
+            myds_metal_barrier();
+
+            CHECK(myds_metal_v41_hc_expand_batch(cw->layer_out_buf, cw->ffn_out_buf, cw->after_attn_buf, cw->ffn_split_buf, V41_DIM, c_len));
+
+            if (getenv("MYDS_BATCH_TRACE_PREFIX")) {
+                for (uint32_t t = 0; t < c_len; t++) {
+                    uint32_t idx = c_start + t;
+                    uint32_t pos = base_pos + idx;
+                    TRACE("shared_out", cw->shared_out[t], V41_DIM);
+                    TRACE("routed_out", cw->moe_out[t], V41_DIM);
+                    TRACE("ffnblock", cw->ffn_out[t], V41_DIM);
+                    TRACE("layer_out", cw->layer_out[t], 4 * V41_DIM);
+                }
+            }
+
+            CHECK(myds_metal_buffer_copy(prompt_res, (size_t)c_start * res_tok_bytes,
+                                         cw->layer_out_buf, 0, (size_t)c_len * res_tok_bytes));
+            CHECK(myds_metal_buffer_copy(prompt_pre, (size_t)c_start * pre_tok_bytes,
+                                         cw->ffn_split_buf, 0, (size_t)c_len * pre_tok_bytes));
+            TIME_ACC(prof_step8);
+
+            TIME_START();
             CHECK(myds_metal_commit_batch());
+            TIME_ACC(prof_wait_moe);
         }
+    }
+
+    if (do_prof) {
+        gettimeofday(&ptv_all1, NULL);
+        prof_total_layers = (ptv_all1.tv_sec - ptv_all0.tv_sec) * 1000.0 + (ptv_all1.tv_usec - ptv_all0.tv_usec) / 1000.0;
+        printf("--- PREFILL PROFILE (%u tokens, %u layers) ---\n", n_tokens, V41_LAYERS);
+        printf("Engram Prepare        : %8.2f ms\n", prof_engram);
+        printf("Embedding Lookup      : %8.2f ms\n", prof_embedding);
+        printf("Step 1 (HC Attn In)   : %8.2f ms\n", prof_step1);
+        printf("Step 2 (Q_A & KV GEMV): %8.2f ms\n", prof_step2);
+        printf("Step 3 (Q_B GEMV)     : %8.2f ms\n", prof_step3);
+        printf("Wait Proj (GPU)       : %8.2f ms\n", prof_wait_qkv);
+        printf("Step 4 (SWA Attention): %8.2f ms\n", prof_step4);
+        printf("Wait SWA (GPU)        : %8.2f ms\n", prof_wait_swa);
+        printf("Step 5 (Attn Out B)   : %8.2f ms\n", prof_step5);
+        printf("Step 6 (HC FFN In)    : %8.2f ms\n", prof_step6);
+        printf("Step 7 (Shared+Route) : %8.2f ms\n", prof_step7);
+        printf("Wait FFN+R (GPU)      : %8.2f ms\n", prof_wait_ffn_router);
+        printf("Step 8 (MoE dispatch) : %8.2f ms\n", prof_step8);
+        printf("Wait MoE (GPU)        : %8.2f ms\n", prof_wait_moe);
+        printf("Total Layers Wall     : %8.2f ms\n", prof_total_layers);
+        printf("Total Steps Sum       : %8.2f ms\n",
+               prof_step1 + prof_step2 + prof_step3 + prof_wait_qkv + prof_step4 + prof_wait_swa +
+               prof_step5 + prof_step6 + prof_step7 + prof_wait_ffn_router + prof_step8 + prof_wait_moe);
+        fflush(stdout);
     }
 
     ctx->pos = base_pos + n_tokens;
@@ -874,7 +1224,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 
     size_t last_idx = n_tokens - 1;
     CHECK(myds_metal_buffer_copy(g->residual, 0, prompt_res, last_idx * res_tok_bytes, res_tok_bytes));
-    CHECK(myds_metal_buffer_copy(g->pre, 0, prompt_pre, last_idx * pre_tok_bytes, pre_tok_bytes));
+    CHECK(myds_metal_buffer_copy(g->pre, 0, prompt_pre, last_idx * pre_tok_bytes, 4 * sizeof(float)));
     CHECK(myds_metal_commit_batch());
 #undef CHECK
 #undef TRACE
