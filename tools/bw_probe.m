@@ -41,7 +41,9 @@ static double now_s(void) {
 }
 
 #define Q8_0_BYTES_PER_ELEM 1.0625
-#define POOL_CAP_DEFAULT (256u << 20)
+/* 池必须显著大于 SLC（M2 Ultra 约 96 MB），否则同一份权重会被缓存反复命中，
+ * 测出的带宽【偏高】—— 这是本工具第一版的实际缺陷。默认 1.5 GiB。 */
+#define POOL_CAP_DEFAULT (1536u << 20)
 
 typedef struct { uint32_t out_dim, in_dim; const char *label; } probe_t;
 
@@ -102,9 +104,9 @@ static int run_probe(const probe_t *p, uint64_t reps_lo, uint64_t reps_hi, size_
     const double c0 = t_lo - c1 * (double)reps_lo;                    /* s，批边界 */
     const double gbps = (double)w_bytes / c1 / 1e9;
 
-    printf("  %-20s 片段=%7.2f MB  池=%3llu份%s  c1=%8.2f µs/次  带宽=%6.1f GB/s (%4.1f%%)  c0=%7.1f µs\n",
-           p->label, w_bytes / 1048576.0, (unsigned long long)n_sub,
-           (pool_bytes > pool_cap ? "(超上限!)" : ""),
+    printf("  %-20s 片段=%7.2f MB  池=%3llu份/%.0f MB%s  c1=%8.2f µs/次  带宽=%6.1f GB/s (%4.1f%%)  c0=%7.1f µs\n",
+           p->label, w_bytes / 1048576.0, (unsigned long long)n_sub, pool_bytes / 1048576.0,
+           (n_sub == 1 ? "  ★仅1份⇒读数偏高,忽略" : (pool_bytes > pool_cap ? "  (超上限!)" : "")),
            c1 * 1e6, gbps, 100.0 * gbps / 773.0, c0 * 1e6);
 
     for (uint64_t i = 0; i < n_sub; i++) myds_metal_buffer_free(views[i]);
