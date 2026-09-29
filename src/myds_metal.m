@@ -43,8 +43,6 @@ static id<MTLComputePipelineState> g_pso_moe_swiglu_weight = nil;
 static id<MTLComputePipelineState> g_pso_moe_sum6 = nil;
 static id<MTLComputePipelineState> g_pso_moe_pair_swiglu_iq2_xxs = nil;
 static id<MTLComputePipelineState> g_pso_moe_sum6_q2_k = nil;
-static id<MTLComputePipelineState> g_pso_moe_slots6_pair_swiglu_iq2_xxs = nil;
-static id<MTLComputePipelineState> g_pso_moe_slots6_sum6_q2_k = nil;
 static id<MTLComputePipelineState> g_pso_attn_out_low_q8_0 = nil;
 static id<MTLComputePipelineState> g_pso_mul_mm_q8_0 = nil;
 static id<MTLComputePipelineState> g_pso_mul_mm_q8_0_bco = nil;
@@ -58,7 +56,6 @@ static id<MTLComputePipelineState> g_pso_compute_copy_u32x4 = nil;
 static id<MTLSharedEvent>          g_shared_event = nil;
 static uint64_t                    g_shared_event_val = 0;
 static bool                        g_initialized = false;
-static NSCache                    *g_exact_view_cache = nil;
 static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *g_native_pipelines = nil;
 struct native_kernel_cache_entry {
     char name[64];
@@ -67,34 +64,6 @@ struct native_kernel_cache_entry {
 static struct native_kernel_cache_entry g_native_pso_cache[64];
 static size_t g_native_pso_cache_count = 0;
 
-static id<MTLBuffer> get_exact_buffer_view(const void *base_ptr, uint64_t offset, uint64_t len, NSUInteger *out_offset) {
-    if (!g_device || !base_ptr || len == 0) return nil;
-    const size_t page_sz = (size_t)getpagesize();
-    const uintptr_t target_ptr = (uintptr_t)base_ptr + (uintptr_t)offset;
-    const uintptr_t page_aligned_ptr = target_ptr & ~(page_sz - 1);
-    const NSUInteger leading = (NSUInteger)(target_ptr - page_aligned_ptr);
-    const NSUInteger page_len = (NSUInteger)(((len + leading + page_sz - 1) / page_sz) * page_sz);
-
-    if (out_offset) *out_offset = leading;
-
-    if (!g_exact_view_cache) {
-        g_exact_view_cache = [[NSCache alloc] init];
-        [g_exact_view_cache setCountLimit:16384];
-    }
-
-    NSString *key = [NSString stringWithFormat:@"%lx:%lx", (unsigned long)page_aligned_ptr, (unsigned long)page_len];
-    id<MTLBuffer> buf = [g_exact_view_cache objectForKey:key];
-    if (!buf) {
-        buf = [g_device newBufferWithBytesNoCopy:(void *)page_aligned_ptr
-                                          length:page_len
-                                         options:MTLResourceStorageModeShared
-                                     deallocator:nil];
-        if (buf) {
-            [g_exact_view_cache setObject:buf forKey:key];
-        }
-    }
-    return buf;
-}
 
 /* Batch command buffer state */
 static id<MTLCommandBuffer>         g_batch_cb = nil;
@@ -442,28 +411,6 @@ int myds_metal_init(const char *shader_dir) {
             printf("myds_metal: kernel_mul_mv_id_q2_K_sum6_f32 fn error: %s\n", [[pso_err localizedDescription] UTF8String]);
         }
 
-        pso_err = nil;
-        fn = [g_library newFunctionWithName:@"kernel_mul_mv_slots6_iq2_xxs_pair_swiglu_f32" constantValues:moe_mv_id_constants error:&pso_err];
-        if (fn) {
-            g_pso_moe_slots6_pair_swiglu_iq2_xxs = [g_device newComputePipelineStateWithFunction:fn error:&pso_err];
-            if (!g_pso_moe_slots6_pair_swiglu_iq2_xxs) {
-                printf("myds_metal: kernel_mul_mv_slots6_iq2_xxs_pair_swiglu_f32 PSO error: %s\n", [[pso_err localizedDescription] UTF8String]);
-            }
-        } else {
-            printf("myds_metal: kernel_mul_mv_slots6_iq2_xxs_pair_swiglu_f32 fn error: %s\n", [[pso_err localizedDescription] UTF8String]);
-        }
-
-        pso_err = nil;
-        fn = [g_library newFunctionWithName:@"kernel_mul_mv_slots6_q2_K_sum6_f32" constantValues:moe_mv_id_constants error:&pso_err];
-        if (fn) {
-            g_pso_moe_slots6_sum6_q2_k = [g_device newComputePipelineStateWithFunction:fn error:&pso_err];
-            if (!g_pso_moe_slots6_sum6_q2_k) {
-                printf("myds_metal: kernel_mul_mv_slots6_q2_K_sum6_f32 PSO error: %s\n", [[pso_err localizedDescription] UTF8String]);
-            }
-        } else {
-            printf("myds_metal: kernel_mul_mv_slots6_q2_K_sum6_f32 fn error: %s\n", [[pso_err localizedDescription] UTF8String]);
-        }
-
         fn = [g_library newFunctionWithName:@"kernel_dsv4_attn_out_low_q8_0_f32" constantValues:mv_constants error:nil];
         if (fn) {
             g_pso_attn_out_low_q8_0 = [g_device newComputePipelineStateWithFunction:fn error:nil];
@@ -524,8 +471,6 @@ void myds_metal_cleanup(void) {
     g_pso_moe_sum6 = nil;
     g_pso_moe_pair_swiglu_iq2_xxs = nil;
     g_pso_moe_sum6_q2_k = nil;
-    g_pso_moe_slots6_pair_swiglu_iq2_xxs = nil;
-    g_pso_moe_slots6_sum6_q2_k = nil;
     g_pso_attn_out_low_q8_0 = nil;
     g_pso_mul_mm_q8_0 = nil;
     g_pso_mul_mm_q8_0_bco = nil;
@@ -548,7 +493,6 @@ void myds_metal_cleanup(void) {
     }
     g_native_pso_cache_count = 0;
     g_device = nil;
-    g_exact_view_cache = nil;
     g_initialized = false;
 }
 
@@ -2039,25 +1983,18 @@ int myds_metal_routed_moe_batch(
         const NSUInteger smem_iq2 = 256u * sizeof(uint64_t) + 128u * sizeof(uint8_t); /* 2176 */
         static bool logged_moe_mode = false;
         if (!logged_moe_mode) {
-            /* 2026-09-29 参谋长: 原来的标签是误导的 ——
-             *   · 它把"两个 PSO 都不可用"叫成 "FALLBACK (5-step)", 但代码里根本没有
-             *     5-step 回退路径, 那条分支直接 `return 0` 失败。
-             *   · SLOTS6 实测【能跑但输出错误】(16:03 实测: 15.94 t/s + 乱码; FUSED 27.07 t/s + 逐位正确)。
-             *     ⇒ 它是条会静默产出错误结果的路径, 不能用作自动回退。
-             * 现改为: 只在 MYDS_ALLOW_SLOTS6_MOE=1 显式要求时才用 SLOTS6, 且响亮告警。
-             * 依据: docs/verification/2026-09-29-gpu-bottleneck-ablation.md §3 */
-            const bool fused_ok  = g_pso_moe_pair_swiglu_iq2_xxs && g_pso_moe_sum6_q2_k;
-            const bool slots6_ok = g_pso_moe_slots6_pair_swiglu_iq2_xxs && g_pso_moe_slots6_sum6_q2_k;
-            const bool slots6_opt_in = getenv("MYDS_ALLOW_SLOTS6_MOE") != NULL;
-            if (fused_ok) {
+            /* 2026-09-29 参谋长:
+             *   原标签把「两个 PSO 都不可用」叫成 "FALLBACK (5-step)", 但代码里
+             *   根本没有 5-step 回退路径 —— 那条分支直接 `return 0` 失败。
+             *   SLOTS6 备用路径已于同日【删除】: 实测它能运行但【输出错误】
+             *   (15.94 t/s + 乱码; 对比 FUSED 27.07 t/s + 逐位正确)。它是条会
+             *   静默产出错误结果的路径 —— 宁可响亮失败, 也不要静默出错。
+             *   依据: docs/verification/2026-09-29-gpu-bottleneck-ablation.md §3/§9 */
+            if (g_pso_moe_pair_swiglu_iq2_xxs && g_pso_moe_sum6_q2_k) {
                 MYDS_LOG_I("MoE path: FUSED (2-step) — verified bit-exact");
-            } else if (slots6_ok && slots6_opt_in) {
-                MYDS_LOG_E("MoE path: SLOTS6 (2-step) — UNVERIFIED AND KNOWN WRONG. "
-                           "Enabled only because MYDS_ALLOW_SLOTS6_MOE is set; do NOT trust the output.");
             } else {
-                MYDS_LOG_E("MoE path: FUSED kernels unavailable; refusing MoE rather than silently "
-                           "degrading to the known-wrong SLOTS6 path. "
-                           "(Debug override: MYDS_ALLOW_SLOTS6_MOE=1 — output will be wrong.)");
+                MYDS_LOG_E("MoE path: FUSED kernels unavailable; refusing MoE rather than "
+                           "silently producing wrong output (no fallback path exists).");
             }
             logged_moe_mode = true;
         }
@@ -2147,141 +2084,6 @@ int myds_metal_routed_moe_batch(
                 if (!wait_command_buffer(cb)) return 0;
             }
             return 1;
-        } else if (n_tok == 1 && g_pso_moe_slots6_pair_swiglu_iq2_xxs && g_pso_moe_slots6_sum6_q2_k &&
-                   getenv("MYDS_ALLOW_SLOTS6_MOE") != NULL) {
-            const int32_t *sel_ids = (const int32_t *)selected_ids->ptr;
-
-            /* 1. Slots6 Fused Gate + Up + SwiGLU + Scaling dispatch (IQ2_XXS) */
-            [enc setComputePipelineState:g_pso_moe_slots6_pair_swiglu_iq2_xxs];
-            [enc setBytes:&gate_args length:sizeof(gate_args) atIndex:0];
-            [enc setBytes:&swiglu_args length:sizeof(swiglu_args) atIndex:1];
-            for (uint32_t s = 0; s < 6; s++) {
-                int32_t exp_id = sel_ids[s];
-                NSUInteger inner_gate = 0, inner_up = 0;
-                id<MTLBuffer> buf_gate = (exp_id >= 0 && (uint32_t)exp_id < n_routed_experts) ?
-                    get_exact_buffer_view(gate_exps->ptr, (uint64_t)exp_id * gate_exp_bytes, gate_exp_bytes, &inner_gate) : nil;
-                id<MTLBuffer> buf_up   = (exp_id >= 0 && (uint32_t)exp_id < n_routed_experts) ?
-                    get_exact_buffer_view(up_exps->ptr,   (uint64_t)exp_id * gate_exp_bytes, gate_exp_bytes, &inner_up) : nil;
-                if (buf_gate && buf_up) {
-                    [enc setBuffer:buf_gate offset:inner_gate atIndex:2 + s];
-                    [enc setBuffer:buf_up   offset:inner_up   atIndex:8 + s];
-                } else {
-                    uint64_t off_gate = gate_exps->offset + (uint64_t)exp_id * gate_exp_bytes;
-                    uint64_t off_up   = up_exps->offset   + (uint64_t)exp_id * gate_exp_bytes;
-                    [enc setBuffer:gate_exps->mtl_buf offset:off_gate atIndex:2 + s];
-                    [enc setBuffer:up_exps->mtl_buf   offset:off_up   atIndex:8 + s];
-                }
-            }
-            [enc setBuffer:x_in->mtl_buf offset:x_in->offset atIndex:14];
-            [enc setBuffer:scratch_gate->mtl_buf offset:scratch_gate->offset atIndex:15];
-            [enc setBuffer:scratch_up->mtl_buf offset:scratch_up->offset atIndex:16];
-            [enc setBuffer:scratch_mid->mtl_buf offset:scratch_mid->offset atIndex:17];
-            [enc setBuffer:selected_weights->mtl_buf offset:selected_weights->offset atIndex:18];
-            [enc setThreadgroupMemoryLength:smem_iq2 atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake(row_groups_gate, 1, pairs)
-                threadsPerThreadgroup:MTLSizeMake(32, nsg_gate, 1)];
-
-            /* Inter-kernel barrier within same encoder: ensure scratch_mid is written before sum6 reads */
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-            /* 2. Slots6 Fused Down + Sum6 direct accumulation dispatch (Q2_K) */
-            [enc setComputePipelineState:g_pso_moe_slots6_sum6_q2_k];
-            [enc setBytes:&down_args length:sizeof(down_args) atIndex:0];
-            for (uint32_t s = 0; s < 6; s++) {
-                int32_t exp_id = sel_ids[s];
-                NSUInteger inner_down = 0;
-                id<MTLBuffer> buf_down = (exp_id >= 0 && (uint32_t)exp_id < n_routed_experts) ?
-                    get_exact_buffer_view(down_exps->ptr, (uint64_t)exp_id * down_exp_bytes, down_exp_bytes, &inner_down) : nil;
-                if (buf_down) {
-                    [enc setBuffer:buf_down offset:inner_down atIndex:1 + s];
-                } else {
-                    uint64_t off_down = down_exps->offset + (uint64_t)exp_id * down_exp_bytes;
-                    [enc setBuffer:down_exps->mtl_buf offset:off_down atIndex:1 + s];
-                }
-            }
-            [enc setBuffer:scratch_mid->mtl_buf offset:scratch_mid->offset atIndex:7];
-            [enc setBuffer:moe_out->mtl_buf offset:moe_out->offset atIndex:8];
-            [enc dispatchThreadgroups:MTLSizeMake(row_groups_down, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(32, nsg_down, 1)];
-
-            if (g_batch_cb) {
-                if (g_auto_barrier) {
-                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-                }
-            } else {
-                [enc endEncoding];
-                [cb commit];
-                if (!wait_command_buffer(cb)) return 0;
-            }
-            return 1;
-        } else if (n_tok == 1) {
-            /* 1. Gate experts dispatch (IQ2_XXS) */
-            [enc setComputePipelineState:g_pso_moe_mv_id_iq2_xxs];
-            [enc setBytes:&gate_args length:sizeof(gate_args) atIndex:0];
-            [enc setBuffer:gate_exps->mtl_buf offset:gate_exps->offset atIndex:1];
-            [enc setBuffer:x_in->mtl_buf offset:x_in->offset atIndex:2];
-            [enc setBuffer:scratch_gate->mtl_buf offset:scratch_gate->offset atIndex:3];
-            [enc setBuffer:selected_ids->mtl_buf offset:selected_ids->offset atIndex:4];
-            [enc setThreadgroupMemoryLength:smem_iq2 atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake(row_groups_gate, 1, pairs)
-                threadsPerThreadgroup:MTLSizeMake(32, nsg_gate, 1)];
-
-            /* 2. Up experts dispatch (IQ2_XXS) */
-            struct ds4_metal_args_mul_mv_id up_args = gate_args;
-            [enc setComputePipelineState:g_pso_moe_mv_id_iq2_xxs];
-            [enc setBytes:&up_args length:sizeof(up_args) atIndex:0];
-            [enc setBuffer:up_exps->mtl_buf offset:up_exps->offset atIndex:1];
-            [enc setBuffer:x_in->mtl_buf offset:x_in->offset atIndex:2];
-            [enc setBuffer:scratch_up->mtl_buf offset:scratch_up->offset atIndex:3];
-            [enc setBuffer:selected_ids->mtl_buf offset:selected_ids->offset atIndex:4];
-            [enc setThreadgroupMemoryLength:smem_iq2 atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake(row_groups_gate, 1, pairs)
-                threadsPerThreadgroup:MTLSizeMake(32, nsg_gate, 1)];
-
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-            /* 3. SwiGLU + weight scaling dispatch */
-            NSUInteger nth_swiglu = 256;
-            if (nth_swiglu > expert_dim) nth_swiglu = expert_dim;
-            [enc setComputePipelineState:g_pso_moe_swiglu_weight];
-            [enc setBytes:&swiglu_args length:sizeof(swiglu_args) atIndex:0];
-            [enc setBuffer:scratch_gate->mtl_buf offset:scratch_gate->offset atIndex:1];
-            [enc setBuffer:scratch_up->mtl_buf offset:scratch_up->offset atIndex:2];
-            [enc setBuffer:scratch_mid->mtl_buf offset:scratch_mid->offset atIndex:3];
-            [enc setBuffer:selected_weights->mtl_buf offset:selected_weights->offset atIndex:4];
-            [enc dispatchThreadgroups:MTLSizeMake(n_activated_experts, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(nth_swiglu, 1, 1)];
-
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-            /* 4. Down experts dispatch (Q2_K) */
-            [enc setComputePipelineState:g_pso_moe_mv_id_q2_k];
-            [enc setBytes:&down_args length:sizeof(down_args) atIndex:0];
-            [enc setBuffer:down_exps->mtl_buf offset:down_exps->offset atIndex:1];
-            [enc setBuffer:scratch_mid->mtl_buf offset:scratch_mid->offset atIndex:2];
-            [enc setBuffer:scratch_down->mtl_buf offset:scratch_down->offset atIndex:3];
-            [enc setBuffer:selected_ids->mtl_buf offset:selected_ids->offset atIndex:4];
-            [enc dispatchThreadgroups:MTLSizeMake(row_groups_down, 1, pairs)
-                threadsPerThreadgroup:MTLSizeMake(32, nsg_down, 1)];
-
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-            /* 5. Sum6 dispatch */
-            struct ds4_metal_dsv4_moe_sum6_args sum_args = {
-                .width = dim,
-                .tokens = 1,
-                .src_token_stride = (uint64_t)n_activated_experts * (uint64_t)dim * sizeof(float),
-                .dst_token_stride = (uint64_t)dim * sizeof(float),
-            };
-
-            NSUInteger nth_sum = 256;
-            if (nth_sum > dim) nth_sum = dim;
-            [enc setComputePipelineState:g_pso_moe_sum6];
-            [enc setBytes:&sum_args length:sizeof(sum_args) atIndex:0];
-            [enc setBuffer:scratch_down->mtl_buf offset:scratch_down->offset atIndex:1];
-            [enc setBuffer:moe_out->mtl_buf offset:moe_out->offset atIndex:2];
-            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(nth_sum, 1, 1)];
         } else {
             return 0;
         }
