@@ -714,6 +714,59 @@ static int test_gemv_batch_exact(void) {
     return 1;
 }
 
+static int test_v41_gemv_batch_exact(void) {
+    const uint32_t configs[][3] = {
+        {1280, 2048, 4},
+        {512,  2048, 6},
+        {8192, 1280, 3},
+        {384,  2048, 5},
+    };
+    const ggml_type types[] = {GGML_TYPE_F16, GGML_TYPE_F32};
+    for (size_t c = 0; c < sizeof(configs)/sizeof(configs[0]); c++) {
+        uint32_t out_dim = configs[c][0];
+        uint32_t in_dim = configs[c][1];
+        uint32_t n_tok = configs[c][2];
+        for (size_t t = 0; t < sizeof(types)/sizeof(types[0]); t++) {
+            ggml_type type = types[t];
+            size_t elem_bytes = type == GGML_TYPE_F32 ? 4 : 2;
+            size_t w_bytes = (size_t)out_dim * in_dim * elem_bytes;
+            size_t x_bytes = (size_t)n_tok * in_dim * sizeof(float);
+            size_t y_bytes = (size_t)n_tok * out_dim * sizeof(float);
+            myds_metal_buffer_t *w = myds_metal_buffer_alloc(w_bytes);
+            myds_metal_buffer_t *x = myds_metal_buffer_alloc(x_bytes);
+            myds_metal_buffer_t *y = myds_metal_buffer_alloc(y_bytes);
+            myds_metal_buffer_t *ref = myds_metal_buffer_alloc(y_bytes);
+            ASSERT_TRUE(w && x && y && ref);
+            float *xv = myds_metal_buffer_data(x);
+            for (size_t i = 0; i < (size_t)n_tok * in_dim; i++) xv[i] = sinf((float)i * 0.17f);
+            for (size_t i = 0; i < (size_t)out_dim * in_dim; i++) {
+                float val = ((int)(i % 17) - 8) * 0.125f;
+                if (type == GGML_TYPE_F32) ((float *)myds_metal_buffer_data(w))[i] = val;
+                else ((_Float16 *)myds_metal_buffer_data(w))[i] = (_Float16)val;
+            }
+            ASSERT_TRUE(myds_metal_begin_batch());
+            for (uint32_t tok = 0; tok < n_tok; tok++) {
+                myds_metal_buffer_t *xt = myds_metal_buffer_sub_view(x, (size_t)tok * in_dim * sizeof(float), in_dim * sizeof(float));
+                myds_metal_buffer_t *yt = myds_metal_buffer_sub_view(ref, (size_t)tok * out_dim * sizeof(float), out_dim * sizeof(float));
+                ASSERT_TRUE(xt && yt && myds_metal_v41_gemv(yt, w, xt, out_dim, in_dim, type));
+                myds_metal_buffer_free(xt);
+                myds_metal_buffer_free(yt);
+            }
+            ASSERT_TRUE(myds_metal_commit_batch());
+            ASSERT_TRUE(myds_metal_begin_batch());
+            ASSERT_TRUE(myds_metal_v41_gemv_batch(y, w, x, out_dim, in_dim, n_tok, type));
+            ASSERT_TRUE(myds_metal_commit_batch());
+            ASSERT_TRUE(memcmp(myds_metal_buffer_data(y), myds_metal_buffer_data(ref), y_bytes) == 0);
+            myds_metal_buffer_free(w);
+            myds_metal_buffer_free(x);
+            myds_metal_buffer_free(y);
+            myds_metal_buffer_free(ref);
+        }
+    }
+    printf("  [PASS] V4.1 Batched GEMV is bit-exact to single-token V4.1 GEMV across dimensions\n");
+    return 1;
+}
+
 static int test_event_validation(void) {
     uint64_t commits = myds_metal_get_commit_count();
     ASSERT_TRUE(myds_metal_begin_batch());
@@ -918,6 +971,7 @@ int main(void) {
     RUN_TEST(test_batch_command_buffer());
     RUN_TEST(test_swiglu_flat_shapes());
     RUN_TEST(test_gemv_batch_exact());
+    RUN_TEST(test_v41_gemv_batch_exact());
     RUN_TEST(test_event_validation());
     RUN_TEST(test_event_tail_completion(0));
     RUN_TEST(test_event_tail_completion(1));

@@ -12,4 +12,8 @@ int myds_v41_shared_swiglu(myds_metal_buffer_t *out,
     uint32_t width, float clamp);
 /* Input ctx->ffn_norm_out; output ctx->ffn_out. Retains an active GPU batch. */
 int myds_v41_moe(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t pos);
+int myds_v41_moe_eval(myds_context_t *ctx, uint32_t layer, uint32_t pos,
+                      const myds_metal_buffer_t *ffn_norm,
+                      const myds_metal_buffer_t *router_logits,
+                      const myds_metal_buffer_t *shared_out);
 #endif

@@ -119,6 +119,10 @@ int myds_metal_v41_gemv(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *weight, const myds_metal_buffer_t *input,
     uint32_t out_dim, uint32_t in_dim, ggml_type weight_type);
 
+int myds_metal_v41_gemv_batch(myds_metal_buffer_t *out,
+    const myds_metal_buffer_t *weight, const myds_metal_buffer_t *input,
+    uint32_t out_dim, uint32_t in_dim, uint32_t n_tok, ggml_type weight_type);
+
 /* Multiple independent GEMVs in one dispatch. Uses the same arithmetic and
  * reduction as gemv, with contiguous input/output rows in token order. */
 int myds_metal_gemv_batch(

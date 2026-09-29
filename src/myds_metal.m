@@ -1364,14 +1364,15 @@ int myds_metal_gemv(
     return myds_metal_gemv_batch(y, W, x, out_dim, in_dim, 1, weight_type);
 }
 
-int myds_metal_v41_gemv(myds_metal_buffer_t *out,
+int myds_metal_v41_gemv_batch(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *weight, const myds_metal_buffer_t *input,
-    uint32_t out_dim, uint32_t in_dim, ggml_type weight_type) {
-    if (!out || !weight || !input || !out_dim || !in_dim ||
+    uint32_t out_dim, uint32_t in_dim, uint32_t n_tok, ggml_type weight_type) {
+    if (!out || !weight || !input || !out_dim || !in_dim || !n_tok ||
         (weight_type != GGML_TYPE_F16 && weight_type != GGML_TYPE_F32) ||
-        out_dim > INT32_MAX || in_dim > INT32_MAX ||
+        out_dim > INT32_MAX || in_dim > INT32_MAX || n_tok > INT32_MAX ||
         in_dim % 4u ||
-        input->size / sizeof(float) < in_dim || out->size / sizeof(float) < out_dim)
+        input->size / sizeof(float) / in_dim < n_tok ||
+        out->size / sizeof(float) / out_dim < n_tok)
         return 0;
     const uint64_t elem_bytes = weight_type == GGML_TYPE_F32 ? sizeof(float) : 2u;
     if (weight->size / ((uint64_t)in_dim * elem_bytes) < out_dim) return 0;
@@ -1386,14 +1387,14 @@ int myds_metal_v41_gemv(myds_metal_buffer_t *out,
     args.nb02 = args.nb01 * out_dim;
     args.nb03 = args.nb02;
     args.ne10 = (int32_t)in_dim;
-    args.ne11 = 1;
+    args.ne11 = (int32_t)n_tok;
     args.ne12 = 1;
     args.nb10 = sizeof(float);
     args.nb11 = (uint64_t)in_dim * sizeof(float);
-    args.nb12 = args.nb11;
-    args.nb13 = args.nb11;
+    args.nb12 = (uint64_t)in_dim * n_tok * sizeof(float);
+    args.nb13 = args.nb12;
     args.ne0 = (int32_t)out_dim;
-    args.ne1 = 1;
+    args.ne1 = (int32_t)n_tok;
     args.nr0 = 2;
     args.r2 = 1;
     args.r3 = 1;
@@ -1425,10 +1426,16 @@ int myds_metal_v41_gemv(myds_metal_buffer_t *out,
         [enc setBuffer:input->mtl_buf offset:input->offset atIndex:2];
         [enc setBuffer:out->mtl_buf offset:out->offset atIndex:3];
         [enc setThreadgroupMemoryLength:32u * 2u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake((out_dim + 1u) / 2u, 1, 1)
+        [enc dispatchThreadgroups:MTLSizeMake((out_dim + 1u) / 2u, n_tok, 1)
              threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
         return v41_finish(cb, enc);
     }
+}
+
+int myds_metal_v41_gemv(myds_metal_buffer_t *out,
+    const myds_metal_buffer_t *weight, const myds_metal_buffer_t *input,
+    uint32_t out_dim, uint32_t in_dim, ggml_type weight_type) {
+    return myds_metal_v41_gemv_batch(out, weight, input, out_dim, in_dim, 1, weight_type);
 }
 
 struct ds4_metal_args_mul_mm {

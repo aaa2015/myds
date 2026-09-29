@@ -86,32 +86,54 @@ int myds_v41_shared_swiglu(myds_metal_buffer_t *out,
                     (width+255)/256,256,0);
 }
 
-int myds_v41_moe(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t pos) {
-    (void)token; // V4.1 text router is score-based, without token-hash selection.
+int myds_v41_moe_eval(myds_context_t *ctx, uint32_t layer, uint32_t pos,
+                      const myds_metal_buffer_t *ffn_norm,
+                      const myds_metal_buffer_t *router_logits,
+                      const myds_metal_buffer_t *shared_out) {
     if (!ctx || !ctx->model || layer >= ctx->model->n_layers) return 0;
     myds_model_t *m = ctx->model;
     myds_layer_t *l = &m->layers[layer];
     const uint32_t dim=m->dim, width=m->moe_expert_dim, k=m->n_activated_experts;
-    // The existing resident routed kernels implement this exact quantization
-    // combination. Refuse other formats rather than silently interpreting them.
     if (m->n_routed_experts!=384 || k!=6 || m->n_shared_experts!=1 ||
         !dim || !width || dim%256 || width%256 ||
         l->ffn_gate_exps_type!=GGML_TYPE_IQ2_XXS ||
         l->ffn_up_exps_type!=GGML_TYPE_IQ2_XXS ||
         l->ffn_down_exps_type!=GGML_TYPE_Q2_K) return 0;
-    if (!myds_metal_v41_gemv(ctx->router_logits,l->router_gate,ctx->ffn_norm_out,
-                         m->n_routed_experts,dim,l->router_gate_type) ||
-        !myds_trace_f32("route_logits",layer,pos,ctx->router_logits,m->n_routed_experts) ||
+
+    if (!myds_trace_f32("route_logits",layer,pos,router_logits,m->n_routed_experts) ||
         !myds_v41_route(ctx->selected_ids,ctx->selected_weights,ctx->moe_gate,ctx->moe_up,
-                        ctx->router_logits,l->router_bias,m->n_routed_experts,k,m->routed_scaling_factor) ||
+                        router_logits,l->router_bias,m->n_routed_experts,k,m->routed_scaling_factor) ||
         !myds_trace_f32("route_probs",layer,pos,ctx->moe_gate,m->n_routed_experts) ||
         !myds_trace_f32("route_weights",layer,pos,ctx->selected_weights,k)) return 0;
     const myds_metal_buffer_t *id_buffers[] = {ctx->selected_ids,ctx->moe_up};
     if (!dispatch("kernel_myds_v41_ids_f32",&k,sizeof(k),id_buffers,2,1,32,0) ||
         !myds_trace_f32("route_ids",layer,pos,ctx->moe_up,k)) return 0;
-    // The existing slots6 path binds individual resident expert views using CPU
-    // IDs. Complete the router before it inspects these unified-memory values.
+    // Complete the router before inspecting unified-memory values.
     if (!myds_metal_commit_batch() || !myds_metal_begin_batch()) return 0;
+    if (!myds_trace_f32("shared_out",layer,pos,shared_out,dim)) return 0;
+    myds_metal_barrier();
+    if (!myds_metal_routed_moe(ctx->moe_out,ffn_norm,l->ffn_gate_exps,
+        l->ffn_up_exps,l->ffn_down_exps,ctx->selected_ids,ctx->selected_weights,
+        ctx->moe_gate,ctx->moe_up,ctx->moe_mid,ctx->moe_down,dim,width,
+        m->n_routed_experts,k,l->ffn_gate_exps_type,l->ffn_up_exps_type,
+        l->ffn_down_exps_type,m->swiglu_clamp_exp)) return 0;
+    myds_metal_barrier();
+    if (!myds_trace_f32("routed_out",layer,pos,ctx->moe_out,dim) ||
+        !myds_metal_add(ctx->ffn_out,ctx->moe_out,shared_out,dim)) return 0;
+    myds_metal_barrier();
+    return myds_metal_v41_bf16(ctx->ffn_out,dim) &&
+        myds_trace_f32("ffnblock",layer,pos,ctx->ffn_out,dim);
+}
+
+int myds_v41_moe(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t pos) {
+    (void)token; // V4.1 text router is score-based, without token-hash selection.
+    if (!ctx || !ctx->model || layer >= ctx->model->n_layers) return 0;
+    myds_model_t *m = ctx->model;
+    myds_layer_t *l = &m->layers[layer];
+    const uint32_t dim=m->dim, width=m->moe_expert_dim;
+
+    if (!myds_metal_v41_gemv(ctx->router_logits,l->router_gate,ctx->ffn_norm_out,
+                             m->n_routed_experts,dim,l->router_gate_type)) return 0;
     if (!myds_metal_gemv(ctx->shared_gate_out,l->shared_gate,ctx->ffn_norm_out,
                          width,dim,l->shared_gate_type) ||
         !myds_metal_v41_bf16(ctx->shared_gate_out,width) ||
@@ -122,18 +144,7 @@ int myds_v41_moe(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t p
                                ctx->shared_up_out,width,m->swiglu_clamp_exp) ||
         !myds_metal_gemv(ctx->shared_out,l->shared_down,ctx->shared_swiglu_out,
                          dim,width,l->shared_down_type) ||
-        !myds_metal_v41_bf16(ctx->shared_out,dim) ||
-        !myds_trace_f32("shared_out",layer,pos,ctx->shared_out,dim)) return 0;
-    myds_metal_barrier();
-    if (!myds_metal_routed_moe(ctx->moe_out,ctx->ffn_norm_out,l->ffn_gate_exps,
-        l->ffn_up_exps,l->ffn_down_exps,ctx->selected_ids,ctx->selected_weights,
-        ctx->moe_gate,ctx->moe_up,ctx->moe_mid,ctx->moe_down,dim,width,
-        m->n_routed_experts,k,l->ffn_gate_exps_type,l->ffn_up_exps_type,
-        l->ffn_down_exps_type,m->swiglu_clamp_exp)) return 0;
-    myds_metal_barrier();
-    if (!myds_trace_f32("routed_out",layer,pos,ctx->moe_out,dim) ||
-        !myds_metal_add(ctx->ffn_out,ctx->moe_out,ctx->shared_out,dim)) return 0;
-    myds_metal_barrier();
-    return myds_metal_v41_bf16(ctx->ffn_out,dim) &&
-        myds_trace_f32("ffnblock",layer,pos,ctx->ffn_out,dim);
+        !myds_metal_v41_bf16(ctx->shared_out,dim)) return 0;
+
+    return myds_v41_moe_eval(ctx, layer, pos, ctx->ffn_norm_out, ctx->router_logits, ctx->shared_out);
 }
