@@ -29,6 +29,8 @@
  * died at layer 0 with "HC attention input".  Raising the cap therefore needs
  * this sizing, not just a relaxed clamp. */
 #define V41_MAX_CHUNK 4096u
+/* MoE 批的 token 上限（内存护栏）：批缓冲约 0.44 MB/token。8192 ⇒ 约 3.6 GB。 */
+#define MYDS_MOE_BATCH_MAX_TOKENS 8192u
 
 typedef struct {
     myds_metal_buffer_t *attn_fn, *attn_scale, *attn_base;
@@ -532,6 +534,15 @@ typedef struct {
     myds_metal_buffer_t *ffn_out_buf;
     myds_metal_buffer_t *layer_out_buf;
 
+    /* MoE 的批大小（token 数）可以与 attention 的 chunk 解耦：attention 仍按 chunk 跑
+     * （数值路径完全不变），只把各 chunk 的 MoE 输入累积起来、攒够再跑一次 MoE ——
+     * 因为 MoE 每层都要读【全部 n_routed_experts 个 expert】的权重（~3.8 GB），
+     * 这份开销与 token 数无关、只与 MoE 被调用的【次数】有关。
+     * moe_batch == capacity 时，下面这些指针就是原缓冲本身（零拷贝，与旧行为一致）。 */
+    uint32_t moe_batch;
+    myds_metal_buffer_t *moe_norm_acc, *moe_ids_acc, *moe_w_acc;
+    myds_metal_buffer_t *moe_shared_acc, *moe_after_acc, *moe_split_acc, *moe_out_acc;
+
     myds_metal_buffer_t *x[V41_MAX_CHUNK];
     myds_metal_buffer_t *x_norm[V41_MAX_CHUNK];
     myds_metal_buffer_t *qr[V41_MAX_CHUNK];
@@ -664,15 +675,29 @@ static void v41_chunk_workspace_free(v41_chunk_workspace_t *cw) {
     if (cw->cur_mask_view) myds_metal_buffer_free(cw->cur_mask_view);
     if (cw->hc_flat_norm_buf) myds_metal_buffer_free(cw->hc_flat_norm_buf);
     if (cw->hc_mix_buf) myds_metal_buffer_free(cw->hc_mix_buf);
+    if (cw->moe_batch > cw->capacity) {   /* 别名时不能重复释放 */
+        if (cw->moe_norm_acc) myds_metal_buffer_free(cw->moe_norm_acc);
+        if (cw->moe_ids_acc) myds_metal_buffer_free(cw->moe_ids_acc);
+        if (cw->moe_w_acc) myds_metal_buffer_free(cw->moe_w_acc);
+        if (cw->moe_shared_acc) myds_metal_buffer_free(cw->moe_shared_acc);
+        if (cw->moe_after_acc) myds_metal_buffer_free(cw->moe_after_acc);
+        if (cw->moe_split_acc) myds_metal_buffer_free(cw->moe_split_acc);
+        if (cw->moe_out_acc) myds_metal_buffer_free(cw->moe_out_acc);
+    }
     free(cw);
 }
 
-static v41_chunk_workspace_t *v41_chunk_workspace_create(uint32_t capacity, uint32_t exp_dim) {
+static v41_chunk_workspace_t *v41_chunk_workspace_create(uint32_t capacity, uint32_t exp_dim,
+                                                         uint32_t moe_batch_tokens) {
     if (!capacity || capacity > V41_MAX_CHUNK) return NULL;
     v41_chunk_workspace_t *cw = calloc(1, sizeof(*cw));
     if (!cw) return NULL;
     cw->capacity = capacity;
     size_t C = capacity;
+    /* MoE 的批容量（token 数）—— 至少一个 chunk。调用方按 MYDS_MOE_CHUNKS 与 prompt
+     * 长度给出；只影响 MoE 的调用次数，不影响 attention 的数值。 */
+    size_t B = (moe_batch_tokens > capacity) ? (size_t)moe_batch_tokens : C;
+    cw->moe_batch = (uint32_t)B;
 
 #define ALLOC_BUF(name, bytes) do { cw->name = myds_metal_buffer_alloc(bytes); if (!cw->name) goto fail; } while(0)
     ALLOC_BUF(x_buf, C * V41_DIM * sizeof(float));
@@ -706,15 +731,34 @@ static v41_chunk_workspace_t *v41_chunk_workspace_create(uint32_t capacity, uint
     ALLOC_BUF(pool_score_buf, C * 512 * sizeof(float));
     ALLOC_BUF(index_q_buf, C * V41_INDEX_HEADS * 128 * sizeof(float));
     ALLOC_BUF(index_weights_buf, C * V41_INDEX_HEADS * sizeof(float));
-    ALLOC_BUF(moe_gate_buf, C * 6 * exp_dim * sizeof(float));
-    ALLOC_BUF(moe_up_buf, C * 6 * exp_dim * sizeof(float));
-    ALLOC_BUF(moe_mid_buf, C * 6 * exp_dim * sizeof(float));
-    ALLOC_BUF(moe_down_buf, C * 6 * V41_DIM * sizeof(float));
+    ALLOC_BUF(moe_gate_buf, B * 6 * exp_dim * sizeof(float));
+    ALLOC_BUF(moe_up_buf, B * 6 * exp_dim * sizeof(float));
+    ALLOC_BUF(moe_mid_buf, B * 6 * exp_dim * sizeof(float));
+    ALLOC_BUF(moe_down_buf, B * 6 * V41_DIM * sizeof(float));
     ALLOC_BUF(moe_out_buf, C * V41_DIM * sizeof(float));
     ALLOC_BUF(ffn_out_buf, C * V41_DIM * sizeof(float));
     ALLOC_BUF(layer_out_buf, C * 4 * V41_DIM * sizeof(float));
     ALLOC_BUF(hc_flat_norm_buf, C * 4 * V41_DIM * sizeof(float));
     ALLOC_BUF(hc_mix_buf, C * 24 * sizeof(float));
+    if (B > C) {
+        /* 解耦模式：MoE 的输入/输出各自独立成批缓冲，attention 侧原缓冲继续按 chunk 用。 */
+        ALLOC_BUF(moe_norm_acc, B * V41_DIM * sizeof(float));
+        ALLOC_BUF(moe_ids_acc, B * 6 * sizeof(int32_t));
+        ALLOC_BUF(moe_w_acc, B * 6 * sizeof(float));
+        ALLOC_BUF(moe_shared_acc, B * V41_DIM * sizeof(float));
+        ALLOC_BUF(moe_after_acc, B * 4 * V41_DIM * sizeof(float));
+        ALLOC_BUF(moe_split_acc, B * 24 * sizeof(float));
+        ALLOC_BUF(moe_out_acc, B * V41_DIM * sizeof(float));
+    } else {
+        /* 单 chunk 批：直接指向原缓冲，零拷贝、与旧行为一致。 */
+        cw->moe_norm_acc = cw->ffn_norm_buf;
+        cw->moe_ids_acc = cw->selected_ids_buf;
+        cw->moe_w_acc = cw->selected_weights_buf;
+        cw->moe_shared_acc = cw->shared_out_buf;
+        cw->moe_after_acc = cw->after_attn_buf;
+        cw->moe_split_acc = cw->ffn_split_buf;
+        cw->moe_out_acc = cw->moe_out_buf;
+    }
 #undef ALLOC_BUF
 
     for (size_t t = 0; t < C; t++) {
@@ -844,7 +888,26 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     float *engram_all[2] = {NULL, NULL};
     engram_all[0] = (float *)malloc((size_t)n_tokens * MYDS_ENGRAM_INPUT_DIM * sizeof(float));
     engram_all[1] = (float *)malloc((size_t)n_tokens * MYDS_ENGRAM_INPUT_DIM * sizeof(float));
-    v41_chunk_workspace_t *cw = v41_chunk_workspace_create(chunk_size, m->moe_expert_dim);
+    /* MoE 的批跨几个 attention chunk。默认 1（= 旧行为：每个 chunk 跑一次 MoE）。
+     * 加大它不改变 attention 的数值，只是把 MoE 的调用次数降下来 —— MoE 每层要读
+     * 全部 n_routed_experts 个 expert 的权重，与 token 数无关。 */
+    uint32_t moe_chunks = 1;
+    {
+        const char *mc = getenv("MYDS_MOE_CHUNKS");
+        if (mc) { int v = atoi(mc); if (v > 1) moe_chunks = (uint32_t)v; }
+        if (moe_chunks > 16u) moe_chunks = 16u;
+        /* 内存护栏：批缓冲约 0.44 MB/token（MoE 的 gate/up/mid/down + 累积缓冲） */
+        if (moe_chunks > 1u && (size_t)chunk_size * moe_chunks > MYDS_MOE_BATCH_MAX_TOKENS)
+            moe_chunks = (uint32_t)(MYDS_MOE_BATCH_MAX_TOKENS / chunk_size);
+        if (moe_chunks < 1u) moe_chunks = 1u;
+        if (moe_chunks > 1u) {
+            uint32_t need = (uint32_t)(((size_t)n_tokens + chunk_size - 1u) / chunk_size);  /* 整个 prompt 的 chunk 数 */
+            if (moe_chunks > need) moe_chunks = need;   /* 不需要超过 prompt 本身 */
+            if (moe_chunks < 1u) moe_chunks = 1u;
+        }
+    }
+    const uint32_t moe_batch_tokens = chunk_size * moe_chunks;
+    v41_chunk_workspace_t *cw = v41_chunk_workspace_create(chunk_size, m->moe_expert_dim, moe_batch_tokens);
 
     if (!prompt_res || !prompt_pre || !prompt_selected || !prompt_block_mask ||
         !engram_all[0] || !engram_all[1] || !cw) {
@@ -925,11 +988,13 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 
     if (do_prof) gettimeofday(&ptv_all0, NULL);
 
+    uint32_t moe_off = 0;   /* 当前 MoE 批已经攒了多少 token */
     for (il = 0; il < V41_LAYERS; il++) {
         if (cancel_flag && *cancel_flag) goto cancelled;
         const myds_layer_t *base = &m->layers[il];
         const v41_layer_t *l = &v->layers[il];
         const bool compressed = ratio_for(il) != 0;
+        moe_off = 0;
 
         for (uint32_t c_start = 0; c_start < n_tokens; c_start += chunk_size) {
             if (cancel_flag && *cancel_flag) goto cancelled;
@@ -1293,38 +1358,114 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 myds_metal_barrier();
             }
 
-            /* Step 8: Routed MoE & Layer output across all tokens in chunk */
+            /* Step 8: Routed MoE & Layer output.
+             * 本 chunk 的 MoE 输入先攒进批缓冲（moe_batch > capacity 时才需要搬），
+             * 攒满 —— 或到了 prompt 末尾 —— 再跑一次 MoE。attention 的数值路径与
+             * chunk 大小完全不变，所以结果与「每 chunk 一次 MoE」逐位相同。 */
             TIME_START();
-            CHECK(myds_metal_routed_moe_batch(cw->moe_out_buf, cw->ffn_norm_buf,
-                base->ffn_gate_exps, base->ffn_up_exps, base->ffn_down_exps,
-                cw->selected_ids_buf, cw->selected_weights_buf,
-                cw->moe_gate_buf, cw->moe_up_buf, cw->moe_mid_buf, cw->moe_down_buf,
-                V41_DIM, width, m->n_routed_experts, k, c_len,
-                base->ffn_gate_exps_type, base->ffn_up_exps_type, base->ffn_down_exps_type,
-                m->swiglu_clamp_exp));
-
-            myds_metal_barrier();
-            CHECK(myds_metal_add(cw->ffn_out_buf, cw->moe_out_buf, cw->shared_out_buf, V41_DIM * c_len));
-            CHECK(myds_metal_v41_bf16(cw->ffn_out_buf, V41_DIM * c_len));
-            myds_metal_barrier();
-
-            CHECK(myds_metal_v41_hc_expand_batch(cw->layer_out_buf, cw->ffn_out_buf, cw->after_attn_buf, cw->ffn_split_buf, V41_DIM, c_len));
-
-            if (getenv("MYDS_BATCH_TRACE_PREFIX")) {
-                for (uint32_t t = 0; t < c_len; t++) {
-                    uint32_t idx = c_start + t;
-                    uint32_t pos = base_pos + idx;
-                    TRACE("shared_out", cw->shared_out[t], V41_DIM);
-                    TRACE("routed_out", cw->moe_out[t], V41_DIM);
-                    TRACE("ffnblock", cw->ffn_out[t], V41_DIM);
-                    TRACE("layer_out", cw->layer_out[t], 4 * V41_DIM);
-                }
+            if (cw->moe_batch > cw->capacity) {
+                CHECK(myds_metal_buffer_copy(cw->moe_norm_acc, (size_t)moe_off * V41_DIM * sizeof(float),
+                                             cw->ffn_norm_buf, 0, (size_t)c_len * V41_DIM * sizeof(float)));
+                CHECK(myds_metal_buffer_copy(cw->moe_ids_acc, (size_t)moe_off * 6 * sizeof(int32_t),
+                                             cw->selected_ids_buf, 0, (size_t)c_len * 6 * sizeof(int32_t)));
+                CHECK(myds_metal_buffer_copy(cw->moe_w_acc, (size_t)moe_off * 6 * sizeof(float),
+                                             cw->selected_weights_buf, 0, (size_t)c_len * 6 * sizeof(float)));
+                CHECK(myds_metal_buffer_copy(cw->moe_shared_acc, (size_t)moe_off * V41_DIM * sizeof(float),
+                                             cw->shared_out_buf, 0, (size_t)c_len * V41_DIM * sizeof(float)));
+                CHECK(myds_metal_buffer_copy(cw->moe_after_acc, (size_t)moe_off * 4 * V41_DIM * sizeof(float),
+                                             cw->after_attn_buf, 0, (size_t)c_len * 4 * V41_DIM * sizeof(float)));
+                CHECK(myds_metal_buffer_copy(cw->moe_split_acc, (size_t)moe_off * 24 * sizeof(float),
+                                             cw->ffn_split_buf, 0, (size_t)c_len * 24 * sizeof(float)));
             }
+            moe_off += c_len;
 
-            CHECK(myds_metal_buffer_copy(prompt_res, (size_t)c_start * res_tok_bytes,
-                                         cw->layer_out_buf, 0, (size_t)c_len * res_tok_bytes));
-            CHECK(myds_metal_buffer_copy(prompt_pre, (size_t)c_start * pre_tok_bytes,
-                                         cw->ffn_split_buf, 0, (size_t)c_len * pre_tok_bytes));
+            if (moe_off == cw->moe_batch || c_start + c_len == n_tokens) {
+                const uint32_t mb_len = moe_off;
+                const uint32_t mb_start = c_start + c_len - mb_len;   /* 本批在 prompt 里的起点 */
+                myds_metal_barrier();
+                CHECK(myds_metal_routed_moe_batch(cw->moe_out_acc, cw->moe_norm_acc,
+                    base->ffn_gate_exps, base->ffn_up_exps, base->ffn_down_exps,
+                    cw->moe_ids_acc, cw->moe_w_acc,
+                    cw->moe_gate_buf, cw->moe_up_buf, cw->moe_mid_buf, cw->moe_down_buf,
+                    V41_DIM, width, m->n_routed_experts, k, mb_len,
+                    base->ffn_gate_exps_type, base->ffn_up_exps_type, base->ffn_down_exps_type,
+                    m->swiglu_clamp_exp));
+                myds_metal_barrier();
+
+                /* 收尾仍按 attention chunk 逐个做：hc_expand 要用该 chunk 自己的
+                 * after_attn / ffn_split（它们都被保存在批缓冲里）。 */
+                for (uint32_t e0 = 0; e0 < mb_len; e0 += chunk_size) {
+                    uint32_t e_len = mb_len - e0;
+                    if (e_len > chunk_size) e_len = chunk_size;
+                    const uint32_t e_start = mb_start + e0;
+                    const bool aliased = (cw->moe_batch == cw->capacity);
+                    myds_metal_buffer_t *moe_view = aliased ? NULL :
+                        myds_metal_buffer_sub_view(cw->moe_out_acc, (size_t)e0 * V41_DIM * sizeof(float),
+                                                   (size_t)e_len * V41_DIM * sizeof(float));
+                    myds_metal_buffer_t *shared_view = aliased ? NULL :
+                        myds_metal_buffer_sub_view(cw->moe_shared_acc, (size_t)e0 * V41_DIM * sizeof(float),
+                                                   (size_t)e_len * V41_DIM * sizeof(float));
+                    myds_metal_buffer_t *after_view = aliased ? NULL :
+                        myds_metal_buffer_sub_view(cw->moe_after_acc, (size_t)e0 * 4 * V41_DIM * sizeof(float),
+                                                   (size_t)e_len * 4 * V41_DIM * sizeof(float));
+                    myds_metal_buffer_t *split_view = aliased ? NULL :
+                        myds_metal_buffer_sub_view(cw->moe_split_acc, (size_t)e0 * 24 * sizeof(float),
+                                                   (size_t)e_len * 24 * sizeof(float));
+                    if (!aliased && (!moe_view || !shared_view || !after_view || !split_view)) {
+                        if (moe_view) myds_metal_buffer_free(moe_view);
+                        if (shared_view) myds_metal_buffer_free(shared_view);
+                        if (after_view) myds_metal_buffer_free(after_view);
+                        if (split_view) myds_metal_buffer_free(split_view);
+                        myds_metal_barrier();
+                        MYDS_LOG_E("V4.1 MoE batch sub-view failed (e0=%u mb_len=%u)", e0, mb_len);
+                        goto fail;
+                    }
+                    const myds_metal_buffer_t *moe_b = aliased ? cw->moe_out_buf : moe_view;
+                    const myds_metal_buffer_t *sh_b = aliased ? cw->shared_out_buf : shared_view;
+                    const myds_metal_buffer_t *af_b = aliased ? cw->after_attn_buf : after_view;
+                    const myds_metal_buffer_t *sp_b = aliased ? cw->ffn_split_buf : split_view;
+
+                    CHECK(myds_metal_add(cw->ffn_out_buf, moe_b, sh_b, V41_DIM * e_len));
+                    CHECK(myds_metal_v41_bf16(cw->ffn_out_buf, V41_DIM * e_len));
+                    myds_metal_barrier();
+                    CHECK(myds_metal_v41_hc_expand_batch(cw->layer_out_buf, cw->ffn_out_buf, af_b, sp_b, V41_DIM, e_len));
+
+                    if (getenv("MYDS_BATCH_TRACE_PREFIX")) {
+                        for (uint32_t t = 0; t < e_len; t++) {
+                            uint32_t pos = base_pos + e_start + t;
+                            const myds_metal_buffer_t *sv = aliased ? cw->shared_out[t] :
+                                myds_metal_buffer_sub_view(cw->moe_shared_acc,
+                                    (size_t)(e0 + t) * V41_DIM * sizeof(float), V41_DIM * sizeof(float));
+                            const myds_metal_buffer_t *rv = aliased ? cw->moe_out[t] :
+                                myds_metal_buffer_sub_view(cw->moe_out_acc,
+                                    (size_t)(e0 + t) * V41_DIM * sizeof(float), V41_DIM * sizeof(float));
+                            int traced = sv && rv &&
+                                myds_trace_f32("shared_out", il, pos, sv, V41_DIM) &&
+                                myds_trace_f32("routed_out", il, pos, rv, V41_DIM) &&
+                                myds_trace_f32("ffnblock", il, pos, cw->ffn_out[t], V41_DIM) &&
+                                myds_trace_f32("layer_out", il, pos, cw->layer_out[t], 4 * V41_DIM);
+                            if (!aliased) {
+                                if (sv) myds_metal_buffer_free((myds_metal_buffer_t *)sv);
+                                if (rv) myds_metal_buffer_free((myds_metal_buffer_t *)rv);
+                            }
+                            if (!traced) goto fail;
+                        }
+                    }
+
+                    CHECK(myds_metal_buffer_copy(prompt_res, (size_t)e_start * res_tok_bytes,
+                                                 cw->layer_out_buf, 0, (size_t)e_len * res_tok_bytes));
+                    CHECK(myds_metal_buffer_copy(prompt_pre, (size_t)e_start * pre_tok_bytes,
+                                                 sp_b, 0, (size_t)e_len * pre_tok_bytes));
+
+                    if (!aliased) {
+                        myds_metal_buffer_free(moe_view);
+                        myds_metal_buffer_free(shared_view);
+                        myds_metal_buffer_free(after_view);
+                        myds_metal_buffer_free(split_view);
+                    }
+                }
+                moe_off = 0;
+            }
             TIME_ACC(prof_step8);
 
             TIME_START();
