@@ -1913,6 +1913,9 @@ struct ds4_metal_args_mul_mm {
     int32_t  ne1;
     int16_t  r2;
     int16_t  r3;
+    /* 追加在末尾：0 表示原来的紧凑布局（dst 行步长 = ne0）。 */
+    uint64_t nb_out;
+    uint64_t nb_out_batch;
 };
 
 int myds_metal_mul_mm(
@@ -2008,6 +2011,97 @@ int myds_metal_mul_mm(
         }
     }
     return 1;
+}
+
+/* 分组矩阵乘：一组一个权重矩阵，所有组在【一次】派发里完成。
+ *
+ * 布局（DS4 的 attention 输出投影就是这种）：
+ *   src1 : [n_tok][n_groups * in_dim]   —— 每行里第 g 组占 [g*in_dim, (g+1)*in_dim)
+ *   W    : [n_groups][out_dim][in_dim]  —— 第 g 组的权重紧跟在上一组之后
+ *   dst  : [n_tok][n_groups * out_dim]  —— 每行里第 g 组写 [g*out_dim, (g+1)*out_dim)
+ *
+ * 这和逐 (组, token) 的 matvec 是同一个数学，区别只在重用方式：
+ * matvec 那条路每个 threadgroup 都完整读一遍该组的权重，权重被读 n_tok 遍
+ * （本模型是 512 遍，17 GB / layer-chunk）；这里权重按块读进 threadgroup 后
+ * 同时服务 32 个 token。
+ *
+ * 各组之间的偏移分别落在 nb13（输入）、nb03（权重）、nb_out_batch（输出）上，
+ * 因此 tgpig.z 就是组号，内核本身不需要循环。 */
+int myds_metal_mul_mm_grouped(
+    myds_metal_buffer_t       *dst,
+    const myds_metal_buffer_t *W,
+    const myds_metal_buffer_t *src1,
+    uint32_t                   out_dim,
+    uint32_t                   in_dim,
+    uint32_t                   n_groups,
+    uint32_t                   n_tok,
+    ggml_type                  weight_type) {
+    if (!dst || !W || !src1 || !out_dim || !in_dim || !n_groups || !n_tok) return 0;
+
+    const bool bc_inp = (in_dim % 32u) != 0;
+    const bool bc_out = (out_dim % 64u) != 0 || (n_tok % 32u) != 0;
+
+    id<MTLComputePipelineState> pipeline = nil;
+    uint64_t row_bytes = 0;
+
+    if (weight_type == GGML_TYPE_Q8_0) {
+        pipeline = bc_out ? g_pso_mul_mm_q8_0_bco : g_pso_mul_mm_q8_0;
+        row_bytes = (in_dim / 32u) * 34u;
+    } else if (weight_type == GGML_TYPE_F16) {
+        pipeline = bc_out ? g_pso_mul_mm_f16_bco : g_pso_mul_mm_f16;
+        row_bytes = in_dim * sizeof(uint16_t);
+    } else if (weight_type == GGML_TYPE_F32) {
+        pipeline = bc_out ? g_pso_mul_mm_f32_bco : g_pso_mul_mm_f32;
+        row_bytes = in_dim * sizeof(float);
+    }
+
+    if (!pipeline || !W->mtl_buf || !src1->mtl_buf || !dst->mtl_buf || bc_inp) return 0;
+
+    @autoreleasepool {
+        struct ds4_metal_args_mul_mm args;
+        memset(&args, 0, sizeof(args));
+        args.ne00 = (int32_t)in_dim;
+        args.ne02 = 1;
+        args.nb01 = row_bytes;                          /* 权重一行（in_dim 宽） */
+        args.nb02 = row_bytes * out_dim;                /* 未用：ne12 == 1 ⇒ i12 == 0 */
+        args.nb03 = row_bytes * out_dim;                /* 每组权重的字节数 */
+        args.ne12 = 1;
+        args.nb10 = sizeof(float);
+        args.nb11 = (uint64_t)n_groups * in_dim * sizeof(float);  /* 输入的 token 行步长 */
+        args.nb12 = 0;                                  /* 未用 */
+        args.nb13 = (uint64_t)in_dim * sizeof(float);             /* 输入里组的步长 */
+        args.ne0 = (int32_t)out_dim;
+        args.ne1 = (int32_t)n_tok;
+        args.r2 = 1;
+        args.r3 = 1;
+        args.nb_out = (uint64_t)n_groups * out_dim;     /* 输出的 token 行步长 */
+        args.nb_out_batch = out_dim;                    /* 输出行内组的偏移 */
+
+        id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:W->mtl_buf offset:W->offset atIndex:1];
+        [enc setBuffer:src1->mtl_buf offset:src1->offset atIndex:2];
+        [enc setBuffer:dst->mtl_buf offset:dst->offset atIndex:3];
+        uint32_t tg_mem = (weight_type == GGML_TYPE_F32) ? 12288u : (bc_out ? 8192u : 6144u);
+        [enc setThreadgroupMemoryLength:tg_mem atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
+                                              ((NSUInteger)out_dim + 63u) / 64u,
+                                              (NSUInteger)n_groups)
+             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+        if (g_batch_cb) {
+            if (g_auto_barrier) {
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            }
+        } else {
+            [enc endEncoding];
+            [cb commit];
+            if (!wait_command_buffer(cb)) return 0;
+        }
+        return 1;
+    }
 }
 
 struct ds4_metal_args_mul_mv_id {

@@ -1148,7 +1148,19 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             if (do_prof) { disp_step4loop += myds_metal_dispatch_count() - disp_loop0; }  /* 诊断 */
 
             /* Batched Attention Output A for all c_len tokens in chunk (reads 4.2 MB weight ONCE) */
-            CHECK(myds_metal_attn_output_a_batch(cw->attn_low_buf, base->attn_output_a, cw->attn_heads_buf, 8, 4096, 1024, c_len, base->attn_output_a_type));
+            /* Batched: one matmul for all eight groups instead of one threadgroup per
+             * (group, token) pair, which read each group's weight once per token, 512
+             * times, 17 GB per layer chunk.  Falls back to that path if the batched
+             * entry point declines (unsupported type or shape). */
+            myds_metal_barrier();
+            int a_ok = 0;
+            if (!getenv("MYDS_DISABLE_MM_ATTN_A"))
+                a_ok = myds_metal_mul_mm_grouped(cw->attn_low_buf, base->attn_output_a,
+                        cw->attn_heads_buf, 1024, 4096, 8, c_len, base->attn_output_a_type);
+            if (!a_ok)
+                a_ok = myds_metal_attn_output_a_batch(cw->attn_low_buf, base->attn_output_a,
+                        cw->attn_heads_buf, 8, 4096, 1024, c_len, base->attn_output_a_type);
+            CHECK(a_ok);
             CHECK(myds_metal_v41_bf16(cw->attn_low_buf, 8192 * c_len));
             TIME_ACC(prof_step4);
             if (do_prof) { disp_step14 += myds_metal_dispatch_count() - disp_layer0; }  /* 诊断 */

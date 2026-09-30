@@ -47,6 +47,9 @@ struct ds4_metal_args_mul_mm {
     int32_t ne1;
     int16_t r2;
     int16_t r3;
+    /* 追加在末尾：0 表示原来的紧凑布局（dst 行步长 = ne0）。 */
+    uint64_t nb_out;
+    uint64_t nb_out_batch;
 };
 
 struct ds4_metal_args_mul_mv_ext {
@@ -2487,8 +2490,12 @@ kernel void kernel_mul_mm_mpp_direct_rhs(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    device float *dst_batch = (device float *)dst + im*N*M;
-    auto tD = tensor(dst_batch, dextents<int32_t, 2>(M, N), array<int, 2>({1, M}));
+    /* 默认是紧凑布局；分组调用（输出行的每一列块用一份独立的权重）把
+     * nb_out 设为行步长、nb_out_batch 设为行内各组之间的偏移。 */
+    const int     dst_row   = args.nb_out       ? (int)args.nb_out       : M;
+    const int64_t dst_part  = args.nb_out_batch ? (int64_t)args.nb_out_batch : (int64_t)N*M;
+    device float *dst_batch = (device float *)dst + (int64_t)im*dst_part;
+    auto tD = tensor(dst_batch, dextents<int32_t, 2>(M, N), array<int, 2>({1, dst_row}));
     auto mD = tD.slice(r0, r1);
     cT.store(mD);
 }
@@ -2671,14 +2678,19 @@ kernel void kernel_mul_mm(
         }
     }
 
+    /* 默认（nb_out == 0）是紧凑布局：输出行步长 = ne0、批偏移 = ne1*ne0。
+     * 分组调用把行步长与批偏移分开传，好让同一行的各列块用不同的权重。 */
+    const int     mm_dst_row  = args.nb_out       ? (int)args.nb_out       : args.ne0;
+    const int64_t mm_dst_part = args.nb_out_batch ? (int64_t)args.nb_out_batch : (int64_t)args.ne1*args.ne0;
+
     if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1)) {
         // if no bounds checks on the output are needed, we can directly write to device memory
         device float * C = (device float *) dst +
             (r0 + 32*(sgitg &  1)) + \
-            (r1 + 16*(sgitg >> 1)) * args.ne0 + im*args.ne1*args.ne0;
+            (r1 + 16*(sgitg >> 1)) * mm_dst_row + im*mm_dst_part;
 
         for (short i = 0; i < 8; i++) {
-            simdgroup_store(mc[i], C + 8*(i%4) + 8*args.ne0*(i/4), args.ne0, 0, false);
+            simdgroup_store(mc[i], C + 8*(i%4) + 8*mm_dst_row*(i/4), mm_dst_row, 0, false);
         }
     } else {
         // block is smaller than 64x32, we should avoid writing data outside of the matrix
@@ -2694,7 +2706,7 @@ kernel void kernel_mul_mm(
 
         if (sgitg == 0) {
             for (int j = tiitg; j < nr1; j += NR1) {
-                device float  * D  = (device float  *) dst + r0 + (r1 + j)*args.ne0 + im*args.ne1*args.ne0;
+                device float  * D  = (device float  *) dst + r0 + (r1 + j)*mm_dst_row + im*mm_dst_part;
                 device float4 * D4 = (device float4 *) D;
 
                 threadgroup float  * C  = temp_str + (j*NR0);
