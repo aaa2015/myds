@@ -468,6 +468,32 @@ int main(void) {
         printf("  [PASS] Production top-k truncation constraint (only top 2 candidate tokens sampled)\n");
     }
 
+    /* 3b. Production Top-P (nucleus) must span the whole mass prefix.
+     *     构造一个「尾部也占大量质量」的分布，让真 nucleus 远大于任何固定截断：
+     *       token 0..1023   logit 0       （合计 8.2% 质量，且前 1024 名【无歧义】）
+     *       token 1024..    logit -0.5    （合计 91.8% 质量 ⇒ 尾部才是大头）
+     *       top_p = 0.95 ⇒ 真 nucleus 约 1.9 万个（覆盖到尾部）
+     *     旧实现先砍到 1024 个候选再归一化 ⇒ 只可能采到 token < 1024，尾部永远抽不到；
+     *     新实现应让约 91% 的样本落在 1024 号之后（期望约 183/200）。 */
+    {
+        const uint32_t V = 20000;
+        float *logits = (float *)malloc(V * sizeof(float));
+        assert(logits != NULL);
+        for (uint32_t i = 0; i < V; i++) logits[i] = (i < 1024u) ? 0.0f : -0.5f;
+        myds_config_t cfg = {.temperature = 1.0f, .top_k = 0, .top_p = 0.95f,
+                             .repetition_penalty = 1.0f, .seed = 7};
+        uint32_t beyond = 0;
+        for (int iter = 0; iter < 200; iter++) {
+            int32_t picked = myds_sample_next_token(logits, V, &cfg, NULL, NULL, 0);
+            assert(picked >= 0 && (uint32_t)picked < V);
+            if (picked >= 1024) beyond++;
+        }
+        /* 期望约 183/200。旧实现恒为 0，所以 >128 这个门槛宽松但决定性。 */
+        assert(beyond > 128);
+        free(logits);
+        printf("  [PASS] Production top-p nucleus spans the mass prefix (%u/200 samples beyond the top 1024)\n", beyond);
+    }
+
     /* 4. Production Min-P Filtering */
     {
         /* Logits: token 0 dominant, token 1 tiny */

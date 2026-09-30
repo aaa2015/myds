@@ -28,7 +28,10 @@
  * overwrite those fields -- hc_flat_norm_buf came back as size 0 and prefill
  * died at layer 0 with "HC attention input".  Raising the cap therefore needs
  * this sizing, not just a relaxed clamp. */
-#define V41_MAX_CHUNK 4096u
+/* 单个 chunk 的 token 上界。用 myds_v41_gpu.h 里的【单一真源】：以前这里钳到 4096、
+ * 而 chunk attention 只接受 2048 —— 于是 MYDS_PREFILL_CHUNK_SIZE=3000 这种「配置合法」
+ * 的值会在运行时让整个 prefill 失败。现在两边同源，host 侧统一钳到 2048。 */
+#define V41_MAX_CHUNK MYDS_V41_CHUNK_MAX
 /* MoE 批的 token 上限（内存护栏）：批缓冲约 0.44 MB/token。8192 ⇒ 约 3.6 GB。 */
 #define MYDS_MOE_BATCH_MAX_TOKENS 8192u
 
@@ -1093,6 +1096,21 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         return -1;
     }
 
+    /* ratio==1 的层（l>=20）一个 chunk 的 n_comp 就是【绝对位置】，所以键范围
+     * CARRY + c_len + n_comp 最坏到 CARRY + chunk + (base_pos + n_tokens)。
+     * 超过 chunk attention 能覆盖的键数时，旧版会在跑到【第 20 层】才返回 0，
+     * 于是一个超长 prompt 会白跑几秒再报一句「chunked attention failed」。
+     * 这里在分配任何缓冲之前就判定，并直接说清上限与开关。 */
+    {
+        const uint32_t key_cap = myds_v41_gpu_chunk_key_max(g->gpu);
+        if (key_cap && base_pos + n_tokens > key_cap) {
+            MYDS_LOG_E("V4.1 prefill needs %u keys but chunked attention covers %u "
+                       "(position %u + %u tokens). Raise MYDS_CHUNK_KEY_MAX or shorten the prompt.",
+                       base_pos + n_tokens, key_cap, base_pos, n_tokens);
+            return -1;
+        }
+    }
+
     if (base_pos == 0) {
         g->next_position = 0;
         g->valid = true;
@@ -1108,7 +1126,15 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     uint32_t chunk_size = chunk_env ? (uint32_t)atoi(chunk_env) : 256u;
     if (chunk_size < 2u) chunk_size = 2u;
     if (chunk_size % 2u != 0) chunk_size = (chunk_size / 2u) * 2u;
-    if (chunk_size > V41_MAX_CHUNK) chunk_size = V41_MAX_CHUNK;
+    if (chunk_size > V41_MAX_CHUNK) {
+        static bool clamped_warned = false;
+        if (!clamped_warned) {
+            clamped_warned = true;
+            MYDS_LOG_W("V4.1 prefill chunk size %u clamped to the attention limit %u",
+                       chunk_size, V41_MAX_CHUNK);
+        }
+        chunk_size = V41_MAX_CHUNK;
+    }
     if (n_tokens < chunk_size) {
         chunk_size = n_tokens;
         if (chunk_size % 2u != 0) chunk_size++;

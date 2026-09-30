@@ -1380,27 +1380,42 @@ int32_t myds_sample_next_token(
         cands[i].id = indices[i];
     }
 
-    /* Apply top_k truncation with O(N) quickselect before qsort */
-    uint32_t target_k = top_k;
-    if (target_k == 0 && top_p > 0.0f && top_p < 1.0f && n_cands > 1024) {
-        target_k = 1024;
-    }
-    if (target_k > 0 && target_k < n_cands) {
-        quickselect_cand_desc(cands, 0, (int)n_cands - 1, (int)target_k - 1);
-        n_cands = target_k;
-    }
-    qsort(cands, n_cands, sizeof(myds_cand_t), compare_cand_desc);
+    /* quickselect 取出前 target_k 个再 qsort。
+     * top_k 是显式上界；top_p（nucleus）要的是【累计质量刚好达到 top_p 的那一段】，
+     * 固定截断到 1024 只在这段装得下时才精确 —— 所以 1024 现在只是【起点】，
+     * 质量不够就成倍放大重来。旧行为是直接砍到 1024：分布偏平（或温度偏高）时
+     * 会在一个被截断的集合上重新归一化，采样分布是错的
+     * （tests/test_engine.c 里有一条扁平分布的用例专门盯这个）。 */
+    const uint32_t cand_total = n_cands;
+    const bool want_nucleus = (top_k == 0 && top_p > 0.0f && top_p < 1.0f);
+    uint32_t target_k = want_nucleus ? (cand_total < 1024u ? cand_total : 1024u) : top_k;
+    for (;;) {
+        /* quickselect 是就地分区、不要求有序，所以扩大前缀时对整个候选集重来一次即可。 */
+        const uint32_t cut = (target_k > 0 && target_k < cand_total) ? target_k : cand_total;
+        if (cut < cand_total) quickselect_cand_desc(cands, 0, (int)cand_total - 1, (int)cut - 1);
+        qsort(cands, cut, sizeof(myds_cand_t), compare_cand_desc);
 
-    /* Apply top_p truncation */
-    if (top_p > 0.0f && top_p < 1.0f) {
+        /* Apply top_p truncation */
         float cum = 0.0f;
-        uint32_t keep = 0;
-        for (uint32_t i = 0; i < n_cands; i++) {
-            cum += cands[i].prob;
-            keep++;
-            if (cum >= top_p) break;
+        uint32_t keep = cut;
+        if (top_p > 0.0f && top_p < 1.0f) {
+            keep = 0;
+            for (uint32_t i = 0; i < cut; i++) {
+                cum += cands[i].prob;
+                keep++;
+                if (cum >= top_p) break;
+            }
+        }
+        /* 当前前缀的累计质量还不到 top_p ⇒ nucleus 比它更大，放大前缀重来。
+         * （放大到整个候选集仍不够时保留全部 —— 候选池自身的质量就不足 top_p。） */
+        if (want_nucleus && cum < top_p && cut < cand_total) {
+            uint32_t next = cut * 8u;
+            if (next <= cut || next > cand_total) next = cand_total;
+            target_k = next;
+            continue;
         }
         n_cands = keep;
+        break;
     }
 
     /* Re-normalize remaining candidates */

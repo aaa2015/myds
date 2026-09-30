@@ -11,7 +11,17 @@ typedef struct myds_v41_gpu_scratch myds_v41_gpu_scratch_t;
  * 1 MB/缓冲 ⇒ 长 prompt 下每组约 40~60 个 token（vs 逐 token 每次内核 ~9-14 次
  * dispatch），短 prompt 下整 chunk 一组。 */
 #define MYDS_V41_INDEXER_BATCH_FLOATS 262144u
+/* 单个 chunk 的 token 上界。这是【单一真源】：host 侧钳 chunk 尺寸、chunk attention
+ * 的合法性检查都用它。以前 host 钳到 4096、attention 只收 2048 —— 配置合法但运行失败。 */
+#define MYDS_V41_CHUNK_MAX 2048u
 myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp);
+/* chunk attention 的运行时几何量（由【配置的上下文】推出，见 scratch_create）。
+ * 旧版把键上界写死成 16384，导致「配置 262144、实际 16384 就整个 prefill 失败」
+ * （而且注释谎称会回退逐 token，代码里其实是 goto fail）。
+ *   chunk_max_c()   = 单个 chunk 的 token 上界
+ *   chunk_key_max() = 一次 attention 能覆盖的压缩键总数上界（超了必须提前拒绝） */
+uint32_t myds_v41_gpu_chunk_max_c(const myds_v41_gpu_scratch_t *scratch);
+uint32_t myds_v41_gpu_chunk_key_max(const myds_v41_gpu_scratch_t *scratch);
 void myds_v41_gpu_scratch_free(myds_v41_gpu_scratch_t *scratch);
 int myds_v41_gpu_rope(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
     uint32_t pos,bool compressed,bool inverse);

@@ -13,18 +13,22 @@
  * 而这份开销与 chunk 内的 token 数无关 —— 只与 chunk 的【个数】有关。
  * 512 时一个 4404 token 的 prompt 要 9 个 chunk（=9 遍 expert 权重，1.38 TB），
  * 2048 只需 3 个。所以这个值直接决定 MoE 的总量，不该卡在 512。 */
-#define MYDS_CHUNK_MAXC       2048u
-/* ratio 1 layers index every position, so the compressed key range of a chunk is
- * as large as the position itself, not the top-k width.  These bounds cover the
- * prompts this path is used for; anything larger falls back to the per-token path. */
-/* 压缩键的上界。ratio_for 对 l>=20 的层返回 1，此时 n_comp 就是【绝对位置】，
- * 而 4608 的旧值意味着 prompt 一旦超过 ~4608 token，第 20 层以上就会
- * attention_chunk 返回 0 ⇒ 整个 prefill 失败。抬到 16384（≈16k 上下文）。 */
-#define MYDS_CHUNK_MAXCOMP    16384u
-#define MYDS_CHUNK_SLAB_ROWS  (MYDS_CHUNK_CARRY + MYDS_CHUNK_MAXC + MYDS_CHUNK_MAXCOMP)
-/* 掩码行的步长（u16 为单位）= 32 对齐的 keys 上界 = CARRY + MAXC + MAXCOMP 向上取整，
- * 这样 keys_pad 永远落在行内，不需要额外的填充缓冲。 */
-#define MYDS_CHUNK_MASK_U16   18560u  /* multiple of 32 so no key padding is needed */
+#define MYDS_CHUNK_MAXC       MYDS_V41_CHUNK_MAX
+/* 压缩键的上界（键数，含 carry 与本 chunk）。
+ * ratio_for 对 l>=20 的层返回 1，此时一个 chunk 的 n_comp 就是【绝对位置】，
+ * 所以键范围 = CARRY + c_len + n_comp 会随上下文线性增长。
+ * 历史上这个值被写死过两次（4608 → 16384），每次都是一个「宣称的上下文 > 实际能跑的」
+ * 缺口：超了之后第 20 层 attention_chunk 返回 0 ⇒ 整个 prefill 失败，而且注释还谎称
+ * 「会回退逐 token」（代码里根本没有回退）。
+ * 现在：默认【完整覆盖配置的上下文】（不再有「配置 N、实际只能跑 N-2175」的小缺口），
+ * 只封顶在 KEY_MAX_DEFAULT，env MYDS_CHUNK_KEY_MAX 可调（调小省内存，调大覆盖更长的上下文）。
+ * 代价是内存：mask_chunk = MAXC * mask_u16 * 2 字节，kv slab = slab_rows * 1024 字节。
+ *   ctx 262144 ⇒ mask 约 1.03 GB + slab 约 258 MB（配置了这么长上下文就该付这个钱）
+ *   ctx   8192 ⇒ 合计约 42 MB
+ * 超上限的 prompt 在 prefill【开始前】被明确拒绝（不再跑到第 20 层才炸）。 */
+#define MYDS_CHUNK_KEY_MAX_DEFAULT 262144u
+#define MYDS_CHUNK_KEY_MAX_LIMIT  4194304u
+
 
 struct myds_v41_gpu_scratch {
     uint32_t max_comp;
@@ -41,6 +45,11 @@ struct myds_v41_gpu_scratch {
      * vectors so a query's 128 wide window is contiguous. */
     myds_metal_buffer_t *kv_chunk, *mask_chunk;
     uint32_t tmpl_len, tmpl_carry;   /* which window mask template mask_chunk holds */
+    /* chunk attention 的三个运行时几何量，由【配置的上下文】推出（见 scratch_create）。
+     * 以前是编译期常量 ⇒ 「配置的上下文」与「实际能跑的上下文」会静默分叉。 */
+    uint32_t key_comp_max;   /* n_comp 的上界；超了必须在 prefill 开始前就拒绝 */
+    uint32_t mask_u16;       /* 掩码行宽（u16），32 对齐 ⇒ keys_pad 落在行内 */
+    uint32_t slab_rows;      /* kv slab 行数 = CARRY + MAXC + key_comp_max */
 };
 static int floats(const myds_metal_buffer_t *b,uint64_t n) {
     return b && n && n<=myds_metal_buffer_size(b)/4 && myds_metal_buffer_offset(b)%4==0;
@@ -58,11 +67,30 @@ static int specialized(const char *name,const void *args,size_t bytes,
     const uint32_t groups[]={x,y,z},threads[]={tx,ty,tz};
     return myds_metal_dispatch_kernel_constants(name,args,bytes,b,n,groups,threads,smem,constants,nc);
 }
+uint32_t myds_v41_gpu_chunk_max_c(const myds_v41_gpu_scratch_t *s) {
+    return s ? MYDS_CHUNK_MAXC : 0u;
+}
+uint32_t myds_v41_gpu_chunk_key_max(const myds_v41_gpu_scratch_t *s) {
+    return s ? s->key_comp_max : 0u;
+}
 myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp) {
     if(!max_comp || max_comp>1048576) return NULL;
     myds_v41_gpu_scratch_t *s=calloc(1,sizeof(*s));
     if(!s)return NULL;
     s->max_comp=max_comp;
+    /* chunk attention 的几何量：键上界跟随配置的上下文，并封顶（env 可覆盖）。
+     * 封顶的理由是内存：mask_chunk = MAXC * mask_u16 * 2 字节，而 mask_u16 ≈ 键上界。 */
+    {
+        uint32_t key_max=MYDS_CHUNK_KEY_MAX_DEFAULT;
+        const char *km=getenv("MYDS_CHUNK_KEY_MAX");
+        if(km){ long v=atol(km); if(v>0&&(unsigned long)v<=MYDS_CHUNK_KEY_MAX_LIMIT) key_max=(uint32_t)v; }
+        if(key_max>max_comp) key_max=max_comp;   /* 不必超过配置的上下文 */
+        s->key_comp_max=key_max;
+        if(s->key_comp_max<2u||s->key_comp_max>MYDS_CHUNK_KEY_MAX_LIMIT){ free(s); return NULL; }
+        s->slab_rows=MYDS_CHUNK_CARRY+MYDS_CHUNK_MAXC+s->key_comp_max;
+        s->mask_u16=(s->slab_rows+31u)/32u*32u;  /* 32 对齐 ⇒ keys_pad 永远落在行内 */
+        if(s->mask_u16<s->slab_rows){ free(s); return NULL; }   /* 溢出保护 */
+    }
     s->sort_a=myds_metal_buffer_alloc((size_t)max_comp*4);
     s->sort_b=myds_metal_buffer_alloc((size_t)max_comp*4);
     s->kv_f16=myds_metal_buffer_alloc(640u*512u*2u);
@@ -71,8 +99,8 @@ myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp) {
     s->partial=myds_metal_buffer_alloc(64u*(512u+2u)*32u*4u);
     s->sv_view=myds_metal_buffer_create_view();
     s->dv_view=myds_metal_buffer_create_view();
-    s->kv_chunk=myds_metal_buffer_alloc((size_t)MYDS_CHUNK_SLAB_ROWS*512u*2u);
-    s->mask_chunk=myds_metal_buffer_alloc((size_t)MYDS_CHUNK_MAXC*MYDS_CHUNK_MASK_U16*2u);
+    s->kv_chunk=myds_metal_buffer_alloc((size_t)s->slab_rows*512u*2u);
+    s->mask_chunk=myds_metal_buffer_alloc((size_t)MYDS_CHUNK_MAXC*s->mask_u16*2u);
     s->chunk_scores=myds_metal_buffer_alloc((size_t)MYDS_V41_INDEXER_BATCH_FLOATS*4u);
     s->chunk_tmp_a=myds_metal_buffer_alloc((size_t)MYDS_V41_INDEXER_BATCH_FLOATS*4u);
     s->chunk_tmp_b=myds_metal_buffer_alloc((size_t)MYDS_V41_INDEXER_BATCH_FLOATS*4u);
@@ -84,8 +112,8 @@ myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp) {
     memset(myds_metal_buffer_data(s->mask),0,640u*2u);
     /* Zero the slab once: rows that are never written by a chunk must read as 0,
      * not as leftover data, because masked entries still compute a score. */
-    memset(myds_metal_buffer_data(s->kv_chunk),0,(size_t)MYDS_CHUNK_SLAB_ROWS*512u*2u);
-    memset(myds_metal_buffer_data(s->mask_chunk),0xff,(size_t)MYDS_CHUNK_MAXC*MYDS_CHUNK_MASK_U16*2u);
+    memset(myds_metal_buffer_data(s->kv_chunk),0,(size_t)s->slab_rows*512u*2u);
+    memset(myds_metal_buffer_data(s->mask_chunk),0xff,(size_t)MYDS_CHUNK_MAXC*s->mask_u16*2u);
     return s;
 }
 void myds_v41_gpu_scratch_free(myds_v41_gpu_scratch_t *s) {
@@ -392,14 +420,18 @@ static int build_chunk_mask_template(myds_v41_gpu_scratch_t *s,uint32_t c_len,ui
     if(!m)return 0;
     const uint32_t cols=MYDS_CHUNK_CARRY+c_len;
     for(uint32_t r=0;r<c_len;r++){
-        uint16_t *row=m+(size_t)r*MYDS_CHUNK_MASK_U16;
+        uint16_t *row=m+(size_t)r*s->mask_u16;
         for(uint32_t c=0;c<cols;c++){
             int ok=(c>=r)&&(c<=MYDS_CHUNK_CARRY+r);
             if(ok&&c<MYDS_CHUNK_CARRY)ok=(c>=MYDS_CHUNK_CARRY-carry);  /* carry 里只放了真实存在的位置 */
             row[c]=ok?0u:0xfc00u;
         }
-        /* 其余列（压缩区与补齐到 32 倍数的尾部）默认不可见，压缩区的可选项随后 scatter 打开 */
-        for(uint32_t c=cols;c<MYDS_CHUNK_MASK_U16;c++)row[c]=0xfc00u;
+        /* 压缩区（含 32 对齐的尾部）【不在这里】清理：它每个 chunk 都由
+         * kernel_myds_mask_chunk_fill 先置为不可见、再由 scatter 打开本 chunk 的 picks。
+         * 以前这里有一句「把 cols 之后全部清成不可见」—— mask_u16 还是编译期常量
+         * （18560）时只是两万次/行；改成跟随上下文的运行时值（最大 264320）后变成
+         * 24 万次/行 × 2048 行 ≈ 5 亿次，ttft 直接 +0.7s（实测 13.83 → 14.52）。
+         * keys_pad 之后的列没有任何读者，所以现在只写 [0, cols) 就够。 */
     }
     s->tmpl_len=c_len;s->tmpl_carry=carry;
     return 1;
@@ -412,7 +444,7 @@ int myds_v41_gpu_attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buf
     uint32_t c_len,uint32_t n_comp,uint32_t top_k,
     uint32_t base_pos,uint32_t c_start,uint32_t ratio,myds_v41_gpu_scratch_t *s) {
     if(!s||!heads||!q||!chunk_kv||c_len==0||c_len>MYDS_CHUNK_MAXC||top_k>512u||
-       n_comp>MYDS_CHUNK_MAXCOMP||
+       n_comp>s->key_comp_max||
        !floats(heads,(uint64_t)c_len*64u*512)||!floats(q,(uint64_t)c_len*64u*512)||
        !floats(sinks,64)||!floats(chunk_kv,(uint64_t)c_len*512)||
        (n_comp&&(!comp_kv||!floats(comp_kv,(uint64_t)n_comp*512)||
@@ -440,23 +472,26 @@ int myds_v41_gpu_attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buf
     if(!stage_f16(s->kv_chunk,(size_t)MYDS_CHUNK_CARRY*1024u,chunk_kv,0,c_len*512u,s))return 0;
     if(n_comp&&!stage_f16(s->kv_chunk,(size_t)comp_base*1024u,comp_kv,0,n_comp*512u,s))return 0;
 
+    /* 填充覆盖 [comp_base, keys_pad)：n_comp 只是【本 chunk 真实的压缩键数】，而内核读的
+     * 是 32 对齐后的 keys_pad，多出来那几列必须显式置为不可见
+     * （以前靠模板的清尾巴兜底，现在模板不再清 —— 见 build_chunk_mask_template）。 */
+    {
+        const uint32_t pad_cols=keys_pad-comp_base;
+        const uint32_t fill_groups=(pad_cols+63u)/64u;
+        if(fill_groups) {
+            struct {uint32_t base,stride,n_comp,top_k,rows,c_start,base_pos,ratio;} mf={
+                comp_base,s->mask_u16,pad_cols,top_k,c_len,c_start,base_pos,ratio};
+            const myds_metal_buffer_t *fb[]={s->mask_chunk};
+            /* 位置单调递增 ⇒ 上一个 chunk 打开的 picks 一定落在 [comp_base, comp_base+pad_cols) 内，
+             * 所以这个区间清成不可见就够。线程组按 64 线程/组折算（拿「编译期的列跨度」当组数
+             * 会让 64 倍线程空转，且随行宽一起变大 —— 抬上限时实测慢了 2.1s）。 */
+            if(!dispatch("kernel_myds_mask_chunk_fill",&mf,sizeof(mf),fb,1,
+                         fill_groups,c_len,1,64,1,1,0))return 0;
+        }
+    }
     if(n_comp) {
         struct {uint32_t base,stride,n_comp,top_k,rows,c_start,base_pos,ratio;} ma={
-            comp_base,MYDS_CHUNK_MASK_U16,n_comp,top_k,c_len,c_start,base_pos,ratio};
-        /* Reset the whole compressed region to invisible, then open this token's picks.
-         * Resetting the full region (not just n_comp columns) also clears the picks the
-         * previous chunk left open. */
-        const myds_metal_buffer_t *fb[]={s->mask_chunk};
-        /* 只清【真正在用】的压缩列 [comp_base, comp_base+n_comp)。
-         * 位置单调递增 ⇒ 上一个 chunk 打开的 picks 一定落在这个区间内，所以够用；
-         * 而模板在 (c_len,carry) 变化时会把 comp_base 之后的列全部置为不可见。
-         * 线程组数按 [64 线程/组] 折算 —— 原来是直接拿「编译期的列跨度」当组数，
-         * 于是 64 倍的线程空转，且随 MASK_U16 一起变大（抬上限时实测慢了 2.1s）。 */
-        {
-            const uint32_t fill_groups=(n_comp+63u)/64u;
-            if(fill_groups&&!dispatch("kernel_myds_mask_chunk_fill",&ma,sizeof(ma),fb,1,
-                                     fill_groups,c_len,1,64,1,1,0))return 0;
-        }
+            comp_base,s->mask_u16,n_comp,top_k,c_len,c_start,base_pos,ratio};
         const myds_metal_buffer_t *sb[]={s->mask_chunk,ids};
         if(!dispatch("kernel_myds_mask_chunk_scatter",&ma,sizeof(ma),sb,2,top_k,c_len,1,64,1,1,0))return 0;
     }
@@ -467,9 +502,9 @@ int myds_v41_gpu_attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buf
         .nb11=1024u,.nb12=(uint64_t)keys_pad*1024u,.nb13=(uint64_t)keys_pad*1024u,
         .ns20=512,.nb21=1024u,.nb22=(uint64_t)keys_pad*1024u,.nb23=(uint64_t)keys_pad*1024u,
         .ne31=(int32_t)c_len,.ne32=1,.ne33=1,
-        .nb31=(uint64_t)MYDS_CHUNK_MASK_U16*2u,
-        .nb32=(uint64_t)MYDS_CHUNK_MASK_U16*2u*(uint64_t)c_len,
-        .nb33=(uint64_t)MYDS_CHUNK_MASK_U16*2u*(uint64_t)c_len,
+        .nb31=(uint64_t)s->mask_u16*2u,
+        .nb32=(uint64_t)s->mask_u16*2u*(uint64_t)c_len,
+        .nb33=(uint64_t)s->mask_u16*2u*(uint64_t)c_len,
         .ne1=64,.ne2=(int32_t)c_len,.ne3=1,.scale=1.0f/sqrtf(512)};
     const myds_metal_buffer_t *b[]={q,s->kv_chunk,s->kv_chunk,s->mask_chunk,sinks,s->pad,heads};
     const myds_metal_constant_t c[]={{400,true,1},{401,true,1},{402,true,0},{403,true,0},{404,true,0},
