@@ -357,7 +357,8 @@ int myds_metal_init(const char *shader_dir) {
             @"glu.metal",
             @"norm.metal",
             @"bin.metal",
-            @"set_rows.metal"
+            @"set_rows.metal",
+            @"myds_chunk.metal"
         ];
 
         NSMutableString *full_source = [NSMutableString stringWithUTF8String:g_metal_base_preamble];

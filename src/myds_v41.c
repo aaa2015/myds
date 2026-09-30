@@ -1049,11 +1049,14 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             }
 
             uint64_t disp_loop0 = myds_metal_dispatch_count();  /* 诊断 */
+            /* The indexer and the KV compressor are stateful across positions, so that
+             * part stays per token.  Everything after it - staging the keys, selecting
+             * them and running the attention - is per token only because it used to be
+             * written that way, and is what made prefill dispatch bound. */
             for (uint32_t t = 0; t < c_len; t++) {
                 uint32_t idx = c_start + t;
                 uint32_t pos = base_pos + idx;
-                uint32_t count = compressed ? (pos + 1u) / ratio_for(il) : 0;
-                uint32_t top = count < V41_TOPK ? count : V41_TOPK;
+                uint32_t count = compressed ? (pos + 1u) / ratio : 0;
 
                 phase = "compressed KV / indexer";
                 if (!myds_metal_buffer_update_sub_view(cw->cur_selected_view, prompt_selected, (size_t)idx * sel_bytes, sel_bytes) ||
@@ -1069,20 +1072,42 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                                          (count && index_source(il)) ? cw->cur_selected_view : NULL,
                                          (il > 20 && index_source(il)) ? cw->cur_mask_view : NULL,
                                          (il == 20) ? cw->cur_mask_view : NULL));
+            }
 
-                if (count) {
-                    CHECK(myds_v41_gpu_gather(g->selected_kv, g->compressed[owner_for(il)], cw->cur_selected_view, count, top));
+            /* Sliding window ring: the chunk's slots are consecutive modulo the ring, so
+             * two copies cover the chunk instead of one per token.  Nothing reads the ring
+             * during prefill any more (the batched attention reads the slab), but the
+             * decode path does, so it still has to be filled. */
+            {
+                /* The ring only holds V41_WINDOW slots, so only the chunk's last
+                 * V41_WINDOW tokens survive there; the per-token path wrote all of them
+                 * and let the later ones overwrite the earlier, which ends in exactly
+                 * this state. */
+                phase = "window ring";
+                uint32_t t0 = c_len > V41_WINDOW ? c_len - V41_WINDOW : 0;
+                uint32_t nw = c_len - t0;
+                uint32_t slot0 = (base_pos + c_start + t0) % V41_WINDOW;
+                uint32_t run1 = V41_WINDOW - slot0; if (run1 > nw) run1 = nw;
+                if (run1 && !myds_metal_buffer_copy(g->window[il], (size_t)slot0 * 512 * 4u, cw->kv_act_buf, (size_t)t0 * 512 * 4u, (size_t)run1 * 512 * 4u)) goto fail;
+                uint32_t run2 = nw - run1;
+                if (run2 && !myds_metal_buffer_copy(g->window[il], 0, cw->kv_act_buf, (size_t)(t0 + run1) * 512 * 4u, (size_t)run2 * 512 * 4u)) goto fail;
+            }
+
+            /* One attention for the whole chunk.  The key range covers the carry, this
+             * chunk and the compressed table prefix, and each token masks what it may not
+             * see; that is the shape the shared kernel is built for, and it turns 512
+             * tokens x 7 dispatches into 5. */
+            {
+                uint32_t n_comp = compressed ? (base_pos + c_start + c_len) / ratio : 0;
+                phase = "chunk attention";
+                if (!myds_v41_gpu_attention_chunk(cw->attn_heads_buf, base->attn_sinks, cw->q_buf,
+                        cw->kv_act_buf,
+                        n_comp ? g->compressed[owner_for(il)] : NULL,
+                        n_comp ? prompt_selected : NULL,
+                        c_len, n_comp, V41_TOPK, base_pos, c_start, ratio, g->gpu)) {
+                    MYDS_LOG_E("chunked attention failed (c_len=%u n_comp=%u)", c_len, n_comp);
+                    goto fail;
                 }
-                uint32_t nraw = pos + 1u < 128 ? pos + 1u : 128;
-
-                /* Publish this token's KV into the ring immediately before reading it,
-                 * so the nraw keys attention sees are exactly the tokens in
-                 * [pos+1-nraw, pos].  myds_metal_buffer_copy brackets itself with buffer
-                 * memory barriers, so no extra barrier is needed between the two. */
-                CHECK(myds_metal_buffer_copy(g->window[il], (size_t)(pos % 128) * 512 * 4u, cw->kv_act[t], 0, 512 * 4u));
-
-                phase = "attention reduction";
-                CHECK(myds_v41_gpu_attention(cw->attn_heads[t], base->attn_sinks, cw->q[t], g->window[il], nraw, (pos + 1u - nraw) % 128, g->selected_kv, top, g->gpu));
             }
 
             /* bf16 + inverse RoPE are elementwise over (token, head) and each token's slice of

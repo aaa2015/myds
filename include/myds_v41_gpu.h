@@ -38,4 +38,10 @@ int myds_v41_gpu_attention(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *window,uint32_t n_raw,
     uint32_t raw_start,const myds_metal_buffer_t *selected_kv,uint32_t selected_rows,
     myds_v41_gpu_scratch_t *scratch);
+/* 整个 chunk 一次算完的 attention（chunked prefill 用）。 */
+int myds_v41_gpu_attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *chunk_kv,
+    const myds_metal_buffer_t *comp_kv,const myds_metal_buffer_t *ids,
+    uint32_t c_len,uint32_t n_comp,uint32_t top_k,
+    uint32_t base_pos,uint32_t c_start,uint32_t ratio,myds_v41_gpu_scratch_t *s);
 #endif
