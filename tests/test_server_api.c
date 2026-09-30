@@ -270,9 +270,6 @@ static void test_deepseek41_chat_templates(void) {
         "{\"messages\":[{\"content\":\"hi\"}]}", "{\"messages\":[{\"role\":\"unknown\",\"content\":\"hi\"}]}",
         "{\"input\":[{\"content\":[{\"type\":\"input_image\",\"image_url\":\"image\"}]}]}",
         "{\"input\":[{\"content\":[{\"type\":\"input_text\"}]}]}",
-        "{\"input\":\"hi\",\"tools\":[{\"type\":\"function\",\"name\":\"lookup\"}]}",
-        "{\"messages\":[{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_1\"}]}]}",
-        "{\"messages\":[{\"role\":\"assistant\",\"content\":\"hi\",\"function_call\":{\"name\":\"lookup\"}}]}",
     };
     for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
         char output[4096] = "previous";
@@ -307,6 +304,179 @@ static void test_deepseek41_chat_templates(void) {
     printf("  [PASS] V4.1 exact chat templates, Unicode input, structured text parts, large input and explicit parse/capacity errors\n");
 }
 
+
+/* 工具调用格式（官方 DeepSeek-V4.1 DSML）—— 行为在 2026-10-01 由「拒绝」改为「支持」，
+ * 原先放在 invalid[] 里的三个用例已移到此处验证渲染结果。 */
+static void test_deepseek41_tool_calls(void) {
+    char output[16384];
+
+    /* ① tools（chat 嵌套形状）：应渲染官方 TOOLS_TEMPLATE + 原样 schema */
+    const char *with_tools =
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"Weather in Beijing?\"}],"
+        "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\","
+        "\"description\":\"Get weather\",\"parameters\":{\"type\":\"object\","
+        "\"properties\":{\"city\":{\"type\":\"string\"},\"days\":{\"type\":\"integer\"}},"
+        "\"required\":[\"city\"]}}}]}";
+    assert(parse_chat_prompt(with_tools, output, sizeof(output)));
+    assert(strstr(output, "<｜System｜>") != NULL);
+    assert(strstr(output, "## Tools") != NULL);
+    assert(strstr(output, "<｜DSML｜ calls>") != NULL);
+    assert(strstr(output, "<｜DSML｜ invoke") != NULL);
+    assert(strstr(output, "### Available Tool Schemas") != NULL);
+    /* schema 逐字节原样（含参数细节），而不是被重新序列化后失真 */
+    assert(strstr(output, "{\"name\":\"get_weather\",\"description\":\"Get weather\","
+                          "\"parameters\":{\"type\":\"object\",\"properties\":"
+                          "{\"city\":{\"type\":\"string\"},\"days\":{\"type\":\"integer\"}},"
+                          "\"required\":[\"city\"]}}") != NULL);
+    assert(strstr(output, "<｜User｜>Weather in Beijing?") != NULL);
+    assert(strstr(output, "You MUST strictly follow the above defined tool name") != NULL);
+
+    /* ② tools（Responses 扁平形状）也应被接受 */
+    const char *flat_tools =
+        "{\"input\":\"hi\",\"tools\":[{\"type\":\"function\",\"name\":\"lookup\","
+        "\"description\":\"Look up\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}]}";
+    assert(parse_chat_prompt(flat_tools, output, sizeof(output)));
+    assert(strstr(output, "{\"name\":\"lookup\",\"description\":\"Look up\","
+                          "\"parameters\":{\"type\":\"object\",\"properties\":{}}}") != NULL);
+
+    /* ③ 历史里的 assistant tool_calls ⇒ DSML invoke/parameter 块（在 EOS 之前） */
+    const char *history =
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"Weather?\"},"
+        "{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\","
+        "\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Beijing\\\",\\\"days\\\":3}\"}}]},"
+        "{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"sunny\"},"
+        "{\"role\":\"user\",\"content\":\"thanks\"}]}";
+    assert(parse_chat_prompt(history, output, sizeof(output)));
+    assert(strstr(output, "<｜DSML｜ calls>") != NULL);
+    assert(strstr(output, "<｜DSML｜ invoke name=\"get_weather\">") != NULL);
+    /* 字符串参数：string="true"；非字符串参数：JSON 形式 + string="false" */
+    assert(strstr(output, "<｜DSML｜ parameter name=\"city\" string=\"true\">Beijing</｜DSML｜ parameter>") != NULL);
+    assert(strstr(output, "<｜DSML｜ parameter name=\"days\" string=\"false\">3</｜DSML｜ parameter>") != NULL);
+    assert(strstr(output, "</｜DSML｜ invoke>") != NULL);
+    assert(strstr(output, "</｜DSML｜ calls>") != NULL);
+    /* 工具结果走官方 <tool_result> 格式 */
+    assert(strstr(output, "<tool_result>sunny</tool_result>") != NULL);
+    /* 工具调用必须出现在 assistant 的 EOS 之前 */
+    const char *calls_at = strstr(output, "</｜DSML｜ calls>");
+    const char *eos_at = strstr(calls_at, "<｜end▁of▁sentence｜>");
+    assert(calls_at && eos_at && eos_at > calls_at);
+
+    /* ④ 旧式 function_call（Responses）也应接受 */
+    const char *legacy =
+        "{\"messages\":[{\"role\":\"assistant\",\"content\":\"hi\","
+        "\"function_call\":{\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":\\\"x\\\"}\"}}]}";
+    assert(parse_chat_prompt(legacy, output, sizeof(output)));
+    assert(strstr(output, "<｜DSML｜ invoke name=\"lookup\">") != NULL);
+    assert(strstr(output, "<｜DSML｜ parameter name=\"q\" string=\"true\">x</｜DSML｜ parameter>") != NULL);
+
+    /* ⑤ 非 assistant 角色挂 tool_calls ⇒ 拒绝（格式只对 assistant 有意义） */
+    char small[4096];
+    assert(!parse_chat_prompt("{\"messages\":[{\"role\":\"user\",\"content\":\"hi\","
+                              "\"tool_calls\":[{\"type\":\"function\",\"function\":{\"name\":\"x\"}}]}]}",
+                              small, sizeof(small)));
+    /* ⑥ 工具名用不安全字符（会被写进 DSML 属性）⇒ 拒绝 */
+    assert(!parse_chat_prompt("{\"tools\":[{\"type\":\"function\",\"function\":"
+                              "{\"name\":\"bad\\\"name\",\"parameters\":{}}}]}", small, sizeof(small)));
+
+    printf("  [PASS] V4.1 DSML tool definitions, assistant tool_calls, tool results and rejections\n");
+}
+
+
+/* DSML 解析：把模型输出切成「正文 + 结构化工具调用」 */
+static void test_deepseek41_dsml_parse(void) {
+    const char *DS = "\xef\xbd\x9c" "DSML" "\xef\xbd\x9c";
+    char text[4096];
+
+    /* ① 纯文本（无工具块）⇒ 原样、count=0 */
+    size_t clen = 0, n = 0; myds_tool_call_t *tc = NULL;
+    assert(myds_parse_completion_tool_calls("hello <think>x</think> world", 27, &clen, &tc, &n));
+    assert(n == 0 && tc == NULL && clen == 27);
+
+    /* ② 一个调用，两种参数类型 */
+    snprintf(text, sizeof(text),
+        "Let me check.\n\n<%s calls>\n<%s invoke name=\"get_weather\">\n"
+        "<%s parameter name=\"city\" string=\"true\">Beijing</%s parameter>\n"
+        "<%s parameter name=\"days\" string=\"false\">3</%s parameter>\n"
+        "</%s invoke>\n</%s calls>",
+        DS,DS,DS,DS,DS,DS,DS,DS);
+    assert(myds_parse_completion_tool_calls(text, strlen(text), &clen, &tc, &n));
+    assert(n == 1 && tc != NULL);
+    assert(strcmp(tc[0].id, "call_1") == 0);
+    assert(strcmp(tc[0].name, "get_weather") == 0);
+    assert(strcmp(tc[0].arguments, "{\"city\": \"Beijing\", \"days\": 3}") == 0);
+    assert(clen == strlen("Let me check."));      /* 正文不该含工具块，尾部换行也要去掉 */
+    myds_free_tool_calls(tc, n); tc = NULL;
+
+    /* ③ 两个调用 */
+    snprintf(text, sizeof(text),
+        "ok\n\n<%s calls>\n<%s invoke name=\"a\">\n<%s parameter name=\"x\" string=\"false\">1</%s parameter>\n"
+        "</%s invoke>\n<%s invoke name=\"b\">\n</%s invoke>\n</%s calls>", DS,DS,DS,DS,DS,DS,DS,DS);
+    assert(myds_parse_completion_tool_calls(text, strlen(text), &clen, &tc, &n));
+    assert(n == 2);
+    assert(strcmp(tc[0].name, "a") == 0 && strcmp(tc[0].arguments, "{\"x\": 1}") == 0);
+    assert(strcmp(tc[1].name, "b") == 0 && strcmp(tc[1].arguments, "{}") == 0);
+    myds_free_tool_calls(tc, n); tc = NULL;
+
+    /* ④ 字符串参数里的引号/换行必须被正确转义 */
+    snprintf(text, sizeof(text),
+        "x\n\n<%s calls>\n<%s invoke name=\"t\">\n<%s parameter name=\"s\" string=\"true\">a\"b</%s parameter>\n"
+        "</%s invoke>\n</%s calls>", DS,DS,DS,DS,DS,DS);
+    assert(myds_parse_completion_tool_calls(text, strlen(text), &clen, &tc, &n));
+    assert(n == 1 && strcmp(tc[0].arguments, "{\"s\": \"a\\\"b\"}") == 0);
+    myds_free_tool_calls(tc, n); tc = NULL;
+
+    /* ⑤ 格式不合（invoke 未闭合）⇒ 返回 false，调用方按纯文本处理 */
+    snprintf(text, sizeof(text), "x\n\n<%s calls>\n<%s invoke name=\"a\">\n\"", DS, DS);
+    assert(!myds_parse_completion_tool_calls(text, strlen(text), &clen, &tc, &n));
+
+    /* ⑥ 数组参数：非字符串参数原样透传 JSON */
+    snprintf(text, sizeof(text),
+        "x\n\n<%s calls>\n<%s invoke name=\"f\">\n"
+        "<%s parameter name=\"xs\" string=\"false\">[1, 2, 3]</%s parameter>\n"
+        "<%s parameter name=\"o\" string=\"false\">{\"k\": true}</%s parameter>\n"
+        "</%s invoke>\n</%s calls>", DS,DS,DS,DS,DS,DS,DS,DS);
+    assert(myds_parse_completion_tool_calls(text, strlen(text), &clen, &tc, &n));
+    assert(n == 1 && strcmp(tc[0].arguments, "{\"xs\": [1, 2, 3], \"o\": {\"k\": true}}") == 0);
+    myds_free_tool_calls(tc, n);
+
+    printf("  [PASS] V4.1 DSML completion parsing: content split, parameter kinds, escaping, two calls, malformed fallback\n");
+}
+
+
+/* 流式工具调用：DSML 块必须【不】作为正文发出，且必须吐出 tool_calls */
+static void test_deepseek41_stream_tool_calls(void) {
+    const char *DS = "\xef\xbd\x9c" "DSML" "\xef\xbd\x9c";
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    socket_capture_t capture = {.fd = sockets[1]};
+    pthread_t reader;
+    assert(pthread_create(&reader, NULL, capture_socket, &capture) == 0);
+    myds_sse_stream_ctx_t stream = {.client_fd = sockets[0]};
+    /* 逐片投喂：空白 + 分片到跨片边界的标签，模拟真实 token 流 */
+    const char *parts[] = {"\n", "\n", "<", DS, " calls>\n<", DS,
+                           " invoke name=\"get_weather\">\n<", DS,
+                           " parameter name=\"city\" string=\"true\">Beijing</", DS,
+                           " parameter>\n</", DS, " invoke>\n</", DS, " calls>"};
+    for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); ++i) {
+        myds_server_sse_callback(parts[i], strlen(parts[i]), (int32_t)i, &stream);
+    }
+    assert(myds_server_sse_finish(&stream));
+    assert(!stream.cancel_flag && !stream.failed);
+    assert(shutdown(sockets[0], SHUT_WR) == 0);
+    assert(pthread_join(reader, NULL) == 0);
+    size_t clen = 0;
+    char *collected = collect_sse_escaped_text(capture.bytes, 0, &clen);
+    /* 只验【回调路径】：DSML 块绝不能作为正文流出。
+     * 结构化工具调用的发射在 handle_client 的收尾里，单元测试覆盖不到 ——
+     * 那部分由集成测试（真实模型）负责。 */
+    assert(clen == 0);
+    free(collected);
+    free(capture.bytes);
+    close(sockets[0]);
+    close(sockets[1]);
+    printf("  [PASS] V4.1 streaming DSML: the call block is withheld from content, including the newlines before it\n");
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && !strcmp(argv[1], "--render")) {
         size_t capacity = strlen(argv[2]) * 4 + 1024;
@@ -317,6 +487,9 @@ int main(int argc, char **argv) {
         free(output); return ok ? 0 : 1;
     }
     test_deepseek41_chat_templates();
+    test_deepseek41_tool_calls();
+    test_deepseek41_dsml_parse();
+    test_deepseek41_stream_tool_calls();
     printf("====================================================\n");
     printf("       Running myds Server API Unit Tests           \n");
     printf("====================================================\n");
