@@ -1852,10 +1852,26 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         double decode_tps = (decode_s > 0.0 && final_tokens > 1) ? ((double)(final_tokens - 1) / decode_s) : ((wall_s > 0.0) ? ((double)final_tokens / wall_s) : 0.0);
         const char *final_finish_str = (stop_reason == MYDS_STOP_LENGTH || stop_reason == MYDS_STOP_CTX_FULL) ? "length" : (stop_reason == MYDS_STOP_CANCELLED ? "cancelled" : (stop_reason == MYDS_STOP_ERROR ? "error" : "stop"));
 
-        MYDS_LOG_I("[%s:%d] Completed %s %s - prompt: %u tok, ttft: %.3fs, decode: %u tok in %.3fs = %.2f t/s, wall: %.3fs, finish_reason: %s",
+        /* prefill 速率直接取自引擎的 prefill 阶段计时，不用 ttft 反推：
+         * ttft 混了排队/分词/首个解码步，反推会低估速率（实测差数倍），
+         * 而「复用命中的轮次」更会把固定开销摊到极少量 token 上 ⇒ 看起来极慢。 */
+        myds_prefill_stats_t pf;
+        myds_last_prefill_stats(ctx, &pf);
+        char prefill_str[96];
+        if (pf.prefill_tokens == 0) {
+            snprintf(prefill_str, sizeof(prefill_str), "none (all %u cached)", pf.cached_tokens);
+        } else {
+            double pf_tps = (pf.prefill_seconds > 0.0)
+                                ? (double)pf.prefill_tokens / pf.prefill_seconds : 0.0;
+            snprintf(prefill_str, sizeof(prefill_str), "%u tok in %.3fs = %.1f t/s (cached %u)",
+                     pf.prefill_tokens, pf.prefill_seconds, pf_tps, pf.cached_tokens);
+        }
+        MYDS_LOG_I("[%s:%d] Completed %s %s - prompt: %u tok, prefill: %s, ttft: %.3fs, "
+                   "decode: %u tok in %.3fs = %.2f t/s, wall: %.3fs, finish_reason: %s",
                    client_ip, client_port,
                    is_responses_endpoint ? "Responses" : "ChatCompletions",
-                   path, prompt_tokens, ttft_s, final_tokens, decode_s, decode_tps, wall_s, final_finish_str);
+                   path, prompt_tokens, prefill_str, ttft_s,
+                   final_tokens, decode_s, decode_tps, wall_s, final_finish_str);
 
         myds_context_set_config(ctx, &prev_cfg);
         pthread_mutex_unlock(&g_infer_mutex);

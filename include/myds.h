@@ -62,6 +62,19 @@ void            myds_context_free(myds_context_t *ctx);
 myds_config_t   myds_context_get_config(const myds_context_t *ctx);
 void            myds_context_set_config(myds_context_t *ctx, const myds_config_t *cfg);
 
+/* 最近一次请求的 prefill 统计（供服务端日志/工具使用）。
+ * 「prefill 速度」这个词有歧义：这里 prefill_tokens 是【真正被 prefilled 的 token 数】，
+ * 前缀缓存复用的部分计入 cached_tokens 而不算进 prefill —— 否则「复用越多越慢」会被误读。 */
+typedef struct {
+    uint32_t prompt_tokens;    /* 本次请求的提示词总长 */
+    uint32_t cached_tokens;    /* 前缀缓存复用掉的 token 数（0 = 全量 prefill） */
+    uint32_t prefill_tokens;   /* 实际跑了 prefill 的 token 数 */
+    double   prefill_seconds;  /* prefill 阶段墙钟耗时 */
+} myds_prefill_stats_t;
+
+/* 读取最近一次生成（myds_generate*）的 prefill 统计；ctx 为 NULL 时清零返回。 */
+void            myds_last_prefill_stats(const myds_context_t *ctx, myds_prefill_stats_t *out);
+
 /* Generation termination reasons */
 typedef enum {
     MYDS_STOP_EOS = 0,

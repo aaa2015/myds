@@ -118,6 +118,12 @@ struct myds_context {
     uint32_t             pcache_len;
     uint32_t             pcache_cap;
 
+    /* 最近一次请求的 prefill 统计（只写不读，供 myds_last_prefill_stats 暴露给服务端日志） */
+    uint32_t             last_prompt_tokens;
+    uint32_t             last_cached_tokens;
+    uint32_t             last_prefill_tokens;
+    double               last_prefill_seconds;
+
     /* Metal activation buffers */
     myds_metal_buffer_t *x;
     myds_metal_buffer_t *x_norm;

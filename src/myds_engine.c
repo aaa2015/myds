@@ -2864,9 +2864,21 @@ static int myds_generate_internal(myds_context_t *ctx,
     int32_t cur_token = prompt_tokens[0];
 
     /* 2. Prefill phase (bypassing LM head & sampling for tokens 0..n_prompt-2) */
-    if ((uint32_t)n_prompt - 1 > resume_from || resume_from == 0) {
+    /* 统计口径：prefill_tokens 只算【真正跑过的】token，复用掉的不算 —— 否则「缓存命中的轮次」
+     * 会因为只 prefill 少量 token 而显示成极慢，那是把固定开销算进了速率里。 */
+    ctx->last_prompt_tokens = (uint32_t)n_prompt;
+    ctx->last_cached_tokens = resume_from;
+    ctx->last_prefill_tokens = ((uint32_t)n_prompt - 1 > resume_from)
+                                   ? (uint32_t)(n_prompt - 1) - resume_from : 0;
+    ctx->last_prefill_seconds = 0.0;
+    {
+        struct timespec _pf0, _pf1;
+        clock_gettime(CLOCK_MONOTONIC, &_pf0);
         int res = myds_prefill_tokens(ctx, prompt_tokens + resume_from,
                                       n_prompt - 1 - (int32_t)resume_from, cancel_flag);
+        clock_gettime(CLOCK_MONOTONIC, &_pf1);
+        ctx->last_prefill_seconds = (double)(_pf1.tv_sec - _pf0.tv_sec) +
+                                    (double)(_pf1.tv_nsec - _pf0.tv_nsec) / 1e9;
         /* 中途失败/取消时，状态可能只推进了一部分 ⇒ 整条缓存作废（下次全量重跑）。
          * 绝不能留下「pcache_len 说已缓存 n_prompt、而 GPU 状态只到一半」的组合：
          * 那会让下一个请求从错误的位置续跑（直接撞 base_pos != next_position 的检查）。 */
@@ -2943,6 +2955,17 @@ static int myds_generate_internal(myds_context_t *ctx,
 
     if (out_reason) *out_reason = stop_reason;
     return success;
+}
+
+/* 最近一次请求的 prefill 统计。故意做成「读 ctx 上的字段」而不是改 generate 的签名：
+ * 生成 API 的签名被库、单测、服务端多处依赖，加出参是多余的破坏。 */
+void myds_last_prefill_stats(const myds_context_t *ctx, myds_prefill_stats_t *out) {
+    if (!out) return;
+    if (!ctx) { memset(out, 0, sizeof(*out)); return; }
+    out->prompt_tokens    = ctx->last_prompt_tokens;
+    out->cached_tokens    = ctx->last_cached_tokens;
+    out->prefill_tokens   = ctx->last_prefill_tokens;
+    out->prefill_seconds  = ctx->last_prefill_seconds;
 }
 
 int myds_generate_bytes_ex(myds_context_t *ctx, const char *prompt,
