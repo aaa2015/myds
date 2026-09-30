@@ -971,6 +971,45 @@ static int v41_finish(id<MTLCommandBuffer> cb, id<MTLComputeCommandEncoder> enc)
 /* 诊断用（参谋长 2026-09-30）：统计 GPU dispatch 次数。
  * 用途：判定 prefill 的 GPU 时间是被"启动开销 x 海量小 kernel"主导，还是被算力/带宽主导。 */
 static uint64_t g_dispatch_count = 0;
+/* 诊断：按内核名统计 dispatch 次数，用于定位"每 token 一串小 kernel"里的大头。 */
+#define MYDS_HIST_SLOTS 128
+static struct { const char *name; uint64_t n; } g_hist[MYDS_HIST_SLOTS];
+static int g_hist_used = 0;
+/* 默认关闭：开启时每次 dispatch 都要做线性查找 + strcmp，会明显拖慢 CPU 侧
+ * （实测在计时对比里造成 ~0.8s 的系统误差）。只在 MYDS_DISPATCH_HIST=1 时启用。 */
+static int g_hist_enabled = -1;
+static int hist_on(void) {
+    if (g_hist_enabled < 0) g_hist_enabled = getenv("MYDS_DISPATCH_HIST") ? 1 : 0;
+    return g_hist_enabled;
+}
+static void hist_add(const char *name) {
+    if (!hist_on()) return;
+    for (int i = 0; i < g_hist_used; i++) {
+        if (g_hist[i].name == name || (g_hist[i].name && name && !strcmp(g_hist[i].name, name))) {
+            g_hist[i].n++; return;
+        }
+    }
+    if (g_hist_used < MYDS_HIST_SLOTS) { g_hist[g_hist_used].name = name; g_hist[g_hist_used].n = 1; g_hist_used++; }
+}
+int myds_metal_dispatch_hist_dump(FILE *out) {
+    if (!out) return 0;
+    /* 简单选择排序前 24 名 */
+    int idx[MYDS_HIST_SLOTS];
+    for (int i = 0; i < g_hist_used; i++) idx[i] = i;
+    for (int i = 0; i < g_hist_used; i++)
+        for (int j = i+1; j < g_hist_used; j++)
+            if (g_hist[idx[j]].n > g_hist[idx[i]].n) { int t = idx[i]; idx[i] = idx[j]; idx[j] = t; }
+    uint64_t tot = 0;
+    for (int i = 0; i < g_hist_used; i++) tot += g_hist[i].n;
+    fprintf(out, "--- DISPATCH BY KERNEL (%d kinds, %llu total) ---\n", g_hist_used, (unsigned long long)tot);
+    for (int i = 0; i < g_hist_used && i < 24; i++)
+        fprintf(out, "%-46s %10llu  %5.2f%%\n", g_hist[idx[i]].name,
+                (unsigned long long)g_hist[idx[i]].n,
+                tot ? 100.0*(double)g_hist[idx[i]].n/(double)tot : 0.0);
+    fflush(out);
+    return 1;
+}
+
 uint64_t myds_metal_dispatch_count(void) { return g_dispatch_count; }
 void myds_metal_dispatch_count_reset(void) { g_dispatch_count = 0; }
 
@@ -1073,6 +1112,7 @@ int myds_metal_dispatch_kernel_constants(const char *name, const void *args, siz
         [enc dispatchThreadgroups:MTLSizeMake(groups[0], groups[1], groups[2])
             threadsPerThreadgroup:MTLSizeMake(threads[0], threads[1], threads[2])];
         g_dispatch_count++;
+        hist_add(name);
         return v41_finish(cb, enc);
     }
 }

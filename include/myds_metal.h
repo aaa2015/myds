@@ -32,7 +32,9 @@ int                  myds_metal_buffer_write(myds_metal_buffer_t *buf, size_t of
 int                  myds_metal_buffer_read(const myds_metal_buffer_t *buf, size_t offset, void *dst, size_t bytes);
 /* GPU-ordered copy; overlapping source/destination ranges are rejected. */
 /* 诊断用：GPU dispatch 计数（参谋长 2026-09-30） */
+#include <stdio.h>
 uint64_t myds_metal_dispatch_count(void);
+int myds_metal_dispatch_hist_dump(FILE *out);
 void myds_metal_dispatch_count_reset(void);
 
 int myds_metal_buffer_copy(myds_metal_buffer_t *dst, size_t dst_offset,
