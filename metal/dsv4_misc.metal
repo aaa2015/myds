@@ -273,6 +273,21 @@ struct ds4_metal_args_glm_indexer_score_one {
     float    scale;
 };
 
+/* 批量（整 prefill chunk）版 indexer 分数。逐字照抄 ds4_metal_args_glm_indexer_score_one，
+ * 另加 token 数与逐行因果宽度参数 —— 不改数值路径，只把同一批 (row, head) 归约
+ * 一次算完。 */
+struct ds4_metal_args_glm_indexer_score_chunk {
+    uint32_t n_rows;
+    uint32_t n_head;
+    uint32_t head_dim;
+    uint32_t cache_f16;
+    float    scale;
+    uint32_t n_tokens;
+    uint32_t causal_start;
+    uint32_t causal_ratio;
+    uint32_t pad;
+};
+
 struct ds4_metal_args_glm_indexer_scores_batch {
     uint32_t n_rows;
     uint32_t n_tokens;
@@ -2012,6 +2027,76 @@ kernel void kernel_glm_indexer_score_one_direct(
 
     if (tid == 0) {
         scores[row] = acc;
+    }
+}
+
+/* kernel_glm_indexer_score_one_direct 的 token 维版本：同一套 head 循环、simdgroup
+ * 归约与点积顺序，只把 q/weights/scores 的指针按 token 偏移，并加上逐行因果门
+ * （row >= count_tok 的格子写 -INFINITY）。网格 (压缩键, token, 1)、线程 (32,4,1)、
+ * smem 132 floats 与 _direct 完全一致，所以每一格的算术与逐 token 调用逐位相同。 */
+kernel void kernel_glm_indexer_score_chunk_direct(
+        constant ds4_metal_args_glm_indexer_score_chunk & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2 tgpid [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    const uint row = tgpid.x;
+    const uint tok = tgpid.y;
+    if (row >= args.n_rows || tok >= args.n_tokens ||
+        args.n_head != 32u || args.head_dim != 128u) {
+        return;
+    }
+
+    device float *row_scores = scores + (uint64_t)tok * args.n_rows;
+    if (row >= (args.causal_start + tok + 1u) / args.causal_ratio) {
+        if (tid == 0u) row_scores[row] = -INFINITY;
+        return;
+    }
+
+    device const char *q_tok =
+        q + (uint64_t)tok * args.n_head * args.head_dim * sizeof(float);
+    device const float *w_tok = weights + (uint64_t)tok * args.n_head;
+
+    threadgroup float *ktg = shared;
+    threadgroup float *psum = ktg + 128u;
+
+    if (tid < 128u) {
+        ktg[tid] = glm_cache_load_f32_or_f16(indexer_key_cache,
+                                             (uint64_t)row * 128u + tid,
+                                             args.cache_f16);
+    }
+
+    float acc = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint head0 = 0; head0 < 32u; head0 += 4u) {
+        const uint head = head0 + (uint)sg;
+        device const float4 *q4 = (device const float4 *)(q_tok +
+            (uint64_t)head * 128u * sizeof(float));
+        threadgroup const float4 *k4 = (threadgroup const float4 *)ktg;
+
+        float s = dot(q4[lane], k4[lane]);
+        s = simd_sum(s);
+        if (lane == 0) {
+            psum[sg] = max(s * args.scale, 0.0f) * w_tok[head];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            acc += psum[0];
+            acc += psum[1];
+            acc += psum[2];
+            acc += psum[3];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        row_scores[row] = acc;
     }
 }
 

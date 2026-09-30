@@ -151,6 +151,10 @@ struct ds4_metal_args_dsv41_candidates {
     uint rows;
     uint start;
     uint ratio;
+    /* block_mask 的【行步长】（float 为单位）。逐 token 时每行的可见块数就是
+     * (width+7)/8，可以当下标算；批量后每行的可见块数不同，而 prompt_block_mask
+     * 的行步长是全局的，所以必须显式传。逐 token 调用传 (width+7)/8 ⇒ 行为不变。 */
+    uint mask_stride;
 };
 
 kernel void kernel_dsv41_candidate_blocks(
@@ -178,10 +182,9 @@ kernel void kernel_dsv41_candidate_filter(
         uint2 index [[thread_position_in_grid]]) {
     if (index.x >= args.width || index.y >= args.rows) return;
     const ulong offset = (ulong)index.y * args.width + index.x;
-    const uint blocks = (args.width + 7u) / 8u;
     const uint visible = min(args.width, (args.start + index.y + 1u) / args.ratio);
     out[offset] = index.x < visible &&
-        block_mask[(ulong)index.y * blocks + index.x / 8u] == 0.0f
+        block_mask[(ulong)index.y * args.mask_stride + index.x / 8u] == 0.0f
         ? scores[offset] : -INFINITY;
 }
 

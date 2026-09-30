@@ -364,6 +364,7 @@ int myds_metal_init(const char *shader_dir) {
         NSMutableString *full_source = [NSMutableString stringWithUTF8String:g_metal_base_preamble];
         NSFileManager *fm = [NSFileManager defaultManager];
 
+        NSString *dir_used = nil;
         for (NSString *filename in shader_files) {
             NSString *path = [NSString stringWithFormat:@"%s/%@", dir, filename];
             if (![fm fileExistsAtPath:path]) {
@@ -382,6 +383,7 @@ int myds_metal_init(const char *shader_dir) {
                         [path UTF8String], [[read_err localizedDescription] UTF8String]);
                 return 0;
             }
+            if (!dir_used) dir_used = [[path stringByDeletingLastPathComponent] copy];
             [full_source appendFormat:@"\n#line 1 \"%@\"\n%@", filename, content];
         }
 
@@ -440,6 +442,9 @@ int myds_metal_init(const char *shader_dir) {
 
         NSError *compile_err = nil;
         g_library = [g_device newLibraryWithSource:full_source options:options error:&compile_err];
+        if (g_library)
+            myds_log(MYDS_LOG_INFO, "myds_metal: shaders loaded from %s (%lu files)",
+                     dir_used ? [dir_used UTF8String] : "?", (unsigned long)[shader_files count]);
         if (!g_library) {
             fprintf(stderr, "myds_metal: Metal shader compilation failed: %s\n",
                     [[compile_err localizedDescription] UTF8String]);
@@ -1039,23 +1044,31 @@ uint32_t myds_metal_kernel_max_threads(const char *name) {
     }
 }
 
+/* 派发失败原因：设 MYDS_DEBUG_DISPATCH=1 时打印【哪一条校验】挡下了这次 dispatch，
+ * 以及 newFunctionWithName / newComputePipelineState 的 NSError。
+ * 2026-09-30 加 —— 当时一个新内核在 macstudio 上「FUNCTION NOT FOUND」，靠这条日志
+ * 立刻定位到「二进制按 CWD 相对路径读 metal/ 源码，而测试脚本没 cd 到构建目录」。
+ * 未设该环境变量时无任何额外开销（只在失败路径上 getenv）。 */
+#define MYDS_DBG_DISPATCH_FAIL(why) do { \
+    if (getenv("MYDS_DEBUG_DISPATCH")) myds_log(MYDS_LOG_ERROR, "DBGDISP %s: %s", name, why); \
+    return 0; } while (0)
 int myds_metal_dispatch_kernel_constants(const char *name, const void *args, size_t args_size,
     const myds_metal_buffer_t *const *buffers, size_t n_buffers,
     const uint32_t groups[3], const uint32_t threads[3], size_t threadgroup_memory,
     const myds_metal_constant_t *constants, size_t n_constants) {
     if (!g_initialized || !name || !*name || !args || !args_size || args_size > 4096 ||
         !buffers || !n_buffers || n_buffers > 30 || !groups || !threads ||
-        (n_constants && !constants) || n_constants>64) return 0;
+        (n_constants && !constants) || n_constants>64) MYDS_DBG_DISPATCH_FAIL("precheck args/buffers");
     uint64_t n_threads = 1;
     const MTLSize maximum = g_device.maxThreadsPerThreadgroup;
     const NSUInteger limits[3] = {maximum.width, maximum.height, maximum.depth};
     for (unsigned i = 0; i < 3; ++i) {
         if (!groups[i] || !threads[i] || threads[i] > limits[i] ||
-            n_threads > UINT64_MAX / threads[i]) return 0;
+            n_threads > UINT64_MAX / threads[i]) MYDS_DBG_DISPATCH_FAIL("threads/groups invalid");
         n_threads *= threads[i];
     }
     for (size_t i = 0; i < n_buffers; ++i)
-        if (!buffers[i] || !buffers[i]->mtl_buf || !buffers[i]->size) return 0;
+        if (!buffers[i] || !buffers[i]->mtl_buf || !buffers[i]->size) MYDS_DBG_DISPATCH_FAIL("null/empty buffer");
     @autoreleasepool {
         id<MTLComputePipelineState> pipeline = nil;
         if (n_constants == 0) {
@@ -1068,7 +1081,7 @@ int myds_metal_dispatch_kernel_constants(const char *name, const void *args, siz
         }
         if (!pipeline) {
             NSString *function_name = [NSString stringWithUTF8String:name];
-            if (!function_name) return 0;
+            if (!function_name) MYDS_DBG_DISPATCH_FAIL("bad name");
             NSMutableString *key = [function_name mutableCopy];
             for (size_t i=0;i<n_constants;i++)
                 [key appendFormat:@":%u:%d:%d",constants[i].index,constants[i].is_bool,constants[i].value];
@@ -1082,11 +1095,23 @@ int myds_metal_dispatch_kernel_constants(const char *name, const void *args, siz
                     [values setConstantValue:constants[i].is_bool ? (const void *)&bv : (const void *)&iv
                         type:constants[i].is_bool ? MTLDataTypeBool : MTLDataTypeInt atIndex:constants[i].index];
                 }
-                id<MTLFunction> fn = n_constants ? [g_library newFunctionWithName:function_name constantValues:values error:nil]
+                NSError *ferr = nil;
+                id<MTLFunction> fn = n_constants ? [g_library newFunctionWithName:function_name constantValues:values error:&ferr]
                                                : [g_library newFunctionWithName:function_name];
-                if (!fn) return 0;
-                pipeline = [g_device newComputePipelineStateWithFunction:fn error:nil];
-                if (!pipeline) return 0;
+                if (!fn) {
+                    if (getenv("MYDS_DEBUG_DISPATCH"))
+                        myds_log(MYDS_LOG_ERROR, "DBGDISP %s: FUNCTION NOT FOUND (%s)", name,
+                                 ferr ? [[ferr localizedDescription] UTF8String] : "no error");
+                    return 0;
+                }
+                NSError *perr = nil;
+                pipeline = [g_device newComputePipelineStateWithFunction:fn error:&perr];
+                if (!pipeline) {
+                    if (getenv("MYDS_DEBUG_DISPATCH"))
+                        myds_log(MYDS_LOG_ERROR, "DBGDISP %s: PIPELINE FAILED (%s)", name,
+                                 perr ? [[perr localizedDescription] UTF8String] : "no error");
+                    return 0;
+                }
                 g_native_pipelines[key] = pipeline;
             }
             if (n_constants == 0 && g_native_pso_cache_count < 64 && strlen(name) < 64) {
@@ -1096,10 +1121,13 @@ int myds_metal_dispatch_kernel_constants(const char *name, const void *args, siz
                 g_native_pso_cache_count++;
             }
         }
-        if (n_threads > pipeline.maxTotalThreadsPerThreadgroup ||
-            threadgroup_memory > g_device.maxThreadgroupMemoryLength ||
-            pipeline.staticThreadgroupMemoryLength > g_device.maxThreadgroupMemoryLength - threadgroup_memory ||
-            threadgroup_memory % 16) return 0;
+        if (n_threads > pipeline.maxTotalThreadsPerThreadgroup)
+            MYDS_DBG_DISPATCH_FAIL("n_threads > maxTotalThreadsPerThreadgroup");
+        if (threadgroup_memory > g_device.maxThreadgroupMemoryLength)
+            MYDS_DBG_DISPATCH_FAIL("threadgroup_memory > device max");
+        if (pipeline.staticThreadgroupMemoryLength > g_device.maxThreadgroupMemoryLength - threadgroup_memory)
+            MYDS_DBG_DISPATCH_FAIL("static+dynamic tg mem > device max");
+        if (threadgroup_memory % 16) MYDS_DBG_DISPATCH_FAIL("threadgroup_memory not 16-aligned");
         id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
         if (!cb) return 0;
         id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);

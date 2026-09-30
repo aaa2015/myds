@@ -306,10 +306,52 @@ static int dispatch_k(const char *kernel, const void *args, size_t size,
     return myds_metal_dispatch_kernel(kernel, args, size, buffers, count, grid, block, scratch);
 }
 
-static int publish_and_select(myds_context_t *ctx, uint32_t il, uint32_t pos,
-                              const myds_metal_buffer_t *x_norm, const myds_metal_buffer_t *qr_norm,
+/* 压缩器（只有 kv_source 层有）。它跨位置有状态：pool2 依赖 previous_kv/previous_score，
+ * rope/quant 写入 index_cache/compressed 的第 count-1 行。所以【必须逐 token、按位置
+ * 递增顺序】跑 —— prefill 与 decode 共用这一份。 */
+static int publish_compressor(myds_context_t *ctx, uint32_t il, uint32_t pos,
+                              const myds_metal_buffer_t *x_norm,
                               const myds_metal_buffer_t *pre_pool_kv,
-                              const myds_metal_buffer_t *pre_pool_score,
+                              const myds_metal_buffer_t *pre_pool_score) {
+    myds_v41_context_t *g=ctx->v41;
+    const v41_layer_t *l=&ctx->model->v41->layers[il];
+    const uint32_t ratio=ratio_for(il), owner=owner_for(il);
+    if (!ratio || !kv_source(il)) return 1;
+    const uint32_t count=(pos+1u)/ratio;
+#define CHECK(x) do { if (!(x)) return 0; } while (0)
+    const myds_metal_buffer_t *p_kv = pre_pool_kv;
+    if (!p_kv) {
+        CHECK(project(g->pool_kv,l->compressor_kv,x_norm,512,V41_DIM,GGML_TYPE_F16,ratio==1));
+        p_kv = g->pool_kv;
+    }
+    if (ratio==2) {
+        const myds_metal_buffer_t *p_score = pre_pool_score;
+        if (!p_score) {
+            CHECK(project(g->pool_score,l->compressor_gate,x_norm,512,V41_DIM,GGML_TYPE_F16,false));
+            p_score = g->pool_score;
+        }
+        CHECK(myds_v41_gpu_pool2(g->latent,p_kv,p_score,
+            g->previous_kv[owner],g->previous_score[owner],512,pos));
+    } else CHECK(myds_metal_buffer_copy(g->latent,0,p_kv,0,512*4u));
+    if ((pos+1u)%ratio==0) {
+        const uint32_t start=pos+1u-ratio;
+        CHECK(myds_metal_v41_rmsnorm(g->latent,g->latent,l->compressor_norm,512,ctx->model->norm_eps,true));
+        CHECK(project(g->index_k,l->index_k,g->latent,128,512,GGML_TYPE_F16,true));
+        CHECK(myds_metal_v41_rmsnorm(g->index_k,g->index_k,l->index_k_norm,128,ctx->model->norm_eps,true));
+        CHECK(myds_v41_gpu_rope(g->index_k,128,1,start,true,false));
+        CHECK(myds_v41_gpu_quant(g->index_k,128,1,2));
+        CHECK(myds_metal_buffer_copy(g->index_cache[owner],(size_t)(count-1)*128*4u,g->index_k,0,128*4u));
+        CHECK(myds_v41_gpu_rope(g->latent,512,1,start,true,false));
+        CHECK(myds_v41_gpu_quant(g->latent,512,1,3));
+        CHECK(myds_metal_buffer_copy(g->compressed[owner],(size_t)(count-1)*512*4u,g->latent,0,512*4u));
+    }
+#undef CHECK
+    return 1;
+}
+
+/* indexer 的逐 token 版（decode 路径与 prefill 的回退路径用）。 */
+static int publish_indexer_one(myds_context_t *ctx, uint32_t il, uint32_t pos,
+                              const myds_metal_buffer_t *x_norm, const myds_metal_buffer_t *qr_norm,
                               myds_metal_buffer_t *pre_index_q,
                               const myds_metal_buffer_t *pre_index_weights,
                               myds_metal_buffer_t *out_selected,
@@ -321,34 +363,6 @@ static int publish_and_select(myds_context_t *ctx, uint32_t il, uint32_t pos,
     if (!ratio) return 1;
     const uint32_t count=(pos+1u)/ratio;
 #define CHECK(x) do { if (!(x)) return 0; } while (0)
-    if (kv_source(il)) {
-        const myds_metal_buffer_t *p_kv = pre_pool_kv;
-        if (!p_kv) {
-            CHECK(project(g->pool_kv,l->compressor_kv,x_norm,512,V41_DIM,GGML_TYPE_F16,ratio==1));
-            p_kv = g->pool_kv;
-        }
-        if (ratio==2) {
-            const myds_metal_buffer_t *p_score = pre_pool_score;
-            if (!p_score) {
-                CHECK(project(g->pool_score,l->compressor_gate,x_norm,512,V41_DIM,GGML_TYPE_F16,false));
-                p_score = g->pool_score;
-            }
-            CHECK(myds_v41_gpu_pool2(g->latent,p_kv,p_score,
-                g->previous_kv[owner],g->previous_score[owner],512,pos));
-        } else CHECK(myds_metal_buffer_copy(g->latent,0,p_kv,0,512*4u));
-        if ((pos+1u)%ratio==0) {
-            const uint32_t start=pos+1u-ratio;
-            CHECK(myds_metal_v41_rmsnorm(g->latent,g->latent,l->compressor_norm,512,ctx->model->norm_eps,true));
-            CHECK(project(g->index_k,l->index_k,g->latent,128,512,GGML_TYPE_F16,true));
-            CHECK(myds_metal_v41_rmsnorm(g->index_k,g->index_k,l->index_k_norm,128,ctx->model->norm_eps,true));
-            CHECK(myds_v41_gpu_rope(g->index_k,128,1,start,true,false));
-            CHECK(myds_v41_gpu_quant(g->index_k,128,1,2));
-            CHECK(myds_metal_buffer_copy(g->index_cache[owner],(size_t)(count-1)*128*4u,g->index_k,0,128*4u));
-            CHECK(myds_v41_gpu_rope(g->latent,512,1,start,true,false));
-            CHECK(myds_v41_gpu_quant(g->latent,512,1,3));
-            CHECK(myds_metal_buffer_copy(g->compressed[owner],(size_t)(count-1)*512*4u,g->latent,0,512*4u));
-        }
-    }
     if (count && index_source(il)) {
         myds_metal_buffer_t *q_buf = pre_index_q;
         if (!q_buf) {
@@ -379,6 +393,140 @@ static int publish_and_select(myds_context_t *ctx, uint32_t il, uint32_t pos,
         CHECK(myds_v41_gpu_topk(sel,g->index_scores,count,count<V41_TOPK?count:V41_TOPK,g->gpu));
     }
 #undef CHECK
+    return 1;
+}
+
+/* decode 路径的一份完整发布/选择（= 压缩器 + indexer，逐 token）。 */
+static int publish_and_select(myds_context_t *ctx, uint32_t il, uint32_t pos,
+                              const myds_metal_buffer_t *x_norm, const myds_metal_buffer_t *qr_norm,
+                              const myds_metal_buffer_t *pre_pool_kv,
+                              const myds_metal_buffer_t *pre_pool_score,
+                              myds_metal_buffer_t *pre_index_q,
+                              const myds_metal_buffer_t *pre_index_weights,
+                              myds_metal_buffer_t *out_selected,
+                              const myds_metal_buffer_t *in_block_mask,
+                              myds_metal_buffer_t *out_block_mask) {
+    if (!publish_compressor(ctx,il,pos,x_norm,pre_pool_kv,pre_pool_score)) return 0;
+    return publish_indexer_one(ctx,il,pos,x_norm,qr_norm,pre_index_q,pre_index_weights,
+                               out_selected,in_block_mask,out_block_mask);
+}
+
+/* 子组的 token 数：本组最后一个 token 的 count（= 该组分数表的列数）必须让
+ * 组内 token 数 × 列数 ≤ 预算。返回 0 表示 1 行都放不下（调用方回退）。 */
+static uint32_t indexer_group_len(uint32_t c_len, uint32_t off, uint32_t base_pos,
+                                  uint32_t c_start, uint32_t ratio) {
+    uint32_t glen = c_len - off;
+    for (;;) {
+        uint32_t nc = (base_pos + c_start + off + glen) / ratio;
+        /* 分数表的宽度至少要补到 V41_TOPK：批量 top-k 写 ids 的行步长是 top，
+         * 而 prompt_selected 的行步长固定是 V41_TOPK，只有 top == V41_TOPK 时两者一致
+         * （见 myds_v41_gpu.c 的 topk_rows_causal）。 */
+        uint32_t width = nc < V41_TOPK ? V41_TOPK : nc;
+        if ((uint64_t)glen * width <= (uint64_t)MYDS_V41_INDEXER_BATCH_FLOATS) return glen;
+        uint32_t next = glen > 1u ? (uint32_t)((uint64_t)MYDS_V41_INDEXER_BATCH_FLOATS / width) : 0u;
+        if (!next || next >= glen) return 0;
+        glen = next;
+    }
+}
+
+/* 【整 chunk 批量】prefill Step 4 的 indexer。要求调用方已用 project_batch 把整 chunk 的
+ * index_q / index_weights 投影好（pre_index_q = cw->index_q_buf 等）。
+ *
+ * 与逐 token 路径逐位相同的依据：
+ *   1) 压缩器仍在外面逐 token 跑（index_cache 的写入单调递增）⇒ 批量 indexer 读到的
+ *      压缩键与逐 token 时完全一样；
+ *   2) 每个内核都自带【逐行】因果宽度，行号就是本组内的 token 序号：
+ *        - kernel_glm_indexer_score_chunk_direct: row >= (causal_start+tok+1)/ratio 写 -INF；
+ *        - kernel_argsort_*_causal:    width = min(ne00, (causal_start+i01+1)/ratio)，
+ *                                      i01 就是行号（grid.x % ne01）；
+ *        - kernel_dsv41_candidate_blocks/_filter: visible = min(width, (start+row+1)/ratio)；
+ *      ⇒ 每行看到的列数恰好等于逐 token 的 count；多算出来的列全被宽度挡在排序之外。
+ *   3) 投影/rope/quant 本来就是整 chunk 做（project_batch），逐 token 循环里的那两个
+ *      rope/quant 只是把它们拆碎 ⇒ 合并回整 chunk 是同一批内核、同一组参数。
+ *
+ * 分数表是「组内 token 数 × 本组最大 count」的矩形，缓冲预算有限
+ * （MYDS_V41_INDEXER_BATCH_FLOATS），所以把 chunk 再切成若干 token 子组，
+ * 子组宽度取该组【最后一个 token】的 count。
+ *
+ * 返回值：1 = 已批量完成；0 = 前提不满足（调用方回退到逐 token，此时【未做任何修改】）；
+ *        -1 = 已经开始 dispatch 后失败（rope/quant 是原地改写，不能回退重复做）——致命。 */
+static int publish_indexer_chunk(myds_context_t *ctx, uint32_t il, uint32_t c_start, uint32_t c_len,
+                                 uint32_t base_pos, myds_metal_buffer_t *index_q_buf,
+                                 const myds_metal_buffer_t *index_weights_buf,
+                                 myds_metal_buffer_t *prompt_selected, size_t sel_bytes,
+                                 myds_metal_buffer_t *prompt_block_mask, size_t mask_bytes,
+                                 myds_metal_buffer_t *q_view, myds_metal_buffer_t *w_view,
+                                 myds_metal_buffer_t *sel_view, myds_metal_buffer_t *mask_view) {
+    myds_v41_context_t *g=ctx->v41;
+    const uint32_t ratio=ratio_for(il), owner=owner_for(il);
+    const uint32_t n_comp_all=(base_pos + c_start + c_len)/ratio;
+    const uint32_t mask_stride=(uint32_t)(mask_bytes/4u);
+    if (!ratio || !index_source(il) || !c_len) return 0;
+    /* 逐 token 路径里 count==0 的 token 整段跳过（连 rope/quant 都不做）；只有
+     * 「序列第一个 token + ratio==2 的层」会出现。批量路径没有对应「整行不写」的语义
+     * （因果宽度 0 会让 merge 的无符号减法下溢），所以直接回退。 */
+    if (!n_comp_all || (base_pos + c_start + 1u)/ratio == 0u) return 0;
+    if (V41_INDEX_HEADS != 32u) return 0;
+    if (n_comp_all > MYDS_V41_INDEXER_BATCH_FLOATS) return 0;
+    if (mask_bytes%4u || !mask_stride) return 0;
+    /* 压缩键的【表宽】：不足 V41_TOPK 时补到 V41_TOPK（多出来的列由因果宽度挡成
+     * -INF，既多算了什么也不选），这样 top == V41_TOPK == prompt_selected 的行步长。
+     * 缓存里必须真的有 V41_TOPK 行，否则按逐 token 回退（缓存行数 = 位置容量/ratio）。 */
+    const uint32_t cache_rows=(uint32_t)(myds_metal_buffer_size(g->index_cache[owner])/(128u*4u));
+    if (n_comp_all<V41_TOPK && cache_rows<V41_TOPK) return 0;
+    myds_metal_buffer_t *scores_buf=myds_v41_gpu_indexer_scores(g->gpu);
+    myds_metal_buffer_t *blocks_buf=myds_v41_gpu_indexer_blocks(g->gpu);
+    myds_metal_buffer_t *block_sel_buf=myds_v41_gpu_indexer_block_selected(g->gpu);
+    if (!scores_buf || !blocks_buf || !block_sel_buf) return 0;
+    if (!q_view || !w_view || !sel_view || !mask_view) return 0;
+    /* 预检：先把子组划分算完（不做任何 dispatch）。rope/quant 是原地改写，一旦开始
+     * 就不能再回退重做，所以放不下必须在这里发现。 */
+    for (uint32_t off=0; off<c_len; ) {
+        uint32_t glen=indexer_group_len(c_len,off,base_pos,c_start,ratio);
+        if (!glen) return 0;
+        off+=glen;
+    }
+    /* 1) index_q 的 rope + quant：逐 token 版本在 publish_and_select 里逐行做，参数
+     *    完全相同（start_pos = 该位置、heads = 32、width = 128、compressed = true）。 */
+    if (!myds_v41_gpu_rope_batch(index_q_buf,128,V41_INDEX_HEADS,base_pos + c_start,c_len,true,false)) return -1;
+    if (!myds_v41_gpu_quant(index_q_buf,128,V41_INDEX_HEADS*c_len,2)) return -1;
+    for (uint32_t off=0; off<c_len; ) {
+        const uint32_t glen=indexer_group_len(c_len,off,base_pos,c_start,ratio);
+        const uint32_t nc_raw=(base_pos + c_start + off + glen)/ratio;
+        const uint32_t nc=nc_raw<V41_TOPK?V41_TOPK:nc_raw;   /* 表宽（见上） */
+        const uint32_t g_start=base_pos + c_start + off;
+        if (!glen || !nc_raw) return -1;
+        if (!myds_metal_buffer_update_sub_view(q_view,index_q_buf,
+                (size_t)off*V41_INDEX_HEADS*128u*sizeof(float),
+                (size_t)glen*V41_INDEX_HEADS*128u*sizeof(float)) ||
+            !myds_metal_buffer_update_sub_view(w_view,index_weights_buf,
+                (size_t)off*V41_INDEX_HEADS*sizeof(float),
+                (size_t)glen*V41_INDEX_HEADS*sizeof(float)) ||
+            !myds_metal_buffer_update_sub_view(sel_view,prompt_selected,
+                (size_t)(c_start+off)*sel_bytes,(size_t)glen*sel_bytes) ||
+            !myds_metal_buffer_update_sub_view(mask_view,prompt_block_mask,
+                (size_t)(c_start+off)*mask_bytes,(size_t)glen*mask_bytes)) return -1;
+        /* 分数表：glen 行 × nc 列，行主序。 */
+        if (!myds_v41_gpu_indexscores_chunk(scores_buf,q_view,w_view,g->index_cache[owner],
+                nc,V41_INDEX_HEADS,glen,g_start,ratio)) return -1;
+        if (il==20) {
+            /* 块掩码：只要本行的块【全部被选中】，掩码前缀就与逐 token 一致
+             * （前 blocks_t 列先清成不可见、再被 scatter 打开）。这里 nc ≤ 16384
+             * ⇒ blocks ≤ 2048 ⇒ top = blocks = 全选，行内顺序不影响结果。 */
+            const uint32_t blocks=(nc+7u)/8u;
+            const uint32_t top_blocks=blocks<2048u?blocks:2048u;
+            if (!myds_v41_gpu_candidates_rows(blocks_buf,scores_buf,nc,glen,g_start,ratio,mask_stride)) return -1;
+            if (!myds_v41_gpu_topk_causal(block_sel_buf,blocks_buf,blocks,top_blocks,glen,
+                    g_start,ratio,g->gpu)) return -1;
+            if (!myds_v41_gpu_topkmask_rows(mask_view,block_sel_buf,blocks,top_blocks,glen,mask_stride)) return -1;
+        } else if (il>20) {
+            if (!myds_v41_gpu_filter_rows(scores_buf,mask_view,nc,glen,g_start,ratio,mask_stride)) return -1;
+        }
+        /* 最终选择：top 取全局 V41_TOPK（≤ nc），逐行宽度由因果参数限制到 count。 */
+        if (!myds_v41_gpu_topk_causal(sel_view,scores_buf,nc,nc<V41_TOPK?nc:V41_TOPK,
+                glen,g_start,ratio,g->gpu)) return -1;
+        off+=glen;
+    }
     return 1;
 }
 
@@ -586,6 +734,9 @@ typedef struct {
     myds_metal_buffer_t *cur_pre_view;
     myds_metal_buffer_t *cur_selected_view;
     myds_metal_buffer_t *cur_mask_view;
+    /* 批量 indexer 用的分组视图（整 chunk 缓冲 / 提示缓冲按子组切片） */
+    myds_metal_buffer_t *cur_index_q_view;
+    myds_metal_buffer_t *cur_index_weights_view;
     myds_metal_buffer_t *hc_flat_norm_buf;
     myds_metal_buffer_t *hc_mix_buf;
 } v41_chunk_workspace_t;
@@ -673,6 +824,8 @@ static void v41_chunk_workspace_free(v41_chunk_workspace_t *cw) {
     if (cw->cur_pre_view) myds_metal_buffer_free(cw->cur_pre_view);
     if (cw->cur_selected_view) myds_metal_buffer_free(cw->cur_selected_view);
     if (cw->cur_mask_view) myds_metal_buffer_free(cw->cur_mask_view);
+    if (cw->cur_index_q_view) myds_metal_buffer_free(cw->cur_index_q_view);
+    if (cw->cur_index_weights_view) myds_metal_buffer_free(cw->cur_index_weights_view);
     if (cw->hc_flat_norm_buf) myds_metal_buffer_free(cw->hc_flat_norm_buf);
     if (cw->hc_mix_buf) myds_metal_buffer_free(cw->hc_mix_buf);
     if (cw->moe_batch > cw->capacity) {   /* 别名时不能重复释放 */
@@ -829,7 +982,10 @@ static v41_chunk_workspace_t *v41_chunk_workspace_create(uint32_t capacity, uint
     cw->cur_pre_view = myds_metal_buffer_create_view();
     cw->cur_selected_view = myds_metal_buffer_create_view();
     cw->cur_mask_view = myds_metal_buffer_create_view();
-    if (!cw->cur_res_view || !cw->cur_pre_view || !cw->cur_selected_view || !cw->cur_mask_view) goto fail;
+    cw->cur_index_q_view = myds_metal_buffer_create_view();
+    cw->cur_index_weights_view = myds_metal_buffer_create_view();
+    if (!cw->cur_res_view || !cw->cur_pre_view || !cw->cur_selected_view || !cw->cur_mask_view ||
+        !cw->cur_index_q_view || !cw->cur_index_weights_view) goto fail;
     return cw;
 fail:
     v41_chunk_workspace_free(cw);
@@ -937,6 +1093,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 #define TIME_ACC(acc) do { if (do_prof) { gettimeofday(&ptv1, NULL); acc += (ptv1.tv_sec - ptv0.tv_sec) * 1000.0 + (ptv1.tv_usec - ptv0.tv_usec) / 1000.0; } } while(0)
 
     uint32_t il = 0;
+    int idx_fallback_warned = 0;   /* 批量 indexer 回退只提示一次 */
     const char *phase = "engram prepare";
 
     TIME_START();
@@ -1150,29 +1307,51 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             }
 
             uint64_t disp_loop0 = myds_metal_dispatch_count();  /* 诊断 */
-            /* The indexer and the KV compressor are stateful across positions, so that
-             * part stays per token.  Everything after it - staging the keys, selecting
-             * them and running the attention - is per token only because it used to be
-             * written that way, and is what made prefill dispatch bound. */
-            for (uint32_t t = 0; t < c_len; t++) {
-                uint32_t idx = c_start + t;
-                uint32_t pos = base_pos + idx;
-                uint32_t count = compressed ? (pos + 1u) / ratio : 0;
-
-                phase = "compressed KV / indexer";
-                if (!myds_metal_buffer_update_sub_view(cw->cur_selected_view, prompt_selected, (size_t)idx * sel_bytes, sel_bytes) ||
-                    !myds_metal_buffer_update_sub_view(cw->cur_mask_view, prompt_block_mask, (size_t)idx * mask_bytes, mask_bytes)) {
-                    goto fail;
+            /* Step 4 的 indexer/压缩器。压缩器跨位置有状态 ⇒ 保持逐 token；indexer
+             * 整 chunk 批量（publish_indexer_chunk），失败或 MYDS_INDEXER_PER_TOKEN
+             * 则回退到这个逐 token 循环（两条路径应当逐位相同）。 */
+            if (kv_source(il)) {
+                phase = "compressed KV";
+                for (uint32_t t = 0; t < c_len; t++) {
+                    uint32_t pos = base_pos + c_start + t;
+                    CHECK(publish_compressor(ctx, il, pos, cw->x_norm[t], cw->pool_kv[t],
+                                             ratio == 2 ? cw->pool_score[t] : NULL));
                 }
-
-                CHECK(publish_and_select(ctx, il, pos, cw->x_norm[t], cw->qr_norm[t],
-                                         kv_source(il) ? cw->pool_kv[t] : NULL,
-                                         (kv_source(il) && ratio == 2) ? cw->pool_score[t] : NULL,
-                                         index_source(il) ? cw->index_q[t] : NULL,
-                                         index_source(il) ? cw->index_weights[t] : NULL,
-                                         (count && index_source(il)) ? cw->cur_selected_view : NULL,
-                                         (il > 20 && index_source(il)) ? cw->cur_mask_view : NULL,
-                                         (il == 20) ? cw->cur_mask_view : NULL));
+            }
+            if (index_source(il)) {
+                int batched = 0;
+                if (!getenv("MYDS_INDEXER_PER_TOKEN")) {
+                    batched = publish_indexer_chunk(ctx, il, c_start, c_len, base_pos,
+                        cw->index_q_buf, cw->index_weights_buf, prompt_selected, sel_bytes,
+                        prompt_block_mask, mask_bytes, cw->cur_index_q_view, cw->cur_index_weights_view,
+                        cw->cur_selected_view, cw->cur_mask_view);
+                    if (batched < 0) {
+                        MYDS_LOG_E("V4.1 chunk indexer failed mid-flight (layer %u chunk %u)", il, c_start);
+                        goto fail;
+                    }
+                    if (!batched && !idx_fallback_warned) {
+                        idx_fallback_warned = 1;
+                        MYDS_LOG_W("V4.1 chunk indexer skipped at layer %u, per-token fallback (first token / small cache)", il);
+                    }
+                }
+                if (!batched) {
+                    phase = "compressed KV / indexer";
+                    for (uint32_t t = 0; t < c_len; t++) {
+                        uint32_t idx = c_start + t;
+                        uint32_t pos = base_pos + idx;
+                        uint32_t count = compressed ? (pos + 1u) / ratio : 0;
+                        if (!myds_metal_buffer_update_sub_view(cw->cur_selected_view, prompt_selected, (size_t)idx * sel_bytes, sel_bytes) ||
+                            !myds_metal_buffer_update_sub_view(cw->cur_mask_view, prompt_block_mask, (size_t)idx * mask_bytes, mask_bytes)) {
+                            goto fail;
+                        }
+                        CHECK(publish_indexer_one(ctx, il, pos, cw->x_norm[t], cw->qr_norm[t],
+                                                  index_source(il) ? cw->index_q[t] : NULL,
+                                                  index_source(il) ? cw->index_weights[t] : NULL,
+                                                  (count && index_source(il)) ? cw->cur_selected_view : NULL,
+                                                  (il > 20 && index_source(il)) ? cw->cur_mask_view : NULL,
+                                                  (il == 20) ? cw->cur_mask_view : NULL));
+                    }
+                }
             }
 
             /* 诊断：把 Step 4 切成 indexer / attention 两段，各自测 GPU 等待。
