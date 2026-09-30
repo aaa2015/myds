@@ -270,9 +270,6 @@ static void test_deepseek41_chat_templates(void) {
         "{\"messages\":[{\"content\":\"hi\"}]}", "{\"messages\":[{\"role\":\"unknown\",\"content\":\"hi\"}]}",
         "{\"input\":[{\"content\":[{\"type\":\"input_image\",\"image_url\":\"image\"}]}]}",
         "{\"input\":[{\"content\":[{\"type\":\"input_text\"}]}]}",
-        "{\"input\":\"hi\",\"tools\":[{\"type\":\"function\",\"name\":\"lookup\"}]}",
-        "{\"messages\":[{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_1\"}]}]}",
-        "{\"messages\":[{\"role\":\"assistant\",\"content\":\"hi\",\"function_call\":{\"name\":\"lookup\"}}]}",
     };
     for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
         char output[4096] = "previous";
@@ -307,6 +304,83 @@ static void test_deepseek41_chat_templates(void) {
     printf("  [PASS] V4.1 exact chat templates, Unicode input, structured text parts, large input and explicit parse/capacity errors\n");
 }
 
+
+/* 工具调用格式（官方 DeepSeek-V4.1 DSML）—— 行为在 2026-10-01 由「拒绝」改为「支持」，
+ * 原先放在 invalid[] 里的三个用例已移到此处验证渲染结果。 */
+static void test_deepseek41_tool_calls(void) {
+    char output[16384];
+
+    /* ① tools（chat 嵌套形状）：应渲染官方 TOOLS_TEMPLATE + 原样 schema */
+    const char *with_tools =
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"Weather in Beijing?\"}],"
+        "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\","
+        "\"description\":\"Get weather\",\"parameters\":{\"type\":\"object\","
+        "\"properties\":{\"city\":{\"type\":\"string\"},\"days\":{\"type\":\"integer\"}},"
+        "\"required\":[\"city\"]}}}]}";
+    assert(parse_chat_prompt(with_tools, output, sizeof(output)));
+    assert(strstr(output, "<｜System｜>") != NULL);
+    assert(strstr(output, "## Tools") != NULL);
+    assert(strstr(output, "<｜DSML｜ calls>") != NULL);
+    assert(strstr(output, "<｜DSML｜ invoke") != NULL);
+    assert(strstr(output, "### Available Tool Schemas") != NULL);
+    /* schema 逐字节原样（含参数细节），而不是被重新序列化后失真 */
+    assert(strstr(output, "{\"name\":\"get_weather\",\"description\":\"Get weather\","
+                          "\"parameters\":{\"type\":\"object\",\"properties\":"
+                          "{\"city\":{\"type\":\"string\"},\"days\":{\"type\":\"integer\"}},"
+                          "\"required\":[\"city\"]}}") != NULL);
+    assert(strstr(output, "<｜User｜>Weather in Beijing?") != NULL);
+    assert(strstr(output, "You MUST strictly follow the above defined tool name") != NULL);
+
+    /* ② tools（Responses 扁平形状）也应被接受 */
+    const char *flat_tools =
+        "{\"input\":\"hi\",\"tools\":[{\"type\":\"function\",\"name\":\"lookup\","
+        "\"description\":\"Look up\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}]}";
+    assert(parse_chat_prompt(flat_tools, output, sizeof(output)));
+    assert(strstr(output, "{\"name\":\"lookup\",\"description\":\"Look up\","
+                          "\"parameters\":{\"type\":\"object\",\"properties\":{}}}") != NULL);
+
+    /* ③ 历史里的 assistant tool_calls ⇒ DSML invoke/parameter 块（在 EOS 之前） */
+    const char *history =
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"Weather?\"},"
+        "{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\","
+        "\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Beijing\\\",\\\"days\\\":3}\"}}]},"
+        "{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"sunny\"},"
+        "{\"role\":\"user\",\"content\":\"thanks\"}]}";
+    assert(parse_chat_prompt(history, output, sizeof(output)));
+    assert(strstr(output, "<｜DSML｜ calls>") != NULL);
+    assert(strstr(output, "<｜DSML｜ invoke name=\"get_weather\">") != NULL);
+    /* 字符串参数：string="true"；非字符串参数：JSON 形式 + string="false" */
+    assert(strstr(output, "<｜DSML｜ parameter name=\"city\" string=\"true\">Beijing</｜DSML｜ parameter>") != NULL);
+    assert(strstr(output, "<｜DSML｜ parameter name=\"days\" string=\"false\">3</｜DSML｜ parameter>") != NULL);
+    assert(strstr(output, "</｜DSML｜ invoke>") != NULL);
+    assert(strstr(output, "</｜DSML｜ calls>") != NULL);
+    /* 工具结果走官方 <tool_result> 格式 */
+    assert(strstr(output, "<tool_result>sunny</tool_result>") != NULL);
+    /* 工具调用必须出现在 assistant 的 EOS 之前 */
+    const char *calls_at = strstr(output, "</｜DSML｜ calls>");
+    const char *eos_at = strstr(calls_at, "<｜end▁of▁sentence｜>");
+    assert(calls_at && eos_at && eos_at > calls_at);
+
+    /* ④ 旧式 function_call（Responses）也应接受 */
+    const char *legacy =
+        "{\"messages\":[{\"role\":\"assistant\",\"content\":\"hi\","
+        "\"function_call\":{\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":\\\"x\\\"}\"}}]}";
+    assert(parse_chat_prompt(legacy, output, sizeof(output)));
+    assert(strstr(output, "<｜DSML｜ invoke name=\"lookup\">") != NULL);
+    assert(strstr(output, "<｜DSML｜ parameter name=\"q\" string=\"true\">x</｜DSML｜ parameter>") != NULL);
+
+    /* ⑤ 非 assistant 角色挂 tool_calls ⇒ 拒绝（格式只对 assistant 有意义） */
+    char small[4096];
+    assert(!parse_chat_prompt("{\"messages\":[{\"role\":\"user\",\"content\":\"hi\","
+                              "\"tool_calls\":[{\"type\":\"function\",\"function\":{\"name\":\"x\"}}]}]}",
+                              small, sizeof(small)));
+    /* ⑥ 工具名用不安全字符（会被写进 DSML 属性）⇒ 拒绝 */
+    assert(!parse_chat_prompt("{\"tools\":[{\"type\":\"function\",\"function\":"
+                              "{\"name\":\"bad\\\"name\",\"parameters\":{}}}]}", small, sizeof(small)));
+
+    printf("  [PASS] V4.1 DSML tool definitions, assistant tool_calls, tool results and rejections\n");
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && !strcmp(argv[1], "--render")) {
         size_t capacity = strlen(argv[2]) * 4 + 1024;
@@ -317,6 +391,7 @@ int main(int argc, char **argv) {
         free(output); return ok ? 0 : 1;
     }
     test_deepseek41_chat_templates();
+    test_deepseek41_tool_calls();
     printf("====================================================\n");
     printf("       Running myds Server API Unit Tests           \n");
     printf("====================================================\n");

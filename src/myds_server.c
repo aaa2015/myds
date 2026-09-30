@@ -356,9 +356,13 @@ void extract_message_text(const char *obj_buf, char *out, size_t out_size) {
  * Keep JSON parsing structural so nested fields cannot impersonate top-level
  * input and reject malformed/oversized data instead of truncating a prompt. */
 typedef enum { PJ_OBJECT, PJ_ARRAY, PJ_STRING, PJ_NULL, PJ_SCALAR } prompt_json_kind_t;
-typedef struct { prompt_json_kind_t kind; char *text; size_t next; } prompt_json_node_t;
+typedef struct {
+    prompt_json_kind_t kind; char *text; size_t next;
+    size_t off, len;   /* 原始 JSON 的字节区间（相对 base）；用于原样抽出工具 schema */
+} prompt_json_node_t;
 typedef struct {
     const char *cursor;
+    const char *base;  /* 请求体起点，配合 off/len 取原始切片 */
     prompt_json_node_t *nodes;
     size_t count, capacity;
 } prompt_json_t;
@@ -469,6 +473,7 @@ static bool prompt_json_value(prompt_json_t *j, unsigned depth) {
     }
     size_t index = j->count++;
     j->nodes[index] = (prompt_json_node_t){.kind = PJ_SCALAR};
+    if (j->base) j->nodes[index].off = (size_t)(j->cursor - j->base);
     char first = *j->cursor;
     if (first == '"') {
         j->nodes[index].kind = PJ_STRING;
@@ -508,7 +513,9 @@ static bool prompt_json_value(prompt_json_t *j, unsigned depth) {
         }
         j->cursor = p;
     }
-    j->nodes[index].next = j->count; return true;
+    j->nodes[index].next = j->count;
+    if (j->base) j->nodes[index].len = (size_t)(j->cursor - j->base) - j->nodes[index].off;
+    return true;
 }
 /* A duplicate relevant field is ambiguous and fails the request. */
 static const prompt_json_node_t *prompt_json_field(const prompt_json_t *j, const prompt_json_node_t *object,
@@ -528,6 +535,12 @@ static const prompt_json_node_t *prompt_json_field(const prompt_json_t *j, const
 static bool prompt_absent_or_empty(const prompt_json_t *j, const prompt_json_node_t *node) {
     return !node || node->kind == PJ_NULL ||
            (node->kind == PJ_ARRAY && (size_t)(node - j->nodes) + 1 == node->next);
+}
+/* 按长度追加：工具 schema 是原始 JSON 切片，不能当 C 字符串用。 */
+static bool prompt_append_n(prompt_buffer_t *b, const char *text, size_t length) {
+    if (b->length >= b->capacity || length >= b->capacity - b->length) { b->overflow = true; return false; }
+    memcpy(b->data + b->length, text, length); b->length += length; b->data[b->length] = 0;
+    return true;
 }
 static bool prompt_append(prompt_buffer_t *b, const char *text) {
     size_t length = strlen(text);
@@ -561,20 +574,221 @@ static bool prompt_tool_text(prompt_buffer_t *out, const char *text) {
     return prompt_append(out, "</tool_result>");
 }
 typedef struct { bool pending, user_open; size_t count; } prompt_chat_state_t;
-static bool prompt_render_message(prompt_buffer_t *out, prompt_chat_state_t *state, const char *role, const char *text) {
+static bool prompt_render_message(prompt_buffer_t *out, prompt_chat_state_t *state, const char *role,
+                                  const char *text, const char *suffix) {
     if (!strcmp(role, "system") || !strcmp(role, "developer")) {
         if (!prompt_append(out, "<｜System｜>") || !prompt_append(out, text)) return false;
+        (void)suffix;
         state->pending = state->count > 0; state->user_open = false;
     } else if (!strcmp(role, "user") || !strcmp(role, "tool") || !strcmp(role, "function")) {
+        (void)suffix;
         if (!prompt_append(out, state->user_open ? "\n\n" : "<｜User｜>")) return false;
         if (!strcmp(role, "user") ? !prompt_append(out, text) : !prompt_tool_text(out, text)) return false;
         state->pending = state->user_open = true;
     } else if (!strcmp(role, "assistant")) {
         if (state->pending && !prompt_append(out, "<｜Assistant｜></think>")) return false;
-        if (!prompt_append(out, text) || !prompt_append(out, "<｜end▁of▁sentence｜>")) return false;
+        if (!prompt_append(out, text)) return false;
+        if (suffix && !prompt_append(out, suffix)) return false;   /* 工具调用在 EOS 之前 */
+        if (!prompt_append(out, "<｜end▁of▁sentence｜>")) return false;
         state->pending = state->user_open = false;
     } else return false;
     ++state->count; return true;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 工具调用（官方 DeepSeek-V4.1 格式）—— 见 docs/DEEPSEEK_V41_PROMPT_FORMAT.md
+ * 该模型 GGUF 无 chat_template、词表无工具控制符 ⇒ 格式全由这里渲染进提示词。
+ * DSML 标签名带【前导空格】（V4.1 相对 V4 的改动）：" calls" / " invoke" / " parameter"
+ * ══════════════════════════════════════════════════════════════════════════ */
+/* 注意：\x9c 后紧跟 D（十六进制位）会被并入转义 ⇒ 必须拆开字面量 */
+#define PROMPT_DSML              "\xef\xbd\x9c" "DSML" "\xef\xbd\x9c"   /* ｜DSML｜（全角竖线） */
+#define PROMPT_TOOL_CALLS_OPEN   "<" PROMPT_DSML " calls>"
+#define PROMPT_TOOL_CALLS_CLOSE  "</" PROMPT_DSML " calls>"
+#define PROMPT_TOOL_INVOKE_OPEN  "<" PROMPT_DSML " invoke name=\""
+#define PROMPT_TOOL_INVOKE_CLOSE "</" PROMPT_DSML " invoke>"
+#define PROMPT_TOOL_PARAM_OPEN   "<" PROMPT_DSML " parameter name=\""
+#define PROMPT_TOOL_PARAM_CLOSE  "</" PROMPT_DSML " parameter>"
+
+/* 工具名/参数名会被写进 DSML 属性 ⇒ 只允许安全字符，避免格式注入。 */
+static bool prompt_name_ok(const char *name) {
+    if (!name || !*name || strlen(name) > 128) return false;
+    for (const char *p = name; *p; ++p) {
+        char c = *p;
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                  c == '_' || c == '-' || c == '.' || c == ':' || c == '/' || c == ' ';
+        if (!ok) return false;
+    }
+    return true;
+}
+/* 取节点的原始 JSON 切片（含引号的字符串、或数字/对象等字面量）。 */
+static const char *prompt_node_raw(const prompt_json_t *j, const prompt_json_node_t *n, size_t *len) {
+    if (!n || !j->base || !n->len) return NULL;
+    if (len) *len = n->len;
+    return j->base + n->off;
+}
+
+/* 一行工具 schema：{"name":…[,"description":…][,"parameters":…]}
+ * 用【原始切片】拼装 ⇒ 参数 schema 逐字节原样，不会因重新序列化而失真。 */
+static bool prompt_append_tool_schema(prompt_buffer_t *out, const prompt_json_t *j,
+                                      const prompt_json_node_t *tool) {
+    if (!tool || tool->kind != PJ_OBJECT) return false;
+    bool valid = true;
+    const prompt_json_node_t *fn = prompt_json_field(j, tool, "function", &valid);
+    const prompt_json_node_t *base = (fn && fn->kind == PJ_OBJECT) ? fn : tool;
+    const prompt_json_node_t *name = prompt_json_field(j, base, "name", &valid);
+    const prompt_json_node_t *desc = prompt_json_field(j, base, "description", &valid);
+    const prompt_json_node_t *params = prompt_json_field(j, base, "parameters", &valid);
+    if (!valid || !name || name->kind != PJ_STRING || !prompt_name_ok(name->text)) return false;
+    size_t nlen = 0, dlen = 0, plen = 0;
+    const char *nraw = prompt_node_raw(j, name, &nlen);
+    const char *draw = prompt_node_raw(j, desc, &dlen);
+    const char *praw = prompt_node_raw(j, params, &plen);
+    if (!nraw) return false;
+    if (!prompt_append(out, "{\"name\":")) return false;
+    if (!prompt_append_n(out, nraw, nlen)) return false;
+    if (draw && desc->kind == PJ_STRING) {
+        if (!prompt_append(out, ",\"description\":")) return false;
+        if (!prompt_append_n(out, draw, dlen)) return false;
+    }
+    if (praw && params->kind == PJ_OBJECT) {
+        if (!prompt_append(out, ",\"parameters\":")) return false;
+        if (!prompt_append_n(out, praw, plen)) return false;
+    }
+    return prompt_append(out, "}");
+}
+
+/* 官方 TOOLS_TEMPLATE：追加到 system 消息之后（调用方负责先补 "\n\n"）。 */
+static bool prompt_render_tools(prompt_buffer_t *out, const prompt_json_t *j,
+                                const prompt_json_node_t *tools) {
+    if (!tools) return false;
+    if (!prompt_append(out,
+        "## Tools\n\n"
+        "You have access to a set of tools to help answer the user's question. You can invoke tools by writing a \""
+        PROMPT_TOOL_CALLS_OPEN "\" block like the following:\n\n"
+        PROMPT_TOOL_CALLS_OPEN "\n"
+        PROMPT_TOOL_INVOKE_OPEN "$TOOL_NAME\">\n"
+        PROMPT_TOOL_PARAM_OPEN "$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE" PROMPT_TOOL_PARAM_CLOSE "\n"
+        "...\n"
+        PROMPT_TOOL_INVOKE_CLOSE "\n"
+        PROMPT_TOOL_INVOKE_OPEN "$TOOL_NAME2\">\n"
+        "...\n"
+        PROMPT_TOOL_INVOKE_CLOSE "\n"
+        PROMPT_TOOL_CALLS_CLOSE "\n\n"
+        "String parameters should be specified as is and set `string=\"true\"`. For all other types "
+        "(numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\n"
+        "If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside "
+        "<think>...</think> BEFORE any tool calls or final response.\n\n"
+        "Otherwise, output directly after </think> with tool calls or final response.\n\n"
+        "### Available Tool Schemas\n\n")) return false;
+    size_t count = 0;
+    if (tools->kind == PJ_ARRAY) {
+        for (size_t i = (size_t)(tools - j->nodes) + 1; i < tools->next; i = j->nodes[i].next) {
+            if (count++ && !prompt_append(out, "\n")) return false;
+            if (!prompt_append_tool_schema(out, j, &j->nodes[i])) return false;
+        }
+    } else if (tools->kind == PJ_OBJECT) {
+        count = 1;
+        if (!prompt_append_tool_schema(out, j, tools)) return false;
+    } else return false;
+    if (!count) return false;
+    return prompt_append(out, "\n\nYou MUST strictly follow the above defined tool name and parameter "
+                              "schemas to invoke tool calls.");
+}
+
+/* assistant 历史里的工具调用 ⇒ DSML 块（返回值以 "\n\n" 开头，便于直接接到 content 之后）。 */
+static bool prompt_render_tool_call_block(prompt_buffer_t *out, const prompt_json_t *j,
+                                          const prompt_json_node_t *calls) {
+    if (!calls) return false;
+    /* 兼容三种形状：数组（OpenAI tool_calls）/ 单对象（function_call）/ 对象 */
+    const prompt_json_node_t *array = calls;
+    const prompt_json_node_t *single = NULL;
+    if (calls->kind == PJ_OBJECT) {
+        bool valid = true;
+        const prompt_json_node_t *inner = prompt_json_field(j, calls, "tool_calls", &valid);
+        if (inner && inner->kind == PJ_ARRAY) array = inner;
+        else if (!prompt_json_field(j, calls, "name", &valid)) return false;
+        else { array = NULL; single = calls; }
+    } else if (calls->kind != PJ_ARRAY) return false;
+
+    if (!prompt_append(out, "\n\n" PROMPT_TOOL_CALLS_OPEN "\n")) return false;
+    size_t emitted = 0;
+    size_t i = array ? (size_t)(array - j->nodes) + 1 : 0;
+    for (;;) {
+        const prompt_json_node_t *entry;
+        if (array) {
+            if (i >= array->next) break;
+            entry = &j->nodes[i];
+            i = j->nodes[i].next;
+        } else { entry = single; i = 0; if (emitted) break; }
+        if (!entry || entry->kind != PJ_OBJECT) return false;
+        bool valid = true;
+        const prompt_json_node_t *fn = prompt_json_field(j, entry, "function", &valid);
+        const prompt_json_node_t *base = (fn && fn->kind == PJ_OBJECT) ? fn : entry;
+        const prompt_json_node_t *name = prompt_json_field(j, base, "name", &valid);
+        const prompt_json_node_t *args = prompt_json_field(j, base, "arguments", &valid);
+        if (!args) args = prompt_json_field(j, base, "parameters", &valid);
+        if (!valid || !name || name->kind != PJ_STRING || !prompt_name_ok(name->text)) return false;
+        if (emitted++ && !prompt_append(out, "\n")) return false;
+        if (!prompt_append(out, PROMPT_TOOL_INVOKE_OPEN)) return false;
+        if (!prompt_append(out, name->text)) return false;
+        if (!prompt_append(out, "\">")) return false;
+
+        /* arguments 是 JSON 字符串（OpenAI）或对象；统一解析成对象再逐参数渲染。 */
+        const char *arg_text = NULL;
+        char *arg_copy = NULL;
+        if (!args || args->kind == PJ_NULL) {
+            /* 无参数 */
+        } else if (args->kind == PJ_STRING) {
+            arg_text = args->text;
+        } else if (args->kind == PJ_OBJECT) {
+            size_t alen = 0;
+            const char *araw = prompt_node_raw(j, args, &alen);
+            if (!araw) return false;
+            arg_copy = malloc(alen + 1);
+            if (!arg_copy) return false;
+            memcpy(arg_copy, araw, alen); arg_copy[alen] = 0; arg_text = arg_copy;
+        } else return false;
+
+        if (arg_text && *arg_text) {
+            prompt_json_t aj = {.cursor = arg_text, .base = arg_text};
+            if (!prompt_json_value(&aj, 0) || aj.nodes[0].kind != PJ_OBJECT) {
+                for (size_t k = 0; k < aj.count; ++k) free(aj.nodes[k].text);
+                free(aj.nodes); free(arg_copy);
+                /* 参数不是对象 ⇒ 按官方容错：包成 {"arguments": <原值>} */
+                if (!prompt_append(out, "\n" PROMPT_TOOL_PARAM_OPEN "arguments\" string=\"false\">")) {
+                    return false;
+                }
+                size_t rl = 0; const char *rraw = prompt_node_raw(j, args, &rl);
+                if (rraw && !prompt_append_n(out, rraw, rl)) return false;
+                if (!prompt_append(out, PROMPT_TOOL_PARAM_CLOSE)) return false;
+            } else {
+                if (!prompt_append(out, "\n")) { free(arg_copy); return false; }
+                size_t pn = 0;
+                for (size_t k = 1; k < aj.nodes[0].next;) {
+                    const prompt_json_node_t *key = &aj.nodes[k];
+                    const prompt_json_node_t *val = &aj.nodes[key->next];
+                    if (pn++ && !prompt_append(out, "\n")) break;
+                    if (!prompt_append(out, PROMPT_TOOL_PARAM_OPEN) ||
+                        !prompt_append(out, key->text ? key->text : "") ||
+                        !prompt_append(out, "\" string=\"")) break;
+                    if (val->kind == PJ_STRING) {
+                        if (!prompt_append(out, "true\">") || !prompt_append(out, val->text ? val->text : "")) break;
+                    } else {
+                        size_t vl = 0; const char *vraw = prompt_node_raw(&aj, val, &vl);
+                        if (!prompt_append(out, "false\">") || !vraw || !prompt_append_n(out, vraw, vl)) break;
+                    }
+                    if (!prompt_append(out, PROMPT_TOOL_PARAM_CLOSE)) break;
+                    k = val->next;
+                }
+                for (size_t k = 0; k < aj.count; ++k) free(aj.nodes[k].text);
+                free(aj.nodes);
+            }
+        }
+        free(arg_copy);
+        if (!prompt_append(out, "\n" PROMPT_TOOL_INVOKE_CLOSE)) return false;
+    }
+    if (!emitted) return false;
+    return prompt_append(out, "\n" PROMPT_TOOL_CALLS_CLOSE);
 }
 
 /* 失败原因（供日志与报错使用）。调用方每次进入前不必清空 —— 每个失败路径都会写它。 */
@@ -587,10 +801,10 @@ bool parse_chat_prompt_ex(const char *body, char *out_prompt, size_t max_prompt_
     if (!out_prompt || !max_prompt_len) { *why = "server misconfigured (no prompt buffer)"; return false; }
     out_prompt[0] = 0;
     if (!body) { *why = "no request body"; return false; }
-    prompt_json_t json = {.cursor = body};
+    prompt_json_t json = {.cursor = body, .base = body};
     prompt_buffer_t out = {out_prompt, max_prompt_len, 0, false};
     prompt_chat_state_t state = {0};
-    char *content_buffer = NULL; bool ok = false, valid = true;
+    char *content_buffer = NULL; char *suffix = NULL; bool ok = false, valid = true;
     if (!prompt_json_value(&json, 0)) { *why = "body is not valid JSON"; goto done; }
     prompt_json_ws(&json);
     if (*json.cursor || json.nodes[0].kind != PJ_OBJECT) { *why = "body is not a JSON object"; goto done; }
@@ -601,23 +815,49 @@ bool parse_chat_prompt_ex(const char *body, char *out_prompt, size_t max_prompt_
     const prompt_json_node_t *prompt = prompt_json_field(&json, root, "prompt", &valid);
     const prompt_json_node_t *tools = prompt_json_field(&json, root, "tools", &valid);
     const prompt_json_node_t *functions = prompt_json_field(&json, root, "functions", &valid);
-    if (!prompt_absent_or_empty(&json, tools) || !prompt_absent_or_empty(&json, functions)) {
-        *why = "the request declares tools/functions, which this server does not support";
-        goto done;
-    }
+    /* 工具定义：接受 tools（chat 嵌套 {"type","function":{…}} 或 Responses 扁平 {name,description,parameters}），
+     * 也接受旧式 functions。渲染成官方 TOOLS_TEMPLATE 追加到 system 消息之后。 */
+    bool has_tools = !prompt_absent_or_empty(&json, tools) || !prompt_absent_or_empty(&json, functions);
+    const prompt_json_node_t *tool_defs = !prompt_absent_or_empty(&json, tools) ? tools : functions;
     if (!valid) { *why = "malformed JSON in messages/input/prompt"; goto done; }
     if (!messages && !input && !prompt) { *why = "no messages, input or prompt field"; goto done; }
     if ((messages && input) || (prompt && (messages || input))) {
         *why = "messages, input and prompt are mutually exclusive";
         goto done;
     }
+    const prompt_json_node_t *items = messages ? messages : input ? input : prompt;
+    /* 工具块要插在 system 消息之后；先看 items 里有没有 system 角色。 */
+    bool system_in_items = false;
+    if (has_tools && items->kind == PJ_ARRAY) {
+        for (size_t i = (size_t)(items - json.nodes) + 1; i < items->next; i = json.nodes[i].next) {
+            bool v2 = true;
+            const prompt_json_node_t *r = prompt_json_field(&json, &json.nodes[i], "role", &v2);
+            if (r && r->kind == PJ_STRING && !strcmp(r->text, "system")) { system_in_items = true; break; }
+        }
+    }
+    bool tools_done = false;
     if (!prompt_append(&out, "<｜begin▁of▁sentence｜>")) goto done;
     if (instructions && instructions->kind != PJ_NULL) {
-        if (instructions->kind != PJ_STRING || !prompt_render_message(&out, &state, "system", instructions->text)) goto done;
+        if (instructions->kind != PJ_STRING ||
+            !prompt_render_message(&out, &state, "system", instructions->text, NULL)) goto done;
+        if (has_tools) {
+            if (!prompt_append(&out, "\n\n") || !prompt_render_tools(&out, &json, tool_defs)) {
+                *why = "invalid or oversized tool definitions (tools/functions)";
+                goto done;
+            }
+            tools_done = true;
+        }
+    } else if (has_tools && !system_in_items) {
+        /* 没有 system 消息：自建一条只装工具定义 */
+        if (!prompt_render_message(&out, &state, "system", "", NULL) ||
+            !prompt_append(&out, "\n\n") || !prompt_render_tools(&out, &json, tool_defs)) {
+            *why = "invalid or oversized tool definitions (tools/functions)";
+            goto done;
+        }
+        tools_done = true;
     }
-    const prompt_json_node_t *items = messages ? messages : input ? input : prompt;
     if (items->kind == PJ_STRING && !messages) {
-        if (!prompt_render_message(&out, &state, "user", items->text)) goto done;
+        if (!prompt_render_message(&out, &state, "user", items->text, NULL)) goto done;
     } else if (items->kind == PJ_ARRAY && !prompt) {
         if ((size_t)(items - json.nodes) + 1 == items->next) goto done;
         content_buffer = malloc(max_prompt_len);
@@ -629,10 +869,9 @@ bool parse_chat_prompt_ex(const char *body, char *out_prompt, size_t max_prompt_
             const prompt_json_node_t *content = prompt_json_field(&json, item, "content", &valid);
             const prompt_json_node_t *calls = prompt_json_field(&json, item, "tool_calls", &valid);
             const prompt_json_node_t *call = prompt_json_field(&json, item, "function_call", &valid);
-            if (!prompt_absent_or_empty(&json, calls) || !prompt_absent_or_empty(&json, call)) {
-                *why = "the message history contains tool_calls/function_call, which this server does not support";
-                goto done;
-            }
+            /* assistant 的工具调用 ⇒ DSML 块（接在 content 之后、EOS 之前） */
+            const prompt_json_node_t *tc = !prompt_absent_or_empty(&json, calls) ? calls
+                                         : (!prompt_absent_or_empty(&json, call) ? call : NULL);
             const char *role_text = role && role->kind == PJ_STRING ? role->text : "user";
             if (!valid || (role && role->kind != PJ_STRING) || (type && type->kind != PJ_STRING) || (messages && !role)) goto done;
             if (type && !strcmp(type->text, "function_call_output")) {
@@ -640,13 +879,37 @@ bool parse_chat_prompt_ex(const char *body, char *out_prompt, size_t max_prompt_
             } else if (type && strcmp(type->text, "message")) goto done;
             if (!content) content = prompt_json_field(&json, item, "text", &valid);
             prompt_buffer_t decoded = {content_buffer, max_prompt_len, 0, false}; content_buffer[0] = 0;
-            if (!valid || !prompt_content(&json, content, &decoded) || !prompt_render_message(&out, &state, role_text, content_buffer)) goto done;
+            /* 工具调用只能挂在 assistant 上；其余角色出现即视为请求有误 */
+            if (tc && strcmp(role_text, "assistant")) {
+                *why = "tool_calls/function_call is only supported on assistant messages";
+                goto done;
+            }
+            if (tc) {
+                suffix = malloc(max_prompt_len);
+                if (!suffix) goto done;
+                prompt_buffer_t sb = {suffix, max_prompt_len, 0, false};
+                if (!prompt_render_tool_call_block(&sb, &json, tc)) {
+                    *why = "malformed tool_calls/function_call in the message history";
+                    goto done;
+                }
+            }
+            if (!valid || !prompt_content(&json, content, &decoded) ||
+                !prompt_render_message(&out, &state, role_text, decoded.data, suffix)) goto done;
+            free(suffix); suffix = NULL;
+            if (!strcmp(role_text, "system") && has_tools && !tools_done) {
+                if (!prompt_append(&out, "\n\n") || !prompt_render_tools(&out, &json, tool_defs)) {
+                    *why = "invalid or oversized tool definitions (tools/functions)";
+                    goto done;
+                }
+                tools_done = true;
+            }
         }
     } else goto done;
     if (state.pending && !prompt_append(&out, "<｜Assistant｜></think>")) goto done;
     ok = true;
 done:
     if (!ok && out.overflow) *why = "the prompt does not fit the prompt buffer (request too large)";
+    free(suffix);
     free(content_buffer);
     for (size_t i = 0; i < json.count; ++i) free(json.nodes[i].text);
     free(json.nodes);
