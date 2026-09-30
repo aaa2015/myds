@@ -84,3 +84,8 @@ typedef struct { char *id; char *name; char *arguments; } myds_tool_call_t;
 bool myds_parse_completion_tool_calls(const char *text, size_t len, size_t *content_len,
                                       myds_tool_call_t **calls_out, size_t *count_out);
 void myds_free_tool_calls(myds_tool_call_t *calls, size_t count);
+
+/* 工具调用事件的发射（内部实现，暴露出来是为了让测试能直接校验产出的 JSON 合法性） */
+bool sse_emit_chat_tool_calls(myds_sse_stream_ctx_t *sctx, const myds_tool_call_t *calls, size_t count);
+bool sse_emit_responses_function_calls(myds_sse_stream_ctx_t *sctx,
+                                       const myds_tool_call_t *calls, size_t count);

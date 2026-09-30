@@ -1102,6 +1102,14 @@ bool myds_parse_completion_tool_calls(const char *text, size_t len, size_t *cont
 }
 
 #define DSML_PUTS(b, lit) dsml_put((b), (lit), strlen(lit))
+/* 小整数格式化（index 之类）——别用 %s 拼裸数字 */
+static bool dsml_putf(dsml_buf_t *b, const char *fmt, ...) {
+    char tmp[64];
+    va_list ap; va_start(ap, fmt);
+    int n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
+    va_end(ap);
+    return n > 0 && (size_t)n < sizeof(tmp) && dsml_put(b, tmp, (size_t)n);
+}
 static bool dsml_put_escaped(dsml_buf_t *b, const char *p, size_t n) {
     char *e = json_escape_alloc(p, n);
     if (!e) return false;
@@ -1296,7 +1304,7 @@ static char *chat_tool_calls_delta_json(const myds_tool_call_t *calls, size_t co
 }
 
 /* chat/completions：工具调用 delta + finish_reason=tool_calls + [DONE] */
-static bool sse_emit_chat_tool_calls(myds_sse_stream_ctx_t *sctx, const myds_tool_call_t *calls, size_t count) {
+bool sse_emit_chat_tool_calls(myds_sse_stream_ctx_t *sctx, const myds_tool_call_t *calls, size_t count) {
     char *tc = chat_tool_calls_delta_json(calls, count);
     if (!tc) return false;
     char *chunk = format_alloc(
@@ -1314,38 +1322,53 @@ static bool sse_emit_chat_tool_calls(myds_sse_stream_ctx_t *sctx, const myds_too
     return myds_server_send_all(sctx->client_fd, done, strlen(done));
 }
 
-/* Responses API：function_call 项的 added / arguments.delta / done */
-static bool sse_emit_responses_function_calls(myds_sse_stream_ctx_t *sctx,
+/* Responses API：function_call 项的 added / arguments.delta / done
+ * ★ 所有插值都必须【转义】—— arguments 本身就是含引号的 JSON 字符串，
+ *   直接 %s 进去会产出非法 JSON（客户端 json 解析直接失败）。
+ *   这一条曾经漏掉：事件看着是对的，但解析不了。 */
+bool sse_emit_responses_function_calls(myds_sse_stream_ctx_t *sctx,
                                               const myds_tool_call_t *calls, size_t count) {
     for (size_t i = 0; i < count; ++i) {
         char ids[96];
         snprintf(ids, sizeof(ids), "fc_%zu", i + 1);
-        char *added = format_alloc(
-            "event: response.output_item.added\n"
-            "data: {\"type\":\"response.output_item.added\",\"output_index\":%zu,\"item\":"
-            "{\"type\":\"function_call\",\"id\":\"%s\",\"call_id\":\"%s\",\"name\":\"%s\",\"arguments\":\"\","
-            "\"status\":\"in_progress\"}}\n\n", i, ids, calls[i].id, calls[i].name);
-        if (!added) return false;
-        bool sent = myds_server_send_all(sctx->client_fd, added, strlen(added));
-        free(added);
-        if (!sent) return false;
-        char *delta = format_alloc(
-            "event: response.function_call_arguments.delta\n"
-            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"%s\","
-            "\"output_index\":%zu,\"delta\":\"%s\"}\n\n", ids, i, calls[i].arguments);
-        if (!delta) return false;
-        sent = myds_server_send_all(sctx->client_fd, delta, strlen(delta));
-        free(delta);
-        if (!sent) return false;
-        char *done = format_alloc(
-            "event: response.output_item.done\n"
-            "data: {\"type\":\"response.output_item.done\",\"output_index\":%zu,\"item\":"
-            "{\"type\":\"function_call\",\"id\":\"%s\",\"call_id\":\"%s\",\"name\":\"%s\",\"arguments\":\"%s\","
-            "\"status\":\"completed\"}}\n\n", i, ids, calls[i].id, calls[i].name, calls[i].arguments);
-        if (!done) return false;
-        sent = myds_server_send_all(sctx->client_fd, done, strlen(done));
-        free(done);
-        if (!sent) return false;
+        dsml_buf_t ev = {0};
+        bool ok = true;
+        /* added */
+        ok = ok && DSML_PUTS(&ev, "event: response.output_item.added\n"
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":")
+            && dsml_putf(&ev, "%zu", i)
+            && DSML_PUTS(&ev, ",\"item\":{\"type\":\"function_call\",\"id\":\"")
+            && DSML_PUTS(&ev, ids)
+            && DSML_PUTS(&ev, "\",\"call_id\":\"")
+            && dsml_put_escaped(&ev, calls[i].id, strlen(calls[i].id))
+            && DSML_PUTS(&ev, "\",\"name\":\"")
+            && dsml_put_escaped(&ev, calls[i].name, strlen(calls[i].name))
+            && DSML_PUTS(&ev, "\",\"arguments\":\"\",\"status\":\"in_progress\"}}\n\n");
+        /* arguments delta */
+        ok = ok && DSML_PUTS(&ev, "event: response.function_call_arguments.delta\n"
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"")
+            && DSML_PUTS(&ev, ids)
+            && DSML_PUTS(&ev, "\",\"output_index\":")
+            && dsml_putf(&ev, "%zu", i)
+            && DSML_PUTS(&ev, ",\"delta\":\"")
+            && dsml_put_escaped(&ev, calls[i].arguments, strlen(calls[i].arguments))
+            && DSML_PUTS(&ev, "\"}\n\n");
+        /* done */
+        ok = ok && DSML_PUTS(&ev, "event: response.output_item.done\n"
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":")
+            && dsml_putf(&ev, "%zu", i)
+            && DSML_PUTS(&ev, ",\"item\":{\"type\":\"function_call\",\"id\":\"")
+            && DSML_PUTS(&ev, ids)
+            && DSML_PUTS(&ev, "\",\"call_id\":\"")
+            && dsml_put_escaped(&ev, calls[i].id, strlen(calls[i].id))
+            && DSML_PUTS(&ev, "\",\"name\":\"")
+            && dsml_put_escaped(&ev, calls[i].name, strlen(calls[i].name))
+            && DSML_PUTS(&ev, "\",\"arguments\":\"")
+            && dsml_put_escaped(&ev, calls[i].arguments, strlen(calls[i].arguments))
+            && DSML_PUTS(&ev, "\",\"status\":\"completed\"}}\n\n");
+        if (ok) ok = myds_server_send_all(sctx->client_fd, ev.data, ev.len);
+        free(ev.data);
+        if (!ok) return false;
     }
     return true;
 }

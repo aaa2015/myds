@@ -498,6 +498,147 @@ static void test_deepseek41_stream_tool_calls(void) {
     printf("  [PASS] V4.1 streaming DSML: the call block is withheld from content, including the newlines before it\n");
 }
 
+
+/* 真正的递归下降 JSON 校验（弱版只数引号/括号，抓不到「字符串外的裸 token」——
+ * 而那正是漏转义会产生的东西）。存在的意义：事件里 arguments 本身就是含引号的
+ * JSON 串，忘了转义会产出【看着像 JSON 但解析不了】的事件。 */
+static void json_ws(const char **pp, const char *e) {
+    while (*pp < e && (**pp == ' ' || **pp == '\t' || **pp == '\n' || **pp == '\r')) ++*pp;
+}
+static bool json_str(const char **pp, const char *e) {
+    const char *p = *pp;
+    if (p >= e || *p != '"') return false;
+    for (++p; p < e; ++p) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '\\') {
+            if (++p >= e) return false;
+            if (*p == 'u') { if (p + 4 >= e) return false; p += 4; }
+        } else if (c == '"') { *pp = p + 1; return true; }
+        else if (c < 0x20) return false;
+    }
+    return false;
+}
+static bool json_value(const char **pp, const char *e) {
+    json_ws(pp, e);
+    const char *p = *pp;
+    if (p >= e) return false;
+    if (*p == '{') {                                    /* 对象：键:值,键:值 */
+        ++p; json_ws(&p, e);
+        if (p < e && *p == '}') { *pp = p + 1; return true; }
+        for (;;) {
+            if (!json_str(&p, e)) return false;
+            json_ws(&p, e);
+            if (p >= e || *p != ':') return false;
+            ++p;
+            if (!json_value(&p, e)) return false;
+            json_ws(&p, e);
+            if (p < e && *p == ',') { ++p; json_ws(&p, e); continue; }
+            break;
+        }
+        json_ws(&p, e);
+        if (p >= e || *p != '}') return false;
+        *pp = p + 1; return true;
+    }
+    if (*p == '[') {                                    /* 数组：值,值 */
+        ++p; json_ws(&p, e);
+        if (p < e && *p == ']') { *pp = p + 1; return true; }
+        for (;;) {
+            if (!json_value(&p, e)) return false;
+            json_ws(&p, e);
+            if (p < e && *p == ',') { ++p; json_ws(&p, e); continue; }
+            break;
+        }
+        json_ws(&p, e);
+        if (p >= e || *p != ']') return false;
+        *pp = p + 1; return true;
+    }
+    if (*p == '"') { if (!json_str(&p, e)) return false; *pp = p; return true; }
+    if (p + 4 <= e && !strncmp(p, "true", 4)) { *pp = p + 4; return true; }
+    if (p + 5 <= e && !strncmp(p, "false", 5)) { *pp = p + 5; return true; }
+    if (p + 4 <= e && !strncmp(p, "null", 4)) { *pp = p + 4; return true; }
+    if (*p == '-' || (*p >= '0' && *p <= '9')) {
+        const char *q = p;
+        if (*q == '-') ++q;
+        if (q < e && *q == '0') ++q;
+        else { if (q >= e || *q < '1' || *q > '9') return false; while (q < e && *q >= '0' && *q <= '9') ++q; }
+        if (q < e && *q == '.') { ++q; if (q >= e || *q < '0' || *q > '9') return false; while (q < e && *q >= '0' && *q <= '9') ++q; }
+        if (q < e && (*q == 'e' || *q == 'E')) {
+            ++q; if (q < e && (*q == '+' || *q == '-')) ++q;
+            if (q >= e || *q < '0' || *q > '9') return false;
+            while (q < e && *q >= '0' && *q <= '9') ++q;
+        }
+        *pp = q; return true;
+    }
+    return false;
+}
+static bool json_valid(const char *p, size_t n) {
+    const char *e = p + n, *q = p;
+    if (!json_value(&q, e)) return false;
+    json_ws(&q, e);
+    return q == e;
+}
+/* 校验抓到的 SSE 流里每一行 `data: ` 都是合法 JSON */
+static void assert_sse_data_lines_valid(const char *bytes) {
+    const char *p = bytes;
+    size_t checked = 0;
+    while ((p = strstr(p, "data: ")) != NULL) {
+        p += 6;
+        const char *nl = strchr(p, '\n');
+        size_t n = nl ? (size_t)(nl - p) : strlen(p);
+        if (n == 6 && !memcmp(p, "[DONE]", 6)) continue;   /* [DONE] 不是 JSON */
+        if (!json_valid(p, n)) {
+            printf("  [FAIL] 非法 JSON 事件: %.*s\n", (int)n, p);
+            assert(0 && "SSE data line is not valid JSON");
+        }
+        ++checked;
+        p = nl ? nl : p + n;
+    }
+    assert(checked > 0);
+}
+
+/* 工具调用事件必须是【合法 JSON】（曾经漏转义 ⇒ 客户端解析直接失败） */
+static void test_tool_call_event_json(void) {
+    const char *DS = "\xef\xbd\x9c" "DSML" "\xef\xbd\x9c";
+    char text[2048];
+    /* 造一个 arguments 含引号的调用（正是会踩雷的输入） */
+    snprintf(text, sizeof(text),
+        "ok\n\n<%s calls>\n<%s invoke name=\"get_weather\">\n"
+        "<%s parameter name=\"city\" string=\"true\">Beijing</%s parameter>\n"
+        "</%s invoke>\n</%s calls>", DS,DS,DS,DS,DS,DS);
+    size_t clen = 0, n = 0;
+    myds_tool_call_t *tc = NULL;
+    assert(myds_parse_completion_tool_calls(text, strlen(text), &clen, &tc, &n));
+    assert(n == 1 && strcmp(tc[0].arguments, "{\"city\": \"Beijing\"}") == 0);
+
+    /* chat 流式 */
+    int s1[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, s1) == 0);
+    socket_capture_t c1 = {.fd = s1[1]};
+    pthread_t r1; assert(pthread_create(&r1, NULL, capture_socket, &c1) == 0);
+    myds_sse_stream_ctx_t st1 = {.client_fd = s1[0]};
+    assert(sse_emit_chat_tool_calls(&st1, tc, n));
+    assert(shutdown(s1[0], SHUT_WR) == 0);
+    assert(pthread_join(r1, NULL) == 0);
+    assert_sse_data_lines_valid(c1.bytes);
+    assert(strstr(c1.bytes, "finish_reason\":\"tool_calls\"") != NULL);
+    assert(strstr(c1.bytes, "\\\"city\\\"") != NULL);        /* 引号必须是转义后的 */
+    free(c1.bytes); close(s1[0]); close(s1[1]);
+
+    /* Responses 流式 */
+    int s2[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, s2) == 0);
+    socket_capture_t c2 = {.fd = s2[1]};
+    pthread_t r2; assert(pthread_create(&r2, NULL, capture_socket, &c2) == 0);
+    myds_sse_stream_ctx_t st2 = {.client_fd = s2[0]};
+    assert(sse_emit_responses_function_calls(&st2, tc, n));
+    assert(shutdown(s2[0], SHUT_WR) == 0);
+    assert(pthread_join(r2, NULL) == 0);
+    assert_sse_data_lines_valid(c2.bytes);
+    assert(strstr(c2.bytes, "\\\"city\\\"") != NULL);
+    free(c2.bytes); close(s2[0]); close(s2[1]);
+
+    myds_free_tool_calls(tc, n);
+    printf("  [PASS] tool call events are valid JSON in both protocols (arguments escaped)\n");
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && !strcmp(argv[1], "--render")) {
         size_t capacity = strlen(argv[2]) * 4 + 1024;
@@ -511,6 +652,7 @@ int main(int argc, char **argv) {
     test_deepseek41_tool_calls();
     test_deepseek41_dsml_parse();
     test_deepseek41_stream_tool_calls();
+    test_tool_call_event_json();
     printf("====================================================\n");
     printf("       Running myds Server API Unit Tests           \n");
     printf("====================================================\n");
