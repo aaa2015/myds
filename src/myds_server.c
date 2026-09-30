@@ -836,7 +836,7 @@ bool parse_chat_prompt_ex(const char *body, char *out_prompt, size_t max_prompt_
         }
     }
     bool tools_done = false;
-    if (!prompt_append(&out, "<｜begin▁of▁sentence｜>")) goto done;
+    if (!prompt_append(&out, "<｜begin▁of▁sentence｜>")) { *why = "the prompt buffer is too small"; goto done; }
     if (instructions && instructions->kind != PJ_NULL) {
         if (instructions->kind != PJ_STRING ||
             !prompt_render_message(&out, &state, "system", instructions->text, NULL)) goto done;
@@ -859,7 +859,7 @@ bool parse_chat_prompt_ex(const char *body, char *out_prompt, size_t max_prompt_
     if (items->kind == PJ_STRING && !messages) {
         if (!prompt_render_message(&out, &state, "user", items->text, NULL)) goto done;
     } else if (items->kind == PJ_ARRAY && !prompt) {
-        if ((size_t)(items - json.nodes) + 1 == items->next) goto done;
+        if ((size_t)(items - json.nodes) + 1 == items->next) { *why = "the message list is empty"; goto done; }
         content_buffer = malloc(max_prompt_len);
         if (!content_buffer) goto done;
         for (size_t i = (size_t)(items - json.nodes) + 1; i < items->next; i = json.nodes[i].next) {
@@ -873,10 +873,23 @@ bool parse_chat_prompt_ex(const char *body, char *out_prompt, size_t max_prompt_
             const prompt_json_node_t *tc = !prompt_absent_or_empty(&json, calls) ? calls
                                          : (!prompt_absent_or_empty(&json, call) ? call : NULL);
             const char *role_text = role && role->kind == PJ_STRING ? role->text : "user";
-            if (!valid || (role && role->kind != PJ_STRING) || (type && type->kind != PJ_STRING) || (messages && !role)) goto done;
+            if (!valid || (role && role->kind != PJ_STRING) || (type && type->kind != PJ_STRING) || (messages && !role)) {
+                *why = "a message has a malformed role/type field";
+                goto done;
+            }
+            bool content_optional = false;
             if (type && !strcmp(type->text, "function_call_output")) {
                 content = prompt_json_field(&json, item, "output", &valid); role_text = "tool";
-            } else if (type && strcmp(type->text, "message")) goto done;
+            } else if (type && !strcmp(type->text, "function_call")) {
+                /* Responses API 的标准多轮形状：把上一轮模型的 function_call 原样发回来。
+                 * 它是一条【assistant 项】，name/arguments 就在这一层 ⇒ 直接当工具调用渲染。 */
+                role_text = "assistant";
+                tc = item;
+                content_optional = true;
+            } else if (type && strcmp(type->text, "message")) {
+                *why = "a message has an unsupported \"type\" value";
+                goto done;
+            }
             if (!content) content = prompt_json_field(&json, item, "text", &valid);
             prompt_buffer_t decoded = {content_buffer, max_prompt_len, 0, false}; content_buffer[0] = 0;
             /* 工具调用只能挂在 assistant 上；其余角色出现即视为请求有误 */
@@ -886,15 +899,25 @@ bool parse_chat_prompt_ex(const char *body, char *out_prompt, size_t max_prompt_
             }
             if (tc) {
                 suffix = malloc(max_prompt_len);
-                if (!suffix) goto done;
+                if (!suffix) { *why = "out of memory rendering tool calls"; goto done; }
                 prompt_buffer_t sb = {suffix, max_prompt_len, 0, false};
                 if (!prompt_render_tool_call_block(&sb, &json, tc)) {
                     *why = "malformed tool_calls/function_call in the message history";
                     goto done;
                 }
             }
-            if (!valid || !prompt_content(&json, content, &decoded) ||
-                !prompt_render_message(&out, &state, role_text, decoded.data, suffix)) goto done;
+            if (!valid) { *why = "malformed content in the message history"; goto done; }
+            /* function_call 项没有 content（name/arguments 在这一层）⇒ 正文按空处理 */
+            if (content_optional && !content) {
+                decoded.data[0] = 0;
+            } else if (!prompt_content(&json, content, &decoded)) {
+                *why = "unsupported content block in the message history";
+                goto done;
+            }
+            if (!prompt_render_message(&out, &state, role_text, decoded.data, suffix)) {
+                *why = "a message could not be rendered (or the prompt buffer is full)";
+                goto done;
+            }
             free(suffix); suffix = NULL;
             if (!strcmp(role_text, "system") && has_tools && !tools_done) {
                 if (!prompt_append(&out, "\n\n") || !prompt_render_tools(&out, &json, tool_defs)) {
@@ -904,7 +927,7 @@ bool parse_chat_prompt_ex(const char *body, char *out_prompt, size_t max_prompt_
                 tools_done = true;
             }
         }
-    } else goto done;
+    } else { *why = "messages/input must be a string or an array"; goto done; }
     if (state.pending && !prompt_append(&out, "<｜Assistant｜></think>")) goto done;
     ok = true;
 done:

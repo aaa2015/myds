@@ -369,6 +369,27 @@ static void test_deepseek41_tool_calls(void) {
     assert(strstr(output, "<｜DSML｜ invoke name=\"lookup\">") != NULL);
     assert(strstr(output, "<｜DSML｜ parameter name=\"q\" string=\"true\">x</｜DSML｜ parameter>") != NULL);
 
+    /* ④b Responses 标准多轮形状：把上一轮的 function_call 原样发回来 */
+    const char *resp_multi =
+        "{\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Weather?\"}]},"
+        "{\"type\":\"function_call\",\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Beijing\\\"}\",\"call_id\":\"call_1\"},"
+        "{\"type\":\"function_call_output\",\"call_id\":\"call_1\",\"output\":\"sunny\"}]}";
+    assert(parse_chat_prompt(resp_multi, output, sizeof(output)));
+    assert(strstr(output, "<｜DSML｜ invoke name=\"get_weather\">") != NULL);
+    assert(strstr(output, "<｜DSML｜ parameter name=\"city\" string=\"true\">Beijing</｜DSML｜ parameter>") != NULL);
+    assert(strstr(output, "<tool_result>sunny</tool_result>") != NULL);
+    /* 正文为空的 function_call 项也要能渲染（name/arguments 在该项自身） */
+    assert(strstr(output, "<｜User｜>Weather?") != NULL);
+
+    /* ④c 不支持的类型必须给出【可诊断】的原因，而不是笼统文案 */
+    const char *bad_type =
+        "{\"input\":[{\"role\":\"user\",\"content\":\"hi\"},{\"type\":\"reasoning\",\"summary\":[]}]}";
+    char reason_buf[256];
+    const char *why = NULL;
+    assert(!parse_chat_prompt_ex(bad_type, output, sizeof(output), &why));
+    assert(why && strstr(why, "unsupported") != NULL);
+    (void)reason_buf;
+
     /* ⑤ 非 assistant 角色挂 tool_calls ⇒ 拒绝（格式只对 assistant 有意义） */
     char small[4096];
     assert(!parse_chat_prompt("{\"messages\":[{\"role\":\"user\",\"content\":\"hi\","
