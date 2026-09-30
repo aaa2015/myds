@@ -58,6 +58,10 @@ const char *find_matching_brace(const char *start);
 void extract_message_text(const char *obj_buf, char *out, size_t out_size);
 /* False rejects malformed/unsupported JSON or insufficient capacity; output is empty. */
 bool parse_chat_prompt(const char *body, char *out_prompt, size_t max_prompt_len);
+/* 同上，但把【失败原因】回传给调用方（服务端用它写日志与精确报错）。
+ * 两者原本共用一个笼统文案，导致「带 tools 被拒」与「提示词太大」在线上无法区分。 */
+bool parse_chat_prompt_ex(const char *body, char *out_prompt, size_t max_prompt_len,
+                          const char **out_reason);
 
 #ifdef __cplusplus
 }

@@ -362,7 +362,9 @@ typedef struct {
     prompt_json_node_t *nodes;
     size_t count, capacity;
 } prompt_json_t;
-typedef struct { char *data; size_t capacity, length; } prompt_buffer_t;
+/* overflow 用来把【缓冲不够】与【形状不支持】区分开：两者原本都只是 return false，
+ * 于是一个「工具调用被拒」和一个「提示词太大」会给出完全相同的报错。 */
+typedef struct { char *data; size_t capacity, length; bool overflow; } prompt_buffer_t;
 
 static void prompt_json_ws(prompt_json_t *j) {
     while (*j->cursor == ' ' || *j->cursor == '\t' || *j->cursor == '\r' || *j->cursor == '\n') ++j->cursor;
@@ -529,7 +531,7 @@ static bool prompt_absent_or_empty(const prompt_json_t *j, const prompt_json_nod
 }
 static bool prompt_append(prompt_buffer_t *b, const char *text) {
     size_t length = strlen(text);
-    if (b->length >= b->capacity || length >= b->capacity - b->length) return false;
+    if (b->length >= b->capacity || length >= b->capacity - b->length) { b->overflow = true; return false; }
     memcpy(b->data + b->length, text, length + 1); b->length += length; return true;
 }
 static bool prompt_content(const prompt_json_t *j, const prompt_json_node_t *content, prompt_buffer_t *out) {
@@ -575,17 +577,23 @@ static bool prompt_render_message(prompt_buffer_t *out, prompt_chat_state_t *sta
     ++state->count; return true;
 }
 
-bool parse_chat_prompt(const char *body, char *out_prompt, size_t max_prompt_len) {
-    if (!out_prompt || !max_prompt_len) return false;
+/* 失败原因（供日志与报错使用）。调用方每次进入前不必清空 —— 每个失败路径都会写它。 */
+bool parse_chat_prompt_ex(const char *body, char *out_prompt, size_t max_prompt_len,
+                          const char **out_reason) {
+    const char **why = out_reason;
+    const char *local_why = "unsupported prompt shape";
+    if (!why) why = &local_why;
+    *why = "unsupported prompt shape";
+    if (!out_prompt || !max_prompt_len) { *why = "server misconfigured (no prompt buffer)"; return false; }
     out_prompt[0] = 0;
-    if (!body) return false;
+    if (!body) { *why = "no request body"; return false; }
     prompt_json_t json = {.cursor = body};
-    prompt_buffer_t out = {out_prompt, max_prompt_len, 0};
+    prompt_buffer_t out = {out_prompt, max_prompt_len, 0, false};
     prompt_chat_state_t state = {0};
     char *content_buffer = NULL; bool ok = false, valid = true;
-    if (!prompt_json_value(&json, 0)) goto done;
+    if (!prompt_json_value(&json, 0)) { *why = "body is not valid JSON"; goto done; }
     prompt_json_ws(&json);
-    if (*json.cursor || json.nodes[0].kind != PJ_OBJECT) goto done;
+    if (*json.cursor || json.nodes[0].kind != PJ_OBJECT) { *why = "body is not a JSON object"; goto done; }
     const prompt_json_node_t *root = &json.nodes[0];
     const prompt_json_node_t *instructions = prompt_json_field(&json, root, "instructions", &valid);
     const prompt_json_node_t *messages = prompt_json_field(&json, root, "messages", &valid);
@@ -593,8 +601,16 @@ bool parse_chat_prompt(const char *body, char *out_prompt, size_t max_prompt_len
     const prompt_json_node_t *prompt = prompt_json_field(&json, root, "prompt", &valid);
     const prompt_json_node_t *tools = prompt_json_field(&json, root, "tools", &valid);
     const prompt_json_node_t *functions = prompt_json_field(&json, root, "functions", &valid);
-    if (!prompt_absent_or_empty(&json, tools) || !prompt_absent_or_empty(&json, functions)) goto done;
-    if (!valid || (!messages && !input && !prompt) || (messages && input) || (prompt && (messages || input))) goto done;
+    if (!prompt_absent_or_empty(&json, tools) || !prompt_absent_or_empty(&json, functions)) {
+        *why = "the request declares tools/functions, which this server does not support";
+        goto done;
+    }
+    if (!valid) { *why = "malformed JSON in messages/input/prompt"; goto done; }
+    if (!messages && !input && !prompt) { *why = "no messages, input or prompt field"; goto done; }
+    if ((messages && input) || (prompt && (messages || input))) {
+        *why = "messages, input and prompt are mutually exclusive";
+        goto done;
+    }
     if (!prompt_append(&out, "<｜begin▁of▁sentence｜>")) goto done;
     if (instructions && instructions->kind != PJ_NULL) {
         if (instructions->kind != PJ_STRING || !prompt_render_message(&out, &state, "system", instructions->text)) goto done;
@@ -613,25 +629,34 @@ bool parse_chat_prompt(const char *body, char *out_prompt, size_t max_prompt_len
             const prompt_json_node_t *content = prompt_json_field(&json, item, "content", &valid);
             const prompt_json_node_t *calls = prompt_json_field(&json, item, "tool_calls", &valid);
             const prompt_json_node_t *call = prompt_json_field(&json, item, "function_call", &valid);
-            if (!prompt_absent_or_empty(&json, calls) || !prompt_absent_or_empty(&json, call)) goto done;
+            if (!prompt_absent_or_empty(&json, calls) || !prompt_absent_or_empty(&json, call)) {
+                *why = "the message history contains tool_calls/function_call, which this server does not support";
+                goto done;
+            }
             const char *role_text = role && role->kind == PJ_STRING ? role->text : "user";
             if (!valid || (role && role->kind != PJ_STRING) || (type && type->kind != PJ_STRING) || (messages && !role)) goto done;
             if (type && !strcmp(type->text, "function_call_output")) {
                 content = prompt_json_field(&json, item, "output", &valid); role_text = "tool";
             } else if (type && strcmp(type->text, "message")) goto done;
             if (!content) content = prompt_json_field(&json, item, "text", &valid);
-            prompt_buffer_t decoded = {content_buffer, max_prompt_len, 0}; content_buffer[0] = 0;
+            prompt_buffer_t decoded = {content_buffer, max_prompt_len, 0, false}; content_buffer[0] = 0;
             if (!valid || !prompt_content(&json, content, &decoded) || !prompt_render_message(&out, &state, role_text, content_buffer)) goto done;
         }
     } else goto done;
     if (state.pending && !prompt_append(&out, "<｜Assistant｜></think>")) goto done;
     ok = true;
 done:
+    if (!ok && out.overflow) *why = "the prompt does not fit the prompt buffer (request too large)";
     free(content_buffer);
     for (size_t i = 0; i < json.count; ++i) free(json.nodes[i].text);
     free(json.nodes);
     if (!ok) out_prompt[0] = 0;
     return ok;
+}
+
+/* 兼容包装：测试与其它调用方沿用旧的三参签名（它们不关心失败原因）。 */
+bool parse_chat_prompt(const char *body, char *out_prompt, size_t max_prompt_len) {
+    return parse_chat_prompt_ex(body, out_prompt, max_prompt_len, NULL);
 }
 
 static inline double myds_server_now_s(void) {
@@ -894,9 +919,16 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             close(client_fd);
             return;
         }
-        if (!parse_chat_prompt(body, prompt, prompt_cap)) {
-            send_response(client_fd, 400, "Bad Request", "application/json",
-                          "{\"error\":{\"message\":\"Invalid or unsupported text prompt, or prompt exceeds buffer capacity\",\"type\":\"invalid_request_error\"}}");
+        const char *parse_reason = NULL;
+        if (!parse_chat_prompt_ex(body, prompt, prompt_cap, &parse_reason)) {
+            /* 必须落日志：此前这条路径【完全不记录】，导致线上只能看到一个笼统的 400。 */
+            MYDS_LOG_W("[%s:%d] ChatCompletions rejected (400): %s [body=%zd bytes, prompt_cap=%zu]",
+                       client_ip, client_port, parse_reason, total_read, prompt_cap);
+            char err[512];
+            snprintf(err, sizeof(err),
+                     "{\"error\":{\"message\":\"Invalid or unsupported text prompt: %s\",\"type\":\"invalid_request_error\"}}",
+                     parse_reason ? parse_reason : "unknown");
+            send_response(client_fd, 400, "Bad Request", "application/json", err);
             free(prompt);
             free(req_buf);
             close(client_fd);
