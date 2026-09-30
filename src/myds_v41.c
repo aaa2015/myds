@@ -996,7 +996,12 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 TRACE("kv_norm", cw->kv_act[t], 512);
                 TRACE("kv_rope", cw->kv_act[t], 512);
                 TRACE("kv_quant", cw->kv_act[t], 512);
-                CHECK(myds_metal_buffer_copy(g->window[il], (size_t)(pos % 128) * 512 * 4u, cw->kv_act[t], 0, 512 * 4u));
+                /* The sliding-window ring is deliberately NOT written here.  Writing the
+                 * whole chunk first and reading it afterwards made each token read the
+                 * last tokens of the chunk instead of its own window, because the ring
+                 * only holds V41_WINDOW slots.  It is written per token in the attention
+                 * loop below, immediately before it is read, which is the order the
+                 * per-token path uses. */
             }
             TIME_ACC(prof_step2);
 
@@ -1064,6 +1069,12 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     CHECK(myds_v41_gpu_gather(g->selected_kv, g->compressed[owner_for(il)], cw->cur_selected_view, count, top));
                 }
                 uint32_t nraw = pos + 1u < 128 ? pos + 1u : 128;
+
+                /* Publish this token's KV into the ring immediately before reading it,
+                 * so the nraw keys attention sees are exactly the tokens in
+                 * [pos+1-nraw, pos].  myds_metal_buffer_copy brackets itself with buffer
+                 * memory barriers, so no extra barrier is needed between the two. */
+                CHECK(myds_metal_buffer_copy(g->window[il], (size_t)(pos % 128) * 512 * 4u, cw->kv_act[t], 0, 512 * 4u));
 
                 phase = "attention reduction";
                 CHECK(myds_v41_gpu_attention(cw->attn_heads[t], base->attn_sinks, cw->q[t], g->window[il], nraw, (pos + 1u - nraw) % 128, g->selected_kv, top, g->gpu));
