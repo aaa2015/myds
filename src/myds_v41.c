@@ -850,6 +850,9 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     double prof_step1 = 0, prof_step2 = 0, prof_step3 = 0, prof_step4 = 0, prof_step5 = 0;
     double prof_step6 = 0, prof_step7 = 0, prof_step8 = 0;
     double prof_wait_qkv = 0, prof_wait_swa = 0, prof_wait_ffn_router = 0, prof_wait_moe = 0;
+    double prof_wait_indexer = 0;   /* 诊断：Step 4 里 indexer 部分的 GPU 等待 */
+    double prof_wait_attn2 = 0;     /* 诊断：ring+attention 的 GPU 等待 */
+    double prof_wait_bf16 = 0;      /* 诊断：attn_heads 的 bf16 转换 */
     uint64_t disp_step14 = 0, disp_step58 = 0, disp_layer_all = 0;  /* 诊断 */
     uint64_t disp_step4loop = 0;  /* 诊断：仅 Step4 逐 token 循环 */
     struct timeval ptv0, ptv1, ptv_all0, ptv_all1;
@@ -1074,6 +1077,15 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                                          (il == 20) ? cw->cur_mask_view : NULL));
             }
 
+            /* 诊断：把 Step 4 切成 indexer / attention 两段，各自测 GPU 等待。
+             * 不开这个开关时行为与原来完全一致（一次 commit 都不多）。 */
+            if (do_prof && getenv("MYDS_PROFILE_SPLIT")) {
+                TIME_START();
+                CHECK(myds_metal_commit_batch());
+                TIME_ACC(prof_wait_indexer);
+                CHECK(myds_metal_begin_batch());
+            }
+
             /* Sliding window ring: the chunk's slots are consecutive modulo the ring, so
              * two copies cover the chunk instead of one per token.  Nothing reads the ring
              * during prefill any more (the batched attention reads the slab), but the
@@ -1114,7 +1126,23 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
              * attn_heads_buf is disjoint, so they run once for the whole chunk instead of once per
              * token.  That removes two dispatches per token per layer.  Positions in the chunk are
              * consecutive, which is what the batched RoPE wants. */
+            /* 诊断：把 Step 4 尾部再切一刀 —— attention 与 bf16/rope 分开计等待 */
+            if (do_prof && getenv("MYDS_PROFILE_SPLIT2")) {
+                TIME_START();
+                CHECK(myds_metal_commit_batch());
+                TIME_ACC(prof_wait_attn2);
+                CHECK(myds_metal_begin_batch());
+            }
+
             CHECK(myds_metal_v41_bf16(cw->attn_heads_buf, V41_HEADS * 512 * c_len));
+            /* 诊断：bf16 与 rope 分开计等待 */
+            if (do_prof && getenv("MYDS_PROFILE_SPLIT3")) {
+                TIME_START();
+                CHECK(myds_metal_commit_batch());
+                TIME_ACC(prof_wait_bf16);
+                CHECK(myds_metal_begin_batch());
+            }
+
             CHECK(myds_v41_gpu_rope_batch(cw->attn_heads_buf, 512, V41_HEADS, base_pos + c_start, c_len, compressed, true));
 
             if (do_prof) { disp_step4loop += myds_metal_dispatch_count() - disp_loop0; }  /* 诊断 */
@@ -1276,6 +1304,12 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         printf("Wait Proj (GPU)       : %8.2f ms\n", prof_wait_qkv);
         printf("Step 4 (SWA Attention): %8.2f ms\n", prof_step4);
         printf("Wait SWA (GPU)        : %8.2f ms\n", prof_wait_swa);
+        if (getenv("MYDS_PROFILE_SPLIT"))
+            printf("  ...of which indexer  : %8.2f ms\n", prof_wait_indexer);
+        if (getenv("MYDS_PROFILE_SPLIT2"))
+            printf("  ...ring+attention    : %8.2f ms\n", prof_wait_attn2);
+        if (getenv("MYDS_PROFILE_SPLIT3"))
+            printf("  ...bf16(attn_heads)  : %8.2f ms  (rope = remainder)\n", prof_wait_bf16);
         printf("Step 5 (Attn Out B)   : %8.2f ms\n", prof_step5);
         printf("Step 6 (HC FFN In)    : %8.2f ms\n", prof_step6);
         printf("Step 7 (Shared+Route) : %8.2f ms\n", prof_step7);
@@ -1297,7 +1331,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                    layer_iters ? (double)disp_step4loop / (double)layer_iters : 0.0);
         }
         printf("Total Steps Sum       : %8.2f ms\n",
-               prof_step1 + prof_step2 + prof_step3 + prof_wait_qkv + prof_step4 + prof_wait_swa +
+               prof_step1 + prof_step2 + prof_step3 + prof_wait_qkv + prof_step4 + prof_wait_indexer + prof_wait_attn2 + prof_wait_bf16 + prof_wait_swa +
                prof_step5 + prof_step6 + prof_step7 + prof_wait_ffn_router + prof_step8 + prof_wait_moe);
         fflush(stdout);
     }

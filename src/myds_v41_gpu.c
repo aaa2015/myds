@@ -264,6 +264,13 @@ int myds_v41_gpu_attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buf
        (n_comp&&(!comp_kv||!floats(comp_kv,(uint64_t)n_comp*512)||
                  !ids||!floats(ids,(uint64_t)c_len*top_k))))return 0;
 
+    /* 诊断：把压缩键数强行调小，【只影响 attention 读取的 K/V 量，不影响 dispatch 结构】，
+     * 用来判断这 8 秒是不是 K/V 带宽 bound。结果不完整，仅计时。 */
+    if(getenv("MYDS_ATTN_KEYS_CLAMP")) {
+        uint32_t cl=(uint32_t)strtoul(getenv("MYDS_ATTN_KEYS_CLAMP"),NULL,10);
+        if(cl&&cl<n_comp)n_comp=cl;
+    }
+
     const uint32_t p0=base_pos+c_start;
     const uint32_t carry=p0<MYDS_CHUNK_CARRY?p0:MYDS_CHUNK_CARRY;
     if(s->tmpl_len!=c_len||s->tmpl_carry!=carry)
