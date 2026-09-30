@@ -4,7 +4,8 @@
 #include <stddef.h>
 #include <stdlib.h>
 
-struct route_args { uint32_t count, top_k, op; float scale; };
+/* 必须与 metal/myds_v41_moe.metal 的 myds_v41_route_args 逐字段一致 */
+struct route_args { uint32_t count, top_k, op; float scale; uint32_t rows, row, row4; };
 struct sort_args {
     int32_t ne00, ne01, ne02, ne03;
     uint64_t nb00, nb01, nb02, nb03;
@@ -28,49 +29,62 @@ static int dispatch(const char *kernel, const void *args, size_t size,
     return myds_metal_dispatch_kernel(kernel, args, size, buffers, count, grid, block, scratch);
 }
 
-int myds_v41_route(myds_metal_buffer_t *selected, myds_metal_buffer_t *weights,
+int myds_v41_route_batch(myds_metal_buffer_t *selected, myds_metal_buffer_t *weights,
     myds_metal_buffer_t *probs, myds_metal_buffer_t *scores,
     const myds_metal_buffer_t *logits, const myds_metal_buffer_t *bias,
-    uint32_t experts, uint32_t top_k, float scale) {
-    if (experts != 384 || top_k != 6 || !isfinite(scale) || scale <= 0 ||
-        !sized(selected, top_k) || !sized(weights, top_k) ||
-        !sized(probs, experts) || !sized(scores, experts) ||
-        !sized(logits, experts) || !sized(bias, experts)) return 0;
-    struct route_args args = {experts, top_k, 0, scale};
+    uint32_t experts, uint32_t top_k, float scale, uint32_t rows) {
+    if (experts != 384 || top_k != 6 || !isfinite(scale) || scale <= 0 || rows == 0 ||
+        !sized(selected, (size_t)top_k * rows) || !sized(weights, (size_t)top_k * rows) ||
+        !sized(probs, (size_t)experts * rows) || !sized(scores, (size_t)experts * rows) ||
+        !sized(logits, (size_t)experts * rows) || !sized(bias, experts)) return 0;
+    const uint64_t total = (uint64_t)experts * (uint64_t)rows;
+    struct route_args args = {(uint32_t)total, top_k, 0, scale, rows, experts, experts / 4u};
+    const uint32_t tgroups = (uint32_t)((total / 4u + 31u) / 32u);
+
     const myds_metal_buffer_t *softplus[] = {logits, bias, probs};
     args.op = 0;
     if (!dispatch("kernel_myds_v41_route_transform", &args, sizeof(args), softplus, 3,
-                  (experts/4+31)/32, 32, 0)) {
+                  tgroups, 32, 0)) {
         MYDS_LOG_E("V4.1 route transform dispatch failed");
         return 0;
     }
     const myds_metal_buffer_t *sqrt_buffers[] = {probs, bias, probs};
     args.op = 1;
     if (!dispatch("kernel_myds_v41_route_transform", &args, sizeof(args), sqrt_buffers, 3,
-                  (experts/4+31)/32, 32, 0)) return 0;
+                  tgroups, 32, 0)) return 0;
     const myds_metal_buffer_t *add[] = {probs, bias, scores};
     args.op = 2;
     if (!dispatch("kernel_myds_v41_route_transform", &args, sizeof(args), add, 3,
-                  (experts/4+31)/32, 32, 0)) {
+                  tgroups, 32, 0)) {
         MYDS_LOG_E("V4.1 route bias dispatch failed");
         return 0;
     }
-    const uint64_t row = (uint64_t)experts * sizeof(float);
-    struct sort_args sort = {.ne00=(int32_t)experts,.ne01=1,.ne02=1,.ne03=1,
-        .nb00=4,.nb01=row,.nb02=row,.nb03=row,.ne0=(int32_t)top_k,
+
+    /* One row per threadgroup: the kernel already indexes rows by tgpig[0] % ne01. */
+    const uint64_t row_bytes = (uint64_t)experts * sizeof(float);
+    struct sort_args sort = {.ne00=(int32_t)experts,.ne01=(int32_t)rows,.ne02=1,.ne03=1,
+        .nb00=4,.nb01=row_bytes,.nb02=row_bytes,.nb03=row_bytes,.ne0=(int32_t)top_k,
         .ne1=1,.ne2=1,.ne3=1,.top_k=(int32_t)top_k};
     const myds_metal_buffer_t *sort_buffers[] = {scores, selected};
     if (!dispatch("kernel_argsort_f32_i32_desc", &sort, sizeof(sort), sort_buffers, 2,
-                  1, 512, 512 * (sizeof(int32_t) + sizeof(float)))) {
+                  rows, 512, 512 * (sizeof(int32_t) + sizeof(float)))) {
         MYDS_LOG_E("V4.1 route top-k dispatch failed");
         return 0;
     }
     const myds_metal_buffer_t *sum[] = {probs, selected, weights, scores};
     const myds_metal_buffer_t *divide[] = {weights, scores};
     const myds_metal_buffer_t *multiply[] = {weights};
-    return dispatch("kernel_myds_v41_route_sum", &args, sizeof(args), sum, 4, 1, top_k, 128) &&
-        dispatch("kernel_myds_v41_route_divide", &args, sizeof(args), divide, 2, 1, top_k, 0) &&
-        dispatch("kernel_myds_v41_route_scale", &args, sizeof(args), multiply, 1, 1, top_k, 0);
+    return dispatch("kernel_myds_v41_route_sum", &args, sizeof(args), sum, 4, rows, top_k, 128) &&
+        dispatch("kernel_myds_v41_route_divide", &args, sizeof(args), divide, 2, rows, top_k, 0) &&
+        dispatch("kernel_myds_v41_route_scale", &args, sizeof(args), multiply, 1, rows, top_k, 0);
+}
+
+int myds_v41_route(myds_metal_buffer_t *selected, myds_metal_buffer_t *weights,
+    myds_metal_buffer_t *probs, myds_metal_buffer_t *scores,
+    const myds_metal_buffer_t *logits, const myds_metal_buffer_t *bias,
+    uint32_t experts, uint32_t top_k, float scale) {
+    return myds_v41_route_batch(selected, weights, probs, scores, logits, bias,
+                                experts, top_k, scale, 1);
 }
 
 int myds_v41_shared_swiglu(myds_metal_buffer_t *out,

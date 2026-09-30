@@ -31,6 +31,10 @@ bool                 myds_metal_buffer_is_view(const myds_metal_buffer_t *buf);
 int                  myds_metal_buffer_write(myds_metal_buffer_t *buf, size_t offset, const void *src, size_t bytes);
 int                  myds_metal_buffer_read(const myds_metal_buffer_t *buf, size_t offset, void *dst, size_t bytes);
 /* GPU-ordered copy; overlapping source/destination ranges are rejected. */
+/* 诊断用：GPU dispatch 计数（参谋长 2026-09-30） */
+uint64_t myds_metal_dispatch_count(void);
+void myds_metal_dispatch_count_reset(void);
+
 int myds_metal_buffer_copy(myds_metal_buffer_t *dst, size_t dst_offset,
     const myds_metal_buffer_t *src, size_t src_offset, size_t bytes);
 /* Internal native-graph bridge. args occupies slot0, buffers slots1..N.

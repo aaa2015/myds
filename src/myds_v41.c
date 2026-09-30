@@ -850,6 +850,8 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     double prof_step1 = 0, prof_step2 = 0, prof_step3 = 0, prof_step4 = 0, prof_step5 = 0;
     double prof_step6 = 0, prof_step7 = 0, prof_step8 = 0;
     double prof_wait_qkv = 0, prof_wait_swa = 0, prof_wait_ffn_router = 0, prof_wait_moe = 0;
+    uint64_t disp_step14 = 0, disp_step58 = 0, disp_layer_all = 0;  /* 诊断 */
+    uint64_t disp_step4loop = 0;  /* 诊断：仅 Step4 逐 token 循环 */
     struct timeval ptv0, ptv1, ptv_all0, ptv_all1;
 #define TIME_START() do { if (do_prof) gettimeofday(&ptv0, NULL); } while(0)
 #define TIME_ACC(acc) do { if (do_prof) { gettimeofday(&ptv1, NULL); acc += (ptv1.tv_sec - ptv0.tv_sec) * 1000.0 + (ptv1.tv_usec - ptv0.tv_usec) / 1000.0; } } while(0)
@@ -934,6 +936,8 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 myds_metal_buffer_update_sub_view(cw->res_view[t], prompt_res, (size_t)idx * res_tok_bytes, res_tok_bytes);
                 myds_metal_buffer_update_sub_view(cw->pre_view[t], prompt_pre, (size_t)idx * pre_tok_bytes, 4 * sizeof(float));
             }
+
+            uint64_t disp_layer0 = myds_metal_dispatch_count();  /* 诊断 */
 
             /* Step 1: HC Attention Inputs for all tokens in chunk */
             TIME_START();
@@ -1044,6 +1048,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 }
             }
 
+            uint64_t disp_loop0 = myds_metal_dispatch_count();  /* 诊断 */
             for (uint32_t t = 0; t < c_len; t++) {
                 uint32_t idx = c_start + t;
                 uint32_t pos = base_pos + idx;
@@ -1078,14 +1083,22 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 
                 phase = "attention reduction";
                 CHECK(myds_v41_gpu_attention(cw->attn_heads[t], base->attn_sinks, cw->q[t], g->window[il], nraw, (pos + 1u - nraw) % 128, g->selected_kv, top, g->gpu));
-                CHECK(myds_metal_v41_bf16(cw->attn_heads[t], V41_HEADS * 512));
-                CHECK(myds_v41_gpu_rope(cw->attn_heads[t], 512, V41_HEADS, pos, compressed, true));
             }
+
+            /* bf16 + inverse RoPE are elementwise over (token, head) and each token's slice of
+             * attn_heads_buf is disjoint, so they run once for the whole chunk instead of once per
+             * token.  That removes two dispatches per token per layer.  Positions in the chunk are
+             * consecutive, which is what the batched RoPE wants. */
+            CHECK(myds_metal_v41_bf16(cw->attn_heads_buf, V41_HEADS * 512 * c_len));
+            CHECK(myds_v41_gpu_rope_batch(cw->attn_heads_buf, 512, V41_HEADS, base_pos + c_start, c_len, compressed, true));
+
+            if (do_prof) { disp_step4loop += myds_metal_dispatch_count() - disp_loop0; }  /* 诊断 */
 
             /* Batched Attention Output A for all c_len tokens in chunk (reads 4.2 MB weight ONCE) */
             CHECK(myds_metal_attn_output_a_batch(cw->attn_low_buf, base->attn_output_a, cw->attn_heads_buf, 8, 4096, 1024, c_len, base->attn_output_a_type));
             CHECK(myds_metal_v41_bf16(cw->attn_low_buf, 8192 * c_len));
             TIME_ACC(prof_step4);
+            if (do_prof) { disp_step14 += myds_metal_dispatch_count() - disp_layer0; }  /* 诊断 */
 
             if (do_prof) {
                 TIME_START();
@@ -1144,17 +1157,27 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             /* Step 7b: Batched MoE routing for all tokens in chunk on GPU */
             phase = "batched MoE routing";
             uint32_t k = m->n_activated_experts;
-            for (uint32_t t = 0; t < c_len; t++) {
-                uint32_t idx = c_start + t;
-                uint32_t pos = base_pos + idx;
-                TRACE("route_logits", cw->router_logits[t], m->n_routed_experts);
-                CHECK(myds_v41_route(cw->selected_ids[t], cw->selected_weights[t],
-                                     cw->route_probs[t], cw->route_scores[t],
-                                     cw->router_logits[t], base->router_bias,
-                                     m->n_routed_experts, k, m->routed_scaling_factor));
-                TRACE("route_probs", cw->route_probs[t], m->n_routed_experts);
-                TRACE("route_weights", cw->selected_weights[t], k);
-                if (getenv("MYDS_BATCH_TRACE_PREFIX")) {
+            /* Routing is independent per token, so the whole chunk is routed in one pass.
+             * This replaces seven dispatches per token (three transform, argsort, sum,
+             * divide, scale) with seven dispatches per chunk.  The trace calls are kept
+             * per token because they read the same per-token rows the batched kernels write. */
+            if (getenv("MYDS_BATCH_TRACE_PREFIX")) {
+                for (uint32_t t = 0; t < c_len; t++) {
+                    uint32_t pos = base_pos + c_start + t;   /* TRACE 需要 pos */
+                    (void)pos;
+                    TRACE("route_logits", cw->router_logits[t], m->n_routed_experts);
+                }
+            }
+            CHECK(myds_v41_route_batch(cw->selected_ids_buf, cw->selected_weights_buf,
+                                       cw->route_probs_buf, cw->route_scores_buf,
+                                       cw->router_logits_buf, base->router_bias,
+                                       m->n_routed_experts, k, m->routed_scaling_factor, c_len));
+            if (getenv("MYDS_BATCH_TRACE_PREFIX")) {
+                for (uint32_t t = 0; t < c_len; t++) {
+                    uint32_t pos = base_pos + c_start + t;   /* TRACE 需要 pos */
+                    (void)pos;
+                    TRACE("route_probs", cw->route_probs[t], m->n_routed_experts);
+                    TRACE("route_weights", cw->selected_weights[t], k);
                     const myds_metal_buffer_t *id_buffers[] = {cw->selected_ids[t], cw->route_ids_f32[t]};
                     CHECK(dispatch_k("kernel_myds_v41_ids_f32", &k, sizeof(k), id_buffers, 2, 1, 32, 0));
                     TRACE("route_ids", cw->route_ids_f32[t], k);
@@ -1209,6 +1232,10 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             TIME_START();
             CHECK(myds_metal_commit_batch());
             TIME_ACC(prof_wait_moe);
+            if (do_prof) {  /* 诊断 */
+                disp_layer_all += myds_metal_dispatch_count() - disp_layer0;
+                disp_step58 += myds_metal_dispatch_count() - disp_layer0 - disp_step14;
+            }
         }
     }
 
@@ -1231,6 +1258,19 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         printf("Step 8 (MoE dispatch) : %8.2f ms\n", prof_step8);
         printf("Wait MoE (GPU)        : %8.2f ms\n", prof_wait_moe);
         printf("Total Layers Wall     : %8.2f ms\n", prof_total_layers);
+        {   /* 诊断：dispatch 次数 */
+            uint64_t layer_iters = (uint64_t)V41_LAYERS * (uint64_t)((n_tokens + chunk_size - 1u) / (chunk_size ? chunk_size : 1u));
+            double kvpl = layer_iters ? (double)disp_layer_all / (double)layer_iters : 0.0;
+            printf("--- DISPATCH COUNT (诊断) ---\n");
+            printf("Step1-4 dispatches    : %10llu\n", (unsigned long long)disp_step14);
+            printf("Step5-8 dispatches    : %10llu\n", (unsigned long long)disp_step58);
+            printf("Layer dispatches total: %10llu\n", (unsigned long long)disp_layer_all);
+            printf("Layer iterations      : %10llu\n", (unsigned long long)layer_iters);
+            printf("Step4 loop dispatches : %10llu\n", (unsigned long long)disp_step4loop);
+            printf("dispatches / layer-iter: %8.1f  (Step1-4: %.1f, Step4loop: %.1f)\n",
+                   kvpl, layer_iters ? (double)disp_step14 / (double)layer_iters : 0.0,
+                   layer_iters ? (double)disp_step4loop / (double)layer_iters : 0.0);
+        }
         printf("Total Steps Sum       : %8.2f ms\n",
                prof_step1 + prof_step2 + prof_step3 + prof_wait_qkv + prof_step4 + prof_wait_swa +
                prof_step5 + prof_step6 + prof_step7 + prof_wait_ffn_router + prof_step8 + prof_wait_moe);

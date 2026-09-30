@@ -968,6 +968,12 @@ static int v41_finish(id<MTLCommandBuffer> cb, id<MTLComputeCommandEncoder> enc)
     return wait_command_buffer(cb);
 }
 
+/* 诊断用（参谋长 2026-09-30）：统计 GPU dispatch 次数。
+ * 用途：判定 prefill 的 GPU 时间是被"启动开销 x 海量小 kernel"主导，还是被算力/带宽主导。 */
+static uint64_t g_dispatch_count = 0;
+uint64_t myds_metal_dispatch_count(void) { return g_dispatch_count; }
+void myds_metal_dispatch_count_reset(void) { g_dispatch_count = 0; }
+
 int myds_metal_dispatch_kernel(const char *name, const void *args, size_t args_size,
     const myds_metal_buffer_t *const *buffers, size_t n_buffers,
     const uint32_t groups[3], const uint32_t threads[3], size_t threadgroup_memory) {
@@ -1066,6 +1072,7 @@ int myds_metal_dispatch_kernel_constants(const char *name, const void *args, siz
         if (threadgroup_memory) [enc setThreadgroupMemoryLength:threadgroup_memory atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(groups[0], groups[1], groups[2])
             threadsPerThreadgroup:MTLSizeMake(threads[0], threads[1], threads[2])];
+        g_dispatch_count++;
         return v41_finish(cb, enc);
     }
 }

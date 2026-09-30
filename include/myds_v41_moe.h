@@ -7,6 +7,12 @@ int myds_v41_route(myds_metal_buffer_t *selected, myds_metal_buffer_t *weights,
     myds_metal_buffer_t *probabilities, myds_metal_buffer_t *scores,
     const myds_metal_buffer_t *logits, const myds_metal_buffer_t *bias,
     uint32_t n_experts, uint32_t top_k, float scale);
+/* 批量版：一次处理 rows 个 token 的路由（logits/probs/scores 为 rows*n_experts 连续，
+ * selected/weights 为 rows*top_k 连续，denominator 为 rows 个）。数值与逐 token 版一致。 */
+int myds_v41_route_batch(myds_metal_buffer_t *selected, myds_metal_buffer_t *weights,
+    myds_metal_buffer_t *probabilities, myds_metal_buffer_t *scores,
+    const myds_metal_buffer_t *logits, const myds_metal_buffer_t *bias,
+    uint32_t n_experts, uint32_t top_k, float scale, uint32_t rows);
 int myds_v41_shared_swiglu(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *gate, const myds_metal_buffer_t *up,
     uint32_t width, float clamp);
