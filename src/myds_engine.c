@@ -2870,6 +2870,10 @@ static int myds_generate_internal(myds_context_t *ctx,
         }
         int32_t next_token = myds_forward_token(ctx, cur_token, ctx->pos);
         if (next_token < 0 || (uint32_t)next_token >= m->tokenizer->vocab_size) {
+            /* 这一步没跑完 ⇒ 刚记下的那个 token 并未真正被消费（外部评审指出的盲区）。
+             * 若留着它，下个请求会从一个状态从未到达的位置续跑 —— 直接撞位置检查。
+             * 与 prefill 失败同理：整条缓存作废。 */
+            ctx->pcache_len = 0;
             MYDS_LOG_E("Generation step %u failed", step);
             stop_reason = MYDS_STOP_ERROR;
             success = 0;
