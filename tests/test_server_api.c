@@ -381,6 +381,67 @@ static void test_deepseek41_tool_calls(void) {
     printf("  [PASS] V4.1 DSML tool definitions, assistant tool_calls, tool results and rejections\n");
 }
 
+
+/* DSML 解析：把模型输出切成「正文 + 结构化工具调用」 */
+static void test_deepseek41_dsml_parse(void) {
+    const char *DS = "\xef\xbd\x9c" "DSML" "\xef\xbd\x9c";
+    char text[4096];
+
+    /* ① 纯文本（无工具块）⇒ 原样、count=0 */
+    size_t clen = 0, n = 0; myds_tool_call_t *tc = NULL;
+    assert(myds_parse_completion_tool_calls("hello <think>x</think> world", 27, &clen, &tc, &n));
+    assert(n == 0 && tc == NULL && clen == 27);
+
+    /* ② 一个调用，两种参数类型 */
+    snprintf(text, sizeof(text),
+        "Let me check.\n\n<%s calls>\n<%s invoke name=\"get_weather\">\n"
+        "<%s parameter name=\"city\" string=\"true\">Beijing</%s parameter>\n"
+        "<%s parameter name=\"days\" string=\"false\">3</%s parameter>\n"
+        "</%s invoke>\n</%s calls>",
+        DS,DS,DS,DS,DS,DS,DS,DS);
+    assert(myds_parse_completion_tool_calls(text, strlen(text), &clen, &tc, &n));
+    assert(n == 1 && tc != NULL);
+    assert(strcmp(tc[0].id, "call_1") == 0);
+    assert(strcmp(tc[0].name, "get_weather") == 0);
+    assert(strcmp(tc[0].arguments, "{\"city\": \"Beijing\", \"days\": 3}") == 0);
+    assert(clen == strlen("Let me check."));      /* 正文不该含工具块，尾部换行也要去掉 */
+    myds_free_tool_calls(tc, n); tc = NULL;
+
+    /* ③ 两个调用 */
+    snprintf(text, sizeof(text),
+        "ok\n\n<%s calls>\n<%s invoke name=\"a\">\n<%s parameter name=\"x\" string=\"false\">1</%s parameter>\n"
+        "</%s invoke>\n<%s invoke name=\"b\">\n</%s invoke>\n</%s calls>", DS,DS,DS,DS,DS,DS,DS,DS);
+    assert(myds_parse_completion_tool_calls(text, strlen(text), &clen, &tc, &n));
+    assert(n == 2);
+    assert(strcmp(tc[0].name, "a") == 0 && strcmp(tc[0].arguments, "{\"x\": 1}") == 0);
+    assert(strcmp(tc[1].name, "b") == 0 && strcmp(tc[1].arguments, "{}") == 0);
+    myds_free_tool_calls(tc, n); tc = NULL;
+
+    /* ④ 字符串参数里的引号/换行必须被正确转义 */
+    snprintf(text, sizeof(text),
+        "x\n\n<%s calls>\n<%s invoke name=\"t\">\n<%s parameter name=\"s\" string=\"true\">a\"b</%s parameter>\n"
+        "</%s invoke>\n</%s calls>", DS,DS,DS,DS,DS,DS);
+    assert(myds_parse_completion_tool_calls(text, strlen(text), &clen, &tc, &n));
+    assert(n == 1 && strcmp(tc[0].arguments, "{\"s\": \"a\\\"b\"}") == 0);
+    myds_free_tool_calls(tc, n); tc = NULL;
+
+    /* ⑤ 格式不合（invoke 未闭合）⇒ 返回 false，调用方按纯文本处理 */
+    snprintf(text, sizeof(text), "x\n\n<%s calls>\n<%s invoke name=\"a\">\n\"", DS, DS);
+    assert(!myds_parse_completion_tool_calls(text, strlen(text), &clen, &tc, &n));
+
+    /* ⑥ 数组参数：非字符串参数原样透传 JSON */
+    snprintf(text, sizeof(text),
+        "x\n\n<%s calls>\n<%s invoke name=\"f\">\n"
+        "<%s parameter name=\"xs\" string=\"false\">[1, 2, 3]</%s parameter>\n"
+        "<%s parameter name=\"o\" string=\"false\">{\"k\": true}</%s parameter>\n"
+        "</%s invoke>\n</%s calls>", DS,DS,DS,DS,DS,DS,DS,DS);
+    assert(myds_parse_completion_tool_calls(text, strlen(text), &clen, &tc, &n));
+    assert(n == 1 && strcmp(tc[0].arguments, "{\"xs\": [1, 2, 3], \"o\": {\"k\": true}}") == 0);
+    myds_free_tool_calls(tc, n);
+
+    printf("  [PASS] V4.1 DSML completion parsing: content split, parameter kinds, escaping, two calls, malformed fallback\n");
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && !strcmp(argv[1], "--render")) {
         size_t capacity = strlen(argv[2]) * 4 + 1024;
@@ -392,6 +453,7 @@ int main(int argc, char **argv) {
     }
     test_deepseek41_chat_templates();
     test_deepseek41_tool_calls();
+    test_deepseek41_dsml_parse();
     printf("====================================================\n");
     printf("       Running myds Server API Unit Tests           \n");
     printf("====================================================\n");

@@ -922,6 +922,167 @@ bool parse_chat_prompt(const char *body, char *out_prompt, size_t max_prompt_len
     return parse_chat_prompt_ex(body, out_prompt, max_prompt_len, NULL);
 }
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * 解析模型输出里的 DSML 工具调用（官方 DeepSeek-V4.1 格式）
+ * 官方的 parse_message_from_completion_text 是【严格】实现（格式稍不合就抛错）；
+ * 这里做【宽容】解析：任何不合格式之处一律退回「整段当纯文本」，
+ * 绝不因为模型一处手滑就把回答吞掉。
+ * ══════════════════════════════════════════════════════════════════════════ */
+#define MYDS_DSML_S "\xef\xbd\x9c" "DSML" "\xef\xbd\x9c"   /* ｜DSML｜（全角竖线） */
+
+typedef struct { char *data; size_t len, cap; } dsml_buf_t;
+static bool dsml_put(dsml_buf_t *b, const char *p, size_t n) {
+    if (b->len + n + 1 > b->cap) {
+        size_t cap = b->cap ? b->cap : 64;
+        while (cap < b->len + n + 1) {
+            if (cap > SIZE_MAX / 2) return false;
+            cap *= 2;
+        }
+        char *grown = realloc(b->data, cap);
+        if (!grown) return false;
+        b->data = grown; b->cap = cap;
+    }
+    if (n) memcpy(b->data + b->len, p, n);
+    b->len += n; b->data[b->len] = 0;
+    return true;
+}
+static char *dsml_dup(const char *p, size_t n) {
+    char *s = malloc(n + 1);
+    if (!s) return NULL;
+    memcpy(s, p, n); s[n] = 0;
+    return s;
+}
+static const char *dsml_find(const char *pos, const char *end, const char *lit) {
+    size_t n = strlen(lit);
+    if (!n || pos > end || (size_t)(end - pos) < n) return NULL;
+    for (const char *q = pos; q + n <= end; ++q) if (!memcmp(q, lit, n)) return q + n;
+    return NULL;
+}
+static bool dsml_match(const char *p, const char *end, const char *lit) {
+    size_t n = strlen(lit);
+    return (size_t)(end - p) >= n && !memcmp(p, lit, n);
+}
+static const char *dsml_skip_ws(const char *p, const char *end) {
+    while (p < end && (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')) ++p;
+    return p;
+}
+/* 读 key="value" 属性；返回闭合引号之后的位置。 */
+static const char *dsml_attr(const char *p, const char *end, const char *key,
+                             const char **value, size_t *value_len) {
+    if (!p) return NULL;
+    if (!(p = dsml_find(p, end, key))) return NULL;
+    if (p >= end || *p != '"') return NULL;
+    const char *v = ++p;
+    while (p < end && *p != '"') ++p;
+    if (p >= end) return NULL;
+    *value = v; *value_len = (size_t)(p - v);
+    return p + 1;
+}
+
+/* 成功：content_len 收工具块之前的正文字节数；calls_out 与 count_out 收解析出的调用（调用方负责释放）。
+ * 没有工具块时 count=0 且返回 true；格式不合格式时返回 false（调用方按纯文本处理）。 */
+bool myds_parse_completion_tool_calls(const char *text, size_t len, size_t *content_len,
+                                      myds_tool_call_t **calls_out, size_t *count_out) {
+    static const char *open_tag = "<" MYDS_DSML_S " calls>";
+    static const char *close_tag = "</" MYDS_DSML_S " calls>";
+    static const char *invoke_open = "<" MYDS_DSML_S " invoke";
+    static const char *invoke_close = "</" MYDS_DSML_S " invoke>";
+    static const char *param_open = "<" MYDS_DSML_S " parameter";
+    static const char *param_close = "</" MYDS_DSML_S " parameter>";
+    *calls_out = NULL; *count_out = 0; *content_len = len;
+    const char *end = text + len;
+    const char *body = dsml_find(text, end, open_tag);
+    if (!body) return true;
+    const char *content_end = body - strlen(open_tag);
+    while (content_end > text && (content_end[-1] == '\n' || content_end[-1] == '\r' ||
+                                  content_end[-1] == ' ' || content_end[-1] == '\t')) --content_end;
+    *content_len = (size_t)(content_end - text);
+
+    size_t cap = 4, count = 0;
+    myds_tool_call_t *calls = calloc(cap, sizeof(*calls));
+    if (!calls) return false;
+    const char *p = body;
+    bool ok = true;
+    while (ok) {
+        p = dsml_skip_ws(p, end);
+        if (dsml_match(p, end, close_tag)) { p += strlen(close_tag); break; }
+        if (!dsml_match(p, end, invoke_open)) { ok = false; break; }
+        p += strlen(invoke_open);
+        const char *name = NULL; size_t name_len = 0;
+        if (!(p = dsml_attr(p, end, "name=", &name, &name_len))) { ok = false; break; }
+        p = dsml_skip_ws(p, end);
+        if (p >= end || *p != '>') { ok = false; break; }
+        ++p;
+
+        dsml_buf_t args = {0};
+        if (!dsml_put(&args, "{", 1)) { ok = false; break; }
+        size_t n_params = 0;
+        while (ok) {
+            p = dsml_skip_ws(p, end);
+            if (dsml_match(p, end, invoke_close)) { p += strlen(invoke_close); break; }
+            if (!dsml_match(p, end, param_open)) { ok = false; break; }
+            p += strlen(param_open);
+            const char *pk = NULL; size_t pk_len = 0;
+            const char *sv = NULL; size_t sv_len = 0;
+            if (!(p = dsml_attr(p, end, "name=", &pk, &pk_len))) { ok = false; break; }
+            if (!(p = dsml_attr(p, end, "string=", &sv, &sv_len))) { ok = false; break; }
+            p = dsml_skip_ws(p, end);
+            if (p >= end || *p != '>') { ok = false; break; }
+            ++p;
+            const char *vend = dsml_find(p, end, param_close);
+            if (!vend) { ok = false; break; }
+            size_t val_len = (size_t)(vend - strlen(param_close) - p);
+            while (val_len && (p[val_len - 1] == '\n' || p[val_len - 1] == '\r')) --val_len;
+            bool is_str = (sv_len == 4 && !memcmp(sv, "true", 4));
+            if (n_params++ && !dsml_put(&args, ", ", 2)) { ok = false; break; }
+            if (!dsml_put(&args, "\"", 1) || !dsml_put(&args, pk, pk_len) || !dsml_put(&args, "\": ", 3)) {
+                ok = false; break;
+            }
+            if (is_str) {
+                /* json_escape_alloc 只做转义、不加引号 ⇒ 引号要自己补 */
+                char *esc = json_escape_alloc(p, val_len);
+                if (!esc) { ok = false; break; }
+                bool put = dsml_put(&args, "\"", 1) && dsml_put(&args, esc, strlen(esc)) &&
+                           dsml_put(&args, "\"", 1);
+                free(esc);
+                if (!put) { ok = false; break; }
+            } else if (!dsml_put(&args, p, val_len)) { ok = false; break; }
+            p = vend;
+        }
+        if (ok && !dsml_put(&args, "}", 1)) ok = false;
+        if (!ok) { free(args.data); break; }
+
+        if (count == cap) {
+            size_t grown_cap = cap * 2;
+            myds_tool_call_t *grown = realloc(calls, grown_cap * sizeof(*calls));
+            if (!grown) { free(args.data); ok = false; break; }
+            calls = grown; cap = grown_cap;
+        }
+        char idbuf[32];
+        snprintf(idbuf, sizeof(idbuf), "call_%zu", count + 1);
+        myds_tool_call_t *tc = &calls[count];
+        memset(tc, 0, sizeof(*tc));
+        tc->id = dsml_dup(idbuf, strlen(idbuf));
+        tc->name = dsml_dup(name, name_len);
+        tc->arguments = args.data;
+        if (!tc->id || !tc->name || !tc->arguments) { ok = false; break; }
+        ++count;
+    }
+    if (!ok) {
+        for (size_t k = 0; k < count; ++k) { free(calls[k].id); free(calls[k].name); free(calls[k].arguments); }
+        free(calls);
+        return false;
+    }
+    if (!count) { free(calls); *count_out = 0; return true; }
+    *calls_out = calls; *count_out = count;
+    return true;
+}
+
+void myds_free_tool_calls(myds_tool_call_t *calls, size_t count) {
+    for (size_t i = 0; i < count; ++i) { free(calls[i].id); free(calls[i].name); free(calls[i].arguments); }
+    free(calls);
+}
+
 static inline double myds_server_now_s(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);

@@ -68,3 +68,14 @@ bool parse_chat_prompt_ex(const char *body, char *out_prompt, size_t max_prompt_
 #endif
 
 #endif /* MYDS_SERVER_INTERNAL_H */
+
+/* ── 工具调用（官方 DeepSeek-V4.1 DSML 格式，见 docs/DEEPSEEK_V41_PROMPT_FORMAT.md）──
+ * 服务端把工具定义渲染进提示词，并把模型输出的 DSML 块解析成结构化调用。 */
+typedef struct { char *id; char *name; char *arguments; } myds_tool_call_t;
+
+/* 解析完成文本：*content_len 为工具块之前的正文字节数；
+ * calls_out 与 count_out 为解析结果（调用方用 myds_free_tool_calls 释放）。
+ * 无工具块 ⇒ count=0 且返回 true；格式不合 ⇒ 返回 false（调用方按纯文本处理）。 */
+bool myds_parse_completion_tool_calls(const char *text, size_t len, size_t *content_len,
+                                      myds_tool_call_t **calls_out, size_t *count_out);
+void myds_free_tool_calls(myds_tool_call_t *calls, size_t count);
