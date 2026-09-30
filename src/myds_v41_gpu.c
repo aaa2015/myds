@@ -194,6 +194,24 @@ int myds_v41_gpu_quant(myds_metal_buffer_t *x,uint32_t width,uint32_t rows,uint3
 }
 /* 整 chunk 的 pool2：tail=0 ⇒ 第 p 对读 kv/scores 的第 2p、2p+1 行，
  * 与逐 token 版（previous_* 保存前一个偶数位）结果逐位相同：每个输出元素独立计算。 */
+static int stage_f16(myds_metal_buffer_t *dst,size_t dstoff,const myds_metal_buffer_t *src,
+    size_t srcoff,uint32_t count,myds_v41_gpu_scratch_t *s);   /* 定义在后面 */
+/* 见头文件。位置 p ∈ [base_pos-carry, base_pos) → slab 行 (p + CARRY - base_pos)、
+ * 窗槽位 (p % 128)；carry = min(127, base_pos)。 */
+int myds_v41_gpu_carry_stage(myds_v41_gpu_scratch_t *s,const myds_metal_buffer_t *window,
+    uint32_t base_pos) {
+    if(!s||!window||!base_pos)return 0;
+    const uint32_t carry=base_pos<MYDS_CHUNK_CARRY?base_pos:MYDS_CHUNK_CARRY;
+    if(!carry)return 1;
+    const uint32_t p0=base_pos-carry;
+    const uint32_t s0=p0%128u;
+    uint32_t run1=128u-s0; if(run1>carry)run1=carry;
+    const uint32_t row0=MYDS_CHUNK_CARRY-carry;
+    if(!stage_f16(s->kv_chunk,(size_t)row0*1024u,window,(size_t)s0*512u*4u,run1*512u,s))return 0;
+    if(carry>run1&&!stage_f16(s->kv_chunk,(size_t)(row0+run1)*1024u,window,0,
+                             (carry-run1)*512u,s))return 0;
+    return 1;
+}
 int myds_v41_gpu_pool2_pairs(myds_metal_buffer_t *out,const myds_metal_buffer_t *kv,
     const myds_metal_buffer_t *scores,uint32_t width,uint32_t pairs) {
     if(!width||!pairs||!floats(out,(uint64_t)width*pairs)||

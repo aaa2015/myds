@@ -1512,6 +1512,18 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
              * chunk and the compressed table prefix, and each token masks what it may not
              * see; that is the shape the shared kernel is built for, and it turns 512
              * tokens x 7 dispatches into 5. */
+            /* 续跑（prefix cache）时的 carry：slab 行 [0,127) 平时由【上一层 chunk】的尾部
+             * 拷贝维持，但第一段的起点之前并没有 chunk —— 那些 KV 只存在于每层的环形窗里
+             * （decode 路径写进去的，内容与 chunk 路径是同一个张量 ⇒ 逐位相同）。
+             * 所以这里从窗里按位置顺序重建一次。只在 c_start==0 且 base_pos!=0 时做。 */
+            if (c_start == 0 && base_pos != 0) {
+                phase = "carry stage";
+                if (!myds_v41_gpu_carry_stage(g->gpu, g->window[il], base_pos)) {
+                    MYDS_LOG_E("carry stage failed at layer %u (base_pos=%u)", il, base_pos);
+                    goto fail;
+                }
+            }
+
             {
                 uint32_t n_comp = compressed ? (base_pos + c_start + c_len) / ratio : 0;
                 phase = "chunk attention";

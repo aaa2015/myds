@@ -109,6 +109,15 @@ struct myds_context {
     myds_prefill_chunk_t *prefill_chunk; /* Lazily allocated, reused between requests. */
     uint32_t             prefill_capacity;
 
+    /* Prefix cache（服务端调度用）：记录状态里当前的【完整 token 序列】
+     * （prompt + 已生成，EOS 不在其中，因为它从未被喂入）。
+     * 下一个请求的 prompt 若是它的严格续写，就可以跳过公共部分的 prefill。
+     * 要求严格相等是刻意的：engram 的状态是逐 token 的滚动链，只有已消费的
+     * token 序列完全一致时才对齐，回滚做不到。 */
+    int32_t             *pcache_tokens;
+    uint32_t             pcache_len;
+    uint32_t             pcache_cap;
+
     /* Metal activation buffers */
     myds_metal_buffer_t *x;
     myds_metal_buffer_t *x_norm;

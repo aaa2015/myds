@@ -1185,6 +1185,7 @@ myds_context_t *myds_context_create(myds_model_t *model, const myds_config_t *cf
 }
 
 void myds_context_free(myds_context_t *ctx) {
+    free(ctx->pcache_tokens); ctx->pcache_tokens=NULL; ctx->pcache_len=ctx->pcache_cap=0;
     if (!ctx) return;
     (void)myds_metal_synchronize();
     myds_v41_context_free(ctx->v41);
@@ -2782,12 +2783,55 @@ static int myds_generate_internal(myds_context_t *ctx,
         return 0;
     }
 
-    ctx->pos = 0;
+    /* ── Prefix cache（服务端调度）──
+     * 上一个请求留下的状态覆盖 token 序列 pcache_tokens[0..pcache_len)，位置与之一一对应。
+     * 如果这次 prompt 是它的【严格续写】（公共前缀恰好等于它的全部长度），就从 pcache_len
+     * 继续跑，跳过公共部分的 prefill —— 多轮对话的第二轮起，公共部分就是整段历史。
+     * 为什么必须严格相等：engram 的状态是逐 token 的滚动链，只有已消费的序列完全一致时
+     * 才对齐（回滚做不到）；而 decode 产出的 EOS 从未被喂入，所以缓存序列天然就是
+     * 「prompt + 生成文本」，客户端下一轮重发的历史与之逐 token 对齐。
+     * MYDS_PREFIX_CACHE=0 关闭（用于对照）。 */
+    uint32_t resume_from = 0;
+    {
+        /* 【默认关闭】：这是服务端调度优化，不是库语义 —— 库的调用方（含单测）
+         * 依赖「每次 generate = 从位置 0 全量 prefill」。服务端在启动环境里
+         * 显式打开（MYDS_PREFIX_CACHE=1）。 */
+        static int pcache_on = -1;
+        if (pcache_on < 0) {
+            const char *e = getenv("MYDS_PREFIX_CACHE");
+            pcache_on = (e && atoi(e) != 0) ? 1 : 0;
+        }
+        if (pcache_on && ctx->pcache_tokens && ctx->pcache_len &&
+            (uint32_t)n_prompt > ctx->pcache_len) {
+            uint32_t L = 0;
+            while (L < ctx->pcache_len && ctx->pcache_tokens[L] == prompt_tokens[L]) L++;
+            if (L == ctx->pcache_len) resume_from = L;
+            MYDS_LOG_I("prefix cache: prompt %d tok, cached %u, common prefix %u -> %s%s",
+                       n_prompt, ctx->pcache_len, L,
+                       resume_from ? "resume from " : "full prefill",
+                       resume_from ? "cached prefix" : "");
+        }
+    }
+    /* 缓存序列的落点：容量按配置的上下文一次要够（续跑时只追加，所以不重排前缀）。 */
+    if (ctx->pcache_cap < ctx->cfg.max_seq_len) {
+        int32_t *nt = (int32_t *)realloc(ctx->pcache_tokens, (size_t)ctx->cfg.max_seq_len * sizeof(int32_t));
+        if (nt) { ctx->pcache_tokens = nt; ctx->pcache_cap = ctx->cfg.max_seq_len; }
+        else { ctx->pcache_len = 0; }
+    }
+    if (ctx->pcache_tokens && ctx->pcache_cap >= (uint32_t)n_prompt) {
+        memcpy(ctx->pcache_tokens, prompt_tokens, (size_t)n_prompt * sizeof(int32_t));
+        ctx->pcache_len = (uint32_t)n_prompt;
+    } else {
+        ctx->pcache_len = 0;
+    }
+
+    ctx->pos = resume_from;
     int32_t cur_token = prompt_tokens[0];
 
     /* 2. Prefill phase (bypassing LM head & sampling for tokens 0..n_prompt-2) */
-    if (n_prompt > 1) {
-        int res = myds_prefill_tokens(ctx, prompt_tokens, n_prompt - 1, cancel_flag);
+    if ((uint32_t)n_prompt - 1 > resume_from || resume_from == 0) {
+        int res = myds_prefill_tokens(ctx, prompt_tokens + resume_from,
+                                      n_prompt - 1 - (int32_t)resume_from, cancel_flag);
         if (res == -2) {
             free(prompt_tokens);
             if (out_reason) *out_reason = MYDS_STOP_CANCELLED;
@@ -2811,6 +2855,12 @@ static int myds_generate_internal(myds_context_t *ctx,
         if (cancel_flag && *cancel_flag) {
             stop_reason = MYDS_STOP_CANCELLED;
             break;
+        }
+        /* 记录「正在被喂入的这个 token」（位置 = ctx->pos）⇒ 缓存序列与状态一一对应，
+         * 而产出的 EOS 从未被喂入，所以不会被记进去。 */
+        if (ctx->pcache_tokens && ctx->pos < ctx->pcache_cap) {
+            ctx->pcache_tokens[ctx->pos] = cur_token;
+            if (ctx->pos + 1u > ctx->pcache_len) ctx->pcache_len = ctx->pos + 1u;
         }
         int32_t next_token = myds_forward_token(ctx, cur_token, ctx->pos);
         if (next_token < 0 || (uint32_t)next_token >= m->tokenizer->vocab_size) {

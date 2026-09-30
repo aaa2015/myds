@@ -40,6 +40,11 @@ int myds_v41_gpu_pool2(myds_metal_buffer_t *out,const myds_metal_buffer_t *kv,
 /* 整 chunk 版：out 的第 p 行 = 第 p 对（偶数位 kv/scores 与紧随的奇数位）合并的结果，
  * 每对的算术与 pool2 逐 token 版完全相同（逐元素，无跨线程归约），故逐位一致。
  * 要求 chunk 从偶数位开始且长度为偶数（调用方保证）。 */
+/* 续跑（prefix cache）时用：把上一段结束位置之前的 127 个 KV 从【每层环形窗】
+ * 按位置顺序搬进 slab 的 carry 段。窗是按位置旋转的（槽位 = 位置 %% 128），
+ * 所以这里是两段拷贝。内容与 chunk 路径自己留下的 carry 逐位相同（同一个张量）。 */
+int myds_v41_gpu_carry_stage(myds_v41_gpu_scratch_t *s,const myds_metal_buffer_t *window,
+    uint32_t base_pos);
 int myds_v41_gpu_pool2_pairs(myds_metal_buffer_t *out,const myds_metal_buffer_t *kv,
     const myds_metal_buffer_t *scores,uint32_t width,uint32_t pairs);
 int myds_v41_gpu_indexscores(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
