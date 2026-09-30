@@ -514,6 +514,7 @@ typedef struct {
     myds_metal_buffer_t *shared_swiglu_buf;
     myds_metal_buffer_t *shared_out_buf;
     myds_metal_buffer_t *engram_rows_buf[2];
+    myds_metal_buffer_t *engram_proj_buf[2];
     myds_metal_buffer_t *selected_ids_buf;
     myds_metal_buffer_t *selected_weights_buf;
     myds_metal_buffer_t *route_probs_buf;
@@ -547,6 +548,10 @@ typedef struct {
     myds_metal_buffer_t *router_logits[V41_MAX_CHUNK];
     myds_metal_buffer_t *shared_out[V41_MAX_CHUNK];
     myds_metal_buffer_t *engram_rows[2][V41_MAX_CHUNK];
+    /* engram 投影的整 chunk 输出（每个 engram 层一个缓冲），以及每 token 的视图。
+     * 以前这里只有单个 token 的 g->engram_kv，逐 token 调用把 [25600 x 6144] 的
+     * F16 权重（314 MB）整个读一遍 —— 每个 token 一遍。 */
+    myds_metal_buffer_t *engram_proj_view[2][V41_MAX_CHUNK];
     myds_metal_buffer_t *selected_ids[V41_MAX_CHUNK];
     myds_metal_buffer_t *selected_weights[V41_MAX_CHUNK];
     myds_metal_buffer_t *route_probs[V41_MAX_CHUNK];
@@ -594,6 +599,8 @@ static void v41_chunk_workspace_free(v41_chunk_workspace_t *cw) {
         if (cw->shared_out[t]) myds_metal_buffer_free(cw->shared_out[t]);
         if (cw->engram_rows[0][t]) myds_metal_buffer_free(cw->engram_rows[0][t]);
         if (cw->engram_rows[1][t]) myds_metal_buffer_free(cw->engram_rows[1][t]);
+        if (cw->engram_proj_view[0][t]) myds_metal_buffer_free(cw->engram_proj_view[0][t]);
+        if (cw->engram_proj_view[1][t]) myds_metal_buffer_free(cw->engram_proj_view[1][t]);
         if (cw->selected_ids[t]) myds_metal_buffer_free(cw->selected_ids[t]);
         if (cw->selected_weights[t]) myds_metal_buffer_free(cw->selected_weights[t]);
         if (cw->route_probs[t]) myds_metal_buffer_free(cw->route_probs[t]);
@@ -633,6 +640,8 @@ static void v41_chunk_workspace_free(v41_chunk_workspace_t *cw) {
     if (cw->shared_out_buf) myds_metal_buffer_free(cw->shared_out_buf);
     if (cw->engram_rows_buf[0]) myds_metal_buffer_free(cw->engram_rows_buf[0]);
     if (cw->engram_rows_buf[1]) myds_metal_buffer_free(cw->engram_rows_buf[1]);
+    if (cw->engram_proj_buf[0]) myds_metal_buffer_free(cw->engram_proj_buf[0]);
+    if (cw->engram_proj_buf[1]) myds_metal_buffer_free(cw->engram_proj_buf[1]);
     if (cw->selected_ids_buf) myds_metal_buffer_free(cw->selected_ids_buf);
     if (cw->selected_weights_buf) myds_metal_buffer_free(cw->selected_weights_buf);
     if (cw->route_probs_buf) myds_metal_buffer_free(cw->route_probs_buf);
@@ -686,6 +695,8 @@ static v41_chunk_workspace_t *v41_chunk_workspace_create(uint32_t capacity, uint
     ALLOC_BUF(shared_out_buf, C * V41_DIM * sizeof(float));
     ALLOC_BUF(engram_rows_buf[0], C * MYDS_ENGRAM_INPUT_DIM * sizeof(float));
     ALLOC_BUF(engram_rows_buf[1], C * MYDS_ENGRAM_INPUT_DIM * sizeof(float));
+    ALLOC_BUF(engram_proj_buf[0], (size_t)C * 5 * V41_DIM * sizeof(float));
+    ALLOC_BUF(engram_proj_buf[1], (size_t)C * 5 * V41_DIM * sizeof(float));
     ALLOC_BUF(selected_ids_buf, C * 6 * sizeof(int32_t));
     ALLOC_BUF(selected_weights_buf, C * 6 * sizeof(float));
     ALLOC_BUF(route_probs_buf, C * 384 * sizeof(float));
@@ -730,6 +741,9 @@ static v41_chunk_workspace_t *v41_chunk_workspace_create(uint32_t capacity, uint
         cw->engram_rows[0][t] = myds_metal_buffer_sub_view(cw->engram_rows_buf[0], (t * MYDS_ENGRAM_INPUT_DIM) * sizeof(float), MYDS_ENGRAM_INPUT_DIM * sizeof(float));
         cw->engram_rows[1][t] = myds_metal_buffer_sub_view(cw->engram_rows_buf[1], (t * MYDS_ENGRAM_INPUT_DIM) * sizeof(float), MYDS_ENGRAM_INPUT_DIM * sizeof(float));
         if (!cw->engram_rows[0][t] || !cw->engram_rows[1][t]) goto fail;
+        cw->engram_proj_view[0][t] = myds_metal_buffer_sub_view(cw->engram_proj_buf[0], (size_t)t * 5 * V41_DIM * sizeof(float), 5 * V41_DIM * sizeof(float));
+        cw->engram_proj_view[1][t] = myds_metal_buffer_sub_view(cw->engram_proj_buf[1], (size_t)t * 5 * V41_DIM * sizeof(float), 5 * V41_DIM * sizeof(float));
+        if (!cw->engram_proj_view[0][t] || !cw->engram_proj_view[1][t]) goto fail;
 
         cw->selected_ids[t] = myds_metal_buffer_sub_view(cw->selected_ids_buf, t * 6 * sizeof(int32_t), 6 * sizeof(int32_t));
         if (!cw->selected_ids[t]) goto fail;
@@ -948,10 +962,22 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 
             if (il == 1 || il == 14) {
                 uint32_t e = (il == 1 ? 0 : 1);
+                /* 整 chunk 一次 matmul。输入行在 engram_rows_buf 里本来就是连续的，
+                 * 逐 token 的写法只是把同一批拆碎：每个 token 都要把 314 MB 的权重
+                 * 完整读一遍（4404 token x 2 层 = 2.8 TB）。 */
+                myds_metal_barrier();
+                int e_batched = 0;
+                if (!getenv("MYDS_DISABLE_MM_ENGRAM"))
+                    e_batched = myds_metal_mul_mm(cw->engram_proj_buf[e], v->engram_proj[e],
+                        cw->engram_rows_buf[e], 5 * V41_DIM, MYDS_ENGRAM_INPUT_DIM, c_len, GGML_TYPE_F16);
+                if (!e_batched) {
+                    for (uint32_t t = 0; t < c_len; t++)
+                        CHECK(project(cw->engram_proj_view[e][t], v->engram_proj[e], cw->engram_rows[e][t],
+                            5 * V41_DIM, MYDS_ENGRAM_INPUT_DIM, GGML_TYPE_F16, true));
+                }
                 for (uint32_t t = 0; t < c_len; t++) {
-                    uint32_t pos = base_pos + c_start + t;
-                    CHECK(project(g->engram_kv, v->engram_proj[e], cw->engram_rows[e][t], 5 * V41_DIM, MYDS_ENGRAM_INPUT_DIM, GGML_TYPE_F16, true));
-                    CHECK(myds_metal_v41_engram_add(cw->res_view[t], g->engram_kv, v->engram_q[e], v->engram_k[e], V41_DIM, m->norm_eps));
+                    uint32_t pos = base_pos + c_start + t;   /* TRACE 宏要用 */
+                    CHECK(myds_metal_v41_engram_add(cw->res_view[t], cw->engram_proj_view[e][t], v->engram_q[e], v->engram_k[e], V41_DIM, m->norm_eps));
                     TRACE("engram_out", cw->res_view[t], 4 * V41_DIM);
                 }
             }
@@ -984,15 +1010,20 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             /* Step 2: Batched Q_A and KV projections (reads weights ONCE for all c_len tokens) */
             TIME_START();
             phase = "batched attention projections";
-            CHECK(project_batch(cw->qr_buf, base->attn_q_a, cw->x_norm_buf, 1280, V41_DIM, c_len, base->attn_q_a_type, true));
-            CHECK(project_batch(cw->kv_act_buf, base->attn_kv, cw->x_norm_buf, 512, V41_DIM, c_len, base->attn_kv_type, true));
+            if (!getenv("MYDS_SKIP_Q_A"))
+                CHECK(project_batch(cw->qr_buf, base->attn_q_a, cw->x_norm_buf, 1280, V41_DIM, c_len, base->attn_q_a_type, true));
+            if (!getenv("MYDS_SKIP_KV"))
+                CHECK(project_batch(cw->kv_act_buf, base->attn_kv, cw->x_norm_buf, 512, V41_DIM, c_len, base->attn_kv_type, true));
 
+            if (!getenv("MYDS_SKIP_NORM"))
             CHECK(myds_metal_v41_rmsnorm_batch(cw->qr_norm_buf, cw->qr_buf, base->attn_q_a_norm, 1280, c_len, m->norm_eps, true));
             CHECK(myds_metal_v41_rmsnorm_batch(cw->kv_act_buf, cw->kv_act_buf, base->attn_kv_a_norm, 512, c_len, m->norm_eps, true));
 
             /* Batched RoPE & Quant for KV */
-            CHECK(myds_v41_gpu_rope_batch(cw->kv_act_buf, 512, 1, base_pos + c_start, c_len, compressed, false));
-            CHECK(myds_v41_gpu_quant(cw->kv_act_buf, 512, c_len, 1));
+            if (!getenv("MYDS_SKIP_KV_ROPE"))
+                CHECK(myds_v41_gpu_rope_batch(cw->kv_act_buf, 512, 1, base_pos + c_start, c_len, compressed, false));
+            if (!getenv("MYDS_SKIP_KV_QUANT"))
+                CHECK(myds_v41_gpu_quant(cw->kv_act_buf, 512, c_len, 1));
 
             for (uint32_t t = 0; t < c_len; t++) {
                 uint32_t idx = c_start + t;
@@ -1014,10 +1045,12 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 
             /* Step 3: Batched Q_B projection (reads 21 MB weight ONCE for all c_len tokens) */
             TIME_START();
+            if (!getenv("MYDS_SKIP_Q_B"))
             CHECK(project_batch(cw->q_buf, base->attn_q_b, cw->qr_norm_buf, V41_HEADS * 512, 1280, c_len, base->attn_q_b_type, true));
 
             /* Batched RoPE for Q */
-            CHECK(myds_v41_gpu_rope_batch(cw->q_buf, 512, V41_HEADS, base_pos + c_start, c_len, compressed, false));
+            if (!getenv("MYDS_SKIP_Q_ROPE"))
+                CHECK(myds_v41_gpu_rope_batch(cw->q_buf, 512, V41_HEADS, base_pos + c_start, c_len, compressed, false));
 
             if (getenv("MYDS_BATCH_TRACE_PREFIX")) {
                 for (uint32_t t = 0; t < c_len; t++) {
