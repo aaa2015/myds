@@ -349,6 +349,83 @@ static int publish_compressor(myds_context_t *ctx, uint32_t il, uint32_t pos,
     return 1;
 }
 
+/* 【整 chunk 批量】prefill 的压缩器（ratio ∈ {1,2}，只跑在 kv_source 层 = 2/8/14/20）。
+ * 逐 token 版把每个 token 拆成 3~11 次 dispatch（4 层合计约 5 万次），其中一半是纯搬运
+ * （previous 拷贝、latent 拷贝）—— 每次挪 2 KB 却要付约 9 µs 的 dispatch 开销。
+ *
+ * 与逐 token 路径逐位相同的依据：
+ *   1) ratio==2：提交行是奇数位，它依赖的「前一位」是同 chunk 内的偶数位。chunk 起点为
+ *      偶数位、长度为偶数时，配对 (2p, 2p+1) 与逐 token 的 previous_kv/scores 语义完全
+ *      对应 ⇒ 同一个 kernel_dsv41_pool2（tail=0）逐元素算出同一结果（无跨线程归约）；
+ *   2) ratio==1：latent 就是 pool_kv 自身（逐 token 版是逐行 copy，值相同）；
+ *   3) 提交段每个算子都有 batch 版，逐行结果与逐 token 版一致（同一个内核，只是 nef1
+ *      的行数不同），bf16 取整参数也保持一致（rmsnorm round_bf16=true）；
+ *   4) rope 的位置：逐 token 的 start=pos+1-ratio ⇒ ratio==1 时步长 1、ratio==2 时步长 2，
+ *      用内核自带的 stride 参数表达（theta=(start+row*stride)*freq）；
+ *   5) 缓存写入的行号：count-1 = (pos+1)/ratio - 1，对提交行而言是【连续】的
+ *      ⇒ row0=(base_pos+c_start)/ratio 起、n_commit 行，一次搬运即可。
+ *
+ * 返回：1 = 已批量完成；0 = 前提不满足（未做任何修改，调用方可安全回退）；
+ *      -1 = 已开始 dispatch 后失败（这些算子是原地改写，不能回退重做）⇒ 致命。
+ */
+static int publish_compressor_chunk(myds_context_t *ctx, uint32_t il,
+                                    uint32_t c_start, uint32_t c_len, uint32_t base_pos,
+                                    const myds_metal_buffer_t *pool_kv_buf,
+                                    const myds_metal_buffer_t *pool_score_buf,
+                                    myds_metal_buffer_t *latent_buf,
+                                    myds_metal_buffer_t *index_k_buf) {
+    myds_v41_context_t *g=ctx->v41;
+    const v41_layer_t *l=&ctx->model->v41->layers[il];
+    const uint32_t ratio=ratio_for(il), owner=owner_for(il);
+    if (!ratio || ratio > 2u || !kv_source(il) || !c_len) return 0;
+    if (!pool_kv_buf || !latent_buf || !index_k_buf) return 0;
+    /* ratio==2 必须从偶数位开始且长度为偶数，配对才与逐 token 的 previous 语义一致 */
+    if (ratio == 2u) {
+        if (!pool_score_buf) return 0;
+        if (((base_pos + c_start) & 1u) || (c_len & 1u)) return 0;
+    }
+    const uint32_t n_commit = (ratio == 2u) ? c_len / 2u : c_len;
+    if (!n_commit) return 0;
+    if (myds_metal_buffer_size(latent_buf) < (size_t)n_commit * 512u * 4u) return 0;
+    if (myds_metal_buffer_size(index_k_buf) < (size_t)n_commit * 128u * 4u) return 0;
+    const uint32_t row0 = (base_pos + c_start) / ratio;
+    if (myds_metal_buffer_size(g->compressed[owner]) < (size_t)(row0 + n_commit) * 512u * 4u) return 0;
+    if (myds_metal_buffer_size(g->index_cache[owner]) < (size_t)(row0 + n_commit) * 128u * 4u) return 0;
+    /* 1) latent */
+    if (ratio == 2u) {
+        if (!myds_v41_gpu_pool2_pairs(latent_buf, pool_kv_buf, pool_score_buf, 512u, n_commit)) return -1;
+    } else {
+        if (!myds_metal_buffer_copy(latent_buf, 0, pool_kv_buf, 0, (size_t)c_len * 512u * 4u)) return -1;
+    }
+    /* 2) 提交段：整 chunk 一次 */
+    /* 逐 token 的 start = pos+1-ratio：ratio==1 ⇒ start=pos=base+c_start+t；ratio==2 ⇒ 提交位是
+     * 奇数位 pos=base+c_start+2p+1，start=pos-1=base+c_start+2p。两种情况的【首行】都是
+     * base_pos+c_start（ratio==2 时靠 stride=2 逐行错开）。 */
+    const uint32_t first_pos = base_pos + c_start;
+    if (!myds_metal_v41_rmsnorm_batch(latent_buf, latent_buf, l->compressor_norm, 512u, n_commit,
+                                      ctx->model->norm_eps, true)) return -1;
+    if (!project_batch(index_k_buf, l->index_k, latent_buf, 128u, 512u, n_commit, GGML_TYPE_F16, true)) return -1;
+    if (!myds_metal_v41_rmsnorm_batch(index_k_buf, index_k_buf, l->index_k_norm, 128u, n_commit,
+                                      ctx->model->norm_eps, true)) return -1;
+    if (!myds_v41_gpu_rope_batch_stride(index_k_buf, 128u, 1u, first_pos, n_commit, ratio, true, false)) return -1;
+    if (!myds_v41_gpu_quant(index_k_buf, 128u, n_commit, 2u)) return -1;
+    if (!myds_metal_buffer_copy(g->index_cache[owner], (size_t)row0 * 128u * 4u, index_k_buf, 0,
+                                (size_t)n_commit * 128u * 4u)) return -1;
+    if (!myds_v41_gpu_rope_batch_stride(latent_buf, 512u, 1u, first_pos, n_commit, ratio, true, false)) return -1;
+    if (!myds_v41_gpu_quant(latent_buf, 512u, n_commit, 3u)) return -1;
+    if (!myds_metal_buffer_copy(g->compressed[owner], (size_t)row0 * 512u * 4u, latent_buf, 0,
+                                (size_t)n_commit * 512u * 4u)) return -1;
+    /* 3) 跨 chunk 的状态：逐 token 版在【每个偶数位】把 pool_kv/pool_score 拷进 previous_*，
+     *    所以 chunk 结束时的状态 = 最后一个偶数位（c_len-2）的值。 */
+    if (ratio == 2u && c_len >= 2u) {
+        if (!myds_metal_buffer_copy(g->previous_kv[owner], 0, pool_kv_buf,
+                                    (size_t)(c_len - 2u) * 512u * 4u, 512u * 4u)) return -1;
+        if (!myds_metal_buffer_copy(g->previous_score[owner], 0, pool_score_buf,
+                                    (size_t)(c_len - 2u) * 512u * 4u, 512u * 4u)) return -1;
+    }
+    return 1;
+}
+
 /* indexer 的逐 token 版（decode 路径与 prefill 的回退路径用）。 */
 static int publish_indexer_one(myds_context_t *ctx, uint32_t il, uint32_t pos,
                               const myds_metal_buffer_t *x_norm, const myds_metal_buffer_t *qr_norm,
@@ -672,6 +749,10 @@ typedef struct {
     myds_metal_buffer_t *route_ids_f32_buf;
     myds_metal_buffer_t *pool_kv_buf;
     myds_metal_buffer_t *pool_score_buf;
+    /* 压缩器批量化（publish_compressor_chunk）的临时缓冲：latent 的 512 维行与
+     * index_k 的 128 维行，各按 chunk 内【提交行数】计（ratio==1 是 c_len，ratio==2 是 c_len/2）。 */
+    myds_metal_buffer_t *comp_latent_buf;
+    myds_metal_buffer_t *comp_index_k_buf;
     myds_metal_buffer_t *index_q_buf;
     myds_metal_buffer_t *index_weights_buf;
     myds_metal_buffer_t *moe_gate_buf;
@@ -811,6 +892,8 @@ static void v41_chunk_workspace_free(v41_chunk_workspace_t *cw) {
     if (cw->route_ids_f32_buf) myds_metal_buffer_free(cw->route_ids_f32_buf);
     if (cw->pool_kv_buf) myds_metal_buffer_free(cw->pool_kv_buf);
     if (cw->pool_score_buf) myds_metal_buffer_free(cw->pool_score_buf);
+    if (cw->comp_latent_buf) myds_metal_buffer_free(cw->comp_latent_buf);
+    if (cw->comp_index_k_buf) myds_metal_buffer_free(cw->comp_index_k_buf);
     if (cw->index_q_buf) myds_metal_buffer_free(cw->index_q_buf);
     if (cw->index_weights_buf) myds_metal_buffer_free(cw->index_weights_buf);
     if (cw->moe_gate_buf) myds_metal_buffer_free(cw->moe_gate_buf);
@@ -882,6 +965,8 @@ static v41_chunk_workspace_t *v41_chunk_workspace_create(uint32_t capacity, uint
     ALLOC_BUF(route_ids_f32_buf, C * 6 * sizeof(float));
     ALLOC_BUF(pool_kv_buf, C * 512 * sizeof(float));
     ALLOC_BUF(pool_score_buf, C * 512 * sizeof(float));
+    ALLOC_BUF(comp_latent_buf, C * 512 * sizeof(float));
+    ALLOC_BUF(comp_index_k_buf, C * 128 * sizeof(float));
     ALLOC_BUF(index_q_buf, C * V41_INDEX_HEADS * 128 * sizeof(float));
     ALLOC_BUF(index_weights_buf, C * V41_INDEX_HEADS * sizeof(float));
     ALLOC_BUF(moe_gate_buf, B * 6 * exp_dim * sizeof(float));
@@ -1083,6 +1168,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     double prof_step1 = 0, prof_step2 = 0, prof_step3 = 0, prof_step4 = 0, prof_step5 = 0;
     double prof_step6 = 0, prof_step7 = 0, prof_step8 = 0;
     double prof_wait_qkv = 0, prof_wait_swa = 0, prof_wait_ffn_router = 0, prof_wait_moe = 0;
+    uint64_t disp_ringattn = 0, disp_compressor = 0;   /* 诊断：分段 dispatch 数 */
     double prof_wait_indexer = 0;   /* 诊断：Step 4 里 indexer 部分的 GPU 等待 */
     double prof_wait_attn2 = 0;     /* 诊断：ring+attention 的 GPU 等待 */
     double prof_wait_bf16 = 0;      /* 诊断：attn_heads 的 bf16 转换 */
@@ -1312,10 +1398,23 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
              * 则回退到这个逐 token 循环（两条路径应当逐位相同）。 */
             if (kv_source(il)) {
                 phase = "compressed KV";
-                for (uint32_t t = 0; t < c_len; t++) {
-                    uint32_t pos = base_pos + c_start + t;
-                    CHECK(publish_compressor(ctx, il, pos, cw->x_norm[t], cw->pool_kv[t],
-                                             ratio == 2 ? cw->pool_score[t] : NULL));
+                int comp_batched = 0;
+                if (!getenv("MYDS_COMPRESSOR_PER_TOKEN"))
+                    comp_batched = publish_compressor_chunk(ctx, il, c_start, c_len, base_pos,
+                        cw->pool_kv_buf, ratio == 2 ? cw->pool_score_buf : NULL,
+                        cw->comp_latent_buf, cw->comp_index_k_buf);
+                if (comp_batched < 0) {
+                    MYDS_LOG_E("V4.1 chunk compressor failed mid-flight (layer %u chunk %u)", il, c_start);
+                    goto fail;
+                }
+                if (!comp_batched) {
+                    uint64_t dc0 = myds_metal_dispatch_count();
+                    for (uint32_t t = 0; t < c_len; t++) {
+                        uint32_t pos = base_pos + c_start + t;
+                        CHECK(publish_compressor(ctx, il, pos, cw->x_norm[t], cw->pool_kv[t],
+                                                 ratio == 2 ? cw->pool_score[t] : NULL));
+                    }
+                    disp_compressor += myds_metal_dispatch_count() - dc0;
                 }
             }
             if (index_source(il)) {
@@ -1363,6 +1462,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 CHECK(myds_metal_begin_batch());
             }
 
+            uint64_t dr0 = myds_metal_dispatch_count();   /* 诊断 */
             /* Sliding window ring: the chunk's slots are consecutive modulo the ring, so
              * two copies cover the chunk instead of one per token.  Nothing reads the ring
              * during prefill any more (the batched attention reads the slab), but the
@@ -1421,6 +1521,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             }
 
             CHECK(myds_v41_gpu_rope_batch(cw->attn_heads_buf, 512, V41_HEADS, base_pos + c_start, c_len, compressed, true));
+            disp_ringattn += myds_metal_dispatch_count() - dr0;   /* 诊断 */
 
             if (do_prof) { disp_step4loop += myds_metal_dispatch_count() - disp_loop0; }  /* 诊断 */
 
@@ -1691,6 +1792,11 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             printf("Layer dispatches total: %10llu\n", (unsigned long long)disp_layer_all);
             printf("Layer iterations      : %10llu\n", (unsigned long long)layer_iters);
             printf("Step4 loop dispatches : %10llu\n", (unsigned long long)disp_step4loop);
+            printf("Seg: compressor       : %10llu  (%.1f / layer-iter)\n",
+                   (unsigned long long)disp_compressor, (double)disp_compressor / (double)layer_iters);
+            printf("Seg: ring+attn+bf16+rope: %9llu  (%.1f / layer-iter, %.1f / chunk-attn-call)\n",
+                   (unsigned long long)disp_ringattn, (double)disp_ringattn / (double)layer_iters,
+                   (double)disp_ringattn / (double)layer_iters);
             printf("dispatches / layer-iter: %8.1f  (Step1-4: %.1f, Step4loop: %.1f)\n",
                    kvpl, layer_iters ? (double)disp_step14 / (double)layer_iters : 0.0,
                    layer_iters ? (double)disp_step4loop / (double)layer_iters : 0.0);

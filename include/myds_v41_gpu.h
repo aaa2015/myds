@@ -17,12 +17,21 @@ int myds_v41_gpu_rope(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
     uint32_t pos,bool compressed,bool inverse);
 int myds_v41_gpu_rope_batch(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
     uint32_t start_pos,uint32_t rows,bool compressed,bool inverse);
+/* 同上，但行间的位置步长可指定（stride=1 即 rope_batch）。压缩器批量路径用它：
+ * ratio==2 的提交行位置是 first_pos + 2*row。内核算的是 theta=(start+row*stride)*freq。 */
+int myds_v41_gpu_rope_batch_stride(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
+    uint32_t start_pos,uint32_t rows,uint32_t stride,bool compressed,bool inverse);
 /* 0 BF16, 1 FP8 E8M0 scales, 2 FP4 E8M0 scales, 3 FP4 E4M3 scales. */
 int myds_v41_gpu_quant(myds_metal_buffer_t *x,uint32_t width,uint32_t rows,uint32_t mode);
 /* Even positions cache kv/scores; odd positions write the pooled output. */
 int myds_v41_gpu_pool2(myds_metal_buffer_t *out,const myds_metal_buffer_t *kv,
     const myds_metal_buffer_t *scores,myds_metal_buffer_t *previous_kv,
     myds_metal_buffer_t *previous_scores,uint32_t width,uint32_t pos);
+/* 整 chunk 版：out 的第 p 行 = 第 p 对（偶数位 kv/scores 与紧随的奇数位）合并的结果，
+ * 每对的算术与 pool2 逐 token 版完全相同（逐元素，无跨线程归约），故逐位一致。
+ * 要求 chunk 从偶数位开始且长度为偶数（调用方保证）。 */
+int myds_v41_gpu_pool2_pairs(myds_metal_buffer_t *out,const myds_metal_buffer_t *kv,
+    const myds_metal_buffer_t *scores,uint32_t width,uint32_t pairs);
 int myds_v41_gpu_indexscores(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
     const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,
     uint32_t n_comp,uint32_t n_heads);

@@ -137,14 +137,20 @@ static void init_rope(void) {
     }
 }
 #pragma float_control(pop)
-int myds_v41_gpu_rope_batch(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
-    uint32_t start_pos,uint32_t rows,bool compressed,bool inverse) {
-    if(width<64||!heads||!rows||start_pos>=1048576||!floats(x,(uint64_t)width*heads*rows))return 0;
+int myds_v41_gpu_rope_batch_stride(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
+    uint32_t start_pos,uint32_t rows,uint32_t stride,bool compressed,bool inverse) {
+    if(width<64||!heads||!rows||!stride||start_pos>=1048576||
+        (uint64_t)start_pos+(uint64_t)(rows-1u)*stride>=1048576||
+        !floats(x,(uint64_t)width*heads*rows))return 0;
     pthread_once(&rope_once,init_rope);
-    struct {uint32_t width,heads,rows,start,inverse,stride;float frequencies[32];} a={width,heads,rows,start_pos,inverse,1,{0}};
+    struct {uint32_t width,heads,rows,start,inverse,stride;float frequencies[32];} a={width,heads,rows,start_pos,inverse,stride,{0}};
     memcpy(a.frequencies,rope_frequencies[compressed?1:0],sizeof(a.frequencies));
     const myds_metal_buffer_t *b[]={x};
     return dispatch("kernel_dsv41_rope",&a,sizeof(a),b,1,heads,rows,1,32,1,1,0);
+}
+int myds_v41_gpu_rope_batch(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
+    uint32_t start_pos,uint32_t rows,bool compressed,bool inverse) {
+    return myds_v41_gpu_rope_batch_stride(x,width,heads,start_pos,rows,1u,compressed,inverse);
 }
 int myds_v41_gpu_rope(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
     uint32_t pos,bool compressed,bool inverse) {
@@ -157,6 +163,16 @@ int myds_v41_gpu_quant(myds_metal_buffer_t *x,uint32_t width,uint32_t rows,uint3
         return myds_metal_v41_bf16(x,width*rows);
     const uint32_t a[]={width,rows,mode};const myds_metal_buffer_t *b[]={x};
     return dispatch("kernel_dsv41_quantize",a,sizeof(a),b,1,(width+block-1)/block,rows,1,32,1,1,0);
+}
+/* 整 chunk 的 pool2：tail=0 ⇒ 第 p 对读 kv/scores 的第 2p、2p+1 行，
+ * 与逐 token 版（previous_* 保存前一个偶数位）结果逐位相同：每个输出元素独立计算。 */
+int myds_v41_gpu_pool2_pairs(myds_metal_buffer_t *out,const myds_metal_buffer_t *kv,
+    const myds_metal_buffer_t *scores,uint32_t width,uint32_t pairs) {
+    if(!width||!pairs||!floats(out,(uint64_t)width*pairs)||
+        !floats(kv,(uint64_t)width*2u*pairs)||!floats(scores,(uint64_t)width*2u*pairs))return 0;
+    const uint32_t a[]={width,pairs,0u};
+    const myds_metal_buffer_t *b[]={out,kv,scores,kv,kv};
+    return dispatch("kernel_dsv41_pool2",a,sizeof(a),b,5,(width+255u)/256,pairs,1,256,1,1,0);
 }
 int myds_v41_gpu_pool2(myds_metal_buffer_t *out,const myds_metal_buffer_t *kv,
     const myds_metal_buffer_t *scores,myds_metal_buffer_t *previous_kv,
