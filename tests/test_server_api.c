@@ -639,6 +639,52 @@ static void test_tool_call_event_json(void) {
     printf("  [PASS] tool call events are valid JSON in both protocols (arguments escaped)\n");
 }
 
+
+static size_t count_occurrences(const char *hay, const char *needle) {
+    size_t n = 0;
+    for (const char *p = hay; (p = strstr(p, needle)) != NULL; p += strlen(needle)) ++n;
+    return n;
+}
+
+/* Responses 形状：正文（message 项）与调用（function_call 项）必须合并成【一个】assistant 轮。
+ * 拆成两轮会多出一个 EOS 与一个 <｜Assistant｜>，于是下一轮的前缀缓存必然失配
+ * （实测每次 agent 回合都全量重跑 prefill，ttft 17s 而非 ~1s）。 */
+static void test_responses_call_merges_into_assistant_turn(void) {
+    char output[8192];
+    const char *req =
+        "{\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Weather in Beijing?\"}]},"
+        "{\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"I will check that for you.\"}]},"
+        "{\"type\":\"function_call\",\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Beijing\\\"}\",\"call_id\":\"c1\"},"
+        "{\"type\":\"function_call_output\",\"call_id\":\"c1\",\"output\":\"22C clear\"}]}";
+    assert(parse_chat_prompt(req, output, sizeof(output)));
+
+    /* 正文之后【直接】接调用块（官方模板 {reasoning}{content}{tool_calls} + 单个 EOS） */
+    assert(strstr(output, "for you.\n\n<｜DSML｜ calls>") != NULL);
+    /* 只有【一个】EOS 收这一轮 assistant；拆成两轮会出现第二个 */
+    assert(count_occurrences(output, "<｜end▁of▁sentence｜>") == 1);
+    /* <｜Assistant｜></think> 只出现两次：本轮开头 + 末尾等模型续写 */
+    assert(count_occurrences(output, "<｜Assistant｜>") == 2);
+    /* 调用必须在本轮 EOS 之前 */
+    const char *block = strstr(output, "</｜DSML｜ calls>");
+    const char *eos = strstr(output, "<｜end▁of▁sentence｜>");
+    assert(block && eos && eos > block);
+    /* 相邻的多个 function_call 项合并进【一个】块 */
+    const char *two =
+        "{\"input\":[{\"role\":\"user\",\"content\":\"hi\"},"
+        "{\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]},"
+        "{\"type\":\"function_call\",\"name\":\"a\",\"arguments\":\"{}\",\"call_id\":\"c1\"},"
+        "{\"type\":\"function_call\",\"name\":\"b\",\"arguments\":\"{}\",\"call_id\":\"c2\"},"
+        "{\"type\":\"function_call_output\",\"call_id\":\"c1\",\"output\":\"1\"},"
+        "{\"type\":\"function_call_output\",\"call_id\":\"c2\",\"output\":\"2\"}]}";
+    assert(parse_chat_prompt(two, output, sizeof(output)));
+    assert(count_occurrences(output, "<｜DSML｜ calls>") == 1);
+    assert(count_occurrences(output, "<｜end▁of▁sentence｜>") == 1);
+    assert(strstr(output, "invoke name=\"a\"") && strstr(output, "invoke name=\"b\""));
+    assert(count_occurrences(output, "<tool_result>") == 2);
+
+    printf("  [PASS] Responses text+call merge into one assistant turn (single EOS)\n");
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && !strcmp(argv[1], "--render")) {
         size_t capacity = strlen(argv[2]) * 4 + 1024;
@@ -653,6 +699,7 @@ int main(int argc, char **argv) {
     test_deepseek41_dsml_parse();
     test_deepseek41_stream_tool_calls();
     test_tool_call_event_json();
+    test_responses_call_merges_into_assistant_turn();
     printf("====================================================\n");
     printf("       Running myds Server API Unit Tests           \n");
     printf("====================================================\n");
