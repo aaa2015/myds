@@ -308,9 +308,23 @@ int myds_v41_gpu_attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buf
     if(!specialized("kernel_flash_attn_ext_vec_f16_dk512_dv512",&a,sizeof(a),b,7,
                     c_len,64,1,32,1,1,3328,c,10))return 0;
 
-    /* This chunk's tail becomes the next chunk's carry. */
-    if(!myds_metal_buffer_copy(s->kv_chunk,0,s->kv_chunk,
-            (size_t)(comp_base-MYDS_CHUNK_CARRY)*1024u,(size_t)MYDS_CHUNK_CARRY*1024u))return 0;
+    /* This chunk's tail becomes the next chunk's carry: rows [c_len, c_len + 127)
+     * move down to [0, 127).  When the chunk is shorter than the carry window the
+     * source and destination overlap, and myds_metal_buffer_copy rejects overlapping
+     * ranges on one buffer (a dispatch based copy is unordered across them), so the
+     * move happens on the CPU.  It is 127 rows, once per chunk.  Without this, any
+     * run whose last chunk is shorter than 127 rows fails outright, which is what the
+     * default chunk size of 256 produces for a prompt that is not a multiple of it. */
+    {
+        /* Two copies through a scratch buffer rather than one overlapping copy:
+         * myds_metal_buffer_copy rejects overlapping ranges on the same buffer, and
+         * a CPU move would read the slab while the dispatch that filled it may still
+         * be in flight.  Both copies below go between different buffers, and the copy
+         * helper brackets each one with a buffer memory barrier. */
+        const size_t carry_bytes=(size_t)MYDS_CHUNK_CARRY*512u*2u;
+        if(!myds_metal_buffer_copy(s->kv_f16,0,s->kv_chunk,(size_t)c_len*1024u,carry_bytes))return 0;
+        if(!myds_metal_buffer_copy(s->kv_chunk,0,s->kv_f16,0,carry_bytes))return 0;
+    }
     return 1;
 }
 
