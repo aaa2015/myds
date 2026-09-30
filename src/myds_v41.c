@@ -1493,6 +1493,23 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
              * two copies cover the chunk instead of one per token.  Nothing reads the ring
              * during prefill any more (the batched attention reads the slab), but the
              * decode path does, so it still has to be filled. */
+            /* ★ 顺序要求：必须【先】重建 carry，【再】更新环形窗。
+             * 窗是全层共享的（128 槽），更新时把本 chunk 的 token 写进槽位 (pos % 128)；
+             * 而 carry 要读的正是【本 chunk 起点之前】的 127 个槽位，两者在重启位点上必然重叠
+             * —— 先更新就会把 carry 该读的历史数据覆盖掉。
+             * （实测：续跑 c_len=13 时槽位 35..46 被换成新 token ⇒ 127 个 carry 里 12 个是错的。） */
+            /* 续跑（prefix cache）时的 carry：slab 行 [0,127) 平时由【上一层 chunk】的尾部
+             * 拷贝维持，但第一段的起点之前并没有 chunk —— 那些 KV 只存在于每层的环形窗里
+             * （decode 路径写进去的）。所以这里从窗里按位置顺序重建一次，
+             * 只在 c_start==0 且 base_pos!=0 时做。 */
+            if (c_start == 0 && base_pos != 0) {
+                phase = "carry stage";
+                if (!myds_v41_gpu_carry_stage(g->gpu, g->window[il], base_pos)) {
+                    MYDS_LOG_E("carry stage failed at layer %u (base_pos=%u)", il, base_pos);
+                    goto fail;
+                }
+            }
+
             {
                 /* The ring only holds V41_WINDOW slots, so only the chunk's last
                  * V41_WINDOW tokens survive there; the per-token path wrote all of them
@@ -1512,17 +1529,6 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
              * chunk and the compressed table prefix, and each token masks what it may not
              * see; that is the shape the shared kernel is built for, and it turns 512
              * tokens x 7 dispatches into 5. */
-            /* 续跑（prefix cache）时的 carry：slab 行 [0,127) 平时由【上一层 chunk】的尾部
-             * 拷贝维持，但第一段的起点之前并没有 chunk —— 那些 KV 只存在于每层的环形窗里
-             * （decode 路径写进去的，内容与 chunk 路径是同一个张量 ⇒ 逐位相同）。
-             * 所以这里从窗里按位置顺序重建一次。只在 c_start==0 且 base_pos!=0 时做。 */
-            if (c_start == 0 && base_pos != 0) {
-                phase = "carry stage";
-                if (!myds_v41_gpu_carry_stage(g->gpu, g->window[il], base_pos)) {
-                    MYDS_LOG_E("carry stage failed at layer %u (base_pos=%u)", il, base_pos);
-                    goto fail;
-                }
-            }
 
             {
                 uint32_t n_comp = compressed ? (base_pos + c_start + c_len) / ratio : 0;

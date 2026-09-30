@@ -2832,11 +2832,17 @@ static int myds_generate_internal(myds_context_t *ctx,
     if ((uint32_t)n_prompt - 1 > resume_from || resume_from == 0) {
         int res = myds_prefill_tokens(ctx, prompt_tokens + resume_from,
                                       n_prompt - 1 - (int32_t)resume_from, cancel_flag);
-        if (res == -2) {
-            free(prompt_tokens);
-            if (out_reason) *out_reason = MYDS_STOP_CANCELLED;
-            return 1;
-        } else if (res < 0) {
+        /* 中途失败/取消时，状态可能只推进了一部分 ⇒ 整条缓存作废（下次全量重跑）。
+         * 绝不能留下「pcache_len 说已缓存 n_prompt、而 GPU 状态只到一半」的组合：
+         * 那会让下一个请求从错误的位置续跑（直接撞 base_pos != next_position 的检查）。 */
+        if (res != 1) {
+            MYDS_LOG_W("prefix cache invalidated: prefill returned %d", res);
+            ctx->pcache_len = 0;
+            if (res == -2) {
+                free(prompt_tokens);
+                if (out_reason) *out_reason = MYDS_STOP_CANCELLED;
+                return 1;
+            }
             MYDS_LOG_E("Prefill phase failed");
             free(prompt_tokens);
             if (out_reason) *out_reason = MYDS_STOP_ERROR;
