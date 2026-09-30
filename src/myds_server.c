@@ -1234,6 +1234,10 @@ static bool sse_emit_bytes(myds_sse_stream_ctx_t *sctx, const char *piece, size_
     for (size_t k = maxk; k > 0; --k) {
         if (!memcmp(base + avail - k, open_tag, k)) { keep = k; break; }
     }
+    /* 尾部空白也先扣住：工具块通常紧跟两个换行之后，立刻发出会让客户端先看到空行。
+     * 注意必须【无条件】做 —— 若只因「标签前缀匹配成功(keep>0)」就跳过，
+     * 标签前那串换行就会被当成正文发出去（实测泄露 "\n\n"）。 */
+    while (keep < avail && (base[avail - 1 - keep] == '\n' || base[avail - 1 - keep] == '\r')) ++keep;
     size_t upto = avail - keep;
     bool ok = upto ? sse_emit_content(sctx, base, upto, false) : true;
     sctx->emitted += upto;

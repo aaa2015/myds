@@ -442,6 +442,41 @@ static void test_deepseek41_dsml_parse(void) {
     printf("  [PASS] V4.1 DSML completion parsing: content split, parameter kinds, escaping, two calls, malformed fallback\n");
 }
 
+
+/* 流式工具调用：DSML 块必须【不】作为正文发出，且必须吐出 tool_calls */
+static void test_deepseek41_stream_tool_calls(void) {
+    const char *DS = "\xef\xbd\x9c" "DSML" "\xef\xbd\x9c";
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    socket_capture_t capture = {.fd = sockets[1]};
+    pthread_t reader;
+    assert(pthread_create(&reader, NULL, capture_socket, &capture) == 0);
+    myds_sse_stream_ctx_t stream = {.client_fd = sockets[0]};
+    /* 逐片投喂：空白 + 分片到跨片边界的标签，模拟真实 token 流 */
+    const char *parts[] = {"\n", "\n", "<", DS, " calls>\n<", DS,
+                           " invoke name=\"get_weather\">\n<", DS,
+                           " parameter name=\"city\" string=\"true\">Beijing</", DS,
+                           " parameter>\n</", DS, " invoke>\n</", DS, " calls>"};
+    for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); ++i) {
+        myds_server_sse_callback(parts[i], strlen(parts[i]), (int32_t)i, &stream);
+    }
+    assert(myds_server_sse_finish(&stream));
+    assert(!stream.cancel_flag && !stream.failed);
+    assert(shutdown(sockets[0], SHUT_WR) == 0);
+    assert(pthread_join(reader, NULL) == 0);
+    size_t clen = 0;
+    char *collected = collect_sse_escaped_text(capture.bytes, 0, &clen);
+    /* 只验【回调路径】：DSML 块绝不能作为正文流出。
+     * 结构化工具调用的发射在 handle_client 的收尾里，单元测试覆盖不到 ——
+     * 那部分由集成测试（真实模型）负责。 */
+    assert(clen == 0);
+    free(collected);
+    free(capture.bytes);
+    close(sockets[0]);
+    close(sockets[1]);
+    printf("  [PASS] V4.1 streaming DSML: the call block is withheld from content, including the newlines before it\n");
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && !strcmp(argv[1], "--render")) {
         size_t capacity = strlen(argv[2]) * 4 + 1024;
@@ -454,6 +489,7 @@ int main(int argc, char **argv) {
     test_deepseek41_chat_templates();
     test_deepseek41_tool_calls();
     test_deepseek41_dsml_parse();
+    test_deepseek41_stream_tool_calls();
     printf("====================================================\n");
     printf("       Running myds Server API Unit Tests           \n");
     printf("====================================================\n");
