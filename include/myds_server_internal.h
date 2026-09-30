@@ -28,6 +28,11 @@ typedef struct {
     volatile int cancel_flag;
     bool failed;
     myds_utf8_state_t utf8;
+    /* 累积原始文本：DSML 工具块要跨 token 才能识别，识别到就停止输出正文 */
+    char *acc;
+    size_t acc_len, acc_cap;
+    size_t emitted;
+    bool in_tool_block;
 } myds_sse_stream_ctx_t;
 
 typedef struct {

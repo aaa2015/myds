@@ -1078,6 +1078,65 @@ bool myds_parse_completion_tool_calls(const char *text, size_t len, size_t *cont
     return true;
 }
 
+#define DSML_PUTS(b, lit) dsml_put((b), (lit), strlen(lit))
+static bool dsml_put_escaped(dsml_buf_t *b, const char *p, size_t n) {
+    char *e = json_escape_alloc(p, n);
+    if (!e) return false;
+    bool ok = dsml_put(b, e, strlen(e));
+    free(e);
+    return ok;
+}
+
+/* OpenAI 的 tool_calls 数组：arguments 是【JSON 字符串】。 */
+static char *openai_tool_calls_json(const myds_tool_call_t *calls, size_t count) {
+    dsml_buf_t b = {0};
+    if (!DSML_PUTS(&b, "[")) return NULL;
+    for (size_t i = 0; i < count; ++i) {
+        if ((i && !DSML_PUTS(&b, ",")) ||
+            !DSML_PUTS(&b, "{\"id\":\"") ||
+            !dsml_put_escaped(&b, calls[i].id, strlen(calls[i].id)) ||
+            !DSML_PUTS(&b, "\",\"type\":\"function\",\"function\":{\"name\":\"") ||
+            !dsml_put_escaped(&b, calls[i].name, strlen(calls[i].name)) ||
+            !DSML_PUTS(&b, "\",\"arguments\":\"") ||
+            !dsml_put_escaped(&b, calls[i].arguments, strlen(calls[i].arguments)) ||
+            !DSML_PUTS(&b, "\"}}")) { free(b.data); return NULL; }
+    }
+    if (!DSML_PUTS(&b, "]")) { free(b.data); return NULL; }
+    return b.data;
+}
+
+/* Responses API 的 output 数组：正文（若有）作 message 项，工具调用作 function_call 项。 */
+static char *responses_output_items_json(const char *content, size_t content_len,
+                                        const myds_tool_call_t *calls, size_t count) {
+    dsml_buf_t b = {0};
+    if (!DSML_PUTS(&b, "[")) return NULL;
+    bool first = true;
+    if (content_len) {
+        if (!DSML_PUTS(&b, "{\"type\":\"message\",\"id\":\"msg_myds_1\",\"role\":\"assistant\","
+                           "\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"") ||
+            !dsml_put_escaped(&b, content, content_len) ||
+            !DSML_PUTS(&b, "\"}]}")) { free(b.data); return NULL; }
+        first = false;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        char ids[96];
+        snprintf(ids, sizeof(ids), "fc_%zu", i + 1);
+        if ((!first && !DSML_PUTS(&b, ",")) ||
+            !DSML_PUTS(&b, "{\"type\":\"function_call\",\"id\":\"") ||
+            !DSML_PUTS(&b, ids) ||
+            !DSML_PUTS(&b, "\",\"call_id\":\"") ||
+            !dsml_put_escaped(&b, calls[i].id, strlen(calls[i].id)) ||
+            !DSML_PUTS(&b, "\",\"name\":\"") ||
+            !dsml_put_escaped(&b, calls[i].name, strlen(calls[i].name)) ||
+            !DSML_PUTS(&b, "\",\"arguments\":\"") ||
+            !dsml_put_escaped(&b, calls[i].arguments, strlen(calls[i].arguments)) ||
+            !DSML_PUTS(&b, "\",\"status\":\"completed\"}")) { free(b.data); return NULL; }
+        first = false;
+    }
+    if (!DSML_PUTS(&b, "]")) { free(b.data); return NULL; }
+    return b.data;
+}
+
 void myds_free_tool_calls(myds_tool_call_t *calls, size_t count) {
     for (size_t i = 0; i < count; ++i) { free(calls[i].id); free(calls[i].name); free(calls[i].arguments); }
     free(calls);
@@ -1097,7 +1156,7 @@ static bool client_disconnected(int fd) {
     return r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK);
 }
 
-static bool sse_emit_bytes(myds_sse_stream_ctx_t *sctx, const char *piece, size_t length, bool final) {
+static bool sse_emit_content(myds_sse_stream_ctx_t *sctx, const char *piece, size_t length, bool final) {
     if (sctx->cancel_flag) return false;
     if (length > (SIZE_MAX - 1) / 6 - sctx->utf8.pending_length) goto failed;
     size_t capacity = (length + sctx->utf8.pending_length) * 6 + 1;
@@ -1129,6 +1188,139 @@ failed:
     sctx->failed = true;
     sctx->cancel_flag = 1;
     return false;
+}
+
+/* 累积原始文本，并在【确认进入 DSML 工具块】之前照常输出正文 delta。
+ * 工具块一旦出现就停止输出正文 —— 收尾阶段改为发结构化工具调用。
+ * 尾部若可能是开标签的一部分，先扣住不发，避免把半截标签当正文发给客户端。 */
+static bool sse_emit_bytes(myds_sse_stream_ctx_t *sctx, const char *piece, size_t length, bool final) {
+    static const char *open_tag = "<" MYDS_DSML_S " calls>";
+    const size_t tag_len = strlen(open_tag);
+    if (length) {
+        /* 先挡住长度溢出：acc_len + length + 1 自身会回绕，
+         * 回绕后判断为「不用扩容」⇒ 直接 memcpy 到空指针（既有测试正是用 SIZE_MAX 打这里）。 */
+        if (length > SIZE_MAX - 1 - sctx->acc_len) {
+            sctx->failed = true; sctx->cancel_flag = 1;
+            return false;
+        }
+        if (sctx->acc_len + length + 1 > sctx->acc_cap) {
+            size_t cap = sctx->acc_cap ? sctx->acc_cap : 4096;
+            while (cap < sctx->acc_len + length + 1) {
+                if (cap > SIZE_MAX / 2) { sctx->failed = true; sctx->cancel_flag = 1; return false; }
+                cap *= 2;
+            }
+            char *grown = realloc(sctx->acc, cap);
+            if (!grown) { sctx->failed = true; sctx->cancel_flag = 1; return false; }
+            sctx->acc = grown; sctx->acc_cap = cap;
+        }
+        memcpy(sctx->acc + sctx->acc_len, piece, length);
+        sctx->acc_len += length;
+        sctx->acc[sctx->acc_len] = 0;
+    }
+    if (sctx->in_tool_block) return true;              /* 工具块中 ⇒ 不再输出正文 */
+    const char *base = sctx->acc + sctx->emitted;
+    size_t avail = sctx->acc_len - sctx->emitted;
+    const char *tag = avail ? dsml_find(base, sctx->acc + sctx->acc_len, open_tag) : NULL;
+    if (tag) {
+        size_t upto = (size_t)(tag - tag_len - base);
+        while (upto && (base[upto - 1] == '\n' || base[upto - 1] == '\r')) --upto;
+        bool ok = upto ? sse_emit_content(sctx, base, upto, false) : true;
+        sctx->emitted += upto;
+        sctx->in_tool_block = true;
+        return ok;
+    }
+    size_t maxk = tag_len - 1 < avail ? tag_len - 1 : avail;
+    size_t keep = 0;
+    for (size_t k = maxk; k > 0; --k) {
+        if (!memcmp(base + avail - k, open_tag, k)) { keep = k; break; }
+    }
+    size_t upto = avail - keep;
+    bool ok = upto ? sse_emit_content(sctx, base, upto, false) : true;
+    sctx->emitted += upto;
+    if (!ok) return false;
+    if (final) {
+        if (keep) {                                    /* 半截标签始终没补全 ⇒ 当正文发出去 */
+            ok = sse_emit_content(sctx, base + upto, keep, false);
+            sctx->emitted += keep;
+        }
+        ok = ok && sse_emit_content(sctx, NULL, 0, true);
+    }
+    return ok;
+}
+
+/* chat/completions：一次性给出全部工具调用的 delta（OpenAI 允许多个 index）。 */
+static char *chat_tool_calls_delta_json(const myds_tool_call_t *calls, size_t count) {
+    dsml_buf_t b = {0};
+    if (!DSML_PUTS(&b, "[")) return NULL;
+    for (size_t i = 0; i < count; ++i) {
+        char idx[32];
+        snprintf(idx, sizeof(idx), "%zu", i);
+        if ((i && !DSML_PUTS(&b, ",")) ||
+            !DSML_PUTS(&b, "{\"index\":") || !DSML_PUTS(&b, idx) ||
+            !DSML_PUTS(&b, ",\"id\":\"") || !dsml_put_escaped(&b, calls[i].id, strlen(calls[i].id)) ||
+            !DSML_PUTS(&b, "\",\"type\":\"function\",\"function\":{\"name\":\"") ||
+            !dsml_put_escaped(&b, calls[i].name, strlen(calls[i].name)) ||
+            !DSML_PUTS(&b, "\",\"arguments\":\"") ||
+            !dsml_put_escaped(&b, calls[i].arguments, strlen(calls[i].arguments)) ||
+            !DSML_PUTS(&b, "\"}}")) { free(b.data); return NULL; }
+    }
+    if (!DSML_PUTS(&b, "]")) { free(b.data); return NULL; }
+    return b.data;
+}
+
+/* chat/completions：工具调用 delta + finish_reason=tool_calls + [DONE] */
+static bool sse_emit_chat_tool_calls(myds_sse_stream_ctx_t *sctx, const myds_tool_call_t *calls, size_t count) {
+    char *tc = chat_tool_calls_delta_json(calls, count);
+    if (!tc) return false;
+    char *chunk = format_alloc(
+        "data: {\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,"
+        "\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":%s},\"finish_reason\":null}]}\n\n", tc);
+    if (!chunk) { free(tc); return false; }
+    bool sent = myds_server_send_all(sctx->client_fd, chunk, strlen(chunk));
+    free(chunk); free(tc);
+    if (!sent) return false;
+    const char *finish_chunk =
+        "data: {\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,"
+        "\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n";
+    if (!myds_server_send_all(sctx->client_fd, finish_chunk, strlen(finish_chunk))) return false;
+    const char *done = "data: [DONE]\n\n";
+    return myds_server_send_all(sctx->client_fd, done, strlen(done));
+}
+
+/* Responses API：function_call 项的 added / arguments.delta / done */
+static bool sse_emit_responses_function_calls(myds_sse_stream_ctx_t *sctx,
+                                              const myds_tool_call_t *calls, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        char ids[96];
+        snprintf(ids, sizeof(ids), "fc_%zu", i + 1);
+        char *added = format_alloc(
+            "event: response.output_item.added\n"
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":%zu,\"item\":"
+            "{\"type\":\"function_call\",\"id\":\"%s\",\"call_id\":\"%s\",\"name\":\"%s\",\"arguments\":\"\","
+            "\"status\":\"in_progress\"}}\n\n", i, ids, calls[i].id, calls[i].name);
+        if (!added) return false;
+        bool sent = myds_server_send_all(sctx->client_fd, added, strlen(added));
+        free(added);
+        if (!sent) return false;
+        char *delta = format_alloc(
+            "event: response.function_call_arguments.delta\n"
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"%s\","
+            "\"output_index\":%zu,\"delta\":\"%s\"}\n\n", ids, i, calls[i].arguments);
+        if (!delta) return false;
+        sent = myds_server_send_all(sctx->client_fd, delta, strlen(delta));
+        free(delta);
+        if (!sent) return false;
+        char *done = format_alloc(
+            "event: response.output_item.done\n"
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":%zu,\"item\":"
+            "{\"type\":\"function_call\",\"id\":\"%s\",\"call_id\":\"%s\",\"name\":\"%s\",\"arguments\":\"%s\","
+            "\"status\":\"completed\"}}\n\n", i, ids, calls[i].id, calls[i].name, calls[i].arguments);
+        if (!done) return false;
+        sent = myds_server_send_all(sctx->client_fd, done, strlen(done));
+        free(done);
+        if (!sent) return false;
+    }
+    return true;
 }
 
 void myds_server_sse_callback(const char *piece, size_t length, int32_t token_id, void *user_data) {
@@ -1416,7 +1608,29 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                     : "data: {\"error\":{\"message\":\"Inference or response encoding failed\",\"type\":\"server_error\"}}\n\ndata: [DONE]\n\n";
                 (void)myds_server_send_all(client_fd, error_event, strlen(error_event));
             } else if (!sctx.cancel_flag) {
-                if (is_responses_endpoint) {
+                /* 模型可能用 DSML 块发起工具调用 ⇒ 从累积文本里解析（与协议无关） */
+                size_t scontent_len = sctx.acc_len;
+                myds_tool_call_t *stool = NULL;
+                size_t stool_count = 0;
+                if (!sctx.acc || !myds_parse_completion_tool_calls(sctx.acc, sctx.acc_len,
+                                                                 &scontent_len, &stool, &stool_count)) {
+                    scontent_len = sctx.acc_len; stool = NULL; stool_count = 0;
+                }
+                if (!stool_count && sctx.acc && sctx.emitted < sctx.acc_len) {
+                    /* 曾疑似进入工具块但格式不合 ⇒ 把没发出的正文补出去，绝不吞内容 */
+                    (void)sse_emit_content(&sctx, sctx.acc + sctx.emitted,
+                                           sctx.acc_len - sctx.emitted, false);
+                    sctx.emitted = sctx.acc_len;
+                }
+                if (stool_count) {
+                    bool tsent = is_responses_endpoint
+                        ? sse_emit_responses_function_calls(&sctx, stool, stool_count)
+                        : sse_emit_chat_tool_calls(&sctx, stool, stool_count);
+                    if (!tsent) stop_reason = MYDS_STOP_CANCELLED;
+                    myds_free_tool_calls(stool, stool_count);
+                    stool = NULL;
+                }
+                if (!stool_count && is_responses_endpoint) {
                     char *alias_json = json_escape_alloc(model_alias ? model_alias : "myds",
                                                          strlen(model_alias ? model_alias : "myds"));
                     char *completed = alias_json ? format_alloc(
@@ -1436,7 +1650,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                         const char *error_event = "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"Response allocation failed\",\"type\":\"server_error\"}}\n\n";
                         (void)myds_server_send_all(client_fd, error_event, strlen(error_event));
                     }
-                } else {
+                } else if (!stool_count) {
                     const char *finish = (stop_reason == MYDS_STOP_LENGTH || stop_reason == MYDS_STOP_CTX_FULL) ? "length" : "stop";
                     char chunk[512];
                     int len = snprintf(chunk, sizeof(chunk),
@@ -1454,6 +1668,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             } else {
                 stop_reason = MYDS_STOP_CANCELLED;
             }
+            free(sctx.acc); sctx.acc = NULL;   /* 每请求一份累积缓冲，必须释放 */
         } else {
             myds_non_stream_ctx_t ns = {.client_fd = client_fd};
             int generated = myds_generate_bytes_ex(ctx, prompt, myds_server_non_stream_callback, &ns,
@@ -1472,23 +1687,52 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 char *response = NULL;
                 const char *finish = (stop_reason == MYDS_STOP_LENGTH || stop_reason == MYDS_STOP_CTX_FULL) ? "length" : "stop";
                 long now = (long)time(NULL);
-                if (escaped && alias_json) {
+
+                /* 模型可能在正文之后用 DSML 块发起工具调用 ⇒ 拆出来，按各自协议输出。 */
+                size_t tool_content_len = ns.len;
+                myds_tool_call_t *tool_calls = NULL;
+                size_t tool_count = 0;
+                if (!myds_parse_completion_tool_calls(ns.buf, ns.len, &tool_content_len, &tool_calls, &tool_count)) {
+                    tool_content_len = ns.len; tool_calls = NULL; tool_count = 0;   /* 格式不合 ⇒ 整段当正文 */
+                }
+                char *body_escaped = json_escape_alloc(ns.buf, tool_content_len);
+                char *calls_json = tool_count ? openai_tool_calls_json(tool_calls, tool_count) : NULL;
+                char *items_json = responses_output_items_json(ns.buf, tool_content_len, tool_calls, tool_count);
+                char *content_field = body_escaped ? format_alloc("\"%s\"", body_escaped) : NULL;
+                if (tool_count) finish = "tool_calls";
+
+                if (body_escaped && alias_json) {
                     if (is_responses_endpoint) {
-                        response = format_alloc(
+                        response = items_json ? format_alloc(
                             "{\"id\":\"resp_myds_%ld\",\"object\":\"response\",\"created_at\":%ld,"
                             "\"status\":\"completed\",\"model\":\"%s\","
-                            "\"output\":[{\"type\":\"message\",\"id\":\"msg_myds_1\",\"role\":\"assistant\",\"status\":\"completed\","
-                            "\"content\":[{\"type\":\"output_text\",\"text\":\"%s\"}]}],"
+                            "\"output\":%s,"
                             "\"usage\":{\"input_tokens\":%u,\"output_tokens\":%u,\"total_tokens\":%u}}",
-                            now, now, alias_json, escaped, prompt_tokens, final_tokens, prompt_tokens + final_tokens);
+                            now, now, alias_json, items_json,
+                            prompt_tokens, final_tokens, prompt_tokens + final_tokens) : NULL;
+                    } else if (tool_count && calls_json && content_field) {
+                        response = format_alloc(
+                            "{\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion\",\"created\":%ld,"
+                            "\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\","
+                            "\"content\":%s,\"tool_calls\":%s},"
+                            "\"finish_reason\":\"%s\"}],"
+                            "\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u}}",
+                            now, alias_json, content_field, calls_json, finish,
+                            prompt_tokens, final_tokens, prompt_tokens + final_tokens);
                     } else {
                         response = format_alloc(
                             "{\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion\",\"created\":%ld,"
-                            "\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\"},\"finish_reason\":\"%s\"}],"
+                            "\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\"},"
+                            "\"finish_reason\":\"%s\"}],"
                             "\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u}}",
-                            now, alias_json, escaped, finish, prompt_tokens, final_tokens, prompt_tokens + final_tokens);
+                            now, alias_json, body_escaped, finish, prompt_tokens, final_tokens, prompt_tokens + final_tokens);
                     }
                 }
+                free(content_field);
+                myds_free_tool_calls(tool_calls, tool_count);
+                free(items_json);
+                free(calls_json);
+                free(body_escaped);
                 free(escaped);
                 free(alias_json);
                 if (response) {
