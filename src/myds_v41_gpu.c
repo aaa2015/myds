@@ -9,13 +9,22 @@
  * 127 KV vectors, this chunk's tokens, and the compressed table prefix; the mask
  * block holds one uint16 row per token. */
 #define MYDS_CHUNK_CARRY      127u
-#define MYDS_CHUNK_MAXC       512u
+/* 单个 chunk 的 token 上界。MoE 每层要读【全部 384 个 expert】的权重（3.79 GB），
+ * 而这份开销与 chunk 内的 token 数无关 —— 只与 chunk 的【个数】有关。
+ * 512 时一个 4404 token 的 prompt 要 9 个 chunk（=9 遍 expert 权重，1.38 TB），
+ * 2048 只需 3 个。所以这个值直接决定 MoE 的总量，不该卡在 512。 */
+#define MYDS_CHUNK_MAXC       2048u
 /* ratio 1 layers index every position, so the compressed key range of a chunk is
  * as large as the position itself, not the top-k width.  These bounds cover the
  * prompts this path is used for; anything larger falls back to the per-token path. */
-#define MYDS_CHUNK_MAXCOMP    4608u
+/* 压缩键的上界。ratio_for 对 l>=20 的层返回 1，此时 n_comp 就是【绝对位置】，
+ * 而 4608 的旧值意味着 prompt 一旦超过 ~4608 token，第 20 层以上就会
+ * attention_chunk 返回 0 ⇒ 整个 prefill 失败。抬到 16384（≈16k 上下文）。 */
+#define MYDS_CHUNK_MAXCOMP    16384u
 #define MYDS_CHUNK_SLAB_ROWS  (MYDS_CHUNK_CARRY + MYDS_CHUNK_MAXC + MYDS_CHUNK_MAXCOMP)
-#define MYDS_CHUNK_MASK_U16   5248u   /* multiple of 32 so no key padding is needed */
+/* 掩码行的步长（u16 为单位）= 32 对齐的 keys 上界 = CARRY + MAXC + MAXCOMP 向上取整，
+ * 这样 keys_pad 永远落在行内，不需要额外的填充缓冲。 */
+#define MYDS_CHUNK_MASK_U16   18560u  /* multiple of 32 so no key padding is needed */
 
 struct myds_v41_gpu_scratch {
     uint32_t max_comp;
@@ -293,8 +302,16 @@ int myds_v41_gpu_attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buf
          * Resetting the full region (not just n_comp columns) also clears the picks the
          * previous chunk left open. */
         const myds_metal_buffer_t *fb[]={s->mask_chunk};
-        if(!dispatch("kernel_myds_mask_chunk_fill",&ma,sizeof(ma),fb,1,
-                     MYDS_CHUNK_MASK_U16-comp_base,c_len,1,64,1,1,0))return 0;
+        /* 只清【真正在用】的压缩列 [comp_base, comp_base+n_comp)。
+         * 位置单调递增 ⇒ 上一个 chunk 打开的 picks 一定落在这个区间内，所以够用；
+         * 而模板在 (c_len,carry) 变化时会把 comp_base 之后的列全部置为不可见。
+         * 线程组数按 [64 线程/组] 折算 —— 原来是直接拿「编译期的列跨度」当组数，
+         * 于是 64 倍的线程空转，且随 MASK_U16 一起变大（抬上限时实测慢了 2.1s）。 */
+        {
+            const uint32_t fill_groups=(n_comp+63u)/64u;
+            if(fill_groups&&!dispatch("kernel_myds_mask_chunk_fill",&ma,sizeof(ma),fb,1,
+                                     fill_groups,c_len,1,64,1,1,0))return 0;
+        }
         const myds_metal_buffer_t *sb[]={s->mask_chunk,ids};
         if(!dispatch("kernel_myds_mask_chunk_scatter",&ma,sizeof(ma),sb,2,top_k,c_len,1,64,1,1,0))return 0;
     }
