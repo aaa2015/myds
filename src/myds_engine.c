@@ -2810,6 +2810,41 @@ static int myds_generate_internal(myds_context_t *ctx,
                        n_prompt, ctx->pcache_len, L,
                        resume_from ? "resume from " : "full prefill",
                        resume_from ? "cached prefix" : "");
+            /* 复用要求【严格续写】。一旦失配，唯一有用的问题是「在第几个 token 分叉、
+             * 两边分别是什么」——否则只能猜是渲染差异还是 token 往返差异。
+             * 这里把分歧点两侧各 3 个 token（id + 转义后的文本）打出来。 */
+            if (resume_from == 0) {
+                char why[640];
+                size_t o = 0;
+                #define APPEND_TOK(TAG, ARR, IDX)                                            \
+                    do {                                                                     \
+                        int32_t _id = (int32_t)(ARR)[IDX];                                   \
+                        const char *_t = (m->tokenizer && _id >= 0 &&                        \
+                                          (uint32_t)_id < m->tokenizer->vocab_size &&        \
+                                          m->tokenizer->vocab[_id].decoded)                  \
+                            ? m->tokenizer->vocab[_id].decoded : "?";                        \
+                        int _w = snprintf(why + o, sizeof(why) - o, "%s[%u]=%d:", TAG, (IDX), _id); \
+                        if (_w > 0) o += (size_t)_w;                                         \
+                        for (const char *_q = _t; *_q && o + 6 < sizeof(why); ++_q) {        \
+                            unsigned char _c = (unsigned char)*_q;                           \
+                            if (_c == '\n') { memcpy(why + o, "\\n", 2); o += 2; }          \
+                            else if (_c == '\r') { memcpy(why + o, "\\r", 2); o += 2; }      \
+                            else if (_c < 0x20 || _c == 0x7f) {                              \
+                                int _w2 = snprintf(why + o, sizeof(why) - o, "\\x%02x", _c); \
+                                if (_w2 > 0) o += (size_t)_w2;                                \
+                            } else why[o++] = (char)_c;                                      \
+                        }                                                                    \
+                        why[o++] = ' ';                                                      \
+                    } while (0)
+                uint32_t lo = L > 3 ? L - 3 : 0;
+                for (uint32_t k = lo; k <= L && o + 80 < sizeof(why); ++k) APPEND_TOK("c", ctx->pcache_tokens, k);
+                APPEND_TOK("|", ctx->pcache_tokens, L + 1 < ctx->pcache_len ? L + 1 : L);
+                for (uint32_t k = lo; k <= L && o + 80 < sizeof(why); ++k) APPEND_TOK("p", prompt_tokens, k);
+                APPEND_TOK("|", prompt_tokens, (uint32_t)n_prompt > L + 1 ? L + 1 : L);
+                #undef APPEND_TOK
+                why[o < sizeof(why) ? o : sizeof(why) - 1] = 0;
+                MYDS_LOG_I("prefix cache divergence at %u: %s", L, why);
+            }
         }
     }
     /* 缓存序列的落点：容量按配置的上下文一次要够（续跑时只追加，所以不重排前缀）。 */
