@@ -1027,12 +1027,19 @@ static bool parse_chat_prompt_impl(const char *body, char *out_prompt, size_t ma
     }
     const prompt_json_node_t *items = messages ? messages : input ? input : prompt;
     /* 工具块要插在 system 消息之后；先看 items 里有没有 system 角色。 */
+    /* 历史里有没有 system 消息 —— ★ 与 has_tools 无关：
+     * 之前只在有 tools 时才算，于是「无 tools 但历史带 system」时判定漏掉，
+     * 系统提示词照样进两遍。这里无条件扫（只扫 items 的角色字段，代价可忽略）。 */
     bool system_in_items = false;
-    if (has_tools && items->kind == PJ_ARRAY) {
+    const prompt_json_node_t *first_system = NULL;
+    if (items->kind == PJ_ARRAY) {
         for (size_t i = (size_t)(items - json.nodes) + 1; i < items->next; i = json.nodes[i].next) {
             bool v2 = true;
             const prompt_json_node_t *r = prompt_json_field(&json, &json.nodes[i], "role", &v2);
-            if (r && r->kind == PJ_STRING && !strcmp(r->text, "system")) { system_in_items = true; break; }
+            if (r && r->kind == PJ_STRING && !strcmp(r->text, "system")) {
+                system_in_items = true;
+                if (!first_system) first_system = &json.nodes[i];
+            }
         }
     }
     bool tools_done = false;
@@ -1052,7 +1059,27 @@ static bool parse_chat_prompt_impl(const char *body, char *out_prompt, size_t ma
         goto render_items;
     }
     if (!prompt_append(&out, "<｜begin▁of▁sentence｜>")) { *why = "the prompt buffer is too small"; goto done; }
-    if (instructions && instructions->kind != PJ_NULL) {
+    /* ── 系统提示词去重（2026-10-01 线上实证）──
+     * 客户端可能【同时】发 instructions 字段、又在 input 历史里带一条 system 消息
+     * （OpenClaw 就是这样）。旧逻辑只要看到 instructions 就渲染 ⇒ 系统提示词进两遍：
+     *   实测 渲染出的提示词里系统提示词出现 2 次，prompt_chars 从 21073 涨到 42428。
+     * 代价是 token 与延迟翻倍，而且模型会看到两遍同样的指令。
+     * 规则：历史里已有 system 消息 ⇒ 以【历史】为准，跳过 instructions。
+     *   · 历史是这段对话的既成事实，丢历史消息比丢一个重复字段更危险；
+     *   · 这样渲染结果也更稳定（利于前缀缓存）。
+     * tools 不受影响：它仍会渲染在历史那条 system 消息之后（见下方 items 循环）。 */
+    if (instructions && instructions->kind != PJ_NULL && system_in_items) {
+        /* 两边文本不同 ⇒ 我们正丢掉 instructions 字段里的一份内容。不静默做这件事。 */
+        bool v3 = true;
+        const prompt_json_node_t *sys_content =
+            first_system ? prompt_json_field(&json, first_system, "content", &v3) : NULL;
+        const char *hist_text = (sys_content && sys_content->kind == PJ_STRING) ? sys_content->text : NULL;
+        if (!hist_text || strcmp(hist_text, instructions->text)) {
+            MYDS_LOG_W("instructions 与历史里的 system 消息内容不同 —— 以【历史】为准，"
+                       "本次忽略 instructions 字段（避免系统提示词进两遍）");
+        }
+    }
+    if (instructions && instructions->kind != PJ_NULL && !system_in_items) {
         if (instructions->kind != PJ_STRING ||
             !prompt_render_message(&out, &state, "system", instructions->text, NULL)) goto done;
         if (has_tools) {
