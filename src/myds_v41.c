@@ -219,7 +219,11 @@ bool myds_v41_snapshot_restore(myds_v41_context_t *g, uint32_t p) {
  * 开 way 之后：同一位置可以同时容纳 W 个不同前缀（按前缀哈希区分），
  * 默认 3 ⇒ 可容纳三套「system + tools」互不干扰；条目总数 11×3=33，文件约 1.5 GiB。 */
 #define V41_LOWKV_WAYS_DEFAULT 3u
-#define V41_LOWKV_WAYS_MAX     8u
+/* 上限。磁盘充足时调大即可：每个 way 约 511 MiB（11 个位置组 × 最深位置 47.5 MiB）。
+ * 32 way = 16.33 GiB，可同时容纳 32 套不同的「system + tools」。
+ * ★ 调大只需改 MYDS_KV_DSK_WAYS：槽数不进身份戳，但 open 时会比对槽数 ⇒
+ *   自动重建文件（旧内容作废，代价是一次冷 prefill），不会读写错位。 */
+#define V41_LOWKV_WAYS_MAX     32u
 #define V41_LOWKV_NO_ENTRY     0xFFFFFFFFu
 
 static void lk_put_u32(unsigned char *p, uint32_t v) {
@@ -505,16 +509,25 @@ uint32_t myds_v41_low_kv_load(myds_v41_context_t *g, const int32_t *tokens, uint
     if (max_position < V41_SNAP_MIN) return 0;
 
     /* 取【最深】的匹配条目：位置越深，免掉的 prefill 越多。
-     * 扫全部条目（位置组 × way）—— 同一组内的 way 装的是同一个位置，只是前缀不同，
-     * 所以同组内只比哈希；跨组才比深度。 */
+     *
+     * 迭代【位置组】而不是【条目】：组的位置可以直接算出来（第 gi 组 = MIN + gi×STRIDE），
+     * 而组内所有 way 装的是同一个位置 ⇒ 哈希【每位置只算一次】。
+     * 32 way 时这一步把 352 次 O(p) 哈希降回 11 次 —— 按条目扫会让每次请求
+     * 白白多算约 1.2M 个 token 哈希（那是真正的浪费，因为它对每个 way 重算一遍）。 */
     uint32_t best_entry = V41_LOWKV_NO_ENTRY, best_pos = 0;
-    const uint32_t n_entries = MYDS_SNAP_PINNED * g->low_ways;
-    for (uint32_t e = 0; e < n_entries; ++e) {
-        uint32_t p = 0; uint64_t hh = 0, hu = 0;
-        if (!myds_kvdsk_slot_meta(g->low_store, e, &p, &hh, &hu)) continue;
-        if (p > max_position || p <= best_pos) continue;
-        if (myds_kvdsk_hash_tokens(tokens, p) != hh) continue;   /* 前缀不同 ⇒ 这份字节不是给它的 */
-        best_entry = e; best_pos = p;
+    for (uint32_t gi = 0; gi < MYDS_SNAP_PINNED; ++gi) {
+        const uint32_t group_pos = MYDS_SNAP_MIN + gi * MYDS_SNAP_STRIDE;
+        if (group_pos > max_position || group_pos <= best_pos) continue;
+        const uint64_t want = myds_kvdsk_hash_tokens(tokens, group_pos);
+        for (uint32_t w = 0; w < g->low_ways; ++w) {
+            const uint32_t e = lowkv_entry_index(g, gi, w);
+            uint32_t p = 0; uint64_t hh = 0, hu = 0;
+            if (!myds_kvdsk_slot_meta(g->low_store, e, &p, &hh, &hu)) continue;
+            if (p == group_pos && hh == want) {   /* 前缀逐 token 相同 ⇒ 这份字节就是给它的 */
+                best_entry = e; best_pos = group_pos;
+                break;                            /* 一组内位置相同，命中一个就够 */
+            }
+        }
     }
     if (best_entry == V41_LOWKV_NO_ENTRY) return 0;
     const uint32_t best_slot = best_entry / g->low_ways + 1u;

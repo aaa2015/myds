@@ -263,6 +263,76 @@ static void test_policy_handles_no_way(void) {
           "没有 way 时必须明确返回 NO_WAY（不能瞎返回 0）");
 }
 
+
+/* ── 32 way：容量与索引边界 ──
+ * 「加大到 32 套」有两处会出错，都不报错、只表现为诡异行为：
+ *   ① 策略没真的给出 32 个独立位置 ⇒ 第 4 套就把第 1 套顶掉（上限虚标）
+ *   ② 条目编号 = 组×way + way 的算术在大表上偏一位 ⇒ 写到别人的格子里
+ */
+#define T32_WAYS 32u
+
+static void test_policy_holds_32_prefixes(void) {
+    myds_lowkv_way_t ways[T32_WAYS];
+    for (uint32_t i = 0; i < T32_WAYS; i++) ways[i] = W(false, 0, 0, 0);
+    /* 32 个不同前缀依次写入：每一个都必须拿到【自己的】格子（0..31 各不相同） */
+    bool used[T32_WAYS] = {false};
+    for (uint32_t k = 0; k < T32_WAYS; k++) {
+        bool already = false;
+        const uint32_t w = myds_lowkv_pick_way(ways, T32_WAYS, 4608, 0x1000 + k, &already);
+        CHECK(!already, "第 %u 个前缀不该被当成已有条目", k);
+        CHECK(w < T32_WAYS, "第 %u 个前缀必须拿到合法格子（实际 %u）", k, w);
+        if (w < T32_WAYS) {
+            CHECK(!used[w], "格子 %u 被两个前缀共用（第 %u 个前缀）", w, k);
+            used[w] = true;
+            ways[w] = W(true, 4608, 0x1000 + k, 0);
+        }
+    }
+    /* 全部占满 ⇒ 第 33 个只能是淘汰，不能再凭空多出格子 */
+    bool already = false;
+    const uint32_t w33 = myds_lowkv_pick_way(ways, T32_WAYS, 4608, 0xBEEF, &already);
+    CHECK(!already && w33 < T32_WAYS, "占满后必须是淘汰（实际 way %u）", w33);
+
+    /* 前面 31 个都各被命中过 5 次，只有 7 号从没命中 ⇒ 淘汰必须选它 */
+    for (uint32_t i = 0; i < T32_WAYS; i++) if (i != 7u) ways[i].hits = 5;
+    ways[7].hits = 0;
+    const uint32_t w = myds_lowkv_pick_way(ways, T32_WAYS, 4608, 0xBEEF, NULL);
+    CHECK(w == 7u, "必须淘汰唯一没被命中过的那个（way 7），实际 %u", w);
+}
+
+static void test_storage_handles_a_32_way_table(void) {
+    /* 352 条的大表：验索引算术与最后一条的读写（偏一位在这一层就会被抓住） */
+    fresh_path("big", 0);
+    const uint32_t slots = 11u * T32_WAYS;      /* 352 */
+    myds_kvdsk_t *k = myds_kvdsk_open(g_path, 7u, slots, 512u, 0);
+    CHECK(k != NULL, "open 352 条失败: %s", myds_kvdsk_open_error());
+    if (!k) return;
+
+    const uint32_t last = slots - 1u;           /* 组 10、way 31 */
+    CHECK(last / T32_WAYS == 10u && last % T32_WAYS == 31u, "条目编号算术不符预期");
+
+    unsigned char w[200], r[200];
+    fill(w, sizeof(w), 11);
+    const uint64_t hash = myds_kvdsk_hash_tokens((const int32_t[]){9,8,7}, 3);
+    CHECK(myds_kvdsk_write_start(k, last), "write_start(last)");
+    CHECK(myds_kvdsk_write_chunk(k, 0, w, sizeof(w)), "write_chunk(last)");
+    CHECK(myds_kvdsk_write_finish(k, last, 6144u, hash, sizeof(w)), "write_finish(last)");
+
+    uint32_t pos = 0; uint64_t hh = 0, used = 0;
+    CHECK(myds_kvdsk_slot_meta(k, last, &pos, &hh, &used), "读回最后一条");
+    CHECK(pos == 6144u && hh == hash, "最后一条的元信息不符");
+    uint64_t got = 0;
+    CHECK(myds_kvdsk_read_start(k, last, &got), "read_start(last)");
+    memset(r, 0, sizeof(r));
+    CHECK(myds_kvdsk_read_chunk(k, 0, r, sizeof(w)), "read_chunk(last)");
+    CHECK(myds_kvdsk_read_finish(k), "read_finish(last)");
+    CHECK(memcmp(w, r, sizeof(w)) == 0, "最后一条的数据必须逐字节相同");
+    CHECK(myds_kvdsk_live_entries(k) == 1u, "应当只有 1 条有效（其余 351 格是空的）");
+    /* 相邻格子必须仍是空的 —— 否则就是越界写 */
+    uint32_t p2 = 0;
+    CHECK(!myds_kvdsk_slot_meta(k, last - 1u, &p2, NULL, NULL), "相邻格必须是空的（没越界写）");
+    myds_kvdsk_close(k);
+}
+
 int main(void) {
     printf("myds 低位区 KV 落盘（存储层）\n");
     test_hash_is_stable_and_discriminating();
@@ -279,7 +349,9 @@ int main(void) {
     test_policy_with_one_way_must_displace();
     test_policy_evicts_the_least_hit_when_full();
     test_policy_handles_no_way();
-    if (failures == 0) { printf("  ✓ 13 组断言全部通过\n"); return 0; }
+    test_policy_holds_32_prefixes();
+    test_storage_handles_a_32_way_table();
+    if (failures == 0) { printf("  ✓ 15 组断言全部通过\n"); return 0; }
     printf("  ✗ %d 处断言失败\n", failures);
     return 1;
 }
