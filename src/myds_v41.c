@@ -49,6 +49,19 @@ struct myds_v41_model {
     float hc_eps;
 };
 
+/* ── 前缀快照 ──
+ * 引擎里唯一【无法从「按位置索引」重建】的状态有两样：
+ *   · 窗口环（每层 128 槽）—— raw KV 只存在这里，而它只保留【最后 128 个位置】；
+ *   · engram 的滚动 tail[3] —— 且它在【层循环之前】就已被推到 prompt 末尾。
+ * 压缩 KV 与 index cache 都是按位置累积的，续跑时直接用，因此不入快照。
+ * 窗口环事后无法回溯（已被后续 token 覆盖）⇒ 必须在 prefill【经过】该位置时就存下来。
+ * 槽位用确定性映射（P/STRIDE % SLOTS）：engram 循环与层循环各自独立写入，
+ * 但映射与覆盖顺序一致 ⇒ 同一槽里的 engram 与各层窗口环必然对应同一个 P。
+ * ds4 的对应机制见 ds4_kvstore.c: boundary_trim/align + find_text_prefix（默认 trim=32/align=2048）。 */
+#define V41_SNAP_SLOTS   8u
+#define V41_SNAP_STRIDE  512u   /* 快照点必须是 chunk 边界，且为 ratio(2)/32 键块对齐的倍数 */
+#define V41_SNAP_MIN     1024u  /* 太短的点不值一份窗口环；保留最近 SLOTS 个点 */
+
 struct myds_v41_context {
     myds_engram_t *engram;
     myds_v41_gpu_scratch_t *gpu;
@@ -58,6 +71,11 @@ struct myds_v41_context {
     myds_metal_buffer_t *attn_split, *ffn_split, *pre;
     myds_metal_buffer_t *engram_rows[2], *engram_kv;
     myds_metal_buffer_t *window[V41_LAYERS];
+    /* 快照：每槽把 V41_LAYERS 层的窗口环连续存放（40 x 256 KB = 10.5 MB/槽） */
+    myds_metal_buffer_t *snap_window[V41_SNAP_SLOTS];
+    uint32_t              snap_pos[V41_SNAP_SLOTS];      /* 0 = 空槽 */
+    myds_engram_history_t snap_engram[V41_SNAP_SLOTS];
+    bool                  snap_enabled;
     myds_metal_buffer_t *compressed[4], *index_cache[4];
     myds_metal_buffer_t *previous_kv[4], *previous_score[4];
     myds_metal_buffer_t *pool_kv, *pool_score, *latent;
@@ -65,6 +83,55 @@ struct myds_v41_context {
     myds_metal_buffer_t *selected, *selected_kv;
     myds_metal_buffer_t *block_scores, *block_selected, *block_mask;
 };
+
+/* 每次请求开始前清空：本次 prefill 会重建属于【本次序列】的点。
+ * 这样就不会用到「被后续请求改写过的压缩 KV」所对应的旧点 —— 那会让续跑接在错误的状态上。 */
+void myds_v41_snapshot_clear(myds_v41_context_t *g) {
+    if (!g) return;
+    memset(g->snap_pos, 0, sizeof(g->snap_pos));
+}
+
+static uint32_t snapshot_slot(uint32_t p) {
+    return (p / V41_SNAP_STRIDE) % V41_SNAP_SLOTS;
+}
+/* 处理完位置 p 之后，记下 engram 的滚动状态。在 engram 循环里调用（层循环之前）。 */
+static void snapshot_store_engram(myds_v41_context_t *g, uint32_t p) {
+    if (!g->snap_enabled || p < V41_SNAP_MIN || (p % V41_SNAP_STRIDE)) return;
+    const uint32_t s = snapshot_slot(p);
+    g->snap_pos[s] = p;
+    g->snap_engram[s] = g->engram->history;
+}
+/* 在层循环里、每个 chunk 结束时调用：把【本层】在 p 处的窗口环存进对应槽。
+ * snap_pos 里此时是 engram 侧跑完整段后的【最终】映射 ⇒ 若该槽已属于别的 p（被环形覆盖），
+ * 这里直接跳过。这既丢弃了过期点，又保证同一槽里的 engram 与窗口环必属同一个 p。 */
+static bool snapshot_store_window(myds_v41_context_t *g, uint32_t il, uint32_t p) {
+    if (!g->snap_enabled || p < V41_SNAP_MIN || (p % V41_SNAP_STRIDE)) return true;
+    const uint32_t s = snapshot_slot(p);
+    if (g->snap_pos[s] != p) return true;
+    const size_t bytes = (size_t)V41_WINDOW * V41_HEAD_DIM * 4u;
+    return myds_metal_buffer_copy(g->snap_window[s], (size_t)il * bytes, g->window[il], 0, bytes);
+}
+/* 在 [0, common] 内选最大的快照点 */
+uint32_t myds_v41_snapshot_best(const myds_v41_context_t *g, uint32_t common) {
+    if (!g->snap_enabled) return 0;
+    uint32_t best = 0;
+    for (uint32_t s = 0; s < V41_SNAP_SLOTS; ++s)
+        if (g->snap_pos[s] && g->snap_pos[s] <= common && g->snap_pos[s] > best) best = g->snap_pos[s];
+    return best;
+}
+/* 把某点的【全部】状态装回去：engram tail + 各层窗口环（carry 随后由 carry_stage 从窗口环重建） */
+bool myds_v41_snapshot_restore(myds_v41_context_t *g, uint32_t p) {
+    for (uint32_t s = 0; s < V41_SNAP_SLOTS; ++s) {
+        if (g->snap_pos[s] != p) continue;
+        g->engram->history = g->snap_engram[s];
+        const size_t bytes = (size_t)V41_WINDOW * V41_HEAD_DIM * 4u;
+        for (uint32_t il = 0; il < V41_LAYERS; ++il)
+            if (!myds_metal_buffer_copy(g->window[il], 0, g->snap_window[s], (size_t)il * bytes, bytes))
+                return false;
+        return true;
+    }
+    return false;
+}
 
 static uint32_t ratio_for(uint32_t l) { return l < 2 ? 0 : l < 20 ? 2 : 1; }
 static uint32_t owner_for(uint32_t l) { return l < 8 ? 0 : l < 14 ? 1 : l < 20 ? 2 : 3; }
@@ -245,6 +312,8 @@ myds_v41_context_t *myds_v41_context_create(myds_context_t *ctx) {
     A(engram_rows[0],MYDS_ENGRAM_INPUT_DIM); A(engram_rows[1],MYDS_ENGRAM_INPUT_DIM);
     A(engram_kv,5*V41_DIM);
     for (uint32_t i=0;i<V41_LAYERS;i++) A(window[i],V41_WINDOW*V41_HEAD_DIM);
+    for (uint32_t si=0;si<V41_SNAP_SLOTS;si++) A(snap_window[si],V41_LAYERS*V41_WINDOW*V41_HEAD_DIM);
+    g->snap_enabled=getenv("MYDS_NO_PREFIX_SNAPSHOT")==NULL;
     for (uint32_t i=0;i<4;i++) {
         const size_t rows=i==3 ? g->capacity : (g->capacity+1u)/2u;
         A(compressed[i],rows*512); A(index_cache[i],rows*128);
@@ -268,6 +337,7 @@ void myds_v41_context_free(myds_v41_context_t *g) {
     F(residual); F(after_attn); F(flat_norm); F(mix); F(attn_split); F(ffn_split); F(pre);
     F(engram_rows[0]); F(engram_rows[1]); F(engram_kv);
     for (uint32_t i=0;i<V41_LAYERS;i++) F(window[i]);
+    for (uint32_t si=0;si<V41_SNAP_SLOTS;si++) F(snap_window[si]);
     for (uint32_t i=0;i<4;i++) { F(compressed[i]); F(index_cache[i]); F(previous_kv[i]); F(previous_score[i]); }
     F(pool_kv); F(pool_score); F(latent); F(index_k); F(index_q); F(index_weights);
     F(index_scores); F(selected); F(selected_kv); F(block_scores); F(block_selected); F(block_mask);
@@ -1215,6 +1285,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             MYDS_LOG_E("V4.1 engram prepare failed at pos %u", pos);
             goto fail;
         }
+        snapshot_store_engram(g, pos + 1u);   /* 处理完 pos ⇒ 已推进到 pos+1 */
         memcpy(engram_all[0] + (size_t)t * MYDS_ENGRAM_INPUT_DIM,
                g->engram->row_values[0], MYDS_ENGRAM_INPUT_DIM * sizeof(float));
         memcpy(engram_all[1] + (size_t)t * MYDS_ENGRAM_INPUT_DIM,
@@ -1790,6 +1861,10 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 }
                 moe_off = 0;
             }
+            /* ★ 前缀快照：本层在本 chunk 结束处的窗口环。此刻它正好含 [p-128, p-1]，
+             * 而这 128 槽随后会被后面的 token 覆盖 ⇒ 只能在这里存下来（事后无法回溯）。
+             * 与 engram 的保存用同一个确定性槽位映射，故两者必然属于同一个 p。 */
+            if (!snapshot_store_window(g, il, base_pos + c_start + c_len)) goto fail;
             TIME_ACC(prof_step8);
 
             TIME_START();
