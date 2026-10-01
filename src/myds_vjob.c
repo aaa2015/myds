@@ -293,6 +293,7 @@ int myds_vjob_sink_add(myds_vjob_sink_t *sink, const uint8_t *encoded, size_t le
     myds_vjob_plan_t fresh;
     if (!myds_vjob_plan(encoded, len, &fresh, error, error_cap)) {
         sink->failed = true;
+        if (error) snprintf(sink->why, sizeof(sink->why), "%.190s", error);
         return 0;
     }
     g_misses++;

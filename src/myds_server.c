@@ -668,7 +668,12 @@ static bool prompt_append(prompt_buffer_t *b, const char *text) {
  * 等提示词全部拼好后由调用方按位置注入。 */
 /* 每条早退都报原因：静默失败会让「图片没生效」变成一个很难查的现象
  * ——第一版就是只回一句「不支持的内容块」，看不出到底哪一步不认。 */
-#define IMG_REJECT(why) do { MYDS_LOG_E("input_image 被拒: %s", (why)); return false; } while (0)
+/* ★ 宏参数名不能取 why：预处理器按 token 替换，会把 img->why 里的 why 一并替掉，
+ *   变成 img->"…"。这种错编译器只报 "expected identifier"，很难一眼看出。 */
+#define IMG_REJECT(msg_) do { \
+        MYDS_LOG_E("input_image 被拒: %s", (msg_)); \
+        if (img) snprintf(img->why, sizeof(img->why), "%.190s", (msg_)); \
+        return false; } while (0)
 
 static bool prompt_content_image(const prompt_json_t *j, const prompt_json_node_t *node,
                                  prompt_buffer_t *out, myds_vjob_sink_t *img) {
@@ -1998,12 +2003,16 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             : parse_chat_prompt_vis(body, prompt, prompt_cap, &parse_reason, &img_sink);
         if (!parsed_ok) {
             /* 必须落日志：此前这条路径【完全不记录】，导致线上只能看到一个笼统的 400。 */
-            MYDS_LOG_W("[%s:%d] ChatCompletions rejected (400): %s [body=%zd bytes, prompt_cap=%zu]",
-                       client_ip, client_port, parse_reason, total_read, prompt_cap);
+            MYDS_LOG_W("[%s:%d] rejected (400): %s%s%s [body=%zd bytes, prompt_cap=%zu]",
+                       client_ip, client_port, parse_reason,
+                       img_sink.why[0] ? " — " : "", img_sink.why, total_read, prompt_cap);
             char err[512];
+            /* 把【具体原因】回给调用方：笼统的 "unsupported content block" 看不出
+             * 是「字段缺失」「格式不对」还是「图片处理失败」，排查代价极高。 */
             snprintf(err, sizeof(err),
-                     "{\"error\":{\"message\":\"Invalid or unsupported text prompt: %s\",\"type\":\"invalid_request_error\"}}",
-                     parse_reason ? parse_reason : "unknown");
+                     "{\"error\":{\"message\":\"Invalid or unsupported text prompt: %s%s%s\",\"type\":\"invalid_request_error\"}}",
+                     parse_reason ? parse_reason : "unknown",
+                     img_sink.why[0] ? " — " : "", img_sink.why);
             send_response(client_fd, 400, "Bad Request", "application/json", err);
             free(prompt);
             free(req_buf);

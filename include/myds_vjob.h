@@ -47,6 +47,7 @@ typedef struct myds_vjob_sink_s {
     uint32_t          count;
     uint32_t          cap;
     bool              failed;     /* 某个图片块处理失败 ⇒ 整个请求应当被拒 */
+    char              why[192];   /* 失败原因（要回给调用方，不能只写日志） */
 } myds_vjob_sink_t;
 
 /* 往 sink 里追加一张图（服务端内部用；失败时置 failed 并返回 false）。 */
