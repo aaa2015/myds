@@ -71,6 +71,22 @@ static int dispatch_rows(const char *kernel, uint32_t width, uint32_t rows,
                                       groups, threads, 0);
 }
 
+/* 按行批处理的 RMSNorm（含 BF16 舍入）。★ 不能用引擎的单行 rmsnorm：
+ *   那个只处理第 0 行 —— 见 metal/visenc.metal 的说明。 */
+static int dispatch_rmsnorm(const char *k, myds_metal_buffer_t *out,
+                            myds_metal_buffer_t *x, myds_metal_buffer_t *weight,
+                            uint32_t width, uint32_t rows, float eps) {
+    struct { uint32_t width, rows; float eps; } args = { width, rows, eps };
+    const myds_metal_buffer_t *b[3];
+    myds_metal_buffer_t *bs[3] = { x, weight, out };
+    b[0] = bs[0]; b[1] = bs[1]; b[2] = bs[2];
+    const uint32_t groups[3] = { rows, 1u, 1u };
+    const uint32_t threads[3] = { 256u, 1u, 1u };
+    return myds_metal_dispatch_kernel(k, &args, sizeof(args),
+                                      (const myds_metal_buffer_t *const *)bs, 3,
+                                      groups, threads, 8u * sizeof(float));
+}
+
 int myds_vis_encode(const myds_vis_weights *w, const myds_vis_patches *patches,
                     float *out, uint32_t *out_rows, char *error, size_t error_cap) {
     if (!w || !patches || !patches->patches || !out) {
@@ -151,8 +167,8 @@ int myds_vis_encode(const myds_vis_weights *w, const myds_vis_patches *patches,
 
         /* --- 注意力分支 --- */
         STAGE("rmsnorm norm1");
-        ok = myds_metal_rmsnorm(tmp, cur, L->norm1, VIS_WIDTH, eps);
-        if (ok) ok = dispatch_rows("kernel_visenc_round", VIS_WIDTH, rows, &tmp, 1, 0.0f, 0);
+        ok = dispatch_rmsnorm("kernel_visenc_rmsnorm", tmp, cur, L->norm1,
+                              VIS_WIDTH, rows, eps);
         if (ok) STAGE("qkv gemm");
         if (ok && il == 0u) dump_stage("b0_norm1", tmp, (size_t)rows * VIS_WIDTH);
         if (ok) ok = myds_metal_mul_mm(qkv, L->qkv_weight, tmp,
@@ -196,8 +212,8 @@ int myds_vis_encode(const myds_vis_weights *w, const myds_vis_patches *patches,
 
         /* --- FFN 分支 --- */
         if (ok) STAGE("rmsnorm norm2");
-        if (ok) ok = myds_metal_rmsnorm(tmp, cur, L->norm2, VIS_WIDTH, eps);
-        if (ok) ok = dispatch_rows("kernel_visenc_round", VIS_WIDTH, rows, &tmp, 1, 0.0f, 0);
+        if (ok) ok = dispatch_rmsnorm("kernel_visenc_rmsnorm", tmp, cur, L->norm2,
+                                      VIS_WIDTH, rows, eps);
         if (ok) STAGE("mlp w1 gemm");
         if (ok) ok = myds_metal_mul_mm(w1, L->mlp_w1, tmp,
                                        VIS_FFN2, VIS_WIDTH, rows, GGML_TYPE_F32);
@@ -236,8 +252,8 @@ int myds_vis_encode(const myds_vis_weights *w, const myds_vis_patches *patches,
 
     /* ── 收尾：最终 norm → 下采样重排 → aligner 两层 ── */
     if (ok) STAGE("rmsnorm post_norm");
-    if (ok) ok = myds_metal_rmsnorm(tmp, cur, w->post_norm, VIS_WIDTH, eps);
-    if (ok) ok = dispatch_rows("kernel_visenc_round", VIS_WIDTH, rows, &tmp, 1, 0.0f, 0);
+    if (ok) ok = dispatch_rmsnorm("kernel_visenc_rmsnorm", tmp, cur, w->post_norm,
+                                  VIS_WIDTH, rows, eps);
     if (ok) dump_stage("vision_norm", tmp, (size_t)rows * VIS_WIDTH);
 
     if (ok) {

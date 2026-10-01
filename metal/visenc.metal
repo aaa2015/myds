@@ -228,3 +228,43 @@ kernel void kernel_visenc_gelu_bias(
     out[off] = visenc_round_bf16(
         0.5f * value * (1.0f + visenc_erf(value * 0.7071067811865475f)));
 }
+
+/* 按行批处理的 RMSNorm（带 BF16 舍入）。
+ *
+ * ★ 为什么不能用引擎的 myds_metal_rmsnorm：那个只派【一个】线程组，
+ *   是给解码时「最后一行」用的单行算子。拿它归一化 rows 行 ⇒ 只有第 0 行正确，
+ *   其余行原样返回 ⇒ 残差流逐块放大（实测 RMS ×2.7 → ×6.7 → ×24 → 爆炸）。
+ *   症状很能骗人：抽查第 0 行时【逐位正确】，于是以为算子没问题。
+ *   ⇒ 教训：抽查要覆盖【下标不为 0】的位置，否则「只处理了第一个」这类错永远看不出来。
+ *
+ * 与 ds4 一致：先归一再舍 BF16（ds4 是 rms 后单独 dispatch_round，这里合并进内核，
+ * 结果等价）。归约次序也照抄（256 线程、simd_sum、跨 simdgroup 归约）。 */
+kernel void kernel_visenc_rmsnorm(
+        constant visenc_rms_args &args,
+        device const float       *x,
+        device const float       *weight,
+        device float             *out,
+        threadgroup float        *partial,
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort nsg [[simdgroups_per_threadgroup]]) {
+    if (row >= args.rows) return;
+    device const float *xr = x + (ulong)row * args.width;
+    device float *yr = out + (ulong)row * args.width;
+    float sum = 0.0f;
+    for (uint d = tid; d < args.width; d += 256u) sum = fma(xr[d], xr[d], sum);
+    sum = simd_sum(sum);
+    if (lane == 0u) partial[sg] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0u) {
+        float v = lane < nsg ? partial[lane] : 0.0f;
+        v = simd_sum(v);
+        if (lane == 0u) partial[0] = rsqrt(v / (float)args.width + args.eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv = partial[0];
+    for (uint d = tid; d < args.width; d += 256u)
+        yr[d] = visenc_round_bf16(xr[d] * inv * weight[d]);
+}
