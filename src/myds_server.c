@@ -666,26 +666,33 @@ static bool prompt_append(prompt_buffer_t *b, const char *text) {
 /* 处理一个 input_image 内容块：取出 data URL、解码、编一次图，
  * 然后把它对应的【占位文本】追加进提示词。向量本身留在 sink 里，
  * 等提示词全部拼好后由调用方按位置注入。 */
+/* 每条早退都报原因：静默失败会让「图片没生效」变成一个很难查的现象
+ * ——第一版就是只回一句「不支持的内容块」，看不出到底哪一步不认。 */
+#define IMG_REJECT(why) do { MYDS_LOG_E("input_image 被拒: %s", (why)); return false; } while (0)
+
 static bool prompt_content_image(const prompt_json_t *j, const prompt_json_node_t *node,
                                  prompt_buffer_t *out, myds_vjob_sink_t *img) {
-    if (!img) return false;                 /* 服务端没启用视觉 ⇒ 明确失败，别静默丢图 */
-    if (img->have) return false;            /* 一次请求目前只支持一张图（注入接口是一段区间） */
+    if (!img) IMG_REJECT("服务端未启用视觉（启动时没给 --vision？）");
+    if (img->have) IMG_REJECT("一次请求只支持一张图");
     bool valid = true;
     const prompt_json_node_t *url = prompt_json_field(j, node, "image_url", &valid);
-    if (!valid) return false;
+    if (!valid) IMG_REJECT("image_url 字段重复或结构异常");
     if (url && url->kind == PJ_OBJECT) {    /* Chat Completions 风格 {"url": "..."} */
         url = prompt_json_field(j, url, "url", &valid);
-        if (!valid) return false;
+        if (!valid) IMG_REJECT("image_url.url 字段重复或结构异常");
     }
-    if (!url || url->kind != PJ_STRING) return false;
+    if (!url) IMG_REJECT("没有 image_url 字段");
+    if (url->kind != PJ_STRING) IMG_REJECT("image_url 不是字符串（只支持 data: 内联 URL）");
     const char *spec = url->text;
-    if (strncmp(spec, "data:", 5) != 0) return false;   /* 只接受内联 data URL */
+    MYDS_LOG_I("input_image: image_url 前 40 字节 = %.40s", spec);
+    if (strncmp(spec, "data:", 5) != 0) IMG_REJECT("不是 data: 内联 URL");
     const char *comma = strchr(spec, ',');
-    if (!comma) return false;
-    if (!strstr(spec, "base64")) return false;          /* 只接受 base64 编码 */
+    if (!comma) IMG_REJECT("data URL 里没有逗号分隔");
+    if (!strstr(spec, "base64")) IMG_REJECT("data URL 不是 base64 编码");
     size_t nbytes = 0;
     uint8_t *bytes = server_base64_decode(comma + 1, strlen(comma + 1), &nbytes);
-    if (!bytes) return false;
+    if (!bytes) IMG_REJECT("base64 解码失败（含非法字符或为空）");
+    MYDS_LOG_I("input_image: base64 解出 %zu 字节", nbytes);
 
     char err[256] = {0};
     const bool ok = myds_vjob_plan(bytes, nbytes, &img->plan, err, sizeof(err)) != 0;
