@@ -26,6 +26,7 @@ CTX="${5:-32768}"
 PROMPT_FILE="${PROMPT_FILE:-/tmp/low_kv_gate_prompt.txt}"
 LOG_A=/tmp/low_kv_gate_cold.log
 LOG_B=/tmp/low_kv_gate_warm.log
+LOG_C=/tmp/low_kv_gate_alt.log
 OUT_A=/tmp/low_kv_gate_A.txt
 OUT_B=/tmp/low_kv_gate_B.txt
 
@@ -60,6 +61,18 @@ if [ ! -f "$PREFIX_FILE" ]; then
     } > "$PREFIX_FILE"
 fi
 
+# 第二个常量前缀：与第一个【长度相近但内容不同】—— 用来验证两套「system + tools」
+# 互不顶替（改之前它们会争同一批槽，第二个把第一个整个顶掉）。
+# ★ 长度要相近才有效：长度差得远会自动落到不同的位置组，那就测不到争用。
+PREFIX2_FILE="${PREFIX2_FILE:-/tmp/low_kv_gate_prefix2.txt}"
+if [ ! -f "$PREFIX2_FILE" ]; then
+    {
+        printf 'You are a DIFFERENT assistant. The vault code is AMBERFALCON4. Remember it exactly.\n'
+        for i in $(seq 1 600); do printf 'context-%d z%d other filler text for the second prefix. ' "$i" "$((i % 89))"; done
+        printf '\n'
+    } > "$PREFIX2_FILE"
+fi
+
 # 三个提示词共用同一段常量前缀（这正是要被磁盘复用的那段），只在末尾提问不同。
 # 判据写的是「回答里必须出现什么」—— 逐字匹配对生成模型太脆，包含关系才是稳定的判据。
 PROMPT_TAILS=(
@@ -84,8 +97,8 @@ start_server() {   # $1=日志文件
     return 1
 }
 
-ask() {   # $1=末尾提问  $2=输出文件
-    python3 - "$PORT" "$PREFIX_FILE" "$1" "$2" <<'PY'
+ask() {   # $1=前缀文件 $2=末尾提问 $3=输出文件
+    python3 - "$PORT" "$1" "$2" "$3" <<'PY'
 import json, sys, urllib.request, pathlib
 port, pf, tail, out = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 prompt = pathlib.Path(pf).read_text() + tail
@@ -101,14 +114,14 @@ print("  回答:", repr(d["choices"][0]["message"]["content"][:60]))
 PY
 }
 
-# 跑一轮全部提示词（$1 = 输出前缀名）
+# 跑一轮全部提示词（$1 = 输出前缀名；$2 = 用哪个常量前缀，默认第一个）
 run_all() {
-    local tag="$1" i=0 ok_here=0
+    local tag="$1" pfile="${2:-$PREFIX_FILE}" i=0 ok_here=0
     for entry in "${PROMPT_TAILS[@]}"; do
         i=$((i + 1))
         local tail="${entry%%|*}" want="${entry##*|}"
         printf '  [%s] #%d 期望含 %s\n' "$tag" "$i" "$want"
-        ask "$tail" "/tmp/low_kv_gate_${tag}_${i}.txt" || { fail "$tag #$i 请求失败"; continue; }
+        ask "$pfile" "$tail" "/tmp/low_kv_gate_${tag}_${i}.txt" || { fail "$tag #$i 请求失败"; continue; }
         if grep -qF "$want" "/tmp/low_kv_gate_${tag}_${i}.txt"; then
             ok_here=$((ok_here + 1))
         else
@@ -161,6 +174,32 @@ for entry in "${PROMPT_TAILS[@]}"; do
         note "B: $(head -c 160 "$B" 2>/dev/null)"
     fi
 done
+
+echo
+echo "═══ ⑤ 两个不同的「system + tools」交替 —— 必须各自命中，不得互相顶掉 ═══"
+# 这一项是 way 机制真正的回归测试。顺序 P1 -> P2 -> P1：
+#   · P2 从未存过 ⇒ 全量 prefill，然后把【自己那一套】写进空着的 way（不许动 P1 的）
+#   · 再发 P1 ⇒ 内存里是 P2 的状态（内存必然落空）⇒ 只能靠磁盘
+#   · 改之前：P2 的写入会顶掉 P1 的 11 条 ⇒ 这一步必然落空 ⇒ 本项失败
+start_server "$LOG_C" || exit 1
+note "服务已起（pid $SRV_PID，用同一份磁盘缓存）"
+ask "$PREFIX_FILE"  "Reply with the vault code only." /tmp/low_kv_gate_alt1.txt | sed 's/^/    P1 /'
+ask "$PREFIX2_FILE" "Reply with the vault code only." /tmp/low_kv_gate_alt2.txt | sed 's/^/    P2 /'
+ask "$PREFIX_FILE"  "Reply with the vault code only." /tmp/low_kv_gate_alt3.txt | sed 's/^/    P1 /'
+if grep -qF "CRIMSONOTTER9" /tmp/low_kv_gate_alt1.txt; then ok "P1 回答正确"; else fail "P1 回答不对"; fi
+if grep -qF "AMBERFALCON4" /tmp/low_kv_gate_alt2.txt; then ok "P2 回答正确"; else fail "P2 回答不对"; fi
+# 第三次（回到 P1）必须命中磁盘 —— 这是「P1 的条目没被 P2 顶掉」的直接证据
+_HIT_BEFORE=$(grep -c "resume from DISK snapshot" "$LOG_C" || true)
+if grep -q "resume from DISK snapshot" "$LOG_C" && [ "${_HIT_BEFORE:-0}" -ge 1 ]; then
+    ok "第三次回到 P1 时命中了磁盘（P1 的条目仍在）"
+    grep -m2 "resume from DISK snapshot" "$LOG_C" | sed 's/^/    /'
+else
+    fail "P1 的条目被 P2 顶掉了（第三次没有磁盘命中）—— way 机制没生效"
+    grep -E "prefix cache:|kvdisk:" "$LOG_C" | tail -4 | sed 's/^/    /'
+fi
+# P2 也必须被存下来（不是只有 P1 能享受）
+if grep -q "命中位置" "$LOG_C"; then ok "磁盘命中记录存在"; fi
+kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null
 
 echo
 if [ "$fails" -eq 0 ]; then

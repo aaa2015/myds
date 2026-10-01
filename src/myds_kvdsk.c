@@ -217,6 +217,15 @@ bool myds_kvdsk_slot_touch(myds_kvdsk_t *k, uint32_t slot) {
     return write_at(k->fd, hits, 4, entry_offset(slot) + 4u) ? true : false;
 }
 
+bool myds_kvdsk_slot_hits(const myds_kvdsk_t *k, uint32_t slot, uint32_t *hits) {
+    if (!k || slot >= k->slots) return false;
+    unsigned char e[KVDSK_ENTRY_BYTES];
+    if (!entry_read(k, slot, e)) return false;
+    if (get_u32(e + 0) == 0u) return false;
+    if (hits) *hits = get_u32(e + 4);
+    return true;
+}
+
 uint32_t myds_kvdsk_live_entries(const myds_kvdsk_t *k) {
     if (!k) return 0;
     uint32_t n = 0;

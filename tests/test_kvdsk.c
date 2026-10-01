@@ -9,6 +9,7 @@
  * 编译运行：cc -O1 -Iinclude tests/test_kvdsk.c src/myds_kvdsk.c src/myds_log.c -o /tmp/t && /tmp/t
  */
 #include "myds_kvdsk.h"
+#include "myds_lowkv_policy.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -209,47 +210,57 @@ static void test_budget_is_reported_not_silently_trimmed(void) {
 }
 
 
-/* ── 一条槽只装得下【一条】前缀 ──
- * 这是「相同的系统提示词 + tools 就会命中」这句话的另一面，也是它唯一的边界：
- * 槽号由【位置】决定（低位区的位置↔槽是双射），而载荷按位置对齐存放 ⇒ 两个长度相同、
- * 内容不同的常量前缀会争同一批槽，后写的把先写的顶掉。
- *
- * 后果不是「命中率下降一点」，而是【互相把对方挤没】：
- *   A 写完 B 写 ⇒ B 写时发现「同位置、哈希不同」⇒ 覆盖 ⇒ A 再来时哈希对不上 ⇒ 全量 prefill。
- * 两个前缀交替出现时，每一个请求都是全量 + 重写一遍载荷（位置 1024..4608 约 218 MiB）。
- *
- * 这条测试把「一个位置一条」这个前提钉住。若将来改成每个位置放多条（带命中数淘汰，
- * 像 ds4_kvstore.c 那样），它会失败 —— 那时应当连同淘汰策略一起，有意识地改。
+/* ── 选位策略（纯函数 myds_lowkv_policy.h）──
+ * 这四条就是「用 system + tools 作为去重逻辑」的全部行为：
+ *   ① 同前缀 ⇒ 认出自己，不重写
+ *   ② 不同前缀 + 有空位 ⇒ 各占一个 way【共存】（改之前它会顶掉人家）
+ *   ③ way=1 时共存不了 ⇒ 只能顶掉（保留旧行为，作为对照）
+ *   ④ 全占满 ⇒ 淘汰命中最少的：「命中过」比「刚写进来的」更值钱
  */
-static void test_one_prefix_per_position(void) {
-    fresh_path("oneper", 0);
-    myds_kvdsk_t *k = myds_kvdsk_open(g_path, 6u, 4u, 1024u, 0);
-    if (!k) { CHECK(0, "open 失败"); return; }
-    unsigned char a[256], b[256];
-    fill(a, sizeof(a), 1);
-    fill(b, sizeof(b), 2);
-    const uint32_t pos = 4608u;                 /* 低位区的一个位置 */
-    const uint64_t hash_a = myds_kvdsk_hash_tokens((const int32_t[]){1,2,3,4,5}, 5);
-    const uint64_t hash_b = myds_kvdsk_hash_tokens((const int32_t[]){1,2,3,4,6}, 5);
-    CHECK(hash_a != hash_b, "两个前缀必须哈希不同（否则本测试无意义）");
+static myds_lowkv_way_t W(bool occ, uint32_t pos, uint64_t hash, uint32_t hits) {
+    myds_lowkv_way_t w; w.occupied = occ; w.position = pos; w.hash = hash; w.hits = hits;
+    return w;
+}
 
-    CHECK(myds_kvdsk_write_start(k, 1) && myds_kvdsk_write_chunk(k, 0, a, sizeof(a)) &&
-          myds_kvdsk_write_finish(k, 1, pos, hash_a, sizeof(a)), "写 A");
-    uint32_t p1 = 0; uint64_t h1 = 0, u1 = 0;
-    CHECK(myds_kvdsk_slot_meta(k, 1, &p1, &h1, &u1) && h1 == hash_a, "A 应在位");
+static void test_policy_recognizes_the_same_prefix(void) {
+    const myds_lowkv_way_t ways[3] = { W(true, 4608, 0xAAAA, 0), W(true, 4608, 0xBBBB, 7), W(false,0,0,0) };
+    bool already = false;
+    const uint32_t w = myds_lowkv_pick_way(ways, 3, 4608, 0xBBBB, &already);
+    CHECK(already, "同位置同哈希必须被认出来（already_here=true）");
+    CHECK(w == 1u, "并且指向它自己那一格（实际 %u）", w);
+}
 
-    /* B 落在同一个位置（同一个槽） */
-    CHECK(myds_kvdsk_write_start(k, 1) && myds_kvdsk_write_chunk(k, 0, b, sizeof(b)) &&
-          myds_kvdsk_write_finish(k, 1, pos, hash_b, sizeof(b)), "写 B");
-    uint32_t p2 = 0; uint64_t h2 = 0, u2 = 0;
-    CHECK(myds_kvdsk_slot_meta(k, 1, &p2, &h2, &u2) && h2 == hash_b, "B 应顶掉 A");
-    CHECK(myds_kvdsk_live_entries(k) == 1u, "同一位置仍然只有 1 条");
+static void test_policy_gives_a_different_prefix_its_own_way(void) {
+    /* ★ 核心：第二个前缀必须去用【空位】，而不是把第一个顶掉。 */
+    const myds_lowkv_way_t ways[3] = { W(true, 4608, 0xAAAA, 0), W(false,0,0,0), W(false,0,0,0) };
+    bool already = false;
+    const uint32_t w = myds_lowkv_pick_way(ways, 3, 4608, 0xCCCC, &already);
+    CHECK(!already, "不同前缀不该被当成已有条目");
+    CHECK(w == 1u, "应当去用第一个空位（way 1），而不是顶掉 way 0（实际 %u）", w);
+}
 
-    /* 于是 A 的前缀再也找不到自己的字节 —— 这不是 bug，是「位置即身份」的直接后果 */
-    uint32_t p3 = 0; uint64_t h3 = 0, u3 = 0;
-    bool a_still_there = myds_kvdsk_slot_meta(k, 1, &p3, &h3, &u3) && h3 == hash_a;
-    CHECK(!a_still_there, "A 的条目已被 B 顶掉（两个不同前缀交替 ⇒ 互相挤没）");
-    myds_kvdsk_close(k);
+static void test_policy_with_one_way_must_displace(void) {
+    /* ways=1 时没有共存空间 —— 这就是改之前的行为，留作对照。 */
+    const myds_lowkv_way_t ways[1] = { W(true, 4608, 0xAAAA, 5) };
+    bool already = false;
+    const uint32_t w = myds_lowkv_pick_way(ways, 1, 4608, 0xCCCC, &already);
+    CHECK(w == 0u && !already, "只有一个 way 时只能覆盖它");
+}
+
+static void test_policy_evicts_the_least_hit_when_full(void) {
+    const myds_lowkv_way_t ways[3] = { W(true, 4608, 1, 9), W(true, 4608, 2, 0), W(true, 4608, 3, 4) };
+    bool already = false;
+    const uint32_t w = myds_lowkv_pick_way(ways, 3, 4608, 0x99, &already);
+    CHECK(w == 1u, "全占满时淘汰命中最少的（way 1，hits=0），实际 %u", w);
+    /* 并列时取下标小的 —— 行为要确定、可复现 */
+    const myds_lowkv_way_t tie[3] = { W(true, 4608, 1, 2), W(true, 4608, 2, 2), W(true, 4608, 3, 2) };
+    CHECK(myds_lowkv_pick_way(tie, 3, 4608, 0x99, NULL) == 0u, "并列时必须确定地取 way 0");
+}
+
+static void test_policy_handles_no_way(void) {
+    bool already = false;
+    CHECK(myds_lowkv_pick_way(NULL, 0, 4608, 1, &already) == MYDS_LOWKV_NO_WAY,
+          "没有 way 时必须明确返回 NO_WAY（不能瞎返回 0）");
 }
 
 int main(void) {
@@ -263,8 +274,12 @@ int main(void) {
     test_identity_change_invalidates_file();
     test_bounds_are_enforced();
     test_budget_is_reported_not_silently_trimmed();
-    test_one_prefix_per_position();
-    if (failures == 0) { printf("  ✓ 10 组断言全部通过\n"); return 0; }
+    test_policy_recognizes_the_same_prefix();
+    test_policy_gives_a_different_prefix_its_own_way();
+    test_policy_with_one_way_must_displace();
+    test_policy_evicts_the_least_hit_when_full();
+    test_policy_handles_no_way();
+    if (failures == 0) { printf("  ✓ 13 组断言全部通过\n"); return 0; }
     printf("  ✗ %d 处断言失败\n", failures);
     return 1;
 }

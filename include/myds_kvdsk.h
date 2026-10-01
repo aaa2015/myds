@@ -40,7 +40,8 @@ typedef struct myds_kvdsk myds_kvdsk_t;
  * 打开（不存在则创建）。identity / 版本 / 槽数 / 槽容量任何一个不符，都重建为空表 ——
  * 那不是「损坏」，是运行环境变了，旧内容不该被复用。
  *
- * `slots`         槽数（= 低位槽数）
+ * `slots`         条目数（= 低位位置组数 × 每组 way 数）。
+ *                 调用方按「一个位置 = 一组 way」使用，见 myds_v41.c 的 lowkv_pick_entry。
  * `slot_stride`   每个槽在文件里的字节容量（按最深位置算）
  * `budget_bytes`  文件总字节上限；0 = 不限。超出则在打开时报错（由调用方下调槽数）。
  * 失败返回 NULL；原因用 myds_kvdsk_open_error() 取。
@@ -56,6 +57,9 @@ bool myds_kvdsk_slot_meta(const myds_kvdsk_t *k, uint32_t slot,
                           uint32_t *position, uint64_t *prefix_hash, uint64_t *used_bytes);
 /* 命中计数 +1（只是证据：用来回答「这段前缀到底有没有被复用」）。 */
 bool myds_kvdsk_slot_touch(myds_kvdsk_t *k, uint32_t slot);
+/* 读命中数。★ 淘汰要用的判据：命中过 = 这份快照真的在被用，
+ * 比「刚写进来的」更值得保留（ds4 的 KV_CACHE_MIN_EFFECTIVE_HITS 是同一个理由）。 */
+bool myds_kvdsk_slot_hits(const myds_kvdsk_t *k, uint32_t slot, uint32_t *hits);
 /* 置空某槽（写之前必须先调；发现坏数据时也用它作废）。 */
 bool myds_kvdsk_slot_clear(myds_kvdsk_t *k, uint32_t slot);
 /* 当前非空条目数（诊断用）。 */

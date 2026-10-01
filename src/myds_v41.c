@@ -61,6 +61,7 @@ struct myds_v41_model {
 /* 槽位分配抽到 include/myds_snapshot_slots.h（可单测）。 */
 #include "myds_snapshot_slots.h"
 #include "myds_kvdsk.h"
+#include "myds_lowkv_policy.h"
 #define V41_SNAP_SLOTS   MYDS_SNAP_SLOTS
 /* 快照点必须是 chunk 边界；512 同时满足 ratio(2)/32 键块的对齐要求。
  * ★ 它还是【偶数】这一点是承重的：压缩器的 pool2 跨位置有状态（previous_kv/previous_score），
@@ -87,6 +88,8 @@ struct myds_v41_context {
     myds_kvdsk_t         *low_store;
     /* 身份戳的来源（arch / 形状 / 模型大小）。不持有所有权。 */
     const myds_model_t   *model;
+    /* 每组位置的 way 数（1..8）。见 V41_LOWKV_WAYS_DEFAULT 的说明。 */
+    uint32_t              low_ways;
     myds_metal_buffer_t *compressed[4], *index_cache[4];
     myds_metal_buffer_t *previous_kv[4], *previous_score[4];
     myds_metal_buffer_t *pool_kv, *pool_score, *latent;
@@ -209,6 +212,15 @@ bool myds_v41_snapshot_restore(myds_v41_context_t *g, uint32_t p) {
 #define V41_LOWKV_HEADER 64u
 #define V41_LOWKV_STAGE  (1u << 20)  /* 1 MiB 搬运分块：峰值内存只多这 1 MiB */
 #define V41_LOWKV_LATENT 512u        /* 压缩 KV 每行宽度（须与 publish_compressor 一致） */
+/* 每组位置开几个条目（way）。★ 为什么需要它：
+ * 11 个固定位置槽【不是 11 个前缀】，而是【同一个前缀的 11 个深度层】——
+ * 所以「一个位置一条」等于「一个前缀独占全部 11 槽」，第二个前缀进来就把第一个整个顶掉，
+ * 两个前缀交替出现时互相挤没（每个请求都全量 + 重写约 218 MiB，且日志只报 miss）。
+ * 开 way 之后：同一位置可以同时容纳 W 个不同前缀（按前缀哈希区分），
+ * 默认 3 ⇒ 可容纳三套「system + tools」互不干扰；条目总数 11×3=33，文件约 1.5 GiB。 */
+#define V41_LOWKV_WAYS_DEFAULT 3u
+#define V41_LOWKV_WAYS_MAX     8u
+#define V41_LOWKV_NO_ENTRY     0xFFFFFFFFu
 
 static void lk_put_u32(unsigned char *p, uint32_t v) {
     p[0] = (unsigned char)(v & 0xFFu);          p[1] = (unsigned char)((v >> 8) & 0xFFu);
@@ -230,6 +242,13 @@ static uint32_t lowkv_owner_ratio(uint32_t owner) {
     for (uint32_t il = 0; il < V41_LAYERS; ++il)
         if (kv_source(il) && owner_for(il) == owner) return ratio_for(il);
     return 0;
+}
+
+/* 条目编号 = 位置组 × way 数 + way。位置组分 1..MYDS_SNAP_PINNED，
+ * 对应的位置由 myds_snap_slot_for 决定（1024、1536、…、6144）。
+ * 注意快照点只有 512 的倍数 ⇒ p 与位置组是一一对应的，不会歧义。 */
+static uint32_t lowkv_entry_index(const myds_v41_context_t *g, uint32_t group, uint32_t way) {
+    return group * g->low_ways + way;
 }
 
 /* 位置 p 的 payload 字节数。既用于算槽容量（取最深位置），也用于读时自检。 */
@@ -264,6 +283,31 @@ static uint64_t lowkv_identity(const myds_model_t *m) {
     return myds_kvdsk_identity(m ? m->arch : "", v, n);
 }
 
+/* 为「位置 p、前缀哈希 hash」挑一个条目来写。策略本体在 myds_lowkv_policy.h
+ * （纯函数，有单测）：同哈希 > 空位 > 淘汰命中最少的。
+ * 这里只负责把磁盘上的 way 状态读出来喂给它、再把 way 换算回条目编号。 */
+static uint32_t lowkv_pick_entry(myds_v41_context_t *g, uint32_t group,
+                                uint32_t p, uint64_t hash, bool *already_here) {
+    if (already_here) *already_here = false;
+    if (g->low_ways > V41_LOWKV_WAYS_MAX) {
+        if (already_here) *already_here = false;
+        return V41_LOWKV_NO_ENTRY;
+    }
+    myds_lowkv_way_t ways[V41_LOWKV_WAYS_MAX];
+    for (uint32_t w = 0; w < g->low_ways; ++w) {
+        const uint32_t e = lowkv_entry_index(g, group, w);
+        uint32_t ep = 0; uint64_t eh = 0, eu = 0;
+        ways[w].occupied = myds_kvdsk_slot_meta(g->low_store, e, &ep, &eh, &eu);
+        ways[w].position = ep;
+        ways[w].hash = eh;
+        ways[w].hits = 0;
+        if (ways[w].occupied) (void)myds_kvdsk_slot_hits(g->low_store, e, &ways[w].hits);
+    }
+    const uint32_t way = myds_lowkv_pick_way(ways, g->low_ways, p, hash, already_here);
+    if (way == MYDS_LOWKV_NO_WAY) return V41_LOWKV_NO_ENTRY;
+    return lowkv_entry_index(g, group, way);
+}
+
 /* 把 Metal buffer 的一段搬到磁盘（分块，避免一次性申请几十 MB）。 */
 static bool lowkv_emit(myds_kvdsk_t *k, const myds_metal_buffer_t *buf, uint64_t bytes,
                        unsigned char *stage, uint64_t *file_off) {
@@ -290,8 +334,8 @@ static bool lowkv_fill(myds_kvdsk_t *k, myds_metal_buffer_t *buf, uint64_t bytes
     return true;
 }
 
-static bool lowkv_write_slot(myds_v41_context_t *g, uint32_t s, uint32_t p,
-                             uint64_t hash, unsigned char *stage) {
+static bool lowkv_write_slot(myds_v41_context_t *g, uint32_t entry, uint32_t s,
+                             uint32_t p, uint64_t hash, unsigned char *stage) {
     const uint32_t window_bytes = V41_WINDOW * V41_HEAD_DIM * 4u;
     const uint32_t engram_bytes = (uint32_t)sizeof(myds_engram_history_t);
     uint32_t rows[4];
@@ -311,8 +355,7 @@ static bool lowkv_write_slot(myds_v41_context_t *g, uint32_t s, uint32_t p,
     lk_put_u32(hdr + 40, V41_LOWKV_LATENT);
     lk_put_u32(hdr + 44, V41_INDEX_DIM);
 
-    const uint32_t fslot = s - 1u;
-    if (!myds_kvdsk_write_start(g->low_store, fslot)) return false;
+    if (!myds_kvdsk_write_start(g->low_store, entry)) return false;
     uint64_t off = 0;
     if (!myds_kvdsk_write_chunk(g->low_store, off, hdr, V41_LOWKV_HEADER)) return false;
     off += V41_LOWKV_HEADER;
@@ -330,18 +373,16 @@ static bool lowkv_write_slot(myds_v41_context_t *g, uint32_t s, uint32_t p,
         if (!lowkv_emit(g->low_store, g->index_cache[o],
                         (uint64_t)rows[o] * V41_INDEX_DIM * 4u, stage, &off)) return false;
     }
-    return myds_kvdsk_write_finish(g->low_store, fslot, p, hash, off);
+    return myds_kvdsk_write_finish(g->low_store, entry, p, hash, off);
 }
 
 /* 读一条并装回。任一步失败都返回 false，且【不】改动 snap_pos。 */
-static bool lowkv_read_slot(myds_v41_context_t *g, uint32_t s, uint32_t p,
-                            unsigned char *stage, myds_engram_history_t *out_hist) {
+static bool lowkv_read_slot(myds_v41_context_t *g, uint32_t entry, uint32_t s,
+                            uint32_t p, unsigned char *stage, myds_engram_history_t *out_hist) {
     const uint32_t window_bytes = V41_WINDOW * V41_HEAD_DIM * 4u;
     const uint32_t engram_bytes = (uint32_t)sizeof(myds_engram_history_t);
-    const uint32_t fslot = s - 1u;
-
     uint64_t used = 0;
-    if (!myds_kvdsk_read_start(g->low_store, fslot, &used)) return false;
+    if (!myds_kvdsk_read_start(g->low_store, entry, &used)) return false;
     if (used != lowkv_payload_bytes(p)) return false;
 
     unsigned char hdr[V41_LOWKV_HEADER];
@@ -391,6 +432,18 @@ bool myds_v41_low_kv_enable(myds_v41_context_t *g, const char *dir) {
     }
     const uint32_t deepest = MYDS_SNAP_MIN + (MYDS_SNAP_PINNED - 1u) * MYDS_SNAP_STRIDE;
     const uint64_t stride = lowkv_payload_bytes(deepest);
+
+    /* way 数：同一位置能同时容纳几套不同的「system + tools」。见 V41_LOWKV_WAYS_DEFAULT。 */
+    uint32_t ways = V41_LOWKV_WAYS_DEFAULT;
+    const char *we = getenv("MYDS_KV_DSK_WAYS");
+    if (we && *we) {
+        const long v = atol(we);
+        if (v >= 1 && v <= (long)V41_LOWKV_WAYS_MAX) ways = (uint32_t)v;
+        else MYDS_LOG_W("kvdisk: MYDS_KV_DSK_WAYS=%s 超出 1..%u，改用默认 %u",
+                        we, (unsigned)V41_LOWKV_WAYS_MAX, (unsigned)V41_LOWKV_WAYS_DEFAULT);
+    }
+    g->low_ways = ways;
+    const uint32_t entries = MYDS_SNAP_PINNED * ways;
     const uint64_t identity = lowkv_identity(g->model);
 
     uint64_t budget = 2048ull << 20;
@@ -407,14 +460,18 @@ bool myds_v41_low_kv_enable(myds_v41_context_t *g, const char *dir) {
         MYDS_LOG_E("kvdisk: 目录过长，无法组成文件名: %s", dir);
         return false;
     }
-    g->low_store = myds_kvdsk_open(path, identity, MYDS_SNAP_PINNED, stride, budget);
+    g->low_store = myds_kvdsk_open(path, identity, entries, stride, budget);
     if (!g->low_store) {
         MYDS_LOG_E("kvdisk: 打开失败: %s（%s）", path, myds_kvdsk_open_error());
         return false;
     }
-    MYDS_LOG_I("kvdisk: 低位区落盘已启用 · %u 槽 × %.1f MiB · 位置 %u..%u · %s",
-               (unsigned)MYDS_SNAP_PINNED, (double)stride / 1048576.0,
+    MYDS_LOG_I("kvdisk: 低位区落盘已启用 · %u 个位置组 × %u way = %u 条 · 每条 %.1f MiB "
+               "· 位置 %u..%u · %s",
+               (unsigned)MYDS_SNAP_PINNED, (unsigned)ways, (unsigned)entries,
+               (double)stride / 1048576.0,
                (unsigned)MYDS_SNAP_MIN, (unsigned)deepest, path);
+    MYDS_LOG_I("kvdisk: 同一位置可容纳 %u 套不同的「system + tools」—— 它们的哈希不同，"
+               "互不顶替；只有全部占满才按命中数淘汰", (unsigned)ways);
     return true;
 }
 
@@ -432,13 +489,12 @@ bool myds_v41_low_kv_save(myds_v41_context_t *g, const int32_t *tokens, uint32_t
         const uint32_t p = g->snap_pos[s];
         if (!p || p < V41_SNAP_MIN || p > n_tokens) continue;
         const uint64_t hash = myds_kvdsk_hash_tokens(tokens, p);
-        uint32_t have_pos = 0; uint64_t have_hash = 0, have_used = 0;
-        if (myds_kvdsk_slot_meta(g->low_store, s - 1u, &have_pos, &have_hash, &have_used)
-            && have_pos == p && have_hash == hash) {
-            continue;   /* 内容没变 ⇒ 不重写。稳态下这一段【零写盘】。 */
-        }
-        ok = lowkv_write_slot(g, s, p, hash, stage);
-        if (!ok) MYDS_LOG_W("kvdisk: 槽 %u（位置 %u）写盘失败", s, p);
+        bool already = false;
+        const uint32_t entry = lowkv_pick_entry(g, s - 1u, p, hash, &already);
+        if (already) continue;                        /* 已在盘上 ⇒ 不重写（稳态零写盘） */
+        if (entry == V41_LOWKV_NO_ENTRY) continue;    /* 一组里一条都占不到（不应发生） */
+        ok = lowkv_write_slot(g, entry, s, p, hash, stage);
+        if (!ok) MYDS_LOG_W("kvdisk: 位置 %u 写盘失败", p);
     }
     free(stage);
     return ok;
@@ -448,22 +504,26 @@ uint32_t myds_v41_low_kv_load(myds_v41_context_t *g, const int32_t *tokens, uint
     if (!g || !g->low_store || !g->snap_enabled || !tokens) return 0;
     if (max_position < V41_SNAP_MIN) return 0;
 
-    /* 取【最深】的匹配条目：位置越深，免掉的 prefill 越多。 */
-    uint32_t best_slot = 0, best_pos = 0;
-    for (uint32_t s = 1; s <= MYDS_SNAP_PINNED; ++s) {
+    /* 取【最深】的匹配条目：位置越深，免掉的 prefill 越多。
+     * 扫全部条目（位置组 × way）—— 同一组内的 way 装的是同一个位置，只是前缀不同，
+     * 所以同组内只比哈希；跨组才比深度。 */
+    uint32_t best_entry = V41_LOWKV_NO_ENTRY, best_pos = 0;
+    const uint32_t n_entries = MYDS_SNAP_PINNED * g->low_ways;
+    for (uint32_t e = 0; e < n_entries; ++e) {
         uint32_t p = 0; uint64_t hh = 0, hu = 0;
-        if (!myds_kvdsk_slot_meta(g->low_store, s - 1u, &p, &hh, &hu)) continue;
+        if (!myds_kvdsk_slot_meta(g->low_store, e, &p, &hh, &hu)) continue;
         if (p > max_position || p <= best_pos) continue;
         if (myds_kvdsk_hash_tokens(tokens, p) != hh) continue;   /* 前缀不同 ⇒ 这份字节不是给它的 */
-        best_slot = s; best_pos = p;
+        best_entry = e; best_pos = p;
     }
-    if (!best_slot) return 0;
+    if (best_entry == V41_LOWKV_NO_ENTRY) return 0;
+    const uint32_t best_slot = best_entry / g->low_ways + 1u;
 
     unsigned char *stage = (unsigned char *)malloc(V41_LOWKV_STAGE);
     if (!stage) return 0;
     myds_engram_history_t hist;
     memset(&hist, 0, sizeof(hist));
-    if (!lowkv_read_slot(g, best_slot, best_pos, stage, &hist)) {
+    if (!lowkv_read_slot(g, best_entry, best_slot, best_pos, stage, &hist)) {
         MYDS_LOG_W("kvdisk: 位置 %u 的条目读取失败，回退全量", best_pos);
         free(stage);
         return 0;
@@ -483,7 +543,7 @@ uint32_t myds_v41_low_kv_load(myds_v41_context_t *g, const int32_t *tokens, uint
 
 void myds_v41_low_kv_stats(const myds_v41_context_t *g, uint32_t *live_entries, uint32_t *slots) {
     if (live_entries) *live_entries = (g && g->low_store) ? myds_kvdsk_live_entries(g->low_store) : 0u;
-    if (slots) *slots = (g && g->low_store) ? MYDS_SNAP_PINNED : 0u;
+    if (slots) *slots = (g && g->low_store) ? MYDS_SNAP_PINNED * g->low_ways : 0u;
 }
 
 /* ── 图片嵌入注入 ──
