@@ -723,6 +723,10 @@ static void test_previous_response_id_suffix_render(void) {
     assert(strstr(full, "SYSPROMPT") != NULL);                    /* 全量带系统提示词 */
     assert(strstr(suffix, "SYSPROMPT") == NULL);                  /* 增量不带 */
     assert(strstr(suffix, "hello_new") != NULL);                  /* 增量带新消息 */
+    /* ★ 续跑必须以【上一个 assistant 回合的 EOS】开头：
+     * 缓存序列停在生成文本之后（EOS 从未被喂入），而全量重放里 assistant 消息是带 EOS 的。
+     * 少了这一个 token，续跑序列就与全量重放差一个 —— 实测会少 1 个 token，属静默错位。 */
+    assert(strncmp(suffix, "<" "\xef\xbd\x9c" "end", 6) == 0);
     assert(strlen(suffix) < strlen(full));
     printf("  [PASS] previous_response_id suffix render: items only, no BOS/instructions/tools\n");
 }

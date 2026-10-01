@@ -2791,16 +2791,40 @@ static int myds_generate_internal(myds_context_t *ctx,
                 }
                 prompt_tokens = nt; prompt_alloc_tokens = need;
             }
+            /* ★ 必须先丢掉 delta 开头的 BOS：分词器会给每段文本与位一个 BOS，
+             * 但这段文本是要接在【已有序列】后面的 ⇒ 那个 BOS 会落在序列中间，是错的。
+             * 实测证据：不丢时续跑比全量重放【多 1 个 token】（2058 vs 2057），
+             * 而两条路径的其它 token 逐位一致。 */
+            if (n_prompt > 0 && m->tokenizer && prompt_tokens[0] == m->tokenizer->bos_id) {
+                memmove(prompt_tokens, prompt_tokens + 1, (size_t)(n_prompt - 1) * sizeof(int32_t));
+                --n_prompt;
+                MYDS_LOG_I("previous_response_id: dropped the leading BOS from the delta "
+                           "(it would sit mid-sequence)");
+            }
             memmove(prompt_tokens + pl, prompt_tokens, (size_t)n_prompt * sizeof(int32_t));
             memcpy(prompt_tokens, ctx->pcache_tokens, (size_t)pl * sizeof(int32_t));
-            MYDS_LOG_I("previous_response_id: %u cached + %d new = %u tokens",
-                       pl, n_prompt, pl + (uint32_t)n_prompt);
             n_prompt += (int32_t)pl;
+            MYDS_LOG_I("previous_response_id: %u cached + %d new = %d tokens",
+                       pl, n_prompt - (int32_t)pl, n_prompt);
         } else {
             /* 状态已被后续请求换掉 ⇒ 前缀不在。这里【继续按全量跑】并说话，
              * 而不是假装命中 —— 服务端那一侧已经用 id 保证只会走到「最近一次」。 */
             MYDS_LOG_W("previous_response_id: no cached sequence to continue from; prefilling in full");
         }
+    }
+
+    /* 诊断（临时）：把最终 token 序列的首尾打出来，用于比较「续跑」与「全量重放」
+     * 两条路径是否逐位一致。MYDS_DEBUG_TAIL=1 开启。 */
+    if (getenv("MYDS_DEBUG_TAIL")) {
+        char head[256] = "", tail[256] = "";
+        size_t ho = 0, to = 0;
+        uint32_t nh = n_prompt < 8 ? (uint32_t)n_prompt : 8u;
+        uint32_t nt = n_prompt < 12 ? (uint32_t)n_prompt : 12u;
+        for (uint32_t i = 0; i < nh; ++i)
+            ho += (size_t)snprintf(head + ho, sizeof(head) - ho, "%s%d", i ? "," : "", prompt_tokens[i]);
+        for (uint32_t i = n_prompt - nt; i < (uint32_t)n_prompt; ++i)
+            to += (size_t)snprintf(tail + to, sizeof(tail) - to, "%s%d", i == n_prompt - nt ? "" : ",", prompt_tokens[i]);
+        MYDS_LOG_I("TOKDIAG n=%d head=[%s] tail=[%s]", n_prompt, head, tail);
     }
 
     if (out_prompt_tokens) {

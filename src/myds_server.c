@@ -915,7 +915,18 @@ static bool parse_chat_prompt_impl(const char *body, char *out_prompt, size_t ma
     /* suffix 模式（previous_response_id）：服务端会把【上一次响应的完整序列】接在前面，
      * 所以这里只渲染【本次新增的消息】，并且不能带 BOS、instructions 与 tools
      * —— 它们已经在被续接的那段序列里了，重复渲染会把前缀整体错位。 */
-    if (suffix_only) { tools_done = true; goto render_items; }
+    if (suffix_only) {
+        /* ★ 必须先补上【上一个 assistant 回合的 EOS】。
+         * 被续接的那段序列停在生成文本之后 —— 生成时 prompt 末尾是
+         * "<｜Assistant｜></think>"，生成的 token 被喂进去，但 EOS【从未被喂】
+         * （EOS 只在渲染【历史中的】assistant 消息时追加）。
+         * 而全量重放那条路径里，assistant 消息会渲染成 "…" + EOS。
+         * 不补这一个 token，续跑的序列就与全量重放【差一个 EOS】——
+         * 实测 prompt 会少 1（6427 vs 6428），属静默错位。 */
+        if (!prompt_append(&out, "<｜end▁of▁sentence｜>")) goto done;
+        tools_done = true;
+        goto render_items;
+    }
     if (!prompt_append(&out, "<｜begin▁of▁sentence｜>")) { *why = "the prompt buffer is too small"; goto done; }
     if (instructions && instructions->kind != PJ_NULL) {
         if (instructions->kind != PJ_STRING ||
