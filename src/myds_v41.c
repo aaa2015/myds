@@ -58,13 +58,15 @@ struct myds_v41_model {
  * 槽位用确定性映射（P/STRIDE % SLOTS）：engram 循环与层循环各自独立写入，
  * 但映射与覆盖顺序一致 ⇒ 同一槽里的 engram 与各层窗口环必然对应同一个 P。
  * ds4 的对应机制见 ds4_kvstore.c: boundary_trim/align + find_text_prefix（默认 trim=32/align=2048）。 */
-#define V41_SNAP_SLOTS   8u
+/* 槽位分配抽到 include/myds_snapshot_slots.h（可单测）。 */
+#include "myds_snapshot_slots.h"
+#define V41_SNAP_SLOTS   MYDS_SNAP_SLOTS
 /* 快照点必须是 chunk 边界；512 同时满足 ratio(2)/32 键块的对齐要求。
  * ★ 它还是【偶数】这一点是承重的：压缩器的 pool2 跨位置有状态（previous_kv/previous_score），
  *   但只在【奇数】位置被读取 —— 从偶数位置续跑时它先被本位置覆盖，因此无需进快照。
  *   若将来把 STRIDE 改成奇数，就必须把这些 previous_* 一并纳入快照。 */
-#define V41_SNAP_STRIDE  512u
-#define V41_SNAP_MIN     1024u  /* 太短的点不值一份窗口环；保留最近 SLOTS 个点 */
+#define V41_SNAP_STRIDE  MYDS_SNAP_STRIDE
+#define V41_SNAP_MIN     MYDS_SNAP_MIN  /* 太短的点不值一份窗口环 */
 
 struct myds_v41_context {
     myds_engram_t *engram;
@@ -108,8 +110,7 @@ void myds_v41_snapshot_clear(myds_v41_context_t *g, uint32_t keep_up_to) {
  * 下一个兄弟请求又要全量重跑 —— 实测就是这样退化的（第 2 次命中 40x，第 3 次全量）。
  * 末尾点恰好是「下一个兄弟请求最可能用到的」那一个，所以给它一个固定槽、每次覆盖。 */
 static uint32_t snapshot_slot_for(uint32_t p, bool is_last) {
-    if (is_last) return 0;
-    return 1u + (p / V41_SNAP_STRIDE) % (V41_SNAP_SLOTS - 1u);
+    return myds_snap_slot_for(p, is_last ? 1 : 0);
 }
 /* 处理完位置 p 之后，记下 engram 的滚动状态。在 engram 循环里调用（层循环之前）。 */
 static void snapshot_store_engram(myds_v41_context_t *g, uint32_t p, bool is_last) {
@@ -358,6 +359,15 @@ myds_v41_context_t *myds_v41_context_create(myds_context_t *ctx) {
     for (uint32_t i=0;i<V41_LAYERS;i++) A(window[i],V41_WINDOW*V41_HEAD_DIM);
     for (uint32_t si=0;si<V41_SNAP_SLOTS;si++) A(snap_window[si],V41_LAYERS*V41_WINDOW*V41_HEAD_DIM);
     g->snap_enabled=getenv("MYDS_NO_PREFIX_SNAPSHOT")==NULL;
+    if (g->snap_enabled) {
+        /* 布局写进日志：槽位分配错了不会报错，只会让该命中的请求悄悄退化成全量重算。 */
+        MYDS_LOG_I("prefix snapshots: %u slots (%u pinned for positions %u..%u, %u ring), stride %u",
+                   (unsigned)MYDS_SNAP_SLOTS, (unsigned)MYDS_SNAP_PINNED,
+                   (unsigned)MYDS_SNAP_MIN,
+                   (unsigned)(MYDS_SNAP_MIN + (MYDS_SNAP_PINNED - 1u) * MYDS_SNAP_STRIDE),
+                   (unsigned)(MYDS_SNAP_SLOTS - 1u - MYDS_SNAP_PINNED),
+                   (unsigned)MYDS_SNAP_STRIDE);
+    }
     for (uint32_t i=0;i<4;i++) {
         const size_t rows=i==3 ? g->capacity : (g->capacity+1u)/2u;
         A(compressed[i],rows*512); A(index_cache[i],rows*128);

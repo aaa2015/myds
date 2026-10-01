@@ -1,6 +1,7 @@
 #include "myds.h"
 #include "myds_gguf.h"
 #include "myds_internal.h"
+#include "myds_snapshot_slots.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -531,12 +532,53 @@ static void test_prefix_cache_reports_every_outcome(void) {
     printf("  [PASS] prefix cache reports every outcome, including the two skipped cases\n");
 }
 
+/* ── 前缀快照的槽位分配 ──
+ * 判据是【常量前缀必须永远有槽可用】：
+ * 一个会话走得很深之后，位置 1024/2048/... 的槽不能被远处的点顶掉，
+ * 否则新会话（短提示词）就只能全量重算 —— 实测出现过这种退化，且没有任何报错。 */
+static void test_snapshot_slots_keep_the_constant_prefix(void) {
+    /* ① 槽 0 专供序列末尾 */
+    assert(myds_snap_slot_for(999999u, 1) == 0u);
+    assert(myds_snap_slot_for(1024u, 1) == 0u);
+
+    /* ② 低位区：位置与槽【固定一一对应】，与后续走了多深无关 */
+    const uint32_t first = MYDS_SNAP_MIN / MYDS_SNAP_STRIDE;
+    for (uint32_t k = 0; k < MYDS_SNAP_PINNED; ++k) {
+        const uint32_t p = MYDS_SNAP_MIN + k * MYDS_SNAP_STRIDE;
+        const uint32_t slot = myds_snap_slot_for(p, 0);
+        assert(slot == 1u + k);
+        assert(myds_snap_slot_is_pinned(slot));
+    }
+
+    /* ③ 【关键性质】一个很深的点不会映射到任何低位槽 ——
+     *    这正是原来「按位置取模」退化的根源（位置 9216 会顶掉 2048）。 */
+    const uint32_t deepest_pinned = MYDS_SNAP_MIN + (MYDS_SNAP_PINNED - 1u) * MYDS_SNAP_STRIDE;
+    for (uint32_t p = deepest_pinned + MYDS_SNAP_STRIDE; p <= 200000u; p += MYDS_SNAP_STRIDE) {
+        assert(!myds_snap_slot_is_pinned(myds_snap_slot_for(p, 0)));
+    }
+
+    /* ④ 环形区：只在环内复用，且始终落在合法槽上 */
+    for (uint32_t p = 0; p <= 400000u; p += MYDS_SNAP_STRIDE) {
+        const uint32_t s = myds_snap_slot_for(p, 0);
+        assert(s < MYDS_SNAP_SLOTS);
+    }
+    /* 环形区确实会复用（说明它是环，不是无限增长） */
+    const uint32_t r1 = myds_snap_slot_for(deepest_pinned + MYDS_SNAP_STRIDE, 0);
+    const uint32_t r2 = myds_snap_slot_for(
+        deepest_pinned + MYDS_SNAP_STRIDE * (MYDS_SNAP_SLOTS - 1u - MYDS_SNAP_PINNED + 1u), 0);
+    assert(r1 == r2);
+
+    printf("  [PASS] snapshot slots keep the constant prefix pinned (%u slots, %u pinned up to pos %u)\n",
+           (unsigned)MYDS_SNAP_SLOTS, (unsigned)MYDS_SNAP_PINNED, (unsigned)deepest_pinned);
+}
+
 int main(void) {
     printf("====================================================\n");
     printf("       Running myds Engine Sampling Unit Tests      \n");
     printf("====================================================\n");
 
     test_prefix_cache_reports_every_outcome();
+    test_snapshot_slots_keep_the_constant_prefix();
 
     /* 1. Production Greedy Argmax Sampling */
     {
