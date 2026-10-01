@@ -2998,25 +2998,29 @@ static int myds_generate_internal(myds_context_t *ctx,
                            "at %u (reuse %u tok, still to prefill %u)",
                            n_prompt, ctx->pcache_len, L, snap, snap, (uint32_t)n_prompt - 1u - snap);
             } else {
-                /* 内存里没有可用的快照 ⇒ 再试【磁盘】（跨进程 / 跨会话的常量前缀，
-                 * 也就是系统提示词 + 工具定义那一段）。这一步只在内存路径失败之后才走，
-                 * 所以不改变原有快路径的任何行为。
-                 * 判据只看「这条 prompt 自己开头那段是否与盘上的前缀逐 token 相同」（哈希），
-                 * 不要求与上一条请求有公共前缀 —— 全新会话恰恰就是这种情况。 */
-                const uint32_t disk = ctx->v41
-                    ? myds_v41_low_kv_load(ctx->v41, prompt_tokens, (uint32_t)n_prompt - 1u) : 0;
-                if (disk) {
-                    resume_from = disk; snap_hit = true;
-                    MYDS_LOG_I("prefix cache: prompt %d tok, common prefix %u -> resume from DISK snapshot "
-                               "at %u (reuse %u tok, still to prefill %u)",
-                               n_prompt, L, disk, disk, (uint32_t)n_prompt - 1u - disk);
-                } else {
-                    MYDS_LOG_I("prefix cache: skipped - common prefix %u of cached %u, but no snapshot within it "
-                               "(the state cannot be rewound, so this restarts from 0)", L, ctx->pcache_len);
-                }
+                MYDS_LOG_I("prefix cache: skipped - common prefix %u of cached %u, but no snapshot within it "
+                           "(the state cannot be rewound, so this restarts from 0)", L, ctx->pcache_len);
             }
         } else {
             MYDS_LOG_I("prefix cache: skipped - no common prefix with the cached %u tokens", ctx->pcache_len);
+        }
+
+        /* ★ 内存路径没能给出续跑点 ⇒ 试【磁盘】。
+         * 为什么放在整条分支【之后】而不是各分支里面：最主要的使用场景是
+         * 「重启后的第一个请求」——那时还没有上一条序列（走的是 !have_prev 分支），
+         * 而常量前缀就在盘上。塞在某个分支里会正好漏掉它。
+         * MYDS_PREFIX_CACHE=0 时不试：那是「关掉一切复用」的开关，磁盘复用也算复用。
+         * 判据只看「这条 prompt 开头那段是否与盘上的前缀逐 token 相同」（哈希），
+         * 不要求与上一条请求有公共前缀。 */
+        if (pcache_on && resume_from == 0 && ctx->v41) {
+            const uint32_t disk = myds_v41_low_kv_load(ctx->v41, prompt_tokens,
+                                                       (uint32_t)n_prompt - 1u);
+            if (disk) {
+                resume_from = disk; snap_hit = true;
+                MYDS_LOG_I("prefix cache: prompt %d tok -> resume from DISK snapshot at %u "
+                           "(reuse %u tok, still to prefill %u)",
+                           n_prompt, disk, disk, (uint32_t)n_prompt - 1u - disk);
+            }
         }
 
         /* 快照续跑必须把状态装回去（engram tail + 各层窗口环）；装不回去就退回全量。 */
