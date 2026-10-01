@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/mman.h>
+#include <math.h>
 
 #include "myds.h"
 #include "myds_gguf.h"
@@ -286,13 +287,131 @@ static void test_p1_unmapped_engram_identity(void) {
     assert(id_fail1 == 0);
     assert(id_fail2 == 0);
 
-    /* Verify low_kv_enable safely refuses NULL context or failed identity */
-    assert(!myds_v41_low_kv_enable(NULL, "/tmp"));
-    assert(!myds_v41_low_kv_enabled(NULL));
+    /* Verify low_kv_enable on a valid non-null context safely refuses to enable disk reuse when identity is 0 */
+    myds_v41_context_t *ctx = myds_v41_context_create_for_model(&m2);
+    assert(ctx != NULL);
+    assert(!myds_v41_low_kv_enable(ctx, "/tmp"));
+    assert(!myds_v41_low_kv_enabled(ctx));
+
+    /* Restore file descriptor so tensor reading succeeds */
+    gf2.fd = fd;
+    char tmp_kvdsk_dir[] = "/tmp/test_myds_kvdsk_recover_XXXXXX";
+    assert(mkdtemp(tmp_kvdsk_dir) != NULL);
+    assert(myds_v41_low_kv_enable(ctx, tmp_kvdsk_dir));
+    assert(myds_v41_low_kv_enabled(ctx));
+    myds_v41_context_free(ctx);
+
+    /* Clean up temporary test files */
+    char bin_path[1200];
+    snprintf(bin_path, sizeof(bin_path), "%s/kvlow-%016llx.bin", tmp_kvdsk_dir, (unsigned long long)id_mut);
+    unlink(bin_path);
+    rmdir(tmp_kvdsk_dir);
 
     close(fd);
     unlink(path);
-    printf("  [PASS] P1 & P2: Unmapped tensor streamed via fd detects byte changes and returns 0 on read failure, disabling disk reuse\n");
+    printf("  [PASS] P1 & P2: Unmapped tensor streamed via fd detects byte changes, returns 0 on read failure, and recovers on valid fd\n");
+}
+
+static void test_p1_tensor_descriptor_binding_identity(void) {
+    myds_model_t m1, m2;
+    memset(&m1, 0, sizeof(m1));
+    memset(&m2, 0, sizeof(m2));
+
+    gguf_file_t gf1, gf2;
+    memset(&gf1, 0, sizeof(gf1));
+    memset(&gf2, 0, sizeof(gf2));
+
+    snprintf(m1.arch, sizeof(m1.arch), "deepseek2");
+    snprintf(m2.arch, sizeof(m2.arch), "deepseek2");
+    m1.gf = &gf1;
+    m2.gf = &gf2;
+
+    gf1.tensor_count = 2;
+    gf2.tensor_count = 2;
+    gf1.tensor_data_offset = 1024;
+    gf2.tensor_data_offset = 1024;
+    gf1.mmap_size = 20000;
+    gf2.mmap_size = 20000;
+
+    gguf_tensor_t t1[2], t2[2];
+    memset(t1, 0, sizeof(t1));
+    memset(t2, 0, sizeof(t2));
+
+    float w_gate[16], w_up[16];
+    for (int i = 0; i < 16; i++) {
+        w_gate[i] = 1.0f + 0.1f * i;
+        w_up[i] = 2.0f + 0.2f * i;
+    }
+
+    /* Model 1:
+     * Tensor 0: name="ffn_gate_shexp.weight", data=w_gate
+     * Tensor 1: name="ffn_up_shexp.weight",   data=w_up
+     *
+     * Model 2: (weights and layout in memory identical, only tensor names swapped!)
+     * Tensor 0: name="ffn_up_shexp.weight",   data=w_gate
+     * Tensor 1: name="ffn_gate_shexp.weight", data=w_up
+     */
+    snprintf(t1[0].name, sizeof(t1[0].name), "ffn_gate_shexp.weight");
+    t1[0].n_dims = 1;
+    t1[0].dims[0] = 16;
+    t1[0].type = GGML_TYPE_F32;
+    t1[0].offset = 0;
+    t1[0].size_bytes = sizeof(w_gate);
+    t1[0].data = w_gate;
+
+    snprintf(t1[1].name, sizeof(t1[1].name), "ffn_up_shexp.weight");
+    t1[1].n_dims = 1;
+    t1[1].dims[0] = 16;
+    t1[1].type = GGML_TYPE_F32;
+    t1[1].offset = sizeof(w_gate);
+    t1[1].size_bytes = sizeof(w_up);
+    t1[1].data = w_up;
+
+    snprintf(t2[0].name, sizeof(t2[0].name), "ffn_up_shexp.weight");
+    t2[0].n_dims = 1;
+    t2[0].dims[0] = 16;
+    t2[0].type = GGML_TYPE_F32;
+    t2[0].offset = 0;
+    t2[0].size_bytes = sizeof(w_gate);
+    t2[0].data = w_gate;
+
+    snprintf(t2[1].name, sizeof(t2[1].name), "ffn_gate_shexp.weight");
+    t2[1].n_dims = 1;
+    t2[1].dims[0] = 16;
+    t2[1].type = GGML_TYPE_F32;
+    t2[1].offset = sizeof(w_gate);
+    t2[1].size_bytes = sizeof(w_up);
+    t2[1].data = w_up;
+
+    gf1.tensors = t1;
+    gf2.tensors = t2;
+
+    /* 1. In standard mode: swapping tensor names with identical weights MUST yield different identities */
+    uint64_t id1 = myds_v41_model_identity(&m1);
+    uint64_t id2 = myds_v41_model_identity(&m2);
+    assert(id1 != 0);
+    assert(id2 != 0);
+    assert(id1 != id2);
+
+    /* 2. In MYDS_FORCE_FULL_DIGEST=1 mode: identities must also differ */
+    setenv("MYDS_FORCE_FULL_DIGEST", "1", 1);
+    uint64_t id1_force = myds_v41_model_identity(&m1);
+    uint64_t id2_force = myds_v41_model_identity(&m2);
+    unsetenv("MYDS_FORCE_FULL_DIGEST");
+    assert(id1_force != id2_force);
+
+    /* 3. Mutating dimensions must change identity */
+    t2[0].dims[0] = 32;
+    uint64_t id_dim = myds_v41_model_identity(&m2);
+    assert(id_dim != id2);
+    t2[0].dims[0] = 16;
+
+    /* 4. Mutating type must change identity */
+    t2[0].type = GGML_TYPE_BF16;
+    uint64_t id_type = myds_v41_model_identity(&m2);
+    assert(id_type != id2);
+
+    printf("  [PASS] P1: Tensor name, dimension, and type descriptors bound to weights alter model identity\n");
 }
 
 static void test_p1_engram_metadata_identity(void) {
@@ -393,18 +512,19 @@ static void test_p2_moe_kernel_and_pso_validation(void) {
         return;
     }
 
-    const uint32_t dim = 64;
-    const uint32_t expert_dim = 64;
+    /* Valid MoE test with 256-wide dimensions aligned to IQ2_XXS and Q2_K 256-quantization blocks */
+    const uint32_t dim = 256;
+    const uint32_t expert_dim = 256;
     const uint32_t n_routed_experts = 16;
     const uint32_t n_activated_experts = 6;
 
     myds_metal_buffer_t *moe_out = myds_metal_buffer_alloc(dim * sizeof(float));
     myds_metal_buffer_t *x_in = myds_metal_buffer_alloc(dim * sizeof(float));
+
+    /* IQ2_XXS has 66 bytes per 256 weights; Q2_K has 84 bytes per 256 weights */
     uint64_t gate_row_bytes = (dim / 256u) * 66u;
-    if (gate_row_bytes == 0) gate_row_bytes = 66u;
     uint64_t gate_exp_bytes = (uint64_t)expert_dim * gate_row_bytes;
     uint64_t down_row_bytes = (expert_dim / 256u) * 84u;
-    if (down_row_bytes == 0) down_row_bytes = 84u;
     uint64_t down_exp_bytes = (uint64_t)dim * down_row_bytes;
 
     myds_metal_buffer_t *gate_exps = myds_metal_buffer_alloc((size_t)(n_routed_experts * gate_exp_bytes));
@@ -419,6 +539,16 @@ static void test_p2_moe_kernel_and_pso_validation(void) {
 
     assert(moe_out && x_in && gate_exps && up_exps && down_exps && selected_ids &&
            selected_weights && scratch_gate && scratch_up && scratch_mid && scratch_down);
+
+    float h_x[256];
+    for (uint32_t i = 0; i < dim; i++) h_x[i] = 1.0f + 0.01f * (float)(i % 17);
+    assert(myds_metal_buffer_write(x_in, 0, h_x, sizeof(h_x)));
+
+    uint8_t q_data[344064];
+    memset(q_data, 0x22, sizeof(q_data));
+    assert(myds_metal_buffer_write(gate_exps, 0, q_data, (size_t)(n_routed_experts * gate_exp_bytes)));
+    assert(myds_metal_buffer_write(up_exps, 0, q_data, (size_t)(n_routed_experts * gate_exp_bytes)));
+    assert(myds_metal_buffer_write(down_exps, 0, q_data, (size_t)(n_routed_experts * down_exp_bytes)));
 
     int32_t ids[6] = {0, 1, 2, 3, 4, 5};
     float weights[6] = {0.2f, 0.2f, 0.2f, 0.2f, 0.1f, 0.1f};
@@ -435,6 +565,12 @@ static void test_p2_moe_kernel_and_pso_validation(void) {
     );
     assert(ret == 1);
 
+    float h_out[256];
+    assert(myds_metal_buffer_read(moe_out, 0, h_out, sizeof(h_out)));
+    for (uint32_t i = 0; i < dim; i++) {
+        assert(isfinite(h_out[i]));
+    }
+
     myds_metal_buffer_free(moe_out);
     myds_metal_buffer_free(x_in);
     myds_metal_buffer_free(gate_exps);
@@ -447,7 +583,7 @@ static void test_p2_moe_kernel_and_pso_validation(void) {
     myds_metal_buffer_free(scratch_mid);
     myds_metal_buffer_free(scratch_down);
 
-    printf("  [PASS] P2: MoE IQ2/Q2K kernels verified and executed successfully on GPU\n");
+    printf("  [PASS] P2: MoE IQ2/Q2K 256-block quantized execution verified successfully on GPU\n");
 }
 
 static void test_p1_same_process_large_model_isolation(void) {
@@ -517,6 +653,7 @@ int main(void) {
     test_p1_response_id_lifecycle();
     test_p1_vision_queue_slot();
     test_p1_weight_identity();
+    test_p1_tensor_descriptor_binding_identity();
     test_p1_engram_metadata_identity();
     test_p1_unmapped_engram_identity();
     test_p1_same_process_large_model_isolation();

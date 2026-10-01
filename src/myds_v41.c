@@ -404,6 +404,20 @@ static void digest_update_metadata_kv(uint64_t *d, const gguf_kv_t *kv) {
     }
 }
 
+static void digest_update_tensor_descriptor(uint64_t *d, const gguf_tensor_t *t) {
+    if (!d || !t) return;
+    const size_t name_len = strlen(t->name);
+    digest_update_u64(d, (uint64_t)name_len);
+    digest_update(d, t->name, name_len);
+    digest_update_u64(d, (uint64_t)t->type);
+    digest_update_u64(d, (uint64_t)t->n_dims);
+    for (uint32_t k = 0; k < t->n_dims && k < GGUF_MAX_DIMS; k++) {
+        digest_update_u64(d, t->dims[k]);
+    }
+    digest_update_u64(d, t->offset);
+    digest_update_u64(d, (uint64_t)t->size_bytes);
+}
+
 /* 身份戳：决定这些字节含义的【全部】参数。任何一项变了，旧文件都必须作废 ——
  * 宁可重新付一次 prefill，也不能把上一版模型的 KV 接上去。 */
 static uint64_t lowkv_identity(const myds_model_t *m) {
@@ -454,6 +468,13 @@ static uint64_t lowkv_identity(const myds_model_t *m) {
             }
         }
 
+        /* ② 全量哈希所有张量描述符（名称及长度、类型、维度、偏移、大小），将张量元信息牢固绑定到模型身份 */
+        if (m->gf->tensors) {
+            for (uint64_t i = 0; i < m->gf->tensor_count; i++) {
+                digest_update_tensor_descriptor(&weight_digest, &m->gf->tensors[i]);
+            }
+        }
+
         uint64_t total_tensor_bytes = 0;
         if (m->gf->tensors) {
             for (uint64_t i = 0; i < m->gf->tensor_count; i++) {
@@ -468,6 +489,8 @@ static uint64_t lowkv_identity(const myds_model_t *m) {
             if (m->gf->tensors) {
                 for (uint64_t i = 0; i < m->gf->tensor_count; i++) {
                     const gguf_tensor_t *t = &m->gf->tensors[i];
+                    /* 显式将该张量描述符与该张量的数据强绑定 */
+                    digest_update_tensor_descriptor(&weight_digest, t);
                     if (t->size_bytes == 0) continue;
                     if (t->data) {
                         digest_update(&weight_digest, t->data, t->size_bytes);
@@ -499,10 +522,14 @@ static uint64_t lowkv_identity(const myds_model_t *m) {
                 return 0;
             }
             if (m->tok_embeddings && myds_metal_buffer_data(m->tok_embeddings)) {
+                digest_update_str(&weight_digest, "tok_embeddings");
+                digest_update_u64(&weight_digest, (uint64_t)m->tok_embeddings_type);
                 digest_update(&weight_digest, myds_metal_buffer_data(m->tok_embeddings),
                               myds_metal_buffer_size(m->tok_embeddings));
             }
             if (m->output && myds_metal_buffer_data(m->output)) {
+                digest_update_str(&weight_digest, "output");
+                digest_update_u64(&weight_digest, (uint64_t)m->output_type);
                 digest_update(&weight_digest, myds_metal_buffer_data(m->output),
                               myds_metal_buffer_size(m->output));
             }
@@ -525,6 +552,7 @@ static uint64_t lowkv_identity(const myds_model_t *m) {
                 const uint64_t step = (tc > 16u) ? (tc / 16u) : 1u;
                 for (uint64_t i = 0; i < tc; i += step) {
                     const gguf_tensor_t *t = &m->gf->tensors[i];
+                    digest_update_tensor_descriptor(&weight_digest, t);
                     if (t->size_bytes == 0) continue;
                     uint64_t w1 = 0, w2 = 0;
                     size_t s1 = t->size_bytes < 8 ? t->size_bytes : 8;
@@ -1135,6 +1163,15 @@ void myds_v41_context_free(myds_v41_context_t *g) {
     if (g->prompt_engram[1]) free(g->prompt_engram[1]);
     v41_chunk_workspace_free(g->chunk_ws);
     myds_v41_gpu_scratch_free(g->gpu); myds_engram_free(g->engram); free(g);
+}
+
+myds_v41_context_t *myds_v41_context_create_for_model(const myds_model_t *model) {
+    if (!model) return NULL;
+    myds_v41_context_t *g = calloc(1, sizeof(*g));
+    if (!g) return NULL;
+    g->model = model;
+    g->snap_enabled = (getenv("MYDS_NO_PREFIX_SNAPSHOT") == NULL);
+    return g;
 }
 
 static int project(myds_metal_buffer_t *out, const myds_metal_buffer_t *w,
