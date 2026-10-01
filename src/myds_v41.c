@@ -2487,8 +2487,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     const myds_metal_buffer_t *af_b = aliased ? cw->after_attn_buf : cw->after_view;
                     const myds_metal_buffer_t *sp_b = aliased ? cw->ffn_split_buf : cw->split_view;
 
-                    CHECK(myds_metal_add(cw->ffn_out_buf, moe_b, sh_b, V41_DIM * e_len));
-                    CHECK(myds_metal_v41_bf16(cw->ffn_out_buf, V41_DIM * e_len));
+                    CHECK(myds_metal_v41_add_bf16(cw->ffn_out_buf, moe_b, sh_b, V41_DIM * e_len));
                     myds_metal_barrier();
                     CHECK(myds_metal_v41_hc_expand_batch(cw->layer_out_buf, cw->ffn_out_buf, af_b, sp_b, V41_DIM, e_len));
 

@@ -846,7 +846,31 @@ static int test_v41_bf16_norm(void) {
         ASSERT_TRUE(!myds_metal_v41_rmsnorm(o,x,w,64,1e-20f,true));
         myds_metal_buffer_free(x);myds_metal_buffer_free(w);myds_metal_buffer_free(o);
     }
-    printf("  [PASS] V4.1 BF16 literal bits, ties, subnormals, tails and reference RMS reductions\n");
+    {
+        const uint32_t add_sizes[] = {64, 128, 512, 7168, 14336};
+        for (unsigned s = 0; s < sizeof(add_sizes)/sizeof(add_sizes[0]); s++) {
+            uint32_t count = add_sizes[s];
+            myds_metal_buffer_t *a = myds_metal_buffer_alloc(count * 4);
+            myds_metal_buffer_t *b = myds_metal_buffer_alloc(count * 4);
+            myds_metal_buffer_t *ref = myds_metal_buffer_alloc(count * 4);
+            myds_metal_buffer_t *fused = myds_metal_buffer_alloc(count * 4);
+            ASSERT_TRUE(a && b && ref && fused);
+            float *ap = myds_metal_buffer_data(a), *bp = myds_metal_buffer_data(b);
+            for (uint32_t i = 0; i < count; i++) {
+                ap[i] = 1.234567f * (float)(i + 1);
+                bp[i] = -0.876543f * (float)(i + 1);
+            }
+            ASSERT_TRUE(myds_metal_add(ref, a, b, count));
+            ASSERT_TRUE(myds_metal_v41_bf16(ref, count));
+            ASSERT_TRUE(myds_metal_v41_add_bf16(fused, a, b, count));
+            ASSERT_TRUE(!memcmp(myds_metal_buffer_data(ref), myds_metal_buffer_data(fused), count * 4));
+            myds_metal_buffer_free(a);
+            myds_metal_buffer_free(b);
+            myds_metal_buffer_free(ref);
+            myds_metal_buffer_free(fused);
+        }
+    }
+    printf("  [PASS] V4.1 BF16 literal bits, ties, subnormals, tails, add_bf16 and reference RMS reductions\n");
     return 1;
 }
 

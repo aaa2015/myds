@@ -34,6 +34,7 @@ static id<MTLComputePipelineState> g_pso_v41_hc_expand = nil;
 static id<MTLComputePipelineState> g_pso_v41_engram_add = nil;
 static id<MTLComputePipelineState> g_pso_swiglu = nil;
 static id<MTLComputePipelineState> g_pso_add = nil;
+static id<MTLComputePipelineState> g_pso_add_bf16 = nil;
 static id<MTLComputePipelineState> g_pso_mul_mv_q8_0 = nil;
 static id<MTLComputePipelineState> g_pso_mul_mv_f32 = nil;
 static id<MTLComputePipelineState> g_pso_mul_mv_f16 = nil;
@@ -521,6 +522,10 @@ int myds_metal_init(const char *shader_dir) {
         if (fn) {
             g_pso_add = [g_device newComputePipelineStateWithFunction:fn error:nil];
         }
+        fn = [g_library newFunctionWithName:@"kernel_add2_bf16_f32"];
+        if (fn) {
+            g_pso_add_bf16 = [g_device newComputePipelineStateWithFunction:fn error:nil];
+        }
 
         /* 4. Build Softmax pipeline */
         fn = [g_library newFunctionWithName:@"kernel_soft_max_f32"];
@@ -671,6 +676,7 @@ void myds_metal_cleanup(void) {
     g_pso_v41_engram_add = nil;
     g_pso_swiglu = nil;
     g_pso_add = nil;
+    g_pso_add_bf16 = nil;
     g_pso_mul_mv_q8_0 = nil;
     g_pso_mul_mv_f32 = nil;
     g_pso_mul_mv_f16 = nil;
@@ -2970,6 +2976,63 @@ int myds_metal_add(
 
     for (uint32_t i = 0; i < count; i++) {
         ov[i] = av[i] + bv[i];
+    }
+    return 1;
+}
+
+int myds_metal_v41_add_bf16(
+    myds_metal_buffer_t       *out,
+    const myds_metal_buffer_t *a,
+    const myds_metal_buffer_t *b,
+    uint32_t                   count) {
+    if (!out || !a || !b || count == 0) return 0;
+
+    if (g_pso_add_bf16 && a->mtl_buf && b->mtl_buf && out->mtl_buf) {
+        @autoreleasepool {
+            struct ds4_metal_args_add3 args;
+            args.n = count;
+            args.r2 = 1;
+            args.r3 = 1;
+
+            id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
+            [enc setComputePipelineState:g_pso_add_bf16];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:a->mtl_buf offset:(a ? a->offset : 0) atIndex:1];
+            [enc setBuffer:b->mtl_buf offset:(b ? b->offset : 0) atIndex:2];
+            [enc setBuffer:out->mtl_buf offset:(out ? out->offset : 0) atIndex:3];
+
+            NSUInteger threads = (count < 256) ? count : 256;
+            if (threads == 0) threads = 1;
+            [enc dispatchThreads:MTLSizeMake(count, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+
+            if (g_batch_cb) {
+                if (g_auto_barrier) {
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                }
+            } else {
+                [enc endEncoding];
+                [cb commit];
+                if (!wait_command_buffer(cb)) return 0;
+            }
+            return 1;
+        }
+    }
+
+    /* CPU Fallback with exact BF16 round */
+    float *ov = (float *)out->ptr;
+    const float *av = (const float *)a->ptr;
+    const float *bv = (const float *)b->ptr;
+    for (uint32_t i = 0; i < count; i++) {
+        float sum = av[i] + bv[i];
+        uint32_t bits;
+        memcpy(&bits, &sum, sizeof(bits));
+        if ((bits & 0x7f800000u) != 0x7f800000u) {
+            bits += 0x7fffu + ((bits >> 16u) & 1u);
+        }
+        bits &= 0xffff0000u;
+        memcpy(&ov[i], &bits, sizeof(bits));
     }
     return 1;
 }

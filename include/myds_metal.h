@@ -270,6 +270,14 @@ int myds_metal_add(
     const myds_metal_buffer_t *b,
     uint32_t                   count);
 
+/* Element-wise residual addition with fused BF16 round epilogue: out = bf16(a + b) */
+int myds_metal_v41_add_bf16(
+    myds_metal_buffer_t       *out,
+    const myds_metal_buffer_t *a,
+    const myds_metal_buffer_t *b,
+    uint32_t                   count);
+
+
 /* Softmax over row */
 int myds_metal_softmax(
     myds_metal_buffer_t       *out,

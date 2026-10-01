@@ -153,8 +153,10 @@ kernel void kernel_add_rms_norm_mul_f32_4(
 
     const float mean = sumf / args.ne00;
     const float scale = 1.0f / sqrt(mean + args.eps);
+    const bool round_bf16 = args.round_bf16 != 0;
     for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
-        norm[i00] = (sum[i00] * scale) * w[i00];
+        const float4 v = (sum[i00] * scale) * w[i00];
+        norm[i00] = round_bf16 ? dsv41_bf16_round_f32x4(v) : v;
     }
 }
 

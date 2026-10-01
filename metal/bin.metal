@@ -205,6 +205,31 @@ kernel void kernel_add2_f32(
     out[i] = a[i] + b[i];
 }
 
+#ifndef DSV41_BF16_ROUND_HELPER_DEFINED
+#define DSV41_BF16_ROUND_HELPER_DEFINED
+static inline float dsv41_bf16_round_f32(float v) {
+    uint bits = as_type<uint>(v);
+    if ((bits & 0x7f800000u) != 0x7f800000u) {
+        bits += 0x7fffu + ((bits >> 16u) & 1u);
+    }
+    return as_type<float>(bits & 0xffff0000u);
+}
+static inline float4 dsv41_bf16_round_f32x4(float4 v) {
+    return float4(dsv41_bf16_round_f32(v.x), dsv41_bf16_round_f32(v.y),
+                  dsv41_bf16_round_f32(v.z), dsv41_bf16_round_f32(v.w));
+}
+#endif
+
+kernel void kernel_add2_bf16_f32(
+        constant ds4_metal_args_add3 &args,
+        device const float *a,
+        device const float *b,
+        device float *out,
+        uint i [[thread_position_in_grid]]) {
+    if (i >= args.n) return;
+    out[i] = dsv41_bf16_round_f32(a[i] + b[i]);
+}
+
 kernel void kernel_add3_f32(
         constant ds4_metal_args_add3 &args,
         device const float *a,
@@ -215,3 +240,4 @@ kernel void kernel_add3_f32(
     if (i >= args.n) return;
     out[i] = a[i] + b[i] + c[i];
 }
+

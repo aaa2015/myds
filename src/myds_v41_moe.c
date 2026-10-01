@@ -133,10 +133,8 @@ int myds_v41_moe_eval(myds_context_t *ctx, uint32_t layer, uint32_t pos,
         l->ffn_down_exps_type,m->swiglu_clamp_exp)) return 0;
     myds_metal_barrier();
     if (!myds_trace_f32("routed_out",layer,pos,ctx->moe_out,dim) ||
-        !myds_metal_add(ctx->ffn_out,ctx->moe_out,shared_out,dim)) return 0;
-    myds_metal_barrier();
-    return myds_metal_v41_bf16(ctx->ffn_out,dim) &&
-        myds_trace_f32("ffnblock",layer,pos,ctx->ffn_out,dim);
+        !myds_metal_v41_add_bf16(ctx->ffn_out,ctx->moe_out,shared_out,dim)) return 0;
+    return myds_trace_f32("ffnblock",layer,pos,ctx->ffn_out,dim);
 }
 
 int myds_v41_moe(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t pos) {
