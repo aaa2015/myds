@@ -174,6 +174,7 @@ static bool snapshot_store_window(myds_v41_context_t *g, uint32_t il, uint32_t p
 /* prefill 结束后由引擎调用：把【当前状态】存进末尾槽（0 号）。 */
 bool myds_v41_snapshot_store_now(myds_v41_context_t *g, uint32_t p) {
     if (!g || !g->snap_enabled || !p || p < V41_SNAP_MIN) return true;
+    if (!myds_metal_commit_batch()) return false;
     const size_t bytes = (size_t)V41_WINDOW * V41_HEAD_DIM * 4u;
     for (uint32_t il = 0; il < V41_LAYERS; ++il)
         if (!myds_metal_buffer_copy(g->snap_window[0], (size_t)il * bytes, g->window[il], 0, bytes))
@@ -184,6 +185,7 @@ bool myds_v41_snapshot_store_now(myds_v41_context_t *g, uint32_t p) {
         if (!myds_metal_buffer_copy(g->snap_prev_score[0][o], 0, g->previous_score[o], 0, 512 * 4u))
             return false;
     }
+    if (!myds_metal_commit_batch()) return false;
     g->snap_engram[0] = g->engram->history;   /* engram 的 position 恒等于 p（每 token 推进一次） */
     g->snap_pos[0] = p;
     return true;
@@ -199,6 +201,7 @@ uint32_t myds_v41_snapshot_best(const myds_v41_context_t *g, uint32_t common) {
 }
 /* 把某点的【全部】状态装回去：engram tail + 各层窗口环 + 压缩器跨步状态 */
 bool myds_v41_snapshot_restore(myds_v41_context_t *g, uint32_t p) {
+    if (!myds_metal_commit_batch()) return false;
     for (uint32_t s = 0; s < V41_SNAP_SLOTS; ++s) {
         if (g->snap_pos[s] != p) continue;
         g->engram->history = g->snap_engram[s];
@@ -215,6 +218,7 @@ bool myds_v41_snapshot_restore(myds_v41_context_t *g, uint32_t p) {
             if (!myds_metal_buffer_copy(g->previous_score[o], 0, g->snap_prev_score[s][o], 0, 512 * 4u))
                 return false;
         }
+        if (!myds_metal_commit_batch()) return false;
         g->next_position = p;
         g->valid = true;
         return true;
@@ -1243,8 +1247,9 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
         MYDS_LOG_E("V4.1 expected consecutive token position %u, received %u",g->next_position,pos);
         return -1;
     }
+    const bool trace_on = myds_trace_active();
 #define CHECK(x) do { if (!(x)) goto fail; } while (0)
-#define TRACE(stage,buf,n) CHECK(myds_trace_f32(stage,il,pos,buf,n))
+#define TRACE(stage,buf,n) do { if (trace_on) CHECK(myds_trace_f32(stage,il,pos,buf,n)); } while (0)
     CHECK(myds_engram_prepare_token(g->engram,token,pos));
     for (uint32_t i=0;i<2;i++) CHECK(myds_metal_buffer_write(g->engram_rows[i],0,
         g->engram->row_values[i],MYDS_ENGRAM_INPUT_DIM*4u));

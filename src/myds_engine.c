@@ -16,6 +16,7 @@
 #include <sys/mman.h>
 #include <mach/mach.h>
 #include <dispatch/dispatch.h>
+#include <stdatomic.h>
 
 bool myds_trace_f32(const char *stage, uint32_t layer, uint32_t pos,
                       const myds_metal_buffer_t *buffer, size_t count);
@@ -1996,14 +1997,23 @@ static bool trace_selected(const char *filter, uint32_t value) {
 
 /* Opt-in numerical diagnostics, independent of sampling/text decoding. Files
  * contain native little-endian F32 on Apple Silicon. Never enabled by default. */
+static atomic_int g_trace_checked = 0;
+static bool g_trace_active_cached = false;
+
 bool myds_trace_active(void) {
-    const char *prefix = getenv("MYDS_TRACE_PREFIX");
-    if (!prefix || !*prefix) prefix = getenv("MYDS_BATCH_TRACE_PREFIX");
-    return (prefix && *prefix);
+    int checked = atomic_load_explicit(&g_trace_checked, memory_order_relaxed);
+    if (__builtin_expect(!checked, 0)) {
+        const char *prefix = getenv("MYDS_TRACE_PREFIX");
+        if (!prefix || !*prefix) prefix = getenv("MYDS_BATCH_TRACE_PREFIX");
+        g_trace_active_cached = (prefix && *prefix);
+        atomic_store_explicit(&g_trace_checked, 1, memory_order_relaxed);
+    }
+    return g_trace_active_cached;
 }
 
 bool myds_trace_f32(const char *stage, uint32_t layer, uint32_t pos,
                       const myds_metal_buffer_t *buffer, size_t count) {
+    if (!myds_trace_active()) return true;
     const char *prefix = getenv("MYDS_TRACE_PREFIX");
     if (!prefix || !*prefix) prefix = getenv("MYDS_BATCH_TRACE_PREFIX");
     if (!prefix || !*prefix) return true;
