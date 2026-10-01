@@ -22,6 +22,12 @@ MODEL="${2:?缺少 model.gguf}"
 CACHE="${3:?缺少 cache_dir}"
 PORT="${4:-8199}"
 CTX="${5:-32768}"
+# ★ 被测的 way 数。必须显式传给 myds —— 否则它会用内置默认值（3），
+#   门禁就会「通过」在一个根本没被测的配置上（2026-10-01 真实踩到）。
+WAYS="${WAYS:-3}"
+# 每个 way 占 11 个位置组 × 最深位置 47.5 MiB ≈ 523 MiB（每格按最深预留）；
+# 预算必须给够，否则 myds 在 open 时会明确报错（那正是我们要的：不静默截断）。
+BUDGET_MB="${BUDGET_MB:-$(( WAYS * 523 + 256 ))}"
 
 PROMPT_FILE="${PROMPT_FILE:-/tmp/low_kv_gate_prompt.txt}"
 LOG_A=/tmp/low_kv_gate_cold.log
@@ -82,9 +88,11 @@ PROMPT_TAILS=(
 )
 note "前缀: $PREFIX_FILE（$(wc -c < "$PREFIX_FILE" | tr -d ' ') 字节，码词在最前面）"
 note "提示词: ${#PROMPT_TAILS[@]} 个（共用同一段常量前缀）"
+note "被测配置: MYDS_KV_DSK_WAYS=$WAYS  MYDS_KV_DSK_BUDGET_MB=$BUDGET_MB"
 
 start_server() {   # $1=日志文件
     MYDS_PREFIX_CACHE=1 MYDS_KV_DSK="$CACHE" \
+    MYDS_KV_DSK_WAYS="$WAYS" MYDS_KV_DSK_BUDGET_MB="$BUDGET_MB" \
         "$BIN" -m "$MODEL" --port "$PORT" -c "$CTX" --alias low-kv-gate \
         > "$1" 2>&1 &
     SRV_PID=$!
@@ -138,6 +146,16 @@ start_server "$LOG_A" || exit 1
 note "服务已起（pid $SRV_PID）"
 run_all cold
 grep -q "kvdisk: 低位区落盘已启用" "$LOG_A" && ok "落盘已启用" || fail "日志里没有启用行"
+# ★★ 必查：实际生效的 way 数必须【等于】被测的 way 数。
+#   门禁脚本曾经只传 MYDS_KV_DSK 而漏传 MYDS_KV_DSK_WAYS ⇒ myds 用默认 3 ⇒
+#   门禁在「ways=3」下通过，却被当成「ways=32 已验证」。这种失败是静默的：
+#   输出全对、断言全绿，只有这一行能戳穿它。
+if grep -q "× ${WAYS} way" "$LOG_A"; then
+    ok "实际生效的配置正是被测配置（${WAYS} way，预算 ${BUDGET_MB} MiB）"
+else
+    fail "跑的不是被测配置！期望 ${WAYS} way，日志说："
+    grep -m1 "位置组 ×" "$LOG_A" | sed 's/^/    /'
+fi
 ls -la "$CACHE" 2>/dev/null | grep kvlow | sed 's/^/    /'
 kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null
 
