@@ -3,6 +3,7 @@
 #include "myds_gguf.h"
 #include "myds_tokenizer.h"
 #include "myds_v41.h"
+#include "myds_align.h"
 #include "myds_log.h"
 #include "myds_cpu.h"
 
@@ -1192,7 +1193,8 @@ myds_context_t *myds_context_create(myds_model_t *model, const myds_config_t *cf
  * 与 ds4 一致：ds4 也是推同一个 id，靠注入的向量区分。
  * 这里拷一份数据（3~4MB 量级），避免调用方还要管生命周期 —— 少一个出错点。 */
 void myds_context_add_image_embeddings(myds_context_t *ctx, uint32_t start_pos,
-                                       uint32_t count, const float *data, uint32_t dim) {
+                                       uint32_t count, const float *data, uint32_t dim,
+                                       uint32_t image_token_id) {
     if (!ctx || !data || count == 0 || dim == 0) return;
     if (ctx->img_emb_n > 0 && ctx->img_emb_dim != dim) {
         MYDS_LOG_E("image embeddings: 向量宽度不一致（已有 %u，本次 %u），拒绝添加",
@@ -1224,6 +1226,7 @@ void myds_context_add_image_embeddings(myds_context_t *ctx, uint32_t start_pos,
     ctx->img_emb_count[ctx->img_emb_n] = count;
     ctx->img_emb_n++;
     ctx->img_emb_dim = dim;
+    ctx->img_emb_token_id = image_token_id;
     MYDS_LOG_I("image embeddings: 区间 %u = 位置 [%u, %u)，每维 %u",
                ctx->img_emb_n, start_pos, start_pos + count, dim);
 }
@@ -2850,21 +2853,72 @@ static int myds_generate_internal(myds_context_t *ctx,
              * 但这段文本是要接在【已有序列】后面的 ⇒ 那个 BOS 会落在序列中间，是错的。
              * 实测证据：不丢时续跑比全量重放【多 1 个 token】（2058 vs 2057），
              * 而两条路径的其它 token 逐位一致。 */
+            bool bos_dropped = false;
             if (n_prompt > 0 && m->tokenizer && prompt_tokens[0] == m->tokenizer->bos_id) {
                 memmove(prompt_tokens, prompt_tokens + 1, (size_t)(n_prompt - 1) * sizeof(int32_t));
                 --n_prompt;
+                bos_dropped = true;
                 MYDS_LOG_I("previous_response_id: dropped the leading BOS from the delta "
                            "(it would sit mid-sequence)");
             }
             memmove(prompt_tokens + pl, prompt_tokens, (size_t)n_prompt * sizeof(int32_t));
             memcpy(prompt_tokens, ctx->pcache_tokens, (size_t)pl * sizeof(int32_t));
             n_prompt += (int32_t)pl;
+            /* ★ 图像向量的区间也必须跟着搬家。
+             * 它们由服务端按【本次请求那段文本】的下标登记（含 BOS 于 0），而这里
+             * ① 丢掉了 delta 的 BOS、② 把整段挪到缓存前缀之后 ⇒ 坐标系变了两次。
+             * 不搬的后果非常具体、也非常隐蔽：新图的向量落回了【上一次那张图】的位置，
+             * 于是每一轮都识别出第一张图（实测连续三轮不同图片，答案全是第一张）。
+             * 正确换算：delta 下标 i ⇒ pl - (丢过BOS ? 1 : 0) + i。 */
+            const int32_t head_shift = (int32_t)pl - (bos_dropped ? 1 : 0);
+            if (head_shift != 0 && ctx->img_emb_n) {
+                for (uint32_t i = 0; i < ctx->img_emb_n; i++) {
+                    ctx->img_emb_start[i] = (uint32_t)((int64_t)ctx->img_emb_start[i] + head_shift);
+                }
+                MYDS_LOG_I("previous_response_id: 图像向量区间后移 %d 位（%u 个区间）",
+                           head_shift, ctx->img_emb_n);
+            }
             MYDS_LOG_I("previous_response_id: %u cached + %d new = %d tokens",
                        pl, n_prompt - (int32_t)pl, n_prompt);
         } else {
             /* 状态已被后续请求换掉 ⇒ 前缀不在。这里【继续按全量跑】并说话，
              * 而不是假装命中 —— 服务端那一侧已经用 id 保证只会走到「最近一次」。 */
             MYDS_LOG_W("previous_response_id: no cached sequence to continue from; prefilling in full");
+        }
+    }
+
+    /* ★ 图像向量区间的自检与纠正。
+     *
+     * 为什么需要它：区间是【服务端】按请求文本算的下标，而序列在【引擎】里可能被
+     * 续接逻辑改过（丢 BOS、前置缓存前缀）。两个坐标系一旦不一致，图片向量就会贴到
+     * 别的 token 上 —— 不报错，只是认错图，属于最难查的一类。上面已按公式换算过，
+     * 这里再独立验一遍：判据来自图片块自身的性质（每个位置都是同一个图片 token），
+     * 这也让正确位置可恢复。判据与恢复算法是纯函数，见 myds_align.h（有单测）。
+     * 找不到就拒绝本轮 —— 宁可报错，也不要把图片向量贴到错的 token 上。 */
+    if (ctx->img_emb_n && n_prompt > 0) {
+        uint32_t scan_from = 0;
+        for (uint32_t i = 0; i < ctx->img_emb_n; i++) {
+            const uint32_t cnt = ctx->img_emb_count[i];
+            const uint32_t declared = ctx->img_emb_start[i];
+            const int64_t at = myds_image_range_resolve(prompt_tokens, (uint32_t)n_prompt,
+                                                        ctx->img_emb_token_id, declared,
+                                                        cnt, scan_from);
+            if (at < 0) {
+                MYDS_LOG_E("image embeddings: 区间 %u（声明位置 [%u,%u)，长 %u）"
+                           "在序列里找不到对应的图片 token，拒绝本轮",
+                           i + 1, declared, declared + cnt, cnt);
+                free(prompt_tokens);
+                if (out_reason) *out_reason = MYDS_STOP_ERROR;
+                return 0;
+            }
+            if ((uint32_t)at != declared) {
+                MYDS_LOG_W("image embeddings: 区间 %u 声明位置 [%u,%u) 与序列不符，"
+                           "按实际 token 位置纠正为 [%lld,%lld)",
+                           i + 1, declared, declared + cnt,
+                           (long long)at, (long long)at + (long long)cnt);
+                ctx->img_emb_start[i] = (uint32_t)at;
+            }
+            scan_from = (uint32_t)at + cnt;
         }
     }
 

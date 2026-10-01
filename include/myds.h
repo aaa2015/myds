@@ -124,7 +124,8 @@ int32_t         myds_forward_token(myds_context_t *ctx, int32_t token_id, uint32
  *   的任何对话」都被拒：网关每轮重发完整历史，历史里不止一张图。）
  * 添加时【拷贝】数据，调用方不必管生命周期；clear / 下一次生成结束时统一释放。 */
 void            myds_context_add_image_embeddings(myds_context_t *ctx, uint32_t start_pos,
-                                                  uint32_t count, const float *data, uint32_t dim);
+                                                  uint32_t count, const float *data, uint32_t dim,
+                                                  uint32_t image_token_id);
 void            myds_context_clear_image_embeddings(myds_context_t *ctx);
 
 #ifdef __cplusplus

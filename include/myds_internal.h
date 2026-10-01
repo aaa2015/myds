@@ -189,6 +189,10 @@ struct myds_context {
     uint32_t             img_emb_n;      /* 区间个数 */
     uint32_t             img_emb_cap;
     uint32_t             img_emb_dim;    /* 各区间共同的向量宽度 */
+    /* 图片块占用的那个 token id（V4.1 是 129264）。引擎用它【自检】区间是否对齐：
+     * 区间内每个位置都必须是这个 id，否则向量就贴错了地方。
+     * 由调用方在 add 时告知 —— 引擎不该去依赖视觉模块。 */
+    uint32_t             img_emb_token_id;
 };
 
 /* Unified production sampler: greedy, temperature, top-k, min-p, top-p, repetition penalty */

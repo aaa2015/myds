@@ -1850,7 +1850,8 @@ static bool inject_image_embeddings(myds_context_t *ctx, const char *prompt,
             return false;
         }
         myds_context_add_image_embeddings(ctx, (uint32_t)off, plan->token_count,
-                                         plan->block, plan->dim);
+                                         plan->block, plan->dim,
+                                         myds_vjob_image_token_id());
         /* 跳过本块的整段占位文本，保证第 i+1 个块不会匹配到同一个位置
          * （相邻图片块的首个占位符字符完全相同） */
         cursor = at + (size_t)plan->token_count * phlen;
