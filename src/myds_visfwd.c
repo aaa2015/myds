@@ -170,9 +170,10 @@ int myds_vis_encode(const myds_vis_weights *w, const myds_vis_patches *patches,
         ok = dispatch_rmsnorm("kernel_visenc_rmsnorm", tmp, cur, L->norm1,
                               VIS_WIDTH, rows, eps);
         if (ok) STAGE("qkv gemm");
-        if (ok && il == 0u) dump_stage("b0_norm1", tmp, (size_t)rows * VIS_WIDTH);
+        if (ok && il == 0u) dump_stage("block0_norm1", tmp, (size_t)rows * VIS_WIDTH);
         if (ok) ok = myds_metal_mul_mm(qkv, L->qkv_weight, tmp,
                                        VIS_QKV, VIS_WIDTH, rows, GGML_TYPE_F32);
+        if (ok && il == 0u) dump_stage("block0_qkv", qkv, (size_t)rows * VIS_QKV);
         if (ok) {
             struct { uint32_t rows, grid_width; } qa_args = { rows, gw };
             myds_metal_buffer_t *bufs[5] = { qkv, L->qkv_bias, q, k, v };
@@ -196,7 +197,10 @@ int myds_vis_encode(const myds_vis_weights *w, const myds_vis_patches *patches,
                                             groups, threads, 0);
         }
         if (ok) ok = dispatch_rows("kernel_visenc_round", VIS_WIDTH, rows, &attn, 1, 0.0f, 0);
-        if (ok && il == 0u) dump_stage("b0_attn", attn, (size_t)rows * VIS_WIDTH);
+        if (ok && il == 0u) dump_stage("block0_q", q, (size_t)rows * VIS_WIDTH);
+        if (ok && il == 0u) dump_stage("block0_k", k, (size_t)rows * VIS_WIDTH);
+        if (ok && il == 0u) dump_stage("block0_v", v, (size_t)rows * VIS_WIDTH);
+        if (ok && il == 0u) dump_stage("block0_attention", attn, (size_t)rows * VIS_WIDTH);
         if (ok) STAGE("attn wo gemm");
         if (ok) ok = myds_metal_mul_mm(tmp, L->attn_proj_weight, attn,
                                        VIS_WIDTH, VIS_WIDTH, rows, GGML_TYPE_F32);
@@ -231,8 +235,10 @@ int myds_vis_encode(const myds_vis_weights *w, const myds_vis_patches *patches,
                                             (const myds_metal_buffer_t *const *)b, 2,
                                             groups, threads, 0);
         }
-        if (ok && il == 0u) dump_stage("b0_wo", tmp, (size_t)rows * VIS_WIDTH);
-        if (ok && il == 0u) dump_stage("b0_mlp_mid", mid, (size_t)rows * VIS_FFN);
+        if (ok && il == 0u) dump_stage("block0_attn_proj", tmp, (size_t)rows * VIS_WIDTH);
+        if (ok && il == 0u) dump_stage("block0_norm2", tmp, (size_t)rows * VIS_WIDTH);
+        if (ok && il == 0u) dump_stage("block0_mlp_w1", w1, (size_t)rows * VIS_FFN2);
+        if (ok && il == 0u) dump_stage("block0_mlp_mid", mid, (size_t)rows * VIS_FFN);
         if (ok) STAGE("mlp w2 gemm");
         if (ok) ok = myds_metal_mul_mm(tmp, L->mlp_w2, mid,
                                        VIS_WIDTH, VIS_FFN, rows, GGML_TYPE_F32);
@@ -243,7 +249,7 @@ int myds_vis_encode(const myds_vis_weights *w, const myds_vis_patches *patches,
             ok = dispatch_rows("kernel_visenc_add_residual", VIS_WIDTH, rows, b, 2, 0.0f, 0);
         }
         { myds_metal_buffer_t *sw = cur; cur = tmp; tmp = sw; }
-        if (ok && g_dump_prefix && il <= 6u) {
+        if (ok && g_dump_prefix && (il <= 6u || il == 15u || il == 31u)) {
             char stage[24];
             snprintf(stage, sizeof(stage), "block%u", il);
             dump_stage(stage, cur, (size_t)rows * VIS_WIDTH);
