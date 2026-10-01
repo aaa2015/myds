@@ -208,6 +208,50 @@ static void test_budget_is_reported_not_silently_trimmed(void) {
     CHECK(myds_kvdsk_open_error()[0] != 0, "失败原因不能是空字符串");
 }
 
+
+/* ── 一条槽只装得下【一条】前缀 ──
+ * 这是「相同的系统提示词 + tools 就会命中」这句话的另一面，也是它唯一的边界：
+ * 槽号由【位置】决定（低位区的位置↔槽是双射），而载荷按位置对齐存放 ⇒ 两个长度相同、
+ * 内容不同的常量前缀会争同一批槽，后写的把先写的顶掉。
+ *
+ * 后果不是「命中率下降一点」，而是【互相把对方挤没】：
+ *   A 写完 B 写 ⇒ B 写时发现「同位置、哈希不同」⇒ 覆盖 ⇒ A 再来时哈希对不上 ⇒ 全量 prefill。
+ * 两个前缀交替出现时，每一个请求都是全量 + 重写一遍载荷（位置 1024..4608 约 218 MiB）。
+ *
+ * 这条测试把「一个位置一条」这个前提钉住。若将来改成每个位置放多条（带命中数淘汰，
+ * 像 ds4_kvstore.c 那样），它会失败 —— 那时应当连同淘汰策略一起，有意识地改。
+ */
+static void test_one_prefix_per_position(void) {
+    fresh_path("oneper", 0);
+    myds_kvdsk_t *k = myds_kvdsk_open(g_path, 6u, 4u, 1024u, 0);
+    if (!k) { CHECK(0, "open 失败"); return; }
+    unsigned char a[256], b[256];
+    fill(a, sizeof(a), 1);
+    fill(b, sizeof(b), 2);
+    const uint32_t pos = 4608u;                 /* 低位区的一个位置 */
+    const uint64_t hash_a = myds_kvdsk_hash_tokens((const int32_t[]){1,2,3,4,5}, 5);
+    const uint64_t hash_b = myds_kvdsk_hash_tokens((const int32_t[]){1,2,3,4,6}, 5);
+    CHECK(hash_a != hash_b, "两个前缀必须哈希不同（否则本测试无意义）");
+
+    CHECK(myds_kvdsk_write_start(k, 1) && myds_kvdsk_write_chunk(k, 0, a, sizeof(a)) &&
+          myds_kvdsk_write_finish(k, 1, pos, hash_a, sizeof(a)), "写 A");
+    uint32_t p1 = 0; uint64_t h1 = 0, u1 = 0;
+    CHECK(myds_kvdsk_slot_meta(k, 1, &p1, &h1, &u1) && h1 == hash_a, "A 应在位");
+
+    /* B 落在同一个位置（同一个槽） */
+    CHECK(myds_kvdsk_write_start(k, 1) && myds_kvdsk_write_chunk(k, 0, b, sizeof(b)) &&
+          myds_kvdsk_write_finish(k, 1, pos, hash_b, sizeof(b)), "写 B");
+    uint32_t p2 = 0; uint64_t h2 = 0, u2 = 0;
+    CHECK(myds_kvdsk_slot_meta(k, 1, &p2, &h2, &u2) && h2 == hash_b, "B 应顶掉 A");
+    CHECK(myds_kvdsk_live_entries(k) == 1u, "同一位置仍然只有 1 条");
+
+    /* 于是 A 的前缀再也找不到自己的字节 —— 这不是 bug，是「位置即身份」的直接后果 */
+    uint32_t p3 = 0; uint64_t h3 = 0, u3 = 0;
+    bool a_still_there = myds_kvdsk_slot_meta(k, 1, &p3, &h3, &u3) && h3 == hash_a;
+    CHECK(!a_still_there, "A 的条目已被 B 顶掉（两个不同前缀交替 ⇒ 互相挤没）");
+    myds_kvdsk_close(k);
+}
+
 int main(void) {
     printf("myds 低位区 KV 落盘（存储层）\n");
     test_hash_is_stable_and_discriminating();
@@ -219,7 +263,8 @@ int main(void) {
     test_identity_change_invalidates_file();
     test_bounds_are_enforced();
     test_budget_is_reported_not_silently_trimmed();
-    if (failures == 0) { printf("  ✓ 9 组断言全部通过\n"); return 0; }
+    test_one_prefix_per_position();
+    if (failures == 0) { printf("  ✓ 10 组断言全部通过\n"); return 0; }
     printf("  ✗ %d 处断言失败\n", failures);
     return 1;
 }
