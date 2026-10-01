@@ -270,6 +270,38 @@ int extract_http_header_int(const char *headers, const char *header_name) {
 }
 
 /* Very simple JSON string value finder: searches for "key"\s*:\s*"value" */
+/* 判断 body 的【顶层】是否有某个 key。
+ * 只认深度 1：input 里的消息内容也可能含 "tools" 之类的字样，不能被误判。
+ * 用途：看请求是否重复携带了已在续接序列里的 instructions/tools。 */
+bool json_has_top_field(const char *body, const char *key) {
+    if (!body || !key) return false;
+    const size_t klen = strlen(key);
+    int depth = 0;
+    const char *p = body;
+    while (*p) {
+        if (*p == '{' || *p == '[') { ++depth; ++p; continue; }
+        if (*p == '}' || *p == ']') { --depth; ++p; continue; }
+        if (*p == '"') {
+            const char *start = p + 1;
+            const char *q = start;
+            while (*q) {
+                if (*q == '\\') { q += 2; continue; }
+                if (*q == '"') break;
+                ++q;
+            }
+            if (!*q) break;
+            const char *after = q + 1;
+            while (*after == ' ' || *after == '\t' || *after == '\r' || *after == '\n') ++after;
+            if (depth == 1 && *after == ':' && (size_t)(q - start) == klen &&
+                !strncmp(start, key, klen)) return true;
+            p = q + 1;
+            continue;
+        }
+        ++p;
+    }
+    return false;
+}
+
 int json_extract_string_field(const char *json, const char *key, char *out, size_t out_size) {
     if (!json || !key || !out || out_size == 0) return 0;
     char needle[128];
@@ -1747,12 +1779,17 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             return;
         }
 
-        MYDS_LOG_I("[%s:%d] %s %s (protocol=%s, stream=%s, max_tokens=%d, temp=%.2f, top_p=%.2f, top_k=%d, prompt_chars=%zu)",
+        /* 这两项在【续接请求】里本不该出现（服务端会忽略，用被续接序列里的那份）；
+         * 记下来是为了让「还在重复携带」这件事可见。 */
+        const bool req_has_instructions = json_has_top_field(body, "instructions");
+        const bool req_has_tools = json_has_top_field(body, "tools");
+        MYDS_LOG_I("[%s:%d] %s %s (protocol=%s, stream=%s, max_tokens=%d, temp=%.2f, top_p=%.2f, top_k=%d, "
+                   "prompt_chars=%zu, body=%zd, has_instructions=%d, has_tools=%d)",
                    client_ip, client_port, method, path,
                    is_responses_endpoint ? "Responses" : "ChatCompletions",
                    stream ? "true" : "false",
                    max_tokens, temp, top_p, top_k,
-                   strlen(prompt));
+                   strlen(prompt), total_read, req_has_instructions ? 1 : 0, req_has_tools ? 1 : 0);
 
         pthread_mutex_lock(&g_infer_mutex);
         if (is_continuation) myds_set_continue_from_cache(ctx, true);

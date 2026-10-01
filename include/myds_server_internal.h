@@ -56,6 +56,8 @@ void myds_server_non_stream_callback(const char *piece, size_t length, int32_t t
 void json_unescape_slice(const char *src, size_t len, char *dst, size_t dst_size);
 int extract_http_header_int(const char *headers, const char *header_name);
 int json_extract_string_field(const char *json, const char *key, char *out, size_t out_size);
+/* 顶层字段存在性（深度 1），避免误判 input 内容里的同名字样。 */
+bool json_has_top_field(const char *body, const char *key);
 int json_extract_bool_field(const char *json, const char *key, int default_val);
 int json_extract_int_field(const char *json, const char *key, int default_val);
 float json_extract_float_field(const char *json, const char *key, float default_val);
