@@ -232,3 +232,8 @@ Options:
   --seed <int>            Random seed (default: random)
   -h, --help              Show this help message
 ```
+
+## 视觉（图片输入）
+
+支持图片输入（DeepSeek-V4.1-Flash-Vision），启动加 `--vision <编码器.gguf>`。
+使用、原理、验证与**明确不做**的范围：见 **[docs/VISION.md](docs/VISION.md)**。
