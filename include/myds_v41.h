@@ -24,6 +24,33 @@ bool     myds_v41_snapshot_restore(myds_v41_context_t *context, uint32_t positio
 void     myds_v41_snapshot_clear(myds_v41_context_t *context, uint32_t keep_up_to);
 /* prefill 结束后记下当前状态（末尾槽），供下一个共享前缀的请求复用。 */
 bool     myds_v41_snapshot_store_now(myds_v41_context_t *context, uint32_t position);
+
+/* ── 低位区 KV 的 SSD 落盘 ──
+ * 内存快照只活在【进程内、且只在与上一条序列共享前缀时】可用。跨进程（重启）或
+ * 跨会话（客户端每次都当新对话）就没有了，于是那几秒～十几秒的常量前缀 prefill
+ * 每次都要重付。这里把【低位区】那批快照落到磁盘，让它们能跨进程复用。
+ *
+ * 只做低位区（位置 1024..6144，对应系统提示词 + 工具定义那一段），不做环形槽：
+ * 文件于是有界，淘汰退化成「一个位置一条，新的覆盖旧的」。
+ *
+ * 为什么还要存压缩 KV：注意力除了窗口环还要读 compressed/index_cache（跨位置累积的
+ * 压缩 KV）。内存快照能省掉它们，是因为「与上一条序列共享前缀」已经保证了那批行仍然
+ * 对应当前前缀；跨进程恢复没有这个前提，所以必须一并存。
+ *
+ * `dir` 为空或 MYDS_KV_DSK=0 则不启用（库的调用方依赖「每次 generate 都是全量」，
+ * 这个优化由服务端显式打开）。 */
+bool     myds_v41_low_kv_enable(myds_v41_context_t *context, const char *dir);
+bool     myds_v41_low_kv_enabled(const myds_v41_context_t *context);
+/* 把当前【低位槽】里还需要的快照写盘（内容没变则不重写）。 */
+bool     myds_v41_low_kv_save(myds_v41_context_t *context, const int32_t *tokens,
+                              uint32_t n_tokens);
+/* 在 (0, max_position] 内找【最深】的、前缀哈希匹配的条目，装回内存快照槽。
+ * 返回命中的位置（0 = 未命中），随后由 myds_v41_snapshot_restore 应用。 */
+uint32_t myds_v41_low_kv_load(myds_v41_context_t *context, const int32_t *tokens,
+                              uint32_t max_position);
+/* 落盘条目的诊断信息（命中数 / 有效数），供日志与测试读取。 */
+void     myds_v41_low_kv_stats(const myds_v41_context_t *context,
+                               uint32_t *live_entries, uint32_t *slots);
 int32_t myds_v41_forward(myds_context_t *context, int32_t token,
                         uint32_t position, bool need_logits);
 int myds_v41_prefill_tokens(myds_context_t *context, const int32_t *tokens,

@@ -1182,6 +1182,13 @@ myds_context_t *myds_context_create(myds_model_t *model, const myds_config_t *cf
     if (model->v41) {
         ctx->v41 = myds_v41_context_create(ctx);
         if (!ctx->v41) { myds_context_free(ctx); return NULL; }
+        /* 低位区 KV 的 SSD 落盘：由服务端显式打开（MYDS_KV_DSK=<目录>）。
+         * 不设就完全不开 —— 与 MYDS_PREFIX_CACHE 同一个道理：库的调用方（含单测）
+         * 依赖「每次 generate 都是从位置 0 全量 prefill」。 */
+        {
+            const char *dsk = getenv("MYDS_KV_DSK");
+            if (dsk && *dsk) (void)myds_v41_low_kv_enable(ctx->v41, dsk);
+        }
     }
     return ctx;
 }
@@ -2991,8 +2998,22 @@ static int myds_generate_internal(myds_context_t *ctx,
                            "at %u (reuse %u tok, still to prefill %u)",
                            n_prompt, ctx->pcache_len, L, snap, snap, (uint32_t)n_prompt - 1u - snap);
             } else {
-                MYDS_LOG_I("prefix cache: skipped - common prefix %u of cached %u, but no snapshot within it "
-                           "(the state cannot be rewound, so this restarts from 0)", L, ctx->pcache_len);
+                /* 内存里没有可用的快照 ⇒ 再试【磁盘】（跨进程 / 跨会话的常量前缀，
+                 * 也就是系统提示词 + 工具定义那一段）。这一步只在内存路径失败之后才走，
+                 * 所以不改变原有快路径的任何行为。
+                 * 判据只看「这条 prompt 自己开头那段是否与盘上的前缀逐 token 相同」（哈希），
+                 * 不要求与上一条请求有公共前缀 —— 全新会话恰恰就是这种情况。 */
+                const uint32_t disk = ctx->v41
+                    ? myds_v41_low_kv_load(ctx->v41, prompt_tokens, (uint32_t)n_prompt - 1u) : 0;
+                if (disk) {
+                    resume_from = disk; snap_hit = true;
+                    MYDS_LOG_I("prefix cache: prompt %d tok, common prefix %u -> resume from DISK snapshot "
+                               "at %u (reuse %u tok, still to prefill %u)",
+                               n_prompt, L, disk, disk, (uint32_t)n_prompt - 1u - disk);
+                } else {
+                    MYDS_LOG_I("prefix cache: skipped - common prefix %u of cached %u, but no snapshot within it "
+                               "(the state cannot be rewound, so this restarts from 0)", L, ctx->pcache_len);
+                }
             }
         } else {
             MYDS_LOG_I("prefix cache: skipped - no common prefix with the cached %u tokens", ctx->pcache_len);
@@ -3095,6 +3116,9 @@ static int myds_generate_internal(myds_context_t *ctx,
     /* 记下 prefill 末尾的状态，供下一个只共享前缀的请求续跑（续跑点为 0 token 时，
      * prefill 里的保存点不会执行，所以必须在这里显式存一次）。 */
     if (ctx->v41) (void)myds_v41_snapshot_store_now(ctx->v41, (uint32_t)n_prompt - 1u);
+    /* 低位区快照落盘（内容没变则不重写 ⇒ 稳态零写盘）。
+     * 必须在这里：下一行 prompt_tokens 就释放了，而哈希与快照位置都要用到它。 */
+    if (ctx->v41) (void)myds_v41_low_kv_save(ctx->v41, prompt_tokens, (uint32_t)n_prompt);
     cur_token = prompt_tokens[n_prompt - 1];
     free(prompt_tokens);
 
