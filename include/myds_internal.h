@@ -96,6 +96,9 @@ struct myds_model {
     myds_metal_buffer_t *output_norm;
     myds_metal_buffer_t *output;
     ggml_type            output_type;
+
+    /* Model load instance generation (for cache isolation when manifest digest is absent) */
+    uint64_t             load_generation;
 };
 
 typedef struct myds_prefill_chunk myds_prefill_chunk_t;

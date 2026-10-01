@@ -543,6 +543,7 @@ static void test_snapshot_slots_keep_the_constant_prefix(void) {
 
     /* ② 低位区：位置与槽【固定一一对应】，与后续走了多深无关 */
     const uint32_t first = MYDS_SNAP_MIN / MYDS_SNAP_STRIDE;
+    (void)first;
     for (uint32_t k = 0; k < MYDS_SNAP_PINNED; ++k) {
         const uint32_t p = MYDS_SNAP_MIN + k * MYDS_SNAP_STRIDE;
         const uint32_t slot = myds_snap_slot_for(p, 0);

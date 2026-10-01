@@ -4,6 +4,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <sys/mman.h>
 
 #include "myds.h"
 #include "myds_gguf.h"
@@ -220,11 +221,145 @@ static void test_p1_metal_fused_add_fallback(void) {
     printf("  [PASS] P1-1: Metal fused add BF16 and GPU fallback chain are bit-exact identical (memcmp == 0)\n");
 }
 
+static void test_p1_unmapped_engram_identity(void) {
+    char path[] = "/tmp/test_myds_engram_unmapped_XXXXXX";
+    int fd = mkstemp(path);
+    assert(fd >= 0);
+
+    /* Write 1024 bytes header + 256 bytes dummy tensor data */
+    uint8_t zeros[1024 + 256];
+    memset(zeros, 0x42, sizeof(zeros));
+    assert(pwrite(fd, zeros, sizeof(zeros), 0) == (ssize_t)sizeof(zeros));
+
+    myds_model_t m1, m2;
+    memset(&m1, 0, sizeof(m1));
+    memset(&m2, 0, sizeof(m2));
+
+    gguf_file_t gf1, gf2;
+    memset(&gf1, 0, sizeof(gf1));
+    memset(&gf2, 0, sizeof(gf2));
+
+    snprintf(m1.arch, sizeof(m1.arch), "deepseek2");
+    snprintf(m2.arch, sizeof(m2.arch), "deepseek2");
+    m1.gf = &gf1;
+    m2.gf = &gf2;
+
+    gf1.tensor_count = 1;
+    gf2.tensor_count = 1;
+    gf1.tensor_data_offset = 1024;
+    gf2.tensor_data_offset = 1024;
+    gf1.fd = fd;
+    gf2.fd = fd;
+
+    gguf_tensor_t t1, t2;
+    memset(&t1, 0, sizeof(t1));
+    memset(&t2, 0, sizeof(t2));
+
+    /* Unmapped tensor: data is NULL, read via gf->fd and pread */
+    t1.data = NULL;
+    t1.size_bytes = 256;
+    t1.offset = 0;
+
+    t2.data = NULL;
+    t2.size_bytes = 256;
+    t2.offset = 0;
+
+    gf1.tensors = &t1;
+    gf2.tensors = &t2;
+
+    uint64_t id1 = myds_v41_model_identity(&m1);
+    uint64_t id2 = myds_v41_model_identity(&m2);
+    assert(id1 == id2);
+
+    /* Mutate a single byte in the file inside the unmapped tensor */
+    uint8_t mut_byte = 0x99;
+    assert(pwrite(fd, &mut_byte, 1, 1024 + 16) == 1);
+
+    uint64_t id_mut = myds_v41_model_identity(&m2);
+    assert(id_mut != id1);
+
+    /* Read failure case: close fd or use invalid offset */
+    gf2.fd = -1;
+    uint64_t id_fail1 = myds_v41_model_identity(&m2);
+    uint64_t id_fail2 = myds_v41_model_identity(&m2);
+    /* Upon read error, unique non-repeatable fail_salt is injected, disabling disk reuse */
+    assert(id_fail1 != id1 && id_fail1 != id_mut);
+    assert(id_fail1 != id_fail2);
+
+    close(fd);
+    unlink(path);
+    printf("  [PASS] P1: Unmapped tensor streamed via fd detects byte changes and disables disk reuse on error\n");
+}
+
+static void test_p1_same_process_large_model_isolation(void) {
+    /* Two models with > 256MB tensors and no manifest */
+    myds_model_t m1, m2;
+    memset(&m1, 0, sizeof(m1));
+    memset(&m2, 0, sizeof(m2));
+
+    gguf_file_t gf1, gf2;
+    memset(&gf1, 0, sizeof(gf1));
+    memset(&gf2, 0, sizeof(gf2));
+
+    snprintf(m1.arch, sizeof(m1.arch), "deepseek2");
+    snprintf(m2.arch, sizeof(m2.arch), "deepseek2");
+    m1.gf = &gf1;
+    m2.gf = &gf2;
+
+    gf1.tensor_count = 1;
+    gf2.tensor_count = 1;
+    gf1.fd = -1;
+    gf2.fd = -1;
+
+    gguf_tensor_t t1, t2;
+    memset(&t1, 0, sizeof(t1));
+    memset(&t2, 0, sizeof(t2));
+
+    const size_t sz = 300ull * 1024ull * 1024ull; /* 300 MB > 256 MB */
+    void *buf = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    assert(buf != MAP_FAILED);
+    memset(buf, 0x33, 1024);
+    memset((uint8_t *)buf + sz / 2, 0x55, 1024);
+
+    t1.data = buf;
+    t1.size_bytes = sz;
+    t2.data = buf;
+    t2.size_bytes = sz;
+
+    gf1.tensors = &t1;
+    gf2.tensors = &t2;
+
+    /* 1. Distinct load generations */
+    m1.load_generation = 0x10001ull;
+    m2.load_generation = 0x20002ull;
+
+    uint64_t id1 = myds_v41_model_identity(&m1);
+    uint64_t id2 = myds_v41_model_identity(&m2);
+    assert(id1 != id2);
+
+    /* 2. Same model instance preserves identity across multiple identity checks */
+    uint64_t id1_again = myds_v41_model_identity(&m1);
+    assert(id1 == id1_again);
+
+    /* 3. Even if load_generation is 0 (fallback to model instance pointer),
+     * two distinct model pointers in the same process must have different identities */
+    m1.load_generation = 0;
+    m2.load_generation = 0;
+    uint64_t id_ptr1 = myds_v41_model_identity(&m1);
+    uint64_t id_ptr2 = myds_v41_model_identity(&m2);
+    assert(id_ptr1 != id_ptr2);
+
+    munmap(buf, sz);
+    printf("  [PASS] P1: Same-process large models have isolated identities across distinct instances\n");
+}
+
 int main(void) {
     printf("Running P1 Regression Verification Suite:\n");
     test_p1_response_id_lifecycle();
     test_p1_vision_queue_slot();
     test_p1_weight_identity();
+    test_p1_unmapped_engram_identity();
+    test_p1_same_process_large_model_isolation();
     test_p1_metal_fused_add_fallback();
     printf("All P1 Regression Verifications PASSED!\n");
     return 0;

@@ -1850,6 +1850,7 @@ bool sse_emit_responses_finish(myds_sse_stream_ctx_t *sctx,
                                       const char *text, size_t text_len,
                                       const char *output_items_json,
                                       int emit_text_events) {
+    if (!sctx || sctx->cancel_flag || sctx->failed) return false;
     char *alias_json = json_escape_alloc(model_alias ? model_alias : "myds",
                                         strlen(model_alias ? model_alias : "myds"));
     char *text_json = json_escape_alloc(text ? text : "", text ? text_len : 0);
@@ -2191,18 +2192,6 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         const bool is_continuation = prev_id[0] != 0;
         char resp_id[64];
         resp_id_new(resp_id, sizeof(resp_id));
-        if (is_continuation && !resp_id_is_live(prev_id)) {
-            MYDS_LOG_W("[%s:%d] previous_response_id rejected (%s): %s",
-                       client_ip, client_port,
-                       resp_id_seen(prev_id) ? "expired" : "unknown", prev_id);
-            char err[512];
-            snprintf(err, sizeof(err),
-                     "{\"error\":{\"message\":\"previous_response_id '%s' is not the most recent response "
-                     "(this server keeps one live state); replay the full input instead\","
-                     "\"type\":\"invalid_request_error\"}}", prev_id);
-            send_response(client_fd, 400, "Bad Request", "application/json", err);
-            free(prompt); free(req_buf); close(client_fd); return;
-        }
         /* 排队与背压保护：在解析与任何 GPU 工作（包括视觉处理）前统一获取推理名额 */
         int q_timeout_ms = 60000;
         const char *to_env = getenv("MYDS_QUEUE_TIMEOUT_MS");
@@ -2234,6 +2223,23 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         t_infer_slot_depth = 1;
         myds_config_t prev_cfg = myds_context_get_config(ctx);
 
+        if (is_continuation && (!resp_id_is_live(prev_id) || myds_context_get_pcache_len(ctx) == 0)) {
+            t_infer_slot_depth = 0;
+            pthread_mutex_unlock(&g_infer_mutex);
+            server_release_infer_slot();
+            MYDS_LOG_W("[%s:%d] previous_response_id rejected (%s): %s",
+                       client_ip, client_port,
+                       resp_id_seen(prev_id) ? "expired" : "unknown", prev_id);
+            char err[512];
+            snprintf(err, sizeof(err),
+                     "{\"error\":{\"message\":\"previous_response_id '%s' is not the most recent response "
+                     "(this server keeps one live state); replay the full input instead\","
+                     "\"type\":\"invalid_request_error\"}}", prev_id);
+            send_response(client_fd, 400, "Bad Request", "application/json", err);
+            myds_vjob_sink_free(&img_sink);
+            free(prompt); free(req_buf); close(client_fd); return;
+        }
+
         const char *parse_reason = NULL;
         const bool parsed_ok = is_continuation
             ? parse_chat_prompt_suffix_vis(body, prompt, prompt_cap, &parse_reason, &img_sink)
@@ -2251,6 +2257,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             t_infer_slot_depth = 0;
             pthread_mutex_unlock(&g_infer_mutex);
             server_release_infer_slot();
+            myds_vjob_sink_free(&img_sink);
             free(prompt);
             free(req_buf);
             close(client_fd);
@@ -2267,22 +2274,6 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                    max_tokens, temp, top_p, top_k,
                    strlen(prompt), total_read, req_has_instructions ? 1 : 0, req_has_tools ? 1 : 0);
 
-        if (is_continuation && (!resp_id_is_live(prev_id) || myds_context_get_pcache_len(ctx) == 0)) {
-            t_infer_slot_depth = 0;
-            pthread_mutex_unlock(&g_infer_mutex);
-            server_release_infer_slot();
-            MYDS_LOG_W("[%s:%d] previous_response_id invalidated or prefix cache empty (%s): %s",
-                       client_ip, client_port,
-                       resp_id_seen(prev_id) ? "expired" : "unknown", prev_id);
-            char err[512];
-            snprintf(err, sizeof(err),
-                     "{\"error\":{\"message\":\"previous_response_id '%s' is not valid or state has been lost "
-                     "(this server keeps one live state); replay the full input instead\","
-                     "\"type\":\"invalid_request_error\"}}", prev_id);
-            send_response(client_fd, 400, "Bad Request", "application/json", err);
-            myds_vjob_sink_free(&img_sink);
-            free(prompt); free(req_buf); close(client_fd); return;
-        }
         if (is_continuation) myds_set_continue_from_cache(ctx, true);
 
         /* Apply request configuration overrides if provided */
@@ -2307,6 +2298,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             goto cleanup_infer;
         }
 
+        bool transport_ok = true;
         if (stream) {
             const char *sse_header =
                 "HTTP/1.1 200 OK\r\n"
@@ -2356,11 +2348,14 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 }
                 if (!stool_count && sctx.acc && sctx.emitted < sctx.acc_len) {
                     /* 曾疑似进入工具块但格式不合 ⇒ 把没发出的正文补出去，绝不吞内容 */
-                    (void)sse_emit_content(&sctx, sctx.acc + sctx.emitted,
-                                           sctx.acc_len - sctx.emitted, false);
+                    bool replayed = sse_emit_content(&sctx, sctx.acc + sctx.emitted,
+                                                     sctx.acc_len - sctx.emitted, false);
                     sctx.emitted = sctx.acc_len;
+                    if (!replayed || sctx.failed || sctx.cancel_flag) {
+                        stop_reason = sctx.failed ? MYDS_STOP_ERROR : MYDS_STOP_CANCELLED;
+                    }
                 }
-                if (stool_count) {
+                if (stool_count && !sctx.failed && !sctx.cancel_flag) {
                     bool tsent = is_responses_endpoint
                         ? sse_emit_responses_function_calls(&sctx, stool, stool_count)
                         : sse_emit_chat_tool_calls(&sctx, stool, stool_count);
@@ -2377,8 +2372,11 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                     }
                     myds_free_tool_calls(stool, stool_count);
                     stool = NULL;
+                } else if (stool) {
+                    myds_free_tool_calls(stool, stool_count);
+                    stool = NULL;
                 }
-                if (!stool_count && is_responses_endpoint) {
+                if (!stool_count && !sctx.failed && !sctx.cancel_flag && is_responses_endpoint) {
                     /* 聚合文本 = 工具块之前的正文（无工具块时就是全文）。 */
                     char *items = responses_output_message_json(sctx.acc, sctx.acc ? scontent_len : 0);
                     const bool finished = items && sse_emit_responses_finish(
@@ -2390,7 +2388,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                         const char *error_event = "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"Response allocation failed\",\"type\":\"server_error\"}}\n\n";
                         (void)myds_server_send_all(client_fd, error_event, strlen(error_event));
                     }
-                } else if (!stool_count) {
+                } else if (!stool_count && !sctx.failed && !sctx.cancel_flag) {
                     const char *finish = (stop_reason == MYDS_STOP_LENGTH || stop_reason == MYDS_STOP_CTX_FULL) ? "length" : "stop";
                     char chunk[512];
                     int len = snprintf(chunk, sizeof(chunk),
@@ -2404,10 +2402,19 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                     }
                     const char *done = "data: [DONE]\n\n";
                     if (!sent || !myds_server_send_all(client_fd, done, strlen(done))) stop_reason = MYDS_STOP_CANCELLED;
+                } else if (sctx.failed) {
+                    stop_reason = MYDS_STOP_ERROR;
+                    const char *error_event = is_responses_endpoint
+                        ? "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"Inference or response encoding failed\",\"type\":\"server_error\"}}\n\n"
+                        : "data: {\"error\":{\"message\":\"Inference or response encoding failed\",\"type\":\"server_error\"}}\n\ndata: [DONE]\n\n";
+                    (void)myds_server_send_all(client_fd, error_event, strlen(error_event));
+                } else if (sctx.cancel_flag) {
+                    stop_reason = MYDS_STOP_CANCELLED;
                 }
             } else {
                 stop_reason = MYDS_STOP_CANCELLED;
             }
+            if (sctx.failed || sctx.cancel_flag) transport_ok = false;
             free(sctx.acc); sctx.acc = NULL;   /* 每请求一份累积缓冲，必须释放 */
         } else {
             myds_non_stream_ctx_t ns = {.client_fd = client_fd};
@@ -2423,6 +2430,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             if (!generated || ns.failed) {
                 resp_id_invalidate_all();
                 stop_reason = MYDS_STOP_ERROR;
+                transport_ok = false;
                 send_response(client_fd, 500, "Internal Server Error", "application/json",
                               "{\"error\":{\"message\":\"Inference or response allocation failed\",\"type\":\"server_error\"}}");
             } else if (!ns.cancel_flag) {
@@ -2481,18 +2489,25 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 free(escaped);
                 free(alias_json);
                 if (response) {
-                    if (!send_response(client_fd, 200, "OK", "application/json", response)) stop_reason = MYDS_STOP_CANCELLED;
+                    if (!send_response(client_fd, 200, "OK", "application/json", response)) {
+                        stop_reason = MYDS_STOP_CANCELLED;
+                        transport_ok = false;
+                    }
                     free(response);
                 } else {
                     stop_reason = MYDS_STOP_ERROR;
+                    transport_ok = false;
                     send_response(client_fd, 500, "Internal Server Error", "application/json",
                                   "{\"error\":{\"message\":\"Response allocation failed\",\"type\":\"server_error\"}}");
                 }
+            } else {
+                transport_ok = false;
             }
+            if (ns.failed || ns.cancel_flag) transport_ok = false;
             free(ns.buf);
         }
 
-        if (stop_reason != MYDS_STOP_ERROR && stop_reason != MYDS_STOP_CANCELLED) {
+        if (stop_reason != MYDS_STOP_ERROR && stop_reason != MYDS_STOP_CANCELLED && transport_ok) {
             resp_id_register(resp_id);
         } else {
             resp_id_invalidate_all();

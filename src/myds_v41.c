@@ -14,6 +14,7 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+#include <stdatomic.h>
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -371,10 +372,12 @@ static uint64_t lowkv_identity(const myds_model_t *m) {
         const bool is_small_model = (total_tensor_bytes <= 256ull * 1024ull * 1024ull);
 
         if (is_small_model || force_full) {
+            bool digest_error = false;
             if (m && m->gf && m->gf->tensors) {
                 for (uint64_t i = 0; i < m->gf->tensor_count; i++) {
                     const gguf_tensor_t *t = &m->gf->tensors[i];
-                    if (t->data && t->size_bytes > 0) {
+                    if (t->size_bytes == 0) continue;
+                    if (t->data) {
                         const uint8_t *p = (const uint8_t *)t->data;
                         const size_t len = t->size_bytes;
                         const size_t u64_count = len / 8;
@@ -388,6 +391,34 @@ static uint64_t lowkv_identity(const myds_model_t *m) {
                             weight_digest ^= (uint64_t)p[k];
                             weight_digest *= 1099511628211ull;
                         }
+                    } else if (m->gf->fd >= 0) {
+                        /* 解除映射后的张量（例如 Engram unmap 后的表）：通过文件描述符流式读取校验 */
+                        uint8_t chunk[65536];
+                        uint64_t file_offset = m->gf->tensor_data_offset + t->offset;
+                        size_t remaining = t->size_bytes;
+                        while (remaining > 0) {
+                            size_t to_read = remaining < sizeof(chunk) ? remaining : sizeof(chunk);
+                            ssize_t nread = pread(m->gf->fd, chunk, to_read, (off_t)file_offset);
+                            if (nread <= 0 || (size_t)nread != to_read) {
+                                digest_error = true;
+                                break;
+                            }
+                            const size_t u64_count = (size_t)nread / 8;
+                            for (size_t k = 0; k < u64_count; k++) {
+                                uint64_t val;
+                                memcpy(&val, chunk + k * 8, 8);
+                                weight_digest ^= val;
+                                weight_digest *= 1099511628211ull;
+                            }
+                            for (size_t k = u64_count * 8; k < (size_t)nread; k++) {
+                                weight_digest ^= (uint64_t)chunk[k];
+                                weight_digest *= 1099511628211ull;
+                            }
+                            file_offset += (uint64_t)nread;
+                            remaining -= (size_t)nread;
+                        }
+                    } else {
+                        digest_error = true;
                     }
                 }
             }
@@ -421,35 +452,48 @@ static uint64_t lowkv_identity(const myds_model_t *m) {
                     weight_digest *= 1099511628211ull;
                 }
             }
-        } else {
-            /* 模型 > 256MB 且缺少 manifest digest：注入进程 boot salt，禁用跨进程 KV 复用 */
-            static uint64_t s_boot_salt = 0;
-            if (!s_boot_salt) {
-                uint64_t t = (uint64_t)time(NULL);
-                uint64_t p = (uint64_t)getpid();
-                s_boot_salt = ((p << 32) ^ t ^ 0x9e3779b97f4a7c15ull);
-                if (!s_boot_salt) s_boot_salt = 1;
+            if (digest_error) {
+                /* 读取失败禁用磁盘复用：注入不可复现的唯一随机盐 */
+                static atomic_uint_fast64_t s_err_seq = 0;
+                uint64_t fail_salt = ((uint64_t)getpid() << 32) ^ (uint64_t)time(NULL) ^ (uint64_t)atomic_fetch_add(&s_err_seq, 1);
+                weight_digest ^= fail_salt;
+                weight_digest *= 1099511628211ull;
             }
-            weight_digest ^= s_boot_salt;
+        } else {
+            /* 模型 > 256MB 且缺少 manifest digest：
+             * 使用该 model 实例专有的 load_generation（同 model 实例各 context 共享；
+             * 同进程不同加载实例或独立 model 结构不同，跨进程 pid 亦不同），彻底杜绝误复用。 */
+            uint64_t gen = (m && m->load_generation) ? m->load_generation : (m ? (((uint64_t)(uintptr_t)m << 13) ^ 0x517cc1b727220a95ull) : 0);
+            if (!gen) {
+                static atomic_uint_fast64_t s_boot_counter = 0;
+                gen = ((uint64_t)getpid() << 32) ^ (uint64_t)time(NULL) ^ (uint64_t)atomic_fetch_add(&s_boot_counter, 1);
+                if (!gen) gen = 1;
+            }
+            weight_digest ^= gen;
             weight_digest *= 1099511628211ull;
 
-            /* 保留多点抽样作为进程内辅助检查 */
+            /* 保留多点抽样作为辅助检查（覆盖内存映射张量与已 unmap 的 fd 张量） */
             if (m && m->gf && m->gf->tensors && m->gf->tensor_count > 0) {
                 const uint64_t tc = m->gf->tensor_count;
                 const uint64_t step = (tc > 16u) ? (tc / 16u) : 1u;
                 for (uint64_t i = 0; i < tc; i += step) {
                     const gguf_tensor_t *t = &m->gf->tensors[i];
-                    if (t->data && t->size_bytes > 0) {
+                    if (t->size_bytes == 0) continue;
+                    uint64_t w1 = 0, w2 = 0;
+                    size_t s1 = t->size_bytes < 8 ? t->size_bytes : 8;
+                    size_t mid = t->size_bytes / 2;
+                    size_t s2 = (t->size_bytes - mid) < 8 ? (t->size_bytes - mid) : 8;
+                    if (t->data) {
                         const uint8_t *b = (const uint8_t *)t->data;
-                        uint64_t w1 = 0, w2 = 0;
-                        size_t s1 = t->size_bytes < 8 ? t->size_bytes : 8;
                         memcpy(&w1, b, s1);
-                        size_t mid = t->size_bytes / 2;
-                        size_t s2 = (t->size_bytes - mid) < 8 ? (t->size_bytes - mid) : 8;
                         memcpy(&w2, b + mid, s2);
-                        weight_digest ^= w1; weight_digest *= 1099511628211ull;
-                        weight_digest ^= w2; weight_digest *= 1099511628211ull;
+                    } else if (m->gf->fd >= 0) {
+                        uint64_t file_offset = m->gf->tensor_data_offset + t->offset;
+                        (void)pread(m->gf->fd, &w1, s1, (off_t)file_offset);
+                        (void)pread(m->gf->fd, &w2, s2, (off_t)(file_offset + mid));
                     }
+                    weight_digest ^= w1; weight_digest *= 1099511628211ull;
+                    weight_digest ^= w2; weight_digest *= 1099511628211ull;
                 }
             }
         }

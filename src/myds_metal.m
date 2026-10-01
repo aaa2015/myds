@@ -403,7 +403,45 @@ int myds_metal_init(const char *shader_dir) {
                         @"kernel_compute_copy_u32x4",
                         @"kernel_soft_max_f32",
                         @"kernel_dsv4_moe_swiglu_weight",
-                        @"kernel_dsv4_moe_sum6_f32"
+                        @"kernel_dsv4_moe_sum6_f32",
+                        /* V4.1 prefill, indexer & flash attention */
+                        @"kernel_myds_mask_chunk_fill",
+                        @"kernel_myds_mask_chunk_scatter",
+                        @"kernel_dsv41_candidate_filter",
+                        @"kernel_dsv41_candidate_blocks",
+                        @"kernel_dsv41_quantize",
+                        @"kernel_dsv41_pool2",
+                        @"kernel_glm_indexer_score_one",
+                        @"kernel_glm_indexer_score_one_direct",
+                        @"kernel_glm_indexer_score_chunk_direct",
+                        @"kernel_argsort_f32_i32_desc",
+                        @"kernel_argsort_f32_i32_desc_causal",
+                        @"kernel_argsort_merge_f32_i32_desc",
+                        @"kernel_argsort_merge_f32_i32_desc_causal",
+                        @"kernel_dsv4_topk_mask",
+                        @"kernel_dsv4_topk_mask_scatter",
+                        @"kernel_get_rows_f32",
+                        @"kernel_cpy_contig_f32_f16_4",
+                        @"kernel_flash_attn_ext_vec_f16_dk512_dv512",
+                        @"kernel_flash_attn_ext_pad",
+                        @"kernel_flash_attn_ext_vec_reduce",
+                        /* V4.1 MoE & routing */
+                        @"kernel_myds_v41_route_transform",
+                        @"kernel_myds_v41_route_sum",
+                        @"kernel_myds_v41_route_divide",
+                        @"kernel_myds_v41_route_scale",
+                        @"kernel_myds_v41_ids_f32",
+                        /* V4.1 Vision encoder */
+                        @"kernel_visenc_round",
+                        @"kernel_visenc_bias",
+                        @"kernel_visenc_rmsnorm",
+                        @"kernel_visenc_qkv_rope",
+                        @"kernel_visenc_attention",
+                        @"kernel_visenc_bias_residual41",
+                        @"kernel_visenc_swiglu_split41",
+                        @"kernel_visenc_add_residual",
+                        @"kernel_visenc_aligner_reorder",
+                        @"kernel_visenc_gelu_bias"
                     ];
                     BOOL all_present = YES;
                     for (NSString *kname in required_kernels) {

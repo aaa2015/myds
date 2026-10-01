@@ -17,6 +17,7 @@
 #include <mach/mach.h>
 #include <dispatch/dispatch.h>
 #include <stdatomic.h>
+#include <unistd.h>
 
 bool myds_trace_f32(const char *stage, uint32_t layer, uint32_t pos,
                       const myds_metal_buffer_t *buffer, size_t count);
@@ -337,6 +338,13 @@ static myds_model_t *model_load_internal(const char *model_path, bool diagnostic
 
     myds_model_t *m = (myds_model_t *)calloc(1, sizeof(myds_model_t));
     if (!m) { gguf_close(gf); return NULL; }
+    static atomic_uint_fast64_t s_model_load_counter = 0;
+    uint64_t seq = (uint64_t)atomic_fetch_add(&s_model_load_counter, 1) + 1;
+    uint64_t t = (uint64_t)time(NULL);
+    uint64_t p = (uint64_t)getpid();
+    m->load_generation = ((p << 32) ^ t ^ (seq * 0x9e3779b97f4a7c15ull));
+    if (!m->load_generation) m->load_generation = seq;
+
     m->gf = gf;
     m->tokenizer = myds_tokenizer_load(gf);
     if (!m->tokenizer) {
