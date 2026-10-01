@@ -21,8 +21,8 @@
 static volatile sig_atomic_t g_running = 1;
 static int g_server_fd = -1;
 static pthread_mutex_t g_infer_mutex = PTHREAD_MUTEX_INITIALIZER;
-static void server_vjob_gpu_lock(void) { pthread_mutex_lock(&g_infer_mutex); }
-static void server_vjob_gpu_unlock(void) { pthread_mutex_unlock(&g_infer_mutex); }
+void server_vjob_gpu_lock(void);
+void server_vjob_gpu_unlock(void);
 static pthread_once_t  g_vjob_lock_once = PTHREAD_ONCE_INIT;
 static void init_vjob_gpu_lock(void) {
     myds_vjob_set_gpu_lock(server_vjob_gpu_lock, server_vjob_gpu_unlock);
@@ -142,6 +142,51 @@ static void server_release_infer_slot(void) {
         g_infer_busy = false;
     }
     pthread_mutex_unlock(&g_queue_lock);
+}
+
+/* ── 视觉 GPU 锁：统一获取推理名额，排队覆盖视觉编码等待 ── */
+static __thread int t_infer_slot_depth = 0;
+static __thread int t_vjob_slot_error = 0;
+
+void server_vjob_gpu_lock(void) {
+    if (t_infer_slot_depth > 0) {
+        t_infer_slot_depth++;
+        return;
+    }
+    int q_timeout_ms = 60000;
+    const char *to_env = getenv("MYDS_QUEUE_TIMEOUT_MS");
+    if (to_env && to_env[0]) {
+        int v = atoi(to_env);
+        if (v >= 0) q_timeout_ms = v;
+    }
+    int max_q_depth = 32;
+    const char *qd_env = getenv("MYDS_MAX_QUEUE_DEPTH");
+    if (qd_env && qd_env[0]) {
+        int v = atoi(qd_env);
+        if (v > 0) max_q_depth = v;
+    }
+
+    int rc = server_acquire_infer_slot(q_timeout_ms, max_q_depth);
+    if (rc != 0) {
+        t_vjob_slot_error = rc;
+        return;
+    }
+    pthread_mutex_lock(&g_infer_mutex);
+    t_infer_slot_depth = 1;
+    t_vjob_slot_error = 0;
+}
+
+void server_vjob_gpu_unlock(void) {
+    if (t_infer_slot_depth <= 0) return;
+    t_infer_slot_depth--;
+    if (t_infer_slot_depth == 0) {
+        pthread_mutex_unlock(&g_infer_mutex);
+        server_release_infer_slot();
+    }
+}
+
+int server_vjob_gpu_last_error(void) {
+    return t_vjob_slot_error;
 }
 
 /* ── previous_response_id：响应 id 注册表 ──
@@ -2158,42 +2203,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             send_response(client_fd, 400, "Bad Request", "application/json", err);
             free(prompt); free(req_buf); close(client_fd); return;
         }
-        const char *parse_reason = NULL;
-        const bool parsed_ok = is_continuation
-            ? parse_chat_prompt_suffix_vis(body, prompt, prompt_cap, &parse_reason, &img_sink)
-            : parse_chat_prompt_vis(body, prompt, prompt_cap, &parse_reason, &img_sink);
-        if (!parsed_ok) {
-            /* 必须落日志：此前这条路径【完全不记录】，导致线上只能看到一个笼统的 400。 */
-            MYDS_LOG_W("[%s:%d] rejected (400): %s%s%s [body=%zd bytes, prompt_cap=%zu]",
-                       client_ip, client_port, parse_reason,
-                       img_sink.why[0] ? " — " : "", img_sink.why, total_read, prompt_cap);
-            char err[512];
-            /* 把【具体原因】回给调用方：笼统的 "unsupported content block" 看不出
-             * 是「字段缺失」「格式不对」还是「图片处理失败」，排查代价极高。 */
-            snprintf(err, sizeof(err),
-                     "{\"error\":{\"message\":\"Invalid or unsupported text prompt: %s%s%s\",\"type\":\"invalid_request_error\"}}",
-                     parse_reason ? parse_reason : "unknown",
-                     img_sink.why[0] ? " — " : "", img_sink.why);
-            send_response(client_fd, 400, "Bad Request", "application/json", err);
-            free(prompt);
-            free(req_buf);
-            close(client_fd);
-            return;
-        }
-
-        /* 这两项在【续接请求】里本不该出现（服务端会忽略，用被续接序列里的那份）；
-         * 记下来是为了让「还在重复携带」这件事可见。 */
-        const bool req_has_instructions = json_has_top_field(body, "instructions");
-        const bool req_has_tools = json_has_top_field(body, "tools");
-        MYDS_LOG_I("[%s:%d] %s %s (protocol=%s, stream=%s, max_tokens=%d, temp=%.2f, top_p=%.2f, top_k=%d, "
-                   "prompt_chars=%zu, body=%zd, has_instructions=%d, has_tools=%d)",
-                   client_ip, client_port, method, path,
-                   is_responses_endpoint ? "Responses" : "ChatCompletions",
-                   stream ? "true" : "false",
-                   max_tokens, temp, top_p, top_k,
-                   strlen(prompt), total_read, req_has_instructions ? 1 : 0, req_has_tools ? 1 : 0);
-
-        /* 排队与背压保护 */
+        /* 排队与背压保护：在解析与任何 GPU 工作（包括视觉处理）前统一获取推理名额 */
         int q_timeout_ms = 60000;
         const char *to_env = getenv("MYDS_QUEUE_TIMEOUT_MS");
         if (to_env && to_env[0]) {
@@ -2221,7 +2231,44 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         }
 
         pthread_mutex_lock(&g_infer_mutex);
+        t_infer_slot_depth = 1;
+        myds_config_t prev_cfg = myds_context_get_config(ctx);
+
+        const char *parse_reason = NULL;
+        const bool parsed_ok = is_continuation
+            ? parse_chat_prompt_suffix_vis(body, prompt, prompt_cap, &parse_reason, &img_sink)
+            : parse_chat_prompt_vis(body, prompt, prompt_cap, &parse_reason, &img_sink);
+        if (!parsed_ok) {
+            MYDS_LOG_W("[%s:%d] rejected (400): %s%s%s [body=%zd bytes, prompt_cap=%zu]",
+                       client_ip, client_port, parse_reason,
+                       img_sink.why[0] ? " — " : "", img_sink.why, total_read, prompt_cap);
+            char err[512];
+            snprintf(err, sizeof(err),
+                     "{\"error\":{\"message\":\"Invalid or unsupported text prompt: %s%s%s\",\"type\":\"invalid_request_error\"}}",
+                     parse_reason ? parse_reason : "unknown",
+                     img_sink.why[0] ? " — " : "", img_sink.why);
+            send_response(client_fd, 400, "Bad Request", "application/json", err);
+            t_infer_slot_depth = 0;
+            pthread_mutex_unlock(&g_infer_mutex);
+            server_release_infer_slot();
+            free(prompt);
+            free(req_buf);
+            close(client_fd);
+            return;
+        }
+
+        const bool req_has_instructions = json_has_top_field(body, "instructions");
+        const bool req_has_tools = json_has_top_field(body, "tools");
+        MYDS_LOG_I("[%s:%d] %s %s (protocol=%s, stream=%s, max_tokens=%d, temp=%.2f, top_p=%.2f, top_k=%d, "
+                   "prompt_chars=%zu, body=%zd, has_instructions=%d, has_tools=%d)",
+                   client_ip, client_port, method, path,
+                   is_responses_endpoint ? "Responses" : "ChatCompletions",
+                   stream ? "true" : "false",
+                   max_tokens, temp, top_p, top_k,
+                   strlen(prompt), total_read, req_has_instructions ? 1 : 0, req_has_tools ? 1 : 0);
+
         if (is_continuation && (!resp_id_is_live(prev_id) || myds_context_get_pcache_len(ctx) == 0)) {
+            t_infer_slot_depth = 0;
             pthread_mutex_unlock(&g_infer_mutex);
             server_release_infer_slot();
             MYDS_LOG_W("[%s:%d] previous_response_id invalidated or prefix cache empty (%s): %s",
@@ -2239,7 +2286,6 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         if (is_continuation) myds_set_continue_from_cache(ctx, true);
 
         /* Apply request configuration overrides if provided */
-        myds_config_t prev_cfg = myds_context_get_config(ctx);
         myds_config_t req_cfg = prev_cfg;
         req_cfg.max_new_tokens = myds_server_default_max_tokens(prev_cfg.max_new_tokens);
         if (max_tokens > 0) req_cfg.max_new_tokens = (uint32_t)max_tokens;
@@ -2286,9 +2332,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                                                    &stop_reason, &prompt_tokens, &sctx.cancel_flag);
             myds_context_clear_image_embeddings(ctx); myds_vjob_sink_free(&img_sink);
             if (generated && !sctx.cancel_flag) (void)myds_server_sse_finish(&sctx);
-            if (generated && !sctx.failed && !sctx.cancel_flag) {
-                resp_id_register(resp_id);   /* 状态已停在本次序列末尾 */
-            } else {
+            if (!generated || sctx.failed || sctx.cancel_flag) {
                 resp_id_invalidate_all();
             }
             final_tokens = sctx.token_count;
@@ -2370,9 +2414,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             int generated = myds_generate_bytes_ex(ctx, prompt, myds_server_non_stream_callback, &ns,
                                                    &stop_reason, &prompt_tokens, &ns.cancel_flag);
             myds_context_clear_image_embeddings(ctx); myds_vjob_sink_free(&img_sink);
-            if (generated && !ns.failed && !ns.cancel_flag) {
-                resp_id_register(resp_id);
-            } else {
+            if (!generated || ns.failed || ns.cancel_flag) {
                 resp_id_invalidate_all();
             }
             final_tokens = ns.token_count;
@@ -2450,6 +2492,12 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             free(ns.buf);
         }
 
+        if (stop_reason != MYDS_STOP_ERROR && stop_reason != MYDS_STOP_CANCELLED) {
+            resp_id_register(resp_id);
+        } else {
+            resp_id_invalidate_all();
+        }
+
         double t_end = myds_server_now_s();
         double wall_s = t_end - t_start;
         double prefill_s = (final_tokens > 0 && t_first > t_start) ? (t_first - t_start) : wall_s;
@@ -2484,6 +2532,7 @@ cleanup_infer:
         myds_vjob_sink_free(&img_sink);
         myds_set_continue_from_cache(ctx, false);
         myds_context_set_config(ctx, &prev_cfg);
+        t_infer_slot_depth = 0;
         pthread_mutex_unlock(&g_infer_mutex);
         server_release_infer_slot();
 

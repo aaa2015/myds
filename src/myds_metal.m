@@ -386,12 +386,39 @@ int myds_metal_init(const char *shader_dir) {
                 g_library = [g_device newLibraryWithURL:[NSURL fileURLWithPath:lib_path] error:&lib_err];
                 if (g_library) {
                     /* Verify essential kernels exist in the precompiled library */
-                    id<MTLFunction> test_fn = [g_library newFunctionWithName:@"kernel_add2_bf16_f32"];
-                    if (!test_fn) {
-                        myds_log(MYDS_LOG_WARN, "myds_metal: precompiled library %s is missing kernel_add2_bf16_f32, rebuilding from source", [lib_path UTF8String]);
+                    NSArray<NSString *> *required_kernels = @[
+                        @"kernel_add2_bf16_f32",
+                        @"kernel_dsv41_bf16_linear",
+                        @"kernel_rms_norm_mul_f32_4",
+                        @"kernel_rms_norm_f32_4",
+                        @"kernel_swiglu_flat_f32",
+                        @"kernel_add2_f32",
+                        @"kernel_dsv4_hc_split_sinkhorn",
+                        @"kernel_dsv4_hc_weighted_sum",
+                        @"kernel_dsv4_hc_expand4",
+                        @"kernel_dsv41_engram_add",
+                        @"kernel_dsv41_rope",
+                        @"kernel_compute_copy_u8",
+                        @"kernel_compute_copy_u32",
+                        @"kernel_compute_copy_u32x4",
+                        @"kernel_soft_max_f32",
+                        @"kernel_dsv4_moe_swiglu_weight",
+                        @"kernel_dsv4_moe_sum6_f32"
+                    ];
+                    BOOL all_present = YES;
+                    for (NSString *kname in required_kernels) {
+                        id<MTLFunction> test_fn = [g_library newFunctionWithName:kname];
+                        if (!test_fn) {
+                            myds_log(MYDS_LOG_WARN, "myds_metal: precompiled library %s is missing %s, rebuilding from source",
+                                     [lib_path UTF8String], [kname UTF8String]);
+                            all_present = NO;
+                            break;
+                        }
+                    }
+                    if (!all_present) {
                         g_library = nil;
                     } else {
-                        myds_log(MYDS_LOG_INFO, "myds_metal: loaded precompiled library from %s", [lib_path UTF8String]);
+                        myds_log(MYDS_LOG_INFO, "myds_metal: loaded precompiled library from %s (all required V4.1 kernels verified)", [lib_path UTF8String]);
                         break;
                     }
                 }
@@ -665,6 +692,20 @@ int myds_metal_init(const char *shader_dir) {
         fn = [g_library newFunctionWithName:@"kernel_mul_mm_f32_f32_full" constantValues:mm_c_bco1 error:nil];
         if (fn) g_pso_mul_mm_f32_bco = [g_device newComputePipelineStateWithFunction:fn error:nil];
 
+        /* Verify all essential pipelines were successfully created */
+        if (!g_pso_rms_norm || !g_pso_v41_norm_plain || !g_pso_v41_bf16 ||
+            !g_pso_v41_hc_split || !g_pso_v41_hc_sum || !g_pso_v41_hc_expand ||
+            !g_pso_v41_engram_add || !g_pso_compute_copy_u8 || !g_pso_compute_copy_u32 ||
+            !g_pso_compute_copy_u32x4 || !g_pso_swiglu || !g_pso_add ||
+            !g_pso_add_bf16 || !g_pso_softmax || !g_pso_moe_swiglu_weight ||
+            !g_pso_moe_sum6) {
+            fprintf(stderr, "myds_metal: failed to create one or more required compute pipeline states\n");
+            g_queue = nil;
+            g_device = nil;
+            g_library = nil;
+            return 0;
+        }
+
         g_initialized = true;
         printf("myds_metal: Initialized successfully on GPU: %s\n", [[g_device name] UTF8String]);
         return 1;
@@ -730,8 +771,8 @@ void myds_metal_cleanup(void) {
 int myds_metal_begin_batch(void) {
     if (!g_queue && !myds_metal_init(NULL)) return 0;
     if (g_batch_cb) return 1;
+    close_compute_encoder();
     g_batch_cb = [g_queue commandBuffer];
-    g_batch_enc = nil;
     return g_batch_cb != nil;
 }
 

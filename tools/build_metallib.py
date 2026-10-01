@@ -7,6 +7,7 @@ Eliminates runtime pipeline compilation latency (~500ms) on server launch / firs
 import os
 import sys
 import subprocess
+import argparse
 
 SHADER_FILES = [
     "flash_attn.metal",
@@ -114,10 +115,15 @@ kernel void kernel_compute_copy_u32x4(
 """
 
 def main():
+    parser = argparse.ArgumentParser(description="Compile Metal shaders into .metallib")
+    parser.add_argument("--bin-dir", default=None, help="Directory to write myds.metallib")
+    parser.add_argument("--build-dir", default=None, help="Directory to write intermediate .air and .metal files")
+    args = parser.parse_args()
+
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     metal_dir = os.path.join(repo_root, "metal")
-    build_dir = os.path.join(repo_root, "build")
-    bin_dir = os.path.join(repo_root, "bin")
+    build_dir = os.path.abspath(args.build_dir) if args.build_dir else os.path.join(repo_root, "build")
+    bin_dir = os.path.abspath(args.bin_dir) if args.bin_dir else os.path.join(repo_root, "bin")
 
     os.makedirs(build_dir, exist_ok=True)
     os.makedirs(bin_dir, exist_ok=True)

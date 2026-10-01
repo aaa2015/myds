@@ -12,6 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
+#include <time.h>
+#include <unistd.h>
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -333,58 +335,132 @@ static uint64_t lowkv_identity(const myds_model_t *m) {
 
     /* 权重内容指纹：区分同结构、同大小但权重不同的 checkpoint */
     uint64_t weight_digest = 1469598103934665603ull;
+    const char *manifest = NULL;
     if (m && m->gf) {
-        const char *manifest = gguf_get_str(m->gf, "models.manifest.digest", NULL);
+        manifest = gguf_get_str(m->gf, "models.manifest.digest", NULL);
         if (!manifest) manifest = gguf_get_str(m->gf, "general.sha256", NULL);
         if (!manifest) manifest = gguf_get_str(m->gf, "general.source.sha256", NULL);
-        if (manifest && *manifest) {
-            for (const unsigned char *p = (const unsigned char *)manifest; *p; p++) {
-                weight_digest ^= (uint64_t)*p;
-                weight_digest *= 1099511628211ull;
+        if (!manifest) manifest = gguf_get_str(m->gf, "models.digest", NULL);
+        if (!manifest) manifest = gguf_get_str(m->gf, "model.digest", NULL);
+        if (!manifest) manifest = gguf_get_str(m->gf, "general.digest", NULL);
+        if (!manifest) manifest = gguf_get_str(m->gf, "general.file_sha256", NULL);
+        if (!manifest) manifest = gguf_get_str(m->gf, "models.file_digest", NULL);
+    }
+    if (!manifest) {
+        manifest = getenv("MYDS_MODEL_DIGEST");
+    }
+
+    if (manifest && *manifest) {
+        for (const unsigned char *p = (const unsigned char *)manifest; *p; p++) {
+            weight_digest ^= (uint64_t)*p;
+            weight_digest *= 1099511628211ull;
+        }
+    } else {
+        /* 缺少完整 manifest digest 时：
+         * ① 对 <= 256MB 模型（或显式开启 MYDS_FORCE_FULL_DIGEST=1）全量遍历全部 tensor 字节，
+         *    生成完整 64 位无死角指纹，确保任意 offset（如 offset 16）变动都能改变 identity。
+         * ② 对 > 256MB 且无完整 digest 的模型，混入进程启动盐（ephemeral boot salt），
+         *    强制禁用跨进程 KV 复用，防止上一版或不同权重的陈旧磁盘 KV 被误用。 */
+        uint64_t total_tensor_bytes = 0;
+        if (m && m->gf && m->gf->tensors) {
+            for (uint64_t i = 0; i < m->gf->tensor_count; i++) {
+                total_tensor_bytes += m->gf->tensors[i].size_bytes;
             }
         }
-        if (m->gf->tensors && m->gf->tensor_count > 0) {
-            const uint64_t tc = m->gf->tensor_count;
-            const uint64_t step = (tc > 16u) ? (tc / 16u) : 1u;
-            for (uint64_t i = 0; i < tc; i += step) {
-                const gguf_tensor_t *t = &m->gf->tensors[i];
-                if (t->data && t->size_bytes > 0) {
-                    const uint8_t *b = (const uint8_t *)t->data;
-                    uint64_t w1 = 0, w2 = 0;
-                    size_t s1 = t->size_bytes < 8 ? t->size_bytes : 8;
-                    memcpy(&w1, b, s1);
-                    size_t mid = t->size_bytes / 2;
-                    size_t s2 = (t->size_bytes - mid) < 8 ? (t->size_bytes - mid) : 8;
-                    memcpy(&w2, b + mid, s2);
-                    weight_digest ^= w1; weight_digest *= 1099511628211ull;
-                    weight_digest ^= w2; weight_digest *= 1099511628211ull;
+        const bool force_full = (getenv("MYDS_FORCE_FULL_DIGEST") != NULL);
+        const bool is_small_model = (total_tensor_bytes <= 256ull * 1024ull * 1024ull);
+
+        if (is_small_model || force_full) {
+            if (m && m->gf && m->gf->tensors) {
+                for (uint64_t i = 0; i < m->gf->tensor_count; i++) {
+                    const gguf_tensor_t *t = &m->gf->tensors[i];
+                    if (t->data && t->size_bytes > 0) {
+                        const uint8_t *p = (const uint8_t *)t->data;
+                        const size_t len = t->size_bytes;
+                        const size_t u64_count = len / 8;
+                        for (size_t k = 0; k < u64_count; k++) {
+                            uint64_t val;
+                            memcpy(&val, p + k * 8, 8);
+                            weight_digest ^= val;
+                            weight_digest *= 1099511628211ull;
+                        }
+                        for (size_t k = u64_count * 8; k < len; k++) {
+                            weight_digest ^= (uint64_t)p[k];
+                            weight_digest *= 1099511628211ull;
+                        }
+                    }
                 }
             }
-        }
-    }
-    if (m && m->tok_embeddings && myds_metal_buffer_data(m->tok_embeddings)) {
-        const uint8_t *b = (const uint8_t *)myds_metal_buffer_data(m->tok_embeddings);
-        size_t sz = myds_metal_buffer_size(m->tok_embeddings);
-        size_t s = sz < 64 ? sz : 64;
-        for (size_t k = 0; k < s; k += 8) {
-            uint64_t chunk = 0;
-            memcpy(&chunk, b + k, (s - k >= 8 ? 8 : s - k));
-            weight_digest ^= chunk; weight_digest *= 1099511628211ull;
-        }
-    }
-    if (m && m->output && myds_metal_buffer_data(m->output)) {
-        const uint8_t *b = (const uint8_t *)myds_metal_buffer_data(m->output);
-        size_t sz = myds_metal_buffer_size(m->output);
-        size_t s = sz < 64 ? sz : 64;
-        for (size_t k = 0; k < s; k += 8) {
-            uint64_t chunk = 0;
-            memcpy(&chunk, b + k, (s - k >= 8 ? 8 : s - k));
-            weight_digest ^= chunk; weight_digest *= 1099511628211ull;
+            if (m && m->tok_embeddings && myds_metal_buffer_data(m->tok_embeddings)) {
+                const uint8_t *p = (const uint8_t *)myds_metal_buffer_data(m->tok_embeddings);
+                const size_t len = myds_metal_buffer_size(m->tok_embeddings);
+                const size_t u64_count = len / 8;
+                for (size_t k = 0; k < u64_count; k++) {
+                    uint64_t val;
+                    memcpy(&val, p + k * 8, 8);
+                    weight_digest ^= val;
+                    weight_digest *= 1099511628211ull;
+                }
+                for (size_t k = u64_count * 8; k < len; k++) {
+                    weight_digest ^= (uint64_t)p[k];
+                    weight_digest *= 1099511628211ull;
+                }
+            }
+            if (m && m->output && myds_metal_buffer_data(m->output)) {
+                const uint8_t *p = (const uint8_t *)myds_metal_buffer_data(m->output);
+                const size_t len = myds_metal_buffer_size(m->output);
+                const size_t u64_count = len / 8;
+                for (size_t k = 0; k < u64_count; k++) {
+                    uint64_t val;
+                    memcpy(&val, p + k * 8, 8);
+                    weight_digest ^= val;
+                    weight_digest *= 1099511628211ull;
+                }
+                for (size_t k = u64_count * 8; k < len; k++) {
+                    weight_digest ^= (uint64_t)p[k];
+                    weight_digest *= 1099511628211ull;
+                }
+            }
+        } else {
+            /* 模型 > 256MB 且缺少 manifest digest：注入进程 boot salt，禁用跨进程 KV 复用 */
+            static uint64_t s_boot_salt = 0;
+            if (!s_boot_salt) {
+                uint64_t t = (uint64_t)time(NULL);
+                uint64_t p = (uint64_t)getpid();
+                s_boot_salt = ((p << 32) ^ t ^ 0x9e3779b97f4a7c15ull);
+                if (!s_boot_salt) s_boot_salt = 1;
+            }
+            weight_digest ^= s_boot_salt;
+            weight_digest *= 1099511628211ull;
+
+            /* 保留多点抽样作为进程内辅助检查 */
+            if (m && m->gf && m->gf->tensors && m->gf->tensor_count > 0) {
+                const uint64_t tc = m->gf->tensor_count;
+                const uint64_t step = (tc > 16u) ? (tc / 16u) : 1u;
+                for (uint64_t i = 0; i < tc; i += step) {
+                    const gguf_tensor_t *t = &m->gf->tensors[i];
+                    if (t->data && t->size_bytes > 0) {
+                        const uint8_t *b = (const uint8_t *)t->data;
+                        uint64_t w1 = 0, w2 = 0;
+                        size_t s1 = t->size_bytes < 8 ? t->size_bytes : 8;
+                        memcpy(&w1, b, s1);
+                        size_t mid = t->size_bytes / 2;
+                        size_t s2 = (t->size_bytes - mid) < 8 ? (t->size_bytes - mid) : 8;
+                        memcpy(&w2, b + mid, s2);
+                        weight_digest ^= w1; weight_digest *= 1099511628211ull;
+                        weight_digest ^= w2; weight_digest *= 1099511628211ull;
+                    }
+                }
+            }
         }
     }
     v[n++] = weight_digest;
 
     return myds_kvdsk_identity(m ? m->arch : "", v, n);
+}
+
+uint64_t myds_v41_model_identity(const myds_model_t *m) {
+    return lowkv_identity(m);
 }
 
 /* 为「位置 p、前缀哈希 hash」挑一个条目来写。策略本体在 myds_lowkv_policy.h

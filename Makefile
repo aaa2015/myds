@@ -52,7 +52,7 @@ all: $(TARGET) $(ALL_TESTS) $(DUMP_TENSORS) $(METALLIB)
 metallib: $(METALLIB)
 
 $(METALLIB): $(METAL_SRCS) tools/build_metallib.py | $(BIN_DIR) $(BUILD_DIR)
-	python3 tools/build_metallib.py
+	python3 tools/build_metallib.py --bin-dir $(BIN_DIR) --build-dir $(BUILD_DIR)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)

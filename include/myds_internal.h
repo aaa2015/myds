@@ -211,6 +211,8 @@ int32_t myds_sample_next_token(
     const int32_t       *prev_tokens,
     size_t               n_prev_tokens);
 
+uint64_t myds_v41_model_identity(const myds_model_t *m);
+
 #ifdef __cplusplus
 }
 #endif

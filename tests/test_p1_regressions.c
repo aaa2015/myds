@@ -2,6 +2,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <pthread.h>
 
 #include "myds.h"
 #include "myds_gguf.h"
@@ -25,7 +27,53 @@ static void test_p1_response_id_lifecycle(void) {
     assert(!resp_id_seen(id1));
     assert(!resp_id_seen(id2));
 
-    printf("  [PASS] P1-3: resp_id_invalidate_all correctly wipes state on failure\n");
+    /* Test late response failure: if ID is generated but transport fails */
+    char id3[64];
+    resp_id_new(id3, sizeof(id3));
+    resp_id_invalidate_all();
+    assert(!resp_id_is_live(id3));
+    assert(!resp_id_seen(id3));
+
+    printf("  [PASS] P1-3 & P2: resp_id lifecycle and late transport failure invalidation\n");
+}
+
+static void *worker_hold_slot(void *arg) {
+    (void)arg;
+    server_vjob_gpu_lock();
+    usleep(60000); /* hold for 60ms */
+    server_vjob_gpu_unlock();
+    return NULL;
+}
+
+static void test_p1_vision_queue_slot(void) {
+    /* Test 1: Recursive locking in the same thread */
+    server_vjob_gpu_lock();
+    server_vjob_gpu_lock();
+    server_vjob_gpu_unlock();
+    server_vjob_gpu_unlock();
+
+    /* Test 2: Timeout when slot is held by another thread */
+    setenv("MYDS_QUEUE_TIMEOUT_MS", "15", 1);
+    setenv("MYDS_MAX_QUEUE_DEPTH", "1", 1);
+
+    pthread_t th;
+    assert(pthread_create(&th, NULL, worker_hold_slot, NULL) == 0);
+    usleep(5000); /* ensure worker thread has acquired the slot */
+
+    /* Current thread tries to acquire: timeout is 15ms, worker holds for 60ms */
+    server_vjob_gpu_lock();
+    assert(server_vjob_gpu_last_error() != 0); /* must fail with timeout (-2) or busy (-1) */
+
+    pthread_join(th, NULL);
+    unsetenv("MYDS_QUEUE_TIMEOUT_MS");
+    unsetenv("MYDS_MAX_QUEUE_DEPTH");
+
+    /* Test 3: After worker releases, slot can be cleanly acquired again */
+    server_vjob_gpu_lock();
+    assert(server_vjob_gpu_last_error() == 0);
+    server_vjob_gpu_unlock();
+
+    printf("  [PASS] P2: Vision GPU lock integrates with queue timeout and depth limits\n");
 }
 
 static void test_p1_weight_identity(void) {
@@ -46,8 +94,8 @@ static void test_p1_weight_identity(void) {
 
     gf1.tensor_count = 4;
     gf2.tensor_count = 4;
-    gf1.metadata_kv_count = 5;
-    gf2.metadata_kv_count = 5;
+    gf1.metadata_kv_count = 0;
+    gf2.metadata_kv_count = 0;
     gf1.tensor_data_offset = 1024;
     gf2.tensor_data_offset = 1024;
     gf1.mmap_size = 1000000;
@@ -59,7 +107,7 @@ static void test_p1_weight_identity(void) {
 
     uint8_t data1[64], data2[64];
     memset(data1, 0x11, sizeof(data1));
-    memset(data2, 0x22, sizeof(data2));
+    memset(data2, 0x11, sizeof(data2)); /* identical contents */
 
     for (int i = 0; i < 4; i++) {
         t1[i].data = data1;
@@ -70,17 +118,43 @@ static void test_p1_weight_identity(void) {
     gf1.tensors = t1;
     gf2.tensors = t2;
 
-    uint64_t w1 = 1469598103934665603ull;
-    uint64_t w2 = 1469598103934665603ull;
-    for (uint64_t i = 0; i < 4; i++) {
-        uint64_t d1 = 0, d2 = 0;
-        memcpy(&d1, t1[i].data, 8);
-        memcpy(&d2, t2[i].data, 8);
-        w1 ^= d1; w1 *= 1099511628211ull;
-        w2 ^= d2; w2 *= 1099511628211ull;
-    }
-    assert(w1 != w2);
-    printf("  [PASS] P1-4: weight digests distinguish identical architectures with different weights\n");
+    /* 1. Same weights at different memory addresses: identity must be identical */
+    uint64_t id1 = myds_v41_model_identity(&m1);
+    uint64_t id2 = myds_v41_model_identity(&m2);
+    assert(id1 == id2);
+
+    /* 2. Modify sampled offset 0: identity must change */
+    data2[0] = 0x99;
+    uint64_t id_mut0 = myds_v41_model_identity(&m2);
+    assert(id_mut0 != id1);
+
+    /* 3. Reset offset 0, modify ONLY unsampled offset 16: identity must change! */
+    data2[0] = data1[0];
+    data2[16] = 0x77;
+    uint64_t id_mut16 = myds_v41_model_identity(&m2);
+    assert(id_mut16 != id1);
+    assert(id_mut16 != id_mut0);
+
+    /* 4. Reset offset 16, modify offset 33: identity must change */
+    data2[16] = data1[16];
+    data2[33] = 0x55;
+    uint64_t id_mut33 = myds_v41_model_identity(&m2);
+    assert(id_mut33 != id1);
+
+    /* 5. With manifest digest, identity is driven by manifest */
+    gguf_kv_t kv;
+    memset(&kv, 0, sizeof(kv));
+    char manifest_key[] = "models.manifest.digest";
+    char manifest_val[] = "sha256-verified-manifest-digest-v1";
+    kv.key = manifest_key;
+    kv.type = GGUF_TYPE_STRING;
+    kv.value.val_str = manifest_val;
+    gf1.kvs = &kv;
+    gf1.metadata_kv_count = 1;
+    uint64_t id_manifest = myds_v41_model_identity(&m1);
+    assert(id_manifest != id1);
+
+    printf("  [PASS] P1-1: myds_v41_model_identity distinguishes modifications at offset 0, 16, 33 and manifest\n");
 }
 
 static void test_p1_metal_fused_add_fallback(void) {
@@ -149,6 +223,7 @@ static void test_p1_metal_fused_add_fallback(void) {
 int main(void) {
     printf("Running P1 Regression Verification Suite:\n");
     test_p1_response_id_lifecycle();
+    test_p1_vision_queue_slot();
     test_p1_weight_identity();
     test_p1_metal_fused_add_fallback();
     printf("All P1 Regression Verifications PASSED!\n");

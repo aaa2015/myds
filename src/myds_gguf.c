@@ -320,7 +320,7 @@ void gguf_close(gguf_file_t *f) {
 }
 
 const gguf_kv_t *gguf_find_key(const gguf_file_t *f, const char *key) {
-    if (!f || !key) return NULL;
+    if (!f || !f->kvs || !key) return NULL;
     for (uint64_t i = 0; i < f->metadata_kv_count; i++) {
         if (strcmp(f->kvs[i].key, key) == 0) return &f->kvs[i];
     }
@@ -328,7 +328,7 @@ const gguf_kv_t *gguf_find_key(const gguf_file_t *f, const char *key) {
 }
 
 const gguf_tensor_t *gguf_find_tensor(const gguf_file_t *f, const char *name) {
-    if (!f || !name) return NULL;
+    if (!f || !f->tensors || !name) return NULL;
     for (uint64_t i = 0; i < f->tensor_count; i++) {
         if (strcmp(f->tensors[i].name, name) == 0) return &f->tensors[i];
     }
