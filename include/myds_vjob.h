@@ -10,8 +10,10 @@
  *   if (myds_vjob_init(vision_gguf_path) != 1) → 降级为纯文本
  *   plan = myds_vjob_plan(encoded_bytes, len, ...);   // 编一次图
  *   把 plan->text 插进提示词
- *   prompt 拼好后：token_offset = myds_vjob_token_offset(ctx, prompt, ...)
- *   myds_context_set_image_embeddings(ctx, token_offset, plan->token_count, plan->block, plan->dim);
+ *   prompt 拼好后，对每个块求偏移并注入：
+ *     off_i = myds_vjob_token_offset_at(ctx, prompt, 第 i 个块的占位文本起点);
+ *     myds_context_add_image_embeddings(ctx, off_i, plans[i].token_count,
+ *                                      plans[i].block, plans[i].dim);
  */
 #ifndef MYDS_VJOB_H
 #define MYDS_VJOB_H
@@ -37,12 +39,20 @@ typedef struct {
     bool     ok;
 } myds_vjob_plan_t;
 
-/* 一次请求的图片槽。服务端把它传进提示词构建函数，
- * 构建过程中遇到 input_image 就填进来（目前只支持一张）。 */
+/* 一次请求的图片槽【列表】。服务端把它传进提示词构建函数，
+ * 构建过程中每遇到一个 input_image 就追加一个 plan。
+ * ★ 是列表而不是单个：网关每轮重发完整历史，历史里可能有多张图。 */
 typedef struct myds_vjob_sink_s {
-    myds_vjob_plan_t plan;
-    bool             have;
+    myds_vjob_plan_t *plans;
+    uint32_t          count;
+    uint32_t          cap;
+    bool              failed;     /* 某个图片块处理失败 ⇒ 整个请求应当被拒 */
 } myds_vjob_sink_t;
+
+/* 往 sink 里追加一张图（服务端内部用；失败时置 failed 并返回 false）。 */
+int  myds_vjob_sink_add(myds_vjob_sink_t *sink, const uint8_t *encoded, size_t len,
+                        char *error, size_t error_cap);
+void myds_vjob_sink_free(myds_vjob_sink_t *sink);
 
 /* 加载视觉编码器权重。成功返回 1，失败返回 0（服务端据此降级为纯文本）。 */
 int  myds_vjob_init(myds_context_t *ctx, const char *vision_gguf);
@@ -58,10 +68,17 @@ int  myds_vjob_plan(const uint8_t *encoded, size_t len, myds_vjob_plan_t *out,
                     char *error, size_t error_cap);
 void myds_vjob_plan_free(myds_vjob_plan_t *plan);
 
-/* 在【最终提示词】里找图片块，返回它的起始 token 下标；找不到返回 -1。
- * 做法：定位占位文本的首次出现位置，再把该位置之前的文本编码一次数 token ——
- * 与引擎内部分词的方式（add_bos=true）保持一致。 */
-int64_t myds_vjob_token_offset(myds_context_t *ctx, const char *prompt);
+/* 在【最终提示词】里找某个图片块的起始 token 下标；找不到返回 -1。
+ * block_at 指向提示词里该块占位文本的起点。
+ * 做法：把「该点之前的文本」编码一次数 token —— 与引擎内部分词的方式
+ * （add_bos=true）保持一致（差 1 会整体错位）。 */
+int64_t myds_vjob_token_offset_at(myds_context_t *ctx, const char *prompt_base,
+                                  const char *block_at);
+
+/* 编码缓存：同一张图在历史里反复出现（网关每轮重发）⇒ 按内容哈希复用上一次的结果。
+ * 命中时省掉整次编码（实测 ~6s/图）。 */
+uint32_t myds_vjob_cache_hits(void);
+uint32_t myds_vjob_cache_misses(void);
 
 #ifdef __cplusplus
 }

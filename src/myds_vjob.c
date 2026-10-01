@@ -209,21 +209,110 @@ void myds_vjob_plan_free(myds_vjob_plan_t *plan) {
     memset(plan, 0, sizeof(*plan));
 }
 
-int64_t myds_vjob_token_offset(myds_context_t *ctx, const char *prompt) {
-    if (!ctx || !prompt || !g_placeholder) return -1;
-    const char *at = strstr(prompt, g_placeholder);
-    if (!at) return -1;
+int64_t myds_vjob_token_offset_at(myds_context_t *ctx, const char *prompt_base,
+                                  const char *block_at) {
+    if (!ctx || !prompt_base || !block_at || block_at < prompt_base) return -1;
     const myds_tokenizer_t *tok = ctx->model ? ctx->model->tokenizer : NULL;
     if (!tok) return -1;
-    /* 编码「占位块之前的那段」，token 数就是图片块的起始下标。
+    /* 编码「占位块之前的那段」，token 数就是该块的起始下标。
      * ★ add_bos 必须与引擎内部分词时一致（myds_generate_bytes_ex 传 true），
      *   否则会整体差 1 个位置 —— 那会静默地把图片向量贴到错的 token 上。 */
-    const size_t prefix_len = (size_t)(at - prompt);
+    const size_t prefix_len = (size_t)(block_at - prompt_base);
     char *prefix = (char *)malloc(prefix_len + 1);
     if (!prefix) return -1;
-    memcpy(prefix, prompt, prefix_len);
+    memcpy(prefix, prompt_base, prefix_len);
     prefix[prefix_len] = 0;
     int32_t count = myds_tokenizer_encode(tok, prefix, NULL, 0, true);
     free(prefix);
     return count < 0 ? -1 : (int64_t)count;
+}
+
+/* ── 编码缓存 ──
+ * 网关每轮重发完整历史 ⇒ 同一张图会被反复送进来。缓存最近若干张的【整份计划】，
+ * 避免每轮把每张图重编一遍（实测 ~6s/图；历史里 3 张图就是每轮 18s）。
+ * 键 = 内容哈希（FNV-1a，够用；不需要抗碰撞的强度）。 */
+#define VJOB_CACHE_SLOTS 6
+typedef struct {
+    uint64_t         hash;
+    size_t           len;
+    myds_vjob_plan_t plan;
+    bool             used;
+} vjob_cache_t;
+static vjob_cache_t g_cache[VJOB_CACHE_SLOTS];
+static uint32_t     g_cache_next;
+static uint32_t     g_hits, g_misses;
+
+static uint64_t vjob_hash(const uint8_t *p, size_t n) {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ull; }
+    return h ^ (uint64_t)n;
+}
+
+static int vjob_plan_copy(const myds_vjob_plan_t *src, myds_vjob_plan_t *dst) {
+    memset(dst, 0, sizeof(*dst));
+    const size_t bbytes = (size_t)src->token_count * src->dim * sizeof(float);
+    float *block = (float *)malloc(bbytes);
+    char  *text  = src->text ? strdup(src->text) : NULL;
+    if (!block || !text) { free(block); free(text); return 0; }
+    memcpy(block, src->block, bbytes);
+    dst->token_count = src->token_count;
+    dst->dim = src->dim;
+    dst->block = block;
+    dst->text = text;
+    dst->grid_height = src->grid_height;
+    dst->grid_width = src->grid_width;
+    dst->ok = true;
+    return 1;
+}
+
+uint32_t myds_vjob_cache_hits(void)   { return g_hits; }
+uint32_t myds_vjob_cache_misses(void) { return g_misses; }
+
+int myds_vjob_sink_add(myds_vjob_sink_t *sink, const uint8_t *encoded, size_t len,
+                       char *error, size_t error_cap) {
+    if (!sink) return 0;
+    if (sink->count == sink->cap) {
+        const uint32_t cap = sink->cap ? sink->cap * 2u : 4u;
+        myds_vjob_plan_t *np = (myds_vjob_plan_t *)realloc(sink->plans, cap * sizeof(*np));
+        if (!np) { vjob_error(error, error_cap, "图片计划表扩容失败"); sink->failed = true; return 0; }
+        sink->plans = np;
+        sink->cap = cap;
+    }
+    const uint64_t h = vjob_hash(encoded, len);
+    for (uint32_t i = 0; i < VJOB_CACHE_SLOTS; i++) {
+        if (g_cache[i].used && g_cache[i].hash == h && g_cache[i].len == len) {
+            if (vjob_plan_copy(&g_cache[i].plan, &sink->plans[sink->count])) {
+                sink->count++;
+                g_hits++;
+                MYDS_LOG_I("图片命中缓存（第 %u 张，%zu 字节）—— 跳过编码", sink->count, len);
+                return 1;
+            }
+            break;   /* 拷贝失败就退回重新编码 */
+        }
+    }
+    myds_vjob_plan_t fresh;
+    if (!myds_vjob_plan(encoded, len, &fresh, error, error_cap)) {
+        sink->failed = true;
+        return 0;
+    }
+    g_misses++;
+    /* 存入缓存（覆盖最老的一格）。★ 先存再拷：两份独立的数据，谁都不许 free 到对方。 */
+    vjob_cache_t *slot = &g_cache[g_cache_next];
+    g_cache_next = (g_cache_next + 1u) % VJOB_CACHE_SLOTS;
+    myds_vjob_plan_free(&slot->plan);
+    slot->used = false;
+    if (vjob_plan_copy(&fresh, &slot->plan)) {
+        slot->hash = h;
+        slot->len = len;
+        slot->used = true;
+    }
+    sink->plans[sink->count++] = fresh;   /* 承接所有权 */
+    return 1;
+}
+
+void myds_vjob_sink_free(myds_vjob_sink_t *sink) {
+    if (!sink) return;
+    for (uint32_t i = 0; i < sink->count; i++) myds_vjob_plan_free(&sink->plans[i]);
+    free(sink->plans);
+    memset(sink, 0, sizeof(*sink));
 }

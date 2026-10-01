@@ -673,7 +673,6 @@ static bool prompt_append(prompt_buffer_t *b, const char *text) {
 static bool prompt_content_image(const prompt_json_t *j, const prompt_json_node_t *node,
                                  prompt_buffer_t *out, myds_vjob_sink_t *img) {
     if (!img) IMG_REJECT("服务端未启用视觉（启动时没给 --vision？）");
-    if (img->have) IMG_REJECT("一次请求只支持一张图");
     bool valid = true;
     const prompt_json_node_t *url = prompt_json_field(j, node, "image_url", &valid);
     if (!valid) IMG_REJECT("image_url 字段重复或结构异常");
@@ -695,17 +694,18 @@ static bool prompt_content_image(const prompt_json_t *j, const prompt_json_node_
     MYDS_LOG_I("input_image: base64 解出 %zu 字节", nbytes);
 
     char err[256] = {0};
-    const bool ok = myds_vjob_plan(bytes, nbytes, &img->plan, err, sizeof(err)) != 0;
-    free(bytes);
-    if (!ok) {
+    /* ★ 追加而不是覆盖：网关每轮重发完整历史，历史里可能有多张图。
+     *   第一版只支持一张，结果「发过图之后的任何对话」都会被拒。 */
+    if (!myds_vjob_sink_add(img, bytes, nbytes, err, sizeof(err))) {
         MYDS_LOG_E("图片处理失败: %s", err[0] ? err : "未知原因");
+        free(bytes);
         return false;
     }
-    img->have = true;
-    MYDS_LOG_I("收到图片: %ux%u 画布 → 网格 %ux%u → %u 个占位 token",
-               img->plan.grid_width * 14u, img->plan.grid_height * 14u,
-               img->plan.grid_width, img->plan.grid_height, img->plan.token_count);
-    return prompt_append(out, img->plan.text);
+    free(bytes);
+    const myds_vjob_plan_t *plan = &img->plans[img->count - 1];
+    MYDS_LOG_I("收到图片 #%u: 网格 %ux%u → %u 个占位 token（累计 %u 张）",
+               img->count, plan->grid_width, plan->grid_height, plan->token_count, img->count);
+    return prompt_append(out, plan->text);
 }
 
 static bool prompt_content(const prompt_json_t *j, const prompt_json_node_t *content,
@@ -1781,6 +1781,51 @@ static bool send_response(int fd, int code, const char *status, const char *cont
     return body_len == 0 || myds_server_send_all(fd, body, body_len);
 }
 
+/* ── 把请求里的所有图片块注入引擎 ──
+ * 图片块在提示词里的位置：第 i 个块 = 第 i 次出现占位符的地方。
+ * 逐块求「该点之前的 token 数」得到起始位置，然后添加区间。
+ * 任一块找不到 ⇒ 返回 false（调用方拒绝整个请求）——
+ * 宁可报错，也不要把图片向量贴到错的 token 上（那是静默出错）。
+ *
+ * ★ 为什么收敛成一个函数：之前流式/非流式各写了一份，复制体迟早会分叉。 */
+static bool inject_image_embeddings(myds_context_t *ctx, const char *prompt,
+                                    myds_vjob_sink_t *sink,
+                                    const char *client_ip, int client_port) {
+    if (!sink || sink->count == 0) return true;
+    if (sink->failed) {
+        MYDS_LOG_E("[%s:%d] 本次请求有图片块处理失败，拒绝", client_ip, client_port);
+        return false;
+    }
+    const char *ph = myds_vjob_placeholder();
+    const size_t phlen = ph ? strlen(ph) : 0;
+    if (!ph || phlen == 0) {
+        MYDS_LOG_E("[%s:%d] 视觉占位符缺失，拒绝", client_ip, client_port);
+        return false;
+    }
+    const char *cursor = prompt;
+    for (uint32_t i = 0; i < sink->count; i++) {
+        const myds_vjob_plan_t *plan = &sink->plans[i];
+        const char *at = strstr(cursor, ph);
+        if (!at) {
+            MYDS_LOG_E("[%s:%d] 第 %u 个图片块的占位文本在提示词里找不到，拒绝",
+                       client_ip, client_port, i + 1);
+            return false;
+        }
+        const int64_t off = myds_vjob_token_offset_at(ctx, prompt, at);
+        if (off < 0) {
+            MYDS_LOG_E("[%s:%d] 第 %u 个图片块的 token 偏移量算不出来，拒绝",
+                       client_ip, client_port, i + 1);
+            return false;
+        }
+        myds_context_add_image_embeddings(ctx, (uint32_t)off, plan->token_count,
+                                         plan->block, plan->dim);
+        /* 跳过本块的整段占位文本，保证第 i+1 个块不会匹配到同一个位置
+         * （相邻图片块的首个占位符字符完全相同） */
+        cursor = at + (size_t)plan->token_count * phlen;
+    }
+    return true;
+}
+
 static void handle_client(int client_fd, myds_context_t *ctx, const char *model_alias, const char *client_ip, int client_port) {
     /* Protect against slowloris and stalled connections */
     struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
@@ -2016,26 +2061,17 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 !myds_server_send_all(client_fd, initial, strlen(initial))) {
                 sctx.cancel_flag = 1;
             }
-            /* ── 视觉注入 ──
-             * 提示词已经拼好（含图片的占位块），把该块的逐位置向量交给引擎。
-             * ★ 注入必须在 generate 之前，且下一次请求会自行覆盖/清除 ——
-             *   否则第二个请求会用到上一张图的向量。 */
-            if (img_sink.have) {
-                const int64_t off = myds_vjob_token_offset(ctx, prompt);
-                if (off < 0) {
-                    MYDS_LOG_E("[%s:%d] 图片占位块在提示词里找不到，拒绝本次请求（宁可报错也不要错位注入）",
-                               client_ip, client_port);
-                    myds_vjob_plan_free(&img_sink.plan);
-                    send_response(client_fd, 400, "Bad Request", "application/json",
-                                  "{\"error\":{\"message\":\"image placeholder missing from rendered prompt\"}}");
-                    free(req_buf); free(prompt); close(client_fd); return;
-                }
-                myds_context_set_image_embeddings(ctx, (uint32_t)off, img_sink.plan.token_count,
-                                                  img_sink.plan.block, img_sink.plan.dim);
+            /* 视觉注入：提示词已拼好，把所有图片块的逐位置向量交给引擎。
+             * ★ 必须在 generate 之前；generate 之后清除，否则下一请求会用错图。 */
+            if (!inject_image_embeddings(ctx, prompt, &img_sink, client_ip, client_port)) {
+                myds_vjob_sink_free(&img_sink);
+                send_response(client_fd, 400, "Bad Request", "application/json",
+                              "{\"error\":{\"message\":\"image block could not be aligned with the prompt\"}}");
+                free(req_buf); free(prompt); close(client_fd); return;
             }
             int generated = myds_generate_bytes_ex(ctx, prompt, myds_server_sse_callback, &sctx,
                                                    &stop_reason, &prompt_tokens, &sctx.cancel_flag);
-            if (img_sink.have) { myds_context_clear_image_embeddings(ctx); myds_vjob_plan_free(&img_sink.plan); }
+            myds_context_clear_image_embeddings(ctx); myds_vjob_sink_free(&img_sink);
             if (generated && !sctx.cancel_flag) (void)myds_server_sse_finish(&sctx);
             if (generated && !sctx.failed) resp_id_register(resp_id);   /* 状态已停在本次序列末尾 */
             final_tokens = sctx.token_count;
@@ -2113,21 +2149,15 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             free(sctx.acc); sctx.acc = NULL;   /* 每请求一份累积缓冲，必须释放 */
         } else {
             myds_non_stream_ctx_t ns = {.client_fd = client_fd};
-            if (img_sink.have) {
-                const int64_t off = myds_vjob_token_offset(ctx, prompt);
-                if (off < 0) {
-                    MYDS_LOG_E("[%s:%d] 图片占位块在提示词里找不到，拒绝本次请求", client_ip, client_port);
-                    myds_vjob_plan_free(&img_sink.plan);
-                    send_response(client_fd, 400, "Bad Request", "application/json",
-                                  "{\"error\":{\"message\":\"image placeholder missing from rendered prompt\"}}");
-                    free(req_buf); free(prompt); close(client_fd); return;
-                }
-                myds_context_set_image_embeddings(ctx, (uint32_t)off, img_sink.plan.token_count,
-                                                  img_sink.plan.block, img_sink.plan.dim);
+            if (!inject_image_embeddings(ctx, prompt, &img_sink, client_ip, client_port)) {
+                myds_vjob_sink_free(&img_sink);
+                send_response(client_fd, 400, "Bad Request", "application/json",
+                              "{\"error\":{\"message\":\"image block could not be aligned with the prompt\"}}");
+                free(req_buf); free(prompt); close(client_fd); return;
             }
             int generated = myds_generate_bytes_ex(ctx, prompt, myds_server_non_stream_callback, &ns,
                                                    &stop_reason, &prompt_tokens, &ns.cancel_flag);
-            if (img_sink.have) { myds_context_clear_image_embeddings(ctx); myds_vjob_plan_free(&img_sink.plan); }
+            myds_context_clear_image_embeddings(ctx); myds_vjob_sink_free(&img_sink);
             if (generated && !ns.failed) resp_id_register(resp_id);
             final_tokens = ns.token_count;
             t_first = ns.t_first;

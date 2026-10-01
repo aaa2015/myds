@@ -30,9 +30,9 @@ static void try_body(const char *label, const char *body) {
     printf("\n");
     if (ok) {
         printf("       渲染出的提示词（前 220 字节）: %.220s\n", prompt);
-        printf("       sink.have=%d\n", (int)sink.have);
+        printf("       sink: %u 张图\n", sink.count);
     }
-    myds_vjob_plan_free(&sink.plan);
+    myds_vjob_sink_free(&sink);
 }
 
 int main(void) {
@@ -65,7 +65,26 @@ int main(void) {
              "{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,%s\"}]}]}", TINY_PNG_B64);
     try_body("messages + input_image", body);
 
-    /* ⑤ 带 type:message 的消息壳（Responses 里也常见） */
+    /* ⑤ 历史里【多张图】—— 网关每轮重发完整历史时就是这个形状。
+     *   第一版这里会被拒（"一次请求只支持一张图"），
+     *   导致「发过图之后的任何对话」全部 400。 */
+    {
+        char img_part[4096];
+        snprintf(img_part, sizeof(img_part),
+                 "{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,%s\"}",
+                 TINY_PNG_B64);
+        char *w = body;
+        w += sprintf(w, "{\"messages\":[");
+        w += sprintf(w, "{\"role\":\"user\",\"content\":[%s,{\"type\":\"text\",\"text\":\"first\"}]},", img_part);
+        w += sprintf(w, "{\"role\":\"assistant\",\"content\":\"ok\"},");
+        w += sprintf(w, "{\"role\":\"user\",\"content\":[%s,{\"type\":\"text\",\"text\":\"second\"}]},", img_part);
+        w += sprintf(w, "{\"role\":\"assistant\",\"content\":\"ok\"},");
+        w += sprintf(w, "{\"role\":\"user\",\"content\":\"now just talking\"}]}");
+        *w = 0;
+    }
+    try_body("历史里两张图 + 后续对话", body);
+
+    /* ⑥ 带 type:message 的消息壳（Responses 里也常见） */
     snprintf(body, sizeof(body),
              "{\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":["
              "{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,%s\"}]}]}", TINY_PNG_B64);

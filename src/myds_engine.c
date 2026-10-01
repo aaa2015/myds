@@ -1191,31 +1191,52 @@ myds_context_t *myds_context_create(myds_model_t *model, const myds_config_t *cf
  * 词表查表做不到这件事 ⇒ 单独给一段位置挂向量。
  * 与 ds4 一致：ds4 也是推同一个 id，靠注入的向量区分。
  * 这里拷一份数据（3~4MB 量级），避免调用方还要管生命周期 —— 少一个出错点。 */
-void myds_context_set_image_embeddings(myds_context_t *ctx, uint32_t start_pos,
+void myds_context_add_image_embeddings(myds_context_t *ctx, uint32_t start_pos,
                                        uint32_t count, const float *data, uint32_t dim) {
-    if (!ctx) return;
-    myds_context_clear_image_embeddings(ctx);
-    if (!data || count == 0 || dim == 0) return;
-    size_t bytes = (size_t)count * dim * sizeof(float);
+    if (!ctx || !data || count == 0 || dim == 0) return;
+    if (ctx->img_emb_n > 0 && ctx->img_emb_dim != dim) {
+        MYDS_LOG_E("image embeddings: 向量宽度不一致（已有 %u，本次 %u），拒绝添加",
+                   ctx->img_emb_dim, dim);
+        return;
+    }
+    if (ctx->img_emb_n == ctx->img_emb_cap) {
+        const uint32_t cap = ctx->img_emb_cap ? ctx->img_emb_cap * 2u : 4u;
+        float **nd = (float **)realloc(ctx->img_emb_data, cap * sizeof(*nd));
+        if (!nd) { MYDS_LOG_E("image embeddings: 区间表扩容失败"); return; }
+        ctx->img_emb_data = nd;
+        uint32_t *ns = (uint32_t *)realloc(ctx->img_emb_start, cap * sizeof(*ns));
+        if (!ns) { MYDS_LOG_E("image embeddings: 区间表扩容失败"); return; }
+        ctx->img_emb_start = ns;
+        uint32_t *nc = (uint32_t *)realloc(ctx->img_emb_count, cap * sizeof(*nc));
+        if (!nc) { MYDS_LOG_E("image embeddings: 区间表扩容失败"); return; }
+        ctx->img_emb_count = nc;
+        ctx->img_emb_cap = cap;
+    }
+    const size_t bytes = (size_t)count * dim * sizeof(float);
     float *copy = (float *)malloc(bytes);
     if (!copy) {
-        MYDS_LOG_E("image embeddings: cannot allocate %.1f MB", (double)bytes / 1048576.0);
+        MYDS_LOG_E("image embeddings: 无法分配 %.1f MB", (double)bytes / 1048576.0);
         return;
     }
     memcpy(copy, data, bytes);
-    ctx->img_emb_data = copy;
-    ctx->img_emb_start = start_pos;
-    ctx->img_emb_count = count;
-    MYDS_LOG_I("image embeddings: positions [%u, %u), %u values each %u wide",
-               start_pos, start_pos + count, count, dim);
+    ctx->img_emb_data[ctx->img_emb_n] = copy;
+    ctx->img_emb_start[ctx->img_emb_n] = start_pos;
+    ctx->img_emb_count[ctx->img_emb_n] = count;
+    ctx->img_emb_n++;
+    ctx->img_emb_dim = dim;
+    MYDS_LOG_I("image embeddings: 区间 %u = 位置 [%u, %u)，每维 %u",
+               ctx->img_emb_n, start_pos, start_pos + count, dim);
 }
 
 void myds_context_clear_image_embeddings(myds_context_t *ctx) {
     if (!ctx) return;
-    free(ctx->img_emb_data);
-    ctx->img_emb_data = NULL;
-    ctx->img_emb_start = 0;
-    ctx->img_emb_count = 0;
+    for (uint32_t i = 0; i < ctx->img_emb_n; i++) free(ctx->img_emb_data[i]);
+    free(ctx->img_emb_data);      ctx->img_emb_data = NULL;
+    free(ctx->img_emb_start);     ctx->img_emb_start = NULL;
+    free(ctx->img_emb_count);     ctx->img_emb_count = NULL;
+    ctx->img_emb_n = 0;
+    ctx->img_emb_cap = 0;
+    ctx->img_emb_dim = 0;
 }
 
 void myds_context_free(myds_context_t *ctx) {

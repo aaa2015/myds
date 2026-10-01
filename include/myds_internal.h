@@ -179,10 +179,16 @@ struct myds_context {
      * V4.1 的图片块所有位置共用 image token id（129264），
      * 逐位置的向量才区分（图片格 = 编码器输出；行尾 = image_newline 哨兵；首尾 = start/end）。
      * 这与 ds4 的做法一致（ds4 也是推同一个 id、靠注入的向量区分）。
-     * 指针由 context 持有（设置时拷贝一份），clear / context_free 时释放。 */
-    float               *img_emb_data;   /* [img_emb_count * dim] */
-    uint32_t             img_emb_start;
-    uint32_t             img_emb_count;
+     * 指针由 context 持有（添加时拷贝一份），clear / context_free 时释放。
+     * ★ 是【数组】而不是单个区间：网关每轮重发完整历史，历史里会有多张图
+     *   ⇒ 一次请求天然可能带 N 个图片块。（我第一版写死单区间，
+     *     结果第一张图之后的所有对话全被拒 —— 见 docs/VISION.md 的排障节。） */
+    float              **img_emb_data;   /* 每个区间一份 [count * dim] */
+    uint32_t            *img_emb_start;
+    uint32_t            *img_emb_count;
+    uint32_t             img_emb_n;      /* 区间个数 */
+    uint32_t             img_emb_cap;
+    uint32_t             img_emb_dim;    /* 各区间共同的向量宽度 */
 };
 
 /* Unified production sampler: greedy, temperature, top-k, min-p, top-p, repetition penalty */

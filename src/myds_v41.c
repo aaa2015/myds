@@ -186,13 +186,18 @@ bool myds_v41_snapshot_restore(myds_v41_context_t *g, uint32_t p) {
  * ★ 为什么要按【位置】而不是按 token id：图片块所有位置共用同一个 id。 */
 static bool v41_image_embedding_at(const myds_context_t *ctx, uint32_t pos,
                                    float *out, uint32_t dim) {
-    if (!ctx || !ctx->img_emb_data || ctx->img_emb_count == 0) return false;
-    if (pos < ctx->img_emb_start) return false;
-    const uint32_t off = pos - ctx->img_emb_start;
-    if (off >= ctx->img_emb_count) return false;
+    if (!ctx || !ctx->img_emb_data || ctx->img_emb_n == 0) return false;
     if (dim != V41_DIM) return false;      /* 注入数据按语言模型的嵌入宽度给 */
-    memcpy(out, ctx->img_emb_data + (size_t)off * dim, (size_t)dim * sizeof(float));
-    return true;
+    /* 区间数是个位数（历史里有几张图就是几个）⇒ 线性扫足够，不必二分 */
+    for (uint32_t i = 0; i < ctx->img_emb_n; i++) {
+        const uint32_t start = ctx->img_emb_start[i];
+        if (pos < start) continue;
+        const uint32_t off = pos - start;
+        if (off >= ctx->img_emb_count[i]) continue;
+        memcpy(out, ctx->img_emb_data[i] + (size_t)off * dim, (size_t)dim * sizeof(float));
+        return true;
+    }
+    return false;
 }
 
 static uint32_t ratio_for(uint32_t l) { return l < 2 ? 0 : l < 20 ? 2 : 1; }
