@@ -548,13 +548,22 @@ static void test_p2_moe_kernel_and_pso_validation(void) {
     memset(q_data, 0x22, sizeof(q_data));
     assert(myds_metal_buffer_write(gate_exps, 0, q_data, (size_t)(n_routed_experts * gate_exp_bytes)));
     assert(myds_metal_buffer_write(up_exps, 0, q_data, (size_t)(n_routed_experts * gate_exp_bytes)));
-    assert(myds_metal_buffer_write(down_exps, 0, q_data, (size_t)(n_routed_experts * down_exp_bytes)));
+
+    /* Avoid cancellation by zeroing dmin in Q2_K down-projection blocks (scale only) */
+    uint8_t q_down[344064];
+    memset(q_down, 0x22, sizeof(q_down));
+    for (uint32_t row = 0; row < n_routed_experts * dim; row++) {
+        q_down[row * 84 + 82] = 0;
+        q_down[row * 84 + 83] = 0;
+    }
+    assert(myds_metal_buffer_write(down_exps, 0, q_down, (size_t)(n_routed_experts * down_exp_bytes)));
 
     int32_t ids[6] = {0, 1, 2, 3, 4, 5};
     float weights[6] = {0.2f, 0.2f, 0.2f, 0.2f, 0.1f, 0.1f};
     assert(myds_metal_buffer_write(selected_ids, 0, ids, sizeof(ids)));
     assert(myds_metal_buffer_write(selected_weights, 0, weights, sizeof(weights)));
 
+    myds_metal_dispatch_count_reset();
     int ret = myds_metal_routed_moe(
         moe_out, x_in, gate_exps, up_exps, down_exps,
         selected_ids, selected_weights,
@@ -564,11 +573,16 @@ static void test_p2_moe_kernel_and_pso_validation(void) {
         0.0f
     );
     assert(ret == 1);
+    uint64_t dispatches = myds_metal_dispatch_count();
+    assert(dispatches == 2);
 
     float h_out[256];
     assert(myds_metal_buffer_read(moe_out, 0, h_out, sizeof(h_out)));
+    const double expected_out = 985.310926;
     for (uint32_t i = 0; i < dim; i++) {
         assert(isfinite(h_out[i]));
+        double diff = fabs((double)h_out[i] - expected_out);
+        assert(diff / expected_out < 1e-4);
     }
 
     myds_metal_buffer_free(moe_out);
