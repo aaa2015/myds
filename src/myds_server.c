@@ -1,5 +1,6 @@
 #include "myds_server.h"
 #include "myds_server_internal.h"
+#include "myds_vjob.h"
 #include "myds_log.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -449,6 +450,40 @@ typedef struct {
 } prompt_json_t;
 /* overflow 用来把【缓冲不够】与【形状不支持】区分开：两者原本都只是 return false，
  * 于是一个「工具调用被拒」和一个「提示词太大」会给出完全相同的报错。 */
+/* ── base64 解码（客户端把图片塞在 data URL 里）──
+ * 只接受标准字母表 + '=' 填充；遇到空白跳过（有些客户端会换行）。
+ * 返回 malloc 出来的字节（调用方 free），长度为 0 或 NULL 表示失败。 */
+static uint8_t *server_base64_decode(const char *text, size_t len, size_t *out_len) {
+    static int8_t rev[256];
+    static bool init = false;
+    if (!init) {
+        for (int i = 0; i < 256; i++) rev[i] = -1;
+        const char *alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for (int i = 0; i < 64; i++) rev[(unsigned char)alpha[i]] = (int8_t)i;
+        init = true;
+    }
+    uint8_t *out = (uint8_t *)malloc(len / 4u * 3u + 4u);
+    if (!out) return NULL;
+    size_t used = 0;
+    uint32_t acc = 0;
+    int nbits = 0;
+    for (size_t i = 0; i < len; i++) {
+        const unsigned char c = (unsigned char)text[i];
+        if (c == '=' || c == '\n' || c == '\r' || c == ' ' || c == '\t') continue;
+        const int8_t v = rev[c];
+        if (v < 0) { free(out); return NULL; }
+        acc = (acc << 6) | (uint32_t)v;
+        nbits += 6;
+        if (nbits >= 8) {
+            nbits -= 8;
+            out[used++] = (uint8_t)((acc >> nbits) & 0xffu);
+        }
+    }
+    if (used == 0) { free(out); return NULL; }
+    *out_len = used;
+    return out;
+}
+
 typedef struct { char *data; size_t capacity, length; bool overflow; } prompt_buffer_t;
 
 static void prompt_json_ws(prompt_json_t *j) {
@@ -628,7 +663,46 @@ static bool prompt_append(prompt_buffer_t *b, const char *text) {
     if (b->length >= b->capacity || length >= b->capacity - b->length) { b->overflow = true; return false; }
     memcpy(b->data + b->length, text, length + 1); b->length += length; return true;
 }
-static bool prompt_content(const prompt_json_t *j, const prompt_json_node_t *content, prompt_buffer_t *out) {
+/* 处理一个 input_image 内容块：取出 data URL、解码、编一次图，
+ * 然后把它对应的【占位文本】追加进提示词。向量本身留在 sink 里，
+ * 等提示词全部拼好后由调用方按位置注入。 */
+static bool prompt_content_image(const prompt_json_t *j, const prompt_json_node_t *node,
+                                 prompt_buffer_t *out, myds_vjob_sink_t *img) {
+    if (!img) return false;                 /* 服务端没启用视觉 ⇒ 明确失败，别静默丢图 */
+    if (img->have) return false;            /* 一次请求目前只支持一张图（注入接口是一段区间） */
+    bool valid = true;
+    const prompt_json_node_t *url = prompt_json_field(j, node, "image_url", &valid);
+    if (!valid) return false;
+    if (url && url->kind == PJ_OBJECT) {    /* Chat Completions 风格 {"url": "..."} */
+        url = prompt_json_field(j, url, "url", &valid);
+        if (!valid) return false;
+    }
+    if (!url || url->kind != PJ_STRING) return false;
+    const char *spec = url->text;
+    if (strncmp(spec, "data:", 5) != 0) return false;   /* 只接受内联 data URL */
+    const char *comma = strchr(spec, ',');
+    if (!comma) return false;
+    if (!strstr(spec, "base64")) return false;          /* 只接受 base64 编码 */
+    size_t nbytes = 0;
+    uint8_t *bytes = server_base64_decode(comma + 1, strlen(comma + 1), &nbytes);
+    if (!bytes) return false;
+
+    char err[256] = {0};
+    const bool ok = myds_vjob_plan(bytes, nbytes, &img->plan, err, sizeof(err)) != 0;
+    free(bytes);
+    if (!ok) {
+        MYDS_LOG_E("图片处理失败: %s", err[0] ? err : "未知原因");
+        return false;
+    }
+    img->have = true;
+    MYDS_LOG_I("收到图片: %ux%u 画布 → 网格 %ux%u → %u 个占位 token",
+               img->plan.grid_width * 14u, img->plan.grid_height * 14u,
+               img->plan.grid_width, img->plan.grid_height, img->plan.token_count);
+    return prompt_append(out, img->plan.text);
+}
+
+static bool prompt_content(const prompt_json_t *j, const prompt_json_node_t *content,
+                           prompt_buffer_t *out, myds_vjob_sink_t *img) {
     if (!content) return false;
     if (content->kind == PJ_NULL) return true;
     if (content->kind == PJ_STRING) return prompt_append(out, content->text);
@@ -637,8 +711,13 @@ static bool prompt_content(const prompt_json_t *j, const prompt_json_node_t *con
         bool valid = true;
         const prompt_json_node_t *type = prompt_json_field(j, &j->nodes[i], "type", &valid);
         const prompt_json_node_t *text = prompt_json_field(j, &j->nodes[i], "text", &valid);
-        if (!valid || !type || type->kind != PJ_STRING || !text ||
-            (strcmp(type->text, "text") && strcmp(type->text, "input_text") && strcmp(type->text, "output_text")) ||
+        if (!valid || !type || type->kind != PJ_STRING) return false;
+        if (!strcmp(type->text, "input_image")) {
+            if (!prompt_content_image(j, &j->nodes[i], out, img)) return false;
+            continue;
+        }
+        if ((strcmp(type->text, "text") && strcmp(type->text, "input_text") && strcmp(type->text, "output_text")) ||
+            !text ||
             (text->kind != PJ_NULL && (text->kind != PJ_STRING || !prompt_append(out, text->text)))) return false;
     }
     return true;
@@ -901,7 +980,8 @@ static bool prompt_render_tool_call_items(prompt_buffer_t *out, const prompt_jso
 
 /* 失败原因（供日志与报错使用）。调用方每次进入前不必清空 —— 每个失败路径都会写它。 */
 static bool parse_chat_prompt_impl(const char *body, char *out_prompt, size_t max_prompt_len,
-                                   const char **out_reason, bool suffix_only) {
+                                   const char **out_reason, bool suffix_only,
+                                   myds_vjob_sink_t *img) {
     const char **why = out_reason;
     const char *local_why = "unsupported prompt shape";
     if (!why) why = &local_why;
@@ -1054,7 +1134,7 @@ render_items:
             /* function_call 项没有 content（name/arguments 在这一层）⇒ 正文按空处理 */
             if (content_optional && !content) {
                 decoded.data[0] = 0;
-            } else if (!prompt_content(&json, content, &decoded)) {
+            } else if (!prompt_content(&json, content, &decoded, img)) {
                 *why = "unsupported content block in the message history";
                 goto done;
             }
@@ -1087,14 +1167,25 @@ done:
 /* 兼容包装：测试与其它调用方沿用旧的三参签名（它们不关心失败原因）。 */
 bool parse_chat_prompt_ex(const char *body, char *out_prompt, size_t max_prompt_len,
                           const char **out_reason) {
-    return parse_chat_prompt_impl(body, out_prompt, max_prompt_len, out_reason, false);
+    return parse_chat_prompt_impl(body, out_prompt, max_prompt_len, out_reason, false, NULL);
+}
+
+/* 带视觉槽的版本：服务端在启用视觉时走这两个。 */
+bool parse_chat_prompt_vis(const char *body, char *out_prompt, size_t max_prompt_len,
+                           const char **out_reason, myds_vjob_sink_t *img) {
+    return parse_chat_prompt_impl(body, out_prompt, max_prompt_len, out_reason, false, img);
+}
+
+bool parse_chat_prompt_suffix_vis(const char *body, char *out_prompt, size_t max_prompt_len,
+                                  const char **out_reason, myds_vjob_sink_t *img) {
+    return parse_chat_prompt_impl(body, out_prompt, max_prompt_len, out_reason, true, img);
 }
 
 /* previous_response_id：只渲染新增部分（无 BOS / instructions / tools），
  * 前缀由引擎的缓存序列提供。 */
 bool parse_chat_prompt_suffix_ex(const char *body, char *out_prompt, size_t max_prompt_len,
                                  const char **out_reason) {
-    return parse_chat_prompt_impl(body, out_prompt, max_prompt_len, out_reason, true);
+    return parse_chat_prompt_impl(body, out_prompt, max_prompt_len, out_reason, true, NULL);
 }
 
 bool parse_chat_prompt(const char *body, char *out_prompt, size_t max_prompt_len) {
@@ -1818,6 +1909,10 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         int include_usage = (strstr(body, "\"include_usage\":true") != NULL || strstr(body, "\"include_usage\": true") != NULL);
 
         size_t prompt_cap = (total_read * 4 > 65536) ? (total_read * 4 + 8192) : 65536;
+        /* 视觉槽：本次请求若带图，构建提示词时填进来，提示词拼好后按位置注入向量。
+         * ★ 必须在 parse 之前声明 —— 它是构建过程的输出。 */
+        myds_vjob_sink_t img_sink;
+        memset(&img_sink, 0, sizeof(img_sink));
         char *prompt = malloc(prompt_cap);
         if (!prompt) {
             MYDS_LOG_E("[%s:%d] Out of memory allocating prompt buffer (%zu bytes)", client_ip, client_port, prompt_cap);
@@ -1847,8 +1942,8 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         }
         const char *parse_reason = NULL;
         const bool parsed_ok = is_continuation
-            ? parse_chat_prompt_suffix_ex(body, prompt, prompt_cap, &parse_reason)
-            : parse_chat_prompt_ex(body, prompt, prompt_cap, &parse_reason);
+            ? parse_chat_prompt_suffix_vis(body, prompt, prompt_cap, &parse_reason, &img_sink)
+            : parse_chat_prompt_vis(body, prompt, prompt_cap, &parse_reason, &img_sink);
         if (!parsed_ok) {
             /* 必须落日志：此前这条路径【完全不记录】，导致线上只能看到一个笼统的 400。 */
             MYDS_LOG_W("[%s:%d] ChatCompletions rejected (400): %s [body=%zd bytes, prompt_cap=%zu]",
@@ -1914,8 +2009,26 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 !myds_server_send_all(client_fd, initial, strlen(initial))) {
                 sctx.cancel_flag = 1;
             }
+            /* ── 视觉注入 ──
+             * 提示词已经拼好（含图片的占位块），把该块的逐位置向量交给引擎。
+             * ★ 注入必须在 generate 之前，且下一次请求会自行覆盖/清除 ——
+             *   否则第二个请求会用到上一张图的向量。 */
+            if (img_sink.have) {
+                const int64_t off = myds_vjob_token_offset(ctx, prompt);
+                if (off < 0) {
+                    MYDS_LOG_E("[%s:%d] 图片占位块在提示词里找不到，拒绝本次请求（宁可报错也不要错位注入）",
+                               client_ip, client_port);
+                    myds_vjob_plan_free(&img_sink.plan);
+                    send_response(client_fd, 400, "Bad Request", "application/json",
+                                  "{\"error\":{\"message\":\"image placeholder missing from rendered prompt\"}}");
+                    free(req_buf); free(prompt); close(client_fd); return;
+                }
+                myds_context_set_image_embeddings(ctx, (uint32_t)off, img_sink.plan.token_count,
+                                                  img_sink.plan.block, img_sink.plan.dim);
+            }
             int generated = myds_generate_bytes_ex(ctx, prompt, myds_server_sse_callback, &sctx,
                                                    &stop_reason, &prompt_tokens, &sctx.cancel_flag);
+            if (img_sink.have) { myds_context_clear_image_embeddings(ctx); myds_vjob_plan_free(&img_sink.plan); }
             if (generated && !sctx.cancel_flag) (void)myds_server_sse_finish(&sctx);
             if (generated && !sctx.failed) resp_id_register(resp_id);   /* 状态已停在本次序列末尾 */
             final_tokens = sctx.token_count;
@@ -1993,8 +2106,21 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             free(sctx.acc); sctx.acc = NULL;   /* 每请求一份累积缓冲，必须释放 */
         } else {
             myds_non_stream_ctx_t ns = {.client_fd = client_fd};
+            if (img_sink.have) {
+                const int64_t off = myds_vjob_token_offset(ctx, prompt);
+                if (off < 0) {
+                    MYDS_LOG_E("[%s:%d] 图片占位块在提示词里找不到，拒绝本次请求", client_ip, client_port);
+                    myds_vjob_plan_free(&img_sink.plan);
+                    send_response(client_fd, 400, "Bad Request", "application/json",
+                                  "{\"error\":{\"message\":\"image placeholder missing from rendered prompt\"}}");
+                    free(req_buf); free(prompt); close(client_fd); return;
+                }
+                myds_context_set_image_embeddings(ctx, (uint32_t)off, img_sink.plan.token_count,
+                                                  img_sink.plan.block, img_sink.plan.dim);
+            }
             int generated = myds_generate_bytes_ex(ctx, prompt, myds_server_non_stream_callback, &ns,
                                                    &stop_reason, &prompt_tokens, &ns.cancel_flag);
+            if (img_sink.have) { myds_context_clear_image_embeddings(ctx); myds_vjob_plan_free(&img_sink.plan); }
             if (generated && !ns.failed) resp_id_register(resp_id);
             final_tokens = ns.token_count;
             t_first = ns.t_first;

@@ -1,5 +1,6 @@
 #include "myds.h"
 #include "myds_server.h"
+#include "myds_vjob.h"
 #include "myds_log.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +17,7 @@ static void print_usage(const char *prog) {
     printf("  --port <port>           Run HTTP server on specified port\n");
     printf("  --host <host>           Host to listen on (default: 0.0.0.0)\n");
     printf("  --alias <name>          Model alias for API responses (default: myds)\n");
+    printf("  --vision <file>         Vision encoder GGUF (enables image input; omit = text only)\n");
     printf("  -p, --prompt <string>   Prompt string (if omitted and no --port, starts interactive chat)\n");
     printf("  -n, --max-tokens <int>  Max tokens to generate (default: 256)\n");
     printf("  -c, --ctx, --ctx-size   Context window size (default: 4096)\n");
@@ -61,6 +63,7 @@ int main(int argc, char *argv[]) {
     const char *prompt = NULL;
     const char *host = "0.0.0.0";
     const char *alias = "myds";
+    const char *vision_path = NULL;
     int port = 0;
     bool print_tokens = false;
 
@@ -83,6 +86,8 @@ int main(int argc, char *argv[]) {
             host = argv[++i];
         } else if (strcmp(argv[i], "--alias") == 0 && i + 1 < argc) {
             alias = argv[++i];
+        } else if (strcmp(argv[i], "--vision") == 0 && i + 1 < argc) {
+            vision_path = argv[++i];
         } else if ((strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--prompt") == 0) && i + 1 < argc) {
             prompt = argv[++i];
         } else if (strcmp(argv[i], "--prompt-file") == 0 && i + 1 < argc) {
@@ -156,6 +161,16 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     MYDS_LOG_I("Inference context initialized");
+
+    /* 视觉编码器（可选）。★ 初始化失败【不致命】—— 服务照常起，只是不接受图片。
+     * 这样配置写错一个路径不会把整个服务拖down；错误在日志里说清楚。 */
+    if (vision_path) {
+        if (!myds_vjob_init(ctx, vision_path)) {
+            MYDS_LOG_E("视觉编码器初始化失败（%s）—— 本次以【纯文本】模式运行", vision_path);
+        } else {
+            MYDS_LOG_I("多模态已启用：接受 input_image（image_url 需为 data: base64 URL）");
+        }
+    }
 
     if (port > 0) {
         /* HTTP Server Mode for Fleet deployment */
