@@ -49,6 +49,23 @@ struct myds_v41_model {
     float hc_eps;
 };
 
+/* ── 前缀快照 ──
+ * 引擎里唯一【无法从「按位置索引」重建】的状态有两样：
+ *   · 窗口环（每层 128 槽）—— raw KV 只存在这里，而它只保留【最后 128 个位置】；
+ *   · engram 的滚动 tail[3] —— 且它在【层循环之前】就已被推到 prompt 末尾。
+ * 压缩 KV 与 index cache 都是按位置累积的，续跑时直接用，因此不入快照。
+ * 窗口环事后无法回溯（已被后续 token 覆盖）⇒ 必须在 prefill【经过】该位置时就存下来。
+ * 槽位用确定性映射（P/STRIDE % SLOTS）：engram 循环与层循环各自独立写入，
+ * 但映射与覆盖顺序一致 ⇒ 同一槽里的 engram 与各层窗口环必然对应同一个 P。
+ * ds4 的对应机制见 ds4_kvstore.c: boundary_trim/align + find_text_prefix（默认 trim=32/align=2048）。 */
+#define V41_SNAP_SLOTS   8u
+/* 快照点必须是 chunk 边界；512 同时满足 ratio(2)/32 键块的对齐要求。
+ * ★ 它还是【偶数】这一点是承重的：压缩器的 pool2 跨位置有状态（previous_kv/previous_score），
+ *   但只在【奇数】位置被读取 —— 从偶数位置续跑时它先被本位置覆盖，因此无需进快照。
+ *   若将来把 STRIDE 改成奇数，就必须把这些 previous_* 一并纳入快照。 */
+#define V41_SNAP_STRIDE  512u
+#define V41_SNAP_MIN     1024u  /* 太短的点不值一份窗口环；保留最近 SLOTS 个点 */
+
 struct myds_v41_context {
     myds_engram_t *engram;
     myds_v41_gpu_scratch_t *gpu;
@@ -58,6 +75,11 @@ struct myds_v41_context {
     myds_metal_buffer_t *attn_split, *ffn_split, *pre;
     myds_metal_buffer_t *engram_rows[2], *engram_kv;
     myds_metal_buffer_t *window[V41_LAYERS];
+    /* 快照：每槽把 V41_LAYERS 层的窗口环连续存放（40 x 256 KB = 10.5 MB/槽） */
+    myds_metal_buffer_t *snap_window[V41_SNAP_SLOTS];
+    uint32_t              snap_pos[V41_SNAP_SLOTS];      /* 0 = 空槽 */
+    myds_engram_history_t snap_engram[V41_SNAP_SLOTS];
+    bool                  snap_enabled;
     myds_metal_buffer_t *compressed[4], *index_cache[4];
     myds_metal_buffer_t *previous_kv[4], *previous_score[4];
     myds_metal_buffer_t *pool_kv, *pool_score, *latent;
@@ -65,6 +87,95 @@ struct myds_v41_context {
     myds_metal_buffer_t *selected, *selected_kv;
     myds_metal_buffer_t *block_scores, *block_selected, *block_mask;
 };
+
+/* 每次请求开始前清掉【本次会失效】的点：只保留位置 <= keep_up_to 的。
+ *
+ * 判据是「本次请求从哪里开始写」：本次只写 [keep_up_to, ...)，因此比 keep_up_to 更早的位置
+ * 其窗口环（[S-128, S-1] ⊆ [.., keep_up_to-1]）与压缩 KV 都【不会被本次触碰】⇒ 那些点仍然有效。
+ * 反过来 keep_up_to 之后的点必须清掉：它们的窗口环已被后续 token 覆盖。
+ * keep_up_to == 0（全量 prefill）时等于全清，与之前的行为一致。
+ *
+ * 清空全部是错的：实测第 2 次命中 6144 之后，第 3 次的公共前缀只到 6153（不到末尾 6162），
+ * 唯一能用的就是被清掉的那个 6144，于是又退回全量 20 秒。 */
+void myds_v41_snapshot_clear(myds_v41_context_t *g, uint32_t keep_up_to) {
+    if (!g) return;
+    for (uint32_t s = 0; s < V41_SNAP_SLOTS; ++s)
+        if (g->snap_pos[s] > keep_up_to) g->snap_pos[s] = 0;
+}
+
+/* 槽 0 专供「本次序列的末尾」。理由：续跑常常只推进很少的 token（比如兄弟请求之间），
+ * 那种情况下序列末尾【不会】落在 512 的对齐点上，于是本次请求结束后槽里没有有效点，
+ * 下一个兄弟请求又要全量重跑 —— 实测就是这样退化的（第 2 次命中 40x，第 3 次全量）。
+ * 末尾点恰好是「下一个兄弟请求最可能用到的」那一个，所以给它一个固定槽、每次覆盖。 */
+static uint32_t snapshot_slot_for(uint32_t p, bool is_last) {
+    if (is_last) return 0;
+    return 1u + (p / V41_SNAP_STRIDE) % (V41_SNAP_SLOTS - 1u);
+}
+/* 处理完位置 p 之后，记下 engram 的滚动状态。在 engram 循环里调用（层循环之前）。 */
+static void snapshot_store_engram(myds_v41_context_t *g, uint32_t p, bool is_last) {
+    if (!g->snap_enabled || p < V41_SNAP_MIN) return;
+    if (!is_last && (p % V41_SNAP_STRIDE)) return;
+    const uint32_t s = snapshot_slot_for(p, is_last);
+    g->snap_pos[s] = p;
+    g->snap_engram[s] = g->engram->history;
+}
+/* 在层循环里、每个 chunk 结束时调用：把【本层】在 p 处的窗口环存进对应槽。
+ * snap_pos 里此时是 engram 侧跑完整段后的【最终】映射 ⇒ 若该槽已属于别的 p（被环形覆盖），
+ * 这里直接跳过。这既丢弃了过期点，又保证同一槽里的 engram 与窗口环必属同一个 p。 */
+static bool snapshot_store_window(myds_v41_context_t *g, uint32_t il, uint32_t p, bool is_last) {
+    if (!g->snap_enabled || p < V41_SNAP_MIN) return true;
+    if (!is_last && (p % V41_SNAP_STRIDE)) return true;
+    const uint32_t s = snapshot_slot_for(p, is_last);
+    if (g->snap_pos[s] != p) return true;
+    const size_t bytes = (size_t)V41_WINDOW * V41_HEAD_DIM * 4u;
+    return myds_metal_buffer_copy(g->snap_window[s], (size_t)il * bytes, g->window[il], 0, bytes);
+}
+/* prefill 结束后由引擎调用：把【当前状态】存进末尾槽（0 号）。
+ * 为什么必须由引擎显式调一次：续跑点常常正好是上一条序列的末尾，此时 prefill 要跑的 token 数为 0，
+ * 保存点那两处（engram 循环 / chunk 循环）【根本不会执行】⇒ 本次请求结束时不留下任何可复用点，
+ * 下一个兄弟请求又退化成全量（实测：第 2 次命中 420x，第 3 次却全量，就是这个原因）。 */
+bool myds_v41_snapshot_store_now(myds_v41_context_t *g, uint32_t p) {
+    if (!g || !g->snap_enabled || !p || p < V41_SNAP_MIN) return true;
+    g->snap_pos[0] = p;
+    g->snap_engram[0] = g->engram->history;   /* engram 的 position 恒等于 p（每 token 推进一次） */
+    const size_t bytes = (size_t)V41_WINDOW * V41_HEAD_DIM * 4u;
+    for (uint32_t il = 0; il < V41_LAYERS; ++il)
+        if (!myds_metal_buffer_copy(g->snap_window[0], (size_t)il * bytes, g->window[il], 0, bytes))
+            return false;
+    return true;
+}
+
+/* 在 [0, common] 内选最大的快照点 */
+uint32_t myds_v41_snapshot_best(const myds_v41_context_t *g, uint32_t common) {
+    if (!g->snap_enabled) return 0;
+    uint32_t best = 0;
+    for (uint32_t s = 0; s < V41_SNAP_SLOTS; ++s)
+        if (g->snap_pos[s] && g->snap_pos[s] <= common && g->snap_pos[s] > best) best = g->snap_pos[s];
+    return best;
+}
+/* 把某点的【全部】状态装回去：engram tail + 各层窗口环（carry 随后由 carry_stage 从窗口环重建） */
+bool myds_v41_snapshot_restore(myds_v41_context_t *g, uint32_t p) {
+    for (uint32_t s = 0; s < V41_SNAP_SLOTS; ++s) {
+        if (g->snap_pos[s] != p) continue;
+        g->engram->history = g->snap_engram[s];
+        /* engram 自己还有一个位置游标（prepare_token 要求 position == e->position），
+         * 拨回状态就必须把游标一起拨回，否则续跑的第一个 token 就会被拒。 */
+        g->engram->position = p;
+        const size_t bytes = (size_t)V41_WINDOW * V41_HEAD_DIM * 4u;
+        for (uint32_t il = 0; il < V41_LAYERS; ++il)
+            if (!myds_metal_buffer_copy(g->window[il], 0, g->snap_window[s], (size_t)il * bytes, bytes))
+                return false;
+        /* ★ 位置游标也必须一起回退。逐 token 路径（myds_v41_forward）与批处理路径都断言
+         * 「pos == next_position」—— 状态是滚动推进的，这个断言保护的是「状态与位置一致」。
+         * 快照把状态拨回 p，游标就必须跟着拨回 p，否则断言会拦下续跑
+         * （实测：第 1 轮跑到 6172，第 2 轮从快照 6144 起 ⇒ 报
+         *  "expected consecutive token position 6172, received 6144" 而整段失败）。 */
+        g->next_position = p;
+        g->valid = true;
+        return true;
+    }
+    return false;
+}
 
 static uint32_t ratio_for(uint32_t l) { return l < 2 ? 0 : l < 20 ? 2 : 1; }
 static uint32_t owner_for(uint32_t l) { return l < 8 ? 0 : l < 14 ? 1 : l < 20 ? 2 : 3; }
@@ -245,6 +356,8 @@ myds_v41_context_t *myds_v41_context_create(myds_context_t *ctx) {
     A(engram_rows[0],MYDS_ENGRAM_INPUT_DIM); A(engram_rows[1],MYDS_ENGRAM_INPUT_DIM);
     A(engram_kv,5*V41_DIM);
     for (uint32_t i=0;i<V41_LAYERS;i++) A(window[i],V41_WINDOW*V41_HEAD_DIM);
+    for (uint32_t si=0;si<V41_SNAP_SLOTS;si++) A(snap_window[si],V41_LAYERS*V41_WINDOW*V41_HEAD_DIM);
+    g->snap_enabled=getenv("MYDS_NO_PREFIX_SNAPSHOT")==NULL;
     for (uint32_t i=0;i<4;i++) {
         const size_t rows=i==3 ? g->capacity : (g->capacity+1u)/2u;
         A(compressed[i],rows*512); A(index_cache[i],rows*128);
@@ -268,6 +381,7 @@ void myds_v41_context_free(myds_v41_context_t *g) {
     F(residual); F(after_attn); F(flat_norm); F(mix); F(attn_split); F(ffn_split); F(pre);
     F(engram_rows[0]); F(engram_rows[1]); F(engram_kv);
     for (uint32_t i=0;i<V41_LAYERS;i++) F(window[i]);
+    for (uint32_t si=0;si<V41_SNAP_SLOTS;si++) F(snap_window[si]);
     for (uint32_t i=0;i<4;i++) { F(compressed[i]); F(index_cache[i]); F(previous_kv[i]); F(previous_score[i]); }
     F(pool_kv); F(pool_score); F(latent); F(index_k); F(index_q); F(index_weights);
     F(index_scores); F(selected); F(selected_kv); F(block_scores); F(block_selected); F(block_mask);
@@ -1215,6 +1329,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             MYDS_LOG_E("V4.1 engram prepare failed at pos %u", pos);
             goto fail;
         }
+        snapshot_store_engram(g, pos + 1u, (t + 1u) == n_tokens);   /* 处理完 pos ⇒ 已推进到 pos+1 */
         memcpy(engram_all[0] + (size_t)t * MYDS_ENGRAM_INPUT_DIM,
                g->engram->row_values[0], MYDS_ENGRAM_INPUT_DIM * sizeof(float));
         memcpy(engram_all[1] + (size_t)t * MYDS_ENGRAM_INPUT_DIM,
@@ -1789,6 +1904,13 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     }
                 }
                 moe_off = 0;
+            }
+            /* ★ 前缀快照：本层在本 chunk 结束处的窗口环。此刻它正好含 [p-128, p-1]，
+             * 而这 128 槽随后会被后面的 token 覆盖 ⇒ 只能在这里存下来（事后无法回溯）。
+             * 与 engram 的保存用同一个确定性槽位映射，故两者必然属于同一个 p。 */
+            {
+                const uint32_t sp = base_pos + c_start + c_len;
+                if (!snapshot_store_window(g, il, sp, sp == base_pos + n_tokens)) goto fail;
             }
             TIME_ACC(prof_step8);
 

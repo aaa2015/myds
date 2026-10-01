@@ -2,6 +2,7 @@
 #include "myds_metal.h"
 #include "myds_gguf.h"
 #include "myds_tokenizer.h"
+#include "myds_v41.h"
 #include "myds_log.h"
 #include "myds_cpu.h"
 
@@ -2801,40 +2802,51 @@ static int myds_generate_internal(myds_context_t *ctx,
             const char *e = getenv("MYDS_PREFIX_CACHE");
             pcache_on = (e && atoi(e) != 0) ? 1 : 0;
         }
-        /* ★ 每一次都【必须说话】。此前被跳过的情形一行日志都不打，于是「为什么这轮没省下来」
-         * 只能靠读代码去猜 —— 我今天就被这坑到：看到 0 条 prefix cache 行才反应过来判断压根没进。
-         * 一个优化不生效时，沉默是最贵的输出。 */
+        bool snap_hit = false;
+        uint32_t L = 0;                    /* 与【上一条请求序列】的公共前缀长度 */
+        const bool have_prev = pcache_on && ctx->pcache_tokens && ctx->pcache_len;
+        if (have_prev)
+            while (L < ctx->pcache_len && ctx->pcache_tokens[L] == prompt_tokens[L]) L++;
+
+        /* ★ 每一次都【必须说话】：一个优化不生效时，沉默是最贵的输出。 */
         if (!pcache_on) {
             MYDS_LOG_I("prefix cache: off (MYDS_PREFIX_CACHE=0)");
-        } else if (!ctx->pcache_tokens || !ctx->pcache_len) {
+        } else if (!have_prev) {
             MYDS_LOG_I("prefix cache: nothing cached yet (this is the first request)");
-        } else if ((uint32_t)n_prompt <= ctx->pcache_len) {
-            /* 常见于「客户端把每次提问当成全新对话，只带系统提示词」：新提示词比缓存序列还短，
-             * 不可能是续写 ⇒ 整段重跑。这是当前设计【最贵】的一种 miss，必须点名。 */
-            MYDS_LOG_I("prefix cache: skipped - prompt %d tok is not longer than the cached %u "
-                       "(not a continuation: a new conversation sharing only the system prompt?)",
-                       n_prompt, ctx->pcache_len);
-        }
-        if (pcache_on && ctx->pcache_tokens && ctx->pcache_len &&
-            (uint32_t)n_prompt > ctx->pcache_len) {
-            uint32_t L = 0;
-            while (L < ctx->pcache_len && ctx->pcache_tokens[L] == prompt_tokens[L]) L++;
-            if (L == ctx->pcache_len) {
-                resume_from = L;
+        } else if (L == ctx->pcache_len && (uint32_t)n_prompt > ctx->pcache_len) {
+            resume_from = L;               /* 严格续写：上一条的整段都是新提示词的前缀 */
+            MYDS_LOG_I("prefix cache: prompt %d tok, cached %u, common prefix %u -> resume from cached prefix",
+                       n_prompt, ctx->pcache_len, L);
+        } else if (L) {
+            /* 不是续写，但公共前缀可能覆盖到某个【快照点】。窗口环只有 128 槽、事后无法回溯，
+             * 所以 prefill 经过边界时就把状态存了下来 ⇒ 从那里续跑。
+             * 典型场景：客户端每次提问都当新对话，只带系统提示词与工具定义（兄弟请求）。 */
+            uint32_t snap = ctx->v41 ? myds_v41_snapshot_best(ctx->v41, L) : 0;
+            if (snap) {
+                resume_from = snap; snap_hit = true;
+                MYDS_LOG_I("prefix cache: prompt %d tok, cached %u, common prefix %u -> resume from snapshot "
+                           "at %u (reuse %u tok, still to prefill %u)",
+                           n_prompt, ctx->pcache_len, L, snap, snap, (uint32_t)n_prompt - 1u - snap);
             } else {
-                /* 有公共前缀但不足整段（短于缓存序列）⇒ 用不上。这里的公共前缀大小【恰好暴露
-                 * 能省多少】：它基本等于客户端每次重发的系统提示词长度。 */
-                MYDS_LOG_I("prefix cache: skipped - common prefix %u of cached %u tokens "
-                           "(resumable only when it is the whole cached sequence)", L, ctx->pcache_len);
+                MYDS_LOG_I("prefix cache: skipped - common prefix %u of cached %u, but no snapshot within it "
+                           "(the state cannot be rewound, so this restarts from 0)", L, ctx->pcache_len);
             }
-            MYDS_LOG_I("prefix cache: prompt %d tok, cached %u, common prefix %u -> %s%s",
-                       n_prompt, ctx->pcache_len, L,
-                       resume_from ? "resume from " : "full prefill",
-                       resume_from ? "cached prefix" : "");
-            /* 复用要求【严格续写】。一旦失配，唯一有用的问题是「在第几个 token 分叉、
-             * 两边分别是什么」——否则只能猜是渲染差异还是 token 往返差异。
-             * 这里把分歧点两侧各 3 个 token（id + 转义后的文本）打出来。 */
-            if (resume_from == 0) {
+        } else {
+            MYDS_LOG_I("prefix cache: skipped - no common prefix with the cached %u tokens", ctx->pcache_len);
+        }
+
+        /* 快照续跑必须把状态装回去（engram tail + 各层窗口环）；装不回去就退回全量。 */
+        if (snap_hit && (!ctx->v41 || !myds_v41_snapshot_restore(ctx->v41, resume_from))) {
+            MYDS_LOG_W("prefix cache: snapshot restore at %u failed -> full prefill", resume_from);
+            resume_from = 0;
+        }
+        /* 清空：本次 prefill 会重建属于【本次序列】的点。否则可能用到「已被后续请求改写过的
+         * 压缩 KV」所对应的旧点，把续跑接在错误的状态上。 */
+        if (ctx->v41) myds_v41_snapshot_clear(ctx->v41, resume_from);
+
+        /* 失配诊断：一旦没能复用，唯一有用的问题是「在第几个 token 分叉、两边分别是什么」。 */
+        if (have_prev && resume_from == 0 && L < ctx->pcache_len) {
+            {
                 char why[640];
                 size_t o = 0;
                 #define APPEND_TOK(TAG, ARR, IDX)                                            \
@@ -2917,6 +2929,9 @@ static int myds_generate_internal(myds_context_t *ctx,
             return 0;
         }
     }
+    /* 记下 prefill 末尾的状态，供下一个只共享前缀的请求续跑（续跑点为 0 token 时，
+     * prefill 里的保存点不会执行，所以必须在这里显式存一次）。 */
+    if (ctx->v41) (void)myds_v41_snapshot_store_now(ctx->v41, (uint32_t)n_prompt - 1u);
     cur_token = prompt_tokens[n_prompt - 1];
     free(prompt_tokens);
 
