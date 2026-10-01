@@ -35,9 +35,10 @@ struct myds_v41_gpu_scratch {
     myds_metal_buffer_t *sort_a, *sort_b, *kv_f16, *mask, *pad, *partial;
     myds_metal_buffer_t *sv_view, *dv_view;
     /* 批量 indexer（prefill Step 4）的临时缓冲：分数表、top-k 的中间排序结果两份、
-     * 块分数、块选择结果。每个都是 MYDS_V41_INDEXER_BATCH_FLOATS 个 float（或等
+     * 块分数、块选择结果。每个都是 batch_floats 个 float（或等
      * 字节数的 int），由调用方按“组内 token 数 × 本组最大压缩键数 ≤ 预算”切组。
      * 放在 scratch 里（而不是每次 prefill 分配）只是为了所有权清楚、不引入新的失败点。 */
+    uint32_t batch_floats;
     myds_metal_buffer_t *chunk_scores, *chunk_tmp_a, *chunk_tmp_b, *chunk_blocks, *chunk_block_sel;
     /* Chunked prefill works on one f16 slab and one mask row block for a whole
      * chunk, because a per-token staging and a per-token attention dispatch are
@@ -101,11 +102,22 @@ myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp) {
     s->dv_view=myds_metal_buffer_create_view();
     s->kv_chunk=myds_metal_buffer_alloc((size_t)s->slab_rows*512u*2u);
     s->mask_chunk=myds_metal_buffer_alloc((size_t)MYDS_CHUNK_MAXC*s->mask_u16*2u);
-    s->chunk_scores=myds_metal_buffer_alloc((size_t)MYDS_V41_INDEXER_BATCH_FLOATS*4u);
-    s->chunk_tmp_a=myds_metal_buffer_alloc((size_t)MYDS_V41_INDEXER_BATCH_FLOATS*4u);
-    s->chunk_tmp_b=myds_metal_buffer_alloc((size_t)MYDS_V41_INDEXER_BATCH_FLOATS*4u);
-    s->chunk_blocks=myds_metal_buffer_alloc((size_t)MYDS_V41_INDEXER_BATCH_FLOATS*4u);
-    s->chunk_block_sel=myds_metal_buffer_alloc((size_t)MYDS_V41_INDEXER_BATCH_FLOATS*4u);
+    uint32_t batch_floats = MYDS_V41_INDEXER_BATCH_FLOATS;
+    const char *ib_env = getenv("MYDS_INDEXER_BATCH_FLOATS");
+    if (ib_env) {
+        long v = atol(ib_env);
+        if (v >= 65536 && v <= 16777216) batch_floats = (uint32_t)v;
+    } else if (max_comp > 32768u) {
+        uint64_t target = (uint64_t)max_comp * 8ull;
+        if (target > 2097152ull) target = 2097152ull;
+        if (target > (uint64_t)batch_floats) batch_floats = (uint32_t)target;
+    }
+    s->batch_floats = batch_floats;
+    s->chunk_scores=myds_metal_buffer_alloc((size_t)s->batch_floats*4u);
+    s->chunk_tmp_a=myds_metal_buffer_alloc((size_t)s->batch_floats*4u);
+    s->chunk_tmp_b=myds_metal_buffer_alloc((size_t)s->batch_floats*4u);
+    s->chunk_blocks=myds_metal_buffer_alloc((size_t)s->batch_floats*4u);
+    s->chunk_block_sel=myds_metal_buffer_alloc((size_t)s->batch_floats*4u);
     if(!s->sort_a||!s->sort_b||!s->kv_f16||!s->mask||!s->pad||!s->partial||!s->sv_view||!s->dv_view||
        !s->kv_chunk||!s->mask_chunk||!s->chunk_scores||!s->chunk_tmp_a||!s->chunk_tmp_b||
        !s->chunk_blocks||!s->chunk_block_sel){myds_v41_gpu_scratch_free(s);return NULL;}
@@ -136,9 +148,12 @@ myds_metal_buffer_t *myds_v41_gpu_indexer_blocks(const myds_v41_gpu_scratch_t *s
 myds_metal_buffer_t *myds_v41_gpu_indexer_block_selected(const myds_v41_gpu_scratch_t *s) {
     return s?s->chunk_block_sel:NULL;
 }
+uint32_t myds_v41_gpu_indexer_batch_floats(const myds_v41_gpu_scratch_t *s) {
+    return s ? s->batch_floats : MYDS_V41_INDEXER_BATCH_FLOATS;
+}
 uint32_t myds_v41_gpu_indexer_batch_rows(const myds_v41_gpu_scratch_t *s,uint32_t n_comp) {
     if(!s||!n_comp)return 0;
-    uint32_t rows=(uint32_t)(MYDS_V41_INDEXER_BATCH_FLOATS/n_comp);
+    uint32_t rows=(uint32_t)(s->batch_floats/n_comp);
     if(rows>MYDS_CHUNK_MAXC)rows=MYDS_CHUNK_MAXC;
     return rows;
 }
@@ -344,7 +359,7 @@ static int topk_rows_causal(myds_metal_buffer_t *ids,const myds_metal_buffer_t *
     myds_metal_buffer_t *tmp_b=causal_ratio?s->chunk_tmp_b:s->sort_b;
     if(!tmp_a||!tmp_b)return 0;
     if(causal_ratio) {
-        if((uint64_t)n_rows*layout>(uint64_t)MYDS_V41_INDEXER_BATCH_FLOATS)return 0;
+        if((uint64_t)n_rows*layout>(uint64_t)s->batch_floats)return 0;
     } else if(n_cols>s->max_comp||(uint64_t)n_rows*work>(uint64_t)s->max_comp||!n_rows)return 0;
     struct sort_args a={.ne00=n_cols,.ne01=n_rows,.ne02=1,.ne03=1,.nb00=4,
         .nb01=(uint64_t)n_cols*4,.nb02=(uint64_t)n_cols*n_rows*4,.nb03=(uint64_t)n_cols*n_rows*4,

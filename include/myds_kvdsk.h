@@ -71,6 +71,8 @@ bool myds_kvdsk_read_start(myds_kvdsk_t *k, uint32_t slot, uint64_t *used_bytes)
 bool myds_kvdsk_read_chunk(myds_kvdsk_t *k, uint64_t offset, void *dst, uint64_t bytes);
 /* 校验 CRC。不符 ⇒ 把该槽置空并返回 false（调用方必须丢弃本次恢复）。 */
 bool myds_kvdsk_read_finish(myds_kvdsk_t *k);
+/* 显式终止读事务（遇到语义校验失败等外部错误时调用，避免读事务状态泄漏）。 */
+void myds_kvdsk_read_abort(myds_kvdsk_t *k);
 
 /* ── 流式写 ── */
 bool myds_kvdsk_write_start(myds_kvdsk_t *k, uint32_t slot);

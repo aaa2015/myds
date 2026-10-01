@@ -203,16 +203,19 @@ start_server "$LOG_C" || exit 1
 note "服务已起（pid $SRV_PID，用同一份磁盘缓存）"
 ask "$PREFIX_FILE"  "Reply with the vault code only." /tmp/low_kv_gate_alt1.txt | sed 's/^/    P1 /'
 ask "$PREFIX2_FILE" "Reply with the vault code only." /tmp/low_kv_gate_alt2.txt | sed 's/^/    P2 /'
+_HITS_BEFORE=$(grep -c "resume from DISK snapshot" "$LOG_C" 2>/dev/null || true)
 ask "$PREFIX_FILE"  "Reply with the vault code only." /tmp/low_kv_gate_alt3.txt | sed 's/^/    P1 /'
+_HITS_AFTER=$(grep -c "resume from DISK snapshot" "$LOG_C" 2>/dev/null || true)
+_HITS_DELTA=$(( ${_HITS_AFTER:-0} - ${_HITS_BEFORE:-0} ))
+
 if grep -qF "CRIMSONOTTER9" /tmp/low_kv_gate_alt1.txt; then ok "P1 回答正确"; else fail "P1 回答不对"; fi
 if grep -qF "AMBERFALCON4" /tmp/low_kv_gate_alt2.txt; then ok "P2 回答正确"; else fail "P2 回答不对"; fi
 # 第三次（回到 P1）必须命中磁盘 —— 这是「P1 的条目没被 P2 顶掉」的直接证据
-_HIT_BEFORE=$(grep -c "resume from DISK snapshot" "$LOG_C" || true)
-if grep -q "resume from DISK snapshot" "$LOG_C" && [ "${_HIT_BEFORE:-0}" -ge 1 ]; then
-    ok "第三次回到 P1 时命中了磁盘（P1 的条目仍在）"
-    grep -m2 "resume from DISK snapshot" "$LOG_C" | sed 's/^/    /'
+if [ "$_HITS_DELTA" -ge 1 ]; then
+    ok "第三次回到 P1 时精准命中了磁盘（P1 的条目仍在，本轮新增命中 $_HITS_DELTA 次）"
+    grep "resume from DISK snapshot" "$LOG_C" | tail -n "$_HITS_DELTA" | sed 's/^/    /'
 else
-    fail "P1 的条目被 P2 顶掉了（第三次没有磁盘命中）—— way 机制没生效"
+    fail "P1 的条目被 P2 顶掉了（第三次请求没有产生新的磁盘命中，delta=$_HITS_DELTA）—— way 机制没生效"
     grep -E "prefix cache:|kvdisk:" "$LOG_C" | tail -4 | sed 's/^/    /'
 fi
 # P2 也必须被存下来（不是只有 P1 能享受）

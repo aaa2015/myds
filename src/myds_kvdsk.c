@@ -284,6 +284,11 @@ bool myds_kvdsk_read_finish(myds_kvdsk_t *k) {
     return true;
 }
 
+void myds_kvdsk_read_abort(myds_kvdsk_t *k) {
+    if (!k || !k->reading) return;
+    k->reading = 0;
+}
+
 /* ── 写事务 ── */
 bool myds_kvdsk_write_start(myds_kvdsk_t *k, uint32_t slot) {
     if (!k || slot >= k->slots || k->reading || k->writing) return false;

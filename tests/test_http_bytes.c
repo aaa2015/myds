@@ -10,6 +10,32 @@ static unsigned generation_calls;
 myds_config_t myds_context_get_config(const myds_context_t *ctx) { (void)ctx; return config; }
 void myds_context_set_config(myds_context_t *ctx, const myds_config_t *cfg) { (void)ctx; config = *cfg; }
 void myds_log(myds_log_level_t level, const char *fmt, ...) { (void)level; (void)fmt; }
+void myds_context_add_image_embeddings(myds_context_t *ctx, uint32_t start_pos,
+                                       uint32_t count, const float *data, uint32_t dim,
+                                       uint32_t image_token_id) {
+    (void)ctx; (void)start_pos; (void)count; (void)data; (void)dim; (void)image_token_id;
+}
+void myds_context_clear_image_embeddings(myds_context_t *ctx) { (void)ctx; }
+void myds_last_prefill_stats(const myds_context_t *ctx, myds_prefill_stats_t *out) {
+    (void)ctx;
+    if (out) memset(out, 0, sizeof(*out));
+}
+void myds_set_continue_from_cache(myds_context_t *ctx, bool enable) { (void)ctx; (void)enable; }
+const char *myds_vjob_placeholder(void) { return "<|image_pad|>"; }
+uint32_t myds_vjob_image_token_id(void) { return 0; }
+int myds_vjob_sink_add(myds_vjob_sink_t *sink, const uint8_t *encoded, size_t len,
+                       char *error, size_t error_cap) {
+    (void)sink; (void)encoded; (void)len; (void)error; (void)error_cap;
+    return 1;
+}
+void myds_vjob_sink_free(myds_vjob_sink_t *sink) {
+    if (sink) memset(sink, 0, sizeof(*sink));
+}
+int64_t myds_vjob_token_offset_at(myds_context_t *ctx, const char *prompt_base,
+                                  const char *needle) {
+    (void)ctx; (void)prompt_base; (void)needle;
+    return 0;
+}
 int myds_generate_bytes_ex(myds_context_t *ctx, const char *prompt, myds_stream_bytes_callback_t cb, void *data, myds_stop_reason_t *reason, uint32_t *n_prompt, volatile int *cancel) {
     (void)ctx; (void)prompt;
     generation_calls++;

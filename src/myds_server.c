@@ -22,6 +22,122 @@ static volatile sig_atomic_t g_running = 1;
 static int g_server_fd = -1;
 static pthread_mutex_t g_infer_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* ── 推理请求 FIFO 队列与背压保护 ──
+ * 单槽推理引擎同一时刻只能运行一个推理请求。
+ * 为避免多并发请求无序竞争互斥锁或长期阻塞占用连接与线程池，实现显式 FIFO 队列与背压：
+ * - 超过最大排队深度 (MYDS_MAX_QUEUE_DEPTH, 默认 32) 时立即返回 HTTP 503 (Server Busy)。
+ * - 排队等待超时 (MYDS_QUEUE_TIMEOUT_MS, 默认 60000ms) 时返回 HTTP 503 (Queue Timeout)。
+ * - 退出时按先来先到顺序依次唤醒，保证无饥饿。 */
+typedef struct infer_waiter {
+    pthread_cond_t cond;
+    bool granted;
+    bool cancelled;
+    struct infer_waiter *next;
+} infer_waiter_t;
+
+static pthread_mutex_t g_queue_lock = PTHREAD_MUTEX_INITIALIZER;
+static infer_waiter_t *g_queue_head = NULL;
+static infer_waiter_t *g_queue_tail = NULL;
+static uint32_t g_queue_count = 0;
+static bool g_infer_busy = false;
+
+static int server_acquire_infer_slot(int timeout_ms, int max_depth) {
+    pthread_mutex_lock(&g_queue_lock);
+    if (!g_infer_busy && g_queue_count == 0) {
+        g_infer_busy = true;
+        pthread_mutex_unlock(&g_queue_lock);
+        return 0;
+    }
+    if (max_depth > 0 && (int)g_queue_count >= max_depth) {
+        pthread_mutex_unlock(&g_queue_lock);
+        return -1; /* queue full */
+    }
+
+    infer_waiter_t w;
+    pthread_cond_init(&w.cond, NULL);
+    w.granted = false;
+    w.cancelled = false;
+    w.next = NULL;
+
+    if (g_queue_tail) {
+        g_queue_tail->next = &w;
+    } else {
+        g_queue_head = &w;
+    }
+    g_queue_tail = &w;
+    g_queue_count++;
+
+    struct timespec ts;
+    if (timeout_ms > 0) {
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        ts.tv_sec = now.tv_sec + timeout_ms / 1000;
+        ts.tv_nsec = (now.tv_usec + (timeout_ms % 1000) * 1000) * 1000;
+        if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec++;
+            ts.tv_nsec -= 1000000000L;
+        }
+    }
+
+    int rc = 0;
+    while (!w.granted && !w.cancelled && g_running) {
+        if (timeout_ms > 0) {
+            rc = pthread_cond_timedwait(&w.cond, &g_queue_lock, &ts);
+            if (rc == ETIMEDOUT && !w.granted) {
+                w.cancelled = true;
+                break;
+            }
+        } else {
+            pthread_cond_wait(&w.cond, &g_queue_lock);
+        }
+    }
+
+    if (w.cancelled || (!w.granted && !g_running)) {
+        infer_waiter_t **curr = &g_queue_head;
+        while (*curr) {
+            if (*curr == &w) {
+                *curr = w.next;
+                if (g_queue_tail == &w) {
+                    infer_waiter_t *prev = NULL, *p = g_queue_head;
+                    while (p) { prev = p; p = p->next; }
+                    g_queue_tail = prev;
+                }
+                g_queue_count--;
+                break;
+            }
+            curr = &(*curr)->next;
+        }
+        pthread_cond_destroy(&w.cond);
+        pthread_mutex_unlock(&g_queue_lock);
+        return -2; /* timed out or cancelled */
+    }
+
+    pthread_cond_destroy(&w.cond);
+    pthread_mutex_unlock(&g_queue_lock);
+    return 0;
+}
+
+static void server_release_infer_slot(void) {
+    pthread_mutex_lock(&g_queue_lock);
+    infer_waiter_t *w = g_queue_head;
+    while (w && w->cancelled) {
+        g_queue_head = w->next;
+        if (!g_queue_head) g_queue_tail = NULL;
+        g_queue_count--;
+        w = g_queue_head;
+    }
+    if (w) {
+        g_queue_head = w->next;
+        if (!g_queue_head) g_queue_tail = NULL;
+        g_queue_count--;
+        w->granted = true;
+        pthread_cond_signal(&w->cond);
+    } else {
+        g_infer_busy = false;
+    }
+    pthread_mutex_unlock(&g_queue_lock);
+}
+
 /* ── previous_response_id：响应 id 注册表 ──
  * Responses API 允许客户端只发【新增内容】+ 上一次响应的 id，让服务端接着那次的状态跑。
  *
@@ -2060,7 +2176,49 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                    max_tokens, temp, top_p, top_k,
                    strlen(prompt), total_read, req_has_instructions ? 1 : 0, req_has_tools ? 1 : 0);
 
+        /* 排队与背压保护 */
+        int q_timeout_ms = 60000;
+        const char *to_env = getenv("MYDS_QUEUE_TIMEOUT_MS");
+        if (to_env && to_env[0]) {
+            int v = atoi(to_env);
+            if (v >= 0) q_timeout_ms = v;
+        }
+        int max_q_depth = 32;
+        const char *qd_env = getenv("MYDS_MAX_QUEUE_DEPTH");
+        if (qd_env && qd_env[0]) {
+            int v = atoi(qd_env);
+            if (v > 0) max_q_depth = v;
+        }
+
+        int q_res = server_acquire_infer_slot(q_timeout_ms, max_q_depth);
+        if (q_res != 0) {
+            MYDS_LOG_W("[%s:%d] server reject due to %s (depth=%u, timeout=%dms)",
+                       client_ip, client_port, q_res == -1 ? "queue full" : "queue wait timeout",
+                       g_queue_count, q_timeout_ms);
+            const char *err_json = (q_res == -1)
+                ? "{\"error\":{\"message\":\"Server is at capacity (queue full); please retry later\",\"type\":\"server_error\",\"code\":\"server_busy\"}}"
+                : "{\"error\":{\"message\":\"Request timed out waiting in inference queue; please retry later\",\"type\":\"server_error\",\"code\":\"queue_timeout\"}}";
+            send_response(client_fd, 503, "Service Unavailable", "application/json", err_json);
+            myds_vjob_sink_free(&img_sink);
+            free(prompt); free(req_buf); close(client_fd); return;
+        }
+
         pthread_mutex_lock(&g_infer_mutex);
+        if (is_continuation && !resp_id_is_live(prev_id)) {
+            pthread_mutex_unlock(&g_infer_mutex);
+            server_release_infer_slot();
+            MYDS_LOG_W("[%s:%d] previous_response_id invalidated while waiting for infer lock (%s): %s",
+                       client_ip, client_port,
+                       resp_id_seen(prev_id) ? "expired" : "unknown", prev_id);
+            char err[512];
+            snprintf(err, sizeof(err),
+                     "{\"error\":{\"message\":\"previous_response_id '%s' is not the most recent response "
+                     "(this server keeps one live state); replay the full input instead\","
+                     "\"type\":\"invalid_request_error\"}}", prev_id);
+            send_response(client_fd, 400, "Bad Request", "application/json", err);
+            myds_vjob_sink_free(&img_sink);
+            free(prompt); free(req_buf); close(client_fd); return;
+        }
         if (is_continuation) myds_set_continue_from_cache(ctx, true);
 
         /* Apply request configuration overrides if provided */
@@ -2101,10 +2259,9 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             /* 视觉注入：提示词已拼好，把所有图片块的逐位置向量交给引擎。
              * ★ 必须在 generate 之前；generate 之后清除，否则下一请求会用错图。 */
             if (!inject_image_embeddings(ctx, prompt, &img_sink, client_ip, client_port)) {
-                myds_vjob_sink_free(&img_sink);
                 send_response(client_fd, 400, "Bad Request", "application/json",
                               "{\"error\":{\"message\":\"image block could not be aligned with the prompt\"}}");
-                free(req_buf); free(prompt); close(client_fd); return;
+                goto cleanup_infer;
             }
             int generated = myds_generate_bytes_ex(ctx, prompt, myds_server_sse_callback, &sctx,
                                                    &stop_reason, &prompt_tokens, &sctx.cancel_flag);
@@ -2187,10 +2344,9 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         } else {
             myds_non_stream_ctx_t ns = {.client_fd = client_fd};
             if (!inject_image_embeddings(ctx, prompt, &img_sink, client_ip, client_port)) {
-                myds_vjob_sink_free(&img_sink);
                 send_response(client_fd, 400, "Bad Request", "application/json",
                               "{\"error\":{\"message\":\"image block could not be aligned with the prompt\"}}");
-                free(req_buf); free(prompt); close(client_fd); return;
+                goto cleanup_infer;
             }
             int generated = myds_generate_bytes_ex(ctx, prompt, myds_server_non_stream_callback, &ns,
                                                    &stop_reason, &prompt_tokens, &ns.cancel_flag);
@@ -2299,8 +2455,13 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                    path, prompt_tokens, prefill_str, ttft_s,
                    final_tokens, decode_s, decode_tps, wall_s, final_finish_str);
 
+cleanup_infer:
+        myds_context_clear_image_embeddings(ctx);
+        myds_vjob_sink_free(&img_sink);
+        myds_set_continue_from_cache(ctx, false);
         myds_context_set_config(ctx, &prev_cfg);
         pthread_mutex_unlock(&g_infer_mutex);
+        server_release_infer_slot();
 
         free(prompt);
         free(req_buf);

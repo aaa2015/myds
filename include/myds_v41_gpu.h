@@ -62,6 +62,7 @@ int myds_v41_gpu_indexscores_chunk(myds_metal_buffer_t *scores,const myds_metal_
 myds_metal_buffer_t *myds_v41_gpu_indexer_scores(const myds_v41_gpu_scratch_t *scratch);
 myds_metal_buffer_t *myds_v41_gpu_indexer_blocks(const myds_v41_gpu_scratch_t *scratch);
 myds_metal_buffer_t *myds_v41_gpu_indexer_block_selected(const myds_v41_gpu_scratch_t *scratch);
+uint32_t myds_v41_gpu_indexer_batch_floats(const myds_v41_gpu_scratch_t *scratch);
 int myds_v41_gpu_candidates(myds_metal_buffer_t *blocks,const myds_metal_buffer_t *scores,
     uint32_t n_comp,uint32_t pos,uint32_t ratio);
 int myds_v41_gpu_filter(myds_metal_buffer_t *scores,const myds_metal_buffer_t *mask,

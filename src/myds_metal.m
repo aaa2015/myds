@@ -365,96 +365,125 @@ int myds_metal_init(const char *shader_dir) {
             @"visenc.metal"
         ];
 
-        NSMutableString *full_source = [NSMutableString stringWithUTF8String:g_metal_base_preamble];
         NSFileManager *fm = [NSFileManager defaultManager];
+        NSString *exec_path = [[NSProcessInfo processInfo] arguments].firstObject;
+        NSString *exec_dir = [exec_path stringByDeletingLastPathComponent];
 
-        NSString *dir_used = nil;
-        for (NSString *filename in shader_files) {
-            NSString *path = [NSString stringWithFormat:@"%s/%@", dir, filename];
-            if (![fm fileExistsAtPath:path]) {
-                path = [NSString stringWithFormat:@"./metal/%@", filename];
-            }
-            if (![fm fileExistsAtPath:path]) {
-                path = [NSString stringWithFormat:@"~/Projects/myds/metal/%@", filename];
-            }
-
-            NSError *read_err = nil;
-            NSString *content = [NSString stringWithContentsOfFile:path
-                                                          encoding:NSUTF8StringEncoding
-                                                             error:&read_err];
-            if (!content) {
-                fprintf(stderr, "myds_metal: failed reading shader '%s': %s\n",
-                        [path UTF8String], [[read_err localizedDescription] UTF8String]);
-                return 0;
-            }
-            if (!dir_used) dir_used = [[path stringByDeletingLastPathComponent] copy];
-            [full_source appendFormat:@"\n#line 1 \"%@\"\n%@", filename, content];
-        }
-
-        [full_source appendString:@"\n"
-            "struct ds4_compute_copy_args {\n"
-            "    uint64_t src_offset;\n"
-            "    uint64_t dst_offset;\n"
-            "    uint64_t count;\n"
-            "};\n"
-            "kernel void kernel_compute_copy_u8(\n"
-            "    device const uchar *src [[buffer(0)]],\n"
-            "    device uchar *dst [[buffer(1)]],\n"
-            "    constant ds4_compute_copy_args &args [[buffer(2)]],\n"
-            "    uint gid [[thread_position_in_grid]]) {\n"
-            "    if (gid < args.count) {\n"
-            "        (dst + args.dst_offset)[gid] = (src + args.src_offset)[gid];\n"
-            "    }\n"
-            "}\n"
-            "kernel void kernel_compute_copy_u32(\n"
-            "    device const uchar *src [[buffer(0)]],\n"
-            "    device uchar *dst [[buffer(1)]],\n"
-            "    constant ds4_compute_copy_args &args [[buffer(2)]],\n"
-            "    uint gid [[thread_position_in_grid]]) {\n"
-            "    if (gid < args.count) {\n"
-            "        device const uint *s = (device const uint *)(src + args.src_offset);\n"
-            "        device uint *d = (device uint *)(dst + args.dst_offset);\n"
-            "        d[gid] = s[gid];\n"
-            "    }\n"
-            "}\n"
-            "kernel void kernel_compute_copy_u32x4(\n"
-            "    device const uchar *src [[buffer(0)]],\n"
-            "    device uchar *dst [[buffer(1)]],\n"
-            "    constant ds4_compute_copy_args &args [[buffer(2)]],\n"
-            "    uint gid [[thread_position_in_grid]]) {\n"
-            "    if (gid < args.count) {\n"
-            "        device const uint4 *s = (device const uint4 *)(src + args.src_offset);\n"
-            "        device uint4 *d = (device uint4 *)(dst + args.dst_offset);\n"
-            "        d[gid] = s[gid];\n"
-            "    }\n"
-            "}\n"
+        /* Check for precompiled metallib to eliminate ~500ms runtime shader compile jitter */
+        NSArray<NSString *> *metallib_search_paths = @[
+            [NSString stringWithFormat:@"%s/myds.metallib", dir],
+            [NSString stringWithFormat:@"./bin/myds.metallib"],
+            [NSString stringWithFormat:@"./build/myds.metallib"],
+            [NSString stringWithFormat:@"./metal/myds.metallib"],
+            [NSString stringWithFormat:@"%@/myds.metallib", exec_dir],
+            [NSString stringWithFormat:@"%@/../bin/myds.metallib", exec_dir]
         ];
 
-        MTLCompileOptions *options = [MTLCompileOptions new];
-        /* Match the pinned reference defaults for standalone HC sigmoid and
-         * normalization. Existing generic operators do not use these macros. */
-        options.preprocessorMacros = @{@"DS4_METAL_HC_STABLE": @"1",
-                                       @"DS4_METAL_NORM_RSQRT_DISABLE": @"1"};
-        if (@available(macOS 15.0, *)) {
-            options.mathMode = MTLMathModeFast;
-        } else {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-            options.fastMathEnabled = YES;
-#pragma clang diagnostic pop
+        for (NSString *lib_path in metallib_search_paths) {
+            if ([fm fileExistsAtPath:lib_path]) {
+                NSError *lib_err = nil;
+                g_library = [g_device newLibraryWithURL:[NSURL fileURLWithPath:lib_path] error:&lib_err];
+                if (g_library) {
+                    myds_log(MYDS_LOG_INFO, "myds_metal: loaded precompiled library from %s", [lib_path UTF8String]);
+                    break;
+                }
+            }
         }
 
-        NSError *compile_err = nil;
-        g_library = [g_device newLibraryWithSource:full_source options:options error:&compile_err];
-        if (g_library)
-            myds_log(MYDS_LOG_INFO, "myds_metal: shaders loaded from %s (%lu files)",
-                     dir_used ? [dir_used UTF8String] : "?", (unsigned long)[shader_files count]);
         if (!g_library) {
-            fprintf(stderr, "myds_metal: Metal shader compilation failed: %s\n",
-                    [[compile_err localizedDescription] UTF8String]);
-            g_queue = nil;
-            g_device = nil;
-            return 0;
+            NSMutableString *full_source = [NSMutableString stringWithUTF8String:g_metal_base_preamble];
+            NSString *dir_used = nil;
+            for (NSString *filename in shader_files) {
+                NSString *path = [NSString stringWithFormat:@"%s/%@", dir, filename];
+                if (![fm fileExistsAtPath:path]) {
+                    path = [NSString stringWithFormat:@"./metal/%@", filename];
+                }
+                if (![fm fileExistsAtPath:path]) {
+                    path = [NSString stringWithFormat:@"../metal/%@", filename];
+                }
+                if (![fm fileExistsAtPath:path]) {
+                    path = [NSString stringWithFormat:@"%@/metal/%@", exec_dir, filename];
+                    if (![fm fileExistsAtPath:path]) {
+                        path = [NSString stringWithFormat:@"%@/../metal/%@", exec_dir, filename];
+                    }
+                }
+
+                NSError *read_err = nil;
+                NSString *content = [NSString stringWithContentsOfFile:path
+                                                              encoding:NSUTF8StringEncoding
+                                                                 error:&read_err];
+                if (!content) {
+                    fprintf(stderr, "myds_metal: failed reading shader '%s': %s\n",
+                            [path UTF8String], [[read_err localizedDescription] UTF8String]);
+                    return 0;
+                }
+                if (!dir_used) dir_used = [[path stringByDeletingLastPathComponent] copy];
+                [full_source appendFormat:@"\n#line 1 \"%@\"\n%@", filename, content];
+            }
+
+            [full_source appendString:@"\n"
+                "struct ds4_compute_copy_args {\n"
+                "    uint64_t src_offset;\n"
+                "    uint64_t dst_offset;\n"
+                "    uint64_t count;\n"
+                "};\n"
+                "kernel void kernel_compute_copy_u8(\n"
+                "    device const uchar *src [[buffer(0)]],\n"
+                "    device uchar *dst [[buffer(1)]],\n"
+                "    constant ds4_compute_copy_args &args [[buffer(2)]],\n"
+                "    uint gid [[thread_position_in_grid]]) {\n"
+                "    if (gid < args.count) {\n"
+                "        (dst + args.dst_offset)[gid] = (src + args.src_offset)[gid];\n"
+                "    }\n"
+                "}\n"
+                "kernel void kernel_compute_copy_u32(\n"
+                "    device const uchar *src [[buffer(0)]],\n"
+                "    device uchar *dst [[buffer(1)]],\n"
+                "    constant ds4_compute_copy_args &args [[buffer(2)]],\n"
+                "    uint gid [[thread_position_in_grid]]) {\n"
+                "    if (gid < args.count) {\n"
+                "        device const uint *s = (device const uint *)(src + args.src_offset);\n"
+                "        device uint *d = (device uint *)(dst + args.dst_offset);\n"
+                "        d[gid] = s[gid];\n"
+                "    }\n"
+                "}\n"
+                "kernel void kernel_compute_copy_u32x4(\n"
+                "    device const uchar *src [[buffer(0)]],\n"
+                "    device uchar *dst [[buffer(1)]],\n"
+                "    constant ds4_compute_copy_args &args [[buffer(2)]],\n"
+                "    uint gid [[thread_position_in_grid]]) {\n"
+                "    if (gid < args.count) {\n"
+                "        device const uint4 *s = (device const uint4 *)(src + args.src_offset);\n"
+                "        device uint4 *d = (device uint4 *)(dst + args.dst_offset);\n"
+                "        d[gid] = s[gid];\n"
+                "    }\n"
+                "}\n"
+            ];
+
+            MTLCompileOptions *options = [MTLCompileOptions new];
+            options.preprocessorMacros = @{@"DS4_METAL_HC_STABLE": @"1",
+                                           @"DS4_METAL_NORM_RSQRT_DISABLE": @"1"};
+            if (@available(macOS 15.0, *)) {
+                options.mathMode = MTLMathModeFast;
+            } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+                options.fastMathEnabled = YES;
+#pragma clang diagnostic pop
+            }
+
+            NSError *compile_err = nil;
+            g_library = [g_device newLibraryWithSource:full_source options:options error:&compile_err];
+            if (g_library)
+                myds_log(MYDS_LOG_INFO, "myds_metal: shaders loaded from %s (%lu files)",
+                         dir_used ? [dir_used UTF8String] : "?", (unsigned long)[shader_files count]);
+            if (!g_library) {
+                fprintf(stderr, "myds_metal: Metal shader compilation failed: %s\n",
+                        [[compile_err localizedDescription] UTF8String]);
+                g_queue = nil;
+                g_device = nil;
+                return 0;
+            }
         }
 
         /* 1. Build RMSNorm pipeline */
@@ -880,6 +909,60 @@ int myds_metal_buffer_read(const myds_metal_buffer_t *buf, size_t offset, void *
  * Kernel Dispatches
  * ========================================================================= */
 
+/* 诊断用（参谋长 2026-09-30）：统计 GPU dispatch 次数。
+ * 用途：判定 prefill 的 GPU 时间是被"启动开销 x 海量小 kernel"主导，还是被算力/带宽主导。 */
+static uint64_t g_dispatch_count = 0;
+/* 诊断：按内核名统计 dispatch 次数，用于定位"每 token 一串小 kernel"里的大头。 */
+#define MYDS_HIST_SLOTS 128
+static struct { const char *name; uint64_t n; } g_hist[MYDS_HIST_SLOTS];
+static int g_hist_used = 0;
+/* 默认关闭：开启时每次 dispatch 都要做线性查找 + strcmp，会明显拖慢 CPU 侧
+ * （实测在计时对比里造成 ~0.8s 的系统误差）。只在 MYDS_DISPATCH_HIST=1 时启用。 */
+static int g_hist_enabled = -1;
+static int hist_on(void) {
+    if (g_hist_enabled < 0) g_hist_enabled = getenv("MYDS_DISPATCH_HIST") ? 1 : 0;
+    return g_hist_enabled;
+}
+static void hist_add(const char *name) {
+    if (!hist_on()) return;
+    for (int i = 0; i < g_hist_used; i++) {
+        if (g_hist[i].name == name || (g_hist[i].name && name && !strcmp(g_hist[i].name, name))) {
+            g_hist[i].n++; return;
+        }
+    }
+    if (g_hist_used < MYDS_HIST_SLOTS) { g_hist[g_hist_used].name = name; g_hist[g_hist_used].n = 1; g_hist_used++; }
+}
+int myds_metal_dispatch_hist_dump(FILE *out) {
+    if (!out) return 0;
+    /* 简单选择排序前 24 名 */
+    int idx[MYDS_HIST_SLOTS];
+    for (int i = 0; i < g_hist_used; i++) idx[i] = i;
+    for (int i = 0; i < g_hist_used; i++)
+        for (int j = i+1; j < g_hist_used; j++)
+            if (g_hist[idx[j]].n > g_hist[idx[i]].n) { int t = idx[i]; idx[i] = idx[j]; idx[j] = t; }
+    uint64_t tot = 0;
+    for (int i = 0; i < g_hist_used; i++) tot += g_hist[i].n;
+    fprintf(out, "--- DISPATCH BY KERNEL (%d kinds, %llu total) ---\n", g_hist_used, (unsigned long long)tot);
+    for (int i = 0; i < g_hist_used && i < 24; i++)
+        fprintf(out, "%-46s %10llu  %5.2f%%\n", g_hist[idx[i]].name,
+                (unsigned long long)g_hist[idx[i]].n,
+                tot ? 100.0*(double)g_hist[idx[i]].n/(double)tot : 0.0);
+    fflush(out);
+    return 1;
+}
+
+uint64_t myds_metal_dispatch_count(void) { return g_dispatch_count; }
+void myds_metal_dispatch_count_reset(void) { g_dispatch_count = 0; }
+
+static inline void metal_dispatch(id<MTLComputeCommandEncoder> enc,
+                                  const char *name,
+                                  MTLSize threadgroups,
+                                  MTLSize threadsPerThreadgroup) {
+    [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:threadsPerThreadgroup];
+    g_dispatch_count++;
+    hist_add(name);
+}
+
 struct ds4_metal_args_norm {
     int32_t  ne00;
     int32_t  ne00_t;
@@ -928,8 +1011,8 @@ int myds_metal_rmsnorm(
             [enc setThreadgroupMemoryLength:32 * sizeof(float) atIndex:0];
 
             NSUInteger threads = (dim / 4 < 32) ? 32 : (dim / 4 > 256 ? 256 : dim / 4);
-            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+            metal_dispatch(enc, "rms_norm_ref", MTLSizeMake(1, 1, 1),
+                MTLSizeMake(threads, 1, 1));
 
             if (g_batch_cb) {
                 if (g_auto_barrier) {
@@ -978,50 +1061,6 @@ static int v41_finish(id<MTLCommandBuffer> cb, id<MTLComputeCommandEncoder> enc)
     return wait_command_buffer(cb);
 }
 
-/* 诊断用（参谋长 2026-09-30）：统计 GPU dispatch 次数。
- * 用途：判定 prefill 的 GPU 时间是被"启动开销 x 海量小 kernel"主导，还是被算力/带宽主导。 */
-static uint64_t g_dispatch_count = 0;
-/* 诊断：按内核名统计 dispatch 次数，用于定位"每 token 一串小 kernel"里的大头。 */
-#define MYDS_HIST_SLOTS 128
-static struct { const char *name; uint64_t n; } g_hist[MYDS_HIST_SLOTS];
-static int g_hist_used = 0;
-/* 默认关闭：开启时每次 dispatch 都要做线性查找 + strcmp，会明显拖慢 CPU 侧
- * （实测在计时对比里造成 ~0.8s 的系统误差）。只在 MYDS_DISPATCH_HIST=1 时启用。 */
-static int g_hist_enabled = -1;
-static int hist_on(void) {
-    if (g_hist_enabled < 0) g_hist_enabled = getenv("MYDS_DISPATCH_HIST") ? 1 : 0;
-    return g_hist_enabled;
-}
-static void hist_add(const char *name) {
-    if (!hist_on()) return;
-    for (int i = 0; i < g_hist_used; i++) {
-        if (g_hist[i].name == name || (g_hist[i].name && name && !strcmp(g_hist[i].name, name))) {
-            g_hist[i].n++; return;
-        }
-    }
-    if (g_hist_used < MYDS_HIST_SLOTS) { g_hist[g_hist_used].name = name; g_hist[g_hist_used].n = 1; g_hist_used++; }
-}
-int myds_metal_dispatch_hist_dump(FILE *out) {
-    if (!out) return 0;
-    /* 简单选择排序前 24 名 */
-    int idx[MYDS_HIST_SLOTS];
-    for (int i = 0; i < g_hist_used; i++) idx[i] = i;
-    for (int i = 0; i < g_hist_used; i++)
-        for (int j = i+1; j < g_hist_used; j++)
-            if (g_hist[idx[j]].n > g_hist[idx[i]].n) { int t = idx[i]; idx[i] = idx[j]; idx[j] = t; }
-    uint64_t tot = 0;
-    for (int i = 0; i < g_hist_used; i++) tot += g_hist[i].n;
-    fprintf(out, "--- DISPATCH BY KERNEL (%d kinds, %llu total) ---\n", g_hist_used, (unsigned long long)tot);
-    for (int i = 0; i < g_hist_used && i < 24; i++)
-        fprintf(out, "%-46s %10llu  %5.2f%%\n", g_hist[idx[i]].name,
-                (unsigned long long)g_hist[idx[i]].n,
-                tot ? 100.0*(double)g_hist[idx[i]].n/(double)tot : 0.0);
-    fflush(out);
-    return 1;
-}
-
-uint64_t myds_metal_dispatch_count(void) { return g_dispatch_count; }
-void myds_metal_dispatch_count_reset(void) { g_dispatch_count = 0; }
 
 int myds_metal_dispatch_kernel(const char *name, const void *args, size_t args_size,
     const myds_metal_buffer_t *const *buffers, size_t n_buffers,
@@ -1142,10 +1181,8 @@ int myds_metal_dispatch_kernel_constants(const char *name, const void *args, siz
         for (size_t i = 0; i < n_buffers; ++i)
             [enc setBuffer:buffers[i]->mtl_buf offset:buffers[i]->offset atIndex:i+1];
         if (threadgroup_memory) [enc setThreadgroupMemoryLength:threadgroup_memory atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(groups[0], groups[1], groups[2])
-            threadsPerThreadgroup:MTLSizeMake(threads[0], threads[1], threads[2])];
-        g_dispatch_count++;
-        hist_add(name);
+        metal_dispatch(enc, name, MTLSizeMake(groups[0], groups[1], groups[2]),
+            MTLSizeMake(threads[0], threads[1], threads[2]));
         return v41_finish(cb, enc);
     }
 }
@@ -1192,8 +1229,8 @@ int myds_metal_buffer_copy(myds_metal_buffer_t *dst, size_t dst_offset,
                 if (nth == 0) nth = 32;
             }
             NSUInteger ngr = (count + nth - 1) / nth;
-            [enc dispatchThreadgroups:MTLSizeMake(ngr, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+            metal_dispatch(enc, "buffer_copy", MTLSizeMake(ngr, 1, 1),
+                MTLSizeMake(nth, 1, 1));
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             return 1;
         }
@@ -1226,8 +1263,8 @@ int myds_metal_v41_bf16(myds_metal_buffer_t *x, uint32_t count) {
         [enc setComputePipelineState:g_pso_v41_bf16];
         [enc setBytes:&n length:sizeof(n) atIndex:0];
         [enc setBuffer:x->mtl_buf offset:x->offset atIndex:1];
-        [enc dispatchThreadgroups:MTLSizeMake((work + nth - 1u) / nth, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        metal_dispatch(enc, "v41_bf16", MTLSizeMake((work + nth - 1u) / nth, 1, 1),
+            MTLSizeMake(nth, 1, 1));
         return v41_finish(cb, enc);
     }
 }
@@ -1267,7 +1304,7 @@ int myds_metal_v41_rmsnorm(myds_metal_buffer_t *out,
         [enc setBuffer:x->mtl_buf offset:x->offset atIndex:3];
         [enc setBuffer:out->mtl_buf offset:out->offset atIndex:4];
         [enc setThreadgroupMemoryLength:32 * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        metal_dispatch(enc, "v41_rmsnorm", MTLSizeMake(1, 1, 1), MTLSizeMake(nth, 1, 1));
         return v41_finish(cb, enc);
     }
 }
@@ -1310,7 +1347,7 @@ int myds_metal_v41_rmsnorm_batch(myds_metal_buffer_t *out,
         [enc setBuffer:x->mtl_buf offset:x->offset atIndex:3];
         [enc setBuffer:out->mtl_buf offset:out->offset atIndex:4];
         [enc setThreadgroupMemoryLength:32 * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(n_tok, 1, 1) threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        metal_dispatch(enc, "v41_rmsnorm_batch", MTLSizeMake(n_tok, 1, 1), MTLSizeMake(nth, 1, 1));
         return v41_finish(cb, enc);
     }
 }
@@ -1348,7 +1385,7 @@ int myds_metal_v41_hc_mix(myds_metal_buffer_t *split,
         [enc setBuffer:scale->mtl_buf offset:scale->offset atIndex:2];
         [enc setBuffer:base->mtl_buf offset:base->offset atIndex:3];
         [enc setBuffer:split->mtl_buf offset:split->offset atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        metal_dispatch(enc, "v41_hc_split", MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
         return v41_finish(cb, enc);
     }
 }
@@ -1375,7 +1412,7 @@ int myds_metal_v41_hc_split_batch(myds_metal_buffer_t *split,
         [enc setBuffer:split->mtl_buf offset:split->offset atIndex:4];
         NSUInteger nth = 32;
         NSUInteger ngr = (n_tokens + nth - 1) / nth;
-        [enc dispatchThreadgroups:MTLSizeMake(ngr, 1, 1) threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        metal_dispatch(enc, "v41_hc_split_batch", MTLSizeMake(ngr, 1, 1), MTLSizeMake(nth, 1, 1));
         return v41_finish(cb, enc);
     }
 }
@@ -1408,7 +1445,7 @@ int myds_metal_v41_hc_weighted_sum(myds_metal_buffer_t *out,
         [enc setBuffer:weights->mtl_buf offset:weights->offset atIndex:2];
         [enc setBuffer:out->mtl_buf offset:out->offset atIndex:3];
         NSUInteger nth = MIN((NSUInteger)256, (NSUInteger)dim);
-        [enc dispatchThreadgroups:MTLSizeMake((dim+nth-1)/nth, 1, 1) threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        metal_dispatch(enc, "v41_hc_sum", MTLSizeMake((dim+nth-1)/nth, 1, 1), MTLSizeMake(nth, 1, 1));
         return v41_finish(cb, enc);
     }
 }
@@ -1447,7 +1484,7 @@ int myds_metal_v41_hc_expand(myds_metal_buffer_t *out,
         [enc setBuffer:block->mtl_buf offset:block->offset atIndex:5];
         [enc setBuffer:out->mtl_buf offset:out->offset atIndex:6];
         NSUInteger nth = MIN((NSUInteger)256, (NSUInteger)dim);
-        [enc dispatchThreadgroups:MTLSizeMake((dim+nth-1)/nth, 1, 1) threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        metal_dispatch(enc, "v41_hc_expand", MTLSizeMake((dim+nth-1)/nth, 1, 1), MTLSizeMake(nth, 1, 1));
         return v41_finish(cb, enc);
     }
 }
@@ -1478,8 +1515,8 @@ int myds_metal_v41_hc_weighted_sum_batch(myds_metal_buffer_t *out,
         [enc setBuffer:out->mtl_buf offset:out->offset atIndex:3];
         NSUInteger nth = MIN((NSUInteger)256, (NSUInteger)dim);
         uint64_t total_elements = (uint64_t)dim * n_tok;
-        [enc dispatchThreadgroups:MTLSizeMake((total_elements + nth - 1) / nth, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        metal_dispatch(enc, "v41_hc_sum_batch", MTLSizeMake((total_elements + nth - 1) / nth, 1, 1),
+            MTLSizeMake(nth, 1, 1));
         return v41_finish(cb, enc);
     }
 }
@@ -1518,8 +1555,8 @@ int myds_metal_v41_hc_expand_batch(myds_metal_buffer_t *out,
         [enc setBuffer:out->mtl_buf offset:out->offset atIndex:6];
         NSUInteger nth = MIN((NSUInteger)256, (NSUInteger)dim);
         uint64_t total_elements = (uint64_t)dim * n_tok;
-        [enc dispatchThreadgroups:MTLSizeMake((total_elements + nth - 1) / nth, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        metal_dispatch(enc, "v41_hc_expand_batch", MTLSizeMake((total_elements + nth - 1) / nth, 1, 1),
+            MTLSizeMake(nth, 1, 1));
         return v41_finish(cb, enc);
     }
 }
@@ -1544,7 +1581,7 @@ int myds_metal_v41_engram_add(myds_metal_buffer_t *residual,
         [enc setBuffer:q_weight->mtl_buf offset:q_weight->offset atIndex:3];
         [enc setBuffer:k_weight->mtl_buf offset:k_weight->offset atIndex:4];
         [enc setBuffer:residual->mtl_buf offset:residual->offset atIndex:5];
-        [enc dispatchThreadgroups:MTLSizeMake(1, 4, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        metal_dispatch(enc, "v41_engram_add", MTLSizeMake(1, 4, 1), MTLSizeMake(32, 1, 1));
         return v41_finish(cb, enc);
     }
 }
@@ -1803,8 +1840,8 @@ int myds_metal_gemv_batch(
             [enc setBuffer:y->mtl_buf offset:y->offset atIndex:3];
             [enc setThreadgroupMemoryLength:32 * 2 * sizeof(float) atIndex:0];
             /* Each token retains the single-vector lane assignment/reduction. */
-            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + 1) / 2, n_tok, 1)
-                threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
+            metal_dispatch(enc, "gemv_q8_0_batch", MTLSizeMake(((NSUInteger)out_dim + 1) / 2, n_tok, 1),
+                MTLSizeMake(32, nsg, 1));
             if (g_batch_cb) {
                 if (g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             } else {
@@ -1918,8 +1955,8 @@ int myds_metal_v41_gemv_batch(myds_metal_buffer_t *out,
         [enc setBuffer:input->mtl_buf offset:input->offset atIndex:2];
         [enc setBuffer:out->mtl_buf offset:out->offset atIndex:3];
         [enc setThreadgroupMemoryLength:32u * 2u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake((out_dim + 1u) / 2u, n_tok, 1)
-             threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
+        metal_dispatch(enc, [funcName UTF8String], MTLSizeMake((out_dim + 1u) / 2u, n_tok, 1),
+             MTLSizeMake(32, nsg, 1));
         return v41_finish(cb, enc);
     }
 }
@@ -2008,10 +2045,10 @@ int myds_metal_mul_mm(
             [enc setBuffer:dst->mtl_buf offset:(dst ? dst->offset : 0) atIndex:3];
             uint32_t tg_mem = (weight_type == GGML_TYPE_F32) ? 12288u : (bc_out ? 8192u : 6144u);
             [enc setThreadgroupMemoryLength:tg_mem atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
+            metal_dispatch(enc, "gemm_batch", MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
                                                   ((NSUInteger)out_dim + 63u) / 64u,
-                                                  1)
-                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                                                  1),
+                 MTLSizeMake(128, 1, 1));
 
             if (g_batch_cb) {
                 if (g_auto_barrier) {
@@ -2118,10 +2155,10 @@ int myds_metal_mul_mm_grouped(
         [enc setBuffer:dst->mtl_buf offset:dst->offset atIndex:3];
         uint32_t tg_mem = (weight_type == GGML_TYPE_F32) ? 12288u : (bc_out ? 8192u : 6144u);
         [enc setThreadgroupMemoryLength:tg_mem atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
+        metal_dispatch(enc, "gemm_grouped", MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
                                               ((NSUInteger)out_dim + 63u) / 64u,
-                                              (NSUInteger)n_groups)
-             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                                              (NSUInteger)n_groups),
+             MTLSizeMake(128, 1, 1));
 
         if (g_batch_cb) {
             if (g_auto_barrier) {
@@ -2480,8 +2517,8 @@ int myds_metal_routed_moe_batch(
             [enc setBuffer:g_moe_id_map_buffer offset:tpe_bytes atIndex:3];
             [enc setBuffer:g_moe_id_map_buffer offset:work_offset atIndex:4];
             [enc setThreadgroupMemoryLength:(NSUInteger)n_routed_experts * (NSUInteger)n_activated_experts * sizeof(uint16_t) atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake((NSUInteger)n_routed_experts, 1, 1)];
+            metal_dispatch(enc, "moe_map0", MTLSizeMake(1, 1, 1),
+                MTLSizeMake((NSUInteger)n_routed_experts, 1, 1));
 
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
@@ -2498,10 +2535,10 @@ int myds_metal_routed_moe_batch(
             [enc setBuffer:selected_weights->mtl_buf offset:selected_weights->offset atIndex:8];
             [enc setBuffer:g_moe_id_map_buffer offset:work_offset atIndex:9];
             [enc setThreadgroupMemoryLength:16384u atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)work_cap,
+            metal_dispatch(enc, "moe_pair_swiglu", MTLSizeMake((NSUInteger)work_cap,
                                                   ((NSUInteger)expert_dim + 63u) / 64u,
-                                                  1)
-                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                                                  1),
+                MTLSizeMake(128, 1, 1));
 
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
@@ -2515,10 +2552,10 @@ int myds_metal_routed_moe_batch(
             [enc setBuffer:scratch_down->mtl_buf offset:scratch_down->offset atIndex:5];
             [enc setBuffer:g_moe_id_map_buffer offset:work_offset atIndex:6];
             [enc setThreadgroupMemoryLength:8192u atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)work_cap,
+            metal_dispatch(enc, "moe_down_q2_k", MTLSizeMake((NSUInteger)work_cap,
                                                   ((NSUInteger)dim + 63u) / 64u,
-                                                  1)
-                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                                                  1),
+                MTLSizeMake(128, 1, 1));
 
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
@@ -2531,8 +2568,8 @@ int myds_metal_routed_moe_batch(
             [enc setBytes:&sum_args length:sizeof(sum_args) atIndex:0];
             [enc setBuffer:scratch_down->mtl_buf offset:scratch_down->offset atIndex:1];
             [enc setBuffer:moe_out->mtl_buf offset:moe_out->offset atIndex:2];
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tok, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+            metal_dispatch(enc, "moe_sum6", MTLSizeMake((NSUInteger)n_tok, 1, 1),
+                MTLSizeMake(nth, 1, 1));
 
             if (g_batch_cb) {
                 if (g_auto_barrier) {
@@ -2655,8 +2692,8 @@ int myds_metal_routed_moe_batch(
             [enc setBuffer:selected_ids->mtl_buf offset:selected_ids->offset atIndex:8];
             [enc setBuffer:selected_weights->mtl_buf offset:selected_weights->offset atIndex:9];
             [enc setThreadgroupMemoryLength:smem_iq2 atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake(row_groups_gate, 1, pairs)
-                threadsPerThreadgroup:MTLSizeMake(32, nsg_gate, 1)];
+            metal_dispatch(enc, "fused_moe_swiglu", MTLSizeMake(row_groups_gate, 1, pairs),
+                MTLSizeMake(32, nsg_gate, 1));
 
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
@@ -2668,8 +2705,8 @@ int myds_metal_routed_moe_batch(
             [enc setBuffer:moe_out->mtl_buf offset:moe_out->offset atIndex:3];
             [enc setBuffer:selected_ids->mtl_buf offset:selected_ids->offset atIndex:4];
             [enc setBuffer:moe_out->mtl_buf offset:moe_out->offset atIndex:5];
-            [enc dispatchThreadgroups:MTLSizeMake(row_groups_down, (NSUInteger)n_tok, 1)
-                threadsPerThreadgroup:MTLSizeMake(32, nsg_down, 1)];
+            metal_dispatch(enc, "fused_moe_sum6_q2_k", MTLSizeMake(row_groups_down, (NSUInteger)n_tok, 1),
+                MTLSizeMake(32, nsg_down, 1));
 
             if (g_batch_cb) {
                 if (g_auto_barrier) {
@@ -2776,8 +2813,8 @@ int myds_metal_attn_output_a_batch(
             [enc setBuffer:heads->mtl_buf offset:heads->offset atIndex:2];
             [enc setBuffer:low->mtl_buf offset:low->offset atIndex:3];
             [enc setThreadgroupMemoryLength:smem_bytes atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
-                threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+            metal_dispatch(enc, "attn_out_low_q8_0", MTLSizeMake(row_groups, 1, pairs),
+                MTLSizeMake(32, 4, 1));
 
             if (g_batch_cb) {
                 if (g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];

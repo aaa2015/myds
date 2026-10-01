@@ -35,16 +35,23 @@ TEST_KVDSK = $(BIN_DIR)/test_kvdsk
 BENCH_SYNTHETIC = $(BIN_DIR)/bench_synthetic
 BENCH_METAL = $(BIN_DIR)/bench_metal
 DUMP_TENSORS = $(BIN_DIR)/dump_tensors
+METALLIB = $(BIN_DIR)/myds.metallib
+METAL_SRCS = $(wildcard metal/*.metal)
 
 ALL_TESTS = $(TEST_METAL) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE) $(TEST_CPU) $(TEST_ENGRAM) $(TEST_ALIGN) $(TEST_KVDSK)
 
-.PHONY: all test clean bench
+.PHONY: all test clean bench metallib
 
 # Rebuild consumers when public or internal layouts change.
 -include $(wildcard $(BUILD_DIR)/*.d)
 .DEFAULT_GOAL := all
 
-all: $(TARGET) $(ALL_TESTS) $(DUMP_TENSORS)
+all: $(TARGET) $(ALL_TESTS) $(DUMP_TENSORS) $(METALLIB)
+
+metallib: $(METALLIB)
+
+$(METALLIB): $(METAL_SRCS) tools/build_metallib.py | $(BIN_DIR) $(BUILD_DIR)
+	python3 tools/build_metallib.py
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -197,8 +204,14 @@ test: $(ALL_TESTS)
 	@./$(TEST_SERVER_API)
 	@echo ""
 	@./$(TEST_ENGINE)
+	@echo ""
 	@./$(TEST_CPU)
+	@echo ""
 	@./$(TEST_ENGRAM)
+	@echo ""
+	@./$(TEST_ALIGN)
+	@echo ""
+	@./$(TEST_KVDSK)
 	@echo "\n========================================================"
 	@echo "      ALL TEST SUITES PASSED CLEANLY & SUCCESSFULLY!    "
 	@echo "========================================================"
