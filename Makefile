@@ -1,12 +1,20 @@
 CC ?= clang
-CFLAGS ?= -O3 -Wall -Wextra -std=c11 -Iinclude
+# -Ithird_party: 视觉用的 iris 单头解码器（JPEG/PNG）
+CFLAGS ?= -O3 -Wall -Wextra -std=c11 -Iinclude -Ithird_party
 OBJCFLAGS ?= -O3 -Wall -Wextra -Iinclude -fobjc-arc
 LDFLAGS ?= -framework Foundation -framework Metal -lm -lpthread
 
 BIN_DIR = bin
 BUILD_DIR = build
 
-SRCS_C = src/myds_cpu.c src/myds_log.c src/myds_gguf.c src/myds_tokenizer.c src/myds_engine.c src/myds_v41.c src/myds_v41_gpu.c src/myds_v41_moe.c src/myds_engram.c src/myds_server.c
+# ★ 视觉相关四个文件别漏：漏了不会报错 —— 只是这些代码【没被编进二进制】，
+#   直到有人引用它们才在链接期暴露。我第一版就漏了三个（vispre/visw/visfwd），
+#   而当时所有测试仍然全过，因为没人用到它们。
+SRCS_C = src/myds_cpu.c src/myds_log.c src/myds_gguf.c src/myds_tokenizer.c \
+         src/myds_engine.c src/myds_v41.c src/myds_v41_gpu.c src/myds_v41_moe.c \
+         src/myds_engram.c \
+         src/myds_vispre.c src/myds_visw.c src/myds_visfwd.c src/myds_vjob.c \
+         src/myds_server.c
 SRCS_M = src/myds_metal.m
 OBJS_C = $(patsubst src/%.c, $(BUILD_DIR)/%.o, $(SRCS_C))
 OBJS_M = $(patsubst src/%.m, $(BUILD_DIR)/%.o, $(SRCS_M))
