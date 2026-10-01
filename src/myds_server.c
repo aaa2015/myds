@@ -21,6 +21,55 @@ static volatile sig_atomic_t g_running = 1;
 static int g_server_fd = -1;
 static pthread_mutex_t g_infer_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* ── previous_response_id：响应 id 注册表 ──
+ * Responses API 允许客户端只发【新增内容】+ 上一次响应的 id，让服务端接着那次的状态跑。
+ *
+ * myds 是单槽：只有【最近一次】响应的状态还活着 —— 引擎的 pcache 序列正好停在它的末尾，
+ * 连快照都不用恢复。所以这里只认「最近一次」，更早的 id 一律明确报错。
+ * 这与 ds4 的取舍一致（它直接拒绝该字段），但比【静默忽略】安全得多：静默忽略会让客户端
+ * 以为服务端持有历史，实际只渲染了新增的那几条 ⇒ 模型拿不到上下文却照常作答，输出静默错误。 */
+#define RESP_ID_SLOTS 4u
+static char            g_resp_ids[RESP_ID_SLOTS][64];
+static unsigned        g_resp_id_ring = 0;         /* 下一个写入位置 */
+static unsigned long   g_resp_id_seq = 0;
+static pthread_mutex_t g_resp_id_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void resp_id_new(char *out, size_t cap) {
+    unsigned long n;
+    pthread_mutex_lock(&g_resp_id_mutex);
+    n = ++g_resp_id_seq;
+    pthread_mutex_unlock(&g_resp_id_mutex);
+    snprintf(out, cap, "resp_myds_%lu_%04x", n, (unsigned)(rand() & 0xffffu));
+}
+/* 一次响应完成后登记：它成为唯一「活」的 id。 */
+void resp_id_register(const char *id) {
+    if (!id || !id[0]) return;
+    pthread_mutex_lock(&g_resp_id_mutex);
+    snprintf(g_resp_ids[g_resp_id_ring], sizeof(g_resp_ids[0]), "%s", id);
+    g_resp_id_ring = (g_resp_id_ring + 1u) % RESP_ID_SLOTS;
+    pthread_mutex_unlock(&g_resp_id_mutex);
+}
+/* 最新的那个 = 唯一可续跑的 */
+bool resp_id_is_live(const char *id) {
+    if (!id || !id[0]) return false;
+    bool live;
+    pthread_mutex_lock(&g_resp_id_mutex);
+    unsigned prev = (g_resp_id_ring + RESP_ID_SLOTS - 1u) % RESP_ID_SLOTS;
+    live = (strcmp(g_resp_ids[prev], id) == 0);
+    pthread_mutex_unlock(&g_resp_id_mutex);
+    return live;
+}
+/* 是否见过（区分「过期」与「未知」，便于客户端判断） */
+bool resp_id_seen(const char *id) {
+    if (!id || !id[0]) return false;
+    bool seen = false;
+    pthread_mutex_lock(&g_resp_id_mutex);
+    for (unsigned i = 0; i < RESP_ID_SLOTS; ++i)
+        if (g_resp_ids[i][0] && strcmp(g_resp_ids[i], id) == 0) { seen = true; break; }
+    pthread_mutex_unlock(&g_resp_id_mutex);
+    return seen;
+}
+
 static void handle_signal(int sig) {
     (void)sig;
     g_running = 0;
@@ -819,8 +868,8 @@ static bool prompt_render_tool_call_items(prompt_buffer_t *out, const prompt_jso
 }
 
 /* 失败原因（供日志与报错使用）。调用方每次进入前不必清空 —— 每个失败路径都会写它。 */
-bool parse_chat_prompt_ex(const char *body, char *out_prompt, size_t max_prompt_len,
-                          const char **out_reason) {
+static bool parse_chat_prompt_impl(const char *body, char *out_prompt, size_t max_prompt_len,
+                                   const char **out_reason, bool suffix_only) {
     const char **why = out_reason;
     const char *local_why = "unsupported prompt shape";
     if (!why) why = &local_why;
@@ -863,6 +912,10 @@ bool parse_chat_prompt_ex(const char *body, char *out_prompt, size_t max_prompt_
         }
     }
     bool tools_done = false;
+    /* suffix 模式（previous_response_id）：服务端会把【上一次响应的完整序列】接在前面，
+     * 所以这里只渲染【本次新增的消息】，并且不能带 BOS、instructions 与 tools
+     * —— 它们已经在被续接的那段序列里了，重复渲染会把前缀整体错位。 */
+    if (suffix_only) { tools_done = true; goto render_items; }
     if (!prompt_append(&out, "<｜begin▁of▁sentence｜>")) { *why = "the prompt buffer is too small"; goto done; }
     if (instructions && instructions->kind != PJ_NULL) {
         if (instructions->kind != PJ_STRING ||
@@ -883,6 +936,7 @@ bool parse_chat_prompt_ex(const char *body, char *out_prompt, size_t max_prompt_
         }
         tools_done = true;
     }
+render_items:
     if (items->kind == PJ_STRING && !messages) {
         if (!prompt_render_message(&out, &state, "user", items->text, NULL)) goto done;
     } else if (items->kind == PJ_ARRAY && !prompt) {
@@ -988,6 +1042,18 @@ done:
 }
 
 /* 兼容包装：测试与其它调用方沿用旧的三参签名（它们不关心失败原因）。 */
+bool parse_chat_prompt_ex(const char *body, char *out_prompt, size_t max_prompt_len,
+                          const char **out_reason) {
+    return parse_chat_prompt_impl(body, out_prompt, max_prompt_len, out_reason, false);
+}
+
+/* previous_response_id：只渲染新增部分（无 BOS / instructions / tools），
+ * 前缀由引擎的缓存序列提供。 */
+bool parse_chat_prompt_suffix_ex(const char *body, char *out_prompt, size_t max_prompt_len,
+                                 const char **out_reason) {
+    return parse_chat_prompt_impl(body, out_prompt, max_prompt_len, out_reason, true);
+}
+
 bool parse_chat_prompt(const char *body, char *out_prompt, size_t max_prompt_len) {
     return parse_chat_prompt_ex(body, out_prompt, max_prompt_len, NULL);
 }
@@ -1632,8 +1698,30 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             close(client_fd);
             return;
         }
+        /* previous_response_id：客户端只发新增内容，前缀由引擎的缓存序列提供。
+         * 非空且不是「最近一次」⇒ 明确报错，绝不静默截断（见注册表处注释）。 */
+        char prev_id[64] = "";
+        (void)json_extract_string_field(body, "previous_response_id", prev_id, sizeof(prev_id));
+        const bool is_continuation = prev_id[0] != 0;
+        char resp_id[64];
+        resp_id_new(resp_id, sizeof(resp_id));
+        if (is_continuation && !resp_id_is_live(prev_id)) {
+            MYDS_LOG_W("[%s:%d] previous_response_id rejected (%s): %s",
+                       client_ip, client_port,
+                       resp_id_seen(prev_id) ? "expired" : "unknown", prev_id);
+            char err[512];
+            snprintf(err, sizeof(err),
+                     "{\"error\":{\"message\":\"previous_response_id '%s' is not the most recent response "
+                     "(this server keeps one live state); replay the full input instead\","
+                     "\"type\":\"invalid_request_error\"}}", prev_id);
+            send_response(client_fd, 400, "Bad Request", "application/json", err);
+            free(prompt); free(req_buf); close(client_fd); return;
+        }
         const char *parse_reason = NULL;
-        if (!parse_chat_prompt_ex(body, prompt, prompt_cap, &parse_reason)) {
+        const bool parsed_ok = is_continuation
+            ? parse_chat_prompt_suffix_ex(body, prompt, prompt_cap, &parse_reason)
+            : parse_chat_prompt_ex(body, prompt, prompt_cap, &parse_reason);
+        if (!parsed_ok) {
             /* 必须落日志：此前这条路径【完全不记录】，导致线上只能看到一个笼统的 400。 */
             MYDS_LOG_W("[%s:%d] ChatCompletions rejected (400): %s [body=%zd bytes, prompt_cap=%zu]",
                        client_ip, client_port, parse_reason, total_read, prompt_cap);
@@ -1656,6 +1744,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                    strlen(prompt));
 
         pthread_mutex_lock(&g_infer_mutex);
+        if (is_continuation) myds_set_continue_from_cache(ctx, true);
 
         /* Apply request configuration overrides if provided */
         myds_config_t prev_cfg = myds_context_get_config(ctx);
@@ -1695,6 +1784,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             int generated = myds_generate_bytes_ex(ctx, prompt, myds_server_sse_callback, &sctx,
                                                    &stop_reason, &prompt_tokens, &sctx.cancel_flag);
             if (generated && !sctx.cancel_flag) (void)myds_server_sse_finish(&sctx);
+            if (generated && !sctx.failed) resp_id_register(resp_id);   /* 状态已停在本次序列末尾 */
             final_tokens = sctx.token_count;
             t_first = sctx.t_first;
             t_last = sctx.t_last;
@@ -1736,8 +1826,8 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                         "event: response.output_item.done\n"
                         "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_myds_1\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"\"}]}}\n\n"
                         "event: response.completed\n"
-                        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_myds\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"%s\",\"usage\":{\"input_tokens\":%u,\"output_tokens\":%u,\"total_tokens\":%u}}}\n\n",
-                        alias_json, prompt_tokens, final_tokens, prompt_tokens + final_tokens) : NULL;
+                        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"%s\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"%s\",\"usage\":{\"input_tokens\":%u,\"output_tokens\":%u,\"total_tokens\":%u}}}\n\n",
+                        resp_id, alias_json, prompt_tokens, final_tokens, prompt_tokens + final_tokens) : NULL;
                     free(alias_json);
                     if (completed) {
                         if (!myds_server_send_all(client_fd, completed, strlen(completed))) stop_reason = MYDS_STOP_CANCELLED;
@@ -1770,6 +1860,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             myds_non_stream_ctx_t ns = {.client_fd = client_fd};
             int generated = myds_generate_bytes_ex(ctx, prompt, myds_server_non_stream_callback, &ns,
                                                    &stop_reason, &prompt_tokens, &ns.cancel_flag);
+            if (generated && !ns.failed) resp_id_register(resp_id);
             final_tokens = ns.token_count;
             t_first = ns.t_first;
             t_last = ns.t_last;
@@ -1801,11 +1892,11 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 if (body_escaped && alias_json) {
                     if (is_responses_endpoint) {
                         response = items_json ? format_alloc(
-                            "{\"id\":\"resp_myds_%ld\",\"object\":\"response\",\"created_at\":%ld,"
+                            "{\"id\":\"%s\",\"object\":\"response\",\"created_at\":%ld,"
                             "\"status\":\"completed\",\"model\":\"%s\","
                             "\"output\":%s,"
                             "\"usage\":{\"input_tokens\":%u,\"output_tokens\":%u,\"total_tokens\":%u}}",
-                            now, now, alias_json, items_json,
+                            resp_id, now, alias_json, items_json,
                             prompt_tokens, final_tokens, prompt_tokens + final_tokens) : NULL;
                     } else if (tool_count && calls_json && content_field) {
                         response = format_alloc(

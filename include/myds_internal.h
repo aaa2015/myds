@@ -117,6 +117,9 @@ struct myds_context {
     int32_t             *pcache_tokens;
     uint32_t             pcache_len;
     uint32_t             pcache_cap;
+    /* previous_response_id：本请求传入的 prompt 只是【新增后缀】，前缀由 pcache_tokens 提供。
+     * 一次性标志（引擎消费后自清），由服务端在收到该字段时设置。 */
+    bool                 continue_from_cache;
 
     /* 最近一次请求的 prefill 统计（只写不读，供 myds_last_prefill_stats 暴露给服务端日志） */
     uint32_t             last_prompt_tokens;

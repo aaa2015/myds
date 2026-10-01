@@ -685,6 +685,48 @@ static void test_responses_call_merges_into_assistant_turn(void) {
     printf("  [PASS] Responses text+call merge into one assistant turn (single EOS)\n");
 }
 
+/* ── previous_response_id：注册表语义 ──
+ * 只有【最新登记】的那个 id 可以续跑；更早的必须是「见过但已过期」而不是「未知」，
+ * 因为这两者对客户端的含义不同（前者重放即可恢复，后者是拼错了 id）。 */
+static void test_previous_response_id_registry(void) {
+    char a[64], b[64], c[64];
+    resp_id_new(a, sizeof a); resp_id_new(b, sizeof b); resp_id_new(c, sizeof c);
+    assert(strcmp(a, b) != 0 && strcmp(b, c) != 0 && strcmp(a, c) != 0);
+    assert(strncmp(a, "resp_myds_", 10) == 0);
+
+    resp_id_register(a);
+    assert(resp_id_is_live(a));
+    assert(!resp_id_is_live(b));
+    assert(resp_id_seen(a) && !resp_id_seen(b));
+
+    /* 新的响应顶掉旧的：a 变成「见过但不再 live」 */
+    resp_id_register(b);
+    assert(resp_id_is_live(b));
+    assert(!resp_id_is_live(a));
+    assert(resp_id_seen(a));    /* 仍在窗口内 -> expired 而不是 unknown */
+    printf("  [PASS] previous_response_id registry: only the newest is live; older ids are expired, not unknown\n");
+}
+
+/* ── previous_response_id：后缀渲染 ──
+ * 续跑时服务端只渲染【新增消息】：不能带 BOS / instructions / tools ——
+ * 它们已在被续接的那段序列里，重复渲染会让前缀整体错位（静默错误）。 */
+static void test_previous_response_id_suffix_render(void) {
+    const char *body =
+        "{\"instructions\":\"SYSPROMPT\","
+        "\"tools\":[{\"type\":\"function\",\"name\":\"f\",\"description\":\"d\",\"parameters\":{}}],"
+        "\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":\"hello_new\"}]}";
+    char full[8192], suffix[8192];
+    const char *why = NULL;
+    assert(parse_chat_prompt_ex(body, full, sizeof full, &why));
+    assert(parse_chat_prompt_suffix_ex(body, suffix, sizeof suffix, &why));
+    assert(strstr(full, "<\xef\xbd\x9c" "begin") != NULL);   /* 拆开：\x9cb 会被当成一个转义 */        /* 全量带 BOS */
+    assert(strstr(full, "SYSPROMPT") != NULL);                    /* 全量带系统提示词 */
+    assert(strstr(suffix, "SYSPROMPT") == NULL);                  /* 增量不带 */
+    assert(strstr(suffix, "hello_new") != NULL);                  /* 增量带新消息 */
+    assert(strlen(suffix) < strlen(full));
+    printf("  [PASS] previous_response_id suffix render: items only, no BOS/instructions/tools\n");
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && !strcmp(argv[1], "--render")) {
         size_t capacity = strlen(argv[2]) * 4 + 1024;
@@ -700,6 +742,8 @@ int main(int argc, char **argv) {
     test_deepseek41_stream_tool_calls();
     test_tool_call_event_json();
     test_responses_call_merges_into_assistant_turn();
+    test_previous_response_id_registry();
+    test_previous_response_id_suffix_render();
     printf("====================================================\n");
     printf("       Running myds Server API Unit Tests           \n");
     printf("====================================================\n");

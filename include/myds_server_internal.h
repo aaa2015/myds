@@ -65,6 +65,16 @@ void extract_message_text(const char *obj_buf, char *out, size_t out_size);
 bool parse_chat_prompt(const char *body, char *out_prompt, size_t max_prompt_len);
 /* 同上，但把【失败原因】回传给调用方（服务端用它写日志与精确报错）。
  * 两者原本共用一个笼统文案，导致「带 tools 被拒」与「提示词太大」在线上无法区分。 */
+/* previous_response_id：只渲染新增部分（无 BOS / instructions / tools），前缀由引擎缓存提供。 */
+bool parse_chat_prompt_suffix_ex(const char *body, char *out_prompt, size_t max_prompt_len,
+                                 const char **out_reason);
+
+/* 响应 id 注册表（供单测）。语义：只有【最新登记】的那一个是 live。 */
+void resp_id_new(char *out, size_t cap);
+void resp_id_register(const char *id);
+bool resp_id_is_live(const char *id);
+bool resp_id_seen(const char *id);
+
 bool parse_chat_prompt_ex(const char *body, char *out_prompt, size_t max_prompt_len,
                           const char **out_reason);
 

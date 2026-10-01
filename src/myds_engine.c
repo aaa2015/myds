@@ -2773,6 +2773,36 @@ static int myds_generate_internal(myds_context_t *ctx,
         return 0;
     }
 
+    /* ★ previous_response_id：客户端只发了【新增内容】，前缀要由引擎补上。
+     * 直接用 token 而不是「把上次的文本重新拼一遍再分词」——后者要过一遍 tokenizer 往返，
+     * 边界处的合并可能产生不同的 token，从而悄悄错位。pcache_tokens 就是那条精确序列。 */
+    if (ctx->continue_from_cache) {
+        ctx->continue_from_cache = false;   /* 一次性：不能影响后续请求 */
+        const uint32_t pl = ctx->pcache_len;
+        if (pl && ctx->pcache_tokens) {
+            if ((size_t)pl + (size_t)n_prompt > prompt_alloc_tokens) {
+                size_t need = (size_t)pl + (size_t)n_prompt;
+                int32_t *nt = (int32_t *)realloc(prompt_tokens, need * sizeof(int32_t));
+                if (!nt) {
+                    MYDS_LOG_E("continuation: out of memory (%u cached + %d new)", pl, n_prompt);
+                    free(prompt_tokens);
+                    if (out_reason) *out_reason = MYDS_STOP_ERROR;
+                    return 0;
+                }
+                prompt_tokens = nt; prompt_alloc_tokens = need;
+            }
+            memmove(prompt_tokens + pl, prompt_tokens, (size_t)n_prompt * sizeof(int32_t));
+            memcpy(prompt_tokens, ctx->pcache_tokens, (size_t)pl * sizeof(int32_t));
+            MYDS_LOG_I("previous_response_id: %u cached + %d new = %u tokens",
+                       pl, n_prompt, pl + (uint32_t)n_prompt);
+            n_prompt += (int32_t)pl;
+        } else {
+            /* 状态已被后续请求换掉 ⇒ 前缀不在。这里【继续按全量跑】并说话，
+             * 而不是假装命中 —— 服务端那一侧已经用 id 保证只会走到「最近一次」。 */
+            MYDS_LOG_W("previous_response_id: no cached sequence to continue from; prefilling in full");
+        }
+    }
+
     if (out_prompt_tokens) {
         *out_prompt_tokens = (uint32_t)n_prompt;
     }
@@ -3002,6 +3032,11 @@ void myds_last_prefill_stats(const myds_context_t *ctx, myds_prefill_stats_t *ou
     out->cached_tokens    = ctx->last_cached_tokens;
     out->prefill_tokens   = ctx->last_prefill_tokens;
     out->prefill_seconds  = ctx->last_prefill_seconds;
+}
+
+/* 供服务端在收到 previous_response_id 时调用：下一次 generate 把 pcache 序列当作前缀。 */
+void myds_set_continue_from_cache(myds_context_t *ctx, bool enable) {
+    if (ctx) ctx->continue_from_cache = enable;
 }
 
 int myds_generate_bytes_ex(myds_context_t *ctx, const char *prompt,
