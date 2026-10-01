@@ -47,16 +47,28 @@ if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
     exit 2
 fi
 
-# ── 提示词：要足够长，让低位区那 11 个固定槽都有东西可存 ──
-if [ ! -f "$PROMPT_FILE" ]; then
+# ── 提示词：★ 码词放在【最前面】，后面跟一大段填充 ──
+# 为什么必须这样放：快照的窗口环只有 128 个 token，码词若落在尾部，召回只需窗口环
+# 就能做到 —— 那测不到【压缩 KV】，而压缩 KV 恰恰是磁盘路径新加、内存路径不存的那一块。
+# 放在最前面（位置 < 100）时，要在末尾召回就必须靠压缩 KV 覆盖 [0..6144) 那段。
+PREFIX_FILE="${PREFIX_FILE:-/tmp/low_kv_gate_prefix.txt}"
+if [ ! -f "$PREFIX_FILE" ]; then
     {
-        printf 'You are a careful assistant. Answer with only the requested value.\n'
+        printf 'The vault code is CRIMSONOTTER9. Remember it exactly.\n'
         for i in $(seq 1 600); do printf 'context-%d w%d filler text for the constant prefix. ' "$i" "$((i % 97))"; done
-        printf '\nRemember this codeword: CRIMSONOTTER9.\n'
-        printf 'Question: reply with the codeword only.\n'
-    } > "$PROMPT_FILE"
+        printf '\n'
+    } > "$PREFIX_FILE"
 fi
-note "提示词: $PROMPT_FILE（$(wc -c < "$PROMPT_FILE" | tr -d ' ') 字节）"
+
+# 三个提示词共用同一段常量前缀（这正是要被磁盘复用的那段），只在末尾提问不同。
+# 判据写的是「回答里必须出现什么」—— 逐字匹配对生成模型太脆，包含关系才是稳定的判据。
+PROMPT_TAILS=(
+    "Reply with the vault code only.|CRIMSONOTTER9"
+    "What is 6 times 7? Reply with just the number.|42"
+    "Is the vault code CRIMSONOTTER9 or CRIMSONOTTER8? Reply with the correct one.|CRIMSONOTTER9"
+)
+note "前缀: $PREFIX_FILE（$(wc -c < "$PREFIX_FILE" | tr -d ' ') 字节，码词在最前面）"
+note "提示词: ${#PROMPT_TAILS[@]} 个（共用同一段常量前缀）"
 
 start_server() {   # $1=日志文件
     MYDS_PREFIX_CACHE=1 MYDS_KV_DSK="$CACHE" \
@@ -72,44 +84,62 @@ start_server() {   # $1=日志文件
     return 1
 }
 
-ask() {   # $1=输出文件
-    python3 - "$PORT" "$PROMPT_FILE" "$1" <<'PY'
+ask() {   # $1=末尾提问  $2=输出文件
+    python3 - "$PORT" "$PREFIX_FILE" "$1" "$2" <<'PY'
 import json, sys, urllib.request, pathlib
-port, pf, out = sys.argv[1], sys.argv[2], sys.argv[3]
-prompt = pathlib.Path(pf).read_text()
+port, pf, tail, out = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+prompt = pathlib.Path(pf).read_text() + tail
 body = {"model": "low-kv-gate",
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.0, "seed": 42, "max_tokens": 64, "stream": False}
+        "temperature": 0.0, "max_tokens": 32, "stream": False}
 req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions",
         data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
 with urllib.request.urlopen(req, timeout=900) as r:
     d = json.loads(r.read())
 pathlib.Path(out).write_text(d["choices"][0]["message"]["content"])
-print("  回答:", repr(d["choices"][0]["message"]["content"][:80]))
+print("  回答:", repr(d["choices"][0]["message"]["content"][:60]))
 PY
 }
 
-echo "═══ ① 冷跑（空盘 ⇒ 全量 prefill，并落盘）═══"
+# 跑一轮全部提示词（$1 = 输出前缀名）
+run_all() {
+    local tag="$1" i=0 ok_here=0
+    for entry in "${PROMPT_TAILS[@]}"; do
+        i=$((i + 1))
+        local tail="${entry%%|*}" want="${entry##*|}"
+        printf '  [%s] #%d 期望含 %s\n' "$tag" "$i" "$want"
+        ask "$tail" "/tmp/low_kv_gate_${tag}_${i}.txt" || { fail "$tag #$i 请求失败"; continue; }
+        if grep -qF "$want" "/tmp/low_kv_gate_${tag}_${i}.txt"; then
+            ok_here=$((ok_here + 1))
+        else
+            fail "$tag #$i 回答里没有 '$want'"
+        fi
+    done
+    printf '  %s: %d/%d 正确\n' "$tag" "$ok_here" "$i"
+    return 0
+}
+
+echo "═══ ① 冷跑（空盘 => 全量 prefill，并落盘；此时内存里也没有快照）═══"
 rm -rf "$CACHE"; mkdir -p "$CACHE"
 start_server "$LOG_A" || exit 1
 note "服务已起（pid $SRV_PID）"
-ask "$OUT_A" || { fail "冷跑请求失败"; kill "$SRV_PID" 2>/dev/null; exit 1; }
-grep -c "kvdisk: 低位区落盘已启用" "$LOG_A" >/dev/null && ok "落盘已启用" || fail "日志里没有启用行"
-grep -E "kvdisk: 槽|写盘失败" "$LOG_A" | head -3 | sed 's/^/    /'
-ls -la "$CACHE" 2>/dev/null | tail -2 | sed 's/^/    /'
+run_all cold
+grep -q "kvdisk: 低位区落盘已启用" "$LOG_A" && ok "落盘已启用" || fail "日志里没有启用行"
+ls -la "$CACHE" 2>/dev/null | grep kvlow | sed 's/^/    /'
 kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null
 
 echo
-echo "═══ ② 重启（内存快照清空，磁盘保留）═══"
+echo "═══ ② 重启（内存快照清空，磁盘保留 —— 这一步不可省）═══"
 start_server "$LOG_B" || exit 1
 note "服务已起（pid $SRV_PID）"
 
 echo
-echo "═══ ③ 热跑（同一个提示词 ⇒ 应命中磁盘）═══"
-ask "$OUT_B" || { fail "热跑请求失败"; kill "$SRV_PID" 2>/dev/null; exit 1; }
+echo "═══ ③ 热跑（同样三个提示词 => 第一个必须命中磁盘，其余走磁盘派生出的状态）═══"
+run_all warm
 if grep -q "resume from DISK snapshot" "$LOG_B"; then
     ok "日志确认走了【磁盘】路径（不是内存快照，也不是全量）"
     grep -m1 "resume from DISK snapshot" "$LOG_B" | sed 's/^/    /'
+    grep -m1 "kvdisk: 命中位置" "$LOG_B" | sed 's/^/    /'
 else
     fail "没有出现 'resume from DISK snapshot' —— 磁盘路径根本没被走到，本次门禁无效"
     grep -E "prefix cache:" "$LOG_B" | head -3 | sed 's/^/    /'
@@ -117,14 +147,20 @@ fi
 kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null
 
 echo
-echo "═══ ④ 逐位对齐 ═══"
-if [ -s "$OUT_A" ] && cmp -s "$OUT_A" "$OUT_B"; then
-    ok "冷跑与磁盘命中的输出【逐字节相同】（$(wc -c < "$OUT_A" | tr -d ' ') 字节）"
-else
-    fail "输出不同 —— 磁盘恢复的状态与全量 prefill 不等价，本特性【不能启用】"
-    note "A: $(head -c 200 "$OUT_A")"
-    note "B: $(head -c 200 "$OUT_B")"
-fi
+echo "═══ ④ 逐位对齐（三个提示词逐个比对）═══"
+i=0
+for entry in "${PROMPT_TAILS[@]}"; do
+    i=$((i + 1))
+    want="${entry##*|}"
+    A="/tmp/low_kv_gate_cold_${i}.txt"; B="/tmp/low_kv_gate_warm_${i}.txt"
+    if [ -s "$A" ] && [ -s "$B" ] && cmp -s "$A" "$B"; then
+        ok "#$i 冷跑与磁盘命中逐字节相同（$(wc -c < "$A" | tr -d ' ') 字节）"
+    else
+        fail "#$i 输出不同 => 磁盘恢复的状态与全量 prefill 不等价，本特性不能启用"
+        note "A: $(head -c 160 "$A" 2>/dev/null)"
+        note "B: $(head -c 160 "$B" 2>/dev/null)"
+    fi
+done
 
 echo
 if [ "$fails" -eq 0 ]; then
