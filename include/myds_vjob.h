@@ -39,7 +39,7 @@ typedef struct {
 
 /* 一次请求的图片槽。服务端把它传进提示词构建函数，
  * 构建过程中遇到 input_image 就填进来（目前只支持一张）。 */
-typedef struct {
+typedef struct myds_vjob_sink_s {
     myds_vjob_plan_t plan;
     bool             have;
 } myds_vjob_sink_t;

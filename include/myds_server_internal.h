@@ -77,6 +77,13 @@ void resp_id_register(const char *id);
 bool resp_id_is_live(const char *id);
 bool resp_id_seen(const char *id);
 
+/* 带视觉槽的版本：img 非空时，input_image 内容块会被处理并填进 sink。 */
+struct myds_vjob_sink_s;
+bool parse_chat_prompt_vis(const char *body, char *out_prompt, size_t max_prompt_len,
+                           const char **out_reason, struct myds_vjob_sink_s *img);
+bool parse_chat_prompt_suffix_vis(const char *body, char *out_prompt, size_t max_prompt_len,
+                                  const char **out_reason, struct myds_vjob_sink_s *img);
+
 bool parse_chat_prompt_ex(const char *body, char *out_prompt, size_t max_prompt_len,
                           const char **out_reason);
 

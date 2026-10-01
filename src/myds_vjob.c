@@ -106,19 +106,34 @@ int myds_vjob_plan(const uint8_t *encoded, size_t len, myds_vjob_plan_t *out,
         return 0;
     }
 
-    float *emb = (float *)malloc((size_t)pat.patch_count * dim * sizeof(float));
+    /* ★ 编码器输出的行数是【下采样后】的位置数，不是 patch 数：
+     *   39×39 个 patch 经 aligner 的 3×3 unfold ⇒ ceil(39/3)² = 13×13 = 169 行。
+     *   这与布局里的 image_count 一致（也是 169）。
+     *   我第一版拿 patch_count(1521) 去比，于是每张图都报「编码失败」——
+     *   而错误信息还是我自己那句笼统的 catch-all，看不出是这里比错了。 */
+    float *emb = (float *)malloc((size_t)lay.image_count * dim * sizeof(float));
     if (!emb) {
         vjob_error(error, error_cap, "图片嵌入分配失败");
         myds_vis_layout_free(&lay); myds_vis_patches_free(&pat); myds_vis_image_free(&image);
         return 0;
     }
     uint32_t rows = 0;
-    if (!myds_vis_encode(g_w, &pat, emb, &rows, error, error_cap) || rows != pat.patch_count) {
+    if (!myds_vis_encode(g_w, &pat, emb, &rows, error, error_cap)) {
         if (error && !error[0]) vjob_error(error, error_cap, "视觉编码失败");
         free(emb);
         myds_vis_layout_free(&lay); myds_vis_patches_free(&pat); myds_vis_image_free(&image);
         return 0;
     }
+    if (rows != lay.image_count) {
+        /* 位置数对不上 ⇒ 布局与编码器对同一张图的理解不一致，绝不放行（会让向量贴错位置） */
+        if (error && error_cap)
+            snprintf(error, error_cap, "编码输出 %u 行，但布局需要 %u 个图片位置",
+                     rows, lay.image_count);
+        free(emb);
+        myds_vis_layout_free(&lay); myds_vis_patches_free(&pat); myds_vis_image_free(&image);
+        return 0;
+    }
+    
 
     /* ── 按布局拼出逐位置的向量 ──
      * IMAGE 位置取编码器输出（按布局给的排列序）；三处哨兵取模型学出来的向量。 */
