@@ -77,6 +77,13 @@ static inline void scale_f32(float *x, float a, uint32_t n) {
 #endif
 }
 
+static inline bool is_myds_prof_enabled(void) {
+    static int cached = -1;
+    if (__builtin_expect(cached < 0, 0)) {
+        cached = (getenv("MYDS_PROF") != NULL) ? 1 : 0;
+    }
+    return cached == 1;
+}
 
 static void head_rms_norm_inplace(float *x, uint32_t n_head, uint32_t head_dim, float eps) {
     for (uint32_t h = 0; h < n_head; h++) {
@@ -1532,7 +1539,7 @@ static int execute_ffn_layer(
     memset(&tf0, 0, sizeof(tf0));
     memset(&tf1, 0, sizeof(tf1));
     memset(&tf2, 0, sizeof(tf2));
-    bool do_ffn_prof = (l == 0 && getenv("MYDS_PROF") != NULL);
+    bool do_ffn_prof = (l == 0 && is_myds_prof_enabled());
     if (do_ffn_prof) gettimeofday(&tf0, NULL);
 
     if (layer->ffn_gate_exps && layer->ffn_up_exps && layer->ffn_down_exps && layer->router_gate) {
@@ -1719,7 +1726,7 @@ static int execute_transformer_layer(myds_context_t *ctx, uint32_t l, uint32_t p
 
         /* Batch 1: Pre-Attention RMSNorm + Query LoRA down-proj + Latent KV proj */
         struct timeval t0, t1, t2, t3, t4, t5, t6;
-        bool do_prof = (l == 0 && getenv("MYDS_PROF") != NULL);
+        bool do_prof = (l == 0 && is_myds_prof_enabled());
         if (do_prof) gettimeofday(&t0, NULL);
 
         myds_metal_begin_batch();
@@ -2061,7 +2068,7 @@ static int32_t myds_forward_token_internal(myds_context_t *ctx, int32_t token_id
 
     /* 3. Final RMSNorm & LM Head Logits Batch */
     struct timeval t_lm0, t_lm1, t_sp0, t_sp1;
-    bool do_head_prof = (getenv("MYDS_PROF") != NULL);
+    bool do_head_prof = is_myds_prof_enabled();
     if (do_head_prof) gettimeofday(&t_lm0, NULL);
 
     myds_metal_begin_batch();
@@ -2463,7 +2470,7 @@ static int execute_prefill_chunk_layer(
     bool use_mm_sh_down = (prefill_mode == -1) || (prefill_mode > 0 && (prefill_mode & 32));
 
     struct timeval tp0, tp1, tp2, tp3, tp4;
-    bool do_prof = (l == 0 && cur_pos == 0 && getenv("MYDS_PROF") != NULL);
+    bool do_prof = (l == 0 && cur_pos == 0 && is_myds_prof_enabled());
     if (do_prof) gettimeofday(&tp0, NULL);
 
     /* Batch 1: RMSNorm + Q_a + KV + QR_Norm + Q_b + KV_Norm across all chunk tokens (barrier optimized) */

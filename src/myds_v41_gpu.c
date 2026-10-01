@@ -51,6 +51,7 @@ struct myds_v41_gpu_scratch {
     uint32_t key_comp_max;   /* n_comp 的上界；超了必须在 prefill 开始前就拒绝 */
     uint32_t mask_u16;       /* 掩码行宽（u16），32 对齐 ⇒ keys_pad 落在行内 */
     uint32_t slab_rows;      /* kv slab 行数 = CARRY + MAXC + key_comp_max */
+    uint32_t keys_clamp;     /* 诊断：MYDS_ATTN_KEYS_CLAMP 缓存 */
 };
 static int floats(const myds_metal_buffer_t *b,uint64_t n) {
     return b && n && n<=myds_metal_buffer_size(b)/4 && myds_metal_buffer_offset(b)%4==0;
@@ -79,6 +80,8 @@ myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp) {
     myds_v41_gpu_scratch_t *s=calloc(1,sizeof(*s));
     if(!s)return NULL;
     s->max_comp=max_comp;
+    const char *kc = getenv("MYDS_ATTN_KEYS_CLAMP");
+    if(kc) s->keys_clamp = (uint32_t)strtoul(kc, NULL, 10);
     /* chunk attention 的几何量：键上界跟随配置的上下文，并封顶（env 可覆盖）。
      * 封顶的理由是内存：mask_chunk = MAXC * mask_u16 * 2 字节，而 mask_u16 ≈ 键上界。 */
     {
@@ -485,9 +488,8 @@ int myds_v41_gpu_attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buf
 
     /* 诊断：把压缩键数强行调小，【只影响 attention 读取的 K/V 量，不影响 dispatch 结构】，
      * 用来判断这 8 秒是不是 K/V 带宽 bound。结果不完整，仅计时。 */
-    if(getenv("MYDS_ATTN_KEYS_CLAMP")) {
-        uint32_t cl=(uint32_t)strtoul(getenv("MYDS_ATTN_KEYS_CLAMP"),NULL,10);
-        if(cl&&cl<n_comp)n_comp=cl;
+    if(__builtin_expect(s->keys_clamp > 0, 0)) {
+        if(s->keys_clamp < n_comp) n_comp = s->keys_clamp;
     }
 
     const uint32_t p0=base_pos+c_start;

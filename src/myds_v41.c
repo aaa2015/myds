@@ -907,11 +907,19 @@ static int project(myds_metal_buffer_t *out, const myds_metal_buffer_t *w,
         (!round || myds_metal_v41_bf16(out,rows));
 }
 
+static inline bool is_mul_mm_disabled(void) {
+    static int cached = -1;
+    if (__builtin_expect(cached < 0, 0)) {
+        cached = (getenv("MYDS_DISABLE_MUL_MM") != NULL) ? 1 : 0;
+    }
+    return cached == 1;
+}
+
 static int project_batch(myds_metal_buffer_t *out, const myds_metal_buffer_t *w,
                          const myds_metal_buffer_t *in, uint32_t rows, uint32_t width,
                          uint32_t n_tok, ggml_type type, bool round) {
     myds_metal_barrier();
-    int use_mm = (n_tok >= 32 && getenv("MYDS_DISABLE_MUL_MM") == NULL);
+    int use_mm = (n_tok >= 32 && !is_mul_mm_disabled());
     int ok = 0;
     if (use_mm) {
         ok = myds_metal_mul_mm(out, w, in, rows, width, n_tok, type);
@@ -1853,6 +1861,21 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     }
 
     int do_prof = getenv("MYDS_PROFILE_PREFILL") ? 1 : 0;
+    const bool batch_trace_prefix = (getenv("MYDS_BATCH_TRACE_PREFIX") != NULL);
+    const bool opt_disable_mm_engram = (getenv("MYDS_DISABLE_MM_ENGRAM") != NULL);
+    const bool opt_skip_q_a = (getenv("MYDS_SKIP_Q_A") != NULL);
+    const bool opt_skip_kv = (getenv("MYDS_SKIP_KV") != NULL);
+    const bool opt_skip_norm = (getenv("MYDS_SKIP_NORM") != NULL);
+    const bool opt_skip_kv_rope = (getenv("MYDS_SKIP_KV_ROPE") != NULL);
+    const bool opt_skip_kv_quant = (getenv("MYDS_SKIP_KV_QUANT") != NULL);
+    const bool opt_skip_q_b = (getenv("MYDS_SKIP_Q_B") != NULL);
+    const bool opt_skip_q_rope = (getenv("MYDS_SKIP_Q_ROPE") != NULL);
+    const bool opt_comp_per_token = (getenv("MYDS_COMPRESSOR_PER_TOKEN") != NULL);
+    const bool opt_idx_per_token = (getenv("MYDS_INDEXER_PER_TOKEN") != NULL);
+    const bool opt_prof_split = (getenv("MYDS_PROFILE_SPLIT") != NULL);
+    const bool opt_prof_split2 = (getenv("MYDS_PROFILE_SPLIT2") != NULL);
+    const bool opt_prof_split3 = (getenv("MYDS_PROFILE_SPLIT3") != NULL);
+    const bool opt_disable_mm_attn_a = (getenv("MYDS_DISABLE_MM_ATTN_A") != NULL);
     double prof_engram = 0, prof_embedding = 0, prof_total_layers = 0;
     double prof_step1 = 0, prof_step2 = 0, prof_step3 = 0, prof_step4 = 0, prof_step5 = 0;
     double prof_step6 = 0, prof_step7 = 0, prof_step8 = 0;
@@ -1919,7 +1942,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         if (!myds_metal_buffer_write(prompt_res, (size_t)t * res_tok_bytes, r, res_tok_bytes)) goto fail;
         if (!myds_metal_buffer_write(prompt_pre, (size_t)t * pre_tok_bytes, initial_pre, pre_tok_bytes)) goto fail;
 
-        if (getenv("MYDS_BATCH_TRACE_PREFIX")) {
+        if (batch_trace_prefix) {
             memcpy(myds_metal_buffer_data(g->residual), r, res_tok_bytes);
             if (!myds_trace_f32("embedding", 0, base_pos + t, g->residual, 4 * V41_DIM)) goto fail;
         }
@@ -1928,7 +1951,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 
     phase = "layer loop";
 #define CHECK(x) do { if (!(x)) goto fail; } while (0)
-#define TRACE(stage,buf,n) CHECK(myds_trace_f32(stage,il,pos,buf,n))
+#define TRACE(stage,buf,n) do { if (trace_on) CHECK(myds_trace_f32(stage,il,pos,buf,n)); } while (0)
 
     if (do_prof) gettimeofday(&ptv_all0, NULL);
 
@@ -1978,7 +2001,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                  * 完整读一遍（4404 token x 2 层 = 2.8 TB）。 */
                 myds_metal_barrier();
                 int e_batched = 0;
-                if (!getenv("MYDS_DISABLE_MM_ENGRAM"))
+                if (!opt_disable_mm_engram)
                     e_batched = myds_metal_mul_mm(cw->engram_proj_buf[e], v->engram_proj[e],
                         cw->engram_rows_buf[e], 5 * V41_DIM, MYDS_ENGRAM_INPUT_DIM, c_len, GGML_TYPE_F16);
                 if (!e_batched) {
@@ -2029,19 +2052,19 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             /* Step 2: Batched Q_A and KV projections (reads weights ONCE for all c_len tokens) */
             TIME_START();
             phase = "batched attention projections";
-            if (!getenv("MYDS_SKIP_Q_A"))
+            if (!opt_skip_q_a)
                 CHECK(project_batch(cw->qr_buf, base->attn_q_a, cw->x_norm_buf, 1280, V41_DIM, c_len, base->attn_q_a_type, true));
-            if (!getenv("MYDS_SKIP_KV"))
+            if (!opt_skip_kv)
                 CHECK(project_batch(cw->kv_act_buf, base->attn_kv, cw->x_norm_buf, 512, V41_DIM, c_len, base->attn_kv_type, true));
 
-            if (!getenv("MYDS_SKIP_NORM"))
+            if (!opt_skip_norm)
             CHECK(myds_metal_v41_rmsnorm_batch(cw->qr_norm_buf, cw->qr_buf, base->attn_q_a_norm, 1280, c_len, m->norm_eps, true));
             CHECK(myds_metal_v41_rmsnorm_batch(cw->kv_act_buf, cw->kv_act_buf, base->attn_kv_a_norm, 512, c_len, m->norm_eps, true));
 
             /* Batched RoPE & Quant for KV */
-            if (!getenv("MYDS_SKIP_KV_ROPE"))
+            if (!opt_skip_kv_rope)
                 CHECK(myds_v41_gpu_rope_batch(cw->kv_act_buf, 512, 1, base_pos + c_start, c_len, compressed, false));
-            if (!getenv("MYDS_SKIP_KV_QUANT"))
+            if (!opt_skip_kv_quant)
                 CHECK(myds_v41_gpu_quant(cw->kv_act_buf, 512, c_len, 1));
 
             if (trace_on) {
@@ -2066,11 +2089,11 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 
             /* Step 3: Batched Q_B projection (reads 21 MB weight ONCE for all c_len tokens) */
             TIME_START();
-            if (!getenv("MYDS_SKIP_Q_B"))
+            if (!opt_skip_q_b)
             CHECK(project_batch(cw->q_buf, base->attn_q_b, cw->qr_norm_buf, V41_HEADS * 512, 1280, c_len, base->attn_q_b_type, true));
 
             /* Batched RoPE for Q */
-            if (!getenv("MYDS_SKIP_Q_ROPE"))
+            if (!opt_skip_q_rope)
                 CHECK(myds_v41_gpu_rope_batch(cw->q_buf, 512, V41_HEADS, base_pos + c_start, c_len, compressed, false));
 
             if (trace_on) {
@@ -2112,7 +2135,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             if (kv_source(il)) {
                 phase = "compressed KV";
                 int comp_batched = 0;
-                if (!getenv("MYDS_COMPRESSOR_PER_TOKEN"))
+                if (!opt_comp_per_token)
                     comp_batched = publish_compressor_chunk(ctx, il, c_start, c_len, base_pos,
                         cw->pool_kv_buf, ratio == 2 ? cw->pool_score_buf : NULL,
                         cw->comp_latent_buf, cw->comp_index_k_buf);
@@ -2132,7 +2155,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             }
             if (index_source(il)) {
                 int batched = 0;
-                if (!getenv("MYDS_INDEXER_PER_TOKEN")) {
+                if (!opt_idx_per_token) {
                     batched = publish_indexer_chunk(ctx, il, c_start, c_len, base_pos,
                         cw->index_q_buf, cw->index_weights_buf, prompt_selected, sel_bytes,
                         prompt_block_mask, mask_bytes, cw->cur_index_q_view, cw->cur_index_weights_view,
@@ -2168,7 +2191,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 
             /* 诊断：把 Step 4 切成 indexer / attention 两段，各自测 GPU 等待。
              * 不开这个开关时行为与原来完全一致（一次 commit 都不多）。 */
-            if (do_prof && getenv("MYDS_PROFILE_SPLIT")) {
+            if (do_prof && opt_prof_split) {
                 TIME_START();
                 CHECK(myds_metal_commit_batch());
                 TIME_ACC(prof_wait_indexer);
@@ -2239,7 +2262,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
              * token.  That removes two dispatches per token per layer.  Positions in the chunk are
              * consecutive, which is what the batched RoPE wants. */
             /* 诊断：把 Step 4 尾部再切一刀 —— attention 与 bf16/rope 分开计等待 */
-            if (do_prof && getenv("MYDS_PROFILE_SPLIT2")) {
+            if (do_prof && opt_prof_split2) {
                 TIME_START();
                 CHECK(myds_metal_commit_batch());
                 TIME_ACC(prof_wait_attn2);
@@ -2248,7 +2271,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 
             CHECK(myds_metal_v41_bf16(cw->attn_heads_buf, V41_HEADS * 512 * c_len));
             /* 诊断：bf16 与 rope 分开计等待 */
-            if (do_prof && getenv("MYDS_PROFILE_SPLIT3")) {
+            if (do_prof && opt_prof_split3) {
                 TIME_START();
                 CHECK(myds_metal_commit_batch());
                 TIME_ACC(prof_wait_bf16);
@@ -2267,7 +2290,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
              * entry point declines (unsupported type or shape). */
             myds_metal_barrier();
             int a_ok = 0;
-            if (!getenv("MYDS_DISABLE_MM_ATTN_A"))
+            if (!opt_disable_mm_attn_a)
                 a_ok = myds_metal_mul_mm_grouped(cw->attn_low_buf, base->attn_output_a,
                         cw->attn_heads_buf, 1024, 4096, 8, c_len, base->attn_output_a_type);
             if (!a_ok)
@@ -2498,11 +2521,11 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         printf("Wait Proj (GPU)       : %8.2f ms\n", prof_wait_qkv);
         printf("Step 4 (SWA Attention): %8.2f ms\n", prof_step4);
         printf("Wait SWA (GPU)        : %8.2f ms\n", prof_wait_swa);
-        if (getenv("MYDS_PROFILE_SPLIT"))
+        if (opt_prof_split)
             printf("  ...of which indexer  : %8.2f ms\n", prof_wait_indexer);
-        if (getenv("MYDS_PROFILE_SPLIT2"))
+        if (opt_prof_split2)
             printf("  ...ring+attention    : %8.2f ms\n", prof_wait_attn2);
-        if (getenv("MYDS_PROFILE_SPLIT3"))
+        if (opt_prof_split3)
             printf("  ...bf16(attn_heads)  : %8.2f ms  (rope = remainder)\n", prof_wait_bf16);
         printf("Step 5 (Attn Out B)   : %8.2f ms\n", prof_step5);
         printf("Step 6 (HC FFN In)    : %8.2f ms\n", prof_step6);
