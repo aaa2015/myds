@@ -178,6 +178,23 @@ bool myds_v41_snapshot_restore(myds_v41_context_t *g, uint32_t p) {
     return false;
 }
 
+
+/* ── 图片嵌入注入 ──
+ * 序列位置落在 [img_emb_start, img_emb_start+img_emb_count) 时，
+ * 该位置的基础向量不用词表查表，而取注入数据里的那一份（每维 dim 长）。
+ * 其余 (pos, token) 组合照常查表。返回 true 表示已填好 out[0..dim)。
+ * ★ 为什么要按【位置】而不是按 token id：图片块所有位置共用同一个 id。 */
+static bool v41_image_embedding_at(const myds_context_t *ctx, uint32_t pos,
+                                   float *out, uint32_t dim) {
+    if (!ctx || !ctx->img_emb_data || ctx->img_emb_count == 0) return false;
+    if (pos < ctx->img_emb_start) return false;
+    const uint32_t off = pos - ctx->img_emb_start;
+    if (off >= ctx->img_emb_count) return false;
+    if (dim != V41_DIM) return false;      /* 注入数据按语言模型的嵌入宽度给 */
+    memcpy(out, ctx->img_emb_data + (size_t)off * dim, (size_t)dim * sizeof(float));
+    return true;
+}
+
 static uint32_t ratio_for(uint32_t l) { return l < 2 ? 0 : l < 20 ? 2 : 1; }
 static uint32_t owner_for(uint32_t l) { return l < 8 ? 0 : l < 14 ? 1 : l < 20 ? 2 : 3; }
 static bool kv_source(uint32_t l) { return l == 2 || l == 8 || l == 14 || l == 20; }
@@ -753,9 +770,13 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
     CHECK(myds_engram_prepare_token(g->engram,token,pos));
     for (uint32_t i=0;i<2;i++) CHECK(myds_metal_buffer_write(g->engram_rows[i],0,
         g->engram->row_values[i],MYDS_ENGRAM_INPUT_DIM*4u));
-    const uint16_t *row=(const uint16_t *)myds_metal_buffer_data(m->tok_embeddings)+(size_t)token*V41_DIM;
     float *res=myds_metal_buffer_data(g->residual);
-    for (uint32_t j=0;j<V41_DIM;j++) res[j]=myds_fp16_to_fp32(row[j]);
+    if (v41_image_embedding_at(ctx,pos,res,V41_DIM)) {
+        /* 图片块：该位置用注入向量（已填进 res） */
+    } else {
+        const uint16_t *row=(const uint16_t *)myds_metal_buffer_data(m->tok_embeddings)+(size_t)token*V41_DIM;
+        for (uint32_t j=0;j<V41_DIM;j++) res[j]=myds_fp16_to_fp32(row[j]);
+    }
     for (uint32_t j=1;j<4;j++) memcpy(res+j*V41_DIM,res,V41_DIM*4u);
     const float initial_pre[4]={1,0,0,0};
     CHECK(myds_metal_buffer_write(g->pre,0,initial_pre,sizeof(initial_pre)));
@@ -1356,14 +1377,25 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             MYDS_LOG_E("V4.1 invalid token %d at pos %u", tok, base_pos + t);
             goto fail;
         }
-        const uint16_t *row = embd_table + (size_t)tok * V41_DIM;
         float r[4 * V41_DIM];
-        for (uint32_t j = 0; j < V41_DIM; j++) {
-            float v_emb = myds_fp16_to_fp32(row[j]);
-            r[j] = v_emb;
-            r[j + V41_DIM] = v_emb;
-            r[j + 2 * V41_DIM] = v_emb;
-            r[j + 3 * V41_DIM] = v_emb;
+        if (v41_image_embedding_at(ctx, base_pos + t, r, V41_DIM)) {
+            /* 图片块：该位置的向量来自注入（上面已填 r[0..V41_DIM)）*/
+            const uint16_t *unused_row = embd_table;   /* 仅为保持下方代码结构清晰 */
+            (void)unused_row;
+            for (uint32_t j = 0; j < V41_DIM; j++) {
+                r[j + V41_DIM] = r[j];
+                r[j + 2 * V41_DIM] = r[j];
+                r[j + 3 * V41_DIM] = r[j];
+            }
+        } else {
+            const uint16_t *row = embd_table + (size_t)tok * V41_DIM;
+            for (uint32_t j = 0; j < V41_DIM; j++) {
+                float v_emb = myds_fp16_to_fp32(row[j]);
+                r[j] = v_emb;
+                r[j + V41_DIM] = v_emb;
+                r[j + 2 * V41_DIM] = v_emb;
+                r[j + 3 * V41_DIM] = v_emb;
+            }
         }
         const float initial_pre[24] = {1.0f, 0.0f, 0.0f, 0.0f};
         if (!myds_metal_buffer_write(prompt_res, (size_t)t * res_tok_bytes, r, res_tok_bytes)) goto fail;

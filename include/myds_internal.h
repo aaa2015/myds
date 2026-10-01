@@ -172,6 +172,17 @@ struct myds_context {
     int32_t             *sample_indices;
     void                *sample_cands;
     uint64_t             rng_state;
+
+    /* ── 图片嵌入注入（视觉）──
+     * 序列位置 [img_emb_start, img_emb_start + img_emb_count) 的嵌入不用词表查表，
+     * 而是取下面这份数据。理由是【同一 token id 在不同位置要有不同向量】：
+     * V4.1 的图片块所有位置共用 image token id（129264），
+     * 逐位置的向量才区分（图片格 = 编码器输出；行尾 = image_newline 哨兵；首尾 = start/end）。
+     * 这与 ds4 的做法一致（ds4 也是推同一个 id、靠注入的向量区分）。
+     * 指针由 context 持有（设置时拷贝一份），clear / context_free 时释放。 */
+    float               *img_emb_data;   /* [img_emb_count * dim] */
+    uint32_t             img_emb_start;
+    uint32_t             img_emb_count;
 };
 
 /* Unified production sampler: greedy, temperature, top-k, min-p, top-p, repetition penalty */

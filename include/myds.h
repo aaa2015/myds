@@ -114,6 +114,15 @@ int             myds_generate(myds_context_t *ctx,
 /* Single token forward step */
 int32_t         myds_forward_token(myds_context_t *ctx, int32_t token_id, uint32_t pos);
 
+/* ── 视觉：图片嵌入注入 ──
+ * 把提示词里位置 [start_pos, start_pos + count) 的嵌入替换为 data 里的向量
+ * （count 个、每个 dim 长）。用于图片块：那些位置共用同一个 image token id，
+ * 但每格的向量不同（编码器输出 / 行尾哨兵 / 首尾哨兵）。
+ * 设置后【下一次生成】生效；生成结束由 myds_generate* 自动清除。 */
+void            myds_context_set_image_embeddings(myds_context_t *ctx, uint32_t start_pos,
+                                                  uint32_t count, const float *data, uint32_t dim);
+void            myds_context_clear_image_embeddings(myds_context_t *ctx);
+
 #ifdef __cplusplus
 }
 #endif

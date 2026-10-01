@@ -1185,9 +1185,43 @@ myds_context_t *myds_context_create(myds_model_t *model, const myds_config_t *cf
     return ctx;
 }
 
+/* ── 视觉：图片嵌入注入 ──
+ * 为什么需要它：图片块的所有位置共用同一个 token id（129264），
+ * 但每个位置的向量必须不同（图片格=编码器输出；行尾=image_newline；首尾=start/end）。
+ * 词表查表做不到这件事 ⇒ 单独给一段位置挂向量。
+ * 与 ds4 一致：ds4 也是推同一个 id，靠注入的向量区分。
+ * 这里拷一份数据（3~4MB 量级），避免调用方还要管生命周期 —— 少一个出错点。 */
+void myds_context_set_image_embeddings(myds_context_t *ctx, uint32_t start_pos,
+                                       uint32_t count, const float *data, uint32_t dim) {
+    if (!ctx) return;
+    myds_context_clear_image_embeddings(ctx);
+    if (!data || count == 0 || dim == 0) return;
+    size_t bytes = (size_t)count * dim * sizeof(float);
+    float *copy = (float *)malloc(bytes);
+    if (!copy) {
+        MYDS_LOG_E("image embeddings: cannot allocate %.1f MB", (double)bytes / 1048576.0);
+        return;
+    }
+    memcpy(copy, data, bytes);
+    ctx->img_emb_data = copy;
+    ctx->img_emb_start = start_pos;
+    ctx->img_emb_count = count;
+    MYDS_LOG_I("image embeddings: positions [%u, %u), %u values each %u wide",
+               start_pos, start_pos + count, count, dim);
+}
+
+void myds_context_clear_image_embeddings(myds_context_t *ctx) {
+    if (!ctx) return;
+    free(ctx->img_emb_data);
+    ctx->img_emb_data = NULL;
+    ctx->img_emb_start = 0;
+    ctx->img_emb_count = 0;
+}
+
 void myds_context_free(myds_context_t *ctx) {
     free(ctx->pcache_tokens); ctx->pcache_tokens=NULL; ctx->pcache_len=ctx->pcache_cap=0;
     if (!ctx) return;
+    myds_context_clear_image_embeddings(ctx);
     (void)myds_metal_synchronize();
     myds_v41_context_free(ctx->v41);
     free_prefill_chunk(ctx->prefill_chunk);
