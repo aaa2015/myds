@@ -100,6 +100,9 @@ int myds_metal_v41_hc_expand(myds_metal_buffer_t *out,
 int myds_metal_v41_engram_add(myds_metal_buffer_t *residual,
     const myds_metal_buffer_t *projected, const myds_metal_buffer_t *q_weight,
     const myds_metal_buffer_t *k_weight, uint32_t dim, float eps);
+int myds_metal_v41_engram_add_batch(myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *projected, const myds_metal_buffer_t *q_weight,
+    const myds_metal_buffer_t *k_weight, uint32_t dim, uint32_t rows, float eps);
 
 /* Decoupled RoPE (Rotary Position Embedding) for DeepSeek Q and K */
 int myds_metal_rope(

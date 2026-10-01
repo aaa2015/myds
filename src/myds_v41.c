@@ -1444,6 +1444,10 @@ struct v41_chunk_workspace_s {
     /* 批量 indexer 用的分组视图（整 chunk 缓冲 / 提示缓冲按子组切片） */
     myds_metal_buffer_t *cur_index_q_view;
     myds_metal_buffer_t *cur_index_weights_view;
+    myds_metal_buffer_t *moe_view;
+    myds_metal_buffer_t *shared_view;
+    myds_metal_buffer_t *after_view;
+    myds_metal_buffer_t *split_view;
     myds_metal_buffer_t *hc_flat_norm_buf;
     myds_metal_buffer_t *hc_mix_buf;
 };
@@ -1535,6 +1539,10 @@ static void v41_chunk_workspace_free(v41_chunk_workspace_t *cw) {
     if (cw->cur_mask_view) myds_metal_buffer_free(cw->cur_mask_view);
     if (cw->cur_index_q_view) myds_metal_buffer_free(cw->cur_index_q_view);
     if (cw->cur_index_weights_view) myds_metal_buffer_free(cw->cur_index_weights_view);
+    if (cw->moe_view) myds_metal_buffer_free(cw->moe_view);
+    if (cw->shared_view) myds_metal_buffer_free(cw->shared_view);
+    if (cw->after_view) myds_metal_buffer_free(cw->after_view);
+    if (cw->split_view) myds_metal_buffer_free(cw->split_view);
     if (cw->hc_flat_norm_buf) myds_metal_buffer_free(cw->hc_flat_norm_buf);
     if (cw->hc_mix_buf) myds_metal_buffer_free(cw->hc_mix_buf);
     if (cw->moe_batch > cw->capacity) {   /* 别名时不能重复释放 */
@@ -1695,8 +1703,13 @@ static v41_chunk_workspace_t *v41_chunk_workspace_create(uint32_t capacity, uint
     cw->cur_mask_view = myds_metal_buffer_create_view();
     cw->cur_index_q_view = myds_metal_buffer_create_view();
     cw->cur_index_weights_view = myds_metal_buffer_create_view();
+    cw->moe_view = myds_metal_buffer_create_view();
+    cw->shared_view = myds_metal_buffer_create_view();
+    cw->after_view = myds_metal_buffer_create_view();
+    cw->split_view = myds_metal_buffer_create_view();
     if (!cw->cur_res_view || !cw->cur_pre_view || !cw->cur_selected_view || !cw->cur_mask_view ||
-        !cw->cur_index_q_view || !cw->cur_index_weights_view) goto fail;
+        !cw->cur_index_q_view || !cw->cur_index_weights_view ||
+        !cw->moe_view || !cw->shared_view || !cw->after_view || !cw->split_view) goto fail;
     return cw;
 fail:
     v41_chunk_workspace_free(cw);
@@ -1713,6 +1726,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     if (!myds_metal_commit_batch()) return -1;
 
     uint32_t base_pos = ctx->pos;
+    const bool trace_on = myds_trace_active();
     if (base_pos + n_tokens > g->capacity || base_pos + n_tokens > ctx->cfg.max_seq_len) {
         MYDS_LOG_E("V4.1 prefill prompt length exceeds context capacity (%u + %u > %u)",
                    base_pos, n_tokens, g->capacity);
@@ -1938,10 +1952,12 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             myds_metal_buffer_update_sub_view(cw->cur_res_view, prompt_res, (size_t)c_start * res_tok_bytes, (size_t)c_len * res_tok_bytes);
             myds_metal_buffer_update_sub_view(cw->cur_pre_view, prompt_pre, (size_t)c_start * pre_tok_bytes, (size_t)c_len * pre_tok_bytes);
 
-            for (uint32_t t = 0; t < c_len; t++) {
-                uint32_t idx = c_start + t;
-                myds_metal_buffer_update_sub_view(cw->res_view[t], prompt_res, (size_t)idx * res_tok_bytes, res_tok_bytes);
-                myds_metal_buffer_update_sub_view(cw->pre_view[t], prompt_pre, (size_t)idx * pre_tok_bytes, 4 * sizeof(float));
+            if (trace_on) {
+                for (uint32_t t = 0; t < c_len; t++) {
+                    uint32_t idx = c_start + t;
+                    myds_metal_buffer_update_sub_view(cw->res_view[t], prompt_res, (size_t)idx * res_tok_bytes, res_tok_bytes);
+                    myds_metal_buffer_update_sub_view(cw->pre_view[t], prompt_pre, (size_t)idx * pre_tok_bytes, 4 * sizeof(float));
+                }
             }
 
             uint64_t disp_layer0 = myds_metal_dispatch_count();  /* 诊断 */
@@ -1965,10 +1981,18 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                         CHECK(project(cw->engram_proj_view[e][t], v->engram_proj[e], cw->engram_rows[e][t],
                             5 * V41_DIM, MYDS_ENGRAM_INPUT_DIM, GGML_TYPE_F16, true));
                 }
-                for (uint32_t t = 0; t < c_len; t++) {
-                    uint32_t pos = base_pos + c_start + t;   /* TRACE 宏要用 */
-                    CHECK(myds_metal_v41_engram_add(cw->res_view[t], cw->engram_proj_view[e][t], v->engram_q[e], v->engram_k[e], V41_DIM, m->norm_eps));
-                    TRACE("engram_out", cw->res_view[t], 4 * V41_DIM);
+                if (trace_on) {
+                    for (uint32_t t = 0; t < c_len; t++) {
+                        uint32_t idx = c_start + t;
+                        myds_metal_buffer_update_sub_view(cw->res_view[t], prompt_res, (size_t)idx * res_tok_bytes, res_tok_bytes);
+                    }
+                    for (uint32_t t = 0; t < c_len; t++) {
+                        uint32_t pos = base_pos + c_start + t;   /* TRACE 宏要用 */
+                        CHECK(myds_metal_v41_engram_add(cw->res_view[t], cw->engram_proj_view[e][t], v->engram_q[e], v->engram_k[e], V41_DIM, m->norm_eps));
+                        TRACE("engram_out", cw->res_view[t], 4 * V41_DIM);
+                    }
+                } else {
+                    CHECK(myds_metal_v41_engram_add_batch(cw->cur_res_view, cw->engram_proj_buf[e], v->engram_q[e], v->engram_k[e], V41_DIM, c_len, m->norm_eps));
                 }
             }
 
@@ -1977,7 +2001,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             CHECK(project_batch(cw->hc_mix_buf, l->attn_fn, cw->hc_flat_norm_buf, 24, 4 * V41_DIM, c_len, GGML_TYPE_F16, false));
             CHECK(myds_metal_v41_hc_split_batch(cw->attn_split_buf, cw->hc_mix_buf, l->attn_scale, l->attn_base, c_len, v->hc_eps));
 
-            if (getenv("MYDS_BATCH_TRACE_PREFIX")) {
+            if (trace_on) {
                 for (uint32_t t = 0; t < c_len; t++) {
                     uint32_t pos = base_pos + c_start + t;
                     TRACE("hc_attn_split", cw->attn_split[t], 24);
@@ -1988,7 +2012,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             CHECK(myds_metal_v41_hc_weighted_sum_batch(cw->x_buf, cw->cur_res_view, cw->cur_pre_view, V41_DIM, c_len, pre_tok_bytes));
             CHECK(myds_metal_v41_rmsnorm_batch(cw->x_norm_buf, cw->x_buf, base->attn_norm, V41_DIM, c_len, m->norm_eps, true));
 
-            if (getenv("MYDS_BATCH_TRACE_PREFIX")) {
+            if (trace_on) {
                 for (uint32_t t = 0; t < c_len; t++) {
                     uint32_t pos = base_pos + c_start + t;
                     TRACE("hc_attn_input", cw->x[t], V41_DIM);
@@ -2015,21 +2039,23 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             if (!getenv("MYDS_SKIP_KV_QUANT"))
                 CHECK(myds_v41_gpu_quant(cw->kv_act_buf, 512, c_len, 1));
 
-            for (uint32_t t = 0; t < c_len; t++) {
-                uint32_t idx = c_start + t;
-                uint32_t pos = base_pos + idx;
-                TRACE("q_a_raw", cw->qr[t], 1280);
-                TRACE("q_a_norm", cw->qr_norm[t], 1280);
-                TRACE("kv_raw", cw->kv_act[t], 512);
-                TRACE("kv_norm", cw->kv_act[t], 512);
-                TRACE("kv_rope", cw->kv_act[t], 512);
-                TRACE("kv_quant", cw->kv_act[t], 512);
-                /* The sliding-window ring is deliberately NOT written here.  Writing the
-                 * whole chunk first and reading it afterwards made each token read the
-                 * last tokens of the chunk instead of its own window, because the ring
-                 * only holds V41_WINDOW slots.  It is written per token in the attention
-                 * loop below, immediately before it is read, which is the order the
-                 * per-token path uses. */
+            if (trace_on) {
+                for (uint32_t t = 0; t < c_len; t++) {
+                    uint32_t idx = c_start + t;
+                    uint32_t pos = base_pos + idx;
+                    TRACE("q_a_raw", cw->qr[t], 1280);
+                    TRACE("q_a_norm", cw->qr_norm[t], 1280);
+                    TRACE("kv_raw", cw->kv_act[t], 512);
+                    TRACE("kv_norm", cw->kv_act[t], 512);
+                    TRACE("kv_rope", cw->kv_act[t], 512);
+                    TRACE("kv_quant", cw->kv_act[t], 512);
+                    /* The sliding-window ring is deliberately NOT written here.  Writing the
+                     * whole chunk first and reading it afterwards made each token read the
+                     * last tokens of the chunk instead of its own window, because the ring
+                     * only holds V41_WINDOW slots.  It is written per token in the attention
+                     * loop below, immediately before it is read, which is the order the
+                     * per-token path uses. */
+                }
             }
             TIME_ACC(prof_step2);
 
@@ -2042,7 +2068,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             if (!getenv("MYDS_SKIP_Q_ROPE"))
                 CHECK(myds_v41_gpu_rope_batch(cw->q_buf, 512, V41_HEADS, base_pos + c_start, c_len, compressed, false));
 
-            if (getenv("MYDS_BATCH_TRACE_PREFIX")) {
+            if (trace_on) {
                 for (uint32_t t = 0; t < c_len; t++) {
                     uint32_t pos = base_pos + c_start + t;
                     TRACE("q_b", cw->q[t], V41_HEADS * 512);
@@ -2270,7 +2296,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             CHECK(project_batch(cw->hc_mix_buf, l->ffn_fn, cw->hc_flat_norm_buf, 24, 4 * V41_DIM, c_len, GGML_TYPE_F16, false));
             CHECK(myds_metal_v41_hc_split_batch(cw->ffn_split_buf, cw->hc_mix_buf, l->ffn_scale, l->ffn_base, c_len, v->hc_eps));
 
-            if (getenv("MYDS_BATCH_TRACE_PREFIX")) {
+            if (trace_on) {
                 for (uint32_t t = 0; t < c_len; t++) {
                     uint32_t pos = base_pos + c_start + t;
                     TRACE("attn_out", cw->attn_out[t], V41_DIM);
@@ -2282,7 +2308,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             CHECK(myds_metal_v41_hc_weighted_sum_batch(cw->x_buf, cw->after_attn_buf, cw->attn_split_buf, V41_DIM, c_len, 96));
             CHECK(myds_metal_v41_rmsnorm_batch(cw->ffn_norm_buf, cw->x_buf, base->ffn_norm, V41_DIM, c_len, m->norm_eps, true));
 
-            if (getenv("MYDS_BATCH_TRACE_PREFIX")) {
+            if (trace_on) {
                 for (uint32_t t = 0; t < c_len; t++) {
                     uint32_t pos = base_pos + c_start + t;
                     TRACE("hc_ffn_input", cw->x[t], V41_DIM);
@@ -2308,7 +2334,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
              * This replaces seven dispatches per token (three transform, argsort, sum,
              * divide, scale) with seven dispatches per chunk.  The trace calls are kept
              * per token because they read the same per-token rows the batched kernels write. */
-            if (getenv("MYDS_BATCH_TRACE_PREFIX")) {
+            if (trace_on) {
                 for (uint32_t t = 0; t < c_len; t++) {
                     uint32_t pos = base_pos + c_start + t;   /* TRACE 需要 pos */
                     (void)pos;
@@ -2319,7 +2345,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                                        cw->route_probs_buf, cw->route_scores_buf,
                                        cw->router_logits_buf, base->router_bias,
                                        m->n_routed_experts, k, m->routed_scaling_factor, c_len));
-            if (getenv("MYDS_BATCH_TRACE_PREFIX")) {
+            if (trace_on) {
                 for (uint32_t t = 0; t < c_len; t++) {
                     uint32_t pos = base_pos + c_start + t;   /* TRACE 需要 pos */
                     (void)pos;
@@ -2383,38 +2409,31 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     if (e_len > chunk_size) e_len = chunk_size;
                     const uint32_t e_start = mb_start + e0;
                     const bool aliased = (cw->moe_batch == cw->capacity);
-                    myds_metal_buffer_t *moe_view = aliased ? NULL :
-                        myds_metal_buffer_sub_view(cw->moe_out_acc, (size_t)e0 * V41_DIM * sizeof(float),
-                                                   (size_t)e_len * V41_DIM * sizeof(float));
-                    myds_metal_buffer_t *shared_view = aliased ? NULL :
-                        myds_metal_buffer_sub_view(cw->moe_shared_acc, (size_t)e0 * V41_DIM * sizeof(float),
-                                                   (size_t)e_len * V41_DIM * sizeof(float));
-                    myds_metal_buffer_t *after_view = aliased ? NULL :
-                        myds_metal_buffer_sub_view(cw->moe_after_acc, (size_t)e0 * 4 * V41_DIM * sizeof(float),
-                                                   (size_t)e_len * 4 * V41_DIM * sizeof(float));
-                    myds_metal_buffer_t *split_view = aliased ? NULL :
-                        myds_metal_buffer_sub_view(cw->moe_split_acc, (size_t)e0 * 24 * sizeof(float),
-                                                   (size_t)e_len * 24 * sizeof(float));
-                    if (!aliased && (!moe_view || !shared_view || !after_view || !split_view)) {
-                        if (moe_view) myds_metal_buffer_free(moe_view);
-                        if (shared_view) myds_metal_buffer_free(shared_view);
-                        if (after_view) myds_metal_buffer_free(after_view);
-                        if (split_view) myds_metal_buffer_free(split_view);
-                        myds_metal_barrier();
-                        MYDS_LOG_E("V4.1 MoE batch sub-view failed (e0=%u mb_len=%u)", e0, mb_len);
-                        goto fail;
+                    if (!aliased) {
+                        if (!myds_metal_buffer_update_sub_view(cw->moe_view, cw->moe_out_acc,
+                                (size_t)e0 * V41_DIM * sizeof(float), (size_t)e_len * V41_DIM * sizeof(float)) ||
+                            !myds_metal_buffer_update_sub_view(cw->shared_view, cw->moe_shared_acc,
+                                (size_t)e0 * V41_DIM * sizeof(float), (size_t)e_len * V41_DIM * sizeof(float)) ||
+                            !myds_metal_buffer_update_sub_view(cw->after_view, cw->moe_after_acc,
+                                (size_t)e0 * 4 * V41_DIM * sizeof(float), (size_t)e_len * 4 * V41_DIM * sizeof(float)) ||
+                            !myds_metal_buffer_update_sub_view(cw->split_view, cw->moe_split_acc,
+                                (size_t)e0 * 24 * sizeof(float), (size_t)e_len * 24 * sizeof(float))) {
+                            myds_metal_barrier();
+                            MYDS_LOG_E("V4.1 MoE batch sub-view failed (e0=%u mb_len=%u)", e0, mb_len);
+                            goto fail;
+                        }
                     }
-                    const myds_metal_buffer_t *moe_b = aliased ? cw->moe_out_buf : moe_view;
-                    const myds_metal_buffer_t *sh_b = aliased ? cw->shared_out_buf : shared_view;
-                    const myds_metal_buffer_t *af_b = aliased ? cw->after_attn_buf : after_view;
-                    const myds_metal_buffer_t *sp_b = aliased ? cw->ffn_split_buf : split_view;
+                    const myds_metal_buffer_t *moe_b = aliased ? cw->moe_out_buf : cw->moe_view;
+                    const myds_metal_buffer_t *sh_b = aliased ? cw->shared_out_buf : cw->shared_view;
+                    const myds_metal_buffer_t *af_b = aliased ? cw->after_attn_buf : cw->after_view;
+                    const myds_metal_buffer_t *sp_b = aliased ? cw->ffn_split_buf : cw->split_view;
 
                     CHECK(myds_metal_add(cw->ffn_out_buf, moe_b, sh_b, V41_DIM * e_len));
                     CHECK(myds_metal_v41_bf16(cw->ffn_out_buf, V41_DIM * e_len));
                     myds_metal_barrier();
                     CHECK(myds_metal_v41_hc_expand_batch(cw->layer_out_buf, cw->ffn_out_buf, af_b, sp_b, V41_DIM, e_len));
 
-                    if (getenv("MYDS_BATCH_TRACE_PREFIX")) {
+                    if (trace_on) {
                         for (uint32_t t = 0; t < e_len; t++) {
                             uint32_t pos = base_pos + e_start + t;
                             const myds_metal_buffer_t *sv = aliased ? cw->shared_out[t] :
@@ -2440,13 +2459,6 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                                                  cw->layer_out_buf, 0, (size_t)e_len * res_tok_bytes));
                     CHECK(myds_metal_buffer_copy(prompt_pre, (size_t)e_start * pre_tok_bytes,
                                                  sp_b, 0, (size_t)e_len * pre_tok_bytes));
-
-                    if (!aliased) {
-                        myds_metal_buffer_free(moe_view);
-                        myds_metal_buffer_free(shared_view);
-                        myds_metal_buffer_free(after_view);
-                        myds_metal_buffer_free(split_view);
-                    }
                 }
                 moe_off = 0;
             }

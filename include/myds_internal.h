@@ -199,6 +199,7 @@ struct myds_context {
 /* Allows incomplete graphs solely to diagnose tensor/logit mismatches.
  * Never use for user-facing generation or service readiness. */
 myds_model_t *myds_model_load_diagnostic(const char *model_path);
+bool myds_trace_active(void);
 bool myds_trace_f32(const char *stage, uint32_t layer, uint32_t pos,
                     const myds_metal_buffer_t *buffer, size_t count);
 

@@ -1561,14 +1561,14 @@ int myds_metal_v41_hc_expand_batch(myds_metal_buffer_t *out,
     }
 }
 
-int myds_metal_v41_engram_add(myds_metal_buffer_t *residual,
+int myds_metal_v41_engram_add_batch(myds_metal_buffer_t *residual,
     const myds_metal_buffer_t *projected, const myds_metal_buffer_t *q_weight,
-    const myds_metal_buffer_t *k_weight, uint32_t dim, float eps) {
-    if (!g_initialized || !g_pso_v41_engram_add || !isfinite(eps) || eps <= 0 ||
-        !v41_floats(residual, 4ull*dim) || !v41_floats(projected, 5ull*dim) ||
+    const myds_metal_buffer_t *k_weight, uint32_t dim, uint32_t rows, float eps) {
+    if (!g_initialized || !g_pso_v41_engram_add || !isfinite(eps) || eps <= 0 || !rows ||
+        !v41_floats(residual, 4ull*dim*rows) || !v41_floats(projected, 5ull*dim*rows) ||
         !v41_floats(q_weight, 4ull*dim) || !v41_floats(k_weight, 4ull*dim)) return 0;
     @autoreleasepool {
-        struct {uint32_t width, rows; float eps; uint32_t masked;} args = {dim,1,eps,0};
+        struct {uint32_t width, rows; float eps; uint32_t masked;} args = {dim,rows,eps,0};
         id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
         if (!cb) return 0;
         id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
@@ -1581,9 +1581,15 @@ int myds_metal_v41_engram_add(myds_metal_buffer_t *residual,
         [enc setBuffer:q_weight->mtl_buf offset:q_weight->offset atIndex:3];
         [enc setBuffer:k_weight->mtl_buf offset:k_weight->offset atIndex:4];
         [enc setBuffer:residual->mtl_buf offset:residual->offset atIndex:5];
-        metal_dispatch(enc, "v41_engram_add", MTLSizeMake(1, 4, 1), MTLSizeMake(32, 1, 1));
+        metal_dispatch(enc, "v41_engram_add", MTLSizeMake(rows, 4, 1), MTLSizeMake(32, 1, 1));
         return v41_finish(cb, enc);
     }
+}
+
+int myds_metal_v41_engram_add(myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *projected, const myds_metal_buffer_t *q_weight,
+    const myds_metal_buffer_t *k_weight, uint32_t dim, float eps) {
+    return myds_metal_v41_engram_add_batch(residual, projected, q_weight, k_weight, dim, 1, eps);
 }
 
 int myds_metal_rope(
