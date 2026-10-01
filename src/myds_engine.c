@@ -2801,11 +2801,32 @@ static int myds_generate_internal(myds_context_t *ctx,
             const char *e = getenv("MYDS_PREFIX_CACHE");
             pcache_on = (e && atoi(e) != 0) ? 1 : 0;
         }
+        /* ★ 每一次都【必须说话】。此前被跳过的情形一行日志都不打，于是「为什么这轮没省下来」
+         * 只能靠读代码去猜 —— 我今天就被这坑到：看到 0 条 prefix cache 行才反应过来判断压根没进。
+         * 一个优化不生效时，沉默是最贵的输出。 */
+        if (!pcache_on) {
+            MYDS_LOG_I("prefix cache: off (MYDS_PREFIX_CACHE=0)");
+        } else if (!ctx->pcache_tokens || !ctx->pcache_len) {
+            MYDS_LOG_I("prefix cache: nothing cached yet (this is the first request)");
+        } else if ((uint32_t)n_prompt <= ctx->pcache_len) {
+            /* 常见于「客户端把每次提问当成全新对话，只带系统提示词」：新提示词比缓存序列还短，
+             * 不可能是续写 ⇒ 整段重跑。这是当前设计【最贵】的一种 miss，必须点名。 */
+            MYDS_LOG_I("prefix cache: skipped - prompt %d tok is not longer than the cached %u "
+                       "(not a continuation: a new conversation sharing only the system prompt?)",
+                       n_prompt, ctx->pcache_len);
+        }
         if (pcache_on && ctx->pcache_tokens && ctx->pcache_len &&
             (uint32_t)n_prompt > ctx->pcache_len) {
             uint32_t L = 0;
             while (L < ctx->pcache_len && ctx->pcache_tokens[L] == prompt_tokens[L]) L++;
-            if (L == ctx->pcache_len) resume_from = L;
+            if (L == ctx->pcache_len) {
+                resume_from = L;
+            } else {
+                /* 有公共前缀但不足整段（短于缓存序列）⇒ 用不上。这里的公共前缀大小【恰好暴露
+                 * 能省多少】：它基本等于客户端每次重发的系统提示词长度。 */
+                MYDS_LOG_I("prefix cache: skipped - common prefix %u of cached %u tokens "
+                           "(resumable only when it is the whole cached sequence)", L, ctx->pcache_len);
+            }
             MYDS_LOG_I("prefix cache: prompt %d tok, cached %u, common prefix %u -> %s%s",
                        n_prompt, ctx->pcache_len, L,
                        resume_from ? "resume from " : "full prefill",

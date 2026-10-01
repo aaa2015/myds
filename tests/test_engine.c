@@ -431,10 +431,112 @@ static void test_invalid_generated_token(void) {
     printf("  [PASS] Invalid sampled token returns generation error without an empty success callback\n");
 }
 
+
+/* ── prefix cache 的诊断输出测试 ──
+ * 动机：这个缓存不生效时原本一行日志都不打，于是「为什么这轮没省下来」只能读代码猜。
+ * 这里断言【五种结局每一种都说话】—— 尤其「跳过」的两种：它们是当前设计里最贵的 miss，
+ * 也正是实际踩到的那一种（客户端把每次提问当成全新对话、只带系统提示词）。 */
+
+typedef enum {
+    PCACHE_OFF = 0,      /* 功能被关闭 */
+    PCACHE_EMPTY,        /* 还没缓存任何东西（首个请求） */
+    PCACHE_TOO_SHORT,    /* 新提示词不长于缓存序列 ⇒ 不可能是续写 */
+    PCACHE_PARTIAL,      /* 有公共前缀但不足整段 */
+    PCACHE_RESUME        /* 命中：整段严格续写 */
+} pcache_verdict_t;
+
+/* 判定逻辑（与 myds_engine.c 内联的那份同构），抽出来以便在无模型的情况下测试 */
+static pcache_verdict_t pcache_decide(int on, uint32_t cached_len, uint32_t n_prompt,
+                                      const int32_t *cached, const int32_t *prompt,
+                                      uint32_t *out_common) {
+    if (out_common) *out_common = 0;
+    if (!on) return PCACHE_OFF;
+    if (!cached_len) return PCACHE_EMPTY;
+    if (n_prompt <= cached_len) return PCACHE_TOO_SHORT;
+    uint32_t L = 0;
+    while (L < cached_len && cached[L] == prompt[L]) L++;
+    if (out_common) *out_common = L;
+    return (L == cached_len) ? PCACHE_RESUME : PCACHE_PARTIAL;
+}
+
+/* 对应的日志行（不返回空串 —— 沉默就是这次要根治的东西） */
+static void pcache_line(pcache_verdict_t v, uint32_t cached_len, uint32_t n_prompt,
+                        uint32_t common, char *buf, size_t cap) {
+    switch (v) {
+    case PCACHE_OFF:
+        snprintf(buf, cap, "prefix cache: off (MYDS_PREFIX_CACHE=0)");
+        break;
+    case PCACHE_EMPTY:
+        snprintf(buf, cap, "prefix cache: nothing cached yet (this is the first request)");
+        break;
+    case PCACHE_TOO_SHORT:
+        snprintf(buf, cap, "prefix cache: skipped - prompt %u tok is not longer than the cached %u",
+                 n_prompt, cached_len);
+        break;
+    case PCACHE_PARTIAL:
+        snprintf(buf, cap, "prefix cache: skipped - common prefix %u of cached %u tokens", common,
+                 cached_len);
+        break;
+    default:
+        snprintf(buf, cap, "prefix cache: prompt %u tok, cached %u, common prefix %u -> resume",
+                 n_prompt, cached_len, common);
+        break;
+    }
+}
+
+static void test_prefix_cache_reports_every_outcome(void) {
+    int32_t cached[16];
+    for (int i = 0; i < 16; ++i) cached[i] = 100 + i;
+
+    int32_t longer[20];                       /* 严格续写 */
+    for (int i = 0; i < 16; ++i) longer[i] = 100 + i;
+    longer[16] = 999; longer[17] = 998; longer[18] = 997; longer[19] = 996;
+
+    int32_t shortp[8];                        /* 只带系统提示词的新对话 */
+    for (int i = 0; i < 8; ++i) shortp[i] = 100 + i;
+
+    int32_t diverge[20];                      /* 第 5 个 token 起分叉 */
+    for (int i = 0; i < 20; ++i) diverge[i] = 100 + i;
+    diverge[5] = 7;
+
+    char buf[256];
+    uint32_t common = 0;
+
+    assert(pcache_decide(0, 16, 20, cached, longer, &common) == PCACHE_OFF);
+    pcache_line(PCACHE_OFF, 16, 20, 0, buf, sizeof buf);
+    assert(strstr(buf, "prefix cache:") == buf && strstr(buf, "off") != NULL);
+
+    assert(pcache_decide(1, 0, 20, cached, longer, &common) == PCACHE_EMPTY);
+    pcache_line(PCACHE_EMPTY, 0, 20, 0, buf, sizeof buf);
+    assert(strstr(buf, "first request") != NULL);
+
+    /* ★ 最贵的那种 miss：新提示词比缓存还短 */
+    assert(pcache_decide(1, 16, 8, cached, shortp, &common) == PCACHE_TOO_SHORT);
+    pcache_line(PCACHE_TOO_SHORT, 16, 8, 0, buf, sizeof buf);
+    assert(strstr(buf, "not longer than") != NULL);
+
+    assert(pcache_decide(1, 16, 20, cached, diverge, &common) == PCACHE_PARTIAL && common == 5);
+    pcache_line(PCACHE_PARTIAL, 16, 20, common, buf, sizeof buf);
+    assert(strstr(buf, "common prefix 5") != NULL);
+
+    assert(pcache_decide(1, 16, 20, cached, longer, &common) == PCACHE_RESUME && common == 16);
+    pcache_line(PCACHE_RESUME, 16, 20, common, buf, sizeof buf);
+    assert(strstr(buf, "resume") != NULL);
+
+    /* 每一种结局都必须产出【非空且带前缀】的一行 */
+    for (int i = PCACHE_OFF; i <= PCACHE_RESUME; ++i) {
+        pcache_line((pcache_verdict_t)i, 16, 20, 5, buf, sizeof buf);
+        assert(buf[0] != 0 && strstr(buf, "prefix cache:") == buf);
+    }
+    printf("  [PASS] prefix cache reports every outcome, including the two skipped cases\n");
+}
+
 int main(void) {
     printf("====================================================\n");
     printf("       Running myds Engine Sampling Unit Tests      \n");
     printf("====================================================\n");
+
+    test_prefix_cache_reports_every_outcome();
 
     /* 1. Production Greedy Argmax Sampling */
     {
