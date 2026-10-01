@@ -1342,27 +1342,33 @@ int32_t myds_sample_next_token(
     uint32_t top_k = cfg ? cfg->top_k : 0;
     float min_p = cfg ? cfg->min_p : 0.0f;
     float rep_pen = (cfg && cfg->repetition_penalty > 0.0f) ? cfg->repetition_penalty : 1.0f;
+    bool has_rep_pen = (rep_pen > 1.0f && prev_tokens && n_prev_tokens > 0);
 
     /* 1. Greedy argmax check (if temp <= 0) */
     if (temp <= 0.0f) {
         int32_t best_id = 0;
         float max_l = logits[0];
-        if (rep_pen > 1.0f && prev_tokens && n_prev_tokens > 0) {
-            for (size_t p = 0; p < n_prev_tokens; p++) {
-                if (prev_tokens[p] == 0) {
-                    max_l = (max_l > 0.0f) ? (max_l / rep_pen) : (max_l * rep_pen);
-                    break;
+        if (!has_rep_pen) {
+            for (uint32_t i = 1; i < vocab_size; i++) {
+                if (logits[i] > max_l) {
+                    max_l = logits[i];
+                    best_id = (int32_t)i;
                 }
+            }
+            return best_id;
+        }
+        for (size_t p = 0; p < n_prev_tokens; p++) {
+            if (prev_tokens[p] == 0) {
+                max_l = (max_l > 0.0f) ? (max_l / rep_pen) : (max_l * rep_pen);
+                break;
             }
         }
         for (uint32_t i = 1; i < vocab_size; i++) {
             float l = logits[i];
-            if (rep_pen > 1.0f && prev_tokens && n_prev_tokens > 0) {
-                for (size_t p = 0; p < n_prev_tokens; p++) {
-                    if (prev_tokens[p] == (int32_t)i) {
-                        l = (l > 0.0f) ? (l / rep_pen) : (l * rep_pen);
-                        break;
-                    }
+            for (size_t p = 0; p < n_prev_tokens; p++) {
+                if (prev_tokens[p] == (int32_t)i) {
+                    l = (l > 0.0f) ? (l / rep_pen) : (l * rep_pen);
+                    break;
                 }
             }
             if (l > max_l) {
@@ -1375,18 +1381,21 @@ int32_t myds_sample_next_token(
 
     /* 2. Repetition penalty check & max logit search in single linear pass */
     float max_l = -INFINITY;
-    bool has_rep_pen = (rep_pen > 1.0f && prev_tokens && n_prev_tokens > 0);
-    for (uint32_t i = 0; i < vocab_size; i++) {
-        float l = logits[i];
-        if (has_rep_pen) {
+    if (!has_rep_pen) {
+        for (uint32_t i = 0; i < vocab_size; i++) {
+            if (logits[i] > max_l) max_l = logits[i];
+        }
+    } else {
+        for (uint32_t i = 0; i < vocab_size; i++) {
+            float l = logits[i];
             for (size_t p = 0; p < n_prev_tokens; p++) {
                 if (prev_tokens[p] == (int32_t)i) {
                     l = (l > 0.0f) ? (l / rep_pen) : (l * rep_pen);
                     break;
                 }
             }
+            if (l > max_l) max_l = l;
         }
-        if (l > max_l) max_l = l;
     }
 
     /* 3. Buffer acquisition and single-pass candidate collection (diff >= -20.0f) */
@@ -1396,23 +1405,34 @@ int32_t myds_sample_next_token(
     float inv_temp = 1.0f / temp;
     float sum_exp = 0.0f;
     uint32_t n_cands = 0;
-    for (uint32_t i = 0; i < vocab_size; i++) {
-        float l = logits[i];
-        if (has_rep_pen) {
+    if (!has_rep_pen) {
+        for (uint32_t i = 0; i < vocab_size; i++) {
+            float diff = (logits[i] - max_l) * inv_temp;
+            if (diff >= -20.0f) {
+                float e = expf(diff);
+                probs[n_cands] = e;
+                indices[n_cands] = (int32_t)i;
+                sum_exp += e;
+                n_cands++;
+            }
+        }
+    } else {
+        for (uint32_t i = 0; i < vocab_size; i++) {
+            float l = logits[i];
             for (size_t p = 0; p < n_prev_tokens; p++) {
                 if (prev_tokens[p] == (int32_t)i) {
                     l = (l > 0.0f) ? (l / rep_pen) : (l * rep_pen);
                     break;
                 }
             }
-        }
-        float diff = (l - max_l) * inv_temp;
-        if (diff >= -20.0f) {
-            float e = expf(diff);
-            probs[n_cands] = e;
-            indices[n_cands] = (int32_t)i;
-            sum_exp += e;
-            n_cands++;
+            float diff = (l - max_l) * inv_temp;
+            if (diff >= -20.0f) {
+                float e = expf(diff);
+                probs[n_cands] = e;
+                indices[n_cands] = (int32_t)i;
+                sum_exp += e;
+                n_cands++;
+            }
         }
     }
 

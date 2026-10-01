@@ -12,6 +12,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 
 #define V41_LAYERS 40u
 #define V41_DIM 5120u
@@ -1241,6 +1244,34 @@ static int publish_indexer_chunk(myds_context_t *ctx, uint32_t il, uint32_t c_st
     return 1;
 }
 
+static inline bool check_logits_finite(const float *logits, uint32_t n) {
+#if defined(__ARM_NEON)
+    uint32_t i = 0;
+    const uint32x4_t mask = vdupq_n_u32(0x7F800000u);
+    for (; i + 16 <= n; i += 16) {
+        uint32x4_t v0 = vld1q_u32((const uint32_t *)(logits + i));
+        uint32x4_t v1 = vld1q_u32((const uint32_t *)(logits + i + 4));
+        uint32x4_t v2 = vld1q_u32((const uint32_t *)(logits + i + 8));
+        uint32x4_t v3 = vld1q_u32((const uint32_t *)(logits + i + 12));
+        uint32x4_t c0 = vceqq_u32(vandq_u32(v0, mask), mask);
+        uint32x4_t c1 = vceqq_u32(vandq_u32(v1, mask), mask);
+        uint32x4_t c2 = vceqq_u32(vandq_u32(v2, mask), mask);
+        uint32x4_t c3 = vceqq_u32(vandq_u32(v3, mask), mask);
+        uint32x4_t any = vorrq_u32(vorrq_u32(c0, c1), vorrq_u32(c2, c3));
+        if (__builtin_expect(vmaxvq_u32(any) != 0, 0)) return false;
+    }
+    for (; i < n; i++) {
+        if (!isfinite(logits[i])) return false;
+    }
+    return true;
+#else
+    for (uint32_t i = 0; i < n; i++) {
+        if (!isfinite(logits[i])) return false;
+    }
+    return true;
+#endif
+}
+
 int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool need_logits) {
     myds_model_t *m=ctx->model;
     myds_v41_context_t *g=ctx->v41;
@@ -1344,9 +1375,9 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
         CHECK(myds_metal_v41_rmsnorm(ctx->x_norm,ctx->x,m->output_norm,V41_DIM,m->norm_eps,true));
         CHECK(project(ctx->logits,m->output,ctx->x_norm,m->vocab_size,V41_DIM,m->output_type,false));
         CHECK(myds_metal_commit_batch());
-        CHECK(myds_trace_f32("logits",0,pos,ctx->logits,m->vocab_size));
+        if (trace_on) CHECK(myds_trace_f32("logits",0,pos,ctx->logits,m->vocab_size));
         const float *logits=myds_metal_buffer_data(ctx->logits);
-        for (uint32_t i=0;i<m->vocab_size;i++) if (!isfinite(logits[i])) goto fail;
+        if (!check_logits_finite(logits, m->vocab_size)) goto fail;
     } else {
         CHECK(myds_metal_commit_batch());
     }
