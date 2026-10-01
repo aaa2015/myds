@@ -2925,9 +2925,12 @@ static int myds_generate_internal(myds_context_t *ctx,
             MYDS_LOG_I("previous_response_id: %u cached + %d new = %d tokens",
                        pl, n_prompt - (int32_t)pl, n_prompt);
         } else {
-            /* 状态已被后续请求换掉 ⇒ 前缀不在。这里【继续按全量跑】并说话，
-             * 而不是假装命中 —— 服务端那一侧已经用 id 保证只会走到「最近一次」。 */
-            MYDS_LOG_W("previous_response_id: no cached sequence to continue from; prefilling in full");
+            /* 状态已被后续请求换掉或推理失败清空 ⇒ 前缀不在。
+             * 坚决报错，绝不静默把后缀当作全量输入运行。 */
+            MYDS_LOG_E("previous_response_id: continuation requested but prefix cache is empty (pcache_len=%u)", pl);
+            free(prompt_tokens);
+            if (out_reason) *out_reason = MYDS_STOP_ERROR;
+            return 0;
         }
     }
 
@@ -3235,6 +3238,10 @@ void myds_last_prefill_stats(const myds_context_t *ctx, myds_prefill_stats_t *ou
 /* 供服务端在收到 previous_response_id 时调用：下一次 generate 把 pcache 序列当作前缀。 */
 void myds_set_continue_from_cache(myds_context_t *ctx, bool enable) {
     if (ctx) ctx->continue_from_cache = enable;
+}
+
+uint32_t myds_context_get_pcache_len(const myds_context_t *ctx) {
+    return ctx ? ctx->pcache_len : 0;
 }
 
 int myds_generate_bytes_ex(myds_context_t *ctx, const char *prompt,

@@ -88,6 +88,7 @@ typedef enum {
 /* previous_response_id：置位后，下一次 generate 把引擎缓存的序列当作 prompt 前缀，
  * 调用方传入的 prompt 只作为【新增后缀】。一次性；引擎消费后自动清除。 */
 void            myds_set_continue_from_cache(myds_context_t *ctx, bool enable);
+uint32_t        myds_context_get_pcache_len(const myds_context_t *ctx);
 
 int             myds_generate_bytes_ex(myds_context_t *ctx,
                                        const char *prompt,

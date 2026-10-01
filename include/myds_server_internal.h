@@ -76,6 +76,7 @@ void resp_id_new(char *out, size_t cap);
 void resp_id_register(const char *id);
 bool resp_id_is_live(const char *id);
 bool resp_id_seen(const char *id);
+void resp_id_invalidate_all(void);
 
 /* 带视觉槽的版本：img 非空时，input_image 内容块会被处理并填进 sink。 */
 struct myds_vjob_sink_s;

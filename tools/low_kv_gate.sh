@@ -210,6 +210,14 @@ _HITS_DELTA=$(( ${_HITS_AFTER:-0} - ${_HITS_BEFORE:-0} ))
 
 if grep -qF "CRIMSONOTTER9" /tmp/low_kv_gate_alt1.txt; then ok "P1 回答正确"; else fail "P1 回答不对"; fi
 if grep -qF "AMBERFALCON4" /tmp/low_kv_gate_alt2.txt; then ok "P2 回答正确"; else fail "P2 回答不对"; fi
+if grep -qF "CRIMSONOTTER9" /tmp/low_kv_gate_alt3.txt; then ok "P1 (第三次从磁盘恢复) 回答正确"; else fail "P1 (第三次从磁盘恢复) 回答不对"; fi
+if cmp -s /tmp/low_kv_gate_alt1.txt /tmp/low_kv_gate_alt3.txt; then
+    ok "第三次从磁盘恢复的回答与首次全量生成完全一致"
+else
+    fail "第三次从磁盘恢复的回答与首次全量生成不一致"
+    note "首次: $(head -c 160 /tmp/low_kv_gate_alt1.txt 2>/dev/null)"
+    note "恢复: $(head -c 160 /tmp/low_kv_gate_alt3.txt 2>/dev/null)"
+fi
 # 第三次（回到 P1）必须命中磁盘 —— 这是「P1 的条目没被 P2 顶掉」的直接证据
 if [ "$_HITS_DELTA" -ge 1 ]; then
     ok "第三次回到 P1 时精准命中了磁盘（P1 的条目仍在，本轮新增命中 $_HITS_DELTA 次）"

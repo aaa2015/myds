@@ -3,6 +3,7 @@
  */
 #include "myds_vjob.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +20,13 @@
 static myds_vis_weights *g_w = NULL;
 static char             *g_placeholder = NULL;
 static uint32_t          g_image_token = 0;
+static void (*g_vjob_gpu_lock)(void) = NULL;
+static void (*g_vjob_gpu_unlock)(void) = NULL;
+
+void myds_vjob_set_gpu_lock(void (*lock_fn)(void), void (*unlock_fn)(void)) {
+    g_vjob_gpu_lock = lock_fn;
+    g_vjob_gpu_unlock = unlock_fn;
+}
 
 static void vjob_error(char *error, size_t cap, const char *msg) {
     if (!error || cap == 0) return;
@@ -118,7 +126,10 @@ int myds_vjob_plan(const uint8_t *encoded, size_t len, myds_vjob_plan_t *out,
         return 0;
     }
     uint32_t rows = 0;
-    if (!myds_vis_encode(g_w, &pat, emb, &rows, error, error_cap)) {
+    if (g_vjob_gpu_lock) g_vjob_gpu_lock();
+    int enc_ok = myds_vis_encode(g_w, &pat, emb, &rows, error, error_cap);
+    if (g_vjob_gpu_unlock) g_vjob_gpu_unlock();
+    if (!enc_ok) {
         if (error && !error[0]) vjob_error(error, error_cap, "视觉编码失败");
         free(emb);
         myds_vis_layout_free(&lay); myds_vis_patches_free(&pat); myds_vis_image_free(&image);
@@ -238,9 +249,10 @@ typedef struct {
     myds_vjob_plan_t plan;
     bool             used;
 } vjob_cache_t;
-static vjob_cache_t g_cache[VJOB_CACHE_SLOTS];
-static uint32_t     g_cache_next;
-static uint32_t     g_hits, g_misses;
+static vjob_cache_t   g_cache[VJOB_CACHE_SLOTS];
+static uint32_t       g_cache_next;
+static uint32_t       g_hits, g_misses;
+static pthread_mutex_t g_vjob_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static uint64_t vjob_hash(const uint8_t *p, size_t n) {
     uint64_t h = 1469598103934665603ull;
@@ -265,8 +277,19 @@ static int vjob_plan_copy(const myds_vjob_plan_t *src, myds_vjob_plan_t *dst) {
     return 1;
 }
 
-uint32_t myds_vjob_cache_hits(void)   { return g_hits; }
-uint32_t myds_vjob_cache_misses(void) { return g_misses; }
+uint32_t myds_vjob_cache_hits(void) {
+    pthread_mutex_lock(&g_vjob_cache_mutex);
+    uint32_t v = g_hits;
+    pthread_mutex_unlock(&g_vjob_cache_mutex);
+    return v;
+}
+
+uint32_t myds_vjob_cache_misses(void) {
+    pthread_mutex_lock(&g_vjob_cache_mutex);
+    uint32_t v = g_misses;
+    pthread_mutex_unlock(&g_vjob_cache_mutex);
+    return v;
+}
 
 int myds_vjob_sink_add(myds_vjob_sink_t *sink, const uint8_t *encoded, size_t len,
                        char *error, size_t error_cap) {
@@ -279,23 +302,29 @@ int myds_vjob_sink_add(myds_vjob_sink_t *sink, const uint8_t *encoded, size_t le
         sink->cap = cap;
     }
     const uint64_t h = vjob_hash(encoded, len);
+    pthread_mutex_lock(&g_vjob_cache_mutex);
     for (uint32_t i = 0; i < VJOB_CACHE_SLOTS; i++) {
         if (g_cache[i].used && g_cache[i].hash == h && g_cache[i].len == len) {
             if (vjob_plan_copy(&g_cache[i].plan, &sink->plans[sink->count])) {
                 sink->count++;
                 g_hits++;
+                pthread_mutex_unlock(&g_vjob_cache_mutex);
                 MYDS_LOG_I("图片命中缓存（第 %u 张，%zu 字节）—— 跳过编码", sink->count, len);
                 return 1;
             }
             break;   /* 拷贝失败就退回重新编码 */
         }
     }
+    pthread_mutex_unlock(&g_vjob_cache_mutex);
+
     myds_vjob_plan_t fresh;
     if (!myds_vjob_plan(encoded, len, &fresh, error, error_cap)) {
         sink->failed = true;
         if (error) snprintf(sink->why, sizeof(sink->why), "%.190s", error);
         return 0;
     }
+
+    pthread_mutex_lock(&g_vjob_cache_mutex);
     g_misses++;
     /* 存入缓存（覆盖最老的一格）。★ 先存再拷：两份独立的数据，谁都不许 free 到对方。 */
     vjob_cache_t *slot = &g_cache[g_cache_next];
@@ -307,6 +336,8 @@ int myds_vjob_sink_add(myds_vjob_sink_t *sink, const uint8_t *encoded, size_t le
         slot->len = len;
         slot->used = true;
     }
+    pthread_mutex_unlock(&g_vjob_cache_mutex);
+
     sink->plans[sink->count++] = fresh;   /* 承接所有权 */
     return 1;
 }

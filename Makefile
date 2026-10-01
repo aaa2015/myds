@@ -32,13 +32,14 @@ TEST_CPU = $(BIN_DIR)/test_cpu
 TEST_ENGRAM = $(BIN_DIR)/test_engram
 TEST_ALIGN = $(BIN_DIR)/test_align
 TEST_KVDSK = $(BIN_DIR)/test_kvdsk
+TEST_P1 = $(BIN_DIR)/test_p1
 BENCH_SYNTHETIC = $(BIN_DIR)/bench_synthetic
 BENCH_METAL = $(BIN_DIR)/bench_metal
 DUMP_TENSORS = $(BIN_DIR)/dump_tensors
 METALLIB = $(BIN_DIR)/myds.metallib
 METAL_SRCS = $(wildcard metal/*.metal)
 
-ALL_TESTS = $(TEST_METAL) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE) $(TEST_CPU) $(TEST_ENGRAM) $(TEST_ALIGN) $(TEST_KVDSK)
+ALL_TESTS = $(TEST_METAL) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE) $(TEST_CPU) $(TEST_ENGRAM) $(TEST_ALIGN) $(TEST_KVDSK) $(TEST_P1)
 
 .PHONY: all test clean bench metallib
 
@@ -111,6 +112,9 @@ $(TEST_ALIGN): tests/test_align.c include/myds_align.h | $(BIN_DIR)
 # 低位区 KV 落盘：只需要存储层与日志，不需要模型（也就不必占着跑生产的机器开第二个实例）。
 $(TEST_KVDSK): tests/test_kvdsk.c include/myds_kvdsk.h $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_log.o | $(BIN_DIR)
 	$(CC) $(CFLAGS) -Iinclude -o $@ tests/test_kvdsk.c $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_log.o
+
+$(TEST_P1): tests/test_p1_regressions.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) | $(BIN_DIR)
+	$(CC) $(CFLAGS) -Iinclude -o $@ tests/test_p1_regressions.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS)
 
 $(TEST_LOG): $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_log.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@
@@ -212,6 +216,10 @@ test: $(ALL_TESTS)
 	@./$(TEST_ALIGN)
 	@echo ""
 	@./$(TEST_KVDSK)
+	@echo ""
+	@./$(TEST_P1)
+	@echo ""
+	@python3 tests/test_http_bytes.py
 	@echo "\n========================================================"
 	@echo "      ALL TEST SUITES PASSED CLEANLY & SUCCESSFULLY!    "
 	@echo "========================================================"

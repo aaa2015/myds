@@ -58,6 +58,7 @@ void myds_vjob_sink_free(myds_vjob_sink_t *sink);
 /* 加载视觉编码器权重。成功返回 1，失败返回 0（服务端据此降级为纯文本）。 */
 int  myds_vjob_init(myds_context_t *ctx, const char *vision_gguf);
 bool myds_vjob_ready(void);
+void myds_vjob_set_gpu_lock(void (*lock_fn)(void), void (*unlock_fn)(void));
 /* 占位 token 的文本。V4.1 是 "<｜deepseek_image｜>"。
  * ★ 由【主模型的词表】决定，不是写死的常量 —— 这里在 init 时从词表取，
  *   并验证「该文本编码回来恰好是 1 个 image token」，不满足就拒绝启用。 */

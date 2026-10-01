@@ -385,8 +385,15 @@ int myds_metal_init(const char *shader_dir) {
                 NSError *lib_err = nil;
                 g_library = [g_device newLibraryWithURL:[NSURL fileURLWithPath:lib_path] error:&lib_err];
                 if (g_library) {
-                    myds_log(MYDS_LOG_INFO, "myds_metal: loaded precompiled library from %s", [lib_path UTF8String]);
-                    break;
+                    /* Verify essential kernels exist in the precompiled library */
+                    id<MTLFunction> test_fn = [g_library newFunctionWithName:@"kernel_add2_bf16_f32"];
+                    if (!test_fn) {
+                        myds_log(MYDS_LOG_WARN, "myds_metal: precompiled library %s is missing kernel_add2_bf16_f32, rebuilding from source", [lib_path UTF8String]);
+                        g_library = nil;
+                    } else {
+                        myds_log(MYDS_LOG_INFO, "myds_metal: loaded precompiled library from %s", [lib_path UTF8String]);
+                        break;
+                    }
                 }
             }
         }
@@ -965,6 +972,15 @@ static inline void metal_dispatch(id<MTLComputeCommandEncoder> enc,
                                   MTLSize threadgroups,
                                   MTLSize threadsPerThreadgroup) {
     [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:threadsPerThreadgroup];
+    g_dispatch_count++;
+    hist_add(name);
+}
+
+static inline void metal_dispatch_threads(id<MTLComputeCommandEncoder> enc,
+                                          const char *name,
+                                          MTLSize threads,
+                                          MTLSize threadsPerThreadgroup) {
+    [enc dispatchThreads:threads threadsPerThreadgroup:threadsPerThreadgroup];
     g_dispatch_count++;
     hist_add(name);
 }
@@ -1686,8 +1702,9 @@ int myds_metal_swiglu(
             [enc setBuffer:out->mtl_buf offset:(out ? out->offset : 0) atIndex:3];
 
             NSUInteger threads = MIN((NSUInteger)dim, MIN((NSUInteger)256, g_pso_swiglu.maxTotalThreadsPerThreadgroup));
-            [enc dispatchThreads:MTLSizeMake(dim, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+            metal_dispatch_threads(enc, "swiglu",
+                MTLSizeMake(dim, 1, 1),
+                MTLSizeMake(threads, 1, 1));
 
             if (g_batch_cb) {
                 if (g_auto_barrier) {
@@ -2953,8 +2970,9 @@ int myds_metal_add(
 
             NSUInteger threads = (count < 256) ? count : 256;
             if (threads == 0) threads = 1;
-            [enc dispatchThreads:MTLSizeMake(count, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+            metal_dispatch_threads(enc, "add",
+                MTLSizeMake(count, 1, 1),
+                MTLSizeMake(threads, 1, 1));
 
             if (g_batch_cb) {
                 if (g_auto_barrier) {
@@ -2987,37 +3005,47 @@ int myds_metal_v41_add_bf16(
     uint32_t                   count) {
     if (!out || !a || !b || count == 0) return 0;
 
-    if (g_pso_add_bf16 && a->mtl_buf && b->mtl_buf && out->mtl_buf) {
-        @autoreleasepool {
-            struct ds4_metal_args_add3 args;
-            args.n = count;
-            args.r2 = 1;
-            args.r3 = 1;
+    if (a->mtl_buf && b->mtl_buf && out->mtl_buf) {
+        if (g_pso_add_bf16) {
+            @autoreleasepool {
+                struct ds4_metal_args_add3 args;
+                args.n = count;
+                args.r2 = 1;
+                args.r3 = 1;
 
-            id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
-            id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
-            [enc setComputePipelineState:g_pso_add_bf16];
-            [enc setBytes:&args length:sizeof(args) atIndex:0];
-            [enc setBuffer:a->mtl_buf offset:(a ? a->offset : 0) atIndex:1];
-            [enc setBuffer:b->mtl_buf offset:(b ? b->offset : 0) atIndex:2];
-            [enc setBuffer:out->mtl_buf offset:(out ? out->offset : 0) atIndex:3];
+                id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
+                [enc setComputePipelineState:g_pso_add_bf16];
+                [enc setBytes:&args length:sizeof(args) atIndex:0];
+                [enc setBuffer:a->mtl_buf offset:(a ? a->offset : 0) atIndex:1];
+                [enc setBuffer:b->mtl_buf offset:(b ? b->offset : 0) atIndex:2];
+                [enc setBuffer:out->mtl_buf offset:(out ? out->offset : 0) atIndex:3];
 
-            NSUInteger threads = (count < 256) ? count : 256;
-            if (threads == 0) threads = 1;
-            [enc dispatchThreads:MTLSizeMake(count, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+                NSUInteger threads = (count < 256) ? count : 256;
+                if (threads == 0) threads = 1;
+                metal_dispatch_threads(enc, "v41_add_bf16",
+                    MTLSizeMake(count, 1, 1),
+                    MTLSizeMake(threads, 1, 1));
 
-            if (g_batch_cb) {
-                if (g_auto_barrier) {
-                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                if (g_batch_cb) {
+                    if (g_auto_barrier) {
+                        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                    }
+                } else {
+                    [enc endEncoding];
+                    [cb commit];
+                    if (!wait_command_buffer(cb)) return 0;
                 }
-            } else {
-                [enc endEncoding];
-                [cb commit];
-                if (!wait_command_buffer(cb)) return 0;
+                return 1;
             }
-            return 1;
         }
+        /* Fallback: if fused kernel PSO is unavailable, run GPU add + GPU BF16 round within the active command buffer */
+        return myds_metal_add(out, a, b, count) && myds_metal_v41_bf16(out, count);
+    }
+
+    if (g_batch_cb) {
+        /* In batch mode with non-Metal buffers: cannot execute CPU fallback while command buffer is open */
+        return 0;
     }
 
     /* CPU Fallback with exact BF16 round */

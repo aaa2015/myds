@@ -21,6 +21,12 @@
 static volatile sig_atomic_t g_running = 1;
 static int g_server_fd = -1;
 static pthread_mutex_t g_infer_mutex = PTHREAD_MUTEX_INITIALIZER;
+static void server_vjob_gpu_lock(void) { pthread_mutex_lock(&g_infer_mutex); }
+static void server_vjob_gpu_unlock(void) { pthread_mutex_unlock(&g_infer_mutex); }
+static pthread_once_t  g_vjob_lock_once = PTHREAD_ONCE_INIT;
+static void init_vjob_gpu_lock(void) {
+    myds_vjob_set_gpu_lock(server_vjob_gpu_lock, server_vjob_gpu_unlock);
+}
 
 /* ── 推理请求 FIFO 队列与背压保护 ──
  * 单槽推理引擎同一时刻只能运行一个推理请求。
@@ -172,7 +178,7 @@ bool resp_id_is_live(const char *id) {
     bool live;
     pthread_mutex_lock(&g_resp_id_mutex);
     unsigned prev = (g_resp_id_ring + RESP_ID_SLOTS - 1u) % RESP_ID_SLOTS;
-    live = (strcmp(g_resp_ids[prev], id) == 0);
+    live = (g_resp_ids[prev][0] != '\0' && strcmp(g_resp_ids[prev], id) == 0);
     pthread_mutex_unlock(&g_resp_id_mutex);
     return live;
 }
@@ -185,6 +191,16 @@ bool resp_id_seen(const char *id) {
         if (g_resp_ids[i][0] && strcmp(g_resp_ids[i], id) == 0) { seen = true; break; }
     pthread_mutex_unlock(&g_resp_id_mutex);
     return seen;
+}
+
+/* 当推理失败、被取消或上下文被清空时，旧响应 ID 必须立即失效，防止后续请求产生脱节续写 */
+void resp_id_invalidate_all(void) {
+    pthread_mutex_lock(&g_resp_id_mutex);
+    for (unsigned i = 0; i < RESP_ID_SLOTS; ++i) {
+        g_resp_ids[i][0] = '\0';
+    }
+    g_resp_id_ring = 0;
+    pthread_mutex_unlock(&g_resp_id_mutex);
 }
 
 static void handle_signal(int sig) {
@@ -1976,6 +1992,7 @@ static bool inject_image_embeddings(myds_context_t *ctx, const char *prompt,
 }
 
 static void handle_client(int client_fd, myds_context_t *ctx, const char *model_alias, const char *client_ip, int client_port) {
+    pthread_once(&g_vjob_lock_once, init_vjob_gpu_lock);
     /* Protect against slowloris and stalled connections */
     struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -2204,15 +2221,15 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         }
 
         pthread_mutex_lock(&g_infer_mutex);
-        if (is_continuation && !resp_id_is_live(prev_id)) {
+        if (is_continuation && (!resp_id_is_live(prev_id) || myds_context_get_pcache_len(ctx) == 0)) {
             pthread_mutex_unlock(&g_infer_mutex);
             server_release_infer_slot();
-            MYDS_LOG_W("[%s:%d] previous_response_id invalidated while waiting for infer lock (%s): %s",
+            MYDS_LOG_W("[%s:%d] previous_response_id invalidated or prefix cache empty (%s): %s",
                        client_ip, client_port,
                        resp_id_seen(prev_id) ? "expired" : "unknown", prev_id);
             char err[512];
             snprintf(err, sizeof(err),
-                     "{\"error\":{\"message\":\"previous_response_id '%s' is not the most recent response "
+                     "{\"error\":{\"message\":\"previous_response_id '%s' is not valid or state has been lost "
                      "(this server keeps one live state); replay the full input instead\","
                      "\"type\":\"invalid_request_error\"}}", prev_id);
             send_response(client_fd, 400, "Bad Request", "application/json", err);
@@ -2235,6 +2252,15 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         uint32_t prompt_tokens = 0;
         uint32_t final_tokens = 0;
 
+        /* 视觉注入：提示词已拼好，把所有图片块的逐位置向量交给引擎。
+         * ★ 必须在 generate 之前；在发送 200 响应头之前完成，避免注入失败时向客户端连发 200 + 400 */
+        if (!inject_image_embeddings(ctx, prompt, &img_sink, client_ip, client_port)) {
+            resp_id_invalidate_all();
+            send_response(client_fd, 400, "Bad Request", "application/json",
+                          "{\"error\":{\"message\":\"image block could not be aligned with the prompt\"}}");
+            goto cleanup_infer;
+        }
+
         if (stream) {
             const char *sse_header =
                 "HTTP/1.1 200 OK\r\n"
@@ -2256,22 +2282,20 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 !myds_server_send_all(client_fd, initial, strlen(initial))) {
                 sctx.cancel_flag = 1;
             }
-            /* 视觉注入：提示词已拼好，把所有图片块的逐位置向量交给引擎。
-             * ★ 必须在 generate 之前；generate 之后清除，否则下一请求会用错图。 */
-            if (!inject_image_embeddings(ctx, prompt, &img_sink, client_ip, client_port)) {
-                send_response(client_fd, 400, "Bad Request", "application/json",
-                              "{\"error\":{\"message\":\"image block could not be aligned with the prompt\"}}");
-                goto cleanup_infer;
-            }
             int generated = myds_generate_bytes_ex(ctx, prompt, myds_server_sse_callback, &sctx,
                                                    &stop_reason, &prompt_tokens, &sctx.cancel_flag);
             myds_context_clear_image_embeddings(ctx); myds_vjob_sink_free(&img_sink);
             if (generated && !sctx.cancel_flag) (void)myds_server_sse_finish(&sctx);
-            if (generated && !sctx.failed) resp_id_register(resp_id);   /* 状态已停在本次序列末尾 */
+            if (generated && !sctx.failed && !sctx.cancel_flag) {
+                resp_id_register(resp_id);   /* 状态已停在本次序列末尾 */
+            } else {
+                resp_id_invalidate_all();
+            }
             final_tokens = sctx.token_count;
             t_first = sctx.t_first;
             t_last = sctx.t_last;
             if (!generated || sctx.failed) {
+                resp_id_invalidate_all();
                 stop_reason = MYDS_STOP_ERROR;
                 const char *error_event = is_responses_endpoint
                     ? "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"Inference or response encoding failed\",\"type\":\"server_error\"}}\n\n"
@@ -2343,19 +2367,19 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             free(sctx.acc); sctx.acc = NULL;   /* 每请求一份累积缓冲，必须释放 */
         } else {
             myds_non_stream_ctx_t ns = {.client_fd = client_fd};
-            if (!inject_image_embeddings(ctx, prompt, &img_sink, client_ip, client_port)) {
-                send_response(client_fd, 400, "Bad Request", "application/json",
-                              "{\"error\":{\"message\":\"image block could not be aligned with the prompt\"}}");
-                goto cleanup_infer;
-            }
             int generated = myds_generate_bytes_ex(ctx, prompt, myds_server_non_stream_callback, &ns,
                                                    &stop_reason, &prompt_tokens, &ns.cancel_flag);
             myds_context_clear_image_embeddings(ctx); myds_vjob_sink_free(&img_sink);
-            if (generated && !ns.failed) resp_id_register(resp_id);
+            if (generated && !ns.failed && !ns.cancel_flag) {
+                resp_id_register(resp_id);
+            } else {
+                resp_id_invalidate_all();
+            }
             final_tokens = ns.token_count;
             t_first = ns.t_first;
             t_last = ns.t_last;
             if (!generated || ns.failed) {
+                resp_id_invalidate_all();
                 stop_reason = MYDS_STOP_ERROR;
                 send_response(client_fd, 500, "Internal Server Error", "application/json",
                               "{\"error\":{\"message\":\"Inference or response allocation failed\",\"type\":\"server_error\"}}");

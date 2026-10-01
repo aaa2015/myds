@@ -768,7 +768,15 @@ static void test_previous_response_id_registry(void) {
     assert(resp_id_is_live(b));
     assert(!resp_id_is_live(a));
     assert(resp_id_seen(a));    /* 仍在窗口内 -> expired 而不是 unknown */
-    printf("  [PASS] previous_response_id registry: only the newest is live; older ids are expired, not unknown\n");
+
+    /* 推理失败或清空上下文时：全部失效 */
+    resp_id_invalidate_all();
+    assert(!resp_id_is_live(b));
+    assert(!resp_id_is_live(a));
+    assert(!resp_id_seen(a));
+    assert(!resp_id_seen(b));
+
+    printf("  [PASS] previous_response_id registry: only newest live; expired vs unknown; invalidate_all\n");
 }
 
 /* ── previous_response_id：后缀渲染 ──

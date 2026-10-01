@@ -313,7 +313,7 @@ static uint64_t lowkv_payload_bytes(uint32_t p) {
 /* 身份戳：决定这些字节含义的【全部】参数。任何一项变了，旧文件都必须作废 ——
  * 宁可重新付一次 prefill，也不能把上一版模型的 KV 接上去。 */
 static uint64_t lowkv_identity(const myds_model_t *m) {
-    uint64_t v[16];
+    uint64_t v[32];
     uint32_t n = 0;
     v[n++] = V41_LOWKV_ABI;
     v[n++] = V41_LAYERS;
@@ -330,6 +330,60 @@ static uint64_t lowkv_identity(const myds_model_t *m) {
     v[n++] = (m && m->gf) ? (uint64_t)m->gf->metadata_kv_count : 0ull;
     v[n++] = (m && m->gf) ? (uint64_t)m->gf->tensor_data_offset : 0ull;
     v[n++] = (m && m->gf) ? (uint64_t)m->gf->mmap_size : 0ull;   /* 模型文件大小：换模型立刻作废 */
+
+    /* 权重内容指纹：区分同结构、同大小但权重不同的 checkpoint */
+    uint64_t weight_digest = 1469598103934665603ull;
+    if (m && m->gf) {
+        const char *manifest = gguf_get_str(m->gf, "models.manifest.digest", NULL);
+        if (!manifest) manifest = gguf_get_str(m->gf, "general.sha256", NULL);
+        if (!manifest) manifest = gguf_get_str(m->gf, "general.source.sha256", NULL);
+        if (manifest && *manifest) {
+            for (const unsigned char *p = (const unsigned char *)manifest; *p; p++) {
+                weight_digest ^= (uint64_t)*p;
+                weight_digest *= 1099511628211ull;
+            }
+        }
+        if (m->gf->tensors && m->gf->tensor_count > 0) {
+            const uint64_t tc = m->gf->tensor_count;
+            const uint64_t step = (tc > 16u) ? (tc / 16u) : 1u;
+            for (uint64_t i = 0; i < tc; i += step) {
+                const gguf_tensor_t *t = &m->gf->tensors[i];
+                if (t->data && t->size_bytes > 0) {
+                    const uint8_t *b = (const uint8_t *)t->data;
+                    uint64_t w1 = 0, w2 = 0;
+                    size_t s1 = t->size_bytes < 8 ? t->size_bytes : 8;
+                    memcpy(&w1, b, s1);
+                    size_t mid = t->size_bytes / 2;
+                    size_t s2 = (t->size_bytes - mid) < 8 ? (t->size_bytes - mid) : 8;
+                    memcpy(&w2, b + mid, s2);
+                    weight_digest ^= w1; weight_digest *= 1099511628211ull;
+                    weight_digest ^= w2; weight_digest *= 1099511628211ull;
+                }
+            }
+        }
+    }
+    if (m && m->tok_embeddings && myds_metal_buffer_data(m->tok_embeddings)) {
+        const uint8_t *b = (const uint8_t *)myds_metal_buffer_data(m->tok_embeddings);
+        size_t sz = myds_metal_buffer_size(m->tok_embeddings);
+        size_t s = sz < 64 ? sz : 64;
+        for (size_t k = 0; k < s; k += 8) {
+            uint64_t chunk = 0;
+            memcpy(&chunk, b + k, (s - k >= 8 ? 8 : s - k));
+            weight_digest ^= chunk; weight_digest *= 1099511628211ull;
+        }
+    }
+    if (m && m->output && myds_metal_buffer_data(m->output)) {
+        const uint8_t *b = (const uint8_t *)myds_metal_buffer_data(m->output);
+        size_t sz = myds_metal_buffer_size(m->output);
+        size_t s = sz < 64 ? sz : 64;
+        for (size_t k = 0; k < s; k += 8) {
+            uint64_t chunk = 0;
+            memcpy(&chunk, b + k, (s - k >= 8 ? 8 : s - k));
+            weight_digest ^= chunk; weight_digest *= 1099511628211ull;
+        }
+    }
+    v[n++] = weight_digest;
+
     return myds_kvdsk_identity(m ? m->arch : "", v, n);
 }
 
@@ -469,12 +523,14 @@ static bool lowkv_read_slot(myds_v41_context_t *g, uint32_t entry, uint32_t s,
 
     uint64_t off = V41_LOWKV_HEADER;
     if (!myds_kvdsk_read_chunk(g->low_store, off, out_hist, engram_bytes)) {
+        myds_kvdsk_read_abort(g->low_store);
         (void)myds_kvdsk_slot_clear(g->low_store, entry);
         return false;
     }
     off += engram_bytes;
     if (!lowkv_fill(g->low_store, g->snap_window[s],
                     (uint64_t)V41_LAYERS * window_bytes, stage, &off)) {
+        myds_kvdsk_read_abort(g->low_store);
         (void)myds_kvdsk_slot_clear(g->low_store, entry);
         return false;
     }
@@ -483,6 +539,7 @@ static bool lowkv_read_slot(myds_v41_context_t *g, uint32_t entry, uint32_t s,
         if (!rows[o]) continue;
         if (!lowkv_fill(g->low_store, g->compressed[o],
                         (uint64_t)rows[o] * V41_LOWKV_LATENT * 4u, stage, &off)) {
+            myds_kvdsk_read_abort(g->low_store);
             (void)myds_kvdsk_slot_clear(g->low_store, entry);
             return false;
         }
@@ -491,6 +548,7 @@ static bool lowkv_read_slot(myds_v41_context_t *g, uint32_t entry, uint32_t s,
         if (!rows[o]) continue;
         if (!lowkv_fill(g->low_store, g->index_cache[o],
                         (uint64_t)rows[o] * V41_INDEX_DIM * 4u, stage, &off)) {
+            myds_kvdsk_read_abort(g->low_store);
             (void)myds_kvdsk_slot_clear(g->low_store, entry);
             return false;
         }
@@ -1860,21 +1918,43 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     v41_chunk_workspace_t *cw = g->chunk_ws;
 
     /* 复用 prompt 级工作区（避免长请求每次 prefill 申请释放上吉字节引发抖动） */
-    if (!g->prompt_res || g->prompt_tokens_cap < n_tokens || g->prompt_mask_bytes_cap < mask_bytes) {
+    const bool prompt_ws_complete = g->prompt_res && g->prompt_pre && g->prompt_selected &&
+                                    g->prompt_block_mask && g->prompt_engram[0] && g->prompt_engram[1];
+    if (!prompt_ws_complete || g->prompt_tokens_cap < n_tokens || g->prompt_mask_bytes_cap < mask_bytes) {
+        uint32_t cap = (n_tokens + 511u) / 512u * 512u;
+        size_t cap_res_size = (size_t)cap * 4u * V41_DIM;
+        myds_metal_buffer_t *n_res = myds_metal_buffer_alloc(cap_res_size * sizeof(float));
+        myds_metal_buffer_t *n_pre = myds_metal_buffer_alloc((size_t)cap * pre_tok_bytes);
+        myds_metal_buffer_t *n_selected = myds_metal_buffer_alloc((size_t)cap * sel_bytes);
+        myds_metal_buffer_t *n_block_mask = myds_metal_buffer_alloc((size_t)cap * mask_bytes);
+        float *n_engram0 = (float *)malloc((size_t)cap * MYDS_ENGRAM_INPUT_DIM * sizeof(float));
+        float *n_engram1 = (float *)malloc((size_t)cap * MYDS_ENGRAM_INPUT_DIM * sizeof(float));
+
+        if (!n_res || !n_pre || !n_selected || !n_block_mask || !n_engram0 || !n_engram1) {
+            if (n_res) myds_metal_buffer_free(n_res);
+            if (n_pre) myds_metal_buffer_free(n_pre);
+            if (n_selected) myds_metal_buffer_free(n_selected);
+            if (n_block_mask) myds_metal_buffer_free(n_block_mask);
+            if (n_engram0) free(n_engram0);
+            if (n_engram1) free(n_engram1);
+            MYDS_LOG_E("V4.1 prefill failed to allocate workspace buffers (cap=%u)", cap);
+            return -1;
+        }
+
+        /* 成功申请完整一组后再释放旧组并原子替换，确保容量发布与指针完整性原子对齐 */
         if (g->prompt_res) myds_metal_buffer_free(g->prompt_res);
         if (g->prompt_pre) myds_metal_buffer_free(g->prompt_pre);
         if (g->prompt_selected) myds_metal_buffer_free(g->prompt_selected);
         if (g->prompt_block_mask) myds_metal_buffer_free(g->prompt_block_mask);
         if (g->prompt_engram[0]) free(g->prompt_engram[0]);
         if (g->prompt_engram[1]) free(g->prompt_engram[1]);
-        uint32_t cap = (n_tokens + 511u) / 512u * 512u;
-        size_t cap_res_size = (size_t)cap * 4u * V41_DIM;
-        g->prompt_res = myds_metal_buffer_alloc(cap_res_size * sizeof(float));
-        g->prompt_pre = myds_metal_buffer_alloc((size_t)cap * pre_tok_bytes);
-        g->prompt_selected = myds_metal_buffer_alloc((size_t)cap * sel_bytes);
-        g->prompt_block_mask = myds_metal_buffer_alloc((size_t)cap * mask_bytes);
-        g->prompt_engram[0] = (float *)malloc((size_t)cap * MYDS_ENGRAM_INPUT_DIM * sizeof(float));
-        g->prompt_engram[1] = (float *)malloc((size_t)cap * MYDS_ENGRAM_INPUT_DIM * sizeof(float));
+
+        g->prompt_res = n_res;
+        g->prompt_pre = n_pre;
+        g->prompt_selected = n_selected;
+        g->prompt_block_mask = n_block_mask;
+        g->prompt_engram[0] = n_engram0;
+        g->prompt_engram[1] = n_engram1;
         g->prompt_tokens_cap = cap;
         g->prompt_mask_bytes_cap = mask_bytes;
     }

@@ -21,6 +21,8 @@ void myds_last_prefill_stats(const myds_context_t *ctx, myds_prefill_stats_t *ou
     if (out) memset(out, 0, sizeof(*out));
 }
 void myds_set_continue_from_cache(myds_context_t *ctx, bool enable) { (void)ctx; (void)enable; }
+uint32_t myds_context_get_pcache_len(const myds_context_t *ctx) { (void)ctx; return 100; }
+void myds_vjob_set_gpu_lock(void (*lock_fn)(void), void (*unlock_fn)(void)) { (void)lock_fn; (void)unlock_fn; }
 const char *myds_vjob_placeholder(void) { return "<|image_pad|>"; }
 uint32_t myds_vjob_image_token_id(void) { return 0; }
 int myds_vjob_sink_add(myds_vjob_sink_t *sink, const uint8_t *encoded, size_t len,
