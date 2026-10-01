@@ -313,9 +313,102 @@ static uint64_t lowkv_payload_bytes(uint32_t p) {
     return n;
 }
 
+static inline void digest_update(uint64_t *d, const void *data, size_t len) {
+    if (!d || !data || len == 0) return;
+    const uint8_t *p = (const uint8_t *)data;
+    const size_t u64_count = len / 8;
+    for (size_t k = 0; k < u64_count; k++) {
+        uint64_t val;
+        memcpy(&val, p + k * 8, 8);
+        *d ^= val;
+        *d *= 1099511628211ull;
+    }
+    for (size_t k = u64_count * 8; k < len; k++) {
+        *d ^= (uint64_t)p[k];
+        *d *= 1099511628211ull;
+    }
+}
+
+static inline void digest_update_u64(uint64_t *d, uint64_t val) {
+    if (!d) return;
+    *d ^= val;
+    *d *= 1099511628211ull;
+}
+
+static inline void digest_update_str(uint64_t *d, const char *s) {
+    if (!d || !s) return;
+    digest_update(d, s, strlen(s));
+}
+
+static void digest_update_metadata_kv(uint64_t *d, const gguf_kv_t *kv) {
+    if (!d || !kv) return;
+    if (kv->key) digest_update_str(d, kv->key);
+    digest_update_u64(d, (uint64_t)kv->type);
+    switch (kv->type) {
+        case GGUF_TYPE_UINT8:
+        case GGUF_TYPE_INT8:
+        case GGUF_TYPE_BOOL:
+            digest_update(d, &kv->value.val_u8, 1);
+            break;
+        case GGUF_TYPE_UINT16:
+        case GGUF_TYPE_INT16:
+            digest_update(d, &kv->value.val_u16, 2);
+            break;
+        case GGUF_TYPE_UINT32:
+        case GGUF_TYPE_INT32:
+        case GGUF_TYPE_FLOAT32:
+            digest_update(d, &kv->value.val_u32, 4);
+            break;
+        case GGUF_TYPE_UINT64:
+        case GGUF_TYPE_INT64:
+        case GGUF_TYPE_FLOAT64:
+            digest_update(d, &kv->value.val_u64, 8);
+            break;
+        case GGUF_TYPE_STRING:
+            if (kv->value.val_str) digest_update_str(d, kv->value.val_str);
+            break;
+        case GGUF_TYPE_ARRAY: {
+            digest_update_u64(d, (uint64_t)kv->value.val_arr.elem_type);
+            digest_update_u64(d, kv->value.val_arr.count);
+            if (kv->value.val_arr.elem_type == GGUF_TYPE_STRING) {
+                char **strs = (char **)kv->value.val_arr.data;
+                if (strs) {
+                    for (uint64_t j = 0; j < kv->value.val_arr.count; j++) {
+                        if (strs[j]) digest_update_str(d, strs[j]);
+                    }
+                }
+            } else if (kv->value.val_arr.data) {
+                size_t elem_sz = 1;
+                switch (kv->value.val_arr.elem_type) {
+                    case GGUF_TYPE_UINT8:
+                    case GGUF_TYPE_INT8:
+                    case GGUF_TYPE_BOOL: elem_sz = 1; break;
+                    case GGUF_TYPE_UINT16:
+                    case GGUF_TYPE_INT16: elem_sz = 2; break;
+                    case GGUF_TYPE_UINT32:
+                    case GGUF_TYPE_INT32:
+                    case GGUF_TYPE_FLOAT32: elem_sz = 4; break;
+                    case GGUF_TYPE_UINT64:
+                    case GGUF_TYPE_INT64:
+                    case GGUF_TYPE_FLOAT64: elem_sz = 8; break;
+                    default: elem_sz = 0; break;
+                }
+                if (elem_sz > 0 && kv->value.val_arr.count <= (SIZE_MAX / elem_sz)) {
+                    digest_update(d, kv->value.val_arr.data, kv->value.val_arr.count * elem_sz);
+                }
+            }
+            break;
+        }
+        default:
+            break;
+    }
+}
+
 /* 身份戳：决定这些字节含义的【全部】参数。任何一项变了，旧文件都必须作废 ——
  * 宁可重新付一次 prefill，也不能把上一版模型的 KV 接上去。 */
 static uint64_t lowkv_identity(const myds_model_t *m) {
+    if (!m || !m->gf) return 0;
+
     uint64_t v[32];
     uint32_t n = 0;
     v[n++] = V41_LOWKV_ABI;
@@ -329,27 +422,23 @@ static uint64_t lowkv_identity(const myds_model_t *m) {
     v[n++] = MYDS_SNAP_MIN;
     v[n++] = (uint64_t)V41_LOWKV_LATENT;
     v[n++] = (uint64_t)V41_INDEX_DIM;
-    v[n++] = (m && m->gf) ? (uint64_t)m->gf->tensor_count : 0ull;
-    v[n++] = (m && m->gf) ? (uint64_t)m->gf->metadata_kv_count : 0ull;
-    v[n++] = (m && m->gf) ? (uint64_t)m->gf->tensor_data_offset : 0ull;
-    v[n++] = (m && m->gf) ? (uint64_t)m->gf->mmap_size : 0ull;   /* 模型文件大小：换模型立刻作废 */
+    v[n++] = (uint64_t)m->gf->tensor_count;
+    v[n++] = (uint64_t)m->gf->metadata_kv_count;
+    v[n++] = (uint64_t)m->gf->tensor_data_offset;
+    v[n++] = (uint64_t)m->gf->mmap_size;   /* 模型文件大小：换模型立刻作废 */
 
     /* 权重内容指纹：区分同结构、同大小但权重不同的 checkpoint */
     uint64_t weight_digest = 1469598103934665603ull;
     const char *manifest = NULL;
-    if (m && m->gf) {
-        manifest = gguf_get_str(m->gf, "models.manifest.digest", NULL);
-        if (!manifest) manifest = gguf_get_str(m->gf, "general.sha256", NULL);
-        if (!manifest) manifest = gguf_get_str(m->gf, "general.source.sha256", NULL);
-        if (!manifest) manifest = gguf_get_str(m->gf, "models.digest", NULL);
-        if (!manifest) manifest = gguf_get_str(m->gf, "model.digest", NULL);
-        if (!manifest) manifest = gguf_get_str(m->gf, "general.digest", NULL);
-        if (!manifest) manifest = gguf_get_str(m->gf, "general.file_sha256", NULL);
-        if (!manifest) manifest = gguf_get_str(m->gf, "models.file_digest", NULL);
-    }
-    if (!manifest) {
-        manifest = getenv("MYDS_MODEL_DIGEST");
-    }
+    manifest = gguf_get_str(m->gf, "models.manifest.digest", NULL);
+    if (!manifest) manifest = gguf_get_str(m->gf, "general.sha256", NULL);
+    if (!manifest) manifest = gguf_get_str(m->gf, "general.source.sha256", NULL);
+    if (!manifest) manifest = gguf_get_str(m->gf, "models.digest", NULL);
+    if (!manifest) manifest = gguf_get_str(m->gf, "model.digest", NULL);
+    if (!manifest) manifest = gguf_get_str(m->gf, "general.digest", NULL);
+    if (!manifest) manifest = gguf_get_str(m->gf, "general.file_sha256", NULL);
+    if (!manifest) manifest = gguf_get_str(m->gf, "models.file_digest", NULL);
+    if (!manifest) manifest = getenv("MYDS_MODEL_DIGEST");
 
     if (manifest && *manifest) {
         for (const unsigned char *p = (const unsigned char *)manifest; *p; p++) {
@@ -358,12 +447,15 @@ static uint64_t lowkv_identity(const myds_model_t *m) {
         }
     } else {
         /* 缺少完整 manifest digest 时：
-         * ① 对 <= 256MB 模型（或显式开启 MYDS_FORCE_FULL_DIGEST=1）全量遍历全部 tensor 字节，
-         *    生成完整 64 位无死角指纹，确保任意 offset（如 offset 16）变动都能改变 identity。
-         * ② 对 > 256MB 且无完整 digest 的模型，混入进程启动盐（ephemeral boot salt），
-         *    强制禁用跨进程 KV 复用，防止上一版或不同权重的陈旧磁盘 KV 被误用。 */
+         * ① 全量哈希所有影响查表与计算语义的 GGUF 元数据（如 engram.token_map, primes, multipliers 等） */
+        if (m->gf->kvs) {
+            for (uint64_t i = 0; i < m->gf->metadata_kv_count; i++) {
+                digest_update_metadata_kv(&weight_digest, &m->gf->kvs[i]);
+            }
+        }
+
         uint64_t total_tensor_bytes = 0;
-        if (m && m->gf && m->gf->tensors) {
+        if (m->gf->tensors) {
             for (uint64_t i = 0; i < m->gf->tensor_count; i++) {
                 total_tensor_bytes += m->gf->tensors[i].size_bytes;
             }
@@ -373,24 +465,12 @@ static uint64_t lowkv_identity(const myds_model_t *m) {
 
         if (is_small_model || force_full) {
             bool digest_error = false;
-            if (m && m->gf && m->gf->tensors) {
+            if (m->gf->tensors) {
                 for (uint64_t i = 0; i < m->gf->tensor_count; i++) {
                     const gguf_tensor_t *t = &m->gf->tensors[i];
                     if (t->size_bytes == 0) continue;
                     if (t->data) {
-                        const uint8_t *p = (const uint8_t *)t->data;
-                        const size_t len = t->size_bytes;
-                        const size_t u64_count = len / 8;
-                        for (size_t k = 0; k < u64_count; k++) {
-                            uint64_t val;
-                            memcpy(&val, p + k * 8, 8);
-                            weight_digest ^= val;
-                            weight_digest *= 1099511628211ull;
-                        }
-                        for (size_t k = u64_count * 8; k < len; k++) {
-                            weight_digest ^= (uint64_t)p[k];
-                            weight_digest *= 1099511628211ull;
-                        }
+                        digest_update(&weight_digest, t->data, t->size_bytes);
                     } else if (m->gf->fd >= 0) {
                         /* 解除映射后的张量（例如 Engram unmap 后的表）：通过文件描述符流式读取校验 */
                         uint8_t chunk[65536];
@@ -403,67 +483,34 @@ static uint64_t lowkv_identity(const myds_model_t *m) {
                                 digest_error = true;
                                 break;
                             }
-                            const size_t u64_count = (size_t)nread / 8;
-                            for (size_t k = 0; k < u64_count; k++) {
-                                uint64_t val;
-                                memcpy(&val, chunk + k * 8, 8);
-                                weight_digest ^= val;
-                                weight_digest *= 1099511628211ull;
-                            }
-                            for (size_t k = u64_count * 8; k < (size_t)nread; k++) {
-                                weight_digest ^= (uint64_t)chunk[k];
-                                weight_digest *= 1099511628211ull;
-                            }
+                            digest_update(&weight_digest, chunk, (size_t)nread);
                             file_offset += (uint64_t)nread;
                             remaining -= (size_t)nread;
                         }
+                        if (digest_error) break;
                     } else {
                         digest_error = true;
+                        break;
                     }
                 }
             }
-            if (m && m->tok_embeddings && myds_metal_buffer_data(m->tok_embeddings)) {
-                const uint8_t *p = (const uint8_t *)myds_metal_buffer_data(m->tok_embeddings);
-                const size_t len = myds_metal_buffer_size(m->tok_embeddings);
-                const size_t u64_count = len / 8;
-                for (size_t k = 0; k < u64_count; k++) {
-                    uint64_t val;
-                    memcpy(&val, p + k * 8, 8);
-                    weight_digest ^= val;
-                    weight_digest *= 1099511628211ull;
-                }
-                for (size_t k = u64_count * 8; k < len; k++) {
-                    weight_digest ^= (uint64_t)p[k];
-                    weight_digest *= 1099511628211ull;
-                }
-            }
-            if (m && m->output && myds_metal_buffer_data(m->output)) {
-                const uint8_t *p = (const uint8_t *)myds_metal_buffer_data(m->output);
-                const size_t len = myds_metal_buffer_size(m->output);
-                const size_t u64_count = len / 8;
-                for (size_t k = 0; k < u64_count; k++) {
-                    uint64_t val;
-                    memcpy(&val, p + k * 8, 8);
-                    weight_digest ^= val;
-                    weight_digest *= 1099511628211ull;
-                }
-                for (size_t k = u64_count * 8; k < len; k++) {
-                    weight_digest ^= (uint64_t)p[k];
-                    weight_digest *= 1099511628211ull;
-                }
-            }
             if (digest_error) {
-                /* 读取失败禁用磁盘复用：注入不可复现的唯一随机盐 */
-                static atomic_uint_fast64_t s_err_seq = 0;
-                uint64_t fail_salt = ((uint64_t)getpid() << 32) ^ (uint64_t)time(NULL) ^ (uint64_t)atomic_fetch_add(&s_err_seq, 1);
-                weight_digest ^= fail_salt;
-                weight_digest *= 1099511628211ull;
+                MYDS_LOG_W("kvdisk: 模型权重或文件读取失败，无法计算完整指纹");
+                return 0;
+            }
+            if (m->tok_embeddings && myds_metal_buffer_data(m->tok_embeddings)) {
+                digest_update(&weight_digest, myds_metal_buffer_data(m->tok_embeddings),
+                              myds_metal_buffer_size(m->tok_embeddings));
+            }
+            if (m->output && myds_metal_buffer_data(m->output)) {
+                digest_update(&weight_digest, myds_metal_buffer_data(m->output),
+                              myds_metal_buffer_size(m->output));
             }
         } else {
             /* 模型 > 256MB 且缺少 manifest digest：
              * 使用该 model 实例专有的 load_generation（同 model 实例各 context 共享；
              * 同进程不同加载实例或独立 model 结构不同，跨进程 pid 亦不同），彻底杜绝误复用。 */
-            uint64_t gen = (m && m->load_generation) ? m->load_generation : (m ? (((uint64_t)(uintptr_t)m << 13) ^ 0x517cc1b727220a95ull) : 0);
+            uint64_t gen = m->load_generation ? m->load_generation : (((uint64_t)(uintptr_t)m << 13) ^ 0x517cc1b727220a95ull);
             if (!gen) {
                 static atomic_uint_fast64_t s_boot_counter = 0;
                 gen = ((uint64_t)getpid() << 32) ^ (uint64_t)time(NULL) ^ (uint64_t)atomic_fetch_add(&s_boot_counter, 1);
@@ -473,7 +520,7 @@ static uint64_t lowkv_identity(const myds_model_t *m) {
             weight_digest *= 1099511628211ull;
 
             /* 保留多点抽样作为辅助检查（覆盖内存映射张量与已 unmap 的 fd 张量） */
-            if (m && m->gf && m->gf->tensors && m->gf->tensor_count > 0) {
+            if (m->gf->tensors && m->gf->tensor_count > 0) {
                 const uint64_t tc = m->gf->tensor_count;
                 const uint64_t step = (tc > 16u) ? (tc / 16u) : 1u;
                 for (uint64_t i = 0; i < tc; i += step) {
@@ -489,8 +536,15 @@ static uint64_t lowkv_identity(const myds_model_t *m) {
                         memcpy(&w2, b + mid, s2);
                     } else if (m->gf->fd >= 0) {
                         uint64_t file_offset = m->gf->tensor_data_offset + t->offset;
-                        (void)pread(m->gf->fd, &w1, s1, (off_t)file_offset);
-                        (void)pread(m->gf->fd, &w2, s2, (off_t)(file_offset + mid));
+                        ssize_t r1 = pread(m->gf->fd, &w1, s1, (off_t)file_offset);
+                        ssize_t r2 = pread(m->gf->fd, &w2, s2, (off_t)(file_offset + mid));
+                        if (r1 <= 0 || (size_t)r1 != s1 || r2 <= 0 || (size_t)r2 != s2) {
+                            MYDS_LOG_W("kvdisk: 大模型抽样权重读取失败");
+                            return 0;
+                        }
+                    } else {
+                        MYDS_LOG_W("kvdisk: 大模型存在未映射且无有效文件描述符的张量");
+                        return 0;
                     }
                     weight_digest ^= w1; weight_digest *= 1099511628211ull;
                     weight_digest ^= w2; weight_digest *= 1099511628211ull;
@@ -500,7 +554,8 @@ static uint64_t lowkv_identity(const myds_model_t *m) {
     }
     v[n++] = weight_digest;
 
-    return myds_kvdsk_identity(m ? m->arch : "", v, n);
+    uint64_t id = myds_kvdsk_identity(m ? m->arch : "", v, n);
+    return id ? id : 1ull;
 }
 
 uint64_t myds_v41_model_identity(const myds_model_t *m) {
@@ -704,6 +759,10 @@ bool myds_v41_low_kv_enable(myds_v41_context_t *g, const char *dir) {
     g->low_ways = ways;
     const uint32_t entries = MYDS_SNAP_PINNED * ways;
     const uint64_t identity = lowkv_identity(g->model);
+    if (!identity) {
+        MYDS_LOG_W("kvdisk: 模型指纹计算失败 ⇒ 禁用低位区磁盘复用");
+        return false;
+    }
 
     uint64_t budget = 2048ull << 20;
     const char *be = getenv("MYDS_KV_DSK_BUDGET_MB");

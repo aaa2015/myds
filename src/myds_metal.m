@@ -426,6 +426,8 @@ int myds_metal_init(const char *shader_dir) {
                         @"kernel_flash_attn_ext_pad",
                         @"kernel_flash_attn_ext_vec_reduce",
                         /* V4.1 MoE & routing */
+                        @"kernel_mul_mv_id_iq2_xxs_f32",
+                        @"kernel_mul_mv_id_q2_K_f32",
                         @"kernel_myds_v41_route_transform",
                         @"kernel_myds_v41_route_sum",
                         @"kernel_myds_v41_route_divide",
@@ -736,7 +738,7 @@ int myds_metal_init(const char *shader_dir) {
             !g_pso_v41_engram_add || !g_pso_compute_copy_u8 || !g_pso_compute_copy_u32 ||
             !g_pso_compute_copy_u32x4 || !g_pso_swiglu || !g_pso_add ||
             !g_pso_add_bf16 || !g_pso_softmax || !g_pso_moe_swiglu_weight ||
-            !g_pso_moe_sum6) {
+            !g_pso_moe_sum6 || !g_pso_moe_mv_id_iq2_xxs || !g_pso_moe_mv_id_q2_k) {
             fprintf(stderr, "myds_metal: failed to create one or more required compute pipeline states\n");
             g_queue = nil;
             g_device = nil;

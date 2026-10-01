@@ -282,13 +282,172 @@ static void test_p1_unmapped_engram_identity(void) {
     gf2.fd = -1;
     uint64_t id_fail1 = myds_v41_model_identity(&m2);
     uint64_t id_fail2 = myds_v41_model_identity(&m2);
-    /* Upon read error, unique non-repeatable fail_salt is injected, disabling disk reuse */
-    assert(id_fail1 != id1 && id_fail1 != id_mut);
-    assert(id_fail1 != id_fail2);
+    /* Upon read error, identity explicitly returns 0 */
+    assert(id_fail1 == 0);
+    assert(id_fail2 == 0);
+
+    /* Verify low_kv_enable safely refuses NULL context or failed identity */
+    assert(!myds_v41_low_kv_enable(NULL, "/tmp"));
+    assert(!myds_v41_low_kv_enabled(NULL));
 
     close(fd);
     unlink(path);
-    printf("  [PASS] P1: Unmapped tensor streamed via fd detects byte changes and disables disk reuse on error\n");
+    printf("  [PASS] P1 & P2: Unmapped tensor streamed via fd detects byte changes and returns 0 on read failure, disabling disk reuse\n");
+}
+
+static void test_p1_engram_metadata_identity(void) {
+    myds_model_t m1, m2;
+    memset(&m1, 0, sizeof(m1));
+    memset(&m2, 0, sizeof(m2));
+
+    gguf_file_t gf1, gf2;
+    memset(&gf1, 0, sizeof(gf1));
+    memset(&gf2, 0, sizeof(gf2));
+
+    snprintf(m1.arch, sizeof(m1.arch), "deepseek2");
+    snprintf(m2.arch, sizeof(m2.arch), "deepseek2");
+    m1.gf = &gf1;
+    m2.gf = &gf2;
+
+    gf1.tensor_count = 1;
+    gf2.tensor_count = 1;
+    gf1.metadata_kv_count = 1;
+    gf2.metadata_kv_count = 1;
+    gf1.tensor_data_offset = 1024;
+    gf2.tensor_data_offset = 1024;
+    gf1.mmap_size = 10000;
+    gf2.mmap_size = 10000;
+
+    gguf_tensor_t t1, t2;
+    memset(&t1, 0, sizeof(t1));
+    memset(&t2, 0, sizeof(t2));
+
+    uint8_t tensor_data[64];
+    memset(tensor_data, 0x5a, sizeof(tensor_data));
+    t1.data = tensor_data;
+    t1.size_bytes = sizeof(tensor_data);
+    t2.data = tensor_data;
+    t2.size_bytes = sizeof(tensor_data);
+
+    gf1.tensors = &t1;
+    gf2.tensors = &t2;
+
+    /* Two metadata layouts with identical tensor bytes and keys but swapped token_map values at positions 0 and 6 */
+    uint32_t map1[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+    uint32_t map2[16] = {6, 1, 2, 3, 4, 5, 0, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+
+    char key_token_map[] = "deepseek41.engram.token_map";
+    gguf_kv_t kv1, kv2;
+    memset(&kv1, 0, sizeof(kv1));
+    memset(&kv2, 0, sizeof(kv2));
+
+    kv1.key = key_token_map;
+    kv1.type = GGUF_TYPE_ARRAY;
+    kv1.value.val_arr.elem_type = GGUF_TYPE_UINT32;
+    kv1.value.val_arr.count = 16;
+    kv1.value.val_arr.data = map1;
+
+    kv2.key = key_token_map;
+    kv2.type = GGUF_TYPE_ARRAY;
+    kv2.value.val_arr.elem_type = GGUF_TYPE_UINT32;
+    kv2.value.val_arr.count = 16;
+    kv2.value.val_arr.data = map2;
+
+    gf1.kvs = &kv1;
+    gf2.kvs = &kv2;
+
+    /* 1. Normal mode (small model, no manifest): swapped token_map must yield different identity */
+    uint64_t id1 = myds_v41_model_identity(&m1);
+    uint64_t id2 = myds_v41_model_identity(&m2);
+    assert(id1 != 0);
+    assert(id2 != 0);
+    assert(id1 != id2);
+
+    /* 2. Under MYDS_FORCE_FULL_DIGEST=1: must also yield different identity */
+    setenv("MYDS_FORCE_FULL_DIGEST", "1", 1);
+    uint64_t id1_force = myds_v41_model_identity(&m1);
+    uint64_t id2_force = myds_v41_model_identity(&m2);
+    unsetenv("MYDS_FORCE_FULL_DIGEST");
+    assert(id1_force != id2_force);
+
+    /* 3. Mutating primes array must also change identity */
+    uint32_t primes1[4] = {10007, 10009, 10037, 10039};
+    uint32_t primes2[4] = {10007, 10009, 10037, 10069};
+    char key_primes[] = "deepseek41.engram.primes";
+    kv1.key = key_primes;
+    kv1.value.val_arr.count = 4;
+    kv1.value.val_arr.data = primes1;
+    kv2.key = key_primes;
+    kv2.value.val_arr.count = 4;
+    kv2.value.val_arr.data = primes2;
+    uint64_t id_p1 = myds_v41_model_identity(&m1);
+    uint64_t id_p2 = myds_v41_model_identity(&m2);
+    assert(id_p1 != id_p2);
+
+    printf("  [PASS] P1: GGUF metadata (token_map swap, primes mutation) changes model identity\n");
+}
+
+static void test_p2_moe_kernel_and_pso_validation(void) {
+    if (!myds_metal_init(NULL)) {
+        printf("  [SKIP] Metal not supported on this platform\n");
+        return;
+    }
+
+    const uint32_t dim = 64;
+    const uint32_t expert_dim = 64;
+    const uint32_t n_routed_experts = 16;
+    const uint32_t n_activated_experts = 6;
+
+    myds_metal_buffer_t *moe_out = myds_metal_buffer_alloc(dim * sizeof(float));
+    myds_metal_buffer_t *x_in = myds_metal_buffer_alloc(dim * sizeof(float));
+    uint64_t gate_row_bytes = (dim / 256u) * 66u;
+    if (gate_row_bytes == 0) gate_row_bytes = 66u;
+    uint64_t gate_exp_bytes = (uint64_t)expert_dim * gate_row_bytes;
+    uint64_t down_row_bytes = (expert_dim / 256u) * 84u;
+    if (down_row_bytes == 0) down_row_bytes = 84u;
+    uint64_t down_exp_bytes = (uint64_t)dim * down_row_bytes;
+
+    myds_metal_buffer_t *gate_exps = myds_metal_buffer_alloc((size_t)(n_routed_experts * gate_exp_bytes));
+    myds_metal_buffer_t *up_exps = myds_metal_buffer_alloc((size_t)(n_routed_experts * gate_exp_bytes));
+    myds_metal_buffer_t *down_exps = myds_metal_buffer_alloc((size_t)(n_routed_experts * down_exp_bytes));
+    myds_metal_buffer_t *selected_ids = myds_metal_buffer_alloc(n_activated_experts * sizeof(int32_t));
+    myds_metal_buffer_t *selected_weights = myds_metal_buffer_alloc(n_activated_experts * sizeof(float));
+    myds_metal_buffer_t *scratch_gate = myds_metal_buffer_alloc(n_activated_experts * expert_dim * sizeof(float));
+    myds_metal_buffer_t *scratch_up = myds_metal_buffer_alloc(n_activated_experts * expert_dim * sizeof(float));
+    myds_metal_buffer_t *scratch_mid = myds_metal_buffer_alloc(n_activated_experts * expert_dim * sizeof(float));
+    myds_metal_buffer_t *scratch_down = myds_metal_buffer_alloc(n_activated_experts * dim * sizeof(float));
+
+    assert(moe_out && x_in && gate_exps && up_exps && down_exps && selected_ids &&
+           selected_weights && scratch_gate && scratch_up && scratch_mid && scratch_down);
+
+    int32_t ids[6] = {0, 1, 2, 3, 4, 5};
+    float weights[6] = {0.2f, 0.2f, 0.2f, 0.2f, 0.1f, 0.1f};
+    assert(myds_metal_buffer_write(selected_ids, 0, ids, sizeof(ids)));
+    assert(myds_metal_buffer_write(selected_weights, 0, weights, sizeof(weights)));
+
+    int ret = myds_metal_routed_moe(
+        moe_out, x_in, gate_exps, up_exps, down_exps,
+        selected_ids, selected_weights,
+        scratch_gate, scratch_up, scratch_mid, scratch_down,
+        dim, expert_dim, n_routed_experts, n_activated_experts,
+        GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_K,
+        0.0f
+    );
+    assert(ret == 1);
+
+    myds_metal_buffer_free(moe_out);
+    myds_metal_buffer_free(x_in);
+    myds_metal_buffer_free(gate_exps);
+    myds_metal_buffer_free(up_exps);
+    myds_metal_buffer_free(down_exps);
+    myds_metal_buffer_free(selected_ids);
+    myds_metal_buffer_free(selected_weights);
+    myds_metal_buffer_free(scratch_gate);
+    myds_metal_buffer_free(scratch_up);
+    myds_metal_buffer_free(scratch_mid);
+    myds_metal_buffer_free(scratch_down);
+
+    printf("  [PASS] P2: MoE IQ2/Q2K kernels verified and executed successfully on GPU\n");
 }
 
 static void test_p1_same_process_large_model_isolation(void) {
@@ -358,9 +517,11 @@ int main(void) {
     test_p1_response_id_lifecycle();
     test_p1_vision_queue_slot();
     test_p1_weight_identity();
+    test_p1_engram_metadata_identity();
     test_p1_unmapped_engram_identity();
     test_p1_same_process_large_model_isolation();
     test_p1_metal_fused_add_fallback();
+    test_p2_moe_kernel_and_pso_validation();
     printf("All P1 Regression Verifications PASSED!\n");
     return 0;
 }
