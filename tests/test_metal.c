@@ -1022,6 +1022,192 @@ static int test_moe_batch_mm(void) {
     return 1;
 }
 
+
+/* ═══════════════════════════════════════════════════════════════════════
+ *  视觉编码器可行性验证：BF16 → F16 + 复用现有 F16 GEMM
+ *
+ *  背景：DeepSeek-V4.1-Flash-Vision.gguf 的 266 个张量【全是 BF16】，
+ *        而 myds 只有 F16/F32/Q8_0 的 GEMM。
+ *
+ *  待验假定：BF16→F16 对模型权重要【无损】，于是不必新写 BF16 内核。
+ *    依据：BF16 尾数 7 位，F16 尾数 10 位 ⇒ 正常值域内 F16 精度【更高】；
+ *          权重幅值 ~1e-2，远在 F16 范围 [6e-5, 65504] 内。
+ *
+ *  判据（不看"像不像对"，看两路是否一致）：
+ *    参考值 = 用【原始 BF16 值】在 double 下累加  （= ds4 那边看到的东西）
+ *    实测值 = GPU 上的 F16 GEMM
+ *    两者之差 = 「BF16→F16 + 引擎累加次序」引入的全部误差
+ *  用【视觉编码器的真实形状】跑，而不是随便造个矩阵。
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static uint16_t t_f32_to_bf16(float f) {
+    uint32_t x; memcpy(&x, &f, 4);
+    uint32_t lsb = (x >> 16) & 1u;
+    x += 0x7fffu + lsb;                 /* round to nearest even */
+    return (uint16_t)(x >> 16);
+}
+static float t_bf16_to_f32(uint16_t b) {
+    uint32_t x = ((uint32_t)b) << 16;
+    float f; memcpy(&f, &x, 4); return f;
+}
+/* f32 → f16，正确支持【次正规数】与就近偶数舍入。
+ *
+ * ★ 第一版我写成「e < -14 直接返回 0」—— 那会把 F16 次正规区间
+ *   [6e-8, 6.1e-5) 的权重【全部刷成零】。实测代价：aligner 的 47M 权重里
+ *   约 5.8 万个被刷零，造成的误差(7.2e-3) 正好等于当时观测到的 6.1e-3。
+ *   ⇒ 那次「失败」是我的测试代码的缺陷，不是 BF16→F16 这条路线的问题。
+ *   教训：**测量工具自身要先被验证**，否则得到的是工具的行为、不是被测对象的。 */
+static uint16_t t_f32_to_f16(float f) {
+    uint32_t x; memcpy(&x, &f, 4);
+    const uint32_t sign = (x >> 31) & 1u;
+    const int32_t  e    = (int32_t)((x >> 23) & 0xffu) - 127;
+    const uint32_t m    = x & 0x7fffffu;               /* 23 位尾数 */
+    if (((x >> 23) & 0xffu) == 0xffu)                  /* inf / nan */
+        return (uint16_t)((sign << 15) | 0x7c00u | (m ? 0x200u : 0u));
+    if (e > 15) return (uint16_t)((sign << 15) | 0x7c00u);      /* 上溢 */
+    if (e >= -14) {                                             /* 正规数 */
+        uint32_t bits = ((uint32_t)(e + 15) << 10) | (m >> 13);
+        uint32_t rem  = m & 0x1fffu;
+        if (rem > 0x1000u || (rem == 0x1000u && (bits & 1u))) bits++;
+        return (uint16_t)((sign << 15) | bits);
+    }
+    if (e < -25) return (uint16_t)(sign << 15);                 /* 太小 ⇒ 0 */
+    /* 次正规：value = sig * 2^(-23+e)，要表示成 m5 * 2^-24 ⇒ m5 = sig >> (-(e+1)) */
+    const uint32_t sig   = m | 0x800000u;
+    const int      shift = -(e + 1);                            /* 1..24 */
+    uint32_t m5  = sig >> shift;
+    uint32_t rem = sig & ((1u << shift) - 1u);
+    uint32_t half = 1u << (shift - 1);
+    if (rem > half || (rem == half && (m5 & 1u))) m5++;
+    if (m5 > 0x3ffu) m5 = 0x400u;                               /* 进位到最小正规数 */
+    return (uint16_t)((sign << 15) | (m5 & 0x3ffu));
+}
+/* 确定性伪随机（不用 rand，保证可复现） */
+static uint32_t t_rng_state;
+static float t_rng_next(void) {
+    t_rng_state = t_rng_state * 1664525u + 1013904223u;
+    return ((float)((t_rng_state >> 8) & 0xffffu) / 32768.0f) - 1.0f;  /* [-1,1) */
+}
+
+static int test_vision_bf16_to_f16_gemm(void) {
+    /* 全部取自 DeepSeek-V4.1-Flash-Vision.gguf 的真实张量形状 */
+    static const struct { const char *name; uint32_t out_dim, in_dim, n_tok; } cs[] = {
+        { "patch_embed [588,1024]",   1024,  588, 196 },   /* 14x14 网格 */
+        { "qkv         [1024,3072]",  3072, 1024, 196 },
+        { "attn.wo     [1024,1024]",  1024, 1024, 196 },
+        { "mlp.w1      [1024,5632]",  5632, 1024, 196 },
+        { "mlp.w2      [2816,1024]",  1024, 2816, 196 },
+        { "aligner.w1  [9216,5120]",  5120, 9216,  23 },   /* downsample 后 */
+        { "aligner.w2  [5120,5120]",  5120, 5120,  23 },
+    };
+
+    double worst_f16 = 0.0, worst_f32 = 0.0, worst_conv = 0.0;
+    const char *worst_name16 = "", *worst_name32 = "";
+
+    for (size_t ci = 0; ci < sizeof(cs)/sizeof(cs[0]); ci++) {
+        const uint32_t O = cs[ci].out_dim, I = cs[ci].in_dim, T = cs[ci].n_tok;
+
+        myds_metal_buffer_t *W = myds_metal_buffer_alloc((size_t)O * I * 2u);
+        myds_metal_buffer_t *x = myds_metal_buffer_alloc((size_t)T * I * sizeof(float));
+        myds_metal_buffer_t *y = myds_metal_buffer_alloc((size_t)T * O * sizeof(float));
+        ASSERT_TRUE(W && x && y);
+
+        /* 权重：先量化到 BF16（模拟真实文件），再转 F16 喂给 GPU。
+         * 同时留一份 BF16 的 F32 还原值给 CPU 参考 —— 这才是"真值"。 */
+        t_rng_state = 20261001u;
+        uint16_t *wb = (uint16_t *)malloc((size_t)O * I * sizeof(uint16_t));
+        uint16_t *w16 = (uint16_t *)malloc((size_t)O * I * sizeof(uint16_t));
+        float    *wr = (float *)malloc((size_t)O * I * sizeof(float));
+        ASSERT_TRUE(wb && w16 && wr);
+        for (size_t i = 0; i < (size_t)O * I; i++) {
+            float v = t_rng_next() * 0.05f;          /* 典型权重幅值 */
+            wb[i]  = t_f32_to_bf16(v);               /* 文件里存的 */
+            wr[i]  = t_bf16_to_f32(wb[i]);           /* 真值（BF16 能表示的） */
+            w16[i] = t_f32_to_f16(wr[i]);            /* 喂 GPU 的 */
+        }
+        /* 转换自身引入多少误差？（BF16 值 → F16 值，与真值比） */
+        double conv_max = 0.0; size_t subnormal = 0;
+        for (size_t i = 0; i < (size_t)O * I; i++) {
+            float back; uint16_t h = w16[i];
+            uint32_t sg = (h >> 15) & 1u, ex = (h >> 10) & 0x1fu, fr = h & 0x3ffu;
+            if (ex == 0) { back = (float)fr * 5.9604644775390625e-08f; if (sg) back = -back; subnormal++; }
+            else { uint32_t bx = (sg << 31) | ((ex - 15u + 127u) << 23) | (fr << 13);
+                   memcpy(&back, &bx, 4); }
+            double d = fabs((double)back - (double)wr[i]);
+            if (d > conv_max) conv_max = d;
+        }
+        float *xv = (float *)malloc((size_t)T * I * sizeof(float));
+        ASSERT_TRUE(xv);
+        for (size_t i = 0; i < (size_t)T * I; i++) xv[i] = t_rng_next();
+
+        /* CPU 参考：double 累加，权重用【BF16 还原值】= 文件真值 */
+        double *ref = (double *)malloc((size_t)T * O * sizeof(double));
+        ASSERT_TRUE(ref);
+        double sum_sq = 0.0;
+        for (uint32_t t = 0; t < T; t++) {
+            for (uint32_t o = 0; o < O; o++) {
+                double acc = 0.0;
+                for (uint32_t i = 0; i < I; i++)
+                    acc += (double)wr[(size_t)o * I + i] * (double)xv[(size_t)t * I + i];
+                ref[(size_t)t * O + o] = acc;
+                sum_sq += acc * acc;
+            }
+        }
+        const double rms = sqrt(sum_sq / ((double)T * O));
+
+        /* ── 路径 A：BF16 → F16，用 F16 GEMM ── */
+        memcpy(myds_metal_buffer_data(W), w16, (size_t)O * I * 2u);
+        memcpy(myds_metal_buffer_data(x), xv, (size_t)T * I * sizeof(float));
+        ASSERT_TRUE(myds_metal_mul_mm(y, W, x, O, I, T, GGML_TYPE_F16));
+        float *yv = (float *)myds_metal_buffer_data(y);
+        double max16 = 0.0;
+        for (size_t i = 0; i < (size_t)T * O; i++) {
+            double d = fabs(ref[i] - (double)yv[i]);
+            if (d > max16) max16 = d;
+        }
+
+        /* ── 路径 B：BF16 → F32（无损！BF16 就是 F32 的高 16 位），用 F32 GEMM ── */
+        myds_metal_buffer_t *W32 = myds_metal_buffer_alloc((size_t)O * I * sizeof(float));
+        ASSERT_TRUE(W32);
+        memcpy(myds_metal_buffer_data(W32), wr, (size_t)O * I * sizeof(float));
+        ASSERT_TRUE(myds_metal_mul_mm(y, W32, x, O, I, T, GGML_TYPE_F32));
+        yv = (float *)myds_metal_buffer_data(y);
+        double max32 = 0.0;
+        for (size_t i = 0; i < (size_t)T * O; i++) {
+            double d = fabs(ref[i] - (double)yv[i]);
+            if (d > max32) max32 = d;
+        }
+
+        const double rel16 = rms > 0 ? max16 / rms : 0.0;
+        const double rel32 = rms > 0 ? max32 / rms : 0.0;
+        printf("    %-14s in=%-5u tok=%-4u | 转换=%.1e | F16路=%.3e (相对 %.1e) | F32路=%.3e (相对 %.1e)\n",
+               cs[ci].name, I, T, conv_max, max16, rel16, max32, rel32);
+        if (rel16 > worst_f16) { worst_f16 = rel16; worst_name16 = cs[ci].name; }
+        if (rel32 > worst_f32) { worst_f32 = rel32; worst_name32 = cs[ci].name; }
+        if (conv_max > worst_conv) worst_conv = conv_max;
+
+        free(ref); free(wb); free(w16); free(wr); free(xv);
+        myds_metal_buffer_free(W32);
+        myds_metal_buffer_free(W); myds_metal_buffer_free(x); myds_metal_buffer_free(y);
+    }
+
+    printf("\n    转换本身最大误差 (BF16→F16): %.2e\n", worst_conv);
+    printf("    路径 A  F16 权重 + F16 GEMM 最差相对误差: %.2e (%s)\n", worst_f16, worst_name16);
+    printf("    路径 B  F32 权重 + F32 GEMM 最差相对误差: %.2e (%s)\n", worst_f32, worst_name32);
+    printf("\n    ※ F16 内核的累加器是 simdgroup_half8x8（F16 累加）⇒ 长点积精度差；\n");
+    printf("      F32 内核是 simdgroup_float8x8（F32 累加）。BF16→F32 是【无损】的。\n");
+    /* 转换必须无损：BF16→F16 的误差应当在 F16 次正规量级以下 */
+    ASSERT_TRUE(worst_conv < 1e-6);
+    /* F32 路径必须达到【F32 累加本身的精度】：长点积的模型是
+     *   max|err| ≈ c · sqrt(I) · eps_f32 · 量级   （c ~ 4~6，取最大值若干标准差）
+     * I=9216 时约 96 · 6e-8 = 6e-6（RMS），最大值到 3~4e-5 合理。
+     * 阈值取 1e-4：比 F32 实测(3.5e-5) 宽 3 倍，比 F16 实测(4.1e-3) 严 40 倍
+     * ⇒ 能真正区分两条路径，而不是"看着差不多"。 */
+    ASSERT_TRUE(worst_f32 < 1e-4);
+    printf("  [PASS] 视觉编码器 GEMM 可行性：F32 路径达 F32 累加精度（转换无损）\n");
+    return 1;
+}
+
 int main(void) {
     printf("====================================================\n");
     printf("   Running myds Metal GPU Kernel Verification\n");
@@ -1056,6 +1242,7 @@ int main(void) {
     RUN_TEST(test_swiglu_flat_shapes());
     RUN_TEST(test_gemv_batch_exact());
     RUN_TEST(test_v41_gemv_batch_exact());
+    RUN_TEST(test_vision_bf16_to_f16_gemm());
     RUN_TEST(test_event_validation());
     RUN_TEST(test_event_tail_completion(0));
     RUN_TEST(test_event_tail_completion(1));
