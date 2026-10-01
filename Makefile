@@ -136,6 +136,24 @@ bench: $(TEST_CPU) $(BENCH_METAL) $(BENCH_SYNTHETIC)
 	./$(BENCH_METAL)
 	./$(BENCH_SYNTHETIC)
 
+# 视觉权重加载校验。需要指定真实的视觉 GGUF 路径：
+#   make test-visw VIS_GGUF=/path/to/Vision.gguf [VIS_LOAD=1]
+# ★ 默认【不加 --load】—— 全量 load 要 1.81 GiB，不该在随便一台机器上就跑起来。
+VIS_GGUF ?=
+VIS_LOAD ?=
+
+test-visw:
+	@if [ -z "$(VIS_GGUF)" ]; then \
+		echo "用法: make test-visw VIS_GGUF=/path/to/DeepSeek-V4.1-Flash-Vision.gguf [VIS_LOAD=1]"; \
+		exit 2; \
+	fi
+	$(CC) $(CFLAGS) -Iinclude -o $(BIN_DIR)/test_visw tests/test_visw.c \
+		src/myds_visw.c src/myds_gguf.c src/myds_log.c $(BUILD_DIR)/myds_metal.o \
+		-framework Foundation -framework Metal -lm
+	@$(BIN_DIR)/test_visw "$(VIS_GGUF)" $(if $(VIS_LOAD),--load,)
+
+.PHONY: test-visw
+
 # 视觉预处理/布局 与 ds4 的逐字节对拍（开发期门禁，需要 ds4 源码在侧）
 # 不并入 test: —— 它依赖外部仓库路径，缺了会跳过而不是失败。
 vis-crosscheck:

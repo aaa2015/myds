@@ -28,6 +28,12 @@ typedef enum {
     GGUF_TYPE_FLOAT64 = 12,
 } gguf_type;
 
+/* ★ 这些数值必须与 ggml / GGUF 文件格式【逐一对齐】——
+ *   它们直接来自文件里的字节，不是本引擎自己的编号。
+ *   2026-10-01 踩过：BF16 曾被写成 29（正确是 30），于是任何 BF16 的 GGUF
+ *   读进来都报 "type UNKNOWN"。因为本引擎主模型是 Q2/Q8/F16，这个错一直没暴露，
+ *   直到接视觉编码器（266 个张量【全是 BF16】）才现形。
+ *   ⇒ 判断依据要落在「别人写进文件的字节」上；自己的编号写得再自洽也没用。 */
 typedef enum {
     GGML_TYPE_F32     = 0,
     GGML_TYPE_F16     = 1,
@@ -56,7 +62,8 @@ typedef enum {
     GGML_TYPE_I32     = 26,
     GGML_TYPE_I64     = 27,
     GGML_TYPE_F64     = 28,
-    GGML_TYPE_BF16    = 29,
+    GGML_TYPE_IQ1_M   = 29,   /* 本引擎不支持；列出只为与 ggml 编号对齐 */
+    GGML_TYPE_BF16    = 30,   /* ★ 是 30，不是 29 —— 见下方说明 */
     GGML_TYPE_MXFP4   = 39,
 } ggml_type;
 
