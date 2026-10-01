@@ -640,6 +640,70 @@ static void test_tool_call_event_json(void) {
 }
 
 
+static size_t count_occurrences(const char *hay, const char *needle);
+
+/* ★ 回归：流式的【收尾事件】必须带上聚合后的文本。
+ *
+ * 只发增量、不发聚合，是 OpenAI 兼容实现里常见且危险的坑：增量全收到了，
+ * 但读汇总事件的客户端（官方 SDK、多数封装）拿到的是空字符串 ——
+ * 从外部看就是「流正常结束，但内容为空」，而【增量是好的】，所以很难归因。
+ *
+ * 判据：同一段文本必须出现在【全部四处】——output_text.done、content_part.done、
+ * output_item.done、response.completed.response.output[]。少一处就有客户端读不到。 */
+static void test_responses_finish_carries_the_aggregate_text(void) {
+    /* 含非 ASCII：转义/编码出问题时这里会先炸 */
+    const char *text = "你上一个问题是 2+2。";
+    const size_t tlen = strlen(text);
+
+    char *items = responses_output_message_json(text, tlen);
+    assert(items != NULL);
+
+    int s[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, s) == 0);
+    socket_capture_t c = {.fd = s[1]};
+    pthread_t r; assert(pthread_create(&r, NULL, capture_socket, &c) == 0);
+    myds_sse_stream_ctx_t st = {.client_fd = s[0]};
+    assert(sse_emit_responses_finish(&st, "test-model", "resp_test_1", 10, 3,
+                                     text, tlen, items, 1));
+    assert(shutdown(s[0], SHUT_WR) == 0);
+    assert(pthread_join(r, NULL) == 0);
+
+    assert_sse_data_lines_valid(c.bytes);
+
+    /* 四种事件都要在 */
+    assert(strstr(c.bytes, "event: response.output_text.done") != NULL);
+    assert(strstr(c.bytes, "event: response.content_part.done") != NULL);
+    assert(strstr(c.bytes, "event: response.output_item.done") != NULL);
+    assert(strstr(c.bytes, "event: response.completed") != NULL);
+    /* output 数组必须带上（此前 response.completed 完全没有 output） */
+    assert(strstr(c.bytes, "\"output\":[{\"type\":\"message\"") != NULL);
+    /* ★ 关键判据：文本出现 4 次（前三个事件各一次 + output 数组一次）。
+     * 此前三个事件里是 text":"" ⇒ 这里只会命中 1 次（output 那次还没有，即 0 次）。 */
+    assert(count_occurrences(c.bytes, text) == 4);
+
+    free(c.bytes); close(s[0]); close(s[1]); free(items);
+
+    /* 工具调用那类：不发文本事件，但仍要有 response.completed 且 output 是 function_call */
+    myds_tool_call_t tc = {.id = "call_1", .name = "get_weather",
+                           .arguments = "{\"city\": \"Beijing\"}"};
+    char *titems = responses_function_calls_output_json(&tc, 1);
+    assert(titems != NULL);
+    int s2[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, s2) == 0);
+    socket_capture_t c2 = {.fd = s2[1]};
+    pthread_t r2; assert(pthread_create(&r2, NULL, capture_socket, &c2) == 0);
+    myds_sse_stream_ctx_t st2 = {.client_fd = s2[0]};
+    assert(sse_emit_responses_finish(&st2, "test-model", "resp_test_2", 10, 3, "", 0, titems, 0));
+    assert(shutdown(s2[0], SHUT_WR) == 0);
+    assert(pthread_join(r2, NULL) == 0);
+    assert_sse_data_lines_valid(c2.bytes);
+    assert(strstr(c2.bytes, "event: response.completed") != NULL);
+    assert(strstr(c2.bytes, "\"type\":\"function_call\"") != NULL);
+    /* 工具调用不该发 message 类的文本事件（那会误导客户端去读一个空消息） */
+    assert(strstr(c2.bytes, "response.content_part.done") == NULL);
+    free(c2.bytes); close(s2[0]); close(s2[1]); free(titems);
+
+    printf("  [PASS] finish events carry the aggregate text in all four places\n");
+}
+
 static size_t count_occurrences(const char *hay, const char *needle) {
     size_t n = 0;
     for (const char *p = hay; (p = strstr(p, needle)) != NULL; p += strlen(needle)) ++n;
@@ -745,6 +809,7 @@ int main(int argc, char **argv) {
     test_deepseek41_dsml_parse();
     test_deepseek41_stream_tool_calls();
     test_tool_call_event_json();
+    test_responses_finish_carries_the_aggregate_text();
     test_responses_call_merges_into_assistant_turn();
     test_previous_response_id_registry();
     test_previous_response_id_suffix_render();

@@ -1529,6 +1529,91 @@ bool sse_emit_responses_function_calls(myds_sse_stream_ctx_t *sctx,
     return true;
 }
 
+/* ── Responses 流式的【收尾】事件 ──
+ * 只发增量、不发【聚合】，是 OpenAI 兼容实现里常见且危险的坑：
+ * 读汇总事件的客户端（官方 SDK、多数封装）会拿到空字符串 —— 增量全收到了，汇总却是空的。
+ * 服务端手里本来就有全文（sctx.acc），这里补上；而且顺带把 output_text.done 也发出去
+ * （规范里有这个事件，此前完全没发）。
+ * `emit_text_events` 为假时只发 response.completed —— 工具调用那类，输出项是 function_call。 */
+bool sse_emit_responses_finish(myds_sse_stream_ctx_t *sctx,
+                                      const char *model_alias,
+                                      const char *resp_id,
+                                      unsigned prompt_tokens,
+                                      unsigned output_tokens,
+                                      const char *text, size_t text_len,
+                                      const char *output_items_json,
+                                      int emit_text_events) {
+    char *alias_json = json_escape_alloc(model_alias ? model_alias : "myds",
+                                        strlen(model_alias ? model_alias : "myds"));
+    char *text_json = json_escape_alloc(text ? text : "", text ? text_len : 0);
+    if (!alias_json || !text_json) {
+        free(alias_json);
+        free(text_json);
+        return false;
+    }
+    const char *items = output_items_json ? output_items_json : "[]";
+    char *completed = emit_text_events
+        ? format_alloc(
+            "event: response.output_text.done\n"
+            "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"content_index\":0,\"text\":\"%s\"}\n\n"
+            "event: response.content_part.done\n"
+            "data: {\"type\":\"response.content_part.done\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"%s\"}}\n\n"
+            "event: response.output_item.done\n"
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_myds_1\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"%s\"}]}}\n\n"
+            "event: response.completed\n"
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"%s\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"%s\",\"output\":%s,\"usage\":{\"input_tokens\":%u,\"output_tokens\":%u,\"total_tokens\":%u}}}\n\n",
+            text_json, text_json, text_json, resp_id, alias_json, items,
+            prompt_tokens, output_tokens, prompt_tokens + output_tokens)
+        : format_alloc(
+            "event: response.completed\n"
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"%s\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"%s\",\"output\":%s,\"usage\":{\"input_tokens\":%u,\"output_tokens\":%u,\"total_tokens\":%u}}}\n\n",
+            resp_id, alias_json, items,
+            prompt_tokens, output_tokens, prompt_tokens + output_tokens);
+    free(alias_json);
+    free(text_json);
+    if (!completed) return false;
+    const bool ok = myds_server_send_all(sctx->client_fd, completed, strlen(completed));
+    free(completed);
+    return ok;
+}
+
+/* 文本响应的 output 数组：一条 message 项，文本与增量聚合后的完全一致。 */
+char *responses_output_message_json(const char *text, size_t text_len) {
+    char *text_json = json_escape_alloc(text ? text : "", text ? text_len : 0);
+    if (!text_json) return NULL;
+    char *out = format_alloc(
+        "[{\"type\":\"message\",\"id\":\"msg_myds_1\",\"role\":\"assistant\",\"status\":\"completed\","
+        "\"content\":[{\"type\":\"output_text\",\"text\":\"%s\"}]}]", text_json);
+    free(text_json);
+    return out;
+}
+
+/* 工具调用响应的 output 数组（给 response.completed 用）。 */
+char *responses_function_calls_output_json(const myds_tool_call_t *calls, size_t count) {
+    dsml_buf_t out = {0};
+    bool ok = DSML_PUTS(&out, "[");
+    for (size_t i = 0; ok && i < count; ++i) {
+        char ids[32];
+        snprintf(ids, sizeof(ids), "fc_%zu", i + 1);
+        ok = (i == 0 || DSML_PUTS(&out, ",")) &&
+             DSML_PUTS(&out, "{\"type\":\"function_call\",\"id\":\"") &&
+             DSML_PUTS(&out, ids) &&
+             DSML_PUTS(&out, "\",\"call_id\":\"") &&
+             dsml_put_escaped(&out, calls[i].id, strlen(calls[i].id)) &&
+             DSML_PUTS(&out, "\",\"name\":\"") &&
+             dsml_put_escaped(&out, calls[i].name, strlen(calls[i].name)) &&
+             DSML_PUTS(&out, "\",\"arguments\":\"") &&
+             dsml_put_escaped(&out, calls[i].arguments, strlen(calls[i].arguments)) &&
+             DSML_PUTS(&out, "\",\"status\":\"completed\"}");
+    }
+    ok = ok && DSML_PUTS(&out, "]");
+    if (!ok) {
+        free(out.data);
+        return NULL;
+    }
+    return out.data;
+}
+
 void myds_server_sse_callback(const char *piece, size_t length, int32_t token_id, void *user_data) {
     (void)token_id;
     myds_sse_stream_ctx_t *sctx = user_data;
@@ -1862,25 +1947,27 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                         ? sse_emit_responses_function_calls(&sctx, stool, stool_count)
                         : sse_emit_chat_tool_calls(&sctx, stool, stool_count);
                     if (!tsent) stop_reason = MYDS_STOP_CANCELLED;
+                    /* ★ 工具轮次也必须收尾：客户端靠 response.completed 判定这一轮结束，
+                     * 并从里面取【响应 id】—— 少了它，每个工具轮次都只能全量重放。 */
+                    if (tsent && is_responses_endpoint) {
+                        char *items = responses_function_calls_output_json(stool, stool_count);
+                        const bool finished = items && sse_emit_responses_finish(
+                            &sctx, model_alias, resp_id, (unsigned)prompt_tokens, (unsigned)final_tokens,
+                            "", 0, items, 0);
+                        free(items);
+                        if (!finished) stop_reason = MYDS_STOP_ERROR;
+                    }
                     myds_free_tool_calls(stool, stool_count);
                     stool = NULL;
                 }
                 if (!stool_count && is_responses_endpoint) {
-                    char *alias_json = json_escape_alloc(model_alias ? model_alias : "myds",
-                                                         strlen(model_alias ? model_alias : "myds"));
-                    char *completed = alias_json ? format_alloc(
-                        "event: response.content_part.done\n"
-                        "data: {\"type\":\"response.content_part.done\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n"
-                        "event: response.output_item.done\n"
-                        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_myds_1\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"\"}]}}\n\n"
-                        "event: response.completed\n"
-                        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"%s\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"%s\",\"usage\":{\"input_tokens\":%u,\"output_tokens\":%u,\"total_tokens\":%u}}}\n\n",
-                        resp_id, alias_json, prompt_tokens, final_tokens, prompt_tokens + final_tokens) : NULL;
-                    free(alias_json);
-                    if (completed) {
-                        if (!myds_server_send_all(client_fd, completed, strlen(completed))) stop_reason = MYDS_STOP_CANCELLED;
-                        free(completed);
-                    } else {
+                    /* 聚合文本 = 工具块之前的正文（无工具块时就是全文）。 */
+                    char *items = responses_output_message_json(sctx.acc, sctx.acc ? scontent_len : 0);
+                    const bool finished = items && sse_emit_responses_finish(
+                        &sctx, model_alias, resp_id, (unsigned)prompt_tokens, (unsigned)final_tokens,
+                        sctx.acc, scontent_len, items, 1);
+                    free(items);
+                    if (!finished) {
                         stop_reason = MYDS_STOP_ERROR;
                         const char *error_event = "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"Response allocation failed\",\"type\":\"server_error\"}}\n\n";
                         (void)myds_server_send_all(client_fd, error_event, strlen(error_event));

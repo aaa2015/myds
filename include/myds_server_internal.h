@@ -101,3 +101,14 @@ void myds_free_tool_calls(myds_tool_call_t *calls, size_t count);
 bool sse_emit_chat_tool_calls(myds_sse_stream_ctx_t *sctx, const myds_tool_call_t *calls, size_t count);
 bool sse_emit_responses_function_calls(myds_sse_stream_ctx_t *sctx,
                                        const myds_tool_call_t *calls, size_t count);
+
+/* Responses 流式的【收尾】事件（暴露给测试：要能直接校验聚合文本确实写进去了）。
+ * 只发增量不发聚合，是 OpenAI 兼容实现里常见坑 —— 读汇总的客户端会拿到空字符串。 */
+bool sse_emit_responses_finish(myds_sse_stream_ctx_t *sctx, const char *model_alias,
+                               const char *resp_id, unsigned prompt_tokens, unsigned output_tokens,
+                               const char *text, size_t text_len,
+                               const char *output_items_json, int emit_text_events);
+/* 文本响应的 output 数组（一条 message 项），内部自己转义。 */
+char *responses_output_message_json(const char *text, size_t text_len);
+/* 工具调用响应的 output 数组（给 response.completed 用）。 */
+char *responses_function_calls_output_json(const myds_tool_call_t *calls, size_t count);
