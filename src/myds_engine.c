@@ -2842,7 +2842,7 @@ static int myds_generate_internal(myds_context_t *ctx,
         }
         /* 清空：本次 prefill 会重建属于【本次序列】的点。否则可能用到「已被后续请求改写过的
          * 压缩 KV」所对应的旧点，把续跑接在错误的状态上。 */
-        if (ctx->v41) myds_v41_snapshot_clear(ctx->v41);
+        if (ctx->v41) myds_v41_snapshot_clear(ctx->v41, resume_from);
 
         /* 失配诊断：一旦没能复用，唯一有用的问题是「在第几个 token 分叉、两边分别是什么」。 */
         if (have_prev && resume_from == 0 && L < ctx->pcache_len) {
@@ -2929,6 +2929,9 @@ static int myds_generate_internal(myds_context_t *ctx,
             return 0;
         }
     }
+    /* 记下 prefill 末尾的状态，供下一个只共享前缀的请求续跑（续跑点为 0 token 时，
+     * prefill 里的保存点不会执行，所以必须在这里显式存一次）。 */
+    if (ctx->v41) (void)myds_v41_snapshot_store_now(ctx->v41, (uint32_t)n_prompt - 1u);
     cur_token = prompt_tokens[n_prompt - 1];
     free(prompt_tokens);
 

@@ -20,7 +20,10 @@ void myds_v41_context_free(myds_v41_context_t *context);
  * 「客户端每次都当新对话、只带系统提示词」这一类（严格续写之外的）用法。 */
 uint32_t myds_v41_snapshot_best(const myds_v41_context_t *context, uint32_t common);
 bool     myds_v41_snapshot_restore(myds_v41_context_t *context, uint32_t position);
-void     myds_v41_snapshot_clear(myds_v41_context_t *context);
+/* 丢弃位置 > keep_up_to 的快照（本次请求会从那里开始写，更早的点仍然有效）。 */
+void     myds_v41_snapshot_clear(myds_v41_context_t *context, uint32_t keep_up_to);
+/* prefill 结束后记下当前状态（末尾槽），供下一个共享前缀的请求复用。 */
+bool     myds_v41_snapshot_store_now(myds_v41_context_t *context, uint32_t position);
 int32_t myds_v41_forward(myds_context_t *context, int32_t token,
                         uint32_t position, bool need_logits);
 int myds_v41_prefill_tokens(myds_context_t *context, const int32_t *tokens,
