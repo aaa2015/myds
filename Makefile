@@ -136,6 +136,13 @@ bench: $(TEST_CPU) $(BENCH_METAL) $(BENCH_SYNTHETIC)
 	./$(BENCH_METAL)
 	./$(BENCH_SYNTHETIC)
 
+# 视觉预处理/布局 与 ds4 的逐字节对拍（开发期门禁，需要 ds4 源码在侧）
+# 不并入 test: —— 它依赖外部仓库路径，缺了会跳过而不是失败。
+vis-crosscheck:
+	@tools/vis_crosscheck.sh
+
+.PHONY: vis-crosscheck
+
 test: $(ALL_TESTS)
 	@echo "\n========================================================"
 	@echo "               RUNNING ALL UNIT TESTS                   "
