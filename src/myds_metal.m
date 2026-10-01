@@ -358,7 +358,11 @@ int myds_metal_init(const char *shader_dir) {
             @"norm.metal",
             @"bin.metal",
             @"set_rows.metal",
-            @"myds_chunk.metal"
+            @"myds_chunk.metal",
+            /* ★ 这里是【显式清单】，不是扫目录 —— 新增 .metal 忘了登记，
+             *   表象是「内核找不到」，很容易误判成内核写错。
+             *   visenc = DeepSeek V4.1 视觉编码器专用内核。 */
+            @"visenc.metal"
         ];
 
         NSMutableString *full_source = [NSMutableString stringWithUTF8String:g_metal_base_preamble];
