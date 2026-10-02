@@ -169,39 +169,68 @@ if [[ $COUNT -eq 0 ]]; then
     exit 1
 fi
 
-# Compute median index based on DECODE_TPS
-# Sort indices by DECODE_TPS values
-MEDIAN_IDX=$((COUNT / 2))
+# Compute independent statistics for each metric using python
+STAT_JSON=$(python3 -c "
+import sys, json, statistics
 
-# Simple bash selection of median using python/awk if available or sort
-SORTED_DATA=$(for ((i=0; i<COUNT; i++)); do
-    echo "${DECODE_TPS[$i]} $i"
-done | sort -n)
+def get_stats(arr):
+    vals = [float(x) for x in arr if x != '' and x != 'N/A']
+    if not vals:
+        return {'median': 0.0, 'p95': 0.0, 'min': 0.0, 'max': 0.0}
+    vals.sort()
+    med = statistics.median(vals)
+    idx = int(0.95 * (len(vals) - 1))
+    p95 = vals[idx]
+    return {
+        'median': round(med, 4),
+        'p95': round(p95, 4),
+        'min': round(vals[0], 4),
+        'max': round(vals[-1], 4),
+    }
 
-SELECTED_RUN=$(echo "$SORTED_DATA" | sed -n "$((MEDIAN_IDX + 1))p" | awk '{print $2}')
+load = sys.argv[1].split(',')
+prefill = sys.argv[2].split(',')
+ttft = sys.argv[3].split(',')
+tps = sys.argv[4].split(',')
+wall = sys.argv[5].split(',')
 
-MED_LOAD="${LOAD_S[$SELECTED_RUN]}"
-MED_PREFILL="${PREFILL_S[$SELECTED_RUN]}"
-MED_TTFT="${TTFT_S[$SELECTED_RUN]}"
-MED_PTOK="${PROMPT_TOKENS[$SELECTED_RUN]}"
-MED_DTOK="${DECODE_TOKENS[$SELECTED_RUN]}"
-MED_TPS="${DECODE_TPS[$SELECTED_RUN]}"
-MED_WALL="${WALL_S[$SELECTED_RUN]}"
-MED_REASON="${FINISH_REASONS[$SELECTED_RUN]}"
+out = {
+    'load': get_stats(load),
+    'prefill': get_stats(prefill),
+    'ttft': get_stats(ttft),
+    'tps': get_stats(tps),
+    'wall': get_stats(wall),
+}
+print(json.dumps(out))
+" "$(IFS=,; echo "${LOAD_S[*]}")" "$(IFS=,; echo "${PREFILL_S[*]}")" "$(IFS=,; echo "${TTFT_S[*]}")" "$(IFS=,; echo "${DECODE_TPS[*]}")" "$(IFS=,; echo "${WALL_S[*]}")")
+
+MED_LOAD=$(echo "$STAT_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin)['load']['median'])")
+MED_PREFILL=$(echo "$STAT_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin)['prefill']['median'])")
+MED_TTFT=$(echo "$STAT_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin)['ttft']['median'])")
+MED_TPS=$(echo "$STAT_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin)['tps']['median'])")
+MED_WALL=$(echo "$STAT_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin)['wall']['median'])")
+MED_PTOK="${PROMPT_TOKENS[0]}"
+MED_DTOK="${DECODE_TOKENS[0]}"
+MED_REASON="${FINISH_REASONS[0]}"
+
+P95_TTFT=$(echo "$STAT_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin)['ttft']['p95'])")
+P95_TPS=$(echo "$STAT_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin)['tps']['p95'])")
+P95_WALL=$(echo "$STAT_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin)['wall']['p95'])")
 
 if [[ $JSON_OUTPUT -eq 1 ]]; then
     cat <<EOF
-{"model":"$MODEL","prompt_tokens":$MED_PTOK,"max_tokens":$MAX_TOKENS,"load_s":$MED_LOAD,"prefill_s":$MED_PREFILL,"ttft_s":$MED_TTFT,"decode_tokens":$MED_DTOK,"decode_tps":$MED_TPS,"wall_s":$MED_WALL,"finish_reason":"$MED_REASON"}
+{"model":"$MODEL","prompt_tokens":$MED_PTOK,"max_tokens":$MAX_TOKENS,"load_s":$MED_LOAD,"prefill_s":$MED_PREFILL,"ttft_s":$MED_TTFT,"decode_tokens":$MED_DTOK,"decode_tps":$MED_TPS,"wall_s":$MED_WALL,"finish_reason":"$MED_REASON","stats":$STAT_JSON}
 EOF
 else
     echo "---------------------------------------------------------"
-    echo "MEDIAN RESULT (Run $((SELECTED_RUN + 1)) of $COUNT):"
+    echo "BENCHMARK SUMMARY ($COUNT runs, independent medians):"
     echo "  Prompt Tokens : $MED_PTOK"
     echo "  Decode Tokens : $MED_DTOK"
     echo "  Load Time     : ${MED_LOAD} s"
-    echo "  Prefill (TTFT): ${MED_PREFILL} s"
-    echo "  Decode Speed  : ${MED_TPS} tokens/s (wall-clock)"
-    echo "  Total Wall    : ${MED_WALL} s"
+    echo "  Prefill Time  : ${MED_PREFILL} s"
+    echo "  TTFT (P50/P95): ${MED_TTFT} s / ${P95_TTFT} s"
+    echo "  Decode Speed  : ${MED_TPS} tokens/s (P95: ${P95_TPS} t/s)"
+    echo "  Total Wall    : ${MED_WALL} s (P95: ${P95_WALL} s)"
     echo "  Finish Reason : $MED_REASON"
     echo "---------------------------------------------------------"
 fi
