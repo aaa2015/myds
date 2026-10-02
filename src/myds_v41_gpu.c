@@ -269,7 +269,7 @@ int myds_v41_gpu_indexscores_chunk(myds_metal_buffer_t *scores,const myds_metal_
        !floats(q,(uint64_t)n_tokens*n_heads*128u)||
        !floats(weights,(uint64_t)n_tokens*n_heads)||!floats(cache,(uint64_t)n_comp*128u))return 0;
     const char *tiled_env = getenv("MYDS_INDEXER_TILED");
-    int opt_tiled = tiled_env ? atoi(tiled_env) : 1;
+    int opt_tiled = (tiled_env && atoi(tiled_env) > 0) ? 1 : 0;
     const myds_metal_buffer_t *b[]={q,weights,cache,scores};
     if (opt_tiled && n_tokens >= 8) {
         struct {

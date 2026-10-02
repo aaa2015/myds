@@ -101,11 +101,12 @@ def benchmark(url, model, name, prompt, max_tokens, timeout, run):
     
     # Calculate decode speed using usage token count vs event count alignment
     decode_tps = None
+    event_tps = None
     if decode_s > 0:
         if count and count > 1:
             decode_tps = (count - 1) / decode_s
-        elif len(chunks) > 1:
-            decode_tps = (len(chunks) - 1) / decode_s
+        if len(chunks) > 1:
+            event_tps = (len(chunks) - 1) / decode_s
 
     return {
         "name": name,
@@ -119,6 +120,7 @@ def benchmark(url, model, name, prompt, max_tokens, timeout, run):
         "first_byte_s": first_byte_time - start if first_byte_time else None,
         "decode_s": decode_s,
         "decode_tps": round(decode_tps, 2) if decode_tps is not None else None,
+        "event_tps": round(event_tps, 2) if event_tps is not None else None,
         "wall_s": end - start,
         "content_events": len(chunks),
         "completion_tokens": count,
@@ -147,18 +149,20 @@ def main():
                 result = benchmark(args.url, args.model, name, prompt, max_tokens, args.timeout, run)
                 results_by_prompt.setdefault(name, []).append(result)
                 print(json.dumps(result, ensure_ascii=False), file=destination, flush=True)
+                ttft_str = f"{result['ttft_s']:.3f}s" if result['ttft_s'] is not None else "N/A"
+                tps_str = f"{result['decode_tps']:.2f}t/s" if result['decode_tps'] is not None else "N/A"
                 print(
                     f"{name} run={run} tokens={result['completion_tokens']} events={result['content_events']} "
-                    f"TTFT={result['ttft_s']:.3f}s decode={result['decode_tps']}t/s "
+                    f"TTFT={ttft_str} decode={tps_str} "
                     f"wall={result['wall_s']:.3f}s SHA256={result['text_sha256'][:16]}...",
                     file=sys.stderr,
                     flush=True,
                 )
         
-        # Summary table of independent medians
-        import statistics
+        # Summary table of independent medians and nearest-rank P95
+        import statistics, math
         print("\n" + "=" * 80, file=sys.stderr)
-        print(f"BENCHMARK AGGREGATE SUMMARY ({args.repeats} runs, independent medians):", file=sys.stderr)
+        print(f"BENCHMARK AGGREGATE SUMMARY ({args.repeats} runs, independent medians & nearest-rank P95):", file=sys.stderr)
         print(f"{'Prompt':<14} | {'P-Tokens':<8} | {'D-Tokens':<8} | {'TTFT P50':<9} | {'TTFT P95':<9} | {'Decode TPS':<11} | {'Wall P50':<9} | {'Hash Consistent':<15}", file=sys.stderr)
         print("-" * 80, file=sys.stderr)
         for name, run_list in results_by_prompt.items():
@@ -168,17 +172,27 @@ def main():
             p_tok = run_list[0]["usage"].get("prompt_tokens", 0)
             d_tok = run_list[0]["completion_tokens"]
             
-            med_ttft = statistics.median(ttfts) if ttfts else 0.0
-            idx_p95 = int(0.95 * (len(ttfts) - 1)) if ttfts else 0
-            p95_ttft = sorted(ttfts)[idx_p95] if ttfts else 0.0
+            n_ttft = len(ttfts)
+            if n_ttft > 0:
+                sorted_ttfts = sorted(ttfts)
+                med_ttft = statistics.median(sorted_ttfts)
+                k_p95 = math.ceil(0.95 * n_ttft)
+                idx_p95 = max(0, min(n_ttft - 1, k_p95 - 1))
+                p95_ttft = sorted_ttfts[idx_p95]
+                med_ttft_str = f"{med_ttft:.4f}"
+                p95_ttft_str = f"{p95_ttft:.4f}"
+            else:
+                med_ttft_str = "N/A"
+                p95_ttft_str = "N/A"
             
-            med_tps = statistics.median(tps_list) if tps_list else 0.0
+            med_tps = statistics.median(tps_list) if tps_list else None
+            med_tps_str = f"{med_tps:.2f}" if med_tps is not None else "N/A"
             med_wall = statistics.median(walls) if walls else 0.0
             hashes = set(r["text_sha256"] for r in run_list)
             consistent = "YES (deterministic)" if len(hashes) == 1 else f"NO ({len(hashes)} variants)"
             
             print(
-                f"{name:<14} | {p_tok:<8} | {d_tok:<8} | {med_ttft:<9.4f} | {p95_ttft:<9.4f} | {med_tps:<11.2f} | {med_wall:<9.3f} | {consistent:<15}",
+                f"{name:<14} | {p_tok:<8} | {d_tok:<8} | {med_ttft_str:<9} | {p95_ttft_str:<9} | {med_tps_str:<11} | {med_wall:<9.3f} | {consistent:<15}",
                 file=sys.stderr
             )
         print("=" * 80 + "\n", file=sys.stderr)

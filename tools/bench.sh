@@ -171,21 +171,24 @@ fi
 
 # Compute independent statistics for each metric using python
 STAT_JSON=$(python3 -c "
-import sys, json, statistics
+import sys, json, statistics, math
 
 def get_stats(arr):
     vals = [float(x) for x in arr if x != '' and x != 'N/A']
     if not vals:
-        return {'median': 0.0, 'p95': 0.0, 'min': 0.0, 'max': 0.0}
+        return {'median': 0.0, 'p95': 0.0, 'min': 0.0, 'max': 0.0, 'n': 0}
     vals.sort()
+    n = len(vals)
     med = statistics.median(vals)
-    idx = int(0.95 * (len(vals) - 1))
+    k = math.ceil(0.95 * n)
+    idx = max(0, min(n - 1, k - 1))
     p95 = vals[idx]
     return {
         'median': round(med, 4),
         'p95': round(p95, 4),
         'min': round(vals[0], 4),
         'max': round(vals[-1], 4),
+        'n': n,
     }
 
 load = sys.argv[1].split(',')

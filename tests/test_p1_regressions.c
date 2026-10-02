@@ -609,9 +609,9 @@ static void test_p2_moe_batch_mm_tail_cull_validation(void) {
 
     const uint32_t dim = 256;
     const uint32_t expert_dim = 256;
-    const uint32_t n_routed_experts = 8;
+    const uint32_t n_routed_experts = 16;
     const uint32_t n_activated_experts = 6;
-    const uint32_t n_tok = 32;
+    const uint32_t n_tok = 40;
 
     uint64_t gate_row_bytes = (dim / 256u) * 66u;
     uint64_t gate_exp_bytes = (uint64_t)expert_dim * gate_row_bytes;
@@ -656,18 +656,42 @@ static void test_p2_moe_batch_mm_tail_cull_validation(void) {
     }
     assert(myds_metal_buffer_write(down_exps, 0, q_down, (size_t)(n_routed_experts * down_exp_bytes)));
 
-    int32_t *h_ids = malloc((size_t)n_tok * n_activated_experts * sizeof(int32_t));
+    /* Deterministic non-uniform distribution across 16 experts:
+     * Expert active row counts precisely cover:
+     * Expert 0: 1 row, Expert 1: 4 rows, Expert 2: 8 rows, Expert 3: 9 rows,
+     * Expert 4: 16 rows, Expert 5: 17 rows, Expert 6: 24 rows, Expert 7: 31 rows,
+     * Expert 8: 33 rows, Experts 9..15: 13..14 rows each.
+     * This thoroughly exercises all dynamic 8-row slice bucketing and tail culling branches. */
+    static const int32_t s_tail_cull_expert_ids[240] = {
+         8,  7,  6,  5,  4,  9,  8,  7,  6,  5,  4, 10,
+         8,  7,  6,  5,  4, 11,  8,  7,  6,  5, 12, 13,
+         8,  7,  6, 14,  4,  5,  8,  7,  6,  9, 10, 11,
+         8,  7,  6, 12, 13, 14,  8,  7,  6, 15,  4,  5,
+         8,  7,  6,  9, 10, 11,  8,  7,  6, 12, 13, 14,
+         8,  7,  6, 15,  4,  5,  8,  7,  6,  9, 10, 11,
+         8,  7,  6, 12, 13, 14,  8,  7,  6, 15,  4,  5,
+         8,  7,  6,  9, 10, 11,  8,  7, 12, 13, 14, 15,
+         8,  7,  3,  4,  5,  6,  8,  7,  9, 10, 11, 12,
+         8,  7, 13, 14, 15,  2,  8,  7,  3,  4,  5,  6,
+         8,  7,  9, 10, 11, 12,  8,  7, 13, 14, 15,  2,
+         8,  7,  3,  4,  5,  6,  8,  7,  9, 10, 11, 12,
+         8,  7, 13, 14, 15,  2,  8,  3,  4,  5,  6,  7,
+         8,  9, 10, 11, 12, 13,  8, 14, 15,  2,  3,  4,
+         5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15,  1,
+         2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13,
+        14, 15,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10,
+        11, 12, 13, 14, 15,  1,  2,  3,  4,  5,  6,  7,
+         8,  9, 10, 11, 12, 13, 14, 15,  0,  1,  2,  3,
+         4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15,
+    };
+
     float *h_weights = malloc((size_t)n_tok * n_activated_experts * sizeof(float));
-    assert(h_ids && h_weights);
-    for (uint32_t t = 0; t < n_tok; t++) {
-        for (uint32_t k = 0; k < n_activated_experts; k++) {
-            h_ids[t * n_activated_experts + k] = (int32_t)k;
-            h_weights[t * n_activated_experts + k] = (k < 4) ? 0.2f : 0.1f;
-        }
+    assert(h_weights);
+    for (uint32_t i = 0; i < n_tok * n_activated_experts; i++) {
+        h_weights[i] = (i % 6 < 4) ? 0.2f : 0.1f;
     }
-    assert(myds_metal_buffer_write(selected_ids, 0, h_ids, (size_t)n_tok * n_activated_experts * sizeof(int32_t)));
+    assert(myds_metal_buffer_write(selected_ids, 0, s_tail_cull_expert_ids, sizeof(s_tail_cull_expert_ids)));
     assert(myds_metal_buffer_write(selected_weights, 0, h_weights, (size_t)n_tok * n_activated_experts * sizeof(float)));
-    free(h_ids);
     free(h_weights);
 
     int ret = myds_metal_routed_moe_batch(
@@ -706,7 +730,7 @@ static void test_p2_moe_batch_mm_tail_cull_validation(void) {
     myds_metal_buffer_free(scratch_mid);
     myds_metal_buffer_free(scratch_down);
 
-    printf("  [PASS] P2: MoE batch MM path (n_tok=32) with tail-cull and row bucketing verified\n");
+    printf("  [PASS] P2: MoE batch MM path (n_tok=40, non-uniform 1..33 rows) with tail-cull and row bucketing verified\n");
 }
 
 static void test_p1_same_process_large_model_isolation(void) {
@@ -949,6 +973,19 @@ static void test_p1_macroblock_prefill_invariants(void) {
 
     setenv("MYDS_PREFILL_MACROBLOCK_SIZE", "32768", 1);
     assert(myds_v41_resolve_macroblock_size() == 16384u); /* clamp max */
+
+    /* Negative, zero, and malformed inputs must safely fall back to default without integer underflow */
+    setenv("MYDS_PREFILL_MACROBLOCK_SIZE", "-1", 1);
+    assert(myds_v41_resolve_macroblock_size() == 4096u);
+
+    setenv("MYDS_PREFILL_MACROBLOCK_SIZE", "-100", 1);
+    assert(myds_v41_resolve_macroblock_size() == 4096u);
+
+    setenv("MYDS_PREFILL_MACROBLOCK_SIZE", "0", 1);
+    assert(myds_v41_resolve_macroblock_size() == 4096u);
+
+    setenv("MYDS_PREFILL_MACROBLOCK_SIZE", "invalid", 1);
+    assert(myds_v41_resolve_macroblock_size() == 4096u);
 
     unsetenv("MYDS_PREFILL_MACROBLOCK_SIZE");
     assert(myds_v41_resolve_macroblock_size() == 4096u);

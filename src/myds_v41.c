@@ -14,6 +14,7 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+#include <errno.h>
 #include <stdatomic.h>
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -2156,8 +2157,20 @@ fail:
 
 uint32_t myds_v41_resolve_macroblock_size(void) {
     const char *mb_env = getenv("MYDS_PREFILL_MACROBLOCK_SIZE");
-    uint32_t macroblock_size = mb_env ? (uint32_t)atoi(mb_env) : 4096u;
-    if (macroblock_size < 512u) macroblock_size = 512u;
+    long val = 4096L;
+    if (mb_env && *mb_env) {
+        char *endptr = NULL;
+        errno = 0;
+        long parsed = strtol(mb_env, &endptr, 10);
+        if (errno == 0 && endptr != mb_env && parsed > 0) {
+            val = parsed;
+        } else {
+            val = 4096L;
+        }
+    }
+    if (val < 512L) val = 512L;
+    if (val > 16384L) val = 16384L;
+    uint32_t macroblock_size = (uint32_t)val;
     if (macroblock_size % V41_SNAP_STRIDE != 0) {
         macroblock_size = ((macroblock_size + V41_SNAP_STRIDE - 1u) / V41_SNAP_STRIDE) * V41_SNAP_STRIDE;
     }
