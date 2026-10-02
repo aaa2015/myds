@@ -544,7 +544,19 @@ int myds_v41_gpu_attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buf
 
     const uint32_t p0=base_pos+c_start;
     const uint32_t carry=p0<MYDS_CHUNK_CARRY?p0:MYDS_CHUNK_CARRY;
-    if(s->tmpl_len!=c_len||s->tmpl_carry!=carry)
+
+    /* B 方案（docs/B_MAX_SPARSE_ATTENTION_SPEC.md）：把本 query 可见的 640 个键
+     * （128 滑窗 + 512 picks）gather 成紧凑段，内核直接只算这 20 块。
+     *
+     * 开了它，下面三件事就全是【死重】，直接跳过：
+     *   ① 掩码模板 —— 640 列全部由两个 gather 内核显式写（窗口段 / picks 段），
+     *      模板写的 [0,128) 与 [128,640) 都会被覆盖，没有别的读者；
+     *   ② 压缩前缀 staging —— 只有旧内核走 slab 里的压缩列才需要；
+     *      comp gather 是直接从 comp_kv 读 f32，不经 slab（省掉 ∝n_comp 的拷贝）；
+     *   ③ mask fill / scatter 两次 dispatch。 */
+    const int use_gather = attn_gather_enabled() && gathered != NULL && n_comp != 0;
+
+    if(!use_gather && (s->tmpl_len!=c_len||s->tmpl_carry!=carry))
         if(!build_chunk_mask_template(s,c_len,carry))return 0;
 
     const uint32_t comp_base=MYDS_CHUNK_CARRY+c_len;
@@ -555,8 +567,9 @@ int myds_v41_gpu_attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buf
     const uint32_t keys_pad=(keys+31u)/32u*32u;
 
     if(!stage_f16(s->kv_chunk,(size_t)MYDS_CHUNK_CARRY*1024u,chunk_kv,0,c_len*512u,s))return 0;
-    if(n_comp&&!stage_f16(s->kv_chunk,(size_t)comp_base*1024u,comp_kv,0,n_comp*512u,s))return 0;
+    if(!use_gather && n_comp && !stage_f16(s->kv_chunk,(size_t)comp_base*1024u,comp_kv,0,n_comp*512u,s))return 0;
 
+    if(!use_gather) {
     /* 填充覆盖 [comp_base, keys_pad)：n_comp 只是【本 chunk 真实的压缩键数】，而内核读的
      * 是 32 对齐后的 keys_pad，多出来那几列必须显式置为不可见
      * （以前靠模板的清尾巴兜底，现在模板不再清 —— 见 build_chunk_mask_template）。 */
@@ -580,11 +593,8 @@ int myds_v41_gpu_attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buf
         const myds_metal_buffer_t *sb[]={s->mask_chunk,ids};
         if(!dispatch("kernel_myds_mask_chunk_scatter",&ma,sizeof(ma),sb,2,top_k,c_len,1,64,1,1,0))return 0;
     }
+    }   /* !use_gather */
 
-    /* B 方案（docs/B_MAX_SPARSE_ATTENTION_SPEC.md）：把本 query 可见的 640 个键
-     * （128 滑窗 + 512 picks）gather 成各自的紧凑段，并重写 [0,640) 的掩码。
-     * 在上面那套旧掩码【之后】跑，直接覆盖它 —— 内核只看 [0,640)，其余列无读者。 */
-    const int use_gather = attn_gather_enabled() && gathered != NULL && n_comp != 0;
     if (use_gather) {
         struct myds_attn_gather_args ga={
             c_len,top_k,n_comp,MYDS_CHUNK_CARRY-carry,s->mask_u16,c_start,base_pos,ratio};
