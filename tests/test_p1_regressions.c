@@ -880,7 +880,7 @@ static void test_p2_moe_tail_cull_multi_case_golden_equivalence(void) {
     myds_metal_buffer_free(scratch_mid);
     myds_metal_buffer_free(scratch_down);
 
-    printf("  [PASS] P2: MoE tail-cull multi-case golden equivalence (rows 1,4,8,9,16,17,24,31,33 bit-exact to un-culled reference)\n");
+    printf("  [PASS] P2: MoE multi-case golden equivalence (rows 1,4,8,9,16,17,24,31,33 bit-exact to un-culled reference)\n");
 }
 
 static void test_p1_same_process_large_model_isolation(void) {
