@@ -2526,6 +2526,9 @@ static void moe_split_point(id<MTLCommandBuffer> *cbp,
     myds_metal_commit_batch();
     clock_gettime(CLOCK_MONOTONIC, &t1);
     *acc += (t1.tv_sec - t0.tv_sec) * 1000.0 + (double)(t1.tv_nsec - t0.tv_nsec) / 1.0e6;
+    /* 与仓库其它剖析点同一模式：commit 之后必须 begin，否则 encoder 生命周期错乱
+     * （首次实现漏了这步，实测直接 abort：encoder released without endEncoding）。 */
+    myds_metal_begin_batch();
     *cbp = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
     *encp = get_compute_encoder(*cbp);
 }
