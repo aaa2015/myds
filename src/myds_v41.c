@@ -1460,6 +1460,19 @@ static int publish_compressor_chunk(myds_context_t *ctx, uint32_t il,
     return 1;
 }
 
+/* 实验开关：把 il==20 的块预算压到 N（默认 0 = 现行为 = 全选）。
+ * 现行为下 blocks<=2048 ⇒ top=blocks ⇒ 块掩码等于纯因果前缀 ⇒ 21..39 层的
+ * 键掩码【不稀疏】，flash 内核在 32 键粒度上几乎跳不掉任何块。
+ * 压到 ~64（=512 个 8 键块 = TOPK）后掩码真正稀疏，用来量化「块级稀疏」的
+ * 收益与质量代价。设 MYDS_BLOCK_BUDGET=<N>，只在 N 更小时生效。 */
+static uint32_t block_budget_cap(uint32_t all) {
+    const char *v = getenv("MYDS_BLOCK_BUDGET");
+    if (!v) return all;
+    int n = atoi(v);
+    if (n > 0 && (uint32_t)n < all) return (uint32_t)n;
+    return all;
+}
+
 /* indexer 的逐 token 版（decode 路径与 prefill 的回退路径用）。 */
 static int publish_indexer_one(myds_context_t *ctx, uint32_t il, uint32_t pos,
                               const myds_metal_buffer_t *x_norm, const myds_metal_buffer_t *qr_norm,
@@ -1491,7 +1504,7 @@ static int publish_indexer_one(myds_context_t *ctx, uint32_t il, uint32_t pos,
 
         CHECK(myds_v41_gpu_indexscores(g->index_scores,q_buf,w_buf,g->index_cache[owner],count,V41_INDEX_HEADS));
         if (il==20) {
-            uint32_t blocks=(count+7)/8,top=blocks<2048?blocks:2048;
+            uint32_t blocks=(count+7)/8,top=block_budget_cap(blocks<2048?blocks:2048);
             CHECK(myds_v41_gpu_candidates(g->block_scores,g->index_scores,count,pos,ratio));
             CHECK(myds_v41_gpu_topk(g->block_selected,g->block_scores,blocks,top,g->gpu));
             myds_metal_buffer_t *b_mask = out_block_mask ? out_block_mask : g->block_mask;
@@ -1626,7 +1639,7 @@ static int publish_indexer_chunk(myds_context_t *ctx, uint32_t il, uint32_t c_st
              * （前 blocks_t 列先清成不可见、再被 scatter 打开）。这里 nc ≤ 16384
              * ⇒ blocks ≤ 2048 ⇒ top = blocks = 全选，行内顺序不影响结果。 */
             const uint32_t blocks=(nc+7u)/8u;
-            const uint32_t top_blocks=blocks<2048u?blocks:2048u;
+            const uint32_t top_blocks=block_budget_cap(blocks<2048u?blocks:2048u);
             if (!myds_v41_gpu_candidates_rows(blocks_buf,scores_buf,nc,glen,g_start,ratio,mask_stride)) return -1;
             if (!myds_v41_gpu_topk_causal(block_sel_buf,blocks_buf,blocks,top_blocks,glen,
                     g_start,ratio,g->gpu)) return -1;
