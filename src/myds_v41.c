@@ -1460,24 +1460,18 @@ static int publish_compressor_chunk(myds_context_t *ctx, uint32_t il,
     return 1;
 }
 
-/* il==20 的块预算上限（= 层 21..39 实际能看到多少压缩键）。
+/* 块预算：0 = 不限制（默认）。
  *
- * 历史行为是【全选】（top=blocks）：块掩码等于纯因果前缀 ⇒ 21..39 层的键掩码
- * 不稀疏 ⇒ flash 内核在 32 键粒度上几乎跳不掉任何块（实测只跳 0.01%~5.8%）,
- * 于是每个 query 扫 383+n_comp 个键而只用到 640 个（128 滑窗 + 512 picks），
- * 约 4.7× 的算力被浪费在“算了再掩掉”上。
- *
- * 默认收紧到 32 块（8 键/块 ⇒ 256 个键）。实测（macstudio M2 Ultra，
- * 3264 tok，生产 env，服务端自报 prefill）：
- *    全选 259.7/263.2 t/s  →  32 块 ~290-294 t/s（+13%）
- * 质量门禁（同一份长上下文，8 题：3k/12k 各 4 题，含两跳聚合与反幻觉对照）：
- *    全选 8/8   32 块 8/8（答案逐字符相同）
- * 而 16 块（128 键）会把召回打到 4/10 ⇒ 256 键是检索质量底线，勿再往下调。
- * 继续往下压的收益也被“32 键跳块粒度”封顶；要拿剩下的必须改成
- * per-query gather（让内核只算选中的键，而不是算了再掩）。
- *
- * MYDS_BLOCK_BUDGET=<N> 可覆盖（N<=0 或 >=blocks 表示不限制 = 旧行为）。 */
-#define V41_BLOCK_BUDGET_DEFAULT 32u
+ * 2026-10-02 经实测，这个「压预算」的做法已被 per-query gather 取代：
+ * gather 让内核直接只算选中键，扫描不再浪费，而压预算只是「少选一些键」，
+ * 两者叠加会把可见键收缩两次 —— gather+budget=32 在 3k 上下文下实测丢题
+ * （budget=0/64 均 8/8，budget=32 挂一题）。
+ * ⇒ 默认应当是不限制；预算降到 32 只作为【不用 gather 时】的替代手段。
+ * 实测（macstudio M2 Ultra，服务端自报）：
+ *   仅 budget=32（无 gather） 5.3k 262.6 / 12.4k 203.8 t/s   8/8
+ *   gather + budget=0        5.3k 281.3 / 12.4k 274.9 t/s   8/8
+ *   gather + budget=32       5.3k 281.3 / 12.4k 275.2 t/s   3k 挂一题 */
+#define V41_BLOCK_BUDGET_DEFAULT 0u
 
 static uint32_t block_budget_cap(uint32_t all) {
     const char *v = getenv("MYDS_BLOCK_BUDGET");
@@ -2044,9 +2038,12 @@ static v41_chunk_workspace_t *v41_chunk_workspace_create(uint32_t capacity, uint
     ALLOC_BUF(q_buf, C * V41_HEADS * 512 * sizeof(float));
     ALLOC_BUF(kv_act_buf, C * 512 * sizeof(float));
     ALLOC_BUF(attn_heads_buf, C * V41_HEADS * 512 * sizeof(float));
-    /* B 方案：只在开关打开时分配，不跑 gather 的进程不付这 335 MB。 */
-    if (getenv("MYDS_ATTN_GATHER") && atoi(getenv("MYDS_ATTN_GATHER")) > 0)
-        ALLOC_BUF(kv_gathered, C * 640u * 512u * sizeof(uint16_t));
+    /* B 方案（gather）默认开：仅当显式 MYDS_ATTN_GATHER=0 时跳过分配。 */
+    {
+        const char *gv = getenv("MYDS_ATTN_GATHER");
+        if (!(gv && atoi(gv) == 0))
+            ALLOC_BUF(kv_gathered, C * 640u * 512u * sizeof(uint16_t));
+    }
     ALLOC_BUF(attn_low_buf, C * 8192 * sizeof(float));
     ALLOC_BUF(attn_out_buf, C * V41_DIM * sizeof(float));
     ALLOC_BUF(after_attn_buf, C * 4 * V41_DIM * sizeof(float));

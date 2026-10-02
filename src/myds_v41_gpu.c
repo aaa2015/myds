@@ -486,12 +486,12 @@ struct myds_attn_gather_args {
     uint32_t rows, top_k, n_comp, valid_from, mask_stride, c_start, base_pos, ratio;
 };
 
-/* 进程级开关：默认【关】。开了才走 gather 路径。 */
+/* 进程级开关：默认【开】。MYDS_ATTN_GATHER=0 可关回旧路径。 */
 static int attn_gather_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *v = getenv("MYDS_ATTN_GATHER");
-        cached = (v && atoi(v) > 0) ? 1 : 0;
+        cached = (v && atoi(v) == 0) ? 0 : 1;
     }
     return cached;
 }
