@@ -1316,11 +1316,28 @@ static inline bool is_mul_mm_disabled(void) {
     return cached == 1;
 }
 
+/* 小 M 时改走 GEMV 路径的阈值。MM 内核的 tile 是 NR0=64 行；当 rows 远小于 64 时
+ * （例如 hc_mix 的 rows=24），线程组网格退化成 ceil(rows/64)=1 ⇒ 占用率极低。
+ * MYDS_MM_MIN_M=<n> 表示「rows < n 就不用 MM」（默认 0 = 总是用 MM，完全保持现行为）。 */
+static inline uint32_t mm_min_m(void) {
+    static int cached = -1;
+    if (__builtin_expect(cached < 0, 0)) {
+        const char *v = getenv("MYDS_MM_MIN_M");
+        long n = v ? atol(v) : 0;
+        cached = (n > 0 && n < 100000) ? (int)n : 0;
+    }
+    return (uint32_t)cached;
+}
+
 static int project_batch(myds_metal_buffer_t *out, const myds_metal_buffer_t *w,
                          const myds_metal_buffer_t *in, uint32_t rows, uint32_t width,
                          uint32_t n_tok, ggml_type type, bool round) {
     myds_metal_barrier();
     int use_mm = (n_tok >= 32 && !is_mul_mm_disabled());
+    if (use_mm) {
+        const uint32_t mm_min = mm_min_m();
+        if (mm_min && rows < mm_min) use_mm = 0;   /* 小 M：MM 的 64 行 tile 会退化成单块 */
+    }
     int ok = 0;
     if (use_mm) {
         ok = myds_metal_mul_mm(out, w, in, rows, width, n_tok, type);
