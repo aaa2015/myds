@@ -2399,6 +2399,8 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     const bool opt_prof_split2 = (getenv("MYDS_PROFILE_SPLIT2") != NULL);
     const bool opt_prof_split3 = (getenv("MYDS_PROFILE_SPLIT3") != NULL);
     const bool opt_prof_moe = (getenv("MYDS_PROFILE_MOE") != NULL);
+    const bool opt_prof_step1 = (getenv("MYDS_PROFILE_STEP1") != NULL);
+    double prof_s1_norm = 0, prof_s1_mix = 0, prof_s1_split = 0, prof_s1_wsum = 0, prof_s1_norm2 = 0;
     const bool opt_disable_mm_attn_a = (getenv("MYDS_DISABLE_MM_ATTN_A") != NULL);
     double prof_engram = 0, prof_embedding = 0, prof_total_layers = 0;
     double prof_step1 = 0, prof_step2 = 0, prof_step3 = 0, prof_step4 = 0, prof_step5 = 0;
@@ -2557,8 +2559,11 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 
                 /* Batched HC Mix: RMSNorm + GEMM + Split across the entire chunk */
                 CHECK(myds_metal_v41_rmsnorm_batch(cw->hc_flat_norm_buf, cw->cur_res_view, NULL, 4 * V41_DIM, c_len, m->norm_eps, false));
+                if (do_prof && opt_prof_step1) { TIME_START(); CHECK(myds_metal_commit_batch()); TIME_ACC(prof_s1_norm); CHECK(myds_metal_begin_batch()); }
                 CHECK(project_batch(cw->hc_mix_buf, l->attn_fn, cw->hc_flat_norm_buf, 24, 4 * V41_DIM, c_len, GGML_TYPE_F16, false));
+                if (do_prof && opt_prof_step1) { TIME_START(); CHECK(myds_metal_commit_batch()); TIME_ACC(prof_s1_mix); CHECK(myds_metal_begin_batch()); }
                 CHECK(myds_metal_v41_hc_split_batch(cw->attn_split_buf, cw->hc_mix_buf, l->attn_scale, l->attn_base, c_len, v->hc_eps));
+                if (do_prof && opt_prof_step1) { TIME_START(); CHECK(myds_metal_commit_batch()); TIME_ACC(prof_s1_split); CHECK(myds_metal_begin_batch()); }
 
                 if (trace_on) {
                     for (uint32_t t = 0; t < c_len; t++) {
@@ -2569,7 +2574,9 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 }
 
                 CHECK(myds_metal_v41_hc_weighted_sum_batch(cw->x_buf, cw->cur_res_view, cw->cur_pre_view, V41_DIM, c_len, pre_tok_bytes));
+                if (do_prof && opt_prof_step1) { TIME_START(); CHECK(myds_metal_commit_batch()); TIME_ACC(prof_s1_wsum); CHECK(myds_metal_begin_batch()); }
                 CHECK(myds_metal_v41_rmsnorm_batch(cw->x_norm_buf, cw->x_buf, base->attn_norm, V41_DIM, c_len, m->norm_eps, true));
+                if (do_prof && opt_prof_step1) { TIME_START(); CHECK(myds_metal_commit_batch()); TIME_ACC(prof_s1_norm2); CHECK(myds_metal_begin_batch()); }
 
                 if (trace_on) {
                     for (uint32_t t = 0; t < c_len; t++) {
@@ -3045,6 +3052,10 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         printf("Step 7 (Shared+Route) : %8.2f ms\n", prof_step7);
         printf("Wait FFN+R (GPU)      : %8.2f ms\n", prof_wait_ffn_router);
         printf("Step 8 (MoE dispatch) : %8.2f ms\n", prof_step8);
+        if (opt_prof_step1) {
+            printf("  [Step1] norm=%.1f mix=%.1f split=%.1f wsum=%.1f norm2=%.1f ms\n",
+                   prof_s1_norm, prof_s1_mix, prof_s1_split, prof_s1_wsum, prof_s1_norm2);
+        }
         printf("Wait MoE (GPU)        : %8.2f ms\n", prof_wait_moe);
         if (opt_prof_moe) {
             printf("  ...attn_out B       : %8.2f ms\n", prof_wait_attnB);
