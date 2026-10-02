@@ -226,6 +226,7 @@ void myds_v41_snapshot_set_engram_history(myds_v41_context_t *g, uint32_t t0, ui
 void myds_v41_snapshot_get_engram_history(const myds_v41_context_t *g, uint32_t out[3]);
 void myds_v41_snapshot_set_positions(myds_v41_context_t *g, uint32_t engram_pos, uint32_t next_pos);
 bool myds_v41_snapshot_get_valid(const myds_v41_context_t *g);
+uint32_t myds_v41_resolve_macroblock_size(void);
 
 #ifdef __cplusplus
 }

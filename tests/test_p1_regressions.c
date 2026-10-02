@@ -11,6 +11,7 @@
 #include "myds_gguf.h"
 #include "myds_internal.h"
 #include "myds_metal.h"
+#include "myds_v41_gpu.h"
 #include "myds_server_internal.h"
 
 static void test_p1_response_id_lifecycle(void) {
@@ -824,6 +825,53 @@ static void test_p1_snapshot_overwrite_failure(void) {
     printf("  [PASS] P1: Snapshot slot 0 invalidation on copy/commit failure prevents selecting corrupted state, and recovers cleanly on next store\n");
 }
 
+static void test_p1_macroblock_prefill_invariants(void) {
+    /* 1. Test macroblock size environment resolution & clamping */
+    unsetenv("MYDS_PREFILL_MACROBLOCK_SIZE");
+    assert(myds_v41_resolve_macroblock_size() == 4096u);
+
+    setenv("MYDS_PREFILL_MACROBLOCK_SIZE", "200", 1);
+    assert(myds_v41_resolve_macroblock_size() == 512u); /* clamp min */
+
+    setenv("MYDS_PREFILL_MACROBLOCK_SIZE", "1000", 1);
+    assert(myds_v41_resolve_macroblock_size() == 1024u); /* round up to multiple of 512 */
+
+    setenv("MYDS_PREFILL_MACROBLOCK_SIZE", "2048", 1);
+    assert(myds_v41_resolve_macroblock_size() == 2048u);
+
+    setenv("MYDS_PREFILL_MACROBLOCK_SIZE", "32768", 1);
+    assert(myds_v41_resolve_macroblock_size() == 16384u); /* clamp max */
+
+    unsetenv("MYDS_PREFILL_MACROBLOCK_SIZE");
+    assert(myds_v41_resolve_macroblock_size() == 4096u);
+
+    /* 2. Test carry staging across macroblock boundaries */
+    if (!myds_metal_init(NULL)) {
+        printf("  [SKIP] Metal not supported for macroblock carry test\n");
+        return;
+    }
+
+    myds_v41_gpu_scratch_t *scr = myds_v41_gpu_scratch_create(2048);
+    assert(scr != NULL);
+
+    myds_metal_buffer_t *window = myds_metal_buffer_alloc(128u * 512u * sizeof(float));
+    assert(window != NULL);
+    fill_buffer_f32(window, 123.45f);
+
+    /* Stage carry at boundary 512 (which is > 128 carry tokens) */
+    int ok = myds_v41_gpu_carry_stage(scr, window, 512u);
+    assert(ok == 1);
+
+    /* Stage carry at boundary 1024 */
+    ok = myds_v41_gpu_carry_stage(scr, window, 1024u);
+    assert(ok == 1);
+
+    myds_metal_buffer_free(window);
+    myds_v41_gpu_scratch_free(scr);
+
+    printf("  [PASS] P1: Macroblock configuration bounds, stride snapping, and carry staging invariants\n");
+}
+
 int main(void) {
     printf("Running P1 Regression Verification Suite:\n");
     test_p1_response_id_lifecycle();
@@ -836,6 +884,7 @@ int main(void) {
     test_p1_metal_fused_add_fallback();
     test_p2_moe_kernel_and_pso_validation();
     test_p1_snapshot_overwrite_failure();
+    test_p1_macroblock_prefill_invariants();
     printf("All P1 Regression Verifications PASSED!\n");
     return 0;
 }
