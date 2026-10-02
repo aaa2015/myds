@@ -1317,14 +1317,15 @@ static inline bool is_mul_mm_disabled(void) {
 }
 
 /* 小 M 时改走 GEMV 路径的阈值。MM 内核的 tile 是 NR0=64 行；当 rows 远小于 64 时
- * （例如 hc_mix 的 rows=24），线程组网格退化成 ceil(rows/64)=1 ⇒ 占用率极低。
- * MYDS_MM_MIN_M=<n> 表示「rows < n 就不用 MM」（默认 0 = 总是用 MM，完全保持现行为）。 */
+ * （例如 hc_mix 的 rows=24），线程组网格退化成 ceil(rows/64)=1 ⇒ 占用率极低：
+ * 实测这一步单独占 Wait Proj 的 ~10%（206 ms/趟），改用 GEMV 后回收。
+ * 默认 64 = rows<64 不走 MM。MYDS_MM_MIN_M=<n> 可覆盖（0 = 总是用 MM = 旧行为）。 */
 static inline uint32_t mm_min_m(void) {
     static int cached = -1;
     if (__builtin_expect(cached < 0, 0)) {
         const char *v = getenv("MYDS_MM_MIN_M");
-        long n = v ? atol(v) : 0;
-        cached = (n > 0 && n < 100000) ? (int)n : 0;
+        long n = v ? atol(v) : 64;
+        cached = (n >= 0 && n < 100000) ? (int)n : 64;
     }
     return (uint32_t)cached;
 }

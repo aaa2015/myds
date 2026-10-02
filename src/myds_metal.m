@@ -1468,6 +1468,18 @@ int myds_metal_v41_rmsnorm_batch(myds_metal_buffer_t *out,
     NSUInteger nth = 32;
     while (nth < dim / 4u && nth < 1024u) nth *= 2;
     if (nth > dim / 4u) nth = dim / 4u;
+    /* 诊断：线程组尺寸直接给定（0 = 用上面的启发式）。
+     * 这条 norm 在剖析里是 Step 1 的最大单项（~336 ms），而它只是纯访存操作，
+     * 实测有效带宽只有 ~110 GB/s ⇒ 怀疑 1024 线程/组的占用率或访存模式。 */
+    {
+        static int ov = -2;
+        if (__builtin_expect(ov == -2, 0)) {
+            const char *v = getenv("MYDS_RMS_NTH");
+            long n = v ? atol(v) : 0;
+            ov = (n > 0 && n <= 1024) ? (int)n : -1;
+        }
+        if (ov > 0) nth = (NSUInteger)ov;
+    }
     if (nth > pipeline.maxTotalThreadsPerThreadgroup) return 0;
     @autoreleasepool {
         const uint64_t bytes = (uint64_t)dim * sizeof(float);
