@@ -2512,6 +2512,24 @@ int myds_metal_moe_route(
                                        n_routed_experts, n_activated_experts, routed_scaling_factor);
 }
 
+/* 诊断：MoE 四步分步计时（MYDS_MOE_STEP_PROF=1 才开）。
+ * 在每步 dispatch 后 commit+wait，从而把「MoE GEMMs」这个大窗口拆成
+ * map0 / pair_swiglu / down / sum6 四段。默认零开销。 */
+static int    g_moe_split = -1;
+static double g_moe_t_map0 = 0, g_moe_t_swiglu = 0, g_moe_t_down = 0, g_moe_t_sum = 0;
+static long   g_moe_split_calls = 0;
+
+static void moe_split_point(id<MTLCommandBuffer> *cbp,
+                            id<MTLComputeCommandEncoder> *encp, double *acc) {
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    myds_metal_commit_batch();
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    *acc += (t1.tv_sec - t0.tv_sec) * 1000.0 + (double)(t1.tv_nsec - t0.tv_nsec) / 1.0e6;
+    *cbp = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
+    *encp = get_compute_encoder(*cbp);
+}
+
 int myds_metal_routed_moe_batch(
     myds_metal_buffer_t       *moe_out,
     const myds_metal_buffer_t *x_in,
@@ -2670,6 +2688,8 @@ int myds_metal_routed_moe_batch(
             [enc setThreadgroupMemoryLength:(NSUInteger)n_routed_experts * (NSUInteger)n_activated_experts * sizeof(uint16_t) atIndex:0];
             metal_dispatch(enc, "moe_map0", MTLSizeMake(1, 1, 1),
                 MTLSizeMake((NSUInteger)n_routed_experts, 1, 1));
+            if (g_moe_split < 0) g_moe_split = getenv("MYDS_MOE_STEP_PROF") ? 1 : 0;
+            if (g_moe_split) moe_split_point(&cb, &enc, &g_moe_t_map0);
 
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
@@ -2690,6 +2710,7 @@ int myds_metal_routed_moe_batch(
                                                   ((NSUInteger)expert_dim + 63u) / 64u,
                                                   1),
                 MTLSizeMake(128, 1, 1));
+            if (g_moe_split) moe_split_point(&cb, &enc, &g_moe_t_swiglu);
 
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
@@ -2707,6 +2728,7 @@ int myds_metal_routed_moe_batch(
                                                   ((NSUInteger)dim + 63u) / 64u,
                                                   1),
                 MTLSizeMake(128, 1, 1));
+            if (g_moe_split) moe_split_point(&cb, &enc, &g_moe_t_down);
 
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
@@ -2721,6 +2743,13 @@ int myds_metal_routed_moe_batch(
             [enc setBuffer:moe_out->mtl_buf offset:moe_out->offset atIndex:2];
             metal_dispatch(enc, "moe_sum6", MTLSizeMake((NSUInteger)n_tok, 1, 1),
                 MTLSizeMake(nth, 1, 1));
+            if (g_moe_split) {
+                moe_split_point(&cb, &enc, &g_moe_t_sum);
+                g_moe_split_calls++;
+                if ((g_moe_split_calls % 20) == 0)
+                    printf("[MOE-STEP] n=%ld  map0=%.0f  swiglu=%.0f  down=%.0f  sum6=%.0f ms\n",
+                           g_moe_split_calls, g_moe_t_map0, g_moe_t_swiglu, g_moe_t_down, g_moe_t_sum);
+            }
 
             if (g_batch_cb) {
                 if (g_auto_barrier) {
