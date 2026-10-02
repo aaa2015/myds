@@ -473,7 +473,28 @@ struct flash_vec_args {
     uint64_t nb11,nb12,nb13;int32_t ns20;uint64_t nb21,nb22,nb23;
     int32_t ne31,ne32,ne33;uint64_t nb31,nb32,nb33;int32_t ne1,ne2,ne3;
     float scale,max_bias,m0,m1;int32_t n_head_log2;float logit_softcap;
+    uint64_t nb_kvq;   /* 每 query 的 K/V 基址步长；0 = 旧行为 */
 };
+/* 两侧手工镜像（宿主 C ↔ Metal），无编译器交叉校验：加字段必须同步改两边。
+ * 这里钉死尺寸，任何一侧改动而另一边没跟就会在编译期炸，而不是跑出垃圾 K 地址。 */
+_Static_assert(sizeof(struct flash_vec_args) == 200,
+               "flash_vec_args 尺寸变了 —— 内核侧 struct ds4_metal_args_flash_attn_ext_vec 必须同步");
+_Static_assert(sizeof(struct flash_vec_args) - 8 == 192, "nb_kvq 必须在尾部偏移 192");
+
+/* B 方案：见 metal/myds_chunk.metal 里的 myds_attn_gather_args（必须逐字段对齐）。 */
+struct myds_attn_gather_args {
+    uint32_t rows, top_k, n_comp, valid_from, mask_stride, c_start, base_pos, ratio;
+};
+
+/* 进程级开关：默认【关】。开了才走 gather 路径。 */
+static int attn_gather_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("MYDS_ATTN_GATHER");
+        cached = (v && atoi(v) > 0) ? 1 : 0;
+    }
+    return cached;
+}
 /* 建窗口/因果 mask 模板。列 [0,127) 是 carry，[127,127+c_len) 是本 chunk。
  * 行 r（chunk 内第 r 个 token）能看的是 slab 列 [r, r+127]：位置不超过自己（因果）
  * 且不早于自己往前 128 个（窗口）。carry 部分还要满足"那个位置真实存在"。
@@ -505,6 +526,7 @@ static int build_chunk_mask_template(myds_v41_gpu_scratch_t *s,uint32_t c_len,ui
 int myds_v41_gpu_attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *chunk_kv,
     const myds_metal_buffer_t *comp_kv,const myds_metal_buffer_t *ids,
+    myds_metal_buffer_t *gathered,
     uint32_t c_len,uint32_t n_comp,uint32_t top_k,
     uint32_t base_pos,uint32_t c_start,uint32_t ratio,myds_v41_gpu_scratch_t *s) {
     if(!s||!heads||!q||!chunk_kv||c_len==0||c_len>MYDS_CHUNK_MAXC||top_k>512u||
@@ -559,17 +581,35 @@ int myds_v41_gpu_attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buf
         if(!dispatch("kernel_myds_mask_chunk_scatter",&ma,sizeof(ma),sb,2,top_k,c_len,1,64,1,1,0))return 0;
     }
 
+    /* B 方案（docs/B_MAX_SPARSE_ATTENTION_SPEC.md）：把本 query 可见的 640 个键
+     * （128 滑窗 + 512 picks）gather 成各自的紧凑段，并重写 [0,640) 的掩码。
+     * 在上面那套旧掩码【之后】跑，直接覆盖它 —— 内核只看 [0,640)，其余列无读者。 */
+    const int use_gather = attn_gather_enabled() && gathered != NULL && n_comp != 0;
+    if (use_gather) {
+        struct myds_attn_gather_args ga={
+            c_len,top_k,n_comp,MYDS_CHUNK_CARRY-carry,s->mask_u16,c_start,base_pos,ratio};
+        {   const myds_metal_buffer_t *g1[]={gathered,s->mask_chunk,s->kv_chunk};
+            if(!dispatch("kernel_myds_attn_gather_window",&ga,sizeof(ga),g1,3,
+                         128u,c_len,1,128,1,1,0))return 0; }
+        {   const myds_metal_buffer_t *g2[]={gathered,s->mask_chunk,comp_kv,ids};
+            if(!dispatch("kernel_myds_attn_gather_comp",&ga,sizeof(ga),g2,4,
+                         top_k,c_len,1,128,1,1,0))return 0; }
+    }
+
+    const uint32_t kv_keys = use_gather ? 640u : keys_pad;
     struct flash_vec_args a={
         .ne01=(int32_t)c_len,.ne02=64,.ne03=1,.nb01=64u*2048u,.nb02=2048u,.nb03=64u*2048u,
-        .ne11=(int32_t)keys_pad,.ne_12_2=1,.ne_12_3=1,.ns10=512,
-        .nb11=1024u,.nb12=(uint64_t)keys_pad*1024u,.nb13=(uint64_t)keys_pad*1024u,
-        .ns20=512,.nb21=1024u,.nb22=(uint64_t)keys_pad*1024u,.nb23=(uint64_t)keys_pad*1024u,
+        .ne11=(int32_t)kv_keys,.ne_12_2=1,.ne_12_3=1,.ns10=512,
+        .nb11=1024u,.nb12=(uint64_t)kv_keys*1024u,.nb13=(uint64_t)kv_keys*1024u,
+        .ns20=512,.nb21=1024u,.nb22=(uint64_t)kv_keys*1024u,.nb23=(uint64_t)kv_keys*1024u,
         .ne31=(int32_t)c_len,.ne32=1,.ne33=1,
         .nb31=(uint64_t)s->mask_u16*2u,
         .nb32=(uint64_t)s->mask_u16*2u*(uint64_t)c_len,
         .nb33=(uint64_t)s->mask_u16*2u*(uint64_t)c_len,
-        .ne1=64,.ne2=(int32_t)c_len,.ne3=1,.scale=1.0f/sqrtf(512)};
-    const myds_metal_buffer_t *b[]={q,s->kv_chunk,s->kv_chunk,s->mask_chunk,sinks,s->pad,heads};
+        .ne1=64,.ne2=(int32_t)c_len,.ne3=1,.scale=1.0f/sqrtf(512),
+        .nb_kvq= use_gather ? 640u*1024u : 0u };
+    const myds_metal_buffer_t *kv_sel = use_gather ? gathered : s->kv_chunk;
+    const myds_metal_buffer_t *b[]={q,kv_sel,kv_sel,s->mask_chunk,sinks,s->pad,heads};
     const myds_metal_constant_t c[]={{400,true,1},{401,true,1},{402,true,0},{403,true,0},{404,true,0},
         {405,true,0},{420,false,512},{421,false,512},{422,false,1},{423,false,1}};
     if(!specialized("kernel_flash_attn_ext_vec_f16_dk512_dv512",&a,sizeof(a),b,7,

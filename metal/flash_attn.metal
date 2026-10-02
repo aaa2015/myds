@@ -125,7 +125,18 @@ struct ds4_metal_args_flash_attn_ext_vec {
     float    m1;
     int32_t  n_head_log2;
     float    logit_softcap;
+    /* 每 query 的 K/V 基址步长（字节）。非 0 时 `k`/`v` 再偏移 iq1*nb_kvq，用于把
+     * 「本 query 可见的键」从稀疏前缀 gather 成紧凑 slab（见
+     * docs/B_MAX_SPARSE_ATTENTION_SPEC.md）。为 0 时与旧行为完全一致。
+     * ⚠ 必须与宿主侧 struct flash_vec_args 的最后一项逐字对齐。 */
+    uint64_t nb_kvq;
 };
+/* 与宿主 C 侧 struct flash_vec_args 手工镜像 —— 在这里同样钉死尺寸/偏移，
+ * 两侧任一边改动而另一边没跟，编译期就炸，不会跑出垃圾 K 地址。 */
+static_assert(sizeof(struct ds4_metal_args_flash_attn_ext_vec) == 200,
+              "manifest 与宿主 flash_vec_args 尺寸不一致");
+static_assert(__builtin_offsetof(struct ds4_metal_args_flash_attn_ext_vec, nb_kvq) == 192,
+              "nb_kvq 偏移与宿主不一致");
 
 struct ds4_metal_args_flash_attn_ext_vec_reduce {
     int32_t nrows;
@@ -1023,6 +1034,12 @@ kernel void kernel_flash_attn_ext_vec(
 
         k += ikv2*args.nb12 + ikv3*args.nb13;
         v += ikv2*args.nb22 + ikv3*args.nb23;
+        /* B 方案：紧凑 slab 下每个 query 的键从自己的 [0,640) 段取。
+         * nb_kvq==0 时整句为恒等变换，与旧行为逐位一致。 */
+        if (args.nb_kvq != 0) {
+            k += (ulong)iq1 * args.nb_kvq;
+            v += (ulong)iq1 * args.nb_kvq;
+        }
     }
 
     device const float4 * q4 = (device const float4 *) ((device const char *) q);

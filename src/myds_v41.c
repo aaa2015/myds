@@ -1823,6 +1823,9 @@ struct v41_chunk_workspace_s {
     myds_metal_buffer_t *q_buf;
     myds_metal_buffer_t *kv_act_buf;
     myds_metal_buffer_t *attn_heads_buf;
+    /* B 方案：每 query 640 个可见键的紧凑段（f16）。只在 MYDS_ATTN_GATHER=1 时分配，
+     * 否则为 NULL（旧路径）。尺寸 = C * 640 * 512 * 2 字节（chunk 512 ⇒ 335 MB）。 */
+    myds_metal_buffer_t *kv_gathered;
     myds_metal_buffer_t *attn_low_buf;
     myds_metal_buffer_t *attn_out_buf;
     myds_metal_buffer_t *after_attn_buf;
@@ -2041,6 +2044,9 @@ static v41_chunk_workspace_t *v41_chunk_workspace_create(uint32_t capacity, uint
     ALLOC_BUF(q_buf, C * V41_HEADS * 512 * sizeof(float));
     ALLOC_BUF(kv_act_buf, C * 512 * sizeof(float));
     ALLOC_BUF(attn_heads_buf, C * V41_HEADS * 512 * sizeof(float));
+    /* B 方案：只在开关打开时分配，不跑 gather 的进程不付这 335 MB。 */
+    if (getenv("MYDS_ATTN_GATHER") && atoi(getenv("MYDS_ATTN_GATHER")) > 0)
+        ALLOC_BUF(kv_gathered, C * 640u * 512u * sizeof(uint16_t));
     ALLOC_BUF(attn_low_buf, C * 8192 * sizeof(float));
     ALLOC_BUF(attn_out_buf, C * V41_DIM * sizeof(float));
     ALLOC_BUF(after_attn_buf, C * 4 * V41_DIM * sizeof(float));
@@ -2727,6 +2733,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                             cw->kv_act_buf,
                             n_comp ? g->compressed[owner_for(il)] : NULL,
                             n_comp ? cw->cur_selected_view : NULL,
+                            cw->kv_gathered,
                             c_len, n_comp, V41_TOPK, mb_base_pos, c_start, ratio, g->gpu)) {
                         MYDS_LOG_E("chunked attention failed (c_len=%u n_comp=%u)", c_len, n_comp);
                         goto fail;
