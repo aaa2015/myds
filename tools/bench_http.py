@@ -99,14 +99,29 @@ def benchmark(url, model, name, prompt, max_tokens, timeout, run):
     ]
     ttft_s = first - start if first is not None else None
     
-    # Calculate decode speed using usage token count vs event count alignment
+    # Calculate decode speed using usage token count vs event count alignment.
+    # Note: decode_s measures the interval between the first and last visible delta.content events.
+    # When count (completion_tokens) includes reasoning, tool calls, or multi-token coalescing,
+    # dividing (count - 1) by decode_s is an estimate based on the visible content window.
+    # We record event_tps for event rate, decode_tps as estimated content window TPS,
+    # and mark decode_tps_is_estimated explicitly.
     decode_tps = None
     event_tps = None
+    decode_tps_is_estimated = False
+    decode_tps_basis = "none"
     if decode_s > 0:
         if count and count > 1:
             decode_tps = (count - 1) / decode_s
+            decode_tps_is_estimated = (count != len(chunks))
+            decode_tps_basis = "content_window_1to1" if count == len(chunks) else "content_window_estimated"
         if len(chunks) > 1:
             event_tps = (len(chunks) - 1) / decode_s
+
+    # If server reports explicit decode timing in usage, compute server decode TPS
+    server_decode_s = usage.get("decode_time_s") or usage.get("decode_s") if usage else None
+    server_decode_tps = None
+    if server_decode_s and server_decode_s > 0 and count > 1:
+        server_decode_tps = (count - 1) / server_decode_s
 
     return {
         "name": name,
@@ -120,6 +135,9 @@ def benchmark(url, model, name, prompt, max_tokens, timeout, run):
         "first_byte_s": first_byte_time - start if first_byte_time else None,
         "decode_s": decode_s,
         "decode_tps": round(decode_tps, 2) if decode_tps is not None else None,
+        "decode_tps_is_estimated": decode_tps_is_estimated,
+        "decode_tps_basis": decode_tps_basis,
+        "server_decode_tps": round(server_decode_tps, 2) if server_decode_tps is not None else None,
         "event_tps": round(event_tps, 2) if event_tps is not None else None,
         "wall_s": end - start,
         "content_events": len(chunks),
@@ -151,9 +169,11 @@ def main():
                 print(json.dumps(result, ensure_ascii=False), file=destination, flush=True)
                 ttft_str = f"{result['ttft_s']:.3f}s" if result['ttft_s'] is not None else "N/A"
                 tps_str = f"{result['decode_tps']:.2f}t/s" if result['decode_tps'] is not None else "N/A"
+                ev_str = f"{result['event_tps']:.2f}ev/s" if result['event_tps'] is not None else "N/A"
+                est_suffix = "(est)" if result.get("decode_tps_is_estimated") else ""
                 print(
                     f"{name} run={run} tokens={result['completion_tokens']} events={result['content_events']} "
-                    f"TTFT={ttft_str} decode={tps_str} "
+                    f"TTFT={ttft_str} decode={tps_str}{est_suffix} events={ev_str} "
                     f"wall={result['wall_s']:.3f}s SHA256={result['text_sha256'][:16]}...",
                     file=sys.stderr,
                     flush=True,
@@ -161,10 +181,10 @@ def main():
         
         # Summary table of independent medians and nearest-rank P95
         import statistics, math
-        print("\n" + "=" * 80, file=sys.stderr)
+        print("\n" + "=" * 85, file=sys.stderr)
         print(f"BENCHMARK AGGREGATE SUMMARY ({args.repeats} runs, independent medians & nearest-rank P95):", file=sys.stderr)
-        print(f"{'Prompt':<14} | {'P-Tokens':<8} | {'D-Tokens':<8} | {'TTFT P50':<9} | {'TTFT P95':<9} | {'Decode TPS':<11} | {'Wall P50':<9} | {'Hash Consistent':<15}", file=sys.stderr)
-        print("-" * 80, file=sys.stderr)
+        print(f"{'Prompt':<14} | {'P-Tokens':<8} | {'D-Tokens':<8} | {'TTFT P50':<9} | {'TTFT P95':<9} | {'Decode TPS(est)':<15} | {'Wall P50':<9} | {'Hash Consistent':<15}", file=sys.stderr)
+        print("-" * 85, file=sys.stderr)
         for name, run_list in results_by_prompt.items():
             ttfts = [r["ttft_s"] for r in run_list if r["ttft_s"] is not None]
             tps_list = [r["decode_tps"] for r in run_list if r["decode_tps"] is not None]
@@ -192,10 +212,13 @@ def main():
             consistent = "YES (deterministic)" if len(hashes) == 1 else f"NO ({len(hashes)} variants)"
             
             print(
-                f"{name:<14} | {p_tok:<8} | {d_tok:<8} | {med_ttft_str:<9} | {p95_ttft_str:<9} | {med_tps_str:<11} | {med_wall:<9.3f} | {consistent:<15}",
+                f"{name:<14} | {p_tok:<8} | {d_tok:<8} | {med_ttft_str:<9} | {p95_ttft_str:<9} | {med_tps_str:<15} | {med_wall:<9.3f} | {consistent:<15}",
                 file=sys.stderr
             )
-        print("=" * 80 + "\n", file=sys.stderr)
+        print("=" * 85, file=sys.stderr)
+        print("* Note: 'Decode TPS(est)' uses usage.completion_tokens over visible content event interval (last - first).", file=sys.stderr)
+        print("  For raw SSE event rate, see 'event_tps'. If reasoning or tool calls occur outside the visible window,", file=sys.stderr)
+        print("  or tokens coalesce, true decoding throughput requires server-side phase timing.\n", file=sys.stderr)
     finally:
         if destination is not sys.stdout:
             destination.close()

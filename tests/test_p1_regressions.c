@@ -708,14 +708,26 @@ static void test_p2_moe_batch_mm_tail_cull_validation(void) {
     assert(h_out);
     assert(myds_metal_buffer_read(moe_out, 0, h_out, (size_t)n_tok * dim * sizeof(float)));
 
-    /* Verify all 32 tokens output valid, positive, finite values */
+    /* Verify all 40 tokens output valid, positive, finite values matching golden reference */
+    double sum = 0.0;
     for (uint32_t t = 0; t < n_tok; t++) {
         for (uint32_t i = 0; i < dim; i++) {
             float val = h_out[t * dim + i];
             assert(isfinite(val));
             assert(val > 0.0f);
+            sum += (double)val;
         }
     }
+    uint64_t fnv = 0xcbf29ce484222325ULL;
+    const uint8_t *p_bytes = (const uint8_t *)h_out;
+    for (size_t b = 0; b < (size_t)n_tok * dim * sizeof(float); b++) {
+        fnv = ((fnv ^ p_bytes[b]) * 0x100000001b3ULL);
+    }
+    /* Bit-exact reference assertions against un-culled baseline */
+    assert(fabsf(h_out[0] - 985.08129883f) < 1e-4f);
+    assert(fabsf(h_out[1] - 985.08129883f) < 1e-4f);
+    assert(fabs(sum - 10087232.5) < 1.0);
+    assert(fnv == 0x503770f9a4c89325ULL);
     free(h_out);
 
     myds_metal_buffer_free(moe_out);
@@ -730,7 +742,145 @@ static void test_p2_moe_batch_mm_tail_cull_validation(void) {
     myds_metal_buffer_free(scratch_mid);
     myds_metal_buffer_free(scratch_down);
 
-    printf("  [PASS] P2: MoE batch MM path (n_tok=40, non-uniform 1..33 rows) with tail-cull and row bucketing verified\n");
+    printf("  [PASS] P2: MoE batch MM path (n_tok=40, non-uniform 1..33 rows) bit-exact to golden reference\n");
+}
+
+/* Multi-case non-uniform expert row coverage fixture (tested bit-exact on M2 Ultra vs un-culled kernel) */
+static void test_p2_moe_tail_cull_multi_case_golden_equivalence(void) {
+    if (!myds_metal_init(NULL)) {
+        printf("  [SKIP] Metal not supported on this platform\n");
+        return;
+    }
+
+    const uint32_t dim = 256;
+    const uint32_t expert_dim = 256;
+    const uint32_t n_routed_experts = 8;
+    const uint32_t n_activated_experts = 6;
+    const uint32_t n_tok = 64;
+
+    uint64_t gate_row_bytes = (dim / 256u) * 66u;
+    uint64_t gate_exp_bytes = (uint64_t)expert_dim * gate_row_bytes;
+    uint64_t down_row_bytes = (expert_dim / 256u) * 84u;
+    uint64_t down_exp_bytes = (uint64_t)dim * down_row_bytes;
+
+    myds_metal_buffer_t *moe_out = myds_metal_buffer_alloc((size_t)n_tok * dim * sizeof(float));
+    myds_metal_buffer_t *x_in = myds_metal_buffer_alloc((size_t)n_tok * dim * sizeof(float));
+    myds_metal_buffer_t *gate_exps = myds_metal_buffer_alloc((size_t)(n_routed_experts * gate_exp_bytes));
+    myds_metal_buffer_t *up_exps = myds_metal_buffer_alloc((size_t)(n_routed_experts * gate_exp_bytes));
+    myds_metal_buffer_t *down_exps = myds_metal_buffer_alloc((size_t)(n_routed_experts * down_exp_bytes));
+    myds_metal_buffer_t *selected_ids = myds_metal_buffer_alloc((size_t)n_tok * n_activated_experts * sizeof(int32_t));
+    myds_metal_buffer_t *selected_weights = myds_metal_buffer_alloc((size_t)n_tok * n_activated_experts * sizeof(float));
+    myds_metal_buffer_t *scratch_gate = myds_metal_buffer_alloc((size_t)n_tok * n_activated_experts * expert_dim * sizeof(float));
+    myds_metal_buffer_t *scratch_up = myds_metal_buffer_alloc((size_t)n_tok * n_activated_experts * expert_dim * sizeof(float));
+    myds_metal_buffer_t *scratch_mid = myds_metal_buffer_alloc((size_t)n_tok * n_activated_experts * expert_dim * sizeof(float));
+    myds_metal_buffer_t *scratch_down = myds_metal_buffer_alloc((size_t)n_tok * n_activated_experts * dim * sizeof(float));
+
+    assert(moe_out && x_in && gate_exps && up_exps && down_exps && selected_ids &&
+           selected_weights && scratch_gate && scratch_up && scratch_mid && scratch_down);
+
+    float *h_x = malloc((size_t)n_tok * dim * sizeof(float));
+    assert(h_x);
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t i = 0; i < dim; i++) {
+            h_x[t * dim + i] = 1.0f + 0.01f * (float)(i % 17) + .001f * t;
+        }
+    }
+    assert(myds_metal_buffer_write(x_in, 0, h_x, (size_t)n_tok * dim * sizeof(float)));
+    free(h_x);
+
+    uint8_t q_data[344064];
+    memset(q_data, 0x22, sizeof(q_data));
+    for (unsigned z = 0; z < n_routed_experts * expert_dim; z++) {
+        __fp16 h = (__fp16)(.013f + .0001f * (z % 13));
+        memcpy(q_data + z * 66, &h, 2);
+    }
+    assert(myds_metal_buffer_write(gate_exps, 0, q_data, (size_t)(n_routed_experts * gate_exp_bytes)));
+    assert(myds_metal_buffer_write(up_exps, 0, q_data, (size_t)(n_routed_experts * gate_exp_bytes)));
+
+    uint8_t q_down[344064];
+    memset(q_down, 0x22, sizeof(q_down));
+    for (uint32_t row = 0; row < n_routed_experts * dim; row++) {
+        __fp16 d = (__fp16)(.007f + .00007f * (row % 17));
+        memcpy(q_down + row * 84 + 80, &d, 2);
+        q_down[row * 84 + 82] = 0;
+        q_down[row * 84 + 83] = 0;
+    }
+    assert(myds_metal_buffer_write(down_exps, 0, q_down, (size_t)(n_routed_experts * down_exp_bytes)));
+
+    const unsigned cases[] = {1, 4, 8, 9, 16, 17, 24, 31, 33};
+    const uint64_t golden_fnv[9] = {
+        0xd0d94abd21752177ULL, /* case  1 */
+        0x1f7cbd4c5028c4caULL, /* case  4 */
+        0x5185f9997de3b766ULL, /* case  8 */
+        0xa4073ee7411ad74dULL, /* case  9 */
+        0x61c8c0db813324a7ULL, /* case 16 */
+        0x5ce5956dcabc4fceULL, /* case 17 */
+        0x1beab66e7157c06bULL, /* case 24 */
+        0xc411339798b00279ULL, /* case 31 */
+        0xedbd0bc4a7c5c802ULL, /* case 33 */
+    };
+
+    int32_t *h_ids = malloc((size_t)n_tok * n_activated_experts * sizeof(int32_t));
+    float *h_weights = malloc((size_t)n_tok * n_activated_experts * sizeof(float));
+    float *h_out = malloc((size_t)n_tok * dim * sizeof(float));
+    assert(h_ids && h_weights && h_out);
+
+    for (unsigned c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
+        unsigned case_rows = cases[c];
+        for (uint32_t t = 0; t < n_tok; t++) {
+            for (uint32_t k = 0; k < n_activated_experts; k++) {
+                h_ids[t * n_activated_experts + k] = (t < case_rows && k == t % 6) ? 6 : (int32_t)k;
+                h_weights[t * n_activated_experts + k] = .1f + .01f * ((t + 2 * k) % 11);
+            }
+        }
+        assert(myds_metal_buffer_write(selected_ids, 0, h_ids, (size_t)n_tok * n_activated_experts * sizeof(int32_t)));
+        assert(myds_metal_buffer_write(selected_weights, 0, h_weights, (size_t)n_tok * n_activated_experts * sizeof(float)));
+
+        myds_metal_dispatch_count_reset();
+        int ret = myds_metal_routed_moe_batch(
+            moe_out, x_in, gate_exps, up_exps, down_exps,
+            selected_ids, selected_weights,
+            scratch_gate, scratch_up, scratch_mid, scratch_down,
+            dim, expert_dim, n_routed_experts, n_activated_experts, n_tok,
+            GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_K,
+            0.0f
+        );
+        assert(ret == 1);
+        assert(myds_metal_dispatch_count() == 4);
+        assert(myds_metal_buffer_read(moe_out, 0, h_out, (size_t)n_tok * dim * sizeof(float)));
+
+        /* Bitwise hash check against M2 Ultra / un-culled reference run */
+        uint64_t fnv = 0xcbf29ce484222325ULL;
+        const uint8_t *p_bytes = (const uint8_t *)h_out;
+        for (size_t b = 0; b < (size_t)n_tok * dim * sizeof(float); b++) {
+            fnv = ((fnv ^ p_bytes[b]) * 0x100000001b3ULL);
+        }
+        assert(fnv == golden_fnv[c]);
+        assert(fabsf(h_out[0] - 692.66223145f) < 1e-4f);
+
+        for (uint32_t i = 0; i < n_tok * dim; i++) {
+            assert(isfinite(h_out[i]));
+            assert(h_out[i] >= 649.0f && h_out[i] <= 888.0f);
+        }
+    }
+
+    free(h_ids);
+    free(h_weights);
+    free(h_out);
+
+    myds_metal_buffer_free(moe_out);
+    myds_metal_buffer_free(x_in);
+    myds_metal_buffer_free(gate_exps);
+    myds_metal_buffer_free(up_exps);
+    myds_metal_buffer_free(down_exps);
+    myds_metal_buffer_free(selected_ids);
+    myds_metal_buffer_free(selected_weights);
+    myds_metal_buffer_free(scratch_gate);
+    myds_metal_buffer_free(scratch_up);
+    myds_metal_buffer_free(scratch_mid);
+    myds_metal_buffer_free(scratch_down);
+
+    printf("  [PASS] P2: MoE tail-cull multi-case golden equivalence (rows 1,4,8,9,16,17,24,31,33 bit-exact to un-culled reference)\n");
 }
 
 static void test_p1_same_process_large_model_isolation(void) {
@@ -1107,6 +1257,7 @@ int main(void) {
     test_p1_metal_fused_add_fallback();
     test_p2_moe_kernel_and_pso_validation();
     test_p2_moe_batch_mm_tail_cull_validation();
+    test_p2_moe_tail_cull_multi_case_golden_equivalence();
     test_p1_snapshot_overwrite_failure();
     test_p1_macroblock_prefill_invariants();
     test_p2_tiled_indexer_causal_equivalence();
