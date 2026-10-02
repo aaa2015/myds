@@ -1460,15 +1460,28 @@ static int publish_compressor_chunk(myds_context_t *ctx, uint32_t il,
     return 1;
 }
 
-/* 实验开关：把 il==20 的块预算压到 N（默认 0 = 现行为 = 全选）。
- * 现行为下 blocks<=2048 ⇒ top=blocks ⇒ 块掩码等于纯因果前缀 ⇒ 21..39 层的
- * 键掩码【不稀疏】，flash 内核在 32 键粒度上几乎跳不掉任何块。
- * 压到 ~64（=512 个 8 键块 = TOPK）后掩码真正稀疏，用来量化「块级稀疏」的
- * 收益与质量代价。设 MYDS_BLOCK_BUDGET=<N>，只在 N 更小时生效。 */
+/* il==20 的块预算上限（= 层 21..39 实际能看到多少压缩键）。
+ *
+ * 历史行为是【全选】（top=blocks）：块掩码等于纯因果前缀 ⇒ 21..39 层的键掩码
+ * 不稀疏 ⇒ flash 内核在 32 键粒度上几乎跳不掉任何块（实测只跳 0.01%~5.8%）,
+ * 于是每个 query 扫 383+n_comp 个键而只用到 640 个（128 滑窗 + 512 picks），
+ * 约 4.7× 的算力被浪费在“算了再掩掉”上。
+ *
+ * 默认收紧到 32 块（8 键/块 ⇒ 256 个键）。实测（macstudio M2 Ultra，
+ * 3264 tok，生产 env，服务端自报 prefill）：
+ *    全选 259.7/263.2 t/s  →  32 块 ~290-294 t/s（+13%）
+ * 质量门禁（同一份长上下文，8 题：3k/12k 各 4 题，含两跳聚合与反幻觉对照）：
+ *    全选 8/8   32 块 8/8（答案逐字符相同）
+ * 而 16 块（128 键）会把召回打到 4/10 ⇒ 256 键是检索质量底线，勿再往下调。
+ * 继续往下压的收益也被“32 键跳块粒度”封顶；要拿剩下的必须改成
+ * per-query gather（让内核只算选中的键，而不是算了再掩）。
+ *
+ * MYDS_BLOCK_BUDGET=<N> 可覆盖（N<=0 或 >=blocks 表示不限制 = 旧行为）。 */
+#define V41_BLOCK_BUDGET_DEFAULT 32u
+
 static uint32_t block_budget_cap(uint32_t all) {
     const char *v = getenv("MYDS_BLOCK_BUDGET");
-    if (!v) return all;
-    int n = atoi(v);
+    int n = v ? atoi(v) : (int)V41_BLOCK_BUDGET_DEFAULT;
     if (n > 0 && (uint32_t)n < all) return (uint32_t)n;
     return all;
 }
