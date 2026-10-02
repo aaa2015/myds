@@ -2381,11 +2381,16 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     const bool opt_prof_split = (getenv("MYDS_PROFILE_SPLIT") != NULL);
     const bool opt_prof_split2 = (getenv("MYDS_PROFILE_SPLIT2") != NULL);
     const bool opt_prof_split3 = (getenv("MYDS_PROFILE_SPLIT3") != NULL);
+    const bool opt_prof_moe = (getenv("MYDS_PROFILE_MOE") != NULL);
     const bool opt_disable_mm_attn_a = (getenv("MYDS_DISABLE_MM_ATTN_A") != NULL);
     double prof_engram = 0, prof_embedding = 0, prof_total_layers = 0;
     double prof_step1 = 0, prof_step2 = 0, prof_step3 = 0, prof_step4 = 0, prof_step5 = 0;
     double prof_step6 = 0, prof_step7 = 0, prof_step8 = 0;
     double prof_wait_qkv = 0, prof_wait_swa = 0, prof_wait_ffn_router = 0, prof_wait_moe = 0;
+    /* 诊断：把「Wait MoE」这个窗口拆开 —— 它实际包含 Step5..8 全部（attn_out 投影、
+     * FFN In、shared+router、MoE GEMM、以及 epilogue 的 add_bf16/hc_expand），
+     * 所以不能直接当成「MoE 的耗时」。三段在 MYDS_PROFILE_MOE=1 时才测。 */
+    double prof_wait_attnB = 0, prof_wait_ffnpre = 0, prof_wait_moe_gemm = 0;
     uint64_t disp_ringattn = 0, disp_compressor = 0;   /* 诊断：分段 dispatch 数 */
     double prof_wait_indexer = 0;   /* 诊断：Step 4 里 indexer 部分的 GPU 等待 */
     double prof_wait_attn2 = 0;     /* 诊断：ring+attention 的 GPU 等待 */
@@ -2782,6 +2787,12 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 phase = "batched attention output b";
                 CHECK(project_batch(cw->attn_out_buf, base->attn_output_b, cw->attn_low_buf, V41_DIM, 8192, c_len, base->attn_output_b_type, true));
                 TIME_ACC(prof_step5);
+                if (do_prof && opt_prof_moe) {
+                    TIME_START();
+                    CHECK(myds_metal_commit_batch());
+                    TIME_ACC(prof_wait_attnB);
+                    CHECK(myds_metal_begin_batch());
+                }
 
                 /* Step 6: HC FFN Input for all tokens in chunk */
                 TIME_START();
@@ -2850,6 +2861,12 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     }
                 }
                 TIME_ACC(prof_step7);
+                if (do_prof && opt_prof_moe) {
+                    TIME_START();
+                    CHECK(myds_metal_commit_batch());
+                    TIME_ACC(prof_wait_ffnpre);
+                    CHECK(myds_metal_begin_batch());
+                }
 
                 /* Single commit for all Attention + FFN + Shared + Routing in the chunk */
                 if (do_prof) {
@@ -2894,6 +2911,12 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                         base->ffn_gate_exps_type, base->ffn_up_exps_type, base->ffn_down_exps_type,
                         m->swiglu_clamp_exp));
                     myds_metal_barrier();
+                    if (do_prof && opt_prof_moe) {
+                        TIME_START();
+                        CHECK(myds_metal_commit_batch());
+                        TIME_ACC(prof_wait_moe_gemm);
+                        CHECK(myds_metal_begin_batch());
+                    }
 
                     /* 收尾仍按 attention chunk 逐个做：hc_expand 要用该 chunk 自己的
                      * after_attn / ffn_split（它们都被保存在批缓冲里）。 */
@@ -3006,6 +3029,13 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         printf("Wait FFN+R (GPU)      : %8.2f ms\n", prof_wait_ffn_router);
         printf("Step 8 (MoE dispatch) : %8.2f ms\n", prof_step8);
         printf("Wait MoE (GPU)        : %8.2f ms\n", prof_wait_moe);
+        if (opt_prof_moe) {
+            printf("  ...attn_out B       : %8.2f ms\n", prof_wait_attnB);
+            printf("  ...FFN-in+sh+router : %8.2f ms\n", prof_wait_ffnpre);
+            printf("  ===> MoE GEMMs      : %8.2f ms\n", prof_wait_moe_gemm);
+            printf("  ...epilogue(add/hc) : %8.2f ms\n",
+                   prof_wait_moe - prof_wait_attnB - prof_wait_ffnpre - prof_wait_moe_gemm);
+        }
         printf("Total Layers Wall     : %8.2f ms\n", prof_total_layers);
         {   /* 诊断：dispatch 次数 */
             uint64_t layer_iters = (uint64_t)V41_LAYERS * (uint64_t)((n_tokens + chunk_size - 1u) / (chunk_size ? chunk_size : 1u));
