@@ -980,6 +980,84 @@ static void test_p1_macroblock_prefill_invariants(void) {
     printf("  [PASS] P1: Macroblock configuration bounds, stride snapping, and carry staging invariants\n");
 }
 
+static void test_p2_tiled_indexer_causal_equivalence(void) {
+    if (!myds_metal_init(NULL)) {
+        printf("  [SKIP] Metal not supported for tiled indexer test\n");
+        return;
+    }
+
+    const uint32_t n_tokens = 32;
+    const uint32_t n_comp = 64;
+    const uint32_t n_head = 32;
+    const uint32_t head_dim = 128;
+    const uint32_t pos0 = 100;
+    const uint32_t ratio = 2;
+
+    size_t q_bytes = (size_t)n_tokens * n_head * head_dim * sizeof(float);
+    size_t w_bytes = (size_t)n_tokens * n_head * sizeof(float);
+    size_t k_bytes = (size_t)n_comp * head_dim * sizeof(float);
+    size_t s_bytes = (size_t)n_tokens * n_comp * sizeof(float);
+
+    myds_metal_buffer_t *q_buf = myds_metal_buffer_alloc(q_bytes);
+    myds_metal_buffer_t *w_buf = myds_metal_buffer_alloc(w_bytes);
+    myds_metal_buffer_t *k_buf = myds_metal_buffer_alloc(k_bytes);
+    myds_metal_buffer_t *s_direct = myds_metal_buffer_alloc(s_bytes);
+    myds_metal_buffer_t *s_tiled = myds_metal_buffer_alloc(s_bytes);
+    assert(q_buf && w_buf && k_buf && s_direct && s_tiled);
+
+    float *q_ptr = (float *)myds_metal_buffer_data(q_buf);
+    float *w_ptr = (float *)myds_metal_buffer_data(w_buf);
+    float *k_ptr = (float *)myds_metal_buffer_data(k_buf);
+    for (size_t i = 0; i < n_tokens * n_head * head_dim; i++) {
+        q_ptr[i] = ((float)(i % 19) - 9.0f) * 0.05f;
+    }
+    for (size_t i = 0; i < n_tokens * n_head; i++) {
+        w_ptr[i] = 1.0f + 0.02f * (float)(i % 11);
+    }
+    for (size_t i = 0; i < n_comp * head_dim; i++) {
+        k_ptr[i] = ((float)(i % 23) - 11.0f) * 0.04f;
+    }
+
+    /* 1. Run direct indexer */
+    setenv("MYDS_INDEXER_TILED", "0", 1);
+    assert(myds_metal_begin_batch());
+    assert(myds_v41_gpu_indexscores_chunk(s_direct, q_buf, w_buf, k_buf,
+                                          n_comp, n_head, n_tokens, pos0, ratio));
+    assert(myds_metal_commit_batch());
+
+    /* 2. Run hardware tiled indexer */
+    setenv("MYDS_INDEXER_TILED", "1", 1);
+    assert(myds_metal_begin_batch());
+    assert(myds_v41_gpu_indexscores_chunk(s_tiled, q_buf, w_buf, k_buf,
+                                          n_comp, n_head, n_tokens, pos0, ratio));
+    assert(myds_metal_commit_batch());
+
+    unsetenv("MYDS_INDEXER_TILED");
+
+    /* 3. Compare direct and tiled */
+    const float *sd = (const float *)myds_metal_buffer_data(s_direct);
+    const float *st = (const float *)myds_metal_buffer_data(s_tiled);
+    float max_diff = 0.0f;
+    for (size_t i = 0; i < n_tokens * n_comp; i++) {
+        float vd = sd[i], vt = st[i];
+        if (isinf(vd) || isinf(vt)) {
+            assert(vd == vt);
+        } else {
+            float diff = fabsf(vd - vt);
+            if (diff > max_diff) max_diff = diff;
+            assert(diff < 1e-4f);
+        }
+    }
+
+    myds_metal_buffer_free(q_buf);
+    myds_metal_buffer_free(w_buf);
+    myds_metal_buffer_free(k_buf);
+    myds_metal_buffer_free(s_direct);
+    myds_metal_buffer_free(s_tiled);
+
+    printf("  [PASS] P2: Hardware-tiled indexer causal equivalence to direct indexer (max_diff=%e)\n", max_diff);
+}
+
 int main(void) {
     printf("Running P1 Regression Verification Suite:\n");
     test_p1_response_id_lifecycle();
@@ -994,6 +1072,7 @@ int main(void) {
     test_p2_moe_batch_mm_tail_cull_validation();
     test_p1_snapshot_overwrite_failure();
     test_p1_macroblock_prefill_invariants();
+    test_p2_tiled_indexer_causal_equivalence();
     printf("All P1 Regression Verifications PASSED!\n");
     return 0;
 }

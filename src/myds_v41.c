@@ -2042,7 +2042,10 @@ static v41_chunk_workspace_t *v41_chunk_workspace_create(uint32_t capacity, uint
     ALLOC_BUF(pool_score_buf, C * 512 * sizeof(float));
     ALLOC_BUF(comp_latent_buf, C * 512 * sizeof(float));
     ALLOC_BUF(comp_index_k_buf, C * 128 * sizeof(float));
-    ALLOC_BUF(index_q_buf, C * V41_INDEX_HEADS * 128 * sizeof(float));
+    /* 复用注意力输出缓冲：attn_heads_buf (C*32768*4) 在 indexer 完成后才由 attention_chunk 写入，
+     * 生命周期与 index_q_buf (C*4096*4) 完全正交，直接作为 sub_view 复用，省去 32 MiB 独占显存。 */
+    cw->index_q_buf = myds_metal_buffer_sub_view(cw->attn_heads_buf, 0, C * V41_INDEX_HEADS * 128 * sizeof(float));
+    if (!cw->index_q_buf) goto fail;
     ALLOC_BUF(index_weights_buf, C * V41_INDEX_HEADS * sizeof(float));
     ALLOC_BUF(moe_gate_buf, B * 6 * exp_dim * sizeof(float));
     ALLOC_BUF(moe_up_buf, B * 6 * exp_dim * sizeof(float));

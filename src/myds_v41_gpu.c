@@ -268,10 +268,38 @@ int myds_v41_gpu_indexscores_chunk(myds_metal_buffer_t *scores,const myds_metal_
     if(!floats(scores,(uint64_t)n_comp*n_tokens)||
        !floats(q,(uint64_t)n_tokens*n_heads*128u)||
        !floats(weights,(uint64_t)n_tokens*n_heads)||!floats(cache,(uint64_t)n_comp*128u))return 0;
+    const char *tiled_env = getenv("MYDS_INDEXER_TILED");
+    int opt_tiled = tiled_env ? atoi(tiled_env) : 1;
+    const myds_metal_buffer_t *b[]={q,weights,cache,scores};
+    if (opt_tiled && n_tokens >= 8) {
+        struct {
+            uint32_t n_comp, n_tokens, n_head, head_dim, pos0, ratio;
+            uint64_t q_token_stride, q_head_stride, weights_token_stride;
+            uint64_t index_row_stride, score_token_stride;
+            float    scale;
+        } ta = {
+            .n_comp = n_comp,
+            .n_tokens = n_tokens,
+            .n_head = n_heads,
+            .head_dim = 128,
+            .pos0 = causal_start,
+            .ratio = causal_ratio,
+            .q_token_stride = (uint64_t)n_heads * 128u * sizeof(float),
+            .q_head_stride = (uint64_t)128u * sizeof(float),
+            .weights_token_stride = (uint64_t)n_heads * sizeof(float),
+            .index_row_stride = (uint64_t)128u * sizeof(float),
+            .score_token_stride = (uint64_t)n_comp * sizeof(float),
+            .scale = 1.0f / 64.0f
+        };
+        const uint32_t gx = (n_comp + 31u) / 32u;
+        const uint32_t gy = (n_tokens + 7u) / 8u;
+        const size_t smem = (8u * 128u + 32u * 128u + 8u * 32u) * sizeof(float);
+        return dispatch("kernel_dsv4_indexer_scores_tiled_f32", &ta, sizeof(ta), b, 4,
+                        gx, gy, 1, 32, 4, 1, smem);
+    }
     struct {uint32_t n_rows,n_head,head_dim,cache_f16;float scale;
             uint32_t n_tokens,causal_start,causal_ratio,pad;} a={
         n_comp,n_heads,128,0,1.0f/64.0f,n_tokens,causal_start,causal_ratio,0};
-    const myds_metal_buffer_t *b[]={q,weights,cache,scores};
     return dispatch("kernel_glm_indexer_score_chunk_direct",&a,sizeof(a),b,4,
         n_comp,n_tokens,1,32,4,1,132u*4);
 }

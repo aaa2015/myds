@@ -414,6 +414,7 @@ int myds_metal_init(const char *shader_dir) {
                         @"kernel_glm_indexer_score_one",
                         @"kernel_glm_indexer_score_one_direct",
                         @"kernel_glm_indexer_score_chunk_direct",
+                        @"kernel_dsv4_indexer_scores_tiled_f32",
                         @"kernel_argsort_f32_i32_desc",
                         @"kernel_argsort_f32_i32_desc_causal",
                         @"kernel_argsort_merge_f32_i32_desc",
