@@ -216,6 +216,16 @@ int32_t myds_sample_next_token(
 
 uint64_t myds_v41_model_identity(const myds_model_t *m);
 myds_v41_context_t *myds_v41_context_create_for_model(const myds_model_t *model);
+myds_v41_context_t *myds_v41_context_create_snapshot_fixture(void);
+uint32_t myds_v41_snapshot_get_pos(const myds_v41_context_t *g, uint32_t slot);
+uint32_t myds_v41_snapshot_get_staged_pos(const myds_v41_context_t *g, uint32_t slot);
+myds_metal_buffer_t *myds_v41_snapshot_get_window(myds_v41_context_t *g, uint32_t layer);
+myds_metal_buffer_t *myds_v41_snapshot_get_previous_kv(myds_v41_context_t *g, uint32_t o);
+myds_metal_buffer_t *myds_v41_snapshot_get_previous_score(myds_v41_context_t *g, uint32_t o);
+void myds_v41_snapshot_set_engram_history(myds_v41_context_t *g, uint32_t t0, uint32_t t1, uint32_t t2);
+void myds_v41_snapshot_get_engram_history(const myds_v41_context_t *g, uint32_t out[3]);
+void myds_v41_snapshot_set_positions(myds_v41_context_t *g, uint32_t engram_pos, uint32_t next_pos);
+bool myds_v41_snapshot_get_valid(const myds_v41_context_t *g);
 
 #ifdef __cplusplus
 }

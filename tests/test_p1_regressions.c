@@ -662,6 +662,168 @@ static void test_p1_same_process_large_model_isolation(void) {
     printf("  [PASS] P1: Same-process large models have isolated identities across distinct instances\n");
 }
 
+static void fill_buffer_f32(myds_metal_buffer_t *buf, float val) {
+    assert(buf);
+    float *ptr = (float *)myds_metal_buffer_data(buf);
+    size_t words = myds_metal_buffer_size(buf) / sizeof(float);
+    for (size_t i = 0; i < words; i++) ptr[i] = val;
+}
+
+static void check_buffer_f32(myds_metal_buffer_t *buf, float expected) {
+    assert(buf);
+    const float *ptr = (const float *)myds_metal_buffer_data(buf);
+    size_t words = myds_metal_buffer_size(buf) / sizeof(float);
+    for (size_t i = 0; i < words; i++) assert(ptr[i] == expected);
+}
+
+static void test_p1_snapshot_overwrite_failure(void) {
+    if (!myds_metal_init(NULL)) {
+        printf("  [SKIP] Metal not supported on this platform\n");
+        return;
+    }
+
+    myds_v41_context_t *g = myds_v41_context_create_snapshot_fixture();
+    assert(g != NULL);
+
+    /* ── Case 1: Existing valid slot 0 -> partial copy failure during overwrite ── */
+    /* 1. Setup slot 0 with valid snapshot at pos 1024 */
+    for (uint32_t l = 0; l < 40; l++) {
+        fill_buffer_f32(myds_v41_snapshot_get_window(g, l), 7.0f);
+    }
+    for (uint32_t o = 0; o < 4; o++) {
+        fill_buffer_f32(myds_v41_snapshot_get_previous_kv(g, o), 2.0f);
+        fill_buffer_f32(myds_v41_snapshot_get_previous_score(g, o), 0.0f);
+    }
+    myds_v41_snapshot_set_engram_history(g, 11, 22, 33);
+    myds_v41_snapshot_set_positions(g, 1024, 1024);
+
+    assert(myds_v41_snapshot_store_now(g, 1024));
+    assert(myds_v41_snapshot_get_pos(g, 0) == 1024);
+    assert(myds_v41_snapshot_get_staged_pos(g, 0) == 0);
+    assert(myds_v41_snapshot_best(g, 1024) == 1024);
+
+    /* 2. Advance live state to pos 1025 with new contents */
+    for (uint32_t l = 0; l < 40; l++) {
+        fill_buffer_f32(myds_v41_snapshot_get_window(g, l), 9.0f);
+    }
+    for (uint32_t o = 0; o < 4; o++) {
+        fill_buffer_f32(myds_v41_snapshot_get_previous_kv(g, o), 4.0f);
+        fill_buffer_f32(myds_v41_snapshot_get_previous_score(g, o), 5.0f);
+    }
+    myds_v41_snapshot_set_engram_history(g, 44, 55, 66);
+    myds_v41_snapshot_set_positions(g, 1025, 1025);
+
+    /* Clear up to 1025 keeps old snapshot at 1024 intact */
+    myds_v41_snapshot_clear(g, 1025);
+    assert(myds_v41_snapshot_get_pos(g, 0) == 1024);
+
+    /* 3. Inject copy failure at copy #10 */
+    myds_metal_inject_copy_failure(10);
+    bool stored = myds_v41_snapshot_store_now(g, 1025);
+    assert(!stored);
+    assert(myds_metal_get_copy_call_count() == 10);
+
+    /* Slot 0 MUST be invalidated so corrupted mixed data is NEVER selectable */
+    assert(myds_v41_snapshot_get_pos(g, 0) == 0);
+    assert(myds_v41_snapshot_get_staged_pos(g, 0) == 0);
+    assert(myds_v41_snapshot_best(g, 1024) == 0);
+    assert(myds_v41_snapshot_best(g, 1025) == 0);
+    assert(!myds_v41_snapshot_restore(g, 1024));
+    assert(!myds_v41_snapshot_restore(g, 1025));
+
+    myds_metal_inject_copy_failure(0);
+
+    /* ── Case 2: Existing valid slot 0 -> final commit_batch failure ── */
+    /* 1. Re-populate slot 0 with valid snapshot at pos 1024 */
+    for (uint32_t l = 0; l < 40; l++) {
+        fill_buffer_f32(myds_v41_snapshot_get_window(g, l), 7.0f);
+    }
+    for (uint32_t o = 0; o < 4; o++) {
+        fill_buffer_f32(myds_v41_snapshot_get_previous_kv(g, o), 2.0f);
+        fill_buffer_f32(myds_v41_snapshot_get_previous_score(g, o), 0.0f);
+    }
+    myds_v41_snapshot_set_engram_history(g, 11, 22, 33);
+    myds_v41_snapshot_set_positions(g, 1024, 1024);
+
+    assert(myds_v41_snapshot_store_now(g, 1024));
+    assert(myds_v41_snapshot_get_pos(g, 0) == 1024);
+    assert(myds_v41_snapshot_best(g, 1024) == 1024);
+
+    /* 2. Advance live state to pos 1026 */
+    for (uint32_t l = 0; l < 40; l++) {
+        fill_buffer_f32(myds_v41_snapshot_get_window(g, l), 8.0f);
+    }
+    for (uint32_t o = 0; o < 4; o++) {
+        fill_buffer_f32(myds_v41_snapshot_get_previous_kv(g, o), 3.0f);
+        fill_buffer_f32(myds_v41_snapshot_get_previous_score(g, o), 1.0f);
+    }
+    myds_v41_snapshot_set_engram_history(g, 77, 88, 99);
+    myds_v41_snapshot_set_positions(g, 1026, 1026);
+
+    /* 3. Inject commit failure on the 2nd commit_batch call (the batch commit) */
+    myds_metal_inject_commit_failure(2);
+    stored = myds_v41_snapshot_store_now(g, 1026);
+    assert(!stored);
+    assert(myds_metal_get_commit_call_count() == 2);
+
+    /* Slot 0 MUST be invalidated */
+    assert(myds_v41_snapshot_get_pos(g, 0) == 0);
+    assert(myds_v41_snapshot_get_staged_pos(g, 0) == 0);
+    assert(myds_v41_snapshot_best(g, 1024) == 0);
+    assert(myds_v41_snapshot_best(g, 1026) == 0);
+    assert(!myds_v41_snapshot_restore(g, 1024));
+    assert(!myds_v41_snapshot_restore(g, 1026));
+
+    myds_metal_inject_commit_failure(0);
+
+    /* ── Case 3: Subsequent successful store recovers normal operation ── */
+    /* 1. Advance to 1027 and store without faults */
+    for (uint32_t l = 0; l < 40; l++) {
+        fill_buffer_f32(myds_v41_snapshot_get_window(g, l), 10.0f);
+    }
+    for (uint32_t o = 0; o < 4; o++) {
+        fill_buffer_f32(myds_v41_snapshot_get_previous_kv(g, o), 5.0f);
+        fill_buffer_f32(myds_v41_snapshot_get_previous_score(g, o), 6.0f);
+    }
+    myds_v41_snapshot_set_engram_history(g, 101, 102, 103);
+    myds_v41_snapshot_set_positions(g, 1027, 1027);
+
+    stored = myds_v41_snapshot_store_now(g, 1027);
+    assert(stored);
+    assert(myds_v41_snapshot_get_pos(g, 0) == 1027);
+    assert(myds_v41_snapshot_get_staged_pos(g, 0) == 0);
+    assert(myds_v41_snapshot_best(g, 1027) == 1027);
+
+    /* 2. Zero out live buffers and restore from 1027 */
+    for (uint32_t l = 0; l < 40; l++) {
+        fill_buffer_f32(myds_v41_snapshot_get_window(g, l), 0.0f);
+    }
+    for (uint32_t o = 0; o < 4; o++) {
+        fill_buffer_f32(myds_v41_snapshot_get_previous_kv(g, o), 0.0f);
+        fill_buffer_f32(myds_v41_snapshot_get_previous_score(g, o), 0.0f);
+    }
+    myds_v41_snapshot_set_engram_history(g, 0, 0, 0);
+    myds_v41_snapshot_set_positions(g, 0, 0);
+
+    assert(myds_v41_snapshot_restore(g, 1027));
+    assert(myds_v41_snapshot_get_valid(g));
+
+    uint32_t hist[3];
+    myds_v41_snapshot_get_engram_history(g, hist);
+    assert(hist[0] == 101 && hist[1] == 102 && hist[2] == 103);
+
+    for (uint32_t l = 0; l < 40; l++) {
+        check_buffer_f32(myds_v41_snapshot_get_window(g, l), 10.0f);
+    }
+    for (uint32_t o = 0; o < 4; o++) {
+        check_buffer_f32(myds_v41_snapshot_get_previous_kv(g, o), 5.0f);
+        check_buffer_f32(myds_v41_snapshot_get_previous_score(g, o), 6.0f);
+    }
+
+    myds_v41_context_free(g);
+    printf("  [PASS] P1: Snapshot slot 0 invalidation on copy/commit failure prevents selecting corrupted state, and recovers cleanly on next store\n");
+}
+
 int main(void) {
     printf("Running P1 Regression Verification Suite:\n");
     test_p1_response_id_lifecycle();
@@ -673,6 +835,7 @@ int main(void) {
     test_p1_same_process_large_model_isolation();
     test_p1_metal_fused_add_fallback();
     test_p2_moe_kernel_and_pso_validation();
+    test_p1_snapshot_overwrite_failure();
     printf("All P1 Regression Verifications PASSED!\n");
     return 0;
 }

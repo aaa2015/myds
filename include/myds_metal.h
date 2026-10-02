@@ -293,6 +293,12 @@ void     myds_metal_barrier(void);
 void     myds_metal_set_auto_barrier(int enable);
 bool     myds_trace_active(void);
 
+/* Diagnostic fault injection for testing (0 = disabled) */
+void     myds_metal_inject_copy_failure(uint32_t fail_at_call_index);
+void     myds_metal_inject_commit_failure(uint32_t fail_at_call_index);
+uint32_t myds_metal_get_copy_call_count(void);
+uint32_t myds_metal_get_commit_call_count(void);
+
 /* Shared Event management for overlapping router gate with shared expert.
  * commit_and_wait_event waits only through the signal point; subsequent work
  * remains in flight until commit_batch, synchronize, or cleanup waits for it. */

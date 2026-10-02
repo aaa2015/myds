@@ -808,6 +808,29 @@ void myds_metal_cleanup(void) {
 }
 
 
+static uint32_t g_inject_copy_fail_at = 0;
+static uint32_t g_inject_copy_calls = 0;
+static uint32_t g_inject_commit_fail_at = 0;
+static uint32_t g_inject_commit_calls = 0;
+
+void myds_metal_inject_copy_failure(uint32_t fail_at_call_index) {
+    g_inject_copy_fail_at = fail_at_call_index;
+    g_inject_copy_calls = 0;
+}
+
+void myds_metal_inject_commit_failure(uint32_t fail_at_call_index) {
+    g_inject_commit_fail_at = fail_at_call_index;
+    g_inject_commit_calls = 0;
+}
+
+uint32_t myds_metal_get_copy_call_count(void) {
+    return g_inject_copy_calls;
+}
+
+uint32_t myds_metal_get_commit_call_count(void) {
+    return g_inject_commit_calls;
+}
+
 int myds_metal_begin_batch(void) {
     if (!g_queue && !myds_metal_init(NULL)) return 0;
     if (g_batch_cb) return 1;
@@ -817,6 +840,19 @@ int myds_metal_begin_batch(void) {
 }
 
 int myds_metal_commit_batch(void) {
+    if (g_inject_commit_fail_at) {
+        g_inject_commit_calls++;
+        if (g_inject_commit_calls == g_inject_commit_fail_at) {
+            if (g_batch_cb) {
+                close_compute_encoder();
+                id<MTLCommandBuffer> cb = g_batch_cb;
+                g_batch_cb = nil;
+                [cb commit];
+                [cb waitUntilCompleted];
+            }
+            return 0;
+        }
+    }
     if (!g_batch_cb) return wait_inflight_commands();
     close_compute_encoder();
     id<MTLCommandBuffer> cb = g_batch_cb;
@@ -1292,6 +1328,10 @@ int myds_metal_dispatch_kernel_constants(const char *name, const void *args, siz
 
 int myds_metal_buffer_copy(myds_metal_buffer_t *dst, size_t dst_offset,
     const myds_metal_buffer_t *src, size_t src_offset, size_t bytes) {
+    if (g_inject_copy_fail_at) {
+        g_inject_copy_calls++;
+        if (g_inject_copy_calls == g_inject_copy_fail_at) return 0;
+    }
     if (!g_initialized || !dst || !src || !dst->mtl_buf || !src->mtl_buf ||
         dst_offset > dst->size || bytes > dst->size-dst_offset ||
         src_offset > src->size || bytes > src->size-src_offset) return 0;

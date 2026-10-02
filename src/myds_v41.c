@@ -146,31 +146,42 @@ static uint32_t snapshot_slot_for(uint32_t p, bool is_last) {
 }
 /* 处理完位置 p 之后，记下 engram 的滚动状态。在 engram 循环里调用（层循环之前）。
  * ★ 事务契约：这里仅暂存 engram 状态与目标位置到 staged 槽，绝不提前置 snap_pos，
- * 避免在各层窗口环拷贝完成前被 snapshot_best 抢先选出半状态。 */
+ * 避免在各层窗口环拷贝完成前被 snapshot_best 抢先选出半状态。
+ * 若该槽此前存有旧快照，在此处先使旧发布标签失效，避免覆盖失败时旧标签仍有效。 */
 static void snapshot_store_engram(myds_v41_context_t *g, uint32_t p, bool is_last) {
     if (!g->snap_enabled || p < V41_SNAP_MIN) return;
     if (!is_last && (p % V41_SNAP_STRIDE)) return;
     const uint32_t s = snapshot_slot_for(p, is_last);
+    g->snap_pos[s] = 0;
     g->snap_staged_pos[s] = p;
     g->snap_engram[s] = g->engram->history;
 }
 /* 在层循环里、每个 chunk 结束时调用：把【本层】在 p 处的窗口环存进对应槽。
  * 只有当最后一层（il == V41_LAYERS-1）也保存完成，并且同步保存压缩器的 previous_kv/score
- * 之后，才正式发布 g->snap_pos[s] = p。 */
+ * 之后，才正式发布 g->snap_pos[s] = p。任一步失败都清除 staged/published 标记。 */
 static bool snapshot_store_window(myds_v41_context_t *g, uint32_t il, uint32_t p, bool is_last) {
     if (!g->snap_enabled || p < V41_SNAP_MIN) return true;
     if (!is_last && (p % V41_SNAP_STRIDE)) return true;
     const uint32_t s = snapshot_slot_for(p, is_last);
     if (g->snap_staged_pos[s] != p) return true;
     const size_t bytes = (size_t)V41_WINDOW * V41_HEAD_DIM * 4u;
-    if (!myds_metal_buffer_copy(g->snap_window[s], (size_t)il * bytes, g->window[il], 0, bytes))
+    if (!myds_metal_buffer_copy(g->snap_window[s], (size_t)il * bytes, g->window[il], 0, bytes)) {
+        g->snap_pos[s] = 0;
+        g->snap_staged_pos[s] = 0;
         return false;
+    }
     if (il == V41_LAYERS - 1u) {
         for (uint32_t o = 0; o < 4u; ++o) {
-            if (!myds_metal_buffer_copy(g->snap_prev_kv[s][o], 0, g->previous_kv[o], 0, 512 * 4u))
+            if (!myds_metal_buffer_copy(g->snap_prev_kv[s][o], 0, g->previous_kv[o], 0, 512 * 4u)) {
+                g->snap_pos[s] = 0;
+                g->snap_staged_pos[s] = 0;
                 return false;
-            if (!myds_metal_buffer_copy(g->snap_prev_score[s][o], 0, g->previous_score[o], 0, 512 * 4u))
+            }
+            if (!myds_metal_buffer_copy(g->snap_prev_score[s][o], 0, g->previous_score[o], 0, 512 * 4u)) {
+                g->snap_pos[s] = 0;
+                g->snap_staged_pos[s] = 0;
                 return false;
+            }
         }
         g->snap_pos[s] = p;
         g->snap_staged_pos[s] = 0;
@@ -180,9 +191,14 @@ static bool snapshot_store_window(myds_v41_context_t *g, uint32_t il, uint32_t p
 /* prefill 结束后由引擎调用：把【当前状态】存进末尾槽（0 号）。
  * ★ 批量提交：40 层窗口 + 4 previous KV + 4 previous score = 48 次复制，
  *   在同一个 command buffer 中编码，一次提交/等待。逐次提交路径（每次复制
- *   单独创建 CB → commit → waitUntilCompleted）实测 ~9.5 ms，批量 ~1.3 ms。 */
+ *   单独创建 CB → commit → waitUntilCompleted）实测 ~9.5 ms，批量 ~1.3 ms。
+ * ★ 事务一致性：覆盖 slot 0 前先清除其 snap_pos 与 snap_staged_pos，确保若复制
+ *   或 GPU 提交失败，旧快照标签不会残留指向新旧层混合的数据。 */
 bool myds_v41_snapshot_store_now(myds_v41_context_t *g, uint32_t p) {
     if (!g || !g->snap_enabled || !p || p < V41_SNAP_MIN) return true;
+    /* 首次覆盖 slot 0 前使原发布标签和 staged 标记失效。 */
+    g->snap_pos[0] = 0;
+    g->snap_staged_pos[0] = 0;
     /* 先把调用方可能遗留的 in-flight 工作提交完成，保证窗口环/previous 数据已落定。 */
     if (!myds_metal_commit_batch()) return false;
     /* 开一个新 batch，把全部 48 次复制编进同一 command buffer。 */
@@ -197,14 +213,20 @@ bool myds_v41_snapshot_store_now(myds_v41_context_t *g, uint32_t p) {
         if (!myds_metal_buffer_copy(g->snap_prev_score[0][o], 0, g->previous_score[o], 0, 512 * 4u))
             goto store_fail;
     }
-    if (!myds_metal_commit_batch()) return false;
+    if (!myds_metal_commit_batch()) {
+        g->snap_pos[0] = 0;
+        g->snap_staged_pos[0] = 0;
+        return false;
+    }
     /* GPU 操作成功后才发布快照位置和有效状态。 */
     g->snap_engram[0] = g->engram->history;   /* engram 的 position 恒等于 p（每 token 推进一次） */
     g->snap_pos[0] = p;
     return true;
 store_fail:
-    /* 提交失败路径：提交残余 batch（可能部分编码），不发布快照。
+    /* 复制失败路径：提交残余 batch（可能部分编码），确保不发布快照。
      * 快照缺失的后果只是下一个请求无法从此点续跑（退回全量 prefill），不会静默出错。 */
+    g->snap_pos[0] = 0;
+    g->snap_staged_pos[0] = 0;
     (void)myds_metal_commit_batch();
     return false;
 }
@@ -235,7 +257,7 @@ bool myds_v41_snapshot_restore(myds_v41_context_t *g, uint32_t p) {
             if (!myds_metal_buffer_copy(g->previous_score[o], 0, g->snap_prev_score[s][o], 0, 512 * 4u))
                 goto restore_fail;
         }
-        if (!myds_metal_commit_batch()) return false;
+        if (!myds_metal_commit_batch()) goto restore_fail;
         /* GPU 操作成功后才更新 CPU 状态，保证不会在 GPU 复制失败时留下半初始化的状态。 */
         g->engram->history = g->snap_engram[s];
         g->engram->position = p;
@@ -247,6 +269,90 @@ restore_fail:
         return false;
     }
     return false;
+}
+
+/* ── 快照诊断与单测夹具 ── */
+myds_v41_context_t *myds_v41_context_create_snapshot_fixture(void) {
+    myds_v41_context_t *g = calloc(1, sizeof(*g));
+    if (!g) return NULL;
+    g->engram = calloc(1, sizeof(*g->engram));
+    if (!g->engram) { free(g); return NULL; }
+    for (uint32_t o = 0; o < 2; o++) g->engram->table[o].fd = -1;
+    g->snap_enabled = true;
+    for (uint32_t l = 0; l < V41_LAYERS; l++) {
+        g->window[l] = myds_metal_buffer_alloc(V41_WINDOW * V41_HEAD_DIM * 4u);
+        if (!g->window[l]) goto fail;
+    }
+    for (uint32_t s = 0; s < V41_SNAP_SLOTS; s++) {
+        g->snap_window[s] = myds_metal_buffer_alloc(V41_LAYERS * V41_WINDOW * V41_HEAD_DIM * 4u);
+        if (!g->snap_window[s]) goto fail;
+        for (uint32_t o = 0; o < 4; o++) {
+            g->snap_prev_kv[s][o] = myds_metal_buffer_alloc(512 * 4u);
+            g->snap_prev_score[s][o] = myds_metal_buffer_alloc(512 * 4u);
+            if (!g->snap_prev_kv[s][o] || !g->snap_prev_score[s][o]) goto fail;
+        }
+    }
+    for (uint32_t o = 0; o < 4; o++) {
+        g->previous_kv[o] = myds_metal_buffer_alloc(512 * 4u);
+        g->previous_score[o] = myds_metal_buffer_alloc(512 * 4u);
+        if (!g->previous_kv[o] || !g->previous_score[o]) goto fail;
+    }
+    g->valid = true;
+    return g;
+fail:
+    myds_v41_context_free(g);
+    return NULL;
+}
+
+uint32_t myds_v41_snapshot_get_pos(const myds_v41_context_t *g, uint32_t slot) {
+    return (g && slot < V41_SNAP_SLOTS) ? g->snap_pos[slot] : 0;
+}
+
+uint32_t myds_v41_snapshot_get_staged_pos(const myds_v41_context_t *g, uint32_t slot) {
+    return (g && slot < V41_SNAP_SLOTS) ? g->snap_staged_pos[slot] : 0;
+}
+
+myds_metal_buffer_t *myds_v41_snapshot_get_window(myds_v41_context_t *g, uint32_t layer) {
+    return (g && layer < V41_LAYERS) ? g->window[layer] : NULL;
+}
+
+myds_metal_buffer_t *myds_v41_snapshot_get_snap_window(myds_v41_context_t *g, uint32_t slot) {
+    return (g && slot < V41_SNAP_SLOTS) ? g->snap_window[slot] : NULL;
+}
+
+myds_metal_buffer_t *myds_v41_snapshot_get_previous_kv(myds_v41_context_t *g, uint32_t o) {
+    return (g && o < 4) ? g->previous_kv[o] : NULL;
+}
+
+myds_metal_buffer_t *myds_v41_snapshot_get_previous_score(myds_v41_context_t *g, uint32_t o) {
+    return (g && o < 4) ? g->previous_score[o] : NULL;
+}
+
+void myds_v41_snapshot_set_engram_history(myds_v41_context_t *g, uint32_t t0, uint32_t t1, uint32_t t2) {
+    if (g && g->engram) {
+        g->engram->history.tail[0] = t0;
+        g->engram->history.tail[1] = t1;
+        g->engram->history.tail[2] = t2;
+    }
+}
+
+void myds_v41_snapshot_get_engram_history(const myds_v41_context_t *g, uint32_t out[3]) {
+    if (g && g->engram && out) {
+        out[0] = g->engram->history.tail[0];
+        out[1] = g->engram->history.tail[1];
+        out[2] = g->engram->history.tail[2];
+    }
+}
+
+void myds_v41_snapshot_set_positions(myds_v41_context_t *g, uint32_t engram_pos, uint32_t next_pos) {
+    if (g) {
+        if (g->engram) g->engram->position = engram_pos;
+        g->next_position = next_pos;
+    }
+}
+
+bool myds_v41_snapshot_get_valid(const myds_v41_context_t *g) {
+    return g ? g->valid : false;
 }
 
 
