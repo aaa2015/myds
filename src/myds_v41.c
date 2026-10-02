@@ -1845,8 +1845,6 @@ struct v41_chunk_workspace_s {
     myds_metal_buffer_t *qr_norm[V41_MAX_CHUNK];
     myds_metal_buffer_t *q[V41_MAX_CHUNK];
     myds_metal_buffer_t *kv_act[V41_MAX_CHUNK];
-    myds_metal_buffer_t *attn_heads[V41_MAX_CHUNK];
-    myds_metal_buffer_t *attn_low[V41_MAX_CHUNK];
     myds_metal_buffer_t *attn_out[V41_MAX_CHUNK];
     myds_metal_buffer_t *after_attn[V41_MAX_CHUNK];
     myds_metal_buffer_t *attn_split[V41_MAX_CHUNK];
@@ -1902,8 +1900,6 @@ static void v41_chunk_workspace_free(v41_chunk_workspace_t *cw) {
         if (cw->qr_norm[t]) myds_metal_buffer_free(cw->qr_norm[t]);
         if (cw->q[t]) myds_metal_buffer_free(cw->q[t]);
         if (cw->kv_act[t]) myds_metal_buffer_free(cw->kv_act[t]);
-        if (cw->attn_heads[t]) myds_metal_buffer_free(cw->attn_heads[t]);
-        if (cw->attn_low[t]) myds_metal_buffer_free(cw->attn_low[t]);
         if (cw->attn_out[t]) myds_metal_buffer_free(cw->attn_out[t]);
         if (cw->after_attn[t]) myds_metal_buffer_free(cw->after_attn[t]);
         if (cw->attn_split[t]) myds_metal_buffer_free(cw->attn_split[t]);
@@ -2088,8 +2084,6 @@ static v41_chunk_workspace_t *v41_chunk_workspace_create(uint32_t capacity, uint
         SUB_V(qr_norm, qr_norm_buf, 1280, 1280);
         SUB_V(q, q_buf, V41_HEADS * 512, V41_HEADS * 512);
         SUB_V(kv_act, kv_act_buf, 512, 512);
-        SUB_V(attn_heads, attn_heads_buf, V41_HEADS * 512, V41_HEADS * 512);
-        SUB_V(attn_low, attn_low_buf, 8192, 8192);
         SUB_V(attn_out, attn_out_buf, V41_DIM, V41_DIM);
         SUB_V(after_attn, after_attn_buf, 4 * V41_DIM, 4 * V41_DIM);
         SUB_V(attn_split, attn_split_buf, 24, 24);

@@ -7,6 +7,9 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
 
 static void print_usage(const char *prog) {
     printf("myds - Minimal DeepSeek V4 / V4.1 Inference Engine on Apple Silicon Metal\n\n");
@@ -59,6 +62,9 @@ static void token_stream_printer(const char *piece, size_t length, int32_t token
 }
 
 int main(int argc, char *argv[]) {
+#if defined(__APPLE__)
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
     const char *model_path = NULL;
     const char *prompt = NULL;
     const char *host = "0.0.0.0";

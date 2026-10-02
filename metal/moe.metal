@@ -3723,8 +3723,10 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
             g = min(g, c);
             u = clamp(u, -c, c);
         }
-        dst_gate_f32[out_row] = gate;
-        dst_up_f32[out_row] = up;
+        if (act.write_clamped != 0) {
+            dst_gate_f32[out_row] = gate;
+            dst_up_f32[out_row] = up;
+        }
         const float silu = g / (1.0f + exp(-g));
         dst_mid_f32[out_row] = silu * u * route_weight;
     }
@@ -3915,8 +3917,10 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_batch_f32(
                 g = min(g, c);
                 u = clamp(u, -c, c);
             }
-            dst_gate_f32[out_row] = gate;
-            dst_up_f32[out_row] = up;
+            if (act.write_clamped != 0) {
+                dst_gate_f32[out_row] = gate;
+                dst_up_f32[out_row] = up;
+            }
             const float silu = g / (1.0f + exp(-g));
             dst_mid_f32[out_row] = silu * u * route_weight;
         }
@@ -4068,8 +4072,10 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_pack2_overlap_f32(
             g = min(g, c);
             u = clamp(u, -c, c);
         }
-        dst_gate_f32[out_row] = gate;
-        dst_up_f32[out_row] = up;
+        if (act.write_clamped != 0) {
+            dst_gate_f32[out_row] = gate;
+            dst_up_f32[out_row] = up;
+        }
         const float silu = g / (1.0f + exp(-g));
         dst_mid_f32[out_row] = silu * u * route_weight;
     }

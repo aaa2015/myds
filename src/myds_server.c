@@ -17,6 +17,9 @@
 #include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
 
 static volatile sig_atomic_t g_running = 1;
 static int g_server_fd = -1;
@@ -2573,6 +2576,9 @@ typedef struct {
 } server_client_job_t;
 
 static void *server_client_thread(void *arg) {
+#if defined(__APPLE__)
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
     server_client_job_t *job = (server_client_job_t *)arg;
     handle_client(job->client_fd, job->ctx, job->model_alias, job->client_ip, job->client_port);
     free(job);
@@ -2580,6 +2586,9 @@ static void *server_client_thread(void *arg) {
 }
 
 int myds_server_start(myds_context_t *ctx, const char *host, int port, const char *model_alias) {
+#if defined(__APPLE__)
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
