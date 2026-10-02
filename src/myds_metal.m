@@ -2570,7 +2570,8 @@ int myds_metal_routed_moe_batch(
             const NSUInteger hids_bytes = (NSUInteger)n_routed_experts * (NSUInteger)n_tok * sizeof(int32_t);
             const NSUInteger work_offset = (tpe_bytes + hids_bytes + 7u) & ~7u;
             const uint64_t pair_rows = (uint64_t)n_activated_experts * (uint64_t)n_tok;
-            const uint64_t work_cap = (pair_rows + 31u * (uint32_t)n_routed_experts + 31u) / 32u;
+            const uint64_t max_active_exp = (pair_rows < (uint64_t)n_routed_experts) ? pair_rows : (uint64_t)n_routed_experts;
+            const uint64_t work_cap = (pair_rows + 31u * max_active_exp + 31u) / 32u;
             const NSUInteger work_item_bytes = 2u * sizeof(uint32_t);
             const NSUInteger total_bytes = work_offset + 8u + (NSUInteger)work_cap * work_item_bytes;
 

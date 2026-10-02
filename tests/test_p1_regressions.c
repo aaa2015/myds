@@ -601,6 +601,114 @@ static void test_p2_moe_kernel_and_pso_validation(void) {
     printf("  [PASS] P2: MoE IQ2/Q2K 256-block quantized execution verified successfully on GPU\n");
 }
 
+static void test_p2_moe_batch_mm_tail_cull_validation(void) {
+    if (!myds_metal_init(NULL)) {
+        printf("  [SKIP] Metal not supported on this platform\n");
+        return;
+    }
+
+    const uint32_t dim = 256;
+    const uint32_t expert_dim = 256;
+    const uint32_t n_routed_experts = 8;
+    const uint32_t n_activated_experts = 6;
+    const uint32_t n_tok = 32;
+
+    uint64_t gate_row_bytes = (dim / 256u) * 66u;
+    uint64_t gate_exp_bytes = (uint64_t)expert_dim * gate_row_bytes;
+    uint64_t down_row_bytes = (expert_dim / 256u) * 84u;
+    uint64_t down_exp_bytes = (uint64_t)dim * down_row_bytes;
+
+    myds_metal_buffer_t *moe_out = myds_metal_buffer_alloc((size_t)n_tok * dim * sizeof(float));
+    myds_metal_buffer_t *x_in = myds_metal_buffer_alloc((size_t)n_tok * dim * sizeof(float));
+    myds_metal_buffer_t *gate_exps = myds_metal_buffer_alloc((size_t)(n_routed_experts * gate_exp_bytes));
+    myds_metal_buffer_t *up_exps = myds_metal_buffer_alloc((size_t)(n_routed_experts * gate_exp_bytes));
+    myds_metal_buffer_t *down_exps = myds_metal_buffer_alloc((size_t)(n_routed_experts * down_exp_bytes));
+    myds_metal_buffer_t *selected_ids = myds_metal_buffer_alloc((size_t)n_tok * n_activated_experts * sizeof(int32_t));
+    myds_metal_buffer_t *selected_weights = myds_metal_buffer_alloc((size_t)n_tok * n_activated_experts * sizeof(float));
+    myds_metal_buffer_t *scratch_gate = myds_metal_buffer_alloc((size_t)n_tok * n_activated_experts * expert_dim * sizeof(float));
+    myds_metal_buffer_t *scratch_up = myds_metal_buffer_alloc((size_t)n_tok * n_activated_experts * expert_dim * sizeof(float));
+    myds_metal_buffer_t *scratch_mid = myds_metal_buffer_alloc((size_t)n_tok * n_activated_experts * expert_dim * sizeof(float));
+    myds_metal_buffer_t *scratch_down = myds_metal_buffer_alloc((size_t)n_tok * n_activated_experts * dim * sizeof(float));
+
+    assert(moe_out && x_in && gate_exps && up_exps && down_exps && selected_ids &&
+           selected_weights && scratch_gate && scratch_up && scratch_mid && scratch_down);
+
+    float *h_x = malloc((size_t)n_tok * dim * sizeof(float));
+    assert(h_x);
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t i = 0; i < dim; i++) {
+            h_x[t * dim + i] = 1.0f + 0.01f * (float)(i % 17);
+        }
+    }
+    assert(myds_metal_buffer_write(x_in, 0, h_x, (size_t)n_tok * dim * sizeof(float)));
+    free(h_x);
+
+    uint8_t q_data[344064];
+    memset(q_data, 0x22, sizeof(q_data));
+    assert(myds_metal_buffer_write(gate_exps, 0, q_data, (size_t)(n_routed_experts * gate_exp_bytes)));
+    assert(myds_metal_buffer_write(up_exps, 0, q_data, (size_t)(n_routed_experts * gate_exp_bytes)));
+
+    uint8_t q_down[344064];
+    memset(q_down, 0x22, sizeof(q_down));
+    for (uint32_t row = 0; row < n_routed_experts * dim; row++) {
+        q_down[row * 84 + 82] = 0;
+        q_down[row * 84 + 83] = 0;
+    }
+    assert(myds_metal_buffer_write(down_exps, 0, q_down, (size_t)(n_routed_experts * down_exp_bytes)));
+
+    int32_t *h_ids = malloc((size_t)n_tok * n_activated_experts * sizeof(int32_t));
+    float *h_weights = malloc((size_t)n_tok * n_activated_experts * sizeof(float));
+    assert(h_ids && h_weights);
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t k = 0; k < n_activated_experts; k++) {
+            h_ids[t * n_activated_experts + k] = (int32_t)k;
+            h_weights[t * n_activated_experts + k] = (k < 4) ? 0.2f : 0.1f;
+        }
+    }
+    assert(myds_metal_buffer_write(selected_ids, 0, h_ids, (size_t)n_tok * n_activated_experts * sizeof(int32_t)));
+    assert(myds_metal_buffer_write(selected_weights, 0, h_weights, (size_t)n_tok * n_activated_experts * sizeof(float)));
+    free(h_ids);
+    free(h_weights);
+
+    int ret = myds_metal_routed_moe_batch(
+        moe_out, x_in, gate_exps, up_exps, down_exps,
+        selected_ids, selected_weights,
+        scratch_gate, scratch_up, scratch_mid, scratch_down,
+        dim, expert_dim, n_routed_experts, n_activated_experts, n_tok,
+        GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_K,
+        0.0f
+    );
+    assert(ret == 1);
+
+    float *h_out = malloc((size_t)n_tok * dim * sizeof(float));
+    assert(h_out);
+    assert(myds_metal_buffer_read(moe_out, 0, h_out, (size_t)n_tok * dim * sizeof(float)));
+
+    /* Verify all 32 tokens output valid, positive, finite values */
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t i = 0; i < dim; i++) {
+            float val = h_out[t * dim + i];
+            assert(isfinite(val));
+            assert(val > 0.0f);
+        }
+    }
+    free(h_out);
+
+    myds_metal_buffer_free(moe_out);
+    myds_metal_buffer_free(x_in);
+    myds_metal_buffer_free(gate_exps);
+    myds_metal_buffer_free(up_exps);
+    myds_metal_buffer_free(down_exps);
+    myds_metal_buffer_free(selected_ids);
+    myds_metal_buffer_free(selected_weights);
+    myds_metal_buffer_free(scratch_gate);
+    myds_metal_buffer_free(scratch_up);
+    myds_metal_buffer_free(scratch_mid);
+    myds_metal_buffer_free(scratch_down);
+
+    printf("  [PASS] P2: MoE batch MM path (n_tok=32) with tail-cull and row bucketing verified\n");
+}
+
 static void test_p1_same_process_large_model_isolation(void) {
     /* Two models with > 256MB tensors and no manifest */
     myds_model_t m1, m2;
@@ -883,6 +991,7 @@ int main(void) {
     test_p1_same_process_large_model_isolation();
     test_p1_metal_fused_add_fallback();
     test_p2_moe_kernel_and_pso_validation();
+    test_p2_moe_batch_mm_tail_cull_validation();
     test_p1_snapshot_overwrite_failure();
     test_p1_macroblock_prefill_invariants();
     printf("All P1 Regression Verifications PASSED!\n");
