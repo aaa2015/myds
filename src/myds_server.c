@@ -1297,7 +1297,18 @@ render_items:
             const prompt_json_node_t *tc = !prompt_absent_or_empty(&json, calls) ? calls
                                          : (!prompt_absent_or_empty(&json, call) ? call : NULL);
             const char *role_text = role && role->kind == PJ_STRING ? role->text : "user";
-            if (!valid || (role && role->kind != PJ_STRING) || (type && type->kind != PJ_STRING) || (messages && !role)) {
+            if (!valid || (role && role->kind != PJ_STRING) || (type && type->kind != PJ_STRING)) {
+                *why = "a message has a malformed role/type field";
+                goto done;
+            }
+            /* ★ {type:"reasoning"} —— 模型内部项，不是对话内容。
+             * OpenClaw 对 reasoning:true 的模型会把上一轮的 reasoning 项【连同历史一起回灌】
+             * （Responses 契约如此），而它在这里曾经被当成未知 type 直接拒掉 ⇒
+             * 任何【带历史的请求】都 400，整条链路不可用（实测 2026-10-01 与 10-02 两次踩中，
+             * 而当时的小探针因为不带历史而全绿 —— 所以【必须用真实轮次验收】）。
+             * 正确处置：安全跳过。它不贡献 prompt token，也不改变上下文。 */
+            if (type && !strcmp(type->text, "reasoning")) continue;
+            if (messages && !role) {
                 *why = "a message has a malformed role/type field";
                 goto done;
             }
@@ -1769,6 +1780,61 @@ static char *chat_tool_calls_delta_json(const myds_tool_call_t *calls, size_t co
     return b.data;
 }
 
+/* ── Responses：把流里那条【正文 message 项】（output_index 0）按契约收尾 ──
+ *
+ * 为什么必须有：本端点一开流就【无条件】发过
+ *   response.output_item.added(index 0, item=message, status=in_progress)
+ * 而工具轮次过去直接从 index 0 开始发 function_call ⇒ **同一个 output_index 被复用**。
+ * 客户端据此判定非法流（OpenClaw 的报错原文：“Responses stream reused active output index 0”）⇒
+ * 整轮失败。实测 2026-10-01 与 10-02 两次因此整条链路不可用。
+ *
+ * 修法：发 function_call（index 从 1 起，见 sse_emit_responses_function_calls）【之前】，
+ * 先把 index 0 这条 message 项按契约关掉：output_text.done → content_part.done → output_item.done。
+ * 文本取【工具块之前的正文】（调用方传 scontent_len），与本流已发的 delta 一致。 */
+static bool sse_emit_responses_close_message(myds_sse_stream_ctx_t *sctx,
+                                             const char *text, size_t text_len) {
+    if (!sctx || sctx->cancel_flag || sctx->failed) return false;
+    char *text_json = json_escape_alloc(text ? text : "", text ? text_len : 0);
+    if (!text_json) return false;
+    char *ev = format_alloc(
+        "event: response.output_text.done\n"
+        "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"content_index\":0,\"text\":\"%s\"}\n\n"
+        "event: response.content_part.done\n"
+        "data: {\"type\":\"response.content_part.done\",\"output_index\":0,\"content_index\":0,"
+        "\"part\":{\"type\":\"output_text\",\"text\":\"%s\"}}\n\n"
+        "event: response.output_item.done\n"
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,"
+        "\"item\":{\"type\":\"message\",\"id\":\"msg_myds_1\",\"role\":\"assistant\",\"status\":\"completed\","
+        "\"content\":[{\"type\":\"output_text\",\"text\":\"%s\"}]}}\n\n",
+        text_json, text_json, text_json);
+    free(text_json);
+    if (!ev) return false;
+    const bool ok = myds_server_send_all(sctx->client_fd, ev, strlen(ev));
+    free(ev);
+    return ok;
+}
+
+/* 工具轮次的 output 数组：先正文 message 项，再 function_call 项 ——
+ * 与流里实际 added 过的项保持一致（缺了 message 项会让汇总与增量对不上）。 */
+static char *responses_message_then_calls_output_json(const char *text, size_t text_len,
+                                                     const myds_tool_call_t *calls, size_t count) {
+    char *msg = responses_output_message_json(text, text_len);
+    char *fcs = responses_function_calls_output_json(calls, count);
+    if (!msg || !fcs) {
+        free(msg);
+        free(fcs);
+        return NULL;
+    }
+    const size_t ml = strlen(msg);   /* msg 形如 "[{...}]" */
+    const size_t fl = strlen(fcs);   /* fcs 形如 "[{...},...]" —— 自带方括号 */
+    /* 去掉 msg 的尾 ']' 与 fcs 的首 '['，拼成一条数组；直接接 fcs 会得到 `[{...},[...]]`
+     * （嵌套数组）⇒ 客户端报 "malformed server-sent event JSON"（实测踩中过）。 */
+    char *out = (ml > 0 && fl > 1) ? format_alloc("%.*s,%s", (int)(ml - 1u), msg, fcs + 1) : NULL;
+    free(msg);
+    free(fcs);
+    return out;
+}
+
 /* chat/completions：工具调用 delta + finish_reason=tool_calls + [DONE] */
 bool sse_emit_chat_tool_calls(myds_sse_stream_ctx_t *sctx, const myds_tool_call_t *calls, size_t count) {
     char *tc = chat_tool_calls_delta_json(calls, count);
@@ -1794,6 +1860,10 @@ bool sse_emit_chat_tool_calls(myds_sse_stream_ctx_t *sctx, const myds_tool_call_
  *   这一条曾经漏掉：事件看着是对的，但解析不了。 */
 bool sse_emit_responses_function_calls(myds_sse_stream_ctx_t *sctx,
                                               const myds_tool_call_t *calls, size_t count) {
+    /* ★ output_index 从 1 起：本端点开流时【无条件】发过一条正文 message 项（index 0）。
+     * 过去这里从 0 编号 ⇒ 同一个 output_index 被复用，客户端判为非法流
+     * （OpenClaw 报错原文：“Responses stream reused active output index 0”）⇒ 整轮失败。
+     * 调用方负责先把那条 message 项按契约收尾（sse_emit_responses_close_message）。 */
     for (size_t i = 0; i < count; ++i) {
         char ids[96];
         snprintf(ids, sizeof(ids), "fc_%zu", i + 1);
@@ -1802,7 +1872,7 @@ bool sse_emit_responses_function_calls(myds_sse_stream_ctx_t *sctx,
         /* added */
         ok = ok && DSML_PUTS(&ev, "event: response.output_item.added\n"
             "data: {\"type\":\"response.output_item.added\",\"output_index\":")
-            && dsml_putf(&ev, "%zu", i)
+            && dsml_putf(&ev, "%zu", i + 1)
             && DSML_PUTS(&ev, ",\"item\":{\"type\":\"function_call\",\"id\":\"")
             && DSML_PUTS(&ev, ids)
             && DSML_PUTS(&ev, "\",\"call_id\":\"")
@@ -1815,14 +1885,14 @@ bool sse_emit_responses_function_calls(myds_sse_stream_ctx_t *sctx,
             "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"")
             && DSML_PUTS(&ev, ids)
             && DSML_PUTS(&ev, "\",\"output_index\":")
-            && dsml_putf(&ev, "%zu", i)
+            && dsml_putf(&ev, "%zu", i + 1)
             && DSML_PUTS(&ev, ",\"delta\":\"")
             && dsml_put_escaped(&ev, calls[i].arguments, strlen(calls[i].arguments))
             && DSML_PUTS(&ev, "\"}\n\n");
         /* done */
         ok = ok && DSML_PUTS(&ev, "event: response.output_item.done\n"
             "data: {\"type\":\"response.output_item.done\",\"output_index\":")
-            && dsml_putf(&ev, "%zu", i)
+            && dsml_putf(&ev, "%zu", i + 1)
             && DSML_PUTS(&ev, ",\"item\":{\"type\":\"function_call\",\"id\":\"")
             && DSML_PUTS(&ev, ids)
             && DSML_PUTS(&ev, "\",\"call_id\":\"")
@@ -2359,14 +2429,22 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                     }
                 }
                 if (stool_count && !sctx.failed && !sctx.cancel_flag) {
-                    bool tsent = is_responses_endpoint
-                        ? sse_emit_responses_function_calls(&sctx, stool, stool_count)
-                        : sse_emit_chat_tool_calls(&sctx, stool, stool_count);
+                    bool tsent;
+                    if (is_responses_endpoint) {
+                        /* 顺序不能反：先把正文 message 项（index 0）按契约关掉，再发 function_call
+                         * （index 从 1 起）。否则 output_index 0 被复用 ⇒ 客户端判非法流。 */
+                        tsent = sse_emit_responses_close_message(&sctx, sctx.acc, scontent_len) &&
+                                sse_emit_responses_function_calls(&sctx, stool, stool_count);
+                    } else {
+                        tsent = sse_emit_chat_tool_calls(&sctx, stool, stool_count);
+                    }
                     if (!tsent) stop_reason = MYDS_STOP_CANCELLED;
                     /* ★ 工具轮次也必须收尾：客户端靠 response.completed 判定这一轮结束，
                      * 并从里面取【响应 id】—— 少了它，每个工具轮次都只能全量重放。 */
                     if (tsent && is_responses_endpoint) {
-                        char *items = responses_function_calls_output_json(stool, stool_count);
+                        /* output 数组要与流一致：先 message 项，再 function_call 项。 */
+                        char *items = responses_message_then_calls_output_json(
+                            sctx.acc, scontent_len, stool, stool_count);
                         const bool finished = items && sse_emit_responses_finish(
                             &sctx, model_alias, resp_id, (unsigned)prompt_tokens, (unsigned)final_tokens,
                             "", 0, items, 0);
