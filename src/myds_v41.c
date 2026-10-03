@@ -2401,6 +2401,19 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     const bool opt_prof_split3 = (getenv("MYDS_PROFILE_SPLIT3") != NULL);
     const bool opt_prof_moe = (getenv("MYDS_PROFILE_MOE") != NULL);
     const bool opt_prof_step1 = (getenv("MYDS_PROFILE_STEP1") != NULL);
+    /* 后缀收缩（suffix shrink，见 docs/SUFFIX_SHRINK_SPEC.md）：只处理因果依赖锥内的
+     * 尾部行。默认关（不设变量 ⇒ 行为与现在逐位一致）；阈值对齐 ds4：total_count >= 8192。 */
+    const char *suffix_env = getenv("MYDS_SUFFIX_SHRINK");
+    const bool opt_suffix_shrink = suffix_env && atoi(suffix_env) != 0;
+    /* 只在【per-query gather 路径】（默认）下开启：那条路径把每个 query 可见的
+     * 640 个键（128 滑窗 + 512 picks）gather 成紧凑段，内核看到的输入与 chunk
+     * 边界无关 ⇒ 收缩后各行结果与不收缩【逐位相同】。
+     * 关掉 gather（MYDS_ATTN_GATHER=0）时注意力走 slab 掩码路径，键在 slab 里的
+     * 块对齐随 chunk 长度变化 ⇒ 极点值可能差最后几位，本版未验证那种组合，直接不收缩。 */
+    const char *gather_env = getenv("MYDS_ATTN_GATHER");
+    const bool shrink_gather_ok = (!gather_env) || atoi(gather_env) != 0;
+    const bool suffix_shrink = opt_suffix_shrink && shrink_gather_ok &&
+                               (base_pos + n_tokens) >= 8192u;
     double prof_s1_norm = 0, prof_s1_mix = 0, prof_s1_split = 0, prof_s1_wsum = 0, prof_s1_norm2 = 0;
     const bool opt_disable_mm_attn_a = (getenv("MYDS_DISABLE_MM_ATTN_A") != NULL);
     double prof_engram = 0, prof_embedding = 0, prof_total_layers = 0;
@@ -2500,10 +2513,51 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             const bool compressed = ratio_for(il) != 0;
             moe_off = 0;
 
-            for (uint32_t c_start = 0; c_start < mb_len; c_start += chunk_size) {
+            /* ── 后缀收缩：本层只处理因果锥内的尾部行 ────────────────────────────
+             * 参考点取【本 macroblock 的末尾】B（不是整条 prompt 的末尾）：
+             *   层 il 的输出只需覆盖 [S(il), B)，S(il) = B - (1 + (39-il)*127)；
+             *   再往前 127 行 [S-127, S) 只算 KV（填窗口环，否则进入 S 时第一段 carry
+             *   是空的 ⇒ 误差会沿因果锥传到最后一行）。
+             * 取 B 的理由：每个 macroblock 都要把最后一层的窗口环推进到自己的末尾，
+             * 供下一个 macroblock 的 carry 使用；「相对 B 的锥」恰好同时满足
+             * 「KV 环维护」与「正确性」—— 因为 S(il-1) = S(il) - 127，上一层的输出
+             * 范围天生比本层宽 127 行，正好覆盖本层前端需要的输入。
+             * 短 macroblock（B-A 小于锥宽）⇒ s 被夹到 A ⇒ 整块全量，等价于关掉收缩。 */
+            const uint32_t total_eff = mb_base_pos + mb_len;
+            const uint32_t sh_need = 1u + (V41_LAYERS - 1u - il) * 127u;
+            const bool shrink_layer = suffix_shrink && il >= 20u;
+            uint32_t sh_loop_rel = 0, sh_full_rel = 0;
+            if (shrink_layer) {
+                uint32_t s = (total_eff > sh_need) ? total_eff - sh_need : 0u;
+                if (s < mb_base_pos) s = mb_base_pos;
+                uint32_t skv = (s > 127u) ? (s - 127u) : 0u;
+                if (skv < mb_base_pos) skv = mb_base_pos;
+                /* 层 20 例外：owner 3 的压缩 KV 与 index_cache 必须覆盖全部行
+                 * （后面所有层的 attention 都要读它们），所以它的「前端」从 A 开始，
+                 * 只是不做 attention/输出/FFN/MoE。 */
+                sh_loop_rel = (il == 20u) ? 0u : (skv - mb_base_pos);
+                sh_full_rel = s - mb_base_pos;
+            }
+            if (shrink_layer && il == 20u) {
+                static bool shrink_logged = false;
+                if (!shrink_logged) {
+                    shrink_logged = true;
+                    MYDS_LOG_I("V4.1 suffix shrink: on (total=%u, layer20 rows=%u..%u of %u)",
+                               base_pos + n_tokens, sh_full_rel, mb_len, mb_len);
+                }
+            }
+
+            for (uint32_t c_start = sh_loop_rel; c_start < mb_len; ) {
                 if (cancel_flag && *cancel_flag) goto cancelled;
                 uint32_t c_len = mb_len - c_start;
                 if (c_len > chunk_size) c_len = chunk_size;
+                /* 全量/前端的边界必须落在 chunk 边界上（一个 chunk 不能走两条路径） */
+                if (shrink_layer && c_start < sh_full_rel && c_start + c_len > sh_full_rel)
+                    c_len = sh_full_rel - c_start;
+                /* kv_only：只做「窗口环需要的 KV 投影」（层 20 还要做压缩器），
+                 * 不做 attention / 输出 / FFN / MoE，也不累加 moe_off。
+                 * 注意窗口环拷贝对两条路径都要做 —— 它正是前端存在的目的。 */
+                const bool kv_only = shrink_layer && (c_start + c_len <= sh_full_rel);
 
                 if (il == 1 || il == 14) {
                     uint32_t e = (il == 1 ? 0 : 1);
@@ -2623,6 +2677,8 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 
                 /* Step 3: Batched Q_B projection (reads 21 MB weight ONCE for all c_len tokens) */
                 TIME_START();
+                if (kv_only) { /* 前端只喂窗口环，Q 完全不用算 */ }
+                else {
                 if (!opt_skip_q_b)
                     CHECK(project_batch(cw->q_buf, base->attn_q_b, cw->qr_norm_buf, V41_HEADS * 512, 1280, c_len, base->attn_q_b_type, true));
 
@@ -2636,6 +2692,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                         TRACE("q_b", cw->q[t], V41_HEADS * 512);
                         TRACE("q_rope", cw->q[t], V41_HEADS * 512);
                     }
+                }
                 }
                 TIME_ACC(prof_step3);
 
@@ -2656,7 +2713,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                             CHECK(project_batch(cw->pool_score_buf, l->compressor_gate, cw->x_norm_buf, 512, V41_DIM, c_len, GGML_TYPE_F16, false));
                         }
                     }
-                    if (index_source(il)) {
+                    if (index_source(il) && !kv_only) {
                         CHECK(project_batch(cw->index_q_buf, l->index_q, cw->qr_norm_buf, V41_INDEX_HEADS * 128, 1280, c_len, GGML_TYPE_F16, true));
                         CHECK(project_batch(cw->index_weights_buf, l->index_proj, cw->x_norm_buf, V41_INDEX_HEADS, V41_DIM, c_len, GGML_TYPE_F16, true));
                     }
@@ -2684,7 +2741,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                         disp_compressor += myds_metal_dispatch_count() - dc0;
                     }
                 }
-                if (index_source(il)) {
+                if (index_source(il) && !kv_only) {
                     int batched = 0;
                     if (!opt_idx_per_token) {
                         batched = publish_indexer_chunk(ctx, il, c_start, c_len, mb_base_pos,
@@ -2730,7 +2787,19 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 }
 
                 uint64_t dr0 = myds_metal_dispatch_count();   /* 诊断 */
-                if (c_start == 0 && mb_base_pos != 0) {
+                /* carry：进入第一个【全量】chunk 之前，把前 127 行的 KV 从窗口环搬进
+                 * 注意力 slab。收缩后这个位置不再是 c_start==0（前端可能已经占掉了
+                 * 若干 chunk），但窗口环此刻恰好是 [S-128, S)（前端刚写进去）
+                 * ⇒ 用 sh_full_abs 当 base_pos 调用与原来完全同一支内核。 */
+                if (shrink_layer) {
+                    if (c_start == sh_full_rel) {
+                        phase = "carry stage";
+                        if (!myds_v41_gpu_carry_stage(g->gpu, g->window[il], mb_base_pos + c_start)) {
+                            MYDS_LOG_E("carry stage failed at layer %u (pos=%u)", il, mb_base_pos + c_start);
+                            goto fail;
+                        }
+                    }
+                } else if (c_start == 0 && mb_base_pos != 0) {
                     phase = "carry stage";
                     if (!myds_v41_gpu_carry_stage(g->gpu, g->window[il], mb_base_pos)) {
                         MYDS_LOG_E("carry stage failed at layer %u (mb_base_pos=%u)", il, mb_base_pos);
@@ -2749,6 +2818,8 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     if (run2 && !myds_metal_buffer_copy(g->window[il], 0, cw->kv_act_buf, (size_t)(t0 + run1) * 512 * 4u, (size_t)run2 * 512 * 4u)) goto fail;
                 }
 
+                if (kv_only) { /* 前端：attention 整体跳过（下面 !kv_only 段） */ }
+                else {
                 {
                     uint32_t n_comp = compressed ? (mb_base_pos + c_start + c_len) / ratio : 0;
                     phase = "chunk attention";
@@ -2767,6 +2838,8 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     }
                 }
 
+                }
+                if (!kv_only) {
                 if (do_prof && opt_prof_split2) {
                     TIME_START();
                     CHECK(myds_metal_commit_batch());
@@ -2925,6 +2998,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 moe_off += c_len;
 
                 if (moe_off == cw->moe_batch || c_start + c_len == mb_len) {
+                    /* 注：本分支只在全量 chunk 里可达（moe_off 只在全量 chunk 里累加） */
                     const uint32_t mb_moe_len = moe_off;
                     const uint32_t mb_moe_start = c_start + c_len - mb_moe_len;   /* 本批在 prompt 里的起点 */
                     myds_metal_barrier();
@@ -3002,6 +3076,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     }
                     moe_off = 0;
                 }
+                }  /* !kv_only */
                 /* ★ 前缀快照：本层在本 chunk 结束处的窗口环。时刻它正好含 [p-128, p-1]，
                  * 而这 128 槽随后会被后面的 token 覆盖 ⇒ 只能在这里存下来（事后无法回溯）。
                  * 与 engram 的保存用同一个确定性槽位映射，故两者必然属于同一个 p。 */
@@ -3018,6 +3093,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     disp_layer_all += myds_metal_dispatch_count() - disp_layer0;
                     disp_step58 += myds_metal_dispatch_count() - disp_layer0 - disp_step14;
                 }
+                c_start += c_len;
             } /* chunk loop */
         } /* layer loop */
 
