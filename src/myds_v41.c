@@ -2402,9 +2402,14 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     const bool opt_prof_moe = (getenv("MYDS_PROFILE_MOE") != NULL);
     const bool opt_prof_step1 = (getenv("MYDS_PROFILE_STEP1") != NULL);
     /* 后缀收缩（suffix shrink，见 docs/SUFFIX_SHRINK_SPEC.md）：只处理因果依赖锥内的
-     * 尾部行。默认关（不设变量 ⇒ 行为与现在逐位一致）；阈值对齐 ds4：total_count >= 8192。 */
+     * 尾部行。阈值对齐 ds4：total_count >= 8192。
+     *
+     * 默认【开】（2026-10-03 定）：真实负载是【纯顺序增长】—— 实测 62/62 次复用走
+     * 活序列（`resume from cached prefix`）、0 次走中途快照，而收缩不碰活序列
+     * ⇒ 零代价拿满收益（12.4k: 283→425 t/s）。要回旧行为用 `MYDS_SUFFIX_SHRINK=0`。
+     * （跨会话「兄弟请求」复用中途快照时会退化，那类负载需配 MYDS_SUFFIX_SHRINK_SHIFT。） */
     const char *suffix_env = getenv("MYDS_SUFFIX_SHRINK");
-    const bool opt_suffix_shrink = suffix_env && atoi(suffix_env) != 0;
+    const bool opt_suffix_shrink = !(suffix_env && atoi(suffix_env) == 0);
     /* 只在【per-query gather 路径】（默认）下开启：那条路径把每个 query 可见的
      * 640 个键（128 滑窗 + 512 picks）gather 成紧凑段，内核看到的输入与 chunk
      * 边界无关 ⇒ 收缩后各行结果与不收缩【逐位相同】。
