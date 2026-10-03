@@ -2414,6 +2414,29 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     const bool shrink_gather_ok = (!gather_env) || atoi(gather_env) != 0;
     const bool suffix_shrink = opt_suffix_shrink && shrink_gather_ok &&
                                (base_pos + n_tokens) >= 8192u;
+    /* 收缩前置段的「有效快照窗口」（见 docs/verification/2026-10-03-suffix-shrink-snapshot.md）：
+     * 层 il 的窗口环在 p 处【内容正确】的前提是 p ≥ B - shift（推导见层循环里的注释）。
+     *   shift = 0（默认）⇒ 与 6a 完全一致：只有 macroblock 末尾能发布快照，
+     *                    前置段仍从 S(il)-127 起跳（零额外开销）。
+     *   shift > 0       ⇒ 前置段从 A 起跑（chunk 末端落在 512 网格上），并在
+     *                    [B-shift, B] 上发布快照 ⇒ 每个 macroblock 多出 shift/512
+     *                    个可复用点。代价：层 il 多算 shift 行 KV（不做 attention/FFN/MoE）。 */
+    uint32_t shrink_shift = 0;
+    {
+        const char *se = getenv("MYDS_SUFFIX_SHRINK_SHIFT");
+        if (se && *se) {
+            const long v = atol(se);
+            if (v > 0) {
+                shrink_shift = (uint32_t)v;
+                /* 只有 512 网格点才可能成为快照点 ⇒ 向上取整到 STRIDE。 */
+                if (shrink_shift % V41_SNAP_STRIDE)
+                    shrink_shift = (shrink_shift / V41_SNAP_STRIDE + 1u) * V41_SNAP_STRIDE;
+                if (shrink_shift > macroblock_size) shrink_shift = macroblock_size;
+            } else if (v < 0) {
+                MYDS_LOG_W("MYDS_SUFFIX_SHRINK_SHIFT=%s 非法（需 >= 0），按 0 处理", se);
+            }
+        }
+    }
     double prof_s1_norm = 0, prof_s1_mix = 0, prof_s1_split = 0, prof_s1_wsum = 0, prof_s1_norm2 = 0;
     const bool opt_disable_mm_attn_a = (getenv("MYDS_DISABLE_MM_ATTN_A") != NULL);
     double prof_engram = 0, prof_embedding = 0, prof_total_layers = 0;
@@ -2515,34 +2538,49 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 
             /* ── 后缀收缩：本层只处理因果锥内的尾部行 ────────────────────────────
              * 参考点取【本 macroblock 的末尾】B（不是整条 prompt 的末尾）：
-             *   层 il 的输出只需覆盖 [S(il), B)，S(il) = B - (1 + (39-il)*127)；
-             *   再往前 127 行 [S-127, S) 只算 KV（填窗口环，否则进入 S 时第一段 carry
-             *   是空的 ⇒ 误差会沿因果锥传到最后一行）。
+             *   层 il 的输出只覆盖 [S(il), B)，S(il) = B - (1 + (39-il)*127) - shift；
+             *   [A, S(il)) 这段只算 KV（填窗口环）—— 它是「进入 S 时的 carry 引导」。
+             *   shift = 0 时引导段从 S(il)-127 起跳（6a 原样）；shift > 0 时从 A 起跳。
              * 取 B 的理由：每个 macroblock 都要把最后一层的窗口环推进到自己的末尾，
              * 供下一个 macroblock 的 carry 使用；「相对 B 的锥」恰好同时满足
              * 「KV 环维护」与「正确性」—— 因为 S(il-1) = S(il) - 127，上一层的输出
-             * 范围天生比本层宽 127 行，正好覆盖本层前端需要的输入。
+             * 范围天生比本层宽 127 行，正好覆盖本层进入 S 所需的输入。
              * 短 macroblock（B-A 小于锥宽）⇒ s 被夹到 A ⇒ 整块全量，等价于关掉收缩。 */
             const uint32_t total_eff = mb_base_pos + mb_len;
             const uint32_t sh_need = 1u + (V41_LAYERS - 1u - il) * 127u;
             const bool shrink_layer = suffix_shrink && il >= 20u;
+            /* 本层窗口环在 p 处【内容有效】的边界：p ≥ s(il)+1（s(il) = A + sh_full_rel）。
+             * 推导：环在 p 处装着 [p-128,p-1] 的 KV，要它们全对，这些行的输入残差必须都由
+             * 层 il-1 的【全量段】写出；层 il-1 的全量段起点 = s(il)-127
+             * ⇒ p-128 ≥ s(il)-127 ⇒ p ≥ s(il)+1。
+             * 发布要求【全部 40 层】都存过同一个 p ⇒ 全局紧界 = s(39)+1 = B - shift
+             * （s(39) = max(mb_base, B-1-shift)）；shift=0 时就是 B ⇒ 只有
+             * macroblock 末尾/序列末尾能发布（即 6a 行为；锥被夹到 A 时所有层都
+             * 满足 p ≥ A+1，与 6a 一样在各网格点发布 —— 那时整块都是全量，环本来就对）。 */
+            const uint32_t sh_valid_from = (total_eff > shrink_shift) ? total_eff - shrink_shift : 0u;
             uint32_t sh_loop_rel = 0, sh_full_rel = 0;
             if (shrink_layer) {
-                uint32_t s = (total_eff > sh_need) ? total_eff - sh_need : 0u;
+                const uint32_t sub = sh_need + shrink_shift;
+                uint32_t s = (total_eff > sub) ? total_eff - sub : 0u;
                 if (s < mb_base_pos) s = mb_base_pos;
-                uint32_t skv = (s > 127u) ? (s - 127u) : 0u;
-                if (skv < mb_base_pos) skv = mb_base_pos;
-                /* 层 20 例外：owner 3 的压缩 KV 与 index_cache 必须覆盖全部行
-                 * （后面所有层的 attention 都要读它们），所以它的「前端」从 A 开始，
-                 * 只是不做 attention/输出/FFN/MoE。 */
-                sh_loop_rel = (il == 20u) ? 0u : (skv - mb_base_pos);
                 sh_full_rel = s - mb_base_pos;
+                if (shrink_shift == 0u) {
+                    /* 默认（6a）路径：前置段只从 S(il)-127 起跳（层 20 从 A）。
+                     * 与已验证的 6a 逐位一致，且不多算任何 KV。 */
+                    uint32_t skv = (s > 127u) ? s - 127u : 0u;
+                    if (skv < mb_base_pos) skv = mb_base_pos;
+                    sh_loop_rel = (il == 20u) ? 0u : (skv - mb_base_pos);
+                }
+                /* shift>0：sh_loop_rel = 0 ⇒ 前置段从 A 起跑；A 是 STRIDE 的倍数，
+                 * 所以各层 chunk 末端都落在 512 网格上（否则中途快照点根本无法发布）。 */
             }
             if (shrink_layer && il == 20u) {
                 static bool shrink_logged = false;
                 if (!shrink_logged) {
                     shrink_logged = true;
-                    MYDS_LOG_I("V4.1 suffix shrink: on (total=%u, layer20 rows=%u..%u of %u)",
+                    MYDS_LOG_I("V4.1 suffix shrink[snapshot-guard v2]: front=%s shift=%u valid_from=%u "
+                               "(total=%u, layer20 rows=%u..%u of %u)",
+                               shrink_shift ? "all" : "skv", shrink_shift, sh_valid_from,
                                base_pos + n_tokens, sh_full_rel, mb_len, mb_len);
                 }
             }
@@ -2551,12 +2589,22 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 if (cancel_flag && *cancel_flag) goto cancelled;
                 uint32_t c_len = mb_len - c_start;
                 if (c_len > chunk_size) c_len = chunk_size;
+                /* shift>0：chunk 末端还要落在【绝对位置】的 512 网格上 —— 快照点只可能存在于
+                 * 网格点，而上面那句「模式边界必须落在 chunk 边界」会把 chunk 切到非网格的
+                 * s(il) 上，之后的 chunk 就全部错位、再也发布不了快照（实测：shift=2048 时
+                 * 续跑点仍然退到 8192 —— 就是这个错位造成的）。默认（shift=0）不动，
+                 * 保持 6a 行为（那时的错位恰好让中途快照发布不了，是我们想要的）。 */
+                if (shrink_shift) {
+                    const uint32_t abs0 = mb_base_pos + c_start;
+                    const uint32_t grid = ((abs0 + c_len) / V41_SNAP_STRIDE) * V41_SNAP_STRIDE;
+                    if (grid > abs0) c_len = grid - abs0;   /* 只在能缩短时对齐（不会变成 0） */
+                }
                 /* 全量/前端的边界必须落在 chunk 边界上（一个 chunk 不能走两条路径） */
                 if (shrink_layer && c_start < sh_full_rel && c_start + c_len > sh_full_rel)
                     c_len = sh_full_rel - c_start;
                 /* kv_only：只做「窗口环需要的 KV 投影」（层 20 还要做压缩器），
-                 * 不做 attention / 输出 / FFN / MoE，也不累加 moe_off。
-                 * 注意窗口环拷贝对两条路径都要做 —— 它正是前端存在的目的。 */
+                 * 不做 Q_A/Q_B 投影、attention / 输出 / FFN / MoE，也不累加 moe_off。
+                 * 注意窗口环拷贝对两条路径都要做 —— 它正是前置段存在的目的。 */
                 const bool kv_only = shrink_layer && (c_start + c_len <= sh_full_rel);
 
                 if (il == 1 || il == 14) {
@@ -2642,16 +2690,20 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 }
                 TIME_ACC(prof_step1);
 
-                /* Step 2: Batched Q_A and KV projections (reads weights ONCE for all c_len tokens) */
+                /* Step 2: Batched Q_A and KV projections (reads weights ONCE for all c_len tokens)
+                 * ★ 前缀段（kv_only）只需要 KV：Q_A/Q_B 都不必算（窗口环只用 KV）。
+                 *   层 20 保持原样（它要建 owner 3 的全局状态）。 */
+                const bool kv_only_skip_q = kv_only && il >= 21u;
                 TIME_START();
                 phase = "batched attention projections";
-                if (!opt_skip_q_a)
+                if (!opt_skip_q_a && !kv_only_skip_q)
                     CHECK(project_batch(cw->qr_buf, base->attn_q_a, cw->x_norm_buf, 1280, V41_DIM, c_len, base->attn_q_a_type, true));
                 if (!opt_skip_kv)
                     CHECK(project_batch(cw->kv_act_buf, base->attn_kv, cw->x_norm_buf, 512, V41_DIM, c_len, base->attn_kv_type, true));
 
                 if (!opt_skip_norm) {
-                    CHECK(myds_metal_v41_rmsnorm_batch(cw->qr_norm_buf, cw->qr_buf, base->attn_q_a_norm, 1280, c_len, m->norm_eps, true));
+                    if (!kv_only_skip_q)
+                        CHECK(myds_metal_v41_rmsnorm_batch(cw->qr_norm_buf, cw->qr_buf, base->attn_q_a_norm, 1280, c_len, m->norm_eps, true));
                     CHECK(myds_metal_v41_rmsnorm_batch(cw->kv_act_buf, cw->kv_act_buf, base->attn_kv_a_norm, 512, c_len, m->norm_eps, true));
                 }
 
@@ -2661,7 +2713,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 if (!opt_skip_kv_quant)
                     CHECK(myds_v41_gpu_quant(cw->kv_act_buf, 512, c_len, 1));
 
-                if (trace_on) {
+                if (trace_on && !kv_only) {   /* 前缀段不算 Q（il>=21），Q 的 trace 无意义 */
                     for (uint32_t t = 0; t < c_len; t++) {
                         uint32_t idx = c_start + t;
                         uint32_t pos = mb_base_pos + idx;
@@ -2788,18 +2840,22 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 
                 uint64_t dr0 = myds_metal_dispatch_count();   /* 诊断 */
                 /* carry：进入第一个【全量】chunk 之前，把前 127 行的 KV 从窗口环搬进
-                 * 注意力 slab。收缩后这个位置不再是 c_start==0（前端可能已经占掉了
-                 * 若干 chunk），但窗口环此刻恰好是 [S-128, S)（前端刚写进去）
-                 * ⇒ 用 sh_full_abs 当 base_pos 调用与原来完全同一支内核。 */
+                 * 注意力 slab。收缩后这个位置不再是 c_start==0（前置段可能已经占掉
+                 * 若干 chunk），但窗口环此刻恰好是 [S-128, S)（前置段刚写进去）
+                 * ⇒ 用 sh_full_abs 当 base_pos 调用与原来完全同一支内核。
+                 * ★ 位置 0 没有「前面的 127 行」，carry_stage 对 base_pos==0 返回失败；
+                 *   锥被夹到 A=0（首块 + 大 shift，或小 macroblock）时 sh_full_rel==0、
+                 *   c_start==0 ⇒ 必须跳过（否则整次 prefill 直接失败，实测 HTTP 500）。 */
+                const uint32_t carry_pos = mb_base_pos + c_start;
                 if (shrink_layer) {
-                    if (c_start == sh_full_rel) {
+                    if (c_start == sh_full_rel && carry_pos != 0u) {
                         phase = "carry stage";
-                        if (!myds_v41_gpu_carry_stage(g->gpu, g->window[il], mb_base_pos + c_start)) {
-                            MYDS_LOG_E("carry stage failed at layer %u (pos=%u)", il, mb_base_pos + c_start);
+                        if (!myds_v41_gpu_carry_stage(g->gpu, g->window[il], carry_pos)) {
+                            MYDS_LOG_E("carry stage failed at layer %u (pos=%u)", il, carry_pos);
                             goto fail;
                         }
                     }
-                } else if (c_start == 0 && mb_base_pos != 0) {
+                } else if (c_start == 0 && carry_pos != 0u) {
                     phase = "carry stage";
                     if (!myds_v41_gpu_carry_stage(g->gpu, g->window[il], mb_base_pos)) {
                         MYDS_LOG_E("carry stage failed at layer %u (mb_base_pos=%u)", il, mb_base_pos);
@@ -3079,10 +3135,22 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 }  /* !kv_only */
                 /* ★ 前缀快照：本层在本 chunk 结束处的窗口环。时刻它正好含 [p-128, p-1]，
                  * 而这 128 槽随后会被后面的 token 覆盖 ⇒ 只能在这里存下来（事后无法回溯）。
-                 * 与 engram 的保存用同一个确定性槽位映射，故两者必然属于同一个 p。 */
+                 * 与 engram 的保存用同一个确定性槽位映射，故两者必然属于同一个 p。
+                 *
+                 * ★★ 有效性门（2026-10-03，实测教训）：本层的环只有在 p ≥ s(il)+1 时
+                 * 内容才对；不满足就不写（也绝不让最深的那一层发布）—— 否则快照会带着
+                 * 「位置对得上、内容却来自旧残差」的环被兄弟请求选中续跑，输出静默错掉
+                 * （上机实证：front=all 但无此门时两臂在恢复点逐字节不同，max|Δ|=57.6）。 */
                 {
                     const uint32_t sp = mb_base_pos + c_start + c_len;
-                    if (!snapshot_store_window(g, il, sp, sp == base_pos + n_tokens)) goto fail;
+                    if (!shrink_layer || sp > mb_base_pos + sh_full_rel) {
+                        if (!snapshot_store_window(g, il, sp, sp == base_pos + n_tokens)) goto fail;
+                    }
+                    /* ★ 注意：拒绝时【不能】顺手清槽位 —— 槽是按位置模数映射的，同一个槽可能
+                     * 正存着另一个（有效的）已发布位置。2026-10-03 実测踩过：删掉这一句之前，
+                     * 末块里被拒的 sp 会把「本块末尾 B」的已发布快照一并清掉（实测 x/l 两臂
+                     * 的续跑点于是从 8192 退到 4096）。staged 标记留着无害：它只对同一个 p 生效，
+                     * 而位置单调递增 ⇒ 同一个 p 不会再被访问。 */
                 }
                 TIME_ACC(prof_step8);
 
