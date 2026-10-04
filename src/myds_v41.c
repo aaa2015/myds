@@ -1860,6 +1860,16 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
         return -1;
     }
     const bool trace_on = myds_trace_active();
+    /* A：decode 分段提交（MYDS_DECODE_SPLIT=N，N 段；未设/0/1 = 关 = 与以前完全一致）。
+     * 在层边界把已编码的部分 commit（不等），GPU 先跑前面的层，CPU 同时编码后面的层。
+     * 内核与顺序不变；缓冲是默认 tracked ⇒ 同一 queue 上跨 command buffer 的读写顺序由 Metal 保证。
+     * 上限约 7%（2026-10-04 powermetrics：GPU 已 93% 活跃）。trace 时不分段。 */
+    static int decode_split = -1;
+    if (decode_split < 0) {
+        const char *e = getenv("MYDS_DECODE_SPLIT");
+        const int n = e ? atoi(e) : 0;
+        decode_split = (n > 1 && n <= (int)V41_LAYERS) ? n : 0;
+    }
 #define CHECK(x) do { if (!(x)) goto fail; } while (0)
 #define TRACE(stage,buf,n) do { if (trace_on) CHECK(myds_trace_f32(stage,il,pos,buf,n)); } while (0)
     CHECK(myds_engram_prepare_token(g->engram,token,pos));
@@ -1941,6 +1951,11 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
         CHECK(myds_metal_buffer_copy(g->pre,0,g->ffn_split,0,4*4u));
         TRACE("layer_out",g->residual,4*V41_DIM);
         myds_metal_barrier();
+        if (decode_split && !trace_on && il + 1u < V41_LAYERS &&
+            ((il + 1u) * (uint32_t)decode_split) / V41_LAYERS != (il * (uint32_t)decode_split) / V41_LAYERS) {
+            CHECK(myds_metal_flush_batch());
+            CHECK(myds_metal_begin_batch());
+        }
     }
     phase="output head";
     if (need_logits) {
