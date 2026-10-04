@@ -27,7 +27,8 @@ CTX="${5:-32768}"
 WAYS="${WAYS:-3}"
 # 每个 way 占 MYDS_SNAP_PINNED 个位置组 × 最深位置 ≈ 79 MiB ≈ 1.62 GiB（每格按最深预留）；
 # ★ 这个数字随 include/myds_snapshot_slots.h 变：2026-10-04 起 PINNED=21（旧值 11 × 47.5 MiB）。
-# 预算必须给够，否则 myds 在 open 时会明确报错（那正是我们要的：不静默截断）。
+# 代码默认【不限】预算；门禁这里显式给一个够用的值，是为了顺带验证预算检查本身在工作
+# （给少了 myds 会在 open 时明确报错 —— 那正是我们要的：不静默截断）。
 BUDGET_MB="${BUDGET_MB:-$(( WAYS * 1660 + 512 ))}"
 
 PROMPT_FILE="${PROMPT_FILE:-/tmp/low_kv_gate_prompt.txt}"

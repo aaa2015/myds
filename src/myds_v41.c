@@ -411,9 +411,8 @@ bool myds_v41_snapshot_get_valid(const myds_v41_context_t *g) {
  * ★ 槽数随 include/myds_snapshot_slots.h 走，别在这里写死数字：2026-10-04 常量前缀涨到
  *   ~11k token 后 PINNED 11→21（位置 1024..11264），条目总数 21×3=63，每个 way ≈ 1.62 GiB
  *   （最深位置单条 ≈ 79 MiB）⇒ 默认 3 way 的虚拟大小 ≈ 4.86 GiB。
- * ★ 由此代码默认预算（2048 MiB，见 myds_v41_low_kv_enable）【装不下默认配置】：不经
- *   start_fleet.sh 显式给预算而启动时，kvdisk 会在启动时报错并禁用。是否调默认值待拍板
- *   （docs/verification/2026-10-04-pkg1-window-runbook.md §3）。 */
+ * ★ 预算默认【不限】（见 myds_v41_low_kv_enable）——默认槽数需要的那点虚拟空间由稀疏文件
+ *   承担；显式设 MYDS_KV_DSK_BUDGET_MB 才启用护栏（生产 start_fleet.sh 给 55296 MiB）。 */
 #define V41_LOWKV_WAYS_DEFAULT 3u
 /* 上限。磁盘充足时调大即可：每个 way ≈ 1.62 GiB（MYDS_SNAP_PINNED 个位置组 × 最深位置 ≈ 79 MiB）。
  * 32 way ≈ 51.7 GiB，可同时容纳 32 套不同的「system + tools」（生产即此配置，预算 55296 MiB）。
@@ -954,11 +953,17 @@ bool myds_v41_low_kv_enable(myds_v41_context_t *g, const char *dir) {
         return false;
     }
 
-    uint64_t budget = 2048ull << 20;
+    /* 预算：默认【不限】。写死一个数字就会自己打自己：默认槽数（MYDS_SNAP_PINNED × ways）
+     * 的虚拟大小本就随两个维度变，2026-10-04 实测默认 3 way 已需 ~4.86 GiB，而旧的
+     * 2048 MiB 默认会让【默认配置】在 open 时直接失败。文件是 APFS 稀疏文件，虚拟大小不
+     * 等于真实占用，所以默认不需要护栏。要护栏就显式设 MYDS_KV_DSK_BUDGET_MB
+     * （生产 start_fleet.sh 给 55296）；设小了会明确报错，不会降级为更少槽位。 */
+    uint64_t budget = 0;   /* 0 = 不限 */
     const char *be = getenv("MYDS_KV_DSK_BUDGET_MB");
     if (be && *be) {
         const long mb = atol(be);
         if (mb > 0) budget = (uint64_t)mb << 20;
+        else MYDS_LOG_W("kvdisk: MYDS_KV_DSK_BUDGET_MB=%s 非法（需 > 0）⇒ 按【不限】处理", be);
     }
 
     char path[1200];

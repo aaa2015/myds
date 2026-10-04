@@ -45,9 +45,9 @@ typedef struct myds_kvdsk myds_kvdsk_t;
  * `slots`         条目数（= 低位位置组数 × 每组 way 数）。
  *                 调用方按「一个位置 = 一组 way」使用，见 myds_v41.c 的 lowkv_pick_entry。
  * `slot_stride`   每个槽在文件里的字节容量（按最深位置算）
- * `budget_bytes`  文件总字节上限；0 = 不限。超出则【打开失败并报错】，不会自动下调槽数。
- *                 注意：myds_v41.c 里【没有任何调用方】会在失败后下调槽数重试，所以预算
- *                 必须由调用者按 slots × slot_stride 配足（代码默认预算装不下默认槽数）。
+ * `budget_bytes`  文件总字节上限；0 = 不限（默认，见 myds_v41_low_kv_enable）。超出则
+ *                 【打开失败并报错】，不会自动下调槽数。注意：没有调用方会在失败后下调槽数
+ *                 重试，所以【设了】预算就必须按 slots × slot_stride 配足。
  * 失败返回 NULL；原因用 myds_kvdsk_open_error() 取。
  */
 myds_kvdsk_t *myds_kvdsk_open(const char *path, uint64_t identity,

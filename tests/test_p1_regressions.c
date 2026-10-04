@@ -299,11 +299,11 @@ static void test_p1_unmapped_engram_identity(void) {
     gf2.fd = fd;
     char tmp_kvdsk_dir[] = "/tmp/test_myds_kvdsk_recover_XXXXXX";
     assert(mkdtemp(tmp_kvdsk_dir) != NULL);
-    /* f0fe18d 起固定区 21 槽：默认 3 way × 21 × ~79 MiB 超出代码默认预算 2048 MiB。
-     * 生产由 start_fleet.sh 显式给预算；单测这里也显式给（文件是稀疏的，不真占盘）。 */
-    setenv("MYDS_KV_DSK_BUDGET_MB", "8192", 1);
+    /* 默认预算【不限】⇒ 默认槽数（21 组 × 3 way）必须能开起来。
+     * ★ 这条断言是刻意的：它覆盖「不设 MYDS_KV_DSK_BUDGET_MB 也能启用」这个默认路径
+     *   （f0fe18d 期间默认写死 2048 MiB，把这条路径打断了；现在默认不限，故此断言成立）。 */
+    unsetenv("MYDS_KV_DSK_BUDGET_MB");   /* 保证真的走默认路径，不受开发者 shell 影响 */
     assert(myds_v41_low_kv_enable(ctx, tmp_kvdsk_dir));
-    unsetenv("MYDS_KV_DSK_BUDGET_MB");
     assert(myds_v41_low_kv_enabled(ctx));
     myds_v41_context_free(ctx);
 
