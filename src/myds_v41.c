@@ -2633,6 +2633,9 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 }
 
                 uint64_t disp_layer0 = myds_metal_dispatch_count();  /* 诊断 */
+                /* 本次迭代 Step1-4 结束时的计数（诊断）。默认 = 起点：若本迭代没走到 Step4 末尾，
+                 * Step5-8 就按「整段都算 5-8」计，而不会出现负数回绕。 */
+                uint64_t disp_mark4 = disp_layer0;
 
                 /* Step 1: HC Attention Inputs for all tokens in chunk */
                 TIME_START();
@@ -2932,7 +2935,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 CHECK(a_ok);
                 CHECK(myds_metal_v41_bf16(cw->attn_low_buf, 8192 * c_len));
                 TIME_ACC(prof_step4);
-                if (do_prof) { disp_step14 += myds_metal_dispatch_count() - disp_layer0; }  /* 诊断 */
+                if (do_prof) { disp_mark4 = myds_metal_dispatch_count(); disp_step14 += disp_mark4 - disp_layer0; }  /* 诊断 */
 
                 if (do_prof) {
                     TIME_START();
@@ -3164,7 +3167,9 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 TIME_ACC(prof_wait_moe);
                 if (do_prof) {  /* 诊断 */
                     disp_layer_all += myds_metal_dispatch_count() - disp_layer0;
-                    disp_step58 += myds_metal_dispatch_count() - disp_layer0 - disp_step14;
+                    /* ★ 减【本次迭代】的 Step4 末尾标记，不是跨迭代累加的 disp_step14
+                     *   （旧写法从第 2 次迭代起为负，按 uint64 回绕成 ~1.8e19）。 */
+                    disp_step58 += myds_metal_dispatch_count() - disp_mark4;
                 }
                 c_start += c_len;
             } /* chunk loop */
