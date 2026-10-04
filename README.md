@@ -1,8 +1,8 @@
 # myds: Apple Silicon Metal 推理引擎实验
 
-**当前 native engine 尚不能正确运行完整 DeepSeek V4 / V4.1 模型。** 分词器和 F16 embedding 已修复并经独立参考验证；完整 V4.1 所需的 HC、Engram、压缩 KV、indexer 及若干数值路径仍未实现。模型包含这些必要特性时，普通 CLI / HTTP 服务会明确拒绝加载。
+**当前 native engine 已完整实现 DeepSeek V4.1 文本计算图（HC、Engram、压缩 KV、indexer），并通过与 ds4 oracle 的逐位验收；生产 8181 正在运行 DeepSeek-V4.1-Flash Q2。** 正确性门禁默认放行已验收特性，`MYDS_DENY_V41=1` 可不重编译地恢复「拒绝加载」（紧急刹车）。
 
-项目保留 C / Objective-C、Metal 算子、GGUF 映射、BPE、HTTP 与合成模型测试基础，继续用于实现和验证完整推理图。请先阅读 [正确性修复与验证状态](docs/CORRECTNESS_STATUS.md)；单元测试通过或历史速度提升不能证明当前目标模型可用。
+验收依据与门禁规则见 [正确性修复与验证状态](docs/CORRECTNESS_STATUS.md)；性能结论以 `docs/verification/` 下带日期的实测记录为准。单元测试通过不等于真实模型逐位对齐，改动数值路径仍须过同等门禁。
 
 ---
 
@@ -170,7 +170,7 @@ make bench
 
 ### 命令行生成
 
-以下展示 CLI 接口。当前完整目标模型会因缺少必要计算图而被拒绝；请勿将这些命令示例理解为完整 V4.1 已可用：
+以下展示 CLI 接口：
 
 ```bash
 ./bin/myds -m /path/to/deepseek.gguf -p "你好，请介绍一下你自己。"
@@ -186,7 +186,7 @@ make bench
 
 ### HTTP 服务器模式 (OpenAI 兼容 API)
 
-`myds` 内置 POSIX HTTP 服务端。只有模型加载通过后才会启动监听；当前完整 V4.1 模型不满足这一条件：
+`myds` 内置 POSIX HTTP 服务端。只有模型加载通过后才会启动监听：
 
 ```bash
 ./bin/myds -m /path/to/deepseek.gguf --port 8181 --host 0.0.0.0 --alias local-myds
@@ -201,7 +201,7 @@ make bench
 
 ### 算力舰队部署与启动
 
-当前版本会拒绝实际 V4.1 模型；完成完整图的正确性验收前，不应通过自动部署替换现有生产实例。
+生产实例（8181）的替换必须经停产窗口（模型重载约 1~2 分钟）；改码只在 macmini，macstudio 只做靶机。
 
 `deploy` 中已集成 `myds` 算力引擎支持：
 - `start_fleet.sh`：定义 `SERVER_TYPE=15` 或 `SERVER_TYPE=myds` 即可调度 `myds` 作为后端引擎
