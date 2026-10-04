@@ -25,9 +25,10 @@ CTX="${5:-32768}"
 # ★ 被测的 way 数。必须显式传给 myds —— 否则它会用内置默认值（3），
 #   门禁就会「通过」在一个根本没被测的配置上（2026-10-01 真实踩到）。
 WAYS="${WAYS:-3}"
-# 每个 way 占 11 个位置组 × 最深位置 47.5 MiB ≈ 523 MiB（每格按最深预留）；
+# 每个 way 占 MYDS_SNAP_PINNED 个位置组 × 最深位置 ≈ 79 MiB ≈ 1.62 GiB（每格按最深预留）；
+# ★ 这个数字随 include/myds_snapshot_slots.h 变：2026-10-04 起 PINNED=21（旧值 11 × 47.5 MiB）。
 # 预算必须给够，否则 myds 在 open 时会明确报错（那正是我们要的：不静默截断）。
-BUDGET_MB="${BUDGET_MB:-$(( WAYS * 523 + 256 ))}"
+BUDGET_MB="${BUDGET_MB:-$(( WAYS * 1660 + 512 ))}"
 
 PROMPT_FILE="${PROMPT_FILE:-/tmp/low_kv_gate_prompt.txt}"
 LOG_A=/tmp/low_kv_gate_cold.log
@@ -57,7 +58,7 @@ fi
 # ── 提示词：★ 码词放在【最前面】，后面跟一大段填充 ──
 # 为什么必须这样放：快照的窗口环只有 128 个 token，码词若落在尾部，召回只需窗口环
 # 就能做到 —— 那测不到【压缩 KV】，而压缩 KV 恰恰是磁盘路径新加、内存路径不存的那一块。
-# 放在最前面（位置 < 100）时，要在末尾召回就必须靠压缩 KV 覆盖 [0..6144) 那段。
+# 放在最前面（位置 < 100）时，要在末尾召回就必须靠压缩 KV 覆盖 [0..最深固定位置) 那段。
 PREFIX_FILE="${PREFIX_FILE:-/tmp/low_kv_gate_prefix.txt}"
 if [ ! -f "$PREFIX_FILE" ]; then
     {
@@ -198,7 +199,7 @@ echo "═══ ⑤ 两个不同的「system + tools」交替 —— 必须各�
 # 这一项是 way 机制真正的回归测试。顺序 P1 -> P2 -> P1：
 #   · P2 从未存过 ⇒ 全量 prefill，然后把【自己那一套】写进空着的 way（不许动 P1 的）
 #   · 再发 P1 ⇒ 内存里是 P2 的状态（内存必然落空）⇒ 只能靠磁盘
-#   · 改之前：P2 的写入会顶掉 P1 的 11 条 ⇒ 这一步必然落空 ⇒ 本项失败
+#   · 改之前：P2 的写入会顶掉 P1 的全部低区条目 ⇒ 这一步必然落空 ⇒ 本项失败
 start_server "$LOG_C" || exit 1
 note "服务已起（pid $SRV_PID，用同一份磁盘缓存）"
 ask "$PREFIX_FILE"  "Reply with the vault code only." /tmp/low_kv_gate_alt1.txt | sed 's/^/    P1 /'

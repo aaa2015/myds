@@ -106,7 +106,7 @@ struct myds_v41_context {
     myds_kvdsk_t         *low_store;
     /* 身份戳的来源（arch / 形状 / 模型大小）。不持有所有权。 */
     const myds_model_t   *model;
-    /* 每组位置的 way 数（1..8）。见 V41_LOWKV_WAYS_DEFAULT 的说明。 */
+    /* 每组位置的 way 数（1..V41_LOWKV_WAYS_MAX，现为 32）。见 V41_LOWKV_WAYS_DEFAULT 的说明。 */
     uint32_t              low_ways;
     /* 低位区【后台】写盘（MYDS_KV_DSK_ASYNC=1，默认关）。见 myds_v41_low_kv_save 的契约说明。
      * 线程只读 low_jobs[] + snap_window/snap_engram[s] + compressed/index_cache 的 [0, p/r) 行，
@@ -402,17 +402,32 @@ bool myds_v41_snapshot_get_valid(const myds_v41_context_t *g) {
 #define V41_LOWKV_STAGE  (1u << 20)  /* 1 MiB 搬运分块：峰值内存只多这 1 MiB */
 #define V41_LOWKV_LATENT 512u        /* 压缩 KV 每行宽度（须与 publish_compressor 一致） */
 /* 每组位置开几个条目（way）。★ 为什么需要它：
- * 11 个固定位置槽【不是 11 个前缀】，而是【同一个前缀的 11 个深度层】——
- * 所以「一个位置一条」等于「一个前缀独占全部 11 槽」，第二个前缀进来就把第一个整个顶掉，
- * 两个前缀交替出现时互相挤没（每个请求都全量 + 重写约 218 MiB，且日志只报 miss）。
+ * MYDS_SNAP_PINNED 个固定位置槽【不是 P 个前缀】，而是【同一个前缀的 P 个深度层】——
+ * 所以「一个位置一条」等于「一个前缀独占全部 P 槽」，第二个前缀进来就把第一个整个顶掉，
+ * 两个前缀交替出现时互相挤没（每个请求都全量 + 重写，且日志只报 miss）。
  * 开 way 之后：同一位置可以同时容纳 W 个不同前缀（按前缀哈希区分），
- * 默认 3 ⇒ 可容纳三套「system + tools」互不干扰；条目总数 11×3=33，文件约 1.5 GiB。 */
+ * 默认 3 ⇒ 可容纳三套「system + tools」互不干扰。
+ *
+ * ★ 槽数随 include/myds_snapshot_slots.h 走，别在这里写死数字：2026-10-04 常量前缀涨到
+ *   ~11k token 后 PINNED 11→21（位置 1024..11264），条目总数 21×3=63，每个 way ≈ 1.62 GiB
+ *   （最深位置单条 ≈ 79 MiB）⇒ 默认 3 way 的虚拟大小 ≈ 4.86 GiB。
+ * ★ 由此代码默认预算（2048 MiB，见 myds_v41_low_kv_enable）【装不下默认配置】：不经
+ *   start_fleet.sh 显式给预算而启动时，kvdisk 会在启动时报错并禁用。是否调默认值待拍板
+ *   （docs/verification/2026-10-04-pkg1-window-runbook.md §3）。 */
 #define V41_LOWKV_WAYS_DEFAULT 3u
-/* 上限。磁盘充足时调大即可：每个 way 约 511 MiB（11 个位置组 × 最深位置 47.5 MiB）。
- * 32 way = 16.33 GiB，可同时容纳 32 套不同的「system + tools」。
+/* 上限。磁盘充足时调大即可：每个 way ≈ 1.62 GiB（MYDS_SNAP_PINNED 个位置组 × 最深位置 ≈ 79 MiB）。
+ * 32 way ≈ 51.7 GiB，可同时容纳 32 套不同的「system + tools」（生产即此配置，预算 55296 MiB）。
  * ★ 调大只需改 MYDS_KV_DSK_WAYS：槽数不进身份戳，但 open 时会比对槽数 ⇒
- *   自动重建文件（旧内容作废，代价是一次冷 prefill），不会读写错位。 */
+ *   自动重建文件（旧内容作废，代价是一次冷 prefill），不会读写错位。
+ * ★ 同时须把 MYDS_KV_DSK_BUDGET_MB 配足：预算不够 open 会【直接失败】，不会降级为更少槽位。 */
 #define V41_LOWKV_WAYS_MAX     32u
+
+/* 后台写盘与 decode 的「行区间不相交」只排除【值】冲突；Metal 对 shared 资源另要求 CPU/GPU
+ * 不同时访问同一区域。这里再钉一层结构性保证：行边界必须落在 128 B 缓存行上，否则一次
+ * memcpy 可能跨进 GPU 正在写的行。改 V41_LOWKV_LATENT / V41_INDEX_DIM 使其不再是 32 float
+ * 的整数倍时，下面两条会直接编译失败。 */
+_Static_assert((V41_LOWKV_LATENT * 4u) % 128u == 0u, "LOWKV latent 行宽必须对齐 128 B 缓存行");
+_Static_assert((V41_INDEX_DIM * 4u) % 128u == 0u, "LOWKV index 行宽必须对齐 128 B 缓存行");
 #define V41_LOWKV_NO_ENTRY     0xFFFFFFFFu
 
 static void lk_put_u32(unsigned char *p, uint32_t v) {
@@ -438,7 +453,7 @@ static uint32_t lowkv_owner_ratio(uint32_t owner) {
 }
 
 /* 条目编号 = 位置组 × way 数 + way。位置组分 1..MYDS_SNAP_PINNED，
- * 对应的位置由 myds_snap_slot_for 决定（1024、1536、…、6144）。
+ * 对应的位置由 myds_snap_slot_for 决定（1024 + 512k，k = 0..MYDS_SNAP_PINNED-1；现为 1024..11264）。
  * 注意快照点只有 512 的倍数 ⇒ p 与位置组是一一对应的，不会歧义。 */
 static uint32_t lowkv_entry_index(const myds_v41_context_t *g, uint32_t group, uint32_t way) {
     return group * g->low_ways + way;
@@ -980,7 +995,8 @@ bool myds_v41_low_kv_enabled(const myds_v41_context_t *g) {
  *   ① 只被 prefill 的存点、store_now（槽 0，线程不读）、restore、low_kv_load 改 ⇒ 它们都先 join；
  *     decode（myds_v41_forward）不碰快照槽。
  *   ② decode 从位置 q0 = n_tokens-1 起写压缩行：ratio 1 写行 q，ratio 2 只在奇数 q 写行 (q-1)/2。
- *     p 是 512 的倍数；当 p <= q0 时两者的行号都 >= p/r ⇒ 与线程读的区间不相交。
+ *     当 p <= q0 时两者的行号都 >= p/r ⇒ 与线程读的半开区间 [0, p/r) 不相交。
+ *     ★ 这里【不】需要「p 是 512 的倍数」：pinned 槽恰好是 1024+512k，但不相交对任意 p 成立。
  *     ★ p == n_tokens 时 q0 = p-1，ratio 1 会重写第 p-1 行（decode 路径的数值可能与 prefill 不同位）
  *       ⇒ 这种条目【必须】在返回前同步写完。下一个请求在碰任何状态前都会 join。
  *   线程只写 low_store；它的崩溃安全性不变（write_start 先置空，元信息最后写）。 */

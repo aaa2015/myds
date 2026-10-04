@@ -7,7 +7,8 @@
  *
  * 为什么只做【低位区】：快照本来就按固定间隔存，而真正被反复复用的是序列开头那一段
  * （见 myds_snapshot_slots.h）。位置越深越少被命中，越浅越常用。所以只把「固定低位槽」
- * （MYDS_SNAP_PINNED 个，覆盖位置 1024..6144）落盘，环形槽不进磁盘。
+ * （MYDS_SNAP_PINNED 个，覆盖位置 1024..1024+(MYDS_SNAP_PINNED-1)*MYDS_SNAP_STRIDE；现为
+ * 1024..11264）落盘，环形槽不进磁盘。
  * 好处是文件有界、且淘汰策略退化成「一个位置一条，新的覆盖旧的」。
  *
  * ── 本模块的职责边界 ──
@@ -20,7 +21,8 @@
  *
  * ── 为什么 payload 是变长的 ──
  * 一条快照里最大的一块是「压缩 KV」，它的行数随位置线性增长（每个 owner 每 ratio 个
- * token 一行）。位置 1024 与位置 6144 的实际数据量差了 6 倍，所以槽的容量按【最深
+ * token 一行）。位置越深条目越大（现最深 11264 每条 ≈ 79 MiB，而位置 1024 仅 ≈ 16 MiB），
+ * 所以槽的容量按【最深
  * 位置】定，但每条只写、只读它自己那一段（payload_used），不写不读填充区。
  */
 #ifndef MYDS_KVDSK_H
@@ -43,7 +45,9 @@ typedef struct myds_kvdsk myds_kvdsk_t;
  * `slots`         条目数（= 低位位置组数 × 每组 way 数）。
  *                 调用方按「一个位置 = 一组 way」使用，见 myds_v41.c 的 lowkv_pick_entry。
  * `slot_stride`   每个槽在文件里的字节容量（按最深位置算）
- * `budget_bytes`  文件总字节上限；0 = 不限。超出则在打开时报错（由调用方下调槽数）。
+ * `budget_bytes`  文件总字节上限；0 = 不限。超出则【打开失败并报错】，不会自动下调槽数。
+ *                 注意：myds_v41.c 里【没有任何调用方】会在失败后下调槽数重试，所以预算
+ *                 必须由调用者按 slots × slot_stride 配足（代码默认预算装不下默认槽数）。
  * 失败返回 NULL；原因用 myds_kvdsk_open_error() 取。
  */
 myds_kvdsk_t *myds_kvdsk_open(const char *path, uint64_t identity,
