@@ -16,6 +16,8 @@
 #include <unistd.h>
 #include <errno.h>
 #include <stdatomic.h>
+#include <pthread.h>
+#include <sys/qos.h>
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -80,6 +82,9 @@ struct myds_v41_model {
 typedef struct v41_chunk_workspace_s v41_chunk_workspace_t;
 static void v41_chunk_workspace_free(v41_chunk_workspace_t *cw);
 
+/* 一条待落盘的低位区快照：槽号、位置、前缀哈希（哈希在主线程算好，线程不碰 token 数组）。 */
+typedef struct { uint32_t s, p; uint64_t hash; } v41_lowkv_job_t;
+
 struct myds_v41_context {
     myds_engram_t *engram;
     myds_v41_gpu_scratch_t *gpu;
@@ -103,6 +108,15 @@ struct myds_v41_context {
     const myds_model_t   *model;
     /* 每组位置的 way 数（1..8）。见 V41_LOWKV_WAYS_DEFAULT 的说明。 */
     uint32_t              low_ways;
+    /* 低位区【后台】写盘（MYDS_KV_DSK_ASYNC=1，默认关）。见 myds_v41_low_kv_save 的契约说明。
+     * 线程只读 low_jobs[] + snap_window/snap_engram[s] + compressed/index_cache 的 [0, p/r) 行，
+     * 只写 low_store；任何可能碰到这些的入口都先 lowkv_join()。 */
+    bool                  low_async;
+    bool                  low_thr_live;
+    bool                  low_thr_ok;
+    pthread_t             low_thr;
+    uint32_t              low_job_n;
+    v41_lowkv_job_t       low_jobs[MYDS_SNAP_PINNED];
     myds_metal_buffer_t *compressed[4], *index_cache[4];
     myds_metal_buffer_t *previous_kv[4], *previous_score[4];
     myds_metal_buffer_t *pool_kv, *pool_score, *latent;
@@ -130,8 +144,11 @@ struct myds_v41_context {
  *
  * 清空全部是错的：实测第 2 次命中 6144 之后，第 3 次的公共前缀只到 6153（不到末尾 6162），
  * 唯一能用的就是被清掉的那个 6144，于是又退回全量 20 秒。 */
+static void lowkv_join(myds_v41_context_t *g);   /* 低位区后台写盘的汇合点，定义见「低位区 KV 的 SSD 落盘」 */
+
 void myds_v41_snapshot_clear(myds_v41_context_t *g, uint32_t keep_up_to) {
     if (!g) return;
+    lowkv_join(g);   /* 每个请求开头都会走到这里（engine 在 prefill/decode 之前调） */
     for (uint32_t s = 0; s < V41_SNAP_SLOTS; ++s) {
         if (g->snap_pos[s] > keep_up_to) g->snap_pos[s] = 0;
         if (g->snap_staged_pos[s] > keep_up_to) g->snap_staged_pos[s] = 0;
@@ -197,6 +214,7 @@ static bool snapshot_store_window(myds_v41_context_t *g, uint32_t il, uint32_t p
  *   或 GPU 提交失败，旧快照标签不会残留指向新旧层混合的数据。 */
 bool myds_v41_snapshot_store_now(myds_v41_context_t *g, uint32_t p) {
     if (!g || !g->snap_enabled || !p || p < V41_SNAP_MIN) return true;
+    lowkv_join(g);
     /* 首次覆盖 slot 0 前使原发布标签和 staged 标记失效。 */
     g->snap_pos[0] = 0;
     g->snap_staged_pos[0] = 0;
@@ -243,6 +261,7 @@ uint32_t myds_v41_snapshot_best(const myds_v41_context_t *g, uint32_t common) {
 /* 把某点的【全部】状态装回去：engram tail + 各层窗口环 + 压缩器跨步状态
  * ★ 批量提交：与 store_now 同理，48 次复制编进同一 command buffer。 */
 bool myds_v41_snapshot_restore(myds_v41_context_t *g, uint32_t p) {
+    lowkv_join(g);   /* restore 会改活窗口环；与线程读的 snap_window 同源 */
     if (!myds_metal_commit_batch()) return false;
     for (uint32_t s = 0; s < V41_SNAP_SLOTS; ++s) {
         if (g->snap_pos[s] != p) continue;
@@ -909,6 +928,10 @@ bool myds_v41_low_kv_enable(myds_v41_context_t *g, const char *dir) {
                         we, (unsigned)V41_LOWKV_WAYS_MAX, (unsigned)V41_LOWKV_WAYS_DEFAULT);
     }
     g->low_ways = ways;
+    {   /* 后台写盘开关：只在启用时读一次（不进热路径）。默认关 = 与以前完全一致。 */
+        const char *ae = getenv("MYDS_KV_DSK_ASYNC");
+        g->low_async = (ae && atoi(ae) != 0);
+    }
     const uint32_t entries = MYDS_SNAP_PINNED * ways;
     const uint64_t identity = lowkv_identity(g->model);
     if (!identity) {
@@ -949,29 +972,108 @@ bool myds_v41_low_kv_enabled(const myds_v41_context_t *g) {
     return g && g->low_store != NULL;
 }
 
-bool myds_v41_low_kv_save(myds_v41_context_t *g, const int32_t *tokens, uint32_t n_tokens) {
-    if (!g || !g->low_store) return true;              /* 未启用不是错误 */
-    if (!g->snap_enabled || !tokens || n_tokens == 0) return true;
+/* ── 后台写盘 ──
+ * 为什么要：新前缀的首轮会在【首 token 之前】同步写最多 21 条（每条最深 ~79 MiB）。
+ *
+ * 为什么可以（与 decode 并行的安全论证，改动前务必读）：
+ *   线程读的只有 ① snap_window[s] / snap_engram[s]（s >= 1），② compressed/index_cache 的 [0, p/r) 行。
+ *   ① 只被 prefill 的存点、store_now（槽 0，线程不读）、restore、low_kv_load 改 ⇒ 它们都先 join；
+ *     decode（myds_v41_forward）不碰快照槽。
+ *   ② decode 从位置 q0 = n_tokens-1 起写压缩行：ratio 1 写行 q，ratio 2 只在奇数 q 写行 (q-1)/2。
+ *     p 是 512 的倍数；当 p <= q0 时两者的行号都 >= p/r ⇒ 与线程读的区间不相交。
+ *     ★ p == n_tokens 时 q0 = p-1，ratio 1 会重写第 p-1 行（decode 路径的数值可能与 prefill 不同位）
+ *       ⇒ 这种条目【必须】在返回前同步写完。下一个请求在碰任何状态前都会 join。
+ *   线程只写 low_store；它的崩溃安全性不变（write_start 先置空，元信息最后写）。 */
+static bool lowkv_run_jobs(myds_v41_context_t *g, const v41_lowkv_job_t *jobs, uint32_t n,
+                           uint32_t *written, uint64_t *bytes) {
+    if (written) *written = 0;
+    if (bytes) *bytes = 0;
+    if (!n) return true;
     unsigned char *stage = (unsigned char *)malloc(V41_LOWKV_STAGE);
     if (!stage) { MYDS_LOG_E("kvdisk: 分块缓冲分配失败"); return false; }
     bool ok = true;
-    for (uint32_t s = 1; s <= MYDS_SNAP_PINNED && ok; ++s) {
-        const uint32_t p = g->snap_pos[s];
-        if (!p || p < V41_SNAP_MIN || p > n_tokens) continue;
-        const uint64_t hash = myds_kvdsk_hash_tokens(tokens, p);
+    for (uint32_t i = 0; i < n && ok; ++i) {
+        const uint32_t s = jobs[i].s, p = jobs[i].p;
         bool already = false;
-        const uint32_t entry = lowkv_pick_entry(g, s - 1u, p, hash, &already);
+        const uint32_t entry = lowkv_pick_entry(g, s - 1u, p, jobs[i].hash, &already);
         if (already) continue;                        /* 已在盘上 ⇒ 不重写（稳态零写盘） */
         if (entry == V41_LOWKV_NO_ENTRY) continue;    /* 一组里一条都占不到（不应发生） */
-        ok = lowkv_write_slot(g, entry, s, p, hash, stage);
-        if (!ok) MYDS_LOG_W("kvdisk: 位置 %u 写盘失败", p);
+        ok = lowkv_write_slot(g, entry, s, p, jobs[i].hash, stage);
+        if (!ok) { MYDS_LOG_W("kvdisk: 位置 %u 写盘失败", p); break; }
+        if (written) ++*written;
+        if (bytes) *bytes += lowkv_payload_bytes(p);
     }
     free(stage);
     return ok;
 }
 
+static double lowkv_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
+}
+
+static void *lowkv_thread_main(void *arg) {
+    myds_v41_context_t *g = (myds_v41_context_t *)arg;
+    /* 不与 decode 线程抢 CPU：落盘是「做完就行」的活。 */
+    (void)pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+    const double t0 = lowkv_now_ms();
+    uint32_t written = 0; uint64_t bytes = 0;
+    g->low_thr_ok = lowkv_run_jobs(g, g->low_jobs, g->low_job_n, &written, &bytes);
+    if (written || !g->low_thr_ok)
+        MYDS_LOG_I("kvdisk: 后台写盘 %u/%u 条 · %.1f MiB · %.1f ms%s", written, g->low_job_n,
+                   (double)bytes / 1048576.0, lowkv_now_ms() - t0, g->low_thr_ok ? "" : " · 有失败");
+    return NULL;
+}
+
+static void lowkv_join(myds_v41_context_t *g) {
+    if (!g || !g->low_thr_live) return;
+    const double t0 = lowkv_now_ms();
+    (void)pthread_join(g->low_thr, NULL);
+    g->low_thr_live = false;
+    const double waited = lowkv_now_ms() - t0;
+    /* 等待超过 1 ms 就说出来：这是「后台写盘拖住了下一个请求」的唯一信号。 */
+    if (waited > 1.0) MYDS_LOG_I("kvdisk: 等待上一轮后台写盘 %.1f ms", waited);
+}
+
+void myds_v41_low_kv_wait(myds_v41_context_t *g) { lowkv_join(g); }
+
+bool myds_v41_low_kv_save(myds_v41_context_t *g, const int32_t *tokens, uint32_t n_tokens) {
+    if (!g || !g->low_store) return true;              /* 未启用不是错误 */
+    if (!g->snap_enabled || !tokens || n_tokens == 0) return true;
+    lowkv_join(g);
+    /* 哈希在这里算完：调用方返回后就会释放 tokens。 */
+    v41_lowkv_job_t sync_jobs[MYDS_SNAP_PINNED];
+    uint32_t n_sync = 0, n_async = 0;
+    for (uint32_t s = 1; s <= MYDS_SNAP_PINNED; ++s) {
+        const uint32_t p = g->snap_pos[s];
+        if (!p || p < V41_SNAP_MIN || p > n_tokens) continue;
+        const v41_lowkv_job_t job = { s, p, myds_kvdsk_hash_tokens(tokens, p) };
+        if (g->low_async && p < n_tokens) g->low_jobs[n_async++] = job;   /* 见上方论证 ② */
+        else sync_jobs[n_sync++] = job;
+    }
+    const double t0 = lowkv_now_ms();
+    uint32_t written = 0; uint64_t bytes = 0;
+    bool ok = lowkv_run_jobs(g, sync_jobs, n_sync, &written, &bytes);
+    if (written)   /* 这段时间全部挂在首 token 之前 */
+        MYDS_LOG_I("kvdisk: 同步写盘 %u 条 · %.1f MiB · %.1f ms（首 token 前）",
+                   written, (double)bytes / 1048576.0, lowkv_now_ms() - t0);
+    if (n_async) {
+        g->low_job_n = n_async;
+        g->low_thr_ok = true;
+        if (pthread_create(&g->low_thr, NULL, lowkv_thread_main, g) == 0) {
+            g->low_thr_live = true;
+        } else {
+            MYDS_LOG_W("kvdisk: 后台线程创建失败 ⇒ 改为同步写盘");
+            ok = lowkv_run_jobs(g, g->low_jobs, n_async, NULL, NULL) && ok;
+        }
+    }
+    return ok;
+}
+
 uint32_t myds_v41_low_kv_load(myds_v41_context_t *g, const int32_t *tokens, uint32_t max_position) {
     if (!g || !g->low_store || !g->snap_enabled || !tokens) return 0;
+    lowkv_join(g);   /* 读盘与灌活压缩 KV 都不能与后台写盘并发 */
     if (max_position < V41_SNAP_MIN) return 0;
 
     /* 取【最深】的匹配条目：位置越深，免掉的 prefill 越多。
@@ -1021,8 +1123,42 @@ uint32_t myds_v41_low_kv_load(myds_v41_context_t *g, const int32_t *tokens, uint
 }
 
 void myds_v41_low_kv_stats(const myds_v41_context_t *g, uint32_t *live_entries, uint32_t *slots) {
+    /* 注意：不汇合后台写盘（const，且只读计数）。生产代码目前没有调用方。 */
     if (live_entries) *live_entries = (g && g->low_store) ? myds_kvdsk_live_entries(g->low_store) : 0u;
     if (slots) *slots = (g && g->low_store) ? MYDS_SNAP_PINNED * g->low_ways : 0u;
+}
+
+/* ── 低位区落盘的单测夹具（只供 tests/ 使用）── */
+bool myds_v41_low_kv_fixture_enable(myds_v41_context_t *g, const char *path, uint64_t identity,
+                                    uint32_t ways, bool async_on, uint32_t max_pos) {
+    if (!g || !path || g->low_store || !ways || ways > V41_LOWKV_WAYS_MAX || !identity) return false;
+    for (uint32_t o = 0; o < 4u; ++o) {
+        const uint32_t r = lowkv_owner_ratio(o);
+        const uint32_t rows = r ? (max_pos / r) + 1u : 1u;
+        if (!g->compressed[o]) g->compressed[o] = myds_metal_buffer_alloc((size_t)rows * V41_LOWKV_LATENT * 4u);
+        if (!g->index_cache[o]) g->index_cache[o] = myds_metal_buffer_alloc((size_t)rows * V41_INDEX_DIM * 4u);
+        if (!g->compressed[o] || !g->index_cache[o]) return false;
+    }
+    const uint32_t deepest = MYDS_SNAP_MIN + (MYDS_SNAP_PINNED - 1u) * MYDS_SNAP_STRIDE;
+    g->low_store = myds_kvdsk_open(path, identity, MYDS_SNAP_PINNED * ways, lowkv_payload_bytes(deepest), 0);
+    if (!g->low_store) return false;
+    g->low_ways = ways;
+    g->low_async = async_on;
+    return true;
+}
+
+void myds_v41_snapshot_fixture_publish(myds_v41_context_t *g, uint32_t slot, uint32_t p) {
+    if (!g || slot >= V41_SNAP_SLOTS) return;
+    if (g->engram) g->snap_engram[slot] = g->engram->history;
+    g->snap_pos[slot] = p;
+}
+
+myds_metal_buffer_t *myds_v41_snapshot_get_compressed(myds_v41_context_t *g, uint32_t o) {
+    return (g && o < 4) ? g->compressed[o] : NULL;
+}
+
+myds_metal_buffer_t *myds_v41_snapshot_get_index_cache(myds_v41_context_t *g, uint32_t o) {
+    return (g && o < 4) ? g->index_cache[o] : NULL;
 }
 
 /* ── 图片嵌入注入 ──
@@ -1262,6 +1398,7 @@ fail:
 
 void myds_v41_context_free(myds_v41_context_t *g) {
     if (!g) return;
+    lowkv_join(g);                     /* 先等后台写盘结束：它还在读下面要释放的缓冲 */
     myds_kvdsk_close(g->low_store);   /* 未启用时为 NULL，close 自己会跳过 */
     g->low_store = NULL;
 #define F(x) myds_metal_buffer_free(g->x)
@@ -2232,6 +2369,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     myds_v41_context_t *g = ctx->v41;
     myds_v41_model_t *v = m ? m->v41 : NULL;
     if (!m || !g || !v) return -1;
+    lowkv_join(g);   /* prefill 会写压缩 KV 与快照槽 */
     if (!myds_metal_commit_batch()) return -1;
 
     uint32_t base_pos = ctx->pos;

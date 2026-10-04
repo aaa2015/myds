@@ -41,9 +41,13 @@ bool     myds_v41_snapshot_store_now(myds_v41_context_t *context, uint32_t posit
  * 这个优化由服务端显式打开）。 */
 bool     myds_v41_low_kv_enable(myds_v41_context_t *context, const char *dir);
 bool     myds_v41_low_kv_enabled(const myds_v41_context_t *context);
-/* 把当前【低位槽】里还需要的快照写盘（内容没变则不重写）。 */
+/* 把当前【低位槽】里还需要的快照写盘（内容没变则不重写）。
+ * MYDS_KV_DSK_ASYNC=1 时，位置 < n_tokens 的条目交给后台线程写（与 decode 并行）；
+ * 下一次 snapshot_clear/restore/store_now、low_kv_load/save、prefill、context_free 会先汇合。 */
 bool     myds_v41_low_kv_save(myds_v41_context_t *context, const int32_t *tokens,
                               uint32_t n_tokens);
+/* 显式等待后台写盘结束（未启用/无在途写盘时立即返回）。 */
+void     myds_v41_low_kv_wait(myds_v41_context_t *context);
 /* 在 (0, max_position] 内找【最深】的、前缀哈希匹配的条目，装回内存快照槽。
  * 返回命中的位置（0 = 未命中），随后由 myds_v41_snapshot_restore 应用。 */
 uint32_t myds_v41_low_kv_load(myds_v41_context_t *context, const int32_t *tokens,

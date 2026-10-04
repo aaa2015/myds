@@ -226,6 +226,13 @@ void myds_v41_snapshot_set_engram_history(myds_v41_context_t *g, uint32_t t0, ui
 void myds_v41_snapshot_get_engram_history(const myds_v41_context_t *g, uint32_t out[3]);
 void myds_v41_snapshot_set_positions(myds_v41_context_t *g, uint32_t engram_pos, uint32_t next_pos);
 bool myds_v41_snapshot_get_valid(const myds_v41_context_t *g);
+/* 低位区落盘的单测夹具：给快照夹具补上压缩 KV 缓冲并直接打开磁盘存储（不需要模型）。 */
+bool myds_v41_low_kv_fixture_enable(myds_v41_context_t *g, const char *path, uint64_t identity,
+                                    uint32_t ways, bool async_on, uint32_t max_pos);
+void myds_v41_snapshot_fixture_publish(myds_v41_context_t *g, uint32_t slot, uint32_t p);
+myds_metal_buffer_t *myds_v41_snapshot_get_snap_window(myds_v41_context_t *g, uint32_t slot);
+myds_metal_buffer_t *myds_v41_snapshot_get_compressed(myds_v41_context_t *g, uint32_t o);
+myds_metal_buffer_t *myds_v41_snapshot_get_index_cache(myds_v41_context_t *g, uint32_t o);
 uint32_t myds_v41_resolve_macroblock_size(void);
 
 #ifdef __cplusplus

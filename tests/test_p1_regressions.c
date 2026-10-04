@@ -13,6 +13,7 @@
 #include "myds_metal.h"
 #include "myds_v41_gpu.h"
 #include "myds_server_internal.h"
+#include "myds_snapshot_slots.h"
 
 static void test_p1_response_id_lifecycle(void) {
     char id1[64], id2[64];
@@ -1249,6 +1250,118 @@ static void test_p2_tiled_indexer_causal_equivalence(void) {
     printf("  [PASS] P2: Hardware-tiled indexer causal equivalence to direct indexer (max_diff=%e)\n", max_diff);
 }
 
+/* ── 低位区后台写盘（MYDS_KV_DSK_ASYNC=1）的逐位门禁 ──
+ * 同一份状态：同步写出文件 A；后台写出文件 B，且在后台写盘期间
+ *   ① 立即释放并涂花调用方的 token 数组（engine 在 save 返回后就 free 它），
+ *   ② 模拟 decode 从位置 n_tokens-1 起改写压缩行（ratio 1 行 q / ratio 2 行 (q-1)/2）。
+ * ⇒ A 与 B 必须逐字节相同。随后：不显式 wait 直接 load，必须先汇合并命中最深可用点。 */
+#define LK_NTOK 2048u
+static const uint32_t lk_pos[3] = {1024u, 1536u, 2048u};   /* 2048 == n_tokens ⇒ 走同步分支 */
+
+static uint32_t lk_ratio(uint32_t o) { return o == 3u ? 1u : 2u; }   /* 与 myds_v41.c 的 ratio_for/owner_for 一致 */
+
+static void lk_fill_state(myds_v41_context_t *g) {
+    myds_v41_snapshot_set_engram_history(g, 101, 202, 303);
+    for (uint32_t i = 0; i < 3; i++) {
+        const uint32_t s = myds_snap_slot_for(lk_pos[i], 0);
+        myds_metal_buffer_t *w = myds_v41_snapshot_get_snap_window(g, s);
+        float *f = (float *)myds_metal_buffer_data(w);
+        const size_t n = myds_metal_buffer_size(w) / sizeof(float);
+        for (size_t k = 0; k < n; k++) f[k] = (float)((s * 1000003u + (uint32_t)k) % 65521u) * 0.25f;
+        myds_v41_snapshot_fixture_publish(g, s, lk_pos[i]);
+    }
+    for (uint32_t o = 0; o < 4; o++) {
+        float *c = (float *)myds_metal_buffer_data(myds_v41_snapshot_get_compressed(g, o));
+        const size_t nc = myds_metal_buffer_size(myds_v41_snapshot_get_compressed(g, o)) / sizeof(float);
+        for (size_t k = 0; k < nc; k++) c[k] = (float)(((o + 1u) * 7919u + (uint32_t)k) % 32749u) * 0.5f;
+        float *x = (float *)myds_metal_buffer_data(myds_v41_snapshot_get_index_cache(g, o));
+        const size_t nx = myds_metal_buffer_size(myds_v41_snapshot_get_index_cache(g, o)) / sizeof(float);
+        for (size_t k = 0; k < nx; k++) x[k] = -(float)(((o + 3u) * 104729u + (uint32_t)k) % 32749u);
+    }
+}
+
+static void lk_simulate_decode(myds_v41_context_t *g) {
+    const uint32_t q0 = LK_NTOK - 1u;
+    for (uint32_t o = 0; o < 4; o++) {
+        const uint32_t r = lk_ratio(o);
+        const uint32_t first = (r == 1u) ? q0 : ((q0 | 1u) - 1u) / 2u;   /* 第一个奇数 q >= q0 写的行 */
+        float *c = (float *)myds_metal_buffer_data(myds_v41_snapshot_get_compressed(g, o));
+        const size_t nc = myds_metal_buffer_size(myds_v41_snapshot_get_compressed(g, o)) / sizeof(float);
+        for (size_t k = (size_t)first * 512u; k < nc; k++) c[k] = 9999.0f;
+        float *x = (float *)myds_metal_buffer_data(myds_v41_snapshot_get_index_cache(g, o));
+        const size_t nx = myds_metal_buffer_size(myds_v41_snapshot_get_index_cache(g, o)) / sizeof(float);
+        for (size_t k = (size_t)first * 128u; k < nx; k++) x[k] = 9999.0f;
+    }
+}
+
+static int32_t *lk_tokens(void) {
+    int32_t *t = (int32_t *)malloc(LK_NTOK * sizeof(int32_t));
+    assert(t);
+    for (uint32_t i = 0; i < LK_NTOK; i++) t[i] = (int32_t)((i * 37u + 11u) % 50000u);
+    return t;
+}
+
+static void lk_write(const char *path, bool async_on) {
+    myds_v41_context_t *g = myds_v41_context_create_snapshot_fixture();
+    assert(g);
+    assert(myds_v41_low_kv_fixture_enable(g, path, 0x5EEDull, 1, async_on, LK_NTOK + 64u));
+    lk_fill_state(g);
+    int32_t *tok = lk_tokens();
+    assert(myds_v41_low_kv_save(g, tok, LK_NTOK));
+    memset(tok, 0xA5, LK_NTOK * sizeof(int32_t));   /* ① 调用方立刻改/释放 token */
+    free(tok);
+    lk_simulate_decode(g);                          /* ② decode 与后台写盘并行 */
+    myds_v41_low_kv_wait(g);
+    uint32_t live = 0, slots = 0;
+    myds_v41_low_kv_stats(g, &live, &slots);
+    assert(live == 3u);
+    myds_v41_context_free(g);
+}
+
+static void lk_assert_files_equal(const char *a, const char *b) {
+    FILE *fa = fopen(a, "rb"), *fb = fopen(b, "rb");
+    assert(fa && fb);
+    static unsigned char ba[1u << 20], bb[1u << 20];
+    uint64_t total = 0;
+    for (;;) {
+        const size_t na = fread(ba, 1, sizeof(ba), fa), nb = fread(bb, 1, sizeof(bb), fb);
+        assert(na == nb);
+        if (!na) break;
+        assert(memcmp(ba, bb, na) == 0);
+        total += na;
+    }
+    assert(total > 0);
+    fclose(fa); fclose(fb);
+}
+
+static void test_p2_lowkv_async_bit_identical(void) {
+    if (!myds_metal_init(NULL)) { printf("  [SKIP] Metal not supported on this platform\n"); return; }
+    char dir[] = "/tmp/test_myds_lowkv_async_XXXXXX";
+    assert(mkdtemp(dir) != NULL);
+    char pa[256], pb[256], pc[256];
+    snprintf(pa, sizeof(pa), "%s/sync.bin", dir);
+    snprintf(pb, sizeof(pb), "%s/async.bin", dir);
+    snprintf(pc, sizeof(pc), "%s/join.bin", dir);
+
+    lk_write(pa, false);
+    lk_write(pb, true);
+    lk_assert_files_equal(pa, pb);
+
+    /* 新文件上后台写盘、不显式 wait：load 必须先汇合，再命中 [0, 2047] 内最深的 1536 */
+    myds_v41_context_t *g = myds_v41_context_create_snapshot_fixture();
+    assert(g);
+    assert(myds_v41_low_kv_fixture_enable(g, pc, 0x5EEDull, 1, true, LK_NTOK + 64u));
+    lk_fill_state(g);
+    int32_t *tok = lk_tokens();
+    assert(myds_v41_low_kv_save(g, tok, LK_NTOK));
+    assert(myds_v41_low_kv_load(g, tok, LK_NTOK - 1u) == 1536u);
+    free(tok);
+    myds_v41_context_free(g);
+
+    unlink(pa); unlink(pb); unlink(pc); rmdir(dir);
+    printf("  [PASS] P2: async low-KV write is byte-identical to sync under concurrent decode writes, and load joins first\n");
+}
+
 int main(void) {
     printf("Running P1 Regression Verification Suite:\n");
     test_p1_response_id_lifecycle();
@@ -1265,6 +1378,7 @@ int main(void) {
     test_p1_snapshot_overwrite_failure();
     test_p1_macroblock_prefill_invariants();
     test_p2_tiled_indexer_causal_equivalence();
+    test_p2_lowkv_async_bit_identical();
     printf("All P1 Regression Verifications PASSED!\n");
     return 0;
 }
