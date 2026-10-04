@@ -381,14 +381,25 @@ static void test_deepseek41_tool_calls(void) {
     /* 正文为空的 function_call 项也要能渲染（name/arguments 在该项自身） */
     assert(strstr(output, "<｜User｜>Weather?") != NULL);
 
-    /* ④c 不支持的类型必须给出【可诊断】的原因，而不是笼统文案 */
+    /* ④c 不支持的类型必须给出【可诊断】的原因，而不是笼统文案。
+     * 注意：reasoning 自 1860e70 起是【合法】项（OpenClaw 会回灌），这里换成真正不支持的类型。 */
     const char *bad_type =
-        "{\"input\":[{\"role\":\"user\",\"content\":\"hi\"},{\"type\":\"reasoning\",\"summary\":[]}]}";
+        "{\"input\":[{\"role\":\"user\",\"content\":\"hi\"},{\"type\":\"computer_call\",\"action\":{}}]}";
     char reason_buf[256];
     const char *why = NULL;
     assert(!parse_chat_prompt_ex(bad_type, output, sizeof(output), &why));
     assert(why && strstr(why, "unsupported") != NULL);
     (void)reason_buf;
+
+    /* ④d reasoning 项必须被安全跳过：不报错、不贡献任何 prompt 内容 */
+    const char *with_reasoning =
+        "{\"input\":[{\"role\":\"user\",\"content\":\"hi\"},{\"type\":\"reasoning\",\"summary\":[]}]}";
+    const char *plain = "{\"input\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
+    char out_plain[sizeof(output)];
+    why = NULL;
+    assert(parse_chat_prompt_ex(with_reasoning, output, sizeof(output), &why));
+    assert(parse_chat_prompt_ex(plain, out_plain, sizeof(out_plain), &why));
+    assert(strcmp(output, out_plain) == 0);
 
     /* ⑤ 非 assistant 角色挂 tool_calls ⇒ 拒绝（格式只对 assistant 有意义） */
     char small[4096];
