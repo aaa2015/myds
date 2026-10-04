@@ -24,10 +24,10 @@
 
 #include <stdint.h>
 
-#define MYDS_SNAP_SLOTS    24u   /* 含槽 0 与固定低位区 */
+#define MYDS_SNAP_SLOTS    44u   /* 含槽 0 与固定低位区（2026-10-04 扩容：常量前缀已涨到 ~11k）*/
 #define MYDS_SNAP_STRIDE   512u  /* 每隔多少 token 存一份 */
 #define MYDS_SNAP_MIN      1024u /* 低于此长度不值得存（太浅的前缀复用价值低） */
-#define MYDS_SNAP_PINNED   11u   /* 固定槽数量：覆盖位置 1024 .. 1024+(PINNED-1)*STRIDE */
+#define MYDS_SNAP_PINNED   21u   /* 固定槽数量：覆盖位置 1024 .. 1024+(PINNED-1)*STRIDE = 11264 */
 
 /* 位置 p 的快照该放哪个槽。`is_last` 表示这是本次序列的末尾点。
  * 调用方需保证 p >= MYDS_SNAP_MIN（更浅的点本就不存）。 */
