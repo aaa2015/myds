@@ -896,27 +896,6 @@ static bool prompt_content_image(const prompt_json_t *j, const prompt_json_node_
     return prompt_append(out, plan->text);
 }
 
-static bool prompt_content(const prompt_json_t *j, const prompt_json_node_t *content,
-                           prompt_buffer_t *out, myds_vjob_sink_t *img) {
-    if (!content) return false;
-    if (content->kind == PJ_NULL) return true;
-    if (content->kind == PJ_STRING) return prompt_append(out, content->text);
-    if (content->kind != PJ_ARRAY) return false;
-    for (size_t i = (size_t)(content - j->nodes) + 1; i < content->next; i = j->nodes[i].next) {
-        bool valid = true;
-        const prompt_json_node_t *type = prompt_json_field(j, &j->nodes[i], "type", &valid);
-        const prompt_json_node_t *text = prompt_json_field(j, &j->nodes[i], "text", &valid);
-        if (!valid || !type || type->kind != PJ_STRING) return false;
-        if (!strcmp(type->text, "input_image")) {
-            if (!prompt_content_image(j, &j->nodes[i], out, img)) return false;
-            continue;
-        }
-        if ((strcmp(type->text, "text") && strcmp(type->text, "input_text") && strcmp(type->text, "output_text")) ||
-            !text ||
-            (text->kind != PJ_NULL && (text->kind != PJ_STRING || !prompt_append(out, text->text)))) return false;
-    }
-    return true;
-}
 static bool prompt_tool_text(prompt_buffer_t *out, const char *text) {
     if (!prompt_append(out, "<tool_result>")) return false;
     for (const char *p = text; *p; ++p) {
@@ -927,6 +906,51 @@ static bool prompt_tool_text(prompt_buffer_t *out, const char *text) {
         if (!prompt_append(out, escape ? (*p == '<' ? "&lt;" : "&amp;") : byte)) return false;
     }
     return prompt_append(out, "</tool_result>");
+}
+
+static bool prompt_content(const prompt_json_t *j, const prompt_json_node_t *content,
+                           prompt_buffer_t *out, myds_vjob_sink_t *img) {
+    if (!content) return false;
+    if (content->kind == PJ_NULL) return true;
+    if (content->kind == PJ_STRING) return prompt_append(out, content->text);
+    if (content->kind != PJ_ARRAY) return false;
+    size_t count = 0;
+    for (size_t i = (size_t)(content - j->nodes) + 1; i < content->next; i = j->nodes[i].next) {
+        bool valid = true;
+        const prompt_json_node_t *type = prompt_json_field(j, &j->nodes[i], "type", &valid);
+        const prompt_json_node_t *text = prompt_json_field(j, &j->nodes[i], "text", &valid);
+        if (!valid || !type || type->kind != PJ_STRING) return false;
+        if (!strcmp(type->text, "input_image")) {
+            if (count++ && !prompt_append(out, "\n\n")) return false;
+            if (!prompt_content_image(j, &j->nodes[i], out, img)) return false;
+            continue;
+        }
+        if (!strcmp(type->text, "tool_result")) {
+            const prompt_json_node_t *t_content = prompt_json_field(j, &j->nodes[i], "content", &valid);
+            if (!t_content) t_content = text;
+            if (count++ && !prompt_append(out, "\n\n")) return false;
+            if (t_content && t_content->kind == PJ_STRING) {
+                if (!prompt_tool_text(out, t_content->text)) return false;
+            } else if (t_content && t_content->kind == PJ_ARRAY) {
+                char *tmp = malloc(out->capacity);
+                if (!tmp) return false;
+                prompt_buffer_t tb = {tmp, out->capacity, 0, false};
+                if (!prompt_content(j, t_content, &tb, img)) { free(tmp); return false; }
+                bool ok = prompt_tool_text(out, tb.data);
+                free(tmp);
+                if (!ok) return false;
+            }
+            continue;
+        }
+        if ((strcmp(type->text, "text") && strcmp(type->text, "input_text") && strcmp(type->text, "output_text")) ||
+            !text ||
+            (text->kind != PJ_NULL && text->kind != PJ_STRING)) return false;
+        if (text->kind == PJ_STRING) {
+            if (count++ && !prompt_append(out, "\n\n")) return false;
+            if (!prompt_append(out, text->text)) return false;
+        }
+    }
+    return true;
 }
 typedef struct { bool pending, user_open; size_t count; } prompt_chat_state_t;
 static bool prompt_render_message(prompt_buffer_t *out, prompt_chat_state_t *state, const char *role,
@@ -982,32 +1006,139 @@ static const char *prompt_node_raw(const prompt_json_t *j, const prompt_json_nod
     return j->base + n->off;
 }
 
-/* 一行工具 schema：{"name":…[,"description":…][,"parameters":…]}
- * 用【原始切片】拼装 ⇒ 参数 schema 逐字节原样，不会因重新序列化而失真。 */
+static bool prompt_dump_json_string(prompt_buffer_t *out, const char *s) {
+    if (!prompt_append(out, "\"")) return false;
+    for (const unsigned char *p = (const unsigned char *)s; *p; ++p) {
+        switch (*p) {
+            case '"': if (!prompt_append(out, "\\\"")) return false; break;
+            case '\\': if (!prompt_append(out, "\\\\")) return false; break;
+            case '\b': if (!prompt_append(out, "\\b")) return false; break;
+            case '\f': if (!prompt_append(out, "\\f")) return false; break;
+            case '\n': if (!prompt_append(out, "\\n")) return false; break;
+            case '\r': if (!prompt_append(out, "\\r")) return false; break;
+            case '\t': if (!prompt_append(out, "\\t")) return false; break;
+            default:
+                if (*p < 0x20) {
+                    char esc[8];
+                    snprintf(esc, sizeof(esc), "\\u%04x", *p);
+                    if (!prompt_append(out, esc)) return false;
+                } else {
+                    char b[2] = {(char)*p, 0};
+                    if (!prompt_append(out, b)) return false;
+                }
+                break;
+        }
+    }
+    return prompt_append(out, "\"");
+}
+
+static bool prompt_dump_json_node(prompt_buffer_t *out, const prompt_json_t *j,
+                                  const prompt_json_node_t *node) {
+    if (!node) return false;
+    switch (node->kind) {
+        case PJ_NULL:
+            return prompt_append(out, "null");
+        case PJ_STRING:
+            return prompt_dump_json_string(out, node->text ? node->text : "");
+        case PJ_SCALAR:
+            if (!j->base || !node->len) return false;
+            return prompt_append_n(out, j->base + node->off, node->len);
+        case PJ_ARRAY: {
+            if (!prompt_append(out, "[")) return false;
+            size_t count = 0;
+            for (size_t i = (size_t)(node - j->nodes) + 1; i < node->next; i = j->nodes[i].next) {
+                if (count++ && !prompt_append(out, ", ")) return false;
+                if (!prompt_dump_json_node(out, j, &j->nodes[i])) return false;
+            }
+            return prompt_append(out, "]");
+        }
+        case PJ_OBJECT: {
+            if (!prompt_append(out, "{")) return false;
+            size_t count = 0;
+            for (size_t i = (size_t)(node - j->nodes) + 1; i < node->next; ) {
+                const prompt_json_node_t *key = &j->nodes[i];
+                const prompt_json_node_t *val = &j->nodes[key->next];
+                if (count++ && !prompt_append(out, ", ")) return false;
+                if (!prompt_dump_json_string(out, key->text ? key->text : "")) return false;
+                if (!prompt_append(out, ": ")) return false;
+                if (!prompt_dump_json_node(out, j, val)) return false;
+                i = val->next;
+            }
+            return prompt_append(out, "}");
+        }
+        default:
+            return false;
+    }
+}
+
+/* 一行工具 schema：{"name": ...} 采用与官方 to_json(json.dumps ensure_ascii=False) 完全一致的格式 */
 static bool prompt_append_tool_schema(prompt_buffer_t *out, const prompt_json_t *j,
                                       const prompt_json_node_t *tool) {
     if (!tool || tool->kind != PJ_OBJECT) return false;
     bool valid = true;
     const prompt_json_node_t *fn = prompt_json_field(j, tool, "function", &valid);
     const prompt_json_node_t *base = (fn && fn->kind == PJ_OBJECT) ? fn : tool;
-    const prompt_json_node_t *name = prompt_json_field(j, base, "name", &valid);
-    const prompt_json_node_t *desc = prompt_json_field(j, base, "description", &valid);
-    const prompt_json_node_t *params = prompt_json_field(j, base, "parameters", &valid);
-    if (!valid || !name || name->kind != PJ_STRING || !prompt_name_ok(name->text)) return false;
-    size_t nlen = 0, dlen = 0, plen = 0;
-    const char *nraw = prompt_node_raw(j, name, &nlen);
-    const char *draw = prompt_node_raw(j, desc, &dlen);
-    const char *praw = prompt_node_raw(j, params, &plen);
-    if (!nraw) return false;
-    if (!prompt_append(out, "{\"name\":")) return false;
-    if (!prompt_append_n(out, nraw, nlen)) return false;
-    if (draw && desc->kind == PJ_STRING) {
-        if (!prompt_append(out, ",\"description\":")) return false;
-        if (!prompt_append_n(out, draw, dlen)) return false;
+    if (!valid || base->kind != PJ_OBJECT) return false;
+
+    /* 提取 namespace（支持字符串或带 name/description 的对象） */
+    bool v_ns = true;
+    const prompt_json_node_t *ns_node = prompt_json_field(j, tool, "namespace", &v_ns);
+    if (!ns_node) ns_node = prompt_json_field(j, base, "namespace", &v_ns);
+    const char *ns_name = NULL;
+    const char *ns_desc = NULL;
+    if (ns_node) {
+        if (ns_node->kind == PJ_STRING) {
+            ns_name = ns_node->text;
+        } else if (ns_node->kind == PJ_OBJECT) {
+            bool v_name = true, v_desc = true;
+            const prompt_json_node_t *n_val = prompt_json_field(j, ns_node, "name", &v_name);
+            const prompt_json_node_t *d_val = prompt_json_field(j, ns_node, "description", &v_desc);
+            if (n_val && n_val->kind == PJ_STRING) ns_name = n_val->text;
+            if (d_val && d_val->kind == PJ_STRING) ns_desc = d_val->text;
+        }
     }
-    if (praw && params->kind == PJ_OBJECT) {
-        if (!prompt_append(out, ",\"parameters\":")) return false;
-        if (!prompt_append_n(out, praw, plen)) return false;
+
+    bool v_name = true;
+    const prompt_json_node_t *name_node = prompt_json_field(j, base, "name", &v_name);
+    if (!v_name || !name_node || name_node->kind != PJ_STRING || !prompt_name_ok(name_node->text))
+        return false;
+
+    char qualified_name[256];
+    const char *colon_colon = strstr(name_node->text, "::");
+    if (colon_colon) {
+        size_t prefix_len = (size_t)(colon_colon - name_node->text);
+        if (ns_name && (strncmp(ns_name, name_node->text, prefix_len) != 0 || ns_name[prefix_len] != 0)) {
+            return false; /* conflicting namespace */
+        }
+        snprintf(qualified_name, sizeof(qualified_name), "%s", name_node->text);
+    } else if (ns_name && *ns_name) {
+        snprintf(qualified_name, sizeof(qualified_name), "%s::%s", ns_name, name_node->text);
+    } else {
+        snprintf(qualified_name, sizeof(qualified_name), "%s", name_node->text);
+    }
+
+    if (!prompt_append(out, "{")) return false;
+    size_t count = 0;
+    for (size_t i = (size_t)(base - j->nodes) + 1; i < base->next; ) {
+        const prompt_json_node_t *key = &j->nodes[i];
+        const prompt_json_node_t *val = &j->nodes[key->next];
+        i = val->next;
+        if (!key->text) continue;
+        if (!strcmp(key->text, "namespace")) continue;
+
+        if (count++ && !prompt_append(out, ", ")) return false;
+        if (!prompt_dump_json_string(out, key->text)) return false;
+        if (!prompt_append(out, ": ")) return false;
+
+        if (!strcmp(key->text, "name")) {
+            if (!prompt_dump_json_string(out, qualified_name)) return false;
+        } else if (!strcmp(key->text, "description") && ns_desc && *ns_desc) {
+            char merged_desc[2048];
+            snprintf(merged_desc, sizeof(merged_desc), "%s\n%s", ns_desc, val->text ? val->text : "");
+            if (!prompt_dump_json_string(out, merged_desc)) return false;
+        } else {
+            if (!prompt_dump_json_node(out, j, val)) return false;
+        }
     }
     return prompt_append(out, "}");
 }
@@ -1047,7 +1178,7 @@ static bool prompt_render_tools(prompt_buffer_t *out, const prompt_json_t *j,
     } else return false;
     if (!count) return false;
     return prompt_append(out, "\n\nYou MUST strictly follow the above defined tool name and parameter "
-                              "schemas to invoke tool calls.");
+                              "schemas to invoke tool calls.\n");
 }
 
 /* assistant 历史里的工具调用 ⇒ DSML 块（返回值以 "\n\n" 开头，便于直接接到 content 之后）。 */
@@ -1288,6 +1419,8 @@ render_items:
         if ((size_t)(items - json.nodes) + 1 == items->next) { *why = "the message list is empty"; goto done; }
         content_buffer = malloc(max_prompt_len);
         if (!content_buffer) goto done;
+        char last_call_ids[64][128];
+        size_t last_call_id_count = 0;
         for (size_t i = (size_t)(items - json.nodes) + 1, i_next = 0; i < items->next; i = i_next) {
             i_next = json.nodes[i].next;   /* 默认推进一条；合并 function_call 时会跳过若干条 */
             const prompt_json_node_t *item = &json.nodes[i];
@@ -1311,6 +1444,85 @@ render_items:
              * 而当时的小探针因为不带历史而全绿 —— 所以【必须用真实轮次验收】）。
              * 正确处置：安全跳过。它不贡献 prompt token，也不改变上下文。 */
             if (type && !strcmp(type->text, "reasoning")) continue;
+
+            /* ── 工具结果排序（按官方 sort_tool_results_by_call_order 规则）──
+             * 连续的 tool / function_call_output 消息按上一轮 assistant 的 tool_calls 顺序重排。 */
+            bool is_tool = (role && role->kind == PJ_STRING && (!strcmp(role->text, "tool") || !strcmp(role->text, "function"))) ||
+                           (type && type->kind == PJ_STRING && !strcmp(type->text, "function_call_output"));
+            if (is_tool) {
+                size_t tool_indices[64];
+                int tool_ranks[64];
+                size_t tool_count = 0;
+                size_t scan = i;
+                while (scan < items->next && tool_count < 64) {
+                    bool v_chk = true;
+                    const prompt_json_node_t *cur = &json.nodes[scan];
+                    const prompt_json_node_t *r = prompt_json_field(&json, cur, "role", &v_chk);
+                    const prompt_json_node_t *t = prompt_json_field(&json, cur, "type", &v_chk);
+                    bool cur_is_tool = (r && r->kind == PJ_STRING && (!strcmp(r->text, "tool") || !strcmp(r->text, "function"))) ||
+                                       (t && t->kind == PJ_STRING && !strcmp(t->text, "function_call_output"));
+                    if (!cur_is_tool) break;
+                    tool_indices[tool_count] = scan;
+
+                    const prompt_json_node_t *tcid = prompt_json_field(&json, cur, "tool_call_id", &v_chk);
+                    if (!tcid) tcid = prompt_json_field(&json, cur, "call_id", &v_chk);
+                    if (!tcid) tcid = prompt_json_field(&json, cur, "id", &v_chk);
+
+                    int rank = 1000 + (int)tool_count;
+                    if (tcid && tcid->kind == PJ_STRING && tcid->text) {
+                        for (size_t c = 0; c < last_call_id_count; ++c) {
+                            if (!strcmp(last_call_ids[c], tcid->text)) {
+                                rank = (int)c;
+                                break;
+                            }
+                        }
+                    }
+                    tool_ranks[tool_count] = rank;
+                    tool_count++;
+                    scan = json.nodes[scan].next;
+                }
+                i_next = scan;
+
+                /* 稳定插入排序 */
+                for (size_t a = 1; a < tool_count; ++a) {
+                    size_t key_idx = tool_indices[a];
+                    int key_rank = tool_ranks[a];
+                    size_t b = a;
+                    while (b > 0 && tool_ranks[b - 1] > key_rank) {
+                        tool_indices[b] = tool_indices[b - 1];
+                        tool_ranks[b] = tool_ranks[b - 1];
+                        b--;
+                    }
+                    tool_indices[b] = key_idx;
+                    tool_ranks[b] = key_rank;
+                }
+
+                for (size_t a = 0; a < tool_count; ++a) {
+                    const prompt_json_node_t *cur_item = &json.nodes[tool_indices[a]];
+                    bool v_item = true;
+                    const prompt_json_node_t *cur_type = prompt_json_field(&json, cur_item, "type", &v_item);
+                    const prompt_json_node_t *cur_content = NULL;
+                    if (cur_type && !strcmp(cur_type->text, "function_call_output")) {
+                        cur_content = prompt_json_field(&json, cur_item, "output", &v_item);
+                    } else {
+                        cur_content = prompt_json_field(&json, cur_item, "content", &v_item);
+                    }
+                    if (!cur_content) cur_content = prompt_json_field(&json, cur_item, "text", &v_item);
+
+                    prompt_buffer_t decoded = {content_buffer, max_prompt_len, 0, false};
+                    content_buffer[0] = 0;
+                    if (cur_content && !prompt_content(&json, cur_content, &decoded, img)) {
+                        *why = "unsupported content block in tool result";
+                        goto done;
+                    }
+                    if (!prompt_render_message(&out, &state, "tool", decoded.data, NULL)) {
+                        *why = "a message could not be rendered (or the prompt buffer is full)";
+                        goto done;
+                    }
+                }
+                continue;
+            }
+
             if (messages && !role) {
                 *why = "a message has a malformed role/type field";
                 goto done;
@@ -1351,6 +1563,54 @@ render_items:
                 if (run_begin) i_next = json.nodes[run_last].next;
             }
             if (tc || run_begin) {
+                last_call_id_count = 0;
+                if (tc) {
+                    const prompt_json_node_t *array = tc;
+                    const prompt_json_node_t *single = NULL;
+                    if (tc->kind == PJ_OBJECT) {
+                        bool v_tc = true;
+                        const prompt_json_node_t *inner = prompt_json_field(&json, tc, "tool_calls", &v_tc);
+                        if (inner && inner->kind == PJ_ARRAY) array = inner;
+                        else if (prompt_json_field(&json, tc, "name", &v_tc)) single = tc;
+                    }
+                    if (array && array->kind == PJ_ARRAY) {
+                        for (size_t k = (size_t)(array - json.nodes) + 1; k < array->next; k = json.nodes[k].next) {
+                            bool v_tc = true;
+                            const prompt_json_node_t *entry = &json.nodes[k];
+                            const prompt_json_node_t *id_node = prompt_json_field(&json, entry, "id", &v_tc);
+                            if (!id_node) {
+                                const prompt_json_node_t *fn = prompt_json_field(&json, entry, "function", &v_tc);
+                                if (fn && fn->kind == PJ_OBJECT) id_node = prompt_json_field(&json, fn, "id", &v_tc);
+                            }
+                            if (id_node && id_node->kind == PJ_STRING && id_node->text && last_call_id_count < 64) {
+                                strncpy(last_call_ids[last_call_id_count], id_node->text, 127);
+                                last_call_ids[last_call_id_count][127] = 0;
+                                last_call_id_count++;
+                            }
+                        }
+                    } else if (single) {
+                        bool v_tc = true;
+                        const prompt_json_node_t *id_node = prompt_json_field(&json, single, "id", &v_tc);
+                        if (id_node && id_node->kind == PJ_STRING && id_node->text && last_call_id_count < 64) {
+                            strncpy(last_call_ids[last_call_id_count], id_node->text, 127);
+                            last_call_ids[last_call_id_count][127] = 0;
+                            last_call_id_count++;
+                        }
+                    }
+                }
+                if (run_begin) {
+                    size_t stop = json.nodes[run_last].next;
+                    for (size_t k = run_begin; k < stop; k = json.nodes[k].next) {
+                        bool v_tc = true;
+                        const prompt_json_node_t *id_node = prompt_json_field(&json, &json.nodes[k], "call_id", &v_tc);
+                        if (!id_node) id_node = prompt_json_field(&json, &json.nodes[k], "id", &v_tc);
+                        if (id_node && id_node->kind == PJ_STRING && id_node->text && last_call_id_count < 64) {
+                            strncpy(last_call_ids[last_call_id_count], id_node->text, 127);
+                            last_call_ids[last_call_id_count][127] = 0;
+                            last_call_id_count++;
+                        }
+                    }
+                }
                 suffix = malloc(max_prompt_len);
                 if (!suffix) { *why = "out of memory rendering tool calls"; goto done; }
                 prompt_buffer_t sb = {suffix, max_prompt_len, 0, false};
@@ -1362,6 +1622,8 @@ render_items:
                     *why = "malformed function_call item in the message history";
                     goto done;
                 }
+            } else if (!strcmp(role_text, "assistant")) {
+                last_call_id_count = 0;
             }
             if (!valid) { *why = "malformed content in the message history"; goto done; }
             /* function_call 项没有 content（name/arguments 在这一层）⇒ 正文按空处理 */

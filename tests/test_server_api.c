@@ -396,7 +396,7 @@ static void test_deepseek41_chat_templates(void) {
         {"{\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"},{\"role\":\"assistant\",\"content\":\"Hello\"}]}",
          "<｜begin▁of▁sentence｜><｜User｜>Hi<｜Assistant｜></think>Hello<｜end▁of▁sentence｜>"},
         {"{\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"你\"},{\"type\":\"text\",\"text\":\"好\\uD83D\\uDE42\"}]}]}",
-         "<｜begin▁of▁sentence｜><｜User｜>你好🙂<｜Assistant｜></think>"},
+         "<｜begin▁of▁sentence｜><｜User｜>你\n\n好🙂<｜Assistant｜></think>"},
         {"{\"metadata\":{\"input\":\"wrong\",\"instructions\":\"ignore\"},\"inp\\u0075t\":\"right\"}",
          "<｜begin▁of▁sentence｜><｜User｜>right<｜Assistant｜></think>"},
         {"{\"messages\":[{\"role\":\"system\",\"content\":\"\"},{\"role\":\"user\",\"content\":\"\"}]}",
@@ -477,10 +477,10 @@ static void test_deepseek41_tool_calls(void) {
     assert(strstr(output, "<｜DSML｜ invoke") != NULL);
     assert(strstr(output, "### Available Tool Schemas") != NULL);
     /* schema 逐字节原样（含参数细节），而不是被重新序列化后失真 */
-    assert(strstr(output, "{\"name\":\"get_weather\",\"description\":\"Get weather\","
-                          "\"parameters\":{\"type\":\"object\",\"properties\":"
-                          "{\"city\":{\"type\":\"string\"},\"days\":{\"type\":\"integer\"}},"
-                          "\"required\":[\"city\"]}}") != NULL);
+    assert(strstr(output, "{\"name\": \"get_weather\", \"description\": \"Get weather\", "
+                          "\"parameters\": {\"type\": \"object\", \"properties\": "
+                          "{\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, "
+                          "\"required\": [\"city\"]}}") != NULL);
     assert(strstr(output, "<｜User｜>Weather in Beijing?") != NULL);
     assert(strstr(output, "You MUST strictly follow the above defined tool name") != NULL);
 
@@ -489,8 +489,8 @@ static void test_deepseek41_tool_calls(void) {
         "{\"input\":\"hi\",\"tools\":[{\"type\":\"function\",\"name\":\"lookup\","
         "\"description\":\"Look up\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}]}";
     assert(parse_chat_prompt(flat_tools, output, sizeof(output)));
-    assert(strstr(output, "{\"name\":\"lookup\",\"description\":\"Look up\","
-                          "\"parameters\":{\"type\":\"object\",\"properties\":{}}}") != NULL);
+    assert(strstr(output, "{\"type\": \"function\", \"name\": \"lookup\", \"description\": \"Look up\", "
+                          "\"parameters\": {\"type\": \"object\", \"properties\": {}}}") != NULL);
 
     /* ③ 历史里的 assistant tool_calls ⇒ DSML invoke/parameter 块（在 EOS 之前） */
     const char *history =
@@ -562,6 +562,26 @@ static void test_deepseek41_tool_calls(void) {
     /* ⑥ 工具名用不安全字符（会被写进 DSML 属性）⇒ 拒绝 */
     assert(!parse_chat_prompt("{\"tools\":[{\"type\":\"function\",\"function\":"
                               "{\"name\":\"bad\\\"name\",\"parameters\":{}}}]}", small, sizeof(small)));
+
+    /* ⑦ 工具结果重排：多 tool 结果应按照上一轮 assistant 的 tool_calls 声明顺序排列 */
+    const char *out_of_order =
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"},"
+        "{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":["
+        "{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"exec\",\"arguments\":\"{\\\"cmd\\\":\\\"1\\\"}\"}},"
+        "{\"id\":\"c2\",\"type\":\"function\",\"function\":{\"name\":\"exec\",\"arguments\":\"{\\\"cmd\\\":\\\"2\\\"}\"}}]},"
+        "{\"role\":\"tool\",\"tool_call_id\":\"c2\",\"content\":\"two\"},"
+        "{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"one\"}]}";
+    assert(parse_chat_prompt(out_of_order, output, sizeof(output)));
+    assert(strstr(output, "<tool_result>one</tool_result>\n\n<tool_result>two</tool_result>") != NULL);
+
+    /* ⑧ TOOLS_TEMPLATE 尾部换行与额外字段 (如 strict) 保留 */
+    const char *strict_tool =
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
+        "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"description\":\"d\","
+        "\"parameters\":{\"type\":\"object\"},\"strict\":true}}]}";
+    assert(parse_chat_prompt(strict_tool, output, sizeof(output)));
+    assert(strstr(output, "\"strict\": true") != NULL);
+    assert(strstr(output, "schemas to invoke tool calls.\n<｜User｜>") != NULL);
 
     printf("  [PASS] V4.1 DSML tool definitions, assistant tool_calls, tool results and rejections\n");
 }
