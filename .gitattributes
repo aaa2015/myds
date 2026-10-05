@@ -10,3 +10,6 @@ docs/benchmarks/2026-10-05-phase/*.patch -whitespace
 docs/benchmarks/2026-10-05-optimization/protocol/*.patch -whitespace
 docs/benchmarks/2026-10-05-optimization/replay-tools/patches/*.patch -whitespace
 docs/benchmarks/2026-10-05-optimization/validation/*.log -whitespace
+docs/benchmarks/2026-10-05-engram-io/** -text
+docs/benchmarks/2026-10-05-engram-io/**/*.patch -whitespace
+docs/benchmarks/2026-10-05-engram-io/validation/*.log -whitespace

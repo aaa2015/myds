@@ -1529,6 +1529,9 @@ myds_v41_model_t *myds_v41_model_create(myds_model_t *m, const char *path) {
     }
 #undef W
     v->engram = myds_engram_create(gf,path,m->vocab_size,m->dim);
+    if (v->engram)
+        MYDS_LOG_I("Engram SSD I/O: %u threads%s (MYDS_ENGRAM_IO_THREADS=1 selects serial)",
+                   v->engram->io_threads, v->engram->io_threads > 1 ? ", persistent raw-read pool" : ", serial");
     if (!v->engram) goto fail;
     for (uint32_t i=0;i<2;i++) {
         v->engram_proj[i]=wrap(v->engram->projection[i]);

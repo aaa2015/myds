@@ -40,6 +40,7 @@ TEST_P1 = $(BIN_DIR)/test_p1
 BENCH_SYNTHETIC = $(BIN_DIR)/bench_synthetic
 BENCH_METAL = $(BIN_DIR)/bench_metal
 BENCH_PHASE = $(BIN_DIR)/bench_phase
+BENCH_ENGRAM_IO = $(BIN_DIR)/bench_engram_io
 DUMP_TENSORS = $(BIN_DIR)/dump_tensors
 METALLIB = $(BIN_DIR)/myds.metallib
 METAL_SRCS = $(wildcard metal/*.metal)
@@ -185,7 +186,11 @@ $(BUILD_DIR)/test_engram.o: tests/test_engram.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 $(TEST_ENGRAM): $(BUILD_DIR)/test_engram.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_gguf.o | $(BIN_DIR)
-	$(CC) $^ -lm -o $@
+	$(CC) $^ -lm -lpthread -o $@
+
+# CPU-only real-token Engram I/O harness; does not load GPU/backbone weights.
+$(BENCH_ENGRAM_IO): tools/bench_engram_io.c $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) $^ -lm -lpthread -o $@
 
 $(BUILD_DIR)/test_cpu.o: tests/test_cpu.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
@@ -272,6 +277,10 @@ test: $(ALL_TESTS) $(METALLIB)
 	@echo ""
 	@python3 tests/test_http_bytes.py
 	@python3 tests/test_bench_reproduce.py
+	@python3 tools/test_engram_pool_failures.py
+	@python3 tests/test_engram_io_tools.py
+	@python3 tests/test_engram_io_window.py
+	@python3 docs/benchmarks/2026-10-05-engram-io/scripts/test-full-model-summary.py
 	@echo "\n========================================================"
 	@echo "      ALL TEST SUITES PASSED CLEANLY & SUCCESSFULLY!    "
 	@echo "========================================================"

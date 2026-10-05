@@ -108,6 +108,24 @@ static void metric(FILE *out, const char *key, bool valid, double value) {
     if (valid) fprintf(out, "%.9f", value); else fputs("null", out);
 }
 
+/* Optional storage evidence, outside every request's timed interval. These
+ * are global block-driver counters, not per-process or physical NAND bytes. */
+static bool storage_counters(FILE *json, uint32_t run, const char *phase) {
+    if (!getenv("MYDS_BENCH_STORAGE_COUNTERS")) return true;
+    FILE *pipe = popen("/usr/sbin/ioreg -r -c IOBlockStorageDriver -l -d 1", "r");
+    if (!pipe) return false;
+    char text[65536];
+    size_t n = fread(text, 1, sizeof(text) - 1u, pipe);
+    bool ok = !ferror(pipe) && n < sizeof(text) - 1u;
+    if (pclose(pipe) != 0) ok = false;
+    if (!ok) return false;
+    text[n] = 0;
+    fprintf(json, "{\"kind\":\"storage_counters\",\"run\":%u,\"phase\":", run);
+    json_string(json, phase);
+    fputs(",\"ioreg\":", json); json_string(json, text); fputs("}\n", json); fflush(json);
+    return true;
+}
+
 int main(int argc, char **argv) {
     if (argc < 3 || argc > 6) {
         fprintf(stderr, "Usage: %s model.gguf request.json [repeats=3 (1..4)] [max_new_tokens=64 (32|64)] [max_seq_len=262144]\n", argv[0]);
@@ -174,7 +192,8 @@ int main(int argc, char **argv) {
         /* 2026-10-05 path selectors: without them two configurations of one
          * binary produce identical metadata (see head-first-long-validation). */
         "MYDS_ATTN_VEC_HEAD_FIRST", "MYDS_ATTN_GATHER_MIN_KEYS", "MYDS_PREFILL_ATTN",
-        "MYDS_QKV_FUSE_BF16", "MYDS_QKV_FUSE_POST", "MYDS_QKV_NR0", "MYDS_MOE_IQ2_TAIL_CULL"};
+        "MYDS_QKV_FUSE_BF16", "MYDS_QKV_FUSE_POST", "MYDS_QKV_NR0", "MYDS_MOE_IQ2_TAIL_CULL",
+        "MYDS_ENGRAM_IO_THREADS", "MYDS_ENGRAM_NOCACHE", "MYDS_BENCH_STORAGE_COUNTERS"};
     for (size_t i = 0; i < sizeof(env_names)/sizeof(env_names[0]); ++i) {
         if (i) fputc(',', json); json_string(json, env_names[i]); fputc(':', json); json_string(json, getenv(env_names[i]));
     }
@@ -207,9 +226,11 @@ int main(int argc, char **argv) {
     for (uint32_t run = 0; run <= repeats; ++run) {
         capture_t c = {.bytes_hash = seed_hash, .ids_hash = seed_hash};
         myds_stop_reason_t reason = MYDS_STOP_ERROR; uint32_t prompt_tokens = 0;
+        if (!storage_counters(json, run, "before")) { status = 1; break; }
         const double start = now_s();
         const int ok = myds_generate_bytes_ex(ctx, prompt, capture, &c, &reason, &prompt_tokens, NULL);
         const double wall_s = now_s() - start;
+        if (!storage_counters(json, run, "after")) { status = 1; break; }
         myds_prefill_stats_t pf; myds_last_prefill_stats(ctx, &pf);
         /* Resolve available profiler records only after generation's existing waits.
          * This export is deliberately outside the measured request wall interval. */

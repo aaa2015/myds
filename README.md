@@ -354,6 +354,10 @@ metadata 的 environment 额外记录 `MYDS_ATTN_VEC_HEAD_FIRST`、`MYDS_ATTN_GA
 `MYDS_PREFILL_ATTN`、`MYDS_QKV_FUSE_BF16`、`MYDS_QKV_FUSE_POST`、`MYDS_QKV_NR0`、
 `MYDS_MOE_IQ2_TAIL_CULL`。每个样本含 `attention_paths`（本轮 attention 调用、gather/slab、
 head-first 尝试/成功/失败/缓存回退、原 vec、matrix 及其回退次数）；出现回退时 stderr 另有一行提示。
+Engram I/O 配置另记录 `MYDS_ENGRAM_IO_THREADS`、`MYDS_ENGRAM_NOCACHE`。
+直接调用底层工具时，`MYDS_BENCH_STORAGE_COUNTERS=1` 在每次请求计时前后记录
+`IOBlockStorageDriver` 的全局计数器；采集时间不计入请求耗时。这些是操作系统块设备
+读计数，不能单独归因到本进程，也不能当作 NAND 流量。
 `run-summary.json` 与 `compare` 输出 `attention_paths`，`run` 结束时打印 `attention_fallback`。
 2026-10-05 证据由加入这些字段之前的 bench_phase 生成，样本中没有该字段，汇总显示为 `null`。
 
@@ -371,6 +375,43 @@ chunk=512、MoE chunks=9、suffix shift=512、residency keep-alive=86400。
 prefill 口径为 `1000 * prefill_seconds / prefill_tokens`，最终 prompt token 在首次 decode
 forward 消耗；decode 为 `1000 * (last_callback-first_callback) / (output_tokens-1)`，
 不含首次 forward/TTFT。加载、HTTP 传输、队列等待不计入这两个指标。
+
+#### Engram SSD 并行读取
+
+默认使用 8 个读取线程；`MYDS_ENGRAM_IO_THREADS=1` 使用原串行读取；`2..16` 使用每个 context 独立拥有的
+常驻线程池。只并行当前 token 的两张表共 48 行 raw `pread`，解码仍在调用线程按
+原顺序执行。全部 worker 结束、读取与解码全部成功后才提交 history/position；
+任意失败均返回错误，池初始化失败不会静默改变实际线程数。模型加载日志记录所选配置。
+
+Mac Studio M2 Ultra 的同输入独占实测：Engram 冷首轮 CPU 路径由
+1.197 降到 0.249 ms/token，完整模型冷首请求 prefill 由 4.339 降到
+3.346 ms/token、decode 由 41.779 降到 37.460 ms/token。缓存热态存在调度成本：
+普通 prompt 的 prefill 增加 0.059 ms/token、decode 增加 0.414 ms/token。
+默认 8 线程优先降低 SSD 未命中时延；已知长期热缓存的负载可选择 1 线程。
+这些是固定 prompt 的实测，冷首请求的 decode 已经过 prefill 暖页，不能解释为全部 lookup 都冷。
+
+CPU 工具走真实 GGUF 的 `myds_engram_prepare_token`，包含 hash、派发、等待、读取和解码；
+它不加载主干/GPU。`--tokens-bin` 接受 little-endian int32，`--text` 用模型分词器且
+不额外加 BOS；完整 HTTP prompt 的精确输入导出工具见本轮协议。
+
+```sh
+make bin/bench_engram_io
+python3 tools/run_engram_io.py --bench "$PWD/bin/bench_engram_io" \
+  --model "$MYDS_REPRO_MODEL" --tokens-bin /absolute/path/to/tokens.bin \
+  --output /absolute/path/to/new-results --order 1,4,8,8,4,1 --warm-runs 2
+python3 tools/summarize_engram_io.py /absolute/path/to/new-results
+python3 tools/test_engram_pool_failures.py --sanitizer address
+python3 tools/test_engram_pool_failures.py --sanitizer thread
+```
+
+冷读候选样本使用同内容 APFS clone；每轮在模型/线程池初始化完成后，通过 stdin 闸门
+采集读取阶段的设备计数器。不同 inode、`F_NOCACHE` 或应用层逻辑字节都不能独立证明冷读。
+首轮与重复热态轮分别汇总，逐 token 行 ID、解码向量 hash、history 和跨配置一致性必须通过。
+普通单元测试、线程/同步初始化故障注入、EINTR/正短读、并发、测量工具证据校验和
+mock 独占窗口恢复测试纳入 `make test`。
+完整模型与 CPU 读取的日志、复现步骤和结果见
+[Engram I/O 实测结论](docs/benchmarks/2026-10-05-engram-io/assessment.txt)及
+[复现协议](docs/benchmarks/2026-10-05-engram-io/protocol.txt)。
 
 #### 构建同轮基线并比较
 

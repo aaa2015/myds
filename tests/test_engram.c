@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <fenv.h>
+#include <limits.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -279,6 +280,130 @@ static void test_disk(void) {
     printf("Engram: sparse 1-GiB offset row reads, deduplication, bounds, truncated row failure passed\n");
 }
 
+/* Distinct finite encodings in every row and 32-value block. Unlike a zero
+ * fixture, this detects reordered columns, swapped tables and stale requests.
+ * The mathematical expected values come from decode_scalar above. */
+static void patterned_row(uint8_t raw[MYDS_ENGRAM_ROW_BYTES], unsigned layer, unsigned id) {
+    for (unsigned block = 0; block < 8; ++block) {
+        raw[MYDS_ENGRAM_DIM + block] = (uint8_t)(120 + (id * 3 + layer * 5 + block) % 15);
+        for (unsigned j = 0; j < 32; ++j) {
+            unsigned code = (id * 29 + layer * 71 + block * 11 + j * 7) % 127;
+            raw[block * 32 + j] = (uint8_t)(code | (((id + layer + block + j) & 1u) << 7));
+        }
+    }
+}
+
+static void write_patterned_tables(int fd, const myds_engram_table_t tables[2]) {
+    uint8_t raw[MYDS_ENGRAM_ROW_BYTES];
+    uint64_t end = tables[1].offset + (uint64_t)tables[1].rows * sizeof(raw);
+    assert(ftruncate(fd, (off_t)end) == 0);
+    for (unsigned layer = 0; layer < 2; ++layer)
+        for (uint32_t id = 0; id < tables[layer].rows; ++id) {
+            patterned_row(raw, layer, id);
+            off_t off = (off_t)(tables[layer].offset + (uint64_t)id * sizeof(raw));
+            assert(pwrite(fd, raw, sizeof(raw), off) == (ssize_t)sizeof(raw));
+        }
+}
+
+static void test_parallel_disk(void) {
+    char path[] = "/tmp/myds-engram-parallel.XXXXXX";
+    int fd = mkstemp(path);
+    assert(fd >= 0);
+    const uint64_t offset = (UINT64_C(1) << 30) + 3;
+    myds_engram_table_t tables[2] = {
+        {.fd = fd, .offset = offset, .rows = 64},
+        {.fd = fd, .offset = offset + 64 * MYDS_ENGRAM_ROW_BYTES + 19, .rows = 64},
+    };
+    write_patterned_tables(fd, tables);
+    for (unsigned layer = 0; layer < 2; ++layer)
+        assert(myds_engram_table_open(&tables[layer], path, tables[layer].offset, tables[layer].rows));
+    uint32_t ids[2][MYDS_ENGRAM_COLS];
+    float expected[2][MYDS_ENGRAM_INPUT_DIM], actual[2][MYDS_ENGRAM_INPUT_DIM];
+    uint8_t raw[MYDS_ENGRAM_ROW_BYTES];
+    for (unsigned layer = 0; layer < 2; ++layer)
+        for (unsigned column = 0; column < MYDS_ENGRAM_COLS; ++column) {
+            /* Repeated, shuffled IDs exercise deduplication and output order. */
+            ids[layer][column] = (column * 13 + layer * 7) % 19;
+            patterned_row(raw, layer, ids[layer][column]);
+            assert(decode_scalar(raw, expected[layer] + column * MYDS_ENGRAM_DIM));
+        }
+    assert(myds_engram_reader_read_token(NULL, tables, ids, actual));
+    assert(memcmp(expected, actual, sizeof(actual)) == 0);
+    static const unsigned workers[] = {1, 2, 4, 8, 16};
+    for (size_t w = 0; w < sizeof(workers) / sizeof(workers[0]); ++w) {
+        myds_engram_reader_t *reader = myds_engram_reader_create(workers[w]);
+        assert(reader);
+        for (unsigned iteration = 0; iteration < 32; ++iteration) {
+            errno = EBUSY;
+            assert(myds_engram_reader_read_token(reader, tables, ids, actual));
+            assert(errno == EBUSY && memcmp(expected, actual, sizeof(actual)) == 0);
+        }
+        /* Decode still runs with the caller's rounding mode and sticky flags. */
+        fenv_t saved_env;
+        assert(fegetenv(&saved_env) == 0 && fesetround(FE_UPWARD) == 0);
+        assert(feclearexcept(FE_ALL_EXCEPT) == 0 && feraiseexcept(FE_INVALID) == 0);
+        assert(myds_engram_reader_read_token(reader, tables, ids, actual));
+        assert(fegetround() == FE_UPWARD && fetestexcept(FE_ALL_EXCEPT) == FE_INVALID);
+        assert(memcmp(expected, actual, sizeof(actual)) == 0);
+        assert(fesetenv(&saved_env) == 0);
+
+        /* The first table validates its complete row list before any writes.
+         * Output after a later-table failure is invalid, as in serial reads. */
+        uint32_t invalid[2][MYDS_ENGRAM_COLS];
+        memcpy(invalid, ids, sizeof(invalid)); invalid[0][23] = tables[0].rows;
+        memset(actual, 0x5a, sizeof(actual));
+        float untouched[2][MYDS_ENGRAM_INPUT_DIM]; memcpy(untouched, actual, sizeof(actual));
+        assert(!myds_engram_reader_read_token(reader, tables, invalid, actual) && errno == EINVAL);
+        assert(memcmp(untouched, actual, sizeof(actual)) == 0);
+        memcpy(invalid, ids, sizeof(invalid)); invalid[1][23] = tables[1].rows;
+        assert(!myds_engram_reader_read_token(reader, tables, invalid, actual) && errno == EINVAL);
+
+        /* Actual partial pread followed by EOF; the same pool must recover. */
+        uint64_t short_end = tables[1].offset + (uint64_t)ids[1][0] * sizeof(raw) + 80;
+        assert(ftruncate(fd, (off_t)short_end) == 0);
+        assert(!myds_engram_reader_read_token(reader, tables, ids, actual) && errno == EIO);
+
+        /* Both faults exist concurrently. Serial logical order selects the
+         * earlier corrupt encoding, even if a later EOF finishes first. */
+        patterned_row(raw, 0, ids[0][0]); raw[255] = 127;
+        off_t first = (off_t)(tables[0].offset + (uint64_t)ids[0][0] * sizeof(raw));
+        assert(pwrite(fd, raw, sizeof(raw), first) == (ssize_t)sizeof(raw));
+        assert(!myds_engram_reader_read_token(reader, tables, ids, actual) && errno == EDOM);
+        /* Malformed later input cannot hide an earlier decode error either. */
+        assert(!myds_engram_reader_read_token(reader, tables, invalid, actual) && errno == EDOM);
+        myds_engram_table_t later_bad[2]; memcpy(later_bad, tables, sizeof(later_bad));
+        later_bad[1].fd = -1;
+        assert(!myds_engram_reader_read_token(reader, later_bad, ids, actual) && errno == EDOM);
+        write_patterned_tables(fd, tables);
+        assert(myds_engram_reader_read_token(reader, tables, ids, actual));
+        assert(memcmp(expected, actual, sizeof(actual)) == 0);
+
+        /* A positive descriptor number that has been closed reaches pread,
+         * so EBADF must be transferred back from a worker thread. */
+        myds_engram_table_t bad[2]; memcpy(bad, tables, sizeof(bad));
+        int closed_fd = dup(tables[0].fd);
+        assert(closed_fd >= 0 && close(closed_fd) == 0); bad[0].fd = closed_fd;
+        assert(!myds_engram_reader_read_token(reader, bad, ids, actual) && errno == EBADF);
+        assert(myds_engram_reader_read_token(reader, tables, ids, actual));
+        assert(memcmp(expected, actual, sizeof(actual)) == 0);
+        myds_engram_reader_free(reader);
+    }
+    assert(!myds_engram_reader_create(0) && errno == EINVAL);
+    assert(!myds_engram_reader_create(17) && errno == EINVAL);
+    myds_engram_reader_free(NULL);
+    /* Repeated lifecycle coverage catches stale requests and unjoined worker
+     * access to freed storage under ASan/TSan, without timing-based assertions. */
+    for (unsigned i = 0; i < 32; ++i) {
+        myds_engram_reader_t *reader = myds_engram_reader_create(4);
+        assert(reader && myds_engram_reader_read_token(reader, tables, ids, actual));
+        assert(memcmp(expected, actual, sizeof(actual)) == 0);
+        myds_engram_reader_free(reader);
+    }
+    myds_engram_table_close(&tables[0]); myds_engram_table_close(&tables[1]);
+    close(fd); unlink(path);
+    puts("Engram: serial/1/2/4/8/16-worker byte parity, repeated IDs, ordered errors, EOF/EBADF recovery and lifecycle passed");
+}
+
 static void test_gate(void) {
     float residual[16], kv[20], q[16], k[16];
     for (int s = 0; s < 4; ++s)
@@ -296,6 +421,116 @@ static void test_gate(void) {
     assert(!myds_engram_add_reference(residual, kv, q, k, 4, 1e-20f));
     assert(memcmp(before, residual, sizeof(before)) == 0);
     printf("Engram: independent four-stream signed gate/add known answers passed\n");
+}
+
+static void assert_prepared_equal(const myds_engram_t *a, const myds_engram_t *b) {
+    assert(a->prepared && b->prepared && a->position == b->position);
+    assert(memcmp(&a->history, &b->history, sizeof(a->history)) == 0);
+    assert(memcmp(a->row_ids, b->row_ids, sizeof(a->row_ids)) == 0);
+    assert(memcmp(a->row_values, b->row_values, sizeof(a->row_values)) == 0);
+}
+
+static void test_model_readers(const gguf_file_t *gf, const char *path, int fd) {
+    myds_engram_t *serial = myds_engram_create(gf, path, 5, 1);
+    assert(serial && myds_engram_set_io_threads(serial, 1));
+    write_patterned_tables(fd, serial->table);
+    static const int32_t tokens[] = {1, 2, 3, 4, 4, 0, 1, 3, 2, 0, 4, 1};
+    static const unsigned workers[] = {1, 2, 4, 8, 16};
+    for (size_t w = 0; w < sizeof(workers) / sizeof(workers[0]); ++w) {
+        myds_engram_t *parallel = myds_engram_clone(serial);
+        assert(parallel && myds_engram_set_io_threads(parallel, workers[w]));
+        myds_engram_reader_t *saved_reader = parallel->reader;
+        assert(!myds_engram_set_io_threads(parallel, 0) && errno == EINVAL);
+        assert(parallel->io_threads == workers[w] && parallel->reader == saved_reader);
+        assert(!myds_engram_set_io_threads(parallel, 17) && errno == EINVAL);
+        assert(parallel->io_threads == workers[w] && parallel->reader == saved_reader);
+        for (unsigned pass = 0; pass < 3; ++pass) {
+            myds_engram_reset(serial); myds_engram_reset(parallel);
+            for (size_t p = 0; p < sizeof(tokens) / sizeof(tokens[0]); ++p) {
+                int32_t token = tokens[(p + pass) % (sizeof(tokens) / sizeof(tokens[0]))];
+                assert(myds_engram_prepare_token(serial, token, p));
+                assert(myds_engram_prepare_token(parallel, token, p));
+                assert_prepared_equal(serial, parallel);
+            }
+        }
+
+        /* Fresh clone owns descriptors and a pool independently of its source.
+         * Advancing or destroying it cannot change the source's request/state. */
+        myds_engram_history_t before_clone = parallel->history;
+        myds_engram_t *clone = myds_engram_clone(parallel);
+        assert(clone && clone->io_threads == parallel->io_threads);
+        if (workers[w] > 1) assert(clone->reader && clone->reader != parallel->reader);
+        assert(myds_engram_prepare_token(clone, 2, 0));
+        assert(memcmp(&before_clone, &parallel->history, sizeof(before_clone)) == 0);
+        int clone_fds[2] = {clone->table[0].fd, clone->table[1].fd};
+        myds_engram_free(clone);
+        for (unsigned layer = 0; layer < 2; ++layer)
+            assert(fcntl(clone_fds[layer], F_GETFD) == -1 && errno == EBADF);
+
+        /* Failed duplicate must release its partial ownership while preserving
+         * the source pool. The source remains usable after fixing its fd. */
+        int valid_fd = parallel->table[1].fd;
+        /* A recently closed low fd could be reused by the first duplication. */
+        parallel->table[1].fd = INT_MAX;
+        assert(!myds_engram_clone(parallel) && errno == EBADF);
+        parallel->table[1].fd = valid_fd;
+
+        const uint64_t position = parallel->position;
+        const int32_t token = 3;
+        myds_engram_history_t before = parallel->history, next = before;
+        uint32_t rows[2][MYDS_ENGRAM_COLS];
+        assert(myds_engram_hash(&parallel->layout, &next, &token, NULL, 1, &rows[0][0]));
+        assert(ftruncate(fd, (off_t)(parallel->table[1].offset +
+            (uint64_t)rows[1][0] * MYDS_ENGRAM_ROW_BYTES + 80)) == 0);
+        assert(!myds_engram_prepare_token(parallel, token, position) && errno == EIO);
+        assert(!parallel->prepared && parallel->position == position);
+        assert(memcmp(&before, &parallel->history, sizeof(before)) == 0);
+        write_patterned_tables(fd, parallel->table);
+
+        uint8_t raw[MYDS_ENGRAM_ROW_BYTES];
+        patterned_row(raw, 1, rows[1][0]); raw[255] = 127;
+        off_t corrupt = (off_t)(parallel->table[1].offset +
+            (uint64_t)rows[1][0] * sizeof(raw));
+        assert(pwrite(fd, raw, sizeof(raw), corrupt) == (ssize_t)sizeof(raw));
+        assert(!myds_engram_prepare_token(parallel, token, position) && errno == EDOM);
+        assert(!parallel->prepared && parallel->position == position);
+        assert(memcmp(&before, &parallel->history, sizeof(before)) == 0);
+        write_patterned_tables(fd, parallel->table);
+
+        /* Recover at the original position, with no skipped token or stale
+         * rows from either failed request. Both complete outputs must agree. */
+        assert(myds_engram_prepare_token(serial, token, position));
+        assert(myds_engram_prepare_token(parallel, token, position));
+        assert_prepared_equal(serial, parallel);
+        int parallel_fds[2] = {parallel->table[0].fd, parallel->table[1].fd};
+        myds_engram_free(parallel);
+        for (unsigned layer = 0; layer < 2; ++layer)
+            assert(fcntl(parallel_fds[layer], F_GETFD) == -1 && errno == EBADF);
+    }
+    myds_engram_free(serial);
+    puts("Engram: token/history/row byte parity, reset, clone ownership, configuration rollback and failure/retry transactions passed");
+}
+
+static void test_io_configuration(const gguf_file_t *gf, const char *path) {
+    const char *existing = getenv("MYDS_ENGRAM_IO_THREADS");
+    char *saved = existing ? strdup(existing) : NULL;
+    assert(!existing || saved);
+    assert(unsetenv("MYDS_ENGRAM_IO_THREADS") == 0);
+    myds_engram_t *e = myds_engram_create(gf, path, 5, 1);
+    assert(e && e->io_threads == 8 && !e->reader);
+    myds_engram_free(e);
+    assert(setenv("MYDS_ENGRAM_IO_THREADS", "1", 1) == 0);
+    e = myds_engram_create(gf, path, 5, 1);
+    assert(e && e->io_threads == 1 && !e->reader);
+    myds_engram_free(e);
+    static const char *invalid[] = {"0", "17", "-1", "abc", "8x"};
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+        assert(setenv("MYDS_ENGRAM_IO_THREADS", invalid[i], 1) == 0);
+        assert(!myds_engram_create(gf, path, 5, 1) && errno == EINVAL);
+    }
+    if (saved) { assert(setenv("MYDS_ENGRAM_IO_THREADS", saved, 1) == 0); free(saved); }
+    else assert(unsetenv("MYDS_ENGRAM_IO_THREADS") == 0);
+    puts("Engram: default/lazy template, explicit serial and invalid environment configuration passed");
 }
 
 /* Small descriptor fixture exercises loader contracts and transactional reads
@@ -342,6 +577,8 @@ static void test_model(void) {
         }
     }
     gguf_file_t gf = {.fd=fd, .kvs=kvs, .metadata_kv_count=8, .tensors=tensors, .tensor_count=8};
+    test_io_configuration(&gf, path);
+    test_model_readers(&gf, path, fd);
     myds_engram_t *e = myds_engram_create(&gf, path, 5, 1);
     assert(e && !e->prepared && e->position == 0);
     assert(myds_engram_prepare_token(e, 1, 0) && e->prepared && e->position == 1);
@@ -415,7 +652,7 @@ static void test_unmap(void) {
 }
 
 int main(void) {
-    test_decode_table(); test_decode_rounding_modes(); test_hash(); test_decode(); test_disk(); test_gate(); test_model(); test_unmap();
+    test_decode_table(); test_decode_rounding_modes(); test_hash(); test_decode(); test_disk(); test_parallel_disk(); test_gate(); test_model(); test_unmap();
     puts("Engram: all tests passed");
     return 0;
 }

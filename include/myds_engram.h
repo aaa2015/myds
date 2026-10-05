@@ -40,7 +40,9 @@ bool myds_engram_hash(const myds_engram_layout_t *layout,
                      uint32_t *rows);
 
 typedef struct { int fd; uint64_t offset; uint32_t rows; } myds_engram_table_t;
-/* Separate uncached, no-readahead descriptor. No full-table read or GPU map. */
+/* Separate pread descriptor; no full-table read or GPU map. On macOS,
+ * MYDS_ENGRAM_NOCACHE requests F_NOCACHE/no-readahead for diagnostics. That
+ * switch alone does not prove a cache miss or physical SSD transfer. */
 bool myds_engram_table_open(myds_engram_table_t *table, const char *path,
                            uint64_t offset, uint32_t rows);
 void myds_engram_table_close(myds_engram_table_t *table);
@@ -52,6 +54,18 @@ bool myds_engram_decode_row(const uint8_t row[MYDS_ENGRAM_ROW_BYTES],
 bool myds_engram_read(const myds_engram_table_t *table, const uint32_t *rows,
                      size_t count, float *out);
 
+/* Persistent raw-I/O workers. Only pread is parallel; decoding runs on the
+ * calling thread in table/column order, preserving rounding and error order.
+ * Workers are joined before free returns. Do not free during a read. A NULL
+ * reader, or a reader created with one worker, uses the serial oracle above. */
+typedef struct myds_engram_reader myds_engram_reader_t;
+myds_engram_reader_t *myds_engram_reader_create(unsigned workers);
+void myds_engram_reader_free(myds_engram_reader_t *reader);
+bool myds_engram_reader_read_token(myds_engram_reader_t *reader,
+    const myds_engram_table_t tables[MYDS_ENGRAM_LAYERS],
+    const uint32_t rows[MYDS_ENGRAM_LAYERS][MYDS_ENGRAM_COLS],
+    float out[MYDS_ENGRAM_LAYERS][MYDS_ENGRAM_INPUT_DIM]);
+
 typedef struct {
     myds_engram_layout_t layout;
     myds_engram_history_t history;
@@ -62,6 +76,8 @@ typedef struct {
     uint32_t layer_ids[MYDS_ENGRAM_LAYERS], width;
     uint64_t position;
     bool prepared;
+    unsigned io_threads;
+    myds_engram_reader_t *reader;
     uint32_t row_ids[MYDS_ENGRAM_LAYERS][MYDS_ENGRAM_COLS];
     float row_values[MYDS_ENGRAM_LAYERS][MYDS_ENGRAM_INPUT_DIM];
 } myds_engram_t;
@@ -73,6 +89,10 @@ myds_engram_t *myds_engram_create(const gguf_file_t *gf, const char *path,
 /* Clone model's immutable template into a context. Each clone owns duplicate
  * pread descriptors and fresh history, so contexts cannot share hash state. */
 myds_engram_t *myds_engram_clone(const myds_engram_t *engram);
+/* 1 selects serial I/O; 2..16 create a private persistent pool. Failure leaves
+ * the previous configuration intact. Like prepare/reset/free, this requires
+ * exclusive access to the context. Model load reads MYDS_ENGRAM_IO_THREADS. */
+bool myds_engram_set_io_threads(myds_engram_t *engram, unsigned workers);
 /* Reject overlapping/non-tail layouts; unmap only page-aligned disk-only tail.
  * Call before publishing model pointers/GPU views. Sets table data pointers to
  * NULL and shrinks mmap_size; projection/norm/metadata remain valid. */
