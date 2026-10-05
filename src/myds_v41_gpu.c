@@ -4,6 +4,7 @@
 #include <math.h>
 #include <limits.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -57,6 +58,28 @@ void myds_v41_gpu_inject_attention_vec_head_first_failure(bool enabled) {
 }
 uint32_t myds_v41_gpu_attention_vec_head_first_status(const myds_v41_gpu_scratch_t *s) {
     return !s||!s->attn_vec_head_first ? 0u : s->attn_vec_head_first_unavailable ? 2u : 1u;
+}
+/* Process-wide prefill attention path counters. Host-only relaxed increments at
+ * points that already exist on the encode path; no GPU work or ordering change.
+ * The order matches myds_v41_gpu_attention_counters_t field order. */
+enum { AC_CALLS, AC_GATHER, AC_SLAB, AC_HF_ATTEMPTS, AC_HF_ENCODED, AC_HF_FAILURES,
+       AC_HF_CACHED, AC_ORIGINAL, AC_MATRIX, AC_MATRIX_FALLBACKS, AC_COUNT };
+static _Atomic uint64_t attn_counters[AC_COUNT];
+static inline void attn_count(unsigned k) {
+    atomic_fetch_add_explicit(&attn_counters[k], 1u, memory_order_relaxed);
+}
+void myds_v41_gpu_attention_counters(myds_v41_gpu_attention_counters_t *out, bool reset) {
+    uint64_t v[AC_COUNT];
+    for (unsigned k = 0; k < AC_COUNT; ++k)
+        v[k] = reset ? atomic_exchange_explicit(&attn_counters[k], 0u, memory_order_relaxed)
+                     : atomic_load_explicit(&attn_counters[k], memory_order_relaxed);
+    if (!out) return;
+    *out = (myds_v41_gpu_attention_counters_t){
+        .calls = v[AC_CALLS], .gather_calls = v[AC_GATHER], .slab_calls = v[AC_SLAB],
+        .head_first_attempts = v[AC_HF_ATTEMPTS], .head_first_encoded = v[AC_HF_ENCODED],
+        .head_first_failures = v[AC_HF_FAILURES], .head_first_cached_fallbacks = v[AC_HF_CACHED],
+        .original_vec_encoded = v[AC_ORIGINAL], .matrix_encoded = v[AC_MATRIX],
+        .matrix_fallbacks = v[AC_MATRIX_FALLBACKS]};
 }
 static int floats(const myds_metal_buffer_t *b,uint64_t n) {
     return b && n && n<=myds_metal_buffer_size(b)/4 && myds_metal_buffer_offset(b)%4==0;
@@ -679,6 +702,7 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
         (s->prefill_attn_variant==2 && !s->attn_matrix_unavailable && c_len>=32u && p0/ratio>=256u && n_comp>=512u));
     if(use_gather&&(myds_metal_buffer_offset(gathered)%2u||
        myds_metal_buffer_size(gathered)<(size_t)c_len*640u*512u*2u))return 0;
+    attn_count(AC_CALLS);attn_count(use_gather?AC_GATHER:AC_SLAB);
 
     if(!use_gather&&!ensure_chunk_workspace(s,MYDS_CHUNK_CARRY+c_len+n_comp))return 0;
 
@@ -787,24 +811,51 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
             "kernel_myds_flash_attn_heads_f16_dk512_dv512";
         const size_t smem=attn_matrix_test_failure==2?SIZE_MAX-15u:32768u;
         if(ready)matrix_encoded=specialized(kernel,&ma,192,mb,8,8,c_len,1,32,4,1,smem,mc,9);
-        if(!matrix_encoded){
-            if(s->prefill_attn_variant!=2)return 0; /* explicit matrix is strict */
+        if(matrix_encoded)attn_count(AC_MATRIX);
+        else{
+            if(s->prefill_attn_variant!=2){ /* explicit matrix is strict */
+                MYDS_LOG_E("attention: MYDS_PREFILL_ATTN=matrix could not encode "
+                           "(c_len=%u n_comp=%u pos=%u); set MYDS_DEBUG_DISPATCH=1 for the reason",
+                           c_len,n_comp,p0);
+                return 0;
+            }
+            attn_count(AC_MATRIX_FALLBACKS);
             s->attn_matrix_unavailable=1;
+            MYDS_LOG_W("attention: matrix auto unavailable (c_len=%u n_comp=%u pos=%u); "
+                       "scratch %p uses vec from now on. MYDS_DEBUG_DISPATCH=1 shows the reason",
+                       c_len,n_comp,p0,(void *)s);
         }
     }
     if(!matrix_encoded){
         int vec_encoded=0;
-        if(use_gather && s->attn_vec_head_first && !s->attn_vec_head_first_unavailable){
-            const char *kernel=attn_vec_head_first_test_failure?
-                "kernel_myds_attention_test_missing_head_first_pso":
-                "kernel_myds_flash_attn_vec_head_first_f16_dk512_dv512";
-            /* Only the physical query/head grid changes. Keep a, the buffers,
-             * constants, one SIMD group and 3328-byte private scratch unchanged. */
-            vec_encoded=specialized(kernel,&a,sizeof(a),b,7,64,c_len,1,32,1,1,3328,c,10);
-            if(!vec_encoded)s->attn_vec_head_first_unavailable=1;
+        if(use_gather && s->attn_vec_head_first){
+            if(s->attn_vec_head_first_unavailable) attn_count(AC_HF_CACHED);
+            else {
+                const char *kernel=attn_vec_head_first_test_failure?
+                    "kernel_myds_attention_test_missing_head_first_pso":
+                    "kernel_myds_flash_attn_vec_head_first_f16_dk512_dv512";
+                /* Only the physical query/head grid changes. Keep a, the buffers,
+                 * constants, one SIMD group and 3328-byte private scratch unchanged. */
+                attn_count(AC_HF_ATTEMPTS);
+                vec_encoded=specialized(kernel,&a,sizeof(a),b,7,64,c_len,1,32,1,1,3328,c,10);
+                if(vec_encoded)attn_count(AC_HF_ENCODED);
+                else{
+                    /* Sticky for this scratch (the process lifetime of a context):
+                     * say so once, because every later gathered chunk silently
+                     * pays the original grid's cost. */
+                    attn_count(AC_HF_FAILURES);
+                    s->attn_vec_head_first_unavailable=1;
+                    MYDS_LOG_W("attention: head-first vec could not encode (c_len=%u n_comp=%u pos=%u); "
+                               "scratch %p uses the original grid from now on. "
+                               "MYDS_DEBUG_DISPATCH=1 shows the reason",c_len,n_comp,p0,(void *)s);
+                }
+            }
         }
-        if(!vec_encoded && !specialized("kernel_flash_attn_ext_vec_f16_dk512_dv512",
-                        &a,sizeof(a),b,7,c_len,64,1,32,1,1,3328,c,10))return 0;
+        if(!vec_encoded){
+            if(!specialized("kernel_flash_attn_ext_vec_f16_dk512_dv512",
+                            &a,sizeof(a),b,7,c_len,64,1,32,1,1,3328,c,10))return 0;
+            attn_count(AC_ORIGINAL);
+        }
     }
 
     /* This chunk's tail becomes the next chunk's carry: rows [c_len, c_len + 127)

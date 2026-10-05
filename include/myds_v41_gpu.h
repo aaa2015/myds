@@ -45,6 +45,20 @@ uint32_t myds_v41_gpu_attention_vec_head_first_status(const myds_v41_gpu_scratch
 /* Diagnostic fixture only: force an absent head-first PSO. Change only between
  * completed GPU batches. Both default and explicit enablement remain best effort. */
 void myds_v41_gpu_inject_attention_vec_head_first_failure(bool enabled);
+/* Process-wide prefill attention path counters (host-side, relaxed atomics).
+ * Each attention_chunk call that passes validation counts once as gather or
+ * slab; the vec/matrix fields count encoded kernels. head_first_failures is
+ * the call that made a scratch fall back; cached_fallbacks are gathered calls
+ * that used the original grid because of an earlier failure. The macro lets
+ * tools compile against headers that predate this API. */
+#define MYDS_V41_GPU_HAS_ATTENTION_COUNTERS 1
+typedef struct {
+    uint64_t calls, gather_calls, slab_calls;
+    uint64_t head_first_attempts, head_first_encoded, head_first_failures, head_first_cached_fallbacks;
+    uint64_t original_vec_encoded, matrix_encoded, matrix_fallbacks;
+} myds_v41_gpu_attention_counters_t;
+/* Snapshot into *out (may be NULL); reset=true atomically zeroes each field. */
+void myds_v41_gpu_attention_counters(myds_v41_gpu_attention_counters_t *out, bool reset);
 int myds_v41_gpu_rope(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
     uint32_t pos,bool compressed,bool inverse);
 int myds_v41_gpu_rope_batch(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,

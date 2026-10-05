@@ -7,6 +7,7 @@
 #include "myds_internal.h"
 #include "myds_metal.h"
 #include "myds_server_internal.h"
+#include "myds_v41_gpu.h"
 #include <errno.h>
 #include <inttypes.h>
 #include <pthread.h>
@@ -169,7 +170,11 @@ int main(int argc, char **argv) {
         "MYDS_RESIDENCY_KEEP_ALIVE_S", "MYDS_RESIDENCY_HB_MS", "MYDS_NO_RESIDENCY_HB", "MYDS_NO_PREFIX_SNAPSHOT",
         "MYDS_CHUNK_KEY_MAX", "MYDS_ATTN_KEYS_CLAMP", "MYDS_INDEXER_BATCH_FLOATS", "MYDS_INDEXER_TILED",
         "MYDS_BLOCK_BUDGET", "MYDS_DISABLE_MUL_MM", "MYDS_MM_MIN_M", "MYDS_DISABLE_MM_ENGRAM",
-        "MYDS_DISABLE_MM_ATTN_A", "MYDS_COMPRESSOR_PER_TOKEN", "MYDS_INDEXER_PER_TOKEN"};
+        "MYDS_DISABLE_MM_ATTN_A", "MYDS_COMPRESSOR_PER_TOKEN", "MYDS_INDEXER_PER_TOKEN",
+        /* 2026-10-05 path selectors: without them two configurations of one
+         * binary produce identical metadata (see head-first-long-validation). */
+        "MYDS_ATTN_VEC_HEAD_FIRST", "MYDS_ATTN_GATHER_MIN_KEYS", "MYDS_PREFILL_ATTN",
+        "MYDS_QKV_FUSE_BF16", "MYDS_QKV_FUSE_POST", "MYDS_QKV_NR0", "MYDS_MOE_IQ2_TAIL_CULL"};
     for (size_t i = 0; i < sizeof(env_names)/sizeof(env_names[0]); ++i) {
         if (i) fputc(',', json); json_string(json, env_names[i]); fputc(':', json); json_string(json, getenv(env_names[i]));
     }
@@ -196,6 +201,9 @@ int main(int argc, char **argv) {
     int status = 0;
     uint64_t expected_ids = 0, expected_bytes = 0;
     uint32_t expected_count = 0;
+#ifdef MYDS_V41_GPU_HAS_ATTENTION_COUNTERS
+    myds_v41_gpu_attention_counters(NULL, true);   /* exclude load/context creation */
+#endif
     for (uint32_t run = 0; run <= repeats; ++run) {
         capture_t c = {.bytes_hash = seed_hash, .ids_hash = seed_hash};
         myds_stop_reason_t reason = MYDS_STOP_ERROR; uint32_t prompt_tokens = 0;
@@ -206,6 +214,11 @@ int main(int argc, char **argv) {
         /* Resolve available profiler records only after generation's existing waits.
          * This export is deliberately outside the measured request wall interval. */
         /* No profiler in this uninstrumented baseline. */
+#ifdef MYDS_V41_GPU_HAS_ATTENTION_COUNTERS
+        /* Host counters only, read after generation returned (outside wall_s). */
+        myds_v41_gpu_attention_counters_t ac;
+        myds_v41_gpu_attention_counters(&ac, true);
+#endif
         const bool generation_ok = ok && (reason == MYDS_STOP_EOS || reason == MYDS_STOP_LENGTH);
         const bool full_prefill = pf.cached_tokens == 0 && prompt_tokens > 0 &&
             pf.prefill_tokens == prompt_tokens - 1u && pf.prompt_tokens == prompt_tokens;
@@ -231,6 +244,19 @@ int main(int argc, char **argv) {
         metric(json, "prefill_ms_per_token", full_prefill && pf.prefill_tokens > 0, 1000.0 * pf.prefill_seconds / (pf.prefill_tokens ? pf.prefill_tokens : 1));
         metric(json, "decode_s", decode_valid, c.last - c.first);
         metric(json, "decode_ms_per_token", decode_valid, 1000.0 * (c.last - c.first) / (c.count > 1 ? c.count - 1u : 1u));
+#ifdef MYDS_V41_GPU_HAS_ATTENTION_COUNTERS
+        fprintf(json, ",\"attention_paths\":{\"calls\":%" PRIu64 ",\"gather_calls\":%" PRIu64
+            ",\"slab_calls\":%" PRIu64 ",\"head_first_attempts\":%" PRIu64 ",\"head_first_encoded\":%" PRIu64
+            ",\"head_first_failures\":%" PRIu64 ",\"head_first_cached_fallbacks\":%" PRIu64
+            ",\"original_vec_encoded\":%" PRIu64 ",\"matrix_encoded\":%" PRIu64 ",\"matrix_fallbacks\":%" PRIu64 "}",
+            ac.calls, ac.gather_calls, ac.slab_calls, ac.head_first_attempts, ac.head_first_encoded,
+            ac.head_first_failures, ac.head_first_cached_fallbacks, ac.original_vec_encoded,
+            ac.matrix_encoded, ac.matrix_fallbacks);
+        if (ac.head_first_failures || ac.head_first_cached_fallbacks || ac.matrix_fallbacks)
+            fprintf(stderr, "run %u: attention fallback: head_first_failures=%" PRIu64
+                " cached_fallbacks=%" PRIu64 " matrix_fallbacks=%" PRIu64 "\n", run,
+                ac.head_first_failures, ac.head_first_cached_fallbacks, ac.matrix_fallbacks);
+#endif
         fputs(",\"callback_intervals_ms\":[", json);
         for (uint32_t i = 1; i < retained; ++i) fprintf(json, "%s%.9f", i > 1 ? "," : "", 1000.0 * (c.times[i] - c.times[i-1]));
         fputs("]}\n", json); fflush(json);

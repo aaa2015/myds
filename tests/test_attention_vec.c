@@ -91,12 +91,18 @@ static int numeric(uint32_t rows,uint32_t start,uint32_t ratio) {
     /* Policy is captured at creation, so later environment changes cannot alter a batch. */
     setenv("MYDS_ATTN_VEC_HEAD_FIRST","0",1);
     for(int packed=0;packed<2;packed++) {
+        myds_v41_gpu_attention_counters(NULL,true);
         CHECK(myds_metal_begin_batch());
         for(int k=0;k<3;k++) { CHECK(stage(&f,s[k]));CHECK(call(&f,s[k],k,packed,0)); }
         CHECK(myds_metal_commit_batch());CHECK(compare(&f,1)&&compare(&f,2));
         /* Refuse fallback-only success: the compiled transpose PSO must have encoded. */
         CHECK(myds_v41_gpu_attention_vec_head_first_status(s[1])==1);
         CHECK(myds_v41_gpu_attention_vec_head_first_status(s[2])==1);
+        myds_v41_gpu_attention_counters_t ac;myds_v41_gpu_attention_counters(&ac,false);
+        CHECK(ac.calls==3&&ac.gather_calls==3&&ac.slab_calls==0);
+        CHECK(ac.head_first_attempts==2&&ac.head_first_encoded==2);
+        CHECK(ac.head_first_failures==0&&ac.head_first_cached_fallbacks==0);
+        CHECK(ac.original_vec_encoded==1&&ac.matrix_encoded==0&&ac.matrix_fallbacks==0);
     }
     printf("PASS head-first exact rows=%u start=%u ratio=%u F32/BF16 default/explicit same-CB guarded outputs\n",rows,start,ratio);
     for(int k=0;k<3;k++)myds_v41_gpu_scratch_free(s[k]);cleanup(&f);return 1;
@@ -105,6 +111,7 @@ static int unavailable(const char *env) {
     struct fixture f;CHECK(init(&f,33,1536,2));
     myds_v41_gpu_scratch_t *vec=scratch("vec","0"),*hf=scratch("vec",env);CHECK(vec&&hf);
     myds_v41_gpu_inject_attention_vec_head_first_failure(true);
+    myds_v41_gpu_attention_counters(NULL,true);
     CHECK(myds_metal_begin_batch());
     /* A failing optional PSO must not even be consulted for window/slab paths. */
     for(int mode=1;mode<=2;mode++) {
@@ -116,6 +123,12 @@ static int unavailable(const char *env) {
     myds_v41_gpu_inject_attention_vec_head_first_failure(false);
     CHECK(myds_metal_begin_batch());CHECK(stage(&f,hf));CHECK(call(&f,hf,1,1,0));CHECK(myds_metal_commit_batch());
     CHECK(compare(&f,1));CHECK(myds_v41_gpu_attention_vec_head_first_status(hf)==2);
+    /* 4 window/slab calls; 3 gathered: disabled vec, first failure, cached retry. */
+    myds_v41_gpu_attention_counters_t ac;myds_v41_gpu_attention_counters(&ac,true);
+    CHECK(ac.calls==7&&ac.gather_calls==3&&ac.slab_calls==4);
+    CHECK(ac.head_first_attempts==1&&ac.head_first_encoded==0);
+    CHECK(ac.head_first_failures==1&&ac.head_first_cached_fallbacks==1);
+    CHECK(ac.original_vec_encoded==7&&ac.matrix_encoded==0&&ac.matrix_fallbacks==0);
     printf("PASS missing head-first PSO %s fallback exact and cached; window/slab unchanged\n",env?"explicit=1":"default");
     myds_v41_gpu_scratch_free(vec);myds_v41_gpu_scratch_free(hf);cleanup(&f);return 1;
 }

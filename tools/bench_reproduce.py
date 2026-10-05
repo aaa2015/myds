@@ -142,6 +142,17 @@ def validate_run(directory, state, audit):
     return group, samples
 
 
+def attention_paths(samples):
+    """Per-run attention path counters, or None for harnesses that predate them."""
+    paths = [{'run': r['run'], 'warmup': r['warmup'], **r['attention_paths']}
+             for r in samples if isinstance(r.get('attention_paths'), dict)]
+    if not paths:
+        return None
+    fallbacks = sum(p.get('head_first_failures', 0) + p.get('head_first_cached_fallbacks', 0) +
+                    p.get('matrix_fallbacks', 0) for p in paths)
+    return {'runs': paths, 'any_fallback': bool(fallbacks)}
+
+
 def compare(args):
     audit = load_audit()
     groups, raw, states = [], [], []
@@ -173,6 +184,8 @@ def compare(args):
     summary = {'audit_pass': True, 'all_warm_and_formal_outputs_match': True,
                'scope': 'Separate processes, one warmup plus three formal samples; direct callback timing',
                'base': base, 'candidate': candidate, 'comparison': reductions,
+               'attention_paths': {'base': attention_paths(raw[0]),
+                                   'candidate': attention_paths(raw[1])},
                'builds': [{'binary_sha256': s['binary_sha256'], 'metallib_sha256': s['metallib_sha256'],
                            'environment': s['environment']} for s in states]}
     output = args.out.resolve()
@@ -253,7 +266,8 @@ def run(args):
         state['returncode'] = result
         if result:
             raise RuntimeError(f'Harness exited {result}; inspect {output / "run.log"}')
-        group, _ = validate_run(output, state, load_audit())
+        group, samples = validate_run(output, state, load_audit())
+        group['attention_paths'] = attention_paths(samples)
         write_json(output / 'run-summary.json', group)
         state['status'] = 'validated'
     except BaseException as exc:
@@ -275,9 +289,11 @@ def run(args):
             signal.signal(signal.SIGTERM, previous_sigterm)
     if state['status'] != 'validated':
         raise RuntimeError('Final state capture/cleanup failed; inspect ' + str(output / 'run-state.json'))
+    paths = group.get('attention_paths')
     print(json.dumps({'audit_pass': True, 'output': str(output),
                       'prefill_ms_per_token': group['stats']['prefill_ms_per_token'],
-                      'decode_ms_per_token': group['stats']['decode_ms_per_token']}))
+                      'decode_ms_per_token': group['stats']['decode_ms_per_token'],
+                      'attention_fallback': paths['any_fallback'] if paths else None}))
     return 0
 
 

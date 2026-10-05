@@ -182,6 +182,25 @@ class BenchReproduceTests(unittest.TestCase):
                 for phase, percent in zip(('prefill', 'decode'), expected[workload]):
                     self.assertAlmostEqual(summary['comparison'][phase]['time_saved_percent'], percent,
                                            delta=0.001)
+                # The historical harness predates per-sample attention counters.
+                self.assertEqual(summary['attention_paths'], {'base': None, 'candidate': None})
+
+    def test_attention_paths_flags_head_first_fallback(self):
+        clean = {'calls': 600, 'gather_calls': 570, 'slab_calls': 30, 'head_first_attempts': 570,
+                 'head_first_encoded': 570, 'head_first_failures': 0, 'head_first_cached_fallbacks': 0,
+                 'original_vec_encoded': 30, 'matrix_encoded': 0, 'matrix_fallbacks': 0}
+        sticky = dict(clean, head_first_attempts=0, head_first_encoded=0,
+                      head_first_cached_fallbacks=570, original_vec_encoded=600)
+        samples = [{'run': 0, 'warmup': True, 'attention_paths': clean},
+                   {'run': 1, 'warmup': False, 'attention_paths': clean}]
+        result = self.driver.attention_paths(samples)
+        self.assertFalse(result['any_fallback'])
+        self.assertEqual([r['run'] for r in result['runs']], [0, 1])
+        samples.append({'run': 2, 'warmup': False, 'attention_paths': sticky})
+        result = self.driver.attention_paths(samples)
+        self.assertTrue(result['any_fallback'])
+        self.assertEqual(result['runs'][2]['head_first_cached_fallbacks'], 570)
+        self.assertIsNone(self.driver.attention_paths([{'run': 0, 'warmup': True}]))
 
     def test_compare_rejects_non_greedy_metadata(self):
         args = self.comparison_fixture()

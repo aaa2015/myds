@@ -253,7 +253,7 @@ compressed KV 与 index cache 保存已完成 BF16 舍入的上 16 位，读取�
 | --- | --- | --- |
 | `MYDS_ATTN_GATHER_MIN_KEYS` | `0` | scratch 创建时捕获。压缩键数小于阈值时走 slab，达到阈值时在 gather 已启用且提供缓冲的条件下走 gather。合法范围为 `0..chunk_key_max`；非法值会拒绝工作区创建。阈值须按本机与负载测量。 |
 | `MYDS_ATTN_GATHER` | 启用 | 设为 `0` 关闭 gather，阈值不覆盖此开关。 |
-| `MYDS_ATTN_VEC_HEAD_FIRST` | 启用 | gathered prefill 的 vec attention 将 query/head 物理 grid 调换，保留每个 head 的算术与归约。设为 `0` 使用原排列。旧 metallib 缺新 PSO 时自动回退，并在 scratch 中缓存不可用状态。 |
+| `MYDS_ATTN_VEC_HEAD_FIRST` | 启用 | gathered prefill 的 vec attention 将 query/head 物理 grid 调换，保留每个 head 的算术与归约。设为 `0` 使用原排列。旧 metallib 缺新 PSO 时自动回退，并在 scratch 中缓存不可用状态；首次回退输出一条 WARN 日志，进程级计数可由 `myds_v41_gpu_attention_counters()` 读取。 |
 | `MYDS_PREFILL_ATTN` | `vec` | `matrix` 与 `auto` 是 compressed gather 的实验选项。矩阵归约会产生浮点差异，实测长输入生成 token 可变化；默认关闭。`auto` 的矩阵 PSO/共享内存不可用时回退 vec，显式 `matrix` 则返回失败。 |
 | `MYDS_QKV_FUSE_BF16` | 启用 | decode 的 Q8 QKV 投影把 BF16 舍入合并到 GEMV 写出；设为 `0` 恢复独立舍入 dispatch。trace 使用原路径。 |
 | `MYDS_QKV_FUSE_POST` | 启用 | decode 合并 Q/K RoPE、KV 量化及窗口写入，保留原舍入边界；设为 `0` 恢复原 dispatch。缺融合 PSO、别名或 copy 故障注入时回退原路径。 |
@@ -300,7 +300,8 @@ make test 2>&1 | tee "$MYDS_REPRO_OUT/unit-tests.log"
 make test-tail-init 2>&1 | tee "$MYDS_REPRO_OUT/tail-init.log"
 python3 docs/benchmarks/2026-10-05-optimization/protocol/selftest-summarize-final.py \
   > "$MYDS_REPRO_OUT/measurement-audit-selftest.json"
-python3 tools/bench_reproduce.py verify --check-source
+python3 tools/bench_reproduce.py verify
+# 仅在 afcc05c 检出上：python3 tools/bench_reproduce.py verify --check-source
 ```
 
 `make -B` 强制重编译，避免复制源码或切换测量版本时复用时间戳较新的旧对象文件。
@@ -312,7 +313,7 @@ python3 tools/bench_reproduce.py verify --check-source
 | --- | --- |
 | `bin/test_v41_gpu`、`--slab`、`--threshold` | gather/slab 选择、阈值、lazy 工作区、BF16 缓存、同一 batch 内路径切换；三种配置均在 `make test` 中执行。 |
 | `bin/test_attention_policy` | matrix/auto/vec 策略、缺 PSO 和共享内存失败回退、恢复后的重试。 |
-| `bin/test_attention_vec` | 非零 F32/BF16 逐位对照、短块和 carry、子视图 canary、head-first 成功与缺 PSO 回退。 |
+| `bin/test_attention_vec` | 非零 F32/BF16 逐位对照、短块和 carry、子视图 canary、head-first 成功与缺 PSO 回退及对应路径计数。 |
 | `MYDS_QKV_NR0=4 bin/test_qkv_fusion`、`MYDS_QKV_NR0=2 bin/test_qkv_fusion` | 两种独立行配置、BF16 舍入边界、RoPE/量化/窗口写入、奇数输出行、别名与 copy 失败回退；均在 `make test` 中执行。 |
 | `make test-tail-init` | 真实缺 tail PSO 和必需 PSO 创建失败后的全状态清理、重复失败、恢复完整库及 lazy 初始化重试。 |
 | `bin/test_engine`、`bin/test_p1` | 生成、前缀恢复与快照边界、缓存失败路径回归。 |
@@ -349,6 +350,12 @@ python3 tools/bench_reproduce.py run \
 `run.log` 保存引擎 stdout/stderr；`run-state.json` 保存完整 argv、显式环境、
 二进制/metallib/请求 SHA、模型文件大小与 mtime、运行前后硬件/内存/swap 状态及退出码；
 `run-summary.json` 仅在样本校验通过后产生。模型身份记录为文件元数据，未对整个 GGUF 做 SHA。
+metadata 的 environment 额外记录 `MYDS_ATTN_VEC_HEAD_FIRST`、`MYDS_ATTN_GATHER_MIN_KEYS`、
+`MYDS_PREFILL_ATTN`、`MYDS_QKV_FUSE_BF16`、`MYDS_QKV_FUSE_POST`、`MYDS_QKV_NR0`、
+`MYDS_MOE_IQ2_TAIL_CULL`。每个样本含 `attention_paths`（本轮 attention 调用、gather/slab、
+head-first 尝试/成功/失败/缓存回退、原 vec、matrix 及其回退次数）；出现回退时 stderr 另有一行提示。
+`run-summary.json` 与 `compare` 输出 `attention_paths`，`run` 结束时打印 `attention_fallback`。
+2026-10-05 证据由加入这些字段之前的 bench_phase 生成，样本中没有该字段，汇总显示为 `null`。
 
 入口清除全部继承的 `MYDS_*` 环境，并显式设置 prefix cache、KV disk、phase profiler 为 0，
 chunk=512、MoE chunks=9、suffix shift=512、residency keep-alive=86400。
@@ -436,7 +443,9 @@ layout 按 replay recipe 从同一 GGUF 提取。QKV 的 stdout 含启动信息�
 `.jsonl` 后缀，审计按 CSV 处理；新复现采用 `.csv`。组件 probe 只给出该组件、该输入的计时，
 不可将多个独立回放中位数相加后当作整层或整模型耗时。
 `.gitattributes` 保留证据的原始换行，`bench_reproduce.py verify` 校验两轮证据 manifest；
-`--check-source` 同时验证本次打包源码。服务部署后 SHA、模型或环境变化时，应另存新的结果目录。
+`--check-source` 同时验证本次打包源码，基准是 `afcc05c` 中的测量快照；之后的提交
+（例如 attention 回退计数）会被报告为漂移，可用 `git diff afcc05c -- <file>` 查看，证据 manifest 不随之改写。
+服务部署后 SHA、模型或环境变化时，应另存新的结果目录。
 
 ## 视觉（图片输入）
 
