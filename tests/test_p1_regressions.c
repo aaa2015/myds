@@ -1864,6 +1864,118 @@ static void test_p1_attn_output_a_bf16_fusion(void) {
     printf("  [PASS] Output_A grouped NR4 + BF16 store fusion bit-exact parity verified (8 groups x 1024 rank = 8192 rows)\n");
 }
 
+static void test_p1_attn_direct_pack_fusion(void) {
+    if (!myds_metal_init(NULL)) {
+        fprintf(stderr, "skip test_p1_attn_direct_pack_fusion: no Metal\n");
+        return;
+    }
+    myds_v41_gpu_scratch_t *s = myds_v41_gpu_scratch_create(4096);
+    assert(s);
+
+    const uint32_t source_rows = 1024;
+    const uint32_t heads_floats = 64u * 512u;
+
+    myds_metal_buffer_t *heads_unfused = myds_metal_buffer_alloc(heads_floats * sizeof(float));
+    myds_metal_buffer_t *heads_fused = myds_metal_buffer_alloc(heads_floats * sizeof(float));
+    myds_metal_buffer_t *sinks = myds_metal_buffer_alloc(64 * sizeof(float));
+    myds_metal_buffer_t *q = myds_metal_buffer_alloc(heads_floats * sizeof(float));
+    myds_metal_buffer_t *window = myds_metal_buffer_alloc(128u * 512u * sizeof(float));
+    myds_metal_buffer_t *comp_kv = myds_metal_buffer_alloc((uint64_t)source_rows * 512u * sizeof(uint16_t));
+    myds_metal_buffer_t *selected_ids = myds_metal_buffer_alloc(512 * sizeof(int32_t));
+    myds_metal_buffer_t *selected_kv = myds_metal_buffer_alloc(512u * 512u * sizeof(float));
+    assert(heads_unfused && heads_fused && sinks && q && window && comp_kv && selected_ids && selected_kv);
+
+    float *sinks_ptr = (float *)myds_metal_buffer_data(sinks);
+    for (int i = 0; i < 64; i++) sinks_ptr[i] = 0.5f + (float)i * 0.01f;
+
+    float *q_ptr = (float *)myds_metal_buffer_data(q);
+    for (size_t i = 0; i < heads_floats; i++) {
+        q_ptr[i] = (float)sin((double)i * 0.013) * 0.25f;
+    }
+
+    float *win_ptr = (float *)myds_metal_buffer_data(window);
+    for (size_t i = 0; i < 128u * 512u; i++) {
+        win_ptr[i] = (float)cos((double)i * 0.021) * 0.35f;
+    }
+
+    uint16_t *comp_ptr = (uint16_t *)myds_metal_buffer_data(comp_kv);
+    for (size_t i = 0; i < (size_t)source_rows * 512u; i++) {
+        float val = (float)sin((double)i * 0.037) * 0.8f;
+        uint32_t bits;
+        memcpy(&bits, &val, 4);
+        comp_ptr[i] = (uint16_t)(bits >> 16);
+    }
+
+    int32_t *ids_ptr = (int32_t *)myds_metal_buffer_data(selected_ids);
+    for (int i = 0; i < 512; i++) {
+        ids_ptr[i] = (int32_t)((i * 17) % source_rows);
+    }
+
+    struct {
+        uint32_t n_raw;
+        uint32_t raw_start;
+        uint32_t selected_rows;
+    } test_configs[] = {
+        {10, 0, 0},     // early decode, no selected KV
+        {64, 20, 0},    // partial window, no wrap
+        {128, 0, 32},   // full window, no wrap, small top_k
+        {128, 45, 64},  // full window, wraps around 128
+        {128, 120, 128},// full window, wraps around 128, 128 top_k
+        {128, 77, 512}, // full window, wraps around 128, max 512 top_k
+    };
+
+    for (size_t t = 0; t < sizeof(test_configs)/sizeof(test_configs[0]); t++) {
+        uint32_t n_raw = test_configs[t].n_raw;
+        uint32_t raw_start = test_configs[t].raw_start;
+        uint32_t sel = test_configs[t].selected_rows;
+
+        // Clear output buffers
+        memset(myds_metal_buffer_data(heads_unfused), 0, heads_floats * sizeof(float));
+        memset(myds_metal_buffer_data(heads_fused), 0, heads_floats * sizeof(float));
+
+        // 1. Unfused path
+        if (sel) {
+            assert(myds_v41_gpu_gather_bf16(selected_kv, comp_kv, selected_ids, source_rows, sel));
+        }
+        assert(myds_v41_gpu_attention(heads_unfused, sinks, q, window, n_raw, raw_start, selected_kv, sel, s));
+
+        // 2. Fused direct path
+        assert(myds_v41_gpu_attention_direct(heads_fused, sinks, q, window, n_raw, raw_start,
+                                             sel ? comp_kv : NULL,
+                                             sel ? selected_ids : NULL,
+                                             source_rows, sel, s));
+
+        // 3. Bit-exact check
+        float *u = (float *)myds_metal_buffer_data(heads_unfused);
+        float *f = (float *)myds_metal_buffer_data(heads_fused);
+        size_t nonzero = 0;
+        for (size_t i = 0; i < heads_floats; i++) {
+            assert(isfinite(u[i]) && isfinite(f[i]));
+            nonzero += (u[i] != 0.0f);
+            if (memcmp(&u[i], &f[i], sizeof(float)) != 0) {
+                uint32_t ub, fb;
+                memcpy(&ub, &u[i], 4);
+                memcpy(&fb, &f[i], 4);
+                fprintf(stderr, "mismatch in config %zu at element %zu: unfused=%08x (%f) fused=%08x (%f)\n",
+                        t, i, ub, u[i], fb, f[i]);
+                assert(0);
+            }
+        }
+        assert(nonzero > 0);
+    }
+
+    myds_metal_buffer_free(heads_unfused);
+    myds_metal_buffer_free(heads_fused);
+    myds_metal_buffer_free(sinks);
+    myds_metal_buffer_free(q);
+    myds_metal_buffer_free(window);
+    myds_metal_buffer_free(comp_kv);
+    myds_metal_buffer_free(selected_ids);
+    myds_metal_buffer_free(selected_kv);
+    myds_v41_gpu_scratch_free(s);
+    printf("  [PASS] Attention direct packing (circular window + direct BF16 gather) bit-exact parity verified\n");
+}
+
 int main(void) {
     printf("Running P1 Regression Verification Suite:\n");
     test_p1_response_id_lifecycle();
@@ -1877,6 +1989,7 @@ int main(void) {
     test_p1_metal_fused_add_fallback();
     test_p1_moe_route_fusion();
     test_p1_attn_output_a_bf16_fusion();
+    test_p1_attn_direct_pack_fusion();
     test_p2_moe_kernel_and_pso_validation();
     test_p2_moe_batch_mm_tail_cull_validation();
     test_p2_moe_tail_cull_multi_case_golden_equivalence();

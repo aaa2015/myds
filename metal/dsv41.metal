@@ -150,6 +150,50 @@ kernel void kernel_dsv41_get_rows_bf16(
     dst[(ulong)gid.y*512u+gid.x]=value;
 }
 
+kernel void kernel_dsv41_copy_window_f32_to_f16(
+        constant uint2 &args,
+        device const float *window,
+        device half *dst,
+        uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= 128u || gid.y >= args.x) return;
+    const uint src_row = (args.y + gid.y) % 128u;
+    device const float4 *w4 = (device const float4 *)(window + (ulong)src_row * 512u);
+    device half4 *dst4 = (device half4 *)(dst + (ulong)gid.y * 512u);
+    dst4[gid.x] = half4(w4[gid.x]);
+}
+
+struct dsv41_get_rows_bf16_f16_args {
+    uint source_rows;
+    uint selected_rows;
+    uint dst_row_offset;
+    uint pad;
+};
+
+kernel void kernel_dsv41_get_rows_bf16_to_f16(
+        constant dsv41_get_rows_bf16_f16_args &args,
+        device const ushort *src,
+        device const int *ids,
+        device half *dst,
+        uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= 128u || gid.y >= args.selected_rows) return;
+    const int row = ids[gid.y];
+    const ulong dst_row = (ulong)(args.dst_row_offset + gid.y);
+    device half4 *dst4 = (device half4 *)(dst + dst_row * 512u);
+    if (row >= 0 && uint(row) < args.source_rows) {
+        device const ushort4 *src4 = (device const ushort4 *)(src + (ulong)row * 512u);
+        const ushort4 u = src4[gid.x];
+        const float4 f = float4(
+            as_type<float>(uint(u.x) << 16u),
+            as_type<float>(uint(u.y) << 16u),
+            as_type<float>(uint(u.z) << 16u),
+            as_type<float>(uint(u.w) << 16u)
+        );
+        dst4[gid.x] = half4(f);
+    } else {
+        dst4[gid.x] = half4(0.0h);
+    }
+}
+
 struct ds4_metal_args_dsv41_engram {
     uint width;
     uint rows;

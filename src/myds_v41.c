@@ -2795,10 +2795,23 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
         CHECK(publish_and_select(ctx,il,pos,ctx->x_norm,ctx->qr_norm,NULL,NULL,NULL,NULL,NULL,NULL,NULL));
         uint32_t count=compressed?(pos+1u)/ratio_for(il):0;
         uint32_t top=count<V41_TOPK?count:V41_TOPK;
-        if (count) CHECK(myds_v41_gpu_gather_bf16(g->selected_kv,g->compressed[owner_for(il)],g->selected,count,top));
         uint32_t nraw=pos+1u<128?pos+1u:128;
         phase="attention reduction";
-        CHECK(myds_v41_gpu_attention(ctx->attn_heads,base->attn_sinks,ctx->q,g->window[il],nraw,(pos+1u-nraw)%128,g->selected_kv,top,g->gpu));
+        static int attn_direct_enabled = -1;
+        if (attn_direct_enabled < 0) {
+            const char *env = getenv("MYDS_ATTN_DIRECT_PACK");
+            attn_direct_enabled = (env == NULL || atoi(env) != 0);
+        }
+        if (attn_direct_enabled) {
+            CHECK(myds_v41_gpu_attention_direct(ctx->attn_heads,base->attn_sinks,ctx->q,
+                                                g->window[il],nraw,(pos+1u-nraw)%128,
+                                                count ? g->compressed[owner_for(il)] : NULL,
+                                                count ? g->selected : NULL,
+                                                count,top,g->gpu));
+        } else {
+            if (count) CHECK(myds_v41_gpu_gather_bf16(g->selected_kv,g->compressed[owner_for(il)],g->selected,count,top));
+            CHECK(myds_v41_gpu_attention(ctx->attn_heads,base->attn_sinks,ctx->q,g->window[il],nraw,(pos+1u-nraw)%128,g->selected_kv,top,g->gpu));
+        }
         CHECK(myds_metal_v41_bf16(ctx->attn_heads,V41_HEADS*512));
         CHECK(myds_v41_gpu_rope(ctx->attn_heads,512,V41_HEADS,pos,compressed,true));
         CHECK(myds_metal_attn_output_a_bf16(ctx->attn_low,base->attn_output_a,ctx->attn_heads,8,4096,1024,base->attn_output_a_type));

@@ -478,6 +478,8 @@ int myds_metal_init(const char *shader_dir) {
                         @"kernel_flash_attn_ext_vec_f16_dk512_dv512",
                         @"kernel_flash_attn_ext_pad",
                         @"kernel_flash_attn_ext_vec_reduce",
+                        @"kernel_dsv41_copy_window_f32_to_f16",
+                        @"kernel_dsv41_get_rows_bf16_to_f16",
                         /* V4.1 MoE & routing */
                         @"kernel_mul_mv_id_iq2_xxs_f32",
                         @"kernel_mul_mv_id_q2_K_f32",

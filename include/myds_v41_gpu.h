@@ -147,6 +147,13 @@ int myds_v41_gpu_attention(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *window,uint32_t n_raw,
     uint32_t raw_start,const myds_metal_buffer_t *selected_kv,uint32_t selected_rows,
     myds_v41_gpu_scratch_t *scratch);
+/* Fused direct attention: single-dispatch vectorized circular window copy and
+ * direct BF16->F16 gather, eliminating intermediate selected_kv staging buffer
+ * and reducing decode attention dispatches. */
+int myds_v41_gpu_attention_direct(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *window,uint32_t n_raw,
+    uint32_t raw_start,const myds_metal_buffer_t *comp_kv,const myds_metal_buffer_t *selected_ids,
+    uint32_t source_rows,uint32_t selected_rows,myds_v41_gpu_scratch_t *scratch);
 /* 整个 chunk 一次算完的 attention（chunked prefill 用）。 */
 int myds_v41_gpu_attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *chunk_kv,
