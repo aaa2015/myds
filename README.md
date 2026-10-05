@@ -280,6 +280,164 @@ compressed KV 与 index cache 保存已完成 BF16 舍入的上 16 位，读取�
 F32/BF16 输入、子视图 canary、同一 batch 混用和缺 PSO 回退。独立完整模型计时工具
 可用 `make bin/bench_phase` 构建；它不会由默认测试自动加载模型。
 
+### 2026-10-05 测试、日志与测量复现
+
+本轮完整模型实测机器是 Apple M2 Ultra / 192 GiB / macOS 26.5.2，模型为
+`DeepSeek-V4.1-Flash-Q2.gguf`，上下文容量 262144。本地 Apple M4 / 16 GiB
+运行小规模 GPU fixture 和单元测试；完整模型吞吐数据来自 Mac Studio。
+需要 Python 3、Clang、macOS SDK 和 Metal 编译工具；项目的
+`tools/build_metallib.py` 负责生成 metallib。完整模型复测需要本机准备相同 GGUF。
+
+#### 单元测试与日志
+
+从仓库根目录运行，保存 stdout/stderr，并通过 `pipefail` 保留测试失败状态：
+
+```sh
+MYDS_REPRO_OUT="$(mktemp -d /tmp/myds-review-XXXXXX)"
+set -o pipefail
+make -B -j8 all bin/bench_phase 2>&1 | tee "$MYDS_REPRO_OUT/build.log"
+make test 2>&1 | tee "$MYDS_REPRO_OUT/unit-tests.log"
+make test-tail-init 2>&1 | tee "$MYDS_REPRO_OUT/tail-init.log"
+python3 docs/benchmarks/2026-10-05-optimization/protocol/selftest-summarize-final.py \
+  > "$MYDS_REPRO_OUT/measurement-audit-selftest.json"
+python3 tools/bench_reproduce.py verify --check-source
+```
+
+`make -B` 强制重编译，避免复制源码或切换测量版本时复用时间戳较新的旧对象文件。
+`make test-tail-init` 是独立 GPU 测试，不由 `make test` 自动执行；
+`make build-tail-init` 只构建缺少可选 tail PSO 的真实 metallib fixture。
+测量汇总脚本的 selftest 只处理 CPU 数据，验证有效样本及 18 种错误记录的拒绝行为。
+
+| 测试入口 | 主要断言 |
+| --- | --- |
+| `bin/test_v41_gpu`、`--slab`、`--threshold` | gather/slab 选择、阈值、lazy 工作区、BF16 缓存、同一 batch 内路径切换；三种配置均在 `make test` 中执行。 |
+| `bin/test_attention_policy` | matrix/auto/vec 策略、缺 PSO 和共享内存失败回退、恢复后的重试。 |
+| `bin/test_attention_vec` | 非零 F32/BF16 逐位对照、短块和 carry、子视图 canary、head-first 成功与缺 PSO 回退。 |
+| `MYDS_QKV_NR0=4 bin/test_qkv_fusion`、`MYDS_QKV_NR0=2 bin/test_qkv_fusion` | 两种独立行配置、BF16 舍入边界、RoPE/量化/窗口写入、奇数输出行、别名与 copy 失败回退；均在 `make test` 中执行。 |
+| `make test-tail-init` | 真实缺 tail PSO 和必需 PSO 创建失败后的全状态清理、重复失败、恢复完整库及 lazy 初始化重试。 |
+| `bin/test_engine`、`bin/test_p1` | 生成、前缀恢复与快照边界、缓存失败路径回归。 |
+| `bin/test_server_api`、`tests/test_http_bytes.py` | FIFO SSE 输出、背压/断连取消、排空期限与实际 HTTP 字节协议；由 `make test` 执行。 |
+| `bin/test_engram`、`bin/test_kvdsk`、`bin/test_metal` | LUT 数值、共享段提交/覆盖/损坏/budget、Metal 特化缓存与基础算子。 |
+| `python3 tests/test_bench_reproduce.py` | 全 CPU：使用保存的真实 metrics 验证汇总，用 subprocess stub 验证输入/日志绑定、非 greedy 拒绝、超时/失败清理；由 `make test` 执行，stub 不运行 GGUF 或 Metal。 |
+
+本轮原始日志收录于 `docs/benchmarks/2026-10-05-optimization/validation/`：
+`workspace-build.log`、`workspace-test.log`、`workspace-tail-init-test.log`、
+`workspace-policy-retry-test.log`。`mandatory-pso-before-test.log` 是修复前故障复现，
+其失败是预期证据；`mandatory-pso-after-test.log` 是修复后的通过记录。
+打包时新增的测量入口 CPU 回归单独记录在 `reproduction-tool-test.log`，
+探针构建与补丁检查记录在 `replay-tools/cpu-validation.json`。
+本地 fixture 通过的范围是这些断言，完整模型的输出与性能另由下面的工具验证。
+
+#### 完整模型每 token 测量
+
+先在 Mac Studio 安排独占窗口：确认生产请求结束，暂停推理服务和其他 GPU benchmark，
+完成后通过 deploy 的 `start_fleet.sh` 恢复并检查 `/health`。
+`tools/bench_reproduce.py run` 会检查已知推理/benchmark 进程与 8181 监听，
+发现仍在运行时退出；服务暂停与恢复由窗口管理者负责。
+
+```sh
+MYDS_REPRO_MODEL="~/.lmstudio/models/antirez/deepseek-v4.1-flash-gguf/DeepSeek-V4.1-Flash-Q2.gguf"
+python3 tools/bench_reproduce.py run \
+  --binary "$PWD/bin/bench_phase" \
+  --model "$MYDS_REPRO_MODEL" \
+  --request "$PWD/docs/benchmarks/2026-10-05-optimization/requests/normal.json" \
+  --out "$MYDS_REPRO_OUT/candidate-normal"
+```
+
+输出目录必须是新的。`run-metrics.jsonl` 保存 metadata、模型加载信息、预热和三轮正式样本，
+包括实际 token 数、原始 token 数组、输出字节哈希、逐 token 回调间隔；
+`run.log` 保存引擎 stdout/stderr；`run-state.json` 保存完整 argv、显式环境、
+二进制/metallib/请求 SHA、模型文件大小与 mtime、运行前后硬件/内存/swap 状态及退出码；
+`run-summary.json` 仅在样本校验通过后产生。模型身份记录为文件元数据，未对整个 GGUF 做 SHA。
+
+入口清除全部继承的 `MYDS_*` 环境，并显式设置 prefix cache、KV disk、phase profiler 为 0，
+chunk=512、MoE chunks=9、suffix shift=512、residency keep-alive=86400。
+`--env MYDS_NAME=value` 可以重复传入，例如 `--env MYDS_ATTN_VEC_HEAD_FIRST=0`；
+缓存命中、profiler 和跳过计算的配置会被拒绝。三个请求样本为
+`requests/short.json`、`normal.json`、`long.json`，分别实测 prefill 356、1830、7194 token。
+默认生成上限 64；短请求实际 EOS 为 26 token，decode 分母因此为 25。
+
+底层工具也可以直接调用：
+`bin/bench_phase model.gguf request.json [repeats=3] [max_new_tokens=64] [max_seq_len=262144]`。
+输出上限支持 32/64；温度、top-p、top-k、min-p、重复惩罚和 seed 在工具中固定为
+0/1/0/0/1/42，greedy 路径不读取采样 RNG，请求 JSON 中的 sampling 字段不覆盖它。
+prefill 口径为 `1000 * prefill_seconds / prefill_tokens`，最终 prompt token 在首次 decode
+forward 消耗；decode 为 `1000 * (last_callback-first_callback) / (output_tokens-1)`，
+不含首次 forward/TTFT。加载、HTTP 传输、队列等待不计入这两个指标。
+
+#### 构建同轮基线并比较
+
+同轮基线是本轮优化前的工作区，已含 causal mask 修复；使用已提交快照补丁恢复，
+不能直接用旧部署版本代替：
+
+```sh
+MYDS_REPRO_BASE="$MYDS_REPRO_OUT/base-source"
+mkdir "$MYDS_REPRO_BASE"
+git archive f0a9c228ed1bac8e72b8a78e50f87ea89d807b73 | tar -x -C "$MYDS_REPRO_BASE"
+git -C "$MYDS_REPRO_BASE" apply --check \
+  "$PWD/docs/benchmarks/2026-10-05-optimization/protocol/baseline-working-changes.patch"
+git -C "$MYDS_REPRO_BASE" apply \
+  "$PWD/docs/benchmarks/2026-10-05-optimization/protocol/baseline-working-changes.patch"
+make -C "$MYDS_REPRO_BASE" -B -j8 all 2>&1 | tee "$MYDS_REPRO_OUT/base-build.log"
+xcrun clang -O3 -Wall -Wextra -std=c11 -I"$MYDS_REPRO_BASE/include" \
+  -c tools/bench_phase.c -o "$MYDS_REPRO_BASE/build/bench_phase.o"
+xcrun clang "$MYDS_REPRO_BASE"/build/myds_*.o "$MYDS_REPRO_BASE/build/bench_phase.o" \
+  -framework Foundation -framework Metal -lm -lpthread -o "$MYDS_REPRO_BASE/bin/bench_phase"
+python3 tools/bench_reproduce.py run \
+  --binary "$MYDS_REPRO_BASE/bin/bench_phase" --model "$MYDS_REPRO_MODEL" \
+  --request "$PWD/docs/benchmarks/2026-10-05-optimization/requests/normal.json" \
+  --out "$MYDS_REPRO_OUT/base-normal"
+python3 tools/bench_reproduce.py compare \
+  --base "$MYDS_REPRO_OUT/base-normal" --candidate "$MYDS_REPRO_OUT/candidate-normal" \
+  --out "$MYDS_REPRO_OUT/normal-comparison.json"
+```
+
+每个版本使用独立进程，预热一次后正式三次。compare 重新校验原始记录，要求输入配置、
+模型文件元数据、机器配置、全部 token 数组及输出字节哈希一致，再比较三轮中位数并保留
+最小/最大值。实验 matrix 路径若改变输出，严格 compare 会失败，不能按严格一致优化报收益。
+本轮长输入两轮变慢的数据在 `final-summary.json` 和
+`head-first-long-validation.json` 中均保留；重新测试也应保留全部正式样本。
+
+#### 层级归因、组件回放与已保存证据
+
+| 文件/目录 | 用途与复现边界 |
+| --- | --- |
+| `optimization/raw/exclusive-20261005T022233Z/` | 主对照的六组 `*-metrics.jsonl`、引擎 `.log`、独占窗口事件 `window.jsonl`、服务恢复 `restore.log`。 |
+| `optimization/raw/exclusive-20261005T023349Z/` | head-first 长输入补充对照，包含 host 诊断计数，独立于主对照。 |
+| `optimization/protocol/summarize-final.py` | 对主窗口做 CPU 审计，验证完整结束、服务恢复、退出码、实际分母和输出，再生成 JSON/CSV。 |
+| `optimization/replay-tools/recipe.json` | attention/MoE/decode 独立探针、实验 Metal 补丁、实际中间量采集、GGUF tensor layout 提取的源码来源、构建和运行命令。 |
+| `optimization/component-provenance-audit.json` | 区分真实权重、真实中间量和合成输入；QKV 使用真实选定权重及合成非零 activation，decode IQ2 使用捕获的 prefill 末行。 |
+| `optimization/replay-input-manifest.json` | 真实捕获文件的 SHA/大小。约 503 MB 的 activation 数据需按 recipe 重新采集，不包含在 Git 中。 |
+| `phase/instrumentation.patch`、`phase/layer-profile.patch`、`phase/aggregate-layer.py` | 历史分层仪器及聚合脚本。GPU timestamp/counter 可用性与 profiler 扰动记录在 phase manifest；仪器结果用于归因，整体耗时采用关闭仪器的对照。 |
+| `optimization/protocol/run-*.py`、`phase/run-exclusive.py` | 本轮执行过的历史窗口脚本，固定了当时的临时目录、fleet/model 路径、端口和生产 SHA。新窗口使用参数化 `bench_reproduce.py`；复用历史脚本前须准备其依赖并逐项核对现场配置。 |
+
+上表中的 `optimization/`、`phase/` 分别指
+`docs/benchmarks/2026-10-05-optimization/` 和 `docs/benchmarks/2026-10-05-phase/`。
+仅复算已保存主对照数据，无需 GPU 或 GGUF：
+
+```sh
+python3 docs/benchmarks/2026-10-05-optimization/protocol/summarize-final.py \
+  docs/benchmarks/2026-10-05-optimization/raw/exclusive-20261005T022233Z \
+  --out "$MYDS_REPRO_OUT/saved-result-audit"
+```
+
+QKV 探针单独编译，`MYDS_QKV_BENCH_FUSED` 宏和 `--model` 均需提供，才能复现本轮融合对照：
+
+```sh
+xcrun clang -O3 -Wall -Wextra -Iinclude -fobjc-arc -DMYDS_QKV_BENCH_FUSED \
+  tools/bench_qkv.m src/myds_v41_gpu.c src/myds_gguf.c src/myds_log.c \
+  -framework Foundation -framework Metal -lm -lpthread -o bin/bench_qkv
+MYDS_QKV_NR0=4 bin/bench_qkv --layout /path/to/tensor-layout.json \
+  --model "$MYDS_REPRO_MODEL" --shader-dir "$PWD/bin" --layer 0 --samples 9 --reps 64 \
+  > "$MYDS_REPRO_OUT/qkv-nr4.csv" 2> "$MYDS_REPRO_OUT/qkv-nr4.log"
+```
+
+layout 按 replay recipe 从同一 GGUF 提取。QKV 的 stdout 含启动信息及 CSV，历史文件虽用
+`.jsonl` 后缀，审计按 CSV 处理；新复现采用 `.csv`。组件 probe 只给出该组件、该输入的计时，
+不可将多个独立回放中位数相加后当作整层或整模型耗时。
+`.gitattributes` 保留证据的原始换行，`bench_reproduce.py verify` 校验两轮证据 manifest；
+`--check-source` 同时验证本次打包源码。服务部署后 SHA、模型或环境变化时，应另存新的结果目录。
+
 ## 视觉（图片输入）
 
 支持图片输入（DeepSeek-V4.1-Flash-Vision），启动加 `--vision <编码器.gguf>`。

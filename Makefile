@@ -271,6 +271,7 @@ test: $(ALL_TESTS) $(METALLIB)
 	@./$(TEST_P1)
 	@echo ""
 	@python3 tests/test_http_bytes.py
+	@python3 tests/test_bench_reproduce.py
 	@echo "\n========================================================"
 	@echo "      ALL TEST SUITES PASSED CLEANLY & SUCCESSFULLY!    "
 	@echo "========================================================"

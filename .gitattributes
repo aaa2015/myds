@@ -1,2 +1,12 @@
 # Unified diff context lines intentionally contain a single space.
 tools/reference/*.patch -whitespace
+# Benchmark SHA manifests refer to the original bytes, including CSV CRLF.
+docs/benchmarks/2026-10-05-phase/** -text
+docs/benchmarks/2026-10-05-optimization/** -text
+docs/benchmarks/2026-10-05-phase/**/*.csv whitespace=trailing-space,space-before-tab,cr-at-eol
+docs/benchmarks/2026-10-05-optimization/**/*.csv whitespace=trailing-space,space-before-tab,cr-at-eol
+# Preserve unified-diff context and verbatim test output whitespace.
+docs/benchmarks/2026-10-05-phase/*.patch -whitespace
+docs/benchmarks/2026-10-05-optimization/protocol/*.patch -whitespace
+docs/benchmarks/2026-10-05-optimization/replay-tools/patches/*.patch -whitespace
+docs/benchmarks/2026-10-05-optimization/validation/*.log -whitespace

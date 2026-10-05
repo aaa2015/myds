@@ -185,7 +185,7 @@ int main(int argc,char **argv) {
     @autoreleasepool {
         require(myds_metal_init(shader),"Metal init");struct fixture f;fixture_create(&f,layout,model,layer);
         printf("# GPU=%s weights=%s layer=%u samples=%u reps=%u types=Q8_0 shapes=1280x5120,32768x1280,512x5120\n",g_device.name.UTF8String,model?"actual GGUF selected tensors":"synthetic nonzero",layer,samples,reps);
-        printf("# MYDS_QKV_NR0=%s\n",getenv("MYDS_QKV_NR0")?getenv("MYDS_QKV_NR0"):"2 default");
+        printf("# MYDS_QKV_NR0=%s\n",getenv("MYDS_QKV_NR0")?getenv("MYDS_QKV_NR0"):"4 default");
 #ifdef MYDS_QKV_BENCH_FUSED
         require(myds_metal_v41_qkv_fusion_available(),"fused shader unavailable; refusing fallback-only benchmark");
         verify_chain(&f);
