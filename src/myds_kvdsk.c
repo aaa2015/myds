@@ -285,7 +285,7 @@ static bool read_finish(myds_kvdsk_t *k, bool touch) {
     k->reading = 0;
     if (got != k->read_expected_crc) {
         MYDS_LOG_W("kvdisk: slot %u 的 payload 校验和不符（读到 %016llx，应为 %016llx）"
-                   "—— 作废该条并回退全量。",
+                   "—— 作废该条，本次读取失败。",
                    slot, (unsigned long long)got, (unsigned long long)k->read_expected_crc);
         (void)myds_kvdsk_slot_clear(k, slot);
         return false;

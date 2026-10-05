@@ -90,6 +90,47 @@ static void test_roundtrip(void) {
     myds_kvdsk_close(k);
 }
 
+/* Existing files use a word-wise checksum whose partial-word boundary is
+ * significant. Snapshot history is 12 bytes: a transactional staging reader
+ * must retain that write boundary instead of reading the whole payload in
+ * uniform chunks. This contract is exercised without Metal or model files. */
+static void test_snapshot_checksum_ranges(void) {
+    fresh_path("snapshot_ranges", 0);
+    myds_kvdsk_t *k = myds_kvdsk_open(g_path, 0x5EEDu, SLOTS, STRIDE, 0);
+    CHECK(k != NULL, "open snapshot checksum ranges");
+    if (!k) return;
+    enum { HEADER = 64, HISTORY = 12, WINDOW = 128, REF = 32, TOTAL = HEADER + HISTORY + WINDOW + 2 * REF };
+    unsigned char data[TOTAL], staged[TOTAL];
+    fill(data, sizeof(data), 47u);
+    const size_t ranges[] = {HEADER, HISTORY, WINDOW, REF, REF};
+    for (unsigned mode = 0; mode < 2; ++mode) {
+        CHECK(myds_kvdsk_write_start(k, 0), "snapshot range write start");
+        size_t off = 0;
+        for (size_t i = 0; i < sizeof(ranges) / sizeof(ranges[0]); ++i) {
+            CHECK(myds_kvdsk_write_chunk(k, off, data + off, ranges[i]), "snapshot range write");
+            off += ranges[i];
+        }
+        CHECK(myds_kvdsk_write_finish(k, 0, 2048, 0xCAFEu, TOTAL), "snapshot range commit");
+        CHECK(myds_kvdsk_read_start(k, 0, NULL), "snapshot range read start");
+        if (mode == 0) {
+            CHECK(myds_kvdsk_read_chunk(k, 0, staged, TOTAL), "uniform staged read");
+            CHECK(!myds_kvdsk_read_verify(k), "uniform read must expose partial-word checksum boundary mismatch");
+            CHECK(!myds_kvdsk_slot_meta(k, 0, NULL, NULL, NULL), "mismatched checksum invalidates the descriptor");
+        } else {
+            off = 0;
+            for (size_t i = 0; i < sizeof(ranges) / sizeof(ranges[0]); ++i) {
+                CHECK(myds_kvdsk_read_chunk(k, off, staged + off, ranges[i]), "writer-compatible staged range");
+                off += ranges[i];
+            }
+            CHECK(myds_kvdsk_read_verify(k), "writer-compatible private staging preserves existing checksum ABI");
+            CHECK(memcmp(data, staged, TOTAL) == 0, "private stage bytes remain bit-exact");
+            uint32_t hits = 99;
+            CHECK(myds_kvdsk_slot_hits(k, 0, &hits) && hits == 0, "verification alone does not count as publication");
+        }
+    }
+    myds_kvdsk_close(k);
+}
+
 static void test_empty_slot_is_a_clean_miss(void) {
     fresh_path("empty", 0);
     myds_kvdsk_t *k = myds_kvdsk_open(g_path, 1u, SLOTS, STRIDE, 0);
@@ -399,6 +440,7 @@ int main(void) {
     test_hash_is_stable_and_discriminating();
     test_identity_discriminates();
     test_roundtrip();
+    test_snapshot_checksum_ranges();
     test_empty_slot_is_a_clean_miss();
     test_peek_preserves_read_transaction_and_hits();
     test_aborted_write_recovers_without_reopen();

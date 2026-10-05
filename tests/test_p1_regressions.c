@@ -1614,15 +1614,17 @@ static void test_lowkv_segment_failure_paths(void) {
                 free(branch);
                 uint32_t live = 0; myds_v41_low_kv_stats(g, &live, NULL); assert(live == 3);
             }
+            const uint32_t preserved = myds_v41_snapshot_best(g, LK_NTOK);
+            assert(preserved != 0);
             assert(myds_v41_low_kv_load(g, tokens, LK_NTOK) == 0);
-            assert(myds_v41_snapshot_best(g, LK_NTOK) == 0);
-            assert(!myds_v41_snapshot_get_valid(g));
-            assert(!myds_v41_snapshot_restore(g, LK_NTOK));
+            assert(myds_v41_snapshot_best(g, LK_NTOK) == preserved);
+            assert(myds_v41_snapshot_get_valid(g));
+            lk_assert_restored(g, preserved, false);
         }
         myds_v41_context_free(g); lk_remove_store(path);
     }
     free(tokens); rmdir(dir);
-    printf("  [PASS] SSD segment partial writes never publish, aborted writes recover, evicted/replaced/corrupt refs fail closed\n");
+    printf("  [PASS] SSD segment partial writes never publish, aborted writes recover, evicted/replaced/corrupt refs preserve RAM state\n");
 }
 
 int main(void) {

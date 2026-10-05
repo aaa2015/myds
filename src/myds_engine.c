@@ -22,6 +22,23 @@
 bool myds_trace_f32(const char *stage, uint32_t layer, uint32_t pos,
                       const myds_metal_buffer_t *buffer, size_t count);
 
+/* Cache the process policy atomically: different library contexts can first
+ * generate concurrently. Environment changes require a process restart. */
+static bool prefer_deeper_disk_prefix(void) {
+    static atomic_int policy = ATOMIC_VAR_INIT(-1);
+    int value = atomic_load_explicit(&policy, memory_order_acquire);
+    if (value < 0) {
+        const char *e = getenv("MYDS_KV_DSK_PREFER_DEEPER");
+        const int chosen = (!e || atoi(e) != 0) ? 1 : 0;
+        int expected = -1;
+        if (atomic_compare_exchange_strong_explicit(&policy, &expected, chosen,
+                                                   memory_order_acq_rel, memory_order_acquire))
+            value = chosen;
+        else value = expected;
+    }
+    return value != 0;
+}
+
 typedef struct {
     uint16_t d;
     int8_t   qs[32];
@@ -3057,21 +3074,33 @@ static int myds_generate_internal(myds_context_t *ctx,
             MYDS_LOG_I("prefix cache: skipped - no common prefix with the cached %u tokens", ctx->pcache_len);
         }
 
-        /* ★ 内存路径没能给出续跑点 ⇒ 试【磁盘】。
-         * 为什么放在整条分支【之后】而不是各分支里面：最主要的使用场景是
-         * 「重启后的第一个请求」——那时还没有上一条序列（走的是 !have_prev 分支），
-         * 而常量前缀就在盘上。塞在某个分支里会正好漏掉它。
-         * MYDS_PREFIX_CACHE=0 时不试：那是「关掉一切复用」的开关，磁盘复用也算复用。
-         * 判据只看「这条 prompt 开头那段是否与盘上的前缀逐 token 相同」（哈希），
-         * 不要求与上一条请求有公共前缀。 */
-        if (pcache_on && resume_from == 0 && ctx->v41) {
-            const uint32_t disk = myds_v41_low_kv_load(ctx->v41, prompt_tokens,
-                                                       (uint32_t)n_prompt - 1u);
-            if (disk) {
-                resume_from = disk; snap_hit = true;
-                MYDS_LOG_I("prefix cache: prompt %d tok -> resume from DISK snapshot at %u "
-                           "(reuse %u tok, still to prefill %u)",
-                           n_prompt, disk, disk, (uint32_t)n_prompt - 1u - disk);
+        /* Compare metadata even when RAM has a shallow match. Loading only
+         * a strictly deeper SSD entry avoids unnecessary payload I/O at ties.
+         * The transactional loader preserves RAM state on every failure, so
+         * the already-selected snapshot or strict continuation is a fallback.
+         * MYDS_KV_DSK_PREFER_DEEPER=0 keeps the previous selection policy. */
+        bool disk_loaded = false;
+        struct timespec disk_restore_started = {0};
+        if (pcache_on && ctx->v41 && (prefer_deeper_disk_prefix() || resume_from == 0)) {
+            const uint32_t candidate = myds_v41_low_kv_probe_deeper(ctx->v41, prompt_tokens,
+                                                                    resume_from, (uint32_t)n_prompt - 1u);
+            if (candidate > resume_from) {
+                const uint32_t memory = resume_from;
+                clock_gettime(CLOCK_MONOTONIC, &disk_restore_started);
+                MYDS_LOG_I("prefix cache: deeper DISK candidate %u > RAM %u; validating payload",
+                           candidate, memory);
+                const uint32_t disk = myds_v41_low_kv_load_deeper(ctx->v41, prompt_tokens,
+                                                                 memory, candidate);
+                if (disk > memory) {
+                    resume_from = disk; snap_hit = true;
+                    disk_loaded = true;
+                    MYDS_LOG_I("prefix cache: prompt %d tok -> resume from DISK snapshot at %u "
+                               "(RAM %u, reuse %u tok, still to prefill %u)",
+                               n_prompt, disk, memory, disk, (uint32_t)n_prompt - 1u - disk);
+                } else {
+                    MYDS_LOG_W("prefix cache: DISK candidate %u unavailable; retaining RAM %u",
+                               candidate, memory);
+                }
             }
         }
 
@@ -3079,6 +3108,13 @@ static int myds_generate_internal(myds_context_t *ctx,
         if (snap_hit && (!ctx->v41 || !myds_v41_snapshot_restore(ctx->v41, resume_from))) {
             MYDS_LOG_W("prefix cache: snapshot restore at %u failed -> full prefill", resume_from);
             resume_from = 0;
+        }
+        if (disk_loaded) {
+            struct timespec ended;
+            clock_gettime(CLOCK_MONOTONIC, &ended);
+            const double ms = (double)(ended.tv_sec - disk_restore_started.tv_sec) * 1e3 +
+                (double)(ended.tv_nsec - disk_restore_started.tv_nsec) / 1e6;
+            MYDS_LOG_I("prefix cache: DISK load+apply %.3f ms, selected %u tokens", ms, resume_from);
         }
         /* 清空：本次 prefill 会重建属于【本次序列】的点。否则可能用到「已被后续请求改写过的
          * 压缩 KV」所对应的旧点，把续跑接在错误的状态上。 */

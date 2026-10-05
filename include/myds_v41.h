@@ -48,10 +48,26 @@ bool     myds_v41_low_kv_save(myds_v41_context_t *context, const int32_t *tokens
                               uint32_t n_tokens);
 /* 显式等待后台写盘结束（未启用/无在途写盘时立即返回）。 */
 void     myds_v41_low_kv_wait(myds_v41_context_t *context);
+/* Metadata-only deepest-prefix query. Joins any pending save, but does not
+ * read payloads, change hit counts, or change live/snapshot state. A probe
+ * hit remains tentative until load validates its complete payload. */
+uint32_t myds_v41_low_kv_probe(myds_v41_context_t *context, const int32_t *tokens,
+                               uint32_t max_position);
+/* Probe only positions strictly above an already selected RAM prefix. This
+ * avoids scanning ways/hashing prefixes that cannot improve the RAM hit. */
+uint32_t myds_v41_low_kv_probe_deeper(myds_v41_context_t *context, const int32_t *tokens,
+                                     uint32_t memory_position, uint32_t max_position);
 /* 在 (0, max_position] 内找【最深】的、前缀哈希匹配的条目，装回内存快照槽。
- * 返回命中的位置（0 = 未命中），随后由 myds_v41_snapshot_restore 应用。 */
+ * 完整窗口及 packed KV/index 均在私有 RAM 中通过 CRC/布局校验后才发布。
+ * 返回 0 时保留原 live state 与内存快照，可安全继续用浅内存前缀。
+ * 返回命中的位置，随后由 myds_v41_snapshot_restore 应用。
+ * 临时内存最多约 44.4 MiB，成功/失败后立即释放。 */
 uint32_t myds_v41_low_kv_load(myds_v41_context_t *context, const int32_t *tokens,
                               uint32_t max_position);
+/* Like load, but never publishes a position <= memory_position, including
+ * when the earlier metadata probe has become unavailable. */
+uint32_t myds_v41_low_kv_load_deeper(myds_v41_context_t *context, const int32_t *tokens,
+                                     uint32_t memory_position, uint32_t max_position);
 /* 落盘条目的诊断信息（命中数 / 有效数），供日志与测试读取。 */
 void     myds_v41_low_kv_stats(const myds_v41_context_t *context,
                                uint32_t *live_entries, uint32_t *slots);

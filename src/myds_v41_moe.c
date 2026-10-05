@@ -1,4 +1,5 @@
 #include "myds_v41_moe.h"
+#include "myds_v41_decode.h"
 #include "myds_log.h"
 #include <math.h>
 #include <stddef.h>
@@ -143,20 +144,18 @@ int myds_v41_moe(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t p
     myds_model_t *m = ctx->model;
     myds_layer_t *l = &m->layers[layer];
     const uint32_t dim=m->dim, width=m->moe_expert_dim;
+    const bool trace_on = myds_trace_active();
 
     if (!myds_metal_v41_gemv(ctx->router_logits,l->router_gate,ctx->ffn_norm_out,
                              m->n_routed_experts,dim,l->router_gate_type)) return 0;
-    if (!myds_metal_gemv(ctx->shared_gate_out,l->shared_gate,ctx->ffn_norm_out,
-                         width,dim,l->shared_gate_type) ||
-        !myds_metal_v41_bf16(ctx->shared_gate_out,width) ||
-        !myds_metal_gemv(ctx->shared_up_out,l->shared_up,ctx->ffn_norm_out,
-                         width,dim,l->shared_up_type) ||
-        !myds_metal_v41_bf16(ctx->shared_up_out,width) ||
+    if (!myds_v41_decode_gemv_bf16(ctx->shared_gate_out,l->shared_gate,ctx->ffn_norm_out,
+                         width,dim,l->shared_gate_type,trace_on) ||
+        !myds_v41_decode_gemv_bf16(ctx->shared_up_out,l->shared_up,ctx->ffn_norm_out,
+                         width,dim,l->shared_up_type,trace_on) ||
         !myds_v41_shared_swiglu(ctx->shared_swiglu_out,ctx->shared_gate_out,
                                ctx->shared_up_out,width,m->swiglu_clamp_exp) ||
-        !myds_metal_gemv(ctx->shared_out,l->shared_down,ctx->shared_swiglu_out,
-                         dim,width,l->shared_down_type) ||
-        !myds_metal_v41_bf16(ctx->shared_out,dim)) return 0;
+        !myds_v41_decode_gemv_bf16(ctx->shared_out,l->shared_down,ctx->shared_swiglu_out,
+                         dim,width,l->shared_down_type,trace_on)) return 0;
 
     return myds_v41_moe_eval(ctx, layer, pos, ctx->ffn_norm_out, ctx->router_logits, ctx->shared_out);
 }
