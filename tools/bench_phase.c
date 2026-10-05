@@ -196,7 +196,8 @@ int main(int argc, char **argv) {
         "MYDS_MOE_ROUTE_FUSE",
         "MYDS_ATTN_OUT_A_FUSE_BF16",
         "MYDS_ATTN_DIRECT_PACK",
-        "MYDS_ENGRAM_IO_THREADS", "MYDS_ENGRAM_NOCACHE", "MYDS_BENCH_STORAGE_COUNTERS"};
+        "MYDS_ENGRAM_IO_THREADS", "MYDS_ENGRAM_NOCACHE", "MYDS_BENCH_STORAGE_COUNTERS",
+        "MYDS_GEMV_BATCH_SIZE"};
     for (size_t i = 0; i < sizeof(env_names)/sizeof(env_names[0]); ++i) {
         if (i) fputc(',', json); json_string(json, env_names[i]); fputc(':', json); json_string(json, getenv(env_names[i]));
     }

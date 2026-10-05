@@ -2012,6 +2012,12 @@ struct ds4_metal_args_mul_mv {
     int16_t  r3;
 };
 
+static uint32_t get_gemv_batch_size(void) {
+    const char *env = getenv("MYDS_GEMV_BATCH_SIZE");
+    if (env && (strcmp(env, "1") == 0 || strcmp(env, "0") == 0)) return 1;
+    return 4;
+}
+
 int myds_metal_gemv_batch(
     myds_metal_buffer_t       *y,
     const myds_metal_buffer_t *W,
@@ -2184,7 +2190,14 @@ int myds_metal_v41_gemv_batch(myds_metal_buffer_t *out,
     args.r2 = 1;
     args.r3 = 1;
     @autoreleasepool {
-        NSString *funcName = weight_type == GGML_TYPE_F32 ? @"kernel_mul_mv_f32_f32_4" : @"kernel_mul_mv_f16_f32_4";
+        const uint32_t b_size = (n_tok > 1u) ? get_gemv_batch_size() : 1u;
+        const bool use_b4 = (b_size == 4u && n_tok > 1u);
+        NSString *funcName = nil;
+        if (use_b4) {
+            funcName = weight_type == GGML_TYPE_F32 ? @"kernel_mul_mv_f32_f32_4_b4" : @"kernel_mul_mv_f16_f32_4_b4";
+        } else {
+            funcName = weight_type == GGML_TYPE_F32 ? @"kernel_mul_mv_f32_f32_4" : @"kernel_mul_mv_f16_f32_4";
+        }
         NSString *key = [NSString stringWithFormat:@"%@_%u", funcName, nsg];
         id<MTLComputePipelineState> pipeline = g_native_pipelines[key];
         if (!pipeline) {
@@ -2210,8 +2223,10 @@ int myds_metal_v41_gemv_batch(myds_metal_buffer_t *out,
         [enc setBuffer:weight->mtl_buf offset:weight->offset atIndex:1];
         [enc setBuffer:input->mtl_buf offset:input->offset atIndex:2];
         [enc setBuffer:out->mtl_buf offset:out->offset atIndex:3];
-        [enc setThreadgroupMemoryLength:32u * 2u * sizeof(float) atIndex:0];
-        metal_dispatch(enc, [funcName UTF8String], MTLSizeMake((out_dim + 1u) / 2u, n_tok, 1),
+        NSUInteger shmem_len = use_b4 ? (32u * 2u * 4u * sizeof(float)) : (32u * 2u * sizeof(float));
+        [enc setThreadgroupMemoryLength:shmem_len atIndex:0];
+        NSUInteger grid_y = use_b4 ? ((n_tok + 3u) / 4u) : n_tok;
+        metal_dispatch(enc, [funcName UTF8String], MTLSizeMake((out_dim + 1u) / 2u, grid_y, 1),
              MTLSizeMake(32, nsg, 1));
         return v41_finish(cb, enc);
     }
