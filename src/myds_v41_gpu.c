@@ -1,4 +1,6 @@
 #include "myds_v41_gpu.h"
+#include "myds_log.h"
+#include <errno.h>
 #include <math.h>
 #include <limits.h>
 #include <pthread.h>
@@ -9,23 +11,9 @@
  * 127 KV vectors, this chunk's tokens, and the compressed table prefix; the mask
  * block holds one uint16 row per token. */
 #define MYDS_CHUNK_CARRY      127u
-/* 单个 chunk 的 token 上界。MoE 每层要读【全部 384 个 expert】的权重（3.79 GB），
- * 而这份开销与 chunk 内的 token 数无关 —— 只与 chunk 的【个数】有关。
- * 512 时一个 4404 token 的 prompt 要 9 个 chunk（=9 遍 expert 权重，1.38 TB），
- * 2048 只需 3 个。所以这个值直接决定 MoE 的总量，不该卡在 512。 */
 #define MYDS_CHUNK_MAXC       MYDS_V41_CHUNK_MAX
-/* 压缩键的上界（键数，含 carry 与本 chunk）。
- * ratio_for 对 l>=20 的层返回 1，此时一个 chunk 的 n_comp 就是【绝对位置】，
- * 所以键范围 = CARRY + c_len + n_comp 会随上下文线性增长。
- * 历史上这个值被写死过两次（4608 → 16384），每次都是一个「宣称的上下文 > 实际能跑的」
- * 缺口：超了之后第 20 层 attention_chunk 返回 0 ⇒ 整个 prefill 失败，而且注释还谎称
- * 「会回退逐 token」（代码里根本没有回退）。
- * 现在：默认【完整覆盖配置的上下文】（不再有「配置 N、实际只能跑 N-2175」的小缺口），
- * 只封顶在 KEY_MAX_DEFAULT，env MYDS_CHUNK_KEY_MAX 可调（调小省内存，调大覆盖更长的上下文）。
- * 代价是内存：mask_chunk = MAXC * mask_u16 * 2 字节，kv slab = slab_rows * 1024 字节。
- *   ctx 262144 ⇒ mask 约 1.03 GB + slab 约 258 MB（配置了这么长上下文就该付这个钱）
- *   ctx   8192 ⇒ 合计约 42 MB
- * 超上限的 prompt 在 prefill【开始前】被明确拒绝（不再跑到第 20 层才炸）。 */
+/* Compressed-key coverage is independent of the allocated attention workspace.
+ * Gather uses only carry + current chunk; a dense slab is allocated on demand. */
 #define MYDS_CHUNK_KEY_MAX_DEFAULT 262144u
 #define MYDS_CHUNK_KEY_MAX_LIMIT  4194304u
 
@@ -50,11 +38,31 @@ struct myds_v41_gpu_scratch {
      * 以前是编译期常量 ⇒ 「配置的上下文」与「实际能跑的上下文」会静默分叉。 */
     uint32_t key_comp_max;   /* n_comp 的上界；超了必须在 prefill 开始前就拒绝 */
     uint32_t mask_u16;       /* 掩码行宽（u16），32 对齐 ⇒ keys_pad 落在行内 */
-    uint32_t slab_rows;      /* kv slab 行数 = CARRY + MAXC + key_comp_max */
+    uint32_t slab_rows;      /* allocated KV rows, rounded to a 32-key block */
     uint32_t keys_clamp;     /* 诊断：MYDS_ATTN_KEYS_CLAMP 缓存 */
+    uint32_t gather_min_keys; /* explicit opt-in policy; zero preserves default */
+    uint32_t prefill_attn_variant; /* 0=vec, 1=matrix, 2=auto */
+    uint32_t attn_matrix_unavailable; /* auto caches failure for this scratch */
+    uint32_t attn_vec_head_first; /* gather-only prefill vec geometry, default on */
+    uint32_t attn_vec_head_first_unavailable; /* optional PSO failed for this scratch */
+    myds_metal_buffer_t *attn_head_blocks; /* matrix tile mask block flags, lazy */
 };
+static uint32_t attn_matrix_test_failure;
+void myds_v41_gpu_inject_attention_matrix_failure(uint32_t kind) {
+    attn_matrix_test_failure=kind;
+}
+static uint32_t attn_vec_head_first_test_failure;
+void myds_v41_gpu_inject_attention_vec_head_first_failure(bool enabled) {
+    attn_vec_head_first_test_failure=enabled;
+}
+uint32_t myds_v41_gpu_attention_vec_head_first_status(const myds_v41_gpu_scratch_t *s) {
+    return !s||!s->attn_vec_head_first ? 0u : s->attn_vec_head_first_unavailable ? 2u : 1u;
+}
 static int floats(const myds_metal_buffer_t *b,uint64_t n) {
     return b && n && n<=myds_metal_buffer_size(b)/4 && myds_metal_buffer_offset(b)%4==0;
+}
+static int bf16s(const myds_metal_buffer_t *b,uint64_t n) {
+    return b && n && n<=myds_metal_buffer_size(b)/2 && myds_metal_buffer_offset(b)%2==0;
 }
 static int dispatch(const char *name,const void *args,size_t bytes,
     const myds_metal_buffer_t *const *b,size_t n,uint32_t x,uint32_t y,uint32_t z,
@@ -69,11 +77,25 @@ static int specialized(const char *name,const void *args,size_t bytes,
     const uint32_t groups[]={x,y,z},threads[]={tx,ty,tz};
     return myds_metal_dispatch_kernel_constants(name,args,bytes,b,n,groups,threads,smem,constants,nc);
 }
+int myds_v41_gpu_pack_bf16(myds_metal_buffer_t *dst,size_t dst_offset_words,
+    const myds_metal_buffer_t *src,size_t src_offset_floats,uint32_t count) {
+    if(!bf16s(dst,count)||!floats(src,count)||
+       dst_offset_words>myds_metal_buffer_size(dst)/2-count||
+       src_offset_floats>myds_metal_buffer_size(src)/4-count)return 0;
+    struct {uint64_t dst_offset,src_offset;uint32_t count,pad;} a={
+        dst_offset_words,src_offset_floats,count,0};
+    const myds_metal_buffer_t *b[]={src,dst};
+    return dispatch("kernel_dsv41_pack_bf16",&a,sizeof(a),b,2,
+                    (count-1u)/256u+1u,1,1,256,1,1,0);
+}
 uint32_t myds_v41_gpu_chunk_max_c(const myds_v41_gpu_scratch_t *s) {
     return s ? MYDS_CHUNK_MAXC : 0u;
 }
 uint32_t myds_v41_gpu_chunk_key_max(const myds_v41_gpu_scratch_t *s) {
     return s ? s->key_comp_max : 0u;
+}
+size_t myds_v41_gpu_chunk_workspace_bytes(const myds_v41_gpu_scratch_t *s) {
+    return s ? myds_metal_buffer_size(s->kv_chunk)+myds_metal_buffer_size(s->mask_chunk) : 0;
 }
 myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp) {
     if(!max_comp || max_comp>1048576) return NULL;
@@ -82,8 +104,7 @@ myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp) {
     s->max_comp=max_comp;
     const char *kc = getenv("MYDS_ATTN_KEYS_CLAMP");
     if(kc) s->keys_clamp = (uint32_t)strtoul(kc, NULL, 10);
-    /* chunk attention 的几何量：键上界跟随配置的上下文，并封顶（env 可覆盖）。
-     * 封顶的理由是内存：mask_chunk = MAXC * mask_u16 * 2 字节，而 mask_u16 ≈ 键上界。 */
+    /* Cover the configured context without eagerly allocating a dense mask. */
     {
         uint32_t key_max=MYDS_CHUNK_KEY_MAX_DEFAULT;
         const char *km=getenv("MYDS_CHUNK_KEY_MAX");
@@ -91,10 +112,29 @@ myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp) {
         if(key_max>max_comp) key_max=max_comp;   /* 不必超过配置的上下文 */
         s->key_comp_max=key_max;
         if(s->key_comp_max<2u||s->key_comp_max>MYDS_CHUNK_KEY_MAX_LIMIT){ free(s); return NULL; }
-        s->slab_rows=MYDS_CHUNK_CARRY+MYDS_CHUNK_MAXC+s->key_comp_max;
-        s->mask_u16=(s->slab_rows+31u)/32u*32u;  /* 32 对齐 ⇒ keys_pad 永远落在行内 */
-        if(s->mask_u16<s->slab_rows){ free(s); return NULL; }   /* 溢出保护 */
+        s->slab_rows=(MYDS_CHUNK_CARRY+MYDS_CHUNK_MAXC+31u)/32u*32u;
+        s->mask_u16=s->slab_rows;
     }
+    const char *gm=getenv("MYDS_ATTN_GATHER_MIN_KEYS");
+    if(gm){
+        char *end=NULL;errno=0;
+        unsigned long long v=strtoull(gm,&end,10);
+        if(errno||end==gm||*end||v>s->key_comp_max){
+            MYDS_LOG_E("MYDS_ATTN_GATHER_MIN_KEYS must be an integer in [0,%u]",s->key_comp_max);
+            free(s);return NULL;
+        }
+        s->gather_min_keys=(uint32_t)v;
+    }
+    const char *av=getenv("MYDS_PREFILL_ATTN");
+    if(av && strcmp(av,"vec")){
+        if(!strcmp(av,"matrix"))s->prefill_attn_variant=1;
+        else if(!strcmp(av,"auto"))s->prefill_attn_variant=2;
+        else{MYDS_LOG_E("MYDS_PREFILL_ATTN must be vec, matrix, or auto");free(s);return NULL;}
+    }
+    /* Capture the policy once per scratch. Both default and explicit enablement
+     * are best effort: an older complete metallib falls back to the original vec. */
+    const char *hf=getenv("MYDS_ATTN_VEC_HEAD_FIRST");
+    s->attn_vec_head_first=!hf||strcmp(hf,"0")!=0;
     s->sort_a=myds_metal_buffer_alloc((size_t)max_comp*4);
     s->sort_b=myds_metal_buffer_alloc((size_t)max_comp*4);
     s->kv_f16=myds_metal_buffer_alloc(640u*512u*2u);
@@ -136,6 +176,7 @@ void myds_v41_gpu_scratch_free(myds_v41_gpu_scratch_t *s) {
     myds_metal_buffer_free(s->sort_a);myds_metal_buffer_free(s->sort_b);
     myds_metal_buffer_free(s->kv_f16);myds_metal_buffer_free(s->mask);
     myds_metal_buffer_free(s->kv_chunk);myds_metal_buffer_free(s->mask_chunk);
+    myds_metal_buffer_free(s->attn_head_blocks);
     myds_metal_buffer_free(s->pad);myds_metal_buffer_free(s->partial);
     myds_metal_buffer_free(s->chunk_scores);myds_metal_buffer_free(s->chunk_tmp_a);
     myds_metal_buffer_free(s->chunk_tmp_b);myds_metal_buffer_free(s->chunk_blocks);
@@ -210,6 +251,30 @@ int myds_v41_gpu_quant(myds_metal_buffer_t *x,uint32_t width,uint32_t rows,uint3
     const uint32_t a[]={width,rows,mode};const myds_metal_buffer_t *b[]={x};
     return dispatch("kernel_dsv41_quantize",a,sizeof(a),b,1,(width+block-1)/block,rows,1,32,1,1,0);
 }
+static int qkv_ranges_overlap(myds_metal_buffer_t *a,size_t a_bytes,
+                              myds_metal_buffer_t *b,size_t b_bytes) {
+    uintptr_t x=(uintptr_t)myds_metal_buffer_data(a),y=(uintptr_t)myds_metal_buffer_data(b);
+    return x<=y?y-x<a_bytes:x-y<b_bytes;
+}
+int myds_v41_gpu_qkv_finish(myds_metal_buffer_t *q,myds_metal_buffer_t *kv,
+    myds_metal_buffer_t *window,uint32_t pos,bool compressed) {
+    if(pos>=1048576u||!floats(q,64u*512u)||!floats(kv,512u)||
+       !floats(window,128u*512u))return 0;
+    if(!myds_metal_v41_qkv_fusion_available()||
+       qkv_ranges_overlap(q,64u*512u*4u,kv,512u*4u)||
+       qkv_ranges_overlap(q,64u*512u*4u,window,128u*512u*4u)||
+       qkv_ranges_overlap(kv,512u*4u,window,128u*512u*4u)) {
+        return myds_v41_gpu_rope(q,512,64,pos,compressed,false)&&
+            myds_v41_gpu_rope(kv,512,1,pos,compressed,false)&&
+            myds_v41_gpu_quant(kv,512,1,1)&&
+            myds_metal_buffer_copy(window,(size_t)(pos%128u)*512u*4u,kv,0,512u*4u);
+    }
+    pthread_once(&rope_once,init_rope);
+    struct {uint32_t pos,pad;float frequencies[32];} a={pos,0,{0}};
+    memcpy(a.frequencies,rope_frequencies[compressed?1:0],sizeof(a.frequencies));
+    const myds_metal_buffer_t *b[]={q,kv,window};
+    return dispatch("kernel_dsv41_qkv_finish",&a,sizeof(a),b,3,80,1,1,32,1,1,0);
+}
 /* 整 chunk 的 pool2：tail=0 ⇒ 第 p 对读 kv/scores 的第 2p、2p+1 行，
  * 与逐 token 版（previous_* 保存前一个偶数位）结果逐位相同：每个输出元素独立计算。 */
 static int stage_f16(myds_metal_buffer_t *dst,size_t dstoff,const myds_metal_buffer_t *src,
@@ -249,25 +314,35 @@ int myds_v41_gpu_pool2(myds_metal_buffer_t *out,const myds_metal_buffer_t *kv,
     const uint32_t a[]={width,1,1};const myds_metal_buffer_t *b[]={out,kv,scores,previous_kv,previous_scores};
     return dispatch("kernel_dsv41_pool2",a,sizeof(a),b,5,(width+255u)/256,1,1,256,1,1,0);
 }
-int myds_v41_gpu_indexscores(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
-    const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,uint32_t n_comp,uint32_t n_heads) {
+static int indexscores(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
+    const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,uint32_t n_comp,uint32_t n_heads,bool cache_bf16) {
     if(!n_heads||!floats(scores,n_comp)||!floats(q,(uint64_t)n_heads*128)||
-        !floats(weights,n_heads)||!floats(cache,(uint64_t)n_comp*128))return 0;
-    struct {uint32_t n_rows,n_head,head_dim,cache_f16;float scale;} a={n_comp,n_heads,128,0,1.0f/64.0f};
+        !floats(weights,n_heads)||!(cache_bf16?bf16s(cache,(uint64_t)n_comp*128):
+        floats(cache,(uint64_t)n_comp*128)))return 0;
+    struct {uint32_t n_rows,n_head,head_dim,cache_f16;float scale;} a={n_comp,n_heads,128,cache_bf16?2u:0u,1.0f/64.0f};
     const myds_metal_buffer_t *b[]={q,weights,cache,scores};
     return n_heads==32 ? dispatch("kernel_glm_indexer_score_one_direct",&a,sizeof(a),b,4,n_comp,1,1,32,4,1,132u*4)
         : dispatch("kernel_glm_indexer_score_one",&a,sizeof(a),b,4,n_comp,1,1,32,1,1,32u*4);
 }
+int myds_v41_gpu_indexscores(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
+    const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,uint32_t n_comp,uint32_t n_heads) {
+    return indexscores(scores,q,weights,cache,n_comp,n_heads,false);
+}
+int myds_v41_gpu_indexscores_bf16(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
+    const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,uint32_t n_comp,uint32_t n_heads) {
+    return indexscores(scores,q,weights,cache,n_comp,n_heads,true);
+}
 /* 整 chunk 批量版：kernel_glm_indexer_score_chunk_direct 与 _direct 的线程/网格/smem
  * 相同，只是多一维 token（grid.y）与逐行因果门。只支持 n_heads == 32，
  * 否则返回 0 让调用方回退到逐 token 路径。 */
-int myds_v41_gpu_indexscores_chunk(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
+static int indexscores_chunk(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
     const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,uint32_t n_comp,
-    uint32_t n_heads,uint32_t n_tokens,uint32_t causal_start,uint32_t causal_ratio) {
+    uint32_t n_heads,uint32_t n_tokens,uint32_t causal_start,uint32_t causal_ratio,bool cache_bf16) {
     if(n_heads!=32u||!n_comp||!n_tokens||!causal_ratio||causal_start==UINT32_MAX)return 0;
     if(!floats(scores,(uint64_t)n_comp*n_tokens)||
        !floats(q,(uint64_t)n_tokens*n_heads*128u)||
-       !floats(weights,(uint64_t)n_tokens*n_heads)||!floats(cache,(uint64_t)n_comp*128u))return 0;
+       !floats(weights,(uint64_t)n_tokens*n_heads)||!(cache_bf16?bf16s(cache,(uint64_t)n_comp*128u):
+       floats(cache,(uint64_t)n_comp*128u)))return 0;
     const char *tiled_env = getenv("MYDS_INDEXER_TILED");
     int opt_tiled = (tiled_env && atoi(tiled_env) > 0) ? 1 : 0;
     const myds_metal_buffer_t *b[]={q,weights,cache,scores};
@@ -287,21 +362,32 @@ int myds_v41_gpu_indexscores_chunk(myds_metal_buffer_t *scores,const myds_metal_
             .q_token_stride = (uint64_t)n_heads * 128u * sizeof(float),
             .q_head_stride = (uint64_t)128u * sizeof(float),
             .weights_token_stride = (uint64_t)n_heads * sizeof(float),
-            .index_row_stride = (uint64_t)128u * sizeof(float),
+            .index_row_stride = (uint64_t)128u * (cache_bf16?2u:4u),
             .score_token_stride = (uint64_t)n_comp * sizeof(float),
             .scale = 1.0f / 64.0f
         };
         const uint32_t gx = (n_comp + 31u) / 32u;
         const uint32_t gy = (n_tokens + 7u) / 8u;
         const size_t smem = (8u * 128u + 32u * 128u + 8u * 32u) * sizeof(float);
-        return dispatch("kernel_dsv4_indexer_scores_tiled_f32", &ta, sizeof(ta), b, 4,
+        return dispatch(cache_bf16?"kernel_dsv4_indexer_scores_tiled_bf16":
+                        "kernel_dsv4_indexer_scores_tiled_f32", &ta, sizeof(ta), b, 4,
                         gx, gy, 1, 32, 4, 1, smem);
     }
     struct {uint32_t n_rows,n_head,head_dim,cache_f16;float scale;
             uint32_t n_tokens,causal_start,causal_ratio,pad;} a={
-        n_comp,n_heads,128,0,1.0f/64.0f,n_tokens,causal_start,causal_ratio,0};
+        n_comp,n_heads,128,cache_bf16?2u:0u,1.0f/64.0f,n_tokens,causal_start,causal_ratio,0};
     return dispatch("kernel_glm_indexer_score_chunk_direct",&a,sizeof(a),b,4,
         n_comp,n_tokens,1,32,4,1,132u*4);
+}
+int myds_v41_gpu_indexscores_chunk(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
+    const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,uint32_t n_comp,
+    uint32_t n_heads,uint32_t n_tokens,uint32_t causal_start,uint32_t causal_ratio) {
+    return indexscores_chunk(scores,q,weights,cache,n_comp,n_heads,n_tokens,causal_start,causal_ratio,false);
+}
+int myds_v41_gpu_indexscores_chunk_bf16(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
+    const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,uint32_t n_comp,
+    uint32_t n_heads,uint32_t n_tokens,uint32_t causal_start,uint32_t causal_ratio) {
+    return indexscores_chunk(scores,q,weights,cache,n_comp,n_heads,n_tokens,causal_start,causal_ratio,true);
 }
 /* 按行批量（rows 行）。mask_stride 是 block_mask 的行步长（float）；
  * 逐 token 调用传 rows=1、start=pos、mask_stride=(n_comp+7)/8（与改前一致）。 */
@@ -455,6 +541,15 @@ int myds_v41_gpu_gather(myds_metal_buffer_t *out,const myds_metal_buffer_t *cach
     const myds_metal_buffer_t *b[]={cache,ids,out};
     return dispatch("kernel_get_rows_f32",&a,sizeof(a),b,3,2*selected_rows,1,1,256,1,1,0);
 }
+int myds_v41_gpu_gather_bf16(myds_metal_buffer_t *out,const myds_metal_buffer_t *cache,
+    const myds_metal_buffer_t *ids,uint32_t source_rows,uint32_t selected_rows) {
+    if(!selected_rows||selected_rows>512||selected_rows>source_rows||
+       !floats(out,(uint64_t)selected_rows*512)||!bf16s(cache,(uint64_t)source_rows*512)||
+       !floats(ids,selected_rows))return 0;
+    const uint32_t a[]={source_rows,selected_rows};
+    const myds_metal_buffer_t *b[]={cache,ids,out};
+    return dispatch("kernel_dsv41_get_rows_bf16",a,sizeof(a),b,3,2,selected_rows,1,256,1,1,0);
+}
 
 /* Use transient subviews only as binding handles; Metal retains the underlying
  * resources until queued dispatches finish. No CPU readback or synchronization. */
@@ -463,6 +558,14 @@ static int stage_f16(myds_metal_buffer_t *dst,size_t dstoff,const myds_metal_buf
        !myds_metal_buffer_update_sub_view(s->dv_view,dst,dstoff,(size_t)count*2)) return 0;
     const myds_metal_buffer_t *b[]={s->sv_view,s->dv_view};
     return dispatch("kernel_cpy_contig_f32_f16_4",&count,sizeof(count),b,2,(count+1023u)/1024,1,1,256,1,1,0);
+}
+static int stage_bf16_f16(myds_metal_buffer_t *dst,size_t dstoff,const myds_metal_buffer_t *src,
+    size_t srcoff,uint32_t count,myds_v41_gpu_scratch_t *s) {
+    if(!s||!src||!dst||!myds_metal_buffer_update_sub_view(s->sv_view,src,srcoff,(size_t)count*2u)||
+       !myds_metal_buffer_update_sub_view(s->dv_view,dst,dstoff,(size_t)count*2u))return 0;
+    const myds_metal_buffer_t *b[]={s->sv_view,s->dv_view};
+    return dispatch("kernel_dsv41_stage_bf16_f16",&count,sizeof(count),b,2,
+                    (count+255u)/256u,1,1,256,1,1,0);
 }
 struct flash_pad_args {
     int32_t ne11,ne_12_2,ne_12_3;uint64_t nb11,nb12,nb13,nb21,nb22,nb23;
@@ -501,39 +604,52 @@ static int attn_gather_enabled(void) {
  * 模板只在 (c_len, carry) 变化时重建 —— 完整的 chunk 形状相同，所以整个 prefill 只建一两次。 */
 static int build_chunk_mask_template(myds_v41_gpu_scratch_t *s,uint32_t c_len,uint32_t carry) {
     if(c_len==0||c_len>MYDS_CHUNK_MAXC||carry>MYDS_CHUNK_CARRY)return 0;
-    uint16_t *m=(uint16_t *)myds_metal_buffer_data(s->mask_chunk);
-    if(!m)return 0;
     const uint32_t cols=MYDS_CHUNK_CARRY+c_len;
-    for(uint32_t r=0;r<c_len;r++){
-        uint16_t *row=m+(size_t)r*s->mask_u16;
-        for(uint32_t c=0;c<cols;c++){
-            int ok=(c>=r)&&(c<=MYDS_CHUNK_CARRY+r);
-            if(ok&&c<MYDS_CHUNK_CARRY)ok=(c>=MYDS_CHUNK_CARRY-carry);  /* carry 里只放了真实存在的位置 */
-            row[c]=ok?0u:0xfc00u;
-        }
-        /* 压缩区（含 32 对齐的尾部）【不在这里】清理：它每个 chunk 都由
-         * kernel_myds_mask_chunk_fill 先置为不可见、再由 scatter 打开本 chunk 的 picks。
-         * 以前这里有一句「把 cols 之后全部清成不可见」—— mask_u16 还是编译期常量
-         * （18560）时只是两万次/行；改成跟随上下文的运行时值（最大 264320）后变成
-         * 24 万次/行 × 2048 行 ≈ 5 亿次，ttft 直接 +0.7s（实测 13.83 → 14.52）。
-         * keys_pad 之后的列没有任何读者，所以现在只写 [0, cols) 就够。 */
-    }
+    const uint32_t a[]={c_len,s->mask_u16,carry};
+    const myds_metal_buffer_t *b[]={s->mask_chunk};
+    /* Build on the GPU so earlier encoded attention calls can still read the
+     * previous mask, including several mixed paths in a single command batch. */
+    if(!dispatch("kernel_myds_mask_chunk_window",a,sizeof(a),b,1,
+                 (cols+63u)/64u,c_len,1,64,1,1,0))return 0;
     s->tmpl_len=c_len;s->tmpl_carry=carry;
     return 1;
 }
 
+static int ensure_chunk_workspace(myds_v41_gpu_scratch_t *s,uint32_t rows) {
+    if(rows<=s->slab_rows)return 1;
+    const uint32_t full_rows=(MYDS_CHUNK_CARRY+MYDS_CHUNK_MAXC+s->key_comp_max+31u)/32u*32u;
+    if(rows>full_rows)return 0;
+    myds_metal_buffer_t *kv=myds_metal_buffer_alloc((size_t)full_rows*512u*2u);
+    myds_metal_buffer_t *mask=myds_metal_buffer_alloc((size_t)MYDS_CHUNK_MAXC*full_rows*2u);
+    if(!kv||!mask){myds_metal_buffer_free(kv);myds_metal_buffer_free(mask);return 0;}
+    memset(myds_metal_buffer_data(kv),0,(size_t)full_rows*512u*2u);
+    memset(myds_metal_buffer_data(mask),0xff,(size_t)MYDS_CHUNK_MAXC*full_rows*2u);
+    /* Preserve the carry in GPU order. Encoders retain the old MTLBuffers until
+     * prior work finishes, so replacing their host handles does not free an
+     * in-flight mask or read the carry prematurely on the CPU. */
+    if(!myds_metal_buffer_copy(kv,0,s->kv_chunk,0,(size_t)MYDS_CHUNK_CARRY*512u*2u)){
+        myds_metal_buffer_free(kv);myds_metal_buffer_free(mask);return 0;
+    }
+    myds_metal_buffer_free(s->kv_chunk);myds_metal_buffer_free(s->mask_chunk);
+    s->kv_chunk=kv;s->mask_chunk=mask;s->slab_rows=full_rows;s->mask_u16=full_rows;
+    s->tmpl_len=0;s->tmpl_carry=0;
+    return 1;
+}
+
 /* 整个 chunk 的 attention，一次 dispatch。省掉的正是每 token 的 staging/gather/pad/vec/reduce。 */
-int myds_v41_gpu_attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
+static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *chunk_kv,
     const myds_metal_buffer_t *comp_kv,const myds_metal_buffer_t *ids,
     myds_metal_buffer_t *gathered,
     uint32_t c_len,uint32_t n_comp,uint32_t top_k,
-    uint32_t base_pos,uint32_t c_start,uint32_t ratio,myds_v41_gpu_scratch_t *s) {
+    uint32_t base_pos,uint32_t c_start,uint32_t ratio,myds_v41_gpu_scratch_t *s,bool comp_bf16) {
     if(!s||!heads||!q||!chunk_kv||c_len==0||c_len>MYDS_CHUNK_MAXC||top_k>512u||
        n_comp>s->key_comp_max||
        !floats(heads,(uint64_t)c_len*64u*512)||!floats(q,(uint64_t)c_len*64u*512)||
        !floats(sinks,64)||!floats(chunk_kv,(uint64_t)c_len*512)||
-       (n_comp&&(!comp_kv||!floats(comp_kv,(uint64_t)n_comp*512)||
+       (uint64_t)base_pos+c_start+c_len>UINT32_MAX||
+       (n_comp&&!ratio)||
+       (n_comp&&(!comp_kv||!(comp_bf16?bf16s(comp_kv,(uint64_t)n_comp*512):floats(comp_kv,(uint64_t)n_comp*512))||
                  !ids||!floats(ids,(uint64_t)c_len*top_k))))return 0;
 
     /* 诊断：把压缩键数强行调小，【只影响 attention 读取的 K/V 量，不影响 dispatch 结构】，
@@ -554,7 +670,17 @@ int myds_v41_gpu_attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buf
      *   ② 压缩前缀 staging —— 只有旧内核走 slab 里的压缩列才需要；
      *      comp gather 是直接从 comp_kv 读 f32，不经 slab（省掉 ∝n_comp 的拷贝）；
      *   ③ mask fill / scatter 两次 dispatch。 */
-    const int use_gather = attn_gather_enabled() && gathered != NULL && n_comp != 0;
+    const int use_gather = attn_gather_enabled() && gathered != NULL && n_comp != 0 &&
+                          n_comp>=s->gather_min_keys;
+    /* The matrix experiment visits all 640 gathered slots. Auto keeps vec for
+     * early causal prefixes, small chunks, and every slab/window-only call.
+     * The threshold is a policy for tested shapes, not a numerical guarantee. */
+    const int use_matrix = use_gather && (s->prefill_attn_variant==1 ||
+        (s->prefill_attn_variant==2 && !s->attn_matrix_unavailable && c_len>=32u && p0/ratio>=256u && n_comp>=512u));
+    if(use_gather&&(myds_metal_buffer_offset(gathered)%2u||
+       myds_metal_buffer_size(gathered)<(size_t)c_len*640u*512u*2u))return 0;
+
+    if(!use_gather&&!ensure_chunk_workspace(s,MYDS_CHUNK_CARRY+c_len+n_comp))return 0;
 
     if(!use_gather && (s->tmpl_len!=c_len||s->tmpl_carry!=carry))
         if(!build_chunk_mask_template(s,c_len,carry))return 0;
@@ -567,7 +693,9 @@ int myds_v41_gpu_attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buf
     const uint32_t keys_pad=(keys+31u)/32u*32u;
 
     if(!stage_f16(s->kv_chunk,(size_t)MYDS_CHUNK_CARRY*1024u,chunk_kv,0,c_len*512u,s))return 0;
-    if(!use_gather && n_comp && !stage_f16(s->kv_chunk,(size_t)comp_base*1024u,comp_kv,0,n_comp*512u,s))return 0;
+    if(!use_gather && n_comp && !(comp_bf16?
+       stage_bf16_f16(s->kv_chunk,(size_t)comp_base*1024u,comp_kv,0,n_comp*512u,s):
+       stage_f16(s->kv_chunk,(size_t)comp_base*1024u,comp_kv,0,n_comp*512u,s)))return 0;
 
     if(!use_gather) {
     /* 填充覆盖 [comp_base, keys_pad)：n_comp 只是【本 chunk 真实的压缩键数】，而内核读的
@@ -587,23 +715,28 @@ int myds_v41_gpu_attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buf
                          fill_groups,c_len,1,64,1,1,0))return 0;
         }
     }
-    if(n_comp) {
+    if(n_comp&&top_k) {
         struct {uint32_t base,stride,n_comp,top_k,rows,c_start,base_pos,ratio;} ma={
             comp_base,s->mask_u16,n_comp,top_k,c_len,c_start,base_pos,ratio};
         const myds_metal_buffer_t *sb[]={s->mask_chunk,ids};
-        if(!dispatch("kernel_myds_mask_chunk_scatter",&ma,sizeof(ma),sb,2,top_k,c_len,1,64,1,1,0))return 0;
+        if(!dispatch("kernel_myds_mask_chunk_scatter",&ma,sizeof(ma),sb,2,
+                     (top_k+63u)/64u,c_len,1,64,1,1,0))return 0;
     }
     }   /* !use_gather */
 
     if (use_gather) {
+        /* Both gather kernels overwrite the shared mask, even when their chunk
+         * has a different length. A later window-only layer must rebuild it. */
+        s->tmpl_len=0;s->tmpl_carry=0;
         struct myds_attn_gather_args ga={
             c_len,top_k,n_comp,MYDS_CHUNK_CARRY-carry,s->mask_u16,c_start,base_pos,ratio};
         {   const myds_metal_buffer_t *g1[]={gathered,s->mask_chunk,s->kv_chunk};
             if(!dispatch("kernel_myds_attn_gather_window",&ga,sizeof(ga),g1,3,
                          128u,c_len,1,128,1,1,0))return 0; }
         {   const myds_metal_buffer_t *g2[]={gathered,s->mask_chunk,comp_kv,ids};
-            if(!dispatch("kernel_myds_attn_gather_comp",&ga,sizeof(ga),g2,4,
-                         top_k,c_len,1,128,1,1,0))return 0; }
+            if(!dispatch(comp_bf16?"kernel_myds_attn_gather_comp_bf16":
+                         "kernel_myds_attn_gather_comp",&ga,sizeof(ga),g2,4,
+                         512u,c_len,1,128,1,1,0))return 0; }
     }
 
     const uint32_t kv_keys = use_gather ? 640u : keys_pad;
@@ -622,8 +755,57 @@ int myds_v41_gpu_attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buf
     const myds_metal_buffer_t *b[]={q,kv_sel,kv_sel,s->mask_chunk,sinks,s->pad,heads};
     const myds_metal_constant_t c[]={{400,true,1},{401,true,1},{402,true,0},{403,true,0},{404,true,0},
         {405,true,0},{420,false,512},{421,false,512},{422,false,1},{423,false,1}};
-    if(!specialized("kernel_flash_attn_ext_vec_f16_dk512_dv512",&a,sizeof(a),b,7,
-                    c_len,64,1,32,1,1,3328,c,10))return 0;
+    int matrix_encoded=0;
+    if(use_matrix){
+        /* Keep a unchanged: an unavailable matrix PSO/32KiB workspace must fall
+         * back with the original query/head axes and gathered-KV strides. */
+        struct flash_vec_args ma=a;
+        int ready=1;
+        if(!s->attn_head_blocks){
+            s->attn_head_blocks=myds_metal_buffer_alloc((size_t)MYDS_CHUNK_MAXC*8u*10u);
+            if(!s->attn_head_blocks)ready=0;
+        }
+        ma.ne01=64;ma.ne02=(int32_t)c_len;ma.nb01=2048u;ma.nb02=64u*2048u;
+        ma.ne_12_2=(int32_t)c_len;ma.ne31=64;ma.ne32=(int32_t)c_len;
+        ma.nb31=0;ma.nb32=(uint64_t)s->mask_u16*2u;
+        struct {int32_t ne01,ne30,ne31,ne32,ne33;uint64_t nb31,nb32,nb33;} ba={
+            64,640,64,(int32_t)c_len,1,0,(uint64_t)s->mask_u16*2u,
+            (uint64_t)s->mask_u16*2u*c_len};
+        _Static_assert(sizeof(ba)==48,"flash block scanner Metal ABI");
+        const myds_metal_buffer_t *bb[]={s->mask_chunk,s->attn_head_blocks};
+        const myds_metal_constant_t bc[]={{224,false,8},{225,false,64}};
+        if(ready)ready=specialized("kernel_flash_attn_ext_blk",&ba,sizeof(ba),bb,2,
+                                  10,8,c_len,32,1,1,0,bc,2);
+        const myds_metal_buffer_t *mb[]={q,kv_sel,kv_sel,s->mask_chunk,sinks,s->pad,s->attn_head_blocks,heads};
+        const myds_metal_constant_t mc[]={{300,true,1},{301,true,1},{302,true,0},{303,true,0},
+            {304,true,0},{310,true,0},{320,false,512},{321,false,512},{322,false,4}};
+        /* Both diagnostic failures use the real PSO/dispatch validation path.
+         * It returns before encoding a matrix dispatch for absent functions or
+         * excessive shared memory. A prior scanner only modifies its flags. */
+        const char *kernel=attn_matrix_test_failure==1?
+            "kernel_myds_attention_test_missing_matrix_pso":
+            "kernel_myds_flash_attn_heads_f16_dk512_dv512";
+        const size_t smem=attn_matrix_test_failure==2?SIZE_MAX-15u:32768u;
+        if(ready)matrix_encoded=specialized(kernel,&ma,192,mb,8,8,c_len,1,32,4,1,smem,mc,9);
+        if(!matrix_encoded){
+            if(s->prefill_attn_variant!=2)return 0; /* explicit matrix is strict */
+            s->attn_matrix_unavailable=1;
+        }
+    }
+    if(!matrix_encoded){
+        int vec_encoded=0;
+        if(use_gather && s->attn_vec_head_first && !s->attn_vec_head_first_unavailable){
+            const char *kernel=attn_vec_head_first_test_failure?
+                "kernel_myds_attention_test_missing_head_first_pso":
+                "kernel_myds_flash_attn_vec_head_first_f16_dk512_dv512";
+            /* Only the physical query/head grid changes. Keep a, the buffers,
+             * constants, one SIMD group and 3328-byte private scratch unchanged. */
+            vec_encoded=specialized(kernel,&a,sizeof(a),b,7,64,c_len,1,32,1,1,3328,c,10);
+            if(!vec_encoded)s->attn_vec_head_first_unavailable=1;
+        }
+        if(!vec_encoded && !specialized("kernel_flash_attn_ext_vec_f16_dk512_dv512",
+                        &a,sizeof(a),b,7,c_len,64,1,32,1,1,3328,c,10))return 0;
+    }
 
     /* This chunk's tail becomes the next chunk's carry: rows [c_len, c_len + 127)
      * move down to [0, 127).  When the chunk is shorter than the carry window the
@@ -643,6 +825,22 @@ int myds_v41_gpu_attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buf
         if(!myds_metal_buffer_copy(s->kv_chunk,0,s->kv_f16,0,carry_bytes))return 0;
     }
     return 1;
+}
+int myds_v41_gpu_attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *chunk_kv,
+    const myds_metal_buffer_t *comp_kv,const myds_metal_buffer_t *ids,myds_metal_buffer_t *gathered,
+    uint32_t c_len,uint32_t n_comp,uint32_t top_k,uint32_t base_pos,uint32_t c_start,
+    uint32_t ratio,myds_v41_gpu_scratch_t *s) {
+    return attention_chunk(heads,sinks,q,chunk_kv,comp_kv,ids,gathered,c_len,n_comp,top_k,
+                           base_pos,c_start,ratio,s,false);
+}
+int myds_v41_gpu_attention_chunk_bf16(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *chunk_kv,
+    const myds_metal_buffer_t *comp_kv,const myds_metal_buffer_t *ids,myds_metal_buffer_t *gathered,
+    uint32_t c_len,uint32_t n_comp,uint32_t top_k,uint32_t base_pos,uint32_t c_start,
+    uint32_t ratio,myds_v41_gpu_scratch_t *s) {
+    return attention_chunk(heads,sinks,q,chunk_kv,comp_kv,ids,gathered,c_len,n_comp,top_k,
+                           base_pos,c_start,ratio,s,true);
 }
 
 int myds_v41_gpu_attention(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,

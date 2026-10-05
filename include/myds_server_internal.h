@@ -19,6 +19,8 @@ typedef struct {
     size_t pending_length;
 } myds_utf8_state_t;
 
+typedef struct myds_sse_writer myds_sse_writer_t;
+
 typedef struct {
     int client_fd;
     bool responses_api;
@@ -33,6 +35,8 @@ typedef struct {
     size_t acc_len, acc_cap;
     size_t emitted;
     bool in_tool_block;
+    /* Request-owned transport; only the producer mutates this stream context. */
+    myds_sse_writer_t *writer;
 } myds_sse_stream_ctx_t;
 
 typedef struct {
@@ -51,6 +55,17 @@ bool myds_server_send_all(int fd, const char *data, size_t length);
 uint32_t myds_server_default_max_tokens(uint32_t configured_max_tokens);
 void myds_server_sse_callback(const char *piece, size_t length, int32_t token_id, void *user_data);
 bool myds_server_sse_finish(myds_sse_stream_ctx_t *stream);
+/* Start a bounded FIFO transport. Enqueue never waits for the socket or space;
+ * exceeding the byte budget cancels the stream. Join drains with one overall
+ * deadline, or discards pending bytes when aborting. Join precedes fd close. */
+bool myds_server_sse_writer_start(myds_sse_stream_ctx_t *stream, size_t byte_limit,
+                                  unsigned drain_timeout_ms);
+bool myds_server_sse_send(myds_sse_stream_ctx_t *stream, const char *data, size_t length);
+bool myds_server_sse_writer_join(myds_sse_stream_ctx_t *stream, bool aborting);
+unsigned myds_server_sse_drain_timeout_ms(void);
+/* Deterministic regression hook: 1 = next thread creation, 2 = next packet
+ * allocation. A point is consumed once; zero disables injection. */
+void myds_server_sse_writer_inject_failure(unsigned point);
 void myds_server_non_stream_callback(const char *piece, size_t length, int32_t token_id, void *user_data);
 
 void json_unescape_slice(const char *src, size_t len, char *dst, size_t dst_size);

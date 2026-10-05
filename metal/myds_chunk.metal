@@ -18,6 +18,20 @@ struct myds_mask_chunk_args {
     uint ratio;      /* compression ratio of this layer */
 };
 
+/* Only the carry/current-chunk columns belong to this reusable window mask.
+ * Compressed and alignment columns are filled separately for each slab call. */
+kernel void kernel_myds_mask_chunk_window(
+        constant uint *args,
+        device ushort *mask,
+        uint2 gid [[thread_position_in_grid]]) {
+    const uint rows=args[0], stride=args[1], carry=args[2];
+    const uint col=gid.x, row=gid.y;
+    if(row>=rows||col>=127u+rows)return;
+    const bool visible=col>=row&&col<=127u+row&&
+                       (col>=127u||col>=127u-carry);
+    mask[(ulong)row*stride+col]=visible?0u:0xfc00u;
+}
+
 /* One thread per (row, compressed column): everything not selected is invisible. */
 kernel void kernel_myds_mask_chunk_fill(
         constant myds_mask_chunk_args &args,
@@ -91,28 +105,41 @@ kernel void kernel_myds_attn_gather_window(
 }
 
 /* 每个线程组 = (query q, 第 j 个 pick)，同样 128 线程 × half4。 */
-kernel void kernel_myds_attn_gather_comp(
+template<bool BF16>
+kernel void kernel_myds_attn_gather_comp_storage(
         constant myds_attn_gather_args &args,
         device half          *dst,
         device ushort        *mask,
-        device const float   *comp,     /* n_comp * 512 f32 */
+        device const char    *comp,     /* n_comp * 512 F32 or packed BF16 */
         device const int     *ids,      /* rows * top_k */
         ushort2 tgpig [[threadgroup_position_in_grid]],
         ushort  tiitg [[thread_index_in_threadgroup]]) {
-    if (tgpig.y >= args.rows || tgpig.x >= args.top_k) return;
+    if (tgpig.y >= args.rows || tgpig.x >= 512u) return;
     const uint q = tgpig.y, j = tgpig.x;
     /* 因果：第 q 行只有前 count 个 pick 是活的（与 kernel_myds_mask_chunk_scatter 同式）。 */
     const uint count = (args.base_pos + args.c_start + q + 1u) / args.ratio;
     int idx = -1;
-    if (j < count) idx = ids[(ulong)q * args.top_k + j];
+    if (j < args.top_k && j < count) idx = ids[(ulong)q * args.top_k + j];
     const bool vis = (idx >= 0) && ((uint)idx < args.n_comp);
     device half4 *o = (device half4 *)(dst + ((ulong)q * 640u + 128u + j) * 512u);
     if (vis) {
-        device const float4 *s = (device const float4 *)(comp + (ulong)idx * 512u);
-        const float4 x = s[tiitg];
+        float4 x;
+        if(BF16){
+            /* Packed views require only ushort alignment, not ushort4 alignment. */
+            device const ushort *s=(device const ushort *)(comp+(ulong)idx*512u*2u)+4u*tiitg;
+            x=as_type<float4>(uint4(s[0],s[1],s[2],s[3])<<16u);
+        }else{
+            device const float4 *s=(device const float4 *)(comp+(ulong)idx*512u*4u);
+            x=s[tiitg];
+        }
         o[tiitg] = half4((half)x.x, (half)x.y, (half)x.z, (half)x.w);
     } else {
         o[tiitg] = half4(0.0h);
     }
     if (tiitg == 0u) mask[(ulong)q * args.mask_stride + 128u + j] = vis ? 0u : 0xfc00u;
 }
+typedef decltype(kernel_myds_attn_gather_comp_storage<false>) myds_attn_gather_comp_t;
+template [[host_name("kernel_myds_attn_gather_comp")]]
+kernel myds_attn_gather_comp_t kernel_myds_attn_gather_comp_storage<false>;
+template [[host_name("kernel_myds_attn_gather_comp_bf16")]]
+kernel myds_attn_gather_comp_t kernel_myds_attn_gather_comp_storage<true>;

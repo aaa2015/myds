@@ -207,6 +207,16 @@ bool myds_kvdsk_slot_meta(const myds_kvdsk_t *k, uint32_t slot,
     return true;
 }
 
+bool myds_kvdsk_peek_committed(myds_kvdsk_t *k, uint32_t slot, uint64_t offset,
+                               void *dst, uint64_t bytes) {
+    uint64_t used = 0;
+    if (!k || k->writing || (!dst && bytes) || bytes > SIZE_MAX ||
+        !myds_kvdsk_slot_meta(k, slot, NULL, NULL, &used) ||
+        offset > used || bytes > used - offset) return false;
+    if (bytes == 0) return true;
+    return read_at(k->fd, dst, (size_t)bytes, payload_offset(k, slot) + offset) != 0;
+}
+
 bool myds_kvdsk_slot_touch(myds_kvdsk_t *k, uint32_t slot) {
     if (!k || slot >= k->slots) return false;
     unsigned char e[KVDSK_ENTRY_BYTES];
@@ -268,7 +278,7 @@ bool myds_kvdsk_read_chunk(myds_kvdsk_t *k, uint64_t offset, void *dst, uint64_t
     return true;
 }
 
-bool myds_kvdsk_read_finish(myds_kvdsk_t *k) {
+static bool read_finish(myds_kvdsk_t *k, bool touch) {
     if (!k || !k->reading) return false;
     const uint32_t slot = k->read_slot;
     const uint64_t got = k->read_crc;
@@ -280,9 +290,12 @@ bool myds_kvdsk_read_finish(myds_kvdsk_t *k) {
         (void)myds_kvdsk_slot_clear(k, slot);
         return false;
     }
-    (void)myds_kvdsk_slot_touch(k, slot);
+    if (touch) (void)myds_kvdsk_slot_touch(k, slot);
     return true;
 }
+
+bool myds_kvdsk_read_finish(myds_kvdsk_t *k) { return read_finish(k, true); }
+bool myds_kvdsk_read_verify(myds_kvdsk_t *k) { return read_finish(k, false); }
 
 void myds_kvdsk_read_abort(myds_kvdsk_t *k) {
     if (!k || !k->reading) return;
@@ -310,6 +323,10 @@ bool myds_kvdsk_write_chunk(myds_kvdsk_t *k, uint64_t offset, const void *src, u
     }
     k->write_crc = cks_update(k->write_crc, src, (size_t)bytes);
     return true;
+}
+
+void myds_kvdsk_write_abort(myds_kvdsk_t *k) {
+    if (k) k->writing = 0;
 }
 
 /* 收尾。参数不合法或落盘失败 ⇒ 返回 false，且该槽保持「空」（write_start 已清）。 */

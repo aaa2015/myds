@@ -7,11 +7,14 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <time.h>
 #include <stdarg.h>
 #include <limits.h>
 #include <pthread.h>
+#include <poll.h>
+#include <stdatomic.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -1656,6 +1659,226 @@ static inline double myds_server_now_s(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
+typedef struct sse_packet {
+    struct sse_packet *next;
+    size_t length;
+    char data[];
+} sse_packet_t;
+
+struct myds_sse_writer {
+    int fd, original_fd_flags;
+    pthread_t thread;
+    pthread_mutex_t lock;
+    pthread_cond_t ready;
+    sse_packet_t *head, *tail;
+    size_t pending_bytes, byte_limit;
+    bool closing, aborted, failed;
+    double drain_deadline;
+    unsigned drain_timeout_ms;
+};
+
+static atomic_uint sse_writer_failure_point = 0;
+
+void myds_server_sse_writer_inject_failure(unsigned point) {
+    atomic_store(&sse_writer_failure_point, point);
+}
+
+static bool sse_writer_injected_failure(unsigned point) {
+    return atomic_compare_exchange_strong(&sse_writer_failure_point, &point, 0);
+}
+
+unsigned myds_server_sse_drain_timeout_ms(void) {
+    const char *value = getenv("MYDS_SSE_DRAIN_TIMEOUT_MS");
+    if (value && *value) {
+        char *end;
+        unsigned long timeout = strtoul(value, &end, 10);
+        if (!*end && timeout >= 1 && timeout <= 30000) return (unsigned)timeout;
+    }
+    return 1000;
+}
+
+static bool sse_writer_stopped(myds_sse_writer_t *w) {
+    pthread_mutex_lock(&w->lock);
+    bool stopped = w->aborted;
+    if (w->closing && myds_server_now_s() >= w->drain_deadline) {
+        w->failed = w->aborted = true;
+        stopped = true;
+    }
+    pthread_mutex_unlock(&w->lock);
+    return stopped;
+}
+
+static int sse_writer_poll_wait_ms(myds_sse_writer_t *w) {
+    int wait_ms = 20;
+    pthread_mutex_lock(&w->lock);
+    if (w->closing) {
+        const double remaining_ms = (w->drain_deadline - myds_server_now_s()) * 1000.0;
+        if (remaining_ms <= 0.0) wait_ms = 0;
+        else if (remaining_ms < wait_ms) wait_ms = (int)remaining_ms + 1;
+    }
+    pthread_mutex_unlock(&w->lock);
+    return wait_ms;
+}
+
+static bool sse_writer_send_packet(myds_sse_writer_t *w, const sse_packet_t *packet) {
+    size_t sent = 0;
+    while (sent < packet->length) {
+        if (sse_writer_stopped(w)) return false;
+        int flags = MSG_DONTWAIT;
+#ifdef MSG_NOSIGNAL
+        flags |= MSG_NOSIGNAL;
+#endif
+        ssize_t n = send(w->fd, packet->data + sent, packet->length - sent, flags);
+        if (n > 0) { sent += (size_t)n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            struct pollfd writable = {.fd = w->fd, .events = POLLOUT};
+            const int rc = poll(&writable, 1, sse_writer_poll_wait_ms(w));
+            if (rc < 0 && errno == EINTR) continue;
+            if (rc < 0 || (rc > 0 && (writable.revents & (POLLERR | POLLHUP | POLLNVAL))))
+                return false;
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+static void *sse_writer_thread(void *opaque) {
+    myds_sse_writer_t *w = opaque;
+    for (;;) {
+        pthread_mutex_lock(&w->lock);
+        while (!w->head && !w->closing && !w->aborted) pthread_cond_wait(&w->ready, &w->lock);
+        if (w->aborted || (!w->head && w->closing)) {
+            pthread_mutex_unlock(&w->lock);
+            break;
+        }
+        sse_packet_t *packet = w->head;
+        w->head = packet->next;
+        if (!w->head) w->tail = NULL;
+        pthread_mutex_unlock(&w->lock);
+        /* The in-flight packet remains charged to the budget until fully sent. */
+        const bool ok = sse_writer_send_packet(w, packet);
+        pthread_mutex_lock(&w->lock);
+        w->pending_bytes -= sizeof(*packet) + packet->length;
+        if (!ok) w->failed = w->aborted = true;
+        pthread_mutex_unlock(&w->lock);
+        free(packet);
+        if (!ok) { shutdown(w->fd, SHUT_RDWR); break; }
+    }
+    return NULL;
+}
+
+bool myds_server_sse_writer_start(myds_sse_stream_ctx_t *stream, size_t byte_limit,
+                                  unsigned drain_timeout_ms) {
+    if (!stream || stream->writer || stream->client_fd < 0 ||
+        byte_limit <= sizeof(sse_packet_t) || !drain_timeout_ms || drain_timeout_ms > 30000) {
+        errno = EINVAL; return false;
+    }
+    myds_sse_writer_t *w = calloc(1, sizeof(*w));
+    if (!w) return false;
+    w->fd = stream->client_fd;
+    w->byte_limit = byte_limit;
+    w->drain_timeout_ms = drain_timeout_ms;
+    /* Set descriptor nonblocking explicitly: per-send MSG_DONTWAIT alone
+     * does not bound large writes reliably on all supported socket types. */
+    w->original_fd_flags = fcntl(w->fd, F_GETFL);
+    if (w->original_fd_flags < 0 || fcntl(w->fd, F_SETFL, w->original_fd_flags | O_NONBLOCK) < 0) {
+        free(w); return false;
+    }
+#ifdef SO_NOSIGPIPE
+    int no_sigpipe = 1;
+    if (setsockopt(w->fd, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe)) != 0) {
+        const int saved_errno = errno;
+        (void)fcntl(w->fd, F_SETFL, w->original_fd_flags);
+        free(w); errno = saved_errno; return false;
+    }
+#endif
+    int error = pthread_mutex_init(&w->lock, NULL);
+    if (error) {
+        (void)fcntl(w->fd, F_SETFL, w->original_fd_flags);
+        free(w); errno = error; return false;
+    }
+    error = pthread_cond_init(&w->ready, NULL);
+    if (error) {
+        pthread_mutex_destroy(&w->lock);
+        (void)fcntl(w->fd, F_SETFL, w->original_fd_flags);
+        free(w); errno = error; return false;
+    }
+    error = sse_writer_injected_failure(1) ? EAGAIN : pthread_create(&w->thread, NULL, sse_writer_thread, w);
+    if (error) {
+        pthread_cond_destroy(&w->ready); pthread_mutex_destroy(&w->lock);
+        (void)fcntl(w->fd, F_SETFL, w->original_fd_flags);
+        free(w); errno = error; return false;
+    }
+    stream->writer = w;
+    return true;
+}
+
+bool myds_server_sse_send(myds_sse_stream_ctx_t *stream, const char *data, size_t length) {
+    if (!stream || (length && !data)) { errno = EINVAL; return false; }
+    if (!stream->writer) return myds_server_send_all(stream->client_fd, data, length);
+    myds_sse_writer_t *w = stream->writer;
+    pthread_mutex_lock(&w->lock);
+    bool ok = !w->aborted && !w->closing;
+    if (ok && length) {
+        if (length > SIZE_MAX - sizeof(sse_packet_t) ||
+            sizeof(sse_packet_t) + length > w->byte_limit - w->pending_bytes) {
+            w->aborted = true;
+            ok = false;
+        } else {
+            sse_packet_t *packet = NULL;
+            if (sse_writer_injected_failure(2)) errno = ENOMEM;
+            else packet = malloc(sizeof(*packet) + length);
+            if (!packet) { w->failed = w->aborted = true; stream->failed = true; ok = false; }
+            else {
+                packet->next = NULL; packet->length = length;
+                memcpy(packet->data, data, length);
+                if (w->tail) w->tail->next = packet; else w->head = packet;
+                w->tail = packet;
+                w->pending_bytes += sizeof(*packet) + length;
+                pthread_cond_signal(&w->ready);
+            }
+        }
+    }
+    if (!ok) {
+        stream->cancel_flag = 1;
+        pthread_cond_signal(&w->ready);
+    }
+    pthread_mutex_unlock(&w->lock);
+    if (!ok) shutdown(w->fd, SHUT_RDWR);
+    return ok;
+}
+
+bool myds_server_sse_writer_join(myds_sse_stream_ctx_t *stream, bool aborting) {
+    if (!stream || !stream->writer) return stream && !stream->cancel_flag;
+    myds_sse_writer_t *w = stream->writer;
+    pthread_mutex_lock(&w->lock);
+    w->closing = true;
+    w->drain_deadline = myds_server_now_s() + (double)w->drain_timeout_ms / 1000.0;
+    if (aborting) w->aborted = true;
+    pthread_cond_signal(&w->ready);
+    pthread_mutex_unlock(&w->lock);
+    if (aborting) shutdown(w->fd, SHUT_RDWR);
+    pthread_join(w->thread, NULL);
+    const bool ok = !w->failed && !w->aborted;
+    (void)fcntl(w->fd, F_SETFL, w->original_fd_flags);
+    while (w->head) { sse_packet_t *next = w->head->next; free(w->head); w->head = next; }
+    pthread_cond_destroy(&w->ready); pthread_mutex_destroy(&w->lock);
+    free(w); stream->writer = NULL;
+    if (!ok) stream->cancel_flag = 1;
+    return ok;
+}
+
+static bool sse_transport_failed(myds_sse_stream_ctx_t *stream) {
+    if (!stream->writer) return false;
+    pthread_mutex_lock(&stream->writer->lock);
+    const bool failed = stream->writer->aborted;
+    pthread_mutex_unlock(&stream->writer->lock);
+    if (failed) stream->cancel_flag = 1;
+    return failed;
+}
+
 static bool client_disconnected(int fd) {
     if (fd < 0) return false;
     char byte;
@@ -1665,7 +1888,7 @@ static bool client_disconnected(int fd) {
 }
 
 static bool sse_emit_content(myds_sse_stream_ctx_t *sctx, const char *piece, size_t length, bool final) {
-    if (sctx->cancel_flag) return false;
+    if (sctx->cancel_flag || sse_transport_failed(sctx)) return false;
     if (length > (SIZE_MAX - 1) / 6 - sctx->utf8.pending_length) goto failed;
     size_t capacity = (length + sctx->utf8.pending_length) * 6 + 1;
     char *escaped = malloc(capacity);
@@ -1688,7 +1911,7 @@ static bool sse_emit_content(myds_sse_stream_ctx_t *sctx, const char *piece, siz
     char *chunk = format_alloc(format, escaped);
     free(escaped);
     if (!chunk) goto failed;
-    bool sent = myds_server_send_all(sctx->client_fd, chunk, strlen(chunk));
+    bool sent = myds_server_sse_send(sctx, chunk, strlen(chunk));
     free(chunk);
     if (!sent) sctx->cancel_flag = 1;
     return sent;
@@ -1809,7 +2032,7 @@ static bool sse_emit_responses_close_message(myds_sse_stream_ctx_t *sctx,
         text_json, text_json, text_json);
     free(text_json);
     if (!ev) return false;
-    const bool ok = myds_server_send_all(sctx->client_fd, ev, strlen(ev));
+    const bool ok = myds_server_sse_send(sctx, ev, strlen(ev));
     free(ev);
     return ok;
 }
@@ -1843,15 +2066,15 @@ bool sse_emit_chat_tool_calls(myds_sse_stream_ctx_t *sctx, const myds_tool_call_
         "data: {\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,"
         "\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":%s},\"finish_reason\":null}]}\n\n", tc);
     if (!chunk) { free(tc); return false; }
-    bool sent = myds_server_send_all(sctx->client_fd, chunk, strlen(chunk));
+    bool sent = myds_server_sse_send(sctx, chunk, strlen(chunk));
     free(chunk); free(tc);
     if (!sent) return false;
     const char *finish_chunk =
         "data: {\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,"
         "\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n";
-    if (!myds_server_send_all(sctx->client_fd, finish_chunk, strlen(finish_chunk))) return false;
+    if (!myds_server_sse_send(sctx, finish_chunk, strlen(finish_chunk))) return false;
     const char *done = "data: [DONE]\n\n";
-    return myds_server_send_all(sctx->client_fd, done, strlen(done));
+    return myds_server_sse_send(sctx, done, strlen(done));
 }
 
 /* Responses API：function_call 项的 added / arguments.delta / done
@@ -1902,7 +2125,7 @@ bool sse_emit_responses_function_calls(myds_sse_stream_ctx_t *sctx,
             && DSML_PUTS(&ev, "\",\"arguments\":\"")
             && dsml_put_escaped(&ev, calls[i].arguments, strlen(calls[i].arguments))
             && DSML_PUTS(&ev, "\",\"status\":\"completed\"}}\n\n");
-        if (ok) ok = myds_server_send_all(sctx->client_fd, ev.data, ev.len);
+        if (ok) ok = myds_server_sse_send(sctx, ev.data, ev.len);
         free(ev.data);
         if (!ok) return false;
     }
@@ -1953,7 +2176,7 @@ bool sse_emit_responses_finish(myds_sse_stream_ctx_t *sctx,
     free(alias_json);
     free(text_json);
     if (!completed) return false;
-    const bool ok = myds_server_send_all(sctx->client_fd, completed, strlen(completed));
+    const bool ok = myds_server_sse_send(sctx, completed, strlen(completed));
     free(completed);
     return ok;
 }
@@ -2002,7 +2225,7 @@ void myds_server_sse_callback(const char *piece, size_t length, int32_t token_id
     if (sctx->token_count == 0) sctx->t_first = now;
     sctx->t_last = now;
     sctx->token_count++;
-    if (client_disconnected(sctx->client_fd)) {
+    if (sse_transport_failed(sctx) || client_disconnected(sctx->client_fd)) {
         sctx->cancel_flag = 1;
         return;
     }
@@ -2389,12 +2612,14 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 .client_fd = client_fd,
                 .responses_api = is_responses_endpoint,
             };
-            if (!myds_server_send_all(client_fd, sse_header, strlen(sse_header)) ||
-                !myds_server_send_all(client_fd, initial, strlen(initial))) {
+            if (!myds_server_sse_writer_start(&sctx, 1024u * 1024u, myds_server_sse_drain_timeout_ms()) ||
+                !myds_server_sse_send(&sctx, sse_header, strlen(sse_header)) ||
+                !myds_server_sse_send(&sctx, initial, strlen(initial))) {
                 sctx.cancel_flag = 1;
+                if (!sctx.writer) sctx.failed = true;
             }
-            int generated = myds_generate_bytes_ex(ctx, prompt, myds_server_sse_callback, &sctx,
-                                                   &stop_reason, &prompt_tokens, &sctx.cancel_flag);
+            int generated = !sctx.cancel_flag && myds_generate_bytes_ex(ctx, prompt, myds_server_sse_callback, &sctx,
+                                                                       &stop_reason, &prompt_tokens, &sctx.cancel_flag);
             myds_context_clear_image_embeddings(ctx); myds_vjob_sink_free(&img_sink);
             if (generated && !sctx.cancel_flag) (void)myds_server_sse_finish(&sctx);
             if (!generated || sctx.failed || sctx.cancel_flag) {
@@ -2409,7 +2634,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 const char *error_event = is_responses_endpoint
                     ? "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"Inference or response encoding failed\",\"type\":\"server_error\"}}\n\n"
                     : "data: {\"error\":{\"message\":\"Inference or response encoding failed\",\"type\":\"server_error\"}}\n\ndata: [DONE]\n\n";
-                (void)myds_server_send_all(client_fd, error_event, strlen(error_event));
+                if (sctx.writer) (void)myds_server_sse_send(&sctx, error_event, strlen(error_event));
             } else if (!sctx.cancel_flag) {
                 /* 模型可能用 DSML 块发起工具调用 ⇒ 从累积文本里解析（与协议无关） */
                 size_t scontent_len = sctx.acc_len;
@@ -2467,35 +2692,41 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                     if (!finished) {
                         stop_reason = MYDS_STOP_ERROR;
                         const char *error_event = "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"Response allocation failed\",\"type\":\"server_error\"}}\n\n";
-                        (void)myds_server_send_all(client_fd, error_event, strlen(error_event));
+                        (void)myds_server_sse_send(&sctx, error_event, strlen(error_event));
                     }
                 } else if (!stool_count && !sctx.failed && !sctx.cancel_flag) {
                     const char *finish = (stop_reason == MYDS_STOP_LENGTH || stop_reason == MYDS_STOP_CTX_FULL) ? "length" : "stop";
                     char chunk[512];
                     int len = snprintf(chunk, sizeof(chunk),
                         "data: {\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"%s\"}]}\n\n", finish);
-                    bool sent = len > 0 && (size_t)len < sizeof(chunk) && myds_server_send_all(client_fd, chunk, (size_t)len);
+                    bool sent = len > 0 && (size_t)len < sizeof(chunk) && myds_server_sse_send(&sctx, chunk, (size_t)len);
                     if (sent && include_usage) {
                         len = snprintf(chunk, sizeof(chunk),
                             "data: {\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u}}\n\n",
                             prompt_tokens, final_tokens, prompt_tokens + final_tokens);
-                        sent = len > 0 && (size_t)len < sizeof(chunk) && myds_server_send_all(client_fd, chunk, (size_t)len);
+                        sent = len > 0 && (size_t)len < sizeof(chunk) && myds_server_sse_send(&sctx, chunk, (size_t)len);
                     }
                     const char *done = "data: [DONE]\n\n";
-                    if (!sent || !myds_server_send_all(client_fd, done, strlen(done))) stop_reason = MYDS_STOP_CANCELLED;
+                    if (!sent || !myds_server_sse_send(&sctx, done, strlen(done))) stop_reason = MYDS_STOP_CANCELLED;
                 } else if (sctx.failed) {
                     stop_reason = MYDS_STOP_ERROR;
                     const char *error_event = is_responses_endpoint
                         ? "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"Inference or response encoding failed\",\"type\":\"server_error\"}}\n\n"
                         : "data: {\"error\":{\"message\":\"Inference or response encoding failed\",\"type\":\"server_error\"}}\n\ndata: [DONE]\n\n";
-                    (void)myds_server_send_all(client_fd, error_event, strlen(error_event));
+                    (void)myds_server_sse_send(&sctx, error_event, strlen(error_event));
                 } else if (sctx.cancel_flag) {
                     stop_reason = MYDS_STOP_CANCELLED;
                 }
             } else {
                 stop_reason = MYDS_STOP_CANCELLED;
             }
-            if (sctx.failed || sctx.cancel_flag) transport_ok = false;
+            /* Socket I/O runs in the writer. Drain has one overall deadline
+             * (default 1s, MYDS_SSE_DRAIN_TIMEOUT_MS accepts 1..30000), even
+             * if a slow peer keeps making partial progress.
+             * The inference slot remains held during this bounded tail wait. */
+            const bool drained = myds_server_sse_writer_join(&sctx, sctx.cancel_flag && !sctx.failed);
+            if (!drained && stop_reason != MYDS_STOP_ERROR) stop_reason = MYDS_STOP_CANCELLED;
+            if (!drained || sctx.failed || sctx.cancel_flag) transport_ok = false;
             free(sctx.acc); sctx.acc = NULL;   /* 每请求一份累积缓冲，必须释放 */
         } else {
             myds_non_stream_ctx_t ns = {.client_fd = client_fd};

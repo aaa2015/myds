@@ -130,6 +130,14 @@ int myds_metal_v41_gemv(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *weight, const myds_metal_buffer_t *input,
     uint32_t out_dim, uint32_t in_dim, ggml_type weight_type);
 
+/* Decode QKV projection: same Q8_0 GEMV reduction with a BF16 final store.
+ * Other types / unavailable fused PSOs use the original projection + BF16.
+ * The capability helper disables fused window stores during copy injection. */
+int myds_metal_v41_gemv_bf16(myds_metal_buffer_t *out,
+    const myds_metal_buffer_t *weight,const myds_metal_buffer_t *input,
+    uint32_t out_dim,uint32_t in_dim,ggml_type weight_type);
+int myds_metal_v41_qkv_fusion_available(void);
+
 int myds_metal_v41_gemv_batch(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *weight, const myds_metal_buffer_t *input,
     uint32_t out_dim, uint32_t in_dim, uint32_t n_tok, ggml_type weight_type);

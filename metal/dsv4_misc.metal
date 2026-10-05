@@ -1656,6 +1656,9 @@ static inline float glm_cache_load_f32_or_f16(
         device const char *base,
         uint64_t index,
         uint cache_f16) {
+    if (cache_f16 == 2u) {
+        return as_type<float>(uint(((device const ushort *)base)[index]) << 16u);
+    }
     if (cache_f16 != 0u) {
         return (float)((device const half *)base)[index];
     }
@@ -6380,7 +6383,8 @@ static inline float dsv4_indexer_dot128_shared_q(
 //     score[t,c] = sum_h relu(dot(Q[t,h], K[c])) * W[t,h] * scale
 //
 // Causal masking is applied on store so invisible compressed rows become -inf.
-kernel void kernel_dsv4_indexer_scores_tiled_f32(
+template<bool BF16>
+kernel void kernel_dsv4_indexer_scores_tiled_storage(
         constant ds4_metal_args_dsv4_indexer_scores_fused & args,
         device const char *q,
         device const char *weights,
@@ -6428,9 +6432,9 @@ kernel void kernel_dsv4_indexer_scores_tiled_f32(
         const uint comp = c0 + cc;
         float v = 0.0f;
         if (comp < args.n_comp) {
-            device const float *row = (device const float *)(index_comp +
-                (uint64_t)comp * args.index_row_stride);
-            v = row[d];
+            device const char *row=index_comp+(uint64_t)comp*args.index_row_stride;
+            if(BF16)v=as_type<float>(uint(((device const ushort *)row)[d])<<16u);
+            else v=((device const float *)row)[d];
         }
         ktg[i] = v;
     }
@@ -6512,6 +6516,12 @@ kernel void kernel_dsv4_indexer_scores_tiled_f32(
         *dst = comp1 < visible ? acc1 : -INFINITY;
     }
 }
+
+typedef decltype(kernel_dsv4_indexer_scores_tiled_storage<false>) dsv4_indexer_scores_tiled_storage_t;
+template [[host_name("kernel_dsv4_indexer_scores_tiled_f32")]]
+kernel dsv4_indexer_scores_tiled_storage_t kernel_dsv4_indexer_scores_tiled_storage<false>;
+template [[host_name("kernel_dsv4_indexer_scores_tiled_bf16")]]
+kernel dsv4_indexer_scores_tiled_storage_t kernel_dsv4_indexer_scores_tiled_storage<true>;
 
 kernel void kernel_dsv4_indexer_scores_tiled(
         constant ds4_metal_args_dsv4_indexer_scores_fused & args,

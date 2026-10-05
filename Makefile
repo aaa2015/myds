@@ -22,6 +22,10 @@ OBJS_M = $(patsubst src/%.m, $(BUILD_DIR)/%.o, $(SRCS_M))
 
 TARGET = $(BIN_DIR)/myds
 TEST_METAL = $(BIN_DIR)/test_metal
+TEST_V41_GPU = $(BIN_DIR)/test_v41_gpu
+TEST_ATTN_POLICY = $(BIN_DIR)/test_attention_policy
+TEST_ATTN_VEC = $(BIN_DIR)/test_attention_vec
+TEST_QKV_FUSION = $(BIN_DIR)/test_qkv_fusion
 TEST_GGUF = $(BIN_DIR)/test_gguf
 TEST_TOKENIZER = $(BIN_DIR)/test_tokenizer
 TEST_SERVER = $(BIN_DIR)/test_server
@@ -35,13 +39,14 @@ TEST_KVDSK = $(BIN_DIR)/test_kvdsk
 TEST_P1 = $(BIN_DIR)/test_p1
 BENCH_SYNTHETIC = $(BIN_DIR)/bench_synthetic
 BENCH_METAL = $(BIN_DIR)/bench_metal
+BENCH_PHASE = $(BIN_DIR)/bench_phase
 DUMP_TENSORS = $(BIN_DIR)/dump_tensors
 METALLIB = $(BIN_DIR)/myds.metallib
 METAL_SRCS = $(wildcard metal/*.metal)
 
-ALL_TESTS = $(TEST_METAL) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE) $(TEST_CPU) $(TEST_ENGRAM) $(TEST_ALIGN) $(TEST_KVDSK) $(TEST_P1)
+ALL_TESTS = $(TEST_METAL) $(TEST_V41_GPU) $(TEST_ATTN_POLICY) $(TEST_ATTN_VEC) $(TEST_QKV_FUSION) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE) $(TEST_CPU) $(TEST_ENGRAM) $(TEST_ALIGN) $(TEST_KVDSK) $(TEST_P1)
 
-.PHONY: all test clean bench metallib
+.PHONY: all test clean bench metallib build-tail-init test-tail-init
 
 # Rebuild consumers when public or internal layouts change.
 -include $(wildcard $(BUILD_DIR)/*.d)
@@ -50,6 +55,14 @@ ALL_TESTS = $(TEST_METAL) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_L
 all: $(TARGET) $(ALL_TESTS) $(DUMP_TENSORS) $(METALLIB)
 
 metallib: $(METALLIB)
+
+# Optional real-library init/failure/retry regression. The separate build target
+# compiles only; test-tail-init executes GPU work and is scheduled explicitly.
+build-tail-init:
+	python3 tools/build_tail_init_fixture.py --source "$(CURDIR)" --output "$(abspath $(BUILD_DIR)/tail-init)"
+
+test-tail-init: $(METALLIB) build-tail-init
+	"$(abspath $(BUILD_DIR)/tail-init/test_tail_init)" "$(abspath $(BUILD_DIR)/tail-init/missing-tail)" "$(abspath $(BIN_DIR))"
 
 $(METALLIB): $(METAL_SRCS) tools/build_metallib.py | $(BIN_DIR) $(BUILD_DIR)
 	python3 tools/build_metallib.py --bin-dir $(BIN_DIR) --build-dir $(BUILD_DIR)
@@ -70,6 +83,21 @@ $(BUILD_DIR)/main.o: src/main.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 $(BUILD_DIR)/test_metal.o: tests/test_metal.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD_DIR)/test_v41_gpu.o: tests/test_v41_gpu.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD_DIR)/test_attention_policy.o: tests/test_attention_policy.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD_DIR)/test_attention_vec.o: tests/test_attention_vec.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD_DIR)/test_qkv_fusion.o: tests/test_qkv_fusion.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD_DIR)/bench_phase.o: tools/bench_phase.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 $(BUILD_DIR)/test_gguf.o: tests/test_gguf.c | $(BUILD_DIR)
@@ -94,6 +122,22 @@ $(TARGET): $(OBJS_C) $(OBJS_M) $(BUILD_DIR)/main.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
 
 $(TEST_METAL): $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_metal.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
+
+$(TEST_V41_GPU): $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_v41_gpu.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
+
+$(TEST_ATTN_POLICY): $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_attention_policy.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
+
+$(TEST_ATTN_VEC): $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_attention_vec.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
+
+$(TEST_QKV_FUSION): $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_qkv_fusion.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
+
+# Opt-in full-model harness: build only; never run from all/test.
+$(BENCH_PHASE): $(OBJS_C) $(OBJS_M) $(BUILD_DIR)/bench_phase.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
 
 $(TEST_GGUF): $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/test_gguf.o | $(BIN_DIR)
@@ -200,6 +244,13 @@ test: $(ALL_TESTS) $(METALLIB)
 	@./$(TEST_TOKENIZER)
 	@echo ""
 	@./$(TEST_METAL)
+	@./$(TEST_V41_GPU)
+	@./$(TEST_V41_GPU) --slab
+	@./$(TEST_V41_GPU) --threshold
+	@./$(TEST_ATTN_POLICY)
+	@./$(TEST_ATTN_VEC)
+	@MYDS_QKV_NR0=4 ./$(TEST_QKV_FUSION)
+	@MYDS_QKV_NR0=2 ./$(TEST_QKV_FUSION)
 	@echo ""
 	@./$(TEST_SERVER)
 	@echo ""

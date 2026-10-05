@@ -229,8 +229,15 @@ bool myds_v41_snapshot_get_valid(const myds_v41_context_t *g);
 /* 低位区落盘的单测夹具：给快照夹具补上压缩 KV 缓冲并直接打开磁盘存储（不需要模型）。 */
 bool myds_v41_low_kv_fixture_enable(myds_v41_context_t *g, const char *path, uint64_t identity,
                                     uint32_t ways, bool async_on, uint32_t max_pos);
+void myds_v41_low_kv_segment_stats(myds_v41_context_t *g, uint32_t *live,
+                                   uint64_t *writes, uint64_t *bytes);
+void myds_v41_low_kv_write_bytes(myds_v41_context_t *g, uint64_t *snapshots, uint64_t *segments);
+struct myds_kvdsk;
+struct myds_kvdsk *myds_v41_low_kv_fixture_segments(myds_v41_context_t *g);
+void myds_v41_low_kv_fixture_fail_segment(myds_v41_context_t *g, uint32_t end);
 void myds_v41_snapshot_fixture_publish(myds_v41_context_t *g, uint32_t slot, uint32_t p);
 myds_metal_buffer_t *myds_v41_snapshot_get_snap_window(myds_v41_context_t *g, uint32_t slot);
+uint64_t myds_v41_snapshot_allocated_bytes(const myds_v41_context_t *g);
 myds_metal_buffer_t *myds_v41_snapshot_get_compressed(myds_v41_context_t *g, uint32_t o);
 myds_metal_buffer_t *myds_v41_snapshot_get_index_cache(myds_v41_context_t *g, uint32_t o);
 uint32_t myds_v41_resolve_macroblock_size(void);

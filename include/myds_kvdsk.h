@@ -1,15 +1,13 @@
 /*
  * myds_kvdsk.h — 低位区 KV 的【SSD 落盘】（定长槽 + 变长 payload 的条目存储）
  *
- * 目标：把「序列开头那段常量前缀」的 KV 状态存到磁盘，让【新会话】与【重启之后】
- * 都能直接恢复，不必重算。实测这段前缀（系统提示词 + 工具定义）约 4800 token，
- * 全量 prefill 要 17 秒 —— 而每个新会话都要重付一次。
+ * 目标：把可复用的前缀状态存到磁盘，供新会话与重启后的恢复使用。
  *
  * 为什么只做【低位区】：快照本来就按固定间隔存，而真正被反复复用的是序列开头那一段
  * （见 myds_snapshot_slots.h）。位置越深越少被命中，越浅越常用。所以只把「固定低位槽」
  * （MYDS_SNAP_PINNED 个，覆盖位置 1024..1024+(MYDS_SNAP_PINNED-1)*MYDS_SNAP_STRIDE；现为
  * 1024..11264）落盘，环形槽不进磁盘。
- * 好处是文件有界、且淘汰策略退化成「一个位置一条，新的覆盖旧的」。
+ * 文件有界；每个位置组的多个 way 可保存不同前缀，由调用方选择淘汰条目。
  *
  * ── 本模块的职责边界 ──
  * 它【不知道】KV 的布局，只管：
@@ -20,10 +18,8 @@
  * payload 的内部布局由调用方（myds_v41.c）定义，它负责把布局参数并进 identity。
  *
  * ── 为什么 payload 是变长的 ──
- * 一条快照里最大的一块是「压缩 KV」，它的行数随位置线性增长（每个 owner 每 ratio 个
- * token 一行）。位置越深条目越大（现最深 11264 每条 ≈ 79 MiB，而位置 1024 仅 ≈ 16 MiB），
- * 所以槽的容量按【最深
- * 位置】定，但每条只写、只读它自己那一段（payload_used），不写不读填充区。
+ * 存储层不假设 payload 是完整快照还是共享压缩 KV 段；两者可分别使用独立实例。
+ * 槽容量由调用方给出，每条只写、只读实际 payload_used，不处理填充区。
  */
 #ifndef MYDS_KVDSK_H
 #define MYDS_KVDSK_H
@@ -59,6 +55,11 @@ const char   *myds_kvdsk_open_error(void);
 /* ── 条目元信息（不读 payload）── */
 bool myds_kvdsk_slot_meta(const myds_kvdsk_t *k, uint32_t slot,
                           uint32_t *position, uint64_t *prefix_hash, uint64_t *used_bytes);
+/* Inspect a committed payload range without starting a read transaction or
+ * updating checksum/hits. This is only for descriptor comparison; restore
+ * must still validate the complete payload with read_start/chunk/finish. */
+bool myds_kvdsk_peek_committed(myds_kvdsk_t *k, uint32_t slot, uint64_t offset,
+                               void *dst, uint64_t bytes);
 /* 命中计数 +1（只是证据：用来回答「这段前缀到底有没有被复用」）。 */
 bool myds_kvdsk_slot_touch(myds_kvdsk_t *k, uint32_t slot);
 /* 读命中数。★ 淘汰要用的判据：命中过 = 这份快照真的在被用，
@@ -75,6 +76,9 @@ bool myds_kvdsk_read_start(myds_kvdsk_t *k, uint32_t slot, uint64_t *used_bytes)
 bool myds_kvdsk_read_chunk(myds_kvdsk_t *k, uint64_t offset, void *dst, uint64_t bytes);
 /* 校验 CRC。不符 ⇒ 把该槽置空并返回 false（调用方必须丢弃本次恢复）。 */
 bool myds_kvdsk_read_finish(myds_kvdsk_t *k);
+/* Finish a complete checksum read used only for save-time validation; unlike
+ * read_finish this does not count a restore hit or write hit metadata. */
+bool myds_kvdsk_read_verify(myds_kvdsk_t *k);
 /* 显式终止读事务（遇到语义校验失败等外部错误时调用，避免读事务状态泄漏）。 */
 void myds_kvdsk_read_abort(myds_kvdsk_t *k);
 
@@ -84,6 +88,9 @@ bool myds_kvdsk_write_chunk(myds_kvdsk_t *k, uint64_t offset, const void *src, u
 /* 落条目。position > 0 且 used_bytes ≤ slot_stride 才有效；到此为止失败 ⇒ 该槽保持空。 */
 bool myds_kvdsk_write_finish(myds_kvdsk_t *k, uint32_t slot, uint32_t position,
                              uint64_t prefix_hash, uint64_t used_bytes);
+/* Cancel an uncommitted write after a caller-side error. The slot remains a
+ * clean miss and the store can accept a new transaction without reopening. */
+void myds_kvdsk_write_abort(myds_kvdsk_t *k);
 
 /* 前缀哈希（FNV-1a 64，按 token 逐字节）。对【同一条 token 序列】必须稳定 ——
  * 跨进程复用唯一的安全性来源就是它：字节能不能用，取决于它是不是同一段前缀。

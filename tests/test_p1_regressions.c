@@ -6,6 +6,10 @@
 #include <pthread.h>
 #include <sys/mman.h>
 #include <math.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include "myds_kvdsk.h"
+#include "myds_engram.h"
 
 #include "myds.h"
 #include "myds_gguf.h"
@@ -299,9 +303,7 @@ static void test_p1_unmapped_engram_identity(void) {
     gf2.fd = fd;
     char tmp_kvdsk_dir[] = "/tmp/test_myds_kvdsk_recover_XXXXXX";
     assert(mkdtemp(tmp_kvdsk_dir) != NULL);
-    /* 默认预算【不限】⇒ 默认槽数（21 组 × 3 way）必须能开起来。
-     * ★ 这条断言是刻意的：它覆盖「不设 MYDS_KV_DSK_BUDGET_MB 也能启用」这个默认路径
-     *   （f0fe18d 期间默认写死 2048 MiB，把这条路径打断了；现在默认不限，故此断言成立）。 */
+    /* 不设预算也能启用两个 store 的默认路径。 */
     unsetenv("MYDS_KV_DSK_BUDGET_MB");   /* 保证真的走默认路径，不受开发者 shell 影响 */
     assert(myds_v41_low_kv_enable(ctx, tmp_kvdsk_dir));
     assert(myds_v41_low_kv_enabled(ctx));
@@ -309,9 +311,11 @@ static void test_p1_unmapped_engram_identity(void) {
 
     /* Clean up temporary test files */
     char bin_path[1200];
-    snprintf(bin_path, sizeof(bin_path), "%s/kvlow-%016llx.bin", tmp_kvdsk_dir, (unsigned long long)id_mut);
-    unlink(bin_path);
-    rmdir(tmp_kvdsk_dir);
+    snprintf(bin_path, sizeof(bin_path), "%s/kvlow-v3-%016llx.bin", tmp_kvdsk_dir, (unsigned long long)id_mut);
+    assert(unlink(bin_path) == 0);
+    snprintf(bin_path, sizeof(bin_path), "%s/kvsegments-v1-%016llx.bin", tmp_kvdsk_dir, (unsigned long long)id_mut);
+    assert(unlink(bin_path) == 0);
+    assert(rmdir(tmp_kvdsk_dir) == 0);
 
     close(fd);
     unlink(path);
@@ -964,6 +968,39 @@ static void check_buffer_f32(myds_metal_buffer_t *buf, float expected) {
     for (size_t i = 0; i < words; i++) assert(ptr[i] == expected);
 }
 
+static void test_snapshot_slots_allocate_on_capture(void) {
+    if (!myds_metal_init(NULL)) return;
+    unsetenv("MYDS_NO_PREFIX_SNAPSHOT");
+    myds_v41_context_t *g = myds_v41_context_create_snapshot_fixture();
+    assert(g && myds_v41_snapshot_allocated_bytes(g) == 0u);
+    const uint64_t slot_bytes = 40ull * 128u * 512u * 4u + 8ull * 512u * 4u;
+    assert(myds_v41_snapshot_get_snap_window(g, 2u));
+    assert(myds_v41_snapshot_allocated_bytes(g) == slot_bytes);
+    assert(myds_v41_snapshot_get_snap_window(g, 2u));
+    assert(myds_v41_snapshot_allocated_bytes(g) == slot_bytes);
+    assert(myds_v41_snapshot_store_now(g, 512u));
+    assert(myds_v41_snapshot_allocated_bytes(g) == slot_bytes);
+    for (uint32_t l = 0; l < 40u; ++l) fill_buffer_f32(myds_v41_snapshot_get_window(g, l), 7.0f);
+    for (uint32_t o = 0; o < 4u; ++o) {
+        fill_buffer_f32(myds_v41_snapshot_get_previous_kv(g, o), 2.0f);
+        fill_buffer_f32(myds_v41_snapshot_get_previous_score(g, o), 3.0f);
+    }
+    assert(myds_v41_snapshot_store_now(g, 1024u));
+    assert(myds_v41_snapshot_allocated_bytes(g) == 2u * slot_bytes);
+    assert(myds_v41_snapshot_restore(g, 1024u));
+    myds_v41_context_free(g);
+    setenv("MYDS_NO_PREFIX_SNAPSHOT", "1", 1);
+    g = myds_v41_context_create_snapshot_fixture();
+    assert(g && !myds_v41_snapshot_get_snap_window(g, 0u));
+    assert(myds_v41_snapshot_store_now(g, 1024u));
+    assert(myds_v41_snapshot_best(g, 1024u) == 0u);
+    assert(myds_v41_snapshot_allocated_bytes(g) == 0u);
+    myds_v41_context_free(g);
+    unsetenv("MYDS_NO_PREFIX_SNAPSHOT");
+    myds_metal_cleanup();
+    printf("  [PASS] snapshot buffers are lazy and disabled snapshots allocate no slots\n");
+}
+
 static void test_p1_snapshot_overwrite_failure(void) {
     if (!myds_metal_init(NULL)) {
         printf("  [SKIP] Metal not supported on this platform\n");
@@ -1271,12 +1308,12 @@ static void lk_fill_state(myds_v41_context_t *g) {
         myds_v41_snapshot_fixture_publish(g, s, lk_pos[i]);
     }
     for (uint32_t o = 0; o < 4; o++) {
-        float *c = (float *)myds_metal_buffer_data(myds_v41_snapshot_get_compressed(g, o));
-        const size_t nc = myds_metal_buffer_size(myds_v41_snapshot_get_compressed(g, o)) / sizeof(float);
-        for (size_t k = 0; k < nc; k++) c[k] = (float)(((o + 1u) * 7919u + (uint32_t)k) % 32749u) * 0.5f;
-        float *x = (float *)myds_metal_buffer_data(myds_v41_snapshot_get_index_cache(g, o));
-        const size_t nx = myds_metal_buffer_size(myds_v41_snapshot_get_index_cache(g, o)) / sizeof(float);
-        for (size_t k = 0; k < nx; k++) x[k] = -(float)(((o + 3u) * 104729u + (uint32_t)k) % 32749u);
+        uint16_t *c = myds_metal_buffer_data(myds_v41_snapshot_get_compressed(g, o));
+        const size_t nc = myds_metal_buffer_size(myds_v41_snapshot_get_compressed(g, o)) / sizeof(uint16_t);
+        for (size_t k = 0; k < nc; k++) c[k] = (uint16_t)(0x3f00u + ((o * 7919u + k) % 1024u));
+        uint16_t *x = myds_metal_buffer_data(myds_v41_snapshot_get_index_cache(g, o));
+        const size_t nx = myds_metal_buffer_size(myds_v41_snapshot_get_index_cache(g, o)) / sizeof(uint16_t);
+        for (size_t k = 0; k < nx; k++) x[k] = (uint16_t)(0xbf00u + ((o * 104729u + k) % 512u));
     }
 }
 
@@ -1285,12 +1322,12 @@ static void lk_simulate_decode(myds_v41_context_t *g) {
     for (uint32_t o = 0; o < 4; o++) {
         const uint32_t r = lk_ratio(o);
         const uint32_t first = (r == 1u) ? q0 : ((q0 | 1u) - 1u) / 2u;   /* 第一个奇数 q >= q0 写的行 */
-        float *c = (float *)myds_metal_buffer_data(myds_v41_snapshot_get_compressed(g, o));
-        const size_t nc = myds_metal_buffer_size(myds_v41_snapshot_get_compressed(g, o)) / sizeof(float);
-        for (size_t k = (size_t)first * 512u; k < nc; k++) c[k] = 9999.0f;
-        float *x = (float *)myds_metal_buffer_data(myds_v41_snapshot_get_index_cache(g, o));
-        const size_t nx = myds_metal_buffer_size(myds_v41_snapshot_get_index_cache(g, o)) / sizeof(float);
-        for (size_t k = (size_t)first * 128u; k < nx; k++) x[k] = 9999.0f;
+        uint16_t *c = myds_metal_buffer_data(myds_v41_snapshot_get_compressed(g, o));
+        const size_t nc = myds_metal_buffer_size(myds_v41_snapshot_get_compressed(g, o)) / sizeof(uint16_t);
+        for (size_t k = (size_t)first * 512u; k < nc; k++) c[k] = 0x461cu;
+        uint16_t *x = myds_metal_buffer_data(myds_v41_snapshot_get_index_cache(g, o));
+        const size_t nx = myds_metal_buffer_size(myds_v41_snapshot_get_index_cache(g, o)) / sizeof(uint16_t);
+        for (size_t k = (size_t)first * 128u; k < nx; k++) x[k] = 0x461cu;
     }
 }
 
@@ -1301,7 +1338,7 @@ static int32_t *lk_tokens(void) {
     return t;
 }
 
-static void lk_write(const char *path, bool async_on) {
+static void lk_write(const char *path, bool async_on, bool wait_before_free) {
     myds_v41_context_t *g = myds_v41_context_create_snapshot_fixture();
     assert(g);
     assert(myds_v41_low_kv_fixture_enable(g, path, 0x5EEDull, 1, async_on, LK_NTOK + 64u));
@@ -1311,10 +1348,12 @@ static void lk_write(const char *path, bool async_on) {
     memset(tok, 0xA5, LK_NTOK * sizeof(int32_t));   /* ① 调用方立刻改/释放 token */
     free(tok);
     lk_simulate_decode(g);                          /* ② decode 与后台写盘并行 */
-    myds_v41_low_kv_wait(g);
-    uint32_t live = 0, slots = 0;
-    myds_v41_low_kv_stats(g, &live, &slots);
-    assert(live == 3u);
+    if (wait_before_free) {
+        myds_v41_low_kv_wait(g);
+        uint32_t live = 0, slots = 0;
+        myds_v41_low_kv_stats(g, &live, &slots);
+        assert(live == 3u);
+    }
     myds_v41_context_free(g);
 }
 
@@ -1338,14 +1377,25 @@ static void test_p2_lowkv_async_bit_identical(void) {
     if (!myds_metal_init(NULL)) { printf("  [SKIP] Metal not supported on this platform\n"); return; }
     char dir[] = "/tmp/test_myds_lowkv_async_XXXXXX";
     assert(mkdtemp(dir) != NULL);
-    char pa[256], pb[256], pc[256];
+    char pa[256], pb[256], pc[256], pd[256];
     snprintf(pa, sizeof(pa), "%s/sync.bin", dir);
     snprintf(pb, sizeof(pb), "%s/async.bin", dir);
     snprintf(pc, sizeof(pc), "%s/join.bin", dir);
+    snprintf(pd, sizeof(pd), "%s/free.bin", dir);
 
-    lk_write(pa, false);
-    lk_write(pb, true);
+    lk_write(pa, false, true);
+    lk_write(pb, true, true);
+    lk_write(pd, true, false); /* context_free must join before releasing buffers/stores */
     lk_assert_files_equal(pa, pb);
+    lk_assert_files_equal(pa, pd);
+    char sa[300], sb[300];
+    snprintf(sa, sizeof(sa), "%s.segments", pa);
+    snprintf(sb, sizeof(sb), "%s.segments", pb);
+    /* Save-time CRC validation must not inflate restore hits; metadata and
+     * payload are therefore identical across these different job batches. */
+    lk_assert_files_equal(sa, sb);
+    snprintf(sb, sizeof(sb), "%s.segments", pd);
+    lk_assert_files_equal(sa, sb);
 
     /* 新文件上后台写盘、不显式 wait：load 必须先汇合，再命中 [0, 2047] 内最深的 1536 */
     myds_v41_context_t *g = myds_v41_context_create_snapshot_fixture();
@@ -1358,8 +1408,221 @@ static void test_p2_lowkv_async_bit_identical(void) {
     free(tok);
     myds_v41_context_free(g);
 
-    unlink(pa); unlink(pb); unlink(pc); rmdir(dir);
-    printf("  [PASS] P2: async low-KV write is byte-identical to sync under concurrent decode writes, and load joins first\n");
+    unlink(pa); unlink(pb); unlink(pc); unlink(pd);
+    unlink(sa); unlink(sb);
+    snprintf(sb, sizeof(sb), "%s.segments", pb); unlink(sb);
+    snprintf(sa, sizeof(sa), "%s.segments", pc); unlink(sa);
+    rmdir(dir);
+    printf("  [PASS] P2: async low-KV write is byte-identical to sync under concurrent decode writes, and load/free join first\n");
+}
+
+static uint64_t lk_expected_segment_bytes(uint32_t start, uint32_t end) {
+    uint64_t bytes = 64;
+    for (uint32_t o = 0; o < 4; ++o)
+        bytes += (uint64_t)((end - start) / lk_ratio(o)) * (512u + 128u) * sizeof(uint16_t);
+    return bytes;
+}
+
+static void test_lowkv_combined_budget(void) {
+    char dir[] = "/tmp/test_myds_segments_budget_XXXXXX"; assert(mkdtemp(dir));
+    myds_model_t model = {0}; gguf_file_t gf = {0};
+    snprintf(model.arch, sizeof(model.arch), "deepseek41"); model.gf = &gf;
+    const uint64_t identity = myds_v41_model_identity(&model); assert(identity);
+    char snapshots[512], segments[512];
+    snprintf(snapshots, sizeof(snapshots), "%s/kvlow-v3-%016llx.bin", dir, (unsigned long long)identity);
+    snprintf(segments, sizeof(segments), "%s/kvsegments-v1-%016llx.bin", dir, (unsigned long long)identity);
+    const uint64_t entries = MYDS_SNAP_PINNED; /* one way */
+    const uint64_t base = (4096u + entries * 64u + 4095u) / 4096u * 4096u;
+    const uint64_t snapshot_stride = 64u + sizeof(myds_engram_history_t) +
+        40u * 128u * 512u * sizeof(float) + MYDS_SNAP_PINNED * 32u;
+    const uint64_t segment_stride = lk_expected_segment_bytes(0, MYDS_SNAP_MIN);
+    const uint64_t total = 2u * base + entries * (snapshot_stride + segment_stride);
+    char mb[32]; snprintf(mb, sizeof(mb), "%llu", (unsigned long long)(total >> 20));
+    setenv("MYDS_KV_DSK_WAYS", "1", 1); setenv("MYDS_KV_DSK_BUDGET_MB", mb, 1);
+    myds_v41_context_t *g = myds_v41_context_create_for_model(&model); assert(g);
+    assert(!myds_v41_low_kv_enable(g, dir));
+    assert(!myds_v41_low_kv_enabled(g));
+    assert(access(snapshots, F_OK) == -1 && access(segments, F_OK) == -1);
+    /* Budget rejection must leave the same context able to open both stores. */
+    snprintf(mb, sizeof(mb), "%llu", (unsigned long long)((total + (1u << 20) - 1u) >> 20));
+    setenv("MYDS_KV_DSK_BUDGET_MB", mb, 1);
+    assert(myds_v41_low_kv_enable(g, dir));
+    struct stat snap_stat, seg_stat;
+    assert(stat(snapshots, &snap_stat) == 0 && stat(segments, &seg_stat) == 0);
+    assert((uint64_t)snap_stat.st_size == base + entries * snapshot_stride);
+    assert((uint64_t)seg_stat.st_size == base + entries * segment_stride);
+    assert((uint64_t)snap_stat.st_size + (uint64_t)seg_stat.st_size == total);
+    myds_v41_context_free(g);
+    assert(unlink(snapshots) == 0 && unlink(segments) == 0 && rmdir(dir) == 0);
+    unsetenv("MYDS_KV_DSK_WAYS"); unsetenv("MYDS_KV_DSK_BUDGET_MB");
+    printf("  [PASS] SSD combined budget: exact %llu B includes both aligned headers/tables; rejection creates no files and retry succeeds\n",
+        (unsigned long long)total);
+}
+
+static void lk_assert_restored(myds_v41_context_t *g, uint32_t end, bool forked) {
+    assert(myds_v41_snapshot_restore(g, end));
+    const uint32_t slot = myds_snap_slot_for(end, 0);
+    for (uint32_t l = 0; l < 40; ++l) {
+        const float *window = myds_metal_buffer_data(myds_v41_snapshot_get_window(g, l));
+        const size_t n = myds_metal_buffer_size(myds_v41_snapshot_get_window(g, l)) / sizeof(float);
+        for (size_t k = 0; k < n; ++k) {
+            const float expected = (float)((slot * 1000003u + (uint32_t)((size_t)l * n + k)) % 65521u) * 0.25f;
+            assert(window[k] == expected + (forked && end > 1024u ? 32.0f : 0.0f));
+        }
+    }
+    for (uint32_t o = 0; o < 4; ++o) {
+        const uint16_t *c = myds_metal_buffer_data(myds_v41_snapshot_get_compressed(g, o));
+        const uint16_t *x = myds_metal_buffer_data(myds_v41_snapshot_get_index_cache(g, o));
+        for (size_t k = 0; k < (size_t)(end / lk_ratio(o)) * 512u; ++k) {
+            uint16_t expected = (uint16_t)(0x3f00u + ((o * 7919u + k) % 1024u));
+            if (forked && k >= (size_t)(1024u / lk_ratio(o)) * 512u) expected ^= 0x0040u;
+            assert(c[k] == expected);
+        }
+        for (size_t k = 0; k < (size_t)(end / lk_ratio(o)) * 128u; ++k) {
+            uint16_t expected = (uint16_t)(0xbf00u + ((o * 104729u + k) % 512u));
+            if (forked && k >= (size_t)(1024u / lk_ratio(o)) * 128u) expected ^= 0x0040u;
+            assert(x[k] == expected);
+        }
+    }
+    uint32_t history[3]; myds_v41_snapshot_get_engram_history(g, history);
+    assert(history[0] == (forked ? 404u : 101u));
+    assert(history[1] == (forked ? 505u : 202u));
+    assert(history[2] == (forked ? 606u : 303u));
+}
+
+static void lk_make_fork_state(myds_v41_context_t *g) {
+    for (uint32_t o = 0; o < 4; ++o) {
+        uint16_t *c = myds_metal_buffer_data(myds_v41_snapshot_get_compressed(g, o));
+        uint16_t *x = myds_metal_buffer_data(myds_v41_snapshot_get_index_cache(g, o));
+        const size_t rows = LK_NTOK / lk_ratio(o), first = 1024u / lk_ratio(o);
+        for (size_t k = first * 512u; k < rows * 512u; ++k) c[k] ^= 0x0040u;
+        for (size_t k = first * 128u; k < rows * 128u; ++k) x[k] ^= 0x0040u;
+    }
+    myds_v41_snapshot_set_engram_history(g, 404, 505, 606);
+    for (uint32_t s = 2; s <= 3; ++s) {
+        myds_metal_buffer_t *w = myds_v41_snapshot_get_snap_window(g, s);
+        float *f = myds_metal_buffer_data(w);
+        for (size_t k = 0; k < myds_metal_buffer_size(w) / sizeof(float); ++k) f[k] += 32.0f;
+        myds_v41_snapshot_fixture_publish(g, s, lk_pos[s - 1u]);
+    }
+}
+
+static void lk_remove_store(const char *path) {
+    char segments[512]; snprintf(segments, sizeof(segments), "%s.segments", path);
+    unlink(path); unlink(segments);
+}
+
+static void test_shared_lowkv_segments(void) {
+    if (!myds_metal_init(NULL)) return;
+    char dir[] = "/tmp/test_myds_segments_XXXXXX";
+    assert(mkdtemp(dir));
+    char path[512]; snprintf(path, sizeof(path), "%s/shared.bin", dir);
+    int32_t *a = lk_tokens(), *b = lk_tokens();
+    for (uint32_t i = 1024; i < LK_NTOK; ++i) b[i] += 7;
+    myds_v41_context_t *g = myds_v41_context_create_snapshot_fixture(); assert(g);
+    assert(myds_v41_low_kv_fixture_enable(g, path, 0x5EEDull, 2, false, LK_NTOK + 64));
+    lk_fill_state(g);
+    assert(myds_v41_low_kv_save(g, a, LK_NTOK));
+    uint32_t live = 0; uint64_t writes = 0, bytes = 0, snap_bytes = 0, seg_bytes = 0;
+    myds_v41_low_kv_segment_stats(g, &live, &writes, &bytes);
+    assert(live == 3 && writes == 3);
+    assert(bytes == lk_expected_segment_bytes(0, 1024) +
+        lk_expected_segment_bytes(1024, 1536) + lk_expected_segment_bytes(1536, 2048));
+    myds_v41_low_kv_write_bytes(g, &snap_bytes, &seg_bytes);
+    assert(myds_v41_low_kv_save(g, a, LK_NTOK));
+    uint64_t snap_again = 0, seg_again = 0;
+    myds_v41_low_kv_write_bytes(g, &snap_again, &seg_again);
+    assert(snap_again == snap_bytes && seg_again == seg_bytes); /* steady zero payload writes */
+    myds_kvdsk_t *segments = myds_v41_low_kv_fixture_segments(g);
+    for (uint32_t i = 0; i < 3; ++i) {
+        uint32_t hits = 99;
+        assert(myds_kvdsk_slot_hits(segments, i * 2u, &hits) && hits == 0);
+    }
+    printf("  [INFO] SSD 3 snapshots: snapshot payload=%llu B, shared segment payload=%llu B; repeat adds 0 B\n",
+        (unsigned long long)snap_bytes, (unsigned long long)seg_bytes);
+    lk_make_fork_state(g);
+    assert(myds_v41_low_kv_save(g, b, LK_NTOK));
+    myds_v41_low_kv_segment_stats(g, &live, &writes, &bytes);
+    assert(live == 5 && writes == 5); /* identical [0,1024) stored once */
+    assert(bytes == seg_bytes + lk_expected_segment_bytes(1024, 1536) + lk_expected_segment_bytes(1536, 2048));
+    myds_v41_context_free(g);
+    for (unsigned forked = 0; forked < 2; ++forked) {
+        g = myds_v41_context_create_snapshot_fixture(); assert(g);
+        assert(myds_v41_low_kv_fixture_enable(g, path, 0x5EEDull, 2, false, LK_NTOK + 64));
+        assert(myds_v41_low_kv_load(g, forked ? b : a, LK_NTOK) == LK_NTOK);
+        lk_assert_restored(g, LK_NTOK, forked != 0);
+        myds_v41_context_free(g);
+    }
+    lk_remove_store(path); rmdir(dir); free(a); free(b);
+    printf("  [PASS] shared SSD segments: linear writes, steady zero payload writes, forked common prefix and bit-exact reopen/restore\n");
+}
+
+static uint64_t lk_read_u64(const unsigned char *p) {
+    uint64_t v = 0; for (unsigned i = 0; i < 8; ++i) v |= (uint64_t)p[i] << (8u * i); return v;
+}
+
+static void test_lowkv_segment_failure_paths(void) {
+    if (!myds_metal_init(NULL)) return;
+    char dir[] = "/tmp/test_myds_segments_fail_XXXXXX";
+    assert(mkdtemp(dir));
+    char path[512], segments[600];
+    int32_t *tokens = lk_tokens();
+    for (unsigned mode = 0; mode < 4; ++mode) {
+        snprintf(path, sizeof(path), "%s/failure-%u.bin", dir, mode);
+        snprintf(segments, sizeof(segments), "%s.segments", path);
+        myds_v41_context_t *g = myds_v41_context_create_snapshot_fixture(); assert(g);
+        assert(myds_v41_low_kv_fixture_enable(g, path, 0x5EEDull, 1, false, LK_NTOK + 64));
+        lk_fill_state(g);
+        if (mode == 0) {
+            myds_v41_snapshot_fixture_publish(g, 1, 0);
+            myds_v41_snapshot_fixture_publish(g, 2, 0);
+            myds_v41_low_kv_fixture_fail_segment(g, 1536);
+            assert(!myds_v41_low_kv_save(g, tokens, LK_NTOK));
+            uint32_t live = 99; myds_v41_low_kv_stats(g, &live, NULL); assert(live == 0);
+            assert(myds_v41_low_kv_load(g, tokens, LK_NTOK) == 0);
+            /* Abort leaves the transaction reusable, and no snapshot was
+             * published while only the first segment was complete. */
+            myds_v41_low_kv_fixture_fail_segment(g, 0);
+            assert(myds_v41_low_kv_save(g, tokens, LK_NTOK));
+            assert(myds_v41_low_kv_load(g, tokens, LK_NTOK) == LK_NTOK);
+            lk_assert_restored(g, LK_NTOK, false);
+        } else {
+            assert(myds_v41_low_kv_save(g, tokens, LK_NTOK));
+            if (mode == 1) {
+                /* A valid committed replacement in the referenced slot has
+                 * another prefix. Old refs must miss before restoring it. */
+                myds_kvdsk_t *store = myds_v41_low_kv_fixture_segments(g);
+                const uint64_t wrong = 0xDEADBEEFull;
+                assert(myds_kvdsk_write_start(store, 0));
+                assert(myds_kvdsk_write_chunk(store, 0, &wrong, sizeof(wrong)));
+                assert(myds_kvdsk_write_finish(store, 0, 1024, wrong, sizeof(wrong)));
+            } else if (mode == 2) {
+                int fd = open(segments, O_RDWR); assert(fd >= 0);
+                unsigned char header[32]; assert(pread(fd, header, sizeof(header), 0) == sizeof(header));
+                const uint32_t slots = MYDS_SNAP_PINNED;
+                const uint64_t base = (4096u + slots * 64u + 4095u) / 4096u * 4096u;
+                assert(lk_read_u64(header + 24) > 64);
+                unsigned char byte = 0; assert(pread(fd, &byte, 1, (off_t)(base + 64)) == 1);
+                byte ^= 0x80u; assert(pwrite(fd, &byte, 1, (off_t)(base + 64)) == 1); close(fd);
+            } else {
+                /* A shallow new branch evicts only group 0. The old deep
+                 * descriptor remains committed, but its segment ref is stale. */
+                int32_t *branch = lk_tokens(); branch[0] += 1;
+                myds_v41_snapshot_fixture_publish(g, 2, 0);
+                myds_v41_snapshot_fixture_publish(g, 3, 0);
+                assert(myds_v41_low_kv_save(g, branch, LK_NTOK));
+                free(branch);
+                uint32_t live = 0; myds_v41_low_kv_stats(g, &live, NULL); assert(live == 3);
+            }
+            assert(myds_v41_low_kv_load(g, tokens, LK_NTOK) == 0);
+            assert(myds_v41_snapshot_best(g, LK_NTOK) == 0);
+            assert(!myds_v41_snapshot_get_valid(g));
+            assert(!myds_v41_snapshot_restore(g, LK_NTOK));
+        }
+        myds_v41_context_free(g); lk_remove_store(path);
+    }
+    free(tokens); rmdir(dir);
+    printf("  [PASS] SSD segment partial writes never publish, aborted writes recover, evicted/replaced/corrupt refs fail closed\n");
 }
 
 int main(void) {
@@ -1375,10 +1638,14 @@ int main(void) {
     test_p2_moe_kernel_and_pso_validation();
     test_p2_moe_batch_mm_tail_cull_validation();
     test_p2_moe_tail_cull_multi_case_golden_equivalence();
+    test_snapshot_slots_allocate_on_capture();
     test_p1_snapshot_overwrite_failure();
     test_p1_macroblock_prefill_invariants();
     test_p2_tiled_indexer_causal_equivalence();
     test_p2_lowkv_async_bit_identical();
+    test_lowkv_combined_budget();
+    test_shared_lowkv_segments();
+    test_lowkv_segment_failure_paths();
     printf("All P1 Regression Verifications PASSED!\n");
     return 0;
 }

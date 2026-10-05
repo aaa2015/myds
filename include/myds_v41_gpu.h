@@ -14,7 +14,15 @@ typedef struct myds_v41_gpu_scratch myds_v41_gpu_scratch_t;
 /* 单个 chunk 的 token 上界。这是【单一真源】：host 侧钳 chunk 尺寸、chunk attention
  * 的合法性检查都用它。以前 host 钳到 4096、attention 只收 2048 —— 配置合法但运行失败。 */
 #define MYDS_V41_CHUNK_MAX 2048u
+/* MYDS_ATTN_GATHER_MIN_KEYS defaults to zero. A valid threshold in [0,key_max]
+ * selects slab below the threshold and gather at/above it when gather is enabled
+ * and a gathered buffer is supplied. Invalid thresholds reject scratch creation.
+ * The explicit strategy is captured per scratch; no measured threshold is forced. */
 myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp);
+/* Pack the upper 16 bits of already BF16-rounded F32 values. Offsets are in
+ * destination uint16 words / source floats; no numerical conversion or rounding. */
+int myds_v41_gpu_pack_bf16(myds_metal_buffer_t *dst,size_t dst_offset_words,
+    const myds_metal_buffer_t *src,size_t src_offset_floats,uint32_t count);
 /* chunk attention 的运行时几何量（由【配置的上下文】推出，见 scratch_create）。
  * 旧版把键上界写死成 16384，导致「配置 262144、实际 16384 就整个 prefill 失败」
  * （而且注释谎称会回退逐 token，代码里其实是 goto fail）。
@@ -22,7 +30,21 @@ myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp);
  *   chunk_key_max() = 一次 attention 能覆盖的压缩键总数上界（超了必须提前拒绝） */
 uint32_t myds_v41_gpu_chunk_max_c(const myds_v41_gpu_scratch_t *scratch);
 uint32_t myds_v41_gpu_chunk_key_max(const myds_v41_gpu_scratch_t *scratch);
+/* Actual shared-memory bytes occupied by the chunk KV slab and mask. Initially
+ * compact; a compressed slab fallback may grow it to the configured key cap. */
+size_t myds_v41_gpu_chunk_workspace_bytes(const myds_v41_gpu_scratch_t *scratch);
 void myds_v41_gpu_scratch_free(myds_v41_gpu_scratch_t *scratch);
+/* Diagnostic fixtures only: 0 disables, 1 requests a nonexistent matrix PSO,
+ * 2 requests unsupported shared memory. Set only between completed GPU batches. */
+void myds_v41_gpu_inject_attention_matrix_failure(uint32_t kind);
+/* Gather prefill vec is head-first by default; MYDS_ATTN_VEC_HEAD_FIRST=0 selects
+ * the original grid. Missing optional PSOs automatically cache a fallback.
+ * Diagnostic status: 0 disabled/null, 1 enabled, 2 cached unavailable; before
+ * the first gathered vec dispatch, enabled does not yet imply PSO availability. */
+uint32_t myds_v41_gpu_attention_vec_head_first_status(const myds_v41_gpu_scratch_t *scratch);
+/* Diagnostic fixture only: force an absent head-first PSO. Change only between
+ * completed GPU batches. Both default and explicit enablement remain best effort. */
+void myds_v41_gpu_inject_attention_vec_head_first_failure(bool enabled);
 int myds_v41_gpu_rope(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
     uint32_t pos,bool compressed,bool inverse);
 int myds_v41_gpu_rope_batch(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
@@ -31,6 +53,11 @@ int myds_v41_gpu_rope_batch(myds_metal_buffer_t *x,uint32_t width,uint32_t heads
  * ratio==2 的提交行位置是 first_pos + 2*row。内核算的是 theta=(start+row*stride)*freq。 */
 int myds_v41_gpu_rope_batch_stride(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
     uint32_t start_pos,uint32_t rows,uint32_t stride,bool compressed,bool inverse);
+/* Fixed decode Q[64,512], KV[512], F32 window[128,512]. Fuses forward
+ * Q/K RoPE, mode-1 KV quantization and ring store with all BF16 boundaries.
+ * Missing fused kernel / copy injection / overlapping storage use originals. */
+int myds_v41_gpu_qkv_finish(myds_metal_buffer_t *q,myds_metal_buffer_t *kv,
+    myds_metal_buffer_t *window,uint32_t pos,bool compressed);
 /* 0 BF16, 1 FP8 E8M0 scales, 2 FP4 E8M0 scales, 3 FP4 E4M3 scales. */
 int myds_v41_gpu_quant(myds_metal_buffer_t *x,uint32_t width,uint32_t rows,uint32_t mode);
 /* Even positions cache kv/scores; odd positions write the pooled output. */
@@ -50,10 +77,17 @@ int myds_v41_gpu_pool2_pairs(myds_metal_buffer_t *out,const myds_metal_buffer_t 
 int myds_v41_gpu_indexscores(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
     const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,
     uint32_t n_comp,uint32_t n_heads);
+int myds_v41_gpu_indexscores_bf16(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
+    const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,
+    uint32_t n_comp,uint32_t n_heads);
 /* 整 chunk 批量版（n_tokens 行 × n_comp 列，行主序，行步长 n_comp）。只支持
  * n_heads == 32；每行的因果宽度 = (causal_start + row + 1) / causal_ratio，
  * 与逐 token 的 count 相同；行数不够的格子写 -INFINITY。 */
 int myds_v41_gpu_indexscores_chunk(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
+    const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,
+    uint32_t n_comp,uint32_t n_heads,uint32_t n_tokens,
+    uint32_t causal_start,uint32_t causal_ratio);
+int myds_v41_gpu_indexscores_chunk_bf16(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
     const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,
     uint32_t n_comp,uint32_t n_heads,uint32_t n_tokens,
     uint32_t causal_start,uint32_t causal_ratio);
@@ -90,6 +124,8 @@ int myds_v41_gpu_topkmask_rows(myds_metal_buffer_t *mask,const myds_metal_buffer
 /* ids must originate from topk with the same source_rows (trusted GPU indices). */
 int myds_v41_gpu_gather(myds_metal_buffer_t *out,const myds_metal_buffer_t *cache,
     const myds_metal_buffer_t *ids,uint32_t source_rows,uint32_t selected_rows);
+int myds_v41_gpu_gather_bf16(myds_metal_buffer_t *out,const myds_metal_buffer_t *cache,
+    const myds_metal_buffer_t *ids,uint32_t source_rows,uint32_t selected_rows);
 /* Fixed64 heads, width512, raw ring capacity128, selected_rows<=512.
  * Reference F16 staging + 32-way split-K FlashAttention, no output BF16/RoPE:
  * caller must round then inverse-RoPE the heads at the prescribed boundary. */
@@ -99,6 +135,14 @@ int myds_v41_gpu_attention(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
     myds_v41_gpu_scratch_t *scratch);
 /* 整个 chunk 一次算完的 attention（chunked prefill 用）。 */
 int myds_v41_gpu_attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *chunk_kv,
+    const myds_metal_buffer_t *comp_kv,const myds_metal_buffer_t *ids,
+    myds_metal_buffer_t *gathered,
+    uint32_t c_len,uint32_t n_comp,uint32_t top_k,
+    uint32_t base_pos,uint32_t c_start,uint32_t ratio,myds_v41_gpu_scratch_t *s);
+/* These BF16 variants accept packed uint16 cache/comp_kv values; every other
+ * buffer and the arithmetic/reduction order matches the corresponding F32 API. */
+int myds_v41_gpu_attention_chunk_bf16(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *chunk_kv,
     const myds_metal_buffer_t *comp_kv,const myds_metal_buffer_t *ids,
     myds_metal_buffer_t *gathered,

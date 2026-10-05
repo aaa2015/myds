@@ -85,9 +85,16 @@ myds/
 
 ## 编译与测试
 
-本轮推理优化、验证方法与 Mac Studio 实测记录见
-[性能与架构优化说明](docs/PERFORMANCE.md)。默认预填充使用批量 GEMV，保留单 token GEMV
-的归约顺序；`MYDS_PREFILL_MODE` 的实验性 GEMM 档位仍需独立验证。
+2026-10-05 的 Mac Studio 独占测试、逐 token 耗时和组件回放证据见
+[本轮实测汇总](docs/benchmarks/2026-10-05-optimization/final-summary.json)。
+测试关闭 profiler、内存前缀命中和 KV 磁盘命中，每组预热一次后正式运行三次。
+prefill 按实际处理的输入 token 计时，decode 按首次到末次输出回调之间的 token 间隔计时。
+基准固定 `temperature=0`、`top_p=1`、`top_k=0`、`min_p=0`、
+`repetition_penalty=1`、`seed=42`；greedy argmax 路径不读取采样随机数。
+长输入的耗时波动及无 GPU 额外提交的路径诊断见
+[补充验证](docs/benchmarks/2026-10-05-optimization/head-first-long-validation.json)，
+两轮变慢的原始数据仍保留，不将复测的稳定收益当作所有运行的保证。
+[早期性能记录](docs/PERFORMANCE.md) 保留历史状态说明，不作为本轮优化的基线。
 
 ### 1. 编译项目
 
@@ -97,7 +104,7 @@ myds/
 make
 ```
 
-将在 `bin/` 目录下生成 `myds` 主程序以及 8 个独立的测试程序。
+将在 `bin/` 目录下生成 `myds` 主程序以及独立的测试程序。
 
 ### 2. 运行单元测试套件
 
@@ -105,7 +112,8 @@ make
 make test
 ```
 
-测试流程将自动编译并依次运行 8 个独立的单元测试套件：
+测试流程将自动编译并依次运行单元测试套件，包含下列基础测试以及
+Engram、KV 磁盘存储、前缀恢复、V4.1 GPU 和 HTTP 字节输出回归：
 
 1. **GGUF 模型解析器测试套件 (`bin/test_gguf`)**：
    - [x] GGUF v2/v3 标量、字符串、布尔及动态数组元数据提取
@@ -232,6 +240,45 @@ Options:
   --seed <int>            Random seed (default: random)
   -h, --help              Show this help message
 ```
+
+### V4.1 推理工作区与流式传输
+
+chunk attention 的 KV slab 和 mask 初始只分配窗口路径所需的 10.625 MiB。
+压缩键容量仍覆盖配置的上下文；走 dense slab 且现有工作区不足时才扩容。
+内存前缀快照在首次捕获对应槽位时分配，已分配的槽位继续复用。
+compressed KV 与 index cache 保存已完成 BF16 舍入的上 16 位，读取时还原 F32；
+计算中间量保持原精度与归约顺序。
+
+| 环境变量 | 默认值 | 行为 |
+| --- | --- | --- |
+| `MYDS_ATTN_GATHER_MIN_KEYS` | `0` | scratch 创建时捕获。压缩键数小于阈值时走 slab，达到阈值时在 gather 已启用且提供缓冲的条件下走 gather。合法范围为 `0..chunk_key_max`；非法值会拒绝工作区创建。阈值须按本机与负载测量。 |
+| `MYDS_ATTN_GATHER` | 启用 | 设为 `0` 关闭 gather，阈值不覆盖此开关。 |
+| `MYDS_ATTN_VEC_HEAD_FIRST` | 启用 | gathered prefill 的 vec attention 将 query/head 物理 grid 调换，保留每个 head 的算术与归约。设为 `0` 使用原排列。旧 metallib 缺新 PSO 时自动回退，并在 scratch 中缓存不可用状态。 |
+| `MYDS_PREFILL_ATTN` | `vec` | `matrix` 与 `auto` 是 compressed gather 的实验选项。矩阵归约会产生浮点差异，实测长输入生成 token 可变化；默认关闭。`auto` 的矩阵 PSO/共享内存不可用时回退 vec，显式 `matrix` 则返回失败。 |
+| `MYDS_QKV_FUSE_BF16` | 启用 | decode 的 Q8 QKV 投影把 BF16 舍入合并到 GEMV 写出；设为 `0` 恢复独立舍入 dispatch。trace 使用原路径。 |
+| `MYDS_QKV_FUSE_POST` | 启用 | decode 合并 Q/K RoPE、KV 量化及窗口写入，保留原舍入边界；设为 `0` 恢复原 dispatch。缺融合 PSO、别名或 copy 故障注入时回退原路径。 |
+| `MYDS_QKV_NR0` | `4` | 融合 Q8 GEMV 每组处理四个独立输出行；`2` 使用两个行的配置。归约顺序不变。 |
+| `MYDS_MOE_IQ2_TAIL_CULL` | 启用 | prefill MoE IQ2 up/gate 的尾 tile 跳过没有有效 token 的半 tile。`0` 恢复原 kernel；默认缺新 PSO 时回退原 kernel，显式 `1` 缺 PSO 时初始化失败并清理所有部分状态。 |
+| `MYDS_SSE_DRAIN_TIMEOUT_MS` | `1000` | SSE 完成时的整体排空期限，合法范围 `1..30000` ms；非法值使用默认值。 |
+
+生产 SSE 输出使用每请求独立的 FIFO writer。队列上限为 1 MiB，包含包头和正在发送的包；
+入队不等待客户端 socket 或空闲队列容量。积压超限或断连会取消该请求，socket 在 writer
+退出并 join 后关闭。尾部排空目前仍持有推理槽，等待受上述整体期限限制。
+
+低位 KV 磁盘缓存改为窗口快照加共享 BF16 段：第一段为 `[0,1024)`，后续每段 512 token。
+窗口文件为 `kvlow-v3-<identity>.bin`，段文件为 `kvsegments-v1-<identity>.bin`，
+二者的总文件容量共同计入 `MYDS_KV_DSK_BUDGET_MB`。旧格式文件不再复用，也不会自动删除。
+快照仅在相关段提交后发布；恢复校验位置、前缀哈希、布局和完整 payload 校验和，
+引用的段被覆盖或损坏时返回缓存 miss。相同内容再次保存不重写窗口或共享段，但仍读取
+并校验已有段。此存储改动不改变 `MYDS_KV_DSK_ASYNC` 的默认开关。
+
+针对这些改动的本地门禁为 `make test`。V4.1 GPU 回归分别运行默认 gather、关闭 gather、
+显式阈值三种配置，并覆盖同一 command batch 内的路径切换、工作区扩容和 BF16 缓存对照。
+这些测试不替代真实 GGUF 模型的 logits、吞吐与 TTFT 验收。
+
+`make test` 还包含 QKV 两种行配置的非零逐位对照，以及 attention 的短块、carry、
+F32/BF16 输入、子视图 canary、同一 batch 混用和缺 PSO 回退。独立完整模型计时工具
+可用 `make bin/bench_phase` 构建；它不会由默认测试自动加载模型。
 
 ## 视觉（图片输入）
 

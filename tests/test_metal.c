@@ -963,6 +963,75 @@ static int test_v41_engram_dispatch_copy(void) {
     return 1;
 }
 
+static int check_specialized_reduce(uint32_t width,
+    const myds_metal_constant_t *constants, size_t n_constants) {
+    const int32_t rows = 2;
+    const uint32_t splits = 32;
+    const size_t vector_floats = (size_t)rows * width * splits;
+    myds_metal_buffer_t *partial = myds_metal_buffer_alloc((vector_floats + rows * splits * 2u) * 4u);
+    myds_metal_buffer_t *output = myds_metal_buffer_alloc((size_t)rows * width * 4u);
+    ASSERT_TRUE(partial && output);
+    float *p = myds_metal_buffer_data(partial);
+    for (uint32_t r = 0; r < (uint32_t)rows; ++r) {
+        for (uint32_t j = 0; j < width; ++j) {
+            const float expected = (float)(r + 1u) + (float)(j % 13u) * 0.125f;
+            for (uint32_t w = 0; w < splits; ++w)
+                p[(size_t)r * width * splits + (j / 4u) * splits * 4u + w * 4u + j % 4u] =
+                    expected * (float)(w + 1u);
+        }
+        for (uint32_t w = 0; w < splits; ++w) {
+            p[vector_floats + r * splits * 2u + w * 2u] = (float)(w + 1u);
+            p[vector_floats + r * splits * 2u + w * 2u + 1u] = 0.0f;
+        }
+    }
+    const myds_metal_buffer_t *buffers[] = {partial, output};
+    const uint32_t groups[] = {(uint32_t)rows, 1, 1}, threads[] = {1024, 1, 1};
+    ASSERT_TRUE(myds_metal_dispatch_kernel_constants("kernel_flash_attn_ext_vec_reduce",
+        &rows, sizeof(rows), buffers, 2, groups, threads, 0, constants, n_constants));
+    const float *actual = myds_metal_buffer_data(output);
+    for (uint32_t r = 0; r < (uint32_t)rows; ++r)
+        for (uint32_t j = 0; j < width; ++j)
+            ASSERT_NEAR(actual[(size_t)r * width + j],
+                (float)(r + 1u) + (float)(j % 13u) * 0.125f, 1e-6f);
+    myds_metal_buffer_free(partial);
+    myds_metal_buffer_free(output);
+    return 1;
+}
+
+static int test_specialized_dispatch_cache(void) {
+    for (unsigned round = 0; round < 2; ++round) {
+        /* Alternate values in the same caller-owned tuple, then return to the
+         * first specialization. Outputs depend on its width and stats layout. */
+        myds_metal_constant_t constants[] = {{500, false, 16}, {501, false, 32}};
+        const uint32_t widths[] = {16, 32, 512, 16, 32, 512, 16};
+        for (size_t i = 0; i < sizeof(widths) / sizeof(widths[0]); ++i) {
+            constants[0].value = (int32_t)widths[i];
+            ASSERT_TRUE(check_specialized_reduce(widths[i], constants, 2));
+        }
+        /* Metal's last assignment wins for a repeated index. Preserve tuple
+         * order as well as values; reversing it changes the required layout. */
+        const myds_metal_constant_t ordered[] = {{500, false, 16}, {500, false, 32}, {501, false, 32}};
+        const myds_metal_constant_t reversed[] = {{500, false, 32}, {500, false, 16}, {501, false, 32}};
+        ASSERT_TRUE(check_specialized_reduce(32, ordered, 3));
+        ASSERT_TRUE(check_specialized_reduce(16, reversed, 3));
+        ASSERT_TRUE(check_specialized_reduce(32, ordered, 3));
+        if (round == 0) {
+            /* More combinations than the bounded hot cache holds must still
+             * resolve through its backing store, including a revisited entry. */
+            for (uint32_t width = 4; width <= 264; width += 4) {
+                constants[0].value = (int32_t)width;
+                ASSERT_TRUE(check_specialized_reduce(width, constants, 2));
+            }
+            constants[0].value = 16;
+            ASSERT_TRUE(check_specialized_reduce(16, constants, 2));
+            myds_metal_cleanup();
+            ASSERT_TRUE(myds_metal_init("metal"));
+        }
+    }
+    printf("  [PASS] Specialized PSO warm reuse, alternating tuples, duplicate-index order, cache overflow and cleanup/reinit\n");
+    return 1;
+}
+
 static int test_moe_batch_mm(void) {
     const uint32_t dim = 256;
     const uint32_t expert_dim = 256;
@@ -1248,6 +1317,7 @@ int main(void) {
     RUN_TEST(test_v41_bf16_norm());
     RUN_TEST(test_v41_hc());
     RUN_TEST(test_v41_engram_dispatch_copy());
+    RUN_TEST(test_specialized_dispatch_cache());
     RUN_TEST(test_moe_batch_mm());
     RUN_TEST(test_rmsnorm());
     RUN_TEST(test_swiglu());

@@ -30,8 +30,10 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <fenv.h>
 #include <limits.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -155,22 +157,70 @@ static float bf16(float value) {
     return value;
 }
 
-bool myds_engram_decode_row(const uint8_t raw[MYDS_ENGRAM_ROW_BYTES],
-                           float out[MYDS_ENGRAM_DIM]) {
-    if (!raw || !out) return fail(EINVAL);
+/* Every decoded value depends only on two bytes. Populate these tables once,
+ * then never mutate them; pthread_once publishes them to concurrent readers.
+ * Keep the original ldexpf and BF16 operation order during initialization,
+ * including signed zero, subnormal rounding and both overflow checks. Inference
+ * uses round-to-nearest; other caller rounding modes use the scalar fallback.
+ * Initialization must not leak overflow/underflow flags from unrelated entries. */
+static float decode_values[256][256];
+static unsigned char decode_range_error[256][256];
+static pthread_once_t decode_once = PTHREAD_ONCE_INIT;
+
+static void init_decode_values(void) {
+    const int saved_errno = errno;
+    fenv_t saved_env;
+    const bool restore_env = feholdexcept(&saved_env) == 0;
+    if (restore_env) fesetround(FE_TONEAREST);
+    for (int scale = 0; scale < 256; ++scale) {
+        for (int code = 0; code < 256; ++code) {
+            float value = NAN;
+            errno = 0;
+            if ((code & 127) != 127 && scale != 255) {
+                const int exponent = (code >> 3) & 15, fraction = code & 7;
+                value = exponent ? ldexpf((float)(8 + fraction), exponent - 10) :
+                                   ldexpf((float)fraction, -9);
+                if (code & 128) value = -value;
+                value = ldexpf(value, scale - 127);
+                if (isfinite(value)) value = bf16(value);
+            }
+            decode_values[scale][code] = value;
+            decode_range_error[scale][code] = errno == ERANGE;
+        }
+    }
+    if (restore_env) fesetenv(&saved_env);
+    errno = saved_errno;
+}
+
+static bool decode_row_scalar(const uint8_t *raw, float *out) {
     for (int i = 0; i < MYDS_ENGRAM_DIM; ++i) {
-        uint8_t code = raw[i], scale = raw[MYDS_ENGRAM_DIM + i / 32];
-        if ((code & 127) == 127 || scale == 255) return fail(EDOM);
-        int exponent = (code >> 3) & 15, fraction = code & 7;
+        const unsigned code = raw[i], scale = raw[MYDS_ENGRAM_DIM + i / 32];
+        if ((code & 127u) == 127u || scale == 255u) return fail(EDOM);
+        const int exponent = (code >> 3) & 15, fraction = code & 7;
         float value = exponent ? ldexpf((float)(8 + fraction), exponent - 10) :
                                  ldexpf((float)fraction, -9);
-        if (code & 128) value = -value;
+        if (code & 128u) value = -value;
         value = ldexpf(value, (int)scale - 127);
-        /* Check overflow before rounding: adding the BF16 bias to infinity
-         * must not accidentally turn corrupt table data into a finite value. */
         if (!isfinite(value)) return fail(EDOM);
         value = bf16(value);
         if (!isfinite(value)) return fail(EDOM);
+        out[i] = value;
+    }
+    return true;
+}
+
+bool myds_engram_decode_row(const uint8_t raw[MYDS_ENGRAM_ROW_BYTES],
+                           float out[MYDS_ENGRAM_DIM]) {
+    if (!raw || !out) return fail(EINVAL);
+    if (fegetround() != FE_TONEAREST) return decode_row_scalar(raw, out);
+    const int saved_errno = errno;
+    pthread_once(&decode_once, init_decode_values);
+    errno = saved_errno; /* Building unrelated combinations must not leak errno. */
+    for (int i = 0; i < MYDS_ENGRAM_DIM; ++i) {
+        const uint8_t code = raw[i], scale = raw[MYDS_ENGRAM_DIM + i / 32];
+        const float value = decode_values[scale][code];
+        if (!isfinite(value)) return fail(EDOM);
+        if (decode_range_error[scale][code]) errno = ERANGE;
         out[i] = value;
     }
     return true;

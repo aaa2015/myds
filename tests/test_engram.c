@@ -5,7 +5,9 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <fenv.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -75,6 +77,129 @@ static uint32_t bits(float x) { uint32_t u; memcpy(&u, &x, sizeof(u)); return u;
 static void row(uint8_t *raw, uint8_t value, uint8_t scale) {
     memset(raw, value, 256);
     memset(raw + 256, scale, 8);
+}
+
+/* Independent copy of the pre-LUT scalar contract. This intentionally uses
+ * libm and explicit F32 bit rounding rather than the implementation's table. */
+static bool decode_scalar(const uint8_t *raw, float *out) {
+    if (!raw || !out) { errno = EINVAL; return false; }
+    for (int i = 0; i < MYDS_ENGRAM_DIM; ++i) {
+        const unsigned code = raw[i], scale = raw[MYDS_ENGRAM_DIM + i / 32];
+        if ((code & 127u) == 127u || scale == 255u) { errno = EDOM; return false; }
+        const int exponent = (code >> 3) & 15, fraction = code & 7;
+        float value = exponent ? ldexpf((float)(8 + fraction), exponent - 10) :
+                                 ldexpf((float)fraction, -9);
+        if (code & 128u) value = -value;
+        value = ldexpf(value, (int)scale - 127);
+        if (!isfinite(value)) { errno = EDOM; return false; }
+        uint32_t u = bits(value);
+        u += 0x7fffu + ((u >> 16) & 1u);
+        u &= 0xffff0000u;
+        memcpy(&value, &u, sizeof(value));
+        if (!isfinite(value)) { errno = EDOM; return false; }
+        out[i] = value;
+    }
+    return true;
+}
+
+static void *decode_first_reader(void *arg) {
+    uint8_t raw[MYDS_ENGRAM_ROW_BYTES];
+    float out[MYDS_ENGRAM_DIM];
+    const unsigned id = (unsigned)(uintptr_t)arg;
+    row(raw, id & 1u ? 0xb8 : 0x38, (uint8_t)(127 + id % 3));
+    assert(feclearexcept(FE_ALL_EXCEPT) == 0);
+    assert(feraiseexcept(FE_INVALID) == 0);
+    errno = EBUSY;
+    assert(myds_engram_decode_row(raw, out) && errno == EBUSY);
+    assert(fetestexcept(FE_ALL_EXCEPT) == FE_INVALID);
+    assert(feclearexcept(FE_ALL_EXCEPT) == 0);
+    const float expected = (id & 1u ? -1.0f : 1.0f) * (float)(1u << (id % 3));
+    for (int i = 0; i < MYDS_ENGRAM_DIM; ++i) assert(bits(out[i]) == bits(expected));
+    return NULL;
+}
+
+static void test_decode_table(void) {
+    /* Exercise concurrent first use before any other decode test. */
+    pthread_t readers[8];
+    for (unsigned i = 0; i < 8; ++i)
+        assert(pthread_create(&readers[i], NULL, decode_first_reader, (void *)(uintptr_t)i) == 0);
+    for (unsigned i = 0; i < 8; ++i) assert(pthread_join(readers[i], NULL) == 0);
+    uint8_t raw[MYDS_ENGRAM_ROW_BYTES];
+    float actual[MYDS_ENGRAM_DIM], expected[MYDS_ENGRAM_DIM];
+    for (unsigned scale = 0; scale < 256; ++scale) {
+        for (unsigned code = 0; code < 256; ++code) {
+            row(raw, (uint8_t)code, (uint8_t)scale);
+            memset(actual, 0x5a, sizeof(actual));
+            memset(expected, 0x5a, sizeof(expected));
+            errno = EBUSY;
+            const bool oracle_ok = decode_scalar(raw, expected);
+            const int oracle_errno = errno;
+            errno = EBUSY;
+            assert(myds_engram_decode_row(raw, actual) == oracle_ok);
+            assert(errno == oracle_errno);
+            assert(memcmp(actual, expected, sizeof(actual)) == 0);
+        }
+    }
+    /* Mixed rows ensure each scale is selected by its own 32-value block.
+     * Also match partial output and EDOM when corruption appears late. */
+    for (unsigned trial = 0; trial < 512; ++trial) {
+        for (unsigned block = 0; block < 8; ++block) {
+            raw[256 + block] = (uint8_t)((trial * 17u + block * 31u) % 255u);
+            for (unsigned j = 0; j < 32; ++j) {
+                unsigned code = (trial * 13u + block * 29u + j * 7u) & 255u;
+                uint8_t one[MYDS_ENGRAM_ROW_BYTES];
+                row(one, (uint8_t)code, raw[256 + block]);
+                if (!decode_scalar(one, expected)) code = j & 1u ? 128u : 0u;
+                raw[block * 32 + j] = (uint8_t)code;
+            }
+        }
+        errno = EBUSY;
+        assert(decode_scalar(raw, expected));
+        const int oracle_errno = errno;
+        errno = EBUSY;
+        assert(myds_engram_decode_row(raw, actual) && errno == oracle_errno);
+        assert(memcmp(actual, expected, sizeof(actual)) == 0);
+        raw[255] = 127;
+        memset(actual, 0x5a, sizeof(actual)); memset(expected, 0x5a, sizeof(expected));
+        assert(!decode_scalar(raw, expected));
+        assert(!myds_engram_decode_row(raw, actual) && errno == EDOM);
+        assert(memcmp(actual, expected, sizeof(actual)) == 0);
+    }
+    assert(!myds_engram_decode_row(NULL, actual) && errno == EINVAL);
+    assert(!myds_engram_decode_row(raw, NULL) && errno == EINVAL);
+    puts("Engram: concurrent LUT initialization, all 65536 code/scale pairs, mixed rows and errno parity passed");
+}
+
+static void test_decode_rounding_modes(void) {
+    fenv_t saved_env;
+    assert(fegetenv(&saved_env) == 0);
+    static const int modes[] = {FE_DOWNWARD, FE_UPWARD};
+    static const struct { uint8_t code, scale; } cases[] = {
+        {0x01,0}, {0x04,0}, {0x05,0}, {0x84,0}, {0x85,0},
+        {0x38,127}, {0x7e,254}, {0xfe,254}, {0x7f,127}, {0x38,255},
+    };
+    uint8_t raw[MYDS_ENGRAM_ROW_BYTES];
+    float actual[MYDS_ENGRAM_DIM], expected[MYDS_ENGRAM_DIM];
+    for (size_t m = 0; m < sizeof(modes) / sizeof(modes[0]); ++m) {
+        assert(fesetround(modes[m]) == 0);
+        for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); ++c) {
+            row(raw, cases[c].code, cases[c].scale);
+            memset(expected, 0x5a, sizeof(expected)); memset(actual, 0x5a, sizeof(actual));
+            assert(feclearexcept(FE_ALL_EXCEPT) == 0);
+            assert(feraiseexcept(FE_INVALID) == 0);
+            errno = EBUSY;
+            const bool oracle_ok = decode_scalar(raw, expected);
+            const int oracle_errno = errno, oracle_flags = fetestexcept(FE_ALL_EXCEPT);
+            assert(feclearexcept(FE_ALL_EXCEPT) == 0);
+            assert(feraiseexcept(FE_INVALID) == 0);
+            errno = EBUSY;
+            assert(myds_engram_decode_row(raw, actual) == oracle_ok);
+            assert(errno == oracle_errno && fetestexcept(FE_ALL_EXCEPT) == oracle_flags);
+            assert(fegetround() == modes[m] && memcmp(actual, expected, sizeof(actual)) == 0);
+        }
+    }
+    assert(fesetenv(&saved_env) == 0);
+    puts("Engram: downward/upward scalar fallback preserves values, errors and caller floating-point environment");
 }
 
 static void test_decode(void) {
@@ -290,7 +415,7 @@ static void test_unmap(void) {
 }
 
 int main(void) {
-    test_hash(); test_decode(); test_disk(); test_gate(); test_model(); test_unmap();
+    test_decode_table(); test_decode_rounding_modes(); test_hash(); test_decode(); test_disk(); test_gate(); test_model(); test_unmap();
     puts("Engram: all tests passed");
     return 0;
 }

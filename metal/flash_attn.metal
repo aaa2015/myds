@@ -315,7 +315,8 @@ template<
     short DV,
     short Q,
     short C,
-    short NSG>
+    short NSG,
+    bool HEAD_BATCH = false>
 void kernel_flash_attn_ext_impl(
         constant ds4_metal_args_flash_attn_ext & args,
         device const char * q,
@@ -826,7 +827,7 @@ void kernel_flash_attn_ext_impl(
                 const short j = jj*NSG + sgitg;
 
                 const float m = M[jj];
-                const float s = tiisg == 0 ? ((device const float *) sinks)[iq2] : -FLT_MAX/2;
+                const float s = tiisg == 0 ? ((device const float *) sinks)[HEAD_BATCH ? iq1 + j : iq2] : -FLT_MAX/2;
 
                 M[jj] = simd_max(max(M[jj], s));
 
@@ -848,7 +849,9 @@ void kernel_flash_attn_ext_impl(
             break;
         }
 
-        device float4 * dst4 = (device float4 *) dst + ((uint64_t)iq3*args.ne2*args.ne1 + iq2 + (uint64_t)(iq1 + j)*args.ne1)*DV4;
+        const uint64_t rid = HEAD_BATCH ? (uint64_t)iq2*args.ne1 + iq1 + j :
+            (uint64_t)iq3*args.ne2*args.ne1 + iq2 + (uint64_t)(iq1 + j)*args.ne1;
+        device float4 * dst4 = (device float4 *) dst + rid*DV4;
 
         const float scale = S[jj] == 0.0 ? 0.0f : 1.0f/S[jj];
 
@@ -899,7 +902,8 @@ template<
     short DK,
     short DV,
     short Q  = OP_FLASH_ATTN_EXT_NQPSG,
-    short C  = OP_FLASH_ATTN_EXT_NCPSG>
+    short C  = OP_FLASH_ATTN_EXT_NCPSG,
+    bool HEAD_BATCH = false>
 kernel void kernel_flash_attn_ext(
         constant ds4_metal_args_flash_attn_ext & args,
         device const char * q,
@@ -917,8 +921,8 @@ kernel void kernel_flash_attn_ext(
 #define FWD_TMPL q_t, q4_t, q8x8_t, k_t, k4x4_t, k8x8_t, v_t, v4x4_t, v8x8_t, qk_t, qk8x8_t, s_t, s2_t, s8x8_t, o_t, o4_t, o8x8_t, kd4x4_t, nl_k, deq_k, vd4x4_t, nl_v, deq_v, DK, DV, Q, C
 #define FWD_ARGS args, q, k, v, mask, sinks, pad, blk, dst, shmem_f16, tgpig, tiisg, sgitg
     switch (FC_flash_attn_ext_nsg) {
-        case 4: kernel_flash_attn_ext_impl<FWD_TMPL, 4>(FWD_ARGS); break;
-        case 8: kernel_flash_attn_ext_impl<FWD_TMPL, 8>(FWD_ARGS); break;
+        case 4: kernel_flash_attn_ext_impl<FWD_TMPL, 4, HEAD_BATCH>(FWD_ARGS); break;
+        case 8: kernel_flash_attn_ext_impl<FWD_TMPL, 8, HEAD_BATCH>(FWD_ARGS); break;
     }
 #undef FWD_TMPL
 #undef FWD_ARGS
@@ -938,6 +942,11 @@ typedef decltype(kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f
 // Host-visible prefill FlashAttention variant for DS4's 512-wide F16 K/V rows.
 template [[host_name("kernel_flash_attn_ext_f16_dk512_dv512")]]
 kernel flash_attn_ext_dk512_t kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 512, 512>;
+
+// Prefill experiment: an eight-head tile shares one query row's gathered KV.
+// Its output and sink indices remain in the caller's [query, head, dim] order.
+template [[host_name("kernel_myds_flash_attn_heads_f16_dk512_dv512")]]
+kernel flash_attn_ext_dk512_t kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 512, 512, 8, 64, true>;
 
 // Host-visible prefill FlashAttention variant for GLM's 256-wide F16 K/V rows.
 template [[host_name("kernel_flash_attn_ext_f16_dk256_dv256")]]
@@ -977,7 +986,8 @@ template<
     short DV,
     short NE = 4,
     short Q  = OP_FLASH_ATTN_EXT_VEC_NQPSG,
-    short C  = OP_FLASH_ATTN_EXT_VEC_NCPSG>
+    short C  = OP_FLASH_ATTN_EXT_VEC_NCPSG,
+    bool HEAD_FIRST = false>
 kernel void kernel_flash_attn_ext_vec(
         constant ds4_metal_args_flash_attn_ext_vec & args,
         device const char * q,
@@ -1002,8 +1012,8 @@ kernel void kernel_flash_attn_ext_vec(
     const short iwg = tgpig[2]%NWG;
 
     const ushort iq3 = tgpig[2]/NWG;
-    const ushort iq2 = tgpig[1];
-    const ushort iq1 = tgpig[0];
+    const ushort iq2 = HEAD_FIRST ? tgpig[0] : tgpig[1];
+    const ushort iq1 = HEAD_FIRST ? tgpig[1] : tgpig[0];
 
     constexpr short DK4 = DK/4;
     constexpr short DV4 = DV/4;
@@ -1386,6 +1396,7 @@ kernel void kernel_flash_attn_ext_vec(
 #undef NS20
 }
 
+
 #define FA_TYPES \
            half4,  \
            half4,  \
@@ -1406,6 +1417,11 @@ typedef decltype(kernel_flash_attn_ext_vec<FA_TYPES, half4, 1, dequantize_f16_t4
 
 // Host-visible decode FlashAttention variant for DS4's 512-wide F16 K/V rows.
 template [[host_name("kernel_flash_attn_ext_vec_f16_dk512_dv512")]]  kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES,     half4,  1, dequantize_f16_t4, half4,  1, dequantize_f16_t4, 512, 512, 1>;
+
+
+// The same per-head arithmetic, with adjacent threadgroups visiting adjacent heads.
+template [[host_name("kernel_myds_flash_attn_vec_head_first_f16_dk512_dv512")]]
+kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4, 512, 512, 1, 1, 32, true>;
 
 #undef FA_TYPES
 #undef FA_TYPES_F32

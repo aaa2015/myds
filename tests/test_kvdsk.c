@@ -102,6 +102,67 @@ static void test_empty_slot_is_a_clean_miss(void) {
     myds_kvdsk_close(k);
 }
 
+static void test_peek_preserves_read_transaction_and_hits(void) {
+    fresh_path("peek", 0);
+    myds_kvdsk_t *k = myds_kvdsk_open(g_path, 0xA61u, SLOTS, STRIDE, 0);
+    CHECK(k != NULL, "open peek fixture");
+    if (!k) return;
+    unsigned char data[800], out[800], range[32];
+    fill(data, sizeof(data), 31u);
+    CHECK(!myds_kvdsk_peek_committed(k, 0u, 0u, range, sizeof(range)), "empty slot cannot peek");
+    CHECK(myds_kvdsk_write_start(k, 0u), "peek fixture write start");
+    CHECK(myds_kvdsk_write_chunk(k, 0u, data, sizeof(data)), "peek fixture payload");
+    CHECK(!myds_kvdsk_peek_committed(k, 0u, 0u, range, sizeof(range)), "uncommitted write cannot peek");
+    CHECK(myds_kvdsk_write_finish(k, 0u, 1024u, 0x2345u, sizeof(data)), "peek fixture commit");
+    CHECK(myds_kvdsk_peek_committed(k, 0u, 123u, range, sizeof(range)), "committed range peek");
+    CHECK(memcmp(range, data + 123u, sizeof(range)) == 0, "peek returns exact range");
+    uint32_t hits = 99;
+    CHECK(myds_kvdsk_slot_hits(k, 0u, &hits) && hits == 0u, "peek does not count as a restore hit");
+    CHECK(!myds_kvdsk_peek_committed(k, 0u, sizeof(data) - 1u, range, sizeof(range)), "peek bound exceeds payload");
+    CHECK(!myds_kvdsk_peek_committed(k, 0u, UINT64_MAX, range, 1u), "peek offset overflow rejected");
+    CHECK(!myds_kvdsk_peek_committed(k, 0u, 1u, range, UINT64_MAX), "peek size overflow rejected");
+    CHECK(!myds_kvdsk_peek_committed(k, SLOTS, 0u, range, 1u), "peek invalid slot rejected");
+    CHECK(!myds_kvdsk_peek_committed(k, 0u, 0u, NULL, 1u), "peek null output rejected");
+    CHECK(myds_kvdsk_peek_committed(k, 0u, sizeof(data), NULL, 0u), "empty range at payload end permitted");
+    uint64_t used = 0;
+    CHECK(myds_kvdsk_read_start(k, 0u, &used), "start save-time validation");
+    CHECK(myds_kvdsk_read_chunk(k, 0u, out, sizeof(out)), "validate full payload");
+    CHECK(myds_kvdsk_read_verify(k), "save-time checksum validation");
+    CHECK(myds_kvdsk_slot_hits(k, 0u, &hits) && hits == 0u, "validation does not count as a restore hit");
+    CHECK(myds_kvdsk_read_start(k, 0u, &used), "start full checksum read");
+    CHECK(myds_kvdsk_read_chunk(k, 0u, out, 400u), "read first half");
+    CHECK(myds_kvdsk_peek_committed(k, 0u, 123u, range, sizeof(range)), "peek during checksum read");
+    CHECK(myds_kvdsk_read_chunk(k, 400u, out + 400u, 400u), "read second half");
+    CHECK(myds_kvdsk_read_finish(k), "peek did not perturb transaction checksum");
+    CHECK(memcmp(out, data, sizeof(data)) == 0, "full read exact after peek");
+    CHECK(myds_kvdsk_slot_hits(k, 0u, &hits) && hits == 1u, "only full read counts one hit");
+    myds_kvdsk_close(k);
+}
+
+static void test_aborted_write_recovers_without_reopen(void) {
+    fresh_path("abort_recover", 0);
+    myds_kvdsk_t *k = myds_kvdsk_open(g_path, 0xA60u, SLOTS, STRIDE, 0);
+    CHECK(k != NULL, "open aborted write fixture");
+    if (!k) return;
+    unsigned char data[800], out[800];
+    fill(data, sizeof(data), 29u);
+    CHECK(myds_kvdsk_write_start(k, 1u), "start caller-aborted write");
+    CHECK(myds_kvdsk_write_chunk(k, 0, data, 80u), "partial payload before caller failure");
+    myds_kvdsk_write_abort(k);
+    uint64_t used = 0;
+    CHECK(!myds_kvdsk_read_start(k, 1u, &used), "aborted payload must remain a clean miss");
+    CHECK(myds_kvdsk_write_start(k, 1u), "next transaction must work in the same store");
+    CHECK(myds_kvdsk_write_chunk(k, 0, data, sizeof(data)), "replacement complete payload");
+    CHECK(myds_kvdsk_write_finish(k, 1u, 1024u, 0x1234u, sizeof(data)), "replacement commit");
+    CHECK(myds_kvdsk_read_start(k, 1u, &used) && used == sizeof(data), "replacement readable");
+    CHECK(myds_kvdsk_read_chunk(k, 0, out, sizeof(out)), "replacement read");
+    CHECK(myds_kvdsk_read_finish(k), "replacement checksum");
+    CHECK(memcmp(data, out, sizeof(data)) == 0, "replacement exact bytes");
+    myds_kvdsk_write_abort(k); /* No active write must not disturb a committed entry. */
+    CHECK(myds_kvdsk_slot_meta(k, 1u, NULL, NULL, NULL), "no-op abort preserves commit");
+    myds_kvdsk_close(k);
+}
+
 /* 崩溃安全：write_start 之后中途放弃（模拟掉电）⇒ 该槽必须是「空」，不是「半份数据」。 */
 static void test_abandoned_write_leaves_slot_empty(void) {
     fresh_path("torn", 0);
@@ -339,6 +400,8 @@ int main(void) {
     test_identity_discriminates();
     test_roundtrip();
     test_empty_slot_is_a_clean_miss();
+    test_peek_preserves_read_transaction_and_hits();
+    test_aborted_write_recovers_without_reopen();
     test_abandoned_write_leaves_slot_empty();
     test_corrupt_payload_is_rejected_and_invalidated();
     test_identity_change_invalidates_file();
@@ -351,7 +414,7 @@ int main(void) {
     test_policy_handles_no_way();
     test_policy_holds_32_prefixes();
     test_storage_handles_a_32_way_table();
-    if (failures == 0) { printf("  ✓ 15 组断言全部通过\n"); return 0; }
+    if (failures == 0) { printf("  ✓ 存储事务与淘汰策略全部通过\n"); return 0; }
     printf("  ✗ %d 处断言失败\n", failures);
     return 1;
 }

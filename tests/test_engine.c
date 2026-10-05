@@ -1,13 +1,16 @@
+#define _POSIX_C_SOURCE 200809L
 #include "myds.h"
 #include "myds_gguf.h"
 #include "myds_internal.h"
 #include "myds_snapshot_slots.h"
+#include "myds_log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <assert.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
 static void write_u32(FILE *f, uint32_t v) { fwrite(&v, sizeof(v), 1, f); }
 static void write_u64(FILE *f, uint64_t v) { fwrite(&v, sizeof(v), 1, f); }
@@ -241,6 +244,117 @@ static void assert_prefill_matches_sequential(myds_context_t *batched, myds_cont
             assert(fabsf(batched->k_cache[l][i] - reference->k_cache[l][i]) < 1e-5f);
         }
     }
+}
+
+typedef struct { char divergence[4096]; } prefix_log_capture_t;
+
+static void capture_prefix_log(myds_log_level_t level, const char *message, void *opaque) {
+    (void)level;
+    prefix_log_capture_t *capture = opaque;
+    if (strstr(message, "prefix cache divergence"))
+        snprintf(capture->divergence, sizeof(capture->divergence), "%s", message);
+}
+
+static uint32_t prefix_prompt_tokens(myds_model_t *model, const char *prompt, int32_t *tokens) {
+    const int32_t n = myds_tokenizer_encode(model->tokenizer, prompt, tokens, 1024, true);
+    assert(n > 1 && n < 1024);
+    return (uint32_t)n;
+}
+
+static void assert_prefix_generate(myds_context_t *ctx, const char *prompt, uint32_t cached) {
+    int32_t tokens[1024];
+    const uint32_t n = prefix_prompt_tokens(ctx->model, prompt, tokens);
+    myds_stop_reason_t reason = MYDS_STOP_ERROR;
+    uint32_t prompt_count = 0;
+    assert(myds_generate_bytes_ex(ctx, prompt, NULL, NULL, &reason, &prompt_count, NULL));
+    assert(reason == MYDS_STOP_LENGTH || reason == MYDS_STOP_EOS);
+    myds_prefill_stats_t stats;
+    myds_last_prefill_stats(ctx, &stats);
+    assert(prompt_count == n && stats.prompt_tokens == n && stats.cached_tokens == cached);
+    assert(cached <= n - 1u && stats.prefill_tokens == n - 1u - cached);
+    assert(ctx->pos == n && ctx->pcache_len == n);
+    assert(memcmp(ctx->pcache_tokens, tokens, n * sizeof(*tokens)) == 0);
+    /* A legitimate success path must also match a fresh full-prefill context. */
+    myds_context_t *cold = myds_context_create(ctx->model, &ctx->cfg);
+    assert(cold);
+    assert(myds_generate_bytes_ex(cold, prompt, NULL, NULL, &reason, NULL, NULL));
+    const float *a = myds_metal_buffer_data(ctx->logits), *b = myds_metal_buffer_data(cold->logits);
+    for (uint32_t i = 0; i < ctx->model->vocab_size; ++i)
+        assert(isfinite(a[i]) && isfinite(b[i]) && fabsf(a[i] - b[i]) < 1e-5f);
+    myds_context_free(cold);
+}
+
+static void test_prefix_generate_boundaries(void) {
+    assert(setenv("MYDS_PREFIX_CACHE", "1", 1) == 0);
+    assert(unsetenv("MYDS_NO_PREFIX_SNAPSHOT") == 0);
+    assert(myds_metal_init("metal"));
+    myds_model_t *model = test_prefill_model();
+    strcpy(model->arch, "deepseek4");
+    myds_config_t cfg = {.max_seq_len = 1024, .max_new_tokens = 1, .temperature = 0,
+                         .top_p = 1, .seed = 42};
+    myds_context_t *ctx = myds_context_create(model, &cfg);
+    assert(ctx);
+    int32_t tokens[1024];
+    const uint32_t short_n = prefix_prompt_tokens(model, "abc", tokens);
+
+    /* Exercise real snapshot selection/restore through generate, then cancel
+     * before token execution. This small snapshot fixture intentionally has
+     * no V4.1 model weights. The success cases below run the real tiny model. */
+    ctx->v41 = myds_v41_context_create_snapshot_fixture();
+    assert(ctx->v41 && myds_v41_snapshot_get_snap_window(ctx->v41, 0));
+    assert(myds_v41_snapshot_get_snap_window(ctx->v41, 1));
+    ctx->pcache_tokens = malloc(1024 * sizeof(*ctx->pcache_tokens));
+    assert(ctx->pcache_tokens); ctx->pcache_cap = 1024;
+    for (unsigned variant = 0; variant < 4; ++variant) {
+        memcpy(ctx->pcache_tokens, tokens, short_n * sizeof(*tokens));
+        ctx->pcache_len = variant == 0 ? short_n : short_n + 4u;
+        for (uint32_t i = short_n; i < ctx->pcache_len; ++i)
+            ctx->pcache_tokens[i] = variant == 2 ? INT32_MAX : tokens[i % short_n];
+        myds_v41_snapshot_fixture_publish(ctx->v41, 0, short_n);
+        myds_v41_snapshot_fixture_publish(ctx->v41, 1, variant == 3 ? 0 : short_n - 1u);
+        volatile int cancel = 1;
+        myds_stop_reason_t reason = MYDS_STOP_ERROR;
+        assert(myds_generate_bytes_ex(ctx, "abc", NULL, NULL, &reason, NULL, &cancel));
+        assert(reason == MYDS_STOP_CANCELLED);
+        myds_prefill_stats_t stats; myds_last_prefill_stats(ctx, &stats);
+        const uint32_t wanted = variant == 3 ? 0 : short_n - 1u;
+        assert(stats.cached_tokens == wanted && stats.prefill_tokens == short_n - 1u - wanted);
+        assert(stats.prompt_tokens == short_n && stats.cached_tokens < short_n);
+    }
+    myds_v41_context_free(ctx->v41); ctx->v41 = NULL;
+    ctx->pcache_len = 0;
+    prefix_log_capture_t capture = {0};
+    myds_log_set_level(MYDS_LOG_INFO);
+    myds_log_set_callback(capture_prefix_log, &capture);
+    assert_prefix_generate(ctx, "abcdefghij", 0);
+    assert_prefix_generate(ctx, "abc", 0); /* Strictly shorter prefix. */
+    char end_marker[64]; snprintf(end_marker, sizeof(end_marker), "p[%u]=<end>", short_n);
+    assert(strstr(capture.divergence, end_marker));
+    assert_prefix_generate(ctx, "abc", 0); /* Equal-length prompt. */
+    assert_prefix_generate(ctx, "abcde", short_n); /* Legitimate continuation. */
+    for (unsigned poison = 0; poison < 2; ++poison) {
+        assert_prefix_generate(ctx, "abcdefghij", ctx->pcache_len);
+        for (uint32_t i = short_n; i < ctx->pcache_len; ++i)
+            ctx->pcache_tokens[i] = poison ? INT32_MAX : ctx->pcache_tokens[i % short_n];
+        memset(&capture, 0, sizeof(capture));
+        assert_prefix_generate(ctx, "abc", 0);
+        assert(strstr(capture.divergence, end_marker));
+    }
+    /* Long diagnostic token text must truncate inside the fixed why buffer,
+     * including its final token/end-marker append calls. */
+    assert_prefix_generate(ctx, "abcdefghij", ctx->pcache_len);
+    char *saved_decoded = model->tokenizer->vocab[(unsigned char)'a'].decoded;
+    char *long_decoded = malloc(1401); assert(long_decoded);
+    memset(long_decoded, '\n', 1400); long_decoded[1400] = 0;
+    model->tokenizer->vocab[(unsigned char)'a'].decoded = long_decoded;
+    memset(&capture, 0, sizeof(capture));
+    assert_prefix_generate(ctx, "abc", 0);
+    assert(strstr(capture.divergence, "prefix cache divergence at") && strlen(capture.divergence) < 700);
+    model->tokenizer->vocab[(unsigned char)'a'].decoded = saved_decoded;
+    free(long_decoded);
+    myds_log_set_callback(NULL, NULL);
+    myds_context_free(ctx); myds_model_free(model); myds_metal_cleanup();
+    puts("  [PASS] Production generate prefix bounds: short/equal/snapshot-end, matching/poisoned tails and successful continuation with cold-logit parity");
 }
 
 static void test_prefill_workspace_reuse(const char *arch) {
@@ -573,7 +687,20 @@ static void test_snapshot_slots_keep_the_constant_prefix(void) {
            (unsigned)MYDS_SNAP_SLOTS, (unsigned)MYDS_SNAP_PINNED, (unsigned)deepest_pinned);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "--prefix-cache") == 0) {
+        test_prefix_generate_boundaries();
+        return 0;
+    }
+    /* Prefix enablement is cached process-wide by production generate. Run
+     * its enabled-path regression in a fresh process before other GPU work. */
+    assert(argc == 1);
+    const pid_t child = fork();
+    assert(child >= 0);
+    if (!child) { execl(argv[0], argv[0], "--prefix-cache", (char *)NULL); _exit(127); }
+    int child_status;
+    assert(waitpid(child, &child_status, 0) == child);
+    assert(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
     printf("====================================================\n");
     printf("       Running myds Engine Sampling Unit Tests      \n");
     printf("====================================================\n");

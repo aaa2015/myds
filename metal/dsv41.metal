@@ -59,6 +59,45 @@ kernel void kernel_dsv41_rope(
     x[i + 1u] = dsv41_bf16(re * s + im * c);
 }
 
+/* Decode-only fused finish. Each Q head retains the original 32-pair RoPE
+ * mapping. The other 16 groups process one 32-value KV quantization block.
+ * KV tail pairs are read BEFORE any writes; paired elements always share a
+ * SIMD group, so no cross-group read/write dependency is introduced. */
+struct dsv41_qkv_finish_args { uint pos, pad; float frequencies[32]; };
+kernel void kernel_dsv41_qkv_finish(
+        constant dsv41_qkv_finish_args &args,
+        device float *q, device float *kv, device float *window,
+        uint group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    if(group<64u) {
+        const float theta=float(args.pos)*args.frequencies[lane];
+        const float c=precise::cos(theta),s=precise::sin(theta);
+        const uint i=group*512u+448u+2u*lane;
+        const float re=q[i],im=q[i+1u];
+        q[i]=dsv41_bf16(re*c-im*s);
+        q[i+1u]=dsv41_bf16(re*s+im*c);
+        return;
+    }
+    const uint column=(group-64u)*32u+lane;
+    float value=kv[column];
+    if(column>=448u) {
+        const uint pair=(column-448u)/2u;
+        const uint i=448u+pair*2u;
+        const float theta=float(args.pos)*args.frequencies[pair];
+        const float c=precise::cos(theta),s=precise::sin(theta);
+        const float re=kv[i],im=kv[i+1u];
+        value=dsv41_bf16((column&1u)?re*s+im*c:re*c-im*s);
+    }
+    /* Match rope's BF16 store, quant's BF16 input, E4M3 with power-of-two
+     * scale, then quant's final BF16 store. Non-tail values only enter quant. */
+    value=dsv41_bf16(value);
+    const float amax=simd_max(abs(value));
+    const float scale=dsv41_pow2_ceil(max(amax,1.0e-4f)*(1.0f/448.0f));
+    const float result=dsv41_bf16(copysign(dsv4_e4m3fn_dequant(abs(value)/scale),value)*scale);
+    kv[column]=result;
+    window[(args.pos%128u)*512u+column]=result;
+}
+
 kernel void kernel_dsv41_quantize(
         constant ds4_metal_args_dsv41_quantize &args,
         device float *x,
@@ -81,6 +120,34 @@ kernel void kernel_dsv41_quantize(
         result = copysign(dsv4_e2m1fn_dequant(abs(value) / scale), value) * scale;
     }
     if (valid) x[index] = dsv41_bf16(result);
+}
+
+struct dsv41_pack_bf16_args {
+    ulong dst_offset, src_offset;
+    uint count, pad;
+};
+kernel void kernel_dsv41_pack_bf16(
+        constant dsv41_pack_bf16_args &args,
+        device const float *src, device ushort *dst,
+        uint gid [[thread_position_in_grid]]) {
+    if(gid<args.count)
+        dst[args.dst_offset+gid]=ushort(as_type<uint>(src[args.src_offset+gid])>>16u);
+}
+kernel void kernel_dsv41_stage_bf16_f16(
+        constant uint &count,
+        device const ushort *src, device half *dst,
+        uint gid [[thread_position_in_grid]]) {
+    if(gid<count)dst[gid]=half(as_type<float>(uint(src[gid])<<16u));
+}
+kernel void kernel_dsv41_get_rows_bf16(
+        constant uint2 &args,
+        device const ushort *src, device const int *ids, device float *dst,
+        uint2 gid [[thread_position_in_grid]]) {
+    if(gid.x>=512u||gid.y>=args.y)return;
+    const int row=ids[gid.y];
+    const float value=row>=0&&uint(row)<args.x?
+        as_type<float>(uint(src[(ulong)row*512u+gid.x])<<16u):0.0f;
+    dst[(ulong)gid.y*512u+gid.x]=value;
 }
 
 struct ds4_metal_args_dsv41_engram {

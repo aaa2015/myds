@@ -11,6 +11,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <stdatomic.h>
 
 /* Exercise the production byte encoder and socket callbacks directly. */
 static const char binary_text[] = {
@@ -138,7 +140,10 @@ static void test_stream_and_non_stream_bytes(void) {
     }
     memcpy(expected + offset, "�", 4); /* Replacement plus trailing NUL. */
 
-    for (unsigned variant = 0; variant < 2; variant++) {
+    char *wire_reference[2] = {NULL, NULL};
+    size_t wire_reference_length[2] = {0, 0};
+    for (unsigned variant = 0; variant < 4; variant++) {
+        const bool responses = variant % 2 != 0;
         int sockets[2];
         assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
         int send_size = 1024;
@@ -146,7 +151,8 @@ static void test_stream_and_non_stream_bytes(void) {
         socket_capture_t capture = {.fd = sockets[1]};
         pthread_t reader;
         assert(pthread_create(&reader, NULL, capture_socket, &capture) == 0);
-        myds_sse_stream_ctx_t stream = {.client_fd = sockets[0], .responses_api = variant != 0};
+        myds_sse_stream_ctx_t stream = {.client_fd = sockets[0], .responses_api = responses};
+        if (variant >= 2) assert(myds_server_sse_writer_start(&stream, 1024u * 1024u, 1000));
         for (size_t i = 0; i < sizeof(binary_text); i++) {
             myds_server_sse_callback(binary_text + i, 1, (int32_t)i, &stream);
         }
@@ -156,6 +162,7 @@ static void test_stream_and_non_stream_bytes(void) {
         assert(!stream.cancel_flag && !stream.failed && stream.utf8.pending_length == 0);
         assert(stream.token_count == sizeof(binary_text) + 2);
         assert(stream.t_first > 0 && stream.t_last >= stream.t_first);
+        assert(myds_server_sse_writer_join(&stream, false));
         assert(shutdown(sockets[0], SHUT_WR) == 0);
         assert(pthread_join(reader, NULL) == 0);
         /* Validate the wire including JSON punctuation between events. A
@@ -163,15 +170,24 @@ static void test_stream_and_non_stream_bytes(void) {
          * the extracted content happened to recover the original bytes. */
         assert_valid_utf8(capture.bytes, capture.length);
         size_t collected_length = 0;
-        char *collected = collect_sse_escaped_text(capture.bytes, variant != 0, &collected_length);
+        char *collected = collect_sse_escaped_text(capture.bytes, responses, &collected_length);
         assert(collected_length == expected_length);
         assert(memcmp(collected, expected, expected_length + 1) == 0);
-        assert(strstr(capture.bytes, variant ? "event: response.output_text.delta" : "chat.completion.chunk"));
+        assert(strstr(capture.bytes, responses ? "event: response.output_text.delta" : "chat.completion.chunk"));
         free(collected);
-        free(capture.bytes);
+        if (variant < 2) {
+            wire_reference[variant] = capture.bytes;
+            wire_reference_length[variant] = capture.length;
+        } else {
+            assert(capture.length == wire_reference_length[variant % 2]);
+            assert(memcmp(capture.bytes, wire_reference[variant % 2], capture.length) == 0);
+            free(capture.bytes);
+        }
+        free(stream.acc);
         close(sockets[0]);
         close(sockets[1]);
     }
+    free(wire_reference[0]); free(wire_reference[1]);
 
     myds_non_stream_ctx_t nonstream = {.client_fd = -1};
     for (size_t i = 0; i < sizeof(binary_text); i++) {
@@ -212,6 +228,143 @@ static void test_stream_and_non_stream_bytes(void) {
     free(expected);
     free(controls);
     printf("  [PASS] Production SSE/Responses callbacks and collection: split UTF-8, NUL, invalid/truncated UTF-8, long controls, socket short writes and allocation overflow\n");
+}
+
+static double test_now_s(void) {
+    struct timespec ts;
+    assert(clock_gettime(CLOCK_MONOTONIC, &ts) == 0);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+typedef struct { int fd; atomic_bool stop; } trickle_reader_t;
+
+static void *read_socket_slowly(void *opaque) {
+    trickle_reader_t *reader = opaque;
+    char bytes[128];
+    while (!atomic_load(&reader->stop)) {
+        const ssize_t n = recv(reader->fd, bytes, sizeof(bytes), 0);
+        if (n <= 0) break;
+        const struct timespec delay = {.tv_nsec = 5000000};
+        nanosleep(&delay, NULL);
+    }
+    return NULL;
+}
+
+static void test_sse_writer_transport(void) {
+    const char *old_timeout = getenv("MYDS_SSE_DRAIN_TIMEOUT_MS");
+    char *saved_timeout = old_timeout ? strdup(old_timeout) : NULL;
+    assert(setenv("MYDS_SSE_DRAIN_TIMEOUT_MS", "25", 1) == 0);
+    assert(myds_server_sse_drain_timeout_ms() == 25);
+    assert(setenv("MYDS_SSE_DRAIN_TIMEOUT_MS", "30001", 1) == 0);
+    assert(myds_server_sse_drain_timeout_ms() == 1000);
+    assert(setenv("MYDS_SSE_DRAIN_TIMEOUT_MS", "bad", 1) == 0);
+    assert(myds_server_sse_drain_timeout_ms() == 1000);
+    if (saved_timeout) { assert(setenv("MYDS_SSE_DRAIN_TIMEOUT_MS", saved_timeout, 1) == 0); free(saved_timeout); }
+    else assert(unsetenv("MYDS_SSE_DRAIN_TIMEOUT_MS") == 0);
+    /* Header, deltas, usage and terminal event use one FIFO and owned copies. */
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    socket_capture_t capture = {.fd = sockets[1]};
+    pthread_t reader;
+    assert(pthread_create(&reader, NULL, capture_socket, &capture) == 0);
+    myds_sse_stream_ctx_t stream = {.client_fd = sockets[0]};
+    int original_flags = fcntl(sockets[0], F_GETFL);
+    assert(myds_server_sse_writer_start(&stream, 65536, 1000));
+    assert(fcntl(sockets[0], F_GETFL) & O_NONBLOCK);
+    assert(!myds_server_sse_writer_start(&stream, 65536, 1000) && errno == EINVAL);
+    const char *events[] = {"HTTP/1.1 200 OK\r\n\r\n", "data: first\n\n", "data: second\n\n",
+                            "data: finish\n\n", "data: usage\n\n", "data: [DONE]\n\n"};
+    char expected[512] = "";
+    for (size_t i = 0; i < sizeof(events) / sizeof(events[0]); ++i) {
+        char temporary[128];
+        strcpy(temporary, events[i]);
+        strcat(expected, temporary);
+        assert(myds_server_sse_send(&stream, temporary, strlen(temporary)));
+        memset(temporary, 'x', strlen(temporary)); /* Caller may immediately reuse/free its buffer. */
+    }
+    assert(myds_server_sse_writer_join(&stream, false) && !stream.writer);
+    assert(fcntl(sockets[0], F_GETFL) == original_flags);
+    assert(shutdown(sockets[0], SHUT_WR) == 0);
+    assert(pthread_join(reader, NULL) == 0);
+    assert(capture.length == strlen(expected) && strcmp(capture.bytes, expected) == 0);
+    free(capture.bytes); close(sockets[0]); close(sockets[1]);
+
+    /* Thread and packet allocation failure must leave no live writer or
+     * retained packet after joining. The caller still owns the socket. */
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    stream = (myds_sse_stream_ctx_t){.client_fd = sockets[0]};
+    original_flags = fcntl(sockets[0], F_GETFL);
+    myds_server_sse_writer_inject_failure(1);
+    assert(!myds_server_sse_writer_start(&stream, 65536, 50) && errno == EAGAIN && !stream.writer);
+    assert(fcntl(sockets[0], F_GETFL) == original_flags);
+    assert(fcntl(sockets[0], F_GETFD) >= 0);
+    assert(myds_server_sse_writer_start(&stream, 65536, 50));
+    assert(myds_server_sse_send(&stream, "first", 5));
+    myds_server_sse_writer_inject_failure(2);
+    assert(!myds_server_sse_send(&stream, "second", 6) && stream.failed && stream.cancel_flag);
+    assert(!myds_server_sse_writer_join(&stream, true) && !stream.writer);
+    assert(fcntl(sockets[0], F_GETFL) == original_flags);
+    assert(fcntl(sockets[0], F_GETFD) >= 0);
+    close(sockets[0]); close(sockets[1]);
+
+    /* A peer that never reads cannot block the producer, and the in-flight
+     * packet still counts towards the finite queue budget. */
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    int send_size = 1024;
+    assert(setsockopt(sockets[0], SOL_SOCKET, SO_SNDBUF, &send_size, sizeof(send_size)) == 0);
+    stream = (myds_sse_stream_ctx_t){.client_fd = sockets[0]};
+    assert(myds_server_sse_writer_start(&stream, 16384, 50));
+    char packet[4096]; memset(packet, 'a', sizeof(packet));
+    const double enqueue_start = test_now_s();
+    bool accepted = true;
+    for (unsigned i = 0; i < 32 && accepted; ++i)
+        accepted = myds_server_sse_send(&stream, packet, sizeof(packet));
+    assert(!accepted && stream.cancel_flag);
+    assert(test_now_s() - enqueue_start < 0.5);
+    assert(!myds_server_sse_writer_join(&stream, true) && !stream.writer);
+    close(sockets[0]); close(sockets[1]);
+
+    /* A peer making continuous partial progress still cannot extend the
+     * total drain deadline indefinitely. */
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    assert(setsockopt(sockets[0], SOL_SOCKET, SO_SNDBUF, &send_size, sizeof(send_size)) == 0);
+    stream = (myds_sse_stream_ctx_t){.client_fd = sockets[0]};
+    assert(myds_server_sse_writer_start(&stream, 2u * 1024u * 1024u, 50));
+    trickle_reader_t trickle = {.fd = sockets[1]};
+    assert(pthread_create(&reader, NULL, read_socket_slowly, &trickle) == 0);
+    char *large = malloc(1024u * 1024u); assert(large); memset(large, 'z', 1024u * 1024u);
+    assert(myds_server_sse_send(&stream, large, 1024u * 1024u)); free(large);
+    const double progressing_start = test_now_s();
+    assert(!myds_server_sse_writer_join(&stream, false) && stream.cancel_flag && !stream.writer);
+    assert(test_now_s() - progressing_start < 0.5);
+    atomic_store(&trickle.stop, true);
+    assert(pthread_join(reader, NULL) == 0);
+    close(sockets[0]); close(sockets[1]);
+
+    /* End-of-response drain uses an overall deadline, rather than blocking
+     * until SO_SNDTIMEO or allocating beyond the queue cap. */
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    assert(setsockopt(sockets[0], SOL_SOCKET, SO_SNDBUF, &send_size, sizeof(send_size)) == 0);
+    stream = (myds_sse_stream_ctx_t){.client_fd = sockets[0]};
+    assert(myds_server_sse_writer_start(&stream, 2u * 1024u * 1024u, 50));
+    large = malloc(1024u * 1024u); assert(large); memset(large, 'z', 1024u * 1024u);
+    assert(myds_server_sse_send(&stream, large, 1024u * 1024u));
+    free(large);
+    const double drain_start = test_now_s();
+    assert(!myds_server_sse_writer_join(&stream, false) && stream.cancel_flag && !stream.writer);
+    assert(test_now_s() - drain_start < 0.5);
+    close(sockets[0]); close(sockets[1]);
+
+    /* Closing the peer during an active writer is an observable transport
+     * failure; join always completes before the caller closes/reuses its fd. */
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    stream = (myds_sse_stream_ctx_t){.client_fd = sockets[0]};
+    assert(myds_server_sse_writer_start(&stream, 65536, 50));
+    close(sockets[1]);
+    (void)myds_server_sse_send(&stream, "data: x\n\n", 9);
+    assert(!myds_server_sse_writer_join(&stream, false) && stream.cancel_flag && !stream.writer);
+    close(sockets[0]);
+    puts("  [PASS] Async SSE FIFO/copied bytes, allocation/thread failures, bounded slow-reader cancellation, total drain deadline and disconnect join");
 }
 
 /* Simulated response generator for testing format compliance */
@@ -484,6 +637,7 @@ static void test_deepseek41_stream_tool_calls(void) {
     pthread_t reader;
     assert(pthread_create(&reader, NULL, capture_socket, &capture) == 0);
     myds_sse_stream_ctx_t stream = {.client_fd = sockets[0]};
+    assert(myds_server_sse_writer_start(&stream, 1024u * 1024u, 1000));
     /* 逐片投喂：空白 + 分片到跨片边界的标签，模拟真实 token 流 */
     const char *parts[] = {"\n", "\n", "<", DS, " calls>\n<", DS,
                            " invoke name=\"get_weather\">\n<", DS,
@@ -494,6 +648,7 @@ static void test_deepseek41_stream_tool_calls(void) {
     }
     assert(myds_server_sse_finish(&stream));
     assert(!stream.cancel_flag && !stream.failed);
+    assert(myds_server_sse_writer_join(&stream, false));
     assert(shutdown(sockets[0], SHUT_WR) == 0);
     assert(pthread_join(reader, NULL) == 0);
     size_t clen = 0;
@@ -626,7 +781,9 @@ static void test_tool_call_event_json(void) {
     socket_capture_t c1 = {.fd = s1[1]};
     pthread_t r1; assert(pthread_create(&r1, NULL, capture_socket, &c1) == 0);
     myds_sse_stream_ctx_t st1 = {.client_fd = s1[0]};
+    assert(myds_server_sse_writer_start(&st1, 1024u * 1024u, 1000));
     assert(sse_emit_chat_tool_calls(&st1, tc, n));
+    assert(myds_server_sse_writer_join(&st1, false));
     assert(shutdown(s1[0], SHUT_WR) == 0);
     assert(pthread_join(r1, NULL) == 0);
     assert_sse_data_lines_valid(c1.bytes);
@@ -639,7 +796,9 @@ static void test_tool_call_event_json(void) {
     socket_capture_t c2 = {.fd = s2[1]};
     pthread_t r2; assert(pthread_create(&r2, NULL, capture_socket, &c2) == 0);
     myds_sse_stream_ctx_t st2 = {.client_fd = s2[0]};
+    assert(myds_server_sse_writer_start(&st2, 1024u * 1024u, 1000));
     assert(sse_emit_responses_function_calls(&st2, tc, n));
+    assert(myds_server_sse_writer_join(&st2, false));
     assert(shutdown(s2[0], SHUT_WR) == 0);
     assert(pthread_join(r2, NULL) == 0);
     assert_sse_data_lines_valid(c2.bytes);
@@ -673,8 +832,10 @@ static void test_responses_finish_carries_the_aggregate_text(void) {
     socket_capture_t c = {.fd = s[1]};
     pthread_t r; assert(pthread_create(&r, NULL, capture_socket, &c) == 0);
     myds_sse_stream_ctx_t st = {.client_fd = s[0]};
+    assert(myds_server_sse_writer_start(&st, 1024u * 1024u, 1000));
     assert(sse_emit_responses_finish(&st, "test-model", "resp_test_1", 10, 3,
                                      text, tlen, items, 1));
+    assert(myds_server_sse_writer_join(&st, false));
     assert(shutdown(s[0], SHUT_WR) == 0);
     assert(pthread_join(r, NULL) == 0);
 
@@ -702,7 +863,9 @@ static void test_responses_finish_carries_the_aggregate_text(void) {
     socket_capture_t c2 = {.fd = s2[1]};
     pthread_t r2; assert(pthread_create(&r2, NULL, capture_socket, &c2) == 0);
     myds_sse_stream_ctx_t st2 = {.client_fd = s2[0]};
+    assert(myds_server_sse_writer_start(&st2, 1024u * 1024u, 1000));
     assert(sse_emit_responses_finish(&st2, "test-model", "resp_test_2", 10, 3, "", 0, titems, 0));
+    assert(myds_server_sse_writer_join(&st2, false));
     assert(shutdown(s2[0], SHUT_WR) == 0);
     assert(pthread_join(r2, NULL) == 0);
     assert_sse_data_lines_valid(c2.bytes);
@@ -839,6 +1002,7 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     test_json_bytes();
     test_stream_and_non_stream_bytes();
+    test_sse_writer_transport();
     assert(myds_server_default_max_tokens(256) == 256);
     assert(myds_server_default_max_tokens(4096) == 4096);
     assert(myds_server_default_max_tokens(262144) == 4096);

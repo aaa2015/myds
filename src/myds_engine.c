@@ -3024,7 +3024,8 @@ static int myds_generate_internal(myds_context_t *ctx,
         uint32_t L = 0;                    /* 与【上一条请求序列】的公共前缀长度 */
         const bool have_prev = pcache_on && ctx->pcache_tokens && ctx->pcache_len;
         if (have_prev)
-            while (L < ctx->pcache_len && ctx->pcache_tokens[L] == prompt_tokens[L]) L++;
+            while (L < ctx->pcache_len && L < (uint32_t)n_prompt &&
+                   ctx->pcache_tokens[L] == prompt_tokens[L]) L++;
 
         /* ★ 每一次都【必须说话】：一个优化不生效时，沉默是最贵的输出。 */
         if (!pcache_on) {
@@ -3039,7 +3040,10 @@ static int myds_generate_internal(myds_context_t *ctx,
             /* 不是续写，但公共前缀可能覆盖到某个【快照点】。窗口环只有 128 槽、事后无法回溯，
              * 所以 prefill 经过边界时就把状态存了下来 ⇒ 从那里续跑。
              * 典型场景：客户端每次提问都当新对话，只带系统提示词与工具定义（兄弟请求）。 */
-            uint32_t snap = ctx->v41 ? myds_v41_snapshot_best(ctx->v41, L) : 0;
+            /* The last prompt token must still be consumed by decode. A
+             * snapshot at the prompt end would make prefill length negative. */
+            const uint32_t snapshot_limit = L < (uint32_t)n_prompt ? L : (uint32_t)n_prompt - 1u;
+            uint32_t snap = ctx->v41 ? myds_v41_snapshot_best(ctx->v41, snapshot_limit) : 0;
             if (snap) {
                 resume_from = snap; snap_hit = true;
                 MYDS_LOG_I("prefix cache: prompt %d tok, cached %u, common prefix %u -> resume from snapshot "
@@ -3085,14 +3089,21 @@ static int myds_generate_internal(myds_context_t *ctx,
             {
                 char why[640];
                 size_t o = 0;
-                #define APPEND_TOK(TAG, ARR, IDX)                                            \
+                #define APPEND_TOK(TAG, ARR, LEN, IDX)                                       \
                     do {                                                                     \
-                        int32_t _id = (int32_t)(ARR)[IDX];                                   \
+                        if (o + 80u >= sizeof(why)) break;                                   \
+                        const uint32_t _idx = (IDX);                                         \
+                        if (_idx >= (uint32_t)(LEN)) {                                       \
+                            int _w = snprintf(why + o, sizeof(why) - o, "%s[%u]=<end> ", TAG, _idx); \
+                            if (_w > 0) o += (size_t)_w;                                     \
+                            break;                                                          \
+                        }                                                                   \
+                        int32_t _id = (int32_t)(ARR)[_idx];                                   \
                         const char *_t = (m->tokenizer && _id >= 0 &&                        \
                                           (uint32_t)_id < m->tokenizer->vocab_size &&        \
                                           m->tokenizer->vocab[_id].decoded)                  \
                             ? m->tokenizer->vocab[_id].decoded : "?";                        \
-                        int _w = snprintf(why + o, sizeof(why) - o, "%s[%u]=%d:", TAG, (IDX), _id); \
+                        int _w = snprintf(why + o, sizeof(why) - o, "%s[%u]=%d:", TAG, _idx, _id); \
                         if (_w > 0) o += (size_t)_w;                                         \
                         for (const char *_q = _t; *_q && o + 6 < sizeof(why); ++_q) {        \
                             unsigned char _c = (unsigned char)*_q;                           \
@@ -3103,13 +3114,17 @@ static int myds_generate_internal(myds_context_t *ctx,
                                 if (_w2 > 0) o += (size_t)_w2;                                \
                             } else why[o++] = (char)_c;                                      \
                         }                                                                    \
-                        why[o++] = ' ';                                                      \
+                        if (o < sizeof(why) - 1u) why[o++] = ' ';                              \
                     } while (0)
                 uint32_t lo = L > 3 ? L - 3 : 0;
-                for (uint32_t k = lo; k <= L && o + 80 < sizeof(why); ++k) APPEND_TOK("c", ctx->pcache_tokens, k);
-                APPEND_TOK("|", ctx->pcache_tokens, L + 1 < ctx->pcache_len ? L + 1 : L);
-                for (uint32_t k = lo; k <= L && o + 80 < sizeof(why); ++k) APPEND_TOK("p", prompt_tokens, k);
-                APPEND_TOK("|", prompt_tokens, (uint32_t)n_prompt > L + 1 ? L + 1 : L);
+                for (uint32_t k = lo; k <= L && k < ctx->pcache_len && o + 80 < sizeof(why); ++k)
+                    APPEND_TOK("c", ctx->pcache_tokens, ctx->pcache_len, k);
+                APPEND_TOK("c", ctx->pcache_tokens, ctx->pcache_len,
+                           L + 1 < ctx->pcache_len ? L + 1 : ctx->pcache_len);
+                for (uint32_t k = lo; k <= L && k < (uint32_t)n_prompt && o + 80 < sizeof(why); ++k)
+                    APPEND_TOK("p", prompt_tokens, n_prompt, k);
+                APPEND_TOK("p", prompt_tokens, n_prompt,
+                           L + 1 < (uint32_t)n_prompt ? L + 1 : (uint32_t)n_prompt);
                 #undef APPEND_TOK
                 why[o < sizeof(why) ? o : sizeof(why) - 1] = 0;
                 MYDS_LOG_I("prefix cache divergence at %u: %s", L, why);

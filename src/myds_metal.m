@@ -65,6 +65,7 @@ static id<MTLComputePipelineState> g_pso_compute_copy_u32x4 = nil;
 static id<MTLSharedEvent>          g_shared_event = nil;
 static uint64_t                    g_shared_event_val = 0;
 static bool                        g_initialized = false;
+static int g_qkv_finish_available = -1;
 static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *g_native_pipelines = nil;
 struct native_kernel_cache_entry {
     char name[64];
@@ -72,6 +73,49 @@ struct native_kernel_cache_entry {
 };
 static struct native_kernel_cache_entry g_native_pso_cache[64];
 static size_t g_native_pso_cache_count = 0;
+
+/* Keep the ordered numeric tuple on the hot path. The dictionary remains the
+ * backing store when this bounded cache replaces an entry or a name is long. */
+struct specialized_kernel_cache_entry {
+    char name[64];
+    size_t n_constants;
+    myds_metal_constant_t constants[64];
+    id<MTLComputePipelineState> pso;
+};
+static struct specialized_kernel_cache_entry g_specialized_pso_cache[64];
+static size_t g_specialized_pso_cache_count = 0;
+static size_t g_specialized_pso_cache_next = 0;
+
+static id<MTLComputePipelineState> specialized_pipeline_lookup(const char *name,
+    const myds_metal_constant_t *constants, size_t n_constants) {
+    for (size_t i = 0; i < g_specialized_pso_cache_count; ++i) {
+        const struct specialized_kernel_cache_entry *entry = &g_specialized_pso_cache[i];
+        if (entry->n_constants != n_constants || strcmp(entry->name, name) != 0) continue;
+        size_t j = 0;
+        for (; j < n_constants; ++j) {
+            /* Compare fields rather than struct padding. Repeated indices are
+             * order-sensitive because Metal uses the last assigned value. */
+            if (entry->constants[j].index != constants[j].index ||
+                entry->constants[j].is_bool != constants[j].is_bool ||
+                entry->constants[j].value != constants[j].value) break;
+        }
+        if (j == n_constants) return entry->pso;
+    }
+    return nil;
+}
+
+static void specialized_pipeline_cache(const char *name,
+    const myds_metal_constant_t *constants, size_t n_constants,
+    id<MTLComputePipelineState> pipeline) {
+    if (strlen(name) >= sizeof(g_specialized_pso_cache[0].name)) return;
+    struct specialized_kernel_cache_entry *entry = &g_specialized_pso_cache[g_specialized_pso_cache_next];
+    strcpy(entry->name, name);
+    entry->n_constants = n_constants;
+    for (size_t i = 0; i < n_constants; ++i) entry->constants[i] = constants[i];
+    entry->pso = pipeline;
+    if (g_specialized_pso_cache_count < 64) ++g_specialized_pso_cache_count;
+    g_specialized_pso_cache_next = (g_specialized_pso_cache_next + 1u) % 64u;
+}
 
 
 /* Batch command buffer state */
@@ -389,6 +433,9 @@ int myds_metal_init(const char *shader_dir) {
                     NSArray<NSString *> *required_kernels = @[
                         @"kernel_add2_bf16_f32",
                         @"kernel_dsv41_bf16_linear",
+                        @"kernel_dsv41_pack_bf16",
+                        @"kernel_dsv41_stage_bf16_f16",
+                        @"kernel_dsv41_get_rows_bf16",
                         @"kernel_rms_norm_mul_f32_4",
                         @"kernel_rms_norm_f32_4",
                         @"kernel_swiglu_flat_f32",
@@ -405,8 +452,11 @@ int myds_metal_init(const char *shader_dir) {
                         @"kernel_dsv4_moe_swiglu_weight",
                         @"kernel_dsv4_moe_sum6_f32",
                         /* V4.1 prefill, indexer & flash attention */
+                        @"kernel_myds_mask_chunk_window",
                         @"kernel_myds_mask_chunk_fill",
                         @"kernel_myds_mask_chunk_scatter",
+                        @"kernel_myds_attn_gather_comp",
+                        @"kernel_myds_attn_gather_comp_bf16",
                         @"kernel_dsv41_candidate_filter",
                         @"kernel_dsv41_candidate_blocks",
                         @"kernel_dsv41_quantize",
@@ -415,6 +465,7 @@ int myds_metal_init(const char *shader_dir) {
                         @"kernel_glm_indexer_score_one_direct",
                         @"kernel_glm_indexer_score_chunk_direct",
                         @"kernel_dsv4_indexer_scores_tiled_f32",
+                        @"kernel_dsv4_indexer_scores_tiled_bf16",
                         @"kernel_argsort_f32_i32_desc",
                         @"kernel_argsort_f32_i32_desc_causal",
                         @"kernel_argsort_merge_f32_i32_desc",
@@ -687,9 +738,28 @@ int myds_metal_init(const char *shader_dir) {
             g_pso_moe_mm_map0_ne20_6 = [g_device newComputePipelineStateWithFunction:fn error:nil];
         }
 
-        fn = [g_library newFunctionWithName:@"kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16"];
+        const char *moe_tail_env = getenv("MYDS_MOE_IQ2_TAIL_CULL");
+        const bool moe_tail = !moe_tail_env || strcmp(moe_tail_env, "1") == 0;
+        NSString *moe_pair_name = moe_tail ?
+            @"kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16_tail_cull" :
+            @"kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16";
+        fn = [g_library newFunctionWithName:moe_pair_name];
         if (fn) {
             g_pso_moe_mm_iq2_pair_swiglu_f16 = [g_device newComputePipelineStateWithFunction:fn error:nil];
+        }
+        if (moe_tail && !moe_tail_env && !g_pso_moe_mm_iq2_pair_swiglu_f16) {
+            fn = [g_library newFunctionWithName:@"kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16"];
+            if (fn) g_pso_moe_mm_iq2_pair_swiglu_f16 =
+                [g_device newComputePipelineStateWithFunction:fn error:nil];
+        }
+        if (moe_tail_env && moe_tail && !g_pso_moe_mm_iq2_pair_swiglu_f16) {
+            fprintf(stderr, "myds_metal: requested IQ2 MoE tail kernel unavailable\n");
+            /* Initialization has not encoded any work. Let the common cleanup
+             * release every partially created PSO/cache/queue before returning,
+             * including when the caller retries with another library. */
+            g_initialized = true;
+            myds_metal_cleanup();
+            return 0;
         }
 
         /* 11. Build Batched MatMul (GEMM) pipelines with function constants 700/701 */
@@ -741,9 +811,10 @@ int myds_metal_init(const char *shader_dir) {
             !g_pso_add_bf16 || !g_pso_softmax || !g_pso_moe_swiglu_weight ||
             !g_pso_moe_sum6 || !g_pso_moe_mv_id_iq2_xxs || !g_pso_moe_mv_id_q2_k) {
             fprintf(stderr, "myds_metal: failed to create one or more required compute pipeline states\n");
-            g_queue = nil;
-            g_device = nil;
-            g_library = nil;
+            /* Match explicit-tail failure cleanup so a retry cannot retain PSOs
+             * created from the previous device/library. No work was encoded. */
+            g_initialized = true;
+            myds_metal_cleanup();
             return 0;
         }
 
@@ -804,7 +875,14 @@ void myds_metal_cleanup(void) {
         g_native_pso_cache[i].name[0] = '\0';
     }
     g_native_pso_cache_count = 0;
+    for (size_t i = 0; i < g_specialized_pso_cache_count; ++i) {
+        g_specialized_pso_cache[i].pso = nil;
+        g_specialized_pso_cache[i].name[0] = '\0';
+    }
+    g_specialized_pso_cache_count = 0;
+    g_specialized_pso_cache_next = 0;
     g_device = nil;
+    g_qkv_finish_available = -1;
     g_initialized = false;
 }
 
@@ -1261,6 +1339,8 @@ int myds_metal_dispatch_kernel_constants(const char *name, const void *args, siz
                     break;
                 }
             }
+        } else {
+            pipeline = specialized_pipeline_lookup(name, constants, n_constants);
         }
         if (!pipeline) {
             NSString *function_name = [NSString stringWithUTF8String:name];
@@ -1302,6 +1382,8 @@ int myds_metal_dispatch_kernel_constants(const char *name, const void *args, siz
                 g_native_pso_cache[g_native_pso_cache_count].name[63] = '\0';
                 g_native_pso_cache[g_native_pso_cache_count].pso = pipeline;
                 g_native_pso_cache_count++;
+            } else if (n_constants != 0) {
+                specialized_pipeline_cache(name, constants, n_constants, pipeline);
             }
         }
         if (n_threads > pipeline.maxTotalThreadsPerThreadgroup)
@@ -2128,6 +2210,83 @@ int myds_metal_v41_gemv(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *weight, const myds_metal_buffer_t *input,
     uint32_t out_dim, uint32_t in_dim, ggml_type weight_type) {
     return myds_metal_v41_gemv_batch(out, weight, input, out_dim, in_dim, 1, weight_type);
+}
+
+static uint32_t qkv_nr0(void) {
+    static uint32_t cached=0;
+    if(!cached) {const char *v=getenv("MYDS_QKV_NR0");cached=!v||strcmp(v,"4")==0?4u:2u;}
+    return cached;
+}
+int myds_metal_v41_gemv_bf16(myds_metal_buffer_t *out,
+    const myds_metal_buffer_t *weight,const myds_metal_buffer_t *input,
+    uint32_t out_dim,uint32_t in_dim,ggml_type type) {
+    if(type!=GGML_TYPE_Q8_0) {
+        int ok=(type==GGML_TYPE_F16||type==GGML_TYPE_F32)?
+            myds_metal_v41_gemv(out,weight,input,out_dim,in_dim,type):
+            myds_metal_gemv(out,weight,input,out_dim,in_dim,type);
+        return ok&&myds_metal_v41_bf16(out,out_dim);
+    }
+    if(!out||!weight||!input||!out_dim||!in_dim||out_dim>INT32_MAX||
+       in_dim>INT32_MAX||in_dim%32u||out->offset%16u)return 0;
+    const uint64_t row_bytes=(uint64_t)(in_dim/32u)*34u;
+    if(weight->size/row_bytes<out_dim||input->size/4u<in_dim||out->size/4u<out_dim)return 0;
+    const uint32_t nsg=out_dim>65536u?8u:4u,nr0=qkv_nr0();
+    @autoreleasepool {
+        NSString *key=[NSString stringWithFormat:@"q8_0_bf16_%u_%u",nsg,nr0];
+        id<MTLComputePipelineState> pipeline=g_native_pipelines[key];
+        if(!pipeline&&g_library) {
+            MTLFunctionConstantValues *values=[MTLFunctionConstantValues new];
+            short short_nsg=(short)nsg;
+            [values setConstantValue:&short_nsg type:MTLDataTypeShort atIndex:600];
+            NSString *name=nr0==4u?@"kernel_mul_mv_q8_0_f32_bf16_r4":@"kernel_mul_mv_q8_0_f32_bf16";
+            id<MTLFunction> fn=[g_library newFunctionWithName:name
+                constantValues:values error:nil];
+            if(fn)pipeline=[g_device newComputePipelineStateWithFunction:fn error:nil];
+            if(pipeline) {
+                if(!g_native_pipelines)g_native_pipelines=[NSMutableDictionary new];
+                g_native_pipelines[key]=pipeline;
+            }
+        }
+        if(!pipeline||!out->mtl_buf||!weight->mtl_buf||!input->mtl_buf)
+            return myds_metal_gemv(out,weight,input,out_dim,in_dim,type)&&myds_metal_v41_bf16(out,out_dim);
+        struct ds4_metal_args_mul_mv a={0};
+        a.ne00=(int32_t)in_dim;a.ne01=(int32_t)out_dim;a.ne02=1;
+        a.nb00=34;a.nb01=row_bytes;a.nb02=row_bytes*out_dim;a.nb03=a.nb02;
+        a.ne10=(int32_t)in_dim;a.ne11=1;a.ne12=1;a.nb10=4;a.nb11=(uint64_t)in_dim*4;
+        a.nb12=a.nb11;a.nb13=a.nb12;a.ne0=(int32_t)out_dim;a.ne1=1;a.nr0=(int16_t)nr0;a.r2=1;a.r3=1;
+        id<MTLCommandBuffer> cb=g_batch_cb?g_batch_cb:[g_queue commandBuffer];
+        if(!cb)return 0;
+        id<MTLComputeCommandEncoder> enc=get_compute_encoder(cb);
+        if(!enc||32u*nsg>pipeline.maxTotalThreadsPerThreadgroup)return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&a length:sizeof(a) atIndex:0];
+        [enc setBuffer:weight->mtl_buf offset:weight->offset atIndex:1];
+        [enc setBuffer:input->mtl_buf offset:input->offset atIndex:2];
+        [enc setBuffer:out->mtl_buf offset:out->offset atIndex:3];
+        [enc setThreadgroupMemoryLength:32u*nr0*sizeof(float) atIndex:0];
+        metal_dispatch(enc,"gemv_q8_0_bf16",MTLSizeMake(((NSUInteger)out_dim+nr0-1u)/nr0,1,1),MTLSizeMake(32,nsg,1));
+        return v41_finish(cb,enc);
+    }
+}
+
+int myds_metal_v41_qkv_fusion_available(void) {
+    if(!g_initialized||g_inject_copy_fail_at)return 0;
+    if(g_qkv_finish_available<0) {
+        @autoreleasepool {
+            NSString *key=@"kernel_dsv41_qkv_finish";
+            id<MTLComputePipelineState> p=g_native_pipelines[key];
+            if(!p) {
+                id<MTLFunction> fn=[g_library newFunctionWithName:key];
+                if(fn)p=[g_device newComputePipelineStateWithFunction:fn error:nil];
+            }
+            if(p) {
+                if(!g_native_pipelines)g_native_pipelines=[NSMutableDictionary new];
+                g_native_pipelines[key]=p;
+            }
+            g_qkv_finish_available=p&&p.maxTotalThreadsPerThreadgroup>=32u;
+        }
+    }
+    return g_qkv_finish_available;
 }
 
 struct ds4_metal_args_mul_mm {
