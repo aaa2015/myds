@@ -19,3 +19,7 @@ docs/benchmarks/2026-10-05-engram-ablation/*.patch -whitespace
 docs/benchmarks/2026-10-05-engram-io/** -text
 docs/benchmarks/2026-10-05-engram-io/**/*.patch -whitespace
 docs/benchmarks/2026-10-05-engram-io/validation/*.log -whitespace
+docs/benchmarks/2026-10-05-remaining-performance/** -text
+docs/benchmarks/2026-10-05-remaining-performance/**/*.patch -whitespace
+docs/benchmarks/2026-10-05-remaining-performance/*.patch -whitespace
+docs/benchmarks/2026-10-05-remaining-performance/**/*.log -whitespace
