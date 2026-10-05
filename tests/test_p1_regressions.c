@@ -315,6 +315,8 @@ static void test_p1_unmapped_engram_identity(void) {
     assert(unlink(bin_path) == 0);
     snprintf(bin_path, sizeof(bin_path), "%s/kvsegments-v1-%016llx.bin", tmp_kvdsk_dir, (unsigned long long)id_mut);
     assert(unlink(bin_path) == 0);
+    snprintf(bin_path, sizeof(bin_path), "%s/kvends-v1-%016llx.bin", tmp_kvdsk_dir, (unsigned long long)id_mut);
+    assert(unlink(bin_path) == 0);
     assert(rmdir(tmp_kvdsk_dir) == 0);
 
     close(fd);
@@ -954,6 +956,95 @@ static void test_p1_same_process_large_model_isolation(void) {
     printf("  [PASS] P1: Same-process large models have isolated identities across distinct instances\n");
 }
 
+static void test_p1_companion_digest_identity(void) {
+    char model_path[] = "/tmp/test_myds_companion_XXXXXX.gguf";
+    int fd = mkstemps(model_path, 5);
+    assert(fd >= 0);
+    close(fd);
+
+    myds_model_t m1, m2;
+    memset(&m1, 0, sizeof(m1));
+    memset(&m2, 0, sizeof(m2));
+    snprintf(m1.arch, sizeof(m1.arch), "deepseek41");
+    snprintf(m2.arch, sizeof(m2.arch), "deepseek41");
+    strncpy(m1.model_path, model_path, sizeof(m1.model_path) - 1);
+    strncpy(m2.model_path, model_path, sizeof(m2.model_path) - 1);
+
+    gguf_file_t gf1, gf2;
+    memset(&gf1, 0, sizeof(gf1));
+    memset(&gf2, 0, sizeof(gf2));
+    m1.gf = &gf1;
+    m2.gf = &gf2;
+    gf1.tensor_count = 1; gf2.tensor_count = 1;
+    gf1.fd = -1; gf2.fd = -1;
+
+    gguf_tensor_t t1, t2;
+    memset(&t1, 0, sizeof(t1));
+    memset(&t2, 0, sizeof(t2));
+    const size_t sz = 300ull * 1024ull * 1024ull; /* > 256 MB */
+    void *buf = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    assert(buf != MAP_FAILED);
+    memset(buf, 0x5a, 1024);
+    t1.data = buf; t1.size_bytes = sz;
+    t2.data = buf; t2.size_bytes = sz;
+    gf1.tensors = &t1; gf2.tensors = &t2;
+
+    /* Without digest file: distinct instances have different identities */
+    uint64_t id_no1 = myds_v41_model_identity(&m1);
+    uint64_t id_no2 = myds_v41_model_identity(&m2);
+    assert(id_no1 != id_no2);
+
+    /* 1. Create companion .digest file replacing .gguf */
+    char digest_path[1200];
+    snprintf(digest_path, sizeof(digest_path), "%.*s.digest", (int)(strlen(model_path) - 5), model_path);
+    FILE *fp = fopen(digest_path, "w");
+    assert(fp);
+    fputs("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n", fp);
+    fclose(fp);
+
+    /* With companion .digest: distinct instances produce the EXACT SAME stable identity */
+    uint64_t id_comp1 = myds_v41_model_identity(&m1);
+    uint64_t id_comp2 = myds_v41_model_identity(&m2);
+    assert(id_comp1 == id_comp2);
+    assert(id_comp1 != id_no1);
+
+    /* 2. Changing the digest changes the identity */
+    fp = fopen(digest_path, "w");
+    assert(fp);
+    fputs("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n", fp);
+    fclose(fp);
+    uint64_t id_comp_changed = myds_v41_model_identity(&m1);
+    assert(id_comp_changed != id_comp1);
+
+    /* 3. Test .sha256 format */
+    unlink(digest_path);
+    char sha_path[1200];
+    snprintf(sha_path, sizeof(sha_path), "%s.sha256", model_path);
+    fp = fopen(sha_path, "w");
+    assert(fp);
+    fprintf(fp, "SHA256 (%s) = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n", model_path);
+    fclose(fp);
+    uint64_t id_sha = myds_v41_model_identity(&m1);
+    assert(id_sha == id_comp1);
+
+    /* 4. Mutating tensor descriptor (e.g. type) still alters identity even with valid digest */
+    t2.type = GGML_TYPE_F16;
+    uint64_t id_desc_mut = myds_v41_model_identity(&m2);
+    assert(id_desc_mut != id_sha);
+    t2.type = 0;
+
+    /* 5. Environment variable MYDS_MODEL_DIGEST overrides */
+    setenv("MYDS_MODEL_DIGEST", "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210", 1);
+    uint64_t id_env = myds_v41_model_identity(&m1);
+    assert(id_env != id_sha);
+    unsetenv("MYDS_MODEL_DIGEST");
+
+    unlink(sha_path);
+    unlink(model_path);
+    munmap(buf, sz);
+    printf("  [PASS] P1: Companion .digest / .sha256 provides cross-restart stable model identity bound to descriptors\n");
+}
+
 static void fill_buffer_f32(myds_metal_buffer_t *buf, float val) {
     assert(buf);
     float *ptr = (float *)myds_metal_buffer_data(buf);
@@ -1428,34 +1519,40 @@ static void test_lowkv_combined_budget(void) {
     myds_model_t model = {0}; gguf_file_t gf = {0};
     snprintf(model.arch, sizeof(model.arch), "deepseek41"); model.gf = &gf;
     const uint64_t identity = myds_v41_model_identity(&model); assert(identity);
-    char snapshots[512], segments[512];
+    char snapshots[512], segments[512], ends[512];
     snprintf(snapshots, sizeof(snapshots), "%s/kvlow-v3-%016llx.bin", dir, (unsigned long long)identity);
     snprintf(segments, sizeof(segments), "%s/kvsegments-v1-%016llx.bin", dir, (unsigned long long)identity);
+    snprintf(ends, sizeof(ends), "%s/kvends-v1-%016llx.bin", dir, (unsigned long long)identity);
     const uint64_t entries = MYDS_SNAP_PINNED; /* one way */
     const uint64_t base = (4096u + entries * 64u + 4095u) / 4096u * 4096u;
     const uint64_t snapshot_stride = 64u + sizeof(myds_engram_history_t) +
         40u * 128u * 512u * sizeof(float) + MYDS_SNAP_PINNED * 32u;
     const uint64_t segment_stride = lk_expected_segment_bytes(0, MYDS_SNAP_MIN);
-    const uint64_t total = 2u * base + entries * (snapshot_stride + segment_stride);
+    const uint64_t end_entries = 8u;
+    const uint64_t end_stride = 14680064ull;
+    const uint64_t end_base = (4096u + end_entries * 64u + 4095u) / 4096u * 4096u;
+    const uint64_t end_file_bytes = end_base + end_entries * end_stride;
+    const uint64_t total = 2u * base + entries * (snapshot_stride + segment_stride) + end_file_bytes;
     char mb[32]; snprintf(mb, sizeof(mb), "%llu", (unsigned long long)(total >> 20));
     setenv("MYDS_KV_DSK_WAYS", "1", 1); setenv("MYDS_KV_DSK_BUDGET_MB", mb, 1);
     myds_v41_context_t *g = myds_v41_context_create_for_model(&model); assert(g);
     assert(!myds_v41_low_kv_enable(g, dir));
     assert(!myds_v41_low_kv_enabled(g));
-    assert(access(snapshots, F_OK) == -1 && access(segments, F_OK) == -1);
+    assert(access(snapshots, F_OK) == -1 && access(segments, F_OK) == -1 && access(ends, F_OK) == -1);
     /* Budget rejection must leave the same context able to open both stores. */
     snprintf(mb, sizeof(mb), "%llu", (unsigned long long)((total + (1u << 20) - 1u) >> 20));
     setenv("MYDS_KV_DSK_BUDGET_MB", mb, 1);
     assert(myds_v41_low_kv_enable(g, dir));
-    struct stat snap_stat, seg_stat;
-    assert(stat(snapshots, &snap_stat) == 0 && stat(segments, &seg_stat) == 0);
+    struct stat snap_stat, seg_stat, end_stat;
+    assert(stat(snapshots, &snap_stat) == 0 && stat(segments, &seg_stat) == 0 && stat(ends, &end_stat) == 0);
     assert((uint64_t)snap_stat.st_size == base + entries * snapshot_stride);
     assert((uint64_t)seg_stat.st_size == base + entries * segment_stride);
-    assert((uint64_t)snap_stat.st_size + (uint64_t)seg_stat.st_size == total);
+    assert((uint64_t)end_stat.st_size == end_file_bytes);
+    assert((uint64_t)snap_stat.st_size + (uint64_t)seg_stat.st_size + (uint64_t)end_stat.st_size == total);
     myds_v41_context_free(g);
-    assert(unlink(snapshots) == 0 && unlink(segments) == 0 && rmdir(dir) == 0);
+    assert(unlink(snapshots) == 0 && unlink(segments) == 0 && unlink(ends) == 0 && rmdir(dir) == 0);
     unsetenv("MYDS_KV_DSK_WAYS"); unsetenv("MYDS_KV_DSK_BUDGET_MB");
-    printf("  [PASS] SSD combined budget: exact %llu B includes both aligned headers/tables; rejection creates no files and retry succeeds\n",
+    printf("  [PASS] SSD combined budget: exact %llu B includes headers/tables for snapshot, segment, and ends stores; rejection creates no files and retry succeeds\n",
         (unsigned long long)total);
 }
 
@@ -1509,7 +1606,8 @@ static void lk_make_fork_state(myds_v41_context_t *g) {
 
 static void lk_remove_store(const char *path) {
     char segments[512]; snprintf(segments, sizeof(segments), "%s.segments", path);
-    unlink(path); unlink(segments);
+    char ends[512]; snprintf(ends, sizeof(ends), "%s.ends", path);
+    unlink(path); unlink(segments); unlink(ends);
 }
 
 static void test_shared_lowkv_segments(void) {
@@ -1636,6 +1734,7 @@ int main(void) {
     test_p1_engram_metadata_identity();
     test_p1_unmapped_engram_identity();
     test_p1_same_process_large_model_isolation();
+    test_p1_companion_digest_identity();
     test_p1_metal_fused_add_fallback();
     test_p2_moe_kernel_and_pso_validation();
     test_p2_moe_batch_mm_tail_cull_validation();

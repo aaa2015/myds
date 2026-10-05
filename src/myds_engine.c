@@ -363,6 +363,7 @@ static myds_model_t *model_load_internal(const char *model_path, bool diagnostic
     if (!m->load_generation) m->load_generation = seq;
 
     m->gf = gf;
+    if (model_path) strncpy(m->model_path, model_path, sizeof(m->model_path) - 1);
     m->tokenizer = myds_tokenizer_load(gf);
     if (!m->tokenizer) {
         MYDS_LOG_E("Unable to load the model tokenizer");

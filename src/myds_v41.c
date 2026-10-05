@@ -110,6 +110,7 @@ struct myds_v41_context {
     /* 低位区 KV 的磁盘存储（NULL = 未启用）。由引擎在创建后显式打开。 */
     myds_kvdsk_t         *low_store;
     myds_kvdsk_t         *low_segments;
+    myds_kvdsk_t         *low_ends;
     uint64_t              low_segment_writes, low_segment_bytes, low_snapshot_bytes;
     uint32_t              low_fail_segment_end; /* fixture-only partial-write injection */
     /* 身份戳的来源（arch / 形状 / 模型大小）。不持有所有权。 */
@@ -359,6 +360,14 @@ myds_metal_buffer_t *myds_v41_snapshot_get_snap_window(myds_v41_context_t *g, ui
     return snapshot_ensure_slot(g, slot) ? g->snap_window[slot] : NULL;
 }
 
+myds_metal_buffer_t *myds_v41_snapshot_get_snap_prev_kv(myds_v41_context_t *g, uint32_t slot, uint32_t o) {
+    return (snapshot_ensure_slot(g, slot) && o < 4u) ? g->snap_prev_kv[slot][o] : NULL;
+}
+
+myds_metal_buffer_t *myds_v41_snapshot_get_snap_prev_score(myds_v41_context_t *g, uint32_t slot, uint32_t o) {
+    return (snapshot_ensure_slot(g, slot) && o < 4u) ? g->snap_prev_score[slot][o] : NULL;
+}
+
 uint64_t myds_v41_snapshot_allocated_bytes(const myds_v41_context_t *g) {
     uint64_t bytes = 0;
     if (!g) return 0;
@@ -431,6 +440,10 @@ bool myds_v41_snapshot_get_valid(const myds_v41_context_t *g) {
  * ══════════════════════════════════════════════════════════════════════════ */
 #define V41_LOWKV_ABI    3u /* windows/history plus shared-prefix segment references */
 #define V41_LOWKV_SEG_ABI 1u
+#define V41_LOWKV_END_ABI 0x34314531u /* '41E1' prompt-end snapshot */
+#define V41_LOWKV_ENDS_MAX 8u
+#define V41_LOWKV_END_STRIDE 14680064ull /* 14 MiB */
+#define V41_LOWKV_ENTRY_IS_END 0x80000000u
 #define V41_LOWKV_REF_BYTES 32u
 #define V41_CACHE_BYTES  2u
 #define V41_LOWKV_HEADER 64u
@@ -517,6 +530,41 @@ static uint64_t lowkv_segment_bytes(uint32_t start, uint32_t end) {
             (V41_LOWKV_LATENT + V41_INDEX_DIM) * V41_CACHE_BYTES;
     }
     return bytes;
+}
+
+static uint32_t lowkv_base_segment_count(uint32_t p) {
+    if (p < MYDS_SNAP_MIN) return 0;
+    uint32_t count = (p - MYDS_SNAP_MIN) / MYDS_SNAP_STRIDE + 1u;
+    return (count > MYDS_SNAP_PINNED) ? MYDS_SNAP_PINNED : count;
+}
+
+static uint32_t lowkv_base_segment_end(uint32_t base_count) {
+    return base_count ? lowkv_segment_end(base_count - 1u) : 0u;
+}
+
+static uint64_t lowkv_end_tail_bytes(uint32_t base_end, uint32_t p) {
+    if (p <= base_end) return 0;
+    uint64_t bytes = 0;
+    for (uint32_t o = 0; o < 4u; ++o) {
+        const uint32_t ratio = lowkv_owner_ratio(o);
+        if (!ratio) return 0;
+        const uint32_t start_row = base_end / ratio;
+        const uint32_t end_row = p / ratio;
+        if (end_row > start_row) {
+            bytes += (uint64_t)(end_row - start_row) *
+                (V41_LOWKV_LATENT + V41_INDEX_DIM) * V41_CACHE_BYTES;
+        }
+    }
+    return bytes;
+}
+
+static uint64_t lowkv_end_payload_bytes(uint32_t p, uint32_t base_count, uint32_t base_end) {
+    return (uint64_t)V41_LOWKV_HEADER
+        + sizeof(myds_engram_history_t)
+        + 16384u /* 4*2048 prev_kv + 4*2048 prev_score */
+        + (uint64_t)V41_LAYERS * V41_WINDOW * V41_HEAD_DIM * 4u
+        + (uint64_t)base_count * V41_LOWKV_REF_BYTES
+        + lowkv_end_tail_bytes(base_end, p);
 }
 
 static void lk_put_u64(unsigned char *p, uint64_t v) {
@@ -631,6 +679,67 @@ static void digest_update_tensor_descriptor(uint64_t *d, const gguf_tensor_t *t)
     digest_update_u64(d, (uint64_t)t->size_bytes);
 }
 
+static bool lowkv_read_companion_digest(const char *model_path, char *buf, size_t buf_sz) {
+    if (!model_path || !model_path[0] || !buf || buf_sz < 32) return false;
+    char path[1200];
+    FILE *fp = NULL;
+
+    /* Candidate 1: <model_path>.digest */
+    snprintf(path, sizeof(path), "%s.digest", model_path);
+    fp = fopen(path, "r");
+    /* Candidate 2: <model_path>.sha256 */
+    if (!fp) {
+        snprintf(path, sizeof(path), "%s.sha256", model_path);
+        fp = fopen(path, "r");
+    }
+    /* Candidate 3 & 4: replace .gguf with .digest / .sha256 */
+    if (!fp) {
+        size_t len = strlen(model_path);
+        if (len > 5 && strcmp(model_path + len - 5, ".gguf") == 0) {
+            char base[1100];
+            if (len - 5 < sizeof(base)) {
+                memcpy(base, model_path, len - 5);
+                base[len - 5] = '\0';
+                snprintf(path, sizeof(path), "%s.digest", base);
+                fp = fopen(path, "r");
+                if (!fp) {
+                    snprintf(path, sizeof(path), "%s.sha256", base);
+                    fp = fopen(path, "r");
+                }
+            }
+        }
+    }
+    if (!fp) return false;
+
+    char line[512];
+    bool found = false;
+    while (fgets(line, sizeof(line), fp)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (*p == '#' || *p == '\0') continue;
+        if (strncmp(p, "SHA256", 6) == 0) {
+            char *eq = strchr(p, '=');
+            if (eq) p = eq + 1;
+            while (*p == ' ' || *p == '\t') p++;
+        }
+        char *start = p;
+        while ((*p >= '0' && *p <= '9') ||
+               (*p >= 'a' && *p <= 'f') ||
+               (*p >= 'A' && *p <= 'F')) {
+            p++;
+        }
+        size_t hlen = (size_t)(p - start);
+        if (hlen >= 32 && hlen < buf_sz) {
+            memcpy(buf, start, hlen);
+            buf[hlen] = '\0';
+            found = true;
+            break;
+        }
+    }
+    fclose(fp);
+    return found;
+}
+
 /* 身份戳：决定这些字节含义的【全部】参数。任何一项变了，旧文件都必须作废 ——
  * 宁可重新付一次 prefill，也不能把上一版模型的 KV 接上去。 */
 static uint64_t lowkv_identity(const myds_model_t *m) {
@@ -640,6 +749,7 @@ static uint64_t lowkv_identity(const myds_model_t *m) {
     uint32_t n = 0;
     v[n++] = V41_LOWKV_ABI;
     v[n++] = V41_LOWKV_SEG_ABI;
+    v[n++] = V41_LOWKV_END_ABI;
     v[n++] = V41_LOWKV_REF_BYTES;
     v[n++] = V41_CACHE_BYTES;
     v[n++] = V41_LAYERS;
@@ -661,6 +771,7 @@ static uint64_t lowkv_identity(const myds_model_t *m) {
     /* 权重内容指纹：区分同结构、同大小但权重不同的 checkpoint */
     uint64_t weight_digest = 1469598103934665603ull;
     const char *manifest = NULL;
+    char companion_digest[128] = {0};
     manifest = gguf_get_str(m->gf, "models.manifest.digest", NULL);
     if (!manifest) manifest = gguf_get_str(m->gf, "general.sha256", NULL);
     if (!manifest) manifest = gguf_get_str(m->gf, "general.source.sha256", NULL);
@@ -670,6 +781,26 @@ static uint64_t lowkv_identity(const myds_model_t *m) {
     if (!manifest) manifest = gguf_get_str(m->gf, "general.file_sha256", NULL);
     if (!manifest) manifest = gguf_get_str(m->gf, "models.file_digest", NULL);
     if (!manifest) manifest = getenv("MYDS_MODEL_DIGEST");
+    if (!manifest && m->model_path[0]) {
+        if (lowkv_read_companion_digest(m->model_path, companion_digest, sizeof(companion_digest))) {
+            manifest = companion_digest;
+            MYDS_LOG_I("kvdisk: 发现模型伴侣指纹文件: %s", companion_digest);
+        }
+    }
+
+    /* ① 全量哈希所有影响查表与计算语义的 GGUF 元数据（如 engram.token_map, primes, multipliers 等） */
+    if (m->gf->kvs) {
+        for (uint64_t i = 0; i < m->gf->metadata_kv_count; i++) {
+            digest_update_metadata_kv(&weight_digest, &m->gf->kvs[i]);
+        }
+    }
+
+    /* ② 全量哈希所有张量描述符（名称及长度、类型、维度、偏移、大小），将张量元信息牢固绑定到模型身份 */
+    if (m->gf->tensors) {
+        for (uint64_t i = 0; i < m->gf->tensor_count; i++) {
+            digest_update_tensor_descriptor(&weight_digest, &m->gf->tensors[i]);
+        }
+    }
 
     if (manifest && *manifest) {
         for (const unsigned char *p = (const unsigned char *)manifest; *p; p++) {
@@ -677,20 +808,6 @@ static uint64_t lowkv_identity(const myds_model_t *m) {
             weight_digest *= 1099511628211ull;
         }
     } else {
-        /* 缺少完整 manifest digest 时：
-         * ① 全量哈希所有影响查表与计算语义的 GGUF 元数据（如 engram.token_map, primes, multipliers 等） */
-        if (m->gf->kvs) {
-            for (uint64_t i = 0; i < m->gf->metadata_kv_count; i++) {
-                digest_update_metadata_kv(&weight_digest, &m->gf->kvs[i]);
-            }
-        }
-
-        /* ② 全量哈希所有张量描述符（名称及长度、类型、维度、偏移、大小），将张量元信息牢固绑定到模型身份 */
-        if (m->gf->tensors) {
-            for (uint64_t i = 0; i < m->gf->tensor_count; i++) {
-                digest_update_tensor_descriptor(&weight_digest, &m->gf->tensors[i]);
-            }
-        }
 
         uint64_t total_tensor_bytes = 0;
         if (m->gf->tensors) {
@@ -984,6 +1101,133 @@ static bool lowkv_snapshot_refs_match(myds_v41_context_t *g, uint32_t entry,
         memcmp(expected, actual, (size_t)count * V41_LOWKV_REF_BYTES) == 0;
 }
 
+static uint32_t lowkv_pick_end_entry(myds_v41_context_t *g, uint32_t p, uint64_t hash,
+                                     uint64_t total_bytes, bool *already_here) {
+    if (already_here) *already_here = false;
+    if (!g || !g->low_ends) return V41_LOWKV_NO_ENTRY;
+
+    uint32_t empty_slot = V41_LOWKV_NO_ENTRY;
+    uint32_t victim_slot = 0;
+    uint32_t min_hits = UINT32_MAX;
+
+    for (uint32_t s = 0; s < V41_LOWKV_ENDS_MAX; ++s) {
+        uint32_t pos = 0; uint64_t h = 0, used = 0;
+        if (myds_kvdsk_slot_meta(g->low_ends, s, &pos, &h, &used)) {
+            if (pos == p && h == hash && used == total_bytes) {
+                if (already_here) *already_here = true;
+                return s;
+            }
+            uint32_t hits = 0;
+            (void)myds_kvdsk_slot_hits(g->low_ends, s, &hits);
+            if (hits < min_hits) {
+                min_hits = hits;
+                victim_slot = s;
+            }
+        } else {
+            if (empty_slot == V41_LOWKV_NO_ENTRY) empty_slot = s;
+        }
+    }
+    return (empty_slot != V41_LOWKV_NO_ENTRY) ? empty_slot : victim_slot;
+}
+
+static bool lowkv_end_refs_match(myds_v41_context_t *g, uint32_t entry,
+                                 uint32_t base_count, const lowkv_segment_ref_t *refs) {
+    if (!g || !g->low_ends || !refs) return false;
+    if (base_count == 0) return true;
+    if (base_count > MYDS_SNAP_PINNED) return false;
+
+    unsigned char expected[MYDS_SNAP_PINNED * V41_LOWKV_REF_BYTES] = {0};
+    unsigned char actual[sizeof(expected)];
+    for (uint32_t i = 0; i < base_count; ++i) {
+        unsigned char *bytes = expected + i * V41_LOWKV_REF_BYTES;
+        lk_put_u32(bytes, refs[i].slot);
+        lk_put_u32(bytes + 4, refs[i].start);
+        lk_put_u32(bytes + 8, refs[i].end);
+        lk_put_u64(bytes + 16, refs[i].hash);
+        lk_put_u64(bytes + 24, refs[i].bytes);
+    }
+    const uint64_t off = V41_LOWKV_HEADER + sizeof(myds_engram_history_t) + 16384u +
+        (uint64_t)V41_LAYERS * V41_WINDOW * V41_HEAD_DIM * 4u;
+    return myds_kvdsk_peek_committed(g->low_ends, entry, off, actual,
+        (uint64_t)base_count * V41_LOWKV_REF_BYTES) &&
+        memcmp(expected, actual, (size_t)base_count * V41_LOWKV_REF_BYTES) == 0;
+}
+
+static bool lowkv_write_end_slot(myds_v41_context_t *g, uint32_t entry,
+    uint32_t p, uint64_t hash, uint32_t base_count, uint32_t base_end,
+    const lowkv_segment_ref_t *refs, unsigned char *stage) {
+    const uint32_t window_bytes = V41_WINDOW * V41_HEAD_DIM * 4u;
+    const uint64_t total_bytes = lowkv_end_payload_bytes(p, base_count, base_end);
+
+    unsigned char hdr[V41_LOWKV_HEADER] = {0};
+    lk_put_u32(hdr, V41_LOWKV_END_ABI);
+    lk_put_u32(hdr + 4, p);
+    lk_put_u32(hdr + 8, V41_LAYERS);
+    lk_put_u32(hdr + 12, window_bytes);
+    lk_put_u32(hdr + 16, sizeof(myds_engram_history_t));
+    lk_put_u32(hdr + 20, base_count);
+    lk_put_u32(hdr + 24, base_end);
+    lk_put_u32(hdr + 28, p - base_end);
+    lk_put_u32(hdr + 40, V41_LOWKV_LATENT);
+    lk_put_u32(hdr + 44, V41_INDEX_DIM);
+    lk_put_u32(hdr + 48, V41_CACHE_BYTES);
+
+    if (!myds_kvdsk_write_start(g->low_ends, entry) ||
+        !myds_kvdsk_write_chunk(g->low_ends, 0, hdr, sizeof(hdr))) goto bad;
+    uint64_t off = V41_LOWKV_HEADER;
+
+    /* 1. Engram history (12 bytes) */
+    if (!myds_kvdsk_write_chunk(g->low_ends, off, &g->snap_engram[0], sizeof(myds_engram_history_t))) goto bad;
+    off += sizeof(myds_engram_history_t);
+
+    /* 2. Prev KV (4 * 2048) & Score (4 * 2048) = 16384 bytes */
+    for (uint32_t o = 0; o < 4u; ++o) {
+        if (!lowkv_emit(g->low_ends, g->snap_prev_kv[0][o], 512u * 4u, stage, &off, 0)) goto bad;
+    }
+    for (uint32_t o = 0; o < 4u; ++o) {
+        if (!lowkv_emit(g->low_ends, g->snap_prev_score[0][o], 512u * 4u, stage, &off, 0)) goto bad;
+    }
+
+    /* 3. Window (40 layers * window_bytes) */
+    if (!lowkv_emit(g->low_ends, g->snap_window[0],
+        (uint64_t)V41_LAYERS * window_bytes, stage, &off, 0)) goto bad;
+
+    /* 4. Base segment refs */
+    for (uint32_t i = 0; i < base_count; ++i) {
+        unsigned char bytes[V41_LOWKV_REF_BYTES] = {0};
+        lk_put_u32(bytes, refs[i].slot);
+        lk_put_u32(bytes + 4, refs[i].start);
+        lk_put_u32(bytes + 8, refs[i].end);
+        lk_put_u64(bytes + 16, refs[i].hash);
+        lk_put_u64(bytes + 24, refs[i].bytes);
+        if (!myds_kvdsk_write_chunk(g->low_ends, off, bytes, sizeof(bytes))) goto bad;
+        off += sizeof(bytes);
+    }
+
+    /* 5. Tail packed rows [base_end, p) */
+    for (uint32_t kind = 0; kind < 2u; ++kind) {
+        const uint32_t width = kind ? V41_INDEX_DIM : V41_LOWKV_LATENT;
+        for (uint32_t o = 0; o < 4u; ++o) {
+            const uint32_t ratio = lowkv_owner_ratio(o);
+            const uint32_t start_row = base_end / ratio;
+            const uint32_t end_row = p / ratio;
+            if (end_row > start_row) {
+                const uint64_t row_bytes = (uint64_t)(end_row - start_row) * width * V41_CACHE_BYTES;
+                const uint64_t src = (uint64_t)start_row * width * V41_CACHE_BYTES;
+                if (!lowkv_emit(g->low_ends, kind ? g->index_cache[o] : g->compressed[o],
+                    row_bytes, stage, &off, src)) goto bad;
+            }
+        }
+    }
+
+    if (off != total_bytes ||
+        !myds_kvdsk_write_finish(g->low_ends, entry, p, hash, off)) goto bad;
+    return true;
+bad:
+    myds_kvdsk_write_abort(g->low_ends);
+    return false;
+}
+
 /* Read once into private memory, then validate those very bytes. A separate
  * verification pass followed by a second disk read would admit a changed
  * payload between verification and publication. No live Metal buffers or
@@ -997,6 +1241,72 @@ static bool lowkv_read_stage_range(myds_kvdsk_t *store, unsigned char *dst,
         bytes -= n;
     }
     return true;
+}
+
+static bool lowkv_read_checked_end(myds_v41_context_t *g, uint32_t entry, uint32_t position,
+    uint64_t hash, uint64_t bytes, unsigned char *dst, uint32_t *out_base_count, uint32_t *out_base_end) {
+    uint32_t actual_pos = 0;
+    uint64_t actual_hash = 0, used = 0;
+    if (!g || !g->low_ends || !dst || !myds_kvdsk_read_start(g->low_ends, entry, &used)) return false;
+    if (used != bytes || !myds_kvdsk_slot_meta(g->low_ends, entry, &actual_pos, &actual_hash, NULL) ||
+        actual_pos != position || actual_hash != hash) goto bad;
+
+    uint64_t off = 0;
+    if (!lowkv_read_stage_range(g->low_ends, dst, &off, V41_LOWKV_HEADER)) goto bad;
+
+    const unsigned char *hdr = dst;
+    const uint32_t window_bytes = V41_WINDOW * V41_HEAD_DIM * 4u;
+    if (lk_get_u32(hdr) != V41_LOWKV_END_ABI || lk_get_u32(hdr + 4) != position ||
+        lk_get_u32(hdr + 8) != V41_LAYERS || lk_get_u32(hdr + 12) != window_bytes ||
+        lk_get_u32(hdr + 16) != sizeof(myds_engram_history_t) ||
+        lk_get_u32(hdr + 40) != V41_LOWKV_LATENT || lk_get_u32(hdr + 44) != V41_INDEX_DIM ||
+        lk_get_u32(hdr + 48) != V41_CACHE_BYTES) goto bad;
+
+    const uint32_t base_count = lk_get_u32(hdr + 20);
+    const uint32_t base_end = lk_get_u32(hdr + 24);
+    if (base_count > MYDS_SNAP_PINNED || base_end > position) goto bad;
+    if (out_base_count) *out_base_count = base_count;
+    if (out_base_end) *out_base_end = base_end;
+
+    /* 1. Engram history */
+    if (!lowkv_read_stage_range(g->low_ends, dst, &off, sizeof(myds_engram_history_t))) goto bad;
+
+    /* 2. Prev KV & Score (4 * 2048 each) */
+    for (uint32_t o = 0; o < 4u; ++o) {
+        if (!lowkv_read_stage_range(g->low_ends, dst, &off, 512u * 4u)) goto bad;
+    }
+    for (uint32_t o = 0; o < 4u; ++o) {
+        if (!lowkv_read_stage_range(g->low_ends, dst, &off, 512u * 4u)) goto bad;
+    }
+
+    /* 3. Window */
+    if (!lowkv_read_stage_range(g->low_ends, dst, &off, (uint64_t)V41_LAYERS * window_bytes)) goto bad;
+
+    /* 4. Base segment refs */
+    for (uint32_t i = 0; i < base_count; ++i) {
+        if (!lowkv_read_stage_range(g->low_ends, dst, &off, V41_LOWKV_REF_BYTES)) goto bad;
+    }
+
+    /* 5. Tail packed rows */
+    for (uint32_t kind = 0; kind < 2u; ++kind) {
+        const uint32_t width = kind ? V41_INDEX_DIM : V41_LOWKV_LATENT;
+        for (uint32_t o = 0; o < 4u; ++o) {
+            const uint32_t ratio = lowkv_owner_ratio(o);
+            const uint32_t start_row = base_end / ratio;
+            const uint32_t end_row = position / ratio;
+            if (end_row > start_row) {
+                const uint64_t row_bytes = (uint64_t)(end_row - start_row) * width * V41_CACHE_BYTES;
+                if (!lowkv_read_stage_range(g->low_ends, dst, &off, row_bytes)) goto bad;
+            }
+        }
+    }
+
+    if (off != bytes) goto bad;
+    return myds_kvdsk_read_verify(g->low_ends);
+bad:
+    myds_kvdsk_read_abort(g->low_ends);
+    (void)myds_kvdsk_slot_clear(g->low_ends, entry);
+    return false;
 }
 
 static bool lowkv_read_checked(myds_kvdsk_t *store, uint32_t entry, uint32_t position,
@@ -1042,6 +1352,8 @@ typedef struct {
     unsigned char *segment[MYDS_SNAP_PINNED];
     lowkv_segment_ref_t ref[MYDS_SNAP_PINNED];
     uint32_t count;
+    bool is_end;
+    uint32_t base_end;
 } lowkv_restore_stage_t;
 
 static void lowkv_restore_stage_free(lowkv_restore_stage_t *st) {
@@ -1051,10 +1363,52 @@ static void lowkv_restore_stage_free(lowkv_restore_stage_t *st) {
 
 static bool lowkv_stage_slot(myds_v41_context_t *g, uint32_t entry, uint32_t p,
     const int32_t *tokens, lowkv_restore_stage_t *st) {
+    if (entry & V41_LOWKV_ENTRY_IS_END) {
+        const uint32_t raw_entry = entry & ~V41_LOWKV_ENTRY_IS_END;
+        if (!g->low_ends || raw_entry >= V41_LOWKV_ENDS_MAX) return false;
+        uint32_t pos = 0; uint64_t hash = 0, used = 0;
+        if (!myds_kvdsk_slot_meta(g->low_ends, raw_entry, &pos, &hash, &used) || pos != p) return false;
+        st->is_end = true;
+        st->snapshot = (unsigned char *)malloc((size_t)used);
+        if (!st->snapshot) return false;
+        uint32_t base_count = 0, base_end = 0;
+        if (!lowkv_read_checked_end(g, raw_entry, p, myds_kvdsk_hash_tokens(tokens, p),
+            used, st->snapshot, &base_count, &base_end)) return false;
+        st->count = base_count;
+        st->base_end = base_end;
+        const size_t window_bytes = (size_t)V41_LAYERS * V41_WINDOW * V41_HEAD_DIM * 4u;
+        size_t off = V41_LOWKV_HEADER + sizeof(myds_engram_history_t) + 16384u + window_bytes;
+        for (uint32_t i = 0; i < st->count; ++i) {
+            const unsigned char *ref = st->snapshot + off;
+            off += V41_LOWKV_REF_BYTES;
+            st->ref[i] = (lowkv_segment_ref_t){lk_get_u32(ref), lk_get_u32(ref + 4),
+                lk_get_u32(ref + 8), lk_get_u64(ref + 16), lk_get_u64(ref + 24)};
+            const lowkv_segment_ref_t *r = &st->ref[i];
+            if (r->slot / g->low_ways != i || r->start != lowkv_segment_start(i) ||
+                r->end != lowkv_segment_end(i) || r->hash != myds_kvdsk_hash_tokens(tokens, r->end) ||
+                r->bytes != lowkv_segment_bytes(r->start, r->end) || r->bytes > SIZE_MAX) goto bad_end;
+            st->segment[i] = (unsigned char *)malloc((size_t)r->bytes);
+            if (!st->segment[i]) return false;
+            if (!lowkv_read_checked(g->low_segments, r->slot, r->end, r->hash, r->bytes,
+                st->segment[i], false, r->start)) goto bad_end;
+            unsigned char expected[V41_LOWKV_HEADER];
+            lowkv_segment_header(expected, r->start, r->end);
+            if (memcmp(st->segment[i], expected, sizeof(expected))) {
+                (void)myds_kvdsk_slot_clear(g->low_segments, r->slot);
+                goto bad_end;
+            }
+        }
+        return true;
+    bad_end:
+        (void)myds_kvdsk_slot_clear(g->low_ends, raw_entry);
+        return false;
+    }
+
+    st->is_end = false;
     st->count = lowkv_segment_count(p);
     const uint64_t bytes = lowkv_payload_bytes(p);
     if (!st->count || st->count > MYDS_SNAP_PINNED || !bytes || bytes > SIZE_MAX) return false;
-    st->snapshot = malloc((size_t)bytes);
+    st->snapshot = (unsigned char *)malloc((size_t)bytes);
     if (!st->snapshot) return false;
     if (!lowkv_read_checked(g->low_store, entry, p, myds_kvdsk_hash_tokens(tokens, p),
         bytes, st->snapshot, true, 0)) return false;
@@ -1075,7 +1429,7 @@ static bool lowkv_stage_slot(myds_v41_context_t *g, uint32_t entry, uint32_t p,
         if (r->slot / g->low_ways != i || r->start != lowkv_segment_start(i) ||
             r->end != lowkv_segment_end(i) || r->hash != myds_kvdsk_hash_tokens(tokens, r->end) ||
             r->bytes != lowkv_segment_bytes(r->start, r->end) || r->bytes > SIZE_MAX) goto bad;
-        st->segment[i] = malloc((size_t)r->bytes);
+        st->segment[i] = (unsigned char *)malloc((size_t)r->bytes);
         if (!st->segment[i]) return false;  /* Allocation pressure is a miss, not disk corruption. */
         if (!lowkv_read_checked(g->low_segments, r->slot, r->end, r->hash, r->bytes,
             st->segment[i], false, r->start)) goto bad;
@@ -1096,7 +1450,7 @@ static unsigned char *lowkv_restore_destination(myds_metal_buffer_t *buf,
     uint64_t offset, uint64_t bytes) {
     const uint64_t size = myds_metal_buffer_size(buf);
     if (!buf || offset > size || bytes > size - offset || offset > SIZE_MAX) return NULL;
-    unsigned char *data = myds_metal_buffer_data(buf);
+    unsigned char *data = (unsigned char *)myds_metal_buffer_data(buf);
     return data ? data + (size_t)offset : NULL;
 }
 
@@ -1122,27 +1476,71 @@ static bool lowkv_publish_stage(myds_v41_context_t *g, uint32_t s, uint32_t p,
         prev_score[o] = lowkv_restore_destination(g->snap_prev_score[s][o], 0, 512u * 4u);
         if (!compressed[o] || !index[o] || !prev_kv[o] || !prev_score[o]) return false;
     }
-    memcpy(window, st->snapshot + V41_LOWKV_HEADER + sizeof(myds_engram_history_t), window_bytes);
-    for (uint32_t i = 0; i < st->count; ++i) {
-        size_t src = V41_LOWKV_HEADER;
+
+    if (st->is_end) {
+        const size_t win_off = V41_LOWKV_HEADER + sizeof(myds_engram_history_t) + 16384u;
+        memcpy(window, st->snapshot + win_off, window_bytes);
+
+        size_t prev_off = V41_LOWKV_HEADER + sizeof(myds_engram_history_t);
+        for (uint32_t o = 0; o < 4u; ++o) {
+            memcpy(prev_kv[o], st->snapshot + prev_off, 512u * 4u);
+            prev_off += 512u * 4u;
+        }
+        for (uint32_t o = 0; o < 4u; ++o) {
+            memcpy(prev_score[o], st->snapshot + prev_off, 512u * 4u);
+            prev_off += 512u * 4u;
+        }
+
+        for (uint32_t i = 0; i < st->count; ++i) {
+            size_t src = V41_LOWKV_HEADER;
+            for (uint32_t kind = 0; kind < 2u; ++kind) {
+                const uint32_t width = kind ? V41_INDEX_DIM : V41_LOWKV_LATENT;
+                for (uint32_t o = 0; o < 4u; ++o) {
+                    const uint32_t ratio = lowkv_owner_ratio(o);
+                    const size_t n = (size_t)((st->ref[i].end - st->ref[i].start) / ratio) * width * V41_CACHE_BYTES;
+                    const size_t dst = (size_t)(st->ref[i].start / ratio) * width * V41_CACHE_BYTES;
+                    memcpy((kind ? index[o] : compressed[o]) + dst, st->segment[i] + src, n);
+                    src += n;
+                }
+            }
+        }
+
+        size_t tail_off = win_off + window_bytes + (size_t)st->count * V41_LOWKV_REF_BYTES;
         for (uint32_t kind = 0; kind < 2u; ++kind) {
             const uint32_t width = kind ? V41_INDEX_DIM : V41_LOWKV_LATENT;
             for (uint32_t o = 0; o < 4u; ++o) {
                 const uint32_t ratio = lowkv_owner_ratio(o);
-                const size_t n = (size_t)((st->ref[i].end - st->ref[i].start) / ratio) * width * V41_CACHE_BYTES;
-                const size_t dst = (size_t)(st->ref[i].start / ratio) * width * V41_CACHE_BYTES;
-                memcpy((kind ? index[o] : compressed[o]) + dst, st->segment[i] + src, n);
-                src += n;
+                const uint32_t start_row = st->base_end / ratio;
+                const uint32_t end_row = p / ratio;
+                if (end_row > start_row) {
+                    const size_t n = (size_t)(end_row - start_row) * width * V41_CACHE_BYTES;
+                    const size_t dst = (size_t)start_row * width * V41_CACHE_BYTES;
+                    memcpy((kind ? index[o] : compressed[o]) + dst, st->snapshot + tail_off, n);
+                    tail_off += n;
+                }
             }
         }
+    } else {
+        memcpy(window, st->snapshot + V41_LOWKV_HEADER + sizeof(myds_engram_history_t), window_bytes);
+        for (uint32_t i = 0; i < st->count; ++i) {
+            size_t src = V41_LOWKV_HEADER;
+            for (uint32_t kind = 0; kind < 2u; ++kind) {
+                const uint32_t width = kind ? V41_INDEX_DIM : V41_LOWKV_LATENT;
+                for (uint32_t o = 0; o < 4u; ++o) {
+                    const uint32_t ratio = lowkv_owner_ratio(o);
+                    const size_t n = (size_t)((st->ref[i].end - st->ref[i].start) / ratio) * width * V41_CACHE_BYTES;
+                    const size_t dst = (size_t)(st->ref[i].start / ratio) * width * V41_CACHE_BYTES;
+                    memcpy((kind ? index[o] : compressed[o]) + dst, st->segment[i] + src, n);
+                    src += n;
+                }
+            }
+        }
+        for (uint32_t o = 0; o < 4u; ++o) {
+            memset(prev_kv[o], 0, 512u * 4u);
+            memset(prev_score[o], 0, 512u * 4u);
+        }
     }
-    for (uint32_t o = 0; o < 4u; ++o) {
-        /* Disk positions are even: pool2 overwrites previous_* before its
-         * next odd-position read. They need no disk payload; initialize the
-         * otherwise unused snapshot buffers deterministically. */
-        memset(prev_kv[o], 0, 512u * 4u);
-        memset(prev_score[o], 0, 512u * 4u);
-    }
+
     memcpy(&g->snap_engram[s], st->snapshot + V41_LOWKV_HEADER, sizeof(myds_engram_history_t));
     for (uint32_t i = 0; i < V41_SNAP_SLOTS; ++i) {
         g->snap_pos[i] = i == s ? p : 0;
@@ -1157,23 +1555,32 @@ static uint64_t lowkv_store_file_bytes(uint32_t entries, uint64_t stride) {
 }
 
 static bool lowkv_open_stores(myds_v41_context_t *g, const char *snap_path,
-    const char *segment_path, uint64_t identity, uint32_t ways, uint64_t budget) {
+    const char *segment_path, const char *end_path, uint64_t identity, uint32_t ways, uint64_t budget) {
     const uint32_t entries = MYDS_SNAP_PINNED * ways;
     const uint64_t snapshot_stride = lowkv_payload_bytes(lowkv_segment_end(MYDS_SNAP_PINNED - 1u));
     const uint64_t segment_stride = lowkv_segment_bytes(0, MYDS_SNAP_MIN);
+    const uint64_t end_stride = V41_LOWKV_END_STRIDE;
     const uint64_t total = lowkv_store_file_bytes(entries, snapshot_stride) +
-        lowkv_store_file_bytes(entries, segment_stride);
+        lowkv_store_file_bytes(entries, segment_stride) +
+        lowkv_store_file_bytes(V41_LOWKV_ENDS_MAX, end_stride);
     if (!segment_stride || (budget && total > budget)) {
-        MYDS_LOG_E("kvdisk: snapshot + segments require %.1f MiB, budget %.1f MiB",
+        MYDS_LOG_E("kvdisk: snapshot + segments + ends require %.1f MiB, budget %.1f MiB",
             (double)total / 1048576.0, (double)budget / 1048576.0);
         return false;
     }
     const uint64_t snapshot_id = myds_kvdsk_identity("v41-lowkv-snapshot-v3", &identity, 1);
     const uint64_t segment_id = myds_kvdsk_identity("v41-lowkv-segments-v1", &identity, 1);
+    const uint64_t end_id = myds_kvdsk_identity("v41-lowkv-ends-v1", &identity, 1);
     g->low_segments = myds_kvdsk_open(segment_path, segment_id, entries, segment_stride, 0);
     if (!g->low_segments) return false;
     g->low_store = myds_kvdsk_open(snap_path, snapshot_id, entries, snapshot_stride, 0);
     if (!g->low_store) { myds_kvdsk_close(g->low_segments); g->low_segments = NULL; return false; }
+    g->low_ends = myds_kvdsk_open(end_path, end_id, V41_LOWKV_ENDS_MAX, end_stride, 0);
+    if (!g->low_ends) {
+        myds_kvdsk_close(g->low_store); g->low_store = NULL;
+        myds_kvdsk_close(g->low_segments); g->low_segments = NULL;
+        return false;
+    }
     g->low_ways = ways;
     return true;
 }
@@ -1210,7 +1617,7 @@ bool myds_v41_low_kv_enable(myds_v41_context_t *g, const char *dir) {
         return false;
     }
 
-    /* 默认预算不限。显式预算检查两个固定 stride 文件的虚拟大小之和，包含头/表对齐。
+    /* 默认预算不限。显式预算检查三个固定 stride 文件的虚拟大小之和，包含头/表对齐。
      * 预算不足时在打开任一文件前失败，不会减少 ways 或只启用一个库。 */
     uint64_t budget = 0;   /* 0 = 不限 */
     const char *be = getenv("MYDS_KV_DSK_BUDGET_MB");
@@ -1220,7 +1627,7 @@ bool myds_v41_low_kv_enable(myds_v41_context_t *g, const char *dir) {
         else MYDS_LOG_W("kvdisk: MYDS_KV_DSK_BUDGET_MB=%s 非法（需 > 0）⇒ 按【不限】处理", be);
     }
 
-    char path[1200], segment_path[1200];
+    char path[1200], segment_path[1200], end_path[1200];
     const int n = snprintf(path, sizeof(path), "%s/kvlow-v3-%016llx.bin",
                            dir, (unsigned long long)identity);
     if (n <= 0 || (size_t)n >= sizeof(path)) {
@@ -1230,7 +1637,10 @@ bool myds_v41_low_kv_enable(myds_v41_context_t *g, const char *dir) {
     const int sn = snprintf(segment_path, sizeof(segment_path), "%s/kvsegments-v1-%016llx.bin",
                             dir, (unsigned long long)identity);
     if (sn <= 0 || (size_t)sn >= sizeof(segment_path)) return false;
-    if (!lowkv_open_stores(g, path, segment_path, identity, ways, budget)) {
+    const int en = snprintf(end_path, sizeof(end_path), "%s/kvends-v1-%016llx.bin",
+                            dir, (unsigned long long)identity);
+    if (en <= 0 || (size_t)en >= sizeof(end_path)) return false;
+    if (!lowkv_open_stores(g, path, segment_path, end_path, identity, ways, budget)) {
         MYDS_LOG_E("kvdisk: 打开失败: %s（%s）", path, myds_kvdsk_open_error());
         return false;
     }
@@ -1245,7 +1655,7 @@ bool myds_v41_low_kv_enable(myds_v41_context_t *g, const char *dir) {
 }
 
 bool myds_v41_low_kv_enabled(const myds_v41_context_t *g) {
-    return g && g->low_store != NULL && g->low_segments != NULL;
+    return g && g->low_store != NULL && g->low_segments != NULL && g->low_ends != NULL;
 }
 
 /* ── 后台写盘 ──
@@ -1366,6 +1776,52 @@ bool myds_v41_low_kv_save(myds_v41_context_t *g, const int32_t *tokens, uint32_t
     if (written)   /* 这段时间全部挂在首 token 之前 */
         MYDS_LOG_I("kvdisk: 同步写盘 %u 条 · %.1f MiB · %.1f ms（首 token 前）",
                    written, (double)bytes / 1048576.0, lowkv_now_ms() - t0);
+
+    /* Prompt-end 快照落盘（Slot 0）：位置由 snapshot_store_now 记下（通常为 n_tokens - 1）。
+     * 仅当该点未被 pinned 槽覆盖且达到 MYDS_SNAP_MIN 时落盘。必须同步写完以避免与后续 decode 竞争。 */
+    const uint32_t p_end = g->snap_pos[0];
+    if (g->low_ends && p_end >= MYDS_SNAP_MIN && p_end < n_tokens) {
+        const bool on_grid = ((p_end - MYDS_SNAP_MIN) % MYDS_SNAP_STRIDE == 0) &&
+            (p_end <= MYDS_SNAP_MIN + (MYDS_SNAP_PINNED - 1u) * MYDS_SNAP_STRIDE);
+        const uint32_t pinned_s = on_grid ? snapshot_slot_for(p_end, false) : 0;
+        const bool pinned_active = (pinned_s > 0 && g->snap_pos[pinned_s] == p_end);
+        if (!pinned_active) {
+            const uint32_t bc = lowkv_base_segment_count(p_end);
+            const uint32_t be = lowkv_base_segment_end(bc);
+            const uint64_t end_hash = myds_kvdsk_hash_tokens(tokens, p_end);
+            const uint64_t end_bytes = lowkv_end_payload_bytes(p_end, bc, be);
+            bool already = false;
+            const uint32_t end_slot = lowkv_pick_end_entry(g, p_end, end_hash, end_bytes, &already);
+            if (end_slot != V41_LOWKV_NO_ENTRY) {
+                lowkv_segment_ref_t refs[MYDS_SNAP_PINNED];
+                unsigned char *stage = (unsigned char *)malloc(V41_LOWKV_STAGE);
+                bool end_ok = (stage != NULL);
+                for (uint32_t j = 0; j < bc && end_ok; ++j) {
+                    if (!have_hash[j]) {
+                        prefix_hashes[j] = myds_kvdsk_hash_tokens(tokens, lowkv_segment_end(j));
+                        have_hash[j] = true;
+                    }
+                    end_ok = lowkv_ensure_segment(g, j, prefix_hashes[j], stage, &refs[j]);
+                }
+                if (end_ok) {
+                    if (!already || !lowkv_end_refs_match(g, end_slot, bc, refs)) {
+                        const double t_end0 = lowkv_now_ms();
+                        if (lowkv_write_end_slot(g, end_slot, p_end, end_hash, bc, be, refs, stage)) {
+                            MYDS_LOG_I("kvdisk: prompt-end 快照落盘成功 · 槽 %u · 位置 %u (base %u, tail %u) · %.1f MiB · %.1f ms",
+                                       end_slot, p_end, be, p_end - be, (double)end_bytes / 1048576.0, lowkv_now_ms() - t_end0);
+                        } else {
+                            MYDS_LOG_W("kvdisk: prompt-end 快照位置 %u 写盘失败", p_end);
+                            ok = false;
+                        }
+                    }
+                } else {
+                    ok = false;
+                }
+                free(stage);
+            }
+        }
+    }
+
     if (n_async) {
         g->low_job_n = n_async;
         g->low_thr_ok = true;
@@ -1403,11 +1859,28 @@ static uint32_t lowkv_probe_entry(myds_v41_context_t *g, const int32_t *tokens,
             if (!myds_kvdsk_slot_meta(g->low_store, e, &p, &hh, &hu)) continue;
             if (p == group_pos && hh == want && hu == lowkv_payload_bytes(p)) {
                 best_entry = e; best_pos = group_pos;
-                if (out_entry) *out_entry = best_entry;
-                return best_pos;                  /* Descending depth: the first legal hit is deepest. */
+                break;
             }
         }
     }
+
+    /* 检查 prompt-end 快照：若比已发现的 pinned 快照更深，直接优选更深的位置 */
+    if (g->low_ends) {
+        for (uint32_t e = 0; e < V41_LOWKV_ENDS_MAX; ++e) {
+            uint32_t p = 0; uint64_t hh = 0, hu = 0;
+            if (!myds_kvdsk_slot_meta(g->low_ends, e, &p, &hh, &hu)) continue;
+            if (p > max_position || p <= min_position || p <= best_pos) continue;
+            const uint32_t bc = lowkv_base_segment_count(p);
+            const uint32_t be = lowkv_base_segment_end(bc);
+            if (hu != lowkv_end_payload_bytes(p, bc, be)) continue;
+            const uint64_t want = myds_kvdsk_hash_tokens(tokens, p);
+            if (hh == want) {
+                best_entry = e | V41_LOWKV_ENTRY_IS_END;
+                best_pos = p;
+            }
+        }
+    }
+
     if (out_entry) *out_entry = best_entry;
     return best_pos;
 }
@@ -1429,22 +1902,26 @@ uint32_t myds_v41_low_kv_load_deeper(myds_v41_context_t *g, const int32_t *token
     const uint32_t best_pos = lowkv_probe_entry(g, tokens, memory_position, max_position, &entry);
     if (!best_pos || entry == V41_LOWKV_NO_ENTRY || !myds_metal_commit_batch()) return 0;
     lowkv_restore_stage_t stage = {0};
-    const uint32_t slot = entry / g->low_ways + 1u;
+    const bool is_end = (entry & V41_LOWKV_ENTRY_IS_END) != 0;
+    const uint32_t slot = is_end ? 0u : (entry / g->low_ways + 1u);
     const bool ok = lowkv_stage_slot(g, entry, best_pos, tokens, &stage) &&
         lowkv_publish_stage(g, slot, best_pos, &stage);
-    lowkv_restore_stage_free(&stage);
     if (!ok) {
+        lowkv_restore_stage_free(&stage);
         MYDS_LOG_W("kvdisk: 位置 %u 的事务恢复失败；保留原内存快照与 live state (load %.3f ms)",
                    best_pos, lowkv_now_ms() - started_ms);
         return 0;
     }
-    /* Count actual published restores, not a metadata hit or a read that
-     * later failed on another segment/destination. */
-    (void)myds_kvdsk_slot_touch(g->low_store, entry);
+    if (is_end) {
+        (void)myds_kvdsk_slot_touch(g->low_ends, entry & ~V41_LOWKV_ENTRY_IS_END);
+    } else {
+        (void)myds_kvdsk_slot_touch(g->low_store, entry);
+    }
     for (uint32_t i = 0; i < stage.count; ++i)
         (void)myds_kvdsk_slot_touch(g->low_segments, stage.ref[i].slot);
-    MYDS_LOG_I("kvdisk: 命中位置 %u ⇒ 免掉 %u 个 token 的 prefill (load+publish %.3f ms)",
-               best_pos, best_pos, lowkv_now_ms() - started_ms);
+    lowkv_restore_stage_free(&stage);
+    MYDS_LOG_I("kvdisk: 命中位置 %u (%s) ⇒ 免掉 %u 个 token 的 prefill (load+publish %.3f ms)",
+               best_pos, is_end ? "prompt-end" : "pinned", best_pos, lowkv_now_ms() - started_ms);
     return best_pos;
 }
 
@@ -1472,8 +1949,11 @@ bool myds_v41_low_kv_fixture_enable(myds_v41_context_t *g, const char *path, uin
     }
     char segment_path[1400];
     const int n = snprintf(segment_path, sizeof(segment_path), "%s.segments", path);
-    if (n <= 0 || (size_t)n >= sizeof(segment_path) ||
-        !lowkv_open_stores(g, path, segment_path, identity, ways, 0)) return false;
+    if (n <= 0 || (size_t)n >= sizeof(segment_path)) return false;
+    char end_path[1400];
+    const int en = snprintf(end_path, sizeof(end_path), "%s.ends", path);
+    if (en <= 0 || (size_t)en >= sizeof(end_path) ||
+        !lowkv_open_stores(g, path, segment_path, end_path, identity, ways, 0)) return false;
     g->low_async = async_on;
     return true;
 }
@@ -1495,6 +1975,11 @@ void myds_v41_low_kv_write_bytes(myds_v41_context_t *g, uint64_t *snapshots, uin
 myds_kvdsk_t *myds_v41_low_kv_fixture_segments(myds_v41_context_t *g) {
     lowkv_join(g);
     return g ? g->low_segments : NULL;
+}
+
+myds_kvdsk_t *myds_v41_low_kv_fixture_ends(myds_v41_context_t *g) {
+    lowkv_join(g);
+    return g ? g->low_ends : NULL;
 }
 
 void myds_v41_low_kv_fixture_fail_segment(myds_v41_context_t *g, uint32_t end) {
@@ -1754,8 +2239,10 @@ void myds_v41_context_free(myds_v41_context_t *g) {
     lowkv_join(g);                     /* 先等后台写盘结束：它还在读下面要释放的缓冲 */
     myds_kvdsk_close(g->low_store);
     myds_kvdsk_close(g->low_segments);
+    myds_kvdsk_close(g->low_ends);
     g->low_store = NULL;
     g->low_segments = NULL;
+    g->low_ends = NULL;
 #define F(x) myds_metal_buffer_free(g->x)
     F(residual); F(after_attn); F(flat_norm); F(mix); F(attn_split); F(ffn_split); F(pre);
     F(engram_rows[0]); F(engram_rows[1]); F(engram_kv);

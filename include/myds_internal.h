@@ -58,6 +58,7 @@ struct myds_model {
     gguf_file_t         *gf;
     myds_tokenizer_t    *tokenizer;
     myds_v41_model_t    *v41;
+    char                 model_path[1024];
 
     char                 arch[64];
     uint32_t             dim;
@@ -234,9 +235,12 @@ void myds_v41_low_kv_segment_stats(myds_v41_context_t *g, uint32_t *live,
 void myds_v41_low_kv_write_bytes(myds_v41_context_t *g, uint64_t *snapshots, uint64_t *segments);
 struct myds_kvdsk;
 struct myds_kvdsk *myds_v41_low_kv_fixture_segments(myds_v41_context_t *g);
+struct myds_kvdsk *myds_v41_low_kv_fixture_ends(myds_v41_context_t *g);
 void myds_v41_low_kv_fixture_fail_segment(myds_v41_context_t *g, uint32_t end);
 void myds_v41_snapshot_fixture_publish(myds_v41_context_t *g, uint32_t slot, uint32_t p);
 myds_metal_buffer_t *myds_v41_snapshot_get_snap_window(myds_v41_context_t *g, uint32_t slot);
+myds_metal_buffer_t *myds_v41_snapshot_get_snap_prev_kv(myds_v41_context_t *g, uint32_t slot, uint32_t o);
+myds_metal_buffer_t *myds_v41_snapshot_get_snap_prev_score(myds_v41_context_t *g, uint32_t slot, uint32_t o);
 uint64_t myds_v41_snapshot_allocated_bytes(const myds_v41_context_t *g);
 myds_metal_buffer_t *myds_v41_snapshot_get_compressed(myds_v41_context_t *g, uint32_t o);
 myds_metal_buffer_t *myds_v41_snapshot_get_index_cache(myds_v41_context_t *g, uint32_t o);

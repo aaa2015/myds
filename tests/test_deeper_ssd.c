@@ -47,7 +47,13 @@ static uint64_t deeper_state_hash(myds_v41_context_t *g) {
         const uint32_t staged = myds_v41_snapshot_get_staged_pos(g, s);
         h = deeper_hash(h, &p, sizeof(p));
         h = deeper_hash(h, &staged, sizeof(staged));
-        if (p) h = deeper_buffer_hash(h, myds_v41_snapshot_get_snap_window(g, s));
+        if (p) {
+            h = deeper_buffer_hash(h, myds_v41_snapshot_get_snap_window(g, s));
+            for (uint32_t o = 0; o < 4u; ++o) {
+                h = deeper_buffer_hash(h, myds_v41_snapshot_get_snap_prev_kv(g, s, o));
+                h = deeper_buffer_hash(h, myds_v41_snapshot_get_snap_prev_score(g, s, o));
+            }
+        }
     }
     uint32_t history[3]; myds_v41_snapshot_get_engram_history(g, history);
     h = deeper_hash(h, history, sizeof(history));
@@ -281,6 +287,143 @@ static void test_deeper_engine_select(const char *path, bool corrupt, bool enabl
     myds_context_free(ctx); myds_model_free(model); lk_remove_store(path);
 }
 
+static void test_deeper_prompt_end_snapshot(const char *path) {
+    char ends_path[600];
+    snprintf(ends_path, sizeof(ends_path), "%s.ends", path);
+
+    int32_t *tokens = lk_tokens();
+    myds_v41_context_t *g = myds_v41_context_create_snapshot_fixture();
+    assert(g && myds_v41_low_kv_fixture_enable(g, path, 0x5EEDull, 2, false, DEEPER_CAP));
+
+    lk_fill_state(g);
+
+    const uint32_t p_end = 2305u;
+    for (uint32_t l = 0; l < 40u; ++l) {
+        float *w = (float *)myds_metal_buffer_data(myds_v41_snapshot_get_window(g, l));
+        const size_t nw = myds_metal_buffer_size(myds_v41_snapshot_get_window(g, l)) / sizeof(float);
+        for (size_t k = 0; k < nw; ++k) w[k] = (float)(l * 1009u + k * 17u + 42u);
+    }
+    for (uint32_t o = 0; o < 4u; ++o) {
+        float *pkv = (float *)myds_metal_buffer_data(myds_v41_snapshot_get_previous_kv(g, o));
+        float *psc = (float *)myds_metal_buffer_data(myds_v41_snapshot_get_previous_score(g, o));
+        for (size_t k = 0; k < 512; ++k) {
+            pkv[k] = (float)(o * 2003u + k * 13u + 7u);
+            psc[k] = (float)(o * 3001u + k * 19u + 11u);
+        }
+        const uint32_t r = lk_ratio(o);
+        uint16_t *c = (uint16_t *)myds_metal_buffer_data(myds_v41_snapshot_get_compressed(g, o));
+        uint16_t *x = (uint16_t *)myds_metal_buffer_data(myds_v41_snapshot_get_index_cache(g, o));
+        for (uint32_t row = 2048u / r; row < (p_end + r - 1u) / r; ++row) {
+            for (size_t k = 0; k < 512; ++k) c[row * 512 + k] = (uint16_t)(0x5500u + (row * 31u + k) % 256u);
+            for (size_t k = 0; k < 128; ++k) x[row * 128 + k] = (uint16_t)(0xaa00u + (row * 37u + k) % 256u);
+        }
+    }
+    myds_v41_snapshot_set_engram_history(g, 777, 888, 999);
+
+    assert(myds_v41_snapshot_store_now(g, p_end));
+    assert(myds_v41_snapshot_get_pos(g, 0) == p_end);
+
+    assert(myds_v41_low_kv_save(g, tokens, p_end + 1u));
+
+    myds_kvdsk_t *ends = myds_v41_low_kv_fixture_ends(g);
+    assert(ends);
+    uint32_t end_pos = 0; uint64_t end_h = 0, end_used = 0;
+    assert(myds_kvdsk_slot_meta(ends, 0, &end_pos, &end_h, &end_used));
+    assert(end_pos == p_end);
+
+    for (uint32_t s = 1; s < MYDS_SNAP_SLOTS; ++s)
+        myds_v41_snapshot_fixture_publish(g, s, 0);
+    const uint64_t golden_state = deeper_state_hash(g);
+
+    lk_make_fork_state(g);
+    for (uint32_t l = 0; l < 40u; ++l)
+        memset(myds_metal_buffer_data(myds_v41_snapshot_get_window(g, l)), 0x33,
+               myds_metal_buffer_size(myds_v41_snapshot_get_window(g, l)));
+    for (uint32_t o = 0; o < 4u; ++o) {
+        memset(myds_metal_buffer_data(myds_v41_snapshot_get_previous_kv(g, o)), 0x33, 512 * 4);
+        memset(myds_metal_buffer_data(myds_v41_snapshot_get_previous_score(g, o)), 0x33, 512 * 4);
+    }
+    myds_v41_snapshot_fixture_publish(g, 0, 0);
+
+    assert(myds_v41_low_kv_probe(g, tokens, 2047) == 1536);
+    assert(myds_v41_low_kv_probe(g, tokens, 2048) == 2048);
+    assert(myds_v41_low_kv_probe(g, tokens, 2304) == 2048);
+    assert(myds_v41_low_kv_probe(g, tokens, 2305) == 2305);
+    assert(myds_v41_low_kv_probe_deeper(g, tokens, 2048, 2305) == 2305);
+    assert(myds_v41_low_kv_probe_deeper(g, tokens, 2305, 2305) == 0);
+
+    assert(myds_v41_low_kv_load_deeper(g, tokens, 1024, 2305) == 2305);
+    assert(myds_v41_snapshot_get_pos(g, 0) == 2305);
+    assert(myds_v41_snapshot_restore(g, 2305));
+    assert(deeper_state_hash(g) == golden_state);
+
+    uint32_t hits = 0;
+    assert(myds_kvdsk_slot_hits(ends, 0, &hits) && hits == 1);
+
+    /* 7. Transactional corruption test on kvends-v1:
+     * Corrupt slot 0 payload in ends_path. */
+    const uint64_t before_corrupt = deeper_state_hash(g);
+    deeper_corrupt(ends_path, 0, 64 + 10);
+    assert(myds_v41_low_kv_probe(g, tokens, 2305) == 2305);
+    assert(myds_v41_low_kv_load_deeper(g, tokens, 1024, 2305) == 0);
+    assert(deeper_state_hash(g) == before_corrupt);
+
+    myds_v41_context_free(g);
+    free(tokens);
+    lk_remove_store(path);
+    puts("  [PASS] prompt-end SSD snapshot (kvends-v1): odd-position previous state, tail rows, bit-exact restore, and transactional corruption rollback");
+}
+
+static void test_deeper_prompt_end_eviction(const char *path) {
+    myds_v41_context_t *g = myds_v41_context_create_snapshot_fixture();
+    assert(g && myds_v41_low_kv_fixture_enable(g, path, 0x5EEDull, 2, false, DEEPER_CAP));
+    lk_fill_state(g);
+    myds_kvdsk_t *ends = myds_v41_low_kv_fixture_ends(g);
+    assert(ends);
+
+    int32_t *tokens = lk_tokens();
+    /* Fill all 8 end slots with different positions 2101, 2103, ..., 2115 */
+    for (uint32_t i = 0; i < 8u; ++i) {
+        const uint32_t p = 2101u + i * 2u;
+        assert(myds_v41_snapshot_store_now(g, p));
+        assert(myds_v41_low_kv_save(g, tokens, p + 1u));
+        uint32_t meta_p = 0;
+        assert(myds_kvdsk_slot_meta(ends, i, &meta_p, NULL, NULL) && meta_p == p);
+    }
+    assert(myds_kvdsk_live_entries(ends) == 8u);
+
+    /* Touch slots 1..7 so they have hits >= 1, leave slot 0 with 0 hits */
+    for (uint32_t i = 1; i < 8u; ++i) {
+        const uint32_t p = 2101u + i * 2u;
+        assert(myds_v41_low_kv_load_deeper(g, tokens, 1024, p) == p);
+        uint32_t hits = 0;
+        assert(myds_kvdsk_slot_hits(ends, i, &hits) && hits == 1);
+    }
+    uint32_t hits0 = 0;
+    assert(myds_kvdsk_slot_hits(ends, 0, &hits0) && hits0 == 0);
+
+    /* Save a 9th prompt end at p = 2117.
+     * Slot 0 has 0 hits, so slot 0 MUST be the victim. */
+    const uint32_t p9 = 2117u;
+    assert(myds_v41_snapshot_store_now(g, p9));
+    assert(myds_v41_low_kv_save(g, tokens, p9 + 1u));
+
+    /* Verify slot 0 is now p9 (2117) */
+    uint32_t meta_p0 = 0;
+    assert(myds_kvdsk_slot_meta(ends, 0, &meta_p0, NULL, NULL) && meta_p0 == p9);
+
+    /* Verify slots 1..7 still retain their original positions */
+    for (uint32_t i = 1; i < 8u; ++i) {
+        uint32_t meta_pi = 0;
+        assert(myds_kvdsk_slot_meta(ends, i, &meta_pi, NULL, NULL) && meta_pi == 2101u + i * 2u);
+    }
+
+    myds_v41_context_free(g);
+    free(tokens);
+    lk_remove_store(path);
+    puts("  [PASS] prompt-end SSD eviction: 8 slots bound capacity, least-hit victim replacement, survivor preservation");
+}
+
 int main(int argc, char **argv) {
     const bool enabled = !(argc == 2 && strcmp(argv[1], "--legacy-selection") == 0);
     assert(setenv("MYDS_PREFIX_CACHE", "1", 1) == 0);
@@ -290,6 +433,8 @@ int main(int argc, char **argv) {
     char dir[] = "/tmp/myds_deeper_ssd_XXXXXX"; assert(mkdtemp(dir));
     char path[512]; snprintf(path, sizeof(path), "%s/kv.bin", dir);
     test_deeper_probe_and_success(path);
+    test_deeper_prompt_end_snapshot(path);
+    test_deeper_prompt_end_eviction(path);
     for (unsigned mode = 0; mode < 5; ++mode) test_deeper_failure_preserves_ram(path, mode);
     test_deeper_capacity_and_identity(path);
     test_deeper_disabled();
