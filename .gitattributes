@@ -23,3 +23,9 @@ docs/benchmarks/2026-10-05-remaining-performance/** -text
 docs/benchmarks/2026-10-05-remaining-performance/**/*.patch -whitespace
 docs/benchmarks/2026-10-05-remaining-performance/*.patch -whitespace
 docs/benchmarks/2026-10-05-remaining-performance/**/*.log -whitespace
+# Decode split adoption retains original model logs and patch bytes.
+docs/benchmarks/2026-10-05-decode-split-adoption/** -text
+docs/benchmarks/2026-10-05-decode-split-adoption/**/*.patch -whitespace
+docs/benchmarks/2026-10-05-decode-split-adoption/**/*.log -whitespace
+# Preserve the frozen production startup script byte-for-byte.
+docs/benchmarks/2026-10-05-decode-split-adoption/window/start_fleet.before.sh -whitespace
