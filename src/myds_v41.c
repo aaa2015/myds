@@ -2801,8 +2801,7 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
         CHECK(myds_v41_gpu_attention(ctx->attn_heads,base->attn_sinks,ctx->q,g->window[il],nraw,(pos+1u-nraw)%128,g->selected_kv,top,g->gpu));
         CHECK(myds_metal_v41_bf16(ctx->attn_heads,V41_HEADS*512));
         CHECK(myds_v41_gpu_rope(ctx->attn_heads,512,V41_HEADS,pos,compressed,true));
-        CHECK(myds_metal_attn_output_a(ctx->attn_low,base->attn_output_a,ctx->attn_heads,8,4096,1024,base->attn_output_a_type));
-        CHECK(myds_metal_v41_bf16(ctx->attn_low,8192));
+        CHECK(myds_metal_attn_output_a_bf16(ctx->attn_low,base->attn_output_a,ctx->attn_heads,8,4096,1024,base->attn_output_a_type));
         CHECK(project_decode_tail(ctx->attn_out,base->attn_output_b,ctx->attn_low,V41_DIM,8192,base->attn_output_b_type,trace_on));
         TRACE("attn_out",ctx->attn_out,V41_DIM);
         phase="HC FFN input";

@@ -30,6 +30,15 @@ static int dispatch(const char *kernel, const void *args, size_t size,
     return myds_metal_dispatch_kernel(kernel, args, size, buffers, count, grid, block, scratch);
 }
 
+static inline bool is_route_fuse_enabled(void) {
+    static int cached = -1;
+    if (__builtin_expect(cached < 0, 0)) {
+        const char *v = getenv("MYDS_MOE_ROUTE_FUSE");
+        cached = (v && strcmp(v, "0") == 0) ? 0 : 1;
+    }
+    return cached == 1;
+}
+
 int myds_v41_route_batch(myds_metal_buffer_t *selected, myds_metal_buffer_t *weights,
     myds_metal_buffer_t *probs, myds_metal_buffer_t *scores,
     const myds_metal_buffer_t *logits, const myds_metal_buffer_t *bias,
@@ -42,23 +51,32 @@ int myds_v41_route_batch(myds_metal_buffer_t *selected, myds_metal_buffer_t *wei
     struct route_args args = {(uint32_t)total, top_k, 0, scale, rows, experts, experts / 4u};
     const uint32_t tgroups = (uint32_t)((total / 4u + 31u) / 32u);
 
-    const myds_metal_buffer_t *softplus[] = {logits, bias, probs};
-    args.op = 0;
-    if (!dispatch("kernel_myds_v41_route_transform", &args, sizeof(args), softplus, 3,
-                  tgroups, 32, 0)) {
-        MYDS_LOG_E("V4.1 route transform dispatch failed");
-        return 0;
+    int fused_prep_ok = 0;
+    if (is_route_fuse_enabled()) {
+        const myds_metal_buffer_t *prep[] = {logits, bias, probs, scores};
+        fused_prep_ok = dispatch("kernel_myds_v41_route_prepare", &args, sizeof(args), prep, 4,
+                                 tgroups, 32, 0);
     }
-    const myds_metal_buffer_t *sqrt_buffers[] = {probs, bias, probs};
-    args.op = 1;
-    if (!dispatch("kernel_myds_v41_route_transform", &args, sizeof(args), sqrt_buffers, 3,
-                  tgroups, 32, 0)) return 0;
-    const myds_metal_buffer_t *add[] = {probs, bias, scores};
-    args.op = 2;
-    if (!dispatch("kernel_myds_v41_route_transform", &args, sizeof(args), add, 3,
-                  tgroups, 32, 0)) {
-        MYDS_LOG_E("V4.1 route bias dispatch failed");
-        return 0;
+
+    if (!fused_prep_ok) {
+        const myds_metal_buffer_t *softplus[] = {logits, bias, probs};
+        args.op = 0;
+        if (!dispatch("kernel_myds_v41_route_transform", &args, sizeof(args), softplus, 3,
+                      tgroups, 32, 0)) {
+            MYDS_LOG_E("V4.1 route transform dispatch failed");
+            return 0;
+        }
+        const myds_metal_buffer_t *sqrt_buffers[] = {probs, bias, probs};
+        args.op = 1;
+        if (!dispatch("kernel_myds_v41_route_transform", &args, sizeof(args), sqrt_buffers, 3,
+                      tgroups, 32, 0)) return 0;
+        const myds_metal_buffer_t *add[] = {probs, bias, scores};
+        args.op = 2;
+        if (!dispatch("kernel_myds_v41_route_transform", &args, sizeof(args), add, 3,
+                      tgroups, 32, 0)) {
+            MYDS_LOG_E("V4.1 route bias dispatch failed");
+            return 0;
+        }
     }
 
     /* One row per threadgroup: the kernel already indexes rows by tgpig[0] % ne01. */
@@ -72,6 +90,14 @@ int myds_v41_route_batch(myds_metal_buffer_t *selected, myds_metal_buffer_t *wei
         MYDS_LOG_E("V4.1 route top-k dispatch failed");
         return 0;
     }
+
+    if (is_route_fuse_enabled()) {
+        const myds_metal_buffer_t *finish[] = {probs, selected, weights, scores};
+        if (dispatch("kernel_myds_v41_route_finish", &args, sizeof(args), finish, 4, rows, top_k, 128)) {
+            return 1;
+        }
+    }
+
     const myds_metal_buffer_t *sum[] = {probs, selected, weights, scores};
     const myds_metal_buffer_t *divide[] = {weights, scores};
     const myds_metal_buffer_t *multiply[] = {weights};

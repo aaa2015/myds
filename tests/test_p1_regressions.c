@@ -16,6 +16,7 @@
 #include "myds_internal.h"
 #include "myds_metal.h"
 #include "myds_v41_gpu.h"
+#include "myds_v41_moe.h"
 #include "myds_server_internal.h"
 #include "myds_snapshot_slots.h"
 
@@ -1725,6 +1726,144 @@ static void test_lowkv_segment_failure_paths(void) {
     printf("  [PASS] SSD segment partial writes never publish, aborted writes recover, evicted/replaced/corrupt refs preserve RAM state\n");
 }
 
+static void test_p1_moe_route_fusion(void) {
+    if (!myds_metal_init(NULL)) {
+        fprintf(stderr, "skip test_p1_moe_route_fusion: no Metal\n");
+        return;
+    }
+    const uint32_t experts = 384;
+    const uint32_t top_k = 6;
+    const float scale = 1.5f;
+
+    uint32_t row_configs[] = {1, 2, 8, 33, 128};
+    for (size_t r = 0; r < sizeof(row_configs)/sizeof(row_configs[0]); r++) {
+        uint32_t rows = row_configs[r];
+        uint32_t total = experts * rows;
+
+        myds_metal_buffer_t *logits = myds_metal_buffer_alloc(total * sizeof(float));
+        myds_metal_buffer_t *bias = myds_metal_buffer_alloc(experts * sizeof(float));
+
+        myds_metal_buffer_t *sel_unfused = myds_metal_buffer_alloc(rows * top_k * sizeof(int32_t));
+        myds_metal_buffer_t *w_unfused = myds_metal_buffer_alloc(rows * top_k * sizeof(float));
+        myds_metal_buffer_t *p_unfused = myds_metal_buffer_alloc(total * sizeof(float));
+        myds_metal_buffer_t *s_unfused = myds_metal_buffer_alloc(total * sizeof(float));
+
+        myds_metal_buffer_t *sel_fused = myds_metal_buffer_alloc(rows * top_k * sizeof(int32_t));
+        myds_metal_buffer_t *w_fused = myds_metal_buffer_alloc(rows * top_k * sizeof(float));
+        myds_metal_buffer_t *p_fused = myds_metal_buffer_alloc(total * sizeof(float));
+        myds_metal_buffer_t *s_fused = myds_metal_buffer_alloc(total * sizeof(float));
+
+        assert(logits && bias && sel_unfused && w_unfused && p_unfused && s_unfused &&
+               sel_fused && w_fused && p_fused && s_fused);
+
+        float *b_ptr = (float *)myds_metal_buffer_data(bias);
+        for (uint32_t e = 0; e < experts; e++) {
+            b_ptr[e] = (float)sin((double)e * 0.137) * 0.25f;
+        }
+        float *l_ptr = (float *)myds_metal_buffer_data(logits);
+        for (uint32_t i = 0; i < total; i++) {
+            l_ptr[i] = (float)sin((double)i * 0.05 + (double)r) * 12.0f;
+        }
+
+        // Run unfused
+        setenv("MYDS_MOE_ROUTE_FUSE", "0", 1);
+        assert(myds_v41_route_batch(sel_unfused, w_unfused, p_unfused, s_unfused, logits, bias, experts, top_k, scale, rows));
+
+        // Run fused
+        setenv("MYDS_MOE_ROUTE_FUSE", "1", 1);
+        assert(myds_v41_route_batch(sel_fused, w_fused, p_fused, s_fused, logits, bias, experts, top_k, scale, rows));
+
+        // Parity checks
+        assert(memcmp(myds_metal_buffer_data(p_unfused), myds_metal_buffer_data(p_fused), total * sizeof(float)) == 0);
+        assert(memcmp(myds_metal_buffer_data(s_unfused), myds_metal_buffer_data(s_fused), total * sizeof(float)) == 0);
+        assert(memcmp(myds_metal_buffer_data(sel_unfused), myds_metal_buffer_data(sel_fused), rows * top_k * sizeof(int32_t)) == 0);
+        assert(memcmp(myds_metal_buffer_data(w_unfused), myds_metal_buffer_data(w_fused), rows * top_k * sizeof(float)) == 0);
+
+        myds_metal_buffer_free(logits);
+        myds_metal_buffer_free(bias);
+        myds_metal_buffer_free(sel_unfused);
+        myds_metal_buffer_free(w_unfused);
+        myds_metal_buffer_free(p_unfused);
+        myds_metal_buffer_free(s_unfused);
+        myds_metal_buffer_free(sel_fused);
+        myds_metal_buffer_free(w_fused);
+        myds_metal_buffer_free(p_fused);
+        myds_metal_buffer_free(s_fused);
+    }
+    unsetenv("MYDS_MOE_ROUTE_FUSE");
+    printf("  [PASS] MoE route 7->3 dispatch fusion bit-exact parity verified (rows=1,2,8,33,128)\n");
+}
+
+static void test_p1_attn_output_a_bf16_fusion(void) {
+    if (!myds_metal_init(NULL)) {
+        fprintf(stderr, "skip test_p1_attn_output_a_bf16_fusion: no Metal\n");
+        return;
+    }
+    const uint32_t n_groups = 8;
+    const uint32_t group_dim = 4096;
+    const uint32_t rank = 1024;
+    const uint64_t total_rows = (uint64_t)n_groups * rank;
+    const uint64_t w_bytes = total_rows * (group_dim / 32u) * 34u;
+    const uint64_t in_bytes = (uint64_t)n_groups * group_dim * sizeof(float);
+    const uint64_t out_bytes = total_rows * sizeof(float);
+
+    myds_metal_buffer_t *out_a = myds_metal_buffer_alloc(w_bytes);
+    myds_metal_buffer_t *heads = myds_metal_buffer_alloc(in_bytes);
+    myds_metal_buffer_t *low_unfused = myds_metal_buffer_alloc(out_bytes);
+    myds_metal_buffer_t *low_fused = myds_metal_buffer_alloc(out_bytes);
+    assert(out_a && heads && low_unfused && low_fused);
+
+    // Initialize heads input
+    float *h_ptr = (float *)myds_metal_buffer_data(heads);
+    for (size_t i = 0; i < (size_t)n_groups * group_dim; i++) {
+        h_ptr[i] = (float)sin((double)i * 0.017) * 0.5f;
+    }
+
+    // Initialize Q8_0 weights
+    uint8_t *w_ptr = (uint8_t *)myds_metal_buffer_data(out_a);
+    const uint64_t n_blocks = w_bytes / 34u;
+    for (uint64_t b = 0; b < n_blocks; b++) {
+        uint16_t d = (uint16_t)(0x3c00u + (b % 7) * 0x100u); // fp16 ~1.0 .. ~2.0
+        memcpy(w_ptr + b * 34, &d, 2);
+        for (int k = 0; k < 32; k++) {
+            w_ptr[b * 34 + 2 + k] = (uint8_t)(int8_t)((int)((b * 13 + k * 19) % 255) - 127);
+        }
+    }
+
+    // 1. Run unfused
+    setenv("MYDS_ATTN_OUT_A_FUSE_BF16", "0", 1);
+    assert(myds_metal_attn_output_a_bf16(low_unfused, out_a, heads, n_groups, group_dim, rank, GGML_TYPE_Q8_0));
+
+    // 2. Run fused
+    setenv("MYDS_ATTN_OUT_A_FUSE_BF16", "1", 1);
+    assert(myds_metal_attn_output_a_bf16(low_fused, out_a, heads, n_groups, group_dim, rank, GGML_TYPE_Q8_0));
+
+    // 3. Verify exact parity
+    float *u_ptr = (float *)myds_metal_buffer_data(low_unfused);
+    float *f_ptr = (float *)myds_metal_buffer_data(low_fused);
+    size_t nonzero = 0;
+    for (size_t i = 0; i < total_rows; i++) {
+        assert(isfinite(u_ptr[i]) && isfinite(f_ptr[i]));
+        nonzero += (u_ptr[i] != 0.0f);
+        if (memcmp(&u_ptr[i], &f_ptr[i], 4) != 0) {
+            uint32_t ub, fb;
+            memcpy(&ub, &u_ptr[i], 4);
+            memcpy(&fb, &f_ptr[i], 4);
+            fprintf(stderr, "mismatch at row %zu: unfused=%08x (%f) fused=%08x (%f)\n",
+                    i, ub, u_ptr[i], fb, f_ptr[i]);
+            assert(0);
+        }
+    }
+    assert(nonzero > 0);
+
+    myds_metal_buffer_free(out_a);
+    myds_metal_buffer_free(heads);
+    myds_metal_buffer_free(low_unfused);
+    myds_metal_buffer_free(low_fused);
+    unsetenv("MYDS_ATTN_OUT_A_FUSE_BF16");
+    printf("  [PASS] Output_A grouped NR4 + BF16 store fusion bit-exact parity verified (8 groups x 1024 rank = 8192 rows)\n");
+}
+
 int main(void) {
     printf("Running P1 Regression Verification Suite:\n");
     test_p1_response_id_lifecycle();
@@ -1736,6 +1875,8 @@ int main(void) {
     test_p1_same_process_large_model_isolation();
     test_p1_companion_digest_identity();
     test_p1_metal_fused_add_fallback();
+    test_p1_moe_route_fusion();
+    test_p1_attn_output_a_bf16_fusion();
     test_p2_moe_kernel_and_pso_validation();
     test_p2_moe_batch_mm_tail_cull_validation();
     test_p2_moe_tail_cull_multi_case_golden_equivalence();
