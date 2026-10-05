@@ -1529,7 +1529,7 @@ static void test_lowkv_combined_budget(void) {
     const uint64_t snapshot_stride = 64u + sizeof(myds_engram_history_t) +
         40u * 128u * 512u * sizeof(float) + MYDS_SNAP_PINNED * 32u;
     const uint64_t segment_stride = lk_expected_segment_bytes(0, MYDS_SNAP_MIN);
-    const uint64_t end_entries = 8u;
+    const uint64_t end_entries = 32u;
     const uint64_t end_stride = 14680064ull;
     const uint64_t end_base = (4096u + end_entries * 64u + 4095u) / 4096u * 4096u;
     const uint64_t end_file_bytes = end_base + end_entries * end_stride;

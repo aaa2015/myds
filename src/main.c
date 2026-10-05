@@ -155,7 +155,6 @@ int main(int argc, char *argv[]) {
     }
     double load_t1 = myds_now_s();
     double load_sec = load_t1 - load_t0;
-    printf("Model loaded in %.2f s\n", load_sec);
     MYDS_LOG_I("Model loaded successfully in %.2fs", load_sec);
 
     myds_model_print_info(model);

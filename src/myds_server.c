@@ -3195,16 +3195,7 @@ int myds_server_start(myds_context_t *ctx, const char *host, int port, const cha
         return 1;
     }
 
-    /* Print exactly matching start_fleet.sh grep regex:
-     * grep -qiE "listening on http|main: server is listening|running on http|diffusion-gemma.*ready|listening on: [0-9]+|started!"
-     */
-    printf("myds: listening on http://%s:%d (alias: %s)\n",
-           (host && strlen(host) > 0) ? host : "0.0.0.0",
-           port,
-           model_alias ? model_alias : "myds");
-    fflush(stdout);
-
-    MYDS_LOG_I("HTTP server listening on http://%s:%d (model_alias: %s)",
+    MYDS_LOG_I("HTTP server listening on http://%s:%d (alias: %s)",
                (host && strlen(host) > 0) ? host : "0.0.0.0",
                port,
                model_alias ? model_alias : "myds");
@@ -3252,8 +3243,6 @@ int myds_server_start(myds_context_t *ctx, const char *host, int port, const cha
         g_server_fd = -1;
     }
 
-    printf("\nmyds: server stopped gracefully\n");
-    fflush(stdout);
     MYDS_LOG_I("Server stopped gracefully");
     return 0;
 }

@@ -382,18 +382,18 @@ static void test_deeper_prompt_end_eviction(const char *path) {
     assert(ends);
 
     int32_t *tokens = lk_tokens();
-    /* Fill all 8 end slots with different positions 2101, 2103, ..., 2115 */
-    for (uint32_t i = 0; i < 8u; ++i) {
+    /* Fill all 32 end slots with different positions 2101, 2103, ..., 2163 */
+    for (uint32_t i = 0; i < 32u; ++i) {
         const uint32_t p = 2101u + i * 2u;
         assert(myds_v41_snapshot_store_now(g, p));
         assert(myds_v41_low_kv_save(g, tokens, p + 1u));
         uint32_t meta_p = 0;
         assert(myds_kvdsk_slot_meta(ends, i, &meta_p, NULL, NULL) && meta_p == p);
     }
-    assert(myds_kvdsk_live_entries(ends) == 8u);
+    assert(myds_kvdsk_live_entries(ends) == 32u);
 
-    /* Touch slots 1..7 so they have hits >= 1, leave slot 0 with 0 hits */
-    for (uint32_t i = 1; i < 8u; ++i) {
+    /* Touch slots 1..31 so they have hits >= 1, leave slot 0 with 0 hits */
+    for (uint32_t i = 1; i < 32u; ++i) {
         const uint32_t p = 2101u + i * 2u;
         assert(myds_v41_low_kv_load_deeper(g, tokens, 1024, p) == p);
         uint32_t hits = 0;
@@ -402,18 +402,18 @@ static void test_deeper_prompt_end_eviction(const char *path) {
     uint32_t hits0 = 0;
     assert(myds_kvdsk_slot_hits(ends, 0, &hits0) && hits0 == 0);
 
-    /* Save a 9th prompt end at p = 2117.
+    /* Save a 33rd prompt end at p = 2165.
      * Slot 0 has 0 hits, so slot 0 MUST be the victim. */
-    const uint32_t p9 = 2117u;
-    assert(myds_v41_snapshot_store_now(g, p9));
-    assert(myds_v41_low_kv_save(g, tokens, p9 + 1u));
+    const uint32_t p33 = 2101u + 32u * 2u;
+    assert(myds_v41_snapshot_store_now(g, p33));
+    assert(myds_v41_low_kv_save(g, tokens, p33 + 1u));
 
-    /* Verify slot 0 is now p9 (2117) */
+    /* Verify slot 0 is now p33 (2165) */
     uint32_t meta_p0 = 0;
-    assert(myds_kvdsk_slot_meta(ends, 0, &meta_p0, NULL, NULL) && meta_p0 == p9);
+    assert(myds_kvdsk_slot_meta(ends, 0, &meta_p0, NULL, NULL) && meta_p0 == p33);
 
-    /* Verify slots 1..7 still retain their original positions */
-    for (uint32_t i = 1; i < 8u; ++i) {
+    /* Verify slots 1..31 still retain their original positions */
+    for (uint32_t i = 1; i < 32u; ++i) {
         uint32_t meta_pi = 0;
         assert(myds_kvdsk_slot_meta(ends, i, &meta_pi, NULL, NULL) && meta_pi == 2101u + i * 2u);
     }
@@ -421,7 +421,7 @@ static void test_deeper_prompt_end_eviction(const char *path) {
     myds_v41_context_free(g);
     free(tokens);
     lk_remove_store(path);
-    puts("  [PASS] prompt-end SSD eviction: 8 slots bound capacity, least-hit victim replacement, survivor preservation");
+    puts("  [PASS] prompt-end SSD eviction: 32 slots bound capacity, least-hit victim replacement, survivor preservation");
 }
 
 int main(int argc, char **argv) {

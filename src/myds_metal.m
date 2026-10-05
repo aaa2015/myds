@@ -829,7 +829,7 @@ int myds_metal_init(const char *shader_dir) {
         }
 
         g_initialized = true;
-        printf("myds_metal: Initialized successfully on GPU: %s\n", [[g_device name] UTF8String]);
+        MYDS_LOG_I("myds_metal: Initialized successfully on GPU: %s", [[g_device name] UTF8String]);
         return 1;
     }
 }

@@ -441,7 +441,7 @@ bool myds_v41_snapshot_get_valid(const myds_v41_context_t *g) {
 #define V41_LOWKV_ABI    3u /* windows/history plus shared-prefix segment references */
 #define V41_LOWKV_SEG_ABI 1u
 #define V41_LOWKV_END_ABI 0x34314531u /* '41E1' prompt-end snapshot */
-#define V41_LOWKV_ENDS_MAX 8u
+#define V41_LOWKV_ENDS_MAX 32u
 #define V41_LOWKV_END_STRIDE 14680064ull /* 14 MiB */
 #define V41_LOWKV_ENTRY_IS_END 0x80000000u
 #define V41_LOWKV_REF_BYTES 32u
@@ -1104,7 +1104,7 @@ static bool lowkv_snapshot_refs_match(myds_v41_context_t *g, uint32_t entry,
 static uint32_t lowkv_pick_end_entry(myds_v41_context_t *g, uint32_t p, uint64_t hash,
                                      uint64_t total_bytes, bool *already_here) {
     if (already_here) *already_here = false;
-    if (!g || !g->low_ends) return V41_LOWKV_NO_ENTRY;
+    if (!g || !g->low_ends || total_bytes > V41_LOWKV_END_STRIDE) return V41_LOWKV_NO_ENTRY;
 
     uint32_t empty_slot = V41_LOWKV_NO_ENTRY;
     uint32_t victim_slot = 0;
@@ -1790,34 +1790,36 @@ bool myds_v41_low_kv_save(myds_v41_context_t *g, const int32_t *tokens, uint32_t
             const uint32_t be = lowkv_base_segment_end(bc);
             const uint64_t end_hash = myds_kvdsk_hash_tokens(tokens, p_end);
             const uint64_t end_bytes = lowkv_end_payload_bytes(p_end, bc, be);
-            bool already = false;
-            const uint32_t end_slot = lowkv_pick_end_entry(g, p_end, end_hash, end_bytes, &already);
-            if (end_slot != V41_LOWKV_NO_ENTRY) {
-                lowkv_segment_ref_t refs[MYDS_SNAP_PINNED];
-                unsigned char *stage = (unsigned char *)malloc(V41_LOWKV_STAGE);
-                bool end_ok = (stage != NULL);
-                for (uint32_t j = 0; j < bc && end_ok; ++j) {
-                    if (!have_hash[j]) {
-                        prefix_hashes[j] = myds_kvdsk_hash_tokens(tokens, lowkv_segment_end(j));
-                        have_hash[j] = true;
-                    }
-                    end_ok = lowkv_ensure_segment(g, j, prefix_hashes[j], stage, &refs[j]);
-                }
-                if (end_ok) {
-                    if (!already || !lowkv_end_refs_match(g, end_slot, bc, refs)) {
-                        const double t_end0 = lowkv_now_ms();
-                        if (lowkv_write_end_slot(g, end_slot, p_end, end_hash, bc, be, refs, stage)) {
-                            MYDS_LOG_I("kvdisk: prompt-end 快照落盘成功 · 槽 %u · 位置 %u (base %u, tail %u) · %.1f MiB · %.1f ms",
-                                       end_slot, p_end, be, p_end - be, (double)end_bytes / 1048576.0, lowkv_now_ms() - t_end0);
-                        } else {
-                            MYDS_LOG_W("kvdisk: prompt-end 快照位置 %u 写盘失败", p_end);
-                            ok = false;
+            if (end_bytes <= V41_LOWKV_END_STRIDE) {
+                bool already = false;
+                const uint32_t end_slot = lowkv_pick_end_entry(g, p_end, end_hash, end_bytes, &already);
+                if (end_slot != V41_LOWKV_NO_ENTRY) {
+                    lowkv_segment_ref_t refs[MYDS_SNAP_PINNED];
+                    unsigned char *stage = (unsigned char *)malloc(V41_LOWKV_STAGE);
+                    bool end_ok = (stage != NULL);
+                    for (uint32_t j = 0; j < bc && end_ok; ++j) {
+                        if (!have_hash[j]) {
+                            prefix_hashes[j] = myds_kvdsk_hash_tokens(tokens, lowkv_segment_end(j));
+                            have_hash[j] = true;
                         }
+                        end_ok = lowkv_ensure_segment(g, j, prefix_hashes[j], stage, &refs[j]);
                     }
-                } else {
-                    ok = false;
+                    if (end_ok) {
+                        if (!already || !lowkv_end_refs_match(g, end_slot, bc, refs)) {
+                            const double t_end0 = lowkv_now_ms();
+                            if (lowkv_write_end_slot(g, end_slot, p_end, end_hash, bc, be, refs, stage)) {
+                                MYDS_LOG_I("kvdisk: prompt-end 快照落盘成功 · 槽 %u · 位置 %u (base %u, tail %u) · %.1f MiB · %.1f ms",
+                                           end_slot, p_end, be, p_end - be, (double)end_bytes / 1048576.0, lowkv_now_ms() - t_end0);
+                            } else {
+                                MYDS_LOG_W("kvdisk: prompt-end 快照位置 %u 写盘失败", p_end);
+                                ok = false;
+                            }
+                        }
+                    } else {
+                        ok = false;
+                    }
+                    free(stage);
                 }
-                free(stage);
             }
         }
     }
