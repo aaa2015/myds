@@ -18,6 +18,9 @@ int myds_v41_decode_gemv_bf16(myds_metal_buffer_t *out,
     if (fuse && !trace_on && type == GGML_TYPE_Q8_0 &&
         myds_metal_buffer_offset(out) % 16u == 0)
         return myds_metal_v41_gemv_bf16(out, weight, input, rows, width, type);
-    return myds_metal_gemv(out, weight, input, rows, width, type) &&
-        myds_metal_v41_bf16(out, rows);
+    if (!myds_metal_gemv(out, weight, input, rows, width, type)) return 0;
+    if (!myds_metal_get_auto_barrier()) {
+        myds_metal_barrier_buffer(out);
+    }
+    return myds_metal_v41_bf16(out, rows);
 }

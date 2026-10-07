@@ -48,6 +48,12 @@ int myds_metal_v41_bf16(myds_metal_buffer_t *a, uint32_t rows) {
 size_t myds_metal_buffer_offset(const myds_metal_buffer_t *b) {
     forwarded_ok &= b == expected_out; return out_offset;
 }
+int myds_metal_get_auto_barrier(void) {
+    return 1;
+}
+void myds_metal_barrier_buffer(const myds_metal_buffer_t *b) {
+    (void)b;
+}
 static int invoke_args(myds_metal_buffer_t *a, const myds_metal_buffer_t *b,
     const myds_metal_buffer_t *c, uint32_t rows, uint32_t width, ggml_type type, bool trace_on) {
     memset(calls,0,sizeof(calls)); call_count = 0; forwarded_ok = 1;

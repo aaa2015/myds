@@ -1794,6 +1794,98 @@ static void test_p1_moe_route_fusion(void) {
     printf("  [PASS] MoE route 7->3 dispatch fusion bit-exact parity verified (rows=1,2,8,33,128)\n");
 }
 
+static void test_p1_moe_concurrent_barriers_and_route_parity(void) {
+    if (!myds_metal_init(NULL)) {
+        fprintf(stderr, "skip test_p1_moe_concurrent_barriers_and_route_parity: no Metal\n");
+        return;
+    }
+
+    /* 1. Test API robust null handling and deduplication */
+    myds_metal_barrier_buffers(NULL, 0);
+    myds_metal_barrier_buffer(NULL);
+
+    assert(myds_metal_begin_batch());
+    myds_metal_buffer_t *test_buf1 = myds_metal_buffer_alloc(1024);
+    myds_metal_buffer_t *test_buf2 = myds_metal_buffer_alloc(1024);
+    assert(test_buf1 && test_buf2);
+
+    const myds_metal_buffer_t *dup_bufs[] = { test_buf1, test_buf1, test_buf2, test_buf1 };
+    myds_metal_barrier_buffers(dup_bufs, 4);
+    myds_metal_barrier_buffer(test_buf2);
+    assert(myds_metal_commit_batch());
+
+    myds_metal_buffer_free(test_buf1);
+    myds_metal_buffer_free(test_buf2);
+
+    /* 2. Test route batch bit-exact equivalence between auto_barrier=1 and auto_barrier=0 */
+    const uint32_t experts = 384;
+    const uint32_t top_k = 6;
+    const float scale = 2.5f;
+    const uint32_t row_configs[] = {1, 2, 8, 33};
+
+    for (size_t r = 0; r < sizeof(row_configs) / sizeof(row_configs[0]); r++) {
+        uint32_t rows = row_configs[r];
+        uint64_t total = (uint64_t)experts * rows;
+
+        myds_metal_buffer_t *logits = myds_metal_buffer_alloc(total * sizeof(float));
+        myds_metal_buffer_t *bias = myds_metal_buffer_alloc(experts * sizeof(float));
+
+        myds_metal_buffer_t *sel_auto = myds_metal_buffer_alloc(rows * top_k * sizeof(int32_t));
+        myds_metal_buffer_t *w_auto = myds_metal_buffer_alloc(rows * top_k * sizeof(float));
+        myds_metal_buffer_t *p_auto = myds_metal_buffer_alloc(total * sizeof(float));
+        myds_metal_buffer_t *s_auto = myds_metal_buffer_alloc(total * sizeof(float));
+
+        myds_metal_buffer_t *sel_fine = myds_metal_buffer_alloc(rows * top_k * sizeof(int32_t));
+        myds_metal_buffer_t *w_fine = myds_metal_buffer_alloc(rows * top_k * sizeof(float));
+        myds_metal_buffer_t *p_fine = myds_metal_buffer_alloc(total * sizeof(float));
+        myds_metal_buffer_t *s_fine = myds_metal_buffer_alloc(total * sizeof(float));
+
+        assert(logits && bias && sel_auto && w_auto && p_auto && s_auto &&
+               sel_fine && w_fine && p_fine && s_fine);
+
+        float *b_ptr = (float *)myds_metal_buffer_data(bias);
+        for (uint32_t e = 0; e < experts; e++) {
+            b_ptr[e] = (float)sin((double)e * 0.137) * 0.25f;
+        }
+        float *l_ptr = (float *)myds_metal_buffer_data(logits);
+        for (uint32_t i = 0; i < total; i++) {
+            l_ptr[i] = (float)sin((double)i * 0.05 + (double)r) * 12.0f;
+        }
+
+        /* Run with auto_barrier = 1 */
+        myds_metal_set_auto_barrier(1);
+        assert(myds_metal_begin_batch());
+        assert(myds_v41_route_batch(sel_auto, w_auto, p_auto, s_auto, logits, bias, experts, top_k, scale, rows));
+        assert(myds_metal_commit_batch());
+
+        /* Run with auto_barrier = 0 (relying on fine-grained resource barriers) */
+        myds_metal_set_auto_barrier(0);
+        assert(myds_metal_begin_batch());
+        assert(myds_v41_route_batch(sel_fine, w_fine, p_fine, s_fine, logits, bias, experts, top_k, scale, rows));
+        assert(myds_metal_commit_batch());
+        myds_metal_set_auto_barrier(1);
+
+        /* Bit-exact parity assertions */
+        assert(memcmp(myds_metal_buffer_data(p_auto), myds_metal_buffer_data(p_fine), total * sizeof(float)) == 0);
+        assert(memcmp(myds_metal_buffer_data(s_auto), myds_metal_buffer_data(s_fine), total * sizeof(float)) == 0);
+        assert(memcmp(myds_metal_buffer_data(sel_auto), myds_metal_buffer_data(sel_fine), rows * top_k * sizeof(int32_t)) == 0);
+        assert(memcmp(myds_metal_buffer_data(w_auto), myds_metal_buffer_data(w_fine), rows * top_k * sizeof(float)) == 0);
+
+        myds_metal_buffer_free(logits);
+        myds_metal_buffer_free(bias);
+        myds_metal_buffer_free(sel_auto);
+        myds_metal_buffer_free(w_auto);
+        myds_metal_buffer_free(p_auto);
+        myds_metal_buffer_free(s_auto);
+        myds_metal_buffer_free(sel_fine);
+        myds_metal_buffer_free(w_fine);
+        myds_metal_buffer_free(p_fine);
+        myds_metal_buffer_free(s_fine);
+    }
+
+    printf("  [PASS] MoE concurrent resource-level barriers & fine-grained route parity verified\n");
+}
+
 static void test_p1_attn_output_a_bf16_fusion(void) {
     if (!myds_metal_init(NULL)) {
         fprintf(stderr, "skip test_p1_attn_output_a_bf16_fusion: no Metal\n");
@@ -1988,6 +2080,7 @@ int main(void) {
     test_p1_companion_digest_identity();
     test_p1_metal_fused_add_fallback();
     test_p1_moe_route_fusion();
+    test_p1_moe_concurrent_barriers_and_route_parity();
     test_p1_attn_output_a_bf16_fusion();
     test_p1_attn_direct_pack_fusion();
     test_p2_moe_kernel_and_pso_validation();

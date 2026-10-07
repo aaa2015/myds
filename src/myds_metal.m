@@ -275,17 +275,42 @@ void myds_metal_set_auto_barrier(int enable) {
     g_auto_barrier = enable;
 }
 
+int myds_metal_get_auto_barrier(void) {
+    return g_auto_barrier;
+}
+
+static void close_compute_encoder(void) {
+    if (g_batch_enc) {
+        [g_batch_enc endEncoding];
+        g_batch_enc = nil;
+    }
+}
+
+static int g_concurrent_mode = 0;
+
+void myds_metal_set_concurrent(int enable) {
+    if (g_concurrent_mode != enable) {
+        close_compute_encoder();
+        g_concurrent_mode = enable;
+    }
+}
+
+int myds_metal_get_concurrent(void) {
+    return g_concurrent_mode;
+}
+
 static id<MTLComputeCommandEncoder> get_compute_encoder(id<MTLCommandBuffer> cb) {
     if (cb == g_batch_cb && g_batch_enc) {
         return g_batch_enc;
     }
-    static int s_concurrent = -1;
-    if (s_concurrent < 0) {
+    static int s_concurrent_env = -1;
+    if (s_concurrent_env < 0) {
         const char *env = getenv("MYDS_METAL_CONCURRENT");
-        s_concurrent = (env && atoi(env) != 0) ? 1 : 0;
+        s_concurrent_env = (env && atoi(env) != 0) ? 1 : 0;
     }
+    int use_concurrent = (g_concurrent_mode > 0) || (s_concurrent_env > 0);
     id<MTLComputeCommandEncoder> enc = nil;
-    if (s_concurrent && [cb respondsToSelector:@selector(computeCommandEncoderWithDispatchType:)]) {
+    if (use_concurrent && [cb respondsToSelector:@selector(computeCommandEncoderWithDispatchType:)]) {
         enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
     } else {
         enc = [cb computeCommandEncoder];
@@ -303,10 +328,40 @@ void myds_metal_barrier(void) {
     }
 }
 
-static void close_compute_encoder(void) {
-    if (g_batch_enc) {
-        [g_batch_enc endEncoding];
-        g_batch_enc = nil;
+void myds_metal_barrier_buffers(const myds_metal_buffer_t *const *buffers, size_t count) {
+    if (!g_batch_cb || !buffers || count == 0) return;
+    id<MTLComputeCommandEncoder> enc = get_compute_encoder(g_batch_cb);
+    if (!enc) return;
+    if (![enc respondsToSelector:@selector(memoryBarrierWithResources:count:)]) {
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        return;
+    }
+    id<MTLResource> res[count];
+    NSUInteger n = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (buffers[i] && buffers[i]->mtl_buf) {
+            id<MTLBuffer> mb = buffers[i]->mtl_buf;
+            bool duplicate = false;
+            for (NSUInteger j = 0; j < n; j++) {
+                if (res[j] == mb) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                res[n++] = mb;
+            }
+        }
+    }
+    if (n > 0) {
+        [enc memoryBarrierWithResources:res count:n];
+    }
+}
+
+void myds_metal_barrier_buffer(const myds_metal_buffer_t *buf) {
+    if (buf) {
+        const myds_metal_buffer_t *bufs[1] = { buf };
+        myds_metal_barrier_buffers(bufs, 1);
     }
 }
 
@@ -1293,7 +1348,9 @@ static bool v41_floats(const myds_metal_buffer_t *b, uint64_t n) {
 
 static int v41_finish(id<MTLCommandBuffer> cb, id<MTLComputeCommandEncoder> enc) {
     if (g_batch_cb) {
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        if (g_auto_barrier) {
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
         return 1;
     }
     [enc endEncoding];
@@ -1419,7 +1476,7 @@ int myds_metal_dispatch_kernel_constants(const char *name, const void *args, siz
         if (!cb) return 0;
         id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
         if (!enc) return 0;
-        if (g_batch_cb) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        if (g_batch_cb && g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         [enc setComputePipelineState:pipeline];
         [enc setBytes:args length:args_size atIndex:0];
         for (size_t i = 0; i < n_buffers; ++i)
@@ -1465,7 +1522,7 @@ int myds_metal_buffer_copy(myds_metal_buffer_t *dst, size_t dst_offset,
                 uint64_t count;
             } args = { (uint64_t)b, (uint64_t)a, count };
 
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            if (g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             [enc setComputePipelineState:pso];
             [enc setBuffer:src->mtl_buf offset:0 atIndex:0];
             [enc setBuffer:dst->mtl_buf offset:0 atIndex:1];
@@ -1479,7 +1536,7 @@ int myds_metal_buffer_copy(myds_metal_buffer_t *dst, size_t dst_offset,
             NSUInteger ngr = (count + nth - 1) / nth;
             metal_dispatch(enc, "buffer_copy", MTLSizeMake(ngr, 1, 1),
                 MTLSizeMake(nth, 1, 1));
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            if (g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             return 1;
         }
     }
@@ -1507,7 +1564,7 @@ int myds_metal_v41_bf16(myds_metal_buffer_t *x, uint32_t count) {
         if (!cb) return 0;
         id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
         if (!enc) return 0;
-        if (g_batch_cb) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        if (g_batch_cb && g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         [enc setComputePipelineState:g_pso_v41_bf16];
         [enc setBytes:&n length:sizeof(n) atIndex:0];
         [enc setBuffer:x->mtl_buf offset:x->offset atIndex:1];
@@ -1544,7 +1601,7 @@ int myds_metal_v41_rmsnorm(myds_metal_buffer_t *out,
         if (!cb) return 0;
         id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
         if (!enc) return 0;
-        if (g_batch_cb) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        if (g_batch_cb && g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         [enc setComputePipelineState:pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:x->mtl_buf offset:x->offset atIndex:1];
@@ -1599,7 +1656,7 @@ int myds_metal_v41_rmsnorm_batch(myds_metal_buffer_t *out,
         if (!cb) return 0;
         id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
         if (!enc) return 0;
-        if (g_batch_cb) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        if (g_batch_cb && g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         [enc setComputePipelineState:pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:x->mtl_buf offset:x->offset atIndex:1];
@@ -1638,7 +1695,7 @@ int myds_metal_v41_hc_mix(myds_metal_buffer_t *split,
         if (!cb) return 0;
         id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
         if (!enc) return 0;
-        if (g_batch_cb) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        if (g_batch_cb && g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         [enc setComputePipelineState:g_pso_v41_hc_split];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:mix->mtl_buf offset:mix->offset atIndex:1];
@@ -1663,7 +1720,7 @@ int myds_metal_v41_hc_split_batch(myds_metal_buffer_t *split,
         if (!cb) return 0;
         id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
         if (!enc) return 0;
-        if (g_batch_cb) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        if (g_batch_cb && g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         [enc setComputePipelineState:g_pso_v41_hc_split];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:mix->mtl_buf offset:mix->offset atIndex:1];
@@ -1698,7 +1755,7 @@ int myds_metal_v41_hc_weighted_sum(myds_metal_buffer_t *out,
         if (!cb) return 0;
         id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
         if (!enc) return 0;
-        if (g_batch_cb) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        if (g_batch_cb && g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         [enc setComputePipelineState:g_pso_v41_hc_sum];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:residual->mtl_buf offset:residual->offset atIndex:1];
@@ -1734,7 +1791,7 @@ int myds_metal_v41_hc_expand(myds_metal_buffer_t *out,
         if (!cb) return 0;
         id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
         if (!enc) return 0;
-        if (g_batch_cb) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        if (g_batch_cb && g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         [enc setComputePipelineState:g_pso_v41_hc_expand];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:block->mtl_buf offset:block->offset atIndex:1];
@@ -1767,7 +1824,7 @@ int myds_metal_v41_hc_weighted_sum_batch(myds_metal_buffer_t *out,
         if (!cb) return 0;
         id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
         if (!enc) return 0;
-        if (g_batch_cb) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        if (g_batch_cb && g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         [enc setComputePipelineState:g_pso_v41_hc_sum];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:residual->mtl_buf offset:residual->offset atIndex:1];
@@ -1804,7 +1861,7 @@ int myds_metal_v41_hc_expand_batch(myds_metal_buffer_t *out,
         if (!cb) return 0;
         id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
         if (!enc) return 0;
-        if (g_batch_cb) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        if (g_batch_cb && g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         [enc setComputePipelineState:g_pso_v41_hc_expand];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:block->mtl_buf offset:block->offset atIndex:1];
@@ -1833,7 +1890,7 @@ int myds_metal_v41_engram_add_batch(myds_metal_buffer_t *residual,
         if (!cb) return 0;
         id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
         if (!enc) return 0;
-        if (g_batch_cb) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        if (g_batch_cb && g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         [enc setComputePipelineState:g_pso_v41_engram_add];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:residual->mtl_buf offset:residual->offset atIndex:1];
@@ -2902,7 +2959,12 @@ int myds_metal_routed_moe_batch(
             if (g_moe_split < 0) g_moe_split = getenv("MYDS_MOE_STEP_PROF") ? 1 : 0;
             if (g_moe_split) moe_split_point(&cb, &enc, &g_moe_t_map0);
 
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            if (g_auto_barrier) {
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            } else {
+                id<MTLResource> res = g_moe_id_map_buffer;
+                [enc memoryBarrierWithResources:&res count:1];
+            }
 
             /* Step 2: Gate + Up Pair SwiGLU dispatch */
             [enc setComputePipelineState:g_pso_moe_mm_iq2_pair_swiglu_f16];
@@ -2923,7 +2985,12 @@ int myds_metal_routed_moe_batch(
                 MTLSizeMake(128, 1, 1));
             if (g_moe_split) moe_split_point(&cb, &enc, &g_moe_t_swiglu);
 
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            if (g_auto_barrier) {
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            } else {
+                id<MTLResource> res = scratch_mid->mtl_buf;
+                [enc memoryBarrierWithResources:&res count:1];
+            }
 
             /* Step 3: Down Projection dispatch */
             [enc setComputePipelineState:g_pso_moe_mm_q2_k_f16];
@@ -2941,7 +3008,12 @@ int myds_metal_routed_moe_batch(
                 MTLSizeMake(128, 1, 1));
             if (g_moe_split) moe_split_point(&cb, &enc, &g_moe_t_down);
 
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            if (g_auto_barrier) {
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            } else {
+                id<MTLResource> res = scratch_down->mtl_buf;
+                [enc memoryBarrierWithResources:&res count:1];
+            }
 
             /* Step 4: Sum Experts dispatch */
             NSUInteger nth = g_pso_moe_sum6.maxTotalThreadsPerThreadgroup;
@@ -3085,8 +3157,12 @@ int myds_metal_routed_moe_batch(
             [enc setThreadgroupMemoryLength:smem_iq2 atIndex:0];
             metal_dispatch(enc, "fused_moe_swiglu", MTLSizeMake(row_groups_gate, 1, pairs),
                 MTLSizeMake(32, nsg_gate, 1));
-
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            if (g_auto_barrier) {
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            } else {
+                id<MTLResource> res = scratch_mid->mtl_buf;
+                [enc memoryBarrierWithResources:&res count:1];
+            }
 
             /* Fused Down + Sum6 direct accumulation dispatch (Q2_K) across all tokens */
             [enc setComputePipelineState:g_pso_moe_sum6_q2_k];

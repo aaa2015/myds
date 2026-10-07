@@ -307,7 +307,12 @@ int      myds_metal_commit_batch(void);
 int      myds_metal_flush_batch(void);
 uint64_t myds_metal_get_commit_count(void);
 void     myds_metal_barrier(void);
+void     myds_metal_barrier_buffers(const myds_metal_buffer_t *const *buffers, size_t count);
+void     myds_metal_barrier_buffer(const myds_metal_buffer_t *buf);
 void     myds_metal_set_auto_barrier(int enable);
+int      myds_metal_get_auto_barrier(void);
+void     myds_metal_set_concurrent(int enable);
+int      myds_metal_get_concurrent(void);
 bool     myds_trace_active(void);
 
 /* Diagnostic fault injection for testing (0 = disabled) */
