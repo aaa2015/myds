@@ -103,6 +103,9 @@ struct myds_dspark {
     // Adaptive Speculative Scheduler
     uint32_t consecutive_misses;
     uint32_t backoff_counter;
+
+    // Speculative snapshot buffer (heap-allocated, zero stack footprint)
+    struct myds_v41_spec_snapshot *spec_snap;
 };
 
 /* Initialize and load DSpark support model from GGUF */

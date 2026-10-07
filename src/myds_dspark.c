@@ -193,6 +193,7 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
     ds->draft_logits_buf = myds_metal_buffer_alloc(vocab_size * sizeof(float));
     ds->markov_state_host = calloc(ds->markov_rank, sizeof(float));
     ds->markov_bias_host = calloc(vocab_size, sizeof(float));
+    ds->spec_snap = calloc(1, sizeof(myds_v41_spec_snapshot_t));
 
     MYDS_LOG_I("dspark: loaded successfully from %s (stages=%u, block=%u, markov_rank=%u, routed_exp=%u/%u)",
                path, ds->stage_count, ds->block_size, ds->markov_rank,
@@ -253,6 +254,7 @@ void myds_dspark_free(myds_dspark_t *ds) {
 
     if (ds->markov_state_host) free(ds->markov_state_host);
     if (ds->markov_bias_host) free(ds->markov_bias_host);
+    if (ds->spec_snap) free(ds->spec_snap);
 
     if (ds->gf) gguf_close(ds->gf);
     free(ds);

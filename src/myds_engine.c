@@ -3361,15 +3361,19 @@ static int myds_generate_internal(myds_context_t *ctx,
             struct timeval tv_ver0, tv_ver1;
             gettimeofday(&tv_ver0, NULL);
 
-            myds_v41_spec_snapshot_t snap = {0};
-            bool snap_saved = myds_v41_spec_snapshot_save(ctx, &snap, n_draft + 1);
+            myds_v41_spec_snapshot_t *snap = ctx->dspark ? ctx->dspark->spec_snap : NULL;
+            bool snap_saved = false;
+            if (snap) {
+                memset(snap, 0, sizeof(*snap));
+                snap_saved = myds_v41_spec_snapshot_save(ctx, snap, n_draft + 1);
+            }
 
             uint32_t accepted_in_cycle = 0;
             for (uint32_t d = 0; d < n_draft; d++) {
                 if (cancel_flag && *cancel_flag) {
                     stop_reason = MYDS_STOP_CANCELLED;
                     if (snap_saved && d == 0) {
-                        myds_v41_spec_snapshot_restore(ctx, &snap);
+                        myds_v41_spec_snapshot_restore(ctx, snap);
                     }
                     break;
                 }
@@ -3386,7 +3390,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                 int32_t true_next = myds_forward_token(ctx, cur_token, ctx->pos);
                 if (true_next < 0 || (uint32_t)true_next >= m->tokenizer->vocab_size) {
                     if (snap_saved) {
-                        myds_v41_spec_snapshot_restore(ctx, &snap);
+                        myds_v41_spec_snapshot_restore(ctx, snap);
                     }
                     ctx->pcache_len = 0;
                     stop_reason = MYDS_STOP_ERROR;
@@ -3411,7 +3415,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                 const char *piece = myds_tokenizer_decode_bytes(m->tokenizer, true_next, &piece_len);
                 if (!piece) {
                     if (snap_saved) {
-                        myds_v41_spec_snapshot_restore(ctx, &snap);
+                        myds_v41_spec_snapshot_restore(ctx, snap);
                     }
                     stop_reason = MYDS_STOP_ERROR;
                     success = 0;

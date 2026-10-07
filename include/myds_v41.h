@@ -81,7 +81,7 @@ int myds_v41_prefill_tokens(myds_context_t *context, const int32_t *tokens,
 #define MYDS_V41_SPEC_MAX_AHEAD 16
 #define MYDS_V41_LAYERS_COUNT   40
 
-typedef struct {
+typedef struct myds_v41_spec_snapshot {
     uint32_t pos;
     uint32_t next_position;
     myds_engram_history_t engram_history;

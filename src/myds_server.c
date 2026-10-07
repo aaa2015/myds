@@ -3662,12 +3662,16 @@ int myds_server_start(myds_context_t *ctx, const char *host, int port, const cha
         job->client_port = client_port;
 
         pthread_t tid;
-        if (pthread_create(&tid, NULL, server_client_thread, job) == 0) {
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, 4 * 1024 * 1024);
+        if (pthread_create(&tid, &attr, server_client_thread, job) == 0) {
             pthread_detach(tid);
         } else {
             handle_client(client_fd, ctx, model_alias, client_ip, client_port);
             free(job);
         }
+        pthread_attr_destroy(&attr);
     }
 
     if (g_server_fd >= 0) {
