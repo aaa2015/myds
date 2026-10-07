@@ -1753,8 +1753,14 @@ static void test_p1_moe_route_fusion(void) {
         myds_metal_buffer_t *p_fused = myds_metal_buffer_alloc(total * sizeof(float));
         myds_metal_buffer_t *s_fused = myds_metal_buffer_alloc(total * sizeof(float));
 
+        myds_metal_buffer_t *sel_all = myds_metal_buffer_alloc(rows * top_k * sizeof(int32_t));
+        myds_metal_buffer_t *w_all = myds_metal_buffer_alloc(rows * top_k * sizeof(float));
+        myds_metal_buffer_t *p_all = myds_metal_buffer_alloc(total * sizeof(float));
+        myds_metal_buffer_t *s_all = myds_metal_buffer_alloc(total * sizeof(float));
+
         assert(logits && bias && sel_unfused && w_unfused && p_unfused && s_unfused &&
-               sel_fused && w_fused && p_fused && s_fused);
+               sel_fused && w_fused && p_fused && s_fused &&
+               sel_all && w_all && p_all && s_all);
 
         float *b_ptr = (float *)myds_metal_buffer_data(bias);
         for (uint32_t e = 0; e < experts; e++) {
@@ -1765,19 +1771,28 @@ static void test_p1_moe_route_fusion(void) {
             l_ptr[i] = (float)sin((double)i * 0.05 + (double)r) * 12.0f;
         }
 
-        // Run unfused
+        // Run unfused (fuse=0, 7 kernels)
         setenv("MYDS_MOE_ROUTE_FUSE", "0", 1);
         assert(myds_v41_route_batch(sel_unfused, w_unfused, p_unfused, s_unfused, logits, bias, experts, top_k, scale, rows));
 
-        // Run fused
+        // Run 3-kernel fused (fuse=1, prepare + sort + finish)
         setenv("MYDS_MOE_ROUTE_FUSE", "1", 1);
         assert(myds_v41_route_batch(sel_fused, w_fused, p_fused, s_fused, logits, bias, experts, top_k, scale, rows));
 
-        // Parity checks
+        // Run all-in-one single-kernel fused (fuse=2, kernel_myds_v41_route_fused)
+        setenv("MYDS_MOE_ROUTE_FUSE", "2", 1);
+        assert(myds_v41_route_batch(sel_all, w_all, p_all, s_all, logits, bias, experts, top_k, scale, rows));
+
+        // Parity checks: unfused (0) vs 3-kernel (1)
         assert(memcmp(myds_metal_buffer_data(p_unfused), myds_metal_buffer_data(p_fused), total * sizeof(float)) == 0);
         assert(memcmp(myds_metal_buffer_data(s_unfused), myds_metal_buffer_data(s_fused), total * sizeof(float)) == 0);
         assert(memcmp(myds_metal_buffer_data(sel_unfused), myds_metal_buffer_data(sel_fused), rows * top_k * sizeof(int32_t)) == 0);
         assert(memcmp(myds_metal_buffer_data(w_unfused), myds_metal_buffer_data(w_fused), rows * top_k * sizeof(float)) == 0);
+
+        // Parity checks: unfused (0) vs all-in-one single-kernel (2)
+        assert(memcmp(myds_metal_buffer_data(p_unfused), myds_metal_buffer_data(p_all), total * sizeof(float)) == 0);
+        assert(memcmp(myds_metal_buffer_data(sel_unfused), myds_metal_buffer_data(sel_all), rows * top_k * sizeof(int32_t)) == 0);
+        assert(memcmp(myds_metal_buffer_data(w_unfused), myds_metal_buffer_data(w_all), rows * top_k * sizeof(float)) == 0);
 
         myds_metal_buffer_free(logits);
         myds_metal_buffer_free(bias);
@@ -1789,9 +1804,13 @@ static void test_p1_moe_route_fusion(void) {
         myds_metal_buffer_free(w_fused);
         myds_metal_buffer_free(p_fused);
         myds_metal_buffer_free(s_fused);
+        myds_metal_buffer_free(sel_all);
+        myds_metal_buffer_free(w_all);
+        myds_metal_buffer_free(p_all);
+        myds_metal_buffer_free(s_all);
     }
     unsetenv("MYDS_MOE_ROUTE_FUSE");
-    printf("  [PASS] MoE route 7->3 dispatch fusion bit-exact parity verified (rows=1,2,8,33,128)\n");
+    printf("  [PASS] MoE route 7->3->1 dispatch fusion 3-way bit-exact parity verified (rows=1,2,8,33,128)\n");
 }
 
 static void test_p1_moe_concurrent_barriers_and_route_parity(void) {

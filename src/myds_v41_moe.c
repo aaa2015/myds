@@ -30,9 +30,12 @@ static int dispatch(const char *kernel, const void *args, size_t size,
     return myds_metal_dispatch_kernel(kernel, args, size, buffers, count, grid, block, scratch);
 }
 
-static inline bool is_route_fuse_enabled(void) {
+static inline int get_route_fuse_level(void) {
     const char *v = getenv("MYDS_MOE_ROUTE_FUSE");
-    return !(v && strcmp(v, "0") == 0);
+    if (!v) return 2; /* 默认启用全部融合 (all-in-one 单 kernel 派发) */
+    if (strcmp(v, "0") == 0) return 0; /* 禁用融合 (7 个小 kernel) */
+    if (strcmp(v, "1") == 0) return 1; /* 3 个 kernel (prepare + argsort + finish) */
+    return atoi(v); /* >= 2: 全融合 */
 }
 
 int myds_v41_route_batch(myds_metal_buffer_t *selected, myds_metal_buffer_t *weights,
@@ -45,10 +48,26 @@ int myds_v41_route_batch(myds_metal_buffer_t *selected, myds_metal_buffer_t *wei
         !sized(logits, (size_t)experts * rows) || !sized(bias, experts)) return 0;
     const uint64_t total = (uint64_t)experts * (uint64_t)rows;
     struct route_args args = {(uint32_t)total, top_k, 0, scale, rows, experts, experts / 4u};
+
+    const int fuse_level = get_route_fuse_level();
+    if (fuse_level >= 2) {
+        const myds_metal_buffer_t *fused_bufs[] = {logits, bias, probs, scores, selected, weights};
+        /* 共享内存: 512 ints + 512 floats + 384 floats + 32 floats = 5760 字节 */
+        const size_t shmem_bytes = 512 * sizeof(int32_t) + 512 * sizeof(float) +
+                                   experts * sizeof(float) + 32 * sizeof(float);
+        if (dispatch("kernel_myds_v41_route_fused", &args, sizeof(args), fused_bufs, 6,
+                     rows, 512, shmem_bytes)) {
+            const myds_metal_buffer_t *out_bufs[] = {selected, weights};
+            myds_metal_barrier_buffers(out_bufs, 2);
+            return 1;
+        }
+        /* 若全融合派发失败，平滑退回到分阶段路径 */
+    }
+
     const uint32_t tgroups = (uint32_t)((total / 4u + 31u) / 32u);
 
     int fused_prep_ok = 0;
-    if (is_route_fuse_enabled()) {
+    if (fuse_level >= 1) {
         const myds_metal_buffer_t *prep[] = {logits, bias, probs, scores};
         fused_prep_ok = dispatch("kernel_myds_v41_route_prepare", &args, sizeof(args), prep, 4,
                                  tgroups, 32, 0);
@@ -94,7 +113,7 @@ int myds_v41_route_batch(myds_metal_buffer_t *selected, myds_metal_buffer_t *wei
     const myds_metal_buffer_t *finish_in[] = {probs, selected};
     myds_metal_barrier_buffers(finish_in, 2);
 
-    if (is_route_fuse_enabled()) {
+    if (fuse_level >= 1) {
         const myds_metal_buffer_t *finish[] = {probs, selected, weights, scores};
         if (dispatch("kernel_myds_v41_route_finish", &args, sizeof(args), finish, 4, rows, top_k, 128)) {
             const myds_metal_buffer_t *out_bufs[] = {selected, weights};
