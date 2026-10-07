@@ -169,19 +169,52 @@ int myds_v41_moe(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t p
     if (!ctx || !ctx->model || layer >= ctx->model->n_layers) return 0;
     myds_model_t *m = ctx->model;
     myds_layer_t *l = &m->layers[layer];
-    const uint32_t dim=m->dim, width=m->moe_expert_dim;
+    const uint32_t dim = m->dim, width = m->moe_expert_dim, k = m->n_activated_experts;
     const bool trace_on = myds_trace_active();
 
-    if (!myds_metal_v41_gemv(ctx->router_logits,l->router_gate,ctx->ffn_norm_out,
-                             m->n_routed_experts,dim,l->router_gate_type)) return 0;
-    if (!myds_v41_decode_gemv_bf16(ctx->shared_gate_out,l->shared_gate,ctx->ffn_norm_out,
-                         width,dim,l->shared_gate_type,trace_on) ||
-        !myds_v41_decode_gemv_bf16(ctx->shared_up_out,l->shared_up,ctx->ffn_norm_out,
-                         width,dim,l->shared_up_type,trace_on) ||
-        !myds_v41_shared_swiglu(ctx->shared_swiglu_out,ctx->shared_gate_out,
-                               ctx->shared_up_out,width,m->swiglu_clamp_exp) ||
-        !myds_v41_decode_gemv_bf16(ctx->shared_out,l->shared_down,ctx->shared_swiglu_out,
-                         dim,width,l->shared_down_type,trace_on)) return 0;
+    if (m->n_routed_experts != 384 || k != 6 || m->n_shared_experts != 1 ||
+        !dim || !width || dim % 256 || width % 256 ||
+        l->ffn_gate_exps_type != GGML_TYPE_IQ2_XXS ||
+        l->ffn_up_exps_type != GGML_TYPE_IQ2_XXS ||
+        l->ffn_down_exps_type != GGML_TYPE_Q2_K) return 0;
 
-    return myds_v41_moe_eval(ctx, layer, pos, ctx->ffn_norm_out, ctx->router_logits, ctx->shared_out);
+    /* 1. 优先派发 router_logits GEMV 与路由打分排序，使 route 计算与后续 shared expert 在 GPU 上重叠 */
+    if (!myds_metal_v41_gemv(ctx->router_logits, l->router_gate, ctx->ffn_norm_out,
+                             m->n_routed_experts, dim, l->router_gate_type)) return 0;
+    if (trace_on && !myds_trace_f32("route_logits", layer, pos, ctx->router_logits, m->n_routed_experts)) return 0;
+
+    if (!myds_v41_route(ctx->selected_ids, ctx->selected_weights, ctx->moe_gate, ctx->moe_up,
+                        ctx->router_logits, l->router_bias, m->n_routed_experts, k, m->routed_scaling_factor)) return 0;
+    if (trace_on) {
+        if (!myds_trace_f32("route_probs", layer, pos, ctx->moe_gate, m->n_routed_experts) ||
+            !myds_trace_f32("route_weights", layer, pos, ctx->selected_weights, k)) return 0;
+        const myds_metal_buffer_t *id_buffers[] = {ctx->selected_ids, ctx->moe_up};
+        if (!dispatch("kernel_myds_v41_ids_f32", &k, sizeof(k), id_buffers, 2, 1, 32, 0) ||
+            !myds_trace_f32("route_ids", layer, pos, ctx->moe_up, k)) return 0;
+    }
+
+    /* 2. 紧接着派发 shared expert (gate, up, swiglu, down) */
+    if (!myds_v41_decode_gemv_bf16(ctx->shared_gate_out, l->shared_gate, ctx->ffn_norm_out,
+                         width, dim, l->shared_gate_type, trace_on) ||
+        !myds_v41_decode_gemv_bf16(ctx->shared_up_out, l->shared_up, ctx->ffn_norm_out,
+                         width, dim, l->shared_up_type, trace_on) ||
+        !myds_v41_shared_swiglu(ctx->shared_swiglu_out, ctx->shared_gate_out,
+                               ctx->shared_up_out, width, m->swiglu_clamp_exp) ||
+        !myds_v41_decode_gemv_bf16(ctx->shared_out, l->shared_down, ctx->shared_swiglu_out,
+                         dim, width, l->shared_down_type, trace_on)) return 0;
+    if (trace_on && !myds_trace_f32("shared_out", layer, pos, ctx->shared_out, dim)) return 0;
+
+    /* 3. 此时路由选择与 shared expert 计算流已就绪，启动 routed MoE */
+    myds_metal_barrier();
+    if (!myds_metal_routed_moe(ctx->moe_out, ctx->ffn_norm_out, l->ffn_gate_exps,
+        l->ffn_up_exps, l->ffn_down_exps, ctx->selected_ids, ctx->selected_weights,
+        ctx->moe_gate, ctx->moe_up, ctx->moe_mid, ctx->moe_down, dim, width,
+        m->n_routed_experts, k, l->ffn_gate_exps_type, l->ffn_up_exps_type,
+        l->ffn_down_exps_type, m->swiglu_clamp_exp)) return 0;
+    myds_metal_barrier();
+    if (trace_on && !myds_trace_f32("routed_out", layer, pos, ctx->moe_out, dim)) return 0;
+
+    /* 4. 融合 shared_out 与 routed_moe */
+    if (!myds_metal_v41_add_bf16(ctx->ffn_out, ctx->moe_out, ctx->shared_out, dim)) return 0;
+    return !trace_on || myds_trace_f32("ffnblock", layer, pos, ctx->ffn_out, dim);
 }

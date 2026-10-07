@@ -2303,7 +2303,6 @@ static int project_decode_qkv(myds_metal_buffer_t *out,const myds_metal_buffer_t
     static int enabled=-1;
     if(trace_on||!qkv_fusion_enabled("MYDS_QKV_FUSE_BF16",&enabled))
         return project(out,w,in,rows,width,type,true);
-    myds_metal_barrier();
     return myds_metal_v41_gemv_bf16(out,w,in,rows,width,type);
 }
 
@@ -2312,7 +2311,6 @@ static int project_decode_qkv(myds_metal_buffer_t *out,const myds_metal_buffer_t
 static int project_decode_tail(myds_metal_buffer_t *out,const myds_metal_buffer_t *w,
     const myds_metal_buffer_t *in,uint32_t rows,uint32_t width,ggml_type type,bool trace_on) {
     if(type!=GGML_TYPE_Q8_0) return project(out,w,in,rows,width,type,true);
-    myds_metal_barrier();
     return myds_v41_decode_gemv_bf16(out,w,in,rows,width,type,trace_on);
 }
 
@@ -2837,7 +2835,6 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
         CHECK(myds_v41_moe(ctx,il,(uint32_t)token,pos));
         CHECK(myds_metal_v41_hc_expand(g->residual,ctx->ffn_out,g->after_attn,g->ffn_split,V41_DIM));
         TRACE("layer_out",g->residual,4*V41_DIM);
-        myds_metal_barrier();
         if (decode_split && !trace_on && il + 1u < V41_LAYERS &&
             ((il + 1u) * (uint32_t)decode_split) / V41_LAYERS != (il * (uint32_t)decode_split) / V41_LAYERS) {
             CHECK(myds_metal_flush_batch());
@@ -3457,7 +3454,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
      * 块对齐随 chunk 长度变化 ⇒ 极点值可能差最后几位，本版未验证那种组合，直接不收缩。 */
     const char *gather_env = getenv("MYDS_ATTN_GATHER");
     const bool shrink_gather_ok = (!gather_env) || atoi(gather_env) != 0;
-    uint32_t shrink_min = 2048u;
+    uint32_t shrink_min = 512u;
     const char *smin = getenv("MYDS_SUFFIX_SHRINK_MIN_TOKENS");
     if (smin && *smin) {
         long v = atol(smin);
