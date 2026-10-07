@@ -193,16 +193,32 @@ static int test_pack_and_gather(void) {
     printf("  [PASS] mode2/3 BF16 bits, offset guards, special bit patterns and exact gather\n");return 1;
 }
 static int test_indexscores_bf16(void) {
-    const uint32_t rows=65,tokens=9;
+    const uint32_t rows=65,tokens=9,blocks=(rows+7)/8;
     myds_metal_buffer_t *keys=myds_metal_buffer_alloc(rows*128*4),*packed=myds_metal_buffer_alloc(rows*128*2),
                         *q=myds_metal_buffer_alloc(tokens*32*128*4),*w=myds_metal_buffer_alloc(tokens*32*4),
-                        *a=myds_metal_buffer_alloc(tokens*rows*4),*b=myds_metal_buffer_alloc(tokens*rows*4);
-    CHECK(keys&&packed&&q&&w&&a&&b);fill(keys,3);fill(q,7);fill(w,11);
+                        *a=myds_metal_buffer_alloc(tokens*rows*4),*b=myds_metal_buffer_alloc(tokens*rows*4),
+                        *mask=myds_metal_buffer_alloc(blocks*sizeof(float));
+    CHECK(keys&&packed&&q&&w&&a&&b&&mask);fill(keys,3);fill(q,7);fill(w,11);
+    float *mp=(float*)myds_metal_buffer_data(mask);
+    for(uint32_t bk=0;bk<blocks;bk++) mp[bk] = (bk % 2 == 0) ? 0.0f : -INFINITY;
     CHECK(myds_metal_begin_batch());CHECK(myds_v41_gpu_quant(keys,128,rows,2));
     CHECK(myds_v41_gpu_pack_bf16(packed,0,keys,0,rows*128));CHECK(myds_metal_commit_batch());
     const uint32_t heads[]={1,7,32};for(size_t i=0;i<3;i++){
         CHECK(myds_metal_begin_batch());CHECK(myds_v41_gpu_indexscores(a,q,w,keys,rows,heads[i]));
         CHECK(myds_v41_gpu_indexscores_bf16(b,q,w,packed,rows,heads[i]));CHECK(myds_metal_commit_batch());CHECK(exact(a,b,rows));
+
+        /* Masked indexscores 测试：对比 全量+filter 与 直接masked 内核输出，要求 100% 逐位全同 */
+        CHECK(myds_metal_begin_batch());
+        CHECK(myds_v41_gpu_indexscores(a,q,w,keys,rows,heads[i]));
+        CHECK(myds_v41_gpu_filter(a,mask,rows,rows,1));
+        CHECK(myds_v41_gpu_indexscores_masked_bf16(b,q,w,packed,mask,rows,heads[i]));
+        CHECK(myds_metal_commit_batch());
+        CHECK(!memcmp(myds_metal_buffer_data(a),myds_metal_buffer_data(b),(size_t)rows*4));
+        const float *bp=(const float*)myds_metal_buffer_data(b);
+        for(uint32_t r=0;r<rows;r++) {
+            if ((r / 8) % 2 != 0) CHECK(bp[r] == -INFINITY);
+            else CHECK(isfinite(bp[r]));
+        }
     }
     for(int tiled=0;tiled<2;tiled++){
         CHECK(!setenv("MYDS_INDEXER_TILED",tiled?"1":"0",1));
@@ -213,8 +229,8 @@ static int test_indexscores_bf16(void) {
             CHECK(r<(60+t+1)/2?isfinite(p[t*rows+r]):p[t*rows+r]==-INFINITY);
     }
     unsetenv("MYDS_INDEXER_TILED");myds_metal_buffer_free(keys);myds_metal_buffer_free(packed);myds_metal_buffer_free(q);
-    myds_metal_buffer_free(w);myds_metal_buffer_free(a);myds_metal_buffer_free(b);
-    printf("  [PASS] BF16 index scores byte exact: scalar/direct/chunk/tiled and causal tails\n");return 1;
+    myds_metal_buffer_free(w);myds_metal_buffer_free(a);myds_metal_buffer_free(b);myds_metal_buffer_free(mask);
+    printf("  [PASS] BF16 index scores byte exact: scalar/direct/chunk/tiled, masked early exit and causal tails\n");return 1;
 }
 static int test_attention_bf16(void) {
     struct fixture f;CHECK(fixture_create(&f,129,4096));

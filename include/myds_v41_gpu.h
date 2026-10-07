@@ -98,6 +98,12 @@ int myds_v41_gpu_indexscores(myds_metal_buffer_t *scores,const myds_metal_buffer
 int myds_v41_gpu_indexscores_bf16(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
     const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,
     uint32_t n_comp,uint32_t n_heads);
+int myds_v41_gpu_indexscores_masked(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
+    const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,
+    const myds_metal_buffer_t *mask,uint32_t n_comp,uint32_t n_heads);
+int myds_v41_gpu_indexscores_masked_bf16(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
+    const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,
+    const myds_metal_buffer_t *mask,uint32_t n_comp,uint32_t n_heads);
 /* 整 chunk 批量版（n_tokens 行 × n_comp 列，行主序，行步长 n_comp）。只支持
  * n_heads == 32；每行的因果宽度 = (causal_start + row + 1) / causal_ratio，
  * 与逐 token 的 count 相同；行数不够的格子写 -INFINITY。 */

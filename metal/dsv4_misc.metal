@@ -271,6 +271,7 @@ struct ds4_metal_args_glm_indexer_score_one {
     uint32_t head_dim;
     uint32_t cache_f16;
     float    scale;
+    uint32_t has_mask;
 };
 
 /* 批量（整 prefill chunk）版 indexer 分数。逐字照抄 ds4_metal_args_glm_indexer_score_one，
@@ -1947,12 +1948,19 @@ kernel void kernel_glm_indexer_score_one(
         device const float *weights,
         device const char *indexer_key_cache,
         device float *scores,
+        device const float *mask,
         threadgroup float *scratch [[threadgroup(0)]],
         uint tid [[thread_index_in_threadgroup]],
         ushort3 ntg_u [[threads_per_threadgroup]],
         uint3 tgpig [[threadgroup_position_in_grid]]) {
     const uint row = tgpig.x;
     if (row >= args.n_rows) return;
+    if (args.has_mask && mask[row / 8u] != 0.0f) {
+        if (tid == 0) {
+            scores[row] = -INFINITY;
+        }
+        return;
+    }
     const uint nth = ntg_u.x;
     float score = 0.0f;
     for (uint h = 0; h < args.n_head; h++) {
@@ -1986,12 +1994,19 @@ kernel void kernel_glm_indexer_score_one_direct(
         device const float *weights,
         device const char *indexer_key_cache,
         device float *scores,
+        device const float *mask,
         threadgroup float *shared [[threadgroup(0)]],
         uint row [[threadgroup_position_in_grid]],
         ushort tid [[thread_index_in_threadgroup]],
         ushort lane [[thread_index_in_simdgroup]],
         ushort sg [[simdgroup_index_in_threadgroup]]) {
     if (row >= args.n_rows || args.n_head != 32u || args.head_dim != 128u) {
+        return;
+    }
+    if (args.has_mask && mask[row / 8u] != 0.0f) {
+        if (tid == 0) {
+            scores[row] = -INFINITY;
+        }
         return;
     }
 

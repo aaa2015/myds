@@ -2630,15 +2630,15 @@ static int publish_indexer_one(myds_context_t *ctx, uint32_t il, uint32_t pos,
             w_buf = g->index_weights;
         }
 
-        CHECK(myds_v41_gpu_indexscores_bf16(g->index_scores,q_buf,w_buf,g->index_cache[owner],count,V41_INDEX_HEADS));
+        const myds_metal_buffer_t *b_mask = (il > 20) ? (in_block_mask ? in_block_mask : g->block_mask) : NULL;
+        CHECK(myds_v41_gpu_indexscores_masked_bf16(g->index_scores,q_buf,w_buf,g->index_cache[owner],b_mask,count,V41_INDEX_HEADS));
         if (il==20) {
             uint32_t blocks=(count+7)/8,top=block_budget_cap(blocks<2048?blocks:2048);
             CHECK(myds_v41_gpu_candidates(g->block_scores,g->index_scores,count,pos,ratio));
             CHECK(myds_v41_gpu_topk(g->block_selected,g->block_scores,blocks,top,g->gpu));
-            myds_metal_buffer_t *b_mask = out_block_mask ? out_block_mask : g->block_mask;
-            CHECK(myds_v41_gpu_topkmask(b_mask,g->block_selected,blocks,top));
+            myds_metal_buffer_t *b_mask_out = out_block_mask ? out_block_mask : g->block_mask;
+            CHECK(myds_v41_gpu_topkmask(b_mask_out,g->block_selected,blocks,top));
         } else if (il>20) {
-            const myds_metal_buffer_t *b_mask = in_block_mask ? in_block_mask : g->block_mask;
             CHECK(myds_v41_gpu_filter(g->index_scores,b_mask,count,pos,ratio));
         }
         myds_metal_buffer_t *sel = out_selected ? out_selected : g->selected;

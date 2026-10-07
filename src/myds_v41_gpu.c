@@ -353,22 +353,35 @@ int myds_v41_gpu_pool2(myds_metal_buffer_t *out,const myds_metal_buffer_t *kv,
     return dispatch("kernel_dsv41_pool2",a,sizeof(a),b,5,(width+255u)/256,1,1,256,1,1,0);
 }
 static int indexscores(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
-    const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,uint32_t n_comp,uint32_t n_heads,bool cache_bf16) {
+    const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,
+    const myds_metal_buffer_t *mask,uint32_t n_comp,uint32_t n_heads,bool cache_bf16) {
     if(!n_heads||!floats(scores,n_comp)||!floats(q,(uint64_t)n_heads*128)||
         !floats(weights,n_heads)||!(cache_bf16?bf16s(cache,(uint64_t)n_comp*128):
         floats(cache,(uint64_t)n_comp*128)))return 0;
-    struct {uint32_t n_rows,n_head,head_dim,cache_f16;float scale;} a={n_comp,n_heads,128,cache_bf16?2u:0u,1.0f/64.0f};
-    const myds_metal_buffer_t *b[]={q,weights,cache,scores};
-    return n_heads==32 ? dispatch("kernel_glm_indexer_score_one_direct",&a,sizeof(a),b,4,n_comp,1,1,32,4,1,132u*4)
-        : dispatch("kernel_glm_indexer_score_one",&a,sizeof(a),b,4,n_comp,1,1,32,1,1,32u*4);
+    if(mask&&!floats(mask,(n_comp+7u)/8u))return 0;
+    struct {uint32_t n_rows,n_head,head_dim,cache_f16;float scale;uint32_t has_mask;} a={
+        n_comp,n_heads,128,cache_bf16?2u:0u,1.0f/64.0f,mask?1u:0u};
+    const myds_metal_buffer_t *b[]={q,weights,cache,scores,mask?mask:scores};
+    return n_heads==32 ? dispatch("kernel_glm_indexer_score_one_direct",&a,sizeof(a),b,5,n_comp,1,1,32,4,1,132u*4)
+        : dispatch("kernel_glm_indexer_score_one",&a,sizeof(a),b,5,n_comp,1,1,32,1,1,32u*4);
 }
 int myds_v41_gpu_indexscores(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
     const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,uint32_t n_comp,uint32_t n_heads) {
-    return indexscores(scores,q,weights,cache,n_comp,n_heads,false);
+    return indexscores(scores,q,weights,cache,NULL,n_comp,n_heads,false);
 }
 int myds_v41_gpu_indexscores_bf16(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
     const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,uint32_t n_comp,uint32_t n_heads) {
-    return indexscores(scores,q,weights,cache,n_comp,n_heads,true);
+    return indexscores(scores,q,weights,cache,NULL,n_comp,n_heads,true);
+}
+int myds_v41_gpu_indexscores_masked(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
+    const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,
+    const myds_metal_buffer_t *mask,uint32_t n_comp,uint32_t n_heads) {
+    return indexscores(scores,q,weights,cache,mask,n_comp,n_heads,false);
+}
+int myds_v41_gpu_indexscores_masked_bf16(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
+    const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,
+    const myds_metal_buffer_t *mask,uint32_t n_comp,uint32_t n_heads) {
+    return indexscores(scores,q,weights,cache,mask,n_comp,n_heads,true);
 }
 /* 整 chunk 批量版：kernel_glm_indexer_score_chunk_direct 与 _direct 的线程/网格/smem
  * 相同，只是多一维 token（grid.y）与逐行因果门。只支持 n_heads == 32，
