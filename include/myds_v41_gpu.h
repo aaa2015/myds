@@ -61,7 +61,11 @@ typedef struct {
 void myds_v41_gpu_attention_counters(myds_v41_gpu_attention_counters_t *out, bool reset);
 int myds_v41_gpu_rope(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
     uint32_t pos,bool compressed,bool inverse);
+int myds_v41_gpu_rope_round(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
+    uint32_t pos,bool compressed,bool inverse);
 int myds_v41_gpu_rope_batch(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
+    uint32_t start_pos,uint32_t rows,bool compressed,bool inverse);
+int myds_v41_gpu_rope_batch_round(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
     uint32_t start_pos,uint32_t rows,bool compressed,bool inverse);
 /* 同上，但行间的位置步长可指定（stride=1 即 rope_batch）。压缩器批量路径用它：
  * ratio==2 的提交行位置是 first_pos + 2*row。内核算的是 theta=(start+row*stride)*freq。 */

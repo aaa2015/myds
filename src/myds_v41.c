@@ -2771,8 +2771,9 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
         }
         CHECK(myds_metal_v41_hc_mix(g->attn_split,g->residual,l->attn_fn,GGML_TYPE_F16,l->attn_scale,l->attn_base,g->flat_norm,g->mix,V41_DIM,m->norm_eps,v->hc_eps));
         TRACE("hc_attn_mix",g->mix,24); TRACE("hc_attn_split",g->attn_split,24);
-        TRACE("hc_attn_pre",g->pre,4);
-        CHECK(myds_metal_v41_hc_weighted_sum(ctx->x,g->residual,g->pre,V41_DIM));
+        const myds_metal_buffer_t *hc_in_pre = (il == 0 ? g->pre : g->ffn_split);
+        TRACE("hc_attn_pre",hc_in_pre,4);
+        CHECK(myds_metal_v41_hc_weighted_sum(ctx->x,g->residual,hc_in_pre,V41_DIM));
         TRACE("hc_attn_input",ctx->x,V41_DIM);
         CHECK(myds_metal_v41_rmsnorm(ctx->x_norm,ctx->x,base->attn_norm,V41_DIM,m->norm_eps,true));
         TRACE("attn_norm",ctx->x_norm,V41_DIM);
@@ -2819,8 +2820,7 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
             if (count) CHECK(myds_v41_gpu_gather_bf16(g->selected_kv,g->compressed[owner_for(il)],g->selected,count,top));
             CHECK(myds_v41_gpu_attention(ctx->attn_heads,base->attn_sinks,ctx->q,g->window[il],nraw,(pos+1u-nraw)%128,g->selected_kv,top,g->gpu));
         }
-        CHECK(myds_metal_v41_bf16(ctx->attn_heads,V41_HEADS*512));
-        CHECK(myds_v41_gpu_rope(ctx->attn_heads,512,V41_HEADS,pos,compressed,true));
+        CHECK(myds_v41_gpu_rope_round(ctx->attn_heads,512,V41_HEADS,pos,compressed,true));
         CHECK(myds_metal_attn_output_a_bf16(ctx->attn_low,base->attn_output_a,ctx->attn_heads,8,4096,1024,base->attn_output_a_type));
         CHECK(project_decode_tail(ctx->attn_out,base->attn_output_b,ctx->attn_low,V41_DIM,8192,base->attn_output_b_type,trace_on));
         TRACE("attn_out",ctx->attn_out,V41_DIM);
@@ -2836,7 +2836,6 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
         phase="MoE";
         CHECK(myds_v41_moe(ctx,il,(uint32_t)token,pos));
         CHECK(myds_metal_v41_hc_expand(g->residual,ctx->ffn_out,g->after_attn,g->ffn_split,V41_DIM));
-        CHECK(myds_metal_buffer_copy(g->pre,0,g->ffn_split,0,4*4u));
         TRACE("layer_out",g->residual,4*V41_DIM);
         myds_metal_barrier();
         if (decode_split && !trace_on && il + 1u < V41_LAYERS &&
@@ -2847,7 +2846,7 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
     }
     phase="output head";
     if (need_logits) {
-        CHECK(myds_metal_v41_hc_weighted_sum(ctx->x,g->residual,g->pre,V41_DIM));
+        CHECK(myds_metal_v41_hc_weighted_sum(ctx->x,g->residual,g->ffn_split,V41_DIM));
         CHECK(myds_metal_v41_rmsnorm(ctx->x_norm,ctx->x,m->output_norm,V41_DIM,m->norm_eps,true));
         CHECK(project(ctx->logits,m->output,ctx->x_norm,m->vocab_size,V41_DIM,m->output_type,false));
         CHECK(myds_metal_commit_batch());
@@ -3458,8 +3457,14 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
      * 块对齐随 chunk 长度变化 ⇒ 极点值可能差最后几位，本版未验证那种组合，直接不收缩。 */
     const char *gather_env = getenv("MYDS_ATTN_GATHER");
     const bool shrink_gather_ok = (!gather_env) || atoi(gather_env) != 0;
+    uint32_t shrink_min = 2048u;
+    const char *smin = getenv("MYDS_SUFFIX_SHRINK_MIN_TOKENS");
+    if (smin && *smin) {
+        long v = atol(smin);
+        if (v >= 0) shrink_min = (uint32_t)v;
+    }
     const bool suffix_shrink = opt_suffix_shrink && shrink_gather_ok &&
-                               (base_pos + n_tokens) >= 8192u;
+                               (base_pos + n_tokens) >= shrink_min;
     /* 收缩前置段的「有效快照窗口」（见 docs/verification/2026-10-03-suffix-shrink-snapshot.md）：
      * 层 il 的窗口环在 p 处【内容正确】的前提是 p ≥ B - shift（推导见层循环里的注释）。
      *   shift = 0（默认）⇒ 与 6a 完全一致：只有 macroblock 末尾能发布快照，
@@ -3781,11 +3786,11 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 if (kv_only) { /* 前端只喂窗口环，Q 完全不用算 */ }
                 else {
                 if (!opt_skip_q_b)
-                    CHECK(project_batch(cw->q_buf, base->attn_q_b, cw->qr_norm_buf, V41_HEADS * 512, 1280, c_len, base->attn_q_b_type, true));
+                    CHECK(project_batch(cw->q_buf, base->attn_q_b, cw->qr_norm_buf, V41_HEADS * 512, 1280, c_len, base->attn_q_b_type, false));
 
-                /* Batched RoPE for Q */
+                /* Batched RoPE + BF16 rounding for Q */
                 if (!opt_skip_q_rope)
-                    CHECK(myds_v41_gpu_rope_batch(cw->q_buf, 512, V41_HEADS, mb_base_pos + c_start, c_len, compressed, false));
+                    CHECK(myds_v41_gpu_rope_batch_round(cw->q_buf, 512, V41_HEADS, mb_base_pos + c_start, c_len, compressed, false));
 
                 if (trace_on) {
                     for (uint32_t t = 0; t < c_len; t++) {
@@ -3952,15 +3957,8 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     CHECK(myds_metal_begin_batch());
                 }
 
-                CHECK(myds_metal_v41_bf16(cw->attn_heads_buf, V41_HEADS * 512 * c_len));
-                if (do_prof && opt_prof_split3) {
-                    TIME_START();
-                    CHECK(myds_metal_commit_batch());
-                    TIME_ACC(prof_wait_bf16);
-                    CHECK(myds_metal_begin_batch());
-                }
-
-                CHECK(myds_v41_gpu_rope_batch(cw->attn_heads_buf, 512, V41_HEADS, mb_base_pos + c_start, c_len, compressed, true));
+                /* Batched inverse RoPE + BF16 rounding */
+                CHECK(myds_v41_gpu_rope_batch_round(cw->attn_heads_buf, 512, V41_HEADS, mb_base_pos + c_start, c_len, compressed, true));
                 disp_ringattn += myds_metal_dispatch_count() - dr0;   /* 诊断 */
 
                 if (do_prof) { disp_step4loop += myds_metal_dispatch_count() - disp_loop0; }  /* 诊断 */

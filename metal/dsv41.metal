@@ -59,6 +59,28 @@ kernel void kernel_dsv41_rope(
     x[i + 1u] = dsv41_bf16(re * s + im * c);
 }
 
+kernel void kernel_dsv41_rope_round(
+        constant ds4_metal_args_dsv41_rope &args,
+        device float *x,
+        uint2 group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    const ulong head_base = ((ulong)group.y * (ulong)args.heads + (ulong)group.x) * (ulong)args.width;
+    const uint unrotated = args.width >= 64u ? args.width - 64u : 0u;
+    for (uint k = 0; k < unrotated; k += 32u) {
+        if (k + lane < unrotated) {
+            const ulong idx = head_base + (ulong)(k + lane);
+            x[idx] = dsv41_bf16(x[idx]);
+        }
+    }
+    const float theta = float(args.start + group.y * args.stride) * args.frequencies[lane];
+    const float c = precise::cos(theta);
+    const float s = args.inverse ? -precise::sin(theta) : precise::sin(theta);
+    const ulong i = head_base + (ulong)unrotated + 2u * (ulong)lane;
+    const float re = dsv41_bf16(x[i]), im = dsv41_bf16(x[i + 1u]);
+    x[i] = dsv41_bf16(re * c - im * s);
+    x[i + 1u] = dsv41_bf16(re * s + im * c);
+}
+
 /* Decode-only fused finish. Each Q head retains the original 32-pair RoPE
  * mapping. The other 16 groups process one 32-value KV quantization block.
  * KV tail pairs are read BEFORE any writes; paired elements always share a

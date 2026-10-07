@@ -456,6 +456,7 @@ int myds_metal_init(const char *shader_dir) {
                         @"kernel_dsv4_hc_expand4",
                         @"kernel_dsv41_engram_add",
                         @"kernel_dsv41_rope",
+                        @"kernel_dsv41_rope_round",
                         @"kernel_compute_copy_u8",
                         @"kernel_compute_copy_u32",
                         @"kernel_compute_copy_u32x4",

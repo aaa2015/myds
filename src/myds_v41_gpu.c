@@ -266,6 +266,21 @@ int myds_v41_gpu_rope(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
     uint32_t pos,bool compressed,bool inverse) {
     return myds_v41_gpu_rope_batch(x,width,heads,pos,1,compressed,inverse);
 }
+int myds_v41_gpu_rope_batch_round(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
+    uint32_t start_pos,uint32_t rows,bool compressed,bool inverse) {
+    if(width<64||!heads||!rows||start_pos>=1048576||
+        (uint64_t)start_pos+(uint64_t)(rows-1u)>=1048576||
+        !floats(x,(uint64_t)width*heads*rows))return 0;
+    pthread_once(&rope_once,init_rope);
+    struct {uint32_t width,heads,rows,start,inverse,stride;float frequencies[32];} a={width,heads,rows,start_pos,inverse,1u,{0}};
+    memcpy(a.frequencies,rope_frequencies[compressed?1:0],sizeof(a.frequencies));
+    const myds_metal_buffer_t *b[]={x};
+    return dispatch("kernel_dsv41_rope_round",&a,sizeof(a),b,1,heads,rows,1,32,1,1,0);
+}
+int myds_v41_gpu_rope_round(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
+    uint32_t pos,bool compressed,bool inverse) {
+    return myds_v41_gpu_rope_batch_round(x,width,heads,pos,1,compressed,inverse);
+}
 int myds_v41_gpu_quant(myds_metal_buffer_t *x,uint32_t width,uint32_t rows,uint32_t mode) {
     uint32_t block=mode==3?16:32;
     if(!width||!rows||mode>3||(mode&&width%block)||!floats(x,(uint64_t)width*rows))return 0;
