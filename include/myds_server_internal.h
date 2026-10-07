@@ -110,6 +110,7 @@ bool parse_chat_prompt_suffix_vis(const char *body, char *out_prompt, size_t max
 bool parse_chat_prompt_ex(const char *body, char *out_prompt, size_t max_prompt_len,
                           const char **out_reason);
 bool extract_request_thinking_mode(const char *body, bool default_val);
+int extract_request_reasoning_budget(const char *body, int default_budget);
 void split_reasoning_content(const char *text, size_t n, char **content_out, char **reasoning_out);
 
 #ifdef __cplusplus

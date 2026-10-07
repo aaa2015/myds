@@ -2120,6 +2120,11 @@ myds_v41_model_t *myds_v41_model_create(myds_model_t *m, const char *path) {
     myds_v41_model_t *v = calloc(1,sizeof(*v));
     if (!v) return NULL;
     v->hc_eps = 1e-6f;
+    const gguf_tensor_t *t_legacy_hc = gguf_find_tensor(gf, "output_hc.weight");
+    if (!t_legacy_hc) t_legacy_hc = gguf_find_tensor(gf, "output_hc_mix.weight");
+    if (t_legacy_hc) {
+        MYDS_LOG_W("V4.1 GGUF contains unused legacy output_hc weights; V4.1 folds output via last layer FFN mix.");
+    }
 #define W(member, name, type, width, rows) \
     do { l->member = weight(gf,i,name,type,width,rows); if (!l->member) goto fail; } while (0)
     for (uint32_t i = 0; i < V41_LAYERS; i++) {

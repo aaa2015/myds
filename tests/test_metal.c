@@ -949,7 +949,7 @@ static int test_v41_engram_dispatch_copy(void) {
     ASSERT_TRUE(myds_metal_dispatch_kernel("kernel_dsv41_bf16_linear",&count,sizeof(count),buffers,1,groups,threads,0));
     ASSERT_TRUE(myds_metal_commit_batch());
     for(unsigned h=0;h<4;h++) {
-        double dot=(h<2?.25:-.25)*sqrt(D), gate=1/(1+exp(-copysign(sqrt(fabs(dot)),dot)));
+        double dot=(h<2?.25:-.25)*sqrt(D), gate=1/(1+exp(-copysign(sqrt(fmax(fabs(dot), 1.0e-6)),dot)));
         for(unsigned i=0;i<D;i++)ASSERT_NEAR(rv[h*D+i],v41_test_bf16(2+gate*pv[4*D+i]),0);
     }
     ASSERT_TRUE(!memcmp(rv,myds_metal_buffer_data(copy),4*D*4));
@@ -960,6 +960,33 @@ static int test_v41_engram_dispatch_copy(void) {
     ASSERT_TRUE(!myds_metal_dispatch_kernel("kernel_dsv41_bf16_linear",&count,sizeof(count),buffers,1,groups,threads,0));
     myds_metal_buffer_free(r);myds_metal_buffer_free(p);myds_metal_buffer_free(q);myds_metal_buffer_free(k);myds_metal_buffer_free(copy);
     printf("  [PASS] V4.1 Engram analytic gates and ordered native dispatch/copy bridge\n");
+    return 1;
+}
+
+static int test_v41_engram_gate_clamp(void) {
+    enum {D=128};
+    myds_metal_buffer_t *r=myds_metal_buffer_alloc(4*D*4),*p=myds_metal_buffer_alloc(5*D*4),
+        *q=myds_metal_buffer_alloc(4*D*4),*k=myds_metal_buffer_alloc(4*D*4);
+    ASSERT_TRUE(r&&p&&q&&k);
+    float *rv=myds_metal_buffer_data(r),*pv=myds_metal_buffer_data(p),*qv=myds_metal_buffer_data(q),*kv=myds_metal_buffer_data(k);
+    /* Test zero dot: q is 0 => dot = 0.
+     * With 1e-6 clamp: gate = 1 / (1 + exp(-copysign(sqrt(1e-6), 0))) = 1 / (1 + exp(-0.001)) ≈ 0.5002499687.
+     * Without clamp: gate = 1 / (1 + exp(0)) = 0.5. */
+    for(unsigned i=0;i<4*D;i++){rv[i]=0.0f;pv[i]=1.0f;qv[i]=0.0f;kv[i]=1.0f;}
+    for(unsigned i=0;i<D;i++)pv[4*D+i]=10000.0f;
+    ASSERT_TRUE(myds_metal_begin_batch());
+    ASSERT_TRUE(myds_metal_v41_engram_add(r,p,q,k,D,1e-20f));
+    ASSERT_TRUE(myds_metal_commit_batch());
+    double expected_gate = 1.0 / (1.0 + exp(-sqrt(1.0e-6)));
+    float expected_val = v41_test_bf16(expected_gate * 10000.0);
+    /* Notice: 0.5 * 10000 = 5000.0 (BF16 0x459c), while 0.50025 * 10000 = 5002.5 (BF16 0x459d). */
+    for(unsigned h=0;h<4;h++) {
+        for(unsigned i=0;i<D;i++) {
+            ASSERT_NEAR(rv[h*D+i], expected_val, 0);
+        }
+    }
+    myds_metal_buffer_free(r);myds_metal_buffer_free(p);myds_metal_buffer_free(q);myds_metal_buffer_free(k);
+    printf("  [PASS] V4.1 Engram gate 1e-6 boundary clamp (dot=0 produces gate 0.50025 vs unclamped 0.5)\n");
     return 1;
 }
 
@@ -1317,6 +1344,7 @@ int main(void) {
     RUN_TEST(test_v41_bf16_norm());
     RUN_TEST(test_v41_hc());
     RUN_TEST(test_v41_engram_dispatch_copy());
+    RUN_TEST(test_v41_engram_gate_clamp());
     RUN_TEST(test_specialized_dispatch_cache());
     RUN_TEST(test_moe_batch_mm());
     RUN_TEST(test_rmsnorm());

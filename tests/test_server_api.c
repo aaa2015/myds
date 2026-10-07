@@ -1054,10 +1054,32 @@ static void test_thinking_mode(void) {
         assert(parse_chat_prompt(req_thinking_on, prompt_buf, sizeof(prompt_buf)));
         assert(strstr(prompt_buf, "<｜Assistant｜><think>") != NULL);
         assert(strstr(prompt_buf, "</think>") == NULL);
+        assert(strstr(prompt_buf, "<｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>hello") != NULL);
+
+        const char *req_low = "{\"messages\": [{\"role\": \"user\", \"content\": \"hello\"}], \"thinking\": true, \"reasoning_effort\": \"low\"}";
+        assert(parse_chat_prompt(req_low, prompt_buf, sizeof(prompt_buf)));
+        assert(strstr(prompt_buf, "Reasoning Effort: 50") != NULL);
+
+        const char *req_med = "{\"messages\": [{\"role\": \"user\", \"content\": \"hello\"}], \"thinking\": true, \"reasoning_effort\": \"medium\"}";
+        assert(parse_chat_prompt(req_med, prompt_buf, sizeof(prompt_buf)));
+        assert(strstr(prompt_buf, "Reasoning Effort: 62") != NULL);
+
+        const char *req_max = "{\"messages\": [{\"role\": \"user\", \"content\": \"hello\"}], \"thinking\": true, \"reasoning_effort\": \"max\"}";
+        assert(parse_chat_prompt(req_max, prompt_buf, sizeof(prompt_buf)));
+        assert(strstr(prompt_buf, "Reasoning Effort: 100") != NULL);
+
+        const char *req_int = "{\"messages\": [{\"role\": \"user\", \"content\": \"hello\"}], \"thinking\": true, \"reasoning_effort\": 85}";
+        assert(parse_chat_prompt(req_int, prompt_buf, sizeof(prompt_buf)));
+        assert(strstr(prompt_buf, "Reasoning Effort: 85") != NULL);
+
+        const char *req_sys_think = "{\"instructions\": \"You are a bot.\", \"messages\": [{\"role\": \"user\", \"content\": \"hello\"}], \"thinking\": true}";
+        assert(parse_chat_prompt(req_sys_think, prompt_buf, sizeof(prompt_buf)));
+        assert(strstr(prompt_buf, "<｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\nYou are a bot.<｜User｜>hello<｜Assistant｜><think>") != NULL);
 
         const char *req_thinking_off = "{\"messages\": [{\"role\": \"user\", \"content\": \"hello\"}], \"thinking\": false}";
         assert(parse_chat_prompt(req_thinking_off, prompt_buf, sizeof(prompt_buf)));
         assert(strstr(prompt_buf, "<｜Assistant｜></think>") != NULL);
+        assert(strstr(prompt_buf, "Reasoning Effort") == NULL);
     }
 
     /* 4. History rendering with reasoning_content / reasoning */

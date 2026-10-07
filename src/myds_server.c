@@ -953,15 +953,20 @@ static bool prompt_content(const prompt_json_t *j, const prompt_json_node_t *con
     }
     return true;
 }
-typedef struct { bool pending, user_open; size_t count; } prompt_chat_state_t;
+typedef struct { bool pending, user_open, system_open; size_t count; } prompt_chat_state_t;
 static bool prompt_render_message(prompt_buffer_t *out, prompt_chat_state_t *state, const char *role,
                                   const char *text, const char *suffix, const char *reasoning) {
     if (!strcmp(role, "system") || !strcmp(role, "developer")) {
-        if (!prompt_append(out, "<｜System｜>") || !prompt_append(out, text)) return false;
+        if (!state->system_open) {
+            if (!prompt_append(out, "<｜System｜>")) return false;
+        }
+        state->system_open = false;
+        if (!prompt_append(out, text)) return false;
         (void)suffix; (void)reasoning;
         state->pending = state->count > 0; state->user_open = false;
     } else if (!strcmp(role, "user") || !strcmp(role, "tool") || !strcmp(role, "function")) {
         (void)suffix; (void)reasoning;
+        state->system_open = false;
         if (!prompt_append(out, state->user_open ? "\n\n" : "<｜User｜>")) return false;
         if (!strcmp(role, "user") ? !prompt_append(out, text) : !prompt_tool_text(out, text)) return false;
         state->pending = state->user_open = true;
@@ -1341,7 +1346,7 @@ bool extract_request_thinking_mode(const char *body, bool default_val) {
     char effort[32] = "";
     if (json_extract_string_field(body, "reasoning_effort", effort, sizeof(effort))) {
         if (!strcmp(effort, "none") || !strcmp(effort, "off")) return false;
-        if (!strcmp(effort, "low") || !strcmp(effort, "medium") || !strcmp(effort, "high")) return true;
+        if (!strcmp(effort, "low") || !strcmp(effort, "medium") || !strcmp(effort, "high") || !strcmp(effort, "max")) return true;
     }
 
     const char *ctk = strstr(body, "\"chat_template_kwargs\"");
@@ -1355,6 +1360,45 @@ bool extract_request_thinking_mode(const char *body, bool default_val) {
     }
 
     return default_val;
+}
+
+int extract_request_reasoning_budget(const char *body, int default_budget) {
+    int budget = default_budget > 0 ? default_budget : 75;
+    const char *env_eff = getenv("MYDS_DEFAULT_REASONING_EFFORT");
+    if (env_eff) {
+        if (!strcmp(env_eff, "low")) budget = 50;
+        else if (!strcmp(env_eff, "medium")) budget = 62;
+        else if (!strcmp(env_eff, "high")) budget = 75;
+        else if (!strcmp(env_eff, "max")) budget = 100;
+        else {
+            int val = atoi(env_eff);
+            if (val >= 1 && val <= 100) budget = val;
+        }
+    }
+    if (!body) return budget;
+
+    char effort[32] = "";
+    if (json_extract_string_field(body, "reasoning_effort", effort, sizeof(effort))) {
+        if (!strcmp(effort, "low")) return 50;
+        if (!strcmp(effort, "medium")) return 62;
+        if (!strcmp(effort, "high")) return 75;
+        if (!strcmp(effort, "max")) return 100;
+    }
+    const char *p = strstr(body, "\"reasoning_effort\"");
+    if (p) {
+        p += 18;
+    } else {
+        p = strstr(body, "\"reasoning_budget\"");
+        if (p) p += 18;
+    }
+    if (p) {
+        while (*p && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ':')) p++;
+        if (*p >= '0' && *p <= '9') {
+            int val = atoi(p);
+            if (val >= 1 && val <= 100) return val;
+        }
+    }
+    return budget;
 }
 
 void split_reasoning_content(const char *text, size_t n, char **content_out, char **reasoning_out) {
@@ -1427,6 +1471,7 @@ static bool parse_chat_prompt_impl(const char *body, char *out_prompt, size_t ma
     prompt_chat_state_t state = {0};
     char *content_buffer = NULL; char *suffix = NULL; bool ok = false, valid = true;
     const bool req_thinking = extract_request_thinking_mode(body, g_server_default_thinking);
+    const int reasoning_budget = extract_request_reasoning_budget(body, 75);
     if (!prompt_json_value(&json, 0)) { *why = "body is not valid JSON"; goto done; }
     prompt_json_ws(&json);
     if (*json.cursor || json.nodes[0].kind != PJ_OBJECT) { *why = "body is not a JSON object"; goto done; }
@@ -1481,6 +1526,14 @@ static bool parse_chat_prompt_impl(const char *body, char *out_prompt, size_t ma
         goto render_items;
     }
     if (!prompt_append(&out, "<｜begin▁of▁sentence｜>")) { *why = "the prompt buffer is too small"; goto done; }
+    if (req_thinking) {
+        char effort_hdr[160];
+        snprintf(effort_hdr, sizeof(effort_hdr),
+                 "<｜System｜>Reasoning Effort: %d (range 1-100, the higher the value, the more thorough the reasoning)\n\n",
+                 reasoning_budget);
+        if (!prompt_append(&out, effort_hdr)) { *why = "the prompt buffer is too small"; goto done; }
+        state.system_open = true;
+    }
     /* ── 系统提示词去重（2026-10-01 线上实证）──
      * 客户端可能【同时】发 instructions 字段、又在 input 历史里带一条 system 消息
      * （OpenClaw 就是这样）。旧逻辑只要看到 instructions 就渲染 ⇒ 系统提示词进两遍：

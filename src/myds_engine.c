@@ -317,6 +317,41 @@ static bool graph_feature_verified(const char *feature) {
            strcmp(feature, "DeepSeek V4.1 graph") == 0;
 }
 
+bool myds_validate_fp8_block_size(const gguf_file_t *gf, const char *arch) {
+    if (!gf || !arch) return true;
+    const char *keys[] = {
+        "deepseek41.weight_block_size",
+        "quantization_config.weight_block_size",
+        "deepseek4.weight_block_size",
+        "general.weight_block_size"
+    };
+    bool is_v41 = (strcmp(arch, "deepseek41") == 0 || strcmp(arch, "deepseek-v4.1") == 0);
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        const gguf_kv_t *kv = gguf_find_key(gf, keys[i]);
+        if (!kv) continue;
+        uint32_t b0 = 0, b1 = 0;
+        if (kv->type == GGUF_TYPE_ARRAY && kv->value.val_arr.count >= 2 &&
+            (kv->value.val_arr.elem_type == GGUF_TYPE_UINT32 || kv->value.val_arr.elem_type == GGUF_TYPE_INT32)) {
+            const uint32_t *arr = (const uint32_t *)kv->value.val_arr.data;
+            if (arr) { b0 = arr[0]; b1 = arr[1]; }
+        } else if (kv->type == GGUF_TYPE_UINT32) {
+            b0 = b1 = kv->value.val_u32;
+        } else if (kv->type == GGUF_TYPE_INT32) {
+            b0 = b1 = (uint32_t)kv->value.val_i32;
+        }
+        if (b0 > 0 && b1 > 0) {
+            if (is_v41 && (b0 != 32 || b1 != 32)) {
+                MYDS_LOG_E("DeepSeek V4.1 FP8 tile block size mismatch for key '%s': expected [32, 32], got [%u, %u]. "
+                           "(128x128 is legacy V4 block size; using it with V4.1 causes silent dequantization corruption).",
+                           keys[i], b0, b1);
+                return false;
+            }
+            MYDS_LOG_I("FP8 tile block size validated for '%s': [%u, %u]", keys[i], b0, b1);
+        }
+    }
+    return true;
+}
+
 static myds_model_t *model_load_internal(const char *model_path, bool diagnostic) {
 
     gguf_file_t *gf = gguf_open(model_path);
@@ -422,6 +457,10 @@ static myds_model_t *model_load_internal(const char *model_path, bool diagnostic
 
     if (m->n_heads == 0 || m->dim == 0) {
         MYDS_LOG_E("Invalid model dimensions: dim=%u, n_heads=%u", m->dim, m->n_heads);
+        goto fail;
+    }
+
+    if (!myds_validate_fp8_block_size(gf, arch)) {
         goto fail;
     }
 

@@ -175,6 +175,11 @@ gguf_file_t *gguf_open(const char *path) {
         return NULL;
     }
 
+#if defined(__APPLE__) && defined(F_NOCACHE)
+    /* 旁路系统文件缓存，避免统一内存架构下同时存在 Unified Page Cache 和 Metal 映射产生 2x 显存占用 */
+    (void)fcntl(fd, F_NOCACHE, 1);
+#endif
+
     struct stat st;
     if (fstat(fd, &st) != 0) {
         close(fd);

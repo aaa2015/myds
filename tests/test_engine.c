@@ -823,6 +823,47 @@ int main(int argc, char **argv) {
         printf("  [PASS] DeepSeek V4/V4.1 architecture enforcement & V2/V3 rejection\n");
     }
 
+    /* 6b. DeepSeek V4.1 FP8 tile block size defense (32x32 required, 128x128 rejected) */
+    {
+        gguf_file_t gf;
+        memset(&gf, 0, sizeof(gf));
+        assert(myds_validate_fp8_block_size(&gf, "deepseek41") == true);
+
+        gguf_kv_t kv;
+        memset(&kv, 0, sizeof(kv));
+        gf.kvs = &kv;
+        gf.metadata_kv_count = 1;
+
+        uint32_t b32[2] = {32, 32};
+        uint32_t b128[2] = {128, 128};
+
+        char key_wbs[] = "deepseek41.weight_block_size";
+        kv.key = key_wbs;
+        kv.type = GGUF_TYPE_ARRAY;
+        kv.value.val_arr.elem_type = GGUF_TYPE_UINT32;
+        kv.value.val_arr.count = 2;
+        kv.value.val_arr.data = b32;
+        assert(myds_validate_fp8_block_size(&gf, "deepseek41") == true);
+
+        kv.value.val_arr.data = b128;
+        assert(myds_validate_fp8_block_size(&gf, "deepseek41") == false);
+
+        char key_qc[] = "quantization_config.weight_block_size";
+        kv.key = key_qc;
+        assert(myds_validate_fp8_block_size(&gf, "deepseek-v4.1") == false);
+        kv.value.val_arr.data = b32;
+        assert(myds_validate_fp8_block_size(&gf, "deepseek-v4.1") == true);
+
+        /* Scalar test */
+        kv.type = GGUF_TYPE_UINT32;
+        kv.value.val_u32 = 128;
+        assert(myds_validate_fp8_block_size(&gf, "deepseek41") == false);
+        kv.value.val_u32 = 32;
+        assert(myds_validate_fp8_block_size(&gf, "deepseek41") == true);
+
+        printf("  [PASS] DeepSeek V4.1 FP8 tile block size 32x32 defense validation (128x128 rejected)\n");
+    }
+
     /* 7. Gate T0-3: Multi-Head Latent Attention (MLA) without MHA fail-fast rejection */
     {
         const char *path = "/tmp/test_myds_gate_mla.gguf";

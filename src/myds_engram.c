@@ -303,8 +303,22 @@ static void *engram_io_worker(void *opaque) {
         seen = r->generation;
         const unsigned count = r->job_count;
         pthread_mutex_unlock(&r->state);
+        /* Sequentialize I/O: sort assigned jobs by offset to avoid random disk/page thrashing */
+        unsigned my_jobs[ENGRAM_IO_JOBS];
+        unsigned n_my_jobs = 0;
         for (unsigned i = worker->index; i < count; i += r->workers)
-            read_raw_job(&r->jobs[i]);
+            my_jobs[n_my_jobs++] = i;
+        for (unsigned i = 0; i < n_my_jobs; ++i) {
+            for (unsigned j = i + 1; j < n_my_jobs; ++j) {
+                if (r->jobs[my_jobs[j]].offset < r->jobs[my_jobs[i]].offset) {
+                    unsigned tmp = my_jobs[i];
+                    my_jobs[i] = my_jobs[j];
+                    my_jobs[j] = tmp;
+                }
+            }
+        }
+        for (unsigned i = 0; i < n_my_jobs; ++i)
+            read_raw_job(&r->jobs[my_jobs[i]]);
         pthread_mutex_lock(&r->state);
         if (--r->remaining == 0) pthread_cond_signal(&r->done);
     }

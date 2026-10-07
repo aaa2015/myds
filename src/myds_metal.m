@@ -279,7 +279,17 @@ static id<MTLComputeCommandEncoder> get_compute_encoder(id<MTLCommandBuffer> cb)
     if (cb == g_batch_cb && g_batch_enc) {
         return g_batch_enc;
     }
-    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    static int s_concurrent = -1;
+    if (s_concurrent < 0) {
+        const char *env = getenv("MYDS_METAL_CONCURRENT");
+        s_concurrent = (env && atoi(env) != 0) ? 1 : 0;
+    }
+    id<MTLComputeCommandEncoder> enc = nil;
+    if (s_concurrent && [cb respondsToSelector:@selector(computeCommandEncoderWithDispatchType:)]) {
+        enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+    } else {
+        enc = [cb computeCommandEncoder];
+    }
     if (cb == g_batch_cb) {
         g_batch_enc = enc;
     }
