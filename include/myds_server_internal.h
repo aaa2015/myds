@@ -35,6 +35,9 @@ typedef struct {
     size_t acc_len, acc_cap;
     size_t emitted;
     bool in_tool_block;
+    bool thinking;
+    int think_state;    /* 0: NONE, 1: REASONING, 2: CONTENT */
+    int msg_output_index; /* 0 if !thinking, 1 if thinking */
     /* Request-owned transport; only the producer mutates this stream context. */
     myds_sse_writer_t *writer;
 } myds_sse_stream_ctx_t;
@@ -106,6 +109,8 @@ bool parse_chat_prompt_suffix_vis(const char *body, char *out_prompt, size_t max
 
 bool parse_chat_prompt_ex(const char *body, char *out_prompt, size_t max_prompt_len,
                           const char **out_reason);
+bool extract_request_thinking_mode(const char *body, bool default_val);
+void split_reasoning_content(const char *text, size_t n, char **content_out, char **reasoning_out);
 
 #ifdef __cplusplus
 }
@@ -137,5 +142,11 @@ bool sse_emit_responses_finish(myds_sse_stream_ctx_t *sctx, const char *model_al
                                const char *output_items_json, int emit_text_events);
 /* 文本响应的 output 数组（一条 message 项），内部自己转义。 */
 char *responses_output_message_json(const char *text, size_t text_len);
+/* Responses API 的 output 数组（包含思考、正文、工具调用） */
+char *responses_output_items_json(const char *content, size_t content_len,
+                                  const myds_tool_call_t *calls, size_t count);
+char *responses_output_items_json_ex(bool thinking, const char *reasoning, size_t reasoning_len,
+                                     const char *content, size_t content_len,
+                                     const myds_tool_call_t *calls, size_t count);
 /* 工具调用响应的 output 数组（给 response.completed 用）。 */
 char *responses_function_calls_output_json(const myds_tool_call_t *calls, size_t count);

@@ -1,5 +1,6 @@
 #include "myds_server.h"
 #include "myds_server_internal.h"
+#include "myds_internal.h"
 #include "myds_vjob.h"
 #include "myds_log.h"
 #include <stdio.h>
@@ -954,18 +955,28 @@ static bool prompt_content(const prompt_json_t *j, const prompt_json_node_t *con
 }
 typedef struct { bool pending, user_open; size_t count; } prompt_chat_state_t;
 static bool prompt_render_message(prompt_buffer_t *out, prompt_chat_state_t *state, const char *role,
-                                  const char *text, const char *suffix) {
+                                  const char *text, const char *suffix, const char *reasoning) {
     if (!strcmp(role, "system") || !strcmp(role, "developer")) {
         if (!prompt_append(out, "<｜System｜>") || !prompt_append(out, text)) return false;
-        (void)suffix;
+        (void)suffix; (void)reasoning;
         state->pending = state->count > 0; state->user_open = false;
     } else if (!strcmp(role, "user") || !strcmp(role, "tool") || !strcmp(role, "function")) {
-        (void)suffix;
+        (void)suffix; (void)reasoning;
         if (!prompt_append(out, state->user_open ? "\n\n" : "<｜User｜>")) return false;
         if (!strcmp(role, "user") ? !prompt_append(out, text) : !prompt_tool_text(out, text)) return false;
         state->pending = state->user_open = true;
     } else if (!strcmp(role, "assistant")) {
-        if (state->pending && !prompt_append(out, "<｜Assistant｜></think>")) return false;
+        if (state->pending) {
+            if (reasoning && reasoning[0]) {
+                if (!prompt_append(out, "<｜Assistant｜><think>") ||
+                    !prompt_append(out, reasoning) ||
+                    !prompt_append(out, "</think>")) return false;
+            } else if (text && strncmp(text, "<think>", 7) == 0) {
+                if (!prompt_append(out, "<｜Assistant｜>")) return false;
+            } else {
+                if (!prompt_append(out, "<｜Assistant｜></think>")) return false;
+            }
+        }
         if (!prompt_append(out, text)) return false;
         if (suffix && !prompt_append(out, suffix)) return false;   /* 工具调用在 EOS 之前 */
         if (!prompt_append(out, "<｜end▁of▁sentence｜>")) return false;
@@ -1305,6 +1316,102 @@ static bool prompt_render_tool_call_items(prompt_buffer_t *out, const prompt_jso
 }
 
 /* 失败原因（供日志与报错使用）。调用方每次进入前不必清空 —— 每个失败路径都会写它。 */
+static bool g_server_default_thinking = false;
+
+bool extract_request_thinking_mode(const char *body, bool default_val) {
+    if (!body) return default_val;
+    int b = json_extract_bool_field(body, "enable_thinking", -1);
+    if (b != -1) return b != 0;
+
+    const char *p = strstr(body, "\"thinking\"");
+    if (p) {
+        p += 10;
+        while (*p && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ':')) p++;
+        if (strncmp(p, "true", 4) == 0) return true;
+        if (strncmp(p, "false", 5) == 0) return false;
+        if (*p == '{') {
+            const char *end = find_matching_brace(p);
+            if (end) {
+                if (strstr(p, "\"enabled\"")) return true;
+                if (strstr(p, "\"disabled\"")) return false;
+            }
+        }
+    }
+
+    char effort[32] = "";
+    if (json_extract_string_field(body, "reasoning_effort", effort, sizeof(effort))) {
+        if (!strcmp(effort, "none") || !strcmp(effort, "off")) return false;
+        if (!strcmp(effort, "low") || !strcmp(effort, "medium") || !strcmp(effort, "high")) return true;
+    }
+
+    const char *ctk = strstr(body, "\"chat_template_kwargs\"");
+    if (ctk) {
+        ctk += 22;
+        while (*ctk && (*ctk == ' ' || *ctk == '\t' || *ctk == '\r' || *ctk == '\n' || *ctk == ':')) ctk++;
+        if (*ctk == '{') {
+            int tb = json_extract_bool_field(ctk, "thinking", -1);
+            if (tb != -1) return tb != 0;
+        }
+    }
+
+    return default_val;
+}
+
+void split_reasoning_content(const char *text, size_t n, char **content_out, char **reasoning_out) {
+    if (!content_out || !reasoning_out) return;
+    *content_out = NULL;
+    *reasoning_out = NULL;
+    if (!text || n == 0) {
+        *content_out = calloc(1, 1);
+        return;
+    }
+
+    const char *think_end = strstr(text, "</think>");
+    if (think_end && (size_t)(think_end - text) <= n) {
+        const char *t_start = text;
+        size_t r_len = (size_t)(think_end - t_start);
+        if (strncmp(t_start, "<think>", 7) == 0) {
+            t_start += 7;
+            if (r_len >= 7) r_len -= 7;
+            else r_len = 0;
+        }
+        *reasoning_out = malloc(r_len + 1);
+        if (*reasoning_out) {
+            memcpy(*reasoning_out, t_start, r_len);
+            (*reasoning_out)[r_len] = '\0';
+        }
+
+        const char *c_start = think_end + 8;
+        while (c_start < text + n && (*c_start == '\r' || *c_start == '\n')) c_start++;
+        size_t c_offset = (size_t)(c_start - text);
+        if (c_offset <= n) {
+            size_t c_len = n - c_offset;
+            *content_out = malloc(c_len + 1);
+            if (*content_out) {
+                memcpy(*content_out, c_start, c_len);
+                (*content_out)[c_len] = '\0';
+            }
+        } else {
+            *content_out = calloc(1, 1);
+        }
+    } else if (strncmp(text, "<think>", 7) == 0) {
+        size_t r_len = n > 7 ? n - 7 : 0;
+        *reasoning_out = malloc(r_len + 1);
+        if (*reasoning_out) {
+            memcpy(*reasoning_out, text + 7, r_len);
+            (*reasoning_out)[r_len] = '\0';
+        }
+        *content_out = calloc(1, 1);
+    } else {
+        *reasoning_out = NULL;
+        *content_out = malloc(n + 1);
+        if (*content_out) {
+            memcpy(*content_out, text, n);
+            (*content_out)[n] = '\0';
+        }
+    }
+}
+
 static bool parse_chat_prompt_impl(const char *body, char *out_prompt, size_t max_prompt_len,
                                    const char **out_reason, bool suffix_only,
                                    myds_vjob_sink_t *img) {
@@ -1319,6 +1426,7 @@ static bool parse_chat_prompt_impl(const char *body, char *out_prompt, size_t ma
     prompt_buffer_t out = {out_prompt, max_prompt_len, 0, false};
     prompt_chat_state_t state = {0};
     char *content_buffer = NULL; char *suffix = NULL; bool ok = false, valid = true;
+    const bool req_thinking = extract_request_thinking_mode(body, g_server_default_thinking);
     if (!prompt_json_value(&json, 0)) { *why = "body is not valid JSON"; goto done; }
     prompt_json_ws(&json);
     if (*json.cursor || json.nodes[0].kind != PJ_OBJECT) { *why = "body is not a JSON object"; goto done; }
@@ -1395,7 +1503,7 @@ static bool parse_chat_prompt_impl(const char *body, char *out_prompt, size_t ma
     }
     if (instructions && instructions->kind != PJ_NULL && !system_in_items) {
         if (instructions->kind != PJ_STRING ||
-            !prompt_render_message(&out, &state, "system", instructions->text, NULL)) goto done;
+            !prompt_render_message(&out, &state, "system", instructions->text, NULL, NULL)) goto done;
         if (has_tools) {
             if (!prompt_append(&out, "\n\n") || !prompt_render_tools(&out, &json, tool_defs)) {
                 *why = "invalid or oversized tool definitions (tools/functions)";
@@ -1405,7 +1513,7 @@ static bool parse_chat_prompt_impl(const char *body, char *out_prompt, size_t ma
         }
     } else if (has_tools && !system_in_items) {
         /* 没有 system 消息：自建一条只装工具定义 */
-        if (!prompt_render_message(&out, &state, "system", "", NULL) ||
+        if (!prompt_render_message(&out, &state, "system", "", NULL, NULL) ||
             !prompt_append(&out, "\n\n") || !prompt_render_tools(&out, &json, tool_defs)) {
             *why = "invalid or oversized tool definitions (tools/functions)";
             goto done;
@@ -1414,7 +1522,7 @@ static bool parse_chat_prompt_impl(const char *body, char *out_prompt, size_t ma
     }
 render_items:
     if (items->kind == PJ_STRING && !messages) {
-        if (!prompt_render_message(&out, &state, "user", items->text, NULL)) goto done;
+        if (!prompt_render_message(&out, &state, "user", items->text, NULL, NULL)) goto done;
     } else if (items->kind == PJ_ARRAY && !prompt) {
         if ((size_t)(items - json.nodes) + 1 == items->next) { *why = "the message list is empty"; goto done; }
         content_buffer = malloc(max_prompt_len);
@@ -1515,7 +1623,7 @@ render_items:
                         *why = "unsupported content block in tool result";
                         goto done;
                     }
-                    if (!prompt_render_message(&out, &state, "tool", decoded.data, NULL)) {
+                    if (!prompt_render_message(&out, &state, "tool", decoded.data, NULL, NULL)) {
                         *why = "a message could not be rendered (or the prompt buffer is full)";
                         goto done;
                     }
@@ -1633,7 +1741,14 @@ render_items:
                 *why = "unsupported content block in the message history";
                 goto done;
             }
-            if (!prompt_render_message(&out, &state, role_text, decoded.data, suffix)) {
+            const char *reasoning_text = NULL;
+            if (!strcmp(role_text, "assistant")) {
+                const prompt_json_node_t *rnode = prompt_json_field(&json, item, "reasoning_content", &valid);
+                if (!rnode) rnode = prompt_json_field(&json, item, "reasoning", &valid);
+                if (!rnode) rnode = prompt_json_field(&json, item, "thought", &valid);
+                if (rnode && rnode->kind == PJ_STRING) reasoning_text = rnode->text;
+            }
+            if (!prompt_render_message(&out, &state, role_text, decoded.data, suffix, reasoning_text)) {
                 *why = "a message could not be rendered (or the prompt buffer is full)";
                 goto done;
             }
@@ -1647,7 +1762,13 @@ render_items:
             }
         }
     } else { *why = "messages/input must be a string or an array"; goto done; }
-    if (state.pending && !prompt_append(&out, "<｜Assistant｜></think>")) goto done;
+    if (state.pending) {
+        if (req_thinking) {
+            if (!prompt_append(&out, "<｜Assistant｜><think>")) goto done;
+        } else {
+            if (!prompt_append(&out, "<｜Assistant｜></think>")) goto done;
+        }
+    }
     ok = true;
 done:
     if (!ok && out.overflow) *why = "the prompt does not fit the prompt buffer (request too large)";
@@ -1878,16 +1999,25 @@ static char *openai_tool_calls_json(const myds_tool_call_t *calls, size_t count)
     return b.data;
 }
 
-/* Responses API 的 output 数组：正文（若有）作 message 项，工具调用作 function_call 项。 */
-static char *responses_output_items_json(const char *content, size_t content_len,
-                                        const myds_tool_call_t *calls, size_t count) {
+/* Responses API 的 output 数组：思考项（若有）、正文项、工具调用项。 */
+char *responses_output_items_json_ex(bool thinking, const char *reasoning, size_t reasoning_len,
+                                     const char *content, size_t content_len,
+                                     const myds_tool_call_t *calls, size_t count) {
     dsml_buf_t b = {0};
     if (!DSML_PUTS(&b, "[")) return NULL;
     bool first = true;
-    if (content_len) {
-        if (!DSML_PUTS(&b, "{\"type\":\"message\",\"id\":\"msg_myds_1\",\"role\":\"assistant\","
+    if (thinking || reasoning_len > 0) {
+        if (!DSML_PUTS(&b, "{\"type\":\"reasoning\",\"id\":\"rs_myds_0\",\"status\":\"completed\","
+                           "\"summary\":[],\"content\":[{\"type\":\"reasoning_text\",\"text\":\"") ||
+            !dsml_put_escaped(&b, reasoning ? reasoning : "", reasoning ? reasoning_len : 0) ||
+            !DSML_PUTS(&b, "\"}]}")) { free(b.data); return NULL; }
+        first = false;
+    }
+    if (content_len || (!thinking && count == 0)) {
+        if ((!first && !DSML_PUTS(&b, ",")) ||
+            !DSML_PUTS(&b, "{\"type\":\"message\",\"id\":\"msg_myds_1\",\"role\":\"assistant\","
                            "\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"") ||
-            !dsml_put_escaped(&b, content, content_len) ||
+            !dsml_put_escaped(&b, content ? content : "", content ? content_len : 0) ||
             !DSML_PUTS(&b, "\"}]}")) { free(b.data); return NULL; }
         first = false;
     }
@@ -1908,6 +2038,11 @@ static char *responses_output_items_json(const char *content, size_t content_len
     }
     if (!DSML_PUTS(&b, "]")) { free(b.data); return NULL; }
     return b.data;
+}
+
+char *responses_output_items_json(const char *content, size_t content_len,
+                                  const myds_tool_call_t *calls, size_t count) {
+    return responses_output_items_json_ex(false, NULL, 0, content, content_len, calls, count);
 }
 
 void myds_free_tool_calls(myds_tool_call_t *calls, size_t count) {
@@ -2149,6 +2284,79 @@ static bool client_disconnected(int fd) {
     return r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK);
 }
 
+static bool sse_emit_reasoning(myds_sse_stream_ctx_t *sctx, const char *piece, size_t length, bool final) {
+    if (sctx->cancel_flag || sse_transport_failed(sctx)) return false;
+    if (length > (SIZE_MAX - 1) / 6 - sctx->utf8.pending_length) goto failed;
+    size_t capacity = (length + sctx->utf8.pending_length) * 6 + 1;
+    char *escaped = malloc(capacity);
+    if (!escaped) goto failed;
+    size_t escaped_length = 0;
+    bool encoded = escape_utf8_chunk(&sctx->utf8, piece, length, final,
+                                     escaped, capacity, &escaped_length);
+    if (!encoded) {
+        free(escaped);
+        goto failed;
+    }
+    if (escaped_length == 0) {
+        free(escaped);
+        return true;
+    }
+    char *chunk = NULL;
+    if (sctx->responses_api) {
+        chunk = format_alloc(
+            "event: response.reasoning_text.delta\n"
+            "data: {\"type\":\"response.reasoning_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"%s\"}\n\n",
+            escaped);
+    } else {
+        chunk = format_alloc(
+            "data: {\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"%s\"},\"finish_reason\":null}]}\n\n",
+            escaped);
+    }
+    free(escaped);
+    if (!chunk) goto failed;
+    bool sent = myds_server_sse_send(sctx, chunk, strlen(chunk));
+    free(chunk);
+    if (!sent) sctx->cancel_flag = 1;
+    return sent;
+failed:
+    sctx->failed = true;
+    sctx->cancel_flag = 1;
+    return false;
+}
+
+static bool sse_emit_responses_close_reasoning(myds_sse_stream_ctx_t *sctx,
+                                                const char *text, size_t text_len) {
+    if (!sctx || sctx->cancel_flag || sctx->failed) return false;
+    char *text_json = json_escape_alloc(text ? text : "", text ? text_len : 0);
+    if (!text_json) return false;
+    char *ev = format_alloc(
+        "event: response.reasoning_text.done\n"
+        "data: {\"type\":\"response.reasoning_text.done\",\"output_index\":0,\"content_index\":0,\"text\":\"%s\"}\n\n"
+        "event: response.content_part.done\n"
+        "data: {\"type\":\"response.content_part.done\",\"output_index\":0,\"content_index\":0,"
+        "\"part\":{\"type\":\"reasoning_text\",\"text\":\"%s\"}}\n\n"
+        "event: response.output_item.done\n"
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,"
+        "\"item\":{\"type\":\"reasoning\",\"id\":\"rs_myds_0\",\"status\":\"completed\",\"summary\":[],"
+        "\"content\":[{\"type\":\"reasoning_text\",\"text\":\"%s\"}]}}\n\n",
+        text_json, text_json, text_json);
+    free(text_json);
+    if (!ev) return false;
+    const bool ok = myds_server_sse_send(sctx, ev, strlen(ev));
+    free(ev);
+    return ok;
+}
+
+static bool sse_emit_responses_open_message(myds_sse_stream_ctx_t *sctx) {
+    if (!sctx || sctx->cancel_flag || sctx->failed) return false;
+    const char *ev =
+        "event: response.output_item.added\n"
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"message\",\"id\":\"msg_myds_1\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n"
+        "event: response.content_part.added\n"
+        "data: {\"type\":\"response.content_part.added\",\"output_index\":1,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n";
+    return myds_server_sse_send(sctx, ev, strlen(ev));
+}
+
 static bool sse_emit_content(myds_sse_stream_ctx_t *sctx, const char *piece, size_t length, bool final) {
     if (sctx->cancel_flag || sse_transport_failed(sctx)) return false;
     if (length > (SIZE_MAX - 1) / 6 - sctx->utf8.pending_length) goto failed;
@@ -2168,9 +2376,9 @@ static bool sse_emit_content(myds_sse_stream_ctx_t *sctx, const char *piece, siz
     }
     const char *format = sctx->responses_api
         ? "event: response.output_text.delta\n"
-          "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"%s\"}\n\n"
+          "data: {\"type\":\"response.output_text.delta\",\"output_index\":%d,\"content_index\":0,\"delta\":\"%s\"}\n\n"
         : "data: {\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"},\"finish_reason\":null}]}\n\n";
-    char *chunk = format_alloc(format, escaped);
+    char *chunk = sctx->responses_api ? format_alloc(format, sctx->msg_output_index, escaped) : format_alloc(format, escaped);
     free(escaped);
     if (!chunk) goto failed;
     bool sent = myds_server_sse_send(sctx, chunk, strlen(chunk));
@@ -2187,8 +2395,6 @@ failed:
  * 工具块一旦出现就停止输出正文 —— 收尾阶段改为发结构化工具调用。
  * 尾部若可能是开标签的一部分，先扣住不发，避免把半截标签当正文发给客户端。 */
 static bool sse_emit_bytes(myds_sse_stream_ctx_t *sctx, const char *piece, size_t length, bool final) {
-    static const char *open_tag = "<" MYDS_DSML_S " calls>";
-    const size_t tag_len = strlen(open_tag);
     if (length) {
         /* 先挡住长度溢出：acc_len + length + 1 自身会回绕，
          * 回绕后判断为「不用扩容」⇒ 直接 memcpy 到空指针（既有测试正是用 SIZE_MAX 打这里）。 */
@@ -2210,6 +2416,67 @@ static bool sse_emit_bytes(myds_sse_stream_ctx_t *sctx, const char *piece, size_
         sctx->acc_len += length;
         sctx->acc[sctx->acc_len] = 0;
     }
+
+    /* ── 阶段 1: 思考流式输出 (thinking mode) ── */
+    if (sctx->thinking && sctx->think_state == 1) {
+        static const char *think_close = "</think>";
+        const size_t close_len = 8;
+        const char *base = sctx->acc + sctx->emitted;
+        size_t avail = sctx->acc_len - sctx->emitted;
+        const char *tag = avail ? strstr(base, think_close) : NULL;
+        if (tag) {
+            size_t upto = (size_t)(tag - base);
+            bool ok = upto ? sse_emit_reasoning(sctx, base, upto, false) : true;
+            ok = ok && sse_emit_reasoning(sctx, NULL, 0, true); /* flush utf8 */
+            sctx->emitted += upto + close_len;
+            while (sctx->emitted < sctx->acc_len && (sctx->acc[sctx->emitted] == '\r' || sctx->acc[sctx->emitted] == '\n')) sctx->emitted++;
+            if (sctx->responses_api) {
+                size_t total_thought_len = (size_t)(tag - sctx->acc);
+                const char *thought_start = sctx->acc;
+                if (strncmp(thought_start, "<think>", 7) == 0) {
+                    thought_start += 7;
+                    if (total_thought_len >= 7) total_thought_len -= 7;
+                    else total_thought_len = 0;
+                }
+                ok = ok && sse_emit_responses_close_reasoning(sctx, thought_start, total_thought_len);
+                ok = ok && sse_emit_responses_open_message(sctx);
+            }
+            sctx->think_state = 2; /* 进入正文阶段 */
+            if (!ok) return false;
+        } else {
+            size_t maxk = close_len - 1 < avail ? close_len - 1 : avail;
+            size_t keep = 0;
+            for (size_t k = maxk; k > 0; --k) {
+                if (!memcmp(base + avail - k, think_close, k)) { keep = k; break; }
+            }
+            size_t upto = avail - keep;
+            bool ok = upto ? sse_emit_reasoning(sctx, base, upto, false) : true;
+            sctx->emitted += upto;
+            if (!ok) return false;
+            if (final) {
+                if (keep) {
+                    ok = sse_emit_reasoning(sctx, base + upto, keep, false);
+                    sctx->emitted += keep;
+                }
+                ok = ok && sse_emit_reasoning(sctx, NULL, 0, true);
+                if (sctx->responses_api) {
+                    const char *thought_start = sctx->acc;
+                    size_t total_thought_len = sctx->acc_len;
+                    if (strncmp(thought_start, "<think>", 7) == 0) {
+                        thought_start += 7;
+                        if (total_thought_len >= 7) total_thought_len -= 7;
+                        else total_thought_len = 0;
+                    }
+                    ok = ok && sse_emit_responses_close_reasoning(sctx, thought_start, total_thought_len);
+                }
+            }
+            return ok;
+        }
+    }
+
+    /* ── 阶段 2: 正文与工具调用流式输出 (content & DSML tool block) ── */
+    static const char *open_tag = "<" MYDS_DSML_S " calls>";
+    const size_t tag_len = strlen(open_tag);
     if (sctx->in_tool_block) return true;              /* 工具块中 ⇒ 不再输出正文 */
     const char *base = sctx->acc + sctx->emitted;
     size_t avail = sctx->acc_len - sctx->emitted;
@@ -2281,43 +2548,23 @@ static bool sse_emit_responses_close_message(myds_sse_stream_ctx_t *sctx,
     if (!sctx || sctx->cancel_flag || sctx->failed) return false;
     char *text_json = json_escape_alloc(text ? text : "", text ? text_len : 0);
     if (!text_json) return false;
+    const int out_idx = sctx->msg_output_index;
     char *ev = format_alloc(
         "event: response.output_text.done\n"
-        "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"content_index\":0,\"text\":\"%s\"}\n\n"
+        "data: {\"type\":\"response.output_text.done\",\"output_index\":%d,\"content_index\":0,\"text\":\"%s\"}\n\n"
         "event: response.content_part.done\n"
-        "data: {\"type\":\"response.content_part.done\",\"output_index\":0,\"content_index\":0,"
+        "data: {\"type\":\"response.content_part.done\",\"output_index\":%d,\"content_index\":0,"
         "\"part\":{\"type\":\"output_text\",\"text\":\"%s\"}}\n\n"
         "event: response.output_item.done\n"
-        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,"
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":%d,"
         "\"item\":{\"type\":\"message\",\"id\":\"msg_myds_1\",\"role\":\"assistant\",\"status\":\"completed\","
         "\"content\":[{\"type\":\"output_text\",\"text\":\"%s\"}]}}\n\n",
-        text_json, text_json, text_json);
+        out_idx, text_json, out_idx, text_json, out_idx, text_json);
     free(text_json);
     if (!ev) return false;
     const bool ok = myds_server_sse_send(sctx, ev, strlen(ev));
     free(ev);
     return ok;
-}
-
-/* 工具轮次的 output 数组：先正文 message 项，再 function_call 项 ——
- * 与流里实际 added 过的项保持一致（缺了 message 项会让汇总与增量对不上）。 */
-static char *responses_message_then_calls_output_json(const char *text, size_t text_len,
-                                                     const myds_tool_call_t *calls, size_t count) {
-    char *msg = responses_output_message_json(text, text_len);
-    char *fcs = responses_function_calls_output_json(calls, count);
-    if (!msg || !fcs) {
-        free(msg);
-        free(fcs);
-        return NULL;
-    }
-    const size_t ml = strlen(msg);   /* msg 形如 "[{...}]" */
-    const size_t fl = strlen(fcs);   /* fcs 形如 "[{...},...]" —— 自带方括号 */
-    /* 去掉 msg 的尾 ']' 与 fcs 的首 '['，拼成一条数组；直接接 fcs 会得到 `[{...},[...]]`
-     * （嵌套数组）⇒ 客户端报 "malformed server-sent event JSON"（实测踩中过）。 */
-    char *out = (ml > 0 && fl > 1) ? format_alloc("%.*s,%s", (int)(ml - 1u), msg, fcs + 1) : NULL;
-    free(msg);
-    free(fcs);
-    return out;
 }
 
 /* chat/completions：工具调用 delta + finish_reason=tool_calls + [DONE] */
@@ -2339,16 +2586,9 @@ bool sse_emit_chat_tool_calls(myds_sse_stream_ctx_t *sctx, const myds_tool_call_
     return myds_server_sse_send(sctx, done, strlen(done));
 }
 
-/* Responses API：function_call 项的 added / arguments.delta / done
- * ★ 所有插值都必须【转义】—— arguments 本身就是含引号的 JSON 字符串，
- *   直接 %s 进去会产出非法 JSON（客户端 json 解析直接失败）。
- *   这一条曾经漏掉：事件看着是对的，但解析不了。 */
 bool sse_emit_responses_function_calls(myds_sse_stream_ctx_t *sctx,
-                                              const myds_tool_call_t *calls, size_t count) {
-    /* ★ output_index 从 1 起：本端点开流时【无条件】发过一条正文 message 项（index 0）。
-     * 过去这里从 0 编号 ⇒ 同一个 output_index 被复用，客户端判为非法流
-     * （OpenClaw 报错原文：“Responses stream reused active output index 0”）⇒ 整轮失败。
-     * 调用方负责先把那条 message 项按契约收尾（sse_emit_responses_close_message）。 */
+                                       const myds_tool_call_t *calls, size_t count) {
+    const size_t base_idx = sctx ? (size_t)sctx->msg_output_index + 1 : 1;
     for (size_t i = 0; i < count; ++i) {
         char ids[96];
         snprintf(ids, sizeof(ids), "fc_%zu", i + 1);
@@ -2357,7 +2597,7 @@ bool sse_emit_responses_function_calls(myds_sse_stream_ctx_t *sctx,
         /* added */
         ok = ok && DSML_PUTS(&ev, "event: response.output_item.added\n"
             "data: {\"type\":\"response.output_item.added\",\"output_index\":")
-            && dsml_putf(&ev, "%zu", i + 1)
+            && dsml_putf(&ev, "%zu", base_idx + i)
             && DSML_PUTS(&ev, ",\"item\":{\"type\":\"function_call\",\"id\":\"")
             && DSML_PUTS(&ev, ids)
             && DSML_PUTS(&ev, "\",\"call_id\":\"")
@@ -2370,14 +2610,14 @@ bool sse_emit_responses_function_calls(myds_sse_stream_ctx_t *sctx,
             "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"")
             && DSML_PUTS(&ev, ids)
             && DSML_PUTS(&ev, "\",\"output_index\":")
-            && dsml_putf(&ev, "%zu", i + 1)
+            && dsml_putf(&ev, "%zu", base_idx + i)
             && DSML_PUTS(&ev, ",\"delta\":\"")
             && dsml_put_escaped(&ev, calls[i].arguments, strlen(calls[i].arguments))
             && DSML_PUTS(&ev, "\"}\n\n");
         /* done */
         ok = ok && DSML_PUTS(&ev, "event: response.output_item.done\n"
             "data: {\"type\":\"response.output_item.done\",\"output_index\":")
-            && dsml_putf(&ev, "%zu", i + 1)
+            && dsml_putf(&ev, "%zu", base_idx + i)
             && DSML_PUTS(&ev, ",\"item\":{\"type\":\"function_call\",\"id\":\"")
             && DSML_PUTS(&ev, ids)
             && DSML_PUTS(&ev, "\",\"call_id\":\"")
@@ -2394,20 +2634,14 @@ bool sse_emit_responses_function_calls(myds_sse_stream_ctx_t *sctx,
     return true;
 }
 
-/* ── Responses 流式的【收尾】事件 ──
- * 只发增量、不发【聚合】，是 OpenAI 兼容实现里常见且危险的坑：
- * 读汇总事件的客户端（官方 SDK、多数封装）会拿到空字符串 —— 增量全收到了，汇总却是空的。
- * 服务端手里本来就有全文（sctx.acc），这里补上；而且顺带把 output_text.done 也发出去
- * （规范里有这个事件，此前完全没发）。
- * `emit_text_events` 为假时只发 response.completed —— 工具调用那类，输出项是 function_call。 */
 bool sse_emit_responses_finish(myds_sse_stream_ctx_t *sctx,
-                                      const char *model_alias,
-                                      const char *resp_id,
-                                      unsigned prompt_tokens,
-                                      unsigned output_tokens,
-                                      const char *text, size_t text_len,
-                                      const char *output_items_json,
-                                      int emit_text_events) {
+                               const char *model_alias,
+                               const char *resp_id,
+                               unsigned prompt_tokens,
+                               unsigned output_tokens,
+                               const char *text, size_t text_len,
+                               const char *output_items_json,
+                               int emit_text_events) {
     if (!sctx || sctx->cancel_flag || sctx->failed) return false;
     char *alias_json = json_escape_alloc(model_alias ? model_alias : "myds",
                                         strlen(model_alias ? model_alias : "myds"));
@@ -2417,18 +2651,19 @@ bool sse_emit_responses_finish(myds_sse_stream_ctx_t *sctx,
         free(text_json);
         return false;
     }
+    const int out_idx = sctx ? sctx->msg_output_index : 0;
     const char *items = output_items_json ? output_items_json : "[]";
     char *completed = emit_text_events
         ? format_alloc(
             "event: response.output_text.done\n"
-            "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"content_index\":0,\"text\":\"%s\"}\n\n"
+            "data: {\"type\":\"response.output_text.done\",\"output_index\":%d,\"content_index\":0,\"text\":\"%s\"}\n\n"
             "event: response.content_part.done\n"
-            "data: {\"type\":\"response.content_part.done\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"%s\"}}\n\n"
+            "data: {\"type\":\"response.content_part.done\",\"output_index\":%d,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"%s\"}}\n\n"
             "event: response.output_item.done\n"
-            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_myds_1\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"%s\"}]}}\n\n"
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":%d,\"item\":{\"type\":\"message\",\"id\":\"msg_myds_1\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"%s\"}]}}\n\n"
             "event: response.completed\n"
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"%s\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"%s\",\"output\":%s,\"usage\":{\"input_tokens\":%u,\"output_tokens\":%u,\"total_tokens\":%u}}}\n\n",
-            text_json, text_json, text_json, resp_id, alias_json, items,
+            out_idx, text_json, out_idx, text_json, out_idx, text_json, resp_id, alias_json, items,
             prompt_tokens, output_tokens, prompt_tokens + output_tokens)
         : format_alloc(
             "event: response.completed\n"
@@ -2443,15 +2678,14 @@ bool sse_emit_responses_finish(myds_sse_stream_ctx_t *sctx,
     return ok;
 }
 
+char *responses_output_message_json_ex(bool thinking, const char *reasoning, size_t reasoning_len,
+                                       const char *text, size_t text_len) {
+    return responses_output_items_json_ex(thinking, reasoning, reasoning_len, text, text_len, NULL, 0);
+}
+
 /* 文本响应的 output 数组：一条 message 项，文本与增量聚合后的完全一致。 */
 char *responses_output_message_json(const char *text, size_t text_len) {
-    char *text_json = json_escape_alloc(text ? text : "", text ? text_len : 0);
-    if (!text_json) return NULL;
-    char *out = format_alloc(
-        "[{\"type\":\"message\",\"id\":\"msg_myds_1\",\"role\":\"assistant\",\"status\":\"completed\","
-        "\"content\":[{\"type\":\"output_text\",\"text\":\"%s\"}]}]", text_json);
-    free(text_json);
-    return out;
+    return responses_output_message_json_ex(false, NULL, 0, text, text_len);
 }
 
 /* 工具调用响应的 output 数组（给 response.completed 用）。 */
@@ -2857,6 +3091,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         }
 
         bool transport_ok = true;
+        const bool req_thinking = extract_request_thinking_mode(body, g_server_default_thinking);
         if (stream) {
             const char *sse_header =
                 "HTTP/1.1 200 OK\r\n"
@@ -2864,15 +3099,34 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 "Cache-Control: no-cache\r\n"
                 "Access-Control-Allow-Origin: *\r\n"
                 "Connection: close\r\n\r\n";
-            const char *initial = is_responses_endpoint
-                ? "event: response.output_item.added\n"
-                  "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_myds_1\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n"
-                  "event: response.content_part.added\n"
-                  "data: {\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n"
-                : "data: {\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n";
+            const char *initial = NULL;
+            if (is_responses_endpoint) {
+                if (req_thinking) {
+                    initial =
+                        "event: response.output_item.added\n"
+                        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_myds_0\",\"status\":\"in_progress\",\"summary\":[],\"content\":[]}}\n\n"
+                        "event: response.content_part.added\n"
+                        "data: {\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"reasoning_text\",\"text\":\"\"}}\n\n";
+                } else {
+                    initial =
+                        "event: response.output_item.added\n"
+                        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_myds_1\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n"
+                        "event: response.content_part.added\n"
+                        "data: {\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n";
+                }
+            } else {
+                if (req_thinking) {
+                    initial = "data: {\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"\"},\"finish_reason\":null}]}\n\n";
+                } else {
+                    initial = "data: {\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n";
+                }
+            }
             myds_sse_stream_ctx_t sctx = {
                 .client_fd = client_fd,
                 .responses_api = is_responses_endpoint,
+                .thinking = req_thinking,
+                .think_state = req_thinking ? 1 : 0,
+                .msg_output_index = req_thinking ? 1 : 0,
             };
             if (!myds_server_sse_writer_start(&sctx, 1024u * 1024u, myds_server_sse_drain_timeout_ms()) ||
                 !myds_server_sse_send(&sctx, sse_header, strlen(sse_header)) ||
@@ -2915,23 +3169,60 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                         stop_reason = sctx.failed ? MYDS_STOP_ERROR : MYDS_STOP_CANCELLED;
                     }
                 }
+                /* 拆分 reasoning 与 content */
+                const char *reasoning_ptr = NULL;
+                size_t reasoning_len = 0;
+                const char *content_ptr = sctx.acc ? sctx.acc : "";
+                size_t content_len = scontent_len;
+
+                if (sctx.thinking && sctx.acc) {
+                    const char *t_end = strstr(sctx.acc, "</think>");
+                    if (t_end && (size_t)(t_end - sctx.acc) <= scontent_len) {
+                        const char *t_start = sctx.acc;
+                        size_t r_len = (size_t)(t_end - t_start);
+                        if (strncmp(t_start, "<think>", 7) == 0) {
+                            t_start += 7;
+                            if (r_len >= 7) r_len -= 7;
+                            else r_len = 0;
+                        }
+                        reasoning_ptr = t_start;
+                        reasoning_len = r_len;
+
+                        const char *c_start = t_end + 8;
+                        while (c_start < sctx.acc + scontent_len && (*c_start == '\r' || *c_start == '\n')) c_start++;
+                        content_ptr = c_start;
+                        if ((size_t)(c_start - sctx.acc) <= scontent_len) {
+                            content_len = scontent_len - (size_t)(c_start - sctx.acc);
+                        } else {
+                            content_len = 0;
+                        }
+                    } else {
+                        const char *t_start = sctx.acc;
+                        size_t r_len = scontent_len;
+                        if (strncmp(t_start, "<think>", 7) == 0) {
+                            t_start += 7;
+                            if (r_len >= 7) r_len -= 7;
+                            else r_len = 0;
+                        }
+                        reasoning_ptr = t_start;
+                        reasoning_len = r_len;
+                        content_ptr = "";
+                        content_len = 0;
+                    }
+                }
+
                 if (stool_count && !sctx.failed && !sctx.cancel_flag) {
                     bool tsent;
                     if (is_responses_endpoint) {
-                        /* 顺序不能反：先把正文 message 项（index 0）按契约关掉，再发 function_call
-                         * （index 从 1 起）。否则 output_index 0 被复用 ⇒ 客户端判非法流。 */
-                        tsent = sse_emit_responses_close_message(&sctx, sctx.acc, scontent_len) &&
+                        tsent = sse_emit_responses_close_message(&sctx, content_ptr, content_len) &&
                                 sse_emit_responses_function_calls(&sctx, stool, stool_count);
                     } else {
                         tsent = sse_emit_chat_tool_calls(&sctx, stool, stool_count);
                     }
                     if (!tsent) stop_reason = MYDS_STOP_CANCELLED;
-                    /* ★ 工具轮次也必须收尾：客户端靠 response.completed 判定这一轮结束，
-                     * 并从里面取【响应 id】—— 少了它，每个工具轮次都只能全量重放。 */
                     if (tsent && is_responses_endpoint) {
-                        /* output 数组要与流一致：先 message 项，再 function_call 项。 */
-                        char *items = responses_message_then_calls_output_json(
-                            sctx.acc, scontent_len, stool, stool_count);
+                        char *items = responses_output_items_json_ex(
+                            sctx.thinking, reasoning_ptr, reasoning_len, content_ptr, content_len, stool, stool_count);
                         const bool finished = items && sse_emit_responses_finish(
                             &sctx, model_alias, resp_id, (unsigned)prompt_tokens, (unsigned)final_tokens,
                             "", 0, items, 0);
@@ -2945,11 +3236,12 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                     stool = NULL;
                 }
                 if (!stool_count && !sctx.failed && !sctx.cancel_flag && is_responses_endpoint) {
-                    /* 聚合文本 = 工具块之前的正文（无工具块时就是全文）。 */
-                    char *items = responses_output_message_json(sctx.acc, sctx.acc ? scontent_len : 0);
+                    char *items = responses_output_items_json_ex(
+                        sctx.thinking, reasoning_ptr, reasoning_len, content_ptr, content_len, NULL, 0);
+                    int emit_text_events = (sctx.think_state != 1) ? 1 : 0;
                     const bool finished = items && sse_emit_responses_finish(
                         &sctx, model_alias, resp_id, (unsigned)prompt_tokens, (unsigned)final_tokens,
-                        sctx.acc, scontent_len, items, 1);
+                        content_ptr, content_len, items, emit_text_events);
                     free(items);
                     if (!finished) {
                         stop_reason = MYDS_STOP_ERROR;
@@ -3022,9 +3314,54 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 if (!myds_parse_completion_tool_calls(ns.buf, ns.len, &tool_content_len, &tool_calls, &tool_count)) {
                     tool_content_len = ns.len; tool_calls = NULL; tool_count = 0;   /* 格式不合 ⇒ 整段当正文 */
                 }
-                char *body_escaped = json_escape_alloc(ns.buf, tool_content_len);
+
+                /* 拆分 reasoning 与 content */
+                const char *reasoning_ptr = NULL;
+                size_t reasoning_len = 0;
+                const char *content_ptr = ns.buf ? ns.buf : "";
+                size_t content_len = tool_content_len;
+
+                if (req_thinking && ns.buf) {
+                    const char *t_end = strstr(ns.buf, "</think>");
+                    if (t_end && (size_t)(t_end - ns.buf) <= tool_content_len) {
+                        const char *t_start = ns.buf;
+                        size_t r_len = (size_t)(t_end - t_start);
+                        if (strncmp(t_start, "<think>", 7) == 0) {
+                            t_start += 7;
+                            if (r_len >= 7) r_len -= 7;
+                            else r_len = 0;
+                        }
+                        reasoning_ptr = t_start;
+                        reasoning_len = r_len;
+
+                        const char *c_start = t_end + 8;
+                        while (c_start < ns.buf + tool_content_len && (*c_start == '\r' || *c_start == '\n')) c_start++;
+                        content_ptr = c_start;
+                        if ((size_t)(c_start - ns.buf) <= tool_content_len) {
+                            content_len = tool_content_len - (size_t)(c_start - ns.buf);
+                        } else {
+                            content_len = 0;
+                        }
+                    } else {
+                        const char *t_start = ns.buf;
+                        size_t r_len = tool_content_len;
+                        if (strncmp(t_start, "<think>", 7) == 0) {
+                            t_start += 7;
+                            if (r_len >= 7) r_len -= 7;
+                            else r_len = 0;
+                        }
+                        reasoning_ptr = t_start;
+                        reasoning_len = r_len;
+                        content_ptr = "";
+                        content_len = 0;
+                    }
+                }
+
+                char *body_escaped = json_escape_alloc(content_ptr, content_len);
+                char *reasoning_escaped = reasoning_ptr ? json_escape_alloc(reasoning_ptr, reasoning_len) : NULL;
                 char *calls_json = tool_count ? openai_tool_calls_json(tool_calls, tool_count) : NULL;
-                char *items_json = responses_output_items_json(ns.buf, tool_content_len, tool_calls, tool_count);
+                char *items_json = responses_output_items_json_ex(
+                    req_thinking, reasoning_ptr, reasoning_len, content_ptr, content_len, tool_calls, tool_count);
                 char *content_field = body_escaped ? format_alloc("\"%s\"", body_escaped) : NULL;
                 if (tool_count) finish = "tool_calls";
 
@@ -3032,29 +3369,49 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                     if (is_responses_endpoint) {
                         response = items_json ? format_alloc(
                             "{\"id\":\"%s\",\"object\":\"response\",\"created_at\":%ld,"
-                            "\"status\":\"completed\",\"model\":\"%s\","
-                            "\"output\":%s,"
+                            "\"status\":\"completed\",\"model\":\"%s\",\"output\":%s,"
                             "\"usage\":{\"input_tokens\":%u,\"output_tokens\":%u,\"total_tokens\":%u}}",
                             resp_id, now, alias_json, items_json,
                             prompt_tokens, final_tokens, prompt_tokens + final_tokens) : NULL;
                     } else if (tool_count && calls_json && content_field) {
-                        response = format_alloc(
-                            "{\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion\",\"created\":%ld,"
-                            "\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\","
-                            "\"content\":%s,\"tool_calls\":%s},"
-                            "\"finish_reason\":\"%s\"}],"
-                            "\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u}}",
-                            now, alias_json, content_field, calls_json, finish,
-                            prompt_tokens, final_tokens, prompt_tokens + final_tokens);
+                        if (reasoning_escaped) {
+                            response = format_alloc(
+                                "{\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion\",\"created\":%ld,"
+                                "\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\","
+                                "\"content\":%s,\"reasoning_content\":\"%s\",\"tool_calls\":%s},"
+                                "\"finish_reason\":\"%s\"}],"
+                                "\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u}}",
+                                now, alias_json, content_field, reasoning_escaped, calls_json, finish,
+                                prompt_tokens, final_tokens, prompt_tokens + final_tokens);
+                        } else {
+                            response = format_alloc(
+                                "{\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion\",\"created\":%ld,"
+                                "\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\","
+                                "\"content\":%s,\"tool_calls\":%s},"
+                                "\"finish_reason\":\"%s\"}],"
+                                "\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u}}",
+                                now, alias_json, content_field, calls_json, finish,
+                                prompt_tokens, final_tokens, prompt_tokens + final_tokens);
+                        }
                     } else {
-                        response = format_alloc(
-                            "{\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion\",\"created\":%ld,"
-                            "\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\"},"
-                            "\"finish_reason\":\"%s\"}],"
-                            "\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u}}",
-                            now, alias_json, body_escaped, finish, prompt_tokens, final_tokens, prompt_tokens + final_tokens);
+                        if (reasoning_escaped) {
+                            response = format_alloc(
+                                "{\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion\",\"created\":%ld,"
+                                "\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\",\"reasoning_content\":\"%s\"},"
+                                "\"finish_reason\":\"%s\"}],"
+                                "\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u}}",
+                                now, alias_json, body_escaped, reasoning_escaped, finish, prompt_tokens, final_tokens, prompt_tokens + final_tokens);
+                        } else {
+                            response = format_alloc(
+                                "{\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion\",\"created\":%ld,"
+                                "\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\"},"
+                                "\"finish_reason\":\"%s\"}],"
+                                "\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u}}",
+                                now, alias_json, body_escaped, finish, prompt_tokens, final_tokens, prompt_tokens + final_tokens);
+                        }
                     }
                 }
+                free(reasoning_escaped);
                 free(content_field);
                 myds_free_tool_calls(tool_calls, tool_count);
                 free(items_json);
@@ -3187,6 +3544,10 @@ int myds_server_start(myds_context_t *ctx, const char *host, int port, const cha
         MYDS_LOG_E("Failed to bind socket to %s:%d: %s", host ? host : "0.0.0.0", port, strerror(errno));
         close(g_server_fd);
         return 1;
+    }
+
+    if (ctx) {
+        g_server_default_thinking = ctx->cfg.thinking_mode;
     }
 
     if (listen(g_server_fd, 64) < 0) {

@@ -997,6 +997,200 @@ static void test_previous_response_id_suffix_render(void) {
     printf("  [PASS] previous_response_id suffix render: items only, no BOS/instructions/tools\n");
 }
 
+static void test_thinking_mode(void) {
+    /* 1. extract_request_thinking_mode */
+    {
+        assert(extract_request_thinking_mode("{\"enable_thinking\": true}", false) == true);
+        assert(extract_request_thinking_mode("{\"enable_thinking\": false}", true) == false);
+        assert(extract_request_thinking_mode("{\"thinking\": true}", false) == true);
+        assert(extract_request_thinking_mode("{\"thinking\": false}", true) == false);
+        assert(extract_request_thinking_mode("{\"thinking\": {\"type\": \"enabled\"}}", false) == true);
+        assert(extract_request_thinking_mode("{\"thinking\": {\"type\": \"disabled\"}}", true) == false);
+        assert(extract_request_thinking_mode("{\"reasoning_effort\": \"low\"}", false) == true);
+        assert(extract_request_thinking_mode("{\"reasoning_effort\": \"medium\"}", false) == true);
+        assert(extract_request_thinking_mode("{\"reasoning_effort\": \"high\"}", false) == true);
+        assert(extract_request_thinking_mode("{\"reasoning_effort\": \"none\"}", true) == false);
+        assert(extract_request_thinking_mode("{\"chat_template_kwargs\": {\"thinking\": true}}", false) == true);
+        assert(extract_request_thinking_mode("{\"chat_template_kwargs\": {\"thinking\": false}}", true) == false);
+        assert(extract_request_thinking_mode("{}", false) == false);
+        assert(extract_request_thinking_mode("{}", true) == true);
+    }
+
+    /* 2. split_reasoning_content */
+    {
+        char *content = NULL, *reasoning = NULL;
+        const char *t1 = "<think>thought 123</think>answer 456";
+        split_reasoning_content(t1, strlen(t1), &content, &reasoning);
+        assert(reasoning && !strcmp(reasoning, "thought 123"));
+        assert(content && !strcmp(content, "answer 456"));
+        free(content); free(reasoning);
+
+        /* pre-filled <think> where model outputs reasoning</think>content */
+        const char *t2 = "thought only</think>\n\nfinal answer";
+        split_reasoning_content(t2, strlen(t2), &content, &reasoning);
+        assert(reasoning && !strcmp(reasoning, "thought only"));
+        assert(content && !strcmp(content, "final answer"));
+        free(content); free(reasoning);
+
+        /* all thinking, unclosed */
+        const char *t3 = "<think>thinking forever";
+        split_reasoning_content(t3, strlen(t3), &content, &reasoning);
+        assert(reasoning && !strcmp(reasoning, "thinking forever"));
+        assert(content && !strcmp(content, ""));
+        free(content); free(reasoning);
+
+        /* plain content without thinking */
+        const char *t4 = "just plain text";
+        split_reasoning_content(t4, strlen(t4), &content, &reasoning);
+        assert(reasoning == NULL);
+        assert(content && !strcmp(content, "just plain text"));
+        free(content);
+    }
+
+    /* 3. parse_chat_prompt_ex suffix check */
+    {
+        char prompt_buf[4096];
+        const char *req_thinking_on = "{\"messages\": [{\"role\": \"user\", \"content\": \"hello\"}], \"thinking\": true}";
+        assert(parse_chat_prompt(req_thinking_on, prompt_buf, sizeof(prompt_buf)));
+        assert(strstr(prompt_buf, "<｜Assistant｜><think>") != NULL);
+        assert(strstr(prompt_buf, "</think>") == NULL);
+
+        const char *req_thinking_off = "{\"messages\": [{\"role\": \"user\", \"content\": \"hello\"}], \"thinking\": false}";
+        assert(parse_chat_prompt(req_thinking_off, prompt_buf, sizeof(prompt_buf)));
+        assert(strstr(prompt_buf, "<｜Assistant｜></think>") != NULL);
+    }
+
+    /* 4. History rendering with reasoning_content / reasoning */
+    {
+        char prompt_buf[4096];
+        const char *req_hist = "{\"messages\": ["
+            "{\"role\": \"user\", \"content\": \"q1\"},"
+            "{\"role\": \"assistant\", \"content\": \"a1\", \"reasoning_content\": \"r1\"},"
+            "{\"role\": \"user\", \"content\": \"q2\"}"
+            "], \"thinking\": true}";
+        assert(parse_chat_prompt(req_hist, prompt_buf, sizeof(prompt_buf)));
+        assert(strstr(prompt_buf, "<｜Assistant｜><think>r1</think>a1<｜end▁of▁sentence｜>") != NULL);
+        assert(strstr(prompt_buf, "<｜User｜>q2<｜Assistant｜><think>") != NULL);
+
+        /* Responses API history shape: reasoning item + message item */
+        const char *req_resp_hist = "{\"input\": ["
+            "{\"type\": \"message\", \"role\": \"user\", \"content\": \"q1\"},"
+            "{\"type\": \"reasoning\", \"content\": [{\"type\": \"reasoning_text\", \"text\": \"r_resp\"}]},"
+            "{\"type\": \"message\", \"role\": \"assistant\", \"content\": \"a_resp\"},"
+            "{\"type\": \"message\", \"role\": \"user\", \"content\": \"q2\"}"
+            "], \"thinking\": false}";
+        assert(parse_chat_prompt(req_resp_hist, prompt_buf, sizeof(prompt_buf)));
+        assert(strstr(prompt_buf, "<｜Assistant｜></think>a_resp<｜end▁of▁sentence｜>") != NULL);
+        assert(strstr(prompt_buf, "r_resp") == NULL); /* internal reasoning item skipped as per OpenClaw spec */
+        assert(strstr(prompt_buf, "<｜User｜>q2<｜Assistant｜></think>") != NULL);
+    }
+
+    /* 5. responses_output_items_json_ex ordering */
+    {
+        myds_tool_call_t tc = {.id = "c1", .name = "fn", .arguments = "{}"};
+        char *items_think = responses_output_items_json_ex(true, "my_thought", 10, "my_answer", 9, &tc, 1);
+        assert(items_think != NULL);
+        /* Invariant: reasoning item at index 0, message item at index 1, tool call at index 2 */
+        assert(strstr(items_think, "{\"type\":\"reasoning\",\"id\":\"rs_myds_0\"") != NULL);
+        assert(strstr(items_think, "{\"type\":\"message\",\"id\":\"msg_myds_1\"") != NULL);
+        assert(strstr(items_think, "{\"type\":\"function_call\",\"id\":\"fc_1\"") != NULL);
+        char *p_rs = strstr(items_think, "\"type\":\"reasoning\"");
+        char *p_msg = strstr(items_think, "\"type\":\"message\"");
+        char *p_fc = strstr(items_think, "\"type\":\"function_call\"");
+        assert(p_rs < p_msg && p_msg < p_fc);
+        free(items_think);
+
+        /* Non-thinking: message item at index 0, tool call at index 1 */
+        char *items_nothink = responses_output_items_json_ex(false, NULL, 0, "my_answer", 9, &tc, 1);
+        assert(items_nothink != NULL);
+        assert(strstr(items_nothink, "\"type\":\"reasoning\"") == NULL);
+        assert(strstr(items_nothink, "{\"type\":\"message\",\"id\":\"msg_myds_1\"") != NULL);
+        assert(strstr(items_nothink, "{\"type\":\"function_call\",\"id\":\"fc_1\"") != NULL);
+        free(items_nothink);
+    }
+
+    /* 6. Streaming SSE callback transition with thinking mode */
+    {
+        int s[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, s) == 0);
+        socket_capture_t c = {.fd = s[1]};
+        pthread_t r; assert(pthread_create(&r, NULL, capture_socket, &c) == 0);
+        myds_sse_stream_ctx_t st = {
+            .client_fd = s[0],
+            .responses_api = false,
+            .thinking = true,
+            .think_state = 1,
+            .msg_output_index = 1,
+        };
+        assert(myds_server_sse_writer_start(&st, 1024u * 1024u, 1000));
+
+        /* Emit reasoning chunks, then </think>, then content chunk */
+        myds_server_sse_callback("think", 5, 1, &st);
+        myds_server_sse_callback("ing...", 6, 2, &st);
+        myds_server_sse_callback("</think>\nHello world", 20, 3, &st);
+        assert(myds_server_sse_finish(&st));
+        assert(myds_server_sse_writer_join(&st, false));
+        assert(shutdown(s[0], SHUT_WR) == 0);
+        assert(pthread_join(r, NULL) == 0);
+
+        assert_sse_data_lines_valid(c.bytes);
+        assert(strstr(c.bytes, "\"reasoning_content\":\"think\"") != NULL);
+        assert(strstr(c.bytes, "\"reasoning_content\":\"ing...\"") != NULL);
+        assert(strstr(c.bytes, "\"content\":\"Hello world\"") != NULL);
+        assert(strstr(c.bytes, "</think>") == NULL);
+
+        free(c.bytes); close(s[0]); close(s[1]); free(st.acc);
+    }
+
+    /* 7. Responses API streaming lifecycle in thinking mode */
+    {
+        int s[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, s) == 0);
+        socket_capture_t c = {.fd = s[1]};
+        pthread_t r; assert(pthread_create(&r, NULL, capture_socket, &c) == 0);
+        myds_sse_stream_ctx_t st = {
+            .client_fd = s[0],
+            .responses_api = true,
+            .thinking = true,
+            .think_state = 1,
+            .msg_output_index = 1,
+        };
+        assert(myds_server_sse_writer_start(&st, 1024u * 1024u, 1000));
+
+        /* Send initial reasoning item */
+        const char *initial =
+            "event: response.output_item.added\n"
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_myds_0\",\"status\":\"in_progress\",\"summary\":[],\"content\":[]}}\n\n"
+            "event: response.content_part.added\n"
+            "data: {\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"reasoning_text\",\"text\":\"\"}}\n\n";
+        assert(myds_server_sse_send(&st, initial, strlen(initial)));
+
+        /* Stream tokens: thought, then </think>, then answer */
+        myds_server_sse_callback("Let me think", 12, 1, &st);
+        myds_server_sse_callback("</think>\nThe answer is 42", 24, 2, &st);
+        assert(myds_server_sse_finish(&st));
+
+        char *items = responses_output_items_json_ex(true, "Let me think", 12, "The answer is 42", 16, NULL, 0);
+        assert(sse_emit_responses_finish(&st, "test-model", "resp_think_1", 10, 5,
+                                         "The answer is 42", 16, items, 1));
+        free(items);
+
+        assert(myds_server_sse_writer_join(&st, false));
+        assert(shutdown(s[0], SHUT_WR) == 0);
+        assert(pthread_join(r, NULL) == 0);
+
+        assert_sse_data_lines_valid(c.bytes);
+        assert(strstr(c.bytes, "response.reasoning_text.delta") != NULL);
+        assert(strstr(c.bytes, "\"output_index\":0") != NULL);
+        assert(strstr(c.bytes, "event: response.reasoning_text.done\ndata: {\"type\":\"response.reasoning_text.done\",\"output_index\":0") != NULL);
+        assert(strstr(c.bytes, "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"message\"") != NULL);
+        assert(strstr(c.bytes, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":1") != NULL);
+        assert(strstr(c.bytes, "event: response.output_text.done\ndata: {\"type\":\"response.output_text.done\",\"output_index\":1") != NULL);
+
+        free(c.bytes); close(s[0]); close(s[1]); free(st.acc);
+    }
+
+    printf("  [PASS] thinking mode (CoT/Reasoning) prompt formatting, request parsing, streaming deltas & Responses API lifecycle\n");
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && !strcmp(argv[1], "--render")) {
         size_t capacity = strlen(argv[2]) * 4 + 1024;
@@ -1015,6 +1209,7 @@ int main(int argc, char **argv) {
     test_responses_call_merges_into_assistant_turn();
     test_previous_response_id_registry();
     test_previous_response_id_suffix_render();
+    test_thinking_mode();
     printf("====================================================\n");
     printf("       Running myds Server API Unit Tests           \n");
     printf("====================================================\n");

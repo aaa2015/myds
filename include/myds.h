@@ -43,6 +43,7 @@ typedef struct {
     float    repetition_penalty; /* Repetition penalty (1.0 = disabled, default: 1.0) */
     int32_t  seed;              /* Random seed */
     bool     stream;            /* Stream output tokens to callback */
+    bool     thinking_mode;     /* Enable thinking / reasoning mode (default: false) */
 } myds_config_t;
 
 typedef void (*myds_stream_callback_t)(const char *piece, int32_t token_id, void *user_data);

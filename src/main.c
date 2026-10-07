@@ -26,6 +26,8 @@ static void print_usage(const char *prog) {
     printf("  -c, --ctx, --ctx-size   Context window size (default: 4096)\n");
     printf("  --temp <float>          Sampling temperature (default: 0.7, 0.0 for greedy)\n");
     printf("  --top-p <float>         Nucleus top-p sampling cutoff (default: 0.9)\n");
+    printf("  --thinking [on|off]     Enable thinking / reasoning mode (default: off)\n");
+    printf("  --no-thinking           Disable thinking / reasoning mode\n");
     printf("  --seed <int>            Random seed (default: random)\n");
     printf("  -h, --help              Show this help message\n");
 }
@@ -124,6 +126,18 @@ int main(int argc, char *argv[]) {
             cfg.top_k = (uint32_t)atoi(argv[++i]);
         } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
             cfg.seed = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--thinking") == 0) {
+            if (i + 1 < argc && (!strcmp(argv[i+1], "on") || !strcmp(argv[i+1], "true") || !strcmp(argv[i+1], "1"))) {
+                cfg.thinking_mode = true;
+                i++;
+            } else if (i + 1 < argc && (!strcmp(argv[i+1], "off") || !strcmp(argv[i+1], "false") || !strcmp(argv[i+1], "0"))) {
+                cfg.thinking_mode = false;
+                i++;
+            } else {
+                cfg.thinking_mode = true;
+            }
+        } else if (strcmp(argv[i], "--no-thinking") == 0) {
+            cfg.thinking_mode = false;
         } else if (strcmp(argv[i], "--print-tokens") == 0) {
             print_tokens = true;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
