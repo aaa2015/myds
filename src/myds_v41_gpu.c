@@ -947,7 +947,13 @@ int myds_v41_gpu_attention(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
     const myds_metal_buffer_t *b[]={q,s->kv_f16,s->kv_f16,s->mask,sinks,s->pad,s->partial};
     const myds_metal_constant_t c[]={{400,true,1},{401,true,1},{402,true,0},{403,true,0},{404,true,keys%32!=0},
         {405,true,0},{420,false,512},{421,false,512},{422,false,1},{423,false,32}};
-    if(!specialized("kernel_flash_attn_ext_vec_f16_dk512_dv512",&a,sizeof(a),b,7,1,64,32,32,1,1,3328,c,10))return 0;
+    int vec_ok = 0;
+    if(s->attn_vec_head_first && !s->attn_vec_head_first_unavailable) {
+        vec_ok = specialized("kernel_myds_flash_attn_vec_head_first_f16_dk512_dv512",&a,sizeof(a),b,7,64,1,32,32,1,1,3328,c,10);
+    }
+    if(!vec_ok) {
+        if(!specialized("kernel_flash_attn_ext_vec_f16_dk512_dv512",&a,sizeof(a),b,7,1,64,32,32,1,1,3328,c,10))return 0;
+    }
     const int32_t nrows=64;const myds_metal_buffer_t *rb[]={s->partial,heads};
     const myds_metal_constant_t rc[]={{500,false,512},{501,false,32}};
     return specialized("kernel_flash_attn_ext_vec_reduce",&nrows,sizeof(nrows),rb,2,64,1,1,1024,1,1,0,rc,2);
@@ -991,7 +997,13 @@ int myds_v41_gpu_attention_direct(myds_metal_buffer_t *heads,const myds_metal_bu
     const myds_metal_buffer_t *b[]={q,s->kv_f16,s->kv_f16,s->mask,sinks,s->pad,s->partial};
     const myds_metal_constant_t c[]={{400,true,1},{401,true,1},{402,true,0},{403,true,0},{404,true,keys%32!=0},
         {405,true,0},{420,false,512},{421,false,512},{422,false,1},{423,false,32}};
-    if(!specialized("kernel_flash_attn_ext_vec_f16_dk512_dv512",&a,sizeof(a),b,7,1,64,32,32,1,1,3328,c,10))return 0;
+    int vec_ok = 0;
+    if(s->attn_vec_head_first && !s->attn_vec_head_first_unavailable) {
+        vec_ok = specialized("kernel_myds_flash_attn_vec_head_first_f16_dk512_dv512",&a,sizeof(a),b,7,64,1,32,32,1,1,3328,c,10);
+    }
+    if(!vec_ok) {
+        if(!specialized("kernel_flash_attn_ext_vec_f16_dk512_dv512",&a,sizeof(a),b,7,1,64,32,32,1,1,3328,c,10))return 0;
+    }
     const int32_t nrows=64;const myds_metal_buffer_t *rb[]={s->partial,heads};
     const myds_metal_constant_t rc[]={{500,false,512},{501,false,32}};
     return specialized("kernel_flash_attn_ext_vec_reduce",&nrows,sizeof(nrows),rb,2,64,1,1,1024,1,1,0,rc,2);
