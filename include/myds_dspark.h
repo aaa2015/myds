@@ -2,6 +2,7 @@
 #define MYDS_DSPARK_H
 
 #include "myds_internal.h"
+#include "myds_gguf.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -55,7 +56,7 @@ typedef struct {
 } myds_dspark_stage_t;
 
 struct myds_dspark {
-    struct gguf_file *gf;
+    gguf_file_t *gf;
     uint32_t stage_count;
     uint32_t block_size;
     uint32_t markov_rank;
@@ -98,6 +99,10 @@ struct myds_dspark {
     uint64_t accepted_tokens;
     double propose_ms;
     double verify_ms;
+
+    // Adaptive Speculative Scheduler
+    uint32_t consecutive_misses;
+    uint32_t backoff_counter;
 };
 
 /* Initialize and load DSpark support model from GGUF */

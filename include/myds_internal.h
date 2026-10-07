@@ -228,6 +228,8 @@ myds_metal_buffer_t *myds_v41_snapshot_get_previous_score(myds_v41_context_t *g,
 void myds_v41_snapshot_set_engram_history(myds_v41_context_t *g, uint32_t t0, uint32_t t1, uint32_t t2);
 void myds_v41_snapshot_get_engram_history(const myds_v41_context_t *g, uint32_t out[3]);
 void myds_v41_snapshot_set_positions(myds_v41_context_t *g, uint32_t engram_pos, uint32_t next_pos);
+uint32_t myds_v41_snapshot_get_next_position(const myds_v41_context_t *g);
+uint32_t myds_v41_snapshot_get_engram_position(const myds_v41_context_t *g);
 bool myds_v41_snapshot_get_valid(const myds_v41_context_t *g);
 /* 低位区落盘的单测夹具：给快照夹具补上压缩 KV 缓冲并直接打开磁盘存储（不需要模型）。 */
 bool myds_v41_low_kv_fixture_enable(myds_v41_context_t *g, const char *path, uint64_t identity,

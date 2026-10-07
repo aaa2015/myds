@@ -39,6 +39,7 @@ TEST_ENGRAM = $(BIN_DIR)/test_engram
 TEST_ALIGN = $(BIN_DIR)/test_align
 TEST_KVDSK = $(BIN_DIR)/test_kvdsk
 TEST_P1 = $(BIN_DIR)/test_p1
+TEST_DSPARK_ROLLBACK = $(BIN_DIR)/test_dspark_rollback
 BENCH_SYNTHETIC = $(BIN_DIR)/bench_synthetic
 BENCH_METAL = $(BIN_DIR)/bench_metal
 BENCH_PHASE = $(BIN_DIR)/bench_phase
@@ -47,7 +48,7 @@ DUMP_TENSORS = $(BIN_DIR)/dump_tensors
 METALLIB = $(BIN_DIR)/myds.metallib
 METAL_SRCS = $(wildcard metal/*.metal)
 
-ALL_TESTS = $(TEST_METAL) $(TEST_V41_GPU) $(TEST_ATTN_POLICY) $(TEST_ATTN_VEC) $(TEST_QKV_FUSION) $(TEST_DECODE_Q8) $(TEST_DEEPER_SSD) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE) $(TEST_CPU) $(TEST_ENGRAM) $(TEST_ALIGN) $(TEST_KVDSK) $(TEST_P1)
+ALL_TESTS = $(TEST_METAL) $(TEST_V41_GPU) $(TEST_ATTN_POLICY) $(TEST_ATTN_VEC) $(TEST_QKV_FUSION) $(TEST_DECODE_Q8) $(TEST_DEEPER_SSD) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE) $(TEST_CPU) $(TEST_ENGRAM) $(TEST_ALIGN) $(TEST_KVDSK) $(TEST_P1) $(TEST_DSPARK_ROLLBACK)
 
 .PHONY: all test clean bench metallib build-tail-init test-tail-init
 
@@ -171,6 +172,9 @@ $(TEST_KVDSK): tests/test_kvdsk.c include/myds_kvdsk.h $(BUILD_DIR)/myds_kvdsk.o
 $(TEST_P1): tests/test_p1_regressions.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -Iinclude -o $@ tests/test_p1_regressions.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS)
 
+$(TEST_DSPARK_ROLLBACK): tests/test_dspark_rollback.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
+	$(CC) $(CFLAGS) -Iinclude -o $@ tests/test_dspark_rollback.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS)
+
 $(TEST_LOG): $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_log.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@
 
@@ -284,6 +288,8 @@ test: $(ALL_TESTS) $(METALLIB)
 	@./$(TEST_KVDSK)
 	@echo ""
 	@./$(TEST_P1)
+	@echo ""
+	@./$(TEST_DSPARK_ROLLBACK)
 	@echo ""
 	@MYDS_QKV_NR0=4 ./$(TEST_DECODE_Q8) bin
 	@MYDS_QKV_NR0=2 ./$(TEST_DECODE_Q8) bin

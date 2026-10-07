@@ -303,8 +303,19 @@ static inline float dot_q8_row256(const q8_0_block_t *row, const float *state) {
     return total;
 }
 
+#if defined(__APPLE__)
+#include <dispatch/dispatch.h>
+#define MARKOV_NUM_SLICES 16
+#else
+#define MARKOV_NUM_SLICES 1
+#endif
+
 uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t last_token, uint32_t draft_cap) {
-    if (!ds || !ctx || !ctx->model || !ds->main_proj || !ds->target_hidden_buf) return 0;
+    if (!ds || !ctx || !ctx->model) return 0;
+    if (ds->backoff_counter > 0) {
+        ds->backoff_counter--;
+        return 0;
+    }
 
     double t0 = now_ms();
     ds->cycles++;
@@ -312,29 +323,36 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
     uint32_t K = draft_cap > 0 && draft_cap < ds->block_size ? draft_cap : ds->block_size;
     if (K > MYDS_DSPARK_DEFAULT_BLOCK_SIZE) K = MYDS_DSPARK_DEFAULT_BLOCK_SIZE;
 
-    // 1. Stage0 Entry Projection: [15360] -> [5120]
-    const uint32_t in_dim = MYDS_DSPARK_TARGET_LAYERS * MYDS_DSPARK_DIM;
-    if (!myds_metal_gemv(ds->stage_x_buf, ds->main_proj, ds->target_hidden_buf,
-                         MYDS_DSPARK_DIM, in_dim, ds->main_proj_type)) {
-        return 0;
+    static int markov_only = -1;
+    if (__builtin_expect(markov_only < 0, 0)) {
+        const char *env = getenv("MYDS_DSPARK_MARKOV_ONLY");
+        markov_only = (env && atoi(env) != 0) ? 1 : 0;
     }
-    if (ds->main_norm) {
-        if (!myds_metal_v41_rmsnorm(ds->stage_x_buf, ds->stage_x_buf, ds->main_norm,
-                                    MYDS_DSPARK_DIM, 1e-6f, true)) {
-            return 0;
+
+    const float *base_logits = NULL;
+    if (!markov_only && ds->main_proj && ds->target_hidden_buf && ds->stage_x_buf && ds->draft_logits_buf) {
+        // 1. Stage0 Entry Projection: [15360] -> [5120]
+        const uint32_t in_dim = MYDS_DSPARK_TARGET_LAYERS * MYDS_DSPARK_DIM;
+        if (myds_metal_gemv(ds->stage_x_buf, ds->main_proj, ds->target_hidden_buf,
+                            MYDS_DSPARK_DIM, in_dim, ds->main_proj_type)) {
+            if (ds->main_norm) {
+                (void)myds_metal_v41_rmsnorm(ds->stage_x_buf, ds->stage_x_buf, ds->main_norm,
+                                            MYDS_DSPARK_DIM, 1e-6f, true);
+            }
+            if (ds->final_norm) {
+                (void)myds_metal_v41_rmsnorm(ds->stage_x_buf, ds->stage_x_buf, ds->final_norm,
+                                            MYDS_DSPARK_DIM, 1e-6f, true);
+            }
+
+            // 2. Compute Base Logits using Main Model LM Head
+            if (myds_metal_gemv(ds->draft_logits_buf, ctx->model->output, ds->stage_x_buf,
+                                ctx->model->vocab_size, MYDS_DSPARK_DIM, ctx->model->output_type)) {
+                // Synchronize to read logits
+                (void)myds_metal_commit_batch();
+                base_logits = (const float *)myds_metal_buffer_data(ds->draft_logits_buf);
+            }
         }
     }
-
-    // 2. Compute Base Logits using Main Model LM Head
-    if (!myds_metal_gemv(ds->draft_logits_buf, ctx->model->output, ds->stage_x_buf,
-                         ctx->model->vocab_size, MYDS_DSPARK_DIM, ctx->model->output_type)) {
-        return 0;
-    }
-
-    // Synchronize to read logits
-    (void)myds_metal_commit_batch();
-    const float *base_logits = (const float *)myds_metal_buffer_data(ds->draft_logits_buf);
-    if (!base_logits) return 0;
 
     // 3. Draft generation with Markov Head
     int32_t prev = last_token;
@@ -346,12 +364,13 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
                              ds->markov_w2_type == GGML_TYPE_Q8_0 &&
                              ds->markov_state_host && ds->markov_bias_host);
 
+    if (!has_markov && !base_logits) return 0;
+
     const q8_0_block_t *w1_base = has_markov ? (const q8_0_block_t *)myds_metal_buffer_data(ds->markov_w1) : NULL;
     const q8_0_block_t *w2_base = has_markov ? (const q8_0_block_t *)myds_metal_buffer_data(ds->markov_w2) : NULL;
 
     for (uint32_t d = 0; d < K; d++) {
         int32_t best_token = 0;
-        float best_score = -INFINITY;
 
         if (has_markov && w1_base && w2_base && prev >= 0 && (uint32_t)prev < vocab_size) {
             // Dequantize 8 blocks from markov_w1 for row `prev`
@@ -363,18 +382,57 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
                 }
             }
 
-            // Compute Markov bias = markov_w2 @ state and argmax
+#if defined(__APPLE__)
+            int32_t slice_tokens[MARKOV_NUM_SLICES];
+            float slice_scores[MARKOV_NUM_SLICES];
+            int32_t *tokens_out = slice_tokens;
+            float *scores_out = slice_scores;
+            uint32_t chunk = (vocab_size + MARKOV_NUM_SLICES - 1) / MARKOV_NUM_SLICES;
+
+            dispatch_apply(MARKOV_NUM_SLICES, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t s) {
+                uint32_t r0 = (uint32_t)s * chunk;
+                uint32_t r1 = r0 + chunk;
+                if (r1 > vocab_size) r1 = vocab_size;
+
+                int32_t local_best_token = 0;
+                float local_best_score = -INFINITY;
+
+                for (uint32_t r = r0; r < r1; r++) {
+                    const q8_0_block_t *w2_row = w2_base + (size_t)r * 8;
+                    float bias = dot_q8_row256(w2_row, ds->markov_state_host);
+                    float score = base_logits ? (base_logits[r] + bias) : bias;
+                    if (score > local_best_score) {
+                        local_best_score = score;
+                        local_best_token = (int32_t)r;
+                    }
+                }
+                tokens_out[s] = local_best_token;
+                scores_out[s] = local_best_score;
+            });
+
+            best_token = slice_tokens[0];
+            float best_score = slice_scores[0];
+            for (int s = 1; s < MARKOV_NUM_SLICES; s++) {
+                if (slice_scores[s] > best_score) {
+                    best_score = slice_scores[s];
+                    best_token = slice_tokens[s];
+                }
+            }
+#else
+            float best_score = -INFINITY;
             for (uint32_t r = 0; r < vocab_size; r++) {
                 const q8_0_block_t *w2_row = w2_base + (size_t)r * 8;
                 float bias = dot_q8_row256(w2_row, ds->markov_state_host);
-                float score = base_logits[r] + bias;
+                float score = base_logits ? (base_logits[r] + bias) : bias;
                 if (score > best_score) {
                     best_score = score;
                     best_token = (int32_t)r;
                 }
             }
-        } else {
+#endif
+        } else if (base_logits) {
             // Simple argmax fallback
+            float best_score = -INFINITY;
             for (uint32_t r = 0; r < vocab_size; r++) {
                 if (base_logits[r] > best_score) {
                     best_score = base_logits[r];
@@ -393,3 +451,4 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
 
     return n_proposed;
 }
+

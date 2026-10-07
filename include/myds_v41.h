@@ -2,6 +2,7 @@
 #define MYDS_V41_H
 
 #include "myds.h"
+#include "myds_engram.h"
 #include <stdbool.h>
 
 typedef struct myds_v41_model myds_v41_model_t;
@@ -76,4 +77,25 @@ int32_t myds_v41_forward(myds_context_t *context, int32_t token,
 int myds_v41_prefill_tokens(myds_context_t *context, const int32_t *tokens,
                             uint32_t n_tokens, volatile int *cancel_flag);
 
+/* ── 投机解码轻量状态快照与回退 ── */
+#define MYDS_V41_SPEC_MAX_AHEAD 16
+#define MYDS_V41_LAYERS_COUNT   40
+
+typedef struct {
+    uint32_t pos;
+    uint32_t next_position;
+    myds_engram_history_t engram_history;
+    uint32_t engram_position;
+    float previous_kv[4][512];
+    float previous_score[4][512];
+    uint32_t window_start_pos;
+    uint32_t window_count;
+    float window_saved[MYDS_V41_LAYERS_COUNT][MYDS_V41_SPEC_MAX_AHEAD][512];
+    bool valid;
+} myds_v41_spec_snapshot_t;
+
+bool myds_v41_spec_snapshot_save(myds_context_t *context, myds_v41_spec_snapshot_t *snap, uint32_t count);
+bool myds_v41_spec_snapshot_restore(myds_context_t *context, const myds_v41_spec_snapshot_t *snap);
+
 #endif
+

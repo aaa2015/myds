@@ -3358,9 +3358,19 @@ static int myds_generate_internal(myds_context_t *ctx,
                 continue;
             }
 
+            struct timeval tv_ver0, tv_ver1;
+            gettimeofday(&tv_ver0, NULL);
+
+            myds_v41_spec_snapshot_t snap = {0};
+            bool snap_saved = myds_v41_spec_snapshot_save(ctx, &snap, n_draft + 1);
+
+            uint32_t accepted_in_cycle = 0;
             for (uint32_t d = 0; d < n_draft; d++) {
                 if (cancel_flag && *cancel_flag) {
                     stop_reason = MYDS_STOP_CANCELLED;
+                    if (snap_saved && d == 0) {
+                        myds_v41_spec_snapshot_restore(ctx, &snap);
+                    }
                     break;
                 }
                 if (ctx->pos >= ctx->cfg.max_seq_len) {
@@ -3375,6 +3385,9 @@ static int myds_generate_internal(myds_context_t *ctx,
 
                 int32_t true_next = myds_forward_token(ctx, cur_token, ctx->pos);
                 if (true_next < 0 || (uint32_t)true_next >= m->tokenizer->vocab_size) {
+                    if (snap_saved) {
+                        myds_v41_spec_snapshot_restore(ctx, &snap);
+                    }
                     ctx->pcache_len = 0;
                     stop_reason = MYDS_STOP_ERROR;
                     success = 0;
@@ -3386,6 +3399,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                 bool matched = (true_next == ctx->dspark->draft_tokens[d]);
                 if (matched) {
                     ctx->dspark->accepted_tokens++;
+                    accepted_in_cycle++;
                 }
 
                 if (true_next == m->tokenizer->eos_id) {
@@ -3396,6 +3410,9 @@ static int myds_generate_internal(myds_context_t *ctx,
                 size_t piece_len = 0;
                 const char *piece = myds_tokenizer_decode_bytes(m->tokenizer, true_next, &piece_len);
                 if (!piece) {
+                    if (snap_saved) {
+                        myds_v41_spec_snapshot_restore(ctx, &snap);
+                    }
                     stop_reason = MYDS_STOP_ERROR;
                     success = 0;
                     break;
@@ -3410,6 +3427,23 @@ static int myds_generate_internal(myds_context_t *ctx,
                 }
                 if (step >= max_gen) break;
             }
+
+            gettimeofday(&tv_ver1, NULL);
+            ctx->dspark->verify_ms += (double)(tv_ver1.tv_sec - tv_ver0.tv_sec) * 1000.0 +
+                                      (double)(tv_ver1.tv_usec - tv_ver0.tv_usec) / 1000.0;
+
+            if (accepted_in_cycle == 0) {
+                ctx->dspark->consecutive_misses++;
+                if (ctx->dspark->consecutive_misses >= 4) {
+                    ctx->dspark->backoff_counter = 8;
+                } else if (ctx->dspark->consecutive_misses >= 2) {
+                    ctx->dspark->backoff_counter = 4;
+                }
+            } else {
+                ctx->dspark->consecutive_misses = 0;
+                ctx->dspark->backoff_counter = 0;
+            }
+
             if (stop_reason == MYDS_STOP_EOS || stop_reason == MYDS_STOP_CANCELLED || !success) {
                 break;
             }

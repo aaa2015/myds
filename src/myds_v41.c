@@ -321,6 +321,94 @@ restore_fail:
     return false;
 }
 
+/* ── 投机解码轻量状态快照与回退 ── */
+bool myds_v41_spec_snapshot_save(myds_context_t *ctx, myds_v41_spec_snapshot_t *snap, uint32_t count) {
+    if (!ctx || !ctx->v41 || !snap) return false;
+    myds_v41_context_t *g = ctx->v41;
+    if (!g->valid) return false;
+    if (count > MYDS_V41_SPEC_MAX_AHEAD) count = MYDS_V41_SPEC_MAX_AHEAD;
+
+    if (!myds_metal_commit_batch()) return false;
+
+    snap->pos = ctx->pos;
+    snap->next_position = g->next_position;
+    if (g->engram) {
+        snap->engram_history = g->engram->history;
+        snap->engram_position = g->engram->position;
+    } else {
+        memset(&snap->engram_history, 0, sizeof(snap->engram_history));
+        snap->engram_position = 0;
+    }
+
+    for (uint32_t o = 0; o < 4u; o++) {
+        if (g->previous_kv[o]) {
+            const float *src = (const float *)myds_metal_buffer_data(g->previous_kv[o]);
+            if (src) memcpy(snap->previous_kv[o], src, 512 * sizeof(float));
+        }
+        if (g->previous_score[o]) {
+            const float *src = (const float *)myds_metal_buffer_data(g->previous_score[o]);
+            if (src) memcpy(snap->previous_score[o], src, 512 * sizeof(float));
+        }
+    }
+
+    snap->window_start_pos = ctx->pos;
+    snap->window_count = count;
+    for (uint32_t il = 0; il < V41_LAYERS; il++) {
+        if (!g->window[il]) continue;
+        const float *base = (const float *)myds_metal_buffer_data(g->window[il]);
+        if (!base) continue;
+        for (uint32_t k = 0; k < count; k++) {
+            uint32_t slot = (ctx->pos + k) % V41_WINDOW;
+            memcpy(snap->window_saved[il][k], base + (size_t)slot * V41_HEAD_DIM, V41_HEAD_DIM * sizeof(float));
+        }
+    }
+
+    snap->valid = true;
+    return true;
+}
+
+bool myds_v41_spec_snapshot_restore(myds_context_t *ctx, const myds_v41_spec_snapshot_t *snap) {
+    if (!ctx || !ctx->v41 || !snap || !snap->valid) return false;
+    myds_v41_context_t *g = ctx->v41;
+
+    if (!myds_metal_commit_batch()) return false;
+
+    ctx->pos = snap->pos;
+    g->next_position = snap->next_position;
+    if (g->engram) {
+        g->engram->history = snap->engram_history;
+        g->engram->position = snap->engram_position;
+    }
+    g->valid = true;
+
+    for (uint32_t o = 0; o < 4u; o++) {
+        if (g->previous_kv[o]) {
+            float *dst = (float *)myds_metal_buffer_data(g->previous_kv[o]);
+            if (dst) memcpy(dst, snap->previous_kv[o], 512 * sizeof(float));
+        }
+        if (g->previous_score[o]) {
+            float *dst = (float *)myds_metal_buffer_data(g->previous_score[o]);
+            if (dst) memcpy(dst, snap->previous_score[o], 512 * sizeof(float));
+        }
+    }
+
+    for (uint32_t il = 0; il < V41_LAYERS; il++) {
+        if (!g->window[il]) continue;
+        float *base = (float *)myds_metal_buffer_data(g->window[il]);
+        if (!base) continue;
+        for (uint32_t k = 0; k < snap->window_count; k++) {
+            uint32_t slot = (snap->window_start_pos + k) % V41_WINDOW;
+            memcpy(base + (size_t)slot * V41_HEAD_DIM, snap->window_saved[il][k], V41_HEAD_DIM * sizeof(float));
+        }
+    }
+
+    if (ctx->pcache_tokens && ctx->pcache_len > snap->pos) {
+        ctx->pcache_len = snap->pos;
+    }
+
+    return true;
+}
+
 /* ── 快照诊断与单测夹具 ── */
 myds_v41_context_t *myds_v41_context_create_snapshot_fixture(void) {
     myds_v41_context_t *g = calloc(1, sizeof(*g));
@@ -411,6 +499,14 @@ void myds_v41_snapshot_set_positions(myds_v41_context_t *g, uint32_t engram_pos,
         if (g->engram) g->engram->position = engram_pos;
         g->next_position = next_pos;
     }
+}
+
+uint32_t myds_v41_snapshot_get_next_position(const myds_v41_context_t *g) {
+    return g ? g->next_position : 0;
+}
+
+uint32_t myds_v41_snapshot_get_engram_position(const myds_v41_context_t *g) {
+    return (g && g->engram) ? g->engram->position : 0;
 }
 
 bool myds_v41_snapshot_get_valid(const myds_v41_context_t *g) {
