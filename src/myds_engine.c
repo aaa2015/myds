@@ -6,6 +6,7 @@
 #include "myds_align.h"
 #include "myds_log.h"
 #include "myds_cpu.h"
+#include "myds_dspark.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1323,8 +1324,12 @@ void myds_context_clear_image_embeddings(myds_context_t *ctx) {
 }
 
 void myds_context_free(myds_context_t *ctx) {
-    free(ctx->pcache_tokens); ctx->pcache_tokens=NULL; ctx->pcache_len=ctx->pcache_cap=0;
     if (!ctx) return;
+    free(ctx->pcache_tokens); ctx->pcache_tokens=NULL; ctx->pcache_len=ctx->pcache_cap=0;
+    if (ctx->dspark) {
+        myds_dspark_free(ctx->dspark);
+        ctx->dspark = NULL;
+    }
     myds_context_clear_image_embeddings(ctx);
     (void)myds_metal_synchronize();
     myds_v41_context_free(ctx->v41);
@@ -3270,52 +3275,193 @@ static int myds_generate_internal(myds_context_t *ctx,
     uint32_t max_gen = ctx->cfg.max_new_tokens;
     int success = 1;
 
-    for (uint32_t step = 0; step < max_gen; step++) {
-        if (cancel_flag && *cancel_flag) {
-            stop_reason = MYDS_STOP_CANCELLED;
-            break;
-        }
-        /* 记录「正在被喂入的这个 token」（位置 = ctx->pos）⇒ 缓存序列与状态一一对应，
-         * 而产出的 EOS 从未被喂入，所以不会被记进去。 */
-        if (ctx->pcache_tokens && ctx->pos < ctx->pcache_cap) {
-            ctx->pcache_tokens[ctx->pos] = cur_token;
-            if (ctx->pos + 1u > ctx->pcache_len) ctx->pcache_len = ctx->pos + 1u;
-        }
-        int32_t next_token = myds_forward_token(ctx, cur_token, ctx->pos);
-        if (next_token < 0 || (uint32_t)next_token >= m->tokenizer->vocab_size) {
-            /* 这一步没跑完 ⇒ 刚记下的那个 token 并未真正被消费（外部评审指出的盲区）。
-             * 若留着它，下个请求会从一个状态从未到达的位置续跑 —— 直接撞位置检查。
-             * 与 prefill 失败同理：整条缓存作废。 */
-            ctx->pcache_len = 0;
-            MYDS_LOG_E("Generation step %u failed", step);
-            stop_reason = MYDS_STOP_ERROR;
-            success = 0;
-            break;
-        }
-        ctx->pos++;
+    if (ctx->dspark) {
+        uint32_t step = 0;
+        while (step < max_gen) {
+            if (cancel_flag && *cancel_flag) {
+                stop_reason = MYDS_STOP_CANCELLED;
+                break;
+            }
+            if (ctx->pos >= ctx->cfg.max_seq_len) {
+                stop_reason = MYDS_STOP_CTX_FULL;
+                break;
+            }
 
-        if (next_token == m->tokenizer->eos_id) {
-            stop_reason = MYDS_STOP_EOS;
-            break;
-        }
+            if (step == 0) {
+                if (ctx->pcache_tokens && ctx->pos < ctx->pcache_cap) {
+                    ctx->pcache_tokens[ctx->pos] = cur_token;
+                    if (ctx->pos + 1u > ctx->pcache_len) ctx->pcache_len = ctx->pos + 1u;
+                }
+                int32_t next_token = myds_forward_token(ctx, cur_token, ctx->pos);
+                if (next_token < 0 || (uint32_t)next_token >= m->tokenizer->vocab_size) {
+                    ctx->pcache_len = 0;
+                    MYDS_LOG_E("DSpark initial forward step failed at pos %u", ctx->pos);
+                    stop_reason = MYDS_STOP_ERROR;
+                    success = 0;
+                    break;
+                }
+                ctx->pos++;
+                step++;
 
-        size_t piece_len = 0;
-        const char *piece = myds_tokenizer_decode_bytes(m->tokenizer, next_token, &piece_len);
-        if (!piece) {
-            stop_reason = MYDS_STOP_ERROR;
-            success = 0;
-            break;
-        }
-        if (bytes_cb) {
-            bytes_cb(piece, piece_len, next_token, user_data);
-        } else if (cb) {
-            cb(piece, next_token, user_data);
-        }
+                if (next_token == m->tokenizer->eos_id) {
+                    stop_reason = MYDS_STOP_EOS;
+                    break;
+                }
 
-        cur_token = next_token;
-        if (ctx->pos >= ctx->cfg.max_seq_len) {
-            stop_reason = MYDS_STOP_CTX_FULL;
-            break;
+                size_t piece_len = 0;
+                const char *piece = myds_tokenizer_decode_bytes(m->tokenizer, next_token, &piece_len);
+                if (!piece) {
+                    stop_reason = MYDS_STOP_ERROR;
+                    success = 0;
+                    break;
+                }
+                if (bytes_cb) {
+                    bytes_cb(piece, piece_len, next_token, user_data);
+                } else if (cb) {
+                    cb(piece, next_token, user_data);
+                }
+                cur_token = next_token;
+                continue;
+            }
+
+            uint32_t draft_cap = ctx->dspark->block_size;
+            if (draft_cap > max_gen - step) draft_cap = max_gen - step;
+            uint32_t n_draft = myds_dspark_propose(ctx->dspark, ctx, cur_token, draft_cap);
+            if (n_draft == 0) {
+                if (ctx->pcache_tokens && ctx->pos < ctx->pcache_cap) {
+                    ctx->pcache_tokens[ctx->pos] = cur_token;
+                    if (ctx->pos + 1u > ctx->pcache_len) ctx->pcache_len = ctx->pos + 1u;
+                }
+                int32_t next_token = myds_forward_token(ctx, cur_token, ctx->pos);
+                if (next_token < 0 || (uint32_t)next_token >= m->tokenizer->vocab_size) {
+                    ctx->pcache_len = 0;
+                    stop_reason = MYDS_STOP_ERROR;
+                    success = 0;
+                    break;
+                }
+                ctx->pos++;
+                step++;
+                if (next_token == m->tokenizer->eos_id) {
+                    stop_reason = MYDS_STOP_EOS;
+                    break;
+                }
+                size_t piece_len = 0;
+                const char *piece = myds_tokenizer_decode_bytes(m->tokenizer, next_token, &piece_len);
+                if (!piece) {
+                    stop_reason = MYDS_STOP_ERROR;
+                    success = 0;
+                    break;
+                }
+                if (bytes_cb) bytes_cb(piece, piece_len, next_token, user_data);
+                else if (cb) cb(piece, next_token, user_data);
+                cur_token = next_token;
+                continue;
+            }
+
+            for (uint32_t d = 0; d < n_draft; d++) {
+                if (cancel_flag && *cancel_flag) {
+                    stop_reason = MYDS_STOP_CANCELLED;
+                    break;
+                }
+                if (ctx->pos >= ctx->cfg.max_seq_len) {
+                    stop_reason = MYDS_STOP_CTX_FULL;
+                    break;
+                }
+
+                if (ctx->pcache_tokens && ctx->pos < ctx->pcache_cap) {
+                    ctx->pcache_tokens[ctx->pos] = cur_token;
+                    if (ctx->pos + 1u > ctx->pcache_len) ctx->pcache_len = ctx->pos + 1u;
+                }
+
+                int32_t true_next = myds_forward_token(ctx, cur_token, ctx->pos);
+                if (true_next < 0 || (uint32_t)true_next >= m->tokenizer->vocab_size) {
+                    ctx->pcache_len = 0;
+                    stop_reason = MYDS_STOP_ERROR;
+                    success = 0;
+                    break;
+                }
+                ctx->pos++;
+                step++;
+
+                bool matched = (true_next == ctx->dspark->draft_tokens[d]);
+                if (matched) {
+                    ctx->dspark->accepted_tokens++;
+                }
+
+                if (true_next == m->tokenizer->eos_id) {
+                    stop_reason = MYDS_STOP_EOS;
+                    break;
+                }
+
+                size_t piece_len = 0;
+                const char *piece = myds_tokenizer_decode_bytes(m->tokenizer, true_next, &piece_len);
+                if (!piece) {
+                    stop_reason = MYDS_STOP_ERROR;
+                    success = 0;
+                    break;
+                }
+                if (bytes_cb) bytes_cb(piece, piece_len, true_next, user_data);
+                else if (cb) cb(piece, true_next, user_data);
+
+                cur_token = true_next;
+
+                if (!matched) {
+                    break;
+                }
+                if (step >= max_gen) break;
+            }
+            if (stop_reason == MYDS_STOP_EOS || stop_reason == MYDS_STOP_CANCELLED || !success) {
+                break;
+            }
+        }
+    } else {
+        for (uint32_t step = 0; step < max_gen; step++) {
+            if (cancel_flag && *cancel_flag) {
+                stop_reason = MYDS_STOP_CANCELLED;
+                break;
+            }
+            /* 记录「正在被喂入的这个 token」（位置 = ctx->pos）⇒ 缓存序列与状态一一对应，
+             * 而产出的 EOS 从未被喂入，所以不会被记进去。 */
+            if (ctx->pcache_tokens && ctx->pos < ctx->pcache_cap) {
+                ctx->pcache_tokens[ctx->pos] = cur_token;
+                if (ctx->pos + 1u > ctx->pcache_len) ctx->pcache_len = ctx->pos + 1u;
+            }
+            int32_t next_token = myds_forward_token(ctx, cur_token, ctx->pos);
+            if (next_token < 0 || (uint32_t)next_token >= m->tokenizer->vocab_size) {
+                /* 这一步没跑完 ⇒ 刚记下的那个 token 并未真正被消费（外部评审指出的盲区）。
+                 * 若留着它，下个请求会从一个状态从未到达的位置续跑 —— 直接撞位置检查。
+                 * 与 prefill 失败同理：整条缓存作废。 */
+                ctx->pcache_len = 0;
+                MYDS_LOG_E("Generation step %u failed", step);
+                stop_reason = MYDS_STOP_ERROR;
+                success = 0;
+                break;
+            }
+            ctx->pos++;
+
+            if (next_token == m->tokenizer->eos_id) {
+                stop_reason = MYDS_STOP_EOS;
+                break;
+            }
+
+            size_t piece_len = 0;
+            const char *piece = myds_tokenizer_decode_bytes(m->tokenizer, next_token, &piece_len);
+            if (!piece) {
+                stop_reason = MYDS_STOP_ERROR;
+                success = 0;
+                break;
+            }
+            if (bytes_cb) {
+                bytes_cb(piece, piece_len, next_token, user_data);
+            } else if (cb) {
+                cb(piece, next_token, user_data);
+            }
+
+            cur_token = next_token;
+            if (ctx->pos >= ctx->cfg.max_seq_len) {
+                stop_reason = MYDS_STOP_CTX_FULL;
+                break;
+            }
         }
     }
 

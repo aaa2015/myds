@@ -6,6 +6,7 @@
 #include "myds_v41_gpu.h"
 #include "myds_v41_moe.h"
 #include "myds_v41_decode.h"
+#include "myds_dspark.h"
 #include "myds_cpu.h"
 #include "myds_log.h"
 #include <math.h>
@@ -2835,6 +2836,9 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
         CHECK(myds_v41_moe(ctx,il,(uint32_t)token,pos));
         CHECK(myds_metal_v41_hc_expand(g->residual,ctx->ffn_out,g->after_attn,g->ffn_split,V41_DIM));
         TRACE("layer_out",g->residual,4*V41_DIM);
+        if (ctx->dspark && (il == 37 || il == 38 || il == 39)) {
+            myds_dspark_capture_layer(ctx->dspark, il, g->residual);
+        }
         if (decode_split && !trace_on && il + 1u < V41_LAYERS &&
             ((il + 1u) * (uint32_t)decode_split) / V41_LAYERS != (il * (uint32_t)decode_split) / V41_LAYERS) {
             CHECK(myds_metal_flush_batch());

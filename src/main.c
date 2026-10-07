@@ -1,6 +1,7 @@
 #include "myds.h"
 #include "myds_server.h"
 #include "myds_vjob.h"
+#include "myds_dspark.h"
 #include "myds_log.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,6 +22,8 @@ static void print_usage(const char *prog) {
     printf("  --host <host>           Host to listen on (default: 0.0.0.0)\n");
     printf("  --alias <name>          Model alias for API responses (default: myds)\n");
     printf("  --vision <file>         Vision encoder GGUF (enables image input; omit = text only)\n");
+    printf("  --dspark, --mtp-model <path>  DSpark support model GGUF for speculative decoding\n");
+    printf("  --dspark-draft <int>    Draft tokens per speculative cycle (default: 5)\n");
     printf("  -p, --prompt <string>   Prompt string (if omitted and no --port, starts interactive chat)\n");
     printf("  -n, --max-tokens <int>  Max tokens to generate (default: 256)\n");
     printf("  -c, --ctx, --ctx-size   Context window size (default: 4096)\n");
@@ -72,6 +75,8 @@ int main(int argc, char *argv[]) {
     const char *host = "0.0.0.0";
     const char *alias = "myds";
     const char *vision_path = NULL;
+    const char *dspark_path = NULL;
+    uint32_t dspark_draft = 0;
     int port = 0;
     bool print_tokens = false;
 
@@ -96,6 +101,10 @@ int main(int argc, char *argv[]) {
             alias = argv[++i];
         } else if (strcmp(argv[i], "--vision") == 0 && i + 1 < argc) {
             vision_path = argv[++i];
+        } else if ((strcmp(argv[i], "--dspark") == 0 || strcmp(argv[i], "--mtp-model") == 0) && i + 1 < argc) {
+            dspark_path = argv[++i];
+        } else if (strcmp(argv[i], "--dspark-draft") == 0 && i + 1 < argc) {
+            dspark_draft = (uint32_t)atoi(argv[++i]);
         } else if ((strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--prompt") == 0) && i + 1 < argc) {
             prompt = argv[++i];
         } else if (strcmp(argv[i], "--prompt-file") == 0 && i + 1 < argc) {
@@ -191,6 +200,17 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    if (dspark_path) {
+        ctx->dspark = myds_dspark_load(dspark_path, model->vocab_size);
+        if (!ctx->dspark) {
+            MYDS_LOG_E("Failed to load DSpark support model from %s", dspark_path);
+        } else {
+            if (dspark_draft > 0) ctx->dspark->block_size = dspark_draft;
+            MYDS_LOG_I("DSpark speculative decoding enabled: block_size=%u, stages=%u, markov_rank=%u",
+                       ctx->dspark->block_size, ctx->dspark->stage_count, ctx->dspark->markov_rank);
+        }
+    }
+
     if (port > 0) {
         /* HTTP Server Mode for Fleet deployment */
         int rc = myds_server_start(ctx, host, port, alias);
@@ -240,6 +260,16 @@ int main(int argc, char *argv[]) {
         printf("\n\n----------------------------------------------------\n");
         printf("load %.2f s | prefill %.2f s (prompt %u tok, TTFT %.2f s) | decode %u tok in %.2f s = %.2f t/s | wall %.2f s\n",
                load_sec, prefill_s, prompt_tokens, ttft_s, sctx.token_count, decode_s, decode_tps, wall_s);
+        if (ctx->dspark && ctx->dspark->proposed_tokens > 0) {
+            double acc_rate = 100.0 * (double)ctx->dspark->accepted_tokens / (double)ctx->dspark->proposed_tokens;
+            printf("DSpark speculative: cycles=%llu proposed=%llu accepted=%llu (%.2f%%) propose_time=%.2fms (avg %.2fms/cycle)\n",
+                   (unsigned long long)ctx->dspark->cycles,
+                   (unsigned long long)ctx->dspark->proposed_tokens,
+                   (unsigned long long)ctx->dspark->accepted_tokens,
+                   acc_rate,
+                   ctx->dspark->propose_ms,
+                   ctx->dspark->cycles > 0 ? ctx->dspark->propose_ms / (double)ctx->dspark->cycles : 0.0);
+        }
         printf("----------------------------------------------------\n");
         MYDS_LOG_I("Generation metrics: load %.2fs | prefill %.2fs (%u tok, TTFT %.2fs) | decode %u tok in %.2fs = %.2f t/s | wall %.2fs | stop_reason: %d",
                    load_sec, prefill_s, prompt_tokens, ttft_s, sctx.token_count, decode_s, decode_tps, wall_s, (int)stop_reason);
