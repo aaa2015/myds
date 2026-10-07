@@ -85,6 +85,10 @@ myds/
 
 ## 编译与测试
 
+最新 decode 软件与硬件优化路线见
+[2026-10-08 优化方案](docs/DECODE_OPTIMIZATION_PLAN_2026-10-08.md)，包含当前源码与生产观察、
+MoE 分支并行、DSpark 批量验证、长上下文 indexer 优化及统一验收协议。
+
 2026-10-05 的 Mac Studio 独占测试、逐 token 耗时和组件回放证据见
 [本轮实测汇总](docs/benchmarks/2026-10-05-optimization/final-summary.json)。
 测试关闭 profiler、内存前缀命中和 KV 磁盘命中，每组预热一次后正式运行三次。
