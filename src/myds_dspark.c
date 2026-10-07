@@ -61,6 +61,7 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
         gguf_close(gguf);
         return NULL;
     }
+    ds->gf = gguf;
 
     ds->stage_count = gguf_get_u32(gguf, "dspark.stage_count", 3);
     if (ds->stage_count > MYDS_DSPARK_MAX_STAGES) ds->stage_count = MYDS_DSPARK_MAX_STAGES;
@@ -193,8 +194,6 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
     ds->markov_state_host = calloc(ds->markov_rank, sizeof(float));
     ds->markov_bias_host = calloc(vocab_size, sizeof(float));
 
-    gguf_close(gguf);
-
     MYDS_LOG_I("dspark: loaded successfully from %s (stages=%u, block=%u, markov_rank=%u, routed_exp=%u/%u)",
                path, ds->stage_count, ds->block_size, ds->markov_rank,
                ds->num_experts_per_tok, ds->n_routed_experts);
@@ -255,6 +254,7 @@ void myds_dspark_free(myds_dspark_t *ds) {
     if (ds->markov_state_host) free(ds->markov_state_host);
     if (ds->markov_bias_host) free(ds->markov_bias_host);
 
+    if (ds->gf) gguf_close(ds->gf);
     free(ds);
 }
 

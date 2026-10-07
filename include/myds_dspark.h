@@ -55,6 +55,7 @@ typedef struct {
 } myds_dspark_stage_t;
 
 struct myds_dspark {
+    struct gguf_file *gf;
     uint32_t stage_count;
     uint32_t block_size;
     uint32_t markov_rank;
