@@ -1,6 +1,7 @@
 #include "myds_server.h"
 #include "myds_server_internal.h"
 #include "myds_internal.h"
+#include "myds_dspark.h"
 #include "myds_vjob.h"
 #include "myds_log.h"
 #include <stdio.h>
@@ -3067,6 +3068,9 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         pthread_mutex_lock(&g_infer_mutex);
         t_infer_slot_depth = 1;
         myds_config_t prev_cfg = myds_context_get_config(ctx);
+        uint64_t dspark_prop_before = ctx->dspark ? ctx->dspark->proposed_tokens : 0;
+        uint64_t dspark_acc_before  = ctx->dspark ? ctx->dspark->accepted_tokens : 0;
+        uint64_t dspark_cyc_before  = ctx->dspark ? ctx->dspark->cycles : 0;
 
         if (is_continuation && (!resp_id_is_live(prev_id) || myds_context_get_pcache_len(ctx) == 0)) {
             t_infer_slot_depth = 0;
@@ -3525,6 +3529,20 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                    is_responses_endpoint ? "Responses" : "ChatCompletions",
                    path, prompt_tokens, prefill_str, ttft_s,
                    final_tokens, decode_s, decode_tps, wall_s, final_finish_str);
+        if (ctx->dspark && ctx->dspark->proposed_tokens > dspark_prop_before) {
+            uint64_t req_prop = ctx->dspark->proposed_tokens - dspark_prop_before;
+            uint64_t req_acc  = ctx->dspark->accepted_tokens - dspark_acc_before;
+            uint64_t req_cyc  = ctx->dspark->cycles - dspark_cyc_before;
+            MYDS_LOG_I("[%s:%d] DSpark Speculative: proposed=%llu, accepted=%llu (%.1f%% accept rate, %.2f tok/cycle, cumulative: %llu/%llu = %.1f%%)",
+                       client_ip, client_port,
+                       (unsigned long long)req_prop,
+                       (unsigned long long)req_acc,
+                       req_prop > 0 ? (100.0 * (double)req_acc / (double)req_prop) : 0.0,
+                       (double)req_acc / (double)(req_cyc > 0 ? req_cyc : 1),
+                       (unsigned long long)ctx->dspark->accepted_tokens,
+                       (unsigned long long)ctx->dspark->proposed_tokens,
+                       ctx->dspark->proposed_tokens > 0 ? (100.0 * (double)ctx->dspark->accepted_tokens / (double)ctx->dspark->proposed_tokens) : 0.0);
+        }
 
 cleanup_infer:
         myds_context_clear_image_embeddings(ctx);
