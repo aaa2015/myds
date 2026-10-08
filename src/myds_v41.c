@@ -3210,12 +3210,23 @@ int myds_v41_forward_batch_spec(myds_context_t *ctx, const int32_t *tokens,
                                 uint32_t n_tokens, uint32_t pos,
                                 int32_t *out_tokens) {
     if (!ctx || !tokens || !out_tokens || n_tokens == 0) return -1;
-    for (uint32_t i = 0; i < n_tokens; i++) {
-        int32_t next = myds_v41_forward(ctx, tokens[i], pos + i, true);
-        if (next < 0) return -1;
-        out_tokens[i] = next;
+
+    // 1. 先前向第一个 token
+    int32_t next0 = myds_v41_forward(ctx, tokens[0], pos, true);
+    if (next0 < 0) return -1;
+    out_tokens[0] = next0;
+
+    // 投机早退保护（Speculative Short-Circuit Protection）：
+    // 若只有一个 token，或后续草稿与权威输出不符（未命中），绝不浪费一次全模型 32.6ms 前向！
+    if (n_tokens < 2 || next0 != tokens[1]) {
+        return 1;
     }
-    return (int)n_tokens;
+
+    // 2. 仅在第 1 个草稿完全命中时，才前向第 2 个 token
+    int32_t next1 = myds_v41_forward(ctx, tokens[1], pos + 1, true);
+    if (next1 < 0) return -1;
+    out_tokens[1] = next1;
+    return 2;
 }
 
 
