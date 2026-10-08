@@ -144,6 +144,82 @@ static void test_pld_eos_truncation(void) {
     puts("  [PASS] PLD EOS truncation");
 }
 
+/* 模拟模型在给定历史序列下的下一个 token 生成（确定性 oracle） */
+static int32_t mock_oracle_forward(const int32_t *tokens, uint32_t pos) {
+    if (pos == 0) return 100;
+    int32_t prev = tokens[pos - 1];
+    /* 如果前一个是 42，后面跟 43；如果是 43，跟 44；如果是 44，跟 45；如果是 45，跟 999 */
+    if (prev == 42) return 43;
+    if (prev == 43) return 44;
+    if (prev == 44) return 45;
+    if (prev == 45) return 999;
+    /* 默认模运算转移 */
+    return (prev * 31 + 7) % 1000;
+}
+
+static void test_pld_verification_parity(void) {
+    /* 场景：prompt 中有 [42, 43, 44, 45, 999] 的模式 */
+    const int32_t prompt[] = {
+        10, 20, 30, 42, 43, 44, 45, 999, 50, 60, 42
+    };
+    const uint32_t n_prompt = sizeof(prompt) / sizeof(prompt[0]);
+    const uint32_t max_new = 30;
+
+    /* 1. 标准自回归生成 */
+    int32_t seq_baseline[128];
+    memcpy(seq_baseline, prompt, sizeof(prompt));
+    uint32_t len_baseline = n_prompt;
+    for (uint32_t i = 0; i < max_new; i++) {
+        int32_t next = mock_oracle_forward(seq_baseline, len_baseline);
+        seq_baseline[len_baseline++] = next;
+    }
+
+    /* 2. PLD 投机验证生成 */
+    int32_t seq_pld[128];
+    memcpy(seq_pld, prompt, sizeof(prompt));
+    uint32_t len_pld = n_prompt;
+    uint32_t pld_step = 0;
+    uint32_t pld_accepted = 0;
+    uint32_t pld_cycles = 0;
+
+    myds_pld_config_t cfg = myds_pld_default_config(9999);
+    cfg.max_draft = 3;
+
+    while (pld_step < max_new) {
+        int32_t draft[8] = {0};
+        uint32_t n_draft = myds_pld_propose(seq_pld, len_pld, &cfg, draft);
+
+        if (n_draft == 0) {
+            int32_t next = mock_oracle_forward(seq_pld, len_pld);
+            seq_pld[len_pld++] = next;
+            pld_step++;
+            continue;
+        }
+
+        pld_cycles++;
+        for (uint32_t d = 0; d < n_draft && pld_step < max_new; d++) {
+            int32_t true_next = mock_oracle_forward(seq_pld, len_pld);
+            seq_pld[len_pld++] = true_next;
+            pld_step++;
+
+            if (true_next == draft[d]) {
+                pld_accepted++;
+            } else {
+                break; /* 猜测失败，终止本轮投机 */
+            }
+        }
+    }
+
+    /* 3. 严格逐位断言（Bit-Exact Parity） */
+    assert(len_pld == len_baseline);
+    assert(memcmp(seq_pld, seq_baseline, len_baseline * sizeof(int32_t)) == 0);
+    assert(pld_accepted > 0 && "PLD should have accepted matching tokens");
+    assert(pld_cycles > 0);
+
+    printf("  [PASS] PLD verification parity (memcmp == 0, accepted %u tokens across %u cycles)\n",
+           pld_accepted, pld_cycles);
+}
+
 int main(void) {
     printf("====================================================\n");
     printf("       Running myds Prompt-Lookup Decoding Tests    \n");
@@ -154,6 +230,7 @@ int main(void) {
     test_pld_adaptive_fallback();
     test_pld_recency_preference();
     test_pld_eos_truncation();
+    test_pld_verification_parity();
 
     printf("====================================================\n");
     printf("    ALL PLD TESTS PASSED CLEANLY & SUCCESSFULLY!    \n");

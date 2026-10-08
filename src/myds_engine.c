@@ -7,6 +7,7 @@
 #include "myds_log.h"
 #include "myds_cpu.h"
 #include "myds_dspark.h"
+#include "myds_pld.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -3267,12 +3268,31 @@ static int myds_generate_internal(myds_context_t *ctx,
     /* 低位区快照落盘（内容没变则不重写 ⇒ 稳态零写盘）。
      * 必须在这里：下一行 prompt_tokens 就释放了，而哈希与快照位置都要用到它。 */
     if (ctx->v41) (void)myds_v41_low_kv_save(ctx->v41, prompt_tokens, (uint32_t)n_prompt);
+    uint32_t max_gen = ctx->cfg.max_new_tokens;
+    static int pld_env = -1;
+    if (__builtin_expect(pld_env < 0, 0)) {
+        const char *e = getenv("MYDS_PLD");
+        pld_env = (e && atoi(e) != 0) ? 1 : 0;
+    }
+    const bool pld_enabled = (pld_env != 0 && ctx->dspark == NULL);
+
+    int32_t *pld_history = NULL;
+    uint32_t pld_len = 0;
+    uint32_t pld_cap = 0;
+    if (pld_enabled && prompt_tokens && n_prompt > 0) {
+        pld_cap = (uint32_t)n_prompt + max_gen + 16u;
+        pld_history = (int32_t *)malloc(pld_cap * sizeof(int32_t));
+        if (pld_history) {
+            memcpy(pld_history, prompt_tokens, n_prompt * sizeof(int32_t));
+            pld_len = (uint32_t)n_prompt;
+        }
+    }
+
     cur_token = prompt_tokens[n_prompt - 1];
     free(prompt_tokens);
 
     /* 3. Decode phase */
     myds_stop_reason_t stop_reason = MYDS_STOP_LENGTH;
-    uint32_t max_gen = ctx->cfg.max_new_tokens;
     int success = 1;
 
     if (ctx->dspark) {
@@ -3452,6 +3472,144 @@ static int myds_generate_internal(myds_context_t *ctx,
                 break;
             }
         }
+    } else if (pld_enabled && pld_history) {
+        myds_v41_spec_snapshot_t *pld_snap = (myds_v41_spec_snapshot_t *)calloc(1, sizeof(myds_v41_spec_snapshot_t));
+        uint32_t step = 0;
+        uint64_t pld_cycles = 0;
+        uint64_t pld_proposed = 0;
+        uint64_t pld_accepted = 0;
+
+        while (step < max_gen) {
+            if (cancel_flag && *cancel_flag) {
+                stop_reason = MYDS_STOP_CANCELLED;
+                break;
+            }
+            if (ctx->pos >= ctx->cfg.max_seq_len) {
+                stop_reason = MYDS_STOP_CTX_FULL;
+                break;
+            }
+
+            int32_t draft_tokens[MYDS_PLD_DEFAULT_MAX_DRAFT];
+            myds_pld_config_t pld_cfg = myds_pld_default_config(m->tokenizer->eos_id);
+            if (pld_cfg.max_draft > max_gen - step) pld_cfg.max_draft = max_gen - step;
+            uint32_t n_draft = 0;
+            if (pld_len >= 2) {
+                n_draft = myds_pld_propose(pld_history, pld_len, &pld_cfg, draft_tokens);
+            }
+
+            if (n_draft == 0) {
+                if (ctx->pcache_tokens && ctx->pos < ctx->pcache_cap) {
+                    ctx->pcache_tokens[ctx->pos] = cur_token;
+                    if (ctx->pos + 1u > ctx->pcache_len) ctx->pcache_len = ctx->pos + 1u;
+                }
+                int32_t next_token = myds_forward_token(ctx, cur_token, ctx->pos);
+                if (next_token < 0 || (uint32_t)next_token >= m->tokenizer->vocab_size) {
+                    ctx->pcache_len = 0;
+                    MYDS_LOG_E("Generation step %u failed", step);
+                    stop_reason = MYDS_STOP_ERROR;
+                    success = 0;
+                    break;
+                }
+                ctx->pos++;
+                step++;
+                if (pld_len < pld_cap) pld_history[pld_len++] = next_token;
+
+                if (next_token == m->tokenizer->eos_id) {
+                    stop_reason = MYDS_STOP_EOS;
+                    break;
+                }
+
+                size_t piece_len = 0;
+                const char *piece = myds_tokenizer_decode_bytes(m->tokenizer, next_token, &piece_len);
+                if (!piece) {
+                    stop_reason = MYDS_STOP_ERROR;
+                    success = 0;
+                    break;
+                }
+                if (bytes_cb) bytes_cb(piece, piece_len, next_token, user_data);
+                else if (cb) cb(piece, next_token, user_data);
+
+                cur_token = next_token;
+                continue;
+            }
+
+            pld_cycles++;
+            pld_proposed += n_draft;
+
+            bool snap_saved = false;
+            if (pld_snap && ctx->v41) {
+                memset(pld_snap, 0, sizeof(*pld_snap));
+                snap_saved = myds_v41_spec_snapshot_save(ctx, pld_snap, n_draft + 1);
+            }
+
+            for (uint32_t d = 0; d < n_draft; d++) {
+                if (cancel_flag && *cancel_flag) {
+                    stop_reason = MYDS_STOP_CANCELLED;
+                    if (snap_saved && d == 0) myds_v41_spec_snapshot_restore(ctx, pld_snap);
+                    break;
+                }
+                if (ctx->pos >= ctx->cfg.max_seq_len) {
+                    stop_reason = MYDS_STOP_CTX_FULL;
+                    break;
+                }
+                if (ctx->pcache_tokens && ctx->pos < ctx->pcache_cap) {
+                    ctx->pcache_tokens[ctx->pos] = cur_token;
+                    if (ctx->pos + 1u > ctx->pcache_len) ctx->pcache_len = ctx->pos + 1u;
+                }
+
+                int32_t true_next = myds_forward_token(ctx, cur_token, ctx->pos);
+                if (true_next < 0 || (uint32_t)true_next >= m->tokenizer->vocab_size) {
+                    if (snap_saved) myds_v41_spec_snapshot_restore(ctx, pld_snap);
+                    ctx->pcache_len = 0;
+                    stop_reason = MYDS_STOP_ERROR;
+                    success = 0;
+                    break;
+                }
+                ctx->pos++;
+                step++;
+                if (pld_len < pld_cap) pld_history[pld_len++] = true_next;
+
+                bool matched = (true_next == draft_tokens[d]);
+                if (matched) {
+                    pld_accepted++;
+                }
+
+                if (true_next == m->tokenizer->eos_id) {
+                    stop_reason = MYDS_STOP_EOS;
+                    break;
+                }
+
+                size_t piece_len = 0;
+                const char *piece = myds_tokenizer_decode_bytes(m->tokenizer, true_next, &piece_len);
+                if (!piece) {
+                    if (snap_saved) myds_v41_spec_snapshot_restore(ctx, pld_snap);
+                    stop_reason = MYDS_STOP_ERROR;
+                    success = 0;
+                    break;
+                }
+                if (bytes_cb) bytes_cb(piece, piece_len, true_next, user_data);
+                else if (cb) cb(piece, true_next, user_data);
+
+                cur_token = true_next;
+                if (!matched) {
+                    break;
+                }
+                if (step >= max_gen) break;
+            }
+
+            if (stop_reason == MYDS_STOP_EOS || stop_reason == MYDS_STOP_CANCELLED || !success) {
+                break;
+            }
+        }
+
+        if (pld_cycles > 0) {
+            MYDS_LOG_I("PLD speculative: %llu cycles, %llu/%llu tokens accepted (%.1f%%)",
+                       (unsigned long long)pld_cycles,
+                       (unsigned long long)pld_accepted,
+                       (unsigned long long)pld_proposed,
+                       pld_proposed ? 100.0 * (double)pld_accepted / (double)pld_proposed : 0.0);
+        }
+        if (pld_snap) free(pld_snap);
     } else {
         for (uint32_t step = 0; step < max_gen; step++) {
             if (cancel_flag && *cancel_flag) {
@@ -3503,6 +3661,7 @@ static int myds_generate_internal(myds_context_t *ctx,
         }
     }
 
+    if (pld_history) free(pld_history);
     if (out_reason) *out_reason = stop_reason;
     return success;
 }
