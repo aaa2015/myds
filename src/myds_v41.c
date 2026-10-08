@@ -2856,6 +2856,11 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
         const char *env = getenv("MYDS_FUSE_HC_SUM_RMSNORM");
         fuse_hc_norm_enabled = (env == NULL || atoi(env) != 0);
     }
+    static int qkv_pipeline_enabled = -1;
+    if (qkv_pipeline_enabled < 0) {
+        const char *env = getenv("MYDS_QKV_PIPELINE");
+        qkv_pipeline_enabled = (env == NULL || atoi(env) != 0);
+    }
     CHECK(myds_metal_begin_batch());
     for (il=0;il<V41_LAYERS;il++) {
         const myds_layer_t *base=&m->layers[il];
@@ -2881,29 +2886,56 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
         TRACE("hc_attn_input",ctx->x,V41_DIM);
         TRACE("attn_norm",ctx->x_norm,V41_DIM);
         phase="attention projections";
-        CHECK(project_decode_qkv(ctx->qr,base->attn_q_a,ctx->x_norm,1280,V41_DIM,base->attn_q_a_type,trace_on));
-        TRACE("q_a_raw",ctx->qr,1280);
-        CHECK(myds_metal_v41_rmsnorm(ctx->qr_norm,ctx->qr,base->attn_q_a_norm,1280,m->norm_eps,true));
-        TRACE("q_a_norm",ctx->qr_norm,1280);
-        CHECK(project_decode_qkv(ctx->q,base->attn_q_b,ctx->qr_norm,V41_HEADS*512,1280,base->attn_q_b_type,trace_on));
-        TRACE("q_b",ctx->q,V41_HEADS*512);
-        CHECK(project_decode_qkv(ctx->kv_act,base->attn_kv,ctx->x_norm,512,V41_DIM,base->attn_kv_type,trace_on));
-        TRACE("kv_raw",ctx->kv_act,512);
-        CHECK(myds_metal_v41_rmsnorm(ctx->kv_act,ctx->kv_act,base->attn_kv_a_norm,512,m->norm_eps,true));
-        TRACE("kv_norm",ctx->kv_act,512);
-        static int qkv_post_enabled=-1;
-        if(!trace_on&&qkv_fusion_enabled("MYDS_QKV_FUSE_POST",&qkv_post_enabled)) {
-            CHECK(myds_v41_gpu_qkv_finish(ctx->q,ctx->kv_act,g->window[il],pos,compressed));
+        if (!trace_on && qkv_pipeline_enabled) {
+            /* 优化流水排布：
+             * 1. 连续派发 q_a 与 kv，最大化 ctx->x_norm 的 L2 缓存命中与 GPU 双发射潜力
+             * 2. 连续派发 q_a_norm 与 kv_norm
+             * 3. 在 qr_norm 就绪后立即派发 indexer (publish_and_select)
+             * 4. 派发大 GEMV q_b，其执行窗口充分掩盖 indexer 的 Top-K 排序时延
+             * 5. qkv_finish 紧随其后，衔接 attention reduction，消除流水线气泡
+             */
+            CHECK(project_decode_qkv(ctx->qr,base->attn_q_a,ctx->x_norm,1280,V41_DIM,base->attn_q_a_type,false));
+            CHECK(project_decode_qkv(ctx->kv_act,base->attn_kv,ctx->x_norm,512,V41_DIM,base->attn_kv_type,false));
+            CHECK(myds_metal_v41_rmsnorm(ctx->qr_norm,ctx->qr,base->attn_q_a_norm,1280,m->norm_eps,true));
+            CHECK(myds_metal_v41_rmsnorm(ctx->kv_act,ctx->kv_act,base->attn_kv_a_norm,512,m->norm_eps,true));
+            phase="compressed KV / indexer";
+            CHECK(publish_and_select(ctx,il,pos,ctx->x_norm,ctx->qr_norm,NULL,NULL,NULL,NULL,NULL,NULL,NULL));
+            phase="attention projections";
+            CHECK(project_decode_qkv(ctx->q,base->attn_q_b,ctx->qr_norm,V41_HEADS*512,1280,base->attn_q_b_type,false));
+            static int qkv_post_enabled=-1;
+            if(qkv_fusion_enabled("MYDS_QKV_FUSE_POST",&qkv_post_enabled)) {
+                CHECK(myds_v41_gpu_qkv_finish(ctx->q,ctx->kv_act,g->window[il],pos,compressed));
+            } else {
+                CHECK(myds_v41_gpu_rope(ctx->q,512,V41_HEADS,pos,compressed,false));
+                CHECK(myds_v41_gpu_rope(ctx->kv_act,512,1,pos,compressed,false));
+                CHECK(myds_v41_gpu_quant(ctx->kv_act,512,1,1));
+                CHECK(myds_metal_buffer_copy(g->window[il],(size_t)(pos%128)*512*4u,ctx->kv_act,0,512*4u));
+            }
         } else {
-            CHECK(myds_v41_gpu_rope(ctx->q,512,V41_HEADS,pos,compressed,false));
-            CHECK(myds_v41_gpu_rope(ctx->kv_act,512,1,pos,compressed,false));
-            TRACE("kv_rope",ctx->kv_act,512); TRACE("q_rope",ctx->q,V41_HEADS*512);
-            CHECK(myds_v41_gpu_quant(ctx->kv_act,512,1,1));
-            TRACE("kv_quant",ctx->kv_act,512);
-            CHECK(myds_metal_buffer_copy(g->window[il],(size_t)(pos%128)*512*4u,ctx->kv_act,0,512*4u));
+            CHECK(project_decode_qkv(ctx->qr,base->attn_q_a,ctx->x_norm,1280,V41_DIM,base->attn_q_a_type,trace_on));
+            TRACE("q_a_raw",ctx->qr,1280);
+            CHECK(myds_metal_v41_rmsnorm(ctx->qr_norm,ctx->qr,base->attn_q_a_norm,1280,m->norm_eps,true));
+            TRACE("q_a_norm",ctx->qr_norm,1280);
+            CHECK(project_decode_qkv(ctx->q,base->attn_q_b,ctx->qr_norm,V41_HEADS*512,1280,base->attn_q_b_type,trace_on));
+            TRACE("q_b",ctx->q,V41_HEADS*512);
+            CHECK(project_decode_qkv(ctx->kv_act,base->attn_kv,ctx->x_norm,512,V41_DIM,base->attn_kv_type,trace_on));
+            TRACE("kv_raw",ctx->kv_act,512);
+            CHECK(myds_metal_v41_rmsnorm(ctx->kv_act,ctx->kv_act,base->attn_kv_a_norm,512,m->norm_eps,true));
+            TRACE("kv_norm",ctx->kv_act,512);
+            static int qkv_post_enabled=-1;
+            if(!trace_on&&qkv_fusion_enabled("MYDS_QKV_FUSE_POST",&qkv_post_enabled)) {
+                CHECK(myds_v41_gpu_qkv_finish(ctx->q,ctx->kv_act,g->window[il],pos,compressed));
+            } else {
+                CHECK(myds_v41_gpu_rope(ctx->q,512,V41_HEADS,pos,compressed,false));
+                CHECK(myds_v41_gpu_rope(ctx->kv_act,512,1,pos,compressed,false));
+                TRACE("kv_rope",ctx->kv_act,512); TRACE("q_rope",ctx->q,V41_HEADS*512);
+                CHECK(myds_v41_gpu_quant(ctx->kv_act,512,1,1));
+                TRACE("kv_quant",ctx->kv_act,512);
+                CHECK(myds_metal_buffer_copy(g->window[il],(size_t)(pos%128)*512*4u,ctx->kv_act,0,512*4u));
+            }
+            phase="compressed KV / indexer";
+            CHECK(publish_and_select(ctx,il,pos,ctx->x_norm,ctx->qr_norm,NULL,NULL,NULL,NULL,NULL,NULL,NULL));
         }
-        phase="compressed KV / indexer";
-        CHECK(publish_and_select(ctx,il,pos,ctx->x_norm,ctx->qr_norm,NULL,NULL,NULL,NULL,NULL,NULL,NULL));
         uint32_t count=compressed?(pos+1u)/ratio_for(il):0;
         uint32_t top=count<V41_TOPK?count:V41_TOPK;
         uint32_t nraw=pos+1u<128?pos+1u:128;
