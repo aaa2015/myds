@@ -3385,6 +3385,151 @@ static int myds_generate_internal(myds_context_t *ctx,
             }
 
             uint32_t accepted_in_cycle = 0;
+
+            if (ctx->v41 && snap && n_draft >= 1 && (ctx->pos + 2 <= ctx->cfg.max_seq_len)) {
+                ctx->dspark->cycles++;
+                ctx->dspark->proposed_tokens += 1;
+
+                memset(snap, 0, sizeof(*snap));
+                snap_saved = myds_v41_spec_snapshot_save(ctx, snap, 2);
+
+                if (cancel_flag && *cancel_flag) {
+                    stop_reason = MYDS_STOP_CANCELLED;
+                    break;
+                }
+
+                if (ctx->pcache_tokens && ctx->pos < ctx->pcache_cap) {
+                    ctx->pcache_tokens[ctx->pos] = cur_token;
+                    if (ctx->pos + 1u > ctx->pcache_len) ctx->pcache_len = ctx->pos + 1u;
+                }
+
+                int32_t tokens_to_forward[2] = { cur_token, ctx->dspark->draft_tokens[0] };
+                int32_t out_tokens[2] = { 0, 0 };
+
+                int ret = myds_v41_forward_batch_spec(ctx, tokens_to_forward, 2, ctx->pos, out_tokens);
+                if (ret < 0 || out_tokens[0] < 0 || (uint32_t)out_tokens[0] >= m->tokenizer->vocab_size) {
+                    if (snap_saved) myds_v41_spec_snapshot_restore(ctx, snap);
+                    ctx->pcache_len = 0;
+                    stop_reason = MYDS_STOP_ERROR;
+                    success = 0;
+                    break;
+                }
+
+                bool matched = (out_tokens[0] == ctx->dspark->draft_tokens[0]);
+                if (matched) {
+                    ctx->dspark->accepted_tokens++;
+                    accepted_in_cycle++;
+
+                    // 1. 采纳第 1 个 Token
+                    size_t piece_len0 = 0;
+                    const char *piece0 = myds_tokenizer_decode_bytes(m->tokenizer, out_tokens[0], &piece_len0);
+                    if (!piece0) {
+                        if (snap_saved) myds_v41_spec_snapshot_restore(ctx, snap);
+                        stop_reason = MYDS_STOP_ERROR;
+                        success = 0;
+                        break;
+                    }
+                    if (bytes_cb) bytes_cb(piece0, piece_len0, out_tokens[0], user_data);
+                    else if (cb) cb(piece0, out_tokens[0], user_data);
+
+                    step++;
+
+                    if (out_tokens[0] == m->tokenizer->eos_id) {
+                        if (snap_saved) myds_v41_spec_snapshot_restore_partial(ctx, snap, 1);
+                        else ctx->pos++;
+                        stop_reason = MYDS_STOP_EOS;
+                        break;
+                    }
+
+                    if (step >= max_gen) {
+                        if (snap_saved) myds_v41_spec_snapshot_restore_partial(ctx, snap, 1);
+                        else ctx->pos++;
+                        break;
+                    }
+
+                    // 2. 采纳第 2 个 Token (权威模型在真值 draft_tokens[0] 上推理出的真实输出)
+                    if (out_tokens[1] < 0 || (uint32_t)out_tokens[1] >= m->tokenizer->vocab_size) {
+                        if (snap_saved) myds_v41_spec_snapshot_restore_partial(ctx, snap, 1);
+                        else ctx->pos++;
+                        stop_reason = MYDS_STOP_ERROR;
+                        success = 0;
+                        break;
+                    }
+
+                    if (ctx->pcache_tokens && (ctx->pos + 1) < ctx->pcache_cap) {
+                        ctx->pcache_tokens[ctx->pos + 1] = out_tokens[0];
+                        if (ctx->pos + 2u > ctx->pcache_len) ctx->pcache_len = ctx->pos + 2u;
+                    }
+
+                    size_t piece_len1 = 0;
+                    const char *piece1 = myds_tokenizer_decode_bytes(m->tokenizer, out_tokens[1], &piece_len1);
+                    if (!piece1) {
+                        if (snap_saved) myds_v41_spec_snapshot_restore_partial(ctx, snap, 1);
+                        else ctx->pos++;
+                        stop_reason = MYDS_STOP_ERROR;
+                        success = 0;
+                        break;
+                    }
+                    if (bytes_cb) bytes_cb(piece1, piece_len1, out_tokens[1], user_data);
+                    else if (cb) cb(piece1, out_tokens[1], user_data);
+
+                    ctx->pos += 2;
+                    step++;
+                    cur_token = out_tokens[1];
+
+                    if (out_tokens[1] == m->tokenizer->eos_id) {
+                        stop_reason = MYDS_STOP_EOS;
+                        break;
+                    }
+                } else {
+                    // 第 1 个草稿未命中！早退保护生效，保留第 1 个真值
+                    if (snap_saved) {
+                        myds_v41_spec_snapshot_restore_partial(ctx, snap, 1);
+                    } else {
+                        ctx->pos++;
+                    }
+
+                    size_t piece_len = 0;
+                    const char *piece = myds_tokenizer_decode_bytes(m->tokenizer, out_tokens[0], &piece_len);
+                    if (!piece) {
+                        stop_reason = MYDS_STOP_ERROR;
+                        success = 0;
+                        break;
+                    }
+                    if (bytes_cb) bytes_cb(piece, piece_len, out_tokens[0], user_data);
+                    else if (cb) cb(piece, out_tokens[0], user_data);
+
+                    step++;
+                    cur_token = out_tokens[0];
+
+                    if (out_tokens[0] == m->tokenizer->eos_id) {
+                        stop_reason = MYDS_STOP_EOS;
+                        break;
+                    }
+                }
+
+                gettimeofday(&tv_ver1, NULL);
+                ctx->dspark->verify_ms += (double)(tv_ver1.tv_sec - tv_ver0.tv_sec) * 1000.0 +
+                                          (double)(tv_ver1.tv_usec - tv_ver0.tv_usec) / 1000.0;
+
+                if (accepted_in_cycle == 0) {
+                    ctx->dspark->consecutive_misses++;
+                    if (ctx->dspark->consecutive_misses >= 4) {
+                        ctx->dspark->backoff_counter = 8;
+                    } else if (ctx->dspark->consecutive_misses >= 2) {
+                        ctx->dspark->backoff_counter = 4;
+                    }
+                } else {
+                    ctx->dspark->consecutive_misses = 0;
+                    ctx->dspark->backoff_counter = 0;
+                }
+
+                if (stop_reason == MYDS_STOP_EOS || stop_reason == MYDS_STOP_CANCELLED || !success || step >= max_gen) {
+                    break;
+                }
+                continue;
+            }
+
             for (uint32_t d = 0; d < n_draft; d++) {
                 if (cancel_flag && *cancel_flag) {
                     stop_reason = MYDS_STOP_CANCELLED;

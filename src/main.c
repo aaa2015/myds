@@ -205,6 +205,18 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    if (!dspark_path) {
+        const char *dsp_env = getenv("MYDS_DSPARK");
+        if (!dsp_env) dsp_env = getenv("DS4_DSPARK");
+        if (dsp_env && atoi(dsp_env) != 0) {
+            const char *dsp_file = getenv("MYDS_DSPARK_FILE");
+            if (!dsp_file) dsp_file = getenv("DS4_DSPARK_FILE");
+            if (dsp_file && access(dsp_file, R_OK) == 0) {
+                dspark_path = dsp_file;
+            }
+        }
+    }
+
     if (dspark_path) {
         ctx->dspark = myds_dspark_load(dspark_path, model->vocab_size);
         if (!ctx->dspark) {
