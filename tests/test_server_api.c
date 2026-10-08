@@ -164,6 +164,7 @@ static void test_stream_and_non_stream_bytes(void) {
         assert(stream.t_first > 0 && stream.t_last >= stream.t_first);
         assert(myds_server_sse_writer_join(&stream, false));
         assert(shutdown(sockets[0], SHUT_WR) == 0);
+        close(sockets[0]);
         assert(pthread_join(reader, NULL) == 0);
         /* Validate the wire including JSON punctuation between events. A
          * code point split across SSE events would fail here even if joining
@@ -184,7 +185,6 @@ static void test_stream_and_non_stream_bytes(void) {
             free(capture.bytes);
         }
         free(stream.acc);
-        close(sockets[0]);
         close(sockets[1]);
     }
     free(wire_reference[0]); free(wire_reference[1]);
@@ -670,6 +670,7 @@ static void test_deepseek41_stream_tool_calls(void) {
     assert(!stream.cancel_flag && !stream.failed);
     assert(myds_server_sse_writer_join(&stream, false));
     assert(shutdown(sockets[0], SHUT_WR) == 0);
+    close(sockets[0]);
     assert(pthread_join(reader, NULL) == 0);
     size_t clen = 0;
     char *collected = collect_sse_escaped_text(capture.bytes, 0, &clen);
@@ -679,7 +680,6 @@ static void test_deepseek41_stream_tool_calls(void) {
     assert(clen == 0);
     free(collected);
     free(capture.bytes);
-    close(sockets[0]);
     close(sockets[1]);
     printf("  [PASS] V4.1 streaming DSML: the call block is withheld from content, including the newlines before it\n");
 }
@@ -805,11 +805,12 @@ static void test_tool_call_event_json(void) {
     assert(sse_emit_chat_tool_calls(&st1, tc, n));
     assert(myds_server_sse_writer_join(&st1, false));
     assert(shutdown(s1[0], SHUT_WR) == 0);
+    close(s1[0]);
     assert(pthread_join(r1, NULL) == 0);
     assert_sse_data_lines_valid(c1.bytes);
     assert(strstr(c1.bytes, "finish_reason\":\"tool_calls\"") != NULL);
     assert(strstr(c1.bytes, "\\\"city\\\"") != NULL);        /* 引号必须是转义后的 */
-    free(c1.bytes); close(s1[0]); close(s1[1]);
+    free(c1.bytes); close(s1[1]);
 
     /* Responses 流式 */
     int s2[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, s2) == 0);
@@ -820,10 +821,11 @@ static void test_tool_call_event_json(void) {
     assert(sse_emit_responses_function_calls(&st2, tc, n));
     assert(myds_server_sse_writer_join(&st2, false));
     assert(shutdown(s2[0], SHUT_WR) == 0);
+    close(s2[0]);
     assert(pthread_join(r2, NULL) == 0);
     assert_sse_data_lines_valid(c2.bytes);
     assert(strstr(c2.bytes, "\\\"city\\\"") != NULL);
-    free(c2.bytes); close(s2[0]); close(s2[1]);
+    free(c2.bytes); close(s2[1]);
 
     myds_free_tool_calls(tc, n);
     printf("  [PASS] tool call events are valid JSON in both protocols (arguments escaped)\n");
@@ -857,6 +859,7 @@ static void test_responses_finish_carries_the_aggregate_text(void) {
                                      text, tlen, items, 1));
     assert(myds_server_sse_writer_join(&st, false));
     assert(shutdown(s[0], SHUT_WR) == 0);
+    close(s[0]);
     assert(pthread_join(r, NULL) == 0);
 
     assert_sse_data_lines_valid(c.bytes);
@@ -872,7 +875,7 @@ static void test_responses_finish_carries_the_aggregate_text(void) {
      * 此前三个事件里是 text":"" ⇒ 这里只会命中 1 次（output 那次还没有，即 0 次）。 */
     assert(count_occurrences(c.bytes, text) == 4);
 
-    free(c.bytes); close(s[0]); close(s[1]); free(items);
+    free(c.bytes); close(s[1]); free(items);
 
     /* 工具调用那类：不发文本事件，但仍要有 response.completed 且 output 是 function_call */
     myds_tool_call_t tc = {.id = "call_1", .name = "get_weather",
@@ -887,13 +890,14 @@ static void test_responses_finish_carries_the_aggregate_text(void) {
     assert(sse_emit_responses_finish(&st2, "test-model", "resp_test_2", 10, 3, "", 0, titems, 0));
     assert(myds_server_sse_writer_join(&st2, false));
     assert(shutdown(s2[0], SHUT_WR) == 0);
+    close(s2[0]);
     assert(pthread_join(r2, NULL) == 0);
     assert_sse_data_lines_valid(c2.bytes);
     assert(strstr(c2.bytes, "event: response.completed") != NULL);
     assert(strstr(c2.bytes, "\"type\":\"function_call\"") != NULL);
     /* 工具调用不该发 message 类的文本事件（那会误导客户端去读一个空消息） */
     assert(strstr(c2.bytes, "response.content_part.done") == NULL);
-    free(c2.bytes); close(s2[0]); close(s2[1]); free(titems);
+    free(c2.bytes); close(s2[1]); free(titems);
 
     printf("  [PASS] finish events carry the aggregate text in all four places\n");
 }
@@ -1152,6 +1156,7 @@ static void test_thinking_mode(void) {
         assert(myds_server_sse_finish(&st));
         assert(myds_server_sse_writer_join(&st, false));
         assert(shutdown(s[0], SHUT_WR) == 0);
+        close(s[0]);
         assert(pthread_join(r, NULL) == 0);
 
         assert_sse_data_lines_valid(c.bytes);
@@ -1160,7 +1165,7 @@ static void test_thinking_mode(void) {
         assert(strstr(c.bytes, "\"content\":\"Hello world\"") != NULL);
         assert(strstr(c.bytes, "</think>") == NULL);
 
-        free(c.bytes); close(s[0]); close(s[1]); free(st.acc);
+        free(c.bytes); close(s[1]); free(st.acc);
     }
 
     /* 7. Responses API streaming lifecycle in thinking mode */
@@ -1197,6 +1202,7 @@ static void test_thinking_mode(void) {
 
         assert(myds_server_sse_writer_join(&st, false));
         assert(shutdown(s[0], SHUT_WR) == 0);
+        close(s[0]);
         assert(pthread_join(r, NULL) == 0);
 
         assert_sse_data_lines_valid(c.bytes);
@@ -1207,7 +1213,7 @@ static void test_thinking_mode(void) {
         assert(strstr(c.bytes, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":1") != NULL);
         assert(strstr(c.bytes, "event: response.output_text.done\ndata: {\"type\":\"response.output_text.done\",\"output_index\":1") != NULL);
 
-        free(c.bytes); close(s[0]); close(s[1]); free(st.acc);
+        free(c.bytes); close(s[1]); free(st.acc);
     }
 
     printf("  [PASS] thinking mode (CoT/Reasoning) prompt formatting, request parsing, streaming deltas & Responses API lifecycle\n");

@@ -85,7 +85,9 @@ static void deeper_corrupt(const char *path, uint32_t slot, uint64_t payload_byt
     assert(slot < slots && payload_byte < stride);
     const off_t off = (off_t)(base + (uint64_t)slot * stride + payload_byte);
     unsigned char b; assert(pread(fd, &b, 1, off) == 1); b ^= 0x80u;
-    assert(pwrite(fd, &b, 1, off) == 1); assert(close(fd) == 0);
+    assert(pwrite(fd, &b, 1, off) == 1);
+    (void)fsync(fd);
+    assert(close(fd) == 0);
 }
 
 static void test_deeper_probe_and_success(const char *path) {

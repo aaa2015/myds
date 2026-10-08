@@ -2196,6 +2196,9 @@ static bool sse_writer_send_packet(myds_sse_writer_t *w, const sse_packet_t *pac
 }
 
 static void *sse_writer_thread(void *opaque) {
+#if defined(__APPLE__)
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
     myds_sse_writer_t *w = opaque;
     for (;;) {
         pthread_mutex_lock(&w->lock);
