@@ -510,9 +510,9 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
                     ds->propose_ms += (now_ms() - t0);
                     return 0;
                 }
-                ds->is_high_confidence = (conf_prob >= 0.72f || (best_score - best_score2) >= 1.50f);
+                ds->is_high_confidence = (conf_prob >= 0.80f || (best_score - best_score2) >= 2.00f);
             } else {
-                ds->is_high_confidence = ((best_score - best_score2) >= 1.50f);
+                ds->is_high_confidence = ((best_score - best_score2) >= 2.00f);
             }
         }
 
