@@ -2940,7 +2940,7 @@ int myds_metal_routed_moe_batch(
         !scratch_mid || !scratch_down || n_tok == 0) {
         return 0;
     }
-    if (n_activated_experts != 6) {
+    if (n_activated_experts != 6 && n_activated_experts != 3) {
         return 0;
     }
     if (!g_pso_moe_mv_id_iq2_xxs || !g_pso_moe_mv_id_q2_k ||
