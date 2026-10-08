@@ -2044,13 +2044,15 @@ static void test_p1_attn_direct_pack_fusion(void) {
         memset(myds_metal_buffer_data(heads_unfused), 0, heads_floats * sizeof(float));
         memset(myds_metal_buffer_data(heads_fused), 0, heads_floats * sizeof(float));
 
-        // 1. Unfused path
+        // 1. Unfused path with packed reduce disabled (2-kernel path: head-first vec + reduce)
+        setenv("MYDS_ATTN_PACKED_REDUCE", "0", 1);
         if (sel) {
             assert(myds_v41_gpu_gather_bf16(selected_kv, comp_kv, selected_ids, source_rows, sel));
         }
         assert(myds_v41_gpu_attention(heads_unfused, sinks, q, window, n_raw, raw_start, selected_kv, sel, s));
 
-        // 2. Fused direct path
+        // 2. Fused direct path with packed reduce enabled (1-kernel in-threadgroup packed reduce)
+        setenv("MYDS_ATTN_PACKED_REDUCE", "1", 1);
         assert(myds_v41_gpu_attention_direct(heads_fused, sinks, q, window, n_raw, raw_start,
                                              sel ? comp_kv : NULL,
                                              sel ? selected_ids : NULL,
@@ -2074,6 +2076,8 @@ static void test_p1_attn_direct_pack_fusion(void) {
         }
         assert(nonzero > 0);
     }
+    printf("  [PASS] Attention decode: 2-kernel (head-first vec + reduce) vs 1-kernel fused packed8 reduce bit-exact across %zu configs (memcmp == 0)\n",
+           sizeof(test_configs)/sizeof(test_configs[0]));
 
     myds_metal_buffer_free(heads_unfused);
     myds_metal_buffer_free(heads_fused);

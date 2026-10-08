@@ -922,6 +922,12 @@ int myds_v41_gpu_attention_chunk_bf16(myds_metal_buffer_t *heads,const myds_meta
                            base_pos,c_start,ratio,s,true);
 }
 
+static inline int get_attn_packed_reduce_mode(void) {
+    const char *v = getenv("MYDS_ATTN_PACKED_REDUCE");
+    if (!v) return 1;
+    return (strcmp(v, "0") == 0) ? 0 : 1;
+}
+
 int myds_v41_gpu_attention(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *window,uint32_t n_raw,
     uint32_t raw_start,const myds_metal_buffer_t *selected_kv,uint32_t selected_rows,myds_v41_gpu_scratch_t *s) {
@@ -947,6 +953,13 @@ int myds_v41_gpu_attention(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
     const myds_metal_buffer_t *b[]={q,s->kv_f16,s->kv_f16,s->mask,sinks,s->pad,s->partial};
     const myds_metal_constant_t c[]={{400,true,1},{401,true,1},{402,true,0},{403,true,0},{404,true,keys%32!=0},
         {405,true,0},{420,false,512},{421,false,512},{422,false,1},{423,false,32}};
+    if (get_attn_packed_reduce_mode() && keys <= 1024) {
+        const myds_metal_buffer_t *pb[] = {q, s->kv_f16, s->kv_f16, s->mask, sinks, s->pad, heads};
+        if (specialized("kernel_myds_flash_attn_vec_packed8_reduce_f16_dk512_dv512",
+                        &a, sizeof(a), pb, 7, 64, 1, 1, 256, 1, 1, 24448, c, 10)) {
+            return 1;
+        }
+    }
     int vec_ok = 0;
     if(s->attn_vec_head_first && !s->attn_vec_head_first_unavailable) {
         vec_ok = specialized("kernel_myds_flash_attn_vec_head_first_f16_dk512_dv512",&a,sizeof(a),b,7,64,1,32,32,1,1,3328,c,10);
@@ -997,6 +1010,13 @@ int myds_v41_gpu_attention_direct(myds_metal_buffer_t *heads,const myds_metal_bu
     const myds_metal_buffer_t *b[]={q,s->kv_f16,s->kv_f16,s->mask,sinks,s->pad,s->partial};
     const myds_metal_constant_t c[]={{400,true,1},{401,true,1},{402,true,0},{403,true,0},{404,true,keys%32!=0},
         {405,true,0},{420,false,512},{421,false,512},{422,false,1},{423,false,32}};
+    if (get_attn_packed_reduce_mode() && keys <= 1024) {
+        const myds_metal_buffer_t *pb[] = {q, s->kv_f16, s->kv_f16, s->mask, sinks, s->pad, heads};
+        if (specialized("kernel_myds_flash_attn_vec_packed8_reduce_f16_dk512_dv512",
+                        &a, sizeof(a), pb, 7, 64, 1, 1, 256, 1, 1, 24448, c, 10)) {
+            return 1;
+        }
+    }
     int vec_ok = 0;
     if(s->attn_vec_head_first && !s->attn_vec_head_first_unavailable) {
         vec_ok = specialized("kernel_myds_flash_attn_vec_head_first_f16_dk512_dv512",&a,sizeof(a),b,7,64,1,32,32,1,1,3328,c,10);

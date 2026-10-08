@@ -1723,3 +1723,40 @@ static inline void ds4_flash_attn_vec_packed8_reduce_f16_512(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
+
+// Host-visible fused packed-reduce decode FlashAttention kernel for 512-wide F16 K/V rows.
+// Computes all 32 split-K tiles in threadgroup memory and reduces directly to destination heads buffer,
+// eliminating device partial buffer traffic and the separate reduce kernel dispatch.
+kernel void kernel_myds_flash_attn_vec_packed8_reduce_f16_dk512_dv512(
+        constant ds4_metal_args_flash_attn_ext_vec & args [[buffer(0)]],
+        device const char * q                         [[buffer(1)]],
+        device const char * k                         [[buffer(2)]],
+        device const char * v                         [[buffer(3)]],
+        device const char * mask                      [[buffer(4)]],
+        device const char * sinks                     [[buffer(5)]],
+        device const char * pad                       [[buffer(6)]],
+        device       char * dst                       [[buffer(7)]],
+        threadgroup  char * shmem                     [[threadgroup(0)]],
+        uint head                                     [[threadgroup_position_in_grid]],
+        ushort tiisg                                  [[thread_index_in_simdgroup]],
+        ushort sgitg                                  [[simdgroup_index_in_threadgroup]]) {
+    if (!FC_flash_attn_ext_vec_has_mask ||
+        !FC_flash_attn_ext_vec_has_sinks ||
+         FC_flash_attn_ext_vec_has_bias ||
+         FC_flash_attn_ext_vec_has_scap ||
+         FC_flash_attn_ext_vec_nsg != 1 ||
+         FC_flash_attn_ext_vec_nwg != 32 ||
+         FC_flash_attn_ext_vec_ns10 != 512 ||
+         FC_flash_attn_ext_vec_ns20 != 512 ||
+         args.ne01 != 1 || args.ne02 != 64 || args.ne03 != 1 ||
+         args.ne_12_2 != 1 || args.ne_12_3 != 1 ||
+         args.ne31 != 1 || args.ne32 != 1 || args.ne33 != 1 ||
+         args.ne11 <= 0 || args.ne11 > 1024 || head >= (uint)args.ne02 ||
+         args.nb02 != 2048 || args.nb11 != 1024 || args.nb21 != 1024) {
+        return;
+    }
+
+    ds4_flash_attn_vec_packed8_reduce_f16_512(
+        args, q, k, v, mask, sinks, pad, dst, shmem,
+        head, tiisg, sgitg);
+}
