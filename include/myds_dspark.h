@@ -181,7 +181,7 @@ void myds_dspark_capture_layer(myds_dspark_t *ds, uint32_t layer_idx, const myds
 uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t last_token, uint32_t draft_cap);
 
 /* Evaluate 3-Stage Transformer draft model to compute draft logits and confidence score */
-int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float *out_confidence);
+int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_conf, float *out_confidence);
 
 /* Propose Top-2 tree branches for tree-based speculative decoding */
 uint32_t myds_dspark_propose_tree(myds_dspark_t *ds, myds_context_t *ctx, int32_t last_token);

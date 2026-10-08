@@ -438,21 +438,26 @@ static inline void dspark_update_top2(int32_t tok, float score,
     }
 }
 
-int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float *out_confidence) {
+int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_conf, float *out_confidence) {
     if (!ds || !ctx || !ctx->model || !ds->ws) return 0;
     if (!ds->main_proj || !ds->target_hidden_buf || !ds->draft_logits_buf) return 0;
 
     myds_dspark_workspace_t *ws = ds->ws;
     const uint32_t in_dim = MYDS_DSPARK_TARGET_LAYERS * MYDS_DSPARK_DIM;
 
+    // Begin batched Metal command buffer for stages cascade
+    (void)myds_metal_begin_batch();
+
     // 1. Stage 0 Entry Projection: [15360] -> [5120]
     if (!myds_metal_gemv(ds->stage_x_buf, ds->main_proj, ds->target_hidden_buf,
                          MYDS_DSPARK_DIM, in_dim, ds->main_proj_type)) {
+        (void)myds_metal_commit_batch();
         return 0;
     }
     if (ds->main_norm) {
         if (!myds_metal_v41_rmsnorm(ds->stage_x_buf, ds->stage_x_buf, ds->main_norm,
                                     MYDS_DSPARK_DIM, 1e-6f, true)) {
+            (void)myds_metal_commit_batch();
             return 0;
         }
     }
@@ -510,17 +515,14 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float *out_c
         (void)myds_v41_gpu_rope(ws->q, 512, 64, ctx->pos, false, false);
         (void)myds_v41_gpu_rope(ws->kv_norm ? ws->kv_norm : ws->kv, 512, 1, ctx->pos, false, false);
 
-        // Store into Stage KV ring buffer
-        uint32_t ring_slot = (ctx->pos % 128);
-        (void)myds_metal_buffer_copy(ws->stage_kv_cache[s], (size_t)ring_slot * 512 * sizeof(float),
+        // Store into Stage KV cache (Single-row support: seed slot 0 for clean alignment)
+        (void)myds_metal_buffer_copy(ws->stage_kv_cache[s], 0,
                                     ws->kv_norm ? ws->kv_norm : ws->kv, 0, 512 * sizeof(float));
 
-        // Direct Attention with sinks
-        uint32_t nraw = (ctx->pos + 1u < 128) ? (ctx->pos + 1u) : 128;
-        uint32_t raw_start = (ctx->pos + 1u - nraw) % 128;
+        // Direct Attention with sinks (single row: nraw=1, raw_start=0)
         if (gpu_s) {
             (void)myds_v41_gpu_attention_direct(ws->attn_heads, st->attn_sinks, ws->q,
-                                                ws->stage_kv_cache[s], nraw, raw_start,
+                                                ws->stage_kv_cache[s], 1, 0,
                                                 NULL, NULL, 0, 0, gpu_s);
         }
 
@@ -575,12 +577,17 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float *out_c
         // 2. Routed MoE (128 experts, top 3)
         if (st->router_gate && st->ffn_gate_exps && st->ffn_up_exps && st->ffn_down_exps) {
             (void)myds_metal_gemv(ws->router_logits, st->router_gate, ws->ffn_norm, ds->n_routed_experts, MYDS_DSPARK_DIM, st->router_gate_type);
+
+            // Sync point: commit command buffer so CPU can inspect 128 router logits
             (void)myds_metal_commit_batch();
 
             int32_t *sel_ids = (int32_t *)myds_metal_buffer_data(ws->selected_ids);
             float *sel_weights = (float *)myds_metal_buffer_data(ws->selected_weights);
             (void)myds_metal_moe_route_biased(sel_ids, sel_weights, ws->router_logits, st->router_bias,
                                               ds->n_routed_experts, ds->num_experts_per_tok, 2.5f);
+
+            // Re-open batch for routed expert execution
+            (void)myds_metal_begin_batch();
 
             (void)myds_metal_routed_moe(ws->moe_out, ws->ffn_norm,
                                         st->ffn_gate_exps, st->ffn_up_exps, st->ffn_down_exps,
@@ -609,6 +616,9 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float *out_c
     // 3. Final Head (mtp.2.norm + Base Model LM Head)
     myds_dspark_stage_t *final_st = &ds->stages[ds->stage_count - 1u];
     if (final_st->hc_ffn_fn) {
+        (void)myds_metal_v41_rmsnorm(ws->flat_hc_norm, ws->stage_hc, NULL, 4 * MYDS_DSPARK_DIM, 1e-6f, false);
+        (void)myds_metal_gemv(ws->hc_mix, final_st->hc_ffn_fn, ws->flat_hc_norm, 24, 4 * MYDS_DSPARK_DIM, final_st->hc_ffn_fn_type);
+        (void)myds_metal_v41_hc_split_batch(ws->hc_split, ws->hc_mix, final_st->hc_ffn_scale, final_st->hc_ffn_base, 1, 1e-5f);
         (void)myds_metal_v41_hc_weighted_sum(ws->final_embd, ws->stage_hc, ws->hc_split, MYDS_DSPARK_DIM);
     } else {
         (void)myds_metal_buffer_copy(ws->final_embd, 0, ws->stage_hc, 0, stream_bytes);
@@ -620,9 +630,7 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float *out_c
         (void)myds_metal_buffer_copy(ws->final_norm_out, 0, ws->final_embd, 0, stream_bytes);
     }
 
-    // Project to LM Head logits
-    (void)myds_metal_gemv(ds->draft_logits_buf, ctx->model->output, ws->final_norm_out,
-                          ctx->model->vocab_size, MYDS_DSPARK_DIM, ctx->model->output_type);
+    // Commit final stages batch to complete GPU work for hidden states
     (void)myds_metal_commit_batch();
 
     // 4. Confidence Head Gating:
@@ -641,6 +649,17 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float *out_c
         }
     }
     if (out_confidence) *out_confidence = conf_prob;
+
+    // Zero-overhead early exit: If confidence is below threshold, skip the 129,280x5120 LM Head GEMV!
+    if (min_conf > 0.0f && conf_prob < min_conf) {
+        return 0;
+    }
+
+    // Project to LM Head logits only when confidence test passed
+    (void)myds_metal_begin_batch();
+    (void)myds_metal_gemv(ds->draft_logits_buf, ctx->model->output, ws->final_norm_out,
+                          ctx->model->vocab_size, MYDS_DSPARK_DIM, ctx->model->output_type);
+    (void)myds_metal_commit_batch();
 
     return 1;
 }
@@ -667,8 +686,15 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
     static float markov_scale = -1.0f;
     if (__builtin_expect(markov_scale < 0.0f, 0)) {
         const char *env = getenv("MYDS_DSPARK_MARKOV_SCALE");
-        markov_scale = env ? (float)atof(env) : 0.20f;
-        MYDS_LOG_I("DSpark Markov bias Bayesian scale: %.2f", markov_scale);
+        markov_scale = env ? (float)atof(env) : 1.0f; // 1.0 additive residual scale matching ds4
+        MYDS_LOG_I("DSpark Markov bias additive scale: %.2f", markov_scale);
+    }
+
+    static float min_conf = -1.0f;
+    if (__builtin_expect(min_conf < -0.5f, 0)) {
+        const char *env = getenv("MYDS_DSPARK_MIN_CONF");
+        min_conf = env ? (float)atof(env) : 0.80f; // 0.80 threshold
+        MYDS_LOG_I("DSpark confidence head threshold: %.2f", min_conf);
     }
 
     int32_t prev = last_token;
@@ -697,16 +723,9 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
     const float *base_logits = NULL;
 
     if (!markov_only && ds->main_proj && ds->target_hidden_buf) {
-        if (myds_dspark_eval_stages(ds, ctx, &confidence)) {
+        if (myds_dspark_eval_stages(ds, ctx, min_conf, &confidence)) {
             base_logits = (const float *)myds_metal_buffer_data(ds->draft_logits_buf);
         }
-    }
-
-    static float min_conf = -1.0f;
-    if (__builtin_expect(min_conf < -0.5f, 0)) {
-        const char *env = getenv("MYDS_DSPARK_MIN_CONF");
-        min_conf = env ? (float)atof(env) : 0.80f; // 0.80 threshold
-        MYDS_LOG_I("DSpark confidence head threshold: %.2f", min_conf);
     }
 
     static uint64_t s_log_cycle = 0;
@@ -714,7 +733,7 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
         MYDS_LOG_I("[DSpark Propose #%llu] conf=%.4f (min=%.2f, passed=%s), base_logits=%s",
                    (unsigned long long)ds->cycles, confidence, min_conf,
                    (!markov_only && min_conf > 0.0f && confidence < min_conf) ? "NO" : "YES",
-                   base_logits ? "valid" : "null");
+                   base_logits ? "valid" : "none");
     }
 
     // Confidence Gating: if below threshold, return 0 (0 overhead fallback to 29.8 tok/s)
