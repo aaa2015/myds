@@ -457,15 +457,6 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
             ds->draft_tree_tokens[1] = best_token2;
             ds->draft_tree_scores[1] = best_score2;
             ds->draft_tree_count = 2;
-            static int propose_dbg = 0;
-            if (propose_dbg++ < 10) {
-                float logit_true = (base_logits && prev == 1309) ? base_logits[3287] : 0.0f;
-                MYDS_LOG_I("dspark_propose[d=0]: prev=%d, base_logits=%p, Top1=%d (score=%.2f, logit=%.2f), Top2=%d (score=%.2f, logit=%.2f), TrueLogit(3287)=%.2f",
-                           prev, base_logits,
-                           best_token, best_score, base_logits ? base_logits[best_token] : 0.0f,
-                           best_token2, best_score2, base_logits ? base_logits[best_token2] : 0.0f,
-                           logit_true);
-            }
         }
 
         ds->draft_tokens[n_proposed++] = best_token;
