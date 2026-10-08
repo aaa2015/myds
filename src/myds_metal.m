@@ -53,6 +53,7 @@ static id<MTLComputePipelineState> g_pso_moe_mm_q2_k_f16 = nil;
 static id<MTLComputePipelineState> g_pso_moe_mm_q2_k_f32 = nil;
 static id<MTLBuffer>               g_moe_id_map_buffer = nil;
 static NSUInteger                  g_moe_id_map_bytes = 0;
+static int                         g_moe_nsg = 2;
 static id<MTLComputePipelineState> g_pso_attn_out_low_q8_0 = nil;
 static id<MTLComputePipelineState> g_pso_attn_out_low_q8_0_bf16_r4 = nil;
 static id<MTLComputePipelineState> g_pso_mul_mm_q8_0 = nil;
@@ -761,8 +762,10 @@ int myds_metal_init(const char *shader_dir) {
         }
 
         /* 9. Build Routed MoE pipelines */
+        const char *nsg_env = getenv("MYDS_MOE_NSG");
+        g_moe_nsg = (nsg_env && atoi(nsg_env) == 4) ? 4 : 2;
         MTLFunctionConstantValues *moe_mv_id_constants = [[MTLFunctionConstantValues alloc] init];
-        short moe_id_nsg = 2;
+        short moe_id_nsg = (short)g_moe_nsg;
         [moe_mv_id_constants setConstantValue:&moe_id_nsg type:MTLDataTypeShort atIndex:600];
 
         fn = [g_library newFunctionWithName:@"kernel_mul_mv_id_iq2_xxs_f32" constantValues:moe_mv_id_constants error:nil];
@@ -3127,8 +3130,8 @@ int myds_metal_routed_moe_batch(
         };
 
         const NSUInteger nr0_gate = 4;
-        const NSUInteger nsg_gate = 2;
-        const NSUInteger rows_per_group_gate = nr0_gate * nsg_gate; /* 8 */
+        const NSUInteger nsg_gate = (NSUInteger)g_moe_nsg;
+        const NSUInteger rows_per_group_gate = nr0_gate * nsg_gate;
         const NSUInteger row_groups_gate = (expert_dim + rows_per_group_gate - 1) / rows_per_group_gate;
         const NSUInteger pairs = (NSUInteger)n_activated_experts * (NSUInteger)n_tok;
         const NSUInteger smem_iq2 = 256u * sizeof(uint64_t) + 128u * sizeof(uint8_t); /* 2176 */
@@ -3178,8 +3181,8 @@ int myds_metal_routed_moe_batch(
         };
 
         const NSUInteger nr0_down = 2;
-        const NSUInteger nsg_down = 2;
-        const NSUInteger rows_per_group_down = nr0_down * nsg_down; /* 4 */
+        const NSUInteger nsg_down = (NSUInteger)g_moe_nsg;
+        const NSUInteger rows_per_group_down = nr0_down * nsg_down;
         const NSUInteger row_groups_down = (dim + rows_per_group_down - 1) / rows_per_group_down;
 
         struct ds4_metal_dsv4_moe_swiglu_weight_args swiglu_args = {
