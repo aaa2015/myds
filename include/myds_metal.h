@@ -91,6 +91,18 @@ int myds_metal_v41_hc_mix(myds_metal_buffer_t *split,
 int myds_metal_v41_hc_weighted_sum(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *residual, const myds_metal_buffer_t *weights,
     uint32_t dim);
+/* Fuses HC-4 weighted reduction and RMSNorm + weight multiply into a single
+ * dispatch. If sum_out is non-NULL, writes the BF16-rounded intermediate sum to sum_out.
+ * norm_out receives the final normalized and weighted activations. */
+int myds_metal_v41_hc_sum_rmsnorm(
+    myds_metal_buffer_t *norm_out,
+    myds_metal_buffer_t *sum_out,
+    const myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *norm_weight,
+    uint32_t dim,
+    float eps,
+    bool round_bf16);
 /* out may equal residual: the specialized four-stream kernel loads all four
  * source stream values before writing. Other input/output overlap is invalid. */
 int myds_metal_v41_hc_expand(myds_metal_buffer_t *out,

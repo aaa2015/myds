@@ -2195,6 +2195,124 @@ static void test_p1_shared_expert_fusion(void) {
     myds_metal_buffer_free(swiglu_fused);
 }
 
+static void test_p1_hc_sum_rmsnorm_fusion(void) {
+    printf("Testing P1 HC sum + RMSNorm fusion parity (memcmp == 0)...\n");
+    const uint32_t dim = 4096;
+    myds_metal_buffer_t *residual = myds_metal_buffer_alloc(4 * dim * sizeof(float));
+    myds_metal_buffer_t *weights = myds_metal_buffer_alloc(24 * sizeof(float));
+    myds_metal_buffer_t *norm_weight = myds_metal_buffer_alloc(dim * sizeof(float));
+    myds_metal_buffer_t *x_unfused = myds_metal_buffer_alloc(dim * sizeof(float));
+    myds_metal_buffer_t *x_fused = myds_metal_buffer_alloc(dim * sizeof(float));
+    myds_metal_buffer_t *norm_unfused = myds_metal_buffer_alloc(dim * sizeof(float));
+    myds_metal_buffer_t *norm_fused = myds_metal_buffer_alloc(dim * sizeof(float));
+    myds_metal_buffer_t *norm_fused_nosum = myds_metal_buffer_alloc(dim * sizeof(float));
+
+    assert(residual && weights && norm_weight && x_unfused && x_fused &&
+           norm_unfused && norm_fused && norm_fused_nosum);
+
+    // 填充 residual 与 norm_weight
+    float *res_data = (float *)myds_metal_buffer_data(residual);
+    for (size_t i = 0; i < 4 * dim; i++) {
+        res_data[i] = ((float)(i % 1000) - 500.0f) * 0.002f;
+    }
+    float *nw_data = (float *)myds_metal_buffer_data(norm_weight);
+    for (size_t i = 0; i < dim; i++) {
+        nw_data[i] = 0.5f + ((float)(i % 200)) * 0.005f;
+    }
+
+    struct {
+        float w[4];
+        float eps;
+    } cases[] = {
+        {{0.5f, 0.2f, 0.2f, 0.1f}, 1e-6f},
+        {{1.2f, -0.3f, 0.05f, 0.05f}, 1e-6f},
+        {{0.25f, 0.25f, 0.25f, 0.25f}, 1e-5f},
+        {{1.0f, 0.0f, 0.0f, 0.0f}, 1e-6f},
+        {{-0.5f, 0.8f, -0.2f, 0.9f}, 1e-6f},
+    };
+
+    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
+        float *w_data = (float *)myds_metal_buffer_data(weights);
+        for (int i = 0; i < 4; i++) w_data[i] = cases[c].w[i];
+        for (int i = 4; i < 24; i++) w_data[i] = 0.0f;
+        float eps = cases[c].eps;
+
+        memset(myds_metal_buffer_data(x_unfused), 0, dim * sizeof(float));
+        memset(myds_metal_buffer_data(x_fused), 0, dim * sizeof(float));
+        memset(myds_metal_buffer_data(norm_unfused), 0, dim * sizeof(float));
+        memset(myds_metal_buffer_data(norm_fused), 0, dim * sizeof(float));
+        memset(myds_metal_buffer_data(norm_fused_nosum), 0, dim * sizeof(float));
+
+        // 1. 基准路径：独立 hc_weighted_sum + 独立 rmsnorm
+        assert(myds_metal_v41_hc_weighted_sum(x_unfused, residual, weights, dim));
+        assert(myds_metal_v41_rmsnorm(norm_unfused, x_unfused, norm_weight, dim, eps, true));
+
+        // 2. 融合算子路径（保存 sum_out）
+        assert(myds_metal_v41_hc_sum_rmsnorm(norm_fused, x_fused, residual, weights, norm_weight, dim, eps, true));
+
+        // 3. 融合算子路径（bypass sum_out）
+        assert(myds_metal_v41_hc_sum_rmsnorm(norm_fused_nosum, NULL, residual, weights, norm_weight, dim, eps, true));
+
+        // 4. 严格校验
+        float *xu = (float *)myds_metal_buffer_data(x_unfused);
+        float *xf = (float *)myds_metal_buffer_data(x_fused);
+        float *nu = (float *)myds_metal_buffer_data(norm_unfused);
+        float *nf = (float *)myds_metal_buffer_data(norm_fused);
+        float *nf_ns = (float *)myds_metal_buffer_data(norm_fused_nosum);
+
+        if (memcmp(xu, xf, dim * sizeof(float)) != 0) {
+            for (size_t i = 0; i < dim; i++) {
+                if (memcmp(&xu[i], &xf[i], 4) != 0) {
+                    uint32_t ub, fb;
+                    memcpy(&ub, &xu[i], 4);
+                    memcpy(&fb, &xf[i], 4);
+                    fprintf(stderr, "HC sum mismatch in case %zu at %zu: unfused=%08x (%f) fused=%08x (%f)\n",
+                            c, i, ub, xu[i], fb, xf[i]);
+                    assert(0);
+                }
+            }
+        }
+
+        if (memcmp(nu, nf, dim * sizeof(float)) != 0) {
+            for (size_t i = 0; i < dim; i++) {
+                if (memcmp(&nu[i], &nf[i], 4) != 0) {
+                    uint32_t ub, fb;
+                    memcpy(&ub, &nu[i], 4);
+                    memcpy(&fb, &nf[i], 4);
+                    fprintf(stderr, "RMSNorm mismatch in case %zu at %zu: unfused=%08x (%f) fused=%08x (%f)\n",
+                            c, i, ub, nu[i], fb, nf[i]);
+                    assert(0);
+                }
+            }
+        }
+
+        if (memcmp(nu, nf_ns, dim * sizeof(float)) != 0) {
+            for (size_t i = 0; i < dim; i++) {
+                if (memcmp(&nu[i], &nf_ns[i], 4) != 0) {
+                    uint32_t ub, fb;
+                    memcpy(&ub, &nu[i], 4);
+                    memcpy(&fb, &nf_ns[i], 4);
+                    fprintf(stderr, "RMSNorm (nosum) mismatch in case %zu at %zu: unfused=%08x (%f) fused=%08x (%f)\n",
+                            c, i, ub, nu[i], fb, nf_ns[i]);
+                    assert(0);
+                }
+            }
+        }
+    }
+
+    printf("  [PASS] HC sum + RMSNorm: unfused 2-dispatch vs fused 1-dispatch bit-exact across %zu configs (memcmp == 0)\n",
+           sizeof(cases)/sizeof(cases[0]));
+
+    myds_metal_buffer_free(residual);
+    myds_metal_buffer_free(weights);
+    myds_metal_buffer_free(norm_weight);
+    myds_metal_buffer_free(x_unfused);
+    myds_metal_buffer_free(x_fused);
+    myds_metal_buffer_free(norm_unfused);
+    myds_metal_buffer_free(norm_fused);
+    myds_metal_buffer_free(norm_fused_nosum);
+}
+
 int main(void) {
     printf("Running P1 Regression Verification Suite:\n");
     test_p1_response_id_lifecycle();
@@ -2209,6 +2327,7 @@ int main(void) {
     test_p1_moe_route_fusion();
     test_p1_moe_concurrent_barriers_and_route_parity();
     test_p1_shared_expert_fusion();
+    test_p1_hc_sum_rmsnorm_fusion();
     test_p1_attn_output_a_bf16_fusion();
     test_p1_attn_direct_pack_fusion();
     test_p2_moe_kernel_and_pso_validation();

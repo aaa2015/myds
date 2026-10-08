@@ -30,6 +30,7 @@ static id<MTLComputePipelineState> g_pso_v41_norm_plain = nil;
 static id<MTLComputePipelineState> g_pso_v41_bf16 = nil;
 static id<MTLComputePipelineState> g_pso_v41_hc_split = nil;
 static id<MTLComputePipelineState> g_pso_v41_hc_sum = nil;
+static id<MTLComputePipelineState> g_pso_v41_hc_sum_rmsnorm = nil;
 static id<MTLComputePipelineState> g_pso_v41_hc_expand = nil;
 static id<MTLComputePipelineState> g_pso_v41_engram_add = nil;
 static id<MTLComputePipelineState> g_pso_swiglu = nil;
@@ -697,6 +698,8 @@ int myds_metal_init(const char *shader_dir) {
         if (fn) g_pso_v41_hc_split = [g_device newComputePipelineStateWithFunction:fn error:nil];
         fn = [g_library newFunctionWithName:@"kernel_dsv4_hc_weighted_sum"];
         if (fn) g_pso_v41_hc_sum = [g_device newComputePipelineStateWithFunction:fn error:nil];
+        fn = [g_library newFunctionWithName:@"kernel_myds_v41_hc_sum_rmsnorm"];
+        if (fn) g_pso_v41_hc_sum_rmsnorm = [g_device newComputePipelineStateWithFunction:fn error:nil];
         fn = [g_library newFunctionWithName:@"kernel_dsv4_hc_expand4"];
         if (fn) g_pso_v41_hc_expand = [g_device newComputePipelineStateWithFunction:fn error:nil];
         fn = [g_library newFunctionWithName:@"kernel_dsv41_engram_add"];
@@ -908,6 +911,7 @@ void myds_metal_cleanup(void) {
     g_pso_v41_bf16 = nil;
     g_pso_v41_hc_split = nil;
     g_pso_v41_hc_sum = nil;
+    g_pso_v41_hc_sum_rmsnorm = nil;
     g_pso_v41_hc_expand = nil;
     g_pso_v41_engram_add = nil;
     g_pso_swiglu = nil;
@@ -1763,6 +1767,54 @@ int myds_metal_v41_hc_weighted_sum(myds_metal_buffer_t *out,
         [enc setBuffer:out->mtl_buf offset:out->offset atIndex:3];
         NSUInteger nth = MIN((NSUInteger)256, (NSUInteger)dim);
         metal_dispatch(enc, "v41_hc_sum", MTLSizeMake((dim+nth-1)/nth, 1, 1), MTLSizeMake(nth, 1, 1));
+        return v41_finish(cb, enc);
+    }
+}
+
+struct v41_hc_sum_rmsnorm_args {
+    uint32_t dim;
+    float    eps;
+    int32_t  round_bf16;
+    int32_t  has_sum_out;
+};
+
+int myds_metal_v41_hc_sum_rmsnorm(
+    myds_metal_buffer_t *norm_out,
+    myds_metal_buffer_t *sum_out,
+    const myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *norm_weight,
+    uint32_t dim,
+    float eps,
+    bool round_bf16) {
+    if (!g_initialized || !g_pso_v41_hc_sum_rmsnorm || !dim || dim % 128 ||
+        !isfinite(eps) || eps < 0 || !v41_floats(norm_out, dim) ||
+        !v41_floats(residual, 4ull * dim) || !v41_floats(weights, 4) ||
+        !v41_floats(norm_weight, dim) ||
+        (sum_out && !v41_floats(sum_out, dim))) return 0;
+    @autoreleasepool {
+        struct v41_hc_sum_rmsnorm_args args = {
+            .dim = dim,
+            .eps = eps,
+            .round_bf16 = round_bf16 ? 1 : 0,
+            .has_sum_out = sum_out ? 1 : 0,
+        };
+        id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
+        if (!enc) return 0;
+        if (g_batch_cb && g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        [enc setComputePipelineState:g_pso_v41_hc_sum_rmsnorm];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:residual->mtl_buf offset:residual->offset atIndex:1];
+        [enc setBuffer:weights->mtl_buf offset:weights->offset atIndex:2];
+        [enc setBuffer:norm_weight->mtl_buf offset:norm_weight->offset atIndex:3];
+        const myds_metal_buffer_t *s_buf = sum_out ? sum_out : norm_out;
+        [enc setBuffer:s_buf->mtl_buf offset:s_buf->offset atIndex:4];
+        [enc setBuffer:norm_out->mtl_buf offset:norm_out->offset atIndex:5];
+        [enc setThreadgroupMemoryLength:32 * sizeof(float) atIndex:0];
+        NSUInteger nth = 256;
+        metal_dispatch(enc, "v41_hc_sum_rmsnorm", MTLSizeMake(1, 1, 1), MTLSizeMake(nth, 1, 1));
         return v41_finish(cb, enc);
     }
 }

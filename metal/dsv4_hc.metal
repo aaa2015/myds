@@ -41,6 +41,13 @@ struct ds4_metal_args_dsv4_hc_weighted_sum {
     int32_t  round_bf16;
 };
 
+struct ds4_metal_args_hc_sum_rmsnorm {
+    uint32_t dim;
+    float    eps;
+    int32_t  round_bf16;
+    int32_t  has_sum_out;
+};
+
 
 struct ds4_metal_args_dsv4_output_hc_weights4 {
     float post_scale;
@@ -1092,6 +1099,91 @@ kernel void kernel_dsv4_hc_weighted_sum(
     const float ws_v = acc;
     *((device float *) (dst + d*args.nb0 + t*args.nb1)) =
         args.round_bf16 ? dsv41_bf16_round_f32(ws_v) : ws_v;
+}
+
+// Fuses HC-4 weighted reduction and RMSNorm + weight multiply into a single
+// threadgroup dispatch, bypassing intermediate global memory traffic for ctx->x
+// while preserving 100% bit-exact parity with separate launches.
+kernel void kernel_myds_v41_hc_sum_rmsnorm(
+        constant ds4_metal_args_hc_sum_rmsnorm & args [[buffer(0)]],
+        device  const float * residual                 [[buffer(1)]],
+        device  const float * weights                  [[buffer(2)]],
+        device  const float * norm_weight              [[buffer(3)]],
+        device        float * sum_dst                  [[buffer(4)]],
+        device        float * norm_dst                 [[buffer(5)]],
+        threadgroup   float * shmem_f32                [[threadgroup(0)]],
+        ushort3 tpitg [[thread_position_in_threadgroup]],
+        ushort  sgitg [[simdgroup_index_in_threadgroup]],
+        ushort  tiisg [[thread_index_in_simdgroup]],
+        ushort3 ntg   [[threads_per_threadgroup]]) {
+    if (sgitg == 0) {
+        shmem_f32[tiisg] = 0.0f;
+    }
+
+    const uint dim = args.dim;
+    const uint ne00_t = dim / 4;
+
+    device const float4 *r0 = (device const float4 *)(residual);
+    device const float4 *r1 = (device const float4 *)(residual + dim);
+    device const float4 *r2 = (device const float4 *)(residual + 2 * dim);
+    device const float4 *r3 = (device const float4 *)(residual + 3 * dim);
+
+    const float w0 = weights[0];
+    const float w1 = weights[1];
+    const float w2 = weights[2];
+    const float w3 = weights[3];
+
+    device const float4 *norm_w = (device const float4 *)norm_weight;
+    device float4 *sum_out = (device float4 *)sum_dst;
+    device float4 *dst = (device float4 *)norm_dst;
+
+    float sumf = 0.0f;
+    float4 v_reg[4];
+    uint reg_idx = 0;
+
+    for (uint i00 = tpitg.x; i00 < ne00_t; i00 += ntg.x) {
+        const float4 c0 = r0[i00];
+        const float4 c1 = r1[i00];
+        const float4 c2 = r2[i00];
+        const float4 c3 = r3[i00];
+
+        float4 acc = 0.0f;
+        acc += c0 * w0;
+        acc += c1 * w1;
+        acc += c2 * w2;
+        acc += c3 * w3;
+
+        const float4 v = dsv41_bf16_round_f32x4(acc);
+        if (args.has_sum_out) {
+            sum_out[i00] = v;
+        }
+        if (reg_idx < 4) {
+            v_reg[reg_idx] = v;
+        }
+        reg_idx++;
+        sumf += dot(v, v);
+    }
+
+    sumf = simd_sum(sumf);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        shmem_f32[sgitg] = sumf;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sumf = shmem_f32[tiisg];
+    sumf = simd_sum(sumf);
+
+    const float mean  = sumf / (float)dim;
+    const float scale = 1.0f / sqrt(mean + args.eps);
+
+    reg_idx = 0;
+    const bool round_bf16 = (args.round_bf16 != 0);
+    for (uint i00 = tpitg.x; i00 < ne00_t; i00 += ntg.x) {
+        const float4 v = (reg_idx < 4) ? v_reg[reg_idx] : (args.has_sum_out ? sum_out[i00] : float4(0.0f));
+        reg_idx++;
+        const float4 norm_v = (v * scale) * norm_w[i00];
+        dst[i00] = round_bf16 ? dsv41_bf16_round_f32x4(norm_v) : norm_v;
+    }
 }
 
 // The one-row HC=4 output head historically materializes four device-F32

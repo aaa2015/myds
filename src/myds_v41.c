@@ -2851,7 +2851,11 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
     for (uint32_t j=1;j<4;j++) memcpy(res+j*V41_DIM,res,V41_DIM*4u);
     const float initial_pre[4]={1,0,0,0};
     CHECK(myds_metal_buffer_write(g->pre,0,initial_pre,sizeof(initial_pre)));
-    TRACE("embedding",g->residual,4*V41_DIM);
+    static int fuse_hc_norm_enabled = -1;
+    if (fuse_hc_norm_enabled < 0) {
+        const char *env = getenv("MYDS_FUSE_HC_SUM_RMSNORM");
+        fuse_hc_norm_enabled = (env == NULL || atoi(env) != 0);
+    }
     CHECK(myds_metal_begin_batch());
     for (il=0;il<V41_LAYERS;il++) {
         const myds_layer_t *base=&m->layers[il];
@@ -2868,9 +2872,13 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
         TRACE("hc_attn_mix",g->mix,24); TRACE("hc_attn_split",g->attn_split,24);
         const myds_metal_buffer_t *hc_in_pre = (il == 0 ? g->pre : g->ffn_split);
         TRACE("hc_attn_pre",hc_in_pre,4);
-        CHECK(myds_metal_v41_hc_weighted_sum(ctx->x,g->residual,hc_in_pre,V41_DIM));
+        if (fuse_hc_norm_enabled) {
+            CHECK(myds_metal_v41_hc_sum_rmsnorm(ctx->x_norm, ctx->x, g->residual, hc_in_pre, base->attn_norm, V41_DIM, m->norm_eps, true));
+        } else {
+            CHECK(myds_metal_v41_hc_weighted_sum(ctx->x,g->residual,hc_in_pre,V41_DIM));
+            CHECK(myds_metal_v41_rmsnorm(ctx->x_norm,ctx->x,base->attn_norm,V41_DIM,m->norm_eps,true));
+        }
         TRACE("hc_attn_input",ctx->x,V41_DIM);
-        CHECK(myds_metal_v41_rmsnorm(ctx->x_norm,ctx->x,base->attn_norm,V41_DIM,m->norm_eps,true));
         TRACE("attn_norm",ctx->x_norm,V41_DIM);
         phase="attention projections";
         CHECK(project_decode_qkv(ctx->qr,base->attn_q_a,ctx->x_norm,1280,V41_DIM,base->attn_q_a_type,trace_on));
@@ -2924,9 +2932,13 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
         TRACE("after_attn",g->after_attn,4*V41_DIM);
         CHECK(myds_metal_v41_hc_mix(g->ffn_split,g->after_attn,l->ffn_fn,GGML_TYPE_F16,l->ffn_scale,l->ffn_base,g->flat_norm,g->mix,V41_DIM,m->norm_eps,v->hc_eps));
         TRACE("hc_ffn_mix",g->mix,24); TRACE("hc_ffn_split",g->ffn_split,24);
-        CHECK(myds_metal_v41_hc_weighted_sum(ctx->x,g->after_attn,g->attn_split,V41_DIM));
+        if (fuse_hc_norm_enabled) {
+            CHECK(myds_metal_v41_hc_sum_rmsnorm(ctx->ffn_norm_out, ctx->x, g->after_attn, g->attn_split, base->ffn_norm, V41_DIM, m->norm_eps, true));
+        } else {
+            CHECK(myds_metal_v41_hc_weighted_sum(ctx->x,g->after_attn,g->attn_split,V41_DIM));
+            CHECK(myds_metal_v41_rmsnorm(ctx->ffn_norm_out,ctx->x,base->ffn_norm,V41_DIM,m->norm_eps,true));
+        }
         TRACE("hc_ffn_input",ctx->x,V41_DIM);
-        CHECK(myds_metal_v41_rmsnorm(ctx->ffn_norm_out,ctx->x,base->ffn_norm,V41_DIM,m->norm_eps,true));
         TRACE("ffn_norm",ctx->ffn_norm_out,V41_DIM);
         phase="MoE";
         CHECK(myds_v41_moe(ctx,il,(uint32_t)token,pos));
@@ -2943,8 +2955,12 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
     }
     phase="output head";
     if (need_logits) {
-        CHECK(myds_metal_v41_hc_weighted_sum(ctx->x,g->residual,g->ffn_split,V41_DIM));
-        CHECK(myds_metal_v41_rmsnorm(ctx->x_norm,ctx->x,m->output_norm,V41_DIM,m->norm_eps,true));
+        if (fuse_hc_norm_enabled) {
+            CHECK(myds_metal_v41_hc_sum_rmsnorm(ctx->x_norm, ctx->x, g->residual, g->ffn_split, m->output_norm, V41_DIM, m->norm_eps, true));
+        } else {
+            CHECK(myds_metal_v41_hc_weighted_sum(ctx->x,g->residual,g->ffn_split,V41_DIM));
+            CHECK(myds_metal_v41_rmsnorm(ctx->x_norm,ctx->x,m->output_norm,V41_DIM,m->norm_eps,true));
+        }
         CHECK(project(ctx->logits,m->output,ctx->x_norm,m->vocab_size,V41_DIM,m->output_type,false));
         CHECK(myds_metal_commit_batch());
         if (trace_on) CHECK(myds_trace_f32("logits",0,pos,ctx->logits,m->vocab_size));
