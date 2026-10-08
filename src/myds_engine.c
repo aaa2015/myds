@@ -3269,12 +3269,8 @@ static int myds_generate_internal(myds_context_t *ctx,
      * 必须在这里：下一行 prompt_tokens 就释放了，而哈希与快照位置都要用到它。 */
     if (ctx->v41) (void)myds_v41_low_kv_save(ctx->v41, prompt_tokens, (uint32_t)n_prompt);
     uint32_t max_gen = ctx->cfg.max_new_tokens;
-    static int pld_env = -1;
-    if (__builtin_expect(pld_env < 0, 0)) {
-        const char *e = getenv("MYDS_PLD");
-        pld_env = (e && atoi(e) != 0) ? 1 : 0;
-    }
-    const bool pld_enabled = (pld_env != 0 && ctx->dspark == NULL);
+    const char *pld_env_str = getenv("MYDS_PLD");
+    const bool pld_enabled = (pld_env_str && atoi(pld_env_str) != 0 && ctx->dspark == NULL);
 
     int32_t *pld_history = NULL;
     uint32_t pld_len = 0;

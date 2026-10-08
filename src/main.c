@@ -31,7 +31,8 @@ static void print_usage(const char *prog) {
     printf("  --top-p <float>         Nucleus top-p sampling cutoff (default: 0.9)\n");
     printf("  --thinking [on|off]     Enable thinking / reasoning mode (default: off)\n");
     printf("  --no-thinking           Disable thinking / reasoning mode\n");
-    printf("  --seed <int>            Random seed (default: random)\n");
+    printf("  --pld                   Enable Prompt-Lookup Decoding (speculative draft)\n");
+    printf("  --no-pld                Disable Prompt-Lookup Decoding\n");
     printf("  -h, --help              Show this help message\n");
 }
 
@@ -149,6 +150,10 @@ int main(int argc, char *argv[]) {
             cfg.thinking_mode = false;
         } else if (strcmp(argv[i], "--print-tokens") == 0) {
             print_tokens = true;
+        } else if (strcmp(argv[i], "--pld") == 0) {
+            setenv("MYDS_PLD", "1", 1);
+        } else if (strcmp(argv[i], "--no-pld") == 0) {
+            setenv("MYDS_PLD", "0", 1);
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
