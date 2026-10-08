@@ -477,7 +477,7 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
             static float min_margin = -1.0f;
             if (__builtin_expect(min_margin < -0.5f, 0)) {
                 const char *env = getenv("MYDS_DSPARK_MIN_MARGIN");
-                min_margin = env ? (float)atof(env) : 0.80f;
+                min_margin = env ? (float)atof(env) : 1.00f;
                 MYDS_LOG_I("DSpark logit margin gating active: threshold=%.2f", min_margin);
             }
 
@@ -492,7 +492,7 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
             static float min_conf = -1.0f;
             if (__builtin_expect(min_conf < -0.5f, 0)) {
                 const char *env = getenv("MYDS_DSPARK_MIN_CONF");
-                min_conf = env ? (float)atof(env) : 0.0f;
+                min_conf = env ? (float)atof(env) : 0.65f;
                 if (min_conf > 0.0f) {
                     MYDS_LOG_I("DSpark trained confidence head gating active: threshold=%.2f", min_conf);
                 }
