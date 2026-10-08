@@ -3687,20 +3687,15 @@ int myds_v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         }
     }
 
-    /* 4. Output Head & Logits */
+    /* 4. Output Head & Logits for Token 0 (Lazy Projection: defer Token 1) */
     CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_x_norm[0], ws->v_x[0], ws->v_residual[0], ws->v_ffn_split[0], m->output_norm, V41_DIM, m->norm_eps, true));
-    CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_x_norm[1], ws->v_x[1], ws->v_residual[1], ws->v_ffn_split[1], m->output_norm, V41_DIM, m->norm_eps, true));
-    myds_metal_barrier_buffer(ws->x_norm_b2);
-
     CHECK(project(ws->v_logits[0], m->output, ws->v_x_norm[0], m->vocab_size, V41_DIM, m->output_type, false));
-    CHECK(project(ws->v_logits[1], m->output, ws->v_x_norm[1], m->vocab_size, V41_DIM, m->output_type, false));
 
     CHECK(myds_metal_commit_batch());
 
-    /* 5. 权威裁决与状态回滚（Arbitration & Rollback） */
+    /* 5. 权威裁决与状态回滚（Arbitration & Rollback with Lazy Output Projection） */
     const float *logits0 = (const float *)myds_metal_buffer_data(ws->v_logits[0]);
-    const float *logits1 = (const float *)myds_metal_buffer_data(ws->v_logits[1]);
-    if (!check_logits_finite(logits0, m->vocab_size) || !check_logits_finite(logits1, m->vocab_size)) {
+    if (!check_logits_finite(logits0, m->vocab_size)) {
         goto fail;
     }
 
@@ -3708,7 +3703,17 @@ int myds_v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
     out_tokens[0] = auth0;
 
     if (auth0 == tokens[1]) {
-        /* CASE A: 投机命中！2 个 Token 全部验证采纳 */
+        /* CASE A: 投机命中！才对 Token 1 惰性计算 LM Head 投影并采样 */
+        CHECK(myds_metal_begin_batch());
+        CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_x_norm[1], ws->v_x[1], ws->v_residual[1], ws->v_ffn_split[1], m->output_norm, V41_DIM, m->norm_eps, true));
+        CHECK(project(ws->v_logits[1], m->output, ws->v_x_norm[1], m->vocab_size, V41_DIM, m->output_type, false));
+        CHECK(myds_metal_commit_batch());
+
+        const float *logits1 = (const float *)myds_metal_buffer_data(ws->v_logits[1]);
+        if (!check_logits_finite(logits1, m->vocab_size)) {
+            goto fail;
+        }
+
         int32_t auth1 = myds_sample_next_token(logits1, m->vocab_size, &ctx->cfg, ctx, NULL, 0);
         out_tokens[1] = auth1;
 
@@ -3998,21 +4003,15 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
         }
     }
 
-    /* 4. Output Head & Logits */
-    for (uint32_t t = 0; t < 3; t++) {
-        CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_x_norm[t], ws->v_x[t], ws->v_residual[t], ws->v_ffn_split[t], m->output_norm, V41_DIM, m->norm_eps, true));
-        CHECK(project(ws->v_logits[t], m->output, ws->v_x_norm[t], m->vocab_size, V41_DIM, m->output_type, false));
-    }
+    /* 4. Output Head & Logits for Token 0 (Lazy Projection: defer branch A & B) */
+    CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_x_norm[0], ws->v_x[0], ws->v_residual[0], ws->v_ffn_split[0], m->output_norm, V41_DIM, m->norm_eps, true));
+    CHECK(project(ws->v_logits[0], m->output, ws->v_x_norm[0], m->vocab_size, V41_DIM, m->output_type, false));
 
     CHECK(myds_metal_commit_batch());
 
-    /* 5. 3-Way 树状权威裁决器（Tree Arbitration & Commit） */
+    /* 5. 3-Way 树状权威裁决器（Tree Arbitration with Lazy Output Projection） */
     const float *logits0 = (const float *)myds_metal_buffer_data(ws->v_logits[0]);
-    const float *logits1 = (const float *)myds_metal_buffer_data(ws->v_logits[1]);
-    const float *logits2 = (const float *)myds_metal_buffer_data(ws->v_logits[2]);
-    if (!check_logits_finite(logits0, m->vocab_size) ||
-        !check_logits_finite(logits1, m->vocab_size) ||
-        !check_logits_finite(logits2, m->vocab_size)) {
+    if (!check_logits_finite(logits0, m->vocab_size)) {
         MYDS_LOG_E("forward_tree_spec: check_logits_finite failed at pos %u", pos);
         goto fail;
     }
@@ -4021,7 +4020,18 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
     out_tokens[0] = auth0;
 
     if (auth0 == tokens[1]) {
-        /* CASE 1: 命中分支 A (Top-1 候选)！采纳 2 个 Token */
+        /* CASE 1: 命中分支 A (Top-1 候选)！才对 Token 1 惰性计算 LM Head 投影并采样 */
+        CHECK(myds_metal_begin_batch());
+        CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_x_norm[1], ws->v_x[1], ws->v_residual[1], ws->v_ffn_split[1], m->output_norm, V41_DIM, m->norm_eps, true));
+        CHECK(project(ws->v_logits[1], m->output, ws->v_x_norm[1], m->vocab_size, V41_DIM, m->output_type, false));
+        CHECK(myds_metal_commit_batch());
+
+        const float *logits1 = (const float *)myds_metal_buffer_data(ws->v_logits[1]);
+        if (!check_logits_finite(logits1, m->vocab_size)) {
+            MYDS_LOG_E("forward_tree_spec: check_logits_finite failed for branch A at pos %u", pos + 1u);
+            goto fail;
+        }
+
         int32_t auth1 = myds_sample_next_token(logits1, m->vocab_size, &ctx->cfg, ctx, NULL, 0);
         out_tokens[1] = auth1;
 
@@ -4053,7 +4063,18 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
         ctx->pos = pos + 2u;
         return 2;
     } else if (auth0 == tokens[2]) {
-        /* CASE 2: 命中分支 B (Top-2 候选)！采纳 2 个 Token */
+        /* CASE 2: 命中分支 B (Top-2 候选)！才对 Token 2 惰性计算 LM Head 投影并采样 */
+        CHECK(myds_metal_begin_batch());
+        CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_x_norm[2], ws->v_x[2], ws->v_residual[2], ws->v_ffn_split[2], m->output_norm, V41_DIM, m->norm_eps, true));
+        CHECK(project(ws->v_logits[2], m->output, ws->v_x_norm[2], m->vocab_size, V41_DIM, m->output_type, false));
+        CHECK(myds_metal_commit_batch());
+
+        const float *logits2 = (const float *)myds_metal_buffer_data(ws->v_logits[2]);
+        if (!check_logits_finite(logits2, m->vocab_size)) {
+            MYDS_LOG_E("forward_tree_spec: check_logits_finite failed for branch B at pos %u", pos + 1u);
+            goto fail;
+        }
+
         int32_t auth2 = myds_sample_next_token(logits2, m->vocab_size, &ctx->cfg, ctx, NULL, 0);
         out_tokens[1] = auth2;
 
