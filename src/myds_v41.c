@@ -3513,6 +3513,14 @@ int myds_v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         }
     }
     v41_batch2_workspace_t *ws = g->batch2_ws;
+    int prev_auto_barrier = -1;
+
+    static int decode_split = -1;
+    if (decode_split < 0) {
+        const char *e = getenv("MYDS_DECODE_SPLIT");
+        const int n = e ? atoi(e) : 0;
+        decode_split = (n > 1 && n <= (int)V41_LAYERS) ? n : 0;
+    }
 
     /* 1. 保存投机前快照（用于未命中时的无损回滚） */
     myds_v41_spec_snapshot_t snap = {0};
@@ -3551,6 +3559,10 @@ int myds_v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
     CHECK(myds_metal_buffer_write(ws->v_pre[1], 0, init_pre, sizeof(init_pre)));
 
     CHECK(myds_metal_begin_batch());
+    prev_auto_barrier = myds_metal_get_auto_barrier();
+    myds_metal_set_auto_barrier(0);
+    const myds_metal_buffer_t *init_deps[] = { ws->v_residual[0], ws->v_residual[1], ws->v_pre[0], ws->v_pre[1] };
+    myds_metal_barrier_buffers(init_deps, 4);
 
     /* 3. 40 层级联前向（Per-Layer Batch-2 GEMV & MoE） */
     for (uint32_t il = 0; il < V41_LAYERS; il++) {
@@ -3685,6 +3697,12 @@ int myds_v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
                 (void)myds_metal_v41_hc_weighted_sum(ws->dspark_slots[t][slot], ws->v_residual[t], ctx->dspark->hc_mean_weights, MYDS_DSPARK_DIM);
             }
         }
+
+        if (decode_split && il + 1u < V41_LAYERS &&
+            ((il + 1u) * (uint32_t)decode_split) / V41_LAYERS != (il * (uint32_t)decode_split) / V41_LAYERS) {
+            CHECK(myds_metal_flush_batch());
+            CHECK(myds_metal_begin_batch());
+        }
     }
 
     /* 4. Output Head & Logits for Token 0 (Lazy Projection: defer Token 1) */
@@ -3720,7 +3738,6 @@ int myds_v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_begin_batch());
         CHECK(myds_metal_buffer_copy(g->residual, 0, ws->v_residual[1], 0, 4 * V41_DIM * sizeof(float)));
         CHECK(myds_metal_buffer_copy(g->pre, 0, ws->v_pre[1], 0, 4 * sizeof(float)));
-        CHECK(myds_metal_commit_batch());
 
         if (ctx->dspark) {
             for (int s = 0; s < 3; s++) {
@@ -3729,7 +3746,9 @@ int myds_v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
                 }
             }
         }
+        CHECK(myds_metal_commit_batch());
 
+        myds_metal_set_auto_barrier(prev_auto_barrier);
         g->next_position = pos + 2u;
         ctx->pos = pos + 2u;
         return 2;
@@ -3740,7 +3759,6 @@ int myds_v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_begin_batch());
         CHECK(myds_metal_buffer_copy(g->residual, 0, ws->v_residual[0], 0, 4 * V41_DIM * sizeof(float)));
         CHECK(myds_metal_buffer_copy(g->pre, 0, ws->v_pre[0], 0, 4 * sizeof(float)));
-        CHECK(myds_metal_commit_batch());
 
         if (ctx->dspark) {
             for (int s = 0; s < 3; s++) {
@@ -3749,7 +3767,9 @@ int myds_v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
                 }
             }
         }
+        CHECK(myds_metal_commit_batch());
 
+        myds_metal_set_auto_barrier(prev_auto_barrier);
         g->next_position = pos + 1u;
         ctx->pos = pos + 1u;
         return 1;
@@ -3758,6 +3778,7 @@ int myds_v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
 fail:
     MYDS_LOG_E("V4.1 forward_batch2 failed at pos %u", pos);
     (void)myds_metal_commit_batch();
+    if (prev_auto_barrier >= 0) myds_metal_set_auto_barrier(prev_auto_barrier);
     g->valid = false;
     return -1;
 #undef CHECK
@@ -3788,6 +3809,14 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
         }
     }
     v41_batch2_workspace_t *ws = g->batch2_ws;
+    int prev_auto_barrier = -1;
+
+    static int decode_split = -1;
+    if (decode_split < 0) {
+        const char *e = getenv("MYDS_DECODE_SPLIT");
+        const int n = e ? atoi(e) : 0;
+        decode_split = (n > 1 && n <= (int)V41_LAYERS) ? n : 0;
+    }
 
     /* 1. 保存投机前快照（用于未命中时的无损回滚） */
     myds_v41_spec_snapshot_t snap = {0};
@@ -3851,6 +3880,13 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
     CHECK(myds_metal_buffer_write(ws->v_pre[2], 0, init_pre, sizeof(init_pre)));
 
     CHECK(myds_metal_begin_batch());
+    prev_auto_barrier = myds_metal_get_auto_barrier();
+    myds_metal_set_auto_barrier(0);
+    const myds_metal_buffer_t *init_deps[] = {
+        ws->v_residual[0], ws->v_residual[1], ws->v_residual[2],
+        ws->v_pre[0], ws->v_pre[1], ws->v_pre[2]
+    };
+    myds_metal_barrier_buffers(init_deps, 6);
 
     /* 3. 40 层级联前向（Tree-Batch-3 GEMV & MoE 硬件并行） */
     for (uint32_t il = 0; il < V41_LAYERS; il++) {
@@ -3917,8 +3953,10 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
         /* 2) Token 1 (Branch A): 写入 window[il] 的 (pos+1)%128，同时备份到 tree_kv_backup[il] */
         uint32_t pos1 = pos + 1u;
         CHECK(myds_v41_gpu_qkv_finish(ws->v_q[1], ws->v_kv_act[1], g->window[il], pos1, compressed));
+        myds_metal_barrier_buffer(g->window[il]);
         const size_t row_bytes = 512 * sizeof(float);
         CHECK(myds_metal_buffer_copy(ws->tree_kv_backup[il], 0, g->window[il], (pos1 % 128) * row_bytes, row_bytes));
+        myds_metal_barrier_buffer(ws->tree_kv_backup[il]);
 
         uint32_t count1 = compressed ? (pos1 + 1u) / ratio_for(il) : 0;
         uint32_t top1 = count1 < V41_TOPK ? count1 : V41_TOPK;
@@ -4001,6 +4039,12 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
                 (void)myds_metal_v41_hc_weighted_sum(ws->dspark_slots[t][slot], ws->v_residual[t], ctx->dspark->hc_mean_weights, MYDS_DSPARK_DIM);
             }
         }
+
+        if (decode_split && il + 1u < V41_LAYERS &&
+            ((il + 1u) * (uint32_t)decode_split) / V41_LAYERS != (il * (uint32_t)decode_split) / V41_LAYERS) {
+            CHECK(myds_metal_flush_batch());
+            CHECK(myds_metal_begin_batch());
+        }
     }
 
     /* 4. Output Head & Logits for Token 0 (Lazy Projection: defer branch A & B) */
@@ -4035,7 +4079,7 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
         int32_t auth1 = myds_sample_next_token(logits1, m->vocab_size, &ctx->cfg, ctx, NULL, 0);
         out_tokens[1] = auth1;
 
-        // 还原 40 层 window[il] 中 Token 1 的 KV
+        // 还原 40 层 window[il] 中 Token 1 的 KV 并提交状态
         const size_t row_bytes = 512 * sizeof(float);
         const uint32_t pos1 = pos + 1u;
         CHECK(myds_metal_begin_batch());
@@ -4044,7 +4088,6 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
         }
         CHECK(myds_metal_buffer_copy(g->residual, 0, ws->v_residual[1], 0, 4 * V41_DIM * sizeof(float)));
         CHECK(myds_metal_buffer_copy(g->pre, 0, ws->v_pre[1], 0, 4 * sizeof(float)));
-        CHECK(myds_metal_commit_batch());
 
         if (ctx->dspark) {
             for (int s = 0; s < 3; s++) {
@@ -4053,7 +4096,9 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
                 }
             }
         }
+        CHECK(myds_metal_commit_batch());
 
+        myds_metal_set_auto_barrier(prev_auto_barrier);
         if (g->engram) {
             g->engram->history = engram_hist_1;
             g->engram->position = pos + 2u;
@@ -4082,7 +4127,6 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_begin_batch());
         CHECK(myds_metal_buffer_copy(g->residual, 0, ws->v_residual[2], 0, 4 * V41_DIM * sizeof(float)));
         CHECK(myds_metal_buffer_copy(g->pre, 0, ws->v_pre[2], 0, 4 * sizeof(float)));
-        CHECK(myds_metal_commit_batch());
 
         if (ctx->dspark) {
             for (int s = 0; s < 3; s++) {
@@ -4091,7 +4135,9 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
                 }
             }
         }
+        CHECK(myds_metal_commit_batch());
 
+        myds_metal_set_auto_barrier(prev_auto_barrier);
         if (g->engram) {
             g->engram->history = engram_hist_2;
             g->engram->position = pos + 2u;
@@ -4107,7 +4153,6 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_begin_batch());
         CHECK(myds_metal_buffer_copy(g->residual, 0, ws->v_residual[0], 0, 4 * V41_DIM * sizeof(float)));
         CHECK(myds_metal_buffer_copy(g->pre, 0, ws->v_pre[0], 0, 4 * sizeof(float)));
-        CHECK(myds_metal_commit_batch());
 
         if (ctx->dspark) {
             for (int s = 0; s < 3; s++) {
@@ -4116,7 +4161,9 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
                 }
             }
         }
+        CHECK(myds_metal_commit_batch());
 
+        myds_metal_set_auto_barrier(prev_auto_barrier);
         if (g->engram) {
             g->engram->history = engram_hist_0;
             g->engram->position = pos + 1u;
@@ -4130,6 +4177,7 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
 fail:
     MYDS_LOG_E("V4.1 forward_tree_spec failed at pos %u", pos);
     (void)myds_metal_commit_batch();
+    if (prev_auto_barrier >= 0) myds_metal_set_auto_barrier(prev_auto_barrier);
     (void)myds_v41_spec_snapshot_restore(ctx, &snap);
     return -1;
 #undef CHECK
