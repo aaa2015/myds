@@ -420,6 +420,21 @@ bool myds_v41_spec_snapshot_restore_partial(myds_context_t *ctx, const myds_v41_
     ctx->pos = snap->pos + keep_count;
     g->next_position = snap->next_position + keep_count;
 
+    if (g->engram) {
+        g->engram->history = snap->engram_history;
+        g->engram->position = snap->engram_position;
+        if (ctx->pcache_tokens) {
+            for (uint32_t k = 0; k < keep_count; k++) {
+                int32_t tok = ctx->pcache_tokens[snap->pos + k];
+                myds_engram_history_t next = g->engram->history;
+                if (myds_engram_hash(&g->engram->layout, &next, &tok, NULL, 1, &g->engram->row_ids[0][0])) {
+                    g->engram->history = next;
+                    ++g->engram->position;
+                }
+            }
+        }
+    }
+
     for (uint32_t il = 0; il < V41_LAYERS; il++) {
         if (!g->window[il]) continue;
         float *base = (float *)myds_metal_buffer_data(g->window[il]);
@@ -3190,6 +3205,19 @@ fail:
 #undef CHECK
 #undef TRACE
 }
+
+int myds_v41_forward_batch_spec(myds_context_t *ctx, const int32_t *tokens,
+                                uint32_t n_tokens, uint32_t pos,
+                                int32_t *out_tokens) {
+    if (!ctx || !tokens || !out_tokens || n_tokens == 0) return -1;
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        int32_t next = myds_v41_forward(ctx, tokens[i], pos + i, true);
+        if (next < 0) return -1;
+        out_tokens[i] = next;
+    }
+    return (int)n_tokens;
+}
+
 
 struct v41_chunk_workspace_s {
     uint32_t capacity;

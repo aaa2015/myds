@@ -3532,6 +3532,142 @@ static int myds_generate_internal(myds_context_t *ctx,
             pld_cycles++;
             pld_proposed += n_draft;
 
+            if (ctx->v41 && pld_snap && n_draft >= 1 && (ctx->pos + 2 <= ctx->cfg.max_seq_len)) {
+                // 微批多 Token 投机验证（Micro-Batch Speculative Verification, K=2）
+                pld_cycles++;
+                pld_proposed += 1;
+
+                memset(pld_snap, 0, sizeof(*pld_snap));
+                bool snap_saved = myds_v41_spec_snapshot_save(ctx, pld_snap, 2);
+
+                if (cancel_flag && *cancel_flag) {
+                    stop_reason = MYDS_STOP_CANCELLED;
+                    break;
+                }
+
+                // 预记录当前 token 至 prefix cache
+                if (ctx->pcache_tokens && ctx->pos < ctx->pcache_cap) {
+                    ctx->pcache_tokens[ctx->pos] = cur_token;
+                    if (ctx->pos + 1u > ctx->pcache_len) ctx->pcache_len = ctx->pos + 1u;
+                }
+
+                int32_t tokens_to_forward[2] = { cur_token, draft_tokens[0] };
+                int32_t out_tokens[2] = { 0, 0 };
+
+                int ret = myds_v41_forward_batch_spec(ctx, tokens_to_forward, 2, ctx->pos, out_tokens);
+                if (ret < 0 || out_tokens[0] < 0 || (uint32_t)out_tokens[0] >= m->tokenizer->vocab_size) {
+                    if (snap_saved) myds_v41_spec_snapshot_restore(ctx, pld_snap);
+                    ctx->pcache_len = 0;
+                    stop_reason = MYDS_STOP_ERROR;
+                    success = 0;
+                    break;
+                }
+
+                bool matched = (out_tokens[0] == draft_tokens[0]);
+                if (matched) {
+                    // 第 1 个草稿 Token 命中！
+                    pld_accepted++;
+
+                    // 1. 采纳第 1 个 Token (draft_tokens[0] / out_tokens[0])
+                    if (pld_len < pld_cap) pld_history[pld_len++] = out_tokens[0];
+
+                    size_t piece_len0 = 0;
+                    const char *piece0 = myds_tokenizer_decode_bytes(m->tokenizer, out_tokens[0], &piece_len0);
+                    if (!piece0) {
+                        if (snap_saved) myds_v41_spec_snapshot_restore(ctx, pld_snap);
+                        stop_reason = MYDS_STOP_ERROR;
+                        success = 0;
+                        break;
+                    }
+                    if (bytes_cb) bytes_cb(piece0, piece_len0, out_tokens[0], user_data);
+                    else if (cb) cb(piece0, out_tokens[0], user_data);
+
+                    step++;
+
+                    if (out_tokens[0] == m->tokenizer->eos_id) {
+                        if (snap_saved) myds_v41_spec_snapshot_restore_partial(ctx, pld_snap, 1);
+                        else ctx->pos++;
+                        stop_reason = MYDS_STOP_EOS;
+                        break;
+                    }
+
+                    if (step >= max_gen) {
+                        if (snap_saved) myds_v41_spec_snapshot_restore_partial(ctx, pld_snap, 1);
+                        else ctx->pos++;
+                        break;
+                    }
+
+                    // 2. 采纳第 2 个 Token (out_tokens[1]，权威模型在真值 draft_tokens[0] 上推理出的真实输出)
+                    if (out_tokens[1] < 0 || (uint32_t)out_tokens[1] >= m->tokenizer->vocab_size) {
+                        if (snap_saved) myds_v41_spec_snapshot_restore_partial(ctx, pld_snap, 1);
+                        else ctx->pos++;
+                        stop_reason = MYDS_STOP_ERROR;
+                        success = 0;
+                        break;
+                    }
+
+                    if (ctx->pcache_tokens && (ctx->pos + 1) < ctx->pcache_cap) {
+                        ctx->pcache_tokens[ctx->pos + 1] = out_tokens[0];
+                        if (ctx->pos + 2u > ctx->pcache_len) ctx->pcache_len = ctx->pos + 2u;
+                    }
+                    if (pld_len < pld_cap) pld_history[pld_len++] = out_tokens[1];
+
+                    size_t piece_len1 = 0;
+                    const char *piece1 = myds_tokenizer_decode_bytes(m->tokenizer, out_tokens[1], &piece_len1);
+                    if (!piece1) {
+                        if (snap_saved) myds_v41_spec_snapshot_restore_partial(ctx, pld_snap, 1);
+                        else ctx->pos++;
+                        stop_reason = MYDS_STOP_ERROR;
+                        success = 0;
+                        break;
+                    }
+                    if (bytes_cb) bytes_cb(piece1, piece_len1, out_tokens[1], user_data);
+                    else if (cb) cb(piece1, out_tokens[1], user_data);
+
+                    ctx->pos += 2;
+                    step++;
+                    cur_token = out_tokens[1];
+
+                    if (out_tokens[1] == m->tokenizer->eos_id) {
+                        stop_reason = MYDS_STOP_EOS;
+                        break;
+                    }
+                } else {
+                    // 第 1 个草稿 Token 未命中！
+                    // 回滚第 2 个槽位对 KV Cache 的污染修改，保留当前槽位的权威真值
+                    if (snap_saved) {
+                        myds_v41_spec_snapshot_restore_partial(ctx, pld_snap, 1);
+                    } else {
+                        ctx->pos++;
+                    }
+
+                    if (pld_len < pld_cap) pld_history[pld_len++] = out_tokens[0];
+
+                    size_t piece_len = 0;
+                    const char *piece = myds_tokenizer_decode_bytes(m->tokenizer, out_tokens[0], &piece_len);
+                    if (!piece) {
+                        stop_reason = MYDS_STOP_ERROR;
+                        success = 0;
+                        break;
+                    }
+                    if (bytes_cb) bytes_cb(piece, piece_len, out_tokens[0], user_data);
+                    else if (cb) cb(piece, out_tokens[0], user_data);
+
+                    step++;
+                    cur_token = out_tokens[0];
+
+                    if (out_tokens[0] == m->tokenizer->eos_id) {
+                        stop_reason = MYDS_STOP_EOS;
+                        break;
+                    }
+                }
+
+                if (stop_reason == MYDS_STOP_EOS || stop_reason == MYDS_STOP_CANCELLED || !success || step >= max_gen) {
+                    break;
+                }
+                continue;
+            }
+
             bool snap_saved = false;
             if (pld_snap && ctx->v41) {
                 memset(pld_snap, 0, sizeof(*pld_snap));

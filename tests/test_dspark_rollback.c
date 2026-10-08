@@ -285,6 +285,115 @@ static void test_adaptive_speculative_backoff(void) {
     printf("  [PASS] Adaptive Scheduler Backoff State Machine verified.\n");
 }
 
+static void test_spec_micro_batch_verification_sim(void) {
+    printf("[TEST] Micro-Batch Forward Verification & Partial Rollback State Machine...\n");
+    myds_v41_context_t *g = myds_v41_context_create_snapshot_fixture();
+    assert(g && "Failed to create snapshot fixture");
+
+    myds_context_t ctx = {0};
+    ctx.v41 = g;
+    ctx.pos = 100;
+
+    int32_t pcache[256];
+    memset(pcache, 0, sizeof(pcache));
+    ctx.pcache_tokens = pcache;
+    ctx.pcache_cap = 256;
+    ctx.pcache_len = 100;
+
+    // Fill initial state
+    for (uint32_t l = 0; l < MYDS_V41_LAYERS_COUNT; l++) {
+        float *w = (float *)myds_metal_buffer_data(myds_v41_snapshot_get_window(g, l));
+        assert(w);
+        for (uint32_t s = 0; s < 128; s++) {
+            for (uint32_t d = 0; d < 512; d++) {
+                w[s * 512 + d] = (float)(l * 1000 + s);
+            }
+        }
+    }
+    myds_v41_snapshot_set_positions(g, 100, 100);
+
+    // Case 1: Mismatch on token 0 -> partial rollback keeping 1 step
+    myds_v41_spec_snapshot_t snap = {0};
+    bool ok = myds_v41_spec_snapshot_save(&ctx, &snap, 2);
+    assert(ok && snap.valid);
+
+    // Simulate batch execution mutates pos 100 and pos 101
+    ctx.pos = 102;
+    ctx.pcache_tokens[100] = 501;
+    ctx.pcache_tokens[101] = 502; // Wrong speculative draft token
+    ctx.pcache_len = 102;
+    myds_v41_snapshot_set_positions(g, 102, 102);
+
+    for (uint32_t l = 0; l < MYDS_V41_LAYERS_COUNT; l++) {
+        float *w = (float *)myds_metal_buffer_data(myds_v41_snapshot_get_window(g, l));
+        uint32_t s0 = 100 % 128;
+        uint32_t s1 = 101 % 128;
+        for (uint32_t d = 0; d < 512; d++) {
+            w[s0 * 512 + d] = 111.0f; // Kept
+            w[s1 * 512 + d] = 999.0f; // Polluted, to be rolled back
+        }
+    }
+
+    // Speculative mismatch: restore_partial(1)
+    ok = myds_v41_spec_snapshot_restore_partial(&ctx, &snap, 1);
+    assert(ok);
+    assert(ctx.pos == 101);
+    assert(ctx.pcache_len == 101);
+    assert(myds_v41_snapshot_get_next_position(g) == 101);
+
+    for (uint32_t l = 0; l < MYDS_V41_LAYERS_COUNT; l++) {
+        float *w = (float *)myds_metal_buffer_data(myds_v41_snapshot_get_window(g, l));
+        uint32_t s0 = 100 % 128;
+        uint32_t s1 = 101 % 128;
+        for (uint32_t d = 0; d < 512; d++) {
+            assert(w[s0 * 512 + d] == 111.0f); // Kept!
+            assert(w[s1 * 512 + d] == (float)(l * 1000 + s1)); // Reverted!
+        }
+    }
+
+    // Case 2: Full match -> advance both without rollback
+    memset(&snap, 0, sizeof(snap));
+    ok = myds_v41_spec_snapshot_save(&ctx, &snap, 2);
+    assert(ok && snap.valid);
+
+    // Simulate batch execution mutates pos 101 and pos 102
+    ctx.pos = 103;
+    ctx.pcache_tokens[101] = 601;
+    ctx.pcache_tokens[102] = 602;
+    ctx.pcache_len = 103;
+    myds_v41_snapshot_set_positions(g, 103, 103);
+
+    for (uint32_t l = 0; l < MYDS_V41_LAYERS_COUNT; l++) {
+        float *w = (float *)myds_metal_buffer_data(myds_v41_snapshot_get_window(g, l));
+        uint32_t s1 = 101 % 128;
+        uint32_t s2 = 102 % 128;
+        for (uint32_t d = 0; d < 512; d++) {
+            w[s1 * 512 + d] = 222.0f;
+            w[s2 * 512 + d] = 333.0f;
+        }
+    }
+
+    // Speculative full match: keep 2 steps (noop or keep_count >= window_count)
+    ok = myds_v41_spec_snapshot_restore_partial(&ctx, &snap, 2);
+    assert(ok);
+    assert(ctx.pos == 103);
+    assert(ctx.pcache_len == 103);
+    assert(myds_v41_snapshot_get_next_position(g) == 103);
+
+    for (uint32_t l = 0; l < MYDS_V41_LAYERS_COUNT; l++) {
+        float *w = (float *)myds_metal_buffer_data(myds_v41_snapshot_get_window(g, l));
+        uint32_t s1 = 101 % 128;
+        uint32_t s2 = 102 % 128;
+        for (uint32_t d = 0; d < 512; d++) {
+            assert(w[s1 * 512 + d] == 222.0f); // Kept!
+            assert(w[s2 * 512 + d] == 333.0f); // Kept!
+        }
+    }
+
+    myds_v41_context_free(g);
+    printf("  [PASS] Micro-batch verification dual-branch state machine passed cleanly.\n");
+}
+
 int main(void) {
     printf("\n=======================================================\n");
     printf("  DSpark Rollback & Speculative State Machine Tests     \n");
@@ -298,7 +407,9 @@ int main(void) {
     test_spec_snapshot_partial_restore();
     test_spec_snapshot_boundary_checks();
     test_adaptive_speculative_backoff();
+    test_spec_micro_batch_verification_sim();
 
     printf("\n=== All DSpark Rollback Tests Passed Successfully! ===\n\n");
     return 0;
 }
+

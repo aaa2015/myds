@@ -98,5 +98,11 @@ bool myds_v41_spec_snapshot_save(myds_context_t *context, myds_v41_spec_snapshot
 bool myds_v41_spec_snapshot_restore(myds_context_t *context, const myds_v41_spec_snapshot_t *snap);
 bool myds_v41_spec_snapshot_restore_partial(myds_context_t *context, const myds_v41_spec_snapshot_t *snap, uint32_t keep_count);
 
+/* ── 投机微批前向通道 ── */
+int myds_v41_forward_batch_spec(myds_context_t *context, const int32_t *tokens,
+                                uint32_t n_tokens, uint32_t position,
+                                int32_t *out_tokens);
+
 #endif
+
 
