@@ -2962,8 +2962,6 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
         phase="HC FFN input";
         CHECK(myds_metal_v41_hc_expand(g->after_attn,ctx->attn_out,g->residual,g->attn_split,V41_DIM));
         TRACE("after_attn",g->after_attn,4*V41_DIM);
-        CHECK(myds_metal_v41_hc_mix(g->ffn_split,g->after_attn,l->ffn_fn,GGML_TYPE_F16,l->ffn_scale,l->ffn_base,g->flat_norm,g->mix,V41_DIM,m->norm_eps,v->hc_eps));
-        TRACE("hc_ffn_mix",g->mix,24); TRACE("hc_ffn_split",g->ffn_split,24);
         if (fuse_hc_norm_enabled) {
             CHECK(myds_metal_v41_hc_sum_rmsnorm(ctx->ffn_norm_out, ctx->x, g->after_attn, g->attn_split, base->ffn_norm, V41_DIM, m->norm_eps, true));
         } else {
@@ -2972,6 +2970,8 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
         }
         TRACE("hc_ffn_input",ctx->x,V41_DIM);
         TRACE("ffn_norm",ctx->ffn_norm_out,V41_DIM);
+        CHECK(myds_metal_v41_hc_mix(g->ffn_split,g->after_attn,l->ffn_fn,GGML_TYPE_F16,l->ffn_scale,l->ffn_base,g->flat_norm,g->mix,V41_DIM,m->norm_eps,v->hc_eps));
+        TRACE("hc_ffn_mix",g->mix,24); TRACE("hc_ffn_split",g->ffn_split,24);
         phase="MoE";
         CHECK(myds_v41_moe(ctx,il,(uint32_t)token,pos));
         CHECK(myds_metal_v41_hc_expand(g->residual,ctx->ffn_out,g->after_attn,g->ffn_split,V41_DIM));

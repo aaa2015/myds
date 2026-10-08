@@ -389,11 +389,11 @@ int myds_v41_moe(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t p
         return 0;
     }
 
-    /* 5. 仅同步路由输出与 scratch 释放，启动 Routed MoE（与 Shared Down GEMV 在 GPU 上并发） */
+    /* 5. 仅同步路由输出与选择结果，启动 Routed MoE（与 Shared Down GEMV 在 GPU 上并发） */
     const myds_metal_buffer_t *moe_deps[] = {
-        ctx->selected_ids, ctx->selected_weights, ctx->moe_gate, ctx->moe_up
+        ctx->selected_ids, ctx->selected_weights
     };
-    myds_metal_barrier_buffers(moe_deps, 4);
+    myds_metal_barrier_buffers(moe_deps, 2);
     if (!myds_metal_routed_moe(ctx->moe_out, ctx->ffn_norm_out, l->ffn_gate_exps,
         l->ffn_up_exps, l->ffn_down_exps, ctx->selected_ids, ctx->selected_weights,
         ctx->moe_gate, ctx->moe_up, ctx->moe_mid, ctx->moe_down, dim, width,

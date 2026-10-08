@@ -3691,12 +3691,15 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
     threadgroup uint64_t *svalues = (threadgroup uint64_t *)(shmem);
     threadgroup uint8_t  *ssigns  = (threadgroup uint8_t *)(svalues + 256);
     {
-        int nval = 4;
-        int pos = (32 * sgitg + tiisg) * nval;
-        for (int i = 0; i < nval; ++i) svalues[pos + i] = ds4_metal_iq2xxs_grid[pos + i];
-        nval = 2;
-        pos = (32 * sgitg + tiisg) * nval;
-        for (int i = 0; i < nval; ++i) ssigns[pos + i] = ds4_metal_ksigns_iq2xs[pos + i];
+        const int linear_tid = 32 * sgitg + tiisg;
+        if (linear_tid < 64) {
+            int nval = 4;
+            int pos = linear_tid * nval;
+            for (int i = 0; i < nval; ++i) svalues[pos + i] = ds4_metal_iq2xxs_grid[pos + i];
+            nval = 2;
+            pos = linear_tid * nval;
+            for (int i = 0; i < nval; ++i) ssigns[pos + i] = ds4_metal_ksigns_iq2xs[pos + i];
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
@@ -3704,8 +3707,11 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
     device const float *y4 = y + 32 * ix;
 
     for (int ib32 = ix; ib32 < nb32; ib32 += 32) {
-        for (short i = 0; i < 32; ++i) {
-            yl[i] = y4[i];
+        device const float4 *y4_f4 = (device const float4 *)y4;
+        thread float4 *yl_f4 = (thread float4 *)yl;
+        #pragma unroll
+        for (short i = 0; i < 8; ++i) {
+            yl_f4[i] = y4_f4[i];
         }
 
         const int ibl = ib32 / (QK_K / 32);
@@ -6106,6 +6112,7 @@ kernel void kernel_mul_mv_id_q2_K_sum6_f32(
         for (int ib = ix; ib < nb; ib += 4) {
             float yl[32];
             float4 sumy = {0.f, 0.f, 0.f, 0.f};
+            #pragma unroll
             for (short i = 0; i < 8; ++i) {
                 yl[i+ 0] = y4[i+ 0]; sumy[0] += yl[i+ 0];
                 yl[i+ 8] = y4[i+32]; sumy[1] += yl[i+ 8];
@@ -6121,6 +6128,7 @@ kernel void kernel_mul_mv_id_q2_K_sum6_f32(
                 if (first_row + row < args.ne0) {
                     float4 acc1 = {0.f, 0.f, 0.f, 0.f};
                     float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+                    #pragma unroll
                     for (int i = 0; i < 8; i += 2) {
                         acc1[0] += yl[i+ 0] * (qs[i/2] & 0x0003);
                         acc2[0] += yl[i+ 1] * (qs[i/2] & 0x0300);
