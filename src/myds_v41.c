@@ -3765,22 +3765,34 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
 #define CHECK(x) do { if (!(x)) { MYDS_LOG_E("forward_tree_spec CHECK failed at line %d: %s", __LINE__, #x); goto fail; } } while (0)
 
     /* 2. 准备 Token 0, Token 1 (Branch A), Token 2 (Branch B) 的 Engram & Residual 初始化 */
+    myds_engram_history_t engram_hist_0 = {0};
+    myds_engram_history_t engram_hist_1 = {0};
+    myds_engram_history_t engram_hist_2 = {0};
+
     if (g->engram) {
         CHECK(myds_engram_prepare_token(g->engram, tokens[0], pos));
         for (uint32_t i = 0; i < 2; i++) {
             CHECK(myds_metal_buffer_write(ws->engram_rows_b2[0][i], 0,
                                           g->engram->row_values[i], MYDS_ENGRAM_INPUT_DIM * 4u));
         }
+        engram_hist_0 = g->engram->history;
+
         CHECK(myds_engram_prepare_token(g->engram, tokens[1], pos + 1u));
         for (uint32_t i = 0; i < 2; i++) {
             CHECK(myds_metal_buffer_write(ws->engram_rows_b2[1][i], 0,
                                           g->engram->row_values[i], MYDS_ENGRAM_INPUT_DIM * 4u));
         }
+        engram_hist_1 = g->engram->history;
+
+        /* Token 2 (Branch B) 从 Token 0 的状态分叉，同样位于 pos + 1u */
+        g->engram->history = engram_hist_0;
+        g->engram->position = pos + 1u;
         CHECK(myds_engram_prepare_token(g->engram, tokens[2], pos + 1u));
         for (uint32_t i = 0; i < 2; i++) {
             CHECK(myds_metal_buffer_write(ws->engram_rows_b2[2][i], 0,
                                           g->engram->row_values[i], MYDS_ENGRAM_INPUT_DIM * 4u));
         }
+        engram_hist_2 = g->engram->history;
     }
 
     float *res0 = (float *)myds_metal_buffer_data(ws->v_residual[0]);
@@ -3992,6 +4004,11 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_buffer_copy(g->pre, 0, ws->v_pre[1], 0, 4 * sizeof(float)));
         CHECK(myds_metal_commit_batch());
 
+        if (g->engram) {
+            g->engram->history = engram_hist_1;
+            g->engram->position = pos + 2u;
+        }
+
         g->next_position = pos + 2u;
         ctx->pos = pos + 2u;
         return 2;
@@ -4006,6 +4023,11 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_buffer_copy(g->pre, 0, ws->v_pre[2], 0, 4 * sizeof(float)));
         CHECK(myds_metal_commit_batch());
 
+        if (g->engram) {
+            g->engram->history = engram_hist_2;
+            g->engram->position = pos + 2u;
+        }
+
         g->next_position = pos + 2u;
         ctx->pos = pos + 2u;
         return 2;
@@ -4018,6 +4040,11 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_buffer_copy(g->pre, 0, ws->v_pre[0], 0, 4 * sizeof(float)));
         CHECK(myds_metal_commit_batch());
 
+        if (g->engram) {
+            g->engram->history = engram_hist_0;
+            g->engram->position = pos + 1u;
+        }
+
         g->next_position = pos + 1u;
         ctx->pos = pos + 1u;
         return 1;
@@ -4026,7 +4053,7 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
 fail:
     MYDS_LOG_E("V4.1 forward_tree_spec failed at pos %u", pos);
     (void)myds_metal_commit_batch();
-    g->valid = false;
+    (void)myds_v41_spec_snapshot_restore(ctx, &snap);
     return -1;
 #undef CHECK
 }
