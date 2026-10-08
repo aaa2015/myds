@@ -4143,7 +4143,7 @@ int myds_v41_forward_batch_spec(myds_context_t *ctx, const int32_t *tokens,
     static int tree_spec_enabled = -1;
     if (tree_spec_enabled < 0) {
         const char *e = getenv("MYDS_TREE_SPEC");
-        tree_spec_enabled = (e && atoi(e) != 0) ? 1 : 0;
+        tree_spec_enabled = (e && atoi(e) == 0) ? 0 : 1;
     }
 
     if (tree_spec_enabled && n_tokens >= 3) {
@@ -4155,7 +4155,7 @@ int myds_v41_forward_batch_spec(myds_context_t *ctx, const int32_t *tokens,
     static int batch2_enabled = -1;
     if (batch2_enabled < 0) {
         const char *e = getenv("MYDS_BATCH2_SPEC");
-        batch2_enabled = (e && atoi(e) != 0) ? 1 : 0;
+        batch2_enabled = (e && atoi(e) == 0) ? 0 : 1;
     }
 
     if (batch2_enabled && n_tokens >= 2) {
