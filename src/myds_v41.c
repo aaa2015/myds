@@ -4063,6 +4063,7 @@ int myds_v41_forward_batch_spec(myds_context_t *ctx, const int32_t *tokens,
 
     // 投机早退保护（Speculative Short-Circuit Protection）：
     if (n_tokens < 2 || next0 != tokens[1]) {
+        ctx->pos = pos + 1u;
         return 1;
     }
 
@@ -4070,6 +4071,7 @@ int myds_v41_forward_batch_spec(myds_context_t *ctx, const int32_t *tokens,
     int32_t next1 = myds_v41_forward(ctx, tokens[1], pos + 1, true);
     if (next1 < 0) return -1;
     out_tokens[1] = next1;
+    ctx->pos = pos + 2u;
     return 2;
 }
 

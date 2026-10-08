@@ -3416,7 +3416,8 @@ static int myds_generate_internal(myds_context_t *ctx,
 
                 int32_t out_tokens[3] = { 0, 0, 0 };
 
-                int ret = myds_v41_forward_batch_spec(ctx, tokens_to_forward, n_fwd, ctx->pos, out_tokens);
+                uint32_t spec_pos = ctx->pos;
+                int ret = myds_v41_forward_batch_spec(ctx, tokens_to_forward, n_fwd, spec_pos, out_tokens);
                 if (ret < 0 || out_tokens[0] < 0 || (uint32_t)out_tokens[0] >= m->tokenizer->vocab_size) {
                     if (snap_saved) myds_v41_spec_snapshot_restore(ctx, snap);
                     ctx->pcache_len = 0;
@@ -3445,29 +3446,37 @@ static int myds_generate_internal(myds_context_t *ctx,
                     step++;
 
                     if (out_tokens[0] == m->tokenizer->eos_id) {
+                        if (snap_saved) myds_v41_spec_snapshot_restore_partial(ctx, snap, 1);
+                        ctx->pos = spec_pos + 1u;
                         stop_reason = MYDS_STOP_EOS;
                         break;
                     }
 
                     if (step >= max_gen) {
+                        if (snap_saved) myds_v41_spec_snapshot_restore_partial(ctx, snap, 1);
+                        ctx->pos = spec_pos + 1u;
                         break;
                     }
 
                     // 2. 采纳第 2 个 Token (权威模型在命中分支上推理出的真实输出)
                     if (out_tokens[1] < 0 || (uint32_t)out_tokens[1] >= m->tokenizer->vocab_size) {
+                        if (snap_saved) myds_v41_spec_snapshot_restore_partial(ctx, snap, 1);
+                        ctx->pos = spec_pos + 1u;
                         stop_reason = MYDS_STOP_ERROR;
                         success = 0;
                         break;
                     }
 
-                    if (ctx->pcache_tokens && (ctx->pos + 1) < ctx->pcache_cap) {
-                        ctx->pcache_tokens[ctx->pos + 1] = out_tokens[0];
-                        if (ctx->pos + 2u > ctx->pcache_len) ctx->pcache_len = ctx->pos + 2u;
+                    if (ctx->pcache_tokens && (spec_pos + 1u) < ctx->pcache_cap) {
+                        ctx->pcache_tokens[spec_pos + 1u] = out_tokens[0];
+                        if (spec_pos + 2u > ctx->pcache_len) ctx->pcache_len = spec_pos + 2u;
                     }
 
                     size_t piece_len1 = 0;
                     const char *piece1 = myds_tokenizer_decode_bytes(m->tokenizer, out_tokens[1], &piece_len1);
                     if (!piece1) {
+                        if (snap_saved) myds_v41_spec_snapshot_restore_partial(ctx, snap, 1);
+                        ctx->pos = spec_pos + 1u;
                         stop_reason = MYDS_STOP_ERROR;
                         success = 0;
                         break;
@@ -3475,6 +3484,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                     if (bytes_cb) bytes_cb(piece1, piece_len1, out_tokens[1], user_data);
                     else if (cb) cb(piece1, out_tokens[1], user_data);
 
+                    ctx->pos = spec_pos + 2u;
                     step++;
                     cur_token = out_tokens[1];
 
@@ -3494,6 +3504,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                     if (bytes_cb) bytes_cb(piece, piece_len, out_tokens[0], user_data);
                     else if (cb) cb(piece, out_tokens[0], user_data);
 
+                    ctx->pos = spec_pos + 1u;
                     step++;
                     cur_token = out_tokens[0];
 
@@ -3692,7 +3703,8 @@ static int myds_generate_internal(myds_context_t *ctx,
                 int32_t tokens_to_forward[2] = { cur_token, draft_tokens[0] };
                 int32_t out_tokens[2] = { 0, 0 };
 
-                int ret = myds_v41_forward_batch_spec(ctx, tokens_to_forward, 2, ctx->pos, out_tokens);
+                uint32_t pld_pos = ctx->pos;
+                int ret = myds_v41_forward_batch_spec(ctx, tokens_to_forward, 2, pld_pos, out_tokens);
                 if (ret < 0 || out_tokens[0] < 0 || (uint32_t)out_tokens[0] >= m->tokenizer->vocab_size) {
                     if (snap_saved) myds_v41_spec_snapshot_restore(ctx, pld_snap);
                     ctx->pcache_len = 0;
@@ -3724,29 +3736,29 @@ static int myds_generate_internal(myds_context_t *ctx,
 
                     if (out_tokens[0] == m->tokenizer->eos_id) {
                         if (snap_saved) myds_v41_spec_snapshot_restore_partial(ctx, pld_snap, 1);
-                        else ctx->pos++;
+                        ctx->pos = pld_pos + 1u;
                         stop_reason = MYDS_STOP_EOS;
                         break;
                     }
 
                     if (step >= max_gen) {
                         if (snap_saved) myds_v41_spec_snapshot_restore_partial(ctx, pld_snap, 1);
-                        else ctx->pos++;
+                        ctx->pos = pld_pos + 1u;
                         break;
                     }
 
                     // 2. 采纳第 2 个 Token (out_tokens[1]，权威模型在真值 draft_tokens[0] 上推理出的真实输出)
                     if (out_tokens[1] < 0 || (uint32_t)out_tokens[1] >= m->tokenizer->vocab_size) {
                         if (snap_saved) myds_v41_spec_snapshot_restore_partial(ctx, pld_snap, 1);
-                        else ctx->pos++;
+                        ctx->pos = pld_pos + 1u;
                         stop_reason = MYDS_STOP_ERROR;
                         success = 0;
                         break;
                     }
 
-                    if (ctx->pcache_tokens && (ctx->pos + 1) < ctx->pcache_cap) {
-                        ctx->pcache_tokens[ctx->pos + 1] = out_tokens[0];
-                        if (ctx->pos + 2u > ctx->pcache_len) ctx->pcache_len = ctx->pos + 2u;
+                    if (ctx->pcache_tokens && (pld_pos + 1u) < ctx->pcache_cap) {
+                        ctx->pcache_tokens[pld_pos + 1u] = out_tokens[0];
+                        if (pld_pos + 2u > ctx->pcache_len) ctx->pcache_len = pld_pos + 2u;
                     }
                     if (pld_len < pld_cap) pld_history[pld_len++] = out_tokens[1];
 
@@ -3754,7 +3766,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                     const char *piece1 = myds_tokenizer_decode_bytes(m->tokenizer, out_tokens[1], &piece_len1);
                     if (!piece1) {
                         if (snap_saved) myds_v41_spec_snapshot_restore_partial(ctx, pld_snap, 1);
-                        else ctx->pos++;
+                        ctx->pos = pld_pos + 1u;
                         stop_reason = MYDS_STOP_ERROR;
                         success = 0;
                         break;
@@ -3762,7 +3774,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                     if (bytes_cb) bytes_cb(piece1, piece_len1, out_tokens[1], user_data);
                     else if (cb) cb(piece1, out_tokens[1], user_data);
 
-                    ctx->pos += 2;
+                    ctx->pos = pld_pos + 2u;
                     step++;
                     cur_token = out_tokens[1];
 
@@ -3775,9 +3787,8 @@ static int myds_generate_internal(myds_context_t *ctx,
                     // 回滚第 2 个槽位对 KV Cache 的污染修改，保留当前槽位的权威真值
                     if (snap_saved) {
                         myds_v41_spec_snapshot_restore_partial(ctx, pld_snap, 1);
-                    } else {
-                        ctx->pos++;
                     }
+                    ctx->pos = pld_pos + 1u;
 
                     if (pld_len < pld_cap) pld_history[pld_len++] = out_tokens[0];
 
