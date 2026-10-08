@@ -1696,10 +1696,12 @@ int myds_metal_v41_hc_mix(myds_metal_buffer_t *split,
         !isfinite(hc_eps) || hc_eps < 0 || !v41_floats(split, 24) || !v41_floats(mix, 24) ||
         !v41_floats(scale, 3) || !v41_floats(base, 24) ||
         split->offset % 16 || mix->offset % 16 || base->offset % 16) return 0;
-    if (!myds_metal_v41_rmsnorm(flat_norm, residual, NULL, 4u * dim, eps, false) ||
-        !(fn_type == GGML_TYPE_F16
+    if (!myds_metal_v41_rmsnorm(flat_norm, residual, NULL, 4u * dim, eps, false)) return 0;
+    if (!g_auto_barrier) myds_metal_barrier_buffer(flat_norm);
+    if (!(fn_type == GGML_TYPE_F16
             ? myds_metal_v41_gemv(mix, fn, flat_norm, 24, 4u * dim, fn_type)
             : myds_metal_gemv(mix, fn, flat_norm, 24, 4u * dim, fn_type))) return 0;
+    if (!g_auto_barrier) myds_metal_barrier_buffer(mix);
     @autoreleasepool {
         struct v41_hc_split_args args = {4, 20, 1, 24, 24 * sizeof(float), 24 * sizeof(float), hc_eps};
         id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];

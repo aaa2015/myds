@@ -33,6 +33,17 @@ int myds_v41_moe_fused(myds_context_t *ctx, uint32_t layer, uint32_t token, uint
                        myds_metal_buffer_t *residual,
                        const myds_metal_buffer_t *after_attn,
                        const myds_metal_buffer_t *ffn_split);
+/* S11 跨阶段全并发流水线：HC Mix 与 Shared Expert / Router GEMV / MoE 深度重叠 */
+int myds_v41_moe_pipeline(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t pos,
+                          myds_metal_buffer_t *residual,
+                          const myds_metal_buffer_t *after_attn,
+                          myds_metal_buffer_t *ffn_split,
+                          const myds_metal_buffer_t *ffn_fn,
+                          const myds_metal_buffer_t *ffn_scale,
+                          const myds_metal_buffer_t *ffn_base,
+                          myds_metal_buffer_t *flat_norm,
+                          myds_metal_buffer_t *mix,
+                          float hc_eps);
 int myds_v41_moe_eval(myds_context_t *ctx, uint32_t layer, uint32_t pos,
 
                       const myds_metal_buffer_t *ffn_norm,

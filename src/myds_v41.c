@@ -2970,20 +2970,8 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
         }
         TRACE("hc_ffn_input",ctx->x,V41_DIM);
         TRACE("ffn_norm",ctx->ffn_norm_out,V41_DIM);
-        CHECK(myds_metal_v41_hc_mix(g->ffn_split,g->after_attn,l->ffn_fn,GGML_TYPE_F16,l->ffn_scale,l->ffn_base,g->flat_norm,g->mix,V41_DIM,m->norm_eps,v->hc_eps));
-        TRACE("hc_ffn_mix",g->mix,24); TRACE("hc_ffn_split",g->ffn_split,24);
         phase="MoE";
-        static int fuse_moe_expand = -1;
-        if (__builtin_expect(fuse_moe_expand < 0, 0)) {
-            const char *v = getenv("MYDS_MOE_FUSE_EXPAND");
-            fuse_moe_expand = (v && strcmp(v, "0") == 0) ? 0 : 1;
-        }
-        if (fuse_moe_expand) {
-            CHECK(myds_v41_moe_fused(ctx,il,(uint32_t)token,pos,g->residual,g->after_attn,g->ffn_split));
-        } else {
-            CHECK(myds_v41_moe(ctx,il,(uint32_t)token,pos));
-            CHECK(myds_metal_v41_hc_expand(g->residual,ctx->ffn_out,g->after_attn,g->ffn_split,V41_DIM));
-        }
+        CHECK(myds_v41_moe_pipeline(ctx,il,(uint32_t)token,pos,g->residual,g->after_attn,g->ffn_split,l->ffn_fn,l->ffn_scale,l->ffn_base,g->flat_norm,g->mix,v->hc_eps));
         TRACE("layer_out",g->residual,4*V41_DIM);
         if (ctx->dspark && (il == 37 || il == 38 || il == 39)) {
             myds_dspark_capture_layer(ctx->dspark, il, g->residual);

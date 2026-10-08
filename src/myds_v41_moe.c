@@ -342,6 +342,9 @@ int myds_v41_moe_fused(myds_context_t *ctx, uint32_t layer, uint32_t token, uint
             if (!myds_metal_v41_moe_add_hc_expand(residual, ctx->ffn_out, ctx->moe_out, ctx->shared_out, after_attn, ffn_split, dim)) return 0;
         } else {
             if (!myds_metal_v41_add_bf16(ctx->ffn_out, ctx->moe_out, ctx->shared_out, dim)) return 0;
+            if (residual && after_attn && ffn_split) {
+                if (!myds_metal_v41_hc_expand(residual, ctx->ffn_out, after_attn, ffn_split, dim)) return 0;
+            }
         }
         return !trace_on || myds_trace_f32("ffnblock", layer, pos, ctx->ffn_out, dim);
     }
@@ -441,6 +444,14 @@ int myds_v41_moe_fused(myds_context_t *ctx, uint32_t layer, uint32_t token, uint
             return 0;
         }
         myds_metal_barrier_buffer(ctx->ffn_out);
+        if (residual && after_attn && ffn_split) {
+            if (!myds_metal_v41_hc_expand(residual, ctx->ffn_out, after_attn, ffn_split, dim)) {
+                myds_metal_set_auto_barrier(prev_auto_barrier);
+                myds_metal_set_concurrent(prev_concurrent);
+                return 0;
+            }
+            myds_metal_barrier_buffer(residual);
+        }
     }
     myds_metal_set_auto_barrier(prev_auto_barrier);
     myds_metal_set_concurrent(prev_concurrent);
@@ -450,4 +461,168 @@ int myds_v41_moe_fused(myds_context_t *ctx, uint32_t layer, uint32_t token, uint
 int myds_v41_moe(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t pos) {
     return myds_v41_moe_fused(ctx, layer, token, pos, NULL, NULL, NULL);
 }
+
+static inline bool is_moe_pipeline_enabled(void) {
+    static int cached = -1;
+    if (__builtin_expect(cached < 0, 0)) {
+        const char *v = getenv("MYDS_MOE_PIPELINE");
+        cached = (v && strcmp(v, "0") == 0) ? 0 : 1;
+    }
+    return cached == 1;
+}
+
+int myds_v41_moe_pipeline(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t pos,
+                          myds_metal_buffer_t *residual,
+                          const myds_metal_buffer_t *after_attn,
+                          myds_metal_buffer_t *ffn_split,
+                          const myds_metal_buffer_t *ffn_fn,
+                          const myds_metal_buffer_t *ffn_scale,
+                          const myds_metal_buffer_t *ffn_base,
+                          myds_metal_buffer_t *flat_norm,
+                          myds_metal_buffer_t *mix,
+                          float hc_eps) {
+    (void)token;
+    if (!ctx || !ctx->model || layer >= ctx->model->n_layers) return 0;
+    myds_model_t *m = ctx->model;
+    myds_layer_t *l = &m->layers[layer];
+    const uint32_t dim = m->dim, width = m->moe_expert_dim, k = m->n_activated_experts;
+    const bool trace_on = myds_trace_active();
+
+    if (trace_on || !is_moe_concurrent_enabled() || !is_moe_pipeline_enabled() ||
+        !ffn_split || !after_attn || !ffn_fn || !ffn_scale || !ffn_base || !flat_norm || !mix) {
+        /* 回退串行调度：先做 hc_mix，再调 myds_v41_moe_fused */
+        if (!myds_metal_v41_hc_mix(ffn_split, after_attn, ffn_fn, GGML_TYPE_F16,
+                                   ffn_scale, ffn_base, flat_norm, mix, dim, m->norm_eps, hc_eps)) return 0;
+        if (trace_on) {
+            if (!myds_trace_f32("hc_ffn_mix", layer, pos, mix, 24) ||
+                !myds_trace_f32("hc_ffn_split", layer, pos, ffn_split, 24)) return 0;
+        }
+        return myds_v41_moe_fused(ctx, layer, token, pos, residual, after_attn, ffn_split);
+    }
+
+    if (m->n_routed_experts != 384 || k != 6 || m->n_shared_experts != 1 ||
+        !dim || !width || dim % 256 || width % 256 ||
+        l->ffn_gate_exps_type != GGML_TYPE_IQ2_XXS ||
+        l->ffn_up_exps_type != GGML_TYPE_IQ2_XXS ||
+        l->ffn_down_exps_type != GGML_TYPE_Q2_K) return 0;
+
+    /* === S11 跨阶段全并发流水线 === */
+    const int prev_auto_barrier = myds_metal_get_auto_barrier();
+    const int prev_concurrent = myds_metal_get_concurrent();
+    myds_metal_set_auto_barrier(0);
+    myds_metal_set_concurrent(1);
+
+    /* 1. 并发派发 HC Mix 流 (RMSNorm 20480 + GEMV 24x20480 + Sinkhorn) */
+    if (!myds_metal_v41_hc_mix(ffn_split, after_attn, ffn_fn, GGML_TYPE_F16,
+                               ffn_scale, ffn_base, flat_norm, mix, dim, m->norm_eps, hc_eps)) {
+        myds_metal_set_auto_barrier(prev_auto_barrier);
+        myds_metal_set_concurrent(prev_concurrent);
+        return 0;
+    }
+
+    /* 2. 并发派发 Shared Expert Gate/Up/SwiGLU 流 */
+    int sh_fused_ok = 0;
+    if (is_shared_fuse_enabled()) {
+        sh_fused_ok = myds_v41_shared_gate_up_swiglu(
+            ctx->shared_swiglu_out, l->shared_gate, l->shared_up, ctx->ffn_norm_out,
+            width, dim, l->shared_gate_type, l->shared_up_type, m->swiglu_clamp_exp);
+    }
+    if (!sh_fused_ok) {
+        if (!myds_v41_decode_gemv_bf16(ctx->shared_gate_out, l->shared_gate, ctx->ffn_norm_out,
+                                      width, dim, l->shared_gate_type, false) ||
+            !myds_v41_decode_gemv_bf16(ctx->shared_up_out, l->shared_up, ctx->ffn_norm_out,
+                                      width, dim, l->shared_up_type, false)) {
+            myds_metal_set_auto_barrier(prev_auto_barrier);
+            myds_metal_set_concurrent(prev_concurrent);
+            return 0;
+        }
+    }
+
+    /* 3. 并发派发 Router GEMV 流 */
+    if (!myds_metal_v41_gemv(ctx->router_logits, l->router_gate, ctx->ffn_norm_out,
+                             m->n_routed_experts, dim, l->router_gate_type)) {
+        myds_metal_set_auto_barrier(prev_auto_barrier);
+        myds_metal_set_concurrent(prev_concurrent);
+        return 0;
+    }
+
+    /* 4. 仅同步 router_logits，派发路由打分与 Top-K 选择流水线 */
+    myds_metal_barrier_buffer(ctx->router_logits);
+    if (!myds_v41_route(ctx->selected_ids, ctx->selected_weights, ctx->moe_gate, ctx->moe_up,
+                        ctx->router_logits, l->router_bias, m->n_routed_experts, k, m->routed_scaling_factor)) {
+        myds_metal_set_auto_barrier(prev_auto_barrier);
+        myds_metal_set_concurrent(prev_concurrent);
+        return 0;
+    }
+
+    /* 5. 若未融合，仅同步 shared_gate_out 与 shared_up_out，派发 Shared SwiGLU */
+    if (!sh_fused_ok) {
+        const myds_metal_buffer_t *shared_gu_deps[] = { ctx->shared_gate_out, ctx->shared_up_out };
+        myds_metal_barrier_buffers(shared_gu_deps, 2);
+        if (!myds_v41_shared_swiglu(ctx->shared_swiglu_out, ctx->shared_gate_out,
+                                   ctx->shared_up_out, width, m->swiglu_clamp_exp)) {
+            myds_metal_set_auto_barrier(prev_auto_barrier);
+            myds_metal_set_concurrent(prev_concurrent);
+            return 0;
+        }
+    }
+
+    /* 6. 仅同步 shared_swiglu_out，派发 Shared Down GEMV */
+    myds_metal_barrier_buffer(ctx->shared_swiglu_out);
+    if (!myds_v41_decode_gemv_bf16(ctx->shared_out, l->shared_down, ctx->shared_swiglu_out,
+                                  dim, width, l->shared_down_type, false)) {
+        myds_metal_set_auto_barrier(prev_auto_barrier);
+        myds_metal_set_concurrent(prev_concurrent);
+        return 0;
+    }
+
+    /* 7. 仅同步路由输出与选择结果，启动 Routed MoE（与 Shared Down GEMV 在 GPU 上并发） */
+    const myds_metal_buffer_t *moe_deps[] = {
+        ctx->selected_ids, ctx->selected_weights
+    };
+    myds_metal_barrier_buffers(moe_deps, 2);
+    if (!myds_metal_routed_moe(ctx->moe_out, ctx->ffn_norm_out, l->ffn_gate_exps,
+        l->ffn_up_exps, l->ffn_down_exps, ctx->selected_ids, ctx->selected_weights,
+        ctx->moe_gate, ctx->moe_up, ctx->moe_mid, ctx->moe_down, dim, width,
+        m->n_routed_experts, k, l->ffn_gate_exps_type, l->ffn_up_exps_type,
+        l->ffn_down_exps_type, m->swiglu_clamp_exp)) {
+        myds_metal_set_auto_barrier(prev_auto_barrier);
+        myds_metal_set_concurrent(prev_concurrent);
+        return 0;
+    }
+
+    /* 8. 等待 Routed MoE (moe_out), Shared Expert (shared_out), 和 HC Mix (ffn_split) 三路全部汇聚 */
+    const myds_metal_buffer_t *final_deps[] = { ctx->moe_out, ctx->shared_out, ffn_split };
+    myds_metal_barrier_buffers(final_deps, 3);
+
+    const bool can_fuse = (residual && after_attn && ffn_split && is_moe_fuse_expand_enabled());
+    if (can_fuse) {
+        /* S10 深度算子融合：直接将 moe_out + shared_out 与 HC expand 四通道广播累加融合为单次派发 */
+        if (!myds_metal_v41_moe_add_hc_expand(residual, ctx->ffn_out, ctx->moe_out, ctx->shared_out, after_attn, ffn_split, dim)) {
+            myds_metal_set_auto_barrier(prev_auto_barrier);
+            myds_metal_set_concurrent(prev_concurrent);
+            return 0;
+        }
+        myds_metal_barrier_buffer(residual);
+    } else {
+        if (!myds_metal_v41_add_bf16(ctx->ffn_out, ctx->moe_out, ctx->shared_out, dim)) {
+            myds_metal_set_auto_barrier(prev_auto_barrier);
+            myds_metal_set_concurrent(prev_concurrent);
+            return 0;
+        }
+        myds_metal_barrier_buffer(ctx->ffn_out);
+        if (residual && after_attn && ffn_split) {
+            if (!myds_metal_v41_hc_expand(residual, ctx->ffn_out, after_attn, ffn_split, dim)) {
+                myds_metal_set_auto_barrier(prev_auto_barrier);
+                myds_metal_set_concurrent(prev_concurrent);
+                return 0;
+            }
+            myds_metal_barrier_buffer(residual);
+        }
+    }
+    myds_metal_set_auto_barrier(prev_auto_barrier);
+    myds_metal_set_concurrent(prev_concurrent);
+    return 1;
+}
+
 
