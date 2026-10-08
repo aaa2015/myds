@@ -4188,36 +4188,32 @@ int myds_v41_forward_batch_spec(myds_context_t *ctx, const int32_t *tokens,
                                 int32_t *out_tokens) {
     if (!ctx || !tokens || !out_tokens || n_tokens == 0) return -1;
 
-    bool high_conf = false;
-    if (ctx->dspark && ctx->dspark->is_high_confidence) {
-        high_conf = true;
-    }
-
-    static int tree_spec_enabled = -1;
-    if (tree_spec_enabled < 0) {
-        const char *e = getenv("MYDS_TREE_SPEC");
-        tree_spec_enabled = (e && atoi(e) != 0) ? 1 : 0;
-    }
-
-    if (high_conf && tree_spec_enabled && n_tokens >= 3) {
-        int ret = myds_v41_forward_tree_spec(ctx, tokens, pos, out_tokens);
-        if (ret > 0) return ret;
-        MYDS_LOG_W("forward_tree_spec returned %d, falling back to batch2", ret);
-    }
-
     static int batch2_enabled = -1;
     if (batch2_enabled < 0) {
         const char *e = getenv("MYDS_BATCH2_SPEC");
         batch2_enabled = (e && atoi(e) == 0) ? 0 : 1;
     }
 
-    if (high_conf && batch2_enabled && n_tokens >= 2) {
+    if (batch2_enabled && n_tokens >= 2) {
+        const double t0 = lowkv_now_ms();
         int ret = myds_v41_forward_batch2(ctx, tokens, pos, out_tokens);
+        const double el = lowkv_now_ms() - t0;
+        static uint64_t s_b2_runs = 0;
+        static double s_b2_total_ms = 0.0;
+        static uint64_t s_b2_hits = 0;
+        s_b2_runs++;
+        s_b2_total_ms += el;
+        if (ret == 2) s_b2_hits++;
+        if ((s_b2_runs % 20) == 0) {
+            MYDS_LOG_I("Batch-2 Spec Perf: %llu runs, last=%.2f ms, avg=%.2f ms, hit_rate=%.1f%% (%llu/%llu)",
+                       s_b2_runs, el, s_b2_total_ms / s_b2_runs,
+                       (double)s_b2_hits * 100.0 / s_b2_runs, s_b2_hits, s_b2_runs);
+        }
         if (ret > 0) return ret;
         MYDS_LOG_W("forward_batch2 returned %d, falling back to sequential speculative check", ret);
     }
 
-    // 1. 先前向第一个 token
+    // 1. 先前向第一个 token（后备回退）
     int32_t next0 = myds_v41_forward(ctx, tokens[0], pos, true);
     if (next0 < 0) return -1;
     out_tokens[0] = next0;
