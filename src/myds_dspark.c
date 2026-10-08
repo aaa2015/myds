@@ -457,6 +457,11 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
             ds->draft_tree_tokens[1] = best_token2;
             ds->draft_tree_scores[1] = best_score2;
             ds->draft_tree_count = 2;
+            static int propose_dbg = 0;
+            if (propose_dbg++ < 10) {
+                MYDS_LOG_I("dspark_propose[d=0]: prev=%d, base_logits=%p, Top1=%d (score=%.2f), Top2=%d (score=%.2f)",
+                           prev, base_logits, best_token, best_score, best_token2, best_score2);
+            }
         }
 
         ds->draft_tokens[n_proposed++] = best_token;
