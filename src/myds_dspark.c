@@ -464,6 +464,21 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
             ds->draft_tree_tokens[1] = best_token2;
             ds->draft_tree_scores[1] = best_score2;
             ds->draft_tree_count = 2;
+
+            static float min_margin = -1.0f;
+            if (__builtin_expect(min_margin < -0.5f, 0)) {
+                const char *env = getenv("MYDS_DSPARK_MIN_MARGIN");
+                min_margin = env ? (float)atof(env) : 0.80f;
+                MYDS_LOG_I("DSpark logit margin gating active: threshold=%.2f", min_margin);
+            }
+
+            if (min_margin > 0.0f && (best_score - best_score2) < min_margin) {
+                // Top-1 vs Top-2 margin too narrow: skip speculative proposal
+                ds->draft_count = 0;
+                ds->draft_tree_count = 0;
+                ds->propose_ms += (now_ms() - t0);
+                return 0;
+            }
         }
 
         ds->draft_tokens[n_proposed++] = best_token;

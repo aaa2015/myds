@@ -3352,7 +3352,6 @@ static int myds_generate_internal(myds_context_t *ctx,
                 uint32_t n_pld = myds_pld_propose(pld_history, pld_len, &pld_cfg, pld_draft);
                 if (n_pld > 0) {
                     cand_a = pld_draft[0];
-                    if (n_pld > 1) cand_b = pld_draft[1];
                 }
             }
 
@@ -3372,6 +3371,9 @@ static int myds_generate_internal(myds_context_t *ctx,
                             cand_b = ds1;
                         }
                     }
+                } else if (cand_a >= 0) {
+                    // DSpark 因置信度未出词，但 PLD 出词发起了投机，记入投机草稿统计
+                    ctx->dspark->proposed_tokens += 1;
                 }
             }
 

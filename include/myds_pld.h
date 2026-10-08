@@ -35,7 +35,7 @@ static inline myds_pld_config_t myds_pld_default_config(int32_t eos_id) {
     myds_pld_config_t cfg;
     cfg.max_draft = MYDS_PLD_DEFAULT_MAX_DRAFT;
     const char *min_ng_env = getenv("MYDS_PLD_MIN_NGRAM");
-    cfg.min_ngram = (min_ng_env && atoi(min_ng_env) > 0) ? (uint32_t)atoi(min_ng_env) : 3;
+    cfg.min_ngram = (min_ng_env && atoi(min_ng_env) > 0) ? (uint32_t)atoi(min_ng_env) : MYDS_PLD_DEFAULT_MIN_NGRAM;
     const char *max_ng_env = getenv("MYDS_PLD_MAX_NGRAM");
     cfg.max_ngram = (max_ng_env && atoi(max_ng_env) >= (int)cfg.min_ngram) ? (uint32_t)atoi(max_ng_env) : (cfg.min_ngram >= 3 ? cfg.min_ngram + 1 : 4);
     cfg.eos_token_id = eos_id;
