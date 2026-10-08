@@ -538,6 +538,7 @@ static int topk_rows_causal(myds_metal_buffer_t *ids,const myds_metal_buffer_t *
         &a,sizeof(a),b,2,npr*n_rows,1,1,nth,1,1,((size_t)nth*8+15)&~(size_t)15))return 0;
     myds_metal_buffer_t *cur=tmp_a,*next=tmp_b;
     for(uint32_t len=blocktop;len<layout;len*=2) {
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(cur);
         uint32_t nm=(layout+2*len-1)/(2*len);
         struct merge_args m={.ne00=n_cols,.ne01=n_rows,.ne02=1,.ne03=1,.nb00=4,
             .nb01=(uint64_t)n_cols*4,.nb02=(uint64_t)n_cols*n_rows*4,.nb03=(uint64_t)n_cols*n_rows*4,
@@ -549,6 +550,7 @@ static int topk_rows_causal(myds_metal_buffer_t *ids,const myds_metal_buffer_t *
             &m,sizeof(m),mb,3,nm*n_rows,1,1,len<512?len:512,1,1,0))return 0;
         myds_metal_buffer_t *tmp=cur;cur=next;next=tmp;
     }
+    if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(ids);
     return 1;
 }
 int myds_v41_gpu_topk(myds_metal_buffer_t *ids,const myds_metal_buffer_t *scores,
@@ -576,9 +578,10 @@ int myds_v41_gpu_topkmask_rows(myds_metal_buffer_t *mask,const myds_metal_buffer
     const uint64_t clear=(uint64_t)n_cols*rows;
     const uint64_t scatter=(uint64_t)top*rows;
     if(clear>UINT32_MAX*256ull||scatter>UINT32_MAX*256ull)return 0;
-    return dispatch("kernel_dsv4_topk_mask",&a,sizeof(a),b,2,
-               (uint32_t)((clear+255u)/256u),1,1,256,1,1,0)&&
-        dispatch("kernel_dsv4_topk_mask_scatter",&a,sizeof(a),b,2,
+    if (!dispatch("kernel_dsv4_topk_mask",&a,sizeof(a),b,2,
+               (uint32_t)((clear+255u)/256u),1,1,256,1,1,0)) return 0;
+    if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(mask);
+    return dispatch("kernel_dsv4_topk_mask_scatter",&a,sizeof(a),b,2,
                (uint32_t)((scatter+255u)/256u),1,1,256,1,1,0);
 }
 int myds_v41_gpu_gather(myds_metal_buffer_t *out,const myds_metal_buffer_t *cache,

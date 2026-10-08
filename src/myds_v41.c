@@ -2384,11 +2384,21 @@ myds_v41_context_t *myds_v41_context_create_for_model(const myds_model_t *model)
 static int project(myds_metal_buffer_t *out, const myds_metal_buffer_t *w,
                    const myds_metal_buffer_t *in, uint32_t rows, uint32_t width,
                    ggml_type type, bool round) {
-    myds_metal_barrier();
-    return ((type == GGML_TYPE_F16 || type == GGML_TYPE_F32)
+    if (myds_metal_get_auto_barrier()) {
+        myds_metal_barrier();
+    } else {
+        myds_metal_barrier_buffer(in);
+    }
+    int ok = ((type == GGML_TYPE_F16 || type == GGML_TYPE_F32)
         ? myds_metal_v41_gemv(out,w,in,rows,width,type)
-        : myds_metal_gemv(out,w,in,rows,width,type)) &&
-        (!round || myds_metal_v41_bf16(out,rows));
+        : myds_metal_gemv(out,w,in,rows,width,type));
+    if (!ok) return 0;
+    if (round) {
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(out);
+        if (!myds_metal_v41_bf16(out,rows)) return 0;
+    }
+    if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(out);
+    return 1;
 }
 
 static int qkv_fusion_enabled(const char *name,int *cached) {
@@ -2485,20 +2495,39 @@ static int publish_compressor(myds_context_t *ctx, uint32_t il, uint32_t pos,
             CHECK(project(g->pool_score,l->compressor_gate,x_norm,512,V41_DIM,GGML_TYPE_F16,false));
             p_score = g->pool_score;
         }
+        if (!myds_metal_get_auto_barrier()) {
+            const myds_metal_buffer_t *pool_deps[] = { p_kv, p_score };
+            myds_metal_barrier_buffers(pool_deps, 2);
+        }
         CHECK(myds_v41_gpu_pool2(g->latent,p_kv,p_score,
             g->previous_kv[owner],g->previous_score[owner],512,pos));
-    } else CHECK(myds_metal_buffer_copy(g->latent,0,p_kv,0,512*4u));
+    } else {
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(p_kv);
+        CHECK(myds_metal_buffer_copy(g->latent,0,p_kv,0,512*4u));
+    }
     if ((pos+1u)%ratio==0) {
         const uint32_t start=pos+1u-ratio;
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->latent);
         CHECK(myds_metal_v41_rmsnorm(g->latent,g->latent,l->compressor_norm,512,ctx->model->norm_eps,true));
         CHECK(project(g->index_k,l->index_k,g->latent,128,512,GGML_TYPE_F16,true));
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->index_k);
         CHECK(myds_metal_v41_rmsnorm(g->index_k,g->index_k,l->index_k_norm,128,ctx->model->norm_eps,true));
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->index_k);
         CHECK(myds_v41_gpu_rope(g->index_k,128,1,start,true,false));
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->index_k);
         CHECK(myds_v41_gpu_quant(g->index_k,128,1,2));
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->index_k);
         CHECK(myds_v41_gpu_pack_bf16(g->index_cache[owner],(size_t)(count-1)*128u,g->index_k,0,128u));
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->latent);
         CHECK(myds_v41_gpu_rope(g->latent,512,1,start,true,false));
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->latent);
         CHECK(myds_v41_gpu_quant(g->latent,512,1,3));
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->latent);
         CHECK(myds_v41_gpu_pack_bf16(g->compressed[owner],(size_t)(count-1)*512u,g->latent,0,512u));
+        if (!myds_metal_get_auto_barrier()) {
+            const myds_metal_buffer_t *comp_out[] = { g->index_cache[owner], g->compressed[owner] };
+            myds_metal_barrier_buffers(comp_out, 2);
+        }
     }
 #undef CHECK
     return 1;
@@ -2621,7 +2650,9 @@ static int publish_indexer_one(myds_context_t *ctx, uint32_t il, uint32_t pos,
             CHECK(project(g->index_q,l->index_q,qr_norm,V41_INDEX_HEADS*128,1280,GGML_TYPE_F16,true));
             q_buf = g->index_q;
         }
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(q_buf);
         CHECK(myds_v41_gpu_rope(q_buf,128,V41_INDEX_HEADS,pos,true,false));
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(q_buf);
         CHECK(myds_v41_gpu_quant(q_buf,128,V41_INDEX_HEADS,2));
 
         const myds_metal_buffer_t *w_buf = pre_index_weights;
@@ -2631,18 +2662,29 @@ static int publish_indexer_one(myds_context_t *ctx, uint32_t il, uint32_t pos,
         }
 
         const myds_metal_buffer_t *b_mask = (il > 20) ? (in_block_mask ? in_block_mask : g->block_mask) : NULL;
+        if (!myds_metal_get_auto_barrier()) {
+            const myds_metal_buffer_t *score_deps[] = { q_buf, w_buf };
+            myds_metal_barrier_buffers(score_deps, 2);
+        }
         CHECK(myds_v41_gpu_indexscores_masked_bf16(g->index_scores,q_buf,w_buf,g->index_cache[owner],b_mask,count,V41_INDEX_HEADS));
         if (il==20) {
             uint32_t blocks=(count+7)/8,top=block_budget_cap(blocks<2048?blocks:2048);
+            if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->index_scores);
             CHECK(myds_v41_gpu_candidates(g->block_scores,g->index_scores,count,pos,ratio));
+            if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->block_scores);
             CHECK(myds_v41_gpu_topk(g->block_selected,g->block_scores,blocks,top,g->gpu));
             myds_metal_buffer_t *b_mask_out = out_block_mask ? out_block_mask : g->block_mask;
+            if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->block_selected);
             CHECK(myds_v41_gpu_topkmask(b_mask_out,g->block_selected,blocks,top));
+            if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(b_mask_out);
         } else if (il>20) {
+            if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->index_scores);
             CHECK(myds_v41_gpu_filter(g->index_scores,b_mask,count,pos,ratio));
         }
         myds_metal_buffer_t *sel = out_selected ? out_selected : g->selected;
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->index_scores);
         CHECK(myds_v41_gpu_topk(sel,g->index_scores,count,count<V41_TOPK?count:V41_TOPK,g->gpu));
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(sel);
     }
 #undef CHECK
     return 1;
@@ -2866,6 +2908,7 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
         const myds_layer_t *base=&m->layers[il];
         const v41_layer_t *l=&v->layers[il];
         const bool compressed=ratio_for(il)!=0;
+        const uint32_t count=compressed?(pos+1u)/ratio_for(il):0;
         phase="HC attention input";
         if (il==1 || il==14) {
             uint32_t e=il==1?0:1;
@@ -2934,28 +2977,68 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
             CHECK(project_decode_qkv(ctx->qr,base->attn_q_a,ctx->x_norm,1280,V41_DIM,base->attn_q_a_type,false));
             CHECK(project_decode_qkv(ctx->kv_act,base->attn_kv,ctx->x_norm,512,V41_DIM,base->attn_kv_type,false));
 
-            /* 仅同步 q_a 与 kv_a 输出，恢复全局自同步以保后续 indexer 与 attention 逻辑 */
+            /* 仅同步 q_a 与 kv_a 输出，计算 RMSNorm */
             const myds_metal_buffer_t *qkv_out[] = { ctx->qr, ctx->kv_act };
             myds_metal_barrier_buffers(qkv_out, 2);
-            myds_metal_set_auto_barrier(prev_auto_barrier);
 
             CHECK(myds_metal_v41_rmsnorm(ctx->qr_norm,ctx->qr,base->attn_q_a_norm,1280,m->norm_eps,true));
             CHECK(myds_metal_v41_rmsnorm(ctx->kv_act,ctx->kv_act,base->attn_kv_a_norm,512,m->norm_eps,true));
-            phase="compressed KV / indexer";
-            CHECK(publish_and_select(ctx,il,pos,ctx->x_norm,ctx->qr_norm,NULL,NULL,NULL,NULL,NULL,NULL,NULL));
-            phase="attention projections";
-            CHECK(project_decode_qkv(ctx->q,base->attn_q_b,ctx->qr_norm,V41_HEADS*512,1280,base->attn_q_b_type,false));
-            static int qkv_post_enabled=-1;
-            if(qkv_fusion_enabled("MYDS_QKV_FUSE_POST",&qkv_post_enabled)) {
-                CHECK(myds_v41_gpu_qkv_finish(ctx->q,ctx->kv_act,g->window[il],pos,compressed));
+
+            static int indexer_pipeline_enabled = -1;
+            if (indexer_pipeline_enabled < 0) {
+                const char *env = getenv("MYDS_ATTN_INDEXER_PIPELINE");
+                indexer_pipeline_enabled = (env == NULL || atoi(env) != 0);
+            }
+
+            if (indexer_pipeline_enabled) {
+                /* 保持 auto_barrier = 0 跨流并发：
+                 * 1. 同步 RMSNorm 输出供 Q_B 与 Indexer 消费
+                 * 2. 并发派发 Q_B (32768 x 1280 GEMV) 与 publish_and_select (压缩器 + Indexer)
+                 * 3. 仅同步 ctx->q，派发 qkv_finish
+                 * 4. 汇聚等待 QKV finish 与 Indexer 全部完成，恢复 auto_barrier
+                 */
+                const myds_metal_buffer_t *norm_out[] = { ctx->qr_norm, ctx->kv_act };
+                myds_metal_barrier_buffers(norm_out, 2);
+
+                CHECK(project_decode_qkv(ctx->q,base->attn_q_b,ctx->qr_norm,V41_HEADS*512,1280,base->attn_q_b_type,false));
+                phase="compressed KV / indexer";
+                CHECK(publish_and_select(ctx,il,pos,ctx->x_norm,ctx->qr_norm,NULL,NULL,NULL,NULL,NULL,NULL,NULL));
+
+                myds_metal_barrier_buffer(ctx->q);
+                static int qkv_post_enabled=-1;
+                if(qkv_fusion_enabled("MYDS_QKV_FUSE_POST",&qkv_post_enabled)) {
+                    CHECK(myds_v41_gpu_qkv_finish(ctx->q,ctx->kv_act,g->window[il],pos,compressed));
+                } else {
+                    CHECK(myds_v41_gpu_rope(ctx->q,512,V41_HEADS,pos,compressed,false));
+                    CHECK(myds_v41_gpu_rope(ctx->kv_act,512,1,pos,compressed,false));
+                    myds_metal_barrier_buffer(ctx->kv_act);
+                    CHECK(myds_v41_gpu_quant(ctx->kv_act,512,1,1));
+                    myds_metal_barrier_buffer(ctx->kv_act);
+                    CHECK(myds_metal_buffer_copy(g->window[il],(size_t)(pos%128)*512*4u,ctx->kv_act,0,512*4u));
+                }
+
+                const myds_metal_buffer_t *attn_in_deps[] = {
+                    ctx->q, g->window[il], count ? g->selected : NULL, count ? g->compressed[owner_for(il)] : NULL
+                };
+                myds_metal_barrier_buffers(attn_in_deps, 4);
+                myds_metal_set_auto_barrier(prev_auto_barrier);
             } else {
-                CHECK(myds_v41_gpu_rope(ctx->q,512,V41_HEADS,pos,compressed,false));
-                CHECK(myds_v41_gpu_rope(ctx->kv_act,512,1,pos,compressed,false));
-                CHECK(myds_v41_gpu_quant(ctx->kv_act,512,1,1));
-                CHECK(myds_metal_buffer_copy(g->window[il],(size_t)(pos%128)*512*4u,ctx->kv_act,0,512*4u));
+                myds_metal_set_auto_barrier(prev_auto_barrier);
+                phase="compressed KV / indexer";
+                CHECK(publish_and_select(ctx,il,pos,ctx->x_norm,ctx->qr_norm,NULL,NULL,NULL,NULL,NULL,NULL,NULL));
+                phase="attention projections";
+                CHECK(project_decode_qkv(ctx->q,base->attn_q_b,ctx->qr_norm,V41_HEADS*512,1280,base->attn_q_b_type,false));
+                static int qkv_post_enabled=-1;
+                if(qkv_fusion_enabled("MYDS_QKV_FUSE_POST",&qkv_post_enabled)) {
+                    CHECK(myds_v41_gpu_qkv_finish(ctx->q,ctx->kv_act,g->window[il],pos,compressed));
+                } else {
+                    CHECK(myds_v41_gpu_rope(ctx->q,512,V41_HEADS,pos,compressed,false));
+                    CHECK(myds_v41_gpu_rope(ctx->kv_act,512,1,pos,compressed,false));
+                    CHECK(myds_v41_gpu_quant(ctx->kv_act,512,1,1));
+                    CHECK(myds_metal_buffer_copy(g->window[il],(size_t)(pos%128)*512*4u,ctx->kv_act,0,512*4u));
+                }
             }
         }
-        uint32_t count=compressed?(pos+1u)/ratio_for(il):0;
         uint32_t top=count<V41_TOPK?count:V41_TOPK;
         uint32_t nraw=pos+1u<128?pos+1u:128;
         phase="attention reduction";
