@@ -17,6 +17,7 @@
 #include "myds_metal.h"
 #include "myds_v41_gpu.h"
 #include "myds_v41_moe.h"
+#include "myds_v41_decode.h"
 #include "myds_server_internal.h"
 #include "myds_snapshot_slots.h"
 
@@ -2091,6 +2092,109 @@ static void test_p1_attn_direct_pack_fusion(void) {
     printf("  [PASS] Attention direct packing (circular window + direct BF16 gather) bit-exact parity verified\n");
 }
 
+static void test_p1_shared_expert_fusion(void) {
+    if (!myds_metal_init(NULL)) {
+        fprintf(stderr, "skip test_p1_shared_expert_fusion: no Metal\n");
+        return;
+    }
+    const uint32_t in_dim = 4096;
+    const uint32_t out_dim = 2304;
+    const uint32_t row_bytes = (in_dim / 32u) * 34u; // 128 * 34 = 4352
+    const size_t weight_bytes = (size_t)out_dim * row_bytes; // 10,027,008
+
+    myds_metal_buffer_t *gate_w = myds_metal_buffer_alloc(weight_bytes);
+    myds_metal_buffer_t *up_w   = myds_metal_buffer_alloc(weight_bytes);
+    myds_metal_buffer_t *x      = myds_metal_buffer_alloc(in_dim * sizeof(float));
+    myds_metal_buffer_t *gate_out = myds_metal_buffer_alloc(out_dim * sizeof(float));
+    myds_metal_buffer_t *up_out   = myds_metal_buffer_alloc(out_dim * sizeof(float));
+    myds_metal_buffer_t *swiglu_unfused = myds_metal_buffer_alloc(out_dim * sizeof(float));
+    myds_metal_buffer_t *swiglu_fused   = myds_metal_buffer_alloc(out_dim * sizeof(float));
+    assert(gate_w && up_w && x && gate_out && up_out && swiglu_unfused && swiglu_fused);
+
+    // 填充输入 x
+    float *x_ptr = (float *)myds_metal_buffer_data(x);
+    for (size_t i = 0; i < in_dim; i++) {
+        x_ptr[i] = (float)sin((double)i * 0.019) * 1.25f;
+    }
+
+    // 填充 Q8_0 权重 (gate_w 与 up_w)
+    uint8_t *gw_ptr = (uint8_t *)myds_metal_buffer_data(gate_w);
+    uint8_t *uw_ptr = (uint8_t *)myds_metal_buffer_data(up_w);
+    uint16_t scale_half = 0x2e00; // ~0.08984f in float16
+    for (size_t row = 0; row < out_dim; row++) {
+        uint8_t *grow = gw_ptr + row * row_bytes;
+        uint8_t *urow = uw_ptr + row * row_bytes;
+        for (size_t b = 0; b < in_dim / 32u; b++) {
+            memcpy(grow + b * 34u, &scale_half, 2);
+            memcpy(urow + b * 34u, &scale_half, 2);
+            int8_t *gqs = (int8_t *)(grow + b * 34u + 2);
+            int8_t *uqs = (int8_t *)(urow + b * 34u + 2);
+            for (size_t j = 0; j < 32; j++) {
+                gqs[j] = (int8_t)(((row * 13 + b * 7 + j * 3) % 127) - 63);
+                uqs[j] = (int8_t)(((row * 17 + b * 11 + j * 5) % 127) - 63);
+            }
+        }
+    }
+
+    struct {
+        float clamp;
+        const char *nr0;
+    } cases[] = {
+        {0.0f, "4"},
+        {10.0f, "4"},
+        {1.5f, "4"},
+        {10.0f, "2"},
+        {2.0f, "2"},
+    };
+
+    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
+        float clamp = cases[c].clamp;
+        setenv("MYDS_SHARED_NR0", cases[c].nr0, 1);
+
+        memset(myds_metal_buffer_data(gate_out), 0, out_dim * sizeof(float));
+        memset(myds_metal_buffer_data(up_out), 0, out_dim * sizeof(float));
+        memset(myds_metal_buffer_data(swiglu_unfused), 0, out_dim * sizeof(float));
+        memset(myds_metal_buffer_data(swiglu_fused), 0, out_dim * sizeof(float));
+
+        // 1. 基准路径：GEMV_gate + GEMV_up + SwiGLU
+        assert(myds_v41_decode_gemv_bf16(gate_out, gate_w, x, out_dim, in_dim, GGML_TYPE_Q8_0, false));
+        assert(myds_v41_decode_gemv_bf16(up_out, up_w, x, out_dim, in_dim, GGML_TYPE_Q8_0, false));
+        assert(myds_v41_shared_swiglu(swiglu_unfused, gate_out, up_out, out_dim, clamp));
+
+        // 2. 融合内核路径
+        assert(myds_v41_shared_gate_up_swiglu(swiglu_fused, gate_w, up_w, x, out_dim, in_dim,
+                                             GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, clamp));
+
+        // 3. 逐位校验
+        float *u = (float *)myds_metal_buffer_data(swiglu_unfused);
+        float *f = (float *)myds_metal_buffer_data(swiglu_fused);
+        size_t nonzero = 0;
+        for (size_t i = 0; i < out_dim; i++) {
+            assert(isfinite(u[i]) && isfinite(f[i]));
+            nonzero += (u[i] != 0.0f);
+            if (memcmp(&u[i], &f[i], sizeof(float)) != 0) {
+                uint32_t ub, fb;
+                memcpy(&ub, &u[i], 4);
+                memcpy(&fb, &f[i], 4);
+                fprintf(stderr, "Shared expert fusion mismatch in case %zu (nr0=%s, clamp=%.1f) at %zu: unfused=%08x (%f) fused=%08x (%f)\n",
+                        c, cases[c].nr0, clamp, i, ub, u[i], fb, f[i]);
+                assert(0);
+            }
+        }
+        assert(nonzero > 0);
+    }
+    printf("  [PASS] Shared expert: 3-step (GEMV_gate + GEMV_up + SwiGLU) vs 1-kernel fused bit-exact across %zu configs (memcmp == 0)\n",
+           sizeof(cases)/sizeof(cases[0]));
+
+    myds_metal_buffer_free(gate_w);
+    myds_metal_buffer_free(up_w);
+    myds_metal_buffer_free(x);
+    myds_metal_buffer_free(gate_out);
+    myds_metal_buffer_free(up_out);
+    myds_metal_buffer_free(swiglu_unfused);
+    myds_metal_buffer_free(swiglu_fused);
+}
+
 int main(void) {
     printf("Running P1 Regression Verification Suite:\n");
     test_p1_response_id_lifecycle();
@@ -2104,6 +2208,7 @@ int main(void) {
     test_p1_metal_fused_add_fallback();
     test_p1_moe_route_fusion();
     test_p1_moe_concurrent_barriers_and_route_parity();
+    test_p1_shared_expert_fusion();
     test_p1_attn_output_a_bf16_fusion();
     test_p1_attn_direct_pack_fusion();
     test_p2_moe_kernel_and_pso_validation();

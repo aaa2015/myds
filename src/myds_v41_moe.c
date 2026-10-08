@@ -19,6 +19,13 @@ struct glu_args {
     int32_t ne0; uint64_t nb1;
     int32_t i00, i10; float alpha, limit; int32_t round_bf16;
 };
+/* 必须与 metal/myds_v41_moe.metal 的 myds_v41_shared_swiglu_args 逐字段一致 */
+struct myds_v41_shared_swiglu_args {
+    uint32_t in_dim;
+    uint32_t out_dim;
+    uint32_t row_bytes;
+    float clamp;
+};
 
 static int sized(const myds_metal_buffer_t *buf, size_t count) {
     return buf && count <= myds_metal_buffer_size(buf) / sizeof(float);
@@ -157,6 +164,59 @@ int myds_v41_shared_swiglu(myds_metal_buffer_t *out,
                     (width+255)/256,256,0);
 }
 
+static inline bool is_shared_fuse_enabled(void) {
+    static int cached = -1;
+    if (__builtin_expect(cached < 0, 0)) {
+        const char *v = getenv("MYDS_SHARED_FUSE");
+        cached = (v && strcmp(v, "0") == 0) ? 0 : 1;
+    }
+    return cached == 1;
+}
+
+int myds_v41_shared_gate_up_swiglu(myds_metal_buffer_t *out,
+                                  const myds_metal_buffer_t *gate,
+                                  const myds_metal_buffer_t *up,
+                                  const myds_metal_buffer_t *input,
+                                  uint32_t out_dim, uint32_t in_dim,
+                                  ggml_type gate_type, ggml_type up_type,
+                                  float clamp) {
+    if (!out || !gate || !up || !input || !out_dim || !in_dim ||
+        out_dim > INT32_MAX || in_dim > INT32_MAX || in_dim % 32u ||
+        gate_type != GGML_TYPE_Q8_0 || up_type != GGML_TYPE_Q8_0 ||
+        !isfinite(clamp) || clamp < 0 ||
+        myds_metal_buffer_offset(out) % 16u != 0) return 0;
+
+    const uint32_t row_bytes = (in_dim / 32u) * 34u;
+    if (myds_metal_buffer_size(gate) / row_bytes < out_dim ||
+        myds_metal_buffer_size(up) / row_bytes < out_dim ||
+        myds_metal_buffer_size(input) / 4u < in_dim ||
+        myds_metal_buffer_size(out) / 4u < out_dim) return 0;
+
+    struct myds_v41_shared_swiglu_args args = {
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+        .row_bytes = row_bytes,
+        .clamp = clamp
+    };
+
+    static int nr0_cached = 0;
+    if (!nr0_cached) {
+        const char *v = getenv("MYDS_SHARED_NR0");
+        nr0_cached = (v && strcmp(v, "2") == 0) ? 2 : 4;
+    }
+    const uint32_t nr0 = (uint32_t)nr0_cached;
+    const char *kernel_name = (nr0 == 4) ? "kernel_myds_v41_shared_gate_up_swiglu_r4"
+                                         : "kernel_myds_v41_shared_gate_up_swiglu";
+
+    const myds_metal_buffer_t *buffers[] = { gate, up, input, out };
+    const uint32_t groups = (out_dim + nr0 - 1u) / nr0;
+    const uint32_t threads = 128u; // 32 * NSG (NSG=4)
+    const size_t shmem_bytes = 2u * nr0 * 32u * sizeof(float);
+
+    return dispatch(kernel_name, &args, sizeof(args), buffers, 4,
+                    groups, threads, shmem_bytes);
+}
+
 int myds_v41_moe_eval(myds_context_t *ctx, uint32_t layer, uint32_t pos,
                       const myds_metal_buffer_t *ffn_norm,
                       const myds_metal_buffer_t *router_logits,
@@ -235,13 +295,21 @@ int myds_v41_moe(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t p
         }
 
         /* 2. 紧接着派发 shared expert (gate, up, swiglu, down) */
-        if (!myds_v41_decode_gemv_bf16(ctx->shared_gate_out, l->shared_gate, ctx->ffn_norm_out,
-                             width, dim, l->shared_gate_type, trace_on) ||
-            !myds_v41_decode_gemv_bf16(ctx->shared_up_out, l->shared_up, ctx->ffn_norm_out,
-                             width, dim, l->shared_up_type, trace_on) ||
-            !myds_v41_shared_swiglu(ctx->shared_swiglu_out, ctx->shared_gate_out,
-                                   ctx->shared_up_out, width, m->swiglu_clamp_exp) ||
-            !myds_v41_decode_gemv_bf16(ctx->shared_out, l->shared_down, ctx->shared_swiglu_out,
+        int sh_swiglu_ok = 0;
+        if (!trace_on && is_shared_fuse_enabled()) {
+            sh_swiglu_ok = myds_v41_shared_gate_up_swiglu(
+                ctx->shared_swiglu_out, l->shared_gate, l->shared_up, ctx->ffn_norm_out,
+                width, dim, l->shared_gate_type, l->shared_up_type, m->swiglu_clamp_exp);
+        }
+        if (!sh_swiglu_ok) {
+            if (!myds_v41_decode_gemv_bf16(ctx->shared_gate_out, l->shared_gate, ctx->ffn_norm_out,
+                                 width, dim, l->shared_gate_type, trace_on) ||
+                !myds_v41_decode_gemv_bf16(ctx->shared_up_out, l->shared_up, ctx->ffn_norm_out,
+                                 width, dim, l->shared_up_type, trace_on) ||
+                !myds_v41_shared_swiglu(ctx->shared_swiglu_out, ctx->shared_gate_out,
+                                       ctx->shared_up_out, width, m->swiglu_clamp_exp)) return 0;
+        }
+        if (!myds_v41_decode_gemv_bf16(ctx->shared_out, l->shared_down, ctx->shared_swiglu_out,
                              dim, width, l->shared_down_type, trace_on)) return 0;
         if (trace_on && !myds_trace_f32("shared_out", layer, pos, ctx->shared_out, dim)) return 0;
 
@@ -266,13 +334,26 @@ int myds_v41_moe(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t p
     myds_metal_set_auto_barrier(0);
     myds_metal_set_concurrent(1);
 
-    /* 1. 并发派发 Router GEMV 与 Shared Expert Gate/Up GEMVs */
+    /* 1. 并发派发 Router GEMV 与 Shared Expert Gate/Up/SwiGLU 融合算子 */
+    int sh_fused_ok = 0;
+    if (is_shared_fuse_enabled()) {
+        sh_fused_ok = myds_v41_shared_gate_up_swiglu(
+            ctx->shared_swiglu_out, l->shared_gate, l->shared_up, ctx->ffn_norm_out,
+            width, dim, l->shared_gate_type, l->shared_up_type, m->swiglu_clamp_exp);
+    }
+    if (!sh_fused_ok) {
+        if (!myds_v41_decode_gemv_bf16(ctx->shared_gate_out, l->shared_gate, ctx->ffn_norm_out,
+                                      width, dim, l->shared_gate_type, false) ||
+            !myds_v41_decode_gemv_bf16(ctx->shared_up_out, l->shared_up, ctx->ffn_norm_out,
+                                      width, dim, l->shared_up_type, false)) {
+            myds_metal_set_auto_barrier(prev_auto_barrier);
+            myds_metal_set_concurrent(prev_concurrent);
+            return 0;
+        }
+    }
+
     if (!myds_metal_v41_gemv(ctx->router_logits, l->router_gate, ctx->ffn_norm_out,
-                             m->n_routed_experts, dim, l->router_gate_type) ||
-        !myds_v41_decode_gemv_bf16(ctx->shared_gate_out, l->shared_gate, ctx->ffn_norm_out,
-                                  width, dim, l->shared_gate_type, false) ||
-        !myds_v41_decode_gemv_bf16(ctx->shared_up_out, l->shared_up, ctx->ffn_norm_out,
-                                  width, dim, l->shared_up_type, false)) {
+                             m->n_routed_experts, dim, l->router_gate_type)) {
         myds_metal_set_auto_barrier(prev_auto_barrier);
         myds_metal_set_concurrent(prev_concurrent);
         return 0;
@@ -287,14 +368,16 @@ int myds_v41_moe(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t p
         return 0;
     }
 
-    /* 3. 仅同步 shared_gate_out 与 shared_up_out，派发 Shared SwiGLU */
-    const myds_metal_buffer_t *shared_gu_deps[] = { ctx->shared_gate_out, ctx->shared_up_out };
-    myds_metal_barrier_buffers(shared_gu_deps, 2);
-    if (!myds_v41_shared_swiglu(ctx->shared_swiglu_out, ctx->shared_gate_out,
-                               ctx->shared_up_out, width, m->swiglu_clamp_exp)) {
-        myds_metal_set_auto_barrier(prev_auto_barrier);
-        myds_metal_set_concurrent(prev_concurrent);
-        return 0;
+    /* 3. 若未融合，仅同步 shared_gate_out 与 shared_up_out，派发 Shared SwiGLU */
+    if (!sh_fused_ok) {
+        const myds_metal_buffer_t *shared_gu_deps[] = { ctx->shared_gate_out, ctx->shared_up_out };
+        myds_metal_barrier_buffers(shared_gu_deps, 2);
+        if (!myds_v41_shared_swiglu(ctx->shared_swiglu_out, ctx->shared_gate_out,
+                                   ctx->shared_up_out, width, m->swiglu_clamp_exp)) {
+            myds_metal_set_auto_barrier(prev_auto_barrier);
+            myds_metal_set_concurrent(prev_concurrent);
+            return 0;
+        }
     }
 
     /* 4. 仅同步 shared_swiglu_out，派发 Shared Down GEMV */

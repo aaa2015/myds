@@ -218,3 +218,155 @@ kernel void kernel_myds_v41_route_fused(
         weights[t * top_k + tid] = weights[t * top_k + tid] * args.scale;
     }
 }
+
+/* S6 优化：Shared Expert Gate + Up + SwiGLU 三合一融合算子
+ * 消除 78 次 GPU Dispatch，消除 shared_gate_out 与 shared_up_out 显存读写往返。
+ * 输入激活 x 在寄存器中同时用于 Gate 与 Up 的 Q8_0 点积。
+ * 输出直接经过 dsv4_mv_bf16_store -> clamp -> silu * up -> dsv4_mv_bf16_store 写出。
+ */
+struct myds_v41_shared_swiglu_args {
+    uint in_dim;
+    uint out_dim;
+    uint row_bytes;
+    float clamp;
+};
+
+template<short NR0>
+void kernel_myds_v41_shared_gate_up_swiglu_impl(
+        constant myds_v41_shared_swiglu_args &args,
+        device const char *src_gate,
+        device const char *src_up,
+        device const char *src_in,
+        device char *dst_out,
+        threadgroup char *shmem,
+        uint3 tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    constexpr short NSG = 4;
+    constexpr short NW = N_SIMDWIDTH; // 32
+    constexpr short NQ = 8;
+
+    const int nb = (int)args.in_dim / QK8_0;
+    const int r0 = tgpig.x * NR0;
+
+    device const float *y = (device const float *)src_in;
+
+    device const block_q8_0 *ax_gate[NR0];
+    device const block_q8_0 *ax_up[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (uint64_t)(r0 + row) * args.row_bytes;
+        const bool active = (r0 + row < (int)args.out_dim);
+        ax_gate[row] = (device const block_q8_0 *)(src_gate + (active ? offset0 : 0));
+        ax_up[row]   = (device const block_q8_0 *)(src_up   + (active ? offset0 : 0));
+    }
+
+    float sumf_gate[NR0] = { 0.f };
+    float sumf_up[NR0]   = { 0.f };
+
+    const short ix = tiisg / (NW / NQ);
+    const short il = tiisg % (NW / NQ);
+
+    const int ib0 = sgitg * NQ + ix;
+
+    float yl[NQ];
+    device const float *yb = y + ib0 * QK8_0 + il * NQ;
+
+    for (int ib = ib0; ib < nb; ib += NSG * NQ) {
+        for (short i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+
+        for (short row = 0; row < NR0; ++row) {
+            device const int8_t *qs_g = ax_gate[row][ib].qs + il * NQ;
+            device const int8_t *qs_u = ax_up[row][ib].qs   + il * NQ;
+
+            float sumq_g = 0.f;
+            float sumq_u = 0.f;
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                sumq_g += qs_g[i] * yl[i];
+                sumq_u += qs_u[i] * yl[i];
+            }
+
+            sumf_gate[row] += sumq_g * ax_gate[row][ib].d;
+            sumf_up[row]   += sumq_u * ax_up[row][ib].d;
+        }
+
+        yb += NSG * NQ * QK8_0;
+    }
+
+    // 线程组内双规约 (Gate 和 Up 各占 NR0 * NW 个 float)
+    threadgroup float *shmem_gate[NR0];
+    threadgroup float *shmem_up[NR0];
+    for (short row = 0; row < NR0; ++row) {
+        shmem_gate[row] = (threadgroup float *)shmem + NW * row;
+        shmem_up[row]   = (threadgroup float *)shmem + NW * (NR0 + row);
+
+        if (sgitg == 0) {
+            shmem_gate[row][tiisg] = 0.0f;
+            shmem_up[row][tiisg]   = 0.0f;
+        }
+
+        sumf_gate[row] = simd_sum(sumf_gate[row]);
+        sumf_up[row]   = simd_sum(sumf_up[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            shmem_gate[row][sgitg] = sumf_gate[row];
+            shmem_up[row][sgitg]   = sumf_up[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device float *dst_f32 = (device float *)dst_out;
+
+    for (short row = 0; row < NR0 && r0 + row < (int)args.out_dim; ++row) {
+        float tot_g = simd_sum(shmem_gate[row][tiisg]);
+        float tot_u = simd_sum(shmem_up[row][tiisg]);
+
+        if (tiisg == 0 && sgitg == 0) {
+            float g = dsv4_mv_bf16_store(tot_g);
+            float u = dsv4_mv_bf16_store(tot_u);
+
+            if (args.clamp > 1.0e-6f) {
+                g = min(g, args.clamp);
+                u = clamp(u, -args.clamp, args.clamp);
+            }
+
+            const float silu = g / (1.0f + exp(-g));
+            const float glu_v = silu * u;
+            dst_f32[r0 + row] = dsv4_mv_bf16_store(glu_v);
+        }
+    }
+}
+
+kernel void kernel_myds_v41_shared_gate_up_swiglu(
+    constant myds_v41_shared_swiglu_args &args [[buffer(0)]],
+    device const char *src_gate [[buffer(1)]],
+    device const char *src_up [[buffer(2)]],
+    device const char *src_in [[buffer(3)]],
+    device char *dst_out [[buffer(4)]],
+    threadgroup char *shmem [[threadgroup(0)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    kernel_myds_v41_shared_gate_up_swiglu_impl<2>(
+        args, src_gate, src_up, src_in, dst_out, shmem, tgpig, tiisg, sgitg);
+}
+
+kernel void kernel_myds_v41_shared_gate_up_swiglu_r4(
+    constant myds_v41_shared_swiglu_args &args [[buffer(0)]],
+    device const char *src_gate [[buffer(1)]],
+    device const char *src_up [[buffer(2)]],
+    device const char *src_in [[buffer(3)]],
+    device char *dst_out [[buffer(4)]],
+    threadgroup char *shmem [[threadgroup(0)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    kernel_myds_v41_shared_gate_up_swiglu_impl<4>(
+        args, src_gate, src_up, src_in, dst_out, shmem, tgpig, tiisg, sgitg);
+}
