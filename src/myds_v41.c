@@ -3257,6 +3257,9 @@ struct v41_batch2_workspace_s {
     /* 40 层推测树分支 A 的 KV 缓存隔离暂存区 */
     myds_metal_buffer_t *tree_kv_backup[V41_LAYERS]; /* [layer=40], 512 * 4 */
 
+    /* DSpark 多候选目标层隐藏状态捕捉暂存区 [token=3][slot=3] */
+    myds_metal_buffer_t *dspark_slots[3][3];
+
     /* Pre-created sub-views for Token 0, 1, 2 */
     myds_metal_buffer_t *v_x_norm[3];
     myds_metal_buffer_t *v_qr[3];
@@ -3314,6 +3317,9 @@ static void v41_batch2_workspace_free(v41_batch2_workspace_t *ws) {
         FREE_VIEW(ws->v_ffn_out[i]);
         FREE_VIEW(ws->engram_rows_b2[i][0]);
         FREE_VIEW(ws->engram_rows_b2[i][1]);
+        for (int s = 0; s < 3; s++) {
+            FREE_VIEW(ws->dspark_slots[i][s]);
+        }
     }
     for (uint32_t il = 0; il < V41_LAYERS; il++) {
         FREE_VIEW(ws->tree_kv_backup[il]);
@@ -3462,6 +3468,10 @@ static v41_batch2_workspace_t *v41_batch2_workspace_create(myds_context_t *ctx) 
         ws->engram_rows_b2[t][0] = myds_metal_buffer_alloc(MYDS_ENGRAM_INPUT_DIM * 4u);
         ws->engram_rows_b2[t][1] = myds_metal_buffer_alloc(MYDS_ENGRAM_INPUT_DIM * 4u);
         if (!ws->engram_rows_b2[t][0] || !ws->engram_rows_b2[t][1]) goto fail;
+        for (int s = 0; s < 3; s++) {
+            ws->dspark_slots[t][s] = myds_metal_buffer_alloc(MYDS_DSPARK_DIM * sizeof(float));
+            if (!ws->dspark_slots[t][s]) goto fail;
+        }
     }
 
     for (uint32_t il = 0; il < V41_LAYERS; il++) {
@@ -3669,8 +3679,11 @@ int myds_v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_v41_moe_add_hc_expand(ws->v_residual[1], ws->v_ffn_out[1], ws->v_moe_out[1], ws->v_shared_out[1], ws->v_after_attn[1], ws->v_ffn_split[1], V41_DIM));
         myds_metal_barrier_buffer(ws->residual_b2);
 
-        if (ctx->dspark && (il == 37 || il == 38 || il == 39)) {
-            myds_dspark_capture_layer(ctx->dspark, il, ws->v_residual[1]);
+        if (ctx->dspark && (il == 37 || il == 38 || il == 39) && ctx->dspark->hc_mean_weights) {
+            int slot = (il == 37) ? 0 : ((il == 38) ? 1 : 2);
+            for (int t = 0; t < 2; t++) {
+                (void)myds_metal_v41_hc_weighted_sum(ws->dspark_slots[t][slot], ws->v_residual[t], ctx->dspark->hc_mean_weights, MYDS_DSPARK_DIM);
+            }
         }
     }
 
@@ -3704,6 +3717,14 @@ int myds_v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_buffer_copy(g->pre, 0, ws->v_pre[1], 0, 4 * sizeof(float)));
         CHECK(myds_metal_commit_batch());
 
+        if (ctx->dspark) {
+            for (int s = 0; s < 3; s++) {
+                if (ctx->dspark->target_slots[s] && ws->dspark_slots[1][s]) {
+                    (void)myds_metal_buffer_copy(ctx->dspark->target_slots[s], 0, ws->dspark_slots[1][s], 0, MYDS_DSPARK_DIM * sizeof(float));
+                }
+            }
+        }
+
         g->next_position = pos + 2u;
         ctx->pos = pos + 2u;
         return 2;
@@ -3715,6 +3736,14 @@ int myds_v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_buffer_copy(g->residual, 0, ws->v_residual[0], 0, 4 * V41_DIM * sizeof(float)));
         CHECK(myds_metal_buffer_copy(g->pre, 0, ws->v_pre[0], 0, 4 * sizeof(float)));
         CHECK(myds_metal_commit_batch());
+
+        if (ctx->dspark) {
+            for (int s = 0; s < 3; s++) {
+                if (ctx->dspark->target_slots[s] && ws->dspark_slots[0][s]) {
+                    (void)myds_metal_buffer_copy(ctx->dspark->target_slots[s], 0, ws->dspark_slots[0][s], 0, MYDS_DSPARK_DIM * sizeof(float));
+                }
+            }
+        }
 
         g->next_position = pos + 1u;
         ctx->pos = pos + 1u;
@@ -3961,8 +3990,11 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
         }
         myds_metal_barrier_buffer(ws->residual_b2);
 
-        if (ctx->dspark && (il == 37 || il == 38 || il == 39)) {
-            myds_dspark_capture_layer(ctx->dspark, il, ws->v_residual[1]);
+        if (ctx->dspark && (il == 37 || il == 38 || il == 39) && ctx->dspark->hc_mean_weights) {
+            int slot = (il == 37) ? 0 : ((il == 38) ? 1 : 2);
+            for (int t = 0; t < 3; t++) {
+                (void)myds_metal_v41_hc_weighted_sum(ws->dspark_slots[t][slot], ws->v_residual[t], ctx->dspark->hc_mean_weights, MYDS_DSPARK_DIM);
+            }
         }
     }
 
@@ -4004,6 +4036,14 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_buffer_copy(g->pre, 0, ws->v_pre[1], 0, 4 * sizeof(float)));
         CHECK(myds_metal_commit_batch());
 
+        if (ctx->dspark) {
+            for (int s = 0; s < 3; s++) {
+                if (ctx->dspark->target_slots[s] && ws->dspark_slots[1][s]) {
+                    (void)myds_metal_buffer_copy(ctx->dspark->target_slots[s], 0, ws->dspark_slots[1][s], 0, MYDS_DSPARK_DIM * sizeof(float));
+                }
+            }
+        }
+
         if (g->engram) {
             g->engram->history = engram_hist_1;
             g->engram->position = pos + 2u;
@@ -4023,6 +4063,14 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_buffer_copy(g->pre, 0, ws->v_pre[2], 0, 4 * sizeof(float)));
         CHECK(myds_metal_commit_batch());
 
+        if (ctx->dspark) {
+            for (int s = 0; s < 3; s++) {
+                if (ctx->dspark->target_slots[s] && ws->dspark_slots[2][s]) {
+                    (void)myds_metal_buffer_copy(ctx->dspark->target_slots[s], 0, ws->dspark_slots[2][s], 0, MYDS_DSPARK_DIM * sizeof(float));
+                }
+            }
+        }
+
         if (g->engram) {
             g->engram->history = engram_hist_2;
             g->engram->position = pos + 2u;
@@ -4039,6 +4087,14 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_buffer_copy(g->residual, 0, ws->v_residual[0], 0, 4 * V41_DIM * sizeof(float)));
         CHECK(myds_metal_buffer_copy(g->pre, 0, ws->v_pre[0], 0, 4 * sizeof(float)));
         CHECK(myds_metal_commit_batch());
+
+        if (ctx->dspark) {
+            for (int s = 0; s < 3; s++) {
+                if (ctx->dspark->target_slots[s] && ws->dspark_slots[0][s]) {
+                    (void)myds_metal_buffer_copy(ctx->dspark->target_slots[s], 0, ws->dspark_slots[0][s], 0, MYDS_DSPARK_DIM * sizeof(float));
+                }
+            }
+        }
 
         if (g->engram) {
             g->engram->history = engram_hist_0;

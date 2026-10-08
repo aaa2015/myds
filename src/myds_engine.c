@@ -3388,7 +3388,6 @@ static int myds_generate_internal(myds_context_t *ctx,
 
             if (ctx->v41 && snap && n_draft >= 1 && (ctx->pos + 2 <= ctx->cfg.max_seq_len)) {
                 ctx->dspark->cycles++;
-                ctx->dspark->proposed_tokens += 1;
 
                 memset(snap, 0, sizeof(*snap));
                 snap_saved = myds_v41_spec_snapshot_save(ctx, snap, 2);
