@@ -2878,6 +2878,8 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
         const int n = e ? atoi(e) : 0;
         decode_split = (n > 1 && n <= (int)V41_LAYERS) ? n : 0;
     }
+    int prev_auto_barrier = -1;
+    bool fine_pipeline = false;
 #define CHECK(x) do { if (!(x)) goto fail; } while (0)
 #define TRACE(stage,buf,n) do { if (trace_on) CHECK(myds_trace_f32(stage,il,pos,buf,n)); } while (0)
     CHECK(myds_engram_prepare_token(g->engram,token,pos));
@@ -2904,6 +2906,18 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
         qkv_pipeline_enabled = (env == NULL || atoi(env) != 0);
     }
     CHECK(myds_metal_begin_batch());
+    prev_auto_barrier = myds_metal_get_auto_barrier();
+    static int attn_output_pipeline_enabled = -1;
+    if (attn_output_pipeline_enabled < 0) {
+        const char *env = getenv("MYDS_ATTN_OUTPUT_PIPELINE");
+        attn_output_pipeline_enabled = (env == NULL || atoi(env) != 0);
+    }
+    fine_pipeline = !trace_on && qkv_pipeline_enabled && attn_output_pipeline_enabled;
+    if (fine_pipeline) {
+        myds_metal_set_auto_barrier(0);
+        const myds_metal_buffer_t *init_deps[] = { g->residual, g->pre };
+        myds_metal_barrier_buffers(init_deps, 2);
+    }
     for (il=0;il<V41_LAYERS;il++) {
         const myds_layer_t *base=&m->layers[il];
         const v41_layer_t *l=&v->layers[il];
@@ -2914,6 +2928,7 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
             uint32_t e=il==1?0:1;
             CHECK(project(g->engram_kv,v->engram_proj[e],g->engram_rows[e],5*V41_DIM,MYDS_ENGRAM_INPUT_DIM,GGML_TYPE_F16,true));
             CHECK(myds_metal_v41_engram_add(g->residual,g->engram_kv,v->engram_q[e],v->engram_k[e],V41_DIM,m->norm_eps));
+            if (fine_pipeline) myds_metal_barrier_buffer(g->residual);
             TRACE("engram_out",g->residual,4*V41_DIM);
         }
         if (trace_on || !qkv_pipeline_enabled) {
@@ -2968,8 +2983,9 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
                 CHECK(myds_metal_v41_rmsnorm(ctx->x_norm,ctx->x,base->attn_norm,V41_DIM,m->norm_eps,true));
             }
             phase="attention projections";
-            const int prev_auto_barrier = myds_metal_get_auto_barrier();
-            myds_metal_set_auto_barrier(0);
+            if (!fine_pipeline) {
+                myds_metal_set_auto_barrier(0);
+            }
             myds_metal_barrier_buffer(ctx->x_norm);
 
             /* 三路全并发调度：hc_mix、q_a、kv_a 同时进 GPU 队列 */
@@ -2995,7 +3011,7 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
                  * 1. 同步 RMSNorm 输出供 Q_B 与 Indexer 消费
                  * 2. 并发派发 Q_B (32768 x 1280 GEMV) 与 publish_and_select (压缩器 + Indexer)
                  * 3. 仅同步 ctx->q，派发 qkv_finish
-                 * 4. 汇聚等待 QKV finish 与 Indexer 全部完成，恢复 auto_barrier
+                 * 4. 汇聚等待 QKV finish 与 Indexer 全部完成
                  */
                 const myds_metal_buffer_t *norm_out[] = { ctx->qr_norm, ctx->kv_act };
                 myds_metal_barrier_buffers(norm_out, 2);
@@ -3021,9 +3037,13 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
                     ctx->q, g->window[il], count ? g->selected : NULL, count ? g->compressed[owner_for(il)] : NULL
                 };
                 myds_metal_barrier_buffers(attn_in_deps, 4);
-                myds_metal_set_auto_barrier(prev_auto_barrier);
+                if (!fine_pipeline) {
+                    myds_metal_set_auto_barrier(prev_auto_barrier);
+                }
             } else {
-                myds_metal_set_auto_barrier(prev_auto_barrier);
+                if (!fine_pipeline) {
+                    myds_metal_set_auto_barrier(prev_auto_barrier);
+                }
                 phase="compressed KV / indexer";
                 CHECK(publish_and_select(ctx,il,pos,ctx->x_norm,ctx->qr_norm,NULL,NULL,NULL,NULL,NULL,NULL,NULL));
                 phase="attention projections";
@@ -3057,16 +3077,31 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
             if (count) CHECK(myds_v41_gpu_gather_bf16(g->selected_kv,g->compressed[owner_for(il)],g->selected,count,top));
             CHECK(myds_v41_gpu_attention(ctx->attn_heads,base->attn_sinks,ctx->q,g->window[il],nraw,(pos+1u-nraw)%128,g->selected_kv,top,g->gpu));
         }
+        if (fine_pipeline) {
+            myds_metal_barrier_buffer(ctx->attn_heads);
+        }
         CHECK(myds_v41_gpu_rope_round(ctx->attn_heads,512,V41_HEADS,pos,compressed,true));
+        if (fine_pipeline) {
+            myds_metal_barrier_buffer(ctx->attn_heads);
+        }
         CHECK(myds_metal_attn_output_a_bf16(ctx->attn_low,base->attn_output_a,ctx->attn_heads,8,4096,1024,base->attn_output_a_type));
+        if (fine_pipeline) {
+            myds_metal_barrier_buffer(ctx->attn_low);
+        }
         CHECK(project_decode_tail(ctx->attn_out,base->attn_output_b,ctx->attn_low,V41_DIM,8192,base->attn_output_b_type,trace_on));
         TRACE("attn_out",ctx->attn_out,V41_DIM);
         phase="HC FFN input";
-        if (!trace_on && qkv_pipeline_enabled) {
+        if (fine_pipeline) {
+            const myds_metal_buffer_t *expand_in[] = { ctx->attn_out, g->attn_split };
+            myds_metal_barrier_buffers(expand_in, 2);
+        } else if (!trace_on && qkv_pipeline_enabled) {
             myds_metal_barrier_buffer(g->attn_split);
         }
         CHECK(myds_metal_v41_hc_expand(g->after_attn,ctx->attn_out,g->residual,g->attn_split,V41_DIM));
         TRACE("after_attn",g->after_attn,4*V41_DIM);
+        if (fine_pipeline) {
+            myds_metal_barrier_buffer(g->after_attn);
+        }
         if (fuse_hc_norm_enabled) {
             CHECK(myds_metal_v41_hc_sum_rmsnorm(ctx->ffn_norm_out, ctx->x, g->after_attn, g->attn_split, base->ffn_norm, V41_DIM, m->norm_eps, true));
         } else {
@@ -3075,6 +3110,9 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
         }
         TRACE("hc_ffn_input",ctx->x,V41_DIM);
         TRACE("ffn_norm",ctx->ffn_norm_out,V41_DIM);
+        if (fine_pipeline) {
+            myds_metal_barrier_buffer(ctx->ffn_norm_out);
+        }
         phase="MoE";
         CHECK(myds_v41_moe_pipeline(ctx,il,(uint32_t)token,pos,g->residual,g->after_attn,g->ffn_split,l->ffn_fn,l->ffn_scale,l->ffn_base,g->flat_norm,g->mix,v->hc_eps));
         TRACE("layer_out",g->residual,4*V41_DIM);
@@ -3095,19 +3133,32 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
             CHECK(myds_metal_v41_hc_weighted_sum(ctx->x,g->residual,g->ffn_split,V41_DIM));
             CHECK(myds_metal_v41_rmsnorm(ctx->x_norm,ctx->x,m->output_norm,V41_DIM,m->norm_eps,true));
         }
+        if (fine_pipeline) {
+            myds_metal_barrier_buffer(ctx->x_norm);
+        }
         CHECK(project(ctx->logits,m->output,ctx->x_norm,m->vocab_size,V41_DIM,m->output_type,false));
         CHECK(myds_metal_commit_batch());
+        if (fine_pipeline) {
+            myds_metal_set_auto_barrier(prev_auto_barrier);
+        }
         if (trace_on) CHECK(myds_trace_f32("logits",0,pos,ctx->logits,m->vocab_size));
         const float *logits=myds_metal_buffer_data(ctx->logits);
         if (!check_logits_finite(logits, m->vocab_size)) goto fail;
     } else {
         CHECK(myds_metal_commit_batch());
+        if (fine_pipeline) {
+            myds_metal_set_auto_barrier(prev_auto_barrier);
+        }
     }
     g->next_position=pos+1u;
     return need_logits ? myds_sample_next_token(myds_metal_buffer_data(ctx->logits),m->vocab_size,&ctx->cfg,ctx,NULL,0) : 0;
 fail:
     MYDS_LOG_E("V4.1 native graph failed at pos %u layer %u: %s",pos,il,phase);
-    (void)myds_metal_commit_batch(); g->valid=false; return -1;
+    (void)myds_metal_commit_batch();
+    if (fine_pipeline) {
+        myds_metal_set_auto_barrier(prev_auto_barrier);
+    }
+    g->valid=false; return -1;
 #undef CHECK
 #undef TRACE
 }

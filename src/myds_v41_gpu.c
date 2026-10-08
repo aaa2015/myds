@@ -941,6 +941,7 @@ int myds_v41_gpu_attention(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
     if(!stage_f16(s->kv_f16,0,window,(size_t)raw_start*2048,tail*512,s))return 0;
     if(n_raw>tail&&!stage_f16(s->kv_f16,(size_t)tail*1024,window,0,(n_raw-tail)*512,s))return 0;
     if(selected_rows&&!stage_f16(s->kv_f16,(size_t)n_raw*1024,selected_kv,0,selected_rows*512,s))return 0;
+    if(!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(s->kv_f16);
     uint32_t keys=n_raw+selected_rows;uint64_t kvbytes=(uint64_t)keys*1024,maskbytes=(uint64_t)keys*2;
     if(keys%32) {
         struct flash_pad_args a={.ne11=keys,.ne_12_2=1,.ne_12_3=1,.nb11=1024,.nb12=kvbytes,.nb13=kvbytes,
@@ -948,6 +949,7 @@ int myds_v41_gpu_attention(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
         const myds_metal_buffer_t *b[]={s->kv_f16,s->kv_f16,s->mask,s->pad};
         const myds_metal_constant_t c[]={{100,true,1},{125,false,32}};
         if(!specialized("kernel_flash_attn_ext_pad",&a,sizeof(a),b,4,32,1,1,32,1,1,0,c,2))return 0;
+        if(!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(s->kv_f16);
     }
     struct flash_vec_args a={.ne01=1,.ne02=64,.ne03=1,.nb01=64u*2048,.nb02=2048,.nb03=64u*2048,
         .ne11=keys,.ne_12_2=1,.ne_12_3=1,.ns10=512,.nb11=1024,.nb12=kvbytes,.nb13=kvbytes,
@@ -970,6 +972,7 @@ int myds_v41_gpu_attention(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
     if(!vec_ok) {
         if(!specialized("kernel_flash_attn_ext_vec_f16_dk512_dv512",&a,sizeof(a),b,7,1,64,32,32,1,1,3328,c,10))return 0;
     }
+    if(!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(s->partial);
     const int32_t nrows=64;const myds_metal_buffer_t *rb[]={s->partial,heads};
     const myds_metal_constant_t rc[]={{500,false,512},{501,false,32}};
     return specialized("kernel_flash_attn_ext_vec_reduce",&nrows,sizeof(nrows),rb,2,64,1,1,1024,1,1,0,rc,2);
@@ -997,6 +1000,7 @@ int myds_v41_gpu_attention_direct(myds_metal_buffer_t *heads,const myds_metal_bu
         const myds_metal_buffer_t *gb[] = {comp_kv, selected_ids, s->kv_f16};
         if(!dispatch("kernel_dsv41_get_rows_bf16_to_f16", &g_args, sizeof(g_args), gb, 3, 1, selected_rows, 1, 128, 1, 1, 0)) return 0;
     }
+    if(!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(s->kv_f16);
 
     uint32_t keys=n_raw+selected_rows;uint64_t kvbytes=(uint64_t)keys*1024,maskbytes=(uint64_t)keys*2;
     if(keys%32) {
@@ -1005,6 +1009,7 @@ int myds_v41_gpu_attention_direct(myds_metal_buffer_t *heads,const myds_metal_bu
         const myds_metal_buffer_t *b[]={s->kv_f16,s->kv_f16,s->mask,s->pad};
         const myds_metal_constant_t c[]={{100,true,1},{125,false,32}};
         if(!specialized("kernel_flash_attn_ext_pad",&a,sizeof(a),b,4,32,1,1,32,1,1,0,c,2))return 0;
+        if(!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(s->kv_f16);
     }
     struct flash_vec_args a={.ne01=1,.ne02=64,.ne03=1,.nb01=64u*2048,.nb02=2048,.nb03=64u*2048,
         .ne11=keys,.ne_12_2=1,.ne_12_3=1,.ns10=512,.nb11=1024,.nb12=kvbytes,.nb13=kvbytes,
@@ -1027,6 +1032,7 @@ int myds_v41_gpu_attention_direct(myds_metal_buffer_t *heads,const myds_metal_bu
     if(!vec_ok) {
         if(!specialized("kernel_flash_attn_ext_vec_f16_dk512_dv512",&a,sizeof(a),b,7,1,64,32,32,1,1,3328,c,10))return 0;
     }
+    if(!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(s->partial);
     const int32_t nrows=64;const myds_metal_buffer_t *rb[]={s->partial,heads};
     const myds_metal_constant_t rc[]={{500,false,512},{501,false,32}};
     return specialized("kernel_flash_attn_ext_vec_reduce",&nrows,sizeof(nrows),rb,2,64,1,1,1024,1,1,0,rc,2);
