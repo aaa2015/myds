@@ -37,6 +37,7 @@ TEST_ENGINE = $(BIN_DIR)/test_engine
 TEST_CPU = $(BIN_DIR)/test_cpu
 TEST_ENGRAM = $(BIN_DIR)/test_engram
 TEST_ALIGN = $(BIN_DIR)/test_align
+TEST_PLD = $(BIN_DIR)/test_pld
 TEST_KVDSK = $(BIN_DIR)/test_kvdsk
 TEST_P1 = $(BIN_DIR)/test_p1
 TEST_DSPARK_ROLLBACK = $(BIN_DIR)/test_dspark_rollback
@@ -48,7 +49,7 @@ DUMP_TENSORS = $(BIN_DIR)/dump_tensors
 METALLIB = $(BIN_DIR)/myds.metallib
 METAL_SRCS = $(wildcard metal/*.metal)
 
-ALL_TESTS = $(TEST_METAL) $(TEST_V41_GPU) $(TEST_ATTN_POLICY) $(TEST_ATTN_VEC) $(TEST_QKV_FUSION) $(TEST_DECODE_Q8) $(TEST_DEEPER_SSD) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE) $(TEST_CPU) $(TEST_ENGRAM) $(TEST_ALIGN) $(TEST_KVDSK) $(TEST_P1) $(TEST_DSPARK_ROLLBACK)
+ALL_TESTS = $(TEST_METAL) $(TEST_V41_GPU) $(TEST_ATTN_POLICY) $(TEST_ATTN_VEC) $(TEST_QKV_FUSION) $(TEST_DECODE_Q8) $(TEST_DEEPER_SSD) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE) $(TEST_CPU) $(TEST_ENGRAM) $(TEST_ALIGN) $(TEST_PLD) $(TEST_KVDSK) $(TEST_P1) $(TEST_DSPARK_ROLLBACK)
 
 .PHONY: all test clean bench metallib build-tail-init test-tail-init
 
@@ -164,6 +165,10 @@ $(TEST_SERVER): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_vjob.o $(BUILD_DIR)
 # 图片块区间对齐：纯头文件（myds_align.h），不需要任何 .c。
 $(TEST_ALIGN): tests/test_align.c include/myds_align.h | $(BIN_DIR)
 	$(CC) $(CFLAGS) -Iinclude -o $@ tests/test_align.c
+
+# Prompt-Lookup Decoding：纯头文件（myds_pld.h），纳秒级 N-gram 匹配，零外部依赖。
+$(TEST_PLD): tests/test_pld.c include/myds_pld.h | $(BIN_DIR)
+	$(CC) $(CFLAGS) -Iinclude -o $@ tests/test_pld.c
 
 # 低位区 KV 落盘：只需要存储层与日志，不需要模型（也就不必占着跑生产的机器开第二个实例）。
 $(TEST_KVDSK): tests/test_kvdsk.c include/myds_kvdsk.h $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_log.o | $(BIN_DIR)
@@ -284,6 +289,8 @@ test: $(ALL_TESTS) $(METALLIB)
 	@./$(TEST_ENGRAM)
 	@echo ""
 	@./$(TEST_ALIGN)
+	@echo ""
+	@./$(TEST_PLD)
 	@echo ""
 	@./$(TEST_KVDSK)
 	@echo ""
