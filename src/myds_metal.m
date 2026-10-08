@@ -292,10 +292,17 @@ static void close_compute_encoder(void) {
 static int g_concurrent_mode = 0;
 
 void myds_metal_set_concurrent(int enable) {
-    if (g_concurrent_mode != enable) {
-        close_compute_encoder();
-        g_concurrent_mode = enable;
+    static int s_concurrent_env = -1;
+    if (__builtin_expect(s_concurrent_env < 0, 0)) {
+        const char *env = getenv("MYDS_METAL_CONCURRENT");
+        s_concurrent_env = (env && atoi(env) != 0) ? 1 : 0;
     }
+    const int new_use = (enable > 0) || (s_concurrent_env > 0);
+    const int old_use = (g_concurrent_mode > 0) || (s_concurrent_env > 0);
+    if (old_use != new_use) {
+        close_compute_encoder();
+    }
+    g_concurrent_mode = enable;
 }
 
 int myds_metal_get_concurrent(void) {

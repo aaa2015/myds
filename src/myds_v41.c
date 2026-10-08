@@ -2873,18 +2873,29 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
             CHECK(myds_metal_v41_engram_add(g->residual,g->engram_kv,v->engram_q[e],v->engram_k[e],V41_DIM,m->norm_eps));
             TRACE("engram_out",g->residual,4*V41_DIM);
         }
-        CHECK(myds_metal_v41_hc_mix(g->attn_split,g->residual,l->attn_fn,GGML_TYPE_F16,l->attn_scale,l->attn_base,g->flat_norm,g->mix,V41_DIM,m->norm_eps,v->hc_eps));
-        TRACE("hc_attn_mix",g->mix,24); TRACE("hc_attn_split",g->attn_split,24);
-        const myds_metal_buffer_t *hc_in_pre = (il == 0 ? g->pre : g->ffn_split);
-        TRACE("hc_attn_pre",hc_in_pre,4);
-        if (fuse_hc_norm_enabled) {
-            CHECK(myds_metal_v41_hc_sum_rmsnorm(ctx->x_norm, ctx->x, g->residual, hc_in_pre, base->attn_norm, V41_DIM, m->norm_eps, true));
+        if (trace_on) {
+            CHECK(myds_metal_v41_hc_mix(g->attn_split,g->residual,l->attn_fn,GGML_TYPE_F16,l->attn_scale,l->attn_base,g->flat_norm,g->mix,V41_DIM,m->norm_eps,v->hc_eps));
+            TRACE("hc_attn_mix",g->mix,24); TRACE("hc_attn_split",g->attn_split,24);
+            const myds_metal_buffer_t *hc_in_pre = (il == 0 ? g->pre : g->ffn_split);
+            TRACE("hc_attn_pre",hc_in_pre,4);
+            if (fuse_hc_norm_enabled) {
+                CHECK(myds_metal_v41_hc_sum_rmsnorm(ctx->x_norm, ctx->x, g->residual, hc_in_pre, base->attn_norm, V41_DIM, m->norm_eps, true));
+            } else {
+                CHECK(myds_metal_v41_hc_weighted_sum(ctx->x,g->residual,hc_in_pre,V41_DIM));
+                CHECK(myds_metal_v41_rmsnorm(ctx->x_norm,ctx->x,base->attn_norm,V41_DIM,m->norm_eps,true));
+            }
+            TRACE("hc_attn_input",ctx->x,V41_DIM);
+            TRACE("attn_norm",ctx->x_norm,V41_DIM);
         } else {
-            CHECK(myds_metal_v41_hc_weighted_sum(ctx->x,g->residual,hc_in_pre,V41_DIM));
-            CHECK(myds_metal_v41_rmsnorm(ctx->x_norm,ctx->x,base->attn_norm,V41_DIM,m->norm_eps,true));
+            const myds_metal_buffer_t *hc_in_pre = (il == 0 ? g->pre : g->ffn_split);
+            if (fuse_hc_norm_enabled) {
+                CHECK(myds_metal_v41_hc_sum_rmsnorm(ctx->x_norm, ctx->x, g->residual, hc_in_pre, base->attn_norm, V41_DIM, m->norm_eps, true));
+            } else {
+                CHECK(myds_metal_v41_hc_weighted_sum(ctx->x,g->residual,hc_in_pre,V41_DIM));
+                CHECK(myds_metal_v41_rmsnorm(ctx->x_norm,ctx->x,base->attn_norm,V41_DIM,m->norm_eps,true));
+            }
+            CHECK(myds_metal_v41_hc_mix(g->attn_split,g->residual,l->attn_fn,GGML_TYPE_F16,l->attn_scale,l->attn_base,g->flat_norm,g->mix,V41_DIM,m->norm_eps,v->hc_eps));
         }
-        TRACE("hc_attn_input",ctx->x,V41_DIM);
-        TRACE("attn_norm",ctx->x_norm,V41_DIM);
         phase="attention projections";
         if (!trace_on && qkv_pipeline_enabled) {
             /* 优化流水排布：
