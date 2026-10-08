@@ -409,6 +409,34 @@ bool myds_v41_spec_snapshot_restore(myds_context_t *ctx, const myds_v41_spec_sna
     return true;
 }
 
+bool myds_v41_spec_snapshot_restore_partial(myds_context_t *ctx, const myds_v41_spec_snapshot_t *snap, uint32_t keep_count) {
+    if (!ctx || !ctx->v41 || !snap || !snap->valid) return false;
+    if (keep_count == 0) return myds_v41_spec_snapshot_restore(ctx, snap);
+    if (keep_count >= snap->window_count) return true;
+
+    myds_v41_context_t *g = ctx->v41;
+    if (!myds_metal_commit_batch()) return false;
+
+    ctx->pos = snap->pos + keep_count;
+    g->next_position = snap->next_position + keep_count;
+
+    for (uint32_t il = 0; il < V41_LAYERS; il++) {
+        if (!g->window[il]) continue;
+        float *base = (float *)myds_metal_buffer_data(g->window[il]);
+        if (!base) continue;
+        for (uint32_t k = keep_count; k < snap->window_count; k++) {
+            uint32_t slot = (snap->window_start_pos + k) % V41_WINDOW;
+            memcpy(base + (size_t)slot * V41_HEAD_DIM, snap->window_saved[il][k], V41_HEAD_DIM * sizeof(float));
+        }
+    }
+
+    if (ctx->pcache_tokens && ctx->pcache_len > ctx->pos) {
+        ctx->pcache_len = ctx->pos;
+    }
+
+    return true;
+}
+
 /* ── 快照诊断与单测夹具 ── */
 myds_v41_context_t *myds_v41_context_create_snapshot_fixture(void) {
     myds_v41_context_t *g = calloc(1, sizeof(*g));

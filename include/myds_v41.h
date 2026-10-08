@@ -96,6 +96,7 @@ typedef struct myds_v41_spec_snapshot {
 
 bool myds_v41_spec_snapshot_save(myds_context_t *context, myds_v41_spec_snapshot_t *snap, uint32_t count);
 bool myds_v41_spec_snapshot_restore(myds_context_t *context, const myds_v41_spec_snapshot_t *snap);
+bool myds_v41_spec_snapshot_restore_partial(myds_context_t *context, const myds_v41_spec_snapshot_t *snap, uint32_t keep_count);
 
 #endif
 

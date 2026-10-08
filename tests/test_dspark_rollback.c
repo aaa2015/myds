@@ -147,6 +147,84 @@ static void test_spec_snapshot_boundary_checks(void) {
     printf("  [PASS] Boundary checks passed.\n");
 }
 
+static void test_spec_snapshot_partial_restore(void) {
+    printf("[TEST] Speculative Snapshot Partial Restore Integrity...\n");
+    myds_v41_context_t *g = myds_v41_context_create_snapshot_fixture();
+    assert(g && "Failed to create snapshot fixture");
+
+    myds_context_t ctx = {0};
+    ctx.v41 = g;
+    ctx.pos = 50;
+
+    int32_t pcache[256];
+    memset(pcache, 0, sizeof(pcache));
+    ctx.pcache_tokens = pcache;
+    ctx.pcache_cap = 256;
+    ctx.pcache_len = 50;
+
+    // Fill initial state
+    for (uint32_t l = 0; l < MYDS_V41_LAYERS_COUNT; l++) {
+        float *w = (float *)myds_metal_buffer_data(myds_v41_snapshot_get_window(g, l));
+        assert(w);
+        for (uint32_t s = 0; s < 128; s++) {
+            for (uint32_t d = 0; d < 512; d++) {
+                w[s * 512 + d] = (float)(l * 10000 + s * 10 + (d % 10));
+            }
+        }
+    }
+
+    myds_v41_snapshot_set_positions(g, 50, 50);
+
+    // Save snapshot of 4 steps ahead (pos 50 to 53)
+    myds_v41_spec_snapshot_t snap = {0};
+    bool ok = myds_v41_spec_snapshot_save(&ctx, &snap, 4);
+    assert(ok && snap.valid);
+
+    // Simulate stepping forward 4 steps: mutate slots 50, 51, 52, 53
+    ctx.pos = 54;
+    ctx.pcache_len = 54;
+    myds_v41_snapshot_set_positions(g, 54, 54);
+
+    for (uint32_t l = 0; l < MYDS_V41_LAYERS_COUNT; l++) {
+        float *w = (float *)myds_metal_buffer_data(myds_v41_snapshot_get_window(g, l));
+        for (uint32_t k = 0; k < 4; k++) {
+            uint32_t slot = (50 + k) % 128;
+            for (uint32_t d = 0; d < 512; d++) {
+                w[slot * 512 + d] = 888.0f + (float)k;
+            }
+        }
+    }
+
+    // Partial restore: keep 2 steps (slots 50, 51 kept), revert slots 52, 53
+    ok = myds_v41_spec_snapshot_restore_partial(&ctx, &snap, 2);
+    assert(ok && "restore_partial failed");
+    assert(ctx.pos == 52);
+    assert(ctx.pcache_len == 52);
+    assert(myds_v41_snapshot_get_next_position(g) == 52);
+
+    for (uint32_t l = 0; l < MYDS_V41_LAYERS_COUNT; l++) {
+        float *w = (float *)myds_metal_buffer_data(myds_v41_snapshot_get_window(g, l));
+        // k = 0, 1 (slots 50, 51) must KEEP 888.0f + k
+        for (uint32_t k = 0; k < 2; k++) {
+            uint32_t slot = (50 + k) % 128;
+            for (uint32_t d = 0; d < 512; d++) {
+                assert(w[slot * 512 + d] == 888.0f + (float)k);
+            }
+        }
+        // k = 2, 3 (slots 52, 53) must be REVERTED to original expected value
+        for (uint32_t k = 2; k < 4; k++) {
+            uint32_t slot = (50 + k) % 128;
+            for (uint32_t d = 0; d < 512; d++) {
+                float expected = (float)(l * 10000 + slot * 10 + (d % 10));
+                assert(w[slot * 512 + d] == expected);
+            }
+        }
+    }
+
+    myds_v41_context_free(g);
+    printf("  [PASS] Speculative Snapshot Partial Restore exactly preserved kept steps and rolled back remainder.\n");
+}
+
 static void test_adaptive_speculative_backoff(void) {
     printf("[TEST] Adaptive Speculative Scheduler Backoff State Machine...\n");
 
@@ -217,6 +295,7 @@ int main(void) {
     }
 
     test_spec_snapshot_save_restore();
+    test_spec_snapshot_partial_restore();
     test_spec_snapshot_boundary_checks();
     test_adaptive_speculative_backoff();
 
