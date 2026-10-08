@@ -3757,9 +3757,12 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
 
     /* 1. 保存投机前快照（用于未命中时的无损回滚） */
     myds_v41_spec_snapshot_t snap = {0};
-    if (!myds_v41_spec_snapshot_save(ctx, &snap, 2)) return -1;
+    if (!myds_v41_spec_snapshot_save(ctx, &snap, 2)) {
+        MYDS_LOG_E("forward_tree_spec: myds_v41_spec_snapshot_save failed at pos %u", pos);
+        return -1;
+    }
 
-#define CHECK(x) do { if (!(x)) goto fail; } while (0)
+#define CHECK(x) do { if (!(x)) { MYDS_LOG_E("forward_tree_spec CHECK failed at line %d: %s", __LINE__, #x); goto fail; } } while (0)
 
     /* 2. 准备 Token 0, Token 1 (Branch A), Token 2 (Branch B) 的 Engram & Residual 初始化 */
     if (g->engram) {
@@ -3966,6 +3969,7 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
     if (!check_logits_finite(logits0, m->vocab_size) ||
         !check_logits_finite(logits1, m->vocab_size) ||
         !check_logits_finite(logits2, m->vocab_size)) {
+        MYDS_LOG_E("forward_tree_spec: check_logits_finite failed at pos %u", pos);
         goto fail;
     }
 
