@@ -3270,7 +3270,7 @@ static int myds_generate_internal(myds_context_t *ctx,
     if (ctx->v41) (void)myds_v41_low_kv_save(ctx->v41, prompt_tokens, (uint32_t)n_prompt);
     uint32_t max_gen = ctx->cfg.max_new_tokens;
     const char *pld_env_str = getenv("MYDS_PLD");
-    const bool pld_enabled = (pld_env_str && atoi(pld_env_str) != 0);
+    const bool pld_enabled = (pld_env_str == NULL || atoi(pld_env_str) != 0);
 
     int32_t *pld_history = NULL;
     uint32_t pld_len = 0;
@@ -3341,7 +3341,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                 continue;
             }
 
-            uint32_t draft_cap = ctx->dspark ? ctx->dspark->block_size : 4;
+            uint32_t draft_cap = ctx->v41 ? 1 : (ctx->dspark ? ctx->dspark->block_size : 4);
             if (draft_cap > max_gen - step) draft_cap = max_gen - step;
 
             int32_t cand_a = -1, cand_b = -1;

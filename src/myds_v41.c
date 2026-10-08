@@ -4169,14 +4169,21 @@ int myds_v41_forward_batch_spec(myds_context_t *ctx, const int32_t *tokens,
     if (next0 < 0) return -1;
     out_tokens[0] = next0;
 
-    // 投机早退保护（Speculative Short-Circuit Protection）：
-    if (n_tokens < 2 || next0 != tokens[1]) {
+    // 投机双分支命中判定（Dual-Branch Rescue / Speculative Short-Circuit Protection）：
+    int32_t hit_token = -1;
+    if (n_tokens >= 2 && next0 == tokens[1]) {
+        hit_token = tokens[1];
+    } else if (n_tokens >= 3 && next0 == tokens[2]) {
+        hit_token = tokens[2];
+    }
+
+    if (hit_token < 0) {
         ctx->pos = pos + 1u;
         return 1;
     }
 
-    // 2. 仅在第 1 个草稿完全命中时，才前向第 2 个 token
-    int32_t next1 = myds_v41_forward(ctx, tokens[1], pos + 1, true);
+    // 2. 仅在草稿候选命中时，前向对应命中的分支 token
+    int32_t next1 = myds_v41_forward(ctx, hit_token, pos + 1, true);
     if (next1 < 0) return -1;
     out_tokens[1] = next1;
     ctx->pos = pos + 2u;

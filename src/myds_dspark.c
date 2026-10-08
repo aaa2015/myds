@@ -345,6 +345,13 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
         markov_only = (env && atoi(env) != 0) ? 1 : 0;
     }
 
+    static float markov_scale = -1.0f;
+    if (__builtin_expect(markov_scale < 0.0f, 0)) {
+        const char *env = getenv("MYDS_DSPARK_MARKOV_SCALE");
+        markov_scale = env ? (float)atof(env) : 0.20f;
+        MYDS_LOG_I("DSpark Markov bias Bayesian scale: %.2f", markov_scale);
+    }
+
     const float *base_logits = NULL;
     if (!markov_only && ds->main_proj && ds->target_hidden_buf && ds->stage_x_buf && ds->draft_logits_buf) {
         // 1. Stage0 Entry Projection: [15360] -> [5120]
@@ -423,7 +430,7 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
                 for (uint32_t r = r0; r < r1; r++) {
                     const q8_0_block_t *w2_row = w2_base + (size_t)r * 8;
                     float bias = dot_q8_row256(w2_row, ds->markov_state_host);
-                    float score = base_logits ? (base_logits[r] + bias) : bias;
+                    float score = base_logits ? (base_logits[r] + markov_scale * bias) : bias;
                     dspark_update_top2((int32_t)r, score, &local_t1, &local_s1, &local_t2, &local_s2);
                 }
                 tokens_out[s] = local_t1;
@@ -440,7 +447,7 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
             for (uint32_t r = 0; r < vocab_size; r++) {
                 const q8_0_block_t *w2_row = w2_base + (size_t)r * 8;
                 float bias = dot_q8_row256(w2_row, ds->markov_state_host);
-                float score = base_logits ? (base_logits[r] + bias) : bias;
+                float score = base_logits ? (base_logits[r] + markov_scale * bias) : bias;
                 dspark_update_top2((int32_t)r, score, &best_token, &best_score, &best_token2, &best_score2);
             }
 #endif
