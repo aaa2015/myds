@@ -3403,10 +3403,20 @@ static int myds_generate_internal(myds_context_t *ctx,
                     if (ctx->pos + 1u > ctx->pcache_len) ctx->pcache_len = ctx->pos + 1u;
                 }
 
-                int32_t tokens_to_forward[2] = { cur_token, ctx->dspark->draft_tokens[0] };
-                int32_t out_tokens[2] = { 0, 0 };
+                int32_t tokens_to_forward[3];
+                uint32_t n_fwd = 2;
+                tokens_to_forward[0] = cur_token;
+                tokens_to_forward[1] = ctx->dspark->draft_tokens[0];
 
-                int ret = myds_v41_forward_batch_spec(ctx, tokens_to_forward, 2, ctx->pos, out_tokens);
+                if (ctx->dspark->draft_tree_count >= 2) {
+                    tokens_to_forward[1] = ctx->dspark->draft_tree_tokens[0];
+                    tokens_to_forward[2] = ctx->dspark->draft_tree_tokens[1];
+                    n_fwd = 3;
+                }
+
+                int32_t out_tokens[3] = { 0, 0, 0 };
+
+                int ret = myds_v41_forward_batch_spec(ctx, tokens_to_forward, n_fwd, ctx->pos, out_tokens);
                 if (ret < 0 || out_tokens[0] < 0 || (uint32_t)out_tokens[0] >= m->tokenizer->vocab_size) {
                     if (snap_saved) myds_v41_spec_snapshot_restore(ctx, snap);
                     ctx->pcache_len = 0;
@@ -3415,7 +3425,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                     break;
                 }
 
-                bool matched = (out_tokens[0] == ctx->dspark->draft_tokens[0]);
+                bool matched = (ret == 2);
                 if (matched) {
                     ctx->dspark->accepted_tokens++;
                     accepted_in_cycle++;
@@ -3435,22 +3445,16 @@ static int myds_generate_internal(myds_context_t *ctx,
                     step++;
 
                     if (out_tokens[0] == m->tokenizer->eos_id) {
-                        if (snap_saved) myds_v41_spec_snapshot_restore_partial(ctx, snap, 1);
-                        else ctx->pos++;
                         stop_reason = MYDS_STOP_EOS;
                         break;
                     }
 
                     if (step >= max_gen) {
-                        if (snap_saved) myds_v41_spec_snapshot_restore_partial(ctx, snap, 1);
-                        else ctx->pos++;
                         break;
                     }
 
-                    // 2. 采纳第 2 个 Token (权威模型在真值 draft_tokens[0] 上推理出的真实输出)
+                    // 2. 采纳第 2 个 Token (权威模型在命中分支上推理出的真实输出)
                     if (out_tokens[1] < 0 || (uint32_t)out_tokens[1] >= m->tokenizer->vocab_size) {
-                        if (snap_saved) myds_v41_spec_snapshot_restore_partial(ctx, snap, 1);
-                        else ctx->pos++;
                         stop_reason = MYDS_STOP_ERROR;
                         success = 0;
                         break;
@@ -3464,8 +3468,6 @@ static int myds_generate_internal(myds_context_t *ctx,
                     size_t piece_len1 = 0;
                     const char *piece1 = myds_tokenizer_decode_bytes(m->tokenizer, out_tokens[1], &piece_len1);
                     if (!piece1) {
-                        if (snap_saved) myds_v41_spec_snapshot_restore_partial(ctx, snap, 1);
-                        else ctx->pos++;
                         stop_reason = MYDS_STOP_ERROR;
                         success = 0;
                         break;
@@ -3473,7 +3475,6 @@ static int myds_generate_internal(myds_context_t *ctx,
                     if (bytes_cb) bytes_cb(piece1, piece_len1, out_tokens[1], user_data);
                     else if (cb) cb(piece1, out_tokens[1], user_data);
 
-                    ctx->pos += 2;
                     step++;
                     cur_token = out_tokens[1];
 
@@ -3482,13 +3483,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                         break;
                     }
                 } else {
-                    // 第 1 个草稿未命中！早退保护生效，保留第 1 个真值
-                    if (snap_saved) {
-                        myds_v41_spec_snapshot_restore_partial(ctx, snap, 1);
-                    } else {
-                        ctx->pos++;
-                    }
-
+                    // 推测树未命中！保留第 1 个真值
                     size_t piece_len = 0;
                     const char *piece = myds_tokenizer_decode_bytes(m->tokenizer, out_tokens[0], &piece_len);
                     if (!piece) {
@@ -3514,9 +3509,7 @@ static int myds_generate_internal(myds_context_t *ctx,
 
                 if (accepted_in_cycle == 0) {
                     ctx->dspark->consecutive_misses++;
-                    if (ctx->dspark->consecutive_misses >= 4) {
-                        ctx->dspark->backoff_counter = 8;
-                    } else if (ctx->dspark->consecutive_misses >= 2) {
+                    if (ctx->dspark->consecutive_misses >= 8) {
                         ctx->dspark->backoff_counter = 4;
                     }
                 } else {

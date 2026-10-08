@@ -43,6 +43,7 @@ TEST_P1 = $(BIN_DIR)/test_p1
 TEST_DSPARK_ROLLBACK = $(BIN_DIR)/test_dspark_rollback
 TEST_BATCH2_PARITY = $(BIN_DIR)/test_batch2_parity
 TEST_BATCH2_E2E = $(BIN_DIR)/test_batch2_e2e
+TEST_TREE_SPEC = $(BIN_DIR)/test_tree_spec
 BENCH_SYNTHETIC = $(BIN_DIR)/bench_synthetic
 BENCH_METAL = $(BIN_DIR)/bench_metal
 BENCH_PHASE = $(BIN_DIR)/bench_phase
@@ -51,7 +52,7 @@ DUMP_TENSORS = $(BIN_DIR)/dump_tensors
 METALLIB = $(BIN_DIR)/myds.metallib
 METAL_SRCS = $(wildcard metal/*.metal)
 
-ALL_TESTS = $(TEST_METAL) $(TEST_V41_GPU) $(TEST_ATTN_POLICY) $(TEST_ATTN_VEC) $(TEST_QKV_FUSION) $(TEST_DECODE_Q8) $(TEST_DEEPER_SSD) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE) $(TEST_CPU) $(TEST_ENGRAM) $(TEST_ALIGN) $(TEST_PLD) $(TEST_KVDSK) $(TEST_P1) $(TEST_DSPARK_ROLLBACK) $(TEST_BATCH2_PARITY) $(TEST_BATCH2_E2E)
+ALL_TESTS = $(TEST_METAL) $(TEST_V41_GPU) $(TEST_ATTN_POLICY) $(TEST_ATTN_VEC) $(TEST_QKV_FUSION) $(TEST_DECODE_Q8) $(TEST_DEEPER_SSD) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE) $(TEST_CPU) $(TEST_ENGRAM) $(TEST_ALIGN) $(TEST_PLD) $(TEST_KVDSK) $(TEST_P1) $(TEST_DSPARK_ROLLBACK) $(TEST_BATCH2_PARITY) $(TEST_BATCH2_E2E) $(TEST_TREE_SPEC)
 
 .PHONY: all test clean bench metallib build-tail-init test-tail-init
 
@@ -188,6 +189,9 @@ $(TEST_BATCH2_PARITY): tests/test_batch2_parity.c $(filter-out $(BUILD_DIR)/main
 $(TEST_BATCH2_E2E): tests/test_batch2_e2e.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -Iinclude -o $@ tests/test_batch2_e2e.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS)
 
+$(TEST_TREE_SPEC): tests/test_tree_spec.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
+	$(CC) $(CFLAGS) -Iinclude -o $@ tests/test_tree_spec.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS)
+
 $(TEST_LOG): $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_log.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@
 
@@ -309,6 +313,8 @@ test: $(ALL_TESTS) $(METALLIB)
 	@./$(TEST_BATCH2_PARITY)
 	@echo ""
 	@./$(TEST_BATCH2_E2E)
+	@echo ""
+	@./$(TEST_TREE_SPEC)
 	@echo ""
 	@MYDS_QKV_NR0=4 ./$(TEST_DECODE_Q8) bin
 	@MYDS_QKV_NR0=2 ./$(TEST_DECODE_Q8) bin

@@ -103,6 +103,10 @@ int myds_v41_forward_batch_spec(myds_context_t *context, const int32_t *tokens,
                                 uint32_t n_tokens, uint32_t position,
                                 int32_t *out_tokens);
 
+/* ── 推测树（Tree-based Speculative Decoding）级联前向与3-Way裁决器 ── */
+int myds_v41_forward_tree_spec(myds_context_t *context, const int32_t *tokens,
+                               uint32_t position, int32_t *out_tokens);
+
 #endif
 
 

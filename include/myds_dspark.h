@@ -93,6 +93,11 @@ struct myds_dspark {
     int32_t draft_tokens[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
     uint32_t draft_count;
 
+    // Draft tree proposals (Top-2 candidates for Tree-based Speculative Decoding)
+    int32_t draft_tree_tokens[2];
+    float   draft_tree_scores[2];
+    uint32_t draft_tree_count;
+
     // Speculative statistics
     uint64_t cycles;
     uint64_t proposed_tokens;
@@ -119,5 +124,8 @@ void myds_dspark_capture_layer(myds_dspark_t *ds, uint32_t layer_idx, const myds
 
 /* Propose K draft tokens given last token and captured target hidden states */
 uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t last_token, uint32_t draft_cap);
+
+/* Propose Top-2 tree branches for tree-based speculative decoding */
+uint32_t myds_dspark_propose_tree(myds_dspark_t *ds, myds_context_t *ctx, int32_t last_token);
 
 #endif /* MYDS_DSPARK_H */

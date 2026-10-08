@@ -312,6 +312,20 @@ static inline float dot_q8_row256(const q8_0_block_t *row, const float *state) {
 #define MARKOV_NUM_SLICES 1
 #endif
 
+static inline void dspark_update_top2(int32_t tok, float score,
+                                      int32_t *t1, float *s1,
+                                      int32_t *t2, float *s2) {
+    if (score > *s1) {
+        *s2 = *s1;
+        *t2 = *t1;
+        *s1 = score;
+        *t1 = tok;
+    } else if (score > *s2) {
+        *s2 = score;
+        *t2 = tok;
+    }
+}
+
 uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t last_token, uint32_t draft_cap) {
     if (!ds || !ctx || !ctx->model) return 0;
     if (ds->backoff_counter > 0) {
@@ -373,6 +387,9 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
 
     for (uint32_t d = 0; d < K; d++) {
         int32_t best_token = 0;
+        int32_t best_token2 = 0;
+        float best_score = -INFINITY;
+        float best_score2 = -INFINITY;
 
         if (has_markov && w1_base && w2_base && prev >= 0 && (uint32_t)prev < vocab_size) {
             // Dequantize 8 blocks from markov_w1 for row `prev`
@@ -387,8 +404,12 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
 #if defined(__APPLE__)
             int32_t slice_tokens[MARKOV_NUM_SLICES];
             float slice_scores[MARKOV_NUM_SLICES];
+            int32_t slice_tokens2[MARKOV_NUM_SLICES];
+            float slice_scores2[MARKOV_NUM_SLICES];
             int32_t *tokens_out = slice_tokens;
             float *scores_out = slice_scores;
+            int32_t *tokens2_out = slice_tokens2;
+            float *scores2_out = slice_scores2;
             uint32_t chunk = (vocab_size + MARKOV_NUM_SLICES - 1) / MARKOV_NUM_SLICES;
 
             dispatch_apply(MARKOV_NUM_SLICES, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t s) {
@@ -396,51 +417,46 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
                 uint32_t r1 = r0 + chunk;
                 if (r1 > vocab_size) r1 = vocab_size;
 
-                int32_t local_best_token = 0;
-                float local_best_score = -INFINITY;
+                int32_t local_t1 = 0, local_t2 = 0;
+                float local_s1 = -INFINITY, local_s2 = -INFINITY;
 
                 for (uint32_t r = r0; r < r1; r++) {
                     const q8_0_block_t *w2_row = w2_base + (size_t)r * 8;
                     float bias = dot_q8_row256(w2_row, ds->markov_state_host);
                     float score = base_logits ? (base_logits[r] + bias) : bias;
-                    if (score > local_best_score) {
-                        local_best_score = score;
-                        local_best_token = (int32_t)r;
-                    }
+                    dspark_update_top2((int32_t)r, score, &local_t1, &local_s1, &local_t2, &local_s2);
                 }
-                tokens_out[s] = local_best_token;
-                scores_out[s] = local_best_score;
+                tokens_out[s] = local_t1;
+                scores_out[s] = local_s1;
+                tokens2_out[s] = local_t2;
+                scores2_out[s] = local_s2;
             });
 
-            best_token = slice_tokens[0];
-            float best_score = slice_scores[0];
-            for (int s = 1; s < MARKOV_NUM_SLICES; s++) {
-                if (slice_scores[s] > best_score) {
-                    best_score = slice_scores[s];
-                    best_token = slice_tokens[s];
-                }
+            for (int s = 0; s < MARKOV_NUM_SLICES; s++) {
+                dspark_update_top2(slice_tokens[s], slice_scores[s], &best_token, &best_score, &best_token2, &best_score2);
+                dspark_update_top2(slice_tokens2[s], slice_scores2[s], &best_token, &best_score, &best_token2, &best_score2);
             }
 #else
-            float best_score = -INFINITY;
             for (uint32_t r = 0; r < vocab_size; r++) {
                 const q8_0_block_t *w2_row = w2_base + (size_t)r * 8;
                 float bias = dot_q8_row256(w2_row, ds->markov_state_host);
                 float score = base_logits ? (base_logits[r] + bias) : bias;
-                if (score > best_score) {
-                    best_score = score;
-                    best_token = (int32_t)r;
-                }
+                dspark_update_top2((int32_t)r, score, &best_token, &best_score, &best_token2, &best_score2);
             }
 #endif
         } else if (base_logits) {
-            // Simple argmax fallback
-            float best_score = -INFINITY;
+            // Simple argmax / top2 fallback
             for (uint32_t r = 0; r < vocab_size; r++) {
-                if (base_logits[r] > best_score) {
-                    best_score = base_logits[r];
-                    best_token = (int32_t)r;
-                }
+                dspark_update_top2((int32_t)r, base_logits[r], &best_token, &best_score, &best_token2, &best_score2);
             }
+        }
+
+        if (d == 0) {
+            ds->draft_tree_tokens[0] = best_token;
+            ds->draft_tree_scores[0] = best_score;
+            ds->draft_tree_tokens[1] = best_token2;
+            ds->draft_tree_scores[1] = best_score2;
+            ds->draft_tree_count = 2;
         }
 
         ds->draft_tokens[n_proposed++] = best_token;
@@ -452,5 +468,10 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
     ds->propose_ms += (now_ms() - t0);
 
     return n_proposed;
+}
+
+uint32_t myds_dspark_propose_tree(myds_dspark_t *ds, myds_context_t *ctx, int32_t last_token) {
+    if (!ds || !ctx) return 0;
+    return myds_dspark_propose(ds, ctx, last_token, 1);
 }
 
