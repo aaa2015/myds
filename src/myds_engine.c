@@ -3270,7 +3270,7 @@ static int myds_generate_internal(myds_context_t *ctx,
     if (ctx->v41) (void)myds_v41_low_kv_save(ctx->v41, prompt_tokens, (uint32_t)n_prompt);
     uint32_t max_gen = ctx->cfg.max_new_tokens;
     const char *pld_env_str = getenv("MYDS_PLD");
-    const bool pld_enabled = (pld_env_str && atoi(pld_env_str) != 0 && ctx->dspark == NULL);
+    const bool pld_enabled = (pld_env_str && atoi(pld_env_str) != 0);
 
     int32_t *pld_history = NULL;
     uint32_t pld_len = 0;
@@ -3318,6 +3318,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                 }
                 ctx->pos++;
                 step++;
+                if (pld_history && pld_len < pld_cap) pld_history[pld_len++] = next_token;
 
                 if (next_token == m->tokenizer->eos_id) {
                     stop_reason = MYDS_STOP_EOS;
@@ -3340,10 +3341,43 @@ static int myds_generate_internal(myds_context_t *ctx,
                 continue;
             }
 
-            uint32_t draft_cap = ctx->dspark->block_size;
+            uint32_t draft_cap = ctx->dspark ? ctx->dspark->block_size : 4;
             if (draft_cap > max_gen - step) draft_cap = max_gen - step;
-            uint32_t n_draft = myds_dspark_propose(ctx->dspark, ctx, cur_token, draft_cap);
-            if (n_draft == 0) {
+
+            int32_t cand_a = -1, cand_b = -1;
+
+            if (pld_history && pld_len >= 2) {
+                int32_t pld_draft[MYDS_PLD_DEFAULT_MAX_DRAFT];
+                myds_pld_config_t pld_cfg = myds_pld_default_config(m->tokenizer->eos_id);
+                uint32_t n_pld = myds_pld_propose(pld_history, pld_len, &pld_cfg, pld_draft);
+                if (n_pld > 0) {
+                    cand_a = pld_draft[0];
+                    if (n_pld > 1) cand_b = pld_draft[1];
+                }
+            }
+
+            if (ctx->dspark) {
+                uint32_t n_dspark = myds_dspark_propose(ctx->dspark, ctx, cur_token, draft_cap);
+                if (n_dspark > 0) {
+                    int32_t ds0 = ctx->dspark->draft_tree_tokens[0];
+                    int32_t ds1 = (ctx->dspark->draft_tree_count >= 2) ? ctx->dspark->draft_tree_tokens[1] : -1;
+                    if (cand_a < 0) {
+                        cand_a = ds0;
+                        cand_b = ds1;
+                    } else {
+                        // cand_a 来自 PLD，cand_b 接收 DSpark 互补候选
+                        if (ds0 != cand_a) {
+                            cand_b = ds0;
+                        } else if (ds1 >= 0 && ds1 != cand_a) {
+                            cand_b = ds1;
+                        }
+                    }
+                }
+            }
+
+            uint32_t n_draft = (cand_a >= 0) ? ((cand_b >= 0 && cand_b != cand_a) ? 2 : 1) : 0;
+
+            if (cand_a < 0) {
                 if (ctx->pcache_tokens && ctx->pos < ctx->pcache_cap) {
                     ctx->pcache_tokens[ctx->pos] = cur_token;
                     if (ctx->pos + 1u > ctx->pcache_len) ctx->pcache_len = ctx->pos + 1u;
@@ -3357,6 +3391,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                 }
                 ctx->pos++;
                 step++;
+                if (pld_history && pld_len < pld_cap) pld_history[pld_len++] = next_token;
                 if (next_token == m->tokenizer->eos_id) {
                     stop_reason = MYDS_STOP_EOS;
                     break;
@@ -3381,17 +3416,12 @@ static int myds_generate_internal(myds_context_t *ctx,
             bool snap_saved = false;
             if (snap) {
                 memset(snap, 0, sizeof(*snap));
-                snap_saved = myds_v41_spec_snapshot_save(ctx, snap, n_draft + 1);
+                snap_saved = myds_v41_spec_snapshot_save(ctx, snap, 2);
             }
 
             uint32_t accepted_in_cycle = 0;
 
-            if (ctx->v41 && snap && n_draft >= 1 && (ctx->pos + 2 <= ctx->cfg.max_seq_len)) {
-                ctx->dspark->cycles++;
-
-                memset(snap, 0, sizeof(*snap));
-                snap_saved = myds_v41_spec_snapshot_save(ctx, snap, 2);
-
+            if (ctx->v41 && snap && (ctx->pos + 2 <= ctx->cfg.max_seq_len)) {
                 if (cancel_flag && *cancel_flag) {
                     stop_reason = MYDS_STOP_CANCELLED;
                     break;
@@ -3405,11 +3435,10 @@ static int myds_generate_internal(myds_context_t *ctx,
                 int32_t tokens_to_forward[3];
                 uint32_t n_fwd = 2;
                 tokens_to_forward[0] = cur_token;
-                tokens_to_forward[1] = ctx->dspark->draft_tokens[0];
+                tokens_to_forward[1] = cand_a;
 
-                if (ctx->dspark->draft_tree_count >= 2) {
-                    tokens_to_forward[1] = ctx->dspark->draft_tree_tokens[0];
-                    tokens_to_forward[2] = ctx->dspark->draft_tree_tokens[1];
+                if (cand_b >= 0 && cand_b != cand_a) {
+                    tokens_to_forward[2] = cand_b;
                     n_fwd = 3;
                 }
 
@@ -3427,7 +3456,7 @@ static int myds_generate_internal(myds_context_t *ctx,
 
                 bool matched = (ret == 2);
                 if (matched) {
-                    ctx->dspark->accepted_tokens++;
+                    if (ctx->dspark) ctx->dspark->accepted_tokens++;
                     accepted_in_cycle++;
 
                     // 1. 采纳第 1 个 Token
@@ -3443,6 +3472,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                     else if (cb) cb(piece0, out_tokens[0], user_data);
 
                     step++;
+                    if (pld_history && pld_len < pld_cap) pld_history[pld_len++] = out_tokens[0];
 
                     if (out_tokens[0] == m->tokenizer->eos_id) {
                         if (snap_saved) myds_v41_spec_snapshot_restore_partial(ctx, snap, 1);
@@ -3486,6 +3516,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                     ctx->pos = spec_pos + 2u;
                     step++;
                     cur_token = out_tokens[1];
+                    if (pld_history && pld_len < pld_cap) pld_history[pld_len++] = out_tokens[1];
 
                     if (out_tokens[1] == m->tokenizer->eos_id) {
                         stop_reason = MYDS_STOP_EOS;
@@ -3506,6 +3537,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                     ctx->pos = spec_pos + 1u;
                     step++;
                     cur_token = out_tokens[0];
+                    if (pld_history && pld_len < pld_cap) pld_history[pld_len++] = out_tokens[0];
 
                     if (out_tokens[0] == m->tokenizer->eos_id) {
                         stop_reason = MYDS_STOP_EOS;
@@ -3514,17 +3546,19 @@ static int myds_generate_internal(myds_context_t *ctx,
                 }
 
                 gettimeofday(&tv_ver1, NULL);
-                ctx->dspark->verify_ms += (double)(tv_ver1.tv_sec - tv_ver0.tv_sec) * 1000.0 +
-                                          (double)(tv_ver1.tv_usec - tv_ver0.tv_usec) / 1000.0;
+                if (ctx->dspark) {
+                    ctx->dspark->verify_ms += (double)(tv_ver1.tv_sec - tv_ver0.tv_sec) * 1000.0 +
+                                              (double)(tv_ver1.tv_usec - tv_ver0.tv_usec) / 1000.0;
 
-                if (accepted_in_cycle == 0) {
-                    ctx->dspark->consecutive_misses++;
-                    if (ctx->dspark->consecutive_misses >= 8) {
-                        ctx->dspark->backoff_counter = 4;
+                    if (accepted_in_cycle == 0) {
+                        ctx->dspark->consecutive_misses++;
+                        if (ctx->dspark->consecutive_misses >= 8) {
+                            ctx->dspark->backoff_counter = 4;
+                        }
+                    } else {
+                        ctx->dspark->consecutive_misses = 0;
+                        ctx->dspark->backoff_counter = 0;
                     }
-                } else {
-                    ctx->dspark->consecutive_misses = 0;
-                    ctx->dspark->backoff_counter = 0;
                 }
 
                 if (stop_reason == MYDS_STOP_EOS || stop_reason == MYDS_STOP_CANCELLED || !success || step >= max_gen) {
