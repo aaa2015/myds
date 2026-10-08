@@ -3074,6 +3074,8 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         uint64_t dspark_prop_before = ctx->dspark ? ctx->dspark->proposed_tokens : 0;
         uint64_t dspark_acc_before  = ctx->dspark ? ctx->dspark->accepted_tokens : 0;
         uint64_t dspark_cyc_before  = ctx->dspark ? ctx->dspark->cycles : 0;
+        double   dspark_prop_ms_before = ctx->dspark ? ctx->dspark->propose_ms : 0.0;
+        double   dspark_ver_ms_before  = ctx->dspark ? ctx->dspark->verify_ms : 0.0;
 
         if (is_continuation && (!resp_id_is_live(prev_id) || myds_context_get_pcache_len(ctx) == 0)) {
             t_infer_slot_depth = 0;
@@ -3536,7 +3538,9 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             uint64_t req_prop = ctx->dspark->proposed_tokens - dspark_prop_before;
             uint64_t req_acc  = ctx->dspark->accepted_tokens - dspark_acc_before;
             uint64_t req_cyc  = ctx->dspark->cycles - dspark_cyc_before;
-            MYDS_LOG_I("[%s:%d] DSpark Speculative: proposed=%llu, accepted=%llu (%.1f%% accept rate, %.2f tok/cycle, cumulative: %llu/%llu = %.1f%%)",
+            double req_prop_ms = ctx->dspark->propose_ms - dspark_prop_ms_before;
+            double req_ver_ms  = ctx->dspark->verify_ms - dspark_ver_ms_before;
+            MYDS_LOG_I("[%s:%d] DSpark Speculative: proposed=%llu, accepted=%llu (%.1f%% accept rate, %.2f tok/cycle, cumulative: %llu/%llu = %.1f%%) | propose=%.1fms (%.2fms/cyc), verify=%.1fms (%.2fms/cyc)",
                        client_ip, client_port,
                        (unsigned long long)req_prop,
                        (unsigned long long)req_acc,
@@ -3544,7 +3548,9 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                        (double)req_acc / (double)(req_cyc > 0 ? req_cyc : 1),
                        (unsigned long long)ctx->dspark->accepted_tokens,
                        (unsigned long long)ctx->dspark->proposed_tokens,
-                       ctx->dspark->proposed_tokens > 0 ? (100.0 * (double)ctx->dspark->accepted_tokens / (double)ctx->dspark->proposed_tokens) : 0.0);
+                       ctx->dspark->proposed_tokens > 0 ? (100.0 * (double)ctx->dspark->accepted_tokens / (double)ctx->dspark->proposed_tokens) : 0.0,
+                       req_prop_ms, req_cyc > 0 ? req_prop_ms / (double)req_cyc : 0.0,
+                       req_ver_ms, req_cyc > 0 ? req_ver_ms / (double)req_cyc : 0.0);
         }
 
 cleanup_infer:

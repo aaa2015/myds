@@ -3356,17 +3356,12 @@ static int myds_generate_internal(myds_context_t *ctx,
                 }
             }
 
-            if (pld_history && pld_len >= 2) {
+            if (!ctx->dspark && pld_history && pld_len >= 2) {
                 int32_t pld_draft[MYDS_PLD_DEFAULT_MAX_DRAFT];
                 myds_pld_config_t pld_cfg = myds_pld_default_config(m->tokenizer->eos_id);
                 uint32_t n_pld = myds_pld_propose(pld_history, pld_len, &pld_cfg, pld_draft);
                 if (n_pld > 0) {
-                    if (cand_a < 0) {
-                        cand_a = pld_draft[0];
-                        if (ctx->dspark) ctx->dspark->proposed_tokens += 1;
-                    } else if (cand_b < 0 && pld_draft[0] != cand_a) {
-                        cand_b = pld_draft[0];
-                    }
+                    cand_a = pld_draft[0];
                 }
             }
 

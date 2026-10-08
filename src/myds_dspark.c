@@ -671,6 +671,28 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
         MYDS_LOG_I("DSpark Markov bias Bayesian scale: %.2f", markov_scale);
     }
 
+    int32_t prev = last_token;
+    uint32_t n_proposed = 0;
+    const uint32_t vocab_size = ctx->model->vocab_size;
+
+    const bool has_markov = (ds->markov_w1 && ds->markov_w2 &&
+                             ds->markov_w1_type == GGML_TYPE_Q8_0 &&
+                             ds->markov_w2_type == GGML_TYPE_Q8_0 &&
+                             ds->markov_state_host && ds->markov_bias_host);
+
+    const q8_0_block_t *w1_base = has_markov ? (const q8_0_block_t *)myds_metal_buffer_data(ds->markov_w1) : NULL;
+    const q8_0_block_t *w2_base = has_markov ? (const q8_0_block_t *)myds_metal_buffer_data(ds->markov_w2) : NULL;
+
+    if (has_markov && w1_base && prev >= 0 && (uint32_t)prev < vocab_size) {
+        const q8_0_block_t *w1_row = w1_base + (size_t)prev * 8;
+        for (int b = 0; b < 8; b++) {
+            float d_scale = myds_fp16_to_fp32(w1_row[b].d);
+            for (int k = 0; k < 32; k++) {
+                ds->markov_state_host[b * 32 + k] = d_scale * (float)w1_row[b].qs[k];
+            }
+        }
+    }
+
     float confidence = 1.0f;
     const float *base_logits = NULL;
 
@@ -687,6 +709,14 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
         MYDS_LOG_I("DSpark confidence head threshold: %.2f", min_conf);
     }
 
+    static uint64_t s_log_cycle = 0;
+    if ((s_log_cycle++ % 50) == 0 || s_log_cycle <= 5) {
+        MYDS_LOG_I("[DSpark Propose #%llu] conf=%.4f (min=%.2f, passed=%s), base_logits=%s",
+                   (unsigned long long)ds->cycles, confidence, min_conf,
+                   (!markov_only && min_conf > 0.0f && confidence < min_conf) ? "NO" : "YES",
+                   base_logits ? "valid" : "null");
+    }
+
     // Confidence Gating: if below threshold, return 0 (0 overhead fallback to 29.8 tok/s)
     if (!markov_only && min_conf > 0.0f && confidence < min_conf) {
         ds->draft_count = 0;
@@ -696,19 +726,8 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
         return 0;
     }
     ds->is_high_confidence = (confidence >= 0.80f);
-    int32_t prev = last_token;
-    uint32_t n_proposed = 0;
-    const uint32_t vocab_size = ctx->model->vocab_size;
-
-    const bool has_markov = (ds->markov_w1 && ds->markov_w2 &&
-                             ds->markov_w1_type == GGML_TYPE_Q8_0 &&
-                             ds->markov_w2_type == GGML_TYPE_Q8_0 &&
-                             ds->markov_state_host && ds->markov_bias_host);
 
     if (!has_markov && !base_logits) return 0;
-
-    const q8_0_block_t *w1_base = has_markov ? (const q8_0_block_t *)myds_metal_buffer_data(ds->markov_w1) : NULL;
-    const q8_0_block_t *w2_base = has_markov ? (const q8_0_block_t *)myds_metal_buffer_data(ds->markov_w2) : NULL;
 
     for (uint32_t d = 0; d < K; d++) {
         int32_t best_token = 0;
@@ -717,12 +736,14 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
         float best_score2 = -INFINITY;
 
         if (has_markov && w1_base && w2_base && prev >= 0 && (uint32_t)prev < vocab_size) {
-            // Dequantize 8 blocks from markov_w1 for row `prev`
-            const q8_0_block_t *w1_row = w1_base + (size_t)prev * 8;
-            for (int b = 0; b < 8; b++) {
-                float d_scale = myds_fp16_to_fp32(w1_row[b].d);
-                for (int k = 0; k < 32; k++) {
-                    ds->markov_state_host[b * 32 + k] = d_scale * (float)w1_row[b].qs[k];
+            // Dequantize 8 blocks from markov_w1 for row `prev` if d > 0 (d == 0 already done)
+            if (d > 0) {
+                const q8_0_block_t *w1_row = w1_base + (size_t)prev * 8;
+                for (int b = 0; b < 8; b++) {
+                    float d_scale = myds_fp16_to_fp32(w1_row[b].d);
+                    for (int k = 0; k < 32; k++) {
+                        ds->markov_state_host[b * 32 + k] = d_scale * (float)w1_row[b].qs[k];
+                    }
                 }
             }
 

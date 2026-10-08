@@ -3529,17 +3529,23 @@ int myds_v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
 #define CHECK(x) do { if (!(x)) goto fail; } while (0)
 
     /* 2. 准备 Token 0 和 Token 1 的 Engram & Residual 初始化 */
+    myds_engram_history_t engram_hist_0 = {0};
+    myds_engram_history_t engram_hist_1 = {0};
+
     if (g->engram) {
         CHECK(myds_engram_prepare_token(g->engram, tokens[0], pos));
         for (uint32_t i = 0; i < 2; i++) {
             CHECK(myds_metal_buffer_write(ws->engram_rows_b2[0][i], 0,
                                           g->engram->row_values[i], MYDS_ENGRAM_INPUT_DIM * 4u));
         }
+        engram_hist_0 = g->engram->history;
+
         CHECK(myds_engram_prepare_token(g->engram, tokens[1], pos + 1u));
         for (uint32_t i = 0; i < 2; i++) {
             CHECK(myds_metal_buffer_write(ws->engram_rows_b2[1][i], 0,
                                           g->engram->row_values[i], MYDS_ENGRAM_INPUT_DIM * 4u));
         }
+        engram_hist_1 = g->engram->history;
     }
 
     float *res0 = (float *)myds_metal_buffer_data(ws->v_residual[0]);
@@ -3749,6 +3755,10 @@ int myds_v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_commit_batch());
 
         myds_metal_set_auto_barrier(prev_auto_barrier);
+        if (g->engram) {
+            g->engram->history = engram_hist_1;
+            g->engram->position = pos + 2u;
+        }
         g->next_position = pos + 2u;
         ctx->pos = pos + 2u;
         return 2;
@@ -3770,6 +3780,10 @@ int myds_v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_commit_batch());
 
         myds_metal_set_auto_barrier(prev_auto_barrier);
+        if (g->engram) {
+            g->engram->history = engram_hist_0;
+            g->engram->position = pos + 1u;
+        }
         g->next_position = pos + 1u;
         ctx->pos = pos + 1u;
         return 1;
