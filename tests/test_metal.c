@@ -934,6 +934,77 @@ static int test_v41_hc(void) {
     return 1;
 }
 
+static int test_v41_moe_add_hc_expand_parity(void) {
+    enum { D = 256 };
+    myds_metal_buffer_t *moe_out     = myds_metal_buffer_alloc(D * 4);
+    myds_metal_buffer_t *shared_out  = myds_metal_buffer_alloc(D * 4);
+    myds_metal_buffer_t *res_unfused = myds_metal_buffer_alloc(4 * D * 4);
+    myds_metal_buffer_t *res_fused   = myds_metal_buffer_alloc(4 * D * 4);
+    myds_metal_buffer_t *res_inplace = myds_metal_buffer_alloc(4 * D * 4);
+    myds_metal_buffer_t *ffn_unfused = myds_metal_buffer_alloc(D * 4);
+    myds_metal_buffer_t *ffn_fused   = myds_metal_buffer_alloc(D * 4);
+    myds_metal_buffer_t *split       = myds_metal_buffer_alloc(96);
+    ASSERT_TRUE(moe_out && shared_out && res_unfused && res_fused && res_inplace && ffn_unfused && ffn_fused && split);
+
+    float *m = myds_metal_buffer_data(moe_out);
+    float *s = myds_metal_buffer_data(shared_out);
+    float *ru = myds_metal_buffer_data(res_unfused);
+    float *rf = myds_metal_buffer_data(res_fused);
+    float *ri = myds_metal_buffer_data(res_inplace);
+    float *sp = myds_metal_buffer_data(split);
+
+    for (unsigned i = 0; i < D; i++) {
+        m[i] = (float)((int)(i % 31) - 15) * 0.125f;
+        s[i] = (float)((int)(i % 19) - 9) * 0.0625f;
+    }
+    for (unsigned h = 0; h < 4; h++) {
+        for (unsigned i = 0; i < D; i++) {
+            float val = (float)(h + 1) * 0.5f + (float)(i % 13) * 0.25f;
+            ru[h * D + i] = val;
+            rf[h * D + i] = val;
+            ri[h * D + i] = val;
+        }
+    }
+    for (unsigned i = 0; i < 24; i++) sp[i] = 0;
+    for (unsigned h = 0; h < 4; h++) {
+        sp[4 + h] = (float)(h + 1) * 0.25f;
+        sp[8 + ((h + 1) % 4) * 4 + h] = 0.5f;
+        sp[8 + h * 4 + h] = 1.0f;
+    }
+
+    // 1. Unfused reference path: add_bf16 + hc_expand
+    ASSERT_TRUE(myds_metal_v41_add_bf16(ffn_unfused, moe_out, shared_out, D));
+    ASSERT_TRUE(myds_metal_v41_hc_expand(res_unfused, ffn_unfused, res_unfused, split, D));
+
+    // 2. Fused path: moe_add_hc_expand to separate buffer
+    ASSERT_TRUE(myds_metal_v41_moe_add_hc_expand(res_fused, ffn_fused, moe_out, shared_out, res_fused, split, D));
+
+    // 3. Fused path: in-place rewrite of residual
+    ASSERT_TRUE(myds_metal_v41_moe_add_hc_expand(res_inplace, NULL, moe_out, shared_out, res_inplace, split, D));
+
+    // Bit-exact verification: ffn_out must match memcmp == 0
+    float *fu = myds_metal_buffer_data(ffn_unfused);
+    float *ff = myds_metal_buffer_data(ffn_fused);
+    ASSERT_TRUE(!memcmp(fu, ff, D * 4));
+
+    // Bit-exact verification: 4-channel HC residual must match memcmp == 0
+    ASSERT_TRUE(!memcmp(ru, rf, 4 * D * 4));
+    ASSERT_TRUE(!memcmp(ru, ri, 4 * D * 4));
+
+    myds_metal_buffer_free(moe_out);
+    myds_metal_buffer_free(shared_out);
+    myds_metal_buffer_free(res_unfused);
+    myds_metal_buffer_free(res_fused);
+    myds_metal_buffer_free(res_inplace);
+    myds_metal_buffer_free(ffn_unfused);
+    myds_metal_buffer_free(ffn_fused);
+    myds_metal_buffer_free(split);
+
+    printf("  [PASS] S10: myds_metal_v41_moe_add_hc_expand bit-exact parity with add_bf16 + hc_expand (out-of-place and in-place)\n");
+    return 1;
+}
+
+
 static int test_v41_engram_dispatch_copy(void) {
     enum {D=128};
     myds_metal_buffer_t *r=myds_metal_buffer_alloc(4*D*4),*p=myds_metal_buffer_alloc(5*D*4),
@@ -1343,6 +1414,7 @@ int main(void) {
 #define RUN_TEST(test) do { total++; passed += (test); } while (0)
     RUN_TEST(test_v41_bf16_norm());
     RUN_TEST(test_v41_hc());
+    RUN_TEST(test_v41_moe_add_hc_expand_parity());
     RUN_TEST(test_v41_engram_dispatch_copy());
     RUN_TEST(test_v41_engram_gate_clamp());
     RUN_TEST(test_specialized_dispatch_cache());

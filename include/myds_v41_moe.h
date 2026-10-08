@@ -28,7 +28,13 @@ int myds_v41_shared_gate_up_swiglu(myds_metal_buffer_t *out,
                                   float clamp);
 /* Input ctx->ffn_norm_out; output ctx->ffn_out. Retains an active GPU batch. */
 int myds_v41_moe(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t pos);
+/* S10 算子融合版：MoE Output + Shared + HC Expand 融合为单次派发 */
+int myds_v41_moe_fused(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t pos,
+                       myds_metal_buffer_t *residual,
+                       const myds_metal_buffer_t *after_attn,
+                       const myds_metal_buffer_t *ffn_split);
 int myds_v41_moe_eval(myds_context_t *ctx, uint32_t layer, uint32_t pos,
+
                       const myds_metal_buffer_t *ffn_norm,
                       const myds_metal_buffer_t *router_logits,
                       const myds_metal_buffer_t *shared_out);

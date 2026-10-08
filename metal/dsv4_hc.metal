@@ -1749,3 +1749,45 @@ kernel void kernel_dsv4_hc_expand4_rms_norm_mix_f16_cluster2_pre_norm(
     threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
     ds4_hc_rms_norm_mix_cluster2_pre_norm_body(args, split_args, x, weight, dst, hc_scale, hc_base, split, collapse_dst, norm_weight, norm_dst, completion, shmem, tgpig, tiisg, sgitg);
 }
+
+kernel void kernel_dsv4_moe_add_hc_expand4(
+        constant ds4_metal_args_dsv4_hc_expand & args [[buffer(0)]],
+        device  const float * moe_out                  [[buffer(1)]],
+        device  const float * shared_out               [[buffer(2)]],
+        device  const char  * residual                 [[buffer(3)]],
+        device  const char  * post                     [[buffer(4)]],
+        device  const char  * comb                     [[buffer(5)]],
+        device        char  * dst                      [[buffer(6)]],
+        device        float * ffn_out                  [[buffer(7)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (args.n_hc != 4) return;
+    const int64_t n_elem = args.n_embd;
+    if ((int64_t) gid >= n_elem) return;
+    const int64_t d = (int64_t) gid;
+
+    // 1. moe_out + shared_out 逐元素求和，并精确进行 BF16 舍入（与 kernel_add2_bf16_f32 完全一致）
+    const float ffn_val = dsv41_bf16_round_f32(moe_out[d] + shared_out[d]);
+    if (args.has_add && ffn_out) {
+        ffn_out[d] = ffn_val;
+    }
+
+    // 2. 4 通道残差广播与累加（与 kernel_dsv4_hc_expand4 完全一致）
+    const float r0 = *((device const float *) (residual + d*args.nb_res0 + 0*args.nb_res1));
+    const float r1 = *((device const float *) (residual + d*args.nb_res0 + 1*args.nb_res1));
+    const float r2 = *((device const float *) (residual + d*args.nb_res0 + 2*args.nb_res1));
+    const float r3 = *((device const float *) (residual + d*args.nb_res0 + 3*args.nb_res1));
+
+    for (int64_t dst_hc = 0; dst_hc < 4; ++dst_hc) {
+        float acc = ffn_val * *((device const float *) (post + dst_hc*args.nb_post0));
+
+        acc += *((device const float *) (comb + dst_hc*args.nb_comb0 + 0*args.nb_comb1)) * r0;
+        acc += *((device const float *) (comb + dst_hc*args.nb_comb0 + 1*args.nb_comb1)) * r1;
+        acc += *((device const float *) (comb + dst_hc*args.nb_comb0 + 2*args.nb_comb1)) * r2;
+        acc += *((device const float *) (comb + dst_hc*args.nb_comb0 + 3*args.nb_comb1)) * r3;
+
+        *((device float *) (dst + d*args.nb0 + dst_hc*args.nb1)) =
+            args.round_bf16 ? dsv41_bf16_round_f32(acc) : acc;
+    }
+}
+
+

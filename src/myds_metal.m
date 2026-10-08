@@ -32,6 +32,7 @@ static id<MTLComputePipelineState> g_pso_v41_hc_split = nil;
 static id<MTLComputePipelineState> g_pso_v41_hc_sum = nil;
 static id<MTLComputePipelineState> g_pso_v41_hc_sum_rmsnorm = nil;
 static id<MTLComputePipelineState> g_pso_v41_hc_expand = nil;
+static id<MTLComputePipelineState> g_pso_v41_moe_add_hc_expand = nil;
 static id<MTLComputePipelineState> g_pso_v41_engram_add = nil;
 static id<MTLComputePipelineState> g_pso_swiglu = nil;
 static id<MTLComputePipelineState> g_pso_add = nil;
@@ -703,6 +704,8 @@ int myds_metal_init(const char *shader_dir) {
         if (fn) g_pso_v41_hc_sum_rmsnorm = [g_device newComputePipelineStateWithFunction:fn error:nil];
         fn = [g_library newFunctionWithName:@"kernel_dsv4_hc_expand4"];
         if (fn) g_pso_v41_hc_expand = [g_device newComputePipelineStateWithFunction:fn error:nil];
+        fn = [g_library newFunctionWithName:@"kernel_dsv4_moe_add_hc_expand4"];
+        if (fn) g_pso_v41_moe_add_hc_expand = [g_device newComputePipelineStateWithFunction:fn error:nil];
         fn = [g_library newFunctionWithName:@"kernel_dsv41_engram_add"];
         if (fn) g_pso_v41_engram_add = [g_device newComputePipelineStateWithFunction:fn error:nil];
         fn = [g_library newFunctionWithName:@"kernel_compute_copy_u8"];
@@ -916,6 +919,7 @@ void myds_metal_cleanup(void) {
     g_pso_v41_hc_sum = nil;
     g_pso_v41_hc_sum_rmsnorm = nil;
     g_pso_v41_hc_expand = nil;
+    g_pso_v41_moe_add_hc_expand = nil;
     g_pso_v41_engram_add = nil;
     g_pso_swiglu = nil;
     g_pso_add = nil;
@@ -1860,6 +1864,54 @@ int myds_metal_v41_hc_expand(myds_metal_buffer_t *out,
         return v41_finish(cb, enc);
     }
 }
+
+int myds_metal_v41_moe_add_hc_expand(myds_metal_buffer_t *out,
+    myds_metal_buffer_t *ffn_out, const myds_metal_buffer_t *moe_out,
+    const myds_metal_buffer_t *shared_out, const myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *split, uint32_t dim) {
+    if (!g_initialized || !v41_floats(out, 4ull*dim) ||
+        !v41_floats(moe_out, dim) || !v41_floats(shared_out, dim) ||
+        !v41_floats(residual, 4ull*dim) || !v41_floats(split, 24)) return 0;
+    if (ffn_out && !v41_floats(ffn_out, dim)) return 0;
+    if (!g_pso_v41_moe_add_hc_expand) {
+        myds_metal_buffer_t *fout = ffn_out ? ffn_out : out;
+        if (!myds_metal_v41_add_bf16(fout, moe_out, shared_out, dim)) return 0;
+        return myds_metal_v41_hc_expand(out, fout, residual, split, dim);
+    }
+    @autoreleasepool {
+        struct v41_hc_expand_args args = {
+            .n_embd=dim, .n_hc=4, .n_tokens=1,
+            .nb_block0=4, .nb_block1=4ull*dim, .nb_add0=4, .nb_add1=4ull*dim,
+            .nb_res0=4, .nb_res1=4ull*dim, .nb_res2=16ull*dim,
+            .nb_post0=4, .nb_post1=96, .nb_comb0=4, .nb_comb1=16, .nb_comb2=96,
+            .nb0=4, .nb1=4ull*dim, .nb2=16ull*dim,
+            .has_add = (ffn_out != NULL) ? 1 : 0,
+            .round_bf16 = 1,
+        };
+        id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
+        if (!enc) return 0;
+        if (g_batch_cb && g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        [enc setComputePipelineState:g_pso_v41_moe_add_hc_expand];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:moe_out->mtl_buf offset:moe_out->offset atIndex:1];
+        [enc setBuffer:shared_out->mtl_buf offset:shared_out->offset atIndex:2];
+        [enc setBuffer:residual->mtl_buf offset:residual->offset atIndex:3];
+        [enc setBuffer:split->mtl_buf offset:split->offset+16 atIndex:4];
+        [enc setBuffer:split->mtl_buf offset:split->offset+32 atIndex:5];
+        [enc setBuffer:out->mtl_buf offset:out->offset atIndex:6];
+        if (ffn_out) {
+            [enc setBuffer:ffn_out->mtl_buf offset:ffn_out->offset atIndex:7];
+        } else {
+            [enc setBuffer:out->mtl_buf offset:out->offset atIndex:7];
+        }
+        NSUInteger nth = MIN((NSUInteger)256, (NSUInteger)dim);
+        metal_dispatch(enc, "v41_moe_add_hc_expand", MTLSizeMake((dim+nth-1)/nth, 1, 1), MTLSizeMake(nth, 1, 1));
+        return v41_finish(cb, enc);
+    }
+}
+
 
 int myds_metal_v41_hc_weighted_sum_batch(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *residual, const myds_metal_buffer_t *weights,

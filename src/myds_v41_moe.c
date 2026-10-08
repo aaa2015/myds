@@ -263,7 +263,19 @@ static inline bool is_moe_concurrent_enabled(void) {
     return cached == 1;
 }
 
-int myds_v41_moe(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t pos) {
+static inline bool is_moe_fuse_expand_enabled(void) {
+    static int cached = -1;
+    if (__builtin_expect(cached < 0, 0)) {
+        const char *v = getenv("MYDS_MOE_FUSE_EXPAND");
+        cached = (v && strcmp(v, "0") == 0) ? 0 : 1;
+    }
+    return cached == 1;
+}
+
+int myds_v41_moe_fused(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t pos,
+                       myds_metal_buffer_t *residual,
+                       const myds_metal_buffer_t *after_attn,
+                       const myds_metal_buffer_t *ffn_split) {
     (void)token; // V4.1 text router is score-based, without token-hash selection.
     if (!ctx || !ctx->model || layer >= ctx->model->n_layers) return 0;
     myds_model_t *m = ctx->model;
@@ -276,6 +288,8 @@ int myds_v41_moe(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t p
         l->ffn_gate_exps_type != GGML_TYPE_IQ2_XXS ||
         l->ffn_up_exps_type != GGML_TYPE_IQ2_XXS ||
         l->ffn_down_exps_type != GGML_TYPE_Q2_K) return 0;
+
+    const bool can_fuse = (residual && after_attn && ffn_split && is_moe_fuse_expand_enabled());
 
     /* 状态与跟踪门禁：若 trace 开启或显式关闭并发，退回原有严格串行路径 */
     if (trace_on || !is_moe_concurrent_enabled()) {
@@ -324,7 +338,11 @@ int myds_v41_moe(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t p
         if (trace_on && !myds_trace_f32("routed_out", layer, pos, ctx->moe_out, dim)) return 0;
 
         /* 4. 融合 shared_out 与 routed_moe */
-        if (!myds_metal_v41_add_bf16(ctx->ffn_out, ctx->moe_out, ctx->shared_out, dim)) return 0;
+        if (can_fuse) {
+            if (!myds_metal_v41_moe_add_hc_expand(residual, ctx->ffn_out, ctx->moe_out, ctx->shared_out, after_attn, ffn_split, dim)) return 0;
+        } else {
+            if (!myds_metal_v41_add_bf16(ctx->ffn_out, ctx->moe_out, ctx->shared_out, dim)) return 0;
+        }
         return !trace_on || myds_trace_f32("ffnblock", layer, pos, ctx->ffn_out, dim);
     }
 
@@ -404,16 +422,32 @@ int myds_v41_moe(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t p
         return 0;
     }
 
-    /* 6. 等待 Routed MoE (moe_out) 与 Shared Expert (shared_out) 两路汇聚相加 */
+    /* 6. 等待 Routed MoE (moe_out) 与 Shared Expert (shared_out) 两路汇聚 */
     const myds_metal_buffer_t *final_deps[] = { ctx->moe_out, ctx->shared_out };
     myds_metal_barrier_buffers(final_deps, 2);
-    if (!myds_metal_v41_add_bf16(ctx->ffn_out, ctx->moe_out, ctx->shared_out, dim)) {
-        myds_metal_set_auto_barrier(prev_auto_barrier);
-        myds_metal_set_concurrent(prev_concurrent);
-        return 0;
+
+    if (can_fuse) {
+        /* S10 深度算子融合：直接将 moe_out + shared_out 与 HC expand 四通道广播累加融合为单次派发 */
+        if (!myds_metal_v41_moe_add_hc_expand(residual, ctx->ffn_out, ctx->moe_out, ctx->shared_out, after_attn, ffn_split, dim)) {
+            myds_metal_set_auto_barrier(prev_auto_barrier);
+            myds_metal_set_concurrent(prev_concurrent);
+            return 0;
+        }
+        myds_metal_barrier_buffer(residual);
+    } else {
+        if (!myds_metal_v41_add_bf16(ctx->ffn_out, ctx->moe_out, ctx->shared_out, dim)) {
+            myds_metal_set_auto_barrier(prev_auto_barrier);
+            myds_metal_set_concurrent(prev_concurrent);
+            return 0;
+        }
+        myds_metal_barrier_buffer(ctx->ffn_out);
     }
-    myds_metal_barrier_buffer(ctx->ffn_out);
     myds_metal_set_auto_barrier(prev_auto_barrier);
     myds_metal_set_concurrent(prev_concurrent);
     return 1;
 }
+
+int myds_v41_moe(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t pos) {
+    return myds_v41_moe_fused(ctx, layer, token, pos, NULL, NULL, NULL);
+}
+

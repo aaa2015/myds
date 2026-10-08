@@ -108,6 +108,10 @@ int myds_metal_v41_hc_sum_rmsnorm(
 int myds_metal_v41_hc_expand(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *block, const myds_metal_buffer_t *residual,
     const myds_metal_buffer_t *split, uint32_t dim);
+int myds_metal_v41_moe_add_hc_expand(myds_metal_buffer_t *out,
+    myds_metal_buffer_t *ffn_out, const myds_metal_buffer_t *moe_out,
+    const myds_metal_buffer_t *shared_out, const myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *split, uint32_t dim);
 /* projected is F32[5,dim]; q/k weights and residual are F32[4,dim]. */
 int myds_metal_v41_engram_add(myds_metal_buffer_t *residual,
     const myds_metal_buffer_t *projected, const myds_metal_buffer_t *q_weight,
