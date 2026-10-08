@@ -506,9 +506,13 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
                 if (conf_prob < min_conf) {
                     ds->draft_count = 0;
                     ds->draft_tree_count = 0;
+                    ds->is_high_confidence = false;
                     ds->propose_ms += (now_ms() - t0);
                     return 0;
                 }
+                ds->is_high_confidence = (conf_prob >= 0.72f || (best_score - best_score2) >= 1.50f);
+            } else {
+                ds->is_high_confidence = ((best_score - best_score2) >= 1.50f);
             }
         }
 

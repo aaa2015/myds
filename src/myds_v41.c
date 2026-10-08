@@ -4188,13 +4188,18 @@ int myds_v41_forward_batch_spec(myds_context_t *ctx, const int32_t *tokens,
                                 int32_t *out_tokens) {
     if (!ctx || !tokens || !out_tokens || n_tokens == 0) return -1;
 
+    bool high_conf = false;
+    if (ctx->dspark && ctx->dspark->is_high_confidence) {
+        high_conf = true;
+    }
+
     static int tree_spec_enabled = -1;
     if (tree_spec_enabled < 0) {
         const char *e = getenv("MYDS_TREE_SPEC");
         tree_spec_enabled = (e && atoi(e) != 0) ? 1 : 0;
     }
 
-    if (tree_spec_enabled && n_tokens >= 3) {
+    if (high_conf && tree_spec_enabled && n_tokens >= 3) {
         int ret = myds_v41_forward_tree_spec(ctx, tokens, pos, out_tokens);
         if (ret > 0) return ret;
         MYDS_LOG_W("forward_tree_spec returned %d, falling back to batch2", ret);
@@ -4206,7 +4211,7 @@ int myds_v41_forward_batch_spec(myds_context_t *ctx, const int32_t *tokens,
         batch2_enabled = (e && atoi(e) == 0) ? 0 : 1;
     }
 
-    if (batch2_enabled && n_tokens >= 2) {
+    if (high_conf && batch2_enabled && n_tokens >= 2) {
         int ret = myds_v41_forward_batch2(ctx, tokens, pos, out_tokens);
         if (ret > 0) return ret;
         MYDS_LOG_W("forward_batch2 returned %d, falling back to sequential speculative check", ret);
