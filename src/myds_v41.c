@@ -4020,6 +4020,13 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
     int32_t auth0 = myds_sample_next_token(logits0, m->vocab_size, &ctx->cfg, ctx, NULL, 0);
     out_tokens[0] = auth0;
 
+    static int tree_debug_count = 0;
+    if (tree_debug_count++ < 20) {
+        MYDS_LOG_I("TreeSpec [pos %u]: auth0=%d, BranchA=%d, BranchB=%d -> %s",
+                   pos, auth0, tokens[1], tokens[2],
+                   (auth0 == tokens[1]) ? "HIT_A" : ((auth0 == tokens[2]) ? "HIT_B" : "MISS"));
+    }
+
     if (auth0 == tokens[1]) {
         /* CASE 1: 命中分支 A (Top-1 候选)！采纳 2 个 Token */
         int32_t auth1 = myds_sample_next_token(logits1, m->vocab_size, &ctx->cfg, ctx, NULL, 0);
