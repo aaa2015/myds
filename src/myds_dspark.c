@@ -175,6 +175,11 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
     if (t_cproj) {
         ds->confidence_proj = create_metal_buf(t_cproj);
         ds->confidence_proj_type = t_cproj->type;
+        MYDS_LOG_I("confidence_proj: n_dims=%u, dims=[%llu, %llu], type=%d (%s)",
+                   t_cproj->n_dims,
+                   (unsigned long long)t_cproj->dims[0],
+                   (unsigned long long)(t_cproj->n_dims > 1 ? t_cproj->dims[1] : 0),
+                   (int)t_cproj->type, ggml_type_name(t_cproj->type));
     }
 
     // Allocate inference runtime scratch buffers
@@ -273,10 +278,10 @@ void myds_dspark_capture_layer(myds_dspark_t *ds, uint32_t layer_idx, const myds
     (void)myds_metal_v41_hc_weighted_sum(ds->target_slots[slot], residual, ds->hc_mean_weights, MYDS_DSPARK_DIM);
 }
 
-static inline float dot_q8_row256(const q8_0_block_t *row, const float *state) {
+static inline float dot_q8_row(const q8_0_block_t *row, const float *state, uint32_t n_blocks) {
     float total = 0.0f;
 #if defined(__ARM_NEON)
-    for (int b = 0; b < 8; b++) {
+    for (uint32_t b = 0; b < n_blocks; b++) {
         float d = myds_fp16_to_fp32(row[b].d);
         float32x4_t acc0 = vdupq_n_f32(0.0f);
         float32x4_t acc1 = vdupq_n_f32(0.0f);
@@ -294,7 +299,7 @@ static inline float dot_q8_row256(const q8_0_block_t *row, const float *state) {
         total += vaddvq_f32(vaddq_f32(acc0, acc1)) * d;
     }
 #else
-    for (int b = 0; b < 8; b++) {
+    for (uint32_t b = 0; b < n_blocks; b++) {
         float d = myds_fp16_to_fp32(row[b].d);
         const float *s = state + b * 32;
         float bsum = 0.0f;
@@ -303,6 +308,10 @@ static inline float dot_q8_row256(const q8_0_block_t *row, const float *state) {
     }
 #endif
     return total;
+}
+
+static inline float dot_q8_row256(const q8_0_block_t *row, const float *state) {
+    return dot_q8_row(row, state, 8);
 }
 
 #if defined(__APPLE__)
@@ -478,6 +487,28 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
                 ds->draft_tree_count = 0;
                 ds->propose_ms += (now_ms() - t0);
                 return 0;
+            }
+
+            static float min_conf = -1.0f;
+            if (__builtin_expect(min_conf < -0.5f, 0)) {
+                const char *env = getenv("MYDS_DSPARK_MIN_CONF");
+                min_conf = env ? (float)atof(env) : 0.0f;
+                if (min_conf > 0.0f) {
+                    MYDS_LOG_I("DSpark trained confidence head gating active: threshold=%.2f", min_conf);
+                }
+            }
+
+            if (min_conf > 0.0f && ds->confidence_proj && ds->confidence_proj_type == GGML_TYPE_Q8_0 && ds->stage_x_buf) {
+                const q8_0_block_t *w_conf = (const q8_0_block_t *)myds_metal_buffer_data(ds->confidence_proj);
+                const float *stage_x = (const float *)myds_metal_buffer_data(ds->stage_x_buf);
+                float conf_score = dot_q8_row(w_conf, stage_x, 160) + dot_q8_row(w_conf + 160, ds->markov_state_host, 8);
+                float conf_prob = 1.0f / (1.0f + expf(-conf_score));
+                if (conf_prob < min_conf) {
+                    ds->draft_count = 0;
+                    ds->draft_tree_count = 0;
+                    ds->propose_ms += (now_ms() - t0);
+                    return 0;
+                }
             }
         }
 
