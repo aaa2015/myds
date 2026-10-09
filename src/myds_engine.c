@@ -1326,6 +1326,7 @@ void myds_context_clear_image_embeddings(myds_context_t *ctx) {
 
 void myds_context_free(myds_context_t *ctx) {
     if (!ctx) return;
+    free(ctx->decode_cycles);
     free(ctx->pcache_tokens); ctx->pcache_tokens=NULL; ctx->pcache_len=ctx->pcache_cap=0;
     if (ctx->dspark) {
         myds_dspark_free(ctx->dspark);
@@ -2200,6 +2201,10 @@ static int32_t myds_forward_token_internal(myds_context_t *ctx, int32_t token_id
 }
 
 int32_t myds_forward_token(myds_context_t *ctx, int32_t token_id, uint32_t pos) {
+    if (ctx && !ctx->v41 && ctx->decode_metrics_active) {
+        ctx->decode_stats.target_forward_calls++;
+        ctx->decode_stats.target_rows++;
+    }
     return myds_forward_token_internal(ctx, token_id, pos, true);
 }
 
@@ -2916,6 +2921,86 @@ static int myds_prefill_tokens(myds_context_t *ctx, const int32_t *tokens, int32
     return 1;
 }
 
+static double decode_now_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0.0;
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+static bool decode_env_enabled(const char *name) {
+    const char *value = getenv(name);
+    return value && atoi(value) != 0;
+}
+
+static void decode_cycle_finish(myds_context_t *ctx) {
+    if (!ctx->decode_cycle_open) return;
+    const uint64_t outputs = ctx->decode_stats.output_tokens - ctx->decode_cycle_output_start;
+    const double elapsed = ctx->decode_stats.timing_enabled
+        ? decode_now_ms() - ctx->decode_cycle_start_ms : 0.0;
+    ctx->decode_stats.cycle_count++;
+    if (ctx->decode_stats.timing_enabled && ctx->decode_cycles &&
+        ctx->decode_stats.recorded_cycles < ctx->decode_cycle_capacity) {
+        myds_decode_cycle_t *cycle = &ctx->decode_cycles[ctx->decode_stats.recorded_cycles++];
+        cycle->elapsed_ms = elapsed;
+        cycle->output_tokens = (uint32_t)outputs;
+    }
+    if (ctx->decode_cost_scheduler && elapsed > 0.0 && outputs > 0) {
+        if (!ctx->decode_cycle_speculative) {
+            const double per_token = elapsed / (double)outputs;
+            ctx->decode_target_ms = ctx->decode_target_ms > 0.0
+                ? 0.8 * ctx->decode_target_ms + 0.2 * per_token : per_token;
+        } else if (ctx->decode_target_ms > 0.0) {
+            if (elapsed >= ctx->decode_target_ms * (double)outputs) {
+                if (++ctx->decode_costly_cycles >= 3) {
+                    ctx->decode_cost_backoff = 16;
+                    ctx->decode_costly_cycles = 0;
+                }
+            } else {
+                ctx->decode_costly_cycles = 0;
+            }
+        }
+    }
+    ctx->decode_cycle_open = false;
+}
+
+static void decode_cycle_begin(myds_context_t *ctx) {
+    decode_cycle_finish(ctx);
+    ctx->decode_cycle_open = true;
+    ctx->decode_cycle_start_ms = ctx->decode_stats.timing_enabled ? decode_now_ms() : 0.0;
+    ctx->decode_cycle_output_start = ctx->decode_stats.output_tokens;
+    ctx->decode_cycle_speculative = false;
+    ctx->decode_pld_candidate = false;
+}
+
+static bool decode_cost_skip(myds_context_t *ctx) {
+    if (!ctx->decode_cost_scheduler) return false;
+    /* Establish one uncontaminated target cycle before comparing costs. */
+    if (ctx->decode_target_ms <= 0.0) return true;
+    if (!ctx->decode_cost_backoff) return false;
+    ctx->decode_cost_backoff--;
+    ctx->decode_stats.backoff_steps++;
+    return true;
+}
+
+static void decode_emit(myds_context_t *ctx, myds_stream_callback_t cb,
+                        myds_stream_bytes_callback_t bytes_cb, const char *piece,
+                        size_t length, int32_t token, void *user_data) {
+    ctx->decode_stats.output_tokens++;
+    if (bytes_cb) bytes_cb(piece, length, token, user_data);
+    else if (cb) cb(piece, token, user_data);
+}
+
+static uint32_t decode_pld_propose(myds_context_t *ctx, const int32_t *history,
+                                  uint32_t length, const myds_pld_config_t *cfg,
+                                  int32_t *draft) {
+    const double start = ctx->decode_stats.timing_enabled ? decode_now_ms() : 0.0;
+    ctx->decode_stats.pld_queries++;
+    ctx->decode_cycle_speculative = true;
+    const uint32_t count = myds_pld_propose(history, length, cfg, draft);
+    if (ctx->decode_stats.timing_enabled) ctx->decode_stats.pld_ms += decode_now_ms() - start;
+    return count;
+}
+
 static int myds_generate_internal(myds_context_t *ctx,
                      const char     *prompt,
                      myds_stream_callback_t cb,
@@ -2924,11 +3009,38 @@ static int myds_generate_internal(myds_context_t *ctx,
                      myds_stop_reason_t *out_reason,
                      uint32_t       *out_prompt_tokens,
                      volatile int   *cancel_flag) {
-    if (!ctx || !prompt) {
+    if (!ctx) {
         if (out_reason) *out_reason = MYDS_STOP_ERROR;
         return 0;
     }
     myds_model_t *m = ctx->model;
+    memset(&ctx->decode_stats, 0, sizeof(ctx->decode_stats));
+    ctx->decode_metrics_active = false;
+    ctx->decode_cycle_open = false;
+    ctx->decode_target_ms = 0.0;
+    ctx->decode_costly_cycles = ctx->decode_cost_backoff = 0;
+    ctx->decode_cost_scheduler = decode_env_enabled("MYDS_SPEC_COST_SCHEDULER");
+    const bool record_decode_cycles = decode_env_enabled("MYDS_DECODE_METRICS");
+    ctx->decode_stats.timing_enabled = record_decode_cycles || ctx->decode_cost_scheduler;
+    const uint32_t cycle_capacity = ctx->cfg.max_new_tokens < ctx->cfg.max_seq_len
+        ? ctx->cfg.max_new_tokens : ctx->cfg.max_seq_len;
+    if (record_decode_cycles && cycle_capacity > ctx->decode_cycle_capacity) {
+        myds_decode_cycle_t *cycles = realloc(ctx->decode_cycles,
+            (size_t)cycle_capacity * sizeof(*cycles));
+        if (cycles) {
+            ctx->decode_cycles = cycles;
+            ctx->decode_cycle_capacity = cycle_capacity;
+        }
+    }
+    if (!record_decode_cycles) {
+        free(ctx->decode_cycles);
+        ctx->decode_cycles = NULL;
+        ctx->decode_cycle_capacity = 0;
+    }
+    if (!prompt) {
+        if (out_reason) *out_reason = MYDS_STOP_ERROR;
+        return 0;
+    }
 
     /* 1. Tokenize prompt with dynamic allocation based on max_seq_len (P1-2) */
     size_t prompt_alloc_tokens = ctx->cfg.max_seq_len > 4096 ? ctx->cfg.max_seq_len : 4096;
@@ -3317,7 +3429,13 @@ static int myds_generate_internal(myds_context_t *ctx,
     if (ctx->v41) (void)myds_v41_low_kv_save(ctx->v41, prompt_tokens, (uint32_t)n_prompt);
     uint32_t max_gen = ctx->cfg.max_new_tokens;
     const char *pld_env_str = getenv("MYDS_PLD");
-    const bool pld_enabled = (pld_env_str == NULL || atoi(pld_env_str) != 0);
+    const bool serial_probe = decode_env_enabled("MYDS_SPEC_SERIAL_PROBE");
+    const bool spec_requested = !ctx->v41 || myds_v41_batch2_spec_requested(ctx);
+    const bool use_spec = spec_requested || serial_probe;
+    /* A sequential verifier cannot amortize target weight reads. Preserve it
+     * only as an explicit measurement/reference arm, avoiding draft and
+     * snapshot work in ordinary V4.1 decode. */
+    const bool pld_enabled = use_spec && (pld_env_str == NULL || atoi(pld_env_str) != 0);
 
     int32_t *pld_history = NULL;
     uint32_t pld_len = 0;
@@ -3338,7 +3456,8 @@ static int myds_generate_internal(myds_context_t *ctx,
     myds_stop_reason_t stop_reason = MYDS_STOP_LENGTH;
     int success = 1;
 
-    if (ctx->dspark) {
+    ctx->decode_metrics_active = true;
+    if (ctx->dspark && use_spec) {
         uint32_t step = 0;
         while (step < max_gen) {
             if (cancel_flag && *cancel_flag) {
@@ -3350,6 +3469,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                 break;
             }
 
+            decode_cycle_begin(ctx);
             if (step == 0) {
                 if (ctx->pcache_tokens && ctx->pos < ctx->pcache_cap) {
                     ctx->pcache_tokens[ctx->pos] = cur_token;
@@ -3379,11 +3499,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                     success = 0;
                     break;
                 }
-                if (bytes_cb) {
-                    bytes_cb(piece, piece_len, next_token, user_data);
-                } else if (cb) {
-                    cb(piece, next_token, user_data);
-                }
+                decode_emit(ctx, cb, bytes_cb, piece, piece_len, next_token, user_data);
                 cur_token = next_token;
                 continue;
             }
@@ -3392,9 +3508,22 @@ static int myds_generate_internal(myds_context_t *ctx,
             if (draft_cap > max_gen - step) draft_cap = max_gen - step;
 
             int32_t cand_a = -1, cand_b = -1;
+            bool cand_b_pld = false;
+            uint32_t neural_count = 0;
 
-            if (ctx->dspark) {
+            const bool cost_skip = decode_cost_skip(ctx) || (!serial_probe && max_gen - step < 2);
+            if (ctx->dspark && !cost_skip) {
+                const uint64_t before_cycles = ctx->dspark->cycles;
+                const bool backed_off = ctx->dspark->backoff_counter > 0;
+                const double draft_start = ctx->decode_stats.timing_enabled ? decode_now_ms() : 0.0;
                 uint32_t n_dspark = myds_dspark_propose(ctx->dspark, ctx, cur_token, draft_cap);
+                neural_count = n_dspark;
+                ctx->decode_stats.draft_cycles += ctx->dspark->cycles - before_cycles;
+                ctx->decode_stats.draft_proposed += n_dspark;
+                if (backed_off) ctx->decode_stats.backoff_steps++;
+                else ctx->decode_cycle_speculative = true;
+                if (ctx->decode_stats.timing_enabled)
+                    ctx->decode_stats.draft_ms += decode_now_ms() - draft_start;
                 if (n_dspark > 0) {
                     cand_a = ctx->dspark->draft_tree_tokens[0];
                     if (ctx->dspark->draft_tree_count >= 2) {
@@ -3403,25 +3532,30 @@ static int myds_generate_internal(myds_context_t *ctx,
                 }
             }
 
-            if (pld_history && pld_len >= 2) {
+            if (!cost_skip && pld_history && pld_len >= 2) {
                 if (cand_a < 0) {
                     int32_t pld_draft[MYDS_PLD_DEFAULT_MAX_DRAFT];
                     myds_pld_config_t pld_cfg = myds_pld_default_config(m->tokenizer->eos_id);
-                    uint32_t n_pld = myds_pld_propose(pld_history, pld_len, &pld_cfg, pld_draft);
+                    uint32_t n_pld = decode_pld_propose(ctx, pld_history, pld_len, &pld_cfg, pld_draft);
                     if (n_pld > 0) {
                         cand_a = pld_draft[0];
+                        ctx->decode_pld_candidate = true;
                     }
                 } else if (cand_b < 0) {
                     int32_t pld_draft[MYDS_PLD_DEFAULT_MAX_DRAFT];
                     myds_pld_config_t pld_cfg = myds_pld_default_config(m->tokenizer->eos_id);
-                    uint32_t n_pld = myds_pld_propose(pld_history, pld_len, &pld_cfg, pld_draft);
+                    uint32_t n_pld = decode_pld_propose(ctx, pld_history, pld_len, &pld_cfg, pld_draft);
                     if (n_pld > 0 && pld_draft[0] != cand_a) {
                         cand_b = pld_draft[0];
+                        cand_b_pld = true;
                     }
                 }
             }
 
-            uint32_t n_draft = (cand_a >= 0) ? ((cand_b >= 0 && cand_b != cand_a) ? 2 : 1) : 0;
+            /* Tree A/B are alternatives at the same position. The sequential
+             * tail uses only real continuation drafts, or the single PLD A. */
+            uint32_t n_draft = cand_a < 0 ? 0 :
+                (ctx->v41 || ctx->decode_pld_candidate ? 1 : neural_count);
 
             if (cand_a < 0) {
                 if (ctx->pcache_tokens && ctx->pos < ctx->pcache_cap) {
@@ -3449,8 +3583,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                     success = 0;
                     break;
                 }
-                if (bytes_cb) bytes_cb(piece, piece_len, next_token, user_data);
-                else if (cb) cb(piece, next_token, user_data);
+                decode_emit(ctx, cb, bytes_cb, piece, piece_len, next_token, user_data);
                 cur_token = next_token;
                 continue;
             }
@@ -3460,14 +3593,12 @@ static int myds_generate_internal(myds_context_t *ctx,
 
             myds_v41_spec_snapshot_t *snap = ctx->dspark ? ctx->dspark->spec_snap : NULL;
             bool snap_saved = false;
-            if (snap) {
-                memset(snap, 0, sizeof(*snap));
-                snap_saved = myds_v41_spec_snapshot_save(ctx, snap, 2);
-            }
+            if (snap) snap->valid = false;
 
             uint32_t accepted_in_cycle = 0;
 
-            if (ctx->v41 && snap && (ctx->pos + 2 <= ctx->cfg.max_seq_len)) {
+            if (ctx->v41 && snap && max_gen - step >= 2 &&
+                ctx->pos < ctx->cfg.max_seq_len && ctx->cfg.max_seq_len - ctx->pos >= 2) {
                 if (cancel_flag && *cancel_flag) {
                     stop_reason = MYDS_STOP_CANCELLED;
                     break;
@@ -3491,7 +3622,11 @@ static int myds_generate_internal(myds_context_t *ctx,
                 int32_t out_tokens[3] = { 0, 0, 0 };
 
                 uint32_t spec_pos = ctx->pos;
-                int ret = myds_v41_forward_batch_spec(ctx, tokens_to_forward, n_fwd, spec_pos, out_tokens);
+                const double verify_start = ctx->decode_stats.timing_enabled ? decode_now_ms() : 0.0;
+                int ret = myds_v41_forward_batch_spec_ex(ctx, tokens_to_forward, n_fwd, spec_pos, out_tokens, snap);
+                if (ctx->decode_stats.timing_enabled)
+                    ctx->decode_stats.verify_ms += decode_now_ms() - verify_start;
+                snap_saved = snap->valid;
                 if (ret < 0 || out_tokens[0] < 0 || (uint32_t)out_tokens[0] >= m->tokenizer->vocab_size) {
                     if (snap_saved) myds_v41_spec_snapshot_restore(ctx, snap);
                     ctx->pcache_len = 0;
@@ -3500,10 +3635,27 @@ static int myds_generate_internal(myds_context_t *ctx,
                     break;
                 }
 
+                if (out_tokens[0] == m->tokenizer->eos_id) {
+                    ctx->pos = spec_pos + 1u;
+                    stop_reason = MYDS_STOP_EOS;
+                    break;
+                }
+                const bool checked_pld = ctx->decode_pld_candidate ||
+                    (cand_b_pld && out_tokens[0] != cand_a);
+                const bool accepted_from_pld = ctx->decode_pld_candidate ||
+                    (cand_b_pld && out_tokens[0] == cand_b);
+                if (checked_pld) {
+                    ctx->decode_stats.pld_cycles++;
+                    ctx->decode_stats.pld_proposed++;
+                }
                 bool matched = (ret == 2);
                 if (matched) {
-                    if (ctx->dspark) ctx->dspark->accepted_tokens++;
-                    accepted_in_cycle++;
+                    if (accepted_from_pld) ctx->decode_stats.pld_accepted++;
+                    else {
+                        if (ctx->dspark) ctx->dspark->accepted_tokens++;
+                        ctx->decode_stats.draft_accepted++;
+                    }
+                    if (!accepted_from_pld) accepted_in_cycle++;
 
                     // 1. 采纳第 1 个 Token
                     size_t piece_len0 = 0;
@@ -3514,8 +3666,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                         success = 0;
                         break;
                     }
-                    if (bytes_cb) bytes_cb(piece0, piece_len0, out_tokens[0], user_data);
-                    else if (cb) cb(piece0, out_tokens[0], user_data);
+                    decode_emit(ctx, cb, bytes_cb, piece0, piece_len0, out_tokens[0], user_data);
 
                     step++;
                     if (pld_history && pld_len < pld_cap) pld_history[pld_len++] = out_tokens[0];
@@ -3529,6 +3680,18 @@ static int myds_generate_internal(myds_context_t *ctx,
 
                     if (step >= max_gen) {
                         if (snap_saved) myds_v41_spec_snapshot_restore_partial(ctx, snap, 1);
+                        ctx->pos = spec_pos + 1u;
+                        break;
+                    }
+
+                    if (cancel_flag && *cancel_flag) {
+                        if (snap_saved && !myds_v41_spec_snapshot_restore_partial(ctx, snap, 1)) {
+                            ctx->pcache_len = 0;
+                            stop_reason = MYDS_STOP_ERROR;
+                            success = 0;
+                        } else {
+                            stop_reason = MYDS_STOP_CANCELLED;
+                        }
                         ctx->pos = spec_pos + 1u;
                         break;
                     }
@@ -3547,6 +3710,13 @@ static int myds_generate_internal(myds_context_t *ctx,
                         if (spec_pos + 2u > ctx->pcache_len) ctx->pcache_len = spec_pos + 2u;
                     }
 
+                    if (out_tokens[1] == m->tokenizer->eos_id) {
+                        ctx->pos = spec_pos + 2u;
+                        step++;
+                        stop_reason = MYDS_STOP_EOS;
+                        break;
+                    }
+
                     size_t piece_len1 = 0;
                     const char *piece1 = myds_tokenizer_decode_bytes(m->tokenizer, out_tokens[1], &piece_len1);
                     if (!piece1) {
@@ -3556,8 +3726,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                         success = 0;
                         break;
                     }
-                    if (bytes_cb) bytes_cb(piece1, piece_len1, out_tokens[1], user_data);
-                    else if (cb) cb(piece1, out_tokens[1], user_data);
+                    decode_emit(ctx, cb, bytes_cb, piece1, piece_len1, out_tokens[1], user_data);
 
                     ctx->pos = spec_pos + 2u;
                     step++;
@@ -3577,8 +3746,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                         success = 0;
                         break;
                     }
-                    if (bytes_cb) bytes_cb(piece, piece_len, out_tokens[0], user_data);
-                    else if (cb) cb(piece, out_tokens[0], user_data);
+                    decode_emit(ctx, cb, bytes_cb, piece, piece_len, out_tokens[0], user_data);
 
                     ctx->pos = spec_pos + 1u;
                     step++;
@@ -3596,12 +3764,12 @@ static int myds_generate_internal(myds_context_t *ctx,
                     ctx->dspark->verify_ms += (double)(tv_ver1.tv_sec - tv_ver0.tv_sec) * 1000.0 +
                                               (double)(tv_ver1.tv_usec - tv_ver0.tv_usec) / 1000.0;
 
-                    if (accepted_in_cycle == 0) {
+                    if (!ctx->decode_pld_candidate && accepted_in_cycle == 0) {
                         ctx->dspark->consecutive_misses++;
                         if (ctx->dspark->consecutive_misses >= 3) {
                             ctx->dspark->backoff_counter = 16;
                         }
-                    } else {
+                    } else if (!ctx->decode_pld_candidate) {
                         ctx->dspark->consecutive_misses = 0;
                         ctx->dspark->backoff_counter = 0;
                     }
@@ -3613,6 +3781,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                 continue;
             }
 
+            if (ctx->decode_pld_candidate) ctx->decode_stats.pld_cycles++;
             for (uint32_t d = 0; d < n_draft; d++) {
                 if (cancel_flag && *cancel_flag) {
                     stop_reason = MYDS_STOP_CANCELLED;
@@ -3644,10 +3813,17 @@ static int myds_generate_internal(myds_context_t *ctx,
                 ctx->pos++;
                 step++;
 
-                bool matched = (true_next == ctx->dspark->draft_tokens[d]);
+                if (pld_history && pld_len < pld_cap) pld_history[pld_len++] = true_next;
+                const int32_t candidate = d == 0 ? cand_a : ctx->dspark->draft_tokens[d];
+                const bool matched = true_next == candidate;
+                if (ctx->decode_pld_candidate) ctx->decode_stats.pld_proposed++;
                 if (matched) {
-                    ctx->dspark->accepted_tokens++;
-                    accepted_in_cycle++;
+                    if (ctx->decode_pld_candidate) ctx->decode_stats.pld_accepted++;
+                    else {
+                        ctx->dspark->accepted_tokens++;
+                        ctx->decode_stats.draft_accepted++;
+                        accepted_in_cycle++;
+                    }
                 }
 
                 if (true_next == m->tokenizer->eos_id) {
@@ -3665,8 +3841,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                     success = 0;
                     break;
                 }
-                if (bytes_cb) bytes_cb(piece, piece_len, true_next, user_data);
-                else if (cb) cb(piece, true_next, user_data);
+                decode_emit(ctx, cb, bytes_cb, piece, piece_len, true_next, user_data);
 
                 cur_token = true_next;
 
@@ -3680,14 +3855,14 @@ static int myds_generate_internal(myds_context_t *ctx,
             ctx->dspark->verify_ms += (double)(tv_ver1.tv_sec - tv_ver0.tv_sec) * 1000.0 +
                                       (double)(tv_ver1.tv_usec - tv_ver0.tv_usec) / 1000.0;
 
-            if (accepted_in_cycle == 0) {
+            if (!ctx->decode_pld_candidate && accepted_in_cycle == 0) {
                 ctx->dspark->consecutive_misses++;
                 if (ctx->dspark->consecutive_misses >= 4) {
                     ctx->dspark->backoff_counter = 8;
                 } else if (ctx->dspark->consecutive_misses >= 2) {
                     ctx->dspark->backoff_counter = 4;
                 }
-            } else {
+            } else if (!ctx->decode_pld_candidate) {
                 ctx->dspark->consecutive_misses = 0;
                 ctx->dspark->backoff_counter = 0;
             }
@@ -3713,13 +3888,15 @@ static int myds_generate_internal(myds_context_t *ctx,
                 break;
             }
 
+            decode_cycle_begin(ctx);
             int32_t draft_tokens[MYDS_PLD_DEFAULT_MAX_DRAFT];
             myds_pld_config_t pld_cfg = myds_pld_default_config(m->tokenizer->eos_id);
             if (pld_cfg.max_draft > max_gen - step) pld_cfg.max_draft = max_gen - step;
             uint32_t n_draft = 0;
-            if (pld_len >= 2) {
-                n_draft = myds_pld_propose(pld_history, pld_len, &pld_cfg, draft_tokens);
+            if (!decode_cost_skip(ctx) && (serial_probe || max_gen - step >= 2) && pld_len >= 2) {
+                n_draft = decode_pld_propose(ctx, pld_history, pld_len, &pld_cfg, draft_tokens);
             }
+            ctx->decode_pld_candidate = n_draft > 0;
 
             if (n_draft == 0) {
                 if (ctx->pcache_tokens && ctx->pos < ctx->pcache_cap) {
@@ -3750,23 +3927,21 @@ static int myds_generate_internal(myds_context_t *ctx,
                     success = 0;
                     break;
                 }
-                if (bytes_cb) bytes_cb(piece, piece_len, next_token, user_data);
-                else if (cb) cb(piece, next_token, user_data);
+                decode_emit(ctx, cb, bytes_cb, piece, piece_len, next_token, user_data);
 
                 cur_token = next_token;
                 continue;
             }
 
             pld_cycles++;
-            pld_proposed += n_draft;
+            ctx->decode_stats.pld_cycles++;
 
-            if (ctx->v41 && pld_snap && n_draft >= 1 && (ctx->pos + 2 <= ctx->cfg.max_seq_len)) {
-                // 微批多 Token 投机验证（Micro-Batch Speculative Verification, K=2）
-                pld_cycles++;
-                pld_proposed += 1;
-
-                memset(pld_snap, 0, sizeof(*pld_snap));
-                bool snap_saved = myds_v41_spec_snapshot_save(ctx, pld_snap, 2);
+            if (ctx->v41 && pld_snap && n_draft >= 1 && max_gen - step >= 2 &&
+                ctx->pos < ctx->cfg.max_seq_len && ctx->cfg.max_seq_len - ctx->pos >= 2) {
+                pld_proposed++;
+                ctx->decode_stats.pld_proposed++;
+                pld_snap->valid = false;
+                bool snap_saved = false;
 
                 if (cancel_flag && *cancel_flag) {
                     stop_reason = MYDS_STOP_CANCELLED;
@@ -3783,7 +3958,11 @@ static int myds_generate_internal(myds_context_t *ctx,
                 int32_t out_tokens[2] = { 0, 0 };
 
                 uint32_t pld_pos = ctx->pos;
-                int ret = myds_v41_forward_batch_spec(ctx, tokens_to_forward, 2, pld_pos, out_tokens);
+                const double verify_start = ctx->decode_stats.timing_enabled ? decode_now_ms() : 0.0;
+                int ret = myds_v41_forward_batch_spec_ex(ctx, tokens_to_forward, 2, pld_pos, out_tokens, pld_snap);
+                if (ctx->decode_stats.timing_enabled)
+                    ctx->decode_stats.verify_ms += decode_now_ms() - verify_start;
+                snap_saved = pld_snap->valid;
                 if (ret < 0 || out_tokens[0] < 0 || (uint32_t)out_tokens[0] >= m->tokenizer->vocab_size) {
                     if (snap_saved) myds_v41_spec_snapshot_restore(ctx, pld_snap);
                     ctx->pcache_len = 0;
@@ -3792,10 +3971,16 @@ static int myds_generate_internal(myds_context_t *ctx,
                     break;
                 }
 
-                bool matched = (out_tokens[0] == draft_tokens[0]);
+                if (out_tokens[0] == m->tokenizer->eos_id) {
+                    ctx->pos = pld_pos + 1u;
+                    stop_reason = MYDS_STOP_EOS;
+                    break;
+                }
+                bool matched = (ret == 2);
                 if (matched) {
                     // 第 1 个草稿 Token 命中！
                     pld_accepted++;
+                    ctx->decode_stats.pld_accepted++;
 
                     // 1. 采纳第 1 个 Token (draft_tokens[0] / out_tokens[0])
                     if (pld_len < pld_cap) pld_history[pld_len++] = out_tokens[0];
@@ -3808,8 +3993,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                         success = 0;
                         break;
                     }
-                    if (bytes_cb) bytes_cb(piece0, piece_len0, out_tokens[0], user_data);
-                    else if (cb) cb(piece0, out_tokens[0], user_data);
+                    decode_emit(ctx, cb, bytes_cb, piece0, piece_len0, out_tokens[0], user_data);
 
                     step++;
 
@@ -3822,6 +4006,18 @@ static int myds_generate_internal(myds_context_t *ctx,
 
                     if (step >= max_gen) {
                         if (snap_saved) myds_v41_spec_snapshot_restore_partial(ctx, pld_snap, 1);
+                        ctx->pos = pld_pos + 1u;
+                        break;
+                    }
+
+                    if (cancel_flag && *cancel_flag) {
+                        if (snap_saved && !myds_v41_spec_snapshot_restore_partial(ctx, pld_snap, 1)) {
+                            ctx->pcache_len = 0;
+                            stop_reason = MYDS_STOP_ERROR;
+                            success = 0;
+                        } else {
+                            stop_reason = MYDS_STOP_CANCELLED;
+                        }
                         ctx->pos = pld_pos + 1u;
                         break;
                     }
@@ -3841,6 +4037,13 @@ static int myds_generate_internal(myds_context_t *ctx,
                     }
                     if (pld_len < pld_cap) pld_history[pld_len++] = out_tokens[1];
 
+                    if (out_tokens[1] == m->tokenizer->eos_id) {
+                        ctx->pos = pld_pos + 2u;
+                        step++;
+                        stop_reason = MYDS_STOP_EOS;
+                        break;
+                    }
+
                     size_t piece_len1 = 0;
                     const char *piece1 = myds_tokenizer_decode_bytes(m->tokenizer, out_tokens[1], &piece_len1);
                     if (!piece1) {
@@ -3850,8 +4053,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                         success = 0;
                         break;
                     }
-                    if (bytes_cb) bytes_cb(piece1, piece_len1, out_tokens[1], user_data);
-                    else if (cb) cb(piece1, out_tokens[1], user_data);
+                    decode_emit(ctx, cb, bytes_cb, piece1, piece_len1, out_tokens[1], user_data);
 
                     ctx->pos = pld_pos + 2u;
                     step++;
@@ -3864,9 +4066,8 @@ static int myds_generate_internal(myds_context_t *ctx,
                 } else {
                     // 第 1 个草稿 Token 未命中！
                     // 回滚第 2 个槽位对 KV Cache 的污染修改，保留当前槽位的权威真值
-                    if (snap_saved) {
-                        myds_v41_spec_snapshot_restore_partial(ctx, pld_snap, 1);
-                    }
+                    /* The verifier already retains the authoritative first
+                     * state on a miss; a second restore would clobber it. */
                     ctx->pos = pld_pos + 1u;
 
                     if (pld_len < pld_cap) pld_history[pld_len++] = out_tokens[0];
@@ -3878,8 +4079,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                         success = 0;
                         break;
                     }
-                    if (bytes_cb) bytes_cb(piece, piece_len, out_tokens[0], user_data);
-                    else if (cb) cb(piece, out_tokens[0], user_data);
+                    decode_emit(ctx, cb, bytes_cb, piece, piece_len, out_tokens[0], user_data);
 
                     step++;
                     cur_token = out_tokens[0];
@@ -3896,16 +4096,9 @@ static int myds_generate_internal(myds_context_t *ctx,
                 continue;
             }
 
-            bool snap_saved = false;
-            if (pld_snap && ctx->v41) {
-                memset(pld_snap, 0, sizeof(*pld_snap));
-                snap_saved = myds_v41_spec_snapshot_save(ctx, pld_snap, n_draft + 1);
-            }
-
             for (uint32_t d = 0; d < n_draft; d++) {
                 if (cancel_flag && *cancel_flag) {
                     stop_reason = MYDS_STOP_CANCELLED;
-                    if (snap_saved && d == 0) myds_v41_spec_snapshot_restore(ctx, pld_snap);
                     break;
                 }
                 if (ctx->pos >= ctx->cfg.max_seq_len) {
@@ -3919,7 +4112,6 @@ static int myds_generate_internal(myds_context_t *ctx,
 
                 int32_t true_next = myds_forward_token(ctx, cur_token, ctx->pos);
                 if (true_next < 0 || (uint32_t)true_next >= m->tokenizer->vocab_size) {
-                    if (snap_saved) myds_v41_spec_snapshot_restore(ctx, pld_snap);
                     ctx->pcache_len = 0;
                     stop_reason = MYDS_STOP_ERROR;
                     success = 0;
@@ -3929,9 +4121,12 @@ static int myds_generate_internal(myds_context_t *ctx,
                 step++;
                 if (pld_len < pld_cap) pld_history[pld_len++] = true_next;
 
+                pld_proposed++;
+                ctx->decode_stats.pld_proposed++;
                 bool matched = (true_next == draft_tokens[d]);
                 if (matched) {
                     pld_accepted++;
+                    ctx->decode_stats.pld_accepted++;
                 }
 
                 if (true_next == m->tokenizer->eos_id) {
@@ -3942,13 +4137,11 @@ static int myds_generate_internal(myds_context_t *ctx,
                 size_t piece_len = 0;
                 const char *piece = myds_tokenizer_decode_bytes(m->tokenizer, true_next, &piece_len);
                 if (!piece) {
-                    if (snap_saved) myds_v41_spec_snapshot_restore(ctx, pld_snap);
                     stop_reason = MYDS_STOP_ERROR;
                     success = 0;
                     break;
                 }
-                if (bytes_cb) bytes_cb(piece, piece_len, true_next, user_data);
-                else if (cb) cb(piece, true_next, user_data);
+                decode_emit(ctx, cb, bytes_cb, piece, piece_len, true_next, user_data);
 
                 cur_token = true_next;
                 if (!matched) {
@@ -3976,6 +4169,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                 stop_reason = MYDS_STOP_CANCELLED;
                 break;
             }
+            decode_cycle_begin(ctx);
             /* 记录「正在被喂入的这个 token」（位置 = ctx->pos）⇒ 缓存序列与状态一一对应，
              * 而产出的 EOS 从未被喂入，所以不会被记进去。 */
             if (ctx->pcache_tokens && ctx->pos < ctx->pcache_cap) {
@@ -4007,11 +4201,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                 success = 0;
                 break;
             }
-            if (bytes_cb) {
-                bytes_cb(piece, piece_len, next_token, user_data);
-            } else if (cb) {
-                cb(piece, next_token, user_data);
-            }
+            decode_emit(ctx, cb, bytes_cb, piece, piece_len, next_token, user_data);
 
             cur_token = next_token;
             if (ctx->pos >= ctx->cfg.max_seq_len) {
@@ -4021,6 +4211,13 @@ static int myds_generate_internal(myds_context_t *ctx,
         }
     }
 
+    decode_cycle_finish(ctx);
+    ctx->decode_metrics_active = false;
+    if (stop_reason == MYDS_STOP_ERROR || !success) ctx->pcache_len = 0;
+    /* Prefill reserves the whole prompt but leaves its last token for decode.
+     * Cancellation before that step, or a zero-output request, must retain
+     * only tokens that actually reached the model state. */
+    else if (ctx->pcache_len > ctx->pos) ctx->pcache_len = ctx->pos;
     if (pld_history) free(pld_history);
     if (out_reason) *out_reason = stop_reason;
     return success;
@@ -4035,6 +4232,20 @@ void myds_last_prefill_stats(const myds_context_t *ctx, myds_prefill_stats_t *ou
     out->cached_tokens    = ctx->last_cached_tokens;
     out->prefill_tokens   = ctx->last_prefill_tokens;
     out->prefill_seconds  = ctx->last_prefill_seconds;
+}
+
+void myds_last_decode_stats(const myds_context_t *ctx, myds_decode_stats_t *out) {
+    if (!out) return;
+    if (ctx) *out = ctx->decode_stats;
+    else memset(out, 0, sizeof(*out));
+}
+
+bool myds_last_decode_cycle(const myds_context_t *ctx, uint32_t index, myds_decode_cycle_t *out) {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    if (!ctx || !ctx->decode_cycles || index >= ctx->decode_stats.recorded_cycles) return false;
+    *out = ctx->decode_cycles[index];
+    return true;
 }
 
 /* 供服务端在收到 previous_response_id 时调用：下一次 generate 把 pcache 序列当作前缀。 */

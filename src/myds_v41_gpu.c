@@ -289,9 +289,10 @@ int myds_v41_gpu_quant(myds_metal_buffer_t *x,uint32_t width,uint32_t rows,uint3
     const uint32_t a[]={width,rows,mode};const myds_metal_buffer_t *b[]={x};
     return dispatch("kernel_dsv41_quantize",a,sizeof(a),b,1,(width+block-1)/block,rows,1,32,1,1,0);
 }
-static int qkv_ranges_overlap(myds_metal_buffer_t *a,size_t a_bytes,
-                              myds_metal_buffer_t *b,size_t b_bytes) {
-    uintptr_t x=(uintptr_t)myds_metal_buffer_data(a),y=(uintptr_t)myds_metal_buffer_data(b);
+static int buffer_ranges_overlap(const myds_metal_buffer_t *a,size_t a_bytes,
+                                 const myds_metal_buffer_t *b,size_t b_bytes) {
+    uintptr_t x=(uintptr_t)myds_metal_buffer_data((myds_metal_buffer_t *)a),
+              y=(uintptr_t)myds_metal_buffer_data((myds_metal_buffer_t *)b);
     return x<=y?y-x<a_bytes:x-y<b_bytes;
 }
 int myds_v41_gpu_qkv_finish(myds_metal_buffer_t *q,myds_metal_buffer_t *kv,
@@ -299,13 +300,18 @@ int myds_v41_gpu_qkv_finish(myds_metal_buffer_t *q,myds_metal_buffer_t *kv,
     if(pos>=1048576u||!floats(q,64u*512u)||!floats(kv,512u)||
        !floats(window,128u*512u))return 0;
     if(!myds_metal_v41_qkv_fusion_available()||
-       qkv_ranges_overlap(q,64u*512u*4u,kv,512u*4u)||
-       qkv_ranges_overlap(q,64u*512u*4u,window,128u*512u*4u)||
-       qkv_ranges_overlap(kv,512u*4u,window,128u*512u*4u)) {
-        return myds_v41_gpu_rope(q,512,64,pos,compressed,false)&&
-            myds_v41_gpu_rope(kv,512,1,pos,compressed,false)&&
-            myds_v41_gpu_quant(kv,512,1,1)&&
-            myds_metal_buffer_copy(window,(size_t)(pos%128u)*512u*4u,kv,0,512u*4u);
+       buffer_ranges_overlap(q,64u*512u*4u,kv,512u*4u)||
+       buffer_ranges_overlap(q,64u*512u*4u,window,128u*512u*4u)||
+       buffer_ranges_overlap(kv,512u*4u,window,128u*512u*4u)) {
+        if (!myds_v41_gpu_rope(q,512,64,pos,compressed,false)) return 0;
+        /* The fallback also handles aliased Q/KV/window views. Preserve the
+         * reference Q-before-KV order even inside a concurrent encoder. */
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(q);
+        if (!myds_v41_gpu_rope(kv,512,1,pos,compressed,false)) return 0;
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(kv);
+        if (!myds_v41_gpu_quant(kv,512,1,1)) return 0;
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(kv);
+        return myds_metal_buffer_copy(window,(size_t)(pos%128u)*512u*4u,kv,0,512u*4u);
     }
     pthread_once(&rope_once,init_rope);
     struct {uint32_t pos,pad;float frequencies[32];} a={pos,0,{0}};
@@ -382,6 +388,62 @@ int myds_v41_gpu_indexscores_masked_bf16(myds_metal_buffer_t *scores,const myds_
     const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,
     const myds_metal_buffer_t *mask,uint32_t n_comp,uint32_t n_heads) {
     return indexscores(scores,q,weights,cache,mask,n_comp,n_heads,true);
+}
+
+enum { IC_REQUESTS, IC_ENCODED, IC_UNAVAILABLE, IC_DENSE_ROWS, IC_ROW_SLOTS, IC_COUNT };
+static _Atomic uint64_t indexer_compact_counters[IC_COUNT];
+static bool indexer_compact_test_unavailable;
+void myds_v41_gpu_inject_indexer_compact_unavailable(bool enabled) {
+    indexer_compact_test_unavailable=enabled;
+}
+void myds_v41_gpu_indexer_compact_counters(myds_v41_gpu_indexer_compact_counters_t *out,bool reset) {
+    uint64_t v[IC_COUNT];
+    for(unsigned i=0;i<IC_COUNT;i++)v[i]=reset?
+        atomic_exchange_explicit(&indexer_compact_counters[i],0,memory_order_relaxed):
+        atomic_load_explicit(&indexer_compact_counters[i],memory_order_relaxed);
+    if(out)*out=(myds_v41_gpu_indexer_compact_counters_t){v[0],v[1],v[2],v[3],v[4]};
+}
+int myds_v41_gpu_indexscores_selected_blocks_bf16(myds_metal_buffer_t *scores,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *cache,const myds_metal_buffer_t *mask,
+    const myds_metal_buffer_t *block_ids,uint32_t n_comp,uint32_t n_selected_blocks) {
+    if(!n_comp||n_comp>1048576u||n_selected_blocks>(n_comp+7u)/8u||
+       !floats(scores,n_comp)||!floats(q,32u*128u)||!floats(weights,32u)||
+       !bf16s(cache,(uint64_t)n_comp*128u)||!floats(mask,(n_comp+7u)/8u)||
+       (n_selected_blocks&&!floats(block_ids,n_selected_blocks)))return -1;
+    const size_t score_bytes=(size_t)n_comp*4u;
+    if(buffer_ranges_overlap(scores,score_bytes,q,32u*128u*4u)||
+       buffer_ranges_overlap(scores,score_bytes,weights,32u*4u)||
+       buffer_ranges_overlap(scores,score_bytes,cache,(size_t)n_comp*128u*2u)||
+       buffer_ranges_overlap(scores,score_bytes,mask,(size_t)((n_comp+7u)/8u)*4u)||
+       (n_selected_blocks&&buffer_ranges_overlap(scores,score_bytes,block_ids,(size_t)n_selected_blocks*4u)))return -1;
+    atomic_fetch_add_explicit(&indexer_compact_counters[IC_REQUESTS],1,memory_order_relaxed);
+    /* Probe both optional pipelines before filling any score. Missing kernels
+     * can use the original scorer without observing partly changed buffers. */
+    if(indexer_compact_test_unavailable||
+       myds_metal_kernel_max_threads("kernel_myds_indexer_scores_fill")<256u||
+       (n_selected_blocks&&myds_metal_kernel_max_threads("kernel_myds_indexer_score_selected_blocks_direct")<128u)) {
+        atomic_fetch_add_explicit(&indexer_compact_counters[IC_UNAVAILABLE],1,memory_order_relaxed);
+        return 0;
+    }
+    const myds_metal_buffer_t *inputs[]={q,weights,cache,mask,block_ids};
+    myds_metal_barrier_buffers(inputs,5);
+    const myds_metal_buffer_t *fill_b[]={scores};
+    if(!dispatch("kernel_myds_indexer_scores_fill",&n_comp,sizeof(n_comp),fill_b,1,
+                 (n_comp+255u)/256u,1,1,256,1,1,0))return -1;
+    myds_metal_barrier_buffer(scores);
+    if(n_selected_blocks) {
+        struct {uint32_t n_rows,n_head,head_dim,cache_f16;float scale;
+            uint32_t has_mask,n_selected_blocks,pad;} a={n_comp,32u,128u,2u,1.0f/64.0f,1u,n_selected_blocks,0};
+        const myds_metal_buffer_t *b[]={q,weights,cache,scores,mask,block_ids};
+        if(!dispatch("kernel_myds_indexer_score_selected_blocks_direct",&a,sizeof(a),b,6,
+                     n_selected_blocks*8u,1,1,32,4,1,132u*4))return -1;
+    }
+    myds_metal_barrier_buffer(scores);
+    atomic_fetch_add_explicit(&indexer_compact_counters[IC_ENCODED],1,memory_order_relaxed);
+    atomic_fetch_add_explicit(&indexer_compact_counters[IC_DENSE_ROWS],n_comp,memory_order_relaxed);
+    atomic_fetch_add_explicit(&indexer_compact_counters[IC_ROW_SLOTS],(uint64_t)n_selected_blocks*8u,memory_order_relaxed);
+    return 1;
 }
 /* 整 chunk 批量版：kernel_glm_indexer_score_chunk_direct 与 _direct 的线程/网格/smem
  * 相同，只是多一维 token（grid.y）与逐行因果门。只支持 n_heads == 32，

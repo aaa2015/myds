@@ -86,6 +86,7 @@ int myds_v41_prefill_tokens(myds_context_t *context, const int32_t *tokens,
 typedef struct myds_v41_spec_snapshot {
     uint32_t pos;
     uint32_t next_position;
+    uint64_t rng_state;
     myds_engram_history_t engram_history;
     uint32_t engram_position;
     float previous_kv[4][512];
@@ -93,22 +94,60 @@ typedef struct myds_v41_spec_snapshot {
     uint32_t window_start_pos;
     uint32_t window_count;
     float window_saved[MYDS_V41_LAYERS_COUNT][MYDS_V41_SPEC_MAX_AHEAD][512];
+    /* Borrowed views into the verifier's reusable workspace. A successful
+     * K=2 call publishes the exact state after its first authoritative token;
+     * consume immediately, before the next batch reuses the workspace. */
+    myds_metal_buffer_t *first_previous_kv[4], *first_previous_score[4];
+    myds_metal_buffer_t *first_residual, *first_pre, *first_logits;
+    myds_metal_buffer_t *first_dspark_slots[3];
+    myds_engram_history_t first_engram_history;
+    uint64_t first_rng_state;
+    bool first_state_valid;
     bool valid;
 } myds_v41_spec_snapshot_t;
 
 bool myds_v41_spec_snapshot_save(myds_context_t *context, myds_v41_spec_snapshot_t *snap, uint32_t count);
 bool myds_v41_spec_snapshot_restore(myds_context_t *context, const myds_v41_spec_snapshot_t *snap);
 bool myds_v41_spec_snapshot_restore_partial(myds_context_t *context, const myds_v41_spec_snapshot_t *snap, uint32_t keep_count);
+/* Capture the actual, completed first target step for the opt-in sequential
+ * comparison path; also usable by diagnostic state fixtures. */
+bool myds_v41_spec_snapshot_capture_first(myds_context_t *context, myds_v41_spec_snapshot_t *snap);
 
 /* ── 投机微批前向通道 ── */
+/* Explicit opt-in, greedy text only. Requested excludes the per-draft
+ * confidence gate so callers can skip drafter work when batching is off. */
+bool myds_v41_batch2_spec_requested(const myds_context_t *context);
+bool myds_v41_batch2_spec_enabled(const myds_context_t *context, uint32_t n_tokens);
 int myds_v41_forward_batch_spec(myds_context_t *context, const int32_t *tokens,
                                 uint32_t n_tokens, uint32_t position,
                                 int32_t *out_tokens);
+/* Optional reusable caller snapshot is captured once by the verifier. On
+ * success it permits retaining only the first output at length/EOS/cancel;
+ * errors restore it before any sequential retry. No memset is required. */
+int myds_v41_forward_batch_spec_ex(myds_context_t *context, const int32_t *tokens,
+                                   uint32_t n_tokens, uint32_t position,
+                                   int32_t *out_tokens, myds_v41_spec_snapshot_t *snapshot);
+/* Diagnostic fixture: projected Q/KV inputs pass through the production
+ * batch-2 raw-window attention sequence. Real Metal kernels, no model weights.
+ * The caller owns the buffers and a completed batch; failure restores window.
+ * This proves the window/attention component, not full-model logits parity. */
+int myds_v41_batch2_window_probe(myds_metal_buffer_t *window,
+    const myds_metal_buffer_t *sinks, myds_metal_buffer_t *q[2],
+    myds_metal_buffer_t *kv[2], myds_metal_buffer_t *heads[2], uint32_t position,
+    bool fail_after_first);
+/* Diagnostic entry into the production Batch-2 projection boundary. Each
+ * row retains the authoritative decode helper's reduction and BF16 store. */
+typedef enum {
+    MYDS_V41_BATCH2_QKV, MYDS_V41_BATCH2_TAIL,
+    MYDS_V41_BATCH2_SHARED, MYDS_V41_BATCH2_ROUTER
+} myds_v41_batch2_projection_kind_t;
+int myds_v41_batch2_projection_probe(myds_metal_buffer_t *out[2],
+    const myds_metal_buffer_t *weight, myds_metal_buffer_t *input[2],
+    uint32_t rows, uint32_t width, ggml_type type,
+    myds_v41_batch2_projection_kind_t kind);
 
 /* ── 推测树（Tree-based Speculative Decoding）级联前向与3-Way裁决器 ── */
 int myds_v41_forward_tree_spec(myds_context_t *context, const int32_t *tokens,
                                uint32_t position, int32_t *out_tokens);
 
 #endif
-
-

@@ -1988,6 +1988,62 @@ kernel void kernel_glm_indexer_score_one(
     if (tid == 0) scores[row] = score;
 }
 
+kernel void kernel_myds_indexer_scores_fill(
+        constant uint &n_rows,
+        device float *scores,
+        uint row [[thread_position_in_grid]]) {
+    if(row<n_rows)scores[row]=-INFINITY;
+}
+
+struct myds_indexer_selected_blocks_args {
+    uint n_rows,n_head,head_dim,cache_f16;
+    float scale;
+    uint has_mask,n_selected_blocks,pad;
+};
+
+/* Scorer-only compaction: the dot/reduction sequence below is copied from
+ * kernel_glm_indexer_score_one_direct. Scores retain original dense row IDs;
+ * no compact sort can change the reference top-k's network-dependent ties. */
+kernel void kernel_myds_indexer_score_selected_blocks_direct(
+        constant myds_indexer_selected_blocks_args &args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        device const float *mask,
+        device const int *block_ids,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint slot [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    if(slot>=args.n_selected_blocks*8u||args.n_head!=32u||args.head_dim!=128u)return;
+    const int block=block_ids[slot/8u];
+    if(block<0||(uint)block>=(args.n_rows+7u)/8u)return;
+    const uint row=(uint)block*8u+slot%8u;
+    if(row>=args.n_rows||mask[row/8u]!=0.0f)return;
+    threadgroup float *ktg=shared;
+    threadgroup float *psum=ktg+128u;
+    if(tid<128u)ktg[tid]=glm_cache_load_f32_or_f16(indexer_key_cache,
+        (uint64_t)row*128u+tid,args.cache_f16);
+    float acc=0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for(uint head0=0;head0<32u;head0+=4u) {
+        const uint head=head0+(uint)sg;
+        device const float4 *q4=(device const float4 *)(q+(uint64_t)head*128u*sizeof(float));
+        threadgroup const float4 *k4=(threadgroup const float4 *)ktg;
+        float s=dot(q4[lane],k4[lane]);
+        s=simd_sum(s);
+        if(lane==0)psum[sg]=max(s*args.scale,0.0f)*weights[head];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if(tid==0) {
+            acc+=psum[0];acc+=psum[1];acc+=psum[2];acc+=psum[3];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if(tid==0)scores[row]=acc;
+}
+
 kernel void kernel_glm_indexer_score_one_direct(
         constant ds4_metal_args_glm_indexer_score_one & args,
         device const char *q,

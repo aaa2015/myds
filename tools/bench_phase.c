@@ -8,6 +8,8 @@
 #include "myds_metal.h"
 #include "myds_server_internal.h"
 #include "myds_v41_gpu.h"
+#include "myds_dspark.h"
+#include <math.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <pthread.h>
@@ -15,11 +17,12 @@
 #include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
+extern char **environ;
 #if defined(__APPLE__)
 #include <sys/qos.h>
 #endif
 
-enum { MAX_OUTPUT_TOKENS = 64 };
+enum { MAX_OUTPUT_TOKENS = 512 };
 typedef struct {
     uint32_t count;
     bool overflow;
@@ -108,6 +111,40 @@ static void metric(FILE *out, const char *key, bool valid, double value) {
     if (valid) fprintf(out, "%.9f", value); else fputs("null", out);
 }
 
+static void decode_metrics(FILE *json, myds_context_t *ctx) {
+    myds_decode_stats_t ds = {0};
+    myds_last_decode_stats(ctx, &ds);
+    fputs(",\"decode_telemetry\":{", json);
+#define COUNTER(name) fprintf(json, "\"" #name "\":%" PRIu64 ",", ds.name)
+    COUNTER(target_forward_calls); COUNTER(target_rows);
+    COUNTER(batch2_calls); COUNTER(batch2_hits); COUNTER(batch2_misses);
+    COUNTER(batch2_failures); COUNTER(batch2_fallbacks);
+    COUNTER(draft_cycles); COUNTER(draft_proposed); COUNTER(draft_accepted); COUNTER(draft_rejects);
+    COUNTER(confidence_rejects); COUNTER(margin_rejects); COUNTER(backoff_steps);
+    COUNTER(pld_queries); COUNTER(pld_cycles); COUNTER(pld_proposed); COUNTER(pld_accepted);
+    COUNTER(output_tokens); COUNTER(cycle_count);
+#undef COUNTER
+    fprintf(json, "\"timing_enabled\":%s,\"recorded_cycles\":%u", ds.timing_enabled ? "true" : "false", ds.recorded_cycles);
+    metric(json, "draft_ms", ds.timing_enabled, ds.draft_ms);
+    metric(json, "verify_ms", ds.timing_enabled, ds.verify_ms);
+    metric(json, "rollback_ms", ds.timing_enabled, ds.rollback_ms);
+    metric(json, "snapshot_ms", ds.timing_enabled, ds.snapshot_ms);
+    metric(json, "pld_ms", ds.timing_enabled, ds.pld_ms);
+    fputs(",\"cycle_ms\":[", json);
+    for (uint32_t i = 0; i < ds.recorded_cycles; ++i) {
+        myds_decode_cycle_t cycle = {0};
+        if (!myds_last_decode_cycle(ctx, i, &cycle)) { fputs(i ? ",null" : "null", json); continue; }
+        fprintf(json, "%s%.9f", i ? "," : "", cycle.elapsed_ms);
+    }
+    fputs("],\"cycle_output_tokens\":[", json);
+    for (uint32_t i = 0; i < ds.recorded_cycles; ++i) {
+        myds_decode_cycle_t cycle = {0};
+        if (!myds_last_decode_cycle(ctx, i, &cycle)) { fputs(i ? ",null" : "null", json); continue; }
+        fprintf(json, "%s%u", i ? "," : "", cycle.output_tokens);
+    }
+    fputs("]}", json);
+}
+
 /* Optional storage evidence, outside every request's timed interval. These
  * are global block-driver counters, not per-process or physical NAND bytes. */
 static bool storage_counters(FILE *json, uint32_t run, const char *phase) {
@@ -127,18 +164,22 @@ static bool storage_counters(FILE *json, uint32_t run, const char *phase) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 3 || argc > 6) {
-        fprintf(stderr, "Usage: %s model.gguf request.json [repeats=3 (1..4)] [max_new_tokens=64 (32|64)] [max_seq_len=262144]\n", argv[0]);
+    if (argc < 3 || argc > 7) {
+        fprintf(stderr, "Usage: %s model.gguf request.json [repeats=3 (1..4)] [max_new_tokens=64 (32|64|256|512)] [max_seq_len=262144] [dspark-support.gguf]\n", argv[0]);
         return 2;
     }
     const uint32_t repeats = argc > 3 ? positive(argv[3], 4, "repeats") : 3;
     const uint32_t max_new = argc > 4 ? positive(argv[4], MAX_OUTPUT_TOKENS, "max_new_tokens") : 64;
     const uint32_t max_seq = argc > 5 ? positive(argv[5], UINT32_MAX, "max_seq_len") : 262144;
-    if (max_new != 32 && max_new != 64) { fputs("max_new_tokens must be 32 or 64\n", stderr); return 2; }
+    if (max_new != 32 && max_new != 64 && max_new != 256 && max_new != 512) {
+        fputs("max_new_tokens must be 32, 64, 256 or 512\n", stderr); return 2;
+    }
+    const char *dspark_path = argc > 6 ? argv[6] : NULL;
     const char *prefix = getenv("MYDS_PREFIX_CACHE");
     if (!prefix || strcmp(prefix, "0")) { fputs("Set MYDS_PREFIX_CACHE=0 for full-prefill measurements\n", stderr); return 2; }
     const char *forbidden[] = {"MYDS_PROFILE_PREFILL", "MYDS_PROFILE_SPLIT", "MYDS_PROFILE_SPLIT2",
         "MYDS_PROFILE_SPLIT3", "MYDS_PROFILE_MOE", "MYDS_PROFILE_STEP1", "MYDS_MOE_STEP_PROF",
+        "MYDS_PROF", "MYDS_DISPATCH_HIST", "MYDS_DEBUG_DISPATCH",
         "MYDS_TRACE_PREFIX", "MYDS_BATCH_TRACE_PREFIX", "MYDS_DISABLE_V41_PREFILL",
         "MYDS_SKIP_Q_A", "MYDS_SKIP_KV", "MYDS_SKIP_NORM", "MYDS_SKIP_KV_ROPE",
         "MYDS_SKIP_KV_QUANT", "MYDS_SKIP_Q_B", "MYDS_SKIP_Q_ROPE"};
@@ -175,7 +216,8 @@ int main(int argc, char **argv) {
 #endif
     fprintf(json, "{\"kind\":\"metadata\",\"model\":"); json_string(json, argv[1]);
     fputs(",\"request_file\":", json); json_string(json, argv[2]);
-    fprintf(json, ",\"repeats\":%u,\"warmup_runs\":1,\"max_new_tokens\":%u,\"max_seq_len\":%u,"
+    fputs(",\"dspark_model\":", json); json_string(json, dspark_path);
+    fprintf(json, ",\"protocol_version\":2,\"repeats\":%u,\"warmup_runs\":1,\"max_new_tokens\":%u,\"max_seq_len\":%u,"
         "\"temperature\":0,\"top_p\":1,\"top_k\":0,\"min_p\":0,\"repetition_penalty\":1,\"seed\":42,"
         "\"qos\":\"user_interactive\",\"qos_result\":%d,\"prompt_renderer\":\"parse_chat_prompt\","
         "\"request_bytes\":%zu,\"prompt_bytes\":%zu,\"request_fnv1a64\":\"%016" PRIx64 "\","
@@ -187,6 +229,7 @@ int main(int argc, char **argv) {
         "MYDS_DISABLE_MOE_MM", "MYDS_DECODE_SPLIT", "MYDS_ATTN_GATHER", "MYDS_SUFFIX_SHRINK", "MYDS_SUFFIX_SHRINK_SHIFT",
         "MYDS_RESIDENCY_KEEP_ALIVE_S", "MYDS_RESIDENCY_HB_MS", "MYDS_NO_RESIDENCY_HB", "MYDS_NO_PREFIX_SNAPSHOT",
         "MYDS_CHUNK_KEY_MAX", "MYDS_ATTN_KEYS_CLAMP", "MYDS_INDEXER_BATCH_FLOATS", "MYDS_INDEXER_TILED",
+        "MYDS_INDEXER_COMPACT_SCORER",
         "MYDS_BLOCK_BUDGET", "MYDS_DISABLE_MUL_MM", "MYDS_MM_MIN_M", "MYDS_DISABLE_MM_ENGRAM",
         "MYDS_DISABLE_MM_ATTN_A", "MYDS_COMPRESSOR_PER_TOKEN", "MYDS_INDEXER_PER_TOKEN",
         /* 2026-10-05 path selectors: without them two configurations of one
@@ -197,9 +240,36 @@ int main(int argc, char **argv) {
         "MYDS_ATTN_OUT_A_FUSE_BF16",
         "MYDS_ATTN_DIRECT_PACK",
         "MYDS_ENGRAM_IO_THREADS", "MYDS_ENGRAM_NOCACHE", "MYDS_BENCH_STORAGE_COUNTERS",
-        "MYDS_GEMV_BATCH_SIZE"};
+        "MYDS_GEMV_BATCH_SIZE", "MYDS_PLD", "MYDS_BATCH2_SPEC", "MYDS_TREE_SPEC",
+        "MYDS_DSPARK_MARKOV_ONLY", "MYDS_DSPARK_MARKOV_SCALE", "MYDS_DSPARK_MIN_CONF",
+        "MYDS_DSPARK_MIN_MARGIN", "MYDS_DSPARK_HIGH_CONF_MARGIN", "MYDS_DSPARK_COST_GATE",
+        "MYDS_ANCHOR_SNAPSHOT", "MYDS_KV_DSK_PREFER_DEEPER", "MYDS_KV_DSK_BUDGET_MB",
+        "MYDS_KV_DSK_WAYS", "MYDS_MODEL_DIGEST", "MYDS_FORCE_FULL_DIGEST",
+        "MYDS_METAL_CONCURRENT", "MYDS_MOE_CONCURRENT", "MYDS_MOE_PIPELINE",
+        "MYDS_MOE_FUSE_EXPAND", "MYDS_MOE_NSG", "MYDS_SHARED_FUSE", "MYDS_SHARED_NR0",
+        "MYDS_ATTN_INDEXER_PIPELINE", "MYDS_ATTN_OUTPUT_PIPELINE", "MYDS_QKV_PIPELINE",
+        "MYDS_FUSE_HC_SUM_RMSNORM", "MYDS_DECODE_Q8_FUSE_BF16", "MYDS_SUFFIX_SHRINK_MIN_TOKENS",
+        "MYDS_DECODE_METRICS", "MYDS_SPEC_SERIAL_PROBE", "MYDS_SPEC_COST_SCHEDULER"};
     for (size_t i = 0; i < sizeof(env_names)/sizeof(env_names[0]); ++i) {
         if (i) fputc(',', json); json_string(json, env_names[i]); fputc(':', json); json_string(json, getenv(env_names[i]));
+    }
+    /* Also bind future/experimental MYDS_ selectors, without silently omitting
+     * a requested environment setting when this list has not yet been updated. */
+    for (char **entry = environ; entry && *entry; ++entry) {
+        if (strncmp(*entry, "MYDS_", 5) != 0) continue;
+        const char *equal = strchr(*entry, '=');
+        if (!equal) continue;
+        const size_t length = (size_t)(equal - *entry);
+        bool known = false;
+        for (size_t i = 0; i < sizeof(env_names)/sizeof(env_names[0]); ++i) {
+            if (strlen(env_names[i]) == length && memcmp(env_names[i], *entry, length) == 0) { known = true; break; }
+        }
+        if (known) continue;
+        char *name = malloc(length + 1u);
+        if (!name) { free(prompt); fclose(json); return 1; }
+        memcpy(name, *entry, length); name[length] = 0;
+        fputc(',', json); json_string(json, name); fputc(':', json); json_string(json, equal + 1);
+        free(name);
     }
     fputs("}}\n", json); fflush(json);
 
@@ -213,16 +283,29 @@ int main(int argc, char **argv) {
     myds_context_t *ctx = myds_context_create(model, &cfg);
     const double context_s = now_s() - context_start;
     if (!ctx) { fputs("Context creation failed\n", stderr); myds_model_free(model); free(prompt); fclose(json); return 1; }
+    double dspark_load_s = 0;
+    if (dspark_path) {
+        const double dspark_start = now_s();
+        ctx->dspark = myds_dspark_load(dspark_path, model->vocab_size);
+        dspark_load_s = now_s() - dspark_start;
+        if (!ctx->dspark) {
+            fputs("DSpark support model load failed; refusing target-only fallback\n", stderr);
+            myds_context_free(ctx); myds_model_free(model); free(prompt); fclose(json); return 1;
+        }
+    }
     fprintf(json, "{\"kind\":\"load\",\"load_s\":%.9f,\"context_create_s\":%.9f,\"model_arch\":", load_s, context_s);
     json_string(json, model->arch);
     fprintf(json, ",\"layers\":%u,\"dim\":%u,\"heads\":%u,\"head_dim\":%u,\"vocab_size\":%u,"
-        "\"routed_experts\":%u,\"activated_experts\":%u,\"expert_width\":%u,\"shared_experts\":%u,\"native_v41\":%s}\n",
+        "\"routed_experts\":%u,\"activated_experts\":%u,\"expert_width\":%u,\"shared_experts\":%u,\"native_v41\":%s,"
+        "\"dspark_loaded\":%s,\"dspark_load_s\":%.9f,\"dspark_block_size\":%u,\"dspark_stages\":%u}\n",
         model->n_layers, model->dim, model->n_heads, model->head_dim, model->vocab_size,
         model->n_routed_experts, model->n_activated_experts, model->moe_expert_dim, model->n_shared_experts,
-        model->v41 ? "true" : "false");
+        model->v41 ? "true" : "false", ctx->dspark ? "true" : "false", dspark_load_s,
+        ctx->dspark ? ctx->dspark->block_size : 0, ctx->dspark ? ctx->dspark->stage_count : 0);
     fflush(json);
     int status = 0;
     uint64_t expected_ids = 0, expected_bytes = 0;
+    uint64_t expected_logits = 0;
     uint32_t expected_count = 0;
 #ifdef MYDS_V41_GPU_HAS_ATTENTION_COUNTERS
     myds_v41_gpu_attention_counters(NULL, true);   /* exclude load/context creation */
@@ -230,12 +313,27 @@ int main(int argc, char **argv) {
     for (uint32_t run = 0; run <= repeats; ++run) {
         capture_t c = {.bytes_hash = seed_hash, .ids_hash = seed_hash};
         myds_stop_reason_t reason = MYDS_STOP_ERROR; uint32_t prompt_tokens = 0;
+        /* Request-local host path counters; exclude previous requests and load. */
+        myds_v41_gpu_indexer_compact_counters(NULL, true);
         if (!storage_counters(json, run, "before")) { status = 1; break; }
         const double start = now_s();
         const int ok = myds_generate_bytes_ex(ctx, prompt, capture, &c, &reason, &prompt_tokens, NULL);
         const double wall_s = now_s() - start;
+        myds_v41_gpu_indexer_compact_counters_t compact;
+        myds_v41_gpu_indexer_compact_counters(&compact, false);
         if (!storage_counters(json, run, "after")) { status = 1; break; }
         myds_prefill_stats_t pf; myds_last_prefill_stats(ctx, &pf);
+        /* Final logits are read only after the existing generation waits, outside
+         * wall_s. Equality here is a regression gate, not independent model proof. */
+        const float *logits = (const float *)myds_metal_buffer_data(ctx->logits);
+        bool logits_finite = logits != NULL;
+        uint64_t logits_hash = seed_hash;
+        if (logits) {
+            for (uint32_t i = 0; i < model->vocab_size; ++i) {
+                if (!isfinite(logits[i])) logits_finite = false;
+                logits_hash = hash_bytes(logits_hash, logits + i, sizeof(*logits));
+            }
+        }
         /* Resolve available profiler records only after generation's existing waits.
          * This export is deliberately outside the measured request wall interval. */
         /* No profiler in this uninstrumented baseline. */
@@ -249,9 +347,13 @@ int main(int argc, char **argv) {
             pf.prefill_tokens == prompt_tokens - 1u && pf.prompt_tokens == prompt_tokens;
         const bool decode_valid = c.count >= 2 && !c.overflow && c.last > c.first;
         const bool count_valid = c.count <= max_new && (reason != MYDS_STOP_LENGTH || c.count == max_new);
-        if (run == 0) { expected_ids = c.ids_hash; expected_bytes = c.bytes_hash; expected_count = c.count; }
+        if (run == 0) {
+            expected_ids = c.ids_hash; expected_bytes = c.bytes_hash; expected_count = c.count;
+            expected_logits = logits_hash;
+        }
         const bool output_equal = c.ids_hash == expected_ids && c.bytes_hash == expected_bytes && c.count == expected_count;
-        const bool valid = generation_ok && full_prefill && decode_valid && count_valid && output_equal;
+        const bool valid = generation_ok && full_prefill && decode_valid && count_valid && output_equal &&
+                           logits_finite && logits_hash == expected_logits;
         fprintf(json, "{\"kind\":\"sample\",\"run\":%u,\"warmup\":%s,\"generation_ok\":%s,\"sample_valid\":%s,"
             "\"stop_reason\":\"%s\",\"stop_reason_code\":%d,\"prompt_tokens\":%u,\"cached_tokens\":%u,"
             "\"prefill_tokens\":%u,\"prefill_s\":%.9f,\"output_tokens\":%u,\"decode_intervals\":%u,\"wall_s\":%.9f,"
@@ -269,6 +371,12 @@ int main(int argc, char **argv) {
         metric(json, "prefill_ms_per_token", full_prefill && pf.prefill_tokens > 0, 1000.0 * pf.prefill_seconds / (pf.prefill_tokens ? pf.prefill_tokens : 1));
         metric(json, "decode_s", decode_valid, c.last - c.first);
         metric(json, "decode_ms_per_token", decode_valid, 1000.0 * (c.last - c.first) / (c.count > 1 ? c.count - 1u : 1u));
+        fprintf(json, ",\"final_logits\":{\"elements\":%u,\"finite\":%s,\"fnv1a64_bytes\":\"%016" PRIx64 "\"}",
+                model->vocab_size, logits_finite ? "true" : "false", logits_hash);
+        decode_metrics(json, ctx);
+        fprintf(json, ",\"gpu_indexer_compact\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64
+            ",\"unavailable\":%" PRIu64 ",\"dense_rows\":%" PRIu64 ",\"scored_row_slots\":%" PRIu64 "}",
+            compact.requests, compact.encoded, compact.unavailable, compact.dense_rows, compact.scored_row_slots);
 #ifdef MYDS_V41_GPU_HAS_ATTENTION_COUNTERS
         fprintf(json, ",\"attention_paths\":{\"calls\":%" PRIu64 ",\"gather_calls\":%" PRIu64
             ",\"slab_calls\":%" PRIu64 ",\"head_first_attempts\":%" PRIu64 ",\"head_first_encoded\":%" PRIu64

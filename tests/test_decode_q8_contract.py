@@ -15,13 +15,15 @@ class DecodeQ8Contract(unittest.TestCase):
         cls.temp = tempfile.TemporaryDirectory(prefix="myds-decode-q8-host-")
         cls.binary = Path(cls.temp.name) / "test_decode_q8_contract"
         sanitizer = ["-fsanitize=thread", "-g"] if os.environ.get("MYDS_TEST_TSAN") == "1" else []
-        subprocess.run([
+        compilation = subprocess.run([
             "clang", "-O2", "-Wall", "-Wextra", "-Werror", "-std=c11",
             *sanitizer,
             "-I", str(ROOT / "include"),
             str(ROOT / "tests/test_decode_q8_contract.c"),
             str(ROOT / "src/myds_v41_decode.c"), "-lpthread", "-o", str(cls.binary),
-        ], check=True, capture_output=True, text=True)
+        ], capture_output=True, text=True)
+        if compilation.returncode:
+            raise RuntimeError(f"Host contract compilation failed:\n{compilation.stderr}")
 
     @classmethod
     def tearDownClass(cls):

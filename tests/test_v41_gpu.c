@@ -232,6 +232,86 @@ static int test_indexscores_bf16(void) {
     myds_metal_buffer_free(w);myds_metal_buffer_free(a);myds_metal_buffer_free(b);myds_metal_buffer_free(mask);
     printf("  [PASS] BF16 index scores byte exact: scalar/direct/chunk/tiled, masked early exit and causal tails\n");return 1;
 }
+static int test_indexscores_selected_blocks(void) {
+    const uint32_t shapes[]={1,7,8,9,33,16385,32769,131077};
+    myds_v41_gpu_indexer_compact_counters(NULL,true);
+    for(size_t si=0;si<sizeof(shapes)/sizeof(*shapes);si++) {
+        const uint32_t rows=shapes[si],blocks=(rows+7u)/8u,top=rows<512u?rows:512u;
+        const size_t score_bytes=(size_t)rows*4u,cache_bytes=(size_t)rows*128u*2u;
+        myds_metal_buffer_t *cache_owner=myds_metal_buffer_alloc(cache_bytes+32u),
+            *a_owner=myds_metal_buffer_alloc(score_bytes+32u),*b_owner=myds_metal_buffer_alloc(score_bytes+32u);
+        CHECK(cache_owner&&a_owner&&b_owner);
+        memset(myds_metal_buffer_data(cache_owner),0xa5,cache_bytes+32u);
+        memset(myds_metal_buffer_data(a_owner),0xa5,score_bytes+32u);
+        memset(myds_metal_buffer_data(b_owner),0xa5,score_bytes+32u);
+        /* BF16 cache deliberately has only ushort alignment; score views have
+         * guard words before/after and do not start at owner offset zero. */
+        myds_metal_buffer_t *cache=myds_metal_buffer_sub_view(cache_owner,6u,cache_bytes),
+            *a=myds_metal_buffer_sub_view(a_owner,16u,score_bytes),*b=myds_metal_buffer_sub_view(b_owner,16u,score_bytes),
+            *q=myds_metal_buffer_alloc(32u*128u*4u),*w=myds_metal_buffer_alloc(32u*4u),
+            *mask=myds_metal_buffer_alloc((size_t)blocks*4u),*ids=myds_metal_buffer_alloc((size_t)blocks*4u),
+            *sel_a=myds_metal_buffer_alloc((size_t)top*4u),*sel_b=myds_metal_buffer_alloc((size_t)top*4u);
+        CHECK(cache&&a&&b&&q&&w&&mask&&ids&&sel_a&&sel_b);fill(q,7);
+        for(uint32_t h=0;h<32u;h++)((float*)myds_metal_buffer_data(w))[h]=0.25f+(float)h/64.0f;
+        uint16_t *cp=myds_metal_buffer_data(cache);
+        for(uint32_t r=0;r<rows;r++)for(uint32_t d=0;d<128u;d++)
+            cp[(size_t)r*128u+d]=(uint16_t)(0x3c00u+(si%2u?d%127u:(r*17u+d)%511u));
+        /* This fixture uses scratch only for dense top-k. The surrounding
+         * --threshold suite intentionally sets a larger attention threshold;
+         * isolate its construction policy and restore the suite immediately. */
+        const char *threshold=getenv("MYDS_ATTN_GATHER_MIN_KEYS");
+        char *saved_threshold=threshold?strdup(threshold):NULL;
+        CHECK(!threshold||saved_threshold);
+        CHECK(!setenv("MYDS_ATTN_GATHER_MIN_KEYS","0",1));
+        myds_v41_gpu_scratch_t *scratch=myds_v41_gpu_scratch_create(rows<2u?2u:rows);
+        int restore_error=saved_threshold?setenv("MYDS_ATTN_GATHER_MIN_KEYS",saved_threshold,1):unsetenv("MYDS_ATTN_GATHER_MIN_KEYS");
+        free(saved_threshold);CHECK(!restore_error&&scratch);
+        for(unsigned pattern=0;pattern<3;pattern++) {
+            float *mp=myds_metal_buffer_data(mask);int32_t *ip=myds_metal_buffer_data(ids);uint32_t selected=0;
+            for(uint32_t bk=0;bk<blocks;bk++) {
+                const bool allowed=pattern==0||(pattern==2&&(bk%3u==0u||bk+1u==blocks));
+                mp[bk]=allowed?0.0f:-INFINITY;
+            }
+            /* Reversed block order shows scoring order does not define tie IDs.
+             * Only the reference dense top-k network decides final ordering. */
+            for(uint32_t bk=blocks;bk>0;bk--)if(mp[bk-1u]==0.0f)ip[selected++]=(int32_t)(bk-1u);
+            myds_metal_set_concurrent(0);myds_metal_set_auto_barrier(1);
+            CHECK(myds_metal_begin_batch());
+            CHECK(myds_v41_gpu_indexscores_masked_bf16(a,q,w,cache,mask,rows,32));
+            CHECK(myds_v41_gpu_topk(sel_a,a,rows,top,scratch));CHECK(myds_metal_commit_batch());
+            myds_metal_set_concurrent(1);myds_metal_set_auto_barrier(0);
+            CHECK(myds_metal_begin_batch());
+            CHECK(myds_v41_gpu_indexscores_selected_blocks_bf16(b,q,w,cache,mask,ids,rows,selected)==1);
+            CHECK(myds_v41_gpu_topk(sel_b,b,rows,top,scratch));CHECK(myds_metal_commit_batch());
+            CHECK(!memcmp(myds_metal_buffer_data(a),myds_metal_buffer_data(b),score_bytes));
+            CHECK(!memcmp(myds_metal_buffer_data(sel_a),myds_metal_buffer_data(sel_b),(size_t)top*4u));
+            const float *bp=myds_metal_buffer_data(b);
+            for(uint32_t r=0;r<rows;r++)CHECK(mp[r/8u]==0.0f?isfinite(bp[r]):bp[r]==-INFINITY);
+        }
+        /* An absent optional PSO returns before even the -inf fill, so the
+         * original scorer can safely run. Invalid shapes fail explicitly. */
+        myds_v41_gpu_inject_indexer_compact_unavailable(true);
+        CHECK(myds_v41_gpu_indexscores_selected_blocks_bf16(b,q,w,cache,mask,ids,rows,0)==0);
+        CHECK(!memcmp(myds_metal_buffer_data(a),myds_metal_buffer_data(b),score_bytes));
+        myds_v41_gpu_inject_indexer_compact_unavailable(false);
+        CHECK(myds_v41_gpu_indexscores_selected_blocks_bf16(b,q,w,cache,mask,ids,rows,blocks+1u)==-1);
+        CHECK(myds_v41_gpu_indexscores_selected_blocks_bf16(b,q,w,cache,NULL,ids,rows,0)==-1);
+        CHECK(myds_v41_gpu_indexscores_selected_blocks_bf16(q,q,w,cache,mask,ids,rows,0)==-1);
+        const uint8_t *ap=myds_metal_buffer_data(a_owner),*bp=myds_metal_buffer_data(b_owner),*guard=myds_metal_buffer_data(cache_owner);
+        for(size_t i=0;i<16u;i++)CHECK(ap[i]==0xa5&&bp[i]==0xa5&&ap[16u+score_bytes+i]==0xa5&&bp[16u+score_bytes+i]==0xa5);
+        for(size_t i=0;i<6u;i++)CHECK(guard[i]==0xa5);
+        for(size_t i=6u+cache_bytes;i<cache_bytes+32u;i++)CHECK(guard[i]==0xa5);
+        myds_v41_gpu_scratch_free(scratch);
+        myds_metal_buffer_t *bufs[]={cache,a,b,q,w,mask,ids,sel_a,sel_b,cache_owner,a_owner,b_owner};
+        for(size_t i=0;i<sizeof(bufs)/sizeof(*bufs);i++)myds_metal_buffer_free(bufs[i]);
+    }
+    myds_v41_gpu_indexer_compact_counters_t counters;myds_v41_gpu_indexer_compact_counters(&counters,false);
+    CHECK(counters.encoded==24u&&counters.unavailable==8u&&counters.requests==32u);
+    CHECK(counters.scored_row_slots<=counters.dense_rows+8u*24u);
+    myds_metal_set_concurrent(0);myds_metal_set_auto_barrier(1);
+    printf("  [PASS] selected-block scorer original dense scores/top-k IDs exact, finite/-inf ties, 1..128k tails, canaries, concurrent and unavailable PSO\n");return 1;
+}
+
 static int test_attention_bf16(void) {
     struct fixture f;CHECK(fixture_create(&f,129,4096));
     myds_metal_buffer_t *storage=myds_metal_buffer_alloc((size_t)4096*512*2+6);CHECK(storage);
@@ -280,6 +360,6 @@ int main(int argc,char **argv) {
     if(setenv("MYDS_ATTN_GATHER_MIN_KEYS",threshold?"2048":"0",1))return 1;
     if(!myds_metal_init("metal"))return 1;
     int ok=test_compact_resource()&&test_mixed_paths(disabled)&&test_slab_grow_carry()&&test_strategy_threshold(threshold)&&test_window_boundaries()&&
-           test_pack_and_gather()&&test_indexscores_bf16()&&test_attention_bf16()&&test_partial_picks();
+           test_pack_and_gather()&&test_indexscores_bf16()&&test_indexscores_selected_blocks()&&test_attention_bf16()&&test_partial_picks();
     myds_metal_cleanup();if(ok)printf("ALL V4.1 GPU REGRESSIONS PASSED (%s)\n",disabled?"gather disabled":threshold?"explicit threshold":"gather enabled");return ok?0:1;
 }

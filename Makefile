@@ -141,7 +141,7 @@ $(TEST_ATTN_POLICY): $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_metal.o $(BUI
 $(TEST_ATTN_VEC): $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_attention_vec.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
 
-$(TEST_QKV_FUSION): $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_qkv_fusion.o $(METALLIB) | $(BIN_DIR)
+$(TEST_QKV_FUSION): $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_qkv_fusion.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
 
 # Build-only from all; GPU execution occurs only in the explicit test suite.
@@ -155,6 +155,10 @@ $(TEST_DEEPER_SSD): tests/test_deeper_ssd.c tests/test_engine.c tests/test_p1_re
 # Opt-in full-model harness: build only; never run from all/test.
 $(BENCH_PHASE): $(OBJS_C) $(OBJS_M) $(BUILD_DIR)/bench_phase.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
+
+# Metadata/tokenizer-only input audit. No Metal framework, model loader or GPU.
+$(BIN_DIR)/count_chat_tokens: tools/count_chat_tokens.c src/myds_server.c src/myds_gguf.c src/myds_tokenizer.c src/myds_log.c $(wildcard include/*.h) src/myds_tokenizer_unicode.h | $(BIN_DIR)
+	$(CC) $(CFLAGS) $(filter %.c,$^) -Wl,-dead_strip -lpthread -lm -o $@
 
 $(TEST_GGUF): $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/test_gguf.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@
@@ -211,6 +215,13 @@ $(BUILD_DIR)/trace_model.o: tools/trace_model.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 $(BIN_DIR)/trace_model: $(filter-out $(BUILD_DIR)/myds_server.o,$(OBJS_C)) $(OBJS_M) $(BUILD_DIR)/trace_model.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
+
+# Explicit full-model correctness gate; never part of the model-free test suite.
+$(BUILD_DIR)/test_v41_decode_state.o: tools/test_v41_decode_state.c tools/reference/trace_input.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+$(BIN_DIR)/test_v41_decode_state: $(filter-out $(BUILD_DIR)/myds_server.o,$(OBJS_C)) $(OBJS_M) $(BUILD_DIR)/test_v41_decode_state.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
 
 $(BUILD_DIR)/test_engram.o: tests/test_engram.c | $(BUILD_DIR)

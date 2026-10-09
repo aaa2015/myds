@@ -85,9 +85,12 @@ myds/
 
 ## 编译与测试
 
-最新 decode 软件与硬件优化路线见
-[2026-10-08 优化方案](docs/DECODE_OPTIMIZATION_PLAN_2026-10-08.md)，包含当前源码与生产观察、
-MoE 分支并行、DSpark 批量验证、长上下文 indexer 优化及统一验收协议。
+最新 decode 实施状态见 [2026-10-09 实施记录](docs/DECODE_IMPLEMENTATION_2026-10-09.md)，
+包含默认 target 路径、batch2 状态修复、QKV 并发与长上下文 scorer 候选。
+[验证协议](docs/benchmarks/2026-10-09-decode/README.md) 提供真实 DSpark 加载及 A–B–A 命令；
+[Mac Studio 实测](docs/benchmarks/2026-10-09-decode/macstudio/README.md) 记录完整模型状态门禁、
+普通256输出及长上下文对照，包含负收益和失败后修复记录。历史软件与硬件路线见
+[2026-10-08 优化方案](docs/DECODE_OPTIMIZATION_PLAN_2026-10-08.md)。
 
 2026-10-05 的 Mac Studio 独占测试、逐 token 耗时和组件回放证据见
 [本轮实测汇总](docs/benchmarks/2026-10-05-optimization/final-summary.json)。
@@ -262,8 +265,23 @@ compressed KV 与 index cache 保存已完成 BF16 舍入的上 16 位，读取�
 | `MYDS_QKV_FUSE_BF16` | 启用 | decode 的 Q8 QKV 投影把 BF16 舍入合并到 GEMV 写出；设为 `0` 恢复独立舍入 dispatch。trace 使用原路径。 |
 | `MYDS_QKV_FUSE_POST` | 启用 | decode 合并 Q/K RoPE、KV 量化及窗口写入，保留原舍入边界；设为 `0` 恢复原 dispatch。缺融合 PSO、别名或 copy 故障注入时回退原路径。 |
 | `MYDS_QKV_NR0` | `4` | 融合 Q8 GEMV 每组处理四个独立输出行；`2` 使用两个行的配置。归约顺序不变。 |
+| `MYDS_BATCH2_SPEC` | 关闭 | 显式 `1` 请求 greedy、无图片的真实 batch2；剩余输出/context 至少两步，DSpark 主候选仍要求 high-confidence。 |
+| `MYDS_SPEC_SERIAL_PROBE` | 关闭 | 显式 `1` 允许 V4.1 逐 token 验证的 DSpark/PLD 对照；默认未启用 batch2 时跳过这类草稿与快照工作。 |
+| `MYDS_SPEC_COST_SCHEDULER` | 关闭 | 显式 `1` 按整个周期成本与纯 target 基线比较，三个不划算周期后 backoff 16 个候选周期；每请求重置，需独立 A/B。 |
+| `MYDS_DECODE_METRICS` | 关闭 | 显式 `1` 收集 host 分项时间与原始周期；请求 counters 始终可读。成本调度器也启用累计计时，但不会单独开启原始周期数组。 |
+| `MYDS_QKV_CONCURRENT` | 关闭 | 显式设为 `1` 才在单 token QKV/Indexer 局部图创建 concurrent encoder，按资源同步独立分支；正常退出与失败都恢复进入前的 encoder/auto-barrier 设置。trace 与关闭 QKV pipeline 时保留参考路径。已有 `MYDS_METAL_CONCURRENT=1` 仍有原全局语义。 |
+| `MYDS_INDEXER_COMPACT_SCORER` | 关闭 | 显式设为 `1` 才在单 token decode 的 layer 24/28/32/36、历史行数超过 16384 时，按 layer 20 原 selected block IDs 派发评分。先填充 dense scores 为 `-INFINITY`，有效行写回原 ID；原 filter 与 dense top-k 分区/同分网络保持一致。缺可选 PSO 在写入前回退；开始派发后失败终止。prefill、trace 与批量投机保持参考评分路径。 |
 | `MYDS_MOE_IQ2_TAIL_CULL` | 启用 | prefill MoE IQ2 up/gate 的尾 tile 跳过没有有效 token 的半 tile。`0` 恢复原 kernel；默认缺新 PSO 时回退原 kernel，显式 `1` 缺 PSO 时初始化失败并清理所有部分状态。 |
 | `MYDS_SSE_DRAIN_TIMEOUT_MS` | `1000` | SSE 完成时的整体排空期限，合法范围 `1..30000` ms；非法值使用默认值。 |
+
+两项 decode 实验均默认关闭。本地 M4 的非零组件检查验证 QKV/HC/Indexer 中间量、
+有效与屏蔽行分数及原 top-k IDs 逐位一致；Mac Studio 普通输入的 QKV A–B–A 未见额外收益，
+完整结果和配置见上述实测报告。
+compact scorer 只减少屏蔽行的空 threadgroup，并增加一次 dense `-INFINITY` 填充；
+它仍扫描原 dense top-k，不能承诺 top-k 加速。采纳前分别测量实际 GPU 重叠及
+长上下文整模型 A–B–A，报告路径计数、fallback、数值/状态回归和 P95/P99；本轮128k仍未测量。
+`myds_v41_gpu_indexer_compact_counters()` 提供请求、实际派发、缺 PSO 回退、dense 行数及
+实际派发行槽数，避免把请求开关当作已执行路径。
 
 生产 SSE 输出使用每请求独立的 FIFO writer。队列上限为 1 MiB，包含包头和正在发送的包；
 入队不等待客户端 socket 或空闲队列容量。积压超限或断连会取消该请求，socket 在 writer
@@ -315,10 +333,10 @@ python3 tools/bench_reproduce.py verify
 
 | 测试入口 | 主要断言 |
 | --- | --- |
-| `bin/test_v41_gpu`、`--slab`、`--threshold` | gather/slab 选择、阈值、lazy 工作区、BF16 缓存、同一 batch 内路径切换；三种配置均在 `make test` 中执行。 |
+| `bin/test_v41_gpu`、`--slab`、`--threshold` | gather/slab 选择、阈值、lazy 工作区、BF16 缓存、同一 batch 内路径切换；compact scorer 在 1..128k 行比较 dense scores/原 top-k IDs，覆盖全允许/屏蔽、有限及 `-INFINITY` 同分、尾块、反序 block IDs、子视图 canary、concurrent 依赖和缺 PSO 未写入回退；三种配置均在 `make test` 中执行。 |
 | `bin/test_attention_policy` | matrix/auto/vec 策略、缺 PSO 和共享内存失败回退、恢复后的重试。 |
 | `bin/test_attention_vec` | 非零 F32/BF16 逐位对照、短块和 carry、子视图 canary、head-first 成功与缺 PSO 回退及对应路径计数。 |
-| `MYDS_QKV_NR0=4 bin/test_qkv_fusion`、`MYDS_QKV_NR0=2 bin/test_qkv_fusion` | 两种独立行配置、BF16 舍入边界、RoPE/量化/窗口写入、奇数输出行、别名与 copy 失败回退；均在 `make test` 中执行。 |
+| `MYDS_QKV_NR0=4 bin/test_qkv_fusion`、`MYDS_QKV_NR0=2 bin/test_qkv_fusion` | 两种独立行配置、BF16 舍入边界、RoPE/量化/窗口写入、奇数输出行、别名与 copy 失败回退；局部 concurrent scope 比较实际投影形状的 QKV/HC/32-head Indexer，验证 opt-in/trace 门禁及失败后恢复两种设置；均在 `make test` 中执行。 |
 | `make test-tail-init` | 真实缺 tail PSO 和必需 PSO 创建失败后的全状态清理、重复失败、恢复完整库及 lazy 初始化重试。 |
 | `bin/test_engine`、`bin/test_p1` | 生成、前缀恢复与快照边界、缓存失败路径回归。 |
 | `bin/test_server_api`、`tests/test_http_bytes.py` | FIFO SSE 输出、背压/断连取消、排空期限与实际 HTTP 字节协议；由 `make test` 执行。 |

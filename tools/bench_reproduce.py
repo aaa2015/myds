@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import platform
 import signal
+import statistics
 import subprocess
 import sys
 import time
@@ -25,13 +26,73 @@ DEFAULT_ENV = {
     'MYDS_PREFILL_CHUNK_SIZE': '512', 'MYDS_MOE_CHUNKS': '9',
     'MYDS_SUFFIX_SHRINK_SHIFT': '512', 'MYDS_RESIDENCY_KEEP_ALIVE_S': '86400',
 }
+ARM_ENV = {
+    'target': {'MYDS_PLD': '0', 'MYDS_BATCH2_SPEC': '0', 'MYDS_SPEC_SERIAL_PROBE': '0'},
+    'pld': {'MYDS_PLD': '1', 'MYDS_BATCH2_SPEC': '0', 'MYDS_SPEC_SERIAL_PROBE': '1'},
+    'pld-batch2': {'MYDS_PLD': '1', 'MYDS_BATCH2_SPEC': '1', 'MYDS_SPEC_SERIAL_PROBE': '0'},
+    'dspark': {'MYDS_PLD': '0', 'MYDS_BATCH2_SPEC': '0', 'MYDS_SPEC_SERIAL_PROBE': '1'},
+    'batch2': {'MYDS_PLD': '0', 'MYDS_BATCH2_SPEC': '1', 'MYDS_SPEC_SERIAL_PROBE': '0'},
+    'hybrid': {'MYDS_PLD': '1', 'MYDS_BATCH2_SPEC': '1', 'MYDS_SPEC_SERIAL_PROBE': '0'},
+}
+DSPARK_ARMS = {'dspark', 'batch2', 'hybrid'}
+OUTPUT_CAPS = (32, 64, 256, 512)
+DECODE_COUNTERS = ('target_forward_calls', 'target_rows', 'batch2_calls', 'batch2_hits',
+                  'batch2_misses', 'batch2_failures', 'batch2_fallbacks', 'draft_cycles',
+                  'draft_proposed', 'draft_accepted', 'draft_rejects', 'confidence_rejects',
+                  'margin_rejects', 'backoff_steps', 'pld_queries', 'pld_cycles',
+                  'pld_proposed', 'pld_accepted', 'output_tokens', 'cycle_count')
+DECODE_TIMERS = ('draft_ms', 'verify_ms', 'rollback_ms', 'snapshot_ms', 'pld_ms')
+INDEXER_COMPACT_COUNTERS = ('requests', 'encoded', 'unavailable', 'dense_rows', 'scored_row_slots')
+FORBIDDEN_ENV_PREFIXES = ('MYDS_PROFILE_', 'MYDS_SKIP_', 'MYDS_TRACE_', 'MYDS_BATCH_TRACE_')
+FORBIDDEN_ENV_NAMES = {'MYDS_MOE_STEP_PROF', 'MYDS_PHASE_PROFILE_FILE', 'MYDS_DISABLE_V41_PREFILL',
+                       'MYDS_PROF', 'MYDS_DISPATCH_HIST', 'MYDS_DEBUG_DISPATCH'}
 GPU_PROCESSES = {'myds', 'llama-server', 'bench_phase', 'bench_qkv',
                  'bench_attention_group', 'bench_attention_vec',
                  'bench_decode_iq2', 'moe_prefill_replay'}
 
 
 def sha(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def file_identity(path, supplied_digest=None):
+    identity = {'path': str(path), 'bytes': path.stat().st_size,
+                'mtime_ns': path.stat().st_mtime_ns,
+                'identity_note': 'File metadata only; the complete GGUF was not SHA-hashed'}
+    if supplied_digest is not None:
+        if len(supplied_digest) != 64 or any(c not in '0123456789abcdef' for c in supplied_digest):
+            raise ValueError('Model SHA256 must contain exactly 64 lowercase hexadecimal characters')
+        identity.update(artifact_sha256=supplied_digest,
+                        identity_note='Caller-supplied artifact SHA256; runner did not rehash model bytes')
+    return identity
+
+
+def source_state():
+    """Bind the checkout and dirty changes without printing source or secrets."""
+    head = subprocess.run(['git', '-C', str(ROOT), 'rev-parse', 'HEAD'],
+                          capture_output=True, timeout=15)
+    diff = subprocess.run(['git', '-C', str(ROOT), 'diff', '--binary', 'HEAD', '--', '.'],
+                          capture_output=True, timeout=15)
+    status = subprocess.run(['git', '-C', str(ROOT), 'status', '--porcelain=v1', '-z', '--untracked-files=all'],
+                            capture_output=True, timeout=15)
+    if head.returncode or diff.returncode or status.returncode:
+        raise RuntimeError('Could not bind benchmark source checkout identity')
+    # Untracked file contents are bound too; paths are NUL-delimited, preserving spaces.
+    untracked = {}
+    for entry in status.stdout.split(b'\0'):
+        if entry.startswith(b'?? '):
+            relative = os.fsdecode(entry[3:])
+            path = ROOT / relative
+            if path.is_file():
+                untracked[relative] = sha(path)
+    return {'head': head.stdout.decode().strip(), 'dirty': bool(status.stdout),
+            'diff_sha256': hashlib.sha256(diff.stdout).hexdigest(),
+            'status_sha256': hashlib.sha256(status.stdout).hexdigest(),
+            'untracked_sha256': untracked}
 
 
 def fnv_bytes(data):
@@ -43,6 +104,14 @@ def fnv_bytes(data):
 
 def write_json(path, value):
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + '\n')
+
+
+def require_uninstrumented_environment(environment):
+    # Several native diagnostics test getenv presence: string "0" and the empty
+    # string still enable them. Apply this gate to requested and actual metadata.
+    for name, value in environment.items():
+        if value is not None and (name.startswith(FORBIDDEN_ENV_PREFIXES) or name in FORBIDDEN_ENV_NAMES):
+            raise ValueError('Profiling/path-skipping setting is incompatible with this run: ' + name)
 
 
 def verify(args):
@@ -123,6 +192,8 @@ def load_audit():
 def validate_run(directory, state, audit):
     group, samples = audit.validate_group(directory, 'run', {'environment': state['environment']})
     metadata = group['metadata']
+    require_uninstrumented_environment(metadata['environment'])
+    audit.require(metadata.get('protocol_version', 1) in (1, 2), 'Unsupported benchmark protocol version')
     fixed = {'temperature': 0, 'top_p': 1, 'top_k': 0, 'min_p': 0,
              'repetition_penalty': 1, 'seed': 42, 'repeats': 3, 'warmup_runs': 1,
              'clock': 'CLOCK_MONOTONIC', 'prompt_renderer': 'parse_chat_prompt',
@@ -130,16 +201,118 @@ def validate_run(directory, state, audit):
     for key, expected in fixed.items():
         audit.require(metadata.get(key) == expected, 'Fixed protocol differs: ' + key)
     argv = state['argv']
-    audit.require(isinstance(argv, list) and len(argv) == 6, 'Invalid recorded harness argv')
+    audit.require(isinstance(argv, list) and len(argv) in (6, 7), 'Invalid recorded harness argv')
     expected = {'model': argv[1], 'request_file': argv[2], 'repeats': int(argv[3]),
                 'max_new_tokens': int(argv[4]), 'max_seq_len': int(argv[5]),
                 'request_bytes': state['request_bytes'], 'request_fnv1a64': state['request_fnv1a64']}
     for key, value in expected.items():
         audit.require(metadata.get(key) == value, 'Metrics/input binding differs: ' + key)
     audit.require(state['model']['path'] == metadata['model'], 'Recorded model identity/path differs')
-    audit.require(metadata['max_new_tokens'] in (32, 64) and 0 < metadata['max_seq_len'] <= 0xffffffff,
+    audit.require(metadata['max_new_tokens'] in OUTPUT_CAPS and 0 < metadata['max_seq_len'] <= 0xffffffff,
                   'Recorded output/context range differs')
+    if metadata.get('protocol_version') == 2:
+        support = state.get('dspark_model')
+        support_path = argv[6] if len(argv) == 7 else None
+        audit.require(metadata.get('dspark_model') == support_path, 'DSpark model argv/metadata differs')
+        audit.require((support['path'] if support else None) == support_path, 'DSpark identity/path differs')
+        records = audit.read_records(directory / 'run-metrics.jsonl')
+        loaded = next(record for record in records if record['kind'] == 'load')
+        audit.require(loaded.get('dspark_loaded') is (support_path is not None),
+                      'Requested DSpark support model was not loaded')
+        for key, value in state['environment'].items():
+            audit.require(metadata['environment'].get(key) == value, 'Unrecorded/different environment: ' + key)
+        for sample in samples:
+            logits = sample.get('final_logits')
+            audit.require(isinstance(logits, dict) and logits.get('finite') is True,
+                          'Missing/nonfinite final logits gate')
+            audit.require(logits.get('elements') == loaded['vocab_size'], 'Final logits element count differs')
+            digest = logits.get('fnv1a64_bytes')
+            audit.require(isinstance(digest, str) and len(digest) == 16 and
+                          all(c in '0123456789abcdef' for c in digest), 'Invalid final logits hash')
+            audit.require(logits == samples[0]['final_logits'], 'Final logits differ from warmup')
+            telemetry = sample.get('decode_telemetry')
+            audit.require(isinstance(telemetry, dict), 'Missing per-request decode telemetry')
+            for key in (*DECODE_COUNTERS, 'recorded_cycles'):
+                value = telemetry.get(key)
+                audit.require(isinstance(value, int) and not isinstance(value, bool) and value >= 0,
+                              'Invalid decode telemetry counter: ' + key)
+            audit.require(telemetry['output_tokens'] == sample['output_tokens'], 'Decode telemetry output count differs')
+            audit.require(isinstance(telemetry.get('timing_enabled'), bool), 'Missing timing-enabled marker')
+            if state['environment'].get('MYDS_DECODE_METRICS') == '1':
+                audit.require(telemetry['timing_enabled'], 'Requested decode timing was not enabled')
+            audit.require(telemetry['recorded_cycles'] <= telemetry['cycle_count'], 'Too many recorded cycles')
+            for key in DECODE_TIMERS:
+                if telemetry['timing_enabled']:
+                    audit.numeric(telemetry.get(key), key, positive=False)
+                else:
+                    audit.require(telemetry.get(key) is None, 'Disabled timer must be null: ' + key)
+            for key in ('cycle_ms', 'cycle_output_tokens'):
+                values = telemetry.get(key)
+                audit.require(isinstance(values, list) and len(values) == telemetry['recorded_cycles'],
+                              'Invalid recorded cycle array: ' + key)
+            for duration in telemetry['cycle_ms']:
+                audit.numeric(duration, 'cycle duration', positive=False)
+            for count in telemetry['cycle_output_tokens']:
+                audit.require(isinstance(count, int) and not isinstance(count, bool) and
+                              0 <= count <= sample['output_tokens'],
+                              'Invalid recorded cycle output count')
+            audit.require(sum(telemetry['cycle_output_tokens']) <= telemetry['output_tokens'],
+                          'Cycle outputs exceed total output tokens')
+            audit.require(telemetry['batch2_hits'] + telemetry['batch2_misses'] <= telemetry['batch2_calls'],
+                          'Batch2 result counters exceed calls')
+            audit.require(telemetry['draft_accepted'] <= telemetry['draft_proposed'], 'Draft accepted exceeds proposed')
+            audit.require(telemetry['pld_accepted'] <= telemetry['pld_proposed'], 'PLD accepted exceeds proposed')
+    elif len(argv) == 7 or state.get('dspark_model'):
+        audit.require(False, 'Historical protocol cannot establish DSpark execution')
+    for sample in samples:
+        if 'gpu_indexer_compact' not in sample:
+            continue  # Earlier harnesses did not expose this path counter API.
+        compact = sample['gpu_indexer_compact']
+        audit.require(isinstance(compact, dict), 'Invalid compact indexer path counters')
+        for key in INDEXER_COMPACT_COUNTERS:
+            value = compact.get(key)
+            audit.require(isinstance(value, int) and not isinstance(value, bool) and value >= 0,
+                          'Invalid compact indexer counter: ' + key)
+        audit.require(compact['encoded'] + compact['unavailable'] <= compact['requests'],
+                      'Compact indexer results exceed requests')
+    group['callback_latency_ms'] = distribution(
+        [value for sample in samples if not sample['warmup'] for value in sample['callback_intervals_ms']])
+    group['decode_telemetry'] = telemetry_summary(
+        samples, state['environment'].get('MYDS_DECODE_METRICS') == '1')
+    group['gpu_indexer_compact'] = indexer_compact_paths(samples)
     return group, samples
+
+
+def distribution(values):
+    ordered = sorted(values)
+    if not ordered:
+        return None
+    return {'count': len(ordered), 'median': statistics.median(ordered),
+            'p95': ordered[max(0, math.ceil(.95 * len(ordered)) - 1)],
+            'p99': ordered[max(0, math.ceil(.99 * len(ordered)) - 1)],
+            'min': ordered[0], 'max': ordered[-1], 'basis': 'nearest-rank'}
+
+
+def telemetry_summary(samples, cycle_recording_requested=False):
+    records = [{'run': sample['run'], 'warmup': sample['warmup'], **sample['decode_telemetry']}
+               for sample in samples if isinstance(sample.get('decode_telemetry'), dict)]
+    if not records:
+        return None
+    cycle_outputs = [count for record in records if not record['warmup']
+                     for count in record.get('cycle_output_tokens', [])]
+    return {'runs': records, 'scope': 'Per-request engine counters, including first target token',
+            'batch2_executed_in_formal_runs': any(record.get('batch2_calls', 0) > 0
+                                                for record in records if not record['warmup']),
+            'cycle_recording_requested': cycle_recording_requested,
+            'cycles_truncated': cycle_recording_requested and any(
+                record.get('recorded_cycles', 0) < record.get('cycle_count', 0)
+                for record in records if record.get('timing_enabled')),
+            'any_batch2_failure_or_fallback': any(record.get('batch2_failures', 0) or record.get('batch2_fallbacks', 0)
+                                                 for record in records if not record['warmup']),
+            'mean_tokens_per_recorded_cycle': statistics.mean(cycle_outputs) if cycle_outputs else None,
+            'cycle_output_tokens': distribution(cycle_outputs),
+            'cycle_latency_ms': distribution([duration for record in records if not record['warmup']
+                                             for duration in record.get('cycle_ms', [])])}
 
 
 def attention_paths(samples):
@@ -151,6 +324,20 @@ def attention_paths(samples):
     fallbacks = sum(p.get('head_first_failures', 0) + p.get('head_first_cached_fallbacks', 0) +
                     p.get('matrix_fallbacks', 0) for p in paths)
     return {'runs': paths, 'any_fallback': bool(fallbacks)}
+
+
+def indexer_compact_paths(samples):
+    """Host command-encoding evidence, not a GPU timing or performance result."""
+    records = [{'run': sample['run'], 'warmup': sample['warmup'], **sample['gpu_indexer_compact']}
+               for sample in samples if isinstance(sample.get('gpu_indexer_compact'), dict)]
+    if not records:
+        return None
+    formal = [record for record in records if not record['warmup']]
+    return {'runs': records,
+            'encoded_in_formal_runs': any(record['encoded'] > 0 for record in formal),
+            'any_unavailable_in_formal_runs': any(record['unavailable'] > 0 for record in formal),
+            'formal_totals': {key: sum(record[key] for record in formal) for key in INDEXER_COMPACT_COUNTERS},
+            'scope': 'Per-request host path counters; encoded commands are not GPU duration or throughput proof'}
 
 
 def compare(args):
@@ -171,10 +358,17 @@ def compare(args):
         audit.require(states[0][key] == states[1][key], 'File identity differs: ' + key)
     for key in ('cpu', 'memory_bytes', 'os'):
         audit.require(states[0]['host_before'][key] == states[1]['host_before'][key], 'Host differs: ' + key)
+    audit.require((base['metadata']['environment'].get('MYDS_DECODE_METRICS') or '0') ==
+                  (candidate['metadata']['environment'].get('MYDS_DECODE_METRICS') or '0'),
+                  'Measurement setting differs: MYDS_DECODE_METRICS')
+    output_signature = ('token_ids', 'output_bytes_fnv1a64', 'output_bytes', 'prompt_tokens',
+                        'prefill_tokens', 'output_tokens', 'decode_intervals', 'stop_reason')
     for before, after in zip(*raw):
-        for key in ('token_ids', 'output_bytes_fnv1a64', 'output_bytes', 'prompt_tokens',
-                    'prefill_tokens', 'output_tokens', 'decode_intervals', 'stop_reason'):
+        for key in output_signature:
             audit.require(before[key] == after[key], f'Output/count differs in run {before["run"]}: {key}')
+        if 'final_logits' in before or 'final_logits' in after:
+            audit.require(before.get('final_logits') == after.get('final_logits'),
+                          f'Final logits differ in run {before["run"]}')
     reductions = {}
     for phase in ('prefill', 'decode'):
         before = base['stats'][phase + '_ms_per_token']
@@ -186,8 +380,43 @@ def compare(args):
                'base': base, 'candidate': candidate, 'comparison': reductions,
                'attention_paths': {'base': attention_paths(raw[0]),
                                    'candidate': attention_paths(raw[1])},
+               'gpu_indexer_compact': {'base': base['gpu_indexer_compact'],
+                                       'candidate': candidate['gpu_indexer_compact']},
                'builds': [{'binary_sha256': s['binary_sha256'], 'metallib_sha256': s['metallib_sha256'],
-                           'environment': s['environment']} for s in states]}
+                           'environment': s['environment'], 'source': s.get('source'),
+                           'dspark_model': s.get('dspark_model'), 'arm': s.get('arm', 'custom')}
+                          for s in states],
+               'environment_changes': {name: [states[0]['environment'].get(name), states[1]['environment'].get(name)]
+                   for name in sorted(set(states[0]['environment']) | set(states[1]['environment']))
+                   if states[0]['environment'].get(name) != states[1]['environment'].get(name)}}
+    control_directory = getattr(args, 'control', None)
+    if control_directory is not None:
+        control_directory = control_directory.resolve()
+        audit.require(len({args.base.resolve(), args.candidate.resolve(), control_directory}) == 3,
+                      'A–B–A requires three distinct run directories')
+        control_state = json.loads((control_directory / 'run-state.json').read_text())
+        audit.require(control_state.get('status') == 'validated' and control_state.get('returncode') == 0,
+                      'Incomplete/failed final control')
+        control, control_raw = validate_run(control_directory, control_state, audit)
+        for key in ('binary_sha256', 'metallib_sha256', 'model', 'environment', 'dspark_model', 'source'):
+            audit.require(states[0].get(key) == control_state.get(key), 'Final control identity differs: ' + key)
+        for key in ('cpu', 'memory_bytes', 'os'):
+            audit.require(states[0]['host_before'][key] == control_state['host_before'][key], 'Final control host differs: ' + key)
+        for key in audit.MATCH_META:
+            audit.require(base['metadata'][key] == control['metadata'][key], 'Final control input differs: ' + key)
+        for before, after in zip(raw[0], control_raw):
+            for key in output_signature:
+                audit.require(before[key] == after[key],
+                              f'Final control output/count differs in run {before["run"]}: {key}')
+            if 'final_logits' in before or 'final_logits' in after:
+                audit.require(before.get('final_logits') == after.get('final_logits'),
+                              f'Final control logits differ in run {before["run"]}')
+        summary['final_control'] = control
+        summary['control_drift_percent'] = {
+            phase: 100 * (control['stats'][phase + '_ms_per_token']['median'] /
+                          base['stats'][phase + '_ms_per_token']['median'] - 1)
+            for phase in ('prefill', 'decode')}
+        summary['scope'] = 'A–B–A separate processes; one warmup and three formal samples per arm; direct callback timing'
     output = args.out.resolve()
     if output.exists():
         raise ValueError('Comparison output already exists: ' + str(output))
@@ -217,40 +446,53 @@ def run(args):
     if platform.system() != 'Darwin':
         raise ValueError('The model runner requires macOS/Metal; verify works without a GPU')
     binary, model, request = (p.expanduser().resolve() for p in (args.binary, args.model, args.request))
-    for path in (binary, model, request, binary.parent / 'myds.metallib'):
+    dspark_arg = getattr(args, 'dspark_model', None)
+    support = dspark_arg.expanduser().resolve() if dspark_arg is not None else None
+    arm = getattr(args, 'arm', 'custom')
+    if arm in DSPARK_ARMS and support is None:
+        raise ValueError('--dspark-model is required for the ' + arm + ' arm')
+    if arm in ('target', 'pld', 'pld-batch2') and support is not None:
+        raise ValueError('--dspark-model is incompatible with the ' + arm + ' arm')
+    if support is None and getattr(args, 'dspark_sha256', None) is not None:
+        raise ValueError('--dspark-sha256 requires --dspark-model')
+    for path in (binary, model, request, binary.parent / 'myds.metallib', *([support] if support else [])):
         if not path.is_file():
             raise ValueError('Missing input: ' + str(path))
     if not os.access(binary, os.X_OK):
         raise ValueError('Harness is not executable: ' + str(binary))
     explicit_env = dict(DEFAULT_ENV)
+    if arm != 'custom':
+        explicit_env.update(MYDS_DECODE_SPLIT='4', MYDS_DECODE_METRICS='1', MYDS_SPEC_COST_SCHEDULER='0')
+    explicit_env.update(ARM_ENV.get(arm, {}))
     for setting in args.env:
         name, separator, value = setting.partition('=')
         if not separator or not name.startswith('MYDS_'):
             raise ValueError('--env requires MYDS_NAME=value')
         explicit_env[name] = value
+    for name, value in ARM_ENV.get(arm, {}).items():
+        if explicit_env[name] != value:
+            raise ValueError(f'{name}={explicit_env[name]} conflicts with named arm {arm}; use --arm custom')
     for name in ('MYDS_PREFIX_CACHE', 'MYDS_KV_DSK', 'MYDS_PHASE_PROFILE'):
         if explicit_env[name] != '0':
             raise ValueError(name + '=0 is required for this full-prefill protocol')
-    forbidden = ('MYDS_PROFILE_', 'MYDS_SKIP_', 'MYDS_TRACE_', 'MYDS_BATCH_TRACE_')
-    for name in explicit_env:
-        if name.startswith(forbidden) or name in ('MYDS_MOE_STEP_PROF', 'MYDS_PHASE_PROFILE_FILE',
-                                                 'MYDS_DISABLE_V41_PREFILL'):
-            raise ValueError('Profiling/path-skipping setting is incompatible with this run: ' + name)
+    require_uninstrumented_environment(explicit_env)
     check_idle(args.server_port)
     output = args.out.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=False)
     environment = {k: v for k, v in os.environ.items() if not k.startswith('MYDS_')}
     environment.update(explicit_env)
     argv = [str(binary), str(model), str(request), '3', str(args.max_new_tokens), str(args.context)]
+    if support is not None:
+        argv.append(str(support))
     request_data = request.read_bytes()
     state = {'argv': argv, 'cwd': str(binary.parent.parent), 'environment': explicit_env,
              'utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
              'binary_sha256': sha(binary), 'metallib_sha256': sha(binary.parent / 'myds.metallib'),
              'request_sha256': hashlib.sha256(request_data).hexdigest(),
              'request_bytes': len(request_data), 'request_fnv1a64': fnv_bytes(request_data),
-             'model': {'path': str(model),
-             'bytes': model.stat().st_size, 'mtime_ns': model.stat().st_mtime_ns,
-             'identity_note': 'File metadata only; the complete GGUF was not SHA-hashed'},
+             'model': file_identity(model, getattr(args, 'model_sha256', None)),
+             'dspark_model': file_identity(support, getattr(args, 'dspark_sha256', None)) if support else None,
+             'arm': arm, 'source': source_state(),
              'host_before': host_state(), 'status': 'started'}
     write_json(output / 'run-state.json', state)
     child = None
@@ -305,14 +547,20 @@ def main():
     comparison = commands.add_parser('compare', help='Audit raw base/candidate samples and compare medians; no GPU')
     comparison.add_argument('--base', type=Path, required=True)
     comparison.add_argument('--candidate', type=Path, required=True)
+    comparison.add_argument('--control', type=Path, help='Final A arm, identical to --base, for A–B–A drift')
     comparison.add_argument('--out', type=Path, required=True)
     measurement = commands.add_parser('run', help='Run one model configuration; requires an already idle machine')
     measurement.add_argument('--binary', type=Path, default=ROOT / 'bin/bench_phase')
     measurement.add_argument('--model', type=Path, required=True)
+    measurement.add_argument('--model-sha256', help='Caller-supplied immutable target artifact digest; not rehashed by runner')
+    measurement.add_argument('--dspark-model', type=Path, help='Support GGUF; load failure is fatal')
+    measurement.add_argument('--dspark-sha256', help='Caller-supplied immutable support artifact digest; not rehashed by runner')
+    measurement.add_argument('--arm', choices=('target', 'pld', 'pld-batch2', 'dspark', 'batch2', 'hybrid', 'custom'),
+                             default='target', help='Explicit path settings; custom permits arbitrary --env overrides')
     measurement.add_argument('--request', type=Path, required=True)
     measurement.add_argument('--out', type=Path, required=True, help='New output directory; existing directories are refused')
     measurement.add_argument('--env', action='append', default=[], help='Explicit MYDS_NAME=value, repeatable')
-    measurement.add_argument('--max-new-tokens', type=int, choices=(32, 64), default=64)
+    measurement.add_argument('--max-new-tokens', type=int, choices=OUTPUT_CAPS, default=64)
     measurement.add_argument('--context', type=int, default=262144)
     measurement.add_argument('--timeout', type=float, default=900)
     measurement.add_argument('--server-port', type=int, default=8181)

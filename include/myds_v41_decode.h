@@ -18,4 +18,15 @@ int myds_v41_decode_gemv_bf16(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *weight, const myds_metal_buffer_t *input,
     uint32_t rows, uint32_t width, ggml_type type, bool trace_on);
 
+/* Experimental, local QKV/Indexer encoder scope. MYDS_QKV_CONCURRENT=1
+ * explicitly opts in; the default and trace path keep the caller's mode.
+ * End must run on success and failure, before draining/freeing GPU work.
+ * It closes the dependency region and restores both caller settings. */
+typedef struct {
+    int auto_barrier, concurrent;
+    bool active;
+} myds_v41_decode_qkv_scope_t;
+void myds_v41_decode_qkv_scope_begin(myds_v41_decode_qkv_scope_t *scope, bool trace_on);
+void myds_v41_decode_qkv_scope_end(myds_v41_decode_qkv_scope_t *scope);
+
 #endif

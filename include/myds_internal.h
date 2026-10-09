@@ -136,6 +136,20 @@ struct myds_context {
     uint32_t             last_prefill_tokens;
     double               last_prefill_seconds;
 
+    myds_decode_stats_t   decode_stats;
+    bool                 decode_metrics_active;
+    myds_decode_cycle_t  *decode_cycles;
+    uint32_t             decode_cycle_capacity;
+    bool                 decode_cycle_open;
+    double               decode_cycle_start_ms;
+    uint64_t             decode_cycle_output_start;
+    bool                 decode_cycle_speculative;
+    bool                 decode_pld_candidate; /* Candidate A came from prompt lookup. */
+    bool                 decode_cost_scheduler;
+    double               decode_target_ms;
+    uint32_t             decode_costly_cycles;
+    uint32_t             decode_cost_backoff;
+
     /* Metal activation buffers */
     myds_metal_buffer_t *x;
     myds_metal_buffer_t *x_norm;

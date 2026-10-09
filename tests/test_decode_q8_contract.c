@@ -54,6 +54,26 @@ int myds_metal_get_auto_barrier(void) {
 void myds_metal_barrier_buffer(const myds_metal_buffer_t *b) {
     (void)b;
 }
+/* The linked source also defines the independent QKV encoder scope, which has
+ * real Metal coverage in test_qkv_fusion. Its linker stubs fail if this Q8
+ * contract unexpectedly starts changing encoder state; they cannot hide such
+ * a change behind successful no-op implementations. */
+static _Noreturn void unexpected_scope_call(const char *name) {
+    fprintf(stderr,"FAIL Q8 wrapper unexpectedly called %s\n",name);
+    abort();
+}
+int myds_metal_get_concurrent(void) {
+    unexpected_scope_call("myds_metal_get_concurrent");
+}
+void myds_metal_set_concurrent(int enable) {
+    (void)enable;unexpected_scope_call("myds_metal_set_concurrent");
+}
+void myds_metal_set_auto_barrier(int enable) {
+    (void)enable;unexpected_scope_call("myds_metal_set_auto_barrier");
+}
+void myds_metal_barrier(void) {
+    unexpected_scope_call("myds_metal_barrier");
+}
 static int invoke_args(myds_metal_buffer_t *a, const myds_metal_buffer_t *b,
     const myds_metal_buffer_t *c, uint32_t rows, uint32_t width, ggml_type type, bool trace_on) {
     memset(calls,0,sizeof(calls)); call_count = 0; forwarded_ok = 1;

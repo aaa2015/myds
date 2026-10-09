@@ -134,6 +134,36 @@ class BenchReproduceTests(unittest.TestCase):
                                      env=[], server_port=8181, out=self.directory / 'run',
                                      max_new_tokens=64, context=262144, timeout=3)
 
+    def v2_records(self, count=64, environment=None, support=None):
+        """Synthetic telemetry around saved timings; no model/performance claim."""
+        records = self.bound_records(environment=environment)
+        records[0].update(protocol_version=2, max_new_tokens=count,
+                          dspark_model=str(support.resolve()) if support else None)
+        loaded = next(record for record in records if record['kind'] == 'load')
+        loaded.update(dspark_loaded=support is not None, dspark_load_s=0.01 if support else 0)
+        for sample in records:
+            if sample['kind'] != 'sample':
+                continue
+            original = sample['callback_intervals_ms']
+            sample['token_ids'] = [sample['token_ids'][index % len(sample['token_ids'])] for index in range(count)]
+            sample['token_ids_fnv1a64'] = self.driver.load_audit().token_hash(sample['token_ids'])
+            sample['callback_intervals_ms'] = [original[index % len(original)] for index in range(count - 1)]
+            sample.update(output_tokens=count, decode_intervals=count - 1,
+                          decode_s=sum(sample['callback_intervals_ms']) / 1000)
+            sample['decode_ms_per_token'] = 1000 * sample['decode_s'] / (count - 1)
+            sample['last_callback_s'] = sample['first_callback_s'] + sample['decode_s']
+            sample['wall_s'] = sample['last_callback_s'] + .001
+            sample['final_logits'] = {'finite': True, 'elements': loaded['vocab_size'],
+                                      'fnv1a64_bytes': '1234567890abcdef'}
+            telemetry = {key: 0 for key in self.driver.DECODE_COUNTERS}
+            telemetry.update(target_forward_calls=count, target_rows=count, output_tokens=count,
+                             cycle_count=count, recorded_cycles=count, timing_enabled=True,
+                             cycle_ms=[1.] * count, cycle_output_tokens=[1] * count)
+            telemetry.update({key: 0. for key in self.driver.DECODE_TIMERS})
+            sample['decode_telemetry'] = telemetry
+            sample['gpu_indexer_compact'] = {key: 0 for key in self.driver.INDEXER_COMPACT_COUNTERS}
+        return records
+
     def invoke_cpu_runner(self, args, records, host_side_effect=None, captured_stdout=None):
         """All process/host operations are mocked; only files and Python audit run."""
         stdout = captured_stdout if captured_stdout is not None else io.StringIO()
@@ -143,6 +173,7 @@ class BenchReproduceTests(unittest.TestCase):
                        else {'return_value': copy.deepcopy(HOST)})
         patches = (mock.patch.object(self.driver.platform, 'system', return_value='Darwin'),
                    mock.patch.object(self.driver, 'check_idle'),
+                   mock.patch.object(self.driver, 'source_state', return_value={'head': 'CPU fixture', 'dirty': False}),
                    mock.patch.object(self.driver, 'host_state', **host_kwargs),
                    mock.patch.object(self.driver.subprocess, 'Popen', constructor))
         with contextlib.ExitStack() as stack:
@@ -166,6 +197,347 @@ class BenchReproduceTests(unittest.TestCase):
                     self.assertEqual(group['formal_runs'], 3)
                     self.assertTrue(group['warm_formal_raw_tokens_and_byte_hash_equal'])
 
+    def test_v2_all_output_caps_keep_raw_tokens_and_periods(self):
+        for count in (32, 64, 256, 512):
+            with self.subTest(count=count):
+                args = self.run_args()
+                args.max_new_tokens = count
+                args.out = self.directory / f'cap-{count}'
+                records = self.v2_records(count, self.driver.DEFAULT_ENV)
+                result, _, _ = self.invoke_cpu_runner(args, records)
+                self.assertEqual(result, 0)
+                summary = json.loads((args.out / 'run-summary.json').read_text())
+                self.assertEqual(summary['output_tokens'], count)
+                self.assertEqual(summary['callback_latency_ms']['count'], 3 * (count - 1))
+                self.assertEqual(summary['decode_telemetry']['cycle_latency_ms']['count'], 3 * count)
+
+    def test_v2_batched_callbacks_allow_zero_gaps_and_reject_negative_gaps(self):
+        records = self.v2_records(environment=self.driver.DEFAULT_ENV)
+        for sample in records:
+            if sample['kind'] != 'sample':
+                continue
+            # First token, 31 two-token batches, then the final token. Each
+            # batch has one real target interval and a same-tick emit gap.
+            sample['callback_intervals_ms'] = [value for _ in range(31) for value in (5., 0.)] + [5.]
+            sample['decode_s'] = sum(sample['callback_intervals_ms']) / 1000
+            sample['decode_ms_per_token'] = 1000 * sample['decode_s'] / sample['decode_intervals']
+            sample['last_callback_s'] = sample['first_callback_s'] + sample['decode_s']
+            sample['wall_s'] = sample['last_callback_s'] + .001
+            sample['decode_telemetry'].update(
+                target_forward_calls=33, target_rows=64, batch2_calls=31, batch2_hits=31,
+                pld_proposed=31, pld_accepted=31, cycle_count=33, recorded_cycles=33,
+                cycle_ms=[5.] * 33, cycle_output_tokens=[1] + [2] * 31 + [1])
+        args = self.run_args()
+        result, _, _ = self.invoke_cpu_runner(args, records)
+        self.assertEqual(result, 0)
+        summary = json.loads((args.out / 'run-summary.json').read_text())
+        self.assertEqual(summary['callback_latency_ms']['count'], 3 * 63)
+        self.assertEqual(summary['callback_latency_ms']['min'], 0.)
+        self.assertGreater(summary['stats']['decode_ms_per_token']['median'], 0.)
+        self.assertGreater(summary['decode_telemetry']['cycle_latency_ms']['min'], 0.)
+
+        negative = copy.deepcopy(records)
+        negative[2]['callback_intervals_ms'][1] = -.001
+        args.out = self.directory / 'negative-callback-gap'
+        with self.assertRaisesRegex(ValueError, r'Invalid sign: run.run0.callback_interval'):
+            self.invoke_cpu_runner(args, negative)
+        self.assertEqual(json.loads((args.out / 'run-state.json').read_text())['status'], 'failed')
+
+        zero_total = copy.deepcopy(records)
+        zero_total[2].update(callback_intervals_ms=[0.] * 63, decode_s=0.,
+                             decode_ms_per_token=0., last_callback_s=zero_total[2]['first_callback_s'])
+        args.out = self.directory / 'zero-total-decode'
+        with self.assertRaisesRegex(ValueError, r'Invalid sign: run.run0.decode_s'):
+            self.invoke_cpu_runner(args, zero_total)
+
+        # Preserve the original schema 1 audit rather than changing saved
+        # single-token timing evidence to use the new batch emit semantics.
+        legacy = copy.deepcopy(records)
+        legacy[0]['protocol_version'] = 1
+        args.out = self.directory / 'legacy-zero-callback-gap'
+        with self.assertRaisesRegex(ValueError, r'Invalid sign: run.run0.callback_interval'):
+            self.invoke_cpu_runner(args, legacy)
+
+    def test_named_batch2_arm_binds_support_and_records_execution(self):
+        args = self.run_args()
+        args.arm = 'batch2'
+        args.dspark_model = self.directory / 'support-identity-only.gguf'
+        args.dspark_model.write_bytes(b'CPU fixture, never loaded')
+        args.dspark_sha256 = 'a' * 64
+        environment = dict(self.driver.DEFAULT_ENV, MYDS_DECODE_SPLIT='4', MYDS_DECODE_METRICS='1',
+                           MYDS_SPEC_COST_SCHEDULER='0', **self.driver.ARM_ENV['batch2'])
+        records = self.v2_records(environment=environment, support=args.dspark_model)
+        for sample in records:
+            if sample['kind'] == 'sample':
+                sample['decode_telemetry'].update(batch2_calls=5, batch2_hits=2, batch2_misses=3)
+        result, constructor, _ = self.invoke_cpu_runner(args, records)
+        self.assertEqual(result, 0)
+        self.assertEqual(constructor.call_args.args[0][-1], str(args.dspark_model.resolve()))
+        state = json.loads((args.out / 'run-state.json').read_text())
+        self.assertEqual(state['dspark_model']['artifact_sha256'], 'a' * 64)
+        self.assertIn('did not rehash', state['dspark_model']['identity_note'])
+        summary = json.loads((args.out / 'run-summary.json').read_text())
+        self.assertTrue(summary['decode_telemetry']['batch2_executed_in_formal_runs'])
+
+    def test_named_arm_rejects_missing_support_or_conflicting_flags(self):
+        for arm, env in (('batch2', []), ('target', ['MYDS_PLD=1'])):
+            with self.subTest(arm=arm):
+                args = self.run_args()
+                args.arm, args.env = arm, env
+                with mock.patch.object(self.driver.platform, 'system', return_value='Darwin'), \
+                        mock.patch.object(self.driver.subprocess, 'Popen') as execute:
+                    with self.assertRaises(ValueError):
+                        self.driver.run(args)
+                    execute.assert_not_called()
+                self.assertFalse(args.out.exists())
+
+    def test_named_pld_arm_really_enables_serial_probe(self):
+        args = self.run_args()
+        args.arm = 'pld'
+        environment = dict(self.driver.DEFAULT_ENV, MYDS_DECODE_SPLIT='4', MYDS_DECODE_METRICS='1',
+                           MYDS_SPEC_COST_SCHEDULER='0', **self.driver.ARM_ENV['pld'])
+        records = self.v2_records(environment=environment)
+        result, constructor, _ = self.invoke_cpu_runner(args, records)
+        self.assertEqual(result, 0)
+        self.assertEqual(constructor.call_args.kwargs['env']['MYDS_SPEC_SERIAL_PROBE'], '1')
+
+    def test_named_pld_batch2_arm_needs_no_support_and_records_batch_execution(self):
+        args = self.run_args()
+        args.arm = 'pld-batch2'
+        environment = dict(self.driver.DEFAULT_ENV, MYDS_DECODE_SPLIT='4', MYDS_DECODE_METRICS='1',
+                           MYDS_SPEC_COST_SCHEDULER='0', **self.driver.ARM_ENV['pld-batch2'])
+        records = self.v2_records(environment=environment)
+        for sample in records:
+            if sample['kind'] == 'sample':
+                sample['decode_telemetry'].update(pld_queries=10, pld_cycles=4, pld_proposed=4,
+                                                  pld_accepted=2, batch2_calls=4, batch2_hits=2, batch2_misses=2)
+        result, constructor, _ = self.invoke_cpu_runner(args, records)
+        self.assertEqual(result, 0)
+        self.assertEqual(len(constructor.call_args.args[0]), 6)
+        self.assertEqual(constructor.call_args.kwargs['env']['MYDS_BATCH2_SPEC'], '1')
+        self.assertEqual(constructor.call_args.kwargs['env']['MYDS_SPEC_SERIAL_PROBE'], '0')
+        summary = json.loads((args.out / 'run-summary.json').read_text())
+        self.assertTrue(summary['decode_telemetry']['batch2_executed_in_formal_runs'])
+        state = json.loads((args.out / 'run-state.json').read_text())
+        self.assertIsNone(state['dspark_model'])
+
+    def test_v2_rejects_missing_logits_telemetry_or_support_fallback(self):
+        mutations = {
+            'nonfinite': lambda sample: sample['final_logits'].update(finite=False),
+            'changed_logits': lambda sample: sample['final_logits'].update(fnv1a64_bytes='0' * 16),
+            'missing_telemetry': lambda sample: sample.pop('decode_telemetry'),
+            'bad_count': lambda sample: sample['decode_telemetry'].update(output_tokens=999),
+            'bad_cycle': lambda sample: sample['decode_telemetry']['cycle_ms'].__setitem__(0, float('nan')),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                args = self.run_args()
+                args.out = self.directory / name
+                records = self.v2_records(environment=self.driver.DEFAULT_ENV)
+                mutate(records[3])
+                with self.assertRaises(ValueError):
+                    self.invoke_cpu_runner(args, records)
+                self.assertEqual(json.loads((args.out / 'run-state.json').read_text())['status'], 'failed')
+
+        args = self.run_args()
+        args.dspark_model = self.directory / 'support.gguf'
+        args.dspark_model.write_bytes(b'CPU support identity only')
+        args.out = self.directory / 'fallback'
+        records = self.v2_records(environment=self.driver.DEFAULT_ENV, support=args.dspark_model)
+        records[1]['dspark_loaded'] = False
+        with self.assertRaisesRegex(ValueError, 'was not loaded'):
+            self.invoke_cpu_runner(args, records)
+
+    def test_v2_disabled_timing_is_null_without_false_zero_measurement(self):
+        args = self.run_args()
+        records = self.v2_records(environment=self.driver.DEFAULT_ENV)
+        for sample in records:
+            if sample['kind'] == 'sample':
+                sample['decode_telemetry'].update(timing_enabled=False, recorded_cycles=0,
+                                                  cycle_ms=[], cycle_output_tokens=[])
+                sample['decode_telemetry'].update({key: None for key in self.driver.DECODE_TIMERS})
+        result, _, _ = self.invoke_cpu_runner(args, records)
+        self.assertEqual(result, 0)
+        summary = json.loads((args.out / 'run-summary.json').read_text())
+        self.assertIsNone(summary['decode_telemetry']['cycle_latency_ms'])
+
+    def test_cost_scheduler_without_cycle_recording_reports_null_not_truncation(self):
+        args = self.run_args()
+        args.env = ['MYDS_DECODE_METRICS=0', 'MYDS_SPEC_COST_SCHEDULER=1']
+        environment = dict(self.driver.DEFAULT_ENV, MYDS_DECODE_METRICS='0', MYDS_SPEC_COST_SCHEDULER='1')
+        records = self.v2_records(environment=environment)
+        for sample in records:
+            if sample['kind'] == 'sample':
+                sample['decode_telemetry'].update(recorded_cycles=0, cycle_ms=[], cycle_output_tokens=[])
+        result, _, _ = self.invoke_cpu_runner(args, records)
+        self.assertEqual(result, 0)
+        summary = json.loads((args.out / 'run-summary.json').read_text())['decode_telemetry']
+        self.assertIsNone(summary['cycle_latency_ms'])
+        self.assertIsNone(summary['mean_tokens_per_recorded_cycle'])
+        self.assertFalse(summary['cycle_recording_requested'])
+        self.assertFalse(summary['cycles_truncated'])
+
+    def test_requested_cycle_recording_with_zero_records_marks_missing_data(self):
+        args = self.run_args()
+        args.env = ['MYDS_DECODE_METRICS=1']
+        environment = dict(self.driver.DEFAULT_ENV, MYDS_DECODE_METRICS='1')
+        records = self.v2_records(environment=environment)
+        for sample in records:
+            if sample['kind'] == 'sample':
+                sample['decode_telemetry'].update(recorded_cycles=0, cycle_ms=[], cycle_output_tokens=[])
+        result, _, _ = self.invoke_cpu_runner(args, records)
+        self.assertEqual(result, 0)
+        summary = json.loads((args.out / 'run-summary.json').read_text())['decode_telemetry']
+        self.assertIsNone(summary['cycle_latency_ms'])
+        self.assertTrue(summary['cycle_recording_requested'])
+        self.assertTrue(summary['cycles_truncated'])
+
+    def test_compact_indexer_summary_requires_formal_encoding_not_warmup_or_env(self):
+        # Counter records are synthetic CPU schema fixtures, never GPU execution.
+        encoded = {'requests': 4, 'encoded': 4, 'unavailable': 0,
+                   'dense_rows': 65536, 'scored_row_slots': 8192}
+        unavailable = {'requests': 4, 'encoded': 0, 'unavailable': 4,
+                       'dense_rows': 0, 'scored_row_slots': 0}
+        zero = {key: 0 for key in self.driver.INDEXER_COMPACT_COUNTERS}
+        for name, formal in (('encoded', encoded), ('warmup-only', zero), ('unavailable', unavailable)):
+            with self.subTest(name=name):
+                args = self.run_args()
+                args.out = self.directory / ('compact-' + name)
+                args.env = ['MYDS_INDEXER_COMPACT_SCORER=1']
+                environment = dict(self.driver.DEFAULT_ENV, MYDS_INDEXER_COMPACT_SCORER='1')
+                records = self.v2_records(environment=environment)
+                for sample in records:
+                    if sample['kind'] == 'sample':
+                        sample['gpu_indexer_compact'] = dict(encoded if sample['warmup'] else formal)
+                result, _, _ = self.invoke_cpu_runner(args, records)
+                self.assertEqual(result, 0)
+                summary = json.loads((args.out / 'run-summary.json').read_text())['gpu_indexer_compact']
+                self.assertEqual(summary['encoded_in_formal_runs'], name == 'encoded')
+                self.assertEqual(summary['any_unavailable_in_formal_runs'], name == 'unavailable')
+                self.assertEqual(summary['formal_totals'], {key: 3 * value for key, value in formal.items()})
+                self.assertEqual(summary['runs'][0]['encoded'], encoded['encoded'])
+
+    def test_compact_indexer_audit_rejects_invalid_raw_counters(self):
+        for name, invalid in (('negative', {'requests': -1}), ('bool', {'encoded': True}),
+                              ('results', {'requests': 1, 'encoded': 1, 'unavailable': 1})):
+            with self.subTest(name=name):
+                args = self.run_args()
+                args.out = self.directory / ('bad-compact-' + name)
+                records = self.v2_records(environment=self.driver.DEFAULT_ENV)
+                records[3]['gpu_indexer_compact'].update(invalid)
+                with self.assertRaisesRegex(ValueError, 'compact indexer|Compact indexer'):
+                    self.invoke_cpu_runner(args, records)
+                self.assertEqual(json.loads((args.out / 'run-state.json').read_text())['status'], 'failed')
+
+    def test_a_b_a_control_reports_drift_and_rejects_changed_control(self):
+        args = self.comparison_fixture()
+        args.control = self.directory / 'control'
+        args.control.mkdir()
+        records = [json.loads(line) for line in (args.base / 'run-metrics.jsonl').read_text().splitlines()]
+        write_samples(args.control / 'run-metrics.jsonl', records)
+        state = json.loads((args.base / 'run-state.json').read_text())
+        (args.control / 'run-state.json').write_text(json.dumps(state))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.driver.compare(args), 0)
+        summary = json.loads(args.out.read_text())
+        self.assertEqual(summary['control_drift_percent'], {'prefill': 0., 'decode': 0.})
+        args.out.unlink()
+        state['environment']['MYDS_PLD'] = '1'
+        (args.control / 'run-state.json').write_text(json.dumps(state))
+        with self.assertRaisesRegex(ValueError, 'control identity differs'):
+            self.driver.compare(args)
+        self.assertFalse(args.out.exists())
+
+    def test_a_b_a_control_rejects_valid_but_changed_stop_or_prefill_counts(self):
+        args = self.comparison_fixture()
+        args.control = self.directory / 'control'
+        args.control.mkdir()
+        records = self.v2_records(environment=self.driver.DEFAULT_ENV)
+        state = self.state_for(records)
+        for directory in (args.base, args.candidate, args.control):
+            write_samples(directory / 'run-metrics.jsonl', records)
+            (directory / 'run-state.json').write_text(json.dumps(state))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.driver.compare(args), 0)
+        args.out.unlink()
+        for changed, expected_field in (('stop', 'stop_reason'), ('counts', 'prompt_tokens')):
+            with self.subTest(changed=changed):
+                control = copy.deepcopy(records)
+                for sample in control:
+                    if sample['kind'] != 'sample':
+                        continue
+                    if changed == 'stop':
+                        # An EOS at the cap is a valid sample with identical IDs,
+                        # byte digest and logits, but a different stop contract.
+                        sample['stop_reason'] = 'eos'
+                    else:
+                        # Keep the individual sample valid and its output equal;
+                        # only the prompt/prefill count signature differs from A1.
+                        sample['prompt_tokens'] += 1
+                        sample['prefill_tokens'] += 1
+                        sample['prefill_ms_per_token'] = 1000 * sample['prefill_s'] / sample['prefill_tokens']
+                write_samples(args.control / 'run-metrics.jsonl', control)
+                self.driver.validate_run(args.control, state, self.driver.load_audit())
+                with self.assertRaisesRegex(ValueError,
+                                            'Final control output/count differs in run 0: ' + expected_field):
+                    self.driver.compare(args)
+                self.assertFalse(args.out.exists())
+
+    def test_compare_rejects_mixed_metrics_even_with_matching_raw_outputs(self):
+        args = self.comparison_fixture()
+        for directory, enabled in ((args.base, '1'), (args.candidate, '0')):
+            path = directory / 'run-metrics.jsonl'
+            environment = dict(self.driver.DEFAULT_ENV, MYDS_DECODE_METRICS=enabled)
+            records = self.v2_records(environment=environment)
+            if enabled == '0':
+                for sample in records:
+                    if sample['kind'] == 'sample':
+                        sample['decode_telemetry'].update(timing_enabled=False, recorded_cycles=0,
+                                                          cycle_ms=[], cycle_output_tokens=[])
+                        sample['decode_telemetry'].update({key: None for key in self.driver.DECODE_TIMERS})
+            write_samples(path, records)
+            (directory / 'run-state.json').write_text(json.dumps(self.state_for(records)))
+        with self.assertRaisesRegex(ValueError, 'Measurement setting differs: MYDS_DECODE_METRICS'):
+            self.driver.compare(args)
+        self.assertFalse(args.out.exists())
+
+        # Both disabled arms remain comparable and expose no fictitious cycle data.
+        base_records = [json.loads(line) for line in (args.candidate / 'run-metrics.jsonl').read_text().splitlines()]
+        write_samples(args.base / 'run-metrics.jsonl', base_records)
+        (args.base / 'run-state.json').write_text(json.dumps(self.state_for(base_records)))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.driver.compare(args), 0)
+        summary = json.loads(args.out.read_text())
+        self.assertIsNone(summary['base']['decode_telemetry']['cycle_latency_ms'])
+        self.assertIsNone(summary['candidate']['decode_telemetry']['cycle_latency_ms'])
+
+    def test_runner_rejects_presence_based_diagnostics_before_process_creation(self):
+        for name in ('MYDS_PROF', 'MYDS_DISPATCH_HIST', 'MYDS_DEBUG_DISPATCH'):
+            for value in ('0', '1', ''):
+                with self.subTest(name=name, value=value):
+                    args = self.run_args()
+                    args.env = [name + '=' + value]
+                    with mock.patch.object(self.driver.platform, 'system', return_value='Darwin'), \
+                            mock.patch.object(self.driver.subprocess, 'Popen') as execute:
+                        with self.assertRaisesRegex(ValueError, 'incompatible with this run: ' + name):
+                            self.driver.run(args)
+                        execute.assert_not_called()
+                    self.assertFalse(args.out.exists())
+
+    def test_saved_raw_metadata_rejects_unbound_presence_based_diagnostics(self):
+        # Audit the actual native metadata even if a run-state omitted the setting.
+        args = self.comparison_fixture()
+        path = args.candidate / 'run-metrics.jsonl'
+        original = [json.loads(line) for line in path.read_text().splitlines()]
+        for name in ('MYDS_PROF', 'MYDS_DISPATCH_HIST', 'MYDS_DEBUG_DISPATCH'):
+            with self.subTest(name=name):
+                records = copy.deepcopy(original)
+                records[0]['environment'][name] = '0'
+                write_samples(path, records)
+                with self.assertRaisesRegex(ValueError, 'incompatible with this run: ' + name):
+                    self.driver.compare(args)
+                self.assertFalse(args.out.exists())
+
     def test_compare_actual_historical_timings_and_outputs(self):
         expected = {'short': (9.3863755, 2.9336855),
                     'normal': (9.1380277577, 3.3009242441),
@@ -184,6 +556,7 @@ class BenchReproduceTests(unittest.TestCase):
                                            delta=0.001)
                 # The historical harness predates per-sample attention counters.
                 self.assertEqual(summary['attention_paths'], {'base': None, 'candidate': None})
+                self.assertEqual(summary['gpu_indexer_compact'], {'base': None, 'candidate': None})
 
     def test_attention_paths_flags_head_first_fallback(self):
         clean = {'calls': 600, 'gather_calls': 570, 'slab_calls': 30, 'head_first_attempts': 570,
@@ -317,6 +690,7 @@ class BenchReproduceTests(unittest.TestCase):
                                 TimeoutCPUHarness(argv, records=records, **kwargs))
         with mock.patch.object(self.driver.platform, 'system', return_value='Darwin'), \
                 mock.patch.object(self.driver, 'check_idle'), \
+                mock.patch.object(self.driver, 'source_state', return_value={'head': 'CPU fixture', 'dirty': False}), \
                 mock.patch.object(self.driver, 'host_state', return_value=copy.deepcopy(HOST)), \
                 mock.patch.object(self.driver.subprocess, 'Popen', constructor), \
                 mock.patch.object(self.driver.os, 'killpg') as send_signal, \

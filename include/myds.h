@@ -76,6 +76,34 @@ typedef struct {
 /* 读取最近一次生成（myds_generate*）的 prefill 统计；ctx 为 NULL 时清零返回。 */
 void            myds_last_prefill_stats(const myds_context_t *ctx, myds_prefill_stats_t *out);
 
+/* Per-request decode counters. Calls include attempted single-row and batch-2
+ * target invocations; rows include attempted work and rejected future rows.
+ * output_tokens counts non-EOS token fragments delivered by generation.
+ * Timings use a monotonic host clock, not GPU kernel counters. They are only
+ * collected with MYDS_DECODE_METRICS=1 or the opt-in cost scheduler. */
+typedef struct {
+    uint64_t target_forward_calls, target_rows;
+    uint64_t batch2_calls, batch2_hits, batch2_misses, batch2_failures, batch2_fallbacks;
+    uint64_t draft_cycles, draft_proposed, draft_accepted, draft_rejects;
+    uint64_t confidence_rejects, margin_rejects, backoff_steps;
+    uint64_t pld_queries, pld_cycles, pld_proposed, pld_accepted;
+    uint64_t output_tokens, cycle_count;
+    double draft_ms, verify_ms, rollback_ms, snapshot_ms, pld_ms;
+    bool timing_enabled;
+    uint32_t recorded_cycles;
+} myds_decode_stats_t;
+
+typedef struct {
+    double elapsed_ms;       /* Full scheduler cycle, including draft and callbacks. */
+    uint32_t output_tokens;
+} myds_decode_cycle_t;
+
+void            myds_last_decode_stats(const myds_context_t *ctx, myds_decode_stats_t *out);
+/* Cycle records are opt-in (MYDS_DECODE_METRICS=1). False means no such record,
+ * including a timing allocation failure; aggregate counters remain available. */
+bool            myds_last_decode_cycle(const myds_context_t *ctx, uint32_t index,
+                                      myds_decode_cycle_t *out);
+
 /* Generation termination reasons */
 typedef enum {
     MYDS_STOP_EOS = 0,

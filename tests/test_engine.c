@@ -2,6 +2,7 @@
 #include "myds.h"
 #include "myds_gguf.h"
 #include "myds_internal.h"
+#include "myds_dspark.h"
 #include "myds_snapshot_slots.h"
 #include "myds_log.h"
 #include <stdio.h>
@@ -320,6 +321,11 @@ static void test_prefix_generate_boundaries(void) {
         const uint32_t wanted = variant == 3 ? 0 : short_n - 1u;
         assert(stats.cached_tokens == wanted && stats.prefill_tokens == short_n - 1u - wanted);
         assert(stats.prompt_tokens == short_n && stats.cached_tokens < short_n);
+        /* The last prompt token has not reached decode. Cancellation may
+         * retain only the prefix actually restored/consumed, not that token. */
+        assert(ctx->pcache_len == ctx->pos);
+        if (ctx->pcache_len)
+            assert(myds_v41_snapshot_get_next_position(ctx->v41) == ctx->pos);
     }
     myds_v41_context_free(ctx->v41); ctx->v41 = NULL;
     ctx->pcache_len = 0;
@@ -355,6 +361,170 @@ static void test_prefix_generate_boundaries(void) {
     myds_log_set_callback(NULL, NULL);
     myds_context_free(ctx); myds_model_free(model); myds_metal_cleanup();
     puts("  [PASS] Production generate prefix bounds: short/equal/snapshot-end, matching/poisoned tails and successful continuation with cold-logit parity");
+}
+
+static void test_empty_decode_continuation(void) {
+    assert(setenv("MYDS_PREFIX_CACHE", "1", 1) == 0);
+    assert(setenv("MYDS_PLD", "0", 1) == 0);
+    assert(myds_metal_init("metal"));
+    myds_model_t *model = test_prefill_model();
+    strcpy(model->arch, "deepseek4");
+    model->tokenizer->eos_id = -1;
+    myds_config_t cfg = {.max_seq_len = 64, .max_new_tokens = 0,
+                         .temperature = 0, .top_p = 1, .seed = 42};
+    myds_context_t *ctx = myds_context_create(model, &cfg);
+    assert(ctx && !ctx->v41);
+    int32_t initial_tokens[1024];
+    const uint32_t initial_n = prefix_prompt_tokens(model, "abcdefghij", initial_tokens);
+    myds_stop_reason_t reason = MYDS_STOP_ERROR;
+    assert(myds_generate_bytes_ex(ctx, "abcdefghij", NULL, NULL, &reason, NULL, NULL));
+    assert(reason == MYDS_STOP_LENGTH && ctx->pos == initial_n - 1u);
+    myds_decode_stats_t decode; myds_last_decode_stats(ctx, &decode);
+    assert(decode.output_tokens == 0 && decode.target_forward_calls == 0);
+    fprintf(stderr, "EMPTY_DECODE_CACHE consumed=%u cached=%u expected=%u\n",
+            ctx->pos, ctx->pcache_len, initial_n - 1u);
+    assert(ctx->pcache_len == initial_n - 1u);
+    assert(!memcmp(ctx->pcache_tokens, initial_tokens, ctx->pcache_len * sizeof(*initial_tokens)));
+
+    /* A longer full request on the same context must replay the pending last
+     * prompt token. Compare its actual cache and logits with a cold request. */
+    cfg.max_new_tokens = 1;
+    myds_context_set_config(ctx, &cfg);
+    assert_prefix_generate(ctx, "abcdefghijkl", initial_n - 1u);
+    myds_context_t *cold = myds_context_create(model, &cfg);
+    assert(cold);
+    assert(myds_generate_bytes_ex(cold, "abcdefghijkl", NULL, NULL, &reason, NULL, NULL));
+    assert(reason == MYDS_STOP_LENGTH && cold->pos == ctx->pos && cold->pcache_len == ctx->pcache_len);
+    assert(!memcmp(cold->pcache_tokens, ctx->pcache_tokens, ctx->pcache_len * sizeof(*ctx->pcache_tokens)));
+    const size_t cache_elements = (size_t)ctx->pos * model->head_dim;
+    for (uint32_t l = 0; l < model->n_layers; ++l) {
+        bool nonzero = false;
+        for (size_t i = 0; i < cache_elements; ++i) {
+            const float a = ctx->k_cache[l][i], b = cold->k_cache[l][i];
+            assert(isfinite(a) && isfinite(b) && fabsf(a - b) < 1e-5f);
+            if (a != 0.0f) nonzero = true;
+        }
+        assert(nonzero);
+    }
+    const float *a = myds_metal_buffer_data(ctx->logits), *b = myds_metal_buffer_data(cold->logits);
+    for (uint32_t i = 0; i < model->vocab_size; ++i)
+        assert(isfinite(a[i]) && isfinite(b[i]) && fabsf(a[i] - b[i]) < 1e-5f);
+    myds_context_free(cold); myds_context_free(ctx); myds_model_free(model); myds_metal_cleanup();
+    puts("  [PASS] Zero-output real tiny-model request retains only consumed prefix; same-context continuation KV/state/logits match cold replay");
+}
+
+typedef struct {
+    uint32_t count;
+    int32_t tokens[64];
+    volatile int *cancel;
+    myds_context_t *slow_spec;
+} decode_test_capture_t;
+
+static void capture_decode_test(const char *bytes, size_t length, int32_t token, void *opaque) {
+    (void)bytes; (void)length;
+    decode_test_capture_t *capture = opaque;
+    assert(capture->count < 64);
+    capture->tokens[capture->count++] = token;
+    /* Controlled callback cost exercises the actual cycle-based scheduler,
+     * rather than assigning its counters by hand. */
+    if (capture->slow_spec && capture->slow_spec->decode_cycle_speculative) usleep(10000);
+    if (capture->cancel) *capture->cancel = 1;
+}
+
+static void test_decode_request_metrics(void) {
+    assert(setenv("MYDS_PREFIX_CACHE", "0", 1) == 0);
+    assert(setenv("MYDS_PLD", "0", 1) == 0);
+    assert(setenv("MYDS_DECODE_METRICS", "1", 1) == 0);
+    assert(unsetenv("MYDS_SPEC_COST_SCHEDULER") == 0);
+    assert(myds_metal_init("metal"));
+    myds_model_t *model = test_prefill_model();
+    strcpy(model->arch, "deepseek4");
+    model->tokenizer->eos_id = -1;
+    myds_config_t cfg = {.max_seq_len = 64, .max_new_tokens = 8, .temperature = 0,
+                         .top_p = 1, .repetition_penalty = 1, .seed = 42};
+    myds_context_t *ctx = myds_context_create(model, &cfg);
+    assert(ctx);
+    decode_test_capture_t timed = {0}, untimed = {0};
+    myds_stop_reason_t reason;
+    assert(myds_generate_bytes_ex(ctx, "abcd", capture_decode_test, &timed, &reason, NULL, NULL));
+    assert(reason == MYDS_STOP_LENGTH && timed.count == 8);
+    myds_decode_stats_t stats;
+    myds_last_decode_stats(ctx, &stats);
+    assert(stats.timing_enabled && stats.output_tokens == timed.count);
+    assert(stats.target_forward_calls == timed.count && stats.target_rows == timed.count);
+    assert(stats.cycle_count == timed.count && stats.recorded_cycles == timed.count);
+    assert(stats.batch2_calls == 0 && stats.draft_cycles == 0 && stats.pld_queries == 0);
+    for (uint32_t i = 0; i < stats.recorded_cycles; ++i) {
+        myds_decode_cycle_t cycle;
+        assert(myds_last_decode_cycle(ctx, i, &cycle));
+        assert(isfinite(cycle.elapsed_ms) && cycle.elapsed_ms > 0.0 && cycle.output_tokens == 1);
+    }
+    myds_decode_cycle_t missing;
+    assert(!myds_last_decode_cycle(ctx, stats.recorded_cycles, &missing));
+    assert(missing.elapsed_ms == 0 && missing.output_tokens == 0);
+    assert(setenv("MYDS_DECODE_METRICS", "0", 1) == 0);
+    assert(myds_generate_bytes_ex(ctx, "abcd", capture_decode_test, &untimed, &reason, NULL, NULL));
+    assert(reason == MYDS_STOP_LENGTH && untimed.count == timed.count);
+    assert(memcmp(timed.tokens, untimed.tokens, timed.count * sizeof(int32_t)) == 0);
+    myds_last_decode_stats(ctx, &stats);
+    assert(!stats.timing_enabled && stats.output_tokens == 8 && stats.target_forward_calls == 8);
+    assert(stats.recorded_cycles == 0 && !myds_last_decode_cycle(ctx, 0, &missing));
+    /* Real cancellation after one callback retains exactly one completed step. */
+    volatile int cancel = 0;
+    decode_test_capture_t cancelled = {.cancel = &cancel};
+    assert(myds_generate_bytes_ex(ctx, "abcd", capture_decode_test, &cancelled, &reason, NULL, &cancel));
+    assert(reason == MYDS_STOP_CANCELLED && cancelled.count == 1);
+    myds_last_decode_stats(ctx, &stats);
+    assert(stats.output_tokens == 1 && stats.target_forward_calls == 1 && stats.cycle_count == 1);
+    /* EOS consumes a target step but is never reported as an output fragment. */
+    model->tokenizer->eos_id = timed.tokens[0];
+    decode_test_capture_t eos = {0};
+    assert(myds_generate_bytes_ex(ctx, "abcd", capture_decode_test, &eos, &reason, NULL, NULL));
+    assert(reason == MYDS_STOP_EOS && eos.count == 0);
+    myds_last_decode_stats(ctx, &stats);
+    assert(stats.output_tokens == 0 && stats.target_forward_calls == 1 && stats.cycle_count == 1);
+    model->tokenizer->eos_id = -1;
+    memset(myds_metal_buffer_data(model->output), 0,
+           (size_t)model->vocab_size * model->dim * sizeof(float));
+    cfg.max_new_tokens = 24;
+    myds_context_set_config(ctx, &cfg);
+    assert(setenv("MYDS_PLD", "1", 1) == 0);
+    assert(setenv("MYDS_SPEC_COST_SCHEDULER", "1", 1) == 0);
+    decode_test_capture_t budgeted = {.slow_spec = ctx};
+    assert(myds_generate_bytes_ex(ctx, "abcd", capture_decode_test, &budgeted, &reason, NULL, NULL));
+    assert(reason == MYDS_STOP_LENGTH && budgeted.count == 24);
+    myds_last_decode_stats(ctx, &stats);
+    assert(stats.timing_enabled && stats.recorded_cycles == 0);
+    assert(stats.target_forward_calls == budgeted.count && stats.target_rows == budgeted.count);
+    assert(stats.pld_queries > 0 && stats.pld_accepted > 0 && stats.pld_accepted <= stats.pld_proposed);
+    assert(stats.backoff_steps >= 16 && stats.output_tokens == budgeted.count);
+    for (uint32_t i = 0; i < budgeted.count; ++i) assert(budgeted.tokens[i] == 0);
+    assert(!myds_last_decode_cycle(ctx, 0, &missing));
+    /* Real target generation with a deliberately backed-off drafter exercises
+     * PLD A fallback. Its stale neural draft must never receive acceptance. */
+    assert(setenv("MYDS_SPEC_COST_SCHEDULER", "0", 1) == 0);
+    ctx->dspark = calloc(1, sizeof(*ctx->dspark));
+    assert(ctx->dspark);
+    ctx->dspark->block_size = 1;
+    ctx->dspark->backoff_counter = 100;
+    ctx->dspark->draft_tokens[0] = 0;
+    decode_test_capture_t pld_fallback = {0};
+    assert(myds_generate_bytes_ex(ctx, "abcd", capture_decode_test, &pld_fallback, &reason, NULL, NULL));
+    assert(reason == MYDS_STOP_LENGTH && pld_fallback.count == 24);
+    myds_last_decode_stats(ctx, &stats);
+    assert(stats.draft_proposed == 0 && stats.draft_accepted == 0);
+    assert(stats.pld_accepted > 0 && stats.pld_accepted <= stats.pld_proposed);
+    assert(ctx->dspark->accepted_tokens == 0 && ctx->dspark->consecutive_misses == 0);
+    for (uint32_t i = 0; i < pld_fallback.count; ++i) assert(pld_fallback.tokens[i] == 0);
+    assert(!myds_generate_bytes_ex(ctx, NULL, capture_decode_test, &budgeted, &reason, NULL, NULL));
+    assert(reason == MYDS_STOP_ERROR);
+    myds_last_decode_stats(ctx, &stats);
+    assert(stats.output_tokens == 0 && stats.target_forward_calls == 0 && stats.cycle_count == 0);
+    myds_last_decode_stats(NULL, &stats);
+    assert(stats.target_forward_calls == 0 && stats.output_tokens == 0);
+    assert(!myds_last_decode_cycle(NULL, 0, &missing));
+    myds_context_free(ctx); myds_model_free(model); myds_metal_cleanup();
+    puts("  [PASS] Real tiny-model decode counters, EOS/reset/cancel/token parity and cycle-cost backoff");
 }
 
 static void test_prefill_workspace_reuse(const char *arch) {
@@ -688,8 +858,16 @@ static void test_snapshot_slots_keep_the_constant_prefix(void) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "--decode-metrics") == 0) {
+        test_decode_request_metrics();
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "--prefix-cache") == 0) {
         test_prefix_generate_boundaries();
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--empty-decode") == 0) {
+        test_empty_decode_continuation();
         return 0;
     }
     /* Prefix enablement is cached process-wide by production generate. Run
@@ -700,6 +878,16 @@ int main(int argc, char **argv) {
     if (!child) { execl(argv[0], argv[0], "--prefix-cache", (char *)NULL); _exit(127); }
     int child_status;
     assert(waitpid(child, &child_status, 0) == child);
+    assert(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
+    const pid_t empty_child = fork();
+    assert(empty_child >= 0);
+    if (!empty_child) { execl(argv[0], argv[0], "--empty-decode", (char *)NULL); _exit(127); }
+    assert(waitpid(empty_child, &child_status, 0) == empty_child);
+    assert(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
+    const pid_t metrics_child = fork();
+    assert(metrics_child >= 0);
+    if (!metrics_child) { execl(argv[0], argv[0], "--decode-metrics", (char *)NULL); _exit(127); }
+    assert(waitpid(metrics_child, &child_status, 0) == metrics_child);
     assert(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
     printf("====================================================\n");
     printf("       Running myds Engine Sampling Unit Tests      \n");

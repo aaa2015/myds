@@ -9,6 +9,8 @@
 #include "myds_v41_moe.h"
 #include "myds_metal.h"
 #include "myds_log.h"
+#include "myds_v41.h"
+#include "myds_v41_decode.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -220,6 +222,52 @@ static int test_batch2_moe_route(void) {
     return 1;
 }
 
+static int test_authoritative_projection(uint32_t rows, uint32_t width,
+    ggml_type type, myds_v41_batch2_projection_kind_t kind) {
+    printf("[TEST] Production decode projection boundary kind=%u rows=%u width=%u type=%u...\n",
+           kind, rows, width, type);
+    const size_t w_bytes = type == GGML_TYPE_Q8_0 ? (size_t)rows * width / 32u * 34u
+                                                 : (size_t)rows * width * sizeof(float);
+    myds_metal_buffer_t *weight = myds_metal_buffer_alloc(w_bytes);
+    myds_metal_buffer_t *input[2], *reference[2], *candidate[2], *raw[2];
+    CHECK(weight);
+    if (type == GGML_TYPE_Q8_0) fill_q8_weights(weight); else fill_act(weight, 17);
+    for (uint32_t t = 0; t < 2; ++t) {
+        input[t] = myds_metal_buffer_alloc(width * sizeof(float));
+        reference[t] = myds_metal_buffer_alloc(rows * sizeof(float));
+        candidate[t] = myds_metal_buffer_alloc(rows * sizeof(float));
+        raw[t] = myds_metal_buffer_alloc(rows * sizeof(float));
+        CHECK(input[t] && reference[t] && candidate[t] && raw[t]);
+        fill_act(input[t], 101u + 101u * t);
+    }
+    CHECK(myds_metal_begin_batch());
+    for (uint32_t t = 0; t < 2; ++t) {
+        if (kind == MYDS_V41_BATCH2_QKV)
+            CHECK(myds_metal_v41_gemv_bf16(reference[t], weight, input[t], rows, width, type));
+        else if (kind == MYDS_V41_BATCH2_ROUTER)
+            CHECK(myds_metal_v41_gemv(reference[t], weight, input[t], rows, width, type));
+        else
+            CHECK(myds_v41_decode_gemv_bf16(reference[t], weight, input[t], rows, width, type, false));
+        CHECK(myds_metal_gemv(raw[t], weight, input[t], rows, width, type));
+    }
+    CHECK(myds_metal_commit_batch());
+    CHECK(myds_metal_begin_batch());
+    CHECK(myds_v41_batch2_projection_probe(candidate, weight, input, rows, width, type, kind));
+    CHECK(myds_metal_commit_batch());
+    for (uint32_t t = 0; t < 2; ++t) {
+        CHECK(verify_exact(reference[t], candidate[t], rows));
+        if (kind != MYDS_V41_BATCH2_ROUTER) {
+            CHECK(memcmp(myds_metal_buffer_data(raw[t]), myds_metal_buffer_data(candidate[t]), rows * sizeof(float)) != 0);
+            const uint32_t *bits = myds_metal_buffer_data(candidate[t]);
+            for (uint32_t r = 0; r < rows; ++r) CHECK((bits[r] & 0xffffu) == 0);
+        }
+        myds_metal_buffer_free(input[t]); myds_metal_buffer_free(reference[t]);
+        myds_metal_buffer_free(candidate[t]); myds_metal_buffer_free(raw[t]);
+    }
+    myds_metal_buffer_free(weight);
+    return 1;
+}
+
 int main(void) {
     printf("\n=======================================================\n");
     printf("   Phase 3: Metal Per-Layer Batch-2 Parity Test Suite  \n");
@@ -231,28 +279,32 @@ int main(void) {
     }
 
     // 1. Attention Q_A projection (1280 x 5120)
-    CHECK(test_batch2_gemv_projections(1280, 5120));
+    if (!test_batch2_gemv_projections(1280, 5120)) return 1;
 
     // 2. Attention KV_A projection (512 x 5120)
-    CHECK(test_batch2_gemv_projections(512, 5120));
+    if (!test_batch2_gemv_projections(512, 5120)) return 1;
 
     // 3. Attention Q_B projection (32768 x 1280)
-    CHECK(test_batch2_gemv_projections(32768, 1280));
+    if (!test_batch2_gemv_projections(32768, 1280)) return 1;
 
     // 4. Attention Output B projection (5120 x 8192)
-    CHECK(test_batch2_gemv_projections(5120, 8192));
+    if (!test_batch2_gemv_projections(5120, 8192)) return 1;
 
     // 5. MoE Shared Expert Gate/Up (2304 x 5120)
-    CHECK(test_batch2_gemv_projections(2304, 5120));
+    if (!test_batch2_gemv_projections(2304, 5120)) return 1;
 
     // 6. MoE Shared Expert Down (5120 x 2304)
-    CHECK(test_batch2_gemv_projections(5120, 2304));
+    if (!test_batch2_gemv_projections(5120, 2304)) return 1;
 
     // 7. MoE Router Gate (384 x 5120)
-    CHECK(test_batch2_gemv_projections(384, 5120));
+    if (!test_batch2_gemv_projections(384, 5120)) return 1;
 
     // 8. MoE Fused Router (rows = 2)
-    CHECK(test_batch2_moe_route());
+    if (!test_batch2_moe_route()) return 1;
+    if (!test_authoritative_projection(1280, 5120, GGML_TYPE_Q8_0, MYDS_V41_BATCH2_QKV)) return 1;
+    if (!test_authoritative_projection(5120, 8192, GGML_TYPE_Q8_0, MYDS_V41_BATCH2_TAIL)) return 1;
+    if (!test_authoritative_projection(5120, 2304, GGML_TYPE_Q8_0, MYDS_V41_BATCH2_SHARED)) return 1;
+    if (!test_authoritative_projection(384, 5120, GGML_TYPE_F32, MYDS_V41_BATCH2_ROUTER)) return 1;
 
     printf("\n=== ALL PHASE 3 BATCH-2 PARITY TESTS PASSED CLEANLY! ===\n\n");
     return 0;

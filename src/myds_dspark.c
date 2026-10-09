@@ -701,6 +701,17 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
     return 1;
 }
 
+static void dspark_reject_proposal(myds_dspark_t *ds, myds_context_t *ctx, bool confidence) {
+    ds->draft_count = ds->draft_tree_count = 0;
+    ds->is_high_confidence = false;
+    if (++ds->consecutive_misses >= 3) ds->backoff_counter = 16;
+    if (ctx->decode_metrics_active) {
+        ctx->decode_stats.draft_rejects++;
+        if (confidence) ctx->decode_stats.confidence_rejects++;
+        else ctx->decode_stats.margin_rejects++;
+    }
+}
+
 uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t last_token, uint32_t draft_cap) {
     if (!ds || !ctx || !ctx->model) return 0;
     if (ds->backoff_counter > 0) {
@@ -773,11 +784,9 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
                    base_logits ? "valid" : "none");
     }
 
-    // Confidence Gating: if below threshold, return 0 (0 overhead fallback to 29.8 tok/s)
+    // The stages have already run; repeated rejections must also back off.
     if (!markov_only && min_conf > 0.0f && confidence < min_conf) {
-        ds->draft_count = 0;
-        ds->draft_tree_count = 0;
-        ds->is_high_confidence = false;
+        dspark_reject_proposal(ds, ctx, true);
         ds->propose_ms += (now_ms() - t0);
         return 0;
     }
@@ -869,10 +878,7 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
 
             const float margin = best_score - best_score2;
             if (min_margin > 0.0f && margin < min_margin) {
-                // Top-1 vs Top-2 margin too narrow: skip speculative proposal (0 overhead fallback)
-                ds->draft_count = 0;
-                ds->draft_tree_count = 0;
-                ds->is_high_confidence = false;
+                dspark_reject_proposal(ds, ctx, false);
                 ds->propose_ms += (now_ms() - t0);
                 return 0;
             }
@@ -904,4 +910,3 @@ uint32_t myds_dspark_propose_tree(myds_dspark_t *ds, myds_context_t *ctx, int32_
     if (!ds || !ctx) return 0;
     return myds_dspark_propose(ds, ctx, last_token, 1);
 }
-
