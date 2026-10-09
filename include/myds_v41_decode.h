@@ -17,6 +17,8 @@
 int myds_v41_decode_gemv_bf16(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *weight, const myds_metal_buffer_t *input,
     uint32_t rows, uint32_t width, ggml_type type, bool trace_on);
+/* Query the same process-once fuse policy used by the scalar wrapper. */
+bool myds_v41_decode_q8_fuse_bf16_enabled(void);
 
 /* Experimental, local QKV/Indexer encoder scope. MYDS_QKV_CONCURRENT=1
  * explicitly opts in; the default and trace path keep the caller's mode.

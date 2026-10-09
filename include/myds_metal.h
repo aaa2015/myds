@@ -152,6 +152,24 @@ int myds_metal_v41_gemv(myds_metal_buffer_t *out,
 int myds_metal_v41_gemv_bf16(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *weight,const myds_metal_buffer_t *input,
     uint32_t out_dim,uint32_t in_dim,ggml_type weight_type);
+/* Experimental two-input Q8_0 projection, used only by Batch2 output-B.
+ * Each row retains the scalar GEMV K walk, NSG/NR and BF16 store. Outputs
+ * must not overlap each other or any input/weight range; inputs may overlap.
+ * There is no scalar/CPU fallback after this helper is requested.
+ * mode: absent/"0" -> 0, "1" -> 1, any other value -> -1 (with diagnostic).
+ * Encoded counts dispatches, including those whose later commit may fail;
+ * requests/failures count calls to this helper, not scalar bypasses. */
+int myds_metal_batch2_q8_shared_mode(void);
+int myds_metal_v41_gemv_bf16_shared2(myds_metal_buffer_t *const out[2],
+    const myds_metal_buffer_t *weight, myds_metal_buffer_t *const input[2],
+    uint32_t out_dim, uint32_t in_dim);
+typedef struct {
+    uint64_t requests, encoded, failures;
+} myds_metal_batch2_q8_shared_counters_t;
+/* Relaxed per-field snapshots/exchanges; reset belongs to an idle/exclusive
+ * measurement boundary, not a concurrent multi-request accounting window. */
+void myds_metal_batch2_q8_shared_counters(
+    myds_metal_batch2_q8_shared_counters_t *out, bool reset);
 int myds_metal_v41_qkv_fusion_available(void);
 
 int myds_metal_v41_gemv_batch(myds_metal_buffer_t *out,

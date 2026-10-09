@@ -387,3 +387,181 @@ template [[host_name("kernel_myds_argsort_merge_f32_i32_desc_prefix_guarded")]]
 kernel myds_argsort_prefix_merge_t kernel_myds_argsort_merge_prefix_guarded<false>;
 template [[host_name("kernel_myds_argsort_merge_f32_i32_desc_causal_prefix_guarded")]]
 kernel myds_argsort_prefix_merge_t kernel_myds_argsort_merge_prefix_guarded<true>;
+
+// Independent opt-in clone: original sort exports/body above stay unchanged.
+// Flag classification shares the existing score staging and its TG barrier.
+template<ds4_sort_order order, bool causal = false, bool shuffle = false>
+kernel void kernel_myds_argsort_partition_nan(
+        constant   ds4_metal_args_argsort & args,
+        device   const char * src0,
+        device      int32_t * dst,
+        device        uint * partition_nan,
+        threadgroup int32_t * shmem_i32 [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    // bitonic sort
+    const int col = tpitg[0];
+    const int ib  = tgpig[0] / args.ne01;
+
+    const int i00 = ib*ntg.x;
+    const int i01 = tgpig[0] % args.ne01;
+    const int i02 = tgpig[1];
+    const int i03 = tgpig[2];
+    const int width = causal ? min(args.ne00,
+        int((args.causal_start + uint(i01) + 1u) / args.causal_ratio)) : args.ne00;
+    const uint parts=(uint(args.ne00)+uint(ntg.x)-1u)/uint(ntg.x);
+    const ulong flag_slot=(ulong(i01)+ulong(args.ne01)*i02+
+        ulong(args.ne01)*args.ne02*i03)*parts+uint(ib);
+    // Every dispatched partition owns and overwrites one flag, including
+    // partitions with no visible causal values. Never inherit a prior row.
+    if (i00 >= width) {
+        if (col == 0) partition_nan[flag_slot]=0u;
+        return;
+    }
+    const int work_width = causal ?
+        ((width - 1) / ntg.x) * args.top_k + min((width - 1) % ntg.x + 1, args.top_k) : args.ne0;
+
+    device const float * src0_row = (device const float *) (src0 + args.nb01*i01 + args.nb02*i02 + args.nb03*i03);
+
+    // initialize indices
+    shmem_i32[col] = i00 + col;
+
+    // Stage this block's score slice in threadgroup memory (indices stay in
+    // [i00, i00+ntg.x), so shmem_f32[idx - i00] replaces the device gather).
+    // The host allocates ntg.x extra floats after the index array.  Values and
+    // the comparison network are unchanged, so the permutation is identical.
+    threadgroup float * shmem_f32 = (threadgroup float *) (shmem_i32 + ntg.x);
+    uint found=0u;
+    if (i00 + col < width) {
+        // Use the source IEEE bits: fast-math must not erase a NaN test or
+        // quiet signaling NaNs before classification. One source load supplies
+        // both the bit guard and float staging, without changing any IEEE bits
+        // or the original comparison network.
+        const uint bits=((device const uint *)src0_row)[i00 + col];
+        shmem_f32[col] = as_type<float>(bits);
+        found=(bits&0x7fffffffu)>0x7f800000u;
+    }
+    threadgroup uint group_found[32]; // host preserves nth and requires <=1024
+    const uint any=simd_sum(found);
+    if ((col&31) == 0) group_found[uint(col)/32u]=any;
+
+    // The original staging barrier also publishes SIMD classification partials.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (col == 0) {
+        uint flag=0u;
+        for (uint i=0u;i<(uint(ntg.x)+31u)/32u;i++) flag|=group_found[i];
+        partition_nan[flag_slot]=flag!=0u;
+    }
+
+    int reg_idx = i00 + col;
+    float reg_value = reg_idx < width ? shmem_f32[col] : 0.0f;
+    for (int k = 2; k <= ntg.x; k *= 2) {
+        for (int j = k / 2; j > 0; j /= 2) {
+            if (shuffle && j < 32) {
+                if (k > 32 && j == 16) {
+                    reg_idx = shmem_i32[col];
+                    reg_value = reg_idx < width ? shmem_f32[reg_idx - i00] : 0.0f;
+                }
+                const int other = simd_shuffle_xor(reg_idx, j);
+                const float value = simd_shuffle_xor(reg_value, j);
+                const bool first = ((col & k) == 0) == ((col & j) == 0);
+                const bool exchange = first ?
+                    (reg_idx >= width || (other < width && (order == DS4_SORT_ORDER_ASC ?
+                        reg_value > value : reg_value < value))) :
+                    (other >= width || (reg_idx < width && (order == DS4_SORT_ORDER_ASC ?
+                        reg_value < value : reg_value > value)));
+                if (exchange) { reg_idx = other; reg_value = value; }
+                continue;
+            }
+            int ixj = col ^ j;
+            if (ixj > col) {
+                if ((col & k) == 0) {
+                    if (shmem_i32[col] >= width ||
+                       (shmem_i32[ixj] <  width && (order == DS4_SORT_ORDER_ASC ?
+                            shmem_f32[shmem_i32[col] - i00] > shmem_f32[shmem_i32[ixj] - i00] :
+                            shmem_f32[shmem_i32[col] - i00] < shmem_f32[shmem_i32[ixj] - i00]))
+                    ) {
+                        SWAP(shmem_i32[col], shmem_i32[ixj]);
+                    }
+                } else {
+                    if (shmem_i32[ixj] >= width ||
+                       (shmem_i32[col] <  width && (order == DS4_SORT_ORDER_ASC ?
+                            shmem_f32[shmem_i32[col] - i00] < shmem_f32[shmem_i32[ixj] - i00] :
+                            shmem_f32[shmem_i32[col] - i00] > shmem_f32[shmem_i32[ixj] - i00]))
+                    ) {
+                        SWAP(shmem_i32[col], shmem_i32[ixj]);
+                    }
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (shuffle && k >= 32) {
+            shmem_i32[col] = reg_idx;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    const int64_t i0 = ib*args.top_k;
+
+    // copy the result to dst without the padding
+    if (i0 + col < work_width && col < args.top_k) {
+        dst += i0 + args.ne0*i01 + args.ne0*args.ne1*i02 + args.ne0*args.ne1*args.ne2*i03;
+
+        dst[col] = shuffle ? reg_idx : shmem_i32[col];
+    }
+}
+
+typedef void (myds_argsort_partition_nan_t)(
+        constant ds4_metal_args_argsort & args,
+        device const char * src0, device int32_t * dst, device uint * partition_nan,
+        threadgroup int32_t * shmem_i32 [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3 ntg[[threads_per_threadgroup]]);
+template [[host_name("kernel_myds_argsort_f32_i32_desc_partition_nan")]]
+kernel myds_argsort_partition_nan_t kernel_myds_argsort_partition_nan<DS4_SORT_ORDER_DESC>;
+template [[host_name("kernel_myds_argsort_f32_i32_desc_causal_partition_nan")]]
+kernel myds_argsort_partition_nan_t kernel_myds_argsort_partition_nan<DS4_SORT_ORDER_DESC, true>;
+
+struct myds_argsort_partition_prefix_merge_args {
+    ds4_metal_args_argsort_merge merge;
+    uint keep, parts;
+};
+template<bool causal>
+kernel void kernel_myds_argsort_merge_partition_prefix_guarded(
+        constant myds_argsort_partition_prefix_merge_args & args,
+        device const char * src0, device const int32_t * tmp, device int32_t * dst,
+        device const uint * partition_nan,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3 ntg[[threads_per_threadgroup]],
+        ushort lane[[thread_index_in_simdgroup]]) {
+    const uint row=tgpig.x%uint(args.merge.ne01);
+    uint found=0u;
+    // Each SIMD independently ORs the entire row. A NaN in any original run
+    // forces dense merging from the FIRST merge, even in other merge groups.
+    // Non-power-of-two top-k also produces groups such as 48/62/511 threads.
+    // Each SIMD, including a partial LAST SIMD, needs its own actual width as
+    // the stride so every participating thread receives the same row decision.
+    const uint simd_start=(uint(tpitg.x)/32u)*32u;
+    const uint stride=min(uint(ntg.x)-simd_start,32u);
+    for(uint part=uint(lane);part<args.parts;part+=stride)
+        found|=partition_nan[(ulong)row*args.parts+part];
+    const bool prefix=simd_sum(found)==0u;
+    ds4_argsort_merge_body<DS4_SORT_ORDER_DESC, causal>(args.merge,src0,tmp,dst,
+        prefix,int(args.keep),tgpig,tpitg,ntg);
+}
+typedef void (myds_argsort_partition_prefix_merge_t)(
+        constant myds_argsort_partition_prefix_merge_args & args,
+        device const char * src0, device const int32_t * tmp, device int32_t * dst,
+        device const uint * partition_nan,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3 ntg[[threads_per_threadgroup]],
+        ushort lane[[thread_index_in_simdgroup]]);
+template [[host_name("kernel_myds_argsort_merge_f32_i32_desc_partition_prefix_guarded")]]
+kernel myds_argsort_partition_prefix_merge_t kernel_myds_argsort_merge_partition_prefix_guarded<false>;
+template [[host_name("kernel_myds_argsort_merge_f32_i32_desc_causal_partition_prefix_guarded")]]
+kernel myds_argsort_partition_prefix_merge_t kernel_myds_argsort_merge_partition_prefix_guarded<true>;

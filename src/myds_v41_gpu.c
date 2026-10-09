@@ -24,6 +24,8 @@ struct myds_v41_gpu_scratch {
     myds_metal_buffer_t *sort_a, *sort_b, *kv_f16, *mask, *pad, *partial;
     myds_metal_buffer_t *topk_prefix_nan; /* lazy row flags, optional path only */
     uint32_t topk_prefix_rows;
+    myds_metal_buffer_t *topk_nan_partitions; /* independent fused-path flags */
+    uint64_t topk_nan_partition_slots;
     myds_metal_buffer_t *sv_view, *dv_view;
     /* 批量 indexer（prefill Step 4）的临时缓冲：分数表、top-k 的中间排序结果两份、
      * 块分数、块选择结果。每个都是 batch_floats 个 float（或等
@@ -200,6 +202,7 @@ void myds_v41_gpu_scratch_free(myds_v41_gpu_scratch_t *s) {
     if(!s)return;
     myds_metal_buffer_free(s->sort_a);myds_metal_buffer_free(s->sort_b);
     myds_metal_buffer_free(s->topk_prefix_nan);
+    myds_metal_buffer_free(s->topk_nan_partitions);
     myds_metal_buffer_free(s->kv_f16);myds_metal_buffer_free(s->mask);
     myds_metal_buffer_free(s->kv_chunk);myds_metal_buffer_free(s->mask_chunk);
     myds_metal_buffer_free(s->attn_head_blocks);
@@ -546,10 +549,24 @@ struct merge_args {
     int32_t ne0,ne1,ne2,ne3,top_k,len;uint32_t causal_start,causal_ratio,block_width,block_top_k;
 };
 struct prefix_merge_args { struct merge_args merge; uint32_t keep; };
+struct nan_fuse_merge_args { struct merge_args merge; uint32_t keep,parts; };
 enum { TP_REQUESTS, TP_ENCODED, TP_UNAVAILABLE, TP_ROWS, TP_MERGES,
        TP_DENSE_WRITES, TP_PREFIX_WRITES, TP_COUNT };
 static _Atomic uint64_t topk_prefix_counters[TP_COUNT];
 static bool topk_prefix_test_unavailable;
+enum { TN_REQUESTS, TN_ENCODED, TN_UNAVAILABLE, TN_PARTITIONS, TN_COUNT };
+static _Atomic uint64_t topk_nan_fuse_counters[TN_COUNT];
+static uint32_t topk_nan_fuse_test_unavailable;
+void myds_v41_gpu_inject_topk_nan_fuse_unavailable(uint32_t mask) {
+    topk_nan_fuse_test_unavailable=mask;
+}
+void myds_v41_gpu_topk_nan_fuse_counters(myds_v41_gpu_topk_nan_fuse_counters_t *out,bool reset) {
+    uint64_t v[TN_COUNT];
+    for(unsigned i=0;i<TN_COUNT;i++)v[i]=reset?
+        atomic_exchange_explicit(&topk_nan_fuse_counters[i],0,memory_order_relaxed):
+        atomic_load_explicit(&topk_nan_fuse_counters[i],memory_order_relaxed);
+    if(out)*out=(myds_v41_gpu_topk_nan_fuse_counters_t){v[0],v[1],v[2],v[3]};
+}
 void myds_v41_gpu_inject_topk_prefix_unavailable(bool enabled) {
     topk_prefix_test_unavailable=enabled;
 }
@@ -592,6 +609,11 @@ static int topk_rows_causal(myds_metal_buffer_t *ids,const myds_metal_buffer_t *
     if(!s||!n_rows||n_cols>INT32_MAX||!top||top>n_cols||!floats(ids,(uint64_t)top*n_rows)||
        !floats(scores,(uint64_t)n_cols*n_rows))return 0;
     if(causal_ratio&&causal_start==UINT32_MAX)return 0;
+    const char *nan_fuse_env=getenv("MYDS_INDEXER_TOPK_NAN_FUSE");
+    if(nan_fuse_env&&strcmp(nan_fuse_env,"0")&&strcmp(nan_fuse_env,"1")) {
+        MYDS_LOG_E("MYDS_INDEXER_TOPK_NAN_FUSE must be exactly 0 or 1");
+        return 0;
+    }
     /* Match the reference bitonic partition as well as its comparator: ties
      * can otherwise select different cache rows after the merge. */
     uint32_t max_threads=myds_metal_kernel_max_threads(causal_ratio?
@@ -636,14 +658,43 @@ static int topk_rows_causal(myds_metal_buffer_t *ids,const myds_metal_buffer_t *
     const char *prefix_kernel=causal_ratio?
         "kernel_myds_argsort_merge_f32_i32_desc_causal_prefix_guarded":
         "kernel_myds_argsort_merge_f32_i32_desc_prefix_guarded";
+    const bool nan_fuse_requested=prefix&&nan_fuse_env&&strcmp(nan_fuse_env,"1")==0;
+    const char *nan_fuse_sort=causal_ratio?
+        "kernel_myds_argsort_f32_i32_desc_causal_partition_nan":
+        "kernel_myds_argsort_f32_i32_desc_partition_nan";
+    const char *nan_fuse_merge=causal_ratio?
+        "kernel_myds_argsort_merge_f32_i32_desc_causal_partition_prefix_guarded":
+        "kernel_myds_argsort_merge_f32_i32_desc_partition_prefix_guarded";
     if(prefix) {
         atomic_fetch_add_explicit(&topk_prefix_counters[TP_REQUESTS],1,memory_order_relaxed);
         /* Probe both optional PSOs and allocate flags before sort writes.
          * Dispatch failure after classification starts fails closed. */
-        prefix=!topk_prefix_test_unavailable&&
-            myds_metal_kernel_max_threads("kernel_myds_argsort_visible_nan_rows")>=256u&&
-            myds_metal_kernel_max_threads(prefix_kernel)>=512u;
-        if(prefix&&s->topk_prefix_rows<n_rows) {
+        if(nan_fuse_requested) {
+            atomic_fetch_add_explicit(&topk_nan_fuse_counters[TN_REQUESTS],1,memory_order_relaxed);
+            /* Preserve the reference nth even if the optional PSO has a lower
+             * limit: changing the partition would change tie IDs. The clone
+             * reserves 32 SIMD partials, supporting at most 1024 threads. */
+            const char *sort_probe=(topk_nan_fuse_test_unavailable&MYDS_TOPK_NAN_FUSE_UNAVAILABLE_SORT)?
+                "kernel_myds_argsort_partition_nan_missing_sort":nan_fuse_sort;
+            const char *merge_probe=(topk_nan_fuse_test_unavailable&MYDS_TOPK_NAN_FUSE_UNAVAILABLE_MERGE)?
+                "kernel_myds_argsort_partition_nan_missing_merge":nan_fuse_merge;
+            prefix=!topk_prefix_test_unavailable&&nth<=1024u&&
+                myds_metal_kernel_max_threads(sort_probe)>=nth&&
+                myds_metal_kernel_max_threads(merge_probe)>=512u;
+            const uint64_t slots=(uint64_t)npr*n_rows;
+            if(prefix&&s->topk_nan_partition_slots<slots) {
+                myds_metal_buffer_t *flags=slots<=SIZE_MAX/4u?
+                    myds_metal_buffer_alloc((size_t)slots*4u):NULL;
+                if(flags) {
+                    myds_metal_buffer_free(s->topk_nan_partitions);
+                    s->topk_nan_partitions=flags;s->topk_nan_partition_slots=slots;
+                } else prefix=false;
+            }
+            if(!prefix)atomic_fetch_add_explicit(&topk_nan_fuse_counters[TN_UNAVAILABLE],1,memory_order_relaxed);
+        } else prefix=!topk_prefix_test_unavailable&&
+                myds_metal_kernel_max_threads("kernel_myds_argsort_visible_nan_rows")>=256u&&
+                myds_metal_kernel_max_threads(prefix_kernel)>=512u;
+        if(prefix&&!nan_fuse_requested&&s->topk_prefix_rows<n_rows) {
             myds_metal_buffer_t *flags=myds_metal_buffer_alloc((size_t)n_rows*4u);
             if(flags) {
                 myds_metal_buffer_free(s->topk_prefix_nan);
@@ -651,7 +702,7 @@ static int topk_rows_causal(myds_metal_buffer_t *ids,const myds_metal_buffer_t *
             } else prefix=false;
         }
         if(!prefix)atomic_fetch_add_explicit(&topk_prefix_counters[TP_UNAVAILABLE],1,memory_order_relaxed);
-        else {
+        else if(!nan_fuse_requested) {
             struct {uint32_t cols,rows,start,ratio;} na={n_cols,n_rows,causal_start,causal_ratio};
             const myds_metal_buffer_t *nb[]={scores,s->topk_prefix_nan};
             /* Closes WAR when the same scratch is reused within a batch. */
@@ -663,14 +714,29 @@ static int topk_rows_causal(myds_metal_buffer_t *ids,const myds_metal_buffer_t *
             const myds_metal_buffer_t *sort_deps[]={tmp_a,tmp_b};
             myds_metal_barrier_buffers(sort_deps,2);
         }
+        if(nan_fuse_requested) {
+            /* WAR on scratch/flags reused in a concurrent command batch; the
+             * upcoming sort overwrites every partition slot, including empty
+             * causal groups. Also order tmp writes after a preflight failure:
+             * dense fallback may follow a prior prefix call in this same batch.
+             * No reset dispatch or inter-group atomics are needed. */
+            const myds_metal_buffer_t *deps[]={scores,tmp_a,tmp_b,s->topk_nan_partitions};
+            myds_metal_barrier_buffers(deps,s->topk_nan_partitions?4u:3u);
+        }
     }
     struct sort_args a={.ne00=n_cols,.ne01=n_rows,.ne02=1,.ne03=1,.nb00=4,
         .nb01=(uint64_t)n_cols*4,.nb02=(uint64_t)n_cols*n_rows*4,.nb03=(uint64_t)n_cols*n_rows*4,
         .ne0=layout,.ne1=n_rows,.ne2=1,.ne3=1,.top_k=blocktop,
         .causal_start=causal_start,.causal_ratio=causal_ratio};
-    const myds_metal_buffer_t *b[]={scores,npr==1?ids:tmp_a};
-    if(!dispatch(causal_ratio?"kernel_argsort_f32_i32_desc_causal":"kernel_argsort_f32_i32_desc",
-        &a,sizeof(a),b,2,npr*n_rows,1,1,nth,1,1,((size_t)nth*8+15)&~(size_t)15))return 0;
+    const bool nan_fuse=prefix&&nan_fuse_requested;
+    const myds_metal_buffer_t *b[]={scores,npr==1?ids:tmp_a,s->topk_nan_partitions};
+    if(!dispatch(nan_fuse?nan_fuse_sort:causal_ratio?"kernel_argsort_f32_i32_desc_causal":"kernel_argsort_f32_i32_desc",
+        &a,sizeof(a),b,nan_fuse?3u:2u,npr*n_rows,1,1,nth,1,1,((size_t)nth*8+15)&~(size_t)15))return 0;
+    if(nan_fuse) {
+        myds_metal_barrier_buffer(s->topk_nan_partitions);
+        atomic_fetch_add_explicit(&topk_prefix_counters[TP_ROWS],n_rows,memory_order_relaxed);
+        atomic_fetch_add_explicit(&topk_nan_fuse_counters[TN_PARTITIONS],(uint64_t)npr*n_rows,memory_order_relaxed);
+    }
     myds_metal_buffer_t *cur=tmp_a,*next=tmp_b;
     for(uint32_t len=blocktop;len<layout;len*=2) {
         if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(cur);
@@ -679,10 +745,16 @@ static int topk_rows_causal(myds_metal_buffer_t *ids,const myds_metal_buffer_t *
             .nb01=(uint64_t)n_cols*4,.nb02=(uint64_t)n_cols*n_rows*4,.nb03=(uint64_t)n_cols*n_rows*4,
             .ne0=layout,.ne1=n_rows,.ne2=1,.ne3=1,.top_k=nm==1?top:layout,.len=len,.block_width=nth,
             .block_top_k=blocktop,.causal_start=causal_start,.causal_ratio=causal_ratio};
-        const myds_metal_buffer_t *mb[]={scores,cur,nm==1?ids:next,s->topk_prefix_nan};
+        const myds_metal_buffer_t *mb[]={scores,cur,nm==1?ids:next,
+            nan_fuse?s->topk_nan_partitions:s->topk_prefix_nan};
         if(prefix) {
-            struct prefix_merge_args pm={m,top};
-            if(!dispatch(prefix_kernel,&pm,sizeof(pm),mb,4,nm*n_rows,1,1,len<512?len:512,1,1,0))return 0;
+            if(nan_fuse) {
+                struct nan_fuse_merge_args fm={m,top,npr};
+                if(!dispatch(nan_fuse_merge,&fm,sizeof(fm),mb,4,nm*n_rows,1,1,len<512?len:512,1,1,0))return 0;
+            } else {
+                struct prefix_merge_args pm={m,top};
+                if(!dispatch(prefix_kernel,&pm,sizeof(pm),mb,4,nm*n_rows,1,1,len<512?len:512,1,1,0))return 0;
+            }
             atomic_fetch_add_explicit(&topk_prefix_counters[TP_MERGES],1,memory_order_relaxed);
             topk_prefix_count_writes(n_cols,top,n_rows,causal_start,causal_ratio,nth,blocktop,layout,len);
         } else if(!dispatch(causal_ratio?"kernel_argsort_merge_f32_i32_desc_causal":
@@ -692,6 +764,7 @@ static int topk_rows_causal(myds_metal_buffer_t *ids,const myds_metal_buffer_t *
     }
     if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(ids);
     if(prefix)atomic_fetch_add_explicit(&topk_prefix_counters[TP_ENCODED],1,memory_order_relaxed);
+    if(nan_fuse)atomic_fetch_add_explicit(&topk_nan_fuse_counters[TN_ENCODED],1,memory_order_relaxed);
     return 1;
 }
 int myds_v41_gpu_topk(myds_metal_buffer_t *ids,const myds_metal_buffer_t *scores,

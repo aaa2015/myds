@@ -46,6 +46,13 @@ INDEXER_COMPACT_COUNTERS = ('requests', 'encoded', 'unavailable', 'dense_rows', 
 TOPK_PREFIX_COUNTERS = ('requests', 'encoded', 'unavailable', 'classified_rows', 'merge_dispatches',
                        'dense_write_slots', 'prefix_write_slots', 'decode_requests',
                        'decode_encoded', 'decode_unavailable')
+CANDIDATE_PATHS = {
+    'gpu_topk_nan_fuse': ('MYDS_INDEXER_TOPK_NAN_FUSE', 'unavailable',
+        ('requests', 'encoded', 'unavailable', 'classified_partitions',
+         'decode_requests', 'decode_encoded', 'decode_unavailable')),
+    'gpu_batch2_q8_shared': ('MYDS_BATCH2_Q8_SHARED', 'failures',
+        ('requests', 'encoded', 'failures', 'decode_requests', 'decode_encoded', 'decode_failures')),
+}
 FORBIDDEN_ENV_PREFIXES = ('MYDS_PROFILE_', 'MYDS_SKIP_', 'MYDS_TRACE_', 'MYDS_BATCH_TRACE_')
 FORBIDDEN_ENV_NAMES = {'MYDS_MOE_STEP_PROF', 'MYDS_PHASE_PROFILE_FILE', 'MYDS_DISABLE_V41_PREFILL',
                        'MYDS_PROF', 'MYDS_DISPATCH_HIST', 'MYDS_DEBUG_DISPATCH'}
@@ -267,6 +274,8 @@ def validate_run(directory, state, audit):
             audit.require(telemetry['pld_accepted'] <= telemetry['pld_proposed'], 'PLD accepted exceeds proposed')
     elif len(argv) == 7 or state.get('dspark_model'):
         audit.require(False, 'Historical protocol cannot establish DSpark execution')
+    if state.get('arm') in ('batch2', 'pld-batch2', 'hybrid'):
+        require_batch2_graph(samples)
     for sample in samples:
         if 'gpu_indexer_compact' not in sample:
             continue  # Earlier harnesses did not expose this path counter API.
@@ -296,6 +305,9 @@ def validate_run(directory, state, audit):
         for key in ('requests', 'encoded', 'unavailable'):
             audit.require(counters['decode_' + key] <= counters[key],
                           'Topk prefix decode counters exceed request total')
+    validate_candidate_paths(samples, state['environment'], audit)
+    for name in CANDIDATE_PATHS:
+        group[name] = candidate_paths(samples, name)
     group['callback_latency_ms'] = distribution(
         [value for sample in samples if not sample['warmup'] for value in sample['callback_intervals_ms']])
     group['decode_telemetry'] = telemetry_summary(
@@ -377,6 +389,67 @@ def topk_prefix_paths(samples):
                      'callback. These are not actual GPU traffic or timing.'}
 
 
+def validate_candidate_paths(samples, environment, audit):
+    """Validate native encoding records; absent historical records remain usable."""
+    for name, (flag, failure, keys) in CANDIDATE_PATHS.items():
+        for sample in samples:
+            counters = sample.get(name)
+            if counters is None:
+                audit.require(environment.get(flag) != '1', 'Missing candidate path counters: ' + name)
+                continue
+            audit.require(isinstance(counters, dict), 'Invalid candidate path counters: ' + name)
+            for key in keys:
+                value = counters.get(key)
+                audit.require(type(value) is int and value >= 0, 'Invalid candidate counter: ' + name + '.' + key)
+            for key in ('requests', 'encoded', failure):
+                audit.require(counters['decode_' + key] <= counters[key],
+                              'Candidate decode counter exceeds request total: ' + name)
+            audit.require(counters['encoded'] <= counters['requests'] and
+                          counters[failure] <= counters['requests'] and
+                          counters['decode_encoded'] <= counters['decode_requests'] and
+                          counters['decode_' + failure] <= counters['decode_requests'],
+                          'Candidate result exceeds requests: ' + name)
+            if failure == 'unavailable':
+                audit.require(counters['encoded'] + counters[failure] == counters['requests'] and
+                              counters['decode_encoded'] + counters['decode_' + failure] == counters['decode_requests'],
+                              'Candidate encoding/fallback counts differ from requests: ' + name)
+            if environment.get(flag, '0') != '1':
+                audit.require(not any(counters[key] for key in keys),
+                              'Disabled candidate has execution counters: ' + name)
+
+
+def candidate_paths(samples, name):
+    _, failure, keys = CANDIDATE_PATHS[name]
+    records = [{'run': s['run'], 'warmup': s['warmup'], **s[name]}
+               for s in samples if isinstance(s.get(name), dict)]
+    if not records:
+        return None
+    formal = [r for r in records if not r['warmup']]
+    return {'runs': records,
+            'encoded_in_formal_decode': any(r['decode_encoded'] > 0 for r in formal),
+            'any_failure_in_formal_runs': any(r[failure] > 0 for r in formal),
+            'formal_totals': {k: sum(r[k] for r in formal) for k in keys},
+            'scope': 'Host encoding counters, not GPU duration, physical weight traffic or NaN branch counts; '
+                     'decode counters exclude work through the first callback.'}
+
+
+def require_candidate_path(samples, name):
+    _, failure, _ = CANDIDATE_PATHS[name]
+    formal = [s.get(name) for s in samples if not s['warmup']]
+    if not formal or any(not c or c['requests'] <= 0 or c['encoded'] != c['requests'] or c[failure] or
+                         c['decode_requests'] <= 0 or c['decode_encoded'] != c['decode_requests'] or
+                         c['decode_' + failure] for c in formal):
+        raise ValueError('Required candidate path did not encode every formal decode request: ' + name)
+
+
+def require_batch2_graph(samples):
+    """Reject successful scalar recovery masking a failed Batch2 graph."""
+    formal = [s.get('decode_telemetry') for s in samples if not s['warmup']]
+    if not formal or any(not c or c.get('batch2_calls', 0) <= 0 or c.get('batch2_hits', 0) <= 0 or
+                         c.get('batch2_failures', 0) or c.get('batch2_fallbacks', 0) for c in formal):
+        raise ValueError('Required Batch2 graph did not execute with hits and zero failures/fallbacks in every formal sample')
+
+
 def compare(args):
     audit = load_audit()
     groups, raw, states = [], [], []
@@ -393,6 +466,10 @@ def compare(args):
         audit.require(base['metadata'][key] == candidate['metadata'][key], 'Input/config differs: ' + key)
     for key in ('request_sha256', 'model'):
         audit.require(states[0][key] == states[1][key], 'File identity differs: ' + key)
+    audit.require(states[0].get('dspark_model') == states[1].get('dspark_model'),
+                  'File identity differs: dspark_model')
+    audit.require(states[0].get('arm', 'custom') == states[1].get('arm', 'custom'),
+                  'Named measurement arm differs between base and candidate')
     if getattr(args, 'same_build', False):
         for key in ('binary_sha256', 'metallib_sha256', 'source'):
             audit.require(states[0].get(key) is not None and states[0].get(key) == states[1].get(key),
@@ -432,6 +509,8 @@ def compare(args):
                'environment_changes': {name: [states[0]['environment'].get(name), states[1]['environment'].get(name)]
                    for name in sorted(set(states[0]['environment']) | set(states[1]['environment']))
                    if states[0]['environment'].get(name) != states[1]['environment'].get(name)}}
+    for name in CANDIDATE_PATHS:
+        summary[name] = {'base': base[name], 'candidate': candidate[name]}
     control_directory = getattr(args, 'control', None)
     if control_directory is not None:
         control_directory = control_directory.resolve()
@@ -552,6 +631,8 @@ def run(args):
         if result:
             raise RuntimeError(f'Harness exited {result}; inspect {output / "run.log"}')
         group, samples = validate_run(output, state, load_audit())
+        if arm in ('batch2', 'pld-batch2', 'hybrid') or getattr(args, 'require_batch2_q8_shared', False):
+            require_batch2_graph(samples)
         if getattr(args, 'require_topk_prefix', False):
             formal = [sample.get('gpu_topk_prefix') for sample in samples if not sample['warmup']]
             if not formal or any(not counters or counters['requests'] <= 0 or
@@ -560,6 +641,10 @@ def run(args):
                                  counters['decode_encoded'] != counters['decode_requests'] or
                                  counters['decode_unavailable'] for counters in formal):
                 raise ValueError('Required topk prefix path did not encode every formal decode request')
+        for option, name in (('require_topk_nan_fuse', 'gpu_topk_nan_fuse'),
+                             ('require_batch2_q8_shared', 'gpu_batch2_q8_shared')):
+            if getattr(args, option, False):
+                require_candidate_path(samples, name)
         group['attention_paths'] = attention_paths(samples)
         write_json(output / 'run-summary.json', group)
         state['status'] = 'validated'
@@ -614,6 +699,10 @@ def main():
     measurement.add_argument('--out', type=Path, required=True, help='New output directory; existing directories are refused')
     measurement.add_argument('--require-topk-prefix', action='store_true',
                              help='Require all formal runs to encode every eligible decode prefix request without fallback')
+    measurement.add_argument('--require-topk-nan-fuse', action='store_true',
+                             help='Require native fused NaN sort counters in every formal decode, with no fallback')
+    measurement.add_argument('--require-batch2-q8-shared', action='store_true',
+                             help='Require native shared Q8 projection counters in every formal decode, with no failures')
     measurement.add_argument('--env', action='append', default=[], help='Explicit MYDS_NAME=value, repeatable')
     measurement.add_argument('--max-new-tokens', type=int, choices=OUTPUT_CAPS, default=64)
     measurement.add_argument('--context', type=int, default=262144)

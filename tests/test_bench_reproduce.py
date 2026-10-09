@@ -430,6 +430,91 @@ class BenchReproduceTests(unittest.TestCase):
                     self.invoke_cpu_runner(args, records)
                 self.assertEqual(json.loads((args.out / 'run-state.json').read_text())['status'], 'failed')
 
+    def test_required_new_candidate_paths_reject_missing_and_prefill_only_evidence(self):
+        # Native-counter schema fixtures exercise the real runner's rejection
+        # and retained failure logs; no model or Metal work is executed here.
+        for name, (flag, failure, keys) in self.driver.CANDIDATE_PATHS.items():
+            encoded = dict.fromkeys(keys, 0)
+            encoded.update(requests=4, encoded=4, decode_requests=2, decode_encoded=2)
+            if 'classified_partitions' in encoded:
+                encoded['classified_partitions'] = 64
+            for mode in ('missing', 'prefill-only', 'one-formal-only', 'failure', 'encoded'):
+                with self.subTest(path=name, mode=mode):
+                    args = self.run_args()
+                    args.out = self.directory / (name + '-' + mode)
+                    args.env = [flag + '=1']
+                    setattr(args, 'require_topk_nan_fuse' if name == 'gpu_topk_nan_fuse'
+                            else 'require_batch2_q8_shared', True)
+                    env = dict(self.driver.DEFAULT_ENV, **{flag: '1'})
+                    records = self.v2_records(environment=env)
+                    if name == 'gpu_batch2_q8_shared':
+                        for sample in records:
+                            if sample['kind'] == 'sample':
+                                sample['decode_telemetry'].update(batch2_calls=5, batch2_hits=2, batch2_misses=3)
+                    for sample in records:
+                        if sample['kind'] != 'sample' or mode == 'missing':
+                            continue
+                        counters = dict(encoded)
+                        if mode == 'prefill-only':
+                            counters.update(decode_requests=0, decode_encoded=0)
+                        elif mode == 'one-formal-only' and not sample['warmup'] and sample['run'] != 1:
+                            counters = dict.fromkeys(keys, 0)
+                        elif mode == 'failure':
+                            counters.update(encoded=0, decode_encoded=0)
+                            counters[failure], counters['decode_' + failure] = 4, 2
+                        sample[name] = counters
+                    if mode == 'encoded':
+                        result, _, _ = self.invoke_cpu_runner(args, records)
+                        self.assertEqual(result, 0)
+                        summary = json.loads((args.out / 'run-summary.json').read_text())[name]
+                        self.assertTrue(summary['encoded_in_formal_decode'])
+                    else:
+                        with self.assertRaisesRegex(ValueError, 'candidate path'):
+                            self.invoke_cpu_runner(args, records)
+                        state = json.loads((args.out / 'run-state.json').read_text())
+                        self.assertEqual(state['status'], 'failed')
+                        self.assertTrue((args.out / 'run-metrics.jsonl').is_file())
+
+    def test_shared_helper_success_cannot_mask_failed_batch2_graph(self):
+        for field, value in (('batch2_calls', 0), ('batch2_hits', 0),
+                             ('batch2_failures', 1), ('batch2_fallbacks', 1)):
+            args = self.run_args(); args.out = self.directory / ('graph-' + field)
+            args.env = ['MYDS_BATCH2_Q8_SHARED=1']; args.require_batch2_q8_shared = True
+            records = self.v2_records(environment=dict(self.driver.DEFAULT_ENV, MYDS_BATCH2_Q8_SHARED='1'))
+            for sample in records:
+                if sample['kind'] == 'sample':
+                    sample['decode_telemetry'].update(batch2_calls=5, batch2_hits=2, batch2_misses=3)
+                    sample['gpu_batch2_q8_shared'] = dict(requests=4, encoded=4, failures=0,
+                                                        decode_requests=2, decode_encoded=2, decode_failures=0)
+            bad = next(s for s in records if s['kind'] == 'sample' and s['run'] == 2)
+            bad['decode_telemetry'][field] = value
+            if field == 'batch2_calls':
+                bad['decode_telemetry'].update(batch2_hits=0, batch2_misses=0)
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'Required Batch2 graph'):
+                self.invoke_cpu_runner(args, records)
+            self.assertEqual(json.loads((args.out / 'run-state.json').read_text())['status'], 'failed')
+
+    def test_new_candidate_counters_reject_disabled_and_invalid_records(self):
+        for name, (flag, _, keys) in self.driver.CANDIDATE_PATHS.items():
+            for mode in ('negative', 'bool', 'decode-exceeds-total', 'disabled'):
+                with self.subTest(path=name, mode=mode):
+                    args = self.run_args()
+                    args.out = self.directory / (name + '-bad-' + mode)
+                    value = '0' if mode == 'disabled' else '1'
+                    args.env = [flag + '=' + value]
+                    records = self.v2_records(environment=dict(self.driver.DEFAULT_ENV, **{flag: value}))
+                    for sample in records:
+                        if sample['kind'] == 'sample':
+                            sample[name] = dict.fromkeys(keys, 0)
+                    counters = records[3][name]
+                    if mode == 'negative': counters['requests'] = -1
+                    elif mode == 'bool': counters['encoded'] = True
+                    elif mode == 'decode-exceeds-total': counters.update(decode_requests=1, decode_encoded=1)
+                    else: counters.update(requests=1, encoded=1)
+                    with self.assertRaisesRegex(ValueError, '[Cc]andidate'):
+                        self.invoke_cpu_runner(args, records)
+                    self.assertEqual(json.loads((args.out / 'run-state.json').read_text())['status'], 'failed')
+
     def test_topk_prefix_summary_requires_formal_encoding(self):
         encoded = dict(requests=4, encoded=4, unavailable=0, classified_rows=4,
                        merge_dispatches=16, dense_write_slots=100000, prefix_write_slots=20000,
@@ -677,6 +762,34 @@ class BenchReproduceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.driver.compare(args)
         self.assertFalse(args.out.exists())
+
+    def test_compare_binds_support_identity_and_named_arm(self):
+        support = self.directory / 'support.gguf'
+        support.write_bytes(b'CPU identity fixture; never loaded')
+        args = self.comparison_fixture()
+        for directory in (args.base, args.candidate):
+            records = self.v2_records(support=support)
+            state = self.state_for(records)
+            state['argv'].append(str(support.resolve()))
+            state['dspark_model'] = self.driver.file_identity(support.resolve(), 'a' * 64)
+            state['arm'] = 'custom'
+            write_samples(directory / 'run-metrics.jsonl', records)
+            (directory / 'run-state.json').write_text(json.dumps(state))
+        original = json.loads((args.candidate / 'run-state.json').read_text())
+        for field, message in (('dspark_model', 'File identity differs: dspark_model'),
+                               ('arm', 'Named measurement arm differs')):
+            state = copy.deepcopy(original)
+            if field == 'dspark_model':
+                state[field]['artifact_sha256'] = 'b' * 64
+            else:
+                state[field] = 'target'
+            (args.candidate / 'run-state.json').write_text(json.dumps(state))
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, message):
+                self.driver.compare(args)
+            self.assertFalse(args.out.exists())
+        (args.candidate / 'run-state.json').write_text(json.dumps(original))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.driver.compare(args), 0)
 
     def test_compare_rejects_raw_token_hash_mismatch(self):
         args = self.comparison_fixture()

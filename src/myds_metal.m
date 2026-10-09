@@ -73,6 +73,28 @@ static uint64_t                    g_shared_event_val = 0;
 static bool                        g_initialized = false;
 static int g_qkv_finish_available = -1;
 static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *g_native_pipelines = nil;
+static atomic_uint_fast64_t g_batch2_q8_shared_requests = 0;
+static atomic_uint_fast64_t g_batch2_q8_shared_encoded = 0;
+static atomic_uint_fast64_t g_batch2_q8_shared_failures = 0;
+static id<MTLComputePipelineState> batch2_q8_shared_pipeline(uint32_t nsg, uint32_t nr0);
+
+int myds_metal_batch2_q8_shared_mode(void) {
+    const char *value = getenv("MYDS_BATCH2_Q8_SHARED");
+    if (!value || strcmp(value, "0") == 0) return 0;
+    if (strcmp(value, "1") == 0) return 1;
+    fprintf(stderr, "myds_metal: MYDS_BATCH2_Q8_SHARED must be exactly 0 or 1\n");
+    return -1;
+}
+
+void myds_metal_batch2_q8_shared_counters(
+    myds_metal_batch2_q8_shared_counters_t *out, bool reset) {
+#define SHARED_COUNT(field) (reset ? atomic_exchange_explicit(&g_batch2_q8_shared_##field, 0, memory_order_relaxed) \
+                                 : atomic_load_explicit(&g_batch2_q8_shared_##field, memory_order_relaxed))
+    myds_metal_batch2_q8_shared_counters_t value = {
+        .requests = SHARED_COUNT(requests), .encoded = SHARED_COUNT(encoded), .failures = SHARED_COUNT(failures)};
+    if (out) *out = value;
+#undef SHARED_COUNT
+}
 struct native_kernel_cache_entry {
     char name[64];
     id<MTLComputePipelineState> pso;
@@ -443,6 +465,9 @@ static const char *g_metal_base_preamble =
 
 int myds_metal_init(const char *shader_dir) {
     if (g_initialized) return 1;
+
+    const int batch2_q8_shared = myds_metal_batch2_q8_shared_mode();
+    if (batch2_q8_shared < 0) return 0;
 
     /* PSO function constants are initialization-time settings. An absent down
      * override inherits the existing IQ2 setting, including its legacy parser.
@@ -949,12 +974,24 @@ int myds_metal_init(const char *shader_dir) {
             return 0;
         }
 
+        /* An explicit experiment requires all of its named PSOs. Default0
+         * never asks an older library for these optional symbols. */
+        if (batch2_q8_shared) {
+            for (uint32_t nsg = 4; nsg <= 8; nsg += 4)
+                for (uint32_t nr0 = 2; nr0 <= 4; nr0 += 2)
+                    if (!batch2_q8_shared_pipeline(nsg, nr0)) {
+                        g_initialized = true;
+                        myds_metal_cleanup();
+                        return 0;
+                    }
+        }
         g_moe_iq2_constant_lut = moe_iq2_constant_lut;
         g_initialized = true;
         MYDS_LOG_I("myds_metal: Initialized successfully on GPU: %s", [[g_device name] UTF8String]);
         MYDS_LOG_I("Routed MoE geometry: IQ2 NSG=%d, Q2 down NSG=%d (%s)",
                    g_moe_nsg, g_moe_down_nsg, down_nsg_env ? "explicit" : "inherited");
         MYDS_LOG_I("Routed MoE IQ2 LUT: %s", g_moe_iq2_constant_lut ? "constant (explicit)" : "threadgroup (reference)");
+        MYDS_LOG_I("Batch2 output-B Q8 shared weights: %s", batch2_q8_shared ? "enabled (explicit; eligible TAIL only)" : "disabled (scalar reference)");
         return 1;
     }
 }
@@ -2473,6 +2510,111 @@ static uint32_t qkv_nr0(void) {
     if(!cached) {const char *v=getenv("MYDS_QKV_NR0");cached=!v||strcmp(v,"4")==0?4u:2u;}
     return cached;
 }
+
+static id<MTLComputePipelineState> batch2_q8_shared_pipeline(uint32_t nsg, uint32_t nr0) {
+    if ((nsg != 4 && nsg != 8) || (nr0 != 2 && nr0 != 4) || !g_library) return nil;
+    NSString *key = [NSString stringWithFormat:@"batch2_q8_shared_%u_%u", nsg, nr0];
+    id<MTLComputePipelineState> pipeline = g_native_pipelines[key];
+    if (pipeline) return pipeline;
+    MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
+    short short_nsg = (short)nsg;
+    [values setConstantValue:&short_nsg type:MTLDataTypeShort atIndex:600];
+    NSString *name = [NSString stringWithFormat:@"kernel_dsv41_q8_shared2_bf16_r%u", nr0];
+    NSError *error = nil;
+    id<MTLFunction> function = [g_library newFunctionWithName:name constantValues:values error:&error];
+    if (function) pipeline = [g_device newComputePipelineStateWithFunction:function error:&error];
+    if (!pipeline) {
+        fprintf(stderr, "myds_metal: Batch2 Q8 shared PSO %s NSG%u unavailable; refusing fallback (%s)\n",
+                name.UTF8String, nsg, error.localizedDescription.UTF8String ?: "no library/function");
+        return nil;
+    }
+    if (!g_native_pipelines) g_native_pipelines = [NSMutableDictionary new];
+    g_native_pipelines[key] = pipeline;
+    return pipeline;
+}
+
+static int batch2_q8_shared_failure(const char *reason) {
+    atomic_fetch_add_explicit(&g_batch2_q8_shared_failures, 1, memory_order_relaxed);
+    fprintf(stderr, "myds_metal: Batch2 Q8 shared projection rejected: %s; refusing fallback\n", reason);
+    return 0;
+}
+
+static bool batch2_buffer_range(const myds_metal_buffer_t *buffer, uint64_t bytes) {
+    return buffer && buffer->mtl_buf && bytes <= buffer->size &&
+           buffer->offset <= buffer->mtl_buf.length && bytes <= buffer->mtl_buf.length - buffer->offset;
+}
+static bool batch2_buffer_overlap(const myds_metal_buffer_t *a, uint64_t a_bytes,
+                                 const myds_metal_buffer_t *b, uint64_t b_bytes) {
+    /* Ranges were validated before this subtraction-based overlap check. */
+    if (a->mtl_buf != b->mtl_buf) return false;
+    return a->offset <= b->offset ? b->offset - a->offset < a_bytes
+                                  : a->offset - b->offset < b_bytes;
+}
+
+int myds_metal_v41_gemv_bf16_shared2(myds_metal_buffer_t *const out[2],
+    const myds_metal_buffer_t *weight, myds_metal_buffer_t *const input[2],
+    uint32_t out_dim, uint32_t in_dim) {
+    atomic_fetch_add_explicit(&g_batch2_q8_shared_requests, 1, memory_order_relaxed);
+    if (!g_initialized || !out || !input || !out_dim || !in_dim ||
+        out_dim > INT32_MAX - 3u || in_dim > INT32_MAX || in_dim % 32u)
+        return batch2_q8_shared_failure("invalid runtime or dimensions");
+    const uint64_t row_bytes = (uint64_t)(in_dim / 32u) * 34u;
+    const uint64_t weight_bytes = row_bytes * out_dim, input_bytes = (uint64_t)in_dim * 4u;
+    const uint64_t output_bytes = (uint64_t)out_dim * 4u;
+    if (!batch2_buffer_range(weight, weight_bytes) || weight->offset % 2u)
+        return batch2_q8_shared_failure("invalid Q8 weight range/alignment");
+    for (unsigned t = 0; t < 2; ++t)
+        if (!batch2_buffer_range(input[t], input_bytes) || input[t]->offset % 4u ||
+            !batch2_buffer_range(out[t], output_bytes) || out[t]->offset % 16u)
+            return batch2_q8_shared_failure("invalid input/output range/alignment");
+    if (batch2_buffer_overlap(out[0], output_bytes, out[1], output_bytes))
+        return batch2_q8_shared_failure("overlapping output rows");
+    for (unsigned t = 0; t < 2; ++t) {
+        if (batch2_buffer_overlap(out[t], output_bytes, weight, weight_bytes))
+            return batch2_q8_shared_failure("output overlaps weights");
+        for (unsigned s = 0; s < 2; ++s)
+            if (batch2_buffer_overlap(out[t], output_bytes, input[s], input_bytes))
+                return batch2_q8_shared_failure("output overlaps input");
+    }
+    const uint32_t nsg = out_dim > 65536u ? 8u : 4u, nr0 = qkv_nr0();
+    const NSUInteger shmem_bytes = 32u * nr0 * 2u * sizeof(float);
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = batch2_q8_shared_pipeline(nsg, nr0);
+        if (!pipeline) return batch2_q8_shared_failure("candidate PSO unavailable");
+        if (32u * nsg > pipeline.maxTotalThreadsPerThreadgroup ||
+            32u * nsg > g_device.maxThreadsPerThreadgroup.width ||
+            shmem_bytes > g_device.maxThreadgroupMemoryLength ||
+            pipeline.staticThreadgroupMemoryLength > g_device.maxThreadgroupMemoryLength - shmem_bytes)
+            return batch2_q8_shared_failure("candidate geometry exceeds PSO/device limits");
+        /* A public entry may reuse either output while auto barriers are off.
+         * Close previous readers/writers before this kernel overwrites it. */
+        if (g_batch_cb && !g_auto_barrier) {
+            const myds_metal_buffer_t *deps[] = {input[0], input[1], out[0], out[1]};
+            myds_metal_barrier_buffers(deps, 4);
+        }
+        struct ds4_metal_args_mul_mv a = {0};
+        a.ne00 = (int32_t)in_dim; a.ne01 = (int32_t)out_dim; a.ne02 = 1;
+        a.nb00 = 34; a.nb01 = row_bytes; a.nb02 = weight_bytes; a.nb03 = weight_bytes;
+        a.ne10 = (int32_t)in_dim; a.ne11 = 1; a.ne12 = 1;
+        a.nb10 = 4; a.nb11 = input_bytes; a.nb12 = input_bytes; a.nb13 = input_bytes;
+        a.ne0 = (int32_t)out_dim; a.ne1 = 1; a.nr0 = (int16_t)nr0; a.r2 = 1; a.r3 = 1;
+        id<MTLCommandBuffer> cb = g_batch_cb ?: [g_queue commandBuffer];
+        if (!cb) return batch2_q8_shared_failure("command buffer unavailable");
+        id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
+        if (!enc) return batch2_q8_shared_failure("encoder unavailable");
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&a length:sizeof(a) atIndex:0];
+        const myds_metal_buffer_t *buffers[] = {weight, input[0], input[1], out[0], out[1]};
+        for (unsigned i = 0; i < 5; ++i) [enc setBuffer:buffers[i]->mtl_buf offset:buffers[i]->offset atIndex:i + 1u];
+        [enc setThreadgroupMemoryLength:shmem_bytes atIndex:0];
+        const char *name = nr0 == 4u ? "kernel_dsv41_q8_shared2_bf16_r4" : "kernel_dsv41_q8_shared2_bf16_r2";
+        metal_dispatch(enc, name, MTLSizeMake(((NSUInteger)out_dim + nr0 - 1u) / nr0, 1, 1), MTLSizeMake(32, nsg, 1));
+        atomic_fetch_add_explicit(&g_batch2_q8_shared_encoded, 1, memory_order_relaxed);
+        if (!v41_finish(cb, enc)) return batch2_q8_shared_failure("command completion failed");
+        return 1;
+    }
+}
+
 int myds_metal_v41_gemv_bf16(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *weight,const myds_metal_buffer_t *input,
     uint32_t out_dim,uint32_t in_dim,ggml_type type) {

@@ -11,6 +11,11 @@ static void init_fuse(void) {
     fuse = !(value && strcmp(value, "0") == 0);
 }
 
+bool myds_v41_decode_q8_fuse_bf16_enabled(void) {
+    pthread_once(&fuse_once, init_fuse);
+    return fuse != 0;
+}
+
 void myds_v41_decode_qkv_scope_begin(myds_v41_decode_qkv_scope_t *scope, bool trace_on) {
     if (!scope || scope->active) return;
     const char *value = getenv("MYDS_QKV_CONCURRENT");

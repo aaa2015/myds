@@ -291,6 +291,73 @@ kernel void kernel_mul_mv_q8_0_f32_bf16_r4(
         args,src0,src1,dst,shmem,tgpig,tiisg,sgitg);
 }
 
+/* Batch2 output-B experiment. A thread loads a quantized weight and its
+ * half scale once for two independent input rows. Each token preserves the
+ * scalar helper's eight products, block-scale placement, K walk and both
+ * simd_sum reductions. No dequantized half staging or matrix instructions. */
+template<short NR0>
+void kernel_dsv41_q8_shared2_bf16_impl(
+        constant ds4_metal_args_mul_mv &args,
+        device const char *src0,
+        device const float *input0, device const float *input1,
+        device float *output0, device float *output1,
+        threadgroup char *shmem,
+        uint3 tgpig, ushort tiisg, ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+    constexpr short NW = N_SIMDWIDTH, NQ = 8;
+    const int nb = args.ne00 / QK8_0;
+    const int r0 = tgpig.x * NR0;
+    device const block_q8_0 *ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset = (uint64_t)(r0 + row) * args.nb01;
+        ax[row] = (device const block_q8_0 *)(src0 + ((r0 + row < args.ne01) ? offset : 0));
+    }
+    float sumf[2][NR0];
+    FOR_UNROLL (short t = 0; t < 2; ++t)
+        FOR_UNROLL (short row = 0; row < NR0; ++row) sumf[t][row] = 0.f;
+    const short ix = tiisg / (NW / NQ), il = tiisg % (NW / NQ);
+    const int ib0 = sgitg * NQ + ix;
+    device const float *yb0 = input0 + ib0 * QK8_0 + il * NQ;
+    device const float *yb1 = input1 + ib0 * QK8_0 + il * NQ;
+    for (int ib = ib0; ib < nb; ib += NSG * NQ) {
+        float yl0[NQ], yl1[NQ];
+        for (short i = 0; i < NQ; ++i) { yl0[i] = yb0[i]; yl1[i] = yb1[i]; }
+        for (short row = 0; row < NR0; ++row) {
+            device const int8_t *qs = ax[row][ib].qs + il * NQ;
+            const half d = ax[row][ib].d;
+            float sumq0 = 0.f, sumq1 = 0.f;
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                const int8_t q = qs[i];
+                sumq0 += q * yl0[i];
+                sumq1 += q * yl1[i];
+            }
+            sumf[0][row] += sumq0 * d;
+            sumf[1][row] += sumq1 * d;
+        }
+        yb0 += NSG * NQ * QK8_0; yb1 += NSG * NQ * QK8_0;
+    }
+    /* Reuse the authoritative scalar reducer for each token. Separate
+     * planes keep both initialization and both reduction trees unchanged. */
+    helper_mv_reduce_and_write<NR0,true>(output0, sumf[0], r0, args.ne01, tiisg, sgitg, shmem);
+    helper_mv_reduce_and_write<NR0,true>(output1, sumf[1], r0, args.ne01, tiisg, sgitg,
+                                       shmem + NW * NR0 * sizeof(float));
+}
+
+#define DSV41_Q8_SHARED2_KERNEL(NR) \
+kernel void kernel_dsv41_q8_shared2_bf16_r##NR( \
+        constant ds4_metal_args_mul_mv &args [[buffer(0)]], \
+        device const char *weight [[buffer(1)]], \
+        device const float *input0 [[buffer(2)]], device const float *input1 [[buffer(3)]], \
+        device float *output0 [[buffer(4)]], device float *output1 [[buffer(5)]], \
+        threadgroup char *shmem [[threadgroup(0)]], \
+        uint3 tgpig [[threadgroup_position_in_grid]], \
+        ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
+    kernel_dsv41_q8_shared2_bf16_impl<NR>(args,weight,input0,input1,output0,output1,shmem,tgpig,tiisg,sgitg); \
+}
+DSV41_Q8_SHARED2_KERNEL(2)
+DSV41_Q8_SHARED2_KERNEL(4)
+#undef DSV41_Q8_SHARED2_KERNEL
+
 
 
 // Q8_0 matvec whose output is this rank's TP partial in its slab slot: same

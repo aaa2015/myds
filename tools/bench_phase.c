@@ -30,6 +30,8 @@ typedef struct {
     double times[MAX_OUTPUT_TOKENS], first, last;
     uint64_t byte_count, bytes_hash, ids_hash;
     myds_v41_gpu_topk_prefix_counters_t first_topk_prefix;
+    myds_v41_gpu_topk_nan_fuse_counters_t first_nan_fuse;
+    myds_metal_batch2_q8_shared_counters_t first_q8_shared;
 } capture_t;
 
 static double now_s(void) {
@@ -50,6 +52,8 @@ static void capture(const char *piece, size_t length, int32_t id, void *opaque) 
     if (c->count == 0) {
         c->first = t;
         myds_v41_gpu_topk_prefix_counters(&c->first_topk_prefix, false);
+        myds_v41_gpu_topk_nan_fuse_counters(&c->first_nan_fuse, false);
+        myds_metal_batch2_q8_shared_counters(&c->first_q8_shared, false);
     }
     c->last = t;
     if (c->count < MAX_OUTPUT_TOKENS) {
@@ -233,7 +237,7 @@ int main(int argc, char **argv) {
         "MYDS_DISABLE_MOE_MM", "MYDS_DECODE_SPLIT", "MYDS_ATTN_GATHER", "MYDS_SUFFIX_SHRINK", "MYDS_SUFFIX_SHRINK_SHIFT",
         "MYDS_RESIDENCY_KEEP_ALIVE_S", "MYDS_RESIDENCY_HB_MS", "MYDS_NO_RESIDENCY_HB", "MYDS_NO_PREFIX_SNAPSHOT",
         "MYDS_CHUNK_KEY_MAX", "MYDS_ATTN_KEYS_CLAMP", "MYDS_INDEXER_BATCH_FLOATS", "MYDS_INDEXER_TILED",
-        "MYDS_INDEXER_COMPACT_SCORER", "MYDS_INDEXER_TOPK_PREFIX_MERGE",
+        "MYDS_INDEXER_COMPACT_SCORER", "MYDS_INDEXER_TOPK_PREFIX_MERGE", "MYDS_INDEXER_TOPK_NAN_FUSE",
         "MYDS_BLOCK_BUDGET", "MYDS_DISABLE_MUL_MM", "MYDS_MM_MIN_M", "MYDS_DISABLE_MM_ENGRAM",
         "MYDS_DISABLE_MM_ATTN_A", "MYDS_COMPRESSOR_PER_TOKEN", "MYDS_INDEXER_PER_TOKEN",
         /* 2026-10-05 path selectors: without them two configurations of one
@@ -245,7 +249,7 @@ int main(int argc, char **argv) {
         "MYDS_ATTN_OUT_A_FUSE_BF16",
         "MYDS_ATTN_DIRECT_PACK",
         "MYDS_ENGRAM_IO_THREADS", "MYDS_ENGRAM_NOCACHE", "MYDS_BENCH_STORAGE_COUNTERS",
-        "MYDS_GEMV_BATCH_SIZE", "MYDS_PLD", "MYDS_BATCH2_SPEC", "MYDS_TREE_SPEC",
+        "MYDS_GEMV_BATCH_SIZE", "MYDS_PLD", "MYDS_BATCH2_SPEC", "MYDS_BATCH2_Q8_SHARED", "MYDS_TREE_SPEC",
         "MYDS_DSPARK_MARKOV_ONLY", "MYDS_DSPARK_MARKOV_SCALE", "MYDS_DSPARK_MIN_CONF",
         "MYDS_DSPARK_MIN_MARGIN", "MYDS_DSPARK_HIGH_CONF_MARGIN", "MYDS_DSPARK_COST_GATE",
         "MYDS_ANCHOR_SNAPSHOT", "MYDS_KV_DSK_PREFER_DEEPER", "MYDS_KV_DSK_BUDGET_MB",
@@ -321,6 +325,8 @@ int main(int argc, char **argv) {
         /* Request-local host path counters; exclude previous requests and load. */
         myds_v41_gpu_indexer_compact_counters(NULL, true);
         myds_v41_gpu_topk_prefix_counters(NULL, true);
+        myds_v41_gpu_topk_nan_fuse_counters(NULL, true);
+        myds_metal_batch2_q8_shared_counters(NULL, true);
         if (!storage_counters(json, run, "before")) { status = 1; break; }
         const double start = now_s();
         const int ok = myds_generate_bytes_ex(ctx, prompt, capture, &c, &reason, &prompt_tokens, NULL);
@@ -329,6 +335,10 @@ int main(int argc, char **argv) {
         myds_v41_gpu_indexer_compact_counters(&compact, false);
         myds_v41_gpu_topk_prefix_counters_t topk_prefix;
         myds_v41_gpu_topk_prefix_counters(&topk_prefix, false);
+        myds_v41_gpu_topk_nan_fuse_counters_t nan_fuse;
+        myds_v41_gpu_topk_nan_fuse_counters(&nan_fuse, false);
+        myds_metal_batch2_q8_shared_counters_t q8_shared;
+        myds_metal_batch2_q8_shared_counters(&q8_shared, false);
         if (!storage_counters(json, run, "after")) { status = 1; break; }
         myds_prefill_stats_t pf; myds_last_prefill_stats(ctx, &pf);
         /* Final logits are read only after the existing generation waits, outside
@@ -394,6 +404,17 @@ int main(int argc, char **argv) {
             topk_prefix.requests-c.first_topk_prefix.requests,
             topk_prefix.encoded-c.first_topk_prefix.encoded,
             topk_prefix.unavailable-c.first_topk_prefix.unavailable);
+        fprintf(json, ",\"gpu_topk_nan_fuse\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64
+            ",\"unavailable\":%" PRIu64 ",\"classified_partitions\":%" PRIu64
+            ",\"decode_requests\":%" PRIu64 ",\"decode_encoded\":%" PRIu64 ",\"decode_unavailable\":%" PRIu64 "}",
+            nan_fuse.requests, nan_fuse.encoded, nan_fuse.unavailable, nan_fuse.classified_partitions,
+            nan_fuse.requests-c.first_nan_fuse.requests, nan_fuse.encoded-c.first_nan_fuse.encoded,
+            nan_fuse.unavailable-c.first_nan_fuse.unavailable);
+        fprintf(json, ",\"gpu_batch2_q8_shared\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64
+            ",\"failures\":%" PRIu64 ",\"decode_requests\":%" PRIu64 ",\"decode_encoded\":%" PRIu64
+            ",\"decode_failures\":%" PRIu64 "}", q8_shared.requests, q8_shared.encoded, q8_shared.failures,
+            q8_shared.requests-c.first_q8_shared.requests, q8_shared.encoded-c.first_q8_shared.encoded,
+            q8_shared.failures-c.first_q8_shared.failures);
 #ifdef MYDS_V41_GPU_HAS_ATTENTION_COUNTERS
         fprintf(json, ",\"attention_paths\":{\"calls\":%" PRIu64 ",\"gather_calls\":%" PRIu64
             ",\"slab_calls\":%" PRIu64 ",\"head_first_attempts\":%" PRIu64 ",\"head_first_encoded\":%" PRIu64

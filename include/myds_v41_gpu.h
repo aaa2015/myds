@@ -170,6 +170,25 @@ typedef struct {
 void myds_v41_gpu_topk_prefix_counters(myds_v41_gpu_topk_prefix_counters_t *out,bool reset);
 /* Diagnostic preflight-unavailable injection; leaves reference sorting usable. */
 void myds_v41_gpu_inject_topk_prefix_unavailable(bool enabled);
+/* MYDS_INDEXER_TOPK_NAN_FUSE accepts exactly 0/1 (absent=0). With an eligible
+ * prefix call, 1 replaces the separate NaN scan with an independent sort PSO
+ * that writes one IEEE-bit flag per original partition, including empty causal
+ * partitions. Merge checks the whole row before using the original body.
+ * Missing candidate PSOs or flag allocation fall back to dense before writes;
+ * a dispatch failure after encoding starts returns 0. Original partition size,
+ * comparison/tie order and the prefix-counter ABI are unchanged. */
+#define MYDS_V41_GPU_HAS_TOPK_NAN_FUSE_COUNTERS 1
+typedef struct {
+    uint64_t requests, encoded, unavailable, classified_partitions;
+} myds_v41_gpu_topk_nan_fuse_counters_t;
+/* Host encoding counters only; no GPU NaN/dense-fallback count is read back.
+ * classified_partitions counts flag slots written by encoded sorts (rows*npr),
+ * including empty causal partitions; encoded means the complete call encoded. */
+void myds_v41_gpu_topk_nan_fuse_counters(myds_v41_gpu_topk_nan_fuse_counters_t *out,bool reset);
+enum { MYDS_TOPK_NAN_FUSE_UNAVAILABLE_SORT=1u, MYDS_TOPK_NAN_FUSE_UNAVAILABLE_MERGE=2u };
+/* Diagnostic fixture only, between completed batches: independently request a
+ * nonexistent candidate sort and/or candidate merge PSO during preflight. */
+void myds_v41_gpu_inject_topk_nan_fuse_unavailable(uint32_t mask);
 int myds_v41_gpu_topkmask(myds_metal_buffer_t *mask,const myds_metal_buffer_t *ids,
     uint32_t n_cols,uint32_t top);
 /* 按行批量版：mask 是 n_rows × mask_stride（float，行主序），n_cols 是每行要清/写的列数。 */
