@@ -271,6 +271,7 @@ compressed KV 与 index cache 保存已完成 BF16 舍入的上 16 位，读取�
 | `MYDS_QKV_FUSE_BF16` | 启用 | decode 的 Q8 QKV 投影把 BF16 舍入合并到 GEMV 写出；设为 `0` 恢复独立舍入 dispatch。trace 使用原路径。 |
 | `MYDS_QKV_FUSE_POST` | 启用 | decode 合并 Q/K RoPE、KV 量化及窗口写入，保留原舍入边界；设为 `0` 恢复原 dispatch。缺融合 PSO、别名或 copy 故障注入时回退原路径。 |
 | `MYDS_QKV_NR0` | `4` | 融合 Q8 GEMV 每组处理四个独立输出行；`2` 使用两个行的配置。归约顺序不变。 |
+| `MYDS_LM_HEAD_Q8_NR0` | `2` | 初始化时读取，严格接受 `2` 或 `4`；未设置时保留原路径。显式 `4` 在单 token、输出维度大于 65536 的 plain Q8_0 GEMV 中，每组处理四个独立输出行，保留 NSG8、原逐行 K 遍历/归约与完整 F32 logits。缺候选 PSO 时初始化失败并清理；候选 dispatch 失败返回错误。验收与当前采用状态见 [LM-head 验证报告](docs/benchmarks/2026-10-10-decode-lmhead/README.md)。 |
 | `MYDS_BATCH2_SPEC` | 关闭 | 显式 `1` 请求 greedy、无图片的真实 batch2；剩余输出/context 至少两步，DSpark 主候选仍要求 high-confidence。 |
 | `MYDS_BATCH2_Q8_SHARED` | `0` | 严格接受 `0` 或 `1`。显式 `1` 在 eligible Batch2 output-B Q8/BF16 投影中，让两个 token 复用同一量化权重读取，保留各自的累加、归约和舍入。trace、关闭原 decode BF16 fusion 或其他投影保持参考路径；缺候选 PSO 时初始化失败。需与真实 Batch2 整图计数和完整模型 A–B–A 一起验收。 |
 | `MYDS_SPEC_SERIAL_PROBE` | 关闭 | 显式 `1` 允许 V4.1 逐 token 验证的 DSpark/PLD 对照；默认未启用 batch2 时跳过这类草稿与快照工作。 |
