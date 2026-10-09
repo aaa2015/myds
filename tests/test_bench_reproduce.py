@@ -434,6 +434,7 @@ class BenchReproduceTests(unittest.TestCase):
         # Native-counter schema fixtures exercise the real runner's rejection
         # and retained failure logs; no model or Metal work is executed here.
         for name, (flag, failure, keys) in self.driver.CANDIDATE_PATHS.items():
+            enabled_value = self.driver.CANDIDATE_ENABLED_VALUES.get(name, '1')
             encoded = dict.fromkeys(keys, 0)
             encoded.update(requests=4, encoded=4, decode_requests=2, decode_encoded=2)
             if 'classified_partitions' in encoded:
@@ -442,10 +443,12 @@ class BenchReproduceTests(unittest.TestCase):
                 with self.subTest(path=name, mode=mode):
                     args = self.run_args()
                     args.out = self.directory / (name + '-' + mode)
-                    args.env = [flag + '=1']
-                    setattr(args, 'require_topk_nan_fuse' if name == 'gpu_topk_nan_fuse'
-                            else 'require_batch2_q8_shared', True)
-                    env = dict(self.driver.DEFAULT_ENV, **{flag: '1'})
+                    args.env = [flag + '=' + enabled_value]
+                    options = {'gpu_topk_nan_fuse': 'require_topk_nan_fuse',
+                               'gpu_batch2_q8_shared': 'require_batch2_q8_shared',
+                               'gpu_lm_head_q8': 'require_lm_head_q8'}
+                    setattr(args, options[name], True)
+                    env = dict(self.driver.DEFAULT_ENV, **{flag: enabled_value})
                     records = self.v2_records(environment=env)
                     if name == 'gpu_batch2_q8_shared':
                         for sample in records:
@@ -500,7 +503,8 @@ class BenchReproduceTests(unittest.TestCase):
                 with self.subTest(path=name, mode=mode):
                     args = self.run_args()
                     args.out = self.directory / (name + '-bad-' + mode)
-                    value = '0' if mode == 'disabled' else '1'
+                    value = ('2' if name == 'gpu_lm_head_q8' else '0') if mode == 'disabled' \
+                        else self.driver.CANDIDATE_ENABLED_VALUES.get(name, '1')
                     args.env = [flag + '=' + value]
                     records = self.v2_records(environment=dict(self.driver.DEFAULT_ENV, **{flag: value}))
                     for sample in records:
@@ -514,6 +518,17 @@ class BenchReproduceTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, '[Cc]andidate'):
                         self.invoke_cpu_runner(args, records)
                     self.assertEqual(json.loads((args.out / 'run-state.json').read_text())['status'], 'failed')
+
+    def test_lm_head_row_cohort_rejects_invalid_values_even_without_counters(self):
+        for value in ('0', '1', '3', '04', '4 ', '-2', 'garbage'):
+            with self.subTest(value=value):
+                records = self.v2_records(environment=dict(self.driver.DEFAULT_ENV, MYDS_LM_HEAD_Q8_NR0=value))
+                directory = self.directory / ('invalid-lm-head-' + value.strip())
+                directory.mkdir()
+                write_samples(directory / 'run-metrics.jsonl', records)
+                state = self.state_for(records)
+                with self.assertRaisesRegex(ValueError, 'Invalid LM head row cohort'):
+                    self.driver.validate_run(directory, state, self.driver.load_audit())
 
     def test_topk_prefix_summary_requires_formal_encoding(self):
         encoded = dict(requests=4, encoded=4, unavailable=0, classified_rows=4,

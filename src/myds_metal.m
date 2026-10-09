@@ -77,6 +77,55 @@ static atomic_uint_fast64_t g_batch2_q8_shared_requests = 0;
 static atomic_uint_fast64_t g_batch2_q8_shared_encoded = 0;
 static atomic_uint_fast64_t g_batch2_q8_shared_failures = 0;
 static id<MTLComputePipelineState> batch2_q8_shared_pipeline(uint32_t nsg, uint32_t nr0);
+static int g_lm_head_q8_nr0 = 2;
+static id<MTLComputePipelineState> g_pso_lm_head_q8_nr4 = nil;
+static atomic_uint_fast64_t g_lm_head_q8_requests = 0;
+static atomic_uint_fast64_t g_lm_head_q8_encoded = 0;
+static atomic_uint_fast64_t g_lm_head_q8_failures = 0;
+
+static int lm_head_q8_parse_mode(void) {
+    const char *value = getenv("MYDS_LM_HEAD_Q8_NR0");
+    if (!value || strcmp(value, "2") == 0) return 2;
+    if (strcmp(value, "4") == 0) return 4;
+    fprintf(stderr, "myds_metal: MYDS_LM_HEAD_Q8_NR0 must be exactly 2 or 4\n");
+    return -1;
+}
+
+int myds_metal_lm_head_q8_nr0(void) { return g_lm_head_q8_nr0; }
+
+void myds_metal_lm_head_q8_counters(myds_metal_lm_head_q8_counters_t *out, bool reset) {
+#define LM_COUNT(field) (reset ? atomic_exchange_explicit(&g_lm_head_q8_##field, 0, memory_order_relaxed) \
+                             : atomic_load_explicit(&g_lm_head_q8_##field, memory_order_relaxed))
+    myds_metal_lm_head_q8_counters_t value = {
+        .requests = LM_COUNT(requests), .encoded = LM_COUNT(encoded), .failures = LM_COUNT(failures)};
+    if (out) *out = value;
+#undef LM_COUNT
+}
+
+static id<MTLComputePipelineState> lm_head_q8_nr4_pipeline(void) {
+    if (g_pso_lm_head_q8_nr4) return g_pso_lm_head_q8_nr4;
+    if (!g_library || !g_device) return nil;
+    MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
+    short nsg = 8;
+    [values setConstantValue:&nsg type:MTLDataTypeShort atIndex:600];
+    NSError *error = nil;
+    id<MTLFunction> fn = [g_library newFunctionWithName:@"kernel_mul_mv_q8_0_f32_r4"
+                                        constantValues:values error:&error];
+    id<MTLComputePipelineState> pipeline = fn ?
+        [g_device newComputePipelineStateWithFunction:fn error:&error] : nil;
+    const NSUInteger dynamic_bytes = 32u * 4u * sizeof(float);
+    if (!pipeline || pipeline.threadExecutionWidth != 32u ||
+        pipeline.maxTotalThreadsPerThreadgroup < 256u ||
+        g_device.maxThreadsPerThreadgroup.width < 256u ||
+        dynamic_bytes > g_device.maxThreadgroupMemoryLength ||
+        pipeline.staticThreadgroupMemoryLength > g_device.maxThreadgroupMemoryLength - dynamic_bytes) {
+        fprintf(stderr, "myds_metal: explicitly requested LM-head Q8 NR4 PSO/geometry unavailable (%s); refusing fallback\n",
+                error.localizedDescription.UTF8String ?: "function or resource limit");
+        return nil;
+    }
+    g_pso_lm_head_q8_nr4 = pipeline;
+    return pipeline;
+}
 
 int myds_metal_batch2_q8_shared_mode(void) {
     const char *value = getenv("MYDS_BATCH2_Q8_SHARED");
@@ -466,6 +515,8 @@ static const char *g_metal_base_preamble =
 int myds_metal_init(const char *shader_dir) {
     if (g_initialized) return 1;
 
+    const int lm_head_q8_nr0 = lm_head_q8_parse_mode();
+    if (lm_head_q8_nr0 < 0) return 0;
     const int batch2_q8_shared = myds_metal_batch2_q8_shared_mode();
     if (batch2_q8_shared < 0) return 0;
 
@@ -985,6 +1036,12 @@ int myds_metal_init(const char *shader_dir) {
                         return 0;
                     }
         }
+        if (lm_head_q8_nr0 == 4 && !lm_head_q8_nr4_pipeline()) {
+            g_initialized = true;
+            myds_metal_cleanup();
+            return 0;
+        }
+        g_lm_head_q8_nr0 = lm_head_q8_nr0;
         g_moe_iq2_constant_lut = moe_iq2_constant_lut;
         g_initialized = true;
         MYDS_LOG_I("myds_metal: Initialized successfully on GPU: %s", [[g_device name] UTF8String]);
@@ -992,6 +1049,8 @@ int myds_metal_init(const char *shader_dir) {
                    g_moe_nsg, g_moe_down_nsg, down_nsg_env ? "explicit" : "inherited");
         MYDS_LOG_I("Routed MoE IQ2 LUT: %s", g_moe_iq2_constant_lut ? "constant (explicit)" : "threadgroup (reference)");
         MYDS_LOG_I("Batch2 output-B Q8 shared weights: %s", batch2_q8_shared ? "enabled (explicit; eligible TAIL only)" : "disabled (scalar reference)");
+        MYDS_LOG_I("LM-head Q8 rows per threadgroup: %d (%s; single token, large output, NSG8)",
+                   g_lm_head_q8_nr0, lm_head_q8_nr0 == 4 ? "explicit candidate" : "reference");
         return 1;
     }
 }
@@ -1046,6 +1105,8 @@ void myds_metal_cleanup(void) {
     g_shared_event = nil;
     g_shared_event_val = 0;
     g_library = nil;
+    g_pso_lm_head_q8_nr4 = nil;
+    g_lm_head_q8_nr0 = 2;
     g_native_pipelines = nil;
     g_queue = nil;
     for (size_t i = 0; i < g_native_pso_cache_count; i++) {
@@ -2285,6 +2346,86 @@ static uint32_t get_gemv_batch_size(void) {
     return 4;
 }
 
+static int lm_head_q8_failure(const char *reason) {
+    atomic_fetch_add_explicit(&g_lm_head_q8_failures, 1, memory_order_relaxed);
+    fprintf(stderr, "myds_metal: LM-head Q8 NR4 rejected: %s; refusing fallback\n", reason);
+    return 0;
+}
+
+static bool lm_head_q8_range(const myds_metal_buffer_t *buffer, uint64_t bytes) {
+    return buffer && buffer->mtl_buf && bytes <= buffer->size &&
+           buffer->offset <= buffer->mtl_buf.length && bytes <= buffer->mtl_buf.length - buffer->offset;
+}
+
+static bool lm_head_q8_overlap(const myds_metal_buffer_t *a, uint64_t a_bytes,
+                               const myds_metal_buffer_t *b, uint64_t b_bytes) {
+    if (a->mtl_buf != b->mtl_buf) return false;
+    return a->offset <= b->offset ? b->offset - a->offset < a_bytes
+                                  : a->offset - b->offset < b_bytes;
+}
+
+static int lm_head_q8_nr4_gemv(myds_metal_buffer_t *out,
+    const myds_metal_buffer_t *weight, const myds_metal_buffer_t *input,
+    uint32_t out_dim, uint32_t in_dim) {
+    atomic_fetch_add_explicit(&g_lm_head_q8_requests, 1, memory_order_relaxed);
+    if (!g_initialized || out_dim <= 65536u || out_dim > INT32_MAX - 3u ||
+        !in_dim || in_dim > INT32_MAX || in_dim % 32u)
+        return lm_head_q8_failure("invalid runtime or dimensions");
+    const uint64_t row_bytes = (uint64_t)(in_dim / 32u) * 34u;
+    const uint64_t weight_bytes = row_bytes * out_dim;
+    const uint64_t input_bytes = (uint64_t)in_dim * sizeof(float);
+    const uint64_t output_bytes = (uint64_t)out_dim * sizeof(float);
+    if (!lm_head_q8_range(weight, weight_bytes) || weight->offset % 2u ||
+        !lm_head_q8_range(input, input_bytes) || input->offset % 4u ||
+        !lm_head_q8_range(out, output_bytes) || out->offset % 4u)
+        return lm_head_q8_failure("invalid buffer range/alignment");
+    if (lm_head_q8_overlap(out, output_bytes, weight, weight_bytes) ||
+        lm_head_q8_overlap(out, output_bytes, input, input_bytes))
+        return lm_head_q8_failure("output overlaps weights or activation");
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = lm_head_q8_nr4_pipeline();
+        if (!pipeline) return lm_head_q8_failure("candidate PSO unavailable");
+        const NSUInteger scratch_bytes = 32u * 4u * sizeof(float);
+        if (pipeline.threadExecutionWidth != 32u ||
+            pipeline.maxTotalThreadsPerThreadgroup < 256u ||
+            g_device.maxThreadsPerThreadgroup.width < 256u ||
+            scratch_bytes > g_device.maxThreadgroupMemoryLength ||
+            pipeline.staticThreadgroupMemoryLength > g_device.maxThreadgroupMemoryLength - scratch_bytes)
+            return lm_head_q8_failure("candidate geometry exceeds PSO/device limits");
+        /* Complete previous writers of x and readers/writers of out even in
+         * a concurrent encoder with automatic barriers disabled. Validation
+         * above finishes before any barrier/encoder or output mutation. */
+        if (g_batch_cb && !g_auto_barrier) {
+            const myds_metal_buffer_t *deps[] = { weight, input, out };
+            myds_metal_barrier_buffers(deps, 3);
+        }
+        struct ds4_metal_args_mul_mv args = {0};
+        args.ne00 = (int32_t)in_dim; args.ne01 = (int32_t)out_dim; args.ne02 = 1;
+        args.nb00 = 34; args.nb01 = row_bytes;
+        args.nb02 = weight_bytes; args.nb03 = weight_bytes;
+        args.ne10 = (int32_t)in_dim; args.ne11 = 1; args.ne12 = 1;
+        args.nb10 = sizeof(float); args.nb11 = input_bytes;
+        args.nb12 = input_bytes; args.nb13 = input_bytes;
+        args.ne0 = (int32_t)out_dim; args.ne1 = 1;
+        args.nr0 = 4; args.r2 = 1; args.r3 = 1;
+        id<MTLCommandBuffer> cb = g_batch_cb ?: [g_queue commandBuffer];
+        if (!cb) return lm_head_q8_failure("command buffer unavailable");
+        id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
+        if (!enc) return lm_head_q8_failure("encoder unavailable");
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:weight->mtl_buf offset:weight->offset atIndex:1];
+        [enc setBuffer:input->mtl_buf offset:input->offset atIndex:2];
+        [enc setBuffer:out->mtl_buf offset:out->offset atIndex:3];
+        [enc setThreadgroupMemoryLength:scratch_bytes atIndex:0];
+        metal_dispatch(enc, "lm_head_q8_nr4", MTLSizeMake(((NSUInteger)out_dim + 3u) / 4u, 1, 1),
+                       MTLSizeMake(32, 8, 1));
+        atomic_fetch_add_explicit(&g_lm_head_q8_encoded, 1, memory_order_relaxed);
+        if (!v41_finish(cb, enc)) return lm_head_q8_failure("command completion failed");
+        return 1;
+    }
+}
+
 int myds_metal_gemv_batch(
     myds_metal_buffer_t       *y,
     const myds_metal_buffer_t *W,
@@ -2293,6 +2434,11 @@ int myds_metal_gemv_batch(
     uint32_t                   in_dim,
     uint32_t                   n_tok,
     ggml_type                  weight_type) {
+    /* Default/explicit2 leaves the complete original selector and dispatch
+     * below unchanged. Only eligible explicit4 enters the fail-closed helper. */
+    if (g_lm_head_q8_nr0 == 4 && weight_type == GGML_TYPE_Q8_0 &&
+        n_tok == 1u && out_dim > 65536u)
+        return lm_head_q8_nr4_gemv(y, W, x, out_dim, in_dim);
     if (!y || !W || !x || !out_dim || !in_dim || !n_tok ||
         out_dim > INT32_MAX || in_dim > INT32_MAX || n_tok > INT32_MAX) return 0;
 

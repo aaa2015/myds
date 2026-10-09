@@ -263,6 +263,21 @@ kernel void kernel_mul_mv_q8_0_f32(
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+// Optional single-token LM-head cohort. Keep the original NSG8 K walk,
+// per-row floating operations and both reductions; only share each loaded
+// activation across four independent output rows. Logits stay full F32.
+[[host_name("kernel_mul_mv_q8_0_f32_r4")]]
+kernel void kernel_mul_mv_q8_0_f32_r4(
+        constant ds4_metal_args_mul_mv &args,
+        device const char *src0, device const char *src1, device char *dst,
+        threadgroup char *shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_impl<4,constant ds4_metal_args_mul_mv &>(
+        args,src0,src1,dst,shmem,tgpig,tiisg,sgitg);
+}
+
 // Same Q8_0 lane walk and both SIMD reductions as the plain kernel. Only
 // the final store rounds to BF16, matching a subsequent bf16_linear exactly.
 [[host_name("kernel_mul_mv_q8_0_f32_bf16")]]

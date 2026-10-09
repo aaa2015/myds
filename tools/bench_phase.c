@@ -32,6 +32,7 @@ typedef struct {
     myds_v41_gpu_topk_prefix_counters_t first_topk_prefix;
     myds_v41_gpu_topk_nan_fuse_counters_t first_nan_fuse;
     myds_metal_batch2_q8_shared_counters_t first_q8_shared;
+    myds_metal_lm_head_q8_counters_t first_lm_head_q8;
 } capture_t;
 
 static double now_s(void) {
@@ -54,6 +55,7 @@ static void capture(const char *piece, size_t length, int32_t id, void *opaque) 
         myds_v41_gpu_topk_prefix_counters(&c->first_topk_prefix, false);
         myds_v41_gpu_topk_nan_fuse_counters(&c->first_nan_fuse, false);
         myds_metal_batch2_q8_shared_counters(&c->first_q8_shared, false);
+        myds_metal_lm_head_q8_counters(&c->first_lm_head_q8, false);
     }
     c->last = t;
     if (c->count < MAX_OUTPUT_TOKENS) {
@@ -306,11 +308,13 @@ int main(int argc, char **argv) {
     json_string(json, model->arch);
     fprintf(json, ",\"layers\":%u,\"dim\":%u,\"heads\":%u,\"head_dim\":%u,\"vocab_size\":%u,"
         "\"routed_experts\":%u,\"activated_experts\":%u,\"expert_width\":%u,\"shared_experts\":%u,\"native_v41\":%s,"
-        "\"dspark_loaded\":%s,\"dspark_load_s\":%.9f,\"dspark_block_size\":%u,\"dspark_stages\":%u}\n",
+        "\"dspark_loaded\":%s,\"dspark_load_s\":%.9f,\"dspark_block_size\":%u,\"dspark_stages\":%u,"
+        "\"lm_head_weight_type\":%d}\n",
         model->n_layers, model->dim, model->n_heads, model->head_dim, model->vocab_size,
         model->n_routed_experts, model->n_activated_experts, model->moe_expert_dim, model->n_shared_experts,
         model->v41 ? "true" : "false", ctx->dspark ? "true" : "false", dspark_load_s,
-        ctx->dspark ? ctx->dspark->block_size : 0, ctx->dspark ? ctx->dspark->stage_count : 0);
+        ctx->dspark ? ctx->dspark->block_size : 0, ctx->dspark ? ctx->dspark->stage_count : 0,
+        (int)model->output_type);
     fflush(json);
     int status = 0;
     uint64_t expected_ids = 0, expected_bytes = 0;
@@ -327,6 +331,7 @@ int main(int argc, char **argv) {
         myds_v41_gpu_topk_prefix_counters(NULL, true);
         myds_v41_gpu_topk_nan_fuse_counters(NULL, true);
         myds_metal_batch2_q8_shared_counters(NULL, true);
+        myds_metal_lm_head_q8_counters(NULL, true);
         if (!storage_counters(json, run, "before")) { status = 1; break; }
         const double start = now_s();
         const int ok = myds_generate_bytes_ex(ctx, prompt, capture, &c, &reason, &prompt_tokens, NULL);
@@ -339,6 +344,8 @@ int main(int argc, char **argv) {
         myds_v41_gpu_topk_nan_fuse_counters(&nan_fuse, false);
         myds_metal_batch2_q8_shared_counters_t q8_shared;
         myds_metal_batch2_q8_shared_counters(&q8_shared, false);
+        myds_metal_lm_head_q8_counters_t lm_head_q8;
+        myds_metal_lm_head_q8_counters(&lm_head_q8, false);
         if (!storage_counters(json, run, "after")) { status = 1; break; }
         myds_prefill_stats_t pf; myds_last_prefill_stats(ctx, &pf);
         /* Final logits are read only after the existing generation waits, outside
@@ -415,6 +422,11 @@ int main(int argc, char **argv) {
             ",\"decode_failures\":%" PRIu64 "}", q8_shared.requests, q8_shared.encoded, q8_shared.failures,
             q8_shared.requests-c.first_q8_shared.requests, q8_shared.encoded-c.first_q8_shared.encoded,
             q8_shared.failures-c.first_q8_shared.failures);
+        fprintf(json, ",\"gpu_lm_head_q8\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64
+            ",\"failures\":%" PRIu64 ",\"decode_requests\":%" PRIu64 ",\"decode_encoded\":%" PRIu64
+            ",\"decode_failures\":%" PRIu64 "}", lm_head_q8.requests, lm_head_q8.encoded, lm_head_q8.failures,
+            lm_head_q8.requests-c.first_lm_head_q8.requests, lm_head_q8.encoded-c.first_lm_head_q8.encoded,
+            lm_head_q8.failures-c.first_lm_head_q8.failures);
 #ifdef MYDS_V41_GPU_HAS_ATTENTION_COUNTERS
         fprintf(json, ",\"attention_paths\":{\"calls\":%" PRIu64 ",\"gather_calls\":%" PRIu64
             ",\"slab_calls\":%" PRIu64 ",\"head_first_attempts\":%" PRIu64 ",\"head_first_encoded\":%" PRIu64

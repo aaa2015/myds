@@ -17,6 +17,18 @@ typedef struct myds_metal_buffer myds_metal_buffer_t;
 int  myds_metal_init(const char *shader_dir);
 void myds_metal_cleanup(void);
 
+/* Initialization-time LM-head experiment. MYDS_LM_HEAD_Q8_NR0 accepts only
+ * absent/2/4; absent and 2 retain the original path. NR4 applies solely to
+ * Q8_0, one token, out_dim>65536, and keeps NSG8/full F32 logits. Explicit NR4
+ * requires its PSO/device geometry during init; dispatch errors never fall
+ * back to CPU or NR2. Cleanup resets the mode to 2. No public setter exists.
+ * Counters describe NR4 host requests/encoding/failures, not GPU time or
+ * physical traffic. An encoded outside-batch command may also fail completion;
+ * a later enclosing-batch failure is reported by the caller's graph gate. */
+typedef struct { uint64_t requests, encoded, failures; } myds_metal_lm_head_q8_counters_t;
+int myds_metal_lm_head_q8_nr0(void);
+void myds_metal_lm_head_q8_counters(myds_metal_lm_head_q8_counters_t *out, bool reset);
+
 /* Buffer allocation and memory mapping */
 myds_metal_buffer_t *myds_metal_buffer_alloc(size_t bytes);
 myds_metal_buffer_t *myds_metal_buffer_from_ptr(const void *ptr, size_t bytes);

@@ -52,7 +52,10 @@ CANDIDATE_PATHS = {
          'decode_requests', 'decode_encoded', 'decode_unavailable')),
     'gpu_batch2_q8_shared': ('MYDS_BATCH2_Q8_SHARED', 'failures',
         ('requests', 'encoded', 'failures', 'decode_requests', 'decode_encoded', 'decode_failures')),
+    'gpu_lm_head_q8': ('MYDS_LM_HEAD_Q8_NR0', 'failures',
+        ('requests', 'encoded', 'failures', 'decode_requests', 'decode_encoded', 'decode_failures')),
 }
+CANDIDATE_ENABLED_VALUES = {'gpu_lm_head_q8': '4'}
 FORBIDDEN_ENV_PREFIXES = ('MYDS_PROFILE_', 'MYDS_SKIP_', 'MYDS_TRACE_', 'MYDS_BATCH_TRACE_')
 FORBIDDEN_ENV_NAMES = {'MYDS_MOE_STEP_PROF', 'MYDS_PHASE_PROFILE_FILE', 'MYDS_DISABLE_V41_PREFILL',
                        'MYDS_PROF', 'MYDS_DISPATCH_HIST', 'MYDS_DEBUG_DISPATCH'}
@@ -392,10 +395,14 @@ def topk_prefix_paths(samples):
 def validate_candidate_paths(samples, environment, audit):
     """Validate native encoding records; absent historical records remain usable."""
     for name, (flag, failure, keys) in CANDIDATE_PATHS.items():
+        enabled_value = CANDIDATE_ENABLED_VALUES.get(name, '1')
+        if name == 'gpu_lm_head_q8':
+            audit.require(environment.get(flag) in (None, '2', '4'),
+                          'Invalid LM head row cohort: ' + str(environment.get(flag)))
         for sample in samples:
             counters = sample.get(name)
             if counters is None:
-                audit.require(environment.get(flag) != '1', 'Missing candidate path counters: ' + name)
+                audit.require(environment.get(flag) != enabled_value, 'Missing candidate path counters: ' + name)
                 continue
             audit.require(isinstance(counters, dict), 'Invalid candidate path counters: ' + name)
             for key in keys:
@@ -413,7 +420,7 @@ def validate_candidate_paths(samples, environment, audit):
                 audit.require(counters['encoded'] + counters[failure] == counters['requests'] and
                               counters['decode_encoded'] + counters['decode_' + failure] == counters['decode_requests'],
                               'Candidate encoding/fallback counts differ from requests: ' + name)
-            if environment.get(flag, '0') != '1':
+            if environment.get(flag) != enabled_value:
                 audit.require(not any(counters[key] for key in keys),
                               'Disabled candidate has execution counters: ' + name)
 
@@ -642,7 +649,8 @@ def run(args):
                                  counters['decode_unavailable'] for counters in formal):
                 raise ValueError('Required topk prefix path did not encode every formal decode request')
         for option, name in (('require_topk_nan_fuse', 'gpu_topk_nan_fuse'),
-                             ('require_batch2_q8_shared', 'gpu_batch2_q8_shared')):
+                             ('require_batch2_q8_shared', 'gpu_batch2_q8_shared'),
+                             ('require_lm_head_q8', 'gpu_lm_head_q8')):
             if getattr(args, option, False):
                 require_candidate_path(samples, name)
         group['attention_paths'] = attention_paths(samples)
@@ -703,6 +711,8 @@ def main():
                              help='Require native fused NaN sort counters in every formal decode, with no fallback')
     measurement.add_argument('--require-batch2-q8-shared', action='store_true',
                              help='Require native shared Q8 projection counters in every formal decode, with no failures')
+    measurement.add_argument('--require-lm-head-q8', action='store_true',
+                             help='Require native NR4 Q8 LM head encoding in every formal decode, with no failures')
     measurement.add_argument('--env', action='append', default=[], help='Explicit MYDS_NAME=value, repeatable')
     measurement.add_argument('--max-new-tokens', type=int, choices=OUTPUT_CAPS, default=64)
     measurement.add_argument('--context', type=int, default=262144)

@@ -32,6 +32,7 @@ TEST_MOE_IQ2_LUT = $(BIN_DIR)/test_moe_iq2_lut
 TEST_ATTN_PACKED = $(BIN_DIR)/test_attention_packed
 TEST_TOPK_NAN_FUSE = $(BIN_DIR)/test_topk_nan_fuse
 TEST_BATCH2_Q8_SHARED = $(BIN_DIR)/test_batch2_q8_shared
+TEST_LM_HEAD_Q8 = $(BIN_DIR)/test_lm_head_q8
 TEST_DEEPER_SSD = $(BIN_DIR)/test_deeper_ssd
 TEST_GGUF = $(BIN_DIR)/test_gguf
 TEST_TOKENIZER = $(BIN_DIR)/test_tokenizer
@@ -179,6 +180,12 @@ $(TEST_BATCH2_Q8_SHARED): tests/test_batch2_q8_shared.m src/myds_metal.m $(wildc
 
 .PHONY: build-decode-candidates
 build-decode-candidates: $(TEST_MOE_IQ2_LUT) $(TEST_ATTN_PACKED) $(TEST_TOPK_NAN_FUSE) $(TEST_BATCH2_Q8_SHARED)
+
+$(TEST_LM_HEAD_Q8): tests/test_lm_head_q8.m src/myds_metal.m $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) -Isrc $< $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
+
+.PHONY: build-lm-head-candidate
+build-lm-head-candidate: $(TEST_LM_HEAD_Q8)
 
 $(TEST_DEEPER_SSD): tests/test_deeper_ssd.c tests/test_engine.c tests/test_p1_regressions.c $(OBJS_C) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) tests/test_deeper_ssd.c $(OBJS_C) $(OBJS_M) $(LDFLAGS) -o $@
