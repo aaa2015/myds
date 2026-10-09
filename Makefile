@@ -34,6 +34,8 @@ TEST_TOPK_NAN_FUSE = $(BIN_DIR)/test_topk_nan_fuse
 TEST_BATCH2_Q8_SHARED = $(BIN_DIR)/test_batch2_q8_shared
 TEST_LM_HEAD_Q8 = $(BIN_DIR)/test_lm_head_q8
 TEST_ENGRAM_PROJECT_ROUND = $(BIN_DIR)/test_engram_project_round
+TEST_MOE_Q2_SUM_CACHE = $(BIN_DIR)/test_moe_q2_sum_cache
+Q2_SUM_CACHE_ORACLE = $(BIN_DIR)/q2_sum_cache_oracle.metallib
 TEST_DEEPER_SSD = $(BIN_DIR)/test_deeper_ssd
 TEST_GGUF = $(BIN_DIR)/test_gguf
 TEST_TOKENIZER = $(BIN_DIR)/test_tokenizer
@@ -193,6 +195,21 @@ $(TEST_ENGRAM_PROJECT_ROUND): tests/test_engram_project_round.m src/myds_metal.m
 
 .PHONY: build-engram-project-round-candidate
 build-engram-project-round-candidate: $(TEST_ENGRAM_PROJECT_ROUND)
+
+# Q2 cache component is opt-in and BUILD ONLY: not included in ALL_TESTS.
+# The fixture includes the real runtime; link only C helpers, not myds_metal.o.
+$(TEST_MOE_Q2_SUM_CACHE): tests/test_moe_q2_sum_cache.m src/myds_metal.m $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) -Isrc $< $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
+
+# Independent original-order sumy oracle uses the identical production compiler
+# flags. Emitting the source is CPU-only; neither build recipe submits GPU work.
+$(Q2_SUM_CACHE_ORACLE): $(TEST_MOE_Q2_SUM_CACHE) | $(BUILD_DIR)
+	$(TEST_MOE_Q2_SUM_CACHE) --write-oracle-source $(BUILD_DIR)/q2_sum_cache_oracle.metal
+	xcrun -sdk macosx metal -O3 -ffast-math -c $(BUILD_DIR)/q2_sum_cache_oracle.metal -o $(BUILD_DIR)/q2_sum_cache_oracle.air
+	xcrun -sdk macosx metallib $(BUILD_DIR)/q2_sum_cache_oracle.air -o $@
+
+.PHONY: build-moe-q2-sum-cache-candidate
+build-moe-q2-sum-cache-candidate: $(TEST_MOE_Q2_SUM_CACHE) $(Q2_SUM_CACHE_ORACLE)
 
 $(TEST_DEEPER_SSD): tests/test_deeper_ssd.c tests/test_engine.c tests/test_p1_regressions.c $(OBJS_C) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) tests/test_deeper_ssd.c $(OBJS_C) $(OBJS_M) $(LDFLAGS) -o $@

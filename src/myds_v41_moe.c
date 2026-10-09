@@ -272,10 +272,10 @@ static inline bool is_moe_fuse_expand_enabled(void) {
     return cached == 1;
 }
 
-int myds_v41_moe_fused(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t pos,
+static int moe_fused_scoped(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t pos,
                        myds_metal_buffer_t *residual,
                        const myds_metal_buffer_t *after_attn,
-                       const myds_metal_buffer_t *ffn_split) {
+                       const myds_metal_buffer_t *ffn_split, bool ordinary_decode_allowed) {
     (void)token; // V4.1 text router is score-based, without token-hash selection.
     if (!ctx || !ctx->model || layer >= ctx->model->n_layers) return 0;
     myds_model_t *m = ctx->model;
@@ -329,11 +329,11 @@ int myds_v41_moe_fused(myds_context_t *ctx, uint32_t layer, uint32_t token, uint
 
         /* 3. 此时路由选择与 shared expert 计算流已就绪，启动 routed MoE */
         myds_metal_barrier();
-        if (!myds_metal_routed_moe(ctx->moe_out, ctx->ffn_norm_out, l->ffn_gate_exps,
+        if (!myds_metal_routed_moe_scoped(ctx->moe_out, ctx->ffn_norm_out, l->ffn_gate_exps,
             l->ffn_up_exps, l->ffn_down_exps, ctx->selected_ids, ctx->selected_weights,
             ctx->moe_gate, ctx->moe_up, ctx->moe_mid, ctx->moe_down, dim, width,
             m->n_routed_experts, k, l->ffn_gate_exps_type, l->ffn_up_exps_type,
-            l->ffn_down_exps_type, m->swiglu_clamp_exp)) return 0;
+            l->ffn_down_exps_type, m->swiglu_clamp_exp, ordinary_decode_allowed && !trace_on)) return 0;
         myds_metal_barrier();
         if (trace_on && !myds_trace_f32("routed_out", layer, pos, ctx->moe_out, dim)) return 0;
 
@@ -415,11 +415,11 @@ int myds_v41_moe_fused(myds_context_t *ctx, uint32_t layer, uint32_t token, uint
         ctx->selected_ids, ctx->selected_weights
     };
     myds_metal_barrier_buffers(moe_deps, 2);
-    if (!myds_metal_routed_moe(ctx->moe_out, ctx->ffn_norm_out, l->ffn_gate_exps,
+    if (!myds_metal_routed_moe_scoped(ctx->moe_out, ctx->ffn_norm_out, l->ffn_gate_exps,
         l->ffn_up_exps, l->ffn_down_exps, ctx->selected_ids, ctx->selected_weights,
         ctx->moe_gate, ctx->moe_up, ctx->moe_mid, ctx->moe_down, dim, width,
         m->n_routed_experts, k, l->ffn_gate_exps_type, l->ffn_up_exps_type,
-        l->ffn_down_exps_type, m->swiglu_clamp_exp)) {
+        l->ffn_down_exps_type, m->swiglu_clamp_exp, ordinary_decode_allowed && !trace_on)) {
         myds_metal_set_auto_barrier(prev_auto_barrier);
         myds_metal_set_concurrent(prev_concurrent);
         return 0;
@@ -458,6 +458,13 @@ int myds_v41_moe_fused(myds_context_t *ctx, uint32_t layer, uint32_t token, uint
     return 1;
 }
 
+int myds_v41_moe_fused(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t pos,
+                       myds_metal_buffer_t *residual,
+                       const myds_metal_buffer_t *after_attn,
+                       const myds_metal_buffer_t *ffn_split) {
+    return moe_fused_scoped(ctx, layer, token, pos, residual, after_attn, ffn_split, false);
+}
+
 int myds_v41_moe(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t pos) {
     return myds_v41_moe_fused(ctx, layer, token, pos, NULL, NULL, NULL);
 }
@@ -471,7 +478,7 @@ static inline bool is_moe_pipeline_enabled(void) {
     return cached == 1;
 }
 
-int myds_v41_moe_pipeline(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t pos,
+int myds_v41_moe_pipeline_scoped(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t pos,
                           myds_metal_buffer_t *residual,
                           const myds_metal_buffer_t *after_attn,
                           myds_metal_buffer_t *ffn_split,
@@ -480,7 +487,7 @@ int myds_v41_moe_pipeline(myds_context_t *ctx, uint32_t layer, uint32_t token, u
                           const myds_metal_buffer_t *ffn_base,
                           myds_metal_buffer_t *flat_norm,
                           myds_metal_buffer_t *mix,
-                          float hc_eps) {
+                          float hc_eps, bool ordinary_decode_allowed) {
     (void)token;
     if (!ctx || !ctx->model || layer >= ctx->model->n_layers) return 0;
     myds_model_t *m = ctx->model;
@@ -497,7 +504,7 @@ int myds_v41_moe_pipeline(myds_context_t *ctx, uint32_t layer, uint32_t token, u
             if (!myds_trace_f32("hc_ffn_mix", layer, pos, mix, 24) ||
                 !myds_trace_f32("hc_ffn_split", layer, pos, ffn_split, 24)) return 0;
         }
-        return myds_v41_moe_fused(ctx, layer, token, pos, residual, after_attn, ffn_split);
+        return moe_fused_scoped(ctx, layer, token, pos, residual, after_attn, ffn_split, ordinary_decode_allowed && !trace_on);
     }
 
     if (m->n_routed_experts != 384 || k != 6 || m->n_shared_experts != 1 ||
@@ -581,11 +588,11 @@ int myds_v41_moe_pipeline(myds_context_t *ctx, uint32_t layer, uint32_t token, u
         ctx->selected_ids, ctx->selected_weights
     };
     myds_metal_barrier_buffers(moe_deps, 2);
-    if (!myds_metal_routed_moe(ctx->moe_out, ctx->ffn_norm_out, l->ffn_gate_exps,
+    if (!myds_metal_routed_moe_scoped(ctx->moe_out, ctx->ffn_norm_out, l->ffn_gate_exps,
         l->ffn_up_exps, l->ffn_down_exps, ctx->selected_ids, ctx->selected_weights,
         ctx->moe_gate, ctx->moe_up, ctx->moe_mid, ctx->moe_down, dim, width,
         m->n_routed_experts, k, l->ffn_gate_exps_type, l->ffn_up_exps_type,
-        l->ffn_down_exps_type, m->swiglu_clamp_exp)) {
+        l->ffn_down_exps_type, m->swiglu_clamp_exp, ordinary_decode_allowed && !trace_on)) {
         myds_metal_set_auto_barrier(prev_auto_barrier);
         myds_metal_set_concurrent(prev_concurrent);
         return 0;
@@ -623,6 +630,19 @@ int myds_v41_moe_pipeline(myds_context_t *ctx, uint32_t layer, uint32_t token, u
     myds_metal_set_auto_barrier(prev_auto_barrier);
     myds_metal_set_concurrent(prev_concurrent);
     return 1;
+}
+
+int myds_v41_moe_pipeline(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t pos,
+                          myds_metal_buffer_t *residual,
+                          const myds_metal_buffer_t *after_attn,
+                          myds_metal_buffer_t *ffn_split,
+                          const myds_metal_buffer_t *ffn_fn,
+                          const myds_metal_buffer_t *ffn_scale,
+                          const myds_metal_buffer_t *ffn_base,
+                          myds_metal_buffer_t *flat_norm,
+                          myds_metal_buffer_t *mix, float hc_eps) {
+    return myds_v41_moe_pipeline_scoped(ctx, layer, token, pos, residual, after_attn,
+        ffn_split, ffn_fn, ffn_scale, ffn_base, flat_norm, mix, hc_eps, false);
 }
 
 int myds_dspark_route_fused(myds_metal_buffer_t *selected, myds_metal_buffer_t *weights,

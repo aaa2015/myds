@@ -82,6 +82,80 @@ static id<MTLComputePipelineState> g_pso_lm_head_q8_nr4 = nil;
 static atomic_uint_fast64_t g_lm_head_q8_requests = 0;
 static atomic_uint_fast64_t g_lm_head_q8_encoded = 0;
 static atomic_uint_fast64_t g_lm_head_q8_failures = 0;
+static bool g_moe_q2_sum_cache = false;
+static id<MTLComputePipelineState> g_pso_moe_q2_sum_cache_prepare = nil;
+static id<MTLComputePipelineState> g_pso_moe_q2_sum6_cached = nil;
+static id<MTLBuffer> g_moe_q2_sum_cache_buffer = nil;
+static atomic_uint_fast64_t g_moe_q2_sum_cache_requests = 0;
+static atomic_uint_fast64_t g_moe_q2_sum_cache_encoded = 0;
+static atomic_uint_fast64_t g_moe_q2_sum_cache_failures = 0;
+#define MOE_Q2_SUM_CACHE_BYTES (6u * 9u * 32u * sizeof(float))
+
+static int moe_q2_sum_cache_parse_mode(void) {
+    const char *value = getenv("MYDS_MOE_Q2_SUM_CACHE");
+    if (!value || strcmp(value, "0") == 0) return 0;
+    if (strcmp(value, "1") == 0) return 1;
+    fprintf(stderr, "myds_metal: MYDS_MOE_Q2_SUM_CACHE must be exactly 0 or 1\n");
+    return -1;
+}
+
+int myds_metal_moe_q2_sum_cache_enabled(void) { return g_moe_q2_sum_cache ? 1 : 0; }
+
+void myds_metal_moe_q2_sum_cache_counters(myds_metal_moe_q2_sum_cache_counters_t *out, bool reset) {
+#define Q2_COUNT(field) (reset ? atomic_exchange_explicit(&g_moe_q2_sum_cache_##field, 0, memory_order_relaxed) \
+                             : atomic_load_explicit(&g_moe_q2_sum_cache_##field, memory_order_relaxed))
+    myds_metal_moe_q2_sum_cache_counters_t value = {
+        .requests = Q2_COUNT(requests), .encoded = Q2_COUNT(encoded), .failures = Q2_COUNT(failures)};
+    if (out) *out = value;
+#undef Q2_COUNT
+}
+
+static bool moe_q2_sum_cache_geometry(bool constant_lut) {
+    const NSUInteger iq2_bytes = constant_lut ? 0u : 2176u;
+    id<MTLComputePipelineState> pipelines[] = {
+        g_pso_moe_pair_swiglu_iq2_xxs, g_pso_moe_q2_sum_cache_prepare, g_pso_moe_q2_sum6_cached};
+    const NSUInteger threads[] = {32u * (NSUInteger)g_moe_nsg, 128u, 32u * (NSUInteger)g_moe_down_nsg};
+    const NSUInteger widths[] = {32u, 128u, 32u};
+    const NSUInteger heights[] = {(NSUInteger)g_moe_nsg, 1u, (NSUInteger)g_moe_down_nsg};
+    const NSUInteger dynamic_bytes[] = {iq2_bytes, 0u, 0u};
+    if (!g_device || (g_moe_nsg != 2 && g_moe_nsg != 4) ||
+        (g_moe_down_nsg != 2 && g_moe_down_nsg != 4)) return false;
+    for (unsigned i = 0; i < 3u; ++i) {
+        if (!pipelines[i] || pipelines[i].threadExecutionWidth != 32u ||
+            threads[i] > pipelines[i].maxTotalThreadsPerThreadgroup ||
+            widths[i] > g_device.maxThreadsPerThreadgroup.width ||
+            heights[i] > g_device.maxThreadsPerThreadgroup.height ||
+            dynamic_bytes[i] > g_device.maxThreadgroupMemoryLength ||
+            pipelines[i].staticThreadgroupMemoryLength > g_device.maxThreadgroupMemoryLength - dynamic_bytes[i])
+            return false;
+    }
+    return g_device.maxThreadsPerThreadgroup.depth >= 1u;
+}
+
+static int moe_q2_sum_cache_initialize(bool constant_lut) {
+    NSError *error = nil;
+    id<MTLFunction> prep = [g_library newFunctionWithName:@"kernel_dsv41_q2_sum_cache_prepare_f32"];
+    if (prep) g_pso_moe_q2_sum_cache_prepare = [g_device newComputePipelineStateWithFunction:prep error:&error];
+    MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
+    short nsg = (short)g_moe_down_nsg;
+    [values setConstantValue:&nsg type:MTLDataTypeShort atIndex:600];
+    id<MTLFunction> down = [g_library newFunctionWithName:@"kernel_mul_mv_id_q2_K_sum6_cached_f32"
+                                         constantValues:values error:&error];
+    if (down) g_pso_moe_q2_sum6_cached = [g_device newComputePipelineStateWithFunction:down error:&error];
+    if (!moe_q2_sum_cache_geometry(constant_lut)) {
+        fprintf(stderr, "myds_metal: explicit Q2 sum cache PSO/geometry unavailable (%s); refusing fallback\n",
+                error.localizedDescription.UTF8String ?: "function or resource limit");
+        return 0;
+    }
+    g_moe_q2_sum_cache_buffer = [g_device newBufferWithLength:MOE_Q2_SUM_CACHE_BYTES options:MTLResourceStorageModeShared];
+    if (!g_moe_q2_sum_cache_buffer || !g_moe_q2_sum_cache_buffer.contents ||
+        (uintptr_t)g_moe_q2_sum_cache_buffer.contents % 16u) {
+        fprintf(stderr, "myds_metal: explicit Q2 sum cache scratch allocation failed; refusing fallback\n");
+        return 0;
+    }
+    g_moe_q2_sum_cache_buffer.label = @"myds_q2_sum_cache_f32";
+    return 1;
+}
 
 static int lm_head_q8_parse_mode(void) {
     const char *value = getenv("MYDS_LM_HEAD_Q8_NR0");
@@ -514,6 +588,9 @@ static const char *g_metal_base_preamble =
 
 int myds_metal_init(const char *shader_dir) {
     if (g_initialized) return 1;
+
+    const int moe_q2_sum_cache = moe_q2_sum_cache_parse_mode();
+    if (moe_q2_sum_cache < 0) return 0;
 
     const int lm_head_q8_nr0 = lm_head_q8_parse_mode();
     if (lm_head_q8_nr0 < 0) return 0;
@@ -1041,8 +1118,14 @@ int myds_metal_init(const char *shader_dir) {
             myds_metal_cleanup();
             return 0;
         }
+        if (moe_q2_sum_cache && !moe_q2_sum_cache_initialize(moe_iq2_constant_lut)) {
+            g_initialized = true;
+            myds_metal_cleanup();
+            return 0;
+        }
         g_lm_head_q8_nr0 = lm_head_q8_nr0;
         g_moe_iq2_constant_lut = moe_iq2_constant_lut;
+        g_moe_q2_sum_cache = moe_q2_sum_cache != 0;
         g_initialized = true;
         MYDS_LOG_I("myds_metal: Initialized successfully on GPU: %s", [[g_device name] UTF8String]);
         MYDS_LOG_I("Routed MoE geometry: IQ2 NSG=%d, Q2 down NSG=%d (%s)",
@@ -1051,6 +1134,8 @@ int myds_metal_init(const char *shader_dir) {
         MYDS_LOG_I("Batch2 output-B Q8 shared weights: %s", batch2_q8_shared ? "enabled (explicit; eligible TAIL only)" : "disabled (scalar reference)");
         MYDS_LOG_I("LM-head Q8 rows per threadgroup: %d (%s; single token, large output, NSG8)",
                    g_lm_head_q8_nr0, lm_head_q8_nr0 == 4 ? "explicit candidate" : "reference");
+        MYDS_LOG_I("Routed MoE Q2 sum cache: %d (%s; explicit ordinary scalar scope)",
+                   g_moe_q2_sum_cache, g_moe_q2_sum_cache ? "F32 candidate" : "reference");
         return 1;
     }
 }
@@ -1081,6 +1166,10 @@ void myds_metal_cleanup(void) {
     g_pso_moe_sum6 = nil;
     g_pso_moe_pair_swiglu_iq2_xxs = nil;
     g_pso_moe_sum6_q2_k = nil;
+    g_pso_moe_q2_sum_cache_prepare = nil;
+    g_pso_moe_q2_sum6_cached = nil;
+    g_moe_q2_sum_cache_buffer = nil;
+    g_moe_q2_sum_cache = false;
     g_pso_moe_mm_map0_ne20_6 = nil;
     g_pso_moe_mm_iq2_pair_swiglu_f16 = nil;
     g_pso_moe_mm_q2_k_f16 = nil;
@@ -3679,6 +3768,238 @@ int myds_metal_routed_moe(
         scratch_gate, scratch_up, scratch_mid, scratch_down,
         dim, expert_dim, n_routed_experts, n_activated_experts, 1,
         gate_type, up_type, down_type, clamp_val);
+}
+
+static int moe_q2_sum_cache_failure(const char *reason) {
+    atomic_fetch_add_explicit(&g_moe_q2_sum_cache_failures, 1, memory_order_relaxed);
+    fprintf(stderr, "myds_metal: Q2 sum cache rejected: %s; refusing fallback\n", reason);
+    return 0;
+}
+
+static bool moe_q2_sum_cache_range(const myds_metal_buffer_t *buffer, uint64_t bytes, size_t alignment) {
+    return buffer && buffer->mtl_buf && buffer->mtl_buf.device == g_device && bytes <= buffer->size &&
+           buffer->offset <= buffer->mtl_buf.length && bytes <= buffer->mtl_buf.length - buffer->offset &&
+           buffer->offset % alignment == 0 && (!buffer->ptr || (uintptr_t)buffer->ptr % alignment == 0);
+}
+
+static bool moe_q2_sum_cache_overlap(const myds_metal_buffer_t *a, uint64_t a_bytes,
+                                     const myds_metal_buffer_t *b, uint64_t b_bytes) {
+    if (a->mtl_buf == b->mtl_buf)
+        return a->offset <= b->offset ? b->offset - a->offset < a_bytes : a->offset - b->offset < b_bytes;
+    // Different no-copy MTLBuffer objects may still expose overlapping shared
+    // memory. Ranges were checked before these subtraction-based comparisons.
+    if (a->ptr && b->ptr) {
+        const uintptr_t first = (uintptr_t)a->ptr, second = (uintptr_t)b->ptr;
+        return first <= second ? second - first < a_bytes : first - second < b_bytes;
+    }
+    return false;
+}
+
+int myds_metal_routed_moe_scoped(
+    myds_metal_buffer_t       *moe_out,
+    const myds_metal_buffer_t *x_in,
+    const myds_metal_buffer_t *gate_exps,
+    const myds_metal_buffer_t *up_exps,
+    const myds_metal_buffer_t *down_exps,
+    const myds_metal_buffer_t *selected_ids,
+    const myds_metal_buffer_t *selected_weights,
+    myds_metal_buffer_t       *scratch_gate,
+    myds_metal_buffer_t       *scratch_up,
+    myds_metal_buffer_t       *scratch_mid,
+    myds_metal_buffer_t       *scratch_down,
+    uint32_t                   dim,
+    uint32_t                   expert_dim,
+    uint32_t                   n_routed_experts,
+    uint32_t                   n_activated_experts,
+    ggml_type                  gate_type,
+    ggml_type                  up_type,
+    ggml_type                  down_type,
+    float                      clamp_val,
+    bool                       ordinary_decode_allowed) {
+    if (!g_moe_q2_sum_cache || !ordinary_decode_allowed)
+        return myds_metal_routed_moe(moe_out, x_in, gate_exps, up_exps, down_exps,
+            selected_ids, selected_weights, scratch_gate, scratch_up, scratch_mid, scratch_down,
+            dim, expert_dim, n_routed_experts, n_activated_experts,
+            gate_type, up_type, down_type, clamp_val);
+
+    atomic_fetch_add_explicit(&g_moe_q2_sum_cache_requests, 1, memory_order_relaxed);
+    if (!g_initialized || dim != 5120u || expert_dim != 2304u || n_activated_experts != 6u ||
+        n_routed_experts < 6u || n_routed_experts > INT32_MAX ||
+        gate_type != GGML_TYPE_IQ2_XXS || up_type != GGML_TYPE_IQ2_XXS || down_type != GGML_TYPE_Q2_K ||
+        !isfinite(clamp_val) || clamp_val < 0)
+        return moe_q2_sum_cache_failure("invalid runtime, shape, types or clamp");
+    /* A separately enabled one-token MM experiment uses half activations and
+     * another reduction tree. This candidate preserves the existing GEMV path
+     * and must not silently replace an eligible MM reference configuration. */
+    const int min_mm_tokens = get_moe_mm_min_tokens();
+    if (min_mm_tokens > 0 && min_mm_tokens <= 1 && g_pso_moe_mm_map0_ne20_6 &&
+        g_pso_moe_mm_iq2_pair_swiglu_f16 && g_pso_moe_mm_q2_k_f16 && g_pso_moe_sum6)
+        return moe_q2_sum_cache_failure("one-token MM reference is outside candidate scope");
+    if (!moe_q2_sum_cache_geometry(g_moe_iq2_constant_lut) || !g_moe_q2_sum_cache_buffer ||
+        g_moe_q2_sum_cache_buffer.device != g_device ||
+        g_moe_q2_sum_cache_buffer.length < MOE_Q2_SUM_CACHE_BYTES || !g_moe_q2_sum_cache_buffer.contents ||
+        (uintptr_t)g_moe_q2_sum_cache_buffer.contents % 16u)
+        return moe_q2_sum_cache_failure("candidate PSO/geometry or scratch unavailable");
+
+    const uint64_t gate_row_bytes = (uint64_t)(dim / 256u) * 66u;
+    const uint64_t gate_exp_bytes = (uint64_t)expert_dim * gate_row_bytes;
+    const uint64_t down_row_bytes = (uint64_t)(expert_dim / 256u) * 84u;
+    const uint64_t down_exp_bytes = (uint64_t)dim * down_row_bytes;
+    const uint64_t mid_bytes = (uint64_t)n_activated_experts * expert_dim * sizeof(float);
+    const uint64_t out_bytes = (uint64_t)dim * sizeof(float);
+    const uint64_t selected_bytes = (uint64_t)n_activated_experts * sizeof(float);
+    const myds_metal_buffer_t *readers[] = {x_in, gate_exps, up_exps, down_exps, selected_ids, selected_weights};
+    const uint64_t reader_bytes[] = {out_bytes, gate_exp_bytes * n_routed_experts,
+        gate_exp_bytes * n_routed_experts, down_exp_bytes * n_routed_experts, selected_bytes, selected_bytes};
+    const size_t reader_align[] = {16u, 2u, 2u, 2u, 4u, 4u};
+    if (!moe_q2_sum_cache_range(moe_out, out_bytes, 4u) ||
+        !moe_q2_sum_cache_range(scratch_mid, mid_bytes, 4u) ||
+        !moe_q2_sum_cache_range(scratch_gate, mid_bytes, 4u) ||
+        !moe_q2_sum_cache_range(scratch_up, mid_bytes, 4u) ||
+        !moe_q2_sum_cache_range(scratch_down, (uint64_t)n_activated_experts * out_bytes, 4u))
+        return moe_q2_sum_cache_failure("invalid output or scratch range/alignment");
+    for (unsigned i = 0; i < 6u; ++i)
+        if (!moe_q2_sum_cache_range(readers[i], reader_bytes[i], reader_align[i]))
+            return moe_q2_sum_cache_failure("invalid input range/alignment");
+    myds_metal_buffer_t cache_view = {.mtl_buf = g_moe_q2_sum_cache_buffer,
+        .size = MOE_Q2_SUM_CACHE_BYTES, .offset = 0, .ptr = g_moe_q2_sum_cache_buffer.contents, .is_view = true};
+    const myds_metal_buffer_t *writers[] = {moe_out, scratch_mid, &cache_view};
+    const uint64_t writer_bytes[] = {out_bytes, mid_bytes, MOE_Q2_SUM_CACHE_BYTES};
+    for (unsigned i = 0; i < 3u; ++i) {
+        for (unsigned j = i + 1u; j < 3u; ++j)
+            if (moe_q2_sum_cache_overlap(writers[i], writer_bytes[i], writers[j], writer_bytes[j]))
+                return moe_q2_sum_cache_failure("writable buffers overlap");
+        for (unsigned j = 0; j < 6u; ++j)
+            if (moe_q2_sum_cache_overlap(writers[i], writer_bytes[i], readers[j], reader_bytes[j]))
+                return moe_q2_sum_cache_failure("writable buffer overlaps a reader");
+    }
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = g_batch_cb ?: [g_queue commandBuffer];
+        if (!cb) return moe_q2_sum_cache_failure("command buffer unavailable");
+        id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
+        if (!enc) return moe_q2_sum_cache_failure("encoder unavailable");
+        const uint32_t n_tok = 1u;
+        const NSUInteger nsg_gate = (NSUInteger)g_moe_nsg;
+        const NSUInteger nsg_down = (NSUInteger)g_moe_down_nsg;
+        const NSUInteger row_groups_gate = (expert_dim + 4u * nsg_gate - 1u) / (4u * nsg_gate);
+        const NSUInteger row_groups_down = (dim + 2u * nsg_down - 1u) / (2u * nsg_down);
+        const NSUInteger pairs = n_activated_experts;
+        const NSUInteger smem_iq2 = g_moe_iq2_constant_lut ? 0u : 2176u;
+        struct ds4_metal_args_mul_mv_id gate_args = {
+            .nei0 = (int32_t)n_activated_experts,
+            .nei1 = (int32_t)n_tok,
+            .nbi1 = (uint64_t)n_activated_experts * sizeof(int32_t),
+            .ne00 = (int32_t)dim,
+            .ne01 = (int32_t)expert_dim,
+            .ne02 = (int32_t)n_routed_experts,
+            .nb00 = 66u,
+            .nb01 = gate_row_bytes,
+            .nb02 = gate_exp_bytes,
+            .ne10 = (int32_t)dim,
+            .ne11 = 1,
+            .ne12 = 1,
+            .ne13 = 1,
+            .nb10 = sizeof(float),
+            .nb11 = (uint64_t)dim * sizeof(float),
+            .nb12 = (uint64_t)dim * sizeof(float),
+            .ne0 = (int32_t)expert_dim,
+            .ne1 = (int32_t)n_activated_experts,
+            .nb1 = (uint64_t)expert_dim * sizeof(float),
+            .nr0 = 4,
+            .tp_rank = 0,
+            .tp_world = 0,
+            .tp_addend = 0,
+            .tp_expert_base = 0,
+        };
+
+        struct ds4_metal_args_mul_mv_id down_args = {
+            .nei0 = (int32_t)n_activated_experts,
+            .nei1 = (int32_t)n_tok,
+            .nbi1 = (uint64_t)n_activated_experts * sizeof(int32_t),
+            .ne00 = (int32_t)expert_dim,
+            .ne01 = (int32_t)dim,
+            .ne02 = (int32_t)n_routed_experts,
+            .nb00 = 84u,
+            .nb01 = down_row_bytes,
+            .nb02 = down_exp_bytes,
+            .ne10 = (int32_t)expert_dim,
+            .ne11 = (int32_t)n_activated_experts,
+            .ne12 = 1,
+            .ne13 = 1,
+            .nb10 = sizeof(float),
+            .nb11 = (uint64_t)expert_dim * sizeof(float),
+            .nb12 = (uint64_t)n_activated_experts * (uint64_t)expert_dim * sizeof(float),
+            .ne0 = (int32_t)dim,
+            .ne1 = (int32_t)n_tok,
+            .nb1 = (uint64_t)dim * sizeof(float),
+            .nr0 = 2,
+            .tp_rank = 0,
+            .tp_world = 1,
+            .tp_addend = 0,
+            .tp_expert_base = 0,
+        };
+
+        struct ds4_metal_dsv4_moe_swiglu_weight_args swiglu_args = {
+            .width = expert_dim,
+            .rows = (uint64_t)n_activated_experts * (uint64_t)n_tok,
+            .gate_row_stride = (uint64_t)expert_dim * sizeof(float),
+            .up_row_stride = (uint64_t)expert_dim * sizeof(float),
+            .mid_row_stride = (uint64_t)expert_dim * sizeof(float),
+            .weight_stride = sizeof(float),
+            .write_clamped = 0,
+            .clamp_value = clamp_val,
+        };
+
+        // Inputs retain the original caller's upstream producer dependencies.
+        // All validation above occurs before an IQ2, mid or cache write.
+        [enc setComputePipelineState:g_pso_moe_pair_swiglu_iq2_xxs];
+        [enc setBytes:&gate_args length:sizeof(gate_args) atIndex:0];
+        [enc setBytes:&swiglu_args length:sizeof(swiglu_args) atIndex:1];
+        [enc setBuffer:gate_exps->mtl_buf offset:gate_exps->offset atIndex:2];
+        [enc setBuffer:up_exps->mtl_buf offset:up_exps->offset atIndex:3];
+        [enc setBuffer:x_in->mtl_buf offset:x_in->offset atIndex:4];
+        [enc setBuffer:scratch_gate->mtl_buf offset:scratch_gate->offset atIndex:5];
+        [enc setBuffer:scratch_up->mtl_buf offset:scratch_up->offset atIndex:6];
+        [enc setBuffer:scratch_mid->mtl_buf offset:scratch_mid->offset atIndex:7];
+        [enc setBuffer:selected_ids->mtl_buf offset:selected_ids->offset atIndex:8];
+        [enc setBuffer:selected_weights->mtl_buf offset:selected_weights->offset atIndex:9];
+        [enc setThreadgroupMemoryLength:smem_iq2 atIndex:0];
+        metal_dispatch(enc, "fused_moe_swiglu", MTLSizeMake(row_groups_gate, 1, pairs), MTLSizeMake(32, nsg_gate, 1));
+        if (g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        else {id<MTLResource> mid = scratch_mid->mtl_buf; [enc memoryBarrierWithResources:&mid count:1];}
+
+        [enc setComputePipelineState:g_pso_moe_q2_sum_cache_prepare];
+        [enc setBytes:&down_args length:sizeof(down_args) atIndex:0];
+        [enc setBuffer:scratch_mid->mtl_buf offset:scratch_mid->offset atIndex:1];
+        [enc setBuffer:g_moe_q2_sum_cache_buffer offset:0 atIndex:2];
+        [enc setBuffer:selected_ids->mtl_buf offset:selected_ids->offset atIndex:3];
+        metal_dispatch(enc, "moe_q2_sum_cache_prepare", MTLSizeMake(4, 1, 1), MTLSizeMake(128, 1, 1));
+        if (g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        else {id<MTLResource> cache = g_moe_q2_sum_cache_buffer; [enc memoryBarrierWithResources:&cache count:1];}
+
+        [enc setComputePipelineState:g_pso_moe_q2_sum6_cached];
+        [enc setBytes:&down_args length:sizeof(down_args) atIndex:0];
+        [enc setBuffer:down_exps->mtl_buf offset:down_exps->offset atIndex:1];
+        [enc setBuffer:scratch_mid->mtl_buf offset:scratch_mid->offset atIndex:2];
+        [enc setBuffer:moe_out->mtl_buf offset:moe_out->offset atIndex:3];
+        [enc setBuffer:selected_ids->mtl_buf offset:selected_ids->offset atIndex:4];
+        [enc setBuffer:moe_out->mtl_buf offset:moe_out->offset atIndex:5];
+        [enc setBuffer:g_moe_q2_sum_cache_buffer offset:0 atIndex:6];
+        metal_dispatch(enc, "fused_moe_sum6_q2_k_cached", MTLSizeMake(row_groups_down, 1, 1), MTLSizeMake(32, nsg_down, 1));
+        // Match the reference's batch output dependency contract. With auto
+        // barriers disabled, the caller must join OUT before consuming it or
+        // reusing mid/cache; that join completes all prior dispatches, including
+        // the cached down readers. Standalone completion still waits below.
+        if (g_batch_cb) {
+            if (g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        } else {
+            [enc endEncoding]; [cb commit];
+            if (!wait_command_buffer(cb)) return moe_q2_sum_cache_failure("command completion failed");
+        }
+        atomic_fetch_add_explicit(&g_moe_q2_sum_cache_encoded, 1, memory_order_relaxed);
+        return 1;
+    }
 }
 
 int myds_metal_attn_output_a_batch(

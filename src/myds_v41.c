@@ -3149,7 +3149,7 @@ static inline bool check_logits_finite(const float *logits, uint32_t n) {
 }
 
 static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos,
-                               bool need_logits, bool engram_candidate_allowed) {
+                               bool need_logits, bool ordinary_decode_allowed) {
     myds_model_t *m=ctx->model;
     myds_v41_context_t *g=ctx->v41;
     myds_v41_model_t *v=m->v41;
@@ -3231,7 +3231,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
         if (il==1 || il==14) {
             uint32_t e=il==1?0:1;
             CHECK(engram_project_pair(g,g->residual,g->engram_kv,v->engram_proj[e],g->engram_rows[e],
-                v->engram_q[e],v->engram_k[e],m->norm_eps,engram_candidate_allowed,need_logits,trace_on,fine_pipeline));
+                v->engram_q[e],v->engram_k[e],m->norm_eps,ordinary_decode_allowed,need_logits,trace_on,fine_pipeline));
             TRACE("engram_out",g->residual,4*V41_DIM);
         }
         if (trace_on || !qkv_pipeline_enabled) {
@@ -3429,7 +3429,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
             myds_metal_barrier_buffer(ctx->ffn_norm_out);
         }
         phase="MoE";
-        CHECK(myds_v41_moe_pipeline(ctx,il,(uint32_t)token,pos,g->residual,g->after_attn,g->ffn_split,l->ffn_fn,l->ffn_scale,l->ffn_base,g->flat_norm,g->mix,v->hc_eps));
+        CHECK(myds_v41_moe_pipeline_scoped(ctx,il,(uint32_t)token,pos,g->residual,g->after_attn,g->ffn_split,l->ffn_fn,l->ffn_scale,l->ffn_base,g->flat_norm,g->mix,v->hc_eps,ordinary_decode_allowed && need_logits && !trace_on));
         TRACE("layer_out",g->residual,4*V41_DIM);
         if (ctx->dspark && (il == 37 || il == 38 || il == 39)) {
             myds_dspark_capture_layer(ctx->dspark, il, g->residual);

@@ -246,6 +246,52 @@ int myds_metal_moe_route_biased(
     float                      routed_scaling_factor);
 
 /* DeepSeek Routed MoE execution on GPU: gate/up (IQ2_XXS) -> SwiGLU -> down (Q2_K) -> sum6 */
+/* MYDS_MOE_Q2_SUM_CACHE is an init-time absent/0/1 setting (default 0).
+ * cleanup + init is required to change it. Existing routed single/batch APIs
+ * always retain the reference; only the explicitly scoped API may use it. */
+int myds_metal_moe_q2_sum_cache_enabled(void);
+typedef struct {
+    uint64_t requests, encoded, failures;
+} myds_metal_moe_q2_sum_cache_counters_t;
+/* Eligible scoped attempts and successful whole IQ2->prep->Q2 encodings.
+ * Later batch command completion remains the caller's responsibility. */
+void myds_metal_moe_q2_sum_cache_counters(
+    myds_metal_moe_q2_sum_cache_counters_t *out, bool reset);
+/* Scope must come from the public, nontrace scalar logits graph, including
+ * legacy serial verifier callers. Scalar prefill and private Batch2/tree/rescue
+ * origins are excluded. Explicit mode1 requests
+ * require DIM5120, width2304, active6, IQ2/IQ2/Q2 and legal buffer ranges.
+ * An eligible one-token MM override is rejected instead of changing its tree.
+ * Caller preserves upstream X/ID/route-weight RAW dependencies as for the
+ * reference API. Candidate keeps mid RAW and adds cache RAW. As in the
+ * reference, a batch caller with auto barriers disabled must join OUT before
+ * consuming it or issuing another call that overwrites MID/private cache.
+ * That join completes the cached down readers before scratch reuse. Automatic
+ * barriers retain the reference's final buffer-scope barrier; standalone calls
+ * wait for command completion. Default reference is unchanged.
+ * Invalid eligible requests fail without reference or CPU fallback. */
+int myds_metal_routed_moe_scoped(
+    myds_metal_buffer_t       *moe_out,
+    const myds_metal_buffer_t *x_in,
+    const myds_metal_buffer_t *gate_exps,
+    const myds_metal_buffer_t *up_exps,
+    const myds_metal_buffer_t *down_exps,
+    const myds_metal_buffer_t *selected_ids,
+    const myds_metal_buffer_t *selected_weights,
+    myds_metal_buffer_t       *scratch_gate,
+    myds_metal_buffer_t       *scratch_up,
+    myds_metal_buffer_t       *scratch_mid,
+    myds_metal_buffer_t       *scratch_down,
+    uint32_t                   dim,
+    uint32_t                   expert_dim,
+    uint32_t                   n_routed_experts,
+    uint32_t                   n_activated_experts,
+    ggml_type                  gate_type,
+    ggml_type                  up_type,
+    ggml_type                  down_type,
+    float                      clamp_val,
+    bool                       ordinary_decode_allowed);
+
 int myds_metal_routed_moe(
     myds_metal_buffer_t       *moe_out,
     const myds_metal_buffer_t *x_in,

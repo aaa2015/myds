@@ -56,6 +56,8 @@ CANDIDATE_PATHS = {
         ('requests', 'encoded', 'failures', 'decode_requests', 'decode_encoded', 'decode_failures')),
     'gpu_engram_project_round': ('MYDS_ENGRAM_PROJECT_ROUND_SKIP', 'failures',
         ('requests', 'encoded', 'failures', 'decode_requests', 'decode_encoded', 'decode_failures')),
+    'gpu_moe_q2_sum_cache': ('MYDS_MOE_Q2_SUM_CACHE', 'failures',
+        ('requests', 'encoded', 'failures', 'decode_requests', 'decode_encoded', 'decode_failures')),
 }
 CANDIDATE_ENABLED_VALUES = {'gpu_lm_head_q8': '4'}
 FORBIDDEN_ENV_PREFIXES = ('MYDS_PROFILE_', 'MYDS_SKIP_', 'MYDS_TRACE_', 'MYDS_BATCH_TRACE_')
@@ -401,9 +403,9 @@ def validate_candidate_paths(samples, environment, audit):
         if name == 'gpu_lm_head_q8':
             audit.require(environment.get(flag) in (None, '2', '4'),
                           'Invalid LM head row cohort: ' + str(environment.get(flag)))
-        if name == 'gpu_engram_project_round':
+        if name in ('gpu_engram_project_round', 'gpu_moe_q2_sum_cache'):
             audit.require(environment.get(flag) in (None, '0', '1'),
-                          'Invalid Engram round-skip cohort: ' + str(environment.get(flag)))
+                          'Invalid candidate 0/1 cohort: ' + str(environment.get(flag)))
         for sample in samples:
             counters = sample.get(name)
             if counters is None:
@@ -656,7 +658,8 @@ def run(args):
         for option, name in (('require_topk_nan_fuse', 'gpu_topk_nan_fuse'),
                              ('require_batch2_q8_shared', 'gpu_batch2_q8_shared'),
                              ('require_lm_head_q8', 'gpu_lm_head_q8'),
-                             ('require_engram_project_round', 'gpu_engram_project_round')):
+                             ('require_engram_project_round', 'gpu_engram_project_round'),
+                             ('require_moe_q2_sum_cache', 'gpu_moe_q2_sum_cache')):
             if getattr(args, option, False):
                 require_candidate_path(samples, name)
         group['attention_paths'] = attention_paths(samples)
@@ -721,6 +724,8 @@ def main():
                              help='Require native NR4 Q8 LM head encoding in every formal decode, with no failures')
     measurement.add_argument('--require-engram-project-round', action='store_true',
                              help='Require native Engram projection round-skip encoding in every formal decode, with no failures')
+    measurement.add_argument('--require-moe-q2-sum-cache', action='store_true',
+                             help='Require complete routed IQ2/precompute/Q2 encoding in every formal decode, with no failures')
     measurement.add_argument('--env', action='append', default=[], help='Explicit MYDS_NAME=value, repeatable')
     measurement.add_argument('--max-new-tokens', type=int, choices=OUTPUT_CAPS, default=64)
     measurement.add_argument('--context', type=int, default=262144)
