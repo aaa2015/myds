@@ -8,6 +8,7 @@
 #include "myds_metal.h"
 #include "myds_server_internal.h"
 #include "myds_v41_gpu.h"
+#include "myds_v41.h"
 #include "myds_dspark.h"
 #include <math.h>
 #include <errno.h>
@@ -33,6 +34,7 @@ typedef struct {
     myds_v41_gpu_topk_nan_fuse_counters_t first_nan_fuse;
     myds_metal_batch2_q8_shared_counters_t first_q8_shared;
     myds_metal_lm_head_q8_counters_t first_lm_head_q8;
+    myds_v41_engram_project_round_counters_t first_engram_round;
 } capture_t;
 
 static double now_s(void) {
@@ -56,6 +58,7 @@ static void capture(const char *piece, size_t length, int32_t id, void *opaque) 
         myds_v41_gpu_topk_nan_fuse_counters(&c->first_nan_fuse, false);
         myds_metal_batch2_q8_shared_counters(&c->first_q8_shared, false);
         myds_metal_lm_head_q8_counters(&c->first_lm_head_q8, false);
+        myds_v41_engram_project_round_counters(&c->first_engram_round, false);
     }
     c->last = t;
     if (c->count < MAX_OUTPUT_TOKENS) {
@@ -332,6 +335,7 @@ int main(int argc, char **argv) {
         myds_v41_gpu_topk_nan_fuse_counters(NULL, true);
         myds_metal_batch2_q8_shared_counters(NULL, true);
         myds_metal_lm_head_q8_counters(NULL, true);
+        myds_v41_engram_project_round_counters(NULL, true);
         if (!storage_counters(json, run, "before")) { status = 1; break; }
         const double start = now_s();
         const int ok = myds_generate_bytes_ex(ctx, prompt, capture, &c, &reason, &prompt_tokens, NULL);
@@ -346,6 +350,8 @@ int main(int argc, char **argv) {
         myds_metal_batch2_q8_shared_counters(&q8_shared, false);
         myds_metal_lm_head_q8_counters_t lm_head_q8;
         myds_metal_lm_head_q8_counters(&lm_head_q8, false);
+        myds_v41_engram_project_round_counters_t engram_round;
+        myds_v41_engram_project_round_counters(&engram_round, false);
         if (!storage_counters(json, run, "after")) { status = 1; break; }
         myds_prefill_stats_t pf; myds_last_prefill_stats(ctx, &pf);
         /* Final logits are read only after the existing generation waits, outside
@@ -427,6 +433,11 @@ int main(int argc, char **argv) {
             ",\"decode_failures\":%" PRIu64 "}", lm_head_q8.requests, lm_head_q8.encoded, lm_head_q8.failures,
             lm_head_q8.requests-c.first_lm_head_q8.requests, lm_head_q8.encoded-c.first_lm_head_q8.encoded,
             lm_head_q8.failures-c.first_lm_head_q8.failures);
+        fprintf(json, ",\"gpu_engram_project_round\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64
+            ",\"failures\":%" PRIu64 ",\"decode_requests\":%" PRIu64 ",\"decode_encoded\":%" PRIu64
+            ",\"decode_failures\":%" PRIu64 "}", engram_round.requests, engram_round.encoded, engram_round.failures,
+            engram_round.requests-c.first_engram_round.requests, engram_round.encoded-c.first_engram_round.encoded,
+            engram_round.failures-c.first_engram_round.failures);
 #ifdef MYDS_V41_GPU_HAS_ATTENTION_COUNTERS
         fprintf(json, ",\"attention_paths\":{\"calls\":%" PRIu64 ",\"gather_calls\":%" PRIu64
             ",\"slab_calls\":%" PRIu64 ",\"head_first_attempts\":%" PRIu64 ",\"head_first_encoded\":%" PRIu64

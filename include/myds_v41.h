@@ -15,6 +15,36 @@ void myds_v41_model_free(myds_v41_model_t *model);
 myds_v41_context_t *myds_v41_context_create(myds_context_t *context);
 void myds_v41_context_free(myds_v41_context_t *context);
 
+/* MYDS_ENGRAM_PROJECT_ROUND_SKIP accepts only absent/0/1 (default 0),
+ * captured when this V4.1 context is created. Changing getenv afterwards
+ * cannot change the context policy. Only ordinary scalar decode with logits
+ * and without tracing can omit the redundant producer BF16 round; prefill,
+ * Batch2/tree and their scalar verification calls retain the reference. */
+int myds_v41_engram_project_round_skip_enabled(const myds_v41_context_t *context);
+typedef struct {
+    uint64_t requests, encoded, failures;
+} myds_v41_engram_project_round_counters_t;
+/* Global host encoding counters. Requests count eligible skip attempts;
+ * encoded counts an entire projection + consumer pair successfully encoded.
+ * Later command-buffer completion failures belong to the caller's graph gate.
+ * Resetting counters does not change any context's immutable policy. */
+void myds_v41_engram_project_round_counters(
+    myds_v41_engram_project_round_counters_t *out, bool reset);
+/* Model-free diagnostic entry into the same production pair helper, with the
+ * real DIM=5120, Engram input width=6144 and F16 projection. It retains the
+ * producer RAW and consumer completion join used by ordinary auto0 decode;
+ * auto1 retains the existing full barriers. The caller owns buffers and
+ * command-buffer completion. Explicit scope arguments exercise reference-only
+ * prefill/verification/trace cases without changing the stored policy. This
+ * diagnostic rejects overlapping writable/read ranges and invalid alignment
+ * before writing in every mode (projected/input: 16 bytes, weights: 8 bytes,
+ * residual/q/k: 4 bytes); only eligible skip failures affect the counters. */
+int myds_v41_engram_project_round_probe(const myds_v41_context_t *context,
+    myds_metal_buffer_t *residual, myds_metal_buffer_t *projected,
+    const myds_metal_buffer_t *projection, const myds_metal_buffer_t *input,
+    const myds_metal_buffer_t *q_weight, const myds_metal_buffer_t *k_weight,
+    float eps, bool ordinary_decode, bool need_logits, bool trace_on);
+
 /* ── 前缀快照（供服务端调度复用状态）──
  * 窗口环只有 128 槽、事后无法回溯，因此 prefill 经过边界时就把状态存下来。
  * 新请求的公共前缀只要覆盖到某个快照点，就能从那里续跑 —— 覆盖

@@ -446,7 +446,8 @@ class BenchReproduceTests(unittest.TestCase):
                     args.env = [flag + '=' + enabled_value]
                     options = {'gpu_topk_nan_fuse': 'require_topk_nan_fuse',
                                'gpu_batch2_q8_shared': 'require_batch2_q8_shared',
-                               'gpu_lm_head_q8': 'require_lm_head_q8'}
+                               'gpu_lm_head_q8': 'require_lm_head_q8',
+                               'gpu_engram_project_round': 'require_engram_project_round'}
                     setattr(args, options[name], True)
                     env = dict(self.driver.DEFAULT_ENV, **{flag: enabled_value})
                     records = self.v2_records(environment=env)
@@ -529,6 +530,17 @@ class BenchReproduceTests(unittest.TestCase):
                 state = self.state_for(records)
                 with self.assertRaisesRegex(ValueError, 'Invalid LM head row cohort'):
                     self.driver.validate_run(directory, state, self.driver.load_audit())
+
+    def test_engram_round_cohort_rejects_invalid_values_without_counters(self):
+        for i, value in enumerate(('', '2', '01', '1 ', '-1', 'true', 'garbage')):
+            with self.subTest(value=value):
+                records = self.v2_records(environment=dict(self.driver.DEFAULT_ENV,
+                    MYDS_ENGRAM_PROJECT_ROUND_SKIP=value))
+                directory = self.directory / ('invalid-engram-round-' + str(i))
+                directory.mkdir()
+                write_samples(directory / 'run-metrics.jsonl', records)
+                with self.assertRaisesRegex(ValueError, 'Invalid Engram round-skip cohort'):
+                    self.driver.validate_run(directory, self.state_for(records), self.driver.load_audit())
 
     def test_topk_prefix_summary_requires_formal_encoding(self):
         encoded = dict(requests=4, encoded=4, unavailable=0, classified_rows=4,

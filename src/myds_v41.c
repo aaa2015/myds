@@ -100,6 +100,7 @@ struct myds_v41_context {
     myds_v41_gpu_scratch_t *gpu;
     uint32_t capacity, next_position;
     bool valid;
+    int engram_project_round_skip;
     myds_metal_buffer_t *residual, *after_attn, *flat_norm, *mix;
     myds_metal_buffer_t *attn_split, *ffn_split, *pre;
     myds_metal_buffer_t *engram_rows[2], *engram_kv;
@@ -2422,7 +2423,38 @@ void myds_v41_model_free(myds_v41_model_t *v) {
     myds_engram_free(v->engram); free(v);
 }
 
+static atomic_uint_fast64_t engram_round_requests, engram_round_encoded, engram_round_failures;
+
+static int engram_round_parse_mode(void) {
+    const char *value = getenv("MYDS_ENGRAM_PROJECT_ROUND_SKIP");
+    if (!value || strcmp(value, "0") == 0) return 0;
+    if (strcmp(value, "1") == 0) return 1;
+    MYDS_LOG_E("MYDS_ENGRAM_PROJECT_ROUND_SKIP must be exactly 0 or 1");
+    return -1;
+}
+
+int myds_v41_engram_project_round_skip_enabled(const myds_v41_context_t *g) {
+    return g ? g->engram_project_round_skip : 0;
+}
+
+void myds_v41_engram_project_round_counters(
+    myds_v41_engram_project_round_counters_t *out, bool reset) {
+    myds_v41_engram_project_round_counters_t values;
+    if (reset) {
+        values.requests = atomic_exchange_explicit(&engram_round_requests, 0, memory_order_relaxed);
+        values.encoded = atomic_exchange_explicit(&engram_round_encoded, 0, memory_order_relaxed);
+        values.failures = atomic_exchange_explicit(&engram_round_failures, 0, memory_order_relaxed);
+    } else {
+        values.requests = atomic_load_explicit(&engram_round_requests, memory_order_relaxed);
+        values.encoded = atomic_load_explicit(&engram_round_encoded, memory_order_relaxed);
+        values.failures = atomic_load_explicit(&engram_round_failures, memory_order_relaxed);
+    }
+    if (out) *out = values;
+}
+
 myds_v41_context_t *myds_v41_context_create(myds_context_t *ctx) {
+    const int round_skip = engram_round_parse_mode();
+    if (round_skip < 0) return NULL;
     if (!ctx || !ctx->model->v41 || !ctx->cfg.max_seq_len || ctx->cfg.max_seq_len>1048576u)
         return NULL;
     /* Basic buffers are allocated by the shared context constructor. */
@@ -2435,6 +2467,9 @@ myds_v41_context_t *myds_v41_context_create(myds_context_t *ctx) {
     if (!ctx->sample_probs || !ctx->sample_indices || !ctx->sample_cands) return NULL;
     myds_v41_context_t *g=calloc(1,sizeof(*g));
     if (!g) return NULL;
+    g->engram_project_round_skip = round_skip;
+    MYDS_LOG_I("Engram projection round skip: %d (%s; ordinary scalar decode, nontrace)",
+               round_skip, round_skip ? "skip" : "reference");
     g->model = ctx->model;
     g->capacity=ctx->cfg.max_seq_len;
     g->engram=myds_engram_clone(ctx->model->v41->engram);
@@ -2513,8 +2548,11 @@ void myds_v41_context_free(myds_v41_context_t *g) {
 
 myds_v41_context_t *myds_v41_context_create_for_model(const myds_model_t *model) {
     if (!model) return NULL;
+    const int round_skip = engram_round_parse_mode();
+    if (round_skip < 0) return NULL;
     myds_v41_context_t *g = calloc(1, sizeof(*g));
     if (!g) return NULL;
+    g->engram_project_round_skip = round_skip;
     g->model = model;
     g->snap_enabled = (getenv("MYDS_NO_PREFIX_SNAPSHOT") == NULL);
     return g;
@@ -2538,6 +2576,96 @@ static int project(myds_metal_buffer_t *out, const myds_metal_buffer_t *w,
     }
     if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(out);
     return 1;
+}
+
+static bool engram_pair_buffer(const myds_metal_buffer_t *buffer, uint64_t bytes, size_t alignment) {
+    if (!buffer || myds_metal_buffer_size(buffer) < bytes ||
+        myds_metal_buffer_offset(buffer) % alignment) return false;
+    const void *data = myds_metal_buffer_data((myds_metal_buffer_t *)buffer);
+    return data && (uintptr_t)data % alignment == 0;
+}
+
+static bool engram_pair_overlap(const myds_metal_buffer_t *a, uint64_t a_bytes,
+                                const myds_metal_buffer_t *b, uint64_t b_bytes) {
+    const uintptr_t first = (uintptr_t)myds_metal_buffer_data((myds_metal_buffer_t *)a);
+    const uintptr_t second = (uintptr_t)myds_metal_buffer_data((myds_metal_buffer_t *)b);
+    return first <= second ? second - first < a_bytes : first - second < b_bytes;
+}
+
+static bool engram_pair_valid_inputs(myds_metal_buffer_t *residual,
+    myds_metal_buffer_t *projected, const myds_metal_buffer_t *projection,
+    const myds_metal_buffer_t *input, const myds_metal_buffer_t *q_weight,
+    const myds_metal_buffer_t *k_weight, float eps) {
+    const uint64_t residual_bytes = 4u * V41_DIM * sizeof(float);
+    const uint64_t projected_bytes = 5u * V41_DIM * sizeof(float);
+    const uint64_t projection_bytes = (uint64_t)5u * V41_DIM * MYDS_ENGRAM_INPUT_DIM * 2u;
+    const uint64_t input_bytes = MYDS_ENGRAM_INPUT_DIM * sizeof(float);
+    if (!isfinite(eps) || eps <= 0 ||
+        !engram_pair_buffer(residual, residual_bytes, 4u) ||
+        !engram_pair_buffer(projected, projected_bytes, 16u) ||
+        !engram_pair_buffer(projection, projection_bytes, 8u) ||
+        !engram_pair_buffer(input, input_bytes, 16u) ||
+        !engram_pair_buffer(q_weight, residual_bytes, 4u) ||
+        !engram_pair_buffer(k_weight, residual_bytes, 4u)) return false;
+    const myds_metal_buffer_t *readers[] = {projection, input, q_weight, k_weight};
+    const uint64_t sizes[] = {projection_bytes, input_bytes, residual_bytes, residual_bytes};
+    if (engram_pair_overlap(projected, projected_bytes, residual, residual_bytes)) return false;
+    for (size_t i = 0; i < sizeof(readers) / sizeof(*readers); ++i)
+        if (engram_pair_overlap(projected, projected_bytes, readers[i], sizes[i]) ||
+            engram_pair_overlap(residual, residual_bytes, readers[i], sizes[i])) return false;
+    return true;
+}
+
+static int engram_project_pair(const myds_v41_context_t *g,
+    myds_metal_buffer_t *residual, myds_metal_buffer_t *projected,
+    const myds_metal_buffer_t *projection, const myds_metal_buffer_t *input,
+    const myds_metal_buffer_t *q_weight, const myds_metal_buffer_t *k_weight,
+    float eps, bool ordinary_decode, bool need_logits, bool trace_on,
+    bool join_consumer) {
+    if (!g) return 0;
+    const bool skip = g->engram_project_round_skip == 1 && ordinary_decode &&
+                      need_logits && !trace_on;
+    if (skip) {
+        atomic_fetch_add_explicit(&engram_round_requests, 1, memory_order_relaxed);
+        /* Reject invalid fixture/caller buffers before the producer can write.
+         * The actual F16 and consumer entries retain their own validation. */
+        if (!engram_pair_valid_inputs(residual, projected, projection, input,
+                                     q_weight, k_weight, eps)) goto failure;
+    }
+    if (!project(projected, projection, input, 5u * V41_DIM,
+                 MYDS_ENGRAM_INPUT_DIM, GGML_TYPE_F16, !skip) ||
+        !myds_metal_v41_engram_add(residual, projected, q_weight, k_weight, V41_DIM, eps))
+        goto failure;
+    /* Keep the ordinary graph's existing post-add residual fence at the same
+     * position. Metal's resource barrier completes all preceding dispatches;
+     * that joins this sole projected-KV reader before the next overwrite.
+     * The projection's existing final fence still supplies producer->add RAW.
+     * No extra producer fence is introduced by the skip candidate. */
+    if (join_consumer && !myds_metal_get_auto_barrier())
+        myds_metal_barrier_buffer(residual);
+    if (skip) atomic_fetch_add_explicit(&engram_round_encoded, 1, memory_order_relaxed);
+    return 1;
+failure:
+    if (skip) {
+        atomic_fetch_add_explicit(&engram_round_failures, 1, memory_order_relaxed);
+        MYDS_LOG_E("Engram projection round skip failed; refusing fallback");
+    }
+    return 0;
+}
+
+int myds_v41_engram_project_round_probe(const myds_v41_context_t *g,
+    myds_metal_buffer_t *residual, myds_metal_buffer_t *projected,
+    const myds_metal_buffer_t *projection, const myds_metal_buffer_t *input,
+    const myds_metal_buffer_t *q_weight, const myds_metal_buffer_t *k_weight,
+    float eps, bool ordinary_decode, bool need_logits, bool trace_on) {
+    /* The diagnostic API accepts only a legal composite even in reference or
+     * bypass scopes. Keep that additional check out of mode-0 production. */
+    const bool skip = g && g->engram_project_round_skip == 1 &&
+                      ordinary_decode && need_logits && !trace_on;
+    if (!skip && !engram_pair_valid_inputs(residual, projected, projection, input,
+                                         q_weight, k_weight, eps)) return 0;
+    return engram_project_pair(g, residual, projected, projection, input, q_weight,
+        k_weight, eps, ordinary_decode, need_logits, trace_on, true);
 }
 
 static int qkv_fusion_enabled(const char *name,int *cached) {
@@ -3020,7 +3148,8 @@ static inline bool check_logits_finite(const float *logits, uint32_t n) {
 #endif
 }
 
-int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool need_logits) {
+static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos,
+                               bool need_logits, bool engram_candidate_allowed) {
     myds_model_t *m=ctx->model;
     myds_v41_context_t *g=ctx->v41;
     myds_v41_model_t *v=m->v41;
@@ -3101,9 +3230,8 @@ int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool 
         phase="HC attention input";
         if (il==1 || il==14) {
             uint32_t e=il==1?0:1;
-            CHECK(project(g->engram_kv,v->engram_proj[e],g->engram_rows[e],5*V41_DIM,MYDS_ENGRAM_INPUT_DIM,GGML_TYPE_F16,true));
-            CHECK(myds_metal_v41_engram_add(g->residual,g->engram_kv,v->engram_q[e],v->engram_k[e],V41_DIM,m->norm_eps));
-            if (fine_pipeline) myds_metal_barrier_buffer(g->residual);
+            CHECK(engram_project_pair(g,g->residual,g->engram_kv,v->engram_proj[e],g->engram_rows[e],
+                v->engram_q[e],v->engram_k[e],m->norm_eps,engram_candidate_allowed,need_logits,trace_on,fine_pipeline));
             TRACE("engram_out",g->residual,4*V41_DIM);
         }
         if (trace_on || !qkv_pipeline_enabled) {
@@ -3349,6 +3477,10 @@ fail:
     g->valid=false; return -1;
 #undef CHECK
 #undef TRACE
+}
+
+int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool need_logits) {
+    return v41_forward_impl(ctx, token, pos, need_logits, true);
 }
 
 /* =========================================================================
@@ -4559,7 +4691,7 @@ int myds_v41_forward_batch_spec_ex(myds_context_t *ctx, const int32_t *tokens,
         }
         if (ret == 1 && n_tokens >= 3 && out_tokens[0] == tokens[2] &&
             (!ctx->model->tokenizer || out_tokens[0] != ctx->model->tokenizer->eos_id)) {
-            int32_t next1 = myds_v41_forward(ctx, tokens[2], pos + 1u, true);
+            int32_t next1 = v41_forward_impl(ctx, tokens[2], pos + 1u, true, false);
             if (next1 < 0) return -1;
             out_tokens[1] = next1;
             ctx->pos = pos + 2u;
@@ -4574,7 +4706,7 @@ int myds_v41_forward_batch_spec_ex(myds_context_t *ctx, const int32_t *tokens,
     if (snapshot && !myds_v41_spec_snapshot_save(ctx, snapshot, n_tokens >= 2 ? 2 : 1)) return -1;
 
     // 1. 先前向第一个 token（后备回退）
-    int32_t next0 = myds_v41_forward(ctx, tokens[0], pos, true);
+    int32_t next0 = v41_forward_impl(ctx, tokens[0], pos, true, false);
     if (next0 < 0) return -1;
     out_tokens[0] = next0;
     if (ctx->model->tokenizer && next0 == ctx->model->tokenizer->eos_id) {
@@ -4597,7 +4729,7 @@ int myds_v41_forward_batch_spec_ex(myds_context_t *ctx, const int32_t *tokens,
 
     if (snapshot && !myds_v41_spec_snapshot_capture_first(ctx, snapshot)) return -1;
     // 2. 仅在草稿候选命中时，前向对应命中的分支 token
-    int32_t next1 = myds_v41_forward(ctx, hit_token, pos + 1, true);
+    int32_t next1 = v41_forward_impl(ctx, hit_token, pos + 1, true, false);
     if (next1 < 0) return -1;
     out_tokens[1] = next1;
     ctx->pos = pos + 2u;
