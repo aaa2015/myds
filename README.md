@@ -95,6 +95,8 @@ Q2 down 独立 NSG、top-k 前缀合并裁剪及短/长输入对照，见
 [第二轮内核实现与验证](docs/benchmarks/2026-10-09-decode-kernels/README.md)。
 当前 GPU 时间线、IQ2 LUT 与 attention 物理 SIMD 打包的实现和验收边界，见
 [第三轮报告](docs/benchmarks/2026-10-09-decode-profile/README.md)。
+排序中的 NaN 分类融合与 Batch2 output-B Q8 双输入共享权重候选，见
+[第四轮实现与验证](docs/benchmarks/2026-10-09-decode-next/README.md)。
 
 2026-10-05 的 Mac Studio 独占测试、逐 token 耗时和组件回放证据见
 [本轮实测汇总](docs/benchmarks/2026-10-05-optimization/final-summary.json)。
@@ -270,11 +272,14 @@ compressed KV 与 index cache 保存已完成 BF16 舍入的上 16 位，读取�
 | `MYDS_QKV_FUSE_POST` | 启用 | decode 合并 Q/K RoPE、KV 量化及窗口写入，保留原舍入边界；设为 `0` 恢复原 dispatch。缺融合 PSO、别名或 copy 故障注入时回退原路径。 |
 | `MYDS_QKV_NR0` | `4` | 融合 Q8 GEMV 每组处理四个独立输出行；`2` 使用两个行的配置。归约顺序不变。 |
 | `MYDS_BATCH2_SPEC` | 关闭 | 显式 `1` 请求 greedy、无图片的真实 batch2；剩余输出/context 至少两步，DSpark 主候选仍要求 high-confidence。 |
+| `MYDS_BATCH2_Q8_SHARED` | `0` | 严格接受 `0` 或 `1`。显式 `1` 在 eligible Batch2 output-B Q8/BF16 投影中，让两个 token 复用同一量化权重读取，保留各自的累加、归约和舍入。trace、关闭原 decode BF16 fusion 或其他投影保持参考路径；缺候选 PSO 时初始化失败。需与真实 Batch2 整图计数和完整模型 A–B–A 一起验收。 |
 | `MYDS_SPEC_SERIAL_PROBE` | 关闭 | 显式 `1` 允许 V4.1 逐 token 验证的 DSpark/PLD 对照；默认未启用 batch2 时跳过这类草稿与快照工作。 |
 | `MYDS_SPEC_COST_SCHEDULER` | 关闭 | 显式 `1` 按整个周期成本与纯 target 基线比较，三个不划算周期后 backoff 16 个候选周期；每请求重置，需独立 A/B。 |
 | `MYDS_DECODE_METRICS` | 关闭 | 显式 `1` 收集 host 分项时间与原始周期；请求 counters 始终可读。成本调度器也启用累计计时，但不会单独开启原始周期数组。 |
 | `MYDS_QKV_CONCURRENT` | 关闭 | 显式设为 `1` 才在单 token QKV/Indexer 局部图创建 concurrent encoder，按资源同步独立分支；正常退出与失败都恢复进入前的 encoder/auto-barrier 设置。trace 与关闭 QKV pipeline 时保留参考路径。已有 `MYDS_METAL_CONCURRENT=1` 仍有原全局语义。 |
 | `MYDS_INDEXER_COMPACT_SCORER` | 关闭 | 显式设为 `1` 才在单 token decode 的 layer 24/28/32/36、历史行数超过 16384 时，按 layer 20 原 selected block IDs 派发评分。先填充 dense scores 为 `-INFINITY`，有效行写回原 ID；原 filter 与 dense top-k 分区/同分网络保持一致。缺可选 PSO 在写入前回退；开始派发后失败终止。prefill、trace 与批量投机保持参考评分路径。 |
+| `MYDS_INDEXER_TOPK_PREFIX_MERGE` | `0` | 显式 `1` 在至少 16 个原排序分区、`top<=512` 的原 eligibility 内裁剪中间 merge 输出。保留原 partition 与比较网络；含可见 NaN 的行使用 dense merge。 |
+| `MYDS_INDEXER_TOPK_NAN_FUSE` | `0` | 严格接受 `0` 或 `1`。同时开启 prefix merge 时，在原 sorter 中按 IEEE 位分类每个分区，替代独立分类 dispatch；空/future causal 分区明确写零。缺可选 PSO 或几何不支持原 `nth` 时，在写入前回退 dense。counter 表示 host 编码，不能当作实际 GPU 流量。 |
 | `MYDS_MOE_IQ2_TAIL_CULL` | 启用 | prefill MoE IQ2 up/gate 的尾 tile 跳过没有有效 token 的半 tile。`0` 恢复原 kernel；默认缺新 PSO 时回退原 kernel，显式 `1` 缺 PSO 时初始化失败并清理所有部分状态。 |
 | `MYDS_SSE_DRAIN_TIMEOUT_MS` | `1000` | SSE 完成时的整体排空期限，合法范围 `1..30000` ms；非法值使用默认值。 |
 
