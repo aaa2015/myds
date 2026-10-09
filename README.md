@@ -93,6 +93,8 @@ myds/
 [2026-10-08 优化方案](docs/DECODE_OPTIMIZATION_PLAN_2026-10-08.md)。
 Q2 down 独立 NSG、top-k 前缀合并裁剪及短/长输入对照，见
 [第二轮内核实现与验证](docs/benchmarks/2026-10-09-decode-kernels/README.md)。
+当前 GPU 时间线、IQ2 LUT 与 attention 物理 SIMD 打包的实现和验收边界，见
+[第三轮报告](docs/benchmarks/2026-10-09-decode-profile/README.md)。
 
 2026-10-05 的 Mac Studio 独占测试、逐 token 耗时和组件回放证据见
 [本轮实测汇总](docs/benchmarks/2026-10-05-optimization/final-summary.json)。
