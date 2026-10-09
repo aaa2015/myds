@@ -12,6 +12,17 @@
 
 enum { DEEPER_CAP = 4096u, DEEPER_TEXT = 2304u };
 
+/* Prompt-end fixtures hash/save positions beyond the embedded P1 fixture's
+ * LK_NTOK=2048. Allocate and initialize the full deeper capacity so those
+ * prefixes never read adjacent heap data. */
+static int32_t *deeper_tokens(void) {
+    int32_t *tokens = malloc(DEEPER_CAP * sizeof(*tokens));
+    assert(tokens);
+    for (uint32_t i = 0; i < DEEPER_CAP; ++i)
+        tokens[i] = (int32_t)((i * 37u + 11u) % 50000u);
+    return tokens;
+}
+
 static uint32_t deeper_encode(myds_model_t *model, const char *text, int32_t *tokens) {
     const int32_t n = myds_tokenizer_encode(model->tokenizer, text, tokens, DEEPER_CAP, true);
     assert(n > 2048 && n < DEEPER_CAP);
@@ -65,7 +76,7 @@ static myds_v41_context_t *deeper_saved(const char *path, int32_t **out_tokens) 
     myds_v41_context_t *g = myds_v41_context_create_snapshot_fixture();
     assert(g && myds_v41_low_kv_fixture_enable(g, path, 0x5EEDull, 2, false, DEEPER_CAP));
     lk_fill_state(g);
-    int32_t *tokens = lk_tokens();
+    int32_t *tokens = deeper_tokens();
     assert(myds_v41_low_kv_save(g, tokens, LK_NTOK));
     lk_make_fork_state(g); /* RAM is B, disk is A; only the first 1024 agree. */
     for (uint32_t l = 0; l < 40u; ++l)
@@ -204,7 +215,7 @@ static void test_deeper_capacity_and_identity(const char *path) {
 
 static void test_deeper_disabled(void) {
     myds_v41_context_t *g = myds_v41_context_create_snapshot_fixture(); assert(g);
-    int32_t *tokens = lk_tokens();
+    int32_t *tokens = deeper_tokens();
     assert(!myds_v41_low_kv_enabled(g));
     assert(myds_v41_low_kv_probe(g, tokens, 2048) == 0);
     assert(myds_v41_low_kv_load_deeper(g, tokens, 1024, 2048) == 0);
@@ -293,7 +304,7 @@ static void test_deeper_prompt_end_snapshot(const char *path) {
     char ends_path[600];
     snprintf(ends_path, sizeof(ends_path), "%s.ends", path);
 
-    int32_t *tokens = lk_tokens();
+    int32_t *tokens = deeper_tokens();
     myds_v41_context_t *g = myds_v41_context_create_snapshot_fixture();
     assert(g && myds_v41_low_kv_fixture_enable(g, path, 0x5EEDull, 2, false, DEEPER_CAP));
 
@@ -383,7 +394,7 @@ static void test_deeper_prompt_end_eviction(const char *path) {
     myds_kvdsk_t *ends = myds_v41_low_kv_fixture_ends(g);
     assert(ends);
 
-    int32_t *tokens = lk_tokens();
+    int32_t *tokens = deeper_tokens();
     /* Fill all 32 end slots with different positions 2101, 2103, ..., 2163 */
     for (uint32_t i = 0; i < 32u; ++i) {
         const uint32_t p = 2101u + i * 2u;

@@ -43,6 +43,9 @@ DECODE_COUNTERS = ('target_forward_calls', 'target_rows', 'batch2_calls', 'batch
                   'pld_proposed', 'pld_accepted', 'output_tokens', 'cycle_count')
 DECODE_TIMERS = ('draft_ms', 'verify_ms', 'rollback_ms', 'snapshot_ms', 'pld_ms')
 INDEXER_COMPACT_COUNTERS = ('requests', 'encoded', 'unavailable', 'dense_rows', 'scored_row_slots')
+TOPK_PREFIX_COUNTERS = ('requests', 'encoded', 'unavailable', 'classified_rows', 'merge_dispatches',
+                       'dense_write_slots', 'prefix_write_slots', 'decode_requests',
+                       'decode_encoded', 'decode_unavailable')
 FORBIDDEN_ENV_PREFIXES = ('MYDS_PROFILE_', 'MYDS_SKIP_', 'MYDS_TRACE_', 'MYDS_BATCH_TRACE_')
 FORBIDDEN_ENV_NAMES = {'MYDS_MOE_STEP_PROF', 'MYDS_PHASE_PROFILE_FILE', 'MYDS_DISABLE_V41_PREFILL',
                        'MYDS_PROF', 'MYDS_DISPATCH_HIST', 'MYDS_DEBUG_DISPATCH'}
@@ -275,11 +278,30 @@ def validate_run(directory, state, audit):
                           'Invalid compact indexer counter: ' + key)
         audit.require(compact['encoded'] + compact['unavailable'] <= compact['requests'],
                       'Compact indexer results exceed requests')
+    for sample in samples:
+        if 'gpu_topk_prefix' not in sample:
+            continue  # Historical harnesses did not expose this path.
+        counters = sample['gpu_topk_prefix']
+        audit.require(isinstance(counters, dict), 'Invalid topk prefix path counters')
+        for key in TOPK_PREFIX_COUNTERS:
+            value = counters.get(key)
+            audit.require(isinstance(value, int) and not isinstance(value, bool) and value >= 0,
+                          'Invalid topk prefix counter: ' + key)
+        audit.require(counters['encoded'] + counters['unavailable'] == counters['requests'],
+                      'Topk prefix results differ from requests')
+        audit.require(counters['prefix_write_slots'] <= counters['dense_write_slots'],
+                      'Topk prefix planned write slots exceed dense plan')
+        audit.require(counters['decode_encoded'] + counters['decode_unavailable'] == counters['decode_requests'],
+                      'Topk prefix decode results differ from requests')
+        for key in ('requests', 'encoded', 'unavailable'):
+            audit.require(counters['decode_' + key] <= counters[key],
+                          'Topk prefix decode counters exceed request total')
     group['callback_latency_ms'] = distribution(
         [value for sample in samples if not sample['warmup'] for value in sample['callback_intervals_ms']])
     group['decode_telemetry'] = telemetry_summary(
         samples, state['environment'].get('MYDS_DECODE_METRICS') == '1')
     group['gpu_indexer_compact'] = indexer_compact_paths(samples)
+    group['gpu_topk_prefix'] = topk_prefix_paths(samples)
     return group, samples
 
 
@@ -340,6 +362,21 @@ def indexer_compact_paths(samples):
             'scope': 'Per-request host path counters; encoded commands are not GPU duration or throughput proof'}
 
 
+def topk_prefix_paths(samples):
+    records = [{'run': sample['run'], 'warmup': sample['warmup'], **sample['gpu_topk_prefix']}
+               for sample in samples if isinstance(sample.get('gpu_topk_prefix'), dict)]
+    if not records:
+        return None
+    formal = [record for record in records if not record['warmup']]
+    return {'runs': records,
+            'encoded_in_formal_runs': any(record['encoded'] > 0 for record in formal),
+            'any_unavailable_in_formal_runs': any(record['unavailable'] > 0 for record in formal),
+            'formal_totals': {key: sum(record[key] for record in formal) for key in TOPK_PREFIX_COUNTERS},
+            'scope': 'Per-request host encoding evidence. Write slots are planned finite-row work; '
+                     'GPU NaN rows retain dense work. Decode counters exclude work through the first '
+                     'callback. These are not actual GPU traffic or timing.'}
+
+
 def compare(args):
     audit = load_audit()
     groups, raw, states = [], [], []
@@ -356,6 +393,10 @@ def compare(args):
         audit.require(base['metadata'][key] == candidate['metadata'][key], 'Input/config differs: ' + key)
     for key in ('request_sha256', 'model'):
         audit.require(states[0][key] == states[1][key], 'File identity differs: ' + key)
+    if getattr(args, 'same_build', False):
+        for key in ('binary_sha256', 'metallib_sha256', 'source'):
+            audit.require(states[0].get(key) is not None and states[0].get(key) == states[1].get(key),
+                          'Same-build comparison differs: ' + key)
     for key in ('cpu', 'memory_bytes', 'os'):
         audit.require(states[0]['host_before'][key] == states[1]['host_before'][key], 'Host differs: ' + key)
     audit.require((base['metadata']['environment'].get('MYDS_DECODE_METRICS') or '0') ==
@@ -382,6 +423,8 @@ def compare(args):
                                    'candidate': attention_paths(raw[1])},
                'gpu_indexer_compact': {'base': base['gpu_indexer_compact'],
                                        'candidate': candidate['gpu_indexer_compact']},
+               'gpu_topk_prefix': {'base': base['gpu_topk_prefix'],
+                                   'candidate': candidate['gpu_topk_prefix']},
                'builds': [{'binary_sha256': s['binary_sha256'], 'metallib_sha256': s['metallib_sha256'],
                            'environment': s['environment'], 'source': s.get('source'),
                            'dspark_model': s.get('dspark_model'), 'arm': s.get('arm', 'custom')}
@@ -509,6 +552,14 @@ def run(args):
         if result:
             raise RuntimeError(f'Harness exited {result}; inspect {output / "run.log"}')
         group, samples = validate_run(output, state, load_audit())
+        if getattr(args, 'require_topk_prefix', False):
+            formal = [sample.get('gpu_topk_prefix') for sample in samples if not sample['warmup']]
+            if not formal or any(not counters or counters['requests'] <= 0 or
+                                 counters['encoded'] != counters['requests'] or counters['unavailable'] or
+                                 counters['decode_requests'] <= 0 or
+                                 counters['decode_encoded'] != counters['decode_requests'] or
+                                 counters['decode_unavailable'] for counters in formal):
+                raise ValueError('Required topk prefix path did not encode every formal decode request')
         group['attention_paths'] = attention_paths(samples)
         write_json(output / 'run-summary.json', group)
         state['status'] = 'validated'
@@ -549,6 +600,8 @@ def main():
     comparison.add_argument('--candidate', type=Path, required=True)
     comparison.add_argument('--control', type=Path, help='Final A arm, identical to --base, for A–B–A drift')
     comparison.add_argument('--out', type=Path, required=True)
+    comparison.add_argument('--same-build', action='store_true',
+                            help='Require identical binary, metallib and source for an environment-only comparison')
     measurement = commands.add_parser('run', help='Run one model configuration; requires an already idle machine')
     measurement.add_argument('--binary', type=Path, default=ROOT / 'bin/bench_phase')
     measurement.add_argument('--model', type=Path, required=True)
@@ -559,6 +612,8 @@ def main():
                              default='target', help='Explicit path settings; custom permits arbitrary --env overrides')
     measurement.add_argument('--request', type=Path, required=True)
     measurement.add_argument('--out', type=Path, required=True, help='New output directory; existing directories are refused')
+    measurement.add_argument('--require-topk-prefix', action='store_true',
+                             help='Require all formal runs to encode every eligible decode prefix request without fallback')
     measurement.add_argument('--env', action='append', default=[], help='Explicit MYDS_NAME=value, repeatable')
     measurement.add_argument('--max-new-tokens', type=int, choices=OUTPUT_CAPS, default=64)
     measurement.add_argument('--context', type=int, default=262144)

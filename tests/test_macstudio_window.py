@@ -206,6 +206,45 @@ class WindowTests(unittest.TestCase):
         self.assertNotIn('DS4_DSPARK', kwargs['env'])
         self.assertTrue(kwargs['start_new_session'])
 
+    def test_extra_frozen_file_content_change_stops_measurement_and_restores(self):
+        # Outside Git, with unchanged length and mtime: only the requested full
+        # content digest can detect this mutation after a real harmless gate.
+        token_file = self.root / 'state-input-tokens.txt'
+        gate_file = self.root / 'external-gate-binary'
+        token_file.write_text('1111\n')
+        gate_file.write_text('CPU binary identity fixture\n')
+        self.args.freeze_file = [token_file, gate_file]
+        program = ('import os,pathlib; p=pathlib.Path(__import__("sys").argv[1]); '
+                   'st=p.stat(); p.write_text("2222\\n"); '
+                   'os.utime(p, ns=(st.st_atime_ns,st.st_mtime_ns))')
+        self.args.gate = [json.dumps([sys.executable, '-c', program, str(token_file)])]
+        original = token_file.stat()
+        window = FixtureWindow(self.args)
+        self.assertEqual(self.invoke(window), 1)
+        self.assertEqual(window.trace, ['preflight', 'stop', 'restore'])
+        self.assertTrue(self.result()['restoration']['restored'])
+        self.assertIn('identity changed during window', self.result()['error'])
+        self.assertFalse((self.args.out / 'target-a1.stdout.log').exists())
+        self.assertEqual(token_file.stat().st_size, original.st_size)
+        self.assertEqual(token_file.stat().st_mtime_ns, original.st_mtime_ns)
+        frozen = window.frozen_inputs['extra_files_sha256']
+        self.assertEqual(set(frozen), {str(token_file.resolve()), str(gate_file.resolve())})
+        self.assertNotEqual(frozen[str(token_file.resolve())], controller.sha(token_file))
+        self.assertEqual(frozen[str(gate_file.resolve())], controller.sha(gate_file))
+
+    def test_missing_extra_frozen_file_refuses_stop_and_legacy_structure_is_unchanged(self):
+        window = FixtureWindow(self.args)
+        self.assertNotIn('extra_files_sha256', window.freeze_inputs())
+        self.args.freeze_file = []
+        self.assertNotIn('extra_files_sha256', window.freeze_inputs())
+        self.args.freeze_file = [self.root / 'missing-gate-binary']
+        self.assertEqual(self.invoke(window), 1)
+        self.assertEqual(window.trace, [])
+        self.assertTrue(window.active)
+        self.assertIn('Missing extra frozen input:', self.result()['error'])
+        self.assertEqual(self.result()['restoration']['mode'], 'production_not_stopped')
+        self.assertFalse((self.args.out / 'gate-1.stdout.log').exists())
+
     def test_restore_timeout_drains_before_retry(self):
         window = FixtureWindow(self.args)
         window.out.mkdir(); window.preflight(); window.active = False

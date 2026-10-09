@@ -29,6 +29,7 @@ typedef struct {
     int32_t ids[MAX_OUTPUT_TOKENS];
     double times[MAX_OUTPUT_TOKENS], first, last;
     uint64_t byte_count, bytes_hash, ids_hash;
+    myds_v41_gpu_topk_prefix_counters_t first_topk_prefix;
 } capture_t;
 
 static double now_s(void) {
@@ -46,7 +47,10 @@ static uint64_t hash_bytes(uint64_t hash, const void *bytes, size_t length) {
 static void capture(const char *piece, size_t length, int32_t id, void *opaque) {
     capture_t *c = opaque;
     const double t = now_s();
-    if (c->count == 0) c->first = t;
+    if (c->count == 0) {
+        c->first = t;
+        myds_v41_gpu_topk_prefix_counters(&c->first_topk_prefix, false);
+    }
     c->last = t;
     if (c->count < MAX_OUTPUT_TOKENS) {
         c->ids[c->count] = id;
@@ -229,7 +233,7 @@ int main(int argc, char **argv) {
         "MYDS_DISABLE_MOE_MM", "MYDS_DECODE_SPLIT", "MYDS_ATTN_GATHER", "MYDS_SUFFIX_SHRINK", "MYDS_SUFFIX_SHRINK_SHIFT",
         "MYDS_RESIDENCY_KEEP_ALIVE_S", "MYDS_RESIDENCY_HB_MS", "MYDS_NO_RESIDENCY_HB", "MYDS_NO_PREFIX_SNAPSHOT",
         "MYDS_CHUNK_KEY_MAX", "MYDS_ATTN_KEYS_CLAMP", "MYDS_INDEXER_BATCH_FLOATS", "MYDS_INDEXER_TILED",
-        "MYDS_INDEXER_COMPACT_SCORER",
+        "MYDS_INDEXER_COMPACT_SCORER", "MYDS_INDEXER_TOPK_PREFIX_MERGE",
         "MYDS_BLOCK_BUDGET", "MYDS_DISABLE_MUL_MM", "MYDS_MM_MIN_M", "MYDS_DISABLE_MM_ENGRAM",
         "MYDS_DISABLE_MM_ATTN_A", "MYDS_COMPRESSOR_PER_TOKEN", "MYDS_INDEXER_PER_TOKEN",
         /* 2026-10-05 path selectors: without them two configurations of one
@@ -246,7 +250,7 @@ int main(int argc, char **argv) {
         "MYDS_ANCHOR_SNAPSHOT", "MYDS_KV_DSK_PREFER_DEEPER", "MYDS_KV_DSK_BUDGET_MB",
         "MYDS_KV_DSK_WAYS", "MYDS_MODEL_DIGEST", "MYDS_FORCE_FULL_DIGEST",
         "MYDS_METAL_CONCURRENT", "MYDS_MOE_CONCURRENT", "MYDS_MOE_PIPELINE",
-        "MYDS_MOE_FUSE_EXPAND", "MYDS_MOE_NSG", "MYDS_SHARED_FUSE", "MYDS_SHARED_NR0",
+        "MYDS_MOE_FUSE_EXPAND", "MYDS_MOE_NSG", "MYDS_MOE_DOWN_NSG", "MYDS_SHARED_FUSE", "MYDS_SHARED_NR0",
         "MYDS_ATTN_INDEXER_PIPELINE", "MYDS_ATTN_OUTPUT_PIPELINE", "MYDS_QKV_PIPELINE",
         "MYDS_FUSE_HC_SUM_RMSNORM", "MYDS_DECODE_Q8_FUSE_BF16", "MYDS_SUFFIX_SHRINK_MIN_TOKENS",
         "MYDS_DECODE_METRICS", "MYDS_SPEC_SERIAL_PROBE", "MYDS_SPEC_COST_SCHEDULER"};
@@ -315,12 +319,15 @@ int main(int argc, char **argv) {
         myds_stop_reason_t reason = MYDS_STOP_ERROR; uint32_t prompt_tokens = 0;
         /* Request-local host path counters; exclude previous requests and load. */
         myds_v41_gpu_indexer_compact_counters(NULL, true);
+        myds_v41_gpu_topk_prefix_counters(NULL, true);
         if (!storage_counters(json, run, "before")) { status = 1; break; }
         const double start = now_s();
         const int ok = myds_generate_bytes_ex(ctx, prompt, capture, &c, &reason, &prompt_tokens, NULL);
         const double wall_s = now_s() - start;
         myds_v41_gpu_indexer_compact_counters_t compact;
         myds_v41_gpu_indexer_compact_counters(&compact, false);
+        myds_v41_gpu_topk_prefix_counters_t topk_prefix;
+        myds_v41_gpu_topk_prefix_counters(&topk_prefix, false);
         if (!storage_counters(json, run, "after")) { status = 1; break; }
         myds_prefill_stats_t pf; myds_last_prefill_stats(ctx, &pf);
         /* Final logits are read only after the existing generation waits, outside
@@ -377,6 +384,15 @@ int main(int argc, char **argv) {
         fprintf(json, ",\"gpu_indexer_compact\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64
             ",\"unavailable\":%" PRIu64 ",\"dense_rows\":%" PRIu64 ",\"scored_row_slots\":%" PRIu64 "}",
             compact.requests, compact.encoded, compact.unavailable, compact.dense_rows, compact.scored_row_slots);
+        fprintf(json, ",\"gpu_topk_prefix\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64
+            ",\"unavailable\":%" PRIu64 ",\"classified_rows\":%" PRIu64 ",\"merge_dispatches\":%" PRIu64
+            ",\"dense_write_slots\":%" PRIu64 ",\"prefix_write_slots\":%" PRIu64
+            ",\"decode_requests\":%" PRIu64 ",\"decode_encoded\":%" PRIu64 ",\"decode_unavailable\":%" PRIu64 "}",
+            topk_prefix.requests, topk_prefix.encoded, topk_prefix.unavailable, topk_prefix.classified_rows,
+            topk_prefix.merge_dispatches, topk_prefix.dense_write_slots, topk_prefix.prefix_write_slots,
+            topk_prefix.requests-c.first_topk_prefix.requests,
+            topk_prefix.encoded-c.first_topk_prefix.encoded,
+            topk_prefix.unavailable-c.first_topk_prefix.unavailable);
 #ifdef MYDS_V41_GPU_HAS_ATTENTION_COUNTERS
         fprintf(json, ",\"attention_paths\":{\"calls\":%" PRIu64 ",\"gather_calls\":%" PRIu64
             ",\"slab_calls\":%" PRIu64 ",\"head_first_attempts\":%" PRIu64 ",\"head_first_encoded\":%" PRIu64

@@ -55,6 +55,7 @@ static id<MTLComputePipelineState> g_pso_moe_mm_q2_k_f32 = nil;
 static id<MTLBuffer>               g_moe_id_map_buffer = nil;
 static NSUInteger                  g_moe_id_map_bytes = 0;
 static int                         g_moe_nsg = 2;
+static int                         g_moe_down_nsg = 2;
 static id<MTLComputePipelineState> g_pso_attn_out_low_q8_0 = nil;
 static id<MTLComputePipelineState> g_pso_attn_out_low_q8_0_bf16_r4 = nil;
 static id<MTLComputePipelineState> g_pso_mul_mm_q8_0 = nil;
@@ -442,6 +443,24 @@ static const char *g_metal_base_preamble =
 int myds_metal_init(const char *shader_dir) {
     if (g_initialized) return 1;
 
+    /* PSO function constants are initialization-time settings. An absent down
+     * override inherits the existing IQ2 setting, including its legacy parser.
+     * Reject malformed overrides before allocating any Metal resources. */
+    const char *nsg_env = getenv("MYDS_MOE_NSG");
+    const int moe_nsg = (nsg_env && atoi(nsg_env) == 4) ? 4 : 2;
+    const char *down_nsg_env = getenv("MYDS_MOE_DOWN_NSG");
+    int down_nsg = moe_nsg;
+    if (down_nsg_env) {
+        if (strcmp(down_nsg_env, "2") == 0) down_nsg = 2;
+        else if (strcmp(down_nsg_env, "4") == 0) down_nsg = 4;
+        else {
+            fprintf(stderr, "myds_metal: MYDS_MOE_DOWN_NSG must be 2 or 4\n");
+            return 0;
+        }
+    }
+    g_moe_nsg = moe_nsg;
+    g_moe_down_nsg = down_nsg;
+
     @autoreleasepool {
         g_device = MTLCreateSystemDefaultDevice();
         if (!g_device) {
@@ -773,18 +792,19 @@ int myds_metal_init(const char *shader_dir) {
         }
 
         /* 9. Build Routed MoE pipelines */
-        const char *nsg_env = getenv("MYDS_MOE_NSG");
-        g_moe_nsg = (nsg_env && atoi(nsg_env) == 4) ? 4 : 2;
         MTLFunctionConstantValues *moe_mv_id_constants = [[MTLFunctionConstantValues alloc] init];
         short moe_id_nsg = (short)g_moe_nsg;
         [moe_mv_id_constants setConstantValue:&moe_id_nsg type:MTLDataTypeShort atIndex:600];
+        MTLFunctionConstantValues *moe_down_constants = [[MTLFunctionConstantValues alloc] init];
+        short moe_down_nsg = (short)g_moe_down_nsg;
+        [moe_down_constants setConstantValue:&moe_down_nsg type:MTLDataTypeShort atIndex:600];
 
         fn = [g_library newFunctionWithName:@"kernel_mul_mv_id_iq2_xxs_f32" constantValues:moe_mv_id_constants error:nil];
         if (fn) {
             g_pso_moe_mv_id_iq2_xxs = [g_device newComputePipelineStateWithFunction:fn error:nil];
         }
 
-        fn = [g_library newFunctionWithName:@"kernel_mul_mv_id_q2_K_f32" constantValues:moe_mv_id_constants error:nil];
+        fn = [g_library newFunctionWithName:@"kernel_mul_mv_id_q2_K_f32" constantValues:moe_down_constants error:nil];
         if (fn) {
             g_pso_moe_mv_id_q2_k = [g_device newComputePipelineStateWithFunction:fn error:nil];
         }
@@ -811,7 +831,7 @@ int myds_metal_init(const char *shader_dir) {
         }
 
         pso_err = nil;
-        fn = [g_library newFunctionWithName:@"kernel_mul_mv_id_q2_K_sum6_f32" constantValues:moe_mv_id_constants error:&pso_err];
+        fn = [g_library newFunctionWithName:@"kernel_mul_mv_id_q2_K_sum6_f32" constantValues:moe_down_constants error:&pso_err];
         if (fn) {
             g_pso_moe_sum6_q2_k = [g_device newComputePipelineStateWithFunction:fn error:&pso_err];
             if (!g_pso_moe_sum6_q2_k) {
@@ -913,6 +933,8 @@ int myds_metal_init(const char *shader_dir) {
 
         g_initialized = true;
         MYDS_LOG_I("myds_metal: Initialized successfully on GPU: %s", [[g_device name] UTF8String]);
+        MYDS_LOG_I("Routed MoE geometry: IQ2 NSG=%d, Q2 down NSG=%d (%s)",
+                   g_moe_nsg, g_moe_down_nsg, down_nsg_env ? "explicit" : "inherited");
         return 1;
     }
 }
@@ -949,6 +971,8 @@ void myds_metal_cleanup(void) {
     g_pso_moe_mm_q2_k_f32 = nil;
     g_moe_id_map_buffer = nil;
     g_moe_id_map_bytes = 0;
+    g_moe_nsg = 2;
+    g_moe_down_nsg = 2;
     g_pso_attn_out_low_q8_0 = nil;
     g_pso_attn_out_low_q8_0_bf16_r4 = nil;
     g_pso_mul_mm_q8_0 = nil;
@@ -3243,7 +3267,7 @@ int myds_metal_routed_moe_batch(
         };
 
         const NSUInteger nr0_down = 2;
-        const NSUInteger nsg_down = (NSUInteger)g_moe_nsg;
+        const NSUInteger nsg_down = (NSUInteger)g_moe_down_nsg;
         const NSUInteger rows_per_group_down = nr0_down * nsg_down;
         const NSUInteger row_groups_down = (dim + rows_per_group_down - 1) / rows_per_group_down;
 

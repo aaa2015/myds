@@ -162,6 +162,7 @@ class BenchReproduceTests(unittest.TestCase):
             telemetry.update({key: 0. for key in self.driver.DECODE_TIMERS})
             sample['decode_telemetry'] = telemetry
             sample['gpu_indexer_compact'] = {key: 0 for key in self.driver.INDEXER_COMPACT_COUNTERS}
+            sample['gpu_topk_prefix'] = {key: 0 for key in self.driver.TOPK_PREFIX_COUNTERS}
         return records
 
     def invoke_cpu_runner(self, args, records, host_side_effect=None, captured_stdout=None):
@@ -426,6 +427,97 @@ class BenchReproduceTests(unittest.TestCase):
                 records = self.v2_records(environment=self.driver.DEFAULT_ENV)
                 records[3]['gpu_indexer_compact'].update(invalid)
                 with self.assertRaisesRegex(ValueError, 'compact indexer|Compact indexer'):
+                    self.invoke_cpu_runner(args, records)
+                self.assertEqual(json.loads((args.out / 'run-state.json').read_text())['status'], 'failed')
+
+    def test_topk_prefix_summary_requires_formal_encoding(self):
+        encoded = dict(requests=4, encoded=4, unavailable=0, classified_rows=4,
+                       merge_dispatches=16, dense_write_slots=100000, prefix_write_slots=20000,
+                       decode_requests=2, decode_encoded=2, decode_unavailable=0)
+        unavailable = dict(requests=4, encoded=0, unavailable=4, classified_rows=0,
+                           merge_dispatches=0, dense_write_slots=0, prefix_write_slots=0,
+                           decode_requests=2, decode_encoded=0, decode_unavailable=2)
+        zero = {key: 0 for key in self.driver.TOPK_PREFIX_COUNTERS}
+        for name, formal in (('encoded', encoded), ('warmup-only', zero), ('unavailable', unavailable)):
+            with self.subTest(name=name):
+                args = self.run_args()
+                args.out = self.directory / ('topk-' + name)
+                args.env = ['MYDS_INDEXER_TOPK_PREFIX_MERGE=1']
+                environment = dict(self.driver.DEFAULT_ENV, MYDS_INDEXER_TOPK_PREFIX_MERGE='1')
+                records = self.v2_records(environment=environment)
+                for sample in records:
+                    if sample['kind'] == 'sample':
+                        sample['gpu_topk_prefix'] = dict(encoded if sample['warmup'] else formal)
+                result, _, _ = self.invoke_cpu_runner(args, records)
+                self.assertEqual(result, 0)
+                summary = json.loads((args.out / 'run-summary.json').read_text())['gpu_topk_prefix']
+                self.assertEqual(summary['encoded_in_formal_runs'], name == 'encoded')
+                self.assertEqual(summary['any_unavailable_in_formal_runs'], name == 'unavailable')
+                self.assertEqual(summary['formal_totals'], {key: 3 * value for key, value in formal.items()})
+                self.assertIn('not actual GPU traffic', summary['scope'])
+
+    def test_required_topk_prefix_rejects_missing_fallback_and_prefill_only_paths(self):
+        encoded = {key: 0 for key in self.driver.TOPK_PREFIX_COUNTERS}
+        encoded.update(requests=4, encoded=4, classified_rows=4, merge_dispatches=16,
+                       dense_write_slots=100000, prefix_write_slots=20000,
+                       decode_requests=2, decode_encoded=2)
+        unavailable = dict(encoded, encoded=0, unavailable=4, decode_encoded=0, decode_unavailable=2)
+        prefill_only = dict(encoded, decode_requests=0, decode_encoded=0)
+        for name in ('unavailable', 'one-formal-only', 'prefill-only', 'missing', 'encoded'):
+            with self.subTest(name=name):
+                args = self.run_args()
+                args.out = self.directory / ('required-topk-' + name)
+                args.require_topk_prefix = True
+                records = self.v2_records(environment=self.driver.DEFAULT_ENV)
+                for sample in records:
+                    if sample['kind'] != 'sample':
+                        continue
+                    counters = unavailable if name == 'unavailable' else prefill_only if name == 'prefill-only' else encoded
+                    if name == 'one-formal-only' and sample['run'] >= 2:
+                        counters = unavailable
+                    if name == 'missing':
+                        del sample['gpu_topk_prefix']
+                    else:
+                        sample['gpu_topk_prefix'] = dict(counters)
+                if name == 'encoded':
+                    result, _, _ = self.invoke_cpu_runner(args, records)
+                    self.assertEqual(result, 0)
+                else:
+                    with self.assertRaisesRegex(ValueError, 'Required topk prefix path'):
+                        self.invoke_cpu_runner(args, records)
+                    self.assertEqual(json.loads((args.out / 'run-state.json').read_text())['status'], 'failed')
+
+    def test_same_build_comparison_rejects_changed_candidate_artifacts_and_source(self):
+        args = self.comparison_fixture()
+        args.same_build = True
+        for directory in (args.base, args.candidate):
+            path = directory / 'run-state.json'
+            state = json.loads(path.read_text())
+            state['source'] = {'head': 'same CPU fixture', 'dirty': False}
+            path.write_text(json.dumps(state))
+        path = args.candidate / 'run-state.json'
+        original = json.loads(path.read_text())
+        for key in ('binary_sha256', 'metallib_sha256', 'source'):
+            changed = dict(original)
+            changed[key] = {'head': 'different CPU fixture'} if key == 'source' else '0' * 64
+            path.write_text(json.dumps(changed))
+            with self.assertRaisesRegex(ValueError, 'Same-build comparison differs: ' + key):
+                self.driver.compare(args)
+            self.assertFalse(args.out.exists())
+        path.write_text(json.dumps(original))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.driver.compare(args), 0)
+
+    def test_topk_prefix_audit_rejects_invalid_counters(self):
+        for name, invalid in (('negative', {'requests': -1}), ('bool', {'encoded': True}),
+                              ('results', {'requests': 1, 'encoded': 0, 'unavailable': 0}),
+                              ('writes', {'dense_write_slots': 3, 'prefix_write_slots': 4})):
+            with self.subTest(name=name):
+                args = self.run_args()
+                args.out = self.directory / ('bad-topk-' + name)
+                records = self.v2_records(environment=self.driver.DEFAULT_ENV)
+                records[3]['gpu_topk_prefix'].update(invalid)
+                with self.assertRaisesRegex(ValueError, 'topk prefix|Topk prefix'):
                     self.invoke_cpu_runner(args, records)
                 self.assertEqual(json.loads((args.out / 'run-state.json').read_text())['status'], 'failed')
 

@@ -91,6 +91,8 @@ myds/
 [Mac Studio 实测](docs/benchmarks/2026-10-09-decode/macstudio/README.md) 记录完整模型状态门禁、
 普通256输出及长上下文对照，包含负收益和失败后修复记录。历史软件与硬件路线见
 [2026-10-08 优化方案](docs/DECODE_OPTIMIZATION_PLAN_2026-10-08.md)。
+Q2 down 独立 NSG、top-k 前缀合并裁剪及短/长输入对照，见
+[第二轮内核实现与验证](docs/benchmarks/2026-10-09-decode-kernels/README.md)。
 
 2026-10-05 的 Mac Studio 独占测试、逐 token 耗时和组件回放证据见
 [本轮实测汇总](docs/benchmarks/2026-10-05-optimization/final-summary.json)。

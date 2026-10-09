@@ -157,6 +157,19 @@ int myds_v41_gpu_topk(myds_metal_buffer_t *ids,const myds_metal_buffer_t *scores
 int myds_v41_gpu_topk_causal(myds_metal_buffer_t *ids,const myds_metal_buffer_t *scores,
     uint32_t n_cols,uint32_t top,uint32_t n_rows,uint32_t causal_start,uint32_t causal_ratio,
     myds_v41_gpu_scratch_t *scratch);
+/* Opt-in MYDS_INDEXER_TOPK_PREFIX_MERGE=1 preserves original partitions, row
+ * IDs and merge ties. Multi-stage top<=512 calls classify visible NaNs on GPU;
+ * NaN rows keep dense merging. Missing optional PSOs/allocation failures fall
+ * back before sort writes. Counters describe host encoding, not GPU traffic or
+ * timing. Write slots are planned dense/finite-row prefix destinations: NaN
+ * rows dynamically write the dense layout and are not synchronously read back. */
+typedef struct {
+    uint64_t requests, encoded, unavailable, classified_rows, merge_dispatches;
+    uint64_t dense_write_slots, prefix_write_slots;
+} myds_v41_gpu_topk_prefix_counters_t;
+void myds_v41_gpu_topk_prefix_counters(myds_v41_gpu_topk_prefix_counters_t *out,bool reset);
+/* Diagnostic preflight-unavailable injection; leaves reference sorting usable. */
+void myds_v41_gpu_inject_topk_prefix_unavailable(bool enabled);
 int myds_v41_gpu_topkmask(myds_metal_buffer_t *mask,const myds_metal_buffer_t *ids,
     uint32_t n_cols,uint32_t top);
 /* 按行批量版：mask 是 n_rows × mask_stride（float，行主序），n_cols 是每行要清/写的列数。 */

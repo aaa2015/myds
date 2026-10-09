@@ -27,6 +27,7 @@ TEST_ATTN_POLICY = $(BIN_DIR)/test_attention_policy
 TEST_ATTN_VEC = $(BIN_DIR)/test_attention_vec
 TEST_QKV_FUSION = $(BIN_DIR)/test_qkv_fusion
 TEST_DECODE_Q8 = $(BIN_DIR)/test_decode_q8
+TEST_MOE_DOWN_NSG = $(BIN_DIR)/test_moe_down_nsg
 TEST_DEEPER_SSD = $(BIN_DIR)/test_deeper_ssd
 TEST_GGUF = $(BIN_DIR)/test_gguf
 TEST_TOKENIZER = $(BIN_DIR)/test_tokenizer
@@ -52,7 +53,7 @@ DUMP_TENSORS = $(BIN_DIR)/dump_tensors
 METALLIB = $(BIN_DIR)/myds.metallib
 METAL_SRCS = $(wildcard metal/*.metal)
 
-ALL_TESTS = $(TEST_METAL) $(TEST_V41_GPU) $(TEST_ATTN_POLICY) $(TEST_ATTN_VEC) $(TEST_QKV_FUSION) $(TEST_DECODE_Q8) $(TEST_DEEPER_SSD) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE) $(TEST_CPU) $(TEST_ENGRAM) $(TEST_ALIGN) $(TEST_PLD) $(TEST_KVDSK) $(TEST_P1) $(TEST_DSPARK_ROLLBACK) $(TEST_BATCH2_PARITY) $(TEST_BATCH2_E2E) $(TEST_TREE_SPEC)
+ALL_TESTS = $(TEST_METAL) $(TEST_V41_GPU) $(TEST_ATTN_POLICY) $(TEST_ATTN_VEC) $(TEST_QKV_FUSION) $(TEST_DECODE_Q8) $(TEST_MOE_DOWN_NSG) $(TEST_DEEPER_SSD) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE) $(TEST_CPU) $(TEST_ENGRAM) $(TEST_ALIGN) $(TEST_PLD) $(TEST_KVDSK) $(TEST_P1) $(TEST_DSPARK_ROLLBACK) $(TEST_BATCH2_PARITY) $(TEST_BATCH2_E2E) $(TEST_TREE_SPEC)
 
 .PHONY: all test clean bench metallib build-tail-init test-tail-init
 
@@ -148,6 +149,15 @@ $(TEST_QKV_FUSION): $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_decode.o $
 # The fixture includes the unchanged runtime to inject a fused-PSO failure.
 $(TEST_DECODE_Q8): tests/test_decode_q8.m src/myds_metal.m $(wildcard include/*.h) $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc tests/test_decode_q8.m $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
+
+# Includes the actual runtime to check both Q2 PSOs and initialization state.
+# Building submits no GPU work; the Python driver runs isolated component arms.
+$(TEST_MOE_DOWN_NSG): tests/test_moe_down_nsg.m src/myds_metal.m $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) -Isrc tests/test_moe_down_nsg.m $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
+
+.PHONY: test-moe-down-nsg
+test-moe-down-nsg: $(TEST_MOE_DOWN_NSG)
+	python3 tests/test_moe_down_nsg.py
 
 $(TEST_DEEPER_SSD): tests/test_deeper_ssd.c tests/test_engine.c tests/test_p1_regressions.c $(OBJS_C) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) tests/test_deeper_ssd.c $(OBJS_C) $(OBJS_M) $(LDFLAGS) -o $@
@@ -298,6 +308,7 @@ test: $(ALL_TESTS) $(METALLIB)
 	@./$(TEST_ATTN_VEC)
 	@MYDS_QKV_NR0=4 ./$(TEST_QKV_FUSION)
 	@MYDS_QKV_NR0=2 ./$(TEST_QKV_FUSION)
+	@python3 tests/test_moe_down_nsg.py
 	@echo ""
 	@./$(TEST_SERVER)
 	@echo ""

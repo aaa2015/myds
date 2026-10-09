@@ -162,15 +162,14 @@ typedef void (argsort_merge_t)(
 
 // Merges sorted index runs produced by kernel_argsort_f32_i32. In the DS4 graph
 // this finishes top-k over router or compressed-attention score rows.
-template<ds4_sort_order order, bool causal = false, bool prefix = false>
-kernel void kernel_argsort_merge_f32_i32(
+template<ds4_sort_order order, bool causal>
+static inline void ds4_argsort_merge_body(
         constant   ds4_metal_args_argsort_merge & args,
         device const char    * src0,
         device const int32_t * tmp,
         device       int32_t * dst,
-        uint3   tgpig[[threadgroup_position_in_grid]],
-        ushort3 tpitg[[thread_position_in_threadgroup]],
-        ushort3   ntg[[threads_per_threadgroup]]) {
+        bool prefix, int prefix_top,
+        uint3 tgpig, ushort3 tpitg, ushort3 ntg) {
 
     const int im  = tgpig[0] / args.ne01;
     const int i01 = tgpig[0] % args.ne01;
@@ -180,12 +179,16 @@ kernel void kernel_argsort_merge_f32_i32(
     const int start = im * (2 * args.len);
     const uint width = causal ? min(uint(args.ne00),
         (args.causal_start + uint(i01) + 1u) / args.causal_ratio) : 0u;
+    // Empty causal rows leave ids untouched, like the initial sort. In
+    // particular, do not underflow width-1 into an out-of-bounds run length.
+    if (causal && width == 0u) return;
     const int work_width = causal ? int(((width - 1u) / args.block_width) * args.block_top_k +
         min((width - 1u) % args.block_width + 1u, args.block_top_k)) : args.ne0;
 
-    // A merged run can contribute at most 512 entries to the final result.
-    // Keep the original run offsets so the comparison and tie order agree.
-    const int read_limit = prefix ? min(args.len, 512) : args.len;
+    // A sorted run contributes at most final top entries. Keep the original
+    // sparse run offsets/row stride; holes after a prefix are never read by
+    // later prefix stages. NaN rows use exactly the dense lengths and chunks.
+    const int read_limit = prefix ? min(args.len, prefix_top) : args.len;
     const int len0 = MIN(read_limit, MAX(0, work_width - start));
     const int len1 = MIN(read_limit, MAX(0, work_width - (start + args.len)));
 
@@ -215,7 +218,7 @@ kernel void kernel_argsort_merge_f32_i32(
     const int chunk = (total + ntg.x - 1) / ntg.x;
 
     const int k0 = tpitg.x * chunk;
-    const int limit = prefix ? min(args.top_k, 512) : args.top_k;
+    const int limit = prefix ? min(args.top_k, prefix_top) : args.top_k;
     const int k1 = MIN(MIN(k0 + chunk, total), limit);
 
     if (k0 >= limit) {
@@ -314,7 +317,73 @@ kernel void kernel_argsort_merge_f32_i32(
     }
 }
 
+template<ds4_sort_order order, bool causal = false, bool prefix = false>
+kernel void kernel_argsort_merge_f32_i32(
+        constant ds4_metal_args_argsort_merge & args,
+        device const char * src0, device const int32_t * tmp, device int32_t * dst,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3 ntg[[threads_per_threadgroup]]) {
+    ds4_argsort_merge_body<order, causal>(args, src0, tmp, dst, prefix, 512,
+                                         tgpig, tpitg, ntg);
+}
+
 // Host-visible merge variant used by DS4 top-k selection.
 template [[host_name("kernel_argsort_merge_f32_i32_desc")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC>;
 template [[host_name("kernel_argsort_merge_f32_i32_desc_causal")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC, true>;
 template [[host_name("kernel_argsort_merge_f32_i32_desc_causal_prefix")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC, true, true>;
+
+struct myds_argsort_nan_args { uint cols, rows, start, ratio; };
+// One group per row. Test IEEE bits, not isnan(): Metal's fast-math mode must
+// not erase the unordered-input guard. Future causal columns are not consumed
+// by the sort/merge and therefore do not force a dense row.
+kernel void kernel_myds_argsort_visible_nan_rows(
+        constant myds_argsort_nan_args & args,
+        device const uint * score_bits, device uint * nan_rows,
+        uint row[[threadgroup_position_in_grid]],
+        ushort tid[[thread_index_in_threadgroup]],
+        ushort lane[[thread_index_in_simdgroup]],
+        ushort simd[[simdgroup_index_in_threadgroup]]) {
+    const uint width=args.ratio?min(args.cols,(args.start+row+1u)/args.ratio):args.cols;
+    uint found=0u;
+    for(uint col=tid;col<width;col+=256u)
+        found|=(score_bits[(ulong)row*args.cols+col]&0x7fffffffu)>0x7f800000u;
+    threadgroup uint group_found[8];
+    const uint any=simd_sum(found);
+    if(lane==0)group_found[simd]=any;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if(tid==0) {
+        uint flag=0u;
+        for(uint i=0;i<8u;i++)flag|=group_found[i];
+        nan_rows[row]=flag;
+    }
+}
+
+struct myds_argsort_prefix_merge_args {
+    ds4_metal_args_argsort_merge merge;
+    uint keep;
+};
+template<bool causal>
+kernel void kernel_myds_argsort_merge_prefix_guarded(
+        constant myds_argsort_prefix_merge_args & args,
+        device const char * src0, device const int32_t * tmp, device int32_t * dst,
+        device const uint * nan_rows,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3 ntg[[threads_per_threadgroup]]) {
+    const uint row=tgpig.x%uint(args.merge.ne01);
+    const bool prefix=nan_rows[row]==0u;
+    ds4_argsort_merge_body<DS4_SORT_ORDER_DESC, causal>(args.merge,src0,tmp,dst,
+        prefix,int(args.keep),tgpig,tpitg,ntg);
+}
+typedef void (myds_argsort_prefix_merge_t)(
+        constant myds_argsort_prefix_merge_args & args,
+        device const char * src0, device const int32_t * tmp, device int32_t * dst,
+        device const uint * nan_rows,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3 ntg[[threads_per_threadgroup]]);
+template [[host_name("kernel_myds_argsort_merge_f32_i32_desc_prefix_guarded")]]
+kernel myds_argsort_prefix_merge_t kernel_myds_argsort_merge_prefix_guarded<false>;
+template [[host_name("kernel_myds_argsort_merge_f32_i32_desc_causal_prefix_guarded")]]
+kernel myds_argsort_prefix_merge_t kernel_myds_argsort_merge_prefix_guarded<true>;
