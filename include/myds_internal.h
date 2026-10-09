@@ -123,6 +123,9 @@ struct myds_context {
     int32_t             *pcache_tokens;
     uint32_t             pcache_len;
     uint32_t             pcache_cap;
+    /* 常量前缀锚点快照（系统提示词等）：跨非连续请求持久复用 */
+    int32_t              anchor_tokens[1024];
+    uint32_t             anchor_len;
     /* previous_response_id：本请求传入的 prompt 只是【新增后缀】，前缀由 pcache_tokens 提供。
      * 一次性标志（引擎消费后自清），由服务端在收到该字段时设置。 */
     bool                 continue_from_cache;

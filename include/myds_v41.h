@@ -25,6 +25,8 @@ bool     myds_v41_snapshot_restore(myds_v41_context_t *context, uint32_t positio
 void     myds_v41_snapshot_clear(myds_v41_context_t *context, uint32_t keep_up_to);
 /* prefill 结束后记下当前状态（末尾槽），供下一个共享前缀的请求复用。 */
 bool     myds_v41_snapshot_store_now(myds_v41_context_t *context, uint32_t position);
+#define MYDS_V41_ANCHOR_SLOT 43u
+bool     myds_v41_snapshot_store_slot(myds_v41_context_t *context, uint32_t slot, uint32_t position);
 
 /* ── 低位区 KV 的 SSD 落盘 ──
  * 内存快照只活在【进程内、且只在与上一条序列共享前缀时】可用。跨进程（重启）或

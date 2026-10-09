@@ -74,6 +74,7 @@ struct myds_v41_model {
 #include "myds_kvdsk.h"
 #include "myds_lowkv_policy.h"
 #define V41_SNAP_SLOTS   MYDS_SNAP_SLOTS
+#define V41_ANCHOR_SLOT  MYDS_V41_ANCHOR_SLOT
 /* 快照点必须是 chunk 边界；512 同时满足 ratio(2)/32 键块的对齐要求。
  * ★ 它还是【偶数】这一点是承重的：压缩器的 pool2 跨位置有状态（previous_kv/previous_score），
  *   但只在【奇数】位置被读取 —— 从偶数位置续跑时它先被本位置覆盖，因此无需进快照。
@@ -180,6 +181,7 @@ void myds_v41_snapshot_clear(myds_v41_context_t *g, uint32_t keep_up_to) {
     if (!g) return;
     lowkv_join(g);   /* 每个请求开头都会走到这里（engine 在 prefill/decode 之前调） */
     for (uint32_t s = 0; s < V41_SNAP_SLOTS; ++s) {
+        if (s == V41_ANCHOR_SLOT) continue; /* 常量锚点槽跨请求持久保留，不受常规清理影响 */
         if (g->snap_pos[s] > keep_up_to) g->snap_pos[s] = 0;
         if (g->snap_staged_pos[s] > keep_up_to) g->snap_staged_pos[s] = 0;
     }
@@ -190,14 +192,16 @@ void myds_v41_snapshot_clear(myds_v41_context_t *g, uint32_t keep_up_to) {
  * 下一个兄弟请求又要全量重跑 —— 实测就是这样退化的（第 2 次命中 40x，第 3 次全量）。
  * 末尾点恰好是「下一个兄弟请求最可能用到的」那一个，所以给它一个固定槽、每次覆盖。 */
 static uint32_t snapshot_slot_for(uint32_t p, bool is_last) {
-    return myds_snap_slot_for(p, is_last ? 1 : 0);
+    uint32_t s = myds_snap_slot_for(p, is_last ? 1 : 0);
+    if (s == V41_ANCHOR_SLOT) s = 42u; /* 保护 slot 43 专供常驻锚点 */
+    return s;
 }
 /* 处理完位置 p 之后，记下 engram 的滚动状态。在 engram 循环里调用（层循环之前）。
  * ★ 事务契约：这里仅暂存 engram 状态与目标位置到 staged 槽，绝不提前置 snap_pos，
  * 避免在各层窗口环拷贝完成前被 snapshot_best 抢先选出半状态。
  * 若该槽此前存有旧快照，在此处先使旧发布标签失效，避免覆盖失败时旧标签仍有效。 */
 static void snapshot_store_engram(myds_v41_context_t *g, uint32_t p, bool is_last) {
-    if (!g->snap_enabled || (!is_last && p < V41_SNAP_MIN)) return;
+    if (!g->snap_enabled || p < V41_SNAP_MIN) return;
     if (!is_last && (p % V41_SNAP_STRIDE)) return;
     const uint32_t s = snapshot_slot_for(p, is_last);
     g->snap_pos[s] = 0;
@@ -208,7 +212,7 @@ static void snapshot_store_engram(myds_v41_context_t *g, uint32_t p, bool is_las
  * 只有当最后一层（il == V41_LAYERS-1）也保存完成，并且同步保存压缩器的 previous_kv/score
  * 之后，才正式发布 g->snap_pos[s] = p。任一步失败都清除 staged/published 标记。 */
 static bool snapshot_store_window(myds_v41_context_t *g, uint32_t il, uint32_t p, bool is_last) {
-    if (!g->snap_enabled || (!is_last && p < V41_SNAP_MIN)) return true;
+    if (!g->snap_enabled || p < V41_SNAP_MIN) return true;
     if (!is_last && (p % V41_SNAP_STRIDE)) return true;
     const uint32_t s = snapshot_slot_for(p, is_last);
     if (g->snap_staged_pos[s] != p) return true;
@@ -240,49 +244,51 @@ static bool snapshot_store_window(myds_v41_context_t *g, uint32_t il, uint32_t p
     }
     return true;
 }
-/* prefill 结束后由引擎调用：把【当前状态】存进末尾槽（0 号）。
- * ★ 批量提交：40 层窗口 + 4 previous KV + 4 previous score = 48 次复制，
- *   在同一个 command buffer 中编码，一次提交/等待。逐次提交路径（每次复制
- *   单独创建 CB → commit → waitUntilCompleted）实测 ~9.5 ms，批量 ~1.3 ms。
- * ★ 事务一致性：覆盖 slot 0 前先清除其 snap_pos 与 snap_staged_pos，确保若复制
- *   或 GPU 提交失败，旧快照标签不会残留指向新旧层混合的数据。 */
-bool myds_v41_snapshot_store_now(myds_v41_context_t *g, uint32_t p) {
-    if (!g || !g->snap_enabled || !p || p < 4u) return true;
+
+/* 把【当前状态】存进指定槽（0 号用于序列末尾，43 号用于常驻系统提示词锚点）。
+ * ★ 批量提交：40 层窗口 + 4 previous KV + 4 previous score = 48 次复制编进同一 CB。
+ * ★ 事务一致性：覆盖 slot 前先清除其 snap_pos 与 snap_staged_pos。 */
+bool myds_v41_snapshot_store_slot(myds_v41_context_t *g, uint32_t slot, uint32_t p) {
+    if (!g || !g->snap_enabled || !p || p < 4u || slot >= V41_SNAP_SLOTS) return false;
     lowkv_join(g);
-    /* 首次覆盖 slot 0 前使原发布标签和 staged 标记失效。 */
-    g->snap_pos[0] = 0;
-    g->snap_staged_pos[0] = 0;
-    if (!snapshot_ensure_slot(g, 0)) return false;
+    /* 首次覆盖指定 slot 前使原发布标签和 staged 标记失效。 */
+    g->snap_pos[slot] = 0;
+    g->snap_staged_pos[slot] = 0;
+    if (!snapshot_ensure_slot(g, slot)) return false;
     /* 先把调用方可能遗留的 in-flight 工作提交完成，保证窗口环/previous 数据已落定。 */
     if (!myds_metal_commit_batch()) return false;
     /* 开一个新 batch，把全部 48 次复制编进同一 command buffer。 */
     if (!myds_metal_begin_batch()) return false;
     const size_t bytes = (size_t)V41_WINDOW * V41_HEAD_DIM * 4u;
     for (uint32_t il = 0; il < V41_LAYERS; ++il)
-        if (!myds_metal_buffer_copy(g->snap_window[0], (size_t)il * bytes, g->window[il], 0, bytes))
-            goto store_fail;
+        if (!myds_metal_buffer_copy(g->snap_window[slot], (size_t)il * bytes, g->window[il], 0, bytes))
+            goto store_slot_fail;
     for (uint32_t o = 0; o < 4u; ++o) {
-        if (!myds_metal_buffer_copy(g->snap_prev_kv[0][o], 0, g->previous_kv[o], 0, 512 * 4u))
-            goto store_fail;
-        if (!myds_metal_buffer_copy(g->snap_prev_score[0][o], 0, g->previous_score[o], 0, 512 * 4u))
-            goto store_fail;
+        if (!myds_metal_buffer_copy(g->snap_prev_kv[slot][o], 0, g->previous_kv[o], 0, 512 * 4u))
+            goto store_slot_fail;
+        if (!myds_metal_buffer_copy(g->snap_prev_score[slot][o], 0, g->previous_score[o], 0, 512 * 4u))
+            goto store_slot_fail;
     }
     if (!myds_metal_commit_batch()) {
-        g->snap_pos[0] = 0;
-        g->snap_staged_pos[0] = 0;
+        g->snap_pos[slot] = 0;
+        g->snap_staged_pos[slot] = 0;
         return false;
     }
     /* GPU 操作成功后才发布快照位置和有效状态。 */
-    g->snap_engram[0] = g->engram->history;   /* engram 的 position 恒等于 p（每 token 推进一次） */
-    g->snap_pos[0] = p;
+    g->snap_engram[slot] = g->engram->history;   /* engram 的 position 恒等于 p（每 token 推进一次） */
+    g->snap_pos[slot] = p;
     return true;
-store_fail:
-    /* 复制失败路径：提交残余 batch（可能部分编码），确保不发布快照。
-     * 快照缺失的后果只是下一个请求无法从此点续跑（退回全量 prefill），不会静默出错。 */
-    g->snap_pos[0] = 0;
-    g->snap_staged_pos[0] = 0;
+store_slot_fail:
+    g->snap_pos[slot] = 0;
+    g->snap_staged_pos[slot] = 0;
     (void)myds_metal_commit_batch();
     return false;
+}
+
+/* prefill 结束后由引擎调用：把【当前状态】存进末尾槽（0 号）。 */
+bool myds_v41_snapshot_store_now(myds_v41_context_t *g, uint32_t p) {
+    if (!g || !g->snap_enabled || !p || p < V41_SNAP_MIN) return true;
+    return myds_v41_snapshot_store_slot(g, 0, p);
 }
 
 /* 在 [0, common] 内选最大的快照点 */
@@ -4210,7 +4216,7 @@ int myds_v41_forward_batch_spec(myds_context_t *ctx, const int32_t *tokens,
     static int batch2_enabled = -1;
     if (batch2_enabled < 0) {
         const char *e = getenv("MYDS_BATCH2_SPEC");
-        batch2_enabled = (e && atoi(e) == 0) ? 0 : 1;
+        batch2_enabled = (e && atoi(e) != 0) ? 1 : 0;
     }
 
     if (high_conf && batch2_enabled && n_tokens >= 2) {

@@ -3074,15 +3074,15 @@ static int myds_generate_internal(myds_context_t *ctx,
      * 「prompt + 生成文本」，客户端下一轮重发的历史与之逐 token 对齐。
      * MYDS_PREFIX_CACHE=0 关闭（用于对照）。 */
     uint32_t resume_from = 0;
+    /* 【默认关闭】：这是服务端调度优化，不是库语义 —— 库的调用方（含单测）
+     * 依赖「每次 generate = 从位置 0 全量 prefill」。服务端在启动环境里
+     * 显式打开（MYDS_PREFIX_CACHE=1）。 */
+    static int pcache_on = -1;
+    if (pcache_on < 0) {
+        const char *e = getenv("MYDS_PREFIX_CACHE");
+        pcache_on = (e && atoi(e) != 0) ? 1 : 0;
+    }
     {
-        /* 【默认关闭】：这是服务端调度优化，不是库语义 —— 库的调用方（含单测）
-         * 依赖「每次 generate = 从位置 0 全量 prefill」。服务端在启动环境里
-         * 显式打开（MYDS_PREFIX_CACHE=1）。 */
-        static int pcache_on = -1;
-        if (pcache_on < 0) {
-            const char *e = getenv("MYDS_PREFIX_CACHE");
-            pcache_on = (e && atoi(e) != 0) ? 1 : 0;
-        }
         bool snap_hit = false;
         uint32_t L = 0;                    /* 与【上一条请求序列】的公共前缀长度 */
         const bool have_prev = pcache_on && ctx->pcache_tokens && ctx->pcache_len;
@@ -3118,6 +3118,19 @@ static int myds_generate_internal(myds_context_t *ctx,
             }
         } else {
             MYDS_LOG_I("prefix cache: skipped - no common prefix with the cached %u tokens", ctx->pcache_len);
+        }
+
+        /* Check if prompt matches persistent anchor snapshot (e.g. System Prompt) */
+        if (pcache_on && ctx->v41 && resume_from == 0 && ctx->anchor_len > 0 &&
+            (uint32_t)n_prompt > ctx->anchor_len) {
+            if (memcmp(prompt_tokens, ctx->anchor_tokens, (size_t)ctx->anchor_len * sizeof(int32_t)) == 0) {
+                resume_from = ctx->anchor_len;
+                snap_hit = true;
+                MYDS_LOG_I("prefix cache: prompt %d tok -> resume from ANCHOR snapshot at %u "
+                           "(reuse %u tok, still to prefill %u)",
+                           n_prompt, ctx->anchor_len, ctx->anchor_len,
+                           (uint32_t)n_prompt - 1u - ctx->anchor_len);
+            }
         }
 
         /* Compare metadata even when RAM has a shallow match. Loading only
@@ -3240,8 +3253,42 @@ static int myds_generate_internal(myds_context_t *ctx,
     {
         struct timespec _pf0, _pf1;
         clock_gettime(CLOCK_MONOTONIC, &_pf0);
-        int res = myds_prefill_tokens(ctx, prompt_tokens + resume_from,
+        int res = 1;
+        const char *anch_env = getenv("MYDS_ANCHOR_SNAPSHOT");
+        bool anchor_enabled = (anch_env == NULL || atoi(anch_env) != 0);
+
+        if (pcache_on && anchor_enabled && ctx->v41 && resume_from == 0) {
+            uint32_t anchor_pos = 0;
+            for (uint32_t i = 0; i < (uint32_t)n_prompt - 1u; i++) {
+                if (prompt_tokens[i] == 128803) { /* <｜User｜> */
+                    anchor_pos = i + 1u;
+                    break;
+                }
+            }
+            if (anchor_pos >= 4u && anchor_pos < (uint32_t)n_prompt - 1u && anchor_pos <= 1024u &&
+                (ctx->anchor_len == 0 || memcmp(prompt_tokens, ctx->anchor_tokens, (size_t)anchor_pos * sizeof(int32_t)) != 0)) {
+                /* 阶段 1：先 prefill 到系统提示词锚点（pos=anchor_pos） */
+                int res0 = myds_prefill_tokens(ctx, prompt_tokens, (int32_t)anchor_pos, cancel_flag);
+                if (res0 == 1) {
+                    if (myds_v41_snapshot_store_slot(ctx->v41, MYDS_V41_ANCHOR_SLOT, anchor_pos)) {
+                        memcpy(ctx->anchor_tokens, prompt_tokens, (size_t)anchor_pos * sizeof(int32_t));
+                        ctx->anchor_len = anchor_pos;
+                        MYDS_LOG_I("prefix cache: captured persistent anchor snapshot at pos %u (slot %u)",
+                                   anchor_pos, MYDS_V41_ANCHOR_SLOT);
+                    }
+                    /* 阶段 2：prefill 剩余的 user 消息 token */
+                    res = myds_prefill_tokens(ctx, prompt_tokens + anchor_pos,
+                                              n_prompt - 1 - (int32_t)anchor_pos, cancel_flag);
+                } else {
+                    res = res0;
+                }
+            } else {
+                res = myds_prefill_tokens(ctx, prompt_tokens, n_prompt - 1, cancel_flag);
+            }
+        } else {
+            res = myds_prefill_tokens(ctx, prompt_tokens + resume_from,
                                       n_prompt - 1 - (int32_t)resume_from, cancel_flag);
+        }
         clock_gettime(CLOCK_MONOTONIC, &_pf1);
         ctx->last_prefill_seconds = (double)(_pf1.tv_sec - _pf0.tv_sec) +
                                     (double)(_pf1.tv_nsec - _pf0.tv_nsec) / 1e9;
