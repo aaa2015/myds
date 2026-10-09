@@ -56,6 +56,7 @@ static id<MTLBuffer>               g_moe_id_map_buffer = nil;
 static NSUInteger                  g_moe_id_map_bytes = 0;
 static int                         g_moe_nsg = 2;
 static int                         g_moe_down_nsg = 2;
+static bool                        g_moe_iq2_constant_lut = false;
 static id<MTLComputePipelineState> g_pso_attn_out_low_q8_0 = nil;
 static id<MTLComputePipelineState> g_pso_attn_out_low_q8_0_bf16_r4 = nil;
 static id<MTLComputePipelineState> g_pso_mul_mm_q8_0 = nil;
@@ -458,6 +459,12 @@ int myds_metal_init(const char *shader_dir) {
             return 0;
         }
     }
+    const char *iq2_lut_env = getenv("MYDS_MOE_IQ2_CONSTANT_LUT");
+    if (iq2_lut_env && strcmp(iq2_lut_env, "0") != 0 && strcmp(iq2_lut_env, "1") != 0) {
+        fprintf(stderr, "myds_metal: MYDS_MOE_IQ2_CONSTANT_LUT must be 0 or 1\n");
+        return 0;
+    }
+    const bool moe_iq2_constant_lut = iq2_lut_env && strcmp(iq2_lut_env, "1") == 0;
     g_moe_nsg = moe_nsg;
     g_moe_down_nsg = down_nsg;
 
@@ -820,14 +827,25 @@ int myds_metal_init(const char *shader_dir) {
         }
 
         NSError *pso_err = nil;
-        fn = [g_library newFunctionWithName:@"kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32" constantValues:moe_mv_id_constants error:&pso_err];
+        NSString *iq2_pair_name = moe_iq2_constant_lut ?
+            @"kernel_mul_mv_id_iq2_xxs_pair_swiglu_constant_lut_f32" :
+            @"kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32";
+        fn = [g_library newFunctionWithName:iq2_pair_name constantValues:moe_mv_id_constants error:&pso_err];
         if (fn) {
             g_pso_moe_pair_swiglu_iq2_xxs = [g_device newComputePipelineStateWithFunction:fn error:&pso_err];
             if (!g_pso_moe_pair_swiglu_iq2_xxs) {
-                printf("myds_metal: kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32 PSO error: %s\n", [[pso_err localizedDescription] UTF8String]);
+                printf("myds_metal: %s PSO error: %s\n", [iq2_pair_name UTF8String], [[pso_err localizedDescription] UTF8String]);
             }
         } else {
-            printf("myds_metal: kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32 fn error: %s\n", [[pso_err localizedDescription] UTF8String]);
+            printf("myds_metal: %s fn error: %s\n", [iq2_pair_name UTF8String], [[pso_err localizedDescription] UTF8String]);
+        }
+        /* Explicit opt-in must not report successful initialization while
+         * silently selecting the reference kernel or an unrelated MM path. */
+        if (moe_iq2_constant_lut && !g_pso_moe_pair_swiglu_iq2_xxs) {
+            fprintf(stderr, "myds_metal: explicitly requested IQ2 constant LUT kernel unavailable\n");
+            g_initialized = true;
+            myds_metal_cleanup();
+            return 0;
         }
 
         pso_err = nil;
@@ -931,10 +949,12 @@ int myds_metal_init(const char *shader_dir) {
             return 0;
         }
 
+        g_moe_iq2_constant_lut = moe_iq2_constant_lut;
         g_initialized = true;
         MYDS_LOG_I("myds_metal: Initialized successfully on GPU: %s", [[g_device name] UTF8String]);
         MYDS_LOG_I("Routed MoE geometry: IQ2 NSG=%d, Q2 down NSG=%d (%s)",
                    g_moe_nsg, g_moe_down_nsg, down_nsg_env ? "explicit" : "inherited");
+        MYDS_LOG_I("Routed MoE IQ2 LUT: %s", g_moe_iq2_constant_lut ? "constant (explicit)" : "threadgroup (reference)");
         return 1;
     }
 }
@@ -973,6 +993,7 @@ void myds_metal_cleanup(void) {
     g_moe_id_map_bytes = 0;
     g_moe_nsg = 2;
     g_moe_down_nsg = 2;
+    g_moe_iq2_constant_lut = false;
     g_pso_attn_out_low_q8_0 = nil;
     g_pso_attn_out_low_q8_0_bf16_r4 = nil;
     g_pso_mul_mm_q8_0 = nil;
@@ -3220,7 +3241,8 @@ int myds_metal_routed_moe_batch(
         const NSUInteger rows_per_group_gate = nr0_gate * nsg_gate;
         const NSUInteger row_groups_gate = (expert_dim + rows_per_group_gate - 1) / rows_per_group_gate;
         const NSUInteger pairs = (NSUInteger)n_activated_experts * (NSUInteger)n_tok;
-        const NSUInteger smem_iq2 = 256u * sizeof(uint64_t) + 128u * sizeof(uint8_t); /* 2176 */
+        const NSUInteger smem_iq2 = g_moe_iq2_constant_lut ? 0u :
+            256u * sizeof(uint64_t) + 128u * sizeof(uint8_t); /* reference: 2176 */
         static bool logged_moe_mode = false;
         if (!logged_moe_mode) {
             /* 2026-09-29 参谋长:

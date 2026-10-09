@@ -240,6 +240,7 @@ int main(int argc, char **argv) {
          * binary produce identical metadata (see head-first-long-validation). */
         "MYDS_ATTN_VEC_HEAD_FIRST", "MYDS_ATTN_GATHER_MIN_KEYS", "MYDS_PREFILL_ATTN",
         "MYDS_QKV_FUSE_BF16", "MYDS_QKV_FUSE_POST", "MYDS_QKV_NR0", "MYDS_MOE_IQ2_TAIL_CULL",
+        "MYDS_MOE_IQ2_CONSTANT_LUT", "MYDS_ATTN_PACKED_NSG", "MYDS_ATTN_PACKED_REDUCE",
         "MYDS_MOE_ROUTE_FUSE",
         "MYDS_ATTN_OUT_A_FUSE_BF16",
         "MYDS_ATTN_DIRECT_PACK",

@@ -1066,6 +1066,36 @@ int myds_v41_gpu_attention_chunk_bf16(myds_metal_buffer_t *heads,const myds_meta
                            base_pos,c_start,ratio,s,true);
 }
 
+/* Physical SIMD packing is separate from the legacy logical NSG=1/NWG=32
+ * constants. Absent / exact 8 preserves the existing packed8 path. Explicit
+ * candidates are experiments: malformed values and unavailable geometry fail
+ * before they can silently benchmark the original implementation. */
+static int get_attn_packed_physical_nsg(void) {
+    const char *v = getenv("MYDS_ATTN_PACKED_NSG");
+    if (!v || !strcmp(v, "8")) return 8;
+    if (!strcmp(v, "4")) return 4;
+    if (!strcmp(v, "16")) return 16;
+    MYDS_LOG_E("MYDS_ATTN_PACKED_NSG must be exactly 4, 8, or 16");
+    return 0;
+}
+
+/* Shared Q + physical half score banks + 32 logical split weights/stats +
+ * sink scales + padded 32x33 float4 partial plane. Match the shader layout. */
+#define ATTN_PACKED_SMEM(nsg) (22400u + 256u * (nsg))
+_Static_assert(ATTN_PACKED_SMEM(8u) == 24448u, "packed8 allocation changed");
+_Static_assert(ATTN_PACKED_SMEM(4u) == 23424u, "packed4 allocation mismatch");
+_Static_assert(ATTN_PACKED_SMEM(16u) == 26496u, "packed16 allocation mismatch");
+
+static void log_attn_packed_candidate_encoded(int nsg, const char *kernel) {
+    static _Atomic uint32_t logged;
+    const uint32_t bit = nsg == 4 ? 1u : 2u;
+    if (!(atomic_load_explicit(&logged, memory_order_relaxed) & bit) &&
+        !(atomic_fetch_or_explicit(&logged, bit, memory_order_relaxed) & bit)) {
+        MYDS_LOG_I("packed attention candidate encoded: kernel=%s physical_nsg=%d logical_splits=32 groups=64x1x1 threads=%ux1x1 dynamic_bytes=%u",
+            kernel, nsg, 32u * (uint32_t)nsg, ATTN_PACKED_SMEM((uint32_t)nsg));
+    }
+}
+
 static inline int get_attn_packed_reduce_mode(void) {
     const char *v = getenv("MYDS_ATTN_PACKED_REDUCE");
     if (!v) return 1;
@@ -1078,6 +1108,18 @@ int myds_v41_gpu_attention(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
     if(!s||!n_raw||n_raw>128||raw_start>=128||selected_rows>512||
         !floats(heads,64u*512)||!floats(q,64u*512)||!floats(sinks,64)||!floats(window,128u*512)||
         (selected_rows&&!floats(selected_kv,(uint64_t)selected_rows*512)))return 0;
+    const int packed_nsg = get_attn_packed_physical_nsg();
+    if (!packed_nsg) return 0;
+    if (packed_nsg != 8 && !get_attn_packed_reduce_mode()) {
+        MYDS_LOG_E("explicit MYDS_ATTN_PACKED_NSG=%d requires packed reduce enabled", packed_nsg);
+        return 0;
+    }
+    if (!myds_metal_get_auto_barrier()) {
+        /* The previous attention may still READ these shared buffers in a
+         * concurrent encoder. Fence before staging/pad/partial writes (WAR). */
+        const myds_metal_buffer_t *scratch_buffers[] = {s->kv_f16, s->pad, s->partial};
+        myds_metal_barrier_buffers(scratch_buffers, 3);
+    }
     uint32_t tail=128-raw_start<n_raw?128-raw_start:n_raw;
     if(!stage_f16(s->kv_f16,0,window,(size_t)raw_start*2048,tail*512,s))return 0;
     if(n_raw>tail&&!stage_f16(s->kv_f16,(size_t)tail*1024,window,0,(n_raw-tail)*512,s))return 0;
@@ -1090,7 +1132,8 @@ int myds_v41_gpu_attention(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
         const myds_metal_buffer_t *b[]={s->kv_f16,s->kv_f16,s->mask,s->pad};
         const myds_metal_constant_t c[]={{100,true,1},{125,false,32}};
         if(!specialized("kernel_flash_attn_ext_pad",&a,sizeof(a),b,4,32,1,1,32,1,1,0,c,2))return 0;
-        if(!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(s->kv_f16);
+        /* Packed and original vec both READ the generated pad K/V and mask. */
+        if(!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(s->pad);
     }
     struct flash_vec_args a={.ne01=1,.ne02=64,.ne03=1,.nb01=64u*2048,.nb02=2048,.nb03=64u*2048,
         .ne11=keys,.ne_12_2=1,.ne_12_3=1,.ns10=512,.nb11=1024,.nb12=kvbytes,.nb13=kvbytes,
@@ -1099,8 +1142,20 @@ int myds_v41_gpu_attention(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
     const myds_metal_buffer_t *b[]={q,s->kv_f16,s->kv_f16,s->mask,sinks,s->pad,s->partial};
     const myds_metal_constant_t c[]={{400,true,1},{401,true,1},{402,true,0},{403,true,0},{404,true,keys%32!=0},
         {405,true,0},{420,false,512},{421,false,512},{422,false,1},{423,false,32}};
-    if (get_attn_packed_reduce_mode() && keys <= 1024) {
+    if ((packed_nsg != 8 || get_attn_packed_reduce_mode()) && keys <= 1024) {
         const myds_metal_buffer_t *pb[] = {q, s->kv_f16, s->kv_f16, s->mask, sinks, s->pad, heads};
+        if (packed_nsg != 8) {
+            const char *kernel = packed_nsg == 4
+                ? "kernel_myds_flash_attn_vec_packed4_reduce_f16_dk512_dv512"
+                : "kernel_myds_flash_attn_vec_packed16_reduce_f16_dk512_dv512";
+            /* Generic dispatch validates the actual specialized PSO thread
+             * limit and static + dynamic memory before encoding any work. */
+            const int ok = specialized(kernel, &a, sizeof(a), pb, 7, 64, 1, 1,
+                32u * (uint32_t)packed_nsg, 1, 1, ATTN_PACKED_SMEM((uint32_t)packed_nsg), c, 10);
+            if (!ok) MYDS_LOG_E("packed attention NSG=%d candidate unavailable; refusing fallback", packed_nsg);
+            else log_attn_packed_candidate_encoded(packed_nsg, kernel);
+            return ok;
+        }
         if (specialized("kernel_myds_flash_attn_vec_packed8_reduce_f16_dk512_dv512",
                         &a, sizeof(a), pb, 7, 64, 1, 1, 256, 1, 1, 24448, c, 10)) {
             return 1;
@@ -1127,6 +1182,18 @@ int myds_v41_gpu_attention_direct(myds_metal_buffer_t *heads,const myds_metal_bu
         !floats(heads,64u*512)||!floats(q,64u*512)||!floats(sinks,64)||!floats(window,128u*512)||
         (selected_rows&&(selected_rows>source_rows||!bf16s(comp_kv,(uint64_t)source_rows*512)||!floats(selected_ids,selected_rows))))return 0;
 
+    const int packed_nsg = get_attn_packed_physical_nsg();
+    if (!packed_nsg) return 0;
+    if (packed_nsg != 8 && !get_attn_packed_reduce_mode()) {
+        MYDS_LOG_E("explicit MYDS_ATTN_PACKED_NSG=%d requires packed reduce enabled", packed_nsg);
+        return 0;
+    }
+    if (!myds_metal_get_auto_barrier()) {
+        /* The previous attention may still READ these shared buffers in a
+         * concurrent encoder. Fence before staging/pad/partial writes (WAR). */
+        const myds_metal_buffer_t *scratch_buffers[] = {s->kv_f16, s->pad, s->partial};
+        myds_metal_barrier_buffers(scratch_buffers, 3);
+    }
     const uint32_t w_args[] = {n_raw, raw_start};
     const myds_metal_buffer_t *wb[] = {window, s->kv_f16};
     if(!dispatch("kernel_dsv41_copy_window_f32_to_f16", w_args, sizeof(w_args), wb, 2, 1, n_raw, 1, 128, 1, 1, 0)) return 0;
@@ -1150,7 +1217,8 @@ int myds_v41_gpu_attention_direct(myds_metal_buffer_t *heads,const myds_metal_bu
         const myds_metal_buffer_t *b[]={s->kv_f16,s->kv_f16,s->mask,s->pad};
         const myds_metal_constant_t c[]={{100,true,1},{125,false,32}};
         if(!specialized("kernel_flash_attn_ext_pad",&a,sizeof(a),b,4,32,1,1,32,1,1,0,c,2))return 0;
-        if(!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(s->kv_f16);
+        /* Packed and original vec both READ the generated pad K/V and mask. */
+        if(!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(s->pad);
     }
     struct flash_vec_args a={.ne01=1,.ne02=64,.ne03=1,.nb01=64u*2048,.nb02=2048,.nb03=64u*2048,
         .ne11=keys,.ne_12_2=1,.ne_12_3=1,.ns10=512,.nb11=1024,.nb12=kvbytes,.nb13=kvbytes,
@@ -1159,8 +1227,20 @@ int myds_v41_gpu_attention_direct(myds_metal_buffer_t *heads,const myds_metal_bu
     const myds_metal_buffer_t *b[]={q,s->kv_f16,s->kv_f16,s->mask,sinks,s->pad,s->partial};
     const myds_metal_constant_t c[]={{400,true,1},{401,true,1},{402,true,0},{403,true,0},{404,true,keys%32!=0},
         {405,true,0},{420,false,512},{421,false,512},{422,false,1},{423,false,32}};
-    if (get_attn_packed_reduce_mode() && keys <= 1024) {
+    if ((packed_nsg != 8 || get_attn_packed_reduce_mode()) && keys <= 1024) {
         const myds_metal_buffer_t *pb[] = {q, s->kv_f16, s->kv_f16, s->mask, sinks, s->pad, heads};
+        if (packed_nsg != 8) {
+            const char *kernel = packed_nsg == 4
+                ? "kernel_myds_flash_attn_vec_packed4_reduce_f16_dk512_dv512"
+                : "kernel_myds_flash_attn_vec_packed16_reduce_f16_dk512_dv512";
+            /* Generic dispatch validates the actual specialized PSO thread
+             * limit and static + dynamic memory before encoding any work. */
+            const int ok = specialized(kernel, &a, sizeof(a), pb, 7, 64, 1, 1,
+                32u * (uint32_t)packed_nsg, 1, 1, ATTN_PACKED_SMEM((uint32_t)packed_nsg), c, 10);
+            if (!ok) MYDS_LOG_E("packed attention NSG=%d candidate unavailable; refusing fallback", packed_nsg);
+            else log_attn_packed_candidate_encoded(packed_nsg, kernel);
+            return ok;
+        }
         if (specialized("kernel_myds_flash_attn_vec_packed8_reduce_f16_dk512_dv512",
                         &a, sizeof(a), pb, 7, 64, 1, 1, 256, 1, 1, 24448, c, 10)) {
             return 1;

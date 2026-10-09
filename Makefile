@@ -28,6 +28,8 @@ TEST_ATTN_VEC = $(BIN_DIR)/test_attention_vec
 TEST_QKV_FUSION = $(BIN_DIR)/test_qkv_fusion
 TEST_DECODE_Q8 = $(BIN_DIR)/test_decode_q8
 TEST_MOE_DOWN_NSG = $(BIN_DIR)/test_moe_down_nsg
+TEST_MOE_IQ2_LUT = $(BIN_DIR)/test_moe_iq2_lut
+TEST_ATTN_PACKED = $(BIN_DIR)/test_attention_packed
 TEST_DEEPER_SSD = $(BIN_DIR)/test_deeper_ssd
 TEST_GGUF = $(BIN_DIR)/test_gguf
 TEST_TOKENIZER = $(BIN_DIR)/test_tokenizer
@@ -158,6 +160,21 @@ $(TEST_MOE_DOWN_NSG): tests/test_moe_down_nsg.m src/myds_metal.m $(wildcard incl
 .PHONY: test-moe-down-nsg
 test-moe-down-nsg: $(TEST_MOE_DOWN_NSG)
 	python3 tests/test_moe_down_nsg.py
+
+# Optional decode candidates: build submits no GPU work. Run their explicit
+# fixtures only in a controlled validation window, separately from benchmarks.
+$(TEST_MOE_IQ2_LUT): tests/test_moe_iq2_lut.m src/myds_metal.m $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) -Isrc tests/test_moe_iq2_lut.m $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
+
+$(TEST_ATTN_PACKED): tests/test_attention_packed.m src/myds_metal.m src/myds_v41_gpu.c $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) -Isrc tests/test_attention_packed.m $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
+
+.PHONY: build-decode-candidates
+build-decode-candidates: $(TEST_MOE_IQ2_LUT) $(TEST_ATTN_PACKED)
+
+# Full-model state gate is opt-in and never part of the model-free test suite.
+$(BIN_DIR)/test_v41_decode_state: tools/test_v41_decode_state.c tools/reference/trace_input.h $(OBJS_C) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
+	$(CC) $(CFLAGS) tools/test_v41_decode_state.c $(OBJS_C) $(OBJS_M) $(LDFLAGS) -o $@
 
 $(TEST_DEEPER_SSD): tests/test_deeper_ssd.c tests/test_engine.c tests/test_p1_regressions.c $(OBJS_C) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) tests/test_deeper_ssd.c $(OBJS_C) $(OBJS_M) $(LDFLAGS) -o $@
