@@ -781,7 +781,7 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
         ds->propose_ms += (now_ms() - t0);
         return 0;
     }
-    ds->is_high_confidence = (confidence >= 0.80f);
+    ds->is_high_confidence = false;
 
     if (!has_markov && !base_logits) return 0;
 
@@ -863,19 +863,28 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
             static float min_margin = -1.0f;
             if (__builtin_expect(min_margin < -0.5f, 0)) {
                 const char *env = getenv("MYDS_DSPARK_MIN_MARGIN");
-                min_margin = env ? (float)atof(env) : 0.30f;
+                min_margin = env ? (float)atof(env) : 0.40f;
                 MYDS_LOG_I("DSpark logit margin gating active: threshold=%.2f", min_margin);
             }
 
-            if (min_margin > 0.0f && (best_score - best_score2) < min_margin) {
-                // Top-1 vs Top-2 margin too narrow: skip speculative proposal
+            const float margin = best_score - best_score2;
+            if (min_margin > 0.0f && margin < min_margin) {
+                // Top-1 vs Top-2 margin too narrow: skip speculative proposal (0 overhead fallback)
                 ds->draft_count = 0;
                 ds->draft_tree_count = 0;
+                ds->is_high_confidence = false;
                 ds->propose_ms += (now_ms() - t0);
                 return 0;
             }
 
-            if ((best_score - best_score2) >= 2.00f) {
+            static float high_conf_margin = -1.0f;
+            if (__builtin_expect(high_conf_margin < -0.5f, 0)) {
+                const char *env = getenv("MYDS_DSPARK_HIGH_CONF_MARGIN");
+                high_conf_margin = env ? (float)atof(env) : 1.50f;
+                MYDS_LOG_I("DSpark high-confidence speculative margin active: threshold=%.2f", high_conf_margin);
+            }
+
+            if (confidence >= 0.85f && margin >= high_conf_margin) {
                 ds->is_high_confidence = true;
             }
         }

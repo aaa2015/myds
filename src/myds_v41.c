@@ -4205,8 +4205,6 @@ int myds_v41_forward_batch_spec(myds_context_t *ctx, const int32_t *tokens,
     bool high_conf = false;
     if (ctx->dspark && ctx->dspark->is_high_confidence) {
         high_conf = true;
-    } else if (!ctx->dspark) {
-        high_conf = true;
     }
 
     static int batch2_enabled = -1;

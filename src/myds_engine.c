@@ -3542,8 +3542,8 @@ static int myds_generate_internal(myds_context_t *ctx,
 
                     if (accepted_in_cycle == 0) {
                         ctx->dspark->consecutive_misses++;
-                        if (ctx->dspark->consecutive_misses >= 8) {
-                            ctx->dspark->backoff_counter = 4;
+                        if (ctx->dspark->consecutive_misses >= 3) {
+                            ctx->dspark->backoff_counter = 16;
                         }
                     } else {
                         ctx->dspark->consecutive_misses = 0;
