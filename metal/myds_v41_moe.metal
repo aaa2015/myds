@@ -370,3 +370,96 @@ kernel void kernel_myds_v41_shared_gate_up_swiglu_r4(
     kernel_myds_v41_shared_gate_up_swiglu_impl<4>(
         args, src_gate, src_up, src_in, dst_out, shmem, tgpig, tiisg, sgitg);
 }
+
+/* ============================================================================
+ * DSpark 专属融合路由内核：128 专家、Top-3 单 Threadgroup 全在位双调排序与归一化
+ * 消除 CPU-GPU 往返同步与命令缓冲区打断（Zero-Stall GPU Pipelining）
+ * ============================================================================ */
+kernel void kernel_myds_dspark_route_fused_128(
+    constant myds_v41_route_args &args [[buffer(0)]],
+    device const float4 *logits [[buffer(1)]],
+    device const float4 *bias [[buffer(2)]],
+    device int *selected [[buffer(3)]],
+    device float *weights [[buffer(4)]],
+    threadgroup char *shmem [[threadgroup(0)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    ushort tid [[thread_position_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]]) {
+    const uint t = tgid;
+    if (t >= args.rows) return;
+
+    threadgroup int *sh_indices = (threadgroup int *)shmem;
+    threadgroup float *sh_scores = (threadgroup float *)(sh_indices + 128);
+    threadgroup float *sh_probs = (threadgroup float *)(sh_scores + 128);
+    threadgroup float *scratch = (threadgroup float *)(sh_probs + 128);
+
+    // 1. 阶段一：计算 softplus -> sqrt -> + bias
+    // 128 个专家对应 32 个 float4。由 tid < 32 的线程向量化读取与计算
+    if (tid < 32u) {
+        const uint i = t * 32u + tid;
+        const float4 x = logits[i];
+        const float4 b = (args.op != 0) ? bias[tid] : (float4)0.0f;
+        const float4 ex = exp(x);
+        const float4 em = min(ex, (float4)0.03125f);
+        const float4 poly = em * (1.0f - em * (0.5f - em * (1.0f / 3.0f - 0.25f * em)));
+        const float4 sp = select(select(log(1.0f + ex), poly, ex < (float4)0.03125f), x, x > 20.0f);
+        const float4 pr = sqrt(sp);
+        const float4 sc = pr + b;
+        ((threadgroup float4 *)sh_probs)[tid] = pr;
+        ((threadgroup float4 *)sh_scores)[tid] = sc;
+    }
+    sh_indices[tid] = (int)tid;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 2. 阶段二：双调排序（Bitonic Sort Descending，降序，精确 128 元素）
+    for (int k = 2; k <= 128; k *= 2) {
+        for (int j = k / 2; j > 0; j /= 2) {
+            int ixj = (int)tid ^ j;
+            if (ixj > (int)tid) {
+                if (((int)tid & k) == 0) {
+                    if (sh_scores[sh_indices[tid]] < sh_scores[sh_indices[ixj]] ||
+                       (sh_scores[sh_indices[tid]] == sh_scores[sh_indices[ixj]] && sh_indices[tid] > sh_indices[ixj])) {
+                        int tmp = sh_indices[tid];
+                        sh_indices[tid] = sh_indices[ixj];
+                        sh_indices[ixj] = tmp;
+                    }
+                } else {
+                    if (sh_scores[sh_indices[tid]] > sh_scores[sh_indices[ixj]] ||
+                       (sh_scores[sh_indices[tid]] == sh_scores[sh_indices[ixj]] && sh_indices[tid] < sh_indices[ixj])) {
+                        int tmp = sh_indices[tid];
+                        sh_indices[tid] = sh_indices[ixj];
+                        sh_indices[ixj] = tmp;
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    // 3. 阶段三：提取 Top-K 并归一化写出
+    const uint top_k = args.top_k;
+    if (sg == 0) scratch[lane] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float p = 0.0f;
+    if (tid < top_k) {
+        const int best_id = sh_indices[tid];
+        selected[t * top_k + tid] = best_id;
+        p = sh_probs[best_id];
+    }
+
+    float sumf = p;
+    sumf = simd_sum(sumf);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) scratch[sg] = sumf;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sumf = scratch[lane];
+    sumf = simd_sum(sumf);
+    const float denom = clamp(sumf, 6.103515625e-5f, INFINITY);
+
+    if (tid < top_k) {
+        weights[t * top_k + tid] = (p / denom) * args.scale;
+    }
+}

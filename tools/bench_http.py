@@ -79,7 +79,8 @@ def benchmark(url, model, name, prompt, max_tokens, timeout, run):
             data = json.loads(line[6:])
             usage = data.get("usage") or usage
             for choice in data.get("choices", []):
-                text = choice.get("delta", {}).get("content")
+                delta = choice.get("delta", {})
+                text = delta.get("content") or delta.get("reasoning_content")
                 if text:
                     if first is None:
                         first = now

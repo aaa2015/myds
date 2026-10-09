@@ -381,11 +381,21 @@ void myds_dspark_capture_layer(myds_dspark_t *ds, uint32_t layer_idx, const myds
     (void)myds_metal_v41_hc_weighted_sum(ds->target_slots[slot], residual, ds->hc_mean_weights, MYDS_DSPARK_DIM);
 }
 
+static inline float dspark_fp16_to_fp32(uint16_t h) {
+#if defined(__ARM_FEATURE_FP16_SCALAR_ARITHMETIC)
+    __fp16 val;
+    memcpy(&val, &h, sizeof(val));
+    return (float)val;
+#else
+    return myds_fp16_to_fp32(h);
+#endif
+}
+
 static inline float dot_q8_row(const q8_0_block_t *row, const float *state, uint32_t n_blocks) {
     float total = 0.0f;
 #if defined(__ARM_NEON)
     for (uint32_t b = 0; b < n_blocks; b++) {
-        float d = myds_fp16_to_fp32(row[b].d);
+        float d = dspark_fp16_to_fp32(row[b].d);
         float32x4_t acc0 = vdupq_n_f32(0.0f);
         float32x4_t acc1 = vdupq_n_f32(0.0f);
         const int8_t *qs = row[b].qs;
@@ -403,7 +413,7 @@ static inline float dot_q8_row(const q8_0_block_t *row, const float *state, uint
     }
 #else
     for (uint32_t b = 0; b < n_blocks; b++) {
-        float d = myds_fp16_to_fp32(row[b].d);
+        float d = dspark_fp16_to_fp32(row[b].d);
         const float *s = state + b * 32;
         float bsum = 0.0f;
         for (int k = 0; k < 32; k++) bsum += (float)row[b].qs[k] * s[k];
@@ -578,17 +588,24 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
         if (st->router_gate && st->ffn_gate_exps && st->ffn_up_exps && st->ffn_down_exps) {
             (void)myds_metal_gemv(ws->router_logits, st->router_gate, ws->ffn_norm, ds->n_routed_experts, MYDS_DSPARK_DIM, st->router_gate_type);
 
-            // Sync point: commit command buffer so CPU can inspect 128 router logits
-            (void)myds_metal_commit_batch();
+            float route_scale = (ctx && ctx->model && ctx->model->routed_scaling_factor > 0.0f) ?
+                                ctx->model->routed_scaling_factor : 1.5f;
 
-            int32_t *sel_ids = (int32_t *)myds_metal_buffer_data(ws->selected_ids);
-            float *sel_weights = (float *)myds_metal_buffer_data(ws->selected_weights);
-            (void)myds_metal_moe_route_biased(sel_ids, sel_weights, ws->router_logits, st->router_bias,
-                                              ds->n_routed_experts, ds->num_experts_per_tok, 2.5f);
+            myds_metal_barrier_buffer(ws->router_logits);
+            if (!myds_dspark_route_fused(ws->selected_ids, ws->selected_weights,
+                                         ws->router_logits, st->router_bias,
+                                         ds->num_experts_per_tok, route_scale, 1)) {
+                // Fallback to CPU route if GPU dispatch fails
+                (void)myds_metal_commit_batch();
+                int32_t *sel_ids = (int32_t *)myds_metal_buffer_data(ws->selected_ids);
+                float *sel_weights = (float *)myds_metal_buffer_data(ws->selected_weights);
+                (void)myds_metal_moe_route_biased(sel_ids, sel_weights, ws->router_logits, st->router_bias,
+                                                  ds->n_routed_experts, ds->num_experts_per_tok, route_scale);
+                (void)myds_metal_begin_batch();
+            }
 
-            // Re-open batch for routed expert execution
-            (void)myds_metal_begin_batch();
-
+            float clamp_exp = (ctx && ctx->model && ctx->model->swiglu_clamp_exp > 0.0f) ?
+                              ctx->model->swiglu_clamp_exp : 10.0f;
             (void)myds_metal_routed_moe(ws->moe_out, ws->ffn_norm,
                                         st->ffn_gate_exps, st->ffn_up_exps, st->ffn_down_exps,
                                         ws->selected_ids, ws->selected_weights,
@@ -596,7 +613,7 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
                                         MYDS_DSPARK_DIM, MYDS_DSPARK_EXP_DIM,
                                         ds->n_routed_experts, ds->num_experts_per_tok,
                                         st->ffn_gate_exps_type, st->ffn_up_exps_type, st->ffn_down_exps_type,
-                                        0.0f);
+                                        clamp_exp);
 
             (void)myds_metal_add(ws->ffn_total, ws->shared_out, ws->moe_out, MYDS_DSPARK_DIM);
         } else if (st->shared_gate && st->shared_down) {
@@ -630,14 +647,13 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
         (void)myds_metal_buffer_copy(ws->final_norm_out, 0, ws->final_embd, 0, stream_bytes);
     }
 
-    // Commit final stages batch to complete GPU work for hidden states
-    (void)myds_metal_commit_batch();
+    const bool can_early_exit = (ds->confidence_proj && ds->confidence_proj_type == GGML_TYPE_Q8_0 && min_conf > 0.0f);
 
-    // 4. Confidence Head Gating:
-    // confidence_proj is [5376, 1] (Q8_0)
-    // Features: [5120 from final_embd, 256 from markov_state_host]
-    float conf_prob = 1.0f;
-    if (ds->confidence_proj && ds->confidence_proj_type == GGML_TYPE_Q8_0) {
+    if (can_early_exit) {
+        // Commit final stages batch to complete GPU work for hidden states so CPU can test confidence
+        (void)myds_metal_commit_batch();
+
+        float conf_prob = 1.0f;
         const q8_0_block_t *w_conf = (const q8_0_block_t *)myds_metal_buffer_data(ds->confidence_proj);
         const float *final_embd_data = (const float *)myds_metal_buffer_data(ws->final_embd);
         if (w_conf && final_embd_data) {
@@ -647,19 +663,40 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
             }
             conf_prob = 1.0f / (1.0f + expf(-conf_score));
         }
-    }
-    if (out_confidence) *out_confidence = conf_prob;
+        if (out_confidence) *out_confidence = conf_prob;
 
-    // Zero-overhead early exit: If confidence is below threshold, skip the 129,280x5120 LM Head GEMV!
-    if (min_conf > 0.0f && conf_prob < min_conf) {
-        return 0;
-    }
+        // Zero-overhead early exit: If confidence is below threshold, skip the 129,280x5120 LM Head GEMV!
+        if (conf_prob < min_conf) {
+            return 0;
+        }
 
-    // Project to LM Head logits only when confidence test passed
-    (void)myds_metal_begin_batch();
-    (void)myds_metal_gemv(ds->draft_logits_buf, ctx->model->output, ws->final_norm_out,
-                          ctx->model->vocab_size, MYDS_DSPARK_DIM, ctx->model->output_type);
-    (void)myds_metal_commit_batch();
+        // Project to LM Head logits only when confidence test passed
+        (void)myds_metal_begin_batch();
+        (void)myds_metal_gemv(ds->draft_logits_buf, ctx->model->output, ws->final_norm_out,
+                              ctx->model->vocab_size, MYDS_DSPARK_DIM, ctx->model->output_type);
+        (void)myds_metal_commit_batch();
+    } else {
+        // Direct zero-stall pipelining: LM Head GEMV enqueued in the SAME command buffer as stages
+        (void)myds_metal_gemv(ds->draft_logits_buf, ctx->model->output, ws->final_norm_out,
+                              ctx->model->vocab_size, MYDS_DSPARK_DIM, ctx->model->output_type);
+        (void)myds_metal_commit_batch();
+
+        if (out_confidence) {
+            float conf_prob = 1.0f;
+            if (ds->confidence_proj && ds->confidence_proj_type == GGML_TYPE_Q8_0) {
+                const q8_0_block_t *w_conf = (const q8_0_block_t *)myds_metal_buffer_data(ds->confidence_proj);
+                const float *final_embd_data = (const float *)myds_metal_buffer_data(ws->final_embd);
+                if (w_conf && final_embd_data) {
+                    float conf_score = dot_q8_row(w_conf, final_embd_data, 160);
+                    if (ds->markov_state_host) {
+                        conf_score += dot_q8_row(w_conf + 160, ds->markov_state_host, 8);
+                    }
+                    conf_prob = 1.0f / (1.0f + expf(-conf_score));
+                }
+            }
+            *out_confidence = conf_prob;
+        }
+    }
 
     return 1;
 }
@@ -712,7 +749,7 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
     if (has_markov && w1_base && prev >= 0 && (uint32_t)prev < vocab_size) {
         const q8_0_block_t *w1_row = w1_base + (size_t)prev * 8;
         for (int b = 0; b < 8; b++) {
-            float d_scale = myds_fp16_to_fp32(w1_row[b].d);
+            float d_scale = dspark_fp16_to_fp32(w1_row[b].d);
             for (int k = 0; k < 32; k++) {
                 ds->markov_state_host[b * 32 + k] = d_scale * (float)w1_row[b].qs[k];
             }
@@ -759,7 +796,7 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
             if (d > 0) {
                 const q8_0_block_t *w1_row = w1_base + (size_t)prev * 8;
                 for (int b = 0; b < 8; b++) {
-                    float d_scale = myds_fp16_to_fp32(w1_row[b].d);
+                    float d_scale = dspark_fp16_to_fp32(w1_row[b].d);
                     for (int k = 0; k < 32; k++) {
                         ds->markov_state_host[b * 32 + k] = d_scale * (float)w1_row[b].qs[k];
                     }

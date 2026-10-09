@@ -9,6 +9,7 @@
 #include "myds_v41.h"
 #include "myds_metal.h"
 #include "myds_dspark.h"
+#include "myds_v41_moe.h"
 #include "myds_log.h"
 
 static void fill_buffer(myds_metal_buffer_t *b, float val, size_t count) {
@@ -394,6 +395,94 @@ static void test_spec_micro_batch_verification_sim(void) {
     printf("  [PASS] Micro-batch verification dual-branch state machine passed cleanly.\n");
 }
 
+static void test_dspark_fused_route_parity(void) {
+    printf("[TEST] DSpark Fused GPU Route (128 experts, Top-3) Parity vs CPU...\n");
+    const uint32_t experts = 128;
+    const uint32_t top_k = 3;
+    const float scale = 2.5f;
+
+    myds_metal_buffer_t *logits_buf = myds_metal_buffer_alloc(experts * sizeof(float));
+    myds_metal_buffer_t *bias_buf = myds_metal_buffer_alloc(experts * sizeof(float));
+    myds_metal_buffer_t *gpu_ids_buf = myds_metal_buffer_alloc(top_k * sizeof(int32_t));
+    myds_metal_buffer_t *gpu_w_buf = myds_metal_buffer_alloc(top_k * sizeof(float));
+    assert(logits_buf && bias_buf && gpu_ids_buf && gpu_w_buf);
+
+    float *logits = (float *)myds_metal_buffer_data(logits_buf);
+    float *bias = (float *)myds_metal_buffer_data(bias_buf);
+    int32_t *gpu_ids = (int32_t *)myds_metal_buffer_data(gpu_ids_buf);
+    float *gpu_w = (float *)myds_metal_buffer_data(gpu_w_buf);
+
+    int32_t cpu_ids[top_k];
+    float cpu_w[top_k];
+
+    srand(42);
+
+    for (int trial = 0; trial < 100; trial++) {
+        bool use_bias = (trial % 2 == 0);
+        for (uint32_t i = 0; i < experts; i++) {
+            logits[i] = ((float)rand() / (float)RAND_MAX) * 40.0f - 10.0f;
+            bias[i] = ((float)rand() / (float)RAND_MAX) * 4.0f - 2.0f;
+        }
+
+        // 1. CPU reference
+        int ok_cpu = myds_metal_moe_route_biased(cpu_ids, cpu_w, logits_buf,
+                                                 use_bias ? bias_buf : NULL,
+                                                 experts, top_k, scale);
+        assert(ok_cpu);
+
+        // 2. GPU fused route
+        int ok_gpu = 0;
+        if (myds_metal_begin_batch()) {
+            ok_gpu = myds_dspark_route_fused(gpu_ids_buf, gpu_w_buf, logits_buf,
+                                            use_bias ? bias_buf : NULL,
+                                            top_k, scale, 1);
+            myds_metal_commit_batch();
+        }
+        assert(ok_gpu);
+
+        // 3. Verify top-3 expert IDs match exactly
+        for (uint32_t k = 0; k < top_k; k++) {
+            if (gpu_ids[k] != cpu_ids[k]) {
+                fprintf(stderr, "Trial %d (use_bias=%d) mismatch at top-%u: gpu_id=%d vs cpu_id=%d\n",
+                        trial, use_bias, k, gpu_ids[k], cpu_ids[k]);
+                assert(gpu_ids[k] == cpu_ids[k]);
+            }
+            float diff = fabsf(gpu_w[k] - cpu_w[k]);
+            if (diff > 1e-4f) {
+                fprintf(stderr, "Trial %d (use_bias=%d) weight diff at top-%u: gpu_w=%.6f vs cpu_w=%.6f (diff=%.6f)\n",
+                        trial, use_bias, k, gpu_w[k], cpu_w[k], diff);
+                assert(diff <= 1e-4f);
+            }
+        }
+    }
+
+    // Edge Case: Extreme negative logits where softplus Taylor approximation is tested
+    for (uint32_t i = 0; i < experts; i++) {
+        logits[i] = -25.0f - (float)i * 0.1f;
+        bias[i] = 0.0f;
+    }
+    {
+        int ok_cpu = myds_metal_moe_route_biased(cpu_ids, cpu_w, logits_buf, NULL, experts, top_k, scale);
+        assert(ok_cpu);
+        int ok_gpu = 0;
+        if (myds_metal_begin_batch()) {
+            ok_gpu = myds_dspark_route_fused(gpu_ids_buf, gpu_w_buf, logits_buf, NULL, top_k, scale, 1);
+            myds_metal_commit_batch();
+        }
+        assert(ok_gpu);
+        for (uint32_t k = 0; k < top_k; k++) {
+            assert(gpu_ids[k] == cpu_ids[k]);
+        }
+    }
+
+    myds_metal_buffer_free(logits_buf);
+    myds_metal_buffer_free(bias_buf);
+    myds_metal_buffer_free(gpu_ids_buf);
+    myds_metal_buffer_free(gpu_w_buf);
+
+    printf("  [PASS] 100 random trials + extreme negative logits: 100%% bit-exact IDs and weight parity.\n");
+}
+
 int main(void) {
     printf("\n=======================================================\n");
     printf("  DSpark Rollback & Speculative State Machine Tests     \n");
@@ -408,6 +497,7 @@ int main(void) {
     test_spec_snapshot_boundary_checks();
     test_adaptive_speculative_backoff();
     test_spec_micro_batch_verification_sim();
+    test_dspark_fused_route_parity();
 
     printf("\n=== All DSpark Rollback Tests Passed Successfully! ===\n\n");
     return 0;

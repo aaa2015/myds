@@ -49,4 +49,11 @@ int myds_v41_moe_eval(myds_context_t *ctx, uint32_t layer, uint32_t pos,
                       const myds_metal_buffer_t *ffn_norm,
                       const myds_metal_buffer_t *router_logits,
                       const myds_metal_buffer_t *shared_out);
+
+/* DSpark 专属融合路由内核：128 专家、Top-K (通常为 3) 全在位双调排序与归一化
+ * 消除 CPU-GPU 交互与批次中断 */
+int myds_dspark_route_fused(myds_metal_buffer_t *selected, myds_metal_buffer_t *weights,
+                            const myds_metal_buffer_t *logits, const myds_metal_buffer_t *bias,
+                            uint32_t top_k, float scale, uint32_t rows);
+
 #endif

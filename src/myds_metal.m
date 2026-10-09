@@ -566,6 +566,7 @@ int myds_metal_init(const char *shader_dir) {
                         @"kernel_myds_v41_route_scale",
                         @"kernel_myds_v41_route_finish",
                         @"kernel_myds_v41_ids_f32",
+                        @"kernel_myds_dspark_route_fused_128",
                         /* V4.1 Vision encoder */
                         @"kernel_visenc_round",
                         @"kernel_visenc_bias",

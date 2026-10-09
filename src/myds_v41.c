@@ -4202,13 +4202,20 @@ int myds_v41_forward_batch_spec(myds_context_t *ctx, const int32_t *tokens,
                                 int32_t *out_tokens) {
     if (!ctx || !tokens || !out_tokens || n_tokens == 0) return -1;
 
+    bool high_conf = false;
+    if (ctx->dspark && ctx->dspark->is_high_confidence) {
+        high_conf = true;
+    } else if (!ctx->dspark) {
+        high_conf = true;
+    }
+
     static int batch2_enabled = -1;
     if (batch2_enabled < 0) {
         const char *e = getenv("MYDS_BATCH2_SPEC");
         batch2_enabled = (e && atoi(e) == 0) ? 0 : 1;
     }
 
-    if (batch2_enabled && n_tokens >= 2) {
+    if (high_conf && batch2_enabled && n_tokens >= 2) {
         const double t0 = lowkv_now_ms();
         int ret = myds_v41_forward_batch2(ctx, tokens, pos, out_tokens);
         const double el = lowkv_now_ms() - t0;

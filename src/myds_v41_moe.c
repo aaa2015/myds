@@ -625,4 +625,37 @@ int myds_v41_moe_pipeline(myds_context_t *ctx, uint32_t layer, uint32_t token, u
     return 1;
 }
 
+int myds_dspark_route_fused(myds_metal_buffer_t *selected, myds_metal_buffer_t *weights,
+                            const myds_metal_buffer_t *logits, const myds_metal_buffer_t *bias,
+                            uint32_t top_k, float scale, uint32_t rows) {
+    if (!selected || !weights || !logits || rows == 0 || top_k == 0 || top_k > 32 ||
+        !isfinite(scale) || scale <= 0.0f) return 0;
+
+    const uint32_t experts = 128;
+    const uint64_t total = (uint64_t)experts * (uint64_t)rows;
+    struct route_args args = {
+        .count = (uint32_t)total,
+        .top_k = top_k,
+        .op = (bias != NULL) ? 1u : 0u,
+        .scale = scale,
+        .rows = rows,
+        .row = experts,
+        .row4 = experts / 4u
+    };
+
+    const myds_metal_buffer_t *fused_bufs[] = {logits, bias ? bias : logits, selected, weights};
+    /* 共享内存: 128 ints + 128 floats + 128 floats + 32 floats = 1664 字节 */
+    const size_t shmem_bytes = 128 * sizeof(int32_t) + 128 * sizeof(float) +
+                               128 * sizeof(float) + 32 * sizeof(float);
+
+    if (dispatch("kernel_myds_dspark_route_fused_128", &args, sizeof(args), fused_bufs, 4,
+                 rows, 128, shmem_bytes)) {
+        const myds_metal_buffer_t *out_bufs[] = {selected, weights};
+        myds_metal_barrier_buffers(out_bufs, 2);
+        return 1;
+    }
+    return 0;
+}
+
+
 

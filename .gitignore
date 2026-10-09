@@ -7,3 +7,4 @@ __pycache__/
 *.py[cod]
 tests/verify_metal
 tests/test_metal
+scratch/
