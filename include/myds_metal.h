@@ -257,6 +257,24 @@ typedef struct {
  * Later batch command completion remains the caller's responsibility. */
 void myds_metal_moe_q2_sum_cache_counters(
     myds_metal_moe_q2_sum_cache_counters_t *out, bool reset);
+/* MYDS_MOE_Q2_SUM_CACHE_FUSED is a separate init-time absent/0/1 setting
+ * (default 0), mutually exclusive with MYDS_MOE_Q2_SUM_CACHE=1. Fused mode
+ * requires MYDS_MOE_IQ2_CONSTANT_LUT=0/absent and IQ2 NSG2/4. cleanup + init
+ * is required to change modes; malformed, conflicting or unavailable explicit
+ * configurations fail initialization without fallback. The scoped API below
+ * uses the same legal shape and caller dependency contract, with IQ2 producing
+ * F32 MID and the private F32 cache in one dispatch, then cached Q2 down.
+ * Existing unscoped single/batch APIs always remain the reference. */
+int myds_metal_moe_q2_sum_cache_fused_enabled(void);
+typedef struct {
+    uint64_t requests, encoded, failures;
+} myds_metal_moe_q2_sum_cache_fused_counters_t;
+/* Eligible fused attempts and successful whole two-dispatch host encodings.
+ * These are not GPU completion counts. The old independent-cache counters
+ * stay zero when only fused mode is enabled. Both counter sets survive cleanup
+ * until explicitly reset. */
+void myds_metal_moe_q2_sum_cache_fused_counters(
+    myds_metal_moe_q2_sum_cache_fused_counters_t *out, bool reset);
 /* Scope must come from the public, nontrace scalar logits graph, including
  * legacy serial verifier callers. Scalar prefill and private Batch2/tree/rescue
  * origins are excluded. Explicit mode1 requests

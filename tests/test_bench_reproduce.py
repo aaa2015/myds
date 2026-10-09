@@ -140,7 +140,9 @@ class BenchReproduceTests(unittest.TestCase):
         records[0].update(protocol_version=2, max_new_tokens=count,
                           dspark_model=str(support.resolve()) if support else None)
         loaded = next(record for record in records if record['kind'] == 'load')
-        loaded.update(dspark_loaded=support is not None, dspark_load_s=0.01 if support else 0)
+        loaded.update(dspark_loaded=support is not None, dspark_load_s=0.01 if support else 0,
+                      moe_q2_sum_cache_mode=int((environment or {}).get('MYDS_MOE_Q2_SUM_CACHE') == '1'),
+                      moe_q2_sum_cache_fused_mode=int((environment or {}).get('MYDS_MOE_Q2_SUM_CACHE_FUSED') == '1'))
         for sample in records:
             if sample['kind'] != 'sample':
                 continue
@@ -163,6 +165,8 @@ class BenchReproduceTests(unittest.TestCase):
             sample['decode_telemetry'] = telemetry
             sample['gpu_indexer_compact'] = {key: 0 for key in self.driver.INDEXER_COMPACT_COUNTERS}
             sample['gpu_topk_prefix'] = {key: 0 for key in self.driver.TOPK_PREFIX_COUNTERS}
+            if (environment or {}).get('MYDS_MOE_Q2_SUM_CACHE_FUSED') == '1':
+                sample['gpu_moe_q2_sum_cache'] = dict.fromkeys(self.driver.CANDIDATE_PATHS['gpu_moe_q2_sum_cache'][2], 0)
         return records
 
     def invoke_cpu_runner(self, args, records, host_side_effect=None, captured_stdout=None):
@@ -448,7 +452,8 @@ class BenchReproduceTests(unittest.TestCase):
                                'gpu_batch2_q8_shared': 'require_batch2_q8_shared',
                                'gpu_lm_head_q8': 'require_lm_head_q8',
                                'gpu_engram_project_round': 'require_engram_project_round',
-                               'gpu_moe_q2_sum_cache': 'require_moe_q2_sum_cache'}
+                               'gpu_moe_q2_sum_cache': 'require_moe_q2_sum_cache',
+                               'gpu_moe_q2_sum_cache_fused': 'require_moe_q2_sum_cache_fused'}
                     setattr(args, options[name], True)
                     env = dict(self.driver.DEFAULT_ENV, **{flag: enabled_value})
                     records = self.v2_records(environment=env)
@@ -552,6 +557,50 @@ class BenchReproduceTests(unittest.TestCase):
                 write_samples(directory / 'run-metrics.jsonl', records)
                 with self.assertRaisesRegex(ValueError, 'Invalid candidate 0/1 cohort'):
                     self.driver.validate_run(directory, self.state_for(records), self.driver.load_audit())
+
+    def test_fused_q2_modes_rejected_before_any_runner_process(self):
+        settings_cases = [['MYDS_MOE_Q2_SUM_CACHE_FUSED=' + value]
+                          for value in ('', '2', '01', '1 ', '-1', 'true', 'garbage')]
+        settings_cases.extend([['MYDS_MOE_Q2_SUM_CACHE=1', 'MYDS_MOE_Q2_SUM_CACHE_FUSED=1'],
+                               ['MYDS_MOE_Q2_SUM_CACHE_FUSED=1', 'MYDS_MOE_IQ2_CONSTANT_LUT=1']])
+        for settings in settings_cases:
+            args = self.run_args(); args.env = settings
+            with mock.patch.object(self.driver.platform, 'system', return_value='Darwin'), \
+                    mock.patch.object(self.driver, 'check_idle') as idle, \
+                    mock.patch.object(self.driver.subprocess, 'Popen') as child, \
+                    self.assertRaisesRegex(ValueError, '[Cc]andidate'):
+                self.driver.run(args)
+            idle.assert_not_called(); child.assert_not_called()
+            self.assertFalse(args.out.exists())
+
+    def test_fused_q2_context_getter_and_independent_counters_are_required(self):
+        environment = dict(self.driver.DEFAULT_ENV, MYDS_MOE_Q2_SUM_CACHE_FUSED='1')
+        for mode in ('getter-missing', 'getter-zero', 'getter-bool', 'old-getter-one', 'old-counter-missing', 'old-counter-positive'):
+            records = self.v2_records(environment=environment)
+            loaded = next(r for r in records if r['kind'] == 'load')
+            if mode == 'getter-missing': loaded.pop('moe_q2_sum_cache_fused_mode')
+            elif mode == 'getter-zero': loaded['moe_q2_sum_cache_fused_mode'] = 0
+            elif mode == 'getter-bool': loaded['moe_q2_sum_cache_fused_mode'] = True
+            elif mode == 'old-getter-one': loaded['moe_q2_sum_cache_mode'] = 1
+            for sample in records:
+                if sample['kind'] == 'sample':
+                    sample['gpu_moe_q2_sum_cache_fused'] = dict(requests=4, encoded=4, failures=0,
+                        decode_requests=2, decode_encoded=2, decode_failures=0)
+                    if mode == 'old-counter-missing': sample.pop('gpu_moe_q2_sum_cache')
+                    elif mode == 'old-counter-positive': sample['gpu_moe_q2_sum_cache']['requests'] = 1
+            directory = self.directory / mode; directory.mkdir()
+            write_samples(directory / 'run-metrics.jsonl', records)
+            with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, '[Cc]andidate'):
+                self.driver.validate_run(directory, self.state_for(records), self.driver.load_audit())
+
+    def test_historical_q2_records_without_fused_identity_remain_usable(self):
+        records = self.v2_records()
+        loaded = next(r for r in records if r['kind'] == 'load')
+        loaded.pop('moe_q2_sum_cache_mode'); loaded.pop('moe_q2_sum_cache_fused_mode')
+        directory = self.directory / 'historical-no-fused'; directory.mkdir()
+        write_samples(directory / 'run-metrics.jsonl', records)
+        group, _ = self.driver.validate_run(directory, self.state_for(records), self.driver.load_audit())
+        self.assertIsNone(group['gpu_moe_q2_sum_cache_fused'])
 
     def test_topk_prefix_summary_requires_formal_encoding(self):
         encoded = dict(requests=4, encoded=4, unavailable=0, classified_rows=4,

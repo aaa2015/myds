@@ -3795,6 +3795,192 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
 
     (void)tiitg;
 }
+// Opt-in IQ2 producer sum-cache fusion. The reference producer is unchanged.
+// Host scope: NR4, NSG2/4, DIM5120, width2304, six slots, reference TG LUT.
+// Each TG publishes 8/16 complete F32 MID values and one/two ordered eight-add
+// sums. Cache[k] is the sum of MID[8*k..8*k+7], matching the Q2 cache layout.
+kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_sum_cache_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        device const char * ids,
+        device const char * weights,
+        device float * sum_cache,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        threadgroup float * tile_mid [[threadgroup(1)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+    const int iid1 = tgpig.z / args.nei0;
+    const int idx  = tgpig.z % args.nei0;
+
+    tgpig.z = 0;
+
+    const int32_t i02 = ((device const int32_t *) (ids + iid1 * args.nbi1))[idx];
+    const bool owns_expert = ds4_tp_owns_expert(i02, args.ne02, args.tp_rank, args.tp_world);
+    if (owns_expert) {
+    const int i02b = i02 - args.tp_expert_base;
+    const int64_t i11 = idx % args.ne11;
+    const int64_t i12 = iid1;
+
+    const int nb = args.ne00 / QK_K;
+    const int first_row = (tgpig.x * NSG + sgitg) * N_R0_IQ2_XXS;
+    const int nb32 = nb * (QK_K / 32);
+
+    device const block_iq2_xxs *xg =
+        (device const block_iq2_xxs *)(src0_gate + (int64_t)i02b * args.nb02 + (uint64_t)first_row * args.nb01);
+    device const block_iq2_xxs *xu =
+        (device const block_iq2_xxs *)(src0_up + (int64_t)i02b * args.nb02 + (uint64_t)first_row * args.nb01);
+    device const float *y =
+        (device const float *)(src1 + i11 * args.nb11 + i12 * args.nb12);
+
+    float yl[32];
+    float sumg[N_R0_IQ2_XXS] = {0.f};
+    float sumu[N_R0_IQ2_XXS] = {0.f};
+
+    threadgroup uint64_t *svalues = (threadgroup uint64_t *)(shmem);
+    threadgroup uint8_t  *ssigns  = (threadgroup uint8_t *)(svalues + 256);
+    {
+        const int linear_tid = 32 * sgitg + tiisg;
+        if (linear_tid < 64) {
+            int nval = 4;
+            int pos = linear_tid * nval;
+            for (int i = 0; i < nval; ++i) svalues[pos + i] = ds4_metal_iq2xxs_grid[pos + i];
+            nval = 2;
+            pos = linear_tid * nval;
+            for (int i = 0; i < nval; ++i) ssigns[pos + i] = ds4_metal_ksigns_iq2xs[pos + i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const int ix = tiisg;
+    device const float *y4 = y + 32 * ix;
+
+    for (int ib32 = ix; ib32 < nb32; ib32 += 32) {
+        device const float4 *y4_f4 = (device const float4 *)y4;
+        thread float4 *yl_f4 = (thread float4 *)yl;
+        #pragma unroll
+        for (short i = 0; i < 8; ++i) {
+            yl_f4[i] = y4_f4[i];
+        }
+
+        const int ibl = ib32 / (QK_K / 32);
+        const int ib  = ib32 % (QK_K / 32);
+
+        device const block_iq2_xxs *xgr = xg + ibl;
+        device const block_iq2_xxs *xur = xu + ibl;
+        device const uint16_t *qg = xgr->qs + 4 * ib;
+        device const uint16_t *qu = xur->qs + 4 * ib;
+        device const half *dhg = &xgr->d;
+        device const half *dhu = &xur->d;
+
+        for (short row = 0; row < N_R0_IQ2_XXS; row++) {
+            device const uint8_t *aux8g = (device const uint8_t *)qg;
+            device const uint8_t *aux8u = (device const uint8_t *)qu;
+            const uint32_t aux32g = qg[2] | (qg[3] << 16);
+            const uint32_t aux32u = qu[2] | (qu[3] << 16);
+            const float dg = (float)dhg[0] * (0.5f + (aux32g >> 28));
+            const float du = (float)dhu[0] * (0.5f + (aux32u >> 28));
+
+            float sg = 0;
+            float su = 0;
+            for (short l = 0; l < 4; ++l) {
+                const threadgroup uint8_t *gridg = (const threadgroup uint8_t *)(svalues + aux8g[l]);
+                const threadgroup uint8_t *gridu = (const threadgroup uint8_t *)(svalues + aux8u[l]);
+                const uint8_t signg = ssigns[(aux32g >> 7 * l) & 127];
+                const uint8_t signu = ssigns[(aux32u >> 7 * l) & 127];
+                for (short j = 0; j < 8; ++j) {
+                    const float v = yl[8 * l + j];
+                    sg += v * gridg[j] * (signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                    su += v * gridu[j] * (signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                }
+            }
+            sumg[row] += dg * sg;
+            sumu[row] += du * su;
+
+            dhg += args.nb01 / 2;
+            dhu += args.nb01 / 2;
+            qg  += args.nb01 / 2;
+            qu  += args.nb01 / 2;
+        }
+
+        y4 += 32 * 32;
+    }
+
+    device float *dst_gate_f32 =
+        (device float *)dst_gate + (uint64_t)i12 * args.ne0 * args.ne1 + (uint64_t)i11 * args.ne0;
+    device float *dst_up_f32 =
+        (device float *)dst_up + (uint64_t)i12 * args.ne0 * args.ne1 + (uint64_t)i11 * args.ne0;
+    const uint64_t pair_row = (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx;
+    device float *dst_mid_f32 =
+        (device float *)(dst_mid + pair_row * act.mid_row_stride);
+    device const float *route_w =
+        (device const float *)(weights + pair_row * act.weight_stride);
+
+    const float c = act.clamp_value;
+    const float route_weight = route_w[0];
+    float4 reduced_gate;
+    float4 reduced_up;
+    for (int row = 0; row < N_R0_IQ2_XXS; ++row) {
+        reduced_gate[row] = simd_sum(sumg[row]);
+        reduced_up[row] = simd_sum(sumu[row]);
+    }
+    if (tiisg < N_R0_IQ2_XXS && first_row + tiisg < args.ne0) {
+        const uint out_row = first_row + tiisg;
+        const float gate = reduced_gate[tiisg] * 0.25f;
+        const float up = reduced_up[tiisg] * 0.25f;
+        float g = gate;
+        float u = up;
+        if (c > 1.0e-6f) {
+            g = min(g, c);
+            u = clamp(u, -c, c);
+        }
+        if (act.write_clamped != 0) {
+            dst_gate_f32[out_row] = gate;
+            dst_up_f32[out_row] = up;
+        }
+        const float silu = g / (1.0f + exp(-g));
+        dst_mid_f32[out_row] = silu * u * route_weight;
+        // Same-writer F32 store/read before publication through threadgroup
+        // memory. The compiler may forward this load; no DRAM reread is claimed.
+        tile_mid[sgitg * N_R0_IQ2_XXS + tiisg] = dst_mid_f32[out_row];
+    } else if (tiisg < N_R0_IQ2_XXS) {
+        tile_mid[sgitg * N_R0_IQ2_XXS + tiisg] = 0.f;
+    }
+    } else if (tiisg < N_R0_IQ2_XXS) {
+        // The expert decision is uniform across this entire TG. Do not read or
+        // overwrite MID for unowned/invalid experts; overwrite the cache plane.
+        tile_mid[sgitg * N_R0_IQ2_XXS + tiisg] = 0.f;
+    }
+
+    // Every thread reaches this barrier, including tail and unowned experts.
+    // Only tile_mid crosses threads; device MID/cache are published to down by
+    // the host's joint MID/cache resource barrier after this producer dispatch.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0 && tiisg < NSG / 2) {
+        const uint chunk = tgpig.x * NSG * N_R0_IQ2_XXS / 8u + tiisg;
+        const uint chunks_per_pair = act.width / 8u;
+        if (chunk < chunks_per_pair) {
+            float4 sumy = {0.f, 0.f, 0.f, 0.f};
+            #pragma unroll
+            for (short i = 0; i < 8; ++i) {
+                sumy[0] += tile_mid[8 * tiisg + i];
+            }
+            const uint64_t cache_pair_row = (uint64_t)iid1 * args.nei0 + idx;
+            sum_cache[cache_pair_row * chunks_per_pair + chunk] = sumy[0];
+        }
+    }
+
+    (void)tiitg;
+}
+
 
 // Opt-in IQ2 LUT experiment. Keep the reference fused kernel above unchanged.
 // Quantized layout, dot products, SIMD reductions, activation, and buffer

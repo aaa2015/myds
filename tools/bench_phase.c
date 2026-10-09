@@ -36,6 +36,7 @@ typedef struct {
     myds_metal_lm_head_q8_counters_t first_lm_head_q8;
     myds_v41_engram_project_round_counters_t first_engram_round;
     myds_metal_moe_q2_sum_cache_counters_t first_moe_q2_sum_cache;
+    myds_metal_moe_q2_sum_cache_fused_counters_t first_moe_q2_sum_cache_fused;
 } capture_t;
 
 static double now_s(void) {
@@ -61,6 +62,7 @@ static void capture(const char *piece, size_t length, int32_t id, void *opaque) 
         myds_metal_lm_head_q8_counters(&c->first_lm_head_q8, false);
         myds_v41_engram_project_round_counters(&c->first_engram_round, false);
         myds_metal_moe_q2_sum_cache_counters(&c->first_moe_q2_sum_cache, false);
+        myds_metal_moe_q2_sum_cache_fused_counters(&c->first_moe_q2_sum_cache_fused, false);
     }
     c->last = t;
     if (c->count < MAX_OUTPUT_TOKENS) {
@@ -262,7 +264,7 @@ int main(int argc, char **argv) {
         "MYDS_ANCHOR_SNAPSHOT", "MYDS_KV_DSK_PREFER_DEEPER", "MYDS_KV_DSK_BUDGET_MB",
         "MYDS_KV_DSK_WAYS", "MYDS_MODEL_DIGEST", "MYDS_FORCE_FULL_DIGEST",
         "MYDS_METAL_CONCURRENT", "MYDS_MOE_CONCURRENT", "MYDS_MOE_PIPELINE",
-        "MYDS_MOE_FUSE_EXPAND", "MYDS_MOE_Q2_SUM_CACHE", "MYDS_MOE_NSG", "MYDS_MOE_DOWN_NSG", "MYDS_SHARED_FUSE", "MYDS_SHARED_NR0",
+        "MYDS_MOE_FUSE_EXPAND", "MYDS_MOE_Q2_SUM_CACHE", "MYDS_MOE_Q2_SUM_CACHE_FUSED", "MYDS_MOE_NSG", "MYDS_MOE_DOWN_NSG", "MYDS_SHARED_FUSE", "MYDS_SHARED_NR0",
         "MYDS_ATTN_INDEXER_PIPELINE", "MYDS_ATTN_OUTPUT_PIPELINE", "MYDS_QKV_PIPELINE",
         "MYDS_FUSE_HC_SUM_RMSNORM", "MYDS_DECODE_Q8_FUSE_BF16", "MYDS_SUFFIX_SHRINK_MIN_TOKENS",
         "MYDS_DECODE_METRICS", "MYDS_SPEC_SERIAL_PROBE", "MYDS_SPEC_COST_SCHEDULER"};
@@ -314,12 +316,13 @@ int main(int argc, char **argv) {
     fprintf(json, ",\"layers\":%u,\"dim\":%u,\"heads\":%u,\"head_dim\":%u,\"vocab_size\":%u,"
         "\"routed_experts\":%u,\"activated_experts\":%u,\"expert_width\":%u,\"shared_experts\":%u,\"native_v41\":%s,"
         "\"dspark_loaded\":%s,\"dspark_load_s\":%.9f,\"dspark_block_size\":%u,\"dspark_stages\":%u,"
-        "\"lm_head_weight_type\":%d}\n",
+        "\"lm_head_weight_type\":%d,\"moe_q2_sum_cache_mode\":%d,\"moe_q2_sum_cache_fused_mode\":%d}\n",
         model->n_layers, model->dim, model->n_heads, model->head_dim, model->vocab_size,
         model->n_routed_experts, model->n_activated_experts, model->moe_expert_dim, model->n_shared_experts,
         model->v41 ? "true" : "false", ctx->dspark ? "true" : "false", dspark_load_s,
         ctx->dspark ? ctx->dspark->block_size : 0, ctx->dspark ? ctx->dspark->stage_count : 0,
-        (int)model->output_type);
+        (int)model->output_type, myds_metal_moe_q2_sum_cache_enabled(),
+        myds_metal_moe_q2_sum_cache_fused_enabled());
     fflush(json);
     int status = 0;
     uint64_t expected_ids = 0, expected_bytes = 0;
@@ -339,6 +342,7 @@ int main(int argc, char **argv) {
         myds_metal_lm_head_q8_counters(NULL, true);
         myds_v41_engram_project_round_counters(NULL, true);
         myds_metal_moe_q2_sum_cache_counters(NULL, true);
+        myds_metal_moe_q2_sum_cache_fused_counters(NULL, true);
         if (!storage_counters(json, run, "before")) { status = 1; break; }
         const double start = now_s();
         const int ok = myds_generate_bytes_ex(ctx, prompt, capture, &c, &reason, &prompt_tokens, NULL);
@@ -357,6 +361,8 @@ int main(int argc, char **argv) {
         myds_v41_engram_project_round_counters(&engram_round, false);
         myds_metal_moe_q2_sum_cache_counters_t moe_q2_sum_cache;
         myds_metal_moe_q2_sum_cache_counters(&moe_q2_sum_cache, false);
+        myds_metal_moe_q2_sum_cache_fused_counters_t moe_q2_sum_cache_fused;
+        myds_metal_moe_q2_sum_cache_fused_counters(&moe_q2_sum_cache_fused, false);
         if (!storage_counters(json, run, "after")) { status = 1; break; }
         myds_prefill_stats_t pf; myds_last_prefill_stats(ctx, &pf);
         /* Final logits are read only after the existing generation waits, outside
@@ -448,6 +454,11 @@ int main(int argc, char **argv) {
             ",\"decode_failures\":%" PRIu64 "}", moe_q2_sum_cache.requests, moe_q2_sum_cache.encoded, moe_q2_sum_cache.failures,
             moe_q2_sum_cache.requests-c.first_moe_q2_sum_cache.requests, moe_q2_sum_cache.encoded-c.first_moe_q2_sum_cache.encoded,
             moe_q2_sum_cache.failures-c.first_moe_q2_sum_cache.failures);
+        fprintf(json, ",\"gpu_moe_q2_sum_cache_fused\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64
+            ",\"failures\":%" PRIu64 ",\"decode_requests\":%" PRIu64 ",\"decode_encoded\":%" PRIu64
+            ",\"decode_failures\":%" PRIu64 "}", moe_q2_sum_cache_fused.requests, moe_q2_sum_cache_fused.encoded, moe_q2_sum_cache_fused.failures,
+            moe_q2_sum_cache_fused.requests-c.first_moe_q2_sum_cache_fused.requests, moe_q2_sum_cache_fused.encoded-c.first_moe_q2_sum_cache_fused.encoded,
+            moe_q2_sum_cache_fused.failures-c.first_moe_q2_sum_cache_fused.failures);
 #ifdef MYDS_V41_GPU_HAS_ATTENTION_COUNTERS
         fprintf(json, ",\"attention_paths\":{\"calls\":%" PRIu64 ",\"gather_calls\":%" PRIu64
             ",\"slab_calls\":%" PRIu64 ",\"head_first_attempts\":%" PRIu64 ",\"head_first_encoded\":%" PRIu64

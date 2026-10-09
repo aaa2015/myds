@@ -58,6 +58,8 @@ CANDIDATE_PATHS = {
         ('requests', 'encoded', 'failures', 'decode_requests', 'decode_encoded', 'decode_failures')),
     'gpu_moe_q2_sum_cache': ('MYDS_MOE_Q2_SUM_CACHE', 'failures',
         ('requests', 'encoded', 'failures', 'decode_requests', 'decode_encoded', 'decode_failures')),
+    'gpu_moe_q2_sum_cache_fused': ('MYDS_MOE_Q2_SUM_CACHE_FUSED', 'failures',
+        ('requests', 'encoded', 'failures', 'decode_requests', 'decode_encoded', 'decode_failures')),
 }
 CANDIDATE_ENABLED_VALUES = {'gpu_lm_head_q8': '4'}
 FORBIDDEN_ENV_PREFIXES = ('MYDS_PROFILE_', 'MYDS_SKIP_', 'MYDS_TRACE_', 'MYDS_BATCH_TRACE_')
@@ -236,6 +238,14 @@ def validate_run(directory, state, audit):
         loaded = next(record for record in records if record['kind'] == 'load')
         audit.require(loaded.get('dspark_loaded') is (support_path is not None),
                       'Requested DSpark support model was not loaded')
+        if state['environment'].get('MYDS_MOE_Q2_SUM_CACHE_FUSED') == '1' or \
+                'moe_q2_sum_cache_fused_mode' in loaded:
+            for key, flag in (('moe_q2_sum_cache_mode', 'MYDS_MOE_Q2_SUM_CACHE'),
+                              ('moe_q2_sum_cache_fused_mode', 'MYDS_MOE_Q2_SUM_CACHE_FUSED')):
+                actual = loaded.get(key)
+                audit.require(type(actual) is int and actual in (0, 1) and
+                              actual == int(state['environment'].get(flag) == '1'),
+                              'Actual candidate context getter differs: ' + key)
         for key, value in state['environment'].items():
             audit.require(metadata['environment'].get(key) == value, 'Unrecorded/different environment: ' + key)
         for sample in samples:
@@ -396,14 +406,32 @@ def topk_prefix_paths(samples):
                      'callback. These are not actual GPU traffic or timing.'}
 
 
+def validate_moe_cache_modes(environment):
+    for flag in ('MYDS_MOE_Q2_SUM_CACHE', 'MYDS_MOE_Q2_SUM_CACHE_FUSED'):
+        if environment.get(flag) not in (None, '0', '1'):
+            raise ValueError('Invalid candidate 0/1 cohort: ' + flag + '=' + str(environment.get(flag)))
+    if environment.get('MYDS_MOE_Q2_SUM_CACHE') == '1' and environment.get('MYDS_MOE_Q2_SUM_CACHE_FUSED') == '1':
+        raise ValueError('Mutually exclusive candidate Q2 cache modes requested')
+    if environment.get('MYDS_MOE_Q2_SUM_CACHE_FUSED') == '1' and \
+            environment.get('MYDS_MOE_IQ2_CONSTANT_LUT') not in (None, '0'):
+        raise ValueError('Fused candidate Q2 cache requires reference IQ2 LUT0')
+
+
 def validate_candidate_paths(samples, environment, audit):
     """Validate native encoding records; absent historical records remain usable."""
+    validate_moe_cache_modes(environment)
+    if environment.get('MYDS_MOE_Q2_SUM_CACHE_FUSED') == '1':
+        for sample in samples:
+            old = sample.get('gpu_moe_q2_sum_cache')
+            audit.require(isinstance(old, dict) and all(type(old.get(key)) is int and old[key] == 0
+                          for key in CANDIDATE_PATHS['gpu_moe_q2_sum_cache'][2]),
+                          'Fused candidate requires zero independent-cache counters')
     for name, (flag, failure, keys) in CANDIDATE_PATHS.items():
         enabled_value = CANDIDATE_ENABLED_VALUES.get(name, '1')
         if name == 'gpu_lm_head_q8':
             audit.require(environment.get(flag) in (None, '2', '4'),
                           'Invalid LM head row cohort: ' + str(environment.get(flag)))
-        if name in ('gpu_engram_project_round', 'gpu_moe_q2_sum_cache'):
+        if name in ('gpu_engram_project_round', 'gpu_moe_q2_sum_cache', 'gpu_moe_q2_sum_cache_fused'):
             audit.require(environment.get(flag) in (None, '0', '1'),
                           'Invalid candidate 0/1 cohort: ' + str(environment.get(flag)))
         for sample in samples:
@@ -612,6 +640,7 @@ def run(args):
         if explicit_env[name] != '0':
             raise ValueError(name + '=0 is required for this full-prefill protocol')
     require_uninstrumented_environment(explicit_env)
+    validate_moe_cache_modes(explicit_env)
     check_idle(args.server_port)
     output = args.out.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -659,7 +688,8 @@ def run(args):
                              ('require_batch2_q8_shared', 'gpu_batch2_q8_shared'),
                              ('require_lm_head_q8', 'gpu_lm_head_q8'),
                              ('require_engram_project_round', 'gpu_engram_project_round'),
-                             ('require_moe_q2_sum_cache', 'gpu_moe_q2_sum_cache')):
+                             ('require_moe_q2_sum_cache', 'gpu_moe_q2_sum_cache'),
+                             ('require_moe_q2_sum_cache_fused', 'gpu_moe_q2_sum_cache_fused')):
             if getattr(args, option, False):
                 require_candidate_path(samples, name)
         group['attention_paths'] = attention_paths(samples)
@@ -726,6 +756,8 @@ def main():
                              help='Require native Engram projection round-skip encoding in every formal decode, with no failures')
     measurement.add_argument('--require-moe-q2-sum-cache', action='store_true',
                              help='Require complete routed IQ2/precompute/Q2 encoding in every formal decode, with no failures')
+    measurement.add_argument('--require-moe-q2-sum-cache-fused', action='store_true',
+                             help='Require complete fused IQ2/cache/Q2 encoding in every formal decode, with no failures')
     measurement.add_argument('--env', action='append', default=[], help='Explicit MYDS_NAME=value, repeatable')
     measurement.add_argument('--max-new-tokens', type=int, choices=OUTPUT_CAPS, default=64)
     measurement.add_argument('--context', type=int, default=262144)

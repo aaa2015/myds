@@ -36,6 +36,8 @@ TEST_LM_HEAD_Q8 = $(BIN_DIR)/test_lm_head_q8
 TEST_ENGRAM_PROJECT_ROUND = $(BIN_DIR)/test_engram_project_round
 TEST_MOE_Q2_SUM_CACHE = $(BIN_DIR)/test_moe_q2_sum_cache
 Q2_SUM_CACHE_ORACLE = $(BIN_DIR)/q2_sum_cache_oracle.metallib
+TEST_MOE_Q2_SUM_CACHE_FUSED = $(BIN_DIR)/test_moe_q2_sum_cache_fused
+Q2_SUM_CACHE_FUSED_ORACLE = $(BIN_DIR)/q2_sum_cache_fused_oracle.metallib
 TEST_DEEPER_SSD = $(BIN_DIR)/test_deeper_ssd
 TEST_GGUF = $(BIN_DIR)/test_gguf
 TEST_TOKENIZER = $(BIN_DIR)/test_tokenizer
@@ -210,6 +212,18 @@ $(Q2_SUM_CACHE_ORACLE): $(TEST_MOE_Q2_SUM_CACHE) | $(BUILD_DIR)
 
 .PHONY: build-moe-q2-sum-cache-candidate
 build-moe-q2-sum-cache-candidate: $(TEST_MOE_Q2_SUM_CACHE) $(Q2_SUM_CACHE_ORACLE)
+
+# Fused IQ2/cache component is explicit BUILD ONLY, never ALL_TESTS.
+$(TEST_MOE_Q2_SUM_CACHE_FUSED): tests/test_moe_q2_sum_cache_fused.m src/myds_metal.m $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) -Isrc $< $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
+
+$(Q2_SUM_CACHE_FUSED_ORACLE): $(TEST_MOE_Q2_SUM_CACHE_FUSED) | $(BUILD_DIR)
+	$(TEST_MOE_Q2_SUM_CACHE_FUSED) --write-oracle-source $(BUILD_DIR)/q2_sum_cache_fused_oracle.metal
+	xcrun -sdk macosx metal -O3 -ffast-math -c $(BUILD_DIR)/q2_sum_cache_fused_oracle.metal -o $(BUILD_DIR)/q2_sum_cache_fused_oracle.air
+	xcrun -sdk macosx metallib $(BUILD_DIR)/q2_sum_cache_fused_oracle.air -o $@
+
+.PHONY: build-moe-q2-sum-cache-fused-candidate
+build-moe-q2-sum-cache-fused-candidate: $(TEST_MOE_Q2_SUM_CACHE_FUSED) $(Q2_SUM_CACHE_FUSED_ORACLE)
 
 $(TEST_DEEPER_SSD): tests/test_deeper_ssd.c tests/test_engine.c tests/test_p1_regressions.c $(OBJS_C) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) tests/test_deeper_ssd.c $(OBJS_C) $(OBJS_M) $(LDFLAGS) -o $@
