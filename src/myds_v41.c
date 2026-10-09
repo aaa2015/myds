@@ -197,7 +197,7 @@ static uint32_t snapshot_slot_for(uint32_t p, bool is_last) {
  * 避免在各层窗口环拷贝完成前被 snapshot_best 抢先选出半状态。
  * 若该槽此前存有旧快照，在此处先使旧发布标签失效，避免覆盖失败时旧标签仍有效。 */
 static void snapshot_store_engram(myds_v41_context_t *g, uint32_t p, bool is_last) {
-    if (!g->snap_enabled || p < V41_SNAP_MIN) return;
+    if (!g->snap_enabled || (!is_last && p < V41_SNAP_MIN)) return;
     if (!is_last && (p % V41_SNAP_STRIDE)) return;
     const uint32_t s = snapshot_slot_for(p, is_last);
     g->snap_pos[s] = 0;
@@ -208,7 +208,7 @@ static void snapshot_store_engram(myds_v41_context_t *g, uint32_t p, bool is_las
  * 只有当最后一层（il == V41_LAYERS-1）也保存完成，并且同步保存压缩器的 previous_kv/score
  * 之后，才正式发布 g->snap_pos[s] = p。任一步失败都清除 staged/published 标记。 */
 static bool snapshot_store_window(myds_v41_context_t *g, uint32_t il, uint32_t p, bool is_last) {
-    if (!g->snap_enabled || p < V41_SNAP_MIN) return true;
+    if (!g->snap_enabled || (!is_last && p < V41_SNAP_MIN)) return true;
     if (!is_last && (p % V41_SNAP_STRIDE)) return true;
     const uint32_t s = snapshot_slot_for(p, is_last);
     if (g->snap_staged_pos[s] != p) return true;
@@ -247,7 +247,7 @@ static bool snapshot_store_window(myds_v41_context_t *g, uint32_t il, uint32_t p
  * ★ 事务一致性：覆盖 slot 0 前先清除其 snap_pos 与 snap_staged_pos，确保若复制
  *   或 GPU 提交失败，旧快照标签不会残留指向新旧层混合的数据。 */
 bool myds_v41_snapshot_store_now(myds_v41_context_t *g, uint32_t p) {
-    if (!g || !g->snap_enabled || !p || p < V41_SNAP_MIN) return true;
+    if (!g || !g->snap_enabled || !p || p < 4u) return true;
     lowkv_join(g);
     /* 首次覆盖 slot 0 前使原发布标签和 staged 标记失效。 */
     g->snap_pos[0] = 0;
