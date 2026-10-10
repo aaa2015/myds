@@ -21,6 +21,7 @@ SHADER_FILES = [
     "dsv4_rope.metal",
     "dsv4_misc.metal",
     "argsort.metal",
+    "topk_threshold.metal",
     "cpy.metal",
     "concat.metal",
     "get_rows.metal",

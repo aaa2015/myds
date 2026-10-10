@@ -46,7 +46,22 @@ INDEXER_COMPACT_COUNTERS = ('requests', 'encoded', 'unavailable', 'dense_rows', 
 TOPK_PREFIX_COUNTERS = ('requests', 'encoded', 'unavailable', 'classified_rows', 'merge_dispatches',
                        'dense_write_slots', 'prefix_write_slots', 'decode_requests',
                        'decode_encoded', 'decode_unavailable')
+TOPK_THRESHOLD_FIELDS = ('requests', 'encoded', 'errors', 'validated', 'adopted', 'fallback',
+                         'nan', 'inf', 'insufficient', 'capacity', 'certificate', 'tie')
+TOPK_THRESHOLD_COUNTERS = TOPK_THRESHOLD_FIELDS + tuple('decode_' + k for k in TOPK_THRESHOLD_FIELDS)
 CANDIDATE_PATHS = {
+    'gpu_f16_gemv_bf16_fuse': ('MYDS_F16_GEMV_BF16_FUSE', 'failures',
+        ('requests', 'encoded', 'failures', 'decode_requests', 'decode_encoded', 'decode_failures')),
+    'gpu_indexer_rope_quant_fuse': ('MYDS_INDEXER_ROPE_QUANT_FUSE', 'failures',
+        ('requests', 'encoded', 'failures', 'decode_requests', 'decode_encoded', 'decode_failures')),
+    'gpu_dspark_capture': ('MYDS_DSPARK_CAPTURE_BYPASS', 'failures',
+        tuple(k for f in ('requests','encoded','bypassed','failures','stale_rejections') for k in (f,'decode_'+f))),
+    'gpu_topk_nan_shuffle': ('MYDS_INDEXER_TOPK_NAN_SHUFFLE', 'failures',
+        ('requests', 'encoded', 'failures', 'decode_requests', 'decode_encoded', 'decode_failures')),
+    'gpu_topk_threshold': ('MYDS_INDEXER_TOPK_THRESHOLD', 'errors', TOPK_THRESHOLD_COUNTERS),
+    'gpu_indexer_head_slots': ('MYDS_INDEXER_HEAD_SLOTS', 'failures',
+        ('requests', 'encoded', 'unavailable', 'failures', 'decode_requests', 'decode_encoded',
+         'decode_unavailable', 'decode_failures')),
     'gpu_topk_nan_fuse': ('MYDS_INDEXER_TOPK_NAN_FUSE', 'unavailable',
         ('requests', 'encoded', 'unavailable', 'classified_partitions',
          'decode_requests', 'decode_encoded', 'decode_unavailable')),
@@ -195,7 +210,7 @@ def check_idle(port):
 
 
 def load_audit():
-    path = EVIDENCE / 'protocol/summarize-final.py'
+    path = ROOT / 'tools/bench_phase_audit.py'
     spec = importlib.util.spec_from_file_location('myds_saved_phase_audit', path)
     module = importlib.util.module_from_spec(spec)
     # Evidence directories contain versioned raw bytes, not generated Python caches.
@@ -211,14 +226,28 @@ def load_audit():
 def validate_run(directory, state, audit):
     group, samples = audit.validate_group(directory, 'run', {'environment': state['environment']})
     metadata = group['metadata']
+    validate_indexer_rope_quant_mode(state['environment'])
+    validate_f16_fuse_mode(state['environment'])
+    validate_indexer_rope_quant_mode(metadata['environment'])
+    validate_f16_fuse_mode(metadata['environment'])
+    validate_capture_modes(state['environment'])
+    validate_capture_modes(metadata['environment'])
+    if state['environment'].get('MYDS_INDEXER_ROPE_QUANT_FUSE') is not None:
+        audit.require(metadata.get('protocol_version') == 2, 'Indexer RoPE quant fuse requires native protocol2')
+    if state['environment'].get('MYDS_F16_GEMV_BF16_FUSE') is not None:
+        audit.require(metadata.get('protocol_version') == 2, 'F16 BF16 fuse requires native protocol2')
+    if state['environment'].get('MYDS_ENGINE_CAPTURE_BYPASS') is not None:
+        audit.require(metadata.get('protocol_version') == 2, 'Engine capture bypass requires native protocol2')
     require_uninstrumented_environment(metadata['environment'])
     audit.require(metadata.get('protocol_version', 1) in (1, 2), 'Unsupported benchmark protocol version')
     fixed = {'temperature': 0, 'top_p': 1, 'top_k': 0, 'min_p': 0,
-             'repetition_penalty': 1, 'seed': 42, 'repeats': 3, 'warmup_runs': 1,
+             'repetition_penalty': 1, 'seed': 42, 'warmup_runs': 1,
              'clock': 'CLOCK_MONOTONIC', 'prompt_renderer': 'parse_chat_prompt',
              'transport': 'direct_byte_callback', 'qos': 'user_interactive', 'qos_result': 0}
     for key, expected in fixed.items():
         audit.require(metadata.get(key) == expected, 'Fixed protocol differs: ' + key)
+    audit.require(type(metadata.get('repeats')) is int and metadata['repeats'] in (3, 5),
+                  'Fixed repeat protocol must be three or five formal samples')
     argv = state['argv']
     audit.require(isinstance(argv, list) and len(argv) in (6, 7), 'Invalid recorded harness argv')
     expected = {'model': argv[1], 'request_file': argv[2], 'repeats': int(argv[3]),
@@ -236,6 +265,59 @@ def validate_run(directory, state, audit):
         audit.require((support['path'] if support else None) == support_path, 'DSpark identity/path differs')
         records = audit.read_records(directory / 'run-metrics.jsonl')
         loaded = next(record for record in records if record['kind'] == 'load')
+        for mode,flag in (('topk_nan_shuffle_mode','MYDS_INDEXER_TOPK_NAN_SHUFFLE'),):
+            if state['environment'].get(flag)=='1' or mode in loaded:
+                actual=loaded.get(mode)
+                audit.require(type(actual) is int and actual in (0,1) and
+                    actual==int(state['environment'].get(flag)=='1'), 'Actual candidate getter differs: '+mode)
+                if actual==1:
+                    audit.require(loaded.get('native_v41') is True,'Candidate requires native V4.1')
+        if state['environment'].get('MYDS_F16_GEMV_BF16_FUSE') is not None or 'f16_gemv_bf16_fuse_mode' in loaded:
+            actual = loaded.get('f16_gemv_bf16_fuse_mode')
+            audit.require(type(actual) is int and actual in (0, 1) and
+                          actual == int(state['environment'].get('MYDS_F16_GEMV_BF16_FUSE') == '1'),
+                          'Actual candidate getter differs: f16_gemv_bf16_fuse_mode')
+            if actual:
+                audit.require(loaded.get('native_v41') is True, 'F16 BF16 fuse requires native V4.1')
+        if state['environment'].get('MYDS_INDEXER_ROPE_QUANT_FUSE') is not None or 'indexer_rope_quant_fuse_mode' in loaded:
+            actual = loaded.get('indexer_rope_quant_fuse_mode')
+            audit.require(type(actual) is int and actual in (0, 1) and
+                          actual == int(state['environment'].get('MYDS_INDEXER_ROPE_QUANT_FUSE') == '1'),
+                          'Actual candidate getter differs: indexer_rope_quant_fuse_mode')
+            if actual:
+                audit.require(loaded.get('native_v41') is True and loaded.get('dspark_loaded') is False and support_path is None,
+                              'Indexer RoPE quant fuse requires pure ordinary native V4.1 target')
+        effective_capture = capture_bypass_requested(state['environment'])
+        engine_capture = state['environment'].get('MYDS_ENGINE_CAPTURE_BYPASS') == '1'
+        if effective_capture or 'dspark_capture_bypass_mode' in loaded:
+            actual = loaded.get('dspark_capture_bypass_mode')
+            audit.require(type(actual) is int and actual in (0, 1) and actual == int(effective_capture),
+                          'Actual candidate getter differs: dspark_capture_bypass_mode')
+            if actual:
+                audit.require(loaded.get('native_v41') is True and support_path is not None,
+                              'Capture bypass requires native V4.1 and loaded DSpark support')
+        # Historical records predate this field. Explicit new-mode cohorts
+        # require it even for A=0, while old archives remain unchanged.
+        if state['environment'].get('MYDS_ENGINE_CAPTURE_BYPASS') is not None or 'engine_capture_bypass_mode' in loaded:
+            actual = loaded.get('engine_capture_bypass_mode')
+            audit.require(type(actual) is int and actual in (0, 1) and actual == int(engine_capture),
+                          'Actual candidate getter differs: engine_capture_bypass_mode')
+        if state['environment'].get('MYDS_INDEXER_TOPK_THRESHOLD') == '1' or 'topk_threshold_mode' in loaded:
+            actual = loaded.get('topk_threshold_mode')
+            audit.require(type(actual) is int and actual in (0, 1) and
+                          actual == int(state['environment'].get('MYDS_INDEXER_TOPK_THRESHOLD') == '1'),
+                          'Actual candidate context getter differs: topk_threshold_mode')
+            if actual == 1:
+                audit.require(loaded.get('native_v41') is True,
+                              'TopK threshold candidate requires native V4.1 shape')
+        if state['environment'].get('MYDS_INDEXER_HEAD_SLOTS') == '1' or 'indexer_head_slots_mode' in loaded:
+            actual = loaded.get('indexer_head_slots_mode')
+            audit.require(type(actual) is int and actual in (0, 1) and
+                          actual == int(state['environment'].get('MYDS_INDEXER_HEAD_SLOTS') == '1'),
+                          'Actual candidate context getter differs: indexer_head_slots_mode')
+            if actual == 1:
+                audit.require(loaded.get('native_v41') is True,
+                              'Indexer head slots candidate requires native V4.1 shape')
         audit.require(loaded.get('dspark_loaded') is (support_path is not None),
                       'Requested DSpark support model was not loaded')
         if state['environment'].get('MYDS_MOE_Q2_SUM_CACHE_FUSED') == '1' or \
@@ -417,9 +499,77 @@ def validate_moe_cache_modes(environment):
         raise ValueError('Fused candidate Q2 cache requires reference IQ2 LUT0')
 
 
+def validate_capture_modes(environment):
+    for flag in ('MYDS_DSPARK_CAPTURE_BYPASS', 'MYDS_ENGINE_CAPTURE_BYPASS'):
+        if environment.get(flag) not in (None, '0', '1'):
+            raise ValueError('Invalid candidate 0/1 cohort: ' + flag)
+    if environment.get('MYDS_DSPARK_CAPTURE_BYPASS') == '1' and environment.get('MYDS_ENGINE_CAPTURE_BYPASS') == '1':
+        raise ValueError('Mutually exclusive old and Engine capture bypass modes requested')
+
+
+def capture_bypass_requested(environment):
+    return any(environment.get(flag) == '1' for flag in
+               ('MYDS_DSPARK_CAPTURE_BYPASS', 'MYDS_ENGINE_CAPTURE_BYPASS'))
+
+
+def validate_f16_fuse_mode(environment):
+    if environment.get('MYDS_F16_GEMV_BF16_FUSE') not in (None, '0', '1'):
+        raise ValueError('Invalid candidate 0/1 cohort: MYDS_F16_GEMV_BF16_FUSE')
+
+
+def require_f16_gemv_bf16_fuse(samples):
+    # Host encoding evidence for every completed warm/formal ordinary graph.
+    # Complete outputs/completion are audited elsewhere; encoded alone is not
+    # a claim that a GPU command completed successfully.
+    if not samples or not any(s.get('warmup') is False for s in samples):
+        raise ValueError('F16 BF16 fuse requires complete warm/formal samples')
+    for sample in samples:
+        c = sample.get('gpu_f16_gemv_bf16_fuse')
+        t = sample.get('decode_telemetry', {})
+        if (not isinstance(c, dict) or any(type(c.get(k)) is not int or c[k] < 0
+                for k in CANDIDATE_PATHS['gpu_f16_gemv_bf16_fuse'][2]) or
+                c['requests'] <= 0 or c['encoded'] != c['requests'] or c['failures'] or
+                c['decode_requests'] <= 0 or c['decode_encoded'] != c['decode_requests'] or c['decode_failures'] or
+                c['decode_requests'] > c['requests'] or
+                t.get('target_forward_calls') != sample.get('output_tokens') or
+                t.get('target_rows') != sample.get('output_tokens') or
+                any(t.get(k) != 0 for k in ('batch2_calls', 'batch2_failures', 'batch2_fallbacks',
+                    'draft_cycles', 'draft_proposed', 'pld_queries', 'pld_cycles'))):
+            raise ValueError('Required F16 BF16 fuse did not encode the full ordinary decode path')
+
+
+def validate_indexer_rope_quant_mode(environment):
+    if environment.get('MYDS_INDEXER_ROPE_QUANT_FUSE') not in (None, '0', '1'):
+        raise ValueError('Invalid candidate 0/1 cohort: MYDS_INDEXER_ROPE_QUANT_FUSE')
+
+
+def require_indexer_rope_quant_fuse(samples):
+    # Host encoding evidence for every completed warm/formal ordinary graph.
+    # Complete outputs/completion are audited elsewhere; encoded alone is not
+    # a claim that a GPU command completed successfully.
+    if not samples or not any(s.get('warmup') is False for s in samples):
+        raise ValueError('Indexer RoPE quant fuse requires complete warm/formal samples')
+    for sample in samples:
+        c = sample.get('gpu_indexer_rope_quant_fuse')
+        t = sample.get('decode_telemetry', {})
+        if (not isinstance(c, dict) or any(type(c.get(k)) is not int or c[k] < 0
+                for k in CANDIDATE_PATHS['gpu_indexer_rope_quant_fuse'][2]) or
+                c['requests'] <= 0 or c['encoded'] != c['requests'] or c['failures'] or
+                c['decode_requests'] <= 0 or c['decode_encoded'] != c['decode_requests'] or c['decode_failures'] or
+                c['decode_requests'] > c['requests'] or
+                t.get('target_forward_calls') != sample.get('output_tokens') or
+                t.get('target_rows') != sample.get('output_tokens') or
+                any(t.get(k) != 0 for k in ('batch2_calls', 'batch2_failures', 'batch2_fallbacks',
+                    'draft_cycles', 'draft_proposed', 'pld_queries', 'pld_cycles'))):
+            raise ValueError('Required Indexer RoPE quant fuse did not encode the full ordinary decode path')
+
+
 def validate_candidate_paths(samples, environment, audit):
     """Validate native encoding records; absent historical records remain usable."""
     validate_moe_cache_modes(environment)
+    validate_capture_modes(environment)
+    validate_indexer_rope_quant_mode(environment)
+    validate_f16_fuse_mode(environment)
     if environment.get('MYDS_MOE_Q2_SUM_CACHE_FUSED') == '1':
         for sample in samples:
             old = sample.get('gpu_moe_q2_sum_cache')
@@ -431,13 +581,15 @@ def validate_candidate_paths(samples, environment, audit):
         if name == 'gpu_lm_head_q8':
             audit.require(environment.get(flag) in (None, '2', '4'),
                           'Invalid LM head row cohort: ' + str(environment.get(flag)))
-        if name in ('gpu_engram_project_round', 'gpu_moe_q2_sum_cache', 'gpu_moe_q2_sum_cache_fused'):
+        if name in ('gpu_dspark_capture','gpu_topk_nan_shuffle','gpu_topk_threshold', 'gpu_indexer_head_slots', 'gpu_engram_project_round', 'gpu_moe_q2_sum_cache', 'gpu_moe_q2_sum_cache_fused', 'gpu_f16_gemv_bf16_fuse', 'gpu_indexer_rope_quant_fuse'):
             audit.require(environment.get(flag) in (None, '0', '1'),
                           'Invalid candidate 0/1 cohort: ' + str(environment.get(flag)))
         for sample in samples:
             counters = sample.get(name)
             if counters is None:
-                audit.require(environment.get(flag) != enabled_value, 'Missing candidate path counters: ' + name)
+                enabled = capture_bypass_requested(environment) if name == 'gpu_dspark_capture' else environment.get(flag) == enabled_value
+                audit.require(not enabled and not (name in ('gpu_f16_gemv_bf16_fuse','gpu_indexer_rope_quant_fuse') and environment.get(flag) is not None),
+                              'Missing candidate path counters: ' + name)
                 continue
             audit.require(isinstance(counters, dict), 'Invalid candidate path counters: ' + name)
             for key in keys:
@@ -455,9 +607,60 @@ def validate_candidate_paths(samples, environment, audit):
                 audit.require(counters['encoded'] + counters[failure] == counters['requests'] and
                               counters['decode_encoded'] + counters['decode_' + failure] == counters['decode_requests'],
                               'Candidate encoding/fallback counts differ from requests: ' + name)
-            if environment.get(flag) != enabled_value:
+            if name == 'gpu_indexer_head_slots':
+                audit.require(counters['unavailable'] <= counters['failures'] and
+                              counters['decode_unavailable'] <= counters['decode_failures'] and
+                              counters['decode_unavailable'] <= counters['unavailable'],
+                              'Candidate head-slot unavailable is not a failure subset')
+            if name == 'gpu_topk_threshold':
+                audit.require(counters.get('stats_completed') is True,
+                              'TopK threshold GPU decisions were not observed after existing completion')
+                for prefix in ('', 'decode_'):
+                    audit.require(counters[prefix + 'validated'] == counters[prefix + 'encoded'] and
+                                  counters[prefix + 'adopted'] + counters[prefix + 'fallback'] == counters[prefix + 'validated'],
+                                  'TopK threshold GPU decision conservation differs')
+                    audit.require(sum(counters[prefix + k] for k in
+                                  ('nan', 'inf', 'insufficient', 'capacity', 'certificate', 'tie')) == counters[prefix + 'fallback'],
+                                  'TopK threshold mutually exclusive fallback reasons differ')
+                audit.require(all(counters['decode_' + k] <= counters[k] for k in TOPK_THRESHOLD_FIELDS),
+                              'TopK threshold decode outcome exceeds total')
+                audit.require(counters['errors'] == 0 and counters['encoded'] == counters['requests'],
+                              'Completed TopK threshold graph has a host error or missing encoding')
+                if environment.get(flag) == enabled_value:
+                    expected_total, expected_decode = expected_topk_threshold_requests(sample['prompt_tokens'], sample['output_tokens'])
+                    audit.require((counters['requests'], counters['decode_requests']) == (expected_total, expected_decode),
+                                  'TopK threshold eligible ordinary row denominator differs')
+            if name=='gpu_dspark_capture':
+                for prefix in ('','decode_'):
+                    audit.require(counters[prefix+'encoded']+counters[prefix+'bypassed']+counters[prefix+'failures']==counters[prefix+'requests'],
+                                  'Capture result conservation differs')
+                audit.require(all(counters['decode_'+k]<=counters[k] for k in
+                    ('bypassed','stale_rejections')),'Capture decode counter exceeds total')
+                if not capture_bypass_requested(environment):
+                    audit.require(counters['bypassed']==0,'Reference capture path bypassed work')
+            elif name=='gpu_topk_nan_shuffle' and environment.get(flag)==enabled_value:
+                fused=sample.get('gpu_topk_nan_fuse')
+                audit.require(isinstance(fused,dict) and all(counters[k]==fused[k] for k in
+                    ('requests','encoded','decode_requests','decode_encoded')) and
+                    fused.get('unavailable')==0 and fused.get('decode_unavailable')==0,
+                    'Shuffle candidate path did not cover the complete eligible production NaN-fused path')
+            elif environment.get(flag) != enabled_value:
                 audit.require(not any(counters[key] for key in keys),
                               'Disabled candidate has execution counters: ' + name)
+
+
+def expected_topk_threshold_requests(prompt_tokens, output_tokens):
+    """Eight regular index rows, not the extra layer20 block TopK.
+
+    First output uses pos=P-1; remaining N-1 outputs are the decode intervals.
+    Three sources have compression ratio2 and five ratio1. Only top512 rows
+    with n_cols8192..262144 enter the opt-in graph. No speculative rows here.
+    """
+    if type(prompt_tokens) is not int or type(output_tokens) is not int or prompt_tokens <= 0 or output_tokens < 0:
+        raise ValueError('Invalid TopK threshold position/count')
+    calls = [3 * int(8192 <= (prompt_tokens + j) // 2 <= 262144) +
+             5 * int(8192 <= prompt_tokens + j <= 262144) for j in range(output_tokens)]
+    return sum(calls), sum(calls[1:])
 
 
 def candidate_paths(samples, name):
@@ -467,21 +670,68 @@ def candidate_paths(samples, name):
     if not records:
         return None
     formal = [r for r in records if not r['warmup']]
-    return {'runs': records,
+    result = {'runs': records,
             'encoded_in_formal_decode': any(r['decode_encoded'] > 0 for r in formal),
             'any_failure_in_formal_runs': any(r[failure] > 0 for r in formal),
             'formal_totals': {k: sum(r[k] for r in formal) for k in keys},
             'scope': 'Host encoding counters, not GPU duration, physical weight traffic or NaN branch counts; '
                      'decode counters exclude work through the first callback.'}
+    if name=='gpu_dspark_capture':
+        result.update(bypassed_in_formal_decode=any(r['decode_bypassed']>0 for r in formal),
+            any_stale_rejection_in_formal_runs=any(r['stale_rejections']>0 for r in formal),
+            scope='Host capture request/encoding/bypass counters, not GPU duration; decode excludes first callback.')
+    if name == 'gpu_topk_threshold':
+        result.update(adopted_in_formal_decode=any(r['decode_adopted'] > 0 for r in formal),
+                      fallback_in_formal_decode=any(r['decode_fallback'] > 0 for r in formal),
+                      formal_decode_adoption_fraction=(sum(r['decode_adopted'] for r in formal) /
+                          sum(r['decode_validated'] for r in formal)) if sum(r['decode_validated'] for r in formal) else None,
+                      scope='Host graph encoding plus GPU completed validation/adoption/fallback decisions; '
+                            'only ordinary top512 index rows with n_cols8192..262144. Extra layer20 block TopK excluded. '
+                            'GPU stats observed at existing generation completion; no per-TopK CPU wait. '
+                            'Decode excludes work through first callback; no GPU time or physical traffic claim.')
+    return result
 
 
 def require_candidate_path(samples, name):
     _, failure, _ = CANDIDATE_PATHS[name]
     formal = [s.get(name) for s in samples if not s['warmup']]
+    if name=='gpu_dspark_capture':
+        for sample in (s for s in samples if not s['warmup']):
+            c=sample.get(name)
+            if not c or c['requests']<=0 or c['bypassed']!=c['requests'] or c['encoded'] or c['failures'] or c['stale_rejections'] or \
+                c['decode_requests']!=3*sample['decode_intervals'] or c['decode_bypassed']!=c['decode_requests'] or \
+                c['decode_encoded'] or c['decode_failures'] or c['decode_stale_rejections'] or \
+                sample['decode_telemetry']['target_forward_calls']!=sample['output_tokens'] or \
+                sample['decode_telemetry']['target_rows']!=sample['output_tokens']:
+                raise ValueError('Required capture bypass did not bypass the full ordinary decode path')
+        if not formal: raise ValueError('Capture bypass has no formal samples')
+        return
     if not formal or any(not c or c['requests'] <= 0 or c['encoded'] != c['requests'] or c[failure] or
                          c['decode_requests'] <= 0 or c['decode_encoded'] != c['decode_requests'] or
                          c['decode_' + failure] for c in formal):
         raise ValueError('Required candidate path did not encode every formal decode request: ' + name)
+    if name == 'gpu_topk_threshold':
+        for sample in (s for s in samples if not s['warmup']):
+            c = sample[name]
+            total, decode = expected_topk_threshold_requests(sample['prompt_tokens'], sample['output_tokens'])
+            if (decode <= 0 or c['requests'] != total or c['decode_requests'] != decode or
+                    c['stats_completed'] is not True or c['validated'] != total or c['decode_validated'] != decode or
+                    c['decode_adopted'] <= 0 or
+                    sample['decode_telemetry']['target_forward_calls'] != sample['output_tokens'] or
+                    sample['decode_telemetry']['target_rows'] != sample['output_tokens']):
+                raise ValueError('Required TopK threshold path lacks actual eligible ordinary GPU adoption')
+    if name == 'gpu_indexer_head_slots':
+        # Native V4.1 validates the eight index-source layers and 32x128
+        # indexer shape. The pure-target protocol has one forward per output;
+        # work through the first callback is excluded from N-1 decode periods.
+        for sample in (s for s in samples if not s['warmup']):
+            counters = sample[name]
+            if (counters['unavailable'] or counters['decode_unavailable'] or
+                    counters['requests'] != 8 * sample['output_tokens'] or
+                    counters['decode_requests'] != 8 * sample['decode_intervals'] or
+                    sample['decode_telemetry']['target_forward_calls'] != sample['output_tokens'] or
+                    sample['decode_telemetry']['target_rows'] != sample['output_tokens']):
+                raise ValueError('Required candidate path did not encode the full 32x128 eight-layer scalar shape: ' + name)
 
 
 def require_batch2_graph(samples):
@@ -536,7 +786,7 @@ def compare(args):
         reductions[phase] = {'base': before, 'candidate': after,
                              'time_saved_percent': 100 * (1 - after['median'] / before['median'])}
     summary = {'audit_pass': True, 'all_warm_and_formal_outputs_match': True,
-               'scope': 'Separate processes, one warmup plus three formal samples; direct callback timing',
+               'scope': f"Separate processes, one warmup plus {base['formal_runs']} formal samples; direct callback timing",
                'base': base, 'candidate': candidate, 'comparison': reductions,
                'attention_paths': {'base': attention_paths(raw[0]),
                                    'candidate': attention_paths(raw[1])},
@@ -580,7 +830,7 @@ def compare(args):
             phase: 100 * (control['stats'][phase + '_ms_per_token']['median'] /
                           base['stats'][phase + '_ms_per_token']['median'] - 1)
             for phase in ('prefill', 'decode')}
-        summary['scope'] = 'A–B–A separate processes; one warmup and three formal samples per arm; direct callback timing'
+        summary['scope'] = f"A–B–A separate processes; one warmup and {base['formal_runs']} formal samples per arm; direct callback timing"
     output = args.out.resolve()
     if output.exists():
         raise ValueError('Comparison output already exists: ' + str(output))
@@ -604,6 +854,22 @@ def stop_child(child):
             except ProcessLookupError:
                 pass
             child.wait(timeout=5)
+
+
+def require_engine_capture_bypass(samples):
+    """The new candidate must cover every complete ordinary request, including warmup."""
+    if not samples or not any(not s['warmup'] for s in samples):
+        raise ValueError('Engine capture bypass has no formal samples')
+    for sample in samples:
+        c = sample.get('gpu_dspark_capture')
+        t = sample.get('decode_telemetry', {})
+        if not c or c['requests'] <= 0 or c['bypassed'] != c['requests'] or c['encoded'] or c['failures'] or c['stale_rejections'] or \
+                c['decode_requests'] != 3 * sample['decode_intervals'] or c['decode_bypassed'] != c['decode_requests'] or \
+                c['decode_encoded'] or c['decode_failures'] or c['decode_stale_rejections'] or \
+                t.get('target_forward_calls') != sample['output_tokens'] or t.get('target_rows') != sample['output_tokens'] or \
+                any(t.get(k) != 0 for k in ('batch2_calls', 'batch2_failures', 'batch2_fallbacks',
+                                           'draft_cycles', 'draft_proposed', 'pld_queries', 'pld_cycles')):
+            raise ValueError('Required Engine capture bypass did not bypass the full ordinary decode graph')
 
 
 def run(args):
@@ -641,12 +907,49 @@ def run(args):
             raise ValueError(name + '=0 is required for this full-prefill protocol')
     require_uninstrumented_environment(explicit_env)
     validate_moe_cache_modes(explicit_env)
+    validate_capture_modes(explicit_env)
+    validate_indexer_rope_quant_mode(explicit_env)
+    validate_f16_fuse_mode(explicit_env)
+    if getattr(args, "require_f16_gemv_bf16_fuse", False) and (
+            explicit_env.get("MYDS_F16_GEMV_BF16_FUSE") != "1" or
+            any(explicit_env.get(k) != "0" for k in ("MYDS_PLD", "MYDS_BATCH2_SPEC", "MYDS_SPEC_SERIAL_PROBE"))):
+        raise ValueError("Required F16 BF16 fuse needs explicit flag1 and ordinary SPEC0/SERIAL0 path")
+    if getattr(args, "require_indexer_rope_quant_fuse", False) and (
+            explicit_env.get("MYDS_INDEXER_ROPE_QUANT_FUSE") != "1" or arm != "target" or support is not None or
+            any(explicit_env.get(k) != "0" for k in ("MYDS_PLD", "MYDS_BATCH2_SPEC", "MYDS_SPEC_SERIAL_PROBE"))):
+        raise ValueError("Required Indexer RoPE quant fuse needs explicit flag1 and ordinary SPEC0/SERIAL0 path")
+    for flag in ('MYDS_INDEXER_TOPK_NAN_SHUFFLE','MYDS_DSPARK_CAPTURE_BYPASS'):
+        if explicit_env.get(flag) not in (None,'0','1'):
+            raise ValueError('Invalid candidate 0/1 cohort: '+flag)
+    if getattr(args,'require_topk_nan_shuffle',False) and explicit_env.get('MYDS_INDEXER_TOPK_NAN_SHUFFLE')!='1':
+        raise ValueError('Required NaN shuffle path needs explicit flag1')
+    if getattr(args,'require_dspark_capture_bypass',False) and (support is None or
+        explicit_env.get('MYDS_DSPARK_CAPTURE_BYPASS')!='1' or
+        any(explicit_env.get(k)!='0' for k in ('MYDS_PLD','MYDS_BATCH2_SPEC','MYDS_SPEC_SERIAL_PROBE'))):
+        raise ValueError('Required capture bypass needs loaded support and ordinary SPEC0/SERIAL0 path')
+    if getattr(args, 'require_engine_capture_bypass', False) and (support is None or
+        explicit_env.get('MYDS_ENGINE_CAPTURE_BYPASS') != '1' or explicit_env.get('MYDS_DSPARK_CAPTURE_BYPASS') != '0' or
+        any(explicit_env.get(k) != '0' for k in ('MYDS_PLD', 'MYDS_BATCH2_SPEC', 'MYDS_SPEC_SERIAL_PROBE'))):
+        raise ValueError('Required Engine capture bypass needs old0/new1, loaded support and ordinary SPEC0/SERIAL0 path')
+    if explicit_env.get('MYDS_INDEXER_TOPK_THRESHOLD') not in (None, '0', '1'):
+        raise ValueError('Invalid candidate 0/1 cohort: MYDS_INDEXER_TOPK_THRESHOLD')
+    if explicit_env.get('MYDS_INDEXER_TOPK_THRESHOLD') == '1' and (arm != 'target' or
+            explicit_env.get('MYDS_INDEXER_COMPACT_SCORER') not in (None, '0')):
+        raise ValueError('TopK threshold graph needs pure target and dense scorer')
+    if getattr(args, 'require_topk_threshold', False) and explicit_env.get('MYDS_INDEXER_TOPK_THRESHOLD') != '1':
+        raise ValueError('Required TopK threshold candidate needs flag1')
+    if explicit_env.get('MYDS_INDEXER_HEAD_SLOTS') not in (None, '0', '1'):
+        raise ValueError('Invalid candidate 0/1 cohort: MYDS_INDEXER_HEAD_SLOTS')
+    if getattr(args, 'require_indexer_head_slots', False) and (
+            explicit_env.get('MYDS_INDEXER_HEAD_SLOTS') != '1' or arm != 'target' or
+            explicit_env.get('MYDS_INDEXER_COMPACT_SCORER') not in (None, '0')):
+        raise ValueError('Required indexer head-slot candidate needs flag1, pure target and dense scorer')
     check_idle(args.server_port)
     output = args.out.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=False)
     environment = {k: v for k, v in os.environ.items() if not k.startswith('MYDS_')}
     environment.update(explicit_env)
-    argv = [str(binary), str(model), str(request), '3', str(args.max_new_tokens), str(args.context)]
+    argv = [str(binary), str(model), str(request), str(getattr(args,'repeats',3)), str(args.max_new_tokens), str(args.context)]
     if support is not None:
         argv.append(str(support))
     request_data = request.read_bytes()
@@ -674,6 +977,12 @@ def run(args):
         if result:
             raise RuntimeError(f'Harness exited {result}; inspect {output / "run.log"}')
         group, samples = validate_run(output, state, load_audit())
+        if getattr(args, 'require_engine_capture_bypass', False):
+            require_engine_capture_bypass(samples)
+        if getattr(args, 'require_indexer_rope_quant_fuse', False):
+            require_indexer_rope_quant_fuse(samples)
+        if getattr(args, 'require_f16_gemv_bf16_fuse', False):
+            require_f16_gemv_bf16_fuse(samples)
         if arm in ('batch2', 'pld-batch2', 'hybrid') or getattr(args, 'require_batch2_q8_shared', False):
             require_batch2_graph(samples)
         if getattr(args, 'require_topk_prefix', False):
@@ -684,7 +993,11 @@ def run(args):
                                  counters['decode_encoded'] != counters['decode_requests'] or
                                  counters['decode_unavailable'] for counters in formal):
                 raise ValueError('Required topk prefix path did not encode every formal decode request')
-        for option, name in (('require_topk_nan_fuse', 'gpu_topk_nan_fuse'),
+        for option, name in (('require_topk_threshold', 'gpu_topk_threshold'),
+                             ('require_topk_nan_shuffle','gpu_topk_nan_shuffle'),
+                             ('require_dspark_capture_bypass','gpu_dspark_capture'),
+                             ('require_indexer_head_slots', 'gpu_indexer_head_slots'),
+                             ('require_topk_nan_fuse', 'gpu_topk_nan_fuse'),
                              ('require_batch2_q8_shared', 'gpu_batch2_q8_shared'),
                              ('require_lm_head_q8', 'gpu_lm_head_q8'),
                              ('require_engram_project_round', 'gpu_engram_project_round'),
@@ -746,6 +1059,20 @@ def main():
     measurement.add_argument('--out', type=Path, required=True, help='New output directory; existing directories are refused')
     measurement.add_argument('--require-topk-prefix', action='store_true',
                              help='Require all formal runs to encode every eligible decode prefix request without fallback')
+    measurement.add_argument('--require-topk-nan-shuffle',action='store_true',
+                             help='Require actual shuffle encoding in every eligible formal decode request')
+    measurement.add_argument('--require-dspark-capture-bypass',action='store_true',
+                             help='Require all three unconsumed target captures per ordinary decode to be bypassed')
+    measurement.add_argument('--require-engine-capture-bypass', action='store_true',
+                             help='Require actual Engine mode1 with old mode0, all ordinary capture work bypassed and no speculative graph')
+    measurement.add_argument('--require-topk-threshold', action='store_true',
+                             help='Require complete eligible ordinary top512 graph and actual GPU adoption in every formal decode')
+    measurement.add_argument('--require-indexer-head-slots', action='store_true',
+                             help='Require actual native 32x128 head-slot encoding in all eight scalar indexers per output, with no failures/unavailability')
+    measurement.add_argument('--require-indexer-rope-quant-fuse', action='store_true',
+                             help='Require actual fused indexer RoPE/quant in every warm/formal pure ordinary target decode, with no failures')
+    measurement.add_argument('--require-f16-gemv-bf16-fuse', action='store_true',
+                             help='Require actual F16 fused BF16 encoding in every warm/formal ordinary decode, with no failures')
     measurement.add_argument('--require-topk-nan-fuse', action='store_true',
                              help='Require native fused NaN sort counters in every formal decode, with no fallback')
     measurement.add_argument('--require-batch2-q8-shared', action='store_true',
@@ -760,6 +1087,8 @@ def main():
                              help='Require complete fused IQ2/cache/Q2 encoding in every formal decode, with no failures')
     measurement.add_argument('--env', action='append', default=[], help='Explicit MYDS_NAME=value, repeatable')
     measurement.add_argument('--max-new-tokens', type=int, choices=OUTPUT_CAPS, default=64)
+    measurement.add_argument('--repeats', type=int, choices=(3,5), default=3,
+                             help='Formal samples after one warmup; fixed before launching the native harness')
     measurement.add_argument('--context', type=int, default=262144)
     measurement.add_argument('--timeout', type=float, default=900)
     measurement.add_argument('--server-port', type=int, default=8181)

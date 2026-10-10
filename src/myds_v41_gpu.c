@@ -26,6 +26,10 @@ struct myds_v41_gpu_scratch {
     uint32_t topk_prefix_rows;
     myds_metal_buffer_t *topk_nan_partitions; /* independent fused-path flags */
     uint64_t topk_nan_partition_slots;
+    /* Independent Top512 candidate; fixed maxima avoid reallocating in-flight
+     * scratch on same-command-buffer reuse. Allocated only on explicit use. */
+    myds_metal_buffer_t *threshold_parts, *threshold_control, *threshold_hist;
+    myds_metal_buffer_t *threshold_offsets, *threshold_pairs;
     myds_metal_buffer_t *sv_view, *dv_view;
     /* 批量 indexer（prefill Step 4）的临时缓冲：分数表、top-k 的中间排序结果两份、
      * 块分数、块选择结果。每个都是 batch_floats 个 float（或等
@@ -203,6 +207,9 @@ void myds_v41_gpu_scratch_free(myds_v41_gpu_scratch_t *s) {
     myds_metal_buffer_free(s->sort_a);myds_metal_buffer_free(s->sort_b);
     myds_metal_buffer_free(s->topk_prefix_nan);
     myds_metal_buffer_free(s->topk_nan_partitions);
+    myds_metal_buffer_free(s->threshold_parts);myds_metal_buffer_free(s->threshold_control);
+    myds_metal_buffer_free(s->threshold_hist);myds_metal_buffer_free(s->threshold_offsets);
+    myds_metal_buffer_free(s->threshold_pairs);
     myds_metal_buffer_free(s->kv_f16);myds_metal_buffer_free(s->mask);
     myds_metal_buffer_free(s->kv_chunk);myds_metal_buffer_free(s->mask_chunk);
     myds_metal_buffer_free(s->attn_head_blocks);
@@ -295,6 +302,12 @@ int myds_v41_gpu_quant(myds_metal_buffer_t *x,uint32_t width,uint32_t rows,uint3
     const uint32_t a[]={width,rows,mode};const myds_metal_buffer_t *b[]={x};
     return dispatch("kernel_dsv41_quantize",a,sizeof(a),b,1,(width+block-1)/block,rows,1,32,1,1,0);
 }
+int myds_v41_gpu_indexer_rope_quant(myds_metal_buffer_t *x,uint32_t heads,uint32_t pos) {
+    /* Reuse the exact once-initialized compressed frequency table; the
+     * explicit native bridge owns complete preflight/fail-closed counters. */
+    pthread_once(&rope_once,init_rope);
+    return myds_metal_indexer_rope_quant_dispatch(x,heads,pos,rope_frequencies[1]);
+}
 static int buffer_ranges_overlap(const myds_metal_buffer_t *a,size_t a_bytes,
                                  const myds_metal_buffer_t *b,size_t b_bytes) {
     uintptr_t x=(uintptr_t)myds_metal_buffer_data((myds_metal_buffer_t *)a),
@@ -363,6 +376,36 @@ int myds_v41_gpu_pool2(myds_metal_buffer_t *out,const myds_metal_buffer_t *kv,
     if(!floats(out,width))return 0;
     const uint32_t a[]={width,1,1};const myds_metal_buffer_t *b[]={out,kv,scores,previous_kv,previous_scores};
     return dispatch("kernel_dsv41_pool2",a,sizeof(a),b,5,(width+255u)/256,1,1,256,1,1,0);
+}
+static _Atomic uint64_t indexer_head_slots_requests;
+static _Atomic uint64_t indexer_head_slots_encoded;
+static _Atomic uint64_t indexer_head_slots_unavailable;
+static _Atomic uint64_t indexer_head_slots_failures;
+int myds_v41_gpu_indexer_head_slots_enabled(void) {
+    return myds_metal_indexer_head_slots_enabled();
+}
+void myds_v41_gpu_indexer_head_slots_counters(
+    myds_v41_gpu_indexer_head_slots_counters_t *out,bool reset) {
+#define HEAD_SLOTS_COUNT(field) (reset ? atomic_exchange_explicit(&indexer_head_slots_##field,0u,memory_order_relaxed) \
+                                     : atomic_load_explicit(&indexer_head_slots_##field,memory_order_relaxed))
+    const myds_v41_gpu_indexer_head_slots_counters_t value = {
+        .requests=HEAD_SLOTS_COUNT(requests), .encoded=HEAD_SLOTS_COUNT(encoded),
+        .unavailable=HEAD_SLOTS_COUNT(unavailable), .failures=HEAD_SLOTS_COUNT(failures)};
+    if(out)*out=value;
+#undef HEAD_SLOTS_COUNT
+}
+int myds_v41_gpu_indexscores_head_slots(myds_metal_buffer_t *scores,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *cache,const myds_metal_buffer_t *mask,
+    uint32_t n_comp,uint32_t n_heads,bool cache_bf16) {
+    atomic_fetch_add_explicit(&indexer_head_slots_requests,1u,memory_order_relaxed);
+    bool encoded=false,unavailable=false;
+    const int ok=myds_metal_indexer_head_slots_dispatch(scores,q,weights,cache,mask,
+        n_comp,n_heads,cache_bf16,&encoded,&unavailable);
+    if(encoded)atomic_fetch_add_explicit(&indexer_head_slots_encoded,1u,memory_order_relaxed);
+    if(unavailable)atomic_fetch_add_explicit(&indexer_head_slots_unavailable,1u,memory_order_relaxed);
+    if(!ok)atomic_fetch_add_explicit(&indexer_head_slots_failures,1u,memory_order_relaxed);
+    return ok;
 }
 static int indexscores(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
     const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,
@@ -767,13 +810,354 @@ static int topk_rows_causal(myds_metal_buffer_t *ids,const myds_metal_buffer_t *
     if(nan_fuse)atomic_fetch_add_explicit(&topk_nan_fuse_counters[TN_ENCODED],1,memory_order_relaxed);
     return 1;
 }
+
+/* Opt-in strict clone: default and all ineligible calls retain the original
+ * helper. Successful encoding is not GPU completion or a performance claim. */
+static _Atomic uint64_t topk_nan_shuffle_requests,topk_nan_shuffle_encoded,topk_nan_shuffle_failures;
+int myds_v41_gpu_topk_nan_shuffle_enabled(void) {
+    return myds_metal_indexer_topk_nan_shuffle_enabled();
+}
+void myds_v41_gpu_topk_nan_shuffle_counters(myds_v41_gpu_topk_nan_shuffle_counters_t *out,bool reset) {
+#define NS_COUNT(field) (reset?atomic_exchange_explicit(&topk_nan_shuffle_##field,0u,memory_order_relaxed):atomic_load_explicit(&topk_nan_shuffle_##field,memory_order_relaxed))
+    const myds_v41_gpu_topk_nan_shuffle_counters_t value={NS_COUNT(requests),NS_COUNT(encoded),NS_COUNT(failures)};
+#undef NS_COUNT
+    if(out)*out=value;
+}
+
+static int topk_rows_causal_nan_shuffle_encode(myds_metal_buffer_t *ids,const myds_metal_buffer_t *scores,
+    uint32_t n_cols,uint32_t top,uint32_t n_rows,uint32_t causal_start,uint32_t causal_ratio,
+    myds_v41_gpu_scratch_t *s) {
+    if(!s||!n_rows||n_cols>INT32_MAX||!top||top>n_cols||!floats(ids,(uint64_t)top*n_rows)||
+       !floats(scores,(uint64_t)n_cols*n_rows))return 0;
+    if(causal_ratio&&causal_start==UINT32_MAX)return 0;
+    const char *nan_fuse_env=getenv("MYDS_INDEXER_TOPK_NAN_FUSE");
+    if(nan_fuse_env&&strcmp(nan_fuse_env,"0")&&strcmp(nan_fuse_env,"1")) {
+        MYDS_LOG_E("MYDS_INDEXER_TOPK_NAN_FUSE must be exactly 0 or 1");
+        return 0;
+    }
+    /* Match the reference bitonic partition as well as its comparator: ties
+     * can otherwise select different cache rows after the merge. */
+    uint32_t max_threads=myds_metal_kernel_max_threads(causal_ratio?
+        "kernel_argsort_f32_i32_desc_causal":"kernel_argsort_f32_i32_desc");
+    if(!max_threads)return 0;
+    uint32_t nth=1;while(nth<n_cols&&2u*nth<=max_threads)nth*=2;
+    uint32_t npr=(n_cols+nth-1)/nth,blocktop=top<nth?top:nth;
+    uint32_t last=n_cols-(npr-1)*nth;
+    uint32_t work=npr==1?top:(npr-1)*blocktop+(last<blocktop?last:blocktop);
+    /* 一行的中间结果长度：非 causal（逐 token）是 work；causal（批量）则是内核按
+     * 【该行自己的宽度】算出来的 work_width = ((w-1)/nth)*blocktop + min((w-1)%nth+1, blocktop)。
+     * 它对 w 不单调（w 越接近 nth 的整数倍，右边那项越大），实测出现过比 work 还大的例子
+     * （n_cols=5304 ⇒ work=2664，但 width=5267 的行要写 2707 个），那样会越界覆盖下一行。
+     * 注意 work_width(w) ≤ w（因为 blocktop ≤ nth），所以批量路径的行步长直接取满宽
+     * n_cols：每行一定落在自己行内，且缓冲需求与分数表同为 n_rows*n_cols（调用方已保证）。
+     *
+     * 但 dst 的行步长在两种情况下不同，必须分开看：
+     *   - npr > 1：sort 写中间缓冲（步长 = ne0 = n_cols），最后一级 merge 写 ids
+     *     （步长 = top_k = top）；
+     *   - npr == 1：没有 merge，sort 直接把 ids 当 dst（步长 = ne0），所以此时
+     *     ne0 必须 = top。
+     * 调用方（prompt_selected / 块掩码 scatter）按 top 一行行读，所以批量路径要求
+     * top == 调用方给 ids 的行步长；host 侧通过把分数表宽度补到 ≥ V41_TOPK 来保证
+     * top == V41_TOPK。 */
+    uint32_t layout=causal_ratio?(npr==1?top:n_cols):work;
+    /* 中间结果缓冲：非 causal 的逐 token 路径沿用 sort_a/sort_b（大小 = max_comp，
+     * 与旧行为一致）；批量（causal）路径改用专门的 chunk_tmp_a/chunk_tmp_b
+     * （大小 = MYDS_V41_INDEXER_BATCH_FLOATS）—— 多行时需要的 n_rows*layout 个 float
+     * 远超 max_comp，直接用 sort_a 会越界写坏堆（实测：n_rows*layout 超 max_comp 后
+     * 相邻缓冲被覆盖，结果随机错乱）。 */
+    myds_metal_buffer_t *tmp_a=causal_ratio?s->chunk_tmp_a:s->sort_a;
+    myds_metal_buffer_t *tmp_b=causal_ratio?s->chunk_tmp_b:s->sort_b;
+    if(!tmp_a||!tmp_b)return 0;
+    const myds_metal_buffer_t *native[]={ids,scores,tmp_a,tmp_b};
+    const uint64_t words[]={ (uint64_t)top*n_rows, (uint64_t)n_cols*n_rows,
+        (uint64_t)layout*n_rows, (uint64_t)layout*n_rows };
+    for(unsigned i=0;i<4u;i++) {
+        if(words[i]>SIZE_MAX/4u||!myds_metal_buffer_native_valid(native[i])||
+           !floats(native[i],words[i]))return 0;
+        for(unsigned j=0;j<i;j++)if(buffer_ranges_overlap(native[i],(size_t)words[i]*4u,
+            native[j],(size_t)words[j]*4u))return 0;
+    }
+    if(!myds_metal_indexer_topk_nan_shuffle_preflight(causal_ratio!=0u,nth))return 0;
+    if(causal_ratio) {
+        if((uint64_t)n_rows*layout>(uint64_t)s->batch_floats)return 0;
+    } else if(n_cols>s->max_comp||(uint64_t)n_rows*work>(uint64_t)s->max_comp||!n_rows)return 0;
+    const char *prefix_env=getenv("MYDS_INDEXER_TOPK_PREFIX_MERGE");
+    /* A lone final merge already truncates to top. Classification scans every
+     * visible score and adds a dispatch/barriers: require at least 16 sort
+     * partitions so larger intermediate merges can amortize that cost. */
+    bool prefix=npr>=16u&&layout>2u*blocktop&&top<=512u&&prefix_env&&strcmp(prefix_env,"1")==0;
+    const char *prefix_kernel=causal_ratio?
+        "kernel_myds_argsort_merge_f32_i32_desc_causal_prefix_guarded":
+        "kernel_myds_argsort_merge_f32_i32_desc_prefix_guarded";
+    const bool nan_fuse_requested=prefix&&nan_fuse_env&&strcmp(nan_fuse_env,"1")==0;
+    const char *nan_fuse_sort=causal_ratio?
+        "kernel_myds_argsort_f32_i32_desc_causal_partition_nan_shuffle":
+        "kernel_myds_argsort_f32_i32_desc_partition_nan_shuffle";
+    const char *nan_fuse_merge=causal_ratio?
+        "kernel_myds_argsort_merge_f32_i32_desc_causal_partition_prefix_guarded":
+        "kernel_myds_argsort_merge_f32_i32_desc_partition_prefix_guarded";
+    if(prefix) {
+        atomic_fetch_add_explicit(&topk_prefix_counters[TP_REQUESTS],1,memory_order_relaxed);
+        /* Probe both optional PSOs and allocate flags before sort writes.
+         * Dispatch failure after classification starts fails closed. */
+        if(nan_fuse_requested) {
+            atomic_fetch_add_explicit(&topk_nan_fuse_counters[TN_REQUESTS],1,memory_order_relaxed);
+            /* Preserve the reference nth even if the optional PSO has a lower
+             * limit: changing the partition would change tie IDs. The clone
+             * reserves 32 SIMD partials, supporting at most 1024 threads. */
+            const char *sort_probe=(topk_nan_fuse_test_unavailable&MYDS_TOPK_NAN_FUSE_UNAVAILABLE_SORT)?
+                "kernel_myds_argsort_partition_nan_missing_sort":nan_fuse_sort;
+            const char *merge_probe=(topk_nan_fuse_test_unavailable&MYDS_TOPK_NAN_FUSE_UNAVAILABLE_MERGE)?
+                "kernel_myds_argsort_partition_nan_missing_merge":nan_fuse_merge;
+            prefix=!topk_prefix_test_unavailable&&nth<=1024u&&
+                myds_metal_kernel_max_threads(sort_probe)>=nth&&
+                myds_metal_kernel_max_threads(merge_probe)>=512u;
+            const uint64_t slots=(uint64_t)npr*n_rows;
+            if(prefix&&s->topk_nan_partition_slots<slots) {
+                myds_metal_buffer_t *flags=slots<=SIZE_MAX/4u?
+                    myds_metal_buffer_alloc((size_t)slots*4u):NULL;
+                if(flags) {
+                    myds_metal_buffer_free(s->topk_nan_partitions);
+                    s->topk_nan_partitions=flags;s->topk_nan_partition_slots=slots;
+                } else prefix=false;
+            }
+            if(!prefix)atomic_fetch_add_explicit(&topk_nan_fuse_counters[TN_UNAVAILABLE],1,memory_order_relaxed);
+        } else prefix=!topk_prefix_test_unavailable&&
+                myds_metal_kernel_max_threads("kernel_myds_argsort_visible_nan_rows")>=256u&&
+                myds_metal_kernel_max_threads(prefix_kernel)>=512u;
+        if(prefix&&!nan_fuse_requested&&s->topk_prefix_rows<n_rows) {
+            myds_metal_buffer_t *flags=myds_metal_buffer_alloc((size_t)n_rows*4u);
+            if(flags) {
+                myds_metal_buffer_free(s->topk_prefix_nan);
+                s->topk_prefix_nan=flags;s->topk_prefix_rows=n_rows;
+            } else prefix=false;
+        }
+        if(!prefix) { atomic_fetch_add_explicit(&topk_prefix_counters[TP_UNAVAILABLE],1,memory_order_relaxed);return 0; }
+        else if(!nan_fuse_requested) {
+            struct {uint32_t cols,rows,start,ratio;} na={n_cols,n_rows,causal_start,causal_ratio};
+            const myds_metal_buffer_t *nb[]={scores,s->topk_prefix_nan};
+            /* Closes WAR when the same scratch is reused within a batch. */
+            myds_metal_barrier_buffers(nb,2);
+            if(!dispatch("kernel_myds_argsort_visible_nan_rows",&na,sizeof(na),nb,2,
+                         n_rows,1,1,256,1,1,0))return 0;
+            myds_metal_barrier_buffer(s->topk_prefix_nan);
+            atomic_fetch_add_explicit(&topk_prefix_counters[TP_ROWS],n_rows,memory_order_relaxed);
+            const myds_metal_buffer_t *sort_deps[]={tmp_a,tmp_b};
+            myds_metal_barrier_buffers(sort_deps,2);
+        }
+        if(nan_fuse_requested) {
+            /* WAR on scratch/flags reused in a concurrent command batch; the
+             * upcoming sort overwrites every partition slot, including empty
+             * causal groups. Also order tmp writes after a preflight failure:
+             * dense fallback may follow a prior prefix call in this same batch.
+             * No reset dispatch or inter-group atomics are needed. */
+            const myds_metal_buffer_t *deps[]={scores,tmp_a,tmp_b,s->topk_nan_partitions};
+            myds_metal_barrier_buffers(deps,s->topk_nan_partitions?4u:3u);
+        }
+    }
+    struct sort_args a={.ne00=n_cols,.ne01=n_rows,.ne02=1,.ne03=1,.nb00=4,
+        .nb01=(uint64_t)n_cols*4,.nb02=(uint64_t)n_cols*n_rows*4,.nb03=(uint64_t)n_cols*n_rows*4,
+        .ne0=layout,.ne1=n_rows,.ne2=1,.ne3=1,.top_k=blocktop,
+        .causal_start=causal_start,.causal_ratio=causal_ratio};
+    const bool nan_fuse=prefix&&nan_fuse_requested;
+    const uint64_t flag_words=(uint64_t)npr*n_rows;
+    if(!nan_fuse||flag_words>SIZE_MAX/4u||
+       !myds_metal_buffer_native_valid(s->topk_nan_partitions)||
+       !floats(s->topk_nan_partitions,flag_words))return 0;
+    for(unsigned i=0;i<4u;i++)if(buffer_ranges_overlap(s->topk_nan_partitions,
+        (size_t)flag_words*4u,native[i],(size_t)words[i]*4u))return 0;
+    const myds_metal_buffer_t *b[]={scores,npr==1?ids:tmp_a,s->topk_nan_partitions};
+    if(!dispatch(nan_fuse?nan_fuse_sort:causal_ratio?"kernel_argsort_f32_i32_desc_causal":"kernel_argsort_f32_i32_desc",
+        &a,sizeof(a),b,nan_fuse?3u:2u,npr*n_rows,1,1,nth,1,1,((size_t)nth*8+15)&~(size_t)15))return 0;
+    if(nan_fuse) {
+        myds_metal_barrier_buffer(s->topk_nan_partitions);
+        atomic_fetch_add_explicit(&topk_prefix_counters[TP_ROWS],n_rows,memory_order_relaxed);
+        atomic_fetch_add_explicit(&topk_nan_fuse_counters[TN_PARTITIONS],(uint64_t)npr*n_rows,memory_order_relaxed);
+    }
+    myds_metal_buffer_t *cur=tmp_a,*next=tmp_b;
+    for(uint32_t len=blocktop;len<layout;len*=2) {
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(cur);
+        uint32_t nm=(layout+2*len-1)/(2*len);
+        struct merge_args m={.ne00=n_cols,.ne01=n_rows,.ne02=1,.ne03=1,.nb00=4,
+            .nb01=(uint64_t)n_cols*4,.nb02=(uint64_t)n_cols*n_rows*4,.nb03=(uint64_t)n_cols*n_rows*4,
+            .ne0=layout,.ne1=n_rows,.ne2=1,.ne3=1,.top_k=nm==1?top:layout,.len=len,.block_width=nth,
+            .block_top_k=blocktop,.causal_start=causal_start,.causal_ratio=causal_ratio};
+        const myds_metal_buffer_t *mb[]={scores,cur,nm==1?ids:next,
+            nan_fuse?s->topk_nan_partitions:s->topk_prefix_nan};
+        if(prefix) {
+            if(nan_fuse) {
+                struct nan_fuse_merge_args fm={m,top,npr};
+                if(!dispatch(nan_fuse_merge,&fm,sizeof(fm),mb,4,nm*n_rows,1,1,len<512?len:512,1,1,0))return 0;
+            } else {
+                struct prefix_merge_args pm={m,top};
+                if(!dispatch(prefix_kernel,&pm,sizeof(pm),mb,4,nm*n_rows,1,1,len<512?len:512,1,1,0))return 0;
+            }
+            atomic_fetch_add_explicit(&topk_prefix_counters[TP_MERGES],1,memory_order_relaxed);
+            topk_prefix_count_writes(n_cols,top,n_rows,causal_start,causal_ratio,nth,blocktop,layout,len);
+        } else if(!dispatch(causal_ratio?"kernel_argsort_merge_f32_i32_desc_causal":
+                            "kernel_argsort_merge_f32_i32_desc",
+                            &m,sizeof(m),mb,3,nm*n_rows,1,1,len<512?len:512,1,1,0))return 0;
+        myds_metal_buffer_t *tmp=cur;cur=next;next=tmp;
+    }
+    if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(ids);
+    if(prefix)atomic_fetch_add_explicit(&topk_prefix_counters[TP_ENCODED],1,memory_order_relaxed);
+    if(nan_fuse)atomic_fetch_add_explicit(&topk_nan_fuse_counters[TN_ENCODED],1,memory_order_relaxed);
+    return 1;
+}
+
+static int topk_rows_causal_nan_shuffle(myds_metal_buffer_t *ids,const myds_metal_buffer_t *scores,
+    uint32_t cols,uint32_t top,uint32_t rows,uint32_t start,uint32_t ratio,myds_v41_gpu_scratch_t *s) {
+    const char *prefix=getenv("MYDS_INDEXER_TOPK_PREFIX_MERGE"),*nan=getenv("MYDS_INDEXER_TOPK_NAN_FUSE");
+    if(!prefix||strcmp(prefix,"1")||!nan||strcmp(nan,"1")||!rows||!cols||cols>INT32_MAX||
+       !top||top>cols||top>512u||(ratio&&start==UINT32_MAX))
+        return topk_rows_causal(ids,scores,cols,top,rows,start,ratio,s);
+    const uint32_t max=myds_metal_kernel_max_threads(ratio?
+        "kernel_argsort_f32_i32_desc_causal":"kernel_argsort_f32_i32_desc");
+    uint32_t nth=1u;
+    if(max)while(nth<cols&&2u*nth<=max)nth*=2u;
+    const uint32_t npr=(cols+nth-1u)/nth,block=top<nth?top:nth,last=cols-(npr-1u)*nth;
+    const uint32_t work=npr==1u?top:(npr-1u)*block+(last<block?last:block);
+    const uint32_t layout=ratio?(npr==1u?top:cols):work;
+    if(max&&(npr<16u||layout<=2u*block))return topk_rows_causal(ids,scores,cols,top,rows,start,ratio,s);
+    atomic_fetch_add_explicit(&topk_nan_shuffle_requests,1u,memory_order_relaxed);
+    const int ok=max&&topk_rows_causal_nan_shuffle_encode(ids,scores,cols,top,rows,start,ratio,s);
+    atomic_fetch_add_explicit(ok?&topk_nan_shuffle_encoded:&topk_nan_shuffle_failures,1u,memory_order_relaxed);
+    return ok;
+}
+
+static _Atomic uint64_t threshold_host_requests,threshold_host_encoded,threshold_host_errors;
+static bool threshold_test_unavailable;
+int myds_v41_gpu_topk_threshold_enabled(void) { return myds_metal_indexer_topk_threshold_enabled(); }
+void myds_v41_gpu_inject_topk_threshold_unavailable(bool enabled) { threshold_test_unavailable=enabled; }
+void myds_v41_gpu_topk_threshold_counters(myds_v41_gpu_topk_threshold_counters_t *out,bool reset) {
+#define TH_COUNT(field) (reset?atomic_exchange_explicit(&threshold_host_##field,0u,memory_order_relaxed):atomic_load_explicit(&threshold_host_##field,memory_order_relaxed))
+    const myds_v41_gpu_topk_threshold_counters_t value={TH_COUNT(requests),TH_COUNT(encoded),TH_COUNT(errors)};
+#undef TH_COUNT
+    if(out)*out=value;
+}
+int myds_v41_gpu_topk_threshold_stats(myds_v41_gpu_topk_threshold_stats_t *out,bool reset) {
+    uint32_t v[9]={0};const int ok=myds_metal_indexer_topk_threshold_stats(v,reset);
+    if(out)*out=(myds_v41_gpu_topk_threshold_stats_t){v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8]};
+    return ok;
+}
+int myds_v41_gpu_topk_threshold_debug(const myds_v41_gpu_scratch_t *s,
+    uint32_t control[12],uint32_t pairs[2048]) {
+    uint32_t completed[9];
+    if(!s||!control||!pairs||!s->threshold_control||!s->threshold_pairs||
+       !myds_metal_indexer_topk_threshold_stats(completed,false)||
+       !myds_metal_buffer_native_valid(s->threshold_control)||
+       !myds_metal_buffer_native_valid(s->threshold_pairs)||
+       myds_metal_buffer_size(s->threshold_control)<48u||
+       myds_metal_buffer_size(s->threshold_pairs)<8192u)return 0;
+    memcpy(control,myds_metal_buffer_data(s->threshold_control),48u);
+    memcpy(pairs,myds_metal_buffer_data(s->threshold_pairs),8192u);
+    return 1;
+}
+static int threshold_workspace(myds_v41_gpu_scratch_t *s) {
+    if(!s->threshold_parts)s->threshold_parts=myds_metal_buffer_alloc(256u*16u);
+    if(!s->threshold_control)s->threshold_control=myds_metal_buffer_alloc(12u*4u);
+    if(!s->threshold_hist)s->threshold_hist=myds_metal_buffer_alloc(256u*256u*4u);
+    if(!s->threshold_offsets)s->threshold_offsets=myds_metal_buffer_alloc(256u*8u);
+    if(!s->threshold_pairs)s->threshold_pairs=myds_metal_buffer_alloc(1024u*8u);
+    return s->threshold_parts&&s->threshold_control&&s->threshold_hist&&s->threshold_offsets&&s->threshold_pairs;
+}
+static int threshold_encode(myds_metal_buffer_t *ids,const myds_metal_buffer_t *scores,
+                            uint32_t cols,myds_v41_gpu_scratch_t *s) {
+    if(!s||cols<512u||cols>262144u||cols>s->max_comp||!floats(ids,512u)||!floats(scores,cols)||
+       threshold_test_unavailable)return 0;
+    const char *nan_env=getenv("MYDS_INDEXER_TOPK_NAN_FUSE");
+    if(nan_env&&strcmp(nan_env,"0")&&strcmp(nan_env,"1"))return 0;
+    // Preflight every candidate/reference PSO and resource before any GPU write.
+    if(!myds_metal_indexer_topk_threshold_prepare()||!threshold_workspace(s))return 0;
+    uint32_t max_threads=myds_metal_kernel_max_threads("kernel_argsort_f32_i32_desc"),nth=1u;
+    if(!max_threads)return 0;
+    while(nth<cols&&2u*nth<=max_threads)nth*=2u;
+    const uint32_t npr=(cols+nth-1u)/nth,blocktop=nth<512u?nth:512u;
+    const uint32_t last=cols-(npr-1u)*nth;
+    const uint32_t work=npr==1u?512u:(npr-1u)*blocktop+(last<blocktop?last:blocktop);
+    const uint32_t parts=(cols+1023u)/1024u;
+    myds_metal_buffer_t *stats=myds_metal_indexer_topk_threshold_stats_buffer();
+    const myds_metal_buffer_t *all[]={scores,ids,s->sort_a,s->sort_b,s->threshold_parts,
+        s->threshold_control,s->threshold_hist,s->threshold_offsets,s->threshold_pairs,stats};
+    const size_t sizes[]={(size_t)cols*4u,512u*4u,(size_t)work*4u,(size_t)work*4u,
+        (size_t)parts*16u,48u,(size_t)parts*256u*4u,(size_t)parts*8u,8192u,36u};
+    const size_t align[]={4u,4u,4u,4u,16u,4u,4u,8u,8u,4u};
+    for(size_t i=0;i<10u;i++) {
+        if(!myds_metal_buffer_native_valid(all[i])||myds_metal_buffer_size(all[i])<sizes[i]||
+           myds_metal_buffer_offset(all[i])%align[i])return 0;
+        for(size_t j=0;j<i;j++)if(buffer_ranges_overlap(all[i],sizes[i],all[j],sizes[j]))return 0;
+    }
+    const char *prefix_env=getenv("MYDS_INDEXER_TOPK_PREFIX_MERGE");
+    const bool prefix=npr>=16u&&work>2u*blocktop&&prefix_env&&strcmp(prefix_env,"1")==0;
+    struct {uint32_t cols,parts;} a={cols,parts};
+    // Joins previous readers before overwriting every reused scratch plane and
+    // orders upstream scores. All later RAW joins occur without CPU flag reads.
+    myds_metal_barrier_buffers(all,10u);
+    const myds_metal_buffer_t *range[]={scores,s->threshold_parts};
+    if(!dispatch("kernel_myds_topk_threshold_range_parts",&a,sizeof(a),range,2,parts,1,1,256,1,1,0))return 0;
+    myds_metal_barrier_buffer(s->threshold_parts);
+    const myds_metal_buffer_t *reduce[]={s->threshold_parts,s->threshold_control};
+    if(!dispatch("kernel_myds_topk_threshold_range_reduce",&a,sizeof(a),reduce,2,1,1,1,256,1,1,0))return 0;
+    myds_metal_barrier_buffer(s->threshold_control);
+    const myds_metal_buffer_t *hist[]={scores,s->threshold_control,s->threshold_hist};
+    if(!dispatch("kernel_myds_topk_threshold_hist_parts",&a,sizeof(a),hist,3,parts,1,1,256,1,1,0))return 0;
+    myds_metal_barrier_buffer(s->threshold_hist);
+    const myds_metal_buffer_t *hr[]={s->threshold_hist,s->threshold_control,s->threshold_offsets};
+    if(!dispatch("kernel_myds_topk_threshold_hist_reduce",&a,sizeof(a),hr,3,1,1,1,256,1,1,0))return 0;
+    const myds_metal_buffer_t *hdeps[]={s->threshold_control,s->threshold_offsets};
+    myds_metal_barrier_buffers(hdeps,2u);
+    const myds_metal_buffer_t *compact[]={scores,s->threshold_control,s->threshold_offsets,s->threshold_pairs};
+    if(!dispatch("kernel_myds_topk_threshold_compact",&a,sizeof(a),compact,4,parts,1,1,256,1,1,0))return 0;
+    const myds_metal_buffer_t *cdeps[]={s->threshold_control,s->threshold_pairs};
+    myds_metal_barrier_buffers(cdeps,2u);
+    const myds_metal_buffer_t *final[]={s->threshold_control,s->threshold_pairs,ids,stats};
+    if(!dispatch("kernel_myds_topk_threshold_final",&a,sizeof(a),final,4,1,1,1,512,1,1,8192u))return 0;
+    myds_metal_barrier_buffer(s->threshold_control);
+    struct sort_args sa={.ne00=cols,.ne01=1,.ne02=1,.ne03=1,.nb00=4,
+        .nb01=(uint64_t)cols*4,.nb02=(uint64_t)cols*4,.nb03=(uint64_t)cols*4,
+        .ne0=work,.ne1=1,.ne2=1,.ne3=1,.top_k=blocktop,.causal_start=0,.causal_ratio=0};
+    const myds_metal_buffer_t *sb[]={scores,npr==1u?ids:s->sort_a,s->threshold_control};
+    if(!dispatch("kernel_myds_argsort_f32_i32_desc_threshold_guarded",&sa,sizeof(sa),sb,3,
+                 npr,1,1,nth,1,1,((size_t)nth*8u+15u)&~(size_t)15u))return 0;
+    myds_metal_buffer_t *cur=s->sort_a,*next=s->sort_b;
+    for(uint32_t len=blocktop;len<work;len*=2u) {
+        myds_metal_barrier_buffer(cur);
+        const uint32_t nm=(work+2u*len-1u)/(2u*len);
+        struct {struct merge_args merge;uint32_t keep,prefix;} ma={
+            {.ne00=cols,.ne01=1,.ne02=1,.ne03=1,.nb00=4,.nb01=(uint64_t)cols*4,
+             .nb02=(uint64_t)cols*4,.nb03=(uint64_t)cols*4,.ne0=work,.ne1=1,.ne2=1,.ne3=1,
+             .top_k=nm==1u?512u:work,.len=len,.block_width=nth,.block_top_k=blocktop,
+             .causal_start=0,.causal_ratio=0},512u,prefix?1u:0u};
+        const myds_metal_buffer_t *mb[]={scores,cur,nm==1u?ids:next,s->threshold_control};
+        if(!dispatch("kernel_myds_argsort_merge_f32_i32_desc_threshold_guarded",&ma,sizeof(ma),mb,4,
+                     nm,1,1,len<512u?len:512u,1,1,0))return 0;
+        myds_metal_buffer_t *tmp=cur;cur=next;next=tmp;
+    }
+    myds_metal_barrier_buffer(ids);
+    return 1;
+}
+int myds_v41_gpu_topk_threshold_candidate(myds_metal_buffer_t *ids,
+    const myds_metal_buffer_t *scores,uint32_t cols,myds_v41_gpu_scratch_t *s) {
+    atomic_fetch_add_explicit(&threshold_host_requests,1u,memory_order_relaxed);
+    const int ok=threshold_encode(ids,scores,cols,s);
+    atomic_fetch_add_explicit(ok?&threshold_host_encoded:&threshold_host_errors,1u,memory_order_relaxed);
+    return ok;
+}
+int myds_v41_gpu_topk_threshold(myds_metal_buffer_t *ids,const myds_metal_buffer_t *scores,
+    uint32_t cols,uint32_t top,myds_v41_gpu_scratch_t *s) {
+    if(!myds_v41_gpu_topk_threshold_enabled()||top!=512u||cols<8192u||cols>262144u)
+        return topk_rows_causal(ids,scores,cols,top,1,0,0,s);
+    return myds_v41_gpu_topk_threshold_candidate(ids,scores,cols,s);
+}
 int myds_v41_gpu_topk(myds_metal_buffer_t *ids,const myds_metal_buffer_t *scores,
     uint32_t n_cols,uint32_t top,myds_v41_gpu_scratch_t *s) {
+    if(myds_v41_gpu_topk_nan_shuffle_enabled())return topk_rows_causal_nan_shuffle(ids,scores,n_cols,top,1,0,0,s);
     return topk_rows_causal(ids,scores,n_cols,top,1,0,0,s);
 }
 int myds_v41_gpu_topk_causal(myds_metal_buffer_t *ids,const myds_metal_buffer_t *scores,
     uint32_t n_cols,uint32_t top,uint32_t n_rows,uint32_t causal_start,uint32_t causal_ratio,
     myds_v41_gpu_scratch_t *s) {
+    if(myds_v41_gpu_topk_nan_shuffle_enabled())return topk_rows_causal_nan_shuffle(ids,scores,n_cols,top,n_rows,causal_start,causal_ratio,s);
     return topk_rows_causal(ids,scores,n_cols,top,n_rows,causal_start,causal_ratio,s);
 }
 int myds_v41_gpu_topkmask(myds_metal_buffer_t *mask,const myds_metal_buffer_t *ids,

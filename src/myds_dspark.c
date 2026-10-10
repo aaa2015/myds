@@ -40,8 +40,111 @@ static myds_metal_buffer_t *create_metal_buf(const gguf_tensor_t *t) {
     return buf;
 }
 
+static int dspark_markov_only(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *env = getenv("MYDS_DSPARK_MARKOV_ONLY");
+        mode = env && atoi(env) != 0;
+    }
+    return mode;
+}
+
+static int capture_parse_flag(const char *name) {
+    const char *env = getenv(name);
+    if (!env || strcmp(env, "0") == 0) return 0;
+    if (strcmp(env, "1") == 0) return 1;
+    MYDS_LOG_E("%s must be exactly 0 or 1", name);
+    return -1;
+}
+
+int myds_dspark_capture_parse_mode(void) {
+    const int broad = capture_parse_flag("MYDS_DSPARK_CAPTURE_BYPASS");
+    const int engine = capture_parse_flag("MYDS_ENGINE_CAPTURE_BYPASS");
+    if (broad < 0 || engine < 0) return -1;
+    if (broad && engine) {
+        MYDS_LOG_E("MYDS_DSPARK_CAPTURE_BYPASS=1 and MYDS_ENGINE_CAPTURE_BYPASS=1 are mutually exclusive");
+        return -1;
+    }
+    return engine ? 2 : broad;
+}
+
+bool myds_dspark_capture_configure(myds_dspark_t *ds) {
+    if (!ds) return false;
+    if (ds->capture_configured) return true;
+    const int mode = myds_dspark_capture_parse_mode();
+    if (mode < 0) return false;
+    ds->capture_bypass_mode = mode != 0;
+    ds->capture_engine_only = mode == 2;
+    ds->capture_configured = true;
+    ds->capture_disabled = false;
+    ds->capture_valid_mask = 0;
+    MYDS_LOG_I("DSpark target capture bypass: %d (request neural-consumer scope)", mode != 0);
+    MYDS_LOG_I("Engine target capture bypass: %d (Engine call chain; rejects experimental tree when enabled)", mode == 2);
+    return true;
+}
+
+int myds_dspark_capture_bypass_enabled(const myds_dspark_t *ds) {
+    return ds && ds->capture_bypass_mode;
+}
+int myds_dspark_engine_capture_bypass_enabled(const myds_dspark_t *ds) {
+    return ds && ds->capture_engine_only;
+}
+bool myds_dspark_capture_required(const myds_dspark_t *ds) {
+    return ds && (!ds->capture_bypass_mode || !ds->capture_disabled);
+}
+bool myds_dspark_capture_ready(const myds_dspark_t *ds) {
+    return ds && (!ds->capture_bypass_mode ||
+        (!ds->capture_disabled && ds->capture_valid_mask == 7u && ds->capture_committed));
+}
+void myds_dspark_capture_counters(myds_dspark_t *ds, myds_dspark_capture_counters_t *out, bool reset) {
+    if (out) *out = ds ? ds->capture_counters : (myds_dspark_capture_counters_t){0};
+    if (reset && ds) memset(&ds->capture_counters, 0, sizeof(ds->capture_counters));
+}
+void myds_dspark_capture_invalidate(myds_dspark_t *ds) {
+    if (ds && ds->capture_bypass_mode) {
+        ds->capture_valid_mask = 0;
+        ds->capture_committed = false;
+    }
+}
+void myds_dspark_capture_publish(myds_dspark_t *ds) {
+    if (ds && ds->capture_bypass_mode) {
+        ds->capture_valid_mask = myds_dspark_capture_required(ds) ? 7u : 0u;
+        ds->capture_committed = ds->capture_valid_mask == 7u;
+    }
+}
+void myds_dspark_capture_begin_request(myds_dspark_t *ds, bool speculative_scope) {
+    if (!ds || !ds->capture_bypass_mode) return;
+    ds->capture_disabled = !speculative_scope || dspark_markov_only() || !ds->main_proj;
+    myds_dspark_capture_invalidate(ds);
+}
+void myds_dspark_capture_end_request(myds_dspark_t *ds, bool success) {
+    if (!ds || !ds->capture_bypass_mode) return;
+    if (!success || ds->capture_disabled) myds_dspark_capture_invalidate(ds);
+    ds->capture_disabled = false;
+}
+
+/* Public capture_layer callers need not know the target graph's publisher.
+ * Complete their already encoded three-slot capture before allowing a read;
+ * authoritative forward paths publish themselves and never take this branch. */
+static bool capture_consumer_ready(myds_dspark_t *ds) {
+    if (ds && ds->capture_bypass_mode && myds_dspark_capture_required(ds) &&
+        ds->capture_valid_mask == 7u && !ds->capture_committed) {
+        if (!myds_metal_commit_batch()) {
+            ds->capture_counters.failures++;
+            myds_dspark_capture_invalidate(ds);
+            return false;
+        }
+        myds_dspark_capture_publish(ds);
+    }
+    return myds_dspark_capture_ready(ds);
+}
+
 myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
     if (!path || !vocab_size) return NULL;
+    /* Reject malformed explicit modes before opening/allocating any support
+     * model resources. Publish the mode only once on the completed context. */
+    const int capture_mode = myds_dspark_capture_parse_mode();
+    if (capture_mode < 0) return NULL;
 
     gguf_file_t *gguf = gguf_open(path);
     if (!gguf) {
@@ -62,6 +165,11 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
         return NULL;
     }
     ds->gf = gguf;
+    ds->capture_bypass_mode = capture_mode != 0;
+    ds->capture_engine_only = capture_mode == 2;
+    ds->capture_configured = true;
+    MYDS_LOG_I("DSpark target capture bypass: %d (request neural-consumer scope)", capture_mode != 0);
+    MYDS_LOG_I("Engine target capture bypass: %d (Engine call chain; rejects experimental tree when enabled)", capture_mode == 2);
 
     ds->stage_count = gguf_get_u32(gguf, "dspark.stage_count", 3);
     if (ds->stage_count > MYDS_DSPARK_MAX_STAGES) ds->stage_count = MYDS_DSPARK_MAX_STAGES;
@@ -369,7 +477,12 @@ void myds_dspark_free(myds_dspark_t *ds) {
 }
 
 void myds_dspark_capture_layer(myds_dspark_t *ds, uint32_t layer_idx, const myds_metal_buffer_t *residual) {
-    if (!ds || !residual || !ds->target_hidden_buf || !ds->hc_mean_weights) return;
+    (void)myds_dspark_capture_layer_to(ds, layer_idx, residual, NULL);
+}
+
+int myds_dspark_capture_layer_to(myds_dspark_t *ds, uint32_t layer_idx,
+        const myds_metal_buffer_t *residual, myds_metal_buffer_t *output) {
+    if (!ds) return 1;
     int slot = -1;
     for (int i = 0; i < MYDS_DSPARK_TARGET_LAYERS; i++) {
         if (ds->target_layers[i] == layer_idx) {
@@ -377,8 +490,32 @@ void myds_dspark_capture_layer(myds_dspark_t *ds, uint32_t layer_idx, const myds
             break;
         }
     }
-    if (slot < 0 || !ds->target_slots[slot]) return;
-    (void)myds_metal_v41_hc_weighted_sum(ds->target_slots[slot], residual, ds->hc_mean_weights, MYDS_DSPARK_DIM);
+    if (slot < 0) return 1;
+    ds->capture_counters.requests++;
+    if (!myds_dspark_capture_required(ds)) {
+        ds->capture_counters.bypassed++;
+        myds_dspark_capture_invalidate(ds);
+        return 1;
+    }
+    const bool target_output = output == NULL;
+    if (target_output) output = ds->target_slots[slot];
+    const bool actual_slot = output == ds->target_slots[slot];
+    if (actual_slot && ds->capture_bypass_mode) {
+        /* Any overwrite of a published generation starts a fresh capture.
+         * Direct callers cannot combine a new slot1/2 with old slot0 state. */
+        if (slot == 0 || ds->capture_committed) myds_dspark_capture_invalidate(ds);
+        ds->capture_committed = false;
+    }
+    const int ok = residual && (!target_output || ds->target_hidden_buf) && ds->hc_mean_weights && output &&
+        myds_metal_v41_hc_weighted_sum(output, residual, ds->hc_mean_weights, MYDS_DSPARK_DIM);
+    if (ok) {
+        ds->capture_counters.encoded++;
+        if (actual_slot && ds->capture_bypass_mode) ds->capture_valid_mask |= 1u << slot;
+    } else {
+        ds->capture_counters.failures++;
+        myds_dspark_capture_invalidate(ds);
+    }
+    return ok || !ds->capture_bypass_mode;
 }
 
 static inline float dspark_fp16_to_fp32(uint16_t h) {
@@ -449,7 +586,12 @@ static inline void dspark_update_top2(int32_t tok, float score,
 }
 
 int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_conf, float *out_confidence) {
-    if (!ds || !ctx || !ctx->model || !ds->ws) return 0;
+    if (!ds || !ctx || !ctx->model) return 0;
+    if (!capture_consumer_ready(ds)) {
+        ds->capture_counters.stale_rejections++;
+        return 0;
+    }
+    if (!ds->ws) return 0;
     if (!ds->main_proj || !ds->target_hidden_buf || !ds->draft_logits_buf) return 0;
 
     myds_dspark_workspace_t *ws = ds->ws;
@@ -725,10 +867,10 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
     uint32_t K = draft_cap > 0 && draft_cap < ds->block_size ? draft_cap : ds->block_size;
     if (K > MYDS_DSPARK_DEFAULT_BLOCK_SIZE) K = MYDS_DSPARK_DEFAULT_BLOCK_SIZE;
 
-    static int markov_only = -1;
-    if (__builtin_expect(markov_only < 0, 0)) {
-        const char *env = getenv("MYDS_DSPARK_MARKOV_ONLY");
-        markov_only = (env && atoi(env) != 0) ? 1 : 0;
+    const int markov_only = dspark_markov_only();
+    if (!markov_only && ds->main_proj && !capture_consumer_ready(ds)) {
+        ds->capture_counters.stale_rejections++;
+        return 0;
     }
 
     static float markov_scale = -1.0f;

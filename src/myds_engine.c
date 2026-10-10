@@ -3177,6 +3177,15 @@ static int myds_generate_internal(myds_context_t *ctx,
         return 0;
     }
 
+    /* Decide capture policy before either prefill or prefix restoration.
+     * The speculative loop always consumes the last prompt token with a
+     * complete target forward before its first neural proposal; that step
+     * primes fresh slots even when the reused prefix has no slot snapshot. */
+    const bool serial_probe = decode_env_enabled("MYDS_SPEC_SERIAL_PROBE");
+    const bool spec_requested = !ctx->v41 || myds_v41_batch2_spec_requested(ctx);
+    const bool use_spec = spec_requested || serial_probe;
+    myds_dspark_capture_begin_request(ctx->dspark, use_spec && ctx->cfg.max_new_tokens > 1u);
+
     /* ── Prefix cache（服务端调度）──
      * 上一个请求留下的状态覆盖 token 序列 pcache_tokens[0..pcache_len)，位置与之一一对应。
      * 如果这次 prompt 是它的【严格续写】（公共前缀恰好等于它的全部长度），就从 pcache_len
@@ -3410,6 +3419,7 @@ static int myds_generate_internal(myds_context_t *ctx,
         if (res != 1) {
             MYDS_LOG_W("prefix cache invalidated: prefill returned %d", res);
             ctx->pcache_len = 0;
+            myds_dspark_capture_end_request(ctx->dspark, false);
             if (res == -2) {
                 free(prompt_tokens);
                 if (out_reason) *out_reason = MYDS_STOP_CANCELLED;
@@ -3429,9 +3439,6 @@ static int myds_generate_internal(myds_context_t *ctx,
     if (ctx->v41) (void)myds_v41_low_kv_save(ctx->v41, prompt_tokens, (uint32_t)n_prompt);
     uint32_t max_gen = ctx->cfg.max_new_tokens;
     const char *pld_env_str = getenv("MYDS_PLD");
-    const bool serial_probe = decode_env_enabled("MYDS_SPEC_SERIAL_PROBE");
-    const bool spec_requested = !ctx->v41 || myds_v41_batch2_spec_requested(ctx);
-    const bool use_spec = spec_requested || serial_probe;
     /* A sequential verifier cannot amortize target weight reads. Preserve it
      * only as an explicit measurement/reference arm, avoiding draft and
      * snapshot work in ordinary V4.1 decode. */
@@ -4213,6 +4220,8 @@ static int myds_generate_internal(myds_context_t *ctx,
 
     decode_cycle_finish(ctx);
     ctx->decode_metrics_active = false;
+    myds_dspark_capture_end_request(ctx->dspark,
+        success && stop_reason != MYDS_STOP_ERROR && stop_reason != MYDS_STOP_CANCELLED);
     if (stop_reason == MYDS_STOP_ERROR || !success) ctx->pcache_len = 0;
     /* Prefill reserves the whole prompt but leaves its last token for decode.
      * Cancellation before that step, or a zero-output request, must retain

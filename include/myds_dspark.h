@@ -108,6 +108,10 @@ typedef struct {
     float *conf_features_host;             // 5376 * sizeof(float)
 } myds_dspark_workspace_t;
 
+typedef struct {
+    uint64_t requests, encoded, bypassed, failures, stale_rejections;
+} myds_dspark_capture_counters_t;
+
 struct myds_dspark {
     gguf_file_t *gf;
     uint32_t stage_count;
@@ -138,6 +142,13 @@ struct myds_dspark {
     myds_metal_buffer_t *target_hidden_buf; // 3 * 5120 * sizeof(float)
     myds_metal_buffer_t *target_slots[MYDS_DSPARK_TARGET_LAYERS]; // Views into target_hidden_buf
     myds_metal_buffer_t *hc_mean_weights;   // 4 * sizeof(float) {0.25f, 0.25f, 0.25f, 0.25f}
+    /* Immutable construction mode. Request policy is set before prefill;
+     * unmanaged/direct scalar and Batch2 forwards remain capture-active.
+     * Engine mode excludes the experimental tree API, not those direct APIs. */
+    bool capture_configured, capture_bypass_mode, capture_disabled, capture_committed;
+    bool capture_engine_only;
+    uint32_t capture_valid_mask;
+    myds_dspark_capture_counters_t capture_counters;
     myds_metal_buffer_t *stage_x_buf;       // 5120 * sizeof(float)
     myds_metal_buffer_t *draft_logits_buf;  // vocab_size * sizeof(float)
     float *markov_state_host;               // markov_rank * sizeof(float)
@@ -176,6 +187,32 @@ void myds_dspark_free(myds_dspark_t *ds);
 
 /* Capture target layer hidden state (layer 37, 38, or 39) from residual HC streams */
 void myds_dspark_capture_layer(myds_dspark_t *ds, uint32_t layer_idx, const myds_metal_buffer_t *residual);
+
+/* Shared early parser: strict absent/0/1 flags, with explicit old/new 1
+ * mutually exclusive. Returns -1 on error, 0 reference, 1 old broad bypass,
+ * or 2 Engine-call-chain bypass (experimental tree API excluded). */
+int myds_dspark_capture_parse_mode(void);
+/* Repeating configure never rereads the environment on a live context. */
+bool myds_dspark_capture_configure(myds_dspark_t *ds);
+/* Effective mechanism getter: true for either bypass mode. */
+int myds_dspark_capture_bypass_enabled(const myds_dspark_t *ds);
+int myds_dspark_engine_capture_bypass_enabled(const myds_dspark_t *ds);
+bool myds_dspark_capture_required(const myds_dspark_t *ds);
+bool myds_dspark_capture_ready(const myds_dspark_t *ds);
+void myds_dspark_capture_counters(myds_dspark_t *ds, myds_dspark_capture_counters_t *out, bool reset);
+/* Speculative scope includes serial probing. This setter also excludes the
+ * actual Markov-only mode and missing neural entry projection. */
+void myds_dspark_capture_begin_request(myds_dspark_t *ds, bool speculative_scope);
+void myds_dspark_capture_end_request(myds_dspark_t *ds, bool success);
+void myds_dspark_capture_invalidate(myds_dspark_t *ds);
+/* Only call after a successful target/restore commit which has written all
+ * three slots. Whole rollback instead invalidates; a target retry recaptures. */
+void myds_dspark_capture_publish(myds_dspark_t *ds);
+/* NULL output selects the real target slot; a non-NULL output is a verifier
+ * workspace slot. Candidate failures propagate; mode0 preserves the legacy
+ * unchecked capture behavior. A bypass succeeds without reading/writing GPU. */
+int myds_dspark_capture_layer_to(myds_dspark_t *ds, uint32_t layer_idx,
+    const myds_metal_buffer_t *residual, myds_metal_buffer_t *output);
 
 /* Propose K draft tokens given last token and captured target hidden states */
 uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t last_token, uint32_t draft_cap);

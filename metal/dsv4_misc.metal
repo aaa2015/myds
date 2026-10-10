@@ -7256,3 +7256,92 @@ kernel void kernel_dsv4_softmax_pool_ratio4_direct(
 
     dst[ic * args.head_dim + id] = acc/sum;
 }
+
+// Explicit scalar head-slot candidate: 128 key floats + 32 result floats.
+// Original scalar/chunk/compact scorers above remain unchanged.
+kernel void kernel_myds_indexer_score_one_head_slots(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        device const float *mask,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint row [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    if (row >= args.n_rows || args.n_head != 32u || args.head_dim != 128u) {
+        return;
+    }
+    if (args.has_mask && mask[row / 8u] != 0.0f) {
+        if (tid == 0) {
+            scores[row] = -INFINITY;
+        }
+        return;
+    }
+
+    threadgroup float *ktg = shared;
+    threadgroup float *psum = ktg + 128u;
+
+    if (tid < 128u) {
+        ktg[tid] = glm_cache_load_f32_or_f16(indexer_key_cache,
+                                             (uint64_t)row * 128u + tid,
+                                             args.cache_f16);
+    }
+
+    float acc = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint head0 = 0; head0 < 32u; head0 += 4u) {
+        const uint head = head0 + (uint)sg;
+        device const float4 *q4 = (device const float4 *)(q +
+            (uint64_t)head * 128u * sizeof(float));
+        threadgroup const float4 *k4 = (threadgroup const float4 *)ktg;
+
+        float s = dot(q4[lane], k4[lane]);
+        s = simd_sum(s);
+        if (lane == 0) {
+            psum[head] = max(s * args.scale, 0.0f) * weights[head];
+        }
+    }
+
+    // Each head has one writer. Publish once after all independent heads;
+    // the final 32 additions retain the reference head0..31 serial order.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        acc += psum[0];
+        acc += psum[1];
+        acc += psum[2];
+        acc += psum[3];
+        acc += psum[4];
+        acc += psum[5];
+        acc += psum[6];
+        acc += psum[7];
+        acc += psum[8];
+        acc += psum[9];
+        acc += psum[10];
+        acc += psum[11];
+        acc += psum[12];
+        acc += psum[13];
+        acc += psum[14];
+        acc += psum[15];
+        acc += psum[16];
+        acc += psum[17];
+        acc += psum[18];
+        acc += psum[19];
+        acc += psum[20];
+        acc += psum[21];
+        acc += psum[22];
+        acc += psum[23];
+        acc += psum[24];
+        acc += psum[25];
+        acc += psum[26];
+        acc += psum[27];
+        acc += psum[28];
+        acc += psum[29];
+        acc += psum[30];
+        acc += psum[31];
+        scores[row] = acc;
+    }
+}

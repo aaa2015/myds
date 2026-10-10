@@ -78,6 +78,12 @@ int myds_v41_gpu_qkv_finish(myds_metal_buffer_t *q,myds_metal_buffer_t *kv,
     myds_metal_buffer_t *window,uint32_t pos,bool compressed);
 /* 0 BF16, 1 FP8 E8M0 scales, 2 FP4 E8M0 scales, 3 FP4 E4M3 scales. */
 int myds_v41_gpu_quant(myds_metal_buffer_t *x,uint32_t width,uint32_t rows,uint32_t mode);
+/* Explicit opt-in diagnostic API: one contiguous indexer row, heads1 or
+ * heads32, fixed width128 / forward compressed RoPE / mode2 E2M1. Requires
+ * immutable MYDS_INDEXER_ROPE_QUANT_FUSE=1. The generic RoPE/quant APIs above
+ * always retain their reference dispatches; Engine scope is supplied by the
+ * ordinary scalar call sites, not inferred here from token count or env. */
+int myds_v41_gpu_indexer_rope_quant(myds_metal_buffer_t *x,uint32_t heads,uint32_t pos);
 /* Even positions cache kv/scores; odd positions write the pooled output. */
 int myds_v41_gpu_pool2(myds_metal_buffer_t *out,const myds_metal_buffer_t *kv,
     const myds_metal_buffer_t *scores,myds_metal_buffer_t *previous_kv,
@@ -104,6 +110,25 @@ int myds_v41_gpu_indexscores_masked(myds_metal_buffer_t *scores,const myds_metal
 int myds_v41_gpu_indexscores_masked_bf16(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
     const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,
     const myds_metal_buffer_t *mask,uint32_t n_comp,uint32_t n_heads);
+/* Initialization-time MYDS_INDEXER_HEAD_SLOTS accepts only absent/0/1. The
+ * explicit candidate supports one scalar query, 32 heads and head_dim=128;
+ * F32/BF16 keys and an optional original block mask retain their old meaning.
+ * It never retries the reference scorer or CPU after failure. Original scorer
+ * APIs above are always reference, irrespective of this mode. Auto0 callers
+ * supply upstream reader dependencies, score RAW before consumption, and WAR
+ * before reusing scores; the candidate adds no default dependency barriers. */
+int myds_v41_gpu_indexer_head_slots_enabled(void);
+typedef struct { uint64_t requests, encoded, unavailable, failures; }
+    myds_v41_gpu_indexer_head_slots_counters_t;
+/* Host counts: unavailable is a pre-encode subset of failures. Encoded records
+ * an actual dispatch, even if standalone completion subsequently fails; an
+ * enclosing batch's later completion failure remains the caller's contract. */
+void myds_v41_gpu_indexer_head_slots_counters(
+    myds_v41_gpu_indexer_head_slots_counters_t *out,bool reset);
+int myds_v41_gpu_indexscores_head_slots(myds_metal_buffer_t *scores,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *cache,const myds_metal_buffer_t *mask,
+    uint32_t n_comp,uint32_t n_heads,bool cache_bf16);
 /* Optional 32-head decode scorer: expand the unique selected block IDs (8
  * original rows/block), write the original dense score locations, and leave
  * every other row at -INFINITY. The caller must pass all allowed block IDs
@@ -150,6 +175,42 @@ int myds_v41_gpu_filter_rows(myds_metal_buffer_t *scores,const myds_metal_buffer
     uint32_t n_comp,uint32_t rows,uint32_t start,uint32_t ratio,uint32_t mask_stride);
 int myds_v41_gpu_topk(myds_metal_buffer_t *ids,const myds_metal_buffer_t *scores,
     uint32_t n_cols,uint32_t top,myds_v41_gpu_scratch_t *scratch);
+/* Immutable MYDS_INDEXER_TOPK_NAN_SHUFFLE=absent/0/1. Only the original
+ * prefix eligibility with NAN_FUSE=1 opts into independent scalar/causal PSOs.
+ * Reference nth, partition/merge order, IEEE flag planes and joins are retained.
+ * Explicit eligible failures reject without dense/CPU fallback; counters are
+ * host whole-chain encoding decisions, not command-buffer completion. */
+int myds_v41_gpu_topk_nan_shuffle_enabled(void);
+typedef struct { uint64_t requests, encoded, failures; } myds_v41_gpu_topk_nan_shuffle_counters_t;
+void myds_v41_gpu_topk_nan_shuffle_counters(myds_v41_gpu_topk_nan_shuffle_counters_t *out,bool reset);
+/* Immutable init policy MYDS_INDEXER_TOPK_THRESHOLD=absent/0/1. Only the
+ * authoritative ordinary scalar indexer uses the purpose API; generic top-k,
+ * block selection, prefill and private speculative graphs remain reference. */
+int myds_v41_gpu_topk_threshold_enabled(void);
+typedef struct { uint64_t requests, encoded, errors; } myds_v41_gpu_topk_threshold_counters_t;
+void myds_v41_gpu_topk_threshold_counters(myds_v41_gpu_topk_threshold_counters_t *out,bool reset);
+typedef struct {
+    uint64_t validated, adopted, fallback, nan, inf, insufficient, capacity, certificate, tie;
+} myds_v41_gpu_topk_threshold_stats_t;
+/* Actual GPU decisions, uint32 accumulators promoted to uint64. Read/reset only
+ * after the caller's existing completed synchronization; pending work returns
+ * zero without waiting or resetting. No buffer (default0) returns success/0s.
+ * Reset per request before encoding; accumulation must remain below 2^32. */
+int myds_v41_gpu_topk_threshold_stats(myds_v41_gpu_topk_threshold_stats_t *out,bool reset);
+/* Completed-batch diagnostic readback only. No allocation, dispatch or wait;
+ * pending GPU work/missing workspace rejects. Pairs are meaningful only when
+ * final sorting ran (adopted or tie/certificate after a successful compact),
+ * and may be stale for NaN/Inf/insufficient/capacity early fallback. */
+int myds_v41_gpu_topk_threshold_debug(const myds_v41_gpu_scratch_t *scratch,
+    uint32_t control[12],uint32_t pairs[2048]);
+int myds_v41_gpu_topk_threshold(myds_metal_buffer_t *ids,const myds_metal_buffer_t *scores,
+    uint32_t n_cols,uint32_t top,myds_v41_gpu_scratch_t *scratch);
+/* Explicit diagnostic, independent of policy. Scalar Top512 with 512..262144
+ * scores; all PSO/buffer preflight failures reject before writes. GPU numerical
+ * guard failure executes the preencoded original reference, never a CPU wait. */
+int myds_v41_gpu_topk_threshold_candidate(myds_metal_buffer_t *ids,
+    const myds_metal_buffer_t *scores,uint32_t n_cols,myds_v41_gpu_scratch_t *scratch);
+void myds_v41_gpu_inject_topk_threshold_unavailable(bool enabled);
 /* 按行批量 + 逐行因果宽度（与 kernel_argsort_f32_i32_desc_causal 配套）：
  * ids 是 n_rows × top 行主序，scores 是 n_rows × n_cols 行主序；
  * 中间结果用 scratch 里的 chunk_tmp_a/b（大小为 MYDS_V41_INDEXER_BATCH_FLOATS），

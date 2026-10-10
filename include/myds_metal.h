@@ -17,6 +17,71 @@ typedef struct myds_metal_buffer myds_metal_buffer_t;
 int  myds_metal_init(const char *shader_dir);
 void myds_metal_cleanup(void);
 
+/* Independent F16 GEMV BF16-store experiment. The parser performs no Metal
+ * operation: absent/"0" -> 0, "1" -> 1, all other values -> -1. The mode is
+ * published only by successful Metal initialization, never reread at launch,
+ * and reset by cleanup. Explicit1 requires all NSG1..8 candidate PSOs. */
+int myds_metal_f16_gemv_bf16_fuse_parse_mode(void);
+int myds_metal_f16_gemv_bf16_fuse_enabled(void);
+typedef struct { uint64_t requests, encoded, failures; }
+    myds_metal_f16_gemv_bf16_fuse_counters_t;
+/* Per-field relaxed snapshots; reset belongs to an idle/exclusive boundary.
+ * Requests/failures count explicit API calls. Encoded counts dispatches, not
+ * completed GPU work; outside-batch completion failure may count both encoded
+ * and failure, while an enclosing batch failure is reported by its caller. */
+void myds_metal_f16_gemv_bf16_fuse_counters(
+    myds_metal_f16_gemv_bf16_fuse_counters_t *out, bool reset);
+/* Explicit candidate: F16 weights, one F32 input row, NR2 and the unchanged
+ * input-width NSG/reduction, with BF16 values stored as F32. Requires mode1;
+ * no CPU/reference fallback. Width must be a positive multiple of four.
+ * Weight/input/output offsets and shared pointers require 8/16/16 alignment.
+ * Odd output widths require one padded weight row because the unchanged NR2
+ * dot loop reads two rows; output has only out_dim words. Output may not
+ * overlap either input range, including distinct no-copy wrappers or views.
+ * With auto barriers off, the caller must join previous input/output users
+ * before launch and join OUT before consuming or reusing any buffers. This
+ * helper adds no defensive join; auto1 retains the common dispatch barrier.
+ * Production opts in only from an explicit ordinary scalar projection scope;
+ * this diagnostic API itself does not infer Engine/decode purpose. */
+int myds_metal_v41_gemv_f16_bf16(myds_metal_buffer_t *out,
+    const myds_metal_buffer_t *weight, const myds_metal_buffer_t *input,
+    uint32_t out_dim, uint32_t in_dim);
+
+/* Independent indexer forward RoPE + mode2 E2M1 candidate. Strict parsing is
+ * CPU-only: absent/"0" -> 0, "1" -> 1, otherwise -1. Successful initialization
+ * publishes an immutable mode; explicit1 requires the separate SIMD32 PSO.
+ * Cleanup unpublishes the mode and releases the PSO. */
+int myds_metal_indexer_rope_quant_fuse_parse_mode(void);
+int myds_metal_indexer_rope_quant_fuse_enabled(void);
+typedef struct { uint64_t requests, encoded, failures; }
+    myds_metal_indexer_rope_quant_fuse_counters_t;
+/* Relaxed per-field host encoding snapshots, reset only when idle/exclusive.
+ * Encoded is not command completion. A standalone completion failure counts
+ * both encoded and failure; an enclosing batch failure belongs to its caller. */
+void myds_metal_indexer_rope_quant_fuse_counters(
+    myds_metal_indexer_rope_quant_fuse_counters_t *out, bool reset);
+/* Internal explicit candidate bridge. One contiguous row of heads1 or heads32,
+ * each 128 F32 values; forward compressed frequencies are supplied by the V4.1
+ * wrapper. In-place, no CPU/reference fallback. Checks device, full range and
+ * actual offset/pointer 4-byte alignment before any writes/dispatch. Auto0
+ * requires caller input/WAR joins and an OUT join before consume/reuse; this
+ * bridge adds no defensive join. Auto1 retains the common dispatch barrier. */
+int myds_metal_indexer_rope_quant_dispatch(myds_metal_buffer_t *x,
+    uint32_t heads, uint32_t pos, const float frequencies[32]);
+
+/* Internal head-slot scorer bridge. Policy is fixed by Metal initialization,
+ * reset by cleanup, and has no public setter. An explicit1 init requires the
+ * independent PSO (SIMD32, 128 threads, 640 dynamic TG bytes). Shape/ranges,
+ * device identity, alignment and writable/read-only overlap are checked before
+ * encoding. Actual dispatch and unavailable status are returned separately so
+ * the V4.1 host counters do not confuse encoding with command completion. */
+int myds_metal_indexer_head_slots_enabled(void);
+int myds_metal_indexer_head_slots_dispatch(myds_metal_buffer_t *scores,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *cache,const myds_metal_buffer_t *mask,
+    uint32_t n_comp,uint32_t n_heads,bool cache_bf16,
+    bool *encoded,bool *unavailable);
+
 /* Initialization-time LM-head experiment. MYDS_LM_HEAD_Q8_NR0 accepts only
  * absent/2/4; absent and 2 retain the original path. NR4 applies solely to
  * Q8_0, one token, out_dim>65536, and keeps NSG8/full F32 logits. Explicit NR4
@@ -59,6 +124,18 @@ int myds_metal_dispatch_kernel(const char *name, const void *args, size_t args_s
     const uint32_t groups[3], const uint32_t threads[3], size_t threadgroup_memory);
 typedef struct { uint32_t index; bool is_bool; int32_t value; } myds_metal_constant_t;
 uint32_t myds_metal_kernel_max_threads(const char *name);
+/* Independent initialization-time partition-NaN shuffle experiment. Only
+ * absent/0/1 are accepted. Preflight preserves the reference partition size
+ * and validates both sort and merge before the caller writes any scratch. */
+int myds_metal_indexer_topk_nan_shuffle_enabled(void);
+int myds_metal_indexer_topk_nan_shuffle_preflight(bool causal,uint32_t reference_nth);
+int myds_metal_indexer_topk_threshold_enabled(void);
+/* Internal candidate preflight: initializes/checks all independent PSOs and
+ * the init-owned GPU counter buffer without changing policy or waiting. */
+int myds_metal_indexer_topk_threshold_prepare(void);
+myds_metal_buffer_t *myds_metal_indexer_topk_threshold_stats_buffer(void);
+int myds_metal_indexer_topk_threshold_stats(uint32_t words[9],bool reset);
+int myds_metal_buffer_native_valid(const myds_metal_buffer_t *buffer);
 int myds_metal_dispatch_kernel_constants(const char *name, const void *args, size_t args_size,
     const myds_metal_buffer_t *const *buffers, size_t n_buffers,
     const uint32_t groups[3], const uint32_t threads[3], size_t threadgroup_memory,

@@ -387,6 +387,10 @@ static bool v41_spec_snapshot_restore(myds_context_t *ctx, const myds_v41_spec_s
     if (!ctx || !ctx->v41 || !snap || !snap->valid) return false;
     myds_v41_context_t *g = ctx->v41;
 
+    /* Whole rollback has no pre-step slot payload. Reject it as a drafter
+     * input until the authoritative retry captures a complete fresh token. */
+    myds_dspark_capture_invalidate(ctx->dspark);
+
     if (!myds_metal_commit_batch()) return false;
 
     ctx->pos = snap->pos;
@@ -432,6 +436,7 @@ static bool v41_spec_snapshot_restore_partial(myds_context_t *ctx, const myds_v4
     if (keep_count >= snap->window_count) return true;
 
     myds_v41_context_t *g = ctx->v41;
+    myds_dspark_capture_invalidate(ctx->dspark);
     if (!myds_metal_commit_batch()) return false;
 
     ctx->pos = snap->pos + keep_count;
@@ -464,6 +469,11 @@ static bool v41_spec_snapshot_restore_partial(myds_context_t *ctx, const myds_v4
                 memcpy(myds_metal_buffer_data(ctx->dspark->target_slots[s]),
                     myds_metal_buffer_data(snap->first_dspark_slots[s]), MYDS_DSPARK_DIM * sizeof(float));
         }
+        if (ctx->dspark && ctx->dspark->target_slots[0] && ctx->dspark->target_slots[1] &&
+            ctx->dspark->target_slots[2] && snap->first_dspark_slots[0] &&
+            snap->first_dspark_slots[1] && snap->first_dspark_slots[2])
+            myds_dspark_capture_publish(ctx->dspark);
+        else myds_dspark_capture_invalidate(ctx->dspark);
     }
     /* For K=2, rejecting an even-position draft must undo its pool2 carry.
      * An accepted even-position token keeps its newly generated carry. */
@@ -527,7 +537,10 @@ bool myds_v41_spec_snapshot_restore(myds_context_t *ctx, const myds_v41_spec_sna
     const bool ok = v41_spec_snapshot_restore(ctx, snap);
     /* A failed commit may already have executed part of the speculative
      * graph. Do not expose that state as a reusable consecutive prefix. */
-    if (!ok && restoring_live_state) ctx->v41->valid = false;
+    if (!ok && restoring_live_state) {
+        ctx->v41->valid = false;
+        myds_dspark_capture_invalidate(ctx->dspark);
+    }
     if (timed) ctx->decode_stats.rollback_ms += lowkv_now_ms() - t0;
     return ok;
 }
@@ -537,7 +550,10 @@ bool myds_v41_spec_snapshot_restore_partial(myds_context_t *ctx, const myds_v41_
     const bool timed = ctx && ctx->decode_metrics_active && ctx->decode_stats.timing_enabled;
     const double t0 = timed ? lowkv_now_ms() : 0.0;
     const bool ok = v41_spec_snapshot_restore_partial(ctx, snap, keep_count);
-    if (!ok && restoring_live_state) ctx->v41->valid = false;
+    if (!ok && restoring_live_state) {
+        ctx->v41->valid = false;
+        myds_dspark_capture_invalidate(ctx->dspark);
+    }
     if (timed) ctx->decode_stats.rollback_ms += lowkv_now_ms() - t0;
     return ok;
 }
@@ -650,6 +666,17 @@ uint32_t myds_v41_snapshot_get_engram_position(const myds_v41_context_t *g) {
 
 bool myds_v41_snapshot_get_valid(const myds_v41_context_t *g) {
     return g ? g->valid : false;
+}
+
+/* Read-only diagnostics. The caller must already have completed the graph;
+ * these accessors never submit work, change a snapshot or extend its first-step
+ * contract. Returned data is borrowed until the next graph/restore. */
+const float *myds_v41_diagnostic_current_residual(const myds_v41_context_t *g) {
+    return (g && g->valid && g->residual) ? myds_metal_buffer_data(g->residual) : NULL;
+}
+
+const float *myds_v41_diagnostic_current_pre(const myds_v41_context_t *g) {
+    return (g && g->valid && g->pre) ? myds_metal_buffer_data(g->pre) : NULL;
 }
 
 
@@ -2578,6 +2605,25 @@ static int project(myds_metal_buffer_t *out, const myds_metal_buffer_t *w,
     return 1;
 }
 
+/* Opt-in only at the four ordinary indexer/compressor projection call sites.
+ * The generic reference project() and Q8/Engram/speculative helpers retain
+ * their original dispatches. The caller supplies the public scalar logits
+ * scope; neither token count nor a global environment implies that scope. */
+static int project_f16_bf16_scoped(myds_metal_buffer_t *out, const myds_metal_buffer_t *w,
+    const myds_metal_buffer_t *in, uint32_t rows, uint32_t width,
+    ggml_type type, bool round, bool ordinary_allowed) {
+    if (!ordinary_allowed || type != GGML_TYPE_F16 || !round ||
+        !myds_metal_f16_gemv_bf16_fuse_enabled())
+        return project(out, w, in, rows, width, type, round);
+    if (myds_metal_get_auto_barrier()) myds_metal_barrier();
+    else myds_metal_barrier_buffer(in);
+    if (!myds_metal_v41_gemv_f16_bf16(out, w, in, rows, width)) return 0;
+    /* This is the existing projection's final RAW join. The independent
+     * round dispatch and its input RAW join are the only stages removed. */
+    if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(out);
+    return 1;
+}
+
 static bool engram_pair_buffer(const myds_metal_buffer_t *buffer, uint64_t bytes, size_t alignment) {
     if (!buffer || myds_metal_buffer_size(buffer) < bytes ||
         myds_metal_buffer_offset(buffer) % alignment) return false;
@@ -2800,6 +2846,129 @@ static int publish_compressor(myds_context_t *ctx, uint32_t il, uint32_t pos,
     return 1;
 }
 
+/* The reference compressor above remains byte-for-byte intact. This clone
+ * changes only its two rounded F16 projections, preserving pool/RMS/RoPE/
+ * quantization/cache stores and all original dependency joins. */
+static int publish_compressor_f16_bf16_scoped(myds_context_t *ctx, uint32_t il, uint32_t pos,
+                              const myds_metal_buffer_t *x_norm,
+                              const myds_metal_buffer_t *pre_pool_kv,
+                              const myds_metal_buffer_t *pre_pool_score, bool ordinary_allowed) {
+    myds_v41_context_t *g=ctx->v41;
+    const v41_layer_t *l=&ctx->model->v41->layers[il];
+    const uint32_t ratio=ratio_for(il), owner=owner_for(il);
+    if (!ratio || !kv_source(il)) return 1;
+    const uint32_t count=(pos+1u)/ratio;
+#define CHECK(x) do { if (!(x)) return 0; } while (0)
+    const myds_metal_buffer_t *p_kv = pre_pool_kv;
+    if (!p_kv) {
+        CHECK(project_f16_bf16_scoped(g->pool_kv,l->compressor_kv,x_norm,512,V41_DIM,GGML_TYPE_F16,ratio==1,ordinary_allowed));
+        p_kv = g->pool_kv;
+    }
+    if (ratio==2) {
+        const myds_metal_buffer_t *p_score = pre_pool_score;
+        if (!p_score) {
+            CHECK(project(g->pool_score,l->compressor_gate,x_norm,512,V41_DIM,GGML_TYPE_F16,false));
+            p_score = g->pool_score;
+        }
+        if (!myds_metal_get_auto_barrier()) {
+            const myds_metal_buffer_t *pool_deps[] = { p_kv, p_score };
+            myds_metal_barrier_buffers(pool_deps, 2);
+        }
+        CHECK(myds_v41_gpu_pool2(g->latent,p_kv,p_score,
+            g->previous_kv[owner],g->previous_score[owner],512,pos));
+    } else {
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(p_kv);
+        CHECK(myds_metal_buffer_copy(g->latent,0,p_kv,0,512*4u));
+    }
+    if ((pos+1u)%ratio==0) {
+        const uint32_t start=pos+1u-ratio;
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->latent);
+        CHECK(myds_metal_v41_rmsnorm(g->latent,g->latent,l->compressor_norm,512,ctx->model->norm_eps,true));
+        CHECK(project_f16_bf16_scoped(g->index_k,l->index_k,g->latent,128,512,GGML_TYPE_F16,true,ordinary_allowed));
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->index_k);
+        CHECK(myds_metal_v41_rmsnorm(g->index_k,g->index_k,l->index_k_norm,128,ctx->model->norm_eps,true));
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->index_k);
+        CHECK(myds_v41_gpu_rope(g->index_k,128,1,start,true,false));
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->index_k);
+        CHECK(myds_v41_gpu_quant(g->index_k,128,1,2));
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->index_k);
+        CHECK(myds_v41_gpu_pack_bf16(g->index_cache[owner],(size_t)(count-1)*128u,g->index_k,0,128u));
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->latent);
+        CHECK(myds_v41_gpu_rope(g->latent,512,1,start,true,false));
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->latent);
+        CHECK(myds_v41_gpu_quant(g->latent,512,1,3));
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->latent);
+        CHECK(myds_v41_gpu_pack_bf16(g->compressed[owner],(size_t)(count-1)*512u,g->latent,0,512u));
+        if (!myds_metal_get_auto_barrier()) {
+            const myds_metal_buffer_t *comp_out[] = { g->index_cache[owner], g->compressed[owner] };
+            myds_metal_barrier_buffers(comp_out, 2);
+        }
+    }
+#undef CHECK
+    return 1;
+}
+
+/* Independent ordinary-scalar compressor clone. The existing reference and
+ * F16-store candidate above remain byte-for-byte intact. Only the indexer K
+ * RoPE/mode2 pair becomes one dispatch; compressed latent mode3 stays reference.
+ * Rounded F16 projections keep their independent immutable selector. */
+static int publish_compressor_indexer_rope_quant_scoped(myds_context_t *ctx, uint32_t il, uint32_t pos,
+                              const myds_metal_buffer_t *x_norm,
+                              const myds_metal_buffer_t *pre_pool_kv,
+                              const myds_metal_buffer_t *pre_pool_score, bool ordinary_allowed) {
+    myds_v41_context_t *g=ctx->v41;
+    const v41_layer_t *l=&ctx->model->v41->layers[il];
+    const uint32_t ratio=ratio_for(il), owner=owner_for(il);
+    if (!ratio || !kv_source(il)) return 1;
+    const uint32_t count=(pos+1u)/ratio;
+#define CHECK(x) do { if (!(x)) return 0; } while (0)
+    const myds_metal_buffer_t *p_kv = pre_pool_kv;
+    if (!p_kv) {
+        CHECK(project_f16_bf16_scoped(g->pool_kv,l->compressor_kv,x_norm,512,V41_DIM,GGML_TYPE_F16,ratio==1,ordinary_allowed));
+        p_kv = g->pool_kv;
+    }
+    if (ratio==2) {
+        const myds_metal_buffer_t *p_score = pre_pool_score;
+        if (!p_score) {
+            CHECK(project(g->pool_score,l->compressor_gate,x_norm,512,V41_DIM,GGML_TYPE_F16,false));
+            p_score = g->pool_score;
+        }
+        if (!myds_metal_get_auto_barrier()) {
+            const myds_metal_buffer_t *pool_deps[] = { p_kv, p_score };
+            myds_metal_barrier_buffers(pool_deps, 2);
+        }
+        CHECK(myds_v41_gpu_pool2(g->latent,p_kv,p_score,
+            g->previous_kv[owner],g->previous_score[owner],512,pos));
+    } else {
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(p_kv);
+        CHECK(myds_metal_buffer_copy(g->latent,0,p_kv,0,512*4u));
+    }
+    if ((pos+1u)%ratio==0) {
+        const uint32_t start=pos+1u-ratio;
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->latent);
+        CHECK(myds_metal_v41_rmsnorm(g->latent,g->latent,l->compressor_norm,512,ctx->model->norm_eps,true));
+        CHECK(project_f16_bf16_scoped(g->index_k,l->index_k,g->latent,128,512,GGML_TYPE_F16,true,ordinary_allowed));
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->index_k);
+        CHECK(myds_metal_v41_rmsnorm(g->index_k,g->index_k,l->index_k_norm,128,ctx->model->norm_eps,true));
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->index_k);
+        CHECK(myds_v41_gpu_indexer_rope_quant(g->index_k,1u,start));
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->index_k);
+        CHECK(myds_v41_gpu_pack_bf16(g->index_cache[owner],(size_t)(count-1)*128u,g->index_k,0,128u));
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->latent);
+        CHECK(myds_v41_gpu_rope(g->latent,512,1,start,true,false));
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->latent);
+        CHECK(myds_v41_gpu_quant(g->latent,512,1,3));
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->latent);
+        CHECK(myds_v41_gpu_pack_bf16(g->compressed[owner],(size_t)(count-1)*512u,g->latent,0,512u));
+        if (!myds_metal_get_auto_barrier()) {
+            const myds_metal_buffer_t *comp_out[] = { g->index_cache[owner], g->compressed[owner] };
+            myds_metal_barrier_buffers(comp_out, 2);
+        }
+    }
+#undef CHECK
+    return 1;
+}
+
 /* 【整 chunk 批量】prefill 的压缩器（ratio ∈ {1,2}，只跑在 kv_source 层 = 2/8/14/20）。
  * 逐 token 版把每个 token 拆成 3~11 次 dispatch（4 层合计约 5 万次），其中一半是纯搬运
  * （previous 拷贝、latent 拷贝）—— 每次挪 2 KB 却要付约 9 µs 的 dispatch 开销。
@@ -2904,7 +3073,8 @@ static int publish_indexer_one_impl(myds_context_t *ctx, uint32_t il, uint32_t p
                               const myds_metal_buffer_t *pre_index_weights,
                               myds_metal_buffer_t *out_selected,
                               const myds_metal_buffer_t *in_block_mask,
-                              myds_metal_buffer_t *out_block_mask, bool decode_single) {
+                              myds_metal_buffer_t *out_block_mask, bool decode_single,
+                              bool ordinary_indexer_allowed) {
     myds_v41_context_t *g=ctx->v41;
     const v41_layer_t *l=&ctx->model->v41->layers[il];
     const uint32_t ratio=ratio_for(il), owner=owner_for(il);
@@ -2914,17 +3084,21 @@ static int publish_indexer_one_impl(myds_context_t *ctx, uint32_t il, uint32_t p
     if (count && index_source(il)) {
         myds_metal_buffer_t *q_buf = pre_index_q;
         if (!q_buf) {
-            CHECK(project(g->index_q,l->index_q,qr_norm,V41_INDEX_HEADS*128,1280,GGML_TYPE_F16,true));
+            CHECK(project_f16_bf16_scoped(g->index_q,l->index_q,qr_norm,V41_INDEX_HEADS*128,1280,GGML_TYPE_F16,true,ordinary_indexer_allowed));
             q_buf = g->index_q;
         }
         if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(q_buf);
-        CHECK(myds_v41_gpu_rope(q_buf,128,V41_INDEX_HEADS,pos,true,false));
-        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(q_buf);
-        CHECK(myds_v41_gpu_quant(q_buf,128,V41_INDEX_HEADS,2));
+        if (ordinary_indexer_allowed && myds_metal_indexer_rope_quant_fuse_enabled()) {
+            CHECK(myds_v41_gpu_indexer_rope_quant(q_buf,V41_INDEX_HEADS,pos));
+        } else {
+            CHECK(myds_v41_gpu_rope(q_buf,128,V41_INDEX_HEADS,pos,true,false));
+            if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(q_buf);
+            CHECK(myds_v41_gpu_quant(q_buf,128,V41_INDEX_HEADS,2));
+        }
 
         const myds_metal_buffer_t *w_buf = pre_index_weights;
         if (!w_buf) {
-            CHECK(project(g->index_weights,l->index_proj,x_norm,V41_INDEX_HEADS,V41_DIM,GGML_TYPE_F16,true));
+            CHECK(project_f16_bf16_scoped(g->index_weights,l->index_proj,x_norm,V41_INDEX_HEADS,V41_DIM,GGML_TYPE_F16,true,ordinary_indexer_allowed));
             w_buf = g->index_weights;
         }
 
@@ -2944,7 +3118,12 @@ static int publish_indexer_one_impl(myds_context_t *ctx, uint32_t il, uint32_t p
                 CHECK(compact_score>=0);
             }
         }
-        if(!compact_score)CHECK(myds_v41_gpu_indexscores_masked_bf16(g->index_scores,q_buf,w_buf,g->index_cache[owner],b_mask,count,V41_INDEX_HEADS));
+        if(!compact_score) {
+            if(ordinary_indexer_allowed&&myds_v41_gpu_indexer_head_slots_enabled()) {
+                CHECK(myds_v41_gpu_indexscores_head_slots(g->index_scores,q_buf,w_buf,
+                    g->index_cache[owner],b_mask,count,V41_INDEX_HEADS,true));
+            } else CHECK(myds_v41_gpu_indexscores_masked_bf16(g->index_scores,q_buf,w_buf,g->index_cache[owner],b_mask,count,V41_INDEX_HEADS));
+        }
         if (il==20) {
             uint32_t blocks=(count+7)/8,top=block_budget_cap(blocks<2048?blocks:2048);
             if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->index_scores);
@@ -2961,7 +3140,11 @@ static int publish_indexer_one_impl(myds_context_t *ctx, uint32_t il, uint32_t p
         }
         myds_metal_buffer_t *sel = out_selected ? out_selected : g->selected;
         if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->index_scores);
-        CHECK(myds_v41_gpu_topk(sel,g->index_scores,count,count<V41_TOPK?count:V41_TOPK,g->gpu));
+        if(ordinary_indexer_allowed&&myds_v41_gpu_topk_threshold_enabled()) {
+            CHECK(myds_v41_gpu_topk_threshold(sel,g->index_scores,count,count<V41_TOPK?count:V41_TOPK,g->gpu));
+        } else {
+            CHECK(myds_v41_gpu_topk(sel,g->index_scores,count,count<V41_TOPK?count:V41_TOPK,g->gpu));
+        }
         if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(sel);
     }
 #undef CHECK
@@ -2974,7 +3157,7 @@ static int publish_indexer_one(myds_context_t *ctx,uint32_t il,uint32_t pos,
     myds_metal_buffer_t *out_selected,const myds_metal_buffer_t *in_block_mask,
     myds_metal_buffer_t *out_block_mask) {
     return publish_indexer_one_impl(ctx,il,pos,x_norm,qr_norm,pre_index_q,pre_index_weights,
-        out_selected,in_block_mask,out_block_mask,false);
+        out_selected,in_block_mask,out_block_mask,false,false);
 }
 
 /* decode 路径的一份完整发布/选择（= 压缩器 + indexer，逐 token）。 */
@@ -2995,9 +3178,13 @@ static int publish_and_select(myds_context_t *ctx, uint32_t il, uint32_t pos,
 /* Only the authoritative single-token decode opts into compact scoring.
  * Prefill and speculative rows may have different per-row block selections. */
 static int publish_and_select_decode(myds_context_t *ctx,uint32_t il,uint32_t pos,
-    const myds_metal_buffer_t *x_norm,const myds_metal_buffer_t *qr_norm) {
-    if(!publish_compressor(ctx,il,pos,x_norm,NULL,NULL))return 0;
-    return publish_indexer_one_impl(ctx,il,pos,x_norm,qr_norm,NULL,NULL,NULL,NULL,NULL,true);
+    const myds_metal_buffer_t *x_norm,const myds_metal_buffer_t *qr_norm,bool ordinary_indexer_allowed) {
+    if (ordinary_indexer_allowed && myds_metal_indexer_rope_quant_fuse_enabled()) {
+        if (!publish_compressor_indexer_rope_quant_scoped(ctx,il,pos,x_norm,NULL,NULL,true)) return 0;
+    } else if (ordinary_indexer_allowed && myds_metal_f16_gemv_bf16_fuse_enabled()) {
+        if (!publish_compressor_f16_bf16_scoped(ctx,il,pos,x_norm,NULL,NULL,true)) return 0;
+    } else if (!publish_compressor(ctx,il,pos,x_norm,NULL,NULL)) return 0;
+    return publish_indexer_one_impl(ctx,il,pos,x_norm,qr_norm,NULL,NULL,NULL,NULL,NULL,true,ordinary_indexer_allowed);
 }
 
 /* 子组的 token 数：本组最后一个 token 的 count（= 该组分数表的列数）必须让
@@ -3155,6 +3342,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
     myds_v41_model_t *v=m->v41;
     uint32_t il=0;
     const char *phase="input";
+    myds_dspark_capture_invalidate(ctx->dspark);
     if (!g || token<0 || (uint32_t)token>=m->vocab_size || pos>=g->capacity ||
         pos>=ctx->cfg.max_seq_len) return -1;
     if (need_logits && ctx->decode_metrics_active) {
@@ -3270,7 +3458,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
                 CHECK(myds_metal_buffer_copy(g->window[il],(size_t)(pos%128)*512*4u,ctx->kv_act,0,512*4u));
             }
             phase="compressed KV / indexer";
-            CHECK(publish_and_select_decode(ctx,il,pos,ctx->x_norm,ctx->qr_norm));
+            CHECK(publish_and_select_decode(ctx,il,pos,ctx->x_norm,ctx->qr_norm,ordinary_decode_allowed && need_logits && !trace_on));
         } else {
             /* QKV 资源依赖流水线；MYDS_QKV_CONCURRENT=1 才在本局部区域
              * 显式创建 concurrent encoder，默认保留原 encoder 模式。
@@ -3324,7 +3512,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
 
                 CHECK(project_decode_qkv(ctx->q,base->attn_q_b,ctx->qr_norm,V41_HEADS*512,1280,base->attn_q_b_type,false));
                 phase="compressed KV / indexer";
-                CHECK(publish_and_select_decode(ctx,il,pos,ctx->x_norm,ctx->qr_norm));
+                CHECK(publish_and_select_decode(ctx,il,pos,ctx->x_norm,ctx->qr_norm,ordinary_decode_allowed && need_logits && !trace_on));
 
                 myds_metal_barrier_buffer(ctx->q);
                 static int qkv_post_enabled=-1;
@@ -3351,7 +3539,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
                     myds_metal_set_auto_barrier(prev_auto_barrier);
                 }
                 phase="compressed KV / indexer";
-                CHECK(publish_and_select_decode(ctx,il,pos,ctx->x_norm,ctx->qr_norm));
+                CHECK(publish_and_select_decode(ctx,il,pos,ctx->x_norm,ctx->qr_norm,ordinary_decode_allowed && need_logits && !trace_on));
                 phase="attention projections";
                 if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(ctx->qr_norm);
                 CHECK(project_decode_qkv(ctx->q,base->attn_q_b,ctx->qr_norm,V41_HEADS*512,1280,base->attn_q_b_type,false));
@@ -3432,7 +3620,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
         CHECK(myds_v41_moe_pipeline_scoped(ctx,il,(uint32_t)token,pos,g->residual,g->after_attn,g->ffn_split,l->ffn_fn,l->ffn_scale,l->ffn_base,g->flat_norm,g->mix,v->hc_eps,ordinary_decode_allowed && need_logits && !trace_on));
         TRACE("layer_out",g->residual,4*V41_DIM);
         if (ctx->dspark && (il == 37 || il == 38 || il == 39)) {
-            myds_dspark_capture_layer(ctx->dspark, il, g->residual);
+            CHECK(myds_dspark_capture_layer_to(ctx->dspark, il, g->residual, NULL));
         }
         if (decode_split && !trace_on && il + 1u < V41_LAYERS &&
             ((il + 1u) * (uint32_t)decode_split) / V41_LAYERS != (il * (uint32_t)decode_split) / V41_LAYERS) {
@@ -3466,6 +3654,8 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
         }
     }
     g->next_position=pos+1u;
+    if (ctx->dspark && ctx->dspark->capture_valid_mask == 7u)
+        myds_dspark_capture_publish(ctx->dspark);
     return need_logits ? myds_sample_next_token(myds_metal_buffer_data(ctx->logits),m->vocab_size,&ctx->cfg,ctx,NULL,0) : 0;
 fail:
     MYDS_LOG_E("V4.1 native graph failed at pos %u layer %u: %s",pos,il,phase);
@@ -3474,6 +3664,7 @@ fail:
     if (prev_auto_barrier >= 0) {
         myds_metal_set_auto_barrier(prev_auto_barrier);
     }
+    myds_dspark_capture_invalidate(ctx->dspark);
     g->valid=false; return -1;
 #undef CHECK
 #undef TRACE
@@ -3665,6 +3856,16 @@ struct v41_batch2_workspace_s {
     myds_metal_buffer_t *v_moe_out[3];
     myds_metal_buffer_t *v_ffn_out[3];
 };
+
+/* Tree success does not publish its lazy heads to ctx->logits. This borrowed
+ * workspace view is diagnostic only: use immediately after a successful tree
+ * return, and request only heads actually computed by that branch (0 plus 1
+ * for A, 0 plus 2 for B, or just 0 for a miss). Uncomputed heads can be stale. */
+const float *myds_v41_diagnostic_tree_logits(const myds_context_t *ctx, uint32_t row) {
+    if (!ctx || !ctx->v41 || !ctx->v41->valid || !ctx->v41->batch2_ws || row >= 3u) return NULL;
+    myds_metal_buffer_t *head = ctx->v41->batch2_ws->v_logits[row];
+    return head ? myds_metal_buffer_data(head) : NULL;
+}
 
 static void v41_batch2_workspace_free(v41_batch2_workspace_t *ws) {
     if (!ws) return;
@@ -3917,7 +4118,7 @@ bool myds_v41_spec_snapshot_capture_first(myds_context_t *ctx, myds_v41_spec_sna
     if (g->engram) snap->first_engram_history = g->engram->history;
     for (uint32_t s = 0; s < 3; ++s) {
         snap->first_dspark_slots[s] = NULL;
-        if (ctx->dspark && ctx->dspark->target_slots[s]) {
+        if (ctx->dspark && myds_dspark_capture_ready(ctx->dspark) && ctx->dspark->target_slots[s]) {
             memcpy(myds_metal_buffer_data(ws->dspark_slots[0][s]),
                    myds_metal_buffer_data(ctx->dspark->target_slots[s]), MYDS_DSPARK_DIM * sizeof(float));
             snap->first_dspark_slots[s] = ws->dspark_slots[0][s];
@@ -3926,6 +4127,21 @@ bool myds_v41_spec_snapshot_capture_first(myds_context_t *ctx, myds_v41_spec_sna
     snap->first_state_valid = true;
     if (timed) ctx->decode_stats.snapshot_ms += lowkv_now_ms() - t0;
     return true;
+}
+
+/* Preserve legacy mode0's unchecked copies, but a candidate cannot publish
+ * validity after a missing/failed slot copy. The caller commits before publish. */
+static int v41_copy_dspark_slots(myds_context_t *ctx, myds_metal_buffer_t *slots[3]) {
+    myds_dspark_t *ds = ctx->dspark;
+    if (!myds_dspark_capture_required(ds)) return 1;
+    for (uint32_t s = 0; s < 3; ++s) {
+        if (ds->target_slots[s] && slots[s]) {
+            const int copied = myds_metal_buffer_copy(ds->target_slots[s], 0, slots[s], 0,
+                                                      MYDS_DSPARK_DIM * sizeof(float));
+            if (!copied && ds->capture_bypass_mode) return 0;
+        } else if (ds->capture_bypass_mode) return 0;
+    }
+    return 1;
 }
 
 /* 40 层级联前向（Per-Layer Batch-2 GEMV + MoE） */
@@ -3940,6 +4156,7 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         pos >= g->capacity || pos + 1u >= g->capacity ||
         pos >= ctx->cfg.max_seq_len || pos + 1u >= ctx->cfg.max_seq_len) return -1;
 
+    myds_dspark_capture_invalidate(ctx->dspark);
     if (!myds_metal_commit_batch()) return -1;
     if (pos == 0) { g->next_position = 0; g->valid = true; myds_engram_reset(g->engram); }
     if (!g->valid || pos != g->next_position) {
@@ -4145,7 +4362,7 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         if (ctx->dspark && (il == 37 || il == 38 || il == 39) && ctx->dspark->hc_mean_weights) {
             int slot = (il == 37) ? 0 : ((il == 38) ? 1 : 2);
             for (int t = 0; t < 2; t++) {
-                (void)myds_metal_v41_hc_weighted_sum(ws->dspark_slots[t][slot], ws->v_residual[t], ctx->dspark->hc_mean_weights, MYDS_DSPARK_DIM);
+                CHECK(myds_dspark_capture_layer_to(ctx->dspark, il, ws->v_residual[t], ws->dspark_slots[t][slot]));
             }
         }
 
@@ -4179,7 +4396,8 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         snap->first_previous_kv[o] = ws->first_previous_kv[o];
         snap->first_previous_score[o] = ws->first_previous_score[o];
     }
-    for (uint32_t s = 0; s < 3; ++s) snap->first_dspark_slots[s] = ctx->dspark ? ws->dspark_slots[0][s] : NULL;
+    for (uint32_t s = 0; s < 3; ++s) snap->first_dspark_slots[s] =
+        myds_dspark_capture_required(ctx->dspark) ? ws->dspark_slots[0][s] : NULL;
     snap->first_state_valid = true;
 
     if (auth0 == tokens[1] && (!m->tokenizer || auth0 != m->tokenizer->eos_id)) {
@@ -4202,14 +4420,9 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_buffer_copy(g->pre, 0, ws->v_pre[1], 0, 4 * sizeof(float)));
         CHECK(myds_metal_buffer_copy(ctx->logits, 0, ws->v_logits[1], 0, m->vocab_size * sizeof(float)));
 
-        if (ctx->dspark) {
-            for (int s = 0; s < 3; s++) {
-                if (ctx->dspark->target_slots[s] && ws->dspark_slots[1][s]) {
-                    (void)myds_metal_buffer_copy(ctx->dspark->target_slots[s], 0, ws->dspark_slots[1][s], 0, MYDS_DSPARK_DIM * sizeof(float));
-                }
-            }
-        }
+        CHECK(v41_copy_dspark_slots(ctx, ws->dspark_slots[1]));
         CHECK(myds_metal_commit_batch());
+        myds_dspark_capture_publish(ctx->dspark);
 
         myds_metal_set_auto_barrier(prev_auto_barrier);
         if (g->engram) {
@@ -4227,14 +4440,9 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_buffer_copy(g->residual, 0, ws->v_residual[0], 0, 4 * V41_DIM * sizeof(float)));
         CHECK(myds_metal_buffer_copy(g->pre, 0, ws->v_pre[0], 0, 4 * sizeof(float)));
 
-        if (ctx->dspark) {
-            for (int s = 0; s < 3; s++) {
-                if (ctx->dspark->target_slots[s] && ws->dspark_slots[0][s]) {
-                    (void)myds_metal_buffer_copy(ctx->dspark->target_slots[s], 0, ws->dspark_slots[0][s], 0, MYDS_DSPARK_DIM * sizeof(float));
-                }
-            }
-        }
+        CHECK(v41_copy_dspark_slots(ctx, ws->dspark_slots[0]));
         CHECK(myds_metal_commit_batch());
+        myds_dspark_capture_publish(ctx->dspark);
 
         myds_metal_set_auto_barrier(prev_auto_barrier);
         if (g->engram) {
@@ -4262,12 +4470,17 @@ fail:
 int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
                                uint32_t pos, int32_t *out_tokens) {
     if (!ctx || !ctx->v41 || !tokens || !out_tokens) return -1;
+    if (myds_dspark_engine_capture_bypass_enabled(ctx->dspark)) {
+        MYDS_LOG_E("MYDS_ENGINE_CAPTURE_BYPASS excludes the experimental tree API");
+        return -1;
+    }
     myds_model_t *m = ctx->model;
     myds_v41_context_t *g = ctx->v41;
     myds_v41_model_t *v = m->v41;
     if (pos >= g->capacity || pos + 1u >= g->capacity ||
         pos >= ctx->cfg.max_seq_len || pos + 1u >= ctx->cfg.max_seq_len) return -1;
 
+    myds_dspark_capture_invalidate(ctx->dspark);
     if (!myds_metal_commit_batch()) return -1;
     if (pos == 0) { g->next_position = 0; g->valid = true; myds_engram_reset(g->engram); }
     if (!g->valid || pos != g->next_position) {
@@ -4510,7 +4723,7 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
         if (ctx->dspark && (il == 37 || il == 38 || il == 39) && ctx->dspark->hc_mean_weights) {
             int slot = (il == 37) ? 0 : ((il == 38) ? 1 : 2);
             for (int t = 0; t < 3; t++) {
-                (void)myds_metal_v41_hc_weighted_sum(ws->dspark_slots[t][slot], ws->v_residual[t], ctx->dspark->hc_mean_weights, MYDS_DSPARK_DIM);
+                CHECK(myds_dspark_capture_layer_to(ctx->dspark, il, ws->v_residual[t], ws->dspark_slots[t][slot]));
             }
         }
 
@@ -4563,14 +4776,9 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_buffer_copy(g->residual, 0, ws->v_residual[1], 0, 4 * V41_DIM * sizeof(float)));
         CHECK(myds_metal_buffer_copy(g->pre, 0, ws->v_pre[1], 0, 4 * sizeof(float)));
 
-        if (ctx->dspark) {
-            for (int s = 0; s < 3; s++) {
-                if (ctx->dspark->target_slots[s] && ws->dspark_slots[1][s]) {
-                    (void)myds_metal_buffer_copy(ctx->dspark->target_slots[s], 0, ws->dspark_slots[1][s], 0, MYDS_DSPARK_DIM * sizeof(float));
-                }
-            }
-        }
+        CHECK(v41_copy_dspark_slots(ctx, ws->dspark_slots[1]));
         CHECK(myds_metal_commit_batch());
+        myds_dspark_capture_publish(ctx->dspark);
 
         myds_metal_set_auto_barrier(prev_auto_barrier);
         if (g->engram) {
@@ -4602,14 +4810,9 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_buffer_copy(g->residual, 0, ws->v_residual[2], 0, 4 * V41_DIM * sizeof(float)));
         CHECK(myds_metal_buffer_copy(g->pre, 0, ws->v_pre[2], 0, 4 * sizeof(float)));
 
-        if (ctx->dspark) {
-            for (int s = 0; s < 3; s++) {
-                if (ctx->dspark->target_slots[s] && ws->dspark_slots[2][s]) {
-                    (void)myds_metal_buffer_copy(ctx->dspark->target_slots[s], 0, ws->dspark_slots[2][s], 0, MYDS_DSPARK_DIM * sizeof(float));
-                }
-            }
-        }
+        CHECK(v41_copy_dspark_slots(ctx, ws->dspark_slots[2]));
         CHECK(myds_metal_commit_batch());
+        myds_dspark_capture_publish(ctx->dspark);
 
         myds_metal_set_auto_barrier(prev_auto_barrier);
         if (g->engram) {
@@ -4628,14 +4831,9 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_buffer_copy(g->residual, 0, ws->v_residual[0], 0, 4 * V41_DIM * sizeof(float)));
         CHECK(myds_metal_buffer_copy(g->pre, 0, ws->v_pre[0], 0, 4 * sizeof(float)));
 
-        if (ctx->dspark) {
-            for (int s = 0; s < 3; s++) {
-                if (ctx->dspark->target_slots[s] && ws->dspark_slots[0][s]) {
-                    (void)myds_metal_buffer_copy(ctx->dspark->target_slots[s], 0, ws->dspark_slots[0][s], 0, MYDS_DSPARK_DIM * sizeof(float));
-                }
-            }
-        }
+        CHECK(v41_copy_dspark_slots(ctx, ws->dspark_slots[0]));
         CHECK(myds_metal_commit_batch());
+        myds_dspark_capture_publish(ctx->dspark);
 
         myds_metal_set_auto_barrier(prev_auto_barrier);
         if (g->engram) {

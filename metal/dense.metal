@@ -3263,3 +3263,103 @@ template [[host_name("kernel_mul_mm_f16_f32")]]  kernel mul_mm_t kernel_mul_mm<h
 template [[host_name("kernel_mul_mm_q8_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_q4_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_0, 2, dequantize_dense_q4_0, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_q4_K_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float, float2x4>;
+
+// Independent single-token F16 candidate. The reference vector4 template,
+// NR2/K walk/dot/reduction and all batch variants remain unchanged above.
+// Only the final float32 store applies the same BF16 bit rounding as the
+// standalone kernel. NSG remains function constant 600 from input width.
+template<typename T0, typename T04, typename T1, typename T14, short NR0, typename args_t>
+void kernel_mul_mv_f16_f32_bf16_nr2_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NB  = 32;
+    constexpr short NF  = 16;
+    constexpr short NF4 = NF/4;
+
+    const int nb = args.ne00/NB;
+
+    const int r0 = tgpig.x*NR0;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const uint i12 = im%args.ne12;
+    const uint i13 = im/args.ne12;
+
+    const uint64_t offset1 = r1*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
+
+    device const T1  * y  = (device const T1  *) (src1 + offset1);
+    device const T14 * y4 = (device const T14 *) (src1 + offset1);
+
+    device const T0  * ax [NR0];
+    device const T04 * ax4[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (r0 + row)*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+
+        ax [row] = (device const T0  *) ((device char *) src0 + offset0);
+        ax4[row] = (device const T04 *) ((device char *) src0 + offset0);
+    }
+
+    float sumf[NR0] = { 0.f };
+
+    const short ix = tiisg/(NW/NF);
+    const short il = tiisg%(NW/NF);
+
+    const int ib0 = sgitg*NF + ix;
+
+    T14 yl4[NF4];
+
+    device const T14 * yb4 = y4 + (ib0*NB + il*NF)/4;
+
+    for (int ib = ib0; ib < nb; ib += NSG*NF) {
+        for (short i = 0; i < NF4; ++i) {
+            yl4[i] = yb4[i];
+        }
+
+        for (short row = 0; row < NR0; row++) {
+            device const T04 * xb4 = ax4[row] + (ib*NB + il*NF)/4;
+
+            float sumq = 0.f;
+            FOR_UNROLL (short i = 0; i < NF4; ++i) {
+                sumq += dot(float4(xb4[i]), float4(yl4[i]));
+            }
+
+            sumf[row] += sumq;
+        }
+
+        yb4 += NSG*NF*NW/4;
+    }
+
+    for (int i = nb*NB + sgitg*NW + tiisg; i < args.ne00; i += NW*NSG) {
+        for (short row = 0; row < NR0; row++) {
+            sumf[row] += ax[row][i] * y[i];
+        }
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+
+    helper_mv_reduce_and_write<NR0,true>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+}
+
+
+kernel void kernel_mul_mv_f16_f32_4_bf16_nr2(
+        constant ds4_metal_args_mul_mv &args,
+        device const char *src0,
+        device const char *src1,
+        device char *dst,
+        threadgroup char *shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_f16_f32_bf16_nr2_impl<half, half4, float, float4, 2,
+        constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem,
+                                         tgpig, tiisg, sgitg);
+}

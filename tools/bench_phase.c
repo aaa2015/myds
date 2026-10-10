@@ -30,13 +30,22 @@ typedef struct {
     int32_t ids[MAX_OUTPUT_TOKENS];
     double times[MAX_OUTPUT_TOKENS], first, last;
     uint64_t byte_count, bytes_hash, ids_hash;
+    myds_dspark_t *dspark;
+    myds_dspark_capture_counters_t first_dspark_capture;
     myds_v41_gpu_topk_prefix_counters_t first_topk_prefix;
     myds_v41_gpu_topk_nan_fuse_counters_t first_nan_fuse;
+    myds_v41_gpu_topk_nan_shuffle_counters_t first_nan_shuffle;
+    myds_v41_gpu_indexer_head_slots_counters_t first_indexer_head_slots;
+    myds_v41_gpu_topk_threshold_counters_t first_threshold_host;
+    myds_v41_gpu_topk_threshold_stats_t first_threshold_gpu;
+    bool first_threshold_stats_completed;
     myds_metal_batch2_q8_shared_counters_t first_q8_shared;
     myds_metal_lm_head_q8_counters_t first_lm_head_q8;
     myds_v41_engram_project_round_counters_t first_engram_round;
     myds_metal_moe_q2_sum_cache_counters_t first_moe_q2_sum_cache;
     myds_metal_moe_q2_sum_cache_fused_counters_t first_moe_q2_sum_cache_fused;
+    myds_metal_f16_gemv_bf16_fuse_counters_t first_f16_bf16_fuse;
+    myds_metal_indexer_rope_quant_fuse_counters_t first_indexer_rope_quant;
 } capture_t;
 
 static double now_s(void) {
@@ -56,13 +65,20 @@ static void capture(const char *piece, size_t length, int32_t id, void *opaque) 
     const double t = now_s();
     if (c->count == 0) {
         c->first = t;
+        myds_dspark_capture_counters(c->dspark,&c->first_dspark_capture,false);
         myds_v41_gpu_topk_prefix_counters(&c->first_topk_prefix, false);
         myds_v41_gpu_topk_nan_fuse_counters(&c->first_nan_fuse, false);
+        myds_v41_gpu_topk_nan_shuffle_counters(&c->first_nan_shuffle, false);
+        myds_v41_gpu_indexer_head_slots_counters(&c->first_indexer_head_slots, false);
+        myds_v41_gpu_topk_threshold_counters(&c->first_threshold_host, false);
+        c->first_threshold_stats_completed = myds_v41_gpu_topk_threshold_stats(&c->first_threshold_gpu, false) != 0;
         myds_metal_batch2_q8_shared_counters(&c->first_q8_shared, false);
         myds_metal_lm_head_q8_counters(&c->first_lm_head_q8, false);
         myds_v41_engram_project_round_counters(&c->first_engram_round, false);
         myds_metal_moe_q2_sum_cache_counters(&c->first_moe_q2_sum_cache, false);
         myds_metal_moe_q2_sum_cache_fused_counters(&c->first_moe_q2_sum_cache_fused, false);
+        myds_metal_f16_gemv_bf16_fuse_counters(&c->first_f16_bf16_fuse, false);
+        myds_metal_indexer_rope_quant_fuse_counters(&c->first_indexer_rope_quant, false);
     }
     c->last = t;
     if (c->count < MAX_OUTPUT_TOKENS) {
@@ -182,16 +198,24 @@ static bool storage_counters(FILE *json, uint32_t run, const char *phase) {
 
 int main(int argc, char **argv) {
     if (argc < 3 || argc > 7) {
-        fprintf(stderr, "Usage: %s model.gguf request.json [repeats=3 (1..4)] [max_new_tokens=64 (32|64|256|512)] [max_seq_len=262144] [dspark-support.gguf]\n", argv[0]);
+        fprintf(stderr, "Usage: %s model.gguf request.json [repeats=3 (1..5)] [max_new_tokens=64 (32|64|256|512)] [max_seq_len=262144] [dspark-support.gguf]\n", argv[0]);
         return 2;
     }
-    const uint32_t repeats = argc > 3 ? positive(argv[3], 4, "repeats") : 3;
+    const uint32_t repeats = argc > 3 ? positive(argv[3], 5, "repeats") : 3;
     const uint32_t max_new = argc > 4 ? positive(argv[4], MAX_OUTPUT_TOKENS, "max_new_tokens") : 64;
     const uint32_t max_seq = argc > 5 ? positive(argv[5], UINT32_MAX, "max_seq_len") : 262144;
     if (max_new != 32 && max_new != 64 && max_new != 256 && max_new != 512) {
         fputs("max_new_tokens must be 32, 64, 256 or 512\n", stderr); return 2;
     }
     const char *dspark_path = argc > 6 ? argv[6] : NULL;
+    if (myds_metal_f16_gemv_bf16_fuse_parse_mode() < 0) return 2;
+    if (myds_metal_indexer_rope_quant_fuse_parse_mode() < 0) return 2;
+    const int capture_mode = myds_dspark_capture_parse_mode();
+    if (capture_mode < 0) return 2;
+    if (capture_mode != 0 && !dspark_path) {
+        fputs("Capture bypass mode requires DSpark support; refusing target-only fallback\n", stderr);
+        return 2;
+    }
     const char *prefix = getenv("MYDS_PREFIX_CACHE");
     if (!prefix || strcmp(prefix, "0")) { fputs("Set MYDS_PREFIX_CACHE=0 for full-prefill measurements\n", stderr); return 2; }
     const char *forbidden[] = {"MYDS_PROFILE_PREFILL", "MYDS_PROFILE_SPLIT", "MYDS_PROFILE_SPLIT2",
@@ -246,7 +270,7 @@ int main(int argc, char **argv) {
         "MYDS_DISABLE_MOE_MM", "MYDS_DECODE_SPLIT", "MYDS_ATTN_GATHER", "MYDS_SUFFIX_SHRINK", "MYDS_SUFFIX_SHRINK_SHIFT",
         "MYDS_RESIDENCY_KEEP_ALIVE_S", "MYDS_RESIDENCY_HB_MS", "MYDS_NO_RESIDENCY_HB", "MYDS_NO_PREFIX_SNAPSHOT",
         "MYDS_CHUNK_KEY_MAX", "MYDS_ATTN_KEYS_CLAMP", "MYDS_INDEXER_BATCH_FLOATS", "MYDS_INDEXER_TILED",
-        "MYDS_INDEXER_COMPACT_SCORER", "MYDS_INDEXER_TOPK_PREFIX_MERGE", "MYDS_INDEXER_TOPK_NAN_FUSE",
+        "MYDS_INDEXER_COMPACT_SCORER", "MYDS_INDEXER_TOPK_PREFIX_MERGE", "MYDS_INDEXER_TOPK_NAN_FUSE", "MYDS_INDEXER_HEAD_SLOTS",
         "MYDS_BLOCK_BUDGET", "MYDS_DISABLE_MUL_MM", "MYDS_MM_MIN_M", "MYDS_DISABLE_MM_ENGRAM",
         "MYDS_DISABLE_MM_ATTN_A", "MYDS_COMPRESSOR_PER_TOKEN", "MYDS_INDEXER_PER_TOKEN",
         /* 2026-10-05 path selectors: without them two configurations of one
@@ -266,8 +290,9 @@ int main(int argc, char **argv) {
         "MYDS_METAL_CONCURRENT", "MYDS_MOE_CONCURRENT", "MYDS_MOE_PIPELINE",
         "MYDS_MOE_FUSE_EXPAND", "MYDS_MOE_Q2_SUM_CACHE", "MYDS_MOE_Q2_SUM_CACHE_FUSED", "MYDS_MOE_NSG", "MYDS_MOE_DOWN_NSG", "MYDS_SHARED_FUSE", "MYDS_SHARED_NR0",
         "MYDS_ATTN_INDEXER_PIPELINE", "MYDS_ATTN_OUTPUT_PIPELINE", "MYDS_QKV_PIPELINE",
-        "MYDS_FUSE_HC_SUM_RMSNORM", "MYDS_DECODE_Q8_FUSE_BF16", "MYDS_SUFFIX_SHRINK_MIN_TOKENS",
-        "MYDS_DECODE_METRICS", "MYDS_SPEC_SERIAL_PROBE", "MYDS_SPEC_COST_SCHEDULER"};
+        "MYDS_FUSE_HC_SUM_RMSNORM", "MYDS_DECODE_Q8_FUSE_BF16", "MYDS_F16_GEMV_BF16_FUSE", "MYDS_INDEXER_ROPE_QUANT_FUSE", "MYDS_SUFFIX_SHRINK_MIN_TOKENS",
+        "MYDS_DECODE_METRICS", "MYDS_SPEC_SERIAL_PROBE", "MYDS_SPEC_COST_SCHEDULER",
+        "MYDS_DSPARK_CAPTURE_BYPASS", "MYDS_ENGINE_CAPTURE_BYPASS"};
     for (size_t i = 0; i < sizeof(env_names)/sizeof(env_names[0]); ++i) {
         if (i) fputc(',', json); json_string(json, env_names[i]); fputc(':', json); json_string(json, getenv(env_names[i]));
     }
@@ -316,13 +341,14 @@ int main(int argc, char **argv) {
     fprintf(json, ",\"layers\":%u,\"dim\":%u,\"heads\":%u,\"head_dim\":%u,\"vocab_size\":%u,"
         "\"routed_experts\":%u,\"activated_experts\":%u,\"expert_width\":%u,\"shared_experts\":%u,\"native_v41\":%s,"
         "\"dspark_loaded\":%s,\"dspark_load_s\":%.9f,\"dspark_block_size\":%u,\"dspark_stages\":%u,"
-        "\"lm_head_weight_type\":%d,\"moe_q2_sum_cache_mode\":%d,\"moe_q2_sum_cache_fused_mode\":%d}\n",
+        "\"lm_head_weight_type\":%d,\"moe_q2_sum_cache_mode\":%d,\"moe_q2_sum_cache_fused_mode\":%d,\"indexer_head_slots_mode\":%d,\"topk_threshold_mode\":%d,\"topk_nan_shuffle_mode\":%d,\"dspark_capture_bypass_mode\":%d,\"engine_capture_bypass_mode\":%d,\"f16_gemv_bf16_fuse_mode\":%d,\"indexer_rope_quant_fuse_mode\":%d}\n",
         model->n_layers, model->dim, model->n_heads, model->head_dim, model->vocab_size,
         model->n_routed_experts, model->n_activated_experts, model->moe_expert_dim, model->n_shared_experts,
         model->v41 ? "true" : "false", ctx->dspark ? "true" : "false", dspark_load_s,
         ctx->dspark ? ctx->dspark->block_size : 0, ctx->dspark ? ctx->dspark->stage_count : 0,
         (int)model->output_type, myds_metal_moe_q2_sum_cache_enabled(),
-        myds_metal_moe_q2_sum_cache_fused_enabled());
+        myds_metal_moe_q2_sum_cache_fused_enabled(), myds_v41_gpu_indexer_head_slots_enabled(), myds_v41_gpu_topk_threshold_enabled(), myds_v41_gpu_topk_nan_shuffle_enabled(),myds_dspark_capture_bypass_enabled(ctx->dspark),
+        myds_dspark_engine_capture_bypass_enabled(ctx->dspark), myds_metal_f16_gemv_bf16_fuse_enabled(), myds_metal_indexer_rope_quant_fuse_enabled());
     fflush(json);
     int status = 0;
     uint64_t expected_ids = 0, expected_bytes = 0;
@@ -332,27 +358,46 @@ int main(int argc, char **argv) {
     myds_v41_gpu_attention_counters(NULL, true);   /* exclude load/context creation */
 #endif
     for (uint32_t run = 0; run <= repeats; ++run) {
-        capture_t c = {.bytes_hash = seed_hash, .ids_hash = seed_hash};
+        capture_t c = {.bytes_hash = seed_hash, .ids_hash = seed_hash,.dspark=ctx->dspark};
+        myds_dspark_capture_counters(ctx->dspark,NULL,true);
         myds_stop_reason_t reason = MYDS_STOP_ERROR; uint32_t prompt_tokens = 0;
         /* Request-local host path counters; exclude previous requests and load. */
         myds_v41_gpu_indexer_compact_counters(NULL, true);
         myds_v41_gpu_topk_prefix_counters(NULL, true);
         myds_v41_gpu_topk_nan_fuse_counters(NULL, true);
+        myds_v41_gpu_topk_nan_shuffle_counters(NULL, true);
+        myds_v41_gpu_indexer_head_slots_counters(NULL, true);
+        myds_v41_gpu_topk_threshold_counters(NULL, true);
+        if (!myds_v41_gpu_topk_threshold_stats(NULL, true)) {
+            fputs("TopK threshold stats reset attempted before GPU completion\n", stderr); status = 1; break;
+        }
         myds_metal_batch2_q8_shared_counters(NULL, true);
         myds_metal_lm_head_q8_counters(NULL, true);
         myds_v41_engram_project_round_counters(NULL, true);
         myds_metal_moe_q2_sum_cache_counters(NULL, true);
         myds_metal_moe_q2_sum_cache_fused_counters(NULL, true);
+        myds_metal_f16_gemv_bf16_fuse_counters(NULL, true);
+        myds_metal_indexer_rope_quant_fuse_counters(NULL, true);
         if (!storage_counters(json, run, "before")) { status = 1; break; }
         const double start = now_s();
         const int ok = myds_generate_bytes_ex(ctx, prompt, capture, &c, &reason, &prompt_tokens, NULL);
         const double wall_s = now_s() - start;
+        myds_dspark_capture_counters_t dspark_capture={0};
+        myds_dspark_capture_counters(ctx->dspark,&dspark_capture,false);
         myds_v41_gpu_indexer_compact_counters_t compact;
         myds_v41_gpu_indexer_compact_counters(&compact, false);
         myds_v41_gpu_topk_prefix_counters_t topk_prefix;
         myds_v41_gpu_topk_prefix_counters(&topk_prefix, false);
         myds_v41_gpu_topk_nan_fuse_counters_t nan_fuse;
         myds_v41_gpu_topk_nan_fuse_counters(&nan_fuse, false);
+        myds_v41_gpu_topk_nan_shuffle_counters_t nan_shuffle;
+        myds_v41_gpu_topk_nan_shuffle_counters(&nan_shuffle, false);
+        myds_v41_gpu_indexer_head_slots_counters_t indexer_head_slots;
+        myds_v41_gpu_indexer_head_slots_counters(&indexer_head_slots, false);
+        myds_v41_gpu_topk_threshold_counters_t threshold_host = {0};
+        myds_v41_gpu_topk_threshold_stats_t threshold_gpu = {0};
+        myds_v41_gpu_topk_threshold_counters(&threshold_host, false);
+        const bool threshold_stats_completed = myds_v41_gpu_topk_threshold_stats(&threshold_gpu, false) != 0;
         myds_metal_batch2_q8_shared_counters_t q8_shared;
         myds_metal_batch2_q8_shared_counters(&q8_shared, false);
         myds_metal_lm_head_q8_counters_t lm_head_q8;
@@ -363,6 +408,10 @@ int main(int argc, char **argv) {
         myds_metal_moe_q2_sum_cache_counters(&moe_q2_sum_cache, false);
         myds_metal_moe_q2_sum_cache_fused_counters_t moe_q2_sum_cache_fused;
         myds_metal_moe_q2_sum_cache_fused_counters(&moe_q2_sum_cache_fused, false);
+        myds_metal_f16_gemv_bf16_fuse_counters_t f16_bf16_fuse;
+        myds_metal_f16_gemv_bf16_fuse_counters(&f16_bf16_fuse, false);
+        myds_metal_indexer_rope_quant_fuse_counters_t indexer_rope_quant;
+        myds_metal_indexer_rope_quant_fuse_counters(&indexer_rope_quant, false);
         if (!storage_counters(json, run, "after")) { status = 1; break; }
         myds_prefill_stats_t pf; myds_last_prefill_stats(ctx, &pf);
         /* Final logits are read only after the existing generation waits, outside
@@ -434,6 +483,51 @@ int main(int argc, char **argv) {
             nan_fuse.requests, nan_fuse.encoded, nan_fuse.unavailable, nan_fuse.classified_partitions,
             nan_fuse.requests-c.first_nan_fuse.requests, nan_fuse.encoded-c.first_nan_fuse.encoded,
             nan_fuse.unavailable-c.first_nan_fuse.unavailable);
+        fprintf(json, ",\"gpu_topk_nan_shuffle\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64
+            ",\"failures\":%" PRIu64 ",\"decode_requests\":%" PRIu64 ",\"decode_encoded\":%" PRIu64
+            ",\"decode_failures\":%" PRIu64 "}",nan_shuffle.requests,nan_shuffle.encoded,nan_shuffle.failures,
+            nan_shuffle.requests-c.first_nan_shuffle.requests,nan_shuffle.encoded-c.first_nan_shuffle.encoded,
+            nan_shuffle.failures-c.first_nan_shuffle.failures);
+        fputs(",\"gpu_dspark_capture\":{",json);
+#define CAPTURE_JSON(field) \
+        fprintf(json,"\"" #field "\":%" PRIu64 ",\"decode_" #field "\":%" PRIu64, \
+            dspark_capture.field,dspark_capture.field-c.first_dspark_capture.field)
+        CAPTURE_JSON(requests);fputc(',',json);
+        CAPTURE_JSON(encoded);fputc(',',json);
+        CAPTURE_JSON(bypassed);fputc(',',json);
+        CAPTURE_JSON(failures);fputc(',',json);
+        CAPTURE_JSON(stale_rejections);
+#undef CAPTURE_JSON
+        fputc('}',json);
+        fprintf(json, ",\"gpu_indexer_head_slots\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64
+            ",\"unavailable\":%" PRIu64 ",\"failures\":%" PRIu64 ",\"decode_requests\":%" PRIu64
+            ",\"decode_encoded\":%" PRIu64 ",\"decode_unavailable\":%" PRIu64 ",\"decode_failures\":%" PRIu64 "}",
+            indexer_head_slots.requests, indexer_head_slots.encoded, indexer_head_slots.unavailable, indexer_head_slots.failures,
+            indexer_head_slots.requests-c.first_indexer_head_slots.requests,
+            indexer_head_slots.encoded-c.first_indexer_head_slots.encoded,
+            indexer_head_slots.unavailable-c.first_indexer_head_slots.unavailable,
+            indexer_head_slots.failures-c.first_indexer_head_slots.failures);
+        /* GPU decisions are observed only after generation's existing completion
+         * synchronization; no per-TopK wait/readback is introduced here. */
+        fprintf(json, ",\"gpu_topk_threshold\":{\"stats_completed\":%s",
+            threshold_stats_completed && c.first_threshold_stats_completed ? "true" : "false");
+#define THRESHOLD_JSON(field, current, first) \
+        fprintf(json, ",\"" #field "\":%" PRIu64 ",\"decode_" #field "\":%" PRIu64, \
+            (current).field, (current).field - (first).field)
+        THRESHOLD_JSON(requests, threshold_host, c.first_threshold_host);
+        THRESHOLD_JSON(encoded, threshold_host, c.first_threshold_host);
+        THRESHOLD_JSON(errors, threshold_host, c.first_threshold_host);
+        THRESHOLD_JSON(validated, threshold_gpu, c.first_threshold_gpu);
+        THRESHOLD_JSON(adopted, threshold_gpu, c.first_threshold_gpu);
+        THRESHOLD_JSON(fallback, threshold_gpu, c.first_threshold_gpu);
+        THRESHOLD_JSON(nan, threshold_gpu, c.first_threshold_gpu);
+        THRESHOLD_JSON(inf, threshold_gpu, c.first_threshold_gpu);
+        THRESHOLD_JSON(insufficient, threshold_gpu, c.first_threshold_gpu);
+        THRESHOLD_JSON(capacity, threshold_gpu, c.first_threshold_gpu);
+        THRESHOLD_JSON(certificate, threshold_gpu, c.first_threshold_gpu);
+        THRESHOLD_JSON(tie, threshold_gpu, c.first_threshold_gpu);
+#undef THRESHOLD_JSON
+        fputc('}', json);
         fprintf(json, ",\"gpu_batch2_q8_shared\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64
             ",\"failures\":%" PRIu64 ",\"decode_requests\":%" PRIu64 ",\"decode_encoded\":%" PRIu64
             ",\"decode_failures\":%" PRIu64 "}", q8_shared.requests, q8_shared.encoded, q8_shared.failures,
@@ -459,6 +553,16 @@ int main(int argc, char **argv) {
             ",\"decode_failures\":%" PRIu64 "}", moe_q2_sum_cache_fused.requests, moe_q2_sum_cache_fused.encoded, moe_q2_sum_cache_fused.failures,
             moe_q2_sum_cache_fused.requests-c.first_moe_q2_sum_cache_fused.requests, moe_q2_sum_cache_fused.encoded-c.first_moe_q2_sum_cache_fused.encoded,
             moe_q2_sum_cache_fused.failures-c.first_moe_q2_sum_cache_fused.failures);
+        fprintf(json, ",\"gpu_f16_gemv_bf16_fuse\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64
+            ",\"failures\":%" PRIu64 ",\"decode_requests\":%" PRIu64 ",\"decode_encoded\":%" PRIu64
+            ",\"decode_failures\":%" PRIu64 "}", f16_bf16_fuse.requests, f16_bf16_fuse.encoded, f16_bf16_fuse.failures,
+            f16_bf16_fuse.requests-c.first_f16_bf16_fuse.requests, f16_bf16_fuse.encoded-c.first_f16_bf16_fuse.encoded,
+            f16_bf16_fuse.failures-c.first_f16_bf16_fuse.failures);
+        fprintf(json, ",\"gpu_indexer_rope_quant_fuse\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64
+            ",\"failures\":%" PRIu64 ",\"decode_requests\":%" PRIu64 ",\"decode_encoded\":%" PRIu64
+            ",\"decode_failures\":%" PRIu64 "}", indexer_rope_quant.requests, indexer_rope_quant.encoded, indexer_rope_quant.failures,
+            indexer_rope_quant.requests-c.first_indexer_rope_quant.requests, indexer_rope_quant.encoded-c.first_indexer_rope_quant.encoded,
+            indexer_rope_quant.failures-c.first_indexer_rope_quant.failures);
 #ifdef MYDS_V41_GPU_HAS_ATTENTION_COUNTERS
         fprintf(json, ",\"attention_paths\":{\"calls\":%" PRIu64 ",\"gather_calls\":%" PRIu64
             ",\"slab_calls\":%" PRIu64 ",\"head_first_attempts\":%" PRIu64 ",\"head_first_encoded\":%" PRIu64

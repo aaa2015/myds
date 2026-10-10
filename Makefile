@@ -31,6 +31,11 @@ TEST_MOE_DOWN_NSG = $(BIN_DIR)/test_moe_down_nsg
 TEST_MOE_IQ2_LUT = $(BIN_DIR)/test_moe_iq2_lut
 TEST_ATTN_PACKED = $(BIN_DIR)/test_attention_packed
 TEST_TOPK_NAN_FUSE = $(BIN_DIR)/test_topk_nan_fuse
+TEST_TOPK_NAN_SHUFFLE = $(BIN_DIR)/test_topk_nan_shuffle
+TEST_INDEXER_HEAD_SLOTS = $(BIN_DIR)/test_indexer_head_slots
+TEST_TOPK_THRESHOLD = $(BIN_DIR)/test_topk_threshold
+TEST_F16_BF16_FUSE = $(BIN_DIR)/test_f16_bf16_fuse
+TEST_INDEXER_ROPE_QUANT = $(BIN_DIR)/test_indexer_rope_quant
 TEST_BATCH2_Q8_SHARED = $(BIN_DIR)/test_batch2_q8_shared
 TEST_LM_HEAD_Q8 = $(BIN_DIR)/test_lm_head_q8
 TEST_ENGRAM_PROJECT_ROUND = $(BIN_DIR)/test_engram_project_round
@@ -52,6 +57,7 @@ TEST_PLD = $(BIN_DIR)/test_pld
 TEST_KVDSK = $(BIN_DIR)/test_kvdsk
 TEST_P1 = $(BIN_DIR)/test_p1
 TEST_DSPARK_ROLLBACK = $(BIN_DIR)/test_dspark_rollback
+TEST_DSPARK_CAPTURE = $(BIN_DIR)/test_dspark_capture
 TEST_BATCH2_PARITY = $(BIN_DIR)/test_batch2_parity
 TEST_BATCH2_E2E = $(BIN_DIR)/test_batch2_e2e
 TEST_TREE_SPEC = $(BIN_DIR)/test_tree_spec
@@ -63,7 +69,7 @@ DUMP_TENSORS = $(BIN_DIR)/dump_tensors
 METALLIB = $(BIN_DIR)/myds.metallib
 METAL_SRCS = $(wildcard metal/*.metal)
 
-ALL_TESTS = $(TEST_METAL) $(TEST_V41_GPU) $(TEST_ATTN_POLICY) $(TEST_ATTN_VEC) $(TEST_QKV_FUSION) $(TEST_DECODE_Q8) $(TEST_MOE_DOWN_NSG) $(TEST_DEEPER_SSD) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE) $(TEST_CPU) $(TEST_ENGRAM) $(TEST_ALIGN) $(TEST_PLD) $(TEST_KVDSK) $(TEST_P1) $(TEST_DSPARK_ROLLBACK) $(TEST_BATCH2_PARITY) $(TEST_BATCH2_E2E) $(TEST_TREE_SPEC)
+ALL_TESTS = $(TEST_METAL) $(TEST_V41_GPU) $(TEST_ATTN_POLICY) $(TEST_ATTN_VEC) $(TEST_QKV_FUSION) $(TEST_DECODE_Q8) $(TEST_MOE_DOWN_NSG) $(TEST_DEEPER_SSD) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE) $(TEST_CPU) $(TEST_ENGRAM) $(TEST_ALIGN) $(TEST_PLD) $(TEST_KVDSK) $(TEST_P1) $(TEST_DSPARK_ROLLBACK) $(TEST_DSPARK_CAPTURE) $(TEST_BATCH2_PARITY) $(TEST_BATCH2_E2E) $(TEST_TREE_SPEC)
 
 .PHONY: all test clean bench metallib build-tail-init test-tail-init
 
@@ -180,6 +186,42 @@ $(TEST_ATTN_PACKED): tests/test_attention_packed.m src/myds_metal.m src/myds_v41
 $(TEST_TOPK_NAN_FUSE): tests/test_topk_nan_fuse.m src/myds_metal.m src/myds_v41_gpu.c $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc tests/test_topk_nan_fuse.m $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
 
+# Build only. The fixture submits GPU work and belongs to an exclusive window.
+$(TEST_TOPK_NAN_SHUFFLE): tests/test_topk_nan_shuffle.m src/myds_metal.m src/myds_v41_gpu.c $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) -Isrc $< $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
+
+.PHONY: build-topk-nan-shuffle-candidate
+build-topk-nan-shuffle-candidate: $(TEST_TOPK_NAN_SHUFFLE)
+
+# Explicit BUILD ONLY: this native component submits GPU work when run, and
+# must remain outside ALL_TESTS and the ordinary make test recipe.
+$(TEST_INDEXER_HEAD_SLOTS): tests/test_indexer_head_slots.m src/myds_metal.m src/myds_v41_gpu.c $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) -Isrc $< $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
+
+.PHONY: build-indexer-head-slots-candidate
+build-indexer-head-slots-candidate: $(TEST_INDEXER_HEAD_SLOTS)
+
+# Explicit build-only threshold fixture; never part of ALL_TESTS.
+$(TEST_TOPK_THRESHOLD): tests/test_topk_threshold.m src/myds_metal.m src/myds_v41_gpu.c $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) -Isrc $< $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
+
+.PHONY: build-topk-threshold-candidate
+build-topk-threshold-candidate: $(TEST_TOPK_THRESHOLD)
+
+# Explicit build only; the component submits GPU work in an exclusive window.
+$(TEST_F16_BF16_FUSE): tests/test_f16_bf16_fuse.m src/myds_metal.m $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) -Isrc $< $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
+
+.PHONY: build-f16-bf16-fuse-candidate
+build-f16-bf16-fuse-candidate: $(TEST_F16_BF16_FUSE)
+
+# Explicit build only; run the component in an exclusive validation window.
+$(TEST_INDEXER_ROPE_QUANT): tests/test_indexer_rope_quant.m src/myds_metal.m src/myds_v41_gpu.c $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) -Isrc $< $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
+
+.PHONY: build-indexer-rope-quant-candidate
+build-indexer-rope-quant-candidate: $(TEST_INDEXER_ROPE_QUANT)
+
 $(TEST_BATCH2_Q8_SHARED): tests/test_batch2_q8_shared.m src/myds_metal.m $(wildcard include/*.h) $(OBJS_C) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc tests/test_batch2_q8_shared.m $(OBJS_C) $(LDFLAGS) -o $@
 
@@ -263,6 +305,9 @@ $(TEST_P1): tests/test_p1_regressions.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_
 $(TEST_DSPARK_ROLLBACK): tests/test_dspark_rollback.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -Iinclude -o $@ tests/test_dspark_rollback.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS)
 
+$(TEST_DSPARK_CAPTURE): tests/test_dspark_capture.c src/myds_dspark.c $(wildcard include/*.h) $(filter-out $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) | $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ tests/test_dspark_capture.c $(filter-out $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS)
+
 $(TEST_BATCH2_PARITY): tests/test_batch2_parity.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -Iinclude -o $@ tests/test_batch2_parity.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS)
 
@@ -298,6 +343,13 @@ $(BUILD_DIR)/test_v41_decode_state.o: tools/test_v41_decode_state.c tools/refere
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 $(BIN_DIR)/test_v41_decode_state: $(filter-out $(BUILD_DIR)/myds_server.o,$(OBJS_C)) $(OBJS_M) $(BUILD_DIR)/test_v41_decode_state.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
+
+# Explicit real-support Engine lifecycle gate; never run by make test.
+$(BUILD_DIR)/test_engine_capture_state.o: tools/test_engine_capture_state.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+$(BIN_DIR)/test_engine_capture_state: $(OBJS_C) $(OBJS_M) $(BUILD_DIR)/test_engine_capture_state.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
 
 $(BUILD_DIR)/test_engram.o: tests/test_engram.c | $(BUILD_DIR)
@@ -397,6 +449,8 @@ test: $(ALL_TESTS) $(METALLIB)
 	@./$(TEST_P1)
 	@echo ""
 	@./$(TEST_DSPARK_ROLLBACK)
+	@./$(TEST_DSPARK_CAPTURE)
+	@./$(TEST_DSPARK_CAPTURE) --markov-only
 	@echo ""
 	@./$(TEST_BATCH2_PARITY)
 	@echo ""

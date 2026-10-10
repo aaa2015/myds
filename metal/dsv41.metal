@@ -427,3 +427,44 @@ kernel void kernel_dsv41_indexer_scores_packed(
     }
 }
 #endif
+
+/* Independent indexer candidate, one SIMD32 per 128-value head. Keep the
+ * reference RoPE pair->lane mapping/trig and both BF16 outputs in registers.
+ * All tail inputs are read before any stores. Each subsequent quant block
+ * has exactly the reference quantizer's column->lane mapping and simd_max.
+ * The two tail blocks shuffle within this same complete SIMD32 only. */
+struct dsv41_indexer_rope_quant_args {
+    uint heads, pos;
+    float frequencies[32];
+};
+kernel void kernel_dsv41_indexer_rope_quant(
+        constant dsv41_indexer_rope_quant_args &args,
+        device float *x,
+        uint head [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    const ulong base = (ulong)head * 128u;
+    const float theta = float(args.pos) * args.frequencies[lane];
+    const float c = precise::cos(theta);
+    const float s = precise::sin(theta);
+    const ulong i = base + 64u + 2u * lane;
+    const float re = x[i], im = x[i + 1u];
+    const float rotated_re = dsv41_bf16(re * c - im * s);
+    const float rotated_im = dsv41_bf16(re * s + im * c);
+    for (uint block = 0; block < 4u; ++block) {
+        float source;
+        if (block < 2u) {
+            source = x[base + block * 32u + lane];
+        } else {
+            const uint pair = (block - 2u) * 16u + lane / 2u;
+            const float r_re = simd_shuffle(rotated_re, pair);
+            const float r_im = simd_shuffle(rotated_im, pair);
+            source = (lane & 1u) ? r_im : r_re;
+        }
+        /* Preserve quant's BF16 input even for already-rounded RoPE values. */
+        const float value = dsv41_bf16(source);
+        const float amax = simd_max(abs(value));
+        const float scale = dsv41_pow2_ceil(max(amax, 7.052966104933725e-38f) * (1.0f / 6.0f));
+        const float result = copysign(dsv4_e2m1fn_dequant(abs(value) / scale), value) * scale;
+        x[base + block * 32u + lane] = dsv41_bf16(result);
+    }
+}

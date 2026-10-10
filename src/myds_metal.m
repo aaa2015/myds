@@ -71,8 +71,164 @@ static id<MTLComputePipelineState> g_pso_compute_copy_u32x4 = nil;
 static id<MTLSharedEvent>          g_shared_event = nil;
 static uint64_t                    g_shared_event_val = 0;
 static bool                        g_initialized = false;
+static bool g_indexer_head_slots = false;
+static id<MTLComputePipelineState> g_pso_indexer_head_slots = nil;
+static int indexer_head_slots_parse_mode(void) {
+    const char *value = getenv("MYDS_INDEXER_HEAD_SLOTS");
+    if (!value || strcmp(value, "0") == 0) return 0;
+    if (strcmp(value, "1") == 0) return 1;
+    fprintf(stderr, "myds_metal: MYDS_INDEXER_HEAD_SLOTS must be exactly 0 or 1\n");
+    return -1;
+}
+int myds_metal_indexer_head_slots_enabled(void) { return g_indexer_head_slots ? 1 : 0; }
+static bool indexer_head_slots_geometry(void) {
+    const NSUInteger dynamic_bytes = 640u;
+    return g_device && g_pso_indexer_head_slots && g_pso_indexer_head_slots.device == g_device &&
+        g_pso_indexer_head_slots.threadExecutionWidth == 32u &&
+        g_pso_indexer_head_slots.maxTotalThreadsPerThreadgroup >= 128u &&
+        g_device.maxThreadsPerThreadgroup.width >= 32u &&
+        g_device.maxThreadsPerThreadgroup.height >= 4u &&
+        g_device.maxThreadsPerThreadgroup.depth >= 1u &&
+        g_device.maxThreadgroupMemoryLength >= dynamic_bytes &&
+        g_pso_indexer_head_slots.staticThreadgroupMemoryLength <= g_device.maxThreadgroupMemoryLength - dynamic_bytes;
+}
+static int indexer_head_slots_initialize(void) {
+    NSError *error = nil;
+    id<MTLFunction> function = [g_library newFunctionWithName:@"kernel_myds_indexer_score_one_head_slots"];
+    if (function) g_pso_indexer_head_slots = [g_device newComputePipelineStateWithFunction:function error:&error];
+    if (!indexer_head_slots_geometry()) {
+        fprintf(stderr, "myds_metal: explicit indexer head slots PSO/geometry unavailable (%s); refusing fallback\n",
+            error.localizedDescription.UTF8String ?: "function or resource limit");
+        return 0;
+    }
+    return 1;
+}
 static int g_qkv_finish_available = -1;
 static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *g_native_pipelines = nil;
+static bool g_indexer_topk_nan_shuffle = false;
+static int indexer_topk_nan_shuffle_parse_mode(void) {
+    const char *value = getenv("MYDS_INDEXER_TOPK_NAN_SHUFFLE");
+    if (!value || strcmp(value, "0") == 0) return 0;
+    if (strcmp(value, "1") == 0) return 1;
+    fprintf(stderr,"myds_metal: MYDS_INDEXER_TOPK_NAN_SHUFFLE must be exactly 0 or 1\n");
+    return -1;
+}
+int myds_metal_indexer_topk_nan_shuffle_enabled(void) { return g_indexer_topk_nan_shuffle ? 1 : 0; }
+int myds_metal_indexer_topk_nan_shuffle_preflight(bool causal,uint32_t reference_nth) {
+    if (!g_device || !g_library || !reference_nth || reference_nth > 1024u ||
+        (reference_nth & (reference_nth - 1u))) return 0;
+    const char *names[] = {
+        causal ? "kernel_myds_argsort_f32_i32_desc_causal_partition_nan_shuffle" :
+                 "kernel_myds_argsort_f32_i32_desc_partition_nan_shuffle",
+        causal ? "kernel_myds_argsort_merge_f32_i32_desc_causal_partition_prefix_guarded" :
+                 "kernel_myds_argsort_merge_f32_i32_desc_partition_prefix_guarded"};
+    if (!g_native_pipelines) g_native_pipelines = [NSMutableDictionary new];
+    for (unsigned i = 0; i < 2u; ++i) {
+        NSString *name = [NSString stringWithUTF8String:names[i]];
+        id<MTLComputePipelineState> p = g_native_pipelines[name];
+        NSError *error = nil;
+        if (!p) {
+            id<MTLFunction> fn = [g_library newFunctionWithName:name];
+            if (fn) p = [g_device newComputePipelineStateWithFunction:fn error:&error];
+            if (p) g_native_pipelines[name] = p;
+        }
+        const NSUInteger threads = i ? 512u : reference_nth;
+        const NSUInteger dynamic = i ? 0u : (NSUInteger)reference_nth * 8u;
+        if (!p || p.device != g_device || p.threadExecutionWidth != 32u ||
+            threads > p.maxTotalThreadsPerThreadgroup ||
+            threads > g_device.maxThreadsPerThreadgroup.width ||
+            g_device.maxThreadsPerThreadgroup.height < 1u ||
+            g_device.maxThreadsPerThreadgroup.depth < 1u ||
+            dynamic > g_device.maxThreadgroupMemoryLength ||
+            p.staticThreadgroupMemoryLength > g_device.maxThreadgroupMemoryLength - dynamic) {
+            fprintf(stderr,"myds_metal: explicit topk NaN shuffle PSO/geometry unavailable: %s (%s); refusing fallback\n",
+                names[i],error.localizedDescription.UTF8String ?: "function or resource limit");
+            return 0;
+        }
+    }
+    return 1;
+}
+static int indexer_topk_nan_shuffle_initialize(void) {
+    for (unsigned causal = 0; causal < 2u; ++causal) {
+        /* Initialization precedes g_initialized. Query the actual reference
+         * PSO here; the public post-init query correctly rejects this phase. */
+        NSString *name = causal ? @"kernel_argsort_f32_i32_desc_causal" :
+                                  @"kernel_argsort_f32_i32_desc";
+        if (!g_native_pipelines) g_native_pipelines = [NSMutableDictionary new];
+        id<MTLComputePipelineState> reference = g_native_pipelines[name];
+        NSError *error = nil;
+        if (!reference) {
+            id<MTLFunction> fn = [g_library newFunctionWithName:name];
+            if (fn) reference = [g_device newComputePipelineStateWithFunction:fn error:&error];
+            if (reference) g_native_pipelines[name] = reference;
+        }
+        if (!reference) {
+            fprintf(stderr,"myds_metal: topk NaN shuffle reference PSO unavailable: %s (%s)\n",
+                name.UTF8String,error.localizedDescription.UTF8String ?: "function unavailable");
+            return 0;
+        }
+        const uint32_t max = (uint32_t)reference.maxTotalThreadsPerThreadgroup;
+        if (!max) return 0;
+        uint32_t nth = 1u;
+        while (nth <= max / 2u) nth *= 2u;
+        if (!myds_metal_indexer_topk_nan_shuffle_preflight(causal != 0u,nth)) return 0;
+    }
+    return 1;
+}
+static bool g_indexer_topk_threshold = false;
+static myds_metal_buffer_t *g_indexer_topk_threshold_stats = NULL;
+static int indexer_topk_threshold_parse_mode(void) {
+    const char *value=getenv("MYDS_INDEXER_TOPK_THRESHOLD");
+    if(!value||strcmp(value,"0")==0)return 0;
+    if(strcmp(value,"1")==0)return 1;
+    fprintf(stderr,"myds_metal: MYDS_INDEXER_TOPK_THRESHOLD must be exactly 0 or 1\n");
+    return -1;
+}
+int myds_metal_indexer_topk_threshold_enabled(void) { return g_indexer_topk_threshold?1:0; }
+int myds_metal_buffer_native_valid(const myds_metal_buffer_t *b) {
+    return b&&b->mtl_buf&&b->mtl_buf.device==g_device&&b->ptr&&
+        b->offset<=b->mtl_buf.length&&b->size<=b->mtl_buf.length-b->offset;
+}
+int myds_metal_indexer_topk_threshold_prepare(void) {
+    if(!g_device||!g_library)return 0;
+    const char *names[]={"kernel_myds_topk_threshold_range_parts","kernel_myds_topk_threshold_range_reduce",
+        "kernel_myds_topk_threshold_hist_parts","kernel_myds_topk_threshold_hist_reduce",
+        "kernel_myds_topk_threshold_compact","kernel_myds_topk_threshold_final",
+        "kernel_myds_argsort_f32_i32_desc_threshold_guarded",
+        "kernel_myds_argsort_merge_f32_i32_desc_threshold_guarded","kernel_argsort_f32_i32_desc"};
+    if(!g_native_pipelines)g_native_pipelines=[NSMutableDictionary new];
+    uint32_t original_nth=0u;
+    for(int i=8;i>=0;i--) {
+        NSString *name=[NSString stringWithUTF8String:names[i]];
+        id<MTLComputePipelineState> p=g_native_pipelines[name];
+        NSError *error=nil;
+        if(!p) {
+            id<MTLFunction> fn=[g_library newFunctionWithName:name];
+            if(fn)p=[g_device newComputePipelineStateWithFunction:fn error:&error];
+            if(p)g_native_pipelines[name]=p;
+        }
+        if(i==8&&p) { original_nth=1u;while(original_nth<=p.maxTotalThreadsPerThreadgroup/2u)original_nth*=2u; }
+        const uint32_t threads=i==8?original_nth:i==6?original_nth:i==5||i==7?512u:256u;
+        const NSUInteger dynamic=i==5?8192u:i==6?(NSUInteger)original_nth*8u:0u;
+        if(!p||p.device!=g_device||p.threadExecutionWidth!=32u||!threads||
+           threads>p.maxTotalThreadsPerThreadgroup||threads>g_device.maxThreadsPerThreadgroup.width||
+           dynamic>g_device.maxThreadgroupMemoryLength||
+           p.staticThreadgroupMemoryLength>g_device.maxThreadgroupMemoryLength-dynamic) {
+            fprintf(stderr,"myds_metal: explicit topk threshold PSO/geometry unavailable: %s (%s); refusing fallback\n",
+                names[i],error.localizedDescription.UTF8String?:"function or resource limit");
+            return 0;
+        }
+    }
+    if(!g_indexer_topk_threshold_stats) {
+        g_indexer_topk_threshold_stats=myds_metal_buffer_alloc(9u*sizeof(uint32_t));
+        if(!g_indexer_topk_threshold_stats)return 0;
+        memset(g_indexer_topk_threshold_stats->ptr,0,9u*sizeof(uint32_t));
+    }
+    return myds_metal_buffer_native_valid(g_indexer_topk_threshold_stats);
+}
+myds_metal_buffer_t *myds_metal_indexer_topk_threshold_stats_buffer(void) {
+    return g_indexer_topk_threshold_stats;
+}
 static atomic_uint_fast64_t g_batch2_q8_shared_requests = 0;
 static atomic_uint_fast64_t g_batch2_q8_shared_encoded = 0;
 static atomic_uint_fast64_t g_batch2_q8_shared_failures = 0;
@@ -82,6 +238,115 @@ static id<MTLComputePipelineState> g_pso_lm_head_q8_nr4 = nil;
 static atomic_uint_fast64_t g_lm_head_q8_requests = 0;
 static atomic_uint_fast64_t g_lm_head_q8_encoded = 0;
 static atomic_uint_fast64_t g_lm_head_q8_failures = 0;
+static bool g_f16_gemv_bf16_fuse = false;
+static id<MTLComputePipelineState> g_pso_f16_gemv_bf16[8] = {nil};
+static atomic_uint_fast64_t g_f16_gemv_bf16_requests = 0;
+static atomic_uint_fast64_t g_f16_gemv_bf16_encoded = 0;
+static atomic_uint_fast64_t g_f16_gemv_bf16_failures = 0;
+
+int myds_metal_f16_gemv_bf16_fuse_parse_mode(void) {
+    const char *value = getenv("MYDS_F16_GEMV_BF16_FUSE");
+    if (!value || strcmp(value, "0") == 0) return 0;
+    if (strcmp(value, "1") == 0) return 1;
+    fprintf(stderr, "myds_metal: MYDS_F16_GEMV_BF16_FUSE must be exactly 0 or 1\n");
+    return -1;
+}
+
+int myds_metal_f16_gemv_bf16_fuse_enabled(void) {
+    return g_f16_gemv_bf16_fuse ? 1 : 0;
+}
+
+void myds_metal_f16_gemv_bf16_fuse_counters(
+    myds_metal_f16_gemv_bf16_fuse_counters_t *out, bool reset) {
+#define F16_BF16_COUNT(field) (reset ? atomic_exchange_explicit(&g_f16_gemv_bf16_##field, 0, memory_order_relaxed) \
+                                  : atomic_load_explicit(&g_f16_gemv_bf16_##field, memory_order_relaxed))
+    myds_metal_f16_gemv_bf16_fuse_counters_t value = {
+        .requests = F16_BF16_COUNT(requests), .encoded = F16_BF16_COUNT(encoded),
+        .failures = F16_BF16_COUNT(failures)};
+    if (out) *out = value;
+#undef F16_BF16_COUNT
+}
+
+static bool f16_gemv_bf16_geometry(id<MTLComputePipelineState> pso, uint32_t nsg) {
+    const NSUInteger dynamic_bytes = 32u * 2u * sizeof(float);
+    return g_device && pso && pso.device == g_device && nsg >= 1u && nsg <= 8u &&
+        pso.threadExecutionWidth == 32u && pso.maxTotalThreadsPerThreadgroup >= 32u * nsg &&
+        g_device.maxThreadsPerThreadgroup.width >= 32u &&
+        g_device.maxThreadsPerThreadgroup.height >= nsg &&
+        g_device.maxThreadsPerThreadgroup.depth >= 1u &&
+        dynamic_bytes <= g_device.maxThreadgroupMemoryLength &&
+        pso.staticThreadgroupMemoryLength <= g_device.maxThreadgroupMemoryLength - dynamic_bytes;
+}
+
+static int f16_gemv_bf16_initialize(void) {
+    for (uint32_t nsg = 1u; nsg <= 8u; ++nsg) {
+        MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
+        short short_nsg = (short)nsg;
+        [values setConstantValue:&short_nsg type:MTLDataTypeShort atIndex:600];
+        NSError *error = nil;
+        id<MTLFunction> fn = [g_library newFunctionWithName:@"kernel_mul_mv_f16_f32_4_bf16_nr2"
+                                            constantValues:values error:&error];
+        id<MTLComputePipelineState> pso = fn ?
+            [g_device newComputePipelineStateWithFunction:fn error:&error] : nil;
+        if (!f16_gemv_bf16_geometry(pso, nsg)) {
+            fprintf(stderr, "myds_metal: explicit F16 GEMV BF16 fuse PSO/geometry unavailable (NSG=%u, %s); refusing fallback\n",
+                nsg, error.localizedDescription.UTF8String ?: "function or resource limit");
+            return 0;
+        }
+        g_pso_f16_gemv_bf16[nsg - 1u] = pso;
+    }
+    return 1;
+}
+static bool g_indexer_rope_quant_fuse = false;
+static id<MTLComputePipelineState> g_pso_indexer_rope_quant = nil;
+static atomic_uint_fast64_t g_indexer_rope_quant_requests = 0;
+static atomic_uint_fast64_t g_indexer_rope_quant_encoded = 0;
+static atomic_uint_fast64_t g_indexer_rope_quant_failures = 0;
+
+int myds_metal_indexer_rope_quant_fuse_parse_mode(void) {
+    const char *value = getenv("MYDS_INDEXER_ROPE_QUANT_FUSE");
+    if (!value || strcmp(value, "0") == 0) return 0;
+    if (strcmp(value, "1") == 0) return 1;
+    fprintf(stderr, "myds_metal: MYDS_INDEXER_ROPE_QUANT_FUSE must be exactly 0 or 1\n");
+    return -1;
+}
+
+int myds_metal_indexer_rope_quant_fuse_enabled(void) {
+    return g_indexer_rope_quant_fuse ? 1 : 0;
+}
+
+void myds_metal_indexer_rope_quant_fuse_counters(
+    myds_metal_indexer_rope_quant_fuse_counters_t *out, bool reset) {
+#define INDEXER_RQ_COUNT(field) (reset ? atomic_exchange_explicit(&g_indexer_rope_quant_##field, 0, memory_order_relaxed) \
+                                     : atomic_load_explicit(&g_indexer_rope_quant_##field, memory_order_relaxed))
+    myds_metal_indexer_rope_quant_fuse_counters_t value = {
+        .requests = INDEXER_RQ_COUNT(requests), .encoded = INDEXER_RQ_COUNT(encoded),
+        .failures = INDEXER_RQ_COUNT(failures)};
+    if (out) *out = value;
+#undef INDEXER_RQ_COUNT
+}
+
+static bool indexer_rope_quant_geometry(id<MTLComputePipelineState> pso) {
+    return g_device && pso && pso.device == g_device &&
+        pso.threadExecutionWidth == 32u && pso.maxTotalThreadsPerThreadgroup >= 32u &&
+        g_device.maxThreadsPerThreadgroup.width >= 32u &&
+        g_device.maxThreadsPerThreadgroup.height >= 1u &&
+        g_device.maxThreadsPerThreadgroup.depth >= 1u &&
+        pso.staticThreadgroupMemoryLength <= g_device.maxThreadgroupMemoryLength;
+}
+
+static int indexer_rope_quant_initialize(void) {
+    NSError *error = nil;
+    id<MTLFunction> function = [g_library newFunctionWithName:@"kernel_dsv41_indexer_rope_quant"];
+    if (function) g_pso_indexer_rope_quant = [g_device newComputePipelineStateWithFunction:function error:&error];
+    if (!indexer_rope_quant_geometry(g_pso_indexer_rope_quant)) {
+        fprintf(stderr, "myds_metal: indexer RoPE quant candidate unavailable; refusing fallback (%s)\n",
+            error.localizedDescription.UTF8String ?: "function or resource limit");
+        return 0;
+    }
+    return 1;
+}
+
 static bool g_moe_q2_sum_cache = false;
 static id<MTLComputePipelineState> g_pso_moe_q2_sum_cache_prepare = nil;
 static id<MTLComputePipelineState> g_pso_moe_q2_sum6_cached = nil;
@@ -362,6 +627,17 @@ static id<MTLComputeCommandEncoder> g_batch_enc = nil;
 static NSMutableArray<id<MTLCommandBuffer>> *g_inflight_cbs = nil;
 static uint64_t                     g_batch_commit_count = 0;
 static int                          g_auto_barrier = 1;
+int myds_metal_indexer_topk_threshold_stats(uint32_t words[9],bool reset) {
+    if(!words)return 0;
+    memset(words,0,9u*sizeof(uint32_t));
+    if(g_batch_cb)return 0;
+    for(id<MTLCommandBuffer> cb in g_inflight_cbs)
+        if(cb.status!=MTLCommandBufferStatusCompleted)return 0;
+    if(!g_indexer_topk_threshold_stats)return 1;
+    memcpy(words,g_indexer_topk_threshold_stats->ptr,9u*sizeof(uint32_t));
+    if(reset)memset(g_indexer_topk_threshold_stats->ptr,0,9u*sizeof(uint32_t));
+    return 1;
+}
 
 /* ══════════════════════════════════════════════════════════════════════════
  * Residency keep-alive —— llama.cpp PR #17766 (ggerganov) 的移植
@@ -675,6 +951,22 @@ static const char *g_metal_base_preamble =
 int myds_metal_init(const char *shader_dir) {
     if (g_initialized) return 1;
 
+    const int f16_gemv_bf16_fuse = myds_metal_f16_gemv_bf16_fuse_parse_mode();
+    if (f16_gemv_bf16_fuse < 0) return 0;
+    const int indexer_rope_quant_fuse = myds_metal_indexer_rope_quant_fuse_parse_mode();
+    if (indexer_rope_quant_fuse < 0) return 0;
+
+    const int indexer_head_slots = indexer_head_slots_parse_mode();
+    if (indexer_head_slots < 0) return 0;
+    const int indexer_topk_threshold=indexer_topk_threshold_parse_mode();
+    if(indexer_topk_threshold<0)return 0;
+    const int indexer_topk_nan_shuffle = indexer_topk_nan_shuffle_parse_mode();
+    if (indexer_topk_nan_shuffle < 0) return 0;
+    if (indexer_topk_threshold && indexer_topk_nan_shuffle) {
+        fprintf(stderr,"myds_metal: threshold and NaN shuffle experiments must be isolated\n");
+        return 0;
+    }
+
     const int moe_q2_sum_cache = moe_q2_sum_cache_parse_mode();
     if (moe_q2_sum_cache < 0) return 0;
     const int moe_q2_sum_cache_fused = moe_q2_sum_cache_fused_parse_mode();
@@ -737,6 +1029,7 @@ int myds_metal_init(const char *shader_dir) {
             @"dsv4_rope.metal",
             @"dsv4_misc.metal",
             @"argsort.metal",
+            @"topk_threshold.metal",
             @"cpy.metal",
             @"concat.metal",
             @"get_rows.metal",
@@ -1207,6 +1500,16 @@ int myds_metal_init(const char *shader_dir) {
             myds_metal_cleanup();
             return 0;
         }
+        if (f16_gemv_bf16_fuse && !f16_gemv_bf16_initialize()) {
+            g_initialized = true;
+            myds_metal_cleanup();
+            return 0;
+        }
+        if (indexer_rope_quant_fuse && !indexer_rope_quant_initialize()) {
+            g_initialized = true;
+            myds_metal_cleanup();
+            return 0;
+        }
         if (moe_q2_sum_cache && !moe_q2_sum_cache_initialize(moe_iq2_constant_lut)) {
             g_initialized = true;
             myds_metal_cleanup();
@@ -1217,18 +1520,44 @@ int myds_metal_init(const char *shader_dir) {
             myds_metal_cleanup();
             return 0;
         }
+        if (indexer_head_slots && !indexer_head_slots_initialize()) {
+            g_initialized = true;
+            myds_metal_cleanup();
+            return 0;
+        }
+        g_indexer_head_slots = indexer_head_slots != 0;
+        if(indexer_topk_threshold&&!myds_metal_indexer_topk_threshold_prepare()) {
+            g_initialized=true;myds_metal_cleanup();return 0;
+        }
+        g_indexer_topk_threshold=indexer_topk_threshold!=0;
+        if (indexer_topk_nan_shuffle && !indexer_topk_nan_shuffle_initialize()) {
+            g_initialized = true; myds_metal_cleanup(); return 0;
+        }
+        g_indexer_topk_nan_shuffle = indexer_topk_nan_shuffle != 0;
         g_lm_head_q8_nr0 = lm_head_q8_nr0;
+        g_f16_gemv_bf16_fuse = f16_gemv_bf16_fuse != 0;
+        g_indexer_rope_quant_fuse = indexer_rope_quant_fuse != 0;
         g_moe_iq2_constant_lut = moe_iq2_constant_lut;
         g_moe_q2_sum_cache = moe_q2_sum_cache != 0;
         g_moe_q2_sum_cache_fused = moe_q2_sum_cache_fused != 0;
         g_initialized = true;
         MYDS_LOG_I("myds_metal: Initialized successfully on GPU: %s", [[g_device name] UTF8String]);
+        MYDS_LOG_I("Indexer head slots: %d (%s; explicit ordinary scalar scope)",
+                   g_indexer_head_slots, g_indexer_head_slots ? "F32 candidate" : "reference");
+        MYDS_LOG_I("Indexer topk threshold: %d (%s; explicit ordinary scalar scope)",
+                   g_indexer_topk_threshold,g_indexer_topk_threshold?"F32 candidate":"reference");
+        MYDS_LOG_I("Indexer topk NaN shuffle: %d (%s; reference partition geometry)",
+                   g_indexer_topk_nan_shuffle,g_indexer_topk_nan_shuffle?"SIMD candidate":"reference");
         MYDS_LOG_I("Routed MoE geometry: IQ2 NSG=%d, Q2 down NSG=%d (%s)",
                    g_moe_nsg, g_moe_down_nsg, down_nsg_env ? "explicit" : "inherited");
         MYDS_LOG_I("Routed MoE IQ2 LUT: %s", g_moe_iq2_constant_lut ? "constant (explicit)" : "threadgroup (reference)");
         MYDS_LOG_I("Batch2 output-B Q8 shared weights: %s", batch2_q8_shared ? "enabled (explicit; eligible TAIL only)" : "disabled (scalar reference)");
         MYDS_LOG_I("LM-head Q8 rows per threadgroup: %d (%s; single token, large output, NSG8)",
                    g_lm_head_q8_nr0, lm_head_q8_nr0 == 4 ? "explicit candidate" : "reference");
+        MYDS_LOG_I("F16 GEMV BF16 fuse: %d (%s; explicit ordinary scalar scope)",
+                   g_f16_gemv_bf16_fuse, g_f16_gemv_bf16_fuse ? "fused store" : "reference");
+        MYDS_LOG_I("Indexer RoPE quant fuse: %d (%s; explicit ordinary scalar scope)",
+                   g_indexer_rope_quant_fuse, g_indexer_rope_quant_fuse ? "SIMD candidate" : "reference");
         MYDS_LOG_I("Routed MoE Q2 sum cache: %d (%s; explicit ordinary scalar scope)",
                    g_moe_q2_sum_cache, g_moe_q2_sum_cache ? "F32 candidate" : "reference");
         MYDS_LOG_I("Routed MoE Q2 sum cache fused: %d (%s; explicit ordinary scalar scope)",
@@ -1240,6 +1569,12 @@ int myds_metal_init(const char *shader_dir) {
 void myds_metal_cleanup(void) {
     if (!g_initialized) return;
     (void)myds_metal_synchronize();
+    g_pso_indexer_head_slots = nil;
+    g_indexer_head_slots = false;
+    g_indexer_topk_nan_shuffle = false;
+    g_indexer_topk_threshold=false;
+    myds_metal_buffer_free(g_indexer_topk_threshold_stats);
+    g_indexer_topk_threshold_stats=NULL;
     g_pso_rms_norm = nil;
     g_pso_v41_norm_plain = nil;
     g_pso_v41_bf16 = nil;
@@ -1295,6 +1630,10 @@ void myds_metal_cleanup(void) {
     g_library = nil;
     g_pso_lm_head_q8_nr4 = nil;
     g_lm_head_q8_nr0 = 2;
+    g_f16_gemv_bf16_fuse = false;
+    for (unsigned i = 0; i < 8u; ++i) g_pso_f16_gemv_bf16[i] = nil;
+    g_indexer_rope_quant_fuse = false;
+    g_pso_indexer_rope_quant = nil;
     g_native_pipelines = nil;
     g_queue = nil;
     for (size_t i = 0; i < g_native_pso_cache_count; i++) {
@@ -1708,6 +2047,66 @@ static int v41_finish(id<MTLCommandBuffer> cb, id<MTLComputeCommandEncoder> enc)
     return wait_command_buffer(cb);
 }
 
+static bool indexer_head_slots_range(const myds_metal_buffer_t *buffer,uint64_t bytes,size_t alignment) {
+    return buffer && buffer->mtl_buf && buffer->mtl_buf.device == g_device && bytes &&
+        bytes <= buffer->size && buffer->offset <= buffer->mtl_buf.length &&
+        bytes <= buffer->mtl_buf.length - buffer->offset && buffer->offset % alignment == 0;
+}
+static bool indexer_head_slots_overlap(const myds_metal_buffer_t *a,uint64_t a_bytes,
+    const myds_metal_buffer_t *b,uint64_t b_bytes) {
+    if (a->mtl_buf == b->mtl_buf) {
+        return a->offset <= b->offset ? b->offset - a->offset < a_bytes : a->offset - b->offset < b_bytes;
+    }
+    /* Distinct no-copy handles can expose the same unified-memory range. */
+    if (a->ptr && b->ptr) {
+        const uintptr_t first=(uintptr_t)a->ptr,second=(uintptr_t)b->ptr;
+        return first <= second ? second-first < a_bytes : first-second < b_bytes;
+    }
+    return false;
+}
+int myds_metal_indexer_head_slots_dispatch(myds_metal_buffer_t *scores,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *cache,const myds_metal_buffer_t *mask,
+    uint32_t n_comp,uint32_t n_heads,bool cache_bf16,bool *encoded,bool *unavailable) {
+    if(encoded)*encoded=false;
+    if(unavailable)*unavailable=false;
+    if(!g_initialized || !g_indexer_head_slots || !indexer_head_slots_geometry()) {
+        if(unavailable)*unavailable=true;
+        return 0;
+    }
+    if(!n_comp || n_heads!=32u) return 0;
+    const uint64_t score_bytes=(uint64_t)n_comp*4u;
+    const uint64_t cache_bytes=(uint64_t)n_comp*128u*(cache_bf16?2u:4u);
+    const uint64_t mask_bytes=((uint64_t)n_comp+7u)/8u*4u;
+    if(!indexer_head_slots_range(scores,score_bytes,4u) ||
+       !indexer_head_slots_range(q,32u*128u*4u,16u) ||
+       !indexer_head_slots_range(weights,32u*4u,4u) ||
+       !indexer_head_slots_range(cache,cache_bytes,cache_bf16?2u:4u) ||
+       (mask && !indexer_head_slots_range(mask,mask_bytes,4u))) return 0;
+    if(indexer_head_slots_overlap(scores,score_bytes,q,32u*128u*4u) ||
+       indexer_head_slots_overlap(scores,score_bytes,weights,32u*4u) ||
+       indexer_head_slots_overlap(scores,score_bytes,cache,cache_bytes) ||
+       (mask && indexer_head_slots_overlap(scores,score_bytes,mask,mask_bytes))) return 0;
+    struct {uint32_t n_rows,n_head,head_dim,cache_f16;float scale;uint32_t has_mask;} args={
+        n_comp,n_heads,128u,cache_bf16?2u:0u,1.0f/64.0f,mask?1u:0u};
+    const myds_metal_buffer_t *buffers[]={q,weights,cache,scores,mask?mask:scores};
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb=g_batch_cb?g_batch_cb:[g_queue commandBuffer];
+        if(!cb)return 0;
+        id<MTLComputeCommandEncoder> enc=get_compute_encoder(cb);
+        if(!enc)return 0;
+        /* Preserve the original generic scorer bridge's auto1 pre/post barriers.
+         * Auto0 callers retain the same upstream/score-consumer/reuse joins. */
+        if(g_batch_cb && g_auto_barrier)[enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        [enc setComputePipelineState:g_pso_indexer_head_slots];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        for(size_t i=0;i<5u;++i)[enc setBuffer:buffers[i]->mtl_buf offset:buffers[i]->offset atIndex:i+1];
+        [enc setThreadgroupMemoryLength:640u atIndex:0];
+        metal_dispatch(enc,"kernel_myds_indexer_score_one_head_slots",MTLSizeMake(n_comp,1u,1u),MTLSizeMake(32u,4u,1u));
+        if(encoded)*encoded=true;
+        return v41_finish(cb,enc);
+    }
+}
 
 int myds_metal_dispatch_kernel(const char *name, const void *args, size_t args_size,
     const myds_metal_buffer_t *const *buffers, size_t n_buffers,
@@ -2837,6 +3236,123 @@ int myds_metal_v41_gemv(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *weight, const myds_metal_buffer_t *input,
     uint32_t out_dim, uint32_t in_dim, ggml_type weight_type) {
     return myds_metal_v41_gemv_batch(out, weight, input, out_dim, in_dim, 1, weight_type);
+}
+
+static int f16_gemv_bf16_failure(const char *reason) {
+    atomic_fetch_add_explicit(&g_f16_gemv_bf16_failures, 1, memory_order_relaxed);
+    fprintf(stderr, "myds_metal: F16 GEMV BF16 fuse rejected: %s; refusing fallback\n", reason);
+    return 0;
+}
+
+static bool f16_gemv_bf16_range(const myds_metal_buffer_t *b, uint64_t bytes, size_t alignment) {
+    if (!b || !b->mtl_buf || b->mtl_buf.device != g_device || !b->ptr ||
+        bytes > b->size || b->offset > b->mtl_buf.length ||
+        bytes > b->mtl_buf.length - b->offset || b->offset % alignment ||
+        (uintptr_t)b->ptr % alignment || bytes > UINTPTR_MAX - (uintptr_t)b->ptr)
+        return false;
+    const uintptr_t base = (uintptr_t)b->mtl_buf.contents;
+    return base && b->offset <= UINTPTR_MAX - base &&
+        (uintptr_t)b->ptr == base + b->offset;
+}
+
+static bool f16_gemv_bf16_overlap(const myds_metal_buffer_t *a, uint64_t a_bytes,
+                                 const myds_metal_buffer_t *b, uint64_t b_bytes) {
+    /* Resource identity catches views; CPU ranges also catch two different
+     * no-copy MTLBuffer wrappers around overlapping unified-memory pages. */
+    if (a->mtl_buf == b->mtl_buf &&
+        (a->offset <= b->offset ? b->offset - a->offset < a_bytes
+                               : a->offset - b->offset < b_bytes)) return true;
+    const uintptr_t ap = (uintptr_t)a->ptr, bp = (uintptr_t)b->ptr;
+    return ap <= bp ? bp - ap < a_bytes : ap - bp < b_bytes;
+}
+
+int myds_metal_v41_gemv_f16_bf16(myds_metal_buffer_t *out,
+    const myds_metal_buffer_t *weight, const myds_metal_buffer_t *input,
+    uint32_t out_dim, uint32_t in_dim) {
+    atomic_fetch_add_explicit(&g_f16_gemv_bf16_requests, 1, memory_order_relaxed);
+    if (!g_initialized || !g_f16_gemv_bf16_fuse || !out_dim || !in_dim ||
+        out_dim > INT32_MAX || in_dim > INT32_MAX || in_dim % 4u)
+        return f16_gemv_bf16_failure("invalid immutable mode or dimensions");
+    const uint64_t row_bytes = (uint64_t)in_dim * 2u;
+    const uint64_t weight_bytes = row_bytes * (((uint64_t)out_dim + 1u) / 2u * 2u);
+    const uint64_t input_bytes = (uint64_t)in_dim * sizeof(float);
+    const uint64_t output_bytes = (uint64_t)out_dim * sizeof(float);
+    if (!f16_gemv_bf16_range(weight, weight_bytes, 8u) ||
+        !f16_gemv_bf16_range(input, input_bytes, 16u) ||
+        !f16_gemv_bf16_range(out, output_bytes, 16u))
+        return f16_gemv_bf16_failure("invalid device, range, padding or alignment");
+    if (f16_gemv_bf16_overlap(out, output_bytes, weight, weight_bytes) ||
+        f16_gemv_bf16_overlap(out, output_bytes, input, input_bytes))
+        return f16_gemv_bf16_failure("output overlaps weights or activation");
+    const uint32_t nsg = (in_dim + 127u) / 128u > 8u ? 8u : (in_dim + 127u) / 128u;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pso = g_pso_f16_gemv_bf16[nsg - 1u];
+        if (!f16_gemv_bf16_geometry(pso, nsg))
+            return f16_gemv_bf16_failure("candidate PSO or geometry unavailable");
+        struct ds4_metal_args_mul_mv args = {0};
+        args.ne00 = (int32_t)in_dim; args.ne01 = (int32_t)out_dim; args.ne02 = 1;
+        args.nb00 = 2u; args.nb01 = row_bytes;
+        args.nb02 = row_bytes * out_dim; args.nb03 = args.nb02;
+        args.ne10 = (int32_t)in_dim; args.ne11 = 1; args.ne12 = 1;
+        args.nb10 = sizeof(float); args.nb11 = input_bytes;
+        args.nb12 = input_bytes; args.nb13 = input_bytes;
+        args.ne0 = (int32_t)out_dim; args.ne1 = 1;
+        args.nr0 = 2; args.r2 = 1; args.r3 = 1;
+        id<MTLCommandBuffer> cb = g_batch_cb ?: [g_queue commandBuffer];
+        if (!cb) return f16_gemv_bf16_failure("command buffer unavailable");
+        id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
+        if (!enc) return f16_gemv_bf16_failure("encoder unavailable");
+        [enc setComputePipelineState:pso];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:weight->mtl_buf offset:weight->offset atIndex:1];
+        [enc setBuffer:input->mtl_buf offset:input->offset atIndex:2];
+        [enc setBuffer:out->mtl_buf offset:out->offset atIndex:3];
+        [enc setThreadgroupMemoryLength:32u * 2u * sizeof(float) atIndex:0];
+        metal_dispatch(enc, "kernel_mul_mv_f16_f32_4_bf16_nr2",
+            MTLSizeMake(((NSUInteger)out_dim + 1u) / 2u, 1, 1), MTLSizeMake(32, nsg, 1));
+        atomic_fetch_add_explicit(&g_f16_gemv_bf16_encoded, 1, memory_order_relaxed);
+        if (!v41_finish(cb, enc)) return f16_gemv_bf16_failure("command completion failed");
+        return 1;
+    }
+}
+
+static int indexer_rope_quant_failure(const char *reason) {
+    atomic_fetch_add_explicit(&g_indexer_rope_quant_failures, 1, memory_order_relaxed);
+    fprintf(stderr, "myds_metal: indexer RoPE quant fuse rejected: %s; refusing fallback\n", reason);
+    return 0;
+}
+
+int myds_metal_indexer_rope_quant_dispatch(myds_metal_buffer_t *x,
+    uint32_t heads, uint32_t pos, const float frequencies[32]) {
+    atomic_fetch_add_explicit(&g_indexer_rope_quant_requests, 1, memory_order_relaxed);
+    if (!g_initialized || !g_indexer_rope_quant_fuse ||
+        (heads != 1u && heads != 32u) || pos >= 1048576u || !frequencies)
+        return indexer_rope_quant_failure("invalid immutable mode, shape or position");
+    /* One intentionally in-place range; there is no second GPU input/output
+     * range to alias. Reuse/WAR synchronization remains the caller's contract. */
+    if (!f16_gemv_bf16_range(x, (uint64_t)heads * 128u * sizeof(float), 4u))
+        return indexer_rope_quant_failure("invalid device, full range or alignment");
+    if (!indexer_rope_quant_geometry(g_pso_indexer_rope_quant))
+        return indexer_rope_quant_failure("candidate PSO or geometry unavailable");
+    for (unsigned i = 0; i < 32u; ++i)
+        if (!isfinite(frequencies[i]) || frequencies[i] <= 0.0f)
+            return indexer_rope_quant_failure("invalid forward compressed frequency");
+    struct { uint32_t heads, pos; float frequencies[32]; } args = { heads, pos, {0} };
+    memcpy(args.frequencies, frequencies, sizeof(args.frequencies));
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = g_batch_cb ?: [g_queue commandBuffer];
+        if (!cb) return indexer_rope_quant_failure("command buffer unavailable");
+        id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
+        if (!enc) return indexer_rope_quant_failure("encoder unavailable");
+        [enc setComputePipelineState:g_pso_indexer_rope_quant];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:x->mtl_buf offset:x->offset atIndex:1];
+        metal_dispatch(enc, "kernel_dsv41_indexer_rope_quant",
+            MTLSizeMake(heads, 1, 1), MTLSizeMake(32, 1, 1));
+        atomic_fetch_add_explicit(&g_indexer_rope_quant_encoded, 1, memory_order_relaxed);
+        if (!v41_finish(cb, enc)) return indexer_rope_quant_failure("command completion failed");
+        return 1;
+    }
 }
 
 static uint32_t qkv_nr0(void) {

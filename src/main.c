@@ -2,6 +2,7 @@
 #include "myds_server.h"
 #include "myds_vjob.h"
 #include "myds_dspark.h"
+#include "myds_metal.h"
 #include "myds_log.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,6 +69,10 @@ static void token_stream_printer(const char *piece, size_t length, int32_t token
 }
 
 int main(int argc, char *argv[]) {
+    const int capture_mode = myds_dspark_capture_parse_mode();
+    if (capture_mode < 0) return 1;
+    if (myds_metal_f16_gemv_bf16_fuse_parse_mode() < 0) return 1;
+    if (myds_metal_indexer_rope_quant_fuse_parse_mode() < 0) return 1;
 #if defined(__APPLE__)
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 #endif
@@ -160,6 +165,23 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    if (!dspark_path) {
+        const char *dsp_env = getenv("MYDS_DSPARK");
+        if (!dsp_env) dsp_env = getenv("DS4_DSPARK");
+        if (dsp_env && atoi(dsp_env) != 0) {
+            const char *dsp_file = getenv("MYDS_DSPARK_FILE");
+            if (!dsp_file) dsp_file = getenv("DS4_DSPARK_FILE");
+            if (dsp_file && access(dsp_file, R_OK) == 0) {
+                dspark_path = dsp_file;
+            }
+        }
+    }
+
+    if (capture_mode != 0 && !dspark_path) {
+        MYDS_LOG_E("DSpark capture bypass requires a support model path (--dspark or MYDS_DSPARK_FILE)");
+        return 1;
+    }
+
     if (!model_path) {
         fprintf(stderr, "Error: missing model path (-m <model.gguf>)\n\n");
         print_usage(argv[0]);
@@ -205,27 +227,26 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    if (!dspark_path) {
-        const char *dsp_env = getenv("MYDS_DSPARK");
-        if (!dsp_env) dsp_env = getenv("DS4_DSPARK");
-        if (dsp_env && atoi(dsp_env) != 0) {
-            const char *dsp_file = getenv("MYDS_DSPARK_FILE");
-            if (!dsp_file) dsp_file = getenv("DS4_DSPARK_FILE");
-            if (dsp_file && access(dsp_file, R_OK) == 0) {
-                dspark_path = dsp_file;
-            }
-        }
-    }
-
     if (dspark_path) {
         ctx->dspark = myds_dspark_load(dspark_path, model->vocab_size);
         if (!ctx->dspark) {
             MYDS_LOG_E("Failed to load DSpark support model from %s", dspark_path);
+            if (capture_mode != 0) {
+                myds_context_free(ctx);
+                myds_model_free(model);
+                return 1;
+            }
         } else {
             if (dspark_draft > 0) ctx->dspark->block_size = dspark_draft;
             MYDS_LOG_I("DSpark speculative decoding enabled: block_size=%u, stages=%u, markov_rank=%u",
                        ctx->dspark->block_size, ctx->dspark->stage_count, ctx->dspark->markov_rank);
         }
+    }
+    if (capture_mode != 0 && !ctx->dspark) {
+        MYDS_LOG_E("DSpark capture bypass requires a loaded support model");
+        myds_context_free(ctx);
+        myds_model_free(model);
+        return 1;
     }
 
     if (port > 0) {

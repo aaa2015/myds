@@ -142,7 +142,15 @@ class BenchReproduceTests(unittest.TestCase):
         loaded = next(record for record in records if record['kind'] == 'load')
         loaded.update(dspark_loaded=support is not None, dspark_load_s=0.01 if support else 0,
                       moe_q2_sum_cache_mode=int((environment or {}).get('MYDS_MOE_Q2_SUM_CACHE') == '1'),
-                      moe_q2_sum_cache_fused_mode=int((environment or {}).get('MYDS_MOE_Q2_SUM_CACHE_FUSED') == '1'))
+                      moe_q2_sum_cache_fused_mode=int((environment or {}).get('MYDS_MOE_Q2_SUM_CACHE_FUSED') == '1'),
+                      indexer_head_slots_mode=int((environment or {}).get('MYDS_INDEXER_HEAD_SLOTS') == '1'),
+                      topk_threshold_mode=int((environment or {}).get('MYDS_INDEXER_TOPK_THRESHOLD') == '1'))
+        loaded.update(topk_nan_shuffle_mode=int((environment or {}).get('MYDS_INDEXER_TOPK_NAN_SHUFFLE')=='1'),
+                      dspark_capture_bypass_mode=int(any((environment or {}).get(k)=='1' for k in
+                          ('MYDS_DSPARK_CAPTURE_BYPASS','MYDS_ENGINE_CAPTURE_BYPASS'))),
+                      engine_capture_bypass_mode=int((environment or {}).get('MYDS_ENGINE_CAPTURE_BYPASS')=='1'))
+        if loaded['indexer_head_slots_mode'] or loaded['topk_threshold_mode'] or loaded['topk_nan_shuffle_mode'] or loaded['dspark_capture_bypass_mode']:
+            loaded['native_v41'] = True
         for sample in records:
             if sample['kind'] != 'sample':
                 continue
@@ -187,6 +195,98 @@ class BenchReproduceTests(unittest.TestCase):
             stack.enter_context(contextlib.redirect_stdout(stdout))
             result = self.driver.run(args)
         return result, constructor, stdout.getvalue()
+
+    def threshold_records(self, prompt=32672, adopted=True):
+        environment = dict(self.driver.DEFAULT_ENV, **self.driver.ARM_ENV['target'],
+                           MYDS_INDEXER_TOPK_THRESHOLD='1',MYDS_DECODE_SPLIT='4',
+                           MYDS_DECODE_METRICS='1',MYDS_SPEC_COST_SCHEDULER='0')
+        records = self.v2_records(256, environment)
+        for sample in records:
+            if sample['kind'] != 'sample':
+                continue
+            sample.update(prompt_tokens=prompt, prefill_tokens=prompt-1,
+                          prefill_ms_per_token=1000*sample['prefill_s']/(prompt-1))
+            total, decode = self.driver.expected_topk_threshold_requests(prompt,256)
+            c = dict.fromkeys(self.driver.TOPK_THRESHOLD_COUNTERS,0)
+            for prefix,value in (('',total),('decode_',decode)):
+                for key in ('requests','encoded','validated'):
+                    c[prefix+key]=value
+                c[prefix+('adopted' if adopted else 'fallback')]=value
+                if not adopted:c[prefix+'capacity']=value
+            c['stats_completed']=True
+            sample['gpu_topk_threshold']=c
+        return records
+
+    def test_topk_threshold_ordinary_position_denominator_excludes_extra_block_topk(self):
+        self.assertEqual(self.driver.expected_topk_threshold_requests(1831,256),(0,0))
+        self.assertEqual(self.driver.expected_topk_threshold_requests(32672,256),(2048,2040))
+        # Pool2 first qualifies halfway through this request, proving no hard8 multiplier.
+        self.assertEqual(self.driver.expected_topk_threshold_requests(16288,256),(1760,1755))
+        self.assertEqual(self.driver.expected_topk_threshold_requests(8191,2),(5,5))
+        self.assertEqual(self.driver.expected_topk_threshold_requests(262144,2),(11,3))
+
+    def test_topk_threshold_gpu_adoption_required_not_only_host_encoding(self):
+        records=self.threshold_records()
+        samples=[s for s in records if s['kind']=='sample']
+        environment=records[0]['environment']
+        self.driver.validate_candidate_paths(samples,environment,self.driver.load_audit())
+        self.driver.require_candidate_path(samples,'gpu_topk_threshold')
+        paths=self.driver.candidate_paths(samples,'gpu_topk_threshold')
+        self.assertTrue(paths['adopted_in_formal_decode'])
+        self.assertEqual(paths['formal_decode_adoption_fraction'],1.)
+        fallback=[s for s in self.threshold_records(adopted=False) if s['kind']=='sample']
+        self.driver.validate_candidate_paths(fallback,environment,self.driver.load_audit())
+        with self.assertRaisesRegex(ValueError,'actual eligible ordinary GPU adoption'):
+            self.driver.require_candidate_path(fallback,'gpu_topk_threshold')
+
+    def test_topk_threshold_gpu_decision_conservation_and_pending_snapshots_reject(self):
+        records=self.threshold_records(); environment=records[0]['environment']
+        originals=[s for s in records if s['kind']=='sample']
+        for field,change,message in (('validated',-1,'conservation'),('adopted',-1,'conservation'),
+                                     ('fallback',1,'conservation'),('nan',1,'fallback reasons'),
+                                     ('decode_certificate',1,'fallback reasons'),('stats_completed',False,'existing completion'),
+                                     ('requests',-9999,'Invalid candidate counter'),('encoded',True,'Invalid candidate counter')):
+            samples=copy.deepcopy(originals); c=samples[1]['gpu_topk_threshold']
+            c[field]=(change if type(change) is bool else c[field]+change)
+            with self.subTest(field=field),self.assertRaisesRegex(ValueError,message):
+                self.driver.validate_candidate_paths(samples,environment,self.driver.load_audit())
+
+    def test_topk_threshold_missing_counter_disabled_activity_and_wrong_scope_reject(self):
+        records=self.threshold_records(); environment=records[0]['environment']; samples=[s for s in records if s['kind']=='sample']
+        missing=copy.deepcopy(samples);del missing[1]['gpu_topk_threshold']
+        with self.assertRaisesRegex(ValueError,'Missing candidate path counters'):
+            self.driver.validate_candidate_paths(missing,environment,self.driver.load_audit())
+        with self.assertRaisesRegex(ValueError,'Disabled candidate'):
+            self.driver.validate_candidate_paths(samples,dict(environment,MYDS_INDEXER_TOPK_THRESHOLD='0'),self.driver.load_audit())
+        wrong=copy.deepcopy(samples)
+        for key in ('requests','encoded','validated','adopted'):wrong[1]['gpu_topk_threshold'][key]=2304
+        with self.assertRaisesRegex(ValueError,'denominator'):
+            self.driver.validate_candidate_paths(wrong,environment,self.driver.load_audit())
+        with self.assertRaisesRegex(ValueError,'0/1 cohort'):
+            self.driver.validate_candidate_paths(samples,dict(environment,MYDS_INDEXER_TOPK_THRESHOLD='01'),self.driver.load_audit())
+
+    def test_topk_threshold_normal_zero_eligibility_is_valid_but_cannot_meet_required_hit(self):
+        records=self.threshold_records(prompt=1831);samples=[s for s in records if s['kind']=='sample']
+        self.driver.validate_candidate_paths(samples,records[0]['environment'],self.driver.load_audit())
+        summary=self.driver.candidate_paths(samples,'gpu_topk_threshold')
+        self.assertIsNone(summary['formal_decode_adoption_fraction'])
+        self.assertFalse(summary['adopted_in_formal_decode'])
+        with self.assertRaisesRegex(ValueError,'Required candidate path'):
+            self.driver.require_candidate_path(samples,'gpu_topk_threshold')
+
+    def test_topk_threshold_runner_binds_getter_and_required_cli_without_gpu(self):
+        records=self.threshold_records();args=self.run_args();args.max_new_tokens=256
+        args.arm='target';args.env=['MYDS_INDEXER_TOPK_THRESHOLD=1'];args.require_topk_threshold=True
+        self.invoke_cpu_runner(args,records)
+        summary=json.loads((args.out/'run-summary.json').read_text())
+        self.assertEqual(summary['gpu_topk_threshold']['formal_totals']['decode_adopted'],6120)
+        bad=copy.deepcopy(records);next(s for s in bad if s['kind']=='load')['topk_threshold_mode']=0
+        args.out=self.directory/'threshold-getter-diff'
+        with self.assertRaisesRegex(ValueError,'context getter differs'):
+            self.invoke_cpu_runner(args,bad)
+        args.out=self.directory/'threshold-wrong-arm';args.arm='custom'
+        with self.assertRaisesRegex(ValueError,'pure target'):
+            self.invoke_cpu_runner(args,records)
 
     def test_historical_all_six_groups_pass_raw_audit(self):
         audit = self.driver.load_audit()
@@ -438,6 +538,8 @@ class BenchReproduceTests(unittest.TestCase):
         # Native-counter schema fixtures exercise the real runner's rejection
         # and retained failure logs; no model or Metal work is executed here.
         for name, (flag, failure, keys) in self.driver.CANDIDATE_PATHS.items():
+            if name in ('gpu_topk_threshold','gpu_dspark_capture','gpu_f16_gemv_bf16_fuse','gpu_indexer_rope_quant_fuse'):
+                continue  # GPU decisions/eligible positions have dedicated complete fixtures above.
             enabled_value = self.driver.CANDIDATE_ENABLED_VALUES.get(name, '1')
             encoded = dict.fromkeys(keys, 0)
             encoded.update(requests=4, encoded=4, decode_requests=2, decode_encoded=2)
@@ -448,7 +550,11 @@ class BenchReproduceTests(unittest.TestCase):
                     args = self.run_args()
                     args.out = self.directory / (name + '-' + mode)
                     args.env = [flag + '=' + enabled_value]
-                    options = {'gpu_topk_nan_fuse': 'require_topk_nan_fuse',
+                    if name=='gpu_topk_nan_shuffle':
+                        args.env+=['MYDS_INDEXER_TOPK_NAN_FUSE=1','MYDS_INDEXER_TOPK_PREFIX_MERGE=1']
+                    options = {'gpu_indexer_head_slots': 'require_indexer_head_slots',
+                               'gpu_topk_nan_shuffle':'require_topk_nan_shuffle',
+                               'gpu_topk_nan_fuse': 'require_topk_nan_fuse',
                                'gpu_batch2_q8_shared': 'require_batch2_q8_shared',
                                'gpu_lm_head_q8': 'require_lm_head_q8',
                                'gpu_engram_project_round': 'require_engram_project_round',
@@ -456,6 +562,15 @@ class BenchReproduceTests(unittest.TestCase):
                                'gpu_moe_q2_sum_cache_fused': 'require_moe_q2_sum_cache_fused'}
                     setattr(args, options[name], True)
                     env = dict(self.driver.DEFAULT_ENV, **{flag: enabled_value})
+                    if name=='gpu_topk_nan_shuffle':
+                        env.update(MYDS_INDEXER_TOPK_NAN_FUSE='1',MYDS_INDEXER_TOPK_PREFIX_MERGE='1')
+                    if name == 'gpu_indexer_head_slots':
+                        args.arm = 'target'
+                        env.update(self.driver.ARM_ENV['target'], MYDS_DECODE_SPLIT='4',
+                                   MYDS_DECODE_METRICS='1', MYDS_SPEC_COST_SCHEDULER='0')
+                        encoded.update(requests=8 * args.max_new_tokens, encoded=8 * args.max_new_tokens,
+                                       decode_requests=8 * (args.max_new_tokens - 1),
+                                       decode_encoded=8 * (args.max_new_tokens - 1))
                     records = self.v2_records(environment=env)
                     if name == 'gpu_batch2_q8_shared':
                         for sample in records:
@@ -464,6 +579,9 @@ class BenchReproduceTests(unittest.TestCase):
                     for sample in records:
                         if sample['kind'] != 'sample' or mode == 'missing':
                             continue
+                        if name=='gpu_topk_nan_shuffle':
+                            sample['gpu_topk_nan_fuse']=dict(requests=4,encoded=4,unavailable=0,
+                                classified_partitions=64,decode_requests=2,decode_encoded=2,decode_unavailable=0)
                         counters = dict(encoded)
                         if mode == 'prefill-only':
                             counters.update(decode_requests=0, decode_encoded=0)
@@ -506,6 +624,8 @@ class BenchReproduceTests(unittest.TestCase):
 
     def test_new_candidate_counters_reject_disabled_and_invalid_records(self):
         for name, (flag, _, keys) in self.driver.CANDIDATE_PATHS.items():
+            if name in ('gpu_topk_threshold','gpu_dspark_capture','gpu_f16_gemv_bf16_fuse','gpu_indexer_rope_quant_fuse'):
+                continue  # Specialized graph validation includes GPU conservation and scope.
             for mode in ('negative', 'bool', 'decode-exceeds-total', 'disabled'):
                 with self.subTest(path=name, mode=mode):
                     args = self.run_args()
@@ -525,6 +645,310 @@ class BenchReproduceTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, '[Cc]andidate'):
                         self.invoke_cpu_runner(args, records)
                     self.assertEqual(json.loads((args.out / 'run-state.json').read_text())['status'], 'failed')
+
+    def test_capture_bypass_requires_complete_ordinary_decode_and_loaded_support(self):
+        for mode in ('valid','missing','encoded','partial','stale','failure','warmup-only','no-support'):
+            with self.subTest(mode=mode):
+                args=self.run_args()
+                args.out=self.directory/('capture-'+mode)
+                args.arm='custom'
+                args.dspark_model=None if mode=='no-support' else self.model
+                args.require_dspark_capture_bypass=True
+                env=dict(self.driver.DEFAULT_ENV,MYDS_DSPARK_CAPTURE_BYPASS='1',
+                         MYDS_PLD='0',MYDS_BATCH2_SPEC='0',MYDS_SPEC_SERIAL_PROBE='0')
+                args.env=[k+'='+v for k,v in env.items()]
+                records=self.v2_records(environment=env,support=args.dspark_model)
+                for row in records:
+                    if row['kind']!='sample' or mode=='missing': continue
+                    c=dict.fromkeys(self.driver.CANDIDATE_PATHS['gpu_dspark_capture'][2],0)
+                    c.update(requests=192,bypassed=192,decode_requests=189,decode_bypassed=189)
+                    if not row['warmup']:
+                        if mode=='encoded': c.update(encoded=192,bypassed=0,decode_encoded=189,decode_bypassed=0)
+                        if mode=='partial': c.update(encoded=1,bypassed=191,decode_encoded=1,decode_bypassed=188)
+                        if mode=='stale': c.update(stale_rejections=1,decode_stale_rejections=1)
+                        if mode=='failure': c.update(failures=1,bypassed=191,decode_failures=1,decode_bypassed=188)
+                        if mode=='warmup-only': c=dict.fromkeys(c,0)
+                    row['gpu_dspark_capture']=c
+                if mode=='valid':
+                    self.assertEqual(self.invoke_cpu_runner(args,records)[0],0)
+                else:
+                    with self.assertRaises(ValueError): self.invoke_cpu_runner(args,records)
+
+    def engine_capture_fixture(self, mode='1'):
+        args = self.run_args()
+        args.arm='custom';args.dspark_model=self.model;args.max_new_tokens=256
+        args.require_engine_capture_bypass=mode=='1'
+        env=dict(self.driver.DEFAULT_ENV,MYDS_DSPARK_CAPTURE_BYPASS='0',MYDS_ENGINE_CAPTURE_BYPASS=mode,
+                 MYDS_PLD='0',MYDS_BATCH2_SPEC='0',MYDS_SPEC_SERIAL_PROBE='0')
+        args.env=[k+'='+v for k,v in env.items()]
+        records=self.v2_records(count=256,environment=env,support=args.dspark_model)
+        for row in records:
+            if row['kind']!='sample':continue
+            c=dict.fromkeys(self.driver.CANDIDATE_PATHS['gpu_dspark_capture'][2],0)
+            # Total may include prefill captures; only decode's 3*255 is fixed.
+            c.update(requests=900,decode_requests=765)
+            c['bypassed' if mode=='1' else 'encoded']=900
+            c['decode_bypassed' if mode=='1' else 'decode_encoded']=765
+            row['gpu_dspark_capture']=c
+        return args,records
+
+    def test_engine_capture_load_getters_bind_effective_and_independent_modes(self):
+        for mode in ('valid','missing-engine','zero-engine','bool-engine','missing-effective','zero-effective','bool-effective','non-native'):
+            with self.subTest(mode=mode):
+                args,records=self.engine_capture_fixture()
+                args.out=self.directory/('engine-getter-'+mode)
+                loaded=next(r for r in records if r['kind']=='load')
+                if mode=='missing-engine':loaded.pop('engine_capture_bypass_mode')
+                elif mode=='zero-engine':loaded['engine_capture_bypass_mode']=0
+                elif mode=='bool-engine':loaded['engine_capture_bypass_mode']=True
+                elif mode=='missing-effective':loaded.pop('dspark_capture_bypass_mode')
+                elif mode=='zero-effective':loaded['dspark_capture_bypass_mode']=0
+                elif mode=='bool-effective':loaded['dspark_capture_bypass_mode']=True
+                elif mode=='non-native':loaded['native_v41']=False
+                if mode=='valid':
+                    result,constructor,_=self.invoke_cpu_runner(args,records)
+                    self.assertEqual(result,0)
+                    self.assertEqual(constructor.call_args.kwargs['env']['MYDS_ENGINE_CAPTURE_BYPASS'],'1')
+                    report=json.loads((args.out/'run-summary.json').read_text())['gpu_dspark_capture']
+                    self.assertEqual(report['formal_totals']['decode_requests'],3*765)
+                    self.assertEqual(report['formal_totals']['decode_bypassed'],3*765)
+                else:
+                    with self.assertRaises(ValueError):self.invoke_cpu_runner(args,records)
+                    self.assertEqual(json.loads((args.out/'run-state.json').read_text())['status'],'failed')
+
+    def test_engine_capture_require_rejects_fake_counts_and_nonordinary_graph(self):
+        for mode in ('missing','encoded','partial','wrong-denominator','stale','failure','no-target','extra-target','draft','batch2','pld','warmup-encoded','warmup-only'):
+            with self.subTest(mode=mode):
+                args,records=self.engine_capture_fixture()
+                args.out=self.directory/('engine-counts-'+mode)
+                rows=[r for r in records if r['kind']=='sample']
+                row=rows[0] if mode=='warmup-encoded' else rows[1]
+                c=row['gpu_dspark_capture'];t=row['decode_telemetry']
+                if mode=='missing':row.pop('gpu_dspark_capture')
+                elif mode in ('encoded','warmup-encoded'):c.update(encoded=900,bypassed=0,decode_encoded=765,decode_bypassed=0)
+                elif mode=='partial':c.update(encoded=1,bypassed=899,decode_encoded=1,decode_bypassed=764)
+                elif mode=='wrong-denominator':c.update(decode_requests=762,decode_bypassed=762)
+                elif mode=='stale':c.update(stale_rejections=1,decode_stale_rejections=1)
+                elif mode=='failure':c.update(failures=1,bypassed=899,decode_failures=1,decode_bypassed=764)
+                elif mode=='no-target':t.update(target_forward_calls=0,target_rows=0)
+                elif mode=='extra-target':t.update(target_forward_calls=257,target_rows=257)
+                elif mode=='draft':t['draft_cycles']=1
+                elif mode=='batch2':t['batch2_calls']=1
+                elif mode=='pld':t['pld_queries']=1
+                elif mode=='warmup-only':
+                    for sample in rows[1:]:sample['gpu_dspark_capture']=dict.fromkeys(c,0)
+                with self.assertRaises(ValueError):self.invoke_cpu_runner(args,records)
+
+    def test_engine_capture_strict_modes_reject_before_spawning(self):
+        for mode in ('mutual','old-only','no-support','serial','batch2','pld','invalid01','invalid-empty','invalid-space'):
+            with self.subTest(mode=mode):
+                args,records=self.engine_capture_fixture()
+                args.out=self.directory/('engine-preflight-'+mode)
+                env=dict(setting.split('=',1) for setting in args.env)
+                if mode=='mutual':env['MYDS_DSPARK_CAPTURE_BYPASS']='1'
+                elif mode=='old-only':env.update(MYDS_ENGINE_CAPTURE_BYPASS='0',MYDS_DSPARK_CAPTURE_BYPASS='1')
+                elif mode=='no-support':args.dspark_model=None
+                elif mode=='serial':env['MYDS_SPEC_SERIAL_PROBE']='1'
+                elif mode=='batch2':env['MYDS_BATCH2_SPEC']='1'
+                elif mode=='pld':env['MYDS_PLD']='1'
+                elif mode=='invalid01':env['MYDS_ENGINE_CAPTURE_BYPASS']='01'
+                elif mode=='invalid-empty':env['MYDS_ENGINE_CAPTURE_BYPASS']=''
+                elif mode=='invalid-space':env['MYDS_ENGINE_CAPTURE_BYPASS']='1 '
+                args.env=[k+'='+v for k,v in env.items()]
+                with mock.patch.object(self.driver.subprocess,'Popen') as spawn:
+                    with self.assertRaises(ValueError):self.invoke_cpu_runner(args,records)
+                    spawn.assert_not_called()
+                self.assertFalse(args.out.exists())
+
+    def test_engine_capture_mode0_encoded_control_and_legacy_metadata_compatibility(self):
+        args,records=self.engine_capture_fixture('0')
+        self.assertEqual(self.invoke_cpu_runner(args,records)[0],0)
+        controls=[r for r in records if r['kind']=='sample']
+        self.assertTrue(all(r['gpu_dspark_capture']['decode_encoded']==765 for r in controls))
+        bad=copy.deepcopy(records)
+        c=next(r for r in bad if r['kind']=='sample')['gpu_dspark_capture']
+        c.update(encoded=899,bypassed=1)
+        with self.assertRaisesRegex(ValueError,'Reference capture path bypassed'):
+            self.driver.validate_candidate_paths([r for r in bad if r['kind']=='sample'],records[0]['environment'],self.driver.load_audit())
+        # Saved old-mode protocol2 logs have no new getter or selector.
+        legacy=self.v2_records(environment=self.driver.DEFAULT_ENV)
+        next(r for r in legacy if r['kind']=='load').pop('engine_capture_bypass_mode')
+        directory=self.directory/'legacy-no-engine-field';directory.mkdir()
+        write_samples(directory/'run-metrics.jsonl',legacy)
+        self.driver.validate_run(directory,self.state_for(legacy),self.driver.load_audit())
+        # Explicit new A=0 cannot borrow those older logs as mode evidence.
+        legacy[0]['environment']['MYDS_ENGINE_CAPTURE_BYPASS']='0'
+        write_samples(directory/'run-metrics.jsonl',legacy)
+        with self.assertRaisesRegex(ValueError,'engine_capture_bypass_mode'):
+            self.driver.validate_run(directory,self.state_for(legacy),self.driver.load_audit())
+        legacy[0]['protocol_version']=1
+        write_samples(directory/'run-metrics.jsonl',legacy)
+        with self.assertRaisesRegex(ValueError,'native protocol2'):
+            self.driver.validate_run(directory,self.state_for(legacy),self.driver.load_audit())
+
+    def f16_fuse_fixture(self, mode='1'):
+        args=self.run_args()
+        args.max_new_tokens=256
+        args.require_f16_gemv_bf16_fuse=mode=='1'
+        env=dict(self.driver.DEFAULT_ENV, MYDS_F16_GEMV_BF16_FUSE=mode,
+                 MYDS_PLD='0',MYDS_BATCH2_SPEC='0',MYDS_SPEC_SERIAL_PROBE='0')
+        args.env=[k+'='+v for k,v in env.items()]
+        records=self.v2_records(count=256,environment=env)
+        loaded=next(r for r in records if r['kind']=='load')
+        loaded.update(native_v41=True,f16_gemv_bf16_fuse_mode=int(mode=='1'))
+        for row in records:
+            if row['kind']=='sample':
+                row['gpu_f16_gemv_bf16_fuse']=dict(requests=4992 if mode=='1' else 0,
+                    encoded=4992 if mode=='1' else 0,failures=0,decode_requests=4974 if mode=='1' else 0,
+                    decode_encoded=4974 if mode=='1' else 0,decode_failures=0)
+        return args,records
+
+    def test_f16_fuse_actual_getter_and_all_samples_are_required(self):
+        for mode in ('valid','missing-getter','wrong-getter','bool-getter','not-native','warmup-missing-counter','warmup-prefill-only','one-not-encoded','failed','extra-target','draft'):
+            with self.subTest(mode=mode):
+                args,records=self.f16_fuse_fixture();args.out=self.directory/('f16-'+mode)
+                loaded=next(r for r in records if r['kind']=='load')
+                sample=next(r for r in records if r['kind']=='sample')
+                if mode=='missing-getter':loaded.pop('f16_gemv_bf16_fuse_mode')
+                elif mode=='wrong-getter':loaded['f16_gemv_bf16_fuse_mode']=0
+                elif mode=='bool-getter':loaded['f16_gemv_bf16_fuse_mode']=True
+                elif mode=='not-native':loaded['native_v41']=False
+                elif mode=='warmup-missing-counter':sample.pop('gpu_f16_gemv_bf16_fuse')
+                elif mode=='warmup-prefill-only':sample['gpu_f16_gemv_bf16_fuse'].update(decode_requests=0,decode_encoded=0)
+                elif mode=='one-not-encoded':sample['gpu_f16_gemv_bf16_fuse']['encoded']-=1
+                elif mode=='failed':sample['gpu_f16_gemv_bf16_fuse']['failures']=1
+                elif mode=='extra-target':sample['decode_telemetry']['target_rows']+=1
+                elif mode=='draft':sample['decode_telemetry']['draft_cycles']=1
+                if mode=='valid':self.assertEqual(self.invoke_cpu_runner(args,records)[0],0)
+                else:
+                    with self.assertRaises(ValueError):self.invoke_cpu_runner(args,records)
+
+    def test_f16_fuse_invalid_modes_reject_before_spawn_and_before_outputs(self):
+        for mode in ('01','','true',' 1','1 ','2','0','spec'):
+            with self.subTest(mode=mode):
+                args,records=self.f16_fuse_fixture();args.out=self.directory/('f16-invalid-'+repr(mode))
+                env=dict(records[0]['environment'],MYDS_F16_GEMV_BF16_FUSE=mode)
+                if mode=='spec':env.update(MYDS_F16_GEMV_BF16_FUSE='1',MYDS_BATCH2_SPEC='1')
+                args.env=[k+'='+v for k,v in env.items() if v is not None]
+                with mock.patch.object(self.driver.subprocess,'Popen') as spawn:
+                    with self.assertRaises(ValueError):self.invoke_cpu_runner(args,records)
+                    spawn.assert_not_called()
+                self.assertFalse(args.out.exists())
+
+    def test_f16_fuse_reference_zero_counts_and_historical_protocol_remain_valid(self):
+        args,records=self.f16_fuse_fixture('0')
+        self.assertEqual(self.invoke_cpu_runner(args,records)[0],0)
+        bad=copy.deepcopy(records);next(r for r in bad if r['kind']=='sample')['gpu_f16_gemv_bf16_fuse'].update(requests=1,encoded=1)
+        with self.assertRaisesRegex(ValueError,'Disabled candidate'):
+            self.driver.validate_candidate_paths([r for r in bad if r['kind']=='sample'],records[0]['environment'],self.driver.load_audit())
+        legacy=self.v2_records(environment=self.driver.DEFAULT_ENV)
+        directory=self.directory/'f16-history';directory.mkdir();write_samples(directory/'run-metrics.jsonl',legacy)
+        self.driver.validate_run(directory,self.state_for(legacy),self.driver.load_audit())
+        legacy[0]['environment']['MYDS_F16_GEMV_BF16_FUSE']='0';write_samples(directory/'run-metrics.jsonl',legacy)
+        with self.assertRaisesRegex(ValueError,'f16_gemv_bf16_fuse_mode'):
+            self.driver.validate_run(directory,self.state_for(legacy),self.driver.load_audit())
+        next(r for r in legacy if r['kind']=='load')['f16_gemv_bf16_fuse_mode']=0
+        write_samples(directory/'run-metrics.jsonl',legacy)
+        with self.assertRaisesRegex(ValueError,'Missing candidate path counters'):
+            self.driver.validate_run(directory,self.state_for(legacy),self.driver.load_audit())
+
+    def indexer_rope_quant_fixture(self, mode='1'):
+        args=self.run_args();args.arm='target';args.max_new_tokens=256
+        args.require_indexer_rope_quant_fuse=mode=='1'
+        env=dict(self.driver.DEFAULT_ENV,**self.driver.ARM_ENV['target'])
+        env.update(MYDS_DECODE_SPLIT='4',MYDS_DECODE_METRICS='1',MYDS_SPEC_COST_SCHEDULER='0',
+            MYDS_INDEXER_ROPE_QUANT_FUSE=mode,MYDS_SPEC_SERIAL_PROBE='0')
+        args.env=[k+'='+v for k,v in env.items()]
+        records=self.v2_records(count=256,environment=env)
+        loaded=next(r for r in records if r['kind']=='load')
+        loaded.update(native_v41=True,indexer_rope_quant_fuse_mode=int(mode=='1'))
+        for row in records:
+            if row['kind']=='sample':
+                row['gpu_indexer_rope_quant_fuse']=dict(requests=2688 if mode=='1' else 0,
+                    encoded=2688 if mode=='1' else 0,failures=0,decode_requests=2679 if mode=='1' else 0,
+                    decode_encoded=2679 if mode=='1' else 0,decode_failures=0)
+        return args,records
+
+    def test_indexer_rope_quant_actual_getter_and_all_samples_are_required(self):
+        for mode in ('valid','missing-getter','wrong-getter','bool-getter','not-native','loaded-support',
+                     'warmup-missing','warmup-skipped','prefill-only','encoded-zero','one-not-encoded','failed',
+                     'decode-failed','extra-target','extra-call','draft','batch2','pld'):
+            with self.subTest(mode=mode):
+                args,records=self.indexer_rope_quant_fixture();args.out=self.directory/('rope-'+mode)
+                loaded=next(r for r in records if r['kind']=='load');sample=next(r for r in records if r['kind']=='sample')
+                if mode=='missing-getter':loaded.pop('indexer_rope_quant_fuse_mode')
+                elif mode=='wrong-getter':loaded['indexer_rope_quant_fuse_mode']=0
+                elif mode=='bool-getter':loaded['indexer_rope_quant_fuse_mode']=True
+                elif mode=='not-native':loaded['native_v41']=False
+                elif mode=='loaded-support':loaded['dspark_loaded']=True
+                elif mode=='warmup-missing':sample.pop('gpu_indexer_rope_quant_fuse')
+                elif mode=='warmup-skipped':records.remove(sample)
+                elif mode=='prefill-only':sample['gpu_indexer_rope_quant_fuse'].update(decode_requests=0,decode_encoded=0)
+                elif mode=='encoded-zero':sample['gpu_indexer_rope_quant_fuse']['encoded']=0
+                elif mode=='one-not-encoded':sample['gpu_indexer_rope_quant_fuse']['encoded']-=1
+                elif mode=='failed':sample['gpu_indexer_rope_quant_fuse']['failures']=1
+                elif mode=='decode-failed':sample['gpu_indexer_rope_quant_fuse']['decode_failures']=1
+                elif mode=='extra-target':sample['decode_telemetry']['target_rows']+=1
+                elif mode=='extra-call':sample['decode_telemetry']['target_forward_calls']+=1
+                elif mode=='draft':sample['decode_telemetry']['draft_cycles']=1
+                elif mode=='batch2':sample['decode_telemetry'].update(batch2_calls=1,batch2_misses=1)
+                elif mode=='pld':sample['decode_telemetry']['pld_queries']=1
+                if mode=='valid':self.assertEqual(self.invoke_cpu_runner(args,records)[0],0)
+                else:
+                    with self.assertRaises(ValueError):self.invoke_cpu_runner(args,records)
+
+    def test_indexer_rope_quant_invalid_modes_and_scope_reject_before_spawn(self):
+        for mode in ('01','','true',' 1','1 ','2','0','spec','support','wrong-arm'):
+            with self.subTest(mode=mode):
+                args,records=self.indexer_rope_quant_fixture();args.out=self.directory/('rope-invalid-'+repr(mode))
+                env=dict(records[0]['environment'],MYDS_INDEXER_ROPE_QUANT_FUSE=mode)
+                if mode in ('spec','support','wrong-arm'):env['MYDS_INDEXER_ROPE_QUANT_FUSE']='1'
+                if mode=='spec':args.arm='custom';env['MYDS_BATCH2_SPEC']='1'
+                elif mode=='support':args.dspark_model=self.model
+                elif mode=='wrong-arm':args.arm='custom'
+                args.env=[k+'='+v for k,v in env.items() if v is not None]
+                with mock.patch.object(self.driver.subprocess,'Popen') as spawn:
+                    with self.assertRaises(ValueError):self.invoke_cpu_runner(args,records)
+                    spawn.assert_not_called()
+                self.assertFalse(args.out.exists())
+
+    def test_indexer_rope_quant_reference_and_historical_archives_remain_distinct(self):
+        args,records=self.indexer_rope_quant_fixture('0');self.assertEqual(self.invoke_cpu_runner(args,records)[0],0)
+        bad=copy.deepcopy(records);next(r for r in bad if r['kind']=='sample')['gpu_indexer_rope_quant_fuse'].update(requests=1,encoded=1)
+        with self.assertRaisesRegex(ValueError,'Disabled candidate'):
+            self.driver.validate_candidate_paths([r for r in bad if r['kind']=='sample'],records[0]['environment'],self.driver.load_audit())
+        legacy=self.v2_records(environment=self.driver.DEFAULT_ENV)
+        directory=self.directory/'rope-history';directory.mkdir();write_samples(directory/'run-metrics.jsonl',legacy)
+        self.driver.validate_run(directory,self.state_for(legacy),self.driver.load_audit())
+        legacy[0]['environment']['MYDS_INDEXER_ROPE_QUANT_FUSE']='0';write_samples(directory/'run-metrics.jsonl',legacy)
+        with self.assertRaisesRegex(ValueError,'indexer_rope_quant_fuse_mode'):
+            self.driver.validate_run(directory,self.state_for(legacy),self.driver.load_audit())
+        next(r for r in legacy if r['kind']=='load')['indexer_rope_quant_fuse_mode']=0
+        write_samples(directory/'run-metrics.jsonl',legacy)
+        with self.assertRaisesRegex(ValueError,'Missing candidate path counters'):
+            self.driver.validate_run(directory,self.state_for(legacy),self.driver.load_audit())
+
+    def test_five_formal_samples_are_bound_to_declaration_and_native_argv(self):
+        for mode in ('valid','missing','duplicate','mismatch'):
+            with self.subTest(mode=mode):
+                args=self.run_args()
+                args.repeats=5
+                args.out=self.directory/('five-'+mode)
+                records=self.v2_records(environment=self.driver.DEFAULT_ENV)
+                records[0]['repeats']=5
+                samples=[r for r in records if r['kind']=='sample']
+                for run in (4,5):
+                    row=copy.deepcopy(samples[-1]);row['run']=run;records.append(row)
+                if mode=='missing': records.pop()
+                if mode=='duplicate': records[-1]['run']=4
+                if mode=='mismatch': args.repeats=3
+                if mode=='valid':
+                    result,constructor,_=self.invoke_cpu_runner(args,records)
+                    self.assertEqual(result,0)
+                    self.assertEqual(constructor.call_args.args[0][3],'5')
+                    self.assertEqual(json.loads((args.out/'run-summary.json').read_text())['formal_runs'],5)
+                else:
+                    with self.assertRaises(ValueError): self.invoke_cpu_runner(args,records)
 
     def test_lm_head_row_cohort_rejects_invalid_values_even_without_counters(self):
         for value in ('0', '1', '3', '04', '4 ', '-2', 'garbage'):
@@ -601,6 +1025,75 @@ class BenchReproduceTests(unittest.TestCase):
         write_samples(directory / 'run-metrics.jsonl', records)
         group, _ = self.driver.validate_run(directory, self.state_for(records), self.driver.load_audit())
         self.assertIsNone(group['gpu_moe_q2_sum_cache_fused'])
+
+    def test_head_slots_identity_counters_and_full_scalar_shape_gate(self):
+        environment = dict(self.driver.DEFAULT_ENV, **self.driver.ARM_ENV['target'],
+                           MYDS_INDEXER_HEAD_SLOTS='1', MYDS_DECODE_SPLIT='4',
+                           MYDS_DECODE_METRICS='1', MYDS_SPEC_COST_SCHEDULER='0')
+        for mode in ('valid', 'getter-missing', 'getter-zero', 'getter-bool', 'non-native',
+                     'missing', 'unavailable-not-failure', 'prefill-only', 'seven-layers',
+                     'one-decode-call-missing', 'non-scalar-target'):
+            records = self.v2_records(256, environment)
+            loaded = next(r for r in records if r['kind'] == 'load')
+            if mode == 'getter-missing': loaded.pop('indexer_head_slots_mode')
+            elif mode == 'getter-zero': loaded['indexer_head_slots_mode'] = 0
+            elif mode == 'getter-bool': loaded['indexer_head_slots_mode'] = True
+            elif mode == 'non-native': loaded['native_v41'] = False
+            for sample in records:
+                if sample['kind'] != 'sample' or mode == 'missing': continue
+                counters = dict(requests=2048, encoded=2048, failures=0, unavailable=0,
+                                decode_requests=2040, decode_encoded=2040,
+                                decode_failures=0, decode_unavailable=0)
+                if mode == 'unavailable-not-failure': counters['unavailable'] = 1
+                elif mode == 'prefill-only': counters.update(decode_requests=0, decode_encoded=0)
+                elif mode == 'seven-layers':
+                    counters.update(requests=7 * 256, encoded=7 * 256,
+                                    decode_requests=7 * 255, decode_encoded=7 * 255)
+                elif mode == 'one-decode-call-missing':
+                    counters.update(decode_requests=2039, decode_encoded=2039)
+                elif mode == 'non-scalar-target':
+                    sample['decode_telemetry']['target_forward_calls'] = 255
+                sample['gpu_indexer_head_slots'] = counters
+            args = self.run_args(); args.arm = 'target'; args.max_new_tokens = 256
+            args.require_indexer_head_slots = True
+            args.env = ['MYDS_INDEXER_HEAD_SLOTS=1']; args.out = self.directory / ('headslots-' + mode)
+            with self.subTest(mode=mode):
+                if mode == 'valid':
+                    result, _, _ = self.invoke_cpu_runner(args, records)
+                    self.assertEqual(result, 0)
+                    summary = json.loads((args.out / 'run-summary.json').read_text())['gpu_indexer_head_slots']
+                    self.assertEqual(summary['formal_totals']['decode_encoded'], 3 * 2040)
+                    self.assertTrue(summary['encoded_in_formal_decode'])
+                else:
+                    with self.assertRaisesRegex(ValueError, '[Cc]andidate'):
+                        self.invoke_cpu_runner(args, records)
+                    self.assertEqual(json.loads((args.out / 'run-state.json').read_text())['status'], 'failed')
+
+    def test_head_slots_invalid_env_and_incompatible_required_arm_reject_before_spawn(self):
+        settings = ([f'MYDS_INDEXER_HEAD_SLOTS={value}'] for value in ('', 'true', '01', '2', '-1'))
+        cases = [(values, 'target', False) for values in settings]
+        cases += [(['MYDS_INDEXER_HEAD_SLOTS=0'], 'target', True),
+                  (['MYDS_INDEXER_HEAD_SLOTS=1', 'MYDS_INDEXER_COMPACT_SCORER=1'], 'target', True),
+                  (['MYDS_INDEXER_HEAD_SLOTS=1'], 'pld', True)]
+        for settings, arm, required in cases:
+            args = self.run_args(); args.arm = arm; args.env = settings
+            args.require_indexer_head_slots = required
+            with self.subTest(settings=settings, arm=arm), \
+                    mock.patch.object(self.driver.platform, 'system', return_value='Darwin'), \
+                    mock.patch.object(self.driver, 'check_idle') as idle, \
+                    mock.patch.object(self.driver.subprocess, 'Popen') as child, \
+                    self.assertRaisesRegex(ValueError, '[Cc]andidate'):
+                self.driver.run(args)
+            idle.assert_not_called(); child.assert_not_called()
+            self.assertFalse(args.out.exists())
+
+    def test_historical_head_slot_identity_absence_remains_usable(self):
+        records = self.v2_records()
+        next(r for r in records if r['kind'] == 'load').pop('indexer_head_slots_mode')
+        directory = self.directory / 'historical-no-headslots'; directory.mkdir()
+        write_samples(directory / 'run-metrics.jsonl', records)
+        group, _ = self.driver.validate_run(directory, self.state_for(records), self.driver.load_audit())
+        self.assertIsNone(group['gpu_indexer_head_slots'])
 
     def test_topk_prefix_summary_requires_formal_encoding(self):
         encoded = dict(requests=4, encoded=4, unavailable=0, classified_rows=4,
