@@ -59,8 +59,11 @@ static int                         g_moe_down_nsg = 2;
 static bool                        g_moe_iq2_constant_lut = false;
 static id<MTLComputePipelineState> g_pso_attn_out_low_q8_0 = nil;
 static id<MTLComputePipelineState> g_pso_attn_out_low_q8_0_bf16_r4 = nil;
+static id<MTLComputePipelineState> g_pso_attn_out_low_q4_K = nil;
 static id<MTLComputePipelineState> g_pso_mul_mm_q8_0 = nil;
 static id<MTLComputePipelineState> g_pso_mul_mm_q8_0_bco = nil;
+static id<MTLComputePipelineState> g_pso_mul_mm_q4_K = nil;
+static id<MTLComputePipelineState> g_pso_mul_mm_q4_K_bco = nil;
 static id<MTLComputePipelineState> g_pso_mul_mm_f16 = nil;
 static id<MTLComputePipelineState> g_pso_mul_mm_f16_bco = nil;
 static id<MTLComputePipelineState> g_pso_mul_mm_f32 = nil;
@@ -625,8 +628,22 @@ static id<MTLCommandBuffer>         g_batch_cb = nil;
 static id<MTLComputeCommandEncoder> g_batch_enc = nil;
 /* An event can wake the CPU before the rest of its command buffer finishes. */
 static NSMutableArray<id<MTLCommandBuffer>> *g_inflight_cbs = nil;
-static uint64_t                     g_batch_commit_count = 0;
-static int                          g_auto_barrier = 1;
+static NSMutableArray<id<MTLBuffer>>        *g_batch_released_buffers = nil;
+static uint64_t                             g_batch_commit_count = 0;
+static int                                  g_auto_barrier = 1;
+
+static inline id<MTLCommandBuffer> make_command_buffer(void) {
+    if (!g_queue) return nil;
+    static int s_has_unretained = -1;
+    if (__builtin_expect(s_has_unretained < 0, 0)) {
+        s_has_unretained = [g_queue respondsToSelector:@selector(commandBufferWithUnretainedReferences)] ? 1 : 0;
+    }
+    if (s_has_unretained) {
+        return [g_queue commandBufferWithUnretainedReferences];
+    }
+    return [g_queue commandBuffer];
+}
+
 int myds_metal_indexer_topk_threshold_stats(uint32_t words[9],bool reset) {
     if(!words)return 0;
     memset(words,0,9u*sizeof(uint32_t));
@@ -892,12 +909,23 @@ static int command_buffer_result(id<MTLCommandBuffer> cb) {
 }
 
 static int wait_inflight_commands(void) {
+    if (!g_inflight_cbs || [g_inflight_cbs count] == 0) {
+        if (g_batch_released_buffers && [g_batch_released_buffers count] > 0) {
+            [g_batch_released_buffers removeAllObjects];
+        }
+        return 1;
+    }
     int ok = 1;
     for (id<MTLCommandBuffer> cb in g_inflight_cbs) {
-        [cb waitUntilCompleted];
+        if (cb.status != MTLCommandBufferStatusCompleted) {
+            [cb waitUntilCompleted];
+        }
         if (!command_buffer_result(cb)) ok = 0;
     }
     [g_inflight_cbs removeAllObjects];
+    if (g_batch_released_buffers && [g_batch_released_buffers count] > 0) {
+        [g_batch_released_buffers removeAllObjects];
+    }
     return ok;
 }
 
@@ -906,6 +934,9 @@ static int wait_command_buffer(id<MTLCommandBuffer> cb) {
     int ok = command_buffer_result(cb);
     /* Keep errors from earlier asynchronous submissions observable, too. */
     if (!wait_inflight_commands()) ok = 0;
+    if (g_batch_released_buffers && [g_batch_released_buffers count] > 0) {
+        [g_batch_released_buffers removeAllObjects];
+    }
     return ok;
 }
 
@@ -1328,7 +1359,7 @@ int myds_metal_init(const char *shader_dir) {
         }
 
         /* 8. Build Q4_K MatVec pipeline */
-        fn = [g_library newFunctionWithName:@"kernel_mul_mv_q4_K_f32" constantValues:mv_constants error:nil];
+        fn = [g_library newFunctionWithName:@"kernel_mul_mv_q4_K_dense_f32" constantValues:mv_constants error:nil];
         if (fn) {
             g_pso_mul_mv_q4_K = [g_device newComputePipelineStateWithFunction:fn error:nil];
         }
@@ -1450,6 +1481,11 @@ int myds_metal_init(const char *shader_dir) {
             g_pso_attn_out_low_q8_0_bf16_r4 = [g_device newComputePipelineStateWithFunction:fn error:nil];
         }
 
+        fn = [g_library newFunctionWithName:@"kernel_dsv4_attn_out_low_q4_K_f32" constantValues:mv_constants error:nil];
+        if (fn) {
+            g_pso_attn_out_low_q4_K = [g_device newComputePipelineStateWithFunction:fn error:nil];
+        }
+
         MTLFunctionConstantValues *mm_c_bco1 = [[MTLFunctionConstantValues alloc] init];
         [mm_c_bco1 setConstantValue:&b_false type:MTLDataTypeBool atIndex:700];
         [mm_c_bco1 setConstantValue:&b_true type:MTLDataTypeBool atIndex:701];
@@ -1458,6 +1494,11 @@ int myds_metal_init(const char *shader_dir) {
         if (fn) g_pso_mul_mm_q8_0 = [g_device newComputePipelineStateWithFunction:fn error:nil];
         fn = [g_library newFunctionWithName:@"kernel_mul_mm_q8_0_f32" constantValues:mm_c_bco1 error:nil];
         if (fn) g_pso_mul_mm_q8_0_bco = [g_device newComputePipelineStateWithFunction:fn error:nil];
+
+        fn = [g_library newFunctionWithName:@"kernel_mul_mm_q4_K_f32" constantValues:mm_c_bco0 error:nil];
+        if (fn) g_pso_mul_mm_q4_K = [g_device newComputePipelineStateWithFunction:fn error:nil];
+        fn = [g_library newFunctionWithName:@"kernel_mul_mm_q4_K_f32" constantValues:mm_c_bco1 error:nil];
+        if (fn) g_pso_mul_mm_q4_K_bco = [g_device newComputePipelineStateWithFunction:fn error:nil];
 
         fn = [g_library newFunctionWithName:@"kernel_mul_mm_f16_f32" constantValues:mm_c_bco0 error:nil];
         if (fn) g_pso_mul_mm_f16 = [g_device newComputePipelineStateWithFunction:fn error:nil];
@@ -1615,8 +1656,11 @@ void myds_metal_cleanup(void) {
     g_moe_iq2_constant_lut = false;
     g_pso_attn_out_low_q8_0 = nil;
     g_pso_attn_out_low_q8_0_bf16_r4 = nil;
+    g_pso_attn_out_low_q4_K = nil;
     g_pso_mul_mm_q8_0 = nil;
     g_pso_mul_mm_q8_0_bco = nil;
+    g_pso_mul_mm_q4_K = nil;
+    g_pso_mul_mm_q4_K_bco = nil;
     g_pso_mul_mm_f16 = nil;
     g_pso_mul_mm_f16_bco = nil;
     g_pso_mul_mm_f32 = nil;
@@ -1625,6 +1669,7 @@ void myds_metal_cleanup(void) {
     g_pso_compute_copy_u32 = nil;
     g_pso_compute_copy_u32x4 = nil;
     g_inflight_cbs = nil;
+    g_batch_released_buffers = nil;
     g_shared_event = nil;
     g_shared_event_val = 0;
     g_library = nil;
@@ -1680,7 +1725,7 @@ int myds_metal_begin_batch(void) {
     if (!g_queue && !myds_metal_init(NULL)) return 0;
     if (g_batch_cb) return 1;
     close_compute_encoder();
-    g_batch_cb = [g_queue commandBuffer];
+    g_batch_cb = make_command_buffer();
     return g_batch_cb != nil;
 }
 
@@ -1713,7 +1758,7 @@ int myds_metal_flush_batch(void) {
     close_compute_encoder();
     id<MTLCommandBuffer> cb = g_batch_cb;
     g_batch_cb = nil;
-    if (!g_inflight_cbs) g_inflight_cbs = [NSMutableArray new];
+    if (!g_inflight_cbs) g_inflight_cbs = [[NSMutableArray alloc] initWithCapacity:64];
     [g_inflight_cbs addObject:cb];
     myds_metal_residency_keep_alive();
     [cb commit];
@@ -1746,7 +1791,7 @@ int myds_metal_commit_and_wait_event(uint64_t val) {
     close_compute_encoder();
     id<MTLCommandBuffer> cb = g_batch_cb;
     g_batch_cb = nil;
-    if (!g_inflight_cbs) g_inflight_cbs = [NSMutableArray new];
+    if (!g_inflight_cbs) g_inflight_cbs = [[NSMutableArray alloc] initWithCapacity:64];
     [g_inflight_cbs addObject:cb];
     myds_metal_residency_keep_alive();
     [cb commit];
@@ -1848,6 +1893,10 @@ int myds_metal_buffer_update_sub_view(myds_metal_buffer_t *view, const myds_meta
 
 void myds_metal_buffer_free(myds_metal_buffer_t *buf) {
     if (!buf) return;
+    if (buf->mtl_buf && (g_batch_cb || (g_inflight_cbs && [g_inflight_cbs count] > 0))) {
+        if (!g_batch_released_buffers) g_batch_released_buffers = [[NSMutableArray alloc] initWithCapacity:16];
+        [g_batch_released_buffers addObject:buf->mtl_buf];
+    }
     buf->mtl_buf = nil;
     free(buf);
 }
@@ -3051,6 +3100,25 @@ int myds_metal_gemv_batch(
                 g_native_pipelines[key] = pipeline;
             }
         }
+    } else if (weight_type == GGML_TYPE_Q4_K) {
+        if (in_dim % 256u) return 0;
+        block_bytes = 144;
+        row_bytes = (uint64_t)(in_dim / 256u) * block_bytes;
+        nsg = 4u;
+        NSString *key = [NSString stringWithFormat:@"q4_k_%u", nsg];
+        pipeline = g_native_pipelines[key];
+        if (!pipeline) {
+            MTLFunctionConstantValues *mv_constants = [MTLFunctionConstantValues new];
+            short short_nsg = (short)nsg;
+            [mv_constants setConstantValue:&short_nsg type:MTLDataTypeShort atIndex:600];
+            id<MTLFunction> fn = [g_library newFunctionWithName:@"kernel_mul_mv_q4_K_dense_f32" constantValues:mv_constants error:nil];
+            if (fn) {
+                pipeline = [g_device newComputePipelineStateWithFunction:fn error:nil];
+                if (!g_native_pipelines) g_native_pipelines = [NSMutableDictionary new];
+                g_native_pipelines[key] = pipeline;
+            }
+        }
+        if (!pipeline) pipeline = g_pso_mul_mv_q4_K;
     } else if (weight_type == GGML_TYPE_F32) {
         pipeline = g_pso_mul_mv_f32;
         block_bytes = sizeof(float);
@@ -3102,8 +3170,14 @@ int myds_metal_gemv_batch(
             [enc setBuffer:y->mtl_buf offset:y->offset atIndex:3];
             [enc setThreadgroupMemoryLength:32 * 2 * sizeof(float) atIndex:0];
             /* Each token retains the single-vector lane assignment/reduction. */
-            metal_dispatch(enc, "gemv_q8_0_batch", MTLSizeMake(((NSUInteger)out_dim + 1) / 2, n_tok, 1),
-                MTLSizeMake(32, nsg, 1));
+            if (weight_type == GGML_TYPE_Q4_K) {
+                NSUInteger ngr = ((NSUInteger)out_dim + nsg * 2 - 1) / (nsg * 2);
+                metal_dispatch(enc, "gemv_q4_k_batch", MTLSizeMake(ngr, n_tok, 1),
+                    MTLSizeMake(32, nsg, 1));
+            } else {
+                metal_dispatch(enc, "gemv_q8_0_batch", MTLSizeMake(((NSUInteger)out_dim + 1) / 2, n_tok, 1),
+                    MTLSizeMake(32, nsg, 1));
+            }
             if (g_batch_cb) {
                 if (g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             } else {
@@ -3579,6 +3653,9 @@ int myds_metal_mul_mm(
     if (weight_type == GGML_TYPE_Q8_0) {
         pipeline = bc_out ? g_pso_mul_mm_q8_0_bco : g_pso_mul_mm_q8_0;
         row_bytes = (in_dim / 32u) * 34u;
+    } else if (weight_type == GGML_TYPE_Q4_K) {
+        pipeline = bc_out ? g_pso_mul_mm_q4_K_bco : g_pso_mul_mm_q4_K;
+        row_bytes = (in_dim / 256u) * 144u;
     } else if (weight_type == GGML_TYPE_F16) {
         pipeline = bc_out ? g_pso_mul_mm_f16_bco : g_pso_mul_mm_f16;
         row_bytes = in_dim * sizeof(uint16_t);
@@ -3686,6 +3763,9 @@ int myds_metal_mul_mm_grouped(
     if (weight_type == GGML_TYPE_Q8_0) {
         pipeline = bc_out ? g_pso_mul_mm_q8_0_bco : g_pso_mul_mm_q8_0;
         row_bytes = (in_dim / 32u) * 34u;
+    } else if (weight_type == GGML_TYPE_Q4_K) {
+        pipeline = bc_out ? g_pso_mul_mm_q4_K_bco : g_pso_mul_mm_q4_K;
+        row_bytes = (in_dim / 256u) * 144u;
     } else if (weight_type == GGML_TYPE_F16) {
         pipeline = bc_out ? g_pso_mul_mm_f16_bco : g_pso_mul_mm_f16;
         row_bytes = in_dim * sizeof(uint16_t);
@@ -4878,6 +4958,57 @@ int myds_metal_attn_output_a_batch(
             [enc setBuffer:low->mtl_buf offset:low->offset atIndex:3];
             [enc setThreadgroupMemoryLength:smem_bytes atIndex:0];
             metal_dispatch(enc, "attn_out_low_q8_0", MTLSizeMake(row_groups, 1, pairs),
+                MTLSizeMake(32, 4, 1));
+
+            if (g_batch_cb) {
+                if (g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            } else {
+                [enc endEncoding];
+                [cb commit];
+                if (!wait_command_buffer(cb)) return 0;
+            }
+            return 1;
+        }
+    } else if (weight_type == GGML_TYPE_Q4_K && g_pso_attn_out_low_q4_K && out_a->mtl_buf && heads->mtl_buf && low->mtl_buf && (group_dim % 256 == 0)) {
+        @autoreleasepool {
+            const uint64_t a_group_bytes = (uint64_t)rank * (group_dim / 256u) * 144u;
+            struct ds4_metal_args_mul_mv_id args;
+            memset(&args, 0, sizeof(args));
+            args.nei0 = (int32_t)n_groups;
+            args.nei1 = (int32_t)n_tok;
+            args.nbi1 = (uint64_t)n_groups * sizeof(int32_t);
+            args.ne00 = (int32_t)group_dim;
+            args.ne01 = (int32_t)rank;
+            args.ne02 = (int32_t)n_groups;
+            args.nb00 = 144u;
+            args.nb01 = (group_dim / 256u) * 144u;
+            args.nb02 = a_group_bytes;
+            args.ne10 = (int32_t)group_dim;
+            args.ne11 = (int32_t)n_groups;
+            args.ne12 = 1;
+            args.ne13 = (int32_t)n_tok;
+            args.nb10 = sizeof(float);
+            args.nb11 = (uint64_t)group_dim * sizeof(float);
+            args.nb12 = (uint64_t)n_groups * (uint64_t)group_dim * sizeof(float);
+            args.ne0 = (int32_t)rank;
+            args.ne1 = (int32_t)n_groups;
+            args.nb1 = (uint64_t)rank * sizeof(float);
+            args.nr0 = 2;
+
+            const NSUInteger rows_per_group = 8; // NSG=4 * nr0=2
+            const NSUInteger row_groups = (rank + rows_per_group - 1) / rows_per_group;
+            const NSUInteger pairs = (NSUInteger)n_groups * (NSUInteger)n_tok;
+            const NSUInteger smem_bytes = 256;
+
+            id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
+            [enc setComputePipelineState:g_pso_attn_out_low_q4_K];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:out_a->mtl_buf offset:out_a->offset atIndex:1];
+            [enc setBuffer:heads->mtl_buf offset:heads->offset atIndex:2];
+            [enc setBuffer:low->mtl_buf offset:low->offset atIndex:3];
+            [enc setThreadgroupMemoryLength:smem_bytes atIndex:0];
+            metal_dispatch(enc, "attn_out_low_q4_K", MTLSizeMake(row_groups, 1, pairs),
                 MTLSizeMake(32, 4, 1));
 
             if (g_batch_cb) {

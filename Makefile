@@ -473,6 +473,7 @@ test: $(ALL_TESTS) $(METALLIB)
 	@python3 tests/test_engram_io_window.py
 	@python3 docs/benchmarks/2026-10-05-engram-io/scripts/test-full-model-summary.py
 	@python3 tests/test_v41_engram_tool.py
+	@python3 tests/test_slim_dense.py
 	@echo "\n========================================================"
 	@echo "      ALL TEST SUITES PASSED CLEANLY & SUCCESSFULLY!    "
 	@echo "========================================================"

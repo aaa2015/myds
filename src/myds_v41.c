@@ -2411,8 +2411,8 @@ myds_v41_model_t *myds_v41_model_create(myds_model_t *m, const char *path) {
         }
         const myds_layer_t *base = &m->layers[i];
         if (!base->router_bias || !base->attn_sinks || !base->shared_gate ||
-            base->attn_output_a_type != GGML_TYPE_Q8_0 ||
-            base->attn_output_b_type != GGML_TYPE_Q8_0) goto fail;
+            (base->attn_output_a_type != GGML_TYPE_Q8_0 && base->attn_output_a_type != GGML_TYPE_Q4_K) ||
+            (base->attn_output_b_type != GGML_TYPE_Q8_0 && base->attn_output_b_type != GGML_TYPE_Q4_K)) goto fail;
     }
 #undef W
     v->engram = myds_engram_create(gf,path,m->vocab_size,m->dim);

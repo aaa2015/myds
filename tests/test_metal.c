@@ -237,6 +237,60 @@ static int test_gemv_q8_0(void) {
     return 1;
 }
 
+static int test_gemv_q4_k(void) {
+    const uint32_t out_dim = 64;
+    const uint32_t in_dim = 256; /* 1 block of 256 */
+
+    typedef struct {
+        uint16_t d;     /* half float scale */
+        uint16_t dmin;  /* half float min */
+        uint8_t  scales[12];
+        uint8_t  qs[128];
+    } block_q4_K_t;
+
+    size_t q4_bytes = (size_t)out_dim * (in_dim / 256) * sizeof(block_q4_K_t);
+    myds_metal_buffer_t *W = myds_metal_buffer_alloc(q4_bytes);
+    myds_metal_buffer_t *x = myds_metal_buffer_alloc(in_dim * sizeof(float));
+    myds_metal_buffer_t *y = myds_metal_buffer_alloc(out_dim * sizeof(float));
+    ASSERT_TRUE(W && x && y);
+
+    block_q4_K_t *blocks = (block_q4_K_t *)myds_metal_buffer_data(W);
+    float *xv = (float *)myds_metal_buffer_data(x);
+    for (uint32_t i = 0; i < in_dim; i++) xv[i] = 1.0f;
+
+    /* Fill Q4_K blocks with scale d = 1.0f (0x3c00), dmin = 0, scales = 1, qs = 0x22 (val = 2.0f) */
+    uint32_t n_blocks = out_dim * (in_dim / 256);
+    for (uint32_t b = 0; b < n_blocks; b++) {
+        blocks[b].d = 0x3c00;    /* 1.0f */
+        blocks[b].dmin = 0x0000; /* 0.0f */
+        memset(blocks[b].scales, 0, 12);
+        blocks[b].scales[0] = 1;
+        blocks[b].scales[1] = 1;
+        blocks[b].scales[2] = 1;
+        blocks[b].scales[3] = 1;
+        blocks[b].scales[8] = 0x01;
+        blocks[b].scales[9] = 0x01;
+        blocks[b].scales[10] = 0x01;
+        blocks[b].scales[11] = 0x01;
+        memset(blocks[b].qs, 0x22, 128); /* low 4 bits = 2, high 4 bits = 2 */
+    }
+
+    ASSERT_TRUE(myds_metal_gemv(y, W, x, out_dim, in_dim, GGML_TYPE_Q4_K));
+
+    float *yv = (float *)myds_metal_buffer_data(y);
+    for (uint32_t r = 0; r < out_dim; r++) {
+        /* Dot product of row: in_dim elements of 1.0 * (1.0 * 2.0) = 512.0f */
+        ASSERT_NEAR(yv[r], (float)in_dim * 2.0f, 1.0f);
+    }
+
+    myds_metal_buffer_free(W);
+    myds_metal_buffer_free(x);
+    myds_metal_buffer_free(y);
+    printf("  [PASS] GEMV Q4_K quantization dot-product test (%ux%u)\n", out_dim, in_dim);
+    return 1;
+}
+
+
 static int test_mul_mm_q8_0(void) {
     const uint32_t out_dim = 64;
     const uint32_t in_dim = 256;
@@ -578,6 +632,84 @@ static int test_batch_command_buffer(void) {
     printf("  [PASS] Batch command buffer: multi-operator chaining with single commit (T1-1)\n");
     return 1;
 }
+
+static int test_cb_unretained_and_split_pipeline(void) {
+    const uint32_t dim = 256;
+    myds_metal_buffer_t *x = myds_metal_buffer_alloc(dim * sizeof(float));
+    myds_metal_buffer_t *w = myds_metal_buffer_alloc(dim * sizeof(float));
+    myds_metal_buffer_t *norm_out = myds_metal_buffer_alloc(dim * sizeof(float));
+    myds_metal_buffer_t *W_gemv = myds_metal_buffer_alloc(dim * dim * sizeof(float));
+    myds_metal_buffer_t *gemv_out = myds_metal_buffer_alloc(dim * sizeof(float));
+    myds_metal_buffer_t *res_out = myds_metal_buffer_alloc(dim * sizeof(float));
+    /* Ephemeral buffer to test in-flight deferred release with unretained references */
+    myds_metal_buffer_t *ephemeral = myds_metal_buffer_alloc(dim * sizeof(float));
+    ASSERT_TRUE(x && w && norm_out && W_gemv && gemv_out && res_out && ephemeral);
+
+    float *xv = (float *)myds_metal_buffer_data(x);
+    float *wv = (float *)myds_metal_buffer_data(w);
+    float *Wv = (float *)myds_metal_buffer_data(W_gemv);
+    float *ev = (float *)myds_metal_buffer_data(ephemeral);
+    for (uint32_t i = 0; i < dim; i++) {
+        xv[i] = 1.0f;
+        wv[i] = 1.0f;
+        ev[i] = 0.5f;
+        for (uint32_t c = 0; c < dim; c++) {
+            Wv[i * dim + c] = 0.005f;
+        }
+    }
+
+    uint64_t c0 = myds_metal_get_commit_count();
+
+    /* Segment 1: begin_batch -> rmsnorm -> flush_batch */
+    ASSERT_TRUE(myds_metal_begin_batch());
+    ASSERT_TRUE(myds_metal_rmsnorm(norm_out, x, w, dim, 1e-5f));
+    ASSERT_TRUE(myds_metal_flush_batch());
+    /* Segment 1 committed asynchronously without waiting */
+    ASSERT_TRUE(myds_metal_get_commit_count() == c0 + 1);
+
+    /* Segment 2: begin_batch -> gemv -> add with ephemeral buffer -> flush_batch */
+    ASSERT_TRUE(myds_metal_begin_batch());
+    ASSERT_TRUE(myds_metal_gemv(gemv_out, W_gemv, norm_out, dim, dim, GGML_TYPE_F32));
+    ASSERT_TRUE(myds_metal_add(res_out, gemv_out, ephemeral, dim));
+
+    /* CRITICAL TEST: Free 'ephemeral' WHILE batch/pipeline is in flight!
+     * With unretained command buffers, if the underlying MTLBuffer was deallocated immediately,
+     * the GPU would encounter kIOGPUCommandBufferCallbackErrorInvalidResource.
+     * The deferred release pool (g_batch_released_buffers) keeps it alive until wait. */
+    myds_metal_buffer_free(ephemeral);
+
+    ASSERT_TRUE(myds_metal_flush_batch());
+    ASSERT_TRUE(myds_metal_get_commit_count() == c0 + 2);
+
+    /* Segment 3: begin_batch -> final accumulation -> commit_batch */
+    ASSERT_TRUE(myds_metal_begin_batch());
+    ASSERT_TRUE(myds_metal_add(res_out, res_out, norm_out, dim));
+    ASSERT_TRUE(myds_metal_commit_batch());
+    ASSERT_TRUE(myds_metal_get_commit_count() == c0 + 3);
+
+    /* Verify math:
+     * norm_out = all 1.0f
+     * gemv_out = 256 * 0.005f = 1.28f
+     * ephemeral = 0.5f
+     * res_out (seg 2) = 1.28f + 0.5f = 1.78f
+     * res_out (seg 3) = 1.78f + 1.0f = 2.78f
+     */
+    float *rv = (float *)myds_metal_buffer_data(res_out);
+    for (uint32_t i = 0; i < dim; i++) {
+        ASSERT_NEAR(rv[i], 2.78f, 1e-3f);
+    }
+
+    myds_metal_buffer_free(x);
+    myds_metal_buffer_free(w);
+    myds_metal_buffer_free(norm_out);
+    myds_metal_buffer_free(W_gemv);
+    myds_metal_buffer_free(gemv_out);
+    myds_metal_buffer_free(res_out);
+
+    printf("  [PASS] Metal CB: unretained references + multi-segment split pipeline + in-flight deferred release\n");
+    return 1;
+}
+
 
 static int test_swiglu_flat_shapes(void) {
     const uint32_t shapes[] = { 1, 31, 257, 1025, 32769 };
@@ -1425,6 +1557,7 @@ int main(void) {
     RUN_TEST(test_moe_routing());
     RUN_TEST(test_gemv_f32());
     RUN_TEST(test_gemv_q8_0());
+    RUN_TEST(test_gemv_q4_k());
     RUN_TEST(test_mul_mm_q8_0());
     RUN_TEST(test_moe_sum());
     RUN_TEST(test_add());
@@ -1433,6 +1566,7 @@ int main(void) {
     RUN_TEST(test_buffer_from_ptr_zerocopy());
     RUN_TEST(test_gemv_unsupported_quant_failfast());
     RUN_TEST(test_batch_command_buffer());
+    RUN_TEST(test_cb_unretained_and_split_pipeline());
     RUN_TEST(test_swiglu_flat_shapes());
     RUN_TEST(test_gemv_batch_exact());
     RUN_TEST(test_v41_gemv_batch_exact());

@@ -242,7 +242,7 @@ static __attribute__((unused)) void matvec_grouped_rows(
 
 /* Helper: verify supported quantization types for GEMV operations */
 static bool is_supported_quant_type(ggml_type type) {
-    return (type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_Q8_0);
+    return (type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_K);
 }
 
 /* Helper: verify supported quantization types for MoE gate & up expert projections */
