@@ -2863,6 +2863,7 @@ void kernel_mul_mv_q4_K_f32_impl(
         device const half *dh = &x[ib].d;
 
         for (short row = 0; row < nr0; row++) {
+            if (first_row + row >= args.ne0) break;
             sc16[0] = sc[0] & kmask1;
             sc16[1] = sc[2] & kmask1;
             sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);

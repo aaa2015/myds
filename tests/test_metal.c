@@ -237,56 +237,224 @@ static int test_gemv_q8_0(void) {
     return 1;
 }
 
+static inline float test_fp16_to_fp32(uint16_t h) {
+    __fp16 f16;
+    memcpy(&f16, &h, sizeof(f16));
+    return (float)f16;
+}
+
+typedef struct {
+    uint16_t d;     /* half float scale */
+    uint16_t dmin;  /* half float min */
+    uint8_t  scales[12];
+    uint8_t  qs[128];
+} test_block_q4_K_t;
+
+static float cpu_ref_q4_k_dot(const void *w_row, const float *x, uint32_t in_dim) {
+    const test_block_q4_K_t *blocks = (const test_block_q4_K_t *)w_row;
+    float sum = 0.0f;
+    for (uint32_t b = 0; b < in_dim / 256u; b++) {
+        const test_block_q4_K_t *blk = &blocks[b];
+        float d = test_fp16_to_fp32(blk->d);
+        float dmin = test_fp16_to_fp32(blk->dmin);
+        for (uint32_t group = 0; group < 8; group++) {
+            uint8_t sc, m;
+            if (group < 4) {
+                sc = blk->scales[group] & 63;
+                m  = blk->scales[group + 4] & 63;
+            } else {
+                sc = (blk->scales[group + 4] & 0x0F) | ((blk->scales[group - 4] & 0xC0) >> 2);
+                m  = (blk->scales[group + 4] >> 4)   | ((blk->scales[group] & 0xC0) >> 2);
+            }
+            float d_sc = d * (float)sc;
+            float dmin_m = dmin * (float)m;
+            const uint8_t *qs = blk->qs + (group >> 1) * 32;
+            const uint32_t shift = (group & 1) * 4;
+            const float *x_grp = x + b * 256u + group * 32u;
+            for (uint32_t l = 0; l < 32; l++) {
+                uint8_t q = (qs[l] >> shift) & 0x0F;
+                float w = d_sc * (float)q - dmin_m;
+                sum += w * x_grp[l];
+            }
+        }
+    }
+    return sum;
+}
+
 static int test_gemv_q4_k(void) {
     const uint32_t out_dim = 64;
-    const uint32_t in_dim = 256; /* 1 block of 256 */
+    const uint32_t in_dim = 512; /* 2 blocks of 256 */
 
-    typedef struct {
-        uint16_t d;     /* half float scale */
-        uint16_t dmin;  /* half float min */
-        uint8_t  scales[12];
-        uint8_t  qs[128];
-    } block_q4_K_t;
-
-    size_t q4_bytes = (size_t)out_dim * (in_dim / 256) * sizeof(block_q4_K_t);
+    size_t q4_bytes = (size_t)out_dim * (in_dim / 256) * sizeof(test_block_q4_K_t);
     myds_metal_buffer_t *W = myds_metal_buffer_alloc(q4_bytes);
     myds_metal_buffer_t *x = myds_metal_buffer_alloc(in_dim * sizeof(float));
     myds_metal_buffer_t *y = myds_metal_buffer_alloc(out_dim * sizeof(float));
     ASSERT_TRUE(W && x && y);
 
-    block_q4_K_t *blocks = (block_q4_K_t *)myds_metal_buffer_data(W);
+    test_block_q4_K_t *blocks = (test_block_q4_K_t *)myds_metal_buffer_data(W);
     float *xv = (float *)myds_metal_buffer_data(x);
-    for (uint32_t i = 0; i < in_dim; i++) xv[i] = 1.0f;
+    for (uint32_t i = 0; i < in_dim; i++) {
+        xv[i] = sinf((float)(i + 1) * 0.1f);
+    }
 
-    /* Fill Q4_K blocks with scale d = 1.0f (0x3c00), dmin = 0, scales = 1, qs = 0x22 (val = 2.0f) */
+    /* Fill Q4_K blocks with realistic non-zero d, dmin, diverse scales, and packed nibbles */
     uint32_t n_blocks = out_dim * (in_dim / 256);
     for (uint32_t b = 0; b < n_blocks; b++) {
-        blocks[b].d = 0x3c00;    /* 1.0f */
-        blocks[b].dmin = 0x0000; /* 0.0f */
-        memset(blocks[b].scales, 0, 12);
-        blocks[b].scales[0] = 1;
-        blocks[b].scales[1] = 1;
-        blocks[b].scales[2] = 1;
-        blocks[b].scales[3] = 1;
-        blocks[b].scales[8] = 0x01;
-        blocks[b].scales[9] = 0x01;
-        blocks[b].scales[10] = 0x01;
-        blocks[b].scales[11] = 0x01;
-        memset(blocks[b].qs, 0x22, 128); /* low 4 bits = 2, high 4 bits = 2 */
+        __fp16 d_val = 0.05f + (float)(b % 7) * 0.01f;
+        __fp16 dmin_val = 0.02f + (float)(b % 5) * 0.005f;
+        memcpy(&blocks[b].d, &d_val, sizeof(uint16_t));
+        memcpy(&blocks[b].dmin, &dmin_val, sizeof(uint16_t));
+
+        for (int j = 0; j < 4; j++) {
+            blocks[b].scales[j] = (uint8_t)((b * 3 + j + 1) % 30);
+            blocks[b].scales[j + 4] = (uint8_t)((b * 2 + j + 1) % 25);
+        }
+        for (int j = 0; j < 4; j++) {
+            uint8_t sc_lo = (uint8_t)((b + j * 2 + 3) % 15);
+            uint8_t m_lo  = (uint8_t)((b + j * 3 + 2) % 15);
+            blocks[b].scales[j + 8] = sc_lo | (m_lo << 4);
+        }
+        for (int i = 0; i < 128; i++) {
+            uint8_t q_lo = (uint8_t)((b * 13 + i * 7) % 16);
+            uint8_t q_hi = (uint8_t)((b * 17 + i * 11) % 16);
+            blocks[b].qs[i] = q_lo | (q_hi << 4);
+        }
     }
 
     ASSERT_TRUE(myds_metal_gemv(y, W, x, out_dim, in_dim, GGML_TYPE_Q4_K));
 
     float *yv = (float *)myds_metal_buffer_data(y);
     for (uint32_t r = 0; r < out_dim; r++) {
-        /* Dot product of row: in_dim elements of 1.0 * (1.0 * 2.0) = 512.0f */
-        ASSERT_NEAR(yv[r], (float)in_dim * 2.0f, 1.0f);
+        const void *w_row = (const uint8_t *)myds_metal_buffer_data(W) + (size_t)r * (in_dim / 256) * sizeof(test_block_q4_K_t);
+        float expected = cpu_ref_q4_k_dot(w_row, xv, in_dim);
+        ASSERT_NEAR(yv[r], expected, 0.05f);
     }
 
     myds_metal_buffer_free(W);
     myds_metal_buffer_free(x);
     myds_metal_buffer_free(y);
-    printf("  [PASS] GEMV Q4_K quantization dot-product test (%ux%u)\n", out_dim, in_dim);
+    printf("  [PASS] GEMV Q4_K packed reference parity test (%ux%u, 2 blocks, non-zero dmin)\n", out_dim, in_dim);
+    return 1;
+}
+
+static int test_mul_mm_q4_k(void) {
+    const uint32_t out_dim = 64;
+    const uint32_t in_dim = 256;
+    const uint32_t n_tok = 4;
+
+    size_t q4_bytes = (size_t)out_dim * (in_dim / 256) * sizeof(test_block_q4_K_t);
+    myds_metal_buffer_t *W = myds_metal_buffer_alloc(q4_bytes);
+    myds_metal_buffer_t *x = myds_metal_buffer_alloc(n_tok * in_dim * sizeof(float));
+    myds_metal_buffer_t *y = myds_metal_buffer_alloc(n_tok * out_dim * sizeof(float));
+    ASSERT_TRUE(W && x && y);
+
+    test_block_q4_K_t *blocks = (test_block_q4_K_t *)myds_metal_buffer_data(W);
+    float *xv = (float *)myds_metal_buffer_data(x);
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t i = 0; i < in_dim; i++) {
+            xv[t * in_dim + i] = sinf((float)(t * in_dim + i + 1));
+        }
+    }
+
+    uint32_t n_blocks = out_dim * (in_dim / 256);
+    for (uint32_t b = 0; b < n_blocks; b++) {
+        __fp16 d_val = 0.04f + (float)(b % 5) * 0.01f;
+        __fp16 dmin_val = 0.01f + (float)(b % 3) * 0.005f;
+        memcpy(&blocks[b].d, &d_val, sizeof(uint16_t));
+        memcpy(&blocks[b].dmin, &dmin_val, sizeof(uint16_t));
+        for (int j = 0; j < 4; j++) {
+            blocks[b].scales[j] = (uint8_t)((b * 3 + j + 1) % 20);
+            blocks[b].scales[j + 4] = (uint8_t)((b * 2 + j + 1) % 16);
+        }
+        for (int j = 0; j < 4; j++) {
+            blocks[b].scales[j + 8] = (uint8_t)((b + j * 2 + 1) % 15) | (((b + j * 3 + 1) % 15) << 4);
+        }
+        for (int i = 0; i < 128; i++) {
+            blocks[b].qs[i] = (uint8_t)((b * 7 + i * 3) % 16) | (((b * 11 + i * 5) % 16) << 4);
+        }
+    }
+
+    /* Compute expected per-token using CPU reference */
+    myds_metal_buffer_t *y_gemv = myds_metal_buffer_alloc(n_tok * out_dim * sizeof(float));
+    float *y_expected = (float *)myds_metal_buffer_data(y_gemv);
+    for (uint32_t t = 0; t < n_tok; t++) {
+        const float *x_t = xv + t * in_dim;
+        for (uint32_t r = 0; r < out_dim; r++) {
+            const void *w_row = (const uint8_t *)myds_metal_buffer_data(W) + (size_t)r * (in_dim / 256) * sizeof(test_block_q4_K_t);
+            y_expected[t * out_dim + r] = cpu_ref_q4_k_dot(w_row, x_t, in_dim);
+        }
+    }
+
+    ASSERT_TRUE(myds_metal_mul_mm(y, W, x, out_dim, in_dim, n_tok, GGML_TYPE_Q4_K));
+
+    float *yv = (float *)myds_metal_buffer_data(y);
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t r = 0; r < out_dim; r++) {
+            ASSERT_NEAR(yv[t * out_dim + r], y_expected[t * out_dim + r], 0.08f);
+        }
+    }
+
+    myds_metal_buffer_free(y_gemv);
+    myds_metal_buffer_free(x);
+    myds_metal_buffer_free(y);
+    myds_metal_buffer_free(W);
+    printf("  [PASS] Batched Matrix-Matrix Q4_K test (out_dim=%u, in_dim=%u, n_tok=%u)\n", out_dim, in_dim, n_tok);
+    return 1;
+}
+
+static int test_mul_mm_grouped_q4_k(void) {
+    const uint32_t n_groups = 8;
+    const uint32_t out_dim = 64;
+    const uint32_t in_dim = 256;
+    const uint32_t n_tok = 4;
+
+    size_t q4_group_bytes = (size_t)out_dim * (in_dim / 256) * sizeof(test_block_q4_K_t);
+    size_t total_w_bytes = q4_group_bytes * n_groups;
+    myds_metal_buffer_t *W = myds_metal_buffer_alloc(total_w_bytes);
+    myds_metal_buffer_t *x = myds_metal_buffer_alloc((size_t)n_tok * n_groups * in_dim * sizeof(float));
+    myds_metal_buffer_t *y = myds_metal_buffer_alloc((size_t)n_tok * n_groups * out_dim * sizeof(float));
+    ASSERT_TRUE(W && x && y);
+
+    test_block_q4_K_t *blocks = (test_block_q4_K_t *)myds_metal_buffer_data(W);
+    float *xv = (float *)myds_metal_buffer_data(x);
+    for (size_t i = 0; i < (size_t)n_tok * n_groups * in_dim; i++) {
+        xv[i] = sinf((float)(i + 1) * 0.05f);
+    }
+
+    size_t total_blocks = (total_w_bytes / sizeof(test_block_q4_K_t));
+    for (size_t b = 0; b < total_blocks; b++) {
+        __fp16 d_val = 0.03f + (float)(b % 4) * 0.01f;
+        __fp16 dmin_val = 0.01f;
+        memcpy(&blocks[b].d, &d_val, sizeof(uint16_t));
+        memcpy(&blocks[b].dmin, &dmin_val, sizeof(uint16_t));
+        for (int j = 0; j < 4; j++) {
+            blocks[b].scales[j] = (uint8_t)((b + j + 1) % 16);
+            blocks[b].scales[j + 4] = (uint8_t)((b + j) % 12);
+            blocks[b].scales[j + 8] = 0x11;
+        }
+        memset(blocks[b].qs, 0x22, 128);
+    }
+
+    ASSERT_TRUE(myds_metal_mul_mm_grouped(y, W, x, out_dim, in_dim, n_groups, n_tok, GGML_TYPE_Q4_K));
+
+    float *yv = (float *)myds_metal_buffer_data(y);
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t g = 0; g < n_groups; g++) {
+            const float *x_tg = xv + (size_t)t * (n_groups * in_dim) + (size_t)g * in_dim;
+            const uint8_t *w_group = (const uint8_t *)myds_metal_buffer_data(W) + (size_t)g * q4_group_bytes;
+            for (uint32_t r = 0; r < out_dim; r++) {
+                const void *w_row = w_group + (size_t)r * (in_dim / 256) * sizeof(test_block_q4_K_t);
+                float expected = cpu_ref_q4_k_dot(w_row, x_tg, in_dim);
+                size_t y_idx = (size_t)t * (n_groups * out_dim) + (size_t)g * out_dim + r;
+                ASSERT_NEAR(yv[y_idx], expected, 0.08f);
+            }
+        }
+    }
+
+    myds_metal_buffer_free(x);
+    myds_metal_buffer_free(y);
+    myds_metal_buffer_free(W);
+    printf("  [PASS] Grouped Matrix-Matrix Q4_K test (groups=%u, out_dim=%u, in_dim=%u, n_tok=%u)\n", n_groups, out_dim, in_dim, n_tok);
     return 1;
 }
 
@@ -572,7 +740,7 @@ static int test_gemv_unsupported_quant_failfast(void) {
     myds_metal_buffer_free(y);
     myds_metal_buffer_free(W);
 
-    printf("  [PASS] myds_metal_gemv fail-fast rejection for unsupported quantization types (Q4_K, Q6_K, IQ4_NL)\n");
+    printf("  [PASS] myds_metal_gemv fail-fast rejection for invalid Q4 geometry (in_dim=64) and unsupported types (Q6_K, IQ4_NL)\n");
     return 1;
 }
 
@@ -1559,6 +1727,8 @@ int main(void) {
     RUN_TEST(test_gemv_q8_0());
     RUN_TEST(test_gemv_q4_k());
     RUN_TEST(test_mul_mm_q8_0());
+    RUN_TEST(test_mul_mm_q4_k());
+    RUN_TEST(test_mul_mm_grouped_q4_k());
     RUN_TEST(test_moe_sum());
     RUN_TEST(test_add());
     RUN_TEST(test_softmax());

@@ -1883,6 +1883,11 @@ myds_metal_buffer_t *myds_metal_buffer_create_view(void) {
 
 int myds_metal_buffer_update_sub_view(myds_metal_buffer_t *view, const myds_metal_buffer_t *parent, size_t offset, size_t bytes) {
     if (!view || !parent || !parent->mtl_buf || (offset + bytes) > parent->size) return 0;
+    id<MTLBuffer> old_buf = view->mtl_buf;
+    if (old_buf && old_buf != parent->mtl_buf && (g_batch_cb || (g_inflight_cbs && [g_inflight_cbs count] > 0))) {
+        if (!g_batch_released_buffers) g_batch_released_buffers = [[NSMutableArray alloc] initWithCapacity:16];
+        [g_batch_released_buffers addObject:old_buf];
+    }
     view->mtl_buf = parent->mtl_buf;
     view->size = bytes;
     view->offset = parent->offset + offset;
@@ -3193,6 +3198,13 @@ int myds_metal_gemv_batch(
     const bool resume_batch = g_batch_cb != nil;
     if (!myds_metal_synchronize()) return 0;
     typedef struct { uint16_t d; int8_t qs[32]; } block_q8_0_t;
+    typedef struct {
+        uint16_t d;
+        uint16_t dmin;
+        uint8_t  scales[12];
+        uint8_t  qs[128];
+    } block_q4_K_t;
+
     for (uint32_t t = 0; t < n_tok; t++) {
         const float *xv = (const float *)x->ptr + (size_t)t * in_dim;
         float *yv = (float *)y->ptr + (size_t)t * out_dim;
@@ -3206,12 +3218,41 @@ int myds_metal_gemv_batch(
                     for (uint32_t i = 0; i < 32; i++) dot += (float)blocks[b].qs[i] * xv[b * 32u + i];
                     sum += dot * fp16_to_fp32(blocks[b].d);
                 }
+            } else if (weight_type == GGML_TYPE_Q4_K) {
+                const block_q4_K_t *blocks = (const block_q4_K_t *)w_row;
+                for (uint32_t b = 0; b < in_dim / 256u; b++) {
+                    const block_q4_K_t *blk = &blocks[b];
+                    float d = fp16_to_fp32(blk->d);
+                    float dmin = fp16_to_fp32(blk->dmin);
+                    for (uint32_t group = 0; group < 8; group++) {
+                        uint8_t sc, m;
+                        if (group < 4) {
+                            sc = blk->scales[group] & 63;
+                            m  = blk->scales[group + 4] & 63;
+                        } else {
+                            sc = (blk->scales[group + 4] & 0x0F) | ((blk->scales[group - 4] & 0xC0) >> 2);
+                            m  = (blk->scales[group + 4] >> 4)   | ((blk->scales[group] & 0xC0) >> 2);
+                        }
+                        float d_sc = d * (float)sc;
+                        float dmin_m = dmin * (float)m;
+                        const uint8_t *qs = blk->qs + (group >> 1) * 32;
+                        const uint32_t shift = (group & 1) * 4;
+                        const float *x_grp = xv + b * 256u + group * 32u;
+                        for (uint32_t l = 0; l < 32; l++) {
+                            uint8_t q = (qs[l] >> shift) & 0x0F;
+                            float w = d_sc * (float)q - dmin_m;
+                            sum += w * x_grp[l];
+                        }
+                    }
+                }
             } else if (weight_type == GGML_TYPE_F32) {
                 const float *weights = (const float *)w_row;
                 for (uint32_t col = 0; col < in_dim; col++) sum += weights[col] * xv[col];
-            } else {
+            } else if (weight_type == GGML_TYPE_F16) {
                 const uint16_t *weights = (const uint16_t *)w_row;
                 for (uint32_t col = 0; col < in_dim; col++) sum += fp16_to_fp32(weights[col]) * xv[col];
+            } else {
+                return 0;
             }
             yv[row] = sum;
         }
@@ -3654,6 +3695,7 @@ int myds_metal_mul_mm(
         pipeline = bc_out ? g_pso_mul_mm_q8_0_bco : g_pso_mul_mm_q8_0;
         row_bytes = (in_dim / 32u) * 34u;
     } else if (weight_type == GGML_TYPE_Q4_K) {
+        if (in_dim % 256u != 0) return 0;
         pipeline = bc_out ? g_pso_mul_mm_q4_K_bco : g_pso_mul_mm_q4_K;
         row_bytes = (in_dim / 256u) * 144u;
     } else if (weight_type == GGML_TYPE_F16) {
@@ -3663,6 +3705,11 @@ int myds_metal_mul_mm(
         pipeline = bc_out ? g_pso_mul_mm_f32_bco : g_pso_mul_mm_f32;
         row_bytes = in_dim * sizeof(float);
     }
+
+    if (row_bytes == 0 ||
+        W->size / row_bytes < out_dim ||
+        src1->size / sizeof(float) / in_dim < n_tok ||
+        dst->size / sizeof(float) / out_dim < n_tok) return 0;
 
     if (pipeline && W->mtl_buf && src1->mtl_buf && dst->mtl_buf && !bc_inp) {
         @autoreleasepool {
@@ -3764,6 +3811,7 @@ int myds_metal_mul_mm_grouped(
         pipeline = bc_out ? g_pso_mul_mm_q8_0_bco : g_pso_mul_mm_q8_0;
         row_bytes = (in_dim / 32u) * 34u;
     } else if (weight_type == GGML_TYPE_Q4_K) {
+        if (in_dim % 256u != 0) return 0;
         pipeline = bc_out ? g_pso_mul_mm_q4_K_bco : g_pso_mul_mm_q4_K;
         row_bytes = (in_dim / 256u) * 144u;
     } else if (weight_type == GGML_TYPE_F16) {
@@ -3775,6 +3823,10 @@ int myds_metal_mul_mm_grouped(
     }
 
     if (!pipeline || !W->mtl_buf || !src1->mtl_buf || !dst->mtl_buf || bc_inp) return 0;
+    if (row_bytes == 0 ||
+        W->size / row_bytes / out_dim < n_groups ||
+        src1->size / sizeof(float) / in_dim / n_groups < n_tok ||
+        dst->size / sizeof(float) / out_dim / n_groups < n_tok) return 0;
 
     @autoreleasepool {
         struct ds4_metal_args_mul_mm args;

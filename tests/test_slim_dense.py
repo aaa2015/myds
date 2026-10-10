@@ -9,11 +9,15 @@ Validates end-to-end slimming of dense Q8_0 weights to Q4_K on a synthetic GGUF:
 """
 
 import hashlib
+import json
 import os
+import shutil
 import struct
 import subprocess
 import sys
 import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 GGUF_MAGIC = b"GGUF"
 GGUF_ALIGNMENT = 16384
@@ -207,6 +211,181 @@ class SlimDenseTests(unittest.TestCase):
         self.assertEqual(tensors[1][3], align(tensors[0][3] + 2048, GGUF_ALIGNMENT))
         self.assertEqual(tensors[2][3], align(tensors[1][3] + expected_t1_size, GGUF_ALIGNMENT))
 
+    def test_collision_symlink_parent_rejected(self):
+        # F1: output resolves to same real file through symlinked parent directory
+        import tempfile
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            real_dir = os.path.join(tmp_dir, "real")
+            link_dir = os.path.join(tmp_dir, "link")
+            os.makedirs(real_dir)
+            src_file = os.path.join(real_dir, "model.gguf")
+            create_synthetic_model(src_file)
+            with open(src_file, "rb") as f:
+                orig_sha = hashlib.sha256(f.read()).hexdigest()
+            os.symlink(real_dir, link_dir, target_is_directory=True)
+            out_file = os.path.join(link_dir, "model.gguf")
+
+            cmd = [sys.executable, "tools/slim_dense_q4.py", "--in", src_file, "--out", out_file, "--force"]
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("resolves to the same real path", res.stderr)
+
+            # Verify source was untouched
+            with open(src_file, "rb") as f:
+                after_sha = hashlib.sha256(f.read()).hexdigest()
+            self.assertEqual(orig_sha, after_sha)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_collision_partial_input_rejected(self):
+        # F1: input happens to be named x.partial, output named x -> would collide with x.partial
+        partial_src = self.src_path + ".partial"
+        os.rename(self.src_path, partial_src)
+        with open(partial_src, "rb") as f:
+            orig_sha = hashlib.sha256(f.read()).hexdigest()
+
+        cmd = [sys.executable, "tools/slim_dense_q4.py", "--in", partial_src, "--out", self.src_path]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("resolves to the same real path", res.stderr)
+
+        # Verify source was not truncated
+        with open(partial_src, "rb") as f:
+            after_sha = hashlib.sha256(f.read()).hexdigest()
+        self.assertEqual(orig_sha, after_sha)
+        os.rename(partial_src, self.src_path)
+
+    def test_resume_source_mismatch_rejected(self):
+        # F2: resume with modified source header/size is rejected
+        journal_path = self.dst_path + ".journal.json"
+        partial_path = self.dst_path + ".partial"
+
+        # Create dummy partial and journal with fake header sha
+        with open(partial_path, "wb") as f:
+            f.write(b"0" * 4096)
+        with open(journal_path, "w") as f:
+            json.dump({
+                "completed_tensor_idx": 1,
+                "tensor_name": "blk.0.ffn_gate_shexp.weight",
+                "source_header_sha256": "0" * 64,
+                "source_size": 999999,
+                "n_tensors": 3,
+            }, f)
+
+        cmd = [sys.executable, "tools/slim_dense_q4.py", "--in", self.src_path, "--out", self.dst_path, "--resume"]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("Resume rejected! Source model, metadata, alignment, or quantizer library has changed", res.stderr)
+
+    def test_resume_all_tensors_completed_finalizes(self):
+        # F2: when journal completed_tensor_idx == n_tensors, cleanly finalize without IndexError
+        # First do a complete run
+        cmd = [sys.executable, "tools/slim_dense_q4.py", "--in", self.src_path, "--out", self.dst_path, "--threads", "2"]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0)
+
+        # Rename out to partial, write journal with completed_tensor_idx == 3
+        partial_path = self.dst_path + ".partial"
+        journal_path = self.dst_path + ".journal.json"
+        os.rename(self.dst_path, partial_path)
+
+        with open(self.src_path, "rb") as f:
+            # Read header up to data_start
+            f.seek(0)
+            f.read(4)
+            _, nt, nk = struct.unpack("<IQQ", f.read(20))
+            def rs():
+                l = struct.unpack("<Q", f.read(8))[0]
+                return f.read(l)
+            for _ in range(nk):
+                rs()
+                vt = struct.unpack("<I", f.read(4))[0]
+                if vt == 4: f.seek(4, os.SEEK_CUR)
+                elif vt == 8: rs()
+            for _ in range(nt):
+                rs()
+                nd = struct.unpack("<I", f.read(4))[0]
+                f.seek(8 * nd + 12, os.SEEK_CUR)
+            hdr_end = f.tell()
+            f.seek(0)
+            hdr_sha = hashlib.sha256(f.read(hdr_end)).hexdigest()
+
+        # Load quants library to get sha
+        from tools.slim_dense_q4 import load_quants_library
+        _, _, lib_sha = load_quants_library(None)
+
+        with open(journal_path, "w") as jf:
+            json.dump({
+                "completed_tensor_idx": 3,
+                "tensor_name": "blk.0.attn_output_a.weight",
+                "source_header_sha256": hdr_sha,
+                "source_size": os.path.getsize(self.src_path),
+                "n_tensors": 3,
+                "quants_lib_sha256": lib_sha,
+                "alignment": GGUF_ALIGNMENT,
+            }, jf)
+
+        # Resume should detect all completed and rename cleanly without IndexError
+        cmd = [sys.executable, "tools/slim_dense_q4.py", "--in", self.src_path, "--out", self.dst_path, "--resume"]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, f"Resume failed: {res.stderr}")
+        self.assertIn("All 3 tensors already completed. Finalizing output file", res.stdout)
+        self.assertTrue(os.path.exists(self.dst_path))
+        self.assertFalse(os.path.exists(journal_path))
+
+    def test_zero_target_dry_run(self):
+        # F8: zero targets in dry-run should not divide by zero
+        import tempfile
+        zero_src = "/tmp/test_zero_target.gguf"
+        zero_out = "/tmp/test_zero_out.gguf"
+        try:
+            with open(zero_src, "wb") as f:
+                f.write(GGUF_MAGIC + struct.pack("<IQQ", 3, 1, 1))
+                write_str(f, "general.architecture")
+                f.write(struct.pack("<I", 8))
+                write_str(f, "deepseek41")
+                # Single non-target tensor
+                write_str(f, "token_embd.weight")
+                f.write(struct.pack("<I2QIQ", 2, 256, 2, TYPE_F32, 0))
+                hdr_end = f.tell()
+                data_start = (hdr_end + 31) // 32 * 32
+                f.write(bytes(data_start - hdr_end))
+                f.write(b"\x00" * (256 * 2 * 4))
+
+            cmd = [sys.executable, "tools/slim_dense_q4.py", "--in", zero_src, "--out", zero_out, "--dry-run"]
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, f"Zero target dry run failed: {res.stderr}")
+            self.assertIn("0.0% reduction", res.stdout)
+        finally:
+            if os.path.exists(zero_src): os.unlink(zero_src)
+            if os.path.exists(zero_out): os.unlink(zero_out)
+
+    def test_explicit_missing_quants_lib_fails_fast(self):
+        # F9: missing explicit library must fail fast
+        cmd = [sys.executable, "tools/slim_dense_q4.py", "--in", self.src_path, "--out", self.dst_path,
+               "--quants-lib", "/nonexistent/path/libds4quants.dylib"]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("Explicit quants library '/nonexistent/path/libds4quants.dylib' not found", res.stderr)
+
+    def test_strict_whitelist(self):
+        # F7: strict whitelist
+        from tools.slim_dense_q4 import is_dense_target
+        # Allowed targets (Q8_0)
+        self.assertTrue(is_dense_target("output.weight", TYPE_Q8_0))
+        self.assertTrue(is_dense_target("blk.0.attn_q_a.weight", TYPE_Q8_0))
+        self.assertTrue(is_dense_target("blk.39.ffn_down_shexp.weight", TYPE_Q8_0))
+        self.assertTrue(is_dense_target("blk.12.attn_output_b.weight", TYPE_Q8_0))
+
+        # Rejected (non-target or invalid pattern)
+        self.assertFalse(is_dense_target("output.weight", TYPE_F32)) # not Q8_0
+        self.assertFalse(is_dense_target("blk.0.indexer.attn_q_b.weight", TYPE_Q8_0)) # nested indexer
+        self.assertFalse(is_dense_target("blk.not_a_layer.attn_q_a.weight", TYPE_Q8_0)) # non-numeric layer
+        self.assertFalse(is_dense_target("blk.0.unknown_shexp.weight", TYPE_Q8_0)) # unknown suffix
+        self.assertFalse(is_dense_target("blk.0.ffn_gate_exps.weight", TYPE_Q8_0)) # routed expert
+
 
 if __name__ == "__main__":
     unittest.main()
+

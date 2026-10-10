@@ -14,8 +14,10 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import ctypes
+import hashlib
 import json
 import os
+import re
 import shutil
 import struct
 import sys
@@ -23,7 +25,7 @@ import time
 from typing import List, Tuple
 
 GGUF_MAGIC = b"GGUF"
-GGUF_DEFAULT_ALIGNMENT = 16384
+GGUF_DEFAULT_ALIGNMENT = 32
 
 # GGUF Metadata Value Types
 GGUF_TYPE_UINT8 = 0
@@ -97,48 +99,95 @@ class TensorInfo:
         self.new_offset = 0
 
 
+TARGET_DENSE_SUFFIXES = (
+    "ffn_gate_shexp",
+    "ffn_up_shexp",
+    "ffn_down_shexp",
+    "attn_q_a",
+    "attn_q_b",
+    "attn_kv",
+    "attn_output_a",
+    "attn_output_b",
+)
+TARGET_RE = re.compile(
+    r"^blk\.(\d+)\.(" + "|".join(TARGET_DENSE_SUFFIXES) + r")\.weight$"
+)
+
+
 def is_dense_target(name: str, ttype: int) -> bool:
     if ttype != GGML_TYPE_Q8_0:
         return False
     if name == "output.weight":
         return True
-    if name.startswith("blk."):
-        if name.endswith((
-            "_shexp.weight",
-            ".attn_q_a.weight",
-            ".attn_q_b.weight",
-            ".attn_kv.weight",
-            ".attn_output_a.weight",
-            ".attn_output_b.weight",
-        )):
-            return True
+    m = TARGET_RE.match(name)
+    if m:
+        layer_idx = int(m.group(1))
+        return 0 <= layer_idx < 1000
     return False
 
 
-def load_quants_library(custom_path: str | None = None) -> ctypes.CDLL:
-    paths = []
-    if custom_path:
-        paths.append(custom_path)
-    base_dir = os.path.dirname(os.path.abspath(__file__))
+def check_file_collision(in_path: str, candidate_path: str, role: str):
+    """Ensure candidate_path does not resolve to the same real file or inode as in_path."""
+    in_real = os.path.realpath(in_path)
+    cand_real = os.path.realpath(candidate_path)
+    if in_real == cand_real:
+        sys.exit(f"Error: {role} '{candidate_path}' resolves to the same real path as input '{in_path}'. Refusing to proceed.")
+    if os.path.exists(candidate_path) and os.path.exists(in_path):
+        try:
+            if os.path.samefile(in_path, candidate_path):
+                sys.exit(f"Error: {role} '{candidate_path}' references the same file (same inode) as input '{in_path}'. Refusing to proceed.")
+        except OSError:
+            pass
+
+
+def load_quants_library(custom_path: str | None = None) -> tuple[ctypes.CDLL, str, str]:
+    """Load libds4quants library. Returns (lib, resolved_path, sha256_hex)."""
     suffix = "dylib" if sys.platform == "darwin" else "so"
-    paths.extend([
+    if custom_path:
+        if not os.path.isfile(custom_path):
+            sys.exit(f"Error: Explicit quants library '{custom_path}' not found")
+        resolved = os.path.abspath(custom_path)
+        lib = ctypes.CDLL(resolved)
+        _setup_lib(lib)
+        with open(resolved, "rb") as f:
+            lib_sha = hashlib.sha256(f.read()).hexdigest()
+        return lib, resolved, lib_sha
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    paths = [
         os.path.join(base_dir, f"../ds4/gguf-tools/libds4quants.{suffix}"),
         os.path.join(base_dir, f"../../ds4/gguf-tools/libds4quants.{suffix}"),
         os.path.join(base_dir, f"libds4quants.{suffix}"),
         f"~/Projects/ds4/gguf-tools/libds4quants.{suffix}",
-    ])
+    ]
     for p in paths:
         if p and os.path.isfile(p):
-            lib = ctypes.CDLL(p)
-            lib.ds4q_convert_q8_0_to_q4_k.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_void_p,
-                ctypes.c_int64,
-                ctypes.c_int64,
-            ]
-            lib.ds4q_convert_q8_0_to_q4_k.restype = ctypes.c_size_t
-            return lib
-    raise FileNotFoundError(f"Could not locate libds4quants.{suffix}. Tried: {paths}")
+            resolved = os.path.abspath(p)
+            lib = ctypes.CDLL(resolved)
+            _setup_lib(lib)
+            with open(resolved, "rb") as f:
+                lib_sha = hashlib.sha256(f.read()).hexdigest()
+            return lib, resolved, lib_sha
+    sys.exit(f"Error: Could not locate libds4quants.{suffix}. Tried: {paths}")
+
+
+def _setup_lib(lib: ctypes.CDLL):
+    lib.ds4q_convert_q8_0_to_q4_k.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int64,
+        ctypes.c_int64,
+    ]
+    lib.ds4q_convert_q8_0_to_q4_k.restype = ctypes.c_size_t
+
+
+def write_atomic_journal(journal_path: str, data: dict):
+    tmp_path = journal_path + ".tmp"
+    with open(tmp_path, "w") as jf:
+        json.dump(data, jf, indent=2)
+        jf.flush()
+        os.fsync(jf.fileno())
+    os.replace(tmp_path, journal_path)
 
 
 def read_str(f) -> str:
@@ -218,11 +267,16 @@ def main():
 
     in_path = os.path.abspath(args.in_path)
     out_path = os.path.abspath(args.out_path)
+    partial_path = out_path + ".partial"
+    journal_path = out_path + ".journal.json"
 
     if not os.path.isfile(in_path):
         sys.exit(f"Error: input file {in_path} does not exist")
-    if in_path == out_path:
-        sys.exit("Error: --in and --out must be different files to preserve the original baseline!")
+
+    # Protection against in-place overwriting of the original baseline
+    check_file_collision(in_path, out_path, "output file")
+    check_file_collision(in_path, partial_path, "partial file")
+    check_file_collision(in_path, journal_path, "journal file")
 
     if os.path.exists(out_path) and not args.force:
         sys.exit(f"Error: output file {out_path} already exists. Use --force or specify a different path.")
@@ -278,6 +332,11 @@ def main():
         in_header_end = fin.tell()
         in_data_start = align(in_header_end, alignment)
 
+        # Compute SHA256 of the exact input header bytes for source identity verification
+        fin.seek(0)
+        source_header_bytes = fin.read(in_header_end)
+        source_header_sha256 = hashlib.sha256(source_header_bytes).hexdigest()
+
     # 2. Recalculate tensor offsets
     curr_offset = 0
     for t in tensors:
@@ -288,6 +347,11 @@ def main():
     total_out_size = in_data_start + out_data_bytes
     in_file_size = os.path.getsize(in_path)
     savings_bytes = target_q8_bytes - target_q4_bytes
+
+    if target_q8_bytes > 0:
+        reduction_str = f"~{savings_bytes / target_q8_bytes * 100:.1f}% reduction"
+    else:
+        reduction_str = "0.0% reduction"
 
     print("==================================================================")
     print("      DeepSeek V4.1 Flash Dense Slimming Plan (Q8_0 -> Q4_K)      ")
@@ -301,7 +365,7 @@ def main():
     print("------------------------------------------------------------------")
     print(f"Original Dense Q8_0:  {target_q8_bytes / (1 << 30):.3f} GiB ({target_q8_bytes / 1e9:.3f} GB)")
     print(f"Slimmed Dense Q4_K:   {target_q4_bytes / (1 << 30):.3f} GiB ({target_q4_bytes / 1e9:.3f} GB)")
-    print(f"Memory Saved:         {savings_bytes / (1 << 30):.3f} GiB ({savings_bytes / 1e9:.3f} GB) (~{savings_bytes / target_q8_bytes * 100:.1f}% reduction)")
+    print(f"Memory Saved:         {savings_bytes / (1 << 30):.3f} GiB ({savings_bytes / 1e9:.3f} GB) ({reduction_str})")
     print(f"Total File Size:      {in_file_size / (1 << 30):.2f} GiB -> {total_out_size / (1 << 30):.2f} GiB")
     print("==================================================================")
 
@@ -317,7 +381,7 @@ def main():
         sys.exit(f"Error: Insufficient disk space in {out_dir}. Available: {free_space / (1 << 30):.2f} GiB, Required: {needed_space / (1 << 30):.2f} GiB")
 
     # Load quantizer library
-    quants_lib = load_quants_library(args.quants_lib)
+    quants_lib, quants_lib_path, quants_lib_sha256 = load_quants_library(args.quants_lib)
 
     # 3. Construct new header
     # GGUF Magic + version + n_tensors + n_kv
@@ -338,15 +402,59 @@ def main():
     # Pad header to data_start
     out_header += bytes(in_data_start - len(out_header))
 
-    partial_path = out_path + ".partial"
-    journal_path = out_path + ".journal.json"
     start_idx = 0
+    if args.resume:
+        if not os.path.exists(partial_path):
+            sys.exit(f"Error: --resume requested but partial file {partial_path} does not exist.")
+        if not os.path.exists(journal_path):
+            sys.exit(f"Error: --resume requested but journal file {journal_path} does not exist.")
+        try:
+            with open(journal_path, "r") as jf:
+                journal_data = json.load(jf)
+        except Exception as e:
+            sys.exit(f"Error: Corrupted journal file {journal_path}: {e}")
 
-    if args.resume and os.path.exists(partial_path) and os.path.exists(journal_path):
-        with open(journal_path, "r") as jf:
-            journal_data = json.load(jf)
-            start_idx = journal_data.get("completed_tensor_idx", 0)
-        print(f"[RESUME] Resuming from tensor index {start_idx}/{n_tensors}...")
+        # Validate source identity binding
+        saved_hdr_sha = journal_data.get("source_header_sha256")
+        saved_src_sz = journal_data.get("source_size")
+        saved_nt = journal_data.get("n_tensors")
+        saved_lib_sha = journal_data.get("quants_lib_sha256")
+        saved_align = journal_data.get("alignment")
+
+        if (saved_hdr_sha != source_header_sha256 or
+            saved_src_sz != in_file_size or
+            saved_nt != n_tensors or
+            (saved_lib_sha is not None and saved_lib_sha != quants_lib_sha256) or
+            saved_align != alignment):
+            sys.exit(
+                f"Error: Resume rejected! Source model, metadata, alignment, or quantizer library has changed.\n"
+                f"  Journal: header_sha={saved_hdr_sha}, size={saved_src_sz}, nt={saved_nt}, lib_sha={saved_lib_sha}, align={saved_align}\n"
+                f"  Current: header_sha={source_header_sha256}, size={in_file_size}, nt={n_tensors}, lib_sha={quants_lib_sha256}, align={alignment}"
+            )
+
+        start_idx = journal_data.get("completed_tensor_idx", 0)
+        if not (0 <= start_idx <= n_tensors):
+            sys.exit(f"Error: Invalid completed_tensor_idx {start_idx} in journal (total tensors: {n_tensors})")
+
+        partial_size = os.path.getsize(partial_path)
+        if start_idx == n_tensors:
+            if partial_size != total_out_size:
+                sys.exit(f"Error: All tensors completed in journal, but partial file size ({partial_size}) != expected ({total_out_size})")
+            print(f"[RESUME] All {n_tensors} tensors already completed. Finalizing output file...")
+            check_file_collision(in_path, out_path, "output file")
+            os.rename(partial_path, out_path)
+            if os.path.exists(journal_path):
+                os.unlink(journal_path)
+            print("==================================================================")
+            print("                 SLIMMING COMPLETED SUCCESSFULLY!                 ")
+            print("==================================================================")
+            return
+
+        expected_min = in_data_start + tensors[start_idx].new_offset
+        if partial_size < expected_min:
+            sys.exit(f"Error: Partial file {partial_path} size ({partial_size}) is smaller than expected position for tensor {start_idx} ({expected_min})")
+
+        print(f"[RESUME] Validated source & journal. Resuming from tensor index {start_idx}/{n_tensors} ({tensors[start_idx].name})...")
     else:
         with open(partial_path, "wb") as fout:
             fout.write(out_header)
@@ -411,7 +519,7 @@ def main():
             now = time.monotonic()
             if now - last_print >= 2.0 or i == n_tensors - 1 or t.is_target:
                 pct = (i + 1) / n_tensors * 100
-                speed = total_bytes_written / (now - start_time) / (1 << 20)
+                speed = total_bytes_written / max(1e-3, (now - start_time)) / (1 << 20)
                 elapsed = now - start_time
                 est_total = elapsed / ((i + 1) / n_tensors)
                 eta = max(0, est_total - elapsed)
@@ -419,20 +527,34 @@ def main():
                 print(f"[{i+1:4d}/{n_tensors}] {pct:5.1f}% {tag} {t.name:<40s} | {speed:6.1f} MB/s | ETA: {eta:.0f}s", flush=True)
                 last_print = now
 
-                # Write journal
-                with open(journal_path, "w") as jf:
-                    json.dump({"completed_tensor_idx": i + 1, "tensor_name": t.name}, jf)
+                # Flush and fsync output file before updating journal
+                fout.flush()
+                os.fsync(fout.fileno())
+
+                # Write journal atomically
+                write_atomic_journal(journal_path, {
+                    "completed_tensor_idx": i + 1,
+                    "tensor_name": t.name,
+                    "source_header_sha256": source_header_sha256,
+                    "source_size": in_file_size,
+                    "n_tensors": n_tensors,
+                    "quants_lib_path": quants_lib_path,
+                    "quants_lib_sha256": quants_lib_sha256,
+                    "alignment": alignment,
+                    "target_count": target_count,
+                })
 
         fout.flush()
         os.fsync(fout.fileno())
 
     # Atomically rename to destination
+    check_file_collision(in_path, out_path, "output file")
     os.rename(partial_path, out_path)
     if os.path.exists(journal_path):
         os.unlink(journal_path)
 
     total_time = time.monotonic() - start_time
-    avg_speed = total_out_size / total_time / (1 << 20)
+    avg_speed = total_out_size / max(1e-3, total_time) / (1 << 20)
     print("==================================================================")
     print("                 SLIMMING COMPLETED SUCCESSFULLY!                 ")
     print("==================================================================")
