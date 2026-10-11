@@ -192,7 +192,8 @@ static myds_context_t *create(myds_model_t *m,const char *support) {
 }
 static int run(const char *model,const char *support) {
     CHECK(setenv("MYDS_PLD","0",1)==0&&setenv("MYDS_SPEC_SERIAL_PROBE","0",1)==0);
-    CHECK(setenv("MYDS_DSPARK_CAPTURE_BYPASS","0",1)==0);
+    CHECK(setenv("MYDS_DSPARK_CAPTURE_BYPASS","0",1)==0&&setenv("MYDS_PREFIX_CACHE","1",1)==0);
+    CHECK(!myds_trace_active()&&!getenv("MYDS_TRACE_DIR"));
     CHECK(setenv("MYDS_TREE_SPEC","1",1)==0&&setenv("MYDS_ENGINE_CAPTURE_BYPASS","0",1)==0);
     CHECK(setenv("MYDS_DSPARK_BACKOFF_THRESH","0",1)==0);
     myds_model_t *m=myds_model_load(model);CHECK(m&&m->v41&&m->vocab_size==129280u&&m->dim==DIM);

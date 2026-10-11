@@ -88,7 +88,11 @@ def inspect(report, raw):
             if not suffix and c<2:
                 require(requests[cl]['hit_output_cancel']==c+1 and requests[cl]['hit_index']==c+1 and
                     a['decode']['depth2_hits2']>0 and a['reason']==4,'Actual all-hit truncation absent')
-            if suffix:require(requests[cl]['continuation'] is True and requests[cl]['cached_tokens']>0,'Missing actual cache continuation')
+            if suffix:
+                require(requests[cl]['continuation'] is True and requests[ol]['continuation'] is True and
+                    requests[cl]['cached_tokens']==states[f'case{c}_candidate']['pos'] and
+                    requests[ol]['cached_tokens']==states[f'case{c}_ordinary']['pos'] and
+                    requests[cl]['prompt_tokens']==requests[ol]['prompt_tokens'],'Missing actual prefix resume')
     require(rows[-1].get('kind')=='complete' and rows[-1].get('states')==14 and rows[-1].get('raw_files')==files and
         rows[-1].get('native_all_hit_partial1_partial2') is True,'Missing completion')
     require(set(p.name for p in raw.iterdir() if p.is_file())==set(digests),'Unrecorded raw file')
