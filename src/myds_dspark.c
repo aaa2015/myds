@@ -238,15 +238,15 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
 
     // Target capture layer ids for DeepSeek-V4.1: load from GGUF metadata if available, defaulting to {37, 38, 39}
     static const char *const target_layer_keys[] = {
+        "deepseek41-dflash-draft.dflash.capture_layer_ids",
+        "dflash.capture_layer_ids",
+        "dspark.capture_layer_ids",
         "deepseek41-dflash-draft.dflash.target_layer_ids",
         "dspark.target_layer_ids",
         "deepseek4.dspark.target_layer_ids",
         "deepseek4.dspark_target_layer_ids",
         "dflash.target_layer_ids",
         "dspark.target_layers",
-        "deepseek41-dflash-draft.dflash.capture_layer_ids",
-        "dflash.capture_layer_ids",
-        "dspark.capture_layer_ids",
     };
     const gguf_kv_t *kv_cap = NULL;
     for (size_t k = 0; k < sizeof(target_layer_keys) / sizeof(target_layer_keys[0]); k++) {
@@ -264,9 +264,9 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
             ds->target_layers[i] = arr[i];
         }
     } else {
-        ds->target_layers[0] = 37;
-        ds->target_layers[1] = 38;
-        ds->target_layers[2] = 39;
+        ds->target_layers[0] = 36;
+        ds->target_layers[1] = 37;
+        ds->target_layers[2] = 38;
     }
 
     const char *env_layers = getenv("MYDS_DSPARK_TARGET_LAYERS");
