@@ -136,6 +136,7 @@ struct myds_dspark {
     myds_metal_buffer_t *markov_w1;        // mtp.2.markov_head.markov_w1.weight (embed)
     myds_metal_buffer_t *markov_w2;        // mtp.2.markov_head.markov_w2.weight (head)
     myds_metal_buffer_t *confidence_proj;  // mtp.2.confidence_head.proj.weight
+    float confidence_bias;
     ggml_type markov_w1_type, markov_w2_type, confidence_proj_type;
 
     // Context / Scratch Buffers for inference
@@ -155,6 +156,7 @@ struct myds_dspark {
     float *markov_bias_host;                // vocab_size * sizeof(float)
 
     // Draft proposal storage
+    int32_t current_seed_token;
     int32_t draft_tokens[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
     uint32_t draft_count;
 

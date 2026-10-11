@@ -28,6 +28,16 @@ static inline double now_ms(void) {
     return (double)tv.tv_sec * 1000.0 + (double)tv.tv_usec / 1000.0;
 }
 
+static inline float dspark_fp16_to_fp32(uint16_t h) {
+#if defined(__ARM_FEATURE_FP16_SCALAR_ARITHMETIC)
+    __fp16 val;
+    memcpy(&val, &h, sizeof(val));
+    return (float)val;
+#else
+    return myds_fp16_to_fp32(h);
+#endif
+}
+
 static myds_metal_buffer_t *create_metal_buf(const gguf_tensor_t *t) {
     if (!t || !t->data || !t->size_bytes) return NULL;
     myds_metal_buffer_t *buf = myds_metal_buffer_from_ptr(t->data, t->size_bytes);
@@ -195,6 +205,7 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
     uint32_t kexp = gguf_get_u32(gguf, "dspark.num_experts_per_tok", 0);
     if (!kexp) kexp = gguf_get_u32(gguf, "deepseek41-dflash-draft.expert_used_count", 3);
     ds->num_experts_per_tok = kexp;
+    ds->current_seed_token = -1;
 
     // Target capture layer ids for DeepSeek-V4.1: load from GGUF metadata if available, defaulting to {36, 37, 38}
     const gguf_kv_t *kv_cap = gguf_find_key(gguf, "deepseek41-dflash-draft.dflash.capture_layer_ids");
@@ -344,6 +355,22 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
                    (unsigned long long)t_cproj->dims[0],
                    (unsigned long long)(t_cproj->n_dims > 1 ? t_cproj->dims[1] : 0),
                    (int)t_cproj->type, ggml_type_name(t_cproj->type));
+    }
+
+    snprintf(name, sizeof(name), "mtp.%u.confidence_head.proj.bias", final_s);
+    const gguf_tensor_t *t_cbias = gguf_find_tensor(gguf, name);
+    if (!t_cbias) {
+        t_cbias = gguf_find_tensor(gguf, "dflash.dspark.confidence.bias");
+    }
+    if (t_cbias && t_cbias->data) {
+        if (t_cbias->type == GGML_TYPE_F32) {
+            ds->confidence_bias = *(const float *)t_cbias->data;
+        } else if (t_cbias->type == GGML_TYPE_F16) {
+            ds->confidence_bias = dspark_fp16_to_fp32(*(const uint16_t *)t_cbias->data);
+        }
+        MYDS_LOG_I("confidence_bias: %.6f (type=%d)", ds->confidence_bias, (int)t_cbias->type);
+    } else {
+        ds->confidence_bias = 0.0f;
     }
 
     // Allocate inference runtime scratch buffers
@@ -568,14 +595,90 @@ int myds_dspark_capture_layer_to(myds_dspark_t *ds, uint32_t layer_idx,
     return ok || !ds->capture_bypass_mode;
 }
 
-static inline float dspark_fp16_to_fp32(uint16_t h) {
-#if defined(__ARM_FEATURE_FP16_SCALAR_ARITHMETIC)
-    __fp16 val;
-    memcpy(&val, &h, sizeof(val));
-    return (float)val;
+static inline float dot_f16_row256(const uint16_t *row, const float *state) {
+    float total = 0.0f;
+#if defined(__ARM_NEON)
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    float32x4_t acc2 = vdupq_n_f32(0.0f);
+    float32x4_t acc3 = vdupq_n_f32(0.0f);
+
+    for (int k = 0; k < 256; k += 16) {
+        float16x8_t h0 = vld1q_f16((const float16_t *)(row + k));
+        float16x8_t h1 = vld1q_f16((const float16_t *)(row + k + 8));
+
+        float32x4_t f0 = vcvt_f32_f16(vget_low_f16(h0));
+        float32x4_t f1 = vcvt_f32_f16(vget_high_f16(h0));
+        float32x4_t f2 = vcvt_f32_f16(vget_low_f16(h1));
+        float32x4_t f3 = vcvt_f32_f16(vget_high_f16(h1));
+
+        acc0 = vfmaq_f32(acc0, f0, vld1q_f32(state + k));
+        acc1 = vfmaq_f32(acc1, f1, vld1q_f32(state + k + 4));
+        acc2 = vfmaq_f32(acc2, f2, vld1q_f32(state + k + 8));
+        acc3 = vfmaq_f32(acc3, f3, vld1q_f32(state + k + 12));
+    }
+    total = vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
 #else
-    return myds_fp16_to_fp32(h);
+    for (int k = 0; k < 256; k++) {
+        total += dspark_fp16_to_fp32(row[k]) * state[k];
+    }
 #endif
+    return total;
+}
+
+static inline float dot_f16_row(const uint16_t *row, const float *state, uint32_t n) {
+    float total = 0.0f;
+#if defined(__ARM_NEON)
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    uint32_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        float16x8_t h = vld1q_f16((const float16_t *)(row + i));
+        float32x4_t f0 = vcvt_f32_f16(vget_low_f16(h));
+        float32x4_t f1 = vcvt_f32_f16(vget_high_f16(h));
+        acc0 = vfmaq_f32(acc0, f0, vld1q_f32(state + i));
+        acc1 = vfmaq_f32(acc1, f1, vld1q_f32(state + i + 4));
+    }
+    total = vaddvq_f32(vaddq_f32(acc0, acc1));
+    for (; i < n; i++) {
+        total += dspark_fp16_to_fp32(row[i]) * state[i];
+    }
+#else
+    for (uint32_t i = 0; i < n; i++) {
+        total += dspark_fp16_to_fp32(row[i]) * state[i];
+    }
+#endif
+    return total;
+}
+
+static bool dspark_lookup_token_embedding(const myds_model_t *m, int32_t token_id, float *dest) {
+    if (!m || !m->tok_embeddings || token_id < 0 || (uint32_t)token_id >= m->vocab_size) {
+        return false;
+    }
+    const void *data = myds_metal_buffer_data(m->tok_embeddings);
+    if (!data) return false;
+    if (m->tok_embeddings_type == GGML_TYPE_F32) {
+        const float *row = (const float *)data + (size_t)token_id * m->dim;
+        memcpy(dest, row, m->dim * sizeof(float));
+        return true;
+    } else if (m->tok_embeddings_type == GGML_TYPE_F16) {
+        const uint16_t *row = (const uint16_t *)data + (size_t)token_id * m->dim;
+#if defined(__ARM_NEON)
+        uint32_t i = 0;
+        for (; i + 8 <= m->dim; i += 8) {
+            float16x8_t h = vld1q_f16((const float16_t *)(row + i));
+            vst1q_f32(dest + i, vcvt_f32_f16(vget_low_f16(h)));
+            vst1q_f32(dest + i + 4, vcvt_f32_f16(vget_high_f16(h)));
+        }
+        for (; i < m->dim; i++) {
+            dest[i] = dspark_fp16_to_fp32(row[i]);
+        }
+#else
+        for (uint32_t i = 0; i < m->dim; i++) dest[i] = dspark_fp16_to_fp32(row[i]);
+#endif
+        return true;
+    }
+    return false;
 }
 
 static inline float dot_q8_row(const q8_0_block_t *row, const float *state, uint32_t n_blocks) {
@@ -646,11 +749,23 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
 
     myds_dspark_workspace_t *ws = ds->ws;
     const uint32_t in_dim = MYDS_DSPARK_TARGET_LAYERS * MYDS_DSPARK_DIM;
+    const size_t stream_bytes = (size_t)MYDS_DSPARK_DIM * sizeof(float);
+
+    // 1. Initialize 4 HC streams from seed token embedding (replicated 4 times across 4 HC streams)
+    float *stage_hc_ptr = (float *)myds_metal_buffer_data(ws->stage_hc);
+    bool seeded_hc = false;
+    if (stage_hc_ptr && ds->current_seed_token >= 0 &&
+        dspark_lookup_token_embedding(ctx->model, ds->current_seed_token, stage_hc_ptr)) {
+        for (size_t c = 1; c < 4; c++) {
+            memcpy(stage_hc_ptr + c * MYDS_DSPARK_DIM, stage_hc_ptr, stream_bytes);
+        }
+        seeded_hc = true;
+    }
 
     // Begin batched Metal command buffer for stages cascade
     (void)myds_metal_begin_batch();
 
-    // 1. Stage 0 Entry Projection: [15360] -> [5120]
+    // 2. Stage 0 Entry Projection: target_hidden -> main_x [15360] -> [5120]
     if (!myds_metal_gemv(ds->stage_x_buf, ds->main_proj, ds->target_hidden_buf,
                          MYDS_DSPARK_DIM, in_dim, ds->main_proj_type)) {
         (void)myds_metal_commit_batch();
@@ -664,15 +779,16 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
         }
     }
 
-    // Initialize 4 HC streams from stage_x_buf (replicate 5120 floats 4 times)
-    const size_t stream_bytes = (size_t)MYDS_DSPARK_DIM * sizeof(float);
-    for (size_t c = 0; c < 4; c++) {
-        (void)myds_metal_buffer_copy(ws->stage_hc, c * stream_bytes, ds->stage_x_buf, 0, stream_bytes);
+    // Fallback: If seed token embedding lookup was not possible, initialize from main_x
+    if (!seeded_hc) {
+        for (size_t c = 0; c < 4; c++) {
+            (void)myds_metal_buffer_copy(ws->stage_hc, c * stream_bytes, ds->stage_x_buf, 0, stream_bytes);
+        }
     }
 
     myds_v41_gpu_scratch_t *gpu_s = ws->gpu_scratch;
 
-    // 2. Transformer Stages Cascade (0, 1, 2)
+    // 3. Transformer Stages Cascade (0, 1, 2)
     for (uint32_t s = 0; s < ds->stage_count; s++) {
         myds_dspark_stage_t *st = &ds->stages[s];
 
@@ -696,35 +812,43 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
             (void)myds_metal_buffer_copy(ws->attn_norm, 0, ws->attn_cur, 0, stream_bytes);
         }
 
-        // Q projection: [5120] -> [1280] -> [32768]
+        // 3a. Target KV projection from main_x (ds->stage_x_buf) -> slot 0 of ws->stage_kv_cache[s]
+        if (st->attn_kv) {
+            (void)myds_metal_gemv(ws->kv, st->attn_kv, ds->stage_x_buf, 512, MYDS_DSPARK_DIM, st->attn_kv_type);
+            if (st->attn_kv_a_norm) {
+                (void)myds_metal_v41_rmsnorm(ws->kv_norm, ws->kv, st->attn_kv_a_norm, 512, 1e-6f, true);
+            }
+            uint32_t feat_pos = ctx->pos > 0 ? ctx->pos - 1 : 0;
+            (void)myds_v41_gpu_rope(ws->kv_norm ? ws->kv_norm : ws->kv, 512, 1, feat_pos, false, false);
+            (void)myds_metal_buffer_copy(ws->stage_kv_cache[s], 0,
+                                         ws->kv_norm ? ws->kv_norm : ws->kv, 0, 512 * sizeof(float));
+        }
+
+        // 3b. Draft Q projection from ws->attn_norm: [5120] -> [1280] -> [32768]
         if (st->attn_q_a && st->attn_q_b) {
             (void)myds_metal_gemv(ws->qr, st->attn_q_a, ws->attn_norm, 1280, MYDS_DSPARK_DIM, st->attn_q_a_type);
             if (st->attn_q_a_norm) {
                 (void)myds_metal_v41_rmsnorm(ws->qr_norm, ws->qr, st->attn_q_a_norm, 1280, 1e-6f, true);
             }
             (void)myds_metal_gemv(ws->q, st->attn_q_b, ws->qr_norm ? ws->qr_norm : ws->qr, 64 * 512, 1280, st->attn_q_b_type);
+            (void)myds_v41_gpu_rope(ws->q, 512, 64, ctx->pos, false, false);
         }
 
-        // KV projection: [5120] -> [512]
+        // 3c. Draft KV projection from ws->attn_norm: [5120] -> [512] -> slot 1 of ws->stage_kv_cache[s]
         if (st->attn_kv) {
             (void)myds_metal_gemv(ws->kv, st->attn_kv, ws->attn_norm, 512, MYDS_DSPARK_DIM, st->attn_kv_type);
             if (st->attn_kv_a_norm) {
                 (void)myds_metal_v41_rmsnorm(ws->kv_norm, ws->kv, st->attn_kv_a_norm, 512, 1e-6f, true);
             }
+            (void)myds_v41_gpu_rope(ws->kv_norm ? ws->kv_norm : ws->kv, 512, 1, ctx->pos, false, false);
+            (void)myds_metal_buffer_copy(ws->stage_kv_cache[s], 512 * sizeof(float),
+                                         ws->kv_norm ? ws->kv_norm : ws->kv, 0, 512 * sizeof(float));
         }
 
-        // RoPE on Q & KV
-        (void)myds_v41_gpu_rope(ws->q, 512, 64, ctx->pos, false, false);
-        (void)myds_v41_gpu_rope(ws->kv_norm ? ws->kv_norm : ws->kv, 512, 1, ctx->pos, false, false);
-
-        // Store into Stage KV cache (Single-row support: seed slot 0 for clean alignment)
-        (void)myds_metal_buffer_copy(ws->stage_kv_cache[s], 0,
-                                    ws->kv_norm ? ws->kv_norm : ws->kv, 0, 512 * sizeof(float));
-
-        // Direct Attention with sinks (single row: nraw=1, raw_start=0)
+        // 3d. Direct Attention with sinks attending to BOTH keys: slot 0 (target) and slot 1 (draft), n_raw = 2
         if (gpu_s) {
             (void)myds_v41_gpu_attention_direct(ws->attn_heads, st->attn_sinks, ws->q,
-                                                ws->stage_kv_cache[s], 1, 0,
+                                                ws->stage_kv_cache[s], 2, 0,
                                                 NULL, NULL, 0, 0, gpu_s);
         }
 
@@ -822,7 +946,7 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
         }
     }
 
-    // 3. Final Head (mtp.2.norm + Base Model LM Head)
+    // 4. Final Head (mtp.2.norm + Base Model LM Head)
     myds_dspark_stage_t *final_st = &ds->stages[ds->stage_count - 1u];
     if (final_st->hc_ffn_fn) {
         (void)myds_metal_v41_rmsnorm(ws->flat_hc_norm, ws->stage_hc, NULL, 4 * MYDS_DSPARK_DIM, 1e-6f, false);
@@ -839,20 +963,33 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
         (void)myds_metal_buffer_copy(ws->final_norm_out, 0, ws->final_embd, 0, stream_bytes);
     }
 
-    const bool can_early_exit = (ds->confidence_proj && ds->confidence_proj_type == GGML_TYPE_Q8_0 && min_conf > 0.0f);
+    const bool has_conf_proj = (ds->confidence_proj &&
+                                (ds->confidence_proj_type == GGML_TYPE_F16 ||
+                                 ds->confidence_proj_type == GGML_TYPE_Q8_0));
+    const bool can_early_exit = (has_conf_proj && min_conf > 0.0f);
 
     if (can_early_exit) {
         // Commit final stages batch to complete GPU work for hidden states so CPU can test confidence
         (void)myds_metal_commit_batch();
 
         float conf_prob = 1.0f;
-        const q8_0_block_t *w_conf = (const q8_0_block_t *)myds_metal_buffer_data(ds->confidence_proj);
         const float *final_embd_data = (const float *)myds_metal_buffer_data(ws->final_embd);
-        if (w_conf && final_embd_data) {
-            float conf_score = dot_q8_row(w_conf, final_embd_data, 160);
-            if (ds->markov_state_host) {
-                conf_score += dot_q8_row(w_conf + 160, ds->markov_state_host, 8);
+        if (final_embd_data) {
+            float conf_score = 0.0f;
+            if (ds->confidence_proj_type == GGML_TYPE_F16) {
+                const uint16_t *w_conf = (const uint16_t *)myds_metal_buffer_data(ds->confidence_proj);
+                conf_score = dot_f16_row(w_conf, final_embd_data, MYDS_DSPARK_DIM);
+                if (ds->markov_state_host) {
+                    conf_score += dot_f16_row(w_conf + MYDS_DSPARK_DIM, ds->markov_state_host, ds->markov_rank);
+                }
+            } else if (ds->confidence_proj_type == GGML_TYPE_Q8_0) {
+                const q8_0_block_t *w_conf = (const q8_0_block_t *)myds_metal_buffer_data(ds->confidence_proj);
+                conf_score = dot_q8_row(w_conf, final_embd_data, MYDS_DSPARK_DIM / 32);
+                if (ds->markov_state_host) {
+                    conf_score += dot_q8_row(w_conf + MYDS_DSPARK_DIM / 32, ds->markov_state_host, ds->markov_rank / 32);
+                }
             }
+            conf_score += ds->confidence_bias;
             conf_prob = 1.0f / (1.0f + expf(-conf_score));
         }
         if (out_confidence) *out_confidence = conf_prob;
@@ -875,14 +1012,24 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
 
         if (out_confidence) {
             float conf_prob = 1.0f;
-            if (ds->confidence_proj && ds->confidence_proj_type == GGML_TYPE_Q8_0) {
-                const q8_0_block_t *w_conf = (const q8_0_block_t *)myds_metal_buffer_data(ds->confidence_proj);
+            if (has_conf_proj) {
                 const float *final_embd_data = (const float *)myds_metal_buffer_data(ws->final_embd);
-                if (w_conf && final_embd_data) {
-                    float conf_score = dot_q8_row(w_conf, final_embd_data, 160);
-                    if (ds->markov_state_host) {
-                        conf_score += dot_q8_row(w_conf + 160, ds->markov_state_host, 8);
+                if (final_embd_data) {
+                    float conf_score = 0.0f;
+                    if (ds->confidence_proj_type == GGML_TYPE_F16) {
+                        const uint16_t *w_conf = (const uint16_t *)myds_metal_buffer_data(ds->confidence_proj);
+                        conf_score = dot_f16_row(w_conf, final_embd_data, MYDS_DSPARK_DIM);
+                        if (ds->markov_state_host) {
+                            conf_score += dot_f16_row(w_conf + MYDS_DSPARK_DIM, ds->markov_state_host, ds->markov_rank);
+                        }
+                    } else if (ds->confidence_proj_type == GGML_TYPE_Q8_0) {
+                        const q8_0_block_t *w_conf = (const q8_0_block_t *)myds_metal_buffer_data(ds->confidence_proj);
+                        conf_score = dot_q8_row(w_conf, final_embd_data, MYDS_DSPARK_DIM / 32);
+                        if (ds->markov_state_host) {
+                            conf_score += dot_q8_row(w_conf + MYDS_DSPARK_DIM / 32, ds->markov_state_host, ds->markov_rank / 32);
+                        }
                     }
+                    conf_score += ds->confidence_bias;
                     conf_prob = 1.0f / (1.0f + expf(-conf_score));
                 }
             }
@@ -915,6 +1062,7 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
 
     double t0 = now_ms();
     ds->cycles++;
+    ds->current_seed_token = last_token;
 
     uint32_t K = draft_cap > 0 && draft_cap < ds->block_size ? draft_cap : ds->block_size;
     if (K > MYDS_DSPARK_DEFAULT_BLOCK_SIZE) K = MYDS_DSPARK_DEFAULT_BLOCK_SIZE;
@@ -935,7 +1083,7 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
     static float min_conf = -1.0f;
     if (__builtin_expect(min_conf < -0.5f, 0)) {
         const char *env = getenv("MYDS_DSPARK_MIN_CONF");
-        min_conf = env ? (float)atof(env) : 0.80f; // 0.80 threshold
+        min_conf = env ? (float)atof(env) : 0.0f; // Default 0.0f so authoritative verifier always runs
         MYDS_LOG_I("DSpark confidence head threshold: %.2f", min_conf);
     }
 
@@ -943,20 +1091,35 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
     uint32_t n_proposed = 0;
     const uint32_t vocab_size = ctx->model->vocab_size;
 
-    const bool has_markov = (ds->markov_w1 && ds->markov_w2 &&
-                             ds->markov_w1_type == GGML_TYPE_Q8_0 &&
-                             ds->markov_w2_type == GGML_TYPE_Q8_0 &&
+    const bool is_f16 = (ds->markov_w1_type == GGML_TYPE_F16 && ds->markov_w2_type == GGML_TYPE_F16);
+    const bool is_q8  = (ds->markov_w1_type == GGML_TYPE_Q8_0 && ds->markov_w2_type == GGML_TYPE_Q8_0);
+    const bool has_markov = (ds->markov_w1 && ds->markov_w2 && (is_f16 || is_q8) &&
                              ds->markov_state_host && ds->markov_bias_host);
 
-    const q8_0_block_t *w1_base = has_markov ? (const q8_0_block_t *)myds_metal_buffer_data(ds->markov_w1) : NULL;
-    const q8_0_block_t *w2_base = has_markov ? (const q8_0_block_t *)myds_metal_buffer_data(ds->markov_w2) : NULL;
+    const void *w1_base = has_markov ? myds_metal_buffer_data(ds->markov_w1) : NULL;
+    const void *w2_base = has_markov ? myds_metal_buffer_data(ds->markov_w2) : NULL;
 
     if (has_markov && w1_base && prev >= 0 && (uint32_t)prev < vocab_size) {
-        const q8_0_block_t *w1_row = w1_base + (size_t)prev * 8;
-        for (int b = 0; b < 8; b++) {
-            float d_scale = dspark_fp16_to_fp32(w1_row[b].d);
-            for (int k = 0; k < 32; k++) {
-                ds->markov_state_host[b * 32 + k] = d_scale * (float)w1_row[b].qs[k];
+        if (is_f16) {
+            const uint16_t *w1_row = ((const uint16_t *)w1_base) + (size_t)prev * 256;
+#if defined(__ARM_NEON)
+            for (int k = 0; k < 256; k += 8) {
+                float16x8_t h = vld1q_f16((const float16_t *)(w1_row + k));
+                vst1q_f32(ds->markov_state_host + k, vcvt_f32_f16(vget_low_f16(h)));
+                vst1q_f32(ds->markov_state_host + k + 4, vcvt_f32_f16(vget_high_f16(h)));
+            }
+#else
+            for (int k = 0; k < 256; k++) {
+                ds->markov_state_host[k] = dspark_fp16_to_fp32(w1_row[k]);
+            }
+#endif
+        } else if (is_q8) {
+            const q8_0_block_t *w1_row = ((const q8_0_block_t *)w1_base) + (size_t)prev * 8;
+            for (int b = 0; b < 8; b++) {
+                float d_scale = dspark_fp16_to_fp32(w1_row[b].d);
+                for (int k = 0; k < 32; k++) {
+                    ds->markov_state_host[b * 32 + k] = d_scale * (float)w1_row[b].qs[k];
+                }
             }
         }
     }
@@ -995,13 +1158,28 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
         float best_score2 = -INFINITY;
 
         if (has_markov && w1_base && w2_base && prev >= 0 && (uint32_t)prev < vocab_size) {
-            // Dequantize 8 blocks from markov_w1 for row `prev` if d > 0 (d == 0 already done)
+            // Dequantize / load row `prev` if d > 0 (d == 0 already done)
             if (d > 0) {
-                const q8_0_block_t *w1_row = w1_base + (size_t)prev * 8;
-                for (int b = 0; b < 8; b++) {
-                    float d_scale = dspark_fp16_to_fp32(w1_row[b].d);
-                    for (int k = 0; k < 32; k++) {
-                        ds->markov_state_host[b * 32 + k] = d_scale * (float)w1_row[b].qs[k];
+                if (is_f16) {
+                    const uint16_t *w1_row = ((const uint16_t *)w1_base) + (size_t)prev * 256;
+#if defined(__ARM_NEON)
+                    for (int k = 0; k < 256; k += 8) {
+                        float16x8_t h = vld1q_f16((const float16_t *)(w1_row + k));
+                        vst1q_f32(ds->markov_state_host + k, vcvt_f32_f16(vget_low_f16(h)));
+                        vst1q_f32(ds->markov_state_host + k + 4, vcvt_f32_f16(vget_high_f16(h)));
+                    }
+#else
+                    for (int k = 0; k < 256; k++) {
+                        ds->markov_state_host[k] = dspark_fp16_to_fp32(w1_row[k]);
+                    }
+#endif
+                } else if (is_q8) {
+                    const q8_0_block_t *w1_row = ((const q8_0_block_t *)w1_base) + (size_t)prev * 8;
+                    for (int b = 0; b < 8; b++) {
+                        float d_scale = dspark_fp16_to_fp32(w1_row[b].d);
+                        for (int k = 0; k < 32; k++) {
+                            ds->markov_state_host[b * 32 + k] = d_scale * (float)w1_row[b].qs[k];
+                        }
                     }
                 }
             }
@@ -1025,11 +1203,22 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
                 int32_t local_t1 = 0, local_t2 = 0;
                 float local_s1 = -INFINITY, local_s2 = -INFINITY;
 
-                for (uint32_t r = r0; r < r1; r++) {
-                    const q8_0_block_t *w2_row = w2_base + (size_t)r * 8;
-                    float bias = dot_q8_row256(w2_row, ds->markov_state_host);
-                    float score = base_logits ? (base_logits[r] + markov_scale * bias) : bias;
-                    dspark_update_top2((int32_t)r, score, &local_t1, &local_s1, &local_t2, &local_s2);
+                if (is_f16) {
+                    const uint16_t *w2_base_f16 = (const uint16_t *)w2_base;
+                    for (uint32_t r = r0; r < r1; r++) {
+                        const uint16_t *w2_row = w2_base_f16 + (size_t)r * 256;
+                        float bias = dot_f16_row256(w2_row, ds->markov_state_host);
+                        float score = base_logits ? (base_logits[r] + markov_scale * bias) : bias;
+                        dspark_update_top2((int32_t)r, score, &local_t1, &local_s1, &local_t2, &local_s2);
+                    }
+                } else if (is_q8) {
+                    const q8_0_block_t *w2_base_q8 = (const q8_0_block_t *)w2_base;
+                    for (uint32_t r = r0; r < r1; r++) {
+                        const q8_0_block_t *w2_row = w2_base_q8 + (size_t)r * 8;
+                        float bias = dot_q8_row256(w2_row, ds->markov_state_host);
+                        float score = base_logits ? (base_logits[r] + markov_scale * bias) : bias;
+                        dspark_update_top2((int32_t)r, score, &local_t1, &local_s1, &local_t2, &local_s2);
+                    }
                 }
                 tokens_out[s] = local_t1;
                 scores_out[s] = local_s1;
@@ -1042,11 +1231,22 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
                 dspark_update_top2(slice_tokens2[s], slice_scores2[s], &best_token, &best_score, &best_token2, &best_score2);
             }
 #else
-            for (uint32_t r = 0; r < vocab_size; r++) {
-                const q8_0_block_t *w2_row = w2_base + (size_t)r * 8;
-                float bias = dot_q8_row256(w2_row, ds->markov_state_host);
-                float score = base_logits ? (base_logits[r] + markov_scale * bias) : bias;
-                dspark_update_top2((int32_t)r, score, &best_token, &best_score, &best_token2, &best_score2);
+            if (is_f16) {
+                const uint16_t *w2_base_f16 = (const uint16_t *)w2_base;
+                for (uint32_t r = 0; r < vocab_size; r++) {
+                    const uint16_t *w2_row = w2_base_f16 + (size_t)r * 256;
+                    float bias = dot_f16_row256(w2_row, ds->markov_state_host);
+                    float score = base_logits ? (base_logits[r] + markov_scale * bias) : bias;
+                    dspark_update_top2((int32_t)r, score, &best_token, &best_score, &best_token2, &best_score2);
+                }
+            } else if (is_q8) {
+                const q8_0_block_t *w2_base_q8 = (const q8_0_block_t *)w2_base;
+                for (uint32_t r = 0; r < vocab_size; r++) {
+                    const q8_0_block_t *w2_row = w2_base_q8 + (size_t)r * 8;
+                    float bias = dot_q8_row256(w2_row, ds->markov_state_host);
+                    float score = base_logits ? (base_logits[r] + markov_scale * bias) : bias;
+                    dspark_update_top2((int32_t)r, score, &best_token, &best_score, &best_token2, &best_score2);
+                }
             }
 #endif
         } else if (base_logits) {
@@ -1066,7 +1266,7 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
             static float min_margin = -1.0f;
             if (__builtin_expect(min_margin < -0.5f, 0)) {
                 const char *env = getenv("MYDS_DSPARK_MIN_MARGIN");
-                min_margin = env ? (float)atof(env) : 0.40f;
+                min_margin = env ? (float)atof(env) : 0.0f; // Default 0.0f so authoritative verifier always runs
                 MYDS_LOG_I("DSpark logit margin gating active: threshold=%.2f", min_margin);
             }
 
