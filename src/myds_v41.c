@@ -3703,7 +3703,8 @@ int myds_v41_batch2_projection_probe(myds_metal_buffer_t *out[2],
     const bool trace_on = myds_trace_active();
     int shared_eligible = 0;
     if (!trace_on) {
-        if (type == GGML_TYPE_Q8_0 && kind == MYDS_V41_BATCH2_TAIL) {
+        if (type == GGML_TYPE_Q8_0 &&
+            (kind == MYDS_V41_BATCH2_TAIL || kind == MYDS_V41_BATCH2_SHARED || kind == MYDS_V41_BATCH2_QKV)) {
             const int shared = myds_metal_batch2_q8_shared_mode();
             if (shared < 0) return 0;
             if (shared && myds_v41_decode_q8_fuse_bf16_enabled()) shared_eligible = 1;
@@ -4253,12 +4254,12 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
 
     CHECK(myds_metal_begin_batch());
     prev_auto_barrier = myds_metal_get_auto_barrier();
-    /* Batch-2 shares Engram/compressor scratch between rows and reuses HC
-     * intermediates across layers. Retain the helpers' scope barriers until
-     * the complete graph has an audited RAW/WAR dependency schedule. A
-     * serial encoder hid missing joins here; global METAL_CONCURRENT=1
-     * makes them observable. Restore the caller's setting on every exit. */
-    myds_metal_set_auto_barrier(1);
+    static int batch2_auto_barrier = -1;
+    if (batch2_auto_barrier < 0) {
+        const char *e = getenv("MYDS_BATCH2_AUTO_BARRIER");
+        batch2_auto_barrier = e ? atoi(e) : 1;
+    }
+    myds_metal_set_auto_barrier(batch2_auto_barrier);
     const myds_metal_buffer_t *init_deps[] = { ws->v_residual[0], ws->v_residual[1], ws->v_pre[0], ws->v_pre[1] };
     myds_metal_barrier_buffers(init_deps, 4);
 
@@ -4453,7 +4454,7 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_buffer_copy(ctx->logits, 0, ws->v_logits[1], 0, m->vocab_size * sizeof(float)));
 
         CHECK(v41_copy_dspark_slots(ctx, ws->dspark_slots[1]));
-        CHECK(myds_metal_commit_batch());
+        CHECK(myds_metal_flush_batch());
         myds_dspark_capture_publish(ctx->dspark);
 
         myds_metal_set_auto_barrier(prev_auto_barrier);
@@ -4473,7 +4474,7 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_buffer_copy(g->pre, 0, ws->v_pre[0], 0, 4 * sizeof(float)));
 
         CHECK(v41_copy_dspark_slots(ctx, ws->dspark_slots[0]));
-        CHECK(myds_metal_commit_batch());
+        CHECK(myds_metal_flush_batch());
         myds_dspark_capture_publish(ctx->dspark);
 
         myds_metal_set_auto_barrier(prev_auto_barrier);
@@ -4809,7 +4810,7 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_buffer_copy(g->pre, 0, ws->v_pre[1], 0, 4 * sizeof(float)));
 
         CHECK(v41_copy_dspark_slots(ctx, ws->dspark_slots[1]));
-        CHECK(myds_metal_commit_batch());
+        CHECK(myds_metal_flush_batch());
         myds_dspark_capture_publish(ctx->dspark);
 
         myds_metal_set_auto_barrier(prev_auto_barrier);
@@ -4843,7 +4844,7 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_buffer_copy(g->pre, 0, ws->v_pre[2], 0, 4 * sizeof(float)));
 
         CHECK(v41_copy_dspark_slots(ctx, ws->dspark_slots[2]));
-        CHECK(myds_metal_commit_batch());
+        CHECK(myds_metal_flush_batch());
         myds_dspark_capture_publish(ctx->dspark);
 
         myds_metal_set_auto_barrier(prev_auto_barrier);
@@ -4864,7 +4865,7 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_buffer_copy(g->pre, 0, ws->v_pre[0], 0, 4 * sizeof(float)));
 
         CHECK(v41_copy_dspark_slots(ctx, ws->dspark_slots[0]));
-        CHECK(myds_metal_commit_batch());
+        CHECK(myds_metal_flush_batch());
         myds_dspark_capture_publish(ctx->dspark);
 
         myds_metal_set_auto_barrier(prev_auto_barrier);

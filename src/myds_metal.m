@@ -1619,7 +1619,7 @@ int myds_metal_init(const char *shader_dir) {
         MYDS_LOG_I("Routed MoE geometry: IQ2 NSG=%d, Q2 down NSG=%d (%s)",
                    g_moe_nsg, g_moe_down_nsg, down_nsg_env ? "explicit" : "inherited");
         MYDS_LOG_I("Routed MoE IQ2 LUT: %s", g_moe_iq2_constant_lut ? "constant (explicit)" : "threadgroup (reference)");
-        MYDS_LOG_I("Batch2 output-B Q8 shared weights: %s", batch2_q8_shared ? "enabled (explicit; eligible TAIL only)" : "disabled (scalar reference)");
+        MYDS_LOG_I("Batch2 Q8 shared weights: %s", batch2_q8_shared ? "enabled (explicit; TAIL, SHARED, QKV)" : "disabled (scalar reference)");
         MYDS_LOG_I("LM-head Q8 rows per threadgroup: %d (%s; single token, large output, NSG8)",
                    g_lm_head_q8_nr0, lm_head_q8_nr0 == 4 ? "explicit candidate" : "reference");
         MYDS_LOG_I("F16 GEMV BF16 fuse: %d (%s; explicit ordinary scalar scope)",
