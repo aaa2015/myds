@@ -4288,7 +4288,7 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
     static int batch2_auto_barrier = -1;
     if (batch2_auto_barrier < 0) {
         const char *e = getenv("MYDS_BATCH2_AUTO_BARRIER");
-        batch2_auto_barrier = e ? atoi(e) : 1;
+        batch2_auto_barrier = e ? atoi(e) : 0;
     }
     myds_metal_set_auto_barrier(batch2_auto_barrier);
     const myds_metal_buffer_t *init_deps[] = { ws->v_residual[0], ws->v_residual[1], ws->v_pre[0], ws->v_pre[1] };

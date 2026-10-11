@@ -310,9 +310,9 @@ kernel void kernel_mul_mv_q8_0_f32_bf16_r4(
  * half scale once for two independent input rows. Each token preserves the
  * scalar helper's eight products, block-scale placement, K walk and both
  * simd_sum reductions. No dequantized half staging or matrix instructions. */
-template<short NR0, bool ROUND_BF16>
+template<short NR0, bool ROUND_BF16, typename args_t = constant ds4_metal_args_mul_mv &>
 void kernel_dsv41_q8_shared2_impl(
-        constant ds4_metal_args_mul_mv &args,
+        args_t args,
         device const char *src0,
         device const float *input0, device const float *input1,
         device float *output0, device float *output1,

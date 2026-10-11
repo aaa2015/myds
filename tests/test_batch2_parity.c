@@ -350,7 +350,45 @@ static int test_batch2_attn_output_a(void) {
     myds_metal_buffer_free(low_b2);
     myds_metal_buffer_free(out_a);
 
-    printf("  [PASS] Batch-2 Attention Output A 100%% bit-exact!\n");
+    // Also test Q8_0 shared2 Attention Output A
+    const size_t out_a_bytes_q8 = (size_t)n_groups * rank * (group_dim / 32u) * 34u;
+    myds_metal_buffer_t *out_a_q8 = myds_metal_buffer_alloc(out_a_bytes_q8);
+    heads_b2 = myds_metal_buffer_alloc(2 * heads_per_tok * sizeof(float));
+    low_b2 = myds_metal_buffer_alloc(2 * low_per_tok * sizeof(float));
+    CHECK(out_a_q8 && heads_b2 && low_b2);
+    fill_q8_weights(out_a_q8);
+
+    for (uint32_t t = 0; t < 2; ++t) {
+        heads_seq[t] = myds_metal_buffer_alloc(heads_per_tok * sizeof(float));
+        low_seq[t] = myds_metal_buffer_alloc(low_per_tok * sizeof(float));
+        CHECK(heads_seq[t] && low_seq[t]);
+        fill_act(heads_seq[t], 123u + 456u * t);
+        memcpy((float *)myds_metal_buffer_data(heads_b2) + t * heads_per_tok,
+               myds_metal_buffer_data(heads_seq[t]), heads_per_tok * sizeof(float));
+    }
+
+    CHECK(myds_metal_begin_batch());
+    for (uint32_t t = 0; t < 2; ++t) {
+        CHECK(myds_metal_attn_output_a_bf16(low_seq[t], out_a_q8, heads_seq[t], n_groups, group_dim, rank, GGML_TYPE_Q8_0));
+    }
+    CHECK(myds_metal_commit_batch());
+
+    CHECK(myds_metal_begin_batch());
+    CHECK(myds_metal_attn_output_a_bf16_batch(low_b2, out_a_q8, heads_b2, n_groups, group_dim, rank, 2, GGML_TYPE_Q8_0));
+    CHECK(myds_metal_commit_batch());
+
+    for (uint32_t t = 0; t < 2; ++t) {
+        myds_metal_buffer_t *low_sub = myds_metal_buffer_sub_view(low_b2, t * low_per_tok * sizeof(float), low_per_tok * sizeof(float));
+        CHECK(verify_exact(low_seq[t], low_sub, low_per_tok));
+        myds_metal_buffer_free(low_sub);
+        myds_metal_buffer_free(heads_seq[t]);
+        myds_metal_buffer_free(low_seq[t]);
+    }
+    myds_metal_buffer_free(heads_b2);
+    myds_metal_buffer_free(low_b2);
+    myds_metal_buffer_free(out_a_q8);
+
+    printf("  [PASS] Batch-2 Attention Output A (Q4_K and Q8_0) 100%% bit-exact!\n");
     return 1;
 }
 

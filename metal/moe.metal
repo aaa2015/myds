@@ -3408,9 +3408,9 @@ kernel void kernel_mul_mv_q4_K_dense_f32_bf16(
  * once for two independent input rows (tokens 0 and 1). Reuses the exact
  * 4-bit nibble unpacking, scaling, and intra-simdgroup reduction as
  * kernel_mul_mv_q4_K_f32_impl. Rounds final outputs directly to BF16. */
-template<short NR0>
+template<short NR0, typename args_t = constant ds4_metal_args_mul_mv &>
 void kernel_dsv41_q4_K_shared2_bf16_impl(
-        constant ds4_metal_args_mul_mv &args,
+        args_t args,
         device const char *weight,
         device const float *input0, device const float *input1,
         device float *output0, device float *output1,
@@ -3675,6 +3675,61 @@ kernel void kernel_dsv4_attn_out_low_q8_0_bf16_r4(
         sgitg);
 }
 
+kernel void kernel_dsv4_attn_out_low_q8_0_bf16_shared2(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    (void)tiitg;
+    const int idx = tgpig.z;
+    tgpig.z = 0;
+
+    device const char * src0_cur = src0s + idx * args.nb02;
+    device const float * src1_0  = (device const float *)(src1 + idx * args.nb11);
+    device const float * src1_1  = (device const float *)(src1 + idx * args.nb11 + args.nb12);
+    device float * dst_0         = (device float *)(dst + (idx * args.ne0) * sizeof(float));
+    device float * dst_1         = (device float *)(dst + (idx * args.ne0 + args.ne1 * args.ne0) * sizeof(float));
+
+    ds4_metal_args_mul_mv args0 = {
+        args.ne00,
+        args.ne01,
+        1,
+        args.nb00,
+        args.nb01,
+        args.nb02,
+        args.nb02,
+        args.ne10,
+        1,
+        1,
+        args.nb10,
+        args.nb11,
+        args.nb12,
+        args.nb12,
+        args.ne0,
+        1,
+        4,
+        1,
+        1,
+    };
+
+    kernel_dsv41_q8_shared2_impl<4, true, ds4_metal_args_mul_mv>(
+        args0,
+        src0_cur,
+        src1_0,
+        src1_1,
+        dst_0,
+        dst_1,
+        shmem,
+        tgpig,
+        tiisg,
+        sgitg);
+}
+
 kernel void kernel_dsv4_attn_out_low_q4_K_f32(
         constant ds4_metal_args_mul_mv_id & args,
         device const char * src0s,
@@ -3783,6 +3838,61 @@ kernel void kernel_dsv4_attn_out_low_q4_K_bf16(
         src0_cur,
         src1_cur,
         dst_cur,
+        shmem,
+        tgpig,
+        tiisg,
+        sgitg);
+}
+
+kernel void kernel_dsv4_attn_out_low_q4_K_bf16_shared2(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    (void)tiitg;
+    const int idx = tgpig.z;
+    tgpig.z = 0;
+
+    device const char * src0_cur = src0s + idx * args.nb02;
+    device const float * src1_0  = (device const float *)(src1 + idx * args.nb11);
+    device const float * src1_1  = (device const float *)(src1 + idx * args.nb11 + args.nb12);
+    device float * dst_0         = (device float *)(dst + (idx * args.ne0) * sizeof(float));
+    device float * dst_1         = (device float *)(dst + (idx * args.ne0 + args.ne1 * args.ne0) * sizeof(float));
+
+    ds4_metal_args_mul_mv args0 = {
+        args.ne00,
+        args.ne01,
+        1,
+        args.nb00,
+        args.nb01,
+        args.nb02,
+        args.nb02,
+        args.ne10,
+        1,
+        1,
+        args.nb10,
+        args.nb11,
+        args.nb12,
+        args.nb12,
+        args.ne0,
+        1,
+        args.nr0,
+        1,
+        1,
+    };
+
+    kernel_dsv41_q4_K_shared2_bf16_impl<N_R0_Q4_K, ds4_metal_args_mul_mv>(
+        args0,
+        src0_cur,
+        src1_0,
+        src1_1,
+        dst_0,
+        dst_1,
         shmem,
         tgpig,
         tiisg,
