@@ -167,6 +167,75 @@ static void reuse(struct fixture *f,unsigned case_id) {
     for(unsigned i=0;i<3u;++i)release(inputs[i]);
 }
 
+/* Match Batch2's two distinct inputs/residual views and shared projected KV.
+ * The oracle completes each scalar token in its own CB. The paired arm has
+ * no copies, observations, caller barriers, or encoder breaks between adds
+ * and HC consumers: only the production helper supplies the dependency. */
+static void batch2_hc_dependency(struct fixture *f,unsigned case_id) {
+    struct guarded inputs=allocate(2u*WIDTH*4u,32u),pre=allocate(8u*4u,16u),norm=allocate(DIM*4u,32u);
+    struct guarded res[2],sum[2],out[2];
+    myds_metal_buffer_t *input_rows[2],*pre_rows[2],*res_rows[2][2],*sum_rows[2][2],*out_rows[2][2];
+    for(unsigned t=0;t<2u;++t){
+        fill_inputs(f,211u+31u*t,0);
+        memcpy((uint8_t *)myds_metal_buffer_data(inputs.view)+t*WIDTH*4u,myds_metal_buffer_data(f->input.view),WIDTH*4u);
+        input_rows[t]=myds_metal_buffer_sub_view(inputs.view,t*WIDTH*4u,WIDTH*4u);REQUIRE(input_rows[t]);
+        pre_rows[t]=myds_metal_buffer_sub_view(pre.view,t*4u*4u,4u*4u);REQUIRE(pre_rows[t]);
+        float *p=myds_metal_buffer_data(pre_rows[t]);
+        for(unsigned h=0;h<4u;++h)p[h]=(float)(h+1u+t)/16.0f;
+    }
+    float *nw=myds_metal_buffer_data(norm.view);
+    for(unsigned i=0;i<DIM;++i)nw[i]=0.5f+(float)(random_bits(i,313u)%128u)/128.0f;
+    for(unsigned arm=0;arm<2u;++arm){
+        res[arm]=allocate(2u*RES_FLOATS*4u,32u);sum[arm]=allocate(2u*DIM*4u,48u);out[arm]=allocate(2u*DIM*4u,64u);
+        for(unsigned t=0;t<2u;++t){
+            res_rows[arm][t]=myds_metal_buffer_sub_view(res[arm].view,t*RES_FLOATS*4u,RES_FLOATS*4u);
+            sum_rows[arm][t]=myds_metal_buffer_sub_view(sum[arm].view,t*DIM*4u,DIM*4u);
+            out_rows[arm][t]=myds_metal_buffer_sub_view(out[arm].view,t*DIM*4u,DIM*4u);
+            REQUIRE(res_rows[arm][t]&&sum_rows[arm][t]&&out_rows[arm][t]);
+        }
+    }
+    uint64_t input_hash=fnv(myds_metal_buffer_data(inputs.view),inputs.bytes);
+    uint64_t norm_hash=fnv(myds_metal_buffer_data(norm.view),norm.bytes),pre_hash=fnv(myds_metal_buffer_data(pre.view),pre.bytes);
+    myds_v41_engram_project_round_counters_t before,after;myds_v41_engram_project_round_counters(&before,false);
+    for(unsigned arm=0;arm<2u;++arm)for(unsigned repeat=0;repeat<(arm?8u:1u);++repeat){
+        for(unsigned t=0;t<2u;++t){
+            fill_inputs(f,337u+19u*t,0);
+            memcpy(myds_metal_buffer_data(res_rows[arm][t]),myds_metal_buffer_data(f->initial.view),RES_FLOATS*4u);
+        }
+        memset(myds_metal_buffer_data(sum[arm].view),0xa5,sum[arm].bytes);
+        memset(myds_metal_buffer_data(out[arm].view),0xa5,out[arm].bytes);
+        if(arm)REQUIRE(myds_metal_begin_batch());
+        for(unsigned t=0;t<2u;++t){
+            if(!arm)REQUIRE(myds_metal_begin_batch());
+            REQUIRE(myds_v41_engram_project_round_probe(policies[1],res_rows[arm][t],f->kv[arm].view,
+                f->weight.view,input_rows[t],f->q.view,f->k.view,1e-6f,false,false,false));
+            if(!arm){
+                REQUIRE(myds_metal_v41_hc_sum_rmsnorm(out_rows[arm][t],sum_rows[arm][t],res_rows[arm][t],pre_rows[t],norm.view,DIM,1e-6f,true));
+                verify_encoder();REQUIRE(myds_metal_commit_batch());
+            }
+        }
+        if(arm){
+            for(unsigned t=0;t<2u;++t)REQUIRE(myds_metal_v41_hc_sum_rmsnorm(out_rows[arm][t],sum_rows[arm][t],res_rows[arm][t],pre_rows[t],norm.view,DIM,1e-6f,true));
+            verify_encoder();REQUIRE(myds_metal_commit_batch());
+            REQUIRE(!memcmp(myds_metal_buffer_data(res[0].view),myds_metal_buffer_data(res[1].view),res[0].bytes));
+            REQUIRE(!memcmp(myds_metal_buffer_data(sum[0].view),myds_metal_buffer_data(sum[1].view),sum[0].bytes));
+            REQUIRE(!memcmp(myds_metal_buffer_data(out[0].view),myds_metal_buffer_data(out[1].view),out[0].bytes));
+        }
+        finite(res[arm]);finite(sum[arm]);finite(out[arm]);
+    }
+    myds_v41_engram_project_round_counters(&after,false);
+    REQUIRE(!memcmp(&before,&after,sizeof(before)));
+    REQUIRE(input_hash==fnv(myds_metal_buffer_data(inputs.view),inputs.bytes));
+    REQUIRE(norm_hash==fnv(myds_metal_buffer_data(norm.view),norm.bytes)&&pre_hash==fnv(myds_metal_buffer_data(pre.view),pre.bytes));
+    printf("{\"kind\":\"batch2_hc_dependency\",\"case\":%u,\"concurrent\":%d,\"auto_barrier\":%d,\"tokens\":2,\"paired_repeats\":8,\"scalar_oracle_separate_cbs\":true,\"paired_same_cb\":true,\"shared_projected_kv\":true,\"residual_subviews_shared_owner\":true,\"helper_consumer_join\":true,\"caller_barriers\":false,\"observation_copies\":false,\"round_skip_requests\":0,\"full_f32_residual_bit_exact\":true,\"hc_sum_bit_exact\":true,\"hc_norm_bit_exact\":true,\"inputs_unchanged\":true,\"canaries\":true}\n",case_id,myds_metal_get_concurrent(),myds_metal_get_auto_barrier());
+    for(unsigned t=0;t<2u;++t){myds_metal_buffer_free(input_rows[t]);myds_metal_buffer_free(pre_rows[t]);}
+    for(unsigned arm=0;arm<2u;++arm){
+        for(unsigned t=0;t<2u;++t){myds_metal_buffer_free(res_rows[arm][t]);myds_metal_buffer_free(sum_rows[arm][t]);myds_metal_buffer_free(out_rows[arm][t]);}
+        release(res[arm]);release(sum[arm]);release(out[arm]);
+    }
+    release(inputs);release(pre);release(norm);
+}
+
 static void rejected(struct fixture *f,const char *name,myds_metal_buffer_t *residual,myds_metal_buffer_t *kv,
                      const myds_metal_buffer_t *weight,const myds_metal_buffer_t *input,
                      const myds_metal_buffer_t *q,const myds_metal_buffer_t *k,float eps,int partial) {
@@ -260,11 +329,11 @@ int main(int argc,char **argv) {
     REQUIRE(myds_metal_init(shader_dir));struct fixture f=create(0);myds_metal_set_concurrent(1);myds_metal_set_auto_barrier(0);reset_arm(&f,0);run(policies[0],&f,0,1u,true,true,false);
     printf("{\"kind\":\"identity\",\"device\":\"%s\",\"dim\":5120,\"input_width\":6144,\"weight_bytes\":%zu,\"projection_kernel\":\"kernel_mul_mv_f16_f32_4\",\"projection_nsg\":8,\"projection_threads\":256,\"projection_groups\":12800,\"projection_dynamic_tg_bytes\":256,\"round_kernel\":\"kernel_dsv41_bf16_linear\",\"consumer_kernel\":\"kernel_dsv41_engram_add\",\"actual_context_modes\":[0,1],\"context_policy_immutable\":true,\"setup_completed_cb\":true,\"encoder_dispatch_type_verified\":true,\"ambient_concurrent_env_cleared\":true,\"fixture_not_fullmodel\":true}\n",g_device.name.UTF8String,f.weight.bytes);
     myds_v41_engram_project_round_counters(NULL,true);unsigned case_id=0;
-    for(unsigned c=0;c<2u;++c)for(unsigned a=0;a<2u;++a){myds_metal_set_concurrent(c);myds_metal_set_auto_barrier(a);fill_inputs(&f,31u,0);numeric(&f,case_id++,"seeded_dense",true,true,false);reuse(&f,2u*c+a);}
+    for(unsigned c=0;c<2u;++c)for(unsigned a=0;a<2u;++a){myds_metal_set_concurrent(c);myds_metal_set_auto_barrier(a);fill_inputs(&f,31u,0);numeric(&f,case_id++,"seeded_dense",true,true,false);reuse(&f,2u*c+a);batch2_hc_dependency(&f,2u*c+a);}
     myds_metal_set_concurrent(1);myds_metal_set_auto_barrier(0);
     numeric(&f,8u,"nonordinary_reference",false,true,false);numeric(&f,9u,"no_logits_reference",true,false,false);numeric(&f,10u,"trace_reference",true,true,true);rejections(&f);
     g_hist_enabled=0;if(!no_timing){timing(&f,1u);if(repetitions!=1u)timing(&f,repetitions);}destroy(&f);
     f=create(1);case_id=4u;for(unsigned c=0;c<2u;++c)for(unsigned a=0;a<2u;++a){myds_metal_set_concurrent(c);myds_metal_set_auto_barrier(a);fill_inputs(&f,31u,1);numeric(&f,case_id++,"sparse_bf16_boundary",true,true,false);}destroy(&f);
     for(unsigned i=0;i<2u;++i)myds_v41_context_free(policies[i]);myds_metal_cleanup();
-    printf("{\"kind\":\"suite_complete\",\"pass\":true,\"parity_cases\":11,\"same_batch_reuse_modes\":4,\"reuse_calls_per_mode\":7,\"rejected_calls\":10,\"samples_per_arm\":%u,\"timing_enabled\":%s,\"timing_repetitions\":[1,%u],\"production_setter_added\":false}\n",samples,no_timing?"false":"true",repetitions);return 0;
+    printf("{\"kind\":\"suite_complete\",\"pass\":true,\"parity_cases\":11,\"same_batch_reuse_modes\":4,\"reuse_calls_per_mode\":7,\"batch2_hc_dependency_modes\":4,\"batch2_hc_paired_repeats\":8,\"rejected_calls\":10,\"samples_per_arm\":%u,\"timing_enabled\":%s,\"timing_repetitions\":[1,%u],\"production_setter_added\":false}\n",samples,no_timing?"false":"true",repetitions);return 0;
 }

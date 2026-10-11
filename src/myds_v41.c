@@ -4300,10 +4300,11 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         if (il == 1 || il == 14) {
             uint32_t e = (il == 1 ? 0 : 1);
             for (uint32_t t = 0; t < 2; t++) {
-                CHECK(project(g->engram_kv, v->engram_proj[e], ws->engram_rows_b2[t][e],
-                              5 * V41_DIM, MYDS_ENGRAM_INPUT_DIM, GGML_TYPE_F16, true));
-                CHECK(myds_metal_v41_engram_add(ws->v_residual[t], g->engram_kv,
-                                                v->engram_q[e], v->engram_k[e], V41_DIM, m->norm_eps));
+                /* Retain rounded projection and join the add before HC reads
+                 * this residual or the next token reuses projected scratch. */
+                CHECK(engram_project_pair(g, ws->v_residual[t], g->engram_kv,
+                    v->engram_proj[e], ws->engram_rows_b2[t][e], v->engram_q[e],
+                    v->engram_k[e], m->norm_eps, false, false, false, true));
             }
         }
 
@@ -4717,10 +4718,11 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
         if (il == 1 || il == 14) {
             uint32_t e = (il == 1 ? 0 : 1);
             for (uint32_t t = 0; t < 3; t++) {
-                CHECK(project(g->engram_kv, v->engram_proj[e], ws->engram_rows_b2[t][e],
-                              5 * V41_DIM, MYDS_ENGRAM_INPUT_DIM, GGML_TYPE_F16, true));
-                CHECK(myds_metal_v41_engram_add(ws->v_residual[t], g->engram_kv,
-                                                v->engram_q[e], v->engram_k[e], V41_DIM, m->norm_eps));
+                /* Retain rounded projection and join the add before HC reads
+                 * this residual or the next token reuses projected scratch. */
+                CHECK(engram_project_pair(g, ws->v_residual[t], g->engram_kv,
+                    v->engram_proj[e], ws->engram_rows_b2[t][e], v->engram_q[e],
+                    v->engram_k[e], m->norm_eps, false, false, false, true));
             }
         }
 
