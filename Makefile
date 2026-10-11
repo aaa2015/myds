@@ -59,6 +59,7 @@ TEST_P1 = $(BIN_DIR)/test_p1
 TEST_DSPARK_ROLLBACK = $(BIN_DIR)/test_dspark_rollback
 TEST_DSPARK_ROUTER = $(BIN_DIR)/test_dspark_router
 TEST_V41_ROUTER = $(BIN_DIR)/test_v41_router
+TEST_BATCH2_SHARED_PAIR = $(BIN_DIR)/test_batch2_shared_swiglu_pair
 TEST_DSPARK_ATTN = $(BIN_DIR)/test_dspark_attention
 TEST_DSPARK_MOE = $(BIN_DIR)/test_dspark_moe
 TEST_DSPARK_PROPOSAL = $(BIN_DIR)/test_dspark_proposal
@@ -75,7 +76,7 @@ DUMP_TENSORS = $(BIN_DIR)/dump_tensors
 METALLIB = $(BIN_DIR)/myds.metallib
 METAL_SRCS = $(wildcard metal/*.metal)
 
-ALL_TESTS = $(TEST_METAL) $(TEST_V41_GPU) $(TEST_ATTN_POLICY) $(TEST_ATTN_VEC) $(TEST_QKV_FUSION) $(TEST_DECODE_Q8) $(TEST_MOE_DOWN_NSG) $(TEST_DEEPER_SSD) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE) $(TEST_CPU) $(TEST_ENGRAM) $(TEST_ALIGN) $(TEST_PLD) $(TEST_KVDSK) $(TEST_P1) $(TEST_DSPARK_ROLLBACK) $(TEST_DSPARK_CAPTURE) $(TEST_DSPARK_ROUTER) $(TEST_V41_ROUTER) $(TEST_DSPARK_ATTN) $(TEST_DSPARK_MOE) $(TEST_DSPARK_PROPOSAL) $(TEST_BATCH2_PARITY) $(TEST_BATCH2_E2E) $(TEST_Q4_BF16_PARITY) $(TEST_TREE_SPEC)
+ALL_TESTS = $(TEST_METAL) $(TEST_V41_GPU) $(TEST_ATTN_POLICY) $(TEST_ATTN_VEC) $(TEST_QKV_FUSION) $(TEST_DECODE_Q8) $(TEST_MOE_DOWN_NSG) $(TEST_DEEPER_SSD) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE) $(TEST_CPU) $(TEST_ENGRAM) $(TEST_ALIGN) $(TEST_PLD) $(TEST_KVDSK) $(TEST_P1) $(TEST_DSPARK_ROLLBACK) $(TEST_DSPARK_CAPTURE) $(TEST_DSPARK_ROUTER) $(TEST_V41_ROUTER) $(TEST_BATCH2_SHARED_PAIR) $(TEST_DSPARK_ATTN) $(TEST_DSPARK_MOE) $(TEST_DSPARK_PROPOSAL) $(TEST_BATCH2_PARITY) $(TEST_BATCH2_E2E) $(TEST_Q4_BF16_PARITY) $(TEST_TREE_SPEC)
 
 .PHONY: all test clean bench metallib build-tail-init test-tail-init
 
@@ -323,6 +324,9 @@ $(TEST_DSPARK_ROUTER): tests/test_dspark_router.c $(BUILD_DIR)/myds_v41_moe.o $(
 $(TEST_V41_ROUTER): tests/test_v41_router.c $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $< $(filter %.o,$^) $(LDFLAGS) -Wl,-dead_strip
 
+$(TEST_BATCH2_SHARED_PAIR): tests/test_batch2_shared_swiglu_pair.c src/myds_v41_moe.c $(wildcard include/*.h) $(filter-out $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $< $(filter %.o,$^) $(LDFLAGS) -Wl,-dead_strip
+
 $(TEST_DSPARK_ATTN): tests/test_dspark_attention.c $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $< $(filter %.o,$^) $(LDFLAGS) -Wl,-dead_strip
 
@@ -484,6 +488,7 @@ test: $(ALL_TESTS) $(METALLIB)
 	@./$(TEST_DSPARK_CAPTURE) --markov-only
 	@./$(TEST_DSPARK_ROUTER)
 	@./$(TEST_V41_ROUTER)
+	@./$(TEST_BATCH2_SHARED_PAIR)
 	@./$(TEST_DSPARK_ATTN)
 	@./$(TEST_DSPARK_MOE)
 	@./$(TEST_DSPARK_PROPOSAL)

@@ -5721,7 +5721,10 @@ int myds_metal_attn_output_a_bf16_batch(
     static int cached_shared2 = -1;
     if (__builtin_expect(cached_shared2 < 0, 0)) {
         const char *v = getenv("MYDS_ATTN_OUT_A_SHARED2");
-        cached_shared2 = (v && strcmp(v, "0") == 0) ? 0 : 1;
+        /* The paired PSO failed real-checkpoint bitwise parity. Until its
+         * numerical contract is accepted, use the existing scalar PSO with
+         * the token dimension in the grid. Explicit 1 is diagnostic only. */
+        cached_shared2 = (v && strcmp(v, "1") == 0) ? 1 : 0;
     }
 
     if (cached_fuse && cached_shared2 && weight_type == GGML_TYPE_Q8_0 && n_tok == 2 && g_pso_attn_out_low_q8_0_bf16_shared2 &&

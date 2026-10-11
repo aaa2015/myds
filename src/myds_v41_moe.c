@@ -258,6 +258,59 @@ int myds_v41_shared_gate_up_swiglu(myds_metal_buffer_t *out,
     return 0;
 }
 
+static bool shared_pair_overlap(const myds_metal_buffer_t *a, uint64_t a_bytes,
+                                const myds_metal_buffer_t *b, uint64_t b_bytes) {
+    const uintptr_t first = (uintptr_t)myds_metal_buffer_data((myds_metal_buffer_t *)a);
+    const uintptr_t second = (uintptr_t)myds_metal_buffer_data((myds_metal_buffer_t *)b);
+    return first <= second ? second - first < a_bytes : first - second < b_bytes;
+}
+
+int myds_v41_shared_gate_up_swiglu_pair(myds_metal_buffer_t *const out[2],
+                                      const myds_metal_buffer_t *gate,
+                                      const myds_metal_buffer_t *up,
+                                      myds_metal_buffer_t *const input[2],
+                                      uint32_t out_dim, uint32_t in_dim,
+                                      ggml_type gate_type, ggml_type up_type,
+                                      float clamp) {
+    if (!out || !input || !out[0] || !out[1] || !input[0] || !input[1] ||
+        !gate || !up || !out_dim || !in_dim ||
+        out_dim > INT32_MAX || in_dim > INT32_MAX ||
+        !isfinite(clamp) || clamp < 0 || gate_type != up_type) return 0;
+    const uint32_t block = gate_type == GGML_TYPE_Q4_K ? 256u : 32u;
+    const uint32_t bytes = gate_type == GGML_TYPE_Q4_K ? 144u : 34u;
+    if ((gate_type != GGML_TYPE_Q4_K && gate_type != GGML_TYPE_Q8_0) ||
+        in_dim % block) return 0;
+    const uint64_t row_bytes = (uint64_t)(in_dim / block) * bytes;
+    if (myds_metal_buffer_size(gate) / row_bytes < out_dim ||
+        myds_metal_buffer_size(up) / row_bytes < out_dim) return 0;
+    const uint64_t output_bytes = (uint64_t)out_dim * sizeof(float);
+    const uint64_t input_bytes = (uint64_t)in_dim * sizeof(float);
+    const uint64_t weight_bytes = row_bytes * out_dim;
+    if (!myds_metal_buffer_data((myds_metal_buffer_t *)gate) ||
+        !myds_metal_buffer_data((myds_metal_buffer_t *)up)) return 0;
+    for (uint32_t t = 0; t < 2; ++t)
+        if (!sized(out[t], out_dim) || !sized(input[t], in_dim) ||
+            !myds_metal_buffer_data(out[t]) || !myds_metal_buffer_data(input[t]) ||
+            myds_metal_buffer_offset(out[t]) % 16u ||
+            myds_metal_buffer_offset(input[t]) % sizeof(float)) return 0;
+    if (shared_pair_overlap(out[0], output_bytes, out[1], output_bytes)) return 0;
+    for (uint32_t t = 0; t < 2; ++t) {
+        if (shared_pair_overlap(out[t], output_bytes, gate, weight_bytes) ||
+            shared_pair_overlap(out[t], output_bytes, up, weight_bytes)) return 0;
+        for (uint32_t s = 0; s < 2; ++s)
+            if (shared_pair_overlap(out[t], output_bytes, input[s], input_bytes)) return 0;
+    }
+    /* Keep the existing scalar kernel and its compiled arithmetic. The
+     * shared2-only real-model arm first differs at layer-38 Q1 raw KV, even
+     * though the previous clamp=0 component fixture passed. The intermediate
+     * GU output has not been tapped, so no compiler root cause is asserted. */
+    for (uint32_t t = 0; t < 2; ++t)
+        if (!myds_v41_shared_gate_up_swiglu(out[t], gate, up, input[t],
+            out_dim, in_dim, gate_type, up_type, clamp)) return 0;
+    return 1;
+}
+
+/* Unaccepted diagnostic candidate; production uses the scalar-PSO pair. */
 int myds_v41_shared_gate_up_swiglu_batch2(myds_metal_buffer_t *out,
                                          const myds_metal_buffer_t *gate,
                                          const myds_metal_buffer_t *up,

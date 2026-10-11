@@ -4409,12 +4409,23 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_v41_batch2_projection_probe(ws->v_router_logits, base->router_gate,
             ws->v_ffn_norm, 384, V41_DIM, base->router_gate_type, MYDS_V41_BATCH2_ROUTER));
 
-        /* 3. 并发派发 Shared Expert Gate+Up */
+        /* 3. Retain each row's authoritative fused Gate+Up PSO. The shared2
+         * candidate failed full-model parity on the current checkpoint. */
         const char *shared_fuse = getenv("MYDS_SHARED_FUSE");
-        int shared_fused = !myds_trace_active() && (!shared_fuse || strcmp(shared_fuse, "0")) &&
-            myds_v41_shared_gate_up_swiglu_batch2(
-            ws->shared_swiglu_b2, base->shared_gate, base->shared_up, ws->ffn_norm_b2,
-            2304, V41_DIM, base->shared_gate_type, base->shared_up_type, m->swiglu_clamp_exp);
+        const bool shared_requested = !myds_trace_active() &&
+            (!shared_fuse || strcmp(shared_fuse, "0"));
+        const bool shared_fused = shared_requested &&
+            base->shared_gate_type == base->shared_up_type &&
+            (base->shared_gate_type == GGML_TYPE_Q4_K ||
+             base->shared_gate_type == GGML_TYPE_Q8_0);
+        if (shared_fused) {
+            /* A dispatch may fail after row 0 was encoded. It must enter the
+             * transaction's restore path rather than retry a partial graph. */
+            CHECK(myds_v41_shared_gate_up_swiglu_pair(
+                ws->v_shared_swiglu, base->shared_gate, base->shared_up, ws->v_ffn_norm,
+                2304, V41_DIM, base->shared_gate_type, base->shared_up_type,
+                m->swiglu_clamp_exp));
+        }
         if (!shared_fused) {
             for (uint32_t t = 0; t < 2; ++t) {
                 int single_fused = !myds_trace_active() && (!shared_fuse || strcmp(shared_fuse, "0")) &&

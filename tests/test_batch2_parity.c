@@ -398,6 +398,109 @@ static int test_batch2_attn_output_a(void) {
     return 1;
 }
 
+static uint32_t outa_random(uint32_t value) {
+    value ^= value >> 16; value *= 0x7feb352du;
+    value ^= value >> 15; value *= 0x846ca68bu;
+    return value ^ (value >> 16);
+}
+
+/* Full production shape, canonical BF16 heads, non-power-of-two F16 block
+ * scales, and explicit even/odd BF16 midpoint outputs. Compare the public
+ * batch entry with two completed scalar CBs in all four dependency modes. */
+static int test_batch2_outa_precision(void) {
+    const uint32_t groups=8, width=4096, rank=1024;
+    const size_t heads_count=(size_t)groups*width, low_count=(size_t)groups*rank;
+    const char *shared_env=getenv("MYDS_ATTN_OUT_A_SHARED2");
+    const int diagnostic=shared_env && !strcmp(shared_env,"1");
+    size_t comparisons=0;
+    for(unsigned format=0;format<2;++format){
+        const ggml_type type=format?GGML_TYPE_Q8_0:GGML_TYPE_Q4_K;
+        const uint32_t block_width=format?32u:256u, block_bytes=format?34u:144u;
+        const size_t blocks=low_count*(width/block_width);
+        struct guarded weight,heads,scalar,paired;
+        CHECK(guarded_create(&weight,blocks*block_bytes));
+        CHECK(guarded_create(&heads,2u*heads_count*4u));
+        CHECK(guarded_create(&scalar,2u*low_count*4u));
+        CHECK(guarded_create(&paired,2u*low_count*4u));
+        myds_metal_buffer_t *head_rows[2],*low_rows[2];
+        for(unsigned t=0;t<2;++t){
+            head_rows[t]=myds_metal_buffer_sub_view(heads.view,t*heads_count*4u,heads_count*4u);
+            low_rows[t]=myds_metal_buffer_sub_view(scalar.view,t*low_count*4u,low_count*4u);
+            CHECK(head_rows[t]&&low_rows[t]);
+        }
+        for(unsigned sample=0;sample<3;++sample){
+            uint8_t *w=myds_metal_buffer_data(weight.view);
+            float *h=myds_metal_buffer_data(heads.view);
+            if(!sample){
+                memset(w,0,weight.bytes);memset(h,0,heads.bytes);
+                for(size_t row=0;row<low_count;++row)for(unsigned b=0;b<2;++b){
+                    uint8_t *p=w+(row*(width/block_width)+b)*block_bytes;
+                    uint16_t scale=b?0x1c00u:0x3c00u; /* 2^-8 and 1 */
+                    memcpy(p,&scale,2u);
+                    if(format)p[2]=1u;
+                    else {p[4]=1u;p[16]=1u;}
+                }
+                for(unsigned t=0;t<2;++t)for(unsigned g=0;g<groups;++g){
+                    const size_t base=t*heads_count+g*width;
+                    h[base]=(t?-1.0f:1.0f)*(g&1u?1.0078125f:1.0f);
+                    h[base+block_width]=t?-1.0f:1.0f;
+                }
+            }else{
+                for(size_t b=0;b<blocks;++b){
+                    uint8_t *p=w+b*block_bytes;
+                    uint32_t z=outa_random((uint32_t)b+sample*1709u);
+                    uint16_t scale=(uint16_t)(0x1800u+(z&0x1fffu));
+                    memcpy(p,&scale,2u);
+                    if(!format){uint16_t minimum=(uint16_t)(0x1000u+((z>>8)&0x1fffu));memcpy(p+2,&minimum,2u);}
+                    for(unsigned j=format?2u:4u;j<block_bytes;++j)p[j]=(uint8_t)outa_random(z+j*211u);
+                }
+                for(size_t i=0;i<2u*heads_count;++i){
+                    uint32_t z=outa_random((uint32_t)i+sample*3907u);
+                    uint32_t bits=0x3c000000u+(z&0x03ff0000u);
+                    bits|=z&0x80000000u;memcpy(h+i,&bits,4u);
+                }
+            }
+            uint8_t *saved_weight=malloc(weight.bytes),*saved_heads=malloc(heads.bytes);
+            CHECK(saved_weight&&saved_heads);
+            memcpy(saved_weight,w,weight.bytes);memcpy(saved_heads,h,heads.bytes);
+            for(unsigned concurrent=0;concurrent<2;++concurrent)for(unsigned automatic=0;automatic<2;++automatic){
+                myds_metal_set_concurrent(concurrent);myds_metal_set_auto_barrier(automatic);
+                memset(myds_metal_buffer_data(scalar.view),0xa5,scalar.bytes);
+                for(unsigned t=0;t<2;++t){
+                    CHECK(myds_metal_begin_batch());
+                    CHECK(myds_metal_attn_output_a_bf16(low_rows[t],weight.view,head_rows[t],groups,width,rank,type));
+                    CHECK(myds_metal_commit_batch());
+                }
+                for(unsigned repeat=0;repeat<4;++repeat){
+                    memset(myds_metal_buffer_data(paired.view),0xa5,paired.bytes);
+                    CHECK(myds_metal_begin_batch());
+                    CHECK(myds_metal_attn_output_a_bf16_batch(paired.view,weight.view,heads.view,groups,width,rank,2u,type));
+                    CHECK(myds_metal_commit_batch());
+                    if(!verify_exact(scalar.view,paired.view,2u*low_count)){
+                        fprintf(stderr,"OutA precision failure: type=%s sample=%u concurrent=%u auto_barrier=%u repeat=%u shared2_diagnostic=%d\n",
+                            format?"Q8_0":"Q4_K",sample,concurrent,automatic,repeat,diagnostic);
+                        return 0;
+                    }
+                    if(!sample){
+                        const float *p=myds_metal_buffer_data(paired.view);
+                        for(unsigned t=0;t<2;++t)for(unsigned g=0;g<groups;++g)for(unsigned row=0;row<rank;++row)
+                            CHECK(p[t*low_count+g*rank+row]==(t?-1.0f:1.0f)*(g&1u?1.015625f:1.0f));
+                    }
+                    CHECK(guarded_ok(&weight)&&guarded_ok(&heads)&&guarded_ok(&scalar)&&guarded_ok(&paired));
+                    comparisons+=2u*low_count;
+                }
+                CHECK(!memcmp(saved_weight,w,weight.bytes)&&!memcmp(saved_heads,h,heads.bytes));
+            }
+            free(saved_weight);free(saved_heads);
+        }
+        for(unsigned t=0;t<2;++t){myds_metal_buffer_free(head_rows[t]);myds_metal_buffer_free(low_rows[t]);}
+        guarded_free(&weight);guarded_free(&heads);guarded_free(&scalar);guarded_free(&paired);
+    }
+    myds_metal_set_concurrent(0);myds_metal_set_auto_barrier(1);
+    printf("  [PASS] OutA full-shape precision: Q4_K/Q8_0, 4 modes, even/odd BF16 midpoint + 2 multiscale cases, 4 repeats, %zu byteexact comparisons (%s; synthetic fixture scope).\n",comparisons,diagnostic?"explicit shared2 diagnostic":"production scalar PSO default/explicit0");
+    return 1;
+}
+
 static int test_batch2_shared_swiglu(void) {
     printf("[TEST] Batch-2 Shared Gate+Up SwiGLU (2304 x 5120 Q4_K)...\n");
     const uint32_t out_dim = 2304;
@@ -449,7 +552,7 @@ static int test_batch2_shared_swiglu(void) {
     myds_metal_buffer_free(gate);
     myds_metal_buffer_free(up);
 
-    printf("  [PASS] Batch-2 Shared Gate+Up SwiGLU 100%% bit-exact!\n");
+    printf("  [PASS] Diagnostic shared2 GU fixture parity (clamp=0); current-checkpoint full-model parity remains unaccepted.\n");
     return 1;
 }
 
@@ -707,6 +810,9 @@ int main(void) {
     printf("   Phase 3: Metal Per-Layer Batch-2 Parity Test Suite  \n");
     printf("=======================================================\n");
 
+    /* Setter modes below must select the actual encoder; clear the ambient
+     * concurrent override before the runtime caches it on its first CB. */
+    unsetenv("MYDS_METAL_CONCURRENT");
     if (!myds_metal_init(NULL)) {
         fprintf(stderr, "Failed to initialize Metal\n");
         return 1;
@@ -752,6 +858,7 @@ int main(void) {
 
     // 9. Batch-2 Attention Output A
     if (!test_batch2_attn_output_a()) return 1;
+    if (!test_batch2_outa_precision()) return 1;
 
     // 10. Batch-2 HC Mix
     if (!test_batch2_hc_mix()) return 1;

@@ -26,9 +26,18 @@ int myds_v41_shared_gate_up_swiglu(myds_metal_buffer_t *out,
                                   uint32_t out_dim, uint32_t in_dim,
                                   ggml_type gate_type, ggml_type up_type,
                                   float clamp);
-/* Shared Expert Gate + Up + SwiGLU 2-Token 共享权重融合算子
- * 一次流式读取 shared_gate 与 shared_up 权重，同时为 2 个 token 计算 SwiGLU。
- * 消除 528 MB 显存冗余带宽并节省 40 次 GPU Dispatch。 */
+/* Production two-row execution retains the authoritative single-row PSO,
+ * reduction and BF16 boundaries for each input. The caller joins inputs and
+ * outputs at the same boundaries as the single-row entry. */
+int myds_v41_shared_gate_up_swiglu_pair(myds_metal_buffer_t *const out[2],
+                                      const myds_metal_buffer_t *gate,
+                                      const myds_metal_buffer_t *up,
+                                      myds_metal_buffer_t *const input[2],
+                                      uint32_t out_dim, uint32_t in_dim,
+                                      ggml_type gate_type, ggml_type up_type,
+                                      float clamp);
+/* Diagnostic candidate only. This shared-weight kernel has not passed the
+ * current checkpoint's full-model parity gate and is not selected by Batch2. */
 int myds_v41_shared_gate_up_swiglu_batch2(myds_metal_buffer_t *out,
                                          const myds_metal_buffer_t *gate,
                                          const myds_metal_buffer_t *up,
