@@ -5,6 +5,7 @@
 #include "myds_v41.h"
 #include "myds_v41_gpu.h"
 #include "myds_v41_moe.h"
+#include "myds_tokenizer.h"
 #include "myds_log.h"
 
 #include <stdio.h>
@@ -57,6 +58,34 @@ static int dspark_markov_only(void) {
         mode = env && atoi(env) != 0;
     }
     return mode;
+}
+
+static void dspark_format_token_preview(const myds_tokenizer_t *tok, int32_t token_id, char *buf, size_t buf_size) {
+    if (!buf || buf_size == 0) return;
+    buf[0] = '\0';
+    if (!tok || token_id < 0) {
+        snprintf(buf, buf_size, "%d", token_id);
+        return;
+    }
+    size_t piece_len = 0;
+    const char *piece = myds_tokenizer_decode_bytes(tok, token_id, &piece_len);
+    if (!piece || piece_len == 0) {
+        snprintf(buf, buf_size, "%d", token_id);
+        return;
+    }
+    char esc[48];
+    size_t e = 0;
+    for (size_t i = 0; i < piece_len && e + 2 < sizeof(esc); i++) {
+        unsigned char c = (unsigned char)piece[i];
+        if (c == '\n') { esc[e++] = '\\'; esc[e++] = 'n'; }
+        else if (c == '\r') { esc[e++] = '\\'; esc[e++] = 'r'; }
+        else if (c == '\t') { esc[e++] = '\\'; esc[e++] = 't'; }
+        else if (c == ' ') { esc[e++] = '_'; }
+        else if (c >= 32 && c < 127) { esc[e++] = (char)c; }
+        else { esc[e++] = (char)c; }
+    }
+    esc[e] = '\0';
+    snprintf(buf, buf_size, "%d ('%s')", token_id, esc);
 }
 
 static int capture_parse_flag(const char *name) {
@@ -1154,26 +1183,29 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
         return 0;
     }
 
-    static float s_cached_markov_scale = -1.0f;
+    static float s_cached_markov_scale = -999.0f;
     static int s_markov_scale_logged = 0;
     float markov_scale = 1.0f;
-    const char *no_m = getenv("DS4_DSPARK_NO_MARKOV");
-    if (!no_m) no_m = getenv("MYDS_DSPARK_NO_MARKOV");
-    const bool markov_disabled = (no_m && no_m[0] && strcmp(no_m, "0") != 0);
+    if (__builtin_expect(s_cached_markov_scale < -500.0f, 0)) {
+        const char *no_m = getenv("DS4_DSPARK_NO_MARKOV");
+        if (!no_m) no_m = getenv("MYDS_DSPARK_NO_MARKOV");
+        const bool markov_disabled = (no_m && no_m[0] && strcmp(no_m, "0") != 0);
 
-    const char *scale_env = getenv("MYDS_DSPARK_MARKOV_SCALE");
-    if (scale_env && scale_env[0]) {
-        markov_scale = (float)atof(scale_env);
-    } else if (markov_disabled) {
-        markov_scale = 0.0f;
-    } else if (s_cached_markov_scale >= 0.0f) {
+        const char *scale_env = getenv("MYDS_DSPARK_MARKOV_SCALE");
+        if (scale_env && scale_env[0]) {
+            markov_scale = (float)atof(scale_env);
+        } else if (markov_disabled) {
+            markov_scale = 0.0f;
+        } else {
+            markov_scale = 1.0f;
+        }
+        s_cached_markov_scale = markov_scale;
+        if (!s_markov_scale_logged) {
+            s_markov_scale_logged = 1;
+            MYDS_LOG_I("DSpark Markov bias additive scale: %.2f (no_markov=%d)", markov_scale, (int)markov_disabled);
+        }
+    } else {
         markov_scale = s_cached_markov_scale;
-    }
-    s_cached_markov_scale = markov_scale;
-
-    if (!s_markov_scale_logged) {
-        s_markov_scale_logged = 1;
-        MYDS_LOG_I("DSpark Markov bias additive scale: %.2f (no_markov=%d)", markov_scale, (int)markov_disabled);
     }
 
     static float min_conf = -1.0f;
@@ -1220,7 +1252,7 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
 
     const bool is_f16 = (ds->markov_w1_type == GGML_TYPE_F16 && ds->markov_w2_type == GGML_TYPE_F16);
     const bool is_q8  = (ds->markov_w1_type == GGML_TYPE_Q8_0 && ds->markov_w2_type == GGML_TYPE_Q8_0);
-    const bool has_markov = (!markov_disabled && markov_scale > 0.0f &&
+    const bool has_markov = (markov_scale > 0.0f &&
                              ds->markov_w1 && ds->markov_w2 && (is_f16 || is_q8) &&
                              ds->markov_state_host && ds->markov_bias_host);
     const void *w2_base = has_markov ? myds_metal_buffer_data(ds->markov_w2) : NULL;
@@ -1364,30 +1396,6 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
             ds->draft_tree_scores[1] = best_score2;
             ds->draft_tree_count = 2;
 
-            static int s_prop_diag_count = 0;
-            static int s_prop_diag_enabled = -1;
-            if (s_prop_diag_enabled < 0) {
-                const char *env = getenv("MYDS_DSPARK_DEBUG");
-                s_prop_diag_enabled = env ? atoi(env) : 0;
-            }
-            if (s_prop_diag_enabled || s_prop_diag_count < 15) {
-                s_prop_diag_count++;
-                int32_t neural_cand = -1;
-                float neural_score = -INFINITY;
-                if (base_logits) {
-                    for (uint32_t r = 0; r < vocab_size; r++) {
-                        if (base_logits[r] > neural_score) {
-                            neural_score = base_logits[r];
-                            neural_cand = (int32_t)r;
-                        }
-                    }
-                }
-                MYDS_LOG_I("[dspark-prop] cycle=%llu seed=%d cand_a=%d (s=%.2f) cand_b=%d (s=%.2f) neural=%d (s=%.2f) conf=%.3f",
-                           (unsigned long long)ds->cycles, last_token,
-                           best_token, best_score, best_token2, best_score2,
-                           neural_cand, neural_score, confidence);
-            }
-
             static float min_margin = -1.0f;
             if (__builtin_expect(min_margin < -0.5f, 0)) {
                 const char *env = getenv("MYDS_DSPARK_MIN_MARGIN");
@@ -1418,6 +1426,36 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
 
             if (confidence >= high_conf_thresh || margin >= high_conf_margin) {
                 ds->is_high_confidence = true;
+            }
+
+            static int s_prop_diag_count = 0;
+            static int s_prop_diag_enabled = -1;
+            if (s_prop_diag_enabled < 0) {
+                const char *env = getenv("MYDS_DSPARK_DEBUG");
+                s_prop_diag_enabled = env ? atoi(env) : 0;
+            }
+            if (s_prop_diag_enabled || s_prop_diag_count < 30) {
+                s_prop_diag_count++;
+                int32_t neural_cand = -1;
+                float neural_score = -INFINITY;
+                if (base_logits) {
+                    for (uint32_t r = 0; r < vocab_size; r++) {
+                        if (base_logits[r] > neural_score) {
+                            neural_score = base_logits[r];
+                            neural_cand = (int32_t)r;
+                        }
+                    }
+                }
+                char str_seed[96], str_cand_a[96], str_cand_b[96], str_neural[96];
+                const myds_tokenizer_t *tok = (ctx && ctx->model) ? ctx->model->tokenizer : NULL;
+                dspark_format_token_preview(tok, last_token, str_seed, sizeof(str_seed));
+                dspark_format_token_preview(tok, best_token, str_cand_a, sizeof(str_cand_a));
+                dspark_format_token_preview(tok, best_token2, str_cand_b, sizeof(str_cand_b));
+                dspark_format_token_preview(tok, neural_cand, str_neural, sizeof(str_neural));
+                MYDS_LOG_I("[dspark-prop] cycle=%llu seed=%s cand_a=%s (s=%.2f) cand_b=%s (s=%.2f) neural=%s (s=%.2f) margin=%.2f conf=%.3f high_conf=%d",
+                           (unsigned long long)ds->cycles, str_seed,
+                           str_cand_a, best_score, str_cand_b, best_score2,
+                           str_neural, neural_score, margin, confidence, (int)ds->is_high_confidence);
             }
         }
 
