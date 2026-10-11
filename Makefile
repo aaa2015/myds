@@ -226,8 +226,8 @@ build-indexer-rope-quant-candidate: $(TEST_INDEXER_ROPE_QUANT)
 $(TEST_BATCH2_Q8_SHARED): tests/test_batch2_q8_shared.m src/myds_metal.m $(wildcard include/*.h) $(OBJS_C) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc tests/test_batch2_q8_shared.m $(OBJS_C) $(LDFLAGS) -o $@
 
-$(TEST_Q4_BF16_PARITY): tests/test_q4_bf16_parity.m src/myds_metal.m $(wildcard include/*.h) $(OBJS_C) $(METALLIB) | $(BIN_DIR)
-	$(CC) $(OBJCFLAGS) -Isrc tests/test_q4_bf16_parity.m $(OBJS_C) $(LDFLAGS) -o $@
+$(TEST_Q4_BF16_PARITY): tests/test_q4_bf16_parity.m src/myds_metal.m $(wildcard include/*.h) $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) -Isrc tests/test_q4_bf16_parity.m $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS) -o $@
 
 .PHONY: build-decode-candidates
 build-decode-candidates: $(TEST_MOE_IQ2_LUT) $(TEST_ATTN_PACKED) $(TEST_TOPK_NAN_FUSE) $(TEST_BATCH2_Q8_SHARED)
