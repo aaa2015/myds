@@ -9,6 +9,7 @@
 #define MYDS_DSPARK_MAX_STAGES 4
 #define MYDS_DSPARK_TARGET_LAYERS 3
 #define MYDS_DSPARK_DEFAULT_BLOCK_SIZE 5
+#define MYDS_DSPARK_TOTAL_ROWS 6
 #define MYDS_DSPARK_MARKOV_RANK 256
 #define MYDS_DSPARK_DIM 5120
 #define MYDS_DSPARK_EXP_DIM 2304
@@ -60,68 +61,113 @@ typedef struct {
 struct myds_v41_gpu_scratch;
 
 typedef struct {
-    // Multi-row Stage residual streams (Row 0: Target, Row 1: Draft)
-    myds_metal_buffer_t *stage_target_hc;     // 4 * 5120 * sizeof(float) (constant across stages)
-    myds_metal_buffer_t *stage_draft_hc;      // 4 * 5120 * sizeof(float) (updated across stages)
-    myds_metal_buffer_t *stage_hc;            // alias to stage_draft_hc
-    myds_metal_buffer_t *after_attn_hc;       // 4 * 5120 * sizeof(float) (draft row after attn)
-    myds_metal_buffer_t *target_flat_hc_norm; // 4 * 5120 * sizeof(float)
-    myds_metal_buffer_t *draft_flat_hc_norm;  // 4 * 5120 * sizeof(float)
-    myds_metal_buffer_t *flat_hc_norm;        // alias to draft_flat_hc_norm
-    myds_metal_buffer_t *target_hc_mix;       // 24 * sizeof(float)
-    myds_metal_buffer_t *draft_hc_mix;        // 24 * sizeof(float)
-    myds_metal_buffer_t *hc_mix;              // alias to draft_hc_mix
-    myds_metal_buffer_t *target_hc_split;     // 24 * sizeof(float)
-    myds_metal_buffer_t *draft_hc_split;      // 24 * sizeof(float)
-    myds_metal_buffer_t *hc_split;            // alias to draft_hc_split
+    // Multi-row Stage residual streams (Row 0: Target, Rows 1..5: Draft)
+    myds_metal_buffer_t *stage_target_hc;       // 4 * 5120 * sizeof(float) (Row 0, constant across stages)
+    myds_metal_buffer_t *stage_draft_hc;        // 5 * 4 * 5120 * sizeof(float) (Rows 1..5, updated across stages)
+    myds_metal_buffer_t *stage_hc;              // alias to stage_draft_hc
+    myds_metal_buffer_t *stage_input_hc;        // 6 * 4 * 5120 * sizeof(float) (all 6 rows concatenated)
+    myds_metal_buffer_t *after_attn_hc;         // 5 * 4 * 5120 * sizeof(float) (5 draft rows after attn)
+    myds_metal_buffer_t *stage_flat_hc_norm;    // 6 * 4 * 5120 * sizeof(float) (6 rows flat normalized)
+    myds_metal_buffer_t *target_flat_hc_norm;   // subview: row 0
+    myds_metal_buffer_t *draft_flat_hc_norm;    // 5 * 4 * 5120 * sizeof(float) (5 draft rows for FFN)
+    myds_metal_buffer_t *flat_hc_norm;          // alias to stage_flat_hc_norm
+    myds_metal_buffer_t *hc_mix;                // 6 * 24 * sizeof(float)
+    myds_metal_buffer_t *target_hc_mix;         // subview: row 0
+    myds_metal_buffer_t *draft_hc_mix;          // subview: rows 1..5
+    myds_metal_buffer_t *hc_split;              // 6 * 24 * sizeof(float)
+    myds_metal_buffer_t *target_hc_split;       // subview: row 0
+    myds_metal_buffer_t *draft_hc_split;        // subview: rows 1..5
+    myds_metal_buffer_t *draft_ffn_hc_mix;      // 5 * 24 * sizeof(float) (5 draft rows for FFN)
+    myds_metal_buffer_t *draft_ffn_hc_split;    // 5 * 24 * sizeof(float) (5 draft rows for FFN)
 
     // Attention intermediate buffers
-    myds_metal_buffer_t *target_attn_cur;     // 5120 * sizeof(float)
-    myds_metal_buffer_t *draft_attn_cur;      // 5120 * sizeof(float)
-    myds_metal_buffer_t *attn_cur;            // alias to draft_attn_cur
-    myds_metal_buffer_t *target_attn_norm;    // 5120 * sizeof(float)
-    myds_metal_buffer_t *draft_attn_norm;     // 5120 * sizeof(float)
-    myds_metal_buffer_t *attn_norm;           // alias to draft_attn_norm
-    myds_metal_buffer_t *target_kv;           // 512 * sizeof(float)
-    myds_metal_buffer_t *target_kv_norm;      // 512 * sizeof(float)
-    myds_metal_buffer_t *draft_kv;            // 512 * sizeof(float)
-    myds_metal_buffer_t *draft_kv_norm;       // 512 * sizeof(float)
-    myds_metal_buffer_t *kv;                  // alias to draft_kv
-    myds_metal_buffer_t *kv_norm;             // alias to draft_kv_norm
-    myds_metal_buffer_t *qr;                  // 1280 * sizeof(float)
-    myds_metal_buffer_t *qr_norm;             // 1280 * sizeof(float)
-    myds_metal_buffer_t *q;                   // 32768 * sizeof(float) (64 heads * 512)
+    myds_metal_buffer_t *attn_cur;              // 6 * 5120 * sizeof(float)
+    myds_metal_buffer_t *target_attn_cur;       // subview: row 0
+    myds_metal_buffer_t *draft_attn_cur;        // subview: rows 1..5
+    myds_metal_buffer_t *attn_norm;             // 6 * 5120 * sizeof(float)
+    myds_metal_buffer_t *target_attn_norm;      // subview: row 0
+    myds_metal_buffer_t *draft_attn_norm;       // subview: rows 1..5
+    myds_metal_buffer_t *kv;                    // 6 * 512 * sizeof(float)
+    myds_metal_buffer_t *kv_norm;               // 6 * 512 * sizeof(float)
+    myds_metal_buffer_t *target_kv;             // subview: row 0
+    myds_metal_buffer_t *target_kv_norm;        // subview: row 0
+    myds_metal_buffer_t *draft_kv;              // subview: rows 1..5
+    myds_metal_buffer_t *draft_kv_norm;         // subview: rows 1..5
+    myds_metal_buffer_t *qr;                    // 5 * 1280 * sizeof(float)
+    myds_metal_buffer_t *qr_norm;               // 5 * 1280 * sizeof(float)
+    myds_metal_buffer_t *q;                     // 5 * 64 * 512 * sizeof(float)
     myds_metal_buffer_t *stage_kv_cache[MYDS_DSPARK_MAX_STAGES]; // 128 * 512 * sizeof(float)
-    myds_metal_buffer_t *attn_heads;          // 32768 * sizeof(float)
-    myds_metal_buffer_t *attn_low;            // 8192 * sizeof(float)
-    myds_metal_buffer_t *attn_out;            // 5120 * sizeof(float)
+    myds_metal_buffer_t *attn_heads;            // 5 * 64 * 512 * sizeof(float)
+    myds_metal_buffer_t *attn_low;              // 5 * 8192 * sizeof(float)
+    myds_metal_buffer_t *attn_out;              // 5 * 5120 * sizeof(float)
 
-    // FFN / MoE intermediate buffers
-    myds_metal_buffer_t *ffn_cur;          // 5120 * sizeof(float)
-    myds_metal_buffer_t *ffn_norm;         // 5120 * sizeof(float)
-    myds_metal_buffer_t *shared_gate;      // 2304 * sizeof(float)
-    myds_metal_buffer_t *shared_up;        // 2304 * sizeof(float)
-    myds_metal_buffer_t *shared_swiglu;    // 2304 * sizeof(float)
-    myds_metal_buffer_t *shared_out;       // 5120 * sizeof(float)
+    // FFN / MoE intermediate buffers (5 draft rows)
+    myds_metal_buffer_t *ffn_cur;               // 5 * 5120 * sizeof(float)
+    myds_metal_buffer_t *ffn_norm;              // 5 * 5120 * sizeof(float)
+    myds_metal_buffer_t *shared_gate;           // 5 * 2304 * sizeof(float)
+    myds_metal_buffer_t *shared_up;             // 5 * 2304 * sizeof(float)
+    myds_metal_buffer_t *shared_swiglu;         // 5 * 2304 * sizeof(float)
+    myds_metal_buffer_t *shared_out;            // 5 * 5120 * sizeof(float)
 
-    myds_metal_buffer_t *router_logits;    // 128 * sizeof(float)
-    myds_metal_buffer_t *selected_ids;     // 6 * sizeof(int32_t)
-    myds_metal_buffer_t *selected_weights; // 6 * sizeof(float)
-    myds_metal_buffer_t *moe_gate;         // 6 * 2304 * sizeof(float)
-    myds_metal_buffer_t *moe_up;           // 6 * 2304 * sizeof(float)
-    myds_metal_buffer_t *moe_mid;          // 6 * 2304 * sizeof(float)
-    myds_metal_buffer_t *moe_down;         // 6 * 5120 * sizeof(float)
-    myds_metal_buffer_t *moe_out;          // 5120 * sizeof(float)
-    myds_metal_buffer_t *ffn_total;        // 5120 * sizeof(float)
+    myds_metal_buffer_t *router_logits;         // 5 * 128 * sizeof(float)
+    myds_metal_buffer_t *selected_ids;          // 5 * 6 * sizeof(int32_t)
+    myds_metal_buffer_t *selected_weights;      // 5 * 6 * sizeof(float)
+    myds_metal_buffer_t *moe_gate;              // 5 * 6 * 2304 * sizeof(float)
+    myds_metal_buffer_t *moe_up;                // 5 * 6 * 2304 * sizeof(float)
+    myds_metal_buffer_t *moe_mid;               // 5 * 6 * 2304 * sizeof(float)
+    myds_metal_buffer_t *moe_down;              // 5 * 6 * 5120 * sizeof(float)
+    myds_metal_buffer_t *moe_out;               // 5 * 5120 * sizeof(float)
+    myds_metal_buffer_t *ffn_total;             // 5 * 5120 * sizeof(float)
 
-    // Final stage output
-    myds_metal_buffer_t *final_embd;       // 5120 * sizeof(float)
-    myds_metal_buffer_t *final_norm_out;   // 5120 * sizeof(float)
+    // Final stage output (5 draft rows)
+    myds_metal_buffer_t *final_embd;            // 5 * 5120 * sizeof(float)
+    myds_metal_buffer_t *final_norm_out;        // 5 * 5120 * sizeof(float)
+
+    // Pre-allocated subviews for 6 rows (row 0 = target, rows 1..5 = draft)
+    myds_metal_buffer_t *v_stage_input_hc[MYDS_DSPARK_TOTAL_ROWS];
+    myds_metal_buffer_t *v_stage_flat_hc_norm[MYDS_DSPARK_TOTAL_ROWS];
+    myds_metal_buffer_t *v_hc_mix[MYDS_DSPARK_TOTAL_ROWS];
+    myds_metal_buffer_t *v_hc_split[MYDS_DSPARK_TOTAL_ROWS];
+    myds_metal_buffer_t *v_attn_cur[MYDS_DSPARK_TOTAL_ROWS];
+    myds_metal_buffer_t *v_attn_norm[MYDS_DSPARK_TOTAL_ROWS];
+    myds_metal_buffer_t *v_kv[MYDS_DSPARK_TOTAL_ROWS];
+    myds_metal_buffer_t *v_kv_norm[MYDS_DSPARK_TOTAL_ROWS];
+
+    // Pre-allocated subviews for 5 draft rows
+    myds_metal_buffer_t *v_stage_draft_hc[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
+    myds_metal_buffer_t *v_after_attn_hc[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
+    myds_metal_buffer_t *v_draft_flat_hc_norm[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
+    myds_metal_buffer_t *v_draft_ffn_hc_mix[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
+    myds_metal_buffer_t *v_draft_ffn_hc_split[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
+    myds_metal_buffer_t *v_qr[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
+    myds_metal_buffer_t *v_qr_norm[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
+    myds_metal_buffer_t *v_q[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
+    myds_metal_buffer_t *v_attn_heads[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
+    myds_metal_buffer_t *v_attn_low[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
+    myds_metal_buffer_t *v_attn_out[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
+    myds_metal_buffer_t *v_ffn_cur[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
+    myds_metal_buffer_t *v_ffn_norm[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
+    myds_metal_buffer_t *v_shared_gate[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
+    myds_metal_buffer_t *v_shared_up[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
+    myds_metal_buffer_t *v_shared_swiglu[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
+    myds_metal_buffer_t *v_shared_out[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
+    myds_metal_buffer_t *v_router_logits[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
+    myds_metal_buffer_t *v_selected_ids[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
+    myds_metal_buffer_t *v_selected_weights[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
+    myds_metal_buffer_t *v_moe_gate[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
+    myds_metal_buffer_t *v_moe_up[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
+    myds_metal_buffer_t *v_moe_mid[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
+    myds_metal_buffer_t *v_moe_down[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
+    myds_metal_buffer_t *v_moe_out[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
+    myds_metal_buffer_t *v_ffn_total[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
+    myds_metal_buffer_t *v_final_embd[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
+    myds_metal_buffer_t *v_final_norm_out[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
+    myds_metal_buffer_t *v_logits[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
 
     // Scratch for GPU attention
     struct myds_v41_gpu_scratch *gpu_scratch;
 
-    float *conf_features_host;             // 5376 * sizeof(float)
+    float *conf_features_host;                 // 5376 * sizeof(float)
 } myds_dspark_workspace_t;
 
 typedef struct {
@@ -167,7 +213,9 @@ struct myds_dspark {
     uint32_t capture_valid_mask;
     myds_dspark_capture_counters_t capture_counters;
     myds_metal_buffer_t *stage_x_buf;       // 5120 * sizeof(float)
-    myds_metal_buffer_t *draft_logits_buf;  // vocab_size * sizeof(float)
+    myds_metal_buffer_t *noise_hc;          // 4 * 5120 * sizeof(float)
+    bool noise_hc_initialized;
+    myds_metal_buffer_t *draft_logits_buf;  // 5 * vocab_size * sizeof(float)
     float *markov_state_host;               // markov_rank * sizeof(float)
     float *markov_bias_host;                // vocab_size * sizeof(float)
 
