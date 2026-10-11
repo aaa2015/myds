@@ -31,6 +31,9 @@ def inspect(report, raw):
         roles=set()
         for f in row.get('files',[]):
             name=f['path'];require(type(name) is str and Path(name).name==name,'Unsafe raw path')
+            require(name not in digests,'Duplicate global raw path '+name)
+            label=row['label'] if kind=='state' else 'prefix'
+            require(name==label+'_'+f['role']+'.'+f['dtype'],'Raw path/role binding differs')
             p=raw/name;require(p.is_file() and not p.is_symlink(),'Missing raw file '+name)
             b=p.read_bytes();require(type(f['bytes']) is int and len(b)==f['bytes'],'Raw size differs '+name)
             h=14695981039346656037
