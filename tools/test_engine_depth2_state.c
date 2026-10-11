@@ -103,10 +103,12 @@ static int export_state(myds_context_t *ctx,const char *label,stream_t *s,myds_s
         "\"next_position\":%u,\"pcache_len\":%u,\"rng_state\":\"%" PRIu64 "\",\"engram_position\":%u,\"engram_history\":[%d,%d,%d],"
         "\"decode\":{\"target_forward_calls\":%" PRIu64 ",\"target_rows\":%" PRIu64 ",\"batch2_calls\":%" PRIu64 ","
         "\"depth2_calls\":%" PRIu64 ",\"depth2_hits1\":%" PRIu64 ",\"depth2_hits2\":%" PRIu64 ",\"depth2_misses\":%" PRIu64 ","
-        "\"depth2_failures\":%" PRIu64 ",\"depth2_fallbacks\":%" PRIu64 ",\"draft_proposed\":%" PRIu64 ",\"draft_accepted\":%" PRIu64 "},\"files\":[",
+        "\"depth2_failures\":%" PRIu64 ",\"depth2_fallbacks\":%" PRIu64 ",\"draft_proposed\":%" PRIu64 ",\"draft_accepted\":%" PRIu64 ","
+        "\"batch2_hits\":%" PRIu64 ",\"batch2_misses\":%" PRIu64 ",\"batch2_failures\":%" PRIu64 ",\"batch2_fallbacks\":%" PRIu64 ",\"draft_cycles\":%" PRIu64 "},\"files\":[",
         label,reason,s->count,ctx->pos,snap->next_position,ctx->pcache_len,snap->rng_state,snap->engram_position,
         snap->engram_history.tail[0],snap->engram_history.tail[1],snap->engram_history.tail[2],d.target_forward_calls,d.target_rows,
-        d.batch2_calls,d.depth2_calls,d.depth2_hits1,d.depth2_hits2,d.depth2_misses,d.depth2_failures,d.depth2_fallbacks,d.draft_proposed,d.draft_accepted);
+        d.batch2_calls,d.depth2_calls,d.depth2_hits1,d.depth2_hits2,d.depth2_misses,d.depth2_failures,d.depth2_fallbacks,d.draft_proposed,d.draft_accepted,
+        d.batch2_hits,d.batch2_misses,d.batch2_failures,d.batch2_fallbacks,d.draft_cycles);
     CHECK(raw(label,"logits","f32",myds_metal_buffer_data(ctx->logits),129280u*4u,false));
     CHECK(raw(label,"residual","f32",myds_v41_diagnostic_current_residual(ctx->v41),4u*DIM*4u,true));
     CHECK(raw(label,"pre","f32",myds_v41_diagnostic_current_pre(ctx->v41),16u,true));
@@ -145,8 +147,10 @@ static int request(myds_context_t *ctx,const char *label,const char *prompt,bool
     if(continuation)CHECK(ctx->last_cached_tokens>0);
     if(!spec)CHECK(ctx->decode_stats.depth2_calls==0&&ctx->decode_stats.draft_cycles==0);
     fprintf(report,"{\"kind\":\"request\",\"label\":\"%s\",\"spec\":%s,\"cap\":%u,\"cancel_after\":%u,"
-        "\"hit_output_cancel\":%u,\"hit_index\":%u,\"continuation\":%s,\"temperature\":%.9g,\"prompt_tokens\":%u,\"cached_tokens\":%u,\"pass\":true}\n",
-        label,spec?"true":"false",cap,cancel_after,hit_output,s->hit_index,continuation?"true":"false",temperature,prompt_tokens,ctx->last_cached_tokens);
+        "\"hit_output_cancel\":%u,\"hit_index\":%u,\"continuation\":%s,\"temperature\":%.9g,\"prompt_tokens\":%u,\"cached_tokens\":%u,"
+        "\"prompt_bytes\":%zu,\"prompt_fnv1a64\":\"%016" PRIx64 "\",\"pass\":true}\n",
+        label,spec?"true":"false",cap,cancel_after,hit_output,s->hit_index,continuation?"true":"false",temperature,prompt_tokens,ctx->last_cached_tokens,
+        strlen(prompt),fnv(prompt,strlen(prompt)));
     return export_state(ctx,label,s,*reason);
 }
 /* Compare actual slots1 and2 against full five-slot inference. Poison every
@@ -192,6 +196,25 @@ static myds_context_t *create(myds_model_t *m,const char *support) {
     ctx->dspark=myds_dspark_load(support,m->vocab_size);
     if(!ctx->dspark){myds_context_free(ctx);return NULL;}return ctx;
 }
+/* Preserve the original ten-context churn. Compare actual SDK residency
+ * accounting, not physical unique pages; device allocated size is recorded. */
+static int residency(const char *label,myds_metal_residency_stats_t *out,
+    const myds_metal_residency_stats_t *baseline,bool loaded) {
+    CHECK(myds_metal_residency_diagnostics(out)&&out->supported&&out->pending_unregister==0);
+    if(baseline) {
+        CHECK(out->active&&out->heartbeat_running);
+        if(loaded)CHECK(out->allocation_count>baseline->allocation_count&&out->allocated_size>baseline->allocated_size&&
+            out->live_mapped_allocations>baseline->live_mapped_allocations);
+        else CHECK(out->allocation_count==baseline->allocation_count&&out->allocated_size==baseline->allocated_size&&
+            out->live_mapped_allocations==baseline->live_mapped_allocations);
+    }
+    fprintf(report,"{\"kind\":\"residency\",\"label\":\"%s\",\"allocation_count\":%" PRIu64 ",\"allocated_size\":%" PRIu64 ","
+        "\"device_allocated_size\":%" PRIu64 ",\"live_mapped_allocations\":%" PRIu64 ",\"pending_unregister\":%" PRIu64 ","
+        "\"supported\":%s,\"active\":%s,\"heartbeat_running\":%s,\"pass\":true}\n",
+        label,out->allocation_count,out->allocated_size,out->device_allocated_size,out->live_mapped_allocations,out->pending_unregister,
+        out->supported?"true":"false",out->active?"true":"false",out->heartbeat_running?"true":"false");
+    fflush(report);return 1;
+}
 static int run(const char *model,const char *support) {
     CHECK(setenv("MYDS_PLD","0",1)==0&&setenv("MYDS_SPEC_SERIAL_PROBE","0",1)==0);
     CHECK(setenv("MYDS_DSPARK_CAPTURE_BYPASS","0",1)==0&&setenv("MYDS_PREFIX_CACHE","1",1)==0);
@@ -202,27 +225,39 @@ static int run(const char *model,const char *support) {
     char prompt[8192];CHECK(parse_chat_prompt("{\"enable_thinking\":false,\"messages\":[{\"role\":\"user\",\"content\":\"Write twenty numbered practical steps for software performance optimization, explaining each step with a detailed example.\"}]}",prompt,sizeof(prompt)));
     fprintf(report,"{\"kind\":\"metadata\",\"schema_version\":1,\"target\":");string(report,model);fputs(",\"support\":",report);string(report,support);
     fputs(",\"real_support_loaded\":true,\"capture_mode\":0,\"greedy\":true,\"performance_measurement\":false,\"pairs\":5,\"files_per_state\":18}\n",report);
+    myds_metal_residency_stats_t baseline,stats;
+    CHECK(residency("model_baseline",&baseline,NULL,false)&&baseline.active&&baseline.heartbeat_running&&baseline.allocation_count>0);
     for(unsigned c=0;c<5;c++) {
         myds_context_t *candidate=create(m,support),*ordinary=create(m,support);CHECK(candidate&&ordinary);
         stream_t s={0},o={0};myds_stop_reason_t sr,orr;char cl[64],ol[64];
+        snprintf(cl,sizeof(cl),"case%u_loaded",c);CHECK(residency(cl,&stats,&baseline,true));
         snprintf(cl,sizeof(cl),"case%u_candidate",c);snprintf(ol,sizeof(ol),"case%u_ordinary",c);
         const uint32_t hit=c<2?c+1:0,cap=c<2?256:c-1;
         CHECK(request(candidate,cl,prompt,true,cap,0,hit,false,0,&s,&sr));
+        if(c>=2)CHECK(candidate->decode_stats.depth2_calls==0);
+        if(c==2||c==3)CHECK(candidate->decode_stats.batch2_calls==0);
+        if(c==4)CHECK(candidate->decode_stats.batch2_calls>0&&candidate->decode_stats.draft_proposed>0);
         CHECK(request(ordinary,ol,prompt,false,hit?256:cap,hit?s.count:0,0,false,0,&o,&orr));
-        CHECK(s.count==o.count&&s.n==o.n&&!memcmp(s.ids,o.ids,s.count*4u)&&!memcmp(s.bytes,o.bytes,s.n)&&sr==orr);
+        CHECK(s.count==o.count&&s.n==o.n&&!memcmp(s.ids,o.ids,s.count*4u)&&(!s.n||!memcmp(s.bytes,o.bytes,s.n))&&sr==orr);
         free(s.bytes);free(o.bytes);
         if(c<2) {
             snprintf(cl,sizeof(cl),"case%u_candidate_continue",c);snprintf(ol,sizeof(ol),"case%u_ordinary_continue",c);
             CHECK(request(candidate,cl," Continue with the next point.",true,16,0,0,true,0,&s,&sr));
             CHECK(request(ordinary,ol," Continue with the next point.",false,16,0,0,true,0,&o,&orr));
-            CHECK(s.count==o.count&&s.n==o.n&&!memcmp(s.ids,o.ids,s.count*4u)&&!memcmp(s.bytes,o.bytes,s.n));
+            CHECK(s.count==o.count&&s.n==o.n&&!memcmp(s.ids,o.ids,s.count*4u)&&(!s.n||!memcmp(s.bytes,o.bytes,s.n)));
             if(c==1)CHECK(prefix_probe(candidate));
             free(s.bytes);free(o.bytes);
         }
         myds_context_free(candidate);myds_context_free(ordinary);
+        snprintf(cl,sizeof(cl),"case%u_freed",c);CHECK(residency(cl,&stats,&baseline,false));
     }
+    myds_model_free(m);
+    CHECK(residency("model_freed",&stats,NULL,false)&&stats.allocation_count==0&&stats.live_mapped_allocations==0);
+    myds_metal_cleanup();
+    CHECK(residency("runtime_cleanup",&stats,NULL,false)&&stats.allocation_count==0&&stats.allocated_size==0&&stats.live_mapped_allocations==0&&
+        !stats.active&&!stats.heartbeat_running);
     fprintf(report,"{\"kind\":\"complete\",\"states\":14,\"raw_files\":%u,\"native_all_hit_partial1_partial2\":true,\"pass\":true}\n",raw_count);
-    myds_model_free(m);return 1;
+    return 1;
 }
 int main(int argc,char **argv) {
     if(argc!=4){fputs("Usage: test_engine_depth2_state MODEL SUPPORT NEW_OUTPUT_DIR\n",stderr);return 2;}

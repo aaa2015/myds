@@ -1036,10 +1036,21 @@ myds_model_t *myds_model_load_diagnostic(const char *model_path) {
     return model_load_internal(model_path, true);
 }
 
+/* synchronize has no timeout: its waits finish even when a command reports an
+ * error. Check a second drain after any failure before releasing borrowed mmap
+ * memory. Cleanup of invalid work is never successful inference or recovery. */
+static void drain_gpu_before_release(const char *owner) {
+    if (myds_metal_synchronize()) return;
+    MYDS_LOG_E("%s teardown: GPU synchronization failed; draining prior submissions before releasing resources", owner);
+    if (!myds_metal_synchronize()) {
+        MYDS_LOG_E("%s teardown: prior GPU work also failed after blocking wait; releasing resources without recovery", owner);
+    }
+}
+
 void myds_model_free(myds_model_t *m) {
     if (!m) return;
-    /* An error may leave shared-expert commands in flight over mmap weights. */
-    (void)myds_metal_synchronize();
+    /* All weight views borrow the GGUF mapping released below. */
+    drain_gpu_before_release("model");
     myds_v41_model_free(m->v41);
     if (m->tok_embeddings) myds_metal_buffer_free(m->tok_embeddings);
     if (m->output_norm)    myds_metal_buffer_free(m->output_norm);
@@ -1326,6 +1337,9 @@ void myds_context_clear_image_embeddings(myds_context_t *ctx) {
 
 void myds_context_free(myds_context_t *ctx) {
     if (!ctx) return;
+    /* DSpark owns an mmap: retaining its MTLBuffer wrappers does not preserve
+     * that backing memory. Drain before any destructor can unmap or free it. */
+    drain_gpu_before_release("context");
     free(ctx->decode_cycles);
     free(ctx->pcache_tokens); ctx->pcache_tokens=NULL; ctx->pcache_len=ctx->pcache_cap=0;
     if (ctx->dspark) {
@@ -1333,7 +1347,6 @@ void myds_context_free(myds_context_t *ctx) {
         ctx->dspark = NULL;
     }
     myds_context_clear_image_embeddings(ctx);
-    (void)myds_metal_synchronize();
     myds_v41_context_free(ctx->v41);
     free_prefill_chunk(ctx->prefill_chunk);
     if (ctx->x)            myds_metal_buffer_free(ctx->x);

@@ -578,6 +578,23 @@ void myds_metal_residency_activate(void);
 void myds_metal_residency_keep_alive(void);
 void myds_metal_residency_stop(void);
 
+/* Read-only native counters; no command submission, synchronization or
+ * residency change. Call with the same external serialization as buffer APIs.
+ * allocated_size is Metal's residency accounting, not physical unique pages.
+ * Cleanup must precede reinitialization; surviving wrappers may be freed after
+ * cleanup, but must not be encoded against a reinitialized runtime. */
+typedef struct {
+    uint64_t allocation_count;
+    uint64_t allocated_size;
+    uint64_t device_allocated_size;
+    uint64_t live_mapped_allocations;
+    uint64_t pending_unregister;
+    bool supported;
+    bool active;
+    bool heartbeat_running;
+} myds_metal_residency_stats_t;
+bool myds_metal_residency_diagnostics(myds_metal_residency_stats_t *out);
+
 /* Batched V4.1 HC and RMSNorm primitives across multiple tokens */
 int myds_metal_v41_rmsnorm_batch(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *x, const myds_metal_buffer_t *weight,

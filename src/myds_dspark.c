@@ -738,6 +738,17 @@ static void dspark_workspace_free(myds_dspark_workspace_t *ws) {
 
 void myds_dspark_free(myds_dspark_t *ds) {
     if (!ds) return;
+    /* Public callers may free a support model without freeing its context.
+     * The no-copy weight buffers borrow ds->gf until every GPU wait finishes.
+     * synchronize has no timeout; a returned 0 reports completed failed work.
+     * Check a second drain after any reported error before releasing borrowed
+     * memory. Neither error is inference recovery. */
+    if (!myds_metal_synchronize()) {
+        MYDS_LOG_E("DSpark teardown: GPU synchronization failed; draining prior submissions before releasing the GGUF mapping");
+        if (!myds_metal_synchronize()) {
+            MYDS_LOG_E("DSpark teardown: prior GPU work also failed after blocking wait; releasing resources without recovery");
+        }
+    }
     if (ds->ws) dspark_workspace_free(ds->ws);
     if (ds->main_proj) myds_metal_buffer_free(ds->main_proj);
     if (ds->main_norm) myds_metal_buffer_free(ds->main_norm);

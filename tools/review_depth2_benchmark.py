@@ -2,7 +2,7 @@
 """CPU post-audit of an ordinary -> depth1 -> depth2 -> ordinary benchmark window.
 
 Replays the native benchmark auditor, then requires observed native Batch2
-and tree execution. This reports measurements, not an adoption decision.
+and continuous three-row execution. This reports measurements, not an adoption decision.
 No GPU, subprocess, network or model-weight reads are performed.
 """
 
@@ -192,14 +192,13 @@ def inspect(root):
                 "Unrelated effective environment changes invalidate the comparison: " + arm)
         require(all(all(before.get(key) == after.get(key) for key in OUTPUT_SIGNATURE)
                     for before, after in zip(samples["A1"], samples[arm])), "Token/byte/final-logits output differs: " + arm)
-    require(states["A2"]["environment"] == base["environment"], "Final eager control environment differs")
-    # Eager and lazy change only deferred LM-head scheduling. Their neural
-    # proposal/acceptance and target-row schedules must remain comparable.
+    require(states["A2"]["environment"] == base["environment"], "Final ordinary control environment differs")
+    # Ordinary A1/A2 must execute the same target schedule for drift control.
     for arm in ("A2",):
         require(all(all(before["decode_telemetry"][key] == after["decode_telemetry"][key] for key in PATH_COUNTERS)
-                    for before, after in zip(samples["A1"], samples[arm])), "Eager/lazy/control target or proposal schedule differs: " + arm)
+                    for before, after in zip(samples["A1"], samples[arm])), "Ordinary control target schedule differs: " + arm)
     timestamps = [datetime.datetime.fromisoformat(states[arm]["utc"].replace("Z", "+00:00")) for arm in ARMS]
-    require(all(before < after for before, after in zip(timestamps, timestamps[1:])), "Eager/lazy/tree/eager start order differs")
+    require(all(before < after for before, after in zip(timestamps, timestamps[1:])), "Ordinary/depth1/depth2/ordinary start order differs")
     drift = {name: 100 * (evidence["A2"]["timing"][name]["p50"] / evidence["A1"]["timing"][name]["p50"] - 1)
              for name in ("decode_ms_per_token", "prefill_ms_per_token", "ttft_s", "wall_s")}
     relative = {arm: {name: 100 * (evidence[arm]["timing"][name]["p50"] / evidence["A1"]["timing"][name]["p50"] - 1)

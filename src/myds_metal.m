@@ -14,8 +14,20 @@
 #include <stdatomic.h>
 #include <TargetConditionals.h>
 
+/* Only from_ptr creates this owner. Ordinary subviews retain it independently
+ * of their ARC buffer reference, so freeing/rebinding a parent cannot remove
+ * an allocation which a surviving wrapper still uses. */
+typedef struct mapped_buffer_owner {
+    id<MTLBuffer> buffer;
+    atomic_uint wrappers;
+    bool registered;
+    uint64_t residency_epoch;
+    struct mapped_buffer_owner *pending_next;
+} mapped_buffer_owner_t;
+
 struct myds_metal_buffer {
     id<MTLBuffer> mtl_buf;
+    mapped_buffer_owner_t *mapped_owner;
     size_t        size;
     size_t        offset;
     void         *ptr;
@@ -662,6 +674,7 @@ static id<MTLComputeCommandEncoder> g_batch_enc = nil;
 /* An event can wake the CPU before the rest of its command buffer finishes. */
 static NSMutableArray<id<MTLCommandBuffer>> *g_inflight_cbs = nil;
 static NSMutableArray<id<MTLBuffer>>        *g_batch_released_buffers = nil;
+static mapped_buffer_owner_t              *g_pending_mapped_owners = NULL;
 static uint64_t                             g_batch_commit_count = 0;
 static int                                  g_auto_barrier = 1;
 
@@ -721,6 +734,10 @@ static bool                g_res_off = false;   /* 环境变量或建集失败 *
 static bool                g_res_ready = false; /* 已 requestResidency + 挂队 */
 static atomic_bool         g_res_stop = false;
 static atomic_int          g_res_ticks = 0;     /* 剩余心跳次数 */
+static dispatch_group_t    g_res_heartbeat_group = nil;
+static uint64_t            g_res_epoch = 1;
+static uint64_t            g_live_mapped_owners = 0;
+static uint64_t            g_pending_mapped_count = 0;
 
 static bool myds_metal_residency_disabled(void) {
     static int cached = -1;
@@ -728,10 +745,11 @@ static bool myds_metal_residency_disabled(void) {
     return cached == 1;
 }
 
-/* 每个按字节包裹的模型 view 登记进同一个 residency set。
- * 必须在 g_res_ready 之前完成（即模型加载期间）。 */
-static void myds_metal_residency_register(id<MTLBuffer> buf) {
-    if (!buf || g_res_off || myds_metal_residency_disabled()) return;
+/* MTLResidencySet additions/removals take effect only on commit. The SDK
+ * permits updating a queue-attached set; support models load after activation.
+ * https://developer.apple.com/documentation/metal/mtlresidencyset */
+static bool myds_metal_residency_register(id<MTLBuffer> buf) {
+    if (!buf || g_res_off || myds_metal_residency_disabled()) return false;
 #if TARGET_OS_OSX
     if (@available(macOS 15.0, *)) {
         if (!g_res_lock) g_res_lock = [[NSLock alloc] init];
@@ -751,15 +769,78 @@ static void myds_metal_residency_register(id<MTLBuffer> buf) {
                            [[err localizedDescription] UTF8String]);
                 g_res_off = true;
                 [g_res_lock unlock];
-                return;
+                return false;
             }
         }
         [g_res_set addAllocation:buf];
         [g_res_set commit];
         g_res_count++;
         [g_res_lock unlock];
+        return true;
     }
 #endif
+    return false;
+}
+
+static void mapped_owner_destroy(mapped_buffer_owner_t *owner) {
+    if (!owner) return;
+#if TARGET_OS_OSX
+    if (@available(macOS 15.0, *)) {
+        if (owner->registered && owner->residency_epoch == g_res_epoch && g_res_set) {
+            [g_res_lock lock];
+            [g_res_set removeAllocation:owner->buffer];
+            [g_res_set commit];
+            if (g_res_count > 0) --g_res_count;
+            [g_res_lock unlock];
+        }
+    }
+#endif
+    owner->buffer = nil;
+    --g_live_mapped_owners;
+    free(owner);
+}
+
+static void mapped_owner_release(mapped_buffer_owner_t *owner) {
+    if (!owner || atomic_fetch_sub_explicit(&owner->wrappers, 1, memory_order_acq_rel) != 1) return;
+    if (g_batch_cb || (g_inflight_cbs && [g_inflight_cbs count] > 0)) {
+        owner->pending_next = g_pending_mapped_owners;
+        g_pending_mapped_owners = owner;
+        ++g_pending_mapped_count;
+    } else {
+        mapped_owner_destroy(owner);
+    }
+}
+
+static void release_completed_mapped_owners(void) {
+    /* A standalone synchronous operation need not drain an open batch. */
+    if (g_batch_cb) return;
+    while (g_pending_mapped_owners) {
+        mapped_buffer_owner_t *owner = g_pending_mapped_owners;
+        g_pending_mapped_owners = owner->pending_next;
+        --g_pending_mapped_count;
+        mapped_owner_destroy(owner);
+    }
+}
+
+bool myds_metal_residency_diagnostics(myds_metal_residency_stats_t *out) {
+    if (!out) return false;
+    *out = (myds_metal_residency_stats_t){0};
+    out->live_mapped_allocations = g_live_mapped_owners;
+    out->pending_unregister = g_pending_mapped_count;
+    out->device_allocated_size = g_device ? g_device.currentAllocatedSize : 0;
+    out->heartbeat_running = g_res_heartbeat_group &&
+        dispatch_group_wait(g_res_heartbeat_group, DISPATCH_TIME_NOW) != 0;
+#if TARGET_OS_OSX
+    if (@available(macOS 15.0, *)) {
+        out->supported = true;
+        [g_res_lock lock];
+        out->active = g_res_ready;
+        out->allocation_count = g_res_set ? g_res_set.allocationCount : 0;
+        out->allocated_size = g_res_set ? g_res_set.allocatedSize : 0;
+        [g_res_lock unlock];
+    }
+#endif
+    return true;
 }
 
 void myds_metal_residency_activate(void) {
@@ -804,7 +885,9 @@ void myds_metal_residency_activate(void) {
 
         /* ④ 心跳线程：周期性 requestResidency，把 wired 状态钉住。
          *    （等价于上游循环；不占用主线程，不产生 GPU 负载） */
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+        atomic_store_explicit(&g_res_stop, false, memory_order_relaxed);
+        g_res_heartbeat_group = dispatch_group_create();
+        dispatch_group_async(g_res_heartbeat_group, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
             while (!atomic_load_explicit(&g_res_stop, memory_order_relaxed)) {
                 if (atomic_load_explicit(&g_res_ticks, memory_order_relaxed) > 0) {
                     [g_res_lock lock];
@@ -831,6 +914,33 @@ void myds_metal_residency_keep_alive(void) {
 
 void myds_metal_residency_stop(void) {
     atomic_store_explicit(&g_res_stop, true, memory_order_relaxed);
+    if (g_res_heartbeat_group) dispatch_group_wait(g_res_heartbeat_group, DISPATCH_TIME_FOREVER);
+    g_res_heartbeat_group = nil;
+}
+
+static void residency_cleanup(void) {
+    myds_metal_residency_stop();
+#if TARGET_OS_OSX
+    if (@available(macOS 15.0, *)) {
+        [g_res_lock lock];
+        if (g_res_set) {
+            if (g_res_ready && g_queue) [g_queue removeResidencySet:g_res_set];
+            [g_res_set endResidency];
+            [g_res_set removeAllAllocations];
+            [g_res_set commit];
+        }
+        g_res_set = nil;
+        g_res_ready = false;
+        g_res_count = 0;
+        ++g_res_epoch;
+        [g_res_lock unlock];
+    }
+#endif
+    g_res_lock = nil;
+    g_res_off = false;
+    g_res_keep_alive_s = 180;
+    g_res_hb_ms = 5;
+    atomic_store_explicit(&g_res_ticks, 0, memory_order_relaxed);
 }
 
 void myds_metal_set_auto_barrier(int enable) {
@@ -946,6 +1056,7 @@ static int wait_inflight_commands(void) {
         if (g_batch_released_buffers && [g_batch_released_buffers count] > 0) {
             [g_batch_released_buffers removeAllObjects];
         }
+        release_completed_mapped_owners();
         return 1;
     }
     int ok = 1;
@@ -956,6 +1067,7 @@ static int wait_inflight_commands(void) {
         if (!command_buffer_result(cb)) ok = 0;
     }
     [g_inflight_cbs removeAllObjects];
+    release_completed_mapped_owners();
     if (g_batch_released_buffers && [g_batch_released_buffers count] > 0) {
         [g_batch_released_buffers removeAllObjects];
     }
@@ -1694,7 +1806,13 @@ int myds_metal_init(const char *shader_dir) {
 
 void myds_metal_cleanup(void) {
     if (!g_initialized) return;
-    (void)myds_metal_synchronize();
+    if (!myds_metal_synchronize()) {
+        fprintf(stderr, "myds_metal: cleanup observed a failed command buffer; draining remaining submissions\n");
+        if (!myds_metal_synchronize())
+            fprintf(stderr, "myds_metal: cleanup drain also reported a command buffer failure\n");
+    }
+    /* Join before clearing the set/lock/device the heartbeat accesses. */
+    residency_cleanup();
     g_pso_indexer_head_slots = nil;
     g_indexer_head_slots = false;
     g_indexer_topk_nan_shuffle = false;
@@ -1829,7 +1947,9 @@ int myds_metal_commit_batch(void) {
                 id<MTLCommandBuffer> cb = g_batch_cb;
                 g_batch_cb = nil;
                 [cb commit];
-                [cb waitUntilCompleted];
+                (void)wait_command_buffer(cb);
+            } else {
+                (void)wait_inflight_commands();
             }
             return 0;
         }
@@ -1915,6 +2035,7 @@ myds_metal_buffer_t *myds_metal_buffer_alloc(size_t bytes) {
         if (!mtl_buf) return NULL;
 
         myds_metal_buffer_t *buf = (myds_metal_buffer_t *)calloc(1, sizeof(myds_metal_buffer_t));
+        if (!buf) return NULL;
         buf->mtl_buf = mtl_buf;
         buf->size = bytes;
         buf->offset = 0;
@@ -1942,9 +2063,15 @@ myds_metal_buffer_t *myds_metal_buffer_from_ptr(const void *ptr, size_t bytes) {
         if (!mtl_buf) {
             return NULL;
         }
-        myds_metal_residency_register(mtl_buf);
-
         myds_metal_buffer_t *buf = (myds_metal_buffer_t *)calloc(1, sizeof(myds_metal_buffer_t));
+        mapped_buffer_owner_t *owner = calloc(1, sizeof(*owner));
+        if (!buf || !owner) { free(buf); free(owner); return NULL; }
+        owner->buffer = mtl_buf;
+        atomic_init(&owner->wrappers, 1);
+        owner->registered = myds_metal_residency_register(mtl_buf);
+        owner->residency_epoch = g_res_epoch;
+        ++g_live_mapped_owners;
+        buf->mapped_owner = owner;
         buf->mtl_buf = mtl_buf;
         buf->size = bytes;
         buf->offset = page_offset;
@@ -1955,10 +2082,13 @@ myds_metal_buffer_t *myds_metal_buffer_from_ptr(const void *ptr, size_t bytes) {
 }
 
 myds_metal_buffer_t *myds_metal_buffer_sub_view(const myds_metal_buffer_t *parent, size_t offset, size_t bytes) {
-    if (!parent || !parent->mtl_buf || (offset + bytes) > parent->size) return NULL;
+    if (!parent || !parent->mtl_buf || offset > parent->size || bytes > parent->size - offset ||
+        (parent->mapped_owner && parent->mapped_owner->residency_epoch != g_res_epoch)) return NULL;
     myds_metal_buffer_t *buf = (myds_metal_buffer_t *)calloc(1, sizeof(myds_metal_buffer_t));
     if (!buf) return NULL;
     buf->mtl_buf = parent->mtl_buf;
+    buf->mapped_owner = parent->mapped_owner;
+    if (buf->mapped_owner) atomic_fetch_add_explicit(&buf->mapped_owner->wrappers, 1, memory_order_relaxed);
     buf->size = bytes;
     buf->offset = parent->offset + offset;
     buf->ptr = (void *)((uintptr_t)parent->ptr + offset);
@@ -1973,17 +2103,23 @@ myds_metal_buffer_t *myds_metal_buffer_create_view(void) {
 }
 
 int myds_metal_buffer_update_sub_view(myds_metal_buffer_t *view, const myds_metal_buffer_t *parent, size_t offset, size_t bytes) {
-    if (!view || !parent || !parent->mtl_buf || (offset + bytes) > parent->size) return 0;
+    if (!view || !parent || !parent->mtl_buf || offset > parent->size || bytes > parent->size - offset ||
+        (parent->mapped_owner && parent->mapped_owner->residency_epoch != g_res_epoch)) return 0;
     id<MTLBuffer> old_buf = view->mtl_buf;
+    mapped_buffer_owner_t *old_owner = view->mapped_owner;
+    mapped_buffer_owner_t *new_owner = parent->mapped_owner;
+    if (new_owner != old_owner && new_owner) atomic_fetch_add_explicit(&new_owner->wrappers, 1, memory_order_relaxed);
     if (old_buf && old_buf != parent->mtl_buf && (g_batch_cb || (g_inflight_cbs && [g_inflight_cbs count] > 0))) {
         if (!g_batch_released_buffers) g_batch_released_buffers = [[NSMutableArray alloc] initWithCapacity:16];
         [g_batch_released_buffers addObject:old_buf];
     }
     view->mtl_buf = parent->mtl_buf;
+    view->mapped_owner = new_owner;
     view->size = bytes;
     view->offset = parent->offset + offset;
     view->ptr = (void *)((uintptr_t)parent->ptr + offset);
     view->is_view = true;
+    if (new_owner != old_owner) mapped_owner_release(old_owner);
     return 1;
 }
 
@@ -1994,6 +2130,7 @@ void myds_metal_buffer_free(myds_metal_buffer_t *buf) {
         [g_batch_released_buffers addObject:buf->mtl_buf];
     }
     buf->mtl_buf = nil;
+    mapped_owner_release(buf->mapped_owner);
     free(buf);
 }
 

@@ -22,6 +22,8 @@ OBJS_M = $(patsubst src/%.m, $(BUILD_DIR)/%.o, $(SRCS_M))
 
 TARGET = $(BIN_DIR)/myds
 TEST_METAL = $(BIN_DIR)/test_metal
+TEST_METAL_RESIDENCY = $(BIN_DIR)/test_metal_residency_lifecycle
+TEST_TEARDOWN_ORDER = $(BIN_DIR)/test_teardown_order
 TEST_V41_GPU = $(BIN_DIR)/test_v41_gpu
 TEST_ATTN_POLICY = $(BIN_DIR)/test_attention_policy
 TEST_ATTN_VEC = $(BIN_DIR)/test_attention_vec
@@ -78,6 +80,7 @@ METALLIB = $(BIN_DIR)/myds.metallib
 METAL_SRCS = $(wildcard metal/*.metal)
 
 ALL_TESTS = $(TEST_METAL) $(TEST_V41_GPU) $(TEST_ATTN_POLICY) $(TEST_ATTN_VEC) $(TEST_QKV_FUSION) $(TEST_DECODE_Q8) $(TEST_MOE_DOWN_NSG) $(TEST_DEEPER_SSD) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE) $(TEST_CPU) $(TEST_ENGRAM) $(TEST_ALIGN) $(TEST_PLD) $(TEST_KVDSK) $(TEST_P1) $(TEST_DSPARK_ROLLBACK) $(TEST_DSPARK_CAPTURE) $(TEST_DSPARK_ROUTER) $(TEST_V41_ROUTER) $(TEST_BATCH2_SHARED_PAIR) $(TEST_DSPARK_ATTN) $(TEST_DSPARK_MOE) $(TEST_DSPARK_PROPOSAL) $(TEST_BATCH2_PARITY) $(TEST_BATCH2_E2E) $(TEST_Q4_BF16_PARITY) $(TEST_TREE_SPEC) $(TEST_ENGINE_DEPTH2)
+ALL_TESTS += $(TEST_METAL_RESIDENCY) $(TEST_TEARDOWN_ORDER)
 
 .PHONY: all test clean bench metallib build-tail-init test-tail-init
 
@@ -344,6 +347,12 @@ $(TEST_BATCH2_E2E): tests/test_batch2_e2e.c $(filter-out $(BUILD_DIR)/main.o,$(O
 	$(CC) $(CFLAGS) -Iinclude -o $@ tests/test_batch2_e2e.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS)
 
 $(TEST_ENGINE_DEPTH2): tests/test_engine_depth2.c src/myds_engine.c $(wildcard include/*.h) $(filter-out $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) | $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $< $(filter %.o,$^) $(LDFLAGS)
+
+$(TEST_TEARDOWN_ORDER): tests/test_teardown_order.c src/myds_engine.c $(wildcard include/*.h) $(filter-out $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) | $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $< $(filter %.o,$^) $(LDFLAGS)
+
+$(TEST_METAL_RESIDENCY): tests/test_metal_residency_lifecycle.c $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $< $(filter %.o,$^) $(LDFLAGS)
 
 $(TEST_TREE_SPEC): tests/test_tree_spec.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
