@@ -10,6 +10,9 @@ struct guarded { myds_metal_buffer_t *owner, *view; size_t bytes, offset; };
 struct fixture { uint32_t rows, width; ggml_type type; struct guarded weight, in[3], ref[3], separate[3], out[3]; };
 static unsigned nr, parity_cases, reject_cases;
 static const char *shader_dir = "bin";
+static uint32_t random_bits(uint32_t *state) {
+    uint32_t x=*state;x^=x<<13;x^=x>>17;x^=x<<5;return *state=x;
+}
 static struct guarded allocate(size_t bytes, size_t offset) {
     struct guarded b = {.bytes=bytes,.offset=offset};
     b.owner=myds_metal_buffer_alloc(bytes+offset+16u); REQUIRE(b.owner);
@@ -32,13 +35,19 @@ static void init_fixture(struct fixture *f,uint32_t rows,uint32_t width,ggml_typ
     const unsigned block=type==GGML_TYPE_Q4_K?256u:32u,bytes=type==GGML_TYPE_Q4_K?144u:34u;
     f->weight=allocate((size_t)rows*(width/block)*bytes,18);
     uint8_t *w=myds_metal_buffer_data(f->weight.view);
+    uint32_t rng=seed*0x9e3779b9u+1u;
     for(size_t b=0;b<f->weight.bytes/bytes;b++) {
-        uint16_t scale=(uint16_t)(0x1400u+(b%8u)*0x180u);memcpy(w+bytes*b,&scale,2);
+        uint16_t scale=pattern<5?(uint16_t)(0x1400u+(b%8u)*0x180u):
+            (uint16_t)(0x1000u+(random_bits(&rng)%5u)*0x400u+(random_bits(&rng)&0x3ffu));
+        memcpy(w+bytes*b,&scale,2);
         if(type==GGML_TYPE_Q4_K) {
-            uint16_t minimum=(uint16_t)(0x1000u+(b%5u)*0x190u);memcpy(w+bytes*b+2,&minimum,2);
+            uint16_t minimum=pattern<5?(uint16_t)(0x1000u+(b%5u)*0x190u):
+                (uint16_t)(0x1000u+(random_bits(&rng)%5u)*0x400u+(random_bits(&rng)&0x3ffu));
+            memcpy(w+bytes*b+2,&minimum,2);
             /* Arbitrary packed scales exercise all six-bit scale/min bits. */
-            for(unsigned i=4;i<144;i++) w[bytes*b+i]=(uint8_t)(b*37u+i*29u+seed);
-        } else for(unsigned i=0;i<32;i++) w[bytes*b+2+i]=(uint8_t)(int8_t)((int)((b*37u+i*29u+seed)%255u)-127);
+            for(unsigned i=4;i<144;i++) w[bytes*b+i]=pattern<5?(uint8_t)(b*37u+i*29u+seed):(uint8_t)random_bits(&rng);
+        } else for(unsigned i=0;i<32;i++) w[bytes*b+2+i]=pattern<5?
+            (uint8_t)(int8_t)((int)((b*37u+i*29u+seed)%255u)-127):(uint8_t)random_bits(&rng);
     }
     for(unsigned t=0;t<3;t++) {
         f->in[t]=allocate((size_t)width*4,20+4*t);
@@ -49,6 +58,12 @@ static void init_fixture(struct fixture *f,uint32_t rows,uint32_t width,ggml_typ
             uint32_t z=i*747796405u+(seed+113u*t)*2891336453u;z=((z>>((z>>28)+4))^z)*277803737u;z=(z>>22)^z;
             x[i]=pattern==2?0.f:((int)(z%1023u)-511)/(pattern==3?128.f:257.f);
             if(pattern==4) x[i]=(i&1?-1.f:1.f)*(t+1.f)/256.f;
+            if(pattern>=5) {
+                uint32_t bits=random_bits(&rng);
+                bits=(bits&0x807fffffu)|((124u+random_bits(&rng)%6u)<<23);
+                if(pattern==5)bits=(bits+0x7fffu+((bits>>16)&1u))&0xffff0000u;
+                memcpy(x+i,&bits,4);
+            }
         }
         if(pattern==1&&t) { const float *x0=myds_metal_buffer_data(f->in[0].view);
             for(uint32_t i=0;i<width;i++) x[i]=t==1?-x0[i]:x0[i]*0.5f; }
@@ -207,15 +222,26 @@ static int child(const char *program,unsigned row) {
         fflush(stdout);fflush(stderr);REQUIRE([task launchAndReturnError:nil]);[task waitUntilExit];return task.terminationStatus; }
 }
 int main(int argc,char **argv) {
+    unsigned stress=0;
     for(int i=1;i<argc;i++) {
         if(!strcmp(argv[i],"--shader-dir")&&i+1<argc)shader_dir=argv[++i];
         else if(!strcmp(argv[i],"--nr0")&&i+1<argc){nr=(unsigned)strtoul(argv[++i],NULL,10);REQUIRE(nr==2||nr==4);}
-        else {fprintf(stderr,"usage: %s [--shader-dir DIR] [--nr0 2|4]\n",argv[0]);return 2;}
+        else if(!strcmp(argv[i],"--stress")&&i+1<argc){stress=(unsigned)strtoul(argv[++i],NULL,10);REQUIRE(stress>0&&stress<=512);}
+        else {fprintf(stderr,"usage: %s [--shader-dir DIR] [--nr0 2|4] [--stress COUNT]\n",argv[0]);return 2;}
     }
+    if(stress&&!nr)nr=4;
     if(!nr){REQUIRE(!child(argv[0],2));REQUIRE(!child(argv[0],4));puts("{\"kind\":\"suite_complete\",\"nr_processes\":2,\"pass\":true}");return 0;}
     char text[8];snprintf(text,sizeof(text),"%u",nr);setenv("MYDS_QKV_NR0",text,1);setenv("MYDS_METAL_CONCURRENT","0",1);
     REQUIRE(myds_metal_init(shader_dir));myds_metal_shared3_counters(NULL,true);
     printf("{\"kind\":\"identity\",\"device\":\"%s\",\"nr0\":%u,\"fixture_not_fullmodel\":true}\n",g_device.name.UTF8String,nr);
+    if(stress) {
+        for(unsigned i=0;i<stress;i++) {
+            myds_metal_set_concurrent((int)((i/2u)%2u));myds_metal_set_auto_barrier((int)(i%2u));
+            numeric(i%2u?5120u:32768u,i%2u?5120u:1280u,GGML_TYPE_Q4_K,5u+i%3u);
+        }
+        printf("{\"kind\":\"stress_complete\",\"parity_cases\":%u,\"pass\":true}\n",parity_cases);
+        myds_metal_cleanup();return 0;
+    }
     const uint32_t q8[][2]={{1,32},{3,128},{5,256},{17,1024},{5119,8192},{5120,8192},{5121,8192},{32768,1280},{65536,32},{65537,32},{1280,5120},{512,5120},{5120,2304}};
     const uint32_t q4[][2]={{1,256},{3,256},{5,768},{17,1024},{5119,8192},{5120,8192},{5121,8192},{32768,1280},{32769,256},{1280,5120},{512,5120},{5120,2304}};
     for(unsigned concurrent=0;concurrent<2;concurrent++)for(unsigned automatic=0;automatic<2;automatic++) {
@@ -223,6 +249,7 @@ int main(int argc,char **argv) {
         for(unsigned i=0;i<sizeof(q8)/sizeof(*q8);i++)numeric(q8[i][0],q8[i][1],GGML_TYPE_Q8_0,i%5);
         for(unsigned i=0;i<sizeof(q4)/sizeof(*q4);i++)numeric(q4[i][0],q4[i][1],GGML_TYPE_Q4_K,i%5);
         for(unsigned p=0;p<5;p++){numeric(17,1024,GGML_TYPE_Q8_0,p);numeric(17,1024,GGML_TYPE_Q4_K,p);}
+        for(unsigned p=5;p<8;p++){numeric(32768,1280,GGML_TYPE_Q4_K,p);numeric(5120,5120,GGML_TYPE_Q4_K,p);}
         dependency_chain(GGML_TYPE_Q8_0);dependency_chain(GGML_TYPE_Q4_K);
     }
     ties(GGML_TYPE_Q8_0);ties(GGML_TYPE_Q4_K);

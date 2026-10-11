@@ -198,6 +198,9 @@ def inspect(root, shared3_window=False):
                 isinstance(value, str) for key, value in env.items()), "Invalid recorded environment: " + arm)
         required_env = FIXED_ENV | {"MYDS_BATCH2_SPEC": spec, "MYDS_DSPARK_DEPTH": depth}
         if shared3_window:
+            require(all(recorded_env.get("MYDS_DEPTH2_SHARED3_SHADOW") in (None, "")
+                        for recorded_env in (env, meta["environment"])),
+                    "Shared3 shadow adds diagnostic GPU joins and invalidates timing: " + arm)
             required_env["MYDS_DEPTH2_SHARED3"] = SHARED3_MASTER[arm]
         require(all(env.get(key) == value and meta["environment"].get(key) == value
                     for key, value in required_env.items()), "Requested/effective path selectors differ: " + arm)

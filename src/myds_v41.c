@@ -20,6 +20,7 @@
 #include <stdatomic.h>
 #include <pthread.h>
 #include <sys/qos.h>
+#include <sys/stat.h>
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -4810,14 +4811,94 @@ static int v41_tree_projection(myds_metal_buffer_t *out[3], const myds_metal_buf
     }
 }
 
+/* Explicit same-operand diagnostic only. It adds GPU joins and must never be
+ * enabled for state/fault acceptance or timing. Preserve the candidate graph's
+ * output; compare against the real scalar providers in independent buffers.
+ * Stop the diagnostic process after saving the first discrepancy so later
+ * layers cannot overwrite its inputs. No production selector enables this. */
+static int v41_shared3_shadow_write(const char *dir, const char *name,
+    const void *data, size_t bytes) {
+    char file[4096];
+    int n = snprintf(file, sizeof(file), "%s/%s", dir, name);
+    if (n <= 0 || (size_t)n >= sizeof(file) || (!data && bytes)) return 0;
+    FILE *fp = fopen(file, "wb");
+    if (!fp) return 0;
+    const bool written = fwrite(data, 1, bytes, fp) == bytes;
+    return fclose(fp) == 0 && written;
+}
+
+static int v41_projection_shadow(myds_metal_buffer_t *out[3],
+    const myds_metal_buffer_t *weight, myds_metal_buffer_t *input[3],
+    uint32_t rows, uint32_t width, ggml_type type,
+    myds_v41_batch2_projection_kind_t kind, uint32_t pos, uint32_t layer) {
+    const char *dir = getenv("MYDS_DEPTH2_SHARED3_SHADOW");
+    if (!dir || !*dir) return 1;
+    if (*dir != '/') return 0;
+    myds_metal_buffer_t *ref[3] = {NULL, NULL, NULL};
+    int ok = 1;
+    for (unsigned t = 0; t < 3 && ok; ++t) {
+        ref[t] = myds_metal_buffer_alloc((size_t)rows * sizeof(float));
+        if (!ref[t]) { ok = 0; break; }
+        if (kind == MYDS_V41_BATCH2_QKV)
+            ok = project_decode_qkv(ref[t], weight, input[t], rows, width, type, false);
+        else if (kind == MYDS_V41_BATCH2_TAIL)
+            ok = project_decode_tail(ref[t], weight, input[t], rows, width, type, false);
+        else ok = myds_v41_decode_gemv_bf16(ref[t], weight, input[t], rows, width, type, false);
+    }
+    /* Even encoding failure must drain references before releasing them. */
+    if (!myds_metal_commit_batch()) ok = 0;
+    unsigned first_row = 3;
+    size_t first_index = 0;
+    if (ok) for (unsigned t = 0; t < 3 && first_row == 3; ++t) {
+        const uint32_t *a = myds_metal_buffer_data(out[t]);
+        const uint32_t *b = myds_metal_buffer_data(ref[t]);
+        for (size_t i = 0; i < rows; ++i)
+            if (a[i] != b[i]) { first_row = t; first_index = i; break; }
+    }
+    if (first_row < 3) {
+        int saved = mkdir(dir, 0700) == 0;
+        const size_t row_bytes = type == GGML_TYPE_Q4_K ? (size_t)(width / 256u) * 144u :
+            (size_t)(width / 32u) * 34u;
+        saved &= v41_shared3_shadow_write(dir, "weight.bin",
+            myds_metal_buffer_data((myds_metal_buffer_t *)weight), rows * row_bytes);
+        for (unsigned t = 0; t < 3; ++t) {
+            char name[64];
+            snprintf(name, sizeof(name), "input-%u.f32", t);
+            saved &= v41_shared3_shadow_write(dir, name, myds_metal_buffer_data(input[t]), (size_t)width * 4u);
+            snprintf(name, sizeof(name), "candidate-%u.f32", t);
+            saved &= v41_shared3_shadow_write(dir, name, myds_metal_buffer_data(out[t]), (size_t)rows * 4u);
+            snprintf(name, sizeof(name), "scalar-%u.f32", t);
+            saved &= v41_shared3_shadow_write(dir, name, myds_metal_buffer_data(ref[t]), (size_t)rows * 4u);
+        }
+        const uint32_t *a = myds_metal_buffer_data(out[first_row]);
+        const uint32_t *b = myds_metal_buffer_data(ref[first_row]);
+        char metadata[1024];
+        int n = snprintf(metadata, sizeof(metadata),
+            "{\"provider\":\"dense\",\"pos\":%u,\"layer\":%u,\"kind\":%u,\"type\":%u,\"rows\":%u,\"width\":%u,"
+            "\"first_row\":%u,\"first_index\":%zu,\"candidate_bits\":%u,\"scalar_bits\":%u,\"performance_measurement\":false}\n",
+            pos, layer, (unsigned)kind, (unsigned)type, rows, width, first_row, first_index, a[first_index], b[first_index]);
+        saved &= n > 0 && (size_t)n < sizeof(metadata) &&
+            v41_shared3_shadow_write(dir, "metadata.json", metadata, (size_t)n);
+        MYDS_LOG_E("SHARED3_SHADOW first dense discrepancy pos=%u layer=%u kind=%u row=%u index=%zu bits=%08x/%08x saved=%d dir=%s",
+            pos, layer, (unsigned)kind, first_row, first_index, a[first_index], b[first_index], saved, dir);
+        for (unsigned t = 0; t < 3; ++t) myds_metal_buffer_free(ref[t]);
+        /* A deliberate diagnostic termination, never a correctness PASS. */
+        exit(saved ? 86 : 87);
+    }
+    for (unsigned t = 0; t < 3; ++t) myds_metal_buffer_free(ref[t]);
+    return ok && myds_metal_begin_batch();
+}
+
 static int v41_three_row_projection(myds_metal_buffer_t *out[3],
     const myds_metal_buffer_t *weight, myds_metal_buffer_t *input[3],
     uint32_t rows, uint32_t width, ggml_type type,
-    myds_v41_batch2_projection_kind_t kind, bool shared3) {
+    myds_v41_batch2_projection_kind_t kind, bool shared3, uint32_t pos, uint32_t layer) {
     if (shared3 && (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q8_0) &&
         (kind == MYDS_V41_BATCH2_QKV || kind == MYDS_V41_BATCH2_TAIL ||
-         kind == MYDS_V41_BATCH2_SHARED))
-        return myds_metal_v41_gemv_bf16_shared3_type(out, weight, input, rows, width, type);
+         kind == MYDS_V41_BATCH2_SHARED)) {
+        if (!myds_metal_v41_gemv_bf16_shared3_type(out, weight, input, rows, width, type)) return 0;
+        return v41_projection_shadow(out, weight, input, rows, width, type, kind, pos, layer);
+    }
     return v41_tree_projection(out, weight, input, rows, width, type, kind);
 }
 
@@ -5004,8 +5085,8 @@ static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *t
         myds_metal_barrier_buffer(ws->attn_split_b2);
 
         /* Three-row QKV with the accepted decode projection providers. */
-        CHECK(v41_three_row_projection(ws->v_qr, base->attn_q_a, ws->v_x_norm, 1280, V41_DIM, base->attn_q_a_type, MYDS_V41_BATCH2_QKV, shared3));
-        CHECK(v41_three_row_projection(ws->v_kv_act, base->attn_kv, ws->v_x_norm, 512, V41_DIM, base->attn_kv_type, MYDS_V41_BATCH2_QKV, shared3));
+        CHECK(v41_three_row_projection(ws->v_qr, base->attn_q_a, ws->v_x_norm, 1280, V41_DIM, base->attn_q_a_type, MYDS_V41_BATCH2_QKV, shared3, pos, il));
+        CHECK(v41_three_row_projection(ws->v_kv_act, base->attn_kv, ws->v_x_norm, 512, V41_DIM, base->attn_kv_type, MYDS_V41_BATCH2_QKV, shared3, pos, il));
         myds_metal_barrier_buffer(ws->qr_b2);
         myds_metal_barrier_buffer(ws->kv_act_b2);
 
@@ -5017,7 +5098,7 @@ static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *t
         myds_metal_barrier_buffer(ws->qr_norm_b2);
 
         /* Three-row Q_B (32768 x 1280), preserving per-row BF16. */
-        CHECK(v41_three_row_projection(ws->v_q, base->attn_q_b, ws->v_qr_norm, V41_HEADS * 512, 1280, base->attn_q_b_type, MYDS_V41_BATCH2_QKV, shared3));
+        CHECK(v41_three_row_projection(ws->v_q, base->attn_q_b, ws->v_qr_norm, V41_HEADS * 512, 1280, base->attn_q_b_type, MYDS_V41_BATCH2_QKV, shared3, pos, il));
         myds_metal_barrier_buffer(ws->q_b2);
 
         if (linear) {
@@ -5111,7 +5192,7 @@ static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *t
         myds_metal_barrier_buffer(ws->attn_low_b2);
 
         /* Attention Output B GEMV Batch-3 (5120 x 8192) */
-        CHECK(v41_three_row_projection(ws->v_attn_out, base->attn_output_b, ws->v_attn_low, V41_DIM, 8192, base->attn_output_b_type, MYDS_V41_BATCH2_TAIL, shared3));
+        CHECK(v41_three_row_projection(ws->v_attn_out, base->attn_output_b, ws->v_attn_low, V41_DIM, 8192, base->attn_output_b_type, MYDS_V41_BATCH2_TAIL, shared3, pos, il));
         myds_metal_barrier_buffer(ws->attn_out_b2);
 
         /* HC Expand + FFN Norm */
@@ -5150,9 +5231,9 @@ static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *t
         }
         myds_metal_barrier_buffer(ws->shared_swiglu_b2);
 
-        CHECK(v41_three_row_projection(ws->v_shared_out, base->shared_down, ws->v_shared_swiglu, V41_DIM, 2304, base->shared_down_type, MYDS_V41_BATCH2_SHARED, shared3));
+        CHECK(v41_three_row_projection(ws->v_shared_out, base->shared_down, ws->v_shared_swiglu, V41_DIM, 2304, base->shared_down_type, MYDS_V41_BATCH2_SHARED, shared3, pos, il));
 
-        CHECK(v41_three_row_projection(ws->v_router_logits, base->router_gate, ws->v_ffn_norm, 384, V41_DIM, base->router_gate_type, MYDS_V41_BATCH2_ROUTER, shared3));
+        CHECK(v41_three_row_projection(ws->v_router_logits, base->router_gate, ws->v_ffn_norm, 384, V41_DIM, base->router_gate_type, MYDS_V41_BATCH2_ROUTER, shared3, pos, il));
         myds_metal_barrier_buffer(ws->router_logits_b2);
 
         CHECK(myds_v41_route_batch(ws->selected_ids_b2, ws->selected_w_b2, ws->route_probs_b2, ws->route_scores_b2,
