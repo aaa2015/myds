@@ -3715,7 +3715,9 @@ int myds_v41_batch2_projection_probe(myds_metal_buffer_t *out[2],
                    (kind == MYDS_V41_BATCH2_TAIL || kind == MYDS_V41_BATCH2_QKV || kind == MYDS_V41_BATCH2_SHARED)) {
             const int shared = myds_metal_batch2_q4_shared_mode();
             if (shared < 0) return 0;
-            if (shared) shared_eligible = 1;
+            /* Current-checkpoint fixed-state parity rejects the Q4 shared
+             * provider. Even explicit1 retains the authoritative scalar PSO;
+             * the direct Metal candidate remains available for diagnostics. */
         } else if ((type == GGML_TYPE_F16 || type == GGML_TYPE_F32) &&
                    kind == MYDS_V41_BATCH2_ROUTER) {
             const int shared = myds_metal_batch2_dense_shared_mode();
@@ -3727,11 +3729,11 @@ int myds_v41_batch2_projection_probe(myds_metal_buffer_t *out[2],
             const int shared = (type == GGML_TYPE_Q4_K) ? myds_metal_batch2_q4_shared_mode()
                                                         : myds_metal_batch2_q8_shared_mode();
             if (shared < 0) return 0;
-            if (shared) {
-                return (type == GGML_TYPE_Q4_K)
-                    ? myds_metal_v41_gemv_shared2_q4_f32(out, weight, input, rows, width)
-                    : myds_metal_v41_gemv_shared2_q8_f32(out, weight, input, rows, width);
+            if (shared && type == GGML_TYPE_Q8_0) {
+                return myds_metal_v41_gemv_shared2_q8_f32(out, weight, input, rows, width);
             }
+            /* Q4 LM-head selection shares the same quarantine as its BF16
+             * projections; a fleet explicit1 must not reactivate it. */
         }
     }
     if (shared_eligible) {

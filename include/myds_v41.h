@@ -166,7 +166,10 @@ int myds_v41_batch2_window_probe(myds_metal_buffer_t *window,
     myds_metal_buffer_t *kv[2], myds_metal_buffer_t *heads[2], uint32_t position,
     bool fail_after_first);
 /* Diagnostic entry into the production Batch-2 projection boundary. Each
- * row retains the authoritative decode helper's reduction and BF16 store. */
+ * row retains the authoritative decode helper's reduction and BF16 store.
+ * Q4 shared providers failed current-checkpoint parity: mode0 and mode1 both
+ * use scalar PSOs in this entry, including the LM head. Direct Metal shared2
+ * APIs retain their diagnostic candidates. Q8/dense selection is unchanged. */
 typedef enum {
     MYDS_V41_BATCH2_QKV, MYDS_V41_BATCH2_TAIL,
     MYDS_V41_BATCH2_SHARED, MYDS_V41_BATCH2_ROUTER,

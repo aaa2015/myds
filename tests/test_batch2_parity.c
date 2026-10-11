@@ -278,27 +278,57 @@ static int test_authoritative_projection(uint32_t rows, uint32_t width,
         CHECK(myds_metal_gemv(raw[t], weight, input[t], rows, width, type));
     }
     CHECK(myds_metal_commit_batch());
-    myds_metal_batch2_q8_shared_counters_t before, after;
-    myds_metal_batch2_q8_shared_counters(&before, false);
-    CHECK(myds_metal_begin_batch());
-    CHECK(myds_v41_batch2_projection_probe(candidate, weight, input, rows, width, type, kind));
-    CHECK(myds_metal_commit_batch());
-    myds_metal_batch2_q8_shared_counters(&after, false);
-    if ((type == GGML_TYPE_Q8_0 && myds_metal_batch2_q8_shared_mode() > 0 &&
-         (kind == MYDS_V41_BATCH2_LM_HEAD ||
-          ((kind == MYDS_V41_BATCH2_QKV || kind == MYDS_V41_BATCH2_TAIL || kind == MYDS_V41_BATCH2_SHARED) &&
-           myds_v41_decode_q8_fuse_bf16_enabled()))) ||
-        (type == GGML_TYPE_Q4_K && myds_metal_batch2_q4_shared_mode() > 0 &&
-         (kind == MYDS_V41_BATCH2_QKV || kind == MYDS_V41_BATCH2_TAIL || kind == MYDS_V41_BATCH2_SHARED || kind == MYDS_V41_BATCH2_LM_HEAD))) {
-        CHECK(after.encoded > before.encoded);
-    }
-    for (uint32_t t = 0; t < 2; ++t) {
-        CHECK(verify_exact(reference[t], candidate[t], rows));
-        if (kind != MYDS_V41_BATCH2_ROUTER && kind != MYDS_V41_BATCH2_LM_HEAD) {
-            CHECK(memcmp(myds_metal_buffer_data(raw[t]), myds_metal_buffer_data(candidate[t]), rows * sizeof(float)) != 0);
-            const uint32_t *bits = myds_metal_buffer_data(candidate[t]);
-            for (uint32_t r = 0; r < rows; ++r) CHECK((bits[r] & 0xffffu) == 0);
+    const char *q4_value = getenv("MYDS_BATCH2_Q4_SHARED");
+    char *saved_q4 = q4_value ? strdup(q4_value) : NULL;
+    CHECK(!q4_value || saved_q4);
+    for (unsigned mode = 0; mode < (type == GGML_TYPE_Q4_K ? 2u : 1u); ++mode) {
+        if (type == GGML_TYPE_Q4_K) CHECK(!setenv("MYDS_BATCH2_Q4_SHARED", mode ? "1" : "0", 1));
+        for (uint32_t t = 0; t < 2; ++t)
+            memset(myds_metal_buffer_data(candidate[t]), 0xa5, rows * sizeof(float));
+        myds_metal_batch2_q8_shared_counters_t before, after;
+        myds_metal_batch2_q8_shared_counters(&before, false);
+        const uint64_t dispatches = myds_metal_dispatch_count();
+        CHECK(myds_metal_begin_batch());
+        CHECK(myds_v41_batch2_projection_probe(candidate, weight, input, rows, width, type, kind));
+        CHECK(myds_metal_commit_batch());
+        myds_metal_batch2_q8_shared_counters(&after, false);
+        if (type == GGML_TYPE_Q4_K) {
+            CHECK(after.requests == before.requests && after.encoded == before.encoded &&
+                  after.failures == before.failures);
+            CHECK(myds_metal_dispatch_count() - dispatches >= 2u);
+        } else if (type == GGML_TYPE_Q8_0 && myds_metal_batch2_q8_shared_mode() > 0 &&
+            (kind == MYDS_V41_BATCH2_LM_HEAD ||
+             ((kind == MYDS_V41_BATCH2_QKV || kind == MYDS_V41_BATCH2_TAIL || kind == MYDS_V41_BATCH2_SHARED) &&
+              myds_v41_decode_q8_fuse_bf16_enabled()))) {
+            CHECK(after.encoded > before.encoded);
         }
+        for (uint32_t t = 0; t < 2; ++t) {
+            CHECK(verify_exact(reference[t], candidate[t], rows));
+            if (kind != MYDS_V41_BATCH2_ROUTER && kind != MYDS_V41_BATCH2_LM_HEAD) {
+                CHECK(memcmp(myds_metal_buffer_data(raw[t]), myds_metal_buffer_data(candidate[t]), rows * sizeof(float)) != 0);
+                const uint32_t *bits = myds_metal_buffer_data(candidate[t]);
+                for (uint32_t r = 0; r < rows; ++r) CHECK((bits[r] & 0xffffu) == 0);
+            }
+        }
+        if (type == GGML_TYPE_Q4_K)
+            printf("  [PASS] Q4 production quarantine kind=%u explicit_mode=%u shared_requests=0 shared_dispatches=0 scalar_bit_exact=true\n",kind,mode);
+    }
+    if (type == GGML_TYPE_Q4_K) {
+        CHECK(!setenv("MYDS_BATCH2_Q4_SHARED", "invalid", 1));
+        for (uint32_t t = 0; t < 2; ++t)
+            memset(myds_metal_buffer_data(candidate[t]), 0xa5, rows * sizeof(float));
+        const uint64_t dispatches = myds_metal_dispatch_count();
+        CHECK(myds_metal_begin_batch());
+        CHECK(!myds_v41_batch2_projection_probe(candidate, weight, input, rows, width, type, kind));
+        CHECK(myds_metal_commit_batch());CHECK(myds_metal_dispatch_count() == dispatches);
+        for (uint32_t t = 0; t < 2; ++t) {
+            const uint8_t *p = myds_metal_buffer_data(candidate[t]);
+            for (size_t i = 0; i < (size_t)rows * sizeof(float); ++i) CHECK(p[i] == 0xa5);
+        }
+    }
+    if (saved_q4) {CHECK(!setenv("MYDS_BATCH2_Q4_SHARED", saved_q4, 1));free(saved_q4);}
+    else CHECK(!unsetenv("MYDS_BATCH2_Q4_SHARED"));
+    for (uint32_t t = 0; t < 2; ++t) {
         myds_metal_buffer_free(input[t]); myds_metal_buffer_free(reference[t]);
         myds_metal_buffer_free(candidate[t]); myds_metal_buffer_free(raw[t]);
     }

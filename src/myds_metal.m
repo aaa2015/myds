@@ -3665,7 +3665,7 @@ int myds_metal_v41_gemv_bf16_shared2_type(myds_metal_buffer_t *const out[2],
             if (batch2_buffer_overlap(out[t], output_bytes, input[s], input_bytes))
                 return batch2_shared_failure("output overlaps input", type);
     }
-    const uint32_t nsg = out_dim >= 32768u ? 8u : 4u;
+    const uint32_t nsg = (type == GGML_TYPE_Q8_0 ? out_dim > 65536u : out_dim >= 32768u) ? 8u : 4u;
     const uint32_t nr0 = (type == GGML_TYPE_Q4_K) ? ((qkv_nr0() == 4) ? 4u : 2u) : qkv_nr0();
     const NSUInteger shmem_bytes = (type == GGML_TYPE_Q4_K) ? 0 : (32u * nr0 * 2u * sizeof(float));
     @autoreleasepool {

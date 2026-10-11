@@ -120,8 +120,8 @@ static void rejections(void) {
     setenv("MYDS_BATCH2_Q8_SHARED","1",1);
     /* Actual library without the candidate symbol. Retain all previously
      * initialized scalar PSOs; no substitution can be accepted as success. */
-    id<MTLLibrary> original=g_library;NSString *key=[NSString stringWithFormat:@"batch2_q8_shared_4_%u",nr];
-    id<MTLComputePipelineState> saved=g_native_pipelines[key];[g_native_pipelines removeObjectForKey:key];
+    id<MTLLibrary> original=g_library;NSString *key=[NSString stringWithFormat:@"batch2_shared_q8_4_%u",nr];
+    id<MTLComputePipelineState> saved=g_native_pipelines[key];REQUIRE(saved);[g_native_pipelines removeObjectForKey:key];REQUIRE(!g_native_pipelines[key]);
     NSError *error=nil;g_library=[g_device newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\nkernel void unrelated(device float *x [[buffer(0)]],uint i [[thread_position_in_grid]]) {x[i]=0;}\n" options:nil error:&error];REQUIRE(g_library);
     reset_output(&f);myds_metal_batch2_q8_shared_counters_t a,b;myds_metal_batch2_q8_shared_counters(&a,false);uint64_t count=myds_metal_dispatch_count();
     REQUIRE(!projected(&f,MYDS_V41_BATCH2_TAIL));myds_metal_batch2_q8_shared_counters(&b,false);REQUIRE(b.requests==a.requests+1&&b.failures==a.failures+1&&b.encoded==a.encoded&&count==myds_metal_dispatch_count());untouched(&f);
@@ -197,13 +197,13 @@ int main(int argc,char **argv) {
     REQUIRE(myds_metal_init(shader_dir));myds_metal_batch2_q8_shared_counters(NULL,true);myds_metal_set_concurrent(0);
     printf("{\"kind\":\"identity\",\"device\":\"%s\",\"nr0\":%u,\"policy\":\"%s\",\"fixture_not_fullmodel\":true}\n",g_device.name.UTF8String,nr,policy);
     if(strcmp(policy,"eligible")){numeric(0,5120,8192,0,MYDS_V41_BATCH2_TAIL,0);myds_metal_cleanup();puts("{\"kind\":\"policy_bypass\",\"pass\":true}");return 0;}
-    const uint32_t shapes[][2]={{1,32},{3,128},{5,256},{17,128},{5119,8192},{5120,8192},{5121,8192},{65537,32}};
+    const uint32_t shapes[][2]={{1,32},{3,128},{5,256},{17,128},{5119,8192},{5120,8192},{5121,8192},{32768,1280},{65536,32},{65537,32}};
     unsigned id=0;
     for(unsigned c=0;c<2;c++){myds_metal_set_concurrent((int)c);myds_metal_set_auto_barrier(1);
         for(unsigned i=0;i<sizeof(shapes)/sizeof(*shapes);i++)numeric(id++,shapes[i][0],shapes[i][1],i%3u,MYDS_V41_BATCH2_TAIL,1);
         numeric(id++,5120,8192,0,MYDS_V41_BATCH2_TAIL,1);numeric(id++,5120,8192,1,MYDS_V41_BATCH2_TAIL,1);
         numeric(id++,5120,8192,3,MYDS_V41_BATCH2_TAIL,1);
-        numeric(id++,17,128,0,MYDS_V41_BATCH2_QKV,0);numeric(id++,17,128,0,MYDS_V41_BATCH2_SHARED,0);rejections();
+        numeric(id++,17,128,0,MYDS_V41_BATCH2_QKV,1);numeric(id++,17,128,0,MYDS_V41_BATCH2_SHARED,1);rejections();
         for(unsigned a=0;a<2;a++){myds_metal_set_auto_barrier((int)a);reuse();}
     }
     myds_metal_set_concurrent(1);myds_metal_set_auto_barrier(0);if(timing_enabled){g_hist_enabled=0;timing("A1",0);timing("B",1);timing("A2",0);}
