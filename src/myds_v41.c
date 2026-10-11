@@ -3412,6 +3412,115 @@ static inline bool check_logits_finite(const float *logits, uint32_t n) {
 #endif
 }
 
+#if defined(__ARM_NEON)
+static inline int32_t myds_sample_greedy_finite_neon(const float *logits, uint32_t n, bool *out_finite) {
+    if (!logits || n == 0) {
+        if (out_finite) *out_finite = false;
+        return 0;
+    }
+    const uint32x4_t mask = vdupq_n_u32(0x7F800000u);
+    uint32x4_t any_bad = vdupq_n_u32(0);
+
+    int32_t best_id = 0;
+    float max_l = logits[0];
+    if (!isfinite(max_l)) {
+        if (out_finite) *out_finite = false;
+        return -1;
+    }
+
+    uint32_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        float32x4_t f0 = vld1q_f32(logits + i);
+        float32x4_t f1 = vld1q_f32(logits + i + 4);
+        float32x4_t f2 = vld1q_f32(logits + i + 8);
+        float32x4_t f3 = vld1q_f32(logits + i + 12);
+
+        uint32x4_t u0 = vreinterpretq_u32_f32(f0);
+        uint32x4_t u1 = vreinterpretq_u32_f32(f1);
+        uint32x4_t u2 = vreinterpretq_u32_f32(f2);
+        uint32x4_t u3 = vreinterpretq_u32_f32(f3);
+
+        uint32x4_t c0 = vceqq_u32(vandq_u32(u0, mask), mask);
+        uint32x4_t c1 = vceqq_u32(vandq_u32(u1, mask), mask);
+        uint32x4_t c2 = vceqq_u32(vandq_u32(u2, mask), mask);
+        uint32x4_t c3 = vceqq_u32(vandq_u32(u3, mask), mask);
+        any_bad = vorrq_u32(any_bad, vorrq_u32(vorrq_u32(c0, c1), vorrq_u32(c2, c3)));
+
+        float32x4_t max01 = vmaxq_f32(f0, f1);
+        float32x4_t max23 = vmaxq_f32(f2, f3);
+        float32x4_t max16 = vmaxq_f32(max01, max23);
+        float chunk_max = vmaxvq_f32(max16);
+
+        if (__builtin_expect(chunk_max > max_l, 0)) {
+            for (uint32_t k = 0; k < 16; ++k) {
+                if (logits[i + k] > max_l) {
+                    max_l = logits[i + k];
+                    best_id = (int32_t)(i + k);
+                }
+            }
+        }
+    }
+    for (; i < n; ++i) {
+        float l = logits[i];
+        if (!isfinite(l)) {
+            if (out_finite) *out_finite = false;
+            return -1;
+        }
+        if (l > max_l) {
+            max_l = l;
+            best_id = (int32_t)i;
+        }
+    }
+    if (__builtin_expect(vmaxvq_u32(any_bad) != 0, 0)) {
+        if (out_finite) *out_finite = false;
+        return -1;
+    }
+    if (out_finite) *out_finite = true;
+    return best_id;
+}
+#else
+static inline int32_t myds_sample_greedy_finite_neon(const float *logits, uint32_t n, bool *out_finite) {
+    if (!logits || n == 0) {
+        if (out_finite) *out_finite = false;
+        return 0;
+    }
+    int32_t best_id = 0;
+    float max_l = logits[0];
+    if (!isfinite(max_l)) {
+        if (out_finite) *out_finite = false;
+        return -1;
+    }
+    for (uint32_t i = 1; i < n; i++) {
+        float l = logits[i];
+        if (!isfinite(l)) {
+            if (out_finite) *out_finite = false;
+            return -1;
+        }
+        if (l > max_l) {
+            max_l = l;
+            best_id = (int32_t)i;
+        }
+    }
+    if (out_finite) *out_finite = true;
+    return best_id;
+}
+#endif
+
+static inline int32_t sample_and_verify_token(const float *logits, uint32_t vocab_size,
+                                             const myds_config_t *cfg, myds_context_t *ctx) {
+    float temp = cfg ? cfg->temperature : 0.0f;
+    float rep_pen = (cfg && cfg->repetition_penalty > 0.0f) ? cfg->repetition_penalty : 1.0f;
+    bool has_rep_pen = (rep_pen > 1.0f);
+    if (temp <= 0.0f && !has_rep_pen) {
+        bool finite_ok = true;
+        int32_t tok = myds_sample_greedy_finite_neon(logits, vocab_size, &finite_ok);
+        if (__builtin_expect(!finite_ok, 0)) return -1;
+        return tok;
+    }
+    if (__builtin_expect(!check_logits_finite(logits, vocab_size), 0)) return -1;
+    return myds_sample_next_token(logits, vocab_size, cfg, ctx, NULL, 0);
+}
+
 static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos,
                                bool need_logits, bool ordinary_decode_allowed) {
     myds_model_t *m=ctx->model;
@@ -3736,6 +3845,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
         }
     }
     phase="output head";
+    int32_t next_tok = 0;
     if (need_logits) {
         if (fuse_hc_norm_enabled) {
             CHECK(myds_metal_v41_hc_sum_rmsnorm(ctx->x_norm, ctx->x, g->residual, g->ffn_split, m->output_norm, V41_DIM, m->norm_eps, true));
@@ -3754,7 +3864,8 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
         }
         if (trace_on) CHECK(myds_trace_f32("logits",0,pos,ctx->logits,m->vocab_size));
         const float *logits=myds_metal_buffer_data(ctx->logits);
-        if (!check_logits_finite(logits, m->vocab_size)) goto fail;
+        next_tok = sample_and_verify_token(logits, m->vocab_size, &ctx->cfg, ctx);
+        if (next_tok < 0) goto fail;
     } else {
         CHECK(myds_metal_commit_batch());
         if (fine_pipeline) {
@@ -3765,7 +3876,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
     g->next_position=pos+1u;
     if (ctx->dspark && ctx->dspark->capture_valid_mask == 7u)
         myds_dspark_capture_publish(ctx->dspark);
-    return need_logits ? myds_sample_next_token(myds_metal_buffer_data(ctx->logits),m->vocab_size,&ctx->cfg,ctx,NULL,0) : 0;
+    return need_logits ? next_tok : 0;
 fail:
     MYDS_LOG_E("V4.1 native graph failed at pos %u layer %u: %s",pos,il,phase);
     myds_v41_decode_qkv_scope_end(&qkv_scope);
@@ -4666,11 +4777,10 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
     double lazy_encode_ms = 0.0, lazy_wait_ms = 0.0;
     /* 5. 权威裁决与状态回滚（Arbitration & Rollback with Lazy Verification Head） */
     const float *logits0 = (const float *)myds_metal_buffer_data(ws->v_logits[0]);
-    if (!check_logits_finite(logits0, m->vocab_size)) {
+    int32_t auth0 = sample_and_verify_token(logits0, m->vocab_size, &ctx->cfg, ctx);
+    if (auth0 < 0) {
         goto fail;
     }
-
-    int32_t auth0 = myds_sample_next_token(logits0, m->vocab_size, &ctx->cfg, ctx, NULL, 0);
     out_tokens[0] = auth0;
     snap->first_rng_state = ctx->rng_state;
     snap->first_engram_history = engram_hist_0;
@@ -4701,11 +4811,10 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         }
 
         const float *logits1 = (const float *)myds_metal_buffer_data(ws->v_logits[1]);
-        if (!check_logits_finite(logits1, m->vocab_size)) {
+        int32_t auth1 = sample_and_verify_token(logits1, m->vocab_size, &ctx->cfg, ctx);
+        if (auth1 < 0) {
             goto fail;
         }
-
-        int32_t auth1 = myds_sample_next_token(logits1, m->vocab_size, &ctx->cfg, ctx, NULL, 0);
         out_tokens[1] = auth1;
 
         CHECK(myds_metal_begin_batch());
@@ -5359,12 +5468,11 @@ static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *t
 
     /* 5. 3-Way 树状权威裁决器（Tree Arbitration with Lazy Output Projection） */
     const float *logits0 = (const float *)myds_metal_buffer_data(ws->v_logits[0]);
-    if (!check_logits_finite(logits0, m->vocab_size)) {
-        MYDS_LOG_E("forward_tree_spec: check_logits_finite failed at pos %u", pos);
+    int32_t auth0 = sample_and_verify_token(logits0, m->vocab_size, &ctx->cfg, ctx);
+    if (auth0 < 0) {
+        MYDS_LOG_E("forward_tree_spec: sample_and_verify_token failed at pos %u", pos);
         goto fail;
     }
-
-    int32_t auth0 = myds_sample_next_token(logits0, m->vocab_size, &ctx->cfg, ctx, NULL, 0);
     if (!linear) out_tokens[0] = auth0;
 
     snap->first_rng_state = ctx->rng_state;
@@ -5399,8 +5507,9 @@ static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *t
             lazy_encode_ms += head_encoded - head_start;
             lazy_wait_ms += (timed ? lowkv_now_ms() : 0.0) - head_encoded;
             const float *logits = myds_metal_buffer_data(ws->v_logits[row]);
-            CHECK(check_logits_finite(logits, m->vocab_size));
-            authoritative[row] = myds_sample_next_token(logits, m->vocab_size, &ctx->cfg, ctx, NULL, 0);
+            int32_t auth_row = sample_and_verify_token(logits, m->vocab_size, &ctx->cfg, ctx);
+            if (auth_row < 0) goto fail;
+            authoritative[row] = auth_row;
             selected = row;
             count = row + 1u;
             if (row == 1u) {
@@ -5443,8 +5552,9 @@ static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *t
         lazy_encode_ms = head_encoded - head_start;
         lazy_wait_ms = (timed ? lowkv_now_ms() : 0.0) - head_encoded;
         const float *logits = myds_metal_buffer_data(ws->v_logits[selected]);
-        CHECK(check_logits_finite(logits, m->vocab_size));
-        out_tokens[1] = myds_sample_next_token(logits, m->vocab_size, &ctx->cfg, ctx, NULL, 0);
+        int32_t auth_sel = sample_and_verify_token(logits, m->vocab_size, &ctx->cfg, ctx);
+        if (auth_sel < 0) goto fail;
+        out_tokens[1] = auth_sel;
     } else {
         CHECK(myds_v41_spec_snapshot_restore_partial(ctx, snap, 1));
     }
