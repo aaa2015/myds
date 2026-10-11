@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <assert.h>
 
 #define CHECK(c) do { \
@@ -570,6 +571,46 @@ static int test_batch2_routed_moe(void) {
     CHECK(verify_exact(out_seq1.view, out_b2_tok1, dim));
     myds_metal_buffer_free(out_b2_tok0);
     myds_metal_buffer_free(out_b2_tok1);
+
+    /* 4. Benchmark Sequential vs Batch-2 */
+    const int warmup = 5;
+    const int iters = 50;
+    for (int i = 0; i < warmup; i++) {
+        CHECK(myds_metal_begin_batch());
+        CHECK(myds_metal_routed_moe_batch(out_b2.view, x_b2.view, gate.view, up.view, down.view,
+            sel_b2.view, w_b2.view, sg_b2.view, su_b2.view, smid_b2.view, sdown_b2.view,
+            dim, expert_dim, experts, active, 2, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_K, 10.0f));
+        CHECK(myds_metal_commit_batch());
+    }
+
+    struct timespec ts0, ts1;
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
+    for (int i = 0; i < iters; i++) {
+        CHECK(myds_metal_begin_batch());
+        CHECK(myds_metal_routed_moe_batch(out_b2.view, x_b2.view, gate.view, up.view, down.view,
+            sel_b2.view, w_b2.view, sg_b2.view, su_b2.view, smid_b2.view, sdown_b2.view,
+            dim, expert_dim, experts, active, 2, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_K, 10.0f));
+        CHECK(myds_metal_commit_batch());
+    }
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
+    double b2_us = ((ts1.tv_sec - ts0.tv_sec) * 1e6 + (ts1.tv_nsec - ts0.tv_nsec) / 1e3) / iters;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
+    for (int i = 0; i < iters; i++) {
+        CHECK(myds_metal_begin_batch());
+        CHECK(myds_metal_routed_moe_batch(out_seq0.view, x_seq0.view, gate.view, up.view, down.view,
+            sel_seq0.view, w_seq0.view, sg_seq.view, su_seq.view, smid_seq.view, sdown_seq.view,
+            dim, expert_dim, experts, active, 1, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_K, 10.0f));
+        CHECK(myds_metal_routed_moe_batch(out_seq1.view, x_seq1.view, gate.view, up.view, down.view,
+            sel_seq1.view, w_seq1.view, sg_seq.view, su_seq.view, smid_seq.view, sdown_seq.view,
+            dim, expert_dim, experts, active, 1, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_K, 10.0f));
+        CHECK(myds_metal_commit_batch());
+    }
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
+    double seq_us = ((ts1.tv_sec - ts0.tv_sec) * 1e6 + (ts1.tv_nsec - ts0.tv_nsec) / 1e3) / iters;
+
+    printf("  [BENCH] MoE Per-Layer: Sequential 2x = %.1f us (40L = %.2f ms), Batch-2 = %.1f us (40L = %.2f ms, %.1f%% of seq)\n",
+           seq_us, seq_us * 40.0 / 1000.0, b2_us, b2_us * 40.0 / 1000.0, b2_us / seq_us * 100.0);
 
     guarded_free(&gate); guarded_free(&up); guarded_free(&down);
     guarded_free(&x_seq0); guarded_free(&x_seq1); guarded_free(&x_b2);

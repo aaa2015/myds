@@ -55,7 +55,7 @@ static inline bool get_moe_batch_dedup_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *v = getenv("MYDS_MOE_BATCH_DEDUP");
-        cached = (!v || strcmp(v, "0") != 0) ? 1 : 0;
+        cached = (v && strcmp(v, "1") == 0) ? 1 : 0;
     }
     return cached == 1;
 }
@@ -4841,8 +4841,12 @@ int myds_metal_routed_moe_batch(
             bool use_batch_dedup = (n_tok == 2) && get_moe_batch_dedup_enabled() &&
                                    g_pso_moe_pair_swiglu_batch_iq2_xxs && g_pso_moe_sum6_batch_q2_k;
             static bool logged_moe_dedup = false;
-            if (!logged_moe_dedup && use_batch_dedup) {
-                MYDS_LOG_I("MoE batch-2 path: DEDUP (2-token expert weight sharing) — active");
+            if (!logged_moe_dedup && n_tok == 2) {
+                if (use_batch_dedup) {
+                    MYDS_LOG_I("MoE batch-2 path: DEDUP (2-token expert weight sharing) — active");
+                } else {
+                    MYDS_LOG_I("MoE batch-2 path: CONCURRENT (2-token fused parallel) — active");
+                }
                 logged_moe_dedup = true;
             }
 
