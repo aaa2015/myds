@@ -4497,13 +4497,13 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         }
     }
 
-    /* 4. Output Head & Logits for Token 0 and Token 1 (Batched LM Head) */
+    /* 4. Output Head & Logits for Token 0 (Lazy LM Head for Token 1) */
     CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_x_norm[0], ws->v_x[0], ws->v_residual[0], ws->v_ffn_split[0], m->output_norm, V41_DIM, m->norm_eps, true));
     CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_x_norm[1], ws->v_x[1], ws->v_residual[1], ws->v_ffn_split[1], m->output_norm, V41_DIM, m->norm_eps, true));
     myds_metal_barrier_buffer(ws->x_norm_b2);
 
-    CHECK(myds_v41_batch2_projection_probe(ws->v_logits, m->output, ws->v_x_norm, m->vocab_size, V41_DIM, m->output_type, MYDS_V41_BATCH2_LM_HEAD));
-    myds_metal_barrier_buffer(ws->logits_b2);
+    CHECK(project(ws->v_logits[0], m->output, ws->v_x_norm[0], m->vocab_size, V41_DIM, m->output_type, false));
+    myds_metal_barrier_buffer(ws->v_logits[0]);
 
     const double t_encode = timed ? lowkv_now_ms() : 0.0;
     CHECK(myds_metal_commit_batch());
@@ -4516,7 +4516,7 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
                    t_qkv + t_attn + t_out + t_shared + t_moe + t_mix + t_lmhead);
     }
 
-    /* 5. 权威裁决与状态回滚（Arbitration & Rollback with Precomputed Parallel Head） */
+    /* 5. 权威裁决与状态回滚（Arbitration & Rollback with Lazy Verification Head） */
     const float *logits0 = (const float *)myds_metal_buffer_data(ws->v_logits[0]);
     if (!check_logits_finite(logits0, m->vocab_size)) {
         goto fail;
@@ -4538,7 +4538,12 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
     snap->first_state_valid = true;
 
     if (auth0 == tokens[1] && (!m->tokenizer || auth0 != m->tokenizer->eos_id)) {
-        /* CASE A: 投机命中！Token 1 Logits 已在主批次并行计算完成，直接采样 */
+        /* CASE A: 投机命中！按需（Lazy）计算 Token 1 Logits */
+        CHECK(myds_metal_begin_batch());
+        CHECK(project(ws->v_logits[1], m->output, ws->v_x_norm[1], m->vocab_size, V41_DIM, m->output_type, false));
+        myds_metal_barrier_buffer(ws->v_logits[1]);
+        CHECK(myds_metal_commit_batch());
+
         const float *logits1 = (const float *)myds_metal_buffer_data(ws->v_logits[1]);
         if (!check_logits_finite(logits1, m->vocab_size)) {
             goto fail;
@@ -5012,7 +5017,8 @@ bool myds_v41_batch2_spec_requested(const myds_context_t *ctx) {
 }
 
 bool myds_v41_batch2_spec_enabled(const myds_context_t *ctx, uint32_t n_tokens) {
-    return n_tokens >= 2 && myds_v41_batch2_spec_requested(ctx);
+    return n_tokens >= 2 && myds_v41_batch2_spec_requested(ctx) &&
+           (!ctx->dspark || ctx->dspark->is_high_confidence || ctx->decode_pld_candidate);
 }
 
 int myds_v41_forward_batch_spec_ex(myds_context_t *ctx, const int32_t *tokens,
