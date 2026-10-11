@@ -373,6 +373,102 @@ DSV41_Q8_SHARED2_KERNEL(2)
 DSV41_Q8_SHARED2_KERNEL(4)
 #undef DSV41_Q8_SHARED2_KERNEL
 
+/* Batch2 Dense (F16 / F32) shared-weights matvec.
+ * Reads weight rows once and computes dot products against two independent
+ * input vectors simultaneously, with identical reduction and store trees. */
+template<typename T0, typename T04, short NR0>
+void kernel_dsv41_dense_shared2_impl(
+        constant ds4_metal_args_mul_mv &args,
+        device const char *src0,
+        device const float *input0, device const float *input1,
+        device float *output0, device float *output1,
+        threadgroup char *shmem,
+        uint3 tgpig, ushort tiisg, ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NB = 32;
+    constexpr short NF = 16;
+    constexpr short NF4 = NF / 4;
+
+    const int nb = args.ne00 / NB;
+    const int r0 = tgpig.x * NR0;
+
+    device const float4 *y4_0 = (device const float4 *)input0;
+    device const float4 *y4_1 = (device const float4 *)input1;
+
+    device const T04 *ax4[NR0];
+    device const T0  *ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (uint64_t)(r0 + row) * args.nb01;
+        const bool valid = (r0 + row < args.ne01);
+        ax4[row] = (device const T04 *)(src0 + (valid ? offset0 : 0));
+        ax[row]  = (device const T0  *)(src0 + (valid ? offset0 : 0));
+    }
+
+    float sumf[2][NR0];
+    FOR_UNROLL (short t = 0; t < 2; ++t)
+        FOR_UNROLL (short row = 0; row < NR0; ++row) sumf[t][row] = 0.f;
+
+    const short ix = tiisg / (NW / NF);
+    const short il = tiisg % (NW / NF);
+    const int ib0 = sgitg * NF + ix;
+
+    device const float4 *yb4_0 = y4_0 + (ib0 * NB + il * NF) / 4;
+    device const float4 *yb4_1 = y4_1 + (ib0 * NB + il * NF) / 4;
+
+    for (int ib = ib0; ib < nb; ib += NSG * NF) {
+        float4 yl4_0[NF4], yl4_1[NF4];
+        FOR_UNROLL (short i = 0; i < NF4; ++i) {
+            yl4_0[i] = yb4_0[i];
+            yl4_1[i] = yb4_1[i];
+        }
+
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            device const T04 *xb4 = ax4[row] + (ib * NB + il * NF) / 4;
+            float sumq0 = 0.f, sumq1 = 0.f;
+            FOR_UNROLL (short i = 0; i < NF4; ++i) {
+                float4 x = float4(xb4[i]);
+                sumq0 += dot(x, yl4_0[i]);
+                sumq1 += dot(x, yl4_1[i]);
+            }
+            sumf[0][row] += sumq0;
+            sumf[1][row] += sumq1;
+        }
+
+        yb4_0 += NSG * NF * NW / 4;
+        yb4_1 += NSG * NF * NW / 4;
+    }
+
+    for (int i = nb * NB + sgitg * NW + tiisg; i < args.ne00; i += NW * NSG) {
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            float w = (float)ax[row][i];
+            sumf[0][row] += w * input0[i];
+            sumf[1][row] += w * input1[i];
+        }
+    }
+
+    helper_mv_reduce_and_write<NR0, false>(output0, sumf[0], r0, args.ne01, tiisg, sgitg, shmem);
+    helper_mv_reduce_and_write<NR0, false>(output1, sumf[1], r0, args.ne01, tiisg, sgitg, shmem + NW * NR0 * sizeof(float));
+}
+
+#define DSV41_DENSE_SHARED2_KERNEL(DTYPE, DTYPE4, KTYPE, NR) \
+kernel void kernel_dsv41_##KTYPE##_shared2_r##NR( \
+        constant ds4_metal_args_mul_mv &args [[buffer(0)]], \
+        device const char *weight [[buffer(1)]], \
+        device const float *input0 [[buffer(2)]], device const float *input1 [[buffer(3)]], \
+        device float *output0 [[buffer(4)]], device float *output1 [[buffer(5)]], \
+        threadgroup char *shmem [[threadgroup(0)]], \
+        uint3 tgpig [[threadgroup_position_in_grid]], \
+        ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
+    kernel_dsv41_dense_shared2_impl<DTYPE, DTYPE4, NR>(args, weight, input0, input1, output0, output1, shmem, tgpig, tiisg, sgitg); \
+}
+DSV41_DENSE_SHARED2_KERNEL(half, half4, f16, 2)
+DSV41_DENSE_SHARED2_KERNEL(half, half4, f16, 4)
+DSV41_DENSE_SHARED2_KERNEL(float, float4, f32, 2)
+DSV41_DENSE_SHARED2_KERNEL(float, float4, f32, 4)
+#undef DSV41_DENSE_SHARED2_KERNEL
+
+
 
 
 // Q8_0 matvec whose output is this rank's TP partial in its slab slot: same

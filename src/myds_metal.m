@@ -585,6 +585,15 @@ int myds_metal_batch2_q4_shared_mode(void) {
     return -1;
 }
 
+int myds_metal_batch2_dense_shared_mode(void) {
+    const char *value = getenv("MYDS_BATCH2_DENSE_SHARED");
+    if (!value) value = getenv("MYDS_BATCH2_SHARED");
+    if (!value || strcmp(value, "1") == 0) return 1;
+    if (strcmp(value, "0") == 0) return 0;
+    fprintf(stderr, "myds_metal: MYDS_BATCH2_DENSE_SHARED / MYDS_BATCH2_SHARED must be exactly 0 or 1\n");
+    return -1;
+}
+
 void myds_metal_batch2_q8_shared_counters(
     myds_metal_batch2_q8_shared_counters_t *out, bool reset) {
 #define SHARED_COUNT(field) (reset ? atomic_exchange_explicit(&g_batch2_q8_shared_##field, 0, memory_order_relaxed) \
@@ -3679,6 +3688,105 @@ int myds_metal_v41_gemv_bf16_shared2(myds_metal_buffer_t *const out[2],
     uint32_t out_dim, uint32_t in_dim) {
     return myds_metal_v41_gemv_bf16_shared2_type(out, weight, input, out_dim, in_dim, GGML_TYPE_Q8_0);
 }
+
+static id<MTLComputePipelineState> batch2_dense_shared_pipeline(uint32_t nsg, uint32_t nr0, ggml_type type) {
+    if ((nsg != 4 && nsg != 8) || (nr0 != 2 && nr0 != 4) || !g_library) return nil;
+    NSString *key = [NSString stringWithFormat:@"batch2_dense_shared_%s_%u_%u",
+                     type == GGML_TYPE_F16 ? "f16" : "f32", nsg, nr0];
+    id<MTLComputePipelineState> pipeline = g_native_pipelines[key];
+    if (pipeline) return pipeline;
+    MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
+    short short_nsg = (short)nsg;
+    [values setConstantValue:&short_nsg type:MTLDataTypeShort atIndex:600];
+    NSString *name = [NSString stringWithFormat:@"kernel_dsv41_%s_shared2_r%u",
+                      type == GGML_TYPE_F16 ? "f16" : "f32", nr0];
+    NSError *error = nil;
+    id<MTLFunction> function = [g_library newFunctionWithName:name constantValues:values error:&error];
+    if (function) pipeline = [g_device newComputePipelineStateWithFunction:function error:&error];
+    if (!pipeline) {
+        fprintf(stderr, "myds_metal: Batch2 %s shared PSO %s NSG%u unavailable; refusing fallback (%s)\n",
+                type == GGML_TYPE_F16 ? "F16" : "F32",
+                name.UTF8String, nsg, error.localizedDescription.UTF8String ?: "no library/function");
+        return nil;
+    }
+    if (!g_native_pipelines) g_native_pipelines = [NSMutableDictionary new];
+    g_native_pipelines[key] = pipeline;
+    return pipeline;
+}
+
+int myds_metal_v41_gemv_shared2_dense(myds_metal_buffer_t *const out[2],
+    const myds_metal_buffer_t *weight, myds_metal_buffer_t *const input[2],
+    uint32_t out_dim, uint32_t in_dim, ggml_type type) {
+    atomic_fetch_add_explicit(&g_batch2_q8_shared_requests, 1, memory_order_relaxed);
+    if (type != GGML_TYPE_F16 && type != GGML_TYPE_F32)
+        return batch2_shared_failure("unsupported dense type", type);
+    if (!g_initialized || !out || !input || !weight || !out[0] || !out[1] || !input[0] || !input[1] ||
+        !out_dim || !in_dim || out_dim > INT32_MAX - 3u || in_dim > INT32_MAX ||
+        (in_dim % 32u != 0))
+        return batch2_shared_failure("invalid runtime or dimensions", type);
+
+    const uint64_t elem_bytes = (type == GGML_TYPE_F32) ? sizeof(float) : sizeof(uint16_t);
+    const uint64_t row_bytes = (uint64_t)in_dim * elem_bytes;
+    const uint64_t weight_bytes = row_bytes * out_dim;
+    const uint64_t input_bytes = (uint64_t)in_dim * sizeof(float);
+    const uint64_t output_bytes = (uint64_t)out_dim * sizeof(float);
+
+    if (!batch2_buffer_range(weight, weight_bytes) || weight->offset % elem_bytes)
+        return batch2_shared_failure("invalid weight range/alignment", type);
+    for (unsigned t = 0; t < 2; ++t)
+        if (!batch2_buffer_range(input[t], input_bytes) || input[t]->offset % 4u ||
+            !batch2_buffer_range(out[t], output_bytes) || out[t]->offset % 16u)
+            return batch2_shared_failure("invalid input/output range/alignment", type);
+    if (batch2_buffer_overlap(out[0], output_bytes, out[1], output_bytes))
+        return batch2_shared_failure("overlapping output rows", type);
+    for (unsigned t = 0; t < 2; ++t) {
+        if (batch2_buffer_overlap(out[t], output_bytes, weight, weight_bytes))
+            return batch2_shared_failure("output overlaps weights", type);
+        for (unsigned s = 0; s < 2; ++s)
+            if (batch2_buffer_overlap(out[t], output_bytes, input[s], input_bytes))
+                return batch2_shared_failure("output overlaps input", type);
+    }
+    const uint32_t nsg = (in_dim >= 4096u) ? 8u : 4u;
+    const uint32_t nr0 = (qkv_nr0() == 4 && (out_dim % 4u == 0)) ? 4u : 2u;
+    const NSUInteger shmem_bytes = 32u * nr0 * 2u * sizeof(float);
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = batch2_dense_shared_pipeline(nsg, nr0, type);
+        if (!pipeline) return batch2_shared_failure("candidate dense PSO unavailable", type);
+        if (32u * nsg > pipeline.maxTotalThreadsPerThreadgroup ||
+            shmem_bytes > g_device.maxThreadgroupMemoryLength ||
+            pipeline.staticThreadgroupMemoryLength > g_device.maxThreadgroupMemoryLength - shmem_bytes)
+            return batch2_shared_failure("candidate geometry exceeds PSO/device limits", type);
+
+        if (g_batch_cb && !g_auto_barrier) {
+            const myds_metal_buffer_t *deps[] = {input[0], input[1], out[0], out[1]};
+            myds_metal_barrier_buffers(deps, 4);
+        }
+        struct ds4_metal_args_mul_mv a = {0};
+        a.ne00 = (int32_t)in_dim; a.ne01 = (int32_t)out_dim; a.ne02 = 1;
+        a.nb00 = elem_bytes; a.nb01 = row_bytes; a.nb02 = weight_bytes; a.nb03 = weight_bytes;
+        a.ne10 = (int32_t)in_dim; a.ne11 = 1; a.ne12 = 1;
+        a.nb10 = sizeof(float); a.nb11 = input_bytes; a.nb12 = input_bytes; a.nb13 = input_bytes;
+        a.ne0 = (int32_t)out_dim; a.ne1 = 1; a.nr0 = (int16_t)nr0; a.r2 = 1; a.r3 = 1;
+
+        id<MTLCommandBuffer> cb = g_batch_cb ?: [g_queue commandBuffer];
+        if (!cb) return batch2_shared_failure("command buffer unavailable", type);
+        id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
+        if (!enc) return batch2_shared_failure("encoder unavailable", type);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&a length:sizeof(a) atIndex:0];
+        const myds_metal_buffer_t *buffers[] = {weight, input[0], input[1], out[0], out[1]};
+        for (unsigned i = 0; i < 5; ++i) [enc setBuffer:buffers[i]->mtl_buf offset:buffers[i]->offset atIndex:i + 1u];
+        [enc setThreadgroupMemoryLength:shmem_bytes atIndex:0];
+        const char *name = (type == GGML_TYPE_F16) ?
+            (nr0 == 4u ? "kernel_dsv41_f16_shared2_r4" : "kernel_dsv41_f16_shared2_r2") :
+            (nr0 == 4u ? "kernel_dsv41_f32_shared2_r4" : "kernel_dsv41_f32_shared2_r2");
+        metal_dispatch(enc, name, MTLSizeMake(((NSUInteger)out_dim + nr0 - 1u) / nr0, 1, 1), MTLSizeMake(32, nsg, 1));
+        atomic_fetch_add_explicit(&g_batch2_q8_shared_encoded, 1, memory_order_relaxed);
+        if (!v41_finish(cb, enc)) return batch2_shared_failure("command completion failed", type);
+        return 1;
+    }
+}
+
 
 int myds_metal_v41_gemv_bf16(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *weight,const myds_metal_buffer_t *input,

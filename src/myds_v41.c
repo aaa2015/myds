@@ -3713,6 +3713,18 @@ int myds_v41_batch2_projection_probe(myds_metal_buffer_t *out[2],
             const int shared = myds_metal_batch2_q4_shared_mode();
             if (shared < 0) return 0;
             if (shared) shared_eligible = 1;
+        } else if ((type == GGML_TYPE_F16 || type == GGML_TYPE_F32) &&
+                   kind == MYDS_V41_BATCH2_ROUTER) {
+            const int shared = myds_metal_batch2_dense_shared_mode();
+            if (shared < 0) return 0;
+            if (shared) {
+                const myds_metal_buffer_t *deps[] = {input[0], input[1]};
+                myds_metal_barrier_buffers(deps, 2);
+                if (!myds_metal_v41_gemv_shared2_dense(out, weight, input, rows, width, type)) return 0;
+                const myds_metal_buffer_t *results[] = {out[0], out[1]};
+                myds_metal_barrier_buffers(results, 2);
+                return 1;
+            }
         }
     }
     if (shared_eligible) {
@@ -3723,8 +3735,9 @@ int myds_v41_batch2_projection_probe(myds_metal_buffer_t *out[2],
         myds_metal_barrier_buffers(results, 2);
         return 1;
     }
+    const myds_metal_buffer_t *in_deps[] = {input[0], input[1]};
+    myds_metal_barrier_buffers(in_deps, 2);
     for (uint32_t t = 0; t < 2; ++t) {
-        myds_metal_barrier_buffer(input[t]);
         int ok = 0;
         switch (kind) {
             case MYDS_V41_BATCH2_QKV:
@@ -3738,8 +3751,9 @@ int myds_v41_batch2_projection_probe(myds_metal_buffer_t *out[2],
             default: return 0;
         }
         if (!ok) return 0;
-        myds_metal_barrier_buffer(out[t]);
     }
+    const myds_metal_buffer_t *results[] = {out[0], out[1]};
+    myds_metal_barrier_buffers(results, 2);
     return 1;
 }
 
@@ -4313,17 +4327,21 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_v41_batch2_projection_probe(ws->v_qr, base->attn_q_a, ws->v_x_norm, 1280, V41_DIM, base->attn_q_a_type, MYDS_V41_BATCH2_QKV));
         CHECK(myds_v41_batch2_projection_probe(ws->v_kv_act, base->attn_kv, ws->v_x_norm, 512, V41_DIM, base->attn_kv_type, MYDS_V41_BATCH2_QKV));
         myds_metal_barrier_buffer(ws->qr_b2);
-        myds_metal_barrier_buffer(ws->kv_act_b2);
 
-        /* RMSNorm QR & KV */
+        /* RMSNorm QR */
         CHECK(myds_metal_v41_rmsnorm(ws->v_qr_norm[0], ws->v_qr[0], base->attn_q_a_norm, 1280, m->norm_eps, true));
         CHECK(myds_metal_v41_rmsnorm(ws->v_qr_norm[1], ws->v_qr[1], base->attn_q_a_norm, 1280, m->norm_eps, true));
+        myds_metal_barrier_buffer(ws->qr_norm_b2);
+
+        /* Immediately dispatch attn_q_b (large GEMV: 32768 x 1280) */
+        CHECK(myds_v41_batch2_projection_probe(ws->v_q, base->attn_q_b, ws->v_qr_norm, V41_HEADS * 512, 1280, base->attn_q_b_type, MYDS_V41_BATCH2_QKV));
+
+        /* Concurrently RMSNorm KV_act while attn_q_b is running on GPU */
+        myds_metal_barrier_buffer(ws->kv_act_b2);
         CHECK(myds_metal_v41_rmsnorm(ws->v_kv_act[0], ws->v_kv_act[0], base->attn_kv_a_norm, 512, m->norm_eps, true));
         CHECK(myds_metal_v41_rmsnorm(ws->v_kv_act[1], ws->v_kv_act[1], base->attn_kv_a_norm, 512, m->norm_eps, true));
-        myds_metal_barrier_buffer(ws->qr_norm_b2);
         myds_metal_barrier_buffer(ws->kv_act_b2);
 
-        CHECK(myds_v41_batch2_projection_probe(ws->v_q, base->attn_q_b, ws->v_qr_norm, V41_HEADS * 512, 1280, base->attn_q_b_type, MYDS_V41_BATCH2_QKV));
         myds_metal_barrier_buffer(ws->q_b2);
         if (trace_gpu) {
             CHECK(myds_metal_commit_batch());
@@ -4382,7 +4400,11 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_v41_hc_mix(ws->v_ffn_split[0], ws->v_after_attn[0], l->ffn_fn, GGML_TYPE_F16, l->ffn_scale, l->ffn_base, ws->v_flat_norm[0], ws->v_mix[0], V41_DIM, m->norm_eps, v->hc_eps));
         CHECK(myds_metal_v41_hc_mix(ws->v_ffn_split[1], ws->v_after_attn[1], l->ffn_fn, GGML_TYPE_F16, l->ffn_scale, l->ffn_base, ws->v_flat_norm[1], ws->v_mix[1], V41_DIM, m->norm_eps, v->hc_eps));
 
-        /* 2. 并发派发 Shared Expert Gate+Up */
+        /* 2. 优先并发派发 Router Gate GEMV，使路由计算尽早完成以尽早启动 Routed MoE */
+        CHECK(myds_v41_batch2_projection_probe(ws->v_router_logits, base->router_gate,
+            ws->v_ffn_norm, 384, V41_DIM, base->router_gate_type, MYDS_V41_BATCH2_ROUTER));
+
+        /* 3. 并发派发 Shared Expert Gate+Up */
         const char *shared_fuse = getenv("MYDS_SHARED_FUSE");
         int shared_fused = !myds_trace_active() && (!shared_fuse || strcmp(shared_fuse, "0")) &&
             myds_v41_shared_gate_up_swiglu_batch2(
@@ -4406,10 +4428,6 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
                 }
             }
         }
-
-        /* 3. 并发派发 Router Gate GEMV */
-        CHECK(myds_v41_batch2_projection_probe(ws->v_router_logits, base->router_gate,
-            ws->v_ffn_norm, 384, V41_DIM, base->router_gate_type, MYDS_V41_BATCH2_ROUTER));
 
         /* 4. 仅同步 router_logits，执行路由打分与 Top-K 选择 */
         myds_metal_barrier_buffer(ws->router_logits_b2);

@@ -227,11 +227,19 @@ static int test_authoritative_projection(uint32_t rows, uint32_t width,
     printf("[TEST] Production decode projection boundary kind=%u rows=%u width=%u type=%u...\n",
            kind, rows, width, type);
     const size_t w_bytes = type == GGML_TYPE_Q8_0 ? (size_t)rows * width / 32u * 34u
-                                                 : (size_t)rows * width * sizeof(float);
+                         : (type == GGML_TYPE_F16 ? (size_t)rows * width * sizeof(uint16_t)
+                                                  : (size_t)rows * width * sizeof(float));
     myds_metal_buffer_t *weight = myds_metal_buffer_alloc(w_bytes);
     myds_metal_buffer_t *input[2], *reference[2], *candidate[2], *raw[2];
     CHECK(weight);
-    if (type == GGML_TYPE_Q8_0) fill_q8_weights(weight); else fill_act(weight, 17);
+    if (type == GGML_TYPE_Q8_0) {
+        fill_q8_weights(weight);
+    } else if (type == GGML_TYPE_F16) {
+        uint16_t *p = (uint16_t *)myds_metal_buffer_data(weight);
+        for (size_t i = 0; i < (size_t)rows * width; i++) p[i] = (uint16_t)(0x3000u + (i % 17));
+    } else {
+        fill_act(weight, 17);
+    }
     for (uint32_t t = 0; t < 2; ++t) {
         input[t] = myds_metal_buffer_alloc(width * sizeof(float));
         reference[t] = myds_metal_buffer_alloc(rows * sizeof(float));
@@ -560,6 +568,7 @@ int main(void) {
     if (!test_authoritative_projection(1280, 5120, GGML_TYPE_Q8_0, MYDS_V41_BATCH2_QKV)) return 1;
     if (!test_authoritative_projection(5120, 8192, GGML_TYPE_Q8_0, MYDS_V41_BATCH2_TAIL)) return 1;
     if (!test_authoritative_projection(5120, 2304, GGML_TYPE_Q8_0, MYDS_V41_BATCH2_SHARED)) return 1;
+    if (!test_authoritative_projection(384, 5120, GGML_TYPE_F16, MYDS_V41_BATCH2_ROUTER)) return 1;
     if (!test_authoritative_projection(384, 5120, GGML_TYPE_F32, MYDS_V41_BATCH2_ROUTER)) return 1;
 
     // 9. Batch-2 Attention Output A
