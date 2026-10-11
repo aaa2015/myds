@@ -3551,6 +3551,19 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                        ctx->dspark->proposed_tokens > 0 ? (100.0 * (double)ctx->dspark->accepted_tokens / (double)ctx->dspark->proposed_tokens) : 0.0,
                        req_prop_ms, req_cyc > 0 ? req_prop_ms / (double)req_cyc : 0.0,
                        req_ver_ms, req_cyc > 0 ? req_ver_ms / (double)req_cyc : 0.0);
+            if (ctx->decode_stats.batch2_calls > 0) {
+                MYDS_LOG_I("[%s:%d] Batch2 Stats: calls=%llu (hits=%llu, misses=%llu, fallbacks=%llu) | avg_verify=%.2fms, avg_gpu=%.2fms, prep=%.2fms, encode=%.2fms, arb=%.2fms",
+                           client_ip, client_port,
+                           (unsigned long long)ctx->decode_stats.batch2_calls,
+                           (unsigned long long)ctx->decode_stats.batch2_hits,
+                           (unsigned long long)ctx->decode_stats.batch2_misses,
+                           (unsigned long long)ctx->decode_stats.batch2_fallbacks,
+                           ctx->decode_stats.verify_ms / (double)ctx->decode_stats.batch2_calls,
+                           ctx->decode_stats.batch2_gpu_ms / (double)ctx->decode_stats.batch2_calls,
+                           ctx->decode_stats.batch2_prep_ms / (double)ctx->decode_stats.batch2_calls,
+                           ctx->decode_stats.batch2_encode_ms / (double)ctx->decode_stats.batch2_calls,
+                           ctx->decode_stats.batch2_arb_ms / (double)ctx->decode_stats.batch2_calls);
+            }
         }
 
 cleanup_infer:
