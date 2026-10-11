@@ -5,6 +5,8 @@
 #include "myds_metal.h"
 #include "myds_v41_moe.h"
 #include "myds_v41_decode.h"
+#include <ctype.h>
+#include <errno.h>
 #include <inttypes.h>
 #include <math.h>
 #include <stdio.h>
@@ -54,7 +56,8 @@ static void weights(struct guarded a,ggml_type type,unsigned seed,bool up,bool t
     const unsigned block=type==GGML_TYPE_Q4_K?256u:32u,bytes=type==GGML_TYPE_Q4_K?144u:34u;
     for(unsigned row=0;row<ROWS;++row)for(unsigned b=0;b<WIDTH/block;++b) {
         uint8_t *q=p+((size_t)row*(WIDTH/block)+b)*bytes;
-        uint16_t d=tie?0x3c00u:(uint16_t)(0x0c00u+(random_word(row*93u+b*53u+seed+(up?111u:0u))%10u)*0x400u);
+        const uint32_t scale_bits=random_word(row*93u+b*53u+seed+(up?111u:0u));
+        uint16_t d=tie?0x3c00u:(uint16_t)(0x0c00u+(scale_bits%10u)*0x400u+(seed>=7u?(scale_bits>>9)&0x3ffu:0u));
         memcpy(q,&d,2);
         if(tie) {
             if(!b) {
@@ -62,7 +65,8 @@ static void weights(struct guarded a,ggml_type type,unsigned seed,bool up,bool t
                 if(type==GGML_TYPE_Q4_K){q[4]=1;q[16+k]=1;}else q[2+k]=1;
             }
         } else if(type==GGML_TYPE_Q4_K) {
-            uint16_t dm=(uint16_t)(0x0400u+(row+b)%7u*0x300u);memcpy(q+2,&dm,2);
+            uint16_t dm=seed>=7u?(uint16_t)(0x0800u+(scale_bits%9u)*0x400u+(random_word(scale_bits+113u)&0x3ffu)):
+                (uint16_t)(0x0400u+(row+b)%7u*0x300u);memcpy(q+2,&dm,2);
             for(unsigned i=4;i<bytes;++i)q[i]=(uint8_t)random_word(seed+row*97u+b*31u+i*17u+(up?919u:0u));
         } else for(unsigned i=0;i<32u;++i)q[2+i]=(uint8_t)(int8_t)((int)(random_word(seed+row*97u+b*31u+i*17u+(up?919u:0u))%31u)-15);
     }
@@ -84,7 +88,12 @@ static void run(ggml_type type,int concurrent,int barrier,unsigned seed,bool tie
         in[t]=myds_metal_buffer_sub_view(x.view,t*WIDTH*4u,WIDTH*4u);
         dest[t]=myds_metal_buffer_sub_view(out.view,t*ROWS*4u,ROWS*4u);REQUIRE(in[t]&&dest[t]);
         float *p=myds_metal_buffer_data(in[t]);
-        for(unsigned i=0;i<WIDTH;++i)p[i]=tie?ties[(i+t*7u)%16u]:((int)(random_word(i*57u+seed*193u+t*619u)%4095u)-2047)*scales[seed%6u]/1024.0f;
+        for(unsigned i=0;i<WIDTH;++i) {
+            if(seed>=7u) {
+                uint32_t bits=(random_word(i*57u+seed*193u+t*619u)&0x807fffffu)|((118u+seed%12u)<<23);
+                memcpy(p+i,&bits,4);if(seed&1u)p[i]=bf16(p[i]);
+            } else p[i]=tie?ties[(i+t*7u)%16u]:((int)(random_word(i*57u+seed*193u+t*619u)%4095u)-2047)*scales[seed%6u]/1024.0f;
+        }
     }
     const uint64_t gh=hash(myds_metal_buffer_data(g.view),g.bytes),uh=hash(myds_metal_buffer_data(u.view),u.bytes),xh=hash(myds_metal_buffer_data(x.view),x.bytes);
     myds_metal_set_concurrent(concurrent);myds_metal_set_auto_barrier(barrier);fail_dispatch=0;
@@ -135,14 +144,111 @@ static void run(ggml_type type,int concurrent,int barrier,unsigned seed,bool tie
         myds_metal_buffer_free(short_row);
     }
     REQUIRE(gh==hash(myds_metal_buffer_data(g.view),g.bytes)&&uh==hash(myds_metal_buffer_data(u.view),u.bytes)&&xh==hash(myds_metal_buffer_data(x.view),x.bytes));
-    printf("{\"kind\":\"candidate_gu_shared3\",\"case\":%u,\"type\":%d,\"concurrent\":%d,\"auto_barrier\":%d,\"seed\":%u,\"bf16_ties\":%s,\"clamp\":%.1f,\"repeats\":3,\"native_shared3_psos\":1,\"shared2_psos\":0,\"bit_exact\":true,\"unchanged_inputs\":true,\"canaries\":true,\"scalar_oracle_separate_cbs\":true,\"fixture_not_fullmodel\":true}\n",id,type,concurrent,barrier,seed,tie?"true":"false",limit);
+    printf("{\"kind\":\"candidate_gu_shared3\",\"case\":%u,\"type\":%d,\"concurrent\":%d,\"auto_barrier\":%d,\"seed\":%u,\"bf16_ties\":%s,\"general_scale_input_stress\":%s,\"clamp\":%.1f,\"repeats\":3,\"native_shared3_psos\":1,\"shared2_psos\":0,\"bit_exact\":true,\"unchanged_inputs\":true,\"canaries\":true,\"scalar_oracle_separate_cbs\":true,\"fixture_not_fullmodel\":true}\n",id,type,concurrent,barrier,seed,tie?"true":"false",seed>=7u?"true":"false",limit);
     for(unsigned t=0;t<3u;++t){myds_metal_buffer_free(in[t]);myds_metal_buffer_free(dest[t]);release(ref[t]);}release(g);release(u);release(x);release(out);
 }
+static void replay_read(const char *directory,const char *name,void *data,size_t bytes) {
+    char path[4096];int length=snprintf(path,sizeof(path),"%s/%s",directory,name);
+    REQUIRE(length>0&&(size_t)length<sizeof(path));
+    FILE *f=fopen(path,"rb");REQUIRE(f);REQUIRE(fread(data,1,bytes,f)==bytes);
+    REQUIRE(fgetc(f)==EOF&&!ferror(f));REQUIRE(!fclose(f));
+}
+static unsigned replay_uint(const char *metadata,const char *name) {
+    char key[80];REQUIRE(snprintf(key,sizeof(key),"\"%s\":",name)>0);
+    const char *p=strstr(metadata,key);REQUIRE(p);p+=strlen(key);while(isspace((unsigned char)*p))++p;
+    REQUIRE(isdigit((unsigned char)*p)&&!(*p=='0'&&isdigit((unsigned char)p[1])));
+    errno=0;char *end;unsigned long value=strtoul(p,&end,10);
+    REQUIRE(end>p&&errno!=ERANGE&&value<=UINT32_MAX);while(isspace((unsigned char)*end))++end;
+    REQUIRE(*end==','||*end=='}');return (unsigned)value;
+}
+static float replay_float(const char *metadata,const char *name) {
+    char key[80];REQUIRE(snprintf(key,sizeof(key),"\"%s\":",name)>0);
+    const char *p=strstr(metadata,key);REQUIRE(p);p+=strlen(key);while(isspace((unsigned char)*p))++p;
+    REQUIRE(isdigit((unsigned char)*p)||(*p=='-'&&isdigit((unsigned char)p[1])));
+    errno=0;char *end;float value=strtof(p,&end);
+    REQUIRE(end>p&&errno!=ERANGE&&isfinite(value)&&value>=0);while(isspace((unsigned char)*end))++end;
+    REQUIRE(*end==','||*end=='}');return value;
+}
+/* Replay frozen real-model operands against the unchanged scalar PSO. Archive
+ * candidate outputs are observations: a corrected candidate must equal the
+ * scalar GPU output, not the archived failing candidate. */
+static int replay(const char *directory) {
+    char metadata[2048]={0},path[4096];REQUIRE(snprintf(path,sizeof(path),"%s/metadata.json",directory)>0);
+    FILE *mf=fopen(path,"rb");REQUIRE(mf);size_t mn=fread(metadata,1,sizeof(metadata)-1,mf);
+    REQUIRE(mn&&fgetc(mf)==EOF&&!ferror(mf));REQUIRE(!fclose(mf));
+    REQUIRE(replay_uint(metadata,"rows")==ROWS&&replay_uint(metadata,"width")==WIDTH);
+    const ggml_type type=(ggml_type)replay_uint(metadata,"type");
+    REQUIRE((type==GGML_TYPE_Q4_K||type==GGML_TYPE_Q8_0)&&replay_uint(metadata,"up_type")==type);
+    const float limit=replay_float(metadata,"clamp");
+    (void)replay_uint(metadata,"pos");(void)replay_uint(metadata,"layer");
+    const size_t wb=(size_t)ROWS*(WIDTH/(type==GGML_TYPE_Q4_K?256u:32u))*(type==GGML_TYPE_Q4_K?144u:34u);
+    struct guarded g=alloc(wb),u=alloc(wb),x[3],out[3],ref[3];
+    myds_metal_buffer_t *input[3],*dest[3];
+    float archived_scalar[3][ROWS],archived_candidate[3][ROWS];
+    replay_read(directory,"gate.bin",myds_metal_buffer_data(g.view),wb);
+    replay_read(directory,"up.bin",myds_metal_buffer_data(u.view),wb);
+    for(unsigned t=0;t<3u;++t) {
+        x[t]=alloc(WIDTH*4u);out[t]=alloc(ROWS*4u);ref[t]=alloc(ROWS*4u);
+        input[t]=x[t].view;dest[t]=out[t].view;char name[64];
+        snprintf(name,sizeof(name),"input-%u.f32",t);replay_read(directory,name,myds_metal_buffer_data(input[t]),WIDTH*4u);
+        snprintf(name,sizeof(name),"scalar-%u.f32",t);replay_read(directory,name,archived_scalar[t],ROWS*4u);
+        snprintf(name,sizeof(name),"candidate-%u.f32",t);replay_read(directory,name,archived_candidate[t],ROWS*4u);
+        for(unsigned i=0;i<WIDTH;++i)REQUIRE(isfinite(((float *)myds_metal_buffer_data(input[t]))[i]));
+        for(unsigned i=0;i<ROWS;++i)REQUIRE(isfinite(archived_scalar[t][i])&&isfinite(archived_candidate[t][i]));
+    }
+    const uint64_t gh=hash(myds_metal_buffer_data(g.view),g.bytes),uh=hash(myds_metal_buffer_data(u.view),u.bytes);
+    uint64_t xh[3];for(unsigned t=0;t<3u;++t)xh[t]=hash(myds_metal_buffer_data(input[t]),WIDTH*4u);
+    unsigned failed=0;fail_dispatch=0;
+    for(int c=0;c<2;++c)for(int b=0;b<2;++b) {
+        myds_metal_set_concurrent(c);myds_metal_set_auto_barrier(b);
+        for(unsigned t=0;t<3u;++t){REQUIRE(myds_metal_begin_batch());REQUIRE(myds_v41_shared_gate_up_swiglu(ref[t].view,g.view,u.view,input[t],ROWS,WIDTH,type,type,limit));REQUIRE(myds_metal_commit_batch());}
+        for(unsigned repeat=0;repeat<3u;++repeat) {
+            native_calls=0;const uint64_t before=myds_metal_dispatch_count();
+            myds_v41_shared_gu_shared3_counters_t c0,c1;myds_v41_shared_gu_shared3_counters(&c0,false);
+            REQUIRE(myds_metal_begin_batch());
+            REQUIRE(myds_v41_shared_gate_up_swiglu_shared3(dest,g.view,u.view,input,ROWS,WIDTH,type,type,limit));
+            REQUIRE(native_calls==1u&&myds_metal_dispatch_count()-before==1u);REQUIRE(myds_metal_commit_batch());
+            myds_v41_shared_gu_shared3_counters(&c1,false);
+            REQUIRE(c1.requests-c0.requests==1u&&c1.encoded-c0.encoded==1u&&c1.failures==c0.failures);
+            unsigned mismatches=0,archive_scalar_diff=0,archive_candidate_diff=0;
+            for(unsigned t=0;t<3u;++t) {
+                const float *a=myds_metal_buffer_data(ref[t].view),*z=myds_metal_buffer_data(dest[t]);
+                for(unsigned i=0;i<ROWS;++i) {
+                    REQUIRE(isfinite(a[i])&&isfinite(z[i]));
+                    uint32_t final_bits;memcpy(&final_bits,z+i,4);REQUIRE(!(final_bits&0xffffu));
+                    archive_scalar_diff+=memcmp(a+i,archived_scalar[t]+i,4)!=0;
+                    archive_candidate_diff+=memcmp(z+i,archived_candidate[t]+i,4)!=0;
+                    if(memcmp(a+i,z+i,4)) {
+                        uint32_t ab,zb;memcpy(&ab,a+i,4);memcpy(&zb,z+i,4);
+                        if(!mismatches)fprintf(stderr,"replay first GU difference input=%u channel=%u scalar=%08x candidate=%08x\n",t,i,ab,zb);
+                        ++mismatches;
+                    }
+                }
+            }
+            REQUIRE(archive_scalar_diff==0u);failed+=mismatches!=0;
+            printf("{\"kind\":\"real_gu_replay\",\"pos\":%u,\"layer\":%u,\"type\":%d,\"concurrent\":%d,\"auto_barrier\":%d,\"repeat\":%u,\"native_shared3_psos\":1,\"scalar_archive_different_elements\":%u,\"candidate_archive_different_elements\":%u,\"scalar_candidate_different_elements\":%u,\"bit_exact\":%s,\"performance_measurement\":false}\n",
+                replay_uint(metadata,"pos"),replay_uint(metadata,"layer"),type,c,b,repeat,archive_scalar_diff,archive_candidate_diff,mismatches,mismatches?"false":"true");
+        }
+    }
+    REQUIRE(gh==hash(myds_metal_buffer_data(g.view),g.bytes)&&uh==hash(myds_metal_buffer_data(u.view),u.bytes));
+    for(unsigned t=0;t<3u;++t){REQUIRE(xh[t]==hash(myds_metal_buffer_data(input[t]),WIDTH*4u));release(x[t]);release(out[t]);release(ref[t]);}release(g);release(u);
+    const uint64_t dispatch_before_reset=myds_metal_dispatch_count();
+    myds_v41_shared_gu_shared3_counters_t old,zero;myds_v41_shared_gu_shared3_counters(&old,true);myds_v41_shared_gu_shared3_counters(&zero,false);
+    REQUIRE(old.requests==12u&&old.encoded==12u&&!old.failures&&!zero.requests&&!zero.encoded&&!zero.failures);
+    REQUIRE(myds_metal_dispatch_count()==dispatch_before_reset);
+    printf("[%s] real GU replay, 12 executions against unchanged scalar GPU PSO; no full-model or performance claim.\n",failed?"FAIL":"PASS");return failed?1:0;
+}
 int main(int argc, char **argv) {
-    unsetenv("MYDS_METAL_CONCURRENT");REQUIRE(myds_metal_init(argc > 1 ? argv[1] : "bin"));unsigned id=0;
+    const char *shaders="bin",*replay_dir=NULL;
+    for(int i=1;i<argc;++i) {
+        if(!strcmp(argv[i],"--replay")){REQUIRE(i+1<argc&&!replay_dir);replay_dir=argv[++i];}
+        else {REQUIRE(!strcmp(shaders,"bin"));shaders=argv[i];}
+    }
+    unsetenv("MYDS_METAL_CONCURRENT");REQUIRE(myds_metal_init(shaders));unsigned id=0;
     myds_v41_shared_gu_shared3_counters(NULL,true);
+    if(replay_dir){int result=replay(replay_dir);myds_metal_cleanup();return result;}
     for(unsigned type=0;type<2u;++type)for(int c=0;c<2;++c)for(int b=0;b<2;++b)
-        for(unsigned seed=0;seed<7u;++seed)for(unsigned clamp=0;clamp<2u;++clamp)
+        for(unsigned seed=0;seed<15u;++seed)for(unsigned clamp=0;clamp<2u;++clamp)
             run(type?GGML_TYPE_Q8_0:GGML_TYPE_Q4_K,c,b,seed,seed==6u,clamp?10.0f:0.0f,id++);
     printf("[PASS] %u GU shared3 component cases, real scalar GPU oracle, Q4/Q8, BF16 halfway and native dispatch failure; not full-model evidence.\n",id);
     myds_metal_cleanup();return 0;

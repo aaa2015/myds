@@ -784,6 +784,32 @@ kernel void kernel_myds_v41_shared_gate_up_swiglu_q4_shared2(
  * loaded outside the token loop, so the same values serve all three inputs.
  * Neither this source order nor a component PASS substitutes for the required
  * real-model checkpoint/partial2 byte-parity gate. */
+/* Give each token one scalar-shaped block-dot compilation scope. Weight
+ * words and scales remain thread-local values loaded once outside the token
+ * loop. The explicit noinline boundary preserves the local operation shape;
+ * no global fast-math or scalar PSO contract changes. */
+__attribute__((noinline))
+float myds_v41_gu_shared_q4_scalar_block(float previous, thread const float *yl, thread const float *yh,
+    float4 sumy, thread const ushort *q1, thread const ushort *q2,
+    thread const uchar *sc8, half d, half dm) {
+    float4 acc1={0.f,0.f,0.f,0.f},acc2={0.f,0.f,0.f,0.f};
+    FOR_UNROLL(short i=0;i<4;++i) {
+        acc1[0] += yl[2*i] * (q1[i]&0x000F);
+        acc1[1] += yl[2*i+1] * (q1[i]&0x0F00);
+        acc1[2] += yl[2*i+8] * (q1[i]&0x00F0);
+        acc1[3] += yl[2*i+9] * (q1[i]&0xF000);
+        acc2[0] += yh[2*i] * (q2[i]&0x000F);
+        acc2[1] += yh[2*i+1] * (q2[i]&0x0F00);
+        acc2[2] += yh[2*i+8] * (q2[i]&0x00F0);
+        acc2[3] += yh[2*i+9] * (q2[i]&0xF000);
+    }
+    previous += d*((acc1[0]+1.f/256.f*acc1[1])*sc8[0] +
+                   (acc1[2]+1.f/256.f*acc1[3])*sc8[1]*1.f/16.f +
+                   (acc2[0]+1.f/256.f*acc2[1])*sc8[4] +
+                   (acc2[2]+1.f/256.f*acc2[3])*sc8[5]*1.f/16.f) -
+                dm*(sumy[0]*sc8[2]+sumy[1]*sc8[3]+sumy[2]*sc8[6]+sumy[3]*sc8[7]);
+    return previous;
+}
 kernel void kernel_myds_v41_shared_gate_up_swiglu_q4_shared3(
     constant myds_v41_shared_swiglu_args &args [[buffer(0)]],
     device const char *src_gate [[buffer(1)]],
@@ -819,17 +845,7 @@ kernel void kernel_myds_v41_shared_gate_up_swiglu_q4_shared3(
         ax_up[row] = (device const block_q4_K *)(src_up + (active ? offset : 0));
     }
     float sumf_gate[3][NR0] = {{0.f}}, sumf_up[3][NR0] = {{0.f}};
-    float yl[3][16], yh[3][16];
     for (int ib = ix; ib < nb; ib += 4) {
-        float4 sumy[3] = {float4(0.f), float4(0.f), float4(0.f)};
-        for (short t = 0; t < 3; ++t) {
-            FOR_UNROLL (short i = 0; i < 8; ++i) {
-                yl[t][i + 0] = y4[t][i +   0]; sumy[t][0] += yl[t][i + 0];
-                yl[t][i + 8] = y4[t][i +  32]; sumy[t][1] += yl[t][i + 8];
-                yh[t][i + 0] = y4[t][i + 128]; sumy[t][2] += yh[t][i + 0];
-                yh[t][i + 8] = y4[t][i + 160]; sumy[t][3] += yh[t][i + 8];
-            }
-        }
         FOR_UNROLL (short row = 0; row < NR0; ++row) {
             if (first_row + row >= (int)args.out_dim) break;
             device const uint16_t *sc_g = (device const uint16_t *)ax_gate[row][ib].scales + iq;
@@ -856,36 +872,15 @@ kernel void kernel_myds_v41_shared_gate_up_swiglu_q4_shared3(
                 qu1[i] = q1_u[i]; qu2[i] = q2_u[i];
             }
             for (short t = 0; t < 3; ++t) {
-                float4 acc1g = {0.f, 0.f, 0.f, 0.f}, acc2g = {0.f, 0.f, 0.f, 0.f};
-                float4 acc1u = {0.f, 0.f, 0.f, 0.f}, acc2u = {0.f, 0.f, 0.f, 0.f};
-                FOR_UNROLL (short i = 0; i < 4; ++i) {
-                    acc1g[0] += yl[t][2 * i + 0] * (qg1[i] & 0x000F);
-                    acc1g[1] += yl[t][2 * i + 1] * (qg1[i] & 0x0F00);
-                    acc1g[2] += yl[t][2 * i + 8] * (qg1[i] & 0x00F0);
-                    acc1g[3] += yl[t][2 * i + 9] * (qg1[i] & 0xF000);
-                    acc2g[0] += yh[t][2 * i + 0] * (qg2[i] & 0x000F);
-                    acc2g[1] += yh[t][2 * i + 1] * (qg2[i] & 0x0F00);
-                    acc2g[2] += yh[t][2 * i + 8] * (qg2[i] & 0x00F0);
-                    acc2g[3] += yh[t][2 * i + 9] * (qg2[i] & 0xF000);
-                    acc1u[0] += yl[t][2 * i + 0] * (qu1[i] & 0x000F);
-                    acc1u[1] += yl[t][2 * i + 1] * (qu1[i] & 0x0F00);
-                    acc1u[2] += yl[t][2 * i + 8] * (qu1[i] & 0x00F0);
-                    acc1u[3] += yl[t][2 * i + 9] * (qu1[i] & 0xF000);
-                    acc2u[0] += yh[t][2 * i + 0] * (qu2[i] & 0x000F);
-                    acc2u[1] += yh[t][2 * i + 1] * (qu2[i] & 0x0F00);
-                    acc2u[2] += yh[t][2 * i + 8] * (qu2[i] & 0x00F0);
-                    acc2u[3] += yh[t][2 * i + 9] * (qu2[i] & 0xF000);
+                float yl[16], yh[16]; float4 sumy = {0.f,0.f,0.f,0.f};
+                FOR_UNROLL (short i = 0; i < 8; ++i) {
+                    yl[i] = y4[t][i]; sumy[0] += yl[i];
+                    yl[i+8] = y4[t][i+32]; sumy[1] += yl[i+8];
+                    yh[i] = y4[t][i+128]; sumy[2] += yh[i];
+                    yh[i+8] = y4[t][i+160]; sumy[3] += yh[i+8];
                 }
-                sumf_gate[t][row] += dg * ((acc1g[0] + 1.f / 256.f * acc1g[1]) * sc8g[0] +
-                                          (acc1g[2] + 1.f / 256.f * acc1g[3]) * sc8g[1] * 1.f / 16.f +
-                                          (acc2g[0] + 1.f / 256.f * acc2g[1]) * sc8g[4] +
-                                          (acc2g[2] + 1.f / 256.f * acc2g[3]) * sc8g[5] * 1.f / 16.f) -
-                                     dmg * (sumy[t][0] * sc8g[2] + sumy[t][1] * sc8g[3] + sumy[t][2] * sc8g[6] + sumy[t][3] * sc8g[7]);
-                sumf_up[t][row] += du * ((acc1u[0] + 1.f / 256.f * acc1u[1]) * sc8u[0] +
-                                        (acc1u[2] + 1.f / 256.f * acc1u[3]) * sc8u[1] * 1.f / 16.f +
-                                        (acc2u[0] + 1.f / 256.f * acc2u[1]) * sc8u[4] +
-                                        (acc2u[2] + 1.f / 256.f * acc2u[3]) * sc8u[5] * 1.f / 16.f) -
-                                   dmu * (sumy[t][0] * sc8u[2] + sumy[t][1] * sc8u[3] + sumy[t][2] * sc8u[6] + sumy[t][3] * sc8u[7]);
+                sumf_gate[t][row]=myds_v41_gu_shared_q4_scalar_block(sumf_gate[t][row],yl,yh,sumy,qg1,qg2,sc8g,dg,dmg);
+                sumf_up[t][row]=myds_v41_gu_shared_q4_scalar_block(sumf_up[t][row],yl,yh,sumy,qu1,qu2,sc8u,du,dmu);
             }
         }
         for (short t = 0; t < 3; ++t) y4[t] += 4 * 256;
