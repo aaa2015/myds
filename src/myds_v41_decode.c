@@ -44,7 +44,7 @@ int myds_v41_decode_gemv_bf16(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *weight, const myds_metal_buffer_t *input,
     uint32_t rows, uint32_t width, ggml_type type, bool trace_on) {
     pthread_once(&fuse_once, init_fuse);
-    if (fuse && !trace_on && type == GGML_TYPE_Q8_0 &&
+    if (fuse && !trace_on && (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_K) &&
         myds_metal_buffer_offset(out) % 16u == 0)
         return myds_metal_v41_gemv_bf16(out, weight, input, rows, width, type);
     if (!myds_metal_gemv(out, weight, input, rows, width, type)) return 0;

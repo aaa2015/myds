@@ -2730,7 +2730,7 @@ static int project_decode_qkv(myds_metal_buffer_t *out,const myds_metal_buffer_t
  * caller retains its original generic fallback through the common helper. */
 static int project_decode_tail(myds_metal_buffer_t *out,const myds_metal_buffer_t *w,
     const myds_metal_buffer_t *in,uint32_t rows,uint32_t width,ggml_type type,bool trace_on) {
-    if(type!=GGML_TYPE_Q8_0) return project(out,w,in,rows,width,type,true);
+    if(type!=GGML_TYPE_Q8_0 && type!=GGML_TYPE_Q4_K) return project(out,w,in,rows,width,type,true);
     return myds_v41_decode_gemv_bf16(out,w,in,rows,width,type,trace_on);
 }
 

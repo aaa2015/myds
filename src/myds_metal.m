@@ -41,6 +41,7 @@ static id<MTLComputePipelineState> g_pso_mul_mv_q8_0 = nil;
 static id<MTLComputePipelineState> g_pso_mul_mv_f32 = nil;
 static id<MTLComputePipelineState> g_pso_mul_mv_f16 = nil;
 static id<MTLComputePipelineState> g_pso_mul_mv_q4_K = nil;
+static id<MTLComputePipelineState> g_pso_mul_mv_q4_K_dense_bf16 = nil;
 static id<MTLComputePipelineState> g_pso_softmax = nil;
 static id<MTLComputePipelineState> g_pso_moe_mv_id_iq2_xxs = nil;
 static id<MTLComputePipelineState> g_pso_moe_mv_id_q2_k = nil;
@@ -60,6 +61,7 @@ static bool                        g_moe_iq2_constant_lut = false;
 static id<MTLComputePipelineState> g_pso_attn_out_low_q8_0 = nil;
 static id<MTLComputePipelineState> g_pso_attn_out_low_q8_0_bf16_r4 = nil;
 static id<MTLComputePipelineState> g_pso_attn_out_low_q4_K = nil;
+static id<MTLComputePipelineState> g_pso_attn_out_low_q4_K_bf16 = nil;
 static id<MTLComputePipelineState> g_pso_mul_mm_q8_0 = nil;
 static id<MTLComputePipelineState> g_pso_mul_mm_q8_0_bco = nil;
 static id<MTLComputePipelineState> g_pso_mul_mm_q4_K = nil;
@@ -1363,6 +1365,10 @@ int myds_metal_init(const char *shader_dir) {
         if (fn) {
             g_pso_mul_mv_q4_K = [g_device newComputePipelineStateWithFunction:fn error:nil];
         }
+        fn = [g_library newFunctionWithName:@"kernel_mul_mv_q4_K_dense_f32_bf16" constantValues:mv_constants error:nil];
+        if (fn) {
+            g_pso_mul_mv_q4_K_dense_bf16 = [g_device newComputePipelineStateWithFunction:fn error:nil];
+        }
 
         /* 9. Build Routed MoE pipelines */
         MTLFunctionConstantValues *moe_mv_id_constants = [[MTLFunctionConstantValues alloc] init];
@@ -1484,6 +1490,10 @@ int myds_metal_init(const char *shader_dir) {
         fn = [g_library newFunctionWithName:@"kernel_dsv4_attn_out_low_q4_K_f32" constantValues:mv_constants error:nil];
         if (fn) {
             g_pso_attn_out_low_q4_K = [g_device newComputePipelineStateWithFunction:fn error:nil];
+        }
+        fn = [g_library newFunctionWithName:@"kernel_dsv4_attn_out_low_q4_K_bf16" constantValues:mv_constants error:nil];
+        if (fn) {
+            g_pso_attn_out_low_q4_K_bf16 = [g_device newComputePipelineStateWithFunction:fn error:nil];
         }
 
         MTLFunctionConstantValues *mm_c_bco1 = [[MTLFunctionConstantValues alloc] init];
@@ -1632,6 +1642,7 @@ void myds_metal_cleanup(void) {
     g_pso_mul_mv_f32 = nil;
     g_pso_mul_mv_f16 = nil;
     g_pso_mul_mv_q4_K = nil;
+    g_pso_mul_mv_q4_K_dense_bf16 = nil;
     g_pso_softmax = nil;
     g_pso_moe_mv_id_iq2_xxs = nil;
     g_pso_moe_mv_id_q2_k = nil;
@@ -1657,6 +1668,7 @@ void myds_metal_cleanup(void) {
     g_pso_attn_out_low_q8_0 = nil;
     g_pso_attn_out_low_q8_0_bf16_r4 = nil;
     g_pso_attn_out_low_q4_K = nil;
+    g_pso_attn_out_low_q4_K_bf16 = nil;
     g_pso_mul_mm_q8_0 = nil;
     g_pso_mul_mm_q8_0_bco = nil;
     g_pso_mul_mm_q4_K = nil;
@@ -3583,6 +3595,52 @@ int myds_metal_v41_gemv_bf16_shared2(myds_metal_buffer_t *const out[2],
 int myds_metal_v41_gemv_bf16(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *weight,const myds_metal_buffer_t *input,
     uint32_t out_dim,uint32_t in_dim,ggml_type type) {
+    if (type == GGML_TYPE_Q4_K) {
+        if (!out || !weight || !input || !out_dim || !in_dim || out_dim > INT32_MAX ||
+            in_dim > INT32_MAX || in_dim % 256u || out->offset % 16u) return 0;
+        const uint64_t row_bytes = (uint64_t)(in_dim / 256u) * 144u;
+        if (weight->size / row_bytes < out_dim || input->size / 4u < in_dim || out->size / 4u < out_dim) return 0;
+        const uint32_t nsg = 4u, nr0 = 2u;
+        id<MTLComputePipelineState> pipeline = g_pso_mul_mv_q4_K_dense_bf16;
+        if (!pipeline) {
+            NSString *key = [NSString stringWithFormat:@"q4_k_bf16_%u", nsg];
+            pipeline = g_native_pipelines[key];
+            if (!pipeline && g_library) {
+                MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
+                short short_nsg = (short)nsg;
+                [values setConstantValue:&short_nsg type:MTLDataTypeShort atIndex:600];
+                id<MTLFunction> fn = [g_library newFunctionWithName:@"kernel_mul_mv_q4_K_dense_f32_bf16"
+                    constantValues:values error:nil];
+                if (fn) pipeline = [g_device newComputePipelineStateWithFunction:fn error:nil];
+                if (pipeline) {
+                    if (!g_native_pipelines) g_native_pipelines = [NSMutableDictionary new];
+                    g_native_pipelines[key] = pipeline;
+                }
+            }
+        }
+        if (!pipeline || !out->mtl_buf || !weight->mtl_buf || !input->mtl_buf)
+            return myds_metal_gemv(out, weight, input, out_dim, in_dim, type) && myds_metal_v41_bf16(out, out_dim);
+        @autoreleasepool {
+            struct ds4_metal_args_mul_mv a = {0};
+            a.ne00 = (int32_t)in_dim; a.ne01 = (int32_t)out_dim; a.ne02 = 1;
+            a.nb00 = 144; a.nb01 = row_bytes; a.nb02 = row_bytes * out_dim; a.nb03 = a.nb02;
+            a.ne10 = (int32_t)in_dim; a.ne11 = 1; a.ne12 = 1; a.nb10 = 4; a.nb11 = (uint64_t)in_dim * 4;
+            a.nb12 = a.nb11; a.nb13 = a.nb12; a.ne0 = (int32_t)out_dim; a.ne1 = 1; a.nr0 = (int16_t)nr0; a.r2 = 1; a.r3 = 1;
+            id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
+            if (!cb) return 0;
+            id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
+            if (!enc || 32u * nsg > pipeline.maxTotalThreadsPerThreadgroup) return 0;
+            [enc setComputePipelineState:pipeline];
+            [enc setBytes:&a length:sizeof(a) atIndex:0];
+            [enc setBuffer:weight->mtl_buf offset:weight->offset atIndex:1];
+            [enc setBuffer:input->mtl_buf offset:input->offset atIndex:2];
+            [enc setBuffer:out->mtl_buf offset:out->offset atIndex:3];
+            [enc setThreadgroupMemoryLength:32u * nr0 * sizeof(float) atIndex:0];
+            NSUInteger ngr = ((NSUInteger)out_dim + nsg * nr0 - 1u) / (nsg * nr0);
+            metal_dispatch(enc, "gemv_q4_k_bf16", MTLSizeMake(ngr, 1, 1), MTLSizeMake(32, nsg, 1));
+            return v41_finish(cb, enc);
+        }
+    }
     if(type!=GGML_TYPE_Q8_0) {
         int ok=(type==GGML_TYPE_F16||type==GGML_TYPE_F32)?
             myds_metal_v41_gemv(out,weight,input,out_dim,in_dim,type):
@@ -5192,6 +5250,58 @@ int myds_metal_attn_output_a_bf16(
             [enc setBuffer:low->mtl_buf offset:low->offset atIndex:3];
             [enc setThreadgroupMemoryLength:smem_bytes atIndex:0];
             metal_dispatch(enc, "attn_out_low_q8_0_bf16_r4", MTLSizeMake(row_groups, 1, pairs),
+                MTLSizeMake(32, 4, 1));
+
+            if (g_batch_cb) {
+                if (g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            } else {
+                [enc endEncoding];
+                [cb commit];
+                if (!wait_command_buffer(cb)) return 0;
+            }
+            return 1;
+        }
+    } else if (cached_fuse && weight_type == GGML_TYPE_Q4_K && g_pso_attn_out_low_q4_K_bf16 &&
+               out_a->mtl_buf && heads->mtl_buf && low->mtl_buf && (group_dim % 256 == 0) && (low->offset % 16 == 0)) {
+        @autoreleasepool {
+            const uint64_t a_group_bytes = (uint64_t)rank * (group_dim / 256u) * 144u;
+            struct ds4_metal_args_mul_mv_id args;
+            memset(&args, 0, sizeof(args));
+            args.nei0 = (int32_t)n_groups;
+            args.nei1 = 1;
+            args.nbi1 = (uint64_t)n_groups * sizeof(int32_t);
+            args.ne00 = (int32_t)group_dim;
+            args.ne01 = (int32_t)rank;
+            args.ne02 = (int32_t)n_groups;
+            args.nb00 = 144u;
+            args.nb01 = (group_dim / 256u) * 144u;
+            args.nb02 = a_group_bytes;
+            args.ne10 = (int32_t)group_dim;
+            args.ne11 = (int32_t)n_groups;
+            args.ne12 = 1;
+            args.ne13 = 1;
+            args.nb10 = sizeof(float);
+            args.nb11 = (uint64_t)group_dim * sizeof(float);
+            args.nb12 = (uint64_t)n_groups * (uint64_t)group_dim * sizeof(float);
+            args.ne0 = (int32_t)rank;
+            args.ne1 = (int32_t)n_groups;
+            args.nb1 = (uint64_t)rank * sizeof(float);
+            args.nr0 = 2;
+
+            const NSUInteger rows_per_group = 8; // NSG=4 * nr0=2
+            const NSUInteger row_groups = (rank + rows_per_group - 1) / rows_per_group;
+            const NSUInteger pairs = (NSUInteger)n_groups;
+            const NSUInteger smem_bytes = 256;
+
+            id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
+            [enc setComputePipelineState:g_pso_attn_out_low_q4_K_bf16];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:out_a->mtl_buf offset:out_a->offset atIndex:1];
+            [enc setBuffer:heads->mtl_buf offset:heads->offset atIndex:2];
+            [enc setBuffer:low->mtl_buf offset:low->offset atIndex:3];
+            [enc setThreadgroupMemoryLength:smem_bytes atIndex:0];
+            metal_dispatch(enc, "attn_out_low_q4_K_bf16", MTLSizeMake(row_groups, 1, pairs),
                 MTLSizeMake(32, 4, 1));
 
             if (g_batch_cb) {
