@@ -128,6 +128,11 @@ def inspect(root):
         records = [strict_json(line) for line in metrics.splitlines()]
         require(records and all(isinstance(row, dict) for row in records), "Invalid native metrics: " + arm)
         group, original_samples = bench.validate_run(directory, state, audit)
+        # This frozen cohort measures 256 emitted tokens. A legal EOS adds an
+        # un-emitted target call and a trailing wall-time interval; that needs
+        # its own timing/row protocol instead of this length-only equality.
+        require(all(sample.get('stop_reason') == 'length' and sample.get('output_tokens') == 256
+                    for sample in original_samples), 'Expected length-stop 256-token cohort: ' + arm)
         meta = group["metadata"]
         loaded = next(row for row in records if row.get("kind") == "load")
         require(meta.get("protocol_version") == 2 and meta.get("repeats") == 3 and meta.get("warmup_runs") == 1 and
