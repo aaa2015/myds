@@ -3718,40 +3718,22 @@ int myds_v41_batch2_projection_probe(myds_metal_buffer_t *out[2],
             const int shared = myds_metal_batch2_dense_shared_mode();
             if (shared < 0) return 0;
             if (shared) {
-                const myds_metal_buffer_t *deps[] = {input[0], input[1]};
-                myds_metal_barrier_buffers(deps, 2);
-                if (!myds_metal_v41_gemv_shared2_dense(out, weight, input, rows, width, type)) return 0;
-                const myds_metal_buffer_t *results[] = {out[0], out[1]};
-                myds_metal_barrier_buffers(results, 2);
-                return 1;
+                return myds_metal_v41_gemv_shared2_dense(out, weight, input, rows, width, type);
             }
         } else if ((type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_K) && kind == MYDS_V41_BATCH2_LM_HEAD) {
             const int shared = (type == GGML_TYPE_Q4_K) ? myds_metal_batch2_q4_shared_mode()
                                                         : myds_metal_batch2_q8_shared_mode();
             if (shared < 0) return 0;
             if (shared) {
-                const myds_metal_buffer_t *deps[] = {input[0], input[1]};
-                myds_metal_barrier_buffers(deps, 2);
-                int ok = (type == GGML_TYPE_Q4_K)
+                return (type == GGML_TYPE_Q4_K)
                     ? myds_metal_v41_gemv_shared2_q4_f32(out, weight, input, rows, width)
                     : myds_metal_v41_gemv_shared2_q8_f32(out, weight, input, rows, width);
-                if (!ok) return 0;
-                const myds_metal_buffer_t *results[] = {out[0], out[1]};
-                myds_metal_barrier_buffers(results, 2);
-                return 1;
             }
         }
     }
     if (shared_eligible) {
-        const myds_metal_buffer_t *deps[] = {input[0], input[1]};
-        myds_metal_barrier_buffers(deps, 2);
-        if (!myds_metal_v41_gemv_bf16_shared2_type(out, weight, input, rows, width, type)) return 0;
-        const myds_metal_buffer_t *results[] = {out[0], out[1]};
-        myds_metal_barrier_buffers(results, 2);
-        return 1;
+        return myds_metal_v41_gemv_bf16_shared2_type(out, weight, input, rows, width, type);
     }
-    const myds_metal_buffer_t *in_deps[] = {input[0], input[1]};
-    myds_metal_barrier_buffers(in_deps, 2);
     for (uint32_t t = 0; t < 2; ++t) {
         int ok = 0;
         switch (kind) {
@@ -4357,9 +4339,8 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         myds_metal_barrier_buffer(ws->kv_act_b2);
         CHECK(myds_metal_v41_rmsnorm(ws->v_kv_act[0], ws->v_kv_act[0], base->attn_kv_a_norm, 512, m->norm_eps, true));
         CHECK(myds_metal_v41_rmsnorm(ws->v_kv_act[1], ws->v_kv_act[1], base->attn_kv_a_norm, 512, m->norm_eps, true));
-        myds_metal_barrier_buffer(ws->kv_act_b2);
-
-        myds_metal_barrier_buffer(ws->q_b2);
+        const myds_metal_buffer_t *q_kv_deps[] = { ws->kv_act_b2, ws->q_b2 };
+        myds_metal_barrier_buffers(q_kv_deps, 2);
         if (trace_gpu) {
             CHECK(myds_metal_commit_batch());
             t_qkv += (lowkv_now_ms() - t_step);
@@ -4449,16 +4430,16 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
             }
         }
 
-        /* 4. 仅同步 router_logits，执行路由打分与 Top-K 选择 */
+        /* 4. 提前派发 Shared Down（只依赖 shared_swiglu，与后续 route_batch 路由选择在 GPU 上完全重叠） */
+        myds_metal_barrier_buffer(ws->shared_swiglu_b2);
+        CHECK(myds_v41_batch2_projection_probe(ws->v_shared_out, base->shared_down, ws->v_shared_swiglu, V41_DIM, 2304, base->shared_down_type, MYDS_V41_BATCH2_SHARED));
+
+        /* 5. 同步 router_logits，执行路由打分与 Top-K 选择 */
         myds_metal_barrier_buffer(ws->router_logits_b2);
         CHECK(myds_v41_route_batch(ws->selected_ids_b2, ws->selected_w_b2, ws->route_probs_b2, ws->route_scores_b2,
                                    ws->router_logits_b2, base->router_bias, 384, 6, m->routed_scaling_factor, 2));
-        myds_metal_barrier_buffer(ws->selected_ids_b2);
-        myds_metal_barrier_buffer(ws->selected_w_b2);
-
-        /* 5. 派发 Shared Down */
-        myds_metal_barrier_buffer(ws->shared_swiglu_b2);
-        CHECK(myds_v41_batch2_projection_probe(ws->v_shared_out, base->shared_down, ws->v_shared_swiglu, V41_DIM, 2304, base->shared_down_type, MYDS_V41_BATCH2_SHARED));
+        const myds_metal_buffer_t *route_out_deps[] = { ws->selected_ids_b2, ws->selected_w_b2 };
+        myds_metal_barrier_buffers(route_out_deps, 2);
 
         /* 6. 并发派发 Routed MoE */
         CHECK(myds_metal_routed_moe_batch(ws->moe_out_b2, ws->ffn_norm_b2,
@@ -4469,10 +4450,9 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
                                           base->ffn_gate_exps_type, base->ffn_up_exps_type, base->ffn_down_exps_type,
                                           m->swiglu_clamp_exp));
 
-        /* 7. 同步所有结果并执行最终 HC Expand 累加 */
-        myds_metal_barrier_buffer(ws->moe_out_b2);
-        myds_metal_barrier_buffer(ws->shared_out_b2);
-        myds_metal_barrier_buffer(ws->ffn_split_b2);
+        /* 7. 合并同步所有 FFN 产物并执行最终 HC Expand 累加 */
+        const myds_metal_buffer_t *ffn_deps[] = { ws->moe_out_b2, ws->shared_out_b2, ws->ffn_split_b2 };
+        myds_metal_barrier_buffers(ffn_deps, 3);
         if (trace_gpu) {
             CHECK(myds_metal_commit_batch());
             t_moe += (lowkv_now_ms() - t_step);
