@@ -4199,7 +4199,7 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
     }
     v41_batch2_workspace_t *ws = g->batch2_ws;
     int prev_auto_barrier = -1;
-    const bool timed = ctx && ctx->decode_metrics_active && ctx->decode_stats.timing_enabled;
+    const bool timed = ctx && ctx->decode_metrics_active;
     const double t_start = timed ? lowkv_now_ms() : 0.0;
 
     static int decode_split = -1;

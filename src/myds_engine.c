@@ -3629,10 +3629,9 @@ static int myds_generate_internal(myds_context_t *ctx,
                 int32_t out_tokens[3] = { 0, 0, 0 };
 
                 uint32_t spec_pos = ctx->pos;
-                const double verify_start = ctx->decode_stats.timing_enabled ? decode_now_ms() : 0.0;
+                const double verify_start = decode_now_ms();
                 int ret = myds_v41_forward_batch_spec_ex(ctx, tokens_to_forward, n_fwd, spec_pos, out_tokens, snap);
-                if (ctx->decode_stats.timing_enabled)
-                    ctx->decode_stats.verify_ms += decode_now_ms() - verify_start;
+                ctx->decode_stats.verify_ms += decode_now_ms() - verify_start;
                 snap_saved = snap->valid;
                 if (ret < 0 || out_tokens[0] < 0 || (uint32_t)out_tokens[0] >= m->tokenizer->vocab_size) {
                     if (snap_saved) myds_v41_spec_snapshot_restore(ctx, snap);
@@ -3965,10 +3964,9 @@ static int myds_generate_internal(myds_context_t *ctx,
                 int32_t out_tokens[2] = { 0, 0 };
 
                 uint32_t pld_pos = ctx->pos;
-                const double verify_start = ctx->decode_stats.timing_enabled ? decode_now_ms() : 0.0;
+                const double verify_start = decode_now_ms();
                 int ret = myds_v41_forward_batch_spec_ex(ctx, tokens_to_forward, 2, pld_pos, out_tokens, pld_snap);
-                if (ctx->decode_stats.timing_enabled)
-                    ctx->decode_stats.verify_ms += decode_now_ms() - verify_start;
+                ctx->decode_stats.verify_ms += decode_now_ms() - verify_start;
                 snap_saved = pld_snap->valid;
                 if (ret < 0 || out_tokens[0] < 0 || (uint32_t)out_tokens[0] >= m->tokenizer->vocab_size) {
                     if (snap_saved) myds_v41_spec_snapshot_restore(ctx, pld_snap);
