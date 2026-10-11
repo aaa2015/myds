@@ -3725,6 +3725,17 @@ int myds_v41_batch2_projection_probe(myds_metal_buffer_t *out[2],
                 myds_metal_barrier_buffers(results, 2);
                 return 1;
             }
+        } else if (type == GGML_TYPE_Q8_0 && kind == MYDS_V41_BATCH2_LM_HEAD) {
+            const int shared = myds_metal_batch2_q8_shared_mode();
+            if (shared < 0) return 0;
+            if (shared) {
+                const myds_metal_buffer_t *deps[] = {input[0], input[1]};
+                myds_metal_barrier_buffers(deps, 2);
+                if (!myds_metal_v41_gemv_shared2_q8_f32(out, weight, input, rows, width)) return 0;
+                const myds_metal_buffer_t *results[] = {out[0], out[1]};
+                myds_metal_barrier_buffers(results, 2);
+                return 1;
+            }
         }
     }
     if (shared_eligible) {
@@ -3748,6 +3759,8 @@ int myds_v41_batch2_projection_probe(myds_metal_buffer_t *out[2],
                 ok = myds_v41_decode_gemv_bf16(out[t], weight, input[t], rows, width, type, trace_on); break;
             case MYDS_V41_BATCH2_ROUTER:
                 ok = myds_metal_v41_gemv(out[t], weight, input[t], rows, width, type); break;
+            case MYDS_V41_BATCH2_LM_HEAD:
+                ok = project(out[t], weight, input[t], rows, width, type, false); break;
             default: return 0;
         }
         if (!ok) return 0;
@@ -4483,11 +4496,7 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
     CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_x_norm[1], ws->v_x[1], ws->v_residual[1], ws->v_ffn_split[1], m->output_norm, V41_DIM, m->norm_eps, true));
     myds_metal_barrier_buffer(ws->x_norm_b2);
 
-    int lm_head_batched = myds_metal_gemv_batch(ws->logits_b2, m->output, ws->x_norm_b2, m->vocab_size, V41_DIM, 2, m->output_type);
-    if (!lm_head_batched) {
-        CHECK(project(ws->v_logits[0], m->output, ws->v_x_norm[0], m->vocab_size, V41_DIM, m->output_type, false));
-        CHECK(project(ws->v_logits[1], m->output, ws->v_x_norm[1], m->vocab_size, V41_DIM, m->output_type, false));
-    }
+    CHECK(myds_v41_batch2_projection_probe(ws->v_logits, m->output, ws->v_x_norm, m->vocab_size, V41_DIM, m->output_type, MYDS_V41_BATCH2_LM_HEAD));
     myds_metal_barrier_buffer(ws->logits_b2);
 
     const double t_encode = timed ? lowkv_now_ms() : 0.0;

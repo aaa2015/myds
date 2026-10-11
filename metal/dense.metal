@@ -310,8 +310,8 @@ kernel void kernel_mul_mv_q8_0_f32_bf16_r4(
  * half scale once for two independent input rows. Each token preserves the
  * scalar helper's eight products, block-scale placement, K walk and both
  * simd_sum reductions. No dequantized half staging or matrix instructions. */
-template<short NR0>
-void kernel_dsv41_q8_shared2_bf16_impl(
+template<short NR0, bool ROUND_BF16>
+void kernel_dsv41_q8_shared2_impl(
         constant ds4_metal_args_mul_mv &args,
         device const char *src0,
         device const float *input0, device const float *input1,
@@ -353,8 +353,8 @@ void kernel_dsv41_q8_shared2_bf16_impl(
     }
     /* Reuse the authoritative scalar reducer for each token. Separate
      * planes keep both initialization and both reduction trees unchanged. */
-    helper_mv_reduce_and_write<NR0,true>(output0, sumf[0], r0, args.ne01, tiisg, sgitg, shmem);
-    helper_mv_reduce_and_write<NR0,true>(output1, sumf[1], r0, args.ne01, tiisg, sgitg,
+    helper_mv_reduce_and_write<NR0, ROUND_BF16>(output0, sumf[0], r0, args.ne01, tiisg, sgitg, shmem);
+    helper_mv_reduce_and_write<NR0, ROUND_BF16>(output1, sumf[1], r0, args.ne01, tiisg, sgitg,
                                        shmem + NW * NR0 * sizeof(float));
 }
 
@@ -367,7 +367,17 @@ kernel void kernel_dsv41_q8_shared2_bf16_r##NR( \
         threadgroup char *shmem [[threadgroup(0)]], \
         uint3 tgpig [[threadgroup_position_in_grid]], \
         ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
-    kernel_dsv41_q8_shared2_bf16_impl<NR>(args,weight,input0,input1,output0,output1,shmem,tgpig,tiisg,sgitg); \
+    kernel_dsv41_q8_shared2_impl<NR, true>(args,weight,input0,input1,output0,output1,shmem,tgpig,tiisg,sgitg); \
+} \
+kernel void kernel_dsv41_q8_shared2_f32_r##NR( \
+        constant ds4_metal_args_mul_mv &args [[buffer(0)]], \
+        device const char *weight [[buffer(1)]], \
+        device const float *input0 [[buffer(2)]], device const float *input1 [[buffer(3)]], \
+        device float *output0 [[buffer(4)]], device float *output1 [[buffer(5)]], \
+        threadgroup char *shmem [[threadgroup(0)]], \
+        uint3 tgpig [[threadgroup_position_in_grid]], \
+        ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
+    kernel_dsv41_q8_shared2_impl<NR, false>(args,weight,input0,input1,output0,output1,shmem,tgpig,tiisg,sgitg); \
 }
 DSV41_Q8_SHARED2_KERNEL(2)
 DSV41_Q8_SHARED2_KERNEL(4)

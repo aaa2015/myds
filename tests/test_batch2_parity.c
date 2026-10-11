@@ -252,19 +252,28 @@ static int test_authoritative_projection(uint32_t rows, uint32_t width,
     for (uint32_t t = 0; t < 2; ++t) {
         if (kind == MYDS_V41_BATCH2_QKV)
             CHECK(myds_metal_v41_gemv_bf16(reference[t], weight, input[t], rows, width, type));
-        else if (kind == MYDS_V41_BATCH2_ROUTER)
-            CHECK(myds_metal_v41_gemv(reference[t], weight, input[t], rows, width, type));
+        else if (kind == MYDS_V41_BATCH2_ROUTER || kind == MYDS_V41_BATCH2_LM_HEAD)
+            CHECK(myds_metal_gemv(reference[t], weight, input[t], rows, width, type));
         else
             CHECK(myds_v41_decode_gemv_bf16(reference[t], weight, input[t], rows, width, type, false));
         CHECK(myds_metal_gemv(raw[t], weight, input[t], rows, width, type));
     }
     CHECK(myds_metal_commit_batch());
+    myds_metal_batch2_q8_shared_counters_t before, after;
+    myds_metal_batch2_q8_shared_counters(&before, false);
     CHECK(myds_metal_begin_batch());
     CHECK(myds_v41_batch2_projection_probe(candidate, weight, input, rows, width, type, kind));
     CHECK(myds_metal_commit_batch());
+    myds_metal_batch2_q8_shared_counters(&after, false);
+    if (myds_metal_batch2_q8_shared_mode() > 0 &&
+        (kind == MYDS_V41_BATCH2_LM_HEAD ||
+         ((kind == MYDS_V41_BATCH2_QKV || kind == MYDS_V41_BATCH2_TAIL || kind == MYDS_V41_BATCH2_SHARED) &&
+          type == GGML_TYPE_Q8_0 && myds_v41_decode_q8_fuse_bf16_enabled()))) {
+        CHECK(after.encoded > before.encoded);
+    }
     for (uint32_t t = 0; t < 2; ++t) {
         CHECK(verify_exact(reference[t], candidate[t], rows));
-        if (kind != MYDS_V41_BATCH2_ROUTER) {
+        if (kind != MYDS_V41_BATCH2_ROUTER && kind != MYDS_V41_BATCH2_LM_HEAD) {
             CHECK(memcmp(myds_metal_buffer_data(raw[t]), myds_metal_buffer_data(candidate[t]), rows * sizeof(float)) != 0);
             const uint32_t *bits = myds_metal_buffer_data(candidate[t]);
             for (uint32_t r = 0; r < rows; ++r) CHECK((bits[r] & 0xffffu) == 0);
@@ -570,6 +579,8 @@ int main(void) {
     if (!test_authoritative_projection(5120, 2304, GGML_TYPE_Q8_0, MYDS_V41_BATCH2_SHARED)) return 1;
     if (!test_authoritative_projection(384, 5120, GGML_TYPE_F16, MYDS_V41_BATCH2_ROUTER)) return 1;
     if (!test_authoritative_projection(384, 5120, GGML_TYPE_F32, MYDS_V41_BATCH2_ROUTER)) return 1;
+    if (!test_authoritative_projection(1024, 5120, GGML_TYPE_Q8_0, MYDS_V41_BATCH2_LM_HEAD)) return 1;
+    if (!test_authoritative_projection(129280, 5120, GGML_TYPE_Q8_0, MYDS_V41_BATCH2_LM_HEAD)) return 1;
 
     // 9. Batch-2 Attention Output A
     if (!test_batch2_attn_output_a()) return 1;

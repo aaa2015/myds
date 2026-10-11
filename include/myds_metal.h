@@ -260,6 +260,9 @@ int myds_metal_v41_gemv_bf16_shared2_type(myds_metal_buffer_t *const out[2],
 int myds_metal_v41_gemv_shared2_dense(myds_metal_buffer_t *const out[2],
     const myds_metal_buffer_t *weight, myds_metal_buffer_t *const input[2],
     uint32_t out_dim, uint32_t in_dim, ggml_type type);
+int myds_metal_v41_gemv_shared2_q8_f32(myds_metal_buffer_t *const out[2],
+    const myds_metal_buffer_t *weight, myds_metal_buffer_t *const input[2],
+    uint32_t out_dim, uint32_t in_dim);
 typedef struct {
     uint64_t requests, encoded, failures;
 } myds_metal_batch2_q8_shared_counters_t;

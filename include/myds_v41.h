@@ -169,7 +169,8 @@ int myds_v41_batch2_window_probe(myds_metal_buffer_t *window,
  * row retains the authoritative decode helper's reduction and BF16 store. */
 typedef enum {
     MYDS_V41_BATCH2_QKV, MYDS_V41_BATCH2_TAIL,
-    MYDS_V41_BATCH2_SHARED, MYDS_V41_BATCH2_ROUTER
+    MYDS_V41_BATCH2_SHARED, MYDS_V41_BATCH2_ROUTER,
+    MYDS_V41_BATCH2_LM_HEAD
 } myds_v41_batch2_projection_kind_t;
 int myds_v41_batch2_projection_probe(myds_metal_buffer_t *out[2],
     const myds_metal_buffer_t *weight, myds_metal_buffer_t *input[2],
