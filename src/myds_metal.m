@@ -238,6 +238,7 @@ static atomic_uint_fast64_t g_batch2_q8_shared_requests = 0;
 static atomic_uint_fast64_t g_batch2_q8_shared_encoded = 0;
 static atomic_uint_fast64_t g_batch2_q8_shared_failures = 0;
 static id<MTLComputePipelineState> batch2_q8_shared_pipeline(uint32_t nsg, uint32_t nr0);
+static id<MTLComputePipelineState> batch2_q4_shared_pipeline(uint32_t nsg, uint32_t nr0);
 static int g_lm_head_q8_nr0 = 2;
 static id<MTLComputePipelineState> g_pso_lm_head_q8_nr4 = nil;
 static atomic_uint_fast64_t g_lm_head_q8_requests = 0;
@@ -562,6 +563,15 @@ int myds_metal_batch2_q8_shared_mode(void) {
     if (!value || strcmp(value, "0") == 0) return 0;
     if (strcmp(value, "1") == 0) return 1;
     fprintf(stderr, "myds_metal: MYDS_BATCH2_Q8_SHARED must be exactly 0 or 1\n");
+    return -1;
+}
+
+int myds_metal_batch2_q4_shared_mode(void) {
+    const char *value = getenv("MYDS_BATCH2_Q4_SHARED");
+    if (!value) value = getenv("MYDS_BATCH2_SHARED");
+    if (!value || strcmp(value, "1") == 0) return 1;
+    if (strcmp(value, "0") == 0) return 0;
+    fprintf(stderr, "myds_metal: MYDS_BATCH2_Q4_SHARED / MYDS_BATCH2_SHARED must be exactly 0 or 1\n");
     return -1;
 }
 
@@ -1009,6 +1019,8 @@ int myds_metal_init(const char *shader_dir) {
     if (lm_head_q8_nr0 < 0) return 0;
     const int batch2_q8_shared = myds_metal_batch2_q8_shared_mode();
     if (batch2_q8_shared < 0) return 0;
+    const int batch2_q4_shared = myds_metal_batch2_q4_shared_mode();
+    if (batch2_q4_shared < 0) return 0;
 
     /* PSO function constants are initialization-time settings. An absent down
      * override inherits the existing IQ2 setting, including its legacy parser.
@@ -1545,6 +1557,11 @@ int myds_metal_init(const char *shader_dir) {
                         myds_metal_cleanup();
                         return 0;
                     }
+        }
+        if (batch2_q4_shared) {
+            for (uint32_t nsg = 4; nsg <= 8; nsg += 4)
+                for (uint32_t nr0 = 2; nr0 <= 4; nr0 += 2)
+                    (void)batch2_q4_shared_pipeline(nsg, nr0);
         }
         if (lm_head_q8_nr0 == 4 && !lm_head_q8_nr4_pipeline()) {
             g_initialized = true;
@@ -3488,20 +3505,23 @@ static uint32_t qkv_nr0(void) {
     return cached;
 }
 
-static id<MTLComputePipelineState> batch2_q8_shared_pipeline(uint32_t nsg, uint32_t nr0) {
+static id<MTLComputePipelineState> batch2_shared_pipeline(uint32_t nsg, uint32_t nr0, ggml_type type) {
     if ((nsg != 4 && nsg != 8) || (nr0 != 2 && nr0 != 4) || !g_library) return nil;
-    NSString *key = [NSString stringWithFormat:@"batch2_q8_shared_%u_%u", nsg, nr0];
+    NSString *key = [NSString stringWithFormat:@"batch2_shared_%s_%u_%u",
+                     type == GGML_TYPE_Q4_K ? "q4_K" : "q8", nsg, nr0];
     id<MTLComputePipelineState> pipeline = g_native_pipelines[key];
     if (pipeline) return pipeline;
     MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
     short short_nsg = (short)nsg;
     [values setConstantValue:&short_nsg type:MTLDataTypeShort atIndex:600];
-    NSString *name = [NSString stringWithFormat:@"kernel_dsv41_q8_shared2_bf16_r%u", nr0];
+    NSString *name = [NSString stringWithFormat:@"kernel_dsv41_%s_shared2_bf16_r%u",
+                      type == GGML_TYPE_Q4_K ? "q4_K" : "q8", nr0];
     NSError *error = nil;
     id<MTLFunction> function = [g_library newFunctionWithName:name constantValues:values error:&error];
     if (function) pipeline = [g_device newComputePipelineStateWithFunction:function error:&error];
     if (!pipeline) {
-        fprintf(stderr, "myds_metal: Batch2 Q8 shared PSO %s NSG%u unavailable; refusing fallback (%s)\n",
+        fprintf(stderr, "myds_metal: Batch2 %s shared PSO %s NSG%u unavailable; refusing fallback (%s)\n",
+                type == GGML_TYPE_Q4_K ? "Q4_K" : "Q8",
                 name.UTF8String, nsg, error.localizedDescription.UTF8String ?: "no library/function");
         return nil;
     }
@@ -3510,9 +3530,18 @@ static id<MTLComputePipelineState> batch2_q8_shared_pipeline(uint32_t nsg, uint3
     return pipeline;
 }
 
-static int batch2_q8_shared_failure(const char *reason) {
+static id<MTLComputePipelineState> batch2_q8_shared_pipeline(uint32_t nsg, uint32_t nr0) {
+    return batch2_shared_pipeline(nsg, nr0, GGML_TYPE_Q8_0);
+}
+
+static id<MTLComputePipelineState> batch2_q4_shared_pipeline(uint32_t nsg, uint32_t nr0) {
+    return batch2_shared_pipeline(nsg, nr0, GGML_TYPE_Q4_K);
+}
+
+static int batch2_shared_failure(const char *reason, ggml_type type) {
     atomic_fetch_add_explicit(&g_batch2_q8_shared_failures, 1, memory_order_relaxed);
-    fprintf(stderr, "myds_metal: Batch2 Q8 shared projection rejected: %s; refusing fallback\n", reason);
+    fprintf(stderr, "myds_metal: Batch2 %s shared projection rejected: %s; refusing fallback\n",
+            type == GGML_TYPE_Q4_K ? "Q4_K" : "Q8", reason);
     return 0;
 }
 
@@ -3528,41 +3557,50 @@ static bool batch2_buffer_overlap(const myds_metal_buffer_t *a, uint64_t a_bytes
                                   : a->offset - b->offset < b_bytes;
 }
 
-int myds_metal_v41_gemv_bf16_shared2(myds_metal_buffer_t *const out[2],
+int myds_metal_v41_gemv_bf16_shared2_type(myds_metal_buffer_t *const out[2],
     const myds_metal_buffer_t *weight, myds_metal_buffer_t *const input[2],
-    uint32_t out_dim, uint32_t in_dim) {
+    uint32_t out_dim, uint32_t in_dim, ggml_type type) {
     atomic_fetch_add_explicit(&g_batch2_q8_shared_requests, 1, memory_order_relaxed);
+    if (type != GGML_TYPE_Q8_0 && type != GGML_TYPE_Q4_K)
+        return batch2_shared_failure("unsupported quantization type", type);
     if (!g_initialized || !out || !input || !out_dim || !in_dim ||
-        out_dim > INT32_MAX - 3u || in_dim > INT32_MAX || in_dim % 32u)
-        return batch2_q8_shared_failure("invalid runtime or dimensions");
-    const uint64_t row_bytes = (uint64_t)(in_dim / 32u) * 34u;
+        out_dim > INT32_MAX - 3u || in_dim > INT32_MAX)
+        return batch2_shared_failure("invalid runtime or dimensions", type);
+
+    const uint32_t block_size = type == GGML_TYPE_Q4_K ? 256u : 32u;
+    const uint32_t block_bytes = type == GGML_TYPE_Q4_K ? 144u : 34u;
+    if (in_dim % block_size)
+        return batch2_shared_failure("input dimension not divisible by block size", type);
+
+    const uint64_t row_bytes = (uint64_t)(in_dim / block_size) * (uint64_t)block_bytes;
     const uint64_t weight_bytes = row_bytes * out_dim, input_bytes = (uint64_t)in_dim * 4u;
     const uint64_t output_bytes = (uint64_t)out_dim * 4u;
     if (!batch2_buffer_range(weight, weight_bytes) || weight->offset % 2u)
-        return batch2_q8_shared_failure("invalid Q8 weight range/alignment");
+        return batch2_shared_failure("invalid weight range/alignment", type);
     for (unsigned t = 0; t < 2; ++t)
         if (!batch2_buffer_range(input[t], input_bytes) || input[t]->offset % 4u ||
             !batch2_buffer_range(out[t], output_bytes) || out[t]->offset % 16u)
-            return batch2_q8_shared_failure("invalid input/output range/alignment");
+            return batch2_shared_failure("invalid input/output range/alignment", type);
     if (batch2_buffer_overlap(out[0], output_bytes, out[1], output_bytes))
-        return batch2_q8_shared_failure("overlapping output rows");
+        return batch2_shared_failure("overlapping output rows", type);
     for (unsigned t = 0; t < 2; ++t) {
         if (batch2_buffer_overlap(out[t], output_bytes, weight, weight_bytes))
-            return batch2_q8_shared_failure("output overlaps weights");
+            return batch2_shared_failure("output overlaps weights", type);
         for (unsigned s = 0; s < 2; ++s)
             if (batch2_buffer_overlap(out[t], output_bytes, input[s], input_bytes))
-                return batch2_q8_shared_failure("output overlaps input");
+                return batch2_shared_failure("output overlaps input", type);
     }
-    const uint32_t nsg = out_dim > 65536u ? 8u : 4u, nr0 = qkv_nr0();
-    const NSUInteger shmem_bytes = 32u * nr0 * 2u * sizeof(float);
+    const uint32_t nsg = out_dim > 65536u ? 8u : 4u;
+    const uint32_t nr0 = (type == GGML_TYPE_Q4_K) ? ((qkv_nr0() == 4) ? 4u : 2u) : qkv_nr0();
+    const NSUInteger shmem_bytes = (type == GGML_TYPE_Q4_K) ? 0 : (32u * nr0 * 2u * sizeof(float));
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = batch2_q8_shared_pipeline(nsg, nr0);
-        if (!pipeline) return batch2_q8_shared_failure("candidate PSO unavailable");
+        id<MTLComputePipelineState> pipeline = batch2_shared_pipeline(nsg, nr0, type);
+        if (!pipeline) return batch2_shared_failure("candidate PSO unavailable", type);
         if (32u * nsg > pipeline.maxTotalThreadsPerThreadgroup ||
             32u * nsg > g_device.maxThreadsPerThreadgroup.width ||
             shmem_bytes > g_device.maxThreadgroupMemoryLength ||
             pipeline.staticThreadgroupMemoryLength > g_device.maxThreadgroupMemoryLength - shmem_bytes)
-            return batch2_q8_shared_failure("candidate geometry exceeds PSO/device limits");
+            return batch2_shared_failure("candidate geometry exceeds PSO/device limits", type);
         /* A public entry may reuse either output while auto barriers are off.
          * Close previous readers/writers before this kernel overwrites it. */
         if (g_batch_cb && !g_auto_barrier) {
@@ -3571,25 +3609,38 @@ int myds_metal_v41_gemv_bf16_shared2(myds_metal_buffer_t *const out[2],
         }
         struct ds4_metal_args_mul_mv a = {0};
         a.ne00 = (int32_t)in_dim; a.ne01 = (int32_t)out_dim; a.ne02 = 1;
-        a.nb00 = 34; a.nb01 = row_bytes; a.nb02 = weight_bytes; a.nb03 = weight_bytes;
+        a.nb00 = (uint64_t)block_bytes; a.nb01 = row_bytes; a.nb02 = weight_bytes; a.nb03 = weight_bytes;
         a.ne10 = (int32_t)in_dim; a.ne11 = 1; a.ne12 = 1;
         a.nb10 = 4; a.nb11 = input_bytes; a.nb12 = input_bytes; a.nb13 = input_bytes;
         a.ne0 = (int32_t)out_dim; a.ne1 = 1; a.nr0 = (int16_t)nr0; a.r2 = 1; a.r3 = 1;
         id<MTLCommandBuffer> cb = g_batch_cb ?: [g_queue commandBuffer];
-        if (!cb) return batch2_q8_shared_failure("command buffer unavailable");
+        if (!cb) return batch2_shared_failure("command buffer unavailable", type);
         id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
-        if (!enc) return batch2_q8_shared_failure("encoder unavailable");
+        if (!enc) return batch2_shared_failure("encoder unavailable", type);
         [enc setComputePipelineState:pipeline];
         [enc setBytes:&a length:sizeof(a) atIndex:0];
         const myds_metal_buffer_t *buffers[] = {weight, input[0], input[1], out[0], out[1]};
         for (unsigned i = 0; i < 5; ++i) [enc setBuffer:buffers[i]->mtl_buf offset:buffers[i]->offset atIndex:i + 1u];
-        [enc setThreadgroupMemoryLength:shmem_bytes atIndex:0];
-        const char *name = nr0 == 4u ? "kernel_dsv41_q8_shared2_bf16_r4" : "kernel_dsv41_q8_shared2_bf16_r2";
-        metal_dispatch(enc, name, MTLSizeMake(((NSUInteger)out_dim + nr0 - 1u) / nr0, 1, 1), MTLSizeMake(32, nsg, 1));
+        if (shmem_bytes > 0) [enc setThreadgroupMemoryLength:shmem_bytes atIndex:0];
+        const char *name = (type == GGML_TYPE_Q4_K) ?
+            (nr0 == 4u ? "kernel_dsv41_q4_K_shared2_bf16_r4" : "kernel_dsv41_q4_K_shared2_bf16_r2") :
+            (nr0 == 4u ? "kernel_dsv41_q8_shared2_bf16_r4" : "kernel_dsv41_q8_shared2_bf16_r2");
+        if (type == GGML_TYPE_Q4_K) {
+            NSUInteger ngr = ((NSUInteger)out_dim + nsg * nr0 - 1u) / (nsg * nr0);
+            metal_dispatch(enc, name, MTLSizeMake(ngr, 1, 1), MTLSizeMake(32, nsg, 1));
+        } else {
+            metal_dispatch(enc, name, MTLSizeMake(((NSUInteger)out_dim + nr0 - 1u) / nr0, 1, 1), MTLSizeMake(32, nsg, 1));
+        }
         atomic_fetch_add_explicit(&g_batch2_q8_shared_encoded, 1, memory_order_relaxed);
-        if (!v41_finish(cb, enc)) return batch2_q8_shared_failure("command completion failed");
+        if (!v41_finish(cb, enc)) return batch2_shared_failure("command completion failed", type);
         return 1;
     }
+}
+
+int myds_metal_v41_gemv_bf16_shared2(myds_metal_buffer_t *const out[2],
+    const myds_metal_buffer_t *weight, myds_metal_buffer_t *const input[2],
+    uint32_t out_dim, uint32_t in_dim) {
+    return myds_metal_v41_gemv_bf16_shared2_type(out, weight, input, out_dim, in_dim, GGML_TYPE_Q8_0);
 }
 
 int myds_metal_v41_gemv_bf16(myds_metal_buffer_t *out,

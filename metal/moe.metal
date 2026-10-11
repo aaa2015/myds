@@ -3404,6 +3404,158 @@ kernel void kernel_mul_mv_q4_K_dense_f32_bf16(
     kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K, constant ds4_metal_args_mul_mv &, true>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+/* Batch2 Q4_K dense shared projection. Streams each block of Q4_K weights
+ * once for two independent input rows (tokens 0 and 1). Reuses the exact
+ * 4-bit nibble unpacking, scaling, and intra-simdgroup reduction as
+ * kernel_mul_mv_q4_K_f32_impl. Rounds final outputs directly to BF16. */
+template<short NR0>
+void kernel_dsv41_q4_K_shared2_bf16_impl(
+        constant ds4_metal_args_mul_mv &args,
+        device const char *weight,
+        device const float *input0, device const float *input1,
+        device float *output0, device float *output1,
+        threadgroup char *shmem,
+        uint3 tgpig, ushort tiisg, ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr uint16_t kmask1 = 0x3f3f;
+    constexpr uint16_t kmask2 = 0x0f0f;
+    constexpr uint16_t kmask3 = 0xc0c0;
+
+    const short ix = tiisg / 8;
+    const short it = tiisg % 8;
+    const short iq = it / 4;
+    const short ir = it % 4;
+
+    const int nb = args.ne00 / QK_K;
+
+    const int r0 = tgpig.x;
+    const int first_row = (r0 * NSG + sgitg) * NR0;
+
+    const uint64_t offset0 = (uint64_t)first_row * args.nb01;
+
+    device const block_q4_K *x = (device const block_q4_K *)(weight + offset0);
+
+    float yl0[16], yl1[16];
+    float yh0[16], yh1[16];
+    float sumf[2][NR0];
+    FOR_UNROLL (short t = 0; t < 2; ++t) {
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            sumf[t][row] = 0.f;
+        }
+    }
+
+    device const float *y4_0 = input0 + ix * QK_K + 64 * iq + 8 * ir;
+    device const float *y4_1 = input1 + ix * QK_K + 64 * iq + 8 * ir;
+
+    uint16_t sc16[4];
+    thread const uint8_t *sc8 = (thread const uint8_t *)sc16;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        float4 sumy0 = {0.f, 0.f, 0.f, 0.f};
+        float4 sumy1 = {0.f, 0.f, 0.f, 0.f};
+
+        for (short i = 0; i < 8; ++i) {
+            yl0[i + 0] = y4_0[i +   0]; sumy0[0] += yl0[i + 0];
+            yl0[i + 8] = y4_0[i +  32]; sumy0[1] += yl0[i + 8];
+            yh0[i + 0] = y4_0[i + 128]; sumy0[2] += yh0[i + 0];
+            yh0[i + 8] = y4_0[i + 160]; sumy0[3] += yh0[i + 8];
+
+            yl1[i + 0] = y4_1[i +   0]; sumy1[0] += yl1[i + 0];
+            yl1[i + 8] = y4_1[i +  32]; sumy1[1] += yl1[i + 8];
+            yh1[i + 0] = y4_1[i + 128]; sumy1[2] += yh1[i + 0];
+            yh1[i + 8] = y4_1[i + 160]; sumy1[3] += yh1[i + 8];
+        }
+
+        device const uint16_t *sc = (device const uint16_t *)x[ib].scales + iq;
+        device const uint16_t *q1 = (device const uint16_t *)x[ib].qs + 16 * iq + 4 * ir;
+        device const half *dh = &x[ib].d;
+
+        for (short row = 0; row < NR0; row++) {
+            if (first_row + row >= args.ne0) break;
+            sc16[0] = sc[0] & kmask1;
+            sc16[1] = sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+            device const uint16_t *q2 = q1 + 32;
+
+            float4 acc1_0 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2_0 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc1_1 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2_1 = {0.f, 0.f, 0.f, 0.f};
+
+            FOR_UNROLL (short i = 0; i < 4; ++i) {
+                const uint16_t q1_val = q1[i];
+                const uint16_t q2_val = q2[i];
+
+                acc1_0[0] += yl0[2 * i + 0] * (q1_val & 0x000F);
+                acc1_0[1] += yl0[2 * i + 1] * (q1_val & 0x0F00);
+                acc1_0[2] += yl0[2 * i + 8] * (q1_val & 0x00F0);
+                acc1_0[3] += yl0[2 * i + 9] * (q1_val & 0xF000);
+
+                acc1_1[0] += yl1[2 * i + 0] * (q1_val & 0x000F);
+                acc1_1[1] += yl1[2 * i + 1] * (q1_val & 0x0F00);
+                acc1_1[2] += yl1[2 * i + 8] * (q1_val & 0x00F0);
+                acc1_1[3] += yl1[2 * i + 9] * (q1_val & 0xF000);
+
+                acc2_0[0] += yh0[2 * i + 0] * (q2_val & 0x000F);
+                acc2_0[1] += yh0[2 * i + 1] * (q2_val & 0x0F00);
+                acc2_0[2] += yh0[2 * i + 8] * (q2_val & 0x00F0);
+                acc2_0[3] += yh0[2 * i + 9] * (q2_val & 0xF000);
+
+                acc2_1[0] += yh1[2 * i + 0] * (q2_val & 0x000F);
+                acc2_1[1] += yh1[2 * i + 1] * (q2_val & 0x0F00);
+                acc2_1[2] += yh1[2 * i + 8] * (q2_val & 0x00F0);
+                acc2_1[3] += yh1[2 * i + 9] * (q2_val & 0xF000);
+            }
+
+            sumf[0][row] += dh[0] * ((acc1_0[0] + 1.f / 256.f * acc1_0[1]) * sc8[0] +
+                                     (acc1_0[2] + 1.f / 256.f * acc1_0[3]) * sc8[1] * 1.f / 16.f +
+                                     (acc2_0[0] + 1.f / 256.f * acc2_0[1]) * sc8[4] +
+                                     (acc2_0[2] + 1.f / 256.f * acc2_0[3]) * sc8[5] * 1.f / 16.f) -
+                            dh[1] * (sumy0[0] * sc8[2] + sumy0[1] * sc8[3] + sumy0[2] * sc8[6] + sumy0[3] * sc8[7]);
+
+            sumf[1][row] += dh[0] * ((acc1_1[0] + 1.f / 256.f * acc1_1[1]) * sc8[0] +
+                                     (acc1_1[2] + 1.f / 256.f * acc1_1[3]) * sc8[1] * 1.f / 16.f +
+                                     (acc2_1[0] + 1.f / 256.f * acc2_1[1]) * sc8[4] +
+                                     (acc2_1[2] + 1.f / 256.f * acc2_1[3]) * sc8[5] * 1.f / 16.f) -
+                            dh[1] * (sumy1[0] * sc8[2] + sumy1[1] * sc8[3] + sumy1[2] * sc8[6] + sumy1[3] * sc8[7]);
+
+            q1 += args.nb01 / 2;
+            sc += args.nb01 / 2;
+            dh += args.nb01 / 2;
+        }
+
+        y4_0 += 4 * QK_K;
+        y4_1 += 4 * QK_K;
+    }
+
+    for (int row = 0; row < NR0 && first_row + row < args.ne0; ++row) {
+        float sum_all0 = simd_sum(sumf[0][row]);
+        float sum_all1 = simd_sum(sumf[1][row]);
+        if (tiisg == 0) {
+            output0[first_row + row] = dsv4_mv_bf16_store(sum_all0);
+            output1[first_row + row] = dsv4_mv_bf16_store(sum_all1);
+        }
+    }
+}
+
+#define DSV41_Q4_K_SHARED2_KERNEL(NR) \
+kernel void kernel_dsv41_q4_K_shared2_bf16_r##NR( \
+        constant ds4_metal_args_mul_mv &args [[buffer(0)]], \
+        device const char *weight [[buffer(1)]], \
+        device const float *input0 [[buffer(2)]], device const float *input1 [[buffer(3)]], \
+        device float *output0 [[buffer(4)]], device float *output1 [[buffer(5)]], \
+        threadgroup char *shmem [[threadgroup(0)]], \
+        uint3 tgpig [[threadgroup_position_in_grid]], \
+        ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
+    kernel_dsv41_q4_K_shared2_bf16_impl<NR>(args,weight,input0,input1,output0,output1,shmem,tgpig,tiisg,sgitg); \
+}
+DSV41_Q4_K_SHARED2_KERNEL(2)
+DSV41_Q4_K_SHARED2_KERNEL(4)
+#undef DSV41_Q4_K_SHARED2_KERNEL
+
 // DS4 attention output low projection, specialized for the fixed block
 // diagonal mapping used by the model:
 //

@@ -1,17 +1,13 @@
 #include "myds_metal.h"
 #include "myds_v41_moe.h"
 #include "myds_v41_decode.h"
+#include "myds_v41.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
 #define REQUIRE(x) do { if (!(x)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #x); exit(1); } } while(0)
-
-bool myds_trace_active(void) { return false; }
-bool myds_trace_f32(const char *name, uint32_t layer, uint32_t pos, const myds_metal_buffer_t *buf, size_t count) {
-    (void)name; (void)layer; (void)pos; (void)buf; (void)count; return true;
-}
 
 // Helper to fill Q4_K block with pseudo-random valid data
 static void fill_q4_k(void *ptr, size_t bytes, unsigned seed) {
@@ -197,6 +193,108 @@ int main(void) {
         myds_metal_buffer_free(up_out);
         myds_metal_buffer_free(swiglu_ref);
         myds_metal_buffer_free(swiglu_test);
+    }
+
+    // Test 4: Batch-2 Q4_K Shared GEMV Parity across multiple dimensions
+    {
+        struct {
+            uint32_t out_dim;
+            uint32_t in_dim;
+            const char *desc;
+            myds_v41_batch2_projection_kind_t kind;
+        } cases[] = {
+            { 1280, 2048, "attn_q_a (1280x2048)", MYDS_V41_BATCH2_QKV },
+            { 512,  2048, "attn_kv (512x2048)", MYDS_V41_BATCH2_QKV },
+            { 40960, 1280, "attn_q_b (40960x1280)", MYDS_V41_BATCH2_QKV },
+            { 2048, 8192, "attn_output_b (2048x8192)", MYDS_V41_BATCH2_TAIL },
+            { 2048, 2304, "shared_down (2048x2304)", MYDS_V41_BATCH2_SHARED },
+        };
+
+        for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
+            uint32_t out_dim = cases[c].out_dim;
+            uint32_t in_dim = cases[c].in_dim;
+            size_t row_bytes = (in_dim / 256u) * 144u;
+            size_t w_bytes = row_bytes * out_dim;
+            size_t in_bytes = in_dim * sizeof(float);
+            size_t out_bytes = out_dim * sizeof(float);
+
+            myds_metal_buffer_t *w = myds_metal_buffer_alloc(w_bytes);
+            myds_metal_buffer_t *in[2] = {
+                myds_metal_buffer_alloc(in_bytes),
+                myds_metal_buffer_alloc(in_bytes)
+            };
+            myds_metal_buffer_t *ref[2] = {
+                myds_metal_buffer_alloc(out_bytes),
+                myds_metal_buffer_alloc(out_bytes)
+            };
+            myds_metal_buffer_t *test[2] = {
+                myds_metal_buffer_alloc(out_bytes),
+                myds_metal_buffer_alloc(out_bytes)
+            };
+            REQUIRE(w && in[0] && in[1] && ref[0] && ref[1] && test[0] && test[1]);
+
+            fill_q4_k(myds_metal_buffer_data(w), w_bytes, (unsigned)(501 + c));
+            fill_f32(myds_metal_buffer_data(in[0]), in_dim, (unsigned)(601 + c));
+            fill_f32(myds_metal_buffer_data(in[1]), in_dim, (unsigned)(701 + c));
+
+            // Reference: Two separate single-token GEMV calls
+            for (int t = 0; t < 2; t++) {
+                memset(myds_metal_buffer_data(ref[t]), 0, out_bytes);
+                REQUIRE(myds_metal_v41_gemv_bf16(ref[t], w, in[t], out_dim, in_dim, GGML_TYPE_Q4_K));
+            }
+
+            // Test 4a: Direct myds_metal_v41_gemv_bf16_shared2_type dispatch
+            memset(myds_metal_buffer_data(test[0]), 0, out_bytes);
+            memset(myds_metal_buffer_data(test[1]), 0, out_bytes);
+            REQUIRE(myds_metal_v41_gemv_bf16_shared2_type(test, w, in, out_dim, in_dim, GGML_TYPE_Q4_K));
+
+            for (int t = 0; t < 2; t++) {
+                const uint32_t *ref_u32 = (const uint32_t *)myds_metal_buffer_data(ref[t]);
+                const uint32_t *test_u32 = (const uint32_t *)myds_metal_buffer_data(test[t]);
+                int diff = 0;
+                for (uint32_t i = 0; i < out_dim; i++) {
+                    if (ref_u32[i] != test_u32[i]) {
+                        if (diff < 5) {
+                            printf("Shared2 Direct Mismatch [%s, tok %d] at %u: ref=0x%08x (%.6f) test=0x%08x (%.6f)\n",
+                                   cases[c].desc, t, i, ref_u32[i], *(float*)&ref_u32[i], test_u32[i], *(float*)&test_u32[i]);
+                        }
+                        diff++;
+                    }
+                }
+                REQUIRE(diff == 0);
+            }
+            printf("[PASS] myds_metal_v41_gemv_bf16_shared2_type: %s bit-exact parity for tokens 0 & 1!\n", cases[c].desc);
+
+            // Test 4b: Through myds_v41_batch2_projection_probe
+            memset(myds_metal_buffer_data(test[0]), 0, out_bytes);
+            memset(myds_metal_buffer_data(test[1]), 0, out_bytes);
+            REQUIRE(myds_v41_batch2_projection_probe(test, w, in, out_dim, in_dim, GGML_TYPE_Q4_K, cases[c].kind));
+
+            for (int t = 0; t < 2; t++) {
+                const uint32_t *ref_u32 = (const uint32_t *)myds_metal_buffer_data(ref[t]);
+                const uint32_t *test_u32 = (const uint32_t *)myds_metal_buffer_data(test[t]);
+                int diff = 0;
+                for (uint32_t i = 0; i < out_dim; i++) {
+                    if (ref_u32[i] != test_u32[i]) {
+                        if (diff < 5) {
+                            printf("Batch2 Probe Mismatch [%s, tok %d] at %u: ref=0x%08x (%.6f) test=0x%08x (%.6f)\n",
+                                   cases[c].desc, t, i, ref_u32[i], *(float*)&ref_u32[i], test_u32[i], *(float*)&test_u32[i]);
+                        }
+                        diff++;
+                    }
+                }
+                REQUIRE(diff == 0);
+            }
+            printf("[PASS] myds_v41_batch2_projection_probe: %s bit-exact parity for tokens 0 & 1!\n", cases[c].desc);
+
+            myds_metal_buffer_free(w);
+            myds_metal_buffer_free(in[0]);
+            myds_metal_buffer_free(in[1]);
+            myds_metal_buffer_free(ref[0]);
+            myds_metal_buffer_free(ref[1]);
+            myds_metal_buffer_free(test[0]);
+            myds_metal_buffer_free(test[1]);
+        }
     }
 
     myds_metal_cleanup();

@@ -249,9 +249,13 @@ int myds_metal_v41_gemv_bf16(myds_metal_buffer_t *out,
  * Encoded counts dispatches, including those whose later commit may fail;
  * requests/failures count calls to this helper, not scalar bypasses. */
 int myds_metal_batch2_q8_shared_mode(void);
+int myds_metal_batch2_q4_shared_mode(void);
 int myds_metal_v41_gemv_bf16_shared2(myds_metal_buffer_t *const out[2],
     const myds_metal_buffer_t *weight, myds_metal_buffer_t *const input[2],
     uint32_t out_dim, uint32_t in_dim);
+int myds_metal_v41_gemv_bf16_shared2_type(myds_metal_buffer_t *const out[2],
+    const myds_metal_buffer_t *weight, myds_metal_buffer_t *const input[2],
+    uint32_t out_dim, uint32_t in_dim, ggml_type type);
 typedef struct {
     uint64_t requests, encoded, failures;
 } myds_metal_batch2_q8_shared_counters_t;

@@ -3686,18 +3686,26 @@ int myds_v41_batch2_projection_probe(myds_metal_buffer_t *out[2],
     myds_v41_batch2_projection_kind_t kind) {
     if (!out || !input || !weight || !out[0] || !out[1] || !input[0] || !input[1]) return 0;
     const bool trace_on = myds_trace_active();
-    if (kind == MYDS_V41_BATCH2_TAIL) {
-        const int shared = myds_metal_batch2_q8_shared_mode();
-        if (shared < 0) return 0;
-        if (shared && type == GGML_TYPE_Q8_0 && !trace_on &&
-            myds_v41_decode_q8_fuse_bf16_enabled()) {
-            const myds_metal_buffer_t *deps[] = {input[0], input[1]};
-            myds_metal_barrier_buffers(deps, 2);
-            if (!myds_metal_v41_gemv_bf16_shared2(out, weight, input, rows, width)) return 0;
-            const myds_metal_buffer_t *results[] = {out[0], out[1]};
-            myds_metal_barrier_buffers(results, 2);
-            return 1;
+    int shared_eligible = 0;
+    if (!trace_on) {
+        if (type == GGML_TYPE_Q8_0 && kind == MYDS_V41_BATCH2_TAIL) {
+            const int shared = myds_metal_batch2_q8_shared_mode();
+            if (shared < 0) return 0;
+            if (shared && myds_v41_decode_q8_fuse_bf16_enabled()) shared_eligible = 1;
+        } else if (type == GGML_TYPE_Q4_K &&
+                   (kind == MYDS_V41_BATCH2_TAIL || kind == MYDS_V41_BATCH2_QKV || kind == MYDS_V41_BATCH2_SHARED)) {
+            const int shared = myds_metal_batch2_q4_shared_mode();
+            if (shared < 0) return 0;
+            if (shared) shared_eligible = 1;
         }
+    }
+    if (shared_eligible) {
+        const myds_metal_buffer_t *deps[] = {input[0], input[1]};
+        myds_metal_barrier_buffers(deps, 2);
+        if (!myds_metal_v41_gemv_bf16_shared2_type(out, weight, input, rows, width, type)) return 0;
+        const myds_metal_buffer_t *results[] = {out[0], out[1]};
+        myds_metal_barrier_buffers(results, 2);
+        return 1;
     }
     for (uint32_t t = 0; t < 2; ++t) {
         myds_metal_barrier_buffer(input[t]);
