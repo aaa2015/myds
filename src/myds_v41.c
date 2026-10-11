@@ -4856,7 +4856,12 @@ static int v41_projection_shadow(myds_metal_buffer_t *out[3],
             if (a[i] != b[i]) { first_row = t; first_index = i; break; }
     }
     if (first_row < 3) {
-        int saved = mkdir(dir, 0700) == 0;
+        if (mkdir(dir, 0700)) {
+            MYDS_LOG_E("SHARED3_SHADOW requires a new payload directory: %s", dir);
+            for (unsigned t = 0; t < 3; ++t) myds_metal_buffer_free(ref[t]);
+            exit(87);
+        }
+        int saved = 1;
         const size_t row_bytes = type == GGML_TYPE_Q4_K ? (size_t)(width / 256u) * 144u :
             (size_t)(width / 32u) * 34u;
         saved &= v41_shared3_shadow_write(dir, "weight.bin",
@@ -4888,6 +4893,9 @@ static int v41_projection_shadow(myds_metal_buffer_t *out[3],
     for (unsigned t = 0; t < 3; ++t) myds_metal_buffer_free(ref[t]);
     return ok && myds_metal_begin_batch();
 }
+
+#include "myds_v41_shared3_gu_shadow.inc"
+#include "myds_v41_shared3_routed_shadow.inc"
 
 static int v41_three_row_projection(myds_metal_buffer_t *out[3],
     const myds_metal_buffer_t *weight, myds_metal_buffer_t *input[3],
@@ -5213,6 +5221,7 @@ static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *t
             CHECK(myds_v41_shared_gate_up_swiglu_shared3(ws->v_shared_swiglu,
                 base->shared_gate, base->shared_up, ws->v_ffn_norm, 2304, V41_DIM,
                 base->shared_gate_type, base->shared_up_type, m->swiglu_clamp_exp));
+            CHECK(v41_shared3_gu_shadow(ws, base, m, pos, il));
         } else for (uint32_t row = 0; row < 3; ++row) {
             if (shared_fused) {
                 CHECK(myds_v41_shared_gate_up_swiglu(ws->v_shared_swiglu[row],
@@ -5247,6 +5256,7 @@ static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *t
                 ws->selected_ids_b2, ws->selected_w_b2, ws->moe_mid_b2,
                 V41_DIM, 2304, 384, base->ffn_gate_exps_type,
                 base->ffn_up_exps_type, base->ffn_down_exps_type, m->swiglu_clamp_exp));
+            CHECK(v41_shared3_routed_shadow(ws, base, m, pos, il));
         } else CHECK(myds_metal_routed_moe_batch(ws->moe_out_b2, ws->ffn_norm_b2,
                                           base->ffn_gate_exps, base->ffn_up_exps, base->ffn_down_exps,
                                           ws->selected_ids_b2, ws->selected_w_b2,

@@ -216,6 +216,114 @@ static void dependency_chain(ggml_type type) {
     for(unsigned t=0;t<3;t++) {equal(myds_metal_buffer_data(ref[t].view),myds_metal_buffer_data(out[t].view),256,"dependency_chain",t,&f);release(ref[t]);release(out[t]);}
     printf("{\"kind\":\"dependency_chain\",\"type\":%d,\"concurrent\":%d,\"auto_barrier\":%d,\"raw_war_same_cb\":true,\"native_shared_dispatches\":3,\"bit_exact\":true}\n",type,myds_metal_get_concurrent(),myds_metal_get_auto_barrier());free_fixture(&f);
 }
+static NSDictionary *replay_file(NSString *directory,NSString *name,void *destination,size_t bytes) {
+    NSString *path=[directory stringByAppendingPathComponent:name];
+    NSData *data=[NSData dataWithContentsOfFile:path];
+    if(!data||data.length!=bytes)fprintf(stderr,"REPLAY file=%s expected=%zu actual=%zu\n",path.UTF8String,bytes,(size_t)data.length);
+    REQUIRE(data&&data.length==bytes);memcpy(destination,data.bytes,bytes);
+    uint64_t h=UINT64_C(14695981039346656037);const uint8_t *p=data.bytes;
+    for(size_t i=0;i<bytes;i++){h^=p[i];h*=UINT64_C(1099511628211);}
+    return @{@"file":path,@"bytes":@(bytes),@"fnv1a64":[NSString stringWithFormat:@"%016" PRIx64,h]};
+}
+static uint32_t replay_u32(NSDictionary *metadata,NSString *key) {
+    id value=metadata[key];REQUIRE([value isKindOfClass:NSNumber.class]);
+    REQUIRE(CFGetTypeID((__bridge CFTypeRef)value)!=CFBooleanGetTypeID());
+    double number=[value doubleValue];REQUIRE(isfinite(number)&&number>0&&number<=INT32_MAX&&floor(number)==number);
+    return (uint32_t)number;
+}
+static uint32_t float_order(uint32_t bits){return bits&0x80000000u?~bits:bits^0x80000000u;}
+static NSDictionary *replay_compare(const float *reference,const float *output,const float *unrounded,
+    uint32_t count,NSString *role,unsigned token) {
+    uint64_t mismatches=0,max_ulp=0;uint32_t first=UINT32_MAX,first_ref=0,first_output=0;
+    double max_abs=0;bool finite=true,bf16=true;
+    for(uint32_t i=0;i<count;i++) {
+        uint32_t a,b;memcpy(&a,reference+i,4);memcpy(&b,output+i,4);
+        finite=finite&&isfinite(reference[i])&&isfinite(output[i]);bf16=bf16&&!(a&0xffffu)&&!(b&0xffffu);
+        if(a!=b){mismatches++;if(first==UINT32_MAX){first=i;first_ref=a;first_output=b;}}
+        uint32_t oa=float_order(a),ob=float_order(b);uint64_t ulp=oa>ob?(uint64_t)oa-ob:(uint64_t)ob-oa;
+        if(ulp>max_ulp)max_ulp=ulp;
+        double diff=fabs((double)reference[i]-output[i]);if(isfinite(diff)&&diff>max_abs)max_abs=diff;
+    }
+    NSMutableDictionary *result=[@{@"role":role,@"token":@(token),@"floats":@(count),
+        @"mismatches":@(mismatches),@"bit_exact":@(mismatches==0),@"finite":@(finite),
+        @"bf16":@(bf16),@"max_abs":@(max_abs),@"max_f32_ulp":@(max_ulp)} mutableCopy];
+    if(first!=UINT32_MAX) {
+        result[@"first_index"]=@(first);result[@"first_reference_bits"]=[NSString stringWithFormat:@"%08x",first_ref];
+        result[@"first_output_bits"]=[NSString stringWithFormat:@"%08x",first_output];
+        if(unrounded){uint32_t raw;memcpy(&raw,unrounded+first,4);
+            result[@"generic_scalar_unrounded_bits"]=[NSString stringWithFormat:@"%08x",raw];
+            result[@"generic_scalar_distance_to_bf16_midpoint_f32_ulps"]=@(abs((int)(raw&0xffffu)-0x8000));}
+    }
+    return result;
+}
+/* Replay an archived projection without loading a model. Metadata supplies
+ * rows/width/type; every file is checked against its exact logical size.
+ * Saved output pairs are optional as a complete six-file group. A saved
+ * mismatch is a diagnostic failure, even when this device's kernels agree. */
+static int replay_projection(const char *directory) {
+    @autoreleasepool {
+        NSString *dir=[NSString stringWithUTF8String:directory];
+        NSData *json=[NSData dataWithContentsOfFile:[dir stringByAppendingPathComponent:@"metadata.json"]];REQUIRE(json);
+        id object=[NSJSONSerialization JSONObjectWithData:json options:0 error:nil];REQUIRE([object isKindOfClass:NSDictionary.class]);
+        NSDictionary *metadata=object;uint32_t rows=replay_u32(metadata,@"rows"),width=replay_u32(metadata,@"width");
+        ggml_type type=(ggml_type)replay_u32(metadata,@"type");REQUIRE(type==GGML_TYPE_Q4_K||type==GGML_TYPE_Q8_0);
+        REQUIRE(rows<=INT32_MAX-7u&&width%(type==GGML_TYPE_Q4_K?256u:32u)==0);
+        struct fixture f;init_fixture(&f,rows,width,type,0,1);
+        NSMutableArray *files=[NSMutableArray new],*checks=[NSMutableArray new];
+        [files addObject:replay_file(dir,@"weight.bin",myds_metal_buffer_data(f.weight.view),f.weight.bytes)];
+        for(unsigned t=0;t<3;t++) {
+            [files addObject:replay_file(dir,[NSString stringWithFormat:@"input-%u.f32",t],myds_metal_buffer_data(f.in[t].view),f.in[t].bytes)];
+            const float *input=myds_metal_buffer_data(f.in[t].view);for(uint32_t i=0;i<width;i++)REQUIRE(isfinite(input[i]));
+        }
+        myds_metal_set_concurrent(0);myds_metal_set_auto_barrier(1);reference(&f);
+        struct guarded raw[3];for(unsigned t=0;t<3;t++) {
+            raw[t]=allocate((size_t)rows*4,16);
+            REQUIRE(myds_metal_begin_batch());REQUIRE(myds_metal_gemv(raw[t].view,f.weight.view,f.in[t].view,rows,width,type));REQUIRE(myds_metal_commit_batch());
+        }
+        unsigned saved_count=0;
+        for(unsigned t=0;t<3;t++)for(NSString *role in @[@"scalar",@"candidate"])
+            saved_count+=[[NSFileManager defaultManager]fileExistsAtPath:[dir stringByAppendingPathComponent:[NSString stringWithFormat:@"%@-%u.f32",role,t]]]?1u:0u;
+        REQUIRE(saved_count==0||saved_count==6);bool pass=true;float *saved_candidate[3]={NULL,NULL,NULL};
+        if(saved_count) for(unsigned t=0;t<3;t++) {
+            float *a=malloc((size_t)rows*4),*b=malloc((size_t)rows*4);REQUIRE(a&&b);
+            [files addObject:replay_file(dir,[NSString stringWithFormat:@"scalar-%u.f32",t],a,(size_t)rows*4)];
+            [files addObject:replay_file(dir,[NSString stringWithFormat:@"candidate-%u.f32",t],b,(size_t)rows*4)];
+            const float *unrounded=myds_metal_buffer_data(raw[t].view);
+            NSDictionary *ab=replay_compare(a,b,unrounded,rows,@"archived_scalar_vs_candidate",t);[checks addObject:ab];
+            NSDictionary *ar=replay_compare(a,myds_metal_buffer_data(f.ref[t].view),unrounded,rows,@"archived_scalar_vs_local_scalar",t);[checks addObject:ar];
+            pass=pass&&[ab[@"bit_exact"]boolValue]&&[ab[@"finite"]boolValue]&&[ab[@"bf16"]boolValue]&&
+                [ar[@"bit_exact"]boolValue]&&[ar[@"finite"]boolValue]&&[ar[@"bf16"]boolValue];free(a);saved_candidate[t]=b;
+        }
+        myds_metal_shared3_counters_t before,after;myds_metal_shared3_counters(&before,false);uint64_t dispatch=myds_metal_dispatch_count();
+        for(unsigned concurrent=0;concurrent<2;concurrent++)for(unsigned automatic=0;automatic<2;automatic++) {
+            myds_metal_set_concurrent((int)concurrent);myds_metal_set_auto_barrier((int)automatic);reset(&f);
+            REQUIRE(myds_metal_begin_batch());REQUIRE(candidate(&f));REQUIRE(myds_metal_commit_batch());
+            for(unsigned t=0;t<3;t++) {
+                NSString *role=[NSString stringWithFormat:@"local_scalar_vs_shared3_concurrent%u_auto%u",concurrent,automatic];
+                NSDictionary *check=replay_compare(myds_metal_buffer_data(f.ref[t].view),myds_metal_buffer_data(f.out[t].view),myds_metal_buffer_data(raw[t].view),rows,role,t);
+                [checks addObject:check];pass=pass&&[check[@"bit_exact"]boolValue]&&[check[@"finite"]boolValue]&&[check[@"bf16"]boolValue];
+                if(saved_count) {
+                    NSString *saved_role=[NSString stringWithFormat:@"archived_candidate_vs_local_shared3_concurrent%u_auto%u",concurrent,automatic];
+                    NSDictionary *saved_check=replay_compare(saved_candidate[t],myds_metal_buffer_data(f.out[t].view),myds_metal_buffer_data(raw[t].view),rows,saved_role,t);
+                    [checks addObject:saved_check];pass=pass&&[saved_check[@"bit_exact"]boolValue]&&[saved_check[@"finite"]boolValue]&&[saved_check[@"bf16"]boolValue];
+                }
+            }
+        }
+        if(type==GGML_TYPE_Q4_K)for(unsigned t=0;t<3;t++) {
+            NSDictionary *check=replay_compare(myds_metal_buffer_data(f.ref[t].view),myds_metal_buffer_data(f.separate[t].view),myds_metal_buffer_data(raw[t].view),rows,@"local_scalar_vs_separate_gemv_bf16",t);
+            [checks addObject:check];pass=pass&&[check[@"bit_exact"]boolValue]&&[check[@"finite"]boolValue]&&[check[@"bf16"]boolValue];
+        }
+        myds_metal_shared3_counters(&after,false);REQUIRE(after.requests-before.requests==4&&after.encoded-before.encoded==4&&after.failures==before.failures);
+        REQUIRE(after.q4_encoded-before.q4_encoded==(type==GGML_TYPE_Q4_K?4u:0u)&&after.q8_encoded-before.q8_encoded==(type==GGML_TYPE_Q8_0?4u:0u));
+        REQUIRE(myds_metal_dispatch_count()-dispatch==4);
+        for(unsigned t=0;t<3;t++){free(saved_candidate[t]);release(raw[t]);}free_fixture(&f);
+        NSDictionary *result=@{@"kind":@"projection_replay",@"device":g_device.name,@"directory":dir,
+            @"metadata":metadata,@"files":files,@"checks":checks,@"native_shared_dispatches":@4,
+            @"archived_output_pair_present":@(saved_count==6),@"fixture_not_fullmodel":@YES,@"pass":@(pass)};
+        NSData *output=[NSJSONSerialization dataWithJSONObject:result options:0 error:nil];REQUIRE(output);
+        fwrite(output.bytes,1,output.length,stdout);putchar('\n');return pass?0:1;
+    }
+}
 static int child(const char *program,unsigned row) {
     @autoreleasepool { NSTask *task=[NSTask new];task.executableURL=[NSURL fileURLWithPath:[NSString stringWithUTF8String:program]];
         task.arguments=@[@"--nr0",[NSString stringWithFormat:@"%u",row],@"--shader-dir",[NSString stringWithUTF8String:shader_dir]];
@@ -223,17 +331,20 @@ static int child(const char *program,unsigned row) {
 }
 int main(int argc,char **argv) {
     unsigned stress=0;
+    const char *replay=NULL;
     for(int i=1;i<argc;i++) {
         if(!strcmp(argv[i],"--shader-dir")&&i+1<argc)shader_dir=argv[++i];
         else if(!strcmp(argv[i],"--nr0")&&i+1<argc){nr=(unsigned)strtoul(argv[++i],NULL,10);REQUIRE(nr==2||nr==4);}
         else if(!strcmp(argv[i],"--stress")&&i+1<argc){stress=(unsigned)strtoul(argv[++i],NULL,10);REQUIRE(stress>0&&stress<=512);}
-        else {fprintf(stderr,"usage: %s [--shader-dir DIR] [--nr0 2|4] [--stress COUNT]\n",argv[0]);return 2;}
+        else if(!strcmp(argv[i],"--replay")&&i+1<argc)replay=argv[++i];
+        else {fprintf(stderr,"usage: %s [--shader-dir DIR] [--nr0 2|4] [--stress COUNT | --replay DIR]\n",argv[0]);return 2;}
     }
-    if(stress&&!nr)nr=4;
+    REQUIRE(!stress||!replay);if((stress||replay)&&!nr)nr=4;
     if(!nr){REQUIRE(!child(argv[0],2));REQUIRE(!child(argv[0],4));puts("{\"kind\":\"suite_complete\",\"nr_processes\":2,\"pass\":true}");return 0;}
     char text[8];snprintf(text,sizeof(text),"%u",nr);setenv("MYDS_QKV_NR0",text,1);setenv("MYDS_METAL_CONCURRENT","0",1);
     REQUIRE(myds_metal_init(shader_dir));myds_metal_shared3_counters(NULL,true);
     printf("{\"kind\":\"identity\",\"device\":\"%s\",\"nr0\":%u,\"fixture_not_fullmodel\":true}\n",g_device.name.UTF8String,nr);
+    if(replay){int status=replay_projection(replay);myds_metal_cleanup();return status;}
     if(stress) {
         for(unsigned i=0;i<stress;i++) {
             myds_metal_set_concurrent((int)((i/2u)%2u));myds_metal_set_auto_barrier((int)(i%2u));
