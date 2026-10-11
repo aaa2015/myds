@@ -3015,6 +3015,7 @@ static int myds_generate_internal(myds_context_t *ctx,
     }
     myds_model_t *m = ctx->model;
     memset(&ctx->decode_stats, 0, sizeof(ctx->decode_stats));
+    myds_dspark_reset_proposal_state(ctx->dspark);
     ctx->decode_metrics_active = false;
     ctx->decode_cycle_open = false;
     ctx->decode_target_ms = 0.0;
@@ -3516,7 +3517,9 @@ static int myds_generate_internal(myds_context_t *ctx,
                 continue;
             }
 
-            uint32_t draft_cap = ctx->dspark ? ctx->dspark->block_size : (ctx->v41 ? 1 : 4);
+            /* The V4.1 verifier consumes one continuation position; its A/B
+             * tree candidates are alternatives at that position. */
+            uint32_t draft_cap = ctx->v41 ? 1 : (ctx->dspark ? ctx->dspark->block_size : 4);
             if (draft_cap > max_gen - step) draft_cap = max_gen - step;
 
             int32_t cand_a = -1, cand_b = -1;

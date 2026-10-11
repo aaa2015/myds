@@ -144,6 +144,23 @@ static void metric(FILE *out, const char *key, bool valid, double value) {
     if (valid) fprintf(out, "%.9f", value); else fputs("null", out);
 }
 
+/* Diagnostic opt-in, read after generation's waits and outside the timed
+ * interval. Keep raw floats for investigating a rejected hash gate; never
+ * overwrite an earlier run and do not weaken the native validity check. */
+static bool export_logits(uint32_t run, const float *logits, uint32_t count) {
+    const char *dir = getenv("MYDS_BENCH_LOGITS_DIR");
+    if (!dir) return true;
+    if (!*dir || !logits) return false;
+    char path[4096];
+    int n = snprintf(path, sizeof(path), "%s/run-%u.f32", dir, run);
+    if (n < 0 || (size_t)n >= sizeof(path)) return false;
+    FILE *f = fopen(path, "wbx");
+    if (!f) { perror(path); return false; }
+    bool ok = fwrite(logits, sizeof(*logits), count, f) == count;
+    if (fclose(f) != 0) ok = false;
+    return ok;
+}
+
 static void decode_metrics(FILE *json, myds_context_t *ctx) {
     myds_decode_stats_t ds = {0};
     myds_last_decode_stats(ctx, &ds);
@@ -424,6 +441,9 @@ int main(int argc, char **argv) {
                 if (!isfinite(logits[i])) logits_finite = false;
                 logits_hash = hash_bytes(logits_hash, logits + i, sizeof(*logits));
             }
+        }
+        if (!export_logits(run, logits, model->vocab_size)) {
+            fputs("Final logits diagnostic export failed\n", stderr); status = 1; break;
         }
         /* Resolve available profiler records only after generation's existing waits.
          * This export is deliberately outside the measured request wall interval. */

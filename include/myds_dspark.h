@@ -224,6 +224,7 @@ struct myds_dspark {
     int32_t current_seed_token;
     uint32_t current_seed_position;
     uint32_t current_output_slot; // 1 when the Engine has already emitted slot 0
+    uint32_t current_output_count; // Requested continuation slots for this proposal
     int32_t draft_tokens[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
     uint32_t draft_count;
 
@@ -261,6 +262,11 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size);
 
 /* Free DSpark support model resources */
 void myds_dspark_free(myds_dspark_t *ds);
+
+/* Begin each Engine request with fresh proposal scheduling and availability.
+ * This preserves accumulated statistics, model/Markov/noise resources,
+ * capture policy and buffers, and authoritative target state. */
+void myds_dspark_reset_proposal_state(myds_dspark_t *ds);
 
 /* Capture target layer hidden state (layer 37, 38, or 39) from residual HC streams */
 void myds_dspark_capture_layer(myds_dspark_t *ds, uint32_t layer_idx, const myds_metal_buffer_t *residual);
@@ -306,6 +312,14 @@ uint32_t myds_dspark_propose_next(myds_dspark_t *ds, myds_context_t *ctx,
  * and current_output_slot set by the proposer. Returns 0 on rejection/failure:
  * a confidence rejection publishes its finite score, encoding failure NAN. */
 int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_conf, float *out_confidence);
+
+/* Explicit prefix evaluation for parity probes and limited-depth proposals.
+ * Encodes all stage slots [0, first_slot + count), because later slots depend
+ * on earlier HC/KV rows; collapses and projects only [first_slot, first_slot +
+ * count). current_output_slot must lie in that requested range. The ordinary
+ * eval_stages API always evaluates and projects all five diagnostic slots. */
+int myds_dspark_eval_stages_prefix(myds_dspark_t *ds, myds_context_t *ctx,
+    float min_conf, float *out_confidence, uint32_t first_slot, uint32_t count);
 
 /* Propose Top-2 tree branches for tree-based speculative decoding */
 uint32_t myds_dspark_propose_tree(myds_dspark_t *ds, myds_context_t *ctx, int32_t last_token);

@@ -500,8 +500,8 @@ static void test_decode_request_metrics(void) {
     assert(stats.backoff_steps >= 16 && stats.output_tokens == budgeted.count);
     for (uint32_t i = 0; i < budgeted.count; ++i) assert(budgeted.tokens[i] == 0);
     assert(!myds_last_decode_cycle(ctx, 0, &missing));
-    /* Real target generation with a deliberately backed-off drafter exercises
-     * PLD A fallback. Its stale neural draft must never receive acceptance. */
+    /* A drafter without neural weights exercises PLD A fallback after request
+     * initialization clears stale scheduler state and candidate availability. */
     assert(setenv("MYDS_SPEC_COST_SCHEDULER", "0", 1) == 0);
     ctx->dspark = calloc(1, sizeof(*ctx->dspark));
     assert(ctx->dspark);
@@ -515,6 +515,7 @@ static void test_decode_request_metrics(void) {
     assert(stats.draft_proposed == 0 && stats.draft_accepted == 0);
     assert(stats.pld_accepted > 0 && stats.pld_accepted <= stats.pld_proposed);
     assert(ctx->dspark->accepted_tokens == 0 && ctx->dspark->consecutive_misses == 0);
+    assert(ctx->dspark->backoff_counter == 0);
     for (uint32_t i = 0; i < pld_fallback.count; ++i) assert(pld_fallback.tokens[i] == 0);
     assert(!myds_generate_bytes_ex(ctx, NULL, capture_decode_test, &budgeted, &reason, NULL, NULL));
     assert(reason == MYDS_STOP_ERROR);

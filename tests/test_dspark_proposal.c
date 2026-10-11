@@ -162,6 +162,42 @@ static void neural_contract(void) {
          "\"backoff_and_eval_failure_unpublished\":true,\"zero_position_guard\":true,"
          "\"neural_gpu_arithmetic_verified\":false,\"pass\":true}");
 }
+static void request_reset_contract(void) {
+    fixture_t f;init(&f,true);stale(&f.ds);
+    memset(f.logits,0,sizeof(f.logits));
+    f.ctx.v41=(myds_v41_context_t *)(uintptr_t)1;
+    f.ds.consecutive_misses=4u;f.ds.backoff_counter=8u;
+    f.ds.cycles=31u;f.ds.proposed_tokens=47u;f.ds.accepted_tokens=13u;
+    f.ds.propose_ms=12.5;f.ds.verify_ms=23.5;
+    f.ds.current_seed_token=1;f.ds.current_seed_position=22u;
+    f.ds.current_output_slot=1u;f.ds.current_output_count=4u;
+    f.ds.noise_hc=(myds_metal_buffer_t *)(uintptr_t)3;
+    f.ds.noise_hc_initialized=true;
+    f.ds.capture_configured=true;f.ds.capture_bypass_mode=true;
+    f.ds.capture_valid_mask=7u;f.ds.capture_committed=true;
+    f.ds.capture_counters=(myds_dspark_capture_counters_t){.requests=19u,.encoded=17u};
+    f.state[0]=3.0f;f.bias[0]=4.0f;
+
+    /* Comparing the complete fixture proves reset touches only these five
+     * fields, including when a continuation keeps capture and target state.
+     * No Metal mapping/allocation or neural evaluation is needed by reset. */
+    fixture_t expected;memcpy(&expected,&f,sizeof(expected));
+    expected.ds.consecutive_misses=expected.ds.backoff_counter=0u;
+    expected.ds.draft_count=expected.ds.draft_tree_count=0u;
+    expected.ds.is_high_confidence=false;
+    const unsigned before_eval=eval_calls;
+    myds_dspark_reset_proposal_state(NULL);
+    myds_dspark_reset_proposal_state(&f.ds);
+    assert(eval_calls==before_eval&&!memcmp(&f,&expected,sizeof(f)));
+    myds_dspark_reset_proposal_state(&f.ds);
+    assert(eval_calls==before_eval&&!memcmp(&f,&expected,sizeof(f)));
+    assert(myds_dspark_propose_next(&f.ds,&f.ctx,1,4,1)==1u);
+    assert(eval_calls==before_eval+1u&&f.ds.cycles==32u&&f.ds.proposed_tokens==48u);
+    assert(f.ds.accepted_tokens==13u&&f.ds.draft_tokens[0]==6);
+    puts("{\"kind\":\"host_dspark_request_reset_contract\",\"scheduler_and_availability_only\":true,"
+         "\"cumulative_counts_and_target_capture_preserved\":true,\"reset_eval_calls\":0,"
+         "\"stale_backoff_no_longer_suppresses_request\":true,\"gpu_arithmetic_verified\":false,\"pass\":true}");
+}
 static void metadata_u32(FILE *file,uint32_t value) { assert(fwrite(&value,4,1,file)==1); }
 static void metadata_u64(FILE *file,uint64_t value) { assert(fwrite(&value,8,1,file)==1); }
 static void metadata_string(FILE *file,const char *value) {
@@ -199,6 +235,6 @@ static void metadata_rejection_contract(void) {
 int main(int argc,char **argv) {
     const bool markov_only=argc==2&&!strcmp(argv[1],"--markov-only");
     assert(argc==1||markov_only);environment(markov_only);
-    if(markov_only)markov_only_contract();else {neural_contract();metadata_rejection_contract();}
+    if(markov_only)markov_only_contract();else {neural_contract();request_reset_contract();metadata_rejection_contract();}
     return 0;
 }

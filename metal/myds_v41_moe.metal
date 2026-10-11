@@ -105,7 +105,10 @@ kernel void kernel_myds_v41_route_finish(
     if (tid == 0 && denominator) denominator[t] = denom;
     if (tid < args.top_k) {
         weights[t * args.top_k + tid] = p / denom;
-        threadgroup_barrier(mem_flags::mem_device);
+    }
+    // Preserve the F32 divide/store/load/scale boundary for every threadgroup.
+    threadgroup_barrier(mem_flags::mem_device);
+    if (tid < args.top_k) {
         weights[t * args.top_k + tid] = weights[t * args.top_k + tid] * args.scale;
     }
 }
@@ -214,7 +217,11 @@ kernel void kernel_myds_v41_route_fused(
 
     if (tid < top_k) {
         weights[t * top_k + tid] = p / denom;
-        threadgroup_barrier(mem_flags::mem_device);
+    }
+    // All 512 threads must reach the barrier, including the 506 inactive lanes.
+    // Keep divide -> device F32 store -> load -> scale in the original order.
+    threadgroup_barrier(mem_flags::mem_device);
+    if (tid < top_k) {
         weights[t * top_k + tid] = weights[t * top_k + tid] * args.scale;
     }
 }

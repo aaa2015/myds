@@ -255,6 +255,125 @@ static int neural_failure_probe(myds_context_t *ctx) {
     free(a);free(b);free(target);free(w_before);free(w_after);return 1;
 }
 
+/* Compare actual full and minimal neural graphs on the same captured input.
+ * This is a bitwise/dispatch gate. It does not measure end-to-end speed. */
+static int neural_prefix_probe(myds_context_t *ctx) {
+    myds_dspark_t *ds=ctx->dspark;
+    CHECK(ds&&ds->ws&&ds->noise_hc_initialized&&ctx->pos>0&&ctx->pcache_tokens&&
+        ctx->pcache_len>=ctx->pos&&myds_dspark_capture_ready(ds)&&myds_metal_commit_batch());
+    const myds_context_t original_ctx=*ctx;
+    const myds_dspark_t original_ds=*ds;
+    const int original_barrier=myds_metal_get_auto_barrier();
+    const char *old_env=getenv("MYDS_DSPARK_EVAL_PREFIX");
+    char *saved_env=old_env?strdup(old_env):NULL;CHECK(!old_env||saved_env);
+    const size_t logits_bytes=(size_t)ctx->model->vocab_size*sizeof(float);
+    float *target=malloc(logits_bytes);CHECK(target);
+    memcpy(target,myds_metal_buffer_data(ctx->logits),logits_bytes);
+    float slots[3u*DIM];memcpy(slots,myds_metal_buffer_data(ds->target_hidden_buf),sizeof(slots));
+    float markov[MYDS_DSPARK_MARKOV_RANK],proposal_markov[MYDS_DSPARK_MARKOV_RANK];
+    const bool have_markov=ds->markov_state_host!=NULL;
+    if(have_markov)memcpy(markov,ds->markov_state_host,sizeof(markov));
+    myds_v41_spec_snapshot_t *before=calloc(1,sizeof(*before)),*after=calloc(1,sizeof(*after));CHECK(before&&after);
+    CHECK(myds_v41_spec_snapshot_save(ctx,before,1));
+    float *window_before=NULL,*window_after=NULL;size_t n_before=0,n_after=0;
+    CHECK(windows(ctx,&window_before,&n_before));
+    const int32_t consumed=ctx->pcache_tokens[ctx->pos-1u];
+    int32_t emitted=0;
+    for(uint32_t i=1;i<ctx->model->vocab_size;i++)if(target[i]>target[emitted])emitted=(int32_t)i;
+    ds->current_seed_token=consumed;ds->current_seed_position=ctx->pos-1u;ds->current_output_slot=1u;
+    ds->backoff_counter=0;
+    /* Proposal publication is restored separately, and must not enter the
+     * completed request's telemetry during this diagnostic comparison. */
+    ctx->decode_metrics_active=false;
+    const myds_context_t ready_ctx=*ctx;
+    const myds_dspark_t ready_ds=*ds;
+    myds_metal_buffer_t *buffers[4]={ds->ws->v_stage_draft_hc[1],ds->ws->v_final_embd[1],
+        ds->ws->v_final_norm_out[1],ds->ws->v_logits[1]};
+    const size_t bytes[4]={4u*DIM*sizeof(float),DIM*sizeof(float),DIM*sizeof(float),logits_bytes};
+    const char *roles[4]={"stage_hidden","final_embd","final_norm","logits"};
+    void *reference[4]={0};
+    for(unsigned i=0;i<4;i++){CHECK(buffers[i]&&myds_metal_buffer_size(buffers[i])>=bytes[i]);reference[i]=malloc(bytes[i]);CHECK(reference[i]);}
+    fprintf(report,"{\"schema_version\":1,\"kind\":\"neural_prefix_probe\",\"fixture_revision\":2,\"engine_mode\":%d,"
+        "\"seed_token\":%d,\"seed_position\":%u,\"output_slot\":1,\"full_slots\":5,\"prefix_stage_slots\":2,"
+        "\"prefix_kv_rows\":3,\"prefix_lm_head_first\":1,\"prefix_lm_head_count\":1,\"caller_auto_barriers\":[0,1],\"comparisons\":[",
+        myds_dspark_engine_capture_bypass_enabled(ds),consumed,ctx->pos-1u);
+    for(int barrier=0;barrier<=1;barrier++) {
+        myds_metal_set_auto_barrier(barrier);*ds=ready_ds;
+        if(have_markov)memcpy(ds->markov_state_host,markov,sizeof(markov));
+        float full_confidence=NAN,prefix_confidence=NAN;
+        uint64_t dispatch=myds_metal_dispatch_count();
+        CHECK(myds_dspark_eval_stages(ds,ctx,0.0f,&full_confidence)==1&&myds_metal_commit_batch());
+        const uint64_t full_dispatches=myds_metal_dispatch_count()-dispatch;
+        CHECK(full_dispatches>0&&isfinite(full_confidence)&&myds_metal_get_auto_barrier()==barrier&&
+            !memcmp(&ready_ctx,ctx,sizeof(ready_ctx))&&!memcmp(&ready_ds,ds,sizeof(ready_ds)));
+        const float *full_logits=myds_metal_buffer_data(ds->draft_logits_buf);CHECK(full_logits);
+        for(size_t i=0;i<5u*(size_t)ctx->model->vocab_size;i++)CHECK(isfinite(full_logits[i]));
+        for(unsigned i=0;i<4;i++)memcpy(reference[i],myds_metal_buffer_data(buffers[i]),bytes[i]);
+        /* A minimal graph must overwrite slot 1 and leave every other LM-head
+         * slot untouched. NaNs make accidental use of a skipped head visible. */
+        float *draft=myds_metal_buffer_data(ds->draft_logits_buf);CHECK(draft);
+        for(size_t i=0;i<5u*(size_t)ctx->model->vocab_size;i++)draft[i]=NAN;
+        dispatch=myds_metal_dispatch_count();
+        CHECK(myds_dspark_eval_stages_prefix(ds,ctx,0.0f,&prefix_confidence,1u,1u)==1&&myds_metal_commit_batch());
+        const uint64_t prefix_dispatches=myds_metal_dispatch_count()-dispatch;
+        CHECK(prefix_dispatches>0&&prefix_dispatches<full_dispatches&&
+            !memcmp(&full_confidence,&prefix_confidence,sizeof(float))&&myds_metal_get_auto_barrier()==barrier&&
+            !memcmp(&ready_ctx,ctx,sizeof(ready_ctx))&&!memcmp(&ready_ds,ds,sizeof(ready_ds)));
+        for(unsigned i=0;i<4;i++) {
+            const float *out=myds_metal_buffer_data(buffers[i]);CHECK(out&&!memcmp(reference[i],out,bytes[i]));
+            for(size_t j=0;j<bytes[i]/sizeof(float);j++)CHECK(isfinite(out[j]));
+        }
+        for(size_t i=0;i<5u*(size_t)ctx->model->vocab_size;i++)
+            CHECK(i>=ctx->model->vocab_size&&i<2u*(size_t)ctx->model->vocab_size?isfinite(draft[i]):isnan(draft[i]));
+
+        *ds=ready_ds;if(have_markov)memcpy(ds->markov_state_host,markov,sizeof(markov));
+        CHECK(setenv("MYDS_DSPARK_EVAL_PREFIX","0",1)==0);
+        dispatch=myds_metal_dispatch_count();
+        const uint32_t full_count=myds_dspark_propose_next(ds,ctx,consumed,emitted,1u);
+        CHECK(myds_metal_commit_batch());
+        const uint64_t full_proposal_dispatches=myds_metal_dispatch_count()-dispatch;
+        const myds_dspark_t full_proposal=*ds;
+        if(have_markov)memcpy(proposal_markov,ds->markov_state_host,sizeof(proposal_markov));
+        *ds=ready_ds;if(have_markov)memcpy(ds->markov_state_host,markov,sizeof(markov));
+        CHECK(setenv("MYDS_DSPARK_EVAL_PREFIX","1",1)==0);
+        dispatch=myds_metal_dispatch_count();
+        const uint32_t prefix_count=myds_dspark_propose_next(ds,ctx,consumed,emitted,1u);
+        CHECK(myds_metal_commit_batch());
+        const uint64_t prefix_proposal_dispatches=myds_metal_dispatch_count()-dispatch;
+        CHECK(full_count==1u&&prefix_count==1u&&ds->draft_count==full_proposal.draft_count&&
+            ds->draft_tokens[0]==full_proposal.draft_tokens[0]&&ds->draft_tree_count==full_proposal.draft_tree_count&&
+            ds->draft_tree_count==2u&&!memcmp(ds->draft_tree_tokens,full_proposal.draft_tree_tokens,sizeof(ds->draft_tree_tokens))&&
+            !memcmp(ds->draft_tree_scores,full_proposal.draft_tree_scores,sizeof(ds->draft_tree_scores))&&
+            ds->is_high_confidence==full_proposal.is_high_confidence&&ds->cycles==full_proposal.cycles&&
+            ds->proposed_tokens==full_proposal.proposed_tokens&&ds->accepted_tokens==full_proposal.accepted_tokens&&
+            ds->consecutive_misses==full_proposal.consecutive_misses&&ds->backoff_counter==full_proposal.backoff_counter&&
+            (!have_markov||!memcmp(proposal_markov,ds->markov_state_host,sizeof(proposal_markov)))&&
+            full_proposal_dispatches>prefix_proposal_dispatches&&prefix_proposal_dispatches>0&&
+            myds_metal_get_auto_barrier()==barrier&&!memcmp(&ready_ctx,ctx,sizeof(ready_ctx)));
+        fprintf(report,"%s{\"caller_auto_barrier\":%d,\"full_dispatches\":%" PRIu64 ",\"prefix_dispatches\":%" PRIu64 ","
+            "\"full_confidence\":%.9g,\"prefix_confidence\":%.9g,\"full_all_logits_finite\":true,\"prefix_other_logits_nan\":true,"
+            "\"slot1_outputs_bitwise_equal\":true,\"proposal_bitwise_equal\":true,\"caller_auto_barrier_restored\":true,"
+            "\"full_proposal_count\":%u,\"prefix_proposal_count\":%u,\"candidate\":%d,\"tree\":[%d,%d],"
+            "\"full_proposal_dispatches\":%" PRIu64 ",\"prefix_proposal_dispatches\":%" PRIu64 ",\"slot1_fnv1a64\":{",
+            barrier?",":"",barrier,full_dispatches,prefix_dispatches,full_confidence,prefix_confidence,full_count,prefix_count,
+            ds->draft_tokens[0],ds->draft_tree_tokens[0],ds->draft_tree_tokens[1],full_proposal_dispatches,prefix_proposal_dispatches);
+        for(unsigned i=0;i<4;i++)fprintf(report,"%s\"%s\":\"%016" PRIx64 "\"",i?",":"",roles[i],fnv(reference[i],bytes[i]));
+        fputs("}}",report);
+    }
+    *ds=original_ds;if(have_markov)memcpy(ds->markov_state_host,markov,sizeof(markov));
+    *ctx=original_ctx;myds_metal_set_auto_barrier(original_barrier);
+    CHECK((saved_env?setenv("MYDS_DSPARK_EVAL_PREFIX",saved_env,1):unsetenv("MYDS_DSPARK_EVAL_PREFIX"))==0);
+    CHECK(myds_v41_spec_snapshot_save(ctx,after,1)&&!memcmp(before,after,sizeof(*before))&&
+        windows(ctx,&window_after,&n_after)&&n_before==n_after&&!memcmp(window_before,window_after,n_before*sizeof(float))&&
+        !memcmp(&original_ctx,ctx,sizeof(original_ctx))&&!memcmp(&original_ds,ds,sizeof(original_ds))&&
+        !memcmp(target,myds_metal_buffer_data(ctx->logits),logits_bytes)&&
+        !memcmp(slots,myds_metal_buffer_data(ds->target_hidden_buf),sizeof(slots)));
+    fputs("],\"ctx_ds_target_logits_capture_snapshot_window_unchanged\":true,\"drafter_and_markov_state_restored\":true,"
+        "\"eval_prefix_environment_restored\":true,\"target_forward_calls_added\":0,\"performance_measurement\":false,\"pass\":true}\n",report);
+    fflush(report);for(unsigned i=0;i<4;i++)free(reference[i]);
+    free(saved_env);free(target);free(before);free(after);free(window_before);free(window_after);return 1;
+}
+
 static int request(myds_context_t *ctx,uint32_t i,const char *label,const char *prompt,
     uint32_t cap,uint32_t cancel_after,bool continuation,bool spec,bool active,float temperature,int32_t *first) {
     myds_config_t cfg=ctx->cfg;cfg.max_new_tokens=cap;cfg.temperature=temperature;
@@ -372,7 +491,7 @@ static int run(const char *model_path,const char *support_path) {
     const size_t prompt_bytes=strlen(prompt);CHECK(prompt_bytes>0);
     fprintf(report,"{\"schema_version\":1,\"kind\":\"metadata\",\"model\":");string(report,model_path);
     fputs(",\"support\":",report);string(report,support_path);
-    fprintf(report,",\"engine_mode\":%d,\"effective_mode\":%d,\"vocab\":129280,\"dim\":5120,\"cases\":10,\"files_per_case\":18,"
+    fprintf(report,",\"fixture_revision\":2,\"engine_mode\":%d,\"effective_mode\":%d,\"vocab\":129280,\"dim\":5120,\"cases\":10,\"files_per_case\":18,"
         "\"support_loaded\":true,\"real_drafter_weights\":true,\"stages\":3,\"prefix_cache\":true,\"ssd_cache\":false,\"performance_measurement\":false,"
         "\"service_chat_renderer\":true,\"prompt_bytes\":%zu,\"prompt_fnv1a64\":\"%016" PRIx64 "\"}\n",
         myds_dspark_engine_capture_bypass_enabled(ctx->dspark),myds_dspark_capture_bypass_enabled(ctx->dspark),prompt_bytes,fnv(prompt,prompt_bytes));fflush(report);
@@ -385,7 +504,7 @@ static int run(const char *model_path,const char *support_path) {
     CHECK(request(ctx,5,"neural",prompt,4,0,false,true,true,0,NULL));
     CHECK(request(ctx,6,"neural_cancel",prompt,8,2,false,true,true,0,NULL));
     CHECK(request(ctx,7,"neural_resume"," Continue after the interruption.",4,0,true,true,true,0,NULL));
-    CHECK(neural_probe(ctx)&&neural_failure_probe(ctx)&&tree_rejection(ctx));
+    CHECK(neural_probe(ctx)&&neural_failure_probe(ctx)&&neural_prefix_probe(ctx)&&tree_rejection(ctx));
     CHECK(request(ctx,8,"ordinary_again",prompt,4,0,false,false,false,0.7f,NULL));
     const int32_t original_eos=m->tokenizer->eos_id;m->tokenizer->eos_id=next;
     const int eos_ok=request(ctx,9,"controlled_eos",prompt,4,0,false,true,true,0,NULL);

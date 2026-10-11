@@ -17,7 +17,8 @@
 /* Proposal contract fixtures replace only the neural stage boundary; the
  * production selector, Markov conditioning and publication still run. */
 #ifndef DSPARK_EVAL_STAGES
-#define DSPARK_EVAL_STAGES myds_dspark_eval_stages
+#define DSPARK_EVAL_STAGES dspark_eval_requested_stages
+#define DSPARK_DEFAULT_STAGE_EVAL 1
 #endif
 
 #if defined(__ARM_NEON)
@@ -144,6 +145,14 @@ bool myds_dspark_capture_ready(const myds_dspark_t *ds) {
 void myds_dspark_capture_counters(myds_dspark_t *ds, myds_dspark_capture_counters_t *out, bool reset) {
     if (out) *out = ds ? ds->capture_counters : (myds_dspark_capture_counters_t){0};
     if (reset && ds) memset(&ds->capture_counters, 0, sizeof(ds->capture_counters));
+}
+void myds_dspark_reset_proposal_state(myds_dspark_t *ds) {
+    if (!ds) return;
+    ds->consecutive_misses = 0;
+    ds->backoff_counter = 0;
+    ds->draft_count = 0;
+    ds->draft_tree_count = 0;
+    ds->is_high_confidence = false;
 }
 void myds_dspark_capture_invalidate(myds_dspark_t *ds) {
     if (ds && ds->capture_bypass_mode) {
@@ -952,7 +961,9 @@ static inline void dspark_update_top2(int32_t tok, float score,
     }
 }
 
-int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_conf, float *out_confidence) {
+static int dspark_eval_stages_range(myds_dspark_t *ds, myds_context_t *ctx,
+    float min_conf, float *out_confidence, uint32_t eval_slots,
+    uint32_t logit_first, uint32_t logit_count) {
     if (out_confidence) *out_confidence = NAN;
     if (!ds || !ctx || !ctx->model) return 0;
     if (!capture_consumer_ready(ds)) {
@@ -962,6 +973,10 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
     if (!ds->ws || !ds->stage_count || ds->stage_count > MYDS_DSPARK_MAX_STAGES ||
         ds->current_seed_position > 1048576u - MYDS_DSPARK_DEFAULT_BLOCK_SIZE ||
         ds->current_output_slot >= MYDS_DSPARK_DEFAULT_BLOCK_SIZE) return 0;
+    if (!eval_slots || eval_slots > MYDS_DSPARK_DEFAULT_BLOCK_SIZE ||
+        !logit_count || logit_first >= eval_slots || logit_count > eval_slots - logit_first ||
+        ds->current_output_slot < logit_first ||
+        ds->current_output_slot >= logit_first + logit_count) return 0;
     if (!ds->main_proj || !ds->target_hidden_buf || !ds->draft_logits_buf) return 0;
 
     myds_dspark_workspace_t *ws = ds->ws;
@@ -979,6 +994,8 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
             !st->ffn_gate_exps || !st->ffn_up_exps || !st->ffn_down_exps ||
             !st->hc_ffn_fn || !st->hc_ffn_scale || !st->hc_ffn_base) return 0;
     }
+    const uint32_t eval_rows = eval_slots + 1u;
+    const uint32_t logit_end = logit_first + logit_count;
     /* This small graph has ordinary data dependencies throughout. Keep its
      * encoder barriers active even when the target verifier uses manual fences. */
     const int saved_barrier = myds_metal_get_auto_barrier();
@@ -1032,8 +1049,8 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
         DSPARK_ENCODE(myds_metal_buffer_copy(ws->v_stage_input_hc[0], c * stream_bytes, ds->stage_x_buf, 0, stream_bytes));
     }
 
-    // Initialize the four noise rows from the target model's mask embedding.
-    for (int r = 2; r < MYDS_DSPARK_TOTAL_ROWS; r++) {
+    // Initialize only the mask rows needed by the causal draft prefix.
+    for (uint32_t r = 2; r < eval_rows; r++) {
         DSPARK_ENCODE(myds_metal_buffer_copy(ws->v_stage_input_hc[r], 0, ds->noise_hc, 0, 4 * stream_bytes));
     }
 
@@ -1043,8 +1060,8 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
     for (uint32_t s = 0; s < ds->stage_count; s++) {
         myds_dspark_stage_t *st = &ds->stages[s];
 
-        // --- Step A: Pre-attn HC projection for all 6 rows (r = 0 .. 5) ---
-        for (int r = 0; r < MYDS_DSPARK_TOTAL_ROWS; r++) {
+        // --- Step A: Pre-attn HC projection for target + draft prefix ---
+        for (uint32_t r = 0; r < eval_rows; r++) {
             DSPARK_ENCODE(myds_metal_v41_rmsnorm(ws->v_stage_flat_hc_norm[r], ws->v_stage_input_hc[r], NULL, 4 * MYDS_DSPARK_DIM, ds->rms_eps, false));
             if (st->hc_attn_fn) {
                 DSPARK_ENCODE(myds_metal_gemv(ws->v_hc_mix[r], st->hc_attn_fn, ws->v_stage_flat_hc_norm[r], 24, 4 * MYDS_DSPARK_DIM, st->hc_attn_fn_type));
@@ -1061,8 +1078,8 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
             }
         }
 
-        // --- Step B: Q path for 5 draft rows (d = 0 .. 4) using ws->v_attn_norm[1 + d] ---
-        for (uint32_t d = 0; d < MYDS_DSPARK_DEFAULT_BLOCK_SIZE; d++) {
+        // --- Step B: Q path for every draft slot in the causal prefix ---
+        for (uint32_t d = 0; d < eval_slots; d++) {
             if (st->attn_q_a && st->attn_q_b) {
                 DSPARK_ENCODE(myds_metal_gemv(ws->v_qr[d], st->attn_q_a, ws->v_attn_norm[1 + d], 1280, MYDS_DSPARK_DIM, st->attn_q_a_type));
                 if (st->attn_q_a_norm) {
@@ -1078,8 +1095,8 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
             }
         }
 
-        // --- Step C: KV path for all 6 rows (r = 0 .. 5) stored in ws->stage_kv_cache[s] at slot r ---
-        for (int r = 0; r < MYDS_DSPARK_TOTAL_ROWS; r++) {
+        // --- Step C: KV path for target + draft prefix, preserving row offsets ---
+        for (uint32_t r = 0; r < eval_rows; r++) {
             if (st->attn_kv) {
                 DSPARK_ENCODE(myds_metal_gemv(ws->v_kv[r], st->attn_kv, ws->v_attn_norm[r], 512, MYDS_DSPARK_DIM, st->attn_kv_type));
                 if (st->attn_kv_a_norm) {
@@ -1093,8 +1110,8 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
             }
         }
 
-        // --- Step D: Block-causal Attention for 5 draft queries (d = 0 .. 4) attending to keys 0 .. 1 + d (n_raw = 2 + d) ---
-        for (uint32_t d = 0; d < MYDS_DSPARK_DEFAULT_BLOCK_SIZE; d++) {
+        // --- Step D: Each query d sees exactly keys 0 .. 1 + d (n_raw = 2 + d) ---
+        for (uint32_t d = 0; d < eval_slots; d++) {
             if (gpu_s) {
                 DSPARK_ENCODE(myds_v41_gpu_attention_direct(ws->v_attn_heads[d], st->attn_sinks, ws->v_q[d],
                                                     ws->stage_kv_cache[s], 2 + d, 0,
@@ -1124,8 +1141,8 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
             }
         }
 
-        // --- Step E: FFN / MoE Block on 5 draft rows (d = 0 .. 4) ---
-        for (uint32_t d = 0; d < MYDS_DSPARK_DEFAULT_BLOCK_SIZE; d++) {
+        // --- Step E: FFN / MoE on every draft slot in the causal prefix ---
+        for (uint32_t d = 0; d < eval_slots; d++) {
             // HC RMSNorm over flat 4 streams (20480) of after_attn_hc
             DSPARK_ENCODE(myds_metal_v41_rmsnorm(ws->v_draft_flat_hc_norm[d], ws->v_after_attn_hc[d], NULL, 4 * MYDS_DSPARK_DIM, ds->rms_eps, false));
 
@@ -1190,15 +1207,15 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
 
         // --- Step F: Propagate ws->v_stage_draft_hc[d] to next stage input Row 1 + d ---
         if (s + 1 < ds->stage_count) {
-            for (uint32_t d = 0; d < MYDS_DSPARK_DEFAULT_BLOCK_SIZE; d++) {
+            for (uint32_t d = 0; d < eval_slots; d++) {
                 DSPARK_ENCODE(myds_metal_buffer_copy(ws->v_stage_input_hc[1 + d], 0, ws->v_stage_draft_hc[d], 0, 4 * stream_bytes));
             }
         }
     }
 
-    // 4. Final Head on all 5 draft rows (mtp.2.norm + Base Model LM Head)
+    // 4. Only requested outputs need final collapse/norm and the LM head.
     myds_dspark_stage_t *final_st = &ds->stages[ds->stage_count - 1u];
-    for (uint32_t d = 0; d < MYDS_DSPARK_DEFAULT_BLOCK_SIZE; d++) {
+    for (uint32_t d = logit_first; d < logit_end; d++) {
         if (final_st->hc_ffn_fn) {
             DSPARK_ENCODE(myds_metal_v41_rmsnorm(ws->v_draft_flat_hc_norm[d], ws->v_stage_draft_hc[d], NULL, 4 * MYDS_DSPARK_DIM, ds->rms_eps, false));
             DSPARK_ENCODE(myds_metal_gemv(ws->v_draft_ffn_hc_mix[d], final_st->hc_ffn_fn, ws->v_draft_flat_hc_norm[d], 24, 4 * MYDS_DSPARK_DIM, final_st->hc_ffn_fn_type));
@@ -1246,22 +1263,22 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
         }
         if (out_confidence) *out_confidence = conf_prob;
 
-        // Early exit: If the first requested slot confidence is below threshold, skip the 5 LM Head GEMVs!
+        // Early exit: skip the requested LM head GEMVs on low confidence.
         if (conf_prob < min_conf) {
             myds_metal_set_auto_barrier(saved_barrier);
             return 0;
         }
 
-        // Project to LM Head logits for all 5 draft slots
+        // Project only the requested slots, at their original buffer offsets.
         DSPARK_ENCODE(myds_metal_begin_batch());
-        for (uint32_t d = 0; d < MYDS_DSPARK_DEFAULT_BLOCK_SIZE; d++) {
+        for (uint32_t d = logit_first; d < logit_end; d++) {
             DSPARK_ENCODE(myds_metal_gemv(ws->v_logits[d], ctx->model->output, ws->v_final_norm_out[d],
                                   ctx->model->vocab_size, MYDS_DSPARK_DIM, ctx->model->output_type));
         }
         DSPARK_ENCODE(myds_metal_commit_batch());
     } else {
-        // Direct zero-stall pipelining: Enqueue all 5 LM Head GEMVs in the SAME command buffer as stages
-        for (uint32_t d = 0; d < MYDS_DSPARK_DEFAULT_BLOCK_SIZE; d++) {
+        // Enqueue the requested LM head GEMVs with the stage command buffer.
+        for (uint32_t d = logit_first; d < logit_end; d++) {
             DSPARK_ENCODE(myds_metal_gemv(ws->v_logits[d], ctx->model->output, ws->v_final_norm_out[d],
                                   ctx->model->vocab_size, MYDS_DSPARK_DIM, ctx->model->output_type));
         }
@@ -1306,6 +1323,36 @@ encode_failure:
 #undef DSPARK_ENCODE
 }
 
+int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx,
+    float min_conf, float *out_confidence) {
+    return dspark_eval_stages_range(ds, ctx, min_conf, out_confidence,
+        MYDS_DSPARK_DEFAULT_BLOCK_SIZE, 0u, MYDS_DSPARK_DEFAULT_BLOCK_SIZE);
+}
+
+int myds_dspark_eval_stages_prefix(myds_dspark_t *ds, myds_context_t *ctx,
+    float min_conf, float *out_confidence, uint32_t first_slot, uint32_t count) {
+    if (first_slot >= MYDS_DSPARK_DEFAULT_BLOCK_SIZE || !count ||
+        count > MYDS_DSPARK_DEFAULT_BLOCK_SIZE - first_slot) {
+        if (out_confidence) *out_confidence = NAN;
+        return 0;
+    }
+    return dspark_eval_stages_range(ds, ctx, min_conf, out_confidence,
+        first_slot + count, first_slot, count);
+}
+
+#if defined(DSPARK_DEFAULT_STAGE_EVAL)
+static int dspark_eval_requested_stages(myds_dspark_t *ds, myds_context_t *ctx,
+    float min_conf, float *out_confidence) {
+    /* Read on every proposal so diagnostic runs can compare both graphs on
+     * the same process and model without changing their initial state. */
+    const char *prefix = getenv("MYDS_DSPARK_EVAL_PREFIX");
+    if (prefix && strcmp(prefix, "0") == 0)
+        return myds_dspark_eval_stages(ds, ctx, min_conf, out_confidence);
+    return myds_dspark_eval_stages_prefix(ds, ctx, min_conf, out_confidence,
+        ds ? ds->current_output_slot : 0u, ds ? ds->current_output_count : 0u);
+}
+#endif
+
 static void dspark_reject_proposal(myds_dspark_t *ds, myds_context_t *ctx, bool confidence) {
     ds->draft_count = ds->draft_tree_count = 0;
     ds->is_high_confidence = false;
@@ -1337,6 +1384,7 @@ static uint32_t dspark_propose_at(myds_dspark_t *ds, myds_context_t *ctx,
 
     uint32_t K = draft_cap > 0 && draft_cap < ds->block_size ? draft_cap : ds->block_size;
     if (K > MYDS_DSPARK_DEFAULT_BLOCK_SIZE - first_slot) K = MYDS_DSPARK_DEFAULT_BLOCK_SIZE - first_slot;
+    ds->current_output_count = K;
 
     const int markov_only = dspark_markov_only();
     if (!markov_only && ds->main_proj && !capture_consumer_ready(ds)) {
