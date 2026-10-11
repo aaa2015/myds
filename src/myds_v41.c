@@ -4269,6 +4269,14 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
     myds_metal_barrier_buffers(init_deps, 4);
 
     /* 3. 40 层级联前向（Per-Layer Batch-2 GEMV & MoE） */
+    static int trace_gpu = -1;
+    if (trace_gpu < 0) {
+        const char *e = getenv("MYDS_BATCH2_TRACE_GPU");
+        trace_gpu = e ? atoi(e) : 0;
+    }
+    double t_step = trace_gpu ? lowkv_now_ms() : 0.0;
+    double t_qkv = 0.0, t_attn = 0.0, t_out = 0.0, t_shared = 0.0, t_moe = 0.0, t_mix = 0.0, t_lmhead = 0.0;
+
     for (uint32_t il = 0; il < V41_LAYERS; il++) {
         const myds_layer_t *base = &m->layers[il];
         const v41_layer_t *l = &v->layers[il];
@@ -4294,6 +4302,12 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_v41_hc_mix(ws->v_attn_split[0], ws->v_residual[0], l->attn_fn, GGML_TYPE_F16, l->attn_scale, l->attn_base, ws->v_flat_norm[0], ws->v_mix[0], V41_DIM, m->norm_eps, v->hc_eps));
         CHECK(myds_metal_v41_hc_mix(ws->v_attn_split[1], ws->v_residual[1], l->attn_fn, GGML_TYPE_F16, l->attn_scale, l->attn_base, ws->v_flat_norm[1], ws->v_mix[1], V41_DIM, m->norm_eps, v->hc_eps));
         myds_metal_barrier_buffer(ws->attn_split_b2);
+        if (trace_gpu) {
+            CHECK(myds_metal_commit_batch());
+            t_mix += (lowkv_now_ms() - t_step);
+            CHECK(myds_metal_begin_batch());
+            t_step = lowkv_now_ms();
+        }
 
         /* Retain the exact decode reduction/BF16 boundary per row until a
          * dedicated batched kernel has passed full-model parity. */
@@ -4312,6 +4326,12 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
 
         CHECK(myds_v41_batch2_projection_probe(ws->v_q, base->attn_q_b, ws->v_qr_norm, V41_HEADS * 512, 1280, base->attn_q_b_type, MYDS_V41_BATCH2_QKV));
         myds_metal_barrier_buffer(ws->q_b2);
+        if (trace_gpu) {
+            CHECK(myds_metal_commit_batch());
+            t_qkv += (lowkv_now_ms() - t_step);
+            CHECK(myds_metal_begin_batch());
+            t_step = lowkv_now_ms();
+        }
 
         for (uint32_t t = 0; t < 2; ++t) {
             CHECK(v41_batch2_attention_token(ctx, il, pos + t, ws->v_q[t],
@@ -4326,6 +4346,12 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
             }
         }
         myds_metal_barrier_buffer(ws->attn_heads_b2);
+        if (trace_gpu) {
+            CHECK(myds_metal_commit_batch());
+            t_attn += (lowkv_now_ms() - t_step);
+            CHECK(myds_metal_begin_batch());
+            t_step = lowkv_now_ms();
+        }
 
         /* Attention Output A (8x down-proj, batched 2 tokens) */
         CHECK(myds_metal_attn_output_a_bf16_batch(ws->attn_low_b2, base->attn_output_a, ws->attn_heads_b2, 8, 4096, 1024, 2, base->attn_output_a_type));
@@ -4333,6 +4359,12 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
 
         CHECK(myds_v41_batch2_projection_probe(ws->v_attn_out, base->attn_output_b, ws->v_attn_low, V41_DIM, 8192, base->attn_output_b_type, MYDS_V41_BATCH2_TAIL));
         myds_metal_barrier_buffer(ws->attn_out_b2);
+        if (trace_gpu) {
+            CHECK(myds_metal_commit_batch());
+            t_out += (lowkv_now_ms() - t_step);
+            CHECK(myds_metal_begin_batch());
+            t_step = lowkv_now_ms();
+        }
 
         /* HC Expand + FFN Norm */
         CHECK(myds_metal_v41_hc_expand(ws->v_after_attn[0], ws->v_attn_out[0], ws->v_residual[0], ws->v_attn_split[0], V41_DIM));
@@ -4369,6 +4401,12 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         myds_metal_barrier_buffer(ws->shared_swiglu_b2);
 
         CHECK(myds_v41_batch2_projection_probe(ws->v_shared_out, base->shared_down, ws->v_shared_swiglu, V41_DIM, 2304, base->shared_down_type, MYDS_V41_BATCH2_SHARED));
+        if (trace_gpu) {
+            CHECK(myds_metal_commit_batch());
+            t_shared += (lowkv_now_ms() - t_step);
+            CHECK(myds_metal_begin_batch());
+            t_step = lowkv_now_ms();
+        }
 
         CHECK(myds_v41_batch2_projection_probe(ws->v_router_logits, base->router_gate,
             ws->v_ffn_norm, 384, V41_DIM, base->router_gate_type, MYDS_V41_BATCH2_ROUTER));
@@ -4388,6 +4426,12 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
                                           m->swiglu_clamp_exp));
         myds_metal_barrier_buffer(ws->moe_out_b2);
         myds_metal_barrier_buffer(ws->shared_out_b2);
+        if (trace_gpu) {
+            CHECK(myds_metal_commit_batch());
+            t_moe += (lowkv_now_ms() - t_step);
+            CHECK(myds_metal_begin_batch());
+            t_step = lowkv_now_ms();
+        }
 
         /* MoE 累加与 HC Expand */
         CHECK(myds_metal_v41_hc_mix(ws->v_ffn_split[0], ws->v_after_attn[0], l->ffn_fn, GGML_TYPE_F16, l->ffn_scale, l->ffn_base, ws->v_flat_norm[0], ws->v_mix[0], V41_DIM, m->norm_eps, v->hc_eps));
@@ -4405,7 +4449,7 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
             }
         }
 
-        if (decode_split && il + 1u < V41_LAYERS &&
+        if (!trace_gpu && decode_split && il + 1u < V41_LAYERS &&
             ((il + 1u) * (uint32_t)decode_split) / V41_LAYERS != (il * (uint32_t)decode_split) / V41_LAYERS) {
             CHECK(myds_metal_flush_batch());
             CHECK(myds_metal_begin_batch());
@@ -4427,6 +4471,13 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
     const double t_encode = timed ? lowkv_now_ms() : 0.0;
     CHECK(myds_metal_commit_batch());
     const double t_gpu = timed ? lowkv_now_ms() : 0.0;
+
+    if (trace_gpu) {
+        t_lmhead = t_gpu - t_encode;
+        MYDS_LOG_I("Batch2 GPU breakdown (40L): QKV=%.1f ms, Attn=%.1f ms, AttnOut=%.1f ms, Shared=%.1f ms, MoE=%.1f ms, Mix=%.1f ms, LMHead=%.1f ms (Total=%.1f ms)",
+                   t_qkv, t_attn, t_out, t_shared, t_moe, t_mix, t_lmhead,
+                   t_qkv + t_attn + t_out + t_shared + t_moe + t_mix + t_lmhead);
+    }
 
     /* 5. 权威裁决与状态回滚（Arbitration & Rollback with Precomputed Parallel Head） */
     const float *logits0 = (const float *)myds_metal_buffer_data(ws->v_logits[0]);
