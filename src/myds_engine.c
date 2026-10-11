@@ -3655,6 +3655,22 @@ static int myds_generate_internal(myds_context_t *ctx,
                     ctx->decode_stats.pld_proposed++;
                 }
                 bool matched = (ret == 2);
+                static int s_spec_diag_count = 0;
+                static int s_spec_diag_enabled = -1;
+                if (s_spec_diag_enabled < 0) {
+                    const char *env = getenv("MYDS_DSPARK_DEBUG");
+                    s_spec_diag_enabled = env ? atoi(env) : 0;
+                }
+                if (ctx->dspark && !ctx->decode_pld_candidate && (s_spec_diag_enabled || s_spec_diag_count < 15)) {
+                    s_spec_diag_count++;
+                    size_t cand_len = 0, truth_len = 0;
+                    const char *cand_str = myds_tokenizer_decode_bytes(m->tokenizer, cand_a, &cand_len);
+                    const char *truth_str = myds_tokenizer_decode_bytes(m->tokenizer, out_tokens[0], &truth_len);
+                    MYDS_LOG_I("[dspark-spec] step=%u cand=%d ('%.*s') truth=%d ('%.*s') -> %s",
+                               step, cand_a, (int)(cand_str ? cand_len : 0), cand_str ? cand_str : "",
+                               out_tokens[0], (int)(truth_str ? truth_len : 0), truth_str ? truth_str : "",
+                               matched ? "ACCEPT" : "REJECT");
+                }
                 if (matched) {
                     if (accepted_from_pld) ctx->decode_stats.pld_accepted++;
                     else {
@@ -3772,8 +3788,10 @@ static int myds_generate_internal(myds_context_t *ctx,
 
                     if (!ctx->decode_pld_candidate && accepted_in_cycle == 0) {
                         ctx->dspark->consecutive_misses++;
-                        if (ctx->dspark->consecutive_misses >= 3) {
-                            ctx->dspark->backoff_counter = 16;
+                        if (ctx->dspark->consecutive_misses >= 4) {
+                            ctx->dspark->backoff_counter = 8;
+                        } else if (ctx->dspark->consecutive_misses >= 3) {
+                            ctx->dspark->backoff_counter = 4;
                         }
                     } else if (!ctx->decode_pld_candidate) {
                         ctx->dspark->consecutive_misses = 0;

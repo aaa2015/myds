@@ -179,6 +179,14 @@ struct myds_dspark {
     struct myds_v41_spec_snapshot *spec_snap;
 };
 
+static inline int myds_dspark_target_slot(const myds_dspark_t *ds, uint32_t layer_idx) {
+    if (!ds) return -1;
+    for (int s = 0; s < MYDS_DSPARK_TARGET_LAYERS; s++) {
+        if (ds->target_layers[s] == layer_idx) return s;
+    }
+    return -1;
+}
+
 /* Initialize and load DSpark support model from GGUF */
 myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size);
 

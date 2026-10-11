@@ -3634,8 +3634,11 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
         phase="MoE";
         CHECK(myds_v41_moe_pipeline_scoped(ctx,il,(uint32_t)token,pos,g->residual,g->after_attn,g->ffn_split,l->ffn_fn,l->ffn_scale,l->ffn_base,g->flat_norm,g->mix,v->hc_eps,ordinary_decode_allowed && need_logits && !trace_on));
         TRACE("layer_out",g->residual,4*V41_DIM);
-        if (ctx->dspark && (il == 37 || il == 38 || il == 39)) {
-            CHECK(myds_dspark_capture_layer_to(ctx->dspark, il, g->residual, NULL));
+        if (ctx->dspark) {
+            int dspark_slot = myds_dspark_target_slot(ctx->dspark, il);
+            if (dspark_slot >= 0) {
+                CHECK(myds_dspark_capture_layer_to(ctx->dspark, il, g->residual, NULL));
+            }
         }
         if (decode_split && !trace_on && il + 1u < V41_LAYERS &&
             ((il + 1u) * (uint32_t)decode_split) / V41_LAYERS != (il * (uint32_t)decode_split) / V41_LAYERS) {
@@ -4464,10 +4467,12 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_v41_moe_add_hc_expand(ws->v_residual[1], ws->v_ffn_out[1], ws->v_moe_out[1], ws->v_shared_out[1], ws->v_after_attn[1], ws->v_ffn_split[1], V41_DIM));
         myds_metal_barrier_buffer(ws->residual_b2);
 
-        if (ctx->dspark && (il == 37 || il == 38 || il == 39) && ctx->dspark->hc_mean_weights) {
-            int slot = (il == 37) ? 0 : ((il == 38) ? 1 : 2);
-            for (int t = 0; t < 2; t++) {
-                CHECK(myds_dspark_capture_layer_to(ctx->dspark, il, ws->v_residual[t], ws->dspark_slots[t][slot]));
+        if (ctx->dspark && ctx->dspark->hc_mean_weights) {
+            int slot = myds_dspark_target_slot(ctx->dspark, il);
+            if (slot >= 0) {
+                for (int t = 0; t < 2; t++) {
+                    CHECK(myds_dspark_capture_layer_to(ctx->dspark, il, ws->v_residual[t], ws->dspark_slots[t][slot]));
+                }
             }
         }
 
@@ -4847,10 +4852,12 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
         }
         myds_metal_barrier_buffer(ws->residual_b2);
 
-        if (ctx->dspark && (il == 37 || il == 38 || il == 39) && ctx->dspark->hc_mean_weights) {
-            int slot = (il == 37) ? 0 : ((il == 38) ? 1 : 2);
-            for (int t = 0; t < 3; t++) {
-                CHECK(myds_dspark_capture_layer_to(ctx->dspark, il, ws->v_residual[t], ws->dspark_slots[t][slot]));
+        if (ctx->dspark && ctx->dspark->hc_mean_weights) {
+            int slot = myds_dspark_target_slot(ctx->dspark, il);
+            if (slot >= 0) {
+                for (int t = 0; t < 3; t++) {
+                    CHECK(myds_dspark_capture_layer_to(ctx->dspark, il, ws->v_residual[t], ws->dspark_slots[t][slot]));
+                }
             }
         }
 

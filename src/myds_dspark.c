@@ -196,10 +196,24 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
     if (!kexp) kexp = gguf_get_u32(gguf, "deepseek41-dflash-draft.expert_used_count", 3);
     ds->num_experts_per_tok = kexp;
 
-    // Default target layer ids for DeepSeek-V4.1: {37, 38, 39}
-    ds->target_layers[0] = 37;
-    ds->target_layers[1] = 38;
-    ds->target_layers[2] = 39;
+    // Target capture layer ids for DeepSeek-V4.1: load from GGUF metadata if available, defaulting to {36, 37, 38}
+    const gguf_kv_t *kv_cap = gguf_find_key(gguf, "deepseek41-dflash-draft.dflash.capture_layer_ids");
+    if (!kv_cap) kv_cap = gguf_find_key(gguf, "dflash.capture_layer_ids");
+    if (!kv_cap) kv_cap = gguf_find_key(gguf, "dspark.capture_layer_ids");
+    if (!kv_cap) kv_cap = gguf_find_key(gguf, "dspark.target_layers");
+    if (kv_cap && kv_cap->type == GGUF_TYPE_ARRAY && kv_cap->value.val_arr.count >= MYDS_DSPARK_TARGET_LAYERS &&
+        (kv_cap->value.val_arr.elem_type == GGUF_TYPE_UINT32 || kv_cap->value.val_arr.elem_type == GGUF_TYPE_INT32)) {
+        const uint32_t *arr = (const uint32_t *)kv_cap->value.val_arr.data;
+        for (int i = 0; i < MYDS_DSPARK_TARGET_LAYERS; i++) {
+            ds->target_layers[i] = arr[i];
+        }
+    } else {
+        ds->target_layers[0] = 36;
+        ds->target_layers[1] = 37;
+        ds->target_layers[2] = 38;
+    }
+    MYDS_LOG_I("dspark: capture_layers = {%u, %u, %u}",
+               ds->target_layers[0], ds->target_layers[1], ds->target_layers[2]);
 
     // Stage 0 entry projection
     const gguf_tensor_t *t_main_proj = gguf_find_tensor(gguf, "mtp.0.main_proj.weight");
@@ -525,13 +539,7 @@ void myds_dspark_capture_layer(myds_dspark_t *ds, uint32_t layer_idx, const myds
 int myds_dspark_capture_layer_to(myds_dspark_t *ds, uint32_t layer_idx,
         const myds_metal_buffer_t *residual, myds_metal_buffer_t *output) {
     if (!ds) return 1;
-    int slot = -1;
-    for (int i = 0; i < MYDS_DSPARK_TARGET_LAYERS; i++) {
-        if (ds->target_layers[i] == layer_idx) {
-            slot = i;
-            break;
-        }
-    }
+    int slot = myds_dspark_target_slot(ds, layer_idx);
     if (slot < 0) return 1;
     ds->capture_counters.requests++;
     if (!myds_dspark_capture_required(ds)) {
@@ -888,7 +896,9 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
 static void dspark_reject_proposal(myds_dspark_t *ds, myds_context_t *ctx, bool confidence) {
     ds->draft_count = ds->draft_tree_count = 0;
     ds->is_high_confidence = false;
-    if (++ds->consecutive_misses >= 3) ds->backoff_counter = 16;
+    ds->consecutive_misses++;
+    if (ds->consecutive_misses >= 4) ds->backoff_counter = 8;
+    else if (ds->consecutive_misses >= 3) ds->backoff_counter = 4;
     if (ctx->decode_metrics_active) {
         ctx->decode_stats.draft_rejects++;
         if (confidence) ctx->decode_stats.confidence_rejects++;
