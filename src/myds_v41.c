@@ -3187,6 +3187,21 @@ static int publish_and_select_decode(myds_context_t *ctx,uint32_t il,uint32_t po
     return publish_indexer_one_impl(ctx,il,pos,x_norm,qr_norm,NULL,NULL,NULL,NULL,NULL,true,ordinary_indexer_allowed);
 }
 
+static int publish_and_select_batch2(myds_context_t *ctx, uint32_t il, uint32_t pos,
+    const myds_metal_buffer_t *x_norm, const myds_metal_buffer_t *qr_norm,
+    myds_metal_buffer_t *out_selected, const myds_metal_buffer_t *in_block_mask,
+    myds_metal_buffer_t *out_block_mask, bool ordinary_indexer_allowed) {
+    if (ordinary_indexer_allowed && myds_metal_indexer_rope_quant_fuse_enabled()) {
+        if (!publish_compressor_indexer_rope_quant_scoped(ctx, il, pos, x_norm, NULL, NULL, true)) return 0;
+    } else if (ordinary_indexer_allowed && myds_metal_f16_gemv_bf16_fuse_enabled()) {
+        if (!publish_compressor_f16_bf16_scoped(ctx, il, pos, x_norm, NULL, NULL, true)) return 0;
+    } else if (!publish_compressor(ctx, il, pos, x_norm, NULL, NULL)) return 0;
+    return publish_indexer_one_impl(ctx, il, pos, x_norm, qr_norm, NULL, NULL,
+                                    out_selected, in_block_mask, out_block_mask,
+                                    true, ordinary_indexer_allowed);
+}
+
+
 /* 子组的 token 数：本组最后一个 token 的 count（= 该组分数表的列数）必须让
  * 组内 token 数 × 列数 ≤ 预算。返回 0 表示 1 行都放不下（调用方回退）。 */
 static uint32_t indexer_group_len(uint32_t c_len, uint32_t off, uint32_t base_pos,
@@ -3741,8 +3756,9 @@ static int v41_batch2_attention_token(myds_context_t *ctx, uint32_t il, uint32_t
     const uint32_t nraw = pos + 1u < V41_WINDOW ? pos + 1u : V41_WINDOW;
     if (!myds_v41_gpu_qkv_finish(q, kv, g->window[il], pos, compressed)) return 0;
     myds_metal_barrier_buffer(g->window[il]);
-    if (!publish_and_select(ctx, il, pos, x_norm, qr_norm,
-                            NULL, NULL, NULL, NULL, selected, block_mask, block_mask)) return 0;
+    const bool ordinary_allowed = !myds_trace_active();
+    if (!publish_and_select_batch2(ctx, il, pos, x_norm, qr_norm,
+                                   selected, block_mask, block_mask, ordinary_allowed)) return 0;
     if (!myds_v41_gpu_attention_direct(heads, ctx->model->layers[il].attn_sinks, q,
         g->window[il], nraw, (pos + 1u - nraw) % V41_WINDOW,
         count ? g->compressed[owner_for(il)] : NULL, count ? (selected ? selected : g->selected) : NULL,
