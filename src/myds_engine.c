@@ -3021,7 +3021,7 @@ static int myds_generate_internal(myds_context_t *ctx,
     ctx->decode_costly_cycles = ctx->decode_cost_backoff = 0;
     ctx->decode_cost_scheduler = decode_env_enabled("MYDS_SPEC_COST_SCHEDULER");
     const bool record_decode_cycles = decode_env_enabled("MYDS_DECODE_METRICS");
-    ctx->decode_stats.timing_enabled = true;
+    ctx->decode_stats.timing_enabled = record_decode_cycles || ctx->decode_cost_scheduler;
     const uint32_t cycle_capacity = ctx->cfg.max_new_tokens < ctx->cfg.max_seq_len
         ? ctx->cfg.max_new_tokens : ctx->cfg.max_seq_len;
     if (record_decode_cycles && cycle_capacity > ctx->decode_cycle_capacity) {

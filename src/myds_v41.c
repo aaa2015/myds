@@ -3768,8 +3768,6 @@ static int v41_batch2_attention_token(myds_context_t *ctx, uint32_t il, uint32_t
     myds_metal_barrier_buffer(heads);
     if (!myds_v41_gpu_rope_round(heads, V41_HEAD_DIM, V41_HEADS,
                                  pos, compressed, true)) return 0;
-    /* The next token writes the same window and reuses attention scratch. */
-    myds_metal_barrier();
     return 1;
 }
 
@@ -3796,6 +3794,7 @@ int myds_v41_batch2_window_probe(myds_metal_buffer_t *window,
     int ok = myds_metal_begin_batch();
     for (uint32_t t = 0; ok && t < 2; ++t) {
         ok = v41_batch2_attention_token(&ctx, 0, pos + t, q[t], kv[t], heads[t], NULL, NULL, NULL, NULL);
+        if (t == 0) myds_metal_barrier();
         if (t == 0 && fail_after_first) ok = 0;
     }
     if (!myds_metal_commit_batch()) ok = 0;
@@ -4337,12 +4336,16 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
             CHECK(v41_batch2_attention_token(ctx, il, pos + t, ws->v_q[t],
                 ws->v_kv_act[t], ws->v_attn_heads[t], ws->v_x_norm[t], ws->v_qr_norm[t],
                 ws->attention_selected[t], ws->attention_block_mask[t]));
-            if (t == 0 && kv_source(il) && ratio_for(il) == 2u) {
-                const uint32_t owner = owner_for(il);
-                CHECK(myds_metal_buffer_copy(ws->first_previous_kv[owner], 0,
-                                              g->previous_kv[owner], 0, 512u * sizeof(float)));
-                CHECK(myds_metal_buffer_copy(ws->first_previous_score[owner], 0,
-                                              g->previous_score[owner], 0, 512u * sizeof(float)));
+            if (t == 0) {
+                if (kv_source(il) && ratio_for(il) == 2u) {
+                    const uint32_t owner = owner_for(il);
+                    CHECK(myds_metal_buffer_copy(ws->first_previous_kv[owner], 0,
+                                                  g->previous_kv[owner], 0, 512u * sizeof(float)));
+                    CHECK(myds_metal_buffer_copy(ws->first_previous_score[owner], 0,
+                                                  g->previous_score[owner], 0, 512u * sizeof(float)));
+                }
+                /* The next token writes the same window and reuses attention scratch. */
+                myds_metal_barrier();
             }
         }
         myds_metal_barrier_buffer(ws->attn_heads_b2);

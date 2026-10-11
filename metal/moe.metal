@@ -4371,26 +4371,26 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_batch_f32(
     const int32_t i02 = ((device const int32_t *) (ids + (uint64_t)iid1 * args.nbi1))[idx];
     if (!ds4_tp_owns_expert(i02, args.ne02, args.tp_rank, args.tp_world)) return;
 
-    for (int p = 0; p < pair_idx; ++p) {
-        const int pt = p / args.nei0;
-        const int ps = p % args.nei0;
-        const int32_t pe = ((device const int32_t *)(ids + (uint64_t)pt * args.nbi1))[ps];
-        if (pe == i02) {
-            return;
-        }
-    }
+    int8_t slot0 = -1;
+    int8_t slot1 = -1;
+    device const int32_t *token_ids0 = (device const int32_t *)ids;
+    device const int32_t *token_ids1 = (device const int32_t *)(ids + args.nbi1);
 
-    int n_matches = 0;
-    int match_pairs[8];
-    for (int p = pair_idx; p < pairs; ++p) {
-        const int pt = p / args.nei0;
-        const int ps = p % args.nei0;
-        const int32_t pe = ((device const int32_t *)(ids + (uint64_t)pt * args.nbi1))[ps];
-        if (pe == i02) {
-            if (n_matches < 8) {
-                match_pairs[n_matches++] = p;
+    if (iid1 == 0) {
+        slot0 = (int8_t)idx;
+        for (int s = 0; s < args.nei0; ++s) {
+            if (token_ids1[s] == i02) {
+                slot1 = (int8_t)s;
+                break;
             }
         }
+    } else {
+        for (int s = 0; s < args.nei0; ++s) {
+            if (token_ids0[s] == i02) {
+                return;
+            }
+        }
+        slot1 = (int8_t)idx;
     }
 
     const int i02b = i02 - args.tp_expert_base;
@@ -4403,14 +4403,13 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_batch_f32(
     device const block_iq2_xxs *xu =
         (device const block_iq2_xxs *)(src0_up + (int64_t)i02b * args.nb02 + (uint64_t)first_row * args.nb01);
 
-    float sumg[8][N_R0_IQ2_XXS];
-    float sumu[8][N_R0_IQ2_XXS];
-    for (int m = 0; m < n_matches; ++m) {
-        for (short r = 0; r < N_R0_IQ2_XXS; ++r) {
-            sumg[m][r] = 0.f;
-            sumu[m][r] = 0.f;
-        }
-    }
+    device const float *y_tok0 = (device const float *)src1;
+    device const float *y_tok1 = (device const float *)(src1 + args.nb12);
+
+    float sumg0[N_R0_IQ2_XXS] = {0.f};
+    float sumu0[N_R0_IQ2_XXS] = {0.f};
+    float sumg1[N_R0_IQ2_XXS] = {0.f};
+    float sumu1[N_R0_IQ2_XXS] = {0.f};
 
     threadgroup uint64_t *svalues = (threadgroup uint64_t *)(shmem);
     threadgroup uint8_t  *ssigns  = (threadgroup uint8_t *)(svalues + 256);
@@ -4440,76 +4439,136 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_batch_f32(
         device const half *dhg = &xgr->d;
         device const half *dhu = &xur->d;
 
-        float dg[N_R0_IQ2_XXS];
-        float du[N_R0_IQ2_XXS];
-        const threadgroup uint8_t *gridg[N_R0_IQ2_XXS][4];
-        const threadgroup uint8_t *gridu[N_R0_IQ2_XXS][4];
-        uint8_t signg[N_R0_IQ2_XXS][4];
-        uint8_t signu[N_R0_IQ2_XXS][4];
-
-        for (short row = 0; row < N_R0_IQ2_XXS; row++) {
-            device const uint8_t *aux8g = (device const uint8_t *)qg;
-            device const uint8_t *aux8u = (device const uint8_t *)qu;
-            const uint32_t aux32g = qg[2] | (qg[3] << 16);
-            const uint32_t aux32u = qu[2] | (qu[3] << 16);
-            dg[row] = (float)dhg[0] * (0.5f + (aux32g >> 28));
-            du[row] = (float)dhu[0] * (0.5f + (aux32u >> 28));
-
-            for (short l = 0; l < 4; ++l) {
-                gridg[row][l] = (const threadgroup uint8_t *)(svalues + aux8g[l]);
-                gridu[row][l] = (const threadgroup uint8_t *)(svalues + aux8u[l]);
-                signg[row][l] = ssigns[(aux32g >> (7 * l)) & 127];
-                signu[row][l] = ssigns[(aux32u >> (7 * l)) & 127];
-            }
-
-            dhg += args.nb01 / 2;
-            dhu += args.nb01 / 2;
-            qg  += args.nb01 / 2;
-            qu  += args.nb01 / 2;
-        }
-
-        for (int m = 0; m < n_matches; ++m) {
-            const int m_token = match_pairs[m] / args.nei0;
-            device const float *y_m = (device const float *)(src1 + (uint64_t)m_token * args.nb12);
-            device const float4 *y4_f4 = (device const float4 *)(y_m + (32 * ib32));
-
-            float yl[32];
-            thread float4 *yl_f4 = (thread float4 *)yl;
+        float yl0[32];
+        float yl1[32];
+        if (slot0 >= 0) {
+            device const float4 *y4_0 = (device const float4 *)(y_tok0 + (32 * ib32));
+            thread float4 *yl0_f4 = (thread float4 *)yl0;
             #pragma unroll
             for (short i = 0; i < 8; ++i) {
-                yl_f4[i] = y4_f4[i];
+                yl0_f4[i] = y4_0[i];
             }
+        }
+        if (slot1 >= 0) {
+            device const float4 *y4_1 = (device const float4 *)(y_tok1 + (32 * ib32));
+            thread float4 *yl1_f4 = (thread float4 *)yl1;
+            #pragma unroll
+            for (short i = 0; i < 8; ++i) {
+                yl1_f4[i] = y4_1[i];
+            }
+        }
 
+        if (slot0 >= 0 && slot1 >= 0) {
             for (short row = 0; row < N_R0_IQ2_XXS; row++) {
-                float sg = 0;
-                float su = 0;
+                device const uint8_t *aux8g = (device const uint8_t *)qg;
+                device const uint8_t *aux8u = (device const uint8_t *)qu;
+                const uint32_t aux32g = qg[2] | (qg[3] << 16);
+                const uint32_t aux32u = qu[2] | (qu[3] << 16);
+                const float dg = (float)dhg[0] * (0.5f + (aux32g >> 28));
+                const float du = (float)dhu[0] * (0.5f + (aux32u >> 28));
+
+                float sg0 = 0.f, su0 = 0.f;
+                float sg1 = 0.f, su1 = 0.f;
                 for (short l = 0; l < 4; ++l) {
-                    const threadgroup uint8_t *cur_gridg = gridg[row][l];
-                    const threadgroup uint8_t *cur_gridu = gridu[row][l];
-                    const uint8_t cur_signg = signg[row][l];
-                    const uint8_t cur_signu = signu[row][l];
+                    const threadgroup uint8_t *cur_gridg = (const threadgroup uint8_t *)(svalues + aux8g[l]);
+                    const threadgroup uint8_t *cur_gridu = (const threadgroup uint8_t *)(svalues + aux8u[l]);
+                    const uint8_t cur_signg = ssigns[(aux32g >> (7 * l)) & 127];
+                    const uint8_t cur_signu = ssigns[(aux32u >> (7 * l)) & 127];
+                    const int l_offset = 8 * l;
+                    #pragma unroll
                     for (short j = 0; j < 8; ++j) {
-                        const float v = yl[8 * l + j];
-                        sg += v * cur_gridg[j] * (cur_signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
-                        su += v * cur_gridu[j] * (cur_signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                        const float wg = cur_gridg[j] * (cur_signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                        const float wu = cur_gridu[j] * (cur_signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                        sg0 += yl0[l_offset + j] * wg;
+                        su0 += yl0[l_offset + j] * wu;
+                        sg1 += yl1[l_offset + j] * wg;
+                        su1 += yl1[l_offset + j] * wu;
                     }
                 }
-                sumg[m][row] += dg[row] * sg;
-                sumu[m][row] += du[row] * su;
+                sumg0[row] += dg * sg0;
+                sumu0[row] += du * su0;
+                sumg1[row] += dg * sg1;
+                sumu1[row] += du * su1;
+
+                dhg += args.nb01 / 2;
+                dhu += args.nb01 / 2;
+                qg  += args.nb01 / 2;
+                qu  += args.nb01 / 2;
+            }
+        } else if (slot0 >= 0) {
+            for (short row = 0; row < N_R0_IQ2_XXS; row++) {
+                device const uint8_t *aux8g = (device const uint8_t *)qg;
+                device const uint8_t *aux8u = (device const uint8_t *)qu;
+                const uint32_t aux32g = qg[2] | (qg[3] << 16);
+                const uint32_t aux32u = qu[2] | (qu[3] << 16);
+                const float dg = (float)dhg[0] * (0.5f + (aux32g >> 28));
+                const float du = (float)dhu[0] * (0.5f + (aux32u >> 28));
+
+                float sg0 = 0.f, su0 = 0.f;
+                for (short l = 0; l < 4; ++l) {
+                    const threadgroup uint8_t *cur_gridg = (const threadgroup uint8_t *)(svalues + aux8g[l]);
+                    const threadgroup uint8_t *cur_gridu = (const threadgroup uint8_t *)(svalues + aux8u[l]);
+                    const uint8_t cur_signg = ssigns[(aux32g >> (7 * l)) & 127];
+                    const uint8_t cur_signu = ssigns[(aux32u >> (7 * l)) & 127];
+                    const int l_offset = 8 * l;
+                    #pragma unroll
+                    for (short j = 0; j < 8; ++j) {
+                        const float wg = cur_gridg[j] * (cur_signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                        const float wu = cur_gridu[j] * (cur_signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                        sg0 += yl0[l_offset + j] * wg;
+                        su0 += yl0[l_offset + j] * wu;
+                    }
+                }
+                sumg0[row] += dg * sg0;
+                sumu0[row] += du * su0;
+
+                dhg += args.nb01 / 2;
+                dhu += args.nb01 / 2;
+                qg  += args.nb01 / 2;
+                qu  += args.nb01 / 2;
+            }
+        } else {
+            for (short row = 0; row < N_R0_IQ2_XXS; row++) {
+                device const uint8_t *aux8g = (device const uint8_t *)qg;
+                device const uint8_t *aux8u = (device const uint8_t *)qu;
+                const uint32_t aux32g = qg[2] | (qg[3] << 16);
+                const uint32_t aux32u = qu[2] | (qu[3] << 16);
+                const float dg = (float)dhg[0] * (0.5f + (aux32g >> 28));
+                const float du = (float)dhu[0] * (0.5f + (aux32u >> 28));
+
+                float sg1 = 0.f, su1 = 0.f;
+                for (short l = 0; l < 4; ++l) {
+                    const threadgroup uint8_t *cur_gridg = (const threadgroup uint8_t *)(svalues + aux8g[l]);
+                    const threadgroup uint8_t *cur_gridu = (const threadgroup uint8_t *)(svalues + aux8u[l]);
+                    const uint8_t cur_signg = ssigns[(aux32g >> (7 * l)) & 127];
+                    const uint8_t cur_signu = ssigns[(aux32u >> (7 * l)) & 127];
+                    const int l_offset = 8 * l;
+                    #pragma unroll
+                    for (short j = 0; j < 8; ++j) {
+                        const float wg = cur_gridg[j] * (cur_signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                        const float wu = cur_gridu[j] * (cur_signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                        sg1 += yl1[l_offset + j] * wg;
+                        su1 += yl1[l_offset + j] * wu;
+                    }
+                }
+                sumg1[row] += dg * sg1;
+                sumu1[row] += du * su1;
+
+                dhg += args.nb01 / 2;
+                dhu += args.nb01 / 2;
+                qg  += args.nb01 / 2;
+                qu  += args.nb01 / 2;
             }
         }
     }
 
     const float c = act.clamp_value;
-    for (int m = 0; m < n_matches; ++m) {
-        const int m_pair = match_pairs[m];
-        const int m_token = m_pair / args.nei0;
-        const int m_slot  = m_pair % args.nei0;
-
+    if (slot0 >= 0) {
+        const int m_pair = slot0;
         device float *dst_gate_f32 =
-            (device float *)dst_gate + (uint64_t)m_token * args.ne0 * args.ne1 + (uint64_t)m_slot * args.ne0;
+            (device float *)dst_gate + (uint64_t)slot0 * args.ne0;
         device float *dst_up_f32 =
-            (device float *)dst_up + (uint64_t)m_token * args.ne0 * args.ne1 + (uint64_t)m_slot * args.ne0;
+            (device float *)dst_up + (uint64_t)slot0 * args.ne0;
         device float *dst_mid_f32 =
             (device float *)(dst_mid + (uint64_t)m_pair * act.mid_row_stride);
         device const float *route_w =
@@ -4519,8 +4578,45 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_batch_f32(
         float4 reduced_gate;
         float4 reduced_up;
         for (int row = 0; row < N_R0_IQ2_XXS; ++row) {
-            reduced_gate[row] = simd_sum(sumg[m][row]);
-            reduced_up[row] = simd_sum(sumu[m][row]);
+            reduced_gate[row] = simd_sum(sumg0[row]);
+            reduced_up[row] = simd_sum(sumu0[row]);
+        }
+        if (tiisg < N_R0_IQ2_XXS && first_row + tiisg < args.ne0) {
+            const uint out_row = first_row + tiisg;
+            const float gate = reduced_gate[tiisg] * 0.25f;
+            const float up = reduced_up[tiisg] * 0.25f;
+            float g = gate;
+            float u = up;
+            if (c > 1.0e-6f) {
+                g = min(g, c);
+                u = clamp(u, -c, c);
+            }
+            if (act.write_clamped != 0) {
+                dst_gate_f32[out_row] = gate;
+                dst_up_f32[out_row] = up;
+            }
+            const float silu = g / (1.0f + exp(-g));
+            dst_mid_f32[out_row] = silu * u * route_weight;
+        }
+    }
+
+    if (slot1 >= 0) {
+        const int m_pair = args.nei0 + slot1;
+        device float *dst_gate_f32 =
+            (device float *)dst_gate + (uint64_t)args.ne0 * args.ne1 + (uint64_t)slot1 * args.ne0;
+        device float *dst_up_f32 =
+            (device float *)dst_up + (uint64_t)args.ne0 * args.ne1 + (uint64_t)slot1 * args.ne0;
+        device float *dst_mid_f32 =
+            (device float *)(dst_mid + (uint64_t)m_pair * act.mid_row_stride);
+        device const float *route_w =
+            (device const float *)(weights + (uint64_t)m_pair * act.weight_stride);
+
+        const float route_weight = route_w[0];
+        float4 reduced_gate;
+        float4 reduced_up;
+        for (int row = 0; row < N_R0_IQ2_XXS; ++row) {
+            reduced_gate[row] = simd_sum(sumg1[row]);
+            reduced_up[row] = simd_sum(sumu1[row]);
         }
         if (tiisg < N_R0_IQ2_XXS && first_row + tiisg < args.ne0) {
             const uint out_row = first_row + tiisg;
@@ -4570,26 +4666,26 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_batch_constant_lut_f32(
     const int32_t i02 = ((device const int32_t *) (ids + (uint64_t)iid1 * args.nbi1))[idx];
     if (!ds4_tp_owns_expert(i02, args.ne02, args.tp_rank, args.tp_world)) return;
 
-    for (int p = 0; p < pair_idx; ++p) {
-        const int pt = p / args.nei0;
-        const int ps = p % args.nei0;
-        const int32_t pe = ((device const int32_t *)(ids + (uint64_t)pt * args.nbi1))[ps];
-        if (pe == i02) {
-            return;
-        }
-    }
+    int8_t slot0 = -1;
+    int8_t slot1 = -1;
+    device const int32_t *token_ids0 = (device const int32_t *)ids;
+    device const int32_t *token_ids1 = (device const int32_t *)(ids + args.nbi1);
 
-    int n_matches = 0;
-    int match_pairs[8];
-    for (int p = pair_idx; p < pairs; ++p) {
-        const int pt = p / args.nei0;
-        const int ps = p % args.nei0;
-        const int32_t pe = ((device const int32_t *)(ids + (uint64_t)pt * args.nbi1))[ps];
-        if (pe == i02) {
-            if (n_matches < 8) {
-                match_pairs[n_matches++] = p;
+    if (iid1 == 0) {
+        slot0 = (int8_t)idx;
+        for (int s = 0; s < args.nei0; ++s) {
+            if (token_ids1[s] == i02) {
+                slot1 = (int8_t)s;
+                break;
             }
         }
+    } else {
+        for (int s = 0; s < args.nei0; ++s) {
+            if (token_ids0[s] == i02) {
+                return;
+            }
+        }
+        slot1 = (int8_t)idx;
     }
 
     const int i02b = i02 - args.tp_expert_base;
@@ -4602,14 +4698,13 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_batch_constant_lut_f32(
     device const block_iq2_xxs *xu =
         (device const block_iq2_xxs *)(src0_up + (int64_t)i02b * args.nb02 + (uint64_t)first_row * args.nb01);
 
-    float sumg[8][N_R0_IQ2_XXS];
-    float sumu[8][N_R0_IQ2_XXS];
-    for (int m = 0; m < n_matches; ++m) {
-        for (short r = 0; r < N_R0_IQ2_XXS; ++r) {
-            sumg[m][r] = 0.f;
-            sumu[m][r] = 0.f;
-        }
-    }
+    device const float *y_tok0 = (device const float *)src1;
+    device const float *y_tok1 = (device const float *)(src1 + args.nb12);
+
+    float sumg0[N_R0_IQ2_XXS] = {0.f};
+    float sumu0[N_R0_IQ2_XXS] = {0.f};
+    float sumg1[N_R0_IQ2_XXS] = {0.f};
+    float sumu1[N_R0_IQ2_XXS] = {0.f};
 
     const int ix = tiisg;
 
@@ -4624,76 +4719,136 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_batch_constant_lut_f32(
         device const half *dhg = &xgr->d;
         device const half *dhu = &xur->d;
 
-        float dg[N_R0_IQ2_XXS];
-        float du[N_R0_IQ2_XXS];
-        const constant uint8_t *gridg[N_R0_IQ2_XXS][4];
-        const constant uint8_t *gridu[N_R0_IQ2_XXS][4];
-        uint8_t signg[N_R0_IQ2_XXS][4];
-        uint8_t signu[N_R0_IQ2_XXS][4];
-
-        for (short row = 0; row < N_R0_IQ2_XXS; row++) {
-            device const uint8_t *aux8g = (device const uint8_t *)qg;
-            device const uint8_t *aux8u = (device const uint8_t *)qu;
-            const uint32_t aux32g = qg[2] | (qg[3] << 16);
-            const uint32_t aux32u = qu[2] | (qu[3] << 16);
-            dg[row] = (float)dhg[0] * (0.5f + (aux32g >> 28));
-            du[row] = (float)dhu[0] * (0.5f + (aux32u >> 28));
-
-            for (short l = 0; l < 4; ++l) {
-                gridg[row][l] = (const constant uint8_t *)(ds4_metal_iq2xxs_grid + aux8g[l]);
-                gridu[row][l] = (const constant uint8_t *)(ds4_metal_iq2xxs_grid + aux8u[l]);
-                signg[row][l] = ds4_metal_ksigns_iq2xs[(aux32g >> (7 * l)) & 127];
-                signu[row][l] = ds4_metal_ksigns_iq2xs[(aux32u >> (7 * l)) & 127];
-            }
-
-            dhg += args.nb01 / 2;
-            dhu += args.nb01 / 2;
-            qg  += args.nb01 / 2;
-            qu  += args.nb01 / 2;
-        }
-
-        for (int m = 0; m < n_matches; ++m) {
-            const int m_token = match_pairs[m] / args.nei0;
-            device const float *y_m = (device const float *)(src1 + (uint64_t)m_token * args.nb12);
-            device const float4 *y4_f4 = (device const float4 *)(y_m + (32 * ib32));
-
-            float yl[32];
-            thread float4 *yl_f4 = (thread float4 *)yl;
+        float yl0[32];
+        float yl1[32];
+        if (slot0 >= 0) {
+            device const float4 *y4_0 = (device const float4 *)(y_tok0 + (32 * ib32));
+            thread float4 *yl0_f4 = (thread float4 *)yl0;
             #pragma unroll
             for (short i = 0; i < 8; ++i) {
-                yl_f4[i] = y4_f4[i];
+                yl0_f4[i] = y4_0[i];
             }
+        }
+        if (slot1 >= 0) {
+            device const float4 *y4_1 = (device const float4 *)(y_tok1 + (32 * ib32));
+            thread float4 *yl1_f4 = (thread float4 *)yl1;
+            #pragma unroll
+            for (short i = 0; i < 8; ++i) {
+                yl1_f4[i] = y4_1[i];
+            }
+        }
 
+        if (slot0 >= 0 && slot1 >= 0) {
             for (short row = 0; row < N_R0_IQ2_XXS; row++) {
-                float sg = 0;
-                float su = 0;
+                device const uint8_t *aux8g = (device const uint8_t *)qg;
+                device const uint8_t *aux8u = (device const uint8_t *)qu;
+                const uint32_t aux32g = qg[2] | (qg[3] << 16);
+                const uint32_t aux32u = qu[2] | (qu[3] << 16);
+                const float dg = (float)dhg[0] * (0.5f + (aux32g >> 28));
+                const float du = (float)dhu[0] * (0.5f + (aux32u >> 28));
+
+                float sg0 = 0.f, su0 = 0.f;
+                float sg1 = 0.f, su1 = 0.f;
                 for (short l = 0; l < 4; ++l) {
-                    const constant uint8_t *cur_gridg = gridg[row][l];
-                    const constant uint8_t *cur_gridu = gridu[row][l];
-                    const uint8_t cur_signg = signg[row][l];
-                    const uint8_t cur_signu = signu[row][l];
+                    const constant uint8_t *cur_gridg = (const constant uint8_t *)(ds4_metal_iq2xxs_grid + aux8g[l]);
+                    const constant uint8_t *cur_gridu = (const constant uint8_t *)(ds4_metal_iq2xxs_grid + aux8u[l]);
+                    const uint8_t cur_signg = ds4_metal_ksigns_iq2xs[(aux32g >> (7 * l)) & 127];
+                    const uint8_t cur_signu = ds4_metal_ksigns_iq2xs[(aux32u >> (7 * l)) & 127];
+                    const int l_offset = 8 * l;
+                    #pragma unroll
                     for (short j = 0; j < 8; ++j) {
-                        const float v = yl[8 * l + j];
-                        sg += v * cur_gridg[j] * (cur_signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
-                        su += v * cur_gridu[j] * (cur_signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                        const float wg = cur_gridg[j] * (cur_signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                        const float wu = cur_gridu[j] * (cur_signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                        sg0 += yl0[l_offset + j] * wg;
+                        su0 += yl0[l_offset + j] * wu;
+                        sg1 += yl1[l_offset + j] * wg;
+                        su1 += yl1[l_offset + j] * wu;
                     }
                 }
-                sumg[m][row] += dg[row] * sg;
-                sumu[m][row] += du[row] * su;
+                sumg0[row] += dg * sg0;
+                sumu0[row] += du * su0;
+                sumg1[row] += dg * sg1;
+                sumu1[row] += du * su1;
+
+                dhg += args.nb01 / 2;
+                dhu += args.nb01 / 2;
+                qg  += args.nb01 / 2;
+                qu  += args.nb01 / 2;
+            }
+        } else if (slot0 >= 0) {
+            for (short row = 0; row < N_R0_IQ2_XXS; row++) {
+                device const uint8_t *aux8g = (device const uint8_t *)qg;
+                device const uint8_t *aux8u = (device const uint8_t *)qu;
+                const uint32_t aux32g = qg[2] | (qg[3] << 16);
+                const uint32_t aux32u = qu[2] | (qu[3] << 16);
+                const float dg = (float)dhg[0] * (0.5f + (aux32g >> 28));
+                const float du = (float)dhu[0] * (0.5f + (aux32u >> 28));
+
+                float sg0 = 0.f, su0 = 0.f;
+                for (short l = 0; l < 4; ++l) {
+                    const constant uint8_t *cur_gridg = (const constant uint8_t *)(ds4_metal_iq2xxs_grid + aux8g[l]);
+                    const constant uint8_t *cur_gridu = (const constant uint8_t *)(ds4_metal_iq2xxs_grid + aux8u[l]);
+                    const uint8_t cur_signg = ds4_metal_ksigns_iq2xs[(aux32g >> (7 * l)) & 127];
+                    const uint8_t cur_signu = ds4_metal_ksigns_iq2xs[(aux32u >> (7 * l)) & 127];
+                    const int l_offset = 8 * l;
+                    #pragma unroll
+                    for (short j = 0; j < 8; ++j) {
+                        const float wg = cur_gridg[j] * (cur_signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                        const float wu = cur_gridu[j] * (cur_signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                        sg0 += yl0[l_offset + j] * wg;
+                        su0 += yl0[l_offset + j] * wu;
+                    }
+                }
+                sumg0[row] += dg * sg0;
+                sumu0[row] += du * su0;
+
+                dhg += args.nb01 / 2;
+                dhu += args.nb01 / 2;
+                qg  += args.nb01 / 2;
+                qu  += args.nb01 / 2;
+            }
+        } else {
+            for (short row = 0; row < N_R0_IQ2_XXS; row++) {
+                device const uint8_t *aux8g = (device const uint8_t *)qg;
+                device const uint8_t *aux8u = (device const uint8_t *)qu;
+                const uint32_t aux32g = qg[2] | (qg[3] << 16);
+                const uint32_t aux32u = qu[2] | (qu[3] << 16);
+                const float dg = (float)dhg[0] * (0.5f + (aux32g >> 28));
+                const float du = (float)dhu[0] * (0.5f + (aux32u >> 28));
+
+                float sg1 = 0.f, su1 = 0.f;
+                for (short l = 0; l < 4; ++l) {
+                    const constant uint8_t *cur_gridg = (const constant uint8_t *)(ds4_metal_iq2xxs_grid + aux8g[l]);
+                    const constant uint8_t *cur_gridu = (const constant uint8_t *)(ds4_metal_iq2xxs_grid + aux8u[l]);
+                    const uint8_t cur_signg = ds4_metal_ksigns_iq2xs[(aux32g >> (7 * l)) & 127];
+                    const uint8_t cur_signu = ds4_metal_ksigns_iq2xs[(aux32u >> (7 * l)) & 127];
+                    const int l_offset = 8 * l;
+                    #pragma unroll
+                    for (short j = 0; j < 8; ++j) {
+                        const float wg = cur_gridg[j] * (cur_signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                        const float wu = cur_gridu[j] * (cur_signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                        sg1 += yl1[l_offset + j] * wg;
+                        su1 += yl1[l_offset + j] * wu;
+                    }
+                }
+                sumg1[row] += dg * sg1;
+                sumu1[row] += du * su1;
+
+                dhg += args.nb01 / 2;
+                dhu += args.nb01 / 2;
+                qg  += args.nb01 / 2;
+                qu  += args.nb01 / 2;
             }
         }
     }
 
     const float c = act.clamp_value;
-    for (int m = 0; m < n_matches; ++m) {
-        const int m_pair = match_pairs[m];
-        const int m_token = m_pair / args.nei0;
-        const int m_slot  = m_pair % args.nei0;
-
+    if (slot0 >= 0) {
+        const int m_pair = slot0;
         device float *dst_gate_f32 =
-            (device float *)dst_gate + (uint64_t)m_token * args.ne0 * args.ne1 + (uint64_t)m_slot * args.ne0;
+            (device float *)dst_gate + (uint64_t)slot0 * args.ne0;
         device float *dst_up_f32 =
-            (device float *)dst_up + (uint64_t)m_token * args.ne0 * args.ne1 + (uint64_t)m_slot * args.ne0;
+            (device float *)dst_up + (uint64_t)slot0 * args.ne0;
         device float *dst_mid_f32 =
             (device float *)(dst_mid + (uint64_t)m_pair * act.mid_row_stride);
         device const float *route_w =
@@ -4703,8 +4858,45 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_batch_constant_lut_f32(
         float4 reduced_gate;
         float4 reduced_up;
         for (int row = 0; row < N_R0_IQ2_XXS; ++row) {
-            reduced_gate[row] = simd_sum(sumg[m][row]);
-            reduced_up[row] = simd_sum(sumu[m][row]);
+            reduced_gate[row] = simd_sum(sumg0[row]);
+            reduced_up[row] = simd_sum(sumu0[row]);
+        }
+        if (tiisg < N_R0_IQ2_XXS && first_row + tiisg < args.ne0) {
+            const uint out_row = first_row + tiisg;
+            const float gate = reduced_gate[tiisg] * 0.25f;
+            const float up = reduced_up[tiisg] * 0.25f;
+            float g = gate;
+            float u = up;
+            if (c > 1.0e-6f) {
+                g = min(g, c);
+                u = clamp(u, -c, c);
+            }
+            if (act.write_clamped != 0) {
+                dst_gate_f32[out_row] = gate;
+                dst_up_f32[out_row] = up;
+            }
+            const float silu = g / (1.0f + exp(-g));
+            dst_mid_f32[out_row] = silu * u * route_weight;
+        }
+    }
+
+    if (slot1 >= 0) {
+        const int m_pair = args.nei0 + slot1;
+        device float *dst_gate_f32 =
+            (device float *)dst_gate + (uint64_t)args.ne0 * args.ne1 + (uint64_t)slot1 * args.ne0;
+        device float *dst_up_f32 =
+            (device float *)dst_up + (uint64_t)args.ne0 * args.ne1 + (uint64_t)slot1 * args.ne0;
+        device float *dst_mid_f32 =
+            (device float *)(dst_mid + (uint64_t)m_pair * act.mid_row_stride);
+        device const float *route_w =
+            (device const float *)(weights + (uint64_t)m_pair * act.weight_stride);
+
+        const float route_weight = route_w[0];
+        float4 reduced_gate;
+        float4 reduced_up;
+        for (int row = 0; row < N_R0_IQ2_XXS; ++row) {
+            reduced_gate[row] = simd_sum(sumg1[row]);
+            reduced_up[row] = simd_sum(sumu1[row]);
         }
         if (tiisg < N_R0_IQ2_XXS && first_row + tiisg < args.ne0) {
             const uint out_row = first_row + tiisg;
@@ -7015,7 +7207,64 @@ kernel void kernel_mul_mv_id_q2_K_sum6_batch_f32(
                 if (first_row + row < args.ne0) {
                     float dall = dh[0];
                     float dmin = dh[1] * (1.f/16.f);
-                    if (s0 >= 0) {
+                    if (s0 >= 0 && s1 >= 0) {
+                        float4 acc1_0 = {0.f, 0.f, 0.f, 0.f};
+                        float4 acc2_0 = {0.f, 0.f, 0.f, 0.f};
+                        float4 acc1_1 = {0.f, 0.f, 0.f, 0.f};
+                        float4 acc2_1 = {0.f, 0.f, 0.f, 0.f};
+                        #pragma unroll
+                        for (int i = 0; i < 8; i += 2) {
+                            const uint16_t q = qs[i/2];
+                            const float q0 = (float)(q & 0x0003);
+                            const float q1 = (float)(q & 0x0300);
+                            const float q2 = (float)(q & 0x000c);
+                            const float q3 = (float)(q & 0x0c00);
+                            const float q4 = (float)(q & 0x0030);
+                            const float q5 = (float)(q & 0x3000);
+                            const float q6 = (float)(q & 0x00c0);
+                            const float q7 = (float)(q & 0xc000);
+
+                            acc1_0[0] += yl0[i+ 0] * q0;
+                            acc2_0[0] += yl0[i+ 1] * q1;
+                            acc1_0[1] += yl0[i+ 8] * q2;
+                            acc2_0[1] += yl0[i+ 9] * q3;
+                            acc1_0[2] += yl0[i+16] * q4;
+                            acc2_0[2] += yl0[i+17] * q5;
+                            acc1_0[3] += yl0[i+24] * q6;
+                            acc2_0[3] += yl0[i+25] * q7;
+
+                            acc1_1[0] += yl1[i+ 0] * q0;
+                            acc2_1[0] += yl1[i+ 1] * q1;
+                            acc1_1[1] += yl1[i+ 8] * q2;
+                            acc2_1[1] += yl1[i+ 9] * q3;
+                            acc1_1[2] += yl1[i+16] * q4;
+                            acc2_1[2] += yl1[i+17] * q5;
+                            acc1_1[3] += yl1[i+24] * q6;
+                            acc2_1[3] += yl1[i+25] * q7;
+                        }
+                        const float sc0_l = (float)(sc[0] & 0xF) * 1.f;
+                        const float sc1_l = (float)(sc[2] & 0xF) * 0.25f;
+                        const float sc2_l = (float)(sc[4] & 0xF) * 0.0625f;
+                        const float sc3_l = (float)(sc[6] & 0xF) * 0.015625f;
+                        const float sc0_h = (float)(sc[0] & 0xF0);
+                        const float sc1_h = (float)(sc[2] & 0xF0);
+                        const float sc2_h = (float)(sc[4] & 0xF0);
+                        const float sc3_h = (float)(sc[6] & 0xF0);
+
+                        sumf0[row] += dall * ((acc1_0[0] + (1.f/256.f) * acc2_0[0]) * sc0_l +
+                                             (acc1_0[1] + (1.f/256.f) * acc2_0[1]) * sc1_l +
+                                             (acc1_0[2] + (1.f/256.f) * acc2_0[2]) * sc2_l +
+                                             (acc1_0[3] + (1.f/256.f) * acc2_0[3]) * sc3_l) -
+                                     dmin * (sumy0[0] * sc0_h + sumy0[1] * sc1_h +
+                                             sumy0[2] * sc2_h + sumy0[3] * sc3_h);
+
+                        sumf1[row] += dall * ((acc1_1[0] + (1.f/256.f) * acc2_1[0]) * sc0_l +
+                                             (acc1_1[1] + (1.f/256.f) * acc2_1[1]) * sc1_l +
+                                             (acc1_1[2] + (1.f/256.f) * acc2_1[2]) * sc2_l +
+                                             (acc1_1[3] + (1.f/256.f) * acc2_1[3]) * sc3_l) -
+                                     dmin * (sumy1[0] * sc0_h + sumy1[1] * sc1_h +
+                                             sumy1[2] * sc2_h + sumy1[3] * sc3_h);
+                    } else if (s0 >= 0) {
                         float4 acc1 = {0.f, 0.f, 0.f, 0.f};
                         float4 acc2 = {0.f, 0.f, 0.f, 0.f};
                         #pragma unroll
@@ -7035,8 +7284,7 @@ kernel void kernel_mul_mv_id_q2_K_sum6_batch_f32(
                                              (acc1[3] + (1.f/256.f) * acc2[3]) * (sc[6] & 0xF) * 0.015625f) -
                                      dmin * (sumy0[0] * (sc[0] & 0xF0) + sumy0[1] * (sc[2] & 0xF0) +
                                              sumy0[2] * (sc[4] & 0xF0) + sumy0[3] * (sc[6] & 0xF0));
-                    }
-                    if (s1 >= 0) {
+                    } else if (s1 >= 0) {
                         float4 acc1 = {0.f, 0.f, 0.f, 0.f};
                         float4 acc2 = {0.f, 0.f, 0.f, 0.f};
                         #pragma unroll
