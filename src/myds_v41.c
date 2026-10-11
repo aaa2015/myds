@@ -4646,8 +4646,7 @@ int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
 
     static int decode_split = -1;
     if (decode_split < 0) {
-        const char *e2 = getenv("MYDS_BATCH2_DECODE_SPLIT");
-        const char *e = e2 ? e2 : getenv("MYDS_DECODE_SPLIT");
+        const char *e = getenv("MYDS_DECODE_SPLIT");
         const int n = e ? atoi(e) : 0;
         decode_split = (n > 1 && n <= (int)V41_LAYERS) ? n : 0;
     }
@@ -5027,58 +5026,29 @@ int myds_v41_forward_batch_spec_ex(myds_context_t *ctx, const int32_t *tokens,
     if (myds_v41_batch2_spec_enabled(ctx, n_tokens) &&
         pos < ctx->cfg.max_seq_len && ctx->cfg.max_seq_len - pos >= 2u &&
         pos < ctx->v41->capacity && ctx->v41->capacity - pos >= 2u) {
-
-        static int tree_spec_enabled = -1;
-        if (__builtin_expect(tree_spec_enabled < 0, 0)) {
-            const char *e = getenv("MYDS_TREE_SPEC");
-            tree_spec_enabled = e ? atoi(e) : 1;
+        if (ctx->decode_metrics_active) {
+            ctx->decode_stats.batch2_calls++;
+            ctx->decode_stats.target_forward_calls++;
+            ctx->decode_stats.target_rows += 2;
         }
-
-        if (n_tokens == 3 && tree_spec_enabled &&
-            !myds_dspark_engine_capture_bypass_enabled(ctx->dspark)) {
-            if (ctx->decode_metrics_active) {
-                ctx->decode_stats.batch2_calls++;
-                ctx->decode_stats.target_forward_calls++;
-                ctx->decode_stats.target_rows += 3;
-            }
-            int ret = myds_v41_forward_tree_spec(ctx, tokens, pos, out_tokens);
-            if (snapshot && ctx->v41 && ctx->v41->batch2_ws) {
-                *snapshot = ctx->v41->batch2_ws->snapshot;
-            }
-            if (ctx->decode_metrics_active) {
-                if (ret == 2) ctx->decode_stats.batch2_hits++;
-                else if (ret == 1) ctx->decode_stats.batch2_misses++;
-                else ctx->decode_stats.batch2_failures++;
-            }
-            if (ret > 0) return ret;
-            if (!ctx->v41->valid || ctx->v41->next_position != pos) return -1;
-            if (ctx->decode_metrics_active) ctx->decode_stats.batch2_fallbacks++;
-            MYDS_LOG_W("tree-spec failed; restored state permits sequential verification at pos %u", pos);
-        } else {
-            if (ctx->decode_metrics_active) {
-                ctx->decode_stats.batch2_calls++;
-                ctx->decode_stats.target_forward_calls++;
-                ctx->decode_stats.target_rows += 2;
-            }
-            int ret = v41_forward_batch2(ctx, tokens, pos, out_tokens, snapshot);
-            if (ctx->decode_metrics_active) {
-                if (ret == 2) ctx->decode_stats.batch2_hits++;
-                else if (ret == 1) ctx->decode_stats.batch2_misses++;
-                else ctx->decode_stats.batch2_failures++;
-            }
-            if (ret == 1 && n_tokens >= 3 && out_tokens[0] == tokens[2] &&
-                (!ctx->model->tokenizer || out_tokens[0] != ctx->model->tokenizer->eos_id)) {
-                int32_t next1 = v41_forward_impl(ctx, tokens[2], pos + 1u, true, false);
-                if (next1 < 0) return -1;
-                out_tokens[1] = next1;
-                ctx->pos = pos + 2u;
-                return 2;
-            }
-            if (ret > 0) return ret;
-            if (!ctx->v41->valid || ctx->v41->next_position != pos) return -1;
-            if (ctx->decode_metrics_active) ctx->decode_stats.batch2_fallbacks++;
-            MYDS_LOG_W("batch-2 failed; restored state permits sequential verification at pos %u", pos);
+        int ret = v41_forward_batch2(ctx, tokens, pos, out_tokens, snapshot);
+        if (ctx->decode_metrics_active) {
+            if (ret == 2) ctx->decode_stats.batch2_hits++;
+            else if (ret == 1) ctx->decode_stats.batch2_misses++;
+            else ctx->decode_stats.batch2_failures++;
         }
+        if (ret == 1 && n_tokens >= 3 && out_tokens[0] == tokens[2] &&
+            (!ctx->model->tokenizer || out_tokens[0] != ctx->model->tokenizer->eos_id)) {
+            int32_t next1 = v41_forward_impl(ctx, tokens[2], pos + 1u, true, false);
+            if (next1 < 0) return -1;
+            out_tokens[1] = next1;
+            ctx->pos = pos + 2u;
+            return 2;
+        }
+        if (ret > 0) return ret;
+        if (!ctx->v41->valid || ctx->v41->next_position != pos) return -1;
+        if (ctx->decode_metrics_active) ctx->decode_stats.batch2_fallbacks++;
+        MYDS_LOG_W("batch-2 failed; restored state permits sequential verification at pos %u", pos);
     }
 
     if (snapshot && !myds_v41_spec_snapshot_save(ctx, snapshot, n_tokens >= 2 ? 2 : 1)) return -1;
