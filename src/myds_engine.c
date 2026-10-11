@@ -3511,7 +3511,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                 continue;
             }
 
-            uint32_t draft_cap = ctx->v41 ? 1 : (ctx->dspark ? ctx->dspark->block_size : 4);
+            uint32_t draft_cap = ctx->dspark ? ctx->dspark->block_size : (ctx->v41 ? 1 : 4);
             if (draft_cap > max_gen - step) draft_cap = max_gen - step;
 
             int32_t cand_a = -1, cand_b = -1;
@@ -3526,7 +3526,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                 uint32_t n_dspark = myds_dspark_propose(ctx->dspark, ctx, cur_token, draft_cap);
                 neural_count = n_dspark;
                 ctx->decode_stats.draft_cycles += ctx->dspark->cycles - before_cycles;
-                ctx->decode_stats.draft_proposed += n_dspark;
+                ctx->decode_stats.draft_proposed += (ctx->v41 ? 1 : n_dspark);
                 if (backed_off) ctx->decode_stats.backoff_steps++;
                 else ctx->decode_cycle_speculative = true;
                 if (ctx->decode_stats.timing_enabled)
@@ -3562,7 +3562,7 @@ static int myds_generate_internal(myds_context_t *ctx,
             /* Tree A/B are alternatives at the same position. The sequential
              * tail uses only real continuation drafts, or the single PLD A. */
             uint32_t n_draft = cand_a < 0 ? 0 :
-                (ctx->v41 || ctx->decode_pld_candidate ? 1 : neural_count);
+                (ctx->decode_pld_candidate ? 1 : neural_count);
 
             if (cand_a < 0) {
                 if (ctx->pcache_tokens && ctx->pos < ctx->pcache_cap) {

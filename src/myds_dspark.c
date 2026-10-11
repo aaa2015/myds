@@ -238,15 +238,15 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
 
     // Target capture layer ids for DeepSeek-V4.1: load from GGUF metadata if available, defaulting to {37, 38, 39}
     static const char *const target_layer_keys[] = {
-        "deepseek41-dflash-draft.dflash.capture_layer_ids",
-        "dflash.capture_layer_ids",
-        "dspark.capture_layer_ids",
         "deepseek41-dflash-draft.dflash.target_layer_ids",
+        "dflash.target_layer_ids",
         "dspark.target_layer_ids",
         "deepseek4.dspark.target_layer_ids",
         "deepseek4.dspark_target_layer_ids",
-        "dflash.target_layer_ids",
         "dspark.target_layers",
+        "deepseek41-dflash-draft.dflash.capture_layer_ids",
+        "dflash.capture_layer_ids",
+        "dspark.capture_layer_ids",
     };
     const gguf_kv_t *kv_cap = NULL;
     for (size_t k = 0; k < sizeof(target_layer_keys) / sizeof(target_layer_keys[0]); k++) {
@@ -264,9 +264,9 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
             ds->target_layers[i] = arr[i];
         }
     } else {
-        ds->target_layers[0] = 36;
-        ds->target_layers[1] = 37;
-        ds->target_layers[2] = 38;
+        ds->target_layers[0] = 37;
+        ds->target_layers[1] = 38;
+        ds->target_layers[2] = 39;
     }
 
     const char *env_layers = getenv("MYDS_DSPARK_TARGET_LAYERS");
@@ -1027,8 +1027,8 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
                 // Per-head RMSNorm on Q (64 heads x 512 head_dim)
                 (void)myds_metal_v41_rmsnorm_batch(ws->v_q[d], ws->v_q[d], NULL, 512, 64, 1e-6f, false);
 
-                // RoPE on Q
-                (void)myds_v41_gpu_rope(ws->v_q[d], 512, 64, ctx->pos, false, false);
+                // RoPE on Q (Query d predicts for position ctx->pos + d)
+                (void)myds_v41_gpu_rope(ws->v_q[d], 512, 64, ctx->pos + d, false, false);
             }
         }
 
@@ -1039,7 +1039,8 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
                 if (st->attn_kv_a_norm) {
                     (void)myds_metal_v41_rmsnorm(ws->v_kv_norm[r], ws->v_kv[r], st->attn_kv_a_norm, 512, 1e-6f, true);
                 }
-                (void)myds_v41_gpu_rope(ws->v_kv_norm[r] ? ws->v_kv_norm[r] : ws->v_kv[r], 512, 1, ctx->pos, false, false);
+                uint32_t kv_pos = (r <= 1) ? ctx->pos : (ctx->pos + (uint32_t)(r - 1));
+                (void)myds_v41_gpu_rope(ws->v_kv_norm[r] ? ws->v_kv_norm[r] : ws->v_kv[r], 512, 1, kv_pos, false, false);
                 (void)myds_metal_buffer_copy(ws->stage_kv_cache[s], (size_t)r * 512 * sizeof(float),
                                              ws->v_kv_norm[r] ? ws->v_kv_norm[r] : ws->v_kv[r], 0, 512 * sizeof(float));
             }
@@ -1053,8 +1054,8 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
                                                     NULL, NULL, 0, 0, gpu_s);
             }
 
-            // RoPE round on attention heads
-            (void)myds_v41_gpu_rope_round(ws->v_attn_heads[d], 512, 64, ctx->pos, false, true);
+            // RoPE round on attention heads: slot d is at position ctx->pos + d
+            (void)myds_v41_gpu_rope_round(ws->v_attn_heads[d], 512, 64, ctx->pos + d, false, true);
 
             // Attention Output Down-Up Projection
             if (st->attn_output_a && st->attn_output_b) {
@@ -1626,7 +1627,7 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
     }
 
     ds->draft_count = n_proposed;
-    ds->proposed_tokens += n_proposed;
+    ds->proposed_tokens += (ctx && ctx->v41 ? 1 : n_proposed);
     ds->propose_ms += (now_ms() - t0);
 
     return n_proposed;
