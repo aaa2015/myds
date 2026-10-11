@@ -635,7 +635,7 @@ int myds_dspark_capture_layer_to(myds_dspark_t *ds, uint32_t layer_idx,
         ds->capture_committed = false;
     }
     const int ok = residual && (!target_output || ds->target_hidden_buf) && ds->hc_mean_weights && output &&
-        myds_metal_v41_hc_weighted_sum(output, residual, ds->hc_mean_weights, MYDS_DSPARK_DIM);
+        myds_metal_v41_hc_weighted_sum_round(output, residual, ds->hc_mean_weights, MYDS_DSPARK_DIM, 0);
     if (ok) {
         ds->capture_counters.encoded++;
         if (actual_slot && ds->capture_bypass_mode) ds->capture_valid_mask |= 1u << slot;
@@ -857,7 +857,7 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
         if (st->hc_attn_fn) {
             (void)myds_metal_gemv(ws->target_hc_mix, st->hc_attn_fn, ws->target_flat_hc_norm, 24, 4 * MYDS_DSPARK_DIM, st->hc_attn_fn_type);
             (void)myds_metal_v41_hc_split_batch(ws->target_hc_split, ws->target_hc_mix, st->hc_attn_scale, st->hc_attn_base, 1, 1e-5f);
-            (void)myds_metal_v41_hc_weighted_sum(ws->target_attn_cur, ws->stage_target_hc, ws->target_hc_split, MYDS_DSPARK_DIM);
+            (void)myds_metal_v41_hc_weighted_sum_round(ws->target_attn_cur, ws->stage_target_hc, ws->target_hc_split, MYDS_DSPARK_DIM, 0);
         } else {
             (void)myds_metal_buffer_copy(ws->target_attn_cur, 0, ws->stage_target_hc, 0, stream_bytes);
         }
@@ -888,7 +888,7 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
         if (st->hc_attn_fn) {
             (void)myds_metal_gemv(ws->draft_hc_mix, st->hc_attn_fn, ws->draft_flat_hc_norm, 24, 4 * MYDS_DSPARK_DIM, st->hc_attn_fn_type);
             (void)myds_metal_v41_hc_split_batch(ws->draft_hc_split, ws->draft_hc_mix, st->hc_attn_scale, st->hc_attn_base, 1, 1e-5f);
-            (void)myds_metal_v41_hc_weighted_sum(ws->draft_attn_cur, ws->stage_draft_hc, ws->draft_hc_split, MYDS_DSPARK_DIM);
+            (void)myds_metal_v41_hc_weighted_sum_round(ws->draft_attn_cur, ws->stage_draft_hc, ws->draft_hc_split, MYDS_DSPARK_DIM, 0);
         } else {
             (void)myds_metal_buffer_copy(ws->draft_attn_cur, 0, ws->stage_draft_hc, 0, stream_bytes);
         }
@@ -961,7 +961,7 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
         if (st->hc_ffn_fn) {
             (void)myds_metal_gemv(ws->draft_hc_mix, st->hc_ffn_fn, ws->draft_flat_hc_norm, 24, 4 * MYDS_DSPARK_DIM, st->hc_ffn_fn_type);
             (void)myds_metal_v41_hc_split_batch(ws->draft_hc_split, ws->draft_hc_mix, st->hc_ffn_scale, st->hc_ffn_base, 1, 1e-5f);
-            (void)myds_metal_v41_hc_weighted_sum(ws->ffn_cur, ws->after_attn_hc, ws->draft_hc_split, MYDS_DSPARK_DIM);
+            (void)myds_metal_v41_hc_weighted_sum_round(ws->ffn_cur, ws->after_attn_hc, ws->draft_hc_split, MYDS_DSPARK_DIM, 0);
         } else {
             (void)myds_metal_buffer_copy(ws->ffn_cur, 0, ws->after_attn_hc, 0, stream_bytes);
         }
@@ -1033,7 +1033,7 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
         (void)myds_metal_v41_rmsnorm(ws->draft_flat_hc_norm, ws->stage_draft_hc, NULL, 4 * MYDS_DSPARK_DIM, 1e-6f, false);
         (void)myds_metal_gemv(ws->draft_hc_mix, final_st->hc_ffn_fn, ws->draft_flat_hc_norm, 24, 4 * MYDS_DSPARK_DIM, final_st->hc_ffn_fn_type);
         (void)myds_metal_v41_hc_split_batch(ws->draft_hc_split, ws->draft_hc_mix, final_st->hc_ffn_scale, final_st->hc_ffn_base, 1, 1e-5f);
-        (void)myds_metal_v41_hc_weighted_sum(ws->final_embd, ws->stage_draft_hc, ws->draft_hc_split, MYDS_DSPARK_DIM);
+        (void)myds_metal_v41_hc_weighted_sum_round(ws->final_embd, ws->stage_draft_hc, ws->draft_hc_split, MYDS_DSPARK_DIM, 0);
     } else {
         (void)myds_metal_buffer_copy(ws->final_embd, 0, ws->stage_draft_hc, 0, stream_bytes);
     }
@@ -1154,11 +1154,26 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
         return 0;
     }
 
-    static float markov_scale = -1.0f;
-    if (__builtin_expect(markov_scale < 0.0f, 0)) {
-        const char *env = getenv("MYDS_DSPARK_MARKOV_SCALE");
-        markov_scale = env ? (float)atof(env) : 1.0f; // 1.0 additive residual scale matching ds4
-        MYDS_LOG_I("DSpark Markov bias additive scale: %.2f", markov_scale);
+    static float s_cached_markov_scale = -1.0f;
+    static int s_markov_scale_logged = 0;
+    float markov_scale = 1.0f;
+    const char *no_m = getenv("DS4_DSPARK_NO_MARKOV");
+    if (!no_m) no_m = getenv("MYDS_DSPARK_NO_MARKOV");
+    const bool markov_disabled = (no_m && no_m[0] && strcmp(no_m, "0") != 0);
+
+    const char *scale_env = getenv("MYDS_DSPARK_MARKOV_SCALE");
+    if (scale_env && scale_env[0]) {
+        markov_scale = (float)atof(scale_env);
+    } else if (markov_disabled) {
+        markov_scale = 0.0f;
+    } else if (s_cached_markov_scale >= 0.0f) {
+        markov_scale = s_cached_markov_scale;
+    }
+    s_cached_markov_scale = markov_scale;
+
+    if (!s_markov_scale_logged) {
+        s_markov_scale_logged = 1;
+        MYDS_LOG_I("DSpark Markov bias additive scale: %.2f (no_markov=%d)", markov_scale, (int)markov_disabled);
     }
 
     static float min_conf = -1.0f;
@@ -1172,16 +1187,14 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
     uint32_t n_proposed = 0;
     const uint32_t vocab_size = ctx->model->vocab_size;
 
-    const bool is_f16 = (ds->markov_w1_type == GGML_TYPE_F16 && ds->markov_w2_type == GGML_TYPE_F16);
-    const bool is_q8  = (ds->markov_w1_type == GGML_TYPE_Q8_0 && ds->markov_w2_type == GGML_TYPE_Q8_0);
-    const bool has_markov = (ds->markov_w1 && ds->markov_w2 && (is_f16 || is_q8) &&
-                             ds->markov_state_host && ds->markov_bias_host);
+    // Markov state update: Load w1[prev] into markov_state_host unconditionally so confidence head
+    // [ws->final_embd; markov_state_host] is always correctly conditioned on previous token.
+    const bool is_w1_f16 = (ds->markov_w1_type == GGML_TYPE_F16);
+    const bool is_w1_q8  = (ds->markov_w1_type == GGML_TYPE_Q8_0);
+    const void *w1_base  = ds->markov_w1 ? myds_metal_buffer_data(ds->markov_w1) : NULL;
 
-    const void *w1_base = has_markov ? myds_metal_buffer_data(ds->markov_w1) : NULL;
-    const void *w2_base = has_markov ? myds_metal_buffer_data(ds->markov_w2) : NULL;
-
-    if (has_markov && w1_base && prev >= 0 && (uint32_t)prev < vocab_size) {
-        if (is_f16) {
+    if (w1_base && ds->markov_state_host && (is_w1_f16 || is_w1_q8) && prev >= 0 && (uint32_t)prev < vocab_size) {
+        if (is_w1_f16) {
             const uint16_t *w1_row = ((const uint16_t *)w1_base) + (size_t)prev * 256;
 #if defined(__ARM_NEON)
             for (int k = 0; k < 256; k += 8) {
@@ -1194,7 +1207,7 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
                 ds->markov_state_host[k] = dspark_fp16_to_fp32(w1_row[k]);
             }
 #endif
-        } else if (is_q8) {
+        } else if (is_w1_q8) {
             const q8_0_block_t *w1_row = ((const q8_0_block_t *)w1_base) + (size_t)prev * 8;
             for (int b = 0; b < 8; b++) {
                 float d_scale = dspark_fp16_to_fp32(w1_row[b].d);
@@ -1204,6 +1217,13 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
             }
         }
     }
+
+    const bool is_f16 = (ds->markov_w1_type == GGML_TYPE_F16 && ds->markov_w2_type == GGML_TYPE_F16);
+    const bool is_q8  = (ds->markov_w1_type == GGML_TYPE_Q8_0 && ds->markov_w2_type == GGML_TYPE_Q8_0);
+    const bool has_markov = (!markov_disabled && markov_scale > 0.0f &&
+                             ds->markov_w1 && ds->markov_w2 && (is_f16 || is_q8) &&
+                             ds->markov_state_host && ds->markov_bias_host);
+    const void *w2_base = has_markov ? myds_metal_buffer_data(ds->markov_w2) : NULL;
 
     float confidence = 1.0f;
     const float *base_logits = NULL;

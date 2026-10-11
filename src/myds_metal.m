@@ -2632,16 +2632,17 @@ struct v41_hc_sum_args {
     int32_t round_bf16;
 };
 
-int myds_metal_v41_hc_weighted_sum(myds_metal_buffer_t *out,
+int myds_metal_v41_hc_weighted_sum_round(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *residual, const myds_metal_buffer_t *weights,
-    uint32_t dim) {
+    uint32_t dim, int round_bf16) {
     if (!g_initialized || !g_pso_v41_hc_sum || !v41_floats(out, dim) ||
         !v41_floats(residual, 4ull * dim) || !v41_floats(weights, 4)) return 0;
     @autoreleasepool {
         struct v41_hc_sum_args args = {
             .n_embd=dim, .n_hc=4, .n_tokens=1,
             .nb_x0=4, .nb_x1=4ull*dim, .nb_x2=16ull*dim,
-            .nb_w0=4, .nb_w1=16, .nb0=4, .nb1=4ull*dim, .round_bf16=1,
+            .nb_w0=4, .nb_w1=16, .nb0=4, .nb1=4ull*dim,
+            .round_bf16=round_bf16 ? 1u : 0u,
         };
         id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
         if (!cb) return 0;
@@ -2657,6 +2658,12 @@ int myds_metal_v41_hc_weighted_sum(myds_metal_buffer_t *out,
         metal_dispatch(enc, "v41_hc_sum", MTLSizeMake((dim+nth-1)/nth, 1, 1), MTLSizeMake(nth, 1, 1));
         return v41_finish(cb, enc);
     }
+}
+
+int myds_metal_v41_hc_weighted_sum(myds_metal_buffer_t *out,
+    const myds_metal_buffer_t *residual, const myds_metal_buffer_t *weights,
+    uint32_t dim) {
+    return myds_metal_v41_hc_weighted_sum_round(out, residual, weights, dim, 1);
 }
 
 struct v41_hc_sum_rmsnorm_args {

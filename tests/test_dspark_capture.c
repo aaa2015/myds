@@ -22,10 +22,17 @@ static int capture_hc_stub(myds_metal_buffer_t *out, const myds_metal_buffer_t *
     dispatches++;last_out=out;last_in=in;last_weight=weight;
     return dispatch_ok;
 }
+static int capture_hc_round_stub(myds_metal_buffer_t *out, const myds_metal_buffer_t *in,
+    const myds_metal_buffer_t *weight, uint32_t dim, int round_bf16) {
+    (void)round_bf16;
+    return capture_hc_stub(out, in, weight, dim);
+}
 #define gguf_open capture_gguf_open_stub
 #define myds_metal_commit_batch capture_commit_stub
 #define myds_metal_v41_hc_weighted_sum capture_hc_stub
+#define myds_metal_v41_hc_weighted_sum_round capture_hc_round_stub
 #include "../src/myds_dspark.c"
+#undef myds_metal_v41_hc_weighted_sum_round
 #undef myds_metal_v41_hc_weighted_sum
 #undef myds_metal_commit_batch
 #undef gguf_open
