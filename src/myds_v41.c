@@ -3425,6 +3425,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
         decode_split = (n > 1 && n <= (int)V41_LAYERS) ? n : 0;
     }
     int prev_auto_barrier = -1;
+    int prev_concurrent = -1;
     bool fine_pipeline = false;
     myds_v41_decode_qkv_scope_t qkv_scope = {0};
 #define CHECK(x) do { if (!(x)) goto fail; } while (0)
@@ -3454,6 +3455,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
     }
     CHECK(myds_metal_begin_batch());
     prev_auto_barrier = myds_metal_get_auto_barrier();
+    prev_concurrent = myds_metal_get_concurrent();
     static int attn_output_pipeline_enabled = -1;
     if (attn_output_pipeline_enabled < 0) {
         const char *env = getenv("MYDS_ATTN_OUTPUT_PIPELINE");
@@ -3462,6 +3464,14 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
     fine_pipeline = !trace_on && qkv_pipeline_enabled && attn_output_pipeline_enabled;
     if (fine_pipeline) {
         myds_metal_set_auto_barrier(0);
+        static int decode_concurrent_enabled = -1;
+        if (decode_concurrent_enabled < 0) {
+            const char *env = getenv("MYDS_DECODE_CONCURRENT");
+            decode_concurrent_enabled = (env == NULL || atoi(env) != 0);
+        }
+        if (decode_concurrent_enabled) {
+            myds_metal_set_concurrent(1);
+        }
         const myds_metal_buffer_t *init_deps[] = { g->residual, g->pre };
         myds_metal_barrier_buffers(init_deps, 2);
     }
@@ -3701,6 +3711,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
         CHECK(myds_metal_commit_batch());
         if (fine_pipeline) {
             myds_metal_set_auto_barrier(prev_auto_barrier);
+            myds_metal_set_concurrent(prev_concurrent);
         }
         if (trace_on) CHECK(myds_trace_f32("logits",0,pos,ctx->logits,m->vocab_size));
         const float *logits=myds_metal_buffer_data(ctx->logits);
@@ -3709,6 +3720,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
         CHECK(myds_metal_commit_batch());
         if (fine_pipeline) {
             myds_metal_set_auto_barrier(prev_auto_barrier);
+            myds_metal_set_concurrent(prev_concurrent);
         }
     }
     g->next_position=pos+1u;
@@ -3721,6 +3733,9 @@ fail:
     (void)myds_metal_commit_batch();
     if (prev_auto_barrier >= 0) {
         myds_metal_set_auto_barrier(prev_auto_barrier);
+    }
+    if (prev_concurrent >= 0) {
+        myds_metal_set_concurrent(prev_concurrent);
     }
     myds_dspark_capture_invalidate(ctx->dspark);
     g->valid=false; return -1;

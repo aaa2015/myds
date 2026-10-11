@@ -661,7 +661,15 @@ static int moe_fused_scoped(myds_context_t *ctx, uint32_t layer, uint32_t token,
     myds_metal_set_auto_barrier(0);
     myds_metal_set_concurrent(1);
 
-    /* 1. 并发派发 Router GEMV 与 Shared Expert Gate/Up/SwiGLU 融合算子 */
+    /* 1. 优先并发派发 Router GEMV 流（小算子，立即在 GPU Cycle 0 启动） */
+    if (!myds_metal_v41_gemv(ctx->router_logits, l->router_gate, ctx->ffn_norm_out,
+                             m->n_routed_experts, dim, l->router_gate_type)) {
+        myds_metal_set_auto_barrier(prev_auto_barrier);
+        myds_metal_set_concurrent(prev_concurrent);
+        return 0;
+    }
+
+    /* 2. 并发派发 Shared Expert Gate/Up/SwiGLU 流（与 Router GEMV 在 GPU 上并发） */
     int sh_fused_ok = 0;
     if (is_shared_fuse_enabled()) {
         sh_fused_ok = myds_v41_shared_gate_up_swiglu(
@@ -677,26 +685,6 @@ static int moe_fused_scoped(myds_context_t *ctx, uint32_t layer, uint32_t token,
             myds_metal_set_concurrent(prev_concurrent);
             return 0;
         }
-    }
-
-    if (!myds_metal_v41_gemv(ctx->router_logits, l->router_gate, ctx->ffn_norm_out,
-                             m->n_routed_experts, dim, l->router_gate_type)) {
-        myds_metal_set_auto_barrier(prev_auto_barrier);
-        myds_metal_set_concurrent(prev_concurrent);
-        return 0;
-    }
-
-    /* 2. 仅同步 router_logits，派发路由打分与 Top-K 选择流水线 */
-    myds_metal_barrier_buffer(ctx->router_logits);
-    if (!myds_v41_route(ctx->selected_ids, ctx->selected_weights, ctx->moe_gate, ctx->moe_up,
-                        ctx->router_logits, l->router_bias, m->n_routed_experts, k, m->routed_scaling_factor)) {
-        myds_metal_set_auto_barrier(prev_auto_barrier);
-        myds_metal_set_concurrent(prev_concurrent);
-        return 0;
-    }
-
-    /* 3. 若未融合，仅同步 shared_gate_out 与 shared_up_out，派发 Shared SwiGLU */
-    if (!sh_fused_ok) {
         const myds_metal_buffer_t *shared_gu_deps[] = { ctx->shared_gate_out, ctx->shared_up_out };
         myds_metal_barrier_buffers(shared_gu_deps, 2);
         if (!myds_v41_shared_swiglu(ctx->shared_swiglu_out, ctx->shared_gate_out,
@@ -707,7 +695,7 @@ static int moe_fused_scoped(myds_context_t *ctx, uint32_t layer, uint32_t token,
         }
     }
 
-    /* 4. 仅同步 shared_swiglu_out，派发 Shared Down GEMV */
+    /* 3. 提前入队 Shared Down GEMV（只依赖 shared_swiglu_out，在 routing 屏障前提交入流） */
     myds_metal_barrier_buffer(ctx->shared_swiglu_out);
     if (!myds_v41_decode_gemv_bf16(ctx->shared_out, l->shared_down, ctx->shared_swiglu_out,
                                   dim, width, l->shared_down_type, false)) {
@@ -716,11 +704,20 @@ static int moe_fused_scoped(myds_context_t *ctx, uint32_t layer, uint32_t token,
         return 0;
     }
 
+    /* 4. 仅同步 router_logits，派发路由打分与 Top-K 选择流水线 */
+    myds_metal_barrier_buffer(ctx->router_logits);
+    if (!myds_v41_route(ctx->selected_ids, ctx->selected_weights, ctx->moe_gate, ctx->moe_up,
+                        ctx->router_logits, l->router_bias, m->n_routed_experts, k, m->routed_scaling_factor)) {
+        myds_metal_set_auto_barrier(prev_auto_barrier);
+        myds_metal_set_concurrent(prev_concurrent);
+        return 0;
+    }
+
     /* 5. 仅同步路由输出与选择结果，启动 Routed MoE（与 Shared Down GEMV 在 GPU 上并发） */
     const myds_metal_buffer_t *moe_deps[] = {
-        ctx->selected_ids, ctx->selected_weights
+        ctx->selected_ids, ctx->selected_weights, ctx->moe_gate, ctx->moe_up
     };
-    myds_metal_barrier_buffers(moe_deps, 2);
+    myds_metal_barrier_buffers(moe_deps, 4);
     if (!myds_metal_routed_moe_scoped(ctx->moe_out, ctx->ffn_norm_out, l->ffn_gate_exps,
         l->ffn_up_exps, l->ffn_down_exps, ctx->selected_ids, ctx->selected_weights,
         ctx->moe_gate, ctx->moe_up, ctx->moe_mid, ctx->moe_down, dim, width,
@@ -825,7 +822,7 @@ int myds_v41_moe_pipeline_scoped(myds_context_t *ctx, uint32_t layer, uint32_t t
     myds_metal_set_auto_barrier(0);
     myds_metal_set_concurrent(1);
 
-    /* 1. 并发派发 HC Mix 流 (RMSNorm 20480 + GEMV 24x20480 + Sinkhorn) */
+    /* 1. 并发派发 HC Mix 流 (RMSNorm 20480 + GEMV 24x20480 + Sinkhorn)（只读 after_attn，写 ffn_split） */
     if (!myds_metal_v41_hc_mix(ffn_split, after_attn, ffn_fn, GGML_TYPE_F16,
                                ffn_scale, ffn_base, flat_norm, mix, dim, m->norm_eps, hc_eps)) {
         myds_metal_set_auto_barrier(prev_auto_barrier);
@@ -833,7 +830,15 @@ int myds_v41_moe_pipeline_scoped(myds_context_t *ctx, uint32_t layer, uint32_t t
         return 0;
     }
 
-    /* 2. 并发派发 Shared Expert Gate/Up/SwiGLU 流 */
+    /* 2. 优先并发派发 Router GEMV 流（小算子，立即在 GPU Cycle 0 启动） */
+    if (!myds_metal_v41_gemv(ctx->router_logits, l->router_gate, ctx->ffn_norm_out,
+                             m->n_routed_experts, dim, l->router_gate_type)) {
+        myds_metal_set_auto_barrier(prev_auto_barrier);
+        myds_metal_set_concurrent(prev_concurrent);
+        return 0;
+    }
+
+    /* 3. 并发派发 Shared Expert Gate/Up/SwiGLU 流（与 Router GEMV 在 GPU 上并发） */
     int sh_fused_ok = 0;
     if (is_shared_fuse_enabled()) {
         sh_fused_ok = myds_v41_shared_gate_up_swiglu(
@@ -849,27 +854,6 @@ int myds_v41_moe_pipeline_scoped(myds_context_t *ctx, uint32_t layer, uint32_t t
             myds_metal_set_concurrent(prev_concurrent);
             return 0;
         }
-    }
-
-    /* 3. 并发派发 Router GEMV 流 */
-    if (!myds_metal_v41_gemv(ctx->router_logits, l->router_gate, ctx->ffn_norm_out,
-                             m->n_routed_experts, dim, l->router_gate_type)) {
-        myds_metal_set_auto_barrier(prev_auto_barrier);
-        myds_metal_set_concurrent(prev_concurrent);
-        return 0;
-    }
-
-    /* 4. 仅同步 router_logits，派发路由打分与 Top-K 选择流水线 */
-    myds_metal_barrier_buffer(ctx->router_logits);
-    if (!myds_v41_route(ctx->selected_ids, ctx->selected_weights, ctx->moe_gate, ctx->moe_up,
-                        ctx->router_logits, l->router_bias, m->n_routed_experts, k, m->routed_scaling_factor)) {
-        myds_metal_set_auto_barrier(prev_auto_barrier);
-        myds_metal_set_concurrent(prev_concurrent);
-        return 0;
-    }
-
-    /* 5. 若未融合，仅同步 shared_gate_out 与 shared_up_out，派发 Shared SwiGLU */
-    if (!sh_fused_ok) {
         const myds_metal_buffer_t *shared_gu_deps[] = { ctx->shared_gate_out, ctx->shared_up_out };
         myds_metal_barrier_buffers(shared_gu_deps, 2);
         if (!myds_v41_shared_swiglu(ctx->shared_swiglu_out, ctx->shared_gate_out,
@@ -880,7 +864,7 @@ int myds_v41_moe_pipeline_scoped(myds_context_t *ctx, uint32_t layer, uint32_t t
         }
     }
 
-    /* 6. 仅同步 shared_swiglu_out，派发 Shared Down GEMV */
+    /* 4. 提前入队 Shared Down GEMV（只依赖 shared_swiglu_out，在 routing 屏障前提交入流） */
     myds_metal_barrier_buffer(ctx->shared_swiglu_out);
     if (!myds_v41_decode_gemv_bf16(ctx->shared_out, l->shared_down, ctx->shared_swiglu_out,
                                   dim, width, l->shared_down_type, false)) {
@@ -889,11 +873,20 @@ int myds_v41_moe_pipeline_scoped(myds_context_t *ctx, uint32_t layer, uint32_t t
         return 0;
     }
 
-    /* 7. 仅同步路由输出与选择结果，启动 Routed MoE（与 Shared Down GEMV 在 GPU 上并发） */
+    /* 5. 仅同步 router_logits，派发路由打分与 Top-K 选择流水线 */
+    myds_metal_barrier_buffer(ctx->router_logits);
+    if (!myds_v41_route(ctx->selected_ids, ctx->selected_weights, ctx->moe_gate, ctx->moe_up,
+                        ctx->router_logits, l->router_bias, m->n_routed_experts, k, m->routed_scaling_factor)) {
+        myds_metal_set_auto_barrier(prev_auto_barrier);
+        myds_metal_set_concurrent(prev_concurrent);
+        return 0;
+    }
+
+    /* 6. 仅同步路由输出与选择结果，启动 Routed MoE（与 Shared Down GEMV 在 GPU 上并发） */
     const myds_metal_buffer_t *moe_deps[] = {
-        ctx->selected_ids, ctx->selected_weights
+        ctx->selected_ids, ctx->selected_weights, ctx->moe_gate, ctx->moe_up
     };
-    myds_metal_barrier_buffers(moe_deps, 2);
+    myds_metal_barrier_buffers(moe_deps, 4);
     if (!myds_metal_routed_moe_scoped(ctx->moe_out, ctx->ffn_norm_out, l->ffn_gate_exps,
         l->ffn_up_exps, l->ffn_down_exps, ctx->selected_ids, ctx->selected_weights,
         ctx->moe_gate, ctx->moe_up, ctx->moe_mid, ctx->moe_down, dim, width,
@@ -904,7 +897,7 @@ int myds_v41_moe_pipeline_scoped(myds_context_t *ctx, uint32_t layer, uint32_t t
         return 0;
     }
 
-    /* 8. 等待 Routed MoE (moe_out), Shared Expert (shared_out), 和 HC Mix (ffn_split) 三路全部汇聚 */
+    /* 7. 等待 Routed MoE (moe_out), Shared Expert (shared_out), 和 HC Mix (ffn_split) 三路全部汇聚 */
     const myds_metal_buffer_t *final_deps[] = { ctx->moe_out, ctx->shared_out, ffn_split };
     myds_metal_barrier_buffers(final_deps, 3);
 
