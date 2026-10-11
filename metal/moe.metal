@@ -3408,8 +3408,8 @@ kernel void kernel_mul_mv_q4_K_dense_f32_bf16(
  * once for two independent input rows (tokens 0 and 1). Reuses the exact
  * 4-bit nibble unpacking, scaling, and intra-simdgroup reduction as
  * kernel_mul_mv_q4_K_f32_impl. Rounds final outputs directly to BF16. */
-template<short NR0, typename args_t = constant ds4_metal_args_mul_mv &>
-void kernel_dsv41_q4_K_shared2_bf16_impl(
+template<short NR0, bool BF16_ROUND = true, typename args_t = constant ds4_metal_args_mul_mv &>
+void kernel_dsv41_q4_K_shared2_impl(
         args_t args,
         device const char *weight,
         device const float *input0, device const float *input1,
@@ -3535,10 +3535,22 @@ void kernel_dsv41_q4_K_shared2_bf16_impl(
         float sum_all0 = simd_sum(sumf[0][row]);
         float sum_all1 = simd_sum(sumf[1][row]);
         if (tiisg == 0) {
-            output0[first_row + row] = dsv4_mv_bf16_store(sum_all0);
-            output1[first_row + row] = dsv4_mv_bf16_store(sum_all1);
+            output0[first_row + row] = BF16_ROUND ? dsv4_mv_bf16_store(sum_all0) : sum_all0;
+            output1[first_row + row] = BF16_ROUND ? dsv4_mv_bf16_store(sum_all1) : sum_all1;
         }
     }
+}
+
+template<short NR0, typename args_t = constant ds4_metal_args_mul_mv &>
+void kernel_dsv41_q4_K_shared2_bf16_impl(
+        args_t args,
+        device const char *weight,
+        device const float *input0, device const float *input1,
+        device float *output0, device float *output1,
+        threadgroup char *shmem,
+        uint3 tgpig, ushort tiisg, ushort sgitg) {
+    kernel_dsv41_q4_K_shared2_impl<NR0, true, args_t>(
+        args, weight, input0, input1, output0, output1, shmem, tgpig, tiisg, sgitg);
 }
 
 #define DSV41_Q4_K_SHARED2_KERNEL(NR) \
@@ -3550,7 +3562,17 @@ kernel void kernel_dsv41_q4_K_shared2_bf16_r##NR( \
         threadgroup char *shmem [[threadgroup(0)]], \
         uint3 tgpig [[threadgroup_position_in_grid]], \
         ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
-    kernel_dsv41_q4_K_shared2_bf16_impl<NR>(args,weight,input0,input1,output0,output1,shmem,tgpig,tiisg,sgitg); \
+    kernel_dsv41_q4_K_shared2_impl<NR, true>(args,weight,input0,input1,output0,output1,shmem,tgpig,tiisg,sgitg); \
+} \
+kernel void kernel_dsv41_q4_K_shared2_f32_r##NR( \
+        constant ds4_metal_args_mul_mv &args [[buffer(0)]], \
+        device const char *weight [[buffer(1)]], \
+        device const float *input0 [[buffer(2)]], device const float *input1 [[buffer(3)]], \
+        device float *output0 [[buffer(4)]], device float *output1 [[buffer(5)]], \
+        threadgroup char *shmem [[threadgroup(0)]], \
+        uint3 tgpig [[threadgroup_position_in_grid]], \
+        ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
+    kernel_dsv41_q4_K_shared2_impl<NR, false>(args,weight,input0,input1,output0,output1,shmem,tgpig,tiisg,sgitg); \
 }
 DSV41_Q4_K_SHARED2_KERNEL(2)
 DSV41_Q4_K_SHARED2_KERNEL(4)

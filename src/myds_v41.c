@@ -3725,13 +3725,17 @@ int myds_v41_batch2_projection_probe(myds_metal_buffer_t *out[2],
                 myds_metal_barrier_buffers(results, 2);
                 return 1;
             }
-        } else if (type == GGML_TYPE_Q8_0 && kind == MYDS_V41_BATCH2_LM_HEAD) {
-            const int shared = myds_metal_batch2_q8_shared_mode();
+        } else if ((type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_K) && kind == MYDS_V41_BATCH2_LM_HEAD) {
+            const int shared = (type == GGML_TYPE_Q4_K) ? myds_metal_batch2_q4_shared_mode()
+                                                        : myds_metal_batch2_q8_shared_mode();
             if (shared < 0) return 0;
             if (shared) {
                 const myds_metal_buffer_t *deps[] = {input[0], input[1]};
                 myds_metal_barrier_buffers(deps, 2);
-                if (!myds_metal_v41_gemv_shared2_q8_f32(out, weight, input, rows, width)) return 0;
+                int ok = (type == GGML_TYPE_Q4_K)
+                    ? myds_metal_v41_gemv_shared2_q4_f32(out, weight, input, rows, width)
+                    : myds_metal_v41_gemv_shared2_q8_f32(out, weight, input, rows, width);
+                if (!ok) return 0;
                 const myds_metal_buffer_t *results[] = {out[0], out[1]};
                 myds_metal_barrier_buffers(results, 2);
                 return 1;
@@ -3783,8 +3787,8 @@ static int v41_batch2_attention_token(myds_context_t *ctx, uint32_t il, uint32_t
     const uint32_t top = count < V41_TOPK ? count : V41_TOPK;
     const uint32_t nraw = pos + 1u < V41_WINDOW ? pos + 1u : V41_WINDOW;
     if (!myds_v41_gpu_qkv_finish(q, kv, g->window[il], pos, compressed)) return 0;
-    myds_metal_barrier_buffer(g->window[il]);
-    myds_metal_barrier_buffer(q);
+    const myds_metal_buffer_t *qkv_deps[] = {g->window[il], q};
+    myds_metal_barrier_buffers(qkv_deps, 2);
     const bool ordinary_allowed = !myds_trace_active();
     if (!publish_and_select_batch2(ctx, il, pos, x_norm, qr_norm,
                                    selected, block_mask, block_mask, ordinary_allowed)) return 0;
@@ -4231,7 +4235,8 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
 
     static int decode_split = -1;
     if (decode_split < 0) {
-        const char *e = getenv("MYDS_DECODE_SPLIT");
+        const char *e2 = getenv("MYDS_BATCH2_DECODE_SPLIT");
+        const char *e = e2 ? e2 : getenv("MYDS_DECODE_SPLIT");
         const int n = e ? atoi(e) : 0;
         decode_split = (n > 1 && n <= (int)V41_LAYERS) ? n : 0;
     }
@@ -4373,9 +4378,13 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
                                                   g->previous_kv[owner], 0, 512u * sizeof(float)));
                     CHECK(myds_metal_buffer_copy(ws->first_previous_score[owner], 0,
                                                   g->previous_score[owner], 0, 512u * sizeof(float)));
+                    const myds_metal_buffer_t *attn_t0_deps[] = {
+                        g->window[il], g->previous_kv[owner], g->previous_score[owner]
+                    };
+                    myds_metal_barrier_buffers(attn_t0_deps, 3);
+                } else {
+                    myds_metal_barrier_buffer(g->window[il]);
                 }
-                /* The next token writes the same window and reuses attention scratch. */
-                myds_metal_barrier();
             }
         }
         myds_metal_barrier_buffer(ws->attn_heads_b2);

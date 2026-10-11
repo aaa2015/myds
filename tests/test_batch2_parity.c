@@ -289,7 +289,7 @@ static int test_authoritative_projection(uint32_t rows, uint32_t width,
           ((kind == MYDS_V41_BATCH2_QKV || kind == MYDS_V41_BATCH2_TAIL || kind == MYDS_V41_BATCH2_SHARED) &&
            myds_v41_decode_q8_fuse_bf16_enabled()))) ||
         (type == GGML_TYPE_Q4_K && myds_metal_batch2_q4_shared_mode() > 0 &&
-         (kind == MYDS_V41_BATCH2_QKV || kind == MYDS_V41_BATCH2_TAIL || kind == MYDS_V41_BATCH2_SHARED))) {
+         (kind == MYDS_V41_BATCH2_QKV || kind == MYDS_V41_BATCH2_TAIL || kind == MYDS_V41_BATCH2_SHARED || kind == MYDS_V41_BATCH2_LM_HEAD))) {
         CHECK(after.encoded > before.encoded);
     }
     for (uint32_t t = 0; t < 2; ++t) {
@@ -747,6 +747,8 @@ int main(void) {
     if (!test_authoritative_projection(384, 5120, GGML_TYPE_F32, MYDS_V41_BATCH2_ROUTER)) return 1;
     if (!test_authoritative_projection(1024, 5120, GGML_TYPE_Q8_0, MYDS_V41_BATCH2_LM_HEAD)) return 1;
     if (!test_authoritative_projection(129280, 5120, GGML_TYPE_Q8_0, MYDS_V41_BATCH2_LM_HEAD)) return 1;
+    if (!test_authoritative_projection(1024, 5120, GGML_TYPE_Q4_K, MYDS_V41_BATCH2_LM_HEAD)) return 1;
+    if (!test_authoritative_projection(129280, 5120, GGML_TYPE_Q4_K, MYDS_V41_BATCH2_LM_HEAD)) return 1;
 
     // 9. Batch-2 Attention Output A
     if (!test_batch2_attn_output_a()) return 1;
