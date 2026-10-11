@@ -63,6 +63,13 @@ int myds_v41_gpu_rope(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
     uint32_t pos,bool compressed,bool inverse);
 int myds_v41_gpu_rope_round(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
     uint32_t pos,bool compressed,bool inverse);
+/* DSpark's F32 activation contract is separate from target-model BF16 QAT.
+ * Adjacent-pair RoPE touches only the last 64 columns, base 10000, no YaRN.
+ * KV QAT uses 64-column E4M3FN blocks on columns [0,448), leaving [448,512)
+ * unchanged. These in-place helpers join prior readers/writers in auto0. */
+int myds_dspark_gpu_rope(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
+    uint32_t pos,bool inverse);
+int myds_dspark_gpu_quant_kv(myds_metal_buffer_t *x,uint32_t rows);
 int myds_v41_gpu_rope_batch(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
     uint32_t start_pos,uint32_t rows,bool compressed,bool inverse);
 int myds_v41_gpu_rope_batch_round(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,

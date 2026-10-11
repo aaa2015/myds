@@ -68,14 +68,24 @@ def suite(args):
                 argv.append('--reinit')
             records = run(binary, argv, gate, down)
             cases = [r for r in records if r['kind'] == 'case']
+            guards = [r for r in records if r['kind'] == 'top3_rejected']
             phases = (0, 1, 2) if reinit else (0,)
             expected_downs = (effective_down, 4, effective_gate) if reinit else (effective_down,)
             seen = set()
             phase_hashes = []
             for phase, expected in zip(phases, expected_downs):
                 phase_cases = [r for r in cases if r['phase'] == phase]
-                if len(phase_cases) != 10:
-                    raise RuntimeError('Expected ten nonzero cases per initialization')
+                if len(phase_cases) != 8:
+                    raise RuntimeError('Expected eight nonzero top6/Q2 cases per initialization')
+                phase_guards = [r for r in guards if r['phase'] == phase]
+                if len(phase_guards) != 2 or {r['batch'] for r in phase_guards} != {0, 1}:
+                    raise RuntimeError('Expected standalone and batched top3 rejection guards')
+                for guard in phase_guards:
+                    if (guard['dim'], guard['width'], guard['active'], guard['tokens']) != (512, 256, 3, 2):
+                        raise RuntimeError('Unexpected top3 guard shape')
+                    if guard['dispatches'] != 0 or not all(guard[key] for key in (
+                            'all_buffers_unchanged', 'canaries', 'pass')):
+                        raise RuntimeError('Top3 guard dispatched work or modified buffers')
                 hashes = {}
                 raw = {}
                 for case in phase_cases:
@@ -97,10 +107,13 @@ def suite(args):
                 if raw != baseline:
                     mismatches = [key for key in raw if raw[key] != baseline.get(key)]
                     raise RuntimeError('Cross-process/reinit outputs are not byte exact: ' + ', '.join(mismatches))
-                phase_hashes.append({'phase': phase, 'down_nsg': expected, 'output_sha256': hashes})
+                phase_hashes.append({'phase': phase, 'down_nsg': expected, 'output_sha256': hashes,
+                                     'top3_rejection_guards': phase_guards})
             report['processes'].append({'name': name, 'iq2_nsg': effective_gate,
                                         'phases': phase_hashes})
-    report.update(audit_pass=True, byte_exact=True, cases_per_initialization=10,
+    report.update(audit_pass=True, byte_exact=True, cases_per_initialization=8,
+                  top3_rejection_guards_per_initialization=2,
+                  top3_rejected_before_dispatch=True, top3_all_buffers_unchanged=True,
                   tested_initializations=8, model_loaded=False)
     return report
 

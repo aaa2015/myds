@@ -164,6 +164,21 @@ int myds_v41_shared_swiglu(myds_metal_buffer_t *out,
                     (width+255)/256,256,0);
 }
 
+int myds_dspark_shared_swiglu(myds_metal_buffer_t *out,
+    const myds_metal_buffer_t *gate, const myds_metal_buffer_t *up,
+    uint32_t width, float clamp_val) {
+    if (!width || width > INT32_MAX || !isfinite(clamp_val) || clamp_val < 0 ||
+        !sized(out, width) || !sized(gate, width) || !sized(up, width)) return 0;
+    struct glu_args args = {.ne00=(int32_t)width,.nb01=(uint64_t)width*4,
+        .ne10=(int32_t)width,.nb11=(uint64_t)width*4,.ne0=(int32_t)width,
+        .nb1=(uint64_t)width*4,.alpha=1,.limit=clamp_val,.round_bf16=0};
+    const myds_metal_buffer_t *buffers[] = {gate, up, out};
+    if (!dispatch("kernel_swiglu_flat_f32", &args, sizeof(args), buffers, 3,
+                   (width+255)/256, 256, 0)) return 0;
+    myds_metal_barrier_buffer(out);
+    return 1;
+}
+
 static inline bool is_shared_fuse_enabled(void) {
     static int cached = -1;
     if (__builtin_expect(cached < 0, 0)) {
@@ -718,6 +733,12 @@ int myds_dspark_route_fused(myds_metal_buffer_t *selected, myds_metal_buffer_t *
 
     const uint32_t experts = 128;
     const uint64_t total = (uint64_t)experts * (uint64_t)rows;
+    /* Shader row indices and count are uint32_t. Validate all buffer views
+     * before dispatch; a short view must fail without issuing GPU work. */
+    if (total > UINT32_MAX || !sized(logits, (size_t)total) ||
+        !sized(selected, (size_t)top_k * rows) ||
+        !sized(weights, (size_t)top_k * rows) ||
+        (bias && !sized(bias, experts))) return 0;
     struct route_args args = {
         .count = (uint32_t)total,
         .top_k = top_k,
@@ -740,6 +761,85 @@ int myds_dspark_route_fused(myds_metal_buffer_t *selected, myds_metal_buffer_t *
         return 1;
     }
     return 0;
+}
+
+/* ABI shared with metal/moe.metal's ds4_metal_glm_routed_moe_args. Those
+ * kernels implement Q2_K addressing and a dynamic expert count; the target's
+ * IQ2_XXS and sum6 kernels cannot execute DSpark's Q2_K/top-3 weights. */
+struct dspark_moe_args {
+    uint32_t in_dim, mid_dim, out_dim, n_total_expert, n_expert_used;
+    uint32_t n_tokens, mid_token_stride, down_type;
+    float swiglu_clamp;
+    int32_t tp_rank, tp_world, tp_expert_base;
+    uint64_t gate_expert_bytes, gate_row_bytes, up_expert_bytes, up_row_bytes;
+    uint64_t down_expert_bytes, down_row_bytes;
+};
+_Static_assert(sizeof(struct dspark_moe_args) == 96, "DSpark MoE shader ABI");
+
+int myds_dspark_moe(myds_metal_buffer_t *moe_out,
+    const myds_metal_buffer_t *x_in,
+    const myds_metal_buffer_t *gate_exps, const myds_metal_buffer_t *up_exps,
+    const myds_metal_buffer_t *down_exps,
+    const myds_metal_buffer_t *selected_ids, const myds_metal_buffer_t *selected_weights,
+    myds_metal_buffer_t *scratch_gate, myds_metal_buffer_t *scratch_up,
+    myds_metal_buffer_t *scratch_mid, myds_metal_buffer_t *scratch_down,
+    uint32_t dim, uint32_t expert_dim, uint32_t n_routed_experts,
+    uint32_t n_activated_experts, ggml_type gate_type, ggml_type up_type,
+    ggml_type down_type, float clamp_val) {
+    (void)scratch_gate; (void)scratch_up; (void)scratch_down;
+    if (!dim || !expert_dim || dim % 256u || expert_dim % 256u ||
+        dim > INT32_MAX || expert_dim > INT32_MAX / 3u ||
+        n_routed_experts < 3u || n_routed_experts > INT32_MAX ||
+        n_activated_experts != 3u || gate_type != GGML_TYPE_Q2_K ||
+        up_type != GGML_TYPE_Q2_K || down_type != GGML_TYPE_Q2_K ||
+        !isfinite(clamp_val) || clamp_val < 0.0f) return 0;
+
+    const uint64_t gate_row = (uint64_t)(dim / 256u) * 84u;
+    const uint64_t down_row = (uint64_t)(expert_dim / 256u) * 84u;
+    const uint64_t gate_expert = gate_row * expert_dim;
+    const uint64_t down_expert = down_row * dim;
+    if (!gate_exps || !up_exps || !down_exps ||
+        gate_expert > SIZE_MAX / n_routed_experts ||
+        down_expert > SIZE_MAX / n_routed_experts ||
+        myds_metal_buffer_size(gate_exps) < gate_expert * n_routed_experts ||
+        myds_metal_buffer_size(up_exps) < gate_expert * n_routed_experts ||
+        myds_metal_buffer_size(down_exps) < down_expert * n_routed_experts ||
+        !sized(moe_out, dim) || !sized(x_in, dim) || !sized(selected_ids, 3u) ||
+        !sized(selected_weights, 3u) || !sized(scratch_mid, (size_t)3u * expert_dim)) return 0;
+    /* Both PSOs must be available before encoding either half of this graph. */
+    const char *pair_kernel = "kernel_glm_q2_K_pair_swiglu_f32";
+    const char *down_kernel = "kernel_glm_q2_K_down_f32";
+    if (myds_metal_kernel_max_threads(pair_kernel) < 64u ||
+        myds_metal_kernel_max_threads(down_kernel) < 64u) return 0;
+
+    const struct dspark_moe_args args = {
+        .in_dim = dim, .mid_dim = expert_dim, .out_dim = dim,
+        .n_total_expert = n_routed_experts, .n_expert_used = 3u,
+        .n_tokens = 1u, .mid_token_stride = 3u * expert_dim,
+        .down_type = GGML_TYPE_Q2_K, .swiglu_clamp = clamp_val,
+        .tp_rank = 0, .tp_world = 1, .tp_expert_base = 0,
+        .gate_expert_bytes = gate_expert, .gate_row_bytes = gate_row,
+        .up_expert_bytes = gate_expert, .up_row_bytes = gate_row,
+        .down_expert_bytes = down_expert, .down_row_bytes = down_row,
+    };
+    /* GLM Q2 kernels use two SIMD groups with two output rows each. This
+     * geometry is independent of the target's MYDS_MOE_* NSG settings. */
+    const uint32_t threads[3] = {32u, 2u, 1u};
+    const uint32_t pair_groups[3] = {(expert_dim + 3u) / 4u, 3u, 1u};
+    const myds_metal_buffer_t *pair_buffers[] = {
+        gate_exps, up_exps, x_in, selected_ids, selected_weights, scratch_mid,
+    };
+    if (!myds_metal_dispatch_kernel(pair_kernel, &args, sizeof(args), pair_buffers,
+                                    6u, pair_groups, threads, 16u)) return 0;
+    myds_metal_barrier_buffer(scratch_mid);
+    const uint32_t down_groups[3] = {(dim + 3u) / 4u, 1u, 1u};
+    const myds_metal_buffer_t *down_buffers[] = {
+        down_exps, selected_ids, scratch_mid, moe_out,
+    };
+    if (!myds_metal_dispatch_kernel(down_kernel, &args, sizeof(args), down_buffers,
+                                    4u, down_groups, threads, 16u)) return 0;
+    myds_metal_barrier_buffer(moe_out);
+    return 1;
 }
 
 

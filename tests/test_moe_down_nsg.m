@@ -91,6 +91,30 @@ static void routed_case(const char *directory,unsigned phase,uint32_t dim,uint32
       out=allocate((size_t)tokens*dim*4u);
     iq2_fill(gate,17); iq2_fill(up,71); q2_fill(down,29); activation_fill(x,43);
     selected_fill(ids,weights,tokens,active);
+    struct guarded all[]={gate,up,down,x,ids,weights,sg,su,mid,sd,out};
+    if (active==3u) {
+        /* The target execution graph uses a fixed sum6 and cannot accept
+         * top-3. Verify rejection before any dispatch or buffer mutation. */
+        uint64_t before[sizeof(all)/sizeof(*all)];
+        for (size_t i=0;i<sizeof(all)/sizeof(*all);i++)
+            before[i]=fnv(myds_metal_buffer_data(all[i].owner),all[i].bytes+32u);
+        if (batch) REQUIRE(myds_metal_begin_batch());
+        myds_metal_dispatch_count_reset();
+        REQUIRE(!myds_metal_routed_moe_batch(out.view,x.view,gate.view,up.view,down.view,
+            ids.view,weights.view,sg.view,su.view,mid.view,sd.view,dim,width,experts,active,tokens,
+            GGML_TYPE_IQ2_XXS,GGML_TYPE_IQ2_XXS,GGML_TYPE_Q2_K,10.0f));
+        REQUIRE(myds_metal_dispatch_count()==0);
+        if (batch) REQUIRE(myds_metal_commit_batch());
+        for (size_t i=0;i<sizeof(all)/sizeof(*all);i++) {
+            REQUIRE(fnv(myds_metal_buffer_data(all[i].owner),all[i].bytes+32u)==before[i]);
+            release(all[i]);
+        }
+        printf("{\"kind\":\"top3_rejected\",\"phase\":%u,\"dim\":%u,\"width\":%u,"
+               "\"active\":3,\"tokens\":%u,\"batch\":%d,\"dispatches\":0,"
+               "\"all_buffers_unchanged\":true,\"canaries\":true,\"pass\":true}\n",
+               phase,dim,width,tokens,batch);
+        return;
+    }
     if (batch) REQUIRE(myds_metal_begin_batch());
     myds_metal_dispatch_count_reset();
     REQUIRE(myds_metal_routed_moe_batch(out.view,x.view,gate.view,up.view,down.view,
@@ -100,7 +124,6 @@ static void routed_case(const char *directory,unsigned phase,uint32_t dim,uint32
     if (batch) REQUIRE(myds_metal_commit_batch());
     char name[128]; snprintf(name,sizeof(name),"routed-%u-%u-%u-%u-batch%d",dim,width,active,tokens,batch);
     export_buffers(directory,phase,name,mid,out);
-    struct guarded all[]={gate,up,down,x,ids,weights,sg,su,mid,sd,out};
     for (size_t i=0;i<sizeof(all)/sizeof(*all);i++) release(all[i]);
 }
 

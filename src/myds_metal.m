@@ -1194,6 +1194,10 @@ int myds_metal_init(const char *shader_dir) {
                         @"kernel_myds_v41_route_finish",
                         @"kernel_myds_v41_ids_f32",
                         @"kernel_myds_dspark_route_fused_128",
+                        @"kernel_myds_dspark_rope_f32",
+                        @"kernel_myds_dspark_kv_fp8_f32",
+                        @"kernel_glm_q2_K_pair_swiglu_f32",
+                        @"kernel_glm_q2_K_down_f32",
                         /* V4.1 Vision encoder */
                         @"kernel_visenc_round",
                         @"kernel_visenc_bias",
@@ -4620,7 +4624,10 @@ int myds_metal_routed_moe_batch(
         !scratch_mid || !scratch_down || n_tok == 0) {
         return 0;
     }
-    if (n_activated_experts != 6 && n_activated_experts != 3) {
+    /* This graph hardcodes IQ2_XXS gate/up, Q2_K down and a six-expert sum.
+     * DSpark's Q2_K/top-3 graph has a separate entry point. */
+    if (n_activated_experts != 6 || gate_type != GGML_TYPE_IQ2_XXS ||
+        up_type != GGML_TYPE_IQ2_XXS || down_type != GGML_TYPE_Q2_K) {
         return 0;
     }
     if (!g_pso_moe_mv_id_iq2_xxs || !g_pso_moe_mv_id_q2_k ||

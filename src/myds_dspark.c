@@ -14,6 +14,12 @@
 #include <math.h>
 #include <sys/time.h>
 
+/* Proposal contract fixtures replace only the neural stage boundary; the
+ * production selector, Markov conditioning and publication still run. */
+#ifndef DSPARK_EVAL_STAGES
+#define DSPARK_EVAL_STAGES myds_dspark_eval_stages
+#endif
+
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -213,7 +219,6 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
     uint32_t stages = gguf_get_u32(gguf, "dspark.stage_count", 0);
     if (!stages) stages = gguf_get_u32(gguf, "deepseek41-dflash-draft.block_count", 3);
     ds->stage_count = stages;
-    if (ds->stage_count > MYDS_DSPARK_MAX_STAGES) ds->stage_count = MYDS_DSPARK_MAX_STAGES;
 
     uint32_t bsize = gguf_get_u32(gguf, "dspark.block_size", 0);
     if (!bsize) bsize = gguf_get_u32(gguf, "deepseek41-dflash-draft.dflash.block_size", MYDS_DSPARK_DEFAULT_BLOCK_SIZE);
@@ -235,24 +240,48 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
     if (!kexp) kexp = gguf_get_u32(gguf, "deepseek41-dflash-draft.expert_used_count", 3);
     ds->num_experts_per_tok = kexp;
     ds->current_seed_token = -1;
+    ds->rms_eps = gguf_get_f32(gguf, "deepseek41-dflash-draft.attention.layer_norm_rms_epsilon", 1e-6f);
+    ds->hc_eps = gguf_get_f32(gguf, "deepseek41-dflash-draft.hyper_connection.epsilon", 1e-5f);
+    ds->route_scale = gguf_get_f32(gguf, "deepseek41-dflash-draft.expert_weights_scale", 1.5f);
+    ds->swiglu_clamp = gguf_get_f32(gguf, "deepseek41-dflash-draft.swiglu_clamp_exp", 10.0f);
 
-    // Target capture layer ids for DeepSeek-V4.1: load from GGUF metadata if available, defaulting to {37, 38, 39}
+    /* The workspace and kernels implement this checkpoint geometry. Reject
+     * metadata that would resize CPU state or overrun fixed router views. */
+    if (ds->stage_count != 3u || ds->block_size != MYDS_DSPARK_DEFAULT_BLOCK_SIZE ||
+        ds->markov_rank != MYDS_DSPARK_MARKOV_RANK || ds->n_routed_experts != 128u ||
+        ds->num_experts_per_tok != 3u || ds->noise_token_id >= vocab_size ||
+        !isfinite(ds->rms_eps) || ds->rms_eps < 0.0f ||
+        !isfinite(ds->hc_eps) || ds->hc_eps <= 0.0f ||
+        !isfinite(ds->route_scale) || ds->route_scale <= 0.0f ||
+        !isfinite(ds->swiglu_clamp) || ds->swiglu_clamp < 0.0f) {
+        MYDS_LOG_E("dspark: unsupported checkpoint geometry or numerical metadata");
+        gguf_close(gguf);
+        free(ds);
+        return NULL;
+    }
+
+    // Official checkpoint capture defaults are zero-based blocks {36, 37, 38}.
+    /* capture_layer_ids are zero-based block indices. target_layer_ids in
+     * the official DFlash GGUF describe hidden-state boundaries (one-based).
+     * The target graph passes its zero-based post-FFN block index here. */
     static const char *const target_layer_keys[] = {
+        "deepseek41-dflash-draft.dflash.capture_layer_ids",
+        "dflash.capture_layer_ids",
+        "dspark.capture_layer_ids",
         "deepseek41-dflash-draft.dflash.target_layer_ids",
         "dflash.target_layer_ids",
         "dspark.target_layer_ids",
         "deepseek4.dspark.target_layer_ids",
         "deepseek4.dspark_target_layer_ids",
         "dspark.target_layers",
-        "deepseek41-dflash-draft.dflash.capture_layer_ids",
-        "dflash.capture_layer_ids",
-        "dspark.capture_layer_ids",
     };
     const gguf_kv_t *kv_cap = NULL;
+    bool hidden_boundary_ids = false;
     for (size_t k = 0; k < sizeof(target_layer_keys) / sizeof(target_layer_keys[0]); k++) {
         kv_cap = gguf_find_key(gguf, target_layer_keys[k]);
         if (kv_cap && kv_cap->type == GGUF_TYPE_ARRAY && kv_cap->value.val_arr.count >= MYDS_DSPARK_TARGET_LAYERS &&
             (kv_cap->value.val_arr.elem_type == GGUF_TYPE_UINT32 || kv_cap->value.val_arr.elem_type == GGUF_TYPE_INT32)) {
+            hidden_boundary_ids = (k == 3u || k == 4u);
             break;
         }
         kv_cap = NULL;
@@ -261,12 +290,18 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
     if (kv_cap) {
         const uint32_t *arr = (const uint32_t *)kv_cap->value.val_arr.data;
         for (int i = 0; i < MYDS_DSPARK_TARGET_LAYERS; i++) {
-            ds->target_layers[i] = arr[i];
+            if (hidden_boundary_ids && arr[i] == 0u) {
+                MYDS_LOG_E("dspark: invalid one-based target hidden-state boundary");
+                gguf_close(gguf);
+                free(ds);
+                return NULL;
+            }
+            ds->target_layers[i] = arr[i] - (hidden_boundary_ids ? 1u : 0u);
         }
     } else {
-        ds->target_layers[0] = 37;
-        ds->target_layers[1] = 38;
-        ds->target_layers[2] = 39;
+        ds->target_layers[0] = 36;
+        ds->target_layers[1] = 37;
+        ds->target_layers[2] = 38;
     }
 
     const char *env_layers = getenv("MYDS_DSPARK_TARGET_LAYERS");
@@ -918,15 +953,37 @@ static inline void dspark_update_top2(int32_t tok, float score,
 }
 
 int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_conf, float *out_confidence) {
+    if (out_confidence) *out_confidence = NAN;
     if (!ds || !ctx || !ctx->model) return 0;
     if (!capture_consumer_ready(ds)) {
         ds->capture_counters.stale_rejections++;
         return 0;
     }
-    if (!ds->ws) return 0;
+    if (!ds->ws || !ds->stage_count || ds->stage_count > MYDS_DSPARK_MAX_STAGES ||
+        ds->current_seed_position > 1048576u - MYDS_DSPARK_DEFAULT_BLOCK_SIZE ||
+        ds->current_output_slot >= MYDS_DSPARK_DEFAULT_BLOCK_SIZE) return 0;
     if (!ds->main_proj || !ds->target_hidden_buf || !ds->draft_logits_buf) return 0;
 
     myds_dspark_workspace_t *ws = ds->ws;
+    if (!ws->gpu_scratch || !ds->main_norm || !ds->final_norm ||
+        !isfinite(ds->rms_eps) || ds->rms_eps < 0.0f ||
+        !isfinite(ds->hc_eps) || ds->hc_eps <= 0.0f) return 0;
+    for (uint32_t i = 0; i < ds->stage_count; i++) {
+        const myds_dspark_stage_t *st = &ds->stages[i];
+        if (!st->attn_norm || !st->attn_q_a || !st->attn_q_a_norm || !st->attn_q_b ||
+            !st->attn_kv || !st->attn_kv_a_norm || !st->attn_sinks ||
+            !st->attn_output_a || !st->attn_output_b ||
+            !st->hc_attn_fn || !st->hc_attn_scale || !st->hc_attn_base ||
+            !st->ffn_norm || !st->router_gate || !st->router_bias ||
+            !st->shared_gate || !st->shared_up || !st->shared_down ||
+            !st->ffn_gate_exps || !st->ffn_up_exps || !st->ffn_down_exps ||
+            !st->hc_ffn_fn || !st->hc_ffn_scale || !st->hc_ffn_base) return 0;
+    }
+    /* This small graph has ordinary data dependencies throughout. Keep its
+     * encoder barriers active even when the target verifier uses manual fences. */
+    const int saved_barrier = myds_metal_get_auto_barrier();
+    myds_metal_set_auto_barrier(1);
+#define DSPARK_ENCODE(call) do { if (!(call)) goto encode_failure; } while (0)
     const uint32_t in_dim = MYDS_DSPARK_TARGET_LAYERS * MYDS_DSPARK_DIM;
     const size_t stream_bytes = (size_t)MYDS_DSPARK_DIM * sizeof(float);
 
@@ -952,43 +1009,32 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
         seeded_draft_hc = true;
     }
 
+    if (!seeded_draft_hc || !ds->noise_hc_initialized) goto encode_failure;
+
     // Begin batched Metal command buffer for stages cascade
-    (void)myds_metal_begin_batch();
+    DSPARK_ENCODE(myds_metal_begin_batch());
 
     // 2. Stage 0 Entry Projection: target_hidden -> main_x [15360] -> [5120]
     if (!myds_metal_gemv(ds->stage_x_buf, ds->main_proj, ds->target_hidden_buf,
                          MYDS_DSPARK_DIM, in_dim, ds->main_proj_type)) {
-        (void)myds_metal_commit_batch();
-        return 0;
+        goto encode_failure;
     }
     if (ds->main_norm) {
         if (!myds_metal_v41_rmsnorm(ds->stage_x_buf, ds->stage_x_buf, ds->main_norm,
-                                    MYDS_DSPARK_DIM, 1e-6f, true)) {
-            (void)myds_metal_commit_batch();
-            return 0;
+                                    MYDS_DSPARK_DIM, ds->rms_eps, false)) {
+            goto encode_failure;
         }
     }
 
     // 2b. Initialize Row 0 (Target Row) from main_x (stage_x_buf replicated 4x across 4 HC streams)
     // Row 0 remains CONSTANT across all stages
     for (size_t c = 0; c < 4; c++) {
-        (void)myds_metal_buffer_copy(ws->v_stage_input_hc[0], c * stream_bytes, ds->stage_x_buf, 0, stream_bytes);
+        DSPARK_ENCODE(myds_metal_buffer_copy(ws->v_stage_input_hc[0], c * stream_bytes, ds->stage_x_buf, 0, stream_bytes));
     }
 
-    // Fallback: If seed token embedding lookup was not possible, initialize Row 1 from main_x
-    if (!seeded_draft_hc) {
-        for (size_t c = 0; c < 4; c++) {
-            (void)myds_metal_buffer_copy(ws->v_stage_input_hc[1], c * stream_bytes, ds->stage_x_buf, 0, stream_bytes);
-        }
-    }
-
-    // Initialize Rows 2..5 (Noise token rows) in ws->v_stage_input_hc[r] from ds->noise_hc
+    // Initialize the four noise rows from the target model's mask embedding.
     for (int r = 2; r < MYDS_DSPARK_TOTAL_ROWS; r++) {
-        if (ds->noise_hc && ds->noise_hc_initialized) {
-            (void)myds_metal_buffer_copy(ws->v_stage_input_hc[r], 0, ds->noise_hc, 0, 4 * stream_bytes);
-        } else {
-            (void)myds_metal_buffer_copy(ws->v_stage_input_hc[r], 0, ws->v_stage_input_hc[1], 0, 4 * stream_bytes);
-        }
+        DSPARK_ENCODE(myds_metal_buffer_copy(ws->v_stage_input_hc[r], 0, ds->noise_hc, 0, 4 * stream_bytes));
     }
 
     myds_v41_gpu_scratch_t *gpu_s = ws->gpu_scratch;
@@ -999,80 +1045,81 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
 
         // --- Step A: Pre-attn HC projection for all 6 rows (r = 0 .. 5) ---
         for (int r = 0; r < MYDS_DSPARK_TOTAL_ROWS; r++) {
-            (void)myds_metal_v41_rmsnorm(ws->v_stage_flat_hc_norm[r], ws->v_stage_input_hc[r], NULL, 4 * MYDS_DSPARK_DIM, 1e-6f, false);
+            DSPARK_ENCODE(myds_metal_v41_rmsnorm(ws->v_stage_flat_hc_norm[r], ws->v_stage_input_hc[r], NULL, 4 * MYDS_DSPARK_DIM, ds->rms_eps, false));
             if (st->hc_attn_fn) {
-                (void)myds_metal_gemv(ws->v_hc_mix[r], st->hc_attn_fn, ws->v_stage_flat_hc_norm[r], 24, 4 * MYDS_DSPARK_DIM, st->hc_attn_fn_type);
-                (void)myds_metal_v41_hc_split_batch(ws->v_hc_split[r], ws->v_hc_mix[r], st->hc_attn_scale, st->hc_attn_base, 1, 1e-5f);
-                (void)myds_metal_v41_hc_weighted_sum_round(ws->v_attn_cur[r], ws->v_stage_input_hc[r], ws->v_hc_split[r], MYDS_DSPARK_DIM, 0);
+                DSPARK_ENCODE(myds_metal_gemv(ws->v_hc_mix[r], st->hc_attn_fn, ws->v_stage_flat_hc_norm[r], 24, 4 * MYDS_DSPARK_DIM, st->hc_attn_fn_type));
+                DSPARK_ENCODE(myds_metal_v41_hc_split_batch(ws->v_hc_split[r], ws->v_hc_mix[r], st->hc_attn_scale, st->hc_attn_base, 1, ds->hc_eps));
+                DSPARK_ENCODE(myds_metal_v41_hc_weighted_sum_round(ws->v_attn_cur[r], ws->v_stage_input_hc[r], ws->v_hc_split[r], MYDS_DSPARK_DIM, 0));
             } else {
-                (void)myds_metal_buffer_copy(ws->v_attn_cur[r], 0, ws->v_stage_input_hc[r], 0, stream_bytes);
+                DSPARK_ENCODE(myds_metal_buffer_copy(ws->v_attn_cur[r], 0, ws->v_stage_input_hc[r], 0, stream_bytes));
             }
 
             if (st->attn_norm) {
-                (void)myds_metal_v41_rmsnorm(ws->v_attn_norm[r], ws->v_attn_cur[r], st->attn_norm, MYDS_DSPARK_DIM, 1e-6f, true);
+                DSPARK_ENCODE(myds_metal_v41_rmsnorm(ws->v_attn_norm[r], ws->v_attn_cur[r], st->attn_norm, MYDS_DSPARK_DIM, ds->rms_eps, false));
             } else {
-                (void)myds_metal_buffer_copy(ws->v_attn_norm[r], 0, ws->v_attn_cur[r], 0, stream_bytes);
+                DSPARK_ENCODE(myds_metal_buffer_copy(ws->v_attn_norm[r], 0, ws->v_attn_cur[r], 0, stream_bytes));
             }
         }
 
         // --- Step B: Q path for 5 draft rows (d = 0 .. 4) using ws->v_attn_norm[1 + d] ---
         for (uint32_t d = 0; d < MYDS_DSPARK_DEFAULT_BLOCK_SIZE; d++) {
             if (st->attn_q_a && st->attn_q_b) {
-                (void)myds_metal_gemv(ws->v_qr[d], st->attn_q_a, ws->v_attn_norm[1 + d], 1280, MYDS_DSPARK_DIM, st->attn_q_a_type);
+                DSPARK_ENCODE(myds_metal_gemv(ws->v_qr[d], st->attn_q_a, ws->v_attn_norm[1 + d], 1280, MYDS_DSPARK_DIM, st->attn_q_a_type));
                 if (st->attn_q_a_norm) {
-                    (void)myds_metal_v41_rmsnorm(ws->v_qr_norm[d], ws->v_qr[d], st->attn_q_a_norm, 1280, 1e-6f, true);
+                    DSPARK_ENCODE(myds_metal_v41_rmsnorm(ws->v_qr_norm[d], ws->v_qr[d], st->attn_q_a_norm, 1280, ds->rms_eps, false));
                 }
-                (void)myds_metal_gemv(ws->v_q[d], st->attn_q_b, ws->v_qr_norm[d] ? ws->v_qr_norm[d] : ws->v_qr[d], 64 * 512, 1280, st->attn_q_b_type);
+                DSPARK_ENCODE(myds_metal_gemv(ws->v_q[d], st->attn_q_b, ws->v_qr_norm[d] ? ws->v_qr_norm[d] : ws->v_qr[d], 64 * 512, 1280, st->attn_q_b_type));
 
                 // Per-head RMSNorm on Q (64 heads x 512 head_dim)
-                (void)myds_metal_v41_rmsnorm_batch(ws->v_q[d], ws->v_q[d], NULL, 512, 64, 1e-6f, false);
+                DSPARK_ENCODE(myds_metal_v41_rmsnorm_batch(ws->v_q[d], ws->v_q[d], NULL, 512, 64, ds->rms_eps, false));
 
-                // RoPE on Q (Query d predicts for position ctx->pos + d)
-                (void)myds_v41_gpu_rope(ws->v_q[d], 512, 64, ctx->pos + d, false, false);
+                // RoPE on Q (Query d predicts for position ds->current_seed_position + d)
+                DSPARK_ENCODE(myds_dspark_gpu_rope(ws->v_q[d], 512, 64, ds->current_seed_position + d, false));
             }
         }
 
         // --- Step C: KV path for all 6 rows (r = 0 .. 5) stored in ws->stage_kv_cache[s] at slot r ---
         for (int r = 0; r < MYDS_DSPARK_TOTAL_ROWS; r++) {
             if (st->attn_kv) {
-                (void)myds_metal_gemv(ws->v_kv[r], st->attn_kv, ws->v_attn_norm[r], 512, MYDS_DSPARK_DIM, st->attn_kv_type);
+                DSPARK_ENCODE(myds_metal_gemv(ws->v_kv[r], st->attn_kv, ws->v_attn_norm[r], 512, MYDS_DSPARK_DIM, st->attn_kv_type));
                 if (st->attn_kv_a_norm) {
-                    (void)myds_metal_v41_rmsnorm(ws->v_kv_norm[r], ws->v_kv[r], st->attn_kv_a_norm, 512, 1e-6f, true);
+                    DSPARK_ENCODE(myds_metal_v41_rmsnorm(ws->v_kv_norm[r], ws->v_kv[r], st->attn_kv_a_norm, 512, ds->rms_eps, false));
                 }
-                uint32_t kv_pos = (r <= 1) ? ctx->pos : (ctx->pos + (uint32_t)(r - 1));
-                (void)myds_v41_gpu_rope(ws->v_kv_norm[r] ? ws->v_kv_norm[r] : ws->v_kv[r], 512, 1, kv_pos, false, false);
-                (void)myds_metal_buffer_copy(ws->stage_kv_cache[s], (size_t)r * 512 * sizeof(float),
-                                             ws->v_kv_norm[r] ? ws->v_kv_norm[r] : ws->v_kv[r], 0, 512 * sizeof(float));
+                uint32_t kv_pos = (r <= 1) ? ds->current_seed_position : (ds->current_seed_position + (uint32_t)(r - 1));
+                DSPARK_ENCODE(myds_dspark_gpu_rope(ws->v_kv_norm[r] ? ws->v_kv_norm[r] : ws->v_kv[r], 512, 1, kv_pos, false));
+                DSPARK_ENCODE(myds_dspark_gpu_quant_kv(ws->v_kv_norm[r] ? ws->v_kv_norm[r] : ws->v_kv[r], 1));
+                DSPARK_ENCODE(myds_metal_buffer_copy(ws->stage_kv_cache[s], (size_t)r * 512 * sizeof(float),
+                                             ws->v_kv_norm[r] ? ws->v_kv_norm[r] : ws->v_kv[r], 0, 512 * sizeof(float)));
             }
         }
 
         // --- Step D: Block-causal Attention for 5 draft queries (d = 0 .. 4) attending to keys 0 .. 1 + d (n_raw = 2 + d) ---
         for (uint32_t d = 0; d < MYDS_DSPARK_DEFAULT_BLOCK_SIZE; d++) {
             if (gpu_s) {
-                (void)myds_v41_gpu_attention_direct(ws->v_attn_heads[d], st->attn_sinks, ws->v_q[d],
+                DSPARK_ENCODE(myds_v41_gpu_attention_direct(ws->v_attn_heads[d], st->attn_sinks, ws->v_q[d],
                                                     ws->stage_kv_cache[s], 2 + d, 0,
-                                                    NULL, NULL, 0, 0, gpu_s);
+                                                    NULL, NULL, 0, 0, gpu_s));
             }
 
-            // RoPE round on attention heads: slot d is at position ctx->pos + d
-            (void)myds_v41_gpu_rope_round(ws->v_attn_heads[d], 512, 64, ctx->pos + d, false, true);
+            // F32 inverse RoPE on attention heads: slot d is at position ds->current_seed_position + d
+            DSPARK_ENCODE(myds_dspark_gpu_rope(ws->v_attn_heads[d], 512, 64, ds->current_seed_position + d, true));
 
             // Attention Output Down-Up Projection
             if (st->attn_output_a && st->attn_output_b) {
-                (void)myds_metal_attn_output_a(ws->v_attn_low[d], st->attn_output_a, ws->v_attn_heads[d],
-                                               8, 4096, 1024, st->attn_output_a_type);
-                (void)myds_metal_gemv(ws->v_attn_out[d], st->attn_output_b, ws->v_attn_low[d],
-                                      MYDS_DSPARK_DIM, 8192, st->attn_output_b_type);
+                DSPARK_ENCODE(myds_metal_attn_output_a(ws->v_attn_low[d], st->attn_output_a, ws->v_attn_heads[d],
+                                               8, 4096, 1024, st->attn_output_a_type));
+                DSPARK_ENCODE(myds_metal_gemv(ws->v_attn_out[d], st->attn_output_b, ws->v_attn_low[d],
+                                      MYDS_DSPARK_DIM, 8192, st->attn_output_b_type));
             }
 
             // HC Expand after Attention on Draft Row (round_bf16 = 0 for full F32 precision matching DSpark)
             if (st->hc_attn_fn) {
-                (void)myds_metal_v41_hc_expand_round(ws->v_after_attn_hc[d], ws->v_attn_out[d],
+                DSPARK_ENCODE(myds_metal_v41_hc_expand_round(ws->v_after_attn_hc[d], ws->v_attn_out[d],
                                                      ws->v_stage_input_hc[1 + d], ws->v_hc_split[1 + d],
-                                                     MYDS_DSPARK_DIM, 0);
+                                                     MYDS_DSPARK_DIM, 0));
             } else {
                 for (size_t c = 0; c < 4; c++) {
-                    (void)myds_metal_buffer_copy(ws->v_after_attn_hc[d], c * stream_bytes, ws->v_attn_out[d], 0, stream_bytes);
+                    DSPARK_ENCODE(myds_metal_buffer_copy(ws->v_after_attn_hc[d], c * stream_bytes, ws->v_attn_out[d], 0, stream_bytes));
                 }
             }
         }
@@ -1080,74 +1127,63 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
         // --- Step E: FFN / MoE Block on 5 draft rows (d = 0 .. 4) ---
         for (uint32_t d = 0; d < MYDS_DSPARK_DEFAULT_BLOCK_SIZE; d++) {
             // HC RMSNorm over flat 4 streams (20480) of after_attn_hc
-            (void)myds_metal_v41_rmsnorm(ws->v_draft_flat_hc_norm[d], ws->v_after_attn_hc[d], NULL, 4 * MYDS_DSPARK_DIM, 1e-6f, false);
+            DSPARK_ENCODE(myds_metal_v41_rmsnorm(ws->v_draft_flat_hc_norm[d], ws->v_after_attn_hc[d], NULL, 4 * MYDS_DSPARK_DIM, ds->rms_eps, false));
 
             // Project to 24 mix values
             if (st->hc_ffn_fn) {
-                (void)myds_metal_gemv(ws->v_draft_ffn_hc_mix[d], st->hc_ffn_fn, ws->v_draft_flat_hc_norm[d], 24, 4 * MYDS_DSPARK_DIM, st->hc_ffn_fn_type);
-                (void)myds_metal_v41_hc_split_batch(ws->v_draft_ffn_hc_split[d], ws->v_draft_ffn_hc_mix[d], st->hc_ffn_scale, st->hc_ffn_base, 1, 1e-5f);
-                (void)myds_metal_v41_hc_weighted_sum_round(ws->v_ffn_cur[d], ws->v_after_attn_hc[d], ws->v_draft_ffn_hc_split[d], MYDS_DSPARK_DIM, 0);
+                DSPARK_ENCODE(myds_metal_gemv(ws->v_draft_ffn_hc_mix[d], st->hc_ffn_fn, ws->v_draft_flat_hc_norm[d], 24, 4 * MYDS_DSPARK_DIM, st->hc_ffn_fn_type));
+                DSPARK_ENCODE(myds_metal_v41_hc_split_batch(ws->v_draft_ffn_hc_split[d], ws->v_draft_ffn_hc_mix[d], st->hc_ffn_scale, st->hc_ffn_base, 1, ds->hc_eps));
+                DSPARK_ENCODE(myds_metal_v41_hc_weighted_sum_round(ws->v_ffn_cur[d], ws->v_after_attn_hc[d], ws->v_draft_ffn_hc_split[d], MYDS_DSPARK_DIM, 0));
             } else {
-                (void)myds_metal_buffer_copy(ws->v_ffn_cur[d], 0, ws->v_after_attn_hc[d], 0, stream_bytes);
+                DSPARK_ENCODE(myds_metal_buffer_copy(ws->v_ffn_cur[d], 0, ws->v_after_attn_hc[d], 0, stream_bytes));
             }
 
             // FFN pre-norm
             if (st->ffn_norm) {
-                (void)myds_metal_v41_rmsnorm(ws->v_ffn_norm[d], ws->v_ffn_cur[d], st->ffn_norm, MYDS_DSPARK_DIM, 1e-6f, true);
+                DSPARK_ENCODE(myds_metal_v41_rmsnorm(ws->v_ffn_norm[d], ws->v_ffn_cur[d], st->ffn_norm, MYDS_DSPARK_DIM, ds->rms_eps, false));
             } else {
-                (void)myds_metal_buffer_copy(ws->v_ffn_norm[d], 0, ws->v_ffn_cur[d], 0, stream_bytes);
+                DSPARK_ENCODE(myds_metal_buffer_copy(ws->v_ffn_norm[d], 0, ws->v_ffn_cur[d], 0, stream_bytes));
             }
 
             // 1. Shared Expert (SwiGLU)
             if (st->shared_gate && st->shared_up && st->shared_down) {
-                (void)myds_metal_gemv(ws->v_shared_gate[d], st->shared_gate, ws->v_ffn_norm[d], MYDS_DSPARK_EXP_DIM, MYDS_DSPARK_DIM, st->shared_gate_type);
-                (void)myds_metal_gemv(ws->v_shared_up[d], st->shared_up, ws->v_ffn_norm[d], MYDS_DSPARK_EXP_DIM, MYDS_DSPARK_DIM, st->shared_up_type);
-                (void)myds_metal_swiglu(ws->v_shared_swiglu[d], ws->v_shared_gate[d], ws->v_shared_up[d], MYDS_DSPARK_EXP_DIM);
-                (void)myds_metal_gemv(ws->v_shared_out[d], st->shared_down, ws->v_shared_swiglu[d], MYDS_DSPARK_DIM, MYDS_DSPARK_EXP_DIM, st->shared_down_type);
+                DSPARK_ENCODE(myds_metal_gemv(ws->v_shared_gate[d], st->shared_gate, ws->v_ffn_norm[d], MYDS_DSPARK_EXP_DIM, MYDS_DSPARK_DIM, st->shared_gate_type));
+                DSPARK_ENCODE(myds_metal_gemv(ws->v_shared_up[d], st->shared_up, ws->v_ffn_norm[d], MYDS_DSPARK_EXP_DIM, MYDS_DSPARK_DIM, st->shared_up_type));
+                DSPARK_ENCODE(myds_dspark_shared_swiglu(ws->v_shared_swiglu[d], ws->v_shared_gate[d], ws->v_shared_up[d], MYDS_DSPARK_EXP_DIM, ds->swiglu_clamp));
+                DSPARK_ENCODE(myds_metal_gemv(ws->v_shared_out[d], st->shared_down, ws->v_shared_swiglu[d], MYDS_DSPARK_DIM, MYDS_DSPARK_EXP_DIM, st->shared_down_type));
             }
 
             // 2. Routed MoE (128 experts, top 3)
             if (st->router_gate && st->ffn_gate_exps && st->ffn_up_exps && st->ffn_down_exps) {
-                (void)myds_metal_gemv(ws->v_router_logits[d], st->router_gate, ws->v_ffn_norm[d], ds->n_routed_experts, MYDS_DSPARK_DIM, st->router_gate_type);
+                DSPARK_ENCODE(myds_metal_gemv(ws->v_router_logits[d], st->router_gate, ws->v_ffn_norm[d], ds->n_routed_experts, MYDS_DSPARK_DIM, st->router_gate_type));
 
-                float route_scale = (ctx && ctx->model && ctx->model->routed_scaling_factor > 0.0f) ?
-                                    ctx->model->routed_scaling_factor : 1.5f;
+                const float route_scale = ds->route_scale; // DSpark GGUF expert_weights_scale, independent of target
 
                 myds_metal_barrier_buffer(ws->v_router_logits[d]);
-                if (!myds_dspark_route_fused(ws->v_selected_ids[d], ws->v_selected_weights[d],
-                                             ws->v_router_logits[d], st->router_bias,
-                                             ds->num_experts_per_tok, route_scale, 1)) {
-                    // Fallback to CPU route if GPU dispatch fails
-                    (void)myds_metal_commit_batch();
-                    int32_t *sel_ids = (int32_t *)myds_metal_buffer_data(ws->v_selected_ids[d]);
-                    float *sel_weights = (float *)myds_metal_buffer_data(ws->v_selected_weights[d]);
-                    (void)myds_metal_moe_route_biased(sel_ids, sel_weights, ws->v_router_logits[d], st->router_bias,
-                                                      ds->n_routed_experts, ds->num_experts_per_tok, route_scale);
-                    (void)myds_metal_begin_batch();
-                }
+                DSPARK_ENCODE(myds_dspark_route_fused(ws->v_selected_ids[d], ws->v_selected_weights[d],
+                    ws->v_router_logits[d], st->router_bias, ds->num_experts_per_tok, route_scale, 1));
 
-                float clamp_exp = (ctx && ctx->model && ctx->model->swiglu_clamp_exp > 0.0f) ?
-                                  ctx->model->swiglu_clamp_exp : 10.0f;
-                (void)myds_metal_routed_moe(ws->v_moe_out[d], ws->v_ffn_norm[d],
+                const float clamp_exp = ds->swiglu_clamp;
+                DSPARK_ENCODE(myds_dspark_moe(ws->v_moe_out[d], ws->v_ffn_norm[d],
                                             st->ffn_gate_exps, st->ffn_up_exps, st->ffn_down_exps,
                                             ws->v_selected_ids[d], ws->v_selected_weights[d],
                                             ws->v_moe_gate[d], ws->v_moe_up[d], ws->v_moe_mid[d], ws->v_moe_down[d],
                                             MYDS_DSPARK_DIM, MYDS_DSPARK_EXP_DIM,
                                             ds->n_routed_experts, ds->num_experts_per_tok,
                                             st->ffn_gate_exps_type, st->ffn_up_exps_type, st->ffn_down_exps_type,
-                                            clamp_exp);
+                                            clamp_exp));
 
-                (void)myds_metal_add(ws->v_ffn_total[d], ws->v_shared_out[d], ws->v_moe_out[d], MYDS_DSPARK_DIM);
+                DSPARK_ENCODE(myds_metal_add(ws->v_ffn_total[d], ws->v_shared_out[d], ws->v_moe_out[d], MYDS_DSPARK_DIM));
             } else if (st->shared_gate && st->shared_down) {
-                (void)myds_metal_buffer_copy(ws->v_ffn_total[d], 0, ws->v_shared_out[d], 0, stream_bytes);
+                DSPARK_ENCODE(myds_metal_buffer_copy(ws->v_ffn_total[d], 0, ws->v_shared_out[d], 0, stream_bytes));
             }
 
             // HC Expand after FFN -> stage_draft_hc for next stage (round_bf16 = 0 for full F32 precision)
             if (st->hc_ffn_fn) {
-                (void)myds_metal_v41_hc_expand_round(ws->v_stage_draft_hc[d], ws->v_ffn_total[d], ws->v_after_attn_hc[d], ws->v_draft_ffn_hc_split[d], MYDS_DSPARK_DIM, 0);
+                DSPARK_ENCODE(myds_metal_v41_hc_expand_round(ws->v_stage_draft_hc[d], ws->v_ffn_total[d], ws->v_after_attn_hc[d], ws->v_draft_ffn_hc_split[d], MYDS_DSPARK_DIM, 0));
             } else {
                 for (size_t c = 0; c < 4; c++) {
-                    (void)myds_metal_buffer_copy(ws->v_stage_draft_hc[d], c * stream_bytes, ws->v_ffn_total[d], 0, stream_bytes);
+                    DSPARK_ENCODE(myds_metal_buffer_copy(ws->v_stage_draft_hc[d], c * stream_bytes, ws->v_ffn_total[d], 0, stream_bytes));
                 }
             }
         }
@@ -1155,7 +1191,7 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
         // --- Step F: Propagate ws->v_stage_draft_hc[d] to next stage input Row 1 + d ---
         if (s + 1 < ds->stage_count) {
             for (uint32_t d = 0; d < MYDS_DSPARK_DEFAULT_BLOCK_SIZE; d++) {
-                (void)myds_metal_buffer_copy(ws->v_stage_input_hc[1 + d], 0, ws->v_stage_draft_hc[d], 0, 4 * stream_bytes);
+                DSPARK_ENCODE(myds_metal_buffer_copy(ws->v_stage_input_hc[1 + d], 0, ws->v_stage_draft_hc[d], 0, 4 * stream_bytes));
             }
         }
     }
@@ -1164,18 +1200,18 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
     myds_dspark_stage_t *final_st = &ds->stages[ds->stage_count - 1u];
     for (uint32_t d = 0; d < MYDS_DSPARK_DEFAULT_BLOCK_SIZE; d++) {
         if (final_st->hc_ffn_fn) {
-            (void)myds_metal_v41_rmsnorm(ws->v_draft_flat_hc_norm[d], ws->v_stage_draft_hc[d], NULL, 4 * MYDS_DSPARK_DIM, 1e-6f, false);
-            (void)myds_metal_gemv(ws->v_draft_ffn_hc_mix[d], final_st->hc_ffn_fn, ws->v_draft_flat_hc_norm[d], 24, 4 * MYDS_DSPARK_DIM, final_st->hc_ffn_fn_type);
-            (void)myds_metal_v41_hc_split_batch(ws->v_draft_ffn_hc_split[d], ws->v_draft_ffn_hc_mix[d], final_st->hc_ffn_scale, final_st->hc_ffn_base, 1, 1e-5f);
-            (void)myds_metal_v41_hc_weighted_sum_round(ws->v_final_embd[d], ws->v_stage_draft_hc[d], ws->v_draft_ffn_hc_split[d], MYDS_DSPARK_DIM, 0);
+            DSPARK_ENCODE(myds_metal_v41_rmsnorm(ws->v_draft_flat_hc_norm[d], ws->v_stage_draft_hc[d], NULL, 4 * MYDS_DSPARK_DIM, ds->rms_eps, false));
+            DSPARK_ENCODE(myds_metal_gemv(ws->v_draft_ffn_hc_mix[d], final_st->hc_ffn_fn, ws->v_draft_flat_hc_norm[d], 24, 4 * MYDS_DSPARK_DIM, final_st->hc_ffn_fn_type));
+            DSPARK_ENCODE(myds_metal_v41_hc_split_batch(ws->v_draft_ffn_hc_split[d], ws->v_draft_ffn_hc_mix[d], final_st->hc_ffn_scale, final_st->hc_ffn_base, 1, ds->hc_eps));
+            DSPARK_ENCODE(myds_metal_v41_hc_weighted_sum_round(ws->v_final_embd[d], ws->v_stage_draft_hc[d], ws->v_draft_ffn_hc_split[d], MYDS_DSPARK_DIM, 0));
         } else {
-            (void)myds_metal_buffer_copy(ws->v_final_embd[d], 0, ws->v_stage_draft_hc[d], 0, stream_bytes);
+            DSPARK_ENCODE(myds_metal_buffer_copy(ws->v_final_embd[d], 0, ws->v_stage_draft_hc[d], 0, stream_bytes));
         }
 
         if (ds->final_norm) {
-            (void)myds_metal_v41_rmsnorm(ws->v_final_norm_out[d], ws->v_final_embd[d], ds->final_norm, MYDS_DSPARK_DIM, 1e-6f, true);
+            DSPARK_ENCODE(myds_metal_v41_rmsnorm(ws->v_final_norm_out[d], ws->v_final_embd[d], ds->final_norm, MYDS_DSPARK_DIM, ds->rms_eps, false));
         } else {
-            (void)myds_metal_buffer_copy(ws->v_final_norm_out[d], 0, ws->v_final_embd[d], 0, stream_bytes);
+            DSPARK_ENCODE(myds_metal_buffer_copy(ws->v_final_norm_out[d], 0, ws->v_final_embd[d], 0, stream_bytes));
         }
     }
 
@@ -1186,10 +1222,10 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
 
     if (can_early_exit) {
         // Commit final stages batch to complete GPU work for hidden states so CPU can test confidence
-        (void)myds_metal_commit_batch();
+        DSPARK_ENCODE(myds_metal_commit_batch());
 
         float conf_prob = 1.0f;
-        const float *final_embd_data = (const float *)myds_metal_buffer_data(ws->v_final_embd[0]);
+        const float *final_embd_data = (const float *)myds_metal_buffer_data(ws->v_final_embd[ds->current_output_slot]);
         if (final_embd_data) {
             float conf_score = 0.0f;
             if (ds->confidence_proj_type == GGML_TYPE_F16) {
@@ -1210,30 +1246,31 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
         }
         if (out_confidence) *out_confidence = conf_prob;
 
-        // Zero-overhead early exit: If slot 0 confidence is below threshold, skip the 5 LM Head GEMVs!
+        // Early exit: If the first requested slot confidence is below threshold, skip the 5 LM Head GEMVs!
         if (conf_prob < min_conf) {
+            myds_metal_set_auto_barrier(saved_barrier);
             return 0;
         }
 
         // Project to LM Head logits for all 5 draft slots
-        (void)myds_metal_begin_batch();
+        DSPARK_ENCODE(myds_metal_begin_batch());
         for (uint32_t d = 0; d < MYDS_DSPARK_DEFAULT_BLOCK_SIZE; d++) {
-            (void)myds_metal_gemv(ws->v_logits[d], ctx->model->output, ws->v_final_norm_out[d],
-                                  ctx->model->vocab_size, MYDS_DSPARK_DIM, ctx->model->output_type);
+            DSPARK_ENCODE(myds_metal_gemv(ws->v_logits[d], ctx->model->output, ws->v_final_norm_out[d],
+                                  ctx->model->vocab_size, MYDS_DSPARK_DIM, ctx->model->output_type));
         }
-        (void)myds_metal_commit_batch();
+        DSPARK_ENCODE(myds_metal_commit_batch());
     } else {
         // Direct zero-stall pipelining: Enqueue all 5 LM Head GEMVs in the SAME command buffer as stages
         for (uint32_t d = 0; d < MYDS_DSPARK_DEFAULT_BLOCK_SIZE; d++) {
-            (void)myds_metal_gemv(ws->v_logits[d], ctx->model->output, ws->v_final_norm_out[d],
-                                  ctx->model->vocab_size, MYDS_DSPARK_DIM, ctx->model->output_type);
+            DSPARK_ENCODE(myds_metal_gemv(ws->v_logits[d], ctx->model->output, ws->v_final_norm_out[d],
+                                  ctx->model->vocab_size, MYDS_DSPARK_DIM, ctx->model->output_type));
         }
-        (void)myds_metal_commit_batch();
+        DSPARK_ENCODE(myds_metal_commit_batch());
 
         if (out_confidence) {
             float conf_prob = 1.0f;
             if (has_conf_proj) {
-                const float *final_embd_data = (const float *)myds_metal_buffer_data(ws->v_final_embd[0]);
+                const float *final_embd_data = (const float *)myds_metal_buffer_data(ws->v_final_embd[ds->current_output_slot]);
                 if (final_embd_data) {
                     float conf_score = 0.0f;
                     if (ds->confidence_proj_type == GGML_TYPE_F16) {
@@ -1257,7 +1294,16 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
         }
     }
 
+    myds_metal_set_auto_barrier(saved_barrier);
     return 1;
+encode_failure:
+    /* Drain partially encoded work; none of its logits become a proposal. */
+    (void)myds_metal_commit_batch();
+    myds_metal_set_auto_barrier(saved_barrier);
+    if (out_confidence) *out_confidence = NAN;
+    MYDS_LOG_E("DSpark stage encoding/commit failed; proposal discarded");
+    return 0;
+#undef DSPARK_ENCODE
 }
 
 static void dspark_reject_proposal(myds_dspark_t *ds, myds_context_t *ctx, bool confidence) {
@@ -1273,8 +1319,11 @@ static void dspark_reject_proposal(myds_dspark_t *ds, myds_context_t *ctx, bool 
     }
 }
 
-uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t last_token, uint32_t draft_cap) {
+static uint32_t dspark_propose_at(myds_dspark_t *ds, myds_context_t *ctx,
+    int32_t last_token, uint32_t position, int32_t markov_seed, uint32_t first_slot, uint32_t draft_cap) {
     if (!ds || !ctx || !ctx->model) return 0;
+    ds->draft_count = ds->draft_tree_count = 0;
+    ds->is_high_confidence = false;
     if (ds->backoff_counter > 0) {
         ds->backoff_counter--;
         return 0;
@@ -1283,9 +1332,11 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
     double t0 = now_ms();
     ds->cycles++;
     ds->current_seed_token = last_token;
+    ds->current_seed_position = position;
+    ds->current_output_slot = first_slot;
 
     uint32_t K = draft_cap > 0 && draft_cap < ds->block_size ? draft_cap : ds->block_size;
-    if (K > MYDS_DSPARK_DEFAULT_BLOCK_SIZE) K = MYDS_DSPARK_DEFAULT_BLOCK_SIZE;
+    if (K > MYDS_DSPARK_DEFAULT_BLOCK_SIZE - first_slot) K = MYDS_DSPARK_DEFAULT_BLOCK_SIZE - first_slot;
 
     const int markov_only = dspark_markov_only();
     if (!markov_only && ds->main_proj && !capture_consumer_ready(ds)) {
@@ -1325,7 +1376,7 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
         MYDS_LOG_I("DSpark confidence head threshold: %.2f", min_conf);
     }
 
-    int32_t prev = last_token;
+    int32_t prev = markov_seed;
     uint32_t n_proposed = 0;
     const uint32_t vocab_size = ctx->model->vocab_size;
 
@@ -1370,10 +1421,15 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
     float confidence = 1.0f;
     const float *base_logits = NULL;
 
-    if (!markov_only && ds->main_proj && ds->target_hidden_buf) {
-        if (myds_dspark_eval_stages(ds, ctx, min_conf, &confidence)) {
-            base_logits = (const float *)myds_metal_buffer_data(ds->draft_logits_buf);
+    if (!markov_only) {
+        if (!ds->main_proj || !ds->target_hidden_buf) return 0;
+        if (!DSPARK_EVAL_STAGES(ds, ctx, min_conf, &confidence)) {
+            if (isfinite(confidence) && min_conf > 0.0f && confidence < min_conf)
+                dspark_reject_proposal(ds, ctx, true);
+            ds->propose_ms += now_ms() - t0;
+            return 0;
         }
+        base_logits = (const float *)myds_metal_buffer_data(ds->draft_logits_buf);
     }
 
     static uint64_t s_log_cycle = 0;
@@ -1400,11 +1456,39 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
     myds_dspark_workspace_t *ws = ds->ws;
 
     for (uint32_t d = 0; d < K; d++) {
-        const float *slot_logits = base_logits ? (base_logits + (size_t)d * vocab_size) : NULL;
+        const uint32_t slot = first_slot + d;
+        const float *slot_logits = base_logits ? (base_logits + (size_t)slot * vocab_size) : NULL;
+
+        // Confidence always conditions on this slot's preceding proposal,
+        // including when additive Markov bias is disabled.
+        if (d > 0 && w1_base && ds->markov_state_host && prev >= 0 && (uint32_t)prev < vocab_size) {
+            if (is_w1_f16) {
+                const uint16_t *w1_row = ((const uint16_t *)w1_base) + (size_t)prev * 256;
+#if defined(__ARM_NEON)
+                for (int k = 0; k < 256; k += 8) {
+                    float16x8_t h = vld1q_f16((const float16_t *)(w1_row + k));
+                    vst1q_f32(ds->markov_state_host + k, vcvt_f32_f16(vget_low_f16(h)));
+                    vst1q_f32(ds->markov_state_host + k + 4, vcvt_f32_f16(vget_high_f16(h)));
+                }
+#else
+                for (int k = 0; k < 256; k++) {
+                    ds->markov_state_host[k] = dspark_fp16_to_fp32(w1_row[k]);
+                }
+#endif
+            } else if (is_w1_q8) {
+                const q8_0_block_t *w1_row = ((const q8_0_block_t *)w1_base) + (size_t)prev * 8;
+                for (int b = 0; b < 8; b++) {
+                    float d_scale = dspark_fp16_to_fp32(w1_row[b].d);
+                    for (int k = 0; k < 32; k++) {
+                        ds->markov_state_host[b * 32 + k] = d_scale * (float)w1_row[b].qs[k];
+                    }
+                }
+            }
+        }
 
         if (d > 0 && min_conf > 0.0f && has_conf_proj && ws) {
             float slot_conf = 1.0f;
-            const float *final_embd_d = (const float *)myds_metal_buffer_data(ws->v_final_embd[d]);
+            const float *final_embd_d = (const float *)myds_metal_buffer_data(ws->v_final_embd[slot]);
             if (final_embd_d) {
                 float conf_score = 0.0f;
                 if (ds->confidence_proj_type == GGML_TYPE_F16) {
@@ -1434,31 +1518,6 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
         float best_score2 = -INFINITY;
 
         if (has_markov && w1_base && w2_base && prev >= 0 && (uint32_t)prev < vocab_size) {
-            // Dequantize / load row `prev` if d > 0 (d == 0 already done)
-            if (d > 0) {
-                if (is_f16) {
-                    const uint16_t *w1_row = ((const uint16_t *)w1_base) + (size_t)prev * 256;
-#if defined(__ARM_NEON)
-                    for (int k = 0; k < 256; k += 8) {
-                        float16x8_t h = vld1q_f16((const float16_t *)(w1_row + k));
-                        vst1q_f32(ds->markov_state_host + k, vcvt_f32_f16(vget_low_f16(h)));
-                        vst1q_f32(ds->markov_state_host + k + 4, vcvt_f32_f16(vget_high_f16(h)));
-                    }
-#else
-                    for (int k = 0; k < 256; k++) {
-                        ds->markov_state_host[k] = dspark_fp16_to_fp32(w1_row[k]);
-                    }
-#endif
-                } else if (is_q8) {
-                    const q8_0_block_t *w1_row = ((const q8_0_block_t *)w1_base) + (size_t)prev * 8;
-                    for (int b = 0; b < 8; b++) {
-                        float d_scale = dspark_fp16_to_fp32(w1_row[b].d);
-                        for (int k = 0; k < 32; k++) {
-                            ds->markov_state_host[b * 32 + k] = d_scale * (float)w1_row[b].qs[k];
-                        }
-                    }
-                }
-            }
 
 #if defined(__APPLE__)
             int32_t slice_tokens[MARKOV_NUM_SLICES];
@@ -1530,6 +1589,12 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
             for (uint32_t r = 0; r < vocab_size; r++) {
                 dspark_update_top2((int32_t)r, slot_logits[r], &best_token, &best_score, &best_token2, &best_score2);
             }
+        }
+
+        if (!isfinite(best_score) || !isfinite(best_score2)) {
+            ds->draft_count = ds->draft_tree_count = 0;
+            ds->propose_ms += now_ms() - t0;
+            return 0;
         }
 
         if (d == 0) {
@@ -1631,6 +1696,20 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
     ds->propose_ms += (now_ms() - t0);
 
     return n_proposed;
+}
+
+uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t last_token, uint32_t draft_cap) {
+    return dspark_propose_at(ds, ctx, last_token, ctx ? ctx->pos : 0, last_token, 0, draft_cap);
+}
+
+uint32_t myds_dspark_propose_next(myds_dspark_t *ds, myds_context_t *ctx,
+    int32_t consumed_token, int32_t emitted_seed, uint32_t draft_cap) {
+    if (!ds || !ctx || !ctx->v41 || !ctx->pos) {
+        if (ds) { ds->draft_count = ds->draft_tree_count = 0; ds->is_high_confidence = false; }
+        return 0;
+    }
+    if (dspark_markov_only()) return myds_dspark_propose(ds, ctx, emitted_seed, draft_cap);
+    return dspark_propose_at(ds, ctx, consumed_token, ctx->pos - 1u, emitted_seed, 1u, draft_cap);
 }
 
 uint32_t myds_dspark_propose_tree(myds_dspark_t *ds, myds_context_t *ctx, int32_t last_token) {

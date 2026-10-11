@@ -77,4 +77,25 @@ int myds_dspark_route_fused(myds_metal_buffer_t *selected, myds_metal_buffer_t *
                             const myds_metal_buffer_t *logits, const myds_metal_buffer_t *bias,
                             uint32_t top_k, float scale, uint32_t rows);
 
+/* DSpark Q2_K gate/up/down with three dynamically selected experts. F32
+ * SwiGLU clamps gate only above limit and up to [-limit, limit], applies route
+ * weights before down projection and sums exactly three expert outputs.
+ * dim/expert_dim must be multiples of 256. scratch_mid holds 3*expert_dim
+ * floats; other scratch arguments preserve the routed_moe call signature and
+ * are unused. Unsupported quantization or top-k fails before GPU dispatch. */
+int myds_dspark_moe(myds_metal_buffer_t *moe_out,
+    const myds_metal_buffer_t *x_in,
+    const myds_metal_buffer_t *gate_exps, const myds_metal_buffer_t *up_exps,
+    const myds_metal_buffer_t *down_exps,
+    const myds_metal_buffer_t *selected_ids, const myds_metal_buffer_t *selected_weights,
+    myds_metal_buffer_t *scratch_gate, myds_metal_buffer_t *scratch_up,
+    myds_metal_buffer_t *scratch_mid, myds_metal_buffer_t *scratch_down,
+    uint32_t dim, uint32_t expert_dim, uint32_t n_routed_experts,
+    uint32_t n_activated_experts, ggml_type gate_type, ggml_type up_type,
+    ggml_type down_type, float clamp_val);
+/* DSpark shared experts use the same clamp but preserve F32 output. */
+int myds_dspark_shared_swiglu(myds_metal_buffer_t *out,
+    const myds_metal_buffer_t *gate, const myds_metal_buffer_t *up,
+    uint32_t width, float clamp_val);
+
 #endif

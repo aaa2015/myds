@@ -3466,6 +3466,10 @@ static int myds_generate_internal(myds_context_t *ctx,
     ctx->decode_metrics_active = true;
     if (ctx->dspark && use_spec) {
         uint32_t step = 0;
+        /* V4.1 capture belongs to the last input the target consumed. The
+         * emitted cur_token is its successor and has not entered the target
+         * yet. Keep the consumed input independently of prefix-cache storage. */
+        int32_t last_consumed_token = -1;
         while (step < max_gen) {
             if (cancel_flag && *cancel_flag) {
                 stop_reason = MYDS_STOP_CANCELLED;
@@ -3490,6 +3494,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                     success = 0;
                     break;
                 }
+                last_consumed_token = cur_token;
                 ctx->pos++;
                 step++;
                 if (pld_history && pld_len < pld_cap) pld_history[pld_len++] = next_token;
@@ -3521,12 +3526,15 @@ static int myds_generate_internal(myds_context_t *ctx,
             const bool cost_skip = decode_cost_skip(ctx) || (!serial_probe && max_gen - step < 2);
             if (ctx->dspark && !cost_skip) {
                 const uint64_t before_cycles = ctx->dspark->cycles;
+                const uint64_t before_proposed = ctx->dspark->proposed_tokens;
                 const bool backed_off = ctx->dspark->backoff_counter > 0;
                 const double draft_start = ctx->decode_stats.timing_enabled ? decode_now_ms() : 0.0;
-                uint32_t n_dspark = myds_dspark_propose(ctx->dspark, ctx, cur_token, draft_cap);
+                uint32_t n_dspark = ctx->v41 ?
+                    myds_dspark_propose_next(ctx->dspark, ctx, last_consumed_token, cur_token, draft_cap) :
+                    myds_dspark_propose(ctx->dspark, ctx, cur_token, draft_cap);
                 neural_count = n_dspark;
                 ctx->decode_stats.draft_cycles += ctx->dspark->cycles - before_cycles;
-                ctx->decode_stats.draft_proposed += (ctx->v41 ? 1 : n_dspark);
+                ctx->decode_stats.draft_proposed += ctx->dspark->proposed_tokens - before_proposed;
                 if (backed_off) ctx->decode_stats.backoff_steps++;
                 else ctx->decode_cycle_speculative = true;
                 if (ctx->decode_stats.timing_enabled)
@@ -3576,6 +3584,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                     success = 0;
                     break;
                 }
+                last_consumed_token = cur_token;
                 ctx->pos++;
                 step++;
                 if (pld_history && pld_len < pld_cap) pld_history[pld_len++] = next_token;
@@ -3640,6 +3649,9 @@ static int myds_generate_internal(myds_context_t *ctx,
                     success = 0;
                     break;
                 }
+                /* A hit consumes the matched A/B input as its second row;
+                 * a miss keeps only the original cur_token target row. */
+                last_consumed_token = ret == 2 ? out_tokens[0] : cur_token;
 
                 if (out_tokens[0] == m->tokenizer->eos_id) {
                     ctx->pos = spec_pos + 1u;
@@ -3845,6 +3857,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                     success = 0;
                     break;
                 }
+                last_consumed_token = cur_token;
                 ctx->pos++;
                 step++;
 

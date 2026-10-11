@@ -294,6 +294,23 @@ int myds_v41_gpu_rope_round(myds_metal_buffer_t *x,uint32_t width,uint32_t heads
     uint32_t pos,bool compressed,bool inverse) {
     return myds_v41_gpu_rope_batch_round(x,width,heads,pos,1,compressed,inverse);
 }
+int myds_dspark_gpu_rope(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
+    uint32_t pos,bool inverse) {
+    if(width<64u||!heads||pos>=1048576u||!floats(x,(uint64_t)width*heads))return 0;
+    pthread_once(&rope_once,init_rope);
+    struct {uint32_t width,heads,rows,start,inverse,stride;float frequencies[32];} a={
+        width,heads,1u,pos,inverse,1u,{0}};
+    memcpy(a.frequencies,rope_frequencies[0],sizeof(a.frequencies));
+    const myds_metal_buffer_t *b[]={x};
+    if(!myds_metal_get_auto_barrier())myds_metal_barrier_buffer(x);
+    return dispatch("kernel_myds_dspark_rope_f32",&a,sizeof(a),b,1,heads,1,1,32,1,1,0);
+}
+int myds_dspark_gpu_quant_kv(myds_metal_buffer_t *x,uint32_t rows) {
+    if(!rows||!floats(x,(uint64_t)rows*512u))return 0;
+    const myds_metal_buffer_t *b[]={x};
+    if(!myds_metal_get_auto_barrier())myds_metal_barrier_buffer(x);
+    return dispatch("kernel_myds_dspark_kv_fp8_f32",&rows,sizeof(rows),b,1,7,rows,1,64,1,1,256u);
+}
 int myds_v41_gpu_quant(myds_metal_buffer_t *x,uint32_t width,uint32_t rows,uint32_t mode) {
     uint32_t block=mode==3?16:32;
     if(!width||!rows||mode>3||(mode&&width%block)||!floats(x,(uint64_t)width*rows))return 0;

@@ -129,8 +129,16 @@ static int tree_rejection(myds_context_t *ctx) {
  * This is numerical equivalence, not GPU failure-injection acceptance. */
 static int neural_probe(myds_context_t *ctx) {
     myds_dspark_t *ds=ctx->dspark;
-    CHECK(ds&&ds->ws&&myds_dspark_capture_ready(ds)&&myds_metal_commit_batch());
-    myds_metal_buffer_t *buffers[4]={ds->draft_logits_buf,ds->ws->final_norm_out,ds->ws->final_embd,ds->stage_x_buf};
+    CHECK(ds&&ds->ws&&ctx->pos>0&&ctx->pcache_tokens&&ctx->pcache_len>=ctx->pos&&
+        myds_dspark_capture_ready(ds)&&myds_metal_commit_batch());
+    const myds_dspark_t before_ds=*ds;
+    float markov_state[MYDS_DSPARK_MARKOV_RANK];
+    const bool have_markov_state=ds->markov_state_host!=NULL;
+    if(have_markov_state)memcpy(markov_state,ds->markov_state_host,sizeof(markov_state));
+    const int32_t consumed=ctx->pcache_tokens[ctx->pos-1u];
+    const uint32_t consumed_pos=ctx->pos-1u;
+    ds->current_seed_token=consumed;ds->current_seed_position=consumed_pos;ds->current_output_slot=1u;
+    myds_metal_buffer_t *buffers[4]={ds->ws->v_logits[1],ds->ws->v_final_norm_out[1],ds->ws->v_final_embd[1],ds->stage_x_buf};
     const size_t sizes[4]={129280u,DIM,DIM,DIM};
     const char *roles[4]={"logits","final_norm","final_embd","entry_projection"};
     for(uint32_t i=0;i<4;i++) {
@@ -140,22 +148,111 @@ static int neural_probe(myds_context_t *ctx) {
     }
     float *target=malloc(129280u*4u);CHECK(target);
     memcpy(target,myds_metal_buffer_data(ctx->logits),129280u*4u);
-    myds_context_t before=*ctx;myds_dspark_t before_ds=*ds;
+    myds_context_t before=*ctx;
     const uint64_t dispatch_before=myds_metal_dispatch_count();
     float confidence=NAN;
     const int ret=myds_dspark_eval_stages(ds,ctx,0.0f,&confidence);
     CHECK(ret==1&&myds_metal_commit_batch());
     const uint64_t dispatch_after=myds_metal_dispatch_count();
     CHECK(dispatch_after>dispatch_before&&isfinite(confidence)&&confidence>=0&&confidence<=1);
+    *ds=before_ds;
+    if(have_markov_state)memcpy(ds->markov_state_host,markov_state,sizeof(markov_state));
     CHECK(!memcmp(&before,ctx,sizeof(before))&&!memcmp(&before_ds,ds,sizeof(before_ds))&&
         !memcmp(target,myds_metal_buffer_data(ctx->logits),129280u*4u)&&myds_dspark_capture_ready(ds));
     fprintf(report,"{\"schema_version\":1,\"kind\":\"neural_probe\",\"engine_mode\":%d,\"ret\":1,"
         "\"min_conf\":0,\"confidence\":%.9g,\"nan_output_poison\":true,\"actual_dispatch_increased\":true,"
+        "\"seed_token\":%d,\"seed_position\":%u,\"output_slot\":1,\"drafter_object_and_markov_state_restored\":true,"
         "\"dispatch_before\":%" PRIu64 ",\"dispatch_after\":%" PRIu64 ",\"ctx_ds_objects_and_target_logits_unchanged\":true,"
         "\"capture_ready\":true,\"batch2_coverage_claimed\":false,\"files\":[",
-        myds_dspark_engine_capture_bypass_enabled(ds),confidence,dispatch_before,dispatch_after);
+        myds_dspark_engine_capture_bypass_enabled(ds),confidence,consumed,consumed_pos,dispatch_before,dispatch_after);
     for(uint32_t i=0;i<4;i++)CHECK(raw("neural_probe",roles[i],"f32",myds_metal_buffer_data(buffers[i]),sizes[i]*4u,i!=0));
     fputs("],\"pass\":true}\n",report);fflush(report);free(target);return 1;
+}
+
+/* Inject actual Metal copy and commit failures into the neural consumer. No
+ * target forward is requested: the capture, target state and logits must stay
+ * usable, and the proposer must discard every partial neural result. */
+static int neural_failure_probe(myds_context_t *ctx) {
+    myds_dspark_t *ds=ctx->dspark;
+    CHECK(ds&&ctx->pos>0&&ctx->pcache_tokens&&ctx->pcache_len>=ctx->pos&&
+        ds->noise_hc_initialized&&myds_dspark_capture_ready(ds)&&myds_metal_commit_batch());
+    const myds_context_t before_ctx=*ctx;
+    const myds_dspark_t original_ds=*ds;
+    const int original_barrier=myds_metal_get_auto_barrier();
+    const size_t logits_bytes=(size_t)ctx->model->vocab_size*sizeof(float);
+    float *target=malloc(logits_bytes);CHECK(target);
+    memcpy(target,myds_metal_buffer_data(ctx->logits),logits_bytes);
+    float slots[3u*DIM];memcpy(slots,myds_metal_buffer_data(ds->target_hidden_buf),sizeof(slots));
+    float markov_state[MYDS_DSPARK_MARKOV_RANK];
+    const bool have_markov_state=ds->markov_state_host!=NULL;
+    if(have_markov_state)memcpy(markov_state,ds->markov_state_host,sizeof(markov_state));
+    myds_v41_spec_snapshot_t *a=calloc(1,sizeof(*a)),*b=calloc(1,sizeof(*b));CHECK(a&&b);
+    CHECK(myds_v41_spec_snapshot_save(ctx,a,1));
+    float *w_before=NULL,*w_after=NULL;size_t n_before=0,n_after=0;
+    CHECK(windows(ctx,&w_before,&n_before));
+    const int32_t consumed=ctx->pcache_tokens[ctx->pos-1u];
+    int32_t emitted=0;
+    for(uint32_t i=1;i<ctx->model->vocab_size;i++)if(target[i]>target[emitted])emitted=(int32_t)i;
+    ds->current_seed_token=consumed;ds->current_seed_position=ctx->pos-1u;ds->current_output_slot=1u;
+    ds->backoff_counter=0;
+    const myds_dspark_t ready_ds=*ds;
+    unsigned direct_failures=0,discarded_proposals=0,recoveries=0;
+    for(int barrier=0;barrier<=1;barrier++) {
+        myds_metal_set_auto_barrier(barrier);
+        for(unsigned failure=0;failure<2;failure++) {
+            *ds=ready_ds;
+            float confidence=NAN;
+            if(failure==0)myds_metal_inject_copy_failure(1);
+            else myds_metal_inject_commit_failure(1);
+            const int ret=myds_dspark_eval_stages(ds,ctx,0.0f,&confidence);
+            const uint32_t injected_calls=failure==0?myds_metal_get_copy_call_count():myds_metal_get_commit_call_count();
+            myds_metal_inject_copy_failure(0);myds_metal_inject_commit_failure(0);
+            CHECK(ret==0&&injected_calls>0&&isnan(confidence)&&myds_metal_get_auto_barrier()==barrier);
+            CHECK(!memcmp(&before_ctx,ctx,sizeof(before_ctx))&&!memcmp(&ready_ds,ds,sizeof(ready_ds))&&
+                !memcmp(target,myds_metal_buffer_data(ctx->logits),logits_bytes)&&
+                !memcmp(slots,myds_metal_buffer_data(ds->target_hidden_buf),sizeof(slots))&&
+                myds_dspark_capture_ready(ds));
+            direct_failures++;
+            /* Deliberately valid old proposal storage must become unavailable
+             * even with a usable Markov head after a neural encoding failure. */
+            ds->draft_count=5u;ds->draft_tree_count=2u;ds->is_high_confidence=true;
+            const uint64_t before_proposed=ds->proposed_tokens,before_accepted=ds->accepted_tokens;
+            if(failure==0)myds_metal_inject_copy_failure(1);
+            else myds_metal_inject_commit_failure(1);
+            const uint32_t n=myds_dspark_propose_next(ds,ctx,consumed,emitted,1);
+            const uint32_t proposal_injected_calls=failure==0?myds_metal_get_copy_call_count():myds_metal_get_commit_call_count();
+            myds_metal_inject_copy_failure(0);myds_metal_inject_commit_failure(0);
+            CHECK(!n&&proposal_injected_calls>0&&!ds->draft_count&&!ds->draft_tree_count&&!ds->is_high_confidence&&
+                ds->proposed_tokens==before_proposed&&ds->accepted_tokens==before_accepted);
+            CHECK(myds_metal_get_auto_barrier()==barrier&&!memcmp(&before_ctx,ctx,sizeof(before_ctx))&&
+                !memcmp(target,myds_metal_buffer_data(ctx->logits),logits_bytes)&&
+                !memcmp(slots,myds_metal_buffer_data(ds->target_hidden_buf),sizeof(slots))&&myds_dspark_capture_ready(ds));
+            discarded_proposals++;
+            *ds=ready_ds;confidence=NAN;
+            CHECK(myds_dspark_eval_stages(ds,ctx,0.0f,&confidence)==1&&myds_metal_commit_batch());
+            CHECK(isfinite(confidence)&&confidence>=0&&confidence<=1&&myds_metal_get_auto_barrier()==barrier&&
+                !memcmp(&before_ctx,ctx,sizeof(before_ctx))&&!memcmp(&ready_ds,ds,sizeof(ready_ds))&&
+                !memcmp(target,myds_metal_buffer_data(ctx->logits),logits_bytes));
+            const float *draft=myds_metal_buffer_data(ds->draft_logits_buf);CHECK(draft);
+            for(size_t i=0;i<5u*(size_t)ctx->model->vocab_size;i++)CHECK(isfinite(draft[i]));
+            recoveries++;
+        }
+    }
+    *ds=original_ds;
+    if(have_markov_state)memcpy(ds->markov_state_host,markov_state,sizeof(markov_state));
+    myds_metal_set_auto_barrier(original_barrier);
+    CHECK(myds_v41_spec_snapshot_save(ctx,b,1)&&!memcmp(a,b,sizeof(*a))&&
+        windows(ctx,&w_after,&n_after)&&n_before==n_after&&!memcmp(w_before,w_after,n_before*sizeof(float)));
+    CHECK(!memcmp(&before_ctx,ctx,sizeof(before_ctx))&&!memcmp(&original_ds,ds,sizeof(original_ds))&&
+        !memcmp(target,myds_metal_buffer_data(ctx->logits),logits_bytes)&&
+        !memcmp(slots,myds_metal_buffer_data(ds->target_hidden_buf),sizeof(slots)));
+    fprintf(report,"{\"schema_version\":1,\"kind\":\"neural_failure_probe\",\"engine_mode\":%d,"
+        "\"actual_metal_copy_commit_injection\":true,\"caller_auto_barriers\":[0,1],\"direct_failures\":%u,"
+        "\"discarded_proposals\":%u,\"successful_recoveries\":%u,\"target_forward_calls_added\":0,"
+        "\"ctx_ds_target_logits_capture_snapshot_window_unchanged\":true,\"all_recovered_draft_logits_finite\":true,"
+        "\"performance_measurement\":false,\"pass\":true}\n",
+        myds_dspark_engine_capture_bypass_enabled(ds),direct_failures,discarded_proposals,recoveries);fflush(report);
+    free(a);free(b);free(target);free(w_before);free(w_after);return 1;
 }
 
 static int request(myds_context_t *ctx,uint32_t i,const char *label,const char *prompt,
@@ -169,6 +266,8 @@ static int request(myds_context_t *ctx,uint32_t i,const char *label,const char *
     float *slots=myds_metal_buffer_data(ctx->dspark->target_hidden_buf);CHECK(slots);
     for(size_t j=0;j<3u*DIM;j++)slots[j]=-12345.25f;
     myds_dspark_capture_counters(ctx->dspark,NULL,true);
+    const uint64_t proposed_before=ctx->dspark->proposed_tokens;
+    const uint64_t accepted_before=ctx->dspark->accepted_tokens;
     stream_t s={.ctx=ctx,.cancel_after=cancel_after};myds_stop_reason_t reason=MYDS_STOP_ERROR;uint32_t prompt_tokens=0;
     const int ok=myds_generate_bytes_ex(ctx,prompt,stream,&s,&reason,&prompt_tokens,&s.cancelled);
     CHECK(myds_metal_commit_batch());
@@ -185,6 +284,11 @@ static int request(myds_context_t *ctx,uint32_t i,const char *label,const char *
         "\"draft_cycles\":%" PRIu64 ",\"batch2_calls\":%" PRIu64 ",\"ready\":%s}\n",
         i,label,ok,(int)reason,s.count,c.requests,c.encoded,c.bypassed,c.failures,c.stale_rejections,d.draft_cycles,d.batch2_calls,ready?"true":"false");fflush(report);
     CHECK(ok==1&&!s.error&&reason!=(int)MYDS_STOP_ERROR&&reason!=(int)MYDS_STOP_CTX_FULL);
+    /* Real request telemetry must count published neural candidates, not
+     * calls suppressed by confidence checks or adaptive backoff. */
+    CHECK(d.draft_proposed==ctx->dspark->proposed_tokens-proposed_before);
+    CHECK(d.draft_accepted==ctx->dspark->accepted_tokens-accepted_before);
+    CHECK(d.draft_accepted<=d.draft_proposed);
     CHECK(s.count==(i==9u?0u:cancel_after?cancel_after:cap));
     CHECK(reason==(i==9u?MYDS_STOP_EOS:cancel_after?MYDS_STOP_CANCELLED:MYDS_STOP_LENGTH));
     CHECK(c.requests>0&&!c.failures&&!c.stale_rejections);
@@ -281,7 +385,7 @@ static int run(const char *model_path,const char *support_path) {
     CHECK(request(ctx,5,"neural",prompt,4,0,false,true,true,0,NULL));
     CHECK(request(ctx,6,"neural_cancel",prompt,8,2,false,true,true,0,NULL));
     CHECK(request(ctx,7,"neural_resume"," Continue after the interruption.",4,0,true,true,true,0,NULL));
-    CHECK(neural_probe(ctx)&&tree_rejection(ctx));
+    CHECK(neural_probe(ctx)&&neural_failure_probe(ctx)&&tree_rejection(ctx));
     CHECK(request(ctx,8,"ordinary_again",prompt,4,0,false,false,false,0.7f,NULL));
     const int32_t original_eos=m->tokenizer->eos_id;m->tokenizer->eos_id=next;
     const int eos_ok=request(ctx,9,"controlled_eos",prompt,4,0,false,true,true,0,NULL);

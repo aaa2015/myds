@@ -44,6 +44,41 @@ struct ds4_metal_args_dsv41_rope {
     float frequencies[32];
 };
 
+/* DSpark checkpoints use F32 transformer activations. Keep these primitives
+ * separate from the target graph's BF16-rounded RoPE and 32-wide FP8 QAT. */
+kernel void kernel_myds_dspark_rope_f32(
+        constant ds4_metal_args_dsv41_rope &args,
+        device float *x,
+        uint2 group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    const float theta = float(args.start) * args.frequencies[lane];
+    const float c = precise::cos(theta);
+    const float s = args.inverse ? -precise::sin(theta) : precise::sin(theta);
+    const ulong i = (ulong)group.x * args.width + args.width - 64u + 2u * lane;
+    const float re = x[i], im = x[i + 1u];
+    x[i] = re * c - im * s;
+    x[i + 1u] = re * s + im * c;
+}
+
+kernel void kernel_myds_dspark_kv_fp8_f32(
+        constant uint &rows,
+        device float *x,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    if(group.x>=7u||group.y>=rows)return;
+    const ulong i=(ulong)group.y*512u+group.x*64u+tid;
+    const float value=x[i];
+    scratch[tid]=abs(value);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for(uint stride=32u;stride>0u;stride>>=1u) {
+        if(tid<stride)scratch[tid]=max(scratch[tid],scratch[tid+stride]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float scale=exp2(ceil(log2(max(scratch[0],1.0e-4f)/448.0f)));
+    x[i]=dsv4_e4m3fn_dequant(clamp(value/scale,-448.0f,448.0f))*scale;
+}
+
 kernel void kernel_dsv41_rope(
         constant ds4_metal_args_dsv41_rope &args,
         device float *x,

@@ -180,9 +180,10 @@ struct myds_dspark {
     uint32_t block_size;
     uint32_t markov_rank;
     uint32_t noise_token_id;
-    uint32_t target_layers[MYDS_DSPARK_TARGET_LAYERS]; // {37, 38, 39}
+    uint32_t target_layers[MYDS_DSPARK_TARGET_LAYERS]; // zero-based blocks {36, 37, 38}
     uint32_t n_routed_experts;    // 128
     uint32_t num_experts_per_tok; // 3
+    float rms_eps, hc_eps, route_scale, swiglu_clamp;
     myds_dspark_workspace_t *ws;
 
     // Stage 0 entry projection
@@ -221,6 +222,8 @@ struct myds_dspark {
 
     // Draft proposal storage
     int32_t current_seed_token;
+    uint32_t current_seed_position;
+    uint32_t current_output_slot; // 1 when the Engine has already emitted slot 0
     int32_t draft_tokens[MYDS_DSPARK_DEFAULT_BLOCK_SIZE];
     uint32_t draft_count;
 
@@ -291,7 +294,17 @@ int myds_dspark_capture_layer_to(myds_dspark_t *ds, uint32_t layer_idx,
 /* Propose K draft tokens given last token and captured target hidden states */
 uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t last_token, uint32_t draft_cap);
 
+/* V4.1 Engine continuation: capture belongs to the last consumed token at
+ * ctx->pos-1; emitted_seed has already been sampled/emitted from its logits.
+ * The next unseen token comes from slot 1, with Markov conditioned on that
+ * authoritative emitted seed. Markov-only drafting retains the usual API. */
+uint32_t myds_dspark_propose_next(myds_dspark_t *ds, myds_context_t *ctx,
+    int32_t consumed_token, int32_t emitted_seed, uint32_t draft_cap);
+
 /* Evaluate 3-Stage Transformer draft model to compute draft logits and confidence score */
+/* Diagnostic stage evaluation uses current_seed_token/current_seed_position
+ * and current_output_slot set by the proposer. Returns 0 on rejection/failure:
+ * a confidence rejection publishes its finite score, encoding failure NAN. */
 int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_conf, float *out_confidence);
 
 /* Propose Top-2 tree branches for tree-based speculative decoding */
