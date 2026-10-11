@@ -8,3 +8,4 @@ __pycache__/
 tests/verify_metal
 tests/test_metal
 scratch/
+*.metallib

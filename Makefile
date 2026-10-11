@@ -60,6 +60,7 @@ TEST_DSPARK_ROLLBACK = $(BIN_DIR)/test_dspark_rollback
 TEST_DSPARK_CAPTURE = $(BIN_DIR)/test_dspark_capture
 TEST_BATCH2_PARITY = $(BIN_DIR)/test_batch2_parity
 TEST_BATCH2_E2E = $(BIN_DIR)/test_batch2_e2e
+TEST_Q4_BF16_PARITY = $(BIN_DIR)/test_q4_bf16_parity
 TEST_TREE_SPEC = $(BIN_DIR)/test_tree_spec
 BENCH_SYNTHETIC = $(BIN_DIR)/bench_synthetic
 BENCH_METAL = $(BIN_DIR)/bench_metal
@@ -69,7 +70,7 @@ DUMP_TENSORS = $(BIN_DIR)/dump_tensors
 METALLIB = $(BIN_DIR)/myds.metallib
 METAL_SRCS = $(wildcard metal/*.metal)
 
-ALL_TESTS = $(TEST_METAL) $(TEST_V41_GPU) $(TEST_ATTN_POLICY) $(TEST_ATTN_VEC) $(TEST_QKV_FUSION) $(TEST_DECODE_Q8) $(TEST_MOE_DOWN_NSG) $(TEST_DEEPER_SSD) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE) $(TEST_CPU) $(TEST_ENGRAM) $(TEST_ALIGN) $(TEST_PLD) $(TEST_KVDSK) $(TEST_P1) $(TEST_DSPARK_ROLLBACK) $(TEST_DSPARK_CAPTURE) $(TEST_BATCH2_PARITY) $(TEST_BATCH2_E2E) $(TEST_TREE_SPEC)
+ALL_TESTS = $(TEST_METAL) $(TEST_V41_GPU) $(TEST_ATTN_POLICY) $(TEST_ATTN_VEC) $(TEST_QKV_FUSION) $(TEST_DECODE_Q8) $(TEST_MOE_DOWN_NSG) $(TEST_DEEPER_SSD) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE) $(TEST_CPU) $(TEST_ENGRAM) $(TEST_ALIGN) $(TEST_PLD) $(TEST_KVDSK) $(TEST_P1) $(TEST_DSPARK_ROLLBACK) $(TEST_DSPARK_CAPTURE) $(TEST_BATCH2_PARITY) $(TEST_BATCH2_E2E) $(TEST_Q4_BF16_PARITY) $(TEST_TREE_SPEC)
 
 .PHONY: all test clean bench metallib build-tail-init test-tail-init
 
@@ -224,6 +225,9 @@ build-indexer-rope-quant-candidate: $(TEST_INDEXER_ROPE_QUANT)
 
 $(TEST_BATCH2_Q8_SHARED): tests/test_batch2_q8_shared.m src/myds_metal.m $(wildcard include/*.h) $(OBJS_C) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc tests/test_batch2_q8_shared.m $(OBJS_C) $(LDFLAGS) -o $@
+
+$(TEST_Q4_BF16_PARITY): tests/test_q4_bf16_parity.m src/myds_metal.m $(wildcard include/*.h) $(OBJS_C) $(METALLIB) | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) -Isrc tests/test_q4_bf16_parity.m $(OBJS_C) $(LDFLAGS) -o $@
 
 .PHONY: build-decode-candidates
 build-decode-candidates: $(TEST_MOE_IQ2_LUT) $(TEST_ATTN_PACKED) $(TEST_TOPK_NAN_FUSE) $(TEST_BATCH2_Q8_SHARED)
