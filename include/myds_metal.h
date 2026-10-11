@@ -177,6 +177,20 @@ int myds_metal_v41_hc_mix(myds_metal_buffer_t *split,
     ggml_type fn_type, const myds_metal_buffer_t *scale,
     const myds_metal_buffer_t *base, myds_metal_buffer_t *flat_norm,
     myds_metal_buffer_t *mix, uint32_t dim, float eps, float hc_eps);
+int myds_metal_v41_hc_mix_batch2(
+    myds_metal_buffer_t *split_b2,
+    myds_metal_buffer_t *split[2],
+    const myds_metal_buffer_t *residual[2],
+    const myds_metal_buffer_t *fn,
+    ggml_type fn_type,
+    const myds_metal_buffer_t *scale,
+    const myds_metal_buffer_t *base,
+    myds_metal_buffer_t *flat_norm[2],
+    myds_metal_buffer_t *mix_b2,
+    myds_metal_buffer_t *mix[2],
+    uint32_t dim,
+    float eps,
+    float hc_eps);
 int myds_metal_v41_hc_weighted_sum(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *residual, const myds_metal_buffer_t *weights,
     uint32_t dim);

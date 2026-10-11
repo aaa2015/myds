@@ -3799,6 +3799,57 @@ int myds_metal_v41_gemv_shared2_dense(myds_metal_buffer_t *const out[2],
     }
 }
 
+int myds_metal_v41_hc_mix_batch2(
+    myds_metal_buffer_t *split_b2,
+    myds_metal_buffer_t *split[2],
+    const myds_metal_buffer_t *residual[2],
+    const myds_metal_buffer_t *fn,
+    ggml_type fn_type,
+    const myds_metal_buffer_t *scale,
+    const myds_metal_buffer_t *base,
+    myds_metal_buffer_t *flat_norm[2],
+    myds_metal_buffer_t *mix_b2,
+    myds_metal_buffer_t *mix[2],
+    uint32_t dim,
+    float eps,
+    float hc_eps) {
+    if (!g_initialized || !dim || dim > INT32_MAX / 4 || dim % 128 ||
+        !isfinite(hc_eps) || hc_eps < 0 ||
+        !split_b2 || !mix_b2 || !fn || !scale || !base ||
+        !split || !split[0] || !split[1] ||
+        !residual || !residual[0] || !residual[1] ||
+        !flat_norm || !flat_norm[0] || !flat_norm[1] ||
+        !mix || !mix[0] || !mix[1]) return 0;
+
+    /* 1. RMSNorm on both tokens */
+    if (!myds_metal_v41_rmsnorm(flat_norm[0], residual[0], NULL, 4u * dim, eps, false)) return 0;
+    if (!myds_metal_v41_rmsnorm(flat_norm[1], residual[1], NULL, 4u * dim, eps, false)) return 0;
+    if (!g_auto_barrier) {
+        const myds_metal_buffer_t *fn_deps[] = {flat_norm[0], flat_norm[1]};
+        myds_metal_barrier_buffers(fn_deps, 2);
+    }
+
+    /* 2. Shared-weight GEMV across both tokens (reads fn weights from DRAM only once) */
+    int ok = 0;
+    if (fn_type == GGML_TYPE_F16 || fn_type == GGML_TYPE_F32) {
+        ok = myds_metal_v41_gemv_shared2_dense(mix, fn, flat_norm, 24, 4u * dim, fn_type);
+    }
+    if (!ok) {
+        for (unsigned t = 0; t < 2; ++t) {
+            if (!(fn_type == GGML_TYPE_F16
+                    ? myds_metal_v41_gemv(mix[t], fn, flat_norm[t], 24, 4u * dim, fn_type)
+                    : myds_metal_gemv(mix[t], fn, flat_norm[t], 24, 4u * dim, fn_type))) return 0;
+        }
+    }
+    if (!g_auto_barrier) {
+        const myds_metal_buffer_t *mx_deps[] = {mix[0], mix[1]};
+        myds_metal_barrier_buffers(mx_deps, 2);
+    }
+
+    /* 3. Batched HC Split across both tokens */
+    return myds_metal_v41_hc_split_batch(split_b2, mix_b2, scale, base, 2, hc_eps);
+}
+
 static id<MTLComputePipelineState> batch2_q8_f32_shared_pipeline(uint32_t nsg, uint32_t nr0) {
     if ((nsg != 4 && nsg != 8) || (nr0 != 2 && nr0 != 4) || !g_library) return nil;
     NSString *key = [NSString stringWithFormat:@"batch2_shared_q8_f32_%u_%u", nsg, nr0];

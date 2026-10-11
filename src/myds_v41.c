@@ -4325,8 +4325,7 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         myds_metal_barrier_buffer(ws->x_norm_b2);
 
         /* HC Mix (dispatches concurrently with QKV and Attention) */
-        CHECK(myds_metal_v41_hc_mix(ws->v_attn_split[0], ws->v_residual[0], l->attn_fn, GGML_TYPE_F16, l->attn_scale, l->attn_base, ws->v_flat_norm[0], ws->v_mix[0], V41_DIM, m->norm_eps, v->hc_eps));
-        CHECK(myds_metal_v41_hc_mix(ws->v_attn_split[1], ws->v_residual[1], l->attn_fn, GGML_TYPE_F16, l->attn_scale, l->attn_base, ws->v_flat_norm[1], ws->v_mix[1], V41_DIM, m->norm_eps, v->hc_eps));
+        CHECK(myds_metal_v41_hc_mix_batch2(ws->attn_split_b2, ws->v_attn_split, (const myds_metal_buffer_t **)ws->v_residual, l->attn_fn, GGML_TYPE_F16, l->attn_scale, l->attn_base, ws->v_flat_norm, ws->mix_b2, ws->v_mix, V41_DIM, m->norm_eps, v->hc_eps));
         if (trace_gpu) {
             myds_metal_barrier_buffer(ws->attn_split_b2);
             CHECK(myds_metal_commit_batch());
@@ -4410,8 +4409,7 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         myds_metal_barrier_buffer(ws->ffn_norm_b2);
 
         /* 1. 并发派发 FFN HC Mix（只读 after_attn，写 ffn_split，与后续 Shared/Router/MoE 完全重叠） */
-        CHECK(myds_metal_v41_hc_mix(ws->v_ffn_split[0], ws->v_after_attn[0], l->ffn_fn, GGML_TYPE_F16, l->ffn_scale, l->ffn_base, ws->v_flat_norm[0], ws->v_mix[0], V41_DIM, m->norm_eps, v->hc_eps));
-        CHECK(myds_metal_v41_hc_mix(ws->v_ffn_split[1], ws->v_after_attn[1], l->ffn_fn, GGML_TYPE_F16, l->ffn_scale, l->ffn_base, ws->v_flat_norm[1], ws->v_mix[1], V41_DIM, m->norm_eps, v->hc_eps));
+        CHECK(myds_metal_v41_hc_mix_batch2(ws->ffn_split_b2, ws->v_ffn_split, (const myds_metal_buffer_t **)ws->v_after_attn, l->ffn_fn, GGML_TYPE_F16, l->ffn_scale, l->ffn_base, ws->v_flat_norm, ws->mix_b2, ws->v_mix, V41_DIM, m->norm_eps, v->hc_eps));
 
         /* 2. 优先并发派发 Router Gate GEMV，使路由计算尽早完成以尽早启动 Routed MoE */
         CHECK(myds_v41_batch2_projection_probe(ws->v_router_logits, base->router_gate,

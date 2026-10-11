@@ -222,18 +222,36 @@ static int test_batch2_moe_route(void) {
     return 1;
 }
 
+static void fill_q4_k_weights(myds_metal_buffer_t *b) {
+    uint8_t *p = (uint8_t *)myds_metal_buffer_data(b);
+    size_t bytes = myds_metal_buffer_size(b);
+    for (size_t i = 0; i < bytes; i++) {
+        p[i] = (uint8_t)((i * 37 + 101) & 0xff);
+    }
+    size_t n_blocks = bytes / 144;
+    for (size_t blk = 0; blk < n_blocks; blk++) {
+        uint16_t *d_ptr = (uint16_t *)(p + blk * 144);
+        uint16_t *dmin_ptr = (uint16_t *)(p + blk * 144 + 2);
+        *d_ptr = 0x3c00; // 1.0 in FP16
+        *dmin_ptr = 0x3800; // 0.5 in FP16
+    }
+}
+
 static int test_authoritative_projection(uint32_t rows, uint32_t width,
     ggml_type type, myds_v41_batch2_projection_kind_t kind) {
     printf("[TEST] Production decode projection boundary kind=%u rows=%u width=%u type=%u...\n",
            kind, rows, width, type);
     const size_t w_bytes = type == GGML_TYPE_Q8_0 ? (size_t)rows * width / 32u * 34u
+                         : (type == GGML_TYPE_Q4_K ? (size_t)rows * width / 256u * 144u
                          : (type == GGML_TYPE_F16 ? (size_t)rows * width * sizeof(uint16_t)
-                                                  : (size_t)rows * width * sizeof(float));
+                                                  : (size_t)rows * width * sizeof(float)));
     myds_metal_buffer_t *weight = myds_metal_buffer_alloc(w_bytes);
     myds_metal_buffer_t *input[2], *reference[2], *candidate[2], *raw[2];
     CHECK(weight);
     if (type == GGML_TYPE_Q8_0) {
         fill_q8_weights(weight);
+    } else if (type == GGML_TYPE_Q4_K) {
+        fill_q4_k_weights(weight);
     } else if (type == GGML_TYPE_F16) {
         uint16_t *p = (uint16_t *)myds_metal_buffer_data(weight);
         for (size_t i = 0; i < (size_t)rows * width; i++) p[i] = (uint16_t)(0x3000u + (i % 17));
@@ -265,10 +283,12 @@ static int test_authoritative_projection(uint32_t rows, uint32_t width,
     CHECK(myds_v41_batch2_projection_probe(candidate, weight, input, rows, width, type, kind));
     CHECK(myds_metal_commit_batch());
     myds_metal_batch2_q8_shared_counters(&after, false);
-    if (myds_metal_batch2_q8_shared_mode() > 0 &&
-        (kind == MYDS_V41_BATCH2_LM_HEAD ||
-         ((kind == MYDS_V41_BATCH2_QKV || kind == MYDS_V41_BATCH2_TAIL || kind == MYDS_V41_BATCH2_SHARED) &&
-          type == GGML_TYPE_Q8_0 && myds_v41_decode_q8_fuse_bf16_enabled()))) {
+    if ((type == GGML_TYPE_Q8_0 && myds_metal_batch2_q8_shared_mode() > 0 &&
+         (kind == MYDS_V41_BATCH2_LM_HEAD ||
+          ((kind == MYDS_V41_BATCH2_QKV || kind == MYDS_V41_BATCH2_TAIL || kind == MYDS_V41_BATCH2_SHARED) &&
+           myds_v41_decode_q8_fuse_bf16_enabled()))) ||
+        (type == GGML_TYPE_Q4_K && myds_metal_batch2_q4_shared_mode() > 0 &&
+         (kind == MYDS_V41_BATCH2_QKV || kind == MYDS_V41_BATCH2_TAIL || kind == MYDS_V41_BATCH2_SHARED))) {
         CHECK(after.encoded > before.encoded);
     }
     for (uint32_t t = 0; t < 2; ++t) {
@@ -283,21 +303,6 @@ static int test_authoritative_projection(uint32_t rows, uint32_t width,
     }
     myds_metal_buffer_free(weight);
     return 1;
-}
-
-static void fill_q4_k_weights(myds_metal_buffer_t *b) {
-    uint8_t *p = (uint8_t *)myds_metal_buffer_data(b);
-    size_t bytes = myds_metal_buffer_size(b);
-    for (size_t i = 0; i < bytes; i++) {
-        p[i] = (uint8_t)((i * 37 + 101) & 0xff);
-    }
-    size_t n_blocks = bytes / 144;
-    for (size_t blk = 0; blk < n_blocks; blk++) {
-        uint16_t *d_ptr = (uint16_t *)(p + blk * 144);
-        uint16_t *dmin_ptr = (uint16_t *)(p + blk * 144 + 2);
-        *d_ptr = 0x3c00; // 1.0 in FP16
-        *dmin_ptr = 0x3800; // 0.5 in FP16
-    }
 }
 
 static int test_batch2_attn_output_a(void) {
@@ -579,6 +584,83 @@ static int test_batch2_routed_moe(void) {
     return 1;
 }
 
+static int test_batch2_hc_mix(void) {
+    printf("[TEST] Batch-2 HC Mix (Attention & FFN)...\n");
+    const uint32_t dim = 5120;
+    const float eps = 1e-6f;
+    const float hc_eps = 1e-4f;
+    const size_t fn_bytes = 24u * 4u * dim * sizeof(uint16_t); // F16: 24 x 20480
+
+    myds_metal_buffer_t *fn = myds_metal_buffer_alloc(fn_bytes);
+    myds_metal_buffer_t *scale = myds_metal_buffer_alloc(3 * sizeof(float));
+    myds_metal_buffer_t *base = myds_metal_buffer_alloc(24 * sizeof(float));
+    CHECK(fn && scale && base);
+
+    uint16_t *fn_p = (uint16_t *)myds_metal_buffer_data(fn);
+    for (size_t i = 0; i < 24u * 4u * dim; i++) fn_p[i] = (uint16_t)(0x3400u + (i % 29));
+    float *scale_p = (float *)myds_metal_buffer_data(scale);
+    scale_p[0] = 0.5f; scale_p[1] = 0.25f; scale_p[2] = 0.125f;
+    fill_act(base, 42);
+
+    myds_metal_buffer_t *flat_norm_b2 = myds_metal_buffer_alloc(3 * 4 * dim * sizeof(float));
+    myds_metal_buffer_t *mix_b2 = myds_metal_buffer_alloc(3 * 24 * sizeof(float));
+    myds_metal_buffer_t *split_b2 = myds_metal_buffer_alloc(3 * 24 * sizeof(float));
+    CHECK(flat_norm_b2 && mix_b2 && split_b2);
+
+    myds_metal_buffer_t *residual[2];
+    myds_metal_buffer_t *flat_norm_seq[2], *mix_seq[2], *split_seq[2];
+    myds_metal_buffer_t *flat_norm_cand[2], *mix_cand[2], *split_cand[2];
+
+    for (uint32_t t = 0; t < 2; ++t) {
+        residual[t] = myds_metal_buffer_alloc(4 * dim * sizeof(float));
+        flat_norm_seq[t] = myds_metal_buffer_alloc(4 * dim * sizeof(float));
+        mix_seq[t] = myds_metal_buffer_alloc(24 * sizeof(float));
+        split_seq[t] = myds_metal_buffer_alloc(24 * sizeof(float));
+        CHECK(residual[t] && flat_norm_seq[t] && mix_seq[t] && split_seq[t]);
+        fill_act(residual[t], 100u + 50u * t);
+
+        flat_norm_cand[t] = myds_metal_buffer_sub_view(flat_norm_b2, t * 4 * dim * sizeof(float), 4 * dim * sizeof(float));
+        mix_cand[t] = myds_metal_buffer_sub_view(mix_b2, t * 24 * sizeof(float), 24 * sizeof(float));
+        split_cand[t] = myds_metal_buffer_sub_view(split_b2, t * 24 * sizeof(float), 24 * sizeof(float));
+        CHECK(flat_norm_cand[t] && mix_cand[t] && split_cand[t]);
+    }
+
+    /* 1. Sequential reference */
+    CHECK(myds_metal_begin_batch());
+    for (uint32_t t = 0; t < 2; ++t) {
+        CHECK(myds_metal_v41_hc_mix(split_seq[t], residual[t], fn, GGML_TYPE_F16, scale, base,
+                                    flat_norm_seq[t], mix_seq[t], dim, eps, hc_eps));
+    }
+    CHECK(myds_metal_commit_batch());
+
+    /* 2. Batched candidate */
+    const myds_metal_buffer_t *res_const[2] = {residual[0], residual[1]};
+    CHECK(myds_metal_begin_batch());
+    CHECK(myds_metal_v41_hc_mix_batch2(split_b2, split_cand, res_const, fn, GGML_TYPE_F16, scale, base,
+                                       flat_norm_cand, mix_b2, mix_cand, dim, eps, hc_eps));
+    CHECK(myds_metal_commit_batch());
+
+    /* 3. Bit-exact verification */
+    for (uint32_t t = 0; t < 2; ++t) {
+        CHECK(verify_exact(split_seq[t], split_cand[t], 24));
+        myds_metal_buffer_free(split_cand[t]);
+        myds_metal_buffer_free(mix_cand[t]);
+        myds_metal_buffer_free(flat_norm_cand[t]);
+        myds_metal_buffer_free(split_seq[t]);
+        myds_metal_buffer_free(mix_seq[t]);
+        myds_metal_buffer_free(flat_norm_seq[t]);
+        myds_metal_buffer_free(residual[t]);
+    }
+    myds_metal_buffer_free(split_b2);
+    myds_metal_buffer_free(mix_b2);
+    myds_metal_buffer_free(flat_norm_b2);
+    myds_metal_buffer_free(base);
+    myds_metal_buffer_free(scale);
+    myds_metal_buffer_free(fn);
+    printf("  [PASS] Batch-2 HC Mix 100%% bit-exact!\n");
+    return 1;
+}
+
 int main(void) {
     printf("\n=======================================================\n");
     printf("   Phase 3: Metal Per-Layer Batch-2 Parity Test Suite  \n");
@@ -613,8 +695,13 @@ int main(void) {
     // 8. MoE Fused Router (rows = 2)
     if (!test_batch2_moe_route()) return 1;
     if (!test_authoritative_projection(1280, 5120, GGML_TYPE_Q8_0, MYDS_V41_BATCH2_QKV)) return 1;
+    if (!test_authoritative_projection(1280, 5120, GGML_TYPE_Q4_K, MYDS_V41_BATCH2_QKV)) return 1;
+    if (!test_authoritative_projection(512, 5120, GGML_TYPE_Q4_K, MYDS_V41_BATCH2_QKV)) return 1;
+    if (!test_authoritative_projection(32768, 1280, GGML_TYPE_Q4_K, MYDS_V41_BATCH2_QKV)) return 1;
     if (!test_authoritative_projection(5120, 8192, GGML_TYPE_Q8_0, MYDS_V41_BATCH2_TAIL)) return 1;
+    if (!test_authoritative_projection(5120, 8192, GGML_TYPE_Q4_K, MYDS_V41_BATCH2_TAIL)) return 1;
     if (!test_authoritative_projection(5120, 2304, GGML_TYPE_Q8_0, MYDS_V41_BATCH2_SHARED)) return 1;
+    if (!test_authoritative_projection(5120, 2304, GGML_TYPE_Q4_K, MYDS_V41_BATCH2_SHARED)) return 1;
     if (!test_authoritative_projection(384, 5120, GGML_TYPE_F16, MYDS_V41_BATCH2_ROUTER)) return 1;
     if (!test_authoritative_projection(384, 5120, GGML_TYPE_F32, MYDS_V41_BATCH2_ROUTER)) return 1;
     if (!test_authoritative_projection(1024, 5120, GGML_TYPE_Q8_0, MYDS_V41_BATCH2_LM_HEAD)) return 1;
@@ -623,10 +710,13 @@ int main(void) {
     // 9. Batch-2 Attention Output A
     if (!test_batch2_attn_output_a()) return 1;
 
-    // 10. Batch-2 Shared Gate+Up SwiGLU
+    // 10. Batch-2 HC Mix
+    if (!test_batch2_hc_mix()) return 1;
+
+    // 11. Batch-2 Shared Gate+Up SwiGLU
     if (!test_batch2_shared_swiglu()) return 1;
 
-    // 11. Batch-2 Routed MoE (Deduplicated SwiGLU + Down)
+    // 12. Batch-2 Routed MoE (Deduplicated SwiGLU + Down)
     if (!test_batch2_routed_moe()) return 1;
 
     printf("\n=== ALL PHASE 3 BATCH-2 PARITY TESTS PASSED CLEANLY! ===\n\n");
