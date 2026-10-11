@@ -5012,8 +5012,7 @@ bool myds_v41_batch2_spec_requested(const myds_context_t *ctx) {
 }
 
 bool myds_v41_batch2_spec_enabled(const myds_context_t *ctx, uint32_t n_tokens) {
-    return n_tokens >= 2 && myds_v41_batch2_spec_requested(ctx) &&
-           (!ctx->dspark || ctx->dspark->is_high_confidence || ctx->decode_pld_candidate);
+    return n_tokens >= 2 && myds_v41_batch2_spec_requested(ctx);
 }
 
 int myds_v41_forward_batch_spec_ex(myds_context_t *ctx, const int32_t *tokens,

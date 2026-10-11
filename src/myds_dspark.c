@@ -1669,14 +1669,14 @@ static uint32_t dspark_propose_at(myds_dspark_t *ds, myds_context_t *ctx,
             static float high_conf_margin = -1.0f;
             if (__builtin_expect(high_conf_margin < -0.5f, 0)) {
                 const char *env = getenv("MYDS_DSPARK_HIGH_CONF_MARGIN");
-                high_conf_margin = env ? (float)atof(env) : 1.50f;
+                high_conf_margin = env ? (float)atof(env) : 0.0f;
                 MYDS_LOG_I("DSpark high-confidence speculative margin active: threshold=%.2f", high_conf_margin);
             }
 
             static float high_conf_thresh = -1.0f;
             if (__builtin_expect(high_conf_thresh < -0.5f, 0)) {
                 const char *env = getenv("MYDS_DSPARK_HIGH_CONF_THRESH");
-                high_conf_thresh = env ? (float)atof(env) : 0.70f;
+                high_conf_thresh = env ? (float)atof(env) : 0.0f;
                 MYDS_LOG_I("DSpark high-confidence speculative threshold active: threshold=%.2f", high_conf_thresh);
             }
 

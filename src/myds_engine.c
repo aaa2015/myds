@@ -3812,12 +3812,19 @@ static int myds_generate_internal(myds_context_t *ctx,
                     ctx->dspark->verify_ms += (double)(tv_ver1.tv_sec - tv_ver0.tv_sec) * 1000.0 +
                                               (double)(tv_ver1.tv_usec - tv_ver0.tv_usec) / 1000.0;
 
+                    static int s_backoff_thresh = -1;
+                    if (__builtin_expect(s_backoff_thresh < 0, 0)) {
+                        const char *e = getenv("MYDS_DSPARK_BACKOFF_THRESH");
+                        s_backoff_thresh = e ? atoi(e) : 6;
+                    }
                     if (!ctx->decode_pld_candidate && accepted_in_cycle == 0) {
                         ctx->dspark->consecutive_misses++;
-                        if (ctx->dspark->consecutive_misses >= 4) {
-                            ctx->dspark->backoff_counter = 8;
-                        } else if (ctx->dspark->consecutive_misses >= 3) {
-                            ctx->dspark->backoff_counter = 4;
+                        if (s_backoff_thresh > 0) {
+                            if (ctx->dspark->consecutive_misses >= (uint32_t)s_backoff_thresh + 2) {
+                                ctx->dspark->backoff_counter = 8;
+                            } else if (ctx->dspark->consecutive_misses >= (uint32_t)s_backoff_thresh) {
+                                ctx->dspark->backoff_counter = 4;
+                            }
                         }
                     } else if (!ctx->decode_pld_candidate) {
                         ctx->dspark->consecutive_misses = 0;
@@ -3906,12 +3913,19 @@ static int myds_generate_internal(myds_context_t *ctx,
             ctx->dspark->verify_ms += (double)(tv_ver1.tv_sec - tv_ver0.tv_sec) * 1000.0 +
                                       (double)(tv_ver1.tv_usec - tv_ver0.tv_usec) / 1000.0;
 
+            static int s_backoff_thresh_old = -1;
+            if (__builtin_expect(s_backoff_thresh_old < 0, 0)) {
+                const char *e = getenv("MYDS_DSPARK_BACKOFF_THRESH");
+                s_backoff_thresh_old = e ? atoi(e) : 6;
+            }
             if (!ctx->decode_pld_candidate && accepted_in_cycle == 0) {
                 ctx->dspark->consecutive_misses++;
-                if (ctx->dspark->consecutive_misses >= 4) {
-                    ctx->dspark->backoff_counter = 8;
-                } else if (ctx->dspark->consecutive_misses >= 2) {
-                    ctx->dspark->backoff_counter = 4;
+                if (s_backoff_thresh_old > 0) {
+                    if (ctx->dspark->consecutive_misses >= (uint32_t)s_backoff_thresh_old + 2) {
+                        ctx->dspark->backoff_counter = 8;
+                    } else if (ctx->dspark->consecutive_misses >= (uint32_t)s_backoff_thresh_old) {
+                        ctx->dspark->backoff_counter = 4;
+                    }
                 }
             } else if (!ctx->decode_pld_candidate) {
                 ctx->dspark->consecutive_misses = 0;
