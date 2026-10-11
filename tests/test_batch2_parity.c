@@ -268,6 +268,130 @@ static int test_authoritative_projection(uint32_t rows, uint32_t width,
     return 1;
 }
 
+static void fill_q4_k_weights(myds_metal_buffer_t *b) {
+    uint8_t *p = (uint8_t *)myds_metal_buffer_data(b);
+    size_t bytes = myds_metal_buffer_size(b);
+    for (size_t i = 0; i < bytes; i++) {
+        p[i] = (uint8_t)((i * 37 + 101) & 0xff);
+    }
+    size_t n_blocks = bytes / 144;
+    for (size_t blk = 0; blk < n_blocks; blk++) {
+        uint16_t *d_ptr = (uint16_t *)(p + blk * 144);
+        uint16_t *dmin_ptr = (uint16_t *)(p + blk * 144 + 2);
+        *d_ptr = 0x3c00; // 1.0 in FP16
+        *dmin_ptr = 0x3800; // 0.5 in FP16
+    }
+}
+
+static int test_batch2_attn_output_a(void) {
+    printf("[TEST] Batch-2 Attention Output A (8 groups x 1024 rank x 4096 dim)...\n");
+    const uint32_t n_groups = 8;
+    const uint32_t group_dim = 4096;
+    const uint32_t rank = 1024;
+    const size_t out_a_bytes = (size_t)n_groups * rank * (group_dim / 256u) * 144u;
+    const size_t heads_per_tok = (size_t)n_groups * group_dim; // 32768 floats
+    const size_t low_per_tok = (size_t)n_groups * rank;         // 8192 floats
+
+    myds_metal_buffer_t *out_a = myds_metal_buffer_alloc(out_a_bytes);
+    myds_metal_buffer_t *heads_seq[2], *low_seq[2];
+    myds_metal_buffer_t *heads_b2 = myds_metal_buffer_alloc(2 * heads_per_tok * sizeof(float));
+    myds_metal_buffer_t *low_b2 = myds_metal_buffer_alloc(2 * low_per_tok * sizeof(float));
+    CHECK(out_a && heads_b2 && low_b2);
+
+    fill_q4_k_weights(out_a);
+
+    for (uint32_t t = 0; t < 2; ++t) {
+        heads_seq[t] = myds_metal_buffer_alloc(heads_per_tok * sizeof(float));
+        low_seq[t] = myds_metal_buffer_alloc(low_per_tok * sizeof(float));
+        CHECK(heads_seq[t] && low_seq[t]);
+        fill_act(heads_seq[t], 77u + 88u * t);
+        memcpy((float *)myds_metal_buffer_data(heads_b2) + t * heads_per_tok,
+               myds_metal_buffer_data(heads_seq[t]), heads_per_tok * sizeof(float));
+    }
+
+    // 1. Sequential execution
+    CHECK(myds_metal_begin_batch());
+    for (uint32_t t = 0; t < 2; ++t) {
+        CHECK(myds_metal_attn_output_a_bf16(low_seq[t], out_a, heads_seq[t], n_groups, group_dim, rank, GGML_TYPE_Q4_K));
+    }
+    CHECK(myds_metal_commit_batch());
+
+    // 2. Batch-2 execution
+    CHECK(myds_metal_begin_batch());
+    CHECK(myds_metal_attn_output_a_bf16_batch(low_b2, out_a, heads_b2, n_groups, group_dim, rank, 2, GGML_TYPE_Q4_K));
+    CHECK(myds_metal_commit_batch());
+
+    // 3. Bit-exact comparison
+    for (uint32_t t = 0; t < 2; ++t) {
+        myds_metal_buffer_t *low_sub = myds_metal_buffer_sub_view(low_b2, t * low_per_tok * sizeof(float), low_per_tok * sizeof(float));
+        CHECK(verify_exact(low_seq[t], low_sub, low_per_tok));
+        myds_metal_buffer_free(low_sub);
+        myds_metal_buffer_free(heads_seq[t]);
+        myds_metal_buffer_free(low_seq[t]);
+    }
+    myds_metal_buffer_free(heads_b2);
+    myds_metal_buffer_free(low_b2);
+    myds_metal_buffer_free(out_a);
+
+    printf("  [PASS] Batch-2 Attention Output A 100%% bit-exact!\n");
+    return 1;
+}
+
+static int test_batch2_shared_swiglu(void) {
+    printf("[TEST] Batch-2 Shared Gate+Up SwiGLU (2304 x 5120 Q4_K)...\n");
+    const uint32_t out_dim = 2304;
+    const uint32_t in_dim = 5120;
+    const size_t row_bytes = (in_dim / 256u) * 144u;
+    const size_t w_bytes = (size_t)out_dim * row_bytes;
+
+    myds_metal_buffer_t *gate = myds_metal_buffer_alloc(w_bytes);
+    myds_metal_buffer_t *up = myds_metal_buffer_alloc(w_bytes);
+    myds_metal_buffer_t *in_seq[2], *out_seq[2];
+    myds_metal_buffer_t *in_b2 = myds_metal_buffer_alloc(2 * (size_t)in_dim * sizeof(float));
+    myds_metal_buffer_t *out_b2 = myds_metal_buffer_alloc(2 * (size_t)out_dim * sizeof(float));
+    CHECK(gate && up && in_b2 && out_b2);
+
+    fill_q4_k_weights(gate);
+    fill_q4_k_weights(up);
+
+    for (uint32_t t = 0; t < 2; ++t) {
+        in_seq[t] = myds_metal_buffer_alloc((size_t)in_dim * sizeof(float));
+        out_seq[t] = myds_metal_buffer_alloc((size_t)out_dim * sizeof(float));
+        CHECK(in_seq[t] && out_seq[t]);
+        fill_act(in_seq[t], 31u + 41u * t);
+        memcpy((float *)myds_metal_buffer_data(in_b2) + t * in_dim,
+               myds_metal_buffer_data(in_seq[t]), in_dim * sizeof(float));
+    }
+
+    // 1. Sequential execution
+    CHECK(myds_metal_begin_batch());
+    for (uint32_t t = 0; t < 2; ++t) {
+        CHECK(myds_v41_shared_gate_up_swiglu(out_seq[t], gate, up, in_seq[t], out_dim, in_dim, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, 0.0f));
+    }
+    CHECK(myds_metal_commit_batch());
+
+    // 2. Batch-2 execution
+    CHECK(myds_metal_begin_batch());
+    CHECK(myds_v41_shared_gate_up_swiglu_batch2(out_b2, gate, up, in_b2, out_dim, in_dim, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, 0.0f));
+    CHECK(myds_metal_commit_batch());
+
+    // 3. Bit-exact comparison
+    for (uint32_t t = 0; t < 2; ++t) {
+        myds_metal_buffer_t *out_sub = myds_metal_buffer_sub_view(out_b2, t * (size_t)out_dim * sizeof(float), out_dim * sizeof(float));
+        CHECK(verify_exact(out_seq[t], out_sub, out_dim));
+        myds_metal_buffer_free(out_sub);
+        myds_metal_buffer_free(in_seq[t]);
+        myds_metal_buffer_free(out_seq[t]);
+    }
+    myds_metal_buffer_free(in_b2);
+    myds_metal_buffer_free(out_b2);
+    myds_metal_buffer_free(gate);
+    myds_metal_buffer_free(up);
+
+    printf("  [PASS] Batch-2 Shared Gate+Up SwiGLU 100%% bit-exact!\n");
+    return 1;
+}
+
 int main(void) {
     printf("\n=======================================================\n");
     printf("   Phase 3: Metal Per-Layer Batch-2 Parity Test Suite  \n");
@@ -305,6 +429,12 @@ int main(void) {
     if (!test_authoritative_projection(5120, 8192, GGML_TYPE_Q8_0, MYDS_V41_BATCH2_TAIL)) return 1;
     if (!test_authoritative_projection(5120, 2304, GGML_TYPE_Q8_0, MYDS_V41_BATCH2_SHARED)) return 1;
     if (!test_authoritative_projection(384, 5120, GGML_TYPE_F32, MYDS_V41_BATCH2_ROUTER)) return 1;
+
+    // 9. Batch-2 Attention Output A
+    if (!test_batch2_attn_output_a()) return 1;
+
+    // 10. Batch-2 Shared Gate+Up SwiGLU
+    if (!test_batch2_shared_swiglu()) return 1;
 
     printf("\n=== ALL PHASE 3 BATCH-2 PARITY TESTS PASSED CLEANLY! ===\n\n");
     return 0;

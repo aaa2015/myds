@@ -5245,15 +5245,16 @@ int myds_metal_attn_output_a(
     return myds_metal_attn_output_a_batch(low, out_a, heads, n_groups, group_dim, rank, 1, weight_type);
 }
 
-int myds_metal_attn_output_a_bf16(
+int myds_metal_attn_output_a_bf16_batch(
     myds_metal_buffer_t       *low,
     const myds_metal_buffer_t *out_a,
     const myds_metal_buffer_t *heads,
     uint32_t                   n_groups,
     uint32_t                   group_dim,
     uint32_t                   rank,
+    uint32_t                   n_tok,
     ggml_type                  weight_type) {
-    if (!low || !out_a || !heads || n_groups == 0 || group_dim == 0 || rank == 0) return 0;
+    if (!low || !out_a || !heads || n_groups == 0 || group_dim == 0 || rank == 0 || n_tok == 0) return 0;
     static int cached_fuse = -1;
     if (__builtin_expect(cached_fuse < 0, 0)) {
         const char *v = getenv("MYDS_ATTN_OUT_A_FUSE_BF16");
@@ -5267,7 +5268,7 @@ int myds_metal_attn_output_a_bf16(
             struct ds4_metal_args_mul_mv_id args;
             memset(&args, 0, sizeof(args));
             args.nei0 = (int32_t)n_groups;
-            args.nei1 = 1;
+            args.nei1 = (int32_t)n_tok;
             args.nbi1 = (uint64_t)n_groups * sizeof(int32_t);
             args.ne00 = (int32_t)group_dim;
             args.ne01 = (int32_t)rank;
@@ -5278,7 +5279,7 @@ int myds_metal_attn_output_a_bf16(
             args.ne10 = (int32_t)group_dim;
             args.ne11 = (int32_t)n_groups;
             args.ne12 = 1;
-            args.ne13 = 1;
+            args.ne13 = (int32_t)n_tok;
             args.nb10 = sizeof(float);
             args.nb11 = (uint64_t)group_dim * sizeof(float);
             args.nb12 = (uint64_t)n_groups * (uint64_t)group_dim * sizeof(float);
@@ -5289,7 +5290,7 @@ int myds_metal_attn_output_a_bf16(
 
             const NSUInteger rows_per_group = 4;
             const NSUInteger row_groups = (rank + rows_per_group - 1) / rows_per_group;
-            const NSUInteger pairs = (NSUInteger)n_groups;
+            const NSUInteger pairs = (NSUInteger)n_groups * (NSUInteger)n_tok;
             const NSUInteger smem_bytes = 512;
 
             id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
@@ -5319,7 +5320,7 @@ int myds_metal_attn_output_a_bf16(
             struct ds4_metal_args_mul_mv_id args;
             memset(&args, 0, sizeof(args));
             args.nei0 = (int32_t)n_groups;
-            args.nei1 = 1;
+            args.nei1 = (int32_t)n_tok;
             args.nbi1 = (uint64_t)n_groups * sizeof(int32_t);
             args.ne00 = (int32_t)group_dim;
             args.ne01 = (int32_t)rank;
@@ -5330,7 +5331,7 @@ int myds_metal_attn_output_a_bf16(
             args.ne10 = (int32_t)group_dim;
             args.ne11 = (int32_t)n_groups;
             args.ne12 = 1;
-            args.ne13 = 1;
+            args.ne13 = (int32_t)n_tok;
             args.nb10 = sizeof(float);
             args.nb11 = (uint64_t)group_dim * sizeof(float);
             args.nb12 = (uint64_t)n_groups * (uint64_t)group_dim * sizeof(float);
@@ -5341,7 +5342,7 @@ int myds_metal_attn_output_a_bf16(
 
             const NSUInteger rows_per_group = 8; // NSG=4 * nr0=2
             const NSUInteger row_groups = (rank + rows_per_group - 1) / rows_per_group;
-            const NSUInteger pairs = (NSUInteger)n_groups;
+            const NSUInteger pairs = (NSUInteger)n_groups * (NSUInteger)n_tok;
             const NSUInteger smem_bytes = 256;
 
             id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
@@ -5366,8 +5367,19 @@ int myds_metal_attn_output_a_bf16(
         }
     }
 
-    return myds_metal_attn_output_a(low, out_a, heads, n_groups, group_dim, rank, weight_type) &&
-           myds_metal_v41_bf16(low, n_groups * rank);
+    return myds_metal_attn_output_a_batch(low, out_a, heads, n_groups, group_dim, rank, n_tok, weight_type) &&
+           myds_metal_v41_bf16(low, (uint64_t)n_groups * rank * n_tok);
+}
+
+int myds_metal_attn_output_a_bf16(
+    myds_metal_buffer_t       *low,
+    const myds_metal_buffer_t *out_a,
+    const myds_metal_buffer_t *heads,
+    uint32_t                   n_groups,
+    uint32_t                   group_dim,
+    uint32_t                   rank,
+    ggml_type                  weight_type) {
+    return myds_metal_attn_output_a_bf16_batch(low, out_a, heads, n_groups, group_dim, rank, 1, weight_type);
 }
 
 int myds_metal_moe_sum(

@@ -26,6 +26,16 @@ int myds_v41_shared_gate_up_swiglu(myds_metal_buffer_t *out,
                                   uint32_t out_dim, uint32_t in_dim,
                                   ggml_type gate_type, ggml_type up_type,
                                   float clamp);
+/* Shared Expert Gate + Up + SwiGLU 2-Token 共享权重融合算子
+ * 一次流式读取 shared_gate 与 shared_up 权重，同时为 2 个 token 计算 SwiGLU。
+ * 消除 528 MB 显存冗余带宽并节省 40 次 GPU Dispatch。 */
+int myds_v41_shared_gate_up_swiglu_batch2(myds_metal_buffer_t *out,
+                                         const myds_metal_buffer_t *gate,
+                                         const myds_metal_buffer_t *up,
+                                         const myds_metal_buffer_t *input,
+                                         uint32_t out_dim, uint32_t in_dim,
+                                         ggml_type gate_type, ggml_type up_type,
+                                         float clamp);
 /* Input ctx->ffn_norm_out; output ctx->ffn_out. Retains an active GPU batch. */
 int myds_v41_moe(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t pos);
 /* S10 算子融合版：MoE Output + Shared + HC Expand 融合为单次派发 */

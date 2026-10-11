@@ -533,6 +533,245 @@ kernel void kernel_myds_v41_shared_gate_up_swiglu_q4(
         args, src_gate, src_up, src_in, dst_out, shmem, tgpig, tiisg, sgitg);
 }
 
+template<short NR0>
+void kernel_myds_v41_shared_gate_up_swiglu_q4_shared2_impl(
+        constant myds_v41_shared_swiglu_args &args,
+        device const char *src_gate,
+        device const char *src_up,
+        device const float *src_in,
+        device float *dst_out,
+        threadgroup char *shmem,
+        uint3 tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    constexpr short NSG = 4;
+    constexpr int QK_K = 256;
+    const int nb = (int)args.in_dim / QK_K;
+    const int first_row = (tgpig.x * NSG + sgitg) * NR0;
+    if (first_row >= (int)args.out_dim) return;
+
+    constexpr uint16_t kmask1 = 0x3f3f;
+    constexpr uint16_t kmask2 = 0x0f0f;
+    constexpr uint16_t kmask3 = 0xc0c0;
+
+    const short ix = tiisg / 8;
+    const short it = tiisg % 8;
+    const short iq = it / 4;
+    const short ir = it % 4;
+
+    device const float *y0 = src_in;
+    device const float *y0_4 = y0 + ix * QK_K + 64 * iq + 8 * ir;
+    device const float *y1 = src_in + args.in_dim;
+    device const float *y1_4 = y1 + ix * QK_K + 64 * iq + 8 * ir;
+
+    device const block_q4_K *ax_gate[NR0];
+    device const block_q4_K *ax_up[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (uint64_t)(first_row + row) * args.row_bytes;
+        const bool active = (first_row + row < (int)args.out_dim);
+        ax_gate[row] = (device const block_q4_K *)(src_gate + (active ? offset0 : 0));
+        ax_up[row]   = (device const block_q4_K *)(src_up   + (active ? offset0 : 0));
+    }
+
+    float yl0[16], yh0[16];
+    float yl1[16], yh1[16];
+    float sumf_gate0[NR0] = { 0.f };
+    float sumf_up0[NR0]   = { 0.f };
+    float sumf_gate1[NR0] = { 0.f };
+    float sumf_up1[NR0]   = { 0.f };
+
+    uint16_t sc16[4];
+    thread const uint8_t *sc8 = (thread const uint8_t *)sc16;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        float4 sumy0 = {0.f, 0.f, 0.f, 0.f};
+        float4 sumy1 = {0.f, 0.f, 0.f, 0.f};
+
+        FOR_UNROLL (short i = 0; i < 8; ++i) {
+            yl0[i + 0] = y0_4[i +   0]; sumy0[0] += yl0[i + 0];
+            yl0[i + 8] = y0_4[i +  32]; sumy0[1] += yl0[i + 8];
+            yh0[i + 0] = y0_4[i + 128]; sumy0[2] += yh0[i + 0];
+            yh0[i + 8] = y0_4[i + 160]; sumy0[3] += yh0[i + 8];
+
+            yl1[i + 0] = y1_4[i +   0]; sumy1[0] += yl1[i + 0];
+            yl1[i + 8] = y1_4[i +  32]; sumy1[1] += yl1[i + 8];
+            yh1[i + 0] = y1_4[i + 128]; sumy1[2] += yh1[i + 0];
+            yh1[i + 8] = y1_4[i + 160]; sumy1[3] += yh1[i + 8];
+        }
+
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            if (first_row + row >= (int)args.out_dim) break;
+
+            // Gate dot product
+            device const uint16_t *sc_g = (device const uint16_t *)ax_gate[row][ib].scales + iq;
+            device const uint16_t *q1_g = (device const uint16_t *)ax_gate[row][ib].qs + 16 * iq + 4 * ir;
+            device const half *dh_g = &ax_gate[row][ib].d;
+
+            sc16[0] = sc_g[0] & kmask1;
+            sc16[1] = sc_g[2] & kmask1;
+            sc16[2] = ((sc_g[4] >> 0) & kmask2) | ((sc_g[0] & kmask3) >> 2);
+            sc16[3] = ((sc_g[4] >> 4) & kmask2) | ((sc_g[2] & kmask3) >> 2);
+
+            device const uint16_t *q2_g = q1_g + 32;
+
+            float4 acc1g0 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2g0 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc1g1 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2g1 = {0.f, 0.f, 0.f, 0.f};
+
+            FOR_UNROLL (short i = 0; i < 4; ++i) {
+                const uint16_t q1 = q1_g[i];
+                const uint16_t q2 = q2_g[i];
+                const float m0 = (float)(q1 & 0x000F);
+                const float m1 = (float)(q1 & 0x0F00);
+                const float m2 = (float)(q1 & 0x00F0);
+                const float m3 = (float)(q1 & 0xF000);
+                const float m4 = (float)(q2 & 0x000F);
+                const float m5 = (float)(q2 & 0x0F00);
+                const float m6 = (float)(q2 & 0x00F0);
+                const float m7 = (float)(q2 & 0xF000);
+
+                acc1g0[0] += yl0[2 * i + 0] * m0;
+                acc1g0[1] += yl0[2 * i + 1] * m1;
+                acc1g0[2] += yl0[2 * i + 8] * m2;
+                acc1g0[3] += yl0[2 * i + 9] * m3;
+                acc2g0[0] += yh0[2 * i + 0] * m4;
+                acc2g0[1] += yh0[2 * i + 1] * m5;
+                acc2g0[2] += yh0[2 * i + 8] * m6;
+                acc2g0[3] += yh0[2 * i + 9] * m7;
+
+                acc1g1[0] += yl1[2 * i + 0] * m0;
+                acc1g1[1] += yl1[2 * i + 1] * m1;
+                acc1g1[2] += yl1[2 * i + 8] * m2;
+                acc1g1[3] += yl1[2 * i + 9] * m3;
+                acc2g1[0] += yh1[2 * i + 0] * m4;
+                acc2g1[1] += yh1[2 * i + 1] * m5;
+                acc2g1[2] += yh1[2 * i + 8] * m6;
+                acc2g1[3] += yh1[2 * i + 9] * m7;
+            }
+
+            sumf_gate0[row] += dh_g[0] * ((acc1g0[0] + 1.f / 256.f * acc1g0[1]) * sc8[0] +
+                                          (acc1g0[2] + 1.f / 256.f * acc1g0[3]) * sc8[1] * 1.f / 16.f +
+                                          (acc2g0[0] + 1.f / 256.f * acc2g0[1]) * sc8[4] +
+                                          (acc2g0[2] + 1.f / 256.f * acc2g0[3]) * sc8[5] * 1.f / 16.f) -
+                               dh_g[1] * (sumy0[0] * sc8[2] + sumy0[1] * sc8[3] + sumy0[2] * sc8[6] + sumy0[3] * sc8[7]);
+
+            sumf_gate1[row] += dh_g[0] * ((acc1g1[0] + 1.f / 256.f * acc1g1[1]) * sc8[0] +
+                                          (acc1g1[2] + 1.f / 256.f * acc1g1[3]) * sc8[1] * 1.f / 16.f +
+                                          (acc2g1[0] + 1.f / 256.f * acc2g1[1]) * sc8[4] +
+                                          (acc2g1[2] + 1.f / 256.f * acc2g1[3]) * sc8[5] * 1.f / 16.f) -
+                               dh_g[1] * (sumy1[0] * sc8[2] + sumy1[1] * sc8[3] + sumy1[2] * sc8[6] + sumy1[3] * sc8[7]);
+
+            // Up dot product
+            device const uint16_t *sc_u = (device const uint16_t *)ax_up[row][ib].scales + iq;
+            device const uint16_t *q1_u = (device const uint16_t *)ax_up[row][ib].qs + 16 * iq + 4 * ir;
+            device const half *dh_u = &ax_up[row][ib].d;
+
+            sc16[0] = sc_u[0] & kmask1;
+            sc16[1] = sc_u[2] & kmask1;
+            sc16[2] = ((sc_u[4] >> 0) & kmask2) | ((sc_u[0] & kmask3) >> 2);
+            sc16[3] = ((sc_u[4] >> 4) & kmask2) | ((sc_u[2] & kmask3) >> 2);
+
+            device const uint16_t *q2_u = q1_u + 32;
+
+            float4 acc1u0 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2u0 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc1u1 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2u1 = {0.f, 0.f, 0.f, 0.f};
+
+            FOR_UNROLL (short i = 0; i < 4; ++i) {
+                const uint16_t q1 = q1_u[i];
+                const uint16_t q2 = q2_u[i];
+                const float m0 = (float)(q1 & 0x000F);
+                const float m1 = (float)(q1 & 0x0F00);
+                const float m2 = (float)(q1 & 0x00F0);
+                const float m3 = (float)(q1 & 0xF000);
+                const float m4 = (float)(q2 & 0x000F);
+                const float m5 = (float)(q2 & 0x0F00);
+                const float m6 = (float)(q2 & 0x00F0);
+                const float m7 = (float)(q2 & 0xF000);
+
+                acc1u0[0] += yl0[2 * i + 0] * m0;
+                acc1u0[1] += yl0[2 * i + 1] * m1;
+                acc1u0[2] += yl0[2 * i + 8] * m2;
+                acc1u0[3] += yl0[2 * i + 9] * m3;
+                acc2u0[0] += yh0[2 * i + 0] * m4;
+                acc2u0[1] += yh0[2 * i + 1] * m5;
+                acc2u0[2] += yh0[2 * i + 8] * m6;
+                acc2u0[3] += yh0[2 * i + 9] * m7;
+
+                acc1u1[0] += yl1[2 * i + 0] * m0;
+                acc1u1[1] += yl1[2 * i + 1] * m1;
+                acc1u1[2] += yl1[2 * i + 8] * m2;
+                acc1u1[3] += yl1[2 * i + 9] * m3;
+                acc2u1[0] += yh1[2 * i + 0] * m4;
+                acc2u1[1] += yh1[2 * i + 1] * m5;
+                acc2u1[2] += yh1[2 * i + 8] * m6;
+                acc2u1[3] += yh1[2 * i + 9] * m7;
+            }
+
+            sumf_up0[row] += dh_u[0] * ((acc1u0[0] + 1.f / 256.f * acc1u0[1]) * sc8[0] +
+                                        (acc1u0[2] + 1.f / 256.f * acc1u0[3]) * sc8[1] * 1.f / 16.f +
+                                        (acc2u0[0] + 1.f / 256.f * acc2u0[1]) * sc8[4] +
+                                        (acc2u0[2] + 1.f / 256.f * acc2u0[3]) * sc8[5] * 1.f / 16.f) -
+                             dh_u[1] * (sumy0[0] * sc8[2] + sumy0[1] * sc8[3] + sumy0[2] * sc8[6] + sumy0[3] * sc8[7]);
+
+            sumf_up1[row] += dh_u[0] * ((acc1u1[0] + 1.f / 256.f * acc1u1[1]) * sc8[0] +
+                                        (acc1u1[2] + 1.f / 256.f * acc1u1[3]) * sc8[1] * 1.f / 16.f +
+                                        (acc2u1[0] + 1.f / 256.f * acc2u1[1]) * sc8[4] +
+                                        (acc2u1[2] + 1.f / 256.f * acc2u1[3]) * sc8[5] * 1.f / 16.f) -
+                             dh_u[1] * (sumy1[0] * sc8[2] + sumy1[1] * sc8[3] + sumy1[2] * sc8[6] + sumy1[3] * sc8[7]);
+        }
+
+        y0_4 += 4 * QK_K;
+        y1_4 += 4 * QK_K;
+    }
+
+    for (short row = 0; row < NR0 && first_row + row < (int)args.out_dim; ++row) {
+        float tot_g0 = simd_sum(sumf_gate0[row]);
+        float tot_u0 = simd_sum(sumf_up0[row]);
+        float tot_g1 = simd_sum(sumf_gate1[row]);
+        float tot_u1 = simd_sum(sumf_up1[row]);
+
+        if (tiisg == 0) {
+            float g0 = dsv4_mv_bf16_store(tot_g0);
+            float u0 = dsv4_mv_bf16_store(tot_u0);
+            float g1 = dsv4_mv_bf16_store(tot_g1);
+            float u1 = dsv4_mv_bf16_store(tot_u1);
+
+            if (args.clamp > 1.0e-6f) {
+                g0 = min(g0, args.clamp);
+                u0 = clamp(u0, -args.clamp, args.clamp);
+                g1 = min(g1, args.clamp);
+                u1 = clamp(u1, -args.clamp, args.clamp);
+            }
+
+            const float silu0 = g0 / (1.0f + exp(-g0));
+            const float glu0 = silu0 * u0;
+            dst_out[first_row + row] = dsv4_mv_bf16_store(glu0);
+
+            const float silu1 = g1 / (1.0f + exp(-g1));
+            const float glu1 = silu1 * u1;
+            dst_out[args.out_dim + first_row + row] = dsv4_mv_bf16_store(glu1);
+        }
+    }
+    (void)shmem;
+}
+
+kernel void kernel_myds_v41_shared_gate_up_swiglu_q4_shared2(
+    constant myds_v41_shared_swiglu_args &args [[buffer(0)]],
+    device const char *src_gate [[buffer(1)]],
+    device const char *src_up [[buffer(2)]],
+    device const float *src_in [[buffer(3)]],
+    device float *dst_out [[buffer(4)]],
+    threadgroup char *shmem [[threadgroup(0)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    kernel_myds_v41_shared_gate_up_swiglu_q4_shared2_impl<2>(
+        args, src_gate, src_up, src_in, dst_out, shmem, tgpig, tiisg, sgitg);
+}
+
 /* ============================================================================
  * DSpark 专属融合路由内核：128 专家、Top-3 单 Threadgroup 全在位双调排序与归一化
  * 消除 CPU-GPU 往返同步与命令缓冲区打断（Zero-Stall GPU Pipelining）

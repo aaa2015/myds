@@ -243,6 +243,45 @@ int myds_v41_shared_gate_up_swiglu(myds_metal_buffer_t *out,
     return 0;
 }
 
+int myds_v41_shared_gate_up_swiglu_batch2(myds_metal_buffer_t *out,
+                                         const myds_metal_buffer_t *gate,
+                                         const myds_metal_buffer_t *up,
+                                         const myds_metal_buffer_t *input,
+                                         uint32_t out_dim, uint32_t in_dim,
+                                         ggml_type gate_type, ggml_type up_type,
+                                         float clamp) {
+    if (!out || !gate || !up || !input || !out_dim || !in_dim ||
+        out_dim > INT32_MAX || in_dim > INT32_MAX ||
+        !isfinite(clamp) || clamp < 0 ||
+        myds_metal_buffer_offset(out) % 16u != 0) return 0;
+
+    if (gate_type == GGML_TYPE_Q4_K && up_type == GGML_TYPE_Q4_K) {
+        if (in_dim % 256u) return 0;
+        const uint32_t row_bytes = (in_dim / 256u) * 144u;
+        if (myds_metal_buffer_size(gate) / row_bytes < out_dim ||
+            myds_metal_buffer_size(up) / row_bytes < out_dim ||
+            myds_metal_buffer_size(input) / 4u < 2 * (uint64_t)in_dim ||
+            myds_metal_buffer_size(out) / 4u < 2 * (uint64_t)out_dim) return 0;
+
+        struct myds_v41_shared_swiglu_args args = {
+            .in_dim = in_dim,
+            .out_dim = out_dim,
+            .row_bytes = row_bytes,
+            .clamp = clamp
+        };
+
+        const char *kernel_name = "kernel_myds_v41_shared_gate_up_swiglu_q4_shared2";
+        const myds_metal_buffer_t *buffers[] = { gate, up, input, out };
+        const uint32_t groups = (out_dim + 8u - 1u) / 8u; // NSG=4 * NR0=2 = 8 rows per threadgroup
+        const uint32_t threads = 128u; // 32 * NSG (NSG=4)
+        const size_t shmem_bytes = 0;
+
+        return dispatch(kernel_name, &args, sizeof(args), buffers, 4,
+                        groups, threads, shmem_bytes);
+    }
+    return 0;
+}
+
 int myds_v41_moe_eval(myds_context_t *ctx, uint32_t layer, uint32_t pos,
                       const myds_metal_buffer_t *ffn_norm,
                       const myds_metal_buffer_t *router_logits,

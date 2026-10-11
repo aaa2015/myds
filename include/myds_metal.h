@@ -453,6 +453,16 @@ int myds_metal_attn_output_a_bf16(
     uint32_t                   rank,
     ggml_type                  weight_type);
 
+int myds_metal_attn_output_a_bf16_batch(
+    myds_metal_buffer_t       *low,
+    const myds_metal_buffer_t *out_a,
+    const myds_metal_buffer_t *heads,
+    uint32_t                   n_groups,
+    uint32_t                   group_dim,
+    uint32_t                   rank,
+    uint32_t                   n_tok,
+    ggml_type                  weight_type);
+
 int myds_metal_attn_output_a_batch(
     myds_metal_buffer_t       *low,
     const myds_metal_buffer_t *out_a,

@@ -4303,9 +4303,8 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         }
         myds_metal_barrier_buffer(ws->attn_heads_b2);
 
-        /* Attention Output A (8x down-proj) */
-        CHECK(myds_metal_attn_output_a_bf16(ws->v_attn_low[0], base->attn_output_a, ws->v_attn_heads[0], 8, 4096, 1024, base->attn_output_a_type));
-        CHECK(myds_metal_attn_output_a_bf16(ws->v_attn_low[1], base->attn_output_a, ws->v_attn_heads[1], 8, 4096, 1024, base->attn_output_a_type));
+        /* Attention Output A (8x down-proj, batched 2 tokens) */
+        CHECK(myds_metal_attn_output_a_bf16_batch(ws->attn_low_b2, base->attn_output_a, ws->attn_heads_b2, 8, 4096, 1024, 2, base->attn_output_a_type));
         myds_metal_barrier_buffer(ws->attn_low_b2);
 
         CHECK(myds_v41_batch2_projection_probe(ws->v_attn_out, base->attn_output_b, ws->v_attn_low, V41_DIM, 8192, base->attn_output_b_type, MYDS_V41_BATCH2_TAIL));
@@ -4318,22 +4317,28 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_ffn_norm[1], ws->v_x[1], ws->v_after_attn[1], ws->v_attn_split[1], base->ffn_norm, V41_DIM, m->norm_eps, true));
         myds_metal_barrier_buffer(ws->ffn_norm_b2);
 
-        /* MoE 调度: Shared Expert + Router + Routed MoE */
-        for (uint32_t t = 0; t < 2; ++t) {
-            const char *shared_fuse = getenv("MYDS_SHARED_FUSE");
-            int shared_fused = !myds_trace_active() && (!shared_fuse || strcmp(shared_fuse, "0")) &&
-                myds_v41_shared_gate_up_swiglu(
-                ws->v_shared_swiglu[t], base->shared_gate, base->shared_up, ws->v_ffn_norm[t],
-                2304, V41_DIM, base->shared_gate_type, base->shared_up_type, m->swiglu_clamp_exp);
-            if (!shared_fused) {
-                CHECK(myds_v41_decode_gemv_bf16(ws->v_shared_gate[t], base->shared_gate,
-                    ws->v_ffn_norm[t], 2304, V41_DIM, base->shared_gate_type, myds_trace_active()));
-                CHECK(myds_v41_decode_gemv_bf16(ws->v_shared_up[t], base->shared_up,
-                    ws->v_ffn_norm[t], 2304, V41_DIM, base->shared_up_type, myds_trace_active()));
-                const myds_metal_buffer_t *shared_inputs[] = {ws->v_shared_gate[t], ws->v_shared_up[t]};
-                myds_metal_barrier_buffers(shared_inputs, 2);
-                CHECK(myds_v41_shared_swiglu(ws->v_shared_swiglu[t], ws->v_shared_gate[t],
-                    ws->v_shared_up[t], 2304, m->swiglu_clamp_exp));
+        /* MoE 调度: Shared Expert + Router + Routed MoE (Batched 2-Token Gate+Up SwiGLU) */
+        const char *shared_fuse = getenv("MYDS_SHARED_FUSE");
+        int shared_fused = !myds_trace_active() && (!shared_fuse || strcmp(shared_fuse, "0")) &&
+            myds_v41_shared_gate_up_swiglu_batch2(
+            ws->shared_swiglu_b2, base->shared_gate, base->shared_up, ws->ffn_norm_b2,
+            2304, V41_DIM, base->shared_gate_type, base->shared_up_type, m->swiglu_clamp_exp);
+        if (!shared_fused) {
+            for (uint32_t t = 0; t < 2; ++t) {
+                int single_fused = !myds_trace_active() && (!shared_fuse || strcmp(shared_fuse, "0")) &&
+                    myds_v41_shared_gate_up_swiglu(
+                    ws->v_shared_swiglu[t], base->shared_gate, base->shared_up, ws->v_ffn_norm[t],
+                    2304, V41_DIM, base->shared_gate_type, base->shared_up_type, m->swiglu_clamp_exp);
+                if (!single_fused) {
+                    CHECK(myds_v41_decode_gemv_bf16(ws->v_shared_gate[t], base->shared_gate,
+                        ws->v_ffn_norm[t], 2304, V41_DIM, base->shared_gate_type, myds_trace_active()));
+                    CHECK(myds_v41_decode_gemv_bf16(ws->v_shared_up[t], base->shared_up,
+                        ws->v_ffn_norm[t], 2304, V41_DIM, base->shared_up_type, myds_trace_active()));
+                    const myds_metal_buffer_t *shared_inputs[] = {ws->v_shared_gate[t], ws->v_shared_up[t]};
+                    myds_metal_barrier_buffers(shared_inputs, 2);
+                    CHECK(myds_v41_shared_swiglu(ws->v_shared_swiglu[t], ws->v_shared_gate[t],
+                        ws->v_shared_up[t], 2304, m->swiglu_clamp_exp));
+                }
             }
         }
         myds_metal_barrier_buffer(ws->shared_swiglu_b2);
@@ -4381,13 +4386,21 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         }
     }
 
-    /* 4. Output Head & Logits for Token 0 (Lazy Projection: defer Token 1) */
+    /* 4. Output Head & Logits for Token 0 and Token 1 (Batched LM Head) */
     CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_x_norm[0], ws->v_x[0], ws->v_residual[0], ws->v_ffn_split[0], m->output_norm, V41_DIM, m->norm_eps, true));
-    CHECK(project(ws->v_logits[0], m->output, ws->v_x_norm[0], m->vocab_size, V41_DIM, m->output_type, false));
+    CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_x_norm[1], ws->v_x[1], ws->v_residual[1], ws->v_ffn_split[1], m->output_norm, V41_DIM, m->norm_eps, true));
+    myds_metal_barrier_buffer(ws->x_norm_b2);
+
+    int lm_head_batched = myds_metal_gemv_batch(ws->logits_b2, m->output, ws->x_norm_b2, m->vocab_size, V41_DIM, 2, m->output_type);
+    if (!lm_head_batched) {
+        CHECK(project(ws->v_logits[0], m->output, ws->v_x_norm[0], m->vocab_size, V41_DIM, m->output_type, false));
+        CHECK(project(ws->v_logits[1], m->output, ws->v_x_norm[1], m->vocab_size, V41_DIM, m->output_type, false));
+    }
+    myds_metal_barrier_buffer(ws->logits_b2);
 
     CHECK(myds_metal_commit_batch());
 
-    /* 5. 权威裁决与状态回滚（Arbitration & Rollback with Lazy Output Projection） */
+    /* 5. 权威裁决与状态回滚（Arbitration & Rollback with Precomputed Parallel Head） */
     const float *logits0 = (const float *)myds_metal_buffer_data(ws->v_logits[0]);
     if (!check_logits_finite(logits0, m->vocab_size)) {
         goto fail;
@@ -4409,12 +4422,7 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
     snap->first_state_valid = true;
 
     if (auth0 == tokens[1] && (!m->tokenizer || auth0 != m->tokenizer->eos_id)) {
-        /* CASE A: 投机命中！才对 Token 1 惰性计算 LM Head 投影并采样 */
-        CHECK(myds_metal_begin_batch());
-        CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_x_norm[1], ws->v_x[1], ws->v_residual[1], ws->v_ffn_split[1], m->output_norm, V41_DIM, m->norm_eps, true));
-        CHECK(project(ws->v_logits[1], m->output, ws->v_x_norm[1], m->vocab_size, V41_DIM, m->output_type, false));
-        CHECK(myds_metal_commit_batch());
-
+        /* CASE A: 投机命中！Token 1 Logits 已在主批次并行计算完成，直接采样 */
         const float *logits1 = (const float *)myds_metal_buffer_data(ws->v_logits[1]);
         if (!check_logits_finite(logits1, m->vocab_size)) {
             goto fail;
