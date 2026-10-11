@@ -391,22 +391,38 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
     ds->markov_bias_host = calloc(vocab_size, sizeof(float));
     ds->spec_snap = calloc(1, sizeof(myds_v41_spec_snapshot_t));
 
-    // Allocate 3-Stage Transformer Workspace
+    // Allocate 3-Stage Transformer Workspace (Multi-row: Target Row and Draft Row)
     myds_dspark_workspace_t *ws = calloc(1, sizeof(*ws));
     if (ws) {
-        ws->stage_hc = myds_metal_buffer_alloc(4 * MYDS_DSPARK_DIM * sizeof(float));
+        ws->stage_target_hc = myds_metal_buffer_alloc(4 * MYDS_DSPARK_DIM * sizeof(float));
+        ws->stage_draft_hc = myds_metal_buffer_alloc(4 * MYDS_DSPARK_DIM * sizeof(float));
+        ws->stage_hc = ws->stage_draft_hc;
         ws->after_attn_hc = myds_metal_buffer_alloc(4 * MYDS_DSPARK_DIM * sizeof(float));
-        ws->flat_hc_norm = myds_metal_buffer_alloc(4 * MYDS_DSPARK_DIM * sizeof(float));
-        ws->hc_mix = myds_metal_buffer_alloc(24 * sizeof(float));
-        ws->hc_split = myds_metal_buffer_alloc(24 * sizeof(float));
+        ws->target_flat_hc_norm = myds_metal_buffer_alloc(4 * MYDS_DSPARK_DIM * sizeof(float));
+        ws->draft_flat_hc_norm = myds_metal_buffer_alloc(4 * MYDS_DSPARK_DIM * sizeof(float));
+        ws->flat_hc_norm = ws->draft_flat_hc_norm;
+        ws->target_hc_mix = myds_metal_buffer_alloc(24 * sizeof(float));
+        ws->draft_hc_mix = myds_metal_buffer_alloc(24 * sizeof(float));
+        ws->hc_mix = ws->draft_hc_mix;
+        ws->target_hc_split = myds_metal_buffer_alloc(24 * sizeof(float));
+        ws->draft_hc_split = myds_metal_buffer_alloc(24 * sizeof(float));
+        ws->hc_split = ws->draft_hc_split;
 
-        ws->attn_cur = myds_metal_buffer_alloc(MYDS_DSPARK_DIM * sizeof(float));
-        ws->attn_norm = myds_metal_buffer_alloc(MYDS_DSPARK_DIM * sizeof(float));
+        ws->target_attn_cur = myds_metal_buffer_alloc(MYDS_DSPARK_DIM * sizeof(float));
+        ws->draft_attn_cur = myds_metal_buffer_alloc(MYDS_DSPARK_DIM * sizeof(float));
+        ws->attn_cur = ws->draft_attn_cur;
+        ws->target_attn_norm = myds_metal_buffer_alloc(MYDS_DSPARK_DIM * sizeof(float));
+        ws->draft_attn_norm = myds_metal_buffer_alloc(MYDS_DSPARK_DIM * sizeof(float));
+        ws->attn_norm = ws->draft_attn_norm;
+        ws->target_kv = myds_metal_buffer_alloc(512 * sizeof(float));
+        ws->target_kv_norm = myds_metal_buffer_alloc(512 * sizeof(float));
+        ws->draft_kv = myds_metal_buffer_alloc(512 * sizeof(float));
+        ws->draft_kv_norm = myds_metal_buffer_alloc(512 * sizeof(float));
+        ws->kv = ws->draft_kv;
+        ws->kv_norm = ws->draft_kv_norm;
         ws->qr = myds_metal_buffer_alloc(1280 * sizeof(float));
         ws->qr_norm = myds_metal_buffer_alloc(1280 * sizeof(float));
         ws->q = myds_metal_buffer_alloc(64 * 512 * sizeof(float));
-        ws->kv = myds_metal_buffer_alloc(512 * sizeof(float));
-        ws->kv_norm = myds_metal_buffer_alloc(512 * sizeof(float));
 
         for (int s = 0; s < MYDS_DSPARK_MAX_STAGES; s++) {
             ws->stage_kv_cache[s] = myds_metal_buffer_alloc(128 * 512 * sizeof(float));
@@ -452,19 +468,27 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
 
 static void dspark_workspace_free(myds_dspark_workspace_t *ws) {
     if (!ws) return;
-    if (ws->stage_hc) myds_metal_buffer_free(ws->stage_hc);
+    if (ws->stage_target_hc) myds_metal_buffer_free(ws->stage_target_hc);
+    if (ws->stage_draft_hc) myds_metal_buffer_free(ws->stage_draft_hc);
     if (ws->after_attn_hc) myds_metal_buffer_free(ws->after_attn_hc);
-    if (ws->flat_hc_norm) myds_metal_buffer_free(ws->flat_hc_norm);
-    if (ws->hc_mix) myds_metal_buffer_free(ws->hc_mix);
-    if (ws->hc_split) myds_metal_buffer_free(ws->hc_split);
+    if (ws->target_flat_hc_norm) myds_metal_buffer_free(ws->target_flat_hc_norm);
+    if (ws->draft_flat_hc_norm) myds_metal_buffer_free(ws->draft_flat_hc_norm);
+    if (ws->target_hc_mix) myds_metal_buffer_free(ws->target_hc_mix);
+    if (ws->draft_hc_mix) myds_metal_buffer_free(ws->draft_hc_mix);
+    if (ws->target_hc_split) myds_metal_buffer_free(ws->target_hc_split);
+    if (ws->draft_hc_split) myds_metal_buffer_free(ws->draft_hc_split);
 
-    if (ws->attn_cur) myds_metal_buffer_free(ws->attn_cur);
-    if (ws->attn_norm) myds_metal_buffer_free(ws->attn_norm);
+    if (ws->target_attn_cur) myds_metal_buffer_free(ws->target_attn_cur);
+    if (ws->draft_attn_cur) myds_metal_buffer_free(ws->draft_attn_cur);
+    if (ws->target_attn_norm) myds_metal_buffer_free(ws->target_attn_norm);
+    if (ws->draft_attn_norm) myds_metal_buffer_free(ws->draft_attn_norm);
+    if (ws->target_kv) myds_metal_buffer_free(ws->target_kv);
+    if (ws->target_kv_norm) myds_metal_buffer_free(ws->target_kv_norm);
+    if (ws->draft_kv) myds_metal_buffer_free(ws->draft_kv);
+    if (ws->draft_kv_norm) myds_metal_buffer_free(ws->draft_kv_norm);
     if (ws->qr) myds_metal_buffer_free(ws->qr);
     if (ws->qr_norm) myds_metal_buffer_free(ws->qr_norm);
     if (ws->q) myds_metal_buffer_free(ws->q);
-    if (ws->kv) myds_metal_buffer_free(ws->kv);
-    if (ws->kv_norm) myds_metal_buffer_free(ws->kv_norm);
 
     for (int s = 0; s < MYDS_DSPARK_MAX_STAGES; s++) {
         if (ws->stage_kv_cache[s]) myds_metal_buffer_free(ws->stage_kv_cache[s]);
@@ -751,15 +775,15 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
     const uint32_t in_dim = MYDS_DSPARK_TARGET_LAYERS * MYDS_DSPARK_DIM;
     const size_t stream_bytes = (size_t)MYDS_DSPARK_DIM * sizeof(float);
 
-    // 1. Initialize 4 HC streams from seed token embedding (replicated 4 times across 4 HC streams)
-    float *stage_hc_ptr = (float *)myds_metal_buffer_data(ws->stage_hc);
-    bool seeded_hc = false;
-    if (stage_hc_ptr && ds->current_seed_token >= 0 &&
-        dspark_lookup_token_embedding(ctx->model, ds->current_seed_token, stage_hc_ptr)) {
+    // 1. Initialize Row 1 (Draft Row) from seed token embedding (replicated 4x across 4 HC streams)
+    float *draft_hc_ptr = (float *)myds_metal_buffer_data(ws->stage_draft_hc);
+    bool seeded_draft_hc = false;
+    if (draft_hc_ptr && ds->current_seed_token >= 0 &&
+        dspark_lookup_token_embedding(ctx->model, ds->current_seed_token, draft_hc_ptr)) {
         for (size_t c = 1; c < 4; c++) {
-            memcpy(stage_hc_ptr + c * MYDS_DSPARK_DIM, stage_hc_ptr, stream_bytes);
+            memcpy(draft_hc_ptr + c * MYDS_DSPARK_DIM, draft_hc_ptr, stream_bytes);
         }
-        seeded_hc = true;
+        seeded_draft_hc = true;
     }
 
     // Begin batched Metal command buffer for stages cascade
@@ -779,12 +803,21 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
         }
     }
 
-    // Fallback: If seed token embedding lookup was not possible, initialize from main_x
-    if (!seeded_hc) {
+    // 2b. Initialize Row 0 (Target Row) from main_x (stage_x_buf replicated 4x across 4 HC streams)
+    // Row 0 remains CONSTANT across all 3 stages!
+    for (size_t c = 0; c < 4; c++) {
+        (void)myds_metal_buffer_copy(ws->stage_target_hc, c * stream_bytes, ds->stage_x_buf, 0, stream_bytes);
+    }
+
+    // Fallback: If seed token embedding lookup was not possible, initialize Draft Row from main_x
+    if (!seeded_draft_hc) {
         for (size_t c = 0; c < 4; c++) {
-            (void)myds_metal_buffer_copy(ws->stage_hc, c * stream_bytes, ds->stage_x_buf, 0, stream_bytes);
+            (void)myds_metal_buffer_copy(ws->stage_draft_hc, c * stream_bytes, ds->stage_x_buf, 0, stream_bytes);
         }
     }
+
+    // Precompute Target Row flat HC norm (constant across stages since stage_target_hc is unchanged)
+    (void)myds_metal_v41_rmsnorm(ws->target_flat_hc_norm, ws->stage_target_hc, NULL, 4 * MYDS_DSPARK_DIM, 1e-6f, false);
 
     myds_v41_gpu_scratch_t *gpu_s = ws->gpu_scratch;
 
@@ -792,60 +825,81 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
     for (uint32_t s = 0; s < ds->stage_count; s++) {
         myds_dspark_stage_t *st = &ds->stages[s];
 
-        // --- Attention Block ---
-        // HC RMSNorm over flat 4 streams (20480)
-        (void)myds_metal_v41_rmsnorm(ws->flat_hc_norm, ws->stage_hc, NULL, 4 * MYDS_DSPARK_DIM, 1e-6f, false);
-
-        // Project to 24 mix values
+        // --- Step A: Target Row (Row 0) Projection for Stage s ---
+        // Mix & split for Target Row
         if (st->hc_attn_fn) {
-            (void)myds_metal_gemv(ws->hc_mix, st->hc_attn_fn, ws->flat_hc_norm, 24, 4 * MYDS_DSPARK_DIM, st->hc_attn_fn_type);
-            (void)myds_metal_v41_hc_split_batch(ws->hc_split, ws->hc_mix, st->hc_attn_scale, st->hc_attn_base, 1, 1e-5f);
-            (void)myds_metal_v41_hc_weighted_sum(ws->attn_cur, ws->stage_hc, ws->hc_split, MYDS_DSPARK_DIM);
+            (void)myds_metal_gemv(ws->target_hc_mix, st->hc_attn_fn, ws->target_flat_hc_norm, 24, 4 * MYDS_DSPARK_DIM, st->hc_attn_fn_type);
+            (void)myds_metal_v41_hc_split_batch(ws->target_hc_split, ws->target_hc_mix, st->hc_attn_scale, st->hc_attn_base, 1, 1e-5f);
+            (void)myds_metal_v41_hc_weighted_sum(ws->target_attn_cur, ws->stage_target_hc, ws->target_hc_split, MYDS_DSPARK_DIM);
         } else {
-            (void)myds_metal_buffer_copy(ws->attn_cur, 0, ws->stage_hc, 0, stream_bytes);
+            (void)myds_metal_buffer_copy(ws->target_attn_cur, 0, ws->stage_target_hc, 0, stream_bytes);
         }
 
-        // Attention pre-norm
+        // Target pre-norm
         if (st->attn_norm) {
-            (void)myds_metal_v41_rmsnorm(ws->attn_norm, ws->attn_cur, st->attn_norm, MYDS_DSPARK_DIM, 1e-6f, true);
+            (void)myds_metal_v41_rmsnorm(ws->target_attn_norm, ws->target_attn_cur, st->attn_norm, MYDS_DSPARK_DIM, 1e-6f, true);
         } else {
-            (void)myds_metal_buffer_copy(ws->attn_norm, 0, ws->attn_cur, 0, stream_bytes);
+            (void)myds_metal_buffer_copy(ws->target_attn_norm, 0, ws->target_attn_cur, 0, stream_bytes);
         }
 
-        // 3a. Target KV projection from main_x (ds->stage_x_buf) -> slot 0 of ws->stage_kv_cache[s]
+        // Target KV projection -> Slot 0 of stage_kv_cache[s]
         if (st->attn_kv) {
-            (void)myds_metal_gemv(ws->kv, st->attn_kv, ds->stage_x_buf, 512, MYDS_DSPARK_DIM, st->attn_kv_type);
+            (void)myds_metal_gemv(ws->target_kv, st->attn_kv, ws->target_attn_norm, 512, MYDS_DSPARK_DIM, st->attn_kv_type);
             if (st->attn_kv_a_norm) {
-                (void)myds_metal_v41_rmsnorm(ws->kv_norm, ws->kv, st->attn_kv_a_norm, 512, 1e-6f, true);
+                (void)myds_metal_v41_rmsnorm(ws->target_kv_norm, ws->target_kv, st->attn_kv_a_norm, 512, 1e-6f, true);
             }
-            uint32_t feat_pos = ctx->pos > 0 ? ctx->pos - 1 : 0;
-            (void)myds_v41_gpu_rope(ws->kv_norm ? ws->kv_norm : ws->kv, 512, 1, feat_pos, false, false);
+            (void)myds_v41_gpu_rope(ws->target_kv_norm ? ws->target_kv_norm : ws->target_kv, 512, 1, ctx->pos, false, false);
             (void)myds_metal_buffer_copy(ws->stage_kv_cache[s], 0,
-                                         ws->kv_norm ? ws->kv_norm : ws->kv, 0, 512 * sizeof(float));
+                                         ws->target_kv_norm ? ws->target_kv_norm : ws->target_kv, 0, 512 * sizeof(float));
         }
 
-        // 3b. Draft Q projection from ws->attn_norm: [5120] -> [1280] -> [32768]
+        // --- Step B: Draft Row (Row 1) Processing for Stage s ---
+        // HC RMSNorm over flat 4 streams (20480) of Draft Row
+        (void)myds_metal_v41_rmsnorm(ws->draft_flat_hc_norm, ws->stage_draft_hc, NULL, 4 * MYDS_DSPARK_DIM, 1e-6f, false);
+
+        // Mix & split for Draft Row
+        if (st->hc_attn_fn) {
+            (void)myds_metal_gemv(ws->draft_hc_mix, st->hc_attn_fn, ws->draft_flat_hc_norm, 24, 4 * MYDS_DSPARK_DIM, st->hc_attn_fn_type);
+            (void)myds_metal_v41_hc_split_batch(ws->draft_hc_split, ws->draft_hc_mix, st->hc_attn_scale, st->hc_attn_base, 1, 1e-5f);
+            (void)myds_metal_v41_hc_weighted_sum(ws->draft_attn_cur, ws->stage_draft_hc, ws->draft_hc_split, MYDS_DSPARK_DIM);
+        } else {
+            (void)myds_metal_buffer_copy(ws->draft_attn_cur, 0, ws->stage_draft_hc, 0, stream_bytes);
+        }
+
+        // Draft pre-norm
+        if (st->attn_norm) {
+            (void)myds_metal_v41_rmsnorm(ws->draft_attn_norm, ws->draft_attn_cur, st->attn_norm, MYDS_DSPARK_DIM, 1e-6f, true);
+        } else {
+            (void)myds_metal_buffer_copy(ws->draft_attn_norm, 0, ws->draft_attn_cur, 0, stream_bytes);
+        }
+
+        // Draft Q projection from draft_attn_norm: [5120] -> [1280] -> [32768]
         if (st->attn_q_a && st->attn_q_b) {
-            (void)myds_metal_gemv(ws->qr, st->attn_q_a, ws->attn_norm, 1280, MYDS_DSPARK_DIM, st->attn_q_a_type);
+            (void)myds_metal_gemv(ws->qr, st->attn_q_a, ws->draft_attn_norm, 1280, MYDS_DSPARK_DIM, st->attn_q_a_type);
             if (st->attn_q_a_norm) {
                 (void)myds_metal_v41_rmsnorm(ws->qr_norm, ws->qr, st->attn_q_a_norm, 1280, 1e-6f, true);
             }
             (void)myds_metal_gemv(ws->q, st->attn_q_b, ws->qr_norm ? ws->qr_norm : ws->qr, 64 * 512, 1280, st->attn_q_b_type);
+
+            // Per-head RMSNorm on Q (64 heads x 512 head_dim) - critical fix for attention magnitude
+            (void)myds_metal_v41_rmsnorm_batch(ws->q, ws->q, NULL, 512, 64, 1e-6f, false);
+
+            // RoPE on Q
             (void)myds_v41_gpu_rope(ws->q, 512, 64, ctx->pos, false, false);
         }
 
-        // 3c. Draft KV projection from ws->attn_norm: [5120] -> [512] -> slot 1 of ws->stage_kv_cache[s]
+        // Draft KV projection from draft_attn_norm: [5120] -> [512] -> Slot 1 of stage_kv_cache[s]
         if (st->attn_kv) {
-            (void)myds_metal_gemv(ws->kv, st->attn_kv, ws->attn_norm, 512, MYDS_DSPARK_DIM, st->attn_kv_type);
+            (void)myds_metal_gemv(ws->draft_kv, st->attn_kv, ws->draft_attn_norm, 512, MYDS_DSPARK_DIM, st->attn_kv_type);
             if (st->attn_kv_a_norm) {
-                (void)myds_metal_v41_rmsnorm(ws->kv_norm, ws->kv, st->attn_kv_a_norm, 512, 1e-6f, true);
+                (void)myds_metal_v41_rmsnorm(ws->draft_kv_norm, ws->draft_kv, st->attn_kv_a_norm, 512, 1e-6f, true);
             }
-            (void)myds_v41_gpu_rope(ws->kv_norm ? ws->kv_norm : ws->kv, 512, 1, ctx->pos, false, false);
+            (void)myds_v41_gpu_rope(ws->draft_kv_norm ? ws->draft_kv_norm : ws->draft_kv, 512, 1, ctx->pos, false, false);
             (void)myds_metal_buffer_copy(ws->stage_kv_cache[s], 512 * sizeof(float),
-                                         ws->kv_norm ? ws->kv_norm : ws->kv, 0, 512 * sizeof(float));
+                                         ws->draft_kv_norm ? ws->draft_kv_norm : ws->draft_kv, 0, 512 * sizeof(float));
         }
 
-        // 3d. Direct Attention with sinks attending to BOTH keys: slot 0 (target) and slot 1 (draft), n_raw = 2
+        // --- Step C: Direct Attention attending to BOTH keys: Slot 0 (target) and Slot 1 (draft), n_raw = 2 ---
         if (gpu_s) {
             (void)myds_v41_gpu_attention_direct(ws->attn_heads, st->attn_sinks, ws->q,
                                                 ws->stage_kv_cache[s], 2, 0,
@@ -863,24 +917,24 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
                                   MYDS_DSPARK_DIM, 8192, st->attn_output_b_type);
         }
 
-        // HC Expand after Attention
+        // HC Expand after Attention on Draft Row (round_bf16 = 0 for full F32 precision matching DSpark)
         if (st->hc_attn_fn) {
-            (void)myds_metal_v41_hc_expand(ws->after_attn_hc, ws->attn_out, ws->stage_hc, ws->hc_split, MYDS_DSPARK_DIM);
+            (void)myds_metal_v41_hc_expand_round(ws->after_attn_hc, ws->attn_out, ws->stage_draft_hc, ws->draft_hc_split, MYDS_DSPARK_DIM, 0);
         } else {
             for (size_t c = 0; c < 4; c++) {
                 (void)myds_metal_buffer_copy(ws->after_attn_hc, c * stream_bytes, ws->attn_out, 0, stream_bytes);
             }
         }
 
-        // --- FFN / MoE Block ---
-        // HC RMSNorm over flat 4 streams (20480)
-        (void)myds_metal_v41_rmsnorm(ws->flat_hc_norm, ws->after_attn_hc, NULL, 4 * MYDS_DSPARK_DIM, 1e-6f, false);
+        // --- Step D: FFN / MoE Block on Draft Row ---
+        // HC RMSNorm over flat 4 streams (20480) of after_attn_hc
+        (void)myds_metal_v41_rmsnorm(ws->draft_flat_hc_norm, ws->after_attn_hc, NULL, 4 * MYDS_DSPARK_DIM, 1e-6f, false);
 
         // Project to 24 mix values
         if (st->hc_ffn_fn) {
-            (void)myds_metal_gemv(ws->hc_mix, st->hc_ffn_fn, ws->flat_hc_norm, 24, 4 * MYDS_DSPARK_DIM, st->hc_ffn_fn_type);
-            (void)myds_metal_v41_hc_split_batch(ws->hc_split, ws->hc_mix, st->hc_ffn_scale, st->hc_ffn_base, 1, 1e-5f);
-            (void)myds_metal_v41_hc_weighted_sum(ws->ffn_cur, ws->after_attn_hc, ws->hc_split, MYDS_DSPARK_DIM);
+            (void)myds_metal_gemv(ws->draft_hc_mix, st->hc_ffn_fn, ws->draft_flat_hc_norm, 24, 4 * MYDS_DSPARK_DIM, st->hc_ffn_fn_type);
+            (void)myds_metal_v41_hc_split_batch(ws->draft_hc_split, ws->draft_hc_mix, st->hc_ffn_scale, st->hc_ffn_base, 1, 1e-5f);
+            (void)myds_metal_v41_hc_weighted_sum(ws->ffn_cur, ws->after_attn_hc, ws->draft_hc_split, MYDS_DSPARK_DIM);
         } else {
             (void)myds_metal_buffer_copy(ws->ffn_cur, 0, ws->after_attn_hc, 0, stream_bytes);
         }
@@ -936,25 +990,25 @@ int myds_dspark_eval_stages(myds_dspark_t *ds, myds_context_t *ctx, float min_co
             (void)myds_metal_buffer_copy(ws->ffn_total, 0, ws->shared_out, 0, stream_bytes);
         }
 
-        // HC Expand after FFN -> stage_hc for next stage
+        // HC Expand after FFN -> stage_draft_hc for next stage (round_bf16 = 0 for full F32 precision)
         if (st->hc_ffn_fn) {
-            (void)myds_metal_v41_hc_expand(ws->stage_hc, ws->ffn_total, ws->after_attn_hc, ws->hc_split, MYDS_DSPARK_DIM);
+            (void)myds_metal_v41_hc_expand_round(ws->stage_draft_hc, ws->ffn_total, ws->after_attn_hc, ws->draft_hc_split, MYDS_DSPARK_DIM, 0);
         } else {
             for (size_t c = 0; c < 4; c++) {
-                (void)myds_metal_buffer_copy(ws->stage_hc, c * stream_bytes, ws->ffn_total, 0, stream_bytes);
+                (void)myds_metal_buffer_copy(ws->stage_draft_hc, c * stream_bytes, ws->ffn_total, 0, stream_bytes);
             }
         }
     }
 
-    // 4. Final Head (mtp.2.norm + Base Model LM Head)
+    // 4. Final Head on stage_draft_hc (mtp.2.norm + Base Model LM Head)
     myds_dspark_stage_t *final_st = &ds->stages[ds->stage_count - 1u];
     if (final_st->hc_ffn_fn) {
-        (void)myds_metal_v41_rmsnorm(ws->flat_hc_norm, ws->stage_hc, NULL, 4 * MYDS_DSPARK_DIM, 1e-6f, false);
-        (void)myds_metal_gemv(ws->hc_mix, final_st->hc_ffn_fn, ws->flat_hc_norm, 24, 4 * MYDS_DSPARK_DIM, final_st->hc_ffn_fn_type);
-        (void)myds_metal_v41_hc_split_batch(ws->hc_split, ws->hc_mix, final_st->hc_ffn_scale, final_st->hc_ffn_base, 1, 1e-5f);
-        (void)myds_metal_v41_hc_weighted_sum(ws->final_embd, ws->stage_hc, ws->hc_split, MYDS_DSPARK_DIM);
+        (void)myds_metal_v41_rmsnorm(ws->draft_flat_hc_norm, ws->stage_draft_hc, NULL, 4 * MYDS_DSPARK_DIM, 1e-6f, false);
+        (void)myds_metal_gemv(ws->draft_hc_mix, final_st->hc_ffn_fn, ws->draft_flat_hc_norm, 24, 4 * MYDS_DSPARK_DIM, final_st->hc_ffn_fn_type);
+        (void)myds_metal_v41_hc_split_batch(ws->draft_hc_split, ws->draft_hc_mix, final_st->hc_ffn_scale, final_st->hc_ffn_base, 1, 1e-5f);
+        (void)myds_metal_v41_hc_weighted_sum(ws->final_embd, ws->stage_draft_hc, ws->draft_hc_split, MYDS_DSPARK_DIM);
     } else {
-        (void)myds_metal_buffer_copy(ws->final_embd, 0, ws->stage_hc, 0, stream_bytes);
+        (void)myds_metal_buffer_copy(ws->final_embd, 0, ws->stage_draft_hc, 0, stream_bytes);
     }
 
     if (ds->final_norm) {
@@ -1284,7 +1338,14 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
                 MYDS_LOG_I("DSpark high-confidence speculative margin active: threshold=%.2f", high_conf_margin);
             }
 
-            if (confidence >= 0.85f && margin >= high_conf_margin) {
+            static float high_conf_thresh = -1.0f;
+            if (__builtin_expect(high_conf_thresh < -0.5f, 0)) {
+                const char *env = getenv("MYDS_DSPARK_HIGH_CONF_THRESH");
+                high_conf_thresh = env ? (float)atof(env) : 0.70f;
+                MYDS_LOG_I("DSpark high-confidence speculative threshold active: threshold=%.2f", high_conf_thresh);
+            }
+
+            if (confidence >= high_conf_thresh || margin >= high_conf_margin) {
                 ds->is_high_confidence = true;
             }
         }

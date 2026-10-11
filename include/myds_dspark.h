@@ -60,25 +60,41 @@ typedef struct {
 struct myds_v41_gpu_scratch;
 
 typedef struct {
-    // Stage input / residual streams
-    myds_metal_buffer_t *stage_hc;         // 4 * 5120 * sizeof(float)
-    myds_metal_buffer_t *after_attn_hc;    // 4 * 5120 * sizeof(float)
-    myds_metal_buffer_t *flat_hc_norm;     // 4 * 5120 * sizeof(float)
-    myds_metal_buffer_t *hc_mix;           // 24 * sizeof(float)
-    myds_metal_buffer_t *hc_split;         // 24 * sizeof(float)
+    // Multi-row Stage residual streams (Row 0: Target, Row 1: Draft)
+    myds_metal_buffer_t *stage_target_hc;     // 4 * 5120 * sizeof(float) (constant across stages)
+    myds_metal_buffer_t *stage_draft_hc;      // 4 * 5120 * sizeof(float) (updated across stages)
+    myds_metal_buffer_t *stage_hc;            // alias to stage_draft_hc
+    myds_metal_buffer_t *after_attn_hc;       // 4 * 5120 * sizeof(float) (draft row after attn)
+    myds_metal_buffer_t *target_flat_hc_norm; // 4 * 5120 * sizeof(float)
+    myds_metal_buffer_t *draft_flat_hc_norm;  // 4 * 5120 * sizeof(float)
+    myds_metal_buffer_t *flat_hc_norm;        // alias to draft_flat_hc_norm
+    myds_metal_buffer_t *target_hc_mix;       // 24 * sizeof(float)
+    myds_metal_buffer_t *draft_hc_mix;        // 24 * sizeof(float)
+    myds_metal_buffer_t *hc_mix;              // alias to draft_hc_mix
+    myds_metal_buffer_t *target_hc_split;     // 24 * sizeof(float)
+    myds_metal_buffer_t *draft_hc_split;      // 24 * sizeof(float)
+    myds_metal_buffer_t *hc_split;            // alias to draft_hc_split
 
     // Attention intermediate buffers
-    myds_metal_buffer_t *attn_cur;         // 5120 * sizeof(float)
-    myds_metal_buffer_t *attn_norm;        // 5120 * sizeof(float)
-    myds_metal_buffer_t *qr;               // 1280 * sizeof(float)
-    myds_metal_buffer_t *qr_norm;          // 1280 * sizeof(float)
-    myds_metal_buffer_t *q;                // 32768 * sizeof(float) (64 heads * 512)
-    myds_metal_buffer_t *kv;               // 512 * sizeof(float)
-    myds_metal_buffer_t *kv_norm;          // 512 * sizeof(float)
+    myds_metal_buffer_t *target_attn_cur;     // 5120 * sizeof(float)
+    myds_metal_buffer_t *draft_attn_cur;      // 5120 * sizeof(float)
+    myds_metal_buffer_t *attn_cur;            // alias to draft_attn_cur
+    myds_metal_buffer_t *target_attn_norm;    // 5120 * sizeof(float)
+    myds_metal_buffer_t *draft_attn_norm;     // 5120 * sizeof(float)
+    myds_metal_buffer_t *attn_norm;           // alias to draft_attn_norm
+    myds_metal_buffer_t *target_kv;           // 512 * sizeof(float)
+    myds_metal_buffer_t *target_kv_norm;      // 512 * sizeof(float)
+    myds_metal_buffer_t *draft_kv;            // 512 * sizeof(float)
+    myds_metal_buffer_t *draft_kv_norm;       // 512 * sizeof(float)
+    myds_metal_buffer_t *kv;                  // alias to draft_kv
+    myds_metal_buffer_t *kv_norm;             // alias to draft_kv_norm
+    myds_metal_buffer_t *qr;                  // 1280 * sizeof(float)
+    myds_metal_buffer_t *qr_norm;             // 1280 * sizeof(float)
+    myds_metal_buffer_t *q;                   // 32768 * sizeof(float) (64 heads * 512)
     myds_metal_buffer_t *stage_kv_cache[MYDS_DSPARK_MAX_STAGES]; // 128 * 512 * sizeof(float)
-    myds_metal_buffer_t *attn_heads;       // 32768 * sizeof(float)
-    myds_metal_buffer_t *attn_low;         // 8192 * sizeof(float)
-    myds_metal_buffer_t *attn_out;         // 5120 * sizeof(float)
+    myds_metal_buffer_t *attn_heads;          // 32768 * sizeof(float)
+    myds_metal_buffer_t *attn_low;            // 8192 * sizeof(float)
+    myds_metal_buffer_t *attn_out;            // 5120 * sizeof(float)
 
     // FFN / MoE intermediate buffers
     myds_metal_buffer_t *ffn_cur;          // 5120 * sizeof(float)

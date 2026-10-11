@@ -2714,9 +2714,9 @@ struct v41_hc_expand_args {
     int32_t has_add, round_bf16;
 };
 
-int myds_metal_v41_hc_expand(myds_metal_buffer_t *out,
+int myds_metal_v41_hc_expand_round(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *block, const myds_metal_buffer_t *residual,
-    const myds_metal_buffer_t *split, uint32_t dim) {
+    const myds_metal_buffer_t *split, uint32_t dim, int round_bf16) {
     if (!g_initialized || !g_pso_v41_hc_expand || !v41_floats(out, 4ull*dim) ||
         !v41_floats(block, dim) || !v41_floats(residual, 4ull*dim) || !v41_floats(split, 24)) return 0;
     @autoreleasepool {
@@ -2725,7 +2725,7 @@ int myds_metal_v41_hc_expand(myds_metal_buffer_t *out,
             .nb_block0=4, .nb_block1=4ull*dim, .nb_add0=4, .nb_add1=4ull*dim,
             .nb_res0=4, .nb_res1=4ull*dim, .nb_res2=16ull*dim,
             .nb_post0=4, .nb_post1=96, .nb_comb0=4, .nb_comb1=16, .nb_comb2=96,
-            .nb0=4, .nb1=4ull*dim, .nb2=16ull*dim, .has_add=0, .round_bf16=1,
+            .nb0=4, .nb1=4ull*dim, .nb2=16ull*dim, .has_add=0, .round_bf16=round_bf16,
         };
         id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
         if (!cb) return 0;
@@ -2744,6 +2744,12 @@ int myds_metal_v41_hc_expand(myds_metal_buffer_t *out,
         metal_dispatch(enc, "v41_hc_expand", MTLSizeMake((dim+nth-1)/nth, 1, 1), MTLSizeMake(nth, 1, 1));
         return v41_finish(cb, enc);
     }
+}
+
+int myds_metal_v41_hc_expand(myds_metal_buffer_t *out,
+    const myds_metal_buffer_t *block, const myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *split, uint32_t dim) {
+    return myds_metal_v41_hc_expand_round(out, block, residual, split, dim, 1);
 }
 
 int myds_metal_v41_moe_add_hc_expand(myds_metal_buffer_t *out,
