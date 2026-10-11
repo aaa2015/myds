@@ -36,6 +36,16 @@ int myds_v41_shared_gate_up_swiglu_pair(myds_metal_buffer_t *const out[2],
                                       uint32_t out_dim, uint32_t in_dim,
                                       ggml_type gate_type, ggml_type up_type,
                                       float clamp);
+/* Three rows with one quantized weight load and independent scalar-order
+ * accumulators/BF16 boundaries. Unsupported inputs fail without fallback. */
+int myds_v41_shared_gate_up_swiglu_shared3(myds_metal_buffer_t *const out[3],
+    const myds_metal_buffer_t *gate, const myds_metal_buffer_t *up,
+    myds_metal_buffer_t *const input[3], uint32_t out_dim, uint32_t in_dim,
+    ggml_type gate_type, ggml_type up_type, float clamp);
+typedef struct { uint64_t requests, encoded, failures; }
+    myds_v41_shared_gu_shared3_counters_t;
+void myds_v41_shared_gu_shared3_counters(
+    myds_v41_shared_gu_shared3_counters_t *out, bool reset);
 /* Diagnostic candidate only. This shared-weight kernel has not passed the
  * current checkpoint's full-model parity gate and is not selected by Batch2. */
 int myds_v41_shared_gate_up_swiglu_batch2(myds_metal_buffer_t *out,

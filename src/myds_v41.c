@@ -2772,10 +2772,10 @@ static int qkv_fusion_enabled(const char *name,int *cached) {
     if(*cached<0) {const char *v=getenv(name);*cached=!(v&&strcmp(v,"0")==0);}
     return *cached;
 }
+static int decode_qkv_bf16_fuse = -1;
 static int project_decode_qkv(myds_metal_buffer_t *out,const myds_metal_buffer_t *w,
     const myds_metal_buffer_t *in,uint32_t rows,uint32_t width,ggml_type type,bool trace_on) {
-    static int enabled=-1;
-    if(trace_on||!qkv_fusion_enabled("MYDS_QKV_FUSE_BF16",&enabled))
+    if(trace_on||!qkv_fusion_enabled("MYDS_QKV_FUSE_BF16",&decode_qkv_bf16_fuse))
         return project(out,w,in,rows,width,type,true);
     return myds_metal_v41_gemv_bf16(out,w,in,rows,width,type);
 }
@@ -4776,6 +4776,24 @@ static int v41_tree_carry(myds_v41_context_t *g, v41_batch2_workspace_t *ws,
     return 1;
 }
 
+int myds_v41_depth2_shared3_mode(void) {
+    const char *value = getenv("MYDS_DEPTH2_SHARED3");
+    if (!value || !strcmp(value, "0")) return 0;
+    return !strcmp(value, "1") ? 1 : -1;
+}
+
+static bool v41_depth2_shared3_config_valid(int mode) {
+    if (mode < 0) return false;
+    if (!mode) return true;
+    const char *qkv = getenv("MYDS_QKV_FUSE_BF16");
+    const char *decode = getenv("MYDS_DECODE_Q8_FUSE_BF16");
+    const char *gu = getenv("MYDS_SHARED_FUSE");
+    return !myds_trace_active() && (!qkv || strcmp(qkv, "0")) &&
+        (!decode || strcmp(decode, "0")) && (!gu || strcmp(gu, "0")) &&
+        qkv_fusion_enabled("MYDS_QKV_FUSE_BF16", &decode_qkv_bf16_fuse) &&
+        myds_v41_decode_q8_fuse_bf16_enabled();
+}
+
 /* Reuse the accepted two-row selection, then the same scalar PSO for B.
  * Generic gemv_batch does not preserve decode's BF16/reduction boundaries. */
 static int v41_tree_projection(myds_metal_buffer_t *out[3], const myds_metal_buffer_t *weight,
@@ -4792,6 +4810,17 @@ static int v41_tree_projection(myds_metal_buffer_t *out[3], const myds_metal_buf
     }
 }
 
+static int v41_three_row_projection(myds_metal_buffer_t *out[3],
+    const myds_metal_buffer_t *weight, myds_metal_buffer_t *input[3],
+    uint32_t rows, uint32_t width, ggml_type type,
+    myds_v41_batch2_projection_kind_t kind, bool shared3) {
+    if (shared3 && (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q8_0) &&
+        (kind == MYDS_V41_BATCH2_QKV || kind == MYDS_V41_BATCH2_TAIL ||
+         kind == MYDS_V41_BATCH2_SHARED))
+        return myds_metal_v41_gemv_bf16_shared3_type(out, weight, input, rows, width, type);
+    return v41_tree_projection(out, weight, input, rows, width, type, kind);
+}
+
 /* Common authoritative providers for two explicit topologies. Linear rows
  * occupy p,p+1,p+2; tree children both occupy p+1. Callers choose topology
  * explicitly, never from n_tokens or a global selector inside the graph. */
@@ -4805,6 +4834,12 @@ static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *t
         caller_snapshot->linear_retry_valid = false;
     }
     if (!ctx || !ctx->v41 || !ctx->model || !ctx->model->v41 || !tokens || !out_tokens) return -1;
+    const int shared3_mode = linear ? myds_v41_depth2_shared3_mode() : 0;
+    const bool shared3 = shared3_mode == 1;
+    /* Reject unsupported diagnostic arithmetic before invalidating capture or
+     * modifying persistent state. The new kernels preserve the fused scalar
+     * contracts, which these selectors explicitly disable. */
+    if (!v41_depth2_shared3_config_valid(shared3_mode)) return -1;
     if (myds_dspark_engine_capture_bypass_enabled(ctx->dspark)) {
         MYDS_LOG_E("MYDS_ENGINE_CAPTURE_BYPASS excludes native three-row verification");
         return -1;
@@ -4969,8 +5004,8 @@ static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *t
         myds_metal_barrier_buffer(ws->attn_split_b2);
 
         /* Three-row QKV with the accepted decode projection providers. */
-        CHECK(v41_tree_projection(ws->v_qr, base->attn_q_a, ws->v_x_norm, 1280, V41_DIM, base->attn_q_a_type, MYDS_V41_BATCH2_QKV));
-        CHECK(v41_tree_projection(ws->v_kv_act, base->attn_kv, ws->v_x_norm, 512, V41_DIM, base->attn_kv_type, MYDS_V41_BATCH2_QKV));
+        CHECK(v41_three_row_projection(ws->v_qr, base->attn_q_a, ws->v_x_norm, 1280, V41_DIM, base->attn_q_a_type, MYDS_V41_BATCH2_QKV, shared3));
+        CHECK(v41_three_row_projection(ws->v_kv_act, base->attn_kv, ws->v_x_norm, 512, V41_DIM, base->attn_kv_type, MYDS_V41_BATCH2_QKV, shared3));
         myds_metal_barrier_buffer(ws->qr_b2);
         myds_metal_barrier_buffer(ws->kv_act_b2);
 
@@ -4982,7 +5017,7 @@ static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *t
         myds_metal_barrier_buffer(ws->qr_norm_b2);
 
         /* Three-row Q_B (32768 x 1280), preserving per-row BF16. */
-        CHECK(v41_tree_projection(ws->v_q, base->attn_q_b, ws->v_qr_norm, V41_HEADS * 512, 1280, base->attn_q_b_type, MYDS_V41_BATCH2_QKV));
+        CHECK(v41_three_row_projection(ws->v_q, base->attn_q_b, ws->v_qr_norm, V41_HEADS * 512, 1280, base->attn_q_b_type, MYDS_V41_BATCH2_QKV, shared3));
         myds_metal_barrier_buffer(ws->q_b2);
 
         if (linear) {
@@ -5076,7 +5111,7 @@ static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *t
         myds_metal_barrier_buffer(ws->attn_low_b2);
 
         /* Attention Output B GEMV Batch-3 (5120 x 8192) */
-        CHECK(v41_tree_projection(ws->v_attn_out, base->attn_output_b, ws->v_attn_low, V41_DIM, 8192, base->attn_output_b_type, MYDS_V41_BATCH2_TAIL));
+        CHECK(v41_three_row_projection(ws->v_attn_out, base->attn_output_b, ws->v_attn_low, V41_DIM, 8192, base->attn_output_b_type, MYDS_V41_BATCH2_TAIL, shared3));
         myds_metal_barrier_buffer(ws->attn_out_b2);
 
         /* HC Expand + FFN Norm */
@@ -5092,7 +5127,12 @@ static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *t
         const bool shared_fused = !myds_trace_active() && (!shared_fuse || strcmp(shared_fuse, "0")) &&
             base->shared_gate_type == base->shared_up_type &&
             (base->shared_gate_type == GGML_TYPE_Q4_K || base->shared_gate_type == GGML_TYPE_Q8_0);
-        for (uint32_t row = 0; row < 3; ++row) {
+        if (shared3) {
+            CHECK(shared_fused);
+            CHECK(myds_v41_shared_gate_up_swiglu_shared3(ws->v_shared_swiglu,
+                base->shared_gate, base->shared_up, ws->v_ffn_norm, 2304, V41_DIM,
+                base->shared_gate_type, base->shared_up_type, m->swiglu_clamp_exp));
+        } else for (uint32_t row = 0; row < 3; ++row) {
             if (shared_fused) {
                 CHECK(myds_v41_shared_gate_up_swiglu(ws->v_shared_swiglu[row],
                     base->shared_gate, base->shared_up, ws->v_ffn_norm[row], 2304, V41_DIM,
@@ -5110,9 +5150,9 @@ static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *t
         }
         myds_metal_barrier_buffer(ws->shared_swiglu_b2);
 
-        CHECK(v41_tree_projection(ws->v_shared_out, base->shared_down, ws->v_shared_swiglu, V41_DIM, 2304, base->shared_down_type, MYDS_V41_BATCH2_SHARED));
+        CHECK(v41_three_row_projection(ws->v_shared_out, base->shared_down, ws->v_shared_swiglu, V41_DIM, 2304, base->shared_down_type, MYDS_V41_BATCH2_SHARED, shared3));
 
-        CHECK(v41_tree_projection(ws->v_router_logits, base->router_gate, ws->v_ffn_norm, 384, V41_DIM, base->router_gate_type, MYDS_V41_BATCH2_ROUTER));
+        CHECK(v41_three_row_projection(ws->v_router_logits, base->router_gate, ws->v_ffn_norm, 384, V41_DIM, base->router_gate_type, MYDS_V41_BATCH2_ROUTER, shared3));
         myds_metal_barrier_buffer(ws->router_logits_b2);
 
         CHECK(myds_v41_route_batch(ws->selected_ids_b2, ws->selected_w_b2, ws->route_probs_b2, ws->route_scores_b2,
@@ -5120,7 +5160,13 @@ static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *t
         myds_metal_barrier_buffer(ws->selected_ids_b2);
         myds_metal_barrier_buffer(ws->selected_w_b2);
 
-        CHECK(myds_metal_routed_moe_batch(ws->moe_out_b2, ws->ffn_norm_b2,
+        if (shared3) {
+            CHECK(myds_v41_routed_moe_shared3(ws->moe_out_b2, ws->ffn_norm_b2,
+                base->ffn_gate_exps, base->ffn_up_exps, base->ffn_down_exps,
+                ws->selected_ids_b2, ws->selected_w_b2, ws->moe_mid_b2,
+                V41_DIM, 2304, 384, base->ffn_gate_exps_type,
+                base->ffn_up_exps_type, base->ffn_down_exps_type, m->swiglu_clamp_exp));
+        } else CHECK(myds_metal_routed_moe_batch(ws->moe_out_b2, ws->ffn_norm_b2,
                                           base->ffn_gate_exps, base->ffn_up_exps, base->ffn_down_exps,
                                           ws->selected_ids_b2, ws->selected_w_b2,
                                           ws->moe_gate_b2, ws->moe_up_b2, ws->moe_mid_b2, ws->moe_down_b2,
@@ -5324,6 +5370,7 @@ int myds_v41_forward_linear_spec_ex(myds_context_t *ctx, const int32_t *tokens,
     if (!ctx || !ctx->v41 || !ctx->model || !ctx->model->v41 || !tokens ||
         !out_tokens || n_tokens != 3u || ctx->img_emb_n || !(ctx->cfg.temperature <= 0.0f) ||
         myds_dspark_engine_capture_bypass_enabled(ctx->dspark)) return -1;
+    if (!v41_depth2_shared3_config_valid(myds_v41_depth2_shared3_mode())) return -1;
     myds_v41_context_t *g = ctx->v41;
     for (uint32_t row = 0; row < 3u; ++row)
         if (tokens[row] < 0 || (uint32_t)tokens[row] >= ctx->model->vocab_size) return -1;

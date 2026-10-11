@@ -293,6 +293,23 @@ typedef struct {
  * measurement boundary, not a concurrent multi-request accounting window. */
 void myds_metal_batch2_q8_shared_counters(
     myds_metal_batch2_q8_shared_counters_t *out, bool reset);
+/* Experimental three-row dense BF16 GEMV. Supports Q8_0 and Q4_K only;
+ * unsupported types, missing PSOs and invalid/overlapping output ranges
+ * fail before dispatch, with no conversion or scalar fallback. Inputs may
+ * overlap each other. The caller selects this experiment; no env is read.
+ * Q8 uses the scalar NSG/NR policy; Q4 retains scalar NSG=4/NR=2. */
+int myds_metal_v41_gemv_bf16_shared3_type(myds_metal_buffer_t *const out[3],
+    const myds_metal_buffer_t *weight, myds_metal_buffer_t *const input[3],
+    uint32_t out_dim, uint32_t in_dim, ggml_type type);
+int myds_metal_gemv_q8_0_bf16_shared3(myds_metal_buffer_t *const out[3],
+    const myds_metal_buffer_t *weight, myds_metal_buffer_t *const input[3],
+    uint32_t out_dim, uint32_t in_dim);
+typedef struct {
+    uint64_t requests, encoded, failures, q8_encoded, q4_encoded;
+} myds_metal_shared3_counters_t;
+/* Encoded means dispatched, including work in a later failing transaction.
+ * Reset only at an idle/exclusive measurement boundary. */
+void myds_metal_shared3_counters(myds_metal_shared3_counters_t *out, bool reset);
 int myds_metal_v41_qkv_fusion_available(void);
 
 int myds_metal_v41_gemv_batch(myds_metal_buffer_t *out,

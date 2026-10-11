@@ -158,6 +158,20 @@ static int test_public_linear_invalid_calls(void) {
         myds_v41_snapshot_set_positions(g,7,8);REJECT_LINEAR(&ctx,tokens,7,1,3);
         myds_v41_snapshot_set_positions(g,7,7);
         ds.capture_engine_only=true;REJECT_LINEAR(&ctx,tokens,7,1,3);ds.capture_engine_only=false;
+        const char *invalid_modes[] = {"", "2", "01", "true", "1 ", "-1"};
+        for (unsigned i=0; i<sizeof(invalid_modes)/sizeof(invalid_modes[0]); ++i) {
+            CHECK(setenv("MYDS_DEPTH2_SHARED3", invalid_modes[i], 1)==0);
+            CHECK(myds_v41_depth2_shared3_mode()==-1);
+            REJECT_LINEAR(&ctx,tokens,7,1,3);
+        }
+        CHECK(setenv("MYDS_DEPTH2_SHARED3", "1", 1)==0);
+        const char *unfused[] = {"MYDS_QKV_FUSE_BF16", "MYDS_DECODE_Q8_FUSE_BF16", "MYDS_SHARED_FUSE"};
+        for (unsigned i=0; i<sizeof(unfused)/sizeof(unfused[0]); ++i) {
+            CHECK(setenv(unfused[i], "0", 1)==0);
+            REJECT_LINEAR(&ctx,tokens,7,1,3);
+            CHECK(unsetenv(unfused[i])==0);
+        }
+        CHECK(unsetenv("MYDS_DEPTH2_SHARED3")==0 && myds_v41_depth2_shared3_mode()==0);
     }
 #undef REJECT_LINEAR
     myds_metal_set_auto_barrier(saved_barrier);

@@ -6,6 +6,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "myds_internal.h"
 #include "myds_v41.h"
+#include "myds_v41_moe.h"
 #include "myds_dspark.h"
 #include "reference/trace_input.h"
 #include <errno.h>
@@ -231,6 +232,17 @@ static void execution_counters(const myds_context_t *ctx) {
     COUNT(depth2_failures);COUNT(depth2_fallbacks);COUNT(batch2_calls);COUNT(batch2_hits);
     COUNT(batch2_misses);COUNT(batch2_failures);COUNT(batch2_fallbacks);COUNT(target_forward_calls);COUNT(target_rows);
 #undef COUNT
+    if (getenv("MYDS_DEPTH2_SHARED3")) {
+        myds_metal_shared3_counters_t dense; myds_metal_shared3_counters(&dense, false);
+        myds_v41_shared_gu_shared3_counters_t gu; myds_v41_shared_gu_shared3_counters(&gu, false);
+        myds_v41_depth2_routed_shared3_counters_t routed; myds_v41_depth2_routed_shared3_counters(&routed, false);
+        fprintf(report,",\"shared3\":{\"mode\":%d,\"dense\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64
+            ",\"failures\":%" PRIu64 ",\"q8_encoded\":%" PRIu64 ",\"q4_encoded\":%" PRIu64
+            "},\"gu\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64 ",\"failures\":%" PRIu64
+            "},\"routed\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64 ",\"failures\":%" PRIu64 "}}",
+            myds_v41_depth2_shared3_mode(),dense.requests,dense.encoded,dense.failures,dense.q8_encoded,dense.q4_encoded,
+            gu.requests,gu.encoded,gu.failures,routed.requests,routed.encoded,routed.failures);
+    }
 }
 static void execution_identity(const char *kind,uint32_t repeat,uint32_t arm,uint32_t keep,uint32_t pos,
     int32_t emitted0,int32_t seed,const int32_t truth[3],const int32_t inputs[3],int expected,int ret,
@@ -241,6 +253,8 @@ static void execution_identity(const char *kind,uint32_t repeat,uint32_t arm,uin
 }
 static int start_native(myds_context_t *ctx,const myds_v41_spec_snapshot_t *base,uint32_t pos,int32_t seed) {
     CHECK(myds_v41_spec_snapshot_restore(ctx,base));ctx->decode_metrics_active=true;ctx->decode_pld_candidate=true;
+    myds_metal_shared3_counters(NULL, true); myds_v41_shared_gu_shared3_counters(NULL, true);
+    myds_v41_depth2_routed_shared3_counters(NULL, true);
     memset(&ctx->decode_stats,0,sizeof(ctx->decode_stats));ctx->pcache_tokens[pos]=seed;ctx->pcache_len=pos+1u;return 1;
 }
 static int export_compare_state(myds_context_t *ctx,uint32_t repeat,const char *label,const state_t *reference,bool *pass) {

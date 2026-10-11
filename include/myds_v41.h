@@ -211,6 +211,24 @@ int myds_v41_batch2_projection_probe(myds_metal_buffer_t *out[2],
     uint32_t rows, uint32_t width, ggml_type type,
     myds_v41_batch2_projection_kind_t kind);
 
+/* Continuous depth2 provider selector: unset/0 retains the validated graph,
+ * literal 1 uses the independent shared3 kernels. Other values fail closed.
+ * Does not select a provider for ordinary decode, Batch2 or the sibling tree. */
+int myds_v41_depth2_shared3_mode(void);
+typedef struct { uint64_t requests, encoded, failures; }
+    myds_v41_depth2_routed_shared3_counters_t;
+void myds_v41_depth2_routed_shared3_counters(
+    myds_v41_depth2_routed_shared3_counters_t *out, bool reset);
+/* Exactly three F32 inputs and top-six routes in contiguous row order.
+ * Reuses each union expert's quantized weights, while preserving each row's
+ * original slot and block reduction order. No scalar fallback on failure. */
+int myds_v41_routed_moe_shared3(myds_metal_buffer_t *out,
+    const myds_metal_buffer_t *x, const myds_metal_buffer_t *gate,
+    const myds_metal_buffer_t *up, const myds_metal_buffer_t *down,
+    const myds_metal_buffer_t *ids, const myds_metal_buffer_t *weights,
+    myds_metal_buffer_t *mid, uint32_t dim, uint32_t width, uint32_t experts,
+    ggml_type gate_type, ggml_type up_type, ggml_type down_type, float clamp);
+
 /* ── 推测树（Tree-based Speculative Decoding）级联前向与3-Way裁决器 ── */
 /* Experimental: tokens={root,A,B}; A/B occupy the same position+1.
  * Returns one/two authoritative outputs. Production dispatcher uses this only

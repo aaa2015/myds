@@ -1,9 +1,11 @@
 #include "myds_v41_moe.h"
 #include "myds_v41_decode.h"
+#include "myds_v41.h"
 #include "myds_log.h"
 #include <math.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 
 /* 必须与 metal/myds_v41_moe.metal 的 myds_v41_route_args 逐字段一致 */
 struct route_args { uint32_t count, top_k, op; float scale; uint32_t rows, row, row4; };
@@ -265,6 +267,75 @@ static bool shared_pair_overlap(const myds_metal_buffer_t *a, uint64_t a_bytes,
     return first <= second ? second - first < a_bytes : first - second < b_bytes;
 }
 
+/* Shared3 is a distinct candidate provider, never an implicit retry. Its
+ * caller owns transaction restoration after any partial encoding failure. */
+static _Atomic uint64_t routed_shared3_requests, routed_shared3_encoded, routed_shared3_failures;
+void myds_v41_depth2_routed_shared3_counters(
+    myds_v41_depth2_routed_shared3_counters_t *out, bool reset) {
+#define ROUTED_COUNT(field) (reset ? atomic_exchange_explicit(&routed_shared3_##field, 0, memory_order_relaxed) \
+                                  : atomic_load_explicit(&routed_shared3_##field, memory_order_relaxed))
+    const myds_v41_depth2_routed_shared3_counters_t value = {
+        .requests = ROUTED_COUNT(requests), .encoded = ROUTED_COUNT(encoded), .failures = ROUTED_COUNT(failures)};
+    if (out) *out = value;
+#undef ROUTED_COUNT
+}
+
+struct myds_moe_shared3_args { uint32_t dim, width, experts; float clamp_value; };
+static bool routed_shared3_buffer(const myds_metal_buffer_t *b, uint64_t bytes, uint32_t alignment) {
+    return b && bytes <= myds_metal_buffer_size(b) &&
+        (uintptr_t)myds_metal_buffer_data((myds_metal_buffer_t *)b) % alignment == 0;
+}
+
+int myds_v41_routed_moe_shared3(myds_metal_buffer_t *out,
+    const myds_metal_buffer_t *input, const myds_metal_buffer_t *gate,
+    const myds_metal_buffer_t *up, const myds_metal_buffer_t *down,
+    const myds_metal_buffer_t *ids, const myds_metal_buffer_t *weights,
+    myds_metal_buffer_t *mid, uint32_t dim, uint32_t width, uint32_t experts,
+    ggml_type gate_type, ggml_type up_type, ggml_type down_type, float clamp_value) {
+    atomic_fetch_add_explicit(&routed_shared3_requests, 1, memory_order_relaxed);
+    if (!dim || dim > INT32_MAX || dim % 256u || !width || width > 2304u ||
+        width % 256u || experts < 6u || experts > 384u || !isfinite(clamp_value) ||
+        clamp_value < 0 || gate_type != GGML_TYPE_IQ2_XXS || up_type != GGML_TYPE_IQ2_XXS ||
+        down_type != GGML_TYPE_Q2_K) goto fail;
+    const uint64_t gate_bytes = (uint64_t)experts * width * (dim / 256u) * 66u;
+    const uint64_t down_bytes = (uint64_t)experts * dim * (width / 256u) * 84u;
+    const uint64_t input_bytes = (uint64_t)3u * dim * sizeof(float);
+    const uint64_t mid_bytes = (uint64_t)18u * width * sizeof(float);
+    const myds_metal_buffer_t *read[] = {input, gate, up, down, ids, weights};
+    const uint64_t read_bytes[] = {input_bytes, gate_bytes, gate_bytes, down_bytes,
+                                  18u * sizeof(int32_t), 18u * sizeof(float)};
+    const uint32_t alignment[] = {16u, 2u, 2u, 2u, 4u, 4u};
+    if (!routed_shared3_buffer(out, input_bytes, 4u) ||
+        !routed_shared3_buffer(mid, mid_bytes, 4u) ||
+        shared_pair_overlap(out, input_bytes, mid, mid_bytes)) goto fail;
+    for (uint32_t i = 0; i < 6; ++i)
+        if (!routed_shared3_buffer(read[i], read_bytes[i], alignment[i]) ||
+            shared_pair_overlap(out, input_bytes, read[i], read_bytes[i]) ||
+            shared_pair_overlap(mid, mid_bytes, read[i], read_bytes[i])) goto fail;
+    const struct myds_moe_shared3_args args = {dim, width, experts, clamp_value};
+    /* Dynamic selected IDs are trusted route output, not host-readable while
+     * their producer is active. Kernels also bounds-check before blob reads. */
+    const myds_metal_buffer_t *inputs[] = {input, ids, weights};
+    myds_metal_barrier_buffers(inputs, 3);
+    const myds_metal_buffer_t *gu[] = {gate, up, input, ids, weights, mid};
+    const uint32_t gu_grid[3] = {(width + 15u) / 16u, 1u, 18u};
+    const uint32_t gu_threads[3] = {128u, 1u, 1u};
+    if (!myds_metal_dispatch_kernel("kernel_myds_v41_iq2_gu_shared3", &args, sizeof(args),
+        gu, 6, gu_grid, gu_threads, 2176u)) goto fail;
+    myds_metal_barrier_buffer(mid);
+    const myds_metal_buffer_t *down_buffers[] = {down, mid, ids, out};
+    const uint32_t down_grid[3] = {dim / 2u, 1u, 1u}, down_threads[3] = {32u, 1u, 1u};
+    const size_t cache_bytes = (size_t)18u * 2u * (width / 256u) * 84u;
+    if (!myds_metal_dispatch_kernel("kernel_myds_v41_q2_down_shared3", &args, sizeof(args),
+        down_buffers, 4, down_grid, down_threads, (cache_bytes + 15u) & ~(size_t)15u)) goto fail;
+    myds_metal_barrier_buffer(out);
+    atomic_fetch_add_explicit(&routed_shared3_encoded, 1, memory_order_relaxed);
+    return 1;
+fail:
+    atomic_fetch_add_explicit(&routed_shared3_failures, 1, memory_order_relaxed);
+    return 0;
+}
+
 int myds_v41_shared_gate_up_swiglu_pair(myds_metal_buffer_t *const out[2],
                                       const myds_metal_buffer_t *gate,
                                       const myds_metal_buffer_t *up,
@@ -308,6 +379,108 @@ int myds_v41_shared_gate_up_swiglu_pair(myds_metal_buffer_t *const out[2],
         if (!myds_v41_shared_gate_up_swiglu(out[t], gate, up, input[t],
             out_dim, in_dim, gate_type, up_type, clamp)) return 0;
     return 1;
+}
+
+/* Three independent inputs share each quantized Gate/Up load in a distinct
+ * kernel. The old shared2 diagnostic is deliberately not used here. This
+ * provider requires scalar-GPU byte parity and real checkpoint validation
+ * before its caller can enable it in production. */
+static int shared_gu_shared3_encode(myds_metal_buffer_t *const out[3],
+                                         const myds_metal_buffer_t *gate,
+                                         const myds_metal_buffer_t *up,
+                                         myds_metal_buffer_t *const input[3],
+                                         uint32_t out_dim, uint32_t in_dim,
+                                         ggml_type gate_type, ggml_type up_type,
+                                         float clamp) {
+    if (!out || !input || !gate || !up || !out_dim || !in_dim ||
+        out_dim > INT32_MAX || in_dim > INT32_MAX ||
+        !isfinite(clamp) || clamp < 0 || gate_type != up_type ||
+        (gate_type != GGML_TYPE_Q4_K && gate_type != GGML_TYPE_Q8_0)) return 0;
+    const uint32_t block = gate_type == GGML_TYPE_Q4_K ? 256u : 32u;
+    const uint32_t bytes = gate_type == GGML_TYPE_Q4_K ? 144u : 34u;
+    if (in_dim % block) return 0;
+    const uint64_t row_bytes = (uint64_t)(in_dim / block) * bytes;
+    if (row_bytes > UINT32_MAX ||
+        myds_metal_buffer_size(gate) / row_bytes < out_dim ||
+        myds_metal_buffer_size(up) / row_bytes < out_dim ||
+        !myds_metal_buffer_data((myds_metal_buffer_t *)gate) ||
+        !myds_metal_buffer_data((myds_metal_buffer_t *)up) ||
+        myds_metal_buffer_offset(gate) % sizeof(uint16_t) ||
+        myds_metal_buffer_offset(up) % sizeof(uint16_t)) return 0;
+    const uint64_t output_bytes = (uint64_t)out_dim * sizeof(float);
+    const uint64_t input_bytes = (uint64_t)in_dim * sizeof(float);
+    const uint64_t weight_bytes = row_bytes * out_dim;
+    /* Preflight every row before encoding anything: output views may be
+     * separately allocated or strided, but must not overlap any reader. */
+    for (uint32_t t = 0; t < 3; ++t) {
+        if (!sized(out[t], out_dim) || !sized(input[t], in_dim) ||
+            !myds_metal_buffer_data(out[t]) || !myds_metal_buffer_data(input[t]) ||
+            myds_metal_buffer_offset(out[t]) % 16u ||
+            myds_metal_buffer_offset(input[t]) % sizeof(float)) return 0;
+    }
+    for (uint32_t t = 0; t < 3; ++t) {
+        if (shared_pair_overlap(out[t], output_bytes, gate, weight_bytes) ||
+            shared_pair_overlap(out[t], output_bytes, up, weight_bytes)) return 0;
+        for (uint32_t s = 0; s < 3; ++s) {
+            if (s < t && shared_pair_overlap(out[t], output_bytes, out[s], output_bytes)) return 0;
+            if (shared_pair_overlap(out[t], output_bytes, input[s], input_bytes)) return 0;
+        }
+    }
+    const struct myds_v41_shared_swiglu_args args = {
+        .in_dim = in_dim, .out_dim = out_dim,
+        .row_bytes = (uint32_t)row_bytes, .clamp = clamp
+    };
+    const myds_metal_buffer_t *buffers[] = {
+        gate, up, input[0], input[1], input[2], out[0], out[1], out[2]
+    };
+    if (gate_type == GGML_TYPE_Q4_K)
+        return dispatch("kernel_myds_v41_shared_gate_up_swiglu_q4_shared3",
+                        &args, sizeof(args), buffers, 8,
+                        (out_dim + 7u) / 8u, 128u, 0);
+    /* Use the same NR0 setting, NSG=4 and cross-SIMD reduction as scalar. */
+    static int nr0_cached = 0;
+    if (!nr0_cached) {
+        const char *v = getenv("MYDS_SHARED_NR0");
+        nr0_cached = (v && strcmp(v, "2") == 0) ? 2 : 4;
+    }
+    const uint32_t nr0 = (uint32_t)nr0_cached;
+    const char *kernel = nr0 == 4u ? "kernel_myds_v41_shared_gate_up_swiglu_q8_shared3_r4"
+                                  : "kernel_myds_v41_shared_gate_up_swiglu_q8_shared3_r2";
+    return dispatch(kernel, &args, sizeof(args), buffers, 8,
+                    (out_dim + nr0 - 1u) / nr0, 128u,
+                    3u * 2u * nr0 * 32u * sizeof(float));
+}
+
+static _Atomic uint64_t shared_gu_shared3_requests;
+static _Atomic uint64_t shared_gu_shared3_encoded;
+static _Atomic uint64_t shared_gu_shared3_failures;
+
+void myds_v41_shared_gu_shared3_counters(myds_v41_shared_gu_shared3_counters_t *out,
+                                       bool reset) {
+#define GU_SHARED3_COUNT(field) (reset ? atomic_exchange_explicit(&shared_gu_shared3_##field, 0, memory_order_relaxed) \
+                                     : atomic_load_explicit(&shared_gu_shared3_##field, memory_order_relaxed))
+    const myds_v41_shared_gu_shared3_counters_t value = {
+        .requests = GU_SHARED3_COUNT(requests),
+        .encoded = GU_SHARED3_COUNT(encoded),
+        .failures = GU_SHARED3_COUNT(failures)
+    };
+#undef GU_SHARED3_COUNT
+    if (out) *out = value;
+}
+
+int myds_v41_shared_gate_up_swiglu_shared3(myds_metal_buffer_t *const out[3],
+                                         const myds_metal_buffer_t *gate,
+                                         const myds_metal_buffer_t *up,
+                                         myds_metal_buffer_t *const input[3],
+                                         uint32_t out_dim, uint32_t in_dim,
+                                         ggml_type gate_type, ggml_type up_type,
+                                         float clamp) {
+    atomic_fetch_add_explicit(&shared_gu_shared3_requests, 1, memory_order_relaxed);
+    const int ok = shared_gu_shared3_encode(out, gate, up, input, out_dim, in_dim,
+                                           gate_type, up_type, clamp);
+    if (ok) atomic_fetch_add_explicit(&shared_gu_shared3_encoded, 1, memory_order_relaxed);
+    else atomic_fetch_add_explicit(&shared_gu_shared3_failures, 1, memory_order_relaxed);
+    return ok;
 }
 
 /* Unaccepted diagnostic candidate; production uses the scalar-PSO pair. */

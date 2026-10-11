@@ -9,6 +9,7 @@
 #include "myds_server_internal.h"
 #include "myds_v41_gpu.h"
 #include "myds_v41.h"
+#include "myds_v41_moe.h"
 #include "myds_dspark.h"
 #include <math.h>
 #include <errno.h>
@@ -46,6 +47,9 @@ typedef struct {
     myds_metal_moe_q2_sum_cache_fused_counters_t first_moe_q2_sum_cache_fused;
     myds_metal_f16_gemv_bf16_fuse_counters_t first_f16_bf16_fuse;
     myds_metal_indexer_rope_quant_fuse_counters_t first_indexer_rope_quant;
+    myds_metal_shared3_counters_t first_depth2_dense;
+    myds_v41_shared_gu_shared3_counters_t first_depth2_gu;
+    myds_v41_depth2_routed_shared3_counters_t first_depth2_routed;
 } capture_t;
 
 static double now_s(void) {
@@ -79,6 +83,9 @@ static void capture(const char *piece, size_t length, int32_t id, void *opaque) 
         myds_metal_moe_q2_sum_cache_fused_counters(&c->first_moe_q2_sum_cache_fused, false);
         myds_metal_f16_gemv_bf16_fuse_counters(&c->first_f16_bf16_fuse, false);
         myds_metal_indexer_rope_quant_fuse_counters(&c->first_indexer_rope_quant, false);
+        myds_metal_shared3_counters(&c->first_depth2_dense, false);
+        myds_v41_shared_gu_shared3_counters(&c->first_depth2_gu, false);
+        myds_v41_depth2_routed_shared3_counters(&c->first_depth2_routed, false);
     }
     c->last = t;
     if (c->count < MAX_OUTPUT_TOKENS) {
@@ -284,7 +291,7 @@ int main(int argc, char **argv) {
         "\"prompt_fnv1a64\":\"%016" PRIx64 "\",\"clock\":\"CLOCK_MONOTONIC\","
         "\"transport\":\"direct_byte_callback\",\"decode_basis\":\"first_to_last_callback/(tokens-1)\",\"environment\":{",
         repeats, max_new, max_seq, qos_result, body_bytes, prompt_bytes, request_hash, prompt_hash);
-    const char *env_names[] = {"MYDS_PHASE_PROFILE", "MYDS_PHASE_PROFILE_FILE", "MYDS_PREFIX_CACHE", "MYDS_KV_DSK", "MYDS_KV_DSK_ASYNC",
+    const char *env_names[] = {"MYDS_DEPTH2_SHARED3", "MYDS_PHASE_PROFILE", "MYDS_PHASE_PROFILE_FILE", "MYDS_PREFIX_CACHE", "MYDS_KV_DSK", "MYDS_KV_DSK_ASYNC",
         "MYDS_PREFILL_CHUNK_SIZE", "MYDS_PREFILL_MACROBLOCK_SIZE", "MYDS_MOE_CHUNKS", "MYDS_MOE_MM_MIN_TOKENS",
         "MYDS_DISABLE_MOE_MM", "MYDS_DECODE_SPLIT", "MYDS_ATTN_GATHER", "MYDS_SUFFIX_SHRINK", "MYDS_SUFFIX_SHRINK_SHIFT",
         "MYDS_RESIDENCY_KEEP_ALIVE_S", "MYDS_RESIDENCY_HB_MS", "MYDS_NO_RESIDENCY_HB", "MYDS_NO_PREFIX_SNAPSHOT",
@@ -397,6 +404,9 @@ int main(int argc, char **argv) {
         myds_metal_moe_q2_sum_cache_fused_counters(NULL, true);
         myds_metal_f16_gemv_bf16_fuse_counters(NULL, true);
         myds_metal_indexer_rope_quant_fuse_counters(NULL, true);
+        myds_metal_shared3_counters(NULL, true);
+        myds_v41_shared_gu_shared3_counters(NULL, true);
+        myds_v41_depth2_routed_shared3_counters(NULL, true);
         if (!storage_counters(json, run, "before")) { status = 1; break; }
         const double start = now_s();
         const int ok = myds_generate_bytes_ex(ctx, prompt, capture, &c, &reason, &prompt_tokens, NULL);
@@ -431,6 +441,12 @@ int main(int argc, char **argv) {
         myds_metal_f16_gemv_bf16_fuse_counters(&f16_bf16_fuse, false);
         myds_metal_indexer_rope_quant_fuse_counters_t indexer_rope_quant;
         myds_metal_indexer_rope_quant_fuse_counters(&indexer_rope_quant, false);
+        myds_metal_shared3_counters_t depth2_dense;
+        myds_metal_shared3_counters(&depth2_dense, false);
+        myds_v41_shared_gu_shared3_counters_t depth2_gu;
+        myds_v41_shared_gu_shared3_counters(&depth2_gu, false);
+        myds_v41_depth2_routed_shared3_counters_t depth2_routed;
+        myds_v41_depth2_routed_shared3_counters(&depth2_routed, false);
         if (!storage_counters(json, run, "after")) { status = 1; break; }
         myds_prefill_stats_t pf; myds_last_prefill_stats(ctx, &pf);
         /* Final logits are read only after the existing generation waits, outside
@@ -549,6 +565,42 @@ int main(int argc, char **argv) {
         THRESHOLD_JSON(certificate, threshold_gpu, c.first_threshold_gpu);
         THRESHOLD_JSON(tie, threshold_gpu, c.first_threshold_gpu);
 #undef THRESHOLD_JSON
+        fputc('}', json);
+        fputs(",\"gpu_depth2_shared3_dense\":{", json);
+        fprintf(json, "\"requests\":%" PRIu64 ",\"decode_requests\":%" PRIu64,
+            depth2_dense.requests, depth2_dense.requests-c.first_depth2_dense.requests);
+        fputc(',', json);
+        fprintf(json, "\"encoded\":%" PRIu64 ",\"decode_encoded\":%" PRIu64,
+            depth2_dense.encoded, depth2_dense.encoded-c.first_depth2_dense.encoded);
+        fputc(',', json);
+        fprintf(json, "\"failures\":%" PRIu64 ",\"decode_failures\":%" PRIu64,
+            depth2_dense.failures, depth2_dense.failures-c.first_depth2_dense.failures);
+        fputc(',', json);
+        fprintf(json, "\"q8_encoded\":%" PRIu64 ",\"decode_q8_encoded\":%" PRIu64,
+            depth2_dense.q8_encoded, depth2_dense.q8_encoded-c.first_depth2_dense.q8_encoded);
+        fputc(',', json);
+        fprintf(json, "\"q4_encoded\":%" PRIu64 ",\"decode_q4_encoded\":%" PRIu64,
+            depth2_dense.q4_encoded, depth2_dense.q4_encoded-c.first_depth2_dense.q4_encoded);
+        fputc('}', json);
+        fputs(",\"gpu_depth2_shared3_gu\":{", json);
+        fprintf(json, "\"requests\":%" PRIu64 ",\"decode_requests\":%" PRIu64,
+            depth2_gu.requests, depth2_gu.requests-c.first_depth2_gu.requests);
+        fputc(',', json);
+        fprintf(json, "\"encoded\":%" PRIu64 ",\"decode_encoded\":%" PRIu64,
+            depth2_gu.encoded, depth2_gu.encoded-c.first_depth2_gu.encoded);
+        fputc(',', json);
+        fprintf(json, "\"failures\":%" PRIu64 ",\"decode_failures\":%" PRIu64,
+            depth2_gu.failures, depth2_gu.failures-c.first_depth2_gu.failures);
+        fputc('}', json);
+        fputs(",\"gpu_depth2_shared3_routed\":{", json);
+        fprintf(json, "\"requests\":%" PRIu64 ",\"decode_requests\":%" PRIu64,
+            depth2_routed.requests, depth2_routed.requests-c.first_depth2_routed.requests);
+        fputc(',', json);
+        fprintf(json, "\"encoded\":%" PRIu64 ",\"decode_encoded\":%" PRIu64,
+            depth2_routed.encoded, depth2_routed.encoded-c.first_depth2_routed.encoded);
+        fputc(',', json);
+        fprintf(json, "\"failures\":%" PRIu64 ",\"decode_failures\":%" PRIu64,
+            depth2_routed.failures, depth2_routed.failures-c.first_depth2_routed.failures);
         fputc('}', json);
         fprintf(json, ",\"gpu_batch2_q8_shared\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64
             ",\"failures\":%" PRIu64 ",\"decode_requests\":%" PRIu64 ",\"decode_encoded\":%" PRIu64

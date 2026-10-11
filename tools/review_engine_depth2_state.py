@@ -36,7 +36,7 @@ def fnv(data):
     for byte in data:value=((value^byte)*1099511628211)&0xffffffffffffffff
     return f'{value:016x}'
 
-def validate_protocol(states, requests):
+def validate_protocol(states, requests, shared3_mode=None):
     """Validate actual request scheduling; CPU selftests exercise this gate."""
     require(set(states)==set(requests)==LABELS,'Missing/extra lifecycle case identities')
     base_prompt=None
@@ -49,7 +49,19 @@ def validate_protocol(states, requests):
             cap=16 if continuing else 256 if c<2 else c-1
             for label,spec in ((cl,True),(ol,False)):
                 request=requests[label];state=states[label];d=state['decode']
-                require(set(request)==REQUEST_KEYS,'Request schema differs '+label)
+                require(set(request)==REQUEST_KEYS | ({'shared3'} if shared3_mode is not None else set()),'Request schema differs '+label)
+                if shared3_mode is not None:
+                    shared=request['shared3']
+                    require(isinstance(shared,dict) and set(shared)=={'mode','dense','gu','routed'},'Missing shared3 counters '+label)
+                    exact(shared,{'mode':shared3_mode},'Shared3 selector differs '+label)
+                    for provider,multiplier in (('dense',200),('gu',40),('routed',40)):
+                        values=shared[provider]
+                        keys={'requests','encoded','failures'} | ({'q8_encoded','q4_encoded'} if provider=='dense' else set())
+                        require(isinstance(values,dict) and set(values)==keys and all(type(v) is int and v>=0 for v in values.values()),'Invalid shared3 counters '+label)
+                        count=d['depth2_calls']*multiplier if shared3_mode==1 else 0
+                        exact(values,{'requests':count,'encoded':count,'failures':0},'Actual shared3 execution absent/failed '+label)
+                        if provider=='dense':
+                            require(values['q8_encoded']+values['q4_encoded']==count and (values['q4_encoded']>0 if count else values['q4_encoded']==0),'Actual shared Q4 absent '+label)
                 hit=(c+1) if not continuing and c<2 and spec else 0
                 cancel=a['output_tokens'] if not continuing and c<2 and not spec else 0
                 exact(request,dict(kind='request',label=label,spec=spec,cap=cap,cancel_after=cancel,
@@ -144,7 +156,9 @@ def inspect(report, raw):
     meta=rows[0];require(meta.get('kind')=='metadata' and meta.get('real_support_loaded') is True and
         meta.get('capture_mode')==0 and meta.get('greedy') is True and meta.get('pairs')==5 and
         meta.get('files_per_state')==18 and meta.get('performance_measurement') is False,'Invalid real-model scope')
-    require(set(meta)=={'kind','schema_version','target','support','real_support_loaded','capture_mode','greedy','performance_measurement','pairs','files_per_state'} and
+    shared3_mode=meta.get('shared3_mode')
+    require(shared3_mode is None or type(shared3_mode) is int and shared3_mode in (0,1),'Invalid shared3 mode')
+    require(set(meta)=={'kind','schema_version','target','support','real_support_loaded','capture_mode','greedy','performance_measurement','pairs','files_per_state'} | ({'shared3_mode'} if shared3_mode is not None else set()) and
         type(meta['schema_version']) is int and meta['schema_version']==1 and all(type(meta[k]) is str and meta[k] for k in ('target','support')),
         'Metadata schema/model identity differs')
     residency=validate_residency(rows)
@@ -213,7 +227,7 @@ def inspect(report, raw):
                 row.get('slot1_slot2_bitwise_equal') is True and row.get('other_heads_nan') is True and
                 0<row['prefix_dispatches']<row['full_dispatches'] and len(roles)==8,'Incomplete neural prefix proof')
     require(len(states)==14 and len(requests)==14 and files==260,'Incomplete lifecycle evidence')
-    validate_protocol(states,requests)
+    validate_protocol(states,requests,shared3_mode)
     comparisons=[]
     for c in range(5):
         for suffix in ('','_continue') if c<2 else ('',):

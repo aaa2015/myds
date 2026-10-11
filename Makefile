@@ -62,6 +62,9 @@ TEST_DSPARK_ROLLBACK = $(BIN_DIR)/test_dspark_rollback
 TEST_DSPARK_ROUTER = $(BIN_DIR)/test_dspark_router
 TEST_V41_ROUTER = $(BIN_DIR)/test_v41_router
 TEST_BATCH2_SHARED_PAIR = $(BIN_DIR)/test_batch2_shared_swiglu_pair
+TEST_DEPTH2_SHARED3 = $(BIN_DIR)/test_depth2_shared3
+TEST_DEPTH2_SHARED3_GU = $(BIN_DIR)/test_depth2_shared_swiglu_shared3
+TEST_DEPTH2_SHARED3_MOE = $(BIN_DIR)/test_moe_shared3
 TEST_DSPARK_ATTN = $(BIN_DIR)/test_dspark_attention
 TEST_DSPARK_MOE = $(BIN_DIR)/test_dspark_moe
 TEST_DSPARK_PROPOSAL = $(BIN_DIR)/test_dspark_proposal
@@ -330,6 +333,19 @@ $(TEST_V41_ROUTER): tests/test_v41_router.c $(BUILD_DIR)/myds_v41_moe.o $(BUILD_
 
 $(TEST_BATCH2_SHARED_PAIR): tests/test_batch2_shared_swiglu_pair.c src/myds_v41_moe.c $(wildcard include/*.h) $(filter-out $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $< $(filter %.o,$^) $(LDFLAGS) -Wl,-dead_strip
+
+# Build-only candidate gates. Execute explicitly under an exclusive GPU window.
+$(TEST_DEPTH2_SHARED3): tests/test_depth2_shared3.m src/myds_metal.m $(wildcard include/*.h) $(OBJS_C) $(METALLIB) | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) -Isrc -o $@ $< $(OBJS_C) $(LDFLAGS)
+
+$(TEST_DEPTH2_SHARED3_GU): tests/test_depth2_shared_swiglu_shared3.c src/myds_v41_moe.c $(wildcard include/*.h) $(filter-out $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $< $(filter %.o,$^) $(LDFLAGS) -Wl,-dead_strip
+
+$(TEST_DEPTH2_SHARED3_MOE): tests/test_moe_shared3.c src/myds_v41_moe.c $(wildcard include/*.h) $(filter-out $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $< $(filter %.o,$^) $(LDFLAGS) -Wl,-dead_strip
+
+.PHONY: build-depth2-shared3-candidates
+build-depth2-shared3-candidates: $(TEST_DEPTH2_SHARED3) $(TEST_DEPTH2_SHARED3_GU) $(TEST_DEPTH2_SHARED3_MOE)
 
 $(TEST_DSPARK_ATTN): tests/test_dspark_attention.c $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $< $(filter %.o,$^) $(LDFLAGS) -Wl,-dead_strip

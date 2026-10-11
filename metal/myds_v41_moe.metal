@@ -779,6 +779,222 @@ kernel void kernel_myds_v41_shared_gate_up_swiglu_q4_shared2(
         args, src_gate, src_up, src_in, dst_out, shmem, tgpig, tiisg, sgitg);
 }
 
+/* Distinct three-input candidate. Keep the scalar Q4 lane/block assignment,
+ * ib += 4, dot expression and BF16 boundaries. Quantized Gate/Up operands are
+ * loaded outside the token loop, so the same values serve all three inputs.
+ * Neither this source order nor a component PASS substitutes for the required
+ * real-model checkpoint/partial2 byte-parity gate. */
+kernel void kernel_myds_v41_shared_gate_up_swiglu_q4_shared3(
+    constant myds_v41_shared_swiglu_args &args [[buffer(0)]],
+    device const char *src_gate [[buffer(1)]],
+    device const char *src_up [[buffer(2)]],
+    device const float *src_in0 [[buffer(3)]],
+    device const float *src_in1 [[buffer(4)]],
+    device const float *src_in2 [[buffer(5)]],
+    device float *dst_out0 [[buffer(6)]],
+    device float *dst_out1 [[buffer(7)]],
+    device float *dst_out2 [[buffer(8)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr short NSG = 4;
+    constexpr short NR0 = 2;
+    const int nb = (int)args.in_dim / 256;
+    const int first_row = (tgpig.x * NSG + sgitg) * NR0;
+    if (first_row >= (int)args.out_dim) return;
+    constexpr uint16_t kmask1 = 0x3f3f, kmask2 = 0x0f0f, kmask3 = 0xc0c0;
+    const short ix = tiisg / 8, it = tiisg % 8;
+    const short iq = it / 4, ir = it % 4;
+    device const float *y4[3] = {
+        src_in0 + ix * 256 + 64 * iq + 8 * ir,
+        src_in1 + ix * 256 + 64 * iq + 8 * ir,
+        src_in2 + ix * 256 + 64 * iq + 8 * ir
+    };
+    device float *dst[3] = {dst_out0, dst_out1, dst_out2};
+    device const block_q4_K *ax_gate[NR0], *ax_up[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset = (uint64_t)(first_row + row) * args.row_bytes;
+        const bool active = first_row + row < (int)args.out_dim;
+        ax_gate[row] = (device const block_q4_K *)(src_gate + (active ? offset : 0));
+        ax_up[row] = (device const block_q4_K *)(src_up + (active ? offset : 0));
+    }
+    float sumf_gate[3][NR0] = {{0.f}}, sumf_up[3][NR0] = {{0.f}};
+    float yl[3][16], yh[3][16];
+    for (int ib = ix; ib < nb; ib += 4) {
+        float4 sumy[3] = {float4(0.f), float4(0.f), float4(0.f)};
+        for (short t = 0; t < 3; ++t) {
+            FOR_UNROLL (short i = 0; i < 8; ++i) {
+                yl[t][i + 0] = y4[t][i +   0]; sumy[t][0] += yl[t][i + 0];
+                yl[t][i + 8] = y4[t][i +  32]; sumy[t][1] += yl[t][i + 8];
+                yh[t][i + 0] = y4[t][i + 128]; sumy[t][2] += yh[t][i + 0];
+                yh[t][i + 8] = y4[t][i + 160]; sumy[t][3] += yh[t][i + 8];
+            }
+        }
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            if (first_row + row >= (int)args.out_dim) break;
+            device const uint16_t *sc_g = (device const uint16_t *)ax_gate[row][ib].scales + iq;
+            device const uint16_t *q1_g = (device const uint16_t *)ax_gate[row][ib].qs + 16 * iq + 4 * ir;
+            device const uint16_t *q2_g = q1_g + 32;
+            device const uint16_t *sc_u = (device const uint16_t *)ax_up[row][ib].scales + iq;
+            device const uint16_t *q1_u = (device const uint16_t *)ax_up[row][ib].qs + 16 * iq + 4 * ir;
+            device const uint16_t *q2_u = q1_u + 32;
+            uint16_t sc16g[4], sc16u[4], qg1[4], qg2[4], qu1[4], qu2[4];
+            sc16g[0] = sc_g[0] & kmask1;
+            sc16g[1] = sc_g[2] & kmask1;
+            sc16g[2] = ((sc_g[4] >> 0) & kmask2) | ((sc_g[0] & kmask3) >> 2);
+            sc16g[3] = ((sc_g[4] >> 4) & kmask2) | ((sc_g[2] & kmask3) >> 2);
+            sc16u[0] = sc_u[0] & kmask1;
+            sc16u[1] = sc_u[2] & kmask1;
+            sc16u[2] = ((sc_u[4] >> 0) & kmask2) | ((sc_u[0] & kmask3) >> 2);
+            sc16u[3] = ((sc_u[4] >> 4) & kmask2) | ((sc_u[2] & kmask3) >> 2);
+            thread const uint8_t *sc8g = (thread const uint8_t *)sc16g;
+            thread const uint8_t *sc8u = (thread const uint8_t *)sc16u;
+            const half dg = ax_gate[row][ib].d, dmg = ax_gate[row][ib].dmin;
+            const half du = ax_up[row][ib].d, dmu = ax_up[row][ib].dmin;
+            FOR_UNROLL (short i = 0; i < 4; ++i) {
+                qg1[i] = q1_g[i]; qg2[i] = q2_g[i];
+                qu1[i] = q1_u[i]; qu2[i] = q2_u[i];
+            }
+            for (short t = 0; t < 3; ++t) {
+                float4 acc1g = {0.f, 0.f, 0.f, 0.f}, acc2g = {0.f, 0.f, 0.f, 0.f};
+                float4 acc1u = {0.f, 0.f, 0.f, 0.f}, acc2u = {0.f, 0.f, 0.f, 0.f};
+                FOR_UNROLL (short i = 0; i < 4; ++i) {
+                    acc1g[0] += yl[t][2 * i + 0] * (qg1[i] & 0x000F);
+                    acc1g[1] += yl[t][2 * i + 1] * (qg1[i] & 0x0F00);
+                    acc1g[2] += yl[t][2 * i + 8] * (qg1[i] & 0x00F0);
+                    acc1g[3] += yl[t][2 * i + 9] * (qg1[i] & 0xF000);
+                    acc2g[0] += yh[t][2 * i + 0] * (qg2[i] & 0x000F);
+                    acc2g[1] += yh[t][2 * i + 1] * (qg2[i] & 0x0F00);
+                    acc2g[2] += yh[t][2 * i + 8] * (qg2[i] & 0x00F0);
+                    acc2g[3] += yh[t][2 * i + 9] * (qg2[i] & 0xF000);
+                    acc1u[0] += yl[t][2 * i + 0] * (qu1[i] & 0x000F);
+                    acc1u[1] += yl[t][2 * i + 1] * (qu1[i] & 0x0F00);
+                    acc1u[2] += yl[t][2 * i + 8] * (qu1[i] & 0x00F0);
+                    acc1u[3] += yl[t][2 * i + 9] * (qu1[i] & 0xF000);
+                    acc2u[0] += yh[t][2 * i + 0] * (qu2[i] & 0x000F);
+                    acc2u[1] += yh[t][2 * i + 1] * (qu2[i] & 0x0F00);
+                    acc2u[2] += yh[t][2 * i + 8] * (qu2[i] & 0x00F0);
+                    acc2u[3] += yh[t][2 * i + 9] * (qu2[i] & 0xF000);
+                }
+                sumf_gate[t][row] += dg * ((acc1g[0] + 1.f / 256.f * acc1g[1]) * sc8g[0] +
+                                          (acc1g[2] + 1.f / 256.f * acc1g[3]) * sc8g[1] * 1.f / 16.f +
+                                          (acc2g[0] + 1.f / 256.f * acc2g[1]) * sc8g[4] +
+                                          (acc2g[2] + 1.f / 256.f * acc2g[3]) * sc8g[5] * 1.f / 16.f) -
+                                     dmg * (sumy[t][0] * sc8g[2] + sumy[t][1] * sc8g[3] + sumy[t][2] * sc8g[6] + sumy[t][3] * sc8g[7]);
+                sumf_up[t][row] += du * ((acc1u[0] + 1.f / 256.f * acc1u[1]) * sc8u[0] +
+                                        (acc1u[2] + 1.f / 256.f * acc1u[3]) * sc8u[1] * 1.f / 16.f +
+                                        (acc2u[0] + 1.f / 256.f * acc2u[1]) * sc8u[4] +
+                                        (acc2u[2] + 1.f / 256.f * acc2u[3]) * sc8u[5] * 1.f / 16.f) -
+                                   dmu * (sumy[t][0] * sc8u[2] + sumy[t][1] * sc8u[3] + sumy[t][2] * sc8u[6] + sumy[t][3] * sc8u[7]);
+            }
+        }
+        for (short t = 0; t < 3; ++t) y4[t] += 4 * 256;
+    }
+    for (short row = 0; row < NR0 && first_row + row < (int)args.out_dim; ++row) {
+        for (short t = 0; t < 3; ++t) {
+            float tot_g = simd_sum(sumf_gate[t][row]), tot_u = simd_sum(sumf_up[t][row]);
+            if (tiisg == 0) {
+                float g = dsv4_mv_bf16_store(tot_g), u = dsv4_mv_bf16_store(tot_u);
+                if (args.clamp > 1.0e-6f) {
+                    g = min(g, args.clamp); u = clamp(u, -args.clamp, args.clamp);
+                }
+                const float silu = g / (1.0f + exp(-g));
+                const float glu_v = silu * u;
+                dst[t][first_row + row] = dsv4_mv_bf16_store(glu_v);
+            }
+        }
+    }
+}
+
+template<short NR0>
+void kernel_myds_v41_shared_gate_up_swiglu_q8_shared3_impl(
+    constant myds_v41_shared_swiglu_args &args,
+    device const char *src_gate, device const char *src_up,
+    device const float *src_in0, device const float *src_in1, device const float *src_in2,
+    device float *dst_out0, device float *dst_out1, device float *dst_out2,
+    threadgroup char *shmem, uint3 tgpig, ushort tiisg, ushort sgitg) {
+    constexpr short NSG = 4, NW = N_SIMDWIDTH, NQ = 8;
+    const int nb = (int)args.in_dim / QK8_0, r0 = tgpig.x * NR0;
+    device const block_q8_0 *ax_gate[NR0], *ax_up[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset = (uint64_t)(r0 + row) * args.row_bytes;
+        const bool active = r0 + row < (int)args.out_dim;
+        ax_gate[row] = (device const block_q8_0 *)(src_gate + (active ? offset : 0));
+        ax_up[row] = (device const block_q8_0 *)(src_up + (active ? offset : 0));
+    }
+    float sumf_gate[3][NR0] = {{0.f}}, sumf_up[3][NR0] = {{0.f}};
+    const short ix = tiisg / (NW / NQ), il = tiisg % (NW / NQ);
+    const int ib0 = sgitg * NQ + ix;
+    device const float *yb[3] = {src_in0 + ib0 * QK8_0 + il * NQ,
+                                src_in1 + ib0 * QK8_0 + il * NQ,
+                                src_in2 + ib0 * QK8_0 + il * NQ};
+    device float *dst[3] = {dst_out0, dst_out1, dst_out2};
+    for (int ib = ib0; ib < nb; ib += NSG * NQ) {
+        float yl[3][NQ];
+        for (short t = 0; t < 3; ++t)
+            for (short i = 0; i < NQ; ++i) yl[t][i] = yb[t][i];
+        for (short row = 0; row < NR0; ++row) {
+            int8_t qg[NQ], qu[NQ];
+            const half dg = ax_gate[row][ib].d, du = ax_up[row][ib].d;
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                qg[i] = ax_gate[row][ib].qs[il * NQ + i];
+                qu[i] = ax_up[row][ib].qs[il * NQ + i];
+            }
+            for (short t = 0; t < 3; ++t) {
+                float sumq_g = 0.f, sumq_u = 0.f;
+                FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                    sumq_g += qg[i] * yl[t][i];
+                    sumq_u += qu[i] * yl[t][i];
+                }
+                sumf_gate[t][row] += sumq_g * dg;
+                sumf_up[t][row] += sumq_u * du;
+            }
+        }
+        for (short t = 0; t < 3; ++t) yb[t] += NSG * NQ * QK8_0;
+    }
+    threadgroup float *sg[3][NR0], *su[3][NR0];
+    for (short t = 0; t < 3; ++t) for (short row = 0; row < NR0; ++row) {
+        sg[t][row] = (threadgroup float *)shmem + NW * (t * 2 * NR0 + row);
+        su[t][row] = (threadgroup float *)shmem + NW * (t * 2 * NR0 + NR0 + row);
+        if (sgitg == 0) {sg[t][row][tiisg] = 0.f; su[t][row][tiisg] = 0.f;}
+        sumf_gate[t][row] = simd_sum(sumf_gate[t][row]);
+        sumf_up[t][row] = simd_sum(sumf_up[t][row]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short t = 0; t < 3; ++t) for (short row = 0; row < NR0; ++row)
+        if (tiisg == 0) {sg[t][row][sgitg] = sumf_gate[t][row]; su[t][row][sgitg] = sumf_up[t][row];}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short row = 0; row < NR0 && r0 + row < (int)args.out_dim; ++row) {
+        for (short t = 0; t < 3; ++t) {
+            float tot_g = simd_sum(sg[t][row][tiisg]), tot_u = simd_sum(su[t][row][tiisg]);
+            if (tiisg == 0 && sgitg == 0) {
+                float g = dsv4_mv_bf16_store(tot_g), u = dsv4_mv_bf16_store(tot_u);
+                if (args.clamp > 1.0e-6f) {g = min(g, args.clamp); u = clamp(u, -args.clamp, args.clamp);}
+                const float silu = g / (1.0f + exp(-g));
+                const float glu_v = silu * u;
+                dst[t][r0 + row] = dsv4_mv_bf16_store(glu_v);
+            }
+        }
+    }
+}
+
+#define MYDS_GU_SHARED3_Q8_KERNEL(NAME, NR0) \
+kernel void NAME( \
+    constant myds_v41_shared_swiglu_args &args [[buffer(0)]], \
+    device const char *src_gate [[buffer(1)]], device const char *src_up [[buffer(2)]], \
+    device const float *src_in0 [[buffer(3)]], device const float *src_in1 [[buffer(4)]], \
+    device const float *src_in2 [[buffer(5)]], device float *dst_out0 [[buffer(6)]], \
+    device float *dst_out1 [[buffer(7)]], device float *dst_out2 [[buffer(8)]], \
+    threadgroup char *shmem [[threadgroup(0)]], uint3 tgpig [[threadgroup_position_in_grid]], \
+    ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
+    kernel_myds_v41_shared_gate_up_swiglu_q8_shared3_impl<NR0>( \
+        args, src_gate, src_up, src_in0, src_in1, src_in2, dst_out0, dst_out1, dst_out2, \
+        shmem, tgpig, tiisg, sgitg); \
+}
+MYDS_GU_SHARED3_Q8_KERNEL(kernel_myds_v41_shared_gate_up_swiglu_q8_shared3_r2, 2)
+MYDS_GU_SHARED3_Q8_KERNEL(kernel_myds_v41_shared_gate_up_swiglu_q8_shared3_r4, 4)
+#undef MYDS_GU_SHARED3_Q8_KERNEL
+
 /* ============================================================================
  * DSpark 专属融合路由内核：128 专家、Top-3 单 Threadgroup 全在位双调排序与归一化
  * 消除 CPU-GPU 往返同步与命令缓冲区打断（Zero-Stall GPU Pipelining）

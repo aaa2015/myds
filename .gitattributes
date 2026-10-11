@@ -29,3 +29,6 @@ docs/benchmarks/2026-10-05-decode-split-adoption/**/*.patch -whitespace
 docs/benchmarks/2026-10-05-decode-split-adoption/**/*.log -whitespace
 # Preserve the frozen production startup script byte-for-byte.
 docs/benchmarks/2026-10-05-decode-split-adoption/window/start_fleet.before.sh -whitespace
+# Preserve verbatim shared3 measurement records and original test whitespace.
+docs/benchmarks/2026-10-12-dspark-shared3/** -text
+docs/benchmarks/2026-10-12-dspark-shared3/**/*.log -whitespace

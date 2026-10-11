@@ -383,6 +383,62 @@ DSV41_Q8_SHARED2_KERNEL(2)
 DSV41_Q8_SHARED2_KERNEL(4)
 #undef DSV41_Q8_SHARED2_KERNEL
 
+/* Three independent decode rows, sharing quantized weights only. Each
+ * accumulator and reducer retains the scalar BF16 GEMV operation order. */
+template<short NR0>
+void kernel_dsv41_q8_shared3_impl(
+        constant ds4_metal_args_mul_mv &args, device const char *weight,
+        device const float *input0, device const float *input1, device const float *input2,
+        device float *output0, device float *output1, device float *output2,
+        threadgroup char *shmem, uint3 tgpig, ushort tiisg, ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+    constexpr short NW = N_SIMDWIDTH, NQ = 8;
+    const int nb = args.ne00 / QK8_0, r0 = tgpig.x * NR0;
+    device const block_q8_0 *ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset = (uint64_t)(r0 + row) * args.nb01;
+        ax[row] = (device const block_q8_0 *)(weight + ((r0 + row < args.ne01) ? offset : 0));
+    }
+    float sumf[3][NR0];
+    FOR_UNROLL (short t = 0; t < 3; ++t)
+        FOR_UNROLL (short row = 0; row < NR0; ++row) sumf[t][row] = 0.f;
+    const short ix = tiisg / (NW / NQ), il = tiisg % (NW / NQ);
+    const int ib0 = sgitg * NQ + ix;
+    device const float *yb0 = input0 + ib0 * QK8_0 + il * NQ;
+    device const float *yb1 = input1 + ib0 * QK8_0 + il * NQ;
+    device const float *yb2 = input2 + ib0 * QK8_0 + il * NQ;
+    for (int ib = ib0; ib < nb; ib += NSG * NQ) {
+        float yl0[NQ], yl1[NQ], yl2[NQ];
+        for (short i = 0; i < NQ; ++i) { yl0[i] = yb0[i]; yl1[i] = yb1[i]; yl2[i] = yb2[i]; }
+        for (short row = 0; row < NR0; ++row) {
+            device const int8_t *qs = ax[row][ib].qs + il * NQ;
+            const half d = ax[row][ib].d;
+            float sumq0 = 0.f, sumq1 = 0.f, sumq2 = 0.f;
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                const int8_t q = qs[i];
+                sumq0 += q * yl0[i]; sumq1 += q * yl1[i]; sumq2 += q * yl2[i];
+            }
+            sumf[0][row] += sumq0 * d; sumf[1][row] += sumq1 * d; sumf[2][row] += sumq2 * d;
+        }
+        yb0 += NSG * NQ * QK8_0; yb1 += NSG * NQ * QK8_0; yb2 += NSG * NQ * QK8_0;
+    }
+    helper_mv_reduce_and_write<NR0, true>(output0, sumf[0], r0, args.ne01, tiisg, sgitg, shmem);
+    helper_mv_reduce_and_write<NR0, true>(output1, sumf[1], r0, args.ne01, tiisg, sgitg, shmem + NW * NR0 * sizeof(float));
+    helper_mv_reduce_and_write<NR0, true>(output2, sumf[2], r0, args.ne01, tiisg, sgitg, shmem + 2 * NW * NR0 * sizeof(float));
+}
+#define DSV41_Q8_SHARED3_KERNEL(NR) \
+kernel void kernel_dsv41_q8_shared3_bf16_r##NR( \
+        constant ds4_metal_args_mul_mv &args [[buffer(0)]], device const char *weight [[buffer(1)]], \
+        device const float *input0 [[buffer(2)]], device const float *input1 [[buffer(3)]], device const float *input2 [[buffer(4)]], \
+        device float *output0 [[buffer(5)]], device float *output1 [[buffer(6)]], device float *output2 [[buffer(7)]], \
+        threadgroup char *shmem [[threadgroup(0)]], uint3 tgpig [[threadgroup_position_in_grid]], \
+        ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
+    kernel_dsv41_q8_shared3_impl<NR>(args, weight, input0, input1, input2, output0, output1, output2, shmem, tgpig, tiisg, sgitg); \
+}
+DSV41_Q8_SHARED3_KERNEL(2)
+DSV41_Q8_SHARED3_KERNEL(4)
+#undef DSV41_Q8_SHARED3_KERNEL
+
 /* Batch2 Dense (F16 / F32) shared-weights matvec.
  * Reads weight rows once and computes dot products against two independent
  * input vectors simultaneously, with identical reduction and store trees. */

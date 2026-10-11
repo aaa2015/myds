@@ -150,6 +150,7 @@ def metadata(meta):
                 "MYDS_BATCH2_TRACE_GPU": "0", "MYDS_DSPARK_CAPTURE_BYPASS": "1" if faults else "0",
                 "MYDS_ENGINE_CAPTURE_BYPASS": "0", "MYDS_PLD": "0"}, "Native/capture/PLD environment differs")
     require("MYDS_TRACE_DIR" not in env, "Trace cannot establish native parity")
+    require(env.get("MYDS_DEPTH2_SHARED3", "0") in ("0", "1"), "Invalid shared3 selector")
     if faults:
         exact(env, {"MYDS_FIXED_STATE_FAULTS": "1"}, "Explicit fault selector required")
     if "MYDS_FIXED_STATE_POSITION" in env:
@@ -260,6 +261,22 @@ def inspect(report, raw):
             extra = {"commit_at", "retry_ready", "capture_invalid", "capture_ready"} if kind == "fault_execution" else {"checkpoint_buffers_disjoint"}
             if kind == "eos_execution":
                 extra |= {"temporary_eos", "original_eos", "temperature"}
+            shared3_mode = meta["environment"].get("MYDS_DEPTH2_SHARED3")
+            if shared3_mode is not None:
+                extra = extra | {"shared3"}
+                shared = row.get("shared3")
+                require(isinstance(shared, dict) and set(shared) == {"mode", "dense", "gu", "routed"}, "Missing shared3 execution")
+                exact(shared, {"mode": int(shared3_mode)}, "Observed shared3 mode differs")
+                for provider, count in (("dense", 200), ("gu", 40), ("routed", 40)):
+                    values = shared[provider]
+                    fields = {"requests", "encoded", "failures"} | ({"q8_encoded", "q4_encoded"} if provider == "dense" else set())
+                    require(isinstance(values, dict) and set(values) == fields and
+                            all(type(v) is int and v >= 0 for v in values.values()), "Invalid shared3 provider counts")
+                    exact(values, {"requests": count if shared3_mode == "1" else 0,
+                                   "encoded": count if shared3_mode == "1" else 0, "failures": 0}, "Shared3 native execution absent/failed")
+                    if provider == "dense":
+                        require(values["q8_encoded"] + values["q4_encoded"] == values["encoded"] and
+                                (values["q4_encoded"] > 0 if shared3_mode == "1" else values["q4_encoded"] == 0), "Actual shared Q4 absent")
             require(set(row) == EXEC_KEYS | extra, "Native execution schema differs")
             identity = kind, row["arm"], row["keep_count"]
             require(type(row["arm"]) is int and type(row["keep_count"]) is int and identity in native, "Unknown native branch")

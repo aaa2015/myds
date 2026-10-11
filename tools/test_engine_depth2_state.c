@@ -6,6 +6,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "myds_internal.h"
 #include "myds_v41.h"
+#include "myds_v41_moe.h"
 #include "myds_dspark.h"
 #include "myds_server_internal.h"
 #include <errno.h>
@@ -129,6 +130,19 @@ static int export_state(myds_context_t *ctx,const char *label,stream_t *s,myds_s
     CHECK(raw(label,"output","bin",s->bytes,s->n,true));
     fputs("],\"pass\":true}\n",report);fflush(report);free(snap);free(w);return 1;
 }
+static void shared3_counters(void) {
+    if (getenv("MYDS_DEPTH2_SHARED3")) {
+        myds_metal_shared3_counters_t dense; myds_metal_shared3_counters(&dense, false);
+        myds_v41_shared_gu_shared3_counters_t gu; myds_v41_shared_gu_shared3_counters(&gu, false);
+        myds_v41_depth2_routed_shared3_counters_t routed; myds_v41_depth2_routed_shared3_counters(&routed, false);
+        fprintf(report,",\"shared3\":{\"mode\":%d,\"dense\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64
+            ",\"failures\":%" PRIu64 ",\"q8_encoded\":%" PRIu64 ",\"q4_encoded\":%" PRIu64
+            "},\"gu\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64 ",\"failures\":%" PRIu64
+            "},\"routed\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64 ",\"failures\":%" PRIu64 "}}",
+            myds_v41_depth2_shared3_mode(),dense.requests,dense.encoded,dense.failures,dense.q8_encoded,dense.q4_encoded,
+            gu.requests,gu.encoded,gu.failures,routed.requests,routed.encoded,routed.failures);
+    }
+}
 static int request(myds_context_t *ctx,const char *label,const char *prompt,bool spec,
     uint32_t cap,uint32_t cancel_after,uint32_t hit_output,bool continuation,float temperature,
     stream_t *s,myds_stop_reason_t *reason) {
@@ -137,6 +151,8 @@ static int request(myds_context_t *ctx,const char *label,const char *prompt,bool
     CHECK(setenv("MYDS_BATCH2_SPEC",spec?"2":"0",1)==0&&setenv("MYDS_DSPARK_DEPTH",spec?"2":"1",1)==0);
     if(continuation)myds_set_continue_from_cache(ctx,true);
     *s=(stream_t){.ctx=ctx,.cancel_after=cancel_after,.hit_output=hit_output};
+    myds_metal_shared3_counters(NULL,true); myds_v41_shared_gu_shared3_counters(NULL,true);
+    myds_v41_depth2_routed_shared3_counters(NULL,true);
     uint32_t prompt_tokens=0;
     CHECK(myds_generate_bytes_ex(ctx,prompt,stream,s,reason,&prompt_tokens,&s->cancel)==1&&!s->failed);
     fprintf(stderr,"[depth2-engine] %s reason=%d outputs=%u cap=%u cached=%u hits2=%" PRIu64 "\n",label,(int)*reason,s->count,cap,ctx->last_cached_tokens,ctx->decode_stats.depth2_hits2);
@@ -148,9 +164,10 @@ static int request(myds_context_t *ctx,const char *label,const char *prompt,bool
     if(!spec)CHECK(ctx->decode_stats.depth2_calls==0&&ctx->decode_stats.draft_cycles==0);
     fprintf(report,"{\"kind\":\"request\",\"label\":\"%s\",\"spec\":%s,\"cap\":%u,\"cancel_after\":%u,"
         "\"hit_output_cancel\":%u,\"hit_index\":%u,\"continuation\":%s,\"temperature\":%.9g,\"prompt_tokens\":%u,\"cached_tokens\":%u,"
-        "\"prompt_bytes\":%zu,\"prompt_fnv1a64\":\"%016" PRIx64 "\",\"pass\":true}\n",
+        "\"prompt_bytes\":%zu,\"prompt_fnv1a64\":\"%016" PRIx64 "\"",
         label,spec?"true":"false",cap,cancel_after,hit_output,s->hit_index,continuation?"true":"false",temperature,prompt_tokens,ctx->last_cached_tokens,
         strlen(prompt),fnv(prompt,strlen(prompt)));
+    shared3_counters(); fputs(",\"pass\":true}\n",report);
     return export_state(ctx,label,s,*reason);
 }
 /* Compare actual slots1 and2 against full five-slot inference. Poison every
@@ -224,7 +241,9 @@ static int run(const char *model,const char *support) {
     myds_model_t *m=myds_model_load(model);CHECK(m&&m->v41&&m->vocab_size==129280u&&m->dim==DIM);
     char prompt[8192];CHECK(parse_chat_prompt("{\"enable_thinking\":false,\"messages\":[{\"role\":\"user\",\"content\":\"Write twenty numbered practical steps for software performance optimization, explaining each step with a detailed example.\"}]}",prompt,sizeof(prompt)));
     fprintf(report,"{\"kind\":\"metadata\",\"schema_version\":1,\"target\":");string(report,model);fputs(",\"support\":",report);string(report,support);
-    fputs(",\"real_support_loaded\":true,\"capture_mode\":0,\"greedy\":true,\"performance_measurement\":false,\"pairs\":5,\"files_per_state\":18}\n",report);
+    fputs(",\"real_support_loaded\":true,\"capture_mode\":0,\"greedy\":true,\"performance_measurement\":false,\"pairs\":5,\"files_per_state\":18",report);
+    if(getenv("MYDS_DEPTH2_SHARED3")) fprintf(report,",\"shared3_mode\":%d",myds_v41_depth2_shared3_mode());
+    fputs("}\n",report);
     myds_metal_residency_stats_t baseline,stats;
     CHECK(residency("model_baseline",&baseline,NULL,false)&&baseline.active&&baseline.heartbeat_running&&baseline.allocation_count>0);
     for(unsigned c=0;c<5;c++) {
