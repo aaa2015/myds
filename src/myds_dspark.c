@@ -1680,7 +1680,9 @@ static uint32_t dspark_propose_at(myds_dspark_t *ds, myds_context_t *ctx,
                 MYDS_LOG_I("DSpark high-confidence speculative threshold active: threshold=%.2f", high_conf_thresh);
             }
 
-            if (confidence >= high_conf_thresh || margin >= high_conf_margin) {
+            const bool conf_ok = isnan(confidence) ? (high_conf_thresh <= 0.0f) : (confidence >= high_conf_thresh);
+            const bool margin_ok = margin >= high_conf_margin;
+            if (conf_ok || margin_ok) {
                 ds->is_high_confidence = true;
             }
 

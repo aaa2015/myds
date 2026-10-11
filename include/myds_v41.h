@@ -181,6 +181,10 @@ int myds_v41_batch2_projection_probe(myds_metal_buffer_t *out[2],
     myds_v41_batch2_projection_kind_t kind);
 
 /* ── 推测树（Tree-based Speculative Decoding）级联前向与3-Way裁决器 ── */
+/* Experimental: tokens={root,A,B}; A/B occupy the same position+1.
+ * Returns one/two authoritative outputs. Production dispatcher uses this only
+ * with MYDS_TREE_SPEC=1 and native speculation enabled; default remains off.
+ * Borrowed first-state checkpoint in _ex remains valid until the next forward. */
 int myds_v41_forward_tree_spec(myds_context_t *context, const int32_t *tokens,
                                uint32_t position, int32_t *out_tokens);
 
