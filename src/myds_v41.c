@@ -4200,6 +4200,8 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
     }
     v41_batch2_workspace_t *ws = g->batch2_ws;
     int prev_auto_barrier = -1;
+    const bool timed = ctx && ctx->decode_metrics_active && ctx->decode_stats.timing_enabled;
+    const double t_start = timed ? lowkv_now_ms() : 0.0;
 
     static int decode_split = -1;
     if (decode_split < 0) {
@@ -4254,6 +4256,7 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
     CHECK(myds_metal_buffer_write(ws->v_pre[0], 0, init_pre, sizeof(init_pre)));
     CHECK(myds_metal_buffer_write(ws->v_pre[1], 0, init_pre, sizeof(init_pre)));
 
+    const double t_prep = timed ? lowkv_now_ms() : 0.0;
     CHECK(myds_metal_begin_batch());
     prev_auto_barrier = myds_metal_get_auto_barrier();
     static int batch2_auto_barrier = -1;
@@ -4421,7 +4424,9 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
     }
     myds_metal_barrier_buffer(ws->logits_b2);
 
+    const double t_encode = timed ? lowkv_now_ms() : 0.0;
     CHECK(myds_metal_commit_batch());
+    const double t_gpu = timed ? lowkv_now_ms() : 0.0;
 
     /* 5. 权威裁决与状态回滚（Arbitration & Rollback with Precomputed Parallel Head） */
     const float *logits0 = (const float *)myds_metal_buffer_data(ws->v_logits[0]);
@@ -4470,6 +4475,13 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         }
         g->next_position = pos + 2u;
         ctx->pos = pos + 2u;
+        if (timed) {
+            const double t_end = lowkv_now_ms();
+            ctx->decode_stats.batch2_prep_ms += (t_prep - t_start);
+            ctx->decode_stats.batch2_encode_ms += (t_encode - t_prep);
+            ctx->decode_stats.batch2_gpu_ms += (t_gpu - t_encode);
+            ctx->decode_stats.batch2_arb_ms += (t_end - t_gpu);
+        }
         return 2;
     } else {
         /* CASE B: 投机未命中！执行 partial snapshot restore，无损回滚 Token 1，保留 Token 0 */
@@ -4490,6 +4502,13 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         }
         g->next_position = pos + 1u;
         ctx->pos = pos + 1u;
+        if (timed) {
+            const double t_end = lowkv_now_ms();
+            ctx->decode_stats.batch2_prep_ms += (t_prep - t_start);
+            ctx->decode_stats.batch2_encode_ms += (t_encode - t_prep);
+            ctx->decode_stats.batch2_gpu_ms += (t_gpu - t_encode);
+            ctx->decode_stats.batch2_arb_ms += (t_end - t_gpu);
+        }
         return 1;
     }
 

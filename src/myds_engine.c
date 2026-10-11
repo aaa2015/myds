@@ -4170,12 +4170,17 @@ static int myds_generate_internal(myds_context_t *ctx,
                        pld_proposed ? 100.0 * (double)pld_accepted / (double)pld_proposed : 0.0);
         }
         if (ctx->decode_stats.batch2_calls > 0) {
-            MYDS_LOG_I("Batch2 verifier: %llu calls (%llu hits, %llu misses), total=%.1f ms (avg=%.2f ms/call)",
+            MYDS_LOG_I("Batch2 verifier: %llu calls (%llu hits, %llu misses), total=%.1f ms (avg=%.2f ms/call) "
+                       "[prep=%.2f ms, encode=%.2f ms, gpu=%.2f ms, arb=%.2f ms]",
                        (unsigned long long)ctx->decode_stats.batch2_calls,
                        (unsigned long long)ctx->decode_stats.batch2_hits,
                        (unsigned long long)ctx->decode_stats.batch2_misses,
                        ctx->decode_stats.verify_ms,
-                       ctx->decode_stats.batch2_calls ? ctx->decode_stats.verify_ms / ctx->decode_stats.batch2_calls : 0.0);
+                       ctx->decode_stats.batch2_calls ? ctx->decode_stats.verify_ms / ctx->decode_stats.batch2_calls : 0.0,
+                       ctx->decode_stats.batch2_calls ? ctx->decode_stats.batch2_prep_ms / ctx->decode_stats.batch2_calls : 0.0,
+                       ctx->decode_stats.batch2_calls ? ctx->decode_stats.batch2_encode_ms / ctx->decode_stats.batch2_calls : 0.0,
+                       ctx->decode_stats.batch2_calls ? ctx->decode_stats.batch2_gpu_ms / ctx->decode_stats.batch2_calls : 0.0,
+                       ctx->decode_stats.batch2_calls ? ctx->decode_stats.batch2_arb_ms / ctx->decode_stats.batch2_calls : 0.0);
         }
         if (pld_snap) free(pld_snap);
     } else {

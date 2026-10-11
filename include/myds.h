@@ -89,6 +89,7 @@ typedef struct {
     uint64_t pld_queries, pld_cycles, pld_proposed, pld_accepted;
     uint64_t output_tokens, cycle_count;
     double draft_ms, verify_ms, rollback_ms, snapshot_ms, pld_ms;
+    double batch2_prep_ms, batch2_encode_ms, batch2_gpu_ms, batch2_arb_ms;
     bool timing_enabled;
     uint32_t recorded_cycles;
 } myds_decode_stats_t;
