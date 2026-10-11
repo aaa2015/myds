@@ -3757,6 +3757,7 @@ static int v41_batch2_attention_token(myds_context_t *ctx, uint32_t il, uint32_t
     const uint32_t nraw = pos + 1u < V41_WINDOW ? pos + 1u : V41_WINDOW;
     if (!myds_v41_gpu_qkv_finish(q, kv, g->window[il], pos, compressed)) return 0;
     myds_metal_barrier_buffer(g->window[il]);
+    myds_metal_barrier_buffer(q);
     const bool ordinary_allowed = !myds_trace_active();
     if (!publish_and_select_batch2(ctx, il, pos, x_norm, qr_norm,
                                    selected, block_mask, block_mask, ordinary_allowed)) return 0;
@@ -3764,6 +3765,7 @@ static int v41_batch2_attention_token(myds_context_t *ctx, uint32_t il, uint32_t
         g->window[il], nraw, (pos + 1u - nraw) % V41_WINDOW,
         count ? g->compressed[owner_for(il)] : NULL, count ? (selected ? selected : g->selected) : NULL,
         count, top, g->gpu)) return 0;
+    myds_metal_barrier_buffer(heads);
     if (!myds_v41_gpu_rope_round(heads, V41_HEAD_DIM, V41_HEADS,
                                  pos, compressed, true)) return 0;
     /* The next token writes the same window and reuses attention scratch. */
@@ -4288,6 +4290,7 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         /* HC Mix */
         CHECK(myds_metal_v41_hc_mix(ws->v_attn_split[0], ws->v_residual[0], l->attn_fn, GGML_TYPE_F16, l->attn_scale, l->attn_base, ws->v_flat_norm[0], ws->v_mix[0], V41_DIM, m->norm_eps, v->hc_eps));
         CHECK(myds_metal_v41_hc_mix(ws->v_attn_split[1], ws->v_residual[1], l->attn_fn, GGML_TYPE_F16, l->attn_scale, l->attn_base, ws->v_flat_norm[1], ws->v_mix[1], V41_DIM, m->norm_eps, v->hc_eps));
+        myds_metal_barrier_buffer(ws->attn_split_b2);
 
         /* Retain the exact decode reduction/BF16 boundary per row until a
          * dedicated batched kernel has passed full-model parity. */
@@ -4302,6 +4305,7 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_v41_rmsnorm(ws->v_kv_act[0], ws->v_kv_act[0], base->attn_kv_a_norm, 512, m->norm_eps, true));
         CHECK(myds_metal_v41_rmsnorm(ws->v_kv_act[1], ws->v_kv_act[1], base->attn_kv_a_norm, 512, m->norm_eps, true));
         myds_metal_barrier_buffer(ws->qr_norm_b2);
+        myds_metal_barrier_buffer(ws->kv_act_b2);
 
         CHECK(myds_v41_batch2_projection_probe(ws->v_q, base->attn_q_b, ws->v_qr_norm, V41_HEADS * 512, 1280, base->attn_q_b_type, MYDS_V41_BATCH2_QKV));
         myds_metal_barrier_buffer(ws->q_b2);
@@ -4329,8 +4333,9 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
 
         /* HC Expand + FFN Norm */
         CHECK(myds_metal_v41_hc_expand(ws->v_after_attn[0], ws->v_attn_out[0], ws->v_residual[0], ws->v_attn_split[0], V41_DIM));
-        CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_ffn_norm[0], ws->v_x[0], ws->v_after_attn[0], ws->v_attn_split[0], base->ffn_norm, V41_DIM, m->norm_eps, true));
         CHECK(myds_metal_v41_hc_expand(ws->v_after_attn[1], ws->v_attn_out[1], ws->v_residual[1], ws->v_attn_split[1], V41_DIM));
+        myds_metal_barrier_buffer(ws->after_attn_b2);
+        CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_ffn_norm[0], ws->v_x[0], ws->v_after_attn[0], ws->v_attn_split[0], base->ffn_norm, V41_DIM, m->norm_eps, true));
         CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_ffn_norm[1], ws->v_x[1], ws->v_after_attn[1], ws->v_attn_split[1], base->ffn_norm, V41_DIM, m->norm_eps, true));
         myds_metal_barrier_buffer(ws->ffn_norm_b2);
 
@@ -4383,11 +4388,12 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
 
         /* MoE 累加与 HC Expand */
         CHECK(myds_metal_v41_hc_mix(ws->v_ffn_split[0], ws->v_after_attn[0], l->ffn_fn, GGML_TYPE_F16, l->ffn_scale, l->ffn_base, ws->v_flat_norm[0], ws->v_mix[0], V41_DIM, m->norm_eps, v->hc_eps));
-        CHECK(myds_metal_v41_moe_add_hc_expand(ws->v_residual[0], ws->v_ffn_out[0], ws->v_moe_out[0], ws->v_shared_out[0], ws->v_after_attn[0], ws->v_ffn_split[0], V41_DIM));
-
         CHECK(myds_metal_v41_hc_mix(ws->v_ffn_split[1], ws->v_after_attn[1], l->ffn_fn, GGML_TYPE_F16, l->ffn_scale, l->ffn_base, ws->v_flat_norm[1], ws->v_mix[1], V41_DIM, m->norm_eps, v->hc_eps));
+        myds_metal_barrier_buffer(ws->ffn_split_b2);
+        CHECK(myds_metal_v41_moe_add_hc_expand(ws->v_residual[0], ws->v_ffn_out[0], ws->v_moe_out[0], ws->v_shared_out[0], ws->v_after_attn[0], ws->v_ffn_split[0], V41_DIM));
         CHECK(myds_metal_v41_moe_add_hc_expand(ws->v_residual[1], ws->v_ffn_out[1], ws->v_moe_out[1], ws->v_shared_out[1], ws->v_after_attn[1], ws->v_ffn_split[1], V41_DIM));
         myds_metal_barrier_buffer(ws->residual_b2);
+        myds_metal_barrier_buffer(ws->ffn_split_b2);
 
         if (ctx->dspark && (il == 37 || il == 38 || il == 39) && ctx->dspark->hc_mean_weights) {
             int slot = (il == 37) ? 0 : ((il == 38) ? 1 : 2);

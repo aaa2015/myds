@@ -392,6 +392,138 @@ static int test_batch2_shared_swiglu(void) {
     return 1;
 }
 
+static void iq2_fill(myds_metal_buffer_t *b, unsigned seed) {
+    uint8_t *p = (uint8_t *)myds_metal_buffer_data(b);
+    size_t bytes = myds_metal_buffer_size(b);
+    for (size_t block = 0; block < bytes / 66; block++) {
+        uint16_t d = (uint16_t)(0x1400u + (block % 4u) * 0x100u);
+        memcpy(p + block * 66, &d, 2);
+        for (size_t j = 0; j < 64; j++) p[block * 66 + 2 + j] = (uint8_t)(block * 37u + j * 29u + seed);
+    }
+}
+
+static void q2_fill(myds_metal_buffer_t *b, unsigned seed) {
+    uint8_t *p = (uint8_t *)myds_metal_buffer_data(b);
+    size_t bytes = myds_metal_buffer_size(b);
+    for (size_t block = 0; block < bytes / 84; block++) {
+        for (size_t j = 0; j < 16; j++) p[block * 84 + j] = (uint8_t)(1u + (block * 13u + j * 17u + seed) % 255u);
+        for (size_t j = 0; j < 64; j++) p[block * 84 + 16 + j] = (uint8_t)(block * 23u + j * 41u + seed);
+        uint16_t d = (uint16_t)(0x1c00u + (block % 3u) * 0x80u), m = (uint16_t)(0x1000u + (block % 5u) * 0x80u);
+        memcpy(p + block * 84 + 80, &d, 2);
+        memcpy(p + block * 84 + 82, &m, 2);
+    }
+}
+
+static int test_batch2_routed_moe(void) {
+    printf("[TEST] Batch-2 Routed MoE (n_tok=2 vs n_tok=1x2, deduplicated IQ2 SwiGLU + Q2_K Down)...\n");
+    const uint32_t dim = 5120;
+    const uint32_t expert_dim = 2304;
+    const uint32_t active = 6;
+    const uint32_t experts = 14;
+
+    const size_t gate_bytes = (size_t)experts * expert_dim * (dim / 256u) * 66u;
+    const size_t down_bytes = (size_t)experts * dim * (expert_dim / 256u) * 84u;
+
+    struct guarded gate, up, down;
+    CHECK(guarded_create(&gate, gate_bytes));
+    CHECK(guarded_create(&up, gate_bytes));
+    CHECK(guarded_create(&down, down_bytes));
+
+    iq2_fill(gate.view, 17);
+    iq2_fill(up.view, 71);
+    q2_fill(down.view, 29);
+
+    struct guarded x_seq0, x_seq1, x_b2;
+    CHECK(guarded_create(&x_seq0, dim * sizeof(float)));
+    CHECK(guarded_create(&x_seq1, dim * sizeof(float)));
+    CHECK(guarded_create(&x_b2, 2 * dim * sizeof(float)));
+    fill_act(x_seq0.view, 43);
+    fill_act(x_seq1.view, 97);
+    memcpy((float *)myds_metal_buffer_data(x_b2.view), myds_metal_buffer_data(x_seq0.view), dim * sizeof(float));
+    memcpy((float *)myds_metal_buffer_data(x_b2.view) + dim, myds_metal_buffer_data(x_seq1.view), dim * sizeof(float));
+
+    /* Token 0: {11, 3, 0, 12, 5, 7}, Token 1: {3, 0, 12, 5, 7, 2} - 5 shared experts! */
+    const int32_t ids0[6] = {11, 3, 0, 12, 5, 7};
+    const int32_t ids1[6] = {3, 0, 12, 5, 7, 2};
+    const float w0[6] = {0.3f, 0.25f, 0.2f, 0.15f, 0.07f, 0.03f};
+    const float w1[6] = {0.28f, 0.24f, 0.18f, 0.16f, 0.08f, 0.06f};
+
+    struct guarded sel_seq0, sel_seq1, sel_b2;
+    struct guarded w_seq0, w_seq1, w_b2;
+    CHECK(guarded_create(&sel_seq0, active * sizeof(int32_t)));
+    CHECK(guarded_create(&sel_seq1, active * sizeof(int32_t)));
+    CHECK(guarded_create(&sel_b2, 2 * active * sizeof(int32_t)));
+    CHECK(guarded_create(&w_seq0, active * sizeof(float)));
+    CHECK(guarded_create(&w_seq1, active * sizeof(float)));
+    CHECK(guarded_create(&w_b2, 2 * active * sizeof(float)));
+
+    memcpy(myds_metal_buffer_data(sel_seq0.view), ids0, active * sizeof(int32_t));
+    memcpy(myds_metal_buffer_data(sel_seq1.view), ids1, active * sizeof(int32_t));
+    memcpy(myds_metal_buffer_data(sel_b2.view), ids0, active * sizeof(int32_t));
+    memcpy((int32_t *)myds_metal_buffer_data(sel_b2.view) + active, ids1, active * sizeof(int32_t));
+
+    memcpy(myds_metal_buffer_data(w_seq0.view), w0, active * sizeof(float));
+    memcpy(myds_metal_buffer_data(w_seq1.view), w1, active * sizeof(float));
+    memcpy(myds_metal_buffer_data(w_b2.view), w0, active * sizeof(float));
+    memcpy((float *)myds_metal_buffer_data(w_b2.view) + active, w1, active * sizeof(float));
+
+    /* Scratch buffers */
+    struct guarded sg_seq, su_seq, smid_seq, sdown_seq, out_seq0, out_seq1;
+    CHECK(guarded_create(&sg_seq, active * expert_dim * sizeof(float)));
+    CHECK(guarded_create(&su_seq, active * expert_dim * sizeof(float)));
+    CHECK(guarded_create(&smid_seq, active * expert_dim * sizeof(float)));
+    CHECK(guarded_create(&sdown_seq, active * dim * sizeof(float)));
+    CHECK(guarded_create(&out_seq0, dim * sizeof(float)));
+    CHECK(guarded_create(&out_seq1, dim * sizeof(float)));
+
+    struct guarded sg_b2, su_b2, smid_b2, sdown_b2, out_b2;
+    CHECK(guarded_create(&sg_b2, 2 * active * expert_dim * sizeof(float)));
+    CHECK(guarded_create(&su_b2, 2 * active * expert_dim * sizeof(float)));
+    CHECK(guarded_create(&smid_b2, 2 * active * expert_dim * sizeof(float)));
+    CHECK(guarded_create(&sdown_b2, 2 * active * dim * sizeof(float)));
+    CHECK(guarded_create(&out_b2, 2 * dim * sizeof(float)));
+
+    /* 1. Sequential execution (n_tok = 1 for each token) */
+    CHECK(myds_metal_begin_batch());
+    CHECK(myds_metal_routed_moe_batch(out_seq0.view, x_seq0.view, gate.view, up.view, down.view,
+        sel_seq0.view, w_seq0.view, sg_seq.view, su_seq.view, smid_seq.view, sdown_seq.view,
+        dim, expert_dim, experts, active, 1, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_K, 10.0f));
+    CHECK(myds_metal_commit_batch());
+
+    CHECK(myds_metal_begin_batch());
+    CHECK(myds_metal_routed_moe_batch(out_seq1.view, x_seq1.view, gate.view, up.view, down.view,
+        sel_seq1.view, w_seq1.view, sg_seq.view, su_seq.view, smid_seq.view, sdown_seq.view,
+        dim, expert_dim, experts, active, 1, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_K, 10.0f));
+    CHECK(myds_metal_commit_batch());
+
+    /* 2. Batch-2 execution (n_tok = 2, triggering deduplication kernels) */
+    CHECK(myds_metal_begin_batch());
+    CHECK(myds_metal_routed_moe_batch(out_b2.view, x_b2.view, gate.view, up.view, down.view,
+        sel_b2.view, w_b2.view, sg_b2.view, su_b2.view, smid_b2.view, sdown_b2.view,
+        dim, expert_dim, experts, active, 2, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_K, 10.0f));
+    CHECK(myds_metal_commit_batch());
+
+    /* 3. Verify 100% bit-exact parity between Sequential and Batch-2 */
+    myds_metal_buffer_t *out_b2_tok0 = myds_metal_buffer_sub_view(out_b2.view, 0, dim * sizeof(float));
+    myds_metal_buffer_t *out_b2_tok1 = myds_metal_buffer_sub_view(out_b2.view, dim * sizeof(float), dim * sizeof(float));
+    CHECK(verify_exact(out_seq0.view, out_b2_tok0, dim));
+    CHECK(verify_exact(out_seq1.view, out_b2_tok1, dim));
+    myds_metal_buffer_free(out_b2_tok0);
+    myds_metal_buffer_free(out_b2_tok1);
+
+    guarded_free(&gate); guarded_free(&up); guarded_free(&down);
+    guarded_free(&x_seq0); guarded_free(&x_seq1); guarded_free(&x_b2);
+    guarded_free(&sel_seq0); guarded_free(&sel_seq1); guarded_free(&sel_b2);
+    guarded_free(&w_seq0); guarded_free(&w_seq1); guarded_free(&w_b2);
+    guarded_free(&sg_seq); guarded_free(&su_seq); guarded_free(&smid_seq); guarded_free(&sdown_seq);
+    guarded_free(&out_seq0); guarded_free(&out_seq1);
+    guarded_free(&sg_b2); guarded_free(&su_b2); guarded_free(&smid_b2); guarded_free(&sdown_b2);
+    guarded_free(&out_b2);
+
+    printf("  [PASS] Batch-2 Routed MoE 100%% bit-exact!\n");
+    return 1;
+}
+
 int main(void) {
     printf("\n=======================================================\n");
     printf("   Phase 3: Metal Per-Layer Batch-2 Parity Test Suite  \n");
@@ -435,6 +567,9 @@ int main(void) {
 
     // 10. Batch-2 Shared Gate+Up SwiGLU
     if (!test_batch2_shared_swiglu()) return 1;
+
+    // 11. Batch-2 Routed MoE (Deduplicated SwiGLU + Down)
+    if (!test_batch2_routed_moe()) return 1;
 
     printf("\n=== ALL PHASE 3 BATCH-2 PARITY TESTS PASSED CLEANLY! ===\n\n");
     return 0;

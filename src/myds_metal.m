@@ -49,6 +49,16 @@ static id<MTLComputePipelineState> g_pso_moe_swiglu_weight = nil;
 static id<MTLComputePipelineState> g_pso_moe_sum6 = nil;
 static id<MTLComputePipelineState> g_pso_moe_pair_swiglu_iq2_xxs = nil;
 static id<MTLComputePipelineState> g_pso_moe_sum6_q2_k = nil;
+static id<MTLComputePipelineState> g_pso_moe_pair_swiglu_batch_iq2_xxs = nil;
+static id<MTLComputePipelineState> g_pso_moe_sum6_batch_q2_k = nil;
+static inline bool get_moe_batch_dedup_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("MYDS_MOE_BATCH_DEDUP");
+        cached = (!v || strcmp(v, "0") != 0) ? 1 : 0;
+    }
+    return cached == 1;
+}
 static id<MTLComputePipelineState> g_pso_moe_mm_map0_ne20_6 = nil;
 static id<MTLComputePipelineState> g_pso_moe_mm_iq2_pair_swiglu_f16 = nil;
 static id<MTLComputePipelineState> g_pso_moe_mm_q2_k_f16 = nil;
@@ -1443,6 +1453,31 @@ int myds_metal_init(const char *shader_dir) {
             printf("myds_metal: kernel_mul_mv_id_q2_K_sum6_f32 fn error: %s\n", [[pso_err localizedDescription] UTF8String]);
         }
 
+        pso_err = nil;
+        NSString *iq2_pair_batch_name = moe_iq2_constant_lut ?
+            @"kernel_mul_mv_id_iq2_xxs_pair_swiglu_batch_constant_lut_f32" :
+            @"kernel_mul_mv_id_iq2_xxs_pair_swiglu_batch_f32";
+        fn = [g_library newFunctionWithName:iq2_pair_batch_name constantValues:moe_mv_id_constants error:&pso_err];
+        if (fn) {
+            g_pso_moe_pair_swiglu_batch_iq2_xxs = [g_device newComputePipelineStateWithFunction:fn error:&pso_err];
+            if (!g_pso_moe_pair_swiglu_batch_iq2_xxs) {
+                printf("myds_metal: %s PSO error: %s\n", [iq2_pair_batch_name UTF8String], [[pso_err localizedDescription] UTF8String]);
+            }
+        } else {
+            printf("myds_metal: %s fn error: %s\n", [iq2_pair_batch_name UTF8String], [[pso_err localizedDescription] UTF8String]);
+        }
+
+        pso_err = nil;
+        fn = [g_library newFunctionWithName:@"kernel_mul_mv_id_q2_K_sum6_batch_f32" constantValues:moe_down_constants error:&pso_err];
+        if (fn) {
+            g_pso_moe_sum6_batch_q2_k = [g_device newComputePipelineStateWithFunction:fn error:&pso_err];
+            if (!g_pso_moe_sum6_batch_q2_k) {
+                printf("myds_metal: kernel_mul_mv_id_q2_K_sum6_batch_f32 PSO error: %s\n", [[pso_err localizedDescription] UTF8String]);
+            }
+        } else {
+            printf("myds_metal: kernel_mul_mv_id_q2_K_sum6_batch_f32 fn error: %s\n", [[pso_err localizedDescription] UTF8String]);
+        }
+
         fn = [g_library newFunctionWithName:@"kernel_mul_mm_id_map0_ne20_6"];
         if (fn) {
             g_pso_moe_mm_map0_ne20_6 = [g_device newComputePipelineStateWithFunction:fn error:nil];
@@ -1667,6 +1702,8 @@ void myds_metal_cleanup(void) {
     g_pso_moe_sum6 = nil;
     g_pso_moe_pair_swiglu_iq2_xxs = nil;
     g_pso_moe_sum6_q2_k = nil;
+    g_pso_moe_pair_swiglu_batch_iq2_xxs = nil;
+    g_pso_moe_sum6_batch_q2_k = nil;
     g_pso_moe_q2_sum_cache_prepare = nil;
     g_pso_moe_q2_sum6_cached = nil;
     g_moe_q2_sum_cache_buffer = nil;
@@ -4538,42 +4575,88 @@ int myds_metal_routed_moe_batch(
         };
 
         if (g_pso_moe_pair_swiglu_iq2_xxs && g_pso_moe_sum6_q2_k) {
-            /* Fused Gate + Up + SwiGLU + Scaling dispatch (IQ2_XXS) across all tokens */
-            [enc setComputePipelineState:g_pso_moe_pair_swiglu_iq2_xxs];
-            [enc setBytes:&gate_args length:sizeof(gate_args) atIndex:0];
-            [enc setBytes:&swiglu_args length:sizeof(swiglu_args) atIndex:1];
-            [enc setBuffer:gate_exps->mtl_buf offset:gate_exps->offset atIndex:2];
-            [enc setBuffer:up_exps->mtl_buf offset:up_exps->offset atIndex:3];
-            [enc setBuffer:x_in->mtl_buf offset:x_in->offset atIndex:4];
-            [enc setBuffer:scratch_gate->mtl_buf offset:scratch_gate->offset atIndex:5];
-            [enc setBuffer:scratch_up->mtl_buf offset:scratch_up->offset atIndex:6];
-            [enc setBuffer:scratch_mid->mtl_buf offset:scratch_mid->offset atIndex:7];
-            [enc setBuffer:selected_ids->mtl_buf offset:selected_ids->offset atIndex:8];
-            [enc setBuffer:selected_weights->mtl_buf offset:selected_weights->offset atIndex:9];
-            [enc setThreadgroupMemoryLength:smem_iq2 atIndex:0];
-            metal_dispatch(enc, "fused_moe_swiglu", MTLSizeMake(row_groups_gate, 1, pairs),
-                MTLSizeMake(32, nsg_gate, 1));
-            if (g_auto_barrier) {
-                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            } else {
-                id<MTLResource> res = scratch_mid->mtl_buf;
-                [enc memoryBarrierWithResources:&res count:1];
+            bool use_batch_dedup = (n_tok == 2) && get_moe_batch_dedup_enabled() &&
+                                   g_pso_moe_pair_swiglu_batch_iq2_xxs && g_pso_moe_sum6_batch_q2_k;
+            static bool logged_moe_dedup = false;
+            if (!logged_moe_dedup && use_batch_dedup) {
+                MYDS_LOG_I("MoE batch-2 path: DEDUP (2-token expert weight sharing) — active");
+                logged_moe_dedup = true;
             }
 
-            /* Fused Down + Sum6 direct accumulation dispatch (Q2_K) across all tokens */
-            [enc setComputePipelineState:g_pso_moe_sum6_q2_k];
-            [enc setBytes:&down_args length:sizeof(down_args) atIndex:0];
-            [enc setBuffer:down_exps->mtl_buf offset:down_exps->offset atIndex:1];
-            [enc setBuffer:scratch_mid->mtl_buf offset:scratch_mid->offset atIndex:2];
-            [enc setBuffer:moe_out->mtl_buf offset:moe_out->offset atIndex:3];
-            [enc setBuffer:selected_ids->mtl_buf offset:selected_ids->offset atIndex:4];
-            [enc setBuffer:moe_out->mtl_buf offset:moe_out->offset atIndex:5];
-            metal_dispatch(enc, "fused_moe_sum6_q2_k", MTLSizeMake(row_groups_down, (NSUInteger)n_tok, 1),
-                MTLSizeMake(32, nsg_down, 1));
+            if (use_batch_dedup) {
+                /* Dedup Batch-2 Gate + Up + SwiGLU + Scaling dispatch (IQ2_XXS) across 2 tokens */
+                [enc setComputePipelineState:g_pso_moe_pair_swiglu_batch_iq2_xxs];
+                [enc setBytes:&gate_args length:sizeof(gate_args) atIndex:0];
+                [enc setBytes:&swiglu_args length:sizeof(swiglu_args) atIndex:1];
+                [enc setBuffer:gate_exps->mtl_buf offset:gate_exps->offset atIndex:2];
+                [enc setBuffer:up_exps->mtl_buf offset:up_exps->offset atIndex:3];
+                [enc setBuffer:x_in->mtl_buf offset:x_in->offset atIndex:4];
+                [enc setBuffer:scratch_gate->mtl_buf offset:scratch_gate->offset atIndex:5];
+                [enc setBuffer:scratch_up->mtl_buf offset:scratch_up->offset atIndex:6];
+                [enc setBuffer:scratch_mid->mtl_buf offset:scratch_mid->offset atIndex:7];
+                [enc setBuffer:selected_ids->mtl_buf offset:selected_ids->offset atIndex:8];
+                [enc setBuffer:selected_weights->mtl_buf offset:selected_weights->offset atIndex:9];
+                [enc setThreadgroupMemoryLength:smem_iq2 atIndex:0];
+                metal_dispatch(enc, "fused_moe_swiglu_batch", MTLSizeMake(row_groups_gate, 1, pairs),
+                    MTLSizeMake(32, nsg_gate, 1));
+                if (g_auto_barrier) {
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                } else {
+                    id<MTLResource> res = scratch_mid->mtl_buf;
+                    [enc memoryBarrierWithResources:&res count:1];
+                }
+
+                /* Dedup Batch-2 Down + Sum6 direct accumulation dispatch (Q2_K) across 2 tokens */
+                [enc setComputePipelineState:g_pso_moe_sum6_batch_q2_k];
+                [enc setBytes:&down_args length:sizeof(down_args) atIndex:0];
+                [enc setBuffer:down_exps->mtl_buf offset:down_exps->offset atIndex:1];
+                [enc setBuffer:scratch_mid->mtl_buf offset:scratch_mid->offset atIndex:2];
+                [enc setBuffer:moe_out->mtl_buf offset:moe_out->offset atIndex:3];
+                [enc setBuffer:selected_ids->mtl_buf offset:selected_ids->offset atIndex:4];
+                [enc setBuffer:moe_out->mtl_buf offset:moe_out->offset atIndex:5];
+                metal_dispatch(enc, "fused_moe_sum6_batch_q2_k", MTLSizeMake(row_groups_down, 1, 1),
+                    MTLSizeMake(32, nsg_down, 1));
+            } else {
+                /* Fused Gate + Up + SwiGLU + Scaling dispatch (IQ2_XXS) across all tokens */
+                [enc setComputePipelineState:g_pso_moe_pair_swiglu_iq2_xxs];
+                [enc setBytes:&gate_args length:sizeof(gate_args) atIndex:0];
+                [enc setBytes:&swiglu_args length:sizeof(swiglu_args) atIndex:1];
+                [enc setBuffer:gate_exps->mtl_buf offset:gate_exps->offset atIndex:2];
+                [enc setBuffer:up_exps->mtl_buf offset:up_exps->offset atIndex:3];
+                [enc setBuffer:x_in->mtl_buf offset:x_in->offset atIndex:4];
+                [enc setBuffer:scratch_gate->mtl_buf offset:scratch_gate->offset atIndex:5];
+                [enc setBuffer:scratch_up->mtl_buf offset:scratch_up->offset atIndex:6];
+                [enc setBuffer:scratch_mid->mtl_buf offset:scratch_mid->offset atIndex:7];
+                [enc setBuffer:selected_ids->mtl_buf offset:selected_ids->offset atIndex:8];
+                [enc setBuffer:selected_weights->mtl_buf offset:selected_weights->offset atIndex:9];
+                [enc setThreadgroupMemoryLength:smem_iq2 atIndex:0];
+                metal_dispatch(enc, "fused_moe_swiglu", MTLSizeMake(row_groups_gate, 1, pairs),
+                    MTLSizeMake(32, nsg_gate, 1));
+                if (g_auto_barrier) {
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                } else {
+                    id<MTLResource> res = scratch_mid->mtl_buf;
+                    [enc memoryBarrierWithResources:&res count:1];
+                }
+
+                /* Fused Down + Sum6 direct accumulation dispatch (Q2_K) across all tokens */
+                [enc setComputePipelineState:g_pso_moe_sum6_q2_k];
+                [enc setBytes:&down_args length:sizeof(down_args) atIndex:0];
+                [enc setBuffer:down_exps->mtl_buf offset:down_exps->offset atIndex:1];
+                [enc setBuffer:scratch_mid->mtl_buf offset:scratch_mid->offset atIndex:2];
+                [enc setBuffer:moe_out->mtl_buf offset:moe_out->offset atIndex:3];
+                [enc setBuffer:selected_ids->mtl_buf offset:selected_ids->offset atIndex:4];
+                [enc setBuffer:moe_out->mtl_buf offset:moe_out->offset atIndex:5];
+                metal_dispatch(enc, "fused_moe_sum6_q2_k", MTLSizeMake(row_groups_down, (NSUInteger)n_tok, 1),
+                    MTLSizeMake(32, nsg_down, 1));
+            }
 
             if (g_batch_cb) {
                 if (g_auto_barrier) {
                     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                } else {
+                    id<MTLResource> res = moe_out->mtl_buf;
+                    [enc memoryBarrierWithResources:&res count:1];
                 }
             } else {
                 [enc endEncoding];
