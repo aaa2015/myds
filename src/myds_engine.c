@@ -3663,13 +3663,24 @@ static int myds_generate_internal(myds_context_t *ctx,
                 }
                 if (ctx->dspark && !ctx->decode_pld_candidate && (s_spec_diag_enabled || s_spec_diag_count < 15)) {
                     s_spec_diag_count++;
-                    size_t cand_len = 0, truth_len = 0;
+                    size_t cand_len = 0, cand_b_len = 0, truth_len = 0;
                     const char *cand_str = myds_tokenizer_decode_bytes(m->tokenizer, cand_a, &cand_len);
+                    const char *cand_b_str = (cand_b >= 0 && cand_b != cand_a) ? myds_tokenizer_decode_bytes(m->tokenizer, cand_b, &cand_b_len) : NULL;
                     const char *truth_str = myds_tokenizer_decode_bytes(m->tokenizer, out_tokens[0], &truth_len);
-                    MYDS_LOG_I("[dspark-spec] step=%u cand=%d ('%.*s') truth=%d ('%.*s') -> %s",
-                               step, cand_a, (int)(cand_str ? cand_len : 0), cand_str ? cand_str : "",
-                               out_tokens[0], (int)(truth_str ? truth_len : 0), truth_str ? truth_str : "",
-                               matched ? "ACCEPT" : "REJECT");
+                    if (cand_b_str) {
+                        MYDS_LOG_I("[dspark-spec] step=%u cand_a=%d ('%.*s') cand_b=%d ('%.*s') truth=%d ('%.*s') -> %s (%s)",
+                                   step,
+                                   cand_a, (int)cand_len, cand_str ? cand_str : "",
+                                   cand_b, (int)cand_b_len, cand_b_str,
+                                   out_tokens[0], (int)truth_len, truth_str ? truth_str : "",
+                                   matched ? "ACCEPT" : "REJECT",
+                                   matched ? (out_tokens[0] == cand_a ? "hit:a" : "hit:b") : "miss");
+                    } else {
+                        MYDS_LOG_I("[dspark-spec] step=%u cand=%d ('%.*s') truth=%d ('%.*s') -> %s",
+                                   step, cand_a, (int)(cand_str ? cand_len : 0), cand_str ? cand_str : "",
+                                   out_tokens[0], (int)(truth_str ? truth_len : 0), truth_str ? truth_str : "",
+                                   matched ? "ACCEPT" : "REJECT");
+                    }
                 }
                 if (matched) {
                     if (accepted_from_pld) ctx->decode_stats.pld_accepted++;

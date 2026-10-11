@@ -207,21 +207,48 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
     ds->num_experts_per_tok = kexp;
     ds->current_seed_token = -1;
 
-    // Target capture layer ids for DeepSeek-V4.1: load from GGUF metadata if available, defaulting to {36, 37, 38}
-    const gguf_kv_t *kv_cap = gguf_find_key(gguf, "deepseek41-dflash-draft.dflash.capture_layer_ids");
-    if (!kv_cap) kv_cap = gguf_find_key(gguf, "dflash.capture_layer_ids");
-    if (!kv_cap) kv_cap = gguf_find_key(gguf, "dspark.capture_layer_ids");
-    if (!kv_cap) kv_cap = gguf_find_key(gguf, "dspark.target_layers");
-    if (kv_cap && kv_cap->type == GGUF_TYPE_ARRAY && kv_cap->value.val_arr.count >= MYDS_DSPARK_TARGET_LAYERS &&
-        (kv_cap->value.val_arr.elem_type == GGUF_TYPE_UINT32 || kv_cap->value.val_arr.elem_type == GGUF_TYPE_INT32)) {
+    // Target capture layer ids for DeepSeek-V4.1: load from GGUF metadata if available, defaulting to {37, 38, 39}
+    static const char *const target_layer_keys[] = {
+        "deepseek41-dflash-draft.dflash.target_layer_ids",
+        "dspark.target_layer_ids",
+        "deepseek4.dspark.target_layer_ids",
+        "deepseek4.dspark_target_layer_ids",
+        "dflash.target_layer_ids",
+        "dspark.target_layers",
+        "deepseek41-dflash-draft.dflash.capture_layer_ids",
+        "dflash.capture_layer_ids",
+        "dspark.capture_layer_ids",
+    };
+    const gguf_kv_t *kv_cap = NULL;
+    for (size_t k = 0; k < sizeof(target_layer_keys) / sizeof(target_layer_keys[0]); k++) {
+        kv_cap = gguf_find_key(gguf, target_layer_keys[k]);
+        if (kv_cap && kv_cap->type == GGUF_TYPE_ARRAY && kv_cap->value.val_arr.count >= MYDS_DSPARK_TARGET_LAYERS &&
+            (kv_cap->value.val_arr.elem_type == GGUF_TYPE_UINT32 || kv_cap->value.val_arr.elem_type == GGUF_TYPE_INT32)) {
+            break;
+        }
+        kv_cap = NULL;
+    }
+
+    if (kv_cap) {
         const uint32_t *arr = (const uint32_t *)kv_cap->value.val_arr.data;
         for (int i = 0; i < MYDS_DSPARK_TARGET_LAYERS; i++) {
             ds->target_layers[i] = arr[i];
         }
     } else {
-        ds->target_layers[0] = 36;
-        ds->target_layers[1] = 37;
-        ds->target_layers[2] = 38;
+        ds->target_layers[0] = 37;
+        ds->target_layers[1] = 38;
+        ds->target_layers[2] = 39;
+    }
+
+    const char *env_layers = getenv("MYDS_DSPARK_TARGET_LAYERS");
+    if (env_layers && *env_layers) {
+        unsigned l0 = 0, l1 = 0, l2 = 0;
+        if (sscanf(env_layers, "%u,%u,%u", &l0, &l1, &l2) == 3) {
+            ds->target_layers[0] = l0;
+            ds->target_layers[1] = l1;
+            ds->target_layers[2] = l2;
+            MYDS_LOG_I("dspark: target_layers overridden by env to {%u, %u, %u}", l0, l1, l2);
+        }
     }
     MYDS_LOG_I("dspark: capture_layers = {%u, %u, %u}",
                ds->target_layers[0], ds->target_layers[1], ds->target_layers[2]);
@@ -1316,6 +1343,30 @@ uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t las
             ds->draft_tree_tokens[1] = best_token2;
             ds->draft_tree_scores[1] = best_score2;
             ds->draft_tree_count = 2;
+
+            static int s_prop_diag_count = 0;
+            static int s_prop_diag_enabled = -1;
+            if (s_prop_diag_enabled < 0) {
+                const char *env = getenv("MYDS_DSPARK_DEBUG");
+                s_prop_diag_enabled = env ? atoi(env) : 0;
+            }
+            if (s_prop_diag_enabled || s_prop_diag_count < 15) {
+                s_prop_diag_count++;
+                int32_t neural_cand = -1;
+                float neural_score = -INFINITY;
+                if (base_logits) {
+                    for (uint32_t r = 0; r < vocab_size; r++) {
+                        if (base_logits[r] > neural_score) {
+                            neural_score = base_logits[r];
+                            neural_cand = (int32_t)r;
+                        }
+                    }
+                }
+                MYDS_LOG_I("[dspark-prop] cycle=%llu seed=%d cand_a=%d (s=%.2f) cand_b=%d (s=%.2f) neural=%d (s=%.2f) conf=%.3f",
+                           (unsigned long long)ds->cycles, last_token,
+                           best_token, best_score, best_token2, best_score2,
+                           neural_cand, neural_score, confidence);
+            }
 
             static float min_margin = -1.0f;
             if (__builtin_expect(min_margin < -0.5f, 0)) {
