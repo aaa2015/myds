@@ -153,8 +153,8 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
     }
 
     const char *arch = gguf_get_str(gguf, "general.architecture", NULL);
-    if (!arch || strcmp(arch, "deepseek4-dspark") != 0) {
-        MYDS_LOG_E("dspark: architecture mismatch (got %s, expected deepseek4-dspark)", arch ? arch : "null");
+    if (!arch || (strcmp(arch, "deepseek4-dspark") != 0 && strcmp(arch, "deepseek41-dflash-draft") != 0)) {
+        MYDS_LOG_E("dspark: architecture mismatch (got %s, expected deepseek4-dspark or deepseek41-dflash-draft)", arch ? arch : "null");
         gguf_close(gguf);
         return NULL;
     }
@@ -171,14 +171,30 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
     MYDS_LOG_I("DSpark target capture bypass: %d (request neural-consumer scope)", capture_mode != 0);
     MYDS_LOG_I("Engine target capture bypass: %d (Engine call chain; rejects experimental tree when enabled)", capture_mode == 2);
 
-    ds->stage_count = gguf_get_u32(gguf, "dspark.stage_count", 3);
+    uint32_t stages = gguf_get_u32(gguf, "dspark.stage_count", 0);
+    if (!stages) stages = gguf_get_u32(gguf, "deepseek41-dflash-draft.block_count", 3);
+    ds->stage_count = stages;
     if (ds->stage_count > MYDS_DSPARK_MAX_STAGES) ds->stage_count = MYDS_DSPARK_MAX_STAGES;
 
-    ds->block_size = gguf_get_u32(gguf, "dspark.block_size", MYDS_DSPARK_DEFAULT_BLOCK_SIZE);
-    ds->markov_rank = gguf_get_u32(gguf, "dspark.markov_rank", MYDS_DSPARK_MARKOV_RANK);
-    ds->noise_token_id = gguf_get_u32(gguf, "dspark.noise_token_id", 128799);
-    ds->n_routed_experts = gguf_get_u32(gguf, "dspark.n_routed_experts", 128);
-    ds->num_experts_per_tok = gguf_get_u32(gguf, "dspark.num_experts_per_tok", 3);
+    uint32_t bsize = gguf_get_u32(gguf, "dspark.block_size", 0);
+    if (!bsize) bsize = gguf_get_u32(gguf, "deepseek41-dflash-draft.dflash.block_size", MYDS_DSPARK_DEFAULT_BLOCK_SIZE);
+    ds->block_size = bsize;
+
+    uint32_t mrank = gguf_get_u32(gguf, "dspark.markov_rank", 0);
+    if (!mrank) mrank = gguf_get_u32(gguf, "deepseek41-dflash-draft.dflash.dspark.markov_rank", MYDS_DSPARK_MARKOV_RANK);
+    ds->markov_rank = mrank;
+
+    uint32_t ntoken = gguf_get_u32(gguf, "dspark.noise_token_id", 0);
+    if (!ntoken) ntoken = gguf_get_u32(gguf, "deepseek41-dflash-draft.dflash.mask_token_id", 128799);
+    ds->noise_token_id = ntoken;
+
+    uint32_t nexp = gguf_get_u32(gguf, "dspark.n_routed_experts", 0);
+    if (!nexp) nexp = gguf_get_u32(gguf, "deepseek41-dflash-draft.expert_count", 128);
+    ds->n_routed_experts = nexp;
+
+    uint32_t kexp = gguf_get_u32(gguf, "dspark.num_experts_per_tok", 0);
+    if (!kexp) kexp = gguf_get_u32(gguf, "deepseek41-dflash-draft.expert_used_count", 3);
+    ds->num_experts_per_tok = kexp;
 
     // Default target layer ids for DeepSeek-V4.1: {37, 38, 39}
     ds->target_layers[0] = 37;
@@ -187,7 +203,9 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
 
     // Stage 0 entry projection
     const gguf_tensor_t *t_main_proj = gguf_find_tensor(gguf, "mtp.0.main_proj.weight");
+    if (!t_main_proj) t_main_proj = gguf_find_tensor(gguf, "dflash.fc.weight");
     const gguf_tensor_t *t_main_norm = gguf_find_tensor(gguf, "mtp.0.main_norm.weight");
+    if (!t_main_norm) t_main_norm = gguf_find_tensor(gguf, "dflash.hidden_norm.weight");
     if (t_main_proj) {
         ds->main_proj = create_metal_buf(t_main_proj);
         ds->main_proj_type = t_main_proj->type;
@@ -204,6 +222,10 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
         #define BIND_T(field, tname, ftype) do { \
             snprintf(name, sizeof(name), "mtp.%u." tname, s); \
             const gguf_tensor_t *t = gguf_find_tensor(gguf, name); \
+            if (!t) { \
+                snprintf(name, sizeof(name), "blk.%u." tname, s); \
+                t = gguf_find_tensor(gguf, name); \
+            } \
             if (t) { \
                 st->field = create_metal_buf(t); \
                 st->ftype = t->type; \
@@ -213,6 +235,10 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
         #define BIND_BUF(field, tname) do { \
             snprintf(name, sizeof(name), "mtp.%u." tname, s); \
             const gguf_tensor_t *t = gguf_find_tensor(gguf, name); \
+            if (!t) { \
+                snprintf(name, sizeof(name), "blk.%u." tname, s); \
+                t = gguf_find_tensor(gguf, name); \
+            } \
             if (t) st->field = create_metal_buf(t); \
         } while (0)
 
@@ -250,10 +276,17 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
         #undef BIND_BUF
     }
 
-    // Final stage heads (on stage ds->stage_count - 1, typically mtp.2)
+    // Final stage heads (on stage ds->stage_count - 1, typically mtp.2 or blk.2)
     uint32_t final_s = ds->stage_count - 1u;
     snprintf(name, sizeof(name), "mtp.%u.norm.weight", final_s);
     const gguf_tensor_t *t_fnorm = gguf_find_tensor(gguf, name);
+    if (!t_fnorm) {
+        snprintf(name, sizeof(name), "blk.%u.norm.weight", final_s);
+        t_fnorm = gguf_find_tensor(gguf, name);
+    }
+    if (!t_fnorm) {
+        t_fnorm = gguf_find_tensor(gguf, "output_norm.weight");
+    }
     if (t_fnorm) ds->final_norm = create_metal_buf(t_fnorm);
 
     snprintf(name, sizeof(name), "mtp.%u.markov_head.markov_w1.weight", final_s);
@@ -261,6 +294,9 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
     if (!t_mw1) {
         snprintf(name, sizeof(name), "mtp.%u.markov_head.embed.weight", final_s);
         t_mw1 = gguf_find_tensor(gguf, name);
+    }
+    if (!t_mw1) {
+        t_mw1 = gguf_find_tensor(gguf, "dflash.dspark.markov.w1");
     }
     if (t_mw1) {
         ds->markov_w1 = create_metal_buf(t_mw1);
@@ -273,6 +309,9 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
         snprintf(name, sizeof(name), "mtp.%u.markov_head.head.weight", final_s);
         t_mw2 = gguf_find_tensor(gguf, name);
     }
+    if (!t_mw2) {
+        t_mw2 = gguf_find_tensor(gguf, "dflash.dspark.markov.w2");
+    }
     if (t_mw2) {
         ds->markov_w2 = create_metal_buf(t_mw2);
         ds->markov_w2_type = t_mw2->type;
@@ -280,6 +319,9 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
 
     snprintf(name, sizeof(name), "mtp.%u.confidence_head.proj.weight", final_s);
     const gguf_tensor_t *t_cproj = gguf_find_tensor(gguf, name);
+    if (!t_cproj) {
+        t_cproj = gguf_find_tensor(gguf, "dflash.dspark.confidence.weight");
+    }
     if (t_cproj) {
         ds->confidence_proj = create_metal_buf(t_cproj);
         ds->confidence_proj_type = t_cproj->type;
