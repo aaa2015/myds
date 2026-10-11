@@ -4297,11 +4297,11 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_x_norm[1], ws->v_x[1], ws->v_residual[1], pre1, base->attn_norm, V41_DIM, m->norm_eps, true));
         myds_metal_barrier_buffer(ws->x_norm_b2);
 
-        /* HC Mix */
+        /* HC Mix (dispatches concurrently with QKV and Attention) */
         CHECK(myds_metal_v41_hc_mix(ws->v_attn_split[0], ws->v_residual[0], l->attn_fn, GGML_TYPE_F16, l->attn_scale, l->attn_base, ws->v_flat_norm[0], ws->v_mix[0], V41_DIM, m->norm_eps, v->hc_eps));
         CHECK(myds_metal_v41_hc_mix(ws->v_attn_split[1], ws->v_residual[1], l->attn_fn, GGML_TYPE_F16, l->attn_scale, l->attn_base, ws->v_flat_norm[1], ws->v_mix[1], V41_DIM, m->norm_eps, v->hc_eps));
-        myds_metal_barrier_buffer(ws->attn_split_b2);
         if (trace_gpu) {
+            myds_metal_barrier_buffer(ws->attn_split_b2);
             CHECK(myds_metal_commit_batch());
             t_mix += (lowkv_now_ms() - t_step);
             CHECK(myds_metal_begin_batch());
@@ -4370,6 +4370,7 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         }
 
         /* HC Expand + FFN Norm */
+        myds_metal_barrier_buffer(ws->attn_split_b2);
         CHECK(myds_metal_v41_hc_expand(ws->v_after_attn[0], ws->v_attn_out[0], ws->v_residual[0], ws->v_attn_split[0], V41_DIM));
         CHECK(myds_metal_v41_hc_expand(ws->v_after_attn[1], ws->v_attn_out[1], ws->v_residual[1], ws->v_attn_split[1], V41_DIM));
         myds_metal_barrier_buffer(ws->after_attn_b2);
@@ -4377,7 +4378,11 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_ffn_norm[1], ws->v_x[1], ws->v_after_attn[1], ws->v_attn_split[1], base->ffn_norm, V41_DIM, m->norm_eps, true));
         myds_metal_barrier_buffer(ws->ffn_norm_b2);
 
-        /* MoE 调度: Shared Expert + Router + Routed MoE (Batched 2-Token Gate+Up SwiGLU) */
+        /* 1. 并发派发 FFN HC Mix（只读 after_attn，写 ffn_split，与后续 Shared/Router/MoE 完全重叠） */
+        CHECK(myds_metal_v41_hc_mix(ws->v_ffn_split[0], ws->v_after_attn[0], l->ffn_fn, GGML_TYPE_F16, l->ffn_scale, l->ffn_base, ws->v_flat_norm[0], ws->v_mix[0], V41_DIM, m->norm_eps, v->hc_eps));
+        CHECK(myds_metal_v41_hc_mix(ws->v_ffn_split[1], ws->v_after_attn[1], l->ffn_fn, GGML_TYPE_F16, l->ffn_scale, l->ffn_base, ws->v_flat_norm[1], ws->v_mix[1], V41_DIM, m->norm_eps, v->hc_eps));
+
+        /* 2. 并发派发 Shared Expert Gate+Up */
         const char *shared_fuse = getenv("MYDS_SHARED_FUSE");
         int shared_fused = !myds_trace_active() && (!shared_fuse || strcmp(shared_fuse, "0")) &&
             myds_v41_shared_gate_up_swiglu_batch2(
@@ -4401,25 +4406,23 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
                 }
             }
         }
-        myds_metal_barrier_buffer(ws->shared_swiglu_b2);
 
-        CHECK(myds_v41_batch2_projection_probe(ws->v_shared_out, base->shared_down, ws->v_shared_swiglu, V41_DIM, 2304, base->shared_down_type, MYDS_V41_BATCH2_SHARED));
-        if (trace_gpu) {
-            CHECK(myds_metal_commit_batch());
-            t_shared += (lowkv_now_ms() - t_step);
-            CHECK(myds_metal_begin_batch());
-            t_step = lowkv_now_ms();
-        }
-
+        /* 3. 并发派发 Router Gate GEMV */
         CHECK(myds_v41_batch2_projection_probe(ws->v_router_logits, base->router_gate,
             ws->v_ffn_norm, 384, V41_DIM, base->router_gate_type, MYDS_V41_BATCH2_ROUTER));
-        myds_metal_barrier_buffer(ws->router_logits_b2);
 
+        /* 4. 仅同步 router_logits，执行路由打分与 Top-K 选择 */
+        myds_metal_barrier_buffer(ws->router_logits_b2);
         CHECK(myds_v41_route_batch(ws->selected_ids_b2, ws->selected_w_b2, ws->route_probs_b2, ws->route_scores_b2,
                                    ws->router_logits_b2, base->router_bias, 384, 6, m->routed_scaling_factor, 2));
         myds_metal_barrier_buffer(ws->selected_ids_b2);
         myds_metal_barrier_buffer(ws->selected_w_b2);
 
+        /* 5. 派发 Shared Down */
+        myds_metal_barrier_buffer(ws->shared_swiglu_b2);
+        CHECK(myds_v41_batch2_projection_probe(ws->v_shared_out, base->shared_down, ws->v_shared_swiglu, V41_DIM, 2304, base->shared_down_type, MYDS_V41_BATCH2_SHARED));
+
+        /* 6. 并发派发 Routed MoE */
         CHECK(myds_metal_routed_moe_batch(ws->moe_out_b2, ws->ffn_norm_b2,
                                           base->ffn_gate_exps, base->ffn_up_exps, base->ffn_down_exps,
                                           ws->selected_ids_b2, ws->selected_w_b2,
@@ -4427,8 +4430,11 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
                                           V41_DIM, 2304, 384, 6, 2,
                                           base->ffn_gate_exps_type, base->ffn_up_exps_type, base->ffn_down_exps_type,
                                           m->swiglu_clamp_exp));
+
+        /* 7. 同步所有结果并执行最终 HC Expand 累加 */
         myds_metal_barrier_buffer(ws->moe_out_b2);
         myds_metal_barrier_buffer(ws->shared_out_b2);
+        myds_metal_barrier_buffer(ws->ffn_split_b2);
         if (trace_gpu) {
             CHECK(myds_metal_commit_batch());
             t_moe += (lowkv_now_ms() - t_step);
@@ -4436,14 +4442,9 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
             t_step = lowkv_now_ms();
         }
 
-        /* MoE 累加与 HC Expand */
-        CHECK(myds_metal_v41_hc_mix(ws->v_ffn_split[0], ws->v_after_attn[0], l->ffn_fn, GGML_TYPE_F16, l->ffn_scale, l->ffn_base, ws->v_flat_norm[0], ws->v_mix[0], V41_DIM, m->norm_eps, v->hc_eps));
-        CHECK(myds_metal_v41_hc_mix(ws->v_ffn_split[1], ws->v_after_attn[1], l->ffn_fn, GGML_TYPE_F16, l->ffn_scale, l->ffn_base, ws->v_flat_norm[1], ws->v_mix[1], V41_DIM, m->norm_eps, v->hc_eps));
-        myds_metal_barrier_buffer(ws->ffn_split_b2);
         CHECK(myds_metal_v41_moe_add_hc_expand(ws->v_residual[0], ws->v_ffn_out[0], ws->v_moe_out[0], ws->v_shared_out[0], ws->v_after_attn[0], ws->v_ffn_split[0], V41_DIM));
         CHECK(myds_metal_v41_moe_add_hc_expand(ws->v_residual[1], ws->v_ffn_out[1], ws->v_moe_out[1], ws->v_shared_out[1], ws->v_after_attn[1], ws->v_ffn_split[1], V41_DIM));
         myds_metal_barrier_buffer(ws->residual_b2);
-        myds_metal_barrier_buffer(ws->ffn_split_b2);
 
         if (ctx->dspark && (il == 37 || il == 38 || il == 39) && ctx->dspark->hc_mean_weights) {
             int slot = (il == 37) ? 0 : ((il == 38) ? 1 : 2);
