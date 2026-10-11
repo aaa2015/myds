@@ -67,6 +67,13 @@ static int dspark_markov_only(void) {
     return mode;
 }
 
+uint32_t myds_dspark_decode_depth(const myds_context_t *ctx) {
+    const char *depth = getenv("MYDS_DSPARK_DEPTH");
+    return depth && !strcmp(depth, "2") && ctx && ctx->v41 &&
+        ctx->img_emb_n == 0 && ctx->cfg.temperature <= 0.0f &&
+        !myds_dspark_engine_capture_bypass_enabled(ctx->dspark) ? 2u : 1u;
+}
+
 static void dspark_format_token_preview(const myds_tokenizer_t *tok, int32_t token_id, char *buf, size_t buf_size) {
     if (!buf || buf_size == 0) return;
     buf[0] = '\0';
@@ -139,7 +146,7 @@ bool myds_dspark_capture_required(const myds_dspark_t *ds) {
     return ds && (!ds->capture_bypass_mode || !ds->capture_disabled);
 }
 bool myds_dspark_capture_ready(const myds_dspark_t *ds) {
-    return ds && (!ds->capture_bypass_mode ||
+    return ds && !ds->capture_poisoned && (!ds->capture_bypass_mode ||
         (!ds->capture_disabled && ds->capture_valid_mask == 7u && ds->capture_committed));
 }
 void myds_dspark_capture_counters(myds_dspark_t *ds, myds_dspark_capture_counters_t *out, bool reset) {
@@ -160,7 +167,15 @@ void myds_dspark_capture_invalidate(myds_dspark_t *ds) {
         ds->capture_committed = false;
     }
 }
+void myds_dspark_capture_poison(myds_dspark_t *ds) {
+    if (!ds) return;
+    ds->capture_poisoned = true;
+    ds->capture_valid_mask = 0;
+    ds->capture_committed = false;
+}
 void myds_dspark_capture_publish(myds_dspark_t *ds) {
+    if (ds && ds->capture_poisoned && ds->capture_valid_mask != 7u) return;
+    if (ds) ds->capture_poisoned = false;
     if (ds && ds->capture_bypass_mode) {
         ds->capture_valid_mask = myds_dspark_capture_required(ds) ? 7u : 0u;
         ds->capture_committed = ds->capture_valid_mask == 7u;
@@ -800,17 +815,21 @@ int myds_dspark_capture_layer_to(myds_dspark_t *ds, uint32_t layer_idx,
     const bool target_output = output == NULL;
     if (target_output) output = ds->target_slots[slot];
     const bool actual_slot = output == ds->target_slots[slot];
-    if (actual_slot && ds->capture_bypass_mode) {
+    if (actual_slot && (ds->capture_bypass_mode || ds->capture_poisoned)) {
         /* Any overwrite of a published generation starts a fresh capture.
          * Direct callers cannot combine a new slot1/2 with old slot0 state. */
-        if (slot == 0 || ds->capture_committed) myds_dspark_capture_invalidate(ds);
+        if (slot == 0 || ds->capture_committed) {
+            myds_dspark_capture_invalidate(ds);
+            ds->capture_valid_mask = 0;
+        }
         ds->capture_committed = false;
     }
     const int ok = residual && (!target_output || ds->target_hidden_buf) && ds->hc_mean_weights && output &&
         myds_metal_v41_hc_weighted_sum_round(output, residual, ds->hc_mean_weights, MYDS_DSPARK_DIM, 0);
     if (ok) {
         ds->capture_counters.encoded++;
-        if (actual_slot && ds->capture_bypass_mode) ds->capture_valid_mask |= 1u << slot;
+        if (actual_slot && (ds->capture_bypass_mode || ds->capture_poisoned))
+            ds->capture_valid_mask |= 1u << slot;
     } else {
         ds->capture_counters.failures++;
         myds_dspark_capture_invalidate(ds);
@@ -1742,7 +1761,7 @@ static uint32_t dspark_propose_at(myds_dspark_t *ds, myds_context_t *ctx,
     }
 
     ds->draft_count = n_proposed;
-    ds->proposed_tokens += (ctx && ctx->v41 ? 1 : n_proposed);
+    ds->proposed_tokens += n_proposed;
     ds->propose_ms += (now_ms() - t0);
 
     return n_proposed;

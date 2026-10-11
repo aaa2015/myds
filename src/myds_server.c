@@ -3571,6 +3571,17 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
 
         }
 
+        if (ctx->decode_stats.depth2_calls > 0) {
+            MYDS_LOG_I("[%s:%d] Depth2 Verify: calls=%llu, hits1=%llu, hits2=%llu, misses=%llu, failures=%llu, fallbacks=%llu",
+                       client_ip, client_port,
+                       (unsigned long long)ctx->decode_stats.depth2_calls,
+                       (unsigned long long)ctx->decode_stats.depth2_hits1,
+                       (unsigned long long)ctx->decode_stats.depth2_hits2,
+                       (unsigned long long)ctx->decode_stats.depth2_misses,
+                       (unsigned long long)ctx->decode_stats.depth2_failures,
+                       (unsigned long long)ctx->decode_stats.depth2_fallbacks);
+        }
+
 cleanup_infer:
         myds_context_clear_image_embeddings(ctx);
         myds_vjob_sink_free(&img_sink);

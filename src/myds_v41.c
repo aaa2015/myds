@@ -339,6 +339,8 @@ static bool v41_spec_snapshot_save(myds_context_t *ctx, myds_v41_spec_snapshot_t
     if (!ctx || !ctx->v41 || !snap) return false;
     snap->valid = false;
     snap->first_state_valid = false;
+    snap->second_state_valid = false;
+    snap->linear_retry_valid = false;
     myds_v41_context_t *g = ctx->v41;
     if (!g->valid) return false;
     if (count > MYDS_V41_SPEC_MAX_AHEAD) count = MYDS_V41_SPEC_MAX_AHEAD;
@@ -430,14 +432,57 @@ static bool v41_spec_snapshot_restore(myds_context_t *ctx, const myds_v41_spec_s
     return true;
 }
 
-static bool v41_spec_snapshot_restore_partial(myds_context_t *ctx, const myds_v41_spec_snapshot_t *snap, uint32_t keep_count) {
+static bool v41_spec_snapshot_restore_partial_completed(myds_context_t *ctx,
+    const myds_v41_spec_snapshot_t *snap, uint32_t keep_count, bool completed) {
     if (!ctx || !ctx->v41 || !snap || !snap->valid) return false;
     if (keep_count == 0) return v41_spec_snapshot_restore(ctx, snap);
-    if (keep_count >= snap->window_count) return true;
+    if (keep_count > snap->window_count) return false;
+    if (keep_count == snap->window_count) return true;
+    /* A three-row graph can leave live carry/activations at row2. Never infer
+     * a retained row1 state from parity or an assumed RNG increment. */
+    if (snap->window_count == 3u &&
+        ((keep_count == 1u && !snap->first_state_valid) ||
+         (keep_count == 2u && !snap->second_state_valid))) return false;
+    const bool exact_checkpoint = (keep_count == 1u && snap->first_state_valid) ||
+                                  (keep_count == 2u && snap->second_state_valid);
+    myds_metal_buffer_t *const *checkpoint_kv = keep_count == 2u
+        ? snap->second_previous_kv : snap->first_previous_kv;
+    myds_metal_buffer_t *const *checkpoint_score = keep_count == 2u
+        ? snap->second_previous_score : snap->first_previous_score;
+    myds_metal_buffer_t *const *checkpoint_slots = keep_count == 2u
+        ? snap->second_dspark_slots : snap->first_dspark_slots;
+    myds_metal_buffer_t *checkpoint_residual = keep_count == 2u
+        ? snap->second_residual : snap->first_residual;
+    myds_metal_buffer_t *checkpoint_pre = keep_count == 2u
+        ? snap->second_pre : snap->first_pre;
+    myds_metal_buffer_t *checkpoint_logits = keep_count == 2u
+        ? snap->second_logits : snap->first_logits;
 
     myds_v41_context_t *g = ctx->v41;
+    if (snap->window_count == 3u && exact_checkpoint) {
+        /* New depth2 checkpoints must be complete. Validate every mapping
+         * before touching positions or publishing capture; legacy count2
+         * diagnostics may intentionally provide only selected first fields. */
+#define VALID_BUFFER(b, n) ((b) && myds_metal_buffer_data(b) && myds_metal_buffer_size(b) >= (n))
+        if (!VALID_BUFFER(g->residual, 4u * V41_DIM * sizeof(float)) ||
+            !VALID_BUFFER(checkpoint_residual, 4u * V41_DIM * sizeof(float)) ||
+            !VALID_BUFFER(g->pre, 4u * sizeof(float)) || !VALID_BUFFER(checkpoint_pre, 4u * sizeof(float)) ||
+            !ctx->logits || !VALID_BUFFER(ctx->logits, myds_metal_buffer_size(ctx->logits)) ||
+            !VALID_BUFFER(checkpoint_logits, myds_metal_buffer_size(ctx->logits))) return false;
+        for (uint32_t o = 0; o < 4u; ++o)
+            if (!VALID_BUFFER(g->previous_kv[o], 512u * sizeof(float)) ||
+                !VALID_BUFFER(g->previous_score[o], 512u * sizeof(float)) ||
+                !VALID_BUFFER(checkpoint_kv[o], 512u * sizeof(float)) ||
+                !VALID_BUFFER(checkpoint_score[o], 512u * sizeof(float))) return false;
+        if (myds_dspark_capture_required(ctx->dspark)) for (uint32_t slot = 0; slot < 3u; ++slot)
+            if (!VALID_BUFFER(ctx->dspark->target_slots[slot], MYDS_DSPARK_DIM * sizeof(float)) ||
+                !VALID_BUFFER(checkpoint_slots[slot], MYDS_DSPARK_DIM * sizeof(float))) return false;
+        for (uint32_t il = 0; il < V41_LAYERS; ++il)
+            if (!VALID_BUFFER(g->window[il], V41_WINDOW * V41_HEAD_DIM * sizeof(float))) return false;
+#undef VALID_BUFFER
+    }
     myds_dspark_capture_invalidate(ctx->dspark);
-    if (!myds_metal_commit_batch()) return false;
+    if (!completed && !myds_metal_commit_batch()) return false;
 
     ctx->pos = snap->pos + keep_count;
     g->next_position = snap->next_position + keep_count;
@@ -446,34 +491,35 @@ static bool v41_spec_snapshot_restore_partial(myds_context_t *ctx, const myds_v4
         for (uint32_t k = 0; k < keep_count; ++k)
             ctx->rng_state = ctx->rng_state * 6364136223846793005ULL + 1ULL;
     }
-    if (keep_count == 1 && snap->first_state_valid) {
-        ctx->rng_state = snap->first_rng_state;
+    if (exact_checkpoint) {
+        ctx->rng_state = keep_count == 2u ? snap->second_rng_state : snap->first_rng_state;
         for (uint32_t o = 0; o < 4u; ++o) {
-            if (g->previous_kv[o] && snap->first_previous_kv[o])
+            if (g->previous_kv[o] && checkpoint_kv[o])
                 memcpy(myds_metal_buffer_data(g->previous_kv[o]),
-                    myds_metal_buffer_data(snap->first_previous_kv[o]), 512u * sizeof(float));
-            if (g->previous_score[o] && snap->first_previous_score[o])
+                    myds_metal_buffer_data(checkpoint_kv[o]), 512u * sizeof(float));
+            if (g->previous_score[o] && checkpoint_score[o])
                 memcpy(myds_metal_buffer_data(g->previous_score[o]),
-                    myds_metal_buffer_data(snap->first_previous_score[o]), 512u * sizeof(float));
+                    myds_metal_buffer_data(checkpoint_score[o]), 512u * sizeof(float));
         }
-        if (g->residual && snap->first_residual)
-            memcpy(myds_metal_buffer_data(g->residual), myds_metal_buffer_data(snap->first_residual),
+        if (g->residual && checkpoint_residual)
+            memcpy(myds_metal_buffer_data(g->residual), myds_metal_buffer_data(checkpoint_residual),
                    4u * V41_DIM * sizeof(float));
-        if (g->pre && snap->first_pre)
-            memcpy(myds_metal_buffer_data(g->pre), myds_metal_buffer_data(snap->first_pre), 4u * sizeof(float));
-        if (ctx->logits && snap->first_logits)
-            memcpy(myds_metal_buffer_data(ctx->logits), myds_metal_buffer_data(snap->first_logits),
+        if (g->pre && checkpoint_pre)
+            memcpy(myds_metal_buffer_data(g->pre), myds_metal_buffer_data(checkpoint_pre), 4u * sizeof(float));
+        if (ctx->logits && checkpoint_logits)
+            memcpy(myds_metal_buffer_data(ctx->logits), myds_metal_buffer_data(checkpoint_logits),
                    myds_metal_buffer_size(ctx->logits));
         if (ctx->dspark) for (uint32_t s = 0; s < 3; ++s) {
-            if (ctx->dspark->target_slots[s] && snap->first_dspark_slots[s])
+            if (ctx->dspark->target_slots[s] && checkpoint_slots[s])
                 memcpy(myds_metal_buffer_data(ctx->dspark->target_slots[s]),
-                    myds_metal_buffer_data(snap->first_dspark_slots[s]), MYDS_DSPARK_DIM * sizeof(float));
+                    myds_metal_buffer_data(checkpoint_slots[s]), MYDS_DSPARK_DIM * sizeof(float));
         }
         if (ctx->dspark && ctx->dspark->target_slots[0] && ctx->dspark->target_slots[1] &&
-            ctx->dspark->target_slots[2] && snap->first_dspark_slots[0] &&
-            snap->first_dspark_slots[1] && snap->first_dspark_slots[2])
+            ctx->dspark->target_slots[2] && checkpoint_slots[0] &&
+            checkpoint_slots[1] && checkpoint_slots[2]) {
+            if (ctx->dspark->capture_poisoned) ctx->dspark->capture_valid_mask = 7u;
             myds_dspark_capture_publish(ctx->dspark);
-        else myds_dspark_capture_invalidate(ctx->dspark);
+        } else myds_dspark_capture_invalidate(ctx->dspark);
     }
     /* For K=2, rejecting an even-position draft must undo its pool2 carry.
      * An accepted even-position token keeps its newly generated carry. */
@@ -489,7 +535,7 @@ static bool v41_spec_snapshot_restore_partial(myds_context_t *ctx, const myds_v4
     if (g->engram) {
         g->engram->history = snap->engram_history;
         g->engram->position = snap->engram_position;
-        if (ctx->pcache_tokens) {
+        if (ctx->pcache_tokens && !exact_checkpoint) {
             for (uint32_t k = 0; k < keep_count; k++) {
                 int32_t tok = ctx->pcache_tokens[snap->pos + k];
                 myds_engram_history_t next = g->engram->history;
@@ -499,9 +545,10 @@ static bool v41_spec_snapshot_restore_partial(myds_context_t *ctx, const myds_v4
                 }
             }
         }
-        if (keep_count == 1 && snap->first_state_valid) {
-            g->engram->history = snap->first_engram_history;
-            g->engram->position = snap->engram_position + 1u;
+        if (exact_checkpoint) {
+            g->engram->history = keep_count == 2u
+                ? snap->second_engram_history : snap->first_engram_history;
+            g->engram->position = snap->engram_position + keep_count;
         }
     }
 
@@ -522,6 +569,11 @@ static bool v41_spec_snapshot_restore_partial(myds_context_t *ctx, const myds_v4
     return true;
 }
 
+static bool v41_spec_snapshot_restore_partial(myds_context_t *ctx,
+    const myds_v41_spec_snapshot_t *snap, uint32_t keep_count) {
+    return v41_spec_snapshot_restore_partial_completed(ctx, snap, keep_count, false);
+}
+
 bool myds_v41_spec_snapshot_save(myds_context_t *ctx, myds_v41_spec_snapshot_t *snap, uint32_t count) {
     const bool timed = ctx && ctx->decode_metrics_active && ctx->decode_stats.timing_enabled;
     const double t0 = timed ? lowkv_now_ms() : 0.0;
@@ -539,7 +591,8 @@ bool myds_v41_spec_snapshot_restore(myds_context_t *ctx, const myds_v41_spec_sna
      * graph. Do not expose that state as a reusable consecutive prefix. */
     if (!ok && restoring_live_state) {
         ctx->v41->valid = false;
-        myds_dspark_capture_invalidate(ctx->dspark);
+        if (snap->window_count == 3u) myds_dspark_capture_poison(ctx->dspark);
+        else myds_dspark_capture_invalidate(ctx->dspark);
     }
     if (timed) ctx->decode_stats.rollback_ms += lowkv_now_ms() - t0;
     return ok;
@@ -552,7 +605,8 @@ bool myds_v41_spec_snapshot_restore_partial(myds_context_t *ctx, const myds_v41_
     const bool ok = v41_spec_snapshot_restore_partial(ctx, snap, keep_count);
     if (!ok && restoring_live_state) {
         ctx->v41->valid = false;
-        myds_dspark_capture_invalidate(ctx->dspark);
+        if (snap->window_count == 3u) myds_dspark_capture_poison(ctx->dspark);
+        else myds_dspark_capture_invalidate(ctx->dspark);
     }
     if (timed) ctx->decode_stats.rollback_ms += lowkv_now_ms() - t0;
     return ok;
@@ -3813,6 +3867,7 @@ struct v41_batch2_workspace_s {
      * service-worker stack or clear its unused 14 window slots per cycle. */
     myds_v41_spec_snapshot_t snapshot;
     myds_metal_buffer_t *first_previous_kv[4], *first_previous_score[4];
+    myds_metal_buffer_t *second_previous_kv[4], *second_previous_score[4];
     myds_metal_buffer_t *x_norm_b2;        /* 3 * 5120 * 4 */
     myds_metal_buffer_t *qr_b2;            /* 3 * 1280 * 4 */
     myds_metal_buffer_t *qr_norm_b2;       /* 3 * 1280 * 4 */
@@ -3903,6 +3958,8 @@ static void v41_batch2_workspace_free(v41_batch2_workspace_t *ws) {
     for (uint32_t o = 0; o < 4; ++o) {
         FREE_VIEW(ws->first_previous_kv[o]);
         FREE_VIEW(ws->first_previous_score[o]);
+        FREE_VIEW(ws->second_previous_kv[o]);
+        FREE_VIEW(ws->second_previous_score[o]);
         for (uint32_t b = 0; b < 2; ++b) {
             FREE_VIEW(ws->tree_compressed[b][o]);
             FREE_VIEW(ws->tree_index[b][o]);
@@ -4003,7 +4060,10 @@ static v41_batch2_workspace_t *v41_batch2_workspace_create(myds_context_t *ctx) 
     for (uint32_t o = 0; o < 4; ++o) {
         ws->first_previous_kv[o] = myds_metal_buffer_alloc(512u * sizeof(float));
         ws->first_previous_score[o] = myds_metal_buffer_alloc(512u * sizeof(float));
-        if (!ws->first_previous_kv[o] || !ws->first_previous_score[o]) goto fail;
+        ws->second_previous_kv[o] = myds_metal_buffer_alloc(512u * sizeof(float));
+        ws->second_previous_score[o] = myds_metal_buffer_alloc(512u * sizeof(float));
+        if (!ws->first_previous_kv[o] || !ws->first_previous_score[o] ||
+            !ws->second_previous_kv[o] || !ws->second_previous_score[o]) goto fail;
     }
 
 #define ALLOC_B2(field, bytes) do { \
@@ -4126,58 +4186,86 @@ fail:
     return NULL;
 }
 
-bool myds_v41_spec_snapshot_capture_first(myds_context_t *ctx, myds_v41_spec_snapshot_t *snap) {
+static bool v41_spec_snapshot_capture_step(myds_context_t *ctx, myds_v41_spec_snapshot_t *snap, uint32_t step) {
     if (!ctx || !ctx->v41 || !ctx->model || !ctx->logits || !snap || !snap->valid) return false;
+    if (step != 1u && (step != 2u || snap->window_count < 3u || !snap->first_state_valid)) return false;
     myds_v41_context_t *g = ctx->v41;
-    if (!g->valid || g->next_position != snap->next_position + 1u ||
+    if (!g->valid || g->next_position != snap->next_position + step ||
         !g->residual || !g->pre || !myds_metal_commit_batch()) return false;
     const bool timed = ctx->decode_metrics_active && ctx->decode_stats.timing_enabled;
     const double t0 = timed ? lowkv_now_ms() : 0.0;
     if (!g->batch2_ws) g->batch2_ws = v41_batch2_workspace_create(ctx);
     if (!g->batch2_ws) return false;
     v41_batch2_workspace_t *ws = g->batch2_ws;
-    memcpy(myds_metal_buffer_data(ws->v_residual[0]), myds_metal_buffer_data(g->residual),
+    const uint32_t row = step - 1u;
+    myds_metal_buffer_t **carry_kv = step == 2u ? ws->second_previous_kv : ws->first_previous_kv;
+    myds_metal_buffer_t **carry_score = step == 2u ? ws->second_previous_score : ws->first_previous_score;
+    myds_metal_buffer_t **saved_kv = step == 2u ? snap->second_previous_kv : snap->first_previous_kv;
+    myds_metal_buffer_t **saved_score = step == 2u ? snap->second_previous_score : snap->first_previous_score;
+    myds_metal_buffer_t **saved_slots = step == 2u ? snap->second_dspark_slots : snap->first_dspark_slots;
+    memcpy(myds_metal_buffer_data(ws->v_residual[row]), myds_metal_buffer_data(g->residual),
            4u * V41_DIM * sizeof(float));
-    memcpy(myds_metal_buffer_data(ws->v_pre[0]), myds_metal_buffer_data(g->pre), 4u * sizeof(float));
-    memcpy(myds_metal_buffer_data(ws->v_logits[0]), myds_metal_buffer_data(ctx->logits),
+    memcpy(myds_metal_buffer_data(ws->v_pre[row]), myds_metal_buffer_data(g->pre), 4u * sizeof(float));
+    memcpy(myds_metal_buffer_data(ws->v_logits[row]), myds_metal_buffer_data(ctx->logits),
            ctx->model->vocab_size * sizeof(float));
     for (uint32_t o = 0; o < 4; ++o) {
-        if (g->previous_kv[o]) memcpy(myds_metal_buffer_data(ws->first_previous_kv[o]),
+        if (g->previous_kv[o]) memcpy(myds_metal_buffer_data(carry_kv[o]),
                                     myds_metal_buffer_data(g->previous_kv[o]), 512u * sizeof(float));
-        if (g->previous_score[o]) memcpy(myds_metal_buffer_data(ws->first_previous_score[o]),
+        if (g->previous_score[o]) memcpy(myds_metal_buffer_data(carry_score[o]),
                                        myds_metal_buffer_data(g->previous_score[o]), 512u * sizeof(float));
-        snap->first_previous_kv[o] = ws->first_previous_kv[o];
-        snap->first_previous_score[o] = ws->first_previous_score[o];
+        saved_kv[o] = carry_kv[o];
+        saved_score[o] = carry_score[o];
     }
-    snap->first_residual = ws->v_residual[0]; snap->first_pre = ws->v_pre[0];
-    snap->first_logits = ws->v_logits[0]; snap->first_rng_state = ctx->rng_state;
-    if (g->engram) snap->first_engram_history = g->engram->history;
+    if (step == 2u) {
+        snap->second_residual = ws->v_residual[row]; snap->second_pre = ws->v_pre[row];
+        snap->second_logits = ws->v_logits[row]; snap->second_rng_state = ctx->rng_state;
+        if (g->engram) snap->second_engram_history = g->engram->history;
+    } else {
+        snap->first_residual = ws->v_residual[row]; snap->first_pre = ws->v_pre[row];
+        snap->first_logits = ws->v_logits[row]; snap->first_rng_state = ctx->rng_state;
+        if (g->engram) snap->first_engram_history = g->engram->history;
+    }
     for (uint32_t s = 0; s < 3; ++s) {
-        snap->first_dspark_slots[s] = NULL;
+        saved_slots[s] = NULL;
         if (ctx->dspark && myds_dspark_capture_ready(ctx->dspark) && ctx->dspark->target_slots[s]) {
-            memcpy(myds_metal_buffer_data(ws->dspark_slots[0][s]),
+            memcpy(myds_metal_buffer_data(ws->dspark_slots[row][s]),
                    myds_metal_buffer_data(ctx->dspark->target_slots[s]), MYDS_DSPARK_DIM * sizeof(float));
-            snap->first_dspark_slots[s] = ws->dspark_slots[0][s];
+            saved_slots[s] = ws->dspark_slots[row][s];
         }
     }
-    snap->first_state_valid = true;
+    if (step == 2u) snap->second_state_valid = true;
+    else snap->first_state_valid = true;
     if (timed) ctx->decode_stats.snapshot_ms += lowkv_now_ms() - t0;
     return true;
 }
 
+bool myds_v41_spec_snapshot_capture_first(myds_context_t *ctx, myds_v41_spec_snapshot_t *snap) {
+    return v41_spec_snapshot_capture_step(ctx, snap, 1u);
+}
+
+bool myds_v41_spec_snapshot_capture_second(myds_context_t *ctx, myds_v41_spec_snapshot_t *snap) {
+    return v41_spec_snapshot_capture_step(ctx, snap, 2u);
+}
+
 /* Preserve legacy mode0's unchecked copies, but a candidate cannot publish
  * validity after a missing/failed slot copy. The caller commits before publish. */
-static int v41_copy_dspark_slots(myds_context_t *ctx, myds_metal_buffer_t *slots[3]) {
+static int v41_copy_dspark_slots_checked(myds_context_t *ctx,
+    myds_metal_buffer_t *slots[3], bool strict) {
     myds_dspark_t *ds = ctx->dspark;
     if (!myds_dspark_capture_required(ds)) return 1;
     for (uint32_t s = 0; s < 3; ++s) {
         if (ds->target_slots[s] && slots[s]) {
             const int copied = myds_metal_buffer_copy(ds->target_slots[s], 0, slots[s], 0,
                                                       MYDS_DSPARK_DIM * sizeof(float));
-            if (!copied && ds->capture_bypass_mode) return 0;
-        } else if (ds->capture_bypass_mode) return 0;
+            if (!copied && (strict || ds->capture_bypass_mode)) return 0;
+        } else if (strict || ds->capture_bypass_mode) return 0;
     }
+    if (strict) ds->capture_valid_mask = 7u;
     return 1;
+}
+
+static int v41_copy_dspark_slots(myds_context_t *ctx, myds_metal_buffer_t *slots[3]) {
+    return v41_copy_dspark_slots_checked(ctx, slots, false);
 }
 
 /* 40 层级联前向（Per-Layer Batch-2 GEMV + MoE） */
@@ -4704,14 +4792,21 @@ static int v41_tree_projection(myds_metal_buffer_t *out[3], const myds_metal_buf
     }
 }
 
-/* Root at pos, alternative A/B children at the same pos+1. */
-static int v41_forward_tree_spec_impl(myds_context_t *ctx, const int32_t *tokens,
+/* Common authoritative providers for two explicit topologies. Linear rows
+ * occupy p,p+1,p+2; tree children both occupy p+1. Callers choose topology
+ * explicitly, never from n_tokens or a global selector inside the graph. */
+static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *tokens,
                                       uint32_t pos, int32_t *out_tokens,
-                                      myds_v41_spec_snapshot_t *caller_snapshot) {
-    if (caller_snapshot) { caller_snapshot->valid = false; caller_snapshot->first_state_valid = false; }
+                                      myds_v41_spec_snapshot_t *caller_snapshot, bool linear) {
+    if (caller_snapshot) {
+        caller_snapshot->valid = false;
+        caller_snapshot->first_state_valid = false;
+        caller_snapshot->second_state_valid = false;
+        caller_snapshot->linear_retry_valid = false;
+    }
     if (!ctx || !ctx->v41 || !ctx->model || !ctx->model->v41 || !tokens || !out_tokens) return -1;
     if (myds_dspark_engine_capture_bypass_enabled(ctx->dspark)) {
-        MYDS_LOG_E("MYDS_ENGINE_CAPTURE_BYPASS excludes the experimental tree API");
+        MYDS_LOG_E("MYDS_ENGINE_CAPTURE_BYPASS excludes native three-row verification");
         return -1;
     }
     myds_model_t *m = ctx->model;
@@ -4719,12 +4814,16 @@ static int v41_forward_tree_spec_impl(myds_context_t *ctx, const int32_t *tokens
     myds_v41_model_t *v = m->v41;
     for (uint32_t t = 0; t < 3; ++t)
         if (tokens[t] < 0 || (uint32_t)tokens[t] >= m->vocab_size) return -1;
-    if (pos >= g->capacity || g->capacity - pos < 2u ||
-        pos >= ctx->cfg.max_seq_len || ctx->cfg.max_seq_len - pos < 2u || ctx->pos != pos) return -1;
+    const uint32_t ahead = linear ? 3u : 2u;
+    if (pos >= g->capacity || g->capacity - pos < ahead ||
+        pos >= ctx->cfg.max_seq_len || ctx->cfg.max_seq_len - pos < ahead || ctx->pos != pos) return -1;
 
     if (pos != 0 && (!g->valid || pos != g->next_position)) return -1;
     myds_dspark_capture_invalidate(ctx->dspark);
-    if (!myds_metal_commit_batch()) return -1;
+    if (!myds_metal_commit_batch()) {
+        if (linear) { g->valid = false; myds_dspark_capture_poison(ctx->dspark); }
+        return -1;
+    }
     if (pos == 0) { g->next_position = 0; g->valid = true; myds_engram_reset(g->engram); }
     if (!g->valid || pos != g->next_position) {
         MYDS_LOG_E("V4.1 forward_tree_spec expected position %u, got %u", g->next_position, pos);
@@ -4735,11 +4834,12 @@ static int v41_forward_tree_spec_impl(myds_context_t *ctx, const int32_t *tokens
         g->batch2_ws = v41_batch2_workspace_create(ctx);
         if (!g->batch2_ws) {
             MYDS_LOG_E("V4.1 failed to allocate tree speculation workspace");
+            if (linear) myds_dspark_capture_poison(ctx->dspark);
             return -1;
         }
     }
     v41_batch2_workspace_t *ws = g->batch2_ws;
-    if (!v41_tree_workspace_prepare(ws)) return -1;
+    if (!linear && !v41_tree_workspace_prepare(ws)) return -1;
     int prev_auto_barrier = -1;
     const bool timed = ctx->decode_metrics_active;
     const double t_start = timed ? lowkv_now_ms() : 0.0;
@@ -4754,13 +4854,18 @@ static int v41_forward_tree_spec_impl(myds_context_t *ctx, const int32_t *tokens
 
     /* 1. 保存投机前快照（用于未命中时的无损回滚） */
     myds_v41_spec_snapshot_t *snap = caller_snapshot ? caller_snapshot : &ws->snapshot;
-    if (!myds_v41_spec_snapshot_save(ctx, snap, 2)) {
+    if (!myds_v41_spec_snapshot_save(ctx, snap, ahead)) {
         MYDS_LOG_E("forward_tree_spec: myds_v41_spec_snapshot_save failed at pos %u", pos);
+        if (linear) { g->valid = false; myds_dspark_capture_poison(ctx->dspark); }
         return -1;
     }
     for (uint32_t o = 0; o < 4; ++o) {
         memcpy(myds_metal_buffer_data(ws->first_previous_kv[o]), snap->previous_kv[o], 512u * sizeof(float));
         memcpy(myds_metal_buffer_data(ws->first_previous_score[o]), snap->previous_score[o], 512u * sizeof(float));
+        if (linear) {
+            memcpy(myds_metal_buffer_data(ws->second_previous_kv[o]), snap->previous_kv[o], 512u * sizeof(float));
+            memcpy(myds_metal_buffer_data(ws->second_previous_score[o]), snap->previous_score[o], 512u * sizeof(float));
+        }
     }
 
 #define CHECK(x) do { if (!(x)) { MYDS_LOG_E("forward_tree_spec CHECK failed at line %d: %s", __LINE__, #x); goto fail; } } while (0)
@@ -4785,10 +4890,12 @@ static int v41_forward_tree_spec_impl(myds_context_t *ctx, const int32_t *tokens
         }
         engram_hist_1 = g->engram->history;
 
-        /* Token 2 (Branch B) 从 Token 0 的状态分叉，同样位于 pos + 1u */
-        g->engram->history = engram_hist_0;
-        g->engram->position = pos + 1u;
-        CHECK(myds_engram_prepare_token(g->engram, tokens[2], pos + 1u));
+        /* Linear row2 follows row1; only tree B forks from root. */
+        if (!linear) {
+            g->engram->history = engram_hist_0;
+            g->engram->position = pos + 1u;
+        }
+        CHECK(myds_engram_prepare_token(g->engram, tokens[2], pos + (linear ? 2u : 1u)));
         for (uint32_t i = 0; i < 2; i++) {
             CHECK(myds_metal_buffer_write(ws->engram_rows_b2[2][i], 0,
                                           g->engram->row_values[i], MYDS_ENGRAM_INPUT_DIM * 4u));
@@ -4878,6 +4985,30 @@ static int v41_forward_tree_spec_impl(myds_context_t *ctx, const int32_t *tokens
         CHECK(v41_tree_projection(ws->v_q, base->attn_q_b, ws->v_qr_norm, V41_HEADS * 512, 1280, base->attn_q_b_type, MYDS_V41_BATCH2_QKV));
         myds_metal_barrier_buffer(ws->q_b2);
 
+        if (linear) {
+            /* Source-owner compressors and pool2 carry are truly causal:
+             * consume row0, save its carry; consume row1, save its carry;
+             * then consume row2. Later non-source layers read only the rows
+             * visible at each query's position. Future appended cache rows
+             * remain invisible after partial1/2. */
+            for (uint32_t t = 0; t < 3u; ++t) {
+                CHECK(v41_batch2_attention_token(ctx, il, pos + t, ws->v_q[t], ws->v_kv_act[t],
+                    ws->v_attn_heads[t], ws->v_x_norm[t], ws->v_qr_norm[t],
+                    ws->attention_selected[t], ws->attention_block_mask[t]));
+                if (kv_source(il) && t < 2u) {
+                    const uint32_t owner = owner_for(il);
+                    myds_metal_buffer_t *saved_kv = t ? ws->second_previous_kv[owner] : ws->first_previous_kv[owner];
+                    myds_metal_buffer_t *saved_score = t ? ws->second_previous_score[owner] : ws->first_previous_score[owner];
+                    const myds_metal_buffer_t *deps[] = {
+                        g->previous_kv[owner], g->previous_score[owner], saved_kv, saved_score};
+                    myds_metal_barrier_buffers(deps, 4);
+                    CHECK(myds_metal_buffer_copy(saved_kv, 0, g->previous_kv[owner], 0, 512u * sizeof(float)));
+                    CHECK(myds_metal_buffer_copy(saved_score, 0, g->previous_score[owner], 0, 512u * sizeof(float)));
+                    myds_metal_barrier_buffers(deps, 4);
+                }
+                myds_metal_barrier_buffer(g->window[il]);
+            }
+        } else {
         /* Attention Direct & RoPE:
          * 1) Token 0: 写入 window[il] 的 pos % 128，计算注意力 */
         uint32_t pos0 = pos;
@@ -4936,6 +5067,7 @@ static int v41_forward_tree_spec_impl(myds_context_t *ctx, const int32_t *tokens
         if (kv_source(il)) {
             CHECK(v41_tree_child_cache(g, ws, owner, pos, 1, true));
             if (ratio_for(il) == 2u) CHECK(v41_tree_carry(g, ws, owner, 1, true));
+        }
         }
         myds_metal_barrier_buffer(ws->attn_heads_b2);
 
@@ -5010,7 +5142,9 @@ static int v41_forward_tree_spec_impl(myds_context_t *ctx, const int32_t *tokens
             int slot = myds_dspark_target_slot(ctx->dspark, il);
             if (slot >= 0) {
                 for (int t = 0; t < 3; t++) {
+                    const uint64_t capture_failures = ctx->dspark->capture_counters.failures;
                     CHECK(myds_dspark_capture_layer_to(ctx->dspark, il, ws->v_residual[t], ws->dspark_slots[t][slot]));
+                    CHECK(!linear || ctx->dspark->capture_counters.failures == capture_failures);
                 }
             }
         }
@@ -5040,7 +5174,7 @@ static int v41_forward_tree_spec_impl(myds_context_t *ctx, const int32_t *tokens
     }
 
     int32_t auth0 = myds_sample_next_token(logits0, m->vocab_size, &ctx->cfg, ctx, NULL, 0);
-    out_tokens[0] = auth0;
+    if (!linear) out_tokens[0] = auth0;
 
     snap->first_rng_state = ctx->rng_state;
     snap->first_engram_history = engram_hist_0;
@@ -5056,6 +5190,51 @@ static int v41_forward_tree_spec_impl(myds_context_t *ctx, const int32_t *tokens
     snap->first_state_valid = true;
 
     uint32_t selected = 0;
+    uint32_t count = 1u;
+    int32_t authoritative[3] = {auth0, -1, -1};
+    if (linear) {
+        for (uint32_t row = 1u; row < 3u; ++row) {
+            const int32_t previous = authoritative[row - 1u];
+            if ((m->tokenizer && previous == m->tokenizer->eos_id) || previous != tokens[row]) break;
+            const double head_start = timed ? lowkv_now_ms() : 0.0;
+            CHECK(myds_metal_begin_batch());
+            CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_x_norm[row], ws->v_x[row],
+                ws->v_residual[row], ws->v_ffn_split[row], m->output_norm, V41_DIM, m->norm_eps, true));
+            myds_metal_barrier_buffer(ws->v_x_norm[row]);
+            CHECK(project(ws->v_logits[row], m->output, ws->v_x_norm[row],
+                m->vocab_size, V41_DIM, m->output_type, false));
+            const double head_encoded = timed ? lowkv_now_ms() : 0.0;
+            CHECK(myds_metal_commit_batch());
+            lazy_encode_ms += head_encoded - head_start;
+            lazy_wait_ms += (timed ? lowkv_now_ms() : 0.0) - head_encoded;
+            const float *logits = myds_metal_buffer_data(ws->v_logits[row]);
+            CHECK(check_logits_finite(logits, m->vocab_size));
+            authoritative[row] = myds_sample_next_token(logits, m->vocab_size, &ctx->cfg, ctx, NULL, 0);
+            selected = row;
+            count = row + 1u;
+            if (row == 1u) {
+                snap->second_rng_state = ctx->rng_state;
+                snap->second_engram_history = engram_hist_1;
+                snap->second_residual = ws->v_residual[1];
+                snap->second_pre = ws->v_pre[1];
+                snap->second_logits = ws->v_logits[1];
+                for (uint32_t o = 0; o < 4u; ++o) {
+                    snap->second_previous_kv[o] = ws->second_previous_kv[o];
+                    snap->second_previous_score[o] = ws->second_previous_score[o];
+                }
+                for (uint32_t slot = 0; slot < 3u; ++slot) snap->second_dspark_slots[slot] =
+                    myds_dspark_capture_required(ctx->dspark) ? ws->dspark_slots[1][slot] : NULL;
+                snap->second_state_valid = true;
+            }
+        }
+        /* The preceding head commit already joined every transformer/copy.
+         * Restore the suffix without adding a redundant empty commit. */
+        if (count < 3u) {
+            const double rollback_start = timed ? lowkv_now_ms() : 0.0;
+            CHECK(v41_spec_snapshot_restore_partial_completed(ctx, snap, count, true));
+            if (timed) ctx->decode_stats.rollback_ms += lowkv_now_ms() - rollback_start;
+        }
+    } else {
     if (!m->tokenizer || auth0 != m->tokenizer->eos_id) {
         if (auth0 == tokens[1]) selected = 1;
         else if (auth0 == tokens[2]) selected = 2;
@@ -5079,8 +5258,10 @@ static int v41_forward_tree_spec_impl(myds_context_t *ctx, const int32_t *tokens
         CHECK(myds_v41_spec_snapshot_restore_partial(ctx, snap, 1));
     }
 
+        count = selected ? 2u : 1u;
+    }
     CHECK(myds_metal_begin_batch());
-    if (selected) {
+    if (!linear && selected) {
         const uint32_t branch = selected - 1u;
         for (uint32_t o = 0; o < 4; ++o) {
             CHECK(v41_tree_child_cache(g, ws, o, pos, branch, false));
@@ -5093,16 +5274,18 @@ static int v41_forward_tree_spec_impl(myds_context_t *ctx, const int32_t *tokens
     CHECK(myds_metal_buffer_copy(g->residual, 0, ws->v_residual[selected], 0, 4u * V41_DIM * sizeof(float)));
     CHECK(myds_metal_buffer_copy(g->pre, 0, ws->v_pre[selected], 0, 4u * sizeof(float)));
     CHECK(myds_metal_buffer_copy(ctx->logits, 0, ws->v_logits[selected], 0, m->vocab_size * sizeof(float)));
-    CHECK(v41_copy_dspark_slots(ctx, ws->dspark_slots[selected]));
-    CHECK(myds_metal_flush_batch());
+    CHECK(v41_copy_dspark_slots_checked(ctx, ws->dspark_slots[selected], linear));
+    /* Linear output publication must be completed before validity or outputs
+     * become observable; its final copy failure is a rollback failure path. */
+    CHECK(linear ? myds_metal_commit_batch() : myds_metal_flush_batch());
     myds_dspark_capture_publish(ctx->dspark);
     myds_metal_set_auto_barrier(prev_auto_barrier);
-    const uint32_t count = selected ? 2u : 1u;
     if (g->engram) {
         g->engram->history = selected == 1 ? engram_hist_1 : selected == 2 ? engram_hist_2 : engram_hist_0;
         g->engram->position = pos + count;
     }
     g->next_position = ctx->pos = pos + count;
+    if (linear) memcpy(out_tokens, authoritative, count * sizeof(*out_tokens));
     if (timed) {
         ctx->decode_stats.batch2_prep_ms += t_prep - t_start;
         ctx->decode_stats.batch2_encode_ms += t_encode - t_prep + lazy_encode_ms;
@@ -5115,14 +5298,63 @@ fail:
     MYDS_LOG_E("V4.1 forward_tree_spec failed at pos %u", pos);
     (void)myds_metal_commit_batch();
     if (prev_auto_barrier >= 0) myds_metal_set_auto_barrier(prev_auto_barrier);
-    if (!myds_v41_spec_snapshot_restore(ctx, snap)) g->valid = false;
+    const bool restored = myds_v41_spec_snapshot_restore(ctx, snap);
+    if (!restored) g->valid = false;
+    if (linear) {
+        snap->first_state_valid = snap->second_state_valid = false;
+        myds_dspark_capture_poison(ctx->dspark);
+        snap->linear_retry_valid = restored && g->valid && ctx->pos == pos && g->next_position == pos;
+    }
     return -1;
 #undef CHECK
 }
 
 int myds_v41_forward_tree_spec(myds_context_t *ctx, const int32_t *tokens,
     uint32_t pos, int32_t *out_tokens) {
-    return v41_forward_tree_spec_impl(ctx, tokens, pos, out_tokens, NULL);
+    return v41_forward_three_row_spec_impl(ctx, tokens, pos, out_tokens, NULL, false);
+}
+
+int myds_v41_forward_linear_spec_ex(myds_context_t *ctx, const int32_t *tokens,
+    uint32_t n_tokens, uint32_t pos, int32_t *out_tokens,
+    myds_v41_spec_snapshot_t *snapshot) {
+    if (snapshot) {
+        snapshot->valid = snapshot->first_state_valid = snapshot->second_state_valid = false;
+        snapshot->linear_retry_valid = false;
+    }
+    if (!ctx || !ctx->v41 || !ctx->model || !ctx->model->v41 || !tokens ||
+        !out_tokens || n_tokens != 3u || ctx->img_emb_n || !(ctx->cfg.temperature <= 0.0f) ||
+        myds_dspark_engine_capture_bypass_enabled(ctx->dspark)) return -1;
+    myds_v41_context_t *g = ctx->v41;
+    for (uint32_t row = 0; row < 3u; ++row)
+        if (tokens[row] < 0 || (uint32_t)tokens[row] >= ctx->model->vocab_size) return -1;
+    if (ctx->pos != pos || pos >= g->capacity || g->capacity - pos < 3u ||
+        pos >= ctx->cfg.max_seq_len || ctx->cfg.max_seq_len - pos < 3u ||
+        (pos && (!g->valid || g->next_position != pos))) return -1;
+    if (ctx->decode_metrics_active) {
+        ctx->decode_stats.batch2_calls++;
+        ctx->decode_stats.depth2_calls++;
+        ctx->decode_stats.target_forward_calls++;
+        ctx->decode_stats.target_rows += 3u;
+    }
+    const int ret = v41_forward_three_row_spec_impl(ctx, tokens, pos, out_tokens, snapshot, true);
+    if (ctx->decode_metrics_active) {
+        if (ret >= 2) ctx->decode_stats.batch2_hits++;
+        else if (ret == 1) ctx->decode_stats.batch2_misses++;
+        else ctx->decode_stats.batch2_failures++;
+        if (ret == 3) ctx->decode_stats.depth2_hits2++;
+        else if (ret == 2) ctx->decode_stats.depth2_hits1++;
+        else if (ret == 1) ctx->decode_stats.depth2_misses++;
+        else ctx->decode_stats.depth2_failures++;
+    }
+    return ret;
+}
+
+bool myds_v41_linear_spec_retry_ready(const myds_context_t *ctx,
+    const myds_v41_spec_snapshot_t *snap) {
+    return ctx && ctx->v41 && snap && snap->valid && snap->linear_retry_valid &&
+        snap->window_count == 3u && ctx->v41->valid && ctx->pos == snap->pos &&
+        ctx->v41->next_position == snap->next_position && snap->next_position == snap->pos &&
+        !myds_dspark_capture_ready(ctx->dspark);
 }
 
 bool myds_v41_batch2_spec_requested(const myds_context_t *ctx) {
@@ -5139,7 +5371,10 @@ bool myds_v41_batch2_spec_enabled(const myds_context_t *ctx, uint32_t n_tokens) 
 
 int myds_v41_forward_batch_spec_ex(myds_context_t *ctx, const int32_t *tokens,
     uint32_t n_tokens, uint32_t pos, int32_t *out_tokens, myds_v41_spec_snapshot_t *snapshot) {
-    if (snapshot) { snapshot->valid = false; snapshot->first_state_valid = false; }
+    if (snapshot) {
+        snapshot->valid = snapshot->first_state_valid = snapshot->second_state_valid = false;
+        snapshot->linear_retry_valid = false;
+    }
     if (!ctx || !ctx->v41 || !ctx->model || !ctx->model->v41 || !tokens ||
         !out_tokens || n_tokens == 0 || n_tokens > MYDS_SPEC_MAX_BATCH) return -1;
     for (uint32_t t = 0; t < n_tokens; ++t)
@@ -5159,7 +5394,7 @@ int myds_v41_forward_batch_spec_ex(myds_context_t *ctx, const int32_t *tokens,
         const bool tree = n_tokens == 3u && tree_env && !strcmp(tree_env, "1") &&
             !myds_dspark_engine_capture_bypass_enabled(ctx->dspark);
         if (tree && ctx->decode_metrics_active) ctx->decode_stats.target_rows++;
-        int ret = tree ? v41_forward_tree_spec_impl(ctx, tokens, pos, out_tokens, snapshot)
+        int ret = tree ? v41_forward_three_row_spec_impl(ctx, tokens, pos, out_tokens, snapshot, false)
                        : v41_forward_batch2(ctx, tokens, pos, out_tokens, snapshot);
         if (ctx->decode_metrics_active) {
             if (ret == 2) ctx->decode_stats.batch2_hits++;

@@ -120,9 +120,13 @@ static void neural_contract(void) {
     assert(f.ctx.pos==23u&&f.ds.draft_count==4u&&f.ds.draft_tokens[0]==3);
     assert(f.ds.draft_tokens[1]==4&&f.ds.draft_tokens[2]==5&&f.ds.draft_tokens[3]==6);
     assert(f.ds.draft_tree_count==2u&&f.ds.draft_tree_tokens[0]==3&&f.ds.draft_tree_tokens[1]==4);
-    assert(f.ds.proposed_tokens==6u); /* V4.1 tests one continuation per cycle. */
+    assert(f.ds.proposed_tokens==9u); /* Count all four generated continuation candidates. */
     assert(myds_dspark_propose_next(&f.ds,&f.ctx,1,4,1)==1u);
-    assert(f.ds.draft_count==1u&&f.ds.proposed_tokens==7u);
+    assert(f.ds.draft_count==1u&&f.ds.proposed_tokens==10u);
+
+    assert(myds_dspark_propose_next(&f.ds,&f.ctx,1,4,2)==2u);
+    assert(observed_slot==1u&&f.ds.draft_tokens[0]==3&&f.ds.draft_tokens[1]==4);
+    assert(f.ds.proposed_tokens==12u);
 
     /* Slot-1 conditioning must follow the emitted seed, independently of the
      * token that produced the target capture. Markov arithmetic is real. */
@@ -133,6 +137,13 @@ static void neural_contract(void) {
     assert(m.ds.draft_tokens[0]==6&&m.state[0]==1.0f);
     assert(myds_dspark_propose(&m.ds,&m.ctx,1,1)==1u);
     assert(m.ds.draft_tokens[0]==7&&m.state[0]==-1.0f);
+
+    fixture_t chain;init(&chain,true);memset(chain.logits,0,sizeof(chain.logits));
+    chain.ctx.v41=(myds_v41_context_t *)(uintptr_t)1;
+    chain.w1[6][0]=UINT16_C(0xbc00); /* draft1=6 makes slot2 prefer 7. */
+    assert(myds_dspark_propose_next(&chain.ds,&chain.ctx,1,4,2)==2u);
+    assert(chain.ds.draft_tokens[0]==6&&chain.ds.draft_tokens[1]==7);
+    assert(chain.state[0]==-1.0f&&chain.ds.proposed_tokens==2u);
 
     /* A failed stage evaluation must not turn the usable Markov head into a
      * fallback proposal or publish leftover tree storage. */

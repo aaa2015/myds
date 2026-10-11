@@ -84,6 +84,9 @@ void            myds_last_prefill_stats(const myds_context_t *ctx, myds_prefill_
 typedef struct {
     uint64_t target_forward_calls, target_rows;
     uint64_t batch2_calls, batch2_hits, batch2_misses, batch2_failures, batch2_fallbacks;
+    /* Continuous [seed,draft1,draft2] attempts are also included in batch2
+     * compatibility totals. hits1/hits2 consume two/three target rows. */
+    uint64_t depth2_calls, depth2_hits1, depth2_hits2, depth2_misses, depth2_failures, depth2_fallbacks;
     uint64_t draft_cycles, draft_proposed, draft_accepted, draft_rejects;
     uint64_t confidence_rejects, margin_rejects, backoff_steps;
     uint64_t pld_queries, pld_cycles, pld_proposed, pld_accepted;

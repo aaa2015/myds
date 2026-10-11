@@ -133,6 +133,16 @@ typedef struct myds_v41_spec_snapshot {
     myds_engram_history_t first_engram_history;
     uint64_t first_rng_state;
     bool first_state_valid;
+    /* Continuous depth2 only: exact state after consuming seed and draft1.
+     * These views have the same next-forward lifetime as the first checkpoint;
+     * a first-row miss/EOS leaves second_state_valid false. */
+    myds_metal_buffer_t *second_previous_kv[4], *second_previous_score[4];
+    myds_metal_buffer_t *second_residual, *second_pre, *second_logits;
+    myds_metal_buffer_t *second_dspark_slots[3];
+    myds_engram_history_t second_engram_history;
+    uint64_t second_rng_state;
+    bool second_state_valid;
+    bool linear_retry_valid;
     bool valid;
 } myds_v41_spec_snapshot_t;
 
@@ -142,6 +152,27 @@ bool myds_v41_spec_snapshot_restore_partial(myds_context_t *context, const myds_
 /* Capture the actual, completed first target step for the opt-in sequential
  * comparison path; also usable by diagnostic state fixtures. */
 bool myds_v41_spec_snapshot_capture_first(myds_context_t *context, myds_v41_spec_snapshot_t *snap);
+/* Capture a completed authoritative second step, for diagnostics or a legal
+ * scalar retry. Requires an existing first checkpoint and a count>=3 snapshot.
+ * Capturing it does not reuse the first checkpoint's backing buffers. */
+bool myds_v41_spec_snapshot_capture_second(myds_context_t *context, myds_v41_spec_snapshot_t *snap);
+
+/* Independent greedy, text-only continuous verifier. Exactly three inputs
+ * {seed,draft1,draft2} occupy position,position+1,position+2; out has capacity3.
+ * A single three-row transformer graph computes the candidates, followed by
+ * lazy authoritative heads. Returns1/2/3 consumed rows (including seed),
+ * stopping on the first mismatch or EOS. The last returned output is a bonus
+ * token and has not itself been consumed. No force/env flag enables sampling.
+ * Failure returns-1 with no output publication and attempts original-prefix
+ * rollback; an invalid context must never be retried. No scalar fallback is
+ * hidden in this API. Borrowed checkpoints support immediate partial1/2. */
+int myds_v41_forward_linear_spec_ex(myds_context_t *context, const int32_t *tokens,
+    uint32_t n_tokens, uint32_t position, int32_t *out_tokens,
+    myds_v41_spec_snapshot_t *snapshot);
+/* True only after this API failed and completed its original-prefix rollback.
+ * The retry must begin with the original seed at snapshot->pos. */
+bool myds_v41_linear_spec_retry_ready(const myds_context_t *context,
+    const myds_v41_spec_snapshot_t *snapshot);
 
 /* ── 投机微批前向通道 ── */
 /* Explicit opt-in, greedy text only. Requested excludes the per-draft

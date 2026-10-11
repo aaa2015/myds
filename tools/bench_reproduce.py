@@ -345,6 +345,19 @@ def validate_run(directory, state, audit):
                 value = telemetry.get(key)
                 audit.require(isinstance(value, int) and not isinstance(value, bool) and value >= 0,
                               'Invalid decode telemetry counter: ' + key)
+            # Optional for older frozen archives; a new record must bind all six.
+            depth2_keys = ('depth2_calls', 'depth2_hits1', 'depth2_hits2',
+                           'depth2_misses', 'depth2_failures', 'depth2_fallbacks')
+            if any(key in telemetry for key in depth2_keys):
+                for key in depth2_keys:
+                    audit.require(type(telemetry.get(key)) is int and telemetry[key] >= 0,
+                                  'Invalid depth2 counter: ' + key)
+                audit.require(sum(telemetry[key] for key in depth2_keys[1:5]) <= telemetry['depth2_calls'],
+                              'Depth2 outcomes exceed calls')
+                audit.require(telemetry['depth2_calls'] <= telemetry['batch2_calls'] and
+                              telemetry['depth2_failures'] <= telemetry['batch2_failures'] and
+                              telemetry['depth2_fallbacks'] <= telemetry['batch2_fallbacks'],
+                              'Depth2 counters exceed compatibility totals')
             audit.require(telemetry['output_tokens'] == sample['output_tokens'], 'Decode telemetry output count differs')
             audit.require(isinstance(telemetry.get('timing_enabled'), bool), 'Missing timing-enabled marker')
             if state['environment'].get('MYDS_DECODE_METRICS') == '1':

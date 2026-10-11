@@ -3001,6 +3001,47 @@ static uint32_t decode_pld_propose(myds_context_t *ctx, const int32_t *history,
     return count;
 }
 
+/* Publish only the target inputs whose authoritative outputs the caller has
+ * kept. A streaming callback may cancel after either accepted draft; the
+ * borrowed first/second checkpoints are still valid until the next forward. */
+static bool decode_linear_keep(myds_context_t *ctx,
+    const myds_v41_spec_snapshot_t *snap, uint32_t evaluated, uint32_t keep,
+    uint32_t pos, const int32_t *inputs) {
+    if (keep > evaluated) return false;
+    if (keep < evaluated) {
+        const bool restored = keep ?
+            myds_v41_spec_snapshot_restore_partial(ctx, snap, keep) :
+            myds_v41_spec_snapshot_restore(ctx, snap);
+        if (!restored) { ctx->pcache_len = 0; return false; }
+    }
+    ctx->pos = pos + keep;
+    if (ctx->pcache_tokens && pos <= ctx->pcache_cap &&
+        keep <= ctx->pcache_cap - pos) {
+        for (uint32_t i = 0; i < keep; ++i) ctx->pcache_tokens[pos + i] = inputs[i];
+        ctx->pcache_len = pos + keep;
+    } else {
+        ctx->pcache_len = 0;
+    }
+    return true;
+}
+
+static void decode_dspark_linear_backoff(myds_dspark_t *ds, uint32_t accepted) {
+    static int threshold = -1;
+    if (threshold < 0) {
+        const char *e = getenv("MYDS_DSPARK_BACKOFF_THRESH");
+        threshold = e ? atoi(e) : 6;
+    }
+    if (accepted) {
+        ds->consecutive_misses = ds->backoff_counter = 0;
+    } else {
+        ds->consecutive_misses++;
+        if (threshold > 0) {
+            if (ds->consecutive_misses >= (uint32_t)threshold + 2u) ds->backoff_counter = 8;
+            else if (ds->consecutive_misses >= (uint32_t)threshold) ds->backoff_counter = 4;
+        }
+    }
+}
+
 static int myds_generate_internal(myds_context_t *ctx,
                      const char     *prompt,
                      myds_stream_callback_t cb,
@@ -3183,7 +3224,9 @@ static int myds_generate_internal(myds_context_t *ctx,
      * complete target forward before its first neural proposal; that step
      * primes fresh slots even when the reused prefix has no slot snapshot. */
     const bool serial_probe = decode_env_enabled("MYDS_SPEC_SERIAL_PROBE");
-    const bool spec_requested = !ctx->v41 || myds_v41_batch2_spec_requested(ctx);
+    const uint32_t dspark_depth = serial_probe ? 1u : myds_dspark_decode_depth(ctx);
+    const bool spec_requested = !ctx->v41 || myds_v41_batch2_spec_requested(ctx) ||
+        (ctx->dspark && dspark_depth == 2u);
     const bool use_spec = spec_requested || serial_probe;
     myds_dspark_capture_begin_request(ctx->dspark, use_spec && ctx->cfg.max_new_tokens > 1u);
 
@@ -3517,9 +3560,12 @@ static int myds_generate_internal(myds_context_t *ctx,
                 continue;
             }
 
-            /* The V4.1 verifier consumes one continuation position; its A/B
-             * tree candidates are alternatives at that position. */
-            uint32_t draft_cap = ctx->v41 ? 1 : (ctx->dspark ? ctx->dspark->block_size : 4);
+            /* Linear depth 2 needs room for the seed and both draft inputs.
+             * Short tails retain the depth-1 verifier and its bonus output. */
+            const bool linear_room = dspark_depth == 2u && max_gen - step >= 3u &&
+                ctx->cfg.max_seq_len - ctx->pos >= 3u;
+            uint32_t draft_cap = ctx->v41 ? (linear_room ? 2u : 1u) :
+                (ctx->dspark ? ctx->dspark->block_size : 4);
             if (draft_cap > max_gen - step) draft_cap = max_gen - step;
 
             int32_t cand_a = -1, cand_b = -1;
@@ -3544,7 +3590,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                     ctx->decode_stats.draft_ms += decode_now_ms() - draft_start;
                 if (n_dspark > 0) {
                     cand_a = ctx->dspark->draft_tree_tokens[0];
-                    if (ctx->dspark->draft_tree_count >= 2) {
+                    if (dspark_depth == 1u && ctx->dspark->draft_tree_count >= 2) {
                         cand_b = ctx->dspark->draft_tree_tokens[1];
                     }
                 }
@@ -3559,7 +3605,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                         cand_a = pld_draft[0];
                         ctx->decode_pld_candidate = true;
                     }
-                } else if (cand_b < 0) {
+                } else if (dspark_depth == 1u && cand_b < 0) {
                     int32_t pld_draft[MYDS_PLD_DEFAULT_MAX_DRAFT];
                     myds_pld_config_t pld_cfg = myds_pld_default_config(m->tokenizer->eos_id);
                     uint32_t n_pld = decode_pld_propose(ctx, pld_history, pld_len, &pld_cfg, pld_draft);
@@ -3615,6 +3661,95 @@ static int myds_generate_internal(myds_context_t *ctx,
             if (snap) snap->valid = false;
 
             uint32_t accepted_in_cycle = 0;
+
+            if (linear_room && snap && neural_count >= 2u && !ctx->decode_pld_candidate) {
+                if (cancel_flag && *cancel_flag) {
+                    stop_reason = MYDS_STOP_CANCELLED;
+                    break;
+                }
+                const uint32_t spec_pos = ctx->pos;
+                const int32_t seed = cur_token;
+                const int32_t inputs[3] = { seed, ctx->dspark->draft_tokens[0],
+                    ctx->dspark->draft_tokens[1] };
+                int32_t out_tokens[3] = { -1, -1, -1 };
+                const double verify_start = decode_now_ms();
+                int ret = myds_v41_forward_linear_spec_ex(ctx, inputs, 3u,
+                    spec_pos, out_tokens, snap);
+                if (ret < 0 && myds_v41_linear_spec_retry_ready(ctx, snap)) {
+                    /* The target has committed a complete restoration to the
+                     * entry prefix. Recover only the original seed, without
+                     * publishing any result from the failed three-row graph. */
+                    out_tokens[0] = myds_forward_token(ctx, seed, spec_pos);
+                    if (out_tokens[0] >= 0 && (uint32_t)out_tokens[0] < m->tokenizer->vocab_size &&
+                        myds_dspark_capture_ready(ctx->dspark)) {
+                        ret = 1;
+                        ctx->decode_stats.depth2_fallbacks++;
+                        ctx->decode_stats.batch2_fallbacks++;
+                    }
+                }
+                ctx->decode_stats.verify_ms += decode_now_ms() - verify_start;
+                bool valid_output = ret >= 1 && ret <= 3;
+                for (int i = 0; valid_output && i < ret; ++i)
+                    valid_output = out_tokens[i] >= 0 &&
+                        (uint32_t)out_tokens[i] < m->tokenizer->vocab_size;
+                if (!valid_output) {
+                    if (ret >= 0 && snap->valid) (void)myds_v41_spec_snapshot_restore(ctx, snap);
+                    ctx->pcache_len = 0;
+                    stop_reason = MYDS_STOP_ERROR;
+                    success = 0;
+                    break;
+                }
+
+                uint32_t keep = 0;
+                for (uint32_t i = 0; i < (uint32_t)ret; ++i) {
+                    if (cancel_flag && *cancel_flag) {
+                        stop_reason = MYDS_STOP_CANCELLED;
+                        break;
+                    }
+                    if (step >= max_gen) break;
+                    if (out_tokens[i] == m->tokenizer->eos_id) {
+                        keep = i + 1u;
+                        step++;
+                        cur_token = out_tokens[i];
+                        if (pld_history && pld_len < pld_cap) pld_history[pld_len++] = out_tokens[i];
+                        stop_reason = MYDS_STOP_EOS;
+                        break;
+                    }
+                    size_t piece_len = 0;
+                    const char *piece = myds_tokenizer_decode_bytes(m->tokenizer,
+                        out_tokens[i], &piece_len);
+                    if (!piece) {
+                        stop_reason = MYDS_STOP_ERROR;
+                        success = 0;
+                        break;
+                    }
+                    keep = i + 1u;
+                    step++;
+                    cur_token = out_tokens[i];
+                    if (pld_history && pld_len < pld_cap) pld_history[pld_len++] = out_tokens[i];
+                    decode_emit(ctx, cb, bytes_cb, piece, piece_len, out_tokens[i], user_data);
+                }
+                const int32_t kept_inputs[3] = { seed, out_tokens[0], out_tokens[1] };
+                if (!decode_linear_keep(ctx, snap, (uint32_t)ret, keep, spec_pos, kept_inputs)) {
+                    stop_reason = MYDS_STOP_ERROR;
+                    success = 0;
+                } else if (keep) {
+                    last_consumed_token = kept_inputs[keep - 1u];
+                    /* An accepted draft is an input which remains consumed;
+                     * the final authoritative output is the pending seed. */
+                    accepted_in_cycle = keep - 1u;
+                    ctx->dspark->accepted_tokens += accepted_in_cycle;
+                    ctx->decode_stats.draft_accepted += accepted_in_cycle;
+                }
+                gettimeofday(&tv_ver1, NULL);
+                ctx->dspark->verify_ms += (double)(tv_ver1.tv_sec - tv_ver0.tv_sec) * 1000.0 +
+                    (double)(tv_ver1.tv_usec - tv_ver0.tv_usec) / 1000.0;
+                if (success && stop_reason != MYDS_STOP_CANCELLED)
+                    decode_dspark_linear_backoff(ctx->dspark, accepted_in_cycle);
+                if (stop_reason == MYDS_STOP_EOS || stop_reason == MYDS_STOP_CANCELLED ||
+                    !success || step >= max_gen) break;
+                continue;
+            }
 
             if (ctx->v41 && snap && max_gen - step >= 2 &&
                 ctx->pos < ctx->cfg.max_seq_len && ctx->cfg.max_seq_len - ctx->pos >= 2) {

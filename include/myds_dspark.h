@@ -210,6 +210,9 @@ struct myds_dspark {
      * unmanaged/direct scalar and Batch2 forwards remain capture-active.
      * Engine mode excludes the experimental tree API, not those direct APIs. */
     bool capture_configured, capture_bypass_mode, capture_disabled, capture_committed;
+    /* A failed continuous target graph invalidates even reference-mode
+     * availability; only a successful target/restore publication clears it. */
+    bool capture_poisoned;
     bool capture_engine_only;
     uint32_t capture_valid_mask;
     myds_dspark_capture_counters_t capture_counters;
@@ -288,6 +291,8 @@ void myds_dspark_capture_counters(myds_dspark_t *ds, myds_dspark_capture_counter
 void myds_dspark_capture_begin_request(myds_dspark_t *ds, bool speculative_scope);
 void myds_dspark_capture_end_request(myds_dspark_t *ds, bool success);
 void myds_dspark_capture_invalidate(myds_dspark_t *ds);
+/* Failure-only invalidation across every capture policy, including mode 0. */
+void myds_dspark_capture_poison(myds_dspark_t *ds);
 /* Only call after a successful target/restore commit which has written all
  * three slots. Whole rollback instead invalidates; a target retry recaptures. */
 void myds_dspark_capture_publish(myds_dspark_t *ds);
@@ -300,10 +305,20 @@ int myds_dspark_capture_layer_to(myds_dspark_t *ds, uint32_t layer_idx,
 /* Propose K draft tokens given last token and captured target hidden states */
 uint32_t myds_dspark_propose(myds_dspark_t *ds, myds_context_t *ctx, int32_t last_token, uint32_t draft_cap);
 
+/* Engine continuation depth: absent/1 keeps the established one-candidate
+ * path; exactly MYDS_DSPARK_DEPTH=2 opts into two consecutive candidates.
+ * Only text V4.1 greedy requests with checkpoint capture can use depth 2;
+ * force/tree flags cannot override the sampling guard. Engine capture bypass
+ * mode 2 retains depth 1. Read per request, without an environment cache. */
+uint32_t myds_dspark_decode_depth(const myds_context_t *ctx);
+
 /* V4.1 Engine continuation: capture belongs to the last consumed token at
  * ctx->pos-1; emitted_seed has already been sampled/emitted from its logits.
  * The next unseen token comes from slot 1, with Markov conditioned on that
- * authoritative emitted seed. Markov-only drafting retains the usual API. */
+ * authoritative emitted seed. A second candidate comes from slot 2 at the
+ * next position, with Markov/confidence conditioned on candidate 1. Prefix
+ * evaluation retains every causal stage row through the requested slot.
+ * Markov-only drafting retains the usual API. */
 uint32_t myds_dspark_propose_next(myds_dspark_t *ds, myds_context_t *ctx,
     int32_t consumed_token, int32_t emitted_seed, uint32_t draft_cap);
 

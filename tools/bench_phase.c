@@ -169,6 +169,8 @@ static void decode_metrics(FILE *json, myds_context_t *ctx) {
     COUNTER(target_forward_calls); COUNTER(target_rows);
     COUNTER(batch2_calls); COUNTER(batch2_hits); COUNTER(batch2_misses);
     COUNTER(batch2_failures); COUNTER(batch2_fallbacks);
+    COUNTER(depth2_calls); COUNTER(depth2_hits1); COUNTER(depth2_hits2);
+    COUNTER(depth2_misses); COUNTER(depth2_failures); COUNTER(depth2_fallbacks);
     COUNTER(draft_cycles); COUNTER(draft_proposed); COUNTER(draft_accepted); COUNTER(draft_rejects);
     COUNTER(confidence_rejects); COUNTER(margin_rejects); COUNTER(backoff_steps);
     COUNTER(pld_queries); COUNTER(pld_cycles); COUNTER(pld_proposed); COUNTER(pld_accepted);
@@ -299,7 +301,7 @@ int main(int argc, char **argv) {
         "MYDS_ATTN_OUT_A_FUSE_BF16",
         "MYDS_ATTN_DIRECT_PACK",
         "MYDS_ENGRAM_IO_THREADS", "MYDS_ENGRAM_NOCACHE", "MYDS_BENCH_STORAGE_COUNTERS",
-        "MYDS_GEMV_BATCH_SIZE", "MYDS_PLD", "MYDS_BATCH2_SPEC", "MYDS_BATCH2_Q8_SHARED", "MYDS_TREE_SPEC",
+        "MYDS_GEMV_BATCH_SIZE", "MYDS_PLD", "MYDS_BATCH2_SPEC", "MYDS_BATCH2_Q8_SHARED", "MYDS_TREE_SPEC", "MYDS_DSPARK_DEPTH", "MYDS_DSPARK_EVAL_PREFIX",
         "MYDS_DSPARK_MARKOV_ONLY", "MYDS_DSPARK_MARKOV_SCALE", "MYDS_DSPARK_MIN_CONF",
         "MYDS_DSPARK_MIN_MARGIN", "MYDS_DSPARK_HIGH_CONF_MARGIN", "MYDS_DSPARK_COST_GATE",
         "MYDS_ANCHOR_SNAPSHOT", "MYDS_KV_DSK_PREFER_DEEPER", "MYDS_KV_DSK_BUDGET_MB",
