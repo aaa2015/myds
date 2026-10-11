@@ -3159,8 +3159,8 @@ static int publish_indexer_one_impl(myds_context_t *ctx, uint32_t il, uint32_t p
 
         const myds_metal_buffer_t *b_mask = (il > 20) ? (in_block_mask ? in_block_mask : g->block_mask) : NULL;
         if (!myds_metal_get_auto_barrier()) {
-            const myds_metal_buffer_t *score_deps[] = { q_buf, w_buf };
-            myds_metal_barrier_buffers(score_deps, 2);
+            const myds_metal_buffer_t *score_deps[] = { q_buf, w_buf, g->index_cache[owner] };
+            myds_metal_barrier_buffers(score_deps, 3);
         }
         int compact_score=0;
         if(decode_single&&il>20&&count>16384u&&!myds_trace_active()) {
@@ -3217,13 +3217,35 @@ static int publish_indexer_one(myds_context_t *ctx,uint32_t il,uint32_t pos,
 
 /* Only the authoritative single-token decode opts into compact scoring.
  * Prefill and speculative rows may have different per-row block selections. */
+static int publish_compressor_decode(myds_context_t *ctx, uint32_t il, uint32_t pos,
+    const myds_metal_buffer_t *x_norm, bool ordinary_indexer_allowed) {
+    if (ordinary_indexer_allowed && myds_metal_indexer_rope_quant_fuse_enabled()) {
+        return publish_compressor_indexer_rope_quant_scoped(ctx,il,pos,x_norm,NULL,NULL,true);
+    } else if (ordinary_indexer_allowed && myds_metal_f16_gemv_bf16_fuse_enabled()) {
+        return publish_compressor_f16_bf16_scoped(ctx,il,pos,x_norm,NULL,NULL,true);
+    } else {
+        return publish_compressor(ctx,il,pos,x_norm,NULL,NULL);
+    }
+}
+
+static int publish_index_weights_decode(myds_context_t *ctx, uint32_t il, uint32_t pos,
+    const myds_metal_buffer_t *x_norm, bool ordinary_indexer_allowed) {
+    const uint32_t ratio = ratio_for(il);
+    if (!ratio) return 1;
+    const uint32_t count = (pos + 1u) / ratio;
+    if (count && index_source(il)) {
+        myds_v41_context_t *g = ctx->v41;
+        const v41_layer_t *l = &ctx->model->v41->layers[il];
+        return project_f16_bf16_scoped(g->index_weights, l->index_proj, x_norm,
+                                       V41_INDEX_HEADS, V41_DIM, GGML_TYPE_F16,
+                                       true, ordinary_indexer_allowed);
+    }
+    return 1;
+}
+
 static int publish_and_select_decode(myds_context_t *ctx,uint32_t il,uint32_t pos,
     const myds_metal_buffer_t *x_norm,const myds_metal_buffer_t *qr_norm,bool ordinary_indexer_allowed) {
-    if (ordinary_indexer_allowed && myds_metal_indexer_rope_quant_fuse_enabled()) {
-        if (!publish_compressor_indexer_rope_quant_scoped(ctx,il,pos,x_norm,NULL,NULL,true)) return 0;
-    } else if (ordinary_indexer_allowed && myds_metal_f16_gemv_bf16_fuse_enabled()) {
-        if (!publish_compressor_f16_bf16_scoped(ctx,il,pos,x_norm,NULL,NULL,true)) return 0;
-    } else if (!publish_compressor(ctx,il,pos,x_norm,NULL,NULL)) return 0;
+    if (!publish_compressor_decode(ctx, il, pos, x_norm, ordinary_indexer_allowed)) return 0;
     return publish_indexer_one_impl(ctx,il,pos,x_norm,qr_norm,NULL,NULL,NULL,NULL,NULL,true,ordinary_indexer_allowed);
 }
 
@@ -3547,10 +3569,27 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
             if (qkv_concurrent_requested) myds_v41_decode_qkv_scope_begin(&qkv_scope, false);
             myds_metal_barrier_buffer(ctx->x_norm);
 
-            /* 三路独立分支：hc_mix、q_a、kv_a；scope 启用时可实际并发 */
+            static int indexer_pipeline_enabled = -1;
+            if (indexer_pipeline_enabled < 0) {
+                const char *env = getenv("MYDS_ATTN_INDEXER_PIPELINE");
+                indexer_pipeline_enabled = (env == NULL || atoi(env) != 0);
+            }
+            static int attn_indexer_early_enabled = -1;
+            if (attn_indexer_early_enabled < 0) {
+                const char *env = getenv("MYDS_ATTN_INDEXER_EARLY");
+                attn_indexer_early_enabled = (env == NULL || atoi(env) != 0);
+            }
+            const bool do_early_indexer = attn_indexer_early_enabled && indexer_pipeline_enabled &&
+                                          ordinary_decode_allowed && need_logits && !trace_on;
+
+            /* 三路独立分支：hc_mix、q_a、kv_a；若 do_early_indexer 则并发派发 compressor 与 index_weights */
             CHECK(myds_metal_v41_hc_mix(g->attn_split,g->residual,l->attn_fn,GGML_TYPE_F16,l->attn_scale,l->attn_base,g->flat_norm,g->mix,V41_DIM,m->norm_eps,v->hc_eps));
             CHECK(project_decode_qkv(ctx->qr,base->attn_q_a,ctx->x_norm,1280,V41_DIM,base->attn_q_a_type,false));
             CHECK(project_decode_qkv(ctx->kv_act,base->attn_kv,ctx->x_norm,512,V41_DIM,base->attn_kv_type,false));
+            if (do_early_indexer) {
+                CHECK(publish_compressor_decode(ctx,il,pos,ctx->x_norm,true));
+                CHECK(publish_index_weights_decode(ctx,il,pos,ctx->x_norm,true));
+            }
 
             /* 仅同步 q_a 与 kv_a 输出，计算 RMSNorm */
             const myds_metal_buffer_t *qkv_out[] = { ctx->qr, ctx->kv_act };
@@ -3559,16 +3598,10 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
             CHECK(myds_metal_v41_rmsnorm(ctx->qr_norm,ctx->qr,base->attn_q_a_norm,1280,m->norm_eps,true));
             CHECK(myds_metal_v41_rmsnorm(ctx->kv_act,ctx->kv_act,base->attn_kv_a_norm,512,m->norm_eps,true));
 
-            static int indexer_pipeline_enabled = -1;
-            if (indexer_pipeline_enabled < 0) {
-                const char *env = getenv("MYDS_ATTN_INDEXER_PIPELINE");
-                indexer_pipeline_enabled = (env == NULL || atoi(env) != 0);
-            }
-
             if (indexer_pipeline_enabled) {
                 /* 保持 auto_barrier = 0 跨流并发：
                  * 1. 同步 RMSNorm 输出供 Q_B 与 Indexer 消费
-                 * 2. 并发派发 Q_B (32768 x 1280 GEMV) 与 publish_and_select (压缩器 + Indexer)
+                 * 2. 并发派发 Q_B (32768 x 1280 GEMV) 与 Indexer (跳过已完成的 weights/compressor)
                  * 3. 仅同步 ctx->q，派发 qkv_finish
                  * 4. 汇聚等待 QKV finish 与 Indexer 全部完成
                  */
@@ -3577,7 +3610,13 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
 
                 CHECK(project_decode_qkv(ctx->q,base->attn_q_b,ctx->qr_norm,V41_HEADS*512,1280,base->attn_q_b_type,false));
                 phase="compressed KV / indexer";
-                CHECK(publish_and_select_decode(ctx,il,pos,ctx->x_norm,ctx->qr_norm,ordinary_decode_allowed && need_logits && !trace_on));
+                if (do_early_indexer) {
+                    CHECK(publish_indexer_one_impl(ctx,il,pos,ctx->x_norm,ctx->qr_norm,NULL,
+                                                   (count && index_source(il)) ? g->index_weights : NULL,
+                                                   NULL,NULL,NULL,true,true));
+                } else {
+                    CHECK(publish_and_select_decode(ctx,il,pos,ctx->x_norm,ctx->qr_norm,ordinary_decode_allowed && need_logits && !trace_on));
+                }
 
                 myds_metal_barrier_buffer(ctx->q);
                 static int qkv_post_enabled=-1;
