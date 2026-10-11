@@ -137,8 +137,10 @@ static int request(myds_context_t *ctx,const char *label,const char *prompt,bool
     *s=(stream_t){.ctx=ctx,.cancel_after=cancel_after,.hit_output=hit_output};
     uint32_t prompt_tokens=0;
     CHECK(myds_generate_bytes_ex(ctx,prompt,stream,s,reason,&prompt_tokens,&s->cancel)==1&&!s->failed);
+    fprintf(stderr,"[depth2-engine] %s reason=%d outputs=%u cap=%u cached=%u hits2=%" PRIu64 "\n",label,(int)*reason,s->count,cap,ctx->last_cached_tokens,ctx->decode_stats.depth2_hits2);
     if(hit_output)CHECK(*reason==MYDS_STOP_CANCELLED&&s->hit_index==hit_output&&ctx->decode_stats.depth2_hits2>0);
     else if(cancel_after)CHECK(*reason==MYDS_STOP_CANCELLED&&s->count==cancel_after);
+    else if(continuation)CHECK((*reason==MYDS_STOP_LENGTH&&s->count==cap)||(*reason==MYDS_STOP_EOS&&s->count<cap));
     else CHECK(*reason==MYDS_STOP_LENGTH&&s->count==cap);
     if(continuation)CHECK(ctx->last_cached_tokens>0);
     if(!spec)CHECK(ctx->decode_stats.depth2_calls==0&&ctx->decode_stats.draft_cycles==0);
