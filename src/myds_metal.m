@@ -63,6 +63,7 @@ static id<MTLComputePipelineState> g_pso_moe_mv_id_q2_k = nil;
 static id<MTLComputePipelineState> g_pso_moe_swiglu_weight = nil;
 static id<MTLComputePipelineState> g_pso_moe_sum6 = nil;
 static id<MTLComputePipelineState> g_pso_moe_pair_swiglu_iq2_xxs = nil;
+static id<MTLComputePipelineState> g_pso_moe_pair_swiglu_popcnt_iq2_xxs = nil;
 static id<MTLComputePipelineState> g_pso_moe_sum6_q2_k = nil;
 static id<MTLComputePipelineState> g_pso_moe_pair_swiglu_batch_iq2_xxs = nil;
 static id<MTLComputePipelineState> g_pso_moe_sum6_batch_q2_k = nil;
@@ -83,6 +84,10 @@ static NSUInteger                  g_moe_id_map_bytes = 0;
 static int                         g_moe_nsg = 2;
 static int                         g_moe_down_nsg = 2;
 static bool                        g_moe_iq2_constant_lut = false;
+/* 2026-10-13 参谋长: IQ2_XXS gate/up 的 popcount 符号变体（位级一致，仅去掉 ssigns 查表）。
+ * 恒等式 ssigns[c] == c | (parity(c) << 7) 已对全部 128 个码逐一核对⇒纯替换。
+ * 默认 0（原路径）；仅接受字面 "1" 开启。 */
+static int                         g_moe_iq2_popcnt_sign = 0;
 static id<MTLComputePipelineState> g_pso_attn_out_low_q8_0 = nil;
 static id<MTLComputePipelineState> g_pso_attn_out_low_q8_0_bf16_r4 = nil;
 static id<MTLComputePipelineState> g_pso_attn_out_low_q4_K = nil;
@@ -1866,6 +1871,23 @@ int myds_metal_init(const char *shader_dir) {
         } else {
             printf("myds_metal: %s fn error: %s\n", [iq2_pair_name UTF8String], [[pso_err localizedDescription] UTF8String]);
         }
+
+        /* 2026-10-13 参谋长: popcount 符号变体（位级一致）。仅在显式开启时构建；
+         * 缺 PSO 时必须失败而不是静默回退（与上面 constant-LUT 的门禁同规矩）。 */
+        if (g_moe_iq2_popcnt_sign) {
+            pso_err = nil;
+            fn = [g_library newFunctionWithName:@"kernel_mul_mv_id_iq2_xxs_pair_swiglu_popcnt_f32"
+                                 constantValues:moe_mv_id_constants error:&pso_err];
+            if (fn) {
+                g_pso_moe_pair_swiglu_popcnt_iq2_xxs = [g_device newComputePipelineStateWithFunction:fn error:&pso_err];
+            }
+            if (!g_pso_moe_pair_swiglu_popcnt_iq2_xxs) {
+                fprintf(stderr, "myds_metal: explicitly requested IQ2 popcount-sign kernel unavailable\n");
+                g_initialized = true;
+                myds_metal_cleanup();
+                return 0;
+            }
+        }
         /* Explicit opt-in must not report successful initialization while
          * silently selecting the reference kernel or an unrelated MM path. */
         if (moe_iq2_constant_lut && !g_pso_moe_pair_swiglu_iq2_xxs) {
@@ -2086,6 +2108,10 @@ int myds_metal_init(const char *shader_dir) {
         g_f16_gemv_bf16_fuse = f16_gemv_bf16_fuse != 0;
         g_indexer_rope_quant_fuse = indexer_rope_quant_fuse != 0;
         g_moe_iq2_constant_lut = moe_iq2_constant_lut;
+        {
+            const char *pc = getenv("MYDS_MOE_IQ2_POPCNT_SIGN");
+            g_moe_iq2_popcnt_sign = (pc && strcmp(pc, "1") == 0) ? 1 : 0;
+        }
         g_moe_q2_sum_cache = moe_q2_sum_cache != 0;
         g_moe_q2_sum_cache_fused = moe_q2_sum_cache_fused != 0;
         g_initialized = true;
@@ -2099,6 +2125,8 @@ int myds_metal_init(const char *shader_dir) {
         MYDS_LOG_I("Routed MoE geometry: IQ2 NSG=%d, Q2 down NSG=%d (%s)",
                    g_moe_nsg, g_moe_down_nsg, down_nsg_env ? "explicit" : "inherited");
         MYDS_LOG_I("Routed MoE IQ2 LUT: %s", g_moe_iq2_constant_lut ? "constant (explicit)" : "threadgroup (reference)");
+        if (g_moe_iq2_popcnt_sign)
+            MYDS_LOG_I("Routed MoE IQ2 gate/up sign: popcount (explicit, bit-exact)");
         MYDS_LOG_I("Batch2 Q8 shared weights: %s", batch2_q8_shared ? "enabled (explicit; TAIL, SHARED, QKV)" : "disabled (scalar reference)");
         MYDS_LOG_I("LM-head Q8 rows per threadgroup: %d (%s; single token, large output, NSG8)",
                    g_lm_head_q8_nr0, lm_head_q8_nr0 == 4 ? "explicit candidate" : "reference");
@@ -2174,6 +2202,8 @@ void myds_metal_cleanup(void) {
     g_moe_nsg = 2;
     g_moe_down_nsg = 2;
     g_moe_iq2_constant_lut = false;
+    g_moe_iq2_popcnt_sign = 0;
+    g_pso_moe_pair_swiglu_popcnt_iq2_xxs = nil;
     g_pso_attn_out_low_q8_0 = nil;
     g_pso_attn_out_low_q8_0_bf16_r4 = nil;
     g_pso_attn_out_low_q4_K = nil;
@@ -5631,7 +5661,13 @@ int myds_metal_routed_moe_batch(
                     MTLSizeMake(32, nsg_down, 1));
             } else {
                 /* Fused Gate + Up + SwiGLU + Scaling dispatch (IQ2_XXS) across all tokens */
-                [enc setComputePipelineState:g_pso_moe_pair_swiglu_iq2_xxs];
+                id<MTLComputePipelineState> gate_up_pso = g_pso_moe_pair_swiglu_iq2_xxs;
+                const char *gate_up_name = "fused_moe_swiglu";
+                if (g_moe_iq2_popcnt_sign && g_pso_moe_pair_swiglu_popcnt_iq2_xxs) {
+                    gate_up_pso = g_pso_moe_pair_swiglu_popcnt_iq2_xxs;
+                    gate_up_name = "fused_moe_swiglu_popcnt";
+                }
+                [enc setComputePipelineState:gate_up_pso];
                 [enc setBytes:&gate_args length:sizeof(gate_args) atIndex:0];
                 [enc setBytes:&swiglu_args length:sizeof(swiglu_args) atIndex:1];
                 [enc setBuffer:gate_exps->mtl_buf offset:gate_exps->offset atIndex:2];
@@ -5643,7 +5679,7 @@ int myds_metal_routed_moe_batch(
                 [enc setBuffer:selected_ids->mtl_buf offset:selected_ids->offset atIndex:8];
                 [enc setBuffer:selected_weights->mtl_buf offset:selected_weights->offset atIndex:9];
                 [enc setThreadgroupMemoryLength:smem_iq2 atIndex:0];
-                metal_dispatch(enc, "fused_moe_swiglu", MTLSizeMake(row_groups_gate, 1, pairs),
+                metal_dispatch(enc, gate_up_name, MTLSizeMake(row_groups_gate, 1, pairs),
                     MTLSizeMake(32, nsg_gate, 1));
                 if (g_auto_barrier) {
                     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
