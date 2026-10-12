@@ -108,6 +108,7 @@ static bool g_indexer_head_slots = false;
 static id<MTLComputePipelineState> g_pso_indexer_head_slots = nil;
 static uint32_t qkv_nr0(void);
 static uint32_t dense_q4_nr0(void);
+static uint32_t dense_q4_nsg(void);
 static int indexer_head_slots_parse_mode(void) {
     const char *value = getenv("MYDS_INDEXER_HEAD_SLOTS");
     if (!value || strcmp(value, "0") == 0) return 0;
@@ -2101,8 +2102,8 @@ int myds_metal_init(const char *shader_dir) {
         MYDS_LOG_I("Batch2 Q8 shared weights: %s", batch2_q8_shared ? "enabled (explicit; TAIL, SHARED, QKV)" : "disabled (scalar reference)");
         MYDS_LOG_I("LM-head Q8 rows per threadgroup: %d (%s; single token, large output, NSG8)",
                    g_lm_head_q8_nr0, lm_head_q8_nr0 == 4 ? "explicit candidate" : "reference");
-        MYDS_LOG_I("Dense Q4 rows per threadgroup: %u (%s; explicit ordinary scalar scope)",
-                   dense_q4_nr0(), dense_q4_nr0() == 4 ? "NR4 candidate" : "reference");
+        MYDS_LOG_I("Dense Q4 rows per threadgroup: %u (%s; explicit ordinary scalar scope), NSG=%u",
+                   dense_q4_nr0(), dense_q4_nr0() == 4 ? "NR4 candidate" : "reference", dense_q4_nsg());
         MYDS_LOG_I("F16 GEMV BF16 fuse: %d (%s; explicit ordinary scalar scope)",
                    g_f16_gemv_bf16_fuse, g_f16_gemv_bf16_fuse ? "fused store" : "reference");
         MYDS_LOG_I("Indexer RoPE quant fuse: %d (%s; explicit ordinary scalar scope)",
@@ -4059,6 +4060,19 @@ static uint32_t dense_q4_nr0(void) {
     return 2u;
 }
 
+/* 2026-10-13 (参谋长): dense Q4_K bf16 GEMV 的 simdgroup 数（每个 threadgroup）。
+ * nsg 与 nr0 都只重排【行】(first_row = (r0*NSG + sgitg)*nr0)，K 维归约固定由
+ * tiisg/8 分成 4 路 + 末尾 simd_sum ⇒ 改 nsg/nr0 保持【位级一致】。
+ * 默认 4（与 g_pso_mul_mv_q4_K_dense_bf16 的编译期 NSG=4 相同）；
+ * 非 4 值必须走函数常量动态管线，不能用预编译 PSO。 */
+static uint32_t dense_q4_nsg(void) {
+    const char *v = getenv("MYDS_DENSE_Q4_NSG");
+    if (!v) return 4u;
+    if (strcmp(v, "2") == 0) return 2u;
+    if (strcmp(v, "8") == 0) return 8u;
+    return 4u;
+}
+
 static id<MTLComputePipelineState> batch2_shared_pipeline(uint32_t nsg, uint32_t nr0, ggml_type type) {
     if ((nsg != 4 && nsg != 8) || (nr0 != 2 && nr0 != 4) || !g_library) return nil;
     NSString *key = [NSString stringWithFormat:@"batch2_shared_%s_%u_%u",
@@ -4657,9 +4671,13 @@ int myds_metal_v41_gemv_bf16(myds_metal_buffer_t *out,
             in_dim > INT32_MAX || in_dim % 256u || out->offset % 16u) return 0;
         const uint64_t row_bytes = (uint64_t)(in_dim / 256u) * 144u;
         if (weight->size / row_bytes < out_dim || input->size / 4u < in_dim || out->size / 4u < out_dim) return 0;
-        const uint32_t nsg = 4u;
+        const uint32_t nsg = dense_q4_nsg();
         uint32_t nr0 = (dense_q4_nr0() == 4u && (out_dim % 4u == 0)) ? 4u : 2u;
-        id<MTLComputePipelineState> pipeline = (nr0 == 4u) ? g_pso_mul_mv_q4_K_dense_bf16_r4 : g_pso_mul_mv_q4_K_dense_bf16;
+        /* Precompiled PSOs bake NSG=4; a non-default NSG must be built with the
+         * function constant below, so force the dynamic path in that case. */
+        id<MTLComputePipelineState> pipeline = (nsg == 4u)
+            ? ((nr0 == 4u) ? g_pso_mul_mv_q4_K_dense_bf16_r4 : g_pso_mul_mv_q4_K_dense_bf16)
+            : nil;
         if (!pipeline) {
             NSString *key = [NSString stringWithFormat:@"q4_k_bf16_%u_%u", nsg, nr0];
             pipeline = g_native_pipelines[key];
@@ -4677,7 +4695,7 @@ int myds_metal_v41_gemv_bf16(myds_metal_buffer_t *out,
                 }
             }
         }
-        if (!pipeline && nr0 == 4u) {
+        if (!pipeline && nr0 == 4u && nsg == 4u) {
             nr0 = 2u;
             pipeline = g_pso_mul_mv_q4_K_dense_bf16;
             if (!pipeline && g_library) {
