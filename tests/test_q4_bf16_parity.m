@@ -64,25 +64,30 @@ int main(void) {
         REQUIRE(myds_metal_gemv(out_ref, w, in, out_dim, in_dim, GGML_TYPE_Q4_K));
         REQUIRE(myds_metal_v41_bf16(out_ref, out_dim));
 
-        // Test: myds_metal_v41_gemv_bf16 (direct single-pass BF16 kernel)
+        // Test NR2: myds_metal_v41_gemv_bf16 with NR2
+        setenv("MYDS_DENSE_Q4_NR0", "2", 1);
         memset(myds_metal_buffer_data(out_test), 0, out_bytes);
         REQUIRE(myds_metal_v41_gemv_bf16(out_test, w, in, out_dim, in_dim, GGML_TYPE_Q4_K));
-
-        // Compare bit-exact
         const uint32_t *ref_u32 = (const uint32_t *)myds_metal_buffer_data(out_ref);
         const uint32_t *test_u32 = (const uint32_t *)myds_metal_buffer_data(out_test);
         int diff = 0;
         for (uint32_t i = 0; i < out_dim; i++) {
-            if (ref_u32[i] != test_u32[i]) {
-                if (diff < 5) {
-                    printf("Mismatch at %u: ref=0x%08x (%.6f) test=0x%08x (%.6f)\n",
-                           i, ref_u32[i], *(float*)&ref_u32[i], test_u32[i], *(float*)&test_u32[i]);
-                }
-                diff++;
-            }
+            if (ref_u32[i] != test_u32[i]) diff++;
         }
         REQUIRE(diff == 0);
-        printf("[PASS] myds_metal_v41_gemv_bf16 (Q4_K): %u x %u bit-exact parity with GEMV+BF16!\n", out_dim, in_dim);
+        printf("[PASS] myds_metal_v41_gemv_bf16 (Q4_K, NR2): %u x %u bit-exact parity with GEMV+BF16!\n", out_dim, in_dim);
+
+        // Test NR4: myds_metal_v41_gemv_bf16 with NR4
+        setenv("MYDS_DENSE_Q4_NR0", "4", 1);
+        memset(myds_metal_buffer_data(out_test), 0, out_bytes);
+        REQUIRE(myds_metal_v41_gemv_bf16(out_test, w, in, out_dim, in_dim, GGML_TYPE_Q4_K));
+        test_u32 = (const uint32_t *)myds_metal_buffer_data(out_test);
+        diff = 0;
+        for (uint32_t i = 0; i < out_dim; i++) {
+            if (ref_u32[i] != test_u32[i]) diff++;
+        }
+        REQUIRE(diff == 0);
+        printf("[PASS] myds_metal_v41_gemv_bf16 (Q4_K, NR4): %u x %u bit-exact parity with GEMV+BF16!\n", out_dim, in_dim);
 
         myds_metal_buffer_free(w);
         myds_metal_buffer_free(in);
@@ -90,53 +95,63 @@ int main(void) {
         myds_metal_buffer_free(out_test);
     }
 
-    // Test 2: myds_metal_attn_output_a_bf16 with Q4_K vs Reference
+    // Test 2: myds_metal_attn_output_a_bf16 with Q4_K vs Reference across ranks
     {
-        uint32_t n_groups = 128;
-        uint32_t group_dim = 256;
-        uint32_t rank = 16;
-        size_t a_group_bytes = (size_t)rank * (group_dim / 256u) * 144u;
-        size_t w_bytes = a_group_bytes * n_groups;
-        size_t heads_bytes = (size_t)n_groups * group_dim * sizeof(float);
-        size_t low_bytes = (size_t)n_groups * rank * sizeof(float);
+        uint32_t ranks[] = { 16, 1024 };
+        for (size_t r = 0; r < sizeof(ranks)/sizeof(ranks[0]); r++) {
+            uint32_t n_groups = (ranks[r] == 1024) ? 8 : 128;
+            uint32_t group_dim = 256;
+            uint32_t rank = ranks[r];
+            size_t a_group_bytes = (size_t)rank * (group_dim / 256u) * 144u;
+            size_t w_bytes = a_group_bytes * n_groups;
+            size_t heads_bytes = (size_t)n_groups * group_dim * sizeof(float);
+            size_t low_bytes = (size_t)n_groups * rank * sizeof(float);
 
-        myds_metal_buffer_t *out_a = myds_metal_buffer_alloc(w_bytes);
-        myds_metal_buffer_t *heads = myds_metal_buffer_alloc(heads_bytes);
-        myds_metal_buffer_t *low_ref = myds_metal_buffer_alloc(low_bytes);
-        myds_metal_buffer_t *low_test = myds_metal_buffer_alloc(low_bytes);
-        REQUIRE(out_a && heads && low_ref && low_test);
+            myds_metal_buffer_t *out_a = myds_metal_buffer_alloc(w_bytes);
+            myds_metal_buffer_t *heads = myds_metal_buffer_alloc(heads_bytes);
+            myds_metal_buffer_t *low_ref = myds_metal_buffer_alloc(low_bytes);
+            myds_metal_buffer_t *low_test = myds_metal_buffer_alloc(low_bytes);
+            REQUIRE(out_a && heads && low_ref && low_test);
 
-        fill_q4_k(myds_metal_buffer_data(out_a), w_bytes, 789);
-        fill_f32(myds_metal_buffer_data(heads), n_groups * group_dim, 101);
+            fill_q4_k(myds_metal_buffer_data(out_a), w_bytes, 789 + (unsigned)r);
+            fill_f32(myds_metal_buffer_data(heads), n_groups * group_dim, 101 + (unsigned)r);
 
-        // Reference: myds_metal_attn_output_a + myds_metal_v41_bf16
-        setenv("MYDS_ATTN_OUT_A_FUSE_BF16", "0", 1);
-        memset(myds_metal_buffer_data(low_ref), 0, low_bytes);
-        REQUIRE(myds_metal_attn_output_a_bf16(low_ref, out_a, heads, n_groups, group_dim, rank, GGML_TYPE_Q4_K));
+            // Reference: myds_metal_attn_output_a + myds_metal_v41_bf16
+            setenv("MYDS_ATTN_OUT_A_FUSE_BF16", "0", 1);
+            memset(myds_metal_buffer_data(low_ref), 0, low_bytes);
+            REQUIRE(myds_metal_attn_output_a_bf16(low_ref, out_a, heads, n_groups, group_dim, rank, GGML_TYPE_Q4_K));
 
-        // Test: fused kernel_dsv4_attn_out_low_q4_K_bf16
-        setenv("MYDS_ATTN_OUT_A_FUSE_BF16", "1", 1);
-        memset(myds_metal_buffer_data(low_test), 0, low_bytes);
-        REQUIRE(myds_metal_attn_output_a_bf16(low_test, out_a, heads, n_groups, group_dim, rank, GGML_TYPE_Q4_K));
-
-        const uint32_t *ref_u32 = (const uint32_t *)myds_metal_buffer_data(low_ref);
-        const uint32_t *test_u32 = (const uint32_t *)myds_metal_buffer_data(low_test);
-        int diff = 0;
-        for (uint32_t i = 0; i < n_groups * rank; i++) {
-            if (ref_u32[i] != test_u32[i]) {
-                if (diff < 5) {
-                    printf("AttnOutA Mismatch at %u: ref=0x%08x test=0x%08x\n", i, ref_u32[i], test_u32[i]);
-                }
-                diff++;
+            // Test NR2 fused
+            setenv("MYDS_ATTN_OUT_A_FUSE_BF16", "1", 1);
+            setenv("MYDS_DENSE_Q4_NR0", "2", 1);
+            memset(myds_metal_buffer_data(low_test), 0, low_bytes);
+            REQUIRE(myds_metal_attn_output_a_bf16(low_test, out_a, heads, n_groups, group_dim, rank, GGML_TYPE_Q4_K));
+            const uint32_t *ref_u32 = (const uint32_t *)myds_metal_buffer_data(low_ref);
+            const uint32_t *test_u32 = (const uint32_t *)myds_metal_buffer_data(low_test);
+            int diff = 0;
+            for (uint32_t i = 0; i < n_groups * rank; i++) {
+                if (ref_u32[i] != test_u32[i]) diff++;
             }
-        }
-        REQUIRE(diff == 0);
-        printf("[PASS] myds_metal_attn_output_a_bf16 (Q4_K): %u groups x rank %u bit-exact parity!\n", n_groups, rank);
+            REQUIRE(diff == 0);
+            printf("[PASS] myds_metal_attn_output_a_bf16 (Q4_K, NR2): %u groups x rank %u bit-exact parity!\n", n_groups, rank);
 
-        myds_metal_buffer_free(out_a);
-        myds_metal_buffer_free(heads);
-        myds_metal_buffer_free(low_ref);
-        myds_metal_buffer_free(low_test);
+            // Test NR4 fused
+            setenv("MYDS_DENSE_Q4_NR0", "4", 1);
+            memset(myds_metal_buffer_data(low_test), 0, low_bytes);
+            REQUIRE(myds_metal_attn_output_a_bf16(low_test, out_a, heads, n_groups, group_dim, rank, GGML_TYPE_Q4_K));
+            test_u32 = (const uint32_t *)myds_metal_buffer_data(low_test);
+            diff = 0;
+            for (uint32_t i = 0; i < n_groups * rank; i++) {
+                if (ref_u32[i] != test_u32[i]) diff++;
+            }
+            REQUIRE(diff == 0);
+            printf("[PASS] myds_metal_attn_output_a_bf16 (Q4_K, NR4): %u groups x rank %u bit-exact parity!\n", n_groups, rank);
+
+            myds_metal_buffer_free(out_a);
+            myds_metal_buffer_free(heads);
+            myds_metal_buffer_free(low_ref);
+            myds_metal_buffer_free(low_test);
+        }
     }
 
     // Test 3: myds_v41_shared_gate_up_swiglu with Q4_K vs Reference

@@ -3352,6 +3352,7 @@ int myds_metal_gemv_batch(
     uint64_t row_bytes = 0;
     uint64_t block_bytes = 0;
     uint32_t nsg = 4u;
+    uint32_t q4_nr0 = 2u;
     if (weight_type == GGML_TYPE_Q8_0) {
         if (in_dim % 32u) return 0;
         block_bytes = 34;
@@ -3374,15 +3375,14 @@ int myds_metal_gemv_batch(
         if (in_dim % 256u) return 0;
         block_bytes = 144;
         row_bytes = (uint64_t)(in_dim / 256u) * block_bytes;
-        nsg = 4u;
-        const uint32_t nr0 = (dense_q4_nr0() == 4u && (out_dim % 4u == 0)) ? 4u : 2u;
-        NSString *key = [NSString stringWithFormat:@"q4_k_%u_%u", nsg, nr0];
+        q4_nr0 = (dense_q4_nr0() == 4u && (out_dim % 4u == 0)) ? 4u : 2u;
+        NSString *key = [NSString stringWithFormat:@"q4_k_%u_%u", nsg, q4_nr0];
         pipeline = g_native_pipelines[key];
         if (!pipeline) {
             MTLFunctionConstantValues *mv_constants = [MTLFunctionConstantValues new];
             short short_nsg = (short)nsg;
             [mv_constants setConstantValue:&short_nsg type:MTLDataTypeShort atIndex:600];
-            NSString *fn_name = (nr0 == 4u) ? @"kernel_mul_mv_q4_K_dense_f32_r4" : @"kernel_mul_mv_q4_K_dense_f32";
+            NSString *fn_name = (q4_nr0 == 4u) ? @"kernel_mul_mv_q4_K_dense_f32_r4" : @"kernel_mul_mv_q4_K_dense_f32";
             id<MTLFunction> fn = [g_library newFunctionWithName:fn_name constantValues:mv_constants error:nil];
             if (fn) {
                 pipeline = [g_device newComputePipelineStateWithFunction:fn error:nil];
@@ -3390,7 +3390,24 @@ int myds_metal_gemv_batch(
                 g_native_pipelines[key] = pipeline;
             }
         }
-        if (!pipeline) pipeline = (nr0 == 4u) ? g_pso_mul_mv_q4_K_r4 : g_pso_mul_mv_q4_K;
+        if (!pipeline) pipeline = (q4_nr0 == 4u) ? g_pso_mul_mv_q4_K_r4 : g_pso_mul_mv_q4_K;
+        if (!pipeline && q4_nr0 == 4u) {
+            q4_nr0 = 2u;
+            key = [NSString stringWithFormat:@"q4_k_%u_%u", nsg, q4_nr0];
+            pipeline = g_native_pipelines[key];
+            if (!pipeline) {
+                MTLFunctionConstantValues *mv_constants = [MTLFunctionConstantValues new];
+                short short_nsg = (short)nsg;
+                [mv_constants setConstantValue:&short_nsg type:MTLDataTypeShort atIndex:600];
+                id<MTLFunction> fn = [g_library newFunctionWithName:@"kernel_mul_mv_q4_K_dense_f32" constantValues:mv_constants error:nil];
+                if (fn) {
+                    pipeline = [g_device newComputePipelineStateWithFunction:fn error:nil];
+                    if (!g_native_pipelines) g_native_pipelines = [NSMutableDictionary new];
+                    g_native_pipelines[key] = pipeline;
+                }
+            }
+            if (!pipeline) pipeline = g_pso_mul_mv_q4_K;
+        }
     } else if (weight_type == GGML_TYPE_F32) {
         pipeline = g_pso_mul_mv_f32;
         block_bytes = sizeof(float);
@@ -3427,7 +3444,7 @@ int myds_metal_gemv_batch(
             args.nb11 = (uint64_t)in_dim * sizeof(float);
             args.nb12 = (uint64_t)in_dim * n_tok * sizeof(float);
             args.nb13 = args.nb12;
-            const uint32_t nr0 = (weight_type == GGML_TYPE_Q4_K && dense_q4_nr0() == 4u && (out_dim % 4u == 0)) ? 4u : 2u;
+            const uint32_t nr0 = (weight_type == GGML_TYPE_Q4_K) ? q4_nr0 : 2u;
             args.ne0 = (int32_t)out_dim;
             args.ne1 = (int32_t)n_tok;
             args.nr0 = (int16_t)nr0;
@@ -3745,13 +3762,9 @@ static uint32_t qkv_nr0(void) {
 }
 
 static uint32_t dense_q4_nr0(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *v = getenv("MYDS_DENSE_Q4_NR0");
-        if (v) cached = (strcmp(v, "4") == 0) ? 4 : 2;
-        else cached = (qkv_nr0() == 4u) ? 4 : 2;
-    }
-    return (uint32_t)cached;
+    const char *v = getenv("MYDS_DENSE_Q4_NR0");
+    if (v && strcmp(v, "4") == 0) return 4u;
+    return 2u;
 }
 
 static id<MTLComputePipelineState> batch2_shared_pipeline(uint32_t nsg, uint32_t nr0, ggml_type type) {
@@ -4353,7 +4366,7 @@ int myds_metal_v41_gemv_bf16(myds_metal_buffer_t *out,
         const uint64_t row_bytes = (uint64_t)(in_dim / 256u) * 144u;
         if (weight->size / row_bytes < out_dim || input->size / 4u < in_dim || out->size / 4u < out_dim) return 0;
         const uint32_t nsg = 4u;
-        const uint32_t nr0 = (dense_q4_nr0() == 4u && (out_dim % 4u == 0)) ? 4u : 2u;
+        uint32_t nr0 = (dense_q4_nr0() == 4u && (out_dim % 4u == 0)) ? 4u : 2u;
         id<MTLComputePipelineState> pipeline = (nr0 == 4u) ? g_pso_mul_mv_q4_K_dense_bf16_r4 : g_pso_mul_mv_q4_K_dense_bf16;
         if (!pipeline) {
             NSString *key = [NSString stringWithFormat:@"q4_k_bf16_%u_%u", nsg, nr0];
@@ -4368,6 +4381,23 @@ int myds_metal_v41_gemv_bf16(myds_metal_buffer_t *out,
                 if (fn) pipeline = [g_device newComputePipelineStateWithFunction:fn error:nil];
                 if (pipeline) {
                     if (!g_native_pipelines) g_native_pipelines = [NSMutableDictionary new];
+                    g_native_pipelines[key] = pipeline;
+                }
+            }
+        }
+        if (!pipeline && nr0 == 4u) {
+            nr0 = 2u;
+            pipeline = g_pso_mul_mv_q4_K_dense_bf16;
+            if (!pipeline && g_library) {
+                MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
+                short short_nsg = (short)nsg;
+                [values setConstantValue:&short_nsg type:MTLDataTypeShort atIndex:600];
+                id<MTLFunction> fn = [g_library newFunctionWithName:@"kernel_mul_mv_q4_K_dense_f32_bf16"
+                    constantValues:values error:nil];
+                if (fn) pipeline = [g_device newComputePipelineStateWithFunction:fn error:nil];
+                if (pipeline) {
+                    if (!g_native_pipelines) g_native_pipelines = [NSMutableDictionary new];
+                    NSString *key = [NSString stringWithFormat:@"q4_k_bf16_%u_%u", nsg, nr0];
                     g_native_pipelines[key] = pipeline;
                 }
             }
@@ -6010,12 +6040,8 @@ int myds_metal_attn_output_a_bf16_batch(
     uint32_t                   rank,
     uint32_t                   n_tok,
     ggml_type                  weight_type) {
-    if (!low || !out_a || !heads || n_groups == 0 || group_dim == 0 || rank == 0 || n_tok == 0) return 0;
-    static int cached_fuse = -1;
-    if (__builtin_expect(cached_fuse < 0, 0)) {
-        const char *v = getenv("MYDS_ATTN_OUT_A_FUSE_BF16");
-        cached_fuse = (v && strcmp(v, "0") == 0) ? 0 : 1;
-    }
+    const char *v_fuse = getenv("MYDS_ATTN_OUT_A_FUSE_BF16");
+    const bool cached_fuse = (!v_fuse || strcmp(v_fuse, "0") != 0);
     static int cached_shared2 = -1;
     if (__builtin_expect(cached_shared2 < 0, 0)) {
         const char *v = getenv("MYDS_ATTN_OUT_A_SHARED2");
@@ -6179,12 +6205,15 @@ int myds_metal_attn_output_a_bf16_batch(
             }
             return 1;
         }
-    } else if (cached_fuse && weight_type == GGML_TYPE_Q4_K &&
-               ((dense_q4_nr0() == 4u && g_pso_attn_out_low_q4_K_bf16_r4) || g_pso_attn_out_low_q4_K_bf16) &&
-               out_a->mtl_buf && heads->mtl_buf && low->mtl_buf && (group_dim % 256 == 0) && (low->offset % 16 == 0)) {
+    }
+    const bool can_use_r4 = (dense_q4_nr0() == 4u && g_pso_attn_out_low_q4_K_bf16_r4 != nil && (rank >= 1024u && rank % 4u == 0));
+    id<MTLComputePipelineState> pso = can_use_r4 ? g_pso_attn_out_low_q4_K_bf16_r4 : g_pso_attn_out_low_q4_K_bf16;
+
+    if (cached_fuse && weight_type == GGML_TYPE_Q4_K &&
+        pso != nil &&
+        out_a->mtl_buf && heads->mtl_buf && low->mtl_buf && (group_dim % 256 == 0) && (low->offset % 16 == 0)) {
         @autoreleasepool {
-            const bool use_r4 = (dense_q4_nr0() == 4u && g_pso_attn_out_low_q4_K_bf16_r4 != nil && (rank >= 1024u && rank % 4u == 0));
-            id<MTLComputePipelineState> pso = use_r4 ? g_pso_attn_out_low_q4_K_bf16_r4 : g_pso_attn_out_low_q4_K_bf16;
+            const bool use_r4 = (pso == g_pso_attn_out_low_q4_K_bf16_r4);
             const uint16_t nr0 = use_r4 ? 4 : 2;
             const uint64_t a_group_bytes = (uint64_t)rank * (group_dim / 256u) * 144u;
             struct ds4_metal_args_mul_mv_id args;

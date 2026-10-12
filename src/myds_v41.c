@@ -3627,6 +3627,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
                 CHECK(myds_metal_v41_hc_sum_rmsnorm(ctx->x_norm, ctx->x, g->residual, hc_in_pre, base->attn_norm, V41_DIM, m->norm_eps, true));
             } else {
                 CHECK(myds_metal_v41_hc_weighted_sum(ctx->x,g->residual,hc_in_pre,V41_DIM));
+                if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(ctx->x);
                 CHECK(myds_metal_v41_rmsnorm(ctx->x_norm,ctx->x,base->attn_norm,V41_DIM,m->norm_eps,true));
             }
             TRACE("hc_attn_input",ctx->x,V41_DIM);
@@ -3822,6 +3823,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
             CHECK(myds_metal_v41_hc_sum_rmsnorm(ctx->ffn_norm_out, ctx->x, g->after_attn, g->attn_split, base->ffn_norm, V41_DIM, m->norm_eps, true));
         } else {
             CHECK(myds_metal_v41_hc_weighted_sum(ctx->x,g->after_attn,g->attn_split,V41_DIM));
+            if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(ctx->x);
             CHECK(myds_metal_v41_rmsnorm(ctx->ffn_norm_out,ctx->x,base->ffn_norm,V41_DIM,m->norm_eps,true));
         }
         TRACE("hc_ffn_input",ctx->x,V41_DIM);
@@ -3851,6 +3853,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
             CHECK(myds_metal_v41_hc_sum_rmsnorm(ctx->x_norm, ctx->x, g->residual, g->ffn_split, m->output_norm, V41_DIM, m->norm_eps, true));
         } else {
             CHECK(myds_metal_v41_hc_weighted_sum(ctx->x,g->residual,g->ffn_split,V41_DIM));
+            if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(ctx->x);
             CHECK(myds_metal_v41_rmsnorm(ctx->x_norm,ctx->x,m->output_norm,V41_DIM,m->norm_eps,true));
         }
         if (fine_pipeline) {
