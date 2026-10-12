@@ -1,5 +1,10 @@
 # myds: Apple Silicon Metal 推理引擎实验
 
+> **来源与免责声明**：本项目**从 ds4 拷贝而来**，**全部内容由 LLM 编写**（DeepSeek / Gemini / Sol / Opus），
+> 唯一目的是让它在 **M2 Ultra · 192 GB** 上更好用。
+>
+> *Origin & disclaimer: copied from ds4; wholly written by LLMs (DeepSeek, Gemini, Sol, Opus); just for better use on M2 Ultra / 192 GB.*
+
 **当前 native engine 已完整实现 DeepSeek V4.1 文本计算图（HC、Engram、压缩 KV、indexer），并通过与 ds4 oracle 的逐位验收；生产 8181 正在运行 DeepSeek-V4.1-Flash Q2。** 正确性门禁默认放行已验收特性，`MYDS_DENY_V41=1` 可不重编译地恢复「拒绝加载」（紧急刹车）。
 
 验收依据与门禁规则见 [正确性修复与验证状态](docs/CORRECTNESS_STATUS.md)；性能结论以 `docs/verification/` 下带日期的实测记录为准。单元测试通过不等于真实模型逐位对齐，改动数值路径仍须过同等门禁。
@@ -8,7 +13,7 @@
 
 ## 已有算子与实验基础
 
-- **围绕 DeepSeek V4 / V4.1 构建的算子基础（完整计算图尚未实现）**：
+- **围绕 DeepSeek V4 / V4.1 构建的算子基础**（已接入 V4.1 文本计算图）：
   - **RMSNorm** 归一化加速
   - **MLA (Multi-head Latent Attention)** 解耦多头潜在注意力与低秩压缩 KV Cache
   - **Decoupled RoPE** 解耦旋转位置编码
@@ -19,8 +24,9 @@
   - 仓库包含从 `ds4` 迁移的 `.metal` 源文件；文件存在不代表相应模型步骤已接入计算图
   - 利用统一内存架构（Unified Memory）通过 `MTLResourceStorageModeShared` 实现 CPU 与 GPU 之间零拷贝
   - 运行时即时编译优化，原生发挥 M 系列芯片（M1/M2/M3/M4/M5 等）的最大能效
-- **极简架构与零依赖**：
-  - 核心推理引擎仅由几个高内聚、低耦合的模块组成，无需任何外部第三方库（仅依赖系统级 Foundation 与 Metal 框架）
+- **极简架构与近乎零依赖**：
+  - 文本推理引擎仅由几个高内聚、低耦合的模块组成，不依赖外部第三方库（仅系统级 Foundation 与 Metal 框架）；
+    视觉路径另用内置的 header-only `third_party/iris`（JPEG/PNG 解码，仅图片输入时用到）
   - 内置极简 GGUF v2/v3 解析器，支持 `mmap` 秒级映射大模型权重
   - 内置 merge-rank byte BPE、JoyAI 预分词、显式字节长度解码与 UTF-8 流式输出
   - `make` 构建本地程序与测试；另有独立 HF tokenizer 与 ds4 tensor 对照工具
@@ -33,52 +39,82 @@
 myds/
 ├── Makefile                          # 极简构建规则 (make, make test, make clean)
 ├── README.md                         # 项目设计与使用文档
-├── metal/                            # 迁移自 ds4 的 20 个 DeepSeek Metal 核心 Shader
+├── metal/                            # 迁移自 ds4 的 Metal 核心 Shader（共 24 个）
 │   ├── argsort.metal                 # Top-K 路由排序
 │   ├── bin.metal                     # 标量与张量二元计算
 │   ├── concat.metal                  # 张量拼接
 │   ├── cpy.metal                     # 快速连续内存与格式转换
-│   ├── dense.metal                   # 量化矩阵向量/矩阵乘法 (Q8_0, Q4_K, F16, F32)
-│   ├── dsv4_hc.metal                 # HC 多路残差算子源码（未接入 native 计算图）
+│   ├── dense.metal                   # 量化 GEMV/GEMM (Q8_0, Q4_K, Q2_K, F16, F32)
+│   ├── dsv4_hc.metal                 # HC 多路残差（split / sinkhorn / 加权和 / RMSNorm）
 │   ├── dsv4_kv.metal                 # DeepSeek KV Cache 状态操作
 │   ├── dsv4_misc.metal               # DeepSeek 辅助算子
 │   ├── dsv4_rope.metal               # 解耦 RoPE 旋转位置编码
-│   ├── dsv41.metal                   # DeepSeek V4.1 专有优化算子
-│   ├── flash_attn.metal              # 闪速注意力核心计算
+│   ├── dsv41.metal                   # V4.1 专有算子（indexer / compressor / attention-out）
+│   ├── flash_attn.metal              # flash attention 核心（含 packed8 归约）
 │   ├── get_rows.metal                # 嵌入层查表操作
 │   ├── glu.metal                     # SwiGLU 激活函数
-│   ├── moe.metal                     # MoE 专家路由与输出累加
+│   ├── moe.metal                     # 量化 MoE 专家 GEMV / 路由 / 累加（iq2_xxs, q2_K, q4_K …）
+│   ├── myds_chunk.metal              # 分块 prefill 的 chunk attention / compressor
+│   ├── myds_v41_moe.metal            # V4.1 shared-expert gate/up/SwiGLU 融合算子
 │   ├── norm.metal                    # RMSNorm 算子
 │   ├── repeat.metal                  # 广播重复
 │   ├── set_rows.metal                # 行级写入
 │   ├── softmax.metal                 # Softmax 与缩放
 │   ├── sum_rows.metal                # 行求和归约
-│   └── unary.metal                   # 一元运算
-├── include/                          # 头文件定义
+│   ├── topk_threshold.metal          # top-k 阈值筛选
+│   ├── unary.metal                   # 一元运算
+│   └── visenc.metal                  # 视觉编码器算子
+├── include/                          # 头文件定义（共 24 个）
 │   ├── myds.h                        # 推理引擎主接口与 V4/V4.1 架构判定
+│   ├── myds_internal.h               # 引擎内部共享
 │   ├── myds_metal.h                  # Metal GPU 运行时与算子声明
 │   ├── myds_gguf.h                   # 极简 GGUF 格式解析器
 │   ├── myds_tokenizer.h              # DeepSeek BPE 分词器
 │   ├── myds_server.h                 # HTTP 服务端
-│   └── myds_log.h                    # 微秒级线程安全结构化日志
-├── src/                              # 核心源码
+│   ├── myds_server_internal.h        # HTTP 服务端内部
+│   ├── myds_log.h                    # 微秒级线程安全结构化日志
+│   ├── myds_cpu.h                    # CPU 算子
+│   ├── myds_align.h                  # 对齐工具
+│   ├── myds_v41.h / _decode.h / _gpu.h / _moe.h   # V4.1 计算图 / decode / GPU / MoE
+│   ├── myds_engram.h                 # Engram 表读取
+│   ├── myds_kvdsk.h                  # 低位 KV 磁盘缓存
+│   ├── myds_lowkv_policy.h           # 低位 KV 策略
+│   ├── myds_snapshot_slots.h         # 内存前缀快照槽位
+│   ├── myds_dspark.h / myds_pld.h    # 投机解码 / PLD
+│   └── myds_vispre.h / _visw.h / _visfwd.h / _vjob.h   # 视觉：预处理 / 权重 / 前向 / 作业
+├── src/                              # 核心源码（共 19 个）
 │   ├── main.c                        # 命令行与交互终端入口
-│   ├── myds_engine.c                 # DeepSeek Transformer 前向传播流程与模型加载
+│   ├── myds_engine.c                 # 前向传播流程、模型加载与投机解码调度
 │   ├── myds_cpu.c                    # CPU 数值算子（复用 RoPE 角度计算）
 │   ├── myds_metal.m                  # Metal 运行时与 GPU 算子分发
 │   ├── myds_gguf.c                   # GGUF 格式解析与 mmap 内存映射
 │   ├── myds_tokenizer.c              # BPE 编码与流式解码
 │   ├── myds_server.c                 # POSIX HTTP Server (OpenAI Responses / Chat)
-│   └── myds_log.c                    # 结构化日志实现
-└── tests/
-    ├── test_metal.c                  # GPU 核心算子金标对齐测试
-    ├── test_gguf.c                   # GGUF 解析与 V4/V4.1 架构校验/V2/V3 拦截测试
-    ├── test_tokenizer.c              # BPE 分词与特殊 Token 测试
-    ├── test_server.c                 # HTTP 端点与并发连接测试
-    ├── test_server_api.c             # Responses API 与协议解析金标测试
-    ├── test_engine.c                 # 采样算法与 V4 架构判定单元测试
-    ├── test_cpu.c                    # CPU RoPE 逐位回归与微基准
-    └── test_log.c                    # 结构化日志线程安全与过滤测试
+│   ├── myds_log.c                    # 结构化日志实现
+│   ├── myds_v41.c                    # V4.1 文本计算图（HC / 压缩 KV / indexer）
+│   ├── myds_v41_decode.c             # V4.1 decode 路径
+│   ├── myds_v41_gpu.c                # V4.1 GPU 算子与 PSO 组合
+│   ├── myds_v41_moe.c                # V4.1 MoE 路由与派发
+│   ├── myds_engram.c                 # Engram 表读取与并行 pread
+│   ├── myds_kvdsk.c                  # 低位 KV 磁盘缓存
+│   ├── myds_dspark.c                 # DSpark 投机解码
+│   ├── myds_vispre.c                 # 视觉：图片解码 / 预处理 / token 布局
+│   ├── myds_visw.c                   # 视觉：编码器权重加载
+│   ├── myds_visfwd.c                 # 视觉：编码器前向
+│   └── myds_vjob.c                   # 视觉作业
+└── tests/                            # C 单元/回归测试（39 个）+ 少量 Python 门禁
+    ├── test_gguf.c  test_tokenizer.c  test_engine.c  test_cpu.c  test_log.c  test_align.c
+    ├── test_metal.c  test_v41_gpu.c  test_attention_vec.c  test_attention_policy.c
+    ├── test_qkv_fusion.c  test_decode_q8_contract.c  test_v41_router.c  test_moe_shared3.c
+    ├── test_engram.c  test_engram_pool_failures.c  test_kvdsk.c  test_deeper_ssd.c
+    ├── test_server.c  test_server_api.c  test_http_bytes.c
+    ├── test_batch2_e2e.c  test_batch2_parity.c  test_batch2_shared_swiglu_pair.c
+    ├── test_tree_spec.c  test_pld.c  test_engine_depth2.c  test_depth2_shared_swiglu_shared3.c
+    ├── test_dspark_rollback.c  test_dspark_capture.c  test_dspark_router.c
+    │   test_dspark_moe.c  test_dspark_attention.c  test_dspark_proposal.c
+    ├── test_p1_regressions.c  test_kprof.c  test_metal_residency_lifecycle.c
+    └── test_teardown_order.c  test_visw.c
+    # Python 门禁：tests/test_http_bytes.py、tests/test_bench_reproduce.py、tests/test_engram_io_window.py 等
 ```
 
 ---
@@ -226,7 +262,7 @@ make bench
 
 `deploy` 中已集成 `myds` 算力引擎支持：
 - `start_fleet.sh`：定义 `SERVER_TYPE=15` 或 `SERVER_TYPE=myds` 即可调度 `myds` 作为后端引擎
-- `sync_myds.sh`：以 `macmini` 为唯一权威源码，自动增量同步到 `macstudio` 并完成远程构建
+- `sync_myds.sh`：以 **GitHub（`origin`）为唯一权威源码**；要求 macmini 已提交并推送，再把 `macstudio` 快进（`--ff-only`，脏工作树直接拒绝而非覆盖）并安全远程构建
 - `deploy.sh`：一键自动执行同步、编译与舰队点火：
 
 ```bash
@@ -333,7 +369,7 @@ make test-tail-init 2>&1 | tee "$MYDS_REPRO_OUT/tail-init.log"
 python3 docs/benchmarks/2026-10-05-optimization/protocol/selftest-summarize-final.py \
   > "$MYDS_REPRO_OUT/measurement-audit-selftest.json"
 python3 tools/bench_reproduce.py verify
-# 仅在 afcc05c 检出上：python3 tools/bench_reproduce.py verify --check-source
+# 仅在基准测量快照检出上：python3 tools/bench_reproduce.py verify --check-source
 ```
 
 `make -B` 强制重编译，避免复制源码或切换测量版本时复用时间戳较新的旧对象文件。
@@ -453,7 +489,7 @@ mock 独占窗口恢复测试纳入 `make test`。
 ```sh
 MYDS_REPRO_BASE="$MYDS_REPRO_OUT/base-source"
 mkdir "$MYDS_REPRO_BASE"
-git archive f0a9c228ed1bac8e72b8a78e50f87ea89d807b73 | tar -x -C "$MYDS_REPRO_BASE"
+git archive 835d0f5161a0852e9021c2783b19847bd973a5d0 | tar -x -C "$MYDS_REPRO_BASE"
 git -C "$MYDS_REPRO_BASE" apply --check \
   "$PWD/docs/benchmarks/2026-10-05-optimization/protocol/baseline-working-changes.patch"
 git -C "$MYDS_REPRO_BASE" apply \
@@ -516,8 +552,14 @@ layout 按 replay recipe 从同一 GGUF 提取。QKV 的 stdout 含启动信息�
 `.jsonl` 后缀，审计按 CSV 处理；新复现采用 `.csv`。组件 probe 只给出该组件、该输入的计时，
 不可将多个独立回放中位数相加后当作整层或整模型耗时。
 `.gitattributes` 保留证据的原始换行，`bench_reproduce.py verify` 校验两轮证据 manifest；
-`--check-source` 同时验证本次打包源码，基准是 `afcc05c` 中的测量快照；之后的提交
-（例如 attention 回退计数）会被报告为漂移，可用 `git diff afcc05c -- <file>` 查看，证据 manifest 不随之改写。
+`--check-source` 同时验证本次打包源码，基准是测量快照提交
+`50a26cf`（*test(perf): add reproducible benchmarks and preserve Mac Studio evidence*）中的
+源文件 SHA256；之后的提交（例如 attention 回退计数）会被报告为漂移，可用
+`git diff 50a26cf -- <file>` 查看，证据 manifest 不随之改写。
+
+> ⚠️ **2026-10-13 为公开做过一次历史重写**（清理家目录路径），**所有 commit SHA 已改变**。
+> 本文中引用的两个基准提交旧哈希 → 新哈希：`afcc05c` → `50a26cf`；
+> `f0a9c228` → `835d0f5`。（`docs/benchmarks/**/manifest.json` 是冻结的证据，仍记录旧哈希，未改。）
 服务部署后 SHA、模型或环境变化时，应另存新的结果目录。
 
 ## 视觉（图片输入）
