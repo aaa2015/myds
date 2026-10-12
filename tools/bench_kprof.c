@@ -125,8 +125,10 @@ int main(int argc, char **argv) {
         fprintf(json, "{\"kind\":\"kprof_run\",\"model\":\"%s\",\"request\":\"%s\",\"prompt_tokens\":%u,"
                 "\"warm_tokens\":%u,\"kprof_tokens\":%u,\"max_seq\":%u,\"outputs\":%u,\"floor_us\":%.3f}\n",
                 argv[1], argv[2], prompt_tokens, warm, window, max_seq, st.count, floor_us);
-        if (!myds_metal_kprof_report(json, "decode", window)) {
-            fputs("kprof report failed: no valid samples\n", stderr);
+        const int rc = myds_metal_kprof_report(json, "decode", window);
+        if (rc != 1) {
+            fprintf(stderr, rc == 2 ? "kprof window truncated: sample buffers full before %u tokens finished; results invalid\n"
+                                    : "kprof report failed: no valid samples\n", window);
             status = 1;
         }
     }

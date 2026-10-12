@@ -979,7 +979,11 @@ typedef struct {
     uint32_t    n;      /* dispatches encoded into this encoder */
     uint8_t     dt;     /* 1 = dispatchThreads, 0 = dispatchThreadgroups */
 } kp_rec_t;
-static id<MTLCounterSampleBuffer> g_kp_sb = nil;
+/* Device limits one counter sample buffer to a few thousand samples, so encoder i
+ * uses buffer i/g_kp_per, local sample index 2*(i%g_kp_per). */
+#define KP_MAXB 256
+static id<MTLCounterSampleBuffer> g_kp_sbs[KP_MAXB];
+static uint32_t g_kp_nbuf = 0, g_kp_per = 0;   /* buffers, encoders per buffer */
 static kp_rec_t *g_kp_rec = NULL;
 static uint32_t  g_kp_cap = 0, g_kp_n = 0, g_kp_overflow = 0;
 static int       g_kp_on = 0, g_kp_env = -1, g_kp_ready = 0;
@@ -1005,19 +1009,35 @@ static int kprof_init(void) {
     for (id<MTLCounterSet> cs in g_device.counterSets)
         if ([cs.name isEqualToString:MTLCommonCounterSetTimestamp]) { ts = cs; break; }
     if (!ts) { fprintf(stderr, "myds_metal: kprof unavailable: no timestamp counter set\n"); return 0; }
-    for (NSUInteger cnt = (NSUInteger)1 << 18; cnt >= ((NSUInteger)1 << 10) && !g_kp_sb; cnt >>= 1) {
+    NSUInteger per_samples = 0;
+    for (NSUInteger cnt = (NSUInteger)1 << 18; cnt >= ((NSUInteger)1 << 8) && !per_samples; cnt >>= 1) {
         MTLCounterSampleBufferDescriptor *d = [MTLCounterSampleBufferDescriptor new];
         d.counterSet = ts;
         d.storageMode = MTLStorageModeShared;
         d.sampleCount = cnt;
         d.label = @"myds-kprof";
         NSError *err = nil;
-        g_kp_sb = [g_device newCounterSampleBufferWithDescriptor:d error:&err];
-        if (g_kp_sb) g_kp_cap = (uint32_t)(cnt / 2);
+        id<MTLCounterSampleBuffer> sb = [g_device newCounterSampleBufferWithDescriptor:d error:&err];
+        if (sb) { g_kp_sbs[0] = sb; per_samples = cnt; }
     }
-    if (!g_kp_sb) { fprintf(stderr, "myds_metal: kprof sample buffer allocation failed\n"); return 0; }
+    if (!per_samples) { fprintf(stderr, "myds_metal: kprof sample buffer allocation failed\n"); return 0; }
+    g_kp_per = (uint32_t)(per_samples / 2);
+    g_kp_nbuf = 1;
+    /* Aim for ~96k encoders (>= 60 decode tokens of ~1.3k encoders each). */
+    while (g_kp_nbuf < KP_MAXB && (uint64_t)g_kp_nbuf * g_kp_per < 98304u) {
+        MTLCounterSampleBufferDescriptor *d = [MTLCounterSampleBufferDescriptor new];
+        d.counterSet = ts; d.storageMode = MTLStorageModeShared;
+        d.sampleCount = per_samples; d.label = @"myds-kprof";
+        NSError *err = nil;
+        id<MTLCounterSampleBuffer> sb = [g_device newCounterSampleBufferWithDescriptor:d error:&err];
+        if (!sb) break;
+        g_kp_sbs[g_kp_nbuf++] = sb;
+    }
+    g_kp_cap = g_kp_nbuf * g_kp_per;
     g_kp_rec = calloc(g_kp_cap, sizeof(kp_rec_t));
-    if (!g_kp_rec) { g_kp_sb = nil; return 0; }
+    if (!g_kp_rec) { g_kp_nbuf = 0; return 0; }
+    fprintf(stderr, "myds_metal: kprof ready: %u sample buffers x %u encoders = %u encoders\n",
+            g_kp_nbuf, g_kp_per, g_kp_cap);
     g_kp_ready = 1;
     return 1;
 }
@@ -1052,9 +1072,9 @@ static id<MTLComputeCommandEncoder> kprof_new_encoder(id<MTLCommandBuffer> cb, i
     MTLComputePassDescriptor *pd = [MTLComputePassDescriptor computePassDescriptor];
     if (concurrent) pd.dispatchType = MTLDispatchTypeConcurrent;
     MTLComputePassSampleBufferAttachmentDescriptor *a = pd.sampleBufferAttachments[0];
-    a.sampleBuffer = g_kp_sb;
-    a.startOfEncoderSampleIndex = (NSUInteger)(2u * g_kp_n);
-    a.endOfEncoderSampleIndex = (NSUInteger)(2u * g_kp_n + 1u);
+    a.sampleBuffer = g_kp_sbs[g_kp_n / g_kp_per];
+    a.startOfEncoderSampleIndex = (NSUInteger)(2u * (g_kp_n % g_kp_per));
+    a.endOfEncoderSampleIndex = (NSUInteger)(2u * (g_kp_n % g_kp_per) + 1u);
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDescriptor:pd];
     if (enc) { memset(&g_kp_rec[g_kp_n], 0, sizeof(kp_rec_t)); ++g_kp_n; }
     return enc;
@@ -1093,6 +1113,24 @@ static int kp_cmp_double(const void *a, const void *b) {
     return (x > y) - (x < y);
 }
 
+/* Copy the first n encoders' (start,end) timestamps out of all sample buffers.
+ * Returns malloc'd array of 2n values (caller frees) or NULL. GPU work must be done. */
+static uint64_t *kprof_resolve(uint32_t n) {
+    uint64_t *v = malloc((size_t)2u * n * sizeof(uint64_t));
+    if (!v) return NULL;
+    for (uint32_t done = 0; done < n; ) {
+        const uint32_t b = done / g_kp_per;
+        uint32_t cnt = n - done;
+        if (cnt > g_kp_per) cnt = g_kp_per;
+        NSData *data = [g_kp_sbs[b] resolveCounterRange:NSMakeRange(0, 2u * cnt)];
+        if (!data || data.length < (NSUInteger)2u * cnt * sizeof(MTLCounterResultTimestamp)) { free(v); return NULL; }
+        const MTLCounterResultTimestamp *ts = (const MTLCounterResultTimestamp *)data.bytes;
+        for (uint32_t i = 0; i < 2u * cnt; ++i) v[2u * done + i] = ts[i].timestamp;
+        done += cnt;
+    }
+    return v;
+}
+
 /* Time a batch of trivial 16-element adds, one encoder each. Their median is the
  * fixed encoder-bracket cost (encoder start/end + sample write) that every real
  * kernel also pays; kprof_report callers subtract it to get net kernel time. */
@@ -1116,15 +1154,15 @@ int myds_metal_kprof_calibrate(double *floor_us) {
     const uint32_t end = g_kp_n;
     g_kp_n = base;   /* calibration records never appear in the report */
     if (!ok || end < base + CAL) return 0;
-    NSData *data = [g_kp_sb resolveCounterRange:NSMakeRange(0, 2u * end)];
-    if (!data || data.length < (NSUInteger)2u * end * sizeof(MTLCounterResultTimestamp)) return 0;
-    const MTLCounterResultTimestamp *ts = (const MTLCounterResultTimestamp *)data.bytes;
+    uint64_t *tsv = kprof_resolve(end);
+    if (!tsv) return 0;
     const double tick_ns = kprof_tick_ns();
     double d[CAL]; uint32_t n = 0;
     for (uint32_t i = base; i < end && n < CAL; ++i) {
-        const uint64_t s = ts[2u * i].timestamp, e = ts[2u * i + 1u].timestamp;
+        const uint64_t s = tsv[2u * i], e = tsv[2u * i + 1u];
         if (s && e && s != UINT64_MAX && e != UINT64_MAX && e >= s) d[n++] = (double)(e - s) * tick_ns / 1e3;
     }
+    free(tsv);
     if (n < CAL / 2) return 0;
     qsort(d, n, sizeof(double), kp_cmp_double);
     g_kp_floor_us = d[n / 2];
@@ -1133,21 +1171,20 @@ int myds_metal_kprof_calibrate(double *floor_us) {
 }
 
 int myds_metal_kprof_report(FILE *out, const char *label, uint32_t tokens) {
-    if (!out || !g_kp_sb || !g_kp_n) return 0;
+    if (!out || !g_kp_nbuf || !g_kp_n) return 0;
     const double tick_ns = kprof_tick_ns();
     const uint32_t n = g_kp_n;
-    NSData *data = [g_kp_sb resolveCounterRange:NSMakeRange(0, 2u * n)];
-    if (!data || data.length < (NSUInteger)2u * n * sizeof(MTLCounterResultTimestamp)) return 0;
-    const MTLCounterResultTimestamp *ts = (const MTLCounterResultTimestamp *)data.bytes;
+    uint64_t *tsv = kprof_resolve(n);
+    if (!tsv) return 0;
 
     enum { AGG_CAP = 2048 };
     kp_agg_t *agg = calloc(AGG_CAP, sizeof(kp_agg_t));
-    if (!agg) return 0;
+    if (!agg) { free(tsv); return 0; }
     uint32_t na = 0, bad = 0, merged = 0, agg_overflow = 0, untagged = 0;
     double busy = 0, gap_small = 0, idle_large = 0;
     uint64_t first_start = 0, last_end = 0, prev_end = 0;
     for (uint32_t i = 0; i < n; ++i) {
-        const uint64_t s = ts[2u * i].timestamp, e = ts[2u * i + 1u].timestamp;
+        const uint64_t s = tsv[2u * i], e = tsv[2u * i + 1u];
         if (s == 0 || e == 0 || s == UINT64_MAX || e == UINT64_MAX || e < s) { ++bad; continue; }
         const uint64_t ns = (uint64_t)((double)(e - s) * tick_ns);
         const kp_rec_t *r = &g_kp_rec[i];
@@ -1198,7 +1235,8 @@ int myds_metal_kprof_report(FILE *out, const char *label, uint32_t tokens) {
             (double)(last_end - first_start) * tick_ns / 1e6, tick_ns, g_kp_floor_us);
     fflush(out);
     free(agg);
-    return 1;
+    free(tsv);
+    return g_kp_overflow ? 2 : 1;   /* 2 = window truncated (buffers full) */
 }
 
 static int g_concurrent_mode = 0;

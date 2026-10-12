@@ -10,15 +10,20 @@
 #define N 4096u
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "FAIL %s:%d %s\n", __FILE__, __LINE__, #c); return 1; } } while (0)
 
-static int run_graph(myds_metal_buffer_t *out, myds_metal_buffer_t *g, myds_metal_buffer_t *u,
-                     myds_metal_buffer_t *t) {
+static int run_graph_n(myds_metal_buffer_t *out, myds_metal_buffer_t *g, myds_metal_buffer_t *u,
+                       myds_metal_buffer_t *t, int iters) {
     if (!myds_metal_begin_batch()) return 0;
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < iters; ++i) {
         if (!myds_metal_swiglu(t, g, u, N)) return 0;
         if (!myds_metal_add(out, t, u, N)) return 0;
         myds_metal_barrier();   /* must be harmless while armed */
     }
     return myds_metal_commit_batch();
+}
+
+static int run_graph(myds_metal_buffer_t *out, myds_metal_buffer_t *g, myds_metal_buffer_t *u,
+                     myds_metal_buffer_t *t) {
+    return run_graph_n(out, g, u, t, 3);
 }
 
 int main(void) {
@@ -74,6 +79,30 @@ int main(void) {
     }
     CHECK(kernels >= 2 && summaries == 1 && total_calls == 6);
     fclose(f);
+
+    /* Window larger than one device sample buffer: records must span buffers intact. */
+    {
+        const int iters = 3000;   /* 6000 encoders */
+        myds_metal_kprof_arm(1);
+        CHECK(run_graph_n(got, g, u, t, iters));
+        myds_metal_kprof_arm(0);
+        CHECK(!memcmp(myds_metal_buffer_data(ref), myds_metal_buffer_data(got), N * 4));
+        FILE *f2 = tmpfile();
+        CHECK(f2);
+        CHECK(myds_metal_kprof_report(f2, "big", 1) == 1);
+        rewind(f2);
+        int ok_summary = 0;
+        while (fgets(line, sizeof line, f2)) {
+            if (!strstr(line, "\"kind\":\"kprof_summary\"")) continue;
+            CHECK(strstr(line, "\"encoders\":6000,"));
+            CHECK(strstr(line, "\"bad_samples\":0,"));
+            CHECK(strstr(line, "\"untagged_encoders\":0,"));
+            CHECK(strstr(line, "\"buffer_overflow\":0,"));
+            ok_summary = 1;
+        }
+        CHECK(ok_summary);
+        fclose(f2);
+    }
 
     /* After disarm a normal batch still works (no stale sample attachments). */
     CHECK(run_graph(got, g, u, t));
