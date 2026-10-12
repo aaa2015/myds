@@ -38,3 +38,11 @@ docs/verification/2026-10-12-gemini-decode-review/** -text
 docs/verification/2026-10-12-gemini-decode-review/**/*.log -whitespace
 docs/verification/2026-10-12-gemini-decode-review/**/*.diff -whitespace
 docs/verification/2026-10-12-gemini-decode-review/**/*.ll -whitespace
+
+# Preserve independent Gemini repair reacceptance evidence bytes.
+docs/verification/2026-10-12-gemini-decode-reacceptance/** -text
+docs/verification/2026-10-12-gemini-decode-reacceptance/**/*.log -whitespace
+# Frozen C extracts and the native suite's verbatim stdout include EOF spaces.
+docs/verification/2026-10-12-gemini-decode-reacceptance/local/f1f2-host/module-before.c -whitespace
+docs/verification/2026-10-12-gemini-decode-reacceptance/local/f1f2-host/module-current.c -whitespace
+docs/verification/2026-10-12-gemini-decode-reacceptance/mac/r1/test_batch2_parity.jsonl -whitespace
