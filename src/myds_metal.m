@@ -5633,6 +5633,7 @@ int myds_metal_routed_moe_batch(
                     id<MTLResource> res = scratch_mid->mtl_buf;
                     [enc memoryBarrierWithResources:&res count:1];
                 }
+                if (g_kp_on && g_batch_cb && cb == g_batch_cb && enc == g_batch_enc) enc = get_compute_encoder(cb);   /* kprof: time down separately */
 
                 /* Fused Down + Sum6 direct accumulation dispatch (Q2_K) across all tokens */
                 [enc setComputePipelineState:g_pso_moe_sum6_q2_k];
