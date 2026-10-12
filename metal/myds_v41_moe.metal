@@ -540,6 +540,20 @@ kernel void kernel_myds_v41_shared_gate_up_swiglu_q4(
         args, src_gate, src_up, src_in, dst_out, shmem, tgpig, tiisg, sgitg);
 }
 
+kernel void kernel_myds_v41_shared_gate_up_swiglu_q4_r4(
+    constant myds_v41_shared_swiglu_args &args [[buffer(0)]],
+    device const char *src_gate [[buffer(1)]],
+    device const char *src_up [[buffer(2)]],
+    device const float *src_in [[buffer(3)]],
+    device float *dst_out [[buffer(4)]],
+    threadgroup char *shmem [[threadgroup(0)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    kernel_myds_v41_shared_gate_up_swiglu_q4_impl<4>(
+        args, src_gate, src_up, src_in, dst_out, shmem, tgpig, tiisg, sgitg);
+}
+
 template<short NR0>
 void kernel_myds_v41_shared_gate_up_swiglu_q4_shared2_impl(
         constant myds_v41_shared_swiglu_args &args,

@@ -148,6 +148,7 @@ def main():
     print(f"[metallib] Compiling AIR with xcrun metal -> {air_file}...")
     compile_cmd = [
         "xcrun", "-sdk", "macosx", "metal",
+        "-mmacosx-version-min=15.0",
         "-O3", "-ffast-math",
         "-DDS4_METAL_HC_STABLE=1",
         "-DDS4_METAL_NORM_RSQRT_DISABLE=1",
