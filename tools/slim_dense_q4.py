@@ -158,7 +158,7 @@ def load_quants_library(custom_path: str | None = None) -> tuple[ctypes.CDLL, st
         os.path.join(base_dir, f"../ds4/gguf-tools/libds4quants.{suffix}"),
         os.path.join(base_dir, f"../../ds4/gguf-tools/libds4quants.{suffix}"),
         os.path.join(base_dir, f"libds4quants.{suffix}"),
-        f"~/Projects/ds4/gguf-tools/libds4quants.{suffix}",
+        os.path.expanduser(f"~/Projects/ds4/gguf-tools/libds4quants.{suffix}"),
     ]
     for p in paths:
         if p and os.path.isfile(p):

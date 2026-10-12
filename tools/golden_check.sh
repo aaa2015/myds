@@ -45,7 +45,7 @@ fi
 
 if [[ -z "$MODEL" ]]; then
     CANDIDATES=(
-        "~/.lmstudio/models/antirez/deepseek-v4.1-flash-gguf/DeepSeek-V4.1-Flash-Q2.gguf"
+        "$HOME/.lmstudio/models/antirez/deepseek-v4.1-flash-gguf/DeepSeek-V4.1-Flash-Q2.gguf"
         "/tmp/test_myds_mla_forward.gguf"
     )
     for c in "${CANDIDATES[@]}"; do

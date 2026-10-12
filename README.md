@@ -369,7 +369,7 @@ python3 tools/bench_reproduce.py verify
 发现仍在运行时退出；服务暂停与恢复由窗口管理者负责。
 
 ```sh
-MYDS_REPRO_MODEL="~/.lmstudio/models/antirez/deepseek-v4.1-flash-gguf/DeepSeek-V4.1-Flash-Q2.gguf"
+MYDS_REPRO_MODEL="$HOME/.lmstudio/models/antirez/deepseek-v4.1-flash-gguf/DeepSeek-V4.1-Flash-Q2.gguf"
 python3 tools/bench_reproduce.py run \
   --binary "$PWD/bin/bench_phase" \
   --model "$MYDS_REPRO_MODEL" \
