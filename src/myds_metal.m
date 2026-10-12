@@ -1098,15 +1098,11 @@ typedef struct {
 } kp_agg_t;
 
 static double g_kp_floor_us = 0;   /* per-encoder fixed cost, see myds_metal_kprof_calibrate */
-
-/* Timestamp ticks -> ns, calibrated against the CPU clock over the armed window. */
-static double kprof_tick_ns(void) {
-    uint64_t cpu1 = 0, gpu1 = 0;
-    [g_device sampleTimestamps:&cpu1 gpuTimestamp:&gpu1];
-    mach_timebase_info_data_t tb; mach_timebase_info(&tb);
-    const double cpu_ns = (double)(cpu1 - g_kp_cpu0) * (double)tb.numer / (double)tb.denom;
-    return (gpu1 > g_kp_gpu0 && cpu_ns > 0) ? cpu_ns / (double)(gpu1 - g_kp_gpu0) : 1.0;
-}
+/* ns per sample-buffer timestamp tick. Measured in calibrate against a command
+ * buffer's GPUStartTime/GPUEndTime. NOTE: do NOT derive it from -sampleTimestamps:
+ * (its GPU counter is a different clock; that was 41.7x off on M2 Ultra/M4). */
+static double g_kp_scale = 1.0;
+static int    g_kp_scale_calibrated = 0;
 
 static int kp_cmp_double(const void *a, const void *b) {
     const double x = *(const double *)a, y = *(const double *)b;
@@ -1136,15 +1132,17 @@ static uint64_t *kprof_resolve(uint32_t n) {
  * kernel also pays; kprof_report callers subtract it to get net kernel time. */
 int myds_metal_kprof_calibrate(double *floor_us) {
     enum { CAL = 256 };
-    if (!kprof_init() || g_batch_cb || g_kp_on || !g_kp_cpu0) return 0;   /* needs a prior armed window for tick scale */
+    if (!kprof_init() || g_batch_cb || g_kp_on) return 0;
     const uint32_t base = g_kp_n;   /* keep already captured records; append after them */
     if (base + CAL > g_kp_cap) return 0;
     myds_metal_buffer_t *a = myds_metal_buffer_alloc(64), *b = myds_metal_buffer_alloc(64),
                         *o = myds_metal_buffer_alloc(64);
     int ok = a && b && o && myds_metal_begin_batch();
+    id<MTLCommandBuffer> cal_cb = nil;
     if (ok) {
         g_kp_on = 1;
         for (int i = 0; ok && i < CAL; ++i) ok = myds_metal_add(o, a, b, 16);
+        cal_cb = g_batch_cb;   /* commit waits for completion; times readable afterwards */
         ok = myds_metal_commit_batch() && ok;
         g_kp_on = 0;
     }
@@ -1156,7 +1154,17 @@ int myds_metal_kprof_calibrate(double *floor_us) {
     if (!ok || end < base + CAL) return 0;
     uint64_t *tsv = kprof_resolve(end);
     if (!tsv) return 0;
-    const double tick_ns = kprof_tick_ns();
+    /* Sample-buffer timestamps are already ~ns. Cross-check against the CB's own GPU
+     * span over the 256 back-to-back calibration encoders; fall back to 1.0 if odd. */
+    {
+        const uint64_t s0 = tsv[2u * base], e1 = tsv[2u * (end - 1u) + 1u];
+        const double cb_ns = cal_cb ? (cal_cb.GPUEndTime - cal_cb.GPUStartTime) * 1e9 : 0.0;
+        double sc = 1.0;
+        if (cb_ns > 0 && s0 && e1 > s0 && s0 != UINT64_MAX && e1 != UINT64_MAX) sc = cb_ns / (double)(e1 - s0);
+        g_kp_scale_calibrated = (sc >= 0.5 && sc <= 2.0);
+        g_kp_scale = g_kp_scale_calibrated ? sc : 1.0;
+    }
+    const double tick_ns = g_kp_scale;
     double d[CAL]; uint32_t n = 0;
     for (uint32_t i = base; i < end && n < CAL; ++i) {
         const uint64_t s = tsv[2u * i], e = tsv[2u * i + 1u];
@@ -1172,7 +1180,7 @@ int myds_metal_kprof_calibrate(double *floor_us) {
 
 int myds_metal_kprof_report(FILE *out, const char *label, uint32_t tokens) {
     if (!out || !g_kp_nbuf || !g_kp_n) return 0;
-    const double tick_ns = kprof_tick_ns();
+    const double tick_ns = g_kp_scale;
     const uint32_t n = g_kp_n;
     uint64_t *tsv = kprof_resolve(n);
     if (!tsv) return 0;
@@ -1229,10 +1237,10 @@ int myds_metal_kprof_report(FILE *out, const char *label, uint32_t tokens) {
     fprintf(out, "{\"kind\":\"kprof_summary\",\"label\":\"%s\",\"tokens\":%u,\"encoders\":%u,\"bad_samples\":%u,"
             "\"untagged_encoders\":%u,\"merged_encoders\":%u,\"agg_overflow\":%u,\"buffer_overflow\":%u,"
             "\"busy_ms\":%.6f,\"gap_lt1ms_ms\":%.6f,\"idle_ge1ms_ms\":%.6f,\"span_ms\":%.6f,"
-            "\"gpu_tick_ns\":%.9f,\"floor_us\":%.3f,\"serialized\":true}\n",
+            "\"gpu_tick_ns\":%.9f,\"scale_calibrated\":%d,\"floor_us\":%.3f,\"serialized\":true}\n",
             label ? label : "", tokens, n, bad, untagged, merged, agg_overflow, g_kp_overflow,
             busy / 1e6, gap_small / 1e6, idle_large / 1e6,
-            (double)(last_end - first_start) * tick_ns / 1e6, tick_ns, g_kp_floor_us);
+            (double)(last_end - first_start) * tick_ns / 1e6, tick_ns, g_kp_scale_calibrated, g_kp_floor_us);
     fflush(out);
     free(agg);
     free(tsv);
