@@ -32,3 +32,9 @@ docs/benchmarks/2026-10-05-decode-split-adoption/window/start_fleet.before.sh -w
 # Preserve verbatim shared3 measurement records and original test whitespace.
 docs/benchmarks/2026-10-12-dspark-shared3/** -text
 docs/benchmarks/2026-10-12-dspark-shared3/**/*.log -whitespace
+
+# Preserve original Gemini acceptance probe/AIR/report evidence bytes.
+docs/verification/2026-10-12-gemini-decode-review/** -text
+docs/verification/2026-10-12-gemini-decode-review/**/*.log -whitespace
+docs/verification/2026-10-12-gemini-decode-review/**/*.diff -whitespace
+docs/verification/2026-10-12-gemini-decode-review/**/*.ll -whitespace
