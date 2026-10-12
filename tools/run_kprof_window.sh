@@ -63,6 +63,19 @@ run_case() { # name request max_seq
     && python3 tools/kprof_report.py "$out/$1.jsonl" --top 40 > "$out/$1.txt" 2>&1 \
     || echo "case $1 FAILED (see $out/$1.log)"
 }
+if [[ -n "${MOE_SWEEP:-}" ]]; then
+  # e.g. MOE_SWEEP="4:4 2:2 2:4 4:2" (MYDS_MOE_NSG:MYDS_MOE_DOWN_NSG), short context only.
+  for cfg in $MOE_SWEEP; do
+    g=${cfg%%:*}; d=${cfg##*:}
+    echo "== sweep nsg=$g down=$d $(date +%T)"
+    env "${common[@]}" MYDS_MOE_NSG=$g MYDS_MOE_DOWN_NSG=$d "$stage/bench_kprof" "$model" "$out/req-short.json" 8 24 4096 \
+      > "$out/sweep-$g-$d.jsonl" 2> "$out/sweep-$g-$d.log" \
+      && python3 tools/kprof_report.py "$out/sweep-$g-$d.jsonl" --top 40 > "$out/sweep-$g-$d.txt" 2>&1 \
+      || echo "sweep $g:$d FAILED"
+  done
+  echo "cases finished $(date +%T)"
+  exit 0
+fi
 run_case short "$out/req-short.json" 4096
 run_case ctx8k "$out/req-8k.json" 12288
 run_case ctx32k "$out/req-32k.json" 40960
