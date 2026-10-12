@@ -77,6 +77,7 @@ TEST_ENGINE_DEPTH2 = $(BIN_DIR)/test_engine_depth2
 BENCH_SYNTHETIC = $(BIN_DIR)/bench_synthetic
 BENCH_METAL = $(BIN_DIR)/bench_metal
 BENCH_PHASE = $(BIN_DIR)/bench_phase
+BENCH_KPROF = $(BIN_DIR)/bench_kprof
 BENCH_ENGRAM_IO = $(BIN_DIR)/bench_engram_io
 DUMP_TENSORS = $(BIN_DIR)/dump_tensors
 METALLIB = $(BIN_DIR)/myds.metallib
@@ -137,6 +138,9 @@ $(BUILD_DIR)/test_qkv_fusion.o: tests/test_qkv_fusion.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 $(BUILD_DIR)/bench_phase.o: tools/bench_phase.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD_DIR)/bench_kprof.o: tools/bench_kprof.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 $(BUILD_DIR)/test_gguf.o: tests/test_gguf.c | $(BUILD_DIR)
@@ -290,6 +294,19 @@ $(TEST_DEEPER_SSD): tests/test_deeper_ssd.c tests/test_engine.c tests/test_p1_re
 # Opt-in full-model harness: build only; never run from all/test.
 $(BENCH_PHASE): $(OBJS_C) $(OBJS_M) $(BUILD_DIR)/bench_phase.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
+
+# Opt-in per-kernel GPU timing harness (serialized encoders; see tools/kprof_report.py).
+$(BENCH_KPROF): $(OBJS_C) $(OBJS_M) $(BUILD_DIR)/bench_kprof.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
+
+# Opt-in (not in ALL_TESTS): armed-vs-unarmed parity and sample validity for MYDS_KPROF.
+TEST_KPROF = $(BIN_DIR)/test_kprof
+$(TEST_KPROF): tests/test_kprof.c $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(CFLAGS) tests/test_kprof.c $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
+
+test-kprof: $(TEST_KPROF)
+	@./$(TEST_KPROF)
+.PHONY: test-kprof
 
 # Metadata/tokenizer-only input audit. No Metal framework, model loader or GPU.
 $(BIN_DIR)/count_chat_tokens: tools/count_chat_tokens.c src/myds_server.c src/myds_gguf.c src/myds_tokenizer.c src/myds_log.c $(wildcard include/*.h) src/myds_tokenizer_unicode.h | $(BIN_DIR)

@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <mach/mach_time.h>
 
 #include "myds_metal.h"
 #include "myds_log.h"
@@ -965,6 +966,241 @@ static void close_compute_encoder(void) {
     }
 }
 
+/* =========================================================================
+ * Per-kernel GPU timing (MYDS_KPROF=1, armed at runtime). Diagnostic only.
+ * Apple GPUs sample counters at encoder (stage) boundaries, not per dispatch,
+ * so while armed each dispatch gets its own compute encoder bracketed by two
+ * GPU timestamps. Encoders are therefore serialized: durations are isolated
+ * per-kernel GPU times, and the sum is NOT the unarmed token latency.
+ * ========================================================================= */
+typedef struct {
+    const char *name;
+    NSUInteger  g[3], t[3];
+    uint32_t    n;      /* dispatches encoded into this encoder */
+    uint8_t     dt;     /* 1 = dispatchThreads, 0 = dispatchThreadgroups */
+} kp_rec_t;
+static id<MTLCounterSampleBuffer> g_kp_sb = nil;
+static kp_rec_t *g_kp_rec = NULL;
+static uint32_t  g_kp_cap = 0, g_kp_n = 0, g_kp_overflow = 0;
+static int       g_kp_on = 0, g_kp_env = -1, g_kp_ready = 0;
+static uint64_t  g_kp_cpu0 = 0, g_kp_gpu0 = 0;
+
+static int kprof_env(void) {
+    if (g_kp_env < 0) {
+        const char *e = getenv("MYDS_KPROF");
+        g_kp_env = (e && atoi(e) != 0) ? 1 : 0;
+    }
+    return g_kp_env;
+}
+
+static int kprof_init(void) {
+    if (g_kp_ready) return g_kp_ready > 0;
+    g_kp_ready = -1;
+    if (!g_device || !kprof_env()) return 0;
+    if (![g_device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+        fprintf(stderr, "myds_metal: kprof unavailable: no stage-boundary counter sampling\n");
+        return 0;
+    }
+    id<MTLCounterSet> ts = nil;
+    for (id<MTLCounterSet> cs in g_device.counterSets)
+        if ([cs.name isEqualToString:MTLCommonCounterSetTimestamp]) { ts = cs; break; }
+    if (!ts) { fprintf(stderr, "myds_metal: kprof unavailable: no timestamp counter set\n"); return 0; }
+    for (NSUInteger cnt = (NSUInteger)1 << 18; cnt >= ((NSUInteger)1 << 10) && !g_kp_sb; cnt >>= 1) {
+        MTLCounterSampleBufferDescriptor *d = [MTLCounterSampleBufferDescriptor new];
+        d.counterSet = ts;
+        d.storageMode = MTLStorageModeShared;
+        d.sampleCount = cnt;
+        d.label = @"myds-kprof";
+        NSError *err = nil;
+        g_kp_sb = [g_device newCounterSampleBufferWithDescriptor:d error:&err];
+        if (g_kp_sb) g_kp_cap = (uint32_t)(cnt / 2);
+    }
+    if (!g_kp_sb) { fprintf(stderr, "myds_metal: kprof sample buffer allocation failed\n"); return 0; }
+    g_kp_rec = calloc(g_kp_cap, sizeof(kp_rec_t));
+    if (!g_kp_rec) { g_kp_sb = nil; return 0; }
+    g_kp_ready = 1;
+    return 1;
+}
+
+int myds_metal_kprof_enabled(void) {
+    return g_device ? kprof_init() : kprof_env();
+}
+
+void myds_metal_kprof_arm(int on) {
+    close_compute_encoder();
+    if (on) {
+        if (!kprof_init()) { g_kp_on = 0; return; }
+        g_kp_n = 0; g_kp_overflow = 0;
+        [g_device sampleTimestamps:&g_kp_cpu0 gpuTimestamp:&g_kp_gpu0];
+        g_kp_on = 1;
+    } else {
+        g_kp_on = 0;
+    }
+}
+
+/* The current (latest) kprof encoder has not dispatched yet and can be reused. */
+static inline int kprof_cur_unused(void) {
+    return g_kp_n && g_kp_rec[g_kp_n - 1].n == 0;
+}
+
+static id<MTLComputeCommandEncoder> kprof_new_encoder(id<MTLCommandBuffer> cb, int concurrent) {
+    if (g_kp_n >= g_kp_cap) {
+        ++g_kp_overflow;
+        g_kp_on = 0;   /* buffer full: stop recording, run the rest normally */
+        return nil;
+    }
+    MTLComputePassDescriptor *pd = [MTLComputePassDescriptor computePassDescriptor];
+    if (concurrent) pd.dispatchType = MTLDispatchTypeConcurrent;
+    MTLComputePassSampleBufferAttachmentDescriptor *a = pd.sampleBufferAttachments[0];
+    a.sampleBuffer = g_kp_sb;
+    a.startOfEncoderSampleIndex = (NSUInteger)(2u * g_kp_n);
+    a.endOfEncoderSampleIndex = (NSUInteger)(2u * g_kp_n + 1u);
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDescriptor:pd];
+    if (enc) { memset(&g_kp_rec[g_kp_n], 0, sizeof(kp_rec_t)); ++g_kp_n; }
+    return enc;
+}
+
+static inline void kprof_tag(id<MTLComputeCommandEncoder> enc, const char *name,
+                             MTLSize g, MTLSize t, int dt) {
+    if (!g_kp_on || !g_kp_n || enc != g_batch_enc) return;
+    kp_rec_t *r = &g_kp_rec[g_kp_n - 1];
+    if (r->n++ == 0) {
+        r->name = name; r->dt = (uint8_t)dt;
+        r->g[0] = g.width; r->g[1] = g.height; r->g[2] = g.depth;
+        r->t[0] = t.width; r->t[1] = t.height; r->t[2] = t.depth;
+    }
+}
+
+typedef struct {
+    const char *name; NSUInteger g[3], t[3]; uint8_t dt;
+    uint64_t calls, sum_ns, min_ns, max_ns;
+    uint32_t merged;   /* encoders holding >1 dispatch (time is shared) */
+} kp_agg_t;
+
+static double g_kp_floor_us = 0;   /* per-encoder fixed cost, see myds_metal_kprof_calibrate */
+
+/* Timestamp ticks -> ns, calibrated against the CPU clock over the armed window. */
+static double kprof_tick_ns(void) {
+    uint64_t cpu1 = 0, gpu1 = 0;
+    [g_device sampleTimestamps:&cpu1 gpuTimestamp:&gpu1];
+    mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+    const double cpu_ns = (double)(cpu1 - g_kp_cpu0) * (double)tb.numer / (double)tb.denom;
+    return (gpu1 > g_kp_gpu0 && cpu_ns > 0) ? cpu_ns / (double)(gpu1 - g_kp_gpu0) : 1.0;
+}
+
+static int kp_cmp_double(const void *a, const void *b) {
+    const double x = *(const double *)a, y = *(const double *)b;
+    return (x > y) - (x < y);
+}
+
+/* Time a batch of trivial 16-element adds, one encoder each. Their median is the
+ * fixed encoder-bracket cost (encoder start/end + sample write) that every real
+ * kernel also pays; kprof_report callers subtract it to get net kernel time. */
+int myds_metal_kprof_calibrate(double *floor_us) {
+    enum { CAL = 256 };
+    if (!kprof_init() || g_batch_cb || g_kp_on || !g_kp_cpu0) return 0;   /* needs a prior armed window for tick scale */
+    const uint32_t base = g_kp_n;   /* keep already captured records; append after them */
+    if (base + CAL > g_kp_cap) return 0;
+    myds_metal_buffer_t *a = myds_metal_buffer_alloc(64), *b = myds_metal_buffer_alloc(64),
+                        *o = myds_metal_buffer_alloc(64);
+    int ok = a && b && o && myds_metal_begin_batch();
+    if (ok) {
+        g_kp_on = 1;
+        for (int i = 0; ok && i < CAL; ++i) ok = myds_metal_add(o, a, b, 16);
+        ok = myds_metal_commit_batch() && ok;
+        g_kp_on = 0;
+    }
+    if (a) myds_metal_buffer_free(a);
+    if (b) myds_metal_buffer_free(b);
+    if (o) myds_metal_buffer_free(o);
+    const uint32_t end = g_kp_n;
+    g_kp_n = base;   /* calibration records never appear in the report */
+    if (!ok || end < base + CAL) return 0;
+    NSData *data = [g_kp_sb resolveCounterRange:NSMakeRange(0, 2u * end)];
+    if (!data || data.length < (NSUInteger)2u * end * sizeof(MTLCounterResultTimestamp)) return 0;
+    const MTLCounterResultTimestamp *ts = (const MTLCounterResultTimestamp *)data.bytes;
+    const double tick_ns = kprof_tick_ns();
+    double d[CAL]; uint32_t n = 0;
+    for (uint32_t i = base; i < end && n < CAL; ++i) {
+        const uint64_t s = ts[2u * i].timestamp, e = ts[2u * i + 1u].timestamp;
+        if (s && e && s != UINT64_MAX && e != UINT64_MAX && e >= s) d[n++] = (double)(e - s) * tick_ns / 1e3;
+    }
+    if (n < CAL / 2) return 0;
+    qsort(d, n, sizeof(double), kp_cmp_double);
+    g_kp_floor_us = d[n / 2];
+    if (floor_us) *floor_us = g_kp_floor_us;
+    return 1;
+}
+
+int myds_metal_kprof_report(FILE *out, const char *label, uint32_t tokens) {
+    if (!out || !g_kp_sb || !g_kp_n) return 0;
+    const double tick_ns = kprof_tick_ns();
+    const uint32_t n = g_kp_n;
+    NSData *data = [g_kp_sb resolveCounterRange:NSMakeRange(0, 2u * n)];
+    if (!data || data.length < (NSUInteger)2u * n * sizeof(MTLCounterResultTimestamp)) return 0;
+    const MTLCounterResultTimestamp *ts = (const MTLCounterResultTimestamp *)data.bytes;
+
+    enum { AGG_CAP = 2048 };
+    kp_agg_t *agg = calloc(AGG_CAP, sizeof(kp_agg_t));
+    if (!agg) return 0;
+    uint32_t na = 0, bad = 0, merged = 0, agg_overflow = 0, untagged = 0;
+    double busy = 0, gap_small = 0, idle_large = 0;
+    uint64_t first_start = 0, last_end = 0, prev_end = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint64_t s = ts[2u * i].timestamp, e = ts[2u * i + 1u].timestamp;
+        if (s == 0 || e == 0 || s == UINT64_MAX || e == UINT64_MAX || e < s) { ++bad; continue; }
+        const uint64_t ns = (uint64_t)((double)(e - s) * tick_ns);
+        const kp_rec_t *r = &g_kp_rec[i];
+        if (!first_start) first_start = s;
+        if (e > last_end) last_end = e;
+        if (prev_end && s > prev_end) {
+            const double gap = (double)(s - prev_end) * tick_ns;
+            if (gap < 1.0e6) gap_small += gap; else idle_large += gap;
+        }
+        if (e > prev_end) prev_end = e;
+        busy += (double)ns;
+        if (r->n == 0) ++untagged;
+        if (r->n > 1) ++merged;
+        uint32_t k = 0;
+        for (; k < na; ++k) {
+            kp_agg_t *a = &agg[k];
+            if (a->dt == r->dt && !memcmp(a->g, r->g, sizeof(a->g)) && !memcmp(a->t, r->t, sizeof(a->t)) &&
+                ((a->name == r->name) || (a->name && r->name && !strcmp(a->name, r->name)))) break;
+        }
+        if (k == na) {
+            if (na == AGG_CAP) { ++agg_overflow; continue; }
+            agg[na] = (kp_agg_t){.name = r->name, .dt = r->dt, .min_ns = UINT64_MAX};
+            memcpy(agg[na].g, r->g, sizeof(r->g)); memcpy(agg[na].t, r->t, sizeof(r->t));
+            ++na;
+        }
+        kp_agg_t *a = &agg[k];
+        ++a->calls; a->sum_ns += ns;
+        if (ns < a->min_ns) a->min_ns = ns;
+        if (ns > a->max_ns) a->max_ns = ns;
+        if (r->n > 1) ++a->merged;
+    }
+    for (uint32_t k = 0; k < na; ++k) {
+        const kp_agg_t *a = &agg[k];
+        fprintf(out, "{\"kind\":\"kprof_kernel\",\"label\":\"%s\",\"name\":\"%s\",\"dispatch_threads\":%s,"
+                "\"grid\":[%llu,%llu,%llu],\"threads\":[%llu,%llu,%llu],\"calls\":%llu,"
+                "\"sum_us\":%.3f,\"min_us\":%.3f,\"max_us\":%.3f,\"merged_encoders\":%u}\n",
+                label ? label : "", a->name ? a->name : "(untagged)", a->dt ? "true" : "false",
+                (unsigned long long)a->g[0], (unsigned long long)a->g[1], (unsigned long long)a->g[2],
+                (unsigned long long)a->t[0], (unsigned long long)a->t[1], (unsigned long long)a->t[2],
+                (unsigned long long)a->calls, a->sum_ns / 1e3, a->min_ns / 1e3, a->max_ns / 1e3, a->merged);
+    }
+    fprintf(out, "{\"kind\":\"kprof_summary\",\"label\":\"%s\",\"tokens\":%u,\"encoders\":%u,\"bad_samples\":%u,"
+            "\"untagged_encoders\":%u,\"merged_encoders\":%u,\"agg_overflow\":%u,\"buffer_overflow\":%u,"
+            "\"busy_ms\":%.6f,\"gap_lt1ms_ms\":%.6f,\"idle_ge1ms_ms\":%.6f,\"span_ms\":%.6f,"
+            "\"gpu_tick_ns\":%.9f,\"floor_us\":%.3f,\"serialized\":true}\n",
+            label ? label : "", tokens, n, bad, untagged, merged, agg_overflow, g_kp_overflow,
+            busy / 1e6, gap_small / 1e6, idle_large / 1e6,
+            (double)(last_end - first_start) * tick_ns / 1e6, tick_ns, g_kp_floor_us);
+    fflush(out);
+    free(agg);
+    return 1;
+}
+
 static int g_concurrent_mode = 0;
 
 void myds_metal_set_concurrent(int enable) {
@@ -986,7 +1222,7 @@ int myds_metal_get_concurrent(void) {
 }
 
 static id<MTLComputeCommandEncoder> get_compute_encoder(id<MTLCommandBuffer> cb) {
-    if (cb == g_batch_cb && g_batch_enc) {
+    if (cb == g_batch_cb && g_batch_enc && !(g_kp_on && !kprof_cur_unused())) {
         return g_batch_enc;
     }
     static int s_concurrent_env = -1;
@@ -996,6 +1232,12 @@ static id<MTLComputeCommandEncoder> get_compute_encoder(id<MTLCommandBuffer> cb)
     }
     int use_concurrent = (g_concurrent_mode > 0) || (s_concurrent_env > 0);
     id<MTLComputeCommandEncoder> enc = nil;
+    if (g_kp_on && cb == g_batch_cb) {
+        /* kprof: the previous encoder already dispatched; start a new bracketed one. */
+        close_compute_encoder();
+        enc = kprof_new_encoder(cb, use_concurrent);
+        if (enc) { g_batch_enc = enc; return enc; }
+    }
     if (use_concurrent && [cb respondsToSelector:@selector(computeCommandEncoderWithDispatchType:)]) {
         enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
     } else {
@@ -1008,6 +1250,7 @@ static id<MTLComputeCommandEncoder> get_compute_encoder(id<MTLCommandBuffer> cb)
 }
 
 void myds_metal_barrier(void) {
+    if (g_kp_on) return;   /* kprof: encoder boundaries already order dispatches */
     if (g_batch_cb) {
         id<MTLComputeCommandEncoder> enc = get_compute_encoder(g_batch_cb);
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -1015,6 +1258,7 @@ void myds_metal_barrier(void) {
 }
 
 void myds_metal_barrier_buffers(const myds_metal_buffer_t *const *buffers, size_t count) {
+    if (g_kp_on) return;
     if (!g_batch_cb || !buffers || count == 0) return;
     id<MTLComputeCommandEncoder> enc = get_compute_encoder(g_batch_cb);
     if (!enc) return;
@@ -2242,6 +2486,7 @@ static inline void metal_dispatch(id<MTLComputeCommandEncoder> enc,
     [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:threadsPerThreadgroup];
     g_dispatch_count++;
     hist_add(name);
+    kprof_tag(enc, name, threadgroups, threadsPerThreadgroup, 0);
 }
 
 static inline void metal_dispatch_threads(id<MTLComputeCommandEncoder> enc,
@@ -2251,6 +2496,7 @@ static inline void metal_dispatch_threads(id<MTLComputeCommandEncoder> enc,
     [enc dispatchThreads:threads threadsPerThreadgroup:threadsPerThreadgroup];
     g_dispatch_count++;
     hist_add(name);
+    kprof_tag(enc, name, threads, threadsPerThreadgroup, 1);
 }
 
 struct ds4_metal_args_norm {

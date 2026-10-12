@@ -114,6 +114,25 @@ uint64_t myds_metal_dispatch_count(void);
 int myds_metal_dispatch_hist_dump(FILE *out);
 void myds_metal_dispatch_count_reset(void);
 
+/* Per-kernel GPU timing (diagnostic, opt-in via MYDS_KPROF=1).
+ * While armed every compute dispatch gets its own encoder bracketed by GPU
+ * timestamp samples, so kernels are SERIALIZED (no encoder overlap) and each
+ * duration is that kernel's isolated GPU time. Never use armed runs for
+ * throughput numbers; use them to split ms/token across kernels.
+ *   enabled : MYDS_KPROF=1 set and the device supports stage-boundary sampling
+ *   arm     : 1 = reset buffers and start recording, 0 = stop recording
+ *   report  : resolve samples and write JSONL (kernel aggregates + summary).
+ *             Call only after all GPU work finished (generation returned).
+ * Returns 1 on success, 0 if not enabled/nothing recorded. */
+int  myds_metal_kprof_enabled(void);
+void myds_metal_kprof_arm(int on);
+int  myds_metal_kprof_report(FILE *out, const char *label, uint32_t tokens);
+/* Measure the fixed per-encoder bracket cost (median of 256 trivial kernels, one
+ * encoder each) on the now-warm GPU and store it for the next report's
+ * "floor_us". Call after the armed window and before report; needs a prior
+ * arm (for the timestamp scale) and no open batch. Returns 1 on success. */
+int  myds_metal_kprof_calibrate(double *floor_us);
+
 int myds_metal_buffer_copy(myds_metal_buffer_t *dst, size_t dst_offset,
     const myds_metal_buffer_t *src, size_t src_offset, size_t bytes);
 /* Internal native-graph bridge. args occupies slot0, buffers slots1..N.
