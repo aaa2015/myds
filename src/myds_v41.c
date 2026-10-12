@@ -3521,6 +3521,33 @@ static inline int32_t sample_and_verify_token(const float *logits, uint32_t voca
     return myds_sample_next_token(logits, vocab_size, cfg, ctx, NULL, 0);
 }
 
+static inline bool v41_fuse_hc_sum_rmsnorm_enabled(void) {
+    static int cached = -1;
+    if (__builtin_expect(cached < 0, 0)) {
+        const char *env = getenv("MYDS_FUSE_HC_SUM_RMSNORM");
+        cached = (env == NULL || atoi(env) != 0);
+    }
+    return cached != 0;
+}
+
+static inline int v41_hc_sum_rmsnorm_scoped(
+    myds_metal_buffer_t       *out_norm,
+    myds_metal_buffer_t       *out_sum,
+    const myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *split_or_pre,
+    const myds_metal_buffer_t *weight,
+    uint32_t                   dim,
+    float                      eps,
+    bool                       fuse_enabled) {
+    if (fuse_enabled) {
+        return myds_metal_v41_hc_sum_rmsnorm(out_norm, out_sum, residual, split_or_pre, weight, dim, eps, true);
+    } else {
+        if (!myds_metal_v41_hc_weighted_sum(out_sum, residual, split_or_pre, dim)) return 0;
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(out_sum);
+        return myds_metal_v41_rmsnorm(out_norm, out_sum, weight, dim, eps, true);
+    }
+}
+
 static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos,
                                bool need_logits, bool ordinary_decode_allowed) {
     myds_model_t *m=ctx->model;
@@ -3574,11 +3601,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
     for (uint32_t j=1;j<4;j++) memcpy(res+j*V41_DIM,res,V41_DIM*4u);
     const float initial_pre[4]={1,0,0,0};
     CHECK(myds_metal_buffer_write(g->pre,0,initial_pre,sizeof(initial_pre)));
-    static int fuse_hc_norm_enabled = -1;
-    if (fuse_hc_norm_enabled < 0) {
-        const char *env = getenv("MYDS_FUSE_HC_SUM_RMSNORM");
-        fuse_hc_norm_enabled = (env == NULL || atoi(env) != 0);
-    }
+    const bool fuse_hc_norm_enabled = v41_fuse_hc_sum_rmsnorm_enabled();
     static int qkv_pipeline_enabled = -1;
     if (qkv_pipeline_enabled < 0) {
         const char *env = getenv("MYDS_QKV_PIPELINE");
@@ -3623,13 +3646,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
             TRACE("hc_attn_mix",g->mix,24); TRACE("hc_attn_split",g->attn_split,24);
             const myds_metal_buffer_t *hc_in_pre = (il == 0 ? g->pre : g->ffn_split);
             TRACE("hc_attn_pre",hc_in_pre,4);
-            if (fuse_hc_norm_enabled) {
-                CHECK(myds_metal_v41_hc_sum_rmsnorm(ctx->x_norm, ctx->x, g->residual, hc_in_pre, base->attn_norm, V41_DIM, m->norm_eps, true));
-            } else {
-                CHECK(myds_metal_v41_hc_weighted_sum(ctx->x,g->residual,hc_in_pre,V41_DIM));
-                if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(ctx->x);
-                CHECK(myds_metal_v41_rmsnorm(ctx->x_norm,ctx->x,base->attn_norm,V41_DIM,m->norm_eps,true));
-            }
+            CHECK(v41_hc_sum_rmsnorm_scoped(ctx->x_norm, ctx->x, g->residual, hc_in_pre, base->attn_norm, V41_DIM, m->norm_eps, fuse_hc_norm_enabled));
             TRACE("hc_attn_input",ctx->x,V41_DIM);
             TRACE("attn_norm",ctx->x_norm,V41_DIM);
             phase="attention projections";
@@ -3665,13 +3682,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
              * 4. 汇聚分支并恢复本局部 scope 的 encoder 模式
              */
             const myds_metal_buffer_t *hc_in_pre = (il == 0 ? g->pre : g->ffn_split);
-            if (fuse_hc_norm_enabled) {
-                CHECK(myds_metal_v41_hc_sum_rmsnorm(ctx->x_norm, ctx->x, g->residual, hc_in_pre, base->attn_norm, V41_DIM, m->norm_eps, true));
-            } else {
-                CHECK(myds_metal_v41_hc_weighted_sum(ctx->x,g->residual,hc_in_pre,V41_DIM));
-                if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(ctx->x);
-                CHECK(myds_metal_v41_rmsnorm(ctx->x_norm,ctx->x,base->attn_norm,V41_DIM,m->norm_eps,true));
-            }
+            CHECK(v41_hc_sum_rmsnorm_scoped(ctx->x_norm, ctx->x, g->residual, hc_in_pre, base->attn_norm, V41_DIM, m->norm_eps, fuse_hc_norm_enabled));
             phase="attention projections";
             if (!fine_pipeline) {
                 myds_metal_set_auto_barrier(0);
@@ -3819,13 +3830,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
         if (fine_pipeline) {
             myds_metal_barrier_buffer(g->after_attn);
         }
-        if (fuse_hc_norm_enabled) {
-            CHECK(myds_metal_v41_hc_sum_rmsnorm(ctx->ffn_norm_out, ctx->x, g->after_attn, g->attn_split, base->ffn_norm, V41_DIM, m->norm_eps, true));
-        } else {
-            CHECK(myds_metal_v41_hc_weighted_sum(ctx->x,g->after_attn,g->attn_split,V41_DIM));
-            if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(ctx->x);
-            CHECK(myds_metal_v41_rmsnorm(ctx->ffn_norm_out,ctx->x,base->ffn_norm,V41_DIM,m->norm_eps,true));
-        }
+        CHECK(v41_hc_sum_rmsnorm_scoped(ctx->ffn_norm_out, ctx->x, g->after_attn, g->attn_split, base->ffn_norm, V41_DIM, m->norm_eps, fuse_hc_norm_enabled));
         TRACE("hc_ffn_input",ctx->x,V41_DIM);
         TRACE("ffn_norm",ctx->ffn_norm_out,V41_DIM);
         if (fine_pipeline) {
@@ -3849,13 +3854,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
     phase="output head";
     int32_t next_tok = 0;
     if (need_logits) {
-        if (fuse_hc_norm_enabled) {
-            CHECK(myds_metal_v41_hc_sum_rmsnorm(ctx->x_norm, ctx->x, g->residual, g->ffn_split, m->output_norm, V41_DIM, m->norm_eps, true));
-        } else {
-            CHECK(myds_metal_v41_hc_weighted_sum(ctx->x,g->residual,g->ffn_split,V41_DIM));
-            if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(ctx->x);
-            CHECK(myds_metal_v41_rmsnorm(ctx->x_norm,ctx->x,m->output_norm,V41_DIM,m->norm_eps,true));
-        }
+        CHECK(v41_hc_sum_rmsnorm_scoped(ctx->x_norm, ctx->x, g->residual, g->ffn_split, m->output_norm, V41_DIM, m->norm_eps, fuse_hc_norm_enabled));
         if (fine_pipeline) {
             myds_metal_barrier_buffer(ctx->x_norm);
         }
@@ -4476,6 +4475,7 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         const int n = e ? atoi(e) : 0;
         decode_split = (n > 1 && n <= (int)V41_LAYERS) ? n : 0;
     }
+    const bool fuse_hc_norm_enabled = v41_fuse_hc_sum_rmsnorm_enabled();
 
     /* 1. 保存投机前快照（用于未命中时的无损回滚） */
     myds_v41_spec_snapshot_t *snap = caller_snapshot ? caller_snapshot : &ws->snapshot;
@@ -4562,8 +4562,8 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         /* HC Sum RMSNorm (产生双 Token 连续输入 ws->x_norm_b2) */
         const myds_metal_buffer_t *pre0 = (il == 0 ? ws->v_pre[0] : ws->v_ffn_split[0]);
         const myds_metal_buffer_t *pre1 = (il == 0 ? ws->v_pre[1] : ws->v_ffn_split[1]);
-        CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_x_norm[0], ws->v_x[0], ws->v_residual[0], pre0, base->attn_norm, V41_DIM, m->norm_eps, true));
-        CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_x_norm[1], ws->v_x[1], ws->v_residual[1], pre1, base->attn_norm, V41_DIM, m->norm_eps, true));
+        CHECK(v41_hc_sum_rmsnorm_scoped(ws->v_x_norm[0], ws->v_x[0], ws->v_residual[0], pre0, base->attn_norm, V41_DIM, m->norm_eps, fuse_hc_norm_enabled));
+        CHECK(v41_hc_sum_rmsnorm_scoped(ws->v_x_norm[1], ws->v_x[1], ws->v_residual[1], pre1, base->attn_norm, V41_DIM, m->norm_eps, fuse_hc_norm_enabled));
         myds_metal_barrier_buffer(ws->x_norm_b2);
 
         /* HC Mix (dispatches concurrently with QKV and Attention) */
@@ -4653,8 +4653,8 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_metal_v41_hc_expand(ws->v_after_attn[0], ws->v_attn_out[0], ws->v_residual[0], ws->v_attn_split[0], V41_DIM));
         CHECK(myds_metal_v41_hc_expand(ws->v_after_attn[1], ws->v_attn_out[1], ws->v_residual[1], ws->v_attn_split[1], V41_DIM));
         myds_metal_barrier_buffer(ws->after_attn_b2);
-        CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_ffn_norm[0], ws->v_x[0], ws->v_after_attn[0], ws->v_attn_split[0], base->ffn_norm, V41_DIM, m->norm_eps, true));
-        CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_ffn_norm[1], ws->v_x[1], ws->v_after_attn[1], ws->v_attn_split[1], base->ffn_norm, V41_DIM, m->norm_eps, true));
+        CHECK(v41_hc_sum_rmsnorm_scoped(ws->v_ffn_norm[0], ws->v_x[0], ws->v_after_attn[0], ws->v_attn_split[0], base->ffn_norm, V41_DIM, m->norm_eps, fuse_hc_norm_enabled));
+        CHECK(v41_hc_sum_rmsnorm_scoped(ws->v_ffn_norm[1], ws->v_x[1], ws->v_after_attn[1], ws->v_attn_split[1], base->ffn_norm, V41_DIM, m->norm_eps, fuse_hc_norm_enabled));
         myds_metal_barrier_buffer(ws->ffn_norm_b2);
 
         /* 1. 并发派发 FFN HC Mix（只读 after_attn，写 ffn_split，与后续 Shared/Router/MoE 完全重叠） */
@@ -4755,8 +4755,8 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
     const char *lazy_env = getenv("MYDS_BATCH2_LAZY_HEAD");
     const bool lazy_head = !lazy_env || strcmp(lazy_env, "0");
     /* 4. Output Head & Logits for Token 0 (Lazy LM Head for Token 1) */
-    CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_x_norm[0], ws->v_x[0], ws->v_residual[0], ws->v_ffn_split[0], m->output_norm, V41_DIM, m->norm_eps, true));
-    CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_x_norm[1], ws->v_x[1], ws->v_residual[1], ws->v_ffn_split[1], m->output_norm, V41_DIM, m->norm_eps, true));
+    CHECK(v41_hc_sum_rmsnorm_scoped(ws->v_x_norm[0], ws->v_x[0], ws->v_residual[0], ws->v_ffn_split[0], m->output_norm, V41_DIM, m->norm_eps, fuse_hc_norm_enabled));
+    CHECK(v41_hc_sum_rmsnorm_scoped(ws->v_x_norm[1], ws->v_x[1], ws->v_residual[1], ws->v_ffn_split[1], m->output_norm, V41_DIM, m->norm_eps, fuse_hc_norm_enabled));
     myds_metal_barrier_buffer(ws->x_norm_b2);
 
     CHECK(project(ws->v_logits[0], m->output, ws->v_x_norm[0], m->vocab_size, V41_DIM, m->output_type, false));
@@ -5141,6 +5141,7 @@ static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *t
         const int n = e ? atoi(e) : 0;
         decode_split = (n > 1 && n <= (int)V41_LAYERS) ? n : 0;
     }
+    const bool fuse_hc_norm_enabled = v41_fuse_hc_sum_rmsnorm_enabled();
 
     /* 1. 保存投机前快照（用于未命中时的无损回滚） */
     myds_v41_spec_snapshot_t *snap = caller_snapshot ? caller_snapshot : &ws->snapshot;
@@ -5246,9 +5247,9 @@ static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *t
         const myds_metal_buffer_t *pre0 = (il == 0 ? ws->v_pre[0] : ws->v_ffn_split[0]);
         const myds_metal_buffer_t *pre1 = (il == 0 ? ws->v_pre[1] : ws->v_ffn_split[1]);
         const myds_metal_buffer_t *pre2 = (il == 0 ? ws->v_pre[2] : ws->v_ffn_split[2]);
-        CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_x_norm[0], ws->v_x[0], ws->v_residual[0], pre0, base->attn_norm, V41_DIM, m->norm_eps, true));
-        CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_x_norm[1], ws->v_x[1], ws->v_residual[1], pre1, base->attn_norm, V41_DIM, m->norm_eps, true));
-        CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_x_norm[2], ws->v_x[2], ws->v_residual[2], pre2, base->attn_norm, V41_DIM, m->norm_eps, true));
+        CHECK(v41_hc_sum_rmsnorm_scoped(ws->v_x_norm[0], ws->v_x[0], ws->v_residual[0], pre0, base->attn_norm, V41_DIM, m->norm_eps, fuse_hc_norm_enabled));
+        CHECK(v41_hc_sum_rmsnorm_scoped(ws->v_x_norm[1], ws->v_x[1], ws->v_residual[1], pre1, base->attn_norm, V41_DIM, m->norm_eps, fuse_hc_norm_enabled));
+        CHECK(v41_hc_sum_rmsnorm_scoped(ws->v_x_norm[2], ws->v_x[2], ws->v_residual[2], pre2, base->attn_norm, V41_DIM, m->norm_eps, fuse_hc_norm_enabled));
         myds_metal_barrier_buffer(ws->x_norm_b2);
 
         /* HC Mix */
@@ -5373,7 +5374,7 @@ static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *t
         for (uint32_t t = 0; t < 3; t++) {
             CHECK(myds_metal_v41_hc_expand(ws->v_after_attn[t], ws->v_attn_out[t], ws->v_residual[t], ws->v_attn_split[t], V41_DIM));
             myds_metal_barrier_buffer(ws->v_after_attn[t]);
-            CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_ffn_norm[t], ws->v_x[t], ws->v_after_attn[t], ws->v_attn_split[t], base->ffn_norm, V41_DIM, m->norm_eps, true));
+            CHECK(v41_hc_sum_rmsnorm_scoped(ws->v_ffn_norm[t], ws->v_x[t], ws->v_after_attn[t], ws->v_attn_split[t], base->ffn_norm, V41_DIM, m->norm_eps, fuse_hc_norm_enabled));
         }
         myds_metal_barrier_buffer(ws->ffn_norm_b2);
 
@@ -5460,7 +5461,7 @@ static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *t
     }
 
     /* 4. Output Head & Logits for Token 0 (Lazy Projection: defer branch A & B) */
-    CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_x_norm[0], ws->v_x[0], ws->v_residual[0], ws->v_ffn_split[0], m->output_norm, V41_DIM, m->norm_eps, true));
+    CHECK(v41_hc_sum_rmsnorm_scoped(ws->v_x_norm[0], ws->v_x[0], ws->v_residual[0], ws->v_ffn_split[0], m->output_norm, V41_DIM, m->norm_eps, fuse_hc_norm_enabled));
     myds_metal_barrier_buffer(ws->v_x_norm[0]);
     CHECK(project(ws->v_logits[0], m->output, ws->v_x_norm[0], m->vocab_size, V41_DIM, m->output_type, false));
 
@@ -5500,8 +5501,8 @@ static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *t
             if ((m->tokenizer && previous == m->tokenizer->eos_id) || previous != tokens[row]) break;
             const double head_start = timed ? lowkv_now_ms() : 0.0;
             CHECK(myds_metal_begin_batch());
-            CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_x_norm[row], ws->v_x[row],
-                ws->v_residual[row], ws->v_ffn_split[row], m->output_norm, V41_DIM, m->norm_eps, true));
+            CHECK(v41_hc_sum_rmsnorm_scoped(ws->v_x_norm[row], ws->v_x[row],
+                ws->v_residual[row], ws->v_ffn_split[row], m->output_norm, V41_DIM, m->norm_eps, fuse_hc_norm_enabled));
             myds_metal_barrier_buffer(ws->v_x_norm[row]);
             CHECK(project(ws->v_logits[row], m->output, ws->v_x_norm[row],
                 m->vocab_size, V41_DIM, m->output_type, false));
@@ -5545,8 +5546,8 @@ static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *t
     if (selected) {
         const double head_start = timed ? lowkv_now_ms() : 0.0;
         CHECK(myds_metal_begin_batch());
-        CHECK(myds_metal_v41_hc_sum_rmsnorm(ws->v_x_norm[selected], ws->v_x[selected],
-            ws->v_residual[selected], ws->v_ffn_split[selected], m->output_norm, V41_DIM, m->norm_eps, true));
+        CHECK(v41_hc_sum_rmsnorm_scoped(ws->v_x_norm[selected], ws->v_x[selected],
+            ws->v_residual[selected], ws->v_ffn_split[selected], m->output_norm, V41_DIM, m->norm_eps, fuse_hc_norm_enabled));
         myds_metal_barrier_buffer(ws->v_x_norm[selected]);
         CHECK(project(ws->v_logits[selected], m->output, ws->v_x_norm[selected],
             m->vocab_size, V41_DIM, m->output_type, false));

@@ -60,6 +60,8 @@ int main(void) {
         fill_f32(myds_metal_buffer_data(in), in_dim, 456);
 
         // Reference: myds_metal_gemv + myds_metal_v41_bf16
+        // Explicitly pin NR2 before computing reference to avoid ambient environment contamination
+        setenv("MYDS_DENSE_Q4_NR0", "2", 1);
         memset(myds_metal_buffer_data(out_ref), 0, out_bytes);
         REQUIRE(myds_metal_gemv(out_ref, w, in, out_dim, in_dim, GGML_TYPE_Q4_K));
         REQUIRE(myds_metal_v41_bf16(out_ref, out_dim));
@@ -117,6 +119,7 @@ int main(void) {
             fill_f32(myds_metal_buffer_data(heads), n_groups * group_dim, 101 + (unsigned)r);
 
             // Reference: myds_metal_attn_output_a + myds_metal_v41_bf16
+            setenv("MYDS_DENSE_Q4_NR0", "2", 1);
             setenv("MYDS_ATTN_OUT_A_FUSE_BF16", "0", 1);
             memset(myds_metal_buffer_data(low_ref), 0, low_bytes);
             REQUIRE(myds_metal_attn_output_a_bf16(low_ref, out_a, heads, n_groups, group_dim, rank, GGML_TYPE_Q4_K));
@@ -177,6 +180,7 @@ int main(void) {
         fill_f32(myds_metal_buffer_data(input), dim, 404);
 
         // Reference: separate gemv(gate) + gemv(up) + shared_swiglu
+        setenv("MYDS_DENSE_Q4_NR0", "2", 1);
         REQUIRE(myds_v41_decode_gemv_bf16(gate_out, gate, input, width, dim, GGML_TYPE_Q4_K, false));
         REQUIRE(myds_v41_decode_gemv_bf16(up_out, up, input, width, dim, GGML_TYPE_Q4_K, false));
         REQUIRE(myds_v41_shared_swiglu(swiglu_ref, gate_out, up_out, width, 5.0f));
@@ -253,6 +257,7 @@ int main(void) {
             fill_f32(myds_metal_buffer_data(in[1]), in_dim, (unsigned)(701 + c));
 
             // Reference: Two separate single-token GEMV calls
+            setenv("MYDS_DENSE_Q4_NR0", "2", 1);
             for (int t = 0; t < 2; t++) {
                 memset(myds_metal_buffer_data(ref[t]), 0, out_bytes);
                 REQUIRE(myds_metal_v41_gemv_bf16(ref[t], w, in[t], out_dim, in_dim, GGML_TYPE_Q4_K));
@@ -312,6 +317,7 @@ int main(void) {
         }
     }
 
+    setenv("MYDS_DENSE_Q4_NR0", "2", 1);
     myds_metal_cleanup();
     printf("=== ALL DENSE Q4_K FUSED KERNEL PARITY TESTS PASSED! ===\n");
     return 0;

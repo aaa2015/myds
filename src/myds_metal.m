@@ -6040,6 +6040,8 @@ int myds_metal_attn_output_a_bf16_batch(
     uint32_t                   rank,
     uint32_t                   n_tok,
     ggml_type                  weight_type) {
+    if (!low || !out_a || !heads || n_groups == 0 || group_dim == 0 || rank == 0 || n_tok == 0) return 0;
+
     const char *v_fuse = getenv("MYDS_ATTN_OUT_A_FUSE_BF16");
     const bool cached_fuse = (!v_fuse || strcmp(v_fuse, "0") != 0);
     static int cached_shared2 = -1;

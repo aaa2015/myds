@@ -1968,6 +1968,23 @@ static void test_p1_attn_output_a_bf16_fusion(void) {
     }
     assert(nonzero > 0);
 
+    // 4. Verify NULL and zero-dimension input guards (return 0 without dispatch or crash)
+    assert(!myds_metal_attn_output_a_bf16_batch(NULL, out_a, heads, n_groups, group_dim, rank, 1, GGML_TYPE_Q8_0));
+    assert(!myds_metal_attn_output_a_bf16_batch(low_fused, NULL, heads, n_groups, group_dim, rank, 1, GGML_TYPE_Q8_0));
+    assert(!myds_metal_attn_output_a_bf16_batch(low_fused, out_a, NULL, n_groups, group_dim, rank, 1, GGML_TYPE_Q8_0));
+    assert(!myds_metal_attn_output_a_bf16_batch(low_fused, out_a, heads, 0, group_dim, rank, 1, GGML_TYPE_Q8_0));
+    assert(!myds_metal_attn_output_a_bf16_batch(low_fused, out_a, heads, n_groups, 0, rank, 1, GGML_TYPE_Q8_0));
+    assert(!myds_metal_attn_output_a_bf16_batch(low_fused, out_a, heads, n_groups, group_dim, 0, 1, GGML_TYPE_Q8_0));
+    assert(!myds_metal_attn_output_a_bf16_batch(low_fused, out_a, heads, n_groups, group_dim, rank, 0, GGML_TYPE_Q8_0));
+
+    assert(!myds_metal_attn_output_a_bf16_batch(NULL, out_a, heads, n_groups, group_dim, rank, 1, GGML_TYPE_Q4_K));
+    assert(!myds_metal_attn_output_a_bf16_batch(low_fused, NULL, heads, n_groups, group_dim, rank, 1, GGML_TYPE_Q4_K));
+    assert(!myds_metal_attn_output_a_bf16_batch(low_fused, out_a, NULL, n_groups, group_dim, rank, 1, GGML_TYPE_Q4_K));
+    assert(!myds_metal_attn_output_a_bf16_batch(low_fused, out_a, heads, 0, group_dim, rank, 1, GGML_TYPE_Q4_K));
+    assert(!myds_metal_attn_output_a_bf16_batch(low_fused, out_a, heads, n_groups, 0, rank, 1, GGML_TYPE_Q4_K));
+    assert(!myds_metal_attn_output_a_bf16_batch(low_fused, out_a, heads, n_groups, group_dim, 0, 1, GGML_TYPE_Q4_K));
+    assert(!myds_metal_attn_output_a_bf16_batch(low_fused, out_a, heads, n_groups, group_dim, rank, 0, GGML_TYPE_Q4_K));
+
     myds_metal_buffer_free(out_a);
     myds_metal_buffer_free(heads);
     myds_metal_buffer_free(low_unfused);
