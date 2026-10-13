@@ -121,10 +121,15 @@ myds/
 
 ## 编译与测试
 
+上述组合已提交并通过 `deploy/deploy.sh` 上线，见
+[2026-10-14 部署后复验](docs/benchmarks/2026-10-14-codex-deploy/README.md)：
+新部署构建的短/800-token 业务输入 decode 时间分别减少 1.85% / 1.98%，
+native 完整 token/logits 和真实服务 SSE 原字节对照均通过，生产三个开关已启用。
+
 新增 [2026-10-13 Mac Studio decode 优化与验收](docs/benchmarks/2026-10-13-codex-decode/README.md)：
 Router SIMD shuffle、attention register 和 Q2 固定形状三个原生候选组合，在同构建完整模型
 A–B–A 中使短/800-token 业务输入 decode 时间减少 1.87% / 2.03%；含完整原始证据、
-独立离线重放、默认关闭的开关与待应用的 fleet 部署补丁。
+独立离线重放、源码默认关闭的开关与已采用的 fleet 部署补丁。
 
 此前的 decode 实施状态见 [2026-10-09 实施记录](docs/DECODE_IMPLEMENTATION_2026-10-09.md)，
 包含默认 target 路径、batch2 状态修复、QKV 并发与长上下文 scorer 候选。
