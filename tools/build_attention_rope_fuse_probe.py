@@ -53,6 +53,17 @@ spec=importlib.util.spec_from_file_location('bm',root/'tools/build_metallib.py')
 combined=bm.PREAMBLE+'\n'+''.join('\n#line 1 "'+n+'"\n'+(root/'metal'/n).read_text() for n in bm.SHADER_FILES)+bm.COPY_KERNELS+'\n'+probe
 (out/'myds_all.metal').write_text(combined)
 env=dict(os.environ);env.setdefault('DEVELOPER_DIR','/Applications/Xcode.app/Contents/Developer')
+resolution_commands=[['xcrun','--sdk','macosx','--show-sdk-path'],
+ ['xcrun','--sdk','macosx','--find','clang'],['xcrun','--sdk','macosx','--show-sdk-version']]
+resolved=[subprocess.check_output(c,cwd=root,env=env,text=True).strip() for c in resolution_commands]
+sdk,clang,sdk_version=resolved
+assert Path(sdk).is_absolute() and Path(sdk).is_dir(),'Resolved macOS SDK is not an existing absolute directory'
+assert Path(clang).is_absolute() and Path(clang).is_file(),'Resolved clang is not an existing absolute compiler'
+compiler_version=subprocess.check_output([clang,'--version'],cwd=root,env=env,text=True).strip()
+toolchain={'developer_dir':env['DEVELOPER_DIR'],'sdk_path':sdk,'sdk_version':sdk_version,
+ 'compiler_path':clang,'compiler_version':compiler_version,'resolution_commands':resolution_commands,
+ 'compiler_version_command':[clang,'--version'],'clang_isysroot_explicit':True,
+ 'inherited_SDKROOT':env.get('SDKROOT'),'inherited_TOOLCHAINS':env.get('TOOLCHAINS')}
 commands=[['xcrun','-sdk','macosx','metal','-mmacosx-version-min=15.0','-O3','-ffast-math','-DDS4_METAL_HC_STABLE=1','-DDS4_METAL_NORM_RSQRT_DISABLE=1','-c',str(out/'myds_all.metal'),'-o',str(out/'myds_all.air')],
  ['xcrun','-sdk','macosx','metallib',str(out/'myds_all.air'),'-o',str(out/'myds.metallib')]]
 reused=None
@@ -69,9 +80,10 @@ if a.reuse_metallib:
  reused={'library_sha256':sha(a.reuse_metallib.read_bytes()),'original_source_identity_sha256':sha(a.reuse_source_identity.read_bytes()),'shader_sources_and_debug_probe_unchanged':True}
  commands=[]
 for n in ('myds_gguf','myds_log'):
- commands.append(['clang','-O3','-Wall','-Wextra','-std=c11','-Iinclude','-Ithird_party','-c','src/'+n+'.c','-o',str(out/(n+'.o'))])
-commands.append(['clang','-O3','-Wall','-Wextra','-fobjc-arc','-Iinclude','-Isrc','-Itests','-Ithird_party','tests/test_attention_rope_fuse.m',str(out/'myds_gguf.o'),str(out/'myds_log.o'),'-framework','Foundation','-framework','Metal','-lm','-lpthread','-o',str(out/'test_attention_rope_fuse')])
+ commands.append([clang,'-isysroot',sdk,'-O3','-Wall','-Wextra','-std=c11','-Iinclude','-Ithird_party','-c','src/'+n+'.c','-o',str(out/(n+'.o'))])
+commands.append([clang,'-isysroot',sdk,'-O3','-Wall','-Wextra','-fobjc-arc','-Iinclude','-Isrc','-Itests','-Ithird_party','tests/test_attention_rope_fuse.m',str(out/'myds_gguf.o'),str(out/'myds_log.o'),'-framework','Foundation','-framework','Metal','-lm','-lpthread','-o',str(out/'test_attention_rope_fuse')])
 with (out/'build.log').open('w') as log:
+ log.write(json.dumps({'toolchain':toolchain})+'\n');log.flush()
  for c in commands:
   log.write(json.dumps(c)+'\n');log.flush();subprocess.run(c,cwd=root,env=env,stdout=log,stderr=log,check=True)
 sha=lambda b:hashlib.sha256(b).hexdigest()
@@ -79,7 +91,7 @@ paths=['metal/flash_attn.metal','metal/dsv41.metal','src/myds_v41_gpu.c','src/my
 identity={'cpu_compile_only':True,'gpu_run':False,'original_helper_sha256':sha(original.encode()),'candidate_helper_sha256':sha(candidate.encode()),
  'clone_reconstructed_original_exact':True,'original_helper_lines':len(original.splitlines()),'candidate_helper_lines':len(candidate.splitlines()),
  'only_clone_difference':'function signature and final float4 store; partial/stats/reductions/barriers byte-identical after normalization',
- 'input_sha256':{n:sha((root/n).read_bytes()) for n in sorted(set(paths))},'commands':commands,
+ 'input_sha256':{n:sha((root/n).read_bytes()) for n in sorted(set(paths))},'commands':commands,'toolchain':toolchain,
  'output_sha256':{n:sha((out/n).read_bytes()) for n in ('myds.metallib','test_attention_rope_fuse','probe_attention_rope.metal')}}
 if reused:identity['diagnostic_reused_measured_library']=reused
 (out/'source-identity.json').write_text(json.dumps(identity,indent=2,sort_keys=True)+'\n')
