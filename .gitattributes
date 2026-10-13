@@ -54,3 +54,5 @@ docs/benchmarks/2026-10-14-decode-next/real/http-*/response.body -whitespace
 docs/benchmarks/2026-10-14-decode-next/replay/reconstruct_q4_weights.py whitespace=trailing-space,space-before-tab,-blank-at-eof
 docs/benchmarks/2026-10-14-decode-next/replay/test_q4_v41_reader_focused.py whitespace=trailing-space,space-before-tab,-blank-at-eof
 docs/benchmarks/2026-10-14-decode-next/replay/test_reconstruct_q4_weights.py whitespace=trailing-space,space-before-tab,-blank-at-eof
+# This startup snapshot is bound to the deployed file's exact SHA.
+docs/benchmarks/2026-10-14-decode-next/deployment/start_fleet-adopted.sh -text -whitespace
