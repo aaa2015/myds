@@ -1591,10 +1591,15 @@ int myds_v41_attention_rope_fuse_enabled(void) {
     if (strcmp(value,"1")) {
         MYDS_LOG_E("MYDS_ATTN_ROPE_FUSE must be exactly 0 or 1");return -1;
     }
+#if !defined(MYDS_ATTN_ROPE_FUSE_PRIVATE_PROBE) || MYDS_ATTN_ROPE_FUSE_PRIVATE_PROBE != 1
+    MYDS_LOG_E("MYDS_ATTN_ROPE_FUSE=1 rejected: component exact-parity gate not passed; private probe only");
+    return -1;
+#else
     if (myds_v41_gpu_attention_packed_register_enabled()!=1) {
         MYDS_LOG_E("MYDS_ATTN_ROPE_FUSE=1 requires packed register1/physical8/reduce1");return -1;
     }
     return 1;
+#endif
 }
 void myds_v41_attention_rope_fuse_counters(myds_metal_decode_candidate_counters_t *out,bool reset) {
     uint64_t v[RF_COUNT];

@@ -1,7 +1,9 @@
 /* Exclusive GPU component fixture. --host-only never initializes Metal.
  * Reuses only input allocation/generation and ABI helpers from the old fixture.
  * All timed controls use actual production register + rope_round PSOs loaded
- * from --golden-metallib; private debug taps must first match those controls. */
+ * from --golden-metallib; private debug taps must first match those controls.
+ * This compile-only private allowance is absent from production builds. */
+#define MYDS_ATTN_ROPE_FUSE_PRIVATE_PROBE 1
 #define main attention_packed_unused_main
 #include "test_attention_packed.m"
 #undef main
