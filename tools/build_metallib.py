@@ -13,6 +13,8 @@ SHADER_FILES = [
     "flash_attn.metal",
     "dense.metal",
     "moe.metal",
+    "myds_iq2_v41.metal",
+    "myds_q4_v41.metal",
     "dsv4_hc.metal",
     "unary.metal",
     "dsv4_kv.metal",

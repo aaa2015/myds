@@ -13,6 +13,29 @@ extern "C" {
 /* Opaque Metal buffer handle (unified memory on Apple Silicon) */
 typedef struct myds_metal_buffer myds_metal_buffer_t;
 
+/* Independent, default-off ordinary V4.1 decode candidates. Counters count
+ * successfully encoded work; completion and performance belong to the caller.
+ * No prefill, trace or speculative scope is inferred from an environment. */
+typedef struct {
+    uint64_t requests, encoded, failures;
+} myds_metal_decode_candidate_counters_t;
+int myds_metal_moe_down_overlap_enabled(void);
+int myds_metal_moe_iq2_v41_enabled(void);
+int myds_metal_dense_q4_v41_enabled(void);
+void myds_metal_moe_down_overlap_counters(myds_metal_decode_candidate_counters_t *out, bool reset);
+void myds_metal_moe_iq2_v41_counters(myds_metal_decode_candidate_counters_t *out, bool reset);
+void myds_metal_dense_q4_v41_counters(myds_metal_decode_candidate_counters_t *out, bool reset);
+/* Diagnostic metadata only, no dispatch/encoder/wait. The path is the actual
+ * verified precompiled library (NULL for runtime source compilation). The
+ * span is the last completed CB, not a token or an entire split request. */
+const char *myds_metal_loaded_library_path(void);
+int myds_metal_last_completed_gpu_span(double *start_s, double *end_s);
+/* Caller supplies the public/nontrace scalar scope. Supports only the three
+ * documented Q4 shapes, with their original F32/BF16 epilogues. */
+int myds_metal_dense_q4_v41(myds_metal_buffer_t *out,
+    const myds_metal_buffer_t *weight, const myds_metal_buffer_t *input,
+    uint32_t rows, uint32_t width, bool round_bf16);
+
 /* Initialize Metal device, command queue, and compile DeepSeek shaders */
 int  myds_metal_init(const char *shader_dir);
 void myds_metal_cleanup(void);
@@ -472,6 +495,33 @@ int myds_metal_routed_moe_scoped(
     ggml_type                  down_type,
     float                      clamp_val,
     bool                       ordinary_decode_allowed);
+
+/* Ordinary scalar only: pairs the original Q4 SharedDown with routed Q2. */
+int myds_metal_routed_moe_down_overlap_scoped(
+    myds_metal_buffer_t       *moe_out,
+    const myds_metal_buffer_t *x_in,
+    const myds_metal_buffer_t *gate_exps,
+    const myds_metal_buffer_t *up_exps,
+    const myds_metal_buffer_t *down_exps,
+    const myds_metal_buffer_t *selected_ids,
+    const myds_metal_buffer_t *selected_weights,
+    myds_metal_buffer_t       *scratch_gate,
+    myds_metal_buffer_t       *scratch_up,
+    myds_metal_buffer_t       *scratch_mid,
+    myds_metal_buffer_t       *scratch_down,
+    uint32_t                   dim,
+    uint32_t                   expert_dim,
+    uint32_t                   n_routed_experts,
+    uint32_t                   n_activated_experts,
+    ggml_type                  gate_type,
+    ggml_type                  up_type,
+    ggml_type                  down_type,
+    float                      clamp_val,
+    bool                       ordinary_decode_allowed,
+    myds_metal_buffer_t *shared_out,
+    const myds_metal_buffer_t *shared_weight,
+    const myds_metal_buffer_t *shared_input,
+    ggml_type shared_type);
 
 int myds_metal_routed_moe(
     myds_metal_buffer_t       *moe_out,

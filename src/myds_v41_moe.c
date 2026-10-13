@@ -752,6 +752,7 @@ static int moe_fused_scoped(myds_context_t *ctx, uint32_t layer, uint32_t token,
         #undef SERIAL_MOE_RETURN
     }
 
+    const bool overlap_down = ordinary_decode_allowed && !trace_on && myds_metal_moe_down_overlap_enabled();
     /* === S1 并发流水调度分支 === */
     const int prev_auto_barrier = myds_metal_get_auto_barrier();
     const int prev_concurrent = myds_metal_get_concurrent();
@@ -794,7 +795,7 @@ static int moe_fused_scoped(myds_context_t *ctx, uint32_t layer, uint32_t token,
 
     /* 3. 提前入队 Shared Down GEMV（只依赖 shared_swiglu_out，在 routing 屏障前提交入流） */
     myds_metal_barrier_buffer(ctx->shared_swiglu_out);
-    if (!myds_v41_decode_gemv_bf16(ctx->shared_out, l->shared_down, ctx->shared_swiglu_out,
+    if (!overlap_down && !myds_v41_decode_gemv_bf16(ctx->shared_out, l->shared_down, ctx->shared_swiglu_out,
                                   dim, width, l->shared_down_type, false)) {
         myds_metal_set_auto_barrier(prev_auto_barrier);
         myds_metal_set_concurrent(prev_concurrent);
@@ -810,16 +811,23 @@ static int moe_fused_scoped(myds_context_t *ctx, uint32_t layer, uint32_t token,
         return 0;
     }
 
-    /* 5. 仅同步路由输出与选择结果，启动 Routed MoE（与 Shared Down GEMV 在 GPU 上并发） */
+    /* 5. 仅同步路由输出与选择结果，启动 Routed MoE（可选 down pair 在 helper 的 MID join 后编码） */
     const myds_metal_buffer_t *moe_deps[] = {
         ctx->selected_ids, ctx->selected_weights, ctx->moe_gate, ctx->moe_up
     };
     myds_metal_barrier_buffers(moe_deps, 4);
-    if (!myds_metal_routed_moe_scoped(ctx->moe_out, ctx->ffn_norm_out, l->ffn_gate_exps,
+    const int routed_ok = overlap_down
+        ? myds_metal_routed_moe_down_overlap_scoped(ctx->moe_out, ctx->ffn_norm_out, l->ffn_gate_exps,
         l->ffn_up_exps, l->ffn_down_exps, ctx->selected_ids, ctx->selected_weights,
         ctx->moe_gate, ctx->moe_up, ctx->moe_mid, ctx->moe_down, dim, width,
         m->n_routed_experts, k, l->ffn_gate_exps_type, l->ffn_up_exps_type,
-        l->ffn_down_exps_type, m->swiglu_clamp_exp, ordinary_decode_allowed && !trace_on)) {
+        l->ffn_down_exps_type, m->swiglu_clamp_exp, ordinary_decode_allowed && !trace_on, ctx->shared_out, l->shared_down, ctx->shared_swiglu_out, l->shared_down_type)
+        : myds_metal_routed_moe_scoped(ctx->moe_out, ctx->ffn_norm_out, l->ffn_gate_exps,
+        l->ffn_up_exps, l->ffn_down_exps, ctx->selected_ids, ctx->selected_weights,
+        ctx->moe_gate, ctx->moe_up, ctx->moe_mid, ctx->moe_down, dim, width,
+        m->n_routed_experts, k, l->ffn_gate_exps_type, l->ffn_up_exps_type,
+        l->ffn_down_exps_type, m->swiglu_clamp_exp, ordinary_decode_allowed && !trace_on);
+    if (!routed_ok) {
         myds_metal_set_auto_barrier(prev_auto_barrier);
         myds_metal_set_concurrent(prev_concurrent);
         return 0;
@@ -919,6 +927,7 @@ int myds_v41_moe_pipeline_scoped(myds_context_t *ctx, uint32_t layer, uint32_t t
     myds_metal_set_auto_barrier(0);
     myds_metal_set_concurrent(1);
 
+    const bool overlap_down = ordinary_decode_allowed && !trace_on && myds_metal_moe_down_overlap_enabled();
     /* 1. 并发派发 HC Mix 流 (RMSNorm 20480 + GEMV 24x20480 + Sinkhorn)（只读 after_attn，写 ffn_split） */
     if (!myds_metal_v41_hc_mix(ffn_split, after_attn, ffn_fn, GGML_TYPE_F16,
                                ffn_scale, ffn_base, flat_norm, mix, dim, m->norm_eps, hc_eps)) {
@@ -963,7 +972,7 @@ int myds_v41_moe_pipeline_scoped(myds_context_t *ctx, uint32_t layer, uint32_t t
 
     /* 4. 提前入队 Shared Down GEMV（只依赖 shared_swiglu_out，在 routing 屏障前提交入流） */
     myds_metal_barrier_buffer(ctx->shared_swiglu_out);
-    if (!myds_v41_decode_gemv_bf16(ctx->shared_out, l->shared_down, ctx->shared_swiglu_out,
+    if (!overlap_down && !myds_v41_decode_gemv_bf16(ctx->shared_out, l->shared_down, ctx->shared_swiglu_out,
                                   dim, width, l->shared_down_type, false)) {
         myds_metal_set_auto_barrier(prev_auto_barrier);
         myds_metal_set_concurrent(prev_concurrent);
@@ -979,16 +988,23 @@ int myds_v41_moe_pipeline_scoped(myds_context_t *ctx, uint32_t layer, uint32_t t
         return 0;
     }
 
-    /* 6. 仅同步路由输出与选择结果，启动 Routed MoE（与 Shared Down GEMV 在 GPU 上并发） */
+    /* 6. 仅同步路由输出与选择结果，启动 Routed MoE（可选 down pair 在 helper 的 MID join 后编码） */
     const myds_metal_buffer_t *moe_deps[] = {
         ctx->selected_ids, ctx->selected_weights, ctx->moe_gate, ctx->moe_up
     };
     myds_metal_barrier_buffers(moe_deps, 4);
-    if (!myds_metal_routed_moe_scoped(ctx->moe_out, ctx->ffn_norm_out, l->ffn_gate_exps,
+    const int routed_ok = overlap_down
+        ? myds_metal_routed_moe_down_overlap_scoped(ctx->moe_out, ctx->ffn_norm_out, l->ffn_gate_exps,
         l->ffn_up_exps, l->ffn_down_exps, ctx->selected_ids, ctx->selected_weights,
         ctx->moe_gate, ctx->moe_up, ctx->moe_mid, ctx->moe_down, dim, width,
         m->n_routed_experts, k, l->ffn_gate_exps_type, l->ffn_up_exps_type,
-        l->ffn_down_exps_type, m->swiglu_clamp_exp, ordinary_decode_allowed && !trace_on)) {
+        l->ffn_down_exps_type, m->swiglu_clamp_exp, ordinary_decode_allowed && !trace_on, ctx->shared_out, l->shared_down, ctx->shared_swiglu_out, l->shared_down_type)
+        : myds_metal_routed_moe_scoped(ctx->moe_out, ctx->ffn_norm_out, l->ffn_gate_exps,
+        l->ffn_up_exps, l->ffn_down_exps, ctx->selected_ids, ctx->selected_weights,
+        ctx->moe_gate, ctx->moe_up, ctx->moe_mid, ctx->moe_down, dim, width,
+        m->n_routed_experts, k, l->ffn_gate_exps_type, l->ffn_up_exps_type,
+        l->ffn_down_exps_type, m->swiglu_clamp_exp, ordinary_decode_allowed && !trace_on);
+    if (!routed_ok) {
         myds_metal_set_auto_barrier(prev_auto_barrier);
         myds_metal_set_concurrent(prev_concurrent);
         return 0;

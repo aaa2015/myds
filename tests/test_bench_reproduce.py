@@ -143,7 +143,10 @@ class BenchReproduceTests(unittest.TestCase):
         loaded['layers'] = 40
         for mode, flag in (('route_simd_shuffle_mode', 'MYDS_ROUTE_SIMD_SHUFFLE'),
                            ('attention_packed_register_mode', 'MYDS_ATTN_PACKED_REGISTER'),
-                           ('moe_q2_v41_mode', 'MYDS_MOE_Q2_V41')):
+                           ('moe_q2_v41_mode', 'MYDS_MOE_Q2_V41'),
+                           ('moe_down_overlap_mode', 'MYDS_MOE_DOWN_OVERLAP'),
+                           ('moe_iq2_v41_mode', 'MYDS_MOE_IQ2_V41'),
+                           ('dense_q4_v41_mode', 'MYDS_DENSE_Q4_V41')):
             loaded[mode] = int(records[0]['environment'].get(flag) == '1')
 
         loaded.update(dspark_loaded=support is not None, dspark_load_s=0.01 if support else 0,
@@ -544,7 +547,7 @@ class BenchReproduceTests(unittest.TestCase):
         # Native-counter schema fixtures exercise the real runner's rejection
         # and retained failure logs; no model or Metal work is executed here.
         for name, (flag, failure, keys) in self.driver.CANDIDATE_PATHS.items():
-            if name in ('gpu_topk_threshold','gpu_dspark_capture','gpu_f16_gemv_bf16_fuse','gpu_indexer_rope_quant_fuse'):
+            if name in self.driver.DECODE_SHAPE_CANDIDATES or name in ('gpu_topk_threshold','gpu_dspark_capture','gpu_f16_gemv_bf16_fuse','gpu_indexer_rope_quant_fuse'):
                 continue  # GPU decisions/eligible positions have dedicated complete fixtures above.
             enabled_value = self.driver.CANDIDATE_ENABLED_VALUES.get(name, '1')
             encoded = dict.fromkeys(keys, 0)
@@ -622,6 +625,83 @@ class BenchReproduceTests(unittest.TestCase):
                         self.assertEqual(state['status'], 'failed')
                         self.assertTrue((args.out / 'run-metrics.jsonl').is_file())
 
+    def shape_candidate_fixture(self, name):
+        flag, mode, per_target, option = self.driver.DECODE_SHAPE_CANDIDATES[name]
+        args = self.run_args()
+        args.arm = 'custom'
+        args.env = [flag + '=1', 'MYDS_PLD=0', 'MYDS_BATCH2_SPEC=0', 'MYDS_SPEC_SERIAL_PROBE=0']
+        setattr(args, option, True)
+        env = dict(self.driver.DEFAULT_ENV, MYDS_PLD='0', MYDS_BATCH2_SPEC='0', MYDS_SPEC_SERIAL_PROBE='0', **{flag: '1'})
+        records = self.v2_records(count=256, environment=env)
+        args.max_new_tokens = 256
+        loaded = next(r for r in records if r['kind'] == 'load')
+        loaded['native_v41'] = True
+        loaded['actual_metallib_path'] = str((self.binary.parent / 'myds.metallib').resolve())
+        loaded[mode] = 1
+        for sample in (r for r in records if r['kind'] == 'sample'):
+            sample[name] = dict(requests=per_target * 256, encoded=per_target * 256, failures=0,
+                                decode_requests=per_target * 255, decode_encoded=per_target * 255,
+                                decode_failures=0)
+        return args, records
+
+    def test_shape_candidates_require_actual_full_warm_and_formal_adoption(self):
+        for name, (_, getter, _, _) in self.driver.DECODE_SHAPE_CANDIDATES.items():
+            for fault in ('valid', 'dead-getter', 'bool-getter', 'missing-getter', 'prefill-only',
+                          'onecall', 'partialcount', 'failure', 'decode-failure', 'missing-counter',
+                          'formal-only', 'warm-only', 'not-native', 'wrong-layer-count', 'support',
+                          'extra-target', 'extra-row', 'batch2', 'draft', 'pld',
+                          'missing-library', 'null-library', 'wrong-library'):
+                with self.subTest(candidate=name, fault=fault):
+                    args, records = self.shape_candidate_fixture(name)
+                    args.out = self.directory / (name + '-' + fault)
+                    loaded = next(r for r in records if r['kind'] == 'load')
+                    samples = [r for r in records if r['kind'] == 'sample']
+                    first = samples[0]
+                    if fault == 'dead-getter': loaded[getter] = 0
+                    elif fault == 'bool-getter': loaded[getter] = True
+                    elif fault == 'missing-getter': loaded.pop(getter)
+                    elif fault == 'prefill-only': first[name].update(decode_requests=0, decode_encoded=0)
+                    elif fault == 'onecall': first[name].update(requests=1, encoded=1, decode_requests=1, decode_encoded=1)
+                    elif fault == 'partialcount': first[name].update(decode_requests=first[name]['decode_requests']-1, decode_encoded=first[name]['decode_encoded']-1)
+                    elif fault == 'failure': first[name]['failures'] = 1
+                    elif fault == 'decode-failure': first[name]['decode_failures'] = first[name]['failures'] = 1
+                    elif fault == 'missing-counter': first.pop(name)
+                    elif fault == 'formal-only': first[name] = dict.fromkeys(first[name], 0)
+                    elif fault == 'warm-only': samples[1][name] = dict.fromkeys(first[name], 0)
+                    elif fault == 'not-native': loaded['native_v41'] = False
+                    elif fault == 'wrong-layer-count': loaded['layers'] = 39
+                    elif fault == 'support': loaded['dspark_loaded'] = True
+                    elif fault == 'extra-target': first['decode_telemetry']['target_forward_calls'] += 1
+                    elif fault == 'extra-row': first['decode_telemetry']['target_rows'] += 1
+                    elif fault == 'batch2': first['decode_telemetry'].update(batch2_calls=1, batch2_misses=1)
+                    elif fault == 'draft': first['decode_telemetry']['draft_cycles'] = 1
+                    elif fault == 'pld': first['decode_telemetry']['pld_queries'] = 1
+                    elif fault == 'missing-library': loaded.pop('actual_metallib_path')
+                    elif fault == 'null-library': loaded['actual_metallib_path'] = None
+                    elif fault == 'wrong-library': loaded['actual_metallib_path'] = str(self.directory / 'old.metallib')
+                    if fault == 'valid':
+                        self.assertEqual(self.invoke_cpu_runner(args, records)[0], 0)
+                    else:
+                        with self.assertRaises(ValueError): self.invoke_cpu_runner(args, records)
+
+    def test_shape_candidate_invalid_flag_and_scope_reject_before_spawn(self):
+        for name, (flag, _, _, _) in self.driver.DECODE_SHAPE_CANDIDATES.items():
+            for fault in ('01', 'true', '', ' 1', '2', '0', 'pld', 'spec', 'serial', 'support', 'profile'):
+                with self.subTest(candidate=name, fault=fault):
+                    args, records = self.shape_candidate_fixture(name)
+                    args.out = self.directory / (name + '-invalid-' + repr(fault))
+                    env = dict(records[0]['environment'])
+                    if fault in ('01', 'true', '', ' 1', '2', '0'): env[flag] = fault
+                    elif fault == 'pld': env['MYDS_PLD'] = '1'
+                    elif fault == 'spec': env['MYDS_BATCH2_SPEC'] = '1'
+                    elif fault == 'serial': env['MYDS_SPEC_SERIAL_PROBE'] = '1'
+                    elif fault == 'support': args.dspark_model = self.model
+                    elif fault == 'profile': env['MYDS_KPROF'] = '1'
+                    args.env = [key + '=' + value for key, value in env.items() if value is not None]
+                    with mock.patch.object(self.driver.subprocess, 'Popen') as launch:
+                        with self.assertRaises(ValueError): self.driver.run(args)
+                        launch.assert_not_called()
+
     def test_full_layer_candidates_reject_partial_decode_and_wrong_getter(self):
         paths = (
             ('gpu_route_simd_shuffle', 'MYDS_ROUTE_SIMD_SHUFFLE', 'route_simd_shuffle_mode', 'require_route_simd_shuffle'),
@@ -674,7 +754,7 @@ class BenchReproduceTests(unittest.TestCase):
 
     def test_new_candidate_counters_reject_disabled_and_invalid_records(self):
         for name, (flag, _, keys) in self.driver.CANDIDATE_PATHS.items():
-            if name in ('gpu_topk_threshold','gpu_dspark_capture','gpu_f16_gemv_bf16_fuse','gpu_indexer_rope_quant_fuse'):
+            if name in self.driver.DECODE_SHAPE_CANDIDATES or name in ('gpu_topk_threshold','gpu_dspark_capture','gpu_f16_gemv_bf16_fuse','gpu_indexer_rope_quant_fuse'):
                 continue  # Specialized graph validation includes GPU conservation and scope.
             for mode in ('negative', 'bool', 'decode-exceeds-total', 'disabled'):
                 with self.subTest(path=name, mode=mode):

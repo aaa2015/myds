@@ -2781,6 +2781,16 @@ static int project_decode_qkv(myds_metal_buffer_t *out,const myds_metal_buffer_t
     return myds_metal_v41_gemv_bf16(out,w,in,rows,width,type);
 }
 
+/* Only native ordinary logits forwards call this wrapper. The generic
+ * projection helpers used by prefill, tree/Batch2/rescue and trace are intact. */
+static int project_qb_shape_scoped(myds_metal_buffer_t *out,const myds_metal_buffer_t *w,
+    const myds_metal_buffer_t *in,uint32_t rows,uint32_t width,ggml_type type,
+    bool trace_on,bool ordinary_allowed) {
+    if (ordinary_allowed && !trace_on && type==GGML_TYPE_Q4_K && myds_metal_dense_q4_v41_enabled())
+        return myds_metal_dense_q4_v41(out,w,in,rows,width,true);
+    return project_decode_qkv(out,w,in,rows,width,type,trace_on);
+}
+
 /* output-B retains project()'s F16/F32 specialization. The shared-expert
  * caller retains its original generic fallback through the common helper. */
 static int project_decode_tail(myds_metal_buffer_t *out,const myds_metal_buffer_t *w,
@@ -3654,7 +3664,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
             TRACE("q_a_raw",ctx->qr,1280);
             CHECK(myds_metal_v41_rmsnorm(ctx->qr_norm,ctx->qr,base->attn_q_a_norm,1280,m->norm_eps,true));
             TRACE("q_a_norm",ctx->qr_norm,1280);
-            CHECK(project_decode_qkv(ctx->q,base->attn_q_b,ctx->qr_norm,V41_HEADS*512,1280,base->attn_q_b_type,trace_on));
+            CHECK(project_qb_shape_scoped(ctx->q,base->attn_q_b,ctx->qr_norm,V41_HEADS*512,1280,base->attn_q_b_type,trace_on,ordinary_decode_allowed && need_logits));
             TRACE("q_b",ctx->q,V41_HEADS*512);
             CHECK(project_decode_qkv(ctx->kv_act,base->attn_kv,ctx->x_norm,512,V41_DIM,base->attn_kv_type,trace_on));
             TRACE("kv_raw",ctx->kv_act,512);
@@ -3729,7 +3739,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
                 const myds_metal_buffer_t *norm_out[] = { ctx->qr_norm, ctx->kv_act };
                 myds_metal_barrier_buffers(norm_out, 2);
 
-                CHECK(project_decode_qkv(ctx->q,base->attn_q_b,ctx->qr_norm,V41_HEADS*512,1280,base->attn_q_b_type,false));
+                CHECK(project_qb_shape_scoped(ctx->q,base->attn_q_b,ctx->qr_norm,V41_HEADS*512,1280,base->attn_q_b_type,false,ordinary_decode_allowed && need_logits));
                 phase="compressed KV / indexer";
                 if (do_early_indexer) {
                     CHECK(publish_indexer_one_impl(ctx,il,pos,ctx->x_norm,ctx->qr_norm,NULL,
@@ -3767,7 +3777,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
                 CHECK(publish_and_select_decode(ctx,il,pos,ctx->x_norm,ctx->qr_norm,ordinary_decode_allowed && need_logits && !trace_on));
                 phase="attention projections";
                 if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(ctx->qr_norm);
-                CHECK(project_decode_qkv(ctx->q,base->attn_q_b,ctx->qr_norm,V41_HEADS*512,1280,base->attn_q_b_type,false));
+                CHECK(project_qb_shape_scoped(ctx->q,base->attn_q_b,ctx->qr_norm,V41_HEADS*512,1280,base->attn_q_b_type,false,ordinary_decode_allowed && need_logits));
                 if (!myds_metal_get_auto_barrier()) {
                     const myds_metal_buffer_t *finish_deps[] = { ctx->q, ctx->kv_act };
                     myds_metal_barrier_buffers(finish_deps, 2);
@@ -3816,7 +3826,12 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
         if (fine_pipeline) {
             myds_metal_barrier_buffer(ctx->attn_low);
         }
-        CHECK(project_decode_tail(ctx->attn_out,base->attn_output_b,ctx->attn_low,V41_DIM,8192,base->attn_output_b_type,trace_on));
+        if (ordinary_decode_allowed && need_logits && !trace_on &&
+            base->attn_output_b_type==GGML_TYPE_Q4_K && myds_metal_dense_q4_v41_enabled()) {
+            CHECK(myds_metal_dense_q4_v41(ctx->attn_out,base->attn_output_b,ctx->attn_low,V41_DIM,8192,true));
+        } else {
+            CHECK(project_decode_tail(ctx->attn_out,base->attn_output_b,ctx->attn_low,V41_DIM,8192,base->attn_output_b_type,trace_on));
+        }
         TRACE("attn_out",ctx->attn_out,V41_DIM);
         phase="HC FFN input";
         if (fine_pipeline) {
@@ -3858,7 +3873,15 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
         if (fine_pipeline) {
             myds_metal_barrier_buffer(ctx->x_norm);
         }
-        CHECK(project(ctx->logits,m->output,ctx->x_norm,m->vocab_size,V41_DIM,m->output_type,false));
+        if (ordinary_decode_allowed && !trace_on && m->output_type==GGML_TYPE_Q4_K && myds_metal_dense_q4_v41_enabled()) {
+            /* Match project()'s input/output dependency boundaries. */
+            if (myds_metal_get_auto_barrier()) myds_metal_barrier();
+            else myds_metal_barrier_buffer(ctx->x_norm);
+            CHECK(myds_metal_dense_q4_v41(ctx->logits,m->output,ctx->x_norm,m->vocab_size,V41_DIM,false));
+            if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(ctx->logits);
+        } else {
+            CHECK(project(ctx->logits,m->output,ctx->x_norm,m->vocab_size,V41_DIM,m->output_type,false));
+        }
         CHECK(myds_metal_commit_batch());
         if (fine_pipeline) {
             myds_metal_set_auto_barrier(prev_auto_barrier);

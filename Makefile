@@ -181,12 +181,12 @@ $(TEST_QKV_FUSION): $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_decode.o $
 
 # Build-only from all; GPU execution occurs only in the explicit test suite.
 # The fixture includes the unchanged runtime to inject a fused-PSO failure.
-$(TEST_DECODE_Q8): tests/test_decode_q8.m src/myds_metal.m $(wildcard include/*.h) $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+$(TEST_DECODE_Q8): tests/test_decode_q8.m src/myds_metal.m src/myds_decode_candidates.inc $(wildcard include/*.h) $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc tests/test_decode_q8.m $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
 
 # Includes the actual runtime to check both Q2 PSOs and initialization state.
 # Building submits no GPU work; the Python driver runs isolated component arms.
-$(TEST_MOE_DOWN_NSG): tests/test_moe_down_nsg.m src/myds_metal.m $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+$(TEST_MOE_DOWN_NSG): tests/test_moe_down_nsg.m src/myds_metal.m src/myds_decode_candidates.inc $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc tests/test_moe_down_nsg.m $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
 
 .PHONY: test-moe-down-nsg
@@ -195,17 +195,17 @@ test-moe-down-nsg: $(TEST_MOE_DOWN_NSG)
 
 # Optional decode candidates: build submits no GPU work. Run their explicit
 # fixtures only in a controlled validation window, separately from benchmarks.
-$(TEST_MOE_IQ2_LUT): tests/test_moe_iq2_lut.m src/myds_metal.m $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+$(TEST_MOE_IQ2_LUT): tests/test_moe_iq2_lut.m src/myds_metal.m src/myds_decode_candidates.inc $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc tests/test_moe_iq2_lut.m $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
 
-$(TEST_ATTN_PACKED): tests/test_attention_packed.m src/myds_metal.m src/myds_v41_gpu.c $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+$(TEST_ATTN_PACKED): tests/test_attention_packed.m src/myds_metal.m src/myds_decode_candidates.inc src/myds_v41_gpu.c $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc tests/test_attention_packed.m $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
 
-$(TEST_TOPK_NAN_FUSE): tests/test_topk_nan_fuse.m src/myds_metal.m src/myds_v41_gpu.c $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+$(TEST_TOPK_NAN_FUSE): tests/test_topk_nan_fuse.m src/myds_metal.m src/myds_decode_candidates.inc src/myds_v41_gpu.c $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc tests/test_topk_nan_fuse.m $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
 
 # Build only. The fixture submits GPU work and belongs to an exclusive window.
-$(TEST_TOPK_NAN_SHUFFLE): tests/test_topk_nan_shuffle.m src/myds_metal.m src/myds_v41_gpu.c $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+$(TEST_TOPK_NAN_SHUFFLE): tests/test_topk_nan_shuffle.m src/myds_metal.m src/myds_decode_candidates.inc src/myds_v41_gpu.c $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc $< $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
 
 .PHONY: build-topk-nan-shuffle-candidate
@@ -213,49 +213,49 @@ build-topk-nan-shuffle-candidate: $(TEST_TOPK_NAN_SHUFFLE)
 
 # Explicit BUILD ONLY: this native component submits GPU work when run, and
 # must remain outside ALL_TESTS and the ordinary make test recipe.
-$(TEST_INDEXER_HEAD_SLOTS): tests/test_indexer_head_slots.m src/myds_metal.m src/myds_v41_gpu.c $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+$(TEST_INDEXER_HEAD_SLOTS): tests/test_indexer_head_slots.m src/myds_metal.m src/myds_decode_candidates.inc src/myds_v41_gpu.c $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc $< $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
 
 .PHONY: build-indexer-head-slots-candidate
 build-indexer-head-slots-candidate: $(TEST_INDEXER_HEAD_SLOTS)
 
 # Explicit build-only threshold fixture; never part of ALL_TESTS.
-$(TEST_TOPK_THRESHOLD): tests/test_topk_threshold.m src/myds_metal.m src/myds_v41_gpu.c $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+$(TEST_TOPK_THRESHOLD): tests/test_topk_threshold.m src/myds_metal.m src/myds_decode_candidates.inc src/myds_v41_gpu.c $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc $< $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
 
 .PHONY: build-topk-threshold-candidate
 build-topk-threshold-candidate: $(TEST_TOPK_THRESHOLD)
 
 # Explicit build only; the component submits GPU work in an exclusive window.
-$(TEST_F16_BF16_FUSE): tests/test_f16_bf16_fuse.m src/myds_metal.m $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+$(TEST_F16_BF16_FUSE): tests/test_f16_bf16_fuse.m src/myds_metal.m src/myds_decode_candidates.inc $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc $< $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
 
 .PHONY: build-f16-bf16-fuse-candidate
 build-f16-bf16-fuse-candidate: $(TEST_F16_BF16_FUSE)
 
 # Explicit build only; run the component in an exclusive validation window.
-$(TEST_INDEXER_ROPE_QUANT): tests/test_indexer_rope_quant.m src/myds_metal.m src/myds_v41_gpu.c $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+$(TEST_INDEXER_ROPE_QUANT): tests/test_indexer_rope_quant.m src/myds_metal.m src/myds_decode_candidates.inc src/myds_v41_gpu.c $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc $< $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
 
 .PHONY: build-indexer-rope-quant-candidate
 build-indexer-rope-quant-candidate: $(TEST_INDEXER_ROPE_QUANT)
 
-$(TEST_BATCH2_Q8_SHARED): tests/test_batch2_q8_shared.m src/myds_metal.m $(wildcard include/*.h) $(OBJS_C) $(METALLIB) | $(BIN_DIR)
+$(TEST_BATCH2_Q8_SHARED): tests/test_batch2_q8_shared.m src/myds_metal.m src/myds_decode_candidates.inc $(wildcard include/*.h) $(OBJS_C) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc tests/test_batch2_q8_shared.m $(OBJS_C) $(LDFLAGS) -o $@
 
-$(TEST_Q4_BF16_PARITY): tests/test_q4_bf16_parity.m src/myds_metal.m $(wildcard include/*.h) $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
+$(TEST_Q4_BF16_PARITY): tests/test_q4_bf16_parity.m src/myds_metal.m src/myds_decode_candidates.inc $(wildcard include/*.h) $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc tests/test_q4_bf16_parity.m $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS) -o $@
 
 .PHONY: build-decode-candidates
 build-decode-candidates: $(TEST_MOE_IQ2_LUT) $(TEST_ATTN_PACKED) $(TEST_TOPK_NAN_FUSE) $(TEST_BATCH2_Q8_SHARED)
 
-$(TEST_LM_HEAD_Q8): tests/test_lm_head_q8.m src/myds_metal.m $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+$(TEST_LM_HEAD_Q8): tests/test_lm_head_q8.m src/myds_metal.m src/myds_decode_candidates.inc $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc $< $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
 
 .PHONY: build-lm-head-candidate
 build-lm-head-candidate: $(TEST_LM_HEAD_Q8)
 
-$(TEST_ENGRAM_PROJECT_ROUND): tests/test_engram_project_round.m src/myds_metal.m $(wildcard include/*.h) $(OBJS_C) $(METALLIB) | $(BIN_DIR)
+$(TEST_ENGRAM_PROJECT_ROUND): tests/test_engram_project_round.m src/myds_metal.m src/myds_decode_candidates.inc $(wildcard include/*.h) $(OBJS_C) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc $< $(OBJS_C) $(LDFLAGS) -o $@
 
 .PHONY: build-engram-project-round-candidate
@@ -263,7 +263,7 @@ build-engram-project-round-candidate: $(TEST_ENGRAM_PROJECT_ROUND)
 
 # Q2 cache component is opt-in and BUILD ONLY: not included in ALL_TESTS.
 # The fixture includes the real runtime; link only C helpers, not myds_metal.o.
-$(TEST_MOE_Q2_SUM_CACHE): tests/test_moe_q2_sum_cache.m src/myds_metal.m $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+$(TEST_MOE_Q2_SUM_CACHE): tests/test_moe_q2_sum_cache.m src/myds_metal.m src/myds_decode_candidates.inc $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc $< $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
 
 # Independent original-order sumy oracle uses the identical production compiler
@@ -277,7 +277,7 @@ $(Q2_SUM_CACHE_ORACLE): $(TEST_MOE_Q2_SUM_CACHE) | $(BUILD_DIR)
 build-moe-q2-sum-cache-candidate: $(TEST_MOE_Q2_SUM_CACHE) $(Q2_SUM_CACHE_ORACLE)
 
 # Fused IQ2/cache component is explicit BUILD ONLY, never ALL_TESTS.
-$(TEST_MOE_Q2_SUM_CACHE_FUSED): tests/test_moe_q2_sum_cache_fused.m src/myds_metal.m $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+$(TEST_MOE_Q2_SUM_CACHE_FUSED): tests/test_moe_q2_sum_cache_fused.m src/myds_metal.m src/myds_decode_candidates.inc $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc $< $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
 
 $(Q2_SUM_CACHE_FUSED_ORACLE): $(TEST_MOE_Q2_SUM_CACHE_FUSED) | $(BUILD_DIR)
@@ -352,7 +352,7 @@ $(TEST_BATCH2_SHARED_PAIR): tests/test_batch2_shared_swiglu_pair.c src/myds_v41_
 	$(CC) $(CFLAGS) -o $@ $< $(filter %.o,$^) $(LDFLAGS) -Wl,-dead_strip
 
 # Build-only candidate gates. Execute explicitly under an exclusive GPU window.
-$(TEST_DEPTH2_SHARED3): tests/test_depth2_shared3.m src/myds_metal.m $(wildcard include/*.h) $(OBJS_C) $(METALLIB) | $(BIN_DIR)
+$(TEST_DEPTH2_SHARED3): tests/test_depth2_shared3.m src/myds_metal.m src/myds_decode_candidates.inc $(wildcard include/*.h) $(OBJS_C) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc -o $@ $< $(OBJS_C) $(LDFLAGS)
 
 $(TEST_DEPTH2_SHARED3_GU): tests/test_depth2_shared_swiglu_shared3.c src/myds_v41_moe.c $(wildcard include/*.h) $(filter-out $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
@@ -582,3 +582,16 @@ test: $(ALL_TESTS) $(METALLIB)
 
 clean:
 	rm -rf $(BUILD_DIR) $(BIN_DIR) tests/verify_metal tests/test_metal /tmp/test_myds*
+
+# The private host candidate implementation participates in rebuild checks.
+$(BUILD_DIR)/myds_metal.o: src/myds_decode_candidates.inc
+
+# Build-only tools; GPU execution belongs to an exclusive experiment window.
+$(BIN_DIR)/bench_iq2_v41: tools/bench_iq2_v41.m | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) $< $(LDFLAGS) -o $@
+$(BIN_DIR)/bench_q4_v41: tools/bench_q4_v41.m $(BUILD_DIR)/myds_gguf.o | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) $< $(BUILD_DIR)/myds_gguf.o $(LDFLAGS) -o $@
+$(BIN_DIR)/bench_moe_down_overlap: tools/bench_moe_down_overlap.m $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) $< $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
+.PHONY: build-decode-next-candidates
+build-decode-next-candidates: $(BIN_DIR)/bench_iq2_v41 $(BIN_DIR)/bench_q4_v41 $(BIN_DIR)/bench_moe_down_overlap

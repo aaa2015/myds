@@ -49,7 +49,20 @@ TOPK_PREFIX_COUNTERS = ('requests', 'encoded', 'unavailable', 'classified_rows',
 TOPK_THRESHOLD_FIELDS = ('requests', 'encoded', 'errors', 'validated', 'adopted', 'fallback',
                          'nan', 'inf', 'insufficient', 'capacity', 'certificate', 'tie')
 TOPK_THRESHOLD_COUNTERS = TOPK_THRESHOLD_FIELDS + tuple('decode_' + k for k in TOPK_THRESHOLD_FIELDS)
+# Exact ordinary-target shapes; source providers exclude prefill and private verification.
+DECODE_SHAPE_CANDIDATES = {
+    'gpu_moe_down_overlap': ('MYDS_MOE_DOWN_OVERLAP', 'moe_down_overlap_mode', 40, 'require_moe_down_overlap'),
+    'gpu_moe_iq2_v41': ('MYDS_MOE_IQ2_V41', 'moe_iq2_v41_mode', 40, 'require_moe_iq2_v41'),
+    'gpu_dense_q4_v41': ('MYDS_DENSE_Q4_V41', 'dense_q4_v41_mode', 81, 'require_dense_q4_v41'),
+}
 CANDIDATE_PATHS = {
+    'gpu_moe_down_overlap': ('MYDS_MOE_DOWN_OVERLAP', 'failures',
+        ('requests', 'encoded', 'failures', 'decode_requests', 'decode_encoded', 'decode_failures')),
+    'gpu_moe_iq2_v41': ('MYDS_MOE_IQ2_V41', 'failures',
+        ('requests', 'encoded', 'failures', 'decode_requests', 'decode_encoded', 'decode_failures')),
+    'gpu_dense_q4_v41': ('MYDS_DENSE_Q4_V41', 'failures',
+        ('requests', 'encoded', 'failures', 'decode_requests', 'decode_encoded', 'decode_failures')),
+
     'gpu_moe_q2_v41': ('MYDS_MOE_Q2_V41', 'failures',
         ('requests', 'encoded', 'failures', 'decode_requests', 'decode_encoded', 'decode_failures')),
     'gpu_attention_packed_register': ('MYDS_ATTN_PACKED_REGISTER', 'failures',
@@ -86,7 +99,7 @@ CANDIDATE_PATHS = {
 CANDIDATE_ENABLED_VALUES = {'gpu_lm_head_q8': '4'}
 FORBIDDEN_ENV_PREFIXES = ('MYDS_PROFILE_', 'MYDS_SKIP_', 'MYDS_TRACE_', 'MYDS_BATCH_TRACE_')
 FORBIDDEN_ENV_NAMES = {'MYDS_MOE_STEP_PROF', 'MYDS_PHASE_PROFILE_FILE', 'MYDS_DISABLE_V41_PREFILL',
-                       'MYDS_PROF', 'MYDS_DISPATCH_HIST', 'MYDS_DEBUG_DISPATCH'}
+                       'MYDS_PROF', 'MYDS_DISPATCH_HIST', 'MYDS_DEBUG_DISPATCH', 'MYDS_KPROF'}
 GPU_PROCESSES = {'myds', 'llama-server', 'bench_phase', 'bench_qkv',
                  'bench_attention_group', 'bench_attention_vec',
                  'bench_decode_iq2', 'moe_prefill_replay'}
@@ -290,7 +303,25 @@ def validate_run(directory, state, audit):
             if state['environment'].get(flag) == '1':
                 audit.require(loaded.get('native_v41') is True and loaded.get('layers') == 40,
                               'Full decode candidate requires the native 40-layer V4.1 model')
+        if any(state['environment'].get(values[0]) == '1' for values in DECODE_SHAPE_CANDIDATES.values()):
+            actual_library = loaded.get('actual_metallib_path')
+            audit.require(type(actual_library) is str and bool(actual_library),
+                          'Required shape candidate lacks the actual loaded metallib path')
+            expected_library = Path(argv[0]).parent / 'myds.metallib'
+            audit.require(Path(actual_library).resolve() == expected_library.resolve(),
+                          'Actual candidate loaded metallib path differs from the recorded build')
+        for name, (flag, mode, _, _) in DECODE_SHAPE_CANDIDATES.items():
+            if state['environment'].get(flag) == '1' or mode in loaded:
+                actual = loaded.get(mode)
+                audit.require(type(actual) is int and actual in (0, 1) and
+                              actual == int(state['environment'].get(flag) == '1'),
+                              'Actual candidate getter differs: ' + mode)
+            if state['environment'].get(flag) == '1':
+                audit.require(loaded.get('native_v41') is True and loaded.get('layers') == 40 and
+                              loaded.get('dspark_loaded') is False,
+                              'Shape candidate requires ordinary native 40-layer V4.1 without support')
         for sample in samples:
+            sample['candidate_modes'] = {name: loaded.get(values[1]) for name, values in DECODE_SHAPE_CANDIDATES.items()}
             sample['candidate_layer_count'] = loaded.get('layers')
         if state['environment'].get('MYDS_F16_GEMV_BF16_FUSE') is not None or 'f16_gemv_bf16_fuse_mode' in loaded:
             actual = loaded.get('f16_gemv_bf16_fuse_mode')
@@ -614,7 +645,7 @@ def validate_candidate_paths(samples, environment, audit):
         if name == 'gpu_lm_head_q8':
             audit.require(environment.get(flag) in (None, '2', '4'),
                           'Invalid LM head row cohort: ' + str(environment.get(flag)))
-        if name in ('gpu_moe_q2_v41','gpu_attention_packed_register','gpu_route_simd_shuffle','gpu_dspark_capture','gpu_topk_nan_shuffle','gpu_topk_threshold', 'gpu_indexer_head_slots', 'gpu_engram_project_round', 'gpu_moe_q2_sum_cache', 'gpu_moe_q2_sum_cache_fused', 'gpu_f16_gemv_bf16_fuse', 'gpu_indexer_rope_quant_fuse'):
+        if name in DECODE_SHAPE_CANDIDATES or name in ('gpu_moe_q2_v41','gpu_attention_packed_register','gpu_route_simd_shuffle','gpu_dspark_capture','gpu_topk_nan_shuffle','gpu_topk_threshold', 'gpu_indexer_head_slots', 'gpu_engram_project_round', 'gpu_moe_q2_sum_cache', 'gpu_moe_q2_sum_cache_fused', 'gpu_f16_gemv_bf16_fuse', 'gpu_indexer_rope_quant_fuse'):
             audit.require(environment.get(flag) in (None, '0', '1'),
                           'Invalid candidate 0/1 cohort: ' + str(environment.get(flag)))
         for sample in samples:
@@ -734,6 +765,25 @@ def candidate_paths(samples, name):
 
 def require_candidate_path(samples, name):
     _, failure, _ = CANDIDATE_PATHS[name]
+    if name in DECODE_SHAPE_CANDIDATES:
+        _, _, per_target, _ = DECODE_SHAPE_CANDIDATES[name]
+        if not samples or not any(not s['warmup'] for s in samples):
+            raise ValueError('Required shape candidate has no warm/formal samples')
+        for sample in samples:  # Warmup must also adopt the complete actual path.
+            c = sample.get(name, {})
+            t = sample.get('decode_telemetry', {})
+            if (sample.get('candidate_modes', {}).get(name) != 1 or
+                    sample.get('candidate_layer_count') != 40 or
+                    c.get('requests') != per_target * sample['output_tokens'] or
+                    c.get('encoded') != c.get('requests') or c.get('failures') != 0 or
+                    c.get('decode_requests') != per_target * sample['decode_intervals'] or
+                    c.get('decode_encoded') != c.get('decode_requests') or c.get('decode_failures') != 0 or
+                    t.get('target_forward_calls') != sample['output_tokens'] or
+                    t.get('target_rows') != sample['output_tokens'] or
+                    any(t.get(k) != 0 for k in ('batch2_calls', 'batch2_failures', 'batch2_fallbacks',
+                                              'draft_cycles', 'draft_proposed', 'pld_queries', 'pld_cycles'))):
+                raise ValueError('Required shape candidate did not adopt every ordinary warm/formal target: ' + name)
+        return
     formal = [s.get(name) for s in samples if not s['warmup']]
     if name=='gpu_dspark_capture':
         for sample in (s for s in samples if not s['warmup']):
@@ -967,6 +1017,13 @@ def run(args):
         raise ValueError('Invalid attention register 0/1 cohort')
     if explicit_env.get('MYDS_MOE_Q2_V41') not in (None, '0', '1'):
         raise ValueError('Invalid Q2 V4.1 0/1 cohort')
+    for _, (flag, _, _, option) in DECODE_SHAPE_CANDIDATES.items():
+        if explicit_env.get(flag) not in (None, '0', '1'):
+            raise ValueError('Invalid candidate 0/1 cohort: ' + flag)
+        if getattr(args, option, False):
+            if (explicit_env.get(flag) != '1' or support is not None or arm not in ('target', 'custom') or
+                    any(explicit_env.get(k) != '0' for k in ('MYDS_PLD', 'MYDS_BATCH2_SPEC', 'MYDS_SPEC_SERIAL_PROBE'))):
+                raise ValueError('Required shape candidate needs explicit flag1 and ordinary target scope: ' + flag)
     if getattr(args, 'require_moe_q2_v41', False) and explicit_env.get('MYDS_MOE_Q2_V41') != '1':
         raise ValueError('Required Q2 V4.1 path needs explicit flag1')
     if getattr(args, 'require_attention_packed_register', False) and explicit_env.get('MYDS_ATTN_PACKED_REGISTER') != '1':
@@ -1056,7 +1113,10 @@ def run(args):
                                  counters['decode_encoded'] != counters['decode_requests'] or
                                  counters['decode_unavailable'] for counters in formal):
                 raise ValueError('Required topk prefix path did not encode every formal decode request')
-        for option, name in (('require_moe_q2_v41', 'gpu_moe_q2_v41'),
+        for option, name in (('require_moe_down_overlap', 'gpu_moe_down_overlap'),
+                             ('require_moe_iq2_v41', 'gpu_moe_iq2_v41'),
+                             ('require_dense_q4_v41', 'gpu_dense_q4_v41'),
+                             ('require_moe_q2_v41', 'gpu_moe_q2_v41'),
                              ('require_attention_packed_register', 'gpu_attention_packed_register'),
                              ('require_route_simd_shuffle', 'gpu_route_simd_shuffle'),
                              ('require_topk_threshold', 'gpu_topk_threshold'),
@@ -1125,6 +1185,12 @@ def main():
     measurement.add_argument('--out', type=Path, required=True, help='New output directory; existing directories are refused')
     measurement.add_argument('--require-topk-prefix', action='store_true',
                              help='Require all formal runs to encode every eligible decode prefix request without fallback')
+    measurement.add_argument('--require-moe-down-overlap', action='store_true',
+                             help='Require the complete actual ordinary moe_down_overlap path in warmup and every formal target')
+    measurement.add_argument('--require-moe-iq2-v41', action='store_true',
+                             help='Require the complete actual ordinary moe_iq2_v41 path in warmup and every formal target')
+    measurement.add_argument('--require-dense-q4-v41', action='store_true',
+                             help='Require the complete actual ordinary dense_q4_v41 path in warmup and every formal target')
     measurement.add_argument('--require-route-simd-shuffle', action='store_true',
                              help='Require actual router SIMD shuffle encoding in every formal decode, with no failures')
     measurement.add_argument('--require-attention-packed-register', action='store_true',

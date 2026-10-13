@@ -38,6 +38,9 @@ struct myds_metal_buffer {
 static id<MTLDevice>               g_device = nil;
 static id<MTLCommandQueue>          g_queue = nil;
 static id<MTLLibrary>              g_library = nil;
+static NSString *g_loaded_library_path = nil;
+static double g_last_gpu_start = 0.0, g_last_gpu_end = 0.0;
+static bool g_last_gpu_span_valid = false;
 static id<MTLComputePipelineState> g_pso_rms_norm = nil;
 static id<MTLComputePipelineState> g_pso_v41_norm_plain = nil;
 static id<MTLComputePipelineState> g_pso_v41_bf16 = nil;
@@ -70,6 +73,13 @@ static bool g_moe_q2_v41 = false;
 static atomic_uint_fast64_t g_moe_q2_v41_requests = 0;
 static atomic_uint_fast64_t g_moe_q2_v41_encoded = 0;
 static atomic_uint_fast64_t g_moe_q2_v41_failures = 0;
+static bool g_moe_down_overlap = false, g_moe_iq2_v41 = false, g_dense_q4_v41 = false;
+static id<MTLComputePipelineState> g_pso_moe_iq2_v41 = nil;
+static id<MTLComputePipelineState> g_pso_dense_q4_v41[3] = {nil, nil, nil};
+enum { DC_OVERLAP, DC_IQ2, DC_Q4, DC_COUNT };
+static atomic_uint_fast64_t g_decode_candidates[DC_COUNT][3];
+static int decode_candidate_parse(const char *name);
+static int decode_candidates_initialize(bool overlap, bool iq2, bool q4);
 static id<MTLComputePipelineState> g_pso_moe_pair_swiglu_batch_iq2_xxs = nil;
 static id<MTLComputePipelineState> g_pso_moe_sum6_batch_q2_k = nil;
 static inline bool get_moe_batch_dedup_enabled(void) {
@@ -1439,7 +1449,23 @@ static int wait_command_buffer(id<MTLCommandBuffer> cb) {
     if (g_batch_released_buffers && [g_batch_released_buffers count] > 0) {
         [g_batch_released_buffers removeAllObjects];
     }
+    g_last_gpu_span_valid = false;
+    if (ok && cb.status == MTLCommandBufferStatusCompleted) {
+        g_last_gpu_start = cb.GPUStartTime;
+        g_last_gpu_end = cb.GPUEndTime;
+        g_last_gpu_span_valid = isfinite(g_last_gpu_start) && isfinite(g_last_gpu_end) &&
+            g_last_gpu_start > 0.0 && g_last_gpu_end > g_last_gpu_start;
+    }
     return ok;
+}
+
+const char *myds_metal_loaded_library_path(void) {
+    return g_initialized ? g_loaded_library_path.UTF8String : NULL;
+}
+int myds_metal_last_completed_gpu_span(double *start_s, double *end_s) {
+    if (!g_initialized || !g_last_gpu_span_valid || !start_s || !end_s) return 0;
+    *start_s=g_last_gpu_start; *end_s=g_last_gpu_end;
+    return 1;
 }
 
 static const char *g_metal_base_preamble =
@@ -1500,13 +1526,17 @@ int myds_metal_init(const char *shader_dir) {
         return 0;
     }
 
+    const int moe_down_overlap = decode_candidate_parse("MYDS_MOE_DOWN_OVERLAP");
+    const int moe_iq2_v41 = decode_candidate_parse("MYDS_MOE_IQ2_V41");
+    const int dense_q4_v41 = decode_candidate_parse("MYDS_DENSE_Q4_V41");
+    if (moe_down_overlap < 0 || moe_iq2_v41 < 0 || dense_q4_v41 < 0) return 0;
     const int moe_q2_v41 = moe_q2_v41_parse_mode();
     if (moe_q2_v41 < 0) return 0;
     const int moe_q2_sum_cache = moe_q2_sum_cache_parse_mode();
     if (moe_q2_sum_cache < 0) return 0;
     const int moe_q2_sum_cache_fused = moe_q2_sum_cache_fused_parse_mode();
     if (!moe_q2_sum_cache_modes_valid(moe_q2_sum_cache, moe_q2_sum_cache_fused, false)) return 0;
-    if (moe_q2_v41 && (moe_q2_sum_cache || moe_q2_sum_cache_fused)) {
+    if ((moe_q2_v41 || moe_iq2_v41 || moe_down_overlap) && (moe_q2_sum_cache || moe_q2_sum_cache_fused)) {
         fprintf(stderr, "myds_metal: MYDS_MOE_Q2_V41 and Q2 sum-cache experiments must be isolated\n");
         return 0;
     }
@@ -1556,6 +1586,28 @@ int myds_metal_init(const char *shader_dir) {
         g_moe_iq2_popcnt_sign = 0;
         return 0;
     }
+    if (moe_iq2_v41 && (!g_moe_iq2_popcnt_sign || moe_iq2_constant_lut)) {
+        fprintf(stderr,"myds_metal: fixed IQ2 requires production popcount1 and constant-LUT0\n");
+        g_moe_iq2_popcnt_sign=0;
+        return 0;
+    }
+    if (moe_down_overlap || dense_q4_v41) {
+        const char *nr=getenv("MYDS_DENSE_Q4_NR0"), *sg=getenv("MYDS_DENSE_Q4_NSG");
+        if ((nr && strcmp(nr,"2")) || (sg && strcmp(sg,"4"))) {
+            fprintf(stderr,"myds_metal: explicit overlap/Q4 candidates require literal NR2/NSG4 or defaults\n");
+            return 0;
+        }
+    }
+    const char *shared_bf16=getenv("MYDS_DECODE_Q8_FUSE_BF16");
+    if (moe_down_overlap && shared_bf16 && !strcmp(shared_bf16,"0")) {
+        fprintf(stderr,"myds_metal: down overlap requires the existing SharedDown BF16 fused provider\n");
+        return 0;
+    }
+    const char *moe_concurrent=getenv("MYDS_MOE_CONCURRENT");
+    if (moe_down_overlap && moe_concurrent && !strcmp(moe_concurrent,"0")) {
+        fprintf(stderr,"myds_metal: down overlap requires concurrent MoE\n");
+        return 0;
+    }
     g_moe_nsg = moe_nsg;
     g_moe_down_nsg = down_nsg;
 
@@ -1578,6 +1630,8 @@ int myds_metal_init(const char *shader_dir) {
             @"flash_attn.metal",
             @"dense.metal",
             @"moe.metal",
+            @"myds_iq2_v41.metal",
+            @"myds_q4_v41.metal",
             @"dsv4_hc.metal",
             @"unary.metal",
             @"dsv4_kv.metal",
@@ -1714,6 +1768,9 @@ int myds_metal_init(const char *shader_dir) {
                     if (!all_present) {
                         g_library = nil;
                     } else {
+                        NSString *absolute=[lib_path isAbsolutePath] ? lib_path :
+                            [[fm currentDirectoryPath] stringByAppendingPathComponent:lib_path];
+                        g_loaded_library_path=[[absolute stringByStandardizingPath] copy];
                         myds_log(MYDS_LOG_INFO, "myds_metal: loaded precompiled library from %s (all required V4.1 kernels verified)", [lib_path UTF8String]);
                         break;
                     }
@@ -2202,6 +2259,9 @@ int myds_metal_init(const char *shader_dir) {
         g_moe_q2_sum_cache = moe_q2_sum_cache != 0;
         g_moe_q2_sum_cache_fused = moe_q2_sum_cache_fused != 0;
         g_moe_q2_v41 = moe_q2_v41 != 0;
+        if (!decode_candidates_initialize(moe_down_overlap,moe_iq2_v41,dense_q4_v41)) {
+            g_initialized=true; myds_metal_cleanup(); return 0;
+        }
         g_initialized = true;
         MYDS_LOG_I("myds_metal: Initialized successfully on GPU: %s", [[g_device name] UTF8String]);
         MYDS_LOG_I("Indexer head slots: %d (%s; explicit ordinary scalar scope)",
@@ -2228,6 +2288,8 @@ int myds_metal_init(const char *shader_dir) {
                    g_moe_q2_sum_cache, g_moe_q2_sum_cache ? "F32 candidate" : "reference");
         MYDS_LOG_I("Routed MoE Q2 sum cache fused: %d (%s; explicit ordinary scalar scope)",
                    g_moe_q2_sum_cache_fused, g_moe_q2_sum_cache_fused ? "F32 fused candidate" : "reference");
+        MYDS_LOG_I("Decode candidates: down overlap=%d, IQ2 V4.1=%d, Dense Q4 V4.1=%d (ordinary scalar only)",
+            g_moe_down_overlap,g_moe_iq2_v41,g_dense_q4_v41);
         MYDS_LOG_I("Routed MoE Q2 V4.1: %d (ordinary scalar F32 MID only; 5120/2304/384/6, NR2, down NSG2/4; MM, trace and unscoped paths retain reference)",
                    g_moe_q2_v41);
         return 1;
@@ -2243,6 +2305,8 @@ void myds_metal_cleanup(void) {
     }
     /* Join before clearing the set/lock/device the heartbeat accesses. */
     residency_cleanup();
+    g_loaded_library_path=nil;
+    g_last_gpu_span_valid=false; g_last_gpu_start=0.0; g_last_gpu_end=0.0;
     g_pso_indexer_head_slots = nil;
     g_indexer_head_slots = false;
     g_indexer_topk_nan_shuffle = false;
@@ -2277,6 +2341,9 @@ void myds_metal_cleanup(void) {
     g_pso_moe_sum6_q2_k = nil;
     g_pso_moe_sum6_v41_q2_k = nil;
     g_moe_q2_v41 = false;
+    g_moe_down_overlap=false; g_moe_iq2_v41=false; g_dense_q4_v41=false;
+    g_pso_moe_iq2_v41=nil;
+    for (unsigned i=0;i<3u;++i) g_pso_dense_q4_v41[i]=nil;
     g_pso_moe_pair_swiglu_batch_iq2_xxs = nil;
     g_pso_moe_sum6_batch_q2_k = nil;
     g_pso_moe_q2_sum_cache_prepare = nil;
@@ -5259,6 +5326,8 @@ static int get_moe_mm_min_tokens(void) {
     return min_tokens;
 }
 
+#include "myds_decode_candidates.inc"
+
 static inline float softplus_stable(float x) {
     if (x > 20.0f) return x;
     if (x < -20.0f) return expf(x);
@@ -5379,7 +5448,9 @@ static int routed_moe_batch_impl(
     ggml_type                  up_type,
     ggml_type                  down_type,
     float                      clamp_val,
-    bool                       q2_v41_allowed) {
+    bool                       q2_v41_allowed,
+    bool                       iq2_v41_allowed,
+    const shared_down_job_t    *shared_down) {
     if (!moe_out || !x_in || !gate_exps || !up_exps || !down_exps ||
         !selected_ids || !selected_weights || !scratch_gate || !scratch_up ||
         !scratch_mid || !scratch_down || n_tok == 0) {
@@ -5400,10 +5471,14 @@ static int routed_moe_batch_impl(
      * exist, and a missing selected provider cannot leave an open encoder. */
     if (q2_v41_allowed && (!moe_q2_v41_producer_geometry(g_moe_iq2_constant_lut) || !moe_q2_v41_geometry())) return 0;
 
+    const bool use_iq2_v41=iq2_v41_allowed && g_moe_iq2_v41 && n_tok==1u &&
+        dim==5120u && expert_dim==2304u && n_routed_experts==384u;
+    if (iq2_v41_allowed && (!use_iq2_v41 ||
+        !decode_candidate_geometry(g_pso_moe_iq2_v41,(unsigned)g_moe_nsg,2176u))) return 0;
     @autoreleasepool {
         id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
-        if (q2_v41_allowed && (!cb || !enc)) return 0;
+        if ((q2_v41_allowed || iq2_v41_allowed || shared_down) && (!cb || !enc)) return 0;
 
         uint64_t gate_row_bytes = (dim / 256u) * 66u;
         uint64_t gate_exp_bytes = (uint64_t)expert_dim * gate_row_bytes;
@@ -5421,6 +5496,7 @@ static int routed_moe_batch_impl(
                           g_pso_moe_mm_q2_k_f16 &&
                           g_pso_moe_sum6;
 
+        if ((iq2_v41_allowed || shared_down) && can_use_mm) return 0;
         if (can_use_mm) {
             const NSUInteger tpe_bytes = (NSUInteger)n_routed_experts * sizeof(int32_t);
             const NSUInteger hids_bytes = (NSUInteger)n_routed_experts * (NSUInteger)n_tok * sizeof(int32_t);
@@ -5719,7 +5795,7 @@ static int routed_moe_batch_impl(
             .clamp_value = clamp_val,
         };
 
-        if ((use_q2_v41 ? moe_q2_v41_producer() : g_pso_moe_pair_swiglu_iq2_xxs) &&
+        if ((use_iq2_v41 ? g_pso_moe_iq2_v41 : (use_q2_v41 ? moe_q2_v41_producer() : g_pso_moe_pair_swiglu_iq2_xxs)) &&
             (use_q2_v41 ? g_pso_moe_sum6_v41_q2_k : g_pso_moe_sum6_q2_k)) {
             bool use_batch_dedup = (n_tok == 2) && get_moe_batch_dedup_enabled() &&
                                    g_pso_moe_pair_swiglu_batch_iq2_xxs && g_pso_moe_sum6_batch_q2_k;
@@ -5774,6 +5850,10 @@ static int routed_moe_batch_impl(
                     gate_up_pso = g_pso_moe_pair_swiglu_popcnt_iq2_xxs;
                     gate_up_name = "fused_moe_swiglu_popcnt";
                 }
+                if (use_iq2_v41) {
+                    gate_up_pso=g_pso_moe_iq2_v41;
+                    gate_up_name="fused_moe_swiglu_iq2_v41_shape32";
+                }
                 [enc setComputePipelineState:gate_up_pso];
                 [enc setBytes:&gate_args length:sizeof(gate_args) atIndex:0];
                 [enc setBytes:&swiglu_args length:sizeof(swiglu_args) atIndex:1];
@@ -5788,6 +5868,7 @@ static int routed_moe_batch_impl(
                 [enc setThreadgroupMemoryLength:smem_iq2 atIndex:0];
                 metal_dispatch(enc, gate_up_name, MTLSizeMake(row_groups_gate, 1, pairs),
                     MTLSizeMake(32, nsg_gate, 1));
+                if (use_iq2_v41) atomic_fetch_add_explicit(&g_decode_candidates[DC_IQ2][1],1,memory_order_relaxed);
                 if (g_auto_barrier) {
                     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
                 } else {
@@ -5809,6 +5890,10 @@ static int routed_moe_batch_impl(
                     MTLSizeMake(row_groups_down, (NSUInteger)n_tok, 1),
                     MTLSizeMake(32, nsg_down, 1));
                 if (use_q2_v41) atomic_fetch_add_explicit(&g_moe_q2_v41_encoded, 1, memory_order_relaxed);
+            }
+            if (shared_down) {
+                if (!encode_shared_down_overlap(enc,shared_down)) return 0;
+                atomic_fetch_add_explicit(&g_decode_candidates[DC_OVERLAP][1],1,memory_order_relaxed);
             }
 
             if (g_batch_cb) {
@@ -5865,7 +5950,7 @@ int myds_metal_routed_moe_batch(
     return routed_moe_batch_impl(moe_out, x_in, gate_exps, up_exps, down_exps,
         selected_ids, selected_weights, scratch_gate, scratch_up, scratch_mid, scratch_down,
         dim, expert_dim, n_routed_experts, n_activated_experts, n_tok,
-        gate_type, up_type, down_type, clamp_val, false);
+        gate_type, up_type, down_type, clamp_val, false, false, NULL);
 }
 
 int myds_metal_routed_moe(
@@ -6131,7 +6216,14 @@ static int moe_q2_sum_cache_fused_scoped(
     }
 }
 
-int myds_metal_routed_moe_scoped(
+static int scoped_moe_candidate_failure(const char *reason) {
+    if (g_moe_iq2_v41) decode_candidate_failure(DC_IQ2,reason);
+    if (g_moe_q2_v41) return moe_q2_v41_failure(reason);
+    fprintf(stderr,"myds_metal: scoped MoE candidate rejected: %s; refusing fallback\n",reason);
+    return 0;
+}
+
+static int routed_moe_scoped_impl(
     myds_metal_buffer_t       *moe_out,
     const myds_metal_buffer_t *x_in,
     const myds_metal_buffer_t *gate_exps,
@@ -6151,10 +6243,10 @@ int myds_metal_routed_moe_scoped(
     ggml_type                  up_type,
     ggml_type                  down_type,
     float                      clamp_val,
-    bool                       ordinary_decode_allowed) {
+    bool                       ordinary_decode_allowed, const shared_down_job_t *shared_down) {
     /* Only this caller-supplied public/nontrace scalar scope can select the
      * specialization. The ordinary batch helper remains the old provider. */
-    if (g_moe_q2_v41 && ordinary_decode_allowed && dim == 5120u && expert_dim == 2304u &&
+    if ((g_moe_q2_v41 || g_moe_iq2_v41 || shared_down) && ordinary_decode_allowed && dim == 5120u && expert_dim == 2304u &&
         n_routed_experts == 384u && n_activated_experts == 6u &&
         gate_type == GGML_TYPE_IQ2_XXS && up_type == GGML_TYPE_IQ2_XXS && down_type == GGML_TYPE_Q2_K &&
         (g_moe_down_nsg == 2 || g_moe_down_nsg == 4)) {
@@ -6165,10 +6257,11 @@ int myds_metal_routed_moe_scoped(
         /* MM materializes F16 MID and has a different reduction tree. Keep
          * that configured provider; it is outside this F32-MID experiment. */
         if (!one_token_mm) {
-            atomic_fetch_add_explicit(&g_moe_q2_v41_requests, 1, memory_order_relaxed);
-            if (!g_initialized || !moe_q2_v41_geometry() ||
+            if (g_moe_q2_v41) atomic_fetch_add_explicit(&g_moe_q2_v41_requests, 1, memory_order_relaxed);
+            if (g_moe_iq2_v41) atomic_fetch_add_explicit(&g_decode_candidates[DC_IQ2][0],1,memory_order_relaxed);
+            if (!g_initialized || (g_moe_q2_v41 && !moe_q2_v41_geometry()) ||
                 !moe_q2_v41_producer_geometry(g_moe_iq2_constant_lut) || !isfinite(clamp_val) || clamp_val < 0)
-                return moe_q2_v41_failure("runtime, PSO/geometry or clamp");
+                return scoped_moe_candidate_failure("runtime, PSO/geometry or clamp");
             const uint64_t out_bytes = 5120u * sizeof(float);
             const uint64_t mid_bytes = 6u * 2304u * sizeof(float);
             const myds_metal_buffer_t *readers[] = {x_in, gate_exps, up_exps, down_exps, selected_ids, selected_weights};
@@ -6180,25 +6273,26 @@ int myds_metal_routed_moe_scoped(
                 !moe_q2_sum_cache_range(scratch_gate, mid_bytes, 4u) ||
                 !moe_q2_sum_cache_range(scratch_up, mid_bytes, 4u) ||
                 !moe_q2_sum_cache_range(scratch_down, 6u * out_bytes, 4u))
-                return moe_q2_v41_failure("output or scratch range/alignment");
+                return scoped_moe_candidate_failure("output or scratch range/alignment");
             for (unsigned i = 0; i < 6u; ++i)
                 if (!moe_q2_sum_cache_range(readers[i], reader_bytes[i], reader_align[i]))
-                    return moe_q2_v41_failure("input range/alignment");
+                    return scoped_moe_candidate_failure("input range/alignment");
             const myds_metal_buffer_t *writers[] = {moe_out, scratch_mid};
             const uint64_t writer_bytes[] = {out_bytes, mid_bytes};
             if (moe_q2_sum_cache_overlap(writers[0], writer_bytes[0], writers[1], writer_bytes[1]))
-                return moe_q2_v41_failure("output overlaps MID");
+                return scoped_moe_candidate_failure("output overlaps MID");
             for (unsigned i = 0; i < 2u; ++i)
                 for (unsigned j = 0; j < 6u; ++j)
                     if (moe_q2_sum_cache_overlap(writers[i], writer_bytes[i], readers[j], reader_bytes[j]))
-                        return moe_q2_v41_failure("writable buffer overlaps reader");
+                        return scoped_moe_candidate_failure("writable buffer overlaps reader");
             const int ok = routed_moe_batch_impl(moe_out, x_in, gate_exps, up_exps, down_exps,
                 selected_ids, selected_weights, scratch_gate, scratch_up, scratch_mid, scratch_down,
                 dim, expert_dim, n_routed_experts, n_activated_experts, 1u,
-                gate_type, up_type, down_type, clamp_val, true);
-            return ok ? 1 : moe_q2_v41_failure("encoding or standalone completion failed");
+                gate_type, up_type, down_type, clamp_val, g_moe_q2_v41, g_moe_iq2_v41, shared_down);
+            return ok ? 1 : scoped_moe_candidate_failure("encoding or standalone completion failed");
         }
     }
+    if (shared_down) return 0; /* A requested schedule must never silently fall back. */
     if (g_moe_q2_sum_cache_fused && ordinary_decode_allowed)
         return moe_q2_sum_cache_fused_scoped(moe_out, x_in, gate_exps, up_exps, down_exps,
             selected_ids, selected_weights, scratch_gate, scratch_up, scratch_mid, scratch_down,
@@ -7034,4 +7128,89 @@ void myds_metal_warm_memory(const void *addr, size_t size) {
         }
         (void)dummy;
     });
+}
+
+int myds_metal_routed_moe_scoped(
+    myds_metal_buffer_t       *moe_out,
+    const myds_metal_buffer_t *x_in,
+    const myds_metal_buffer_t *gate_exps,
+    const myds_metal_buffer_t *up_exps,
+    const myds_metal_buffer_t *down_exps,
+    const myds_metal_buffer_t *selected_ids,
+    const myds_metal_buffer_t *selected_weights,
+    myds_metal_buffer_t       *scratch_gate,
+    myds_metal_buffer_t       *scratch_up,
+    myds_metal_buffer_t       *scratch_mid,
+    myds_metal_buffer_t       *scratch_down,
+    uint32_t                   dim,
+    uint32_t                   expert_dim,
+    uint32_t                   n_routed_experts,
+    uint32_t                   n_activated_experts,
+    ggml_type                  gate_type,
+    ggml_type                  up_type,
+    ggml_type                  down_type,
+    float                      clamp_val,
+    bool                       ordinary_decode_allowed) {
+    return routed_moe_scoped_impl(moe_out, x_in, gate_exps, up_exps, down_exps, selected_ids, selected_weights,
+        scratch_gate, scratch_up, scratch_mid, scratch_down, dim, expert_dim,
+        n_routed_experts, n_activated_experts, gate_type, up_type, down_type,
+        clamp_val, ordinary_decode_allowed,NULL);
+}
+
+int myds_metal_routed_moe_down_overlap_scoped(
+    myds_metal_buffer_t       *moe_out,
+    const myds_metal_buffer_t *x_in,
+    const myds_metal_buffer_t *gate_exps,
+    const myds_metal_buffer_t *up_exps,
+    const myds_metal_buffer_t *down_exps,
+    const myds_metal_buffer_t *selected_ids,
+    const myds_metal_buffer_t *selected_weights,
+    myds_metal_buffer_t       *scratch_gate,
+    myds_metal_buffer_t       *scratch_up,
+    myds_metal_buffer_t       *scratch_mid,
+    myds_metal_buffer_t       *scratch_down,
+    uint32_t                   dim,
+    uint32_t                   expert_dim,
+    uint32_t                   n_routed_experts,
+    uint32_t                   n_activated_experts,
+    ggml_type                  gate_type,
+    ggml_type                  up_type,
+    ggml_type                  down_type,
+    float                      clamp_val,
+    bool                       ordinary_decode_allowed,
+    myds_metal_buffer_t *shared_out,
+    const myds_metal_buffer_t *shared_weight,
+    const myds_metal_buffer_t *shared_input,
+    ggml_type shared_type) {
+    atomic_fetch_add_explicit(&g_decode_candidates[DC_OVERLAP][0],1,memory_order_relaxed);
+    if (!g_initialized || !g_moe_down_overlap || !ordinary_decode_allowed ||
+        dim!=5120u || expert_dim!=2304u || n_routed_experts!=384u || n_activated_experts!=6u ||
+        gate_type!=GGML_TYPE_IQ2_XXS || up_type!=GGML_TYPE_IQ2_XXS || down_type!=GGML_TYPE_Q2_K ||
+        shared_type!=GGML_TYPE_Q4_K || !g_batch_cb || g_auto_barrier ||
+        !myds_metal_get_concurrent() || g_kp_on || dense_q4_nr0()!=2u || dense_q4_nsg()!=4u ||
+        !decode_candidate_geometry(g_pso_mul_mv_q4_K_dense_bf16,4u,256u) ||
+        !decode_candidate_range(shared_out,20480u,16u) ||
+        !decode_candidate_range(shared_input,9216u,4u) ||
+        !decode_candidate_range(shared_weight,6635520u,2u))
+        return decode_candidate_failure(DC_OVERLAP,"scope, range, PSO or geometry");
+    const myds_metal_buffer_t *others[]={moe_out,x_in,gate_exps,up_exps,down_exps,
+        selected_ids,selected_weights,scratch_gate,scratch_up,scratch_mid,scratch_down,shared_input,shared_weight};
+    const uint64_t bytes[]={20480u,20480u,1167851520ull,1167851520ull,1486356480ull,
+        24u,24u,55296u,55296u,55296u,122880u,9216u,6635520u};
+    for (unsigned i=0;i<13u;++i) {
+        if (!decode_candidate_range(others[i],bytes[i],i==2u||i==3u||i==4u||i==12u?2u:4u) ||
+            decode_candidate_overlap(shared_out,20480u,others[i],bytes[i]))
+            return decode_candidate_failure(DC_OVERLAP,"shared output overlaps another allocation");
+    }
+    if (decode_candidate_overlap(shared_input,9216u,moe_out,20480u) ||
+        decode_candidate_overlap(shared_input,9216u,scratch_mid,55296u) ||
+        decode_candidate_overlap(shared_weight,6635520u,moe_out,20480u) ||
+        decode_candidate_overlap(shared_weight,6635520u,scratch_mid,55296u))
+        return decode_candidate_failure(DC_OVERLAP,"shared reader overlaps routed writer");
+    const shared_down_job_t job={shared_out,shared_weight,shared_input};
+    int ok=routed_moe_scoped_impl(moe_out, x_in, gate_exps, up_exps, down_exps, selected_ids, selected_weights,
+        scratch_gate, scratch_up, scratch_mid, scratch_down, dim, expert_dim,
+        n_routed_experts, n_activated_experts, gate_type, up_type, down_type,
+        clamp_val, ordinary_decode_allowed,&job);
+    return ok ? 1 : decode_candidate_failure(DC_OVERLAP,"routed/paired encoding failed");
 }
