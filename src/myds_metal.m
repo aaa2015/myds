@@ -1479,6 +1479,14 @@ int myds_metal_init(const char *shader_dir) {
         return 0;
     }
     const bool moe_iq2_constant_lut = iq2_lut_env && strcmp(iq2_lut_env, "1") == 0;
+    /* 2026-10-13 (参谋长) BUGFIX: popcount 开关必须在下面构建 PSO 之前读取。
+     * 原实现只在 init 末尾赋值，而 PSO 已按默认 0 建完
+     * ⇒ g_pso_moe_pair_swiglu_popcnt_iq2_xxs 恒为 nil ⇒ 该候选从未真正生效
+     *   （此前「popcount 无收益」的结论因此无效）。 */
+    {
+        const char *pc = getenv("MYDS_MOE_IQ2_POPCNT_SIGN");
+        g_moe_iq2_popcnt_sign = (pc && strcmp(pc, "1") == 0) ? 1 : 0;
+    }
     if (!moe_q2_sum_cache_modes_valid(moe_q2_sum_cache, moe_q2_sum_cache_fused, moe_iq2_constant_lut)) return 0;
     g_moe_nsg = moe_nsg;
     g_moe_down_nsg = down_nsg;
@@ -2108,10 +2116,7 @@ int myds_metal_init(const char *shader_dir) {
         g_f16_gemv_bf16_fuse = f16_gemv_bf16_fuse != 0;
         g_indexer_rope_quant_fuse = indexer_rope_quant_fuse != 0;
         g_moe_iq2_constant_lut = moe_iq2_constant_lut;
-        {
-            const char *pc = getenv("MYDS_MOE_IQ2_POPCNT_SIGN");
-            g_moe_iq2_popcnt_sign = (pc && strcmp(pc, "1") == 0) ? 1 : 0;
-        }
+        /* MYDS_MOE_IQ2_POPCNT_SIGN 已在 init 前段读取（见上）；此处不再重复赋值。 */
         g_moe_q2_sum_cache = moe_q2_sum_cache != 0;
         g_moe_q2_sum_cache_fused = moe_q2_sum_cache_fused != 0;
         g_initialized = true;
