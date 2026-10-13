@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Compile-only private attention+rope probe with complete intermediate taps."""
-import argparse,hashlib,importlib.util,json,os,subprocess
+import argparse,hashlib,importlib.util,json,os,subprocess,shutil
 from pathlib import Path
-p=argparse.ArgumentParser(description=__doc__);p.add_argument('--out-dir',required=True);a=p.parse_args()
+p=argparse.ArgumentParser(description=__doc__);p.add_argument('--out-dir',required=True)
+p.add_argument('--reuse-metallib',type=Path,help='Diagnostic host rebuild: preserve the already measured private library bytes')
+p.add_argument('--reuse-source-identity',type=Path,help='Required original library source/build identity for diagnostic reuse')
+a=p.parse_args()
 root=Path(__file__).resolve().parents[1];out=Path(a.out_dir).resolve()
 if root==out or root in out.parents:raise SystemExit('Use a private directory outside repo')
 out.mkdir(parents=True,exist_ok=True)
@@ -52,6 +55,19 @@ combined=bm.PREAMBLE+'\n'+''.join('\n#line 1 "'+n+'"\n'+(root/'metal'/n).read_te
 env=dict(os.environ);env.setdefault('DEVELOPER_DIR','/Applications/Xcode.app/Contents/Developer')
 commands=[['xcrun','-sdk','macosx','metal','-mmacosx-version-min=15.0','-O3','-ffast-math','-DDS4_METAL_HC_STABLE=1','-DDS4_METAL_NORM_RSQRT_DISABLE=1','-c',str(out/'myds_all.metal'),'-o',str(out/'myds_all.air')],
  ['xcrun','-sdk','macosx','metallib',str(out/'myds_all.air'),'-o',str(out/'myds.metallib')]]
+reused=None
+if a.reuse_metallib:
+ assert a.reuse_source_identity,'Reuse requires the original source identity'
+ old=json.loads(a.reuse_source_identity.read_text())
+ sha=lambda b:hashlib.sha256(b).hexdigest()
+ assert sha(a.reuse_metallib.read_bytes())==old['output_sha256']['myds.metallib'],'Reused library SHA differs'
+ assert old['original_helper_sha256']==sha(original.encode()) and old['candidate_helper_sha256']==sha(candidate.encode())
+ assert old['output_sha256']['probe_attention_rope.metal']==sha(probe.encode()),'Debug shader has changed'
+ for name,h in old['input_sha256'].items():
+  if name.startswith('metal/') or name=='tools/build_metallib.py':assert sha((root/name).read_bytes())==h,'Library shader source changed'
+ if a.reuse_metallib.resolve()!=(out/'myds.metallib').resolve():shutil.copyfile(a.reuse_metallib,out/'myds.metallib')
+ reused={'library_sha256':sha(a.reuse_metallib.read_bytes()),'original_source_identity_sha256':sha(a.reuse_source_identity.read_bytes()),'shader_sources_and_debug_probe_unchanged':True}
+ commands=[]
 for n in ('myds_gguf','myds_log'):
  commands.append(['clang','-O3','-Wall','-Wextra','-std=c11','-Iinclude','-Ithird_party','-c','src/'+n+'.c','-o',str(out/(n+'.o'))])
 commands.append(['clang','-O3','-Wall','-Wextra','-fobjc-arc','-Iinclude','-Isrc','-Itests','-Ithird_party','tests/test_attention_rope_fuse.m',str(out/'myds_gguf.o'),str(out/'myds_log.o'),'-framework','Foundation','-framework','Metal','-lm','-lpthread','-o',str(out/'test_attention_rope_fuse')])
@@ -65,5 +81,6 @@ identity={'cpu_compile_only':True,'gpu_run':False,'original_helper_sha256':sha(o
  'only_clone_difference':'function signature and final float4 store; partial/stats/reductions/barriers byte-identical after normalization',
  'input_sha256':{n:sha((root/n).read_bytes()) for n in sorted(set(paths))},'commands':commands,
  'output_sha256':{n:sha((out/n).read_bytes()) for n in ('myds.metallib','test_attention_rope_fuse','probe_attention_rope.metal')}}
+if reused:identity['diagnostic_reused_measured_library']=reused
 (out/'source-identity.json').write_text(json.dumps(identity,indent=2,sort_keys=True)+'\n')
 print(json.dumps({'built':True,'cpu_compile_only':True,'out':str(out),'clone_reconstructed_original_exact':True}))
