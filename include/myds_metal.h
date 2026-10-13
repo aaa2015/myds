@@ -397,6 +397,22 @@ int myds_metal_moe_route_biased(
  * cleanup + init is required to change it. Existing routed single/batch APIs
  * always retain the reference; only the explicitly scoped API may use it. */
 int myds_metal_moe_q2_sum_cache_enabled(void);
+/* MYDS_MOE_Q2_V41 is an init-time absent/0/1 setting, default 0. Only the
+ * public nontrace scalar scope below may select the fixed 5120/2304/384/6
+ * IQ2/IQ2/Q2 F32-MID GEMV provider, with NR2 and down NSG2/4. Unscoped,
+ * prefill, Batch2/tree/rescue, split-TP and eligible one-token MM providers
+ * retain their existing paths. Missing selected PSOs, either sum-cache mode,
+ * or the combined IQ2 popcount1 + constant-LUT1 setting fail initialization.
+ * cleanup + init changes the mode. */
+int myds_metal_moe_q2_v41_enabled(void);
+typedef struct {
+    uint64_t requests, encoded, failures;
+} myds_metal_moe_q2_v41_counters_t;
+/* Eligible scoped attempts, actual specialized down host encodings, and
+ * eligible calls returning failure. Encoded is not GPU completion; counters
+ * survive cleanup until explicitly reset. */
+void myds_metal_moe_q2_v41_counters(
+    myds_metal_moe_q2_v41_counters_t *out, bool reset);
 typedef struct {
     uint64_t requests, encoded, failures;
 } myds_metal_moe_q2_sum_cache_counters_t;

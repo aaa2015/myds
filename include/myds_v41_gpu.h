@@ -270,6 +270,23 @@ int myds_v41_gpu_gather_bf16(myds_metal_buffer_t *out,const myds_metal_buffer_t 
 /* Fixed64 heads, width512, raw ring capacity128, selected_rows<=512.
  * Reference F16 staging + 32-way split-K FlashAttention, no output BF16/RoPE:
  * caller must round then inverse-RoPE the heads at the prescribed boundary. */
+/* Explicit ordinary single-query candidate. MYDS_ATTN_PACKED_REGISTER accepts
+ * absent/literal 0 (reference) or literal 1 (register kernel). Returns -1 for
+ * invalid configuration: candidate requires physical NSG8 and packed reduce
+ * absent/literal 1. Configuration is checked at scratch creation and every
+ * public single-attention call before staging; change env only between graphs.
+ * Explicit candidate PSO/dispatch failure returns 0 without reference fallback. */
+#define MYDS_V41_GPU_HAS_ATTN_PACKED_REGISTER 1
+int myds_v41_gpu_attention_packed_register_enabled(void);
+typedef struct {
+    uint64_t requests, encoded, failures, direct_encoded, staged_encoded;
+} myds_v41_gpu_attention_packed_register_counters_t;
+/* Process-wide relaxed host counters. Request counts explicit candidate calls
+ * including validation failures; encoded counts an actual kernel dispatch even
+ * if standalone completion subsequently fails. Decode deltas are obtained by
+ * caller snapshots, rather than inferring Engine purpose from this low API. */
+void myds_v41_gpu_attention_packed_register_counters(
+    myds_v41_gpu_attention_packed_register_counters_t *out,bool reset);
 int myds_v41_gpu_attention(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *window,uint32_t n_raw,
     uint32_t raw_start,const myds_metal_buffer_t *selected_kv,uint32_t selected_rows,

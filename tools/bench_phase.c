@@ -47,6 +47,9 @@ typedef struct {
     myds_metal_moe_q2_sum_cache_fused_counters_t first_moe_q2_sum_cache_fused;
     myds_metal_f16_gemv_bf16_fuse_counters_t first_f16_bf16_fuse;
     myds_metal_indexer_rope_quant_fuse_counters_t first_indexer_rope_quant;
+    myds_v41_route_simd_shuffle_counters_t first_route_shuffle;
+    myds_v41_gpu_attention_packed_register_counters_t first_attn_register;
+    myds_metal_moe_q2_v41_counters_t first_q2_v41;
     myds_metal_shared3_counters_t first_depth2_dense;
     myds_v41_shared_gu_shared3_counters_t first_depth2_gu;
     myds_v41_depth2_routed_shared3_counters_t first_depth2_routed;
@@ -83,6 +86,9 @@ static void capture(const char *piece, size_t length, int32_t id, void *opaque) 
         myds_metal_moe_q2_sum_cache_fused_counters(&c->first_moe_q2_sum_cache_fused, false);
         myds_metal_f16_gemv_bf16_fuse_counters(&c->first_f16_bf16_fuse, false);
         myds_metal_indexer_rope_quant_fuse_counters(&c->first_indexer_rope_quant, false);
+        myds_v41_route_simd_shuffle_counters(&c->first_route_shuffle, false);
+        myds_v41_gpu_attention_packed_register_counters(&c->first_attn_register, false);
+        myds_metal_moe_q2_v41_counters(&c->first_q2_v41, false);
         myds_metal_shared3_counters(&c->first_depth2_dense, false);
         myds_v41_shared_gu_shared3_counters(&c->first_depth2_gu, false);
         myds_v41_depth2_routed_shared3_counters(&c->first_depth2_routed, false);
@@ -304,7 +310,7 @@ int main(int argc, char **argv) {
         "MYDS_ATTN_VEC_HEAD_FIRST", "MYDS_ATTN_GATHER_MIN_KEYS", "MYDS_PREFILL_ATTN",
         "MYDS_QKV_FUSE_BF16", "MYDS_QKV_FUSE_POST", "MYDS_QKV_NR0", "MYDS_MOE_IQ2_TAIL_CULL",
         "MYDS_MOE_IQ2_CONSTANT_LUT", "MYDS_ATTN_PACKED_NSG", "MYDS_ATTN_PACKED_REDUCE",
-        "MYDS_MOE_ROUTE_FUSE",
+        "MYDS_MOE_ROUTE_FUSE", "MYDS_ROUTE_SIMD_SHUFFLE",
         "MYDS_ATTN_OUT_A_FUSE_BF16",
         "MYDS_ATTN_DIRECT_PACK",
         "MYDS_ENGRAM_IO_THREADS", "MYDS_ENGRAM_NOCACHE", "MYDS_BENCH_STORAGE_COUNTERS",
@@ -367,14 +373,15 @@ int main(int argc, char **argv) {
     fprintf(json, ",\"layers\":%u,\"dim\":%u,\"heads\":%u,\"head_dim\":%u,\"vocab_size\":%u,"
         "\"routed_experts\":%u,\"activated_experts\":%u,\"expert_width\":%u,\"shared_experts\":%u,\"native_v41\":%s,"
         "\"dspark_loaded\":%s,\"dspark_load_s\":%.9f,\"dspark_block_size\":%u,\"dspark_stages\":%u,"
-        "\"lm_head_weight_type\":%d,\"moe_q2_sum_cache_mode\":%d,\"moe_q2_sum_cache_fused_mode\":%d,\"indexer_head_slots_mode\":%d,\"topk_threshold_mode\":%d,\"topk_nan_shuffle_mode\":%d,\"dspark_capture_bypass_mode\":%d,\"engine_capture_bypass_mode\":%d,\"f16_gemv_bf16_fuse_mode\":%d,\"indexer_rope_quant_fuse_mode\":%d}\n",
+        "\"lm_head_weight_type\":%d,\"moe_q2_sum_cache_mode\":%d,\"moe_q2_sum_cache_fused_mode\":%d,\"indexer_head_slots_mode\":%d,\"topk_threshold_mode\":%d,\"topk_nan_shuffle_mode\":%d,\"dspark_capture_bypass_mode\":%d,\"engine_capture_bypass_mode\":%d,\"f16_gemv_bf16_fuse_mode\":%d,\"indexer_rope_quant_fuse_mode\":%d,\"route_simd_shuffle_mode\":%d,\"attention_packed_register_mode\":%d,\"moe_q2_v41_mode\":%d}\n",
         model->n_layers, model->dim, model->n_heads, model->head_dim, model->vocab_size,
         model->n_routed_experts, model->n_activated_experts, model->moe_expert_dim, model->n_shared_experts,
         model->v41 ? "true" : "false", ctx->dspark ? "true" : "false", dspark_load_s,
         ctx->dspark ? ctx->dspark->block_size : 0, ctx->dspark ? ctx->dspark->stage_count : 0,
         (int)model->output_type, myds_metal_moe_q2_sum_cache_enabled(),
         myds_metal_moe_q2_sum_cache_fused_enabled(), myds_v41_gpu_indexer_head_slots_enabled(), myds_v41_gpu_topk_threshold_enabled(), myds_v41_gpu_topk_nan_shuffle_enabled(),myds_dspark_capture_bypass_enabled(ctx->dspark),
-        myds_dspark_engine_capture_bypass_enabled(ctx->dspark), myds_metal_f16_gemv_bf16_fuse_enabled(), myds_metal_indexer_rope_quant_fuse_enabled());
+        myds_dspark_engine_capture_bypass_enabled(ctx->dspark), myds_metal_f16_gemv_bf16_fuse_enabled(), myds_metal_indexer_rope_quant_fuse_enabled(), myds_v41_route_simd_shuffle_mode(),
+        myds_v41_gpu_attention_packed_register_enabled(), myds_metal_moe_q2_v41_enabled());
     fflush(json);
     int status = 0;
     uint64_t expected_ids = 0, expected_bytes = 0;
@@ -404,6 +411,9 @@ int main(int argc, char **argv) {
         myds_metal_moe_q2_sum_cache_fused_counters(NULL, true);
         myds_metal_f16_gemv_bf16_fuse_counters(NULL, true);
         myds_metal_indexer_rope_quant_fuse_counters(NULL, true);
+        myds_v41_route_simd_shuffle_counters(NULL, true);
+        myds_v41_gpu_attention_packed_register_counters(NULL, true);
+        myds_metal_moe_q2_v41_counters(NULL, true);
         myds_metal_shared3_counters(NULL, true);
         myds_v41_shared_gu_shared3_counters(NULL, true);
         myds_v41_depth2_routed_shared3_counters(NULL, true);
@@ -441,6 +451,12 @@ int main(int argc, char **argv) {
         myds_metal_f16_gemv_bf16_fuse_counters(&f16_bf16_fuse, false);
         myds_metal_indexer_rope_quant_fuse_counters_t indexer_rope_quant;
         myds_metal_indexer_rope_quant_fuse_counters(&indexer_rope_quant, false);
+        myds_v41_route_simd_shuffle_counters_t route_shuffle;
+        myds_v41_route_simd_shuffle_counters(&route_shuffle, false);
+        myds_v41_gpu_attention_packed_register_counters_t attn_register;
+        myds_v41_gpu_attention_packed_register_counters(&attn_register, false);
+        myds_metal_moe_q2_v41_counters_t q2_v41;
+        myds_metal_moe_q2_v41_counters(&q2_v41, false);
         myds_metal_shared3_counters_t depth2_dense;
         myds_metal_shared3_counters(&depth2_dense, false);
         myds_v41_shared_gu_shared3_counters_t depth2_gu;
@@ -632,6 +648,24 @@ int main(int argc, char **argv) {
             ",\"decode_failures\":%" PRIu64 "}", f16_bf16_fuse.requests, f16_bf16_fuse.encoded, f16_bf16_fuse.failures,
             f16_bf16_fuse.requests-c.first_f16_bf16_fuse.requests, f16_bf16_fuse.encoded-c.first_f16_bf16_fuse.encoded,
             f16_bf16_fuse.failures-c.first_f16_bf16_fuse.failures);
+        fprintf(json, ",\"gpu_route_simd_shuffle\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64
+            ",\"failures\":%" PRIu64 ",\"decode_requests\":%" PRIu64 ",\"decode_encoded\":%" PRIu64
+            ",\"decode_failures\":%" PRIu64 "}", route_shuffle.requests, route_shuffle.encoded, route_shuffle.failures,
+            route_shuffle.requests-c.first_route_shuffle.requests, route_shuffle.encoded-c.first_route_shuffle.encoded,
+            route_shuffle.failures-c.first_route_shuffle.failures);
+        fprintf(json, ",\"gpu_attention_packed_register\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64
+            ",\"failures\":%" PRIu64 ",\"decode_requests\":%" PRIu64 ",\"decode_encoded\":%" PRIu64
+            ",\"decode_failures\":%" PRIu64 ",\"direct_encoded\":%" PRIu64 ",\"staged_encoded\":%" PRIu64 "}",
+            attn_register.requests, attn_register.encoded, attn_register.failures,
+            attn_register.requests-c.first_attn_register.requests,
+            attn_register.encoded-c.first_attn_register.encoded,
+            attn_register.failures-c.first_attn_register.failures,
+            attn_register.direct_encoded, attn_register.staged_encoded);
+        fprintf(json, ",\"gpu_moe_q2_v41\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64
+            ",\"failures\":%" PRIu64 ",\"decode_requests\":%" PRIu64 ",\"decode_encoded\":%" PRIu64
+            ",\"decode_failures\":%" PRIu64 "}", q2_v41.requests, q2_v41.encoded, q2_v41.failures,
+            q2_v41.requests-c.first_q2_v41.requests, q2_v41.encoded-c.first_q2_v41.encoded,
+            q2_v41.failures-c.first_q2_v41.failures);
         fprintf(json, ",\"gpu_indexer_rope_quant_fuse\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64
             ",\"failures\":%" PRIu64 ",\"decode_requests\":%" PRIu64 ",\"decode_encoded\":%" PRIu64
             ",\"decode_failures\":%" PRIu64 "}", indexer_rope_quant.requests, indexer_rope_quant.encoded, indexer_rope_quant.failures,

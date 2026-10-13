@@ -13,6 +13,16 @@ int myds_v41_route_batch(myds_metal_buffer_t *selected, myds_metal_buffer_t *wei
     myds_metal_buffer_t *probabilities, myds_metal_buffer_t *scores,
     const myds_metal_buffer_t *logits, const myds_metal_buffer_t *bias,
     uint32_t n_experts, uint32_t top_k, float scale, uint32_t rows);
+/* MYDS_ROUTE_SIMD_SHUFFLE accepts absent/0/1, default 0, at each route entry.
+ * Mode1 selects an independent exact all-in-one PSO and never falls back.
+ * Requests count validated eligible calls; encoded counts successful host
+ * dispatch calls, not GPU completion. bench_phase reports decode_* deltas
+ * from the first callback snapshot, matching its N-1 decode intervals. */
+int myds_v41_route_simd_shuffle_mode(void);
+typedef struct { uint64_t requests, encoded, failures; }
+    myds_v41_route_simd_shuffle_counters_t;
+void myds_v41_route_simd_shuffle_counters(
+    myds_v41_route_simd_shuffle_counters_t *out, bool reset);
 int myds_v41_shared_swiglu(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *gate, const myds_metal_buffer_t *up,
     uint32_t width, float clamp);

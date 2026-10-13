@@ -11806,3 +11806,113 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_popcnt_f32(
 // Keep the restored macros local; later files must not see them.
 #undef QK_K
 #undef N_R0_IQ2_XXS
+
+// Explicit MYDS_MOE_Q2_V41 scalar provider. See the independent probe and
+// Golden full-F32 component gate in docs/benchmarks/2026-10-13-codex-decode.
+// Host eligibility pins 5120/2304/384/6, F32 MID, NR2, NSG2/4 and unsplit TP.
+#define QK_K 256
+kernel void kernel_mul_mv_id_q2_K_sum6_v41_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        device const char * ids,
+        device const char * add_in,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    // Scalar V4.1 only. TP ranks with split expert mappings are ineligible.
+    // Valid route IDs 0..383 and full rows fit all offsets in uint32_t:
+    // the entire expert tensor is 1486356480B, below UINT32_MAX.
+    if (args.tp_world > 1) return;
+    const short NSG = FC_mul_mv_nsg;
+    const short nr0 = 2;
+    const int nb = 9;
+    const int first_row = (tgpig.x * NSG + sgitg) * nr0;
+    const uint token = tgpig.y;
+    device const int32_t *token_ids = (device const int32_t *)(ids + (uint64_t)token * 24u);
+    device const char *token_src1 = src1 + (uint64_t)token * 55296u;
+
+    float sumf[nr0] = {0.f};
+
+    const short ix = tiisg/8;
+    const short it = tiisg%8;
+    const short iq = it/4;
+    const short ir = it%4;
+    const short is = (8*ir)/16;
+
+    for (int expert_slot = 0; expert_slot < 6; expert_slot++) {
+        const int32_t expert = token_ids[expert_slot];
+        device const block_q2_K * x = (device const block_q2_K *)(src0s + (uint)expert*3870720u + (uint)first_row*756u);
+        device const float * y = (device const float *)(token_src1 + expert_slot*9216u);
+        device const float * y4 = y + ix * QK_K + 128 * iq + 8 * ir;
+
+        for (int ib = ix; ib < nb; ib += 4) {
+            float yl[32];
+            float4 sumy = {0.f, 0.f, 0.f, 0.f};
+            #pragma unroll
+            for (short i = 0; i < 8; ++i) {
+                yl[i+ 0] = y4[i+ 0]; sumy[0] += yl[i+ 0];
+                yl[i+ 8] = y4[i+32]; sumy[1] += yl[i+ 8];
+                yl[i+16] = y4[i+64]; sumy[2] += yl[i+16];
+                yl[i+24] = y4[i+96]; sumy[3] += yl[i+24];
+            }
+
+            device const uint8_t  * sc = (device const uint8_t  *)x[ib].scales + 8*iq + is;
+            device const uint16_t * qs = (device const uint16_t *)x[ib].qs + 16 * iq + 4 * ir;
+            device const half     * dh = &x[ib].d;
+
+            for (short row = 0; row < nr0; row++) {
+                {
+                    float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+                    float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+                    #pragma unroll
+                    for (int i = 0; i < 8; i += 2) {
+                        acc1[0] += yl[i+ 0] * (qs[i/2] & 0x0003);
+                        acc2[0] += yl[i+ 1] * (qs[i/2] & 0x0300);
+                        acc1[1] += yl[i+ 8] * (qs[i/2] & 0x000c);
+                        acc2[1] += yl[i+ 9] * (qs[i/2] & 0x0c00);
+                        acc1[2] += yl[i+16] * (qs[i/2] & 0x0030);
+                        acc2[2] += yl[i+17] * (qs[i/2] & 0x3000);
+                        acc1[3] += yl[i+24] * (qs[i/2] & 0x00c0);
+                        acc2[3] += yl[i+25] * (qs[i/2] & 0xc000);
+                    }
+                    float dall = dh[0];
+                    float dmin = dh[1] * 1.f/16.f;
+                    sumf[row] += dall * ((acc1[0] + 1.f/256.f * acc2[0]) * (sc[0] & 0xF) * 1.f/ 1.f +
+                                         (acc1[1] + 1.f/256.f * acc2[1]) * (sc[2] & 0xF) * 1.f/ 4.f +
+                                         (acc1[2] + 1.f/256.f * acc2[2]) * (sc[4] & 0xF) * 1.f/16.f +
+                                         (acc1[3] + 1.f/256.f * acc2[3]) * (sc[6] & 0xF) * 1.f/64.f) -
+                                 dmin * (sumy[0] * (sc[0] & 0xF0) + sumy[1] * (sc[2] & 0xF0) +
+                                         sumy[2] * (sc[4] & 0xF0) + sumy[3] * (sc[6] & 0xF0));
+                }
+
+                qs += 756u/2;
+                sc += 756u;
+                dh += 756u/2;
+            }
+
+            y4 += 4 * QK_K;
+        }
+    }
+
+    device float * dst_f32 = (device float *)(dst + (uint64_t)token * 20480u);
+    for (int row = 0; row < nr0; row++) {
+        const float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            float outv = sum_all;
+            if (args.tp_addend) {
+                outv += ((device const float *) add_in)[first_row + row];
+            }
+            dst_f32[first_row + row] = outv;
+        }
+    }
+
+    (void)shmem;
+    (void)tiitg;
+    (void)tgpig;
+}
+
+#undef QK_K

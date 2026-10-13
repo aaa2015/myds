@@ -140,6 +140,12 @@ class BenchReproduceTests(unittest.TestCase):
         records[0].update(protocol_version=2, max_new_tokens=count,
                           dspark_model=str(support.resolve()) if support else None)
         loaded = next(record for record in records if record['kind'] == 'load')
+        loaded['layers'] = 40
+        for mode, flag in (('route_simd_shuffle_mode', 'MYDS_ROUTE_SIMD_SHUFFLE'),
+                           ('attention_packed_register_mode', 'MYDS_ATTN_PACKED_REGISTER'),
+                           ('moe_q2_v41_mode', 'MYDS_MOE_Q2_V41')):
+            loaded[mode] = int(records[0]['environment'].get(flag) == '1')
+
         loaded.update(dspark_loaded=support is not None, dspark_load_s=0.01 if support else 0,
                       moe_q2_sum_cache_mode=int((environment or {}).get('MYDS_MOE_Q2_SUM_CACHE') == '1'),
                       moe_q2_sum_cache_fused_mode=int((environment or {}).get('MYDS_MOE_Q2_SUM_CACHE_FUSED') == '1'),
@@ -543,6 +549,8 @@ class BenchReproduceTests(unittest.TestCase):
             enabled_value = self.driver.CANDIDATE_ENABLED_VALUES.get(name, '1')
             encoded = dict.fromkeys(keys, 0)
             encoded.update(requests=4, encoded=4, decode_requests=2, decode_encoded=2)
+            if name == 'gpu_attention_packed_register':
+                encoded['direct_encoded'] = 4
             if 'classified_partitions' in encoded:
                 encoded['classified_partitions'] = 64
             for mode in ('missing', 'prefill-only', 'one-formal-only', 'failure', 'encoded'):
@@ -552,7 +560,10 @@ class BenchReproduceTests(unittest.TestCase):
                     args.env = [flag + '=' + enabled_value]
                     if name=='gpu_topk_nan_shuffle':
                         args.env+=['MYDS_INDEXER_TOPK_NAN_FUSE=1','MYDS_INDEXER_TOPK_PREFIX_MERGE=1']
-                    options = {'gpu_indexer_head_slots': 'require_indexer_head_slots',
+                    options = {'gpu_moe_q2_v41': 'require_moe_q2_v41',
+                               'gpu_attention_packed_register': 'require_attention_packed_register',
+                               'gpu_route_simd_shuffle': 'require_route_simd_shuffle',
+                               'gpu_indexer_head_slots': 'require_indexer_head_slots',
                                'gpu_topk_nan_shuffle':'require_topk_nan_shuffle',
                                'gpu_topk_nan_fuse': 'require_topk_nan_fuse',
                                'gpu_batch2_q8_shared': 'require_batch2_q8_shared',
@@ -572,6 +583,12 @@ class BenchReproduceTests(unittest.TestCase):
                                        decode_requests=8 * (args.max_new_tokens - 1),
                                        decode_encoded=8 * (args.max_new_tokens - 1))
                     records = self.v2_records(environment=env)
+                    if name in ('gpu_route_simd_shuffle', 'gpu_attention_packed_register', 'gpu_moe_q2_v41'):
+                        encoded.update(requests=40 * args.max_new_tokens, encoded=40 * args.max_new_tokens,
+                                       decode_requests=40 * (args.max_new_tokens - 1),
+                                       decode_encoded=40 * (args.max_new_tokens - 1))
+                        if name == 'gpu_attention_packed_register':
+                            encoded['direct_encoded'] = encoded['encoded']
                     if name == 'gpu_batch2_q8_shared':
                         for sample in records:
                             if sample['kind'] == 'sample':
@@ -589,6 +606,8 @@ class BenchReproduceTests(unittest.TestCase):
                             counters = dict.fromkeys(keys, 0)
                         elif mode == 'failure':
                             counters.update(encoded=0, decode_encoded=0)
+                            if name == 'gpu_attention_packed_register':
+                                counters['direct_encoded'] = 0
                             counters[failure], counters['decode_' + failure] = 4, 2
                         sample[name] = counters
                     if mode == 'encoded':
@@ -602,6 +621,37 @@ class BenchReproduceTests(unittest.TestCase):
                         state = json.loads((args.out / 'run-state.json').read_text())
                         self.assertEqual(state['status'], 'failed')
                         self.assertTrue((args.out / 'run-metrics.jsonl').is_file())
+
+    def test_full_layer_candidates_reject_partial_decode_and_wrong_getter(self):
+        paths = (
+            ('gpu_route_simd_shuffle', 'MYDS_ROUTE_SIMD_SHUFFLE', 'route_simd_shuffle_mode', 'require_route_simd_shuffle'),
+            ('gpu_attention_packed_register', 'MYDS_ATTN_PACKED_REGISTER', 'attention_packed_register_mode', 'require_attention_packed_register'),
+            ('gpu_moe_q2_v41', 'MYDS_MOE_Q2_V41', 'moe_q2_v41_mode', 'require_moe_q2_v41'),
+        )
+        for name, flag, getter, option in paths:
+            for fault in ('partial', 'wrong-getter'):
+                with self.subTest(path=name, fault=fault):
+                    args = self.run_args()
+                    args.env = [flag + '=1']
+                    setattr(args, option, True)
+                    args.out = self.directory / (name + '-coverage-' + fault)
+                    records = self.v2_records(environment=dict(self.driver.DEFAULT_ENV, **{flag: '1'}))
+                    if fault == 'wrong-getter':
+                        next(r for r in records if r['kind'] == 'load')[getter] = 0
+                    for sample in records:
+                        if sample['kind'] != 'sample':
+                            continue
+                        keys = self.driver.CANDIDATE_PATHS[name][2]
+                        counters = dict.fromkeys(keys, 0)
+                        total = 1 if fault == 'partial' else 40 * sample['output_tokens']
+                        decode = 1 if fault == 'partial' else 40 * sample['decode_intervals']
+                        counters.update(requests=total, encoded=total, decode_requests=decode, decode_encoded=decode)
+                        if name == 'gpu_attention_packed_register':
+                            counters['direct_encoded'] = total
+                        sample[name] = counters
+                    with self.assertRaisesRegex(ValueError, '[Cc]andidate'):
+                        self.invoke_cpu_runner(args, records)
+                    self.assertEqual(json.loads((args.out / 'run-state.json').read_text())['status'], 'failed')
 
     def test_shared_helper_success_cannot_mask_failed_batch2_graph(self):
         for field, value in (('batch2_calls', 0), ('batch2_hits', 0),

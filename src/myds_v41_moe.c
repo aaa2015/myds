@@ -6,6 +6,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <stdatomic.h>
+#include <string.h>
 
 /* 必须与 metal/myds_v41_moe.metal 的 myds_v41_route_args 逐字段一致 */
 struct route_args { uint32_t count, top_k, op; float scale; uint32_t rows, row, row4; };
@@ -47,6 +48,25 @@ static inline int get_route_fuse_level(void) {
     return atoi(v); /* >= 2: 全融合 */
 }
 
+static _Atomic uint64_t route_shuffle_requests, route_shuffle_encoded, route_shuffle_failures;
+int myds_v41_route_simd_shuffle_mode(void) {
+    const char *v = getenv("MYDS_ROUTE_SIMD_SHUFFLE");
+    if (!v || !strcmp(v, "0")) return 0;
+    if (!strcmp(v, "1")) return 1;
+    MYDS_LOG_E("MYDS_ROUTE_SIMD_SHUFFLE must be exactly 0 or 1");
+    return -1;
+}
+void myds_v41_route_simd_shuffle_counters(
+    myds_v41_route_simd_shuffle_counters_t *out, bool reset) {
+#define ROUTE_SHUFFLE_COUNT(field) (reset ? atomic_exchange_explicit(&route_shuffle_##field, 0, memory_order_relaxed) \
+                                        : atomic_load_explicit(&route_shuffle_##field, memory_order_relaxed))
+    const myds_v41_route_simd_shuffle_counters_t value = {
+        .requests = ROUTE_SHUFFLE_COUNT(requests), .encoded = ROUTE_SHUFFLE_COUNT(encoded),
+        .failures = ROUTE_SHUFFLE_COUNT(failures)};
+    if (out) *out = value;
+#undef ROUTE_SHUFFLE_COUNT
+}
+
 int myds_v41_route_batch(myds_metal_buffer_t *selected, myds_metal_buffer_t *weights,
     myds_metal_buffer_t *probs, myds_metal_buffer_t *scores,
     const myds_metal_buffer_t *logits, const myds_metal_buffer_t *bias,
@@ -57,6 +77,25 @@ int myds_v41_route_batch(myds_metal_buffer_t *selected, myds_metal_buffer_t *wei
         !sized(logits, (size_t)experts * rows) || !sized(bias, experts)) return 0;
     const uint64_t total = (uint64_t)experts * (uint64_t)rows;
     struct route_args args = {(uint32_t)total, top_k, 0, scale, rows, experts, experts / 4u};
+
+    const int shuffle_mode = myds_v41_route_simd_shuffle_mode();
+    if (shuffle_mode < 0) return 0;
+    if (shuffle_mode == 1) {
+        atomic_fetch_add_explicit(&route_shuffle_requests, 1, memory_order_relaxed);
+        const myds_metal_buffer_t *fused_bufs[] = {logits, bias, probs, scores, selected, weights};
+        const size_t shmem_bytes = 512 * sizeof(int32_t) + 512 * sizeof(float) +
+                                   experts * sizeof(float) + 32 * sizeof(float);
+        if (!dispatch("kernel_myds_v41_route_simd_shuffle", &args, sizeof(args), fused_bufs, 6,
+                      rows, 512, shmem_bytes)) {
+            atomic_fetch_add_explicit(&route_shuffle_failures, 1, memory_order_relaxed);
+            MYDS_LOG_E("V4.1 SIMD shuffle route dispatch failed; refusing fallback");
+            return 0;
+        }
+        atomic_fetch_add_explicit(&route_shuffle_encoded, 1, memory_order_relaxed);
+        const myds_metal_buffer_t *out_bufs[] = {selected, weights};
+        myds_metal_barrier_buffers(out_bufs, 2);
+        return 1;
+    }
 
     const int fuse_level = get_route_fuse_level();
     if (fuse_level >= 2) {

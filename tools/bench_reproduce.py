@@ -50,6 +50,13 @@ TOPK_THRESHOLD_FIELDS = ('requests', 'encoded', 'errors', 'validated', 'adopted'
                          'nan', 'inf', 'insufficient', 'capacity', 'certificate', 'tie')
 TOPK_THRESHOLD_COUNTERS = TOPK_THRESHOLD_FIELDS + tuple('decode_' + k for k in TOPK_THRESHOLD_FIELDS)
 CANDIDATE_PATHS = {
+    'gpu_moe_q2_v41': ('MYDS_MOE_Q2_V41', 'failures',
+        ('requests', 'encoded', 'failures', 'decode_requests', 'decode_encoded', 'decode_failures')),
+    'gpu_attention_packed_register': ('MYDS_ATTN_PACKED_REGISTER', 'failures',
+        ('requests', 'encoded', 'failures', 'decode_requests', 'decode_encoded', 'decode_failures',
+         'direct_encoded', 'staged_encoded')),
+    'gpu_route_simd_shuffle': ('MYDS_ROUTE_SIMD_SHUFFLE', 'failures',
+        ('requests', 'encoded', 'failures', 'decode_requests', 'decode_encoded', 'decode_failures')),
     'gpu_f16_gemv_bf16_fuse': ('MYDS_F16_GEMV_BF16_FUSE', 'failures',
         ('requests', 'encoded', 'failures', 'decode_requests', 'decode_encoded', 'decode_failures')),
     'gpu_indexer_rope_quant_fuse': ('MYDS_INDEXER_ROPE_QUANT_FUSE', 'failures',
@@ -272,6 +279,19 @@ def validate_run(directory, state, audit):
                     actual==int(state['environment'].get(flag)=='1'), 'Actual candidate getter differs: '+mode)
                 if actual==1:
                     audit.require(loaded.get('native_v41') is True,'Candidate requires native V4.1')
+        for mode, flag in (('route_simd_shuffle_mode', 'MYDS_ROUTE_SIMD_SHUFFLE'),
+                           ('attention_packed_register_mode', 'MYDS_ATTN_PACKED_REGISTER'),
+                           ('moe_q2_v41_mode', 'MYDS_MOE_Q2_V41')):
+            if state['environment'].get(flag) == '1' or mode in loaded:
+                actual = loaded.get(mode)
+                audit.require(type(actual) is int and actual in (0, 1) and
+                              actual == int(state['environment'].get(flag) == '1'),
+                              'Actual candidate getter differs: ' + mode)
+            if state['environment'].get(flag) == '1':
+                audit.require(loaded.get('native_v41') is True and loaded.get('layers') == 40,
+                              'Full decode candidate requires the native 40-layer V4.1 model')
+        for sample in samples:
+            sample['candidate_layer_count'] = loaded.get('layers')
         if state['environment'].get('MYDS_F16_GEMV_BF16_FUSE') is not None or 'f16_gemv_bf16_fuse_mode' in loaded:
             actual = loaded.get('f16_gemv_bf16_fuse_mode')
             audit.require(type(actual) is int and actual in (0, 1) and
@@ -594,7 +614,7 @@ def validate_candidate_paths(samples, environment, audit):
         if name == 'gpu_lm_head_q8':
             audit.require(environment.get(flag) in (None, '2', '4'),
                           'Invalid LM head row cohort: ' + str(environment.get(flag)))
-        if name in ('gpu_dspark_capture','gpu_topk_nan_shuffle','gpu_topk_threshold', 'gpu_indexer_head_slots', 'gpu_engram_project_round', 'gpu_moe_q2_sum_cache', 'gpu_moe_q2_sum_cache_fused', 'gpu_f16_gemv_bf16_fuse', 'gpu_indexer_rope_quant_fuse'):
+        if name in ('gpu_moe_q2_v41','gpu_attention_packed_register','gpu_route_simd_shuffle','gpu_dspark_capture','gpu_topk_nan_shuffle','gpu_topk_threshold', 'gpu_indexer_head_slots', 'gpu_engram_project_round', 'gpu_moe_q2_sum_cache', 'gpu_moe_q2_sum_cache_fused', 'gpu_f16_gemv_bf16_fuse', 'gpu_indexer_rope_quant_fuse'):
             audit.require(environment.get(flag) in (None, '0', '1'),
                           'Invalid candidate 0/1 cohort: ' + str(environment.get(flag)))
         for sample in samples:
@@ -616,6 +636,13 @@ def validate_candidate_paths(samples, environment, audit):
                           counters['decode_encoded'] <= counters['decode_requests'] and
                           counters['decode_' + failure] <= counters['decode_requests'],
                           'Candidate result exceeds requests: ' + name)
+            if name == 'gpu_attention_packed_register':
+                audit.require(counters['direct_encoded'] + counters['staged_encoded'] == counters['encoded'],
+                              'Invalid candidate path attention register direct/staged accounting')
+            if name == 'gpu_route_simd_shuffle':
+                audit.require(counters['encoded'] + counters['failures'] == counters['requests'] and
+                              counters['decode_encoded'] + counters['decode_failures'] == counters['decode_requests'],
+                              'Invalid candidate path route shuffle encoding/failure counts differ from requests')
             if failure == 'unavailable':
                 audit.require(counters['encoded'] + counters[failure] == counters['requests'] and
                               counters['decode_encoded'] + counters['decode_' + failure] == counters['decode_requests'],
@@ -723,6 +750,17 @@ def require_candidate_path(samples, name):
                          c['decode_requests'] <= 0 or c['decode_encoded'] != c['decode_requests'] or
                          c['decode_' + failure] for c in formal):
         raise ValueError('Required candidate path did not encode every formal decode request: ' + name)
+    if name in ('gpu_route_simd_shuffle', 'gpu_attention_packed_register', 'gpu_moe_q2_v41'):
+        for sample in (s for s in samples if not s['warmup']):
+            c = sample[name]
+            t = sample.get('decode_telemetry', {})
+            if (sample.get('candidate_layer_count') != 40 or
+                    c['decode_requests'] != 40 * sample['decode_intervals'] or
+                    t.get('target_forward_calls') != sample['output_tokens'] or
+                    t.get('target_rows') != sample['output_tokens'] or
+                    any(t.get(k) != 0 for k in ('batch2_calls', 'batch2_failures', 'batch2_fallbacks',
+                                              'draft_cycles', 'draft_proposed', 'pld_queries', 'pld_cycles'))):
+                raise ValueError('Required candidate path did not cover all 40 layers of ordinary decode: ' + name)
     if name == 'gpu_topk_threshold':
         for sample in (s for s in samples if not s['warmup']):
             c = sample[name]
@@ -923,6 +961,18 @@ def run(args):
     validate_capture_modes(explicit_env)
     validate_indexer_rope_quant_mode(explicit_env)
     validate_f16_fuse_mode(explicit_env)
+    if explicit_env.get('MYDS_ROUTE_SIMD_SHUFFLE') not in (None, '0', '1'):
+        raise ValueError('Invalid candidate 0/1 cohort: MYDS_ROUTE_SIMD_SHUFFLE')
+    if explicit_env.get('MYDS_ATTN_PACKED_REGISTER') not in (None, '0', '1'):
+        raise ValueError('Invalid attention register 0/1 cohort')
+    if explicit_env.get('MYDS_MOE_Q2_V41') not in (None, '0', '1'):
+        raise ValueError('Invalid Q2 V4.1 0/1 cohort')
+    if getattr(args, 'require_moe_q2_v41', False) and explicit_env.get('MYDS_MOE_Q2_V41') != '1':
+        raise ValueError('Required Q2 V4.1 path needs explicit flag1')
+    if getattr(args, 'require_attention_packed_register', False) and explicit_env.get('MYDS_ATTN_PACKED_REGISTER') != '1':
+        raise ValueError('Required attention register path needs explicit flag1')
+    if getattr(args, 'require_route_simd_shuffle', False) and explicit_env.get('MYDS_ROUTE_SIMD_SHUFFLE') != '1':
+        raise ValueError('Required route SIMD shuffle path needs explicit flag1')
     if getattr(args, "require_f16_gemv_bf16_fuse", False) and (
             explicit_env.get("MYDS_F16_GEMV_BF16_FUSE") != "1" or
             any(explicit_env.get(k) != "0" for k in ("MYDS_PLD", "MYDS_BATCH2_SPEC", "MYDS_SPEC_SERIAL_PROBE"))):
@@ -1006,7 +1056,10 @@ def run(args):
                                  counters['decode_encoded'] != counters['decode_requests'] or
                                  counters['decode_unavailable'] for counters in formal):
                 raise ValueError('Required topk prefix path did not encode every formal decode request')
-        for option, name in (('require_topk_threshold', 'gpu_topk_threshold'),
+        for option, name in (('require_moe_q2_v41', 'gpu_moe_q2_v41'),
+                             ('require_attention_packed_register', 'gpu_attention_packed_register'),
+                             ('require_route_simd_shuffle', 'gpu_route_simd_shuffle'),
+                             ('require_topk_threshold', 'gpu_topk_threshold'),
                              ('require_topk_nan_shuffle','gpu_topk_nan_shuffle'),
                              ('require_dspark_capture_bypass','gpu_dspark_capture'),
                              ('require_indexer_head_slots', 'gpu_indexer_head_slots'),
@@ -1072,6 +1125,12 @@ def main():
     measurement.add_argument('--out', type=Path, required=True, help='New output directory; existing directories are refused')
     measurement.add_argument('--require-topk-prefix', action='store_true',
                              help='Require all formal runs to encode every eligible decode prefix request without fallback')
+    measurement.add_argument('--require-route-simd-shuffle', action='store_true',
+                             help='Require actual router SIMD shuffle encoding in every formal decode, with no failures')
+    measurement.add_argument('--require-attention-packed-register', action='store_true',
+                             help='Require actual packed attention register encoding in every formal decode, with no failures')
+    measurement.add_argument('--require-moe-q2-v41', action='store_true',
+                             help='Require actual specialized Q2 down encoding in every formal decode, with no failures')
     measurement.add_argument('--require-topk-nan-shuffle',action='store_true',
                              help='Require actual shuffle encoding in every eligible formal decode request')
     measurement.add_argument('--require-dspark-capture-bypass',action='store_true',
