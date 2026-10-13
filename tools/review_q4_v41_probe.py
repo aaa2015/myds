@@ -11,6 +11,10 @@ import struct
 SHAPES={"head":(129280,5120,"f32"),"qb":(32768,1280,"bf16"),"ob":(5120,8192,"bf16")}
 ARGS=struct.Struct("<iii4xQQQQiii4xQQQQiiihh")
 assert ARGS.size==112
+def native_sample_finite(value):
+    # @(isfinite(us) && us > 0) boxes a C int on the measured ObjC ABI.
+    # Accept exactly JSON true or integer 1, not truthy strings/floats/2.
+    return value is True or (type(value) is int and value==1)
 def digest(path):
     h=hashlib.sha256()
     with path.open("rb") as f:
@@ -70,7 +74,7 @@ def audit(raw,stdout):
     for r in records:
         if r.get("kind")=="parity":
             key=(r["seed"],r["slot"],r["pso"]);assert key in expected_parity and key not in seen;seen.add(key)
-            assert r["finite"] and r["guards"] and r["full_output_same"] and r["production_golden"]==(key[2]==0)
+            assert r["finite"] and r["guards"] and r["full_output_same"] and r["poison_free"] is True and r["production_golden"]==(key[2]==0)
             assert r["sha256"]==hashlib.sha256(output(f"seed{key[0]}-slot{key[1]}-k{key[2]}-output.guarded")).hexdigest()
     assert seen==expected_parity
     timings={}
@@ -87,7 +91,8 @@ def audit(raw,stdout):
         if r.get("kind")!="timing":continue
         key=(r["candidate"],r["scheme"],r["arm"],r["sample"]);assert key in expected_timing and key not in timings
         assert r["warmup"]==(r["sample"]==0)
-        assert all(r[k] is True for k in ("full_output_same","guards","finite","sample_finite"))
+        assert all(r[k] is True for k in ("full_output_same","guards","finite","poison_free"))
+        assert native_sample_finite(r["sample_finite"])
         assert r["pso"]==(r["candidate"] if r["arm"]=="B" else 0) and r["production_control"]==(r["arm"]!="B")
         active=1 if r["scheme"]=="hot" else rotations
         assert r["dispatches"]==active*reps
