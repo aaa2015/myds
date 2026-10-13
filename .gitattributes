@@ -46,3 +46,11 @@ docs/verification/2026-10-12-gemini-decode-reacceptance/**/*.log -whitespace
 docs/verification/2026-10-12-gemini-decode-reacceptance/local/f1f2-host/module-before.c -whitespace
 docs/verification/2026-10-12-gemini-decode-reacceptance/local/f1f2-host/module-current.c -whitespace
 docs/verification/2026-10-12-gemini-decode-reacceptance/mac/r1/test_batch2_parity.jsonl -whitespace
+
+# Preserve captured wire bytes and the tested replay-source identities.
+docs/benchmarks/2026-10-14-decode-next/real/** -text
+docs/benchmarks/2026-10-14-decode-next/real/http-*/content.utf8 -whitespace
+docs/benchmarks/2026-10-14-decode-next/real/http-*/response.body -whitespace
+docs/benchmarks/2026-10-14-decode-next/replay/reconstruct_q4_weights.py whitespace=trailing-space,space-before-tab,-blank-at-eof
+docs/benchmarks/2026-10-14-decode-next/replay/test_q4_v41_reader_focused.py whitespace=trailing-space,space-before-tab,-blank-at-eof
+docs/benchmarks/2026-10-14-decode-next/replay/test_reconstruct_q4_weights.py whitespace=trailing-space,space-before-tab,-blank-at-eof
