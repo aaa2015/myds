@@ -22,9 +22,15 @@ typedef struct {
 int myds_metal_moe_down_overlap_enabled(void);
 int myds_metal_moe_iq2_v41_enabled(void);
 int myds_metal_dense_q4_v41_enabled(void);
+/* Ordinary scalar provider ablations; both require Dense Q4 V41. */
+int myds_metal_dense_q4_v41_nb_enabled(void);
+int myds_metal_dense_q4_v41_head_reference_enabled(void);
+const char *myds_metal_dense_q4_v41_selected_kernel(unsigned shape);
 void myds_metal_moe_down_overlap_counters(myds_metal_decode_candidate_counters_t *out, bool reset);
 void myds_metal_moe_iq2_v41_counters(myds_metal_decode_candidate_counters_t *out, bool reset);
 void myds_metal_dense_q4_v41_counters(myds_metal_decode_candidate_counters_t *out, bool reset);
+void myds_metal_dense_q4_v41_nb_counters(myds_metal_decode_candidate_counters_t *out, bool reset);
+void myds_metal_dense_q4_v41_head_reference_counters(myds_metal_decode_candidate_counters_t *out, bool reset);
 /* Diagnostic metadata only, no dispatch/encoder/wait. The path is the actual
  * verified precompiled library (NULL for runtime source compilation). The
  * span is the last completed CB, not a token or an entire split request. */
@@ -166,6 +172,11 @@ int myds_metal_dispatch_kernel(const char *name, const void *args, size_t args_s
     const uint32_t groups[3], const uint32_t threads[3], size_t threadgroup_memory);
 typedef struct { uint32_t index; bool is_bool; int32_t value; } myds_metal_constant_t;
 uint32_t myds_metal_kernel_max_threads(const char *name);
+/* Resolves the same specialized PSO as dispatch, validating SIMD32 geometry
+ * and scratch without creating a CB/encoder, dispatching, barriering or waiting. */
+int myds_metal_kernel_constants_preflight(const char *name, const uint32_t threads[3],
+    size_t threadgroup_memory, const myds_metal_constant_t *constants, size_t n_constants);
+
 /* Independent initialization-time partition-NaN shuffle experiment. Only
  * absent/0/1 are accepted. Preflight preserves the reference partition size
  * and validates both sort and merge before the caller writes any scratch. */
@@ -178,6 +189,8 @@ int myds_metal_indexer_topk_threshold_prepare(void);
 myds_metal_buffer_t *myds_metal_indexer_topk_threshold_stats_buffer(void);
 int myds_metal_indexer_topk_threshold_stats(uint32_t words[9],bool reset);
 int myds_metal_buffer_native_valid(const myds_metal_buffer_t *buffer);
+/* Full native binding/CPU pointer/range agreement for scoped candidates. */
+int myds_metal_buffer_native_range(const myds_metal_buffer_t *buffer, uint64_t bytes, size_t alignment);
 int myds_metal_dispatch_kernel_constants(const char *name, const void *args, size_t args_size,
     const myds_metal_buffer_t *const *buffers, size_t n_buffers,
     const uint32_t groups[3], const uint32_t threads[3], size_t threadgroup_memory,
@@ -219,6 +232,25 @@ int myds_metal_v41_hc_mix(myds_metal_buffer_t *split,
     ggml_type fn_type, const myds_metal_buffer_t *scale,
     const myds_metal_buffer_t *base, myds_metal_buffer_t *flat_norm,
     myds_metal_buffer_t *mix, uint32_t dim, float eps, float hc_eps);
+/* Fixed V4.1 HC-mix stages for the ordinary 101 MoE scheduler only. The
+ * caller owns input RAW/WAR joins and the final split consumer join. They
+ * require an active concurrent batch, auto-barrier0, KPROF0 and DIM5120;
+ * preflight checks all ranges/aliases and the three original PSOs before
+ * any dispatch. Norm/GEMV/split use the original 1024/256/1 thread geometry.
+ * The complete hc_mix API above retains its original standalone contract. */
+int myds_metal_batch_active(void);
+int myds_metal_v41_hc_mix_stages_preflight(myds_metal_buffer_t *split,
+    const myds_metal_buffer_t *residual, const myds_metal_buffer_t *fn,
+    const myds_metal_buffer_t *scale, const myds_metal_buffer_t *base,
+    myds_metal_buffer_t *flat_norm, myds_metal_buffer_t *mix,
+    uint32_t dim, float eps, float hc_eps);
+int myds_metal_v41_hc_mix_norm_stage(myds_metal_buffer_t *flat_norm,
+    const myds_metal_buffer_t *residual, uint32_t dim, float eps);
+int myds_metal_v41_hc_mix_project_stage(myds_metal_buffer_t *mix,
+    const myds_metal_buffer_t *fn, const myds_metal_buffer_t *flat_norm, uint32_t dim);
+int myds_metal_v41_hc_mix_split_stage(myds_metal_buffer_t *split,
+    const myds_metal_buffer_t *mix, const myds_metal_buffer_t *scale,
+    const myds_metal_buffer_t *base, uint32_t dim, float hc_eps);
 int myds_metal_v41_hc_mix_batch2(
     myds_metal_buffer_t *split_b2,
     myds_metal_buffer_t *split[2],

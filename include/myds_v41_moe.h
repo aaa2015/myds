@@ -23,6 +23,18 @@ typedef struct { uint64_t requests, encoded, failures; }
     myds_v41_route_simd_shuffle_counters_t;
 void myds_v41_route_simd_shuffle_counters(
     myds_v41_route_simd_shuffle_counters_t *out, bool reset);
+/* MYDS_MOE_HC_OVERLAP: absent/0 -> 0, 1 -> 1, otherwise -1. Parse at
+ * context creation, then use the cached getter on the hot path. A later
+ * context creation reparses; reset_mode is for module host fixtures (the
+ * Metal-only runtime does not depend on this C module). Explicit ordinary
+ * nontrace calls outside fixed101 active batches fail before dispatch.
+ * Nonordinary/trace origins preserve their original helper. Encoded
+ * counts a successful original HC split-stage dispatch, not GPU completion;
+ * a later layer failure also increments failures and terminates the layer. */
+int myds_v41_moe_hc_overlap_enabled(void);
+int myds_v41_moe_hc_overlap_parse_mode(void);
+void myds_v41_moe_hc_overlap_reset_mode(void);
+void myds_v41_moe_hc_overlap_counters(myds_metal_decode_candidate_counters_t *out, bool reset);
 int myds_v41_shared_swiglu(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *gate, const myds_metal_buffer_t *up,
     uint32_t width, float clamp);

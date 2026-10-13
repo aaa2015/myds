@@ -2536,7 +2536,7 @@ void myds_v41_engram_project_round_counters(
 
 myds_v41_context_t *myds_v41_context_create(myds_context_t *ctx) {
     const int round_skip = engram_round_parse_mode();
-    if (round_skip < 0) return NULL;
+    if (round_skip < 0 || myds_v41_moe_hc_overlap_parse_mode()<0) return NULL;
     if (!ctx || !ctx->model->v41 || !ctx->cfg.max_seq_len || ctx->cfg.max_seq_len>1048576u)
         return NULL;
     /* Basic buffers are allocated by the shared context constructor. */
@@ -3805,22 +3805,28 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
             const char *env = getenv("MYDS_ATTN_DIRECT_PACK");
             attn_direct_enabled = (env == NULL || atoi(env) != 0);
         }
+        bool attention_rope_consumed=false;
         if (attn_direct_enabled) {
-            CHECK(myds_v41_gpu_attention_direct(ctx->attn_heads,base->attn_sinks,ctx->q,
+            CHECK(myds_v41_gpu_attention_direct_rope_fuse(ctx->attn_heads,base->attn_sinks,ctx->q,
                                                 g->window[il],nraw,(pos+1u-nraw)%128,
                                                 count ? g->compressed[owner_for(il)] : NULL,
                                                 count ? g->selected : NULL,
-                                                count,top,g->gpu));
+                                                count,top,g->gpu,pos,compressed,
+                                                ordinary_decode_allowed && need_logits,trace_on,&attention_rope_consumed));
         } else {
             if (count) CHECK(myds_v41_gpu_gather_bf16(g->selected_kv,g->compressed[owner_for(il)],g->selected,count,top));
-            CHECK(myds_v41_gpu_attention(ctx->attn_heads,base->attn_sinks,ctx->q,g->window[il],nraw,(pos+1u-nraw)%128,g->selected_kv,top,g->gpu));
+            CHECK(myds_v41_gpu_attention_rope_fuse(ctx->attn_heads,base->attn_sinks,ctx->q,g->window[il],nraw,
+                (pos+1u-nraw)%128,g->selected_kv,top,g->gpu,pos,compressed,
+                ordinary_decode_allowed && need_logits,trace_on,&attention_rope_consumed));
         }
         if (fine_pipeline) {
             myds_metal_barrier_buffer(ctx->attn_heads);
         }
-        CHECK(myds_v41_gpu_rope_round(ctx->attn_heads,512,V41_HEADS,pos,compressed,true));
-        if (fine_pipeline) {
-            myds_metal_barrier_buffer(ctx->attn_heads);
+        if (!attention_rope_consumed) {
+            CHECK(myds_v41_gpu_rope_round(ctx->attn_heads,512,V41_HEADS,pos,compressed,true));
+            if (fine_pipeline) {
+                myds_metal_barrier_buffer(ctx->attn_heads);
+            }
         }
         CHECK(myds_metal_attn_output_a_bf16(ctx->attn_low,base->attn_output_a,ctx->attn_heads,8,4096,1024,base->attn_output_a_type));
         if (fine_pipeline) {

@@ -287,6 +287,27 @@ typedef struct {
  * caller snapshots, rather than inferring Engine purpose from this low API. */
 void myds_v41_gpu_attention_packed_register_counters(
     myds_v41_gpu_attention_packed_register_counters_t *out,bool reset);
+/* Ordinary single-query reducer -> inverse rope_round fusion. Default off;
+ * strict MYDS_ATTN_ROPE_FUSE=1 requires packed-register1/physical8/reduce1.
+ * Explicit failure never retries the original. Generic APIs below stay intact.
+ * The scoped APIs always initialize *rope_consumed=false; true means the heads
+ * already satisfy the complete inverse RoPE/BF16 contract. Caller must retain
+ * the heads -> OutputA RAW join and skip only its separate rope_round dispatch.
+ * Requests include predispatch failures; encoded counts the actual fused PSO,
+ * even if standalone command completion subsequently fails. */
+#define MYDS_V41_GPU_HAS_ATTN_ROPE_FUSE 1
+int myds_v41_attention_rope_fuse_enabled(void);
+void myds_v41_attention_rope_fuse_counters(myds_metal_decode_candidate_counters_t *out,bool reset);
+int myds_v41_gpu_attention_rope_fuse(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *window,uint32_t n_raw,
+    uint32_t raw_start,const myds_metal_buffer_t *selected_kv,uint32_t selected_rows,
+    myds_v41_gpu_scratch_t *scratch,uint32_t pos,bool compressed,
+    bool ordinary_allowed,bool trace_on,bool *rope_consumed);
+int myds_v41_gpu_attention_direct_rope_fuse(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *window,uint32_t n_raw,
+    uint32_t raw_start,const myds_metal_buffer_t *comp_kv,const myds_metal_buffer_t *selected_ids,
+    uint32_t source_rows,uint32_t selected_rows,myds_v41_gpu_scratch_t *scratch,
+    uint32_t pos,bool compressed,bool ordinary_allowed,bool trace_on,bool *rope_consumed);
 int myds_v41_gpu_attention(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *window,uint32_t n_raw,
     uint32_t raw_start,const myds_metal_buffer_t *selected_kv,uint32_t selected_rows,

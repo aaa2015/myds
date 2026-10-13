@@ -161,8 +161,18 @@ class PrepareTests(unittest.TestCase):
         counts = {key: original.count(anchor) for key, anchor in (
             ('created', '[g_queue commandBuffer]'), ('commit', '[cb commit];'),
             ('wait', '[cb waitUntilCompleted];'))}
+        unretained = original.count('[g_queue commandBufferWithUnretainedReferences]')
+        counts['created'] += unretained
         manifest = prepare.prepare(self.tree)
         self.assertEqual(manifest['operation_sites'], counts)
+        self.assertEqual(manifest['unretained_creation_sites'], unretained)
+        metal = (self.tree / 'src/myds_metal.m').read_text()
+        self.assertEqual(metal.count('rp_created([g_queue commandBufferWithUnretainedReferences])'), unretained)
+        forward = (self.tree / 'src/myds_v41.c').read_text()
+        begin = forward.index('static int32_t v41_forward_impl(')
+        end = forward.index('\nint32_t myds_v41_forward(', begin)
+        self.assertIn('myds_remaining_context(need_logits', forward[begin:end])
+        self.assertNotIn('myds_remaining_context(', forward[end:])
         for key in ('added_gpu_dispatches', 'added_gpu_barriers', 'added_encoder_boundaries',
                     'added_gpu_commits', 'added_gpu_waits'):
             self.assertEqual(manifest[key], 0)
@@ -174,6 +184,34 @@ class PrepareTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             prepare.prepare(self.tree)
         self.assertEqual(after, {name: (self.tree / name).read_bytes() for name in prepare.FILES})
+
+    def test_whitespace_only_declaration_drift_is_accepted(self):
+        path = self.tree / 'src/myds_metal.m'
+        original = path.read_text()
+        import re
+        changed, count = re.subn(r'^static[ \t]+int[ \t]+g_auto_barrier[ \t]*=[ \t]*1[ \t]*;[ \t]*$',
+                                'static\tint g_auto_barrier=1;', original, flags=re.MULTILINE)
+        self.assertEqual(count, 1)
+        path.write_text(changed)
+        prepare.prepare(self.tree)
+        self.assertIn('static\tint g_auto_barrier=1;\n#include "myds_decode_profile.inc"', path.read_text())
+
+    def test_changed_or_duplicate_declaration_rejects_before_mutation(self):
+        path = self.tree / 'src/myds_metal.m'
+        original = path.read_text()
+        import re
+        for fault in ('changed-initializer', 'duplicate'):
+            with self.subTest(fault=fault):
+                if fault == 'changed-initializer':
+                    changed = re.sub(r'(g_auto_barrier[ \t]*=[ \t]*)1;', r'\g<1>0;', original, count=1)
+                else:
+                    changed = original + '\nstatic int g_auto_barrier = 1;\n'
+                path.write_text(changed)
+                before = {name: (self.tree / name).read_bytes() for name in prepare.FILES}
+                with self.assertRaisesRegex(ValueError, 'g_auto_barrier declaration'):
+                    prepare.prepare(self.tree)
+                self.assertEqual(before, {name: (self.tree / name).read_bytes() for name in prepare.FILES})
+                self.assertFalse((self.tree / 'decode-diag-manifest.json').exists())
 
 
 class OwnershipTests(unittest.TestCase):

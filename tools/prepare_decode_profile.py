@@ -25,6 +25,14 @@ def replace(text, old, new, count=1):
     return text.replace(old, new)
 
 
+def replace_pattern(text, pattern, replacement, label):
+    """Allow formatting changes while still requiring one semantic anchor."""
+    matches = list(re.finditer(pattern, text, re.MULTILINE))
+    if len(matches) != 1:
+        raise ValueError(f'expected 1 {label} anchor, got {len(matches)}')
+    return re.sub(pattern, replacement, text, flags=re.MULTILINE)
+
+
 def prepare(tree):
     tree = tree.resolve()
     roots = (Path('/tmp').resolve(), Path(tempfile.gettempdir()).resolve())
@@ -40,13 +48,18 @@ def prepare(tree):
     counts = {name: m.count(anchor) for name, anchor in (
         ('created', '[g_queue commandBuffer]'), ('commit', '[cb commit];'),
         ('wait', '[cb waitUntilCompleted];'))}
+    unretained_created = m.count('[g_queue commandBufferWithUnretainedReferences]')
+    counts['created'] += unretained_created
     if not all(counts.values()):
         raise ValueError('missing existing CB operation anchors')
     m = m.replace('[g_queue commandBuffer]', 'rp_created([g_queue commandBuffer])')
+    m = m.replace('[g_queue commandBufferWithUnretainedReferences]',
+                  'rp_created([g_queue commandBufferWithUnretainedReferences])')
     m = m.replace('[cb commit];', 'rp_commit(cb);')
     m = m.replace('[cb waitUntilCompleted];', 'rp_wait(cb);')
-    m = replace(m, 'static int                          g_auto_barrier = 1;',
-                'static int                          g_auto_barrier = 1;\n#include "myds_decode_profile.inc"')
+    m = replace_pattern(m, r'^static[ \t]+int[ \t]+g_auto_barrier[ \t]*=[ \t]*1[ \t]*;[ \t]*$',
+                        lambda match: match.group(0) + '\n#include "myds_decode_profile.inc"',
+                        'g_auto_barrier declaration')
     m = replace(m, '    BOOL signaled = [g_shared_event waitUntilSignaledValue:val timeoutMS:60000];',
                 '    const double rp_event_start = myds_remaining_tick();\n'
                 '    BOOL signaled = [g_shared_event waitUntilSignaledValue:val timeoutMS:60000];\n'
@@ -72,8 +85,16 @@ def prepare(tree):
                 'int  myds_metal_init(const char *shader_dir);')
     changed['include/myds_metal.h'] = h
     c = changed['src/myds_v41.c']
-    begin = c.index('int32_t myds_v41_forward(')
-    end = c.index('\nint myds_v41_batch2_projection_probe(', begin)
+    implementation = 'static int32_t v41_forward_impl('
+    if c.count(implementation) == 1:
+        begin = c.index(implementation)
+        end = c.index('\nint32_t myds_v41_forward(', begin)
+    elif implementation in c:
+        raise ValueError('duplicate v41_forward_impl anchor')
+    else:
+        # Older source kept the scalar implementation in the public entry.
+        begin = c.index('int32_t myds_v41_forward(')
+        end = c.index('\nint myds_v41_batch2_projection_probe(', begin)
     f = c[begin:end]
     f = replace(f, '    CHECK(myds_engram_prepare_token(g->engram,token,pos));',
                 '    myds_remaining_context(need_logits ? "decode" : "prefill_scalar", pos, 0, 1, 0, 1);\n'
@@ -85,9 +106,10 @@ def prepare(tree):
                 '    myds_remaining_host("engram_copy", rp_host_start, 2u*MYDS_ENGRAM_INPUT_DIM*4u);\n'
                 '    rp_host_start = myds_remaining_tick();\n'
                 '    float *res=myds_metal_buffer_data(g->residual);')
-    f = replace(f, '    static int fuse_hc_norm_enabled = -1;',
-                '    myds_remaining_host("embedding_expand", rp_host_start, 4u*V41_DIM*4u);\n'
-                '    static int fuse_hc_norm_enabled = -1;')
+    f = replace_pattern(f,
+        r'^[ \t]+(?:static int fuse_hc_norm_enabled = -1;|const bool fuse_hc_norm_enabled = v41_fuse_hc_sum_rmsnorm_enabled\(\);)[ \t]*$',
+        lambda match: '    myds_remaining_host("embedding_expand", rp_host_start, 4u*V41_DIM*4u);\n' + match.group(0),
+        'scalar HC norm mode declaration')
     f, stages = re.subn(r'(?m)^(\s*)phase="([^"]+)";',
                        lambda x: x.group(0) + '\n' + x[1] +
                        f'myds_decode_diag_stage(pos, il, "{x[2]}");', f)
@@ -129,6 +151,7 @@ int32_t myds_sample_next_token(const float *logits, uint32_t vocab_size,
                 'input_sha256': {n: digest(v) for n, v in originals.items()},
                 'output_sha256': {n: digest(v) for n, v in outputs.items()},
                 'patch_sha256': digest(patch), 'operation_sites': counts,
+                'unretained_creation_sites': unretained_created,
                 'profile_env': 'MYDS_PROFILE_DECODE=cb', 'gpu_execution': False,
                 'added_gpu_dispatches': 0, 'added_gpu_barriers': 0,
                 'added_encoder_boundaries': 0, 'added_gpu_commits': 0, 'added_gpu_waits': 0}

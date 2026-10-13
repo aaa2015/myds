@@ -54,6 +54,10 @@ DECODE_SHAPE_CANDIDATES = {
     'gpu_moe_down_overlap': ('MYDS_MOE_DOWN_OVERLAP', 'moe_down_overlap_mode', 40, 'require_moe_down_overlap'),
     'gpu_moe_iq2_v41': ('MYDS_MOE_IQ2_V41', 'moe_iq2_v41_mode', 40, 'require_moe_iq2_v41'),
     'gpu_dense_q4_v41': ('MYDS_DENSE_Q4_V41', 'dense_q4_v41_mode', 81, 'require_dense_q4_v41'),
+    'gpu_dense_q4_v41_nb': ('MYDS_DENSE_Q4_V41_NB', 'dense_q4_v41_nb_mode', 80, 'require_dense_q4_v41_nb'),
+    'gpu_dense_q4_v41_head_reference': ('MYDS_DENSE_Q4_V41_HEAD_REFERENCE', 'dense_q4_v41_head_reference_mode', 1, 'require_dense_q4_v41_head_reference'),
+    'gpu_attention_rope_fuse': ('MYDS_ATTN_ROPE_FUSE', 'attention_rope_fuse_mode', 40, 'require_attention_rope_fuse'),
+    'gpu_moe_hc_overlap': ('MYDS_MOE_HC_OVERLAP', 'moe_hc_overlap_mode', 40, 'require_moe_hc_overlap'),
 }
 CANDIDATE_PATHS = {
     'gpu_moe_down_overlap': ('MYDS_MOE_DOWN_OVERLAP', 'failures',
@@ -96,6 +100,10 @@ CANDIDATE_PATHS = {
     'gpu_moe_q2_sum_cache_fused': ('MYDS_MOE_Q2_SUM_CACHE_FUSED', 'failures',
         ('requests', 'encoded', 'failures', 'decode_requests', 'decode_encoded', 'decode_failures')),
 }
+# Independent next-round ordinary-scalar candidates share the strict six-field contract.
+for _name, (_flag, _mode, _count, _option) in DECODE_SHAPE_CANDIDATES.items():
+    CANDIDATE_PATHS.setdefault(_name, (_flag, 'failures',
+        ('requests', 'encoded', 'failures', 'decode_requests', 'decode_encoded', 'decode_failures')))
 CANDIDATE_ENABLED_VALUES = {'gpu_lm_head_q8': '4'}
 FORBIDDEN_ENV_PREFIXES = ('MYDS_PROFILE_', 'MYDS_SKIP_', 'MYDS_TRACE_', 'MYDS_BATCH_TRACE_')
 FORBIDDEN_ENV_NAMES = {'MYDS_MOE_STEP_PROF', 'MYDS_PHASE_PROFILE_FILE', 'MYDS_DISABLE_V41_PREFILL',
@@ -1116,6 +1124,10 @@ def run(args):
         for option, name in (('require_moe_down_overlap', 'gpu_moe_down_overlap'),
                              ('require_moe_iq2_v41', 'gpu_moe_iq2_v41'),
                              ('require_dense_q4_v41', 'gpu_dense_q4_v41'),
+                             ('require_dense_q4_v41_nb', 'gpu_dense_q4_v41_nb'),
+                             ('require_dense_q4_v41_head_reference', 'gpu_dense_q4_v41_head_reference'),
+                             ('require_attention_rope_fuse', 'gpu_attention_rope_fuse'),
+                             ('require_moe_hc_overlap', 'gpu_moe_hc_overlap'),
                              ('require_moe_q2_v41', 'gpu_moe_q2_v41'),
                              ('require_attention_packed_register', 'gpu_attention_packed_register'),
                              ('require_route_simd_shuffle', 'gpu_route_simd_shuffle'),
@@ -1191,6 +1203,14 @@ def main():
                              help='Require the complete actual ordinary moe_iq2_v41 path in warmup and every formal target')
     measurement.add_argument('--require-dense-q4-v41', action='store_true',
                              help='Require the complete actual ordinary dense_q4_v41 path in warmup and every formal target')
+    measurement.add_argument('--require-dense-q4-v41-nb', action='store_true',
+        help='Require complete ordinary-target dense_q4_v41_nb adoption')
+    measurement.add_argument('--require-dense-q4-v41-head-reference', action='store_true',
+        help='Require complete ordinary-target dense_q4_v41_head_reference adoption')
+    measurement.add_argument('--require-attention-rope-fuse', action='store_true',
+        help='Require complete ordinary-target attention_rope_fuse adoption')
+    measurement.add_argument('--require-moe-hc-overlap', action='store_true',
+        help='Require complete ordinary-target moe_hc_overlap adoption')
     measurement.add_argument('--require-route-simd-shuffle', action='store_true',
                              help='Require actual router SIMD shuffle encoding in every formal decode, with no failures')
     measurement.add_argument('--require-attention-packed-register', action='store_true',

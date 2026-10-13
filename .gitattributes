@@ -56,3 +56,9 @@ docs/benchmarks/2026-10-14-decode-next/replay/test_q4_v41_reader_focused.py whit
 docs/benchmarks/2026-10-14-decode-next/replay/test_reconstruct_q4_weights.py whitespace=trailing-space,space-before-tab,-blank-at-eof
 # This startup snapshot is bound to the deployed file's exact SHA.
 docs/benchmarks/2026-10-14-decode-next/deployment/start_fleet-adopted.sh -text -whitespace
+
+# Round2 evidence preserves complete native and HTTP payload bytes.
+docs/benchmarks/2026-10-14-decode-round2/real/** -text
+docs/benchmarks/2026-10-14-decode-round2/real/http-*/content.utf8 -whitespace
+docs/benchmarks/2026-10-14-decode-round2/real/http-*/response.body -whitespace
+docs/benchmarks/2026-10-14-decode-round2/deployment/start_fleet-adopted.sh -text -whitespace

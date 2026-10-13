@@ -49,6 +49,26 @@ static inline int get_route_fuse_level(void) {
 }
 
 static _Atomic uint64_t route_shuffle_requests, route_shuffle_encoded, route_shuffle_failures;
+static _Atomic uint64_t hc_overlap_requests, hc_overlap_encoded, hc_overlap_failures;
+static _Atomic int hc_overlap_mode;
+int myds_v41_moe_hc_overlap_parse_mode(void) {
+    const char *v = getenv("MYDS_MOE_HC_OVERLAP");
+    const int mode=(!v || !strcmp(v,"0")) ? 0 : !strcmp(v,"1") ? 1 : -1;
+    if (mode<0) MYDS_LOG_E("MYDS_MOE_HC_OVERLAP must be exactly 0 or 1");
+    atomic_store_explicit(&hc_overlap_mode,mode,memory_order_relaxed);
+    return mode;
+}
+int myds_v41_moe_hc_overlap_enabled(void) { return atomic_load_explicit(&hc_overlap_mode,memory_order_relaxed); }
+void myds_v41_moe_hc_overlap_reset_mode(void) { atomic_store_explicit(&hc_overlap_mode,0,memory_order_relaxed); }
+void myds_v41_moe_hc_overlap_counters(myds_metal_decode_candidate_counters_t *out, bool reset) {
+#define HC_OVERLAP_COUNT(field) (reset ? atomic_exchange_explicit(&hc_overlap_##field, 0, memory_order_relaxed) \
+                                     : atomic_load_explicit(&hc_overlap_##field, memory_order_relaxed))
+    const myds_metal_decode_candidate_counters_t value = {
+        .requests=HC_OVERLAP_COUNT(requests), .encoded=HC_OVERLAP_COUNT(encoded),
+        .failures=HC_OVERLAP_COUNT(failures)};
+    if (out) *out=value;
+#undef HC_OVERLAP_COUNT
+}
 int myds_v41_route_simd_shuffle_mode(void) {
     const char *v = getenv("MYDS_ROUTE_SIMD_SHUFFLE");
     if (!v || !strcmp(v, "0")) return 0;
@@ -886,6 +906,98 @@ static inline bool is_moe_pipeline_enabled(void) {
     return cached == 1;
 }
 
+/* A separate ordinary101 schedule. It changes enqueue order and joins only;
+ * every HC/router/shared/routed/expand operation retains its production PSO,
+ * ABI, thread geometry and arithmetic. The caller has already joined the
+ * after_attn and FFN-normalized inputs and previous scratch consumers. */
+static bool hc_scratch_independent(myds_context_t *ctx, uint32_t layer,
+    myds_metal_buffer_t *residual, const myds_metal_buffer_t *after_attn,
+    myds_metal_buffer_t *ffn_split, const myds_metal_buffer_t *ffn_fn,
+    const myds_metal_buffer_t *ffn_scale, const myds_metal_buffer_t *ffn_base,
+    myds_metal_buffer_t *flat_norm, myds_metal_buffer_t *mix) {
+    const myds_layer_t *l=&ctx->model->layers[layer];
+    const myds_metal_buffer_t *write[]={flat_norm,mix,ffn_split};
+    const size_t write_bytes[]={81920u,96u,96u};
+    const myds_metal_buffer_t *other[]={residual,after_attn,ffn_fn,ffn_scale,ffn_base,
+        ctx->ffn_norm_out,ctx->router_logits,l->router_gate,l->router_bias,
+        ctx->shared_swiglu_out,l->shared_gate,l->shared_up,l->shared_down,ctx->shared_out,
+        l->ffn_gate_exps,l->ffn_up_exps,l->ffn_down_exps,ctx->selected_ids,ctx->selected_weights,
+        ctx->moe_gate,ctx->moe_up,ctx->moe_mid,ctx->moe_down,ctx->moe_out,ctx->ffn_out};
+    for (unsigned i=0;i<3u;++i) {
+        const uintptr_t a=(uintptr_t)myds_metal_buffer_data((myds_metal_buffer_t *)write[i]);
+        if (!a || write_bytes[i]>myds_metal_buffer_size(write[i]) || write_bytes[i]>UINTPTR_MAX-a) return false;
+        for (unsigned j=0;j<sizeof(other)/sizeof(*other);++j) {
+            const uintptr_t b=(uintptr_t)myds_metal_buffer_data((myds_metal_buffer_t *)other[j]);
+            const size_t bytes=myds_metal_buffer_size(other[j]);
+            if (!b || !bytes || bytes>UINTPTR_MAX-b ||
+                (a<=b ? b-a<write_bytes[i] : a-b<bytes)) return false;
+        }
+    }
+    return true;
+}
+
+static int moe_hc_overlap_101(myds_context_t *ctx, uint32_t layer,
+    myds_metal_buffer_t *residual, const myds_metal_buffer_t *after_attn,
+    myds_metal_buffer_t *ffn_split, const myds_metal_buffer_t *ffn_fn,
+    const myds_metal_buffer_t *ffn_scale, const myds_metal_buffer_t *ffn_base,
+    myds_metal_buffer_t *flat_norm, myds_metal_buffer_t *mix, float hc_eps) {
+    myds_model_t *m=ctx->model;
+    myds_layer_t *l=&m->layers[layer];
+    const uint32_t dim=m->dim, width=m->moe_expert_dim, k=m->n_activated_experts;
+    const int previous_auto=myds_metal_get_auto_barrier();
+    const int previous_concurrent=myds_metal_get_concurrent();
+    myds_metal_set_auto_barrier(0);
+    myds_metal_set_concurrent(1);
+#define HC_STAGE_CHECK(call) do { if (!(call)) goto failed; } while (0)
+    HC_STAGE_CHECK(hc_scratch_independent(ctx,layer,residual,after_attn,ffn_split,
+        ffn_fn,ffn_scale,ffn_base,flat_norm,mix));
+    HC_STAGE_CHECK(myds_metal_v41_hc_mix_stages_preflight(ffn_split,after_attn,ffn_fn,
+        ffn_scale,ffn_base,flat_norm,mix,dim,m->norm_eps,hc_eps));
+
+    /* Cohort1: the normalization is independent of Router/SharedGU. */
+    HC_STAGE_CHECK(myds_metal_v41_hc_mix_norm_stage(flat_norm,after_attn,dim,m->norm_eps));
+    HC_STAGE_CHECK(myds_metal_v41_gemv(ctx->router_logits,l->router_gate,ctx->ffn_norm_out,
+        m->n_routed_experts,dim,l->router_gate_type));
+    HC_STAGE_CHECK(myds_v41_shared_gate_up_swiglu(ctx->shared_swiglu_out,l->shared_gate,
+        l->shared_up,ctx->ffn_norm_out,width,dim,l->shared_gate_type,l->shared_up_type,m->swiglu_clamp_exp));
+    const myds_metal_buffer_t *cohort1[]={flat_norm,ctx->router_logits,ctx->shared_swiglu_out};
+    myds_metal_barrier_buffers(cohort1,3);
+
+    /* Cohort2: original HC projection alongside the production router. Keep
+     * the router's existing internal output join, plus this full union join. */
+    HC_STAGE_CHECK(myds_metal_v41_hc_mix_project_stage(mix,ffn_fn,flat_norm,dim));
+    HC_STAGE_CHECK(myds_v41_route(ctx->selected_ids,ctx->selected_weights,ctx->moe_gate,
+        ctx->moe_up,ctx->router_logits,l->router_bias,m->n_routed_experts,k,m->routed_scaling_factor));
+    const myds_metal_buffer_t *cohort2[]={mix,ctx->selected_ids,ctx->selected_weights,ctx->moe_gate,ctx->moe_up};
+    myds_metal_barrier_buffers(cohort2,5);
+
+    /* Cohort3: the unchanged one-thread Sinkhorn dispatch is independent of
+     * IQ2 GU, whose original MID join and paired down scheduling stay inside
+     * the production helper. Encoded means the actual stage3 was accepted. */
+    HC_STAGE_CHECK(myds_metal_v41_hc_mix_split_stage(ffn_split,mix,ffn_scale,ffn_base,dim,hc_eps));
+    atomic_fetch_add_explicit(&hc_overlap_encoded,1,memory_order_relaxed);
+    HC_STAGE_CHECK(myds_metal_routed_moe_down_overlap_scoped(ctx->moe_out,ctx->ffn_norm_out,
+        l->ffn_gate_exps,l->ffn_up_exps,l->ffn_down_exps,ctx->selected_ids,ctx->selected_weights,
+        ctx->moe_gate,ctx->moe_up,ctx->moe_mid,ctx->moe_down,dim,width,m->n_routed_experts,k,
+        l->ffn_gate_exps_type,l->ffn_up_exps_type,l->ffn_down_exps_type,m->swiglu_clamp_exp,true,
+        ctx->shared_out,l->shared_down,ctx->shared_swiglu_out,l->shared_down_type));
+    const myds_metal_buffer_t *final_deps[]={ctx->moe_out,ctx->shared_out,ffn_split};
+    myds_metal_barrier_buffers(final_deps,3);
+    HC_STAGE_CHECK(myds_metal_v41_moe_add_hc_expand(residual,ctx->ffn_out,ctx->moe_out,
+        ctx->shared_out,after_attn,ffn_split,dim));
+    myds_metal_barrier_buffer(residual);
+    myds_metal_set_auto_barrier(previous_auto);
+    myds_metal_set_concurrent(previous_concurrent);
+#undef HC_STAGE_CHECK
+    return 1;
+failed:
+    atomic_fetch_add_explicit(&hc_overlap_failures,1,memory_order_relaxed);
+    myds_metal_set_auto_barrier(previous_auto);
+    myds_metal_set_concurrent(previous_concurrent);
+    MYDS_LOG_E("MoE HC overlap selected stage failed; refusing fallback");
+    return 0;
+}
+
 int myds_v41_moe_pipeline_scoped(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t pos,
                           myds_metal_buffer_t *residual,
                           const myds_metal_buffer_t *after_attn,
@@ -897,11 +1009,34 @@ int myds_v41_moe_pipeline_scoped(myds_context_t *ctx, uint32_t layer, uint32_t t
                           myds_metal_buffer_t *mix,
                           float hc_eps, bool ordinary_decode_allowed) {
     (void)token;
+    const int hc_overlap=myds_v41_moe_hc_overlap_enabled();
+    if (hc_overlap < 0) return 0;
     if (!ctx || !ctx->model || layer >= ctx->model->n_layers) return 0;
     myds_model_t *m = ctx->model;
     myds_layer_t *l = &m->layers[layer];
     const uint32_t dim = m->dim, width = m->moe_expert_dim, k = m->n_activated_experts;
     const bool trace_on = myds_trace_active();
+
+    const bool hc_overlap_eligible=hc_overlap && ordinary_decode_allowed && !trace_on &&
+        myds_metal_batch_active() && is_moe_concurrent_enabled() && is_moe_pipeline_enabled() &&
+        is_shared_fuse_enabled() && is_moe_fuse_expand_enabled() &&
+        myds_metal_moe_down_overlap_enabled() && myds_metal_moe_q2_v41_enabled() &&
+        !myds_metal_moe_iq2_v41_enabled() && myds_metal_dense_q4_v41_enabled() &&
+        dim==5120u && width==2304u && m->n_routed_experts==384u && k==6u && m->n_shared_experts==1u &&
+        l->ffn_gate_exps_type==GGML_TYPE_IQ2_XXS && l->ffn_up_exps_type==GGML_TYPE_IQ2_XXS &&
+        l->ffn_down_exps_type==GGML_TYPE_Q2_K && l->shared_gate_type==GGML_TYPE_Q4_K &&
+        l->shared_up_type==GGML_TYPE_Q4_K && l->shared_down_type==GGML_TYPE_Q4_K &&
+        residual && after_attn && ffn_split && ffn_fn && ffn_scale && ffn_base && flat_norm && mix;
+    if (hc_overlap && ordinary_decode_allowed && !trace_on) {
+        atomic_fetch_add_explicit(&hc_overlap_requests,1,memory_order_relaxed);
+        if (!hc_overlap_eligible) {
+            atomic_fetch_add_explicit(&hc_overlap_failures,1,memory_order_relaxed);
+            MYDS_LOG_E("MoE HC overlap ordinary scope conflicts with fixed101 schedule; refusing fallback");
+            return 0;
+        }
+        return moe_hc_overlap_101(ctx,layer,residual,after_attn,ffn_split,ffn_fn,ffn_scale,
+            ffn_base,flat_norm,mix,hc_eps);
+    }
 
     if (trace_on || !is_moe_concurrent_enabled() || !is_moe_pipeline_enabled() ||
         !ffn_split || !after_attn || !ffn_fn || !ffn_scale || !ffn_base || !flat_norm || !mix) {

@@ -74,12 +74,13 @@ static atomic_uint_fast64_t g_moe_q2_v41_requests = 0;
 static atomic_uint_fast64_t g_moe_q2_v41_encoded = 0;
 static atomic_uint_fast64_t g_moe_q2_v41_failures = 0;
 static bool g_moe_down_overlap = false, g_moe_iq2_v41 = false, g_dense_q4_v41 = false;
+static bool g_dense_q4_v41_nb = false, g_dense_q4_v41_head_reference = false;
 static id<MTLComputePipelineState> g_pso_moe_iq2_v41 = nil;
 static id<MTLComputePipelineState> g_pso_dense_q4_v41[3] = {nil, nil, nil};
-enum { DC_OVERLAP, DC_IQ2, DC_Q4, DC_COUNT };
+enum { DC_OVERLAP, DC_IQ2, DC_Q4, DC_Q4_NB, DC_Q4_HEAD_REFERENCE, DC_COUNT };
 static atomic_uint_fast64_t g_decode_candidates[DC_COUNT][3];
 static int decode_candidate_parse(const char *name);
-static int decode_candidates_initialize(bool overlap, bool iq2, bool q4);
+static int decode_candidates_initialize(bool overlap, bool iq2, bool q4, bool nb, bool head_reference);
 static id<MTLComputePipelineState> g_pso_moe_pair_swiglu_batch_iq2_xxs = nil;
 static id<MTLComputePipelineState> g_pso_moe_sum6_batch_q2_k = nil;
 static inline bool get_moe_batch_dedup_enabled(void) {
@@ -1529,7 +1530,14 @@ int myds_metal_init(const char *shader_dir) {
     const int moe_down_overlap = decode_candidate_parse("MYDS_MOE_DOWN_OVERLAP");
     const int moe_iq2_v41 = decode_candidate_parse("MYDS_MOE_IQ2_V41");
     const int dense_q4_v41 = decode_candidate_parse("MYDS_DENSE_Q4_V41");
-    if (moe_down_overlap < 0 || moe_iq2_v41 < 0 || dense_q4_v41 < 0) return 0;
+    const int dense_q4_v41_nb = decode_candidate_parse("MYDS_DENSE_Q4_V41_NB");
+    const int dense_q4_v41_head_reference = decode_candidate_parse("MYDS_DENSE_Q4_V41_HEAD_REFERENCE");
+    if (moe_down_overlap < 0 || moe_iq2_v41 < 0 || dense_q4_v41 < 0 ||
+        dense_q4_v41_nb < 0 || dense_q4_v41_head_reference < 0) return 0;
+    if ((dense_q4_v41_nb || dense_q4_v41_head_reference) && !dense_q4_v41) {
+        fprintf(stderr,"myds_metal: Q4 provider ablations require MYDS_DENSE_Q4_V41=1\n");
+        return 0;
+    }
     const int moe_q2_v41 = moe_q2_v41_parse_mode();
     if (moe_q2_v41 < 0) return 0;
     const int moe_q2_sum_cache = moe_q2_sum_cache_parse_mode();
@@ -2259,7 +2267,8 @@ int myds_metal_init(const char *shader_dir) {
         g_moe_q2_sum_cache = moe_q2_sum_cache != 0;
         g_moe_q2_sum_cache_fused = moe_q2_sum_cache_fused != 0;
         g_moe_q2_v41 = moe_q2_v41 != 0;
-        if (!decode_candidates_initialize(moe_down_overlap,moe_iq2_v41,dense_q4_v41)) {
+        if (!decode_candidates_initialize(moe_down_overlap,moe_iq2_v41,dense_q4_v41,
+            dense_q4_v41_nb,dense_q4_v41_head_reference)) {
             g_initialized=true; myds_metal_cleanup(); return 0;
         }
         g_initialized = true;
@@ -2342,6 +2351,7 @@ void myds_metal_cleanup(void) {
     g_pso_moe_sum6_v41_q2_k = nil;
     g_moe_q2_v41 = false;
     g_moe_down_overlap=false; g_moe_iq2_v41=false; g_dense_q4_v41=false;
+    g_dense_q4_v41_nb=false; g_dense_q4_v41_head_reference=false;
     g_pso_moe_iq2_v41=nil;
     for (unsigned i=0;i<3u;++i) g_pso_dense_q4_v41[i]=nil;
     g_pso_moe_pair_swiglu_batch_iq2_xxs = nil;
@@ -2929,6 +2939,86 @@ uint32_t myds_metal_kernel_max_threads(const char *name) {
 #define MYDS_DBG_DISPATCH_FAIL(why) do { \
     if (getenv("MYDS_DEBUG_DISPATCH")) myds_log(MYDS_LOG_ERROR, "DBGDISP %s: %s", name, why); \
     return 0; } while (0)
+/* Shared with the dispatch bridge: preparation resolves exactly the PSO that
+ * execution will use, without touching a command buffer or encoder. */
+static id<MTLComputePipelineState> resolve_kernel_pipeline(const char *name,
+    const myds_metal_constant_t *constants, size_t n_constants) {
+    id<MTLComputePipelineState> pipeline = nil;
+    if (n_constants == 0) {
+        for (size_t i = 0; i < g_native_pso_cache_count; i++) {
+            if (strcmp(g_native_pso_cache[i].name, name) == 0) {
+                pipeline = g_native_pso_cache[i].pso;
+                break;
+            }
+        }
+    } else {
+        pipeline = specialized_pipeline_lookup(name, constants, n_constants);
+    }
+    if (!pipeline) {
+        NSString *function_name = [NSString stringWithUTF8String:name];
+        if (!function_name) MYDS_DBG_DISPATCH_FAIL("bad name");
+        NSMutableString *key = [function_name mutableCopy];
+        for (size_t i=0;i<n_constants;i++)
+            [key appendFormat:@":%u:%d:%d",constants[i].index,constants[i].is_bool,constants[i].value];
+        if (!g_native_pipelines) g_native_pipelines = [NSMutableDictionary new];
+        pipeline = g_native_pipelines[key];
+        if (!pipeline) {
+            MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
+            for (size_t i=0;i<n_constants;i++) {
+                bool bv=constants[i].value!=0;
+                int32_t iv=constants[i].value;
+                [values setConstantValue:constants[i].is_bool ? (const void *)&bv : (const void *)&iv
+                    type:constants[i].is_bool ? MTLDataTypeBool : MTLDataTypeInt atIndex:constants[i].index];
+            }
+            NSError *ferr = nil;
+            id<MTLFunction> fn = n_constants ? [g_library newFunctionWithName:function_name constantValues:values error:&ferr]
+                                           : [g_library newFunctionWithName:function_name];
+            if (!fn) {
+                if (getenv("MYDS_DEBUG_DISPATCH"))
+                    myds_log(MYDS_LOG_ERROR, "DBGDISP %s: FUNCTION NOT FOUND (%s)", name,
+                             ferr ? [[ferr localizedDescription] UTF8String] : "no error");
+                return 0;
+            }
+            NSError *perr = nil;
+            pipeline = [g_device newComputePipelineStateWithFunction:fn error:&perr];
+            if (!pipeline) {
+                if (getenv("MYDS_DEBUG_DISPATCH"))
+                    myds_log(MYDS_LOG_ERROR, "DBGDISP %s: PIPELINE FAILED (%s)", name,
+                             perr ? [[perr localizedDescription] UTF8String] : "no error");
+                return 0;
+            }
+            g_native_pipelines[key] = pipeline;
+        }
+        if (n_constants == 0 && g_native_pso_cache_count < 64 && strlen(name) < 64) {
+            strncpy(g_native_pso_cache[g_native_pso_cache_count].name, name, 63);
+            g_native_pso_cache[g_native_pso_cache_count].name[63] = '\0';
+            g_native_pso_cache[g_native_pso_cache_count].pso = pipeline;
+            g_native_pso_cache_count++;
+        } else if (n_constants != 0) {
+            specialized_pipeline_cache(name, constants, n_constants, pipeline);
+        }
+    }
+    return pipeline;
+}
+int myds_metal_kernel_constants_preflight(const char *name, const uint32_t threads[3],
+    size_t threadgroup_memory, const myds_metal_constant_t *constants, size_t n_constants) {
+    if (!g_initialized || !name || !*name || !threads ||
+        (n_constants && !constants) || n_constants>64) return 0;
+    uint64_t n_threads=1;
+    const MTLSize maximum=g_device.maxThreadsPerThreadgroup;
+    const NSUInteger limits[3]={maximum.width,maximum.height,maximum.depth};
+    for (unsigned i=0;i<3;i++) {
+        if (!threads[i] || threads[i]>limits[i] || n_threads>UINT64_MAX/threads[i]) return 0;
+        n_threads*=threads[i];
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline=resolve_kernel_pipeline(name,constants,n_constants);
+        return pipeline && pipeline.device==g_device && pipeline.threadExecutionWidth==32u &&
+            n_threads<=pipeline.maxTotalThreadsPerThreadgroup && !(threadgroup_memory%16u) &&
+            threadgroup_memory<=g_device.maxThreadgroupMemoryLength &&
+            pipeline.staticThreadgroupMemoryLength<=g_device.maxThreadgroupMemoryLength-threadgroup_memory;
+    }
+}
 int myds_metal_dispatch_kernel_constants(const char *name, const void *args, size_t args_size,
     const myds_metal_buffer_t *const *buffers, size_t n_buffers,
     const uint32_t groups[3], const uint32_t threads[3], size_t threadgroup_memory,
@@ -2947,61 +3037,8 @@ int myds_metal_dispatch_kernel_constants(const char *name, const void *args, siz
     for (size_t i = 0; i < n_buffers; ++i)
         if (!buffers[i] || !buffers[i]->mtl_buf || !buffers[i]->size) MYDS_DBG_DISPATCH_FAIL("null/empty buffer");
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = nil;
-        if (n_constants == 0) {
-            for (size_t i = 0; i < g_native_pso_cache_count; i++) {
-                if (strcmp(g_native_pso_cache[i].name, name) == 0) {
-                    pipeline = g_native_pso_cache[i].pso;
-                    break;
-                }
-            }
-        } else {
-            pipeline = specialized_pipeline_lookup(name, constants, n_constants);
-        }
-        if (!pipeline) {
-            NSString *function_name = [NSString stringWithUTF8String:name];
-            if (!function_name) MYDS_DBG_DISPATCH_FAIL("bad name");
-            NSMutableString *key = [function_name mutableCopy];
-            for (size_t i=0;i<n_constants;i++)
-                [key appendFormat:@":%u:%d:%d",constants[i].index,constants[i].is_bool,constants[i].value];
-            if (!g_native_pipelines) g_native_pipelines = [NSMutableDictionary new];
-            pipeline = g_native_pipelines[key];
-            if (!pipeline) {
-                MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
-                for (size_t i=0;i<n_constants;i++) {
-                    bool bv=constants[i].value!=0;
-                    int32_t iv=constants[i].value;
-                    [values setConstantValue:constants[i].is_bool ? (const void *)&bv : (const void *)&iv
-                        type:constants[i].is_bool ? MTLDataTypeBool : MTLDataTypeInt atIndex:constants[i].index];
-                }
-                NSError *ferr = nil;
-                id<MTLFunction> fn = n_constants ? [g_library newFunctionWithName:function_name constantValues:values error:&ferr]
-                                               : [g_library newFunctionWithName:function_name];
-                if (!fn) {
-                    if (getenv("MYDS_DEBUG_DISPATCH"))
-                        myds_log(MYDS_LOG_ERROR, "DBGDISP %s: FUNCTION NOT FOUND (%s)", name,
-                                 ferr ? [[ferr localizedDescription] UTF8String] : "no error");
-                    return 0;
-                }
-                NSError *perr = nil;
-                pipeline = [g_device newComputePipelineStateWithFunction:fn error:&perr];
-                if (!pipeline) {
-                    if (getenv("MYDS_DEBUG_DISPATCH"))
-                        myds_log(MYDS_LOG_ERROR, "DBGDISP %s: PIPELINE FAILED (%s)", name,
-                                 perr ? [[perr localizedDescription] UTF8String] : "no error");
-                    return 0;
-                }
-                g_native_pipelines[key] = pipeline;
-            }
-            if (n_constants == 0 && g_native_pso_cache_count < 64 && strlen(name) < 64) {
-                strncpy(g_native_pso_cache[g_native_pso_cache_count].name, name, 63);
-                g_native_pso_cache[g_native_pso_cache_count].name[63] = '\0';
-                g_native_pso_cache[g_native_pso_cache_count].pso = pipeline;
-                g_native_pso_cache_count++;
-            } else if (n_constants != 0) {
-                specialized_pipeline_cache(name, constants, n_constants, pipeline);
-            }
-        }
+        id<MTLComputePipelineState> pipeline=resolve_kernel_pipeline(name,constants,n_constants);
+        if (!pipeline) return 0;
         if (n_threads > pipeline.maxTotalThreadsPerThreadgroup)
             MYDS_DBG_DISPATCH_FAIL("n_threads > maxTotalThreadsPerThreadgroup");
         if (threadgroup_memory > g_device.maxThreadgroupMemoryLength)
@@ -3243,6 +3280,102 @@ int myds_metal_v41_hc_mix(myds_metal_buffer_t *split,
         [enc setBuffer:split->mtl_buf offset:split->offset atIndex:4];
         metal_dispatch(enc, "v41_hc_split", MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
         return v41_finish(cb, enc);
+    }
+}
+
+int myds_metal_batch_active(void) { return g_batch_cb != nil; }
+static bool f16_gemv_bf16_range(const myds_metal_buffer_t *b,uint64_t bytes,size_t alignment);
+int myds_metal_buffer_native_range(const myds_metal_buffer_t *buffer, uint64_t bytes, size_t alignment) {
+    return alignment && bytes && f16_gemv_bf16_range(buffer,bytes,alignment);
+}
+
+static bool hc_stages_scope(uint32_t dim) {
+    return g_initialized && g_batch_cb && !g_auto_barrier && g_concurrent_mode>0 &&
+           !g_kp_on && dim==5120u;
+}
+static bool f16_gemv_bf16_range(const myds_metal_buffer_t *b,uint64_t bytes,size_t alignment);
+static bool f16_gemv_bf16_overlap(const myds_metal_buffer_t *a,uint64_t an,
+                                 const myds_metal_buffer_t *b,uint64_t bn);
+static bool hc_stages_range(const myds_metal_buffer_t *b, uint64_t bytes, size_t alignment) {
+    return f16_gemv_bf16_range(b,bytes,alignment);
+}
+static bool hc_stages_alias(const myds_metal_buffer_t *a, uint64_t an,
+                            const myds_metal_buffer_t *b, uint64_t bn) {
+    return f16_gemv_bf16_overlap(a,an,b,bn);
+}
+static bool hc_stages_geometry(id<MTLComputePipelineState> pso, NSUInteger width,
+                               NSUInteger height, NSUInteger scratch) {
+    const MTLSize limits=g_device.maxThreadsPerThreadgroup;
+    return pso && pso.device==g_device && pso.threadExecutionWidth==32u &&
+        width<=limits.width && height<=limits.height && limits.depth>=1u &&
+        pso.maxTotalThreadsPerThreadgroup>=width*height &&
+        scratch<=g_device.maxThreadgroupMemoryLength &&
+        pso.staticThreadgroupMemoryLength<=g_device.maxThreadgroupMemoryLength-scratch;
+}
+int myds_metal_v41_hc_mix_stages_preflight(myds_metal_buffer_t *split,
+    const myds_metal_buffer_t *residual, const myds_metal_buffer_t *fn,
+    const myds_metal_buffer_t *scale, const myds_metal_buffer_t *base,
+    myds_metal_buffer_t *flat_norm, myds_metal_buffer_t *mix,
+    uint32_t dim, float eps, float hc_eps) {
+    if (!hc_stages_scope(dim) || !isfinite(eps) || eps<0 || !isfinite(hc_eps) || hc_eps<0) return 0;
+    const myds_metal_buffer_t *buffers[]={flat_norm,mix,split,residual,fn,scale,base};
+    const uint64_t bytes[]={81920u,96u,96u,81920u,983040u,12u,96u};
+    const size_t alignments[]={16u,16u,16u,16u,8u,4u,16u};
+    for (unsigned i=0;i<7u;++i) if (!hc_stages_range(buffers[i],bytes[i],alignments[i])) return 0;
+    for (unsigned i=0;i<3u;++i)
+        for (unsigned j=i+1u;j<7u;++j)
+            if (hc_stages_alias(buffers[i],bytes[i],buffers[j],bytes[j])) return 0;
+    @autoreleasepool {
+        /* Same cached symbol/FC key as v41_gemv_batch, prepared before the
+         * first stage so missing selected PSOs cannot produce partial work. */
+        NSString *key=@"kernel_mul_mv_f16_f32_4_8";
+        id<MTLComputePipelineState> pso=g_native_pipelines[key];
+        if (!pso) {
+            MTLFunctionConstantValues *values=[MTLFunctionConstantValues new];
+            short nsg=8;
+            [values setConstantValue:&nsg type:MTLDataTypeShort atIndex:600];
+            id<MTLFunction> fn=[g_library newFunctionWithName:@"kernel_mul_mv_f16_f32_4"
+                constantValues:values error:nil];
+            if (!fn) return 0;
+            pso=[g_device newComputePipelineStateWithFunction:fn error:nil];
+            if (!pso) return 0;
+            if (!g_native_pipelines) g_native_pipelines=[NSMutableDictionary new];
+            g_native_pipelines[key]=pso;
+        }
+        return hc_stages_geometry(g_pso_v41_norm_plain,1024u,1u,128u) &&
+            hc_stages_geometry(pso,32u,8u,256u) && hc_stages_geometry(g_pso_v41_hc_split,1u,1u,0u);
+    }
+}
+int myds_metal_v41_hc_mix_norm_stage(myds_metal_buffer_t *flat_norm,
+    const myds_metal_buffer_t *residual, uint32_t dim, float eps) {
+    if (!hc_stages_scope(dim)) return 0;
+    return myds_metal_v41_rmsnorm(flat_norm,residual,NULL,4u*dim,eps,false);
+}
+int myds_metal_v41_hc_mix_project_stage(myds_metal_buffer_t *mix,
+    const myds_metal_buffer_t *fn, const myds_metal_buffer_t *flat_norm, uint32_t dim) {
+    if (!hc_stages_scope(dim)) return 0;
+    return myds_metal_v41_gemv(mix,fn,flat_norm,24,4u*dim,GGML_TYPE_F16);
+}
+int myds_metal_v41_hc_mix_split_stage(myds_metal_buffer_t *split,
+    const myds_metal_buffer_t *mix, const myds_metal_buffer_t *scale,
+    const myds_metal_buffer_t *base, uint32_t dim, float hc_eps) {
+    if (!hc_stages_scope(dim) || !g_pso_v41_hc_split || !isfinite(hc_eps) || hc_eps<0 ||
+        !hc_stages_range(split,96u,16u) || !hc_stages_range(mix,96u,16u) ||
+        !hc_stages_range(scale,12u,4u) || !hc_stages_range(base,96u,16u)) return 0;
+    @autoreleasepool {
+        /* Exact ABI/geometry of the final block in myds_metal_v41_hc_mix. */
+        struct v41_hc_split_args args={4,20,1,24,24*sizeof(float),24*sizeof(float),hc_eps};
+        id<MTLCommandBuffer> cb=g_batch_cb;
+        id<MTLComputeCommandEncoder> enc=get_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:g_pso_v41_hc_split];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:mix->mtl_buf offset:mix->offset atIndex:1];
+        [enc setBuffer:scale->mtl_buf offset:scale->offset atIndex:2];
+        [enc setBuffer:base->mtl_buf offset:base->offset atIndex:3];
+        [enc setBuffer:split->mtl_buf offset:split->offset atIndex:4];
+        metal_dispatch(enc,"v41_hc_split",MTLSizeMake(1,1,1),MTLSizeMake(1,1,1));
+        return v41_finish(cb,enc);
     }
 }
 

@@ -53,6 +53,10 @@ typedef struct {
     myds_metal_decode_candidate_counters_t first_moe_down_overlap;
     myds_metal_decode_candidate_counters_t first_moe_iq2_v41;
     myds_metal_decode_candidate_counters_t first_dense_q4_v41;
+    myds_metal_decode_candidate_counters_t first_dense_q4_v41_nb;
+    myds_metal_decode_candidate_counters_t first_dense_q4_v41_head_reference;
+    myds_metal_decode_candidate_counters_t first_attention_rope_fuse;
+    myds_metal_decode_candidate_counters_t first_moe_hc_overlap;
     myds_metal_shared3_counters_t first_depth2_dense;
     myds_v41_shared_gu_shared3_counters_t first_depth2_gu;
     myds_v41_depth2_routed_shared3_counters_t first_depth2_routed;
@@ -95,6 +99,10 @@ static void capture(const char *piece, size_t length, int32_t id, void *opaque) 
         myds_metal_moe_down_overlap_counters(&c->first_moe_down_overlap, false);
         myds_metal_moe_iq2_v41_counters(&c->first_moe_iq2_v41, false);
         myds_metal_dense_q4_v41_counters(&c->first_dense_q4_v41, false);
+        myds_metal_dense_q4_v41_nb_counters(&c->first_dense_q4_v41_nb, false);
+        myds_metal_dense_q4_v41_head_reference_counters(&c->first_dense_q4_v41_head_reference, false);
+        myds_v41_attention_rope_fuse_counters(&c->first_attention_rope_fuse, false);
+        myds_v41_moe_hc_overlap_counters(&c->first_moe_hc_overlap, false);
         myds_metal_shared3_counters(&c->first_depth2_dense, false);
         myds_v41_shared_gu_shared3_counters(&c->first_depth2_gu, false);
         myds_v41_depth2_routed_shared3_counters(&c->first_depth2_routed, false);
@@ -390,6 +398,15 @@ int main(int argc, char **argv) {
         myds_dspark_engine_capture_bypass_enabled(ctx->dspark), myds_metal_f16_gemv_bf16_fuse_enabled(), myds_metal_indexer_rope_quant_fuse_enabled(), myds_v41_route_simd_shuffle_mode(),
         myds_v41_gpu_attention_packed_register_enabled(), myds_metal_moe_q2_v41_enabled(),
         myds_metal_moe_down_overlap_enabled(), myds_metal_moe_iq2_v41_enabled(), myds_metal_dense_q4_v41_enabled());
+    fprintf(json, ",\"dense_q4_v41_nb_mode\":%d,\"dense_q4_v41_head_reference_mode\":%d,\"attention_rope_fuse_mode\":%d,\"moe_hc_overlap_mode\":%d",
+        myds_metal_dense_q4_v41_nb_enabled(), myds_metal_dense_q4_v41_head_reference_enabled(),
+        myds_v41_attention_rope_fuse_enabled(), myds_v41_moe_hc_overlap_enabled());
+    fputs(",\"dense_q4_v41_kernels\":[",json);
+    for (unsigned shape=0;shape<3u;shape++) {
+        if (shape) fputc(',',json);
+        json_string(json,myds_metal_dense_q4_v41_selected_kernel(shape));
+    }
+    fputc(']',json);
     fputs(",\"actual_metallib_path\":", json);
     json_string(json, myds_metal_loaded_library_path());
     fputs("}\n", json);
@@ -428,6 +445,10 @@ int main(int argc, char **argv) {
         myds_metal_moe_down_overlap_counters(NULL, true);
         myds_metal_moe_iq2_v41_counters(NULL, true);
         myds_metal_dense_q4_v41_counters(NULL, true);
+        myds_metal_dense_q4_v41_nb_counters(NULL, true);
+        myds_metal_dense_q4_v41_head_reference_counters(NULL, true);
+        myds_v41_attention_rope_fuse_counters(NULL, true);
+        myds_v41_moe_hc_overlap_counters(NULL, true);
         myds_metal_shared3_counters(NULL, true);
         myds_v41_shared_gu_shared3_counters(NULL, true);
         myds_v41_depth2_routed_shared3_counters(NULL, true);
@@ -477,6 +498,14 @@ int main(int argc, char **argv) {
         myds_metal_moe_iq2_v41_counters(&moe_iq2_v41, false);
         myds_metal_decode_candidate_counters_t dense_q4_v41;
         myds_metal_dense_q4_v41_counters(&dense_q4_v41, false);
+        myds_metal_decode_candidate_counters_t dense_q4_v41_nb;
+        myds_metal_dense_q4_v41_nb_counters(&dense_q4_v41_nb, false);
+        myds_metal_decode_candidate_counters_t dense_q4_v41_head_reference;
+        myds_metal_dense_q4_v41_head_reference_counters(&dense_q4_v41_head_reference, false);
+        myds_metal_decode_candidate_counters_t attention_rope_fuse;
+        myds_v41_attention_rope_fuse_counters(&attention_rope_fuse, false);
+        myds_metal_decode_candidate_counters_t moe_hc_overlap;
+        myds_v41_moe_hc_overlap_counters(&moe_hc_overlap, false);
         myds_metal_shared3_counters_t depth2_dense;
         myds_metal_shared3_counters(&depth2_dense, false);
         myds_v41_shared_gu_shared3_counters_t depth2_gu;
@@ -704,6 +733,26 @@ int main(int argc, char **argv) {
             dense_q4_v41.requests-c.first_dense_q4_v41.requests,
             dense_q4_v41.encoded-c.first_dense_q4_v41.encoded,
             dense_q4_v41.failures-c.first_dense_q4_v41.failures);
+        fprintf(json, ",\"gpu_dense_q4_v41_nb\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64
+            ",\"failures\":%" PRIu64 ",\"decode_requests\":%" PRIu64 ",\"decode_encoded\":%" PRIu64
+            ",\"decode_failures\":%" PRIu64 "}", dense_q4_v41_nb.requests, dense_q4_v41_nb.encoded, dense_q4_v41_nb.failures,
+            dense_q4_v41_nb.requests-c.first_dense_q4_v41_nb.requests, dense_q4_v41_nb.encoded-c.first_dense_q4_v41_nb.encoded,
+            dense_q4_v41_nb.failures-c.first_dense_q4_v41_nb.failures);
+        fprintf(json, ",\"gpu_dense_q4_v41_head_reference\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64
+            ",\"failures\":%" PRIu64 ",\"decode_requests\":%" PRIu64 ",\"decode_encoded\":%" PRIu64
+            ",\"decode_failures\":%" PRIu64 "}", dense_q4_v41_head_reference.requests, dense_q4_v41_head_reference.encoded, dense_q4_v41_head_reference.failures,
+            dense_q4_v41_head_reference.requests-c.first_dense_q4_v41_head_reference.requests, dense_q4_v41_head_reference.encoded-c.first_dense_q4_v41_head_reference.encoded,
+            dense_q4_v41_head_reference.failures-c.first_dense_q4_v41_head_reference.failures);
+        fprintf(json, ",\"gpu_attention_rope_fuse\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64
+            ",\"failures\":%" PRIu64 ",\"decode_requests\":%" PRIu64 ",\"decode_encoded\":%" PRIu64
+            ",\"decode_failures\":%" PRIu64 "}", attention_rope_fuse.requests, attention_rope_fuse.encoded, attention_rope_fuse.failures,
+            attention_rope_fuse.requests-c.first_attention_rope_fuse.requests, attention_rope_fuse.encoded-c.first_attention_rope_fuse.encoded,
+            attention_rope_fuse.failures-c.first_attention_rope_fuse.failures);
+        fprintf(json, ",\"gpu_moe_hc_overlap\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64
+            ",\"failures\":%" PRIu64 ",\"decode_requests\":%" PRIu64 ",\"decode_encoded\":%" PRIu64
+            ",\"decode_failures\":%" PRIu64 "}", moe_hc_overlap.requests, moe_hc_overlap.encoded, moe_hc_overlap.failures,
+            moe_hc_overlap.requests-c.first_moe_hc_overlap.requests, moe_hc_overlap.encoded-c.first_moe_hc_overlap.encoded,
+            moe_hc_overlap.failures-c.first_moe_hc_overlap.failures);
         fprintf(json, ",\"gpu_indexer_rope_quant_fuse\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64
             ",\"failures\":%" PRIu64 ",\"decode_requests\":%" PRIu64 ",\"decode_encoded\":%" PRIu64
             ",\"decode_failures\":%" PRIu64 "}", indexer_rope_quant.requests, indexer_rope_quant.encoded, indexer_rope_quant.failures,

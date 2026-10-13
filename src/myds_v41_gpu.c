@@ -4,6 +4,7 @@
 #include <math.h>
 #include <limits.h>
 #include <pthread.h>
+#include <stddef.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -129,7 +130,7 @@ size_t myds_v41_gpu_chunk_workspace_bytes(const myds_v41_gpu_scratch_t *s) {
     return s ? myds_metal_buffer_size(s->kv_chunk)+myds_metal_buffer_size(s->mask_chunk) : 0;
 }
 myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp) {
-    if (myds_v41_gpu_attention_packed_register_enabled()<0) return NULL;
+    if (myds_v41_gpu_attention_packed_register_enabled()<0 || myds_v41_attention_rope_fuse_enabled()<0) return NULL;
     if(!max_comp || max_comp>1048576) return NULL;
     myds_v41_gpu_scratch_t *s=calloc(1,sizeof(*s));
     if(!s)return NULL;
@@ -1253,6 +1254,15 @@ struct flash_vec_args {
 _Static_assert(sizeof(struct flash_vec_args) == 200,
                "flash_vec_args 尺寸变了 —— 内核侧 struct ds4_metal_args_flash_attn_ext_vec 必须同步");
 _Static_assert(sizeof(struct flash_vec_args) - 8 == 192, "nb_kvq 必须在尾部偏移 192");
+struct attention_rope_fuse_args {
+    struct flash_vec_args attention;
+    uint32_t pos, pad;
+    float frequencies[32];
+};
+_Static_assert(sizeof(struct attention_rope_fuse_args)==336u,"attention+rope ABI");
+_Static_assert(offsetof(struct attention_rope_fuse_args,pos)==200u,"attention+rope position ABI");
+_Static_assert(offsetof(struct attention_rope_fuse_args,frequencies)==208u,"attention+rope frequency ABI");
+struct attention_rope_scope { uint32_t pos; bool compressed; };
 
 /* B 方案：见 metal/myds_chunk.metal 里的 myds_attn_gather_args（必须逐字段对齐）。 */
 struct myds_attn_gather_args {
@@ -1570,6 +1580,67 @@ void myds_v41_gpu_attention_packed_register_counters(
         .direct_encoded=values[AR_DIRECT],.staged_encoded=values[AR_STAGED]};
 }
 
+enum { RF_REQUESTS, RF_ENCODED, RF_FAILURES, RF_COUNT };
+static _Atomic uint64_t attention_rope_counters[RF_COUNT];
+static void attention_rope_count(unsigned field) {
+    atomic_fetch_add_explicit(&attention_rope_counters[field],1u,memory_order_relaxed);
+}
+int myds_v41_attention_rope_fuse_enabled(void) {
+    const char *value=getenv("MYDS_ATTN_ROPE_FUSE");
+    if (!value || !strcmp(value,"0")) return 0;
+    if (strcmp(value,"1")) {
+        MYDS_LOG_E("MYDS_ATTN_ROPE_FUSE must be exactly 0 or 1");return -1;
+    }
+    if (myds_v41_gpu_attention_packed_register_enabled()!=1) {
+        MYDS_LOG_E("MYDS_ATTN_ROPE_FUSE=1 requires packed register1/physical8/reduce1");return -1;
+    }
+    return 1;
+}
+void myds_v41_attention_rope_fuse_counters(myds_metal_decode_candidate_counters_t *out,bool reset) {
+    uint64_t v[RF_COUNT];
+    for (unsigned i=0;i<RF_COUNT;i++) v[i]=reset?
+        atomic_exchange_explicit(&attention_rope_counters[i],0u,memory_order_relaxed):
+        atomic_load_explicit(&attention_rope_counters[i],memory_order_relaxed);
+    if (out) *out=(myds_metal_decode_candidate_counters_t){v[0],v[1],v[2]};
+}
+static int attention_rope_failure(void) {
+    attention_rope_count(RF_FAILURES);
+    return 0;
+}
+static int attention_rope_range(const myds_metal_buffer_t *b,uint64_t bytes,size_t alignment) {
+    return myds_metal_buffer_native_range(b,bytes,alignment);
+}
+/* Complete predispatch guards: no scratch staging, joins, CB or dispatch may
+ * precede failure. Read-only selected IDs retain the original GPU range check;
+ * this host never synchronizes or inspects their payload. */
+static int attention_rope_validate(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *window,uint32_t n_raw,uint32_t raw_start,
+    const myds_metal_buffer_t *selected,const myds_metal_buffer_t *ids,uint32_t source_rows,
+    uint32_t selected_rows,myds_v41_gpu_scratch_t *s,uint32_t pos,bool direct) {
+    if (!s || pos>=1048576u || !n_raw || n_raw>128u || raw_start>=128u || selected_rows>512u ||
+        (direct && selected_rows && selected_rows>source_rows)) return 0;
+    const myds_metal_buffer_t *writers[]={heads,s->kv_f16,s->pad,s->partial};
+    const uint64_t wn[]={64u*512u*4u,640u*512u*2u,2u*32u*512u*2u+32u*2u,64u*(512u+2u)*32u*4u};
+    const myds_metal_buffer_t *readers[]={sinks,q,window,s->mask,selected,ids};
+    const uint64_t rn[]={64u*4u,64u*512u*4u,128u*512u*4u,640u*2u,
+        direct?(uint64_t)source_rows*512u*2u:(uint64_t)selected_rows*512u*4u,(uint64_t)selected_rows*4u};
+    const size_t align[]={4u,16u,16u,2u,16u,4u};
+    for (unsigned i=0;i<4u;i++) {
+        if (!attention_rope_range(writers[i],wn[i],16u)) return 0;
+        for (unsigned j=0;j<i;j++) if(buffer_ranges_overlap(writers[i],(size_t)wn[i],writers[j],(size_t)wn[j])) return 0;
+    }
+    for (unsigned j=0;j<6u;j++) {
+        if (j>=4u && (!selected_rows || (j==5u && !direct))) continue;
+        if (!attention_rope_range(readers[j],rn[j],align[j])) return 0;
+        for (unsigned i=0;i<4u;i++) if(buffer_ranges_overlap(writers[i],(size_t)wn[i],readers[j],(size_t)rn[j])) return 0;
+    }
+    const uint32_t threads[]={256u,1u,1u};
+    const uint32_t keys=n_raw+selected_rows;
+    const myds_metal_constant_t c[]={{400,true,1},{401,true,1},{402,true,0},{403,true,0},{404,true,keys%32u!=0},
+        {405,true,0},{420,false,512},{421,false,512},{422,false,1},{423,false,32}};
+    return myds_metal_kernel_constants_preflight("kernel_myds_attention_register_rope_fuse_f16_512",threads,22400u,c,10u);
+}
+
 /* Physical SIMD packing is separate from the legacy logical NSG=1/NWG=32
  * constants. Absent / exact 8 preserves the existing packed8 path. Explicit
  * candidates are experiments: malformed values and unavailable geometry fail
@@ -1608,7 +1679,8 @@ static inline int get_attn_packed_reduce_mode(void) {
 
 static int attention_staged_impl(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *window,uint32_t n_raw,
-    uint32_t raw_start,const myds_metal_buffer_t *selected_kv,uint32_t selected_rows,myds_v41_gpu_scratch_t *s,int register_mode) {
+    uint32_t raw_start,const myds_metal_buffer_t *selected_kv,uint32_t selected_rows,myds_v41_gpu_scratch_t *s,int register_mode,
+    const struct attention_rope_scope *rope) {
     if(!s||!n_raw||n_raw>128||raw_start>=128||selected_rows>512||
         !floats(heads,64u*512)||!floats(q,64u*512)||!floats(sinks,64)||!floats(window,128u*512)||
         (selected_rows&&!floats(selected_kv,(uint64_t)selected_rows*512)))return 0;
@@ -1649,9 +1721,16 @@ static int attention_staged_impl(myds_metal_buffer_t *heads,const myds_metal_buf
     if (register_mode) {
         const myds_metal_buffer_t *register_buffers[]={q,s->kv_f16,s->kv_f16,s->mask,sinks,s->pad,heads};
         const uint64_t dispatch_before=myds_metal_dispatch_count();
-        const int ok=specialized("kernel_myds_flash_attn_vec_packed8_register_reduce_f16_dk512_dv512",
+        int ok;
+        if (rope) {
+            struct attention_rope_fuse_args fused={.attention=a,.pos=rope->pos};
+            memcpy(fused.frequencies,rope_frequencies[rope->compressed?1:0],sizeof(fused.frequencies));
+            ok=specialized("kernel_myds_attention_register_rope_fuse_f16_512",
+                &fused,sizeof(fused),register_buffers,7,64,1,1,256,1,1,22400,c,10);
+        } else ok=specialized("kernel_myds_flash_attn_vec_packed8_register_reduce_f16_dk512_dv512",
             &a,sizeof(a),register_buffers,7,64,1,1,256,1,1,22400,c,10);
         if(myds_metal_dispatch_count()>dispatch_before) {
+            if (rope) attention_rope_count(RF_ENCODED);
             attention_register_count(AR_ENCODED);
             attention_register_count(AR_STAGED);
         }
@@ -1696,7 +1775,7 @@ int myds_v41_gpu_attention(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
     const int mode=myds_v41_gpu_attention_packed_register_enabled();
     if(mode) attention_register_count(AR_REQUESTS);
     if(mode<0) {attention_register_count(AR_FAILURES);return 0;}
-    const int ok=attention_staged_impl(heads,sinks,q,window,n_raw,raw_start,selected_kv,selected_rows,s,mode);
+    const int ok=attention_staged_impl(heads,sinks,q,window,n_raw,raw_start,selected_kv,selected_rows,s,mode,NULL);
     if(mode && !ok) attention_register_count(AR_FAILURES);
     return ok;
 }
@@ -1704,7 +1783,8 @@ int myds_v41_gpu_attention(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
 static int attention_direct_impl(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *window,uint32_t n_raw,
     uint32_t raw_start,const myds_metal_buffer_t *comp_kv,const myds_metal_buffer_t *selected_ids,
-    uint32_t source_rows,uint32_t selected_rows,myds_v41_gpu_scratch_t *s,int register_mode) {
+    uint32_t source_rows,uint32_t selected_rows,myds_v41_gpu_scratch_t *s,int register_mode,
+    const struct attention_rope_scope *rope) {
     if(!s||!n_raw||n_raw>128||raw_start>=128||selected_rows>512||
         !floats(heads,64u*512)||!floats(q,64u*512)||!floats(sinks,64)||!floats(window,128u*512)||
         (selected_rows&&(selected_rows>source_rows||!bf16s(comp_kv,(uint64_t)source_rows*512)||!floats(selected_ids,selected_rows))))return 0;
@@ -1757,9 +1837,16 @@ static int attention_direct_impl(myds_metal_buffer_t *heads,const myds_metal_buf
     if (register_mode) {
         const myds_metal_buffer_t *register_buffers[]={q,s->kv_f16,s->kv_f16,s->mask,sinks,s->pad,heads};
         const uint64_t dispatch_before=myds_metal_dispatch_count();
-        const int ok=specialized("kernel_myds_flash_attn_vec_packed8_register_reduce_f16_dk512_dv512",
+        int ok;
+        if (rope) {
+            struct attention_rope_fuse_args fused={.attention=a,.pos=rope->pos};
+            memcpy(fused.frequencies,rope_frequencies[rope->compressed?1:0],sizeof(fused.frequencies));
+            ok=specialized("kernel_myds_attention_register_rope_fuse_f16_512",
+                &fused,sizeof(fused),register_buffers,7,64,1,1,256,1,1,22400,c,10);
+        } else ok=specialized("kernel_myds_flash_attn_vec_packed8_register_reduce_f16_dk512_dv512",
             &a,sizeof(a),register_buffers,7,64,1,1,256,1,1,22400,c,10);
         if(myds_metal_dispatch_count()>dispatch_before) {
+            if (rope) attention_rope_count(RF_ENCODED);
             attention_register_count(AR_ENCODED);
             attention_register_count(AR_DIRECT);
         }
@@ -1805,7 +1892,52 @@ int myds_v41_gpu_attention_direct(myds_metal_buffer_t *heads,const myds_metal_bu
     const int mode=myds_v41_gpu_attention_packed_register_enabled();
     if(mode) attention_register_count(AR_REQUESTS);
     if(mode<0) {attention_register_count(AR_FAILURES);return 0;}
-    const int ok=attention_direct_impl(heads,sinks,q,window,n_raw,raw_start,comp_kv,selected_ids,source_rows,selected_rows,s,mode);
+    const int ok=attention_direct_impl(heads,sinks,q,window,n_raw,raw_start,comp_kv,selected_ids,source_rows,selected_rows,s,mode,NULL);
     if(mode && !ok) attention_register_count(AR_FAILURES);
     return ok;
+}
+
+int myds_v41_gpu_attention_rope_fuse(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *window,uint32_t n_raw,
+    uint32_t raw_start,const myds_metal_buffer_t *selected_kv,uint32_t selected_rows,
+    myds_v41_gpu_scratch_t *s,uint32_t pos,bool compressed,
+    bool ordinary_allowed,bool trace_on,bool *rope_consumed) {
+    const int mode=myds_v41_attention_rope_fuse_enabled();
+    if (rope_consumed) *rope_consumed=false;
+    if (!mode || (mode>0 && (!ordinary_allowed || trace_on))) {
+        if (!rope_consumed) return 0;
+        return myds_v41_gpu_attention(heads,sinks,q,window,n_raw,raw_start,selected_kv,selected_rows,s);
+    }
+    attention_rope_count(RF_REQUESTS);
+    if (mode<0 || !rope_consumed || !attention_rope_validate(heads,sinks,q,window,n_raw,raw_start,
+        selected_kv,NULL,selected_rows,selected_rows,s,pos,false)) return attention_rope_failure();
+    pthread_once(&rope_once,init_rope);
+    const struct attention_rope_scope rope={pos,compressed};
+    attention_register_count(AR_REQUESTS);
+    const int ok=attention_staged_impl(heads,sinks,q,window,n_raw,raw_start,selected_kv,selected_rows,s,1,&rope);
+    if (!ok) {attention_register_count(AR_FAILURES);return attention_rope_failure();}
+    *rope_consumed=true;
+    return 1;
+}
+int myds_v41_gpu_attention_direct_rope_fuse(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *window,uint32_t n_raw,
+    uint32_t raw_start,const myds_metal_buffer_t *comp_kv,const myds_metal_buffer_t *selected_ids,
+    uint32_t source_rows,uint32_t selected_rows,myds_v41_gpu_scratch_t *s,
+    uint32_t pos,bool compressed,bool ordinary_allowed,bool trace_on,bool *rope_consumed) {
+    const int mode=myds_v41_attention_rope_fuse_enabled();
+    if (rope_consumed) *rope_consumed=false;
+    if (!mode || (mode>0 && (!ordinary_allowed || trace_on))) {
+        if (!rope_consumed) return 0;
+        return myds_v41_gpu_attention_direct(heads,sinks,q,window,n_raw,raw_start,comp_kv,selected_ids,source_rows,selected_rows,s);
+    }
+    attention_rope_count(RF_REQUESTS);
+    if (mode<0 || !rope_consumed || !attention_rope_validate(heads,sinks,q,window,n_raw,raw_start,
+        comp_kv,selected_ids,source_rows,selected_rows,s,pos,true)) return attention_rope_failure();
+    pthread_once(&rope_once,init_rope);
+    const struct attention_rope_scope rope={pos,compressed};
+    attention_register_count(AR_REQUESTS);
+    const int ok=attention_direct_impl(heads,sinks,q,window,n_raw,raw_start,comp_kv,selected_ids,source_rows,selected_rows,s,1,&rope);
+    if (!ok) {attention_register_count(AR_FAILURES);return attention_rope_failure();}
+    *rope_consumed=true;
+    return 1;
 }
