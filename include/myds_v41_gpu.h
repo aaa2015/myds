@@ -288,14 +288,12 @@ typedef struct {
 void myds_v41_gpu_attention_packed_register_counters(
     myds_v41_gpu_attention_packed_register_counters_t *out,bool reset);
 /* Ordinary single-query reducer -> inverse rope_round fusion. Default off.
- * Production MYDS_ATTN_ROPE_FUSE=1 is rejected at initialization: the component
- * exact-parity gate has not passed. Only a private fixture compiled with
- * MYDS_ATTN_ROPE_FUSE_PRIVATE_PROBE=1 permits the candidate, and still requires
- * packed-register1/physical8/reduce1. This is not a runtime environment bypass.
- * Explicit failure never retries the original. Generic APIs below stay intact.
- * The scoped APIs always initialize *rope_consumed=false; in a private probe,
- * true means the fused inverse RoPE/BF16 operation was encoded, while exact
- * parity still requires comparison to the original production oracle. Retain
+ * Strict MYDS_ATTN_ROPE_FUSE=1 requires packed-register1/physical8/reduce1;
+ * malformed flags/configurations fail initialization. Explicit candidate
+ * failure never retries the original. Generic APIs below stay intact.
+ * The scoped APIs always initialize *rope_consumed=false; true means the
+ * fused inverse RoPE/BF16 operation was successfully encoded. Outside ordinary
+ * nontrace scope they use original attention and leave rope_consumed=false. Retain
  * the heads -> OutputA RAW join and skip only its separate rope_round dispatch.
  * Requests include predispatch failures; encoded counts the actual fused PSO,
  * even if standalone command completion subsequently fails. */
