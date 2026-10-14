@@ -30,6 +30,7 @@ REJECTIONS = ('selected_PSO_absent_in_real_golden_library', 'pos_limit', 'short_
               'raw_start_limit', 'selected_too_large', 'forged_cpu_pointer')
 NEGATIVE_LENGTHS = (131072, 262144, 256, 19456, 4, 2048, 131104, 655360, 65600, 4210688, 1280)
 CANARY = b'\xa5' * 16
+RUNTIME_INVERSE_STORE_SHA = 'b4cfb0a2807550f924e4097709afa069a636acb3840890d6e718f96fe9de5dec'
 PROVIDERS = {'production-unrotated': 'cold_golden', 'out0': 'cold_golden', 'out1': 'private_debug', 'out2': 'private_debug', 'out3': 'deployed_candidate'}
 
 
@@ -149,11 +150,30 @@ def source_contract(root, identity, deployment):
     need('uint pos, inverse;' in source and source.count('rope.inverse ? -precise::sin(') == 2,
          'Runtime inverse sign selection missing')
     helper = extract(source, 'myds_attention_rope_store', 'static inline float4 ')
-    for expression in ('re0*c0-im0*s0', 're0*s0+im0*c0', 're1*c1-im1*s1', 're1*s1+im1*c1'):
-        need(expression in helper, 'Original RoPE expression changed')
+    variant = store_contract(helper)
     need('fused.inverse' not in extract(source, FUSED, 'kernel void '), 'Shader inverse guard may constant-fold sign select')
     return {'original_helper_sha256': sha(original.encode()), 'candidate_helper_sha256': sha(candidate.encode()),
-            'reconstructed_original_exact': True, 'args_bytes': 336, 'pos_offset': 200, 'inverse_offset': 204, 'frequencies_offset': 208}
+            'reconstructed_original_exact': True, 'args_bytes': 336, 'pos_offset': 200, 'inverse_offset': 204, 'frequencies_offset': 208,
+            'imag_arithmetic_variant': variant, 'rope_store_helper_sha256': sha(helper.encode())}
+
+
+def store_contract(helper):
+    old = ('myds_attention_rope_bf16(re0*s0+im0*c0)', 'myds_attention_rope_bf16(re1*s1+im1*c1)')
+    new = ('myds_attention_rope_bf16(precise::fma(im0,c0,re0*s0))', 'myds_attention_rope_bf16(precise::fma(im1,c1,re1*s1))')
+    if all(helper.count(value) == 1 for value in old) and all(value not in helper for value in new):
+        restored = helper; variant = 'runtime_inverse_expression'
+    elif all(helper.count(value) == 1 for value in new) and all(value not in helper for value in old):
+        restored = helper
+        for before, after in zip(new, old): restored = restored.replace(before, after, 1)
+        annotation = '''        /* Pin the original scalar AIR's imaginary operand order (im*c,re*s).
+         * This contraction direction is a parity candidate, not M2 ISA proof. */
+'''
+        need(restored.count(annotation) == 1, 'Exact new-variant explanatory comment differs')
+        restored = restored.replace(annotation, '', 1)
+        variant = 'runtime_inverse_explicit_imag_fma'
+    else: raise ValueError('Both imaginary terms must use one exact allowed arithmetic contract')
+    need(sha(restored.encode()) == RUNTIME_INVERSE_STORE_SHA, 'RoPE helper changed outside the two allowed imaginary terms')
+    return variant
 
 
 def expected_constants(pad):

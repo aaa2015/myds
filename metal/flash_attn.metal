@@ -2367,9 +2367,11 @@ static inline float4 myds_attention_rope_store(float4 value, uint oc,
         const float s1 = rope.inverse ? -precise::sin(theta1) : precise::sin(theta1);
         const float re0=result.x, im0=result.y, re1=result.z, im1=result.w;
         result.x = myds_attention_rope_bf16(re0*c0-im0*s0);
-        result.y = myds_attention_rope_bf16(re0*s0+im0*c0);
+        /* Pin the original scalar AIR's imaginary operand order (im*c,re*s).
+         * This contraction direction is a parity candidate, not M2 ISA proof. */
+        result.y = myds_attention_rope_bf16(precise::fma(im0,c0,re0*s0));
         result.z = myds_attention_rope_bf16(re1*c1-im1*s1);
-        result.w = myds_attention_rope_bf16(re1*s1+im1*c1);
+        result.w = myds_attention_rope_bf16(precise::fma(im1,c1,re1*s1));
     }
     return result;
 }
