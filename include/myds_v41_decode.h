@@ -1,7 +1,9 @@
 #ifndef MYDS_V41_DECODE_H
 #define MYDS_V41_DECODE_H
 
+#include "myds.h"
 #include "myds_metal.h"
+#include "myds_v41_gpu.h"
 #include <stdbool.h>
 
 /* Single-token output-B/shared-expert projection only. The caller retains its
@@ -30,5 +32,59 @@ typedef struct {
 } myds_v41_decode_qkv_scope_t;
 void myds_v41_decode_qkv_scope_begin(myds_v41_decode_qkv_scope_t *scope, bool trace_on);
 void myds_v41_decode_qkv_scope_end(myds_v41_decode_qkv_scope_t *scope);
+
+/* Default-off ordinary-decode attention HC stage overlap (MYDS_ATTN_HC_OVERLAP)
+ * and compressor/indexer decode cohort overlap (MYDS_INDEXER_DECODE_OVERLAP).
+ * Both accept only absent/0/1 (default 0) and fail closed on invalid env,
+ * incompatible pipeline settings, aliasing scratch, or stage failures. */
+int myds_v41_attn_hc_overlap_enabled(void);
+int myds_v41_attn_hc_overlap_parse_mode(void);
+void myds_v41_attn_hc_overlap_reset_mode(void);
+void myds_v41_attn_hc_overlap_counters(myds_metal_decode_candidate_counters_t *out, bool reset);
+
+int myds_v41_indexer_decode_overlap_enabled(void);
+int myds_v41_indexer_decode_overlap_parse_mode(void);
+void myds_v41_indexer_decode_overlap_reset_mode(void);
+void myds_v41_indexer_decode_overlap_counters(myds_metal_decode_candidate_counters_t *out, bool reset);
+
+typedef struct {
+    uint32_t layer, pos, capacity;
+    float hc_eps;
+    myds_metal_buffer_t *residual;
+    const myds_metal_buffer_t *hc_in_pre;
+    myds_metal_buffer_t *attn_split;
+    const myds_metal_buffer_t *attn_fn;
+    const myds_metal_buffer_t *attn_scale;
+    const myds_metal_buffer_t *attn_base;
+    myds_metal_buffer_t *flat_norm;
+    myds_metal_buffer_t *mix;
+    myds_metal_buffer_t *window;
+    const myds_metal_buffer_t *compressor_kv;
+    const myds_metal_buffer_t *compressor_gate;
+    const myds_metal_buffer_t *compressor_norm;
+    const myds_metal_buffer_t *index_k_weight;
+    const myds_metal_buffer_t *index_k_norm;
+    const myds_metal_buffer_t *index_q_weight;
+    const myds_metal_buffer_t *index_proj_weight;
+    myds_metal_buffer_t *pool_kv;
+    myds_metal_buffer_t *pool_score;
+    myds_metal_buffer_t *latent;
+    myds_metal_buffer_t *previous_kv;
+    myds_metal_buffer_t *previous_score;
+    myds_metal_buffer_t *compressed_kv;
+    myds_metal_buffer_t *index_cache;
+    myds_metal_buffer_t *index_k_buf;
+    myds_metal_buffer_t *index_q_buf;
+    myds_metal_buffer_t *index_weights;
+    myds_metal_buffer_t *index_scores;
+    myds_metal_buffer_t *selected;
+    myds_metal_buffer_t *block_scores;
+    myds_metal_buffer_t *block_selected;
+    myds_metal_buffer_t *block_mask;
+    myds_v41_gpu_scratch_t *gpu_scratch;
+} myds_v41_decode_attn_args_t;
+
+int myds_v41_decode_attn_indexer_scoped(myds_context_t *ctx,
+    const myds_v41_decode_attn_args_t *args, bool ordinary_decode_allowed);
 
 #endif

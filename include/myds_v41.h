@@ -3,6 +3,7 @@
 
 #include "myds.h"
 #include "myds_engram.h"
+#include "myds_v41_decode.h"
 #include <stdbool.h>
 
 typedef struct myds_v41_model myds_v41_model_t;

@@ -150,7 +150,9 @@ class BenchReproduceTests(unittest.TestCase):
                            ('dense_q4_v41_nb_mode', 'MYDS_DENSE_Q4_V41_NB'),
                            ('dense_q4_v41_head_reference_mode', 'MYDS_DENSE_Q4_V41_HEAD_REFERENCE'),
                            ('attention_rope_fuse_mode', 'MYDS_ATTN_ROPE_FUSE'),
-                           ('moe_hc_overlap_mode', 'MYDS_MOE_HC_OVERLAP')):
+                           ('moe_hc_overlap_mode', 'MYDS_MOE_HC_OVERLAP'),
+                           ('attn_hc_overlap_mode', 'MYDS_ATTN_HC_OVERLAP'),
+                           ('indexer_decode_overlap_mode', 'MYDS_INDEXER_DECODE_OVERLAP')):
             loaded[mode] = int(records[0]['environment'].get(flag) == '1')
 
         loaded.update(dspark_loaded=support is not None, dspark_load_s=0.01 if support else 0,

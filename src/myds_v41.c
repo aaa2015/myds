@@ -2536,7 +2536,9 @@ void myds_v41_engram_project_round_counters(
 
 myds_v41_context_t *myds_v41_context_create(myds_context_t *ctx) {
     const int round_skip = engram_round_parse_mode();
-    if (round_skip < 0 || myds_v41_moe_hc_overlap_parse_mode()<0) return NULL;
+    if (round_skip < 0 || myds_v41_moe_hc_overlap_parse_mode()<0 ||
+        myds_v41_attn_hc_overlap_parse_mode()<0 ||
+        myds_v41_indexer_decode_overlap_parse_mode()<0) return NULL;
     if (!ctx || !ctx->model->v41 || !ctx->cfg.max_seq_len || ctx->cfg.max_seq_len>1048576u)
         return NULL;
     /* Basic buffers are allocated by the shared context constructor. */
@@ -3651,7 +3653,54 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
                 v->engram_q[e],v->engram_k[e],m->norm_eps,ordinary_decode_allowed,need_logits,trace_on,fine_pipeline));
             TRACE("engram_out",g->residual,4*V41_DIM);
         }
-        if (trace_on || !qkv_pipeline_enabled) {
+        const int attn_hc_mode = myds_v41_attn_hc_overlap_enabled();
+        const int idx_overlap_mode = myds_v41_indexer_decode_overlap_enabled();
+        if (attn_hc_mode < 0 || idx_overlap_mode < 0) goto fail;
+        const bool use_decode_attn_overlap = ordinary_decode_allowed && need_logits && !trace_on &&
+            (attn_hc_mode == 1 || (idx_overlap_mode == 1 && index_source(il)));
+        if (use_decode_attn_overlap) {
+            const uint32_t owner = owner_for(il);
+            const myds_v41_decode_attn_args_t decode_args = {
+                .layer = il,
+                .pos = pos,
+                .capacity = g->capacity,
+                .hc_eps = v->hc_eps,
+                .residual = g->residual,
+                .hc_in_pre = (il == 0 ? g->pre : g->ffn_split),
+                .attn_split = g->attn_split,
+                .attn_fn = l->attn_fn,
+                .attn_scale = l->attn_scale,
+                .attn_base = l->attn_base,
+                .flat_norm = g->flat_norm,
+                .mix = g->mix,
+                .window = g->window[il],
+                .compressor_kv = l->compressor_kv,
+                .compressor_gate = l->compressor_gate,
+                .compressor_norm = l->compressor_norm,
+                .index_k_weight = l->index_k,
+                .index_k_norm = l->index_k_norm,
+                .index_q_weight = l->index_q,
+                .index_proj_weight = l->index_proj,
+                .pool_kv = g->pool_kv,
+                .pool_score = g->pool_score,
+                .latent = g->latent,
+                .previous_kv = g->previous_kv[owner],
+                .previous_score = g->previous_score[owner],
+                .compressed_kv = g->compressed[owner],
+                .index_cache = g->index_cache[owner],
+                .index_k_buf = g->index_k,
+                .index_q_buf = g->index_q,
+                .index_weights = g->index_weights,
+                .index_scores = g->index_scores,
+                .selected = g->selected,
+                .block_scores = g->block_scores,
+                .block_selected = g->block_selected,
+                .block_mask = g->block_mask,
+                .gpu_scratch = g->gpu,
+            };
+            phase = "attention / indexer overlap";
+            CHECK(myds_v41_decode_attn_indexer_scoped(ctx, &decode_args, true));
+        } else if (trace_on || !qkv_pipeline_enabled) {
             CHECK(myds_metal_v41_hc_mix(g->attn_split,g->residual,l->attn_fn,GGML_TYPE_F16,l->attn_scale,l->attn_base,g->flat_norm,g->mix,V41_DIM,m->norm_eps,v->hc_eps));
             TRACE("hc_attn_mix",g->mix,24); TRACE("hc_attn_split",g->attn_split,24);
             const myds_metal_buffer_t *hc_in_pre = (il == 0 ? g->pre : g->ffn_split);

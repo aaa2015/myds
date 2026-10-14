@@ -1320,5 +1320,620 @@ int myds_dspark_moe(myds_metal_buffer_t *moe_out,
     return 1;
 }
 
+static _Atomic uint64_t attn_hc_overlap_requests, attn_hc_overlap_encoded, attn_hc_overlap_failures;
+static _Atomic int attn_hc_overlap_mode;
+
+int myds_v41_attn_hc_overlap_parse_mode(void) {
+    const char *v = getenv("MYDS_ATTN_HC_OVERLAP");
+    const int mode = (!v || !strcmp(v, "0")) ? 0 : !strcmp(v, "1") ? 1 : -1;
+    if (mode < 0) MYDS_LOG_E("MYDS_ATTN_HC_OVERLAP must be exactly 0 or 1");
+    atomic_store_explicit(&attn_hc_overlap_mode, mode, memory_order_relaxed);
+    return mode;
+}
+
+int myds_v41_attn_hc_overlap_enabled(void) {
+    return atomic_load_explicit(&attn_hc_overlap_mode, memory_order_relaxed);
+}
+
+void myds_v41_attn_hc_overlap_reset_mode(void) {
+    atomic_store_explicit(&attn_hc_overlap_mode, 0, memory_order_relaxed);
+}
+
+void myds_v41_attn_hc_overlap_counters(myds_metal_decode_candidate_counters_t *out, bool reset) {
+#define ATTN_HC_OVERLAP_COUNT(field) \
+    (reset ? atomic_exchange_explicit(&attn_hc_overlap_##field, 0, memory_order_relaxed) \
+           : atomic_load_explicit(&attn_hc_overlap_##field, memory_order_relaxed))
+    const myds_metal_decode_candidate_counters_t value = {
+        .requests = ATTN_HC_OVERLAP_COUNT(requests),
+        .encoded = ATTN_HC_OVERLAP_COUNT(encoded),
+        .failures = ATTN_HC_OVERLAP_COUNT(failures)};
+    if (out) *out = value;
+#undef ATTN_HC_OVERLAP_COUNT
+}
+
+static _Atomic uint64_t indexer_decode_overlap_requests, indexer_decode_overlap_encoded, indexer_decode_overlap_failures;
+static _Atomic int indexer_decode_overlap_mode;
+
+int myds_v41_indexer_decode_overlap_parse_mode(void) {
+    const char *v = getenv("MYDS_INDEXER_DECODE_OVERLAP");
+    const int mode = (!v || !strcmp(v, "0")) ? 0 : !strcmp(v, "1") ? 1 : -1;
+    if (mode < 0) MYDS_LOG_E("MYDS_INDEXER_DECODE_OVERLAP must be exactly 0 or 1");
+    atomic_store_explicit(&indexer_decode_overlap_mode, mode, memory_order_relaxed);
+    return mode;
+}
+
+int myds_v41_indexer_decode_overlap_enabled(void) {
+    return atomic_load_explicit(&indexer_decode_overlap_mode, memory_order_relaxed);
+}
+
+void myds_v41_indexer_decode_overlap_reset_mode(void) {
+    atomic_store_explicit(&indexer_decode_overlap_mode, 0, memory_order_relaxed);
+}
+
+void myds_v41_indexer_decode_overlap_counters(myds_metal_decode_candidate_counters_t *out, bool reset) {
+#define INDEXER_DECODE_OVERLAP_COUNT(field) \
+    (reset ? atomic_exchange_explicit(&indexer_decode_overlap_##field, 0, memory_order_relaxed) \
+           : atomic_load_explicit(&indexer_decode_overlap_##field, memory_order_relaxed))
+    const myds_metal_decode_candidate_counters_t value = {
+        .requests = INDEXER_DECODE_OVERLAP_COUNT(requests),
+        .encoded = INDEXER_DECODE_OVERLAP_COUNT(encoded),
+        .failures = INDEXER_DECODE_OVERLAP_COUNT(failures)};
+    if (out) *out = value;
+#undef INDEXER_DECODE_OVERLAP_COUNT
+}
+
+static uint32_t decode_ratio_for(uint32_t l) { return l < 2u ? 0u : (l < 20u ? 2u : 1u); }
+static bool decode_kv_source(uint32_t l) { return l == 2u || l == 8u || l == 14u || l == 20u; }
+static bool decode_index_source(uint32_t l) {
+    return decode_kv_source(l) || (l >= 24u && l < 40u && l % 4u == 0u);
+}
+
+static bool env_default_on(const char *name) {
+    const char *v = getenv(name);
+    return !v || atoi(v) != 0;
+}
+
+static bool env_not_zero_literal(const char *name) {
+    const char *v = getenv(name);
+    return !(v && strcmp(v, "0") == 0);
+}
+
+static bool env_is_one_literal(const char *name) {
+    const char *v = getenv(name);
+    return v && strcmp(v, "1") == 0;
+}
+
+static bool env_block_budget_default(void) {
+    const char *v = getenv("MYDS_BLOCK_BUDGET");
+    return !v || atoi(v) <= 0;
+}
+
+typedef struct {
+    const myds_metal_buffer_t *buf;
+    size_t min_bytes;
+} decode_buf_span_t;
+
+static bool decode_spans_disjoint(const decode_buf_span_t *spans, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        if (!spans[i].buf || !spans[i].min_bytes) return false;
+        const uintptr_t a = (uintptr_t)myds_metal_buffer_data((myds_metal_buffer_t *)spans[i].buf);
+        const size_t sa = myds_metal_buffer_size(spans[i].buf);
+        if (!a || spans[i].min_bytes > sa || sa > UINTPTR_MAX - a) return false;
+        for (size_t j = 0; j < i; ++j) {
+            const uintptr_t b = (uintptr_t)myds_metal_buffer_data((myds_metal_buffer_t *)spans[j].buf);
+            const size_t sb = myds_metal_buffer_size(spans[j].buf);
+            if (a <= b ? (b - a < sa) : (a - b < sb)) return false;
+        }
+    }
+    return true;
+}
+
+static bool decode_layer_buffers_valid(const myds_context_t *ctx,
+    const myds_v41_decode_attn_args_t *args, bool check_indexer) {
+    const myds_layer_t *base = &ctx->model->layers[args->layer];
+    const uint32_t il = args->layer;
+    const uint32_t ratio = decode_ratio_for(il);
+    const uint32_t count = ratio ? (args->pos + 1u) / ratio : 0u;
+    const bool is_kv = decode_kv_source(il);
+    const bool is_idx = decode_index_source(il);
+    const bool kv_commit = is_kv && ratio != 0u && ((args->pos + 1u) % ratio == 0u);
+    const uint32_t blocks = (count + 7u) / 8u;
+
+    decode_buf_span_t spans[44];
+    size_t n = 0;
+#define ADD_SPAN(b, bytes) do { spans[n++] = (decode_buf_span_t){(b), (bytes)}; } while (0)
+    ADD_SPAN(args->flat_norm, 81920u);
+    ADD_SPAN(args->mix, 96u);
+    ADD_SPAN(args->attn_split, 96u);
+    ADD_SPAN(args->residual, 81920u);
+    ADD_SPAN(args->hc_in_pre, il == 0u ? 16u : 96u);
+    ADD_SPAN(args->attn_fn, 983040u);
+    ADD_SPAN(args->attn_scale, 12u);
+    ADD_SPAN(args->attn_base, 96u);
+    ADD_SPAN(args->window, 262144u);
+    ADD_SPAN(ctx->x, 20480u);
+    ADD_SPAN(ctx->x_norm, 20480u);
+    ADD_SPAN(ctx->qr, 5120u);
+    ADD_SPAN(ctx->qr_norm, 5120u);
+    ADD_SPAN(ctx->q, 131072u);
+    ADD_SPAN(ctx->kv_act, 2048u);
+    ADD_SPAN(base->attn_norm, 20480u);
+    ADD_SPAN(base->attn_q_a, 1u);
+    ADD_SPAN(base->attn_q_a_norm, 5120u);
+    ADD_SPAN(base->attn_q_b, 1u);
+    ADD_SPAN(base->attn_kv, 5242880u);
+    ADD_SPAN(base->attn_kv_a_norm, 2048u);
+
+    if (check_indexer && (is_kv || is_idx)) {
+        if (is_kv) {
+            ADD_SPAN(args->compressor_kv, 5242880u);
+            ADD_SPAN(args->pool_kv, 2048u);
+            ADD_SPAN(args->latent, 2048u);
+            if (ratio == 2u) {
+                ADD_SPAN(args->compressor_gate, 5242880u);
+                ADD_SPAN(args->pool_score, 2048u);
+                ADD_SPAN(args->previous_kv, 2048u);
+                ADD_SPAN(args->previous_score, 2048u);
+            }
+            if (kv_commit) {
+                ADD_SPAN(args->compressor_norm, 2048u);
+                ADD_SPAN(args->index_k_weight, 131072u);
+                ADD_SPAN(args->index_k_norm, 512u);
+                ADD_SPAN(args->index_k_buf, 512u);
+            }
+        }
+        if (kv_commit || (is_idx && count > 0u)) {
+            const size_t rows = count > 0u ? (size_t)count : 1u;
+            ADD_SPAN(args->compressed_kv, rows * 1024u);
+            ADD_SPAN(args->index_cache, rows * 256u);
+        }
+        if (is_idx && count > 0u) {
+            if (!args->gpu_scratch) return false;
+            ADD_SPAN(args->index_q_weight, 10485760u);
+            ADD_SPAN(args->index_proj_weight, 327680u);
+            ADD_SPAN(args->index_q_buf, 16384u);
+            ADD_SPAN(args->index_weights, 128u);
+            ADD_SPAN(args->index_scores, (size_t)count * 4u);
+            ADD_SPAN(args->selected, 2048u);
+            if (il >= 20u) ADD_SPAN(args->block_mask, (size_t)blocks * 4u);
+            if (il == 20u) {
+                ADD_SPAN(args->block_scores, (size_t)blocks * 4u);
+                ADD_SPAN(args->block_selected, 8192u);
+            }
+        }
+    }
+#undef ADD_SPAN
+    return decode_spans_disjoint(spans, n);
+}
+
+static int ref_project_f16(myds_metal_buffer_t *out, const myds_metal_buffer_t *w,
+    const myds_metal_buffer_t *in, uint32_t rows, uint32_t width, bool round, bool ordinary_allowed) {
+    if (ordinary_allowed && round && myds_metal_f16_gemv_bf16_fuse_enabled() == 1) {
+        if (myds_metal_get_auto_barrier()) myds_metal_barrier();
+        else myds_metal_barrier_buffer(in);
+        if (!myds_metal_v41_gemv_f16_bf16(out, w, in, rows, width)) return 0;
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(out);
+        return 1;
+    }
+    if (myds_metal_get_auto_barrier()) myds_metal_barrier();
+    else myds_metal_barrier_buffer(in);
+    if (!myds_metal_v41_gemv(out, w, in, rows, width, GGML_TYPE_F16)) return 0;
+    if (round) {
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(out);
+        if (!myds_metal_v41_bf16(out, rows)) return 0;
+    }
+    if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(out);
+    return 1;
+}
+
+static int ref_publish_compressor_decode(const myds_context_t *ctx,
+    const myds_v41_decode_attn_args_t *args, bool ordinary_allowed) {
+    const uint32_t il = args->layer;
+    const uint32_t ratio = decode_ratio_for(il);
+    if (!ratio || !decode_kv_source(il)) return 1;
+    const uint32_t count = (args->pos + 1u) / ratio;
+    const float eps = ctx->model->norm_eps;
+#define CHECK(x) do { if (!(x)) return 0; } while (0)
+    CHECK(ref_project_f16(args->pool_kv, args->compressor_kv, ctx->x_norm, 512u, 5120u, ratio == 1u, ordinary_allowed));
+    if (ratio == 2u) {
+        CHECK(ref_project_f16(args->pool_score, args->compressor_gate, ctx->x_norm, 512u, 5120u, false, false));
+        if (!myds_metal_get_auto_barrier()) {
+            const myds_metal_buffer_t *pool_deps[] = { args->pool_kv, args->pool_score };
+            myds_metal_barrier_buffers(pool_deps, 2);
+        }
+        CHECK(myds_v41_gpu_pool2(args->latent, args->pool_kv, args->pool_score,
+            args->previous_kv, args->previous_score, 512u, args->pos));
+    } else {
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(args->pool_kv);
+        CHECK(myds_metal_buffer_copy(args->latent, 0, args->pool_kv, 0, 512u * 4u));
+    }
+    if ((args->pos + 1u) % ratio == 0u) {
+        const uint32_t start = args->pos + 1u - ratio;
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(args->latent);
+        CHECK(myds_metal_v41_rmsnorm(args->latent, args->latent, args->compressor_norm, 512u, eps, true));
+        CHECK(ref_project_f16(args->index_k_buf, args->index_k_weight, args->latent, 128u, 512u, true, ordinary_allowed));
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(args->index_k_buf);
+        CHECK(myds_metal_v41_rmsnorm(args->index_k_buf, args->index_k_buf, args->index_k_norm, 128u, eps, true));
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(args->index_k_buf);
+        if (ordinary_allowed && myds_metal_indexer_rope_quant_fuse_enabled() == 1) {
+            CHECK(myds_v41_gpu_indexer_rope_quant(args->index_k_buf, 1u, start));
+        } else {
+            CHECK(myds_v41_gpu_rope(args->index_k_buf, 128u, 1u, start, true, false));
+            if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(args->index_k_buf);
+            CHECK(myds_v41_gpu_quant(args->index_k_buf, 128u, 1u, 2u));
+        }
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(args->index_k_buf);
+        CHECK(myds_v41_gpu_pack_bf16(args->index_cache, (size_t)(count - 1u) * 128u, args->index_k_buf, 0, 128u));
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(args->latent);
+        CHECK(myds_v41_gpu_rope(args->latent, 512u, 1u, start, true, false));
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(args->latent);
+        CHECK(myds_v41_gpu_quant(args->latent, 512u, 1u, 3u));
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(args->latent);
+        CHECK(myds_v41_gpu_pack_bf16(args->compressed_kv, (size_t)(count - 1u) * 512u, args->latent, 0, 512u));
+        if (!myds_metal_get_auto_barrier()) {
+            const myds_metal_buffer_t *comp_out[] = { args->index_cache, args->compressed_kv };
+            myds_metal_barrier_buffers(comp_out, 2);
+        }
+    }
+#undef CHECK
+    return 1;
+}
+
+static int ref_publish_index_weights_decode(const myds_context_t *ctx,
+    const myds_v41_decode_attn_args_t *args, bool ordinary_allowed) {
+    const uint32_t il = args->layer;
+    const uint32_t ratio = decode_ratio_for(il);
+    if (!ratio) return 1;
+    const uint32_t count = (args->pos + 1u) / ratio;
+    if (count && decode_index_source(il)) {
+        return ref_project_f16(args->index_weights, args->index_proj_weight, ctx->x_norm,
+                               32u, 5120u, true, ordinary_allowed);
+    }
+    return 1;
+}
+
+static int ref_publish_indexer_one(const myds_context_t *ctx,
+    const myds_v41_decode_attn_args_t *args, bool ordinary_allowed) {
+    const uint32_t il = args->layer;
+    const uint32_t ratio = decode_ratio_for(il);
+    if (!ratio) return 1;
+    const uint32_t count = (args->pos + 1u) / ratio;
+    if (!count || !decode_index_source(il)) return 1;
+#define CHECK(x) do { if (!(x)) return 0; } while (0)
+    CHECK(ref_project_f16(args->index_q_buf, args->index_q_weight, ctx->qr_norm, 32u * 128u, 1280u, true, ordinary_allowed));
+    if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(args->index_q_buf);
+    if (ordinary_allowed && myds_metal_indexer_rope_quant_fuse_enabled() == 1) {
+        CHECK(myds_v41_gpu_indexer_rope_quant(args->index_q_buf, 32u, args->pos));
+    } else {
+        CHECK(myds_v41_gpu_rope(args->index_q_buf, 128u, 32u, args->pos, true, false));
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(args->index_q_buf);
+        CHECK(myds_v41_gpu_quant(args->index_q_buf, 128u, 32u, 2u));
+    }
+    const myds_metal_buffer_t *b_mask = (il > 20u) ? args->block_mask : NULL;
+    if (!myds_metal_get_auto_barrier()) {
+        const myds_metal_buffer_t *score_deps[] = { args->index_q_buf, args->index_weights, args->index_cache };
+        myds_metal_barrier_buffers(score_deps, 3);
+    }
+    if (ordinary_allowed && myds_v41_gpu_indexer_head_slots_enabled() == 1) {
+        CHECK(myds_v41_gpu_indexscores_head_slots(args->index_scores, args->index_q_buf,
+            args->index_weights, args->index_cache, b_mask, count, 32u, true));
+    } else {
+        CHECK(myds_v41_gpu_indexscores_masked_bf16(args->index_scores, args->index_q_buf,
+            args->index_weights, args->index_cache, b_mask, count, 32u));
+    }
+    if (il == 20u) {
+        const uint32_t blocks = (count + 7u) / 8u;
+        const uint32_t top = blocks < 2048u ? blocks : 2048u;
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(args->index_scores);
+        CHECK(myds_v41_gpu_candidates(args->block_scores, args->index_scores, count, args->pos, ratio));
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(args->block_scores);
+        CHECK(myds_v41_gpu_topk(args->block_selected, args->block_scores, blocks, top, args->gpu_scratch));
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(args->block_selected);
+        CHECK(myds_v41_gpu_topkmask(args->block_mask, args->block_selected, blocks, top));
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(args->block_mask);
+    } else if (il > 20u) {
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(args->index_scores);
+        CHECK(myds_v41_gpu_filter(args->index_scores, b_mask, count, args->pos, ratio));
+    }
+    if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(args->index_scores);
+    const uint32_t top_k = count < 512u ? count : 512u;
+    if (ordinary_allowed && myds_v41_gpu_topk_threshold_enabled() == 1) {
+        CHECK(myds_v41_gpu_topk_threshold(args->selected, args->index_scores, count, top_k, args->gpu_scratch));
+    } else {
+        CHECK(myds_v41_gpu_topk(args->selected, args->index_scores, count, top_k, args->gpu_scratch));
+    }
+    if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(args->selected);
+#undef CHECK
+    return 1;
+}
+
+int myds_v41_decode_attn_indexer_scoped(myds_context_t *ctx,
+    const myds_v41_decode_attn_args_t *args, bool ordinary_decode_allowed) {
+    const int attn_hc_mode = myds_v41_attn_hc_overlap_enabled();
+    const int idx_overlap_mode = myds_v41_indexer_decode_overlap_enabled();
+    if (attn_hc_mode < 0 || idx_overlap_mode < 0) return 0;
+
+    const bool trace_on = myds_trace_active();
+    const bool in_idx_scope = !args || args->layer >= 40u || decode_index_source(args->layer);
+    const bool want_attn_hc = (attn_hc_mode == 1) && ordinary_decode_allowed && !trace_on;
+    const bool want_idx_overlap = (idx_overlap_mode == 1) && ordinary_decode_allowed && !trace_on && in_idx_scope;
+
+    if (want_attn_hc) atomic_fetch_add_explicit(&attn_hc_overlap_requests, 1, memory_order_relaxed);
+    if (want_idx_overlap) atomic_fetch_add_explicit(&indexer_decode_overlap_requests, 1, memory_order_relaxed);
+
+    const bool struct_ok = ctx && ctx->model && ctx->model->layers && args &&
+        args->layer < ctx->model->n_layers && ctx->model->n_layers == 40u &&
+        ctx->model->dim == 5120u && ctx->model->n_heads == 64u && ctx->model->head_dim == 512u &&
+        isfinite(ctx->model->norm_eps) && ctx->model->norm_eps >= 0.0f &&
+        isfinite(args->hc_eps) && args->hc_eps >= 0.0f &&
+        args->pos < args->capacity && args->pos < ctx->cfg.max_seq_len;
+
+    if (!struct_ok) {
+        if (want_attn_hc) atomic_fetch_add_explicit(&attn_hc_overlap_failures, 1, memory_order_relaxed);
+        if (want_idx_overlap) atomic_fetch_add_explicit(&indexer_decode_overlap_failures, 1, memory_order_relaxed);
+        return 0;
+    }
+
+    const myds_model_t *m = ctx->model;
+    const myds_layer_t *base = &m->layers[args->layer];
+    const uint32_t il = args->layer;
+    const uint32_t pos = args->pos;
+    const uint32_t ratio = decode_ratio_for(il);
+    const bool compressed = ratio != 0u;
+    const uint32_t count = compressed ? (pos + 1u) / ratio : 0u;
+    const bool is_kv = decode_kv_source(il);
+    const bool kv_commit = is_kv && compressed && ((pos + 1u) % ratio == 0u);
+
+    const bool base_pipeline_ok = myds_metal_batch_active() &&
+        env_default_on("MYDS_QKV_PIPELINE") &&
+        env_default_on("MYDS_ATTN_OUTPUT_PIPELINE") &&
+        env_default_on("MYDS_DECODE_CONCURRENT") &&
+        env_default_on("MYDS_ATTN_INDEXER_PIPELINE") &&
+        env_default_on("MYDS_ATTN_INDEXER_EARLY") &&
+        env_default_on("MYDS_FUSE_HC_SUM_RMSNORM") &&
+        env_not_zero_literal("MYDS_QKV_FUSE_BF16") &&
+        env_not_zero_literal("MYDS_QKV_FUSE_POST") &&
+        !env_is_one_literal("MYDS_QKV_CONCURRENT") &&
+        myds_metal_dense_q4_v41_enabled() == 1 &&
+        base->attn_q_a_type == GGML_TYPE_Q8_0 &&
+        base->attn_q_b_type == GGML_TYPE_Q4_K &&
+        base->attn_kv_type == GGML_TYPE_F16;
+
+    const bool idx_pipeline_ok = base_pipeline_ok &&
+        myds_metal_f16_gemv_bf16_fuse_enabled() == 1 &&
+        myds_metal_indexer_rope_quant_fuse_enabled() == 1 &&
+        myds_v41_gpu_indexer_head_slots_enabled() == 1 &&
+        myds_v41_gpu_topk_threshold_enabled() == 0 &&
+        !env_is_one_literal("MYDS_INDEXER_COMPACT_SCORER") &&
+        env_block_budget_default();
+
+    if (!want_attn_hc && !want_idx_overlap) {
+        if (!decode_layer_buffers_valid(ctx, args, true)) return 0;
+        const int prev_auto = myds_metal_get_auto_barrier();
+        const int prev_conc = myds_metal_get_concurrent();
+        myds_metal_set_auto_barrier(0);
+        myds_metal_set_concurrent(1);
+#define REF_CHECK(call) do { if (!(call)) { \
+    myds_metal_set_auto_barrier(prev_auto); myds_metal_set_concurrent(prev_conc); return 0; } } while (0)
+        REF_CHECK(myds_metal_v41_hc_sum_rmsnorm(ctx->x_norm, ctx->x, args->residual,
+            args->hc_in_pre, base->attn_norm, 5120u, m->norm_eps, true));
+        myds_metal_barrier_buffer(ctx->x_norm);
+        REF_CHECK(myds_metal_v41_hc_mix(args->attn_split, args->residual, args->attn_fn, GGML_TYPE_F16,
+            args->attn_scale, args->attn_base, args->flat_norm, args->mix, 5120u, m->norm_eps, args->hc_eps));
+        REF_CHECK(myds_metal_v41_gemv_bf16(ctx->qr, base->attn_q_a, ctx->x_norm, 1280u, 5120u, base->attn_q_a_type));
+        REF_CHECK(myds_metal_v41_gemv_bf16(ctx->kv_act, base->attn_kv, ctx->x_norm, 512u, 5120u, base->attn_kv_type));
+        REF_CHECK(ref_publish_compressor_decode(ctx, args, ordinary_decode_allowed && !trace_on));
+        REF_CHECK(ref_publish_index_weights_decode(ctx, args, ordinary_decode_allowed && !trace_on));
+        const myds_metal_buffer_t *qkv_out[] = { ctx->qr, ctx->kv_act };
+        myds_metal_barrier_buffers(qkv_out, 2);
+        REF_CHECK(myds_metal_v41_rmsnorm(ctx->qr_norm, ctx->qr, base->attn_q_a_norm, 1280u, m->norm_eps, true));
+        REF_CHECK(myds_metal_v41_rmsnorm(ctx->kv_act, ctx->kv_act, base->attn_kv_a_norm, 512u, m->norm_eps, true));
+        const myds_metal_buffer_t *norm_out[] = { ctx->qr_norm, ctx->kv_act };
+        myds_metal_barrier_buffers(norm_out, 2);
+        if (ordinary_decode_allowed && !trace_on && myds_metal_dense_q4_v41_enabled() == 1) {
+            REF_CHECK(myds_metal_dense_q4_v41(ctx->q, base->attn_q_b, ctx->qr_norm, 64u * 512u, 1280u, true));
+        } else {
+            REF_CHECK(myds_metal_v41_gemv_bf16(ctx->q, base->attn_q_b, ctx->qr_norm, 64u * 512u, 1280u, base->attn_q_b_type));
+        }
+        REF_CHECK(ref_publish_indexer_one(ctx, args, ordinary_decode_allowed && !trace_on));
+        myds_metal_barrier_buffer(ctx->q);
+        REF_CHECK(myds_v41_gpu_qkv_finish(ctx->q, ctx->kv_act, args->window, pos, compressed));
+        const myds_metal_buffer_t *attn_in_deps[] = {
+            ctx->q, args->window, count ? args->selected : NULL, count ? args->compressed_kv : NULL
+        };
+        myds_metal_barrier_buffers(attn_in_deps, 4);
+#undef REF_CHECK
+        myds_metal_set_auto_barrier(prev_auto);
+        myds_metal_set_concurrent(prev_conc);
+        return 1;
+    }
+
+    if ((want_attn_hc && !base_pipeline_ok) || (want_idx_overlap && !idx_pipeline_ok) ||
+        !decode_layer_buffers_valid(ctx, args, true)) {
+        if (want_attn_hc) atomic_fetch_add_explicit(&attn_hc_overlap_failures, 1, memory_order_relaxed);
+        if (want_idx_overlap) atomic_fetch_add_explicit(&indexer_decode_overlap_failures, 1, memory_order_relaxed);
+        MYDS_LOG_E("Decode attention/indexer overlap preconditions failed; refusing fallback");
+        return 0;
+    }
+
+    const int previous_auto = myds_metal_get_auto_barrier();
+    const int previous_concurrent = myds_metal_get_concurrent();
+    myds_metal_set_auto_barrier(0);
+    myds_metal_set_concurrent(1);
+
+#define STAGE_CHECK(call) do { if (!(call)) goto failed; } while (0)
+    if (want_attn_hc) {
+        STAGE_CHECK(myds_metal_v41_hc_mix_stages_preflight(args->attn_split, args->residual,
+            args->attn_fn, args->attn_scale, args->attn_base, args->flat_norm, args->mix,
+            5120u, m->norm_eps, args->hc_eps));
+    }
+
+    /* Cohort 1: fused HC sum+RMSNorm for x_norm, plus HC mix norm stage when enabled. */
+    STAGE_CHECK(myds_metal_v41_hc_sum_rmsnorm(ctx->x_norm, ctx->x, args->residual,
+        args->hc_in_pre, base->attn_norm, 5120u, m->norm_eps, true));
+    if (want_attn_hc) {
+        STAGE_CHECK(myds_metal_v41_hc_mix_norm_stage(args->flat_norm, args->residual, 5120u, m->norm_eps));
+        const myds_metal_buffer_t *cohort1[] = { ctx->x_norm, args->flat_norm };
+        myds_metal_barrier_buffers(cohort1, 2);
+    } else {
+        myds_metal_barrier_buffer(ctx->x_norm);
+    }
+
+    if (!want_idx_overlap) {
+        /* MYDS_ATTN_HC_OVERLAP=1 with reference compressor/indexer schedule. */
+        STAGE_CHECK(myds_metal_v41_hc_mix_project_stage(args->mix, args->attn_fn, args->flat_norm, 5120u));
+        STAGE_CHECK(myds_metal_v41_gemv_bf16(ctx->qr, base->attn_q_a, ctx->x_norm, 1280u, 5120u, base->attn_q_a_type));
+        STAGE_CHECK(myds_metal_v41_gemv_bf16(ctx->kv_act, base->attn_kv, ctx->x_norm, 512u, 5120u, base->attn_kv_type));
+        STAGE_CHECK(ref_publish_compressor_decode(ctx, args, true));
+        STAGE_CHECK(ref_publish_index_weights_decode(ctx, args, true));
+        const myds_metal_buffer_t *cohort2[] = { ctx->qr, ctx->kv_act, args->mix };
+        myds_metal_barrier_buffers(cohort2, 3);
+
+        STAGE_CHECK(myds_metal_v41_hc_mix_split_stage(args->attn_split, args->mix,
+            args->attn_scale, args->attn_base, 5120u, args->hc_eps));
+        atomic_fetch_add_explicit(&attn_hc_overlap_encoded, 1, memory_order_relaxed);
+        STAGE_CHECK(myds_metal_v41_rmsnorm(ctx->qr_norm, ctx->qr, base->attn_q_a_norm, 1280u, m->norm_eps, true));
+        STAGE_CHECK(myds_metal_v41_rmsnorm(ctx->kv_act, ctx->kv_act, base->attn_kv_a_norm, 512u, m->norm_eps, true));
+        const myds_metal_buffer_t *cohort3[] = { ctx->qr_norm, ctx->kv_act };
+        myds_metal_barrier_buffers(cohort3, 2);
+
+        STAGE_CHECK(myds_metal_dense_q4_v41(ctx->q, base->attn_q_b, ctx->qr_norm, 64u * 512u, 1280u, true));
+        STAGE_CHECK(ref_publish_indexer_one(ctx, args, true));
+        myds_metal_barrier_buffer(ctx->q);
+        STAGE_CHECK(myds_v41_gpu_qkv_finish(ctx->q, ctx->kv_act, args->window, pos, compressed));
+        const myds_metal_buffer_t *attn_in_deps[] = {
+            ctx->q, args->window, count ? args->selected : NULL, count ? args->compressed_kv : NULL
+        };
+        myds_metal_barrier_buffers(attn_in_deps, 4);
+        myds_metal_set_auto_barrier(previous_auto);
+        myds_metal_set_concurrent(previous_concurrent);
+        return 1;
+    }
+
+    /* Overlapped compressor + indexer + QKV cohort schedule on index_source layers. */
+    /* Cohort 2: all x_norm (and flat_norm) consumers dispatched without intermediate barriers. */
+    if (want_attn_hc) {
+        STAGE_CHECK(myds_metal_v41_hc_mix_project_stage(args->mix, args->attn_fn, args->flat_norm, 5120u));
+    } else {
+        STAGE_CHECK(myds_metal_v41_hc_mix(args->attn_split, args->residual, args->attn_fn, GGML_TYPE_F16,
+            args->attn_scale, args->attn_base, args->flat_norm, args->mix, 5120u, m->norm_eps, args->hc_eps));
+    }
+    STAGE_CHECK(myds_metal_v41_gemv_bf16(ctx->qr, base->attn_q_a, ctx->x_norm, 1280u, 5120u, base->attn_q_a_type));
+    STAGE_CHECK(myds_metal_v41_gemv_bf16(ctx->kv_act, base->attn_kv, ctx->x_norm, 512u, 5120u, base->attn_kv_type));
+    if (is_kv) {
+        if (ratio == 1u) {
+            STAGE_CHECK(myds_metal_v41_gemv_f16_bf16(args->pool_kv, args->compressor_kv, ctx->x_norm, 512u, 5120u));
+        } else {
+            STAGE_CHECK(myds_metal_v41_gemv(args->pool_kv, args->compressor_kv, ctx->x_norm, 512u, 5120u, GGML_TYPE_F16));
+            STAGE_CHECK(myds_metal_v41_gemv(args->pool_score, args->compressor_gate, ctx->x_norm, 512u, 5120u, GGML_TYPE_F16));
+        }
+    }
+    if (count > 0u) {
+        STAGE_CHECK(myds_metal_v41_gemv_f16_bf16(args->index_weights, args->index_proj_weight, ctx->x_norm, 32u, 5120u));
+    }
+    const myds_metal_buffer_t *cohort2[] = {
+        ctx->qr, ctx->kv_act,
+        want_attn_hc ? args->mix : NULL,
+        is_kv ? args->pool_kv : NULL,
+        (is_kv && ratio == 2u) ? args->pool_score : NULL,
+        count ? args->index_weights : NULL
+    };
+    myds_metal_barrier_buffers(cohort2, 6);
+
+    /* Cohort 3: HC split stage (if want_attn_hc) + qr_norm + kv_act_norm + pool2/copy. */
+    if (want_attn_hc) {
+        STAGE_CHECK(myds_metal_v41_hc_mix_split_stage(args->attn_split, args->mix,
+            args->attn_scale, args->attn_base, 5120u, args->hc_eps));
+        atomic_fetch_add_explicit(&attn_hc_overlap_encoded, 1, memory_order_relaxed);
+    }
+    STAGE_CHECK(myds_metal_v41_rmsnorm(ctx->qr_norm, ctx->qr, base->attn_q_a_norm, 1280u, m->norm_eps, true));
+    STAGE_CHECK(myds_metal_v41_rmsnorm(ctx->kv_act, ctx->kv_act, base->attn_kv_a_norm, 512u, m->norm_eps, true));
+    if (is_kv) {
+        if (ratio == 2u) {
+            STAGE_CHECK(myds_v41_gpu_pool2(args->latent, args->pool_kv, args->pool_score,
+                args->previous_kv, args->previous_score, 512u, pos));
+        } else {
+            STAGE_CHECK(myds_metal_buffer_copy(args->latent, 0, args->pool_kv, 0, 512u * 4u));
+        }
+    }
+    const myds_metal_buffer_t *cohort3[] = {
+        ctx->qr_norm, ctx->kv_act, kv_commit ? args->latent : NULL
+    };
+    myds_metal_barrier_buffers(cohort3, 3);
+
+    /* Cohort 4: Q_B GEMV + index_q GEMV + compressor_norm dispatched concurrently. */
+    STAGE_CHECK(myds_metal_dense_q4_v41(ctx->q, base->attn_q_b, ctx->qr_norm, 64u * 512u, 1280u, true));
+    if (count > 0u) {
+        STAGE_CHECK(myds_metal_v41_gemv_f16_bf16(args->index_q_buf, args->index_q_weight, ctx->qr_norm, 32u * 128u, 1280u));
+    }
+    if (kv_commit) {
+        STAGE_CHECK(myds_metal_v41_rmsnorm(args->latent, args->latent, args->compressor_norm, 512u, m->norm_eps, true));
+    }
+    const myds_metal_buffer_t *cohort4[] = {
+        ctx->q, count ? args->index_q_buf : NULL, kv_commit ? args->latent : NULL
+    };
+    myds_metal_barrier_buffers(cohort4, 3);
+
+    /* Cohort 5: qkv_finish + indexer_rope_quant(index_q) + index_k GEMV dispatched concurrently. */
+    STAGE_CHECK(myds_v41_gpu_qkv_finish(ctx->q, ctx->kv_act, args->window, pos, compressed));
+    if (count > 0u) {
+        STAGE_CHECK(myds_v41_gpu_indexer_rope_quant(args->index_q_buf, 32u, pos));
+    }
+    if (kv_commit) {
+        const uint32_t start = pos + 1u - ratio;
+        STAGE_CHECK(myds_metal_v41_gemv_f16_bf16(args->index_k_buf, args->index_k_weight, args->latent, 128u, 512u));
+        const myds_metal_buffer_t *commit_deps[] = { args->index_k_buf, args->latent };
+        myds_metal_barrier_buffers(commit_deps, 2);
+        STAGE_CHECK(myds_metal_v41_rmsnorm(args->index_k_buf, args->index_k_buf, args->index_k_norm, 128u, m->norm_eps, true));
+        STAGE_CHECK(myds_v41_gpu_rope(args->latent, 512u, 1u, start, true, false));
+        myds_metal_barrier_buffers(commit_deps, 2);
+        STAGE_CHECK(myds_v41_gpu_indexer_rope_quant(args->index_k_buf, 1u, start));
+        STAGE_CHECK(myds_v41_gpu_quant(args->latent, 512u, 1u, 3u));
+        myds_metal_barrier_buffers(commit_deps, 2);
+        STAGE_CHECK(myds_v41_gpu_pack_bf16(args->index_cache, (size_t)(count - 1u) * 128u, args->index_k_buf, 0, 128u));
+        STAGE_CHECK(myds_v41_gpu_pack_bf16(args->compressed_kv, (size_t)(count - 1u) * 512u, args->latent, 0, 512u));
+    }
+
+    if (count > 0u) {
+        const myds_metal_buffer_t *b_mask = (il > 20u) ? args->block_mask : NULL;
+        const myds_metal_buffer_t *score_deps[] = {
+            args->index_q_buf, args->index_weights, args->index_cache,
+            kv_commit ? args->compressed_kv : NULL, b_mask, ctx->q, args->window
+        };
+        myds_metal_barrier_buffers(score_deps, 7);
+        STAGE_CHECK(myds_v41_gpu_indexscores_head_slots(args->index_scores, args->index_q_buf,
+            args->index_weights, args->index_cache, b_mask, count, 32u, true));
+        myds_metal_barrier_buffer(args->index_scores);
+        if (il == 20u) {
+            const uint32_t blocks = (count + 7u) / 8u;
+            const uint32_t top_blocks = blocks < 2048u ? blocks : 2048u;
+            STAGE_CHECK(myds_v41_gpu_candidates(args->block_scores, args->index_scores, count, pos, ratio));
+            myds_metal_barrier_buffer(args->block_scores);
+            STAGE_CHECK(myds_v41_gpu_topk(args->block_selected, args->block_scores, blocks, top_blocks, args->gpu_scratch));
+            STAGE_CHECK(myds_v41_gpu_topkmask(args->block_mask, args->block_selected, blocks, top_blocks));
+        }
+        const uint32_t top_k = count < 512u ? count : 512u;
+        STAGE_CHECK(myds_v41_gpu_topk(args->selected, args->index_scores, count, top_k, args->gpu_scratch));
+    } else {
+        const myds_metal_buffer_t *attn_in_deps[] = { ctx->q, args->window };
+        myds_metal_barrier_buffers(attn_in_deps, 2);
+    }
+
+    atomic_fetch_add_explicit(&indexer_decode_overlap_encoded, 1, memory_order_relaxed);
+    myds_metal_set_auto_barrier(previous_auto);
+    myds_metal_set_concurrent(previous_concurrent);
+#undef STAGE_CHECK
+    return 1;
+
+failed:
+    if (want_attn_hc) atomic_fetch_add_explicit(&attn_hc_overlap_failures, 1, memory_order_relaxed);
+    if (want_idx_overlap) atomic_fetch_add_explicit(&indexer_decode_overlap_failures, 1, memory_order_relaxed);
+    myds_metal_set_auto_barrier(previous_auto);
+    myds_metal_set_concurrent(previous_concurrent);
+    MYDS_LOG_E("Decode attention/indexer overlap stage failed; refusing fallback");
+    return 0;
+}
+
+
 
 
