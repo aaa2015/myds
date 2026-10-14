@@ -325,6 +325,13 @@ int myds_v41_gpu_attn_kv_reuse_prestage_window(myds_v41_gpu_scratch_t *scratch,
 void myds_v41_gpu_attn_kv_reuse_mark_fenced(myds_v41_gpu_scratch_t *scratch);
 void myds_v41_gpu_attn_kv_reuse_defer_q_rope(myds_v41_gpu_scratch_t *scratch,
     myds_metal_buffer_t *q,bool compressed);
+int myds_v41_gpu_rope_heads_slice(myds_v41_gpu_scratch_t *scratch,
+    myds_metal_buffer_t *x,uint32_t head_offset,uint32_t head_count,
+    uint32_t pos,bool compressed);
+void myds_v41_gpu_attn_kv_reuse_bind_topk_qb(myds_v41_gpu_scratch_t *scratch,
+    const myds_metal_buffer_t *qb_weight,const myds_metal_buffer_t *qb_input,
+    uint32_t pos,uint32_t qb_done_heads);
+uint32_t myds_v41_gpu_attn_kv_reuse_qb_done(const myds_v41_gpu_scratch_t *scratch);
 const myds_metal_buffer_t *myds_v41_gpu_scratch_kv_f16(const myds_v41_gpu_scratch_t *scratch);
 const myds_metal_buffer_t *myds_v41_gpu_scratch_pad(const myds_v41_gpu_scratch_t *scratch);
 myds_metal_buffer_t *myds_v41_gpu_scratch_partial(const myds_v41_gpu_scratch_t *scratch);

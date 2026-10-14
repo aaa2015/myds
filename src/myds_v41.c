@@ -3927,7 +3927,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
         }
         if (fine_pipeline) {
             const myds_metal_buffer_t *attn_low_deps[] = {
-                ctx->attn_low, prestage_engram ? g->engram_kv : NULL
+                ctx->attn_low, (prestage_engram && !engram_skip_round) ? g->engram_kv : NULL
             };
             myds_metal_barrier_buffers(attn_low_deps, 2);
         }
@@ -3937,22 +3937,26 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
         } else {
             CHECK(project_decode_tail(ctx->attn_out,base->attn_output_b,ctx->attn_low,V41_DIM,8192,base->attn_output_b_type,trace_on));
         }
+        if (prestage_engram && !engram_skip_round) {
+            CHECK(myds_metal_v41_bf16(g->engram_kv, 5u * V41_DIM));
+        }
         TRACE("attn_out",ctx->attn_out,V41_DIM);
         phase="HC FFN input";
         if (fine_pipeline) {
-            const myds_metal_buffer_t *expand_in[] = { ctx->attn_out, g->attn_split };
-            myds_metal_barrier_buffers(expand_in, 2);
+            if (use_decode_attn_overlap) {
+                myds_metal_barrier_buffer(ctx->attn_out);
+            } else {
+                const myds_metal_buffer_t *expand_in[] = { ctx->attn_out, g->attn_split };
+                myds_metal_barrier_buffers(expand_in, 2);
+            }
         } else if (!trace_on && qkv_pipeline_enabled) {
             myds_metal_barrier_buffer(g->attn_split);
         }
         CHECK(myds_metal_v41_hc_expand(g->after_attn,ctx->attn_out,g->residual,g->attn_split,V41_DIM));
-        if (prestage_engram && !engram_skip_round) {
-            CHECK(myds_metal_v41_bf16(g->engram_kv, 5u * V41_DIM));
-        }
         TRACE("after_attn",g->after_attn,4*V41_DIM);
         if (fine_pipeline) {
             const myds_metal_buffer_t *after_attn_deps[] = {
-                g->after_attn, (prestage_engram && !engram_skip_round) ? g->engram_kv : NULL
+                g->after_attn, prestage_engram ? g->engram_kv : NULL
             };
             myds_metal_barrier_buffers(after_attn_deps, 2);
         }

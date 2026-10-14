@@ -61,6 +61,8 @@ struct myds_v41_gpu_scratch {
     bool direct_kv_cache_valid, direct_pad_cache_valid;
     bool direct_deferred_q_compressed;
     myds_metal_buffer_t *direct_deferred_q;
+    const myds_metal_buffer_t *direct_deferred_qb_weight, *direct_deferred_qb_input;
+    uint32_t direct_deferred_q_pos, direct_deferred_qb_done, direct_deferred_q_rope_done;
     const myds_metal_buffer_t *direct_kv_comp_buf, *direct_kv_ids_buf;
     size_t direct_kv_comp_offset, direct_kv_ids_offset;
     uint32_t direct_kv_n_raw, direct_kv_source_rows, direct_kv_selected_rows, direct_kv_pos;
@@ -289,6 +291,24 @@ int myds_v41_gpu_rope_batch(myds_metal_buffer_t *x,uint32_t width,uint32_t heads
 int myds_v41_gpu_rope(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
     uint32_t pos,bool compressed,bool inverse) {
     return myds_v41_gpu_rope_batch(x,width,heads,pos,1,compressed,inverse);
+}
+int myds_v41_gpu_rope_heads_slice(myds_v41_gpu_scratch_t *s,
+    myds_metal_buffer_t *x,uint32_t head_offset,uint32_t head_count,
+    uint32_t pos,bool compressed) {
+    if(!head_count)return 1;
+    if(!s||!s->dv_view||!x||head_offset>=64u||head_count>64u-head_offset||
+       pos>=1048576u||!floats(x,64u*512u))return 0;
+    if(head_offset==0u&&head_count==64u)
+        return myds_v41_gpu_rope(x,512u,64u,pos,compressed,false);
+    const size_t byte_off=(size_t)head_offset*512u*sizeof(float);
+    const size_t byte_len=(size_t)head_count*512u*sizeof(float);
+    if(!myds_metal_buffer_update_sub_view(s->dv_view,x,byte_off,byte_len))return 0;
+    pthread_once(&rope_once,init_rope);
+    struct {uint32_t width,heads,rows,start,inverse,stride;float frequencies[32];} a={
+        512u,head_count,1u,pos,0u,1u,{0}};
+    memcpy(a.frequencies,rope_frequencies[compressed?1:0],sizeof(a.frequencies));
+    const myds_metal_buffer_t *b[]={s->dv_view};
+    return dispatch("kernel_dsv41_rope",&a,sizeof(a),b,1,head_count,1,1,32,1,1,0);
 }
 int myds_v41_gpu_rope_batch_round(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
     uint32_t start_pos,uint32_t rows,bool compressed,bool inverse) {
@@ -800,6 +820,18 @@ static int topk_rows_causal(myds_metal_buffer_t *ids,const myds_metal_buffer_t *
         .ne0=layout,.ne1=n_rows,.ne2=1,.ne3=1,.top_k=blocktop,
         .causal_start=causal_start,.causal_ratio=causal_ratio};
     const bool nan_fuse=prefix&&nan_fuse_requested;
+    const bool overlap_topk_qb = s && !myds_metal_get_auto_barrier() &&
+        s->direct_deferred_q && s->direct_deferred_qb_weight && s->direct_deferred_qb_input &&
+        !causal_ratio && n_rows == 1u && !prefix && npr >= 1u &&
+        s->direct_deferred_qb_done > 0u && s->direct_deferred_qb_done < 64u;
+    const myds_metal_buffer_t *qb_weight = overlap_topk_qb ? s->direct_deferred_qb_weight : NULL;
+    const myds_metal_buffer_t *qb_input = overlap_topk_qb ? s->direct_deferred_qb_input : NULL;
+    uint32_t qb_done = overlap_topk_qb ? s->direct_deferred_qb_done : 0u;
+    uint32_t rope_done = 0u;
+    if (s) {
+        s->direct_deferred_qb_weight = NULL;
+        s->direct_deferred_qb_input = NULL;
+    }
     const myds_metal_buffer_t *b[]={scores,npr==1?ids:tmp_a,s->topk_nan_partitions};
     if(!dispatch(nan_fuse?nan_fuse_sort:causal_ratio?"kernel_argsort_f32_i32_desc_causal":"kernel_argsort_f32_i32_desc",
         &a,sizeof(a),b,nan_fuse?3u:2u,npr*n_rows,1,1,nth,1,1,((size_t)nth*8+15)&~(size_t)15))return 0;
@@ -808,9 +840,28 @@ static int topk_rows_causal(myds_metal_buffer_t *ids,const myds_metal_buffer_t *
         atomic_fetch_add_explicit(&topk_prefix_counters[TP_ROWS],n_rows,memory_order_relaxed);
         atomic_fetch_add_explicit(&topk_nan_fuse_counters[TN_PARTITIONS],(uint64_t)npr*n_rows,memory_order_relaxed);
     }
+    if (overlap_topk_qb) {
+        if (!myds_v41_gpu_rope_heads_slice(s, s->direct_deferred_q, 0u, qb_done,
+                s->direct_deferred_q_pos, s->direct_deferred_q_compressed)) return 0;
+        rope_done = qb_done;
+        const uint32_t pass0_qb_target = (npr == 1u) ? 64u
+            : (qb_done + 16u < 64u ? qb_done + 16u : 64u);
+        if (pass0_qb_target > qb_done) {
+            if (!myds_metal_dense_q4_v41_qb_slice(s->direct_deferred_q, qb_weight, qb_input,
+                    qb_done * 512u, (pass0_qb_target - qb_done) * 512u, false)) return 0;
+            qb_done = pass0_qb_target;
+        }
+    }
     myds_metal_buffer_t *cur=tmp_a,*next=tmp_b;
     for(uint32_t len=blocktop;len<layout;len*=2) {
-        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(cur);
+        if (!myds_metal_get_auto_barrier()) {
+            if (overlap_topk_qb) {
+                const myds_metal_buffer_t *merge_deps[] = {cur, s->direct_deferred_q};
+                myds_metal_barrier_buffers(merge_deps, 2u);
+            } else {
+                myds_metal_barrier_buffer(cur);
+            }
+        }
         uint32_t nm=(layout+2*len-1)/(2*len);
         struct merge_args m={.ne00=n_cols,.ne01=n_rows,.ne02=1,.ne03=1,.nb00=4,
             .nb01=(uint64_t)n_cols*4,.nb02=(uint64_t)n_cols*n_rows*4,.nb03=(uint64_t)n_cols*n_rows*4,
@@ -831,7 +882,26 @@ static int topk_rows_causal(myds_metal_buffer_t *ids,const myds_metal_buffer_t *
         } else if(!dispatch(causal_ratio?"kernel_argsort_merge_f32_i32_desc_causal":
                             "kernel_argsort_merge_f32_i32_desc",
                             &m,sizeof(m),mb,3,nm*n_rows,1,1,len<512?len:512,1,1,0))return 0;
+        if (overlap_topk_qb) {
+            if (qb_done > rope_done) {
+                if (!myds_v41_gpu_rope_heads_slice(s, s->direct_deferred_q, rope_done,
+                        qb_done - rope_done, s->direct_deferred_q_pos,
+                        s->direct_deferred_q_compressed)) return 0;
+                rope_done = qb_done;
+            }
+            if (qb_done < 64u) {
+                const uint32_t qb_target = (nm == 1u) ? 64u
+                    : (qb_done + 10u < 64u ? qb_done + 10u : 64u);
+                if (!myds_metal_dense_q4_v41_qb_slice(s->direct_deferred_q, qb_weight, qb_input,
+                        qb_done * 512u, (qb_target - qb_done) * 512u, false)) return 0;
+                qb_done = qb_target;
+            }
+        }
         myds_metal_buffer_t *tmp=cur;cur=next;next=tmp;
+    }
+    if (overlap_topk_qb) {
+        s->direct_deferred_qb_done = qb_done;
+        s->direct_deferred_q_rope_done = rope_done;
     }
     if (!myds_metal_get_auto_barrier() && !(s && s->direct_deferred_q)) {
         myds_metal_barrier_buffer(ids);
@@ -1665,6 +1735,11 @@ void myds_v41_gpu_attn_kv_reuse_reset(myds_v41_gpu_scratch_t *s) {
     s->direct_pad_cache_valid = false;
     s->direct_deferred_q_compressed = false;
     s->direct_deferred_q = NULL;
+    s->direct_deferred_qb_weight = NULL;
+    s->direct_deferred_qb_input = NULL;
+    s->direct_deferred_q_pos = 0;
+    s->direct_deferred_qb_done = 0;
+    s->direct_deferred_q_rope_done = 0;
     s->direct_kv_comp_buf = NULL;
     s->direct_kv_ids_buf = NULL;
     s->direct_kv_comp_offset = 0;
@@ -1681,6 +1756,11 @@ int myds_v41_gpu_attn_kv_reuse_prepare_layer(myds_v41_gpu_scratch_t *s,
     s->direct_scratch_fenced = false;
     s->direct_deferred_q_compressed = false;
     s->direct_deferred_q = NULL;
+    s->direct_deferred_qb_weight = NULL;
+    s->direct_deferred_qb_input = NULL;
+    s->direct_deferred_q_pos = 0;
+    s->direct_deferred_qb_done = 0;
+    s->direct_deferred_q_rope_done = 0;
     if (layer < 2u || is_index_source) {
         s->direct_kv_cache_valid = false;
         s->direct_pad_cache_valid = false;
@@ -1712,6 +1792,24 @@ void myds_v41_gpu_attn_kv_reuse_defer_q_rope(myds_v41_gpu_scratch_t *s,
     if (!s) return;
     s->direct_deferred_q = q;
     s->direct_deferred_q_compressed = compressed;
+    s->direct_deferred_qb_weight = NULL;
+    s->direct_deferred_qb_input = NULL;
+    s->direct_deferred_q_pos = 0;
+    s->direct_deferred_qb_done = 0;
+    s->direct_deferred_q_rope_done = 0;
+}
+void myds_v41_gpu_attn_kv_reuse_bind_topk_qb(myds_v41_gpu_scratch_t *s,
+    const myds_metal_buffer_t *qb_weight, const myds_metal_buffer_t *qb_input,
+    uint32_t pos, uint32_t qb_done_heads) {
+    if (!s || !s->direct_deferred_q) return;
+    s->direct_deferred_qb_weight = qb_weight;
+    s->direct_deferred_qb_input = qb_input;
+    s->direct_deferred_q_pos = pos;
+    s->direct_deferred_qb_done = qb_done_heads;
+    s->direct_deferred_q_rope_done = 0;
+}
+uint32_t myds_v41_gpu_attn_kv_reuse_qb_done(const myds_v41_gpu_scratch_t *s) {
+    return s ? s->direct_deferred_qb_done : 0u;
 }
 const myds_metal_buffer_t *myds_v41_gpu_scratch_kv_f16(const myds_v41_gpu_scratch_t *s) {
     return s ? s->kv_f16 : NULL;
@@ -1999,6 +2097,7 @@ static int attention_direct_impl(myds_metal_buffer_t *heads,const myds_metal_buf
     const bool expect_kv_reuse = want_kv_reuse && s->direct_expect_kv_reuse;
     myds_metal_buffer_t *deferred_q = want_kv_reuse ? s->direct_deferred_q : NULL;
     const bool deferred_q_compressed = want_kv_reuse && s->direct_deferred_q_compressed;
+    const uint32_t deferred_q_rope_done = (want_kv_reuse && deferred_q) ? s->direct_deferred_q_rope_done : 0u;
     if (s) {
         s->direct_window_prestaged = false;
         s->direct_scratch_fenced = false;
@@ -2006,6 +2105,11 @@ static int attention_direct_impl(myds_metal_buffer_t *heads,const myds_metal_buf
         s->direct_expect_kv_reuse = false;
         s->direct_deferred_q_compressed = false;
         s->direct_deferred_q = NULL;
+        s->direct_deferred_qb_weight = NULL;
+        s->direct_deferred_qb_input = NULL;
+        s->direct_deferred_q_pos = 0;
+        s->direct_deferred_qb_done = 0;
+        s->direct_deferred_q_rope_done = 0;
     }
 
     /* Only an actual ordinary direct RF scope selects this candidate. Public
@@ -2032,7 +2136,7 @@ static int attention_direct_impl(myds_metal_buffer_t *heads,const myds_metal_buf
         return 0;
     }
     if (want_kv_reuse && (register_mode != 1 || packed_nsg != 8 || myds_metal_get_auto_barrier() ||
-        !scratch_fenced || (deferred_q && (deferred_q != q || expect_kv_reuse || !selected_rows || !rope)))) {
+        !scratch_fenced || (deferred_q && (deferred_q != q || expect_kv_reuse || !selected_rows || !rope || deferred_q_rope_done > 64u)))) {
         myds_v41_gpu_attn_kv_reuse_reset(s);
         atomic_fetch_add_explicit(&attn_kv_reuse_failures, 1u, memory_order_relaxed);
         return 0;
@@ -2104,12 +2208,15 @@ static int attention_direct_impl(myds_metal_buffer_t *heads,const myds_metal_buf
                     return 0;
                 }
             }
+            const uint32_t rem_rope = (deferred_q && deferred_q_rope_done < 64u)
+                ? (64u - deferred_q_rope_done) : 0u;
             if (keys % 32u) {
                 if (!window_prestaged || selected_rows) {
                     myds_metal_barrier_buffer(s->kv_f16);
                 }
-                if (deferred_q) {
-                    if (!myds_v41_gpu_rope(deferred_q, 512u, 64u, rope->pos, deferred_q_compressed, false)) {
+                if (rem_rope) {
+                    if (!myds_v41_gpu_rope_heads_slice(s, deferred_q, deferred_q_rope_done,
+                            rem_rope, rope->pos, deferred_q_compressed)) {
                         myds_v41_gpu_attn_kv_reuse_reset(s);
                         atomic_fetch_add_explicit(&attn_kv_reuse_failures, 1u, memory_order_relaxed);
                         return 0;
@@ -2131,12 +2238,15 @@ static int attention_direct_impl(myds_metal_buffer_t *heads,const myds_metal_buf
                     myds_metal_barrier_buffer(s->pad);
                 }
             } else {
-                if (deferred_q) {
-                    if (!myds_v41_gpu_rope(deferred_q, 512u, 64u, rope->pos, deferred_q_compressed, false)) {
+                if (rem_rope) {
+                    if (!myds_v41_gpu_rope_heads_slice(s, deferred_q, deferred_q_rope_done,
+                            rem_rope, rope->pos, deferred_q_compressed)) {
                         myds_v41_gpu_attn_kv_reuse_reset(s);
                         atomic_fetch_add_explicit(&attn_kv_reuse_failures, 1u, memory_order_relaxed);
                         return 0;
                     }
+                }
+                if (deferred_q) {
                     const myds_metal_buffer_t *pack_deps[] = {s->kv_f16, deferred_q};
                     myds_metal_barrier_buffers(pack_deps, 2u);
                 } else if (!window_prestaged || selected_rows) {

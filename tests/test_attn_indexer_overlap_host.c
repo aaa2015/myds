@@ -76,10 +76,23 @@ int myds_v41_gpu_attn_kv_reuse_prestage_window(myds_v41_gpu_scratch_t *s,
     return record("prestage_window");
 }
 void myds_v41_gpu_attn_kv_reuse_mark_fenced(myds_v41_gpu_scratch_t *s) { (void)s; }
+static uint32_t stub_qb_done = 0u;
 void myds_v41_gpu_attn_kv_reuse_defer_q_rope(myds_v41_gpu_scratch_t *s,
     myds_metal_buffer_t *q, bool compressed) {
     (void)s; (void)q; (void)compressed;
+    stub_qb_done = 0u;
     record("defer_q_rope");
+}
+void myds_v41_gpu_attn_kv_reuse_bind_topk_qb(myds_v41_gpu_scratch_t *s,
+    const myds_metal_buffer_t *qb_weight, const myds_metal_buffer_t *qb_input,
+    uint32_t pos, uint32_t qb_done_heads) {
+    (void)s; (void)qb_weight; (void)qb_input; (void)pos;
+    stub_qb_done = qb_done_heads ? 64u : 0u;
+    record("bind_topk_qb");
+}
+uint32_t myds_v41_gpu_attn_kv_reuse_qb_done(const myds_v41_gpu_scratch_t *s) {
+    (void)s;
+    return stub_qb_done;
 }
 const myds_metal_buffer_t *myds_v41_gpu_scratch_kv_f16(const myds_v41_gpu_scratch_t *s) {
     (void)s;
@@ -695,11 +708,33 @@ int main(void) {
     assert(strcmp(event_names[events - 9], "join_9") == 0);
     assert(strcmp(event_names[events - 8], "indexscores_head_slots") == 0);
     assert(strcmp(event_names[events - 7], "q_b_slice_1") == 0);
+    assert(strcmp(event_names[events - 6], "join_2") == 0);
+    assert(strcmp(event_names[events - 5], "hc_mix_split") == 0);
+    assert(strcmp(event_names[events - 4], "defer_q_rope") == 0);
+    assert(strcmp(event_names[events - 3], "bind_topk_qb") == 0);
+    assert(strcmp(event_names[events - 2], "topk") == 0);
+    assert(strcmp(event_names[events - 1], "join_3") == 0);
+    reset();
+    assert(run_layer(2u, 1200u, true));
+    assert(strcmp(event_names[events - 9], "join_9") == 0);
+    assert(strcmp(event_names[events - 8], "indexscores_head_slots") == 0);
+    assert(strcmp(event_names[events - 7], "q_b_slice_1") == 0);
     assert(strcmp(event_names[events - 6], "join_1") == 0);
     assert(strcmp(event_names[events - 5], "hc_mix_split") == 0);
     assert(strcmp(event_names[events - 4], "defer_q_rope") == 0);
     assert(strcmp(event_names[events - 3], "topk") == 0);
     assert(strcmp(event_names[events - 2], "q_b_slice_1") == 0);
+    assert(strcmp(event_names[events - 1], "join_3") == 0);
+    reset();
+    assert(run_layer(2u, 2400u, true));
+    assert(strcmp(event_names[events - 9], "join_9") == 0);
+    assert(strcmp(event_names[events - 8], "indexscores_head_slots") == 0);
+    assert(strcmp(event_names[events - 7], "q_b_slice_1") == 0);
+    assert(strcmp(event_names[events - 6], "join_2") == 0);
+    assert(strcmp(event_names[events - 5], "hc_mix_split") == 0);
+    assert(strcmp(event_names[events - 4], "defer_q_rope") == 0);
+    assert(strcmp(event_names[events - 3], "bind_topk_qb") == 0);
+    assert(strcmp(event_names[events - 2], "topk") == 0);
     assert(strcmp(event_names[events - 1], "join_3") == 0);
     reset();
     assert(run_layer(2u, 2u, true));
