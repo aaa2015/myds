@@ -4,6 +4,7 @@
 #include "../tests/test_attention_packed.m"
 #undef main
 #include <CommonCrypto/CommonDigest.h>
+#include <unistd.h>
 static NSMutableDictionary *files;
 static NSMutableArray *cases;
 static NSString *gold_file,*candidate_file,*identity_file;
@@ -141,12 +142,18 @@ int main(int argc,char **argv) {@autoreleasepool {
       else {fprintf(stderr,"usage: %s --host-only OR --golden-metallib FILE --candidate-metallib FILE --source-identity FILE --output-dir NEW\n",argv[0]);return 2;}}
     if(host){host_only();return 0;}REQUIRE(gold_file&&candidate_file&&identity_file&&output_dir);struct stat st;REQUIRE(lstat(output_dir,&st)!=0&&errno==ENOENT&&mkdir(output_dir,0700)==0);
     setenv("MYDS_ATTN_PACKED_REGISTER","1",1);setenv("MYDS_ATTN_ROPE_FUSE","1",1);setenv("MYDS_ATTN_DIRECT_PACK_FUSE","1",1);unsetenv("MYDS_ATTN_DIRECT_PACK");unsetenv("MYDS_ATTN_PACKED_NSG");unsetenv("MYDS_ATTN_PACKED_REDUCE");unsetenv("MYDS_DEBUG_DISPATCH");g_hist_enabled=0;
-    NSString *dir=[candidate_file stringByDeletingLastPathComponent];REQUIRE([[candidate_file lastPathComponent]isEqual:@"myds.metallib"]);REQUIRE(myds_metal_init(dir.UTF8String));
+    NSString *dir=[candidate_file stringByDeletingLastPathComponent];REQUIRE([[candidate_file lastPathComponent]isEqual:@"myds.metallib"]);
+    REQUIRE(fflush(stdout)==0);int saved_stdout=dup(STDOUT_FILENO);REQUIRE(saved_stdout>=0&&dup2(STDERR_FILENO,STDOUT_FILENO)>=0);
+    const int initialized=myds_metal_init(dir.UTF8String);
+    REQUIRE(fflush(stdout)==0&&dup2(saved_stdout,STDOUT_FILENO)>=0&&close(saved_stdout)==0);REQUIRE(initialized);
     REQUIRE(myds_v41_gpu_attention_direct_pack_fuse_enabled()==1);NSError *error=nil;pack_golden=[g_device newLibraryWithURL:[NSURL fileURLWithPath:gold_file] error:&error];REQUIRE(pack_golden);
     pack_reference[0]=make_pso(pack_golden,"kernel_dsv41_copy_window_f32_to_f16");pack_reference[1]=make_pso(pack_golden,"kernel_dsv41_get_rows_bf16_to_f16");files=[NSMutableDictionary new];cases=[NSMutableArray new];
     emit(@{@"kind":@"library_identity",@"golden_path":gold_file,@"golden_sha256":file_digest(gold_file),@"candidate_path":candidate_file,@"candidate_sha256":file_digest(candidate_file),@"loaded_runtime_path":@(myds_metal_loaded_library_path()),@"candidate_symbol":@(attention_pack_kernel),@"source_identity_sha256":file_digest(identity_file),@"fixture_not_fullmodel":@YES});
     gpu_preflight_negatives();
     const uint32_t nr[]={1,33,128},sel[]={0,1,33,512},start[]={0,127};unsigned n=0;
     for(unsigned concurrent=0;concurrent<2;concurrent++)for(unsigned r=0;r<3;r++)for(unsigned s=0;s<4;s++)for(unsigned ring=0;ring<2;ring++)for(unsigned invalid=0;invalid<2;invalid++)run_case(n++,nr[r],sel[s],start[ring],invalid,concurrent);
-    manifest(@"passed");emit(@{@"kind":@"result",@"pass":@YES,@"cases":@(n),@"fixture_not_fullmodel":@YES});myds_metal_cleanup();return 0;
+    manifest(@"passed");emit(@{@"kind":@"result",@"pass":@YES,@"cases":@(n),@"fixture_not_fullmodel":@YES});
+    REQUIRE(fflush(stdout)==0);saved_stdout=dup(STDOUT_FILENO);REQUIRE(saved_stdout>=0&&dup2(STDERR_FILENO,STDOUT_FILENO)>=0);
+    myds_metal_cleanup();
+    REQUIRE(fflush(stdout)==0&&dup2(saved_stdout,STDOUT_FILENO)>=0&&close(saved_stdout)==0);return 0;
 }}
