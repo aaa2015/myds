@@ -1461,7 +1461,7 @@ static bool decode_layer_buffers_valid(const myds_context_t *ctx,
     ADD_SPAN(base->attn_q_a, 1u);
     ADD_SPAN(base->attn_q_a_norm, 5120u);
     ADD_SPAN(base->attn_q_b, 1u);
-    ADD_SPAN(base->attn_kv, 5242880u);
+    ADD_SPAN(base->attn_kv, 1u);
     ADD_SPAN(base->attn_kv_a_norm, 2048u);
 
     if (check_indexer && (is_kv || is_idx)) {
@@ -1695,9 +1695,10 @@ int myds_v41_decode_attn_indexer_scoped(myds_context_t *ctx,
         env_not_zero_literal("MYDS_QKV_FUSE_POST") &&
         !env_is_one_literal("MYDS_QKV_CONCURRENT") &&
         myds_metal_dense_q4_v41_enabled() == 1 &&
-        base->attn_q_a_type == GGML_TYPE_Q8_0 &&
+        (base->attn_q_a_type == GGML_TYPE_Q8_0 || base->attn_q_a_type == GGML_TYPE_Q4_K) &&
         base->attn_q_b_type == GGML_TYPE_Q4_K &&
-        base->attn_kv_type == GGML_TYPE_F16;
+        (base->attn_kv_type == GGML_TYPE_F16 || base->attn_kv_type == GGML_TYPE_Q8_0 ||
+         base->attn_kv_type == GGML_TYPE_Q4_K);
 
     const bool idx_pipeline_ok = base_pipeline_ok &&
         myds_metal_f16_gemv_bf16_fuse_enabled() == 1 &&
