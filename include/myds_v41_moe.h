@@ -139,4 +139,21 @@ int myds_dspark_shared_swiglu(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *gate, const myds_metal_buffer_t *up,
     uint32_t width, float clamp_val);
 
+#define MYDS_V41_MOE_HAS_FFN_HC_OVERLAP 1
+int myds_v41_ffn_hc_overlap_parse_mode(void);
+int myds_v41_ffn_hc_overlap_enabled(void);
+void myds_v41_ffn_hc_overlap_reset_mode(void);
+void myds_v41_ffn_hc_overlap_counters(myds_metal_decode_candidate_counters_t *out, bool reset);
+int myds_v41_moe_ffn_hc_overlap_scoped(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t pos,
+    myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *after_attn,
+    const myds_metal_buffer_t *attn_split,
+    myds_metal_buffer_t *ffn_split,
+    const myds_metal_buffer_t *ffn_fn,
+    const myds_metal_buffer_t *ffn_scale,
+    const myds_metal_buffer_t *ffn_base,
+    myds_metal_buffer_t *flat_norm,
+    myds_metal_buffer_t *mix,
+    float hc_eps, bool ordinary_decode_allowed);
+
 #endif

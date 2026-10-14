@@ -51,6 +51,9 @@ int myds_metal_last_completed_gpu_span(double *start_s, double *end_s);
 int myds_metal_dense_q4_v41(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *weight, const myds_metal_buffer_t *input,
     uint32_t rows, uint32_t width, bool round_bf16);
+int myds_metal_dense_q4_v41_qb_slice(myds_metal_buffer_t *out,
+    const myds_metal_buffer_t *weight, const myds_metal_buffer_t *input,
+    uint32_t row_offset, uint32_t slice_rows, bool count_call);
 
 /* Initialize Metal device, command queue, and compile DeepSeek shaders */
 int  myds_metal_init(const char *shader_dir);

@@ -59,6 +59,8 @@ typedef struct {
     myds_metal_decode_candidate_counters_t first_moe_hc_overlap;
     myds_metal_decode_candidate_counters_t first_attn_hc_overlap;
     myds_metal_decode_candidate_counters_t first_indexer_decode_overlap;
+    myds_metal_decode_candidate_counters_t first_attn_kv_reuse;
+    myds_metal_decode_candidate_counters_t first_ffn_hc_overlap;
     myds_metal_decode_candidate_counters_t first_shared_q4_v41_nb;
     myds_metal_decode_candidate_counters_t first_attention_direct_pack_fuse;
     myds_metal_shared3_counters_t first_depth2_dense;
@@ -109,6 +111,8 @@ static void capture(const char *piece, size_t length, int32_t id, void *opaque) 
         myds_v41_moe_hc_overlap_counters(&c->first_moe_hc_overlap, false);
         myds_v41_attn_hc_overlap_counters(&c->first_attn_hc_overlap, false);
         myds_v41_indexer_decode_overlap_counters(&c->first_indexer_decode_overlap, false);
+        myds_v41_attn_kv_reuse_counters(&c->first_attn_kv_reuse, false);
+        myds_v41_ffn_hc_overlap_counters(&c->first_ffn_hc_overlap, false);
         myds_metal_shared_q4_v41_nb_counters(&c->first_shared_q4_v41_nb, false);
         myds_v41_gpu_attention_direct_pack_fuse_counters(&c->first_attention_direct_pack_fuse, false);
         myds_metal_shared3_counters(&c->first_depth2_dense, false);
@@ -266,6 +270,8 @@ int main(int argc, char **argv) {
     if (myds_metal_indexer_rope_quant_fuse_parse_mode() < 0) return 2;
     if (myds_v41_attn_hc_overlap_parse_mode() < 0) return 2;
     if (myds_v41_indexer_decode_overlap_parse_mode() < 0) return 2;
+    if (myds_v41_attn_kv_reuse_parse_mode() < 0) return 2;
+    if (myds_v41_ffn_hc_overlap_parse_mode() < 0) return 2;
     const int capture_mode = myds_dspark_capture_parse_mode();
     if (capture_mode < 0) return 2;
     if (capture_mode != 0 && !dspark_path) {
@@ -338,7 +344,7 @@ int main(int argc, char **argv) {
         "MYDS_MOE_DOWN_OVERLAP", "MYDS_MOE_IQ2_V41", "MYDS_DENSE_Q4_V41", "MYDS_SHARED_Q4_V41_NB",
         "MYDS_ATTN_OUT_A_FUSE_BF16",
         "MYDS_ATTN_DIRECT_PACK", "MYDS_ATTN_DIRECT_PACK_FUSE",
-        "MYDS_ATTN_HC_OVERLAP", "MYDS_INDEXER_DECODE_OVERLAP",
+        "MYDS_ATTN_HC_OVERLAP", "MYDS_INDEXER_DECODE_OVERLAP", "MYDS_ATTN_KV_REUSE", "MYDS_FFN_HC_OVERLAP",
         "MYDS_ENGRAM_IO_THREADS", "MYDS_ENGRAM_NOCACHE", "MYDS_BENCH_STORAGE_COUNTERS",
         "MYDS_GEMV_BATCH_SIZE", "MYDS_PLD", "MYDS_BATCH2_SPEC", "MYDS_BATCH2_Q8_SHARED", "MYDS_TREE_SPEC", "MYDS_DSPARK_DEPTH", "MYDS_DSPARK_EVAL_PREFIX",
         "MYDS_DSPARK_MARKOV_ONLY", "MYDS_DSPARK_MARKOV_SCALE", "MYDS_DSPARK_MIN_CONF",
@@ -409,10 +415,11 @@ int main(int argc, char **argv) {
         myds_dspark_engine_capture_bypass_enabled(ctx->dspark), myds_metal_f16_gemv_bf16_fuse_enabled(), myds_metal_indexer_rope_quant_fuse_enabled(), myds_v41_route_simd_shuffle_mode(),
         myds_v41_gpu_attention_packed_register_enabled(), myds_metal_moe_q2_v41_enabled(),
         myds_metal_moe_down_overlap_enabled(), myds_metal_moe_iq2_v41_enabled(), myds_metal_dense_q4_v41_enabled());
-    fprintf(json, ",\"dense_q4_v41_nb_mode\":%d,\"dense_q4_v41_head_reference_mode\":%d,\"attention_rope_fuse_mode\":%d,\"moe_hc_overlap_mode\":%d,\"attn_hc_overlap_mode\":%d,\"indexer_decode_overlap_mode\":%d",
+    fprintf(json, ",\"dense_q4_v41_nb_mode\":%d,\"dense_q4_v41_head_reference_mode\":%d,\"attention_rope_fuse_mode\":%d,\"moe_hc_overlap_mode\":%d,\"attn_hc_overlap_mode\":%d,\"indexer_decode_overlap_mode\":%d,\"attn_kv_reuse_mode\":%d,\"ffn_hc_overlap_mode\":%d",
         myds_metal_dense_q4_v41_nb_enabled(), myds_metal_dense_q4_v41_head_reference_enabled(),
         myds_v41_attention_rope_fuse_enabled(), myds_v41_moe_hc_overlap_enabled(),
-        myds_v41_attn_hc_overlap_enabled(), myds_v41_indexer_decode_overlap_enabled());
+        myds_v41_attn_hc_overlap_enabled(), myds_v41_indexer_decode_overlap_enabled(),
+        myds_v41_attn_kv_reuse_enabled(), myds_v41_ffn_hc_overlap_enabled());
     fputs(",\"dense_q4_v41_kernels\":[",json);
     for (unsigned shape=0;shape<3u;shape++) {
         if (shape) fputc(',',json);
@@ -473,6 +480,8 @@ int main(int argc, char **argv) {
         myds_v41_moe_hc_overlap_counters(NULL, true);
         myds_v41_attn_hc_overlap_counters(NULL, true);
         myds_v41_indexer_decode_overlap_counters(NULL, true);
+        myds_v41_attn_kv_reuse_counters(NULL, true);
+        myds_v41_ffn_hc_overlap_counters(NULL, true);
         myds_metal_shared_q4_v41_nb_counters(NULL, true);
         myds_v41_gpu_attention_direct_pack_fuse_counters(NULL, true);
         myds_metal_shared3_counters(NULL, true);
@@ -536,6 +545,10 @@ int main(int argc, char **argv) {
         myds_v41_attn_hc_overlap_counters(&attn_hc_overlap, false);
         myds_metal_decode_candidate_counters_t indexer_decode_overlap;
         myds_v41_indexer_decode_overlap_counters(&indexer_decode_overlap, false);
+        myds_metal_decode_candidate_counters_t attn_kv_reuse;
+        myds_v41_attn_kv_reuse_counters(&attn_kv_reuse, false);
+        myds_metal_decode_candidate_counters_t ffn_hc_overlap;
+        myds_v41_ffn_hc_overlap_counters(&ffn_hc_overlap, false);
         myds_metal_decode_candidate_counters_t shared_q4_v41_nb;
         myds_metal_shared_q4_v41_nb_counters(&shared_q4_v41_nb, false);
         myds_metal_decode_candidate_counters_t attention_direct_pack_fuse;
@@ -797,6 +810,16 @@ int main(int argc, char **argv) {
             ",\"decode_failures\":%" PRIu64 "}", indexer_decode_overlap.requests, indexer_decode_overlap.encoded, indexer_decode_overlap.failures,
             indexer_decode_overlap.requests-c.first_indexer_decode_overlap.requests, indexer_decode_overlap.encoded-c.first_indexer_decode_overlap.encoded,
             indexer_decode_overlap.failures-c.first_indexer_decode_overlap.failures);
+        fprintf(json, ",\"gpu_attn_kv_reuse\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64
+            ",\"failures\":%" PRIu64 ",\"decode_requests\":%" PRIu64 ",\"decode_encoded\":%" PRIu64
+            ",\"decode_failures\":%" PRIu64 "}", attn_kv_reuse.requests, attn_kv_reuse.encoded, attn_kv_reuse.failures,
+            attn_kv_reuse.requests-c.first_attn_kv_reuse.requests, attn_kv_reuse.encoded-c.first_attn_kv_reuse.encoded,
+            attn_kv_reuse.failures-c.first_attn_kv_reuse.failures);
+        fprintf(json, ",\"gpu_ffn_hc_overlap\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64
+            ",\"failures\":%" PRIu64 ",\"decode_requests\":%" PRIu64 ",\"decode_encoded\":%" PRIu64
+            ",\"decode_failures\":%" PRIu64 "}", ffn_hc_overlap.requests, ffn_hc_overlap.encoded, ffn_hc_overlap.failures,
+            ffn_hc_overlap.requests-c.first_ffn_hc_overlap.requests, ffn_hc_overlap.encoded-c.first_ffn_hc_overlap.encoded,
+            ffn_hc_overlap.failures-c.first_ffn_hc_overlap.failures);
         fprintf(json, ",\"gpu_shared_q4_v41_nb\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64
             ",\"failures\":%" PRIu64 ",\"decode_requests\":%" PRIu64 ",\"decode_encoded\":%" PRIu64
             ",\"decode_failures\":%" PRIu64 "}", shared_q4_v41_nb.requests, shared_q4_v41_nb.encoded, shared_q4_v41_nb.failures,

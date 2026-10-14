@@ -56,6 +56,14 @@ struct myds_v41_gpu_scratch {
     uint32_t attn_vec_head_first; /* gather-only prefill vec geometry, default on */
     uint32_t attn_vec_head_first_unavailable; /* optional PSO failed for this scratch */
     myds_metal_buffer_t *attn_head_blocks; /* matrix tile mask block flags, lazy */
+    bool direct_window_prestaged, direct_scratch_fenced;
+    bool direct_populate_kv_cache, direct_expect_kv_reuse;
+    bool direct_kv_cache_valid, direct_pad_cache_valid;
+    bool direct_deferred_q_compressed;
+    myds_metal_buffer_t *direct_deferred_q;
+    const myds_metal_buffer_t *direct_kv_comp_buf, *direct_kv_ids_buf;
+    size_t direct_kv_comp_offset, direct_kv_ids_offset;
+    uint32_t direct_kv_n_raw, direct_kv_source_rows, direct_kv_selected_rows, direct_kv_pos;
 };
 static uint32_t attn_matrix_test_failure;
 void myds_v41_gpu_inject_attention_matrix_failure(uint32_t kind) {
@@ -825,7 +833,9 @@ static int topk_rows_causal(myds_metal_buffer_t *ids,const myds_metal_buffer_t *
                             &m,sizeof(m),mb,3,nm*n_rows,1,1,len<512?len:512,1,1,0))return 0;
         myds_metal_buffer_t *tmp=cur;cur=next;next=tmp;
     }
-    if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(ids);
+    if (!myds_metal_get_auto_barrier() && !(s && s->direct_deferred_q)) {
+        myds_metal_barrier_buffer(ids);
+    }
     if(prefix)atomic_fetch_add_explicit(&topk_prefix_counters[TP_ENCODED],1,memory_order_relaxed);
     if(nan_fuse)atomic_fetch_add_explicit(&topk_nan_fuse_counters[TN_ENCODED],1,memory_order_relaxed);
     return 1;
@@ -1019,7 +1029,9 @@ static int topk_rows_causal_nan_shuffle_encode(myds_metal_buffer_t *ids,const my
                             &m,sizeof(m),mb,3,nm*n_rows,1,1,len<512?len:512,1,1,0))return 0;
         myds_metal_buffer_t *tmp=cur;cur=next;next=tmp;
     }
-    if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(ids);
+    if (!myds_metal_get_auto_barrier() && !(s && s->direct_deferred_q)) {
+        myds_metal_barrier_buffer(ids);
+    }
     if(prefix)atomic_fetch_add_explicit(&topk_prefix_counters[TP_ENCODED],1,memory_order_relaxed);
     if(nan_fuse)atomic_fetch_add_explicit(&topk_nan_fuse_counters[TN_ENCODED],1,memory_order_relaxed);
     return 1;
@@ -1325,6 +1337,7 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
     myds_metal_buffer_t *gathered,
     uint32_t c_len,uint32_t n_comp,uint32_t top_k,
     uint32_t base_pos,uint32_t c_start,uint32_t ratio,myds_v41_gpu_scratch_t *s,bool comp_bf16) {
+    myds_v41_gpu_attn_kv_reuse_reset(s);
     if(!s||!heads||!q||!chunk_kv||c_len==0||c_len>MYDS_CHUNK_MAXC||top_k>512u||
        n_comp>s->key_comp_max||
        !floats(heads,(uint64_t)c_len*64u*512)||!floats(q,(uint64_t)c_len*64u*512)||
@@ -1612,6 +1625,103 @@ static int attention_rope_failure(void) {
 static int attention_rope_range(const myds_metal_buffer_t *b,uint64_t bytes,size_t alignment) {
     return myds_metal_buffer_native_range(b,bytes,alignment);
 }
+static _Atomic uint64_t attn_kv_reuse_requests, attn_kv_reuse_encoded, attn_kv_reuse_failures;
+static _Atomic int attn_kv_reuse_mode;
+int myds_v41_attn_kv_reuse_parse_mode(void) {
+    const char *v = getenv("MYDS_ATTN_KV_REUSE");
+    const int mode = (!v || !strcmp(v, "0")) ? 0 : !strcmp(v, "1") ? 1 : -1;
+    if (mode < 0) MYDS_LOG_E("MYDS_ATTN_KV_REUSE must be exactly 0 or 1");
+    atomic_store_explicit(&attn_kv_reuse_mode, mode, memory_order_relaxed);
+    return mode;
+}
+int myds_v41_attn_kv_reuse_enabled(void) {
+    return atomic_load_explicit(&attn_kv_reuse_mode, memory_order_relaxed);
+}
+void myds_v41_attn_kv_reuse_reset_mode(void) {
+    atomic_store_explicit(&attn_kv_reuse_mode, 0, memory_order_relaxed);
+}
+void myds_v41_attn_kv_reuse_counters(myds_metal_decode_candidate_counters_t *out, bool reset) {
+#define ATTN_KV_REUSE_COUNT(field) \
+    (reset ? atomic_exchange_explicit(&attn_kv_reuse_##field, 0u, memory_order_relaxed) \
+           : atomic_load_explicit(&attn_kv_reuse_##field, memory_order_relaxed))
+    const myds_metal_decode_candidate_counters_t value = {
+        .requests = ATTN_KV_REUSE_COUNT(requests),
+        .encoded = ATTN_KV_REUSE_COUNT(encoded),
+        .failures = ATTN_KV_REUSE_COUNT(failures)};
+    if (out) *out = value;
+#undef ATTN_KV_REUSE_COUNT
+}
+void myds_v41_attn_kv_reuse_record_prestage_failure(void) {
+    atomic_fetch_add_explicit(&attn_kv_reuse_requests, 1u, memory_order_relaxed);
+    atomic_fetch_add_explicit(&attn_kv_reuse_failures, 1u, memory_order_relaxed);
+}
+void myds_v41_gpu_attn_kv_reuse_reset(myds_v41_gpu_scratch_t *s) {
+    if (!s) return;
+    s->direct_window_prestaged = false;
+    s->direct_scratch_fenced = false;
+    s->direct_populate_kv_cache = false;
+    s->direct_expect_kv_reuse = false;
+    s->direct_kv_cache_valid = false;
+    s->direct_pad_cache_valid = false;
+    s->direct_deferred_q_compressed = false;
+    s->direct_deferred_q = NULL;
+    s->direct_kv_comp_buf = NULL;
+    s->direct_kv_ids_buf = NULL;
+    s->direct_kv_comp_offset = 0;
+    s->direct_kv_ids_offset = 0;
+    s->direct_kv_n_raw = 0;
+    s->direct_kv_source_rows = 0;
+    s->direct_kv_selected_rows = 0;
+    s->direct_kv_pos = 0;
+}
+int myds_v41_gpu_attn_kv_reuse_prepare_layer(myds_v41_gpu_scratch_t *s,
+    uint32_t layer, uint32_t count, bool is_index_source) {
+    if (!s || !s->kv_f16 || !s->pad || layer >= 40u) return 0;
+    s->direct_window_prestaged = false;
+    s->direct_scratch_fenced = false;
+    s->direct_deferred_q_compressed = false;
+    s->direct_deferred_q = NULL;
+    if (layer < 2u || is_index_source) {
+        s->direct_kv_cache_valid = false;
+        s->direct_pad_cache_valid = false;
+        s->direct_expect_kv_reuse = false;
+        s->direct_populate_kv_cache = (layer >= 2u && is_index_source && count > 0u);
+    } else {
+        s->direct_populate_kv_cache = false;
+        s->direct_expect_kv_reuse = (count > 0u);
+    }
+    return 1;
+}
+int myds_v41_gpu_attn_kv_reuse_prestage_window(myds_v41_gpu_scratch_t *s,
+    const myds_metal_buffer_t *window, uint32_t pos) {
+    if (!s || !s->kv_f16 || !floats(window, 128u * 512u) || pos >= 1048576u) return 0;
+    const uint32_t n_raw = pos + 1u < 128u ? pos + 1u : 128u;
+    const uint32_t raw_start = (pos + 1u - n_raw) % 128u;
+    const uint32_t w_args[] = {n_raw, raw_start};
+    const myds_metal_buffer_t *wb[] = {window, s->kv_f16};
+    if (!dispatch("kernel_dsv41_copy_window_f32_to_f16", w_args, sizeof(w_args), wb, 2, 1, n_raw, 1, 128, 1, 1, 0)) return 0;
+    s->direct_window_prestaged = true;
+    s->direct_scratch_fenced = true;
+    return 1;
+}
+void myds_v41_gpu_attn_kv_reuse_mark_fenced(myds_v41_gpu_scratch_t *s) {
+    if (s) s->direct_scratch_fenced = true;
+}
+void myds_v41_gpu_attn_kv_reuse_defer_q_rope(myds_v41_gpu_scratch_t *s,
+    myds_metal_buffer_t *q, bool compressed) {
+    if (!s) return;
+    s->direct_deferred_q = q;
+    s->direct_deferred_q_compressed = compressed;
+}
+const myds_metal_buffer_t *myds_v41_gpu_scratch_kv_f16(const myds_v41_gpu_scratch_t *s) {
+    return s ? s->kv_f16 : NULL;
+}
+const myds_metal_buffer_t *myds_v41_gpu_scratch_pad(const myds_v41_gpu_scratch_t *s) {
+    return s ? s->pad : NULL;
+}
+myds_metal_buffer_t *myds_v41_gpu_scratch_partial(const myds_v41_gpu_scratch_t *s) {
+    return s ? s->partial : NULL;
+}
 enum { AP_REQUESTS, AP_ENCODED, AP_FAILURES, AP_COUNT };
 static _Atomic uint64_t attention_pack_counters[AP_COUNT];
 static pthread_once_t attention_pack_once=PTHREAD_ONCE_INIT;
@@ -1763,6 +1873,7 @@ static int attention_staged_impl(myds_metal_buffer_t *heads,const myds_metal_buf
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *window,uint32_t n_raw,
     uint32_t raw_start,const myds_metal_buffer_t *selected_kv,uint32_t selected_rows,myds_v41_gpu_scratch_t *s,int register_mode,
     const struct attention_rope_scope *rope) {
+    myds_v41_gpu_attn_kv_reuse_reset(s);
     if(!s||!n_raw||n_raw>128||raw_start>=128||selected_rows>512||
         !floats(heads,64u*512)||!floats(q,64u*512)||!floats(sinks,64)||!floats(window,128u*512)||
         (selected_rows&&!floats(selected_kv,(uint64_t)selected_rows*512)))return 0;
@@ -1867,65 +1978,223 @@ static int attention_direct_impl(myds_metal_buffer_t *heads,const myds_metal_buf
     uint32_t raw_start,const myds_metal_buffer_t *comp_kv,const myds_metal_buffer_t *selected_ids,
     uint32_t source_rows,uint32_t selected_rows,myds_v41_gpu_scratch_t *s,int register_mode,
     const struct attention_rope_scope *rope) {
+    const int kv_reuse_mode = rope ? myds_v41_attn_kv_reuse_enabled() : 0;
+    if (kv_reuse_mode < 0) return 0;
+    const bool want_kv_reuse = (kv_reuse_mode == 1);
+    if (!want_kv_reuse) {
+        myds_v41_gpu_attn_kv_reuse_reset(s);
+    } else {
+        atomic_fetch_add_explicit(&attn_kv_reuse_requests, 1u, memory_order_relaxed);
+    }
     if(!s||!n_raw||n_raw>128||raw_start>=128||selected_rows>512||
         !floats(heads,64u*512)||!floats(q,64u*512)||!floats(sinks,64)||!floats(window,128u*512)||
-        (selected_rows&&(selected_rows>source_rows||!bf16s(comp_kv,(uint64_t)source_rows*512)||!floats(selected_ids,selected_rows))))return 0;
+        (selected_rows&&(selected_rows>source_rows||!bf16s(comp_kv,(uint64_t)source_rows*512)||!floats(selected_ids,selected_rows)))) {
+        if (want_kv_reuse) atomic_fetch_add_explicit(&attn_kv_reuse_failures, 1u, memory_order_relaxed);
+        return 0;
+    }
+
+    const bool window_prestaged = want_kv_reuse && s->direct_window_prestaged;
+    const bool scratch_fenced = want_kv_reuse && s->direct_scratch_fenced;
+    const bool populate_kv_cache = want_kv_reuse && s->direct_populate_kv_cache;
+    const bool expect_kv_reuse = want_kv_reuse && s->direct_expect_kv_reuse;
+    myds_metal_buffer_t *deferred_q = want_kv_reuse ? s->direct_deferred_q : NULL;
+    const bool deferred_q_compressed = want_kv_reuse && s->direct_deferred_q_compressed;
+    if (s) {
+        s->direct_window_prestaged = false;
+        s->direct_scratch_fenced = false;
+        s->direct_populate_kv_cache = false;
+        s->direct_expect_kv_reuse = false;
+        s->direct_deferred_q_compressed = false;
+        s->direct_deferred_q = NULL;
+    }
 
     /* Only an actual ordinary direct RF scope selects this candidate. Public
      * direct/staged/trace callers continue to use the two original shaders. */
     const int pack_fuse=rope ? myds_v41_gpu_attention_direct_pack_fuse_enabled() : 0;
     if(pack_fuse) {
         atomic_fetch_add_explicit(&attention_pack_counters[AP_REQUESTS],1u,memory_order_relaxed);
-        if(pack_fuse<0 || register_mode!=1 ||
+        if(pack_fuse<0 || register_mode!=1 || want_kv_reuse ||
            !attention_direct_pack_preflight(s->kv_f16,window,n_raw,raw_start,
-                                            comp_kv,selected_ids,source_rows,selected_rows))
+                                            comp_kv,selected_ids,source_rows,selected_rows)) {
+            if (want_kv_reuse) atomic_fetch_add_explicit(&attn_kv_reuse_failures, 1u, memory_order_relaxed);
             return attention_pack_failure();
+        }
     }
 
     const int packed_nsg = get_attn_packed_physical_nsg();
-    if (!packed_nsg) return 0;
-    if (packed_nsg != 8 && !get_attn_packed_reduce_mode()) {
-        MYDS_LOG_E("explicit MYDS_ATTN_PACKED_NSG=%d requires packed reduce enabled", packed_nsg);
+    if (!packed_nsg) {
+        if (want_kv_reuse) atomic_fetch_add_explicit(&attn_kv_reuse_failures, 1u, memory_order_relaxed);
         return 0;
     }
-    if (!myds_metal_get_auto_barrier()) {
-        /* The previous attention may still READ these shared buffers in a
-         * concurrent encoder. Fence before staging/pad/partial writes (WAR). */
-        const myds_metal_buffer_t *scratch_buffers[] = {s->kv_f16, s->pad, s->partial};
-        myds_metal_barrier_buffers(scratch_buffers, 3);
+    if (packed_nsg != 8 && !get_attn_packed_reduce_mode()) {
+        MYDS_LOG_E("explicit MYDS_ATTN_PACKED_NSG=%d requires packed reduce enabled", packed_nsg);
+        if (want_kv_reuse) atomic_fetch_add_explicit(&attn_kv_reuse_failures, 1u, memory_order_relaxed);
+        return 0;
     }
-    if(pack_fuse) {
-        /* Unused inputs for selected_rows0 bind a valid window resource. The
-         * shader's uniform raw-row branch never reads these dummy bindings. */
-        if(!attention_direct_pack_encode(s->kv_f16,window,n_raw,raw_start,
-                                        comp_kv,selected_ids,source_rows,selected_rows))return 0;
-    } else {
-        const uint32_t w_args[] = {n_raw, raw_start};
-        const myds_metal_buffer_t *wb[] = {window, s->kv_f16};
-        if(!dispatch("kernel_dsv41_copy_window_f32_to_f16", w_args, sizeof(w_args), wb, 2, 1, n_raw, 1, 128, 1, 1, 0)) return 0;
-
-        if(selected_rows) {
-        struct {
-            uint32_t source_rows;
-            uint32_t selected_rows;
-            uint32_t dst_row_offset;
-            uint32_t pad;
-        } g_args = {source_rows, selected_rows, n_raw, 0};
-        const myds_metal_buffer_t *gb[] = {comp_kv, selected_ids, s->kv_f16};
-            if(!dispatch("kernel_dsv41_get_rows_bf16_to_f16", &g_args, sizeof(g_args), gb, 3, 1, selected_rows, 1, 128, 1, 1, 0)) return 0;
-        }
+    if (want_kv_reuse && (register_mode != 1 || packed_nsg != 8 || myds_metal_get_auto_barrier() ||
+        !scratch_fenced || (deferred_q && (deferred_q != q || expect_kv_reuse || !selected_rows || !rope)))) {
+        myds_v41_gpu_attn_kv_reuse_reset(s);
+        atomic_fetch_add_explicit(&attn_kv_reuse_failures, 1u, memory_order_relaxed);
+        return 0;
     }
-    if(!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(s->kv_f16);
 
     uint32_t keys=n_raw+selected_rows;uint64_t kvbytes=(uint64_t)keys*1024,maskbytes=(uint64_t)keys*2;
-    if(keys%32) {
-        struct flash_pad_args a={.ne11=keys,.ne_12_2=1,.ne_12_3=1,.nb11=1024,.nb12=kvbytes,.nb13=kvbytes,
-            .nb21=1024,.nb22=kvbytes,.nb23=kvbytes,.ne31=1,.ne32=1,.ne33=1,.nb31=maskbytes,.nb32=maskbytes,.nb33=maskbytes};
-        const myds_metal_buffer_t *b[]={s->kv_f16,s->kv_f16,s->mask,s->pad};
-        const myds_metal_constant_t c[]={{100,true,1},{125,false,32}};
-        if(!specialized("kernel_flash_attn_ext_pad",&a,sizeof(a),b,4,32,1,1,32,1,1,0,c,2))return 0;
-        /* Packed and original vec both READ the generated pad K/V and mask. */
-        if(!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(s->pad);
+    if (want_kv_reuse) {
+        if (expect_kv_reuse) {
+            const bool cache_hit = selected_rows > 0u &&
+                s->direct_kv_cache_valid &&
+                s->direct_kv_comp_buf == comp_kv &&
+                s->direct_kv_comp_offset == myds_metal_buffer_offset(comp_kv) &&
+                s->direct_kv_ids_buf == selected_ids &&
+                s->direct_kv_ids_offset == myds_metal_buffer_offset(selected_ids) &&
+                s->direct_kv_n_raw == n_raw &&
+                s->direct_kv_source_rows == source_rows &&
+                s->direct_kv_selected_rows == selected_rows &&
+                s->direct_kv_pos == rope->pos;
+            if (!cache_hit) {
+                myds_v41_gpu_attn_kv_reuse_reset(s);
+                atomic_fetch_add_explicit(&attn_kv_reuse_failures, 1u, memory_order_relaxed);
+                return 0;
+            }
+            if (!window_prestaged) {
+                const uint32_t w_args[] = {n_raw, raw_start};
+                const myds_metal_buffer_t *wb[] = {window, s->kv_f16};
+                if (!dispatch("kernel_dsv41_copy_window_f32_to_f16", w_args, sizeof(w_args), wb, 2, 1, n_raw, 1, 128, 1, 1, 0)) {
+                    myds_v41_gpu_attn_kv_reuse_reset(s);
+                    atomic_fetch_add_explicit(&attn_kv_reuse_failures, 1u, memory_order_relaxed);
+                    return 0;
+                }
+                myds_metal_barrier_buffer(s->kv_f16);
+            }
+            if (keys % 32u) {
+                if (!((keys & ~31u) >= n_raw && s->direct_pad_cache_valid)) {
+                    struct flash_pad_args a={.ne11=keys,.ne_12_2=1,.ne_12_3=1,.nb11=1024,.nb12=kvbytes,.nb13=kvbytes,
+                        .nb21=1024,.nb22=kvbytes,.nb23=kvbytes,.ne31=1,.ne32=1,.ne33=1,.nb31=maskbytes,.nb32=maskbytes,.nb33=maskbytes};
+                    const myds_metal_buffer_t *b[]={s->kv_f16,s->kv_f16,s->mask,s->pad};
+                    const myds_metal_constant_t c[]={{100,true,1},{125,false,32}};
+                    if (!specialized("kernel_flash_attn_ext_pad",&a,sizeof(a),b,4,32,1,1,32,1,1,0,c,2)) {
+                        myds_v41_gpu_attn_kv_reuse_reset(s);
+                        atomic_fetch_add_explicit(&attn_kv_reuse_failures, 1u, memory_order_relaxed);
+                        return 0;
+                    }
+                    myds_metal_barrier_buffer(s->pad);
+                }
+            }
+        } else {
+            if (!window_prestaged) {
+                const uint32_t w_args[] = {n_raw, raw_start};
+                const myds_metal_buffer_t *wb[] = {window, s->kv_f16};
+                if (!dispatch("kernel_dsv41_copy_window_f32_to_f16", w_args, sizeof(w_args), wb, 2, 1, n_raw, 1, 128, 1, 1, 0)) {
+                    myds_v41_gpu_attn_kv_reuse_reset(s);
+                    atomic_fetch_add_explicit(&attn_kv_reuse_failures, 1u, memory_order_relaxed);
+                    return 0;
+                }
+            }
+            if (selected_rows) {
+                struct {
+                    uint32_t source_rows;
+                    uint32_t selected_rows;
+                    uint32_t dst_row_offset;
+                    uint32_t pad;
+                } g_args = {source_rows, selected_rows, n_raw, 0};
+                const myds_metal_buffer_t *gb[] = {comp_kv, selected_ids, s->kv_f16};
+                if (!dispatch("kernel_dsv41_get_rows_bf16_to_f16", &g_args, sizeof(g_args), gb, 3, 1, selected_rows, 1, 128, 1, 1, 0)) {
+                    myds_v41_gpu_attn_kv_reuse_reset(s);
+                    atomic_fetch_add_explicit(&attn_kv_reuse_failures, 1u, memory_order_relaxed);
+                    return 0;
+                }
+            }
+            if (keys % 32u) {
+                if (!window_prestaged || selected_rows) {
+                    myds_metal_barrier_buffer(s->kv_f16);
+                }
+                if (deferred_q) {
+                    if (!myds_v41_gpu_rope(deferred_q, 512u, 64u, rope->pos, deferred_q_compressed, false)) {
+                        myds_v41_gpu_attn_kv_reuse_reset(s);
+                        atomic_fetch_add_explicit(&attn_kv_reuse_failures, 1u, memory_order_relaxed);
+                        return 0;
+                    }
+                }
+                struct flash_pad_args a={.ne11=keys,.ne_12_2=1,.ne_12_3=1,.nb11=1024,.nb12=kvbytes,.nb13=kvbytes,
+                    .nb21=1024,.nb22=kvbytes,.nb23=kvbytes,.ne31=1,.ne32=1,.ne33=1,.nb31=maskbytes,.nb32=maskbytes,.nb33=maskbytes};
+                const myds_metal_buffer_t *b[]={s->kv_f16,s->kv_f16,s->mask,s->pad};
+                const myds_metal_constant_t c[]={{100,true,1},{125,false,32}};
+                if (!specialized("kernel_flash_attn_ext_pad",&a,sizeof(a),b,4,32,1,1,32,1,1,0,c,2)) {
+                    myds_v41_gpu_attn_kv_reuse_reset(s);
+                    atomic_fetch_add_explicit(&attn_kv_reuse_failures, 1u, memory_order_relaxed);
+                    return 0;
+                }
+                if (deferred_q) {
+                    const myds_metal_buffer_t *pad_deps[] = {s->pad, deferred_q};
+                    myds_metal_barrier_buffers(pad_deps, 2u);
+                } else {
+                    myds_metal_barrier_buffer(s->pad);
+                }
+            } else {
+                if (deferred_q) {
+                    if (!myds_v41_gpu_rope(deferred_q, 512u, 64u, rope->pos, deferred_q_compressed, false)) {
+                        myds_v41_gpu_attn_kv_reuse_reset(s);
+                        atomic_fetch_add_explicit(&attn_kv_reuse_failures, 1u, memory_order_relaxed);
+                        return 0;
+                    }
+                    const myds_metal_buffer_t *pack_deps[] = {s->kv_f16, deferred_q};
+                    myds_metal_barrier_buffers(pack_deps, 2u);
+                } else if (!window_prestaged || selected_rows) {
+                    myds_metal_barrier_buffer(s->kv_f16);
+                }
+            }
+            if (populate_kv_cache && selected_rows > 0u) {
+                s->direct_kv_cache_valid = true;
+                s->direct_pad_cache_valid = (keys % 32u != 0u) && ((keys & ~31u) >= n_raw);
+                s->direct_kv_comp_buf = comp_kv;
+                s->direct_kv_comp_offset = myds_metal_buffer_offset(comp_kv);
+                s->direct_kv_ids_buf = selected_ids;
+                s->direct_kv_ids_offset = myds_metal_buffer_offset(selected_ids);
+                s->direct_kv_n_raw = n_raw;
+                s->direct_kv_source_rows = source_rows;
+                s->direct_kv_selected_rows = selected_rows;
+                s->direct_kv_pos = rope->pos;
+            }
+        }
+    } else {
+        if (!myds_metal_get_auto_barrier()) {
+            /* The previous attention may still READ these shared buffers in a
+             * concurrent encoder. Fence before staging/pad/partial writes (WAR). */
+            const myds_metal_buffer_t *scratch_buffers[] = {s->kv_f16, s->pad, s->partial};
+            myds_metal_barrier_buffers(scratch_buffers, 3);
+        }
+        if(pack_fuse) {
+            /* Unused inputs for selected_rows0 bind a valid window resource. The
+             * shader's uniform raw-row branch never reads these dummy bindings. */
+            if(!attention_direct_pack_encode(s->kv_f16,window,n_raw,raw_start,
+                                            comp_kv,selected_ids,source_rows,selected_rows))return 0;
+        } else {
+            const uint32_t w_args[] = {n_raw, raw_start};
+            const myds_metal_buffer_t *wb[] = {window, s->kv_f16};
+            if(!dispatch("kernel_dsv41_copy_window_f32_to_f16", w_args, sizeof(w_args), wb, 2, 1, n_raw, 1, 128, 1, 1, 0)) return 0;
+
+            if(selected_rows) {
+            struct {
+                uint32_t source_rows;
+                uint32_t selected_rows;
+                uint32_t dst_row_offset;
+                uint32_t pad;
+            } g_args = {source_rows, selected_rows, n_raw, 0};
+            const myds_metal_buffer_t *gb[] = {comp_kv, selected_ids, s->kv_f16};
+                if(!dispatch("kernel_dsv41_get_rows_bf16_to_f16", &g_args, sizeof(g_args), gb, 3, 1, selected_rows, 1, 128, 1, 1, 0)) return 0;
+            }
+        }
+        if(!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(s->kv_f16);
+
+        if(keys%32) {
+            struct flash_pad_args a={.ne11=keys,.ne_12_2=1,.ne_12_3=1,.nb11=1024,.nb12=kvbytes,.nb13=kvbytes,
+                .nb21=1024,.nb22=kvbytes,.nb23=kvbytes,.ne31=1,.ne32=1,.ne33=1,.nb31=maskbytes,.nb32=maskbytes,.nb33=maskbytes};
+            const myds_metal_buffer_t *b[]={s->kv_f16,s->kv_f16,s->mask,s->pad};
+            const myds_metal_constant_t c[]={{100,true,1},{125,false,32}};
+            if(!specialized("kernel_flash_attn_ext_pad",&a,sizeof(a),b,4,32,1,1,32,1,1,0,c,2))return 0;
+            /* Packed and original vec both READ the generated pad K/V and mask. */
+            if(!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(s->pad);
+        }
     }
     struct flash_vec_args a={.ne01=1,.ne02=64,.ne03=1,.nb01=64u*2048,.nb02=2048,.nb03=64u*2048,
         .ne11=keys,.ne_12_2=1,.ne_12_3=1,.ns10=512,.nb11=1024,.nb12=kvbytes,.nb13=kvbytes,
@@ -1947,8 +2216,12 @@ static int attention_direct_impl(myds_metal_buffer_t *heads,const myds_metal_buf
             &a,sizeof(a),register_buffers,7,64,1,1,256,1,1,22400,c,10);
         if(myds_metal_dispatch_count()>dispatch_before) {
             if (rope) attention_rope_count(RF_ENCODED);
+            if (want_kv_reuse) atomic_fetch_add_explicit(&attn_kv_reuse_encoded, 1u, memory_order_relaxed);
             attention_register_count(AR_ENCODED);
             attention_register_count(AR_DIRECT);
+        } else if (want_kv_reuse) {
+            myds_v41_gpu_attn_kv_reuse_reset(s);
+            atomic_fetch_add_explicit(&attn_kv_reuse_failures, 1u, memory_order_relaxed);
         }
         if(!ok) MYDS_LOG_E("explicit packed attention register candidate unavailable or failed");
         return ok; /* Explicit candidate never retries another attention kernel. */
@@ -2025,14 +2298,27 @@ int myds_v41_gpu_attention_direct_rope_fuse(myds_metal_buffer_t *heads,const myd
     uint32_t source_rows,uint32_t selected_rows,myds_v41_gpu_scratch_t *s,
     uint32_t pos,bool compressed,bool ordinary_allowed,bool trace_on,bool *rope_consumed) {
     const int mode=myds_v41_attention_rope_fuse_enabled();
+    const int kv_reuse_mode=myds_v41_attn_kv_reuse_enabled();
     if (rope_consumed) *rope_consumed=false;
+    if (kv_reuse_mode < 0) return 0;
     if (!mode || (mode>0 && (!ordinary_allowed || trace_on))) {
+        if (kv_reuse_mode == 1 && ordinary_allowed && !trace_on) {
+            myds_v41_gpu_attn_kv_reuse_reset(s);
+            myds_v41_attn_kv_reuse_record_prestage_failure();
+            return 0;
+        }
         if (!rope_consumed) return 0;
         return myds_v41_gpu_attention_direct(heads,sinks,q,window,n_raw,raw_start,comp_kv,selected_ids,source_rows,selected_rows,s);
     }
     attention_rope_count(RF_REQUESTS);
     if (mode<0 || !rope_consumed || !attention_rope_validate(heads,sinks,q,window,n_raw,raw_start,
-        comp_kv,selected_ids,source_rows,selected_rows,s,pos,true)) return attention_rope_failure();
+        comp_kv,selected_ids,source_rows,selected_rows,s,pos,true)) {
+        if (kv_reuse_mode == 1) {
+            myds_v41_gpu_attn_kv_reuse_reset(s);
+            myds_v41_attn_kv_reuse_record_prestage_failure();
+        }
+        return attention_rope_failure();
+    }
     pthread_once(&rope_once,init_rope);
     const struct attention_rope_scope rope={pos,compressed};
     attention_register_count(AR_REQUESTS);

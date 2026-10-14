@@ -2538,7 +2538,9 @@ myds_v41_context_t *myds_v41_context_create(myds_context_t *ctx) {
     const int round_skip = engram_round_parse_mode();
     if (round_skip < 0 || myds_v41_moe_hc_overlap_parse_mode()<0 ||
         myds_v41_attn_hc_overlap_parse_mode()<0 ||
-        myds_v41_indexer_decode_overlap_parse_mode()<0) return NULL;
+        myds_v41_indexer_decode_overlap_parse_mode()<0 ||
+        myds_v41_attn_kv_reuse_parse_mode()<0 ||
+        myds_v41_ffn_hc_overlap_parse_mode()<0) return NULL;
     if (!ctx || !ctx->model->v41 || !ctx->cfg.max_seq_len || ctx->cfg.max_seq_len>1048576u)
         return NULL;
     /* Basic buffers are allocated by the shared context constructor. */
@@ -3568,6 +3570,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
     uint32_t il=0;
     const char *phase="input";
     myds_dspark_capture_invalidate(ctx->dspark);
+    if (g) myds_v41_gpu_attn_kv_reuse_reset(g->gpu);
     if (!g || token<0 || (uint32_t)token>=m->vocab_size || pos>=g->capacity ||
         pos>=ctx->cfg.max_seq_len) return -1;
     if (need_logits && ctx->decode_metrics_active) {
@@ -3638,9 +3641,21 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
         if (decode_concurrent_enabled) {
             myds_metal_set_concurrent(1);
         }
-        const myds_metal_buffer_t *init_deps[] = { g->residual, g->pre };
-        myds_metal_barrier_buffers(init_deps, 2);
+        const myds_metal_buffer_t *init_deps[] = {
+            g->residual, g->pre, g->engram_rows[0], g->engram_rows[1]
+        };
+        myds_metal_barrier_buffers(init_deps, 4);
     }
+    const int attn_hc_mode = myds_v41_attn_hc_overlap_enabled();
+    const int idx_overlap_mode = myds_v41_indexer_decode_overlap_enabled();
+    const int kv_reuse_mode = myds_v41_attn_kv_reuse_enabled();
+    const int ffn_hc_mode = myds_v41_ffn_hc_overlap_enabled();
+    if (attn_hc_mode < 0 || idx_overlap_mode < 0 || kv_reuse_mode < 0 || ffn_hc_mode < 0) goto fail;
+    const bool engram_skip_round = g->engram_project_round_skip == 1 &&
+        ordinary_decode_allowed && need_logits && !trace_on;
+    const bool engram_prestage_enabled = fine_pipeline && ffn_hc_mode == 1 &&
+        g->engram_project_round_skip >= 0 &&
+        ordinary_decode_allowed && need_logits && !trace_on && !myds_metal_get_auto_barrier();
     for (il=0;il<V41_LAYERS;il++) {
         const myds_layer_t *base=&m->layers[il];
         const v41_layer_t *l=&v->layers[il];
@@ -3649,15 +3664,26 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
         phase="HC attention input";
         if (il==1 || il==14) {
             uint32_t e=il==1?0:1;
-            CHECK(engram_project_pair(g,g->residual,g->engram_kv,v->engram_proj[e],g->engram_rows[e],
-                v->engram_q[e],v->engram_k[e],m->norm_eps,ordinary_decode_allowed,need_logits,trace_on,fine_pipeline));
+            if (engram_prestage_enabled) {
+                if (!myds_metal_v41_engram_add(g->residual, g->engram_kv, v->engram_q[e], v->engram_k[e], V41_DIM, m->norm_eps)) {
+                    if (engram_skip_round) {
+                        atomic_fetch_add_explicit(&engram_round_failures, 1, memory_order_relaxed);
+                        MYDS_LOG_E("Engram projection round skip failed; refusing fallback");
+                    }
+                    goto fail;
+                }
+                myds_metal_barrier_buffer(g->residual);
+                if (engram_skip_round) {
+                    atomic_fetch_add_explicit(&engram_round_encoded, 1, memory_order_relaxed);
+                }
+            } else {
+                CHECK(engram_project_pair(g,g->residual,g->engram_kv,v->engram_proj[e],g->engram_rows[e],
+                    v->engram_q[e],v->engram_k[e],m->norm_eps,ordinary_decode_allowed,need_logits,trace_on,fine_pipeline));
+            }
             TRACE("engram_out",g->residual,4*V41_DIM);
         }
-        const int attn_hc_mode = myds_v41_attn_hc_overlap_enabled();
-        const int idx_overlap_mode = myds_v41_indexer_decode_overlap_enabled();
-        if (attn_hc_mode < 0 || idx_overlap_mode < 0) goto fail;
         const bool use_decode_attn_overlap = ordinary_decode_allowed && need_logits && !trace_on &&
-            (attn_hc_mode == 1 || (idx_overlap_mode == 1 && index_source(il)));
+            (attn_hc_mode == 1 || kv_reuse_mode == 1 || (idx_overlap_mode == 1 && index_source(il)));
         if (use_decode_attn_overlap) {
             const uint32_t owner = owner_for(il);
             const myds_v41_decode_attn_args_t decode_args = {
@@ -3855,6 +3881,9 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
             attn_direct_enabled = (env == NULL || atoi(env) != 0);
         }
         bool attention_rope_consumed=false;
+        if (!use_decode_attn_overlap) {
+            myds_v41_gpu_attn_kv_reuse_reset(g->gpu);
+        }
         if (attn_direct_enabled) {
             CHECK(myds_v41_gpu_attention_direct_rope_fuse(ctx->attn_heads,base->attn_sinks,ctx->q,
                                                 g->window[il],nraw,(pos+1u-nraw)%128,
@@ -3863,6 +3892,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
                                                 count,top,g->gpu,pos,compressed,
                                                 ordinary_decode_allowed && need_logits,trace_on,&attention_rope_consumed));
         } else {
+            myds_v41_gpu_attn_kv_reuse_reset(g->gpu);
             if (count) CHECK(myds_v41_gpu_gather_bf16(g->selected_kv,g->compressed[owner_for(il)],g->selected,count,top));
             CHECK(myds_v41_gpu_attention_rope_fuse(ctx->attn_heads,base->attn_sinks,ctx->q,g->window[il],nraw,
                 (pos+1u-nraw)%128,g->selected_kv,top,g->gpu,pos,compressed,
@@ -3878,8 +3908,28 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
             }
         }
         CHECK(myds_metal_attn_output_a_bf16(ctx->attn_low,base->attn_output_a,ctx->attn_heads,8,4096,1024,base->attn_output_a_type));
+        const bool prestage_engram = engram_prestage_enabled && (il == 0 || il == 13);
+        if (prestage_engram) {
+            uint32_t e = (il == 0) ? 0u : 1u;
+            if (engram_skip_round) {
+                atomic_fetch_add_explicit(&engram_round_requests, 1, memory_order_relaxed);
+            }
+            if ((engram_skip_round && !engram_pair_valid_inputs(g->residual, g->engram_kv, v->engram_proj[e],
+                    g->engram_rows[e], v->engram_q[e], v->engram_k[e], m->norm_eps)) ||
+                !myds_metal_v41_gemv(g->engram_kv, v->engram_proj[e], g->engram_rows[e],
+                    5u * V41_DIM, MYDS_ENGRAM_INPUT_DIM, GGML_TYPE_F16)) {
+                if (engram_skip_round) {
+                    atomic_fetch_add_explicit(&engram_round_failures, 1, memory_order_relaxed);
+                    MYDS_LOG_E("Engram projection round skip failed; refusing fallback");
+                }
+                goto fail;
+            }
+        }
         if (fine_pipeline) {
-            myds_metal_barrier_buffer(ctx->attn_low);
+            const myds_metal_buffer_t *attn_low_deps[] = {
+                ctx->attn_low, prestage_engram ? g->engram_kv : NULL
+            };
+            myds_metal_barrier_buffers(attn_low_deps, 2);
         }
         if (ordinary_decode_allowed && need_logits && !trace_on &&
             base->attn_output_b_type==GGML_TYPE_Q4_K && myds_metal_dense_q4_v41_enabled()) {
@@ -3896,18 +3946,29 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
             myds_metal_barrier_buffer(g->attn_split);
         }
         CHECK(myds_metal_v41_hc_expand(g->after_attn,ctx->attn_out,g->residual,g->attn_split,V41_DIM));
+        if (prestage_engram && !engram_skip_round) {
+            CHECK(myds_metal_v41_bf16(g->engram_kv, 5u * V41_DIM));
+        }
         TRACE("after_attn",g->after_attn,4*V41_DIM);
         if (fine_pipeline) {
-            myds_metal_barrier_buffer(g->after_attn);
+            const myds_metal_buffer_t *after_attn_deps[] = {
+                g->after_attn, (prestage_engram && !engram_skip_round) ? g->engram_kv : NULL
+            };
+            myds_metal_barrier_buffers(after_attn_deps, 2);
         }
-        CHECK(v41_hc_sum_rmsnorm_scoped(ctx->ffn_norm_out, ctx->x, g->after_attn, g->attn_split, base->ffn_norm, V41_DIM, m->norm_eps, fuse_hc_norm_enabled));
-        TRACE("hc_ffn_input",ctx->x,V41_DIM);
-        TRACE("ffn_norm",ctx->ffn_norm_out,V41_DIM);
-        if (fine_pipeline) {
-            myds_metal_barrier_buffer(ctx->ffn_norm_out);
+        if (ffn_hc_mode == 1 && ordinary_decode_allowed && need_logits && !trace_on) {
+            phase="MoE";
+            CHECK(myds_v41_moe_ffn_hc_overlap_scoped(ctx,il,(uint32_t)token,pos,g->residual,g->after_attn,g->attn_split,g->ffn_split,l->ffn_fn,l->ffn_scale,l->ffn_base,g->flat_norm,g->mix,v->hc_eps,true));
+        } else {
+            CHECK(v41_hc_sum_rmsnorm_scoped(ctx->ffn_norm_out, ctx->x, g->after_attn, g->attn_split, base->ffn_norm, V41_DIM, m->norm_eps, fuse_hc_norm_enabled));
+            TRACE("hc_ffn_input",ctx->x,V41_DIM);
+            TRACE("ffn_norm",ctx->ffn_norm_out,V41_DIM);
+            if (fine_pipeline) {
+                myds_metal_barrier_buffer(ctx->ffn_norm_out);
+            }
+            phase="MoE";
+            CHECK(myds_v41_moe_pipeline_scoped(ctx,il,(uint32_t)token,pos,g->residual,g->after_attn,g->ffn_split,l->ffn_fn,l->ffn_scale,l->ffn_base,g->flat_norm,g->mix,v->hc_eps,ordinary_decode_allowed && need_logits && !trace_on));
         }
-        phase="MoE";
-        CHECK(myds_v41_moe_pipeline_scoped(ctx,il,(uint32_t)token,pos,g->residual,g->after_attn,g->ffn_split,l->ffn_fn,l->ffn_scale,l->ffn_base,g->flat_norm,g->mix,v->hc_eps,ordinary_decode_allowed && need_logits && !trace_on));
         TRACE("layer_out",g->residual,4*V41_DIM);
         if (ctx->dspark) {
             int dspark_slot = myds_dspark_target_slot(ctx->dspark, il);
@@ -3931,7 +3992,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
         if (ordinary_decode_allowed && !trace_on && m->output_type==GGML_TYPE_Q4_K && myds_metal_dense_q4_v41_enabled()) {
             /* Match project()'s input/output dependency boundaries. */
             if (myds_metal_get_auto_barrier()) myds_metal_barrier();
-            else myds_metal_barrier_buffer(ctx->x_norm);
+            else if (!fine_pipeline) myds_metal_barrier_buffer(ctx->x_norm);
             CHECK(myds_metal_dense_q4_v41(ctx->logits,m->output,ctx->x_norm,m->vocab_size,V41_DIM,false));
             if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(ctx->logits);
         } else {
@@ -3959,6 +4020,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
     return need_logits ? next_tok : 0;
 fail:
     MYDS_LOG_E("V4.1 native graph failed at pos %u layer %u: %s",pos,il,phase);
+    if (g) myds_v41_gpu_attn_kv_reuse_reset(g->gpu);
     myds_v41_decode_qkv_scope_end(&qkv_scope);
     (void)myds_metal_commit_batch();
     if (prev_auto_barrier >= 0) {

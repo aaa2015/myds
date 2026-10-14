@@ -152,7 +152,9 @@ class BenchReproduceTests(unittest.TestCase):
                            ('attention_rope_fuse_mode', 'MYDS_ATTN_ROPE_FUSE'),
                            ('moe_hc_overlap_mode', 'MYDS_MOE_HC_OVERLAP'),
                            ('attn_hc_overlap_mode', 'MYDS_ATTN_HC_OVERLAP'),
-                           ('indexer_decode_overlap_mode', 'MYDS_INDEXER_DECODE_OVERLAP')):
+                           ('indexer_decode_overlap_mode', 'MYDS_INDEXER_DECODE_OVERLAP'),
+                           ('attn_kv_reuse_mode', 'MYDS_ATTN_KV_REUSE'),
+                           ('ffn_hc_overlap_mode', 'MYDS_FFN_HC_OVERLAP')):
             loaded[mode] = int(records[0]['environment'].get(flag) == '1')
 
         loaded.update(dspark_loaded=support is not None, dspark_load_s=0.01 if support else 0,

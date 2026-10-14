@@ -311,6 +311,23 @@ void myds_v41_gpu_attention_packed_register_counters(
 #define MYDS_V41_GPU_HAS_ATTN_ROPE_FUSE 1
 int myds_v41_attention_rope_fuse_enabled(void);
 void myds_v41_attention_rope_fuse_counters(myds_metal_decode_candidate_counters_t *out,bool reset);
+#define MYDS_V41_GPU_HAS_ATTN_KV_REUSE 1
+int myds_v41_attn_kv_reuse_parse_mode(void);
+int myds_v41_attn_kv_reuse_enabled(void);
+void myds_v41_attn_kv_reuse_reset_mode(void);
+void myds_v41_attn_kv_reuse_counters(myds_metal_decode_candidate_counters_t *out,bool reset);
+void myds_v41_attn_kv_reuse_record_prestage_failure(void);
+void myds_v41_gpu_attn_kv_reuse_reset(myds_v41_gpu_scratch_t *scratch);
+int myds_v41_gpu_attn_kv_reuse_prepare_layer(myds_v41_gpu_scratch_t *scratch,
+    uint32_t layer,uint32_t count,bool is_index_source);
+int myds_v41_gpu_attn_kv_reuse_prestage_window(myds_v41_gpu_scratch_t *scratch,
+    const myds_metal_buffer_t *window,uint32_t pos);
+void myds_v41_gpu_attn_kv_reuse_mark_fenced(myds_v41_gpu_scratch_t *scratch);
+void myds_v41_gpu_attn_kv_reuse_defer_q_rope(myds_v41_gpu_scratch_t *scratch,
+    myds_metal_buffer_t *q,bool compressed);
+const myds_metal_buffer_t *myds_v41_gpu_scratch_kv_f16(const myds_v41_gpu_scratch_t *scratch);
+const myds_metal_buffer_t *myds_v41_gpu_scratch_pad(const myds_v41_gpu_scratch_t *scratch);
+myds_metal_buffer_t *myds_v41_gpu_scratch_partial(const myds_v41_gpu_scratch_t *scratch);
 int myds_v41_gpu_attention_rope_fuse(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *window,uint32_t n_raw,
     uint32_t raw_start,const myds_metal_buffer_t *selected_kv,uint32_t selected_rows,

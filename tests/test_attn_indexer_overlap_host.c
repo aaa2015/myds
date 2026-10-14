@@ -6,6 +6,7 @@
  */
 #define _POSIX_C_SOURCE 200809L
 #include "myds_v41_decode.h"
+#include "myds_v41_moe.h"
 #include "myds_internal.h"
 #include "myds_v41.h"
 #include "myds_log.h"
@@ -17,7 +18,7 @@
 struct myds_metal_buffer { size_t bytes, offset; void *data; };
 struct myds_v41_gpu_scratch { int dummy; };
 
-static struct myds_metal_buffer buffers[64];
+static struct myds_metal_buffer buffers[128];
 static struct myds_v41_gpu_scratch scratch_inst;
 static unsigned used, events;
 static const char *event_names[128], *failure;
@@ -31,7 +32,7 @@ static int record(const char *name) {
 }
 
 static myds_metal_buffer_t *buffer(size_t bytes) {
-    assert(used < 64);
+    assert(used < 120);
     struct myds_metal_buffer *b = &buffers[used++];
     *b = (struct myds_metal_buffer){
         bytes, 0, (void *)(uintptr_t)(UINT64_C(0x100000000) + used * UINT64_C(0x2000000))
@@ -60,6 +61,173 @@ int myds_metal_f16_gemv_bf16_fuse_enabled(void) { return f16_bf16; }
 int myds_metal_indexer_rope_quant_fuse_enabled(void) { return idx_rope_quant; }
 int myds_v41_gpu_indexer_head_slots_enabled(void) { return head_slots; }
 int myds_v41_gpu_topk_threshold_enabled(void) { return topk_thresh; }
+static int kv_reuse = 0;
+int myds_v41_attn_kv_reuse_enabled(void) { return kv_reuse; }
+void myds_v41_attn_kv_reuse_record_prestage_failure(void) {}
+void myds_v41_gpu_attn_kv_reuse_reset(myds_v41_gpu_scratch_t *s) { (void)s; }
+int myds_v41_gpu_attn_kv_reuse_prepare_layer(myds_v41_gpu_scratch_t *s,
+    uint32_t layer, uint32_t count, bool is_index_source) {
+    (void)s; (void)layer; (void)count;
+    return is_index_source ? 1 : 2;
+}
+int myds_v41_gpu_attn_kv_reuse_prestage_window(myds_v41_gpu_scratch_t *s,
+    const myds_metal_buffer_t *window, uint32_t pos) {
+    (void)s; (void)window; (void)pos;
+    return record("prestage_window");
+}
+void myds_v41_gpu_attn_kv_reuse_mark_fenced(myds_v41_gpu_scratch_t *s) { (void)s; }
+void myds_v41_gpu_attn_kv_reuse_defer_q_rope(myds_v41_gpu_scratch_t *s,
+    myds_metal_buffer_t *q, bool compressed) {
+    (void)s; (void)q; (void)compressed;
+    record("defer_q_rope");
+}
+const myds_metal_buffer_t *myds_v41_gpu_scratch_kv_f16(const myds_v41_gpu_scratch_t *s) {
+    (void)s;
+    return &buffers[126];
+}
+const myds_metal_buffer_t *myds_v41_gpu_scratch_pad(const myds_v41_gpu_scratch_t *s) {
+    (void)s;
+    return &buffers[127];
+}
+myds_metal_buffer_t *myds_v41_gpu_scratch_partial(const myds_v41_gpu_scratch_t *s) {
+    (void)s;
+    return &buffers[125];
+}
+int myds_v41_gpu_attention_direct_pack_fuse_enabled(void) { return 0; }
+int myds_v41_attention_rope_fuse_enabled(void) { return 1; }
+int myds_v41_gpu_attention_packed_register_enabled(void) { return 1; }
+int myds_metal_moe_down_overlap_enabled(void) { return 1; }
+int myds_metal_moe_q2_v41_enabled(void) { return 1; }
+int myds_metal_moe_iq2_v41_enabled(void) { return 0; }
+int myds_metal_shared_q4_v41_nb_enabled(void) { return 0; }
+int myds_metal_shared_q4_v41_nb_gate_up(myds_metal_buffer_t *o, const myds_metal_buffer_t *g,
+    const myds_metal_buffer_t *u, const myds_metal_buffer_t *x, uint32_t w, uint32_t d, float c) {
+    (void)o; (void)g; (void)u; (void)x; (void)w; (void)d; (void)c;
+    return 1;
+}
+int myds_metal_routed_moe_down_overlap_scoped(myds_metal_buffer_t *o, const myds_metal_buffer_t *x,
+    const myds_metal_buffer_t *g, const myds_metal_buffer_t *u, const myds_metal_buffer_t *d,
+    const myds_metal_buffer_t *ids, const myds_metal_buffer_t *w, myds_metal_buffer_t *mg,
+    myds_metal_buffer_t *mu, myds_metal_buffer_t *mm, myds_metal_buffer_t *md, uint32_t dim,
+    uint32_t width, uint32_t n_exp, uint32_t k, ggml_type gt, ggml_type ut, ggml_type dt,
+    float clamp, bool ordinary, myds_metal_buffer_t *so, const myds_metal_buffer_t *sd,
+    const myds_metal_buffer_t *ss, ggml_type sdt) {
+    (void)o; (void)x; (void)g; (void)u; (void)d; (void)ids; (void)w; (void)mg; (void)mu;
+    (void)mm; (void)md; (void)dim; (void)width; (void)n_exp; (void)k; (void)gt; (void)ut;
+    (void)dt; (void)clamp; (void)ordinary; (void)so; (void)sd; (void)ss; (void)sdt;
+    return record("routed_moe_down_overlap_scoped");
+}
+int myds_metal_routed_moe_down_overlap_nbhc_scoped(myds_metal_buffer_t *o, const myds_metal_buffer_t *x,
+    const myds_metal_buffer_t *g, const myds_metal_buffer_t *u, const myds_metal_buffer_t *d,
+    const myds_metal_buffer_t *ids, const myds_metal_buffer_t *w, myds_metal_buffer_t *mg,
+    myds_metal_buffer_t *mu, myds_metal_buffer_t *mm, myds_metal_buffer_t *md, uint32_t dim,
+    uint32_t width, uint32_t n_exp, uint32_t k, ggml_type gt, ggml_type ut, ggml_type dt,
+    float clamp, bool ordinary, myds_metal_buffer_t *so, const myds_metal_buffer_t *sd,
+    const myds_metal_buffer_t *ss, ggml_type sdt) {
+    (void)o; (void)x; (void)g; (void)u; (void)d; (void)ids; (void)w; (void)mg; (void)mu;
+    (void)mm; (void)md; (void)dim; (void)width; (void)n_exp; (void)k; (void)gt; (void)ut;
+    (void)dt; (void)clamp; (void)ordinary; (void)so; (void)sd; (void)ss; (void)sdt;
+    return 1;
+}
+int myds_metal_v41_moe_add_hc_expand(myds_metal_buffer_t *r, myds_metal_buffer_t *fo,
+    const myds_metal_buffer_t *mo, const myds_metal_buffer_t *so, const myds_metal_buffer_t *aa,
+    const myds_metal_buffer_t *fs, uint32_t d) {
+    (void)r; (void)fo; (void)mo; (void)so; (void)aa; (void)fs; (void)d;
+    return record("moe_add_hc_expand");
+}
+int myds_metal_v41_route_fused(myds_metal_buffer_t *ids, myds_metal_buffer_t *w,
+    const myds_metal_buffer_t *logits, const myds_metal_buffer_t *bias,
+    uint32_t n_exp, uint32_t k, float scale, int mode) {
+    (void)ids; (void)w; (void)logits; (void)bias; (void)n_exp; (void)k; (void)scale; (void)mode;
+    return record("route_fused");
+}
+int myds_metal_v41_route_simd_shuffle(myds_metal_buffer_t *ids, myds_metal_buffer_t *w,
+    const myds_metal_buffer_t *logits, const myds_metal_buffer_t *bias,
+    uint32_t n_exp, uint32_t k, float scale) {
+    (void)ids; (void)w; (void)logits; (void)bias; (void)n_exp; (void)k; (void)scale;
+    return record("route_simd_shuffle");
+}
+int myds_metal_v41_sigmoid_add_bias(myds_metal_buffer_t *o, const myds_metal_buffer_t *x,
+    const myds_metal_buffer_t *b, uint32_t n) {
+    (void)o; (void)x; (void)b; (void)n;
+    return 1;
+}
+int myds_metal_v41_group_top2_sum(myds_metal_buffer_t *o, const myds_metal_buffer_t *x,
+    uint32_t g, uint32_t gs) {
+    (void)o; (void)x; (void)g; (void)gs;
+    return 1;
+}
+int myds_metal_v41_select_groups_mask(myds_metal_buffer_t *o, const myds_metal_buffer_t *x,
+    const myds_metal_buffer_t *gs, uint32_t n, uint32_t g, uint32_t tg) {
+    (void)o; (void)x; (void)gs; (void)n; (void)g; (void)tg;
+    return 1;
+}
+int myds_metal_v41_topk_normalize(myds_metal_buffer_t *ids, myds_metal_buffer_t *w,
+    const myds_metal_buffer_t *m, const myds_metal_buffer_t *r, uint32_t n, uint32_t k, float s) {
+    (void)ids; (void)w; (void)m; (void)r; (void)n; (void)k; (void)s;
+    return 1;
+}
+int myds_metal_v41_shared_gate_up_swiglu(myds_metal_buffer_t *o, const myds_metal_buffer_t *g,
+    const myds_metal_buffer_t *u, const myds_metal_buffer_t *x, uint32_t w, uint32_t d,
+    ggml_type gt, float c) {
+    (void)o; (void)g; (void)u; (void)x; (void)w; (void)d; (void)gt; (void)c;
+    return record("shared_gate_up_swiglu");
+}
+int myds_metal_v41_swiglu(myds_metal_buffer_t *o, const myds_metal_buffer_t *g,
+    const myds_metal_buffer_t *u, uint32_t n, float c) {
+    (void)o; (void)g; (void)u; (void)n; (void)c;
+    return 1;
+}
+int myds_metal_routed_moe_gate_up(myds_metal_buffer_t *m, const myds_metal_buffer_t *x,
+    const myds_metal_buffer_t *g, const myds_metal_buffer_t *u, const myds_metal_buffer_t *ids,
+    uint32_t d, uint32_t w, uint32_t ne, uint32_t k, ggml_type gt, ggml_type ut, float c) {
+    (void)m; (void)x; (void)g; (void)u; (void)ids; (void)d; (void)w; (void)ne; (void)k;
+    (void)gt; (void)ut; (void)c;
+    return 1;
+}
+int myds_metal_routed_moe_down(myds_metal_buffer_t *o, const myds_metal_buffer_t *m,
+    const myds_metal_buffer_t *d, const myds_metal_buffer_t *ids, const myds_metal_buffer_t *w,
+    uint32_t dim, uint32_t width, uint32_t ne, uint32_t k, ggml_type dt) {
+    (void)o; (void)m; (void)d; (void)ids; (void)w; (void)dim; (void)width; (void)ne; (void)k; (void)dt;
+    return 1;
+}
+int myds_metal_routed_moe_batch(myds_metal_buffer_t *o, const myds_metal_buffer_t *x,
+    const myds_metal_buffer_t *g, const myds_metal_buffer_t *u, const myds_metal_buffer_t *d,
+    const myds_metal_buffer_t *ids, const myds_metal_buffer_t *w, myds_metal_buffer_t *mg,
+    myds_metal_buffer_t *mu, myds_metal_buffer_t *mm, myds_metal_buffer_t *md, uint32_t dim,
+    uint32_t width, uint32_t ne, uint32_t k, uint32_t n_tok, ggml_type gt, ggml_type ut,
+    ggml_type dt, float c) {
+    (void)o; (void)x; (void)g; (void)u; (void)d; (void)ids; (void)w; (void)mg; (void)mu;
+    (void)mm; (void)md; (void)dim; (void)width; (void)ne; (void)k; (void)n_tok; (void)gt;
+    (void)ut; (void)dt; (void)c;
+    return 1;
+}
+int myds_metal_v41_add(myds_metal_buffer_t *o, const myds_metal_buffer_t *a,
+    const myds_metal_buffer_t *b, uint32_t n) {
+    (void)o; (void)a; (void)b; (void)n;
+    return 1;
+}
+int myds_metal_v41_hc_expand(myds_metal_buffer_t *o, const myds_metal_buffer_t *b,
+    const myds_metal_buffer_t *r, const myds_metal_buffer_t *s, uint32_t d) {
+    (void)o; (void)b; (void)r; (void)s; (void)d;
+    return 1;
+}
+int myds_metal_shared_gate_up_swiglu_shared3(myds_metal_buffer_t *o, const myds_metal_buffer_t *g,
+    const myds_metal_buffer_t *u, const myds_metal_buffer_t *x, uint32_t w, uint32_t d,
+    ggml_type gt, float c) {
+    (void)o; (void)g; (void)u; (void)x; (void)w; (void)d; (void)gt; (void)c;
+    return 1;
+}
+int myds_metal_routed_moe_shared3(myds_metal_buffer_t *o, const myds_metal_buffer_t *x,
+    const myds_metal_buffer_t *g, const myds_metal_buffer_t *u, const myds_metal_buffer_t *d,
+    const myds_metal_buffer_t *ids, const myds_metal_buffer_t *w, myds_metal_buffer_t *mg,
+    myds_metal_buffer_t *mu, myds_metal_buffer_t *mm, myds_metal_buffer_t *md, uint32_t dim,
+    uint32_t width, uint32_t ne, uint32_t k, ggml_type gt, ggml_type ut, ggml_type dt, float c) {
+    (void)o; (void)x; (void)g; (void)u; (void)d; (void)ids; (void)w; (void)mg; (void)mu;
+    (void)mm; (void)md; (void)dim; (void)width; (void)ne; (void)k; (void)gt; (void)ut;
+    (void)dt; (void)c;
+    return 1;
+}
 
 void myds_metal_barrier(void) { record("barrier"); }
 void myds_metal_barrier_buffer(const myds_metal_buffer_t *b) { assert(b); record("join_1"); }
@@ -69,10 +237,19 @@ void myds_metal_barrier_buffers(const myds_metal_buffer_t *const *b, size_t n) {
         case 2: record("join_2"); break;
         case 3: record("join_3"); break;
         case 4: record("join_4"); break;
+        case 5: record("join_5"); break;
         case 6: record("join_6"); break;
         case 7: record("join_7"); break;
+        case 9: record("join_9"); break;
         default: record("join_n"); break;
     }
+}
+int myds_metal_dispatch_kernel(const char *name, const void *args_ptr, size_t args_size,
+    const myds_metal_buffer_t *const *bufs, size_t n_buffers,
+    const uint32_t groups[3], const uint32_t threads[3], size_t threadgroup_memory) {
+    (void)args_ptr; (void)args_size; (void)bufs; (void)n_buffers;
+    (void)groups; (void)threads; (void)threadgroup_memory;
+    return record(name);
 }
 
 int myds_metal_gemv(myds_metal_buffer_t *o, const myds_metal_buffer_t *w,
@@ -115,6 +292,13 @@ int myds_metal_dense_q4_v41(myds_metal_buffer_t *o, const myds_metal_buffer_t *w
     (void)o; (void)w; (void)x;
     assert(r == 64u * 512u && d == 1280u && ordinary);
     return record("q_b_dense");
+}
+
+int myds_metal_dense_q4_v41_qb_slice(myds_metal_buffer_t *o, const myds_metal_buffer_t *w,
+    const myds_metal_buffer_t *x, uint32_t row_offset, uint32_t rows, bool count_call) {
+    (void)o; (void)w; (void)x;
+    assert(row_offset + rows <= 64u * 512u && (row_offset % 512u) == 0u && (rows % 512u) == 0u);
+    return record(count_call ? "q_b_slice_0" : "q_b_slice_1");
 }
 
 int myds_metal_v41_hc_sum_rmsnorm(myds_metal_buffer_t *o, myds_metal_buffer_t *x,
@@ -362,6 +546,15 @@ int main(void) {
     B(args.block_selected);
     B(args.block_mask);
     args.gpu_scratch = &scratch_inst;
+    buffers[125] = (struct myds_metal_buffer){
+        16u << 20, 0, (void *)(uintptr_t)(UINT64_C(0x100000000) + 125u * UINT64_C(0x2000000))
+    };
+    buffers[126] = (struct myds_metal_buffer){
+        16u << 20, 0, (void *)(uintptr_t)(UINT64_C(0x100000000) + 126u * UINT64_C(0x2000000))
+    };
+    buffers[127] = (struct myds_metal_buffer){
+        16u << 20, 0, (void *)(uintptr_t)(UINT64_C(0x100000000) + 127u * UINT64_C(0x2000000))
+    };
 #undef B
 
     /* 1. Default modes (both 0): reference path executes cleanly. */
@@ -486,6 +679,109 @@ int main(void) {
     assert_idx_counters(1, 0, 1);
     args.mix->data = saved_ptr;
 
-    puts("PASS: attention HC overlap + indexer decode overlap host schedule, cohorts, strict env, exclusions, aliasing guards, counters, and failure recovery");
+    /* 8. MYDS_ATTN_KV_REUSE=1 prestages window on all layers and elides redundant compressor/block-mask steps. */
+    kv_reuse = 1;
+    reset();
+    assert(run_layer(0u, 3u, true));
+    assert(strcmp(event_names[events - 7], "hc_mix_split") == 0);
+    assert(strcmp(event_names[events - 6], "qkv_finish") == 0);
+    assert(strcmp(event_names[events - 5], "q_b_dense") == 0);
+    assert(strcmp(event_names[events - 4], "join_5") == 0);
+    assert(strcmp(event_names[events - 3], "rope") == 0);
+    assert(strcmp(event_names[events - 2], "prestage_window") == 0);
+    assert(strcmp(event_names[events - 1], "join_3") == 0);
+    reset();
+    assert(run_layer(2u, 3u, true));
+    assert(strcmp(event_names[events - 9], "join_9") == 0);
+    assert(strcmp(event_names[events - 8], "indexscores_head_slots") == 0);
+    assert(strcmp(event_names[events - 7], "q_b_slice_1") == 0);
+    assert(strcmp(event_names[events - 6], "join_1") == 0);
+    assert(strcmp(event_names[events - 5], "hc_mix_split") == 0);
+    assert(strcmp(event_names[events - 4], "defer_q_rope") == 0);
+    assert(strcmp(event_names[events - 3], "topk") == 0);
+    assert(strcmp(event_names[events - 2], "q_b_slice_1") == 0);
+    assert(strcmp(event_names[events - 1], "join_3") == 0);
+    reset();
+    assert(run_layer(2u, 2u, true));
+    for (unsigned i = 0; i < events; ++i) {
+        assert(strcmp(event_names[i], "pool2") != 0);
+    }
+    reset();
+    assert(run_layer(20u, 3u, true));
+    for (unsigned i = 0; i < events; ++i) {
+        assert(strcmp(event_names[i], "buffer_copy") != 0);
+        assert(strcmp(event_names[i], "candidates") != 0);
+        assert(strcmp(event_names[i], "topkmask") != 0);
+    }
+    kv_reuse = 0;
+
+    /* 9. MYDS_FFN_HC_OVERLAP=1 overlaps FFN HC with router_gate/shared_gate_up_swiglu/route. */
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(*bad); ++i) {
+        setenv("MYDS_FFN_HC_OVERLAP", bad[i], 1);
+        myds_v41_ffn_hc_overlap_parse_mode();
+        assert(myds_v41_ffn_hc_overlap_enabled() == -1);
+    }
+    setenv("MYDS_FFN_HC_OVERLAP", "1", 1);
+    myds_v41_ffn_hc_overlap_parse_mode();
+    assert(myds_v41_ffn_hc_overlap_enabled() == 1);
+    myds_v41_ffn_hc_overlap_counters(NULL, true);
+    reset();
+    layers[0].ffn_norm = attn_norm;
+    layers[0].router_gate = buffer(16u << 20);
+    layers[0].router_bias = buffer(16u << 20);
+    layers[0].shared_gate = buffer(16u << 20);
+    layers[0].shared_up = buffer(16u << 20);
+    layers[0].shared_down = buffer(16u << 20);
+    layers[0].ffn_gate_exps = buffer(16u << 20);
+    layers[0].ffn_up_exps = buffer(16u << 20);
+    layers[0].ffn_down_exps = buffer(16u << 20);
+    layers[0].router_gate_type = GGML_TYPE_F32;
+    layers[0].shared_gate_type = GGML_TYPE_Q4_K;
+    layers[0].shared_up_type = GGML_TYPE_Q4_K;
+    layers[0].shared_down_type = GGML_TYPE_Q4_K;
+    layers[0].ffn_gate_exps_type = GGML_TYPE_IQ2_XXS;
+    layers[0].ffn_up_exps_type = GGML_TYPE_IQ2_XXS;
+    layers[0].ffn_down_exps_type = GGML_TYPE_Q2_K;
+    model.moe_expert_dim = 2304u;
+    model.n_shared_experts = 1u;
+    model.n_routed_experts = 384u;
+    model.n_activated_experts = 6u;
+    model.routed_scaling_factor = 1.0f;
+    model.swiglu_clamp_exp = 7.0f;
+    context.ffn_norm_out = buffer(16u << 20);
+    context.router_logits = buffer(16u << 20);
+    context.selected_ids = buffer(16u << 20);
+    context.selected_weights = buffer(16u << 20);
+    context.shared_swiglu_out = buffer(16u << 20);
+    context.shared_out = buffer(16u << 20);
+    context.moe_out = buffer(16u << 20);
+    context.moe_gate = buffer(16u << 20);
+    context.moe_up = buffer(16u << 20);
+    context.moe_mid = buffer(16u << 20);
+    context.moe_down = buffer(16u << 20);
+    context.ffn_out = buffer(16u << 20);
+    myds_metal_buffer_t *after_attn = buffer(16u << 20);
+    myds_metal_buffer_t *ffn_split = buffer(16u << 20);
+    events = 0;
+    assert(myds_v41_moe_ffn_hc_overlap_scoped(&context, 0u, 1u, 3u,
+        args.residual, after_attn, args.attn_split, ffn_split,
+        args.attn_fn, args.attn_scale, args.attn_base, args.flat_norm, args.mix,
+        1e-4f, true) == 1);
+    myds_metal_decode_candidate_counters_t ffn_c;
+    myds_v41_ffn_hc_overlap_counters(&ffn_c, false);
+    assert(ffn_c.requests == 1 && ffn_c.encoded == 1 && ffn_c.failures == 0);
+    const char *expected_ffn[] = {
+        "preflight", "hc_sum_rmsnorm", "hc_mix_norm", "join_2",
+        "hc_mix_project", "v41_gemv_f16", "join_2",
+        "hc_mix_split", "kernel_myds_v41_route_fused", "kernel_myds_v41_shared_gate_up_swiglu_q4", "join_5",
+        "routed_moe_down_overlap_scoped", "join_3",
+        "moe_add_hc_expand", "join_1"
+    };
+    assert(events == sizeof(expected_ffn) / sizeof(*expected_ffn));
+    for (unsigned i = 0; i < events; ++i) {
+        assert(strcmp(event_names[i], expected_ffn[i]) == 0);
+    }
+
+    puts("PASS: attention HC overlap + indexer decode overlap + KV reuse + FFN HC overlap host schedule, cohorts, strict env, exclusions, aliasing guards, counters, and failure recovery");
     return 0;
 }

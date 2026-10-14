@@ -215,6 +215,52 @@ int myds_metal_dense_q4_v41(myds_metal_buffer_t *out,
     return 1;
 }
 
+int myds_metal_dense_q4_v41_qb_slice(myds_metal_buffer_t *out,
+    const myds_metal_buffer_t *weight, const myds_metal_buffer_t *input,
+    uint32_t row_offset, uint32_t slice_rows, bool count_call) {
+    if (count_call) atomic_fetch_add_explicit(&g_decode_candidates[DC_Q4][0],1,memory_order_relaxed);
+    const int index = 1;
+    const int provider = g_dense_q4_v41_nb ? DC_Q4_NB : -1;
+    if (count_call && provider>=0) atomic_fetch_add_explicit(&g_decode_candidates[provider][0],1,memory_order_relaxed);
+    if (!g_initialized || !g_dense_q4_v41 || !slice_rows || (slice_rows % 8u) != 0u ||
+        (row_offset % 8u) != 0u || row_offset > 32768u || slice_rows > 32768u - row_offset ||
+        dense_q4_nr0()!=2u || dense_q4_nsg()!=4u ||
+        !decode_candidate_geometry(g_pso_dense_q4_v41[index],4u,256u))
+        return dense_q4_provider_failure(provider,"scope/shape/PSO/geometry");
+    const uint32_t width = 1280u, total_rows = 32768u;
+    const uint64_t row_bytes=(uint64_t)(width/256u)*144u, weights=row_bytes*total_rows;
+    const uint64_t in_bytes=(uint64_t)width*4u, out_bytes=(uint64_t)total_rows*4u;
+    if (!decode_candidate_range(weight,weights,2u) ||
+        !decode_candidate_range(input,in_bytes,4u) || !decode_candidate_range(out,out_bytes,16u) ||
+        decode_candidate_overlap(out,out_bytes,weight,weights) ||
+        decode_candidate_overlap(out,out_bytes,input,in_bytes))
+        return dense_q4_provider_failure(provider,"range/alignment/alias");
+    const uint64_t slice_weights = row_bytes * slice_rows;
+    struct ds4_metal_args_mul_mv a={0};
+    a.ne00=(int32_t)width; a.ne01=(int32_t)slice_rows; a.ne02=1;
+    a.nb00=144u; a.nb01=row_bytes; a.nb02=slice_weights; a.nb03=slice_weights;
+    a.ne10=(int32_t)width; a.ne11=1; a.ne12=1; a.nb10=4u;
+    a.nb11=in_bytes; a.nb12=in_bytes; a.nb13=in_bytes;
+    a.ne0=(int32_t)slice_rows; a.ne1=1; a.nr0=2; a.r2=1; a.r3=1;
+    id<MTLCommandBuffer> cb=g_batch_cb?:[g_queue commandBuffer];
+    if (!cb) return dense_q4_provider_failure(provider,"command buffer unavailable");
+    id<MTLComputeCommandEncoder> enc=get_compute_encoder(cb);
+    if (!enc) return dense_q4_provider_failure(provider,"encoder unavailable");
+    [enc setComputePipelineState:g_pso_dense_q4_v41[index]];
+    [enc setBytes:&a length:sizeof(a) atIndex:0];
+    [enc setBuffer:weight->mtl_buf offset:weight->offset + (NSUInteger)(row_offset * row_bytes) atIndex:1];
+    [enc setBuffer:input->mtl_buf offset:input->offset atIndex:2];
+    [enc setBuffer:out->mtl_buf offset:out->offset + (NSUInteger)(row_offset * 4u) atIndex:3];
+    [enc setThreadgroupMemoryLength:256u atIndex:0];
+    metal_dispatch(enc,myds_metal_dense_q4_v41_selected_kernel((unsigned)index),MTLSizeMake(slice_rows/8u,1u,1u),MTLSizeMake(32u,4u,1u));
+    if (!v41_finish(cb,enc)) return dense_q4_provider_failure(provider,"command completion failed");
+    if (count_call) {
+        atomic_fetch_add_explicit(&g_decode_candidates[DC_Q4][1],1,memory_order_relaxed);
+        if (provider>=0) atomic_fetch_add_explicit(&g_decode_candidates[provider][1],1,memory_order_relaxed);
+    }
+    return 1;
+}
+
 /* Called after Q2 dispatch and before its existing output join. Exactly the
  * reference Q4 SharedDown ABI/PSO/grid. No helper reentry, encoder transition,
  * barrier or BF16 fallback is permitted between these two down dispatches. */
@@ -239,3 +285,4 @@ static int encode_shared_down_overlap(id<MTLComputeCommandEncoder> enc, const sh
     if (job->shared_q4_nb) atomic_fetch_add_explicit(&g_decode_candidates[DC_SHARED_Q4_NB][1],1,memory_order_relaxed);
     return enc==g_batch_enc;
 }
+

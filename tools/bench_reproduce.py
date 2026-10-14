@@ -60,6 +60,8 @@ DECODE_SHAPE_CANDIDATES = {
     'gpu_moe_hc_overlap': ('MYDS_MOE_HC_OVERLAP', 'moe_hc_overlap_mode', 40, 'require_moe_hc_overlap'),
     'gpu_attn_hc_overlap': ('MYDS_ATTN_HC_OVERLAP', 'attn_hc_overlap_mode', 40, 'require_attn_hc_overlap'),
     'gpu_indexer_decode_overlap': ('MYDS_INDEXER_DECODE_OVERLAP', 'indexer_decode_overlap_mode', 8, 'require_indexer_decode_overlap'),
+    'gpu_attn_kv_reuse': ('MYDS_ATTN_KV_REUSE', 'attn_kv_reuse_mode', 40, 'require_attn_kv_reuse'),
+    'gpu_ffn_hc_overlap': ('MYDS_FFN_HC_OVERLAP', 'ffn_hc_overlap_mode', 40, 'require_ffn_hc_overlap'),
     'gpu_shared_q4_v41_nb': ('MYDS_SHARED_Q4_V41_NB', 'shared_q4_v41_nb_mode', 80, 'require_shared_q4_v41_nb'),
     'gpu_attention_direct_pack_fuse': ('MYDS_ATTN_DIRECT_PACK_FUSE', 'attention_direct_pack_fuse_mode', 40, 'require_attention_direct_pack_fuse'),
 }
@@ -1134,6 +1136,8 @@ def run(args):
                              ('require_moe_hc_overlap', 'gpu_moe_hc_overlap'),
                              ('require_attn_hc_overlap', 'gpu_attn_hc_overlap'),
                              ('require_indexer_decode_overlap', 'gpu_indexer_decode_overlap'),
+                             ('require_attn_kv_reuse', 'gpu_attn_kv_reuse'),
+                             ('require_ffn_hc_overlap', 'gpu_ffn_hc_overlap'),
                              ('require_shared_q4_v41_nb', 'gpu_shared_q4_v41_nb'),
                              ('require_attention_direct_pack_fuse', 'gpu_attention_direct_pack_fuse'),
                              ('require_moe_q2_v41', 'gpu_moe_q2_v41'),
@@ -1223,6 +1227,10 @@ def main():
         help='Require complete ordinary-target attn_hc_overlap adoption')
     measurement.add_argument('--require-indexer-decode-overlap', action='store_true',
         help='Require complete ordinary-target indexer_decode_overlap adoption')
+    measurement.add_argument('--require-attn-kv-reuse', action='store_true',
+        help='Require complete ordinary-target attn_kv_reuse adoption')
+    measurement.add_argument('--require-ffn-hc-overlap', action='store_true',
+        help='Require complete ordinary-target ffn_hc_overlap adoption')
     measurement.add_argument('--require-shared-q4-v41-nb', action='store_true',
         help='Require complete fixed Shared Q4 GU/Down adoption in every ordinary target')
     measurement.add_argument('--require-attention-direct-pack-fuse', action='store_true',
