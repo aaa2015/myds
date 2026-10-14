@@ -251,6 +251,43 @@ kernel void kernel_dsv41_get_rows_bf16_to_f16(
     }
 }
 
+// Direct single-query packing only. Each TG owns one complete 512-value row;
+// the two uniform branches reproduce the original half4 conversions verbatim.
+// No attention/RoPE/reduction arithmetic or padding layout is changed here.
+struct myds_dsv41_direct_pack_args {
+    uint n_raw, raw_start, source_rows, selected_rows;
+};
+static_assert(sizeof(myds_dsv41_direct_pack_args)==16,"direct pack host ABI");
+kernel void kernel_myds_dsv41_direct_pack_fuse(
+        constant myds_dsv41_direct_pack_args &args,
+        device const float *window,
+        device const ushort *src,
+        device const int *ids,
+        device half *dst,
+        uint2 gid [[thread_position_in_grid]]) {
+    if(gid.x>=128u||gid.y>=args.n_raw+args.selected_rows)return;
+    if(gid.y<args.n_raw) {
+        const uint src_row=(args.raw_start+gid.y)%128u;
+        device const float4 *w4=(device const float4 *)(window+(ulong)src_row*512u);
+        device half4 *dst4=(device half4 *)(dst+(ulong)gid.y*512u);
+        dst4[gid.x]=half4(w4[gid.x]);
+    } else {
+        const uint selected=gid.y-args.n_raw;
+        const int row=ids[selected];
+        device half4 *dst4=(device half4 *)(dst+(ulong)gid.y*512u);
+        if(row>=0&&uint(row)<args.source_rows) {
+            device const ushort4 *src4=(device const ushort4 *)(src+(ulong)row*512u);
+            const ushort4 u=src4[gid.x];
+            const float4 f=float4(
+                as_type<float>(uint(u.x)<<16u),
+                as_type<float>(uint(u.y)<<16u),
+                as_type<float>(uint(u.z)<<16u),
+                as_type<float>(uint(u.w)<<16u));
+            dst4[gid.x]=half4(f);
+        } else dst4[gid.x]=half4(0.0h);
+    }
+}
+
 struct ds4_metal_args_dsv41_engram {
     uint width;
     uint rows;

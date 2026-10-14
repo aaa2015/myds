@@ -958,8 +958,11 @@ static int moe_hc_overlap_101(myds_context_t *ctx, uint32_t layer,
     HC_STAGE_CHECK(myds_metal_v41_hc_mix_norm_stage(flat_norm,after_attn,dim,m->norm_eps));
     HC_STAGE_CHECK(myds_metal_v41_gemv(ctx->router_logits,l->router_gate,ctx->ffn_norm_out,
         m->n_routed_experts,dim,l->router_gate_type));
-    HC_STAGE_CHECK(myds_v41_shared_gate_up_swiglu(ctx->shared_swiglu_out,l->shared_gate,
-        l->shared_up,ctx->ffn_norm_out,width,dim,l->shared_gate_type,l->shared_up_type,m->swiglu_clamp_exp));
+    HC_STAGE_CHECK(myds_metal_shared_q4_v41_nb_enabled()
+        ? myds_metal_shared_q4_v41_nb_gate_up(ctx->shared_swiglu_out,l->shared_gate,l->shared_up,
+            ctx->ffn_norm_out,width,dim,m->swiglu_clamp_exp)
+        : myds_v41_shared_gate_up_swiglu(ctx->shared_swiglu_out,l->shared_gate,
+            l->shared_up,ctx->ffn_norm_out,width,dim,l->shared_gate_type,l->shared_up_type,m->swiglu_clamp_exp));
     const myds_metal_buffer_t *cohort1[]={flat_norm,ctx->router_logits,ctx->shared_swiglu_out};
     myds_metal_barrier_buffers(cohort1,3);
 
@@ -976,7 +979,15 @@ static int moe_hc_overlap_101(myds_context_t *ctx, uint32_t layer,
      * the production helper. Encoded means the actual stage3 was accepted. */
     HC_STAGE_CHECK(myds_metal_v41_hc_mix_split_stage(ffn_split,mix,ffn_scale,ffn_base,dim,hc_eps));
     atomic_fetch_add_explicit(&hc_overlap_encoded,1,memory_order_relaxed);
-    HC_STAGE_CHECK(myds_metal_routed_moe_down_overlap_scoped(ctx->moe_out,ctx->ffn_norm_out,
+    int (*down_encode)(myds_metal_buffer_t *,const myds_metal_buffer_t *,
+        const myds_metal_buffer_t *,const myds_metal_buffer_t *,const myds_metal_buffer_t *,
+        const myds_metal_buffer_t *,const myds_metal_buffer_t *,myds_metal_buffer_t *,
+        myds_metal_buffer_t *,myds_metal_buffer_t *,myds_metal_buffer_t *,uint32_t,uint32_t,
+        uint32_t,uint32_t,ggml_type,ggml_type,ggml_type,float,bool,myds_metal_buffer_t *,
+        const myds_metal_buffer_t *,const myds_metal_buffer_t *,ggml_type) =
+        myds_metal_shared_q4_v41_nb_enabled() ? myds_metal_routed_moe_down_overlap_nbhc_scoped :
+            myds_metal_routed_moe_down_overlap_scoped;
+    HC_STAGE_CHECK(down_encode(ctx->moe_out,ctx->ffn_norm_out,
         l->ffn_gate_exps,l->ffn_up_exps,l->ffn_down_exps,ctx->selected_ids,ctx->selected_weights,
         ctx->moe_gate,ctx->moe_up,ctx->moe_mid,ctx->moe_down,dim,width,m->n_routed_experts,k,
         l->ffn_gate_exps_type,l->ffn_up_exps_type,l->ffn_down_exps_type,m->swiglu_clamp_exp,true,

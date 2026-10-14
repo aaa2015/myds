@@ -130,7 +130,8 @@ size_t myds_v41_gpu_chunk_workspace_bytes(const myds_v41_gpu_scratch_t *s) {
     return s ? myds_metal_buffer_size(s->kv_chunk)+myds_metal_buffer_size(s->mask_chunk) : 0;
 }
 myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp) {
-    if (myds_v41_gpu_attention_packed_register_enabled()<0 || myds_v41_attention_rope_fuse_enabled()<0) return NULL;
+    if (myds_v41_gpu_attention_packed_register_enabled()<0 || myds_v41_attention_rope_fuse_enabled()<0 ||
+        myds_v41_gpu_attention_direct_pack_fuse_enabled()<0) return NULL;
     if(!max_comp || max_comp>1048576) return NULL;
     myds_v41_gpu_scratch_t *s=calloc(1,sizeof(*s));
     if(!s)return NULL;
@@ -1611,6 +1612,86 @@ static int attention_rope_failure(void) {
 static int attention_rope_range(const myds_metal_buffer_t *b,uint64_t bytes,size_t alignment) {
     return myds_metal_buffer_native_range(b,bytes,alignment);
 }
+enum { AP_REQUESTS, AP_ENCODED, AP_FAILURES, AP_COUNT };
+static _Atomic uint64_t attention_pack_counters[AP_COUNT];
+static pthread_once_t attention_pack_once=PTHREAD_ONCE_INIT;
+static int attention_pack_mode;
+static const char attention_pack_kernel[]="kernel_myds_dsv41_direct_pack_fuse";
+static void attention_pack_init(void) {
+    const char *value=getenv("MYDS_ATTN_DIRECT_PACK_FUSE");
+    if (!value || !strcmp(value,"0")) return;
+    if (strcmp(value,"1")) {
+        MYDS_LOG_E("MYDS_ATTN_DIRECT_PACK_FUSE must be exactly 0 or 1");
+        attention_pack_mode=-1;return;
+    }
+    if (myds_v41_attention_rope_fuse_enabled()!=1) {
+        MYDS_LOG_E("MYDS_ATTN_DIRECT_PACK_FUSE=1 requires RF1/packed register1/physical8/reduce1");
+        attention_pack_mode=-1;return;
+    }
+    const char *direct=getenv("MYDS_ATTN_DIRECT_PACK");
+    if(direct&&strcmp(direct,"1")) {
+        MYDS_LOG_E("MYDS_ATTN_DIRECT_PACK_FUSE=1 requires MYDS_ATTN_DIRECT_PACK absent or exactly1");
+        attention_pack_mode=-1;return;
+    }
+    attention_pack_mode=1;
+}
+int myds_v41_gpu_attention_direct_pack_fuse_enabled(void) {
+    pthread_once(&attention_pack_once,attention_pack_init);
+    return attention_pack_mode;
+}
+const char *myds_v41_gpu_attention_direct_pack_fuse_selected_kernel(void) {
+    return myds_v41_gpu_attention_direct_pack_fuse_enabled()==1 ? attention_pack_kernel : NULL;
+}
+void myds_v41_gpu_attention_direct_pack_fuse_counters(myds_metal_decode_candidate_counters_t *out,bool reset) {
+    uint64_t v[AP_COUNT];
+    for(unsigned i=0;i<AP_COUNT;i++)v[i]=reset?
+        atomic_exchange_explicit(&attention_pack_counters[i],0u,memory_order_relaxed):
+        atomic_load_explicit(&attention_pack_counters[i],memory_order_relaxed);
+    if(out)*out=(myds_metal_decode_candidate_counters_t){v[0],v[1],v[2]};
+}
+static int attention_pack_failure(void) {
+    atomic_fetch_add_explicit(&attention_pack_counters[AP_FAILURES],1u,memory_order_relaxed);
+    return 0;
+}
+struct attention_direct_pack_args {uint32_t n_raw,raw_start,source_rows,selected_rows;};
+_Static_assert(sizeof(struct attention_direct_pack_args)==16u,"direct pack ABI");
+/* Call only before scratch WAR joins/writes. The scoped RF entry has already
+ * validated heads/pad/partial and every reader/writer cross-alias. Keep an
+ * independent complete pack guard and PSO preflight here as well. */
+static int attention_direct_pack_preflight(const myds_metal_buffer_t *dst,
+    const myds_metal_buffer_t *window,uint32_t n_raw,uint32_t raw_start,
+    const myds_metal_buffer_t *comp,const myds_metal_buffer_t *ids,
+    uint32_t source_rows,uint32_t selected_rows) {
+    if(!n_raw||n_raw>128u||raw_start>=128u||selected_rows>512u||
+       (selected_rows&&(!source_rows||selected_rows>source_rows)))return 0;
+    const uint64_t dn=(uint64_t)(n_raw+selected_rows)*512u*2u,wn=128u*512u*4u;
+    if(!myds_metal_buffer_native_range(dst,dn,16u)||
+       !myds_metal_buffer_native_range(window,wn,16u)||
+       buffer_ranges_overlap(dst,(size_t)dn,window,(size_t)wn))return 0;
+    if(selected_rows) {
+        const uint64_t cn=(uint64_t)source_rows*512u*2u,in=(uint64_t)selected_rows*4u;
+        if(!myds_metal_buffer_native_range(comp,cn,16u)||
+           !myds_metal_buffer_native_range(ids,in,4u)||
+           buffer_ranges_overlap(dst,(size_t)dn,comp,(size_t)cn)||
+           buffer_ranges_overlap(dst,(size_t)dn,ids,(size_t)in))return 0;
+    }
+    const uint32_t threads[]={128u,1u,1u};
+    return myds_metal_kernel_constants_preflight(attention_pack_kernel,threads,0u,NULL,0u);
+}
+/* Counts this selected pack dispatch only. A later RF failure propagates from
+ * the enclosing forward; it is not a pack failure after pack encoded success. */
+static int attention_direct_pack_encode(myds_metal_buffer_t *dst,
+    const myds_metal_buffer_t *window,uint32_t n_raw,uint32_t raw_start,
+    const myds_metal_buffer_t *comp,const myds_metal_buffer_t *ids,
+    uint32_t source_rows,uint32_t selected_rows) {
+    const struct attention_direct_pack_args a={n_raw,raw_start,source_rows,selected_rows};
+    const myds_metal_buffer_t *b[]={window,selected_rows?comp:window,selected_rows?ids:window,dst};
+    const uint64_t before=myds_metal_dispatch_count();
+    const int ok=dispatch(attention_pack_kernel,&a,sizeof(a),b,4,1,n_raw+selected_rows,1,128,1,1,0);
+    if(myds_metal_dispatch_count()>before)
+        atomic_fetch_add_explicit(&attention_pack_counters[AP_ENCODED],1u,memory_order_relaxed);
+    return ok ? 1 : attention_pack_failure();
+}
 /* Complete predispatch guards: no scratch staging, joins, CB or dispatch may
  * precede failure. Read-only selected IDs retain the original GPU range check;
  * this host never synchronizes or inspects their payload. */
@@ -1790,6 +1871,17 @@ static int attention_direct_impl(myds_metal_buffer_t *heads,const myds_metal_buf
         !floats(heads,64u*512)||!floats(q,64u*512)||!floats(sinks,64)||!floats(window,128u*512)||
         (selected_rows&&(selected_rows>source_rows||!bf16s(comp_kv,(uint64_t)source_rows*512)||!floats(selected_ids,selected_rows))))return 0;
 
+    /* Only an actual ordinary direct RF scope selects this candidate. Public
+     * direct/staged/trace callers continue to use the two original shaders. */
+    const int pack_fuse=rope ? myds_v41_gpu_attention_direct_pack_fuse_enabled() : 0;
+    if(pack_fuse) {
+        atomic_fetch_add_explicit(&attention_pack_counters[AP_REQUESTS],1u,memory_order_relaxed);
+        if(pack_fuse<0 || register_mode!=1 ||
+           !attention_direct_pack_preflight(s->kv_f16,window,n_raw,raw_start,
+                                            comp_kv,selected_ids,source_rows,selected_rows))
+            return attention_pack_failure();
+    }
+
     const int packed_nsg = get_attn_packed_physical_nsg();
     if (!packed_nsg) return 0;
     if (packed_nsg != 8 && !get_attn_packed_reduce_mode()) {
@@ -1802,11 +1894,17 @@ static int attention_direct_impl(myds_metal_buffer_t *heads,const myds_metal_buf
         const myds_metal_buffer_t *scratch_buffers[] = {s->kv_f16, s->pad, s->partial};
         myds_metal_barrier_buffers(scratch_buffers, 3);
     }
-    const uint32_t w_args[] = {n_raw, raw_start};
-    const myds_metal_buffer_t *wb[] = {window, s->kv_f16};
-    if(!dispatch("kernel_dsv41_copy_window_f32_to_f16", w_args, sizeof(w_args), wb, 2, 1, n_raw, 1, 128, 1, 1, 0)) return 0;
+    if(pack_fuse) {
+        /* Unused inputs for selected_rows0 bind a valid window resource. The
+         * shader's uniform raw-row branch never reads these dummy bindings. */
+        if(!attention_direct_pack_encode(s->kv_f16,window,n_raw,raw_start,
+                                        comp_kv,selected_ids,source_rows,selected_rows))return 0;
+    } else {
+        const uint32_t w_args[] = {n_raw, raw_start};
+        const myds_metal_buffer_t *wb[] = {window, s->kv_f16};
+        if(!dispatch("kernel_dsv41_copy_window_f32_to_f16", w_args, sizeof(w_args), wb, 2, 1, n_raw, 1, 128, 1, 1, 0)) return 0;
 
-    if(selected_rows) {
+        if(selected_rows) {
         struct {
             uint32_t source_rows;
             uint32_t selected_rows;
@@ -1814,7 +1912,8 @@ static int attention_direct_impl(myds_metal_buffer_t *heads,const myds_metal_buf
             uint32_t pad;
         } g_args = {source_rows, selected_rows, n_raw, 0};
         const myds_metal_buffer_t *gb[] = {comp_kv, selected_ids, s->kv_f16};
-        if(!dispatch("kernel_dsv41_get_rows_bf16_to_f16", &g_args, sizeof(g_args), gb, 3, 1, selected_rows, 1, 128, 1, 1, 0)) return 0;
+            if(!dispatch("kernel_dsv41_get_rows_bf16_to_f16", &g_args, sizeof(g_args), gb, 3, 1, selected_rows, 1, 128, 1, 1, 0)) return 0;
+        }
     }
     if(!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(s->kv_f16);
 

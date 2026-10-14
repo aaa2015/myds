@@ -22,6 +22,16 @@ typedef struct {
 int myds_metal_moe_down_overlap_enabled(void);
 int myds_metal_moe_iq2_v41_enabled(void);
 int myds_metal_dense_q4_v41_enabled(void);
+/* Strict init-owned MYDS_SHARED_Q4_V41_NB. Only the ordinary NB+HC caller
+ * selects GU/Down; original wrappers retain their providers. Shape0=GU,
+ * shape1=Down. Counters count accepted dispatches, not GPU completion. */
+int myds_metal_shared_q4_v41_nb_enabled(void);
+const char *myds_metal_shared_q4_v41_nb_selected_kernel(unsigned shape);
+void myds_metal_shared_q4_v41_nb_counters(myds_metal_decode_candidate_counters_t *out,bool reset);
+int myds_metal_shared_q4_v41_nb_gate_up(myds_metal_buffer_t *out,
+    const myds_metal_buffer_t *gate,const myds_metal_buffer_t *up,
+    const myds_metal_buffer_t *input,uint32_t rows,uint32_t width,float clamp);
+
 /* Ordinary scalar provider ablations; both require Dense Q4 V41. */
 int myds_metal_dense_q4_v41_nb_enabled(void);
 int myds_metal_dense_q4_v41_head_reference_enabled(void);
@@ -530,6 +540,32 @@ int myds_metal_routed_moe_scoped(
 
 /* Ordinary scalar only: pairs the original Q4 SharedDown with routed Q2. */
 int myds_metal_routed_moe_down_overlap_scoped(
+    myds_metal_buffer_t       *moe_out,
+    const myds_metal_buffer_t *x_in,
+    const myds_metal_buffer_t *gate_exps,
+    const myds_metal_buffer_t *up_exps,
+    const myds_metal_buffer_t *down_exps,
+    const myds_metal_buffer_t *selected_ids,
+    const myds_metal_buffer_t *selected_weights,
+    myds_metal_buffer_t       *scratch_gate,
+    myds_metal_buffer_t       *scratch_up,
+    myds_metal_buffer_t       *scratch_mid,
+    myds_metal_buffer_t       *scratch_down,
+    uint32_t                   dim,
+    uint32_t                   expert_dim,
+    uint32_t                   n_routed_experts,
+    uint32_t                   n_activated_experts,
+    ggml_type                  gate_type,
+    ggml_type                  up_type,
+    ggml_type                  down_type,
+    float                      clamp_val,
+    bool                       ordinary_decode_allowed,
+    myds_metal_buffer_t *shared_out,
+    const myds_metal_buffer_t *shared_weight,
+    const myds_metal_buffer_t *shared_input,
+    ggml_type shared_type);
+/* Same ABI; exclusively called by the adopted ordinary NB+HC schedule. */
+int myds_metal_routed_moe_down_overlap_nbhc_scoped(
     myds_metal_buffer_t       *moe_out,
     const myds_metal_buffer_t *x_in,
     const myds_metal_buffer_t *gate_exps,

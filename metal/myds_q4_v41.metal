@@ -110,3 +110,13 @@ MYDS_Q4_V41_KERNEL(kernel_myds_q4_v41_ob_addr_bf16,5120,8192,false,true)
 MYDS_Q4_V41_KERNEL(kernel_myds_q4_v41_ob_nb_bf16,5120,8192,true,true)
 #undef MYDS_Q4_V41_KERNEL
 
+
+// Explicit ordinary NB+HC SharedDown: 5120x2304, NR2/NSG4, original BF16 math.
+kernel void kernel_myds_q4_v41_shared_down_nb_bf16(
+ constant myds_q4_v41_args &args [[buffer(0)]],
+ device const char *w [[buffer(1)]], device const char *x [[buffer(2)]],
+ device char *y [[buffer(3)]], threadgroup char *scratch [[threadgroup(0)]],
+ uint3 group [[threadgroup_position_in_grid]],
+ ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+ myds_q4_v41_body<5120,2304,true,true>(args,w,x,y,group,lane,sg); (void)scratch;
+}

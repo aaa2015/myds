@@ -19,6 +19,17 @@ typedef struct myds_v41_gpu_scratch myds_v41_gpu_scratch_t;
  * and a gathered buffer is supplied. Invalid thresholds reject scratch creation.
  * The explicit strategy is captured per scratch; no measured threshold is forced. */
 myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp);
+/* Default-off ordinary direct/RF1 packing candidate. The process configuration
+ * accepts only absent/0/1 and is fixed after the first getter call. Explicit1
+ * requires RF1, packed register1/physical8/reduce1 and DIRECT_PACK absent/1. Public direct, staged and
+ * trace paths retain the reference packing shaders. Missing selected PSO or
+ * invalid input fails before scratch writes; no retry/fallback is permitted.
+ * Counters cover the selected pack dispatch; later attention/RF failures are
+ * reported by the enclosing forward and its existing counters. */
+int myds_v41_gpu_attention_direct_pack_fuse_enabled(void);
+const char *myds_v41_gpu_attention_direct_pack_fuse_selected_kernel(void);
+void myds_v41_gpu_attention_direct_pack_fuse_counters(
+    myds_metal_decode_candidate_counters_t *out,bool reset);
 /* Pack the upper 16 bits of already BF16-rounded F32 values. Offsets are in
  * destination uint16 words / source floats; no numerical conversion or rounding. */
 int myds_v41_gpu_pack_bf16(myds_metal_buffer_t *dst,size_t dst_offset_words,

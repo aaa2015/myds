@@ -58,6 +58,8 @@ DECODE_SHAPE_CANDIDATES = {
     'gpu_dense_q4_v41_head_reference': ('MYDS_DENSE_Q4_V41_HEAD_REFERENCE', 'dense_q4_v41_head_reference_mode', 1, 'require_dense_q4_v41_head_reference'),
     'gpu_attention_rope_fuse': ('MYDS_ATTN_ROPE_FUSE', 'attention_rope_fuse_mode', 40, 'require_attention_rope_fuse'),
     'gpu_moe_hc_overlap': ('MYDS_MOE_HC_OVERLAP', 'moe_hc_overlap_mode', 40, 'require_moe_hc_overlap'),
+    'gpu_shared_q4_v41_nb': ('MYDS_SHARED_Q4_V41_NB', 'shared_q4_v41_nb_mode', 80, 'require_shared_q4_v41_nb'),
+    'gpu_attention_direct_pack_fuse': ('MYDS_ATTN_DIRECT_PACK_FUSE', 'attention_direct_pack_fuse_mode', 40, 'require_attention_direct_pack_fuse'),
 }
 CANDIDATE_PATHS = {
     'gpu_moe_down_overlap': ('MYDS_MOE_DOWN_OVERLAP', 'failures',
@@ -1128,6 +1130,8 @@ def run(args):
                              ('require_dense_q4_v41_head_reference', 'gpu_dense_q4_v41_head_reference'),
                              ('require_attention_rope_fuse', 'gpu_attention_rope_fuse'),
                              ('require_moe_hc_overlap', 'gpu_moe_hc_overlap'),
+                             ('require_shared_q4_v41_nb', 'gpu_shared_q4_v41_nb'),
+                             ('require_attention_direct_pack_fuse', 'gpu_attention_direct_pack_fuse'),
                              ('require_moe_q2_v41', 'gpu_moe_q2_v41'),
                              ('require_attention_packed_register', 'gpu_attention_packed_register'),
                              ('require_route_simd_shuffle', 'gpu_route_simd_shuffle'),
@@ -1211,6 +1215,10 @@ def main():
         help='Require complete ordinary-target attention_rope_fuse adoption')
     measurement.add_argument('--require-moe-hc-overlap', action='store_true',
         help='Require complete ordinary-target moe_hc_overlap adoption')
+    measurement.add_argument('--require-shared-q4-v41-nb', action='store_true',
+        help='Require complete fixed Shared Q4 GU/Down adoption in every ordinary target')
+    measurement.add_argument('--require-attention-direct-pack-fuse', action='store_true',
+        help='Require complete fused raw/selected attention packing in every ordinary target')
     measurement.add_argument('--require-route-simd-shuffle', action='store_true',
                              help='Require actual router SIMD shuffle encoding in every formal decode, with no failures')
     measurement.add_argument('--require-attention-packed-register', action='store_true',

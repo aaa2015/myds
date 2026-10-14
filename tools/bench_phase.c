@@ -57,6 +57,8 @@ typedef struct {
     myds_metal_decode_candidate_counters_t first_dense_q4_v41_head_reference;
     myds_metal_decode_candidate_counters_t first_attention_rope_fuse;
     myds_metal_decode_candidate_counters_t first_moe_hc_overlap;
+    myds_metal_decode_candidate_counters_t first_shared_q4_v41_nb;
+    myds_metal_decode_candidate_counters_t first_attention_direct_pack_fuse;
     myds_metal_shared3_counters_t first_depth2_dense;
     myds_v41_shared_gu_shared3_counters_t first_depth2_gu;
     myds_v41_depth2_routed_shared3_counters_t first_depth2_routed;
@@ -103,6 +105,8 @@ static void capture(const char *piece, size_t length, int32_t id, void *opaque) 
         myds_metal_dense_q4_v41_head_reference_counters(&c->first_dense_q4_v41_head_reference, false);
         myds_v41_attention_rope_fuse_counters(&c->first_attention_rope_fuse, false);
         myds_v41_moe_hc_overlap_counters(&c->first_moe_hc_overlap, false);
+        myds_metal_shared_q4_v41_nb_counters(&c->first_shared_q4_v41_nb, false);
+        myds_v41_gpu_attention_direct_pack_fuse_counters(&c->first_attention_direct_pack_fuse, false);
         myds_metal_shared3_counters(&c->first_depth2_dense, false);
         myds_v41_shared_gu_shared3_counters(&c->first_depth2_gu, false);
         myds_v41_depth2_routed_shared3_counters(&c->first_depth2_routed, false);
@@ -325,9 +329,9 @@ int main(int argc, char **argv) {
         "MYDS_QKV_FUSE_BF16", "MYDS_QKV_FUSE_POST", "MYDS_QKV_NR0", "MYDS_MOE_IQ2_TAIL_CULL",
         "MYDS_MOE_IQ2_CONSTANT_LUT", "MYDS_ATTN_PACKED_NSG", "MYDS_ATTN_PACKED_REDUCE",
         "MYDS_MOE_ROUTE_FUSE", "MYDS_ROUTE_SIMD_SHUFFLE",
-        "MYDS_MOE_DOWN_OVERLAP", "MYDS_MOE_IQ2_V41", "MYDS_DENSE_Q4_V41",
+        "MYDS_MOE_DOWN_OVERLAP", "MYDS_MOE_IQ2_V41", "MYDS_DENSE_Q4_V41", "MYDS_SHARED_Q4_V41_NB",
         "MYDS_ATTN_OUT_A_FUSE_BF16",
-        "MYDS_ATTN_DIRECT_PACK",
+        "MYDS_ATTN_DIRECT_PACK", "MYDS_ATTN_DIRECT_PACK_FUSE",
         "MYDS_ENGRAM_IO_THREADS", "MYDS_ENGRAM_NOCACHE", "MYDS_BENCH_STORAGE_COUNTERS",
         "MYDS_GEMV_BATCH_SIZE", "MYDS_PLD", "MYDS_BATCH2_SPEC", "MYDS_BATCH2_Q8_SHARED", "MYDS_TREE_SPEC", "MYDS_DSPARK_DEPTH", "MYDS_DSPARK_EVAL_PREFIX",
         "MYDS_DSPARK_MARKOV_ONLY", "MYDS_DSPARK_MARKOV_SCALE", "MYDS_DSPARK_MIN_CONF",
@@ -407,6 +411,16 @@ int main(int argc, char **argv) {
         json_string(json,myds_metal_dense_q4_v41_selected_kernel(shape));
     }
     fputc(']',json);
+    fprintf(json, ",\"shared_q4_v41_nb_mode\":%d", myds_metal_shared_q4_v41_nb_enabled());
+    fputs(",\"shared_q4_v41_nb_kernels\":[",json);
+    for (unsigned shape=0;shape<2u;shape++) {
+        if (shape) fputc(',',json);
+        json_string(json,myds_metal_shared_q4_v41_nb_selected_kernel(shape));
+    }
+    fputc(']',json);
+    fprintf(json, ",\"attention_direct_pack_fuse_mode\":%d", myds_v41_gpu_attention_direct_pack_fuse_enabled());
+    fputs(",\"attention_direct_pack_fuse_kernel\":",json);
+    json_string(json,myds_v41_gpu_attention_direct_pack_fuse_selected_kernel());
     fputs(",\"actual_metallib_path\":", json);
     json_string(json, myds_metal_loaded_library_path());
     fputs("}\n", json);
@@ -449,6 +463,8 @@ int main(int argc, char **argv) {
         myds_metal_dense_q4_v41_head_reference_counters(NULL, true);
         myds_v41_attention_rope_fuse_counters(NULL, true);
         myds_v41_moe_hc_overlap_counters(NULL, true);
+        myds_metal_shared_q4_v41_nb_counters(NULL, true);
+        myds_v41_gpu_attention_direct_pack_fuse_counters(NULL, true);
         myds_metal_shared3_counters(NULL, true);
         myds_v41_shared_gu_shared3_counters(NULL, true);
         myds_v41_depth2_routed_shared3_counters(NULL, true);
@@ -506,6 +522,10 @@ int main(int argc, char **argv) {
         myds_v41_attention_rope_fuse_counters(&attention_rope_fuse, false);
         myds_metal_decode_candidate_counters_t moe_hc_overlap;
         myds_v41_moe_hc_overlap_counters(&moe_hc_overlap, false);
+        myds_metal_decode_candidate_counters_t shared_q4_v41_nb;
+        myds_metal_shared_q4_v41_nb_counters(&shared_q4_v41_nb, false);
+        myds_metal_decode_candidate_counters_t attention_direct_pack_fuse;
+        myds_v41_gpu_attention_direct_pack_fuse_counters(&attention_direct_pack_fuse, false);
         myds_metal_shared3_counters_t depth2_dense;
         myds_metal_shared3_counters(&depth2_dense, false);
         myds_v41_shared_gu_shared3_counters_t depth2_gu;
@@ -753,6 +773,16 @@ int main(int argc, char **argv) {
             ",\"decode_failures\":%" PRIu64 "}", moe_hc_overlap.requests, moe_hc_overlap.encoded, moe_hc_overlap.failures,
             moe_hc_overlap.requests-c.first_moe_hc_overlap.requests, moe_hc_overlap.encoded-c.first_moe_hc_overlap.encoded,
             moe_hc_overlap.failures-c.first_moe_hc_overlap.failures);
+        fprintf(json, ",\"gpu_shared_q4_v41_nb\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64
+            ",\"failures\":%" PRIu64 ",\"decode_requests\":%" PRIu64 ",\"decode_encoded\":%" PRIu64
+            ",\"decode_failures\":%" PRIu64 "}", shared_q4_v41_nb.requests, shared_q4_v41_nb.encoded, shared_q4_v41_nb.failures,
+            shared_q4_v41_nb.requests-c.first_shared_q4_v41_nb.requests, shared_q4_v41_nb.encoded-c.first_shared_q4_v41_nb.encoded,
+            shared_q4_v41_nb.failures-c.first_shared_q4_v41_nb.failures);
+        fprintf(json, ",\"gpu_attention_direct_pack_fuse\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64
+            ",\"failures\":%" PRIu64 ",\"decode_requests\":%" PRIu64 ",\"decode_encoded\":%" PRIu64
+            ",\"decode_failures\":%" PRIu64 "}", attention_direct_pack_fuse.requests, attention_direct_pack_fuse.encoded, attention_direct_pack_fuse.failures,
+            attention_direct_pack_fuse.requests-c.first_attention_direct_pack_fuse.requests, attention_direct_pack_fuse.encoded-c.first_attention_direct_pack_fuse.encoded,
+            attention_direct_pack_fuse.failures-c.first_attention_direct_pack_fuse.failures);
         fprintf(json, ",\"gpu_indexer_rope_quant_fuse\":{\"requests\":%" PRIu64 ",\"encoded\":%" PRIu64
             ",\"failures\":%" PRIu64 ",\"decode_requests\":%" PRIu64 ",\"decode_encoded\":%" PRIu64
             ",\"decode_failures\":%" PRIu64 "}", indexer_rope_quant.requests, indexer_rope_quant.encoded, indexer_rope_quant.failures,
