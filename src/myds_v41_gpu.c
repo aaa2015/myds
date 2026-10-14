@@ -1256,11 +1256,12 @@ _Static_assert(sizeof(struct flash_vec_args) == 200,
 _Static_assert(sizeof(struct flash_vec_args) - 8 == 192, "nb_kvq 必须在尾部偏移 192");
 struct attention_rope_fuse_args {
     struct flash_vec_args attention;
-    uint32_t pos, pad;
+    uint32_t pos, inverse;
     float frequencies[32];
 };
 _Static_assert(sizeof(struct attention_rope_fuse_args)==336u,"attention+rope ABI");
 _Static_assert(offsetof(struct attention_rope_fuse_args,pos)==200u,"attention+rope position ABI");
+_Static_assert(offsetof(struct attention_rope_fuse_args,inverse)==204u,"attention+rope inverse ABI");
 _Static_assert(offsetof(struct attention_rope_fuse_args,frequencies)==208u,"attention+rope frequency ABI");
 struct attention_rope_scope { uint32_t pos; bool compressed; };
 
@@ -1728,7 +1729,7 @@ static int attention_staged_impl(myds_metal_buffer_t *heads,const myds_metal_buf
         const uint64_t dispatch_before=myds_metal_dispatch_count();
         int ok;
         if (rope) {
-            struct attention_rope_fuse_args fused={.attention=a,.pos=rope->pos};
+            struct attention_rope_fuse_args fused={.attention=a,.pos=rope->pos,.inverse=1u};
             memcpy(fused.frequencies,rope_frequencies[rope->compressed?1:0],sizeof(fused.frequencies));
             ok=specialized("kernel_myds_attention_register_rope_fuse_f16_512",
                 &fused,sizeof(fused),register_buffers,7,64,1,1,256,1,1,22400,c,10);
@@ -1844,7 +1845,7 @@ static int attention_direct_impl(myds_metal_buffer_t *heads,const myds_metal_buf
         const uint64_t dispatch_before=myds_metal_dispatch_count();
         int ok;
         if (rope) {
-            struct attention_rope_fuse_args fused={.attention=a,.pos=rope->pos};
+            struct attention_rope_fuse_args fused={.attention=a,.pos=rope->pos,.inverse=1u};
             memcpy(fused.frequencies,rope_frequencies[rope->compressed?1:0],sizeof(fused.frequencies));
             ok=specialized("kernel_myds_attention_register_rope_fuse_f16_512",
                 &fused,sizeof(fused),register_buffers,7,64,1,1,256,1,1,22400,c,10);

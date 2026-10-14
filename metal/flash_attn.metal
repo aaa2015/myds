@@ -2338,11 +2338,11 @@ kernel void kernel_myds_flash_attn_vec_packed8_register_reduce_f16_dk512_dv512(
 /* Ordinary single-query opt-in: the complete original register reducer above
  * remains unchanged. This clone changes only its final float4 store, after
  * the original 32-split simd_sum and multiply. Same 22,400 dynamic bytes.
- * Exactly reproduce kernel_dsv41_rope_round: BF16 all columns; tail pairs use
- * those BF16 inputs, precise cos/-sin, then the second BF16 result boundary. */
+ * Preserve kernel_dsv41_rope_round's two BF16 boundaries and runtime inverse
+ * sign selection. Exact parity remains a private component acceptance gate. */
 struct myds_attention_rope_fuse_args {
     ds4_metal_args_flash_attn_ext_vec attention;
-    uint pos, pad;
+    uint pos, inverse;
     float frequencies[32];
 };
 static_assert(sizeof(myds_attention_rope_fuse_args)==336, "attention+rope ABI");
@@ -2360,9 +2360,11 @@ static inline float4 myds_attention_rope_store(float4 value, uint oc,
     if (oc >= 112u) {
         const uint pair = (oc-112u)*2u;
         const float theta0 = float(rope.pos)*rope.frequencies[pair];
-        const float c0 = precise::cos(theta0), s0 = -precise::sin(theta0);
+        const float c0 = precise::cos(theta0);
+        const float s0 = rope.inverse ? -precise::sin(theta0) : precise::sin(theta0);
         const float theta1 = float(rope.pos)*rope.frequencies[pair+1u];
-        const float c1 = precise::cos(theta1), s1 = -precise::sin(theta1);
+        const float c1 = precise::cos(theta1);
+        const float s1 = rope.inverse ? -precise::sin(theta1) : precise::sin(theta1);
         const float re0=result.x, im0=result.y, re1=result.z, im1=result.w;
         result.x = myds_attention_rope_bf16(re0*c0-im0*s0);
         result.y = myds_attention_rope_bf16(re0*s0+im0*c0);
