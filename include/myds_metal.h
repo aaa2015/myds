@@ -724,6 +724,7 @@ void     myds_metal_inject_copy_failure(uint32_t fail_at_call_index);
 void     myds_metal_inject_commit_failure(uint32_t fail_at_call_index);
 uint32_t myds_metal_get_copy_call_count(void);
 uint32_t myds_metal_get_commit_call_count(void);
+bool     myds_metal_copy_fault_injection_active(void);
 
 /* Shared Event management for overlapping router gate with shared expert.
  * commit_and_wait_event waits only through the signal point; subsequent work
@@ -773,6 +774,10 @@ int myds_metal_v41_rmsnorm_batch(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *x, const myds_metal_buffer_t *weight,
     uint32_t dim, uint32_t n_tok, float eps, bool round_bf16);
 
+int myds_metal_v41_rmsnorm_bf16_in_batch(myds_metal_buffer_t *out,
+    const myds_metal_buffer_t *x, const myds_metal_buffer_t *weight,
+    uint32_t dim, uint32_t n_tok, float eps, bool round_bf16);
+
 int myds_metal_v41_hc_weighted_sum_batch(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *residual, const myds_metal_buffer_t *weights,
     uint32_t dim, uint32_t n_tok, uint64_t weight_stride_bytes);
@@ -811,7 +816,16 @@ int myds_metal_v41_hc_expand_batch(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *block, const myds_metal_buffer_t *residual,
     const myds_metal_buffer_t *split, uint32_t dim, uint32_t n_tok);
 
+int myds_metal_v41_hc_expand_bf16_in_batch(myds_metal_buffer_t *out,
+    const myds_metal_buffer_t *block, const myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *split, uint32_t dim, uint32_t n_tok);
+
 int myds_metal_v41_moe_add_hc_expand_batch(myds_metal_buffer_t *out,
+    myds_metal_buffer_t *ffn_out, const myds_metal_buffer_t *moe_out,
+    const myds_metal_buffer_t *shared_out, const myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *split, uint32_t dim, uint32_t n_tok);
+
+int myds_metal_v41_moe_add_hc_expand_bf16_in_batch(myds_metal_buffer_t *out,
     myds_metal_buffer_t *ffn_out, const myds_metal_buffer_t *moe_out,
     const myds_metal_buffer_t *shared_out, const myds_metal_buffer_t *residual,
     const myds_metal_buffer_t *split, uint32_t dim, uint32_t n_tok);

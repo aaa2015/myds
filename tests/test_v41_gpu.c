@@ -790,6 +790,138 @@ static int test_prefill_batch_fusions(void) {
                 myds_metal_buffer_free(pl_out);
             }
         }
+
+        /* 4) Fused BF16-in kernels & vectorized rope_round_batch on unrounded F32 inputs */
+        {
+            /* 4a) rmsnorm_bf16_in_batch (dim=1280, round_bf16=true/false) */
+            const uint32_t qr_dim = 1280u;
+            myds_metal_buffer_t *qr_in_ref = myds_metal_buffer_alloc((size_t)n_tok * qr_dim * 4u);
+            myds_metal_buffer_t *qr_in_out = myds_metal_buffer_alloc((size_t)n_tok * qr_dim * 4u);
+            myds_metal_buffer_t *qr_w      = myds_metal_buffer_alloc(qr_dim * 4u);
+            myds_metal_buffer_t *qr_ref    = myds_metal_buffer_alloc((size_t)n_tok * qr_dim * 4u);
+            myds_metal_buffer_t *qr_out    = myds_metal_buffer_alloc((size_t)n_tok * qr_dim * 4u);
+            CHECK(qr_in_ref && qr_in_out && qr_w && qr_ref && qr_out);
+            float *p_in = myds_metal_buffer_data(qr_in_ref);
+            for (size_t i = 0; i < (size_t)n_tok * qr_dim; i++)
+                p_in[i] = (float)((int)((i * 131u + 41u + n_tok) % 1009u) - 504) / 337.0f;
+            memcpy(myds_metal_buffer_data(qr_in_out), p_in, myds_metal_buffer_size(qr_in_ref));
+            float *p_w = myds_metal_buffer_data(qr_w);
+            for (size_t i = 0; i < qr_dim; i++)
+                p_w[i] = 0.5f + (float)(i % 97u) / 113.0f;
+
+            for (int rbf = 0; rbf < 2; rbf++) {
+                memcpy(myds_metal_buffer_data(qr_in_ref), myds_metal_buffer_data(qr_in_out), myds_metal_buffer_size(qr_in_out));
+                CHECK(myds_metal_begin_batch());
+                CHECK(myds_metal_v41_bf16(qr_in_ref, n_tok * qr_dim));
+                CHECK(myds_metal_v41_rmsnorm_batch(qr_ref, qr_in_ref, qr_w, qr_dim, n_tok, 1e-5f, rbf != 0));
+                CHECK(myds_metal_v41_rmsnorm_bf16_in_batch(qr_out, qr_in_out, qr_w, qr_dim, n_tok, 1e-5f, rbf != 0));
+                CHECK(myds_metal_commit_batch());
+                CHECK(exact(qr_out, qr_ref, (size_t)n_tok * qr_dim));
+            }
+            myds_metal_buffer_free(qr_in_ref);
+            myds_metal_buffer_free(qr_in_out);
+            myds_metal_buffer_free(qr_w);
+            myds_metal_buffer_free(qr_ref);
+            myds_metal_buffer_free(qr_out);
+
+            /* 4b) hc_expand_bf16_in_batch & moe_add_hc_expand_bf16_in_batch */
+            myds_metal_buffer_t *br_unr_ref = myds_metal_buffer_alloc((size_t)n_tok * dim * 4u);
+            myds_metal_buffer_t *br_unr_out = myds_metal_buffer_alloc((size_t)n_tok * dim * 4u);
+            myds_metal_buffer_t *moe_in     = myds_metal_buffer_alloc((size_t)n_tok * dim * 4u);
+            CHECK(br_unr_ref && br_unr_out && moe_in);
+            float *p_br = myds_metal_buffer_data(br_unr_ref);
+            float *p_moe = myds_metal_buffer_data(moe_in);
+            for (size_t i = 0; i < (size_t)n_tok * dim; i++) {
+                p_br[i]  = (float)((int)((i * 73u + 11u + n_tok) % 997u) - 498) / 293.0f;
+                p_moe[i] = (float)((int)((i * 59u + 29u + n_tok) % 991u) - 495) / 256.0f;
+            }
+            memcpy(myds_metal_buffer_data(br_unr_out), p_br, myds_metal_buffer_size(br_unr_ref));
+
+            CHECK(myds_metal_begin_batch());
+            CHECK(myds_metal_v41_hc_expand_bf16_in_batch(exp_out, br_unr_out, res, pre, dim, n_tok));
+            CHECK(myds_metal_v41_bf16(br_unr_ref, n_tok * dim));
+            CHECK(myds_metal_v41_hc_expand_batch(exp_ref, br_unr_ref, res, pre, dim, n_tok));
+            CHECK(myds_metal_commit_batch());
+            CHECK(exact(exp_out, exp_ref, (size_t)n_tok * flat_dim));
+
+            memcpy(myds_metal_buffer_data(br_unr_ref), myds_metal_buffer_data(br_unr_out), myds_metal_buffer_size(br_unr_out));
+            CHECK(myds_metal_begin_batch());
+            CHECK(myds_metal_v41_moe_add_hc_expand_bf16_in_batch(exp_out, NULL, moe_in, br_unr_out, res, pre, dim, n_tok));
+            CHECK(myds_metal_v41_bf16(br_unr_ref, n_tok * dim));
+            CHECK(myds_metal_v41_moe_add_hc_expand_batch(exp_ref, NULL, moe_in, br_unr_ref, res, pre, dim, n_tok));
+            CHECK(myds_metal_commit_batch());
+            CHECK(exact(exp_out, exp_ref, (size_t)n_tok * flat_dim));
+            myds_metal_buffer_free(br_unr_ref);
+            myds_metal_buffer_free(br_unr_out);
+            myds_metal_buffer_free(moe_in);
+
+            /* 4c) rope_batch_round (vectorized kernel_dsv41_rope_round_batch) vs bf16 + rope_batch */
+            for (int comp = 0; comp < 2; comp++) {
+                for (int inv = 0; inv < 2; inv++) {
+                    const uint32_t r_heads = 8u, r_width = 512u;
+                    const size_t r_cnt = (size_t)n_tok * r_heads * r_width;
+                    myds_metal_buffer_t *rp_ref = myds_metal_buffer_alloc(r_cnt * 4u);
+                    myds_metal_buffer_t *rp_out = myds_metal_buffer_alloc(r_cnt * 4u);
+                    CHECK(rp_ref && rp_out);
+                    float *p_rp = myds_metal_buffer_data(rp_ref);
+                    for (size_t i = 0; i < r_cnt; i++)
+                        p_rp[i] = (float)((int)((i * 89u + 17u + comp * 7u + inv * 3u) % 1013u) - 506) / 311.0f;
+                    memcpy(myds_metal_buffer_data(rp_out), p_rp, r_cnt * 4u);
+
+                    CHECK(myds_metal_begin_batch());
+                    CHECK(myds_metal_v41_bf16(rp_ref, r_cnt));
+                    CHECK(myds_v41_gpu_rope_batch(rp_ref, r_width, r_heads, 23u, n_tok, comp != 0, inv != 0));
+                    CHECK(myds_v41_gpu_rope_batch_round(rp_out, r_width, r_heads, 23u, n_tok, comp != 0, inv != 0));
+                    CHECK(myds_metal_commit_batch());
+                    CHECK(exact(rp_out, rp_ref, r_cnt));
+                    myds_metal_buffer_free(rp_ref);
+                    myds_metal_buffer_free(rp_out);
+                }
+            }
+
+            /* 4d) kernel_swiglu_flat_bf16_in_f32 vs bf16(gate) + bf16(up) + kernel_swiglu_flat_f32 */
+            {
+                const uint32_t sw_cnt = n_tok * 256u;
+                myds_metal_buffer_t *g_ref = myds_metal_buffer_alloc(sw_cnt * 4u);
+                myds_metal_buffer_t *u_ref = myds_metal_buffer_alloc(sw_cnt * 4u);
+                myds_metal_buffer_t *g_out = myds_metal_buffer_alloc(sw_cnt * 4u);
+                myds_metal_buffer_t *u_out = myds_metal_buffer_alloc(sw_cnt * 4u);
+                myds_metal_buffer_t *s_ref = myds_metal_buffer_alloc(sw_cnt * 4u);
+                myds_metal_buffer_t *s_out = myds_metal_buffer_alloc(sw_cnt * 4u);
+                CHECK(g_ref && u_ref && g_out && u_out && s_ref && s_out);
+                float *pg = myds_metal_buffer_data(g_ref);
+                float *pu = myds_metal_buffer_data(u_ref);
+                for (size_t i = 0; i < sw_cnt; i++) {
+                    pg[i] = (float)((int)((i * 103u + 5u) % 1021u) - 510) / 127.0f;
+                    pu[i] = (float)((int)((i * 67u + 19u) % 1019u) - 509) / 139.0f;
+                }
+                memcpy(myds_metal_buffer_data(g_out), pg, sw_cnt * 4u);
+                memcpy(myds_metal_buffer_data(u_out), pu, sw_cnt * 4u);
+                struct {
+                    int32_t ne00; uint64_t nb01;
+                    int32_t ne10; uint64_t nb11;
+                    int32_t ne0;  uint64_t nb1;
+                    int32_t i00, i10; float alpha, limit; int32_t round_bf16;
+                } glu_args = {(int32_t)sw_cnt, (uint64_t)sw_cnt * 4u, (int32_t)sw_cnt, (uint64_t)sw_cnt * 4u,
+                              (int32_t)sw_cnt, (uint64_t)sw_cnt * 4u, 0, 0, 1.0f, 7.0f, 1};
+                const myds_metal_buffer_t *ref_bufs[] = {g_ref, u_ref, s_ref};
+                const myds_metal_buffer_t *out_bufs[] = {g_out, u_out, s_out};
+                const uint32_t grid[3] = {(sw_cnt + 255u) / 256u, 1u, 1u}, block[3] = {256u, 1u, 1u};
+                CHECK(myds_metal_begin_batch());
+                CHECK(myds_metal_v41_bf16(g_ref, sw_cnt));
+                CHECK(myds_metal_v41_bf16(u_ref, sw_cnt));
+                CHECK(myds_metal_dispatch_kernel("kernel_swiglu_flat_f32", &glu_args, sizeof(glu_args), ref_bufs, 3, grid, block, 0));
+                CHECK(myds_metal_dispatch_kernel("kernel_swiglu_flat_bf16_in_f32", &glu_args, sizeof(glu_args), out_bufs, 3, grid, block, 0));
+                CHECK(myds_metal_commit_batch());
+                CHECK(exact(s_out, s_ref, sw_cnt));
+                myds_metal_buffer_free(g_ref);
+                myds_metal_buffer_free(u_ref);
+                myds_metal_buffer_free(g_out);
+                myds_metal_buffer_free(u_out);
+                myds_metal_buffer_free(s_ref);
+                myds_metal_buffer_free(s_out);
+            }
+        }
     }
 
     myds_metal_buffer_free(res);
@@ -806,7 +938,7 @@ static int test_prefill_batch_fusions(void) {
     myds_metal_buffer_free(mix_out);
     myds_metal_buffer_free(exp_ref);
     myds_metal_buffer_free(exp_out);
-    printf("  [PASS] prefill batch fusions (hc_expand4_batch, hc_sum_rmsnorm_scale_batch + gemv_batch_scaled, indexer/kv_rope_quant_batch) 0-ULP byte exact\n");
+    printf("  [PASS] prefill batch fusions (hc_expand4_batch, hc_sum_rmsnorm_scale_batch + gemv_batch_scaled, indexer/kv_rope_quant_batch, bf16_in fusions, rope_round_batch) 0-ULP byte exact\n");
     return 1;
 }
 int main(int argc,char **argv) {
@@ -818,6 +950,9 @@ int main(int argc,char **argv) {
     if(!myds_metal_init("metal"))return 1;
     if(argc>1&&!strcmp(argv[1],"--topk-prefix-only")) {
         int ok=test_topk_prefix();myds_metal_cleanup();return ok?0:1;
+    }
+    if(argc>1&&!strcmp(argv[1],"--prefill-only")) {
+        int ok=test_prefill_batch_fusions();myds_metal_cleanup();return ok?0:1;
     }
     int ok=test_compact_resource()&&test_mixed_paths(disabled)&&test_slab_grow_carry()&&test_strategy_threshold(threshold)&&test_window_boundaries()&&
            test_pack_and_gather()&&test_indexscores_bf16()&&test_indexscores_selected_blocks()&&test_topk_prefix()&&test_attention_bf16()&&test_partial_picks()&&

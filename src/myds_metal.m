@@ -1724,6 +1724,9 @@ int myds_metal_init(const char *shader_dir) {
                         @"kernel_myds_v41_hc_sum_rmsnorm_scale_batch",
                         @"kernel_dsv41_indexer_rope_quant_batch",
                         @"kernel_dsv41_kv_rope_quant_batch",
+                        @"kernel_rms_norm_mul_bf16_in_f32_4",
+                        @"kernel_swiglu_flat_bf16_in_f32",
+                        @"kernel_dsv41_rope_round_batch",
                         @"kernel_dsv41_engram_add",
                         @"kernel_dsv41_rope",
                         @"kernel_dsv41_rope_round",
@@ -2476,6 +2479,10 @@ uint32_t myds_metal_get_copy_call_count(void) {
 
 uint32_t myds_metal_get_commit_call_count(void) {
     return g_inject_commit_calls;
+}
+
+bool myds_metal_copy_fault_injection_active(void) {
+    return g_inject_copy_fail_at != 0;
 }
 
 int myds_metal_begin_batch(void) {
@@ -3277,6 +3284,55 @@ int myds_metal_v41_rmsnorm_batch(myds_metal_buffer_t *out,
     }
 }
 
+int myds_metal_v41_rmsnorm_bf16_in_batch(myds_metal_buffer_t *out,
+    const myds_metal_buffer_t *x, const myds_metal_buffer_t *weight,
+    uint32_t dim, uint32_t n_tok, float eps, bool round_bf16) {
+    if (!n_tok) return 1;
+    if (!g_initialized || !dim || dim > INT32_MAX || dim % 128 || !weight ||
+        !isfinite(eps) || eps < 0 || !v41_floats(out, (uint64_t)dim * n_tok) ||
+        !v41_floats(x, (uint64_t)dim * n_tok) ||
+        out->offset % 16 || x->offset % 16 ||
+        !v41_floats(weight, dim) || weight->offset % 16) return 0;
+    NSUInteger nth = 32;
+    while (nth < dim / 4u && nth < 1024u) nth *= 2;
+    if (nth > dim / 4u) nth = dim / 4u;
+    {
+        static int ov = -2;
+        if (__builtin_expect(ov == -2, 0)) {
+            const char *v = getenv("MYDS_RMS_NTH");
+            long n = v ? atol(v) : 0;
+            ov = (n > 0 && n <= 1024) ? (int)n : -1;
+        }
+        if (ov > 0) nth = (NSUInteger)ov;
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = resolve_kernel_pipeline("kernel_rms_norm_mul_bf16_in_f32_4", NULL, 0);
+        if (!pipeline || nth > pipeline.maxTotalThreadsPerThreadgroup) return 0;
+        const uint64_t bytes = (uint64_t)dim * sizeof(float);
+        struct ds4_metal_args_norm args = {
+            .ne00 = (int32_t)dim, .ne00_t = (int32_t)(dim / 4),
+            .nb1 = bytes, .nb2 = bytes * n_tok, .nb3 = bytes * n_tok, .eps = eps,
+            .nef1 = {(int32_t)n_tok, 1, 1}, .nef2 = {1, 1, 1}, .nef3 = {1, 1, 1},
+            .nbf1 = {bytes, 0, 0}, .nbf2 = {bytes * n_tok, 0, 0},
+            .nbf3 = {bytes * n_tok, 0, 0}, .round_bf16 = round_bf16,
+        };
+        id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
+        if (!enc) return 0;
+        if (g_batch_cb && g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:x->mtl_buf offset:x->offset atIndex:1];
+        [enc setBuffer:weight->mtl_buf offset:weight->offset atIndex:2];
+        [enc setBuffer:x->mtl_buf offset:x->offset atIndex:3];
+        [enc setBuffer:out->mtl_buf offset:out->offset atIndex:4];
+        [enc setThreadgroupMemoryLength:32 * sizeof(float) atIndex:0];
+        metal_dispatch(enc, "v41_rmsnorm_bf16_in_batch", MTLSizeMake(n_tok, 1, 1), MTLSizeMake(nth, 1, 1));
+        return v41_finish(cb, enc);
+    }
+}
+
 struct v41_hc_split_args {
     int32_t n_hc, sinkhorn_iters;
     int64_t n_rows, mix_hc;
@@ -3750,17 +3806,18 @@ int myds_metal_v41_moe_add_hc_expand(myds_metal_buffer_t *out,
     }
 }
 
-int myds_metal_v41_moe_add_hc_expand_batch(myds_metal_buffer_t *out,
+static int moe_add_hc_expand_batch_impl(myds_metal_buffer_t *out,
     myds_metal_buffer_t *ffn_out, const myds_metal_buffer_t *moe_out,
     const myds_metal_buffer_t *shared_out, const myds_metal_buffer_t *residual,
-    const myds_metal_buffer_t *split, uint32_t dim, uint32_t n_tok) {
+    const myds_metal_buffer_t *split, uint32_t dim, uint32_t n_tok, int32_t round_bf16_mode) {
     if (!n_tok) return 1;
-    if (n_tok == 1) return myds_metal_v41_moe_add_hc_expand(out, ffn_out, moe_out, shared_out, residual, split, dim);
     if (!g_initialized || !v41_floats(out, 4ull*dim*n_tok) ||
         !v41_floats(moe_out, (uint64_t)dim*n_tok) || !v41_floats(shared_out, (uint64_t)dim*n_tok) ||
         !v41_floats(residual, 4ull*dim*n_tok) || !v41_floats(split, 24ull*n_tok)) return 0;
     if (ffn_out && !v41_floats(ffn_out, (uint64_t)dim*n_tok)) return 0;
     if (!g_pso_v41_moe_add_hc_expand_batch) {
+        if (round_bf16_mode > 1) return 0;
+        if (n_tok == 1) return myds_metal_v41_moe_add_hc_expand(out, ffn_out, moe_out, shared_out, residual, split, dim);
         myds_metal_buffer_t *fout = ffn_out ? ffn_out : out;
         if (!myds_metal_v41_add_bf16(fout, moe_out, shared_out, dim * n_tok)) return 0;
         return myds_metal_v41_hc_expand_batch(out, fout, residual, split, dim, n_tok);
@@ -3773,7 +3830,7 @@ int myds_metal_v41_moe_add_hc_expand_batch(myds_metal_buffer_t *out,
             .nb_post0=4, .nb_post1=96, .nb_comb0=4, .nb_comb1=16, .nb_comb2=96,
             .nb0=4, .nb1=4ull*dim, .nb2=16ull*dim,
             .has_add = (ffn_out != NULL) ? 1 : 0,
-            .round_bf16 = 1,
+            .round_bf16 = round_bf16_mode,
         };
         id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
         if (!cb) return 0;
@@ -3798,6 +3855,20 @@ int myds_metal_v41_moe_add_hc_expand_batch(myds_metal_buffer_t *out,
             MTLSizeMake((dim+nth-1)/nth, n_tok, 1), MTLSizeMake(nth, 1, 1));
         return v41_finish(cb, enc);
     }
+}
+
+int myds_metal_v41_moe_add_hc_expand_batch(myds_metal_buffer_t *out,
+    myds_metal_buffer_t *ffn_out, const myds_metal_buffer_t *moe_out,
+    const myds_metal_buffer_t *shared_out, const myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *split, uint32_t dim, uint32_t n_tok) {
+    return moe_add_hc_expand_batch_impl(out, ffn_out, moe_out, shared_out, residual, split, dim, n_tok, 1);
+}
+
+int myds_metal_v41_moe_add_hc_expand_bf16_in_batch(myds_metal_buffer_t *out,
+    myds_metal_buffer_t *ffn_out, const myds_metal_buffer_t *moe_out,
+    const myds_metal_buffer_t *shared_out, const myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *split, uint32_t dim, uint32_t n_tok) {
+    return moe_add_hc_expand_batch_impl(out, ffn_out, moe_out, shared_out, residual, split, dim, n_tok, 2);
 }
 
 
@@ -3833,11 +3904,10 @@ int myds_metal_v41_hc_weighted_sum_batch(myds_metal_buffer_t *out,
     }
 }
 
-int myds_metal_v41_hc_expand_batch(myds_metal_buffer_t *out,
+static int hc_expand_batch_impl(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *block, const myds_metal_buffer_t *residual,
-    const myds_metal_buffer_t *split, uint32_t dim, uint32_t n_tok) {
+    const myds_metal_buffer_t *split, uint32_t dim, uint32_t n_tok, int32_t round_bf16_mode) {
     if (!n_tok) return 1;
-    if (n_tok == 1) return myds_metal_v41_hc_expand(out, block, residual, split, dim);
     if (!g_initialized || !g_pso_v41_hc_expand || !v41_floats(out, 4ull * dim * n_tok) ||
         !v41_floats(block, (uint64_t)dim * n_tok) || !v41_floats(residual, 4ull * dim * n_tok) ||
         !v41_floats(split, 24ull * n_tok)) return 0;
@@ -3850,7 +3920,7 @@ int myds_metal_v41_hc_expand_batch(myds_metal_buffer_t *out,
             .nb_post0 = 4, .nb_post1 = 96,
             .nb_comb0 = 4, .nb_comb1 = 16, .nb_comb2 = 96,
             .nb0 = 4, .nb1 = 4ull * dim, .nb2 = 16ull * dim,
-            .has_add = 0, .round_bf16 = 1,
+            .has_add = 0, .round_bf16 = round_bf16_mode,
         };
         id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
         if (!cb) return 0;
@@ -3858,6 +3928,7 @@ int myds_metal_v41_hc_expand_batch(myds_metal_buffer_t *out,
         if (!enc) return 0;
         if (g_batch_cb && g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         id<MTLComputePipelineState> pso_2d = resolve_kernel_pipeline("kernel_dsv4_hc_expand4_batch", NULL, 0);
+        if (round_bf16_mode > 1 && !pso_2d) return 0;
         [enc setComputePipelineState:pso_2d ? pso_2d : g_pso_v41_hc_expand];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:block->mtl_buf offset:block->offset atIndex:1];
@@ -3877,6 +3948,18 @@ int myds_metal_v41_hc_expand_batch(myds_metal_buffer_t *out,
         }
         return v41_finish(cb, enc);
     }
+}
+
+int myds_metal_v41_hc_expand_batch(myds_metal_buffer_t *out,
+    const myds_metal_buffer_t *block, const myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *split, uint32_t dim, uint32_t n_tok) {
+    return hc_expand_batch_impl(out, block, residual, split, dim, n_tok, 1);
+}
+
+int myds_metal_v41_hc_expand_bf16_in_batch(myds_metal_buffer_t *out,
+    const myds_metal_buffer_t *block, const myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *split, uint32_t dim, uint32_t n_tok) {
+    return hc_expand_batch_impl(out, block, residual, split, dim, n_tok, 2);
 }
 
 int myds_metal_v41_engram_add_batch(myds_metal_buffer_t *residual,

@@ -7561,7 +7561,8 @@ kernel void kernel_dsv4_moe_add_hc_expand4_batch(
     if (d >= args.n_embd || t >= args.n_tokens) return;
     const int64_t idx = t * args.n_embd + d;
 
-    const float ffn_val = dsv41_bf16_round_f32(moe_out[idx] + shared_out[idx]);
+    const float sh_v = (args.round_bf16 > 1) ? dsv41_bf16_round_f32(shared_out[idx]) : shared_out[idx];
+    const float ffn_val = dsv41_bf16_round_f32(moe_out[idx] + sh_v);
     if (args.has_add && ffn_out) {
         ffn_out[idx] = ffn_val;
     }
@@ -7599,6 +7600,9 @@ kernel void kernel_dsv4_hc_expand4_batch(
     if (d >= args.n_embd || t >= args.n_tokens) return;
 
     float block_v = *((device const float *) (block_out + d*args.nb_block0 + t*args.nb_block1));
+    if (args.round_bf16 > 1) {
+        block_v = dsv41_bf16_round_f32(block_v);
+    }
     if (args.has_add) {
         block_v += *((device const float *) (block_add + d*args.nb_add0 + t*args.nb_add1));
     }
@@ -8081,5 +8085,147 @@ kernel void kernel_dsv41_kv_rope_quant_batch(
             }
         }
     }
+}
+
+struct ds4_metal_args_norm_bf16_in {
+    int32_t  ne00;
+    int32_t  ne00_t;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+    float    eps;
+    int32_t  nef1[3];
+    int32_t  nef2[3];
+    int32_t  nef3[3];
+    uint64_t nbf1[3];
+    uint64_t nbf2[3];
+    uint64_t nbf3[3];
+    int32_t  round_bf16;
+};
+
+kernel void kernel_rms_norm_mul_bf16_in_f32_4(
+        constant ds4_metal_args_norm_bf16_in & args [[buffer(0)]],
+        device const char * src0                    [[buffer(1)]],
+        device const char * src1_0                  [[buffer(2)]],
+        device const char * src1_1                  [[buffer(3)]],
+        device       char * dst                     [[buffer(4)]],
+        threadgroup float * shmem_f32               [[threadgroup(0)]],
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort3 tpitg [[thread_position_in_threadgroup]],
+        ushort  sgitg [[simdgroup_index_in_threadgroup]],
+        ushort  tiisg [[thread_index_in_simdgroup]],
+        ushort3 ntg   [[threads_per_threadgroup]]) {
+    (void)src1_1;
+    if (sgitg == 0) {
+        shmem_f32[tiisg] = 0.0f;
+    }
+
+    const int i01 = tgpig.x;
+    const int i02 = tgpig.y;
+    const int i03 = tgpig.z;
+
+    device const float4 * x = (device const float4 *) (src0 + i03*args.nbf3[0] + i02*args.nbf2[0] + i01*args.nbf1[0]);
+    device const float4 * f0 = (device const float4 *) (src1_0 + (i03%args.nef3[1])*args.nbf3[1] + (i02%args.nef2[1])*args.nbf2[1] + (i01%args.nef1[1])*args.nbf1[1]);
+
+    float sumf = 0.0f;
+    for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
+        const float4 xv = dsv41_bf16_round_f32x4(x[i00]);
+        sumf += dot(xv, xv);
+    }
+    sumf = simd_sum(sumf);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        shmem_f32[sgitg] = sumf;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = shmem_f32[tiisg];
+    sumf = simd_sum(sumf);
+
+    const float mean  = sumf / args.ne00;
+    const float scale = 1.0f / sqrt(mean + args.eps);
+
+    device float4 * y = (device float4 *) (dst + i03*args.nb3 + i02*args.nb2 + i01*args.nb1);
+    const bool round_bf16 = args.round_bf16 != 0;
+    for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
+        #pragma clang fp reassociate(off)
+        const float4 xv = dsv41_bf16_round_f32x4(x[i00]);
+        const float4 v = (xv * scale) * f0[i00];
+        y[i00] = round_bf16 ? dsv41_bf16_round_f32x4(v) : v;
+    }
+}
+
+struct ds4_metal_args_glu_bf16_in {
+    int32_t  ne00;
+    uint64_t nb01;
+    int32_t  ne10;
+    uint64_t nb11;
+    int32_t  ne0;
+    uint64_t nb1;
+    int32_t  i00;
+    int32_t  i10;
+    float    alpha;
+    float    limit;
+    int32_t  round_bf16;
+};
+
+kernel void kernel_swiglu_flat_bf16_in_f32(
+        constant ds4_metal_args_glu_bf16_in & args [[buffer(0)]],
+        device const char * src0                   [[buffer(1)]],
+        device const char * src1                   [[buffer(2)]],
+        device       char * dst                    [[buffer(3)]],
+        uint i [[thread_position_in_grid]]) {
+    #pragma clang fp reassociate(off)
+    if (i >= (uint)args.ne0) return;
+
+    device const float * src0_f32 = (device const float *) src0 + args.i00;
+    device const float * src1_f32 = (device const float *) src1 + args.i10;
+    device       float * dst_f32  = (device       float *) dst;
+
+    float x0 = dsv41_bf16_round_f32(src0_f32[i]);
+    float x1 = dsv41_bf16_round_f32(src1_f32[i]);
+    if (args.limit > 1.0e-6f) {
+        x0 = min(x0, args.limit);
+        x1 = clamp(x1, -args.limit, args.limit);
+    }
+
+    const float silu = x0 / (1.0f + exp(-x0));
+    const float glu_v = (silu * x1) * args.alpha;
+    dst_f32[i] = args.round_bf16 ? dsv41_bf16_round_f32(glu_v) : glu_v;
+}
+
+kernel void kernel_dsv41_rope_round_batch(
+        constant ds4_metal_args_dsv41_rope &args [[buffer(0)]],
+        device float *x                          [[buffer(1)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint  lane  [[thread_index_in_simdgroup]]) {
+    if (group.x >= args.heads || group.y >= args.rows) return;
+    const ulong head_base = ((ulong)group.y * (ulong)args.heads + (ulong)group.x) * (ulong)args.width;
+    const uint unrotated = args.width >= 64u ? args.width - 64u : 0u;
+    if ((args.width & 3u) == 0u && (unrotated & 3u) == 0u) {
+        device uint4 *x4 = (device uint4 *)(x + head_base);
+        const uint unrotated4 = unrotated >> 2u;
+        for (uint k4 = lane; k4 < unrotated4; k4 += 32u) {
+            uint4 bits = x4[k4];
+            const bool4 finite = (bits & 0x7f800000u) != 0x7f800000u;
+            bits += select(uint4(0u), uint4(0x7fffu) + ((bits >> 16u) & 1u), finite);
+            x4[k4] = bits & 0xffff0000u;
+        }
+    } else {
+        for (uint k = 0; k < unrotated; k += 32u) {
+            if (k + lane < unrotated) {
+                const ulong idx = head_base + (ulong)(k + lane);
+                x[idx] = dsv41_bf16(x[idx]);
+            }
+        }
+    }
+    const float theta = float(args.start + group.y * args.stride) * args.frequencies[lane];
+    const float c = precise::cos(theta);
+    const float s = args.inverse ? -precise::sin(theta) : precise::sin(theta);
+    const ulong i = head_base + (ulong)unrotated + 2u * (ulong)lane;
+    const float re = dsv41_bf16(x[i]), im = dsv41_bf16(x[i + 1u]);
+    x[i] = dsv41_bf16(re * c - im * s);
+    x[i + 1u] = dsv41_bf16(re * s + im * c);
 }
 
