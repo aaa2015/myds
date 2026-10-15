@@ -320,6 +320,8 @@ compressed KV 与 index cache 保存已完成 BF16 舍入的上 16 位，读取�
 | `MYDS_PREFILL_ATTN` | `vec` | `matrix` 与 `auto` 是 compressed gather 的实验选项。矩阵归约会产生浮点差异，实测长输入生成 token 可变化；默认关闭。`auto` 的矩阵 PSO/共享内存不可用时回退 vec，显式 `matrix` 则返回失败。 |
 | `MYDS_PREFILL_INDEXER_PEEL` | 启用 | ratio=2 的索引层在绝对位置 0 保留没有可见压缩键的首行，其余行继续批处理，避免整个首块回退逐 token。首行 Q、selected 和 mask 保持不变；设为 `0` 恢复原回退路径。 |
 | `MYDS_PREFILL_SKIP_DEAD_KV` | 启用 | 后缀收缩时，跳过第 21–39 层中已经不需要保留窗口 KV、且没有压缩器工作的前缀块。保留原 chunk 边界、近端窗口、carry 和有效快照；trace 保留原路径。设为 `0` 恢复原归一化与调度。 |
+| `MYDS_PREFILL_SHRINK_GRID_GUARDED` | 启用 | 按实际可发布的 512 网格快照收紧后缀重算范围，并保留原 KV 分块边界和 MM/GEMV 数值路径。仅在 chunk=512、shift=512、非别名 MoE 累积区可容纳完整 macroblock、默认 MoE MM 阈值、dedup 关闭且 attention 为 vec／gather-min=0 时采用；其他配置与 trace 使用原路径。`0` 恢复原重算范围。 |
+| `MYDS_PREFILL_SHORT_END_SNAPSHOT` | 启用 | prefix cache 开启时，当 prompt 末尾位置 `p=prompt_tokens-1` 为 4–1023 时保存 RAM slot 0，使完全重复的短请求直接恢复 prompt-end 状态。周期与 SSD 快照仍从 1024 开始；额外 RAM 约 10 MiB。`0` 关闭短末尾快照。 |
 | `MYDS_QKV_FUSE_BF16` | 启用 | decode 的 Q8 QKV 投影把 BF16 舍入合并到 GEMV 写出；设为 `0` 恢复独立舍入 dispatch。trace 使用原路径。 |
 | `MYDS_QKV_FUSE_POST` | 启用 | decode 合并 Q/K RoPE、KV 量化及窗口写入，保留原舍入边界；设为 `0` 恢复原 dispatch。缺融合 PSO、别名或 copy 故障注入时回退原路径。 |
 | `MYDS_QKV_NR0` | `4` | 融合 Q8 GEMV 每组处理四个独立输出行；`2` 使用两个行的配置。归约顺序不变。 |

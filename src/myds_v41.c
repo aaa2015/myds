@@ -198,6 +198,71 @@ static uint32_t snapshot_slot_for(uint32_t p, bool is_last) {
     if (s == V41_ANCHOR_SLOT) s = 42u; /* 保护 slot 43 专供常驻锚点 */
     return s;
 }
+
+/* Retain every checkpoint the configured suffix window can actually publish.
+ * The first periodic point is 1024 and later ones lie on the 512 grid; the
+ * arbitrary prompt end is always retained separately. This only tightens the
+ * causal cone, never the configured chunk alignment or macroblock boundary. */
+static uint32_t prefill_snapshot_grid_shift(uint32_t end, uint32_t shift) {
+    if (!shift) return 0;
+    uint64_t first = end > shift ? (uint64_t)end - shift : 0u;
+    if (first < V41_SNAP_MIN) first = V41_SNAP_MIN;
+    first = (first + V41_SNAP_STRIDE - 1u) / V41_SNAP_STRIDE * V41_SNAP_STRIDE;
+    return first < end ? end - (uint32_t)first : 0u;
+}
+/* Slab block alignment and the auto matrix selector depend on chunk bounds.
+ * Tighten only the vec/gather policy whose per-query key order is unchanged. */
+static bool prefill_grid_attention_policy_supported(const char *variant, const char *min_keys) {
+    return (!variant || !strcmp(variant, "vec")) &&
+           (!min_keys || !strcmp(min_keys, "0"));
+}
+/* Preserve every baseline 512-grid/old-full-start
+ * partition. A new full boundary may split a baseline chunk only when both
+ * pieces retain its >=32-token GEMM policy. Old short chunks remain intact.
+ * Walking deep-to-shallow propagates every additional row through the 127-row
+ * causal dependency; layers 0..19 are still fully evaluated. */
+static uint32_t prefill_grid_preserve_class(uint32_t old_start, uint32_t end, uint32_t desired) {
+    if (desired <= old_start) return old_start;
+    if (desired >= end) return end;
+    uint32_t left = old_start;
+    uint64_t right = ((uint64_t)old_start / V41_SNAP_STRIDE + 1u) * V41_SNAP_STRIDE;
+    if ((uint64_t)desired >= right) {
+        left = desired / V41_SNAP_STRIDE * V41_SNAP_STRIDE;
+        if (left == desired) return desired;
+        right = (uint64_t)left + V41_SNAP_STRIDE;
+    }
+    if (right > end) right = end;
+    const uint32_t length = (uint32_t)right - left;
+    if (length < 64u || desired - left < 32u) return left;
+    if ((uint32_t)right - desired < 32u) return (uint32_t)right - 32u;
+    return desired;
+}
+static bool prefill_grid_guarded_starts(uint32_t begin, uint32_t end,
+    uint32_t old_shift, uint32_t new_shift, uint32_t old_full[40], uint32_t full[40]) {
+    if (begin >= end || old_shift != 512u || new_shift > old_shift) return false;
+    for (uint32_t il=0; il<40u; ++il) {
+        const uint64_t need=1u+(39u-il)*127u;
+        uint32_t old=(uint64_t)end>need+old_shift ? end-(uint32_t)(need+old_shift) : 0u;
+        uint32_t now=(uint64_t)end>need+new_shift ? end-(uint32_t)(need+new_shift) : 0u;
+        old_full[il]=il<20u ? begin : (old<begin ? begin : old);
+        full[il]=il<20u ? begin : (now<begin ? begin : now);
+    }
+    for (int il=39; il>=20; --il) {
+        uint32_t maximum=full[il];
+        if (il<39) {
+            const uint32_t dependency=(uint64_t)full[il+1] > (uint64_t)begin+127u ? full[il+1]-127u : begin;
+            if (maximum>dependency) maximum=dependency;
+        }
+        /* Production MoE can hold this entire macroblock. Preserve the
+         * default routed MM/MV threshold on the one remaining batch. */
+        if (end-old_full[il] >= 32u && end-maximum < 32u) maximum=end-32u;
+        if (maximum<old_full[il]) return false;
+        full[il]=prefill_grid_preserve_class(old_full[il],end,maximum);
+        if (full[il]<old_full[il] || full[il]>maximum) return false;
+    }
+    return true;
+}
+
 /* 处理完位置 p 之后，记下 engram 的滚动状态。在 engram 循环里调用（层循环之前）。
  * ★ 事务契约：这里仅暂存 engram 状态与目标位置到 staged 槽，绝不提前置 snap_pos，
  * 避免在各层窗口环拷贝完成前被 snapshot_best 抢先选出半状态。
@@ -289,7 +354,16 @@ store_slot_fail:
 
 /* prefill 结束后由引擎调用：把【当前状态】存进末尾槽（0 号）。 */
 bool myds_v41_snapshot_store_now(myds_v41_context_t *g, uint32_t p) {
-    if (!g || !g->snap_enabled || !p || p < V41_SNAP_MIN) return true;
+    if (!g || !g->snap_enabled || p < 4u) return true;
+    if (p < V41_SNAP_MIN) {
+        /* The periodic/SSD grid still begins at 1024. Slot 0 is a RAM-only
+         * prompt-end checkpoint: even a short repeated request can otherwise
+         * rewind only to its system anchor and must recompute the user text.
+         * Capture only when the engine actually uses its prefix cache. */
+        const char *short_end = getenv("MYDS_PREFILL_SHORT_END_SNAPSHOT");
+        const char *prefix = getenv("MYDS_PREFIX_CACHE");
+        if ((short_end && strcmp(short_end, "1")) || !prefix || !atoi(prefix)) return true;
+    }
     return myds_v41_snapshot_store_slot(g, 0, p);
 }
 
@@ -6594,6 +6668,9 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 #define TIME_ACC(acc) do { if (do_prof) { gettimeofday(&ptv1, NULL); acc += (ptv1.tv_sec - ptv0.tv_sec) * 1000.0 + (ptv1.tv_usec - ptv0.tv_usec) / 1000.0; } } while(0)
 
     const bool opt_shrink_macroblock = (getenv("MYDS_SUFFIX_SHRINK_MACROBLOCK") != NULL);
+    const char *guarded_grid_env = getenv("MYDS_PREFILL_SHRINK_GRID_GUARDED");
+    const bool opt_guarded_grid = !trace_on &&
+        (!guarded_grid_env || !strcmp(guarded_grid_env, "1"));
     const bool opt_sync_chunk = (getenv("MYDS_PREFILL_SYNC_CHUNK") != NULL);
     uint32_t inflight_chunks = 0;
     uint32_t il = 0;
@@ -6612,7 +6689,36 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         const uint32_t mb_end = mb_base_pos + mb_len;
         const uint32_t total_eff = (shrink_shift == 0u && !opt_shrink_macroblock)
                                    ? (base_pos + n_tokens) : mb_end;
-        const uint32_t sub_39 = 1u + shrink_shift;
+        uint32_t cone_shift = opt_guarded_grid && suffix_shrink
+            ? prefill_snapshot_grid_shift(total_eff, shrink_shift) : shrink_shift;
+        uint32_t guarded_old_full[40], guarded_full[40];
+        const char *moe_min_env=getenv("MYDS_MOE_MM_MIN_TOKENS");
+        const char *moe_disable_env=getenv("MYDS_DISABLE_MOE_MM");
+        const char *moe_dedup_env=getenv("MYDS_MOE_BATCH_DEDUP");
+        bool guarded_grid_active=opt_guarded_grid && suffix_shrink && chunk_size==512u &&
+            shrink_shift==512u && total_eff==mb_end &&
+            prefill_grid_attention_policy_supported(getenv("MYDS_PREFILL_ATTN"),
+                                                     getenv("MYDS_ATTN_GATHER_MIN_KEYS")) &&
+            cw->moe_batch>cw->capacity &&
+            cw->moe_batch>=mb_len &&
+            (!moe_min_env || !strcmp(moe_min_env,"32")) &&
+            (!moe_disable_env || atoi(moe_disable_env)==0) &&
+            (!moe_dedup_env || strcmp(moe_dedup_env,"1"));
+        if (guarded_grid_active)
+            guarded_grid_active=prefill_grid_guarded_starts(mb_base_pos,mb_end,
+                shrink_shift,cone_shift,guarded_old_full,guarded_full);
+        /* Unsupported numeric/scratch policies retain the original cone. */
+        if (opt_guarded_grid && !guarded_grid_active) cone_shift=shrink_shift;
+        if (guarded_grid_active) {
+            uint64_t guarded_rows_avoided=0;
+            for (uint32_t gi=20u;gi<40u;++gi)
+                guarded_rows_avoided+=(uint64_t)guarded_full[gi]-guarded_old_full[gi];
+            MYDS_LOG_I("prefill guarded grid active: begin=%u end=%u cone_shift=%u "
+                       "layer39_old=%u layer39_new=%u full_rows_avoided=%llu",
+                       mb_base_pos,mb_end,cone_shift,guarded_old_full[39],guarded_full[39],
+                       (unsigned long long)guarded_rows_avoided);
+        }
+        const uint32_t sub_39 = 1u + cone_shift;
         const uint32_t s_global_39 = (total_eff > sub_39) ? total_eff - sub_39 : 0u;
         const uint32_t s_clamped_39 = s_global_39 < mb_base_pos ? mb_base_pos
                                     : (s_global_39 > mb_end ? mb_end : s_global_39);
@@ -6712,16 +6818,20 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
              *     - 跨 macroblock 边界时，上一块末尾与下一块开头的 kv_only 段精确拼接满 127 行窗口环。 */
             const uint32_t sh_need = 1u + (V41_LAYERS - 1u - il) * 127u;
             const bool shrink_layer = suffix_shrink && il >= 20u;
-            const uint32_t sh_valid_from = (total_eff > shrink_shift) ? total_eff - shrink_shift : 0u;
+            const uint32_t sh_valid_from = (total_eff > cone_shift) ? total_eff - cone_shift : 0u;
             uint32_t sh_loop_rel = 0, sh_full_rel = 0, sh_s_global = 0;
             if (shrink_layer) {
-                const uint32_t sub = sh_need + shrink_shift;
+                const uint32_t sub = sh_need + cone_shift;
                 const uint32_t s_global = (total_eff > sub) ? total_eff - sub : 0u;
                 sh_s_global = s_global;
                 uint32_t s = s_global;
                 if (s < mb_base_pos) s = mb_base_pos;
                 if (s > mb_end) s = mb_end;
                 sh_full_rel = s - mb_base_pos;
+                if (guarded_grid_active) {
+                    sh_full_rel=guarded_full[il]-mb_base_pos;
+                    sh_s_global=guarded_full[il];
+                }
                 if (shrink_shift == 0u) {
                     const uint32_t skv_global = (s_global > 127u) ? s_global - 127u : 0u;
                     uint32_t skv = skv_global;
@@ -6751,6 +6861,13 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     const uint32_t abs0 = mb_base_pos + c_start;
                     const uint32_t grid = ((abs0 + c_len) / V41_SNAP_STRIDE) * V41_SNAP_STRIDE;
                     if (grid > abs0) c_len = grid - abs0;   /* 只在能缩短时对齐（不会变成 0） */
+                }
+                /* Preserve the OLD full/kv-only boundary too. Without this,
+                 * a short baseline GEMV chunk could be merged into a prefix
+                 * GEMM chunk, changing retained window KV before the new cone. */
+                if (guarded_grid_active && shrink_layer) {
+                    const uint32_t old_rel=guarded_old_full[il]-mb_base_pos;
+                    if (c_start<old_rel && c_start+c_len>old_rel) c_len=old_rel-c_start;
                 }
                 /* 全量/前端的边界必须落在 chunk 边界上（一个 chunk 不能走两条路径） */
                 if (shrink_layer && c_start < sh_full_rel && c_start + c_len > sh_full_rel)
