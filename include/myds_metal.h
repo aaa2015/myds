@@ -789,6 +789,24 @@ int myds_metal_v41_hc_sum_rmsnorm_batch(
     float eps,
     bool round_bf16);
 
+int myds_metal_v41_hc_sum_rmsnorm_scale_batch(
+    myds_metal_buffer_t *norm_out,
+    myds_metal_buffer_t *sum_out,
+    myds_metal_buffer_t *flat_scale_out,
+    const myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *norm_weight,
+    uint32_t dim,
+    uint32_t n_tok,
+    uint64_t weight_stride_bytes,
+    float eps,
+    bool round_bf16);
+
+int myds_metal_v41_gemv_batch_scaled(myds_metal_buffer_t *out,
+    const myds_metal_buffer_t *weight, const myds_metal_buffer_t *input,
+    const myds_metal_buffer_t *scales,
+    uint32_t out_dim, uint32_t in_dim, uint32_t n_tok, ggml_type weight_type);
+
 int myds_metal_v41_hc_expand_batch(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *block, const myds_metal_buffer_t *residual,
     const myds_metal_buffer_t *split, uint32_t dim, uint32_t n_tok);

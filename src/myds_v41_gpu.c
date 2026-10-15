@@ -356,6 +356,44 @@ int myds_v41_gpu_indexer_rope_quant(myds_metal_buffer_t *x,uint32_t heads,uint32
     pthread_once(&rope_once,init_rope);
     return myds_metal_indexer_rope_quant_dispatch(x,heads,pos,rope_frequencies[1]);
 }
+int myds_v41_gpu_indexer_rope_quant_batch(myds_metal_buffer_t *x,
+    myds_metal_buffer_t *packed_dst,size_t dst_offset_words,
+    uint32_t heads,uint32_t start_pos,uint32_t rows,uint32_t stride,bool compressed) {
+    if(!heads||!rows||!stride||start_pos>=1048576u||
+       (uint64_t)start_pos+(uint64_t)(rows-1u)*stride>=1048576u||
+       !floats(x,(uint64_t)128u*heads*rows))return 0;
+    const uint64_t total_elems=(uint64_t)128u*heads*rows;
+    if(packed_dst&&(!bf16s(packed_dst,total_elems)||
+       dst_offset_words>myds_metal_buffer_size(packed_dst)/2u-total_elems))return 0;
+    pthread_once(&rope_once,init_rope);
+    struct {
+        uint32_t heads,rows,start,stride,mode,pack_bf16;
+        uint64_t dst_offset;
+        float frequencies[32];
+    } a={heads,rows,start_pos,stride,2u,packed_dst?1u:0u,(uint64_t)dst_offset_words,{0}};
+    memcpy(a.frequencies,rope_frequencies[compressed?1:0],sizeof(a.frequencies));
+    const myds_metal_buffer_t *b[]={x,packed_dst?packed_dst:x};
+    return dispatch("kernel_dsv41_indexer_rope_quant_batch",&a,sizeof(a),b,2,heads,rows,1,32,1,1,0);
+}
+int myds_v41_gpu_kv_rope_quant_batch(myds_metal_buffer_t *x,
+    myds_metal_buffer_t *packed_dst,size_t dst_offset_words,
+    uint32_t start_pos,uint32_t rows,uint32_t stride,bool compressed,uint32_t mode) {
+    if(!rows||!stride||(mode!=1u&&mode!=3u)||start_pos>=1048576u||
+       (uint64_t)start_pos+(uint64_t)(rows-1u)*stride>=1048576u||
+       !floats(x,(uint64_t)512u*rows))return 0;
+    const uint64_t total_elems=(uint64_t)512u*rows;
+    if(packed_dst&&(!bf16s(packed_dst,total_elems)||
+       dst_offset_words>myds_metal_buffer_size(packed_dst)/2u-total_elems))return 0;
+    pthread_once(&rope_once,init_rope);
+    struct {
+        uint32_t heads,rows,start,stride,mode,pack_bf16;
+        uint64_t dst_offset;
+        float frequencies[32];
+    } a={1u,rows,start_pos,stride,mode,packed_dst?1u:0u,(uint64_t)dst_offset_words,{0}};
+    memcpy(a.frequencies,rope_frequencies[compressed?1:0],sizeof(a.frequencies));
+    const myds_metal_buffer_t *b[]={x,packed_dst?packed_dst:x};
+    return dispatch("kernel_dsv41_kv_rope_quant_batch",&a,sizeof(a),b,2,1,rows,1,32,1,1,0);
+}
 static int buffer_ranges_overlap(const myds_metal_buffer_t *a,size_t a_bytes,
                                  const myds_metal_buffer_t *b,size_t b_bytes) {
     uintptr_t x=(uintptr_t)myds_metal_buffer_data((myds_metal_buffer_t *)a),

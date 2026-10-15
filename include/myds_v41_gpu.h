@@ -102,6 +102,12 @@ int myds_v41_gpu_quant(myds_metal_buffer_t *x,uint32_t width,uint32_t rows,uint3
  * always retain their reference dispatches; Engine scope is supplied by the
  * ordinary scalar call sites, not inferred here from token count or env. */
 int myds_v41_gpu_indexer_rope_quant(myds_metal_buffer_t *x,uint32_t heads,uint32_t pos);
+int myds_v41_gpu_indexer_rope_quant_batch(myds_metal_buffer_t *x,
+    myds_metal_buffer_t *packed_dst,size_t dst_offset_words,
+    uint32_t heads,uint32_t start_pos,uint32_t rows,uint32_t stride,bool compressed);
+int myds_v41_gpu_kv_rope_quant_batch(myds_metal_buffer_t *x,
+    myds_metal_buffer_t *packed_dst,size_t dst_offset_words,
+    uint32_t start_pos,uint32_t rows,uint32_t stride,bool compressed,uint32_t mode);
 /* Even positions cache kv/scores; odd positions write the pooled output. */
 int myds_v41_gpu_pool2(myds_metal_buffer_t *out,const myds_metal_buffer_t *kv,
     const myds_metal_buffer_t *scores,myds_metal_buffer_t *previous_kv,

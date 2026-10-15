@@ -642,6 +642,173 @@ static int test_partial_picks(void) {
     myds_metal_buffer_free(packed);fixture_free(&f);
     printf("  [PASS] causal partial picks overwrite unused gather slots, F32/BF16 CPU oracle\n");return 1;
 }
+static int test_prefill_batch_fusions(void) {
+    const uint32_t dim = 5120u, flat_dim = 4u * dim, mix_rows = 24u;
+    const uint32_t tok_counts[] = {1u, 3u, 31u, 32u, 65u};
+    const uint32_t max_tok = 65u;
+    myds_metal_buffer_t *res = myds_metal_buffer_alloc((size_t)max_tok * flat_dim * 4u);
+    myds_metal_buffer_t *pre = myds_metal_buffer_alloc((size_t)max_tok * 24u * 4u);
+    myds_metal_buffer_t *branch = myds_metal_buffer_alloc((size_t)max_tok * dim * 4u);
+    myds_metal_buffer_t *norm_w = myds_metal_buffer_alloc((size_t)dim * 4u);
+    myds_metal_buffer_t *w_f16 = myds_metal_buffer_alloc((size_t)mix_rows * flat_dim * 2u);
+    myds_metal_buffer_t *w_f32 = myds_metal_buffer_alloc((size_t)mix_rows * flat_dim * 4u);
+    myds_metal_buffer_t *x_norm_ref = myds_metal_buffer_alloc((size_t)max_tok * dim * 4u);
+    myds_metal_buffer_t *x_norm_out = myds_metal_buffer_alloc((size_t)max_tok * dim * 4u);
+    myds_metal_buffer_t *flat_norm = myds_metal_buffer_alloc((size_t)max_tok * flat_dim * 4u);
+    myds_metal_buffer_t *scales = myds_metal_buffer_alloc((size_t)max_tok * 4u);
+    myds_metal_buffer_t *mix_ref = myds_metal_buffer_alloc((size_t)max_tok * mix_rows * 4u);
+    myds_metal_buffer_t *mix_out = myds_metal_buffer_alloc((size_t)max_tok * mix_rows * 4u);
+    myds_metal_buffer_t *exp_ref = myds_metal_buffer_alloc((size_t)max_tok * flat_dim * 4u);
+    myds_metal_buffer_t *exp_out = myds_metal_buffer_alloc((size_t)max_tok * flat_dim * 4u);
+    CHECK(res && pre && branch && norm_w && w_f16 && w_f32 && x_norm_ref && x_norm_out &&
+          flat_norm && scales && mix_ref && mix_out && exp_ref && exp_out);
+    fill(res, 3u);
+    fill(pre, 7u);
+    fill(branch, 11u);
+    fill(norm_w, 13u);
+    fill(w_f32, 17u);
+    const float *wf32_p = myds_metal_buffer_data(w_f32);
+    _Float16 *wf16_p = myds_metal_buffer_data(w_f16);
+    for (size_t i = 0; i < (size_t)mix_rows * flat_dim; i++) {
+        wf16_p[i] = (_Float16)wf32_p[i];
+    }
+
+    for (size_t ti = 0; ti < sizeof(tok_counts) / sizeof(*tok_counts); ti++) {
+        const uint32_t n_tok = tok_counts[ti];
+        /* 1) 2D-grid hc_expand_batch vs per-token hc_expand */
+        CHECK(myds_metal_begin_batch());
+        CHECK(myds_metal_v41_hc_expand_batch(exp_out, branch, res, pre, dim, n_tok));
+        for (uint32_t t = 0; t < n_tok; t++) {
+            myds_metal_buffer_t *dst_v = myds_metal_buffer_sub_view(exp_ref, (size_t)t * flat_dim * 4u, flat_dim * 4u);
+            myds_metal_buffer_t *br_v = myds_metal_buffer_sub_view(branch, (size_t)t * dim * 4u, dim * 4u);
+            myds_metal_buffer_t *res_v = myds_metal_buffer_sub_view(res, (size_t)t * flat_dim * 4u, flat_dim * 4u);
+            myds_metal_buffer_t *sp_v = myds_metal_buffer_sub_view(pre, (size_t)t * 24u * 4u, 24u * 4u);
+            CHECK(dst_v && br_v && res_v && sp_v);
+            CHECK(myds_metal_v41_hc_expand(dst_v, br_v, res_v, sp_v, dim));
+            myds_metal_buffer_free(dst_v);
+            myds_metal_buffer_free(br_v);
+            myds_metal_buffer_free(res_v);
+            myds_metal_buffer_free(sp_v);
+        }
+        CHECK(myds_metal_commit_batch());
+        CHECK(exact(exp_out, exp_ref, (size_t)n_tok * flat_dim));
+
+        /* 2) Fused hc_sum_rmsnorm_scale_batch + gemv_batch_scaled vs separate reference */
+        for (int wtype = 0; wtype < 2; wtype++) {
+            ggml_type gt = wtype ? GGML_TYPE_F32 : GGML_TYPE_F16;
+            const myds_metal_buffer_t *w_buf = wtype ? w_f32 : w_f16;
+            CHECK(myds_metal_begin_batch());
+            CHECK(myds_metal_v41_hc_sum_rmsnorm_batch(x_norm_ref, NULL, res, pre, norm_w, dim, n_tok, 96u, 1e-5f, true));
+            CHECK(myds_metal_v41_rmsnorm_batch(flat_norm, res, NULL, flat_dim, n_tok, 1e-5f, false));
+            myds_metal_barrier();
+            CHECK(myds_metal_v41_gemv_batch(mix_ref, w_buf, flat_norm, mix_rows, flat_dim, n_tok, gt));
+
+            CHECK(myds_metal_v41_hc_sum_rmsnorm_scale_batch(x_norm_out, NULL, scales, res, pre, norm_w, dim, n_tok, 96u, 1e-5f, true));
+            myds_metal_barrier();
+            CHECK(myds_metal_v41_gemv_batch_scaled(mix_out, w_buf, res, scales, mix_rows, flat_dim, n_tok, gt));
+            CHECK(myds_metal_commit_batch());
+            CHECK(exact(x_norm_out, x_norm_ref, (size_t)n_tok * dim));
+            CHECK(exact(mix_out, mix_ref, (size_t)n_tok * mix_rows));
+        }
+    }
+
+    /* 3) Fused indexer_rope_quant_batch & kv_rope_quant_batch vs separate rope + quant + pack_bf16 */
+    for (size_t ti = 0; ti < sizeof(tok_counts) / sizeof(*tok_counts); ti++) {
+        const uint32_t n_tok = tok_counts[ti];
+        for (uint32_t stride = 1u; stride <= 2u; stride++) {
+            /* 3a) indexer_rope_quant_batch: heads=32 (in-place) and heads=1 (packed BF16) */
+            myds_metal_buffer_t *iq_ref = myds_metal_buffer_alloc((size_t)n_tok * 32u * 128u * 4u);
+            myds_metal_buffer_t *iq_out = myds_metal_buffer_alloc((size_t)n_tok * 32u * 128u * 4u);
+            myds_metal_buffer_t *ik_ref = myds_metal_buffer_alloc((size_t)n_tok * 128u * 4u);
+            myds_metal_buffer_t *ik_out = myds_metal_buffer_alloc((size_t)n_tok * 128u * 4u);
+            myds_metal_buffer_t *pk_ref = myds_metal_buffer_alloc(((size_t)n_tok * 128u + 16u) * 2u);
+            myds_metal_buffer_t *pk_out = myds_metal_buffer_alloc(((size_t)n_tok * 128u + 16u) * 2u);
+            CHECK(iq_ref && iq_out && ik_ref && ik_out && pk_ref && pk_out);
+            fill(iq_ref, 19u + n_tok);
+            memcpy(myds_metal_buffer_data(iq_out), myds_metal_buffer_data(iq_ref), myds_metal_buffer_size(iq_ref));
+            fill(ik_ref, 23u + n_tok);
+            memcpy(myds_metal_buffer_data(ik_out), myds_metal_buffer_data(ik_ref), myds_metal_buffer_size(ik_ref));
+            memset(myds_metal_buffer_data(pk_ref), 0xa5, myds_metal_buffer_size(pk_ref));
+            memset(myds_metal_buffer_data(pk_out), 0xa5, myds_metal_buffer_size(pk_out));
+
+            CHECK(myds_metal_begin_batch());
+            CHECK(myds_v41_gpu_rope_batch_stride(iq_ref, 128u, 32u, 17u, n_tok, stride, true, false));
+            CHECK(myds_v41_gpu_quant(iq_ref, 128u, 32u * n_tok, 2u));
+            CHECK(myds_v41_gpu_indexer_rope_quant_batch(iq_out, NULL, 0, 32u, 17u, n_tok, stride, true));
+
+            CHECK(myds_v41_gpu_rope_batch_stride(ik_ref, 128u, 1u, 17u, n_tok, stride, true, false));
+            CHECK(myds_v41_gpu_quant(ik_ref, 128u, n_tok, 2u));
+            CHECK(myds_v41_gpu_pack_bf16(pk_ref, 8u, ik_ref, 0, n_tok * 128u));
+            CHECK(myds_v41_gpu_indexer_rope_quant_batch(ik_out, pk_out, 8u, 1u, 17u, n_tok, stride, true));
+            CHECK(myds_metal_commit_batch());
+
+            CHECK(exact(iq_out, iq_ref, (size_t)n_tok * 32u * 128u));
+            CHECK(!memcmp(myds_metal_buffer_data(pk_out), myds_metal_buffer_data(pk_ref), myds_metal_buffer_size(pk_ref)));
+            myds_metal_buffer_free(iq_ref);
+            myds_metal_buffer_free(iq_out);
+            myds_metal_buffer_free(ik_ref);
+            myds_metal_buffer_free(ik_out);
+            myds_metal_buffer_free(pk_ref);
+            myds_metal_buffer_free(pk_out);
+
+            /* 3b) kv_rope_quant_batch: mode=1 (compressed=false/true, in-place) and mode=3 (packed BF16) */
+            for (int comp = 0; comp < 2; comp++) {
+                myds_metal_buffer_t *kv_ref = myds_metal_buffer_alloc((size_t)n_tok * 512u * 4u);
+                myds_metal_buffer_t *kv_out = myds_metal_buffer_alloc((size_t)n_tok * 512u * 4u);
+                CHECK(kv_ref && kv_out);
+                fill(kv_ref, 29u + n_tok + comp);
+                memcpy(myds_metal_buffer_data(kv_out), myds_metal_buffer_data(kv_ref), myds_metal_buffer_size(kv_ref));
+                CHECK(myds_metal_begin_batch());
+                CHECK(myds_v41_gpu_rope_batch_stride(kv_ref, 512u, 1u, 31u, n_tok, stride, comp != 0, false));
+                CHECK(myds_v41_gpu_quant(kv_ref, 512u, n_tok, 1u));
+                CHECK(myds_v41_gpu_kv_rope_quant_batch(kv_out, NULL, 0, 31u, n_tok, stride, comp != 0, 1u));
+                CHECK(myds_metal_commit_batch());
+                CHECK(exact(kv_out, kv_ref, (size_t)n_tok * 512u));
+                myds_metal_buffer_free(kv_ref);
+                myds_metal_buffer_free(kv_out);
+            }
+            {
+                myds_metal_buffer_t *lat_ref = myds_metal_buffer_alloc((size_t)n_tok * 512u * 4u);
+                myds_metal_buffer_t *lat_out = myds_metal_buffer_alloc((size_t)n_tok * 512u * 4u);
+                myds_metal_buffer_t *pl_ref = myds_metal_buffer_alloc(((size_t)n_tok * 512u + 16u) * 2u);
+                myds_metal_buffer_t *pl_out = myds_metal_buffer_alloc(((size_t)n_tok * 512u + 16u) * 2u);
+                CHECK(lat_ref && lat_out && pl_ref && pl_out);
+                fill(lat_ref, 37u + n_tok);
+                memcpy(myds_metal_buffer_data(lat_out), myds_metal_buffer_data(lat_ref), myds_metal_buffer_size(lat_ref));
+                memset(myds_metal_buffer_data(pl_ref), 0x5a, myds_metal_buffer_size(pl_ref));
+                memset(myds_metal_buffer_data(pl_out), 0x5a, myds_metal_buffer_size(pl_out));
+                CHECK(myds_metal_begin_batch());
+                CHECK(myds_v41_gpu_rope_batch_stride(lat_ref, 512u, 1u, 31u, n_tok, stride, true, false));
+                CHECK(myds_v41_gpu_quant(lat_ref, 512u, n_tok, 3u));
+                CHECK(myds_v41_gpu_pack_bf16(pl_ref, 8u, lat_ref, 0, n_tok * 512u));
+                CHECK(myds_v41_gpu_kv_rope_quant_batch(lat_out, pl_out, 8u, 31u, n_tok, stride, true, 3u));
+                CHECK(myds_metal_commit_batch());
+                CHECK(!memcmp(myds_metal_buffer_data(pl_out), myds_metal_buffer_data(pl_ref), myds_metal_buffer_size(pl_ref)));
+                myds_metal_buffer_free(lat_ref);
+                myds_metal_buffer_free(lat_out);
+                myds_metal_buffer_free(pl_ref);
+                myds_metal_buffer_free(pl_out);
+            }
+        }
+    }
+
+    myds_metal_buffer_free(res);
+    myds_metal_buffer_free(pre);
+    myds_metal_buffer_free(branch);
+    myds_metal_buffer_free(norm_w);
+    myds_metal_buffer_free(w_f16);
+    myds_metal_buffer_free(w_f32);
+    myds_metal_buffer_free(x_norm_ref);
+    myds_metal_buffer_free(x_norm_out);
+    myds_metal_buffer_free(flat_norm);
+    myds_metal_buffer_free(scales);
+    myds_metal_buffer_free(mix_ref);
+    myds_metal_buffer_free(mix_out);
+    myds_metal_buffer_free(exp_ref);
+    myds_metal_buffer_free(exp_out);
+    printf("  [PASS] prefill batch fusions (hc_expand4_batch, hc_sum_rmsnorm_scale_batch + gemv_batch_scaled, indexer/kv_rope_quant_batch) 0-ULP byte exact\n");
+    return 1;
+}
 int main(int argc,char **argv) {
     int disabled=argc>1&&!strcmp(argv[1],"--slab");
     int threshold=argc>1&&!strcmp(argv[1],"--threshold");
@@ -653,6 +820,7 @@ int main(int argc,char **argv) {
         int ok=test_topk_prefix();myds_metal_cleanup();return ok?0:1;
     }
     int ok=test_compact_resource()&&test_mixed_paths(disabled)&&test_slab_grow_carry()&&test_strategy_threshold(threshold)&&test_window_boundaries()&&
-           test_pack_and_gather()&&test_indexscores_bf16()&&test_indexscores_selected_blocks()&&test_topk_prefix()&&test_attention_bf16()&&test_partial_picks();
+           test_pack_and_gather()&&test_indexscores_bf16()&&test_indexscores_selected_blocks()&&test_topk_prefix()&&test_attention_bf16()&&test_partial_picks()&&
+           test_prefill_batch_fusions();
     myds_metal_cleanup();if(ok)printf("ALL V4.1 GPU REGRESSIONS PASSED (%s)\n",disabled?"gather disabled":threshold?"explicit threshold":"gather enabled");return ok?0:1;
 }

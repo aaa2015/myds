@@ -1720,6 +1720,10 @@ int myds_metal_init(const char *shader_dir) {
                         @"kernel_dsv4_hc_split_sinkhorn",
                         @"kernel_dsv4_hc_weighted_sum",
                         @"kernel_dsv4_hc_expand4",
+                        @"kernel_dsv4_hc_expand4_batch",
+                        @"kernel_myds_v41_hc_sum_rmsnorm_scale_batch",
+                        @"kernel_dsv41_indexer_rope_quant_batch",
+                        @"kernel_dsv41_kv_rope_quant_batch",
                         @"kernel_dsv41_engram_add",
                         @"kernel_dsv41_rope",
                         @"kernel_dsv41_rope_round",
@@ -3591,6 +3595,69 @@ int myds_metal_v41_hc_sum_rmsnorm_batch(
     }
 }
 
+int myds_metal_v41_hc_sum_rmsnorm_scale_batch(
+    myds_metal_buffer_t *norm_out,
+    myds_metal_buffer_t *sum_out,
+    myds_metal_buffer_t *flat_scale_out,
+    const myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *norm_weight,
+    uint32_t dim,
+    uint32_t n_tok,
+    uint64_t weight_stride_bytes,
+    float eps,
+    bool round_bf16) {
+    if (!n_tok) return 1;
+    if (!g_initialized || !dim || dim % 128 || dim < 4096u ||
+        !isfinite(eps) || eps < 0 || !v41_floats(norm_out, (uint64_t)dim * n_tok) ||
+        !v41_floats(flat_scale_out, n_tok) ||
+        !v41_floats(residual, 4ull * dim * n_tok) || !weights || !weights->mtl_buf ||
+        !v41_floats(norm_weight, dim) ||
+        (sum_out && !v41_floats(sum_out, (uint64_t)dim * n_tok))) return 0;
+
+    NSUInteger nth = 32;
+    while (nth < dim / 4u && nth < 1024u) nth *= 2;
+    if (nth > dim / 4u) nth = dim / 4u;
+    {
+        static int ov = -2;
+        if (__builtin_expect(ov == -2, 0)) {
+            const char *v = getenv("MYDS_RMS_NTH");
+            long n = v ? atol(v) : 0;
+            ov = (n > 0 && n <= 1024) ? (int)n : -1;
+        }
+        if (ov > 0) nth = (NSUInteger)ov;
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = resolve_kernel_pipeline("kernel_myds_v41_hc_sum_rmsnorm_scale_batch", NULL, 0);
+        if (!pipeline || nth > pipeline.maxTotalThreadsPerThreadgroup) return 0;
+        struct v41_hc_sum_rmsnorm_batch_args args = {
+            .dim = dim,
+            .eps = eps,
+            .round_bf16 = round_bf16 ? 1 : 0,
+            .has_sum_out = sum_out ? 1 : 0,
+            .weight_stride_bytes = weight_stride_bytes ? weight_stride_bytes : 16ull,
+        };
+        id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
+        if (!enc) return 0;
+        if (g_batch_cb && g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:residual->mtl_buf offset:residual->offset atIndex:1];
+        [enc setBuffer:weights->mtl_buf offset:weights->offset atIndex:2];
+        [enc setBuffer:norm_weight->mtl_buf offset:norm_weight->offset atIndex:3];
+        const myds_metal_buffer_t *s_buf = sum_out ? sum_out : norm_out;
+        [enc setBuffer:s_buf->mtl_buf offset:s_buf->offset atIndex:4];
+        [enc setBuffer:norm_out->mtl_buf offset:norm_out->offset atIndex:5];
+        [enc setBuffer:flat_scale_out->mtl_buf offset:flat_scale_out->offset atIndex:6];
+        [enc setThreadgroupMemoryLength:64 * sizeof(float) atIndex:0];
+        metal_dispatch(enc, "v41_hc_sum_rmsnorm_scale_batch", MTLSizeMake(n_tok, 1, 1), MTLSizeMake(nth, 1, 1));
+        return v41_finish(cb, enc);
+    }
+}
+
 struct v41_hc_expand_args {
     int64_t n_embd, n_hc, n_tokens;
     uint64_t nb_block0, nb_block1, nb_add0, nb_add1, nb_res0, nb_res1, nb_res2;
@@ -3790,7 +3857,8 @@ int myds_metal_v41_hc_expand_batch(myds_metal_buffer_t *out,
         id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
         if (!enc) return 0;
         if (g_batch_cb && g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        [enc setComputePipelineState:g_pso_v41_hc_expand];
+        id<MTLComputePipelineState> pso_2d = resolve_kernel_pipeline("kernel_dsv4_hc_expand4_batch", NULL, 0);
+        [enc setComputePipelineState:pso_2d ? pso_2d : g_pso_v41_hc_expand];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:block->mtl_buf offset:block->offset atIndex:1];
         [enc setBuffer:residual->mtl_buf offset:residual->offset atIndex:2];
@@ -3799,9 +3867,14 @@ int myds_metal_v41_hc_expand_batch(myds_metal_buffer_t *out,
         [enc setBuffer:block->mtl_buf offset:block->offset atIndex:5];
         [enc setBuffer:out->mtl_buf offset:out->offset atIndex:6];
         NSUInteger nth = MIN((NSUInteger)256, (NSUInteger)dim);
-        uint64_t total_elements = (uint64_t)dim * n_tok;
-        metal_dispatch(enc, "v41_hc_expand_batch", MTLSizeMake((total_elements + nth - 1) / nth, 1, 1),
-            MTLSizeMake(nth, 1, 1));
+        if (pso_2d) {
+            metal_dispatch(enc, "v41_hc_expand_batch",
+                MTLSizeMake((dim + nth - 1) / nth, n_tok, 1), MTLSizeMake(nth, 1, 1));
+        } else {
+            uint64_t total_elements = (uint64_t)dim * n_tok;
+            metal_dispatch(enc, "v41_hc_expand_batch", MTLSizeMake((total_elements + nth - 1) / nth, 1, 1),
+                MTLSizeMake(nth, 1, 1));
+        }
         return v41_finish(cb, enc);
     }
 }
@@ -4385,6 +4458,86 @@ int myds_metal_v41_gemv_batch(myds_metal_buffer_t *out,
         [enc setBuffer:weight->mtl_buf offset:weight->offset atIndex:1];
         [enc setBuffer:input->mtl_buf offset:input->offset atIndex:2];
         [enc setBuffer:out->mtl_buf offset:out->offset atIndex:3];
+        NSUInteger shmem_len = use_b4 ? (32u * 2u * 4u * sizeof(float)) : (32u * 2u * sizeof(float));
+        [enc setThreadgroupMemoryLength:shmem_len atIndex:0];
+        NSUInteger grid_y = use_b4 ? ((n_tok + 3u) / 4u) : n_tok;
+        metal_dispatch(enc, [funcName UTF8String], MTLSizeMake((out_dim + 1u) / 2u, grid_y, 1),
+             MTLSizeMake(32, nsg, 1));
+        return v41_finish(cb, enc);
+    }
+}
+
+int myds_metal_v41_gemv_batch_scaled(myds_metal_buffer_t *out,
+    const myds_metal_buffer_t *weight, const myds_metal_buffer_t *input,
+    const myds_metal_buffer_t *scales,
+    uint32_t out_dim, uint32_t in_dim, uint32_t n_tok, ggml_type weight_type) {
+    if (!out || !weight || !input || !scales || !out_dim || !in_dim || !n_tok ||
+        (weight_type != GGML_TYPE_F16 && weight_type != GGML_TYPE_F32) ||
+        out_dim > INT32_MAX || in_dim > INT32_MAX || n_tok > INT32_MAX ||
+        in_dim % 4u ||
+        input->size / sizeof(float) / in_dim < n_tok ||
+        scales->size / sizeof(float) < n_tok ||
+        out->size / sizeof(float) / out_dim < n_tok)
+        return 0;
+    const uint64_t elem_bytes = weight_type == GGML_TYPE_F32 ? sizeof(float) : 2u;
+    if (weight->size / ((uint64_t)in_dim * elem_bytes) < out_dim) return 0;
+    struct ds4_metal_args_mul_mv args;
+    memset(&args, 0, sizeof(args));
+    const uint32_t nsg = (in_dim + 127u) / 128u > 8u ? 8u : (in_dim + 127u) / 128u;
+    args.ne00 = (int32_t)in_dim;
+    args.ne01 = (int32_t)out_dim;
+    args.ne02 = 1;
+    args.nb00 = elem_bytes;
+    args.nb01 = (uint64_t)in_dim * elem_bytes;
+    args.nb02 = args.nb01 * out_dim;
+    args.nb03 = args.nb02;
+    args.ne10 = (int32_t)in_dim;
+    args.ne11 = (int32_t)n_tok;
+    args.ne12 = 1;
+    args.nb10 = sizeof(float);
+    args.nb11 = (uint64_t)in_dim * sizeof(float);
+    args.nb12 = (uint64_t)in_dim * n_tok * sizeof(float);
+    args.nb13 = args.nb12;
+    args.ne0 = (int32_t)out_dim;
+    args.ne1 = (int32_t)n_tok;
+    args.nr0 = 2;
+    args.r2 = 1;
+    args.r3 = 1;
+    @autoreleasepool {
+        const uint32_t b_size = (n_tok > 1u) ? get_gemv_batch_size() : 1u;
+        const bool use_b4 = (b_size == 4u && n_tok > 1u);
+        NSString *funcName = nil;
+        if (use_b4) {
+            funcName = weight_type == GGML_TYPE_F32 ? @"kernel_mul_mv_f32_f32_4_b4_scaled" : @"kernel_mul_mv_f16_f32_4_b4_scaled";
+        } else {
+            funcName = weight_type == GGML_TYPE_F32 ? @"kernel_mul_mv_f32_f32_4_scaled" : @"kernel_mul_mv_f16_f32_4_scaled";
+        }
+        NSString *key = [NSString stringWithFormat:@"%@_%u", funcName, nsg];
+        id<MTLComputePipelineState> pipeline = g_native_pipelines[key];
+        if (!pipeline) {
+            MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
+            short short_nsg = (short)nsg;
+            [values setConstantValue:&short_nsg type:MTLDataTypeShort atIndex:600];
+            id<MTLFunction> fn = [g_library newFunctionWithName:funcName
+                                                   constantValues:values error:nil];
+            if (!fn) { fprintf(stderr, "myds_metal: v41 %s function unavailable\n", [funcName UTF8String]); return 0; }
+            pipeline = [g_device newComputePipelineStateWithFunction:fn error:nil];
+            if (!pipeline) { fprintf(stderr, "myds_metal: v41 %s pipeline unavailable\n", [funcName UTF8String]); return 0; }
+            if (!g_native_pipelines) g_native_pipelines = [NSMutableDictionary new];
+            g_native_pipelines[key] = pipeline;
+        }
+        id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
+        if (!enc || 32u * nsg > pipeline.maxTotalThreadsPerThreadgroup) {
+            fprintf(stderr, "myds_metal: v41 %s encoder unavailable (nsg=%u)\n", [funcName UTF8String], nsg);
+            return 0;
+        }
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:weight->mtl_buf offset:weight->offset atIndex:1];
+        [enc setBuffer:input->mtl_buf offset:input->offset atIndex:2];
+        [enc setBuffer:out->mtl_buf offset:out->offset atIndex:3];
+        [enc setBuffer:scales->mtl_buf offset:scales->offset atIndex:4];
         NSUInteger shmem_len = use_b4 ? (32u * 2u * 4u * sizeof(float)) : (32u * 2u * sizeof(float));
         [enc setThreadgroupMemoryLength:shmem_len atIndex:0];
         NSUInteger grid_y = use_b4 ? ((n_tok + 3u) / 4u) : n_tok;

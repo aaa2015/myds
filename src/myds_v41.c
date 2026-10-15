@@ -3096,14 +3096,20 @@ static int publish_compressor_chunk(myds_context_t *ctx, uint32_t il,
     if (!project_batch(index_k_buf, l->index_k, latent_buf, 128u, 512u, n_commit, GGML_TYPE_F16, true)) return -1;
     if (!myds_metal_v41_rmsnorm_batch(index_k_buf, index_k_buf, l->index_k_norm, 128u, n_commit,
                                       ctx->model->norm_eps, true)) return -1;
-    if (!myds_v41_gpu_rope_batch_stride(index_k_buf, 128u, 1u, first_pos, n_commit, ratio, true, false)) return -1;
-    if (!myds_v41_gpu_quant(index_k_buf, 128u, n_commit, 2u)) return -1;
-    if (!myds_v41_gpu_pack_bf16(g->index_cache[owner], (size_t)row0 * 128u, index_k_buf, 0,
-                                n_commit * 128u)) return -1;
-    if (!myds_v41_gpu_rope_batch_stride(latent_buf, 512u, 1u, first_pos, n_commit, ratio, true, false)) return -1;
-    if (!myds_v41_gpu_quant(latent_buf, 512u, n_commit, 3u)) return -1;
-    if (!myds_v41_gpu_pack_bf16(g->compressed[owner], (size_t)row0 * 512u, latent_buf, 0,
-                                n_commit * 512u)) return -1;
+    if (!myds_v41_gpu_indexer_rope_quant_batch(index_k_buf, g->index_cache[owner], (size_t)row0 * 128u,
+                                               1u, first_pos, n_commit, ratio, true)) {
+        if (!myds_v41_gpu_rope_batch_stride(index_k_buf, 128u, 1u, first_pos, n_commit, ratio, true, false)) return -1;
+        if (!myds_v41_gpu_quant(index_k_buf, 128u, n_commit, 2u)) return -1;
+        if (!myds_v41_gpu_pack_bf16(g->index_cache[owner], (size_t)row0 * 128u, index_k_buf, 0,
+                                    n_commit * 128u)) return -1;
+    }
+    if (!myds_v41_gpu_kv_rope_quant_batch(latent_buf, g->compressed[owner], (size_t)row0 * 512u,
+                                          first_pos, n_commit, ratio, true, 3u)) {
+        if (!myds_v41_gpu_rope_batch_stride(latent_buf, 512u, 1u, first_pos, n_commit, ratio, true, false)) return -1;
+        if (!myds_v41_gpu_quant(latent_buf, 512u, n_commit, 3u)) return -1;
+        if (!myds_v41_gpu_pack_bf16(g->compressed[owner], (size_t)row0 * 512u, latent_buf, 0,
+                                    n_commit * 512u)) return -1;
+    }
     /* 3) 跨 chunk 的状态：逐 token 版在【每个偶数位】把 pool_kv/pool_score 拷进 previous_*，
      *    所以 chunk 结束时的状态 = 最后一个偶数位（c_len-2）的值。 */
     if (ratio == 2u && c_len >= 2u) {
@@ -3356,8 +3362,11 @@ static int publish_indexer_chunk(myds_context_t *ctx, uint32_t il, uint32_t c_st
     }
     /* 1) index_q 的 rope + quant：逐 token 版本在 publish_and_select 里逐行做，参数
      *    完全相同（start_pos = 该位置、heads = 32、width = 128、compressed = true）。 */
-    if (!myds_v41_gpu_rope_batch(index_q_buf,128,V41_INDEX_HEADS,base_pos + c_start,c_len,true,false)) return -1;
-    if (!myds_v41_gpu_quant(index_q_buf,128,V41_INDEX_HEADS*c_len,2)) return -1;
+    if (!myds_v41_gpu_indexer_rope_quant_batch(index_q_buf, NULL, 0, V41_INDEX_HEADS,
+                                               base_pos + c_start, c_len, 1u, true)) {
+        if (!myds_v41_gpu_rope_batch(index_q_buf,128,V41_INDEX_HEADS,base_pos + c_start,c_len,true,false)) return -1;
+        if (!myds_v41_gpu_quant(index_q_buf,128,V41_INDEX_HEADS*c_len,2)) return -1;
+    }
     for (uint32_t off=0; off<c_len; ) {
         const uint32_t glen=indexer_group_len(c_len,off,base_pos,c_start,ratio,batch_floats);
         const uint32_t nc_raw=(base_pos + c_start + off + glen)/ratio;
@@ -6677,10 +6686,11 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             const uint32_t sh_need = 1u + (V41_LAYERS - 1u - il) * 127u;
             const bool shrink_layer = suffix_shrink && il >= 20u;
             const uint32_t sh_valid_from = (total_eff > shrink_shift) ? total_eff - shrink_shift : 0u;
-            uint32_t sh_loop_rel = 0, sh_full_rel = 0;
+            uint32_t sh_loop_rel = 0, sh_full_rel = 0, sh_s_global = 0;
             if (shrink_layer) {
                 const uint32_t sub = sh_need + shrink_shift;
                 const uint32_t s_global = (total_eff > sub) ? total_eff - sub : 0u;
+                sh_s_global = s_global;
                 uint32_t s = s_global;
                 if (s < mb_base_pos) s = mb_base_pos;
                 if (s > mb_end) s = mb_end;
@@ -6722,6 +6732,9 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                  * 不做 Q_A/Q_B 投影、attention / 输出 / FFN / MoE，也不累加 moe_off。
                  * 注意窗口环拷贝对两条路径都要做 —— 它正是前置段存在的目的。 */
                 const bool kv_only = shrink_layer && (c_start + c_len <= sh_full_rel);
+                const bool kv_only_skip_win = kv_only && !trace_on &&
+                                              (mb_base_pos + c_start + c_len + V41_WINDOW <= sh_s_global);
+                const bool hc_mix_use_gemv = (c_len < 32u || is_mul_mm_disabled() || mm_min_m() > 24u);
 
                 if (il == 1 || il == 14) {
                     uint32_t e = (il == 1 ? 0 : 1);
@@ -6784,29 +6797,43 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 }
 
                 /* Batched HC Mix: RMSNorm + GEMM + Split across the entire chunk */
-                CHECK(myds_metal_v41_rmsnorm_batch(cw->hc_flat_norm_buf, cw->cur_res_view, NULL, 4 * V41_DIM, c_len, m->norm_eps, false));
-                if (do_prof && opt_prof_step1) { TIME_START(); CHECK(myds_metal_commit_batch()); TIME_ACC(prof_s1_norm); CHECK(myds_metal_begin_batch()); }
-                CHECK(project_batch(cw->hc_mix_buf, l->attn_fn, cw->hc_flat_norm_buf, 24, 4 * V41_DIM, c_len, GGML_TYPE_F16, false));
-                if (do_prof && opt_prof_step1) { TIME_START(); CHECK(myds_metal_commit_batch()); TIME_ACC(prof_s1_mix); CHECK(myds_metal_begin_batch()); }
-                CHECK(myds_metal_v41_hc_split_batch(cw->attn_split_buf, cw->hc_mix_buf, l->attn_scale, l->attn_base, c_len, v->hc_eps));
-                if (do_prof && opt_prof_step1) { TIME_START(); CHECK(myds_metal_commit_batch()); TIME_ACC(prof_s1_split); CHECK(myds_metal_begin_batch()); }
-
-                if (trace_on) {
-                    for (uint32_t t = 0; t < c_len; t++) {
-                        uint32_t pos = mb_base_pos + c_start + t;
-                        TRACE("hc_attn_split", cw->attn_split[t], 24);
-                        TRACE("hc_attn_pre", cw->pre_view[t], 4);
-                    }
-                }
-
-                if (!trace_on && !(do_prof && opt_prof_step1) &&
+                if (!trace_on && !(do_prof && opt_prof_step1) && kv_only &&
                     myds_metal_v41_hc_sum_rmsnorm_batch(cw->x_norm_buf, NULL, cw->cur_res_view, cw->cur_pre_view,
                                                         base->attn_norm, V41_DIM, c_len, pre_tok_bytes, m->norm_eps, true)) {
+                    /* kv_only chunks skip Step 6/7/8, so attn_split_buf is unused. */
+                } else if (!trace_on && !(do_prof && opt_prof_step1) && hc_mix_use_gemv &&
+                           myds_metal_v41_hc_sum_rmsnorm_scale_batch(cw->x_norm_buf, NULL, cw->hc_flat_norm_buf,
+                                                                     cw->cur_res_view, cw->cur_pre_view,
+                                                                     base->attn_norm, V41_DIM, c_len, pre_tok_bytes, m->norm_eps, true)) {
+                    myds_metal_barrier();
+                    CHECK(myds_metal_v41_gemv_batch_scaled(cw->hc_mix_buf, l->attn_fn, cw->cur_res_view, cw->hc_flat_norm_buf,
+                                                           24, 4 * V41_DIM, c_len, GGML_TYPE_F16));
+                    CHECK(myds_metal_v41_hc_split_batch(cw->attn_split_buf, cw->hc_mix_buf, l->attn_scale, l->attn_base, c_len, v->hc_eps));
                 } else {
-                    CHECK(myds_metal_v41_hc_weighted_sum_batch(cw->x_buf, cw->cur_res_view, cw->cur_pre_view, V41_DIM, c_len, pre_tok_bytes));
-                    if (do_prof && opt_prof_step1) { TIME_START(); CHECK(myds_metal_commit_batch()); TIME_ACC(prof_s1_wsum); CHECK(myds_metal_begin_batch()); }
-                    CHECK(myds_metal_v41_rmsnorm_batch(cw->x_norm_buf, cw->x_buf, base->attn_norm, V41_DIM, c_len, m->norm_eps, true));
-                    if (do_prof && opt_prof_step1) { TIME_START(); CHECK(myds_metal_commit_batch()); TIME_ACC(prof_s1_norm2); CHECK(myds_metal_begin_batch()); }
+                    CHECK(myds_metal_v41_rmsnorm_batch(cw->hc_flat_norm_buf, cw->cur_res_view, NULL, 4 * V41_DIM, c_len, m->norm_eps, false));
+                    if (do_prof && opt_prof_step1) { TIME_START(); CHECK(myds_metal_commit_batch()); TIME_ACC(prof_s1_norm); CHECK(myds_metal_begin_batch()); }
+                    CHECK(project_batch(cw->hc_mix_buf, l->attn_fn, cw->hc_flat_norm_buf, 24, 4 * V41_DIM, c_len, GGML_TYPE_F16, false));
+                    if (do_prof && opt_prof_step1) { TIME_START(); CHECK(myds_metal_commit_batch()); TIME_ACC(prof_s1_mix); CHECK(myds_metal_begin_batch()); }
+                    CHECK(myds_metal_v41_hc_split_batch(cw->attn_split_buf, cw->hc_mix_buf, l->attn_scale, l->attn_base, c_len, v->hc_eps));
+                    if (do_prof && opt_prof_step1) { TIME_START(); CHECK(myds_metal_commit_batch()); TIME_ACC(prof_s1_split); CHECK(myds_metal_begin_batch()); }
+
+                    if (trace_on) {
+                        for (uint32_t t = 0; t < c_len; t++) {
+                            uint32_t pos = mb_base_pos + c_start + t;
+                            TRACE("hc_attn_split", cw->attn_split[t], 24);
+                            TRACE("hc_attn_pre", cw->pre_view[t], 4);
+                        }
+                    }
+
+                    if (!trace_on && !(do_prof && opt_prof_step1) &&
+                        myds_metal_v41_hc_sum_rmsnorm_batch(cw->x_norm_buf, NULL, cw->cur_res_view, cw->cur_pre_view,
+                                                            base->attn_norm, V41_DIM, c_len, pre_tok_bytes, m->norm_eps, true)) {
+                    } else {
+                        CHECK(myds_metal_v41_hc_weighted_sum_batch(cw->x_buf, cw->cur_res_view, cw->cur_pre_view, V41_DIM, c_len, pre_tok_bytes));
+                        if (do_prof && opt_prof_step1) { TIME_START(); CHECK(myds_metal_commit_batch()); TIME_ACC(prof_s1_wsum); CHECK(myds_metal_begin_batch()); }
+                        CHECK(myds_metal_v41_rmsnorm_batch(cw->x_norm_buf, cw->x_buf, base->attn_norm, V41_DIM, c_len, m->norm_eps, true));
+                        if (do_prof && opt_prof_step1) { TIME_START(); CHECK(myds_metal_commit_batch()); TIME_ACC(prof_s1_norm2); CHECK(myds_metal_begin_batch()); }
+                    }
                 }
 
                 if (trace_on) {
@@ -6825,20 +6852,27 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 phase = "batched attention projections";
                 if (!opt_skip_q_a && !kv_only_skip_q)
                     CHECK(project_batch(cw->qr_buf, base->attn_q_a, cw->x_norm_buf, 1280, V41_DIM, c_len, base->attn_q_a_type, true));
-                if (!opt_skip_kv)
+                if (!opt_skip_kv && !kv_only_skip_win)
                     CHECK(project_batch(cw->kv_act_buf, base->attn_kv, cw->x_norm_buf, 512, V41_DIM, c_len, base->attn_kv_type, true));
 
                 if (!opt_skip_norm) {
                     if (!kv_only_skip_q)
                         CHECK(myds_metal_v41_rmsnorm_batch(cw->qr_norm_buf, cw->qr_buf, base->attn_q_a_norm, 1280, c_len, m->norm_eps, true));
-                    CHECK(myds_metal_v41_rmsnorm_batch(cw->kv_act_buf, cw->kv_act_buf, base->attn_kv_a_norm, 512, c_len, m->norm_eps, true));
+                    if (!kv_only_skip_win)
+                        CHECK(myds_metal_v41_rmsnorm_batch(cw->kv_act_buf, cw->kv_act_buf, base->attn_kv_a_norm, 512, c_len, m->norm_eps, true));
                 }
 
                 /* Batched RoPE & Quant for KV */
-                if (!opt_skip_kv_rope)
-                    CHECK(myds_v41_gpu_rope_batch(cw->kv_act_buf, 512, 1, mb_base_pos + c_start, c_len, compressed, false));
-                if (!opt_skip_kv_quant)
-                    CHECK(myds_v41_gpu_quant(cw->kv_act_buf, 512, c_len, 1));
+                if (!kv_only_skip_win) {
+                    if (!opt_skip_kv_rope && !opt_skip_kv_quant && !trace_on &&
+                        myds_v41_gpu_kv_rope_quant_batch(cw->kv_act_buf, NULL, 0, mb_base_pos + c_start, c_len, 1u, compressed, 1u)) {
+                    } else {
+                        if (!opt_skip_kv_rope)
+                            CHECK(myds_v41_gpu_rope_batch(cw->kv_act_buf, 512, 1, mb_base_pos + c_start, c_len, compressed, false));
+                        if (!opt_skip_kv_quant)
+                            CHECK(myds_v41_gpu_quant(cw->kv_act_buf, 512, c_len, 1));
+                    }
+                }
 
                 if (trace_on && !kv_only) {   /* 前缀段不算 Q（il>=21），Q 的 trace 无意义 */
                     for (uint32_t t = 0; t < c_len; t++) {
@@ -6990,7 +7024,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     }
                 }
 
-                {
+                if (!kv_only_skip_win) {
                     phase = "window ring";
                     uint32_t t0 = c_len > V41_WINDOW ? c_len - V41_WINDOW : 0;
                     uint32_t nw = c_len - t0;
@@ -7074,25 +7108,35 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 CHECK(myds_metal_v41_hc_expand_batch(cw->after_attn_buf, cw->attn_out_buf, cw->cur_res_view, cw->attn_split_buf, V41_DIM, c_len));
 
                 /* Batched HC Mix: RMSNorm + GEMM + Split across the entire chunk */
-                CHECK(myds_metal_v41_rmsnorm_batch(cw->hc_flat_norm_buf, cw->after_attn_buf, NULL, 4 * V41_DIM, c_len, m->norm_eps, false));
-                CHECK(project_batch(cw->hc_mix_buf, l->ffn_fn, cw->hc_flat_norm_buf, 24, 4 * V41_DIM, c_len, GGML_TYPE_F16, false));
-                CHECK(myds_metal_v41_hc_split_batch(cw->ffn_split_buf, cw->hc_mix_buf, l->ffn_scale, l->ffn_base, c_len, v->hc_eps));
-
-                if (trace_on) {
-                    for (uint32_t t = 0; t < c_len; t++) {
-                        uint32_t pos = mb_base_pos + c_start + t;
-                        TRACE("attn_out", cw->attn_out[t], V41_DIM);
-                        TRACE("after_attn", cw->after_attn[t], 4 * V41_DIM);
-                        TRACE("hc_ffn_split", cw->ffn_split[t], 24);
-                    }
-                }
-
-                if (!trace_on &&
-                    myds_metal_v41_hc_sum_rmsnorm_batch(cw->ffn_norm_buf, NULL, cw->after_attn_buf, cw->attn_split_buf,
-                                                        base->ffn_norm, V41_DIM, c_len, 96, m->norm_eps, true)) {
+                if (!trace_on && hc_mix_use_gemv &&
+                    myds_metal_v41_hc_sum_rmsnorm_scale_batch(cw->ffn_norm_buf, NULL, cw->hc_flat_norm_buf,
+                                                              cw->after_attn_buf, cw->attn_split_buf,
+                                                              base->ffn_norm, V41_DIM, c_len, 96, m->norm_eps, true)) {
+                    myds_metal_barrier();
+                    CHECK(myds_metal_v41_gemv_batch_scaled(cw->hc_mix_buf, l->ffn_fn, cw->after_attn_buf, cw->hc_flat_norm_buf,
+                                                           24, 4 * V41_DIM, c_len, GGML_TYPE_F16));
+                    CHECK(myds_metal_v41_hc_split_batch(cw->ffn_split_buf, cw->hc_mix_buf, l->ffn_scale, l->ffn_base, c_len, v->hc_eps));
                 } else {
-                    CHECK(myds_metal_v41_hc_weighted_sum_batch(cw->x_buf, cw->after_attn_buf, cw->attn_split_buf, V41_DIM, c_len, 96));
-                    CHECK(myds_metal_v41_rmsnorm_batch(cw->ffn_norm_buf, cw->x_buf, base->ffn_norm, V41_DIM, c_len, m->norm_eps, true));
+                    CHECK(myds_metal_v41_rmsnorm_batch(cw->hc_flat_norm_buf, cw->after_attn_buf, NULL, 4 * V41_DIM, c_len, m->norm_eps, false));
+                    CHECK(project_batch(cw->hc_mix_buf, l->ffn_fn, cw->hc_flat_norm_buf, 24, 4 * V41_DIM, c_len, GGML_TYPE_F16, false));
+                    CHECK(myds_metal_v41_hc_split_batch(cw->ffn_split_buf, cw->hc_mix_buf, l->ffn_scale, l->ffn_base, c_len, v->hc_eps));
+
+                    if (trace_on) {
+                        for (uint32_t t = 0; t < c_len; t++) {
+                            uint32_t pos = mb_base_pos + c_start + t;
+                            TRACE("attn_out", cw->attn_out[t], V41_DIM);
+                            TRACE("after_attn", cw->after_attn[t], 4 * V41_DIM);
+                            TRACE("hc_ffn_split", cw->ffn_split[t], 24);
+                        }
+                    }
+
+                    if (!trace_on &&
+                        myds_metal_v41_hc_sum_rmsnorm_batch(cw->ffn_norm_buf, NULL, cw->after_attn_buf, cw->attn_split_buf,
+                                                            base->ffn_norm, V41_DIM, c_len, 96, m->norm_eps, true)) {
+                    } else {
+                        CHECK(myds_metal_v41_hc_weighted_sum_batch(cw->x_buf, cw->after_attn_buf, cw->attn_split_buf, V41_DIM, c_len, 96));
+                        CHECK(myds_metal_v41_rmsnorm_batch(cw->ffn_norm_buf, cw->x_buf, base->ffn_norm, V41_DIM, c_len, m->norm_eps, true));
+                    }
                 }
 
                 if (trace_on) {
