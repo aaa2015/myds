@@ -139,6 +139,8 @@ A–B–A 中使短/800-token 业务输入 decode 时间减少 1.87% / 2.03%；�
 [2026-10-08 优化方案](docs/DECODE_OPTIMIZATION_PLAN_2026-10-08.md)。
 当前 prefill 的首块索引批处理、后缀收缩冗余工作消除及完整模型 A–B–A 证据，见
 [2026-10-15 Prefill 优化验证](docs/verification/2026-10-15-prefill-indexer-and-dead-kv.md)。
+已提交并部署后的 1M 上下文、真实前缀/SSD 缓存及默认采样复测，见
+[Mac Studio 生产部署与验收](docs/verification/2026-10-15-prefill-production-deployment.md)。
 Q2 down 独立 NSG、top-k 前缀合并裁剪及短/长输入对照，见
 [第二轮内核实现与验证](docs/benchmarks/2026-10-09-decode-kernels/README.md)。
 当前 GPU 时间线、IQ2 LUT 与 attention 物理 SIMD 打包的实现和验收边界，见
