@@ -255,7 +255,12 @@ bool myds_engram_read(const myds_engram_table_t *table, const uint32_t *rows,
     return true;
 }
 
-enum { ENGRAM_IO_MAX_THREADS = 16, ENGRAM_IO_JOBS = MYDS_ENGRAM_LAYERS * MYDS_ENGRAM_COLS };
+enum {
+    ENGRAM_IO_MAX_THREADS = 16,
+    ENGRAM_BATCH_MAX = 64,
+    ENGRAM_IO_JOBS = MYDS_ENGRAM_LAYERS * MYDS_ENGRAM_COLS,
+    ENGRAM_IO_BATCH_JOBS = ENGRAM_BATCH_MAX * ENGRAM_IO_JOBS
+};
 typedef struct {
     int fd, error, retry_errno;
     uint64_t offset;
@@ -276,7 +281,7 @@ struct myds_engram_reader {
     pthread_cond_t work, done;
     pthread_t threads[ENGRAM_IO_MAX_THREADS];
     engram_io_worker_t worker[ENGRAM_IO_MAX_THREADS];
-    engram_io_job_t jobs[ENGRAM_IO_JOBS];
+    engram_io_job_t jobs[ENGRAM_IO_BATCH_JOBS];
 };
 
 static void read_raw_job(engram_io_job_t *job) {
@@ -304,18 +309,19 @@ static void *engram_io_worker(void *opaque) {
         const unsigned count = r->job_count;
         pthread_mutex_unlock(&r->state);
         /* Sequentialize I/O: sort assigned jobs by offset to avoid random disk/page thrashing */
-        unsigned my_jobs[ENGRAM_IO_JOBS];
+        unsigned my_jobs[ENGRAM_IO_BATCH_JOBS];
         unsigned n_my_jobs = 0;
         for (unsigned i = worker->index; i < count; i += r->workers)
             my_jobs[n_my_jobs++] = i;
-        for (unsigned i = 0; i < n_my_jobs; ++i) {
-            for (unsigned j = i + 1; j < n_my_jobs; ++j) {
-                if (r->jobs[my_jobs[j]].offset < r->jobs[my_jobs[i]].offset) {
-                    unsigned tmp = my_jobs[i];
-                    my_jobs[i] = my_jobs[j];
-                    my_jobs[j] = tmp;
-                }
+        for (unsigned i = 1; i < n_my_jobs; ++i) {
+            unsigned tmp = my_jobs[i];
+            uint64_t off = r->jobs[tmp].offset;
+            unsigned j = i;
+            while (j > 0 && r->jobs[my_jobs[j - 1]].offset > off) {
+                my_jobs[j] = my_jobs[j - 1];
+                --j;
             }
+            my_jobs[j] = tmp;
         }
         for (unsigned i = 0; i < n_my_jobs; ++i)
             read_raw_job(&r->jobs[my_jobs[i]]);
@@ -651,6 +657,145 @@ bool myds_engram_prepare_token(myds_engram_t *e, int32_t token, uint64_t positio
     e->history = next;
     ++e->position;
     e->prepared = true;
+    return true;
+}
+
+bool myds_engram_prepare_batch(myds_engram_t *e, const int32_t *tokens,
+                              size_t count, uint64_t start_position,
+                              float *out_layer0, float *out_layer1) {
+    if (!e || (count && (!tokens || !out_layer0 || !out_layer1))) return fail(EINVAL);
+    if (!count) return true;
+    if (start_position != e->position || count > UINT64_MAX - start_position) {
+        e->prepared = false;
+        return fail(EINVAL);
+    }
+    if (e->io_threads > 1 && !e->reader &&
+        !myds_engram_set_io_threads(e, e->io_threads)) {
+        e->prepared = false;
+        return false;
+    }
+    myds_engram_reader_t *r = e->reader;
+    if (!r || r->workers <= 1 || count == 1 ||
+        e->table[0].fd < 0 || e->table[1].fd < 0 ||
+        fegetround() != FE_TONEAREST) {
+        for (size_t t = 0; t < count; ++t) {
+            if (!myds_engram_prepare_token(e, tokens[t], start_position + t)) return false;
+            memcpy(out_layer0 + t * MYDS_ENGRAM_INPUT_DIM,
+                   e->row_values[0], MYDS_ENGRAM_INPUT_DIM * sizeof(float));
+            memcpy(out_layer1 + t * MYDS_ENGRAM_INPUT_DIM,
+                   e->row_values[1], MYDS_ENGRAM_INPUT_DIM * sizeof(float));
+        }
+        return true;
+    }
+
+    for (size_t off = 0; off < count; ) {
+        size_t chunk = count - off;
+        if (chunk > ENGRAM_BATCH_MAX) chunk = ENGRAM_BATCH_MAX;
+
+        uint32_t batch_rows[ENGRAM_BATCH_MAX][MYDS_ENGRAM_LAYERS][MYDS_ENGRAM_COLS];
+        myds_engram_history_t next = e->history;
+        bool valid = myds_engram_hash(&e->layout, &next, tokens + off, NULL, chunk, &batch_rows[0][0][0]);
+        if (valid) {
+            for (size_t t = 0; t < chunk && valid; ++t)
+                for (int layer = 0; layer < MYDS_ENGRAM_LAYERS && valid; ++layer)
+                    for (int col = 0; col < MYDS_ENGRAM_COLS; ++col)
+                        if (batch_rows[t][layer][col] >= e->table[layer].rows) { valid = false; break; }
+        }
+        if (!valid) {
+            for (size_t t = 0; t < chunk; ++t) {
+                if (!myds_engram_prepare_token(e, tokens[off + t], start_position + off + t)) return false;
+                memcpy(out_layer0 + (off + t) * MYDS_ENGRAM_INPUT_DIM,
+                       e->row_values[0], MYDS_ENGRAM_INPUT_DIM * sizeof(float));
+                memcpy(out_layer1 + (off + t) * MYDS_ENGRAM_INPUT_DIM,
+                       e->row_values[1], MYDS_ENGRAM_INPUT_DIM * sizeof(float));
+            }
+            off += chunk;
+            continue;
+        }
+
+        pthread_mutex_lock(&r->submit);
+        unsigned map[ENGRAM_BATCH_MAX][MYDS_ENGRAM_LAYERS][MYDS_ENGRAM_COLS];
+        unsigned jobs = 0;
+        uint32_t ht_row[4096];
+        int16_t ht_job[4096];
+        for (int layer = 0; layer < MYDS_ENGRAM_LAYERS; ++layer) {
+            memset(ht_job, -1, sizeof(ht_job));
+            for (size_t t = 0; t < chunk; ++t) {
+                for (int col = 0; col < MYDS_ENGRAM_COLS; ++col) {
+                    const uint32_t rid = batch_rows[t][layer][col];
+                    uint32_t h = (rid * 2654435761u) & 4095u;
+                    while (ht_job[h] >= 0 && ht_row[h] != rid)
+                        h = (h + 1u) & 4095u;
+                    if (ht_job[h] >= 0) {
+                        map[t][layer][col] = (unsigned)ht_job[h];
+                        continue;
+                    }
+                    ht_row[h] = rid;
+                    ht_job[h] = (int16_t)jobs;
+                    map[t][layer][col] = jobs;
+                    r->jobs[jobs].fd = e->table[layer].fd;
+                    r->jobs[jobs].offset = e->table[layer].offset +
+                                           (uint64_t)rid * MYDS_ENGRAM_ROW_BYTES;
+                    r->jobs[jobs].error = 0;
+                    r->jobs[jobs].retry_errno = 0;
+                    ++jobs;
+                }
+            }
+        }
+        pthread_mutex_lock(&r->state);
+        r->job_count = jobs;
+        r->remaining = r->workers;
+        ++r->generation;
+        pthread_cond_broadcast(&r->work);
+        while (r->remaining) pthread_cond_wait(&r->done, &r->state);
+        pthread_mutex_unlock(&r->state);
+
+        float *job_decoded[ENGRAM_IO_BATCH_JOBS];
+        memset(job_decoded, 0, jobs * sizeof(float *));
+        bool ok = true;
+        for (size_t t = 0; t < chunk && ok; ++t) {
+            for (int layer = 0; layer < MYDS_ENGRAM_LAYERS && ok; ++layer) {
+                float *dst_base = (layer == 0 ? out_layer0 : out_layer1) +
+                                  (off + t) * MYDS_ENGRAM_INPUT_DIM;
+                for (int col = 0; col < MYDS_ENGRAM_COLS; ++col) {
+                    const unsigned jid = map[t][layer][col];
+                    engram_io_job_t *job = &r->jobs[jid];
+                    if (job->error) { ok = false; break; }
+                    float *dst = dst_base + col * MYDS_ENGRAM_DIM;
+                    if (job_decoded[jid]) {
+                        memcpy(dst, job_decoded[jid], MYDS_ENGRAM_DIM * sizeof(float));
+                    } else {
+                        if (job->retry_errno) errno = job->retry_errno;
+                        if (!myds_engram_decode_row(job->raw, dst)) { ok = false; break; }
+                        job_decoded[jid] = dst;
+                    }
+                }
+            }
+        }
+        pthread_mutex_unlock(&r->submit);
+
+        if (!ok) {
+            for (size_t t = 0; t < chunk; ++t) {
+                if (!myds_engram_prepare_token(e, tokens[off + t], start_position + off + t)) return false;
+                memcpy(out_layer0 + (off + t) * MYDS_ENGRAM_INPUT_DIM,
+                       e->row_values[0], MYDS_ENGRAM_INPUT_DIM * sizeof(float));
+                memcpy(out_layer1 + (off + t) * MYDS_ENGRAM_INPUT_DIM,
+                       e->row_values[1], MYDS_ENGRAM_INPUT_DIM * sizeof(float));
+            }
+            off += chunk;
+            continue;
+        }
+
+        memcpy(e->row_ids, batch_rows[chunk - 1], sizeof(e->row_ids));
+        memcpy(e->row_values[0], out_layer0 + (off + chunk - 1) * MYDS_ENGRAM_INPUT_DIM,
+               MYDS_ENGRAM_INPUT_DIM * sizeof(float));
+        memcpy(e->row_values[1], out_layer1 + (off + chunk - 1) * MYDS_ENGRAM_INPUT_DIM,
+               MYDS_ENGRAM_INPUT_DIM * sizeof(float));
+        e->history = next;
+        e->position += chunk;
+        e->prepared = true;
+        off += chunk;
+    }
     return true;
 }
 

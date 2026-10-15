@@ -2506,11 +2506,20 @@ int myds_metal_flush_batch(void) {
     id<MTLCommandBuffer> cb = g_batch_cb;
     g_batch_cb = nil;
     if (!g_inflight_cbs) g_inflight_cbs = [[NSMutableArray alloc] initWithCapacity:64];
+    int ok = 1;
+    while ([g_inflight_cbs count] >= 32) {
+        id<MTLCommandBuffer> oldest = [g_inflight_cbs objectAtIndex:0];
+        if (oldest.status != MTLCommandBufferStatusCompleted) {
+            [oldest waitUntilCompleted];
+        }
+        if (!command_buffer_result(oldest)) ok = 0;
+        [g_inflight_cbs removeObjectAtIndex:0];
+    }
     [g_inflight_cbs addObject:cb];
     myds_metal_residency_keep_alive();
     [cb commit];
     g_batch_commit_count++;
-    return 1;
+    return ok;
 }
 
 int myds_metal_signal_event(uint64_t *out_val) {
@@ -3473,6 +3482,7 @@ struct v41_hc_sum_rmsnorm_args {
     float    eps;
     int32_t  round_bf16;
     int32_t  has_sum_out;
+    uint64_t weight_stride_bytes;
 };
 
 int myds_metal_v41_hc_sum_rmsnorm(
@@ -3495,6 +3505,7 @@ int myds_metal_v41_hc_sum_rmsnorm(
             .eps = eps,
             .round_bf16 = round_bf16 ? 1 : 0,
             .has_sum_out = sum_out ? 1 : 0,
+            .weight_stride_bytes = 16ull,
         };
         id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
         if (!cb) return 0;
@@ -3512,6 +3523,65 @@ int myds_metal_v41_hc_sum_rmsnorm(
         [enc setThreadgroupMemoryLength:32 * sizeof(float) atIndex:0];
         NSUInteger nth = 256;
         metal_dispatch(enc, "v41_hc_sum_rmsnorm", MTLSizeMake(1, 1, 1), MTLSizeMake(nth, 1, 1));
+        return v41_finish(cb, enc);
+    }
+}
+
+int myds_metal_v41_hc_sum_rmsnorm_batch(
+    myds_metal_buffer_t *norm_out,
+    myds_metal_buffer_t *sum_out,
+    const myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *norm_weight,
+    uint32_t dim,
+    uint32_t n_tok,
+    uint64_t weight_stride_bytes,
+    float eps,
+    bool round_bf16) {
+    if (!n_tok) return 1;
+    if (!g_initialized || !g_pso_v41_hc_sum_rmsnorm || !dim || dim % 128 ||
+        !isfinite(eps) || eps < 0 || !v41_floats(norm_out, (uint64_t)dim * n_tok) ||
+        !v41_floats(residual, 4ull * dim * n_tok) || !weights || !weights->mtl_buf ||
+        !v41_floats(norm_weight, dim) ||
+        (sum_out && !v41_floats(sum_out, (uint64_t)dim * n_tok))) return 0;
+
+    NSUInteger nth = 32;
+    while (nth < dim / 4u && nth < 1024u) nth *= 2;
+    if (nth > dim / 4u) nth = dim / 4u;
+    {
+        static int ov = -2;
+        if (__builtin_expect(ov == -2, 0)) {
+            const char *v = getenv("MYDS_RMS_NTH");
+            long n = v ? atol(v) : 0;
+            ov = (n > 0 && n <= 1024) ? (int)n : -1;
+        }
+        if (ov > 0) nth = (NSUInteger)ov;
+    }
+    if (nth > g_pso_v41_hc_sum_rmsnorm.maxTotalThreadsPerThreadgroup) return 0;
+
+    @autoreleasepool {
+        struct v41_hc_sum_rmsnorm_args args = {
+            .dim = dim,
+            .eps = eps,
+            .round_bf16 = round_bf16 ? 1 : 0,
+            .has_sum_out = sum_out ? 1 : 0,
+            .weight_stride_bytes = weight_stride_bytes ? weight_stride_bytes : 16ull,
+        };
+        id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
+        if (!enc) return 0;
+        if (g_batch_cb && g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        [enc setComputePipelineState:g_pso_v41_hc_sum_rmsnorm];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:residual->mtl_buf offset:residual->offset atIndex:1];
+        [enc setBuffer:weights->mtl_buf offset:weights->offset atIndex:2];
+        [enc setBuffer:norm_weight->mtl_buf offset:norm_weight->offset atIndex:3];
+        const myds_metal_buffer_t *s_buf = sum_out ? sum_out : norm_out;
+        [enc setBuffer:s_buf->mtl_buf offset:s_buf->offset atIndex:4];
+        [enc setBuffer:norm_out->mtl_buf offset:norm_out->offset atIndex:5];
+        [enc setThreadgroupMemoryLength:32 * sizeof(float) atIndex:0];
+        metal_dispatch(enc, "v41_hc_sum_rmsnorm_batch", MTLSizeMake(n_tok, 1, 1), MTLSizeMake(nth, 1, 1));
         return v41_finish(cb, enc);
     }
 }
@@ -3561,22 +3631,23 @@ int myds_metal_v41_hc_expand(myds_metal_buffer_t *out,
     return myds_metal_v41_hc_expand_round(out, block, residual, split, dim, 1);
 }
 
-int myds_metal_v41_moe_add_hc_expand(myds_metal_buffer_t *out,
+int myds_metal_v41_moe_add_hc_expand_batch(myds_metal_buffer_t *out,
     myds_metal_buffer_t *ffn_out, const myds_metal_buffer_t *moe_out,
     const myds_metal_buffer_t *shared_out, const myds_metal_buffer_t *residual,
-    const myds_metal_buffer_t *split, uint32_t dim) {
-    if (!g_initialized || !v41_floats(out, 4ull*dim) ||
-        !v41_floats(moe_out, dim) || !v41_floats(shared_out, dim) ||
-        !v41_floats(residual, 4ull*dim) || !v41_floats(split, 24)) return 0;
-    if (ffn_out && !v41_floats(ffn_out, dim)) return 0;
+    const myds_metal_buffer_t *split, uint32_t dim, uint32_t n_tok) {
+    if (!n_tok) return 1;
+    if (!g_initialized || !v41_floats(out, 4ull*dim*n_tok) ||
+        !v41_floats(moe_out, (uint64_t)dim*n_tok) || !v41_floats(shared_out, (uint64_t)dim*n_tok) ||
+        !v41_floats(residual, 4ull*dim*n_tok) || !v41_floats(split, 24ull*n_tok)) return 0;
+    if (ffn_out && !v41_floats(ffn_out, (uint64_t)dim*n_tok)) return 0;
     if (!g_pso_v41_moe_add_hc_expand) {
         myds_metal_buffer_t *fout = ffn_out ? ffn_out : out;
-        if (!myds_metal_v41_add_bf16(fout, moe_out, shared_out, dim)) return 0;
-        return myds_metal_v41_hc_expand(out, fout, residual, split, dim);
+        if (!myds_metal_v41_add_bf16(fout, moe_out, shared_out, dim * n_tok)) return 0;
+        return myds_metal_v41_hc_expand_batch(out, fout, residual, split, dim, n_tok);
     }
     @autoreleasepool {
         struct v41_hc_expand_args args = {
-            .n_embd=dim, .n_hc=4, .n_tokens=1,
+            .n_embd=dim, .n_hc=4, .n_tokens=n_tok,
             .nb_block0=4, .nb_block1=4ull*dim, .nb_add0=4, .nb_add1=4ull*dim,
             .nb_res0=4, .nb_res1=4ull*dim, .nb_res2=16ull*dim,
             .nb_post0=4, .nb_post1=96, .nb_comb0=4, .nb_comb1=16, .nb_comb2=96,
@@ -3603,9 +3674,18 @@ int myds_metal_v41_moe_add_hc_expand(myds_metal_buffer_t *out,
             [enc setBuffer:out->mtl_buf offset:out->offset atIndex:7];
         }
         NSUInteger nth = MIN((NSUInteger)256, (NSUInteger)dim);
-        metal_dispatch(enc, "v41_moe_add_hc_expand", MTLSizeMake((dim+nth-1)/nth, 1, 1), MTLSizeMake(nth, 1, 1));
+        uint64_t total_elements = (uint64_t)dim * n_tok;
+        metal_dispatch(enc, n_tok == 1 ? "v41_moe_add_hc_expand" : "v41_moe_add_hc_expand_batch",
+            MTLSizeMake((total_elements+nth-1)/nth, 1, 1), MTLSizeMake(nth, 1, 1));
         return v41_finish(cb, enc);
     }
+}
+
+int myds_metal_v41_moe_add_hc_expand(myds_metal_buffer_t *out,
+    myds_metal_buffer_t *ffn_out, const myds_metal_buffer_t *moe_out,
+    const myds_metal_buffer_t *shared_out, const myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *split, uint32_t dim) {
+    return myds_metal_v41_moe_add_hc_expand_batch(out, ffn_out, moe_out, shared_out, residual, split, dim, 1);
 }
 
 
@@ -5166,19 +5246,23 @@ struct ds4_metal_args_mul_mm {
     /* 追加在末尾：0 表示原来的紧凑布局（dst 行步长 = ne0）。 */
     uint64_t nb_out;
     uint64_t nb_out_batch;
+    int32_t  round_bf16;
+    int32_t  pad_mm;
 };
 
-int myds_metal_mul_mm(
+int myds_metal_mul_mm_ext(
     myds_metal_buffer_t       *dst,
     const myds_metal_buffer_t *W,
     const myds_metal_buffer_t *src1,
     uint32_t                   out_dim,
     uint32_t                   in_dim,
     uint32_t                   n_tok,
-    ggml_type                  weight_type) {
+    ggml_type                  weight_type,
+    bool                       round_bf16) {
     if (!dst || !W || !src1 || out_dim == 0 || in_dim == 0 || n_tok == 0) return 0;
     if (n_tok == 1) {
-        return myds_metal_gemv(dst, W, src1, out_dim, in_dim, weight_type);
+        int ok = myds_metal_gemv(dst, W, src1, out_dim, in_dim, weight_type);
+        return ok && (!round_bf16 || myds_metal_v41_bf16(dst, out_dim));
     }
 
     const bool bc_inp = (in_dim % 32u) != 0;
@@ -5225,6 +5309,7 @@ int myds_metal_mul_mm(
             args.ne1 = (int32_t)n_tok;
             args.r2 = 1;
             args.r3 = 1;
+            args.round_bf16 = round_bf16 ? 1 : 0;
 
             id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
             id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
@@ -5233,7 +5318,7 @@ int myds_metal_mul_mm(
             [enc setBuffer:W->mtl_buf offset:(W ? W->offset : 0) atIndex:1];
             [enc setBuffer:src1->mtl_buf offset:(src1 ? src1->offset : 0) atIndex:2];
             [enc setBuffer:dst->mtl_buf offset:(dst ? dst->offset : 0) atIndex:3];
-            uint32_t tg_mem = (weight_type == GGML_TYPE_F32) ? 12288u : (bc_out ? 8192u : 6144u);
+            uint32_t tg_mem = (weight_type == GGML_TYPE_F32) ? 12288u : ((bc_out || round_bf16) ? 8192u : 6144u);
             [enc setThreadgroupMemoryLength:tg_mem atIndex:0];
             metal_dispatch(enc, "gemm_batch", MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
                                                   ((NSUInteger)out_dim + 63u) / 64u,
@@ -5269,7 +5354,18 @@ int myds_metal_mul_mm(
             return 0;
         }
     }
-    return 1;
+    return !round_bf16 || myds_metal_v41_bf16(dst, out_dim * n_tok);
+}
+
+int myds_metal_mul_mm(
+    myds_metal_buffer_t       *dst,
+    const myds_metal_buffer_t *W,
+    const myds_metal_buffer_t *src1,
+    uint32_t                   out_dim,
+    uint32_t                   in_dim,
+    uint32_t                   n_tok,
+    ggml_type                  weight_type) {
+    return myds_metal_mul_mm_ext(dst, W, src1, out_dim, in_dim, n_tok, weight_type, false);
 }
 
 /* 分组矩阵乘：一组一个权重矩阵，所有组在【一次】派发里完成。
@@ -5286,7 +5382,7 @@ int myds_metal_mul_mm(
  *
  * 各组之间的偏移分别落在 nb13（输入）、nb03（权重）、nb_out_batch（输出）上，
  * 因此 tgpig.z 就是组号，内核本身不需要循环。 */
-int myds_metal_mul_mm_grouped(
+int myds_metal_mul_mm_grouped_ext(
     myds_metal_buffer_t       *dst,
     const myds_metal_buffer_t *W,
     const myds_metal_buffer_t *src1,
@@ -5294,7 +5390,8 @@ int myds_metal_mul_mm_grouped(
     uint32_t                   in_dim,
     uint32_t                   n_groups,
     uint32_t                   n_tok,
-    ggml_type                  weight_type) {
+    ggml_type                  weight_type,
+    bool                       round_bf16) {
     if (!dst || !W || !src1 || !out_dim || !in_dim || !n_groups || !n_tok) return 0;
 
     const bool bc_inp = (in_dim % 32u) != 0;
@@ -5343,6 +5440,7 @@ int myds_metal_mul_mm_grouped(
         args.r3 = 1;
         args.nb_out = (uint64_t)n_groups * out_dim;     /* 输出的 token 行步长 */
         args.nb_out_batch = out_dim;                    /* 输出行内组的偏移 */
+        args.round_bf16 = round_bf16 ? 1 : 0;
 
         id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
@@ -5351,7 +5449,7 @@ int myds_metal_mul_mm_grouped(
         [enc setBuffer:W->mtl_buf offset:W->offset atIndex:1];
         [enc setBuffer:src1->mtl_buf offset:src1->offset atIndex:2];
         [enc setBuffer:dst->mtl_buf offset:dst->offset atIndex:3];
-        uint32_t tg_mem = (weight_type == GGML_TYPE_F32) ? 12288u : (bc_out ? 8192u : 6144u);
+        uint32_t tg_mem = (weight_type == GGML_TYPE_F32) ? 12288u : ((bc_out || round_bf16) ? 8192u : 6144u);
         [enc setThreadgroupMemoryLength:tg_mem atIndex:0];
         metal_dispatch(enc, "gemm_grouped", MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
                                               ((NSUInteger)out_dim + 63u) / 64u,
@@ -5369,6 +5467,18 @@ int myds_metal_mul_mm_grouped(
         }
         return 1;
     }
+}
+
+int myds_metal_mul_mm_grouped(
+    myds_metal_buffer_t       *dst,
+    const myds_metal_buffer_t *W,
+    const myds_metal_buffer_t *src1,
+    uint32_t                   out_dim,
+    uint32_t                   in_dim,
+    uint32_t                   n_groups,
+    uint32_t                   n_tok,
+    ggml_type                  weight_type) {
+    return myds_metal_mul_mm_grouped_ext(dst, W, src1, out_dim, in_dim, n_groups, n_tok, weight_type, false);
 }
 
 struct ds4_metal_args_mul_mv_id {

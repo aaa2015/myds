@@ -105,6 +105,9 @@ void myds_engram_reset(myds_engram_t *engram);
  * BF16 rounded, followed by the native Metal Engram gate/add at layers 1/14. */
 bool myds_engram_prepare_token(myds_engram_t *engram, int32_t token,
                               uint64_t position);
+bool myds_engram_prepare_batch(myds_engram_t *engram, const int32_t *tokens,
+                              size_t count, uint64_t start_position,
+                              float *out_layer0, float *out_layer1);
 
 /* Small CPU mathematical oracle for the native GPU gate/add. It is not a
  * production projection path. residual=[4,width], kv=[5,width], q/k=[4,width]. */

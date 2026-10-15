@@ -2174,6 +2174,113 @@ kernel void kernel_glm_indexer_score_chunk_direct(
     }
 }
 
+/* 16×8 分块版精确 chunk indexer 打分内核：
+ * - 每个线程组 (32, 4, 1) = 4 个 simdgroup，共负责 16 个压缩键行（每 simdgroup 4 行，常驻寄存器 k_reg[4]）
+ *   × 8 个查询 token（在线程组共享内存 qtg/wtg 中被全部 16 个压缩键行复用）。
+ * - 压缩键读取带宽降低 8×，查询 Q/weights 读取带宽降低 16×，线程组数量减少 128×。
+ * - 每个 (tok, row) 对内的 lane 级 float4 dot、simd_sum(s) 以及 head = 0..31 顺序累加
+ *   与 kernel_glm_indexer_score_chunk_direct 100% 逐位全同（bit-exact）。 */
+kernel void kernel_myds_indexer_score_chunk_exact(
+        constant ds4_metal_args_glm_indexer_score_chunk & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2 tgpid [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    const uint row_base = tgpid.x * 16u;
+    const uint tok_base = tgpid.y * 8u;
+    if (row_base >= args.n_rows || tok_base >= args.n_tokens ||
+        args.n_head != 32u || args.head_dim != 128u) {
+        return;
+    }
+
+    const uint last_tok = min(tok_base + 8u, args.n_tokens);
+    const uint tile_tokens = last_tok - tok_base;
+    const uint max_vis = (args.causal_start + (last_tok - 1u) + 1u) / args.causal_ratio;
+
+    /* 整块因果早退：若本 tile 的起始压缩键行已超出最后一行 token 的可见上限，直接写 -INF 返回 */
+    if (row_base >= max_vis) {
+        const uint cell_t = (uint)tid >> 4;
+        const uint cell_c = (uint)tid & 15u;
+        const uint cell_tok = tok_base + cell_t;
+        const uint cell_row = row_base + cell_c;
+        if (cell_tok < args.n_tokens && cell_row < args.n_rows) {
+            scores[(uint64_t)cell_tok * args.n_rows + cell_row] = -INFINITY;
+        }
+        return;
+    }
+
+    float4 k_reg[4];
+    const uint sg_row0 = row_base + (uint)sg * 4u;
+    FOR_UNROLL (uint r = 0; r < 4u; r++) {
+        const uint row = sg_row0 + r;
+        if (row < args.n_rows && row < max_vis) {
+            const uint64_t base_idx = (uint64_t)row * 128u + (uint)lane * 4u;
+            k_reg[r] = float4(
+                glm_cache_load_f32_or_f16(indexer_key_cache, base_idx + 0u, args.cache_f16),
+                glm_cache_load_f32_or_f16(indexer_key_cache, base_idx + 1u, args.cache_f16),
+                glm_cache_load_f32_or_f16(indexer_key_cache, base_idx + 2u, args.cache_f16),
+                glm_cache_load_f32_or_f16(indexer_key_cache, base_idx + 3u, args.cache_f16));
+        } else {
+            k_reg[r] = float4(0.0f);
+        }
+    }
+
+    threadgroup float4 *qtg = (threadgroup float4 *)shared;       /* 256 float4 = 1024 floats */
+    threadgroup float  *wtg = (threadgroup float *)(qtg + 256u);  /* 256 floats */
+
+    for (uint i = tid; i < tile_tokens * 32u; i += 128u) {
+        const uint t = i >> 5;
+        const uint h = i & 31u;
+        const uint tok = tok_base + t;
+        wtg[i] = weights[(uint64_t)tok * 32u + h];
+    }
+
+    float acc = 0.0f;
+    const uint q_vec_count = tile_tokens * 32u;
+
+    for (uint head = 0; head < 32u; head++) {
+        for (uint i = tid; i < q_vec_count; i += 128u) {
+            const uint t = i >> 5;
+            const uint l = i & 31u;
+            const uint tok = tok_base + t;
+            device const float4 *q4_ptr = (device const float4 *)(q +
+                ((uint64_t)tok * 32u + head) * 128u * sizeof(float));
+            qtg[i] = q4_ptr[l];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint t = 0; t < tile_tokens; t++) {
+            const uint vis_t = (args.causal_start + tok_base + t + 1u) / args.causal_ratio;
+            if (sg_row0 >= vis_t) continue;
+            const float4 q4 = qtg[t * 32u + (uint)lane];
+            const float w = wtg[t * 32u + head];
+            FOR_UNROLL (uint r = 0; r < 4u; r++) {
+                float s = dot(q4, k_reg[r]);
+                s = simd_sum(s);
+                const float contrib = max(s * args.scale, 0.0f) * w;
+                if ((uint)lane == (t * 4u + r)) {
+                    acc += contrib;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const uint out_t = (uint)lane >> 2;
+    const uint out_r = (uint)lane & 3u;
+    const uint out_tok = tok_base + out_t;
+    const uint out_row = sg_row0 + out_r;
+    if (out_tok < args.n_tokens && out_row < args.n_rows) {
+        const uint vis = (args.causal_start + out_tok + 1u) / args.causal_ratio;
+        scores[(uint64_t)out_tok * args.n_rows + out_row] = (out_row < vis) ? acc : -INFINITY;
+    }
+}
+
 kernel void kernel_glm_indexer_scores_batch(
         constant ds4_metal_args_glm_indexer_scores_batch & args,
         device const char *q,

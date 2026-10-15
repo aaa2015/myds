@@ -148,7 +148,7 @@ struct myds_v41_context {
     myds_metal_buffer_t *prompt_pre;
     myds_metal_buffer_t *prompt_selected;
     myds_metal_buffer_t *prompt_block_mask;
-    float *prompt_engram[2];
+    myds_metal_buffer_t *prompt_engram_buf[2];
     uint32_t prompt_tokens_cap;
     size_t prompt_mask_bytes_cap;
 };
@@ -2625,8 +2625,8 @@ void myds_v41_context_free(myds_v41_context_t *g) {
     if (g->prompt_pre) myds_metal_buffer_free(g->prompt_pre);
     if (g->prompt_selected) myds_metal_buffer_free(g->prompt_selected);
     if (g->prompt_block_mask) myds_metal_buffer_free(g->prompt_block_mask);
-    if (g->prompt_engram[0]) free(g->prompt_engram[0]);
-    if (g->prompt_engram[1]) free(g->prompt_engram[1]);
+    if (g->prompt_engram_buf[0]) myds_metal_buffer_free(g->prompt_engram_buf[0]);
+    if (g->prompt_engram_buf[1]) myds_metal_buffer_free(g->prompt_engram_buf[1]);
     v41_chunk_workspace_free(g->chunk_ws);
     v41_batch2_workspace_free(g->batch2_ws);
     myds_v41_gpu_scratch_free(g->gpu); myds_engram_free(g->engram); free(g);
@@ -2834,15 +2834,12 @@ static int project_batch(myds_metal_buffer_t *out, const myds_metal_buffer_t *w,
         const uint32_t mm_min = mm_min_m();
         if (mm_min && rows < mm_min) use_mm = 0;   /* 小 M：MM 的 64 行 tile 会退化成单块 */
     }
-    int ok = 0;
-    if (use_mm) {
-        ok = myds_metal_mul_mm(out, w, in, rows, width, n_tok, type);
+    if (use_mm && myds_metal_mul_mm_ext(out, w, in, rows, width, n_tok, type, round)) {
+        return 1;
     }
-    if (!ok) {
-        ok = ((type == GGML_TYPE_F16 || type == GGML_TYPE_F32)
-            ? myds_metal_v41_gemv_batch(out, w, in, rows, width, n_tok, type)
-            : myds_metal_gemv_batch(out, w, in, rows, width, n_tok, type));
-    }
+    int ok = ((type == GGML_TYPE_F16 || type == GGML_TYPE_F32)
+        ? myds_metal_v41_gemv_batch(out, w, in, rows, width, n_tok, type)
+        : myds_metal_gemv_batch(out, w, in, rows, width, n_tok, type));
     return ok && (!round || myds_metal_v41_bf16(out, rows * n_tok));
 }
 
@@ -5998,6 +5995,7 @@ struct v41_chunk_workspace_s {
     myds_metal_buffer_t *pre_view[V41_MAX_CHUNK];
     myds_metal_buffer_t *cur_res_view;
     myds_metal_buffer_t *cur_pre_view;
+    myds_metal_buffer_t *cur_engram_view[2];
     myds_metal_buffer_t *cur_selected_view;
     myds_metal_buffer_t *cur_mask_view;
     /* 批量 indexer 用的分组视图（整 chunk 缓冲 / 提示缓冲按子组切片） */
@@ -6092,6 +6090,8 @@ static void v41_chunk_workspace_free(v41_chunk_workspace_t *cw) {
     if (cw->layer_out_buf) myds_metal_buffer_free(cw->layer_out_buf);
     if (cw->cur_res_view) myds_metal_buffer_free(cw->cur_res_view);
     if (cw->cur_pre_view) myds_metal_buffer_free(cw->cur_pre_view);
+    if (cw->cur_engram_view[0]) myds_metal_buffer_free(cw->cur_engram_view[0]);
+    if (cw->cur_engram_view[1]) myds_metal_buffer_free(cw->cur_engram_view[1]);
     if (cw->cur_selected_view) myds_metal_buffer_free(cw->cur_selected_view);
     if (cw->cur_mask_view) myds_metal_buffer_free(cw->cur_mask_view);
     if (cw->cur_index_q_view) myds_metal_buffer_free(cw->cur_index_q_view);
@@ -6263,6 +6263,8 @@ static v41_chunk_workspace_t *v41_chunk_workspace_create(uint32_t capacity, uint
     }
     cw->cur_res_view = myds_metal_buffer_create_view();
     cw->cur_pre_view = myds_metal_buffer_create_view();
+    cw->cur_engram_view[0] = myds_metal_buffer_create_view();
+    cw->cur_engram_view[1] = myds_metal_buffer_create_view();
     cw->cur_selected_view = myds_metal_buffer_create_view();
     cw->cur_mask_view = myds_metal_buffer_create_view();
     cw->cur_index_q_view = myds_metal_buffer_create_view();
@@ -6271,7 +6273,8 @@ static v41_chunk_workspace_t *v41_chunk_workspace_create(uint32_t capacity, uint
     cw->shared_view = myds_metal_buffer_create_view();
     cw->after_view = myds_metal_buffer_create_view();
     cw->split_view = myds_metal_buffer_create_view();
-    if (!cw->cur_res_view || !cw->cur_pre_view || !cw->cur_selected_view || !cw->cur_mask_view ||
+    if (!cw->cur_res_view || !cw->cur_pre_view || !cw->cur_engram_view[0] || !cw->cur_engram_view[1] ||
+        !cw->cur_selected_view || !cw->cur_mask_view ||
         !cw->cur_index_q_view || !cw->cur_index_weights_view ||
         !cw->moe_view || !cw->shared_view || !cw->after_view || !cw->split_view) goto fail;
     return cw;
@@ -6411,7 +6414,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 
     /* 复用 prompt 级工作区（按 macroblock 容量分配，避免长请求每次 prefill 申请释放上吉字节引发抖动） */
     const bool prompt_ws_complete = g->prompt_res && g->prompt_pre && g->prompt_selected &&
-                                    g->prompt_block_mask && g->prompt_engram[0] && g->prompt_engram[1];
+                                    g->prompt_block_mask && g->prompt_engram_buf[0] && g->prompt_engram_buf[1];
     uint32_t cap = (mb_cap_needed + 511u) / 512u * 512u;
     if (!prompt_ws_complete || g->prompt_tokens_cap < cap || g->prompt_mask_bytes_cap < mask_bytes) {
         size_t cap_res_size = (size_t)cap * 4u * V41_DIM;
@@ -6419,16 +6422,16 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         myds_metal_buffer_t *n_pre = myds_metal_buffer_alloc((size_t)cap * pre_tok_bytes);
         myds_metal_buffer_t *n_selected = myds_metal_buffer_alloc((size_t)cap * sel_bytes);
         myds_metal_buffer_t *n_block_mask = myds_metal_buffer_alloc((size_t)cap * mask_bytes);
-        float *n_engram0 = (float *)malloc((size_t)cap * MYDS_ENGRAM_INPUT_DIM * sizeof(float));
-        float *n_engram1 = (float *)malloc((size_t)cap * MYDS_ENGRAM_INPUT_DIM * sizeof(float));
+        myds_metal_buffer_t *n_engram0 = myds_metal_buffer_alloc((size_t)cap * MYDS_ENGRAM_INPUT_DIM * sizeof(float));
+        myds_metal_buffer_t *n_engram1 = myds_metal_buffer_alloc((size_t)cap * MYDS_ENGRAM_INPUT_DIM * sizeof(float));
 
         if (!n_res || !n_pre || !n_selected || !n_block_mask || !n_engram0 || !n_engram1) {
             if (n_res) myds_metal_buffer_free(n_res);
             if (n_pre) myds_metal_buffer_free(n_pre);
             if (n_selected) myds_metal_buffer_free(n_selected);
             if (n_block_mask) myds_metal_buffer_free(n_block_mask);
-            if (n_engram0) free(n_engram0);
-            if (n_engram1) free(n_engram1);
+            if (n_engram0) myds_metal_buffer_free(n_engram0);
+            if (n_engram1) myds_metal_buffer_free(n_engram1);
             MYDS_LOG_E("V4.1 prefill failed to allocate workspace buffers (cap=%u)", cap);
             return -1;
         }
@@ -6438,15 +6441,15 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         if (g->prompt_pre) myds_metal_buffer_free(g->prompt_pre);
         if (g->prompt_selected) myds_metal_buffer_free(g->prompt_selected);
         if (g->prompt_block_mask) myds_metal_buffer_free(g->prompt_block_mask);
-        if (g->prompt_engram[0]) free(g->prompt_engram[0]);
-        if (g->prompt_engram[1]) free(g->prompt_engram[1]);
+        if (g->prompt_engram_buf[0]) myds_metal_buffer_free(g->prompt_engram_buf[0]);
+        if (g->prompt_engram_buf[1]) myds_metal_buffer_free(g->prompt_engram_buf[1]);
 
         g->prompt_res = n_res;
         g->prompt_pre = n_pre;
         g->prompt_selected = n_selected;
         g->prompt_block_mask = n_block_mask;
-        g->prompt_engram[0] = n_engram0;
-        g->prompt_engram[1] = n_engram1;
+        g->prompt_engram_buf[0] = n_engram0;
+        g->prompt_engram_buf[1] = n_engram1;
         g->prompt_tokens_cap = cap;
         g->prompt_mask_bytes_cap = mask_bytes;
     }
@@ -6455,7 +6458,11 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     myds_metal_buffer_t *prompt_pre = g->prompt_pre;
     myds_metal_buffer_t *prompt_selected = g->prompt_selected;
     myds_metal_buffer_t *prompt_block_mask = g->prompt_block_mask;
-    float *engram_all[2] = { g->prompt_engram[0], g->prompt_engram[1] };
+    myds_metal_buffer_t *prompt_engram_buf[2] = { g->prompt_engram_buf[0], g->prompt_engram_buf[1] };
+    float *engram_all[2] = {
+        (float *)myds_metal_buffer_data(prompt_engram_buf[0]),
+        (float *)myds_metal_buffer_data(prompt_engram_buf[1])
+    };
 
     if (!prompt_res || !prompt_pre || !prompt_selected || !prompt_block_mask ||
         !engram_all[0] || !engram_all[1] || !cw) {
@@ -6547,6 +6554,8 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 #define TIME_START() do { if (do_prof) gettimeofday(&ptv0, NULL); } while(0)
 #define TIME_ACC(acc) do { if (do_prof) { gettimeofday(&ptv1, NULL); acc += (ptv1.tv_sec - ptv0.tv_sec) * 1000.0 + (ptv1.tv_usec - ptv0.tv_usec) / 1000.0; } } while(0)
 
+    const bool opt_shrink_macroblock = (getenv("MYDS_SUFFIX_SHRINK_MACROBLOCK") != NULL);
+    const bool opt_sync_chunk = (getenv("MYDS_PREFILL_SYNC_CHUNK") != NULL);
     uint32_t il = 0;
     int idx_fallback_warned = 0;   /* 批量 indexer 回退只提示一次 */
     const char *phase = "engram prepare";
@@ -6560,58 +6569,85 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         uint32_t mb_len = n_tokens - mb_start;
         if (mb_len > macroblock_size) mb_len = macroblock_size;
         const uint32_t mb_base_pos = base_pos + mb_start;
+        const uint32_t mb_end = mb_base_pos + mb_len;
+        const uint32_t total_eff = (shrink_shift == 0u && !opt_shrink_macroblock)
+                                   ? (base_pos + n_tokens) : mb_end;
+        const uint32_t sub_39 = 1u + shrink_shift;
+        const uint32_t s_global_39 = (total_eff > sub_39) ? total_eff - sub_39 : 0u;
+        const uint32_t s_clamped_39 = s_global_39 < mb_base_pos ? mb_base_pos
+                                    : (s_global_39 > mb_end ? mb_end : s_global_39);
 
         phase = "engram prepare";
         TIME_START();
-        for (uint32_t t = 0; t < mb_len; t++) {
-            uint32_t pos = mb_base_pos + t;
-            if (!myds_engram_prepare_token(g->engram, tokens[mb_start + t], (uint64_t)pos)) {
+        for (uint32_t t = 0; t < mb_len; ) {
+            const uint32_t pos = mb_base_pos + t;
+            uint32_t step = mb_len - t;
+            const uint32_t next_snap = ((pos / V41_SNAP_STRIDE) + 1u) * V41_SNAP_STRIDE;
+            if (next_snap - pos < step) step = next_snap - pos;
+            if (step > 64u) step = 64u;
+            if (!myds_engram_prepare_batch(g->engram, tokens + mb_start + t, step, (uint64_t)pos,
+                    engram_all[0] + (size_t)t * MYDS_ENGRAM_INPUT_DIM,
+                    engram_all[1] + (size_t)t * MYDS_ENGRAM_INPUT_DIM)) {
                 MYDS_LOG_E("V4.1 engram prepare failed at pos %u", pos);
                 goto fail;
             }
-            snapshot_store_engram(g, pos + 1u, (mb_start + t + 1u) == n_tokens);   /* 处理完 pos ⇒ 已推进到 pos+1 */
-            memcpy(engram_all[0] + (size_t)t * MYDS_ENGRAM_INPUT_DIM,
-                   g->engram->row_values[0], MYDS_ENGRAM_INPUT_DIM * sizeof(float));
-            memcpy(engram_all[1] + (size_t)t * MYDS_ENGRAM_INPUT_DIM,
-                   g->engram->row_values[1], MYDS_ENGRAM_INPUT_DIM * sizeof(float));
+            const uint32_t sp_eng = pos + step;
+            if (!suffix_shrink || sp_eng > s_clamped_39) {
+                snapshot_store_engram(g, sp_eng, (mb_start + t + step) == n_tokens);
+            }
+            t += step;
         }
         TIME_ACC(prof_engram);
 
         phase = "embedding lookup";
         TIME_START();
         const uint16_t *embd_table = (const uint16_t *)myds_metal_buffer_data(m->tok_embeddings);
+        float *prompt_res_f32 = (float *)myds_metal_buffer_data(prompt_res);
+        float *prompt_pre_f32 = (float *)myds_metal_buffer_data(prompt_pre);
         for (uint32_t t = 0; t < mb_len; t++) {
             int32_t tok = tokens[mb_start + t];
             if (tok < 0 || (uint32_t)tok >= m->vocab_size) {
                 MYDS_LOG_E("V4.1 invalid token %d at pos %u", tok, mb_base_pos + t);
                 goto fail;
             }
-            float r[4 * V41_DIM];
-            if (v41_image_embedding_at(ctx, mb_base_pos + t, r, V41_DIM)) {
-                /* 图片块：该位置的向量来自注入（上面已填 r[0..V41_DIM)）*/
-                const uint16_t *unused_row = embd_table;   /* 仅为保持下方代码结构清晰 */
-                (void)unused_row;
-                for (uint32_t j = 0; j < V41_DIM; j++) {
-                    r[j + V41_DIM] = r[j];
-                    r[j + 2 * V41_DIM] = r[j];
-                    r[j + 3 * V41_DIM] = r[j];
-                }
+            float *dst_r = prompt_res_f32 + (size_t)t * 4u * V41_DIM;
+            if (v41_image_embedding_at(ctx, mb_base_pos + t, dst_r, V41_DIM)) {
+                /* 图片块：该位置的向量来自注入（上面已填 dst_r[0..V41_DIM)）*/
+                memcpy(dst_r + V41_DIM, dst_r, V41_DIM * sizeof(float));
+                memcpy(dst_r + 2 * V41_DIM, dst_r, V41_DIM * sizeof(float));
+                memcpy(dst_r + 3 * V41_DIM, dst_r, V41_DIM * sizeof(float));
             } else {
                 const uint16_t *row = embd_table + (size_t)tok * V41_DIM;
+                float *r0 = dst_r;
+                float *r1 = dst_r + V41_DIM;
+                float *r2 = dst_r + 2 * V41_DIM;
+                float *r3 = dst_r + 3 * V41_DIM;
+#if defined(__ARM_NEON)
+                for (uint32_t j = 0; j < V41_DIM; j += 8) {
+                    float16x8_t h = vld1q_f16((const __fp16 *)(row + j));
+                    float32x4_t f_lo = vcvt_f32_f16(vget_low_f16(h));
+                    float32x4_t f_hi = vcvt_f32_f16(vget_high_f16(h));
+                    vst1q_f32(r0 + j, f_lo); vst1q_f32(r0 + j + 4, f_hi);
+                    vst1q_f32(r1 + j, f_lo); vst1q_f32(r1 + j + 4, f_hi);
+                    vst1q_f32(r2 + j, f_lo); vst1q_f32(r2 + j + 4, f_hi);
+                    vst1q_f32(r3 + j, f_lo); vst1q_f32(r3 + j + 4, f_hi);
+                }
+#else
                 for (uint32_t j = 0; j < V41_DIM; j++) {
                     float v_emb = myds_fp16_to_fp32(row[j]);
-                    r[j] = v_emb;
-                    r[j + V41_DIM] = v_emb;
-                    r[j + 2 * V41_DIM] = v_emb;
-                    r[j + 3 * V41_DIM] = v_emb;
+                    r0[j] = v_emb;
+                    r1[j] = v_emb;
+                    r2[j] = v_emb;
+                    r3[j] = v_emb;
                 }
+#endif
             }
-            const float initial_pre[24] = {1.0f, 0.0f, 0.0f, 0.0f};
-            if (!myds_metal_buffer_write(prompt_res, (size_t)t * res_tok_bytes, r, res_tok_bytes)) goto fail;
-            if (!myds_metal_buffer_write(prompt_pre, (size_t)t * pre_tok_bytes, initial_pre, pre_tok_bytes)) goto fail;
+            float *dst_pre = prompt_pre_f32 + (size_t)t * 24u;
+            memset(dst_pre, 0, 24u * sizeof(float));
+            dst_pre[0] = 1.0f;
 
             if (batch_trace_prefix) {
-                memcpy(myds_metal_buffer_data(g->residual), r, res_tok_bytes);
+                memcpy(myds_metal_buffer_data(g->residual), dst_r, res_tok_bytes);
                 if (!myds_trace_f32("embedding", 0, mb_base_pos + t, g->residual, 4 * V41_DIM)) goto fail;
             }
         }
@@ -6626,39 +6662,30 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             const bool compressed = ratio_for(il) != 0;
             moe_off = 0;
 
-            /* ── 后缀收缩：本层只处理因果锥内的尾部行 ────────────────────────────
-             * 参考点取【本 macroblock 的末尾】B（不是整条 prompt 的末尾）：
-             *   层 il 的输出只覆盖 [S(il), B)，S(il) = B - (1 + (39-il)*127) - shift；
-             *   [A, S(il)) 这段只算 KV（填窗口环）—— 它是「进入 S 时的 carry 引导」。
-             *   shift = 0 时引导段从 S(il)-127 起跳（6a 原样）；shift > 0 时从 A 起跳。
-             * 取 B 的理由：每个 macroblock 都要把最后一层的窗口环推进到自己的末尾，
-             * 供下一个 macroblock 的 carry 使用；「相对 B 的锥」恰好同时满足
-             * 「KV 环维护」与「正确性」—— 因为 S(il-1) = S(il) - 127，上一层的输出
-             * 范围天生比本层宽 127 行，正好覆盖本层进入 S 所需的输入。
-             * 短 macroblock（B-A 小于锥宽）⇒ s 被夹到 A ⇒ 整块全量，等价于关掉收缩。 */
-            const uint32_t total_eff = mb_base_pos + mb_len;
+            /* ── 后缀收缩：本层只处理全局因果锥内的尾部行 ────────────────────────────
+             * shift=0（默认）时参考点取【整条 prompt 的末尾】（base_pos + n_tokens）：
+             *   层 il 的全量段全局起点 S_global(il) = total_eff - (1 + (39-il)*127)，
+             *   KV 引导段全局起点 SKV_global(il) = S_global(il) - 127 = S_global(il-1)。
+             *   将两者分别夹到当前 macroblock [A, B] 上：
+             *     - 在早期的 macroblock（SKV_global(il) >= B）中，层 21..39 整块跳过（sh_loop_rel = mb_len）；
+             *     - 层 20 仍从 sh_loop_rel = 0 跑 kv_only 以填充全局压缩 KV 与索引缓存；
+             *     - 跨 macroblock 边界时，上一块末尾与下一块开头的 kv_only 段精确拼接满 127 行窗口环。 */
             const uint32_t sh_need = 1u + (V41_LAYERS - 1u - il) * 127u;
             const bool shrink_layer = suffix_shrink && il >= 20u;
-            /* 本层窗口环在 p 处【内容有效】的边界：p ≥ s(il)+1（s(il) = A + sh_full_rel）。
-             * 推导：环在 p 处装着 [p-128,p-1] 的 KV，要它们全对，这些行的输入残差必须都由
-             * 层 il-1 的【全量段】写出；层 il-1 的全量段起点 = s(il)-127
-             * ⇒ p-128 ≥ s(il)-127 ⇒ p ≥ s(il)+1。
-             * 发布要求【全部 40 层】都存过同一个 p ⇒ 全局紧界 = s(39)+1 = B - shift
-             * （s(39) = max(mb_base, B-1-shift)）；shift=0 时就是 B ⇒ 只有
-             * macroblock 末尾/序列末尾能发布（即 6a 行为；锥被夹到 A 时所有层都
-             * 满足 p ≥ A+1，与 6a 一样在各网格点发布 —— 那时整块都是全量，环本来就对）。 */
             const uint32_t sh_valid_from = (total_eff > shrink_shift) ? total_eff - shrink_shift : 0u;
             uint32_t sh_loop_rel = 0, sh_full_rel = 0;
             if (shrink_layer) {
                 const uint32_t sub = sh_need + shrink_shift;
-                uint32_t s = (total_eff > sub) ? total_eff - sub : 0u;
+                const uint32_t s_global = (total_eff > sub) ? total_eff - sub : 0u;
+                uint32_t s = s_global;
                 if (s < mb_base_pos) s = mb_base_pos;
+                if (s > mb_end) s = mb_end;
                 sh_full_rel = s - mb_base_pos;
                 if (shrink_shift == 0u) {
-                    /* 默认（6a）路径：前置段只从 S(il)-127 起跳（层 20 从 A）。
-                     * 与已验证的 6a 逐位一致，且不多算任何 KV。 */
-                    uint32_t skv = (s > 127u) ? s - 127u : 0u;
+                    const uint32_t skv_global = (s_global > 127u) ? s_global - 127u : 0u;
+                    uint32_t skv = skv_global;
                     if (skv < mb_base_pos) skv = mb_base_pos;
+                    if (skv > mb_end) skv = mb_end;
                     sh_loop_rel = (il == 20u) ? 0u : (skv - mb_base_pos);
                 }
                 /* shift>0：sh_loop_rel = 0 ⇒ 前置段从 A 起跑；A 是 STRIDE 的倍数，
@@ -6679,11 +6706,6 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 if (cancel_flag && *cancel_flag) goto cancelled;
                 uint32_t c_len = mb_len - c_start;
                 if (c_len > chunk_size) c_len = chunk_size;
-                /* shift>0：chunk 末端还要落在【绝对位置】的 512 网格上 —— 快照点只可能存在于
-                 * 网格点，而上面那句「模式边界必须落在 chunk 边界」会把 chunk 切到非网格的
-                 * s(il) 上，之后的 chunk 就全部错位、再也发布不了快照（实测：shift=2048 时
-                 * 续跑点仍然退到 8192 —— 就是这个错位造成的）。默认（shift=0）不动，
-                 * 保持 6a 行为（那时的错位恰好让中途快照发布不了，是我们想要的）。 */
                 if (shrink_shift) {
                     const uint32_t abs0 = mb_base_pos + c_start;
                     const uint32_t grid = ((abs0 + c_len) / V41_SNAP_STRIDE) * V41_SNAP_STRIDE;
@@ -6699,8 +6721,8 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 
                 if (il == 1 || il == 14) {
                     uint32_t e = (il == 1 ? 0 : 1);
-                    CHECK(myds_metal_buffer_write(cw->engram_rows_buf[e], 0,
-                        engram_all[e] + (size_t)c_start * MYDS_ENGRAM_INPUT_DIM,
+                    CHECK(myds_metal_buffer_update_sub_view(cw->cur_engram_view[e], prompt_engram_buf[e],
+                        (size_t)c_start * MYDS_ENGRAM_INPUT_DIM * sizeof(float),
                         (size_t)c_len * MYDS_ENGRAM_INPUT_DIM * sizeof(float)));
                 }
 
@@ -6732,11 +6754,15 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     int e_batched = 0;
                     if (!opt_disable_mm_engram)
                         e_batched = myds_metal_mul_mm(cw->engram_proj_buf[e], v->engram_proj[e],
-                            cw->engram_rows_buf[e], 5 * V41_DIM, MYDS_ENGRAM_INPUT_DIM, c_len, GGML_TYPE_F16);
+                            cw->cur_engram_view[e], 5 * V41_DIM, MYDS_ENGRAM_INPUT_DIM, c_len, GGML_TYPE_F16);
                     if (!e_batched) {
-                        for (uint32_t t = 0; t < c_len; t++)
+                        for (uint32_t t = 0; t < c_len; t++) {
+                            CHECK(myds_metal_buffer_update_sub_view(cw->engram_rows[e][t], prompt_engram_buf[e],
+                                (size_t)(c_start + t) * MYDS_ENGRAM_INPUT_DIM * sizeof(float),
+                                MYDS_ENGRAM_INPUT_DIM * sizeof(float)));
                             CHECK(project(cw->engram_proj_view[e][t], v->engram_proj[e], cw->engram_rows[e][t],
                                 5 * V41_DIM, MYDS_ENGRAM_INPUT_DIM, GGML_TYPE_F16, true));
+                        }
                     }
                     if (trace_on) {
                         for (uint32_t t = 0; t < c_len; t++) {
@@ -6769,10 +6795,15 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     }
                 }
 
-                CHECK(myds_metal_v41_hc_weighted_sum_batch(cw->x_buf, cw->cur_res_view, cw->cur_pre_view, V41_DIM, c_len, pre_tok_bytes));
-                if (do_prof && opt_prof_step1) { TIME_START(); CHECK(myds_metal_commit_batch()); TIME_ACC(prof_s1_wsum); CHECK(myds_metal_begin_batch()); }
-                CHECK(myds_metal_v41_rmsnorm_batch(cw->x_norm_buf, cw->x_buf, base->attn_norm, V41_DIM, c_len, m->norm_eps, true));
-                if (do_prof && opt_prof_step1) { TIME_START(); CHECK(myds_metal_commit_batch()); TIME_ACC(prof_s1_norm2); CHECK(myds_metal_begin_batch()); }
+                if (!trace_on && !(do_prof && opt_prof_step1) &&
+                    myds_metal_v41_hc_sum_rmsnorm_batch(cw->x_norm_buf, NULL, cw->cur_res_view, cw->cur_pre_view,
+                                                        base->attn_norm, V41_DIM, c_len, pre_tok_bytes, m->norm_eps, true)) {
+                } else {
+                    CHECK(myds_metal_v41_hc_weighted_sum_batch(cw->x_buf, cw->cur_res_view, cw->cur_pre_view, V41_DIM, c_len, pre_tok_bytes));
+                    if (do_prof && opt_prof_step1) { TIME_START(); CHECK(myds_metal_commit_batch()); TIME_ACC(prof_s1_wsum); CHECK(myds_metal_begin_batch()); }
+                    CHECK(myds_metal_v41_rmsnorm_batch(cw->x_norm_buf, cw->x_buf, base->attn_norm, V41_DIM, c_len, m->norm_eps, true));
+                    if (do_prof && opt_prof_step1) { TIME_START(); CHECK(myds_metal_commit_batch()); TIME_ACC(prof_s1_norm2); CHECK(myds_metal_begin_batch()); }
+                }
 
                 if (trace_on) {
                     for (uint32_t t = 0; t < c_len; t++) {
@@ -6784,9 +6815,8 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 TIME_ACC(prof_step1);
 
                 /* Step 2: Batched Q_A and KV projections (reads weights ONCE for all c_len tokens)
-                 * ★ 前缀段（kv_only）只需要 KV：Q_A/Q_B 都不必算（窗口环只用 KV）。
-                 *   层 20 保持原样（它要建 owner 3 的全局状态）。 */
-                const bool kv_only_skip_q = kv_only && il >= 21u;
+                 * ★ 前缀段（kv_only）只需要 KV（以及层 20 的压缩器，仅依赖 x_norm_buf）：Q_A/Q_B 都不必算。 */
+                const bool kv_only_skip_q = kv_only;
                 TIME_START();
                 phase = "batched attention projections";
                 if (!opt_skip_q_a && !kv_only_skip_q)
@@ -7005,13 +7035,14 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 myds_metal_barrier();
                 int a_ok = 0;
                 if (!opt_disable_mm_attn_a)
-                    a_ok = myds_metal_mul_mm_grouped(cw->attn_low_buf, base->attn_output_a,
-                            cw->attn_heads_buf, 1024, 4096, 8, c_len, base->attn_output_a_type);
-                if (!a_ok)
+                    a_ok = myds_metal_mul_mm_grouped_ext(cw->attn_low_buf, base->attn_output_a,
+                            cw->attn_heads_buf, 1024, 4096, 8, c_len, base->attn_output_a_type, true);
+                if (!a_ok) {
                     a_ok = myds_metal_attn_output_a_batch(cw->attn_low_buf, base->attn_output_a,
                             cw->attn_heads_buf, 8, 4096, 1024, c_len, base->attn_output_a_type);
-                CHECK(a_ok);
-                CHECK(myds_metal_v41_bf16(cw->attn_low_buf, 8192 * c_len));
+                    CHECK(a_ok);
+                    CHECK(myds_metal_v41_bf16(cw->attn_low_buf, 8192 * c_len));
+                }
                 TIME_ACC(prof_step4);
                 if (do_prof) { disp_mark4 = myds_metal_dispatch_count(); disp_step14 += disp_mark4 - disp_layer0; }  /* 诊断 */
 
@@ -7053,8 +7084,13 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     }
                 }
 
-                CHECK(myds_metal_v41_hc_weighted_sum_batch(cw->x_buf, cw->after_attn_buf, cw->attn_split_buf, V41_DIM, c_len, 96));
-                CHECK(myds_metal_v41_rmsnorm_batch(cw->ffn_norm_buf, cw->x_buf, base->ffn_norm, V41_DIM, c_len, m->norm_eps, true));
+                if (!trace_on &&
+                    myds_metal_v41_hc_sum_rmsnorm_batch(cw->ffn_norm_buf, NULL, cw->after_attn_buf, cw->attn_split_buf,
+                                                        base->ffn_norm, V41_DIM, c_len, 96, m->norm_eps, true)) {
+                } else {
+                    CHECK(myds_metal_v41_hc_weighted_sum_batch(cw->x_buf, cw->after_attn_buf, cw->attn_split_buf, V41_DIM, c_len, 96));
+                    CHECK(myds_metal_v41_rmsnorm_batch(cw->ffn_norm_buf, cw->x_buf, base->ffn_norm, V41_DIM, c_len, m->norm_eps, true));
+                }
 
                 if (trace_on) {
                     for (uint32_t t = 0; t < c_len; t++) {
@@ -7185,9 +7221,13 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                         const myds_metal_buffer_t *af_b = aliased ? cw->after_attn_buf : cw->after_view;
                         const myds_metal_buffer_t *sp_b = aliased ? cw->ffn_split_buf : cw->split_view;
 
-                        CHECK(myds_metal_v41_add_bf16(cw->ffn_out_buf, moe_b, sh_b, V41_DIM * e_len));
-                        myds_metal_barrier();
-                        CHECK(myds_metal_v41_hc_expand_batch(cw->layer_out_buf, cw->ffn_out_buf, af_b, sp_b, V41_DIM, e_len));
+                        if (!trace_on &&
+                            myds_metal_v41_moe_add_hc_expand_batch(cw->layer_out_buf, NULL, moe_b, sh_b, af_b, sp_b, V41_DIM, e_len)) {
+                        } else {
+                            CHECK(myds_metal_v41_add_bf16(cw->ffn_out_buf, moe_b, sh_b, V41_DIM * e_len));
+                            myds_metal_barrier();
+                            CHECK(myds_metal_v41_hc_expand_batch(cw->layer_out_buf, cw->ffn_out_buf, af_b, sp_b, V41_DIM, e_len));
+                        }
 
                         if (trace_on) {
                             for (uint32_t t = 0; t < e_len; t++) {
@@ -7229,7 +7269,8 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                  * （上机实证：front=all 但无此门时两臂在恢复点逐字节不同，max|Δ|=57.6）。 */
                 {
                     const uint32_t sp = mb_base_pos + c_start + c_len;
-                    if (!shrink_layer || sp > mb_base_pos + sh_full_rel) {
+                    if ((!shrink_layer || sp > mb_base_pos + sh_full_rel) &&
+                        (!suffix_shrink || sp > s_clamped_39)) {
                         if (!snapshot_store_window(g, il, sp, sp == base_pos + n_tokens)) goto fail;
                     }
                     /* ★ 注意：拒绝时【不能】顺手清槽位 —— 槽是按位置模数映射的，同一个槽可能
@@ -7241,7 +7282,11 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 TIME_ACC(prof_step8);
 
                 TIME_START();
-                CHECK(myds_metal_commit_batch());
+                if (do_prof || trace_on || opt_sync_chunk) {
+                    CHECK(myds_metal_commit_batch());
+                } else {
+                    CHECK(myds_metal_flush_batch());
+                }
                 TIME_ACC(prof_wait_moe);
                 if (do_prof) {  /* 诊断 */
                     disp_layer_all += myds_metal_dispatch_count() - disp_layer0;
@@ -7255,9 +7300,12 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 
         /* 每个 macroblock 跑完 40 层后，把该 macroblock 最后一个 token 的 residual / pre 保存进 g->residual / g->pre */
         {
-            size_t last_mb_idx = mb_len - 1u;
-            CHECK(myds_metal_buffer_copy(g->residual, 0, prompt_res, last_mb_idx * res_tok_bytes, res_tok_bytes));
-            CHECK(myds_metal_buffer_copy(g->pre, 0, prompt_pre, last_mb_idx * pre_tok_bytes, 4 * sizeof(float)));
+            if (mb_start + mb_len == n_tokens || !suffix_shrink || s_clamped_39 < mb_end) {
+                size_t last_mb_idx = mb_len - 1u;
+                CHECK(myds_metal_begin_batch());
+                CHECK(myds_metal_buffer_copy(g->residual, 0, prompt_res, last_mb_idx * res_tok_bytes, res_tok_bytes));
+                CHECK(myds_metal_buffer_copy(g->pre, 0, prompt_pre, last_mb_idx * pre_tok_bytes, 4 * sizeof(float)));
+            }
             CHECK(myds_metal_commit_batch());
         }
     } /* macroblock loop */
@@ -7350,8 +7398,8 @@ fail:
     if (g->prompt_pre) { myds_metal_buffer_free(g->prompt_pre); g->prompt_pre = NULL; }
     if (g->prompt_selected) { myds_metal_buffer_free(g->prompt_selected); g->prompt_selected = NULL; }
     if (g->prompt_block_mask) { myds_metal_buffer_free(g->prompt_block_mask); g->prompt_block_mask = NULL; }
-    if (g->prompt_engram[0]) { free(g->prompt_engram[0]); g->prompt_engram[0] = NULL; }
-    if (g->prompt_engram[1]) { free(g->prompt_engram[1]); g->prompt_engram[1] = NULL; }
+    if (g->prompt_engram_buf[0]) { myds_metal_buffer_free(g->prompt_engram_buf[0]); g->prompt_engram_buf[0] = NULL; }
+    if (g->prompt_engram_buf[1]) { myds_metal_buffer_free(g->prompt_engram_buf[1]); g->prompt_engram_buf[1] = NULL; }
     g->prompt_tokens_cap = 0;
     g->prompt_mask_bytes_cap = 0;
     return -1;

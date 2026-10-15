@@ -586,6 +586,12 @@ static int indexscores_chunk(myds_metal_buffer_t *scores,const myds_metal_buffer
     struct {uint32_t n_rows,n_head,head_dim,cache_f16;float scale;
             uint32_t n_tokens,causal_start,causal_ratio,pad;} a={
         n_comp,n_heads,128,cache_bf16?2u:0u,1.0f/64.0f,n_tokens,causal_start,causal_ratio,0};
+    const char *exact_env = getenv("MYDS_INDEXER_CHUNK_EXACT");
+    if ((!exact_env || strcmp(exact_env, "0") != 0) &&
+        dispatch("kernel_myds_indexer_score_chunk_exact", &a, sizeof(a), b, 4,
+                 (n_comp + 15u) / 16u, (n_tokens + 7u) / 8u, 1, 32, 4, 1, 1280u * 4u)) {
+        return 1;
+    }
     return dispatch("kernel_glm_indexer_score_chunk_direct",&a,sizeof(a),b,4,
         n_comp,n_tokens,1,32,4,1,132u*4);
 }
@@ -1490,7 +1496,41 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
     }
     }   /* !use_gather */
 
-    if (use_gather) {
+    int indirect_encoded = 0;
+    if (use_gather && s->prefill_attn_variant == 0 &&
+        s->attn_vec_head_first && !s->attn_vec_head_first_unavailable &&
+        !attn_vec_head_first_test_failure) {
+        const char *ind_env = getenv("MYDS_ATTN_INDIRECT_GATHER");
+        if (!ind_env || strcmp(ind_env, "0") != 0) {
+            struct {
+                uint32_t c_len, top_k, n_comp, valid_from;
+                uint32_t c_start, base_pos, ratio;
+                float    scale;
+                uint32_t neg_inf_u16, pad0, pad1, pad2;
+            } ia = {
+                c_len, top_k, n_comp, MYDS_CHUNK_CARRY - carry,
+                c_start, base_pos, ratio, 1.0f / sqrtf(512.0f),
+                0xfc00u, 0, 0, 0
+            };
+            _Static_assert(sizeof(ia) == 48, "indirect vec attn args ABI");
+            const myds_metal_buffer_t *ib[] = {
+                q, s->kv_chunk, comp_kv, ids, sinks, heads
+            };
+            const char *ikernel = comp_bf16
+                ? "kernel_myds_flash_attn_vec_indirect_mh8_bf16_dk512_dv512"
+                : "kernel_myds_flash_attn_vec_indirect_mh8_f32_dk512_dv512";
+            if (myds_metal_kernel_max_threads(ikernel) >= 256u) {
+                indirect_encoded = dispatch(ikernel, &ia, sizeof(ia), ib, 6,
+                                            8u, c_len, 1u, 32u, 8u, 1u, 32768u);
+                if (indirect_encoded) {
+                    attn_count(AC_HF_ATTEMPTS);
+                    attn_count(AC_HF_ENCODED);
+                }
+            }
+        }
+    }
+
+    if (use_gather && !indirect_encoded) {
         /* Both gather kernels overwrite the shared mask, even when their chunk
          * has a different length. A later window-only layer must rebuild it. */
         s->tmpl_len=0;s->tmpl_carry=0;
@@ -1568,7 +1608,7 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
                        c_len,n_comp,p0,(void *)s);
         }
     }
-    if(!matrix_encoded){
+    if(!matrix_encoded && !indirect_encoded){
         int vec_encoded=0;
         if(use_gather && s->attn_vec_head_first){
             if(s->attn_vec_head_first_unavailable) attn_count(AC_HF_CACHED);

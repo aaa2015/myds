@@ -423,6 +423,15 @@ int myds_metal_mul_mm(
     uint32_t                   in_dim,
     uint32_t                   n_tok,
     ggml_type                  weight_type);
+int myds_metal_mul_mm_ext(
+    myds_metal_buffer_t       *dst,
+    const myds_metal_buffer_t *W,
+    const myds_metal_buffer_t *src1,
+    uint32_t                   out_dim,
+    uint32_t                   in_dim,
+    uint32_t                   n_tok,
+    ggml_type                  weight_type,
+    bool                       round_bf16);
 /* 分组矩阵乘：一次派发完成所有组（见 myds_metal.m 的说明）。 */
 int myds_metal_mul_mm_grouped(
     myds_metal_buffer_t       *dst,
@@ -433,6 +442,16 @@ int myds_metal_mul_mm_grouped(
     uint32_t                   n_groups,
     uint32_t                   n_tok,
     ggml_type                  weight_type);
+int myds_metal_mul_mm_grouped_ext(
+    myds_metal_buffer_t       *dst,
+    const myds_metal_buffer_t *W,
+    const myds_metal_buffer_t *src1,
+    uint32_t                   out_dim,
+    uint32_t                   in_dim,
+    uint32_t                   n_groups,
+    uint32_t                   n_tok,
+    ggml_type                  weight_type,
+    bool                       round_bf16);
 
 /* SwiGLU activation: out = (x0 / (1 + exp(-x0))) * x1 */
 int myds_metal_swiglu(
@@ -777,8 +796,25 @@ int myds_metal_v41_hc_weighted_sum_batch(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *residual, const myds_metal_buffer_t *weights,
     uint32_t dim, uint32_t n_tok, uint64_t weight_stride_bytes);
 
+int myds_metal_v41_hc_sum_rmsnorm_batch(
+    myds_metal_buffer_t *norm_out,
+    myds_metal_buffer_t *sum_out,
+    const myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *norm_weight,
+    uint32_t dim,
+    uint32_t n_tok,
+    uint64_t weight_stride_bytes,
+    float eps,
+    bool round_bf16);
+
 int myds_metal_v41_hc_expand_batch(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *block, const myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *split, uint32_t dim, uint32_t n_tok);
+
+int myds_metal_v41_moe_add_hc_expand_batch(myds_metal_buffer_t *out,
+    myds_metal_buffer_t *ffn_out, const myds_metal_buffer_t *moe_out,
+    const myds_metal_buffer_t *shared_out, const myds_metal_buffer_t *residual,
     const myds_metal_buffer_t *split, uint32_t dim, uint32_t n_tok);
 
 int myds_metal_v41_hc_split_batch(myds_metal_buffer_t *split,
