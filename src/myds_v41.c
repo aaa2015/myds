@@ -3080,27 +3080,19 @@ static int publish_compressor_chunk(myds_context_t *ctx, uint32_t il,
     const uint32_t row0 = (base_pos + c_start) / ratio;
     if (myds_metal_buffer_size(g->compressed[owner]) < (size_t)(row0 + n_commit) * 512u * V41_CACHE_BYTES) return 0;
     if (myds_metal_buffer_size(g->index_cache[owner]) < (size_t)(row0 + n_commit) * 128u * V41_CACHE_BYTES) return 0;
-    /* 1) latent + compressor_norm */
-    const uint32_t first_pos = base_pos + c_start;
+    /* 1) latent */
     if (ratio == 2u) {
         if (!myds_v41_gpu_pool2_pairs(latent_buf, pool_kv_buf, pool_score_buf, 512u, n_commit)) return -1;
-        if (!myds_metal_v41_rmsnorm_batch(latent_buf, latent_buf, l->compressor_norm, 512u, n_commit,
-                                          ctx->model->norm_eps, true)) return -1;
     } else {
-        if (!myds_metal_copy_fault_injection_active() &&
-            myds_metal_v41_rmsnorm_bf16_in_batch(latent_buf, pool_kv_buf, l->compressor_norm, 512u, n_commit,
-                                                 ctx->model->norm_eps, true)) {
-        } else {
-            if (!myds_metal_buffer_copy(latent_buf, 0, pool_kv_buf, 0, (size_t)c_len * 512u * 4u)) return -1;
-            if (!myds_metal_v41_bf16(latent_buf, n_commit * 512u)) return -1;
-            if (!myds_metal_v41_rmsnorm_batch(latent_buf, latent_buf, l->compressor_norm, 512u, n_commit,
-                                              ctx->model->norm_eps, true)) return -1;
-        }
+        if (!myds_metal_buffer_copy(latent_buf, 0, pool_kv_buf, 0, (size_t)c_len * 512u * 4u)) return -1;
     }
     /* 2) 提交段：整 chunk 一次 */
     /* 逐 token 的 start = pos+1-ratio：ratio==1 ⇒ start=pos=base+c_start+t；ratio==2 ⇒ 提交位是
      * 奇数位 pos=base+c_start+2p+1，start=pos-1=base+c_start+2p。两种情况的【首行】都是
      * base_pos+c_start（ratio==2 时靠 stride=2 逐行错开）。 */
+    const uint32_t first_pos = base_pos + c_start;
+    if (!myds_metal_v41_rmsnorm_batch(latent_buf, latent_buf, l->compressor_norm, 512u, n_commit,
+                                      ctx->model->norm_eps, true)) return -1;
     if (!project_batch(index_k_buf, l->index_k, latent_buf, 128u, 512u, n_commit, GGML_TYPE_F16, false)) return -1;
     if (!myds_metal_v41_rmsnorm_bf16_in_batch(index_k_buf, index_k_buf, l->index_k_norm, 128u, n_commit,
                                               ctx->model->norm_eps, true)) {
@@ -3376,7 +3368,6 @@ static int publish_indexer_chunk(myds_context_t *ctx, uint32_t il, uint32_t c_st
      *    完全相同（start_pos = 该位置、heads = 32、width = 128、compressed = true）。 */
     if (!myds_v41_gpu_indexer_rope_quant_batch(index_q_buf, NULL, 0, V41_INDEX_HEADS,
                                                base_pos + c_start, c_len, 1u, true)) {
-        if (!myds_metal_v41_bf16(index_q_buf, V41_INDEX_HEADS * 128u * c_len)) return -1;
         if (!myds_v41_gpu_rope_batch(index_q_buf,128,V41_INDEX_HEADS,base_pos + c_start,c_len,true,false)) return -1;
         if (!myds_v41_gpu_quant(index_q_buf,128,V41_INDEX_HEADS*c_len,2)) return -1;
     }
@@ -6947,7 +6938,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 uint32_t ratio = ratio_for(il);
                 if (ratio) {
                     if (kv_source(il)) {
-                        CHECK(project_batch(cw->pool_kv_buf, l->compressor_kv, cw->x_norm_buf, 512, V41_DIM, c_len, GGML_TYPE_F16, ratio == 1 && opt_comp_per_token));
+                        CHECK(project_batch(cw->pool_kv_buf, l->compressor_kv, cw->x_norm_buf, 512, V41_DIM, c_len, GGML_TYPE_F16, ratio == 1));
                         if (ratio == 2) {
                             CHECK(project_batch(cw->pool_score_buf, l->compressor_gate, cw->x_norm_buf, 512, V41_DIM, c_len, GGML_TYPE_F16, false));
                         }
@@ -6971,8 +6962,6 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                         goto fail;
                     }
                     if (!comp_batched) {
-                        if (ratio == 1 && !opt_comp_per_token)
-                            CHECK(myds_metal_v41_bf16(cw->pool_kv_buf, 512 * c_len));
                         uint64_t dc0 = myds_metal_dispatch_count();
                         for (uint32_t t = 0; t < c_len; t++) {
                             uint32_t pos = mb_base_pos + c_start + t;
@@ -7131,9 +7120,6 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 }
 
                 /* Step 6: HC FFN Input for all tokens in chunk */
-                const bool direct_out = !trace_on && !myds_metal_copy_fault_injection_active();
-                const bool direct_pre = direct_out && (cw->moe_batch == cw->capacity);
-                myds_metal_buffer_t *ffn_split_dst = direct_pre ? cw->cur_pre_view : cw->ffn_split_buf;
                 TIME_START();
                 phase = "HC FFN input";
                 if (!trace_on &&
@@ -7152,11 +7138,11 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     myds_metal_barrier();
                     CHECK(myds_metal_v41_gemv_batch_scaled(cw->hc_mix_buf, l->ffn_fn, cw->after_attn_buf, cw->hc_flat_norm_buf,
                                                            24, 4 * V41_DIM, c_len, GGML_TYPE_F16));
-                    CHECK(myds_metal_v41_hc_split_batch(ffn_split_dst, cw->hc_mix_buf, l->ffn_scale, l->ffn_base, c_len, v->hc_eps));
+                    CHECK(myds_metal_v41_hc_split_batch(cw->ffn_split_buf, cw->hc_mix_buf, l->ffn_scale, l->ffn_base, c_len, v->hc_eps));
                 } else {
                     CHECK(myds_metal_v41_rmsnorm_batch(cw->hc_flat_norm_buf, cw->after_attn_buf, NULL, 4 * V41_DIM, c_len, m->norm_eps, false));
                     CHECK(project_batch(cw->hc_mix_buf, l->ffn_fn, cw->hc_flat_norm_buf, 24, 4 * V41_DIM, c_len, GGML_TYPE_F16, false));
-                    CHECK(myds_metal_v41_hc_split_batch(ffn_split_dst, cw->hc_mix_buf, l->ffn_scale, l->ffn_base, c_len, v->hc_eps));
+                    CHECK(myds_metal_v41_hc_split_batch(cw->ffn_split_buf, cw->hc_mix_buf, l->ffn_scale, l->ffn_base, c_len, v->hc_eps));
 
                     if (trace_on) {
                         for (uint32_t t = 0; t < c_len; t++) {
@@ -7298,9 +7284,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                                 !myds_metal_buffer_update_sub_view(cw->after_view, cw->moe_after_acc,
                                     (size_t)e0 * 4 * V41_DIM * sizeof(float), (size_t)e_len * 4 * V41_DIM * sizeof(float)) ||
                                 !myds_metal_buffer_update_sub_view(cw->split_view, cw->moe_split_acc,
-                                    (size_t)e0 * 24 * sizeof(float), (size_t)e_len * 24 * sizeof(float)) ||
-                                (direct_out && !myds_metal_buffer_update_sub_view(cw->cur_res_view, prompt_res,
-                                    (size_t)e_start * res_tok_bytes, (size_t)e_len * res_tok_bytes))) {
+                                    (size_t)e0 * 24 * sizeof(float), (size_t)e_len * 24 * sizeof(float))) {
                                 myds_metal_barrier();
                                 MYDS_LOG_E("V4.1 MoE batch sub-view failed (e0=%u mb_moe_len=%u)", e0, mb_moe_len);
                                 goto fail;
@@ -7309,17 +7293,16 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                         const myds_metal_buffer_t *moe_b = aliased ? cw->moe_out_buf : cw->moe_view;
                         const myds_metal_buffer_t *sh_b = aliased ? cw->shared_out_buf : cw->shared_view;
                         const myds_metal_buffer_t *af_b = aliased ? cw->after_attn_buf : cw->after_view;
-                        const myds_metal_buffer_t *sp_b = aliased ? ffn_split_dst : cw->split_view;
-                        myds_metal_buffer_t *layer_out_dst = direct_out ? cw->cur_res_view : cw->layer_out_buf;
+                        const myds_metal_buffer_t *sp_b = aliased ? cw->ffn_split_buf : cw->split_view;
 
                         if (!trace_on &&
-                            myds_metal_v41_moe_add_hc_expand_bf16_in_batch(layer_out_dst, NULL, moe_b, sh_b, af_b, sp_b, V41_DIM, e_len)) {
+                            myds_metal_v41_moe_add_hc_expand_bf16_in_batch(cw->layer_out_buf, NULL, moe_b, sh_b, af_b, sp_b, V41_DIM, e_len)) {
                         } else {
                             if (!trace_on)
                                 CHECK(myds_metal_v41_bf16((myds_metal_buffer_t *)sh_b, V41_DIM * e_len));
                             CHECK(myds_metal_v41_add_bf16(cw->ffn_out_buf, moe_b, sh_b, V41_DIM * e_len));
                             myds_metal_barrier();
-                            CHECK(myds_metal_v41_hc_expand_batch(layer_out_dst, cw->ffn_out_buf, af_b, sp_b, V41_DIM, e_len));
+                            CHECK(myds_metal_v41_hc_expand_batch(cw->layer_out_buf, cw->ffn_out_buf, af_b, sp_b, V41_DIM, e_len));
                         }
 
                         if (trace_on) {
@@ -7344,14 +7327,10 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                             }
                         }
 
-                        if (!direct_out) {
-                            CHECK(myds_metal_buffer_copy(prompt_res, (size_t)e_start * res_tok_bytes,
-                                                         cw->layer_out_buf, 0, (size_t)e_len * res_tok_bytes));
-                        }
-                        if (!direct_pre) {
-                            CHECK(myds_metal_buffer_copy(prompt_pre, (size_t)e_start * pre_tok_bytes,
-                                                         sp_b, 0, (size_t)e_len * pre_tok_bytes));
-                        }
+                        CHECK(myds_metal_buffer_copy(prompt_res, (size_t)e_start * res_tok_bytes,
+                                                     cw->layer_out_buf, 0, (size_t)e_len * res_tok_bytes));
+                        CHECK(myds_metal_buffer_copy(prompt_pre, (size_t)e_start * pre_tok_bytes,
+                                                     sp_b, 0, (size_t)e_len * pre_tok_bytes));
                     }
                     moe_off = 0;
                 }
