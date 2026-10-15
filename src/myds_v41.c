@@ -3093,13 +3093,9 @@ static int publish_compressor_chunk(myds_context_t *ctx, uint32_t il,
     const uint32_t first_pos = base_pos + c_start;
     if (!myds_metal_v41_rmsnorm_batch(latent_buf, latent_buf, l->compressor_norm, 512u, n_commit,
                                       ctx->model->norm_eps, true)) return -1;
-    if (!project_batch(index_k_buf, l->index_k, latent_buf, 128u, 512u, n_commit, GGML_TYPE_F16, false)) return -1;
-    if (!myds_metal_v41_rmsnorm_bf16_in_batch(index_k_buf, index_k_buf, l->index_k_norm, 128u, n_commit,
-                                              ctx->model->norm_eps, true)) {
-        if (!myds_metal_v41_bf16(index_k_buf, n_commit * 128u)) return -1;
-        if (!myds_metal_v41_rmsnorm_batch(index_k_buf, index_k_buf, l->index_k_norm, 128u, n_commit,
-                                          ctx->model->norm_eps, true)) return -1;
-    }
+    if (!project_batch(index_k_buf, l->index_k, latent_buf, 128u, 512u, n_commit, GGML_TYPE_F16, true)) return -1;
+    if (!myds_metal_v41_rmsnorm_batch(index_k_buf, index_k_buf, l->index_k_norm, 128u, n_commit,
+                                      ctx->model->norm_eps, true)) return -1;
     if (!myds_v41_gpu_indexer_rope_quant_batch(index_k_buf, g->index_cache[owner], (size_t)row0 * 128u,
                                                1u, first_pos, n_commit, ratio, true)) {
         if (!myds_v41_gpu_rope_batch_stride(index_k_buf, 128u, 1u, first_pos, n_commit, ratio, true, false)) return -1;
@@ -3336,14 +3332,26 @@ static int publish_indexer_chunk(myds_context_t *ctx, uint32_t il, uint32_t c_st
                                  myds_metal_buffer_t *sel_view, myds_metal_buffer_t *mask_view) {
     myds_v41_context_t *g=ctx->v41;
     const uint32_t ratio=ratio_for(il), owner=owner_for(il);
-    const uint32_t n_comp_all=(base_pos + c_start + c_len)/ratio;
     const uint32_t mask_stride=(uint32_t)(mask_bytes/4u);
     const uint32_t batch_floats=myds_v41_gpu_indexer_batch_floats(g->gpu);
     if (!ratio || !index_source(il) || !c_len) return 0;
+    const uint32_t n_comp_all=(base_pos + c_start + c_len)/ratio;
     /* 逐 token 路径里 count==0 的 token 整段跳过（连 rope/quant 都不做）；只有
      * 「序列第一个 token + ratio==2 的层」会出现。批量路径没有对应「整行不写」的语义
-     * （因果宽度 0 会让 merge 的无符号减法下溢），所以直接回退。 */
-    if (!n_comp_all || (base_pos + c_start + 1u)/ratio == 0u) return 0;
+     * （因果宽度 0 会让 merge 的无符号减法下溢）。默认只跳过该行，余下行继续批处理；
+     * MYDS_PREFILL_INDEXER_PEEL=0 可恢复整 chunk 回退。原始 Q 的第 0 行、
+     * selected/mask 的第 0 行均不写，与逐 token 的 count==0 分支相同。 */
+    uint32_t input_skip = 0;
+    if ((base_pos + c_start + 1u)/ratio == 0u) {
+        const char *peel_env = getenv("MYDS_PREFILL_INDEXER_PEEL");
+        if ((peel_env && strcmp(peel_env, "1") != 0) || ratio != 2u ||
+            base_pos + c_start != 0u) return 0;
+        input_skip = 1u;
+        c_start++;
+        c_len--;
+        if (!c_len) return 1;  /* Entire chunk is the scalar no-op row. */
+    }
+    if (!n_comp_all) return 0;
     if (V41_INDEX_HEADS != 32u) return 0;
     if (n_comp_all > batch_floats) return 0;
     if (mask_bytes%4u || !mask_stride) return 0;
@@ -3364,12 +3372,24 @@ static int publish_indexer_chunk(myds_context_t *ctx, uint32_t il, uint32_t c_st
         if (!glen) return 0;
         off+=glen;
     }
+    myds_metal_buffer_t *rope_q_buf = index_q_buf;
+    if (input_skip) {
+        /* 只调整 binding handle，不提交 GPU 工作。若视图不合法仍可安全整 chunk 回退；
+         * 开始 RoPE 后则沿用 -1 的 fail-closed 规则，不能重复处理已旋转的行。 */
+        if (!myds_metal_buffer_update_sub_view(q_view,index_q_buf,
+                (size_t)input_skip*V41_INDEX_HEADS*128u*sizeof(float),
+                (size_t)c_len*V41_INDEX_HEADS*128u*sizeof(float)) ||
+            !myds_metal_buffer_update_sub_view(w_view,index_weights_buf,
+                (size_t)input_skip*V41_INDEX_HEADS*sizeof(float),
+                (size_t)c_len*V41_INDEX_HEADS*sizeof(float))) return 0;
+        rope_q_buf = q_view;
+    }
     /* 1) index_q 的 rope + quant：逐 token 版本在 publish_and_select 里逐行做，参数
      *    完全相同（start_pos = 该位置、heads = 32、width = 128、compressed = true）。 */
-    if (!myds_v41_gpu_indexer_rope_quant_batch(index_q_buf, NULL, 0, V41_INDEX_HEADS,
+    if (!myds_v41_gpu_indexer_rope_quant_batch(rope_q_buf, NULL, 0, V41_INDEX_HEADS,
                                                base_pos + c_start, c_len, 1u, true)) {
-        if (!myds_v41_gpu_rope_batch(index_q_buf,128,V41_INDEX_HEADS,base_pos + c_start,c_len,true,false)) return -1;
-        if (!myds_v41_gpu_quant(index_q_buf,128,V41_INDEX_HEADS*c_len,2)) return -1;
+        if (!myds_v41_gpu_rope_batch(rope_q_buf,128,V41_INDEX_HEADS,base_pos + c_start,c_len,true,false)) return -1;
+        if (!myds_v41_gpu_quant(rope_q_buf,128,V41_INDEX_HEADS*c_len,2)) return -1;
     }
     for (uint32_t off=0; off<c_len; ) {
         const uint32_t glen=indexer_group_len(c_len,off,base_pos,c_start,ratio,batch_floats);
@@ -3378,10 +3398,10 @@ static int publish_indexer_chunk(myds_context_t *ctx, uint32_t il, uint32_t c_st
         const uint32_t g_start=base_pos + c_start + off;
         if (!glen || !nc_raw) return -1;
         if (!myds_metal_buffer_update_sub_view(q_view,index_q_buf,
-                (size_t)off*V41_INDEX_HEADS*128u*sizeof(float),
+                (size_t)(input_skip+off)*V41_INDEX_HEADS*128u*sizeof(float),
                 (size_t)glen*V41_INDEX_HEADS*128u*sizeof(float)) ||
             !myds_metal_buffer_update_sub_view(w_view,index_weights_buf,
-                (size_t)off*V41_INDEX_HEADS*sizeof(float),
+                (size_t)(input_skip+off)*V41_INDEX_HEADS*sizeof(float),
                 (size_t)glen*V41_INDEX_HEADS*sizeof(float)) ||
             !myds_metal_buffer_update_sub_view(sel_view,prompt_selected,
                 (size_t)(c_start+off)*sel_bytes,(size_t)glen*sel_bytes) ||
@@ -6498,6 +6518,9 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     const bool opt_skip_q_rope = (getenv("MYDS_SKIP_Q_ROPE") != NULL);
     const bool opt_comp_per_token = (getenv("MYDS_COMPRESSOR_PER_TOKEN") != NULL);
     const bool opt_idx_per_token = (getenv("MYDS_INDEXER_PER_TOKEN") != NULL);
+    const char *skip_dead_kv_env = getenv("MYDS_PREFILL_SKIP_DEAD_KV");
+    /* Default on; explicit 0 restores the prefix HC norm/scheduling path. */
+    const bool opt_skip_dead_kv = !skip_dead_kv_env || strcmp(skip_dead_kv_env, "1") == 0;
     const bool opt_prof_split = (getenv("MYDS_PROFILE_SPLIT") != NULL);
     const bool opt_prof_split2 = (getenv("MYDS_PROFILE_SPLIT2") != NULL);
     const bool opt_prof_split3 = (getenv("MYDS_PROFILE_SPLIT3") != NULL);
@@ -6738,6 +6761,15 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 const bool kv_only = shrink_layer && (c_start + c_len <= sh_full_rel);
                 const bool kv_only_skip_win = kv_only && !trace_on &&
                                               (mb_base_pos + c_start + c_len + V41_WINDOW <= sh_s_global);
+                /* These prefix rows produce neither retained window KV nor compressed KV.
+                 * Their HC norm is never consumed: Q/indexer/attention/FFN are all skipped,
+                 * and sp <= sh_full_rel rejects their snapshots. Keep the near-prefix rows
+                 * so the first full chunk still stages exactly the same window carry.
+                 * Advance by the existing chunk length to preserve every later boundary. */
+                if (opt_skip_dead_kv && kv_only_skip_win && !kv_source(il)) {
+                    c_start += c_len;
+                    continue;
+                }
                 const bool hc_mix_use_gemv = (c_len < 32u || is_mul_mm_disabled() || mm_min_m() > 24u);
 
                 if (il == 1 || il == 14) {
@@ -6852,31 +6884,18 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 /* Step 2: Batched Q_A and KV projections (reads weights ONCE for all c_len tokens)
                  * ★ 前缀段（kv_only）只需要 KV（以及层 20 的压缩器，仅依赖 x_norm_buf）：Q_A/Q_B 都不必算。 */
                 const bool kv_only_skip_q = kv_only;
-                const bool fuse_step2_bf16 = !trace_on && !opt_skip_norm;
                 TIME_START();
                 phase = "batched attention projections";
                 if (!opt_skip_q_a && !kv_only_skip_q)
-                    CHECK(project_batch(cw->qr_buf, base->attn_q_a, cw->x_norm_buf, 1280, V41_DIM, c_len, base->attn_q_a_type, !fuse_step2_bf16));
+                    CHECK(project_batch(cw->qr_buf, base->attn_q_a, cw->x_norm_buf, 1280, V41_DIM, c_len, base->attn_q_a_type, true));
                 if (!opt_skip_kv && !kv_only_skip_win)
-                    CHECK(project_batch(cw->kv_act_buf, base->attn_kv, cw->x_norm_buf, 512, V41_DIM, c_len, base->attn_kv_type, !fuse_step2_bf16));
+                    CHECK(project_batch(cw->kv_act_buf, base->attn_kv, cw->x_norm_buf, 512, V41_DIM, c_len, base->attn_kv_type, true));
 
                 if (!opt_skip_norm) {
-                    if (!kv_only_skip_q) {
-                        if (!(fuse_step2_bf16 &&
-                              myds_metal_v41_rmsnorm_bf16_in_batch(cw->qr_norm_buf, cw->qr_buf, base->attn_q_a_norm, 1280, c_len, m->norm_eps, true))) {
-                            if (fuse_step2_bf16)
-                                CHECK(myds_metal_v41_bf16(cw->qr_buf, 1280 * c_len));
-                            CHECK(myds_metal_v41_rmsnorm_batch(cw->qr_norm_buf, cw->qr_buf, base->attn_q_a_norm, 1280, c_len, m->norm_eps, true));
-                        }
-                    }
-                    if (!kv_only_skip_win) {
-                        if (!(fuse_step2_bf16 &&
-                              myds_metal_v41_rmsnorm_bf16_in_batch(cw->kv_act_buf, cw->kv_act_buf, base->attn_kv_a_norm, 512, c_len, m->norm_eps, true))) {
-                            if (fuse_step2_bf16)
-                                CHECK(myds_metal_v41_bf16(cw->kv_act_buf, 512 * c_len));
-                            CHECK(myds_metal_v41_rmsnorm_batch(cw->kv_act_buf, cw->kv_act_buf, base->attn_kv_a_norm, 512, c_len, m->norm_eps, true));
-                        }
-                    }
+                    if (!kv_only_skip_q)
+                        CHECK(myds_metal_v41_rmsnorm_batch(cw->qr_norm_buf, cw->qr_buf, base->attn_q_a_norm, 1280, c_len, m->norm_eps, true));
+                    if (!kv_only_skip_win)
+                        CHECK(myds_metal_v41_rmsnorm_batch(cw->kv_act_buf, cw->kv_act_buf, base->attn_kv_a_norm, 512, c_len, m->norm_eps, true));
                 }
 
                 /* Batched RoPE & Quant for KV */
@@ -7110,7 +7129,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 /* Step 5: Batched Attention Output B (reads 17.8 MB weight ONCE for all c_len tokens) */
                 TIME_START();
                 phase = "batched attention output b";
-                CHECK(project_batch(cw->attn_out_buf, base->attn_output_b, cw->attn_low_buf, V41_DIM, 8192, c_len, base->attn_output_b_type, trace_on));
+                CHECK(project_batch(cw->attn_out_buf, base->attn_output_b, cw->attn_low_buf, V41_DIM, 8192, c_len, base->attn_output_b_type, true));
                 TIME_ACC(prof_step5);
                 if (do_prof && opt_prof_moe) {
                     TIME_START();
@@ -7122,13 +7141,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 /* Step 6: HC FFN Input for all tokens in chunk */
                 TIME_START();
                 phase = "HC FFN input";
-                if (!trace_on &&
-                    myds_metal_v41_hc_expand_bf16_in_batch(cw->after_attn_buf, cw->attn_out_buf, cw->cur_res_view, cw->attn_split_buf, V41_DIM, c_len)) {
-                } else {
-                    if (!trace_on)
-                        CHECK(myds_metal_v41_bf16(cw->attn_out_buf, V41_DIM * c_len));
-                    CHECK(myds_metal_v41_hc_expand_batch(cw->after_attn_buf, cw->attn_out_buf, cw->cur_res_view, cw->attn_split_buf, V41_DIM, c_len));
-                }
+                CHECK(myds_metal_v41_hc_expand_batch(cw->after_attn_buf, cw->attn_out_buf, cw->cur_res_view, cw->attn_split_buf, V41_DIM, c_len));
 
                 /* Batched HC Mix: RMSNorm + GEMM + Split across the entire chunk */
                 if (!trace_on && hc_mix_use_gemv &&
@@ -7176,14 +7189,10 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 phase = "batched MoE shared and router";
                 uint32_t width = m->moe_expert_dim;
                 CHECK(project_batch(cw->router_logits_buf, base->router_gate, cw->ffn_norm_buf, m->n_routed_experts, V41_DIM, c_len, base->router_gate_type, false));
-                CHECK(project_batch(cw->shared_gate_buf, base->shared_gate, cw->ffn_norm_buf, width, V41_DIM, c_len, base->shared_gate_type, false));
-                CHECK(project_batch(cw->shared_up_buf, base->shared_up, cw->ffn_norm_buf, width, V41_DIM, c_len, base->shared_up_type, false));
-                if (!myds_v41_shared_swiglu_bf16_in(cw->shared_swiglu_buf, cw->shared_gate_buf, cw->shared_up_buf, width * c_len, m->swiglu_clamp_exp)) {
-                    CHECK(myds_metal_v41_bf16(cw->shared_gate_buf, width * c_len));
-                    CHECK(myds_metal_v41_bf16(cw->shared_up_buf, width * c_len));
-                    CHECK(myds_v41_shared_swiglu(cw->shared_swiglu_buf, cw->shared_gate_buf, cw->shared_up_buf, width * c_len, m->swiglu_clamp_exp));
-                }
-                CHECK(project_batch(cw->shared_out_buf, base->shared_down, cw->shared_swiglu_buf, V41_DIM, width, c_len, base->shared_down_type, trace_on));
+                CHECK(project_batch(cw->shared_gate_buf, base->shared_gate, cw->ffn_norm_buf, width, V41_DIM, c_len, base->shared_gate_type, true));
+                CHECK(project_batch(cw->shared_up_buf, base->shared_up, cw->ffn_norm_buf, width, V41_DIM, c_len, base->shared_up_type, true));
+                CHECK(myds_v41_shared_swiglu(cw->shared_swiglu_buf, cw->shared_gate_buf, cw->shared_up_buf, width * c_len, m->swiglu_clamp_exp));
+                CHECK(project_batch(cw->shared_out_buf, base->shared_down, cw->shared_swiglu_buf, V41_DIM, width, c_len, base->shared_down_type, true));
 
                 /* Step 7b: Batched MoE routing for all tokens in chunk on GPU */
                 phase = "batched MoE routing";
@@ -7296,10 +7305,8 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                         const myds_metal_buffer_t *sp_b = aliased ? cw->ffn_split_buf : cw->split_view;
 
                         if (!trace_on &&
-                            myds_metal_v41_moe_add_hc_expand_bf16_in_batch(cw->layer_out_buf, NULL, moe_b, sh_b, af_b, sp_b, V41_DIM, e_len)) {
+                            myds_metal_v41_moe_add_hc_expand_batch(cw->layer_out_buf, NULL, moe_b, sh_b, af_b, sp_b, V41_DIM, e_len)) {
                         } else {
-                            if (!trace_on)
-                                CHECK(myds_metal_v41_bf16((myds_metal_buffer_t *)sh_b, V41_DIM * e_len));
                             CHECK(myds_metal_v41_add_bf16(cw->ffn_out_buf, moe_b, sh_b, V41_DIM * e_len));
                             myds_metal_barrier();
                             CHECK(myds_metal_v41_hc_expand_batch(cw->layer_out_buf, cw->ffn_out_buf, af_b, sp_b, V41_DIM, e_len));

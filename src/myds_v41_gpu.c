@@ -319,9 +319,6 @@ int myds_v41_gpu_rope_batch_round(myds_metal_buffer_t *x,uint32_t width,uint32_t
     struct {uint32_t width,heads,rows,start,inverse,stride;float frequencies[32];} a={width,heads,rows,start_pos,inverse,1u,{0}};
     memcpy(a.frequencies,rope_frequencies[compressed?1:0],sizeof(a.frequencies));
     const myds_metal_buffer_t *b[]={x};
-    if(rows>1u&&(width&3u)==0u&&myds_metal_buffer_offset(x)%16u==0u&&
-       dispatch("kernel_dsv41_rope_round_batch",&a,sizeof(a),b,1,heads,rows,1,32,1,1,0))
-        return 1;
     return dispatch("kernel_dsv41_rope_round",&a,sizeof(a),b,1,heads,rows,1,32,1,1,0);
 }
 int myds_v41_gpu_rope_round(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,

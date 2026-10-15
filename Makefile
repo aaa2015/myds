@@ -36,6 +36,7 @@ TEST_ATTN_ROPE_FUSE = $(BIN_DIR)/test_attention_rope_fuse
 TEST_TOPK_NAN_FUSE = $(BIN_DIR)/test_topk_nan_fuse
 TEST_TOPK_NAN_SHUFFLE = $(BIN_DIR)/test_topk_nan_shuffle
 TEST_INDEXER_HEAD_SLOTS = $(BIN_DIR)/test_indexer_head_slots
+TEST_PREFILL_INDEXER_PEEL = $(BIN_DIR)/test_prefill_indexer_peel
 TEST_TOPK_THRESHOLD = $(BIN_DIR)/test_topk_threshold
 TEST_F16_BF16_FUSE = $(BIN_DIR)/test_f16_bf16_fuse
 TEST_INDEXER_ROPE_QUANT = $(BIN_DIR)/test_indexer_rope_quant
@@ -358,6 +359,9 @@ $(TEST_BATCH2_SHARED_PAIR): tests/test_batch2_shared_swiglu_pair.c src/myds_v41_
 	$(CC) $(CFLAGS) -o $@ $< $(filter %.o,$^) $(LDFLAGS) -Wl,-dead_strip
 
 # Build-only candidate gates. Execute explicitly under an exclusive GPU window.
+$(TEST_PREFILL_INDEXER_PEEL): tests/test_prefill_indexer_peel.c src/myds_v41.c $(wildcard include/*.h) $(filter-out $(BUILD_DIR)/myds_v41.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $< $(filter %.o,$^) $(LDFLAGS) -Wl,-dead_strip
+
 $(TEST_DEPTH2_SHARED3): tests/test_depth2_shared3.m src/myds_metal.m src/myds_decode_candidates.inc $(wildcard include/*.h) $(OBJS_C) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc -o $@ $< $(OBJS_C) $(LDFLAGS)
 

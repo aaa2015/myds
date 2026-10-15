@@ -38,9 +38,6 @@ void myds_v41_moe_hc_overlap_counters(myds_metal_decode_candidate_counters_t *ou
 int myds_v41_shared_swiglu(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *gate, const myds_metal_buffer_t *up,
     uint32_t width, float clamp);
-int myds_v41_shared_swiglu_bf16_in(myds_metal_buffer_t *out,
-    const myds_metal_buffer_t *gate, const myds_metal_buffer_t *up,
-    uint32_t width, float clamp);
 /* Shared Expert Gate + Up + SwiGLU 三合一融合算子
  * 消除 2 次 GPU Dispatch 与中间 buffer 显存往返。
  * 当权重非 Q8_0 或未启用时返回 0，调用方平滑 fallback 到原有分步路径。 */

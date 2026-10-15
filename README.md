@@ -137,6 +137,8 @@ A–B–A 中使短/800-token 业务输入 decode 时间减少 1.87% / 2.03%；�
 [Mac Studio 实测](docs/benchmarks/2026-10-09-decode/macstudio/README.md) 记录完整模型状态门禁、
 普通256输出及长上下文对照，包含负收益和失败后修复记录。历史软件与硬件路线见
 [2026-10-08 优化方案](docs/DECODE_OPTIMIZATION_PLAN_2026-10-08.md)。
+当前 prefill 的首块索引批处理、后缀收缩冗余工作消除及完整模型 A–B–A 证据，见
+[2026-10-15 Prefill 优化验证](docs/verification/2026-10-15-prefill-indexer-and-dead-kv.md)。
 Q2 down 独立 NSG、top-k 前缀合并裁剪及短/长输入对照，见
 [第二轮内核实现与验证](docs/benchmarks/2026-10-09-decode-kernels/README.md)。
 当前 GPU 时间线、IQ2 LUT 与 attention 物理 SIMD 打包的实现和验收边界，见
@@ -314,6 +316,8 @@ compressed KV 与 index cache 保存已完成 BF16 舍入的上 16 位，读取�
 | `MYDS_ATTN_GATHER` | 启用 | 设为 `0` 关闭 gather，阈值不覆盖此开关。 |
 | `MYDS_ATTN_VEC_HEAD_FIRST` | 启用 | gathered prefill 的 vec attention 将 query/head 物理 grid 调换，保留每个 head 的算术与归约。设为 `0` 使用原排列。旧 metallib 缺新 PSO 时自动回退，并在 scratch 中缓存不可用状态；首次回退输出一条 WARN 日志，进程级计数可由 `myds_v41_gpu_attention_counters()` 读取。 |
 | `MYDS_PREFILL_ATTN` | `vec` | `matrix` 与 `auto` 是 compressed gather 的实验选项。矩阵归约会产生浮点差异，实测长输入生成 token 可变化；默认关闭。`auto` 的矩阵 PSO/共享内存不可用时回退 vec，显式 `matrix` 则返回失败。 |
+| `MYDS_PREFILL_INDEXER_PEEL` | 启用 | ratio=2 的索引层在绝对位置 0 保留没有可见压缩键的首行，其余行继续批处理，避免整个首块回退逐 token。首行 Q、selected 和 mask 保持不变；设为 `0` 恢复原回退路径。 |
+| `MYDS_PREFILL_SKIP_DEAD_KV` | 启用 | 后缀收缩时，跳过第 21–39 层中已经不需要保留窗口 KV、且没有压缩器工作的前缀块。保留原 chunk 边界、近端窗口、carry 和有效快照；trace 保留原路径。设为 `0` 恢复原归一化与调度。 |
 | `MYDS_QKV_FUSE_BF16` | 启用 | decode 的 Q8 QKV 投影把 BF16 舍入合并到 GEMV 写出；设为 `0` 恢复独立舍入 dispatch。trace 使用原路径。 |
 | `MYDS_QKV_FUSE_POST` | 启用 | decode 合并 Q/K RoPE、KV 量化及窗口写入，保留原舍入边界；设为 `0` 恢复原 dispatch。缺融合 PSO、别名或 copy 故障注入时回退原路径。 |
 | `MYDS_QKV_NR0` | `4` | 融合 Q8 GEMV 每组处理四个独立输出行；`2` 使用两个行的配置。归约顺序不变。 |

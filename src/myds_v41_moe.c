@@ -241,19 +241,6 @@ int myds_v41_shared_swiglu(myds_metal_buffer_t *out,
                     (width+255)/256,256,0);
 }
 
-int myds_v41_shared_swiglu_bf16_in(myds_metal_buffer_t *out,
-    const myds_metal_buffer_t *gate, const myds_metal_buffer_t *up,
-    uint32_t width, float clamp) {
-    if (!width || width > INT32_MAX || !isfinite(clamp) || clamp < 0 ||
-        !sized(out,width) || !sized(gate,width) || !sized(up,width)) return 0;
-    struct glu_args args = {.ne00=(int32_t)width,.nb01=(uint64_t)width*4,
-        .ne10=(int32_t)width,.nb11=(uint64_t)width*4,.ne0=(int32_t)width,
-        .nb1=(uint64_t)width*4,.alpha=1,.limit=clamp,.round_bf16=1};
-    const myds_metal_buffer_t *buffers[] = {gate,up,out};
-    return dispatch("kernel_swiglu_flat_bf16_in_f32", &args, sizeof(args), buffers, 3,
-                    (width+255)/256,256,0);
-}
-
 int myds_dspark_shared_swiglu(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *gate, const myds_metal_buffer_t *up,
     uint32_t width, float clamp_val) {
