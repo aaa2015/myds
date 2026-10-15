@@ -8176,7 +8176,6 @@ kernel void kernel_swiglu_flat_bf16_in_f32(
         device const char * src1                   [[buffer(2)]],
         device       char * dst                    [[buffer(3)]],
         uint i [[thread_position_in_grid]]) {
-    #pragma clang fp reassociate(off)
     if (i >= (uint)args.ne0) return;
 
     device const float * src0_f32 = (device const float *) src0 + args.i00;
@@ -8191,7 +8190,7 @@ kernel void kernel_swiglu_flat_bf16_in_f32(
     }
 
     const float silu = x0 / (1.0f + exp(-x0));
-    const float glu_v = (silu * x1) * args.alpha;
+    const float glu_v = silu*x1*args.alpha;
     dst_f32[i] = args.round_bf16 ? dsv41_bf16_round_f32(glu_v) : glu_v;
 }
 

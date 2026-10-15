@@ -881,7 +881,7 @@ static int test_prefill_batch_fusions(void) {
 
             /* 4d) kernel_swiglu_flat_bf16_in_f32 vs bf16(gate) + bf16(up) + kernel_swiglu_flat_f32 */
             {
-                const uint32_t sw_cnt = n_tok * 256u;
+                const uint32_t sw_cnt = n_tok * 2304u;
                 myds_metal_buffer_t *g_ref = myds_metal_buffer_alloc(sw_cnt * 4u);
                 myds_metal_buffer_t *u_ref = myds_metal_buffer_alloc(sw_cnt * 4u);
                 myds_metal_buffer_t *g_out = myds_metal_buffer_alloc(sw_cnt * 4u);
@@ -891,9 +891,20 @@ static int test_prefill_batch_fusions(void) {
                 CHECK(g_ref && u_ref && g_out && u_out && s_ref && s_out);
                 float *pg = myds_metal_buffer_data(g_ref);
                 float *pu = myds_metal_buffer_data(u_ref);
+                uint32_t xs = 987654321u + n_tok;
                 for (size_t i = 0; i < sw_cnt; i++) {
-                    pg[i] = (float)((int)((i * 103u + 5u) % 1021u) - 510) / 127.0f;
-                    pu[i] = (float)((int)((i * 67u + 19u) % 1019u) - 509) / 139.0f;
+                    for (int k = 0; k < 2; k++) {
+                        xs ^= xs << 13; xs ^= xs >> 17; xs ^= xs << 5;
+                        uint32_t sign = xs & 0x80000000u;
+                        uint32_t exp  = (110u + ((xs >> 23) % 24u)) << 23;
+                        uint32_t mant = xs & 0x007fffffu;
+                        if ((xs & 3u) == 0u) mant = (mant & 0x007f0000u) | 0x00008000u;
+                        else if ((xs & 3u) == 1u) mant = (mant & 0x007f0000u) | 0x00007fffu;
+                        uint32_t bits = sign | exp | mant;
+                        float fv;
+                        memcpy(&fv, &bits, 4);
+                        if (k == 0) pg[i] = fv; else pu[i] = fv;
+                    }
                 }
                 memcpy(myds_metal_buffer_data(g_out), pg, sw_cnt * 4u);
                 memcpy(myds_metal_buffer_data(u_out), pu, sw_cnt * 4u);
