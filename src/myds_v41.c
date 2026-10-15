@@ -2834,12 +2834,15 @@ static int project_batch(myds_metal_buffer_t *out, const myds_metal_buffer_t *w,
         const uint32_t mm_min = mm_min_m();
         if (mm_min && rows < mm_min) use_mm = 0;   /* 小 M：MM 的 64 行 tile 会退化成单块 */
     }
-    if (use_mm && myds_metal_mul_mm_ext(out, w, in, rows, width, n_tok, type, round)) {
-        return 1;
+    int ok = 0;
+    if (use_mm) {
+        ok = myds_metal_mul_mm(out, w, in, rows, width, n_tok, type);
     }
-    int ok = ((type == GGML_TYPE_F16 || type == GGML_TYPE_F32)
-        ? myds_metal_v41_gemv_batch(out, w, in, rows, width, n_tok, type)
-        : myds_metal_gemv_batch(out, w, in, rows, width, n_tok, type));
+    if (!ok) {
+        ok = ((type == GGML_TYPE_F16 || type == GGML_TYPE_F32)
+            ? myds_metal_v41_gemv_batch(out, w, in, rows, width, n_tok, type)
+            : myds_metal_gemv_batch(out, w, in, rows, width, n_tok, type));
+    }
     return ok && (!round || myds_metal_v41_bf16(out, rows * n_tok));
 }
 
@@ -6556,6 +6559,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 
     const bool opt_shrink_macroblock = (getenv("MYDS_SUFFIX_SHRINK_MACROBLOCK") != NULL);
     const bool opt_sync_chunk = (getenv("MYDS_PREFILL_SYNC_CHUNK") != NULL);
+    uint32_t inflight_chunks = 0;
     uint32_t il = 0;
     int idx_fallback_warned = 0;   /* 批量 indexer 回退只提示一次 */
     const char *phase = "engram prepare";
@@ -7035,14 +7039,13 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 myds_metal_barrier();
                 int a_ok = 0;
                 if (!opt_disable_mm_attn_a)
-                    a_ok = myds_metal_mul_mm_grouped_ext(cw->attn_low_buf, base->attn_output_a,
-                            cw->attn_heads_buf, 1024, 4096, 8, c_len, base->attn_output_a_type, true);
-                if (!a_ok) {
+                    a_ok = myds_metal_mul_mm_grouped(cw->attn_low_buf, base->attn_output_a,
+                            cw->attn_heads_buf, 1024, 4096, 8, c_len, base->attn_output_a_type);
+                if (!a_ok)
                     a_ok = myds_metal_attn_output_a_batch(cw->attn_low_buf, base->attn_output_a,
                             cw->attn_heads_buf, 8, 4096, 1024, c_len, base->attn_output_a_type);
-                    CHECK(a_ok);
-                    CHECK(myds_metal_v41_bf16(cw->attn_low_buf, 8192 * c_len));
-                }
+                CHECK(a_ok);
+                CHECK(myds_metal_v41_bf16(cw->attn_low_buf, 8192 * c_len));
                 TIME_ACC(prof_step4);
                 if (do_prof) { disp_mark4 = myds_metal_dispatch_count(); disp_step14 += disp_mark4 - disp_layer0; }  /* 诊断 */
 
@@ -7282,7 +7285,8 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 TIME_ACC(prof_step8);
 
                 TIME_START();
-                if (do_prof || trace_on || opt_sync_chunk) {
+                if (do_prof || trace_on || opt_sync_chunk || ++inflight_chunks >= 32u) {
+                    inflight_chunks = 0;
                     CHECK(myds_metal_commit_batch());
                 } else {
                     CHECK(myds_metal_flush_batch());
@@ -7306,6 +7310,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 CHECK(myds_metal_buffer_copy(g->residual, 0, prompt_res, last_mb_idx * res_tok_bytes, res_tok_bytes));
                 CHECK(myds_metal_buffer_copy(g->pre, 0, prompt_pre, last_mb_idx * pre_tok_bytes, 4 * sizeof(float)));
             }
+            inflight_chunks = 0;
             CHECK(myds_metal_commit_batch());
         }
     } /* macroblock loop */

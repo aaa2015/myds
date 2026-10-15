@@ -50,8 +50,6 @@ struct ds4_metal_args_mul_mm {
     /* 追加在末尾：0 表示原来的紧凑布局（dst 行步长 = ne0）。 */
     uint64_t nb_out;
     uint64_t nb_out_batch;
-    int32_t  round_bf16;
-    int32_t  pad_mm;
 };
 
 struct ds4_metal_args_mul_mv_ext {
@@ -3165,8 +3163,8 @@ kernel void kernel_mul_mm(
     const int     mm_dst_row  = args.nb_out       ? (int)args.nb_out       : args.ne0;
     const int64_t mm_dst_part = args.nb_out_batch ? (int64_t)args.nb_out_batch : (int64_t)args.ne1*args.ne0;
 
-    if (!args.round_bf16 && (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1))) {
-        // if no bounds checks or BF16 rounding on the output are needed, we can directly write to device memory
+    if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1)) {
+        // if no bounds checks on the output are needed, we can directly write to device memory
         device float * C = (device float *) dst +
             (r0 + 32*(sgitg &  1)) + \
             (r1 + 16*(sgitg >> 1)) * mm_dst_row + im*mm_dst_part;
@@ -3175,7 +3173,7 @@ kernel void kernel_mul_mm(
             simdgroup_store(mc[i], C + 8*(i%4) + 8*mm_dst_row*(i/4), mm_dst_row, 0, false);
         }
     } else {
-        // boundary tile or fused BF16 rounding: stage 64x32 tile in threadgroup shmem (8192 bytes)
+        // block is smaller than 64x32, we should avoid writing data outside of the matrix
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
@@ -3186,15 +3184,23 @@ kernel void kernel_mul_mm(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        threadgroup const float * temp_base = (threadgroup const float *) shmem;
-        const ushort lane = tiitg & 31u;
-        const bool round_bf16 = (args.round_bf16 != 0);
-        for (int j = (int)sgitg; j < (int)nr1; j += 4) {
-            device float * D = (device float *) dst + r0 + (r1 + j)*mm_dst_row + im*mm_dst_part;
-            threadgroup const float * C = temp_base + j*NR0;
-            for (int i = (int)lane; i < (int)nr0; i += 32) {
-                const float v = C[i];
-                D[i] = round_bf16 ? dsv4_mv_bf16_store(v) : v;
+        if (sgitg == 0) {
+            for (int j = tiitg; j < nr1; j += NR1) {
+                device float  * D  = (device float  *) dst + r0 + (r1 + j)*mm_dst_row + im*mm_dst_part;
+                device float4 * D4 = (device float4 *) D;
+
+                threadgroup float  * C  = temp_str + (j*NR0);
+                threadgroup float4 * C4 = (threadgroup float4 *) C;
+
+                int i = 0;
+                for (; i < nr0/4; i++) {
+                    *(D4 + i) = *(C4 + i);
+                }
+
+                i *= 4;
+                for (; i < nr0; i++) {
+                    *(D + i) = *(C + i);
+                }
             }
         }
     }

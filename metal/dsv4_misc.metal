@@ -7452,3 +7452,134 @@ kernel void kernel_myds_indexer_score_one_head_slots(
         scores[row] = acc;
     }
 }
+
+struct ds4_metal_args_hc_sum_rmsnorm_batch {
+    uint32_t dim;
+    float    eps;
+    int32_t  round_bf16;
+    int32_t  has_sum_out;
+    uint64_t weight_stride_bytes;
+};
+
+kernel void kernel_myds_v41_hc_sum_rmsnorm_batch(
+        constant ds4_metal_args_hc_sum_rmsnorm_batch & args  [[buffer(0)]],
+        device  const float * residual                 [[buffer(1)]],
+        device  const float * weights                  [[buffer(2)]],
+        device  const float * norm_weight              [[buffer(3)]],
+        device        float * sum_dst                  [[buffer(4)]],
+        device        float * norm_dst                 [[buffer(5)]],
+        threadgroup   float * shmem_f32                [[threadgroup(0)]],
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort3 tpitg [[thread_position_in_threadgroup]],
+        ushort  sgitg [[simdgroup_index_in_threadgroup]],
+        ushort  tiisg [[thread_index_in_simdgroup]],
+        ushort3 ntg   [[threads_per_threadgroup]]) {
+    if (sgitg == 0) {
+        shmem_f32[tiisg] = 0.0f;
+    }
+
+    const uint dim = args.dim;
+    const uint ne00_t = dim / 4;
+    const uint64_t tok = (uint64_t)tgpig.x;
+    const uint64_t w_stride = args.weight_stride_bytes ? args.weight_stride_bytes : 16ull;
+
+    device const float *res_tok = residual + tok * 4ull * (uint64_t)dim;
+    device const float4 *r0 = (device const float4 *)(res_tok);
+    device const float4 *r1 = (device const float4 *)(res_tok + dim);
+    device const float4 *r2 = (device const float4 *)(res_tok + 2 * dim);
+    device const float4 *r3 = (device const float4 *)(res_tok + 3 * dim);
+
+    device const float *w_tok = (device const float *)((device const char *)weights + tok * w_stride);
+    const float w0 = w_tok[0];
+    const float w1 = w_tok[1];
+    const float w2 = w_tok[2];
+    const float w3 = w_tok[3];
+
+    device const float4 *norm_w = (device const float4 *)norm_weight;
+    device float4 *sum_out = (device float4 *)(sum_dst + tok * (uint64_t)dim);
+    device float4 *dst = (device float4 *)(norm_dst + tok * (uint64_t)dim);
+
+    float sumf = 0.0f;
+    float4 v_reg[5];
+    uint reg_idx = 0;
+
+    for (uint i00 = tpitg.x; i00 < ne00_t; i00 += ntg.x) {
+        float4 acc = 0.0f;
+        acc += r0[i00] * w0;
+        acc += r1[i00] * w1;
+        acc += r2[i00] * w2;
+        acc += r3[i00] * w3;
+
+        const float4 v = dsv41_bf16_round_f32x4(acc);
+        if (args.has_sum_out) {
+            sum_out[i00] = v;
+        }
+        if (reg_idx < 5) {
+            v_reg[reg_idx] = v;
+        }
+        reg_idx++;
+
+        sumf += dot(v, v);
+    }
+
+    sumf = simd_sum(sumf);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        shmem_f32[sgitg] = sumf;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = shmem_f32[tiisg];
+    sumf = simd_sum(sumf);
+
+    const float mean = sumf / float(dim);
+    const float scale = 1.0f / sqrt(mean + args.eps);
+
+    reg_idx = 0;
+    const bool round_bf16 = (args.round_bf16 != 0);
+    for (uint i00 = tpitg.x; i00 < ne00_t; i00 += ntg.x) {
+        const float4 v = (reg_idx < 5) ? v_reg[reg_idx] : (args.has_sum_out ? sum_out[i00] : float4(0.0f));
+        reg_idx++;
+        const float4 norm_v = (v * scale) * norm_w[i00];
+        dst[i00] = round_bf16 ? dsv41_bf16_round_f32x4(norm_v) : norm_v;
+    }
+}
+
+kernel void kernel_dsv4_moe_add_hc_expand4_batch(
+        constant ds4_metal_args_dsv4_hc_expand & args [[buffer(0)]],
+        device  const float * moe_out                  [[buffer(1)]],
+        device  const float * shared_out               [[buffer(2)]],
+        device  const char  * residual                 [[buffer(3)]],
+        device  const char  * post                     [[buffer(4)]],
+        device  const char  * comb                     [[buffer(5)]],
+        device        char  * dst                      [[buffer(6)]],
+        device        float * ffn_out                  [[buffer(7)]],
+        uint2 gid [[thread_position_in_grid]]) {
+    if (args.n_hc != 4) return;
+    const int64_t d = (int64_t) gid.x;
+    const int64_t t = (int64_t) gid.y;
+    if (d >= args.n_embd || t >= args.n_tokens) return;
+    const int64_t idx = t * args.n_embd + d;
+
+    const float ffn_val = dsv41_bf16_round_f32(moe_out[idx] + shared_out[idx]);
+    if (args.has_add && ffn_out) {
+        ffn_out[idx] = ffn_val;
+    }
+
+    const float r0 = *((device const float *) (residual + d*args.nb_res0 + 0*args.nb_res1 + t*args.nb_res2));
+    const float r1 = *((device const float *) (residual + d*args.nb_res0 + 1*args.nb_res1 + t*args.nb_res2));
+    const float r2 = *((device const float *) (residual + d*args.nb_res0 + 2*args.nb_res1 + t*args.nb_res2));
+    const float r3 = *((device const float *) (residual + d*args.nb_res0 + 3*args.nb_res1 + t*args.nb_res2));
+
+    for (int64_t dst_hc = 0; dst_hc < 4; ++dst_hc) {
+        float acc = ffn_val * *((device const float *) (post + dst_hc*args.nb_post0 + t*args.nb_post1));
+
+        acc += *((device const float *) (comb + dst_hc*args.nb_comb0 + 0*args.nb_comb1 + t*args.nb_comb2)) * r0;
+        acc += *((device const float *) (comb + dst_hc*args.nb_comb0 + 1*args.nb_comb1 + t*args.nb_comb2)) * r1;
+        acc += *((device const float *) (comb + dst_hc*args.nb_comb0 + 2*args.nb_comb1 + t*args.nb_comb2)) * r2;
+        acc += *((device const float *) (comb + dst_hc*args.nb_comb0 + 3*args.nb_comb1 + t*args.nb_comb2)) * r3;
+
+        *((device float *) (dst + d*args.nb0 + dst_hc*args.nb1 + t*args.nb2)) =
+            args.round_bf16 ? dsv41_bf16_round_f32(acc) : acc;
+    }
+}

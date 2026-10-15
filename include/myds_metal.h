@@ -423,15 +423,6 @@ int myds_metal_mul_mm(
     uint32_t                   in_dim,
     uint32_t                   n_tok,
     ggml_type                  weight_type);
-int myds_metal_mul_mm_ext(
-    myds_metal_buffer_t       *dst,
-    const myds_metal_buffer_t *W,
-    const myds_metal_buffer_t *src1,
-    uint32_t                   out_dim,
-    uint32_t                   in_dim,
-    uint32_t                   n_tok,
-    ggml_type                  weight_type,
-    bool                       round_bf16);
 /* 分组矩阵乘：一次派发完成所有组（见 myds_metal.m 的说明）。 */
 int myds_metal_mul_mm_grouped(
     myds_metal_buffer_t       *dst,
@@ -442,16 +433,6 @@ int myds_metal_mul_mm_grouped(
     uint32_t                   n_groups,
     uint32_t                   n_tok,
     ggml_type                  weight_type);
-int myds_metal_mul_mm_grouped_ext(
-    myds_metal_buffer_t       *dst,
-    const myds_metal_buffer_t *W,
-    const myds_metal_buffer_t *src1,
-    uint32_t                   out_dim,
-    uint32_t                   in_dim,
-    uint32_t                   n_groups,
-    uint32_t                   n_tok,
-    ggml_type                  weight_type,
-    bool                       round_bf16);
 
 /* SwiGLU activation: out = (x0 / (1 + exp(-x0))) * x1 */
 int myds_metal_swiglu(

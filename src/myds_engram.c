@@ -259,7 +259,8 @@ enum {
     ENGRAM_IO_MAX_THREADS = 16,
     ENGRAM_BATCH_MAX = 64,
     ENGRAM_IO_JOBS = MYDS_ENGRAM_LAYERS * MYDS_ENGRAM_COLS,
-    ENGRAM_IO_BATCH_JOBS = ENGRAM_BATCH_MAX * ENGRAM_IO_JOBS
+    ENGRAM_IO_BATCH_JOBS = ENGRAM_BATCH_MAX * ENGRAM_IO_JOBS,
+    ENGRAM_BATCH_FLAG = 0x80000000u
 };
 typedef struct {
     int fd, error, retry_errno;
@@ -281,7 +282,8 @@ struct myds_engram_reader {
     pthread_cond_t work, done;
     pthread_t threads[ENGRAM_IO_MAX_THREADS];
     engram_io_worker_t worker[ENGRAM_IO_MAX_THREADS];
-    engram_io_job_t jobs[ENGRAM_IO_BATCH_JOBS];
+    engram_io_job_t jobs[ENGRAM_IO_JOBS];
+    engram_io_job_t *batch_jobs;
 };
 
 static void read_raw_job(engram_io_job_t *job) {
@@ -296,6 +298,26 @@ static void read_raw_job(engram_io_job_t *job) {
     job->error = 0;
 }
 
+static __attribute__((noinline)) void engram_io_worker_batch(
+    myds_engram_reader_t *r, unsigned worker_index, unsigned count) {
+    unsigned my_jobs[ENGRAM_IO_BATCH_JOBS];
+    unsigned n_my_jobs = 0;
+    for (unsigned i = worker_index; i < count; i += r->workers)
+        my_jobs[n_my_jobs++] = i;
+    for (unsigned i = 1; i < n_my_jobs; ++i) {
+        unsigned tmp = my_jobs[i];
+        uint64_t off = r->batch_jobs[tmp].offset;
+        unsigned j = i;
+        while (j > 0 && r->batch_jobs[my_jobs[j - 1]].offset > off) {
+            my_jobs[j] = my_jobs[j - 1];
+            --j;
+        }
+        my_jobs[j] = tmp;
+    }
+    for (unsigned i = 0; i < n_my_jobs; ++i)
+        read_raw_job(&r->batch_jobs[my_jobs[i]]);
+}
+
 static void *engram_io_worker(void *opaque) {
     engram_io_worker_t *worker = opaque;
     myds_engram_reader_t *r = worker->reader;
@@ -308,23 +330,26 @@ static void *engram_io_worker(void *opaque) {
         seen = r->generation;
         const unsigned count = r->job_count;
         pthread_mutex_unlock(&r->state);
-        /* Sequentialize I/O: sort assigned jobs by offset to avoid random disk/page thrashing */
-        unsigned my_jobs[ENGRAM_IO_BATCH_JOBS];
-        unsigned n_my_jobs = 0;
-        for (unsigned i = worker->index; i < count; i += r->workers)
-            my_jobs[n_my_jobs++] = i;
-        for (unsigned i = 1; i < n_my_jobs; ++i) {
-            unsigned tmp = my_jobs[i];
-            uint64_t off = r->jobs[tmp].offset;
-            unsigned j = i;
-            while (j > 0 && r->jobs[my_jobs[j - 1]].offset > off) {
-                my_jobs[j] = my_jobs[j - 1];
-                --j;
+        if (__builtin_expect(!(count & ENGRAM_BATCH_FLAG), 1)) {
+            /* Sequentialize I/O: sort assigned jobs by offset to avoid random disk/page thrashing */
+            unsigned my_jobs[ENGRAM_IO_JOBS];
+            unsigned n_my_jobs = 0;
+            for (unsigned i = worker->index; i < count; i += r->workers)
+                my_jobs[n_my_jobs++] = i;
+            for (unsigned i = 0; i < n_my_jobs; ++i) {
+                for (unsigned j = i + 1; j < n_my_jobs; ++j) {
+                    if (r->jobs[my_jobs[j]].offset < r->jobs[my_jobs[i]].offset) {
+                        unsigned tmp = my_jobs[i];
+                        my_jobs[i] = my_jobs[j];
+                        my_jobs[j] = tmp;
+                    }
+                }
             }
-            my_jobs[j] = tmp;
+            for (unsigned i = 0; i < n_my_jobs; ++i)
+                read_raw_job(&r->jobs[my_jobs[i]]);
+        } else {
+            engram_io_worker_batch(r, worker->index, count & ~ENGRAM_BATCH_FLAG);
         }
-        for (unsigned i = 0; i < n_my_jobs; ++i)
-            read_raw_job(&r->jobs[my_jobs[i]]);
         pthread_mutex_lock(&r->state);
         if (--r->remaining == 0) pthread_cond_signal(&r->done);
     }
@@ -388,6 +413,7 @@ void myds_engram_reader_free(myds_engram_reader_t *r) {
         pthread_mutex_destroy(&r->state);
         pthread_mutex_destroy(&r->submit);
     }
+    free(r->batch_jobs);
     free(r);
 }
 
@@ -714,6 +740,21 @@ bool myds_engram_prepare_batch(myds_engram_t *e, const int32_t *tokens,
         }
 
         pthread_mutex_lock(&r->submit);
+        if (!r->batch_jobs) {
+            r->batch_jobs = (engram_io_job_t *)calloc(ENGRAM_IO_BATCH_JOBS, sizeof(engram_io_job_t));
+            if (!r->batch_jobs) {
+                pthread_mutex_unlock(&r->submit);
+                for (size_t t = 0; t < chunk; ++t) {
+                    if (!myds_engram_prepare_token(e, tokens[off + t], start_position + off + t)) return false;
+                    memcpy(out_layer0 + (off + t) * MYDS_ENGRAM_INPUT_DIM,
+                           e->row_values[0], MYDS_ENGRAM_INPUT_DIM * sizeof(float));
+                    memcpy(out_layer1 + (off + t) * MYDS_ENGRAM_INPUT_DIM,
+                           e->row_values[1], MYDS_ENGRAM_INPUT_DIM * sizeof(float));
+                }
+                off += chunk;
+                continue;
+            }
+        }
         unsigned map[ENGRAM_BATCH_MAX][MYDS_ENGRAM_LAYERS][MYDS_ENGRAM_COLS];
         unsigned jobs = 0;
         uint32_t ht_row[4096];
@@ -733,17 +774,17 @@ bool myds_engram_prepare_batch(myds_engram_t *e, const int32_t *tokens,
                     ht_row[h] = rid;
                     ht_job[h] = (int16_t)jobs;
                     map[t][layer][col] = jobs;
-                    r->jobs[jobs].fd = e->table[layer].fd;
-                    r->jobs[jobs].offset = e->table[layer].offset +
-                                           (uint64_t)rid * MYDS_ENGRAM_ROW_BYTES;
-                    r->jobs[jobs].error = 0;
-                    r->jobs[jobs].retry_errno = 0;
+                    r->batch_jobs[jobs].fd = e->table[layer].fd;
+                    r->batch_jobs[jobs].offset = e->table[layer].offset +
+                                                 (uint64_t)rid * MYDS_ENGRAM_ROW_BYTES;
+                    r->batch_jobs[jobs].error = 0;
+                    r->batch_jobs[jobs].retry_errno = 0;
                     ++jobs;
                 }
             }
         }
         pthread_mutex_lock(&r->state);
-        r->job_count = jobs;
+        r->job_count = jobs | ENGRAM_BATCH_FLAG;
         r->remaining = r->workers;
         ++r->generation;
         pthread_cond_broadcast(&r->work);
@@ -759,7 +800,7 @@ bool myds_engram_prepare_batch(myds_engram_t *e, const int32_t *tokens,
                                   (off + t) * MYDS_ENGRAM_INPUT_DIM;
                 for (int col = 0; col < MYDS_ENGRAM_COLS; ++col) {
                     const unsigned jid = map[t][layer][col];
-                    engram_io_job_t *job = &r->jobs[jid];
+                    engram_io_job_t *job = &r->batch_jobs[jid];
                     if (job->error) { ok = false; break; }
                     float *dst = dst_base + col * MYDS_ENGRAM_DIM;
                     if (job_decoded[jid]) {
