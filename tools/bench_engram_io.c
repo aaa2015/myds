@@ -77,12 +77,12 @@ static bool gate(bool enabled) {
     return true;
 }
 static void usage(void) {
-    fputs("usage: bench_engram_io --model MODEL (--tokens-bin LE_I32_FILE | --text UTF8_FILE) [--workers 1|4|8] [--runs 1..8] [--mode cached|nocache] [--gate]\n", stderr);
+    fputs("usage: bench_engram_io --model MODEL (--tokens-bin LE_I32_FILE | --text UTF8_FILE) [--workers 1|4|8|auto] [--runs 1..8] [--mode cached|nocache] [--gate]\n", stderr);
 }
 
 int main(int argc, char **argv) {
     const char *model = NULL, *binary = NULL, *text = NULL, *mode = "cached";
-    unsigned workers = 1, runs = 1; bool gated = false;
+    unsigned workers = 1, runs = 1; bool gated = false; bool adaptive = false;
     for (int i = 1; i < argc; ++i) {
         const char *arg = argv[i];
         if (!strcmp(arg, "--gate")) { gated = true; continue; }
@@ -92,14 +92,18 @@ int main(int argc, char **argv) {
         else if (!strcmp(arg, "--tokens-bin")) binary = value;
         else if (!strcmp(arg, "--text")) text = value;
         else if (!strcmp(arg, "--mode")) mode = value;
-        else if (!strcmp(arg, "--workers")) workers = positive(value, 8);
+        else if (!strcmp(arg, "--workers")) {
+            if (!strcmp(value, "auto")) adaptive = true;
+            else workers = positive(value, 8);
+        }
         else if (!strcmp(arg, "--runs")) runs = positive(value, 8);
         else { usage(); return 2; }
     }
-    if (!model || (!binary == !text) || (workers != 1 && workers != 4 && workers != 8) ||
+    if (!model || (!binary == !text) || (!adaptive && workers != 1 && workers != 4 && workers != 8) ||
         !runs || (strcmp(mode, "cached") && strcmp(mode, "nocache"))) { usage(); return 2; }
     char nworkers[16]; snprintf(nworkers, sizeof(nworkers), "%u", workers);
-    if (setenv("MYDS_ENGRAM_IO_THREADS", nworkers, 1) ||
+    const char *io_env = adaptive ? "auto" : nworkers;
+    if (setenv("MYDS_ENGRAM_IO_THREADS", io_env, 1) ||
         (!strcmp(mode, "nocache") ? setenv("MYDS_ENGRAM_NOCACHE", "1", 1) : unsetenv("MYDS_ENGRAM_NOCACHE"))) {
         perror("environment"); return 1;
     }
@@ -121,7 +125,8 @@ int main(int argc, char **argv) {
         projection->dims[1] / 5 > UINT32_MAX) { fputs("Missing Engram layout\n", stderr); goto done; }
     e = myds_engram_create(gf, model, (uint32_t)map->value.val_arr.count,
                           (uint32_t)(projection->dims[1] / 5));
-    if (!e || !myds_engram_set_io_threads(e, workers)) { perror("Engram creation"); goto done; }
+    /* auto keeps the adaptive controller in charge; fixed counts pin it. */
+    if (!e || (!adaptive && !myds_engram_set_io_threads(e, workers))) { perror("Engram creation"); goto done; }
     if (!myds_engram_unmap_tables(gf, e)) { perror("unmap tables"); goto done; }
     input = read_file(binary ? binary : text, binary ? MAX_TOKENS * 4u : MAX_TEXT_BYTES, &input_size);
     if (!input || !input_size) { perror("input file"); goto done; }

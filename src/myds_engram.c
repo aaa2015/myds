@@ -39,6 +39,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 static bool fail(int error) { errno = error; return false; }
@@ -495,7 +496,70 @@ bool myds_engram_set_io_threads(myds_engram_t *e, unsigned workers) {
     myds_engram_reader_free(e->reader);
     e->reader = next;
     e->io_threads = workers;
+    /* Keep the adaptive controller's view honest when a caller pins the
+     * worker count through this API. */
+    if (e->io_adaptive) e->adapt_pool = workers > 1;
     return true;
+}
+
+/*
+ * Adaptive raw-read controller (MYDS_ENGRAM_IO_THREADS=auto).
+ *
+ * Measured per-token prepare cost on this host:
+ *   hot cache   serial 25 us   pool(8) 83 us   -> serial wins by 58 us
+ *   cold table  serial 1197 us pool(8) 249 us  -> pool wins by 948 us
+ * The two regimes are an order of magnitude apart, so one mark separates them
+ * for both directions. Consecutive-window counters plus a cooldown keep the
+ * controller from flapping when a prompt mixes cold and warm n-grams.
+ */
+enum {
+    ENGRAM_ADAPT_WINDOW_TOKENS   = 8,
+    ENGRAM_ADAPT_MARK_US         = 150,
+    ENGRAM_ADAPT_UP_WINDOWS      = 2,
+    ENGRAM_ADAPT_DOWN_WINDOWS    = 24,
+    ENGRAM_ADAPT_COOLDOWN_WINDOWS= 64,
+    ENGRAM_ADAPT_WORKERS         = 8
+};
+
+static double engram_now_us(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0.0;
+    return (double)ts.tv_sec * 1e6 + (double)ts.tv_nsec * 1e-3;
+}
+
+static void engram_adapt_note(myds_engram_t *e, double us, size_t tokens) {
+    if (!e->io_adaptive || !tokens) return;
+    e->adapt_us += us;
+    e->adapt_win += (unsigned)tokens;
+    if (e->adapt_win < ENGRAM_ADAPT_WINDOW_TOKENS) return;
+    const double avg = e->adapt_us / (double)e->adapt_win;
+    e->adapt_us = 0.0;
+    e->adapt_win = 0;
+    if (e->adapt_cooldown) { --e->adapt_cooldown; return; }
+    if (!e->adapt_pool) {
+        if (avg > ENGRAM_ADAPT_MARK_US) {
+            if (++e->adapt_up >= ENGRAM_ADAPT_UP_WINDOWS) {
+                /* A failed switch leaves the serial path in place: still correct. */
+                if (myds_engram_set_io_threads(e, ENGRAM_ADAPT_WORKERS)) {
+                    e->adapt_cooldown = ENGRAM_ADAPT_COOLDOWN_WINDOWS;
+                }
+                e->adapt_up = e->adapt_down = 0;
+            }
+        } else {
+            e->adapt_up = 0;
+        }
+    } else {
+        if (avg < ENGRAM_ADAPT_MARK_US) {
+            if (++e->adapt_down >= ENGRAM_ADAPT_DOWN_WINDOWS) {
+                if (myds_engram_set_io_threads(e, 1u)) {
+                    e->adapt_cooldown = ENGRAM_ADAPT_COOLDOWN_WINDOWS;
+                }
+                e->adapt_up = e->adapt_down = 0;
+            }
+        } else {
+            e->adapt_down = 0;
+        }
+    }
 }
 
 static unsigned configured_io_threads(void) {
@@ -533,7 +597,11 @@ myds_engram_t *myds_engram_create(const gguf_file_t *gf, const char *path,
     myds_engram_t *e = calloc(1, sizeof(*e));
     if (!e) return NULL;
     for (int i = 0; i < MYDS_ENGRAM_LAYERS; ++i) e->table[i].fd = -1;
-    e->io_threads = configured_io_threads();
+    {
+        const char *io = getenv("MYDS_ENGRAM_IO_THREADS");
+        e->io_adaptive = io && strcmp(io, "auto") == 0;
+    }
+    e->io_threads = e->io_adaptive ? 1u : configured_io_threads();
     if (!e->io_threads) {
         fputs("Invalid MYDS_ENGRAM_IO_THREADS: expected an integer in 1..16\n", stderr);
         goto invalid;
@@ -668,9 +736,14 @@ void myds_engram_reset(myds_engram_t *e) {
     myds_engram_history_reset(&e->history);
     e->position = 0;
     e->prepared = false;
+    /* A new sequence re-hashes from scratch, so drop the window in progress but
+     * keep whatever engagement the controller already decided on. */
+    e->adapt_us = 0.0;
+    e->adapt_win = 0;
+    e->adapt_up = e->adapt_down = 0;
 }
 
-bool myds_engram_prepare_token(myds_engram_t *e, int32_t token, uint64_t position) {
+static bool prepare_token_step(myds_engram_t *e, int32_t token, uint64_t position) {
     if (!e) return fail(EINVAL);
     e->prepared = false;
     if (position != e->position || position == UINT64_MAX) return fail(EINVAL);
@@ -686,7 +759,17 @@ bool myds_engram_prepare_token(myds_engram_t *e, int32_t token, uint64_t positio
     return true;
 }
 
-bool myds_engram_prepare_batch(myds_engram_t *e, const int32_t *tokens,
+bool myds_engram_prepare_token(myds_engram_t *e, int32_t token, uint64_t position) {
+    if (!e || !e->io_adaptive) return prepare_token_step(e, token, position);
+    const double t0 = engram_now_us();
+    const bool ok = prepare_token_step(e, token, position);
+    /* Timed here, not inside the step: the controller may only swap readers
+     * between lookups, never while one is in flight. */
+    engram_adapt_note(e, engram_now_us() - t0, 1);
+    return ok;
+}
+
+static bool prepare_batch_step(myds_engram_t *e, const int32_t *tokens,
                               size_t count, uint64_t start_position,
                               float *out_layer0, float *out_layer1) {
     if (!e || (count && (!tokens || !out_layer0 || !out_layer1))) return fail(EINVAL);
@@ -705,7 +788,7 @@ bool myds_engram_prepare_batch(myds_engram_t *e, const int32_t *tokens,
         e->table[0].fd < 0 || e->table[1].fd < 0 ||
         fegetround() != FE_TONEAREST) {
         for (size_t t = 0; t < count; ++t) {
-            if (!myds_engram_prepare_token(e, tokens[t], start_position + t)) return false;
+            if (!prepare_token_step(e, tokens[t], start_position + t)) return false;
             memcpy(out_layer0 + t * MYDS_ENGRAM_INPUT_DIM,
                    e->row_values[0], MYDS_ENGRAM_INPUT_DIM * sizeof(float));
             memcpy(out_layer1 + t * MYDS_ENGRAM_INPUT_DIM,
@@ -729,7 +812,7 @@ bool myds_engram_prepare_batch(myds_engram_t *e, const int32_t *tokens,
         }
         if (!valid) {
             for (size_t t = 0; t < chunk; ++t) {
-                if (!myds_engram_prepare_token(e, tokens[off + t], start_position + off + t)) return false;
+                if (!prepare_token_step(e, tokens[off + t], start_position + off + t)) return false;
                 memcpy(out_layer0 + (off + t) * MYDS_ENGRAM_INPUT_DIM,
                        e->row_values[0], MYDS_ENGRAM_INPUT_DIM * sizeof(float));
                 memcpy(out_layer1 + (off + t) * MYDS_ENGRAM_INPUT_DIM,
@@ -745,7 +828,7 @@ bool myds_engram_prepare_batch(myds_engram_t *e, const int32_t *tokens,
             if (!r->batch_jobs) {
                 pthread_mutex_unlock(&r->submit);
                 for (size_t t = 0; t < chunk; ++t) {
-                    if (!myds_engram_prepare_token(e, tokens[off + t], start_position + off + t)) return false;
+                    if (!prepare_token_step(e, tokens[off + t], start_position + off + t)) return false;
                     memcpy(out_layer0 + (off + t) * MYDS_ENGRAM_INPUT_DIM,
                            e->row_values[0], MYDS_ENGRAM_INPUT_DIM * sizeof(float));
                     memcpy(out_layer1 + (off + t) * MYDS_ENGRAM_INPUT_DIM,
@@ -817,7 +900,7 @@ bool myds_engram_prepare_batch(myds_engram_t *e, const int32_t *tokens,
 
         if (!ok) {
             for (size_t t = 0; t < chunk; ++t) {
-                if (!myds_engram_prepare_token(e, tokens[off + t], start_position + off + t)) return false;
+                if (!prepare_token_step(e, tokens[off + t], start_position + off + t)) return false;
                 memcpy(out_layer0 + (off + t) * MYDS_ENGRAM_INPUT_DIM,
                        e->row_values[0], MYDS_ENGRAM_INPUT_DIM * sizeof(float));
                 memcpy(out_layer1 + (off + t) * MYDS_ENGRAM_INPUT_DIM,
@@ -838,6 +921,17 @@ bool myds_engram_prepare_batch(myds_engram_t *e, const int32_t *tokens,
         off += chunk;
     }
     return true;
+}
+
+bool myds_engram_prepare_batch(myds_engram_t *e, const int32_t *tokens,
+                              size_t count, uint64_t start_position,
+                              float *out_layer0, float *out_layer1) {
+    if (!e || !e->io_adaptive || !count)
+        return prepare_batch_step(e, tokens, count, start_position, out_layer0, out_layer1);
+    const double t0 = engram_now_us();
+    const bool ok = prepare_batch_step(e, tokens, count, start_position, out_layer0, out_layer1);
+    engram_adapt_note(e, engram_now_us() - t0, count);
+    return ok;
 }
 
 bool myds_engram_add_reference(float *residual, const float *kv,

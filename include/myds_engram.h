@@ -76,8 +76,17 @@ typedef struct {
     uint32_t layer_ids[MYDS_ENGRAM_LAYERS], width;
     uint64_t position;
     bool prepared;
-    unsigned io_threads;
+    unsigned io_threads;              /* fixed 1..16; 1 while adaptive is idle */
+    bool io_adaptive;                 /* MYDS_ENGRAM_IO_THREADS=auto */
     myds_engram_reader_t *reader;
+    /* Adaptive raw-read controller. Contexts are single-threaded, so these
+     * counters need no locking; a switch is only ever performed between
+     * lookups, never while a reader is in flight. */
+    bool adapt_pool;                  /* worker pool currently engaged */
+    double adapt_us;                  /* microseconds in the open window */
+    unsigned adapt_win;               /* tokens in the open window */
+    unsigned adapt_up, adapt_down;    /* consecutive windows past a mark */
+    unsigned adapt_cooldown;          /* windows to wait after a switch */
     uint32_t row_ids[MYDS_ENGRAM_LAYERS][MYDS_ENGRAM_COLS];
     float row_values[MYDS_ENGRAM_LAYERS][MYDS_ENGRAM_INPUT_DIM];
 } myds_engram_t;
@@ -91,7 +100,10 @@ myds_engram_t *myds_engram_create(const gguf_file_t *gf, const char *path,
 myds_engram_t *myds_engram_clone(const myds_engram_t *engram);
 /* 1 selects serial I/O; 2..16 create a private persistent pool. Failure leaves
  * the previous configuration intact. Like prepare/reset/free, this requires
- * exclusive access to the context. Model load reads MYDS_ENGRAM_IO_THREADS. */
+ * exclusive access to the context. Model load reads MYDS_ENGRAM_IO_THREADS:
+ * `auto` selects the adaptive controller, `1` forces the serial path, and
+ * `2`..`16` pin the worker count. An explicit call here overrides the
+ * adaptive controller's current engagement. */
 bool myds_engram_set_io_threads(myds_engram_t *engram, unsigned workers);
 /* Reject overlapping/non-tail layouts; unmap only page-aligned disk-only tail.
  * Call before publishing model pointers/GPU views. Sets table data pointers to
