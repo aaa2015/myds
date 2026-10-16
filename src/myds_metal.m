@@ -4424,9 +4424,25 @@ int myds_metal_v41_gemv_batch(myds_metal_buffer_t *out,
     args.nr0 = 2;
     args.r2 = 1;
     args.r3 = 1;
+    /* 2026-10-16 参谋长: NR0 分块旋钮。模板已实例化 NR0∈{1,2,4}；它只决定每个线程组处理几行，
+     * 每一行的归约顺序与算术完全不变 ⇒ 结果应逐位一致（实测核对）。
+     * 动机: kprof 显示 HC-mix 投影 (out_dim=24) 以 grid=(12,1,1) 派发、80 次/token、合计
+     * 1.139 ms/token，而每 token 仅读约 78 MB ⇒ 76 核 GPU 只用到 12 个线程组。
+     * grid.x 变为 ceil(out_dim/NR0)，归约缓存随 NR0 线性增长。 */
+    static int v41_gemv_nr0 = -1;
+    if (v41_gemv_nr0 < 0) {
+        const char *nr0_env = getenv("MYDS_V41_GEMV_NR0");
+        /* 实测: NR0=1 优于 2（short -0.11% / business -0.05%，原始 logits 逐字节一致），
+         * NR0=4 明显更差（+0.9%）。故默认 1；MYDS_V41_GEMV_NR0=2|4 可显式覆盖。 */
+        const int v = nr0_env ? atoi(nr0_env) : 1;
+        v41_gemv_nr0 = (v == 2 || v == 4) ? v : 1;
+    }
     @autoreleasepool {
         const uint32_t b_size = (n_tok > 1u) ? get_gemv_batch_size() : 1u;
         const bool use_b4 = (b_size == 4u && n_tok > 1u);
+        /* b4 变体沿用其固定 NR0=2 与缓存契约，不参与本旋钮。 */
+        if (!use_b4) args.nr0 = (int32_t)v41_gemv_nr0;
+        const unsigned nr0v = (unsigned)args.nr0;
         NSString *funcName = nil;
         if (use_b4) {
             funcName = weight_type == GGML_TYPE_F32 ? @"kernel_mul_mv_f32_f32_4_b4" : @"kernel_mul_mv_f16_f32_4_b4";
@@ -4458,10 +4474,12 @@ int myds_metal_v41_gemv_batch(myds_metal_buffer_t *out,
         [enc setBuffer:weight->mtl_buf offset:weight->offset atIndex:1];
         [enc setBuffer:input->mtl_buf offset:input->offset atIndex:2];
         [enc setBuffer:out->mtl_buf offset:out->offset atIndex:3];
-        NSUInteger shmem_len = use_b4 ? (32u * 2u * 4u * sizeof(float)) : (32u * 2u * sizeof(float));
+        NSUInteger shmem_len = use_b4 ? (32u * 2u * 4u * sizeof(float))
+                                           : (32u * nr0v * sizeof(float));
         [enc setThreadgroupMemoryLength:shmem_len atIndex:0];
         NSUInteger grid_y = use_b4 ? ((n_tok + 3u) / 4u) : n_tok;
-        metal_dispatch(enc, [funcName UTF8String], MTLSizeMake((out_dim + 1u) / 2u, grid_y, 1),
+        const NSUInteger ngr = (NSUInteger)((out_dim + nr0v - 1u) / nr0v);
+        metal_dispatch(enc, [funcName UTF8String], MTLSizeMake(ngr, grid_y, 1),
              MTLSizeMake(32, nsg, 1));
         return v41_finish(cb, enc);
     }
