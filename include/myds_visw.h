@@ -74,11 +74,16 @@ typedef struct myds_vis_weights {
 } myds_vis_weights;
 
 /* 只读元数据 + 完整校验，不做任何分配。成功返回 1。 */
-int myds_vis_weights_probe(const char *path, myds_vis_spec *out,
+/* 同源校验：expected_revision 必须等于视觉 GGUF 的 general.source.revision。
+ * V4.1 有多个已发布 checkpoint（df42c109 / 1bae0e10 …），写死某一个哈希会造成双向
+ * 错误：更新 checkpoint 的正确文件被拒，而错贴旧标签的文件反而放行。 */
+int myds_vis_weights_probe(const char *path, const char *expected_revision,
+                           myds_vis_spec *out,
                            char *error, size_t error_cap);
 
 /* 全量加载（BF16 → F32 → Metal 缓冲）。成功返回 1，*out 需用 free() 释放。 */
-int myds_vis_weights_load(const char *path, myds_vis_weights **out,
+int myds_vis_weights_load(const char *path, const char *expected_revision,
+                          myds_vis_weights **out,
                           char *error, size_t error_cap);
 void myds_vis_weights_free(myds_vis_weights *w);
 

@@ -38,7 +38,12 @@ int myds_vjob_init(myds_context_t *ctx, const char *vision_gguf) {
     if (!ctx || !vision_gguf || !*vision_gguf) return 0;
 
     char err[512] = {0};
-    if (!myds_vis_weights_load(vision_gguf, &g_w, err, sizeof(err))) {
+    /* 视觉侧车必须与语言模型同源：从语言 GGUF 读它声明的 revision 再传下去，
+     * 而不是写死一个哈希。V4.1 有多个已发布 checkpoint（df42c109 / 1bae0e10 …）。 */
+    const char *lang_rev = (ctx->model && ctx->model->gf)
+                               ? gguf_get_str(ctx->model->gf, "general.source.revision", "")
+                               : "";
+    if (!myds_vis_weights_load(vision_gguf, lang_rev, &g_w, err, sizeof(err))) {
         MYDS_LOG_E("视觉编码器加载失败: %s", err);
         return 0;
     }

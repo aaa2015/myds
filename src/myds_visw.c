@@ -11,7 +11,7 @@
 
 /* V4.1 flash 的期望指纹（与 ds4 同一口径） */
 #define VIS_EXPECT_ARCH      "deepseek4-vision"
-#define VIS_EXPECT_REVISION  "df42c109f1defefcbfcedbe7d905718a12266e40"
+#define VIS_EXPECT_ARCH      "deepseek4-vision"
 #define VIS_EXPECT_VARIANT   "v4.1-flash"
 #define VIS_EXPECT_TENSORS   266u
 #define VIS_EXPECT_BLOCKS    32u
@@ -89,7 +89,8 @@ static uint64_t require_tensor(const gguf_file_t *gf, const char *name,
         total += n_;                                                          \
     } while (0)
 
-int myds_vis_weights_probe(const char *path, myds_vis_spec *out,
+int myds_vis_weights_probe(const char *path, const char *expected_revision,
+                           myds_vis_spec *out,
                            char *error, size_t error_cap) {
     if (!path || !out) return 0;
     memset(out, 0, sizeof(*out));
@@ -108,13 +109,28 @@ int myds_vis_weights_probe(const char *path, myds_vis_spec *out,
                      arch, VIS_EXPECT_ARCH);
         goto fail;
     }
-    const char *rev = gguf_get_str(gf, "general.source.revision", "");
-    if (strcmp(rev, VIS_EXPECT_REVISION) != 0) {
-        if (error && error_cap)
-            snprintf(error, error_cap,
-                     "vision encoder revision is '%s', expected '%s' (file does not match the language checkpoint)",
-                     rev, VIS_EXPECT_REVISION);
-        goto fail;
+    /* 与语言模型同源校验：V4.1 有多个已发布的 checkpoint（df42c109 / 1bae0e10 …），
+     * 写死某一个哈希会造成双向错误：新 checkpoint 的正确文件被拒，而错贴旧标签的文件反而放行。
+     * 这里只要求【侧车与语言模型声明的 revision 一致】。
+     * expected_revision == NULL 表示调用方没有语言模型上下文（单元测试 / 独立工具），
+     * 此时跳过同源校验，其余命名/维数/指纹校验照常执行。 */
+    if (expected_revision) {
+        const char *rev = gguf_get_str(gf, "general.source.revision", "");
+        if (!*expected_revision) {
+            if (error && error_cap)
+                snprintf(error, error_cap,
+                         "language checkpoint did not declare a source revision, so the vision "
+                         "encoder (revision '%s') cannot be verified", rev);
+            goto fail;
+        }
+        if (strcmp(rev, expected_revision) != 0) {
+            if (error && error_cap)
+                snprintf(error, error_cap,
+                         "vision encoder revision is '%s', language checkpoint is '%s' "
+                         "(the sidecar does not match this checkpoint)",
+                         rev, expected_revision);
+            goto fail;
+        }
     }
     const char *variant = gguf_get_str(gf, "deepseek4-vision.checkpoint_variant", "");
     if (strcmp(variant, VIS_EXPECT_VARIANT) != 0) {
@@ -304,14 +320,15 @@ static myds_metal_buffer_t *load_tensor(const gguf_file_t *gf, const char *name,
     return buffer_from_bf16_tensor(t, error, error_cap);
 }
 
-int myds_vis_weights_load(const char *path, myds_vis_weights **out,
+int myds_vis_weights_load(const char *path, const char *expected_revision,
+                          myds_vis_weights **out,
                           char *error, size_t error_cap) {
     if (!path || !out) return 0;
     *out = NULL;
 
     myds_vis_spec spec;
     /* 先 probe：把命名/维数/指纹全查一遍，再动手分配 */
-    if (!myds_vis_weights_probe(path, &spec, error, error_cap)) return 0;
+    if (!myds_vis_weights_probe(path, expected_revision, &spec, error, error_cap)) return 0;
 
     gguf_file_t *gf = gguf_open(path);
     if (!gf) {

@@ -43,7 +43,7 @@ int main(int argc, char **argv) {
     }
 
     myds_vis_weights *w = NULL;
-    if (!myds_vis_weights_load(gguf, &w, err, sizeof(err))) {
+    if (!myds_vis_weights_load(gguf, NULL, &w, err, sizeof(err))) {
         fprintf(stderr, "加载权重失败: %s\n", err); return 1;
     }
     printf("权重: %u 层 · dim %u · projection %u · F32 %.2f GiB\n",

@@ -28,7 +28,7 @@
 static int test_probe(const char *path) {
     char err[512] = {0};
     myds_vis_spec s;
-    CHECK(myds_vis_weights_probe(path, &s, err, sizeof(err)),
+    CHECK(myds_vis_weights_probe(path, NULL, &s, err, sizeof(err)),
           "probe failed: %s", err);
 
     printf("  block_count   = %u\n", s.block_count);
@@ -67,7 +67,7 @@ static int test_reject(const char *path) {
     char err[512] = {0};
     myds_vis_spec s;
     if (!path) { printf("  [SKIP] 未提供反例文件\n"); return 1; }
-    int ok = myds_vis_weights_probe(path, &s, err, sizeof(err));
+    int ok = myds_vis_weights_probe(path, NULL, &s, err, sizeof(err));
     CHECK(!ok, "应当拒绝非视觉编码器文件，但它通过了");
     printf("  [PASS] 正确拒绝非视觉文件: %s\n", err);
     return 1;
@@ -78,7 +78,7 @@ static int test_load(const char *path, const char *shader_dir) {
     myds_vis_weights *w = NULL;
     CHECK(myds_metal_init(shader_dir), "myds_metal_init(%s) 失败", shader_dir);
     printf("  ⏳ 正在加载 ...\n");
-    CHECK(myds_vis_weights_load(path, &w, err, sizeof(err)), "load failed: %s", err);
+    CHECK(myds_vis_weights_load(path, NULL, &w, err, sizeof(err)), "load failed: %s", err);
     CHECK(w != NULL, "load 返回成功但没有对象");
     CHECK(w->patch_weight && w->aligner_w1 && w->layer[31].mlp_w2,
           "加载后有空缓冲");
