@@ -26,7 +26,7 @@ static void test_p1_response_id_lifecycle(void) {
     resp_id_new(id1, sizeof(id1));
     resp_id_new(id2, sizeof(id2));
 
-    resp_id_register(id1);
+    resp_id_register(id1, 0ull);
     assert(resp_id_is_live(id1));
     assert(!resp_id_is_live(id2));
 

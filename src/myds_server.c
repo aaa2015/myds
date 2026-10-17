@@ -206,6 +206,15 @@ int server_vjob_gpu_last_error(void) {
  * 以为服务端持有历史，实际只渲染了新增的那几条 ⇒ 模型拿不到上下文却照常作答，输出静默错误。 */
 #define RESP_ID_SLOTS 4u
 static char            g_resp_ids[RESP_ID_SLOTS][64];
+/* 每个响应登记时所用的【工具集指纹】。
+ *
+ * 为什么必须存：suffix 模式（previous_response_id）只渲染新增消息，
+ * tools 段【不重渲】（它已在前缀里）。若客户端在续跑时改动了 tools，
+ * 旧实现会直接 goto 跳过 —— 既不渲染也不告警，模型看不到新工具，
+ * 调用方只看到模型「假装没有这个工具」，无法定位。
+ * 这里改为：登记响应时记下工具指纹；续跑时若带 tools 就比对，
+ * 相同放行（等价于「重复声明未变」），不同则 400 明确报错。 */
+static unsigned long long g_resp_tools_sig[RESP_ID_SLOTS];
 static unsigned        g_resp_id_ring = 0;         /* 下一个写入位置 */
 static unsigned long   g_resp_id_seq = 0;
 static pthread_mutex_t g_resp_id_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -217,13 +226,23 @@ void resp_id_new(char *out, size_t cap) {
     pthread_mutex_unlock(&g_resp_id_mutex);
     snprintf(out, cap, "resp_myds_%lu_%04x", n, (unsigned)(rand() & 0xffffu));
 }
-/* 一次响应完成后登记：它成为唯一「活」的 id。 */
-void resp_id_register(const char *id) {
+/* 一次响应完成后登记：它成为唯一「活」的 id。sig = 本次请求所用工具集指纹（0 表示无 tools）。 */
+void resp_id_register(const char *id, unsigned long long tools_sig) {
     if (!id || !id[0]) return;
     pthread_mutex_lock(&g_resp_id_mutex);
     snprintf(g_resp_ids[g_resp_id_ring], sizeof(g_resp_ids[0]), "%s", id);
+    g_resp_tools_sig[g_resp_id_ring] = tools_sig;
     g_resp_id_ring = (g_resp_id_ring + 1u) % RESP_ID_SLOTS;
     pthread_mutex_unlock(&g_resp_id_mutex);
+}
+/* 当前「活」响应的工具指纹；无活响应时返回 0。 */
+unsigned long long resp_id_live_tools_sig(void) {
+    unsigned long long sig;
+    pthread_mutex_lock(&g_resp_id_mutex);
+    unsigned prev = (g_resp_id_ring + RESP_ID_SLOTS - 1u) % RESP_ID_SLOTS;
+    sig = (g_resp_ids[prev][0] != '\0') ? g_resp_tools_sig[prev] : 0ull;
+    pthread_mutex_unlock(&g_resp_id_mutex);
+    return sig;
 }
 /* 最新的那个 = 唯一可续跑的 */
 bool resp_id_is_live(const char *id) {
@@ -251,6 +270,7 @@ void resp_id_invalidate_all(void) {
     pthread_mutex_lock(&g_resp_id_mutex);
     for (unsigned i = 0; i < RESP_ID_SLOTS; ++i) {
         g_resp_ids[i][0] = '\0';
+        g_resp_tools_sig[i] = 0ull;
     }
     g_resp_id_ring = 0;
     pthread_mutex_unlock(&g_resp_id_mutex);
@@ -1455,6 +1475,49 @@ void split_reasoning_content(const char *text, size_t n, char **content_out, cha
             (*content_out)[n] = '\0';
         }
     }
+}
+
+/* 工具集指纹：把 tools/functions 段用【渲染器本身】渲染成规范文本后做 FNV-1a。
+ *
+ * 为什么不能直接哈希原始 JSON 字节：同一个工具集只要空白、键序、数字写法有一点差异
+ * 就会算出不同指纹，把一个正常续跑误判成「工具变了」。走 prompt_render_tools 则两边
+ * 都是同一套规范化结果，字节一致当且仅当语义一致。
+ *
+ * 返回 0 表示【无 tools】（或解析失败）；带 tools 时返回值强制非 0，以区分两者。 */
+unsigned long long server_tools_signature(const char *body, size_t scratch_cap) {
+    if (!body || !scratch_cap) return 0ull;
+    prompt_json_t json = {.cursor = body, .base = body};
+    unsigned long long sig = 0ull;
+    char *buf = NULL;
+    if (!prompt_json_value(&json, 0)) goto done;
+    if (json.nodes[0].kind != PJ_OBJECT) goto done;
+    {
+        bool valid = true;
+        const prompt_json_node_t *root = &json.nodes[0];
+        const prompt_json_node_t *t = prompt_json_field(&json, root, "tools", &valid);
+        const prompt_json_node_t *f = prompt_json_field(&json, root, "functions", &valid);
+        if (!valid) goto done;
+        const prompt_json_node_t *defs = !prompt_absent_or_empty(&json, t) ? t : f;
+        if (prompt_absent_or_empty(&json, defs)) goto done;
+        buf = malloc(scratch_cap);
+        if (!buf) goto done;
+        {
+            prompt_buffer_t pb = {buf, scratch_cap, 0, false};
+            if (!prompt_render_tools(&pb, &json, defs)) goto freebuf;
+            unsigned long long h = 1469598103934665603ull;
+            for (size_t i = 0; i < pb.length; ++i) {
+                h ^= (unsigned long long)(unsigned char)buf[i];
+                h *= 1099511628211ull;
+            }
+            sig = h ? h : 1ull;      /* 0 保留给「无 tools」 */
+        }
+    }
+freebuf:
+    free(buf);
+done:
+    for (size_t i = 0; i < json.count; ++i) free(json.nodes[i].text);
+    free(json.nodes);
+    return sig;
 }
 
 static bool parse_chat_prompt_impl(const char *body, char *out_prompt, size_t max_prompt_len,
@@ -3094,6 +3157,32 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             free(prompt); free(req_buf); close(client_fd); return;
         }
 
+        /* ★ 续跑时工具集必须一致。
+         *
+         * suffix 模式只渲染新增消息，tools 段【不重渲】（它已在前缀里）。旧实现遇到
+         * body 里带 tools 就静默 goto 跳过 —— 若客户端在续跑时改了工具集，模型仍拿着
+         * 旧工具列表在跑，却看不到任何报错。这里改为显式校验：
+         *   · 未带 tools ⇒ 沿用前缀里的（正常情况）
+         *   · 带了且与前缀指纹相同 ⇒ 放行（客户端重复声明未变，无副作用）
+         *   · 带了但与指纹不同 ⇒ 400 明确报错，让调用方开启新对话
+         * 仍然不渲染，只做一致性判定。 */
+        const unsigned long long tools_sig = server_tools_signature(body, prompt_cap);
+        if (is_continuation && tools_sig != 0ull && resp_id_live_tools_sig() != tools_sig) {
+            t_infer_slot_depth = 0;
+            pthread_mutex_unlock(&g_infer_mutex);
+            server_release_infer_slot();
+            MYDS_LOG_W("[%s:%d] previous_response_id rejected (tools changed): %s",
+                       client_ip, client_port, prev_id);
+            send_response(client_fd, 400, "Bad Request", "application/json",
+                          "{\"error\":{\"message\":\"tools/functions differ from the previous_response_id "
+                          "conversation: a continuation cannot change the tool set, because the prefix "
+                          "already holds the old schemas. Start a new conversation without "
+                          "previous_response_id to change tools\",\"type\":\"invalid_request_error\","
+                          "\"code\":\"tools_changed_on_continuation\"}}");
+            myds_vjob_sink_free(&img_sink);
+            free(prompt); free(req_buf); close(client_fd); return;
+        }
+
         const char *parse_reason = NULL;
         const bool parsed_ok = is_continuation
             ? parse_chat_prompt_suffix_vis(body, prompt, prompt_cap, &parse_reason, &img_sink)
@@ -3501,7 +3590,8 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         }
 
         if (stop_reason != MYDS_STOP_ERROR && stop_reason != MYDS_STOP_CANCELLED && transport_ok) {
-            resp_id_register(resp_id);
+            /* 续跑自身不重渲 tools ⇒ 它不改变「当前活响应」的工具集，沿用上一轮指纹。 */
+            resp_id_register(resp_id, is_continuation ? resp_id_live_tools_sig() : tools_sig);
         } else {
             resp_id_invalidate_all();
         }

@@ -89,9 +89,13 @@ bool parse_chat_prompt(const char *body, char *out_prompt, size_t max_prompt_len
 bool parse_chat_prompt_suffix_ex(const char *body, char *out_prompt, size_t max_prompt_len,
                                  const char **out_reason);
 
-/* 响应 id 注册表（供单测）。语义：只有【最新登记】的那一个是 live。 */
+/* 响应 id 注册表（供单测）。语义：只有【最新登记】的那一个是 live。
+ * tools_sig = 该轮所用工具集的指纹（0 = 无 tools）；续跑时用于拒绝「中途换工具集」。 */
 void resp_id_new(char *out, size_t cap);
-void resp_id_register(const char *id);
+void resp_id_register(const char *id, unsigned long long tools_sig);
+unsigned long long resp_id_live_tools_sig(void);
+/* 工具集指纹（供单测与续跑一致性校验）。0 = 无 tools。 */
+unsigned long long server_tools_signature(const char *body, size_t scratch_cap);
 bool resp_id_is_live(const char *id);
 bool resp_id_seen(const char *id);
 void resp_id_invalidate_all(void);

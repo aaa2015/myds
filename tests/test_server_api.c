@@ -956,13 +956,13 @@ static void test_previous_response_id_registry(void) {
     assert(strcmp(a, b) != 0 && strcmp(b, c) != 0 && strcmp(a, c) != 0);
     assert(strncmp(a, "resp_myds_", 10) == 0);
 
-    resp_id_register(a);
+    resp_id_register(a, 0ull);
     assert(resp_id_is_live(a));
     assert(!resp_id_is_live(b));
     assert(resp_id_seen(a) && !resp_id_seen(b));
 
     /* 新的响应顶掉旧的：a 变成「见过但不再 live」 */
-    resp_id_register(b);
+    resp_id_register(b, 0ull);
     assert(resp_id_is_live(b));
     assert(!resp_id_is_live(a));
     assert(resp_id_seen(a));    /* 仍在窗口内 -> expired 而不是 unknown */
@@ -999,6 +999,55 @@ static void test_previous_response_id_suffix_render(void) {
     assert(strncmp(suffix, "<" "\xef\xbd\x9c" "end", 6) == 0);
     assert(strlen(suffix) < strlen(full));
     printf("  [PASS] previous_response_id suffix render: items only, no BOS/instructions/tools\n");
+}
+
+/* ── 续跑时工具集变动必须被拒 ──
+ * 旧实现：suffix 模式遇到 body 里带 tools 就静默跳过 —— 模型拿着前缀里的旧工具列表跑，
+ * 客户端拿不到任何报错。现在改为工具集指纹比对：相同放行，不同则 400。
+ * 这里测指纹本身的三个性质：无 tools ⇒ 0；相同语义 ⇒ 同值；不同工具集 ⇒ 异值。 */
+static void test_tools_signature_stability(void) {
+    const char *none = "{\"input\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
+    const char *a = "{\"tools\":[{\"type\":\"function\",\"name\":\"f\",\"description\":\"d\",\"parameters\":{}}],"
+                    "\"input\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
+    /* 同一工具集，仅空白不同 —— 渲染结果不变，指纹必须相同。 */
+    const char *a_reformatted = "{ \"input\" : [ { \"role\" : \"user\" , \"content\" : \"hi\" } ] ,"
+                                " \"tools\" : [ { \"type\" : \"function\" , \"name\" : \"f\" ,"
+                                " \"description\" : \"d\" , \"parameters\" : {} } ] }";
+    /* 键序不同 ⇒ 渲染出来的 schema 文本也真的不同 ⇒ 指纹必须变。
+     * 这不是缺陷，而是有意对齐的不变量：【指纹变 ⇔ 渲染进 prompt 的 tools 段变】。 */
+    const char *a_reordered = "{\"tools\":[{\"parameters\":{},\"description\":\"d\","
+                              "\"name\":\"f\",\"type\":\"function\"}],"
+                              "\"input\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
+    /* 真正改了一个字段 —— 必须算出不同指纹。 */
+    const char *b = "{\"tools\":[{\"type\":\"function\",\"name\":\"f\",\"description\":\"CHANGED\",\"parameters\":{}}],"
+                    "\"input\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
+    const char *c = "{\"tools\":[{\"type\":\"function\",\"name\":\"f\",\"description\":\"d\",\"parameters\":{}}],"
+                    "\"tools_extra\":0,\"input\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
+
+    const unsigned long long s_none = server_tools_signature(none, 65536);
+    const unsigned long long s_a = server_tools_signature(a, 65536);
+    const unsigned long long s_ar = server_tools_signature(a_reformatted, 65536);
+    const unsigned long long s_ao = server_tools_signature(a_reordered, 65536);
+    const unsigned long long s_b = server_tools_signature(b, 65536);
+    const unsigned long long s_c = server_tools_signature(c, 65536);
+
+    assert(s_none == 0ull);          /* 无 tools 保留 0 */
+    assert(s_a != 0ull);             /* 有 tools 必须非 0 */
+    assert(s_a == s_ar);             /* 仅空白差异 ⇒ 指纹相同 */
+    assert(s_a != s_ao);             /* 键序变 ⇒ 渲染文本真变 ⇒ 指纹变（有意对齐的不变量） */
+    assert(s_a != s_b);              /* 描述变了 ⇒ 指纹变了 */
+    assert(s_a == s_c);              /* 改了与本工具集无关的字段不应影响指纹 */
+
+    /* 注册后能读回：续跑校验就靠这条链。 */
+    char id[64];
+    resp_id_new(id, sizeof id);
+    resp_id_register(id, s_a);
+    assert(resp_id_is_live(id));
+    assert(resp_id_live_tools_sig() == s_a);
+    resp_id_invalidate_all();
+    assert(resp_id_live_tools_sig() == 0ull);
+
+    printf("  [PASS] tools signature: no-tools=0, format-independent, change-detecting; survives registration\n");
 }
 
 static void test_thinking_mode(void) {
@@ -1237,6 +1286,7 @@ int main(int argc, char **argv) {
     test_responses_call_merges_into_assistant_turn();
     test_previous_response_id_registry();
     test_previous_response_id_suffix_render();
+    test_tools_signature_stability();
     test_thinking_mode();
     printf("====================================================\n");
     printf("       Running myds Server API Unit Tests           \n");
