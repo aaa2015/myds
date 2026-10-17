@@ -2904,7 +2904,7 @@ static inline uint32_t mm_min_m(void) {
 static int project_batch(myds_metal_buffer_t *out, const myds_metal_buffer_t *w,
                          const myds_metal_buffer_t *in, uint32_t rows, uint32_t width,
                          uint32_t n_tok, ggml_type type, bool round) {
-    myds_metal_barrier();
+    if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(in);
     int use_mm = (n_tok >= 32 && !is_mul_mm_disabled());
     if (use_mm) {
         const uint32_t mm_min = mm_min_m();
@@ -2919,7 +2919,13 @@ static int project_batch(myds_metal_buffer_t *out, const myds_metal_buffer_t *w,
             ? myds_metal_v41_gemv_batch(out, w, in, rows, width, n_tok, type)
             : myds_metal_gemv_batch(out, w, in, rows, width, n_tok, type));
     }
-    return ok && (!round || myds_metal_v41_bf16(out, rows * n_tok));
+    if (!ok) return 0;
+    if (round) {
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(out);
+        if (!myds_metal_v41_bf16(out, rows * n_tok)) return 0;
+    }
+    if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(out);
+    return 1;
 }
 
 static int dispatch_k(const char *kernel, const void *args, size_t size,
@@ -3703,7 +3709,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
     static int decode_split = -1;
     if (decode_split < 0) {
         const char *e = getenv("MYDS_DECODE_SPLIT");
-        const int n = e ? atoi(e) : 0;
+        const int n = e ? atoi(e) : 4;
         decode_split = (n > 1 && n <= (int)V41_LAYERS) ? n : 0;
     }
     int prev_auto_barrier = -1;
@@ -4177,7 +4183,7 @@ int myds_v41_batch2_projection_probe(myds_metal_buffer_t *out[2],
             if (shared < 0) return 0;
             /* Current-checkpoint fixed-state parity rejects the Q4 shared
              * provider. Even explicit1 retains the authoritative scalar PSO;
-             * the direct Metal candidate remains available for diagnostics. */
+             * only validation fixtures evaluate shared parity directly. */
         } else if ((type == GGML_TYPE_F16 || type == GGML_TYPE_F32) &&
                    kind == MYDS_V41_BATCH2_ROUTER) {
             const int shared = myds_metal_batch2_dense_shared_mode();
@@ -4725,7 +4731,7 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
     if (decode_split < 0) {
         const char *e2 = getenv("MYDS_BATCH2_DECODE_SPLIT");
         const char *e = e2 ? e2 : getenv("MYDS_DECODE_SPLIT");
-        const int n = e ? atoi(e) : 0;
+        const int n = e ? atoi(e) : 4;
         decode_split = (n > 1 && n <= (int)V41_LAYERS) ? n : 0;
     }
     const bool fuse_hc_norm_enabled = v41_fuse_hc_sum_rmsnorm_enabled();
@@ -5391,7 +5397,7 @@ static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *t
     if (decode_split < 0) {
         const char *e2 = getenv("MYDS_BATCH2_DECODE_SPLIT");
         const char *e = e2 ? e2 : getenv("MYDS_DECODE_SPLIT");
-        const int n = e ? atoi(e) : 0;
+        const int n = e ? atoi(e) : 4;
         decode_split = (n > 1 && n <= (int)V41_LAYERS) ? n : 0;
     }
     const bool fuse_hc_norm_enabled = v41_fuse_hc_sum_rmsnorm_enabled();
@@ -6922,7 +6928,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 
                 if (il == 1 || il == 14) {
                     uint32_t e = (il == 1 ? 0 : 1);
-                    myds_metal_barrier();
+                    if (!myds_metal_get_auto_barrier()) myds_metal_barrier();
                     int e_batched = 0;
                     if (!opt_disable_mm_engram)
                         e_batched = myds_metal_mul_mm(cw->engram_proj_buf[e], v->engram_proj[e],
@@ -6960,7 +6966,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                            myds_metal_v41_hc_sum_rmsnorm_scale_batch(cw->x_norm_buf, NULL, cw->hc_flat_norm_buf,
                                                                      cw->cur_res_view, cw->cur_pre_view,
                                                                      base->attn_norm, V41_DIM, c_len, pre_tok_bytes, m->norm_eps, true)) {
-                    myds_metal_barrier();
+                    if (!myds_metal_get_auto_barrier()) myds_metal_barrier();
                     CHECK(myds_metal_v41_gemv_batch_scaled(cw->hc_mix_buf, l->attn_fn, cw->cur_res_view, cw->hc_flat_norm_buf,
                                                            24, 4 * V41_DIM, c_len, GGML_TYPE_F16));
                     CHECK(myds_metal_v41_hc_split_batch(cw->attn_split_buf, cw->hc_mix_buf, l->attn_scale, l->attn_base, c_len, v->hc_eps));
@@ -7225,7 +7231,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 
                 if (do_prof) { disp_step4loop += myds_metal_dispatch_count() - disp_loop0; }  /* 诊断 */
 
-                myds_metal_barrier();
+                if (!myds_metal_get_auto_barrier()) myds_metal_barrier();
                 int a_ok = 0;
                 if (!opt_disable_mm_attn_a)
                     a_ok = myds_metal_mul_mm_grouped(cw->attn_low_buf, base->attn_output_a,
@@ -7267,7 +7273,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     myds_metal_v41_hc_sum_rmsnorm_scale_batch(cw->ffn_norm_buf, NULL, cw->hc_flat_norm_buf,
                                                               cw->after_attn_buf, cw->attn_split_buf,
                                                               base->ffn_norm, V41_DIM, c_len, 96, m->norm_eps, true)) {
-                    myds_metal_barrier();
+                    if (!myds_metal_get_auto_barrier()) myds_metal_barrier();
                     CHECK(myds_metal_v41_gemv_batch_scaled(cw->hc_mix_buf, l->ffn_fn, cw->after_attn_buf, cw->hc_flat_norm_buf,
                                                            24, 4 * V41_DIM, c_len, GGML_TYPE_F16));
                     CHECK(myds_metal_v41_hc_split_batch(cw->ffn_split_buf, cw->hc_mix_buf, l->ffn_scale, l->ffn_base, c_len, v->hc_eps));
@@ -7352,7 +7358,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     CHECK(myds_metal_commit_batch());
                     TIME_ACC(prof_wait_ffn_router);
                     CHECK(myds_metal_begin_batch());
-                } else {
+                } else if (!myds_metal_get_auto_barrier()) {
                     myds_metal_barrier();
                 }
 
@@ -7381,7 +7387,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     /* 注：本分支只在全量 chunk 里可达（moe_off 只在全量 chunk 里累加） */
                     const uint32_t mb_moe_len = moe_off;
                     const uint32_t mb_moe_start = c_start + c_len - mb_moe_len;   /* 本批在 prompt 里的起点 */
-                    myds_metal_barrier();
+                    if (!myds_metal_get_auto_barrier()) myds_metal_barrier();
                     CHECK(myds_metal_routed_moe_batch(cw->moe_out_acc, cw->moe_norm_acc,
                         base->ffn_gate_exps, base->ffn_up_exps, base->ffn_down_exps,
                         cw->moe_ids_acc, cw->moe_w_acc,
@@ -7389,7 +7395,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                         V41_DIM, width, m->n_routed_experts, k, mb_moe_len,
                         base->ffn_gate_exps_type, base->ffn_up_exps_type, base->ffn_down_exps_type,
                         m->swiglu_clamp_exp));
-                    myds_metal_barrier();
+                    if (!myds_metal_get_auto_barrier()) myds_metal_barrier();
                     if (do_prof && opt_prof_moe) {
                         TIME_START();
                         CHECK(myds_metal_commit_batch());
@@ -7427,7 +7433,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                             myds_metal_v41_moe_add_hc_expand_batch(cw->layer_out_buf, NULL, moe_b, sh_b, af_b, sp_b, V41_DIM, e_len)) {
                         } else {
                             CHECK(myds_metal_v41_add_bf16(cw->ffn_out_buf, moe_b, sh_b, V41_DIM * e_len));
-                            myds_metal_barrier();
+                            if (!myds_metal_get_auto_barrier()) myds_metal_barrier();
                             CHECK(myds_metal_v41_hc_expand_batch(cw->layer_out_buf, cw->ffn_out_buf, af_b, sp_b, V41_DIM, e_len));
                         }
 

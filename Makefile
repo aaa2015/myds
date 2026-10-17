@@ -79,6 +79,7 @@ TEST_BATCH2_E2E = $(BIN_DIR)/test_batch2_e2e
 TEST_Q4_BF16_PARITY = $(BIN_DIR)/test_q4_bf16_parity
 TEST_TREE_SPEC = $(BIN_DIR)/test_tree_spec
 TEST_ENGINE_DEPTH2 = $(BIN_DIR)/test_engine_depth2
+TEST_DECODE_SPLIT = $(BIN_DIR)/test_decode_split
 BENCH_SYNTHETIC = $(BIN_DIR)/bench_synthetic
 BENCH_METAL = $(BIN_DIR)/bench_metal
 BENCH_PHASE = $(BIN_DIR)/bench_phase
@@ -89,7 +90,7 @@ METALLIB = $(BIN_DIR)/myds.metallib
 METAL_SRCS = $(wildcard metal/*.metal)
 
 ALL_TESTS = $(TEST_METAL) $(TEST_V41_GPU) $(TEST_ATTN_POLICY) $(TEST_ATTN_VEC) $(TEST_QKV_FUSION) $(TEST_DECODE_Q8) $(TEST_MOE_DOWN_NSG) $(TEST_DEEPER_SSD) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE) $(TEST_CPU) $(TEST_ENGRAM) $(TEST_ALIGN) $(TEST_PLD) $(TEST_KVDSK) $(TEST_P1) $(TEST_DSPARK_ROLLBACK) $(TEST_DSPARK_CAPTURE) $(TEST_DSPARK_ROUTER) $(TEST_V41_ROUTER) $(TEST_BATCH2_SHARED_PAIR) $(TEST_DSPARK_ATTN) $(TEST_DSPARK_MOE) $(TEST_DSPARK_PROPOSAL) $(TEST_BATCH2_PARITY) $(TEST_BATCH2_E2E) $(TEST_Q4_BF16_PARITY) $(TEST_TREE_SPEC) $(TEST_ENGINE_DEPTH2)
-ALL_TESTS += $(TEST_METAL_RESIDENCY) $(TEST_TEARDOWN_ORDER)
+ALL_TESTS += $(TEST_METAL_RESIDENCY) $(TEST_TEARDOWN_ORDER) $(TEST_DECODE_SPLIT)
 
 .PHONY: all test clean bench metallib build-tail-init test-tail-init
 
@@ -413,6 +414,9 @@ $(TEST_METAL_RESIDENCY): tests/test_metal_residency_lifecycle.c $(BUILD_DIR)/myd
 $(TEST_TREE_SPEC): tests/test_tree_spec.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -Iinclude -o $@ tests/test_tree_spec.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS)
 
+$(TEST_DECODE_SPLIT): tests/test_decode_split.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
+	$(CC) $(CFLAGS) -Iinclude -o $@ tests/test_decode_split.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS)
+
 $(TEST_LOG): $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_log.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@
 
@@ -581,6 +585,7 @@ test: $(ALL_TESTS) $(METALLIB)
 	@echo ""
 	@./$(TEST_TREE_SPEC)
 	@./$(TEST_ENGINE_DEPTH2)
+	@./$(TEST_DECODE_SPLIT)
 	@echo ""
 	@MYDS_QKV_NR0=4 ./$(TEST_DECODE_Q8) bin
 	@MYDS_QKV_NR0=2 ./$(TEST_DECODE_Q8) bin
