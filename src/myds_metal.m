@@ -3548,15 +3548,28 @@ int myds_metal_v41_hc_sum_rmsnorm_batch(
     float eps,
     bool round_bf16) {
     if (!n_tok) return 1;
+    /* ★ 2026-10-17 默认关闭（opt-in）：验收发现当 ntg 不能整除 ne00_t(=dim/4) 时
+     * 本 kernel 会读出错误的 v_reg 缓存内容，产生【完全错误】的 norm 结果。
+     * 例：M2 Ultra 上 nth=832（1280%832≠0）；M4 上 nth=1024（1280%1024≠0）。
+     * 历史上 M2 Ultra 因 nth>maxTotalThreadsPerThreadgroup 被拒绝而降级，属于
+     * “意外正确”；同一份代码在 M4 上会静默产出乱解码。为消除平台差异，
+     * 融合路径改为默认关闭，需显式 MYDS_HC_RMSNORM_FUSED=1 启用（且 nth 必须整除）。
+     * TODO: 修复 kernel 对非整除 ntg 的处理后，再评估默认开启。 */
+    if (!getenv("MYDS_HC_RMSNORM_FUSED")) return 0;
     if (!g_initialized || !g_pso_v41_hc_sum_rmsnorm_batch || !dim || dim % 128 ||
         !isfinite(eps) || eps < 0 || !v41_floats(norm_out, (uint64_t)dim * n_tok) ||
         !v41_floats(residual, 4ull * dim * n_tok) || !weights || !weights->mtl_buf ||
         !v41_floats(norm_weight, dim) ||
         (sum_out && !v41_floats(sum_out, (uint64_t)dim * n_tok))) return 0;
 
-    NSUInteger nth = 32;
-    while (nth < dim / 4u && nth < 1024u) nth *= 2;
-    if (nth > dim / 4u) nth = dim / 4u;
+    /* 只在 ntg 整除 ne00_t 时才能保证 v_reg 缓存与第二遍循环的 (i00 -> reg_idx)
+     * 映射一致；否则不同线程的迭代次数不同，第二遍会读到别的线程缓存的向量。
+     * 因此从 32 起逐个试 32 的倍数，取【整除 ne00_t 的最大值】。 */
+    const NSUInteger ne00_t = dim / 4u;
+    NSUInteger nth = 0;
+    for (NSUInteger cand = 32; cand <= ne00_t; cand += 32)
+        if (ne00_t % cand == 0) nth = cand;
+    if (!nth) return 0;
     {
         static int ov = -2;
         if (__builtin_expect(ov == -2, 0)) {
@@ -3564,7 +3577,10 @@ int myds_metal_v41_hc_sum_rmsnorm_batch(
             long n = v ? atol(v) : 0;
             ov = (n > 0 && n <= 1024) ? (int)n : -1;
         }
-        if (ov > 0) nth = (NSUInteger)ov;
+        if (ov > 0) {
+            if (ne00_t % (NSUInteger)ov) return 0;   /* 显式覆盖也必须整除 */
+            nth = (NSUInteger)ov;
+        }
     }
     if (nth > g_pso_v41_hc_sum_rmsnorm_batch.maxTotalThreadsPerThreadgroup) return 0;
 
@@ -3608,6 +3624,10 @@ int myds_metal_v41_hc_sum_rmsnorm_scale_batch(
     float eps,
     bool round_bf16) {
     if (!n_tok) return 1;
+    /* ★ 2026-10-17 默认关闭（opt-in），理由同 myds_metal_v41_hc_sum_rmsnorm_batch：
+     * ntg 不能整除 ne00_t 时 kernel 会读错 v_reg 缓存，产出【完全错误】的结果。
+     * M2 Ultra(nth=1024 被 maxTotal 拒) 与 M4(nth=1024 通过) 行为不一致。 */
+    if (!getenv("MYDS_HC_RMSNORM_FUSED")) return 0;
     if (!g_initialized || !dim || dim % 128 || dim < 4096u ||
         !isfinite(eps) || eps < 0 || !v41_floats(norm_out, (uint64_t)dim * n_tok) ||
         !v41_floats(flat_scale_out, n_tok) ||
@@ -3615,9 +3635,12 @@ int myds_metal_v41_hc_sum_rmsnorm_scale_batch(
         !v41_floats(norm_weight, dim) ||
         (sum_out && !v41_floats(sum_out, (uint64_t)dim * n_tok))) return 0;
 
-    NSUInteger nth = 32;
-    while (nth < dim / 4u && nth < 1024u) nth *= 2;
-    if (nth > dim / 4u) nth = dim / 4u;
+    /* 只在 ntg 整除 ne00_t 时才能保证两遍循环的 reg_idx 映射一致，见上文。 */
+    const NSUInteger ne00_t = dim / 4u;
+    NSUInteger nth = 0;
+    for (NSUInteger cand = 32; cand <= ne00_t; cand += 32)
+        if (ne00_t % cand == 0) nth = cand;
+    if (!nth) return 0;
     {
         static int ov = -2;
         if (__builtin_expect(ov == -2, 0)) {
@@ -3625,7 +3648,10 @@ int myds_metal_v41_hc_sum_rmsnorm_scale_batch(
             long n = v ? atol(v) : 0;
             ov = (n > 0 && n <= 1024) ? (int)n : -1;
         }
-        if (ov > 0) nth = (NSUInteger)ov;
+        if (ov > 0) {
+            if (ne00_t % (NSUInteger)ov) return 0;   /* 显式覆盖也必须整除 */
+            nth = (NSUInteger)ov;
+        }
     }
 
     @autoreleasepool {

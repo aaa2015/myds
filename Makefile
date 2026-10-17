@@ -80,6 +80,7 @@ TEST_Q4_BF16_PARITY = $(BIN_DIR)/test_q4_bf16_parity
 TEST_TREE_SPEC = $(BIN_DIR)/test_tree_spec
 TEST_ENGINE_DEPTH2 = $(BIN_DIR)/test_engine_depth2
 TEST_DECODE_SPLIT = $(BIN_DIR)/test_decode_split
+TEST_RMS_FUSED_VS_FALLBACK = $(BIN_DIR)/test_rms_fused_vs_fallback
 BENCH_SYNTHETIC = $(BIN_DIR)/bench_synthetic
 BENCH_METAL = $(BIN_DIR)/bench_metal
 BENCH_PHASE = $(BIN_DIR)/bench_phase
@@ -416,6 +417,12 @@ $(TEST_TREE_SPEC): tests/test_tree_spec.c $(filter-out $(BUILD_DIR)/main.o,$(OBJ
 
 $(TEST_DECODE_SPLIT): tests/test_decode_split.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -Iinclude -o $@ tests/test_decode_split.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS)
+
+# 诊断用：验证 hc_sum_rmsnorm 融合路径与降级路径逐字节一致。
+# 融合默认关闭（MYDS_HC_RMSNORM_FUSED=1 才启用），因此本测试不在 `make test` 里跑；
+# 显式执行：MYDS_HC_RMSNORM_FUSED=1 MYDS_RMS_NTH=640 ./bin/test_rms_fused_vs_fallback 3
+$(TEST_RMS_FUSED_VS_FALLBACK): tests/test_rms_fused_vs_fallback.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
+	$(CC) $(CFLAGS) -Iinclude -o $@ tests/test_rms_fused_vs_fallback.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS)
 
 $(TEST_LOG): $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_log.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@

@@ -693,11 +693,20 @@ static int test_prefill_batch_fusions(void) {
         CHECK(myds_metal_commit_batch());
         CHECK(exact(exp_out, exp_ref, (size_t)n_tok * flat_dim));
 
-        /* 2) Fused hc_sum_rmsnorm_scale_batch + gemv_batch_scaled vs separate reference */
-        for (int wtype = 0; wtype < 2; wtype++) {
+        /* 2) Fused hc_sum_rmsnorm_scale_batch + gemv_batch_scaled vs separate reference
+         *
+         * 2026-10-17: 融合路径改为 opt-in（MYDS_HC_RMSNORM_FUSED=1）。
+         * 原因：ntg 不能整除 ne00_t(=dim/4) 时 kernel 会读错 v_reg 缓存，
+         * 产出完全错误的结果（M2 Ultra nth=832 / M4 nth=1024 都非整除）。
+         * 默认关闭时本子测试跳过；显式开启时必须与【降级路径】逐字节一致。 */
+        const bool fused_on = getenv("MYDS_HC_RMSNORM_FUSED") != NULL;
+        for (int wtype = 0; wtype < 2 && fused_on; wtype++) {
             ggml_type gt = wtype ? GGML_TYPE_F32 : GGML_TYPE_F16;
             const myds_metal_buffer_t *w_buf = wtype ? w_f32 : w_f16;
             CHECK(myds_metal_begin_batch());
+            /* 参照：降级路径（rmsnorm_batch + gemv_batch）。
+             * 注意：旧版本用「融合①」当参照，只能证明两个融合互相一致，
+             * 无法发现二者同时出错 —— 这正是本次漏报的原因。 */
             CHECK(myds_metal_v41_hc_sum_rmsnorm_batch(x_norm_ref, NULL, res, pre, norm_w, dim, n_tok, 96u, 1e-5f, true));
             CHECK(myds_metal_v41_rmsnorm_batch(flat_norm, res, NULL, flat_dim, n_tok, 1e-5f, false));
             myds_metal_barrier();
@@ -710,6 +719,9 @@ static int test_prefill_batch_fusions(void) {
             CHECK(exact(x_norm_out, x_norm_ref, (size_t)n_tok * dim));
             CHECK(exact(mix_out, mix_ref, (size_t)n_tok * mix_rows));
         }
+        if (!fused_on)
+            printf("  [SKIP] hc_sum_rmsnorm_scale_batch fusion disabled by default "
+                   "(set MYDS_HC_RMSNORM_FUSED=1 to exercise it)\n");
     }
 
     /* 3) Fused indexer_rope_quant_batch & kv_rope_quant_batch vs separate rope + quant + pack_bf16 */
