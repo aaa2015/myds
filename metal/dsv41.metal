@@ -6,6 +6,7 @@ struct ds4_metal_args_dsv41_quantize {
     uint mode;
 };
 
+
 static inline float dsv41_bf16(float x) {
     uint bits = as_type<uint>(x);
     if ((bits & 0x7f800000u) != 0x7f800000u)
@@ -75,7 +76,7 @@ kernel void kernel_myds_dspark_kv_fp8_f32(
         if(tid<stride)scratch[tid]=max(scratch[tid],scratch[tid+stride]);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    const float scale=exp2(ceil(log2(max(scratch[0],1.0e-4f)/448.0f)));
+    const float scale=dsv4_pow2_ceil_scale(max(scratch[0],1.0e-4f),448.0f);
     x[i]=dsv4_e4m3fn_dequant(clamp(value/scale,-448.0f,448.0f))*scale;
 }
 

@@ -1,3 +1,26 @@
+/* Exact 2^ceil(log2(x)) with x = amax / div.
+ *
+ * exp2(ceil(log2(x))) is NOT guaranteed to return an exact power of two:
+ * fast-math log2/exp2 can land 1 ULP off. That shifts exact-midpoint inputs
+ * off the tie in the E4M3 / E2M1 nearest-value search, so the documented
+ * "ties choose the even encoding" rule stops applying and results move by one
+ * code step. Building the power of two from its exponent bits is exact.
+ *
+ * Returns 0 for a non-positive x, which preserves the previous zero-scale
+ * behaviour for all-zero blocks. */
+static inline float dsv4_pow2_ceil_scale(float amax, float div) {
+    const float x = amax / div;
+    if (!(x > 0.0f)) return 0.0f;
+    if (isinf(x)) return as_type<float>(0x7f000000u);
+    const uint bits = as_type<uint>(x);
+    const uint mant = bits & 0x7fffffu;
+    int ce = int((bits >> 23u) & 0xffu) - 127;
+    if (mant != 0u) ce += 1;
+    if (ce < -126) ce = -126;
+    if (ce > 127) ce = 127;
+    return as_type<float>(uint(ce + 127) << 23u);
+}
+
 constant float dsv4_e4m3fn_exp_scale[16] = {
     0.0f, 0.015625f, 0.03125f, 0.0625f,
     0.125f, 0.25f, 0.5f, 1.0f,
@@ -145,7 +168,7 @@ kernel void kernel_dsv4_fp8_kv_quantize_f32(
         }
 
         const float amax = max(scratch[0], 1.0e-4f);
-        const float scale = exp2(ceil(log2(amax / 448.0f)));
+        const float scale = dsv4_pow2_ceil_scale(amax, 448.0f);
         if (tid < 64) {
             const float q = dsv4_e4m3fn_dequant(clamp(v / scale, -448.0f, 448.0f)) * scale;
             *((device float *) (dst_base + (off + tid)*args.nb0)) = q;
@@ -204,7 +227,7 @@ kernel void kernel_dsv4_indexer_hadamard_fp4_f32(
     }
 
     const float amax = max(absbuf[block_base], 7.052966104933725e-38f);
-    const float scale = exp2(ceil(log2(amax / 6.0f)));
+    const float scale = dsv4_pow2_ceil_scale(amax, 6.0f);
     xr[tid] = dsv4_e2m1fn_dequant(clamp(v / scale, -6.0f, 6.0f)) * scale;
 }
 
@@ -245,7 +268,7 @@ kernel void kernel_dsv4_kv_fp8_store_f32(
         }
 
         const float amax = max(scratch[0], 1.0e-4f);
-        const float fp8_scale = exp2(ceil(log2(amax / 448.0f)));
+        const float fp8_scale = dsv4_pow2_ceil_scale(amax, 448.0f);
         if (off + (int)tid < n_nope) {
             const float q = dsv4_e4m3fn_dequant(clamp(v / fp8_scale, -448.0f, 448.0f)) * fp8_scale;
             kv[off + tid] = q;

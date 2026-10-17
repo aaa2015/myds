@@ -392,7 +392,7 @@ kernel void kernel_dsv4_qkv_rms_norm_kv_rope_fp8_store_f32(
         }
 
         const float amax = max(scratch[0], 1.0e-4f);
-        const float fp8_scale = exp2(ceil(log2(amax / 448.0f)));
+        const float fp8_scale = dsv4_pow2_ceil_scale(amax, 448.0f);
         if (tid < 64u && off + (int)tid < n_nope) {
             const float q = dsv4_e4m3fn_dequant(clamp(v / fp8_scale, -448.0f, 448.0f)) * fp8_scale;
             kv[off + tid] = q;

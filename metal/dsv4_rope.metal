@@ -558,7 +558,7 @@ kernel void kernel_dsv4_kv_rope_fp8_store_f32(
         }
 
         const float amax = max(scratch[0], 1.0e-4f);
-        const float fp8_scale = exp2(ceil(log2(amax / 448.0f)));
+        const float fp8_scale = dsv4_pow2_ceil_scale(amax, 448.0f);
         if (off + (int)tid < n_nope) {
             const float q = dsv4_e4m3fn_dequant(clamp(v / fp8_scale, -448.0f, 448.0f)) * fp8_scale;
             kv[off + tid] = q;
@@ -714,7 +714,7 @@ kernel void kernel_dsv4_comp_row_finalize_f32(
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
             const float amax = max(shmem[0], 1.0e-4f);
-            const float scale = exp2(ceil(log2(amax / 448.0f)));
+            const float scale = dsv4_pow2_ceil_scale(amax, 448.0f);
             if (tiitg < 64) {
                 const float q = dsv4_e4m3fn_dequant(clamp(v / scale, -448.0f, 448.0f)) * scale;
                 attn_row[off + tiitg] = q;
@@ -822,7 +822,7 @@ kernel void kernel_dsv4_comp_row_finalize_f32(
         }
         if (tiitg < 128) {
             const float amax = max(absbuf[block_base], 7.052966104933725e-38f);
-            const float scale = exp2(ceil(log2(amax / 6.0f)));
+            const float scale = dsv4_pow2_ceil_scale(amax, 6.0f);
             index_row[tiitg] = dsv4_e2m1fn_dequant(clamp(v / scale, -6.0f, 6.0f)) * scale;
         }
     }
