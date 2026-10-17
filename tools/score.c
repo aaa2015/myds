@@ -78,7 +78,7 @@ int main(int argc, char **argv) {
     const char *text_path = NULL;
     const char *prompt_arg = NULL;
     const char *dump_dir = NULL;
-    uint32_t max_tokens = 512;
+    uint32_t max_tokens = 4096;
 
     for (int i = 2; i < argc; ++i) {
         if (strcmp(argv[i], "--text") == 0 && i + 1 < argc) {
@@ -117,11 +117,31 @@ int main(int argc, char **argv) {
     if (!model) { fputs("Model load failed\n", stderr); return 1; }
     if (!model->tokenizer) { fputs("Model has no tokenizer\n", stderr); myds_model_free(model); return 1; }
 
-    /* 先编码：拿不到 token 数就无法给出 max_seq_len。 */
-    int32_t *tokens = malloc((size_t)max_tokens * sizeof(*tokens));
+    /* 先编码：缓冲区按【最坏情况】分配（每个字节一个 token），再检查返回的
+     * 真实长度。myds_tokenizer_encode* 在空间不足时返回所需长度且会继续写
+     * max_tokens 个槽位，所以绝不能用“预期 token 数”去分配 —— 那会堆溢出。 */
+    if (text_len > (size_t)INT32_MAX - 16u) { fputs("input too large\n", stderr); myds_model_free(model); return 2; }
+    int32_t cap = (int32_t)text_len + 16;
+    int32_t *tokens = malloc((size_t)cap * sizeof(*tokens));
     if (!tokens) { myds_model_free(model); return 1; }
     int32_t n_tokens = myds_tokenizer_encode_bytes(model->tokenizer, text, text_len,
-                                                   tokens, (int32_t)max_tokens, true);
+                                                   tokens, cap, true);
+    if (n_tokens < 0) {
+        fputs("tokenizer encode failed\n", stderr);
+        free(tokens); myds_model_free(model);
+        return 2;
+    }
+    if (n_tokens >= cap) {
+        fprintf(stderr, "tokenizer needed more than %d tokens\n", cap);
+        free(tokens); myds_model_free(model);
+        return 2;
+    }
+    if ((uint32_t)n_tokens > max_tokens) {
+        fprintf(stderr, "input encodes to %d tokens; raise --max-tokens (currently %u)\n",
+                n_tokens, max_tokens);
+        free(tokens); myds_model_free(model);
+        return 2;
+    }
     if (n_tokens < 2) {
         fprintf(stderr, "input encodes to %d token(s); need at least 2\n", n_tokens);
         free(tokens); myds_model_free(model);
