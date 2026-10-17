@@ -84,6 +84,7 @@ TEST_RMS_FUSED_VS_FALLBACK = $(BIN_DIR)/test_rms_fused_vs_fallback
 BENCH_SYNTHETIC = $(BIN_DIR)/bench_synthetic
 BENCH_METAL = $(BIN_DIR)/bench_metal
 BENCH_PHASE = $(BIN_DIR)/bench_phase
+SCORE = $(BIN_DIR)/score
 BENCH_KPROF = $(BIN_DIR)/bench_kprof
 BENCH_ENGRAM_IO = $(BIN_DIR)/bench_engram_io
 DUMP_TENSORS = $(BIN_DIR)/dump_tensors
@@ -145,6 +146,9 @@ $(BUILD_DIR)/test_qkv_fusion.o: tests/test_qkv_fusion.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 $(BUILD_DIR)/bench_phase.o: tools/bench_phase.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD_DIR)/score.o: tools/score.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 $(BUILD_DIR)/bench_kprof.o: tools/bench_kprof.c | $(BUILD_DIR)
@@ -305,6 +309,11 @@ $(TEST_DEEPER_SSD): tests/test_deeper_ssd.c tests/test_engine.c tests/test_p1_re
 
 # Opt-in full-model harness: build only; never run from all/test.
 $(BENCH_PHASE): $(OBJS_C) $(OBJS_M) $(BUILD_DIR)/bench_phase.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
+
+# Opt-in per-token scorer (perplexity + full-vocab logits dump). Build only:
+# running it loads a full model, so it must never be part of all/test.
+$(SCORE): $(OBJS_C) $(OBJS_M) $(BUILD_DIR)/score.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
 
 # Opt-in per-kernel GPU timing harness (serialized encoders; see tools/kprof_report.py).
