@@ -19,6 +19,12 @@
  *   score <model.gguf> --text <file>            [--dump <dir>] [--max-tokens N]
  *   score <model.gguf> --prompt "raw text"      [--dump <dir>] [--max-tokens N]
  *
+ * 协议模式（复刻 llama.cpp `perplexity --chunks`，用于与公开数字同口径对比）:
+ *   score <model.gguf> --text <file> --context 512 --chunks 8
+ *   把 token 流按 context 切成 chunks 段，每段只计分 [context/2, context-2]
+ *   这些位置（跳过前半段做预热），于是计分位置数 =
+ *   (context - 1 - context//2) * chunks，与 llama.cpp 的 perplexity 一致。
+ *
  * --dump 会为每个位置写 <dir>/pos-%06u.f32（全词表 float32，原生字节序），
  * 供外部 Python 算 KL 等指标。体积 = vocab_size * 4 B / token。
  *
@@ -67,6 +73,77 @@ static int dump_logits(const char *dir, uint32_t pos, const float *logits, uint3
     return ok;
 }
 
+typedef struct {
+    double   nll;
+    uint32_t scored;
+    uint32_t top1;
+} seg_stats;
+
+/* 跑一段 token：对 pos = 0..n-2 做 forward（KV 必须连续），
+ * 但只对 pos >= score_from 的位置计分。
+ * dump_base 是这段起点在全局编号里的偏移，协议模式下各段编号连续。*/
+static int run_segment(myds_model_t *model, const int32_t *tok, uint32_t n,
+                       uint32_t score_from, const char *dump_dir, uint32_t dump_base,
+                       seg_stats *out) {
+    const myds_config_t cfg = {
+        .max_seq_len = n,
+        .max_new_tokens = 0,
+        .temperature = 0,
+        .top_p = 1,
+        .top_k = 0,
+        .min_p = 0,
+        .repetition_penalty = 1,
+        .seed = 42,
+        .stream = false,
+    };
+    myds_context_t *ctx = myds_context_create(model, &cfg);
+    if (!ctx) { fputs("Context creation failed\n", stderr); return 0; }
+
+    const uint32_t vocab = model->vocab_size;
+    int ok = 1;
+    for (uint32_t pos = 0; pos + 1 < n; ++pos) {
+        if (myds_forward_token(ctx, tok[pos], pos) < 0) {
+            fprintf(stderr, "forward failed at pos %u\n", pos);
+            ok = 0; break;
+        }
+        if (pos < score_from) continue;   /* 预热段：照跑 forward，不计分 */
+
+        const float *logits = (const float *)myds_metal_buffer_data(ctx->logits);
+        if (!logits) { fputs("no logits buffer\n", stderr); ok = 0; break; }
+
+        float mx = -INFINITY;
+        for (uint32_t v = 0; v < vocab; ++v) {
+            if (!isfinite(logits[v])) {
+                fprintf(stderr, "non-finite logit at pos %u\n", pos);
+                ok = 0; break;
+            }
+            if (logits[v] > mx) mx = logits[v];
+        }
+        if (!ok) break;
+
+        double sum = 0.0;
+        for (uint32_t v = 0; v < vocab; ++v) sum += exp((double)logits[v] - (double)mx);
+        const double lse = (double)mx + log(sum);
+
+        const int32_t target = tok[pos + 1];
+        out->nll += -(double)logits[target] + lse;   /* -log p(target) */
+        ++out->scored;
+
+        /* top-1 命中率：argmax 是否等于真实的下一个 token（不依赖采样） */
+        float best = -INFINITY;
+        uint32_t best_i = 0;
+        for (uint32_t v = 0; v < vocab; ++v) {
+            if (logits[v] > best) { best = logits[v]; best_i = v; }
+        }
+        if ((int32_t)best_i == target) ++out->top1;
+
+        if (!dump_logits(dump_dir, dump_base + pos, logits, vocab)) { ok = 0; break; }
+    }
+
+    myds_context_free(ctx);
+    return ok;
+}
+
 int main(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr,
@@ -79,6 +156,8 @@ int main(int argc, char **argv) {
     const char *prompt_arg = NULL;
     const char *dump_dir = NULL;
     uint32_t max_tokens = 4096;
+    uint32_t ctx_len = 0;      /* 协议模式: 每段 token 数 */
+    uint32_t chunks = 0;       /* 协议模式: 段数 */
 
     for (int i = 2; i < argc; ++i) {
         if (strcmp(argv[i], "--text") == 0 && i + 1 < argc) {
@@ -91,6 +170,14 @@ int main(int argc, char **argv) {
             long v = strtol(argv[++i], NULL, 10);
             if (v < 2 || v > 262144) { fprintf(stderr, "bad --max-tokens: %ld\n", v); return 2; }
             max_tokens = (uint32_t)v;
+        } else if (strcmp(argv[i], "--context") == 0 && i + 1 < argc) {
+            long v = strtol(argv[++i], NULL, 10);
+            if (v < 2 || v > 262144) { fprintf(stderr, "bad --context: %ld\n", v); return 2; }
+            ctx_len = (uint32_t)v;
+        } else if (strcmp(argv[i], "--chunks") == 0 && i + 1 < argc) {
+            long v = strtol(argv[++i], NULL, 10);
+            if (v < 1 || v > 100000) { fprintf(stderr, "bad --chunks: %ld\n", v); return 2; }
+            chunks = (uint32_t)v;
         } else {
             fprintf(stderr, "unexpected argument: %s\n", argv[i]);
             return 2;
@@ -98,6 +185,10 @@ int main(int argc, char **argv) {
     }
     if ((text_path != NULL) == (prompt_arg != NULL)) {
         fputs("give exactly one of --text / --prompt\n", stderr);
+        return 2;
+    }
+    if ((ctx_len == 0) != (chunks == 0)) {
+        fputs("--context and --chunks must be given together\n", stderr);
         return 2;
     }
 
@@ -136,7 +227,7 @@ int main(int argc, char **argv) {
         free(tokens); myds_model_free(model);
         return 2;
     }
-    if ((uint32_t)n_tokens > max_tokens) {
+    if (chunks == 0 && (uint32_t)n_tokens > max_tokens) {
         fprintf(stderr, "input encodes to %d tokens; raise --max-tokens (currently %u)\n",
                 n_tokens, max_tokens);
         free(tokens); myds_model_free(model);
@@ -148,57 +239,32 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    const myds_config_t cfg = {
-        .max_seq_len = (uint32_t)n_tokens + 8u,
-        .max_new_tokens = 0,
-        .temperature = 0,
-        .top_p = 1,
-        .top_k = 0,
-        .min_p = 0,
-        .repetition_penalty = 1,
-        .seed = 42,
-        .stream = false,
-    };
-    myds_context_t *ctx = myds_context_create(model, &cfg);
-    if (!ctx) { fputs("Context creation failed\n", stderr); free(tokens); myds_model_free(model); return 1; }
-
     const uint32_t vocab = model->vocab_size;
     double nll = 0.0;
     uint32_t scored = 0;
     uint32_t top1_hits = 0;
     int status = 0;
 
-    for (int32_t pos = 0; pos + 1 < n_tokens; ++pos) {
-        int32_t next = myds_forward_token(ctx, tokens[pos], (uint32_t)pos);
-        if (next < 0) { fprintf(stderr, "forward failed at pos %d\n", pos); status = 1; break; }
-
-        const float *logits = (const float *)myds_metal_buffer_data(ctx->logits);
-        if (!logits) { fputs("no logits buffer\n", stderr); status = 1; break; }
-
-        float mx = -INFINITY;
-        for (uint32_t v = 0; v < vocab; ++v) {
-            if (!isfinite(logits[v])) { fprintf(stderr, "non-finite logit at pos %d\n", pos); status = 1; break; }
-            if (logits[v] > mx) mx = logits[v];
+    if (chunks > 0) {
+        if (ctx_len < 2) { fputs("--context must be at least 2\n", stderr); status = 2; }
+        const uint64_t need = (uint64_t)ctx_len * (uint64_t)chunks;
+        if (status == 0 && (uint64_t)n_tokens < need) {
+            fprintf(stderr, "input encodes to %d tokens; protocol needs %u x %u = %llu\n",
+                    n_tokens, ctx_len, chunks, (unsigned long long)need);
+            status = 2;
         }
-        if (status) break;
-
-        double sum = 0.0;
-        for (uint32_t v = 0; v < vocab; ++v) sum += exp((double)logits[v] - (double)mx);
-        const double lse = (double)mx + log(sum);
-
-        const int32_t target = tokens[pos + 1];
-        nll += -(double)logits[target] + lse;   /* -log p(target) */
-        ++scored;
-
-        /* top-1 命中率：argmax 是否等于真实的下一个 token（不依赖采样） */
-        float best = -INFINITY;
-        uint32_t best_i = 0;
-        for (uint32_t v = 0; v < vocab; ++v) {
-            if (logits[v] > best) { best = logits[v]; best_i = v; }
+        /* llama.cpp perplexity 口径：每段只计分 [context/2, context-2]。 */
+        const uint32_t score_from = ctx_len / 2;
+        for (uint32_t c = 0; c < chunks && status == 0; ++c) {
+            seg_stats s = {0, 0, 0};
+            if (!run_segment(model, tokens + (size_t)c * ctx_len, ctx_len, score_from,
+                             dump_dir, c * ctx_len, &s)) { status = 1; break; }
+            nll += s.nll; scored += s.scored; top1_hits += s.top1;
         }
-        if ((int32_t)best_i == target) ++top1_hits;
-
-        if (!dump_logits(dump_dir, (uint32_t)pos, logits, vocab)) { status = 1; break; }
+    } else {
+        seg_stats s = {0, 0, 0};
+        if (!run_segment(model, tokens, (uint32_t)n_tokens, 0, dump_dir, 0, &s)) status = 1;
+        else { nll = s.nll; scored = s.scored; top1_hits = s.top1; }
     }
 
     if (status == 0) {
@@ -206,14 +272,15 @@ int main(int argc, char **argv) {
         fprintf(json,
                 "{\"kind\":\"score\",\"model\":\"%s\",\"tokens\":%d,\"scored\":%u,"
                 "\"vocab\":%u,\"nll_sum\":%.9f,\"nll_mean\":%.9f,\"ppl\":%.9f,"
-                "\"top1_hits\":%u,\"top1_rate\":%.6f,\"dump_dir\":%s}\n",
+                "\"top1_hits\":%u,\"top1_rate\":%.6f,\"dump_dir\":%s,"
+                "\"context\":%u,\"chunks\":%u,\"score_from\":%u}\n",
                 model_path, n_tokens, scored, vocab, nll, mean_nll, exp(mean_nll),
                 top1_hits, scored ? (double)top1_hits / (double)scored : 0.0,
-                dump_dir ? "true" : "null");
+                dump_dir ? "true" : "null",
+                ctx_len, chunks, chunks > 0 ? ctx_len / 2 : 0u);
         fflush(json);
     }
 
-    myds_context_free(ctx);
     myds_model_free(model);
     free(tokens);
     return status;
