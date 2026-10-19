@@ -29,7 +29,7 @@ const char *myds_metal_shared_q4_v41_nb_selected_kernel(unsigned shape) {
 }
 const char *myds_metal_dense_q4_v41_selected_kernel(unsigned shape) {
     if (!g_dense_q4_v41 || shape >= 3u) return NULL;
-    const uint32_t nr = dense_q4_nr0();
+    const uint32_t nr = dense_q4_nr_site(shape);
     if (!shape) return g_dense_q4_v41_head_reference ?
         (nr == 4u ? "kernel_mul_mv_q4_K_dense_f32_r4" : "kernel_mul_mv_q4_K_dense_f32") :
         (nr == 4u ? "kernel_myds_q4_v41_head_addr_f32_r4" : "kernel_myds_q4_v41_head_addr_f32");
@@ -103,18 +103,18 @@ static int decode_candidates_initialize(bool overlap, bool iq2, bool q4, bool nb
         if (!decode_candidate_geometry(g_pso_moe_iq2_v41,(unsigned)g_moe_nsg,2176u)) return 0;
     }
     if (q4) {
-        const uint32_t nr = dense_q4_nr0();
+        const uint32_t nr0 = dense_q4_nr_site(0u), nr1 = dense_q4_nr_site(1u), nr2 = dense_q4_nr_site(2u);
         NSArray<NSString *> *names=@[
-            head_reference ? (nr == 4u ? @"kernel_mul_mv_q4_K_dense_f32_r4" : @"kernel_mul_mv_q4_K_dense_f32") :
-                (nr == 4u ? @"kernel_myds_q4_v41_head_addr_f32_r4" : @"kernel_myds_q4_v41_head_addr_f32"),
-            nb ? (nr == 4u ? @"kernel_myds_q4_v41_qb_nb_bf16_r4" : @"kernel_myds_q4_v41_qb_nb_bf16") :
-                 (nr == 4u ? @"kernel_myds_q4_v41_qb_addr_bf16_r4" : @"kernel_myds_q4_v41_qb_addr_bf16"),
-            nb ? (nr == 4u ? @"kernel_myds_q4_v41_ob_nb_bf16_r4" : @"kernel_myds_q4_v41_ob_nb_bf16") :
-                 (nr == 4u ? @"kernel_myds_q4_v41_ob_addr_bf16_r4" : @"kernel_myds_q4_v41_ob_addr_bf16")];
+            head_reference ? (nr0 == 4u ? @"kernel_mul_mv_q4_K_dense_f32_r4" : @"kernel_mul_mv_q4_K_dense_f32") :
+                (nr0 == 4u ? @"kernel_myds_q4_v41_head_addr_f32_r4" : @"kernel_myds_q4_v41_head_addr_f32"),
+            nb ? (nr1 == 4u ? @"kernel_myds_q4_v41_qb_nb_bf16_r4" : @"kernel_myds_q4_v41_qb_nb_bf16") :
+                 (nr1 == 4u ? @"kernel_myds_q4_v41_qb_addr_bf16_r4" : @"kernel_myds_q4_v41_qb_addr_bf16"),
+            nb ? (nr2 == 4u ? @"kernel_myds_q4_v41_ob_nb_bf16_r4" : @"kernel_myds_q4_v41_ob_nb_bf16") :
+                 (nr2 == 4u ? @"kernel_myds_q4_v41_ob_addr_bf16_r4" : @"kernel_myds_q4_v41_ob_addr_bf16")];
         for (unsigned i=0;i<3u;++i) {
             g_pso_dense_q4_v41[i]=decode_candidate_pipeline(names[i],4);
             if (!decode_candidate_geometry(g_pso_dense_q4_v41[i],4u,256u)) return 0;
-            fprintf(stderr,"myds_metal: Dense Q4 V41 provider %u = %s (NR%u/NSG4)\n",i,names[i].UTF8String,nr);
+            fprintf(stderr,"myds_metal: Dense Q4 V41 provider %u = %s (NR%u/NSG4)\n",i,names[i].UTF8String,dense_q4_nr_site(i));
         }
     }
     if (overlap && !decode_candidate_geometry(g_pso_mul_mv_q4_K_dense_bf16,4u,256u)) return 0;
@@ -191,7 +191,7 @@ int myds_metal_dense_q4_v41(myds_metal_buffer_t *out,
     const int provider = index==0 && g_dense_q4_v41_head_reference ? DC_Q4_HEAD_REFERENCE :
         index>0 && g_dense_q4_v41_nb ? DC_Q4_NB : -1;
     if (provider>=0) atomic_fetch_add_explicit(&g_decode_candidates[provider][0],1,memory_order_relaxed);
-    const uint32_t nr = (dense_q4_nr0() == 4u && (rows % 4u == 0)) ? 4u : 2u;
+    const uint32_t nr = (index >= 0 && dense_q4_nr_site((unsigned)index) == 4u && (rows % 4u == 0)) ? 4u : 2u;
     if (!g_initialized || !g_dense_q4_v41 || index<0 || (dense_q4_nr0()!=2u && dense_q4_nr0()!=4u) || dense_q4_nsg()!=4u ||
         !decode_candidate_geometry(g_pso_dense_q4_v41[index],4u,256u))
         return dense_q4_provider_failure(provider,"scope/shape/PSO/geometry");
@@ -232,7 +232,7 @@ int myds_metal_dense_q4_v41_qb_slice(myds_metal_buffer_t *out,
     const int index = 1;
     const int provider = g_dense_q4_v41_nb ? DC_Q4_NB : -1;
     if (count_call && provider>=0) atomic_fetch_add_explicit(&g_decode_candidates[provider][0],1,memory_order_relaxed);
-    const uint32_t nr = (dense_q4_nr0() == 4u && (slice_rows % 16u == 0) && (row_offset % 16u == 0)) ? 4u : 2u;
+    const uint32_t nr = (dense_q4_nr_site(1u) == 4u && (slice_rows % 16u == 0) && (row_offset % 16u == 0)) ? 4u : 2u;
     if (!g_initialized || !g_dense_q4_v41 || !slice_rows || (slice_rows % (4u*nr)) != 0u ||
         (row_offset % (4u*nr)) != 0u || row_offset > 32768u || slice_rows > 32768u - row_offset ||
         (dense_q4_nr0()!=2u && dense_q4_nr0()!=4u) || dense_q4_nsg()!=4u ||

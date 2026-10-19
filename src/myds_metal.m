@@ -41,6 +41,12 @@ static id<MTLLibrary>              g_library = nil;
 static NSString *g_loaded_library_path = nil;
 static double g_last_gpu_start = 0.0, g_last_gpu_end = 0.0;
 static bool g_last_gpu_span_valid = false;
+/* MYDS_TOKEN_GAP_PROF=1 (default off): GPU spans of every command buffer in
+ * one wait set, so callers can measure inter-token and inter-segment idle. */
+static int g_gp_on = -1;
+static int g_gp_ncb = 0;
+static double g_gp_first_start = 0.0, g_gp_last_end = 0.0, g_gp_intra_idle = 0.0;
+static double g_gp_first_commit = 0.0;
 static id<MTLComputePipelineState> g_pso_rms_norm = nil;
 static id<MTLComputePipelineState> g_pso_v41_norm_plain = nil;
 static id<MTLComputePipelineState> g_pso_v41_bf16 = nil;
@@ -134,6 +140,7 @@ static id<MTLComputePipelineState> g_pso_indexer_head_slots = nil;
 static uint32_t qkv_nr0(void);
 static uint32_t dense_q4_nr0(void);
 static uint32_t dense_q4_nsg(void);
+static uint32_t dense_q4_nr_site(unsigned site);
 static int indexer_head_slots_parse_mode(void) {
     const char *value = getenv("MYDS_INDEXER_HEAD_SLOTS");
     if (!value || strcmp(value, "0") == 0) return 0;
@@ -1446,8 +1453,59 @@ static int wait_inflight_commands(void) {
     return ok;
 }
 
+double myds_metal_host_time(void) {
+    static mach_timebase_info_data_t tb;
+    if (tb.denom == 0) mach_timebase_info(&tb);
+    return (double)mach_absolute_time() * (double)tb.numer / (double)tb.denom * 1e-9;
+}
+
+int myds_metal_gap_prof_enabled(void) {
+    if (g_gp_on < 0) {
+        const char *e = getenv("MYDS_TOKEN_GAP_PROF");
+        g_gp_on = (e && atoi(e) != 0) ? 1 : 0;
+    }
+    return g_gp_on;
+}
+
+static void gp_note_commit(void) {
+    if (g_gp_on == 1 && g_gp_first_commit == 0.0) g_gp_first_commit = myds_metal_host_time();
+}
+
+static void gp_note_cb(id<MTLCommandBuffer> cb) {
+    const double s = cb.GPUStartTime, e = cb.GPUEndTime;
+    if (!(s > 0.0) || !(e >= s)) return;
+    if (g_gp_ncb == 0) {
+        g_gp_first_start = s;
+    } else if (s > g_gp_last_end) {
+        g_gp_intra_idle += s - g_gp_last_end;
+    }
+    if (e > g_gp_last_end) g_gp_last_end = e;
+    g_gp_ncb++;
+}
+
+int myds_metal_gap_prof_take(double *first_commit, double *first_start, double *last_end,
+                             double *intra_idle, int *ncb) {
+    if (g_gp_on != 1 || g_gp_ncb == 0) return 0;
+    if (first_commit) *first_commit = g_gp_first_commit;
+    if (first_start) *first_start = g_gp_first_start;
+    if (last_end) *last_end = g_gp_last_end;
+    if (intra_idle) *intra_idle = g_gp_intra_idle;
+    if (ncb) *ncb = g_gp_ncb;
+    g_gp_ncb = 0; g_gp_first_start = g_gp_last_end = g_gp_intra_idle = g_gp_first_commit = 0.0;
+    return 1;
+}
+
 static int wait_command_buffer(id<MTLCommandBuffer> cb) {
     [cb waitUntilCompleted];
+    if (g_gp_on == 1) {
+        if (g_inflight_cbs) {
+            for (id<MTLCommandBuffer> icb in g_inflight_cbs) {
+                if (icb.status != MTLCommandBufferStatusCompleted) [icb waitUntilCompleted];
+                gp_note_cb(icb);
+            }
+        }
+        gp_note_cb(cb);
+    }
     int ok = command_buffer_result(cb);
     /* Keep errors from earlier asynchronous submissions observable, too. */
     if (!wait_inflight_commands()) ok = 0;
@@ -2507,6 +2565,7 @@ int myds_metal_commit_batch(void) {
     id<MTLCommandBuffer> cb = g_batch_cb;
     g_batch_cb = nil;
     myds_metal_residency_keep_alive();
+    gp_note_commit();
     [cb commit];
     g_batch_commit_count++;
     return wait_command_buffer(cb);
@@ -2520,6 +2579,7 @@ int myds_metal_flush_batch(void) {
     if (!g_inflight_cbs) g_inflight_cbs = [[NSMutableArray alloc] initWithCapacity:64];
     [g_inflight_cbs addObject:cb];
     myds_metal_residency_keep_alive();
+    gp_note_commit();
     [cb commit];
     g_batch_commit_count++;
     return 1;
@@ -4229,7 +4289,7 @@ int myds_metal_gemv_batch(
         if (in_dim % 256u) return 0;
         block_bytes = 144;
         row_bytes = (uint64_t)(in_dim / 256u) * block_bytes;
-        q4_nr0 = (dense_q4_nr0() == 4u && (out_dim % 4u == 0)) ? 4u : 2u;
+        q4_nr0 = (dense_q4_nr_site(3u) == 4u && (out_dim % 4u == 0)) ? 4u : 2u;
         NSString *key = [NSString stringWithFormat:@"q4_k_%u_%u", nsg, q4_nr0];
         pipeline = g_native_pipelines[key];
         if (!pipeline) {
@@ -4717,6 +4777,21 @@ static uint32_t dense_q4_nr0(void) {
     const char *v = getenv("MYDS_DENSE_Q4_NR0");
     if (v && strcmp(v, "4") == 0) return 4u;
     return 2u;
+}
+
+/* MYDS_DENSE_Q4_NR4_MASK (only meaningful with MYDS_DENSE_Q4_NR0=4): per-site
+ * NR4 opt-in. NR only regroups output rows (K reduction fixed) => bit-exact.
+ * bit0 LM head, bit1 attn_q_b, bit2 attn_output_b (Dense Q4 V41 providers),
+ * bit3 generic Q4 F32 GEMV, bit4 generic Q4 BF16 GEMV, bit5 attn_output_a. */
+enum { DQ4_SITE_HEAD = 0, DQ4_SITE_QB = 1, DQ4_SITE_OB = 2, DQ4_SITE_GEMV_F32 = 3,
+       DQ4_SITE_GEMV_BF16 = 4, DQ4_SITE_OUT_A = 5 };
+static uint32_t dense_q4_nr_site(unsigned site) {
+    static int mask = -1;
+    if (__builtin_expect(mask < 0, 0)) {
+        const char *v = getenv("MYDS_DENSE_Q4_NR4_MASK");
+        mask = v ? (int)(strtol(v, NULL, 0) & 0x3f) : 0x3f;
+    }
+    return (dense_q4_nr0() == 4u && ((mask >> site) & 1)) ? 4u : 2u;
 }
 
 /* 2026-10-13 (参谋长): dense Q4_K bf16 GEMV 的 simdgroup 数（每个 threadgroup）。
@@ -5331,7 +5406,7 @@ int myds_metal_v41_gemv_bf16(myds_metal_buffer_t *out,
         const uint64_t row_bytes = (uint64_t)(in_dim / 256u) * 144u;
         if (weight->size / row_bytes < out_dim || input->size / 4u < in_dim || out->size / 4u < out_dim) return 0;
         const uint32_t nsg = dense_q4_nsg();
-        uint32_t nr0 = (dense_q4_nr0() == 4u && (out_dim % 4u == 0)) ? 4u : 2u;
+        uint32_t nr0 = (dense_q4_nr_site(4u) == 4u && (out_dim % 4u == 0)) ? 4u : 2u;
         /* Precompiled PSOs bake NSG=4; a non-default NSG must be built with the
          * function constant below, so force the dynamic path in that case. */
         id<MTLComputePipelineState> pipeline = (nsg == 4u)
@@ -7309,7 +7384,7 @@ int myds_metal_attn_output_a_bf16_batch(
             return 1;
         }
     }
-    const bool can_use_r4 = (dense_q4_nr0() == 4u && g_pso_attn_out_low_q4_K_bf16_r4 != nil && (rank >= 1024u && rank % 4u == 0));
+    const bool can_use_r4 = (dense_q4_nr_site(5u) == 4u && g_pso_attn_out_low_q4_K_bf16_r4 != nil && (rank >= 1024u && rank % 4u == 0));
     id<MTLComputePipelineState> pso = can_use_r4 ? g_pso_attn_out_low_q4_K_bf16_r4 : g_pso_attn_out_low_q4_K_bf16;
 
     if (cached_fuse && weight_type == GGML_TYPE_Q4_K &&

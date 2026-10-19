@@ -46,6 +46,12 @@ void myds_metal_dense_q4_v41_head_reference_counters(myds_metal_decode_candidate
  * span is the last completed CB, not a token or an entire split request. */
 const char *myds_metal_loaded_library_path(void);
 int myds_metal_last_completed_gpu_span(double *start_s, double *end_s);
+/* MYDS_TOKEN_GAP_PROF=1 diagnostics (default off, zero cost when off).
+ * host_time uses the same clock as MTLCommandBuffer GPUStartTime. */
+double myds_metal_host_time(void);
+int myds_metal_gap_prof_enabled(void);
+int myds_metal_gap_prof_take(double *first_commit, double *first_start, double *last_end,
+                             double *intra_idle, int *ncb);
 /* Caller supplies the public/nontrace scalar scope. Supports only the three
  * documented Q4 shapes, with their original F32/BF16 epilogues. */
 int myds_metal_dense_q4_v41(myds_metal_buffer_t *out,

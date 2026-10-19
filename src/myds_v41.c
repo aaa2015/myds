@@ -3677,6 +3677,45 @@ static inline int v41_hc_sum_rmsnorm_scoped(
     }
 }
 
+/* MYDS_TOKEN_GAP_PROF=1: per-token GPU idle attribution (diagnostic only). */
+typedef struct {
+    double prev_end, prev_done;
+    double s_gap, s_wake, s_sample, s_between, s_engram, s_encode1, s_launch, s_intra, s_busy;
+    double s_ncb;
+    uint32_t n;
+} v41_gap_prof_t;
+static v41_gap_prof_t g_v41_gap;
+
+static void v41_gap_prof_record(double t_entry, double t_engram, double t_wake, double t_done) {
+    double first_commit = 0, s = 0, e = 0, intra = 0; int ncb = 0;
+    if (!myds_metal_gap_prof_take(&first_commit, &s, &e, &intra, &ncb)) return;
+    v41_gap_prof_t *p = &g_v41_gap;
+    const double gap = s - p->prev_end;
+    if (p->prev_end > 0.0 && gap > 0.0 && gap < 0.05 && first_commit > 0.0) {
+        p->s_gap += gap;
+        p->s_wake += t_wake - e;
+        p->s_sample += t_done - t_wake;
+        p->s_between += t_entry - p->prev_done;
+        p->s_engram += t_engram - t_entry;
+        p->s_encode1 += first_commit - t_engram;
+        p->s_launch += s - first_commit;
+        p->s_intra += intra;
+        p->s_busy += e - s;
+        p->s_ncb += ncb;
+        if (++p->n == 128u) {
+            const double k = 1e6 / p->n;
+            MYDS_LOG_I("token-gap-prof n=%u us/token: gpu_gap=%.1f [wake=%.1f sample=%.1f engine=%.1f engram=%.1f encode1=%.1f launch=%.1f] intra_idle=%.1f gpu_span=%.1f cbs=%.1f",
+                p->n, p->s_gap*k, p->s_wake*k, p->s_sample*k, p->s_between*k, p->s_engram*k,
+                p->s_encode1*k, p->s_launch*k, p->s_intra*k, p->s_busy*k, p->s_ncb/p->n);
+            const double pe = p->prev_end, pd = p->prev_done;
+            memset(p, 0, sizeof(*p));
+            p->prev_end = pe; p->prev_done = pd;
+        }
+    }
+    p->prev_end = e;
+    p->prev_done = t_done;
+}
+
 static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos,
                                bool need_logits, bool ordinary_decode_allowed) {
     myds_model_t *m=ctx->model;
@@ -3692,6 +3731,8 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
         ctx->decode_stats.target_forward_calls++;
         ctx->decode_stats.target_rows++;
     }
+    const bool gap_prof = myds_metal_gap_prof_enabled() == 1;
+    const double gp_t_entry = gap_prof ? myds_metal_host_time() : 0.0;
     if (!myds_metal_commit_batch()) return -1;
     if (pos==0) { g->next_position=0; g->valid=true; myds_engram_reset(g->engram); }
     if (!g->valid || pos!=g->next_position) {
@@ -3731,6 +3772,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
     for (uint32_t j=1;j<4;j++) memcpy(res+j*V41_DIM,res,V41_DIM*4u);
     const float initial_pre[4]={1,0,0,0};
     CHECK(myds_metal_buffer_write(g->pre,0,initial_pre,sizeof(initial_pre)));
+    const double gp_t_engram = gap_prof ? myds_metal_host_time() : 0.0;
     const bool fuse_hc_norm_enabled = v41_fuse_hc_sum_rmsnorm_enabled();
     static int qkv_pipeline_enabled = -1;
     if (qkv_pipeline_enabled < 0) {
@@ -4118,6 +4160,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
             CHECK(project(ctx->logits,m->output,ctx->x_norm,m->vocab_size,V41_DIM,m->output_type,false));
         }
         CHECK(myds_metal_commit_batch());
+        const double gp_t_wake = gap_prof ? myds_metal_host_time() : 0.0;
         if (fine_pipeline) {
             myds_metal_set_auto_barrier(prev_auto_barrier);
             myds_metal_set_concurrent(prev_concurrent);
@@ -4126,6 +4169,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
         const float *logits=myds_metal_buffer_data(ctx->logits);
         next_tok = sample_and_verify_token(logits, m->vocab_size, &ctx->cfg, ctx);
         if (next_tok < 0) goto fail;
+        if (gap_prof) v41_gap_prof_record(gp_t_entry, gp_t_engram, gp_t_wake, myds_metal_host_time());
     } else {
         CHECK(myds_metal_commit_batch());
         if (fine_pipeline) {
