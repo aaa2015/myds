@@ -6,8 +6,11 @@ set -uo pipefail
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 repo=~/Projects/myds
-model=~/.lmstudio/models/antirez/deepseek-v4.1-flash-gguf/DeepSeek-V4.1-Flash-Q2-dense-q4.gguf
 out=${1:?provide a NEW absolute output directory}
+# 端口 / 模型 / alias 参数化（2026-10-20）：原值保持为默认，可覆盖以测 1017 与 8187。
+PORT=${KPROF_PORT:-8181}
+model=${KPROF_MODEL:-$HOME/.lmstudio/models/antirez/deepseek-v4.1-flash-gguf/DeepSeek-V4.1-Flash-Q2-dense-q4.gguf}
+alias_name=${KPROF_ALIAS:-local-myds-deepseek-v4.1-flash-q2}
 stage=/tmp/myds-kprof-stage
 mkdir "$out" || exit 1
 cd "$repo"
@@ -21,7 +24,7 @@ shasum -a 256 "$stage/bench_kprof" "$stage/myds.metallib" > "$out/binary-identit
 
 # Requests: short hand-written, plus deterministic long inputs.
 cat > "$out/req-short.json" <<'JSON'
-{"model":"local-myds-deepseek-v4.1-flash-q2","messages":[{"role":"user","content":"请用中文详细介绍一下快速排序算法，包括原理、时间复杂度、Python 实现和优缺点。写得尽量长。"}],"max_tokens":64,"temperature":0}
+{"model":"'"$alias_name"'","messages":[{"role":"user","content":"请用中文详细介绍一下快速排序算法，包括原理、时间复杂度、Python 实现和优缺点。写得尽量长。"}],"max_tokens":64,"temperature":0}
 JSON
 python3 tools/make_decode_business_request.py --records 14 --output "$out/req-8k.json" > "$out/gen-8k.log" 2>&1
 python3 tools/make_decode_business_request.py --records 56 --output "$out/req-32k.json" > "$out/gen-32k.log" 2>&1
@@ -31,20 +34,20 @@ cleanup() {
   if [[ $restore = 1 ]]; then
     (cd ~/Projects/deploy && ./start_fleet.sh) > "$out/restore-service.log" 2>&1
     sleep 5
-    curl -fsS http://127.0.0.1:8181/health > "$out/restored-health.json" 2>"$out/restored-health.err"
-    lsof -nP -a -iTCP:8181 -sTCP:LISTEN > "$out/restored-listener.txt" 2>&1
+    curl -fsS http://127.0.0.1:$PORT/health > "$out/restored-health.json" 2>"$out/restored-health.err"
+    lsof -nP -a -iTCP:$PORT -sTCP:LISTEN > "$out/restored-listener.txt" 2>&1
     echo "RESTORED $(cat "$out/restored-health.json" 2>/dev/null)" > "$out/DONE"
   fi
 }
 trap cleanup EXIT
-pid=$(lsof -nP -t -a -iTCP:8181 -sTCP:LISTEN)
+pid=$(lsof -nP -t -a -iTCP:$PORT -sTCP:LISTEN)
 [[ -n "$pid" ]] || { echo "no 8181 listener" >&2; exit 1; }
 ps -p "$pid" -o pid=,command= > "$out/service-before.txt"
 restore=1
 kill -TERM "$pid"
 for i in {1..30}; do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
 kill -0 "$pid" 2>/dev/null && { echo "service did not stop" >&2; exit 1; }
-python3 -c 'import sys; sys.path.insert(0,"tools"); import bench_reproduce; bench_reproduce.check_idle(8181)' || { echo "not idle" >&2; exit 1; }
+python3 -c "import sys; sys.path.insert(0,'tools'); import bench_reproduce; bench_reproduce.check_idle($PORT)" || { echo "not idle" >&2; exit 1; }
 vm_stat > "$out/vm-before.txt"; sysctl vm.swapusage > "$out/swap-before.txt"
 
 # Production decode settings minus speculation / KV disk / prefix cache.
@@ -54,7 +57,7 @@ common=(MYDS_PREFIX_CACHE=0 MYDS_PLD=0 MYDS_KV_DSK=0
   MYDS_INDEXER_TOPK_NAN_FUSE=1 MYDS_INDEXER_TOPK_PREFIX_MERGE=1 MYDS_LM_HEAD_Q8_NR0=4
   MYDS_METAL_CONCURRENT=1 MYDS_MOE_CONCURRENT=1 MYDS_MOE_NSG=4 MYDS_MOE_CHUNKS=9
   MYDS_PREFILL_CHUNK_SIZE=512 MYDS_RESIDENCY_KEEP_ALIVE_S=86400
-  MYDS_SUFFIX_SHRINK_SHIFT=512 MYDS_TOPK_THRESHOLD=1 MYDS_DENSE_Q4_NR0=4)
+  MYDS_SUFFIX_SHRINK_SHIFT=512 MYDS_TOPK_THRESHOLD=1 MYDS_DENSE_Q4_NR0=2)
 printf '%s\n' "${common[@]}" > "$out/env.txt"
 
 run_case() { # name request max_seq
