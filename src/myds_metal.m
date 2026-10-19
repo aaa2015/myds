@@ -1622,8 +1622,8 @@ int myds_metal_init(const char *shader_dir) {
     }
     if (moe_down_overlap || dense_q4_v41) {
         const char *nr=getenv("MYDS_DENSE_Q4_NR0"), *sg=getenv("MYDS_DENSE_Q4_NSG");
-        if ((nr && strcmp(nr,"2")) || (sg && strcmp(sg,"4"))) {
-            fprintf(stderr,"myds_metal: explicit overlap/Q4 candidates require literal NR2/NSG4 or defaults\n");
+        if ((nr && strcmp(nr,"2") && strcmp(nr,"4")) || (sg && strcmp(sg,"4"))) {
+            fprintf(stderr,"myds_metal: explicit overlap/Q4 candidates require literal NR2/NR4/NSG4 or defaults\n");
             return 0;
         }
     }
