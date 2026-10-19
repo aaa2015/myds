@@ -6123,6 +6123,12 @@ struct v41_chunk_workspace_s {
     myds_metal_buffer_t *shared_view;
     myds_metal_buffer_t *after_view;
     myds_metal_buffer_t *split_view;
+    myds_metal_buffer_t *in_after_view;
+    myds_metal_buffer_t *in_norm_view;
+    myds_metal_buffer_t *in_split_view;
+    myds_metal_buffer_t *in_shared_view;
+    myds_metal_buffer_t *in_ids_view;
+    myds_metal_buffer_t *in_weights_view;
     myds_metal_buffer_t *hc_flat_norm_buf;
     myds_metal_buffer_t *hc_mix_buf;
 };
@@ -6218,6 +6224,12 @@ static void v41_chunk_workspace_free(v41_chunk_workspace_t *cw) {
     if (cw->shared_view) myds_metal_buffer_free(cw->shared_view);
     if (cw->after_view) myds_metal_buffer_free(cw->after_view);
     if (cw->split_view) myds_metal_buffer_free(cw->split_view);
+    if (cw->in_after_view) myds_metal_buffer_free(cw->in_after_view);
+    if (cw->in_norm_view) myds_metal_buffer_free(cw->in_norm_view);
+    if (cw->in_split_view) myds_metal_buffer_free(cw->in_split_view);
+    if (cw->in_shared_view) myds_metal_buffer_free(cw->in_shared_view);
+    if (cw->in_ids_view) myds_metal_buffer_free(cw->in_ids_view);
+    if (cw->in_weights_view) myds_metal_buffer_free(cw->in_weights_view);
     if (cw->hc_flat_norm_buf) myds_metal_buffer_free(cw->hc_flat_norm_buf);
     if (cw->hc_mix_buf) myds_metal_buffer_free(cw->hc_mix_buf);
     if (cw->moe_batch > cw->capacity) {   /* 别名时不能重复释放 */
@@ -6391,10 +6403,18 @@ static v41_chunk_workspace_t *v41_chunk_workspace_create(uint32_t capacity, uint
     cw->shared_view = myds_metal_buffer_create_view();
     cw->after_view = myds_metal_buffer_create_view();
     cw->split_view = myds_metal_buffer_create_view();
+    cw->in_after_view = myds_metal_buffer_create_view();
+    cw->in_norm_view = myds_metal_buffer_create_view();
+    cw->in_split_view = myds_metal_buffer_create_view();
+    cw->in_shared_view = myds_metal_buffer_create_view();
+    cw->in_ids_view = myds_metal_buffer_create_view();
+    cw->in_weights_view = myds_metal_buffer_create_view();
     if (!cw->cur_res_view || !cw->cur_pre_view || !cw->cur_engram_view[0] || !cw->cur_engram_view[1] ||
         !cw->cur_selected_view || !cw->cur_mask_view ||
         !cw->cur_index_q_view || !cw->cur_index_weights_view ||
-        !cw->moe_view || !cw->shared_view || !cw->after_view || !cw->split_view) goto fail;
+        !cw->moe_view || !cw->shared_view || !cw->after_view || !cw->split_view ||
+        !cw->in_after_view || !cw->in_norm_view || !cw->in_split_view ||
+        !cw->in_shared_view || !cw->in_ids_view || !cw->in_weights_view) goto fail;
     return cw;
 fail:
     v41_chunk_workspace_free(cw);
@@ -7266,21 +7286,46 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 /* Step 6: HC FFN Input for all tokens in chunk */
                 TIME_START();
                 phase = "HC FFN input";
-                CHECK(myds_metal_v41_hc_expand_batch(cw->after_attn_buf, cw->attn_out_buf, cw->cur_res_view, cw->attn_split_buf, V41_DIM, c_len));
+                const bool direct_moe_acc = (!trace_on && cw->moe_batch > cw->capacity);
+                if (direct_moe_acc) {
+                    if (!myds_metal_buffer_update_sub_view(cw->in_after_view, cw->moe_after_acc,
+                            (size_t)moe_off * 4 * V41_DIM * sizeof(float), (size_t)c_len * 4 * V41_DIM * sizeof(float)) ||
+                        !myds_metal_buffer_update_sub_view(cw->in_norm_view, cw->moe_norm_acc,
+                            (size_t)moe_off * V41_DIM * sizeof(float), (size_t)c_len * V41_DIM * sizeof(float)) ||
+                        !myds_metal_buffer_update_sub_view(cw->in_split_view, cw->moe_split_acc,
+                            (size_t)moe_off * 24 * sizeof(float), (size_t)c_len * 24 * sizeof(float)) ||
+                        !myds_metal_buffer_update_sub_view(cw->in_shared_view, cw->moe_shared_acc,
+                            (size_t)moe_off * V41_DIM * sizeof(float), (size_t)c_len * V41_DIM * sizeof(float)) ||
+                        !myds_metal_buffer_update_sub_view(cw->in_ids_view, cw->moe_ids_acc,
+                            (size_t)moe_off * 6 * sizeof(int32_t), (size_t)c_len * 6 * sizeof(int32_t)) ||
+                        !myds_metal_buffer_update_sub_view(cw->in_weights_view, cw->moe_w_acc,
+                            (size_t)moe_off * 6 * sizeof(float), (size_t)c_len * 6 * sizeof(float))) {
+                        MYDS_LOG_E("V4.1 MoE acc input sub-view failed (moe_off=%u c_len=%u)", moe_off, c_len);
+                        goto fail;
+                    }
+                }
+                myds_metal_buffer_t *cur_after = direct_moe_acc ? cw->in_after_view : cw->after_attn_buf;
+                myds_metal_buffer_t *cur_norm = direct_moe_acc ? cw->in_norm_view : cw->ffn_norm_buf;
+                myds_metal_buffer_t *cur_split = direct_moe_acc ? cw->in_split_view : cw->ffn_split_buf;
+                myds_metal_buffer_t *cur_shared = direct_moe_acc ? cw->in_shared_view : cw->shared_out_buf;
+                myds_metal_buffer_t *cur_ids = direct_moe_acc ? cw->in_ids_view : cw->selected_ids_buf;
+                myds_metal_buffer_t *cur_w = direct_moe_acc ? cw->in_weights_view : cw->selected_weights_buf;
+
+                CHECK(myds_metal_v41_hc_expand_batch(cur_after, cw->attn_out_buf, cw->cur_res_view, cw->attn_split_buf, V41_DIM, c_len));
 
                 /* Batched HC Mix: RMSNorm + GEMM + Split across the entire chunk */
                 if (!trace_on && hc_mix_use_gemv &&
-                    myds_metal_v41_hc_sum_rmsnorm_scale_batch(cw->ffn_norm_buf, NULL, cw->hc_flat_norm_buf,
-                                                              cw->after_attn_buf, cw->attn_split_buf,
+                    myds_metal_v41_hc_sum_rmsnorm_scale_batch(cur_norm, NULL, cw->hc_flat_norm_buf,
+                                                              cur_after, cw->attn_split_buf,
                                                               base->ffn_norm, V41_DIM, c_len, 96, m->norm_eps, true)) {
                     if (!myds_metal_get_auto_barrier()) myds_metal_barrier();
-                    CHECK(myds_metal_v41_gemv_batch_scaled(cw->hc_mix_buf, l->ffn_fn, cw->after_attn_buf, cw->hc_flat_norm_buf,
+                    CHECK(myds_metal_v41_gemv_batch_scaled(cw->hc_mix_buf, l->ffn_fn, cur_after, cw->hc_flat_norm_buf,
                                                            24, 4 * V41_DIM, c_len, GGML_TYPE_F16));
-                    CHECK(myds_metal_v41_hc_split_batch(cw->ffn_split_buf, cw->hc_mix_buf, l->ffn_scale, l->ffn_base, c_len, v->hc_eps));
+                    CHECK(myds_metal_v41_hc_split_batch(cur_split, cw->hc_mix_buf, l->ffn_scale, l->ffn_base, c_len, v->hc_eps));
                 } else {
-                    CHECK(myds_metal_v41_rmsnorm_batch(cw->hc_flat_norm_buf, cw->after_attn_buf, NULL, 4 * V41_DIM, c_len, m->norm_eps, false));
+                    CHECK(myds_metal_v41_rmsnorm_batch(cw->hc_flat_norm_buf, cur_after, NULL, 4 * V41_DIM, c_len, m->norm_eps, false));
                     CHECK(project_batch(cw->hc_mix_buf, l->ffn_fn, cw->hc_flat_norm_buf, 24, 4 * V41_DIM, c_len, GGML_TYPE_F16, false));
-                    CHECK(myds_metal_v41_hc_split_batch(cw->ffn_split_buf, cw->hc_mix_buf, l->ffn_scale, l->ffn_base, c_len, v->hc_eps));
+                    CHECK(myds_metal_v41_hc_split_batch(cur_split, cw->hc_mix_buf, l->ffn_scale, l->ffn_base, c_len, v->hc_eps));
 
                     if (trace_on) {
                         for (uint32_t t = 0; t < c_len; t++) {
@@ -7292,11 +7337,11 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     }
 
                     if (!trace_on &&
-                        myds_metal_v41_hc_sum_rmsnorm_batch(cw->ffn_norm_buf, NULL, cw->after_attn_buf, cw->attn_split_buf,
+                        myds_metal_v41_hc_sum_rmsnorm_batch(cur_norm, NULL, cur_after, cw->attn_split_buf,
                                                             base->ffn_norm, V41_DIM, c_len, 96, m->norm_eps, true)) {
                     } else {
-                        CHECK(myds_metal_v41_hc_weighted_sum_batch(cw->x_buf, cw->after_attn_buf, cw->attn_split_buf, V41_DIM, c_len, 96));
-                        CHECK(myds_metal_v41_rmsnorm_batch(cw->ffn_norm_buf, cw->x_buf, base->ffn_norm, V41_DIM, c_len, m->norm_eps, true));
+                        CHECK(myds_metal_v41_hc_weighted_sum_batch(cw->x_buf, cur_after, cw->attn_split_buf, V41_DIM, c_len, 96));
+                        CHECK(myds_metal_v41_rmsnorm_batch(cur_norm, cw->x_buf, base->ffn_norm, V41_DIM, c_len, m->norm_eps, true));
                     }
                 }
 
@@ -7313,11 +7358,11 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 TIME_START();
                 phase = "batched MoE shared and router";
                 uint32_t width = m->moe_expert_dim;
-                CHECK(project_batch(cw->router_logits_buf, base->router_gate, cw->ffn_norm_buf, m->n_routed_experts, V41_DIM, c_len, base->router_gate_type, false));
-                CHECK(project_batch(cw->shared_gate_buf, base->shared_gate, cw->ffn_norm_buf, width, V41_DIM, c_len, base->shared_gate_type, true));
-                CHECK(project_batch(cw->shared_up_buf, base->shared_up, cw->ffn_norm_buf, width, V41_DIM, c_len, base->shared_up_type, true));
+                CHECK(project_batch(cw->router_logits_buf, base->router_gate, cur_norm, m->n_routed_experts, V41_DIM, c_len, base->router_gate_type, false));
+                CHECK(project_batch(cw->shared_gate_buf, base->shared_gate, cur_norm, width, V41_DIM, c_len, base->shared_gate_type, true));
+                CHECK(project_batch(cw->shared_up_buf, base->shared_up, cur_norm, width, V41_DIM, c_len, base->shared_up_type, true));
                 CHECK(myds_v41_shared_swiglu(cw->shared_swiglu_buf, cw->shared_gate_buf, cw->shared_up_buf, width * c_len, m->swiglu_clamp_exp));
-                CHECK(project_batch(cw->shared_out_buf, base->shared_down, cw->shared_swiglu_buf, V41_DIM, width, c_len, base->shared_down_type, true));
+                CHECK(project_batch(cur_shared, base->shared_down, cw->shared_swiglu_buf, V41_DIM, width, c_len, base->shared_down_type, true));
 
                 /* Step 7b: Batched MoE routing for all tokens in chunk on GPU */
                 phase = "batched MoE routing";
@@ -7329,7 +7374,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                         TRACE("route_logits", cw->router_logits[t], m->n_routed_experts);
                     }
                 }
-                CHECK(myds_v41_route_batch(cw->selected_ids_buf, cw->selected_weights_buf,
+                CHECK(myds_v41_route_batch(cur_ids, cur_w,
                                            cw->route_probs_buf, cw->route_scores_buf,
                                            cw->router_logits_buf, base->router_bias,
                                            m->n_routed_experts, k, m->routed_scaling_factor, c_len));
@@ -7367,7 +7412,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                  * 攒满 —— 或到了 prompt 末尾 —— 再跑一次 MoE。attention 的数值路径与
                  * chunk 大小完全不变，所以结果与「每 chunk 一次 MoE」逐位相同。 */
                 TIME_START();
-                if (cw->moe_batch > cw->capacity) {
+                if (!direct_moe_acc && cw->moe_batch > cw->capacity) {
                     CHECK(myds_metal_buffer_copy(cw->moe_norm_acc, (size_t)moe_off * V41_DIM * sizeof(float),
                                                  cw->ffn_norm_buf, 0, (size_t)c_len * V41_DIM * sizeof(float)));
                     CHECK(myds_metal_buffer_copy(cw->moe_ids_acc, (size_t)moe_off * 6 * sizeof(int32_t),

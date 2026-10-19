@@ -29,12 +29,16 @@ const char *myds_metal_shared_q4_v41_nb_selected_kernel(unsigned shape) {
 }
 const char *myds_metal_dense_q4_v41_selected_kernel(unsigned shape) {
     if (!g_dense_q4_v41 || shape >= 3u) return NULL;
-    if (!shape) return g_dense_q4_v41_head_reference ? "kernel_mul_mv_q4_K_dense_f32" :
-        "kernel_myds_q4_v41_head_addr_f32";
-    if (shape==1u) return g_dense_q4_v41_nb ? "kernel_myds_q4_v41_qb_nb_bf16" :
-        "kernel_myds_q4_v41_qb_addr_bf16";
-    return g_dense_q4_v41_nb ? "kernel_myds_q4_v41_ob_nb_bf16" :
-        "kernel_myds_q4_v41_ob_addr_bf16";
+    const uint32_t nr = dense_q4_nr0();
+    if (!shape) return g_dense_q4_v41_head_reference ?
+        (nr == 4u ? "kernel_mul_mv_q4_K_dense_f32_r4" : "kernel_mul_mv_q4_K_dense_f32") :
+        (nr == 4u ? "kernel_myds_q4_v41_head_addr_f32_r4" : "kernel_myds_q4_v41_head_addr_f32");
+    if (shape==1u) return g_dense_q4_v41_nb ?
+        (nr == 4u ? "kernel_myds_q4_v41_qb_nb_bf16_r4" : "kernel_myds_q4_v41_qb_nb_bf16") :
+        (nr == 4u ? "kernel_myds_q4_v41_qb_addr_bf16_r4" : "kernel_myds_q4_v41_qb_addr_bf16");
+    return g_dense_q4_v41_nb ?
+        (nr == 4u ? "kernel_myds_q4_v41_ob_nb_bf16_r4" : "kernel_myds_q4_v41_ob_nb_bf16") :
+        (nr == 4u ? "kernel_myds_q4_v41_ob_addr_bf16_r4" : "kernel_myds_q4_v41_ob_addr_bf16");
 }
 
 static void decode_candidate_counts(unsigned which, myds_metal_decode_candidate_counters_t *out, bool reset) {
@@ -90,8 +94,8 @@ static bool shared_q4_nb_geometry(unsigned shape) {
         (shape || g_device.maxThreadsPerThreadgroup.width>=128u);
 }
 static int decode_candidates_initialize(bool overlap, bool iq2, bool q4, bool nb, bool head_reference, bool shared_nb) {
-    if ((overlap || q4) && (dense_q4_nr0()!=2u || dense_q4_nsg()!=4u)) {
-        fprintf(stderr,"myds_metal: overlap/Q4 candidates require existing Dense Q4 NR2/NSG4\n");
+    if ((overlap || q4) && ((dense_q4_nr0()!=2u && dense_q4_nr0()!=4u) || dense_q4_nsg()!=4u)) {
+        fprintf(stderr,"myds_metal: overlap/Q4 candidates require existing Dense Q4 NR2/NR4 and NSG4\n");
         return 0;
     }
     if (iq2) {
@@ -99,13 +103,18 @@ static int decode_candidates_initialize(bool overlap, bool iq2, bool q4, bool nb
         if (!decode_candidate_geometry(g_pso_moe_iq2_v41,(unsigned)g_moe_nsg,2176u)) return 0;
     }
     if (q4) {
-        NSArray<NSString *> *names=@[head_reference ? @"kernel_mul_mv_q4_K_dense_f32" : @"kernel_myds_q4_v41_head_addr_f32",
-            nb ? @"kernel_myds_q4_v41_qb_nb_bf16" : @"kernel_myds_q4_v41_qb_addr_bf16",
-            nb ? @"kernel_myds_q4_v41_ob_nb_bf16" : @"kernel_myds_q4_v41_ob_addr_bf16"];
+        const uint32_t nr = dense_q4_nr0();
+        NSArray<NSString *> *names=@[
+            head_reference ? (nr == 4u ? @"kernel_mul_mv_q4_K_dense_f32_r4" : @"kernel_mul_mv_q4_K_dense_f32") :
+                (nr == 4u ? @"kernel_myds_q4_v41_head_addr_f32_r4" : @"kernel_myds_q4_v41_head_addr_f32"),
+            nb ? (nr == 4u ? @"kernel_myds_q4_v41_qb_nb_bf16_r4" : @"kernel_myds_q4_v41_qb_nb_bf16") :
+                 (nr == 4u ? @"kernel_myds_q4_v41_qb_addr_bf16_r4" : @"kernel_myds_q4_v41_qb_addr_bf16"),
+            nb ? (nr == 4u ? @"kernel_myds_q4_v41_ob_nb_bf16_r4" : @"kernel_myds_q4_v41_ob_nb_bf16") :
+                 (nr == 4u ? @"kernel_myds_q4_v41_ob_addr_bf16_r4" : @"kernel_myds_q4_v41_ob_addr_bf16")];
         for (unsigned i=0;i<3u;++i) {
             g_pso_dense_q4_v41[i]=decode_candidate_pipeline(names[i],4);
             if (!decode_candidate_geometry(g_pso_dense_q4_v41[i],4u,256u)) return 0;
-            fprintf(stderr,"myds_metal: Dense Q4 V41 provider %u = %s (NR2/NSG4)\n",i,names[i].UTF8String);
+            fprintf(stderr,"myds_metal: Dense Q4 V41 provider %u = %s (NR%u/NSG4)\n",i,names[i].UTF8String,nr);
         }
     }
     if (overlap && !decode_candidate_geometry(g_pso_mul_mv_q4_K_dense_bf16,4u,256u)) return 0;
@@ -182,7 +191,8 @@ int myds_metal_dense_q4_v41(myds_metal_buffer_t *out,
     const int provider = index==0 && g_dense_q4_v41_head_reference ? DC_Q4_HEAD_REFERENCE :
         index>0 && g_dense_q4_v41_nb ? DC_Q4_NB : -1;
     if (provider>=0) atomic_fetch_add_explicit(&g_decode_candidates[provider][0],1,memory_order_relaxed);
-    if (!g_initialized || !g_dense_q4_v41 || index<0 || dense_q4_nr0()!=2u || dense_q4_nsg()!=4u ||
+    const uint32_t nr = (dense_q4_nr0() == 4u && (rows % 4u == 0)) ? 4u : 2u;
+    if (!g_initialized || !g_dense_q4_v41 || index<0 || (dense_q4_nr0()!=2u && dense_q4_nr0()!=4u) || dense_q4_nsg()!=4u ||
         !decode_candidate_geometry(g_pso_dense_q4_v41[index],4u,256u))
         return dense_q4_provider_failure(provider,"scope/shape/PSO/geometry");
     const uint64_t row_bytes=(uint64_t)(width/256u)*144u, weights=row_bytes*rows;
@@ -197,7 +207,7 @@ int myds_metal_dense_q4_v41(myds_metal_buffer_t *out,
     a.nb00=144u; a.nb01=row_bytes; a.nb02=weights; a.nb03=weights;
     a.ne10=(int32_t)width; a.ne11=1; a.ne12=1; a.nb10=4u;
     a.nb11=in_bytes; a.nb12=in_bytes; a.nb13=in_bytes;
-    a.ne0=(int32_t)rows; a.ne1=1; a.nr0=2; a.r2=1; a.r3=1;
+    a.ne0=(int32_t)rows; a.ne1=1; a.nr0=(int)nr; a.r2=1; a.r3=1;
     id<MTLCommandBuffer> cb=g_batch_cb?:[g_queue commandBuffer];
     if (!cb) return dense_q4_provider_failure(provider,"command buffer unavailable");
     id<MTLComputeCommandEncoder> enc=get_compute_encoder(cb);
@@ -208,7 +218,7 @@ int myds_metal_dense_q4_v41(myds_metal_buffer_t *out,
     [enc setBuffer:input->mtl_buf offset:input->offset atIndex:2];
     [enc setBuffer:out->mtl_buf offset:out->offset atIndex:3];
     [enc setThreadgroupMemoryLength:256u atIndex:0];
-    metal_dispatch(enc,myds_metal_dense_q4_v41_selected_kernel((unsigned)index),MTLSizeMake(rows/8u,1u,1u),MTLSizeMake(32u,4u,1u));
+    metal_dispatch(enc,myds_metal_dense_q4_v41_selected_kernel((unsigned)index),MTLSizeMake(rows/(4u*nr),1u,1u),MTLSizeMake(32u,4u,1u));
     if (!v41_finish(cb,enc)) return dense_q4_provider_failure(provider,"command completion failed");
     atomic_fetch_add_explicit(&g_decode_candidates[DC_Q4][1],1,memory_order_relaxed);
     if (provider>=0) atomic_fetch_add_explicit(&g_decode_candidates[provider][1],1,memory_order_relaxed);
@@ -222,9 +232,10 @@ int myds_metal_dense_q4_v41_qb_slice(myds_metal_buffer_t *out,
     const int index = 1;
     const int provider = g_dense_q4_v41_nb ? DC_Q4_NB : -1;
     if (count_call && provider>=0) atomic_fetch_add_explicit(&g_decode_candidates[provider][0],1,memory_order_relaxed);
-    if (!g_initialized || !g_dense_q4_v41 || !slice_rows || (slice_rows % 8u) != 0u ||
-        (row_offset % 8u) != 0u || row_offset > 32768u || slice_rows > 32768u - row_offset ||
-        dense_q4_nr0()!=2u || dense_q4_nsg()!=4u ||
+    const uint32_t nr = (dense_q4_nr0() == 4u && (slice_rows % 16u == 0) && (row_offset % 16u == 0)) ? 4u : 2u;
+    if (!g_initialized || !g_dense_q4_v41 || !slice_rows || (slice_rows % (4u*nr)) != 0u ||
+        (row_offset % (4u*nr)) != 0u || row_offset > 32768u || slice_rows > 32768u - row_offset ||
+        (dense_q4_nr0()!=2u && dense_q4_nr0()!=4u) || dense_q4_nsg()!=4u ||
         !decode_candidate_geometry(g_pso_dense_q4_v41[index],4u,256u))
         return dense_q4_provider_failure(provider,"scope/shape/PSO/geometry");
     const uint32_t width = 1280u, total_rows = 32768u;
@@ -241,7 +252,7 @@ int myds_metal_dense_q4_v41_qb_slice(myds_metal_buffer_t *out,
     a.nb00=144u; a.nb01=row_bytes; a.nb02=slice_weights; a.nb03=slice_weights;
     a.ne10=(int32_t)width; a.ne11=1; a.ne12=1; a.nb10=4u;
     a.nb11=in_bytes; a.nb12=in_bytes; a.nb13=in_bytes;
-    a.ne0=(int32_t)slice_rows; a.ne1=1; a.nr0=2; a.r2=1; a.r3=1;
+    a.ne0=(int32_t)slice_rows; a.ne1=1; a.nr0=(int)nr; a.r2=1; a.r3=1;
     id<MTLCommandBuffer> cb=g_batch_cb?:[g_queue commandBuffer];
     if (!cb) return dense_q4_provider_failure(provider,"command buffer unavailable");
     id<MTLComputeCommandEncoder> enc=get_compute_encoder(cb);
@@ -252,7 +263,7 @@ int myds_metal_dense_q4_v41_qb_slice(myds_metal_buffer_t *out,
     [enc setBuffer:input->mtl_buf offset:input->offset atIndex:2];
     [enc setBuffer:out->mtl_buf offset:out->offset + (NSUInteger)(row_offset * 4u) atIndex:3];
     [enc setThreadgroupMemoryLength:256u atIndex:0];
-    metal_dispatch(enc,myds_metal_dense_q4_v41_selected_kernel((unsigned)index),MTLSizeMake(slice_rows/8u,1u,1u),MTLSizeMake(32u,4u,1u));
+    metal_dispatch(enc,myds_metal_dense_q4_v41_selected_kernel((unsigned)index),MTLSizeMake(slice_rows/(4u*nr),1u,1u),MTLSizeMake(32u,4u,1u));
     if (!v41_finish(cb,enc)) return dense_q4_provider_failure(provider,"command completion failed");
     if (count_call) {
         atomic_fetch_add_explicit(&g_decode_candidates[DC_Q4][1],1,memory_order_relaxed);

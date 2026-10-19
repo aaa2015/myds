@@ -26,7 +26,7 @@ static inline float myds_q4_v41_bf16(float x) {
     if ((u & 0x7f800000u)!=0x7f800000u) u += 0x7fffu + ((u >> 16u) & 1u);
     return as_type<float>(u & 0xffff0000u);
 }
-template<uint ROWS, uint WIDTH, bool FIXED_NB, bool BF16>
+template<uint ROWS, uint WIDTH, bool FIXED_NB, bool BF16, uint NR=2>
 static inline void myds_q4_v41_body(
         constant myds_q4_v41_args &args,
         device const char *src0, device const char *src1, device char *dst,
@@ -38,12 +38,12 @@ static inline void myds_q4_v41_body(
     const short iq=it/4;
     const short ir=it%4;
     const int nb=FIXED_NB ? int(WIDTH/256u) : args.ne00/256;
-    const uint first_row=(tgpig.x*uint(NSG)+uint(sgitg))*2u;
+    const uint first_row=(tgpig.x*uint(NSG)+uint(sgitg))*NR;
     constexpr uint ROW_BYTES=(WIDTH/256u)*144u;
     const uint offset0=first_row*ROW_BYTES;
     device const float *y=(device const float *)src1;
     float yl[16],yh[16];
-    float sumf[2]={0.f};
+    float sumf[NR]={0.f};
     device const float *y4=y+ix*256+64*iq+8*ir;
     uint16_t sc16[4];
     thread const uint8_t *sc8=(thread const uint8_t *)sc16;
@@ -60,7 +60,7 @@ static inline void myds_q4_v41_body(
         device const uint16_t *sc=(device const uint16_t *)block->scales+iq;
         device const uint16_t *q1=(device const uint16_t *)block->qs+16*iq+4*ir;
         device const half *dh=&block->d;
-        for(short row=0;row<2;row++) {
+        for(short row=0;row<(short)NR;row++) {
             sc16[0]=sc[0]&kmask1;
             sc16[1]=sc[2]&kmask1;
             sc16[2]=((sc[4]>>0)&kmask2)|((sc[0]&kmask3)>>2);
@@ -90,24 +90,31 @@ static inline void myds_q4_v41_body(
         y4+=4*256;
     }
     device float *dst_f32=(device float *)dst;
-    for(int row=0;row<2;++row) {
+    for(int row=0;row<(int)NR;++row) {
         float sum_all=simd_sum(sumf[row]);
         if(tiisg==0) dst_f32[first_row+row]=BF16 ? myds_q4_v41_bf16(sum_all) : sum_all;
     }
 }
-#define MYDS_Q4_V41_KERNEL(NAME, ROWS, WIDTH, FIXED, BF16) \
+#define MYDS_Q4_V41_KERNEL(NAME, ROWS, WIDTH, FIXED, BF16, NR) \
 kernel void NAME(constant myds_q4_v41_args &args [[buffer(0)]], \
  device const char *w [[buffer(1)]], device const char *x [[buffer(2)]], \
  device char *y [[buffer(3)]], threadgroup char *scratch [[threadgroup(0)]], \
  uint3 group [[threadgroup_position_in_grid]], \
  ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) { \
- myds_q4_v41_body<ROWS,WIDTH,FIXED,BF16>(args,w,x,y,group,lane,sg); (void)scratch; }
-MYDS_Q4_V41_KERNEL(kernel_myds_q4_v41_head_addr_f32,129280,5120,false,false)
-MYDS_Q4_V41_KERNEL(kernel_myds_q4_v41_head_nb_f32,129280,5120,true,false)
-MYDS_Q4_V41_KERNEL(kernel_myds_q4_v41_qb_addr_bf16,32768,1280,false,true)
-MYDS_Q4_V41_KERNEL(kernel_myds_q4_v41_qb_nb_bf16,32768,1280,true,true)
-MYDS_Q4_V41_KERNEL(kernel_myds_q4_v41_ob_addr_bf16,5120,8192,false,true)
-MYDS_Q4_V41_KERNEL(kernel_myds_q4_v41_ob_nb_bf16,5120,8192,true,true)
+ myds_q4_v41_body<ROWS,WIDTH,FIXED,BF16,NR>(args,w,x,y,group,lane,sg); (void)scratch; }
+MYDS_Q4_V41_KERNEL(kernel_myds_q4_v41_head_addr_f32,129280,5120,false,false,2)
+MYDS_Q4_V41_KERNEL(kernel_myds_q4_v41_head_nb_f32,129280,5120,true,false,2)
+MYDS_Q4_V41_KERNEL(kernel_myds_q4_v41_qb_addr_bf16,32768,1280,false,true,2)
+MYDS_Q4_V41_KERNEL(kernel_myds_q4_v41_qb_nb_bf16,32768,1280,true,true,2)
+MYDS_Q4_V41_KERNEL(kernel_myds_q4_v41_ob_addr_bf16,5120,8192,false,true,2)
+MYDS_Q4_V41_KERNEL(kernel_myds_q4_v41_ob_nb_bf16,5120,8192,true,true,2)
+
+MYDS_Q4_V41_KERNEL(kernel_myds_q4_v41_head_addr_f32_r4,129280,5120,false,false,4)
+MYDS_Q4_V41_KERNEL(kernel_myds_q4_v41_head_nb_f32_r4,129280,5120,true,false,4)
+MYDS_Q4_V41_KERNEL(kernel_myds_q4_v41_qb_addr_bf16_r4,32768,1280,false,true,4)
+MYDS_Q4_V41_KERNEL(kernel_myds_q4_v41_qb_nb_bf16_r4,32768,1280,true,true,4)
+MYDS_Q4_V41_KERNEL(kernel_myds_q4_v41_ob_addr_bf16_r4,5120,8192,false,true,4)
+MYDS_Q4_V41_KERNEL(kernel_myds_q4_v41_ob_nb_bf16_r4,5120,8192,true,true,4)
 #undef MYDS_Q4_V41_KERNEL
 
 
