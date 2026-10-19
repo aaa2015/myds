@@ -11,6 +11,7 @@
 
 用法: prefill_decode_bench.py <port> [ctx_sizes...]
 """
+import os
 import json
 import random
 import statistics as st
@@ -19,8 +20,8 @@ import time
 import urllib.request
 
 PORT = int(sys.argv[1])
-SIZES = [int(x) for x in sys.argv[2:]] or [512, 2048, 8192, 16384, 32768]
-ALIAS = "local-myds-deepseek-v4.1-flash-q2"
+SIZES = [int(x) for x in sys.argv[2:] if x.isdigit()] or [512, 2048, 4096]
+ALIAS = os.environ.get("MYDS_ALIAS", "local-myds-deepseek-v4.1-flash-1017-q2-q4")
 
 # 一段约 8 token 的填充文本，重复拼接以构造不同长度
 FILLER = ("The compressor reads rows from the table and folds them into the "
