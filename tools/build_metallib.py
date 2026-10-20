@@ -147,6 +147,13 @@ def main():
                 out.write(f'\n#line 1 "{fn}"\n' + sf.read())
         out.write(COPY_KERNELS + "\n")
 
+    env = os.environ.copy()
+    if "DEVELOPER_DIR" not in env:
+        for xcode_path in ["/Applications/Xcode.app/Contents/Developer", "/Applications/Xcode-beta.app/Contents/Developer"]:
+            if os.path.exists(xcode_path):
+                env["DEVELOPER_DIR"] = xcode_path
+                break
+
     print(f"[metallib] Compiling AIR with xcrun metal -> {air_file}...")
     compile_cmd = [
         "xcrun", "-sdk", "macosx", "metal",
@@ -157,7 +164,7 @@ def main():
         "-c", combined_metal,
         "-o", air_file
     ]
-    res = subprocess.run(compile_cmd)
+    res = subprocess.run(compile_cmd, env=env)
     if res.returncode != 0:
         print("[metallib] Compilation failed!", file=sys.stderr)
         sys.exit(res.returncode)
@@ -168,7 +175,7 @@ def main():
         air_file,
         "-o", metallib_file
     ]
-    res = subprocess.run(link_cmd)
+    res = subprocess.run(link_cmd, env=env)
     if res.returncode != 0:
         print("[metallib] Linking failed!", file=sys.stderr)
         sys.exit(res.returncode)
