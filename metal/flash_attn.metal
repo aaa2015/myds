@@ -2391,7 +2391,7 @@ static inline void myds_attention_register_rope_fuse_impl(
         ushort sgitg) {
     constexpr short NW = 32;
     constexpr short C = 32;
-    constexpr short NSG = 8;
+    constexpr short NSG = 14;
     constexpr short NWG = 32;
     constexpr short DK4 = 128;
     constexpr short DV4 = 128;

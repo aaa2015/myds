@@ -1968,7 +1968,7 @@ static int attention_rope_validate(myds_metal_buffer_t *heads,const myds_metal_b
         if (!attention_rope_range(readers[j],rn[j],align[j])) return 0;
         for (unsigned i=0;i<4u;i++) if(buffer_ranges_overlap(writers[i],(size_t)wn[i],readers[j],(size_t)rn[j])) return 0;
     }
-    const uint32_t threads[]={256u,1u,1u};
+    const uint32_t threads[]={448u,1u,1u};
     const uint32_t keys=n_raw+selected_rows;
     const myds_metal_constant_t c[]={{400,true,1},{401,true,1},{402,true,0},{403,true,0},{404,true,keys%32u!=0},
         {405,true,0},{420,false,512},{421,false,512},{422,false,1},{423,false,32}};
@@ -2061,7 +2061,7 @@ static int attention_staged_impl(myds_metal_buffer_t *heads,const myds_metal_buf
             struct attention_rope_fuse_args fused={.attention=a,.pos=rope->pos,.inverse=1u};
             memcpy(fused.frequencies,rope_frequencies[rope->compressed?1:0],sizeof(fused.frequencies));
             ok=specialized("kernel_myds_attention_register_rope_fuse_f16_512",
-                &fused,sizeof(fused),register_buffers,7,64,1,1,256,1,1,22400,c,10);
+                &fused,sizeof(fused),register_buffers,7,64,1,1,448,1,1,22400,c,10);
         } else ok=specialized("kernel_myds_flash_attn_vec_packed8_register_reduce_f16_dk512_dv512",
             &a,sizeof(a),register_buffers,7,64,1,1,256,1,1,22400,c,10);
         if(myds_metal_dispatch_count()>dispatch_before) {
@@ -2365,7 +2365,7 @@ static int attention_direct_impl(myds_metal_buffer_t *heads,const myds_metal_buf
             struct attention_rope_fuse_args fused={.attention=a,.pos=rope->pos,.inverse=1u};
             memcpy(fused.frequencies,rope_frequencies[rope->compressed?1:0],sizeof(fused.frequencies));
             ok=specialized("kernel_myds_attention_register_rope_fuse_f16_512",
-                &fused,sizeof(fused),register_buffers,7,64,1,1,256,1,1,22400,c,10);
+                &fused,sizeof(fused),register_buffers,7,64,1,1,448,1,1,22400,c,10);
         } else ok=specialized("kernel_myds_flash_attn_vec_packed8_register_reduce_f16_dk512_dv512",
             &a,sizeof(a),register_buffers,7,64,1,1,256,1,1,22400,c,10);
         if(myds_metal_dispatch_count()>dispatch_before) {
