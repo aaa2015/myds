@@ -33,6 +33,7 @@ TEST_MOE_DOWN_NSG = $(BIN_DIR)/test_moe_down_nsg
 TEST_MOE_IQ2_LUT = $(BIN_DIR)/test_moe_iq2_lut
 TEST_ATTN_PACKED = $(BIN_DIR)/test_attention_packed
 TEST_ATTN_ROPE_FUSE = $(BIN_DIR)/test_attention_rope_fuse
+TEST_ATTN_FLASH_DEC = $(BIN_DIR)/test_attention_flash_dec
 TEST_TOPK_NAN_FUSE = $(BIN_DIR)/test_topk_nan_fuse
 TEST_TOPK_NAN_SHUFFLE = $(BIN_DIR)/test_topk_nan_shuffle
 TEST_INDEXER_HEAD_SLOTS = $(BIN_DIR)/test_indexer_head_slots
@@ -216,6 +217,9 @@ $(TEST_ATTN_PACKED): tests/test_attention_packed.m src/myds_metal.m src/myds_dec
 # by tools/build_attention_rope_fuse_probe.py. Never execute GPU from make.
 $(TEST_ATTN_ROPE_FUSE): tests/test_attention_rope_fuse.m tests/test_attention_packed.m src/myds_metal.m src/myds_decode_candidates.inc src/myds_v41_gpu.c $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc -Itests tests/test_attention_rope_fuse.m $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
+
+$(TEST_ATTN_FLASH_DEC): tests/test_attention_flash_dec.m tests/test_attention_packed.m src/myds_metal.m src/myds_decode_candidates.inc src/myds_v41_gpu.c $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) -Isrc -Itests tests/test_attention_flash_dec.m $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
 
 $(TEST_TOPK_NAN_FUSE): tests/test_topk_nan_fuse.m src/myds_metal.m src/myds_decode_candidates.inc src/myds_v41_gpu.c $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc tests/test_topk_nan_fuse.m $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
