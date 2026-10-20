@@ -1296,10 +1296,16 @@ int main(int argc, char **argv) {
     test_json_bytes();
     test_stream_and_non_stream_bytes();
     test_sse_writer_transport();
-    assert(myds_server_default_max_tokens(256) == 256);
-    assert(myds_server_default_max_tokens(4096) == 4096);
-    assert(myds_server_default_max_tokens(262144) == 4096);
-    printf("  [PASS] Omitted API token limits cap at 4096 while smaller server defaults are preserved\n");
+    /* 2026-10-21: 默认值改为与 deepseek-recipe 官方口径一致的三档
+     * （非思考 8192 / 思考 65536 / 思考+max effort 131072），仍受服务端上限约束。 */
+    assert(myds_server_default_max_tokens(256, false, "") == 256);
+    assert(myds_server_default_max_tokens(4096, false, "") == 4096);
+    assert(myds_server_default_max_tokens(262144, false, "") == 8192);
+    assert(myds_server_default_max_tokens(262144, true, "") == 65536);
+    assert(myds_server_default_max_tokens(262144, true, "max") == 131072);
+    assert(myds_server_default_max_tokens(40000, true, "max") == 40000);
+    assert(myds_server_default_max_tokens(0, false, "") >= 1);
+    printf("  [PASS] Omitted API token limits follow official per-mode tiers and server caps\n");
 
     /* 1. Test Endpoint Route Recognition */
     {
