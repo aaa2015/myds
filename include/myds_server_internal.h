@@ -55,7 +55,8 @@ typedef struct {
 } myds_non_stream_ctx_t;
 
 bool myds_server_send_all(int fd, const char *data, size_t length);
-uint32_t myds_server_default_max_tokens(uint32_t configured_max_tokens);
+uint32_t myds_server_default_max_tokens(uint32_t configured_max_tokens, bool thinking,
+                                        const char *reasoning_effort);
 void myds_server_sse_callback(const char *piece, size_t length, int32_t token_id, void *user_data);
 bool myds_server_sse_finish(myds_sse_stream_ctx_t *stream);
 /* Start a bounded FIFO transport. Enqueue never waits for the socket or space;

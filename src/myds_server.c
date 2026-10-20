@@ -403,11 +403,24 @@ bool myds_server_send_all(int fd, const char *data, size_t length) {
     return true;
 }
 
-uint32_t myds_server_default_max_tokens(uint32_t configured_max_tokens) {
-    /* Bound omitted API limits even when the CLI server configuration permits
-     * very long requests. Explicit request limits and CLI generation retain
-     * their existing behavior; the engine enforces the context capacity. */
-    return configured_max_tokens > 4096 ? 4096 : configured_max_tokens;
+/* API 省略 max_tokens 时的默认值。
+ * 2026-10-21: 对齐 deepseek-recipe 的官方口径（deepseek-recipe/src/request/mod.rs）：
+ *   - 非思考模式                    8192
+ *   - 思考模式                       65536
+ *   - 思考模式且 reasoning_effort=max 131072
+ * 之前一律 4096，实测会让"不传 max_tokens"的请求在 4096 token 处硬截断
+ * （completion_tokens=4096, finish_reason=length），而客户端根本无从得知。
+ * 仍然受 CLI 配置上限约束（configured_max_tokens），并保证至少 1。 */
+uint32_t myds_server_default_max_tokens(uint32_t configured_max_tokens, bool thinking,
+                                        const char *reasoning_effort) {
+    uint32_t want = 8192u;                                  /* DEFAULT_NON_THINKING_MAX_TOKENS */
+    if (thinking) {
+        want = 65536u;                                      /* DEFAULT_THINKING_MAX_TOKENS */
+        if (reasoning_effort && strcmp(reasoning_effort, "max") == 0)
+            want = 131072u;                                 /* DEFAULT_MAX_EFFORT_MAX_TOKENS */
+    }
+    if (configured_max_tokens && want > configured_max_tokens) want = configured_max_tokens;
+    return want ? want : 1u;
 }
 
 /* Helper to unescape JSON string slice into normal text */
@@ -3221,7 +3234,12 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
 
         /* Apply request configuration overrides if provided */
         myds_config_t req_cfg = prev_cfg;
-        req_cfg.max_new_tokens = myds_server_default_max_tokens(prev_cfg.max_new_tokens);
+        {
+            char eff[32] = "";
+            (void)json_extract_string_field(body, "reasoning_effort", eff, sizeof(eff));
+            req_cfg.max_new_tokens = myds_server_default_max_tokens(prev_cfg.max_new_tokens,
+                extract_request_thinking_mode(body, g_server_default_thinking), eff);
+        }
         if (max_tokens > 0) req_cfg.max_new_tokens = (uint32_t)max_tokens;
         if (temp >= 0.0f) req_cfg.temperature = temp;
         if (top_p >= 0.0f) req_cfg.top_p = top_p;
