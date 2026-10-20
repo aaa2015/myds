@@ -6467,7 +6467,7 @@ fail:
 
 uint32_t myds_v41_resolve_macroblock_size(void) {
     const char *mb_env = getenv("MYDS_PREFILL_MACROBLOCK_SIZE");
-    long val = 4096L;
+    long val = 8192L;
     if (mb_env && *mb_env) {
         char *endptr = NULL;
         errno = 0;
@@ -6475,7 +6475,7 @@ uint32_t myds_v41_resolve_macroblock_size(void) {
         if (errno == 0 && endptr != mb_env && parsed > 0) {
             val = parsed;
         } else {
-            val = 4096L;
+            val = 8192L;
         }
     }
     if (val < 512L) val = 512L;
@@ -6533,7 +6533,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     }
 
     const char *chunk_env = getenv("MYDS_PREFILL_CHUNK_SIZE");
-    uint32_t chunk_size = chunk_env ? (uint32_t)atoi(chunk_env) : 256u;
+    uint32_t chunk_size = chunk_env ? (uint32_t)atoi(chunk_env) : V41_MAX_CHUNK;
     if (chunk_size < 2u) chunk_size = 2u;
     if (chunk_size % 2u != 0) chunk_size = (chunk_size / 2u) * 2u;
     if (chunk_size > V41_MAX_CHUNK) {

@@ -1245,7 +1245,7 @@ static void test_p1_snapshot_overwrite_failure(void) {
 static void test_p1_macroblock_prefill_invariants(void) {
     /* 1. Test macroblock size environment resolution & clamping */
     unsetenv("MYDS_PREFILL_MACROBLOCK_SIZE");
-    assert(myds_v41_resolve_macroblock_size() == 4096u);
+    assert(myds_v41_resolve_macroblock_size() == 8192u);
 
     setenv("MYDS_PREFILL_MACROBLOCK_SIZE", "200", 1);
     assert(myds_v41_resolve_macroblock_size() == 512u); /* clamp min */
@@ -1261,19 +1261,19 @@ static void test_p1_macroblock_prefill_invariants(void) {
 
     /* Negative, zero, and malformed inputs must safely fall back to default without integer underflow */
     setenv("MYDS_PREFILL_MACROBLOCK_SIZE", "-1", 1);
-    assert(myds_v41_resolve_macroblock_size() == 4096u);
+    assert(myds_v41_resolve_macroblock_size() == 8192u);
 
     setenv("MYDS_PREFILL_MACROBLOCK_SIZE", "-100", 1);
-    assert(myds_v41_resolve_macroblock_size() == 4096u);
+    assert(myds_v41_resolve_macroblock_size() == 8192u);
 
     setenv("MYDS_PREFILL_MACROBLOCK_SIZE", "0", 1);
-    assert(myds_v41_resolve_macroblock_size() == 4096u);
+    assert(myds_v41_resolve_macroblock_size() == 8192u);
 
     setenv("MYDS_PREFILL_MACROBLOCK_SIZE", "invalid", 1);
-    assert(myds_v41_resolve_macroblock_size() == 4096u);
+    assert(myds_v41_resolve_macroblock_size() == 8192u);
 
     unsetenv("MYDS_PREFILL_MACROBLOCK_SIZE");
-    assert(myds_v41_resolve_macroblock_size() == 4096u);
+    assert(myds_v41_resolve_macroblock_size() == 8192u);
 
     /* 2. Test carry staging across macroblock boundaries */
     if (!myds_metal_init(NULL)) {

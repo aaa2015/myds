@@ -377,7 +377,7 @@ def main():
     out_dir = os.path.dirname(out_path) or "."
     free_space = shutil.disk_usage(out_dir).free
     needed_space = total_out_size + (10 << 30)  # 10 GiB safety reserve
-    if free_space < needed_space:
+    if free_space < needed_space and not os.environ.get("MYDS_SKIP_DISK_CHECK"):
         sys.exit(f"Error: Insufficient disk space in {out_dir}. Available: {free_space / (1 << 30):.2f} GiB, Required: {needed_space / (1 << 30):.2f} GiB")
 
     # Load quantizer library

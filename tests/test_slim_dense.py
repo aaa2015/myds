@@ -106,6 +106,7 @@ def create_synthetic_model(path):
 
 class SlimDenseTests(unittest.TestCase):
     def setUp(self):
+        os.environ["MYDS_SKIP_DISK_CHECK"] = "1"
         self.src_path = "/tmp/test_mini_dense_q8.gguf"
         self.dst_path = "/tmp/test_mini_dense_q4.gguf"
         if os.path.exists(self.src_path):

@@ -64,7 +64,7 @@ int main(int argc, char **argv) {
                 int sockets[2];
                 assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
                 force_failure = fail;
-                expected_limit = fail ? 7000 : 4096;
+                expected_limit = fail ? 7000 : 8192;
                 char body[256], request[512];
                 snprintf(body, sizeof(body), "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"stream\":%s%s}", stream ? "true" : "false", fail ? ",\"max_tokens\":7000" : "");
                 int n = snprintf(request, sizeof(request), "POST /v1/%s HTTP/1.1\r\nContent-Length: %zu\r\n\r\n%s", response ? "responses" : "chat/completions", strlen(body), body);
