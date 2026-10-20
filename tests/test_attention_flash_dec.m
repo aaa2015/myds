@@ -56,6 +56,11 @@ static void test_flash_dec_parity(uint32_t keys, uint32_t start, uint32_t mode, 
     REQUIRE(s);
     prepare_mask(s, &f);
 
+    // Stage KV data into s->kv_f16 and pad
+    REQUIRE(myds_metal_begin_batch());
+    REQUIRE(call(&f, s, 0, 1));
+    REQUIRE(myds_metal_commit_batch());
+
     // Run baseline into out[0]
     REQUIRE(myds_metal_begin_batch());
     REQUIRE(encode_baseline(&f, s, 0, pos));
@@ -82,6 +87,11 @@ static void bench_flash_dec(uint32_t keys, uint32_t pos, unsigned reps) {
     myds_v41_gpu_scratch_t *s = myds_v41_gpu_scratch_create(2048);
     REQUIRE(s);
     prepare_mask(s, &f);
+
+    // Stage KV data into s->kv_f16 and pad
+    REQUIRE(myds_metal_begin_batch());
+    REQUIRE(call(&f, s, 0, 1));
+    REQUIRE(myds_metal_commit_batch());
 
     // Warmup
     REQUIRE(myds_metal_begin_batch());
