@@ -153,7 +153,7 @@ int main(int argc, char **argv) {
     printf("======================================================================\n\n");
 
     printf("--- Phase 1: 0-ULP Bit-Exact Functional Equivalence Tests ---\n");
-    const uint32_t test_keys[] = {1, 31, 32, 64, 127, 128, 256, 512, 640, 800, 1024};
+    const uint32_t test_keys[] = {1, 16, 31, 32, 64, 96, 127, 128, 192, 256, 384, 512, 576, 640};
     const uint32_t test_positions[] = {0, 1, 127, 847, 1536};
     const uint32_t test_modes[] = {0, 1, 3, 4}; // Normal, pattern mask, causal prefix, sinks only
 
