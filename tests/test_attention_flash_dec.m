@@ -81,6 +81,26 @@ static void test_flash_dec_parity(uint32_t keys, uint32_t start, uint32_t mode, 
     fixture_free(&f);
 }
 
+static int encode_pass1(struct fixture *f, myds_v41_gpu_scratch_t *s) {
+    struct flash_vec_args a = vector_args(f->keys);
+    myds_metal_constant_t c[10];
+    constants(f->keys, c);
+    const myds_metal_buffer_t *b_split[] = {f->q, s->kv_f16, s->kv_f16, s->mask, f->sinks, s->pad, s->partial};
+    return specialized("kernel_myds_attention_flash_dec_split_f16_512",
+                       &a, sizeof(a), b_split, 7, 64, 4, 1, 256, 1, 1, 2048, c, 10);
+}
+
+static int encode_pass2(struct fixture *f, myds_v41_gpu_scratch_t *s, unsigned out_idx, uint32_t pos) {
+    struct flash_vec_args a = vector_args(f->keys);
+    myds_metal_constant_t c[10];
+    constants(f->keys, c);
+    struct attention_rope_fuse_args fused = {.attention = a, .pos = pos, .inverse = 1u};
+    memcpy(fused.frequencies, rope_frequencies[0], sizeof(fused.frequencies));
+    const myds_metal_buffer_t *b_reduce[] = {s->partial, f->out[out_idx].view};
+    return specialized("kernel_myds_attention_flash_dec_reduce_rope_f16_512",
+                       &fused, sizeof(fused), b_reduce, 2, 64, 1, 1, 128, 1, 1, 0, c, 10);
+}
+
 static void bench_flash_dec(uint32_t keys, uint32_t pos, unsigned reps) {
     struct fixture f;
     fixture_init(&f, keys, 0, 0);
@@ -114,7 +134,29 @@ static void bench_flash_dec(uint32_t keys, uint32_t pos, unsigned reps) {
     REQUIRE(cb_base.status == MTLCommandBufferStatusCompleted);
     double us_base = (cb_base.GPUEndTime - cb_base.GPUStartTime) * 1e6 / reps;
 
-    // Benchmark D1 Flash-Dec
+    // Benchmark Pass 1 alone
+    REQUIRE(myds_metal_begin_batch());
+    id<MTLCommandBuffer> cb_p1 = g_batch_cb;
+    for (unsigned r = 0; r < reps; r++) {
+        REQUIRE(encode_pass1(&f, s));
+        myds_metal_barrier();
+    }
+    REQUIRE(myds_metal_commit_batch());
+    REQUIRE(cb_p1.status == MTLCommandBufferStatusCompleted);
+    double us_p1 = (cb_p1.GPUEndTime - cb_p1.GPUStartTime) * 1e6 / reps;
+
+    // Benchmark Pass 2 alone
+    REQUIRE(myds_metal_begin_batch());
+    id<MTLCommandBuffer> cb_p2 = g_batch_cb;
+    for (unsigned r = 0; r < reps; r++) {
+        REQUIRE(encode_pass2(&f, s, 1, pos));
+        myds_metal_barrier();
+    }
+    REQUIRE(myds_metal_commit_batch());
+    REQUIRE(cb_p2.status == MTLCommandBufferStatusCompleted);
+    double us_p2 = (cb_p2.GPUEndTime - cb_p2.GPUStartTime) * 1e6 / reps;
+
+    // Benchmark D1 Flash-Dec Total (Pass 1 + Intra-batch barrier + Pass 2)
     REQUIRE(myds_metal_begin_batch());
     id<MTLCommandBuffer> cb_d1 = g_batch_cb;
     for (unsigned r = 0; r < reps; r++) {
@@ -130,8 +172,8 @@ static void bench_flash_dec(uint32_t keys, uint32_t pos, unsigned reps) {
     double delta = us_base - us_d1;
     double speedup_pct = (delta / us_base) * 100.0;
 
-    printf("  [BENCH] keys=%-4u | Baseline (1-TG 14-NSG): %5.2f µs | D1 Flash-Dec (4-TG): %5.2f µs | Δ: %+5.2f µs (%+5.1f%%) [0-ULP PASS]\n",
-           keys, us_base, us_d1, delta, speedup_pct);
+    printf("  [BENCH] keys=%-4u | Base: %5.2f µs | Pass1: %5.2f µs | Pass2: %5.2f µs | D1 Total: %5.2f µs | Δ: %+5.2f µs (%+5.1f%%)\n",
+           keys, us_base, us_p1, us_p2, us_d1, delta, speedup_pct);
 
     myds_v41_gpu_scratch_free(s);
     fixture_free(&f);
