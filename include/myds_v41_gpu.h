@@ -317,6 +317,8 @@ void myds_v41_gpu_attention_packed_register_counters(
 #define MYDS_V41_GPU_HAS_ATTN_ROPE_FUSE 1
 int myds_v41_attention_rope_fuse_enabled(void);
 void myds_v41_attention_rope_fuse_counters(myds_metal_decode_candidate_counters_t *out,bool reset);
+#define MYDS_V41_GPU_HAS_ATTN_FLASH_DEC 1
+int myds_v41_gpu_attention_flash_dec_enabled(void);
 #define MYDS_V41_GPU_HAS_ATTN_KV_REUSE 1
 int myds_v41_attn_kv_reuse_parse_mode(void);
 int myds_v41_attn_kv_reuse_enabled(void);

@@ -4,6 +4,7 @@
 
 #include "myds_metal.h"
 #include "myds_log.h"
+#include "myds_v41_gpu.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2389,6 +2390,9 @@ int myds_metal_init(const char *shader_dir) {
             g_moe_down_overlap,g_moe_iq2_v41,g_dense_q4_v41);
         MYDS_LOG_I("Routed MoE Q2 V4.1: %d (ordinary scalar F32 MID only; 5120/2304/384/6, NR2, down NSG2/4; MM, trace and unscoped paths retain reference)",
                    g_moe_q2_v41);
+        const int flash_dec = myds_v41_gpu_attention_flash_dec_enabled();
+        MYDS_LOG_I("Attention flash-decoding: %d (%s)",
+                   flash_dec, flash_dec == 1 ? "4-TG split + reduce (D1 candidate)" : "reference (single-TG in-register 14-NSG)");
         return 1;
     }
 }

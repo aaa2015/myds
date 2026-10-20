@@ -1732,6 +1732,13 @@ void myds_v41_attention_rope_fuse_counters(myds_metal_decode_candidate_counters_
         atomic_load_explicit(&attention_rope_counters[i],memory_order_relaxed);
     if (out) *out=(myds_metal_decode_candidate_counters_t){v[0],v[1],v[2]};
 }
+int myds_v41_gpu_attention_flash_dec_enabled(void) {
+    const char *v = getenv("MYDS_ATTN_FLASH_DEC");
+    if (!v || !strcmp(v, "0")) return 0;
+    if (!strcmp(v, "1")) return 1;
+    MYDS_LOG_E("MYDS_ATTN_FLASH_DEC must be exactly 0 or 1");
+    return -1;
+}
 static int attention_rope_failure(void) {
     attention_rope_count(RF_FAILURES);
     return 0;
@@ -1968,10 +1975,18 @@ static int attention_rope_validate(myds_metal_buffer_t *heads,const myds_metal_b
         if (!attention_rope_range(readers[j],rn[j],align[j])) return 0;
         for (unsigned i=0;i<4u;i++) if(buffer_ranges_overlap(writers[i],(size_t)wn[i],readers[j],(size_t)rn[j])) return 0;
     }
-    const uint32_t threads[]={448u,1u,1u};
+    const int flash_dec = myds_v41_gpu_attention_flash_dec_enabled();
+    if (flash_dec < 0) return 0;
     const uint32_t keys=n_raw+selected_rows;
     const myds_metal_constant_t c[]={{400,true,1},{401,true,1},{402,true,0},{403,true,0},{404,true,keys%32u!=0},
         {405,true,0},{420,false,512},{421,false,512},{422,false,1},{423,false,32}};
+    if (flash_dec == 1) {
+        const uint32_t threads_split[] = {256u, 1u, 1u};
+        const uint32_t threads_reduce[] = {128u, 1u, 1u};
+        return myds_metal_kernel_constants_preflight("kernel_myds_attention_flash_dec_split_f16_512", threads_split, 2048u, c, 10u) &&
+               myds_metal_kernel_constants_preflight("kernel_myds_attention_flash_dec_reduce_rope_f16_512", threads_reduce, 0u, c, 10u);
+    }
+    const uint32_t threads[]={448u,1u,1u};
     return myds_metal_kernel_constants_preflight("kernel_myds_attention_register_rope_fuse_f16_512",threads,22400u,c,10u);
 }
 
@@ -2009,6 +2024,44 @@ static inline int get_attn_packed_reduce_mode(void) {
     const char *v = getenv("MYDS_ATTN_PACKED_REDUCE");
     if (!v) return 1;
     return (strcmp(v, "0") == 0) ? 0 : 1;
+}
+
+static int dispatch_register_attention(
+    myds_metal_buffer_t *heads, const myds_metal_buffer_t *sinks,
+    const myds_metal_buffer_t *q, myds_v41_gpu_scratch_t *s,
+    const struct flash_vec_args *a, const myds_metal_constant_t c[10],
+    const struct attention_rope_scope *rope) {
+    const int flash_dec = myds_v41_gpu_attention_flash_dec_enabled();
+    if (flash_dec < 0) return 0;
+    if (flash_dec == 1) {
+        const myds_metal_buffer_t *b_split[] = {q, s->kv_f16, s->kv_f16, s->mask, sinks, s->pad, s->partial};
+        if (!specialized("kernel_myds_attention_flash_dec_split_f16_512",
+                         a, sizeof(*a), b_split, 7, 64, 4, 1, 256, 1, 1, 2048, c, 10)) {
+            return 0;
+        }
+        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(s->partial);
+        if (rope) {
+            struct attention_rope_fuse_args fused = {.attention = *a, .pos = rope->pos, .inverse = 1u};
+            memcpy(fused.frequencies, rope_frequencies[rope->compressed ? 1 : 0], sizeof(fused.frequencies));
+            const myds_metal_buffer_t *b_reduce[] = {s->partial, heads};
+            return specialized("kernel_myds_attention_flash_dec_reduce_rope_f16_512",
+                               &fused, sizeof(fused), b_reduce, 2, 64, 1, 1, 128, 1, 1, 0, c, 10);
+        } else {
+            const myds_metal_buffer_t *b_reduce[] = {s->partial, heads};
+            return specialized("kernel_myds_attention_flash_dec_reduce_f16_512",
+                               a, sizeof(*a), b_reduce, 2, 64, 1, 1, 128, 1, 1, 0, c, 10);
+        }
+    }
+
+    const myds_metal_buffer_t *register_buffers[] = {q, s->kv_f16, s->kv_f16, s->mask, sinks, s->pad, heads};
+    if (rope) {
+        struct attention_rope_fuse_args fused = {.attention = *a, .pos = rope->pos, .inverse = 1u};
+        memcpy(fused.frequencies, rope_frequencies[rope->compressed ? 1 : 0], sizeof(fused.frequencies));
+        return specialized("kernel_myds_attention_register_rope_fuse_f16_512",
+                           &fused, sizeof(fused), register_buffers, 7, 64, 1, 1, 448, 1, 1, 22400, c, 10);
+    }
+    return specialized("kernel_myds_flash_attn_vec_packed8_register_reduce_f16_dk512_dv512",
+                       a, sizeof(*a), register_buffers, 7, 64, 1, 1, 256, 1, 1, 22400, c, 10);
 }
 
 static int attention_staged_impl(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
@@ -2054,16 +2107,8 @@ static int attention_staged_impl(myds_metal_buffer_t *heads,const myds_metal_buf
     const myds_metal_constant_t c[]={{400,true,1},{401,true,1},{402,true,0},{403,true,0},{404,true,keys%32!=0},
         {405,true,0},{420,false,512},{421,false,512},{422,false,1},{423,false,32}};
     if (register_mode) {
-        const myds_metal_buffer_t *register_buffers[]={q,s->kv_f16,s->kv_f16,s->mask,sinks,s->pad,heads};
         const uint64_t dispatch_before=myds_metal_dispatch_count();
-        int ok;
-        if (rope) {
-            struct attention_rope_fuse_args fused={.attention=a,.pos=rope->pos,.inverse=1u};
-            memcpy(fused.frequencies,rope_frequencies[rope->compressed?1:0],sizeof(fused.frequencies));
-            ok=specialized("kernel_myds_attention_register_rope_fuse_f16_512",
-                &fused,sizeof(fused),register_buffers,7,64,1,1,448,1,1,22400,c,10);
-        } else ok=specialized("kernel_myds_flash_attn_vec_packed8_register_reduce_f16_dk512_dv512",
-            &a,sizeof(a),register_buffers,7,64,1,1,256,1,1,22400,c,10);
+        const int ok = dispatch_register_attention(heads, sinks, q, s, &a, c, rope);
         if(myds_metal_dispatch_count()>dispatch_before) {
             if (rope) attention_rope_count(RF_ENCODED);
             attention_register_count(AR_ENCODED);
@@ -2358,16 +2403,8 @@ static int attention_direct_impl(myds_metal_buffer_t *heads,const myds_metal_buf
     const myds_metal_constant_t c[]={{400,true,1},{401,true,1},{402,true,0},{403,true,0},{404,true,keys%32!=0},
         {405,true,0},{420,false,512},{421,false,512},{422,false,1},{423,false,32}};
     if (register_mode) {
-        const myds_metal_buffer_t *register_buffers[]={q,s->kv_f16,s->kv_f16,s->mask,sinks,s->pad,heads};
         const uint64_t dispatch_before=myds_metal_dispatch_count();
-        int ok;
-        if (rope) {
-            struct attention_rope_fuse_args fused={.attention=a,.pos=rope->pos,.inverse=1u};
-            memcpy(fused.frequencies,rope_frequencies[rope->compressed?1:0],sizeof(fused.frequencies));
-            ok=specialized("kernel_myds_attention_register_rope_fuse_f16_512",
-                &fused,sizeof(fused),register_buffers,7,64,1,1,448,1,1,22400,c,10);
-        } else ok=specialized("kernel_myds_flash_attn_vec_packed8_register_reduce_f16_dk512_dv512",
-            &a,sizeof(a),register_buffers,7,64,1,1,256,1,1,22400,c,10);
+        const int ok = dispatch_register_attention(heads, sinks, q, s, &a, c, rope);
         if(myds_metal_dispatch_count()>dispatch_before) {
             if (rope) attention_rope_count(RF_ENCODED);
             if (want_kv_reuse) atomic_fetch_add_explicit(&attn_kv_reuse_encoded, 1u, memory_order_relaxed);
