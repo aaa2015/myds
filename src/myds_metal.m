@@ -3590,7 +3590,10 @@ int myds_metal_v41_hc_sum_rmsnorm(
         [enc setBuffer:s_buf->mtl_buf offset:s_buf->offset atIndex:4];
         [enc setBuffer:norm_out->mtl_buf offset:norm_out->offset atIndex:5];
         [enc setThreadgroupMemoryLength:32 * sizeof(float) atIndex:0];
-        NSUInteger nth = 256;
+        /* 2026-10-20: 256 线程在 dim=5120 时要跑 5 次跨步迭代，而单个 threadgroup
+         * 只占一个 GPU 核。提到 1024（=32 个 simdgroup，正好等于 shmem 的 32 槽上限）
+         * 后每线程只剩 1.25 次迭代。归约路径不变：simd_sum -> shmem -> simd_sum。 */
+        NSUInteger nth = 1024;
         metal_dispatch(enc, "v41_hc_sum_rmsnorm", MTLSizeMake(1, 1, 1), MTLSizeMake(nth, 1, 1));
         return v41_finish(cb, enc);
     }
