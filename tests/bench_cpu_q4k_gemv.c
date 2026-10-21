@@ -130,7 +130,8 @@ static float ref_row(const block_q4_K *row, uint32_t nb, const float *x) {
 
 int main(int argc, char **argv) {
     int nt = argc > 1 ? atoi(argv[1]) : 16;
-    uint32_t rows = 2304, cols = 5120;   /* MoE gate 单专家形状 */
+    uint32_t rows = argc > 3 ? (uint32_t)atoi(argv[3]) : 2304;
+    uint32_t cols = argc > 4 ? (uint32_t)atoi(argv[4]) : 5120;
     int rep = argc > 2 ? atoi(argv[2]) : 20;
 
     size_t nb = (size_t)rows * (cols / QK_K);

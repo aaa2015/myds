@@ -53,7 +53,12 @@ static _Atomic uint64_t hc_overlap_requests, hc_overlap_encoded, hc_overlap_fail
 static _Atomic int hc_overlap_mode;
 int myds_v41_moe_hc_overlap_parse_mode(void) {
     const char *v = getenv("MYDS_MOE_HC_OVERLAP");
-    const int mode=(!v || !strcmp(v,"0")) ? 0 : !strcmp(v,"1") ? 1 : -1;
+    int mode=(!v || !strcmp(v,"0")) ? 0 : !strcmp(v,"1") ? 1 : -1;
+    /* kprof 下强制串行：它的采样依赖 encoder 边界，而这条路径要求并发 encoder。 */
+    if (mode == 1 && myds_metal_kprof_exclusive()) {
+        MYDS_LOG_I("MYDS_MOE_HC_OVERLAP=1 disabled: kprof sampling requires serial encoders");
+        mode = 0;
+    }
     if (mode<0) MYDS_LOG_E("MYDS_MOE_HC_OVERLAP must be exactly 0 or 1");
     atomic_store_explicit(&hc_overlap_mode,mode,memory_order_relaxed);
     return mode;
@@ -636,6 +641,8 @@ int myds_v41_moe_eval(myds_context_t *ctx, uint32_t layer, uint32_t pos,
 }
 
 static inline bool is_moe_concurrent_enabled(void) {
+    /* kprof 与并发 overlap 互斥（见 hc_stages_scope 的 !g_kp_on）。 */
+    if (myds_metal_kprof_exclusive()) return false;
     static int cached = -1;
     if (__builtin_expect(cached < 0, 0)) {
         const char *v = getenv("MYDS_MOE_CONCURRENT");
@@ -1081,12 +1088,20 @@ int myds_v41_moe_pipeline_scoped(myds_context_t *ctx, uint32_t layer, uint32_t t
         !ffn_split || !after_attn || !ffn_fn || !ffn_scale || !ffn_base || !flat_norm || !mix) {
         /* 回退串行调度：先做 hc_mix，再调 myds_v41_moe_fused */
         if (!myds_metal_v41_hc_mix(ffn_split, after_attn, ffn_fn, GGML_TYPE_F16,
-                                   ffn_scale, ffn_base, flat_norm, mix, dim, m->norm_eps, hc_eps)) return 0;
+                                   ffn_scale, ffn_base, flat_norm, mix, dim, m->norm_eps, hc_eps)) {
+            MYDS_LOG_E("moe pipeline serial: hc_mix failed (layer=%u pos=%u)", layer, pos);
+            return 0;
+        }
         if (trace_on) {
             if (!myds_trace_f32("hc_ffn_mix", layer, pos, mix, 24) ||
                 !myds_trace_f32("hc_ffn_split", layer, pos, ffn_split, 24)) return 0;
         }
-        return moe_fused_scoped(ctx, layer, token, pos, residual, after_attn, ffn_split, ordinary_decode_allowed && !trace_on);
+        if (!moe_fused_scoped(ctx, layer, token, pos, residual, after_attn, ffn_split,
+                              ordinary_decode_allowed && !trace_on)) {
+            MYDS_LOG_E("moe pipeline serial: moe_fused_scoped failed (layer=%u pos=%u)", layer, pos);
+            return 0;
+        }
+        return 1;
     }
 
     if (m->n_routed_experts != 384 || k != 6 || m->n_shared_experts != 1 ||
@@ -1515,6 +1530,52 @@ int myds_v41_moe_ffn_hc_overlap_scoped(myds_context_t *ctx, uint32_t layer, uint
         ctx->selected_ids, ctx->selected_weights, ctx->moe_gate, ctx->moe_up, ctx->shared_swiglu_out
     };
     myds_metal_barrier_buffers(cohort2, 5);
+
+    /* 2026-10-21 探针（MYDS_MOE_ROUTE_PROBE=1）：在单层统计【相邻 token 的专家重合率】。
+     * 目的：判断「用上一个 token 的路由预取下一个 token 的专家权重」是否有意义。
+     * 只在 layer==20 采样，因此每 token 一次 GPU→CPU 同步（约 0.1 ms，对 23 ms 影响 0.4%）。
+     * 仅用于测量，不看性能。 */
+    {
+        static int route_probe = -1;
+        static int32_t prev_ids[6];
+        static int have_prev = 0;
+        static uint64_t n_cmp = 0, n_hit = 0, n_union = 0;
+        if (route_probe < 0) {
+            const char *rp = getenv("MYDS_MOE_ROUTE_PROBE");
+            route_probe = (rp && *rp && strcmp(rp, "0") != 0) ? 1 : 0;
+        }
+        if (route_probe && layer == 20) {
+            const int32_t *ids = (const int32_t *)myds_metal_buffer_data(ctx->selected_ids);
+            if (ids) {
+                if (have_prev) {
+                    int hit = 0, uni = 0;
+                    for (int a = 0; a < 6; a++)
+                        for (int b = 0; b < 6; b++)
+                            if (prev_ids[a] == ids[b]) { hit++; break; }
+                    /* 并集大小 */
+                    int seen[12], ns = 0;
+                    for (int a = 0; a < 6; a++) {
+                        int dup = 0;
+                        for (int k2 = 0; k2 < ns; k2++) if (seen[k2] == prev_ids[a]) { dup = 1; break; }
+                        if (!dup) seen[ns++] = prev_ids[a];
+                    }
+                    for (int b = 0; b < 6; b++) {
+                        int dup = 0;
+                        for (int k2 = 0; k2 < ns; k2++) if (seen[k2] == ids[b]) { dup = 1; break; }
+                        if (!dup) seen[ns++] = ids[b];
+                    }
+                    uni = ns;
+                    n_cmp++; n_hit += (uint64_t)hit; n_union += (uint64_t)uni;
+                    if (n_cmp % 20 == 0)
+                        MYDS_LOG_I("ROUTE_PROBE L20: tokens=%llu avg_hit=%.2f/6 avg_union=%.2f/12 hit_rate=%.1f%%",
+                            (unsigned long long)n_cmp, (double)n_hit / n_cmp,
+                            (double)n_union / n_cmp, 100.0 * n_hit / (n_cmp * 6));
+                }
+                for (int a = 0; a < 6; a++) prev_ids[a] = ids[a];
+                have_prev = 1;
+            }
+        }
+    }
 
     /* Cohort 3: Routed MoE Gate+Up + paired Down + Shared Down. */
     int (*down_encode)(myds_metal_buffer_t *, const myds_metal_buffer_t *,
@@ -2021,7 +2082,11 @@ int myds_v41_decode_attn_indexer_scoped(myds_context_t *ctx,
     myds_metal_set_auto_barrier(0);
     myds_metal_set_concurrent(1);
 
-#define STAGE_CHECK(call) do { if (!(call)) goto failed; } while (0)
+/* 失败时打印具体是哪一级 stage 挂的：这个函数 fail-closed（拒绝回退），
+     * 没有这行日志就只能看到笼统的 "overlap stage failed"。 */
+#define STAGE_CHECK(call) do { if (!(call)) { \
+        MYDS_LOG_E("overlap stage failed at %s:%d: %s", __FILE__, __LINE__, #call); \
+        goto failed; } } while (0)
     if (want_attn_hc) {
         STAGE_CHECK(myds_metal_v41_hc_mix_stages_preflight(args->attn_split, args->residual,
             args->attn_fn, args->attn_scale, args->attn_base, args->flat_norm, args->mix,

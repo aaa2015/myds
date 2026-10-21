@@ -12,7 +12,7 @@ BUILD_DIR = build
 #   而当时所有测试仍然全过，因为没人用到它们。
 SRCS_C = src/myds_cpu.c src/myds_log.c src/myds_gguf.c src/myds_tokenizer.c \
          src/myds_engine.c src/myds_v41.c src/myds_v41_gpu.c src/myds_v41_moe.c src/myds_v41_decode.c \
-         src/myds_engram.c src/myds_engram_cpu.c src/myds_dspark.c \
+         src/myds_engram.c src/myds_engram_cpu.c src/myds_moe_cpu.c src/myds_dspark.c \
          src/myds_vispre.c src/myds_visw.c src/myds_visfwd.c src/myds_vjob.c \
            src/myds_kvdsk.c \
          src/myds_server.c
@@ -178,7 +178,7 @@ $(BUILD_DIR)/test_engine.o: tests/test_engine.c | $(BUILD_DIR)
 $(TARGET): $(OBJS_C) $(OBJS_M) $(BUILD_DIR)/main.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
 
-$(TEST_METAL): $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_metal.o $(METALLIB) | $(BIN_DIR)
+$(TEST_METAL): $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_metal.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
 
 $(TEST_V41_GPU): $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_v41_gpu.o $(METALLIB) | $(BIN_DIR)
@@ -196,12 +196,12 @@ $(TEST_QKV_FUSION): $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_decode.o $
 # Build-only from all; GPU execution occurs only in the explicit test suite.
 # The fixture includes the unchanged runtime to inject a fused-PSO failure.
 $(TEST_DECODE_Q8): tests/test_decode_q8.m src/myds_metal.m src/myds_decode_candidates.inc $(wildcard include/*.h) $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
-	$(CC) $(OBJCFLAGS) -Isrc tests/test_decode_q8.m $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
+	$(CC) $(OBJCFLAGS) -Isrc tests/test_decode_q8.m $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
 
 # Includes the actual runtime to check both Q2 PSOs and initialization state.
 # Building submits no GPU work; the Python driver runs isolated component arms.
 $(TEST_MOE_DOWN_NSG): tests/test_moe_down_nsg.m src/myds_metal.m src/myds_decode_candidates.inc $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
-	$(CC) $(OBJCFLAGS) -Isrc tests/test_moe_down_nsg.m $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
+	$(CC) $(OBJCFLAGS) -Isrc tests/test_moe_down_nsg.m $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
 
 .PHONY: test-moe-down-nsg
 test-moe-down-nsg: $(TEST_MOE_DOWN_NSG)
@@ -334,8 +334,8 @@ $(BENCH_KPROF): $(OBJS_C) $(OBJS_M) $(BUILD_DIR)/bench_kprof.o $(METALLIB) | $(B
 
 # Opt-in (not in ALL_TESTS): armed-vs-unarmed parity and sample validity for MYDS_KPROF.
 TEST_KPROF = $(BIN_DIR)/test_kprof
-$(TEST_KPROF): tests/test_kprof.c $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
-	$(CC) $(CFLAGS) tests/test_kprof.c $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
+$(TEST_KPROF): tests/test_kprof.c $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(CFLAGS) tests/test_kprof.c $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
 
 test-kprof: $(TEST_KPROF)
 	@./$(TEST_KPROF)
@@ -351,7 +351,7 @@ $(TEST_GGUF): $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/test_gguf.o | $(BIN_DIR)
 $(TEST_TOKENIZER): $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/test_tokenizer.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@
 
-$(TEST_SERVER): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_vjob.o $(BUILD_DIR)/myds_vispre.o $(BUILD_DIR)/myds_visw.o $(BUILD_DIR)/myds_visfwd.o $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_server.o $(METALLIB) | $(BIN_DIR)
+$(TEST_SERVER): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_vjob.o $(BUILD_DIR)/myds_vispre.o $(BUILD_DIR)/myds_visw.o $(BUILD_DIR)/myds_visfwd.o $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_engram_cpu.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_server.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
 
 # 图片块区间对齐：纯头文件（myds_align.h），不需要任何 .c。
@@ -430,7 +430,7 @@ $(TEST_ENGINE_DEPTH2): tests/test_engine_depth2.c src/myds_engine.c $(wildcard i
 $(TEST_TEARDOWN_ORDER): tests/test_teardown_order.c src/myds_engine.c $(wildcard include/*.h) $(filter-out $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $< $(filter %.o,$^) $(LDFLAGS)
 
-$(TEST_METAL_RESIDENCY): tests/test_metal_residency_lifecycle.c $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+$(TEST_METAL_RESIDENCY): tests/test_metal_residency_lifecycle.c $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $< $(filter %.o,$^) $(LDFLAGS)
 
 $(TEST_TREE_SPEC): tests/test_tree_spec.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
@@ -448,10 +448,10 @@ $(TEST_RMS_FUSED_VS_FALLBACK): tests/test_rms_fused_vs_fallback.c $(filter-out $
 $(TEST_LOG): $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_log.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@
 
-$(TEST_SERVER_API): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_vjob.o $(BUILD_DIR)/myds_vispre.o $(BUILD_DIR)/myds_visw.o $(BUILD_DIR)/myds_visfwd.o $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_server_api.o $(METALLIB) | $(BIN_DIR)
+$(TEST_SERVER_API): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_vjob.o $(BUILD_DIR)/myds_vispre.o $(BUILD_DIR)/myds_visw.o $(BUILD_DIR)/myds_visfwd.o $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_engram_cpu.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_server_api.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
 
-$(TEST_ENGINE): $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_engine.o $(METALLIB) | $(BIN_DIR)
+$(TEST_ENGINE): $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_engram_cpu.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_engine.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
 
 $(BUILD_DIR)/dump_tensors.o: tools/dump_tensors.c | $(BUILD_DIR)
@@ -503,11 +503,11 @@ $(BIN_DIR)/test_engine_capture_state: $(OBJS_C) $(OBJS_M) $(BUILD_DIR)/test_engi
 $(BUILD_DIR)/test_engram.o: tests/test_engram.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
-$(TEST_ENGRAM): $(BUILD_DIR)/test_engram.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_gguf.o | $(BIN_DIR)
+$(TEST_ENGRAM): $(BUILD_DIR)/test_engram.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_engram_cpu.o $(BUILD_DIR)/myds_gguf.o | $(BIN_DIR)
 	$(CC) $^ -lm -lpthread -o $@
 
 # CPU-only real-token Engram I/O harness; does not load GPU/backbone weights.
-$(BENCH_ENGRAM_IO): tools/bench_engram_io.c $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o | $(BIN_DIR)
+$(BENCH_ENGRAM_IO): tools/bench_engram_io.c $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_engram_cpu.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o | $(BIN_DIR)
 	$(CC) $(CFLAGS) $^ -lm -lpthread -o $@
 
 $(BUILD_DIR)/test_cpu.o: tests/test_cpu.c | $(BUILD_DIR)
@@ -525,7 +525,19 @@ $(BENCH_SYNTHETIC): $(BUILD_DIR)/bench_synthetic.o $(OBJS_C) $(OBJS_M) $(METALLI
 $(BUILD_DIR)/bench_metal.o: tools/bench_metal.m | $(BUILD_DIR)
 	$(CC) $(OBJCFLAGS) -MMD -MP -c $< -o $@
 
-$(BENCH_METAL): $(BUILD_DIR)/bench_metal.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+$(BIN_DIR)/bench_moe_locality: tests/bench_moe_locality.m $(OBJS_C) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) -Isrc $< $(OBJS_C) $(OBJS_M) $(LDFLAGS) -o $@
+
+$(BIN_DIR)/bench_moe_fmt_ab: tests/bench_moe_fmt_ab.m $(OBJS_C) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) -Isrc $< $(OBJS_C) $(OBJS_M) $(LDFLAGS) -o $@
+
+$(BIN_DIR)/bench_fmt_gemv: tests/bench_fmt_gemv.m $(OBJS_C) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) -Isrc $< $(OBJS_C) $(OBJS_M) $(LDFLAGS) -o $@
+
+$(BIN_DIR)/test_moe_cpu_gpu_parity: tests/test_moe_cpu_gpu_parity.c $(OBJS_C) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
+	$(CC) $(CFLAGS) -Isrc $< $(OBJS_C) $(OBJS_M) $(LDFLAGS) -o $@
+
+$(BENCH_METAL): $(BUILD_DIR)/bench_metal.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
 
 bench: $(TEST_CPU) $(BENCH_METAL) $(BENCH_SYNTHETIC)
@@ -545,7 +557,7 @@ test-visw:
 		exit 2; \
 	fi
 	$(CC) $(CFLAGS) -Iinclude -o $(BIN_DIR)/test_visw tests/test_visw.c \
-		src/myds_visw.c src/myds_gguf.c src/myds_log.c $(BUILD_DIR)/myds_metal.o \
+		src/myds_visw.c src/myds_gguf.c src/myds_log.c $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_v41_gpu.o \
 		-framework Foundation -framework Metal -lm
 	@$(BIN_DIR)/test_visw "$(VIS_GGUF)" $(if $(VIS_LOAD),--load,)
 
@@ -639,14 +651,14 @@ clean:
 	rm -rf $(BUILD_DIR) $(BIN_DIR) tests/verify_metal tests/test_metal /tmp/test_myds*
 
 # The private host candidate implementation participates in rebuild checks.
-$(BUILD_DIR)/myds_metal.o: src/myds_decode_candidates.inc
+$(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_v41_gpu.o: src/myds_decode_candidates.inc
 
 # Build-only tools; GPU execution belongs to an exclusive experiment window.
 $(BIN_DIR)/bench_iq2_v41: tools/bench_iq2_v41.m | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) $< $(LDFLAGS) -o $@
 $(BIN_DIR)/bench_q4_v41: tools/bench_q4_v41.m $(BUILD_DIR)/myds_gguf.o | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) $< $(BUILD_DIR)/myds_gguf.o $(LDFLAGS) -o $@
-$(BIN_DIR)/bench_moe_down_overlap: tools/bench_moe_down_overlap.m $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
-	$(CC) $(OBJCFLAGS) $< $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
+$(BIN_DIR)/bench_moe_down_overlap: tools/bench_moe_down_overlap.m $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) $< $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
 .PHONY: build-decode-next-candidates
 build-decode-next-candidates: $(BIN_DIR)/bench_iq2_v41 $(BIN_DIR)/bench_q4_v41 $(BIN_DIR)/bench_moe_down_overlap

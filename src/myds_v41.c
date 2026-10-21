@@ -3839,7 +3839,11 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
             }
             TRACE("engram_out",g->residual,4*V41_DIM);
         }
-        const bool use_decode_attn_overlap = ordinary_decode_allowed && need_logits && !trace_on &&
+        /* kprof 逐 dispatch 建 encoder 来取时间戳，与 concurrency overlap 互斥；
+     * 这里先判定，避免落入 fail-closed 的 overlap 分支。 */
+    const bool kprof_exclusive = myds_metal_kprof_exclusive() != 0;
+    const bool use_decode_attn_overlap = ordinary_decode_allowed && need_logits && !trace_on &&
+            !kprof_exclusive &&
             (attn_hc_mode == 1 || kv_reuse_mode == 1 || (idx_overlap_mode == 1 && index_source(il)));
         if (use_decode_attn_overlap) {
             const uint32_t owner = owner_for(il);
@@ -3883,7 +3887,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
             };
             phase = "attention / indexer overlap";
             CHECK(myds_v41_decode_attn_indexer_scoped(ctx, &decode_args, true));
-        } else if (trace_on || !qkv_pipeline_enabled) {
+        } else if (trace_on || !qkv_pipeline_enabled || kprof_exclusive) {
             CHECK(myds_metal_v41_hc_mix(g->attn_split,g->residual,l->attn_fn,GGML_TYPE_F16,l->attn_scale,l->attn_base,g->flat_norm,g->mix,V41_DIM,m->norm_eps,v->hc_eps));
             TRACE("hc_attn_mix",g->mix,24); TRACE("hc_attn_split",g->attn_split,24);
             const myds_metal_buffer_t *hc_in_pre = (il == 0 ? g->pre : g->ffn_split);
@@ -4042,18 +4046,29 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
             myds_v41_gpu_attn_kv_reuse_reset(g->gpu);
         }
         if (attn_direct_enabled) {
-            CHECK(myds_v41_gpu_attention_direct_rope_fuse(ctx->attn_heads,base->attn_sinks,ctx->q,
+            if (!myds_v41_gpu_attention_direct_rope_fuse(ctx->attn_heads,base->attn_sinks,ctx->q,
                                                 g->window[il],nraw,(pos+1u-nraw)%128,
                                                 count ? g->compressed[owner_for(il)] : NULL,
                                                 count ? g->selected : NULL,
                                                 count,top,g->gpu,pos,compressed,
-                                                ordinary_decode_allowed && need_logits,trace_on,&attention_rope_consumed));
+                                                ordinary_decode_allowed && need_logits,trace_on,&attention_rope_consumed)) {
+                MYDS_LOG_E("attention_direct_rope_fuse failed (layer=%u pos=%u nraw=%u count=%u top=%u)",
+                           il, pos, nraw, count, top);
+                goto fail;
+            }
         } else {
             myds_v41_gpu_attn_kv_reuse_reset(g->gpu);
-            if (count) CHECK(myds_v41_gpu_gather_bf16(g->selected_kv,g->compressed[owner_for(il)],g->selected,count,top));
-            CHECK(myds_v41_gpu_attention_rope_fuse(ctx->attn_heads,base->attn_sinks,ctx->q,g->window[il],nraw,
+            if (count && !myds_v41_gpu_gather_bf16(g->selected_kv,g->compressed[owner_for(il)],g->selected,count,top)) {
+                MYDS_LOG_E("gather_bf16 failed (layer=%u pos=%u count=%u)", il, pos, count);
+                goto fail;
+            }
+            if (!myds_v41_gpu_attention_rope_fuse(ctx->attn_heads,base->attn_sinks,ctx->q,g->window[il],nraw,
                 (pos+1u-nraw)%128,g->selected_kv,top,g->gpu,pos,compressed,
-                ordinary_decode_allowed && need_logits,trace_on,&attention_rope_consumed));
+                ordinary_decode_allowed && need_logits,trace_on,&attention_rope_consumed)) {
+                MYDS_LOG_E("attention_rope_fuse failed (layer=%u pos=%u nraw=%u count=%u top=%u)",
+                           il, pos, nraw, count, top);
+                goto fail;
+            }
         }
         if (fine_pipeline) {
             myds_metal_barrier_buffer(ctx->attn_heads);

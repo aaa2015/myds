@@ -1109,6 +1109,12 @@ static int kprof_env(void) {
     return g_kp_env;
 }
 
+/* 便宜的、无副作用的 kprof 判定：给「kprof 与并发路径互斥」的调用点用。
+ * myds_metal_kprof_enabled() 会触发 kprof_init（分配 sample buffer），
+ * 不适合在每层热路径里调用。 */
+int myds_metal_kprof_exclusive(void) { return kprof_env(); }
+
+
 static int kprof_init(void) {
     if (g_kp_ready) return g_kp_ready > 0;
     g_kp_ready = -1;
@@ -1600,7 +1606,39 @@ static const char *g_metal_base_preamble =
 "};\n"
 "\n";
 
+/* kprof 的采样以「每个 dispatch 一个 encoder」取时间戳，与所有 concurrency
+ * overlap 路径互斥（hc_stages_scope 就显式要求 !g_kp_on，而各 overlap 调用点
+ * 是 fail-closed 的，会直接让整个图失败）。
+ *
+ * 这些路径的模式都在首次调用时缓存 getenv，所以必须在它们之前改环境：
+ * kprof 开启时把 overlap 开关全部压成 0，profile 的是【串行参考排程】。
+ * 这也意味着 kprof 数字不能直接当作并发生产排程的分项耗时。 */
+static void kprof_force_serial_env(void) {
+    static const char *const names[] = {
+        "MYDS_ATTN_HC_OVERLAP",
+        "MYDS_INDEXER_DECODE_OVERLAP",
+        "MYDS_FFN_HC_OVERLAP",
+        "MYDS_MOE_HC_OVERLAP",
+        "MYDS_MOE_DOWN_OVERLAP",
+        "MYDS_ATTN_KV_REUSE",
+        "MYDS_MOE_CONCURRENT",
+        /* direct-pack 的 attention 路径在 kprof 的逐 dispatch encoder 下会
+         * 在 count==0 时失败；改走 gather + rope_fuse 的参考路径。 */
+        "MYDS_ATTN_DIRECT_PACK",
+    };
+    int changed = 0;
+    for (size_t i = 0; i < sizeof(names)/sizeof(names[0]); i++) {
+        const char *v = getenv(names[i]);
+        if (v && strcmp(v, "0") != 0) changed++;
+        setenv(names[i], "0", 1);
+    }
+    if (changed)
+        MYDS_LOG_I("kprof: %d overlap switch(es) forced to 0 — profiling the serial reference schedule", changed);
+}
+
 int myds_metal_init(const char *shader_dir) {
+    /* 必须早于任何 MYDS_* 模式解析：那些解析在首次调用时缓存 getenv。 */
+    if (kprof_env()) kprof_force_serial_env();
     if (g_initialized) return 1;
 
     const int f16_gemv_bf16_fuse = myds_metal_f16_gemv_bf16_fuse_parse_mode();
@@ -3481,21 +3519,39 @@ int myds_metal_v41_hc_mix_stages_preflight(myds_metal_buffer_t *split,
     const myds_metal_buffer_t *scale, const myds_metal_buffer_t *base,
     myds_metal_buffer_t *flat_norm, myds_metal_buffer_t *mix,
     uint32_t dim, float eps, float hc_eps) {
-    if (!hc_stages_scope(dim) || !isfinite(eps) || eps<0 || !isfinite(hc_eps) || hc_eps<0) return 0;
+    /* MYDS_HC_PREFLIGHT_DEBUG=1：把失败的那一条具体原因打出来。
+     * 这个 preflight 是 fail-closed 的，没有原因码时只能看到下游笼统报错。 */
+    static int preflight_dbg = -1;
+    if (preflight_dbg < 0) { const char *d = getenv("MYDS_HC_PREFLIGHT_DEBUG");
+        preflight_dbg = (d && *d && strcmp(d, "0") != 0) ? 1 : 0; }
+#define HC_PF_FAIL(why) do { if (preflight_dbg) \
+        fprintf(stderr, "myds_metal: hc_mix preflight fail: %s (dim=%u)\n", (why), dim); \
+        return 0; } while (0)
+    if (!hc_stages_scope(dim)) HC_PF_FAIL("dim scope");
+    if (!isfinite(eps) || eps<0) HC_PF_FAIL("eps");
+    if (!isfinite(hc_eps) || hc_eps<0) HC_PF_FAIL("hc_eps");
     const myds_metal_buffer_t *buffers[]={flat_norm,mix,split,residual,fn,scale,base};
     const uint64_t bytes[]={81920u,96u,96u,81920u,983040u,12u,96u};
     const size_t alignments[]={16u,16u,16u,16u,8u,4u,16u};
-    for (unsigned i=0;i<7u;++i) if (!hc_stages_range(buffers[i],bytes[i],alignments[i])) return 0;
+    static const char *names[7] = {"flat_norm","mix","split","residual","fn","scale","base"};
+    for (unsigned i=0;i<7u;++i)
+        if (!hc_stages_range(buffers[i],bytes[i],alignments[i]))
+            HC_PF_FAIL(names[i]);
     for (unsigned i=0;i<3u;++i)
         for (unsigned j=i+1u;j<7u;++j)
-            if (hc_stages_alias(buffers[i],bytes[i],buffers[j],bytes[j])) return 0;
+            if (hc_stages_alias(buffers[i],bytes[i],buffers[j],bytes[j])) {
+                if (preflight_dbg) fprintf(stderr,
+                    "myds_metal: hc_mix preflight alias: %s vs %s\n", names[i], names[j]);
+                return 0; }
     @autoreleasepool {
         const int fuse_mode = myds_fuse_hc_norm_mix_mode();
         if (fuse_mode > 0) {
             id<MTLComputePipelineState> fused_pso = (fuse_mode == 2) ? g_pso_hc_norm_mix_f16_cluster2 : g_pso_hc_norm_mix_f16;
             NSUInteger h = (fuse_mode == 2) ? 16u : 8u;
             NSUInteger scratch = (fuse_mode == 2) ? 640u : 384u;
-            return hc_stages_geometry(fused_pso, 32u, h, scratch) && hc_stages_geometry(g_pso_v41_hc_split, 1u, 1u, 0u);
+            if (!hc_stages_geometry(fused_pso, 32u, h, scratch)) HC_PF_FAIL("geometry fused norm_mix");
+            if (!hc_stages_geometry(g_pso_v41_hc_split, 1u, 1u, 0u)) HC_PF_FAIL("geometry hc_split");
+            return 1;
         }
         /* Same cached symbol/FC key as v41_gemv_batch, prepared before the
          * first stage so missing selected PSOs cannot produce partial work. */
@@ -3507,15 +3563,18 @@ int myds_metal_v41_hc_mix_stages_preflight(myds_metal_buffer_t *split,
             [values setConstantValue:&nsg type:MTLDataTypeShort atIndex:600];
             id<MTLFunction> fn=[g_library newFunctionWithName:@"kernel_mul_mv_f16_f32_4"
                 constantValues:values error:nil];
-            if (!fn) return 0;
+            if (!fn) HC_PF_FAIL("newFunction kernel_mul_mv_f16_f32_4");
             pso=[g_device newComputePipelineStateWithFunction:fn error:nil];
-            if (!pso) return 0;
+            if (!pso) HC_PF_FAIL("newPipeline kernel_mul_mv_f16_f32_4");
             if (!g_native_pipelines) g_native_pipelines=[NSMutableDictionary new];
             g_native_pipelines[key]=pso;
         }
-        return hc_stages_geometry(g_pso_v41_norm_plain,1024u,1u,128u) &&
-            hc_stages_geometry(pso,32u,8u,256u) && hc_stages_geometry(g_pso_v41_hc_split,1u,1u,0u);
+        if (!hc_stages_geometry(g_pso_v41_norm_plain,1024u,1u,128u)) HC_PF_FAIL("geometry norm_plain");
+        if (!hc_stages_geometry(pso,32u,8u,256u)) HC_PF_FAIL("geometry f16_f32_4 nsg8");
+        if (!hc_stages_geometry(g_pso_v41_hc_split,1u,1u,0u)) HC_PF_FAIL("geometry hc_split");
+        return 1;
     }
+#undef HC_PF_FAIL
 }
 int myds_metal_v41_hc_mix_norm_stage(myds_metal_buffer_t *flat_norm,
     const myds_metal_buffer_t *residual, uint32_t dim, float eps) {

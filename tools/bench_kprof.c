@@ -75,7 +75,9 @@ int main(int argc, char **argv) {
     const uint32_t warm = argc > 3 ? arg_u32(argv[3], 1, 4096, "warm_tokens") : 8;
     const uint32_t window = argc > 4 ? arg_u32(argv[4], 1, 64, "kprof_tokens") : 24;
     const uint32_t max_seq = argc > 5 ? arg_u32(argv[5], 256, UINT32_MAX, "max_seq") : 4096;
-    setenv("MYDS_KPROF", "1", 1);
+    /* 尊重外部传入的 MYDS_KPROF：为 0 时按普通 decode 跑，用于隔离
+     * 「失败是 kprof 引起的」还是「这个 bench 本身就不支持该配置」。 */
+    if (!getenv("MYDS_KPROF")) setenv("MYDS_KPROF", "1", 1);
 
     char *body = read_file(argv[2]);
     if (!body) return 2;
