@@ -92,6 +92,7 @@ static atomic_uint_fast64_t g_moe_q2_v41_encoded = 0;
 static atomic_uint_fast64_t g_moe_q2_v41_failures = 0;
 static bool g_moe_down_overlap = false, g_moe_iq2_v41 = false, g_dense_q4_v41 = false;
 static bool g_dense_q4_v41_nb = false, g_dense_q4_v41_head_reference = false;
+static int g_dense_q4_mask = -1;
 static id<MTLComputePipelineState> g_pso_moe_iq2_v41 = nil;
 static id<MTLComputePipelineState> g_pso_dense_q4_v41[3] = {nil, nil, nil};
 static bool g_shared_q4_v41_nb = false;
@@ -4973,7 +4974,6 @@ static uint32_t dense_q4_nr0(void) {
  * bit3 generic Q4 F32 GEMV, bit4 generic Q4 BF16 GEMV, bit5 attn_output_a. */
 enum { DQ4_SITE_HEAD = 0, DQ4_SITE_QB = 1, DQ4_SITE_OB = 2, DQ4_SITE_GEMV_F32 = 3,
        DQ4_SITE_GEMV_BF16 = 4, DQ4_SITE_OUT_A = 5 };
-static int g_dense_q4_mask = -1;
 static uint32_t dense_q4_nr_site(unsigned site) {
     if (__builtin_expect(g_dense_q4_mask < 0, 0)) {
         const char *v = getenv("MYDS_DENSE_Q4_NR4_MASK");
