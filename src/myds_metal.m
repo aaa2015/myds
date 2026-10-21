@@ -55,6 +55,9 @@ static id<MTLComputePipelineState> g_pso_v41_hc_split = nil;
 static id<MTLComputePipelineState> g_pso_v41_hc_sum = nil;
 static id<MTLComputePipelineState> g_pso_v41_hc_sum_rmsnorm = nil;
 static id<MTLComputePipelineState> g_pso_v41_hc_sum_rmsnorm_batch = nil;
+static id<MTLComputePipelineState> g_pso_hc_norm_mix_f16 = nil;
+static id<MTLComputePipelineState> g_pso_hc_norm_mix_f16_cluster2 = nil;
+static int g_fuse_hc_norm_mix = -1;
 static id<MTLComputePipelineState> g_pso_v41_hc_expand = nil;
 static id<MTLComputePipelineState> g_pso_v41_moe_add_hc_expand = nil;
 static id<MTLComputePipelineState> g_pso_v41_moe_add_hc_expand_batch = nil;
@@ -110,6 +113,27 @@ static id<MTLBuffer>               g_moe_id_map_buffer = nil;
 static NSUInteger                  g_moe_id_map_bytes = 0;
 static int                         g_moe_nsg = 2;
 static int                         g_moe_down_nsg = 2;
+
+/* 2026-10-21 实验：NR0 可配（必须与 metal 端宏一致）。
+ * MYDS_MOE_NR0_GATE ∈ {1,2,4}（对齐 N_R0_IQ2_XXS），MYDS_MOE_NR0_DOWN ∈ {1,2}（对齐 N_R0_Q2_K）。 */
+static NSUInteger moe_nr0_gate(void) {
+    static NSUInteger v = 0;
+    if (!v) {
+        const char *e = getenv("MYDS_MOE_NR0_GATE");
+        NSUInteger x = (e && *e) ? (NSUInteger)strtoul(e, NULL, 10) : 4u;
+        v = (x == 1u || x == 2u || x == 4u) ? x : 4u;
+    }
+    return v;
+}
+static NSUInteger moe_nr0_down(void) {
+    static NSUInteger v = 0;
+    if (!v) {
+        const char *e = getenv("MYDS_MOE_NR0_DOWN");
+        NSUInteger x = (e && *e) ? (NSUInteger)strtoul(e, NULL, 10) : 2u;
+        v = (x == 1u || x == 2u) ? x : 2u;
+    }
+    return v;
+}
 static bool                        g_moe_iq2_constant_lut = false;
 /* 2026-10-13 参谋长: IQ2_XXS gate/up 的 popcount 符号变体（位级一致，仅去掉 ssigns 查表）。
  * 恒等式 ssigns[c] == c | (parity(c) << 7) 已对全部 128 个码逐一核对⇒纯替换。
@@ -1983,6 +2007,10 @@ int myds_metal_init(const char *shader_dir) {
         if (fn) g_pso_v41_hc_sum_rmsnorm = [g_device newComputePipelineStateWithFunction:fn error:nil];
         fn = [g_library newFunctionWithName:@"kernel_myds_v41_hc_sum_rmsnorm_batch"];
         if (fn) g_pso_v41_hc_sum_rmsnorm_batch = [g_device newComputePipelineStateWithFunction:fn error:nil];
+        fn = [g_library newFunctionWithName:@"kernel_dsv4_hc_rms_norm_mix_f16"];
+        if (fn) g_pso_hc_norm_mix_f16 = [g_device newComputePipelineStateWithFunction:fn error:nil];
+        fn = [g_library newFunctionWithName:@"kernel_dsv4_hc_rms_norm_mix_f16_cluster2"];
+        if (fn) g_pso_hc_norm_mix_f16_cluster2 = [g_device newComputePipelineStateWithFunction:fn error:nil];
         fn = [g_library newFunctionWithName:@"kernel_dsv4_hc_expand4"];
         if (fn) g_pso_v41_hc_expand = [g_device newComputePipelineStateWithFunction:fn error:nil];
         fn = [g_library newFunctionWithName:@"kernel_dsv4_moe_add_hc_expand4"];
@@ -2393,6 +2421,11 @@ int myds_metal_init(const char *shader_dir) {
         const int flash_dec = myds_v41_gpu_attention_flash_dec_enabled();
         MYDS_LOG_I("Attention flash-decoding: %d (%s)",
                    flash_dec, flash_dec == 1 ? "4-TG split + reduce (D1 candidate)" : "reference (single-TG in-register 14-NSG)");
+        const int fuse_hc_norm_mix = myds_fuse_hc_norm_mix_mode();
+        MYDS_LOG_I("HC mix norm pre-fusion: %d (%s)",
+                   fuse_hc_norm_mix,
+                   fuse_hc_norm_mix == 2 ? "cluster2 6-TG (D2 candidate)" :
+                   fuse_hc_norm_mix == 1 ? "NR0=2 12-TG (D2 candidate)" : "reference (separate norm + GEMV)");
         return 1;
     }
 }
@@ -2416,6 +2449,9 @@ void myds_metal_cleanup(void) {
     g_indexer_topk_threshold_stats=NULL;
     g_pso_rms_norm = nil;
     g_pso_v41_norm_plain = nil;
+    g_pso_hc_norm_mix_f16 = nil;
+    g_pso_hc_norm_mix_f16_cluster2 = nil;
+    g_fuse_hc_norm_mix = -1;
     g_pso_v41_bf16 = nil;
     g_pso_v41_hc_split = nil;
     g_pso_v41_hc_sum = nil;
@@ -3410,6 +3446,11 @@ static bool hc_stages_geometry(id<MTLComputePipelineState> pso, NSUInteger width
         scratch<=g_device.maxThreadgroupMemoryLength &&
         pso.staticThreadgroupMemoryLength<=g_device.maxThreadgroupMemoryLength-scratch;
 }
+struct ds4_metal_args_hc_norm_mix {
+    int32_t n;
+    int32_t out_dim;
+    float   eps;
+};
 int myds_metal_v41_hc_mix_stages_preflight(myds_metal_buffer_t *split,
     const myds_metal_buffer_t *residual, const myds_metal_buffer_t *fn,
     const myds_metal_buffer_t *scale, const myds_metal_buffer_t *base,
@@ -3424,6 +3465,13 @@ int myds_metal_v41_hc_mix_stages_preflight(myds_metal_buffer_t *split,
         for (unsigned j=i+1u;j<7u;++j)
             if (hc_stages_alias(buffers[i],bytes[i],buffers[j],bytes[j])) return 0;
     @autoreleasepool {
+        const int fuse_mode = myds_fuse_hc_norm_mix_mode();
+        if (fuse_mode > 0) {
+            id<MTLComputePipelineState> fused_pso = (fuse_mode == 2) ? g_pso_hc_norm_mix_f16_cluster2 : g_pso_hc_norm_mix_f16;
+            NSUInteger h = (fuse_mode == 2) ? 16u : 8u;
+            NSUInteger scratch = (fuse_mode == 2) ? 640u : 384u;
+            return hc_stages_geometry(fused_pso, 32u, h, scratch) && hc_stages_geometry(g_pso_v41_hc_split, 1u, 1u, 0u);
+        }
         /* Same cached symbol/FC key as v41_gemv_batch, prepared before the
          * first stage so missing selected PSOs cannot produce partial work. */
         NSString *key=@"kernel_mul_mv_f16_f32_4_8";
@@ -3453,6 +3501,54 @@ int myds_metal_v41_hc_mix_project_stage(myds_metal_buffer_t *mix,
     const myds_metal_buffer_t *fn, const myds_metal_buffer_t *flat_norm, uint32_t dim) {
     if (!hc_stages_scope(dim)) return 0;
     return myds_metal_v41_gemv(mix,fn,flat_norm,24,4u*dim,GGML_TYPE_F16);
+}
+int myds_fuse_hc_norm_mix_mode(void) {
+    if (g_fuse_hc_norm_mix < 0) {
+        const char *v = getenv("MYDS_FUSE_HC_NORM_MIX");
+        g_fuse_hc_norm_mix = v ? atoi(v) : 0;
+    }
+    return g_fuse_hc_norm_mix;
+}
+void myds_metal_set_fuse_hc_norm_mix_mode(int mode) {
+    g_fuse_hc_norm_mix = mode;
+}
+int myds_metal_v41_hc_mix_norm_project_fused(myds_metal_buffer_t *mix,
+    const myds_metal_buffer_t *fn, const myds_metal_buffer_t *residual,
+    uint32_t dim, float eps) {
+    if (!hc_stages_scope(dim) || !isfinite(eps) || eps < 0) return 0;
+    if (!hc_stages_range(residual, 81920u, 16u) ||
+        !hc_stages_range(fn, 983040u, 8u) ||
+        !hc_stages_range(mix, 96u, 16u)) return 0;
+    if (hc_stages_alias(mix, 96u, residual, 81920u) ||
+        hc_stages_alias(mix, 96u, fn, 983040u)) return 0;
+
+    int mode = myds_fuse_hc_norm_mix_mode();
+    id<MTLComputePipelineState> pso = (mode == 2) ? g_pso_hc_norm_mix_f16_cluster2 : g_pso_hc_norm_mix_f16;
+    if (!pso) return 0;
+
+    @autoreleasepool {
+        struct ds4_metal_args_hc_norm_mix args = {
+            .n = (int32_t)(4u * dim),
+            .out_dim = 24,
+            .eps = eps,
+        };
+        id<MTLCommandBuffer> cb = g_batch_cb;
+        id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:pso];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:residual->mtl_buf offset:residual->offset atIndex:1];
+        [enc setBuffer:fn->mtl_buf offset:fn->offset atIndex:2];
+        [enc setBuffer:mix->mtl_buf offset:mix->offset atIndex:3];
+        if (mode == 2) {
+            [enc setThreadgroupMemoryLength:(32 + 2 * 2 * 32) * sizeof(float) atIndex:0];
+            metal_dispatch(enc, "v41_hc_norm_mix_cluster2", MTLSizeMake(6, 1, 1), MTLSizeMake(32, 16, 1));
+        } else {
+            [enc setThreadgroupMemoryLength:(32 + 32 * 2) * sizeof(float) atIndex:0];
+            metal_dispatch(enc, "v41_hc_norm_mix_nr2", MTLSizeMake(12, 1, 1), MTLSizeMake(32, 8, 1));
+        }
+        return v41_finish(cb, enc);
+    }
 }
 int myds_metal_v41_hc_mix_split_stage(myds_metal_buffer_t *split,
     const myds_metal_buffer_t *mix, const myds_metal_buffer_t *scale,
@@ -6271,7 +6367,7 @@ static int routed_moe_batch_impl(
             .tp_expert_base = 0,
         };
 
-        const NSUInteger nr0_gate = 4;
+        const NSUInteger nr0_gate = moe_nr0_gate();
         const NSUInteger nsg_gate = (NSUInteger)g_moe_nsg;
         const NSUInteger rows_per_group_gate = nr0_gate * nsg_gate;
         const NSUInteger row_groups_gate = (expert_dim + rows_per_group_gate - 1) / rows_per_group_gate;
@@ -6325,7 +6421,7 @@ static int routed_moe_batch_impl(
             .tp_expert_base = 0,
         };
 
-        const NSUInteger nr0_down = 2;
+        const NSUInteger nr0_down = moe_nr0_down();
         const NSUInteger nsg_down = (NSUInteger)g_moe_down_nsg;
         const NSUInteger rows_per_group_down = nr0_down * nsg_down;
         const NSUInteger row_groups_down = (dim + rows_per_group_down - 1) / rows_per_group_down;
@@ -6652,8 +6748,8 @@ static int moe_q2_sum_cache_fused_scoped(
         const uint32_t n_tok = 1u;
         const NSUInteger nsg_gate = (NSUInteger)g_moe_nsg;
         const NSUInteger nsg_down = (NSUInteger)g_moe_down_nsg;
-        const NSUInteger row_groups_gate = (expert_dim + 4u * nsg_gate - 1u) / (4u * nsg_gate);
-        const NSUInteger row_groups_down = (dim + 2u * nsg_down - 1u) / (2u * nsg_down);
+        const NSUInteger row_groups_gate = (expert_dim + moe_nr0_gate() * nsg_gate - 1u) / (moe_nr0_gate() * nsg_gate);
+        const NSUInteger row_groups_down = (dim + moe_nr0_down() * nsg_down - 1u) / (moe_nr0_down() * nsg_down);
         const NSUInteger pairs = n_activated_experts;
         const NSUInteger smem_iq2 = 2176u;
         struct ds4_metal_args_mul_mv_id gate_args = {
@@ -6917,8 +7013,8 @@ static int routed_moe_scoped_impl(
         const uint32_t n_tok = 1u;
         const NSUInteger nsg_gate = (NSUInteger)g_moe_nsg;
         const NSUInteger nsg_down = (NSUInteger)g_moe_down_nsg;
-        const NSUInteger row_groups_gate = (expert_dim + 4u * nsg_gate - 1u) / (4u * nsg_gate);
-        const NSUInteger row_groups_down = (dim + 2u * nsg_down - 1u) / (2u * nsg_down);
+        const NSUInteger row_groups_gate = (expert_dim + moe_nr0_gate() * nsg_gate - 1u) / (moe_nr0_gate() * nsg_gate);
+        const NSUInteger row_groups_down = (dim + moe_nr0_down() * nsg_down - 1u) / (moe_nr0_down() * nsg_down);
         const NSUInteger pairs = n_activated_experts;
         const NSUInteger smem_iq2 = g_moe_iq2_constant_lut ? 0u : 2176u;
         struct ds4_metal_args_mul_mv_id gate_args = {

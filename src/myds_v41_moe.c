@@ -970,8 +970,11 @@ static int moe_hc_overlap_101(myds_context_t *ctx, uint32_t layer,
     HC_STAGE_CHECK(myds_metal_v41_hc_mix_stages_preflight(ffn_split,after_attn,ffn_fn,
         ffn_scale,ffn_base,flat_norm,mix,dim,m->norm_eps,hc_eps));
 
+    const int fuse_hc = myds_fuse_hc_norm_mix_mode();
     /* Cohort1: the normalization is independent of Router/SharedGU. */
-    HC_STAGE_CHECK(myds_metal_v41_hc_mix_norm_stage(flat_norm,after_attn,dim,m->norm_eps));
+    if (!fuse_hc) {
+        HC_STAGE_CHECK(myds_metal_v41_hc_mix_norm_stage(flat_norm,after_attn,dim,m->norm_eps));
+    }
     HC_STAGE_CHECK(myds_metal_v41_gemv(ctx->router_logits,l->router_gate,ctx->ffn_norm_out,
         m->n_routed_experts,dim,l->router_gate_type));
     HC_STAGE_CHECK(myds_metal_shared_q4_v41_nb_enabled()
@@ -979,12 +982,21 @@ static int moe_hc_overlap_101(myds_context_t *ctx, uint32_t layer,
             ctx->ffn_norm_out,width,dim,m->swiglu_clamp_exp)
         : myds_v41_shared_gate_up_swiglu(ctx->shared_swiglu_out,l->shared_gate,
             l->shared_up,ctx->ffn_norm_out,width,dim,l->shared_gate_type,l->shared_up_type,m->swiglu_clamp_exp));
-    const myds_metal_buffer_t *cohort1[]={flat_norm,ctx->router_logits,ctx->shared_swiglu_out};
-    myds_metal_barrier_buffers(cohort1,3);
+    if (fuse_hc) {
+        const myds_metal_buffer_t *cohort1[]={ctx->router_logits,ctx->shared_swiglu_out};
+        myds_metal_barrier_buffers(cohort1,2);
+    } else {
+        const myds_metal_buffer_t *cohort1[]={flat_norm,ctx->router_logits,ctx->shared_swiglu_out};
+        myds_metal_barrier_buffers(cohort1,3);
+    }
 
     /* Cohort2: original HC projection alongside the production router. Keep
      * the router's existing internal output join, plus this full union join. */
-    HC_STAGE_CHECK(myds_metal_v41_hc_mix_project_stage(mix,ffn_fn,flat_norm,dim));
+    if (fuse_hc) {
+        HC_STAGE_CHECK(myds_metal_v41_hc_mix_norm_project_fused(mix,ffn_fn,after_attn,dim,m->norm_eps));
+    } else {
+        HC_STAGE_CHECK(myds_metal_v41_hc_mix_project_stage(mix,ffn_fn,flat_norm,dim));
+    }
     HC_STAGE_CHECK(myds_v41_route(ctx->selected_ids,ctx->selected_weights,ctx->moe_gate,
         ctx->moe_up,ctx->router_logits,l->router_bias,m->n_routed_experts,k,m->routed_scaling_factor));
     const myds_metal_buffer_t *cohort2[]={mix,ctx->selected_ids,ctx->selected_weights,ctx->moe_gate,ctx->moe_up};
@@ -1460,17 +1472,26 @@ int myds_v41_moe_ffn_hc_overlap_scoped(myds_context_t *ctx, uint32_t layer, uint
     FFN_HC_CHECK(myds_metal_v41_hc_mix_stages_preflight(ffn_split, after_attn, ffn_fn,
         ffn_scale, ffn_base, flat_norm, mix, dim, m->norm_eps, hc_eps));
 
+    const int fuse_hc = myds_fuse_hc_norm_mix_mode();
     /* Cohort 0: FFN input HC sum+RMSNorm and HC mix norm stage both read only
      * after_attn (and attn_split / ffn_norm) and write disjoint buffers. */
     FFN_HC_CHECK(myds_metal_v41_hc_sum_rmsnorm(ctx->ffn_norm_out, ctx->x, after_attn,
         attn_split, l->ffn_norm, dim, m->norm_eps, true));
-    FFN_HC_CHECK(myds_metal_v41_hc_mix_norm_stage(flat_norm, after_attn, dim, m->norm_eps));
-    const myds_metal_buffer_t *cohort0[] = { ctx->ffn_norm_out, flat_norm };
-    myds_metal_barrier_buffers(cohort0, 2);
+    if (fuse_hc) {
+        myds_metal_barrier_buffer(ctx->ffn_norm_out);
+    } else {
+        FFN_HC_CHECK(myds_metal_v41_hc_mix_norm_stage(flat_norm, after_attn, dim, m->norm_eps));
+        const myds_metal_buffer_t *cohort0[] = { ctx->ffn_norm_out, flat_norm };
+        myds_metal_barrier_buffers(cohort0, 2);
+    }
 
     /* Cohort 1: HC mix projection (983 KB F16 weights) and Router GEMV (3.9 MB F32
      * weights) run concurrently so router_logits is ready for Cohort 2 as early as possible. */
-    FFN_HC_CHECK(myds_metal_v41_hc_mix_project_stage(mix, ffn_fn, flat_norm, dim));
+    if (fuse_hc) {
+        FFN_HC_CHECK(myds_metal_v41_hc_mix_norm_project_fused(mix, ffn_fn, after_attn, dim, m->norm_eps));
+    } else {
+        FFN_HC_CHECK(myds_metal_v41_hc_mix_project_stage(mix, ffn_fn, flat_norm, dim));
+    }
     FFN_HC_CHECK(myds_metal_v41_gemv(ctx->router_logits, l->router_gate, ctx->ffn_norm_out,
         m->n_routed_experts, dim, l->router_gate_type));
     const myds_metal_buffer_t *cohort1[] = { mix, ctx->router_logits };
@@ -2007,13 +2028,18 @@ int myds_v41_decode_attn_indexer_scoped(myds_context_t *ctx,
             5120u, m->norm_eps, args->hc_eps));
     }
 
+    const int fuse_hc = myds_fuse_hc_norm_mix_mode();
     /* Cohort 1: fused HC sum+RMSNorm for x_norm, plus HC mix norm stage when enabled. */
     STAGE_CHECK(myds_metal_v41_hc_sum_rmsnorm(ctx->x_norm, ctx->x, args->residual,
         args->hc_in_pre, base->attn_norm, 5120u, m->norm_eps, true));
     if (want_attn_hc) {
-        STAGE_CHECK(myds_metal_v41_hc_mix_norm_stage(args->flat_norm, args->residual, 5120u, m->norm_eps));
-        const myds_metal_buffer_t *cohort1[] = { ctx->x_norm, args->flat_norm };
-        myds_metal_barrier_buffers(cohort1, 2);
+        if (fuse_hc) {
+            myds_metal_barrier_buffer(ctx->x_norm);
+        } else {
+            STAGE_CHECK(myds_metal_v41_hc_mix_norm_stage(args->flat_norm, args->residual, 5120u, m->norm_eps));
+            const myds_metal_buffer_t *cohort1[] = { ctx->x_norm, args->flat_norm };
+            myds_metal_barrier_buffers(cohort1, 2);
+        }
     } else {
         myds_metal_barrier_buffer(ctx->x_norm);
     }
@@ -2021,7 +2047,11 @@ int myds_v41_decode_attn_indexer_scoped(myds_context_t *ctx,
     if (!want_idx_overlap) {
         /* Reference compressor/indexer schedule (with optional MYDS_ATTN_HC_OVERLAP and MYDS_ATTN_KV_REUSE). */
         if (want_attn_hc) {
-            STAGE_CHECK(myds_metal_v41_hc_mix_project_stage(args->mix, args->attn_fn, args->flat_norm, 5120u));
+            if (fuse_hc) {
+                STAGE_CHECK(myds_metal_v41_hc_mix_norm_project_fused(args->mix, args->attn_fn, args->residual, 5120u, m->norm_eps));
+            } else {
+                STAGE_CHECK(myds_metal_v41_hc_mix_project_stage(args->mix, args->attn_fn, args->flat_norm, 5120u));
+            }
         } else {
             STAGE_CHECK(myds_metal_v41_hc_mix(args->attn_split, args->residual, args->attn_fn, GGML_TYPE_F16,
                 args->attn_scale, args->attn_base, args->flat_norm, args->mix, 5120u, m->norm_eps, args->hc_eps));
@@ -2097,7 +2127,11 @@ int myds_v41_decode_attn_indexer_scoped(myds_context_t *ctx,
 
     /* Cohort 2: all x_norm (and flat_norm) consumers dispatched without intermediate barriers. */
     if (want_attn_hc) {
-        STAGE_CHECK(myds_metal_v41_hc_mix_project_stage(args->mix, args->attn_fn, args->flat_norm, 5120u));
+        if (fuse_hc) {
+            STAGE_CHECK(myds_metal_v41_hc_mix_norm_project_fused(args->mix, args->attn_fn, args->residual, 5120u, m->norm_eps));
+        } else {
+            STAGE_CHECK(myds_metal_v41_hc_mix_project_stage(args->mix, args->attn_fn, args->flat_norm, 5120u));
+        }
     } else {
         STAGE_CHECK(myds_metal_v41_hc_mix(args->attn_split, args->residual, args->attn_fn, GGML_TYPE_F16,
             args->attn_scale, args->attn_base, args->flat_norm, args->mix, 5120u, m->norm_eps, args->hc_eps));

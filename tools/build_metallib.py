@@ -161,8 +161,13 @@ def main():
         "-O3", "-ffast-math",
         "-DDS4_METAL_HC_STABLE=1",
         "-DDS4_METAL_NORM_RSQRT_DISABLE=1",
+    ]
+    # 2026-10-21 实验：允许从环境注入 -D，用于 NR0 / NSG 组合扫描（默认不注入）。
+    _extra = os.environ.get("MYDS_METALLIB_DEFINES", "").split()
+    compile_cmd += _extra
+    compile_cmd += [
         "-c", combined_metal,
-        "-o", air_file
+        "-o", air_file,
     ]
     res = subprocess.run(compile_cmd, env=env)
     if res.returncode != 0:

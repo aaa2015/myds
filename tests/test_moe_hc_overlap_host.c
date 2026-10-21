@@ -82,6 +82,27 @@ int myds_metal_v41_hc_mix_project_stage(myds_metal_buffer_t *m,const myds_metal_
     const myds_metal_buffer_t *n,uint32_t d) {
     assert(m && f && n && d==5120 && !auto_barrier && concurrent);return record("project");
 }
+int myds_fuse_hc_norm_mix_mode(void) { return 0; }
+void myds_metal_set_fuse_hc_norm_mix_mode(int mode) { (void)mode; }
+int myds_metal_v41_hc_mix_norm_project_fused(myds_metal_buffer_t *m,const myds_metal_buffer_t *f,
+    const myds_metal_buffer_t *r,uint32_t d,float e) {
+    (void)m;(void)f;(void)r;(void)d;(void)e;return record("fused_norm_project");
+}
+int myds_metal_shared_q4_v41_nb_enabled(void) { return 0; }
+int myds_metal_shared_q4_v41_nb_gate_up(myds_metal_buffer_t *s,const myds_metal_buffer_t *g,
+    const myds_metal_buffer_t *u,const myds_metal_buffer_t *x,uint32_t w,uint32_t d,float c) {
+    (void)s;(void)g;(void)u;(void)x;(void)w;(void)d;(void)c;return 0;
+}
+int myds_metal_routed_moe_down_overlap_nbhc_scoped(myds_metal_buffer_t *s,const myds_metal_buffer_t *g,
+    const myds_metal_buffer_t *u,const myds_metal_buffer_t *d,const myds_metal_buffer_t *ids,
+    const myds_metal_buffer_t *w,const myds_metal_buffer_t *x,myds_metal_buffer_t *sg,
+    myds_metal_buffer_t *su,myds_metal_buffer_t *sm,myds_metal_buffer_t *sd,uint32_t dim,
+    uint32_t width,uint32_t ne,uint32_t k,ggml_type gt,ggml_type ut,ggml_type dt,float clamp,
+    bool tr,myds_metal_buffer_t *mo,const myds_metal_buffer_t *mg,const myds_metal_buffer_t *mu,ggml_type mt) {
+    (void)s;(void)g;(void)u;(void)d;(void)ids;(void)w;(void)x;(void)sg;(void)su;(void)sm;(void)sd;
+    (void)dim;(void)width;(void)ne;(void)k;(void)gt;(void)ut;(void)dt;(void)clamp;(void)tr;(void)mo;(void)mg;(void)mu;(void)mt;
+    return 0;
+}
 int myds_metal_v41_hc_mix_split_stage(myds_metal_buffer_t *s,const myds_metal_buffer_t *m,
     const myds_metal_buffer_t *sc,const myds_metal_buffer_t *b,uint32_t d,float h) {
     assert(s && m && sc && b && d==5120 && h>=0 && !auto_barrier && concurrent);return record("split");

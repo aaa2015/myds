@@ -267,6 +267,11 @@ int myds_metal_v41_hc_mix_norm_stage(myds_metal_buffer_t *flat_norm,
     const myds_metal_buffer_t *residual, uint32_t dim, float eps);
 int myds_metal_v41_hc_mix_project_stage(myds_metal_buffer_t *mix,
     const myds_metal_buffer_t *fn, const myds_metal_buffer_t *flat_norm, uint32_t dim);
+int myds_fuse_hc_norm_mix_mode(void);
+void myds_metal_set_fuse_hc_norm_mix_mode(int mode);
+int myds_metal_v41_hc_mix_norm_project_fused(myds_metal_buffer_t *mix,
+    const myds_metal_buffer_t *fn, const myds_metal_buffer_t *residual,
+    uint32_t dim, float eps);
 int myds_metal_v41_hc_mix_split_stage(myds_metal_buffer_t *split,
     const myds_metal_buffer_t *mix, const myds_metal_buffer_t *scale,
     const myds_metal_buffer_t *base, uint32_t dim, float hc_eps);

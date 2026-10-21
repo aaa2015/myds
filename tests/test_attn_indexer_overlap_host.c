@@ -348,6 +348,14 @@ int myds_metal_v41_hc_mix_project_stage(myds_metal_buffer_t *m, const myds_metal
     return record("hc_mix_project");
 }
 
+int myds_fuse_hc_norm_mix_mode(void) { return 0; }
+void myds_metal_set_fuse_hc_norm_mix_mode(int mode) { (void)mode; }
+int myds_metal_v41_hc_mix_norm_project_fused(myds_metal_buffer_t *m, const myds_metal_buffer_t *f,
+    const myds_metal_buffer_t *r, uint32_t d, float e) {
+    (void)m; (void)f; (void)r; (void)d; (void)e;
+    return record("hc_mix_norm_project_fused");
+}
+
 int myds_metal_v41_hc_mix_split_stage(myds_metal_buffer_t *s, const myds_metal_buffer_t *m,
     const myds_metal_buffer_t *sc, const myds_metal_buffer_t *b, uint32_t d, float h) {
     assert(s && m && sc && b && d == 5120u && h >= 0.0f && !auto_barrier && concurrent);
