@@ -80,6 +80,7 @@ TEST_DSPARK_CAPTURE = $(BIN_DIR)/test_dspark_capture
 TEST_BATCH2_PARITY = $(BIN_DIR)/test_batch2_parity
 TEST_BATCH2_E2E = $(BIN_DIR)/test_batch2_e2e
 TEST_Q4_BF16_PARITY = $(BIN_DIR)/test_q4_bf16_parity
+BENCH_DENSE_Q4_SITES = $(BIN_DIR)/bench_dense_q4_sites
 TEST_TREE_SPEC = $(BIN_DIR)/test_tree_spec
 TEST_ENGINE_DEPTH2 = $(BIN_DIR)/test_engine_depth2
 TEST_DECODE_SPLIT = $(BIN_DIR)/test_decode_split
@@ -273,6 +274,9 @@ $(TEST_BATCH2_Q8_SHARED): tests/test_batch2_q8_shared.m src/myds_metal.m src/myd
 
 $(TEST_Q4_BF16_PARITY): tests/test_q4_bf16_parity.m src/myds_metal.m src/myds_decode_candidates.inc $(wildcard include/*.h) $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc tests/test_q4_bf16_parity.m $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS) -o $@
+
+$(BENCH_DENSE_Q4_SITES): tests/bench_dense_q4_sites.m src/myds_metal.m src/myds_decode_candidates.inc $(wildcard include/*.h) $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) -Isrc tests/bench_dense_q4_sites.m $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS) -o $@
 
 .PHONY: build-decode-candidates
 build-decode-candidates: $(TEST_MOE_IQ2_LUT) $(TEST_ATTN_PACKED) $(TEST_TOPK_NAN_FUSE) $(TEST_BATCH2_Q8_SHARED)

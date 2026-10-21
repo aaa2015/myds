@@ -2549,6 +2549,7 @@ void myds_metal_cleanup(void) {
     for (unsigned i=0;i<2u;++i) g_pso_shared_q4_v41_nb[i]=nil;
     g_pso_moe_iq2_v41=nil;
     for (unsigned i=0;i<3u;++i) g_pso_dense_q4_v41[i]=nil;
+    g_dense_q4_mask = -1;
     g_pso_moe_pair_swiglu_batch_iq2_xxs = nil;
     g_pso_moe_sum6_batch_q2_k = nil;
     g_pso_moe_q2_sum_cache_prepare = nil;
@@ -4972,13 +4973,13 @@ static uint32_t dense_q4_nr0(void) {
  * bit3 generic Q4 F32 GEMV, bit4 generic Q4 BF16 GEMV, bit5 attn_output_a. */
 enum { DQ4_SITE_HEAD = 0, DQ4_SITE_QB = 1, DQ4_SITE_OB = 2, DQ4_SITE_GEMV_F32 = 3,
        DQ4_SITE_GEMV_BF16 = 4, DQ4_SITE_OUT_A = 5 };
+static int g_dense_q4_mask = -1;
 static uint32_t dense_q4_nr_site(unsigned site) {
-    static int mask = -1;
-    if (__builtin_expect(mask < 0, 0)) {
+    if (__builtin_expect(g_dense_q4_mask < 0, 0)) {
         const char *v = getenv("MYDS_DENSE_Q4_NR4_MASK");
-        mask = v ? (int)(strtol(v, NULL, 0) & 0x3f) : 0x3f;
+        g_dense_q4_mask = v ? (int)(strtol(v, NULL, 0) & 0x3f) : 0x3f;
     }
-    return (dense_q4_nr0() == 4u && ((mask >> site) & 1)) ? 4u : 2u;
+    return (dense_q4_nr0() == 4u && ((g_dense_q4_mask >> site) & 1)) ? 4u : 2u;
 }
 
 /* 2026-10-13 (参谋长): dense Q4_K bf16 GEMV 的 simdgroup 数（每个 threadgroup）。
