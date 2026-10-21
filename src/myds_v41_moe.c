@@ -1307,7 +1307,6 @@ int myds_dspark_moe(myds_metal_buffer_t *moe_out,
     uint32_t dim, uint32_t expert_dim, uint32_t n_routed_experts,
     uint32_t n_activated_experts, ggml_type gate_type, ggml_type up_type,
     ggml_type down_type, float clamp_val) {
-    (void)scratch_gate; (void)scratch_up; (void)scratch_down;
     if (!dim || !expert_dim || dim % 256u || expert_dim % 256u ||
         dim > INT32_MAX || expert_dim > INT32_MAX / 3u ||
         n_routed_experts < 3u || n_routed_experts > INT32_MAX ||
@@ -1317,7 +1316,9 @@ int myds_dspark_moe(myds_metal_buffer_t *moe_out,
      * 其它类型仍只接受 Q2_K —— 下面的几何/尺寸检查按 Q2_K 写。 */
     const bool is_mxfp4 = (gate_type == GGML_TYPE_MXFP4 && up_type == GGML_TYPE_MXFP4 &&
                            down_type == GGML_TYPE_MXFP4);
-    if (!is_mxfp4 && (gate_type != GGML_TYPE_Q2_K ||
+    const bool is_f16 = (gate_type == GGML_TYPE_F16 && up_type == GGML_TYPE_F16 &&
+                         down_type == GGML_TYPE_F16);
+    if (!is_mxfp4 && !is_f16 && (gate_type != GGML_TYPE_Q2_K ||
                       up_type != GGML_TYPE_Q2_K || down_type != GGML_TYPE_Q2_K)) return 0;
 
     /* 每 256 元素的块字节：Q2_K = 84，MXFP4 = 8 块 × 17 = 136 */
@@ -1341,11 +1342,27 @@ int myds_dspark_moe(myds_metal_buffer_t *moe_out,
      * 定义在 myds_metal.m 内部，与这里的 dspark_moe_args 不兼容。
      * 接线需要在 myds_metal.m 里新增一个公开入口，工作量约 1 天。
      * 在接线完成前，明确拒绝而不是静默跑错。 */
+    if (is_f16) {
+        /* 2026-10-22：F16 路径用生产验证过的 myds_metal_gemv 串起来，
+         * 慢但数值可信（用于测 1017 drafter 的真实接受率）。 */
+        return myds_metal_dspark_moe_f16(moe_out, x_in, gate_exps, up_exps, down_exps,
+                                         selected_ids, selected_weights,
+                                         scratch_gate, scratch_up, scratch_mid, scratch_down,
+                                         dim, expert_dim, n_routed_experts,
+                                         n_activated_experts, clamp_val);
+    }
+
     if (is_mxfp4) {
+        /* 2026-10-22 参谋长：MXFP4 路径已回滚。
+         * metal/moe.metal 里那两个 mxfp4 kernel 是随一个无关 commit 带进来的
+         * 死代码（ds4-dfm-rs 当前版本已无对应实现），host 侧从未接线、也从未
+         * 验证过数值。单测实测连 gate 一级就对不上（GPU 0.1717/0.5604/1.1181
+         * vs CPU -0.3074/0.1093/0.3795）⇒ 不可用。
+         * 1017 drafter 的 MXFP4 专家请先用 tools/requant 转成 Q2_K。 */
         static bool logged = false;
         if (!logged) {
-            MYDS_LOG_E("dspark MoE: MXFP4 experts need a host-side mul_mv_id entry "
-                       "(planned); refusing rather than producing wrong output");
+            MYDS_LOG_E("dspark MoE: MXFP4 experts unsupported (kernel unverified); "
+                       "requantize the drafter to Q2_K first");
             logged = true;
         }
         return 0;

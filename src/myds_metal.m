@@ -7656,8 +7656,12 @@ int myds_metal_moe_sum(
     uint32_t                   dim) {
     if (!out || !expert_outs || !weights || n_activated == 0 || dim == 0) return 0;
 
-    float *ov = (float *)out->ptr;
-    const float *eo = (const float *)expert_outs->ptr;
+    /* 2026-10-22 参谋长：out->ptr 是 view 的基址，必须加上 offset；
+     * 否则写进错误位置（单测表现为 MoE 输出全 0）。 */
+    float *ov = (float *)((char *)out->ptr + out->offset);
+    const float *eo = (const float *)((const char *)expert_outs->ptr + expert_outs->offset);
+    fprintf(stderr, "moe_sum: out.offset=%llu eo.offset=%llu dim=%u\n",
+            (unsigned long long)out->offset, (unsigned long long)expert_outs->offset, dim);
 
     memset(ov, 0, dim * sizeof(float));
     for (uint32_t k = 0; k < n_activated; k++) {
@@ -8047,4 +8051,99 @@ int myds_metal_pureread(myds_metal_buffer_t *dst, const myds_metal_buffer_t *src
         metal_dispatch(enc, "pureread", MTLSizeMake(ntg, 1, 1), MTLSizeMake(tgsz, 1, 1));
         return v41_finish(cb, enc);
     }
+}
+
+
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * 2026-10-22 参谋长：F16 routed MoE（DSpark drafter 验证用）
+ *
+ * 为什么需要：1017 drafter 的专家是 MXFP4，而 metal 里的 mxfp4 MoE kernel
+ * 是从 DS4 带进来的死代码（单测实测连 gate 一级都不对）；把它重量化成
+ * Q2_K 则因二次量化误差 31% 而接受率崩到 4.7%。
+ *
+ * 做法：不用任何 MoE 专用 kernel，直接用【生产验证过的】myds_metal_gemv
+ * 串起 3 个专家 × (gate, up, down) = 9 次 GEMV，配一次 swiglu + 累加。
+ * 慢，但每一步都是已知正确的路径 ⇒ 能干净地回答「1017 drafter 的接受率」。
+ * ═══════════════════════════════════════════════════════════════════════ */
+int myds_metal_dspark_moe_f16(
+    myds_metal_buffer_t       *moe_out,
+    const myds_metal_buffer_t *x_in,
+    const myds_metal_buffer_t *gate_exps,
+    const myds_metal_buffer_t *up_exps,
+    const myds_metal_buffer_t *down_exps,
+    const myds_metal_buffer_t *selected_ids,
+    const myds_metal_buffer_t *selected_weights,
+    myds_metal_buffer_t       *scratch_gate,
+    myds_metal_buffer_t       *scratch_up,
+    myds_metal_buffer_t       *scratch_mid,
+    myds_metal_buffer_t       *scratch_down,
+    uint32_t dim, uint32_t expert_dim, uint32_t n_routed_experts,
+    uint32_t n_activated_experts, float clamp_val) {
+    if (!moe_out || !x_in || !gate_exps || !up_exps || !down_exps ||
+        !selected_ids || !selected_weights || !scratch_gate || !scratch_up ||
+        !scratch_mid || !scratch_down) return 0;
+    if (!dim || !expert_dim || n_activated_experts < 1u || n_activated_experts > 8u) return 0;
+
+    /* F16 行宽 */
+    const size_t g_row = (size_t)dim * 2u;
+    const size_t g_exp = g_row * expert_dim;
+    const size_t d_row = (size_t)expert_dim * 2u;
+    const size_t d_exp = d_row * dim;
+    if (myds_metal_buffer_size(gate_exps) < g_exp * n_routed_experts ||
+        myds_metal_buffer_size(up_exps)   < g_exp * n_routed_experts ||
+        myds_metal_buffer_size(down_exps) < d_exp * n_routed_experts) return 0;
+
+    const int32_t *ids = (const int32_t *)myds_metal_buffer_data((myds_metal_buffer_t *)selected_ids);
+    const float *wts = (const float *)myds_metal_buffer_data((myds_metal_buffer_t *)selected_weights);
+    if (!ids || !wts) return 0;
+
+    /* 逐专家：gate/up → swiglu → down → 累加 */
+    for (uint32_t k = 0; k < n_activated_experts; k++) {
+        const int32_t e = ids[k];
+        if (e < 0 || (uint32_t)e >= n_routed_experts) return 0;
+        const float w = wts[k];
+
+        myds_metal_buffer_t *vg = (myds_metal_buffer_t *)myds_metal_buffer_sub_view(gate_exps, (size_t)e * g_exp, g_exp);
+        myds_metal_buffer_t *vu = (myds_metal_buffer_t *)myds_metal_buffer_sub_view(up_exps,   (size_t)e * g_exp, g_exp);
+        myds_metal_buffer_t *vd = (myds_metal_buffer_t *)myds_metal_buffer_sub_view(down_exps, (size_t)e * d_exp, d_exp);
+        if (!vg || !vu || !vd) return 0;
+
+        if (!myds_metal_gemv(scratch_gate, vg, x_in, expert_dim, dim, GGML_TYPE_F16)) return 0;
+        if (!myds_metal_gemv(scratch_up,   vu, x_in, expert_dim, dim, GGML_TYPE_F16)) return 0;
+        myds_metal_barrier_buffer(scratch_gate);
+        myds_metal_barrier_buffer(scratch_up);
+
+        /* swiglu + route weight；用 CPU 侧算（expert_dim 只有 2304，成本可接受） */
+        {
+            if (!myds_metal_synchronize()) return 0;
+            float *gp = (float *)myds_metal_buffer_data(scratch_gate);
+            float *up = (float *)myds_metal_buffer_data(scratch_up);
+            float *mp = (float *)myds_metal_buffer_data(scratch_mid);
+            if (!gp || !up || !mp) return 0;
+            for (uint32_t r = 0; r < expert_dim; r++) {
+                float gv = gp[r], uv = up[r];
+                if (clamp_val > 1.0e-6f) {
+                    if (gv > clamp_val) gv = clamp_val;
+                    if (uv > clamp_val) uv = clamp_val;
+                    if (uv < -clamp_val) uv = -clamp_val;
+                }
+                mp[r] = (gv / (1.0f + expf(-gv))) * uv * w;
+            }
+        }
+
+        if (!myds_metal_gemv(scratch_down, vd, scratch_mid, dim, expert_dim, GGML_TYPE_F16)) return 0;
+        if (!myds_metal_synchronize()) return 0;
+        {
+            float *dp = (float *)myds_metal_buffer_data(scratch_down);
+            float *op = (float *)myds_metal_buffer_data(moe_out);
+            if (!dp || !op) return 0;
+            if (k == 0) {
+                for (uint32_t i = 0; i < dim; i++) op[i] = dp[i];
+            } else {
+                for (uint32_t i = 0; i < dim; i++) op[i] += dp[i];
+            }
+        }
+    }
+    return 1;
 }

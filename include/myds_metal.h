@@ -695,6 +695,23 @@ int myds_metal_attn_output_a_batch(
     ggml_type                  weight_type);
 
 /* DeepSeek-MoE Expert Output Accumulation: y = sum(w_i * expert_out_i) */
+/* F16 routed MoE（DSpark drafter 验证用）。用生产验证过的 GEMV 串起来，
+ * 慢但数值可信。 */
+int myds_metal_dspark_moe_f16(
+    myds_metal_buffer_t       *moe_out,
+    const myds_metal_buffer_t *x_in,
+    const myds_metal_buffer_t *gate_exps,
+    const myds_metal_buffer_t *up_exps,
+    const myds_metal_buffer_t *down_exps,
+    const myds_metal_buffer_t *selected_ids,
+    const myds_metal_buffer_t *selected_weights,
+    myds_metal_buffer_t       *scratch_gate,
+    myds_metal_buffer_t       *scratch_up,
+    myds_metal_buffer_t       *scratch_mid,
+    myds_metal_buffer_t       *scratch_down,
+    uint32_t dim, uint32_t expert_dim, uint32_t n_routed_experts,
+    uint32_t n_activated_experts, float clamp_val);
+
 int myds_metal_moe_sum(
     myds_metal_buffer_t       *out,
     const myds_metal_buffer_t *expert_outs,

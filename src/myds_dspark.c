@@ -90,6 +90,27 @@ static myds_metal_buffer_t *dspark_mxfp4_to_f16_buf(const gguf_tensor_t *t) {
     return buf;
 }
 
+/* BF16 → F16 转换（2026-10-22 参谋长）
+ *
+ * 1017 drafter 的 markov_w1/w2 是 BF16 [256, 129280]，而 markov 那段代码
+ * 只接受 F16 / Q8_0 ⇒ BF16 会让 markov 被【整个跳过】，提案质量崩掉。
+ * BF16 与 F32 同指数宽度（8 位），F16 只有 5 位，所以走 BF16→F32→F16。 */
+static inline float dspark_bf16_to_f32(uint16_t h) {
+    const uint32_t bits = (uint32_t)h << 16;
+    float f; memcpy(&f, &bits, 4); return f;
+}
+static myds_metal_buffer_t *dspark_bf16_to_f16_buf(const gguf_tensor_t *t) {
+    if (!t || !t->data || !t->size_bytes) return NULL;
+    const size_t n = t->size_bytes / 2u;
+    myds_metal_buffer_t *buf = myds_metal_buffer_alloc(n * 2u);
+    if (!buf) return NULL;
+    const uint16_t *src = (const uint16_t *)t->data;
+    _Float16 *dst = (_Float16 *)myds_metal_buffer_data(buf);
+    if (!dst) { myds_metal_buffer_free(buf); return NULL; }
+    for (size_t i = 0; i < n; i++) dst[i] = (_Float16)dspark_bf16_to_f32(src[i]);
+    return buf;
+}
+
 static myds_metal_buffer_t *create_metal_buf(const gguf_tensor_t *t) {
     if (!t || !t->data || !t->size_bytes) return NULL;
     myds_metal_buffer_t *buf = myds_metal_buffer_from_ptr(t->data, t->size_bytes);
@@ -400,6 +421,7 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
     const gguf_tensor_t *t_main_norm = gguf_find_tensor(gguf, "mtp.0.main_norm.weight");
     if (!t_main_norm) t_main_norm = gguf_find_tensor(gguf, "dflash.hidden_norm.weight");
     if (!t_main_norm) t_main_norm = gguf_find_tensor(gguf, "enc.output_norm.weight");   /* 1017 */
+
     if (t_main_proj) {
         ds->main_proj = create_metal_buf(t_main_proj);
         ds->main_proj_type = t_main_proj->type;
@@ -466,7 +488,11 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
          * Q2_K。加载时把 MXFP4 展开成 F16 再交给 MoE —— 慢，但能跑，
          * 目的是先测出 1017 drafter 的真实接受率。
          * 仅当三个专家张量都是 MXFP4 时才转换；其它格式保持原样。 */
-        if (st->ffn_gate_exps_type == GGML_TYPE_MXFP4 && st->ffn_up_exps_type == GGML_TYPE_MXFP4 &&
+        /* 2026-10-22 参谋长：不再转换成 F16 —— MXFP4 已经有了原生 MoE 入口
+         * （myds_metal_dspark_moe_mxfp4）。保留此块仅作诊断开关：
+         * MYDS_DSPARK_MXFP4_AS_F16=1 时才启用（旧路径，供对照）。 */
+        if (getenv("MYDS_DSPARK_MXFP4_AS_F16") &&
+            st->ffn_gate_exps_type == GGML_TYPE_MXFP4 && st->ffn_up_exps_type == GGML_TYPE_MXFP4 &&
             st->ffn_down_exps_type == GGML_TYPE_MXFP4) {
             snprintf(name, sizeof(name), "blk.%u.ffn_gate_exps.weight", s);
             const gguf_tensor_t *tg = gguf_find_tensor(gguf, name);
@@ -513,6 +539,23 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
         t_fnorm = gguf_find_tensor(gguf, "output_norm.weight");
     }
     if (t_fnorm) ds->final_norm = create_metal_buf(t_fnorm);
+    /* 2026-10-22 诊断：1017 同时有 enc.output_norm 与 output_norm（都是 F32 [5120]），
+     * 形状无法区分谁是谁。用 MYDS_DSPARK_SWAP_NORM=1 把两者的角色对调。 */
+    {   const char *sw = getenv("MYDS_DSPARK_SWAP_NORM");
+        if (sw && *sw && strcmp(sw, "0") != 0) {
+            const gguf_tensor_t *a = gguf_find_tensor(gguf, "output_norm.weight");
+            const gguf_tensor_t *b = gguf_find_tensor(gguf, "enc.output_norm.weight");
+            if (a && b) {
+                if (ds->final_norm) myds_metal_buffer_free(ds->final_norm);
+                if (ds->main_norm) myds_metal_buffer_free(ds->main_norm);
+                ds->final_norm = create_metal_buf(b);   /* 原 enc.output_norm 当 final */
+                ds->main_norm  = create_metal_buf(a);   /* 原 output_norm 当 main  */
+                MYDS_LOG_I("dspark: SWAP_NORM — main=output_norm, final=enc.output_norm");
+            } else {
+                MYDS_LOG_E("dspark: SWAP_NORM requested but tensors missing");
+            }
+        }
+    }
 
     snprintf(name, sizeof(name), "mtp.%u.markov_head.markov_w1.weight", final_s);
     const gguf_tensor_t *t_mw1 = gguf_find_tensor(gguf, name);
@@ -525,8 +568,14 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
     if (!t_mw1) t_mw1 = gguf_find_tensor(gguf, "markov_w1.weight");   /* 1017 */
     }
     if (t_mw1) {
-        ds->markov_w1 = create_metal_buf(t_mw1);
-        ds->markov_w1_type = t_mw1->type;
+        if (t_mw1->type == GGML_TYPE_BF16) {
+            ds->markov_w1 = dspark_bf16_to_f16_buf(t_mw1);
+            ds->markov_w1_type = GGML_TYPE_F16;
+            MYDS_LOG_I("dspark: markov_w1 BF16 -> F16 (%.1f MB)", t_mw1->size_bytes / 1e6);
+        } else {
+            ds->markov_w1 = create_metal_buf(t_mw1);
+            ds->markov_w1_type = t_mw1->type;
+        }
     }
 
     snprintf(name, sizeof(name), "mtp.%u.markov_head.markov_w2.weight", final_s);
@@ -540,8 +589,14 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
     if (!t_mw2) t_mw2 = gguf_find_tensor(gguf, "markov_w2.weight");   /* 1017 */
     }
     if (t_mw2) {
-        ds->markov_w2 = create_metal_buf(t_mw2);
-        ds->markov_w2_type = t_mw2->type;
+        if (t_mw2->type == GGML_TYPE_BF16) {
+            ds->markov_w2 = dspark_bf16_to_f16_buf(t_mw2);
+            ds->markov_w2_type = GGML_TYPE_F16;
+            MYDS_LOG_I("dspark: markov_w2 BF16 -> F16 (%.1f MB)", t_mw2->size_bytes / 1e6);
+        } else {
+            ds->markov_w2 = create_metal_buf(t_mw2);
+            ds->markov_w2_type = t_mw2->type;
+        }
     }
 
     snprintf(name, sizeof(name), "mtp.%u.confidence_head.proj.weight", final_s);
