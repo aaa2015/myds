@@ -17,6 +17,13 @@ enum {
     MYDS_ENGRAM_DEAD = -1
 };
 
+/* CPU 卸载：engram_kv 的 F16 GEMV（M=25600, N=6144, 314.6 MB）。
+ * 实测 M2 Ultra 16 线程 219.8 GB/s ⇒ 1.43 ms；GPU 同形状 508 GB/s ⇒ 0.62 ms。
+ * CPU 满载时 GPU decode 掉 −0.02%（互不影响，实测）。
+ * 返回 1 成功。注意：累加顺序与 GPU kernel 不同，不保证 0-ULP。 */
+int myds_cpu_engram_project(const void *weights_f16, const float *x, float *y,
+                            uint32_t nthreads);
+
 typedef struct {
     const uint32_t *token_map;
     uint32_t vocab_size, compressed_vocab_size, pad_id;

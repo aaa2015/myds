@@ -12,7 +12,7 @@ BUILD_DIR = build
 #   而当时所有测试仍然全过，因为没人用到它们。
 SRCS_C = src/myds_cpu.c src/myds_log.c src/myds_gguf.c src/myds_tokenizer.c \
          src/myds_engine.c src/myds_v41.c src/myds_v41_gpu.c src/myds_v41_moe.c src/myds_v41_decode.c \
-         src/myds_engram.c src/myds_dspark.c \
+         src/myds_engram.c src/myds_engram_cpu.c src/myds_dspark.c \
          src/myds_vispre.c src/myds_visw.c src/myds_visfwd.c src/myds_vjob.c \
            src/myds_kvdsk.c \
          src/myds_server.c

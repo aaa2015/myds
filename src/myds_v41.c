@@ -4066,7 +4066,45 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
         }
         CHECK(myds_metal_attn_output_a_bf16(ctx->attn_low,base->attn_output_a,ctx->attn_heads,8,4096,1024,base->attn_output_a_type));
         const bool prestage_engram = engram_prestage_enabled && (il == 0 || il == 13);
+        /* 2026-10-21 实验（MYDS_ENGRAM_CPU=1）：engram_kv 的 F16 GEMV 交给 CPU。
+         * 数据流已就绪：engram_rows[e] 在 token 起始由 CPU 写入；权重 projection[e]->data
+         * 是 mmap 指针；输出 engram_kv 是 Shared buffer ⇒ CPU 直读直写，无需拷贝。
+         * 实测（M2 Ultra）：CPU 16 线程 219.8 GB/s（1.43 ms），GPU 508 GB/s（0.62 ms）；
+         * CPU 满载时 GPU decode 掉 −0.02%（互不影响）。
+         * 注意：累加顺序与 GPU kernel 不同，输出不保证逐位相同。 */
+        bool engram_cpu_done = false;
         if (prestage_engram) {
+            static int engram_cpu_mode = -1;
+            static uint32_t engram_cpu_nt = 16u;
+            if (engram_cpu_mode < 0) {
+                const char *ec = getenv("MYDS_ENGRAM_CPU");
+                const char *et = getenv("MYDS_ENGRAM_CPU_THREADS");
+                engram_cpu_mode = (ec && *ec && strcmp(ec, "0") != 0) ? 1 : 0;
+                if (et && *et) {
+                    long v = strtol(et, NULL, 10);
+                    if (v >= 1 && v <= 16) engram_cpu_nt = (uint32_t)v;
+                }
+                if (engram_cpu_mode)
+                    MYDS_LOG_I("Engram CPU projection enabled (%u threads)", engram_cpu_nt);
+            }
+            if (engram_cpu_mode) {
+                const uint32_t e0 = (il == 0) ? 0u : 1u;
+                const gguf_tensor_t *pt = v->engram->projection[e0];
+                if (pt && pt->data && pt->type == GGML_TYPE_F16) {
+                    const float *xrows = (const float *)myds_metal_buffer_data(g->engram_rows[e0]);
+                    float *ykv = (float *)myds_metal_buffer_data(g->engram_kv);
+                    if (!xrows || !ykv) goto fail;
+                    if (!myds_cpu_engram_project(pt->data, xrows, ykv, engram_cpu_nt)) {
+                        MYDS_LOG_E("Engram CPU projection failed; refusing fallback");
+                        goto fail;
+                    }
+                    engram_cpu_done = true;
+                    atomic_fetch_add_explicit(&engram_round_encoded, 1, memory_order_relaxed);
+                }
+            }
+        }
+
+        if (prestage_engram && !engram_cpu_done) {
             uint32_t e = (il == 0) ? 0u : 1u;
             if (engram_skip_round) {
                 atomic_fetch_add_explicit(&engram_round_requests, 1, memory_order_relaxed);
