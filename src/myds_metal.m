@@ -81,6 +81,11 @@ static id<MTLComputePipelineState> g_pso_moe_pair_swiglu_iq2_xxs = nil;
 static id<MTLComputePipelineState> g_pso_moe_pair_swiglu_popcnt_iq2_xxs = nil;
 static id<MTLComputePipelineState> g_pso_moe_sum6_q2_k = nil;
 static id<MTLComputePipelineState> g_pso_moe_sum6_v41_q2_k = nil;
+/* 2026-10-21 D3 重做：专家进 grid.z + double-single 累加（顺序无关） */
+static id<MTLComputePipelineState> g_pso_moe_sum6_expertz_ds = nil;
+static id<MTLComputePipelineState> g_pso_moe_sum6_merge_ds = nil;
+static myds_metal_buffer_t *g_moe_expertz_ds_parts = nil;
+static int g_moe_expertz_ds_enabled = -1;
 static bool g_moe_q2_v41 = false;
 static atomic_uint_fast64_t g_moe_q2_v41_requests = 0;
 static atomic_uint_fast64_t g_moe_q2_v41_encoded = 0;
@@ -2170,6 +2175,26 @@ int myds_metal_init(const char *shader_dir) {
             fn = [g_library newFunctionWithName:@"kernel_mul_mv_id_q2_K_sum6_v41_f32"
                                  constantValues:moe_down_constants error:&pso_err];
             if (fn) g_pso_moe_sum6_v41_q2_k = [g_device newComputePipelineStateWithFunction:fn error:&pso_err];
+            {
+                const char *ez = getenv("MYDS_MOE_EXPERTZ_DS");
+                g_moe_expertz_ds_enabled = (ez && *ez && strcmp(ez,"0") != 0) ? 1 : 0;
+                if (g_moe_expertz_ds_enabled) {
+                    pso_err = nil;
+                    fn = [g_library newFunctionWithName:@"kernel_mul_mv_id_q2_K_sum6_expertz_ds_f32"
+                                         constantValues:moe_down_constants error:&pso_err];
+                    if (fn) g_pso_moe_sum6_expertz_ds = [g_device newComputePipelineStateWithFunction:fn error:&pso_err];
+                    pso_err = nil;
+                    fn = [g_library newFunctionWithName:@"kernel_mul_mv_id_q2_K_sum6_merge_ds_f32"
+                                         constantValues:moe_down_constants error:&pso_err];
+                    if (fn) g_pso_moe_sum6_merge_ds = [g_device newComputePipelineStateWithFunction:fn error:&pso_err];
+                    if (!g_pso_moe_sum6_expertz_ds || !g_pso_moe_sum6_merge_ds) {
+                        fprintf(stderr, "myds_metal: MYDS_MOE_EXPERTZ_DS PSO unavailable; disabling\n");
+                        g_moe_expertz_ds_enabled = 0;
+                    } else {
+                        fprintf(stderr, "myds_metal: EXPERTZ_DS active (grid.z=6, double-single)\n");
+                    }
+                }
+            }
             if (!moe_q2_v41_geometry() || !moe_q2_v41_producer_geometry(moe_iq2_constant_lut)) {
                 fprintf(stderr, "myds_metal: explicitly requested V4.1 Q2 down PSO unavailable (%s)\n",
                     pso_err.localizedDescription.UTF8String ?: "function or resource limit");

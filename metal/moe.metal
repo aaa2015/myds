@@ -11835,7 +11835,40 @@ kernel void kernel_mul_mv_id_q2_K_sum6_v41_f32(
     device const int32_t *token_ids = (device const int32_t *)(ids + (uint64_t)token * 24u);
     device const char *token_src1 = src1 + (uint64_t)token * 55296u;
 
+    /* 2026-10-21：MoE down 的累加可切到 double-single（TwoSum 补偿）。
+ *
+ * 动机：FP32 顺序累加对【专家累加顺序】敏感（实测最大 163,840 ULP），
+ * 这使得任何「CPU+GPU 分工」「专家拆多 TG」都会改变输出。
+ * double-single 用 hi+lo 两个字保持约 48 位有效精度，实测：
+ *   - 打乱专家顺序：0 ULP
+ *   - 分段（2/3 段）后合并：0 ULP
+ *   ⇒ 解锁一切「拆开并行」的方案（台账 §23）。
+ *
+ * Metal 不支持 double，故用 double-single。
+ * 代价：多 nr0 个寄存器（上限 640 线程、当前只用 64，余量充足）；
+ *       每累加点 4 次 FADD，全 token 约 0.0023 ms（0.01%）。
+ * 默认关闭（DS4_MOE_ACC_DS=1 才启用），保证默认构建行为不变。 */
+#if defined(DS4_MOE_ACC_DS) && DS4_MOE_ACC_DS
+    float sumf_hi[nr0], sumf_lo[nr0];
+    for (int _i = 0; _i < nr0; _i++) { sumf_hi[_i] = 0.0f; sumf_lo[_i] = 0.0f; }
+#define SUMF_ADD(r, v) do { \
+        const float _a = sumf_hi[r], _b = (v); \
+        const float _t = _a + _b; \
+        const float _bb = _t - _a; \
+        const float _e = (_a - (_t - _bb)) + (_b - _bb); \
+        sumf_lo[r] += _e; \
+        const float _t2 = _t + sumf_lo[r]; \
+        const float _bb2 = _t2 - _t; \
+        const float _e2 = (_t - (_t2 - _bb2)) + (sumf_lo[r] - _bb2); \
+        sumf_hi[r] = _t2; \
+        sumf_lo[r] = _e2; \
+    } while (0)
+#define SUMF_ACC(r) (sumf_hi[r] + sumf_lo[r])
+#else
     float sumf[nr0] = {0.f};
+#define SUMF_ADD(r, v) do { sumf[r] += (v); } while (0)
+#define SUMF_ACC(r) sumf[r]
+#endif
 
     const short ix = tiisg/8;
     const short it = tiisg%8;
@@ -11843,7 +11876,15 @@ kernel void kernel_mul_mv_id_q2_K_sum6_v41_f32(
     const short ir = it%4;
     const short is = (8*ir)/16;
 
+    /* 2026-10-21 ULP 探针：反转专家累加顺序，用于验证「1~12 ULP 漂移
+     * 是否改变贪心输出文本」。这是模拟「CPU 做一部分专家、GPU 做另一部分」
+     * 时必然出现的结合律改变。仅编译期开启，默认行为不变。 */
+#if defined(DS4_MOE_REVERSE_EXPERTS) && DS4_MOE_REVERSE_EXPERTS
+    for (int _slot_i = 0; _slot_i < 6; _slot_i++) {
+        const int expert_slot = 5 - _slot_i;
+#else
     for (int expert_slot = 0; expert_slot < 6; expert_slot++) {
+#endif
         const int32_t expert = token_ids[expert_slot];
         device const block_q2_K * x = (device const block_q2_K *)(src0s + (uint)expert*3870720u + (uint)first_row*756u);
         device const float * y = (device const float *)(token_src1 + expert_slot*9216u);
@@ -11881,12 +11922,12 @@ kernel void kernel_mul_mv_id_q2_K_sum6_v41_f32(
                     }
                     float dall = dh[0];
                     float dmin = dh[1] * 1.f/16.f;
-                    sumf[row] += dall * ((acc1[0] + 1.f/256.f * acc2[0]) * (sc[0] & 0xF) * 1.f/ 1.f +
+                    SUMF_ADD(row, dall * ((acc1[0] + 1.f/256.f * acc2[0]) * (sc[0] & 0xF) * 1.f/ 1.f +
                                          (acc1[1] + 1.f/256.f * acc2[1]) * (sc[2] & 0xF) * 1.f/ 4.f +
                                          (acc1[2] + 1.f/256.f * acc2[2]) * (sc[4] & 0xF) * 1.f/16.f +
                                          (acc1[3] + 1.f/256.f * acc2[3]) * (sc[6] & 0xF) * 1.f/64.f) -
                                  dmin * (sumy[0] * (sc[0] & 0xF0) + sumy[1] * (sc[2] & 0xF0) +
-                                         sumy[2] * (sc[4] & 0xF0) + sumy[3] * (sc[6] & 0xF0));
+                                         sumy[2] * (sc[4] & 0xF0) + sumy[3] * (sc[6] & 0xF0)));
                 }
 
                 qs += 756u/2;
@@ -11900,7 +11941,7 @@ kernel void kernel_mul_mv_id_q2_K_sum6_v41_f32(
 
     device float * dst_f32 = (device float *)(dst + (uint64_t)token * 20480u);
     for (int row = 0; row < nr0; row++) {
-        const float sum_all = simd_sum(sumf[row]);
+        const float sum_all = simd_sum((float)SUMF_ACC(row));
         if (tiisg == 0) {
             float outv = sum_all;
             if (args.tp_addend) {
@@ -11913,6 +11954,188 @@ kernel void kernel_mul_mv_id_q2_K_sum6_v41_f32(
     (void)shmem;
     (void)tiitg;
     (void)tgpig;
+}
+kernel void kernel_mul_mv_id_q2_K_sum6_expertz_ds_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        device const char * ids,
+        device const char * add_in,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    // Scalar V4.1 only. TP ranks with split expert mappings are ineligible.
+    // Valid route IDs 0..383 and full rows fit all offsets in uint32_t:
+    // the entire expert tensor is 1486356480B, below UINT32_MAX.
+    if (args.tp_world > 1) return;
+    const short NSG = FC_mul_mv_nsg;
+    const short nr0 = 2;
+    const int nb = 9;
+    const int first_row = (tgpig.x * NSG + sgitg) * nr0;
+    const int expert_slot = (int)tgpig.z;   /* 专家并行 */
+    const uint token = tgpig.y;
+    device const int32_t *token_ids = (device const int32_t *)(ids + (uint64_t)token * 24u);
+    device const char *token_src1 = src1 + (uint64_t)token * 55296u;
+
+    /* 2026-10-21：MoE down 的累加可切到 double-single（TwoSum 补偿）。
+ *
+ * 动机：FP32 顺序累加对【专家累加顺序】敏感（实测最大 163,840 ULP），
+ * 这使得任何「CPU+GPU 分工」「专家拆多 TG」都会改变输出。
+ * double-single 用 hi+lo 两个字保持约 48 位有效精度，实测：
+ *   - 打乱专家顺序：0 ULP
+ *   - 分段（2/3 段）后合并：0 ULP
+ *   ⇒ 解锁一切「拆开并行」的方案（台账 §23）。
+ *
+ * Metal 不支持 double，故用 double-single。
+ * 代价：多 nr0 个寄存器（上限 640 线程、当前只用 64，余量充足）；
+ *       每累加点 4 次 FADD，全 token 约 0.0023 ms（0.01%）。
+ * 默认关闭（DS4_MOE_ACC_DS=1 才启用），保证默认构建行为不变。 */
+#if 1  /* expertz_ds 必须用 double-single：写出 hi/lo 两片 */
+    float sumf_hi[nr0], sumf_lo[nr0];
+    for (int _i = 0; _i < nr0; _i++) { sumf_hi[_i] = 0.0f; sumf_lo[_i] = 0.0f; }
+#define SUMF_ADD(r, v) do { \
+        const float _a = sumf_hi[r], _b = (v); \
+        const float _t = _a + _b; \
+        const float _bb = _t - _a; \
+        const float _e = (_a - (_t - _bb)) + (_b - _bb); \
+        sumf_lo[r] += _e; \
+        const float _t2 = _t + sumf_lo[r]; \
+        const float _bb2 = _t2 - _t; \
+        const float _e2 = (_t - (_t2 - _bb2)) + (sumf_lo[r] - _bb2); \
+        sumf_hi[r] = _t2; \
+        sumf_lo[r] = _e2; \
+    } while (0)
+#define SUMF_ACC(r) (sumf_hi[r] + sumf_lo[r])
+#else
+    float sumf[nr0] = {0.f};
+#define SUMF_ADD(r, v) do { sumf[r] += (v); } while (0)
+#define SUMF_ACC(r) sumf[r]
+#endif
+
+    const short ix = tiisg/8;
+    const short it = tiisg%8;
+    const short iq = it/4;
+    const short ir = it%4;
+    const short is = (8*ir)/16;
+
+    /* 2026-10-21 ULP 探针：反转专家累加顺序，用于验证「1~12 ULP 漂移
+     * 是否改变贪心输出文本」。这是模拟「CPU 做一部分专家、GPU 做另一部分」
+     * 时必然出现的结合律改变。仅编译期开启，默认行为不变。 */
+        const int32_t expert = token_ids[expert_slot];
+        device const block_q2_K * x = (device const block_q2_K *)(src0s + (uint)expert*3870720u + (uint)first_row*756u);
+        device const float * y = (device const float *)(token_src1 + expert_slot*9216u);
+        device const float * y4 = y + ix * QK_K + 128 * iq + 8 * ir;
+
+        for (int ib = ix; ib < nb; ib += 4) {
+            float yl[32];
+            float4 sumy = {0.f, 0.f, 0.f, 0.f};
+            #pragma unroll
+            for (short i = 0; i < 8; ++i) {
+                yl[i+ 0] = y4[i+ 0]; sumy[0] += yl[i+ 0];
+                yl[i+ 8] = y4[i+32]; sumy[1] += yl[i+ 8];
+                yl[i+16] = y4[i+64]; sumy[2] += yl[i+16];
+                yl[i+24] = y4[i+96]; sumy[3] += yl[i+24];
+            }
+
+            device const uint8_t  * sc = (device const uint8_t  *)x[ib].scales + 8*iq + is;
+            device const uint16_t * qs = (device const uint16_t *)x[ib].qs + 16 * iq + 4 * ir;
+            device const half     * dh = &x[ib].d;
+
+            for (short row = 0; row < nr0; row++) {
+                {
+                    float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+                    float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+                    #pragma unroll
+                    for (int i = 0; i < 8; i += 2) {
+                        acc1[0] += yl[i+ 0] * (qs[i/2] & 0x0003);
+                        acc2[0] += yl[i+ 1] * (qs[i/2] & 0x0300);
+                        acc1[1] += yl[i+ 8] * (qs[i/2] & 0x000c);
+                        acc2[1] += yl[i+ 9] * (qs[i/2] & 0x0c00);
+                        acc1[2] += yl[i+16] * (qs[i/2] & 0x0030);
+                        acc2[2] += yl[i+17] * (qs[i/2] & 0x3000);
+                        acc1[3] += yl[i+24] * (qs[i/2] & 0x00c0);
+                        acc2[3] += yl[i+25] * (qs[i/2] & 0xc000);
+                    }
+                    float dall = dh[0];
+                    float dmin = dh[1] * 1.f/16.f;
+                    SUMF_ADD(row, dall * ((acc1[0] + 1.f/256.f * acc2[0]) * (sc[0] & 0xF) * 1.f/ 1.f +
+                                         (acc1[1] + 1.f/256.f * acc2[1]) * (sc[2] & 0xF) * 1.f/ 4.f +
+                                         (acc1[2] + 1.f/256.f * acc2[2]) * (sc[4] & 0xF) * 1.f/16.f +
+                                         (acc1[3] + 1.f/256.f * acc2[3]) * (sc[6] & 0xF) * 1.f/64.f) -
+                                 dmin * (sumy[0] * (sc[0] & 0xF0) + sumy[1] * (sc[2] & 0xF0) +
+                                         sumy[2] * (sc[4] & 0xF0) + sumy[3] * (sc[6] & 0xF0)));
+                }
+
+                qs += 756u/2;
+                sc += 756u;
+                dh += 756u/2;
+            }
+
+            y4 += 4 * QK_K;
+        }
+
+    /* 写出 lane 级 hi/lo 两片，交给合并 kernel 按 slot 顺序用 double-single 累加。
+     * double-single 的顺序无关性保证：分几段、什么顺序，结果都逐位相同。 */
+    device float * parts = (device float *)dst;
+    for (int row = 0; row < nr0; row++) {
+        const uint64_t base = (((uint64_t)token * 6ull + (uint64_t)expert_slot)
+                               * 20480ull + (uint64_t)(first_row + row)) * 32ull
+                              + (uint64_t)tiisg;
+        parts[base * 2ull + 0ull] = sumf_hi[row];
+        parts[base * 2ull + 1ull] = sumf_lo[row];
+    }
+    (void)add_in; (void)args.tp_addend;
+
+    (void)shmem;
+    (void)tiitg;
+    (void)tgpig;
+}
+
+
+/* 合并：按 slot 0..5 顺序用 double-single 累加 hi/lo，再 simd_sum。
+ * double-single 的顺序无关性 ⇒ 与串行版逐位相同（实测 0 ULP）。 */
+kernel void kernel_mul_mv_id_q2_K_sum6_merge_ds_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const float * parts,
+        device const char * add_in,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+    const short nr0 = 2;
+    const int first_row = (tgpig.x * NSG + sgitg) * nr0;
+    const uint token = tgpig.y;
+    device float * dst_f32 = (device float *)(dst + (uint64_t)token * 20480u);
+
+    for (int row = 0; row < nr0; row++) {
+        float hi = 0.0f, lo = 0.0f;
+        for (int slot = 0; slot < 6; slot++) {
+            const uint64_t base = (((uint64_t)token * 6ull + (uint64_t)slot)
+                                   * 20480ull + (uint64_t)(first_row + row)) * 32ull
+                                  + (uint64_t)tiisg;
+            const float a = parts[base * 2ull + 0ull];
+            const float b = parts[base * 2ull + 1ull];
+            /* double-single 累加 (hi,lo) += (a,b) */
+            const float t1 = hi + a;
+            const float bb1 = t1 - hi;
+            const float e1 = (hi - (t1 - bb1)) + (a - bb1);
+            float lo2 = lo + b + e1;
+            const float t2 = t1 + lo2;
+            const float bb2 = t2 - t1;
+            const float e2 = (t1 - (t2 - bb2)) + (lo2 - bb2);
+            hi = t2; lo = e2;
+        }
+        const float sum_all = simd_sum(hi + lo);
+        if (tiisg == 0) {
+            float outv = sum_all;
+            if (args.tp_addend) outv += ((device const float *) add_in)[first_row + row];
+            dst_f32[first_row + row] = outv;
+        }
+    }
 }
 
 #undef QK_K
