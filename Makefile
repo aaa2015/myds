@@ -529,6 +529,9 @@ $(BENCH_SYNTHETIC): $(BUILD_DIR)/bench_synthetic.o $(OBJS_C) $(OBJS_M) $(METALLI
 $(BUILD_DIR)/bench_metal.o: tools/bench_metal.m | $(BUILD_DIR)
 	$(CC) $(OBJCFLAGS) -MMD -MP -c $< -o $@
 
+$(BIN_DIR)/bench_moe_pureread: tests/bench_moe_pureread.m $(OBJS_C) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) -Isrc $< $(OBJS_C) $(OBJS_M) $(LDFLAGS) -o $@
+
 $(BIN_DIR)/bench_moe_locality: tests/bench_moe_locality.m $(OBJS_C) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc $< $(OBJS_C) $(OBJS_M) $(LDFLAGS) -o $@
 

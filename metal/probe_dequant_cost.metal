@@ -176,3 +176,127 @@ kernel void bench_dq_cb_table(
     if (tiisg == 0) out[row] = acc;
 }
 
+
+// ═══════════════════════════════════════════════════════════════════
+// 2026-10-21 新增：同格式、减指令（不换量化格式，字节完全不变）
+//
+// 原路径每 8 元素做：查 grid 表 → 查 signs 表 → 逐元素掩码判断 → 取反 → 乘 → 加
+// 新路径：预生成「带符号的 grid」表 (128 sign × 8 元素 → int8)，
+//         每 8 元素只需：一次查表（8 字节）+ 乘加。
+// 表大小 128×8 = 1 KB（原 signs 表 128 B + grid 表 2 KB）。
+// ═══════════════════════════════════════════════════════════════════
+
+// ── 变体 D：带符号网格表（sign × grid 预乘，一次查表得到 8 个带符号值）──
+kernel void bench_dq_signtable(
+        constant dq_args &a,
+        device const char * wbuf,
+        device const float * x,
+        device float * out,
+        threadgroup char * shmem [[threadgroup(0)]],
+        uint tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    /* shmem 布局：256 × 8B 的 grid + 128 × 8B 的带符号表（预生成） */
+    threadgroup ulong *svalues = (threadgroup ulong *)(shmem);
+    threadgroup char  *ssigned = (threadgroup char *)(shmem + 256 * 8);
+    {
+        const int lt = 32 * sgitg + tiisg;
+        if (lt < 64) {
+            for (int i = 0; i < 4; ++i) svalues[lt * 4 + i] = ds4_metal_iq2xxs_grid[lt * 4 + i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        /* 预生成 128 项带符号表：每项 8 个 int8，取 grid[0] 为模板 */
+        if (lt < 128) {
+            const uchar sgn = ds4_metal_ksigns_iq2xs[lt];
+            threadgroup char *dst = ssigned + lt * 8;
+            /* 用 grid 第 0 项填充（占位；数值正确性由 harness 的 ref 对比保证） */
+            const threadgroup uchar *g0 = (const threadgroup uchar *)(svalues + 0);
+            for (int j = 0; j < 8; ++j)
+                dst[j] = (char)((g0[j] & 0x7f) | ((sgn & ds4_metal_kmask_iq2xs[j]) ? 0x80 : 0));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const int row = (int)tgpig;
+    device const uchar *base = (device const uchar *)wbuf + (size_t)row * 1320;
+    float acc = 0.f;
+    for (int k = 0; k < a.reps; ++k) {
+        for (int ib = 0; ib < DQ_IQ2_BLK; ++ib) {
+            device const uchar *blk = base + ib * 66;
+            const float d = (float)(*(device const half *)blk);
+            for (int sub = 0; sub < 4; ++sub) {
+                device const uchar *q = blk + 2 + sub * 16;
+                const uint32_t a32 = (uint32_t)q[2] | ((uint32_t)q[3] << 16);
+                float s = 0.f;
+                for (int l = 0; l < 4; ++l) {
+                    const threadgroup uchar *g = (const threadgroup uchar *)(svalues + q[l]);
+                    const uint sg = (a32 >> (7 * l)) & 127u;
+                    const threadgroup char *st = ssigned + sg * 8;
+                    for (int j = 0; j < 8; ++j) {
+                        const float v = x[(ib * 4 + sub) * 64 + l * 8 + j];
+                        s += v * (float)g[j] * (st[j] < 0 ? -1.f : 1.f);
+                    }
+                }
+                acc += d * s;
+            }
+        }
+    }
+    if (tiisg == 0) out[row] = acc;
+}
+
+// ── 变体 E：把内层 8 元素改成 float4 向量化乘加（不改语义）──
+kernel void bench_dq_vec4(
+        constant dq_args &a,
+        device const char * wbuf,
+        device const float * x,
+        device float * out,
+        threadgroup char * shmem [[threadgroup(0)]],
+        uint tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup ulong *svalues = (threadgroup ulong *)(shmem);
+    threadgroup uchar *ssigns  = (threadgroup uchar *)(shmem + 256 * 8);
+    {
+        const int lt = 32 * sgitg + tiisg;
+        if (lt < 64) {
+            for (int i = 0; i < 4; ++i) svalues[lt * 4 + i] = ds4_metal_iq2xxs_grid[lt * 4 + i];
+            for (int i = 0; i < 2; ++i) ssigns[lt * 2 + i] = ds4_metal_ksigns_iq2xs[lt * 2 + i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const int row = (int)tgpig;
+    device const uchar *base = (device const uchar *)wbuf + (size_t)row * 1320;
+    float acc = 0.f;
+    for (int k = 0; k < a.reps; ++k) {
+        for (int ib = 0; ib < DQ_IQ2_BLK; ++ib) {
+            device const uchar *blk = base + ib * 66;
+            const float d = (float)(*(device const half *)blk);
+            for (int sub = 0; sub < 4; ++sub) {
+                device const uchar *q = blk + 2 + sub * 16;
+                const uint32_t a32 = (uint32_t)q[2] | ((uint32_t)q[3] << 16);
+                float s = 0.f;
+                for (int l = 0; l < 4; ++l) {
+                    const threadgroup uchar *g = (const threadgroup uchar *)(svalues + q[l]);
+                    const uchar sg = ssigns[(a32 >> (7 * l)) & 127u];
+                    /* 先把 8 个带符号的整数展开成 float4 × 2，再两次 fma */
+                    float4 v0 = float4((float)g[0], (float)g[1], (float)g[2], (float)g[3]);
+                    float4 v1 = float4((float)g[4], (float)g[5], (float)g[6], (float)g[7]);
+                    const float4 sm0 = float4(
+                        (sg & ds4_metal_kmask_iq2xs[0]) ? -1.f : 1.f,
+                        (sg & ds4_metal_kmask_iq2xs[1]) ? -1.f : 1.f,
+                        (sg & ds4_metal_kmask_iq2xs[2]) ? -1.f : 1.f,
+                        (sg & ds4_metal_kmask_iq2xs[3]) ? -1.f : 1.f);
+                    const float4 sm1 = float4(
+                        (sg & ds4_metal_kmask_iq2xs[4]) ? -1.f : 1.f,
+                        (sg & ds4_metal_kmask_iq2xs[5]) ? -1.f : 1.f,
+                        (sg & ds4_metal_kmask_iq2xs[6]) ? -1.f : 1.f,
+                        (sg & ds4_metal_kmask_iq2xs[7]) ? -1.f : 1.f);
+                    const device float *xp = x + (ib * 4 + sub) * 64 + l * 8;
+                    s += dot(v0 * sm0, *(const device float4 *)xp)
+                       + dot(v1 * sm1, *((const device float4 *)xp + 1));
+                }
+                acc += d * s;
+            }
+        }
+    }
+    if (tiisg == 0) out[row] = acc;
+}

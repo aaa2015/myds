@@ -28,7 +28,7 @@ int main(int argc, char **argv) {
         id<MTLLibrary> lib = [dev newLibraryWithURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:argv[1]]] error:&err];
         if (!lib) { fprintf(stderr, "metallib: %s\n", err.localizedDescription.UTF8String); return 1; }
 
-        NSArray<NSString *> *names = @[@"bench_dq_ref_iq2", @"bench_dq_vec_iq2", @"bench_dq_q4code", @"bench_dq_cb_table"];
+        NSArray<NSString *> *names = @[@"bench_dq_ref_iq2", @"bench_dq_vec_iq2", @"bench_dq_signtable", @"bench_dq_vec4"];
         NSMutableArray<id<MTLComputePipelineState>> *psos = [NSMutableArray new];
         for (NSString *n in names) {
             id<MTLFunction> fn = [lib newFunctionWithName:n];

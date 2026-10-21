@@ -32,6 +32,7 @@ SHADER_FILES = [
     "repeat.metal",
     "glu.metal",
     "norm.metal",
+    "pureread.metal",
     "bin.metal",
     "set_rows.metal",
     "myds_chunk.metal",

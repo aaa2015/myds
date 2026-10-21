@@ -1113,6 +1113,7 @@ static int kprof_env(void) {
 /* 便宜的、无副作用的 kprof 判定：给「kprof 与并发路径互斥」的调用点用。
  * myds_metal_kprof_enabled() 会触发 kprof_init（分配 sample buffer），
  * 不适合在每层热路径里调用。 */
+
 int myds_metal_kprof_exclusive(void) { return kprof_env(); }
 
 
@@ -8015,4 +8016,35 @@ int myds_metal_routed_moe_down_overlap_nbhc_scoped(
     return routed_moe_down_overlap_scoped_impl(moe_out,x_in,gate_exps,up_exps,down_exps,selected_ids,selected_weights,
         scratch_gate,scratch_up,scratch_mid,scratch_down,dim,expert_dim,n_routed_experts,n_activated_experts,
         gate_type,up_type,down_type,clamp_val,ordinary_decode_allowed,shared_out,shared_weight,shared_input,shared_type,true);
+}
+
+/* 诊断：纯读带宽（不做任何解码）。用于判定 MoE 的瓶颈是解码还是访存。 */
+struct pureread_args_host { uint64_t n_bytes, base_off, stride; };
+int myds_metal_pureread(myds_metal_buffer_t *dst, const myds_metal_buffer_t *src,
+                        uint64_t n_bytes, uint64_t base_off, uint64_t stride,
+                        uint32_t nthreads) {
+    if (!g_library || !dst || !src || !nthreads) return 0;
+    static id<MTLComputePipelineState> pso = nil;
+    if (!pso) {
+        id<MTLFunction> fn = [g_library newFunctionWithName:@"kernel_pureread_f32"];
+        if (!fn) return 0;
+        pso = [g_device newComputePipelineStateWithFunction:fn error:nil];
+        if (!pso) return 0;
+    }
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = g_batch_cb ?: [g_queue commandBuffer];
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
+        if (!enc) return 0;
+        struct pureread_args_host a = { n_bytes, base_off, stride };
+        [enc setComputePipelineState:pso];
+        [enc setBytes:&a length:sizeof(a) atIndex:0];
+        [enc setBuffer:src->mtl_buf offset:src->offset atIndex:1];
+        [enc setBuffer:dst->mtl_buf offset:dst->offset atIndex:2];
+        /* nthreads 是总线程数，不是线程组数：按 256 线程/组切 */
+        const uint32_t tgsz = 256u;
+        const uint32_t ntg = (nthreads + tgsz - 1u) / tgsz;
+        metal_dispatch(enc, "pureread", MTLSizeMake(ntg, 1, 1), MTLSizeMake(tgsz, 1, 1));
+        return v41_finish(cb, enc);
+    }
 }

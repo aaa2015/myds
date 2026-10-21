@@ -176,6 +176,10 @@ int  myds_metal_kprof_enabled(void);
 /* kprof 采样与并发 overlap 路径互斥（hc_stages_scope 要求 !g_kp_on）。
  * 调用点用它做前置判定，避免走到 fail-closed 分支。无副作用、可热路径调用。 */
 int  myds_metal_kprof_exclusive(void);
+/* 诊断：纯读带宽（不做解码），用于判定 MoE 瓶颈是解码还是访存。 */
+int myds_metal_pureread(myds_metal_buffer_t *dst, const myds_metal_buffer_t *src,
+                        uint64_t n_bytes, uint64_t base_off, uint64_t stride,
+                        uint32_t nthreads);
 void myds_metal_kprof_arm(int on);
 int  myds_metal_kprof_report(FILE *out, const char *label, uint32_t tokens);
 /* Measure the fixed per-encoder bracket cost (median of 256 trivial kernels, one
