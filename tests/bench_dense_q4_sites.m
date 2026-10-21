@@ -162,11 +162,81 @@ static void test_attn_out_a_site(void) {
            "attn_output_a", rank, group_dim, us_nr2, bw_nr2, us_nr4, bw_nr4, diff_pct);
 }
 
+static double measure_gemv_bf16(uint32_t out_dim, uint32_t in_dim,
+                                const char *nr0_val, const char *mask_val) {
+    setenv("MYDS_DENSE_Q4_V41", "1", 1);
+    setenv("MYDS_DENSE_Q4_V41_NB", "1", 1);
+    setenv("MYDS_DENSE_Q4_NR0", nr0_val, 1);
+    setenv("MYDS_DENSE_Q4_NR4_MASK", mask_val, 1);
+
+    if (!myds_metal_init(NULL)) {
+        fprintf(stderr, "Failed to init metal for gemv_bf16\n");
+        exit(1);
+    }
+
+    size_t row_bytes = (in_dim / 256u) * 144u;
+    size_t w_bytes = row_bytes * out_dim;
+    size_t in_bytes = in_dim * sizeof(float);
+    size_t out_bytes = out_dim * sizeof(float);
+
+    myds_metal_buffer_t *w = myds_metal_buffer_alloc(w_bytes);
+    myds_metal_buffer_t *in = myds_metal_buffer_alloc(in_bytes);
+    myds_metal_buffer_t *out = myds_metal_buffer_alloc(out_bytes);
+
+    fill_q4_k(myds_metal_buffer_data(w), w_bytes, 123);
+    fill_f32(myds_metal_buffer_data(in), in_dim, 456);
+
+    extern int myds_metal_v41_gemv_bf16(myds_metal_buffer_t *out,
+        const myds_metal_buffer_t *weight, const myds_metal_buffer_t *input,
+        uint32_t out_dim, uint32_t in_dim, ggml_type type);
+
+    // Warmup
+    for (int i = 0; i < 20; i++) {
+        myds_metal_begin_batch();
+        myds_metal_v41_gemv_bf16(out, w, in, out_dim, in_dim, GGML_TYPE_Q4_K);
+        myds_metal_commit_batch();
+    }
+
+    const int iters = 1000;
+    double t0 = now_us();
+    for (int i = 0; i < iters; i++) {
+        myds_metal_begin_batch();
+        myds_metal_v41_gemv_bf16(out, w, in, out_dim, in_dim, GGML_TYPE_Q4_K);
+        myds_metal_commit_batch();
+    }
+    double t1 = now_us();
+    double avg_us = (t1 - t0) / iters;
+
+    myds_metal_buffer_free(w);
+    myds_metal_buffer_free(in);
+    myds_metal_buffer_free(out);
+    myds_metal_cleanup();
+
+    return avg_us;
+}
+
+static void test_gemv_site(const char *name, uint32_t out_dim, uint32_t in_dim) {
+    double us_nr2 = measure_gemv_bf16(out_dim, in_dim, "2", "0x10");
+    double us_nr4 = measure_gemv_bf16(out_dim, in_dim, "4", "0x10");
+
+    size_t row_bytes = (in_dim / 256u) * 144u;
+    size_t total_bytes = row_bytes * out_dim + (in_dim + out_dim) * sizeof(float);
+    double gb = (double)total_bytes * 1e-9;
+    double bw_nr2 = gb / (us_nr2 * 1e-6);
+    double bw_nr4 = gb / (us_nr4 * 1e-6);
+    double diff_pct = (us_nr4 - us_nr2) / us_nr2 * 100.0;
+
+    printf("%-16s [site 4, %6ux%5u]: NR2 = %6.2f us (%5.1f GB/s) | NR4 = %6.2f us (%5.1f GB/s) | delta = %+6.2f%%\n",
+           name, out_dim, in_dim, us_nr2, bw_nr2, us_nr4, bw_nr4, diff_pct);
+}
+
 int main(void) {
     printf("=== Dense Q4_K Isolated Per-Site Microbenchmarks (1000 iters) ===\n");
     test_dense_site("attn_output_b", 5120, 8192, true, 2);
     test_dense_site("attn_q_b", 32768, 1280, true, 1);
     test_dense_site("lm_head", 129280, 5120, false, 0);
+    test_gemv_site("attn_q_a", 1280, 5120);
+    test_gemv_site("attn_kv", 512, 5120);
     test_attn_out_a_site();
     printf("=== Benchmark Completed ===\n");
     return 0;
