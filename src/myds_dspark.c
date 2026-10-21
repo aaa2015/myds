@@ -46,6 +46,50 @@ static inline float dspark_fp16_to_fp32(uint16_t h) {
 #endif
 }
 
+
+/* ── MXFP4 → F16 反量化（2026-10-22 参谋长）──
+ *
+ * 1017 drafter 的 routed experts 是 MXFP4（17 B / 32 权重），而
+ * myds_dspark_moe 只接受 Q2_K。这里在加载时把它们展开成 F16，
+ * 让 1017 drafter 能跑起来（慢一点，但先拿到真实接受率）。
+ *
+ * 格式与 metal/moe.metal 的 block_mxfp4 一致：
+ *   struct { uchar e; uchar qs[16]; };
+ *   e = E8M0 指数 ⇒ scale = 2^(e-127)（e==0 用 2^-126）
+ *   每字节 2 个 4-bit，低半字节在前；值表 {-0,-.5,-1,-1.5,-2,-3,-4,-6,0,.5,1,1.5,2,3,4,6}
+ */
+static const float dspark_mxfp4_lut[16] = {
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
+     0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+};
+static inline float dspark_e8m0_to_f32(uint8_t e) {
+    uint32_t bits = (e == 0) ? 0x00400000u : ((uint32_t)e << 23);
+    float f; memcpy(&f, &bits, 4); return f;
+}
+/* 返回新分配的 F16 buffer；失败返回 NULL */
+static myds_metal_buffer_t *dspark_mxfp4_to_f16_buf(const gguf_tensor_t *t) {
+    if (!t || !t->data || !t->size_bytes) return NULL;
+    const size_t nblocks = t->size_bytes / 17u;      /* 每块 17 B */
+    if (t->size_bytes % 17u) return NULL;
+    const size_t out_n = nblocks * 32u;
+    const size_t out_bytes = out_n * 2u;
+    myds_metal_buffer_t *buf = myds_metal_buffer_alloc(out_bytes);
+    if (!buf) return NULL;
+    uint16_t *dst = (uint16_t *)myds_metal_buffer_data(buf);
+    if (!dst) { myds_metal_buffer_free(buf); return NULL; }
+    const uint8_t *src = (const uint8_t *)t->data;
+    for (size_t b = 0; b < nblocks; b++) {
+        const uint8_t *blk = src + b * 17u;
+        const float d = dspark_e8m0_to_f32(blk[0]);
+        for (int i = 0; i < 16; i++) {
+            const uint8_t byte = blk[1 + i];
+            ((_Float16 *)dst)[b * 32u + 2u * i]     = (_Float16)(dspark_mxfp4_lut[byte & 0x0F] * d);
+            ((_Float16 *)dst)[b * 32u + 2u * i + 1] = (_Float16)(dspark_mxfp4_lut[(byte >> 4) & 0x0F] * d);
+        }
+    }
+    return buf;
+}
+
 static myds_metal_buffer_t *create_metal_buf(const gguf_tensor_t *t) {
     if (!t || !t->data || !t->size_bytes) return NULL;
     myds_metal_buffer_t *buf = myds_metal_buffer_from_ptr(t->data, t->size_bytes);
@@ -222,8 +266,13 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
     }
 
     const char *arch = gguf_get_str(gguf, "general.architecture", NULL);
-    if (!arch || (strcmp(arch, "deepseek4-dspark") != 0 && strcmp(arch, "deepseek41-dflash-draft") != 0)) {
-        MYDS_LOG_E("dspark: architecture mismatch (got %s, expected deepseek4-dspark or deepseek41-dflash-draft)", arch ? arch : "null");
+    /* 2026-10-22 参谋长：加入 "dflash"（1017 版 drafter 用的 arch 名，
+     * 见 ~/hf-1017/dspark/dspark-1017-Q8_0.gguf）。缺它会导致 1017 drafter
+     * 被直接拒绝，只能回退到旧 V4.1 drafter，接受率从 ~70% 掉到 26.6%。 */
+    if (!arch || (strcmp(arch, "deepseek4-dspark") != 0 &&
+                  strcmp(arch, "deepseek41-dflash-draft") != 0 &&
+                  strcmp(arch, "dflash") != 0)) {
+        MYDS_LOG_E("dspark: architecture mismatch (got %s, expected deepseek4-dspark / deepseek41-dflash-draft / dflash)", arch ? arch : "null");
         gguf_close(gguf);
         return NULL;
     }
@@ -242,6 +291,7 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
 
     uint32_t stages = gguf_get_u32(gguf, "dspark.stage_count", 0);
     if (!stages) stages = gguf_get_u32(gguf, "deepseek41-dflash-draft.block_count", 3);
+        if (!stages) stages= gguf_get_u32(gguf, "dflash.block_count", stages);
     ds->stage_count = stages;
 
     uint32_t bsize = gguf_get_u32(gguf, "dspark.block_size", 0);
@@ -258,10 +308,12 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
 
     uint32_t nexp = gguf_get_u32(gguf, "dspark.n_routed_experts", 0);
     if (!nexp) nexp = gguf_get_u32(gguf, "deepseek41-dflash-draft.expert_count", 128);
+        if (!nexp) nexp= gguf_get_u32(gguf, "dflash.expert_count", nexp);
     ds->n_routed_experts = nexp;
 
     uint32_t kexp = gguf_get_u32(gguf, "dspark.num_experts_per_tok", 0);
     if (!kexp) kexp = gguf_get_u32(gguf, "deepseek41-dflash-draft.expert_used_count", 3);
+        if (!kexp) kexp= gguf_get_u32(gguf, "dflash.expert_used_count", kexp);
     ds->num_experts_per_tok = kexp;
     ds->current_seed_token = -1;
     ds->rms_eps = gguf_get_f32(gguf, "deepseek41-dflash-draft.attention.layer_norm_rms_epsilon", 1e-6f);
@@ -344,8 +396,10 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
     // Stage 0 entry projection
     const gguf_tensor_t *t_main_proj = gguf_find_tensor(gguf, "mtp.0.main_proj.weight");
     if (!t_main_proj) t_main_proj = gguf_find_tensor(gguf, "dflash.fc.weight");
+    if (!t_main_proj) t_main_proj = gguf_find_tensor(gguf, "fc.weight");   /* 1017 */
     const gguf_tensor_t *t_main_norm = gguf_find_tensor(gguf, "mtp.0.main_norm.weight");
     if (!t_main_norm) t_main_norm = gguf_find_tensor(gguf, "dflash.hidden_norm.weight");
+    if (!t_main_norm) t_main_norm = gguf_find_tensor(gguf, "enc.output_norm.weight");   /* 1017 */
     if (t_main_proj) {
         ds->main_proj = create_metal_buf(t_main_proj);
         ds->main_proj_type = t_main_proj->type;
@@ -408,6 +462,37 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
         BIND_T(ffn_up_exps, "ffn_up_exps.weight", ffn_up_exps_type);
         BIND_T(ffn_down_exps, "ffn_down_exps.weight", ffn_down_exps_type);
 
+        /* 2026-10-22 参谋长：1017 drafter 的专家是 MXFP4，而 dspark MoE 只吃
+         * Q2_K。加载时把 MXFP4 展开成 F16 再交给 MoE —— 慢，但能跑，
+         * 目的是先测出 1017 drafter 的真实接受率。
+         * 仅当三个专家张量都是 MXFP4 时才转换；其它格式保持原样。 */
+        if (st->ffn_gate_exps_type == GGML_TYPE_MXFP4 && st->ffn_up_exps_type == GGML_TYPE_MXFP4 &&
+            st->ffn_down_exps_type == GGML_TYPE_MXFP4) {
+            snprintf(name, sizeof(name), "blk.%u.ffn_gate_exps.weight", s);
+            const gguf_tensor_t *tg = gguf_find_tensor(gguf, name);
+            snprintf(name, sizeof(name), "blk.%u.ffn_up_exps.weight", s);
+            const gguf_tensor_t *tu = gguf_find_tensor(gguf, name);
+            snprintf(name, sizeof(name), "blk.%u.ffn_down_exps.weight", s);
+            const gguf_tensor_t *td = gguf_find_tensor(gguf, name);
+            if (!tg) { snprintf(name, sizeof(name), "mtp.%u.ffn_gate_exps.weight", s); tg = gguf_find_tensor(gguf, name); }
+            if (!tu) { snprintf(name, sizeof(name), "mtp.%u.ffn_up_exps.weight", s); tu = gguf_find_tensor(gguf, name); }
+            if (!td) { snprintf(name, sizeof(name), "mtp.%u.ffn_down_exps.weight", s); td = gguf_find_tensor(gguf, name); }
+            myds_metal_buffer_t *bg = dspark_mxfp4_to_f16_buf(tg);
+            myds_metal_buffer_t *bu = dspark_mxfp4_to_f16_buf(tu);
+            myds_metal_buffer_t *bd = dspark_mxfp4_to_f16_buf(td);
+            if (bg && bu && bd) {
+                if (st->ffn_gate_exps) myds_metal_buffer_free(st->ffn_gate_exps);
+                if (st->ffn_up_exps)   myds_metal_buffer_free(st->ffn_up_exps);
+                if (st->ffn_down_exps) myds_metal_buffer_free(st->ffn_down_exps);
+                st->ffn_gate_exps = bg; st->ffn_up_exps = bu; st->ffn_down_exps = bd;
+                st->ffn_gate_exps_type = st->ffn_up_exps_type = st->ffn_down_exps_type = GGML_TYPE_F16;
+                MYDS_LOG_I("dspark: MXFP4 experts dequantized to F16 (%.2f GB, acceptance probe)",
+                           (double)(myds_metal_buffer_size(bg) + myds_metal_buffer_size(bu) + myds_metal_buffer_size(bd)) / 1e9);
+            } else {
+                MYDS_LOG_E("dspark: MXFP4->F16 dequant failed; drafter will not propose");
+            }
+        }
+
         BIND_BUF(hc_ffn_base, "hc_ffn_base.weight");
         BIND_T(hc_ffn_fn, "hc_ffn_fn.weight", hc_ffn_fn_type);
         BIND_BUF(hc_ffn_scale, "hc_ffn_scale.weight");
@@ -437,6 +522,7 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
     }
     if (!t_mw1) {
         t_mw1 = gguf_find_tensor(gguf, "dflash.dspark.markov.w1");
+    if (!t_mw1) t_mw1 = gguf_find_tensor(gguf, "markov_w1.weight");   /* 1017 */
     }
     if (t_mw1) {
         ds->markov_w1 = create_metal_buf(t_mw1);
@@ -451,6 +537,7 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
     }
     if (!t_mw2) {
         t_mw2 = gguf_find_tensor(gguf, "dflash.dspark.markov.w2");
+    if (!t_mw2) t_mw2 = gguf_find_tensor(gguf, "markov_w2.weight");   /* 1017 */
     }
     if (t_mw2) {
         ds->markov_w2 = create_metal_buf(t_mw2);
@@ -461,6 +548,7 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
     const gguf_tensor_t *t_cproj = gguf_find_tensor(gguf, name);
     if (!t_cproj) {
         t_cproj = gguf_find_tensor(gguf, "dflash.dspark.confidence.weight");
+    if (!t_cproj) t_cproj = gguf_find_tensor(gguf, "conf_proj.weight");   /* 1017 */
     }
     if (t_cproj) {
         ds->confidence_proj = create_metal_buf(t_cproj);
@@ -476,6 +564,7 @@ myds_dspark_t *myds_dspark_load(const char *path, uint32_t vocab_size) {
     const gguf_tensor_t *t_cbias = gguf_find_tensor(gguf, name);
     if (!t_cbias) {
         t_cbias = gguf_find_tensor(gguf, "dflash.dspark.confidence.bias");
+    if (!t_cbias) t_cbias = gguf_find_tensor(gguf, "conf_proj.bias");   /* 1017 */
     }
     if (t_cbias && t_cbias->data) {
         if (t_cbias->type == GGML_TYPE_F32) {
@@ -995,7 +1084,10 @@ static int dspark_eval_stages_range(myds_dspark_t *ds, myds_context_t *ctx,
     float min_conf, float *out_confidence, uint32_t eval_slots,
     uint32_t logit_first, uint32_t logit_count) {
     if (out_confidence) *out_confidence = NAN;
-    if (!ds || !ctx || !ctx->model) return 0;
+    static int diag = -1;
+    if (diag < 0) { const char *e = getenv("MYDS_DSPARK_GATE_DEBUG"); diag = e ? atoi(e) : 0;
+        if (diag) MYDS_LOG_I("[dspark-gate] diagnostic enabled"); }
+    if (!ds || !ctx || !ctx->model) { if (diag) MYDS_LOG_I("[dspark-gate] reject: !ds||!ctx||!model"); return 0; }
     if (!capture_consumer_ready(ds)) {
         ds->capture_counters.stale_rejections++;
         return 0;
@@ -1030,7 +1122,14 @@ static int dspark_eval_stages_range(myds_dspark_t *ds, myds_context_t *ctx,
      * encoder barriers active even when the target verifier uses manual fences. */
     const int saved_barrier = myds_metal_get_auto_barrier();
     myds_metal_set_auto_barrier(1);
-#define DSPARK_ENCODE(call) do { if (!(call)) goto encode_failure; } while (0)
+/* 2026-10-22 参谋长：失败时打印行号与调用，定位 stage 失败点。
+ * 1017 drafter 首次接入时依赖它找出具体是哪个 stage 挂了。 */
+#define DSPARK_ENCODE(call) do { \
+    if (!(call)) { \
+        static int dbg = -1; \
+        if (dbg < 0) { const char *e = getenv("MYDS_DSPARK_STAGE_DEBUG"); dbg = e ? atoi(e) : 0; } \
+        if (dbg) MYDS_LOG_E("[dspark-stage] failed at %s:%d: %s", __FILE__, __LINE__, #call); \
+        goto encode_failure; } } while (0)
     const uint32_t in_dim = MYDS_DSPARK_TARGET_LAYERS * MYDS_DSPARK_DIM;
     const size_t stream_bytes = (size_t)MYDS_DSPARK_DIM * sizeof(float);
 
@@ -1295,9 +1394,11 @@ static int dspark_eval_stages_range(myds_dspark_t *ds, myds_context_t *ctx,
 
         // Early exit: skip the requested LM head GEMVs on low confidence.
         if (conf_prob < min_conf) {
+            if (diag) MYDS_LOG_I("[dspark-gate] reject@conf: conf=%.4f < min=%.4f", conf_prob, min_conf);
             myds_metal_set_auto_barrier(saved_barrier);
             return 0;
         }
+        if (diag) MYDS_LOG_I("[dspark-gate] PASS@conf: conf=%.4f >= min=%.4f", conf_prob, min_conf);
 
         // Project only the requested slots, at their original buffer offsets.
         DSPARK_ENCODE(myds_metal_begin_batch());

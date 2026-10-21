@@ -123,11 +123,22 @@ struct ds4_metal_args_dsv4_hc_expand {
 // logits on M5 Max, while the historical inline exp form remains finite and is
 // the decode throughput baseline.
 #ifdef DS4_METAL_HC_STABLE
-static inline float  ds4_hc_sigmoid(float  z)  { return 0.5f * tanh(0.5f * z) + 0.5f; }
-static inline float4 ds4_hc_sigmoid(float4 z)  { return 0.5f * tanh(0.5f * z) + 0.5f; }
+/* 2026-10-22 参谋长修：-ffast-math 下 tanh 走 exp 实现，
+ *   tanh(0.5*z) = 1 - 2/(exp(z)+1)
+ * 对 z >= ~88，exp(z) 溢出到 inf ⇒ inf/inf = NaN；
+ * 对 z = 88 更糟：静默返回 0.5（应为 ~1.0）。
+ * 实测（M2 Ultra，生产同款 -O3 -ffast-math）：
+ *   z=80 → 1.000000（对）；z=88 → 0.500000（静默错）；z>=100 → NaN
+ * 用 exp 的旧形式在整个 float 范围内都有限，故不能直接回退（旧形式在
+ * z 极负时 exp(-z) 会溢出，虽然结果仍被 1/(1+inf)=0 正确吸收）。
+ * 修法：tanh 前 clamp 到 ±87。主路径 |z| 从未接近 88（生产 decode 稳定），
+ * 故此 clamp 对主路径是 no-op ⇒ 逐位不变；只修正 DSpark 等大 z 场景。 */
+#define DS4_HC_SIGMOID_CLAMP 87.0f
+static inline float  ds4_hc_sigmoid(float  z)  { return 0.5f * tanh(0.5f * clamp(z, -DS4_HC_SIGMOID_CLAMP, DS4_HC_SIGMOID_CLAMP)) + 0.5f; }
+static inline float4 ds4_hc_sigmoid(float4 z)  { return 0.5f * tanh(0.5f * clamp(z, -DS4_HC_SIGMOID_CLAMP, DS4_HC_SIGMOID_CLAMP)) + 0.5f; }
 // 2 * sigmoid(z) == 1 + tanh(z/2).
-static inline float  ds4_hc_twice_sigmoid(float  z) { return 1.0f + tanh(0.5f * z); }
-static inline float4 ds4_hc_twice_sigmoid(float4 z) { return 1.0f + tanh(0.5f * z); }
+static inline float  ds4_hc_twice_sigmoid(float  z) { return 1.0f + tanh(0.5f * clamp(z, -DS4_HC_SIGMOID_CLAMP, DS4_HC_SIGMOID_CLAMP)); }
+static inline float4 ds4_hc_twice_sigmoid(float4 z) { return 1.0f + tanh(0.5f * clamp(z, -DS4_HC_SIGMOID_CLAMP, DS4_HC_SIGMOID_CLAMP)); }
 #else
 static inline float  ds4_hc_sigmoid(float  z)  { return 1.0f / (1.0f + exp(-z)); }
 static inline float4 ds4_hc_sigmoid(float4 z)  { return 1.0f / (1.0f + exp(-z)); }

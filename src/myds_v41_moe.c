@@ -1311,12 +1311,19 @@ int myds_dspark_moe(myds_metal_buffer_t *moe_out,
     if (!dim || !expert_dim || dim % 256u || expert_dim % 256u ||
         dim > INT32_MAX || expert_dim > INT32_MAX / 3u ||
         n_routed_experts < 3u || n_routed_experts > INT32_MAX ||
-        n_activated_experts != 3u || gate_type != GGML_TYPE_Q2_K ||
-        up_type != GGML_TYPE_Q2_K || down_type != GGML_TYPE_Q2_K ||
+        n_activated_experts != 3u ||
         !isfinite(clamp_val) || clamp_val < 0.0f) return 0;
+    /* 2026-10-22 参谋长：允许 MXFP4（1017 drafter 的格式）。
+     * 其它类型仍只接受 Q2_K —— 下面的几何/尺寸检查按 Q2_K 写。 */
+    const bool is_mxfp4 = (gate_type == GGML_TYPE_MXFP4 && up_type == GGML_TYPE_MXFP4 &&
+                           down_type == GGML_TYPE_MXFP4);
+    if (!is_mxfp4 && (gate_type != GGML_TYPE_Q2_K ||
+                      up_type != GGML_TYPE_Q2_K || down_type != GGML_TYPE_Q2_K)) return 0;
 
-    const uint64_t gate_row = (uint64_t)(dim / 256u) * 84u;
-    const uint64_t down_row = (uint64_t)(expert_dim / 256u) * 84u;
+    /* 每 256 元素的块字节：Q2_K = 84，MXFP4 = 8 块 × 17 = 136 */
+    const uint64_t gate_blk_bytes = is_mxfp4 ? 136u : 84u;
+    const uint64_t gate_row = (uint64_t)(dim / 256u) * gate_blk_bytes;
+    const uint64_t down_row = (uint64_t)(expert_dim / 256u) * gate_blk_bytes;
     const uint64_t gate_expert = gate_row * expert_dim;
     const uint64_t down_expert = down_row * dim;
     if (!gate_exps || !up_exps || !down_exps ||
@@ -1327,6 +1334,23 @@ int myds_dspark_moe(myds_metal_buffer_t *moe_out,
         myds_metal_buffer_size(down_exps) < down_expert * n_routed_experts ||
         !sized(moe_out, dim) || !sized(x_in, dim) || !sized(selected_ids, 3u) ||
         !sized(selected_weights, 3u) || !sized(scratch_mid, (size_t)3u * expert_dim)) return 0;
+    /* 2026-10-22 参谋长：1017 drafter 的专家是 MXFP4。
+     * metal 里已有对应 kernel（kernel_mul_mv_id_mxfp4_pair_swiglu_f32 /
+     * kernel_mul_mv_id_mxfp4_f32），但 host 侧从未接线，且它们的参数结构
+     * （ds4_metal_args_mul_mv_id + ds4_metal_dsv4_moe_swiglu_weight_args）
+     * 定义在 myds_metal.m 内部，与这里的 dspark_moe_args 不兼容。
+     * 接线需要在 myds_metal.m 里新增一个公开入口，工作量约 1 天。
+     * 在接线完成前，明确拒绝而不是静默跑错。 */
+    if (is_mxfp4) {
+        static bool logged = false;
+        if (!logged) {
+            MYDS_LOG_E("dspark MoE: MXFP4 experts need a host-side mul_mv_id entry "
+                       "(planned); refusing rather than producing wrong output");
+            logged = true;
+        }
+        return 0;
+    }
+
     /* Both PSOs must be available before encoding either half of this graph. */
     const char *pair_kernel = "kernel_glm_q2_K_pair_swiglu_f32";
     const char *down_kernel = "kernel_glm_q2_K_down_f32";

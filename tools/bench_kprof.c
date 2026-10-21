@@ -15,6 +15,7 @@
 #define _POSIX_C_SOURCE 200809L
 #define _DARWIN_C_SOURCE 1
 #include "myds.h"
+#include "myds_dspark.h"
 #include "myds_internal.h"
 #include "myds_metal.h"
 #include "myds_server_internal.h"
@@ -102,6 +103,15 @@ int main(int argc, char **argv) {
         .temperature = 0, .top_p = 1, .top_k = 0, .min_p = 0, .repetition_penalty = 1,
         .seed = 42, .stream = false};
     myds_context_t *ctx = myds_context_create(model, &cfg);
+    /* 2026-10-22 参谋长：支持加载 DSpark draft 模型，用于剖析投机验证路径。
+     * 取法与 src/main.c:231 相同（MYDS_DSPARK_FILE），失败不致命。 */
+    {   const char *dp = getenv("MYDS_DSPARK_FILE");
+        const char *de = getenv("MYDS_DSPARK");
+        if (dp && de && atoi(de) != 0) {
+            ctx->dspark = myds_dspark_load(dp, model->vocab_size);
+            fprintf(stderr, "bench_kprof: dspark %s\n", ctx->dspark ? "loaded" : "LOAD FAILED");
+        }
+    }
     if (!ctx) { fputs("Context creation failed\n", stderr); myds_model_free(model); return 1; }
     if (!myds_metal_kprof_enabled()) {
         fputs("GPU kernel timing unavailable on this device (see message above)\n", stderr);
