@@ -7640,7 +7640,30 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 }
                 moe_off += c_len;
 
-                if (moe_off == cw->moe_batch || c_start + c_len == mb_len) {
+                /* 冲刷条件三条，第三条是 2026-10-23 补的（原为两条）：
+                 *   ① 攒满 —— 精确等于批容量；
+                 *   ② 本层 macroblock 结束；
+                 *   ③ 必须在写下一个 chunk 之前腾出空间。
+                 *
+                 * 为什么需要 ③：chunk 长度并不总是 chunk_size。缓存续跑时 base_pos
+                 * 往往不落在 V41_SNAP_STRIDE(512) 网格上，首个 chunk 被网格对齐削短
+                 * （实测 2048 → 1597）。之后每个 chunk 恢复 2048，于是 moe_off 从
+                 * 1597 起步：16384-1597=14787 不是 2048 的整数倍 ⇒ moe_off 永远取不到
+                 * 16384 ⇒ ① 一次都不命中。累积到第 9 个 chunk 时 moe_off=15933，
+                 * 再写 c_len=1536 得 17469 > 16384，Step 6 的 sub-view 越界失败：
+                 *   "V4.1 MoE acc input sub-view failed (moe_off=15933 c_len=1536)"
+                 * 触发条件（确定性，非偶发）：续跑起点不被 512 整除 + 剩余长度 > 批容量。
+                 *
+                 * ③ 以 chunk_size 作上界，而不是下一个 chunk 的真实长度：c_len 只会被
+                 * 削短、绝不会超过 chunk_size（见上方 clamp 与各 shrink 分支），所以
+                 * 「moe_off + chunk_size <= moe_batch」⇒ 下一个 chunk 怎么削都放得下。
+                 * 由此得到不变量：写 acc 之前恒有 moe_off + c_len <= moe_batch，永不越界。
+                 *
+                 * 只改「何时分组」，不改 c_len。若反过来把 c_len 削到 MoE 边界，chunk
+                 * 端点就不在 512 网格上（例：113091+16384=129475，mod 512=451），
+                 * 会破坏快照发布。 */
+                if (moe_off == cw->moe_batch || c_start + c_len == mb_len ||
+                    (c_start + c_len < mb_len && moe_off + chunk_size > cw->moe_batch)) {
                     /* 注：本分支只在全量 chunk 里可达（moe_off 只在全量 chunk 里累加） */
                     const uint32_t mb_moe_len = moe_off;
                     const uint32_t mb_moe_start = c_start + c_len - mb_moe_len;   /* 本批在 prompt 里的起点 */
