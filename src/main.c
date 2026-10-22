@@ -4,6 +4,7 @@
 #include "myds_dspark.h"
 #include "myds_metal.h"
 #include "myds_log.h"
+#include "myds_configfile.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -68,7 +69,55 @@ static void token_stream_printer(const char *piece, size_t length, int32_t token
     fflush(stdout);
 }
 
+/* 配置文件的默认搜索顺序。第一个存在的会被加载。
+ * 相对路径按当前工作目录解析——生产由 start_fleet.sh 传绝对路径，不依赖 cwd。 */
+static const char *const kConfigCandidates[] = {
+    "myds.conf",                       /* 当前目录 */
+    "./etc/myds.conf",
+    NULL
+};
+
+/* 在解析任何环境变量之前把配置文件读成环境变量。
+ * 这是整个方案的关键：180 处 getenv 一行都不用改。
+ * 返回真正生效的条数（0 = 没找到配置文件，走纯环境变量 + 代码默认值）。 */
+static int load_config_early(int argc, char *argv[]) {
+    const char *path = NULL;
+    /* --config <path> 优先 */
+    for (int i = 1; i + 1 < argc; i++) {
+        if (strcmp(argv[i], "--config") == 0) { path = argv[i + 1]; break; }
+    }
+    if (!path) {
+        const char *e = getenv("MYDS_CONFIG");
+        if (e && *e) path = e;
+    }
+    if (!path) {
+        for (int i = 0; kConfigCandidates[i]; i++) {
+            FILE *f = fopen(kConfigCandidates[i], "r");
+            if (f) { fclose(f); path = kConfigCandidates[i]; break; }
+        }
+    }
+    if (!path) return 0;   /* 没有配置文件不是错误 */
+
+    /* 配置文件不覆盖已存在的环境变量：保住"临时覆盖一次"的能力 */
+    return myds_configfile_load(path, false);
+}
+
 int main(int argc, char *argv[]) {
+    /* ★ 必须最先执行：下面所有函数都会 getenv */
+    const int cfg_n = load_config_early(argc, argv);
+
+    /* --dump-config <path>：把当前生效的 MYDS_* 全量导出（用于从生产进程抓权威配置） */
+    for (int i = 1; i + 1 < argc; i++) {
+        if (strcmp(argv[i], "--dump-config") == 0) {
+            const int n = myds_configfile_dump_env(argv[i + 1]);
+            return n >= 0 ? 0 : 1;
+        }
+        if (strcmp(argv[i], "--check-config") == 0) {
+            return myds_configfile_diff(argv[i + 1]) >= 0 ? 0 : 1;
+        }
+    }
+    (void)cfg_n;
+
     const int capture_mode = myds_dspark_capture_parse_mode();
     if (capture_mode < 0) return 1;
     if (myds_metal_f16_gemv_bf16_fuse_parse_mode() < 0) return 1;
