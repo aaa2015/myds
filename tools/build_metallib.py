@@ -156,9 +156,20 @@ def main():
                 break
 
     print(f"[metallib] Compiling AIR with xcrun metal -> {air_file}...")
+    # 2026-10-23: Metal 语言版本与部署目标可注入。
+    # 关键实测：默认 -std 生成 AIR v27，-std=metal4.0 生成 AIR v28。
+    # metallib 里只有 AIR（无机器码），机器码由驱动在创建 pipeline 时编译
+    # ⇒ 同一份源码、不同 -std，会得到不同的 GPU 机器码质量。
+    # macOS 27 + Metal 4 下 air64_v27 可能走兼容路径，实测 decode 比 26.7.1 慢 4.7%。
+    _std = os.environ.get("MYDS_METAL_STD", "")
+    _minver = os.environ.get("MYDS_METAL_MINVER", "15.0")
     compile_cmd = [
         "xcrun", "-sdk", "macosx", "metal",
-        "-mmacosx-version-min=15.0",
+        f"-mmacosx-version-min={_minver}",
+    ]
+    if _std:
+        compile_cmd.append(f"-std={_std}")
+    compile_cmd += [
         "-O3", "-ffast-math",
         "-DDS4_METAL_HC_STABLE=1",
         "-DDS4_METAL_NORM_RSQRT_DISABLE=1",

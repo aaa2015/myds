@@ -48,6 +48,12 @@ step() { echo "── $* ──"; }
 
 R() { ssh -o BatchMode=yes -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=20 "$HOST" "$@"; }
 
+# base64 打包：把 env 文件内容安全地穿过 ssh 的引号层
+pack()   { base64 < /dev/stdin | tr -d '\n'; }
+unpack() { base64 -d; }
+# 目录名里的 @ 在某些 shell 里要转义，统一换成 _（arm@tokens → arm_at_tokens）
+safetag() { echo "${1//@/_}"; }
+
 # 远端小工具（避免依赖 macOS 没有的 timeout/setsid）
 remote_lib() {
     cat <<'LIB'
@@ -106,10 +112,17 @@ cmd_doctor() {
     ok "测试端口空闲"
 
     step "5/6 可用内存"
-    local avail
+    local avail prod
     avail=$(R "$(remote_lib); avail_gb" | tr -d '\r')
-    [ "${avail:-0}" -ge "$MIN_FREE_GB" ] || die "可用 ${avail} GB < ${MIN_FREE_GB} GB"
-    ok "可用 ${avail} GB"
+    prod=$(R "$(remote_lib); port_pid $PROD_PORT" | tr -d '\r')
+    if [ -n "$prod" ]; then
+        # 生产在跑时可用内存必然很低（模型常驻 wired ~162 GB）。
+        # 这里只报告，不判定：真正需要独占内存的是 run，它在停生产之后才检查。
+        info "可用 ${avail} GB（生产 pid=$prod 占用中，门槛留到停生产后再判）"
+    else
+        [ "${avail:-0}" -ge "$MIN_FREE_GB" ] || die "可用 ${avail} GB < ${MIN_FREE_GB} GB"
+        ok "可用 ${avail} GB"
+    fi
 
     step "6/6 远端仓库与 metallib"
     R "ls -la $REPO/bin/myds.metallib 2>/dev/null | awk '{print \"  remote metallib:\", \$5}'"
@@ -174,7 +187,10 @@ build_env_file() {
         IFS=',' read -ra pairs <<< "$overrides"
         for kv in "${pairs[@]}"; do
             [ -z "$kv" ] && continue
-            keys="$keys ${kv%%=*}"
+            case "$kv" in
+                -*) keys="$keys ${kv#-}" ;;   # -KEY = 只删除，不追加
+                *)  keys="$keys ${kv%%=*}" ;;
+            esac
         done
     fi
     while IFS= read -r line; do
@@ -188,33 +204,57 @@ build_env_file() {
         IFS=',' read -ra pairs <<< "$overrides"
         for kv in "${pairs[@]}"; do
             [ -z "$kv" ] && continue
-            echo "$kv" >> "$out"
+            case "$kv" in
+                -*) : ;;                      # -KEY：已在上一步删除，不追加
+                *)  echo "$kv" >> "$out" ;;
+            esac
         done
     fi
 }
 
 # ---------------------------------------------------------------------------
-arm_serve() {   # tag overrides
-    local tag="$1" ovr="${2:-}"
-    local dir="$RUN/$tag"
-    mkdir -p "$dir"; rm -f "$dir"/sampler.* "$dir"/server.log
-    build_env_file "$dir/env" "$ovr"
-    local envb64; envb64=$(pack "$(cat "$dir/env")")
-    local shipb64=""
-    [ -f "$RUN/bin.md5" ] && shipb64=$(cat "$RUN/bin.md5")
+# 按 token 数推导所需的 ctx 与 prompt 上限：ctx 必须 ≥ tokens，否则 server 直接拒绝；
+# MYDS_PREFILL_MAX_TOKENS 是源码里的保护阈值（默认 327680），实验必须显式放宽
+# 否则 400K/500K 会被它以「exceeds the tested-safe limit」拒绝。
+arm_ctx_for() {
+    local n="$1"
+    local c=$(( (n + 8191) / 8192 * 8192 ))
+    [ "$c" -lt "$CTX" ] && c="$CTX"
+    echo "$c"
+}
 
+arm_serve() {   # tag overrides tokens
+    local tag="$1" ovr="${2:-}" ntok="${3:-0}"
+    local dir="$RUN/$(safetag "$tag")"
+    mkdir -p "$dir"; rm -f "$dir"/sampler.* "$dir"/server.log
+    local actx actxmax
+    actx=$(arm_ctx_for "$ntok")
+    # 覆盖项里若显式给了 ctx / 上限，则以显式为准；否则注入按 token 推导的值
+    case ",$ovr," in
+        *MYDS_PREFILL_MAX_TOKENS=*) : ;;
+        *) ovr="${ovr:+$ovr,}MYDS_PREFILL_MAX_TOKENS=$actx" ;;
+    esac
+    case ",$ovr," in
+        *MYDS_CHUNK_KEY_MAX=*) : ;;
+        *) ovr="${ovr:+$ovr,}MYDS_CHUNK_KEY_MAX=$actx" ;;
+    esac
+    build_env_file "$dir/env" "$ovr"
+    
     # 停测试端口残留（并等它真的消失）
     R "$(remote_lib)
         p=\$(port_pid $TEST_PORT); [ -n \"\$p\" ] && kill_wait \$p
         exit 0"
 
-    # 起被测进程（env 用文件注入，避免 shell 引号地狱）
+    # 起被测进程（env 用 base64 文件注入，避免 shell 引号地狱）
+    base64 < "$dir/env" > "$dir/env.b64"
+    R "mkdir -p $dir" || die "[$tag] 远端目录创建失败"
+    scp -q "$dir/env.b64" "$HOST:$dir/env.b64" || die "[$tag] env 上传失败"
     R "$(remote_lib)
         cd $dir || exit 1
-        echo $(pack "$(cat "$dir/env")") | base64 -d > env.use
+        cat env.b64 | base64 -d > env.use
         set -a; . ./env.use; set +a
         \"$REPO/bin/myds\" -m $MODEL --port $TEST_PORT --host 127.0.0.1 \
-            --ctx-size $CTX --temp 0 --top-p 1.0 --max-tokens 262144 \
+            --ctx-size $actx --temp 0 --top-p 1.0 --max-tokens 262144 \
             --thinking off --alias $ALIAS > server.log 2>&1 &
         for i in \$(seq 1 500); do
             curl -s -m 2 http://127.0.0.1:$TEST_PORT/health 2>/dev/null | grep -q ok && break
@@ -239,21 +279,21 @@ arm_serve() {   # tag overrides
     ok "[$tag] 看门狗心跳 $hb"
 }
 
-arm_probe() {   # tag tokens
-    local tag="$1" ntok="$2"
-    local dir="$RUN/$tag"
-    R "python3 - $TEST_PORT $ALIAS $ntok $dir <<'PY'
+arm_probe() {   # tag tokens [gen]
+    local tag="$1" ntok="$2" ngen="${3:-1}"
+    local dir="$RUN/$(safetag "$tag")"
+    R "python3 - $TEST_PORT $ALIAS $ntok $dir $ngen <<'PY'
 import json,sys,time,urllib.request,random
-port,alias,tgt,out = sys.argv[1],sys.argv[2],int(sys.argv[3]),sys.argv[4]
+port,alias,tgt,out,ngen = sys.argv[1],sys.argv[2],int(sys.argv[3]),sys.argv[4],int(sys.argv[5])
 FILL=('The compressor reads rows from the table and folds them into the residual stream '
       'before the next sublayer begins its work. ')
 chars=int(tgt*5.347)
 p='[n %d] '%random.getrandbits(60)+(FILL*200000)[:chars]+'\n\nSummarize.'
-body=json.dumps({'model':alias,'messages':[{'role':'user','content':p}],'max_tokens':1,
+body=json.dumps({'model':alias,'messages':[{'role':'user','content':p}],'max_tokens':ngen,
                  'temperature':0,'stream':True,'stream_options':{'include_usage':True}}).encode()
 req=urllib.request.Request('http://127.0.0.1:%s/v1/chat/completions'%port,data=body,
                            headers={'Content-Type':'application/json'})
-t0=time.monotonic(); ttft=None; pt=None
+t0=time.monotonic(); ttft=None; pt=None; chunks=[]; tl=None; ntok=0
 try:
     with urllib.request.urlopen(req,timeout=5400) as s:
         for raw in s:
@@ -265,10 +305,21 @@ try:
             except Exception: continue
             if j.get('usage'): pt=j['usage']['prompt_tokens']
             c=j.get('choices') or []
-            if c and (c[0].get('delta') or {}).get('content') and ttft is None:
-                ttft=time.monotonic()-t0
+            if c:
+                dl=c[0].get('delta') or {}
+                if dl.get('content'):
+                    now=time.monotonic()-t0
+                    if ttft is None: ttft=now
+                    tl=now
+                    ntok+=1
+                    chunks.append(dl['content'])
+    open(out+'/out.txt','w').write(''.join(chunks))
+    # decode 速率：(生成数-1)/（最后一个 token 时刻 - 第一个 token 时刻）
+    dec=0.0
+    if ntok>1 and tl is not None and ttft is not None and tl>ttft:
+        dec=(ntok-1)/(tl-ttft)
     if pt and ttft:
-        print('OK %d %.1f %.1f'%(pt,ttft,pt/ttft))
+        print('OK %d %.1f %.1f dec=%.2f n=%d'%(pt,ttft,pt/ttft,dec,ntok))
     else:
         print('EMPTY')
 except Exception as e:
@@ -284,12 +335,17 @@ PY" > "$dir/probe_$ntok.txt" 2>&1
         mask=\$(grep -oE 'prompt block mask: [a-z-]+' server.log | head -1)
         echo \"PEAK \$pw \$trip \$mb \$mask\"" > "$dir/assert.txt" 2>&1
 
+    # 服务端自己记的 prefill/decode 才权威（探针是客户端视角，会漏算）
+    R "grep -a 'Completed' $dir/server.log 2>/dev/null | tail -1" > "$dir/done.txt" 2>&1
+
     local res peak trip mb mask
     res=$(tr -d '\r' < "$dir/probe_$ntok.txt" | tail -1)
     read -r _ peak trip mb mask <<< "$(tr -d '\r' < "$dir/assert.txt" | tail -1)"
-    printf "   %-10s %-8s %-58s peak=%-4sGB %s %s %s\n" \
-        "$tag" "$ntok" "$res" "${peak:-?}" "${trip:-?}" "${mb:-}" "${mask:-}"
-    echo "$tag $ntok $res ${peak:-?} ${trip:-?} ${mb:-} ${mask:-}" >> "$RUN/results.txt"
+    local srvdec
+    srvdec=$(tr -d '\r' < "$dir/done.txt" 2>/dev/null | grep -oE 'decode: [0-9]+ tok in [0-9.]+s = [0-9.]+ t/s' | sed 's/decode: //')
+    printf "   %-10s %-8s %-40s peak=%-4sGB %s  srv[%s]\n" \
+        "$tag" "$ntok" "$res" "${peak:-?}" "${trip:-?}" "${srvdec:-n/a}"
+    echo "$tag $ntok $res ${peak:-?} ${trip:-?} ${mb:-} ${mask:-} ${srvdec:-n/a}" >> "$RUN/results.txt"
 
     if [ "${trip:-no}" != "no" ]; then
         die "[$tag] 看门狗因 wired 超限杀进程（$trip）—— 立即停止，不要再往上加长度"
@@ -297,7 +353,7 @@ PY" > "$dir/probe_$ntok.txt" 2>&1
 }
 
 arm_down() {
-    local tag="$1" dir="$RUN/$1"
+    local tag="$1" dir="$RUN/$(safetag "$1")"
     R "$(remote_lib)
         pkill -f 'rss_sampler.sh.*--port $TEST_PORT' 2>/dev/null
         p=\$(port_pid $TEST_PORT); [ -n \"\$p\" ] && kill_wait \$p
@@ -310,7 +366,7 @@ arm_down() {
 cmd_run() {
     echo "═══════════ mx run ═══════════"
     mkdir -p "$RUN"
-    local arms=() tokens=""
+    local arms=() tokens="" gen=1
     local a
     for a in "$@"; do
         case "$a" in
@@ -324,12 +380,13 @@ cmd_run() {
     local prev=""
     for a in "$@"; do
         [ "$prev" = "--tokens" ] && tokens="$a"
+        [ "$prev" = "--gen" ] && gen="$a"
         prev="$a"
     done
     [ ${#arms[@]} -gt 0 ] || die "至少给一臂，例如 A=MYDS_PROMPT_MASK_BITS=1（无覆盖写 A=）"
     [ -n "$tokens" ] || tokens="200000"
 
-    cmd_doctor >/dev/null 2>&1 || cmd_doctor
+    cmd_doctor   # 失败直接退出（die 用 exit，不能用 || 兜底重试）
     cmd_env
     L=$(md5 -q "$RUN/env.prod")
 
@@ -341,10 +398,13 @@ cmd_run() {
         for p in \$(pgrep -x myds); do kill -9 \$p; done
         sleep 8
         echo \"  myds=\$(nds_count)  wired=\$(wired_gb)GB\""
-    local left
+    local left avail2
     left=$(R "$(remote_lib); nds_count" | tr -d '\r')
     [ "$left" = "0" ] || die "还有 $left 个 myds 残留，拒绝开始（会假 OOM）"
-    ok "生产已停，无残留"
+    avail2=$(R "$(remote_lib); avail_gb" | tr -d '\r')
+    [ "${avail2:-0}" -ge "$MIN_FREE_GB" ] \
+        || die "停生产后可用仅 ${avail2} GB < ${MIN_FREE_GB} GB —— 拒绝实验"
+    ok "生产已停，无残留；可用 ${avail2} GB"
 
     : > "$RUN/results.txt"
     local tok armtag
@@ -355,8 +415,8 @@ cmd_run() {
         for tok in "${TOKS[@]}"; do
             local t2="$tag@$tok"
             step "臂 $t2  覆盖[${ovr:-无}]"
-            arm_serve "$t2" "$ovr"
-            arm_probe "$t2" "$tok"
+            arm_serve "$t2" "$ovr" "$tok"
+            arm_probe "$t2" "$tok" "$gen"
             arm_down "$t2"
         done
     done
