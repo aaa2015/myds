@@ -44,8 +44,20 @@
  * 而 chunk attention 只接受 2048 —— 于是 MYDS_PREFILL_CHUNK_SIZE=3000 这种「配置合法」
  * 的值会在运行时让整个 prefill 失败。现在两边同源，host 侧统一钳到 2048。 */
 #define V41_MAX_CHUNK MYDS_V41_CHUNK_MAX
-/* MoE 批的 token 上限（内存护栏）：批缓冲约 0.44 MB/token。8192 ⇒ 约 3.6 GB。 */
+/* MoE 批的 token 上限（内存护栏）：批缓冲约 0.44 MB/token。8192 ⇒ 约 3.6 GB。
+ * 2026-10-22：改为可被 MYDS_MOE_BATCH_MAX_TOKENS 覆盖，便于实测上限。
+ * 注意它必须与 MYDS_PREFILL_MACROBLOCK_SIZE 同时放宽才有意义 ——
+ * moe_chunks 同时被 macroblock/chunk_size 钳制（见下方 need 的计算）。 */
 #define MYDS_MOE_BATCH_MAX_TOKENS 8192u
+static uint32_t moe_batch_max_tokens(void) {
+    static uint32_t v = 0;
+    if (!v) {
+        const char *e = getenv("MYDS_MOE_BATCH_MAX_TOKENS");
+        long n = e ? strtol(e, NULL, 10) : 0;
+        v = (n >= 2048 && n <= 65536) ? (uint32_t)n : MYDS_MOE_BATCH_MAX_TOKENS;
+    }
+    return v;
+}
 
 typedef struct {
     myds_metal_buffer_t *attn_fn, *attn_scale, *attn_base;
@@ -6631,8 +6643,8 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         if (mc) { int v = atoi(mc); if (v > 1) moe_chunks = (uint32_t)v; }
         if (moe_chunks > 16u) moe_chunks = 16u;
         /* 内存护栏：批缓冲约 0.44 MB/token（MoE 的 gate/up/mid/down + 累积缓冲） */
-        if (moe_chunks > 1u && (size_t)chunk_size * moe_chunks > MYDS_MOE_BATCH_MAX_TOKENS)
-            moe_chunks = (uint32_t)(MYDS_MOE_BATCH_MAX_TOKENS / chunk_size);
+        if (moe_chunks > 1u && (size_t)chunk_size * moe_chunks > moe_batch_max_tokens())
+            moe_chunks = (uint32_t)(moe_batch_max_tokens() / chunk_size);
         if (moe_chunks < 1u) moe_chunks = 1u;
         if (moe_chunks > 1u) {
             uint32_t need = (uint32_t)(((size_t)mb_cap_needed + chunk_size - 1u) / chunk_size);  /* 不需要超过一个 macroblock 的 chunk 数 */
@@ -6650,6 +6662,15 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     /* 复用 prompt 级工作区（按 macroblock 容量分配，避免长请求每次 prefill 申请释放上吉字节引发抖动） */
     const bool prompt_ws_complete = g->prompt_res && g->prompt_pre && g->prompt_selected &&
                                     g->prompt_block_mask && g->prompt_engram_buf[0] && g->prompt_engram_buf[1];
+    {   static int logged = 0;
+        if (!logged) {
+            MYDS_LOG_I("prefill batching: chunk=%u macroblock=%u moe_chunks=%u "
+                       "(=> MoE batch = %u tok, guard=%u)",
+                       chunk_size, macroblock_size, moe_chunks,
+                       chunk_size * moe_chunks, moe_batch_max_tokens());
+            logged = 1;
+        }
+    }
     uint32_t cap = (mb_cap_needed + 511u) / 512u * 512u;
     if (!prompt_ws_complete || g->prompt_tokens_cap < cap || g->prompt_mask_bytes_cap < mask_bytes) {
         size_t cap_res_size = (size_t)cap * 4u * V41_DIM;
