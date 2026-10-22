@@ -3422,6 +3422,7 @@ static int publish_indexer_chunk(myds_context_t *ctx, uint32_t il, uint32_t c_st
                                  const myds_metal_buffer_t *index_weights_buf,
                                  myds_metal_buffer_t *prompt_selected, size_t sel_bytes,
                                  myds_metal_buffer_t *prompt_block_mask, size_t mask_bytes,
+                                 bool mask_bits,
                                  myds_metal_buffer_t *q_view, myds_metal_buffer_t *w_view,
                                  myds_metal_buffer_t *sel_view, myds_metal_buffer_t *mask_view) {
     myds_v41_context_t *g=ctx->v41;
@@ -3491,6 +3492,10 @@ static int publish_indexer_chunk(myds_context_t *ctx, uint32_t il, uint32_t c_st
         const uint32_t nc=nc_raw<V41_TOPK?V41_TOPK:nc_raw;   /* 表宽（见上） */
         const uint32_t g_start=base_pos + c_start + off;
         if (!glen || !nc_raw) return -1;
+        /* 掩码条目数 = 块数。float 版每条目 4 字节，位打包版每条目 1 bit。 */
+        const uint32_t blk_units = (nc + 7u) / 8u;
+        /* 每行的 4 字节单元数：float 模式是 float 步长，位模式是 word 步长 */
+        const uint32_t mask_units = (uint32_t)(mask_bytes / 4u);
         if (!myds_metal_buffer_update_sub_view(q_view,index_q_buf,
                 (size_t)(input_skip+off)*V41_INDEX_HEADS*128u*sizeof(float),
                 (size_t)glen*V41_INDEX_HEADS*128u*sizeof(float)) ||
@@ -3513,9 +3518,18 @@ static int publish_indexer_chunk(myds_context_t *ctx, uint32_t il, uint32_t c_st
             if (!myds_v41_gpu_candidates_rows(blocks_buf,scores_buf,nc,glen,g_start,ratio,mask_stride)) return -1;
             if (!myds_v41_gpu_topk_causal(block_sel_buf,blocks_buf,blocks,top_blocks,glen,
                     g_start,ratio,g->gpu)) return -1;
-            if (!myds_v41_gpu_topkmask_rows(mask_view,block_sel_buf,blocks,top_blocks,glen,mask_stride)) return -1;
+            if (mask_bits) {
+                /* 位打包：每条目 = 1 块 = 1 bit；mask_units 是每行 word 数 */
+                if (!myds_v41_gpu_maskbits_rows(mask_view,block_sel_buf,blk_units,top_blocks,glen,mask_units)) return -1;
+            } else {
+                if (!myds_v41_gpu_topkmask_rows(mask_view,block_sel_buf,blocks,top_blocks,glen,mask_stride)) return -1;
+            }
         } else if (il>20) {
-            if (!myds_v41_gpu_filter_rows(scores_buf,mask_view,nc,glen,g_start,ratio,mask_stride)) return -1;
+            if (mask_bits) {
+                if (!myds_v41_gpu_filter_rows_bits(scores_buf,mask_view,nc,glen,g_start,ratio,mask_units)) return -1;
+            } else {
+                if (!myds_v41_gpu_filter_rows(scores_buf,mask_view,nc,glen,g_start,ratio,mask_stride)) return -1;
+            }
         }
         /* 最终选择：top 取全局 V41_TOPK（≤ nc），逐行宽度由因果参数限制到 count。 */
         if (!myds_v41_gpu_topk_causal(sel_view,scores_buf,nc,nc<V41_TOPK?nc:V41_TOPK,
@@ -6689,7 +6703,21 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     if (mask_stride < 256u) mask_stride = 256u;
     const uint32_t cap_blocks = (g->capacity + 7u) / 8u;
     if (mask_stride > cap_blocks) mask_stride = cap_blocks;
-    size_t mask_bytes = (size_t)mask_stride * sizeof(float);
+    /* 2026-10-22 §40：位打包掩码。float 版每「8 块组」占 4 字节，
+     * 而 kernel 只做 ==0.0f 判断；改成 1 bit/组 ⇒ 32 倍压缩。
+     * 语义等价（位=1 ⇔ float=0），由 MYDS_PROMPT_MASK_BITS 选择实现以便 0-ULP 对照：
+     *   未设/1 = 位打包（新）；显式 0 = float（旧）。
+     * 500K 上下文：prompt_block_mask 25 GB → 0.8 GB。 */
+    static int mask_bits_mode = -1;
+    if (mask_bits_mode < 0) {
+        const char *e = getenv("MYDS_PROMPT_MASK_BITS");
+        mask_bits_mode = (!e || strcmp(e, "0") != 0) ? 1 : 0;
+        MYDS_LOG_I("prompt block mask: %s", mask_bits_mode ? "bit-packed (1 bit / 8-block group)" : "float legacy");
+    }
+    const uint32_t mask_word_stride = (mask_stride + 31u) / 32u;
+    size_t mask_bytes = mask_bits_mode
+        ? (size_t)mask_word_stride * sizeof(uint32_t)
+        : (size_t)mask_stride * sizeof(float);
 
     /* Macroblock: 把超长 prompt 切成固定上限（默认 4096 tokens）的 macroblock。
      * 每个 macroblock 跑完整 40 层，从而 prompt 级工作区（prompt_res, prompt_block_mask 等）
@@ -7323,7 +7351,8 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     if (!opt_idx_per_token) {
                         batched = publish_indexer_chunk(ctx, il, c_start, c_len, mb_base_pos,
                             cw->index_q_buf, cw->index_weights_buf, prompt_selected, sel_bytes,
-                            prompt_block_mask, mask_bytes, cw->cur_index_q_view, cw->cur_index_weights_view,
+                            prompt_block_mask, mask_bytes, mask_bits_mode != 0,
+                            cw->cur_index_q_view, cw->cur_index_weights_view,
                             cw->cur_selected_view, cw->cur_mask_view);
                         if (batched < 0) {
                             MYDS_LOG_E("V4.1 chunk indexer failed mid-flight (layer %u chunk %u)", il, c_start);

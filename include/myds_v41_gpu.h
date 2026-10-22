@@ -41,6 +41,14 @@ int myds_v41_gpu_pack_bf16(myds_metal_buffer_t *dst,size_t dst_offset_words,
  *   chunk_key_max() = 一次 attention 能覆盖的压缩键总数上界（超了必须提前拒绝） */
 uint32_t myds_v41_gpu_chunk_max_c(const myds_v41_gpu_scratch_t *scratch);
 uint32_t myds_v41_gpu_chunk_key_max(const myds_v41_gpu_scratch_t *scratch);
+
+/* 位打包的 prompt 块掩码：1 bit 表示「8 个压缩键组」的可见性。
+ * 与 float 版语义等价（位=1 ⇔ float=0），占用小 32 倍。 */
+uint32_t myds_v41_gpu_maskbits_stride(uint32_t n_comp);
+int myds_v41_gpu_maskbits_rows(myds_metal_buffer_t *words, const myds_metal_buffer_t *ids,
+    uint32_t n_comp, uint32_t top, uint32_t rows, uint32_t stride_words);
+int myds_v41_gpu_filter_rows_bits(myds_metal_buffer_t *scores, const myds_metal_buffer_t *words,
+    uint32_t n_comp, uint32_t rows, uint32_t start, uint32_t ratio, uint32_t stride_words);
 /* Actual shared-memory bytes occupied by the chunk KV slab and mask. Initially
  * compact; a compressed slab fallback may grow it to the configured key cap. */
 size_t myds_v41_gpu_chunk_workspace_bytes(const myds_v41_gpu_scratch_t *scratch);

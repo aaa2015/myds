@@ -394,6 +394,70 @@ kernel void kernel_dsv41_candidate_filter(
         ? scores[offset] : -INFINITY;
 }
 
+/* ── 位打包的 prompt 块掩码（2026-10-22）───────────────────────────
+ * 上面 kernel_dsv41_candidate_filter 用 float 存每个「8 块组」的可见性，
+ * 而它只判断 == 0.0f。prompt_block_mask 的尺寸是 cap x (blocks) 个 float，
+ * 于是 500K 上下文要吃 25 GB —— 只为存一堆布尔。
+ *
+ * 这里改成 1 bit / 块，32 倍压缩。语义完全等价：位为 1 ⇔ float 为 0。
+ * 原来的 float 版本保留（decode 侧的 dense mask 仍在用），
+ * 两条路径由 host 侧的 MYDS_PROMPT_MASK_BITS 选择，便于 0-ULP 对照。
+ *
+ * 写入用 atomic_fetch_or：同一 word 的 32 个位可能被不同线程并发置位。 */
+struct ds4_metal_args_dsv41_maskbits {
+    uint width;        /* 掩码条目数 = 块数 (n_comp+7)/8 */
+    uint rows;         /* token 行数 */
+    uint stride;       /* 每行 word 数 */
+    uint start, ratio;
+    ulong nb_top0, nb_top1;   /* topk 的 行/列 字节步长 */
+    uint top;                 /* 每行 top_k 个数 */
+};
+
+/* 清零：整块 words。grid 覆盖 rows*stride。 */
+kernel void kernel_dsv41_maskbits_clear(
+        constant ds4_metal_args_dsv41_maskbits &args,
+        device uint *words,
+        uint gid [[thread_position_in_grid]]) {
+    const ulong n = (ulong)args.rows * args.stride;
+    if ((ulong)gid >= n) return;
+    words[gid] = 0u;
+}
+
+/* 置位：把 topk 选中的组打开。grid 覆盖 rows*top。 */
+kernel void kernel_dsv41_maskbits_scatter(
+        constant ds4_metal_args_dsv41_maskbits &args,
+        device const char *topk,
+        device uint *words,
+        uint gid [[thread_position_in_grid]]) {
+    const ulong n = (ulong)args.rows * args.top;
+    if ((ulong)gid >= n) return;
+    const uint ik = (uint)((ulong)gid % args.top);
+    const uint it = (uint)((ulong)gid / args.top);
+    const int32_t idx = *((device const int32_t *)(topk + (ulong)ik * args.nb_top0 + (ulong)it * args.nb_top1));
+    /* idx 就是【块号】：float 版把每个块的可见性存成一个 float，
+     * 读取侧用 x/8（x = 压缩键号）取块号。这里一个块一个 bit。 */
+    if (idx < 0 || (uint)idx >= args.width) return;
+    const uint blk = (uint)idx;
+    atomic_fetch_or_explicit(&((device atomic_uint *)words)[(ulong)it * args.stride + (blk >> 5)],
+                             1u << (blk & 31u), memory_order_relaxed);
+}
+
+/* 读取：位为 1 才保留分数，否则 -INFINITY。与 float 版逐位等价。 */
+kernel void kernel_dsv41_candidate_filter_bits(
+        constant ds4_metal_args_dsv41_maskbits &args,
+        device const float *scores,
+        device float *out,
+        device const uint *words,
+        uint2 index [[thread_position_in_grid]]) {
+    if (index.x >= args.width || index.y >= args.rows) return;
+    const ulong offset = (ulong)index.y * args.width + index.x;
+    const uint visible = min(args.width, (args.start + index.y + 1u) / args.ratio);
+    const uint blk = index.x >> 3;                 /* 8 个压缩键共用 1 个块位 */
+    const bool allowed = blk < args.width &&
+        (words[(ulong)index.y * args.stride + (blk >> 5)] & (1u << (blk & 31u))) != 0u;
+    out[offset] = (index.x < visible && allowed) ? scores[offset] : -INFINITY;
+}
+
 struct ds4_metal_args_dsv41_carry {
     uint width, rows, words, format, pack;
 };

@@ -675,6 +675,66 @@ int myds_v41_gpu_filter_rows(myds_metal_buffer_t *scores,const myds_metal_buffer
     return mask&&candidates(scores,scores,mask,n_comp,rows,start,ratio,mask_stride);
 }
 
+/* ── 位打包的 prompt 块掩码（2026-10-22）────────────────────────────
+ * float 版把每个「8 块组」的可见性存成 4 字节，而只做 ==0.0f 判断。
+ * 改成 1 bit/组 ⇒ 32 倍压缩。语义等价：位=1 ⇔ float=0。
+ * 500K: 25 GB → 0.8 GB。见账本 §40。 */
+struct maskbits_args {
+    uint32_t width, rows, stride, start, ratio;
+    uint64_t nb_top0, nb_top1;
+    uint32_t top;
+};
+
+static void maskbits_fill(struct maskbits_args *a, uint32_t n_comp, uint32_t rows,
+                          uint32_t start, uint32_t ratio, uint32_t stride_words,
+                          uint32_t top, size_t nb0, size_t nb1) {
+    a->width = n_comp; a->rows = rows; a->stride = stride_words;
+    a->start = start; a->ratio = ratio;
+    a->nb_top0 = nb0; a->nb_top1 = nb1; a->top = top;
+}
+
+/* n_blocks 是掩码条目数（= (n_comp+7)/8 个块），每块 1 bit ⇒ ceil(n_blocks/32) word */
+uint32_t myds_v41_gpu_maskbits_stride(uint32_t n_blocks) {
+    return (n_blocks + 31u) / 32u;
+}
+
+/* n_blocks = 掩码条目数（块数）；top = 每行被选中的块数 */
+int myds_v41_gpu_maskbits_rows(myds_metal_buffer_t *words, const myds_metal_buffer_t *ids,
+    uint32_t n_blocks, uint32_t top, uint32_t rows, uint32_t stride_words) {
+    if (!rows || !stride_words || !top || top > n_blocks || !n_blocks) return 0;
+    if (!words || !ids || !floats(ids, (uint64_t)top * rows)) return 0;
+    if (myds_metal_buffer_size(words) < (size_t)stride_words * rows * 4u) return 0;
+
+    struct maskbits_args a;
+    maskbits_fill(&a, n_blocks, rows, 0, 1, stride_words, top, 4, (size_t)top * 4u);
+
+    const myds_metal_buffer_t *b1[] = {words};
+    const uint64_t nwords = (uint64_t)stride_words * rows;
+    if (nwords > (uint64_t)UINT32_MAX * 256ull) return 0;
+    if (!dispatch("kernel_dsv41_maskbits_clear", &a, sizeof(a), b1, 1,
+                  (uint32_t)((nwords + 255ull) / 256ull), 1, 1, 256, 1, 1, 0)) return 0;
+    if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(words);
+
+    const myds_metal_buffer_t *b2[] = {ids, words};
+    const uint64_t nsc = (uint64_t)top * rows;
+    if (nsc > (uint64_t)UINT32_MAX * 256ull) return 0;
+    return dispatch("kernel_dsv41_maskbits_scatter", &a, sizeof(a), b2, 2,
+                    (uint32_t)((nsc + 255ull) / 256ull), 1, 1, 256, 1, 1, 0);
+}
+
+int myds_v41_gpu_filter_rows_bits(myds_metal_buffer_t *scores, const myds_metal_buffer_t *words,
+    uint32_t n_comp, uint32_t rows, uint32_t start, uint32_t ratio, uint32_t stride_words) {
+    if (!words || !n_comp || !rows || !ratio) return 0;
+    if (!floats(scores, (uint64_t)n_comp * rows)) return 0;
+    if (myds_metal_buffer_size(words) < (size_t)stride_words * rows * 4u) return 0;
+
+    struct maskbits_args a;
+    maskbits_fill(&a, n_comp, rows, start, ratio, stride_words, 0, 0, 0);
+    const myds_metal_buffer_t *b[] = {scores, scores, words};
+    return dispatch("kernel_dsv41_candidate_filter_bits", &a, sizeof(a), b, 3,
+                    (n_comp + 255u) / 256u, rows, 1, 256, 1, 1, 0);
+}
+
 struct sort_args {
     int32_t ne00,ne01,ne02,ne03;uint64_t nb00,nb01,nb02,nb03;
     int32_t ne0,ne1,ne2,ne3,top_k;uint32_t causal_start,causal_ratio;
