@@ -3630,6 +3630,12 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         char prefill_str[96];
         if (pf.prefill_tokens == 0) {
             snprintf(prefill_str, sizeof(prefill_str), "none (all %u cached)", pf.cached_tokens);
+        } else if (stop_reason == MYDS_STOP_ERROR) {
+            /* prefill 失败时不能按速率打。原来会打出「399952 tok in 0.000s = 33329333333.3 t/s」
+             * 这种荒谬的成功行（实测），在排查事故时极具误导性 ——
+             * 那条 500K 请求把机器打 panic 的日志里就混着这种行。只报失败与已处理量。 */
+            snprintf(prefill_str, sizeof(prefill_str), "FAILED after %u tok (cached %u)",
+                     pf.prefill_tokens, pf.cached_tokens);
         } else {
             double pf_tps = (pf.prefill_seconds > 0.0)
                                 ? (double)pf.prefill_tokens / pf.prefill_seconds : 0.0;

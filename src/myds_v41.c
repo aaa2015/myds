@@ -6613,6 +6613,42 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         }
     }
 
+    /* 2026-10-22: 长 prompt 的**内存**护栏。这不是性能取舍，是防事故。
+     *
+     * 实测分界：
+     *   300K  → 299,971 tok / 704 s / 426 t/s，RSS 155 GB，正常完成
+     *   500K  → 整机内核 panic。panic-full-2026-10-22-165559.0002.panic 记录：
+     *            "watchdog timeout: no checkins from watchdogd in 91 seconds"
+     *            memoryStatus: wired 12,506,926 pages = 204.9 GB / 206 GB，
+     *                          free 15 MB，inactive 0，pagesReclaimed 0
+     *           wired 页不可回收 ⇒ 内核一页都拿不回来 ⇒ 整机停止响应 ⇒ watchdog 主动 panic。
+     *
+     * 这个失败模式比 OOM 恶劣得多：OOM 只会杀进程，而这里是**整机硬复位**，
+     * 连带掉所有在跑的东西，且事后日志被截断（本次连 prefill 的报错都没来得及写）。
+     * 所以宁可直接拒绝。上限取 320K = 已实测的 300K 加一点余量；
+     * 320K~500K 之间的行为完全未测，不接受它。
+     * 确实要试更长的，显式设 MYDS_PREFILL_MAX_TOKENS，风险自负。 */
+    {
+        static uint32_t max_prompt = 0;
+        if (max_prompt == 0) {
+            uint32_t v = 327680u;   /* 320K */
+            const char *e = getenv("MYDS_PREFILL_MAX_TOKENS");
+            if (e && *e) {
+                long n = atol(e);
+                if (n > 0 && (unsigned long)n <= 16777216ul) v = (uint32_t)n;
+            }
+            max_prompt = v;
+        }
+        if (base_pos + n_tokens > max_prompt) {
+            MYDS_LOG_E("V4.1 prefill %u tokens exceeds the tested-safe limit %u. "
+                       "300K is verified; 500K drove wired memory to 205/206 GB and "
+                       "panicked the kernel (watchdog timeout). "
+                       "Override with MYDS_PREFILL_MAX_TOKENS only if you accept a machine reset.",
+                       base_pos + n_tokens, max_prompt);
+            return -1;
+        }
+    }
+
     if (base_pos == 0) {
         g->next_position = 0;
         g->valid = true;
