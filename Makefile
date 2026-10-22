@@ -29,7 +29,7 @@ BUILD_DIR = build
 # ★ 视觉相关四个文件别漏：漏了不会报错 —— 只是这些代码【没被编进二进制】，
 #   直到有人引用它们才在链接期暴露。我第一版就漏了三个（vispre/visw/visfwd），
 #   而当时所有测试仍然全过，因为没人用到它们。
-SRCS_C = src/myds_cpu.c src/myds_log.c src/myds_gguf.c src/myds_tokenizer.c \
+SRCS_C = src/myds_cpu.c src/myds_log.c src/myds_configfile.c src/myds_gguf.c src/myds_tokenizer.c \
          src/myds_engine.c src/myds_v41.c src/myds_v41_gpu.c src/myds_v41_moe.c src/myds_v41_decode.c \
          src/myds_engram.c src/myds_engram_cpu.c src/myds_moe_cpu.c src/myds_dspark.c \
          src/myds_vispre.c src/myds_visw.c src/myds_visfwd.c src/myds_vjob.c \
