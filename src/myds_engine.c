@@ -1273,7 +1273,12 @@ myds_context_t *myds_context_create(myds_model_t *model, const myds_config_t *cf
          * 依赖「每次 generate 都是从位置 0 全量 prefill」。 */
         {
             const char *dsk = getenv("MYDS_KV_DSK");
-            if (dsk && *dsk) (void)myds_v41_low_kv_enable(ctx->v41, dsk);
+            /* 2026-10-22: 除空串外，"0" 与 "none" 也表示关闭。
+             * 原判断是 if(dsk && *dsk)，于是 MYDS_KV_DSK=0 会被当成目录名 "0"
+             * —— 文档却承诺"=0 即不落盘"。两处不一致，这里以文档为准修代码。 */
+            const bool dsk_off = !dsk || !*dsk ||
+                                 strcmp(dsk, "0") == 0 || strcmp(dsk, "none") == 0;
+            if (!dsk_off) (void)myds_v41_low_kv_enable(ctx->v41, dsk);
         }
     }
     return ctx;
