@@ -6530,6 +6530,14 @@ fail:
     return NULL;
 }
 
+/* macroblock 的硬上限。它同时是 moe_chunks 的钳制来源之一（见 prefill 里的 need 计算），
+ * 所以这个值决定了 MoE 批容量能开到多大：MoE batch = min(MOE_CHUNKS, guard/chunk, 本上限/chunk) * chunk。
+ * 32768 允许 chunk=2048 时拿到 moe_chunks=16。
+ * 2026-10-22 再提到 131072：macroblock 实测是 prefill 的主导旋钮（16384->32768 值 +8.7%，
+ * 而 moe_chunks 8->16 无差别），要继续探这条轴的天花板。工作区按 cap 线性增长
+ * （prompt_res = cap*4*V41_DIM*4 B，32768 时约 3.5 GiB），131072 约 14 GiB。 */
+#define MYDS_MACROBLOCK_HARD_MAX 131072L
+
 uint32_t myds_v41_resolve_macroblock_size(void) {
     const char *mb_env = getenv("MYDS_PREFILL_MACROBLOCK_SIZE");
     long val = 8192L;
@@ -6543,13 +6551,19 @@ uint32_t myds_v41_resolve_macroblock_size(void) {
             val = 8192L;
         }
     }
+    /* 2026-10-22: 硬上限从 16384 提到 32768。
+     * 原来 macroblock 是 moe_chunks 的三方钳制之一（另外两个是 MYDS_MOE_CHUNKS
+     * 和 MYDS_MOE_BATCH_MAX_TOKENS/chunk），而这里 16384 的硬顶意味着
+     * moe_chunks 永远拿不到 16（16 x 2048 = 32768 > 16384）。
+     * 提升代价只是 prompt 级工作区按 cap 线性放大（16384 -> 32768 约 +1.9 GB
+     * 的 prompt_res；其余缓冲同阶），cap 本来就是按需分配。 */
     if (val < 512L) val = 512L;
-    if (val > 16384L) val = 16384L;
+    if (val > MYDS_MACROBLOCK_HARD_MAX) val = MYDS_MACROBLOCK_HARD_MAX;
     uint32_t macroblock_size = (uint32_t)val;
     if (macroblock_size % V41_SNAP_STRIDE != 0) {
         macroblock_size = ((macroblock_size + V41_SNAP_STRIDE - 1u) / V41_SNAP_STRIDE) * V41_SNAP_STRIDE;
     }
-    if (macroblock_size > 16384u) macroblock_size = 16384u;
+    if (macroblock_size > MYDS_MACROBLOCK_HARD_MAX) macroblock_size = MYDS_MACROBLOCK_HARD_MAX;
     return macroblock_size;
 }
 
