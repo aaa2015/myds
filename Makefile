@@ -1,8 +1,27 @@
 CC ?= clang
+# ★ 部署目标（2026-10-22 钉死）
+#
+# 背景：开发机 macmini 是 macOS 27.0.1，生产机 macstudio 是 26.7.1。
+# clang 默认取【编译机】的 SDK 版本作 minos，于是 macmini 编出的二进制
+# minos=27.0，传到 macstudio 上被 dyld 直接 SIGKILL（exit 137，0 字节输出）。
+# 症状极具欺骗性：codesign 有效、metallib 能加载、uname 正常，
+# 只看“进程秒死”很容易误判成代码 bug。
+#
+# 钉成运行机的版本后，两边都能跑，也不再依赖两台版本恰好匹配。
+# 要跨机部署，两边 CFLAGS 都从这里取，不要各自在命令行覆盖。
+DEPLOY_TARGET ?= 26.0
+DEPLOY_FLAGS := -mmacosx-version-min=$(DEPLOY_TARGET)
+
 # -Ithird_party: 视觉用的 iris 单头解码器（JPEG/PNG）
 CFLAGS ?= -O3 -Wall -Wextra -std=c11 -Iinclude -Ithird_party
 OBJCFLAGS ?= -O3 -Wall -Wextra -Iinclude -fobjc-arc
 LDFLAGS ?= -framework Foundation -framework Metal -lm -lpthread
+
+# 用 += 而不是写进 ?=：即使调用方覆盖了 CFLAGS，部署目标仍然生效。
+# （踩过：?= 的变量被外部覆盖后，后面的追加习惯性地跟着失效）
+CFLAGS += $(DEPLOY_FLAGS)
+OBJCFLAGS += $(DEPLOY_FLAGS)
+LDFLAGS += $(DEPLOY_FLAGS)
 
 BIN_DIR = bin
 BUILD_DIR = build
