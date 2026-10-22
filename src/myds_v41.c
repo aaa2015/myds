@@ -6530,6 +6530,11 @@ fail:
     return NULL;
 }
 
+/* 自动策略的单块上限：超过它，块内锥形裁剪的损失大于边界重算的节省。
+ * 实测 150K 上（同批次可比）：2 块均分 537.1、60:40 分 536.5、71:29 分 535.1，
+ * 而 87:13 分掉到 503.8。配合均分，上限只决定「切成几块」。 */
+#define MYDS_MACROBLOCK_AUTO_MAX 106496L
+
 /* macroblock 的硬上限。它同时是 moe_chunks 的钳制来源之一（见 prefill 里的 need 计算），
  * 所以这个值决定了 MoE 批容量能开到多大：MoE batch = min(MOE_CHUNKS, guard/chunk, 本上限/chunk) * chunk。
  * 32768 允许 chunk=2048 时拿到 moe_chunks=16。
@@ -6538,25 +6543,33 @@ fail:
  * （prompt_res = cap*4*V41_DIM*4 B，32768 时约 3.5 GiB），131072 约 14 GiB。 */
 #define MYDS_MACROBLOCK_HARD_MAX 131072L
 
-uint32_t myds_v41_resolve_macroblock_size(void) {
+uint32_t myds_v41_resolve_macroblock_size(uint32_t n_tokens) {
     const char *mb_env = getenv("MYDS_PREFILL_MACROBLOCK_SIZE");
-    long val = 8192L;
+    long val = 0L;
+    bool env_given = false;
     if (mb_env && *mb_env) {
         char *endptr = NULL;
         errno = 0;
         long parsed = strtol(mb_env, &endptr, 10);
         if (errno == 0 && endptr != mb_env && parsed > 0) {
             val = parsed;
-        } else {
-            val = 8192L;
+            env_given = true;
         }
     }
-    /* 2026-10-22: 硬上限从 16384 提到 32768。
-     * 原来 macroblock 是 moe_chunks 的三方钳制之一（另外两个是 MYDS_MOE_CHUNKS
-     * 和 MYDS_MOE_BATCH_MAX_TOKENS/chunk），而这里 16384 的硬顶意味着
-     * moe_chunks 永远拿不到 16（16 x 2048 = 32768 > 16384）。
-     * 提升代价只是 prompt 级工作区按 cap 线性放大（16384 -> 32768 约 +1.9 GB
-     * 的 prompt_res；其余缓冲同阶），cap 本来就是按需分配。 */
+    if (!env_given) {
+        /* 2026-10-22: 按本次 prefill 的 token 数自适应（账本 §35 的实测结果）。
+         *
+         * 规律不是「固定块大小」，而是「块数最少 + 均分」：
+         *   150K: 3块524 / 2块均分 537 / 2块87:13 504
+         *   90K : 6块524 / 3块568 / 2块580 / 1块598
+         *   40K : 3块577 / 2块603 / 1块637
+         * 块数越少越好，但单块超过 ~100K 后锥形裁剪开始吃亏（131072 那块最差）。
+         * 所以取：k = ceil(n / SINGLE_MAX)，再把 n 均分给 k 块。
+         * 均分比「先填满再收尾」好得多：87:13 的切分比 50:50 慢 6.2%。 */
+        const uint32_t k = (n_tokens + (uint32_t)MYDS_MACROBLOCK_AUTO_MAX - 1u) /
+                           (uint32_t)MYDS_MACROBLOCK_AUTO_MAX;
+        val = (long)((n_tokens + k - 1u) / k);
+    }
     if (val < 512L) val = 512L;
     if (val > MYDS_MACROBLOCK_HARD_MAX) val = MYDS_MACROBLOCK_HARD_MAX;
     uint32_t macroblock_size = (uint32_t)val;
@@ -6645,7 +6658,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     /* Macroblock: 把超长 prompt 切成固定上限（默认 4096 tokens）的 macroblock。
      * 每个 macroblock 跑完整 40 层，从而 prompt 级工作区（prompt_res, prompt_block_mask 等）
      * 只需按 macroblock 大小分配，彻底消除 262K 上下文时 64.52 GiB 的内存峰值，降至 ~1 GiB。 */
-    const uint32_t macroblock_size = myds_v41_resolve_macroblock_size();
+    const uint32_t macroblock_size = myds_v41_resolve_macroblock_size(n_tokens);
     const uint32_t mb_cap_needed = n_tokens < macroblock_size ? n_tokens : macroblock_size;
 
     /* MoE 的批跨几个 attention chunk。默认 1（= 旧行为：每个 chunk 跑一次 MoE）。
@@ -6676,13 +6689,15 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     /* 复用 prompt 级工作区（按 macroblock 容量分配，避免长请求每次 prefill 申请释放上吉字节引发抖动） */
     const bool prompt_ws_complete = g->prompt_res && g->prompt_pre && g->prompt_selected &&
                                     g->prompt_block_mask && g->prompt_engram_buf[0] && g->prompt_engram_buf[1];
-    {   static int logged = 0;
-        if (!logged) {
+    /* macroblock 现在是按 n_tokens 自适应的，所以不能只打一次：否则日志永远停留在
+     * 首个请求的取值上，运维看不出策略在工作。改成「值变化时打印」，不刷屏也能观察。 */
+    {   static uint32_t last_mb = 0, last_mc = 0, last_chunk = 0;
+        if (macroblock_size != last_mb || moe_chunks != last_mc || chunk_size != last_chunk) {
             MYDS_LOG_I("prefill batching: chunk=%u macroblock=%u moe_chunks=%u "
-                       "(=> MoE batch = %u tok, guard=%u)",
+                       "(=> MoE batch = %u tok, guard=%u) [n=%u]",
                        chunk_size, macroblock_size, moe_chunks,
-                       chunk_size * moe_chunks, moe_batch_max_tokens());
-            logged = 1;
+                       chunk_size * moe_chunks, moe_batch_max_tokens(), n_tokens);
+            last_mb = macroblock_size; last_mc = moe_chunks; last_chunk = chunk_size;
         }
     }
     uint32_t cap = (mb_cap_needed + 511u) / 512u * 512u;

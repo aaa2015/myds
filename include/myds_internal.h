@@ -265,7 +265,7 @@ myds_metal_buffer_t *myds_v41_snapshot_get_snap_prev_score(myds_v41_context_t *g
 uint64_t myds_v41_snapshot_allocated_bytes(const myds_v41_context_t *g);
 myds_metal_buffer_t *myds_v41_snapshot_get_compressed(myds_v41_context_t *g, uint32_t o);
 myds_metal_buffer_t *myds_v41_snapshot_get_index_cache(myds_v41_context_t *g, uint32_t o);
-uint32_t myds_v41_resolve_macroblock_size(void);
+uint32_t myds_v41_resolve_macroblock_size(uint32_t n_tokens);
 bool myds_validate_fp8_block_size(const gguf_file_t *gf, const char *arch);
 
 #ifdef __cplusplus
