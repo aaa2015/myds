@@ -4314,7 +4314,30 @@ fail:
 #undef TRACE
 }
 
+static int32_t myds_v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos, bool need_logits);
 int32_t myds_v41_forward(myds_context_t *ctx, int32_t token, uint32_t pos, bool need_logits) {
+    /* 诊断 MYDS_COMMIT_PROF=1：单 token decode 的 commit 次数与 CPU 耗时。 */
+    const bool cp_on = getenv("MYDS_COMMIT_PROF") != NULL;
+    const uint64_t cp_cmt0 = cp_on ? myds_metal_get_commit_count() : 0;
+    struct timespec cp_ts0, cp_cpu0;
+    if (cp_on) { clock_gettime(CLOCK_MONOTONIC, &cp_ts0); clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cp_cpu0); }
+    const int32_t cp_ret = myds_v41_forward_impl(ctx, token, pos, need_logits);
+    if (cp_on) {
+        struct timespec cp_ts1; clock_gettime(CLOCK_MONOTONIC, &cp_ts1);
+        struct timespec cp_cpu1; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cp_cpu1);
+        const double wall = (cp_ts1.tv_sec - cp_ts0.tv_sec) * 1000.0
+                          + (cp_ts1.tv_nsec - cp_ts0.tv_nsec) / 1e6;
+        const double cpu  = (cp_cpu1.tv_sec - cp_cpu0.tv_sec) * 1000.0
+                          + (cp_cpu1.tv_nsec - cp_cpu0.tv_nsec) / 1e6;
+        static double acc_wall = 0, acc_cpu = 0; static int n = 0;
+        acc_wall += wall; acc_cpu += cpu; n++;
+        fprintf(stderr, "[commit-prof] commit=%2llu 墙钟 %6.3f ms  CPU %6.3f ms (%.0f%%)\n",
+                (unsigned long long)(myds_metal_get_commit_count() - cp_cmt0), wall, cpu,
+                wall > 0 ? cpu * 100.0 / wall : 0.0);
+    }
+    return cp_ret;
+}
+static int32_t myds_v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos, bool need_logits) {
     return v41_forward_impl(ctx, token, pos, need_logits, true);
 }
 
@@ -4886,6 +4909,10 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
     int prev_auto_barrier = -1;
     const bool timed = ctx && ctx->decode_metrics_active;
     const double t_start = timed ? lowkv_now_ms() : 0.0;
+    /* 诊断 MYDS_COMMIT_PROF=1：一次 decode 内的 commandBuffer commit 次数与 CPU 耗时，
+     * 用来量化「Metal 驱动提交税」。 */
+    const uint64_t cmt_0 = getenv("MYDS_COMMIT_PROF") ? myds_metal_get_commit_count() : 0;
+    struct timespec cts0; if (getenv("MYDS_COMMIT_PROF")) clock_gettime(CLOCK_MONOTONIC, &cts0);
 
     static int decode_split = -1;
     if (decode_split < 0) {
@@ -5288,6 +5315,15 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
             ctx->decode_stats.batch2_encode_ms += (t_encode - t_prep) + lazy_encode_ms;
             ctx->decode_stats.batch2_gpu_ms += (t_gpu - t_encode) + lazy_wait_ms;
             ctx->decode_stats.batch2_arb_ms += (t_end - t_gpu) - lazy_encode_ms - lazy_wait_ms;
+        }
+        /* 诊断：报告 commit 次数与 CPU 耗时（MYDS_COMMIT_PROF=1）。 */
+        if (getenv("MYDS_COMMIT_PROF")) {
+            struct timespec cts1; clock_gettime(CLOCK_MONOTONIC, &cts1);
+            const double ms = (cts1.tv_sec - cts0.tv_sec) * 1000.0
+                            + (cts1.tv_nsec - cts0.tv_nsec) / 1e6;
+            const uint64_t cmt = myds_metal_get_commit_count() - cmt_0;
+            fprintf(stderr, "[commit-prof] 本次 decode：commit=%llu 次，CPU 全程 %.3f ms\n",
+                    (unsigned long long)cmt, ms);
         }
         return 1;
     }
@@ -7664,10 +7700,18 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 /* MYDS_PROFILE_ALLOC=1 附带：本层路由的专家 union。
                  * 决定 MoE 的读取下限——若 union << 384，说明只读部分专家是可能的。 */
                 if (pf_on && (getenv("MYDS_PROFILE_ALLOC")[0] == '2')) {
-                    /* 必须真正等 GPU 写完，否则读到的是旧数据（曾因此得到 union=1 的假结论）。 */
+                    /* 必须真正等 GPU 写完，否则读到旧数据。
+                     * 三步缺一不可（§52 教训）：
+                     *   flush_batch()  → commit 并置 g_batch_cb=nil，**不等待**
+                     *   commit_batch() → g_batch_cb 为 nil ⇒ wait_inflight_commands() 真正排空
+                     *   begin_batch()  → 重建 batch，否则后续 dispatch 没有 encoder */
                     if (!myds_metal_get_auto_barrier()) myds_metal_barrier();
                     CHECK(myds_metal_flush_batch());
-                    const int32_t *ids_host = (const int32_t *)myds_metal_buffer_data(cw->selected_ids_buf);
+                    CHECK(myds_metal_commit_batch());
+                    CHECK(myds_metal_begin_batch());
+                    /* ★ direct_moe_acc 时路由结果写在 moe_ids_acc（经 in_ids_view），
+                     * 不是 selected_ids_buf —— 之前读错 buffer，得到「被触及专家 1 个」的假数据。 */
+                    const int32_t *ids_host = (const int32_t *)myds_metal_buffer_data(cur_ids);
                     static uint32_t seen[512];
                     static uint64_t tot_union = 0; static uint32_t tot_layers = 0;
                     memset(seen, 0, sizeof(seen));
@@ -7685,11 +7729,51 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                                ids_host[0], ids_host[1], ids_host[2],
                                ids_host[3], ids_host[4], ids_host[5]);
                     }
-                    if (il == V41_LAYERS - 1u) {
-                        printf("  [route] %u 层平均 union = %.1f / %u (%.0f%%)\n", tot_layers,
-                               (double)tot_union / tot_layers, m->n_routed_experts,
-                               (double)tot_union / tot_layers * 100.0 / m->n_routed_experts);
-                        tot_union = 0; tot_layers = 0;
+                    /* 全局直方图：每个专家被选中的总次数（跨全部层与全部 chunk）。
+                     * 用来回答「砍掉一半专家后，活跃专家还剩多少」——见 §67。 */
+                    {
+                        static uint64_t hist[512];
+                        static int hist_init = 0;
+                        if (!hist_init) { memset(hist, 0, sizeof(hist)); hist_init = 1; }
+                        for (uint32_t q = 0; q < c_len * 6u; q++) {
+                            int32_t id = ids_host[q];
+                            if (id >= 0 && id < 512) hist[id]++;
+                        }
+                        if (il == V41_LAYERS - 1u) {
+                            printf("  [route] %u 层平均 union = %.1f / %u (%.0f%%)\n", tot_layers,
+                                   (double)tot_union / tot_layers, m->n_routed_experts,
+                                   (double)tot_union / tot_layers * 100.0 / m->n_routed_experts);
+                            tot_union = 0; tot_layers = 0;
+
+                            /* 直方图报告：按被选次数降序，算 top-K 覆盖率 */
+                            const uint32_t NE = m->n_routed_experts;
+                            uint64_t total = 0, used = 0;
+                            for (uint32_t e = 0; e < NE; e++) { total += hist[e]; if (hist[e]) used++; }
+                            /* 排序副本 */
+                            static uint64_t srt[512];
+                            for (uint32_t e = 0; e < NE; e++) srt[e] = hist[e];
+                            for (uint32_t i = 0; i < NE; i++)
+                                for (uint32_t j = i + 1; j < NE; j++)
+                                    if (srt[j] > srt[i]) { uint64_t t = srt[i]; srt[i] = srt[j]; srt[j] = t; }
+                            printf("  [route] === 专家使用直方图 ===\n");
+                            printf("  [route] 总选择次数 %llu，被触及专家 %llu / %u (%.1f%%)，"
+                                   "零使用 %u 个\n",
+                                   (unsigned long long)total, (unsigned long long)used, NE,
+                                   used * 100.0 / NE, NE - (uint32_t)used);
+                            const uint32_t cuts[] = {96, 128, 160, 176, 192, 224, 256, 288, 320, 384};
+                            for (unsigned ci = 0; ci < sizeof(cuts)/sizeof(cuts[0]); ci++) {
+                                uint32_t k = cuts[ci];
+                                if (k > NE) continue;
+                                uint64_t cov = 0;
+                                for (uint32_t i = 0; i < k; i++) cov += srt[i];
+                                printf("  [route] top-%-3u (%5.1f%%) 覆盖 %6.2f%% 的选择次数"
+                                       "   ［砍掉后损失 %.2f%%］\n",
+                                       k, k * 100.0 / NE,
+                                       total ? cov * 100.0 / total : 0.0,
+                                       total ? (total - cov) * 100.0 / total : 0.0);
+                            }
+                            memset(hist, 0, sizeof(hist));
+                        }
                     }
                 }
                 if (do_prof && opt_prof_moe) {

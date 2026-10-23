@@ -2795,9 +2795,20 @@ myds_metal_buffer_t *myds_metal_buffer_from_ptr(const void *ptr, size_t bytes) {
     }
 }
 
+/* 诊断：统计 sub_view 的 calloc 次数（MYDS_VIEW_CNT=1 时每 1000 次打印一次）。 */
+static _Atomic uint64_t g_subview_calls = 0;
+static void myds_view_cnt_report(void) {
+    fprintf(stderr, "[view-cnt] sub_view 总调用 = %llu\n",
+            (unsigned long long)atomic_load_explicit(&g_subview_calls, memory_order_relaxed));
+}
 myds_metal_buffer_t *myds_metal_buffer_sub_view(const myds_metal_buffer_t *parent, size_t offset, size_t bytes) {
     if (!parent || !parent->mtl_buf || offset > parent->size || bytes > parent->size - offset ||
         (parent->mapped_owner && parent->mapped_owner->residency_epoch != g_res_epoch)) return NULL;
+    if (getenv("MYDS_VIEW_CNT")) {
+        static int reg = 0;
+        if (!reg) { reg = 1; atexit((void(*)(void))myds_view_cnt_report); }
+        atomic_fetch_add_explicit(&g_subview_calls, 1, memory_order_relaxed);
+    }
     myds_metal_buffer_t *buf = (myds_metal_buffer_t *)calloc(1, sizeof(myds_metal_buffer_t));
     if (!buf) return NULL;
     buf->mtl_buf = parent->mtl_buf;
