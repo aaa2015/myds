@@ -7720,6 +7720,23 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     /* 注：本分支只在全量 chunk 里可达（moe_off 只在全量 chunk 里累加） */
                     const uint32_t mb_moe_len = moe_off;
                     const uint32_t mb_moe_start = c_start + c_len - mb_moe_len;   /* 本批在 prompt 里的起点 */
+                    /* 诊断 MYDS_MOE_SOLO=1：把队列彻底排空后单独计 MoE 的 GPU 时间。
+                     * 三步缺一不可（见 myds_metal.m 的实现）：
+                     *   flush_batch()  -> commit 并把 g_batch_cb 置 nil（不等待）
+                     *   commit_batch() -> g_batch_cb 为 nil => 走 wait_inflight_commands() 真正排空
+                     *   begin_batch()  -> 重建 batch，否则后续 dispatch 没有 encoder
+                     * 代价：破坏与前后工作的重叠，总时长变长；此处只取 MoE 的真实占比。 */
+                    const bool moe_solo = getenv("MYDS_MOE_SOLO") != NULL;
+                    double moe_solo_t0 = 0.0;
+                    if (moe_solo) {
+                        if (!myds_metal_get_auto_barrier()) myds_metal_barrier();
+                        CHECK(myds_metal_flush_batch());
+                        CHECK(myds_metal_commit_batch());
+                        CHECK(myds_metal_begin_batch());
+                        struct timeval tv;
+                        gettimeofday(&tv, NULL);
+                        moe_solo_t0 = (double)tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+                    }
                     if (!myds_metal_get_auto_barrier()) myds_metal_barrier();
                     CHECK(myds_metal_routed_moe_batch(cw->moe_out_acc, cw->moe_norm_acc,
                         base->ffn_gate_exps, base->ffn_up_exps, base->ffn_down_exps,
@@ -7729,6 +7746,16 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                         base->ffn_gate_exps_type, base->ffn_up_exps_type, base->ffn_down_exps_type,
                         m->swiglu_clamp_exp));
                     if (!myds_metal_get_auto_barrier()) myds_metal_barrier();
+                    if (moe_solo) {
+                        CHECK(myds_metal_flush_batch());
+                        CHECK(myds_metal_commit_batch());
+                        CHECK(myds_metal_begin_batch());
+                        struct timeval tv;
+                        gettimeofday(&tv, NULL);
+                        const double t1 = (double)tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+                        printf("[moe-solo] il=%u n=%u  %.2f ms\n", il, mb_moe_len, t1 - moe_solo_t0);
+                        fflush(stdout);
+                    }
                     if (do_prof && opt_prof_moe) {
                         TIME_START();
                         CHECK(myds_metal_commit_batch());

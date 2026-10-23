@@ -6335,6 +6335,20 @@ static int routed_moe_batch_impl(
             [enc setThreadgroupMemoryLength:(NSUInteger)n_routed_experts * (NSUInteger)n_activated_experts * sizeof(uint16_t) atIndex:0];
             metal_dispatch(enc, "moe_map0", MTLSizeMake(1, 1, 1),
                 MTLSizeMake((NSUInteger)n_routed_experts, 1, 1));
+            /* 诊断：真实 tile 数 vs 保守上限。决定「384 专家全扫」是否成立。 */
+            if (getenv("MYDS_MOE_TILE_PROF")) {
+                id<MTLCommandBuffer> tcb = [g_queue commandBuffer];
+                id<MTLBlitCommandEncoder> b = [tcb blitCommandEncoder];
+                [b synchronizeResource:g_moe_id_map_buffer];
+                [b endEncoding];
+                [tcb commit]; [tcb waitUntilCompleted];
+                const uint32_t *wc = (const uint32_t *)((const char *)[g_moe_id_map_buffer contents] + work_offset);
+                fprintf(stderr, "[moe-tile] n_tok=%u pair_rows=%llu work_cap=%llu work_count=%u "
+                                "(ratio %.1f%%, wasted TG %llu)\n",
+                        n_tok, (unsigned long long)pair_rows, (unsigned long long)work_cap,
+                        wc[0], work_cap ? 100.0 * wc[0] / work_cap : 0.0,
+                        (unsigned long long)(work_cap - wc[0]));
+            }
             if (g_moe_split < 0) g_moe_split = getenv("MYDS_MOE_STEP_PROF") ? 1 : 0;
             if (g_moe_split) moe_split_point(&cb, &enc, &g_moe_t_map0);
 
