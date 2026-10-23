@@ -49,31 +49,44 @@ int main(int argc, char **argv) {
         offs_same[i] = (uint64_t)exps[0] * EXP_BYTES;
     }
 
-    struct { const char *name; const uint64_t *offs; uint32_t nreg; } arms[] = {
-        { "A 连续  (1 段 192MB)",   offs_same, 1 },
-        { "B 散读  (6 个散专家)",   offs_scat, 6 },
-        { "C 同址  (6 次同 offset)", offs_same, 6 },
+    /* 六臂：地址模式相同（除了 A），只差计算量 */
+    struct { const char *name; const uint64_t *offs; uint32_t nreg; uint32_t mode; } arms[] = {
+        { "A 连续 + 只读",            offs_same, 1, 0 },
+        { "B 散读 + 只读",            offs_scat, 6, 0 },
+        { "C 同址 + 只读",            offs_same, 6, 0 },
+        { "D 散读 + 62×FMA 依赖链",   offs_scat, 6, 1 },
+        { "E 散读 + 62×FMA 4累加器",  offs_scat, 6, 2 },
+        { "F 散读 + 合成解码(偏重)",  offs_scat, 6, 3 },
+        { "G 散读 + 真 LDS 解码+FMA", offs_scat, 6, 4 },
     };
+    const int NARM = 7;
 
-    printf("  %-28s %10s %12s\n", "臂", "耗时(ms)", "有效GB/s");
-    double bw[3] = {0,0,0};
-    for (int a = 0; a < 3; a++) {
+    printf("  %-28s %10s %12s %10s\n", "臂", "耗时(ms)", "有效GB/s", "占B臂");
+    double bw[7] = {0,0,0,0,0,0,0};
+    for (int a = 0; a < NARM; a++) {
         double best = 1e18;
         for (int rep = 0; rep < R + 2; rep++) {
             double t0 = now_us();
             for (int k = 0; k < R; k++)
-                if (!myds_metal_pureread_scatter6(d, w, arms[a].offs, region, arms[a].nreg)) return 2;
-            myds_metal_synchronize();          /* 每臂一次 */
+                if (!myds_metal_pureread_fma6(d, w, arms[a].offs, region, arms[a].nreg, arms[a].mode)) return 2;
+            myds_metal_synchronize();
             double dt = now_us() - t0;
             if (rep >= 2 && dt < best) best = dt;
         }
         const double bytes = (double)region * 6.0 * R;
         bw[a] = bytes / (best * 1e-6) / 1e9;
-        printf("  %-28s %10.3f %12.1f\n", arms[a].name, best / 1000.0, bw[a]);
+        printf("  %-28s %10.3f %12.1f %9.0f%%\n", arms[a].name, best / 1000.0, bw[a],
+               a ? bw[a]/bw[1]*100.0 : 100.0*bw[0]/bw[1]);
     }
     printf("\n  ═══ 判读 ═══\n");
-    printf("  A/B = %.2f 倍  ⇒ 这是「散读」的纯代价（三臂 dispatch 数相同）\n", bw[0]/bw[1]);
-    printf("  A/C = %.2f 倍  ⇒ C 是同一地址重复读，差值反映 SLC 命中收益\n", bw[0]/bw[2]);
+    printf("  散读代价      A/B = %.2f 倍（%.0f%%）\n", bw[0]/bw[1], (1-bw[1]/bw[0])*100);
+    printf("  SLC 同址收益  C/B = %.2f 倍\n", bw[2]/bw[1]);
+    printf("  FMA 依赖链    D/B = %.2f 倍  ⇒ 掉 %.0f%%\n", bw[3]/bw[1], (1-bw[3]/bw[1])*100);
+    printf("  FMA 4 累加器  E/B = %.2f 倍  ⇒ 掉 %.0f%%\n", bw[4]/bw[1], (1-bw[4]/bw[1])*100);
+    printf("  合成解码      F/B = %.2f 倍  ⇒ 掉 %.0f%%（含 64 位乘法，偏重）\n", bw[5]/bw[1], (1-bw[5]/bw[1])*100);
+    printf("  ★真 LDS 解码 G/B = %.2f 倍  ⇒ 掉 %.0f%%  ← 这一条才是答案\n", bw[6]/bw[1], (1-bw[6]/bw[1])*100);
+    printf("\n  依赖链 vs 4累加器  E/D = %.2f 倍  ⇒ %s\n", bw[4]/bw[3],
+           bw[4] > bw[3]*1.15 ? "依赖链确实是瓶颈" : "依赖链不是瓶颈");
     myds_metal_buffer_free(w); myds_metal_buffer_free(d);
     return 0;
 }

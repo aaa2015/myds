@@ -186,6 +186,11 @@ int myds_metal_pureread(myds_metal_buffer_t *dst, const myds_metal_buffer_t *src
 int myds_metal_pureread_scatter6(myds_metal_buffer_t *dst, const myds_metal_buffer_t *src,
                                  const uint64_t offs[6], uint64_t region_bytes,
                                  uint32_t n_regions);
+/* 2026-10-23 P2：读 → 解码 → 累加 逐级加上去，定位「53%」来自哪一级。
+ * mode 0=只读  1=FMA 依赖链  2=FMA 4 累加器  3=真实 IQ2 式解码 */
+int myds_metal_pureread_fma6(myds_metal_buffer_t *dst, const myds_metal_buffer_t *src,
+                             const uint64_t offs[6], uint64_t region_bytes,
+                             uint32_t n_regions, uint32_t mode);
 void myds_metal_kprof_arm(int on);
 int  myds_metal_kprof_report(FILE *out, const char *label, uint32_t tokens);
 /* Measure the fixed per-encoder bracket cost (median of 256 trivial kernels, one

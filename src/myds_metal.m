@@ -8176,6 +8176,44 @@ int myds_metal_pureread_scatter6(myds_metal_buffer_t *dst, const myds_metal_buff
 }
 
 
+/* 2026-10-23 P2：把计算量分成四级，其余（地址、dispatch 数、字节）完全相同。 */
+int myds_metal_pureread_fma6(myds_metal_buffer_t *dst, const myds_metal_buffer_t *src,
+                             const uint64_t offs[6], uint64_t region_bytes,
+                             uint32_t n_regions, uint32_t mode) {
+    if (!g_library || !dst || !src || !offs || !region_bytes) return 0;
+    if (n_regions == 0 || n_regions > 6 || mode > 4) return 0;
+    static id<MTLComputePipelineState> pso = nil;
+    if (!pso) {
+        id<MTLFunction> fn = [g_library newFunctionWithName:@"kernel_pureread_fma6"];
+        if (!fn) return 0;
+        pso = [g_device newComputePipelineStateWithFunction:fn error:nil];
+        if (!pso) return 0;
+    }
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = g_batch_cb ?: [g_queue commandBuffer];
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
+        if (!enc) return 0;
+        struct { uint64_t offs[6]; uint64_t region_bytes; uint32_t n_regions, mode; } a;
+        memset(&a, 0, sizeof(a));
+        for (uint32_t i = 0; i < 6; i++) a.offs[i] = offs[i];
+        a.region_bytes = region_bytes;
+        a.n_regions = n_regions;
+        a.mode = mode;
+        [enc setComputePipelineState:pso];
+        [enc setBytes:&a length:sizeof(a) atIndex:0];
+        [enc setBuffer:src->mtl_buf offset:src->offset atIndex:1];
+        [enc setBuffer:dst->mtl_buf offset:dst->offset atIndex:2];
+        const uint32_t tgsz = 256u;
+        const uint64_t total_bytes = (n_regions == 1) ? region_bytes * 6u : region_bytes * n_regions;
+        const uint32_t nthreads = (uint32_t)(total_bytes / 16u);
+        if (!nthreads) return 0;
+        const uint32_t ntg = (nthreads + tgsz - 1u) / tgsz;
+        metal_dispatch(enc, "pureread_fma6", MTLSizeMake(ntg, 1, 1), MTLSizeMake(tgsz, 1, 1));
+        return v41_finish(cb, enc);
+    }
+}
+
 
 /* ═══════════════════════════════════════════════════════════════════════
  * 2026-10-22 参谋长：F16 routed MoE（DSpark drafter 验证用）
