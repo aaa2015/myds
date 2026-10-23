@@ -6596,6 +6596,11 @@ uint32_t myds_v41_resolve_macroblock_size(uint32_t n_tokens) {
 
 int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                             uint32_t n_tokens, volatile int *cancel_flag) {
+    /* MYDS_PROFILE_ALLOC=1：只给「入口 → 层循环」这段未计时区加打点。
+     * 独立开关，避免动 MYDS_PROFILE_PREFILL（后者会把 chunk 退化成串行）。 */
+    struct timeval pf_t0;
+    const bool pf_on = (getenv("MYDS_PROFILE_ALLOC") != NULL);
+    if (pf_on) gettimeofday(&pf_t0, NULL);
     if (!ctx || !tokens || n_tokens == 0) return 1;
     myds_model_t *m = ctx->model;
     myds_v41_context_t *g = ctx->v41;
@@ -6803,6 +6808,14 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         g->prompt_mask_bytes_cap = mask_bytes;
     }
 
+    double pf_alloc_ms = -1.0;
+    if (pf_on) {
+        struct timeval t;
+        gettimeofday(&t, NULL);
+        pf_alloc_ms = (t.tv_sec - pf_t0.tv_sec) * 1000.0
+                    + (t.tv_usec - pf_t0.tv_usec) / 1000.0;
+    }
+
     myds_metal_buffer_t *prompt_res = g->prompt_res;
     myds_metal_buffer_t *prompt_pre = g->prompt_pre;
     myds_metal_buffer_t *prompt_selected = g->prompt_selected;
@@ -6918,6 +6931,14 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 
 #define CHECK(x) do { if (!(x)) goto fail; } while (0)
 #define TRACE(stage,buf,n) do { if (trace_on) CHECK(myds_trace_f32(stage,il,pos,buf,n)); } while (0)
+
+    double pf_prelayers_ms = -1.0;   /* 入口 → 层循环开始（含分配、检查、日志） */
+    if (pf_on) {
+        struct timeval t;
+        gettimeofday(&t, NULL);
+        pf_prelayers_ms = (t.tv_sec - pf_t0.tv_sec) * 1000.0
+                        + (t.tv_usec - pf_t0.tv_usec) / 1000.0;
+    }
 
     if (do_prof) gettimeofday(&ptv_all0, NULL);
 
@@ -7602,6 +7623,38 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     }
                 }
                 TIME_ACC(prof_step7);
+
+                /* MYDS_PROFILE_ALLOC=1 附带：本层路由的专家 union。
+                 * 决定 MoE 的读取下限——若 union << 384，说明只读部分专家是可能的。 */
+                if (pf_on && (getenv("MYDS_PROFILE_ALLOC")[0] == '2')) {
+                    /* 必须真正等 GPU 写完，否则读到的是旧数据（曾因此得到 union=1 的假结论）。 */
+                    if (!myds_metal_get_auto_barrier()) myds_metal_barrier();
+                    CHECK(myds_metal_flush_batch());
+                    const int32_t *ids_host = (const int32_t *)myds_metal_buffer_data(cw->selected_ids_buf);
+                    static uint32_t seen[512];
+                    static uint64_t tot_union = 0; static uint32_t tot_layers = 0;
+                    memset(seen, 0, sizeof(seen));
+                    uint32_t uni = 0;
+                    for (uint32_t q = 0; q < c_len * 6u; q++) {
+                        int32_t id = ids_host[q];
+                        if (id >= 0 && id < 512 && !seen[id]) { seen[id] = 1; uni++; }
+                    }
+                    /* il==0 的第一次 flush 时机不稳（读到全 0），统计从 il>=1 起。
+                     * 不影响结论：39 层的平均与 40 层无实质差异。 */
+                    if (il > 0u) { tot_union += uni; tot_layers++; }
+                    if (il > 0u && (il < 4u || il == V41_LAYERS - 1u)) {
+                        printf("  [route] il=%2u n=%u -> union=%2u / %u   ids[0..5]=%d,%d,%d,%d,%d,%d\n",
+                               il, c_len, uni, m->n_routed_experts,
+                               ids_host[0], ids_host[1], ids_host[2],
+                               ids_host[3], ids_host[4], ids_host[5]);
+                    }
+                    if (il == V41_LAYERS - 1u) {
+                        printf("  [route] %u 层平均 union = %.1f / %u (%.0f%%)\n", tot_layers,
+                               (double)tot_union / tot_layers, m->n_routed_experts,
+                               (double)tot_union / tot_layers * 100.0 / m->n_routed_experts);
+                        tot_union = 0; tot_layers = 0;
+                    }
+                }
                 if (do_prof && opt_prof_moe) {
                     TIME_START();
                     CHECK(myds_metal_commit_batch());
@@ -7799,6 +7852,20 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             CHECK(myds_metal_commit_batch());
         }
     } /* macroblock loop */
+
+    if (pf_on) {
+        struct timeval t;
+        gettimeofday(&t, NULL);
+        const double tail_ms = (t.tv_sec - pf_t0.tv_sec) * 1000.0
+                             + (t.tv_usec - pf_t0.tv_usec) / 1000.0;
+        printf("--- PREFILL SPLIT (n=%u, base_pos=%u) ---\n", n_tokens, base_pos);
+        printf("  A. entry -> after alloc   : %8.2f ms  (chunk_ws + prompt_ws)\n", pf_alloc_ms);
+        printf("  B. alloc -> layers begin  : %8.2f ms  (checks/logs/etc)\n",
+               pf_prelayers_ms - pf_alloc_ms);
+        printf("  C. layers (wall)          : %8.2f ms\n", tail_ms - pf_prelayers_ms);
+        printf("  ------ TOTAL (entry->end) : %8.2f ms\n", tail_ms);
+        fflush(stdout);
+    }
 
     if (do_prof) {
         gettimeofday(&ptv_all1, NULL);
