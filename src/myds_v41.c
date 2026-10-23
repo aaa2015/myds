@@ -3922,7 +3922,43 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
             TRACE("hc_attn_input",ctx->x,V41_DIM);
             TRACE("attn_norm",ctx->x_norm,V41_DIM);
             phase="attention projections";
+            /* MYDS_QKV_MERGE=1：一次 GEMV 覆盖 1280(q_a)+512(kv)=1792 行，
+             * 省掉一次调用的固定开销。输出在 attn_qkv_out 里连续存放，
+             * 前 1280 行是 q_a，后 512 行是 kv。 */
+            if (!trace_on && base->attn_qkv_merged && base->attn_qkv_out) {
+                if (!(project_decode_qkv(base->attn_qkv_out, base->attn_qkv_merged, ctx->x_norm,
+                                         1792u, V41_DIM, base->attn_q_a_type, false) &&
+                      /* GEMV 写 attn_qkv_out，紧接着的 copy 读它 ⇒ 必须同步，
+                       * 否则读到未完成/旧数据（这是首版 0-ULP 失败的原因）。 */
+                      (myds_metal_get_auto_barrier() || (myds_metal_barrier(), true)) &&
+                      myds_metal_buffer_copy(ctx->qr, 0, base->attn_qkv_out, 0, 1280u * sizeof(float)) &&
+                      myds_metal_buffer_copy(ctx->kv_act, 0, base->attn_qkv_out,
+                                             1280u * sizeof(float), 512u * sizeof(float)))) {
+                    MYDS_LOG_E("V4.1 merged qkv projection failed at layer %u", il);
+                    return -1;
+                }
+                if (getenv("MYDS_QKV_DEBUG") && il == 0 && ctx->pos < 3) {
+                    if (!myds_metal_get_auto_barrier()) myds_metal_barrier();
+                    CHECK(myds_metal_flush_batch());
+                    const float *qq = (const float *)myds_metal_buffer_data(ctx->qr);
+                    const float *kk = (const float *)myds_metal_buffer_data(ctx->kv_act);
+                    fprintf(stderr, "[qkv-dbg] MERGED qr[0..3]=%.9g %.9g %.9g %.9g | kv[0..3]=%.9g %.9g %.9g %.9g\n",
+                            qq[0],qq[1],qq[2],qq[3], kk[0],kk[1],kk[2],kk[3]);
+                }
+                TRACE("q_a_raw",ctx->qr,1280);
+                CHECK(myds_metal_v41_rmsnorm(ctx->qr_norm,ctx->qr,base->attn_q_a_norm,1280,m->norm_eps,true));
+                TRACE("q_a_norm",ctx->qr_norm,1280);
+                CHECK(project_qb_shape_scoped(ctx->q,base->attn_q_b,ctx->qr_norm,V41_HEADS*512,1280,base->attn_q_b_type,trace_on,ordinary_decode_allowed && need_logits));
+                TRACE("q_b",ctx->q,V41_HEADS*512);
+                TRACE("kv_raw",ctx->kv_act,512);
+            } else {
             CHECK(project_decode_qkv(ctx->qr,base->attn_q_a,ctx->x_norm,1280,V41_DIM,base->attn_q_a_type,trace_on));
+            if (getenv("MYDS_QKV_DEBUG") && il == 0 && ctx->pos < 3) {
+                if (!myds_metal_get_auto_barrier()) myds_metal_barrier();
+                CHECK(myds_metal_flush_batch());
+                const float *qq = (const float *)myds_metal_buffer_data(ctx->qr);
+                fprintf(stderr, "[qkv-dbg] BASE qr[0..3]=%.9g %.9g %.9g %.9g\n", qq[0],qq[1],qq[2],qq[3]);
+            }
             TRACE("q_a_raw",ctx->qr,1280);
             CHECK(myds_metal_v41_rmsnorm(ctx->qr_norm,ctx->qr,base->attn_q_a_norm,1280,m->norm_eps,true));
             TRACE("q_a_norm",ctx->qr_norm,1280);
@@ -3930,6 +3966,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
             TRACE("q_b",ctx->q,V41_HEADS*512);
             CHECK(project_decode_qkv(ctx->kv_act,base->attn_kv,ctx->x_norm,512,V41_DIM,base->attn_kv_type,trace_on));
             TRACE("kv_raw",ctx->kv_act,512);
+            }
             CHECK(myds_metal_v41_rmsnorm(ctx->kv_act,ctx->kv_act,base->attn_kv_a_norm,512,m->norm_eps,true));
             TRACE("kv_norm",ctx->kv_act,512);
             static int qkv_post_enabled=-1;

@@ -725,6 +725,29 @@ static myds_model_t *model_load_internal(const char *model_path, bool diagnostic
                 goto fail;
             }
             m->layers[i].attn_kv = create_metal_buffer_from_tensor(tkv);
+            /* 诊断 MYDS_QKV_ADJACENCY=1：attn_q_a 与 attn_kv 在 GGUF 里是否物理相邻。
+             * 若相邻，一个 buffer 就能覆盖两者 ⇒ 单次 GEMV 覆盖 1792 行，省一次固定开销。
+             * 判定标准：kv 的 data 起点 == q_a 的 data 起点 + q_a 的 size。 */
+            /* MYDS_QKV_MERGE=1：把 attn_q_a（1280 行）与 attn_kv（512 行）拼成连续 1792 行。
+             * 两者输入相同（都是 x_norm）、in_dim 相同（5120），且互不依赖 ⇒
+             * decode 时一次 GEMV 覆盖两者，省掉一次调用的固定开销（实测 ~33 µs/层）。
+             * 代价：每层多 4.92 MB 常驻（40 层合计 197 MB）。 */
+            if (getenv("MYDS_QKV_MERGE") && tqa->type == tkv->type) {
+                const size_t merged_bytes = tqa->size_bytes + tkv->size_bytes;
+                myds_metal_buffer_t *mb = myds_metal_buffer_alloc(merged_bytes);
+                myds_metal_buffer_t *ob = myds_metal_buffer_alloc(
+                    ((size_t)1280u + 512u) * sizeof(float));
+                if (mb && ob &&
+                    myds_metal_buffer_copy(mb, 0, m->layers[i].attn_q_a, 0, tqa->size_bytes) &&
+                    myds_metal_buffer_copy(mb, tqa->size_bytes, m->layers[i].attn_kv, 0, tkv->size_bytes)) {
+                    m->layers[i].attn_qkv_merged = mb;
+                    m->layers[i].attn_qkv_out = ob;
+                } else {
+                    if (mb) myds_metal_buffer_free(mb);
+                    if (ob) myds_metal_buffer_free(ob);
+                    fprintf(stderr, "myds_engine: QKV merge buffers failed at layer %u\n", i);
+                }
+            }
             m->layers[i].attn_kv_type = tkv->type;
 
             snprintf(name, sizeof(name), "blk.%u.attn_kv_a_norm.weight", i);

@@ -24,6 +24,10 @@ typedef struct {
     myds_metal_buffer_t *attn_q_a_norm;
     myds_metal_buffer_t *attn_q_b;
     myds_metal_buffer_t *attn_kv;
+    /* MYDS_QKV_MERGE=1 时：attn_q_a（1280 行）与 attn_kv（512 行）拼成连续 1792 行，
+     * 使 decode 的一次 GEMV 覆盖两者，省掉一次调用的固定开销（实测 ~33 µs/层）。 */
+    myds_metal_buffer_t *attn_qkv_merged;
+    myds_metal_buffer_t *attn_qkv_out;   /* 1792 行输出，再拆到 qr / kv_act */
     myds_metal_buffer_t *attn_kv_a_norm;
     myds_metal_buffer_t *attn_sinks;
     myds_metal_buffer_t *attn_output_a;
