@@ -6152,6 +6152,14 @@ static void moe_split_point(id<MTLCommandBuffer> *cbp,
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     myds_metal_commit_batch();
+    /* 2026-10-23：注释一直写着「commit+wait」，但实现只有 commit（异步），
+     * 所以旧的 MYDS_MOE_STEP_PROF 量到的是【提交时间】而非 GPU 执行时间。
+     * MYDS_MOE_SYNC_SPLIT=1 时补上真正的排空：
+     *   commit_batch() 在 g_batch_cb 为 nil 时走 wait_inflight_commands()。
+     * 这会破坏重叠、总时长变长，但能得到每一步的真实 GPU 耗时。 */
+    if (getenv("MYDS_MOE_SYNC_SPLIT")) {
+        myds_metal_commit_batch();
+    }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     *acc += (t1.tv_sec - t0.tv_sec) * 1000.0 + (double)(t1.tv_nsec - t0.tv_nsec) / 1.0e6;
     /* 与仓库其它剖析点同一模式：commit 之后必须 begin，否则 encoder 生命周期错乱
@@ -6343,11 +6351,30 @@ static int routed_moe_batch_impl(
                 [b endEncoding];
                 [tcb commit]; [tcb waitUntilCompleted];
                 const uint32_t *wc = (const uint32_t *)((const char *)[g_moe_id_map_buffer contents] + work_offset);
-                fprintf(stderr, "[moe-tile] n_tok=%u pair_rows=%llu work_cap=%llu work_count=%u "
-                                "(ratio %.1f%%, wasted TG %llu)\n",
-                        n_tok, (unsigned long long)pair_rows, (unsigned long long)work_cap,
-                        wc[0], work_cap ? 100.0 * wc[0] / work_cap : 0.0,
-                        (unsigned long long)(work_cap - wc[0]));
+                const uint32_t *tpe = (const uint32_t *)[g_moe_id_map_buffer contents];
+                /* tpe[e] = 专家 e 被路由到的行数；tiles(理论最小) = Σ ceil(tpe[e]/32)。
+                 * 关键比值：experts_used / work_count —— 它决定「权重重复读」的倍数。
+                 * 若某专家占 4 个 tile，它的 9.953 MB 权重会被读 4 次。 */
+                uint32_t experts_used = 0, rows_total = 0, max_rows = 0;
+                uint64_t tiles_min = 0;
+                for (uint32_t e = 0; e < n_routed_experts; e++) {
+                    const uint32_t r = tpe[e];
+                    if (!r) continue;
+                    experts_used++; rows_total += r;
+                    if (r > max_rows) max_rows = r;
+                    tiles_min += (r + 31u) / 32u;
+                }
+                fprintf(stderr,
+                    "[moe-tile] n_tok=%u pair_rows=%llu wc=%u/%llu "
+                    "| experts=%u rows=%u tiles_min=%llu max_rows/exp=%u "
+                    "| reload=%.2fx (ideal %.0f GB, real %.0f GB)\n",
+                    n_tok, (unsigned long long)pair_rows,
+                    wc[0], (unsigned long long)work_cap,
+                    experts_used, rows_total, (unsigned long long)tiles_min, max_rows,
+                    experts_used ? (double)wc[0] / experts_used : 0.0,
+                    /* 每专家 9.953 MB × 40 层 */
+                    experts_used * 9.953 * 40.0 / 1024.0,
+                    wc[0] * 9.953 * 40.0 / 1024.0);
             }
             if (g_moe_split < 0) g_moe_split = getenv("MYDS_MOE_STEP_PROF") ? 1 : 0;
             if (g_moe_split) moe_split_point(&cb, &enc, &g_moe_t_map0);
