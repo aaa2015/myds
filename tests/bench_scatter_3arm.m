@@ -58,11 +58,12 @@ int main(int argc, char **argv) {
         { "E 散读 + 62×FMA 4累加器",  offs_scat, 6, 2 },
         { "F 散读 + 合成解码(偏重)",  offs_scat, 6, 3 },
         { "G 散读 + 真 LDS 解码+FMA", offs_scat, 6, 4 },
+        { "H 散读 + 同形去 LDS",     offs_scat, 6, 5 },
     };
-    const int NARM = 7;
+    const int NARM = 8;
 
     printf("  %-28s %10s %12s %10s\n", "臂", "耗时(ms)", "有效GB/s", "占B臂");
-    double bw[7] = {0,0,0,0,0,0,0};
+    double bw[8] = {0,0,0,0,0,0,0,0};
     for (int a = 0; a < NARM; a++) {
         double best = 1e18;
         for (int rep = 0; rep < R + 2; rep++) {
@@ -84,7 +85,11 @@ int main(int argc, char **argv) {
     printf("  FMA 依赖链    D/B = %.2f 倍  ⇒ 掉 %.0f%%\n", bw[3]/bw[1], (1-bw[3]/bw[1])*100);
     printf("  FMA 4 累加器  E/B = %.2f 倍  ⇒ 掉 %.0f%%\n", bw[4]/bw[1], (1-bw[4]/bw[1])*100);
     printf("  合成解码      F/B = %.2f 倍  ⇒ 掉 %.0f%%（含 64 位乘法，偏重）\n", bw[5]/bw[1], (1-bw[5]/bw[1])*100);
-    printf("  ★真 LDS 解码 G/B = %.2f 倍  ⇒ 掉 %.0f%%  ← 这一条才是答案\n", bw[6]/bw[1], (1-bw[6]/bw[1])*100);
+    printf("  ★真 LDS 解码 G/B = %.2f 倍  ⇒ 掉 %.0f%%\n", bw[6]/bw[1], (1-bw[6]/bw[1])*100);
+    printf("  ★同形去 LDS  H/B = %.2f 倍  ⇒ 掉 %.0f%%\n", bw[7]/bw[1], (1-bw[7]/bw[1])*100);
+    printf("\n  ⇒ G vs H：%s\n", bw[7] > bw[6]*1.15 ?
+           "LDS 延迟是真凶（H 明显快）⇒ 值得做预取/双缓冲" :
+           "LDS 免费（H≈G）⇒ 预取/双缓冲不会有收益，代价来自指令数本身");
     printf("\n  依赖链 vs 4累加器  E/D = %.2f 倍  ⇒ %s\n", bw[4]/bw[3],
            bw[4] > bw[3]*1.15 ? "依赖链确实是瓶颈" : "依赖链不是瓶颈");
     myds_metal_buffer_free(w); myds_metal_buffer_free(d);

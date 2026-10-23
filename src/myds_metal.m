@@ -8181,7 +8181,7 @@ int myds_metal_pureread_fma6(myds_metal_buffer_t *dst, const myds_metal_buffer_t
                              const uint64_t offs[6], uint64_t region_bytes,
                              uint32_t n_regions, uint32_t mode) {
     if (!g_library || !dst || !src || !offs || !region_bytes) return 0;
-    if (n_regions == 0 || n_regions > 6 || mode > 4) return 0;
+    if (n_regions == 0 || n_regions > 6 || mode > 5) return 0;
     static id<MTLComputePipelineState> pso = nil;
     if (!pso) {
         id<MTLFunction> fn = [g_library newFunctionWithName:@"kernel_pureread_fma6"];

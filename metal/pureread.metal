@@ -166,7 +166,7 @@ kernel void kernel_pureread_fma6(
             }
         }
         acc = s;
-    } else {
+    } else if (args.mode == 4u) {
         /* mode 4：忠实形态 —— threadgroup 查表（真 LDS）+ 符号 popcount + 掩码取反 + FMA
          * 与 myds_iq2_v41_shape64_impl 的 8 元素内层一一对应，只是去掉指针算术。 */
         threadgroup uint64_t tbl[256];
@@ -184,6 +184,26 @@ kernel void kernel_pureread_fma6(
             #pragma unroll
             for (int j = 0; j < 8; ++j) {
                 const float w = (float)grid[j] * 1e-6f;
+                s = fma(s, w, (sign & (1u << (j & 7))) ? -1e-7f : 1e-7f);
+            }
+        }
+        acc = s;
+    } else {
+        /* mode 5：与 mode 4 指令数相同，但**不含 shared memory 读**
+         * （grid[j] 用算术代替）。用来回答：43% 里有多少是 LDS 延迟？
+         *   mode5 ≈ mode4  ⇒ LDS 免费，预取/双缓冲不会有收益
+         *   mode5 >> mode4 ⇒ LDS 延迟是真凶，值得做预取 */
+        thread const uint8_t *b8 = (thread const uint8_t *)&v;
+        float s = (float)(v.w & 0xFFu) * 1e-6f;
+        #pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            const uint aux8 = b8[l];
+            const uint s7 = aux8 & 127u;
+            const uint8_t sign = (uint8_t)(s7 | ((popcount(s7) & 1u) << 7));
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                /* 同样一次「取值 → int8→float → 乘」，只是不读 threadgroup */
+                const float w = (float)((aux8 ^ (uint)(j * 17)) & 0xFFu) * 1e-6f;
                 s = fma(s, w, (sign & (1u << (j & 7))) ? -1e-7f : 1e-7f);
             }
         }
