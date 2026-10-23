@@ -7,7 +7,7 @@
 
 **当前 native engine 已完整实现 DeepSeek V4.1 文本计算图（HC、Engram、压缩 KV、indexer），并通过与 ds4 oracle 的逐位验收；生产 8181 正在运行 DeepSeek-V4.1-Flash Q2。** 正确性门禁默认放行已验收特性，`MYDS_DENY_V41=1` 可不重编译地恢复「拒绝加载」（紧急刹车）。
 
-验收依据与门禁规则见 [正确性修复与验证状态](docs/CORRECTNESS_STATUS.md)；性能结论以 `docs/verification/` 下带日期的实测记录为准。单元测试通过不等于真实模型逐位对齐，改动数值路径仍须过同等门禁。
+验收依据与门禁规则见 [正确性修复与验证状态](docs/CORRECTNESS_STATUS.md)；**性能现状、瓶颈归因与优化边界见 [性能现状与边界](docs/PERFORMANCE_BOUNDARIES.md)**（结论先行，数字权威源仍以 `docs/verification/` 下带日期的实测记录为准）。单元测试通过不等于真实模型逐位对齐，改动数值路径仍须过同等门禁。
 
 ---
 
@@ -157,7 +157,7 @@ prefill 按实际处理的输入 token 计时，decode 按首次到末次输出�
 长输入的耗时波动及无 GPU 额外提交的路径诊断见
 [补充验证](docs/benchmarks/2026-10-05-optimization/head-first-long-validation.json)，
 两轮变慢的原始数据仍保留，不将复测的稳定收益当作所有运行的保证。
-[早期性能记录](docs/PERFORMANCE.md) 保留历史状态说明，不作为本轮优化的基线。
+[早期性能记录](docs/PERFORMANCE.md)（2026-09-29）保留历史状态说明，**已明确不代表可用性能**，不作为基线。当前基线与边界见 [性能现状与边界](docs/PERFORMANCE_BOUNDARIES.md)。
 
 ### 1. 编译项目
 
