@@ -11737,6 +11737,19 @@ static inline void ds4_iq2_pair_swiglu_popcnt_impl(
                     su += v * gridu[j] * (signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
                 }
             }
+            /* 剂量-响应实验（MYDS_MOE_DOSE=N：host 把 write_clamped 设 0xFF、
+             * clamp_value 传 N，因此正常路径完全不进入）。内部做 N 次**幂等** FMA：
+             * 依赖真实 sg/su 防止被优化掉，结果不回写，数值路径逐位不变。 */
+            if (act.write_clamped == 0xFFu) {
+                const int dose = (int)act.clamp_value;
+                float pg = sg, pu = su;
+                for (int dz = 0; dz < dose; ++dz) {
+                    pg = fma(pg, 1.0000001f, 1e-9f);
+                    pu = fma(pu, 1.0000001f, 1e-9f);
+                }
+                if (pg == 1234567.0f) { sumg[row] += 0.0f; }
+                if (pu == 7654321.0f) { sumu[row] += 0.0f; }
+            }
             sumg[row] += dg * sg;
             sumu[row] += du * su;
             dhg += args.nb01 / 2;

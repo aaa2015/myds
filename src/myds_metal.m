@@ -6591,6 +6591,15 @@ static int routed_moe_batch_impl(
             .write_clamped = 0,
             .clamp_value = clamp_val,
         };
+        /* 诊断：MYDS_MOE_DOSE=N 给 IQ2 反量化内层加 N 次幂等 FMA（剂量-响应实验）。
+         * 借 write_clamped=0xFF 作哨兵、clamp_value 传 N；不设则完全不进入。 */
+        {
+            const char *dose_env = getenv("MYDS_MOE_DOSE");
+            if (dose_env) {
+                swiglu_args.write_clamped = 0xFFu;
+                swiglu_args.clamp_value = (float)atoi(dose_env);
+            }
+        }
 
         if ((use_iq2_v41 ? g_pso_moe_iq2_v41 : (use_q2_v41 ? moe_q2_v41_producer() : g_pso_moe_pair_swiglu_iq2_xxs)) &&
             (use_q2_v41 ? g_pso_moe_sum6_v41_q2_k : g_pso_moe_sum6_q2_k)) {
