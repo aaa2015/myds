@@ -3186,7 +3186,8 @@ static id<MTLComputePipelineState> resolve_kernel_pipeline(const char *name,
              * 只对 attention kernel 生效，且默认不设置 ⇒ 生产行为不变。 */
             {
                 const char *ft = getenv("MYDS_ATTN_FORCE_THREADS");
-                const bool is_attn = ft && strstr(name, "attention") != NULL;
+                const bool is_attn = ft && (strstr(name, "attention") != NULL ||
+                                            strstr(name, "flash_attn") != NULL);
                 if (is_attn) {
                     const NSUInteger want = (NSUInteger)atoi(ft);
                     if (want >= 32 && want <= 1024) {
