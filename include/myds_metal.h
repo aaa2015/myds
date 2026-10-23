@@ -180,6 +180,12 @@ int  myds_metal_kprof_exclusive(void);
 int myds_metal_pureread(myds_metal_buffer_t *dst, const myds_metal_buffer_t *src,
                         uint64_t n_bytes, uint64_t base_off, uint64_t stride,
                         uint32_t nthreads);
+/* 2026-10-23：一次 dispatch 内读 N 个散块（N<=6），把「散读」与「调用次数」分开。
+ * offs[0..n_regions-1] 是各区域起点，region_bytes 是每块字节（相等）。
+ * n_regions==1 时把 region_bytes*6 当作一整段连续读（对照组）。 */
+int myds_metal_pureread_scatter6(myds_metal_buffer_t *dst, const myds_metal_buffer_t *src,
+                                 const uint64_t offs[6], uint64_t region_bytes,
+                                 uint32_t n_regions);
 void myds_metal_kprof_arm(int on);
 int  myds_metal_kprof_report(FILE *out, const char *label, uint32_t tokens);
 /* Measure the fixed per-encoder bracket cost (median of 256 trivial kernels, one

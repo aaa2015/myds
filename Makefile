@@ -557,6 +557,10 @@ $(BIN_DIR)/bench_moe_pureread: tests/bench_moe_pureread.m $(OBJS_C) $(OBJS_M) $(
 $(BIN_DIR)/bench_moe_locality: tests/bench_moe_locality.m $(OBJS_C) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc $< $(OBJS_C) $(OBJS_M) $(LDFLAGS) -o $@
 
+# 2026-10-23: 三臂散读基准，钉死 MoE 归因（A 连续 / B 散读 / C 同址）
+$(BIN_DIR)/bench_scatter_3arm: tests/bench_scatter_3arm.m $(OBJS_C) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) -Isrc $< $(OBJS_C) $(OBJS_M) $(LDFLAGS) -o $@
+
 $(BIN_DIR)/bench_moe_fmt_ab: tests/bench_moe_fmt_ab.m $(OBJS_C) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc $< $(OBJS_C) $(OBJS_M) $(LDFLAGS) -o $@
 

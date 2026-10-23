@@ -8136,6 +8136,45 @@ int myds_metal_pureread(myds_metal_buffer_t *dst, const myds_metal_buffer_t *src
     }
 }
 
+/* 2026-10-23：一次 dispatch 读 N 个散块（N<=6）。把 offset 表交给 kernel，
+ * 由它按 gid 分配到不同区域 —— 这样「散读」的代价与「调用次数」彻底分开。 */
+int myds_metal_pureread_scatter6(myds_metal_buffer_t *dst, const myds_metal_buffer_t *src,
+                                 const uint64_t offs[6], uint64_t region_bytes,
+                                 uint32_t n_regions) {
+    if (!g_library || !dst || !src || !offs || !region_bytes) return 0;
+    if (n_regions == 0 || n_regions > 6) return 0;
+    static id<MTLComputePipelineState> pso = nil;
+    if (!pso) {
+        id<MTLFunction> fn = [g_library newFunctionWithName:@"kernel_pureread_scatter6"];
+        if (!fn) return 0;
+        pso = [g_device newComputePipelineStateWithFunction:fn error:nil];
+        if (!pso) return 0;
+    }
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = g_batch_cb ?: [g_queue commandBuffer];
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
+        if (!enc) return 0;
+        struct { uint64_t offs[6]; uint64_t region_bytes; uint32_t n_regions, pad; } a;
+        memset(&a, 0, sizeof(a));
+        for (uint32_t i = 0; i < 6; i++) a.offs[i] = offs[i];
+        a.region_bytes = region_bytes;
+        /* n_regions==1 时把 6 块连成一整段，让 A 臂读 region_bytes*6 */
+        a.n_regions = n_regions;
+        [enc setComputePipelineState:pso];
+        [enc setBytes:&a length:sizeof(a) atIndex:0];
+        [enc setBuffer:src->mtl_buf offset:src->offset atIndex:1];
+        [enc setBuffer:dst->mtl_buf offset:dst->offset atIndex:2];
+        const uint32_t tgsz = 256u;
+        const uint64_t total_bytes = (n_regions == 1) ? region_bytes * 6u : region_bytes * n_regions;
+        const uint32_t nthreads = (uint32_t)(total_bytes / 16u);
+        if (!nthreads) return 0;
+        const uint32_t ntg = (nthreads + tgsz - 1u) / tgsz;
+        metal_dispatch(enc, "pureread_scatter6", MTLSizeMake(ntg, 1, 1), MTLSizeMake(tgsz, 1, 1));
+        return v41_finish(cb, enc);
+    }
+}
+
 
 
 /* ═══════════════════════════════════════════════════════════════════════
