@@ -3180,7 +3180,28 @@ static id<MTLComputePipelineState> resolve_kernel_pipeline(const char *name,
                 return 0;
             }
             NSError *perr = nil;
-            pipeline = [g_device newComputePipelineStateWithFunction:fn error:&perr];
+            /* 诊断 MYDS_ATTN_FORCE_THREADS=N：§10.7 曾用 descriptor 抬高
+             * maxTotalThreadsPerThreadgroup 逐档实测 448/512/1024。实验代码当时被回滚，
+             * 这里按同一途径重建，仅用于复现「抬高线程数一定更慢」并区分其机制。
+             * 只对 attention kernel 生效，且默认不设置 ⇒ 生产行为不变。 */
+            {
+                const char *ft = getenv("MYDS_ATTN_FORCE_THREADS");
+                const bool is_attn = ft && strstr(name, "attention") != NULL;
+                if (is_attn) {
+                    const NSUInteger want = (NSUInteger)atoi(ft);
+                    if (want >= 32 && want <= 1024) {
+                        MTLComputePipelineDescriptor *d = [MTLComputePipelineDescriptor new];
+                        d.computeFunction = fn;
+                        d.maxTotalThreadsPerThreadgroup = want;
+                        pipeline = [g_device newComputePipelineStateWithDescriptor:d
+                                                                            options:MTLPipelineOptionNone
+                                                                          reflection:nil
+                                                                               error:&perr];
+                    }
+                }
+            }
+            if (!pipeline)
+                pipeline = [g_device newComputePipelineStateWithFunction:fn error:&perr];
             if (!pipeline) {
                 if (getenv("MYDS_DEBUG_DISPATCH"))
                     myds_log(MYDS_LOG_ERROR, "DBGDISP %s: PIPELINE FAILED (%s)", name,

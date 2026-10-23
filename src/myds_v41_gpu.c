@@ -2114,11 +2114,22 @@ static int dispatch_register_attention(
     }
 
     const myds_metal_buffer_t *register_buffers[] = {q, s->kv_f16, s->kv_f16, s->mask, sinks, s->pad, heads};
+    /* 诊断：MYDS_ATTN_FORCE_THREADS 覆盖 threadgroup 线程数（默认 448 不变）。 */
+    uint32_t attn_nth = 448u;
+    {
+        static int logged = 0;
+        const char *ft = getenv("MYDS_ATTN_FORCE_THREADS");
+        if (ft) {
+            int v = atoi(ft); if (v >= 32 && v <= 1024) attn_nth = (uint32_t)v;
+            if (!logged) { logged = 1;
+                fprintf(stderr, "[attn-force] register路径生效 threads=%u rope=%d\n", attn_nth, rope?1:0); }
+        }
+    }
     if (rope) {
         struct attention_rope_fuse_args fused = {.attention = *a, .pos = rope->pos, .inverse = 1u};
         memcpy(fused.frequencies, rope_frequencies[rope->compressed ? 1 : 0], sizeof(fused.frequencies));
         return specialized("kernel_myds_attention_register_rope_fuse_f16_512",
-                           &fused, sizeof(fused), register_buffers, 7, 64, 1, 1, 448, 1, 1, 22400, c, 10);
+                           &fused, sizeof(fused), register_buffers, 7, 64, 1, 1, attn_nth, 1, 1, 22400, c, 10);
     }
     return specialized("kernel_myds_flash_attn_vec_packed8_register_reduce_f16_dk512_dv512",
                        a, sizeof(*a), register_buffers, 7, 64, 1, 1, 256, 1, 1, 22400, c, 10);
