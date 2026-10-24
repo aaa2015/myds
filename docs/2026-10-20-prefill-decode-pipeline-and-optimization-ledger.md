@@ -78,7 +78,7 @@ bin/myds --check-config                 # 期望「一致 N / 不同 0 / 未生�
 #   或看日志：mask/batching/kvdisk 行必须与预期一致
 
 # ⑥ 恢复生产，并复测一次确认回到基线
-cd ~/Projects/deploy && ./start_fleet.sh
+cd <部署目录> && ./start_fleet.sh
 ```
 
 **每档用唯一 nonce 前缀**，否则命中 prefix cache，测出来的不是 prefill。
@@ -118,8 +118,8 @@ cd ~/Projects/deploy && ./start_fleet.sh
 
 | 项 | 生产值 | 位置 |
 |---|---|---|
-| `MYDS_PREFIX_CACHE` | **1（开）** | `deploy/myds.conf:54` |
-| `MYDS_PLD` | **1（开）** | `deploy/myds.conf:52` |
+| `MYDS_PREFIX_CACHE` | **1（开）** | 生产配置第 54 行 |
+| `MYDS_PLD` | **1（开）** | 生产配置第 52 行 |
 
 **这是正式使用时的收益来源**：相同前缀不必重算，长上下文多轮对话的 TTFT 直接受益。
 
@@ -1171,7 +1171,7 @@ MYDS_KV_DSK=$HOME/.cache/myds/kvlow         # 显式开启 kvdisk（默认关）
 MYDS_PREFILL_MAX_TOKENS=<n>                 # 放宽/收紧源码内 320K 保护
 MYDS_NO_RESIDENCY_HB=1                      # 关心跳（空闲后首请求 +5.5 s）
 MYDS_MOE_DOWN_NSG=2                         # 回 §26.9 之前
-cd ~/Projects/deploy && git checkout start_fleet.sh   # 全部配置
+cd <部署目录> && git checkout start_fleet.sh   # 全部配置
 ```
 
 #### ★ metallib 的 md5 不是稳定标识（2026-10-23 实测）
@@ -1296,7 +1296,7 @@ cd ~/Projects/deploy && git checkout start_fleet.sh   # 全部配置
 
 ```bash
 ~/Projects/myds/tools/mx.sh status            # 一眼看状态
-cd ~/Projects/deploy && ./start_fleet.sh     # 重启生产
+cd <部署目录> && ./start_fleet.sh     # 重启生产
 ~/Projects/myds/tools/panic_report.sh --latest # 事故后读 panic
 ```
 
@@ -1331,7 +1331,7 @@ rm -rf build && make bin/myds   # 改了 CFLAGS 后必须
 | `tools/mx.sh` | 部署 + A/B 唯一入口（selftest/doctor/ship/env/run/restore/status） |
 | `tools/panic_report.sh` | 读 macOS panic 文件，判 wired 打满与进程归因 |
 | `tools/rss_sampler.sh` | 盯 wired 的采样器（`nohup+disown`，脱离会话存活） |
-| `deploy/bench_prep.sh` / `bench_cleanup.sh` | 实验环境准备与清理 |
+| 部署目录的 `bench_prep.sh` / `bench_cleanup.sh` | 实验环境准备与清理 |
 | 技能 `host-memory-guardrails` | 换机器/加模型时照着做 |
 
 ### 0.10 2026-10-22/23 的教训（四次自我证否）
@@ -1632,7 +1632,7 @@ NR0=4 : 34.61 / 34.58 / 34.53   中位 34.58
 - 完整 49 env 下复测同样退化
 - **结论**：micro-benchmark 的收益被 MoE down overlap 的失效抵消（旧代码用
   `dense_q4_nr0()!=2u` 断言把两者绑死；解耦后 NR4 恢复可用，但仍净损失）
-- `deploy` 的 `3e1f2fb`（开启 NR4）已废弃，`start_fleet.sh` 恢复默认
+- 部署配置的 `3e1f2fb`（开启 NR4）已废弃，`start_fleet.sh` 恢复默认
 
 ### 4.2 prefill 零拷贝 MoE 别名（同 `c49bd22`）— **收益远低于预期**
 
@@ -1829,7 +1829,7 @@ stage 都失败，提案全部丢弃，只留下 propose 的成本。
 
 8. **停本机服务只能按端口 PID**。脚本里写 `pkill -9 -f "bin/myds"` 会把同机生产服（8187，
    由 `start_fleet.sh` 拉起，二进制同为 `bin/myds`）一起杀掉。本轮发生两次，
-   恢复方式是 `cd ~/Projects/deploy && ./start_fleet.sh`（`fleet.conf` 当前只有第 124 行启用），
+   恢复方式是 `cd <部署目录> && ./start_fleet.sh`（`fleet.conf` 当前只有第 124 行启用），
    恢复后必须再测一次 decode 回到 42.4x 才算收工。
 
 ## 7. 复现
@@ -4051,7 +4051,7 @@ A 均值 43.178、B 均值 43.411 ⇒ **+0.54%**；B 最小值 43.38 > A 最大�
 **上线后生产实测**：43.38 / 43.36 / 43.35（32-token）、43.32 / 43.32（200-token），
 日志确认 `Routed MoE geometry: IQ2 NSG=2, Q2 down NSG=4 (explicit)`。
 
-配置落在 `deploy/start_fleet.sh:505`，回退 `MYDS_MOE_DOWN_NSG=2`。
+配置落在启动脚本第 505 行，回退 `MYDS_MOE_DOWN_NSG=2`。
 
 **注意（踩过的坑）**：`start_fleet.sh` 在 macmini 与 macstudio 各有一份，
 改配置必须两边同步，否则生产读不到（本次第一次重启就是因为只改了 macmini 那份，
@@ -4757,7 +4757,7 @@ cohort 分析证明是 **MoE 串行链 + attention**，不是那些 1 TG 的小�
 ### 29.5 生产部署与维护
 
 1. **已生效部署**：
-   在 `$HOME/Projects/deploy/start_fleet.sh`（macmini 与 macstudio 均已同步）：
+   在部署目录的 `start_fleet.sh`（两端均已同步）：
    ```bash
    SERVICE_ENV+=(MYDS_INDEXER_BATCH_FLOATS="${MYDS_INDEXER_BATCH_FLOATS:-16777216}")
    ```
@@ -5797,8 +5797,8 @@ watchdog 91/92 秒）几乎逐位相同，但一个是"我发了个疯狂的 pro
 | 技能 | `skill:host-memory-guardrails` | 换机器/加模型时照着做 |
 | 工具 | `myds/tools/panic_report.sh` | 一条命令读 panic |
 | 请求侧护栏 | `src/myds_v41.c`（>320K 拒绝） | 拦住长 prompt |
-| 启动侧护栏 | `deploy/start_fleet.sh`（内存门槛 + kill 等待） | 拦住重复加载 |
-| 实验装置 | `deploy/bench_prep.sh` / `bench_cleanup.sh` | 拦住脏状态实验 |
+| 启动侧护栏 | 启动脚本（内存门槛 + kill 等待） | 拦住重复加载 |
+| 实验装置 | `bench_prep.sh` / `bench_cleanup.sh` | 拦住脏状态实验 |
 | 记录 | 账本 §32–§39 | 结论与自我证否 |
 
 **这些是这一轮真正留下的东西** —— 比 prefill 那 +29% 更持久，因为速度提升会随硬件换代失效，
@@ -6528,7 +6528,7 @@ int main(int argc, char *argv[]) {
 
 ### 47.3 迁移结果
 
-生产 `deploy/myds.conf`（51 条，**由运行中进程 `ps eww` 导出，非手抄**）：
+生产配置（51 条，**由运行中进程 `ps eww` 导出，非手抄**）：
 
 | 项 | 值 |
 |---|---|
@@ -6588,9 +6588,9 @@ int main(int argc, char *argv[]) {
 
 ```bash
 # 改配置（唯一入口）
-vim ~/Projects/deploy/myds.conf
-scp myds.conf macmini/macstudio:~/Projects/deploy/   # 两边都同步
-cd ~/Projects/deploy && ./start_fleet.sh
+vim <部署目录>/myds.conf
+scp myds.conf <目标机>:<部署目录>/   # 两端同步
+cd <部署目录> && ./start_fleet.sh
 
 # 验证是否生效
 ~/Projects/myds/bin/myds --config myds.conf --check-config myds.conf
@@ -6741,8 +6741,8 @@ if (moe_off == cw->moe_batch || c_start + c_len == mb_len ||
 | `tests/test_pld.c` | 已有单测 |
 | `src/myds_engine.c:3507` | `pld_enabled = use_spec && (pld_env_str == NULL \|\| atoi(pld_env_str) != 0)` |
 | `src/myds_engine.c:3248` | `use_spec = spec_requested \|\| serial_probe` |
-| `deploy/myds.conf:52` | `MYDS_PLD=1` |
-| `deploy/myds.conf:27` | `MYDS_DSPARK=0` |
+| 生产配置第 52 行 | `MYDS_PLD=1` |
+| 生产配置第 27 行 | `MYDS_DSPARK=0` |
 
 **⇒ `pld_enabled` 恒为 false。** 生产里 PLD 是死代码。
 

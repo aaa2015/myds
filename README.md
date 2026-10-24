@@ -7,7 +7,7 @@
 
 **当前 native engine 已完整实现 DeepSeek V4.1 文本计算图（HC、Engram、压缩 KV、indexer），并通过与 ds4 oracle 的逐位验收；生产 8181 正在运行 DeepSeek-V4.1-Flash Q2。** 正确性门禁默认放行已验收特性，`MYDS_DENY_V41=1` 可不重编译地恢复「拒绝加载」（紧急刹车）。
 
-验收依据与门禁规则见 [正确性修复与验证状态](https://github.com/aaa2015/documentation/blob/main/CORRECTNESS_STATUS.md)；**性能现状、瓶颈归因与优化边界的唯一权威记录是 [prefill/decode 全链路与优化账本](https://github.com/aaa2015/documentation/blob/main/verification/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md)，只读 §0.0（一页结论）即可掌握全部。** 单元测试通过不等于真实模型逐位对齐，改动数值路径仍须过同等门禁。
+验收依据与门禁规则记在性能账本的「方法论教训」与「已证否清单」两节；**性能现状、瓶颈归因与优化边界的唯一权威记录是 prefill/decode 全链路与优化账本，只读 §0.0（一页结论）即可掌握全部。** 单元测试通过不等于真实模型逐位对齐，改动数值路径仍须过同等门禁。
 
 ---
 
@@ -22,7 +22,7 @@
 
 ## 实测性能
 
-**硬件**：Mac Studio，M2 Ultra（76 核 GPU），206 GB 统一内存，带宽实测峰值 724 GB/s。
+**硬件**：Mac Studio，M2 Ultra（76 核 GPU），**192 GB 统一内存**（Apple 标称；十进制 206 GB，Metal 可用上限 201.9 GB），带宽实测峰值 724 GB/s。
 **模型**：DeepSeek-V4.1-Flash-1017-Q2，文件 362 GB，常驻 148.4 GB。
 **口径**：独占整机、`temperature=0`、无并发，同一台机器上测得。重复测量的离散度见账本 §0.1（90K 四次：587.6 vs 中位 597.4，差 1.7%）。
 
@@ -114,7 +114,7 @@ prefill 与 decode 都已无两位数收益方向。剩下的路要么放弃 0-U
 | 方向 | 阻断点 |
 |---|---|
 | flash-attention 提高每 TG 头数 | **32 KB threadgroup memory 装不下 16 头（需 60 KB）** ⇒ 18% 效率无法改善 |
-| 换 FP8/BF16 主模型 | **统一内存墙**：FP8 需 ~510 GB，机器只有 206 GB |
+| 换 FP8/BF16 主模型 | **统一内存墙**：FP8 需 ~510 GB，机器只有 192 GB |
 | DSpark 投机解码 | 最好 **11.1%** 接受率 × 3.04× 验证成本 ⇒ **净慢** |
 | 多请求合批 | 单人顺序请求**无货可合**，且生产有单飞锁 |
 | TP=2 双机 | 需采购设备 |
@@ -237,43 +237,25 @@ myds/
 
 ## 编译与测试
 
-上述组合已提交并通过 `deploy/deploy.sh` 上线，见
-[2026-10-14 部署后复验](https://github.com/aaa2015/documentation/blob/main/benchmarks/2026-10-14-codex-deploy/README.md)：
-新部署构建的短/800-token 业务输入 decode 时间分别减少 1.85% / 1.98%，
-native 完整 token/logits 和真实服务 SSE 原字节对照均通过，生产三个开关已启用。
+历史优化轮次的验收结果摘要（每轮均为同构建完整模型 A–B–A、短/800-token 业务输入）：
 
-新增 [2026-10-13 Mac Studio decode 优化与验收](https://github.com/aaa2015/documentation/blob/main/benchmarks/2026-10-13-codex-decode/README.md)：
-Router SIMD shuffle、attention register 和 Q2 固定形状三个原生候选组合，在同构建完整模型
-A–B–A 中使短/800-token 业务输入 decode 时间减少 1.87% / 2.03%；含完整原始证据、
-独立离线重放、源码默认关闭的开关与已采用的 fleet 部署补丁。
+| 轮次 | 内容 | decode 变化 |
+|---|---|---|
+| 2026-10-13 | Router SIMD shuffle、attention register、Q2 固定形状三个原生候选 | **−1.87% / −2.03%** |
+| 2026-10-14 | 上述组合部署上线后的复验 | **−1.85% / −1.98%** |
 
-此前的 decode 实施状态见 [2026-10-09 实施记录](https://github.com/aaa2015/documentation/blob/main/DECODE_IMPLEMENTATION_2026-10-09.md)，
-包含默认 target 路径、batch2 状态修复、QKV 并发与长上下文 scorer 候选。
-[验证协议](https://github.com/aaa2015/documentation/blob/main/benchmarks/2026-10-09-decode/README.md) 提供真实 DSpark 加载及 A–B–A 命令；
-[Mac Studio 实测](https://github.com/aaa2015/documentation/blob/main/benchmarks/2026-10-09-decode/macstudio/README.md) 记录完整模型状态门禁、
-普通256输出及长上下文对照，包含负收益和失败后修复记录。历史软件与硬件路线见
-[2026-10-08 优化方案](https://github.com/aaa2015/documentation/blob/main/DECODE_OPTIMIZATION_PLAN_2026-10-08.md)。
-当前 prefill 的首块索引批处理、后缀收缩冗余工作消除及完整模型 A–B–A 证据，见
-[2026-10-15 Prefill 优化验证](https://github.com/aaa2015/documentation/blob/main/verification/2026-10-15-prefill-indexer-and-dead-kv.md)。
-已提交并部署后的 1M 上下文、真实前缀/SSD 缓存及默认采样复测，见
-[Mac Studio 生产部署与验收](https://github.com/aaa2015/documentation/blob/main/verification/2026-10-15-prefill-production-deployment.md)。
-Q2 down 独立 NSG、top-k 前缀合并裁剪及短/长输入对照，见
-[第二轮内核实现与验证](https://github.com/aaa2015/documentation/blob/main/benchmarks/2026-10-09-decode-kernels/README.md)。
-当前 GPU 时间线、IQ2 LUT 与 attention 物理 SIMD 打包的实现和验收边界，见
-[第三轮报告](https://github.com/aaa2015/documentation/blob/main/benchmarks/2026-10-09-decode-profile/README.md)。
-排序中的 NaN 分类融合与 Batch2 output-B Q8 双输入共享权重候选，见
-[第四轮实现与验证](https://github.com/aaa2015/documentation/blob/main/benchmarks/2026-10-09-decode-next/README.md)。
+更早的 Q2 down 独立 NSG、top-k 前缀合并裁剪、NaN 分类融合、Batch2 output-B Q8 双输入共享权重
+等候选，结论均已并入[性能账本](docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md)的
+已采纳 / 已证否两节——**该账本是性能结论的唯一权威，本 README 不重复维护这些数字。**
 
-2026-10-05 的 Mac Studio 独占测试、逐 token 耗时和组件回放证据见
-[本轮实测汇总](https://github.com/aaa2015/documentation/blob/main/benchmarks/2026-10-05-optimization/final-summary.json)。
 测试关闭 profiler、内存前缀命中和 KV 磁盘命中，每组预热一次后正式运行三次。
 prefill 按实际处理的输入 token 计时，decode 按首次到末次输出回调之间的 token 间隔计时。
 基准固定 `temperature=0`、`top_p=1`、`top_k=0`、`min_p=0`、
 `repetition_penalty=1`、`seed=42`；greedy argmax 路径不读取采样随机数。
-长输入的耗时波动及无 GPU 额外提交的路径诊断见
-[补充验证](https://github.com/aaa2015/documentation/blob/main/benchmarks/2026-10-05-optimization/head-first-long-validation.json)，
-两轮变慢的原始数据仍保留，不将复测的稳定收益当作所有运行的保证。
-[早期性能记录](https://github.com/aaa2015/documentation/blob/main/PERFORMANCE.md)（2026-09-29）保留历史状态说明，**已明确不代表可用性能**，不作为基线。当前基线与边界见账本 **§0.0**。
+长输入的耗时波动与「无 GPU 额外提交」的路径诊断当时另有补充验证，测到过两轮变慢；
+原始数据保留在证据包里，**不把复测的稳定收益当作所有运行的保证**。
+2026-09-29 的早期性能记录只作历史状态说明，**已明确不代表可用性能**，不作基线。
+当前基线与边界见性能账本 **§0.0**。
 
 ### 1. 编译项目
 
@@ -386,20 +368,6 @@ make bench
 - `POST /v1/chat/completions` 或 `/chat/completions`：支持标准 OpenAI Chat Completions 协议（流式 SSE 与非流式 JSON）
 - 请求体参数兼容性：全面支持 `instructions`（系统指令）、`input`（消息数组或纯文本，自动展开 `input_text` 复杂结构）、`messages`、`max_output_tokens` / `max_tokens`、`temperature` 与 `top_p`
 
-### 算力舰队部署与启动
-
-生产实例（8181）的替换必须经停产窗口（模型重载约 1~2 分钟）；改码只在 macmini，macstudio 只做靶机。
-
-`deploy` 中已集成 `myds` 算力引擎支持：
-- `start_fleet.sh`：定义 `SERVER_TYPE=15` 或 `SERVER_TYPE=myds` 即可调度 `myds` 作为后端引擎
-- `sync_myds.sh`：以 **GitHub（`origin`）为唯一权威源码**；要求 macmini 已提交并推送，再把 `macstudio` 快进（`--ff-only`，脏工作树直接拒绝而非覆盖）并安全远程构建
-- `deploy.sh`：一键自动执行同步、编译与舰队点火：
-
-```bash
-cd ~/Projects/deploy
-./deploy.sh
-```
-
 ### 常用参数说明
 
 ```
@@ -441,7 +409,7 @@ compressed KV 与 index cache 保存已完成 BF16 舍入的上 16 位，读取�
 | `MYDS_QKV_FUSE_BF16` | 启用 | decode 的 Q8 QKV 投影把 BF16 舍入合并到 GEMV 写出；设为 `0` 恢复独立舍入 dispatch。trace 使用原路径。 |
 | `MYDS_QKV_FUSE_POST` | 启用 | decode 合并 Q/K RoPE、KV 量化及窗口写入，保留原舍入边界；设为 `0` 恢复原 dispatch。缺融合 PSO、别名或 copy 故障注入时回退原路径。 |
 | `MYDS_QKV_NR0` | `4` | 融合 Q8 GEMV 每组处理四个独立输出行；`2` 使用两个行的配置。归约顺序不变。 |
-| `MYDS_LM_HEAD_Q8_NR0` | `2` | 初始化时读取，严格接受 `2` 或 `4`；未设置时保留原路径。显式 `4` 在单 token、输出维度大于 65536 的 plain Q8_0 GEMV 中，每组处理四个独立输出行，保留 NSG8、原逐行 K 遍历/归约与完整 F32 logits。缺候选 PSO 时初始化失败并清理；候选 dispatch 失败返回错误。验收与当前采用状态见 [LM-head 验证报告](https://github.com/aaa2015/documentation/blob/main/benchmarks/2026-10-10-decode-lmhead/README.md)。 |
+| `MYDS_LM_HEAD_Q8_NR0` | `2` | 初始化时读取，严格接受 `2` 或 `4`；未设置时保留原路径。显式 `4` 在单 token、输出维度大于 65536 的 plain Q8_0 GEMV 中，每组处理四个独立输出行，保留 NSG8、原逐行 K 遍历/归约与完整 F32 logits。缺候选 PSO 时初始化失败并清理；候选 dispatch 失败返回错误。验收与当前采用状态见 LM-head 验证报告。 |
 | `MYDS_BATCH2_SPEC` | 关闭 | 显式 `1` 请求 greedy、无图片的真实 batch2；剩余输出/context 至少两步，DSpark 主候选仍要求 high-confidence。 |
 | `MYDS_BATCH2_Q8_SHARED` | `0` | 严格接受 `0` 或 `1`。显式 `1` 在 eligible Batch2 output-B Q8/BF16 投影中，让两个 token 复用同一量化权重读取，保留各自的累加、归约和舍入。trace、关闭原 decode BF16 fusion 或其他投影保持参考路径；缺候选 PSO 时初始化失败。需与真实 Batch2 整图计数和完整模型 A–B–A 一起验收。 |
 | `MYDS_SPEC_SERIAL_PROBE` | 关闭 | 显式 `1` 允许 V4.1 逐 token 验证的 DSpark/PLD 对照；默认未启用 batch2 时跳过这类草稿与快照工作。 |
@@ -484,6 +452,10 @@ F32/BF16 输入、子视图 canary、同一 batch 混用和缺 PSO 回退。独�
 
 ### 2026-10-05 测试、日志与测量复现
 
+> **证据包不在本仓库。** 下文的 `$MYDS_EVIDENCE` 指向独立分发的原始测量证据（冻结的请求、补丁、
+> 日志与汇总脚本），体积为数 GB，未随源码发布。不设该变量时，所有依赖它的步骤可跳过；
+> 本仓库自带的 `tools/bench_reproduce.py` 与 `make test` 不依赖它。
+
 本轮完整模型实测机器是 Apple M2 Ultra / 192 GiB / macOS 26.5.2，模型为
 `DeepSeek-V4.1-Flash-Q2.gguf`，上下文容量 262144。本地 Apple M4 / 16 GiB
 运行小规模 GPU fixture 和单元测试；完整模型吞吐数据来自 Mac Studio。
@@ -500,7 +472,7 @@ set -o pipefail
 make -B -j8 all bin/bench_phase 2>&1 | tee "$MYDS_REPRO_OUT/build.log"
 make test 2>&1 | tee "$MYDS_REPRO_OUT/unit-tests.log"
 make test-tail-init 2>&1 | tee "$MYDS_REPRO_OUT/tail-init.log"
-python3 documentation/benchmarks/2026-10-05-optimization/protocol/selftest-summarize-final.py \
+python3 $MYDS_EVIDENCE/benchmarks/2026-10-05-optimization/protocol/selftest-summarize-final.py \
   > "$MYDS_REPRO_OUT/measurement-audit-selftest.json"
 python3 tools/bench_reproduce.py verify
 # 仅在基准测量快照检出上：python3 tools/bench_reproduce.py verify --check-source
@@ -523,7 +495,7 @@ python3 tools/bench_reproduce.py verify
 | `bin/test_engram`、`bin/test_kvdsk`、`bin/test_metal` | LUT 数值、共享段提交/覆盖/损坏/budget、Metal 特化缓存与基础算子。 |
 | `python3 tests/test_bench_reproduce.py` | 全 CPU：使用保存的真实 metrics 验证汇总，用 subprocess stub 验证输入/日志绑定、非 greedy 拒绝、超时/失败清理；由 `make test` 执行，stub 不运行 GGUF 或 Metal。 |
 
-本轮原始日志收录于 `documentation/benchmarks/2026-10-05-optimization/validation/`：
+本轮原始日志收录于 `$MYDS_EVIDENCE/benchmarks/2026-10-05-optimization/validation/`：
 `workspace-build.log`、`workspace-test.log`、`workspace-tail-init-test.log`、
 `workspace-policy-retry-test.log`。`mandatory-pso-before-test.log` 是修复前故障复现，
 其失败是预期证据；`mandatory-pso-after-test.log` 是修复后的通过记录。
@@ -534,7 +506,7 @@ python3 tools/bench_reproduce.py verify
 #### 完整模型每 token 测量
 
 先在 Mac Studio 安排独占窗口：确认生产请求结束，暂停推理服务和其他 GPU benchmark，
-完成后通过 deploy 的 `start_fleet.sh` 恢复并检查 `/health`。
+完成后重启推理服务并检查 `/health`。
 `tools/bench_reproduce.py run` 会检查已知推理/benchmark 进程与 8181 监听，
 发现仍在运行时退出；服务暂停与恢复由窗口管理者负责。
 
@@ -543,7 +515,7 @@ MYDS_REPRO_MODEL="$HOME/.lmstudio/models/antirez/deepseek-v4.1-flash-gguf/DeepSe
 python3 tools/bench_reproduce.py run \
   --binary "$PWD/bin/bench_phase" \
   --model "$MYDS_REPRO_MODEL" \
-  --request "$PWD/documentation/benchmarks/2026-10-05-optimization/requests/normal.json" \
+  --request "$MYDS_EVIDENCE/benchmarks/2026-10-05-optimization/requests/normal.json" \
   --out "$MYDS_REPRO_OUT/candidate-normal"
 ```
 
@@ -611,9 +583,8 @@ python3 tools/test_engram_pool_failures.py --sanitizer thread
 首轮与重复热态轮分别汇总，逐 token 行 ID、解码向量 hash、history 和跨配置一致性必须通过。
 普通单元测试、线程/同步初始化故障注入、EINTR/正短读、并发、测量工具证据校验和
 mock 独占窗口恢复测试纳入 `make test`。
-完整模型与 CPU 读取的日志、复现步骤和结果见
-[Engram I/O 实测结论](https://github.com/aaa2015/documentation/blob/main/benchmarks/2026-10-05-engram-io/assessment.txt)及
-[复现协议](https://github.com/aaa2015/documentation/blob/main/benchmarks/2026-10-05-engram-io/protocol.txt)。
+完整模型与 CPU 读取的日志、复现步骤和结果在证据包的 `benchmarks/2026-10-05-engram-io/`，
+含实测结论与复现协议两份文本。
 
 #### 构建同轮基线并比较
 
@@ -625,9 +596,9 @@ MYDS_REPRO_BASE="$MYDS_REPRO_OUT/base-source"
 mkdir "$MYDS_REPRO_BASE"
 git archive 835d0f5161a0852e9021c2783b19847bd973a5d0 | tar -x -C "$MYDS_REPRO_BASE"
 git -C "$MYDS_REPRO_BASE" apply --check \
-  "$PWD/documentation/benchmarks/2026-10-05-optimization/protocol/baseline-working-changes.patch"
+  "$MYDS_EVIDENCE/benchmarks/2026-10-05-optimization/protocol/baseline-working-changes.patch"
 git -C "$MYDS_REPRO_BASE" apply \
-  "$PWD/documentation/benchmarks/2026-10-05-optimization/protocol/baseline-working-changes.patch"
+  "$MYDS_EVIDENCE/benchmarks/2026-10-05-optimization/protocol/baseline-working-changes.patch"
 make -C "$MYDS_REPRO_BASE" -B -j8 all 2>&1 | tee "$MYDS_REPRO_OUT/base-build.log"
 xcrun clang -O3 -Wall -Wextra -std=c11 -I"$MYDS_REPRO_BASE/include" \
   -c tools/bench_phase.c -o "$MYDS_REPRO_BASE/build/bench_phase.o"
@@ -635,7 +606,7 @@ xcrun clang "$MYDS_REPRO_BASE"/build/myds_*.o "$MYDS_REPRO_BASE/build/bench_phas
   -framework Foundation -framework Metal -lm -lpthread -o "$MYDS_REPRO_BASE/bin/bench_phase"
 python3 tools/bench_reproduce.py run \
   --binary "$MYDS_REPRO_BASE/bin/bench_phase" --model "$MYDS_REPRO_MODEL" \
-  --request "$PWD/documentation/benchmarks/2026-10-05-optimization/requests/normal.json" \
+  --request "$MYDS_EVIDENCE/benchmarks/2026-10-05-optimization/requests/normal.json" \
   --out "$MYDS_REPRO_OUT/base-normal"
 python3 tools/bench_reproduce.py compare \
   --base "$MYDS_REPRO_OUT/base-normal" --candidate "$MYDS_REPRO_OUT/candidate-normal" \
@@ -662,12 +633,12 @@ python3 tools/bench_reproduce.py compare \
 | `optimization/protocol/run-*.py`、`phase/run-exclusive.py` | 本轮执行过的历史窗口脚本，固定了当时的临时目录、fleet/model 路径、端口和生产 SHA。新窗口使用参数化 `bench_reproduce.py`；复用历史脚本前须准备其依赖并逐项核对现场配置。 |
 
 上表中的 `optimization/`、`phase/` 分别指
-`documentation/benchmarks/2026-10-05-optimization/` 和 `documentation/benchmarks/2026-10-05-phase/`。
+`$MYDS_EVIDENCE/benchmarks/2026-10-05-optimization/` 和 `$MYDS_EVIDENCE/benchmarks/2026-10-05-phase/`。
 仅复算已保存主对照数据，无需 GPU 或 GGUF：
 
 ```sh
-python3 documentation/benchmarks/2026-10-05-optimization/protocol/summarize-final.py \
-  documentation/benchmarks/2026-10-05-optimization/raw/exclusive-20261005T022233Z \
+python3 $MYDS_EVIDENCE/benchmarks/2026-10-05-optimization/protocol/summarize-final.py \
+  $MYDS_EVIDENCE/benchmarks/2026-10-05-optimization/raw/exclusive-20261005T022233Z \
   --out "$MYDS_REPRO_OUT/saved-result-audit"
 ```
 
@@ -693,10 +664,10 @@ layout 按 replay recipe 从同一 GGUF 提取。QKV 的 stdout 含启动信息�
 
 > ⚠️ **2026-10-13 为公开做过一次历史重写**（清理家目录路径），**所有 commit SHA 已改变**。
 > 本文中引用的两个基准提交旧哈希 → 新哈希：`afcc05c` → `50a26cf`；
-> `f0a9c228` → `835d0f5`。（`documentation/benchmarks/**/manifest.json` 是冻结的证据，仍记录旧哈希，未改。）
+> `f0a9c228` → `835d0f5`。（`$MYDS_EVIDENCE/benchmarks/**/manifest.json` 是冻结的证据，仍记录旧哈希，未改。）
 服务部署后 SHA、模型或环境变化时，应另存新的结果目录。
 
 ## 视觉（图片输入）
 
 支持图片输入（DeepSeek-V4.1-Flash-Vision），启动加 `--vision <编码器.gguf>`。
-使用、原理、验证与**明确不做**的范围：见 **[docs/VISION.md](https://github.com/aaa2015/documentation/blob/main/VISION.md)**。
+使用、原理、验证与**明确不做**的范围：见 **docs/VISION.md**。

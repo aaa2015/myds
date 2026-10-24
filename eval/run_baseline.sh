@@ -1,4 +1,8 @@
 #!/bin/zsh
+#
+# 部署目录由 MYDS_FLEET_DIR 指定（本仓库不含该目录）。
+# 未设置时这些脚本会明确报错退出，而不是猜一个路径。
+
 # =================================================================
 # run_baseline.sh — 在 macstudio 上跑一次完整基线度量
 #
@@ -21,7 +25,7 @@ TAG="${1:?usage: run_baseline.sh <tag> <model.gguf> <corpus_dir>}"
 MODEL="${2:?missing model}"
 CORPUS="${3:?missing corpus dir}"
 MYDS_DIR="$HOME/Projects/myds"
-FLEET_DIR="$HOME/Projects/deploy"
+FLEET_DIR="${MYDS_FLEET_DIR:?set MYDS_FLEET_DIR to your deployment directory}"
 OUT="$HOME/myds-eval/$TAG"
 MAXTOK="${MAXTOK:-1024}"
 

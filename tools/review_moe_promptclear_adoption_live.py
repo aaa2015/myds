@@ -98,7 +98,7 @@ def inspect(a):
         check('actual_original_'+k,live[k]==before[k])
     check('original_inherited_myds_exact_two',len(live['myds_env'])==2 and live['myds_env'].get('MYDS_DSPARK')=='0' and 'MYDS_DSPARK_FILE'in live['myds_env'])
     check('actual_nice_zero',live['nice']==0)
-    check('actual_mapped_binary_canonical_9cf',live['binary_sha256']==BIN and Path(live['binary']['path'])==Path('$HOME/Projects/myds/bin/myds'))
+    check('actual_mapped_binary_canonical_9cf',live['binary_sha256']==BIN and Path(live['binary']['path'])==Path(__file__).resolve().parent.parent / 'bin' / 'myds')
     check('actual_c692_metallib',live['metallib_sha256']==LIB and sha(live['metallib']['path'])==LIB)
     check('actual_health_ok',live['health']=={'status':'ok'})
     original_raw=Path(receipt['backups']['config']).read_bytes();expected_raw=original_raw+(b''if not original_raw or original_raw.endswith(b'\n')else b'\n')+b'\n# Exact promptclear-v4 conditional release\n'+b'MYDS_PREFILL_MOE_WORKSPACE=1\nMYDS_PREFILL_PROMPT_VIEW_CLEAR=1\n'
@@ -159,7 +159,7 @@ def main():
     for k in ('adoption_dir','manifest','tools_dir','adopter','out_dir'):
         q=getattr(a,k);need(q.is_absolute(),'Absolute paths');setattr(a,k,q.resolve())
     need(not a.out_dir.exists() and a.out_dir.parent.is_dir(),'NEW audit output directory')
-    m=load(a.manifest);protected=[a.adoption_dir,Path(m['candidate_stage']).resolve(),Path(m['full_window']).resolve(),Path('$HOME/Projects/myds')]
+    m=load(a.manifest);protected=[a.adoption_dir,Path(m['candidate_stage']).resolve(),Path(m['full_window']).resolve(),Path(__file__).resolve().parent.parent]
     decision_path=a.adoption_dir/'summary.json'
     if decision_path.is_file():
         d=load(decision_path)

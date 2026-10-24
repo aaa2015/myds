@@ -1,4 +1,8 @@
 #!/bin/bash
+#
+# 部署目录由 MYDS_FLEET_DIR 指定（本仓库不含该目录）。
+# 未设置时这些脚本会明确报错退出，而不是猜一个路径。
+
 # Exclusive-window per-kernel GPU timing on macstudio (stops 8181, ALWAYS restores it).
 #   tools/run_kprof_window.sh /abs/NEW/output_dir [records_short_ctx=0 8k=14 32k=56 ...]
 # Uses the staged bench_kprof (never touches bin/myds). Run only after deploy.
@@ -32,7 +36,7 @@ python3 tools/make_decode_business_request.py --records 56 --output "$out/req-32
 restore=0
 cleanup() {
   if [[ $restore = 1 ]]; then
-    (cd ~/Projects/deploy && ./start_fleet.sh) > "$out/restore-service.log" 2>&1
+    (cd "${MYDS_FLEET_DIR:?set MYDS_FLEET_DIR}" && ./start_fleet.sh) > "$out/restore-service.log" 2>&1
     sleep 5
     curl -fsS http://127.0.0.1:$PORT/health > "$out/restored-health.json" 2>"$out/restored-health.err"
     lsof -nP -a -iTCP:$PORT -sTCP:LISTEN > "$out/restored-listener.txt" 2>&1

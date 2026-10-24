@@ -25,6 +25,8 @@
 ----
   imatrix_probe.py <hf_dir> <model.gguf> <imatrix.dat> <layer> [n_experts]
 """
+import os
+from pathlib import Path
 import ctypes
 import json
 import re
@@ -33,8 +35,8 @@ import sys
 
 import numpy as np
 
-DS4 = "$HOME/Projects/ds4"
-MYDS = "$HOME/Projects/myds"
+DS4 = os.environ.get("DS4_DIR", str(Path(__file__).resolve().parent.parent.parent / "ds4"))
+MYDS = os.environ.get("MYDS_DIR", str(Path(__file__).resolve().parent.parent))
 
 QTYPE_IQ2_XXS = 16
 BLOCK = 256

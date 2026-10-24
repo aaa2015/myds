@@ -1,4 +1,8 @@
 #!/bin/bash
+#
+# 部署目录由 MYDS_FLEET_DIR 指定（本仓库不含该目录）。
+# 未设置时这些脚本会明确报错退出，而不是猜一个路径。
+
 # =================================================================
 # mx.sh — 部署与 A/B 测试的唯一入口
 #
@@ -36,8 +40,8 @@ RUN=${MX_RUN:-/tmp/mx}
 WIRED_LIMIT=${MX_WIRED_LIMIT:-190}
 MIN_FREE_GB=${MX_MIN_FREE_GB:-40}
 REPO=~/Projects/myds
-FLEET=~/Projects/deploy
-MODEL=${MX_MODEL:-$HOME/hf-1017/DeepSeek-V4.1-Flash-1017-Q2-dense-q4-imx-cliecy.gguf}
+FLEET="${MYDS_FLEET_DIR:?set MYDS_FLEET_DIR to your deployment directory}"
+MODEL=${MX_MODEL:-${MYDS_MODEL_DIR:?set MYDS_MODEL_DIR or MX_MODEL}/DeepSeek-V4.1-Flash-1017-Q2-dense-q4-imx-cliecy.gguf}
 CTX=${MX_CTX:-524288}
 ALIAS=${MX_ALIAS:-mx}
 

@@ -15,18 +15,20 @@
 
 额外提供一个中性参照：全列均匀权重（不偏向任何一方）。
 """
+import os
+from pathlib import Path
 import struct
 import sys
 
 import numpy as np
 
-DS4 = "$HOME/Projects/ds4"
+DS4 = os.environ.get("DS4_DIR", str(Path(__file__).resolve().parent.parent.parent / "ds4"))
 sys.path.insert(0, f"{DS4}/gguf-tools")
 from glm53_quantize import SourceDB                              # noqa: E402
 from deepseek41_quantize import NativeQuantizer, validate_scales  # noqa: E402
 import re                                                         # noqa: E402
 
-MYDS = "$HOME/Projects/myds"
+MYDS = os.environ.get("MYDS_DIR", str(Path(__file__).resolve().parent.parent))
 q = NativeQuantizer(f"{DS4}/gguf-tools/libds4quants.dylib")
 QTYPE_IQ2_XXS = 16
 
@@ -90,7 +92,7 @@ def main():
     nameA, nameB = sys.argv[4] if len(sys.argv) > 4 else "A", "B"
     n_exp = int(sys.argv[6]) if len(sys.argv) > 6 else 6
 
-    db = SourceDB("$HOME/hf-1017", index_validator=lambda _: None,
+    db = SourceDB(os.environ.get("MYDS_MODEL_DIR", str(Path.home() / "hf-1017")), index_validator=lambda _: None,
                   scale_validator=validate_scales)
     A = load(datA)
     B = load(datB)

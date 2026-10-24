@@ -27,13 +27,15 @@ Prism ML 的 Ternary-Bonsai 用三步做到 1.72 bpw：
 ----
   hadamard_probe.py <hf_dir> <imatrix.dat> <layer> [n_experts] [blocks...]
 """
+import os
+from pathlib import Path
 import ctypes
 import struct
 import sys
 
 import numpy as np
 
-DS4 = "$HOME/Projects/ds4"
+DS4 = os.environ.get("DS4_DIR", str(Path(__file__).resolve().parent.parent.parent / "ds4"))
 sys.path.insert(0, f"{DS4}/gguf-tools")
 from glm53_quantize import SourceDB          # noqa: E402
 from deepseek41_quantize import NativeQuantizer, validate_scales  # noqa: E402
@@ -44,7 +46,7 @@ q = NativeQuantizer(f"{DS4}/gguf-tools/libds4quants.dylib")
 # 解码器：IQ2_XXS 的 Metal 反量化在这里用 numpy 复刻（布局见 metal/moe.metal）
 import re  # noqa: E402
 
-MYDS = "$HOME/Projects/myds"
+MYDS = os.environ.get("MYDS_DIR", str(Path(__file__).resolve().parent.parent))
 
 
 def load_tables():

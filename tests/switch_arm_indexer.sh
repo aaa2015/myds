@@ -1,4 +1,8 @@
 #!/bin/bash
+#
+# 部署目录由 MYDS_FLEET_DIR 指定（本仓库不含该目录）。
+# 未设置时这些脚本会明确报错退出，而不是猜一个路径。
+
 set -euo pipefail
 
 BATCH_FLOATS="${1:-16777216}"
@@ -16,7 +20,7 @@ if [ -n "$OLD_PID" ]; then
     echo "Port 8187 is now free."
 fi
 
-cd $HOME/Projects/deploy
+cd "${MYDS_FLEET_DIR:?set MYDS_FLEET_DIR to your deployment directory}"
 ./start_fleet.sh
 
 echo "Waiting for http://127.0.0.1:8187/health..."

@@ -1,4 +1,8 @@
 #!/bin/bash
+#
+# 部署目录由 MYDS_FLEET_DIR 指定（本仓库不含该目录）。
+# 未设置时这些脚本会明确报错退出，而不是猜一个路径。
+
 set -euo pipefail
 
 NR0="${1:-2}"
@@ -18,7 +22,7 @@ if [ -n "$OLD_PID" ]; then
     echo "Port 8187 is now free."
 fi
 
-cd $HOME/Projects/deploy
+cd "${MYDS_FLEET_DIR:?set MYDS_FLEET_DIR to your deployment directory}"
 ./start_fleet.sh
 
 echo "Waiting for http://127.0.0.1:8187/health..."
@@ -41,7 +45,7 @@ echo "--- Environment of running process ---"
 ps eww "$PID" | tr ' ' '\n' | grep -E 'MYDS_DENSE_Q4_NR0|MYDS_DENSE_Q4_NR4_MASK|MYDS_MOE_DOWN_NSG' || true
 
 echo "--- Dense Q4 providers in log ---"
-grep "Dense Q4 V41 provider" $HOME/Projects/deploy/logs/local-myds-deepseek-v4.1-flash-1017-q2-q4.log | tail -n 3 || true
+grep "Dense Q4 V41 provider" ${MYDS_FLEET_DIR}/logs/local-myds-deepseek-v4.1-flash-1017-q2-q4.log | tail -n 3 || true
 
 echo "--- Overlap status in log ---"
-grep "Decode candidates: down overlap=" $HOME/Projects/deploy/logs/local-myds-deepseek-v4.1-flash-1017-q2-q4.log | tail -n 1 || true
+grep "Decode candidates: down overlap=" ${MYDS_FLEET_DIR}/logs/local-myds-deepseek-v4.1-flash-1017-q2-q4.log | tail -n 1 || true
