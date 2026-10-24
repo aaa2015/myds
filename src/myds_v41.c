@@ -1622,6 +1622,15 @@ static uint32_t lowkv_pick_end_entry(myds_v41_context_t *g, myds_kvdsk_t *store,
             if (empty_slot == V41_LOWKV_NO_ENTRY) empty_slot = s;
         }
     }
+    if (empty_slot == V41_LOWKV_NO_ENTRY && victim_slot != V41_LOWKV_NO_ENTRY) {
+        /* 2026-10-24：FIFO 淘汰时留痕。没有这条，策略问题（比如误在 LFU 上）
+         * 只能靠「怎么刚存的又没了」这种间接现象发现。 */
+        uint32_t vpos = 0; uint64_t vhash = 0, vused = 0;
+        (void)myds_kvdsk_slot_meta(store, victim_slot, &vpos, &vhash, &vused);
+        MYDS_LOG_I("kvdisk: ends 槽已满（%u），FIFO 淘汰最老的一条 · 槽 %u · 位置 %u · 写入 %llu",
+                   myds_kvdsk_slot_count(store), victim_slot, vpos,
+                   (unsigned long long)oldest_us);
+    }
     return (empty_slot != V41_LOWKV_NO_ENTRY) ? empty_slot : victim_slot;
 }
 
@@ -2101,6 +2110,27 @@ static bool lowkv_open_stores(myds_v41_context_t *g, const char *snap_path,
         }
     }
     g->low_ways = ways;
+
+    /* 2026-10-24：把两个 store 的容量边界一次打清楚。
+     * 这条日志是「为什么某个 prompt 没进缓存」的第一现场：
+     * 每槽能装多少 token、有几槽、名义/实际磁盘。 */
+    {
+        const uint32_t pc_tok = v41_prompt_cache_max_tokens();
+        const uint32_t an_tok = v41_anchor_max_tokens();
+        const uint32_t pc_slots = v41_prompt_cache_slots();
+        const uint32_t an_slots = v41_anchor_slots();
+        const uint64_t pc_stride = v41_end_stride_for(pc_tok);
+        const uint64_t an_stride = v41_end_stride_for(an_tok);
+        MYDS_LOG_I("kvdisk: prompt-cache store · %u 槽 × %u tok (%.0f MiB/槽) = 名义 %.1f GiB",
+                   pc_slots, pc_tok, (double)pc_stride / 1048576.0,
+                   (double)pc_slots * (double)pc_stride / 1073741824.0);
+        MYDS_LOG_I("kvdisk: anchor store      · %u 槽 × %u tok (%.0f MiB/槽) = 名义 %.1f GiB%s",
+                   an_slots, an_tok, (double)an_stride / 1048576.0,
+                   (double)an_slots * (double)an_stride / 1073741824.0,
+                   g->low_anchor ? "" : "  [不可用]");
+        MYDS_LOG_I("kvdisk: 分段网格上限 %u tok ⇒ 超过此值的 prompt 必须靠 tail 才能缓存",
+                   MYDS_SNAP_MIN + (MYDS_SNAP_PINNED - 1u) * MYDS_SNAP_STRIDE);
+    }
     return true;
 }
 

@@ -84,6 +84,7 @@ TEST_ENGRAM = $(BIN_DIR)/test_engram
 TEST_ALIGN = $(BIN_DIR)/test_align
 TEST_PLD = $(BIN_DIR)/test_pld
 TEST_KVDSK = $(BIN_DIR)/test_kvdsk
+TEST_KVDSK_FIFO = $(BIN_DIR)/test_kvdsk_fifo
 TEST_P1 = $(BIN_DIR)/test_p1
 TEST_DSPARK_ROLLBACK = $(BIN_DIR)/test_dspark_rollback
 TEST_DSPARK_ROUTER = $(BIN_DIR)/test_dspark_router
@@ -115,7 +116,7 @@ METALLIB = $(BIN_DIR)/myds.metallib
 METAL_SRCS = $(wildcard metal/*.metal)
 
 ALL_TESTS = $(TEST_METAL) $(TEST_V41_GPU) $(TEST_ATTN_POLICY) $(TEST_ATTN_VEC) $(TEST_QKV_FUSION) $(TEST_DECODE_Q8) $(TEST_MOE_DOWN_NSG) $(TEST_DEEPER_SSD) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE) $(TEST_CPU) $(TEST_ENGRAM) $(TEST_ALIGN) $(TEST_PLD) $(TEST_KVDSK) $(TEST_P1) $(TEST_DSPARK_ROLLBACK) $(TEST_DSPARK_CAPTURE) $(TEST_DSPARK_ROUTER) $(TEST_V41_ROUTER) $(TEST_BATCH2_SHARED_PAIR) $(TEST_DSPARK_ATTN) $(TEST_DSPARK_MOE) $(TEST_DSPARK_PROPOSAL) $(TEST_BATCH2_PARITY) $(TEST_BATCH2_E2E) $(TEST_Q4_BF16_PARITY) $(TEST_TREE_SPEC) $(TEST_ENGINE_DEPTH2)
-ALL_TESTS += $(TEST_METAL_RESIDENCY) $(TEST_TEARDOWN_ORDER) $(TEST_DECODE_SPLIT)
+ALL_TESTS += $(TEST_METAL_RESIDENCY) $(TEST_TEARDOWN_ORDER) $(TEST_DECODE_SPLIT) $(TEST_KVDSK_FIFO)
 
 .PHONY: all test clean bench metallib build-tail-init test-tail-init
 
@@ -388,6 +389,8 @@ $(TEST_PLD): tests/test_pld.c include/myds_pld.h | $(BIN_DIR)
 # 低位区 KV 落盘：只需要存储层与日志，不需要模型（也就不必占着跑生产的机器开第二个实例）。
 $(TEST_KVDSK): tests/test_kvdsk.c include/myds_kvdsk.h $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_log.o | $(BIN_DIR)
 	$(CC) $(CFLAGS) -Iinclude -o $@ tests/test_kvdsk.c $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_log.o
+$(TEST_KVDSK_FIFO): tests/test_kvdsk_fifo.c include/myds_kvdsk.h $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_log.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) -Iinclude -o $@ tests/test_kvdsk_fifo.c $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_log.o
 
 $(TEST_P1): tests/test_p1_regressions.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -Iinclude -o $@ tests/test_p1_regressions.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS)

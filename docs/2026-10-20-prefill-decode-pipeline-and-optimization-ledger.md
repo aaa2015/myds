@@ -1,6 +1,6 @@
 # prefill / decode 全链路、已采纳优化与排除记录
 
-- 最后更新：**2026-10-24 16:50（§68–§92 全链路效率普查完成。prefill 57.3% 已到顶、30.2% 受硬约束；唯一采纳 §85 TILED −1.73%。生产 PID55488 已核验）**
+- 最后更新：**2026-10-24 18:08（§68–§92 全链路效率普查完成。prefill 57.3% 已到顶、30.2% 受硬约束；唯一采纳 §85 TILED −1.73%。生产 PID55488 已核验）**
 - 主机：macstudio — M2 Ultra，76 核 GPU，**206 GB 统一内存**（=192 GiB，Metal 上限 201.9 GB）；
   带宽理论峰值 **800 GB/s**，实测可达 **724 GB/s**（§0.1），纯读基准最高 799 GB/s（§46.1）
 - 系统：**macOS 27.0.1 (26A434)**，kernel 27.0.0（§42）
@@ -13043,3 +13043,118 @@ turn N（suffix 模式） accumulated = 上一轮 accumulated + 本次新增部�
    带工具定义的系统提示词常超过 1024 token ⇒ 锚点在最需要的场景下永不触发。
 
 **这两条与 §93 的 kvdisk 修复合起来，才构成「长系统提示 + 重启 + 续跑」的完整链路。**
+
+---
+
+## §95 kvdisk 分出两个 store、淘汰改 FIFO、以及一个被我放错位置的恢复（2026-10-24）
+
+### 95.1 起因：一条日志暴露的淘汰顺序问题
+
+启动日志原文：
+
+```
+kvdisk: 同一位置可容纳 3 套不同的「system + tools」——它们的哈希不同，互不顶替；
+        只有全部占满才按【命中数】淘汰
+```
+
+**读完即报缺陷：命中数最少的是「刚写进去的那条」**（还没被用过，hits=0），
+于是下一套新组合进来时，它立刻被淘汰。连写 N 套，**前 N−1 套全部阵亡**。
+更糟的是 hits 只增不减 —— 三周前的热门条目（hits 很大）永不淘汰，
+昨天的（hits=0）优先死。
+
+**模拟验证**（4 槽，写 combo0..combo5）：
+
+```
+LFU（原实现）：存活 combo1,2,3,5    ← combo4 只活了一轮
+FIFO（新实现）：存活 combo2,3,4,5   ← 最新的 4 套，符合直觉
+```
+
+### 95.2 改法：写时刻 + FIFO
+
+条目表原本 32 字节空闲（`offset 40-71`），**加 `u64 written_us` 不改结构大小**：
+
+```
+0-3   position      4-7   hits        8-15  prefix_hash
+16-23 used_bytes    24-31 crc        32-39 (u64 crc 高半)
+40-47 written_us   ← 新增
+```
+
+淘汰改成「取 written_us 最小者」。**旧文件的该字段为 0 ⇒ 视为最老 ⇒ 先淘汰，
+语义正确**（它们确实是旧的）。
+
+注：`lowkv_pick_way`（pinned 段的 way 选择，`src/myds_v41.c:1429`）**仍是 LFU**，
+与本次修改的 `lowkv_pick_end_entry` 是两条独立路径。pinned 段的 21 个位置各有 3 way，
+语义是「同一位置的 3 套 system」，LFU 在那里仍合理。
+
+### 95.3 拆分：anchor 与 prompt-end 必须是两个 store
+
+**共用 stride 的代价**：stride 只能按两者较大者定。把 system prompt 上限提到 65536 tok 后，
+**64 个 prompt-cache 槽也得各付 65536 tok**（名义 35 GB）。
+
+拆成两个文件后：
+
+| store | 文件 | 槽数 | 每槽容量 | 名义 |
+|---|---|---:|---:|---:|
+| anchor | `kvanchor-v1-*.bin` | **16** | 65536 tok | 8.9 GB |
+| prompt-end | `kvends-v1-*.bin` | **64** | 65536 tok | 35.6 GB |
+
+**文件是稀疏的**：实测现有 `kvends` 名义 448 MB / 实占 11 MB（2.5%）。
+单人实际用 3 + 5 条 ⇒ **真实占用约 4.5 GB**。
+
+四个配置项：
+
+```
+MYDS_ANCHOR_MAX_TOKENS=65536        MYDS_ANCHOR_SLOTS=16
+MYDS_PROMPT_CACHE_MAX_TOKENS=65536  MYDS_PROMPT_CACHE_SLOTS=64
+```
+
+### 95.4 我放错位置的一个恢复（重要）
+
+§94 加的 `myds_v41_low_kv_load_anchor` 调用最初放在 **prefill 段**，
+而 `resume_from` 早在它之前就定了。后果：
+
+```
+重启后 → load_anchor 成功恢复 anchor_len
+       → 但 resume_from 已是 0
+       → 这次请求仍全量 prefill（52K ≈ 88 秒）
+       → 恢复只对下一次请求生效
+```
+
+**⇒ 恢复必须发生在 `resume_from` 决策之前。** 已移到 RAM anchor 判定之前
+（`src/myds_v41.c` 的 `prefix cache: anchor restored from disk at decision time`）。
+
+### 95.5 查找顺序（审查确认）
+
+| 顺序 | 检查 | 说明 |
+|---:|---|---|
+| 1 | RAM prefix cache | 上一条的 pcache 公共前缀 |
+| 2 | **system prompt anchor**（先磁盘恢复，再 RAM 判定） | 本次修正点 |
+| 3 | disk probe | **只查 prompt-end 的更深快照** |
+
+后两步都有 `resume_from == 0` 守卫 ⇒ **前一步命中则后续自动跳过**。
+
+### 95.6 新增日志
+
+| 位置 | 内容 |
+|---|---|
+| `lowkv_open_stores` | 两个 store 各自的槽数 / 每槽 token / 名义磁盘，以及分段网格上限 |
+| `lowkv_pick_end_entry` | **槽满时打印淘汰了哪一条**（槽号 / 位置 / 写入时刻） |
+| 启动 | `prompt split: system+tools=N tok / total=M tok` + 超 64K 的 WARN |
+
+**为什么淘汰要留痕**：没有这条，「怎么刚存的又没了」只能靠间接现象发现 ——
+LFU 的缺陷就是从一行启动日志里读出来的，不是从性能数据里。
+
+### 95.7 新增单元测试
+
+`tests/test_kvdsk_fifo.c`（纯 CPU，不需模型）：
+
+| # | 断言 |
+|---:|---|
+| 1 | `slot_written_us` 可读、非 0、后写的不早于先写的 |
+| 2 | 空槽读不到，且不污染输出 |
+| 3 | 槽满时最老（槽 0）被选中；覆盖后它变成最新 |
+| 4 | 写入时刻被清成 0 的条目视为最老 |
+| 5 | `slot_count` 与打开时的槽数一致，NULL 返回 0 |
+
+已挂进 `make test`（`ALL_TESTS += $(TEST_KVDSK_FIFO)`），实测通过。
+原有的 `test_kvdsk`（含 LFU 用例）也仍通过 —— 两条路径互不影响。
