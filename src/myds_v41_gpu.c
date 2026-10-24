@@ -583,6 +583,29 @@ int myds_v41_gpu_indexscores_selected_blocks_bf16(myds_metal_buffer_t *scores,
 /* 整 chunk 批量版：kernel_glm_indexer_score_chunk_direct 与 _direct 的线程/网格/smem
  * 相同，只是多一维 token（grid.y）与逐行因果门。只支持 n_heads == 32，
  * 否则返回 0 让调用方回退到逐 token 路径。 */
+/* 2026-10-25：indexer 的 key 方向距离窗口。
+ *
+ * ★ 这是【非 0-ULP】开关。默认 0 = 不限制 = 与改动前逐位等价。
+ * 设成 >0 后，只有距可见上限最近的 window 个压缩键参与打分，更早的填 -INF。
+ * 复杂度从 O(N²) 降到 O(N × window)，代价是模型失去远距离检索能力。
+ *
+ * 生产默认不设。开启前必须评估长文质量（当前无自动化基准）。 */
+static uint32_t indexer_key_window(void) {
+    static uint32_t cached = UINT32_MAX;   /* 哨兵：未解析 */
+    if (cached != UINT32_MAX) return cached;
+    cached = 0;
+    const char *e = getenv("MYDS_INDEXER_KEY_WINDOW");
+    if (e && *e) {
+        const long v = atol(e);
+        if (v > 0) cached = (uint32_t)v;
+    }
+    if (cached) {
+        MYDS_LOG_W("indexer: key 方向窗口 %u（非 0-ULP —— 更早的压缩键不参与 top-k）",
+                   cached);
+    }
+    return cached;
+}
+
 static int indexscores_chunk(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
     const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,uint32_t n_comp,
     uint32_t n_heads,uint32_t n_tokens,uint32_t causal_start,uint32_t causal_ratio,bool cache_bf16) {
@@ -594,7 +617,7 @@ static int indexscores_chunk(myds_metal_buffer_t *scores,const myds_metal_buffer
     const char *tiled_env = getenv("MYDS_INDEXER_TILED");
     int opt_tiled = (tiled_env && atoi(tiled_env) > 0) ? 1 : 0;
     const myds_metal_buffer_t *b[]={q,weights,cache,scores};
-    if (opt_tiled && n_tokens >= 8) {
+    if (opt_tiled && n_tokens >= 8 && !indexer_key_window()) {
         struct {
             uint32_t n_comp, n_tokens, n_head, head_dim, pos0, ratio;
             uint64_t q_token_stride, q_head_stride, weights_token_stride;
@@ -627,8 +650,9 @@ static int indexscores_chunk(myds_metal_buffer_t *scores,const myds_metal_buffer
                         &ta, sizeof(ta), b, 4, gx, gy, 1, 32, 4, 1, smem);
     }
     struct {uint32_t n_rows,n_head,head_dim,cache_f16;float scale;
-            uint32_t n_tokens,causal_start,causal_ratio,pad;} a={
-        n_comp,n_heads,128,cache_bf16?2u:0u,1.0f/64.0f,n_tokens,causal_start,causal_ratio,0};
+            uint32_t n_tokens,causal_start,causal_ratio,window;} a={
+        n_comp,n_heads,128,cache_bf16?2u:0u,1.0f/64.0f,n_tokens,causal_start,causal_ratio,
+        indexer_key_window()};
     const char *exact_env = getenv("MYDS_INDEXER_CHUNK_EXACT");
     if ((!exact_env || strcmp(exact_env, "0") != 0) &&
         dispatch("kernel_myds_indexer_score_chunk_exact", &a, sizeof(a), b, 4,

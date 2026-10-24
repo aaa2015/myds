@@ -286,7 +286,12 @@ struct ds4_metal_args_glm_indexer_score_chunk {
     uint32_t n_tokens;
     uint32_t causal_start;
     uint32_t causal_ratio;
-    uint32_t pad;
+    /* 2026-10-25：key 方向的【距离窗口】。原为未使用的 pad，复用改名，结构体大小不变。
+     * 0 = 不限制（与改动前逐位等价）。
+     * >0 = 只保留最近 window 个压缩键参与打分，更早的填 -INF ⇒ indexer 从
+     *      O(N²) 降到 O(N × window)。这是【非 0-ULP】近似：模型失去远距离
+     *      检索能力，见 MYDS_INDEXER_KEY_WINDOW 的说明。 */
+    uint32_t window;
 };
 
 struct ds4_metal_args_glm_indexer_scores_batch {
@@ -2202,8 +2207,14 @@ kernel void kernel_myds_indexer_score_chunk_exact(
     const uint tile_tokens = last_tok - tok_base;
     const uint max_vis = (args.causal_start + (last_tok - 1u) + 1u) / args.causal_ratio;
 
-    /* 整块因果早退：若本 tile 的起始压缩键行已超出最后一行 token 的可见上限，直接写 -INF 返回 */
-    if (row_base >= max_vis) {
+    /* 2026-10-25：距离窗口下界。window=0 ⇒ min_vis=0 ⇒ 下面的下界条件永不成立
+     * ⇒ 与改动前逐位等价（0-ULP 门禁可验）。
+     * window>0 ⇒ 距可见上限超过 window 的整块直接跳过，把 O(N²) 降到 O(N×window)。 */
+    const uint min_vis = (args.window && max_vis > args.window)
+                         ? (max_vis - args.window) : 0u;
+
+    /* 整块早退：超出因果上限（未来）或超出距离窗口（太早）都填 -INF 返回 */
+    if (row_base >= max_vis || (min_vis && row_base + 16u <= min_vis)) {
         const uint cell_t = (uint)tid >> 4;
         const uint cell_c = (uint)tid & 15u;
         const uint cell_tok = tok_base + cell_t;
