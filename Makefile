@@ -62,6 +62,7 @@ TEST_PREFILL_INDEXER_PEEL = $(BIN_DIR)/test_prefill_indexer_peel
 TEST_PREFILL_SHORT_SNAPSHOT = $(BIN_DIR)/test_prefill_short_snapshot
 TEST_PREFILL_SHRINK_GRID = $(BIN_DIR)/test_prefill_shrink_grid
 TEST_PREFILL_SHRINK_GRID_GUARDED = $(BIN_DIR)/test_prefill_shrink_grid_guarded
+TEST_YOCO_COMPACT = $(BIN_DIR)/test_yoco_compact
 TEST_TOPK_THRESHOLD = $(BIN_DIR)/test_topk_threshold
 TEST_F16_BF16_FUSE = $(BIN_DIR)/test_f16_bf16_fuse
 TEST_INDEXER_ROPE_QUANT = $(BIN_DIR)/test_indexer_rope_quant
@@ -428,6 +429,9 @@ $(TEST_PREFILL_SHRINK_GRID): tests/test_prefill_shrink_grid.c src/myds_v41.c $(w
 
 $(TEST_PREFILL_SHRINK_GRID_GUARDED): tests/test_prefill_shrink_grid_guarded.c src/myds_v41.c $(wildcard include/*.h) $(filter-out $(BUILD_DIR)/myds_v41.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(filter %.o,$^) $(LDFLAGS) -Wl,-dead_strip
+
+$(TEST_YOCO_COMPACT): tests/test_yoco_compact.c | $(BIN_DIR)
+	$(CC) $(CFLAGS) -Iinclude -o $@ $<
 
 $(TEST_DEPTH2_SHARED3): tests/test_depth2_shared3.m src/myds_metal.m src/myds_decode_candidates.inc $(wildcard include/*.h) $(OBJS_C) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc -o $@ $< $(OBJS_C) $(LDFLAGS)

@@ -7267,6 +7267,25 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             }
         }
     }
+    /* 官方 DeepInfer 借鉴：YoCo SWA Bounded Replay (Prefill Truncation)。
+     * 在 CED 架构中，Decoder 层（20..39）只关注末尾保留区间（默认 140 tokens，覆盖 128 滑窗），
+     * Layer 20 计算全序列的压缩 KV，而 Layer 21..39 跳过末尾 140 之前的全部块，
+     * 消除递归因果锥 (1 + (39-il)*127) 带来的数万 token 重复计算。
+     * 默认关（0），保持绝对 0-ULP 基线；设 MYDS_YOCO_COMPACT=1 开启。 */
+    const char *yoco_compact_env = getenv("MYDS_YOCO_COMPACT");
+    const bool opt_yoco_compact = (yoco_compact_env && atoi(yoco_compact_env) != 0);
+    uint32_t yoco_keep_tokens = 140u;
+    {
+        const char *yke = getenv("MYDS_YOCO_KEEP_TOKENS");
+        if (yke && *yke) {
+            long v = atol(yke);
+            if (v >= 128) yoco_keep_tokens = (uint32_t)v;
+            else if (v > 0) {
+                MYDS_LOG_W("MYDS_YOCO_KEEP_TOKENS=%ld 小于滑窗 128，重置为 128", v);
+                yoco_keep_tokens = 128u;
+            }
+        }
+    }
     double prof_s1_norm = 0, prof_s1_mix = 0, prof_s1_split = 0, prof_s1_wsum = 0, prof_s1_norm2 = 0;
     const bool opt_disable_mm_attn_a = (getenv("MYDS_DISABLE_MM_ATTN_A") != NULL);
     double prof_engram = 0, prof_embedding = 0, prof_total_layers = 0;
@@ -7365,7 +7384,9 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                        mb_base_pos,mb_end,cone_shift,guarded_old_full[39],guarded_full[39],
                        (unsigned long long)guarded_rows_avoided);
         }
-        const uint32_t sub_39 = 1u + cone_shift;
+        const uint32_t sub_39 = (opt_yoco_compact && suffix_shrink)
+                                ? (yoco_keep_tokens + cone_shift)
+                                : (1u + cone_shift);
         const uint32_t s_global_39 = (total_eff > sub_39) ? total_eff - sub_39 : 0u;
         const uint32_t s_clamped_39 = s_global_39 < mb_base_pos ? mb_base_pos
                                     : (s_global_39 > mb_end ? mb_end : s_global_39);
@@ -7463,7 +7484,9 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
              *     - 在早期的 macroblock（SKV_global(il) >= B）中，层 21..39 整块跳过（sh_loop_rel = mb_len）；
              *     - 层 20 仍从 sh_loop_rel = 0 跑 kv_only 以填充全局压缩 KV 与索引缓存；
              *     - 跨 macroblock 边界时，上一块末尾与下一块开头的 kv_only 段精确拼接满 127 行窗口环。 */
-            const uint32_t sh_need = 1u + (V41_LAYERS - 1u - il) * 127u;
+            const uint32_t sh_need = (opt_yoco_compact && suffix_shrink)
+                                     ? yoco_keep_tokens
+                                     : (1u + (V41_LAYERS - 1u - il) * 127u);
             const bool shrink_layer = suffix_shrink && il >= 20u;
             const uint32_t sh_valid_from = (total_eff > cone_shift) ? total_eff - cone_shift : 0u;
             uint32_t sh_loop_rel = 0, sh_full_rel = 0, sh_s_global = 0;
@@ -7475,16 +7498,22 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 if (s < mb_base_pos) s = mb_base_pos;
                 if (s > mb_end) s = mb_end;
                 sh_full_rel = s - mb_base_pos;
-                if (guarded_grid_active) {
+                if (guarded_grid_active && !opt_yoco_compact) {
                     sh_full_rel=guarded_full[il]-mb_base_pos;
                     sh_s_global=guarded_full[il];
                 }
                 if (shrink_shift == 0u) {
-                    const uint32_t skv_global = (s_global > 127u) ? s_global - 127u : 0u;
-                    uint32_t skv = skv_global;
-                    if (skv < mb_base_pos) skv = mb_base_pos;
-                    if (skv > mb_end) skv = mb_end;
-                    sh_loop_rel = (il == 20u) ? 0u : (skv - mb_base_pos);
+                    if (opt_yoco_compact) {
+                        /* YOCO Compact: Layer 20 从 0 跑 kv_only，生产全序列压缩 KV；
+                         * Layer 21..39 无需在 s 之前跑 127 行 kv_only 预热，直接从 sh_full_rel 开始。 */
+                        sh_loop_rel = (il == 20u) ? 0u : sh_full_rel;
+                    } else {
+                        const uint32_t skv_global = (s_global > 127u) ? s_global - 127u : 0u;
+                        uint32_t skv = skv_global;
+                        if (skv < mb_base_pos) skv = mb_base_pos;
+                        if (skv > mb_end) skv = mb_end;
+                        sh_loop_rel = (il == 20u) ? 0u : (skv - mb_base_pos);
+                    }
                 }
                 /* shift>0：sh_loop_rel = 0 ⇒ 前置段从 A 起跑；A 是 STRIDE 的倍数，
                  * 所以各层 chunk 末端都落在 512 网格上（否则中途快照点根本无法发布）。 */
@@ -7493,10 +7522,15 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 static bool shrink_logged = false;
                 if (!shrink_logged) {
                     shrink_logged = true;
-                    MYDS_LOG_I("V4.1 suffix shrink[snapshot-guard v2]: front=%s shift=%u valid_from=%u "
-                               "(total=%u, layer20 rows=%u..%u of %u)",
-                               shrink_shift ? "all" : "skv", shrink_shift, sh_valid_from,
-                               base_pos + n_tokens, sh_full_rel, mb_len, mb_len);
+                    if (opt_yoco_compact) {
+                        MYDS_LOG_I("V4.1 suffix shrink[YOCO COMPACT]: keep_tokens=%u (total=%u, consumer start=%u)",
+                                   yoco_keep_tokens, base_pos + n_tokens, sh_s_global);
+                    } else {
+                        MYDS_LOG_I("V4.1 suffix shrink[snapshot-guard v2]: front=%s shift=%u valid_from=%u "
+                                   "(total=%u, layer20 rows=%u..%u of %u)",
+                                   shrink_shift ? "all" : "skv", shrink_shift, sh_valid_from,
+                                   base_pos + n_tokens, sh_full_rel, mb_len, mb_len);
+                    }
                 }
             }
 
@@ -7821,6 +7855,12 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 if (shrink_layer) {
                     if (c_start == sh_full_rel && carry_pos != 0u) {
                         phase = "carry stage";
+                        if (opt_yoco_compact && il > 20u) {
+                            /* YOCO Compact: consumer 层的重算区始于 sh_full_rel，
+                             * 将其历史 carry 窗置零，防止遗留 KV 脏数据渗入。 */
+                            memset(myds_metal_buffer_data(g->window[il]), 0,
+                                   V41_WINDOW * V41_HEAD_DIM * sizeof(float));
+                        }
                         if (!myds_v41_gpu_carry_stage(g->gpu, g->window[il], carry_pos)) {
                             MYDS_LOG_E("carry stage failed at layer %u (pos=%u)", il, carry_pos);
                             goto fail;

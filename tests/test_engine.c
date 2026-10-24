@@ -904,6 +904,19 @@ int main(int argc, char **argv) {
         int32_t picked = myds_sample_next_token(logits, 8, &cfg, NULL, NULL, 0);
         assert(picked == 2); /* 10.5f is maximum at index 2 */
         printf("  [PASS] Production greedy argmax token selection (index 2 picked)\n");
+
+        /* Structured output bitmask filter: disallow token 2, allow tokens 1, 3, 5 */
+        uint32_t bm[1] = {(1u << 1) | (1u << 3) | (1u << 5)};
+        myds_config_t cfg_bm = {.temperature = 0.0f, .logit_bitmask = bm};
+        int32_t picked_bm = myds_sample_next_token(logits, 8, &cfg_bm, NULL, NULL, 0);
+        assert(picked_bm == 5); /* Token 5 (8.9f) is highest among allowed {1, 3, 5} */
+
+        /* Also test temperature sampling under bitmask */
+        cfg_bm.temperature = 0.8f;
+        cfg_bm.seed = 42;
+        int32_t picked_temp = myds_sample_next_token(logits, 8, &cfg_bm, NULL, NULL, 0);
+        assert(picked_temp == 1 || picked_temp == 3 || picked_temp == 5);
+        printf("  [PASS] Structured output logit bitmask filter (disallowed token 2, selected %d)\n", picked_bm);
     }
 
     /* 2. Production Repetition Penalty */

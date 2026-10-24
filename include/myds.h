@@ -52,6 +52,10 @@ typedef struct {
      * 保留仅为 ABI 兼容；新代码不要依赖它。 */
     bool     stream;            /* Deprecated: set but never read; see note above. */
     bool     thinking_mode;     /* Enable thinking / reasoning mode (default: false) */
+    /* 官方 DeepInfer 借鉴：Structured output token bitmask filter。
+     * 若非 NULL，指向大小为 ceil(vocab_size / 32) 个 uint32 的位掩码数组。
+     * 只有第 (token >> 5) 个 uint32 的第 (token & 31) 位为 1 时才允许采样该 token。 */
+    const uint32_t *logit_bitmask;
 } myds_config_t;
 
 typedef void (*myds_stream_callback_t)(const char *piece, int32_t token_id, void *user_data);
@@ -70,6 +74,8 @@ myds_context_t *myds_context_create(myds_model_t *model, const myds_config_t *cf
 void            myds_context_free(myds_context_t *ctx);
 myds_config_t   myds_context_get_config(const myds_context_t *ctx);
 void            myds_context_set_config(myds_context_t *ctx, const myds_config_t *cfg);
+void            myds_context_set_logit_bitmask(myds_context_t *ctx, const uint32_t *bitmask);
+void            myds_context_clear_logit_bitmask(myds_context_t *ctx);
 
 /* 最近一次请求的 prefill 统计（供服务端日志/工具使用）。
  * 「prefill 速度」这个词有歧义：这里 prefill_tokens 是【真正被 prefilled 的 token 数】，

@@ -227,6 +227,8 @@ struct myds_context {
     uint32_t             recent_next;    /* 下一个写入下标 */
     void                *sample_cands;
     uint64_t             rng_state;
+    /* Structured output token bitmask (borrowed from DeepInfer) */
+    uint32_t            *logit_bitmask;
 
     /* ── 图片嵌入注入（视觉）──
      * 序列位置 [img_emb_start, img_emb_start + img_emb_count) 的嵌入不用词表查表，

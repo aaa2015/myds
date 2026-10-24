@@ -1454,6 +1454,7 @@ void myds_context_free(myds_context_t *ctx) {
     if (ctx->sample_probs)   free(ctx->sample_probs);
     if (ctx->sample_indices) free(ctx->sample_indices);
     if (ctx->sample_cands)   free(ctx->sample_cands);
+    if (ctx->logit_bitmask)  free(ctx->logit_bitmask);
     for (uint32_t i = 0; i < MYDS_ANCHOR_SLOTS_MAX; ++i) free(ctx->anchor_tokens[i]);
     free(ctx);
 }
@@ -1473,6 +1474,30 @@ void myds_context_set_config(myds_context_t *ctx, const myds_config_t *cfg) {
     /* Changing sampling options cannot grow the already allocated KV buffers. */
     if (ctx->cfg.max_seq_len == 0 || ctx->cfg.max_seq_len > ctx->kv_capacity) {
         ctx->cfg.max_seq_len = ctx->kv_capacity;
+    }
+}
+
+void myds_context_set_logit_bitmask(myds_context_t *ctx, const uint32_t *bitmask) {
+    if (!ctx) return;
+    if (!bitmask) {
+        myds_context_clear_logit_bitmask(ctx);
+        return;
+    }
+    const uint32_t vocab = ctx->model ? ctx->model->vocab_size : 129280u;
+    const uint32_t n_words = (vocab + 31u) / 32u;
+    if (!ctx->logit_bitmask) {
+        ctx->logit_bitmask = (uint32_t *)malloc(n_words * sizeof(uint32_t));
+    }
+    if (ctx->logit_bitmask) {
+        memcpy(ctx->logit_bitmask, bitmask, n_words * sizeof(uint32_t));
+    }
+}
+
+void myds_context_clear_logit_bitmask(myds_context_t *ctx) {
+    if (!ctx) return;
+    if (ctx->logit_bitmask) {
+        free(ctx->logit_bitmask);
+        ctx->logit_bitmask = NULL;
     }
 }
 
@@ -1565,44 +1590,34 @@ int32_t myds_sample_next_token(
         } \
     } while (0)
 
+    /* 官方 DeepInfer 借鉴：Structured output token bitmask filter */
+    const uint32_t *bitmask = (cfg && cfg->logit_bitmask) ? cfg->logit_bitmask
+                            : (ctx ? ctx->logit_bitmask : NULL);
+    #define BITMASK_ALLOWED(bm, tok) (!(bm) || (((bm)[(uint32_t)(tok) >> 5] >> ((uint32_t)(tok) & 31)) & 1u))
+
     /* 1. Greedy argmax check (if temp <= 0) */
     if (temp <= 0.0f) {
-        int32_t best_id = 0;
-        float max_l = logits[0];
-        if (!has_penalty) {
-            for (uint32_t i = 1; i < vocab_size; i++) {
-                if (logits[i] > max_l) {
-                    max_l = logits[i];
-                    best_id = (int32_t)i;
-                }
-            }
-            return best_id;
-        }
-        /* token 0 也可能被惩罚，与其余 token 走同一条规则。 */
-        PEN_APPLY(max_l, 0);
-        for (uint32_t i = 1; i < vocab_size; i++) {
+        int32_t best_id = -1;
+        float max_l = -INFINITY;
+        for (uint32_t i = 0; i < vocab_size; i++) {
+            if (!BITMASK_ALLOWED(bitmask, i)) continue;
             float l = logits[i];
             PEN_APPLY(l, i);
-            if (l > max_l) {
+            if (l > max_l || best_id < 0) {
                 max_l = l;
                 best_id = (int32_t)i;
             }
         }
-        return best_id;
+        return (best_id >= 0) ? best_id : 0;
     }
 
     /* 2. Repetition penalty check & max logit search in single linear pass */
     float max_l = -INFINITY;
-    if (!has_penalty) {
-        for (uint32_t i = 0; i < vocab_size; i++) {
-            if (logits[i] > max_l) max_l = logits[i];
-        }
-    } else {
-        for (uint32_t i = 0; i < vocab_size; i++) {
-            float l = logits[i];
-            PEN_APPLY(l, i);
-            if (l > max_l) max_l = l;
-        }
+    for (uint32_t i = 0; i < vocab_size; i++) {
+        if (!BITMASK_ALLOWED(bitmask, i)) continue;
+        float l = logits[i];
+        PEN_APPLY(l, i);
+        if (l > max_l) max_l = l;
     }
 
     /* 3. Buffer acquisition and single-pass candidate collection (diff >= -20.0f) */
@@ -1612,38 +1627,36 @@ int32_t myds_sample_next_token(
     float inv_temp = 1.0f / temp;
     float sum_exp = 0.0f;
     uint32_t n_cands = 0;
-    if (!has_penalty) {
-        for (uint32_t i = 0; i < vocab_size; i++) {
-            float diff = (logits[i] - max_l) * inv_temp;
-            if (diff >= -20.0f) {
-                float e = expf(diff);
-                probs[n_cands] = e;
-                indices[n_cands] = (int32_t)i;
-                sum_exp += e;
-                n_cands++;
-            }
-        }
-    } else {
-        for (uint32_t i = 0; i < vocab_size; i++) {
-            float l = logits[i];
-            PEN_APPLY(l, i);
-            float diff = (l - max_l) * inv_temp;
-            if (diff >= -20.0f) {
-                float e = expf(diff);
-                probs[n_cands] = e;
-                indices[n_cands] = (int32_t)i;
-                sum_exp += e;
-                n_cands++;
-            }
+    for (uint32_t i = 0; i < vocab_size; i++) {
+        if (!BITMASK_ALLOWED(bitmask, i)) continue;
+        float l = logits[i];
+        PEN_APPLY(l, i);
+        float diff = (l - max_l) * inv_temp;
+        if (diff >= -20.0f) {
+            float e = expf(diff);
+            probs[n_cands] = e;
+            indices[n_cands] = (int32_t)i;
+            sum_exp += e;
+            n_cands++;
         }
     }
 
+    #undef BITMASK_ALLOWED
     #undef PEN_APPLY
     #undef PEN_SEEN
 
     if (n_cands == 0) {
         if (!ctx || !ctx->sample_probs) { free(probs); free(indices); }
-        return 0;
+        int32_t best_id = -1;
+        float max_fl = -INFINITY;
+        for (uint32_t i = 0; i < vocab_size; i++) {
+            if (bitmask && !((bitmask[i >> 5] >> (i & 31)) & 1u)) continue;
+            if (logits[i] > max_fl || best_id < 0) {
+                max_fl = logits[i];
+                best_id = (int32_t)i;
+            }
+        }
+        return (best_id >= 0) ? best_id : 0;
     }
 
     /* 4. Normalize candidate probabilities */

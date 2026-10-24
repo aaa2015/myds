@@ -3287,6 +3287,14 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         float rep_pen = json_extract_float_field(body, "repetition_penalty", -1.0f);
         float pres_pen = json_extract_float_field(body, "presence_penalty", -1.0f);
         int include_usage = (strstr(body, "\"include_usage\":true") != NULL || strstr(body, "\"include_usage\": true") != NULL);
+        /* 官方 DeepInfer 借鉴：Structured output response_format 处理 */
+        bool req_json_mode = false;
+        const char *rf_pos = strstr(body, "\"response_format\"");
+        if (rf_pos) {
+            if (strstr(rf_pos, "\"json_object\"") || strstr(rf_pos, "\"json_schema\"")) {
+                req_json_mode = true;
+            }
+        }
 
         size_t prompt_cap = (total_read * 4 > 65536) ? (total_read * 4 + 8192) : 65536;
         /* 视觉槽：本次请求若带图，构建提示词时填进来，提示词拼好后按位置注入向量。
@@ -3541,11 +3549,12 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
          * 也可能被范围校验拒绝，而行首那条日志只反映字面量。
          * 这一行紧跟在 set_config 之后，内容就是采样器实际会读到的 cfg。 */
         MYDS_LOG_I("[%s:%d] effective sampling: temp=%.3f, top_p=%.3f, top_k=%u, "
-                   "min_p=%.3f, rep_pen=%.3f, pres_pen=%.3f, thinking=%d",
+                   "min_p=%.3f, rep_pen=%.3f, pres_pen=%.3f, thinking=%d%s",
                    client_ip, client_port,
                    (double)req_cfg.temperature, (double)req_cfg.top_p, req_cfg.top_k,
                    (double)req_cfg.min_p, (double)req_cfg.repetition_penalty,
-                   (double)req_cfg.presence_penalty, req_thinking_now ? 1 : 0);
+                   (double)req_cfg.presence_penalty, req_thinking_now ? 1 : 0,
+                   req_json_mode ? ", response_format=json" : "");
 
         myds_stop_reason_t stop_reason = MYDS_STOP_EOS;
         uint32_t prompt_tokens = 0;
@@ -4015,6 +4024,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
 
 cleanup_infer:
         myds_context_clear_image_embeddings(ctx);
+        myds_context_clear_logit_bitmask(ctx);
         myds_vjob_sink_free(&img_sink);
         myds_set_continue_from_cache(ctx, false);
         myds_context_set_config(ctx, &prev_cfg);
