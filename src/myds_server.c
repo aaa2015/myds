@@ -540,7 +540,9 @@ uint32_t myds_server_default_max_tokens(uint32_t configured_max_tokens, bool thi
     uint32_t want = 8192u;                                  /* DEFAULT_NON_THINKING_MAX_TOKENS */
     if (thinking) {
         want = 65536u;                                      /* DEFAULT_THINKING_MAX_TOKENS */
-        if (reasoning_effort && strcmp(reasoning_effort, "max") == 0)
+        /* 官方映射表：max 与 ultra 都落到 max 档（xhigh 落 high，不在此列）。 */
+        if (reasoning_effort &&
+            (strcmp(reasoning_effort, "max") == 0 || strcmp(reasoning_effort, "ultra") == 0))
             want = 131072u;                                 /* DEFAULT_MAX_EFFORT_MAX_TOKENS */
     }
     if (configured_max_tokens && want > configured_max_tokens) want = configured_max_tokens;
@@ -1481,6 +1483,41 @@ static bool prompt_render_tool_call_items(prompt_buffer_t *out, const prompt_jso
 /* 失败原因（供日志与报错使用）。调用方每次进入前不必清空 —— 每个失败路径都会写它。 */
 static bool g_server_default_thinking = false;
 
+/* 从请求体的 `reasoning` **对象**里读 effort。
+ *
+ * 2026-10-24：mycode（以及 OpenAI Responses 生态的多数客户端）用
+ *     "reasoning": {"effort": "high", "summary": "detailed"}
+ * 表达思考强度，而此前 myds 只认顶层的 "reasoning_effort" 字符串 ⇒
+ * 这类请求被完全忽略、thinking 回落到启动默认值。实测判别：
+ *     带 reasoning:{effort:"none"} → 无 reasoning 输出（对）
+ *     带 reasoning:{effort:"high"} → 无 reasoning 输出（错！应当有）
+ *     带 reasoning_effort:"high"   → 有 reasoning 输出（对）
+ * 这里把对象形式补上。返回 1 = 读到了 effort（或 enabled 折算成的 effort）。 */
+static int extract_reasoning_object_effort(const char *body, char *out, size_t out_size) {
+    if (!body || !out || out_size == 0) return 0;
+    /* "reasoning" 也可能作为【值】出现（input 数组里的 {"type":"reasoning"}）——
+     * 只有后面紧跟 '{' 的才是我们关心的对象。 */
+    for (const char *p = strstr(body, "\"reasoning\""); p; p = strstr(p + 1, "\"reasoning\"")) {
+        const char *q = p + 11;   /* strlen("\"reasoning\"") */
+        while (*q && (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n' || *q == ':')) q++;
+        if (*q != '{') continue;
+        const char *end = find_matching_brace(q);
+        if (!end) continue;
+        const size_t n2 = (size_t)(end - q + 1);
+        if (n2 >= 512u) continue;         /* 异常大的对象不处理 */
+        char buf[512];
+        memcpy(buf, q, n2);
+        buf[n2] = 0;
+        if (json_extract_string_field(buf, "effort", out, out_size)) return 1;
+        const int en = json_extract_bool_field(buf, "enabled", -1);
+        if (en != -1) {
+            snprintf(out, out_size, "%s", en ? "high" : "none");
+            return 1;
+        }
+    }
+    return 0;
+}
+
 bool extract_request_thinking_mode(const char *body, bool default_val) {
     if (!body) return default_val;
     int b = json_extract_bool_field(body, "enable_thinking", -1);
@@ -1501,10 +1538,27 @@ bool extract_request_thinking_mode(const char *body, bool default_val) {
         }
     }
 
+    /* mycode / OpenAI Responses 用对象形式表达思考强度。
+     * 值域按 DeepSeek 官方 thinking_mode 文档的映射表（2026-10 版）：
+     *   minimal→low  low→low  medium→high  high→high  xhigh→high  max→max  ultra→max
+     *   none 表示关闭（这是 Responses API 里唯一的关闭表达）。
+     * 未识别的值不在这里下结论，交给后面的字段与默认值。 */
+    char obj_effort[32] = "";
+    if (extract_reasoning_object_effort(body, obj_effort, sizeof(obj_effort))) {
+        if (!strcmp(obj_effort, "none") || !strcmp(obj_effort, "off") ||
+            !strcmp(obj_effort, "disabled")) return false;
+        if (!strcmp(obj_effort, "minimal") || !strcmp(obj_effort, "low") ||
+            !strcmp(obj_effort, "medium") || !strcmp(obj_effort, "high") ||
+            !strcmp(obj_effort, "xhigh") || !strcmp(obj_effort, "max") ||
+            !strcmp(obj_effort, "ultra")) return true;
+    }
+
     char effort[32] = "";
     if (json_extract_string_field(body, "reasoning_effort", effort, sizeof(effort))) {
         if (!strcmp(effort, "none") || !strcmp(effort, "off")) return false;
-        if (!strcmp(effort, "low") || !strcmp(effort, "medium") || !strcmp(effort, "high") || !strcmp(effort, "max")) return true;
+        if (!strcmp(effort, "minimal") || !strcmp(effort, "low") || !strcmp(effort, "medium") ||
+            !strcmp(effort, "high") || !strcmp(effort, "xhigh") || !strcmp(effort, "max") ||
+            !strcmp(effort, "ultra")) return true;
     }
 
     const char *ctk = strstr(body, "\"chat_template_kwargs\"");
@@ -1535,12 +1589,18 @@ int extract_request_reasoning_budget(const char *body, int default_budget) {
     }
     if (!body) return budget;
 
+    /* 强度映射。值域按 DeepSeek 官方 thinking_mode 文档的映射表：
+     *   minimal→low  low→low  medium→high  high→high  xhigh→high  max→max  ultra→max
+     * myds 在 low/high 之间保留了 medium=62 这一档更细的粒度（官方把 medium 归到 high），
+     * 既覆盖官方全部取值，也不改变既有行为。 */
     char effort[32] = "";
-    if (json_extract_string_field(body, "reasoning_effort", effort, sizeof(effort))) {
-        if (!strcmp(effort, "low")) return 50;
+    bool have_effort = json_extract_string_field(body, "reasoning_effort", effort, sizeof(effort)) != 0;
+    if (!have_effort) have_effort = extract_reasoning_object_effort(body, effort, sizeof(effort)) != 0;
+    if (have_effort) {
+        if (!strcmp(effort, "minimal") || !strcmp(effort, "low")) return 50;
         if (!strcmp(effort, "medium")) return 62;
-        if (!strcmp(effort, "high")) return 75;
-        if (!strcmp(effort, "max")) return 100;
+        if (!strcmp(effort, "high") || !strcmp(effort, "xhigh")) return 75;
+        if (!strcmp(effort, "max") || !strcmp(effort, "ultra")) return 100;
     }
     const char *p = strstr(body, "\"reasoning_effort\"");
     if (p) {
@@ -3404,14 +3464,41 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
 
         /* Apply request configuration overrides if provided */
         myds_config_t req_cfg = prev_cfg;
+        /* 本次请求是否思考模式：后面「temperature 在思考模式下无效」要用到，
+         * 所以在覆盖块之前先算出来（只算一次，避免两处判定漂移）。 */
+        const bool req_thinking_now =
+            extract_request_thinking_mode(body, g_server_default_thinking);
         {
             char eff[32] = "";
-            (void)json_extract_string_field(body, "reasoning_effort", eff, sizeof(eff));
+            if (!json_extract_string_field(body, "reasoning_effort", eff, sizeof(eff)))
+                (void)extract_reasoning_object_effort(body, eff, sizeof(eff));
             req_cfg.max_new_tokens = myds_server_default_max_tokens(prev_cfg.max_new_tokens,
-                extract_request_thinking_mode(body, g_server_default_thinking), eff);
+                req_thinking_now, eff);
         }
         if (max_tokens > 0) req_cfg.max_new_tokens = (uint32_t)max_tokens;
-        if (temp >= 0.0f) req_cfg.temperature = temp;
+
+        /* ★ DeepSeek thinking_mode 文档（2026-10）明确：
+         *   「思考模式不支持 temperature、presence_penalty、frequency_penalty 参数。
+         *     为了兼容已有软件，设置参数不会报错，但也不会生效。」
+         * 之前的实现无条件应用 temperature，于是思考模式下温度和官方行为不一致：
+         * 客户端以为设了 0.3，实际采样并不受它约束。
+         * 这里对齐官方：思考模式下忽略 temperature，并留一条 WARN 让人看得见——
+         * 静默忽略正是最难发现的那类问题。
+         * top_p / top_k 不在禁用名单内（文档还专门说明 top_p 在思考模式下的
+         * 模型相关行为），继续生效。 */
+        /* ★ 官方规范：「思考模式不支持 temperature …… 设置参数不会报错，但也不会生效。」
+         * 语义是「不受它约束」，因此这里【固定成 1.0（标准分布、不缩放）】，
+         * 而不是「保留上一轮的旧值」——后者会让启动参数里的 0.7 意外主导思考采样。
+         * 仅当请求确实传了非 1.0 的值时才告警，避免官方推荐值（1.0）也刷日志。 */
+        if (req_thinking_now) {
+            if (temp >= 0.0f && temp != 1.0f) {
+                MYDS_LOG_W("[%s:%d] thinking 模式不支持 temperature（官方规范），"
+                           "请求中的 temp=%.2f 不生效，按 1.0 采样", client_ip, client_port, temp);
+            }
+            req_cfg.temperature = 1.0f;
+        } else if (temp >= 0.0f) {
+            req_cfg.temperature = temp;
+        }
         if (top_p >= 0.0f) req_cfg.top_p = top_p;
         if (top_k >= 0) req_cfg.top_k = (uint32_t)top_k;
         /* min_p 语义：0.0 = 关闭；有效范围 (0,1]。超范围的值拒绝而不静默夹取，

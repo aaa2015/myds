@@ -140,6 +140,76 @@ int main(void) {
         printf("  [PASS] min_p / repetition_penalty request-level parsing\n");
     }
 
+    /* 9. 思考模式：reasoning 对象形式（2026-10-24）
+     *
+     * mycode / OpenAI Responses 生态用 "reasoning": {"effort": "high"} 表达强度。
+     * 此前 myds 只认顶层 reasoning_effort 字符串 ⇒ 对象形式被静默忽略、
+     * thinking 回落到启动默认值。实测判别：effort=high 却没有任何 reasoning 输出。
+     * 下面把四种形态钉死。 */
+    {
+        /* 对象形式：high/max/low/medium ⇒ 开 */
+        assert(extract_request_thinking_mode("{\"reasoning\":{\"effort\":\"high\"}}", false) == true);
+        assert(extract_request_thinking_mode("{\"reasoning\":{\"effort\":\"max\"}}", false) == true);
+        assert(extract_request_thinking_mode("{\"reasoning\": {\"effort\" : \"low\"}}", false) == true);
+        /* 对象形式：none/off ⇒ 关（即使默认是开） */
+        assert(extract_request_thinking_mode("{\"reasoning\":{\"effort\":\"none\"}}", true) == false);
+        /* enabled 折算 */
+        assert(extract_request_thinking_mode("{\"reasoning\":{\"enabled\":true}}", false) == true);
+        assert(extract_request_thinking_mode("{\"reasoning\":{\"enabled\":false}}", true) == false);
+        /* 没提任何思考字段 ⇒ 用默认值 */
+        assert(extract_request_thinking_mode("{\"input\":\"hi\"}", false) == false);
+        assert(extract_request_thinking_mode("{\"input\":\"hi\"}", true) == true);
+        /* ★ "reasoning" 作为【值】出现（input 里的 reasoning 项）不得误判 */
+        assert(extract_request_thinking_mode(
+            "{\"input\":[{\"type\":\"reasoning\",\"content\":[]}],\"reasoning\":{\"effort\":\"high\"}}",
+            false) == true);
+        assert(extract_request_thinking_mode(
+            "{\"input\":[{\"type\":\"reasoning\"}]}", false) == false);
+        /* 顶层字符串形式仍然有效（不能被对象解析抢走） */
+        assert(extract_request_thinking_mode("{\"reasoning_effort\":\"high\"}", false) == true);
+        assert(extract_request_thinking_mode("{\"reasoning_effort\":\"none\"}", true) == false);
+
+        /* 官方映射表要求覆盖的全部 effort 取值（DeepSeek thinking_mode 文档）：
+         *   minimal low medium high xhigh max ultra  ⇒ 开
+         *   none/off/disabled                        ⇒ 关
+         * 少一个就会被静默当成「没提」，回落到默认值。 */
+        const char *on_vals[] = {"minimal","low","medium","high","xhigh","max","ultra"};
+        for (unsigned k = 0; k < sizeof(on_vals)/sizeof(on_vals[0]); ++k) {
+            char b[128];
+            snprintf(b, sizeof(b), "{\"reasoning\":{\"effort\":\"%s\"}}", on_vals[k]);
+            if (extract_request_thinking_mode(b, false) != true)
+                printf("  ✗ reasoning.effort=%s 应判为开\n", on_vals[k]);
+            assert(extract_request_thinking_mode(b, false) == true);
+            char b2[128];
+            snprintf(b2, sizeof(b2), "{\"reasoning_effort\":\"%s\"}", on_vals[k]);
+            assert(extract_request_thinking_mode(b2, false) == true);
+        }
+        printf("  [PASS] thinking mode: reasoning object form\n");
+    }
+
+    /* 10. 思考强度 → budget 映射（官方 thinking_mode 文档的映射表）
+     *   minimal→low(50)  low→low(50)  medium→62  high→high(75)
+     *   xhigh→high(75)   max→max(100)  ultra→max(100)
+     * 少映射一个值，思考强度就会被静默降级成默认档。 */
+    {
+        struct { const char *v; int want; } cases[] = {
+            {"minimal", 50}, {"low",  50}, {"medium", 62}, {"high", 75},
+            {"xhigh",   75}, {"max", 100}, {"ultra", 100},
+        };
+        for (unsigned k = 0; k < sizeof(cases)/sizeof(cases[0]); ++k) {
+            char b[96], b2[96];
+            snprintf(b, sizeof(b), "{\"reasoning\":{\"effort\":\"%s\"}}", cases[k].v);
+            const int got = extract_request_reasoning_budget(b, 75);
+            if (got != cases[k].want) printf("  ✗ reasoning.effort=%s → %d（应 %d）\n", cases[k].v, got, cases[k].want);
+            assert(got == cases[k].want);
+            snprintf(b2, sizeof(b2), "{\"reasoning_effort\":\"%s\"}", cases[k].v);
+            assert(extract_request_reasoning_budget(b2, 75) == cases[k].want);
+        }
+        /* 整数形式仍然有效（1-100） */
+        assert(extract_request_reasoning_budget("{\"reasoning_effort\":42}", 75) == 42);
+        printf("  [PASS] thinking effort → budget mapping\n");
+    }
+
     printf("====================================================\n");
     printf("  ALL SERVER PROTOCOL TESTS PASSED CLEANLY!\n");
     printf("====================================================\n");
