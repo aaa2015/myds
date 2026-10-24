@@ -1,4 +1,5 @@
 #include "myds.h"
+#include <errno.h>
 #include "myds_server.h"
 #include "myds_vjob.h"
 #include "myds_dspark.h"
@@ -80,6 +81,41 @@ static const char *const kConfigCandidates[] = {
 /* 在解析任何环境变量之前把配置文件读成环境变量。
  * 这是整个方案的关键：180 处 getenv 一行都不用改。
  * 返回真正生效的条数（0 = 没找到配置文件，走纯环境变量 + 代码默认值）。 */
+/* 2026-10-24：把「配置文件里的键」读成 cfg 的初值。
+ *
+ * 为什么不直接 getenv：配置文件（--config）在 load_config_early 里先加载，
+ * 它是【唯一来源】——无条件覆盖进程环境里的同名项（见 myds_configfile.c 的说明）。
+ * 这两个辅助只负责「取值 + 校验 + 越界时明确告警」，不做任何写入。
+ *
+ * 为什么需要它们：CTX / MAX_OUT / TOP_K / MIN_P / REP_PEN 此前只能来自命令行，
+ * 配置文件里写不了（没有读取点），于是「配置单一来源」对这几项是空的。
+ * 命令行在下面稍后解析，仍然覆盖这里 —— 与既定的优先级一致。 */
+static uint32_t cfg_u32_env(const char *key, uint32_t def, uint32_t lo, uint32_t hi) {
+    const char *e = getenv(key);
+    if (!e || !*e) return def;
+    char *end = NULL;
+    errno = 0;
+    const long long v = strtoll(e, &end, 10);
+    if (errno || end == e || (end && *end) || v < (long long)lo || v > (long long)hi) {
+        MYDS_LOG_W("config: %s=%s 非法（需 %u..%u）⇒ 用默认 %u", key, e, lo, hi, def);
+        return def;
+    }
+    return (uint32_t)v;
+}
+
+static float cfg_f32_env(const char *key, float def, float lo, float hi) {
+    const char *e = getenv(key);
+    if (!e || !*e) return def;
+    char *end = NULL;
+    errno = 0;
+    const double v = strtod(e, &end);
+    if (errno || end == e || (end && *end) || v < (double)lo || v > (double)hi) {
+        MYDS_LOG_W("config: %s=%s 非法（需 %.3g..%.3g）⇒ 用默认 %.3g", key, e, (double)lo, (double)hi, (double)def);
+        return def;
+    }
+    return (float)v;
+}
+
 static int load_config_early(int argc, char *argv[]) {
     const char *path = NULL;
     /* --config <path> 优先 */
@@ -137,14 +173,19 @@ int main(int argc, char *argv[]) {
     int port = 0;
     bool print_tokens = false;
 
+    /* 初值来自配置文件（键可写入 myds.conf）；随后命令行覆盖。
+     * 各键的合法区间按采样语义收紧，越界一律回退默认并告警 ——
+     * 静默夹取会让「配置写了 5% 实际按别的值采样」这类问题无法发现。 */
     myds_config_t cfg = {
-        .max_seq_len = 4096,
-        .max_new_tokens = 256,
-        .temperature = 0.7f,
-        .top_p = 0.9f,
-        .top_k = 40,
-        .seed = (int32_t)time(NULL),
-        .stream = true,
+        .max_seq_len        = cfg_u32_env("MYDS_CTX_SIZE", 4096u, 256u, 4194304u),
+        .max_new_tokens     = cfg_u32_env("MYDS_MAX_NEW_TOKENS", 256u, 1u, 4194304u),
+        .temperature        = cfg_f32_env("MYDS_TEMPERATURE", 0.7f, 0.0f, 4.0f),
+        .top_p              = cfg_f32_env("MYDS_TOP_P", 0.9f, 0.0f, 1.0f),
+        .top_k              = cfg_u32_env("MYDS_TOP_K", 40u, 0u, 1048576u),
+        .min_p              = cfg_f32_env("MYDS_MIN_P", 0.0f, 0.0f, 1.0f),
+        .repetition_penalty = cfg_f32_env("MYDS_REPETITION_PENALTY", 1.0f, 0.0f, 4.0f),
+        .seed               = (int32_t)time(NULL),
+        .stream             = true,
     };
 
     for (int i = 1; i < argc; i++) {
@@ -244,8 +285,14 @@ int main(int argc, char *argv[]) {
     printf("         Accelerated by Apple Silicon Metal         \n");
     printf("====================================================\n");
 
-    MYDS_LOG_I("Starting myds (ctx_size=%u, max_new_tokens=%u, temp=%.2f, top_p=%.2f)",
-               cfg.max_seq_len, cfg.max_new_tokens, cfg.temperature, cfg.top_p);
+    /* 2026-10-24：把全部采样参数打出来。
+     * 此前只打 ctx/max_new/temp/top_p，top_k / min_p / repetition_penalty
+     * 即使配了也无从确认 —— 「配了但不生效」正是这类配置最难发现的地方。 */
+    MYDS_LOG_I("Starting myds (ctx_size=%u, max_new_tokens=%u, temp=%.2f, top_p=%.2f, "
+               "top_k=%u, min_p=%.3f, rep_pen=%.3f, thinking=%s)",
+               cfg.max_seq_len, cfg.max_new_tokens, cfg.temperature, cfg.top_p,
+               cfg.top_k, (double)cfg.min_p, (double)cfg.repetition_penalty,
+               cfg.thinking_mode ? "on" : "off");
     MYDS_LOG_I("Loading model file: %s", model_path);
 
     double load_t0 = myds_now_s();
