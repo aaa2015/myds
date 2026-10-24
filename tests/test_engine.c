@@ -944,6 +944,40 @@ int main(int argc, char **argv) {
             c0.presence_penalty = 1.0f;
             assert(myds_sample_next_token(l2, 8, &c0, NULL, prev3, 3) == 5);
         }
+
+        /* ★ 生产路径：两处调用点都传 (NULL, 0)，历史来自 ctx 的环形缓冲。
+         * 上面几条走的是显式 prev_tokens，不覆盖这条分支 —— 而它才是线上真正跑的。 */
+        {
+            myds_context_t c;
+            memset(&c, 0, sizeof c);
+            c.cfg = cfg;
+            c.cfg.temperature = 0.0f;
+            c.cfg.repetition_penalty = 1.0f;
+            c.cfg.presence_penalty = 0.0f;
+
+            float l3[8] = {0};
+            l3[2] = 2.0f; l3[5] = 1.5f;
+
+            /* 缓冲为空 ⇒ 无惩罚，选 2 */
+            assert(myds_sample_next_token(l3, 8, &c.cfg, &c, NULL, 0) == 2);
+
+            /* 记录 token 2 之后，pres_pen=1.0 应把 2.0 压到 1.0 ⇒ 选 5 */
+            myds_note_recent_token(&c, 2);
+            assert(c.recent_count == 1u);
+            c.cfg.presence_penalty = 1.0f;
+            assert(myds_sample_next_token(l3, 8, &c.cfg, &c, NULL, 0) == 5);
+
+            /* 环形缓冲：连写 300 个（容量 256）不应越界，计数封顶在容量 */
+            for (int i = 0; i < 300; ++i) myds_note_recent_token(&c, 7);
+            const uint32_t cap = (uint32_t)(sizeof(c.recent_tokens)/sizeof(c.recent_tokens[0]));
+            assert(c.recent_count == cap);
+            assert(c.recent_next < cap);
+
+            /* 负 token（无效）不得写入 */
+            const uint32_t before = c.recent_count;
+            myds_note_recent_token(&c, -1);
+            assert(c.recent_count == before);
+        }
         assert(picked == 5);
         printf("  [PASS] Production repetition penalty: token 2 penalized -> token 5 selected\n");
     }
