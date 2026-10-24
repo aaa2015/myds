@@ -20,6 +20,7 @@ void myds_last_prefill_stats(const myds_context_t *ctx, myds_prefill_stats_t *ou
     (void)ctx;
     if (out) memset(out, 0, sizeof(*out));
 }
+void myds_context_reset_prefill_stats(myds_context_t *ctx) { (void)ctx; }
 void myds_set_continue_from_cache(myds_context_t *ctx, bool enable) { (void)ctx; (void)enable; }
 uint32_t myds_context_get_pcache_len(const myds_context_t *ctx) { (void)ctx; return 100; }
 void myds_vjob_set_gpu_lock(void (*lock_fn)(void), void (*unlock_fn)(void)) { (void)lock_fn; (void)unlock_fn; }

@@ -3228,6 +3228,12 @@ static int myds_generate_internal(myds_context_t *ctx,
     }
     myds_model_t *m = ctx->model;
     memset(&ctx->decode_stats, 0, sizeof(ctx->decode_stats));
+    /* ★ 每次请求入口就作废上一次的 prefill 统计。
+     * 放在这里（而不是分词之后）是刻意的：分词失败 / 参数非法 / 空 prompt
+     * 都在这之后才返回，那些路径必须在「本次没跑 prefill」的状态下被日志看到。
+     * 注意：这只能盖住【进入了 generate】的情形。真正不进入的（客户端断连、
+     * SSE 首写失败）由服务端调 myds_context_reset_prefill_stats() 负责。 */
+    myds_context_reset_prefill_stats(ctx);
     myds_dspark_reset_proposal_state(ctx->dspark);
     ctx->decode_metrics_active = false;
     ctx->decode_cycle_open = false;
@@ -3622,6 +3628,7 @@ static int myds_generate_internal(myds_context_t *ctx,
     ctx->last_prefill_tokens = ((uint32_t)n_prompt - 1 > resume_from)
                                    ? (uint32_t)(n_prompt - 1) - resume_from : 0;
     ctx->last_prefill_seconds = 0.0;
+    ctx->last_prefill_valid = 1;
     {
         struct timespec _pf0, _pf1;
         clock_gettime(CLOCK_MONOTONIC, &_pf0);
@@ -4713,13 +4720,26 @@ static int myds_generate_internal(myds_context_t *ctx,
 
 /* 最近一次请求的 prefill 统计。故意做成「读 ctx 上的字段」而不是改 generate 的签名：
  * 生成 API 的签名被库、单测、服务端多处依赖，加出参是多余的破坏。 */
+void myds_context_reset_prefill_stats(myds_context_t *ctx) {
+    if (!ctx) return;
+    ctx->last_prefill_valid = 0;
+    ctx->last_prompt_tokens = 0;
+    ctx->last_cached_tokens = 0;
+    ctx->last_prefill_tokens = 0;
+    ctx->last_prefill_seconds = 0.0;
+}
+
 void myds_last_prefill_stats(const myds_context_t *ctx, myds_prefill_stats_t *out) {
     if (!out) return;
-    if (!ctx) { memset(out, 0, sizeof(*out)); return; }
+    memset(out, 0, sizeof(*out));
+    if (!ctx) return;
     out->prompt_tokens    = ctx->last_prompt_tokens;
     out->cached_tokens    = ctx->last_cached_tokens;
     out->prefill_tokens   = ctx->last_prefill_tokens;
     out->prefill_seconds  = ctx->last_prefill_seconds;
+    /* 不是本请求写的就不外泄：让调用方看到全零 + valid=0，而不是上次的残值。 */
+    if (ctx->last_prefill_valid) out->valid = 1;
+    else memset(out, 0, sizeof(*out));
 }
 
 void myds_last_decode_stats(const myds_context_t *ctx, myds_decode_stats_t *out) {

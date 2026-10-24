@@ -3382,6 +3382,18 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
 
         pthread_mutex_lock(&g_infer_mutex);
         t_infer_slot_depth = 1;
+        /* ★ 排队等待必须单独计量。
+         * t_start 在请求开头（解析前）就记了，而这里可能已经等了很久；
+         * 旧实现把 queue 时间算进 wall/prefill，于是“并发时变慢”会被误认为
+         * 引擎退化（实测 2026-10-25: 一个 34.7s 的“失败请求”里 prefill 数取自上一个
+         * 请求，wall 全是等锁）。现在从拿到锁开始重新计时。 */
+        const double t_slot = myds_server_now_s();
+        const double queue_s = (t_slot > t_start) ? (t_slot - t_start) : 0.0;
+        t_start = t_slot;
+        /* ★ 先作废上一次的 prefill 统计。
+         * 下面可能因 cancel_flag 短路而根本不调 generate，那时引擎内的重置也不会跑；
+         * 不作废就会把【上一个请求】的 token 数当成这个请求的打进日志。 */
+        myds_context_reset_prefill_stats(ctx);
         myds_config_t prev_cfg = myds_context_get_config(ctx);
         uint64_t dspark_prop_before = ctx->dspark ? ctx->dspark->proposed_tokens : 0;
         uint64_t dspark_acc_before  = ctx->dspark ? ctx->dspark->accepted_tokens : 0;
@@ -3660,13 +3672,21 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             final_tokens = sctx.token_count;
             t_first = sctx.t_first;
             t_last = sctx.t_last;
+            /* ★ 客户端断连不是服务端错误。
+             * 2026-10-25：旧实现只看 !generated || sctx.failed，于是「对端在首字节之前
+             * 就断开」被记成 finish_reason=error。而 generated 的短路求值
+             * （!sctx.cancel_flag && myds_generate...）意味着 cancel 时 generate 压根没跑，
+             * prompt_tokens 仍为 0。两个现象叠在一起就产生了那条矛盾的日志。
+             * cancel_flag 单独成案：标 cancelled，不标 error。 */
             if (!generated || sctx.failed) {
                 resp_id_invalidate_all();
-                stop_reason = MYDS_STOP_ERROR;
-                const char *error_event = is_responses_endpoint
-                    ? "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"Inference or response encoding failed\",\"type\":\"server_error\"}}\n\n"
-                    : "data: {\"error\":{\"message\":\"Inference or response encoding failed\",\"type\":\"server_error\"}}\n\ndata: [DONE]\n\n";
-                if (sctx.writer) (void)myds_server_sse_send(&sctx, error_event, strlen(error_event));
+                stop_reason = sctx.cancel_flag ? MYDS_STOP_CANCELLED : MYDS_STOP_ERROR;
+                if (stop_reason == MYDS_STOP_ERROR) {
+                    const char *error_event = is_responses_endpoint
+                        ? "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"Inference or response encoding failed\",\"type\":\"server_error\"}}\n\n"
+                        : "data: {\"error\":{\"message\":\"Inference or response encoding failed\",\"type\":\"server_error\"}}\n\ndata: [DONE]\n\n";
+                    if (sctx.writer) (void)myds_server_sse_send(&sctx, error_event, strlen(error_event));
+                }
             } else if (!sctx.cancel_flag) {
                 /* 模型可能用 DSML 块发起工具调用 ⇒ 从累积文本里解析（与协议无关） */
                 size_t scontent_len = sctx.acc_len;
@@ -3991,7 +4011,12 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         myds_prefill_stats_t pf;
         myds_last_prefill_stats(ctx, &pf);
         char prefill_str[96];
-        if (pf.prefill_tokens == 0) {
+        if (!pf.valid) {
+            /* 本请求从未产出 prefill 统计 ⇒ 分词/排队阶段就结束了。
+             * 旧实现会借用 ctx 上【上一个请求】的 token 数，打出
+             * 「prompt: 0 tok, prefill: FAILED after 15815 tok」这种自相矛盾的行。 */
+            snprintf(prefill_str, sizeof(prefill_str), "not started");
+        } else if (pf.prefill_tokens == 0) {
             snprintf(prefill_str, sizeof(prefill_str), "none (all %u cached)", pf.cached_tokens);
         } else if (stop_reason == MYDS_STOP_ERROR) {
             /* prefill 失败时不能按速率打。原来会打出「399952 tok in 0.000s = 33329333333.3 t/s」
@@ -4006,11 +4031,11 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                      pf.prefill_tokens, pf.prefill_seconds, pf_tps, pf.cached_tokens);
         }
         MYDS_LOG_I("[%s:%d] Completed %s %s - prompt: %u tok, prefill: %s, ttft: %.3fs, "
-                   "decode: %u tok in %.3fs = %.2f t/s, wall: %.3fs, finish_reason: %s",
+                   "decode: %u tok in %.3fs = %.2f t/s, wall: %.3fs (queue %.3fs), finish_reason: %s",
                    client_ip, client_port,
                    is_responses_endpoint ? "Responses" : "ChatCompletions",
                    path, prompt_tokens, prefill_str, ttft_s,
-                   final_tokens, decode_s, decode_tps, wall_s, final_finish_str);
+                   final_tokens, decode_s, decode_tps, wall_s, queue_s, final_finish_str);
         if (ctx->dspark && ctx->dspark->proposed_tokens > dspark_prop_before) {
             uint64_t req_prop = ctx->dspark->proposed_tokens - dspark_prop_before;
             uint64_t req_acc  = ctx->dspark->accepted_tokens - dspark_acc_before;

@@ -92,10 +92,27 @@ typedef struct {
     uint32_t cached_tokens;    /* 前缀缓存复用掉的 token 数（0 = 全量 prefill） */
     uint32_t prefill_tokens;   /* 实际跑了 prefill 的 token 数 */
     double   prefill_seconds;  /* prefill 阶段墙钟耗时 */
+    /* ★ 这份统计【是不是本请求产生的】。
+     * 2026-10-25：这四个字段存在 context 上，而 context 跨请求复用。
+     * 如果某个请求在分词阶段就退出（客户端断连 / 参数非法），从没写过这些字段，
+     * 那么调用方读到的是【上一个请求】的数 —— 日志里就会同时出现
+     * 「prompt: 0 tok」和「prefill: FAILED after 15815 tok」这种自相矛盾的行，
+     * 而那 15815 是上一个请求的。
+     * 0 = 本请求没有产出过 prefill 统计（尚未开始或从未开始）。 */
+    int      valid;
 } myds_prefill_stats_t;
 
 /* 读取最近一次生成（myds_generate*）的 prefill 统计；ctx 为 NULL 时清零返回。 */
 void            myds_last_prefill_stats(const myds_context_t *ctx, myds_prefill_stats_t *out);
+/* 显式作废上一次的 prefill 统计。
+ *
+ * 为什么服务端必须调它：调用方可能【根本不进入】myds_generate*。例如 SSE 首写
+ * 失败时，服务端写的是 `!cancel && myds_generate(...)`，短路后 generate 不执行，
+ * 引擎内部的入口重置也不会跑 ⇒ 统计仍指着上一个请求。那时打日志就会把上次的
+ * token 数当成本次报出去（2026-10-25 定位的那条
+ * “prompt: 0 tok, prefill: FAILED after 15815 tok”）。
+ * 调用时机：拿到推理名额之后、任何可能短路调用 generate 的分支之前。 */
+void            myds_context_reset_prefill_stats(myds_context_t *ctx);
 
 /* Per-request decode counters. Calls include attempted single-row and batch-2
  * target invocations; rows include attempted work and rejected future rows.

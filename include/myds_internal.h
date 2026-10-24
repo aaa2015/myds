@@ -148,11 +148,15 @@ struct myds_context {
      * 一次性标志（引擎消费后自清），由服务端在收到该字段时设置。 */
     bool                 continue_from_cache;
 
-    /* 最近一次请求的 prefill 统计（只写不读，供 myds_last_prefill_stats 暴露给服务端日志） */
+    /* 最近一次请求的 prefill 统计（只写不读，供 myds_last_prefill_stats 暴露给服务端日志）
+     * ★ valid 必须在【每次请求入口】清零：它不是「上一次的值好不好」，而是
+     *   「这份值是不是本请求写的」。忘了清就会让服务端把上一个请求的 token 数
+     *   当成这个请求的报出去（2026-10-25 修的就是这个）。 */
     uint32_t             last_prompt_tokens;
     uint32_t             last_cached_tokens;
     uint32_t             last_prefill_tokens;
     double               last_prefill_seconds;
+    int                  last_prefill_valid;
 
     myds_decode_stats_t   decode_stats;
     bool                 decode_metrics_active;

@@ -247,6 +247,80 @@ static void assert_prefill_matches_sequential(myds_context_t *batched, myds_cont
     }
 }
 
+/* ★ 统计泄露回归（2026-10-25）。
+ *
+ * 场景：先跑一次【成功】的请求，把 last_* 四个字段写成真实值；然后一个在分词
+ * 阶段就失败的请求（这里用空 prompt，与「客户端断连/参数非法」同一条退出路径）。
+ * 旧实现不区分「这是不是本请求写的」，于是服务端会把上一个请求的 token 数当成
+ * 这个请求的报出去 —— 日志里出现「prompt: 0 tok, prefill: FAILED after 15815 tok」。
+ *
+ * 断言两件事：失败请求读到的统计必须是全零且 valid=0；成功请求必须 valid=1。
+ */
+static void test_prefill_stats_do_not_leak(void) {
+    myds_model_t *model = test_prefill_model();
+    strcpy(model->arch, "deepseek4");
+    myds_config_t cfg = {.max_seq_len = 1024, .max_new_tokens = 1, .temperature = 0,
+                         .top_p = 1, .seed = 42};
+    myds_context_t *ctx = myds_context_create(model, &cfg);
+    assert(ctx);
+
+    myds_stop_reason_t reason = MYDS_STOP_ERROR;
+    uint32_t prompt_count = 0;
+    assert(myds_generate_bytes_ex(ctx, "hello world", NULL, NULL, &reason, &prompt_count, NULL));
+    myds_prefill_stats_t good;
+    myds_last_prefill_stats(ctx, &good);
+    assert(good.valid == 1);
+    assert(good.prompt_tokens > 0);
+
+    /* 超长 prompt：超过 max_seq_len，在 prefill 之前就返回 MYDS_STOP_CTX_FULL。
+     * （空 prompt 不行：分词后仍剩 BOS，n_prompt=1 > 0，会真的跑完 prefill。） */
+    static char huge[8192];
+    huge[0] = 0;
+    for (size_t i = 0; i < 4000u; i += 4u) memcpy(huge + i, "abc ", 4u);
+    huge[4000] = 0;
+    reason = MYDS_STOP_ERROR;
+    prompt_count = 0xdeadbeefu;
+    (void)myds_generate_bytes_ex(ctx, huge, NULL, NULL, &reason, &prompt_count, NULL);
+    assert(reason == MYDS_STOP_CTX_FULL);
+    myds_prefill_stats_t bad;
+    myds_last_prefill_stats(ctx, &bad);
+    assert(bad.valid == 0);
+    assert(bad.prompt_tokens == 0 && bad.cached_tokens == 0 &&
+           bad.prefill_tokens == 0 && bad.prefill_seconds == 0.0);
+
+    /* ★ 关键用例：服务端在 cancel 短路时【根本不会调 generate】。
+     * 这时只能靠显式作废，否则日志仍会借用上一个请求的数。 */
+    assert(myds_generate_bytes_ex(ctx, "hello world", NULL, NULL, &reason, &prompt_count, NULL));
+    myds_prefill_stats_t before;
+    myds_last_prefill_stats(ctx, &before);
+    assert(before.valid == 1 && before.prompt_tokens > 0);
+    myds_context_reset_prefill_stats(ctx);
+    myds_prefill_stats_t after_reset;
+    myds_last_prefill_stats(ctx, &after_reset);
+    assert(after_reset.valid == 0 && after_reset.prompt_tokens == 0 &&
+           after_reset.prefill_tokens == 0 && after_reset.cached_tokens == 0);
+    /* idempotent + NULL-safe */
+    myds_context_reset_prefill_stats(ctx);
+    myds_context_reset_prefill_stats(NULL);
+
+    /* 再跑一次成功请求：必须重新变成有效值，不能被上面的清零卡死。 */
+    reason = MYDS_STOP_ERROR;
+    assert(myds_generate_bytes_ex(ctx, "hello world", NULL, NULL, &reason, &prompt_count, NULL));
+    myds_prefill_stats_t again;
+    myds_last_prefill_stats(ctx, &again);
+    assert(again.valid == 1 && again.prompt_tokens > 0);
+
+    /* ctx 为 NULL 时也必须安全清零。 */
+    myds_prefill_stats_t none;
+    memset(&none, 0xff, sizeof(none));
+    myds_last_prefill_stats(NULL, &none);
+    assert(none.valid == 0 && none.prompt_tokens == 0);
+
+    myds_context_free(ctx);
+    myds_model_free(model); myds_metal_cleanup();
+    puts("  [PASS] prefill stats: failure path reports zeros with valid=0, never the previous request");
+}
+
 typedef struct { char divergence[4096]; } prefix_log_capture_t;
 
 static void capture_prefix_log(myds_log_level_t level, const char *message, void *opaque) {
@@ -271,6 +345,7 @@ static void assert_prefix_generate(myds_context_t *ctx, const char *prompt, uint
     assert(reason == MYDS_STOP_LENGTH || reason == MYDS_STOP_EOS);
     myds_prefill_stats_t stats;
     myds_last_prefill_stats(ctx, &stats);
+    assert(stats.valid == 1);
     assert(prompt_count == n && stats.prompt_tokens == n && stats.cached_tokens == cached);
     assert(cached <= n - 1u && stats.prefill_tokens == n - 1u - cached);
     assert(ctx->pos == n && ctx->pcache_len == n);
@@ -318,6 +393,7 @@ static void test_prefix_generate_boundaries(void) {
         assert(myds_generate_bytes_ex(ctx, "abc", NULL, NULL, &reason, NULL, &cancel));
         assert(reason == MYDS_STOP_CANCELLED);
         myds_prefill_stats_t stats; myds_last_prefill_stats(ctx, &stats);
+        assert(stats.valid == 1);
         const uint32_t wanted = variant == 3 ? 0 : short_n - 1u;
         assert(stats.cached_tokens == wanted && stats.prefill_tokens == short_n - 1u - wanted);
         assert(stats.prompt_tokens == short_n && stats.cached_tokens < short_n);
@@ -896,6 +972,7 @@ int main(int argc, char **argv) {
 
     test_prefix_cache_reports_every_outcome();
     test_snapshot_slots_keep_the_constant_prefix();
+    test_prefill_stats_do_not_leak();
 
     /* 1. Production Greedy Argmax Sampling */
     {
