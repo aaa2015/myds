@@ -3219,6 +3219,12 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         float temp = json_extract_float_field(body, "temperature", -1.0f);
         float top_p = json_extract_float_field(body, "top_p", -1.0f);
         int top_k = json_extract_int_field(body, "top_k", -1);
+        /* 2026-10-24：min_p / repetition_penalty 在 myds_config_t 里【一直存在且真的参与
+         * 采样】（engine.c 的 min_p 阈值与 rep_pen 乘子），但此前没有任何入口能给它赋值：
+         * main.c 没有对应 CLI，请求体也不解析 ⇒ 恒为默认 0.0 / 1.0（等于永久禁用）。
+         * 这里补上 per-request 入口。默认 -1 表示「本次未指定」，不覆盖启动配置。 */
+        float min_p = json_extract_float_field(body, "min_p", -1.0f);
+        float rep_pen = json_extract_float_field(body, "repetition_penalty", -1.0f);
         int include_usage = (strstr(body, "\"include_usage\":true") != NULL || strstr(body, "\"include_usage\": true") != NULL);
 
         size_t prompt_cap = (total_read * 4 > 65536) ? (total_read * 4 + 8192) : 65536;
@@ -3408,6 +3414,24 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         if (temp >= 0.0f) req_cfg.temperature = temp;
         if (top_p >= 0.0f) req_cfg.top_p = top_p;
         if (top_k >= 0) req_cfg.top_k = (uint32_t)top_k;
+        /* min_p 语义：0.0 = 关闭；有效范围 (0,1]。超范围的值拒绝而不静默夹取，
+         * 否则客户端以为设了 5%，实际按别的值采样。 */
+        if (min_p >= 0.0f) {
+            if (min_p <= 1.0f) {
+                req_cfg.min_p = min_p;
+            } else {
+                MYDS_LOG_W("[%s:%d] min_p=%.3f 超出 [0,1]，忽略该字段", client_ip, client_port, min_p);
+            }
+        }
+        /* repetition_penalty 语义：1.0 = 关闭；常用范围 (1.0, 2.0]。<=0 视为非法。 */
+        if (rep_pen >= 0.0f) {
+            if (rep_pen == 0.0f || (rep_pen >= 1.0f && rep_pen <= 4.0f)) {
+                req_cfg.repetition_penalty = rep_pen;
+            } else {
+                MYDS_LOG_W("[%s:%d] repetition_penalty=%.3f 非法（需 0 或 [1,4]），忽略该字段",
+                           client_ip, client_port, rep_pen);
+            }
+        }
         myds_context_set_config(ctx, &req_cfg);
 
         myds_stop_reason_t stop_reason = MYDS_STOP_EOS;
