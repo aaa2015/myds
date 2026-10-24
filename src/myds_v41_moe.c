@@ -1947,16 +1947,18 @@ static int ref_publish_indexer_one(const myds_context_t *ctx,
         CHECK(myds_v41_gpu_quant(args->index_q_buf, 128u, 32u, 2u));
     }
     const myds_metal_buffer_t *b_mask = (il > 20u) ? args->block_mask : NULL;
+    /* 距离窗口下界（压缩键行号）：单查询，host 算一次给两个评分器共用。 */
+    const uint32_t win_first = myds_v41_gpu_indexer_window_first_row(args->pos, ratio);
     if (!myds_metal_get_auto_barrier()) {
         const myds_metal_buffer_t *score_deps[] = { args->index_q_buf, args->index_weights, args->index_cache };
         myds_metal_barrier_buffers(score_deps, 3);
     }
     if (ordinary_allowed && myds_v41_gpu_indexer_head_slots_enabled() == 1) {
         CHECK(myds_v41_gpu_indexscores_head_slots(args->index_scores, args->index_q_buf,
-            args->index_weights, args->index_cache, b_mask, count, 32u, true));
+            args->index_weights, args->index_cache, b_mask, count, 32u, true, win_first));
     } else {
         CHECK(myds_v41_gpu_indexscores_masked_bf16(args->index_scores, args->index_q_buf,
-            args->index_weights, args->index_cache, b_mask, count, 32u));
+            args->index_weights, args->index_cache, b_mask, count, 32u, win_first));
     }
     if (il == 20u) {
         const uint32_t blocks = (count + 7u) / 8u;
@@ -2403,7 +2405,8 @@ int myds_v41_decode_attn_indexer_scoped(myds_context_t *ctx,
         myds_metal_barrier_buffers(score_deps, want_kv_reuse ? 9u : 7u);
         if (want_kv_reuse) myds_v41_gpu_attn_kv_reuse_mark_fenced(args->gpu_scratch);
         STAGE_CHECK(myds_v41_gpu_indexscores_head_slots(args->index_scores, args->index_q_buf,
-            args->index_weights, args->index_cache, b_mask, count, 32u, true));
+            args->index_weights, args->index_cache, b_mask, count, 32u, true,
+            myds_v41_gpu_indexer_window_first_row(pos, ratio)));
         if (defer_idx_qb) {
             STAGE_CHECK(myds_metal_dense_q4_v41_qb_slice(ctx->q, base->attn_q_b, ctx->qr_norm,
                 qb_c5_heads * 512u, qb_c6_heads * 512u, false));

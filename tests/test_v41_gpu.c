@@ -204,14 +204,14 @@ static int test_indexscores_bf16(void) {
     CHECK(myds_metal_begin_batch());CHECK(myds_v41_gpu_quant(keys,128,rows,2));
     CHECK(myds_v41_gpu_pack_bf16(packed,0,keys,0,rows*128));CHECK(myds_metal_commit_batch());
     const uint32_t heads[]={1,7,32};for(size_t i=0;i<3;i++){
-        CHECK(myds_metal_begin_batch());CHECK(myds_v41_gpu_indexscores(a,q,w,keys,rows,heads[i]));
-        CHECK(myds_v41_gpu_indexscores_bf16(b,q,w,packed,rows,heads[i]));CHECK(myds_metal_commit_batch());CHECK(exact(a,b,rows));
+        CHECK(myds_metal_begin_batch());CHECK(myds_v41_gpu_indexscores(a,q,w,keys,rows,heads[i],0));
+        CHECK(myds_v41_gpu_indexscores_bf16(b,q,w,packed,rows,heads[i],0));CHECK(myds_metal_commit_batch());CHECK(exact(a,b,rows));
 
         /* Masked indexscores 测试：对比 全量+filter 与 直接masked 内核输出，要求 100% 逐位全同 */
         CHECK(myds_metal_begin_batch());
-        CHECK(myds_v41_gpu_indexscores(a,q,w,keys,rows,heads[i]));
+        CHECK(myds_v41_gpu_indexscores(a,q,w,keys,rows,heads[i],0));
         CHECK(myds_v41_gpu_filter(a,mask,rows,rows,1));
-        CHECK(myds_v41_gpu_indexscores_masked_bf16(b,q,w,packed,mask,rows,heads[i]));
+        CHECK(myds_v41_gpu_indexscores_masked_bf16(b,q,w,packed,mask,rows,heads[i],0));
         CHECK(myds_metal_commit_batch());
         CHECK(!memcmp(myds_metal_buffer_data(a),myds_metal_buffer_data(b),(size_t)rows*4));
         const float *bp=(const float*)myds_metal_buffer_data(b);
@@ -284,26 +284,51 @@ static int test_indexscores_selected_blocks(void) {
             for(uint32_t bk=blocks;bk>0;bk--)if(mp[bk-1u]==0.0f)ip[selected++]=(int32_t)(bk-1u);
             myds_metal_set_concurrent(0);myds_metal_set_auto_barrier(1);
             CHECK(myds_metal_begin_batch());
-            CHECK(myds_v41_gpu_indexscores_masked_bf16(a,q,w,cache,mask,rows,32));
+            CHECK(myds_v41_gpu_indexscores_masked_bf16(a,q,w,cache,mask,rows,32,0));
             CHECK(myds_v41_gpu_topk(sel_a,a,rows,top,scratch));CHECK(myds_metal_commit_batch());
             myds_metal_set_concurrent(1);myds_metal_set_auto_barrier(0);
             CHECK(myds_metal_begin_batch());
-            CHECK(myds_v41_gpu_indexscores_selected_blocks_bf16(b,q,w,cache,mask,ids,rows,selected)==1);
+            CHECK(myds_v41_gpu_indexscores_selected_blocks_bf16(b,q,w,cache,mask,ids,rows,selected,0)==1);
             CHECK(myds_v41_gpu_topk(sel_b,b,rows,top,scratch));CHECK(myds_metal_commit_batch());
             CHECK(!memcmp(myds_metal_buffer_data(a),myds_metal_buffer_data(b),score_bytes));
             CHECK(!memcmp(myds_metal_buffer_data(sel_a),myds_metal_buffer_data(sel_b),(size_t)top*4u));
             const float *bp=myds_metal_buffer_data(b);
             for(uint32_t r=0;r<rows;r++)CHECK(mp[r/8u]==0.0f?isfinite(bp[r]):bp[r]==-INFINITY);
         }
+        /* 2026-10-25：距离窗口下界。compact 路径分两个内核（fill 全填 -INF，
+         * 然后只给被选中的块打分），所以窗口必须【两边都生效】才不会漏掉：
+         * fill 已经铺好 -INF，选中块的打分只需跳过 row<first_row。
+         * 这里让下界切进第一块（8 行）之后：两条路径都得把那几行留成 -INF，
+         * 且剩余行仍逐位相同。 */
+        for(unsigned wpat=0;wpat<2;wpat++) {
+            const uint32_t first_row = wpat==0 ? 0u : 11u;
+            float *mp=myds_metal_buffer_data(mask);int32_t *ip=myds_metal_buffer_data(ids);uint32_t selected=0;
+            for(uint32_t bk=0;bk<blocks;bk++)mp[bk]=0.0f;      /* 全选：让下界成为唯一限制 */
+            for(uint32_t bk=blocks;bk>0;bk--)ip[selected++]=(int32_t)(bk-1u);
+            myds_metal_set_concurrent(0);myds_metal_set_auto_barrier(1);
+            CHECK(myds_metal_begin_batch());
+            CHECK(myds_v41_gpu_indexscores_masked_bf16(a,q,w,cache,mask,rows,32,first_row));
+            CHECK(myds_metal_commit_batch());
+            myds_metal_set_concurrent(1);myds_metal_set_auto_barrier(0);
+            CHECK(myds_metal_begin_batch());
+            CHECK(myds_v41_gpu_indexscores_selected_blocks_bf16(b,q,w,cache,mask,ids,rows,selected,first_row)==1);
+            CHECK(myds_metal_commit_batch());
+            const float *ap=myds_metal_buffer_data(a),*bp=myds_metal_buffer_data(b);
+            for(uint32_t r=0;r<rows;r++) {
+                if(r<first_row){CHECK(ap[r]==-INFINITY);CHECK(bp[r]==-INFINITY);continue;}
+                CHECK(isfinite(ap[r]));CHECK(isfinite(bp[r]));
+            }
+            CHECK(!memcmp(ap,bp,score_bytes));
+        }
         /* An absent optional PSO returns before even the -inf fill, so the
          * original scorer can safely run. Invalid shapes fail explicitly. */
         myds_v41_gpu_inject_indexer_compact_unavailable(true);
-        CHECK(myds_v41_gpu_indexscores_selected_blocks_bf16(b,q,w,cache,mask,ids,rows,0)==0);
+        CHECK(myds_v41_gpu_indexscores_selected_blocks_bf16(b,q,w,cache,mask,ids,rows,0,0)==0);
         CHECK(!memcmp(myds_metal_buffer_data(a),myds_metal_buffer_data(b),score_bytes));
         myds_v41_gpu_inject_indexer_compact_unavailable(false);
-        CHECK(myds_v41_gpu_indexscores_selected_blocks_bf16(b,q,w,cache,mask,ids,rows,blocks+1u)==-1);
-        CHECK(myds_v41_gpu_indexscores_selected_blocks_bf16(b,q,w,cache,NULL,ids,rows,0)==-1);
-        CHECK(myds_v41_gpu_indexscores_selected_blocks_bf16(q,q,w,cache,mask,ids,rows,0)==-1);
+        CHECK(myds_v41_gpu_indexscores_selected_blocks_bf16(b,q,w,cache,mask,ids,rows,blocks+1u,0)==-1);
+        CHECK(myds_v41_gpu_indexscores_selected_blocks_bf16(b,q,w,cache,NULL,ids,rows,0,0)==-1);
+        CHECK(myds_v41_gpu_indexscores_selected_blocks_bf16(q,q,w,cache,mask,ids,rows,0,0)==-1);
         const uint8_t *ap=myds_metal_buffer_data(a_owner),*bp=myds_metal_buffer_data(b_owner),*guard=myds_metal_buffer_data(cache_owner);
         for(size_t i=0;i<16u;i++)CHECK(ap[i]==0xa5&&bp[i]==0xa5&&ap[16u+score_bytes+i]==0xa5&&bp[16u+score_bytes+i]==0xa5);
         for(size_t i=0;i<6u;i++)CHECK(guard[i]==0xa5);
@@ -313,8 +338,14 @@ static int test_indexscores_selected_blocks(void) {
         for(size_t i=0;i<sizeof(bufs)/sizeof(*bufs);i++)myds_metal_buffer_free(bufs[i]);
     }
     myds_v41_gpu_indexer_compact_counters_t counters;myds_v41_gpu_indexer_compact_counters(&counters,false);
-    CHECK(counters.encoded==24u&&counters.unavailable==8u&&counters.requests==32u);
-    CHECK(counters.scored_row_slots<=counters.dense_rows+8u*24u);
+    /* 算式：8 个 shape × 3 个掩码 pattern = 24 次 encoded（原有用例），
+     * 加上 8 个 shape × 2 个窗口 pattern = 16 次（first_row 0/11），共 40。
+     * unavailable 只有每 shape 那 1 次注入，仍是 8；三个非法调用在计数前就
+     * 返回，不计入 requests。 */
+    CHECK(counters.encoded==40u&&counters.unavailable==8u&&counters.requests==48u);
+    /* 每次 encoded 都把 selected_blocks*8 行记为 row_slots，而它最多比 rows 多 7。
+     * 用 encoded 现算松弛量，不再写死 24 —— 那个数字只对原来的调用次数成立。 */
+    CHECK(counters.scored_row_slots<=counters.dense_rows+8u*counters.encoded);
     myds_metal_set_concurrent(0);myds_metal_set_auto_barrier(1);
     printf("  [PASS] selected-block scorer original dense scores/top-k IDs exact, finite/-inf ties, 1..128k tails, canaries, concurrent and unavailable PSO\n");return 1;
 }

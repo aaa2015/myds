@@ -3532,6 +3532,9 @@ static int publish_indexer_one_impl(myds_context_t *ctx, uint32_t il, uint32_t p
         }
 
         const myds_metal_buffer_t *b_mask = (il > 20) ? (in_block_mask ? in_block_mask : g->block_mask) : NULL;
+        /* 2026-10-25：距离窗口下界。decode 是单查询，host 算一次给全部评分器共用；
+         * 不传就又会变成「prefill 窗口、decode 全量」，两条路径的键集分叉。 */
+        const uint32_t win_first = myds_v41_gpu_indexer_window_first_row(pos, ratio);
         if (!myds_metal_get_auto_barrier()) {
             const myds_metal_buffer_t *score_deps[] = { q_buf, w_buf, g->index_cache[owner] };
             myds_metal_barrier_buffers(score_deps, 3);
@@ -3543,15 +3546,15 @@ static int publish_indexer_one_impl(myds_context_t *ctx, uint32_t il, uint32_t p
                 const uint32_t blocks=(count+7u)/8u;
                 const uint32_t selected_blocks=block_budget_cap(blocks<2048u?blocks:2048u);
                 compact_score=myds_v41_gpu_indexscores_selected_blocks_bf16(g->index_scores,q_buf,w_buf,
-                    g->index_cache[owner],b_mask,g->block_selected,count,selected_blocks);
+                    g->index_cache[owner],b_mask,g->block_selected,count,selected_blocks,win_first);
                 CHECK(compact_score>=0);
             }
         }
         if(!compact_score) {
             if(ordinary_indexer_allowed&&myds_v41_gpu_indexer_head_slots_enabled()) {
                 CHECK(myds_v41_gpu_indexscores_head_slots(g->index_scores,q_buf,w_buf,
-                    g->index_cache[owner],b_mask,count,V41_INDEX_HEADS,true));
-            } else CHECK(myds_v41_gpu_indexscores_masked_bf16(g->index_scores,q_buf,w_buf,g->index_cache[owner],b_mask,count,V41_INDEX_HEADS));
+                    g->index_cache[owner],b_mask,count,V41_INDEX_HEADS,true,win_first));
+            } else CHECK(myds_v41_gpu_indexscores_masked_bf16(g->index_scores,q_buf,w_buf,g->index_cache[owner],b_mask,count,V41_INDEX_HEADS,win_first));
         }
         if (il==20) {
             uint32_t blocks=(count+7)/8,top=block_budget_cap(blocks<2048?blocks:2048);

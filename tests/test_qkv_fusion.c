@@ -173,8 +173,10 @@ static int test_qkv_scope_graph(uint32_t pos,int finish_fallback) {
         myds_metal_barrier_buffer(out[arm][IQ].view);
         CHECK(myds_v41_gpu_quant(out[arm][IQ].view,128,32,2));
         myds_metal_barrier_buffers(index_deps,2);
+        /* 合成 fixture：count 固定 641，与 pos/ratio 无对应关系，两臂只需同一个
+         * 窗口下界 —— 传 0（无下界），不假装有真实几何。 */
         CHECK(myds_v41_gpu_indexscores_masked_bf16(out[arm][SCORES].view,out[arm][IQ].view,
-            out[arm][IW].view,cache.view,mask.view,count,32));
+            out[arm][IW].view,cache.view,mask.view,count,32,0));
         myds_metal_barrier_buffer(out[arm][SCORES].view);
         CHECK(myds_v41_gpu_topk(out[arm][SELECT].view,out[arm][SCORES].view,count,512,scratch));
         myds_metal_barrier_buffer(out[arm][Q].view);

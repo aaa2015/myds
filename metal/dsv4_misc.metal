@@ -272,6 +272,14 @@ struct ds4_metal_args_glm_indexer_score_one {
     uint32_t cache_f16;
     float    scale;
     uint32_t has_mask;
+    /* 2026-10-25：key 方向的【距离窗口下界】，与 prefill 的
+     * ds4_metal_args_glm_indexer_score_chunk::window 是同一个语义：
+     * row < first_row 一律 -INF。由 host 从 (pos, ratio, MYDS_INDEXER_KEY_WINDOW)
+     * 算出，内核不重复做除法 —— 四个 decode 评分器只需同一个值。
+     * 0 = 无下界（与改动前逐位等价）。
+     * ★ decode 的网格是逐压缩键一行，所以这里没有 prefill 那个 16 行 tile
+     *   粒度问题：越界行在读完 cache 之前就返回。 */
+    uint32_t first_row;
 };
 
 /* 批量（整 prefill chunk）版 indexer 分数。逐字照抄 ds4_metal_args_glm_indexer_score_one，
@@ -1966,6 +1974,12 @@ kernel void kernel_glm_indexer_score_one(
         }
         return;
     }
+    if (row < args.first_row) {
+        if (tid == 0) {
+            scores[row] = -INFINITY;
+        }
+        return;
+    }
     const uint nth = ntg_u.x;
     float score = 0.0f;
     for (uint h = 0; h < args.n_head; h++) {
@@ -2003,7 +2017,10 @@ kernel void kernel_myds_indexer_scores_fill(
 struct myds_indexer_selected_blocks_args {
     uint n_rows,n_head,head_dim,cache_f16;
     float scale;
-    uint has_mask,n_selected_blocks,pad;
+    uint has_mask,n_selected_blocks;
+    /* 原是未使用的 pad，2026-10-25 复用为距离窗口下界，结构体大小不变。
+     * 被跳过的行不写分数 —— fill 内核已经把整表填成 -INF。 */
+    uint first_row;
 };
 
 /* Scorer-only compaction: the dot/reduction sequence below is copied from
@@ -2027,6 +2044,8 @@ kernel void kernel_myds_indexer_score_selected_blocks_direct(
     if(block<0||(uint)block>=(args.n_rows+7u)/8u)return;
     const uint row=(uint)block*8u+slot%8u;
     if(row>=args.n_rows||mask[row/8u]!=0.0f)return;
+    /* 窗口下界：越界行保持 fill 内核写的 -INF，也不读 cache。 */
+    if(row<args.first_row)return;
     threadgroup float *ktg=shared;
     threadgroup float *psum=ktg+128u;
     if(tid<128u)ktg[tid]=glm_cache_load_f32_or_f16(indexer_key_cache,
@@ -2065,6 +2084,13 @@ kernel void kernel_glm_indexer_score_one_direct(
         return;
     }
     if (args.has_mask && mask[row / 8u] != 0.0f) {
+        if (tid == 0) {
+            scores[row] = -INFINITY;
+        }
+        return;
+    }
+    /* 距离窗口下界（与 prefill chunk 同语义）。逐行网格，无 tile 粒度问题。 */
+    if (row < args.first_row) {
         if (tid == 0) {
             scores[row] = -INFINITY;
         }
@@ -7421,6 +7447,13 @@ kernel void kernel_myds_indexer_score_one_head_slots(
         return;
     }
     if (args.has_mask && mask[row / 8u] != 0.0f) {
+        if (tid == 0) {
+            scores[row] = -INFINITY;
+        }
+        return;
+    }
+    /* 距离窗口下界：与 reference 评分器同一个值，否则两条路径的键集又会分叉。 */
+    if (row < args.first_row) {
         if (tid == 0) {
             scores[row] = -INFINITY;
         }

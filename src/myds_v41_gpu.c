@@ -483,11 +483,11 @@ void myds_v41_gpu_indexer_head_slots_counters(
 int myds_v41_gpu_indexscores_head_slots(myds_metal_buffer_t *scores,
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *weights,
     const myds_metal_buffer_t *cache,const myds_metal_buffer_t *mask,
-    uint32_t n_comp,uint32_t n_heads,bool cache_bf16) {
+    uint32_t n_comp,uint32_t n_heads,bool cache_bf16,uint32_t first_row) {
     atomic_fetch_add_explicit(&indexer_head_slots_requests,1u,memory_order_relaxed);
     bool encoded=false,unavailable=false;
     const int ok=myds_metal_indexer_head_slots_dispatch(scores,q,weights,cache,mask,
-        n_comp,n_heads,cache_bf16,&encoded,&unavailable);
+        n_comp,n_heads,cache_bf16,first_row,&encoded,&unavailable);
     if(encoded)atomic_fetch_add_explicit(&indexer_head_slots_encoded,1u,memory_order_relaxed);
     if(unavailable)atomic_fetch_add_explicit(&indexer_head_slots_unavailable,1u,memory_order_relaxed);
     if(!ok)atomic_fetch_add_explicit(&indexer_head_slots_failures,1u,memory_order_relaxed);
@@ -495,34 +495,38 @@ int myds_v41_gpu_indexscores_head_slots(myds_metal_buffer_t *scores,
 }
 static int indexscores(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
     const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,
-    const myds_metal_buffer_t *mask,uint32_t n_comp,uint32_t n_heads,bool cache_bf16) {
+    const myds_metal_buffer_t *mask,uint32_t n_comp,uint32_t n_heads,bool cache_bf16,
+    uint32_t first_row) {
     if(!n_heads||!floats(scores,n_comp)||!floats(q,(uint64_t)n_heads*128)||
         !floats(weights,n_heads)||!(cache_bf16?bf16s(cache,(uint64_t)n_comp*128):
         floats(cache,(uint64_t)n_comp*128)))return 0;
     if(mask&&!floats(mask,(n_comp+7u)/8u))return 0;
-    struct {uint32_t n_rows,n_head,head_dim,cache_f16;float scale;uint32_t has_mask;} a={
-        n_comp,n_heads,128,cache_bf16?2u:0u,1.0f/64.0f,mask?1u:0u};
+    struct {uint32_t n_rows,n_head,head_dim,cache_f16;float scale;uint32_t has_mask;
+            uint32_t first_row;} a={
+        n_comp,n_heads,128,cache_bf16?2u:0u,1.0f/64.0f,mask?1u:0u,first_row};
     const myds_metal_buffer_t *b[]={q,weights,cache,scores,mask?mask:scores};
     return n_heads==32 ? dispatch("kernel_glm_indexer_score_one_direct",&a,sizeof(a),b,5,n_comp,1,1,32,4,1,132u*4)
         : dispatch("kernel_glm_indexer_score_one",&a,sizeof(a),b,5,n_comp,1,1,32,1,1,32u*4);
 }
 int myds_v41_gpu_indexscores(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
-    const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,uint32_t n_comp,uint32_t n_heads) {
-    return indexscores(scores,q,weights,cache,NULL,n_comp,n_heads,false);
+    const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,uint32_t n_comp,
+    uint32_t n_heads,uint32_t first_row) {
+    return indexscores(scores,q,weights,cache,NULL,n_comp,n_heads,false,first_row);
 }
 int myds_v41_gpu_indexscores_bf16(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
-    const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,uint32_t n_comp,uint32_t n_heads) {
-    return indexscores(scores,q,weights,cache,NULL,n_comp,n_heads,true);
+    const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,uint32_t n_comp,
+    uint32_t n_heads,uint32_t first_row) {
+    return indexscores(scores,q,weights,cache,NULL,n_comp,n_heads,true,first_row);
 }
 int myds_v41_gpu_indexscores_masked(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
     const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,
-    const myds_metal_buffer_t *mask,uint32_t n_comp,uint32_t n_heads) {
-    return indexscores(scores,q,weights,cache,mask,n_comp,n_heads,false);
+    const myds_metal_buffer_t *mask,uint32_t n_comp,uint32_t n_heads,uint32_t first_row) {
+    return indexscores(scores,q,weights,cache,mask,n_comp,n_heads,false,first_row);
 }
 int myds_v41_gpu_indexscores_masked_bf16(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
     const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,
-    const myds_metal_buffer_t *mask,uint32_t n_comp,uint32_t n_heads) {
-    return indexscores(scores,q,weights,cache,mask,n_comp,n_heads,true);
+    const myds_metal_buffer_t *mask,uint32_t n_comp,uint32_t n_heads,uint32_t first_row) {
+    return indexscores(scores,q,weights,cache,mask,n_comp,n_heads,true,first_row);
 }
 
 enum { IC_REQUESTS, IC_ENCODED, IC_UNAVAILABLE, IC_DENSE_ROWS, IC_ROW_SLOTS, IC_COUNT };
@@ -541,7 +545,8 @@ void myds_v41_gpu_indexer_compact_counters(myds_v41_gpu_indexer_compact_counters
 int myds_v41_gpu_indexscores_selected_blocks_bf16(myds_metal_buffer_t *scores,
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *weights,
     const myds_metal_buffer_t *cache,const myds_metal_buffer_t *mask,
-    const myds_metal_buffer_t *block_ids,uint32_t n_comp,uint32_t n_selected_blocks) {
+    const myds_metal_buffer_t *block_ids,uint32_t n_comp,uint32_t n_selected_blocks,
+    uint32_t first_row) {
     if(!n_comp||n_comp>1048576u||n_selected_blocks>(n_comp+7u)/8u||
        !floats(scores,n_comp)||!floats(q,32u*128u)||!floats(weights,32u)||
        !bf16s(cache,(uint64_t)n_comp*128u)||!floats(mask,(n_comp+7u)/8u)||
@@ -569,7 +574,7 @@ int myds_v41_gpu_indexscores_selected_blocks_bf16(myds_metal_buffer_t *scores,
     myds_metal_barrier_buffer(scores);
     if(n_selected_blocks) {
         struct {uint32_t n_rows,n_head,head_dim,cache_f16;float scale;
-            uint32_t has_mask,n_selected_blocks,pad;} a={n_comp,32u,128u,2u,1.0f/64.0f,1u,n_selected_blocks,0};
+            uint32_t has_mask,n_selected_blocks,first_row;} a={n_comp,32u,128u,2u,1.0f/64.0f,1u,n_selected_blocks,first_row};
         const myds_metal_buffer_t *b[]={q,weights,cache,scores,mask,block_ids};
         if(!dispatch("kernel_myds_indexer_score_selected_blocks_direct",&a,sizeof(a),b,6,
                      n_selected_blocks*8u,1,1,32,4,1,132u*4))return -1;
@@ -613,6 +618,22 @@ static void indexer_key_window_init(void) {
 static uint32_t indexer_key_window(void) {
     pthread_once(&indexer_key_window_once, indexer_key_window_init);
     return indexer_key_window_value;
+}
+
+/* 距离窗口在当前查询位置上的下界（压缩键行号）。0 = 无下界。
+ *
+ * prefill 把 (causal_start, tok, ratio, window) 一起交给内核，让内核自己算
+ * 每个 tile/每行的下界；decode 只处理单个查询，算一次整除就够了，所以
+ * 在这里算好再把结果传下去 —— 四个 decode 评分器共用同一个值，不存在
+ * 「某个评分器忘了算」的口径差。
+ *
+ * ★ 调用方必须传【这个查询自己的】pos，不能传 chunk 起点：可见上限是
+ *   (pos+1)/ratio，窗口是相对它的，传错就会把整个窗口平移。 */
+uint32_t myds_v41_gpu_indexer_window_first_row(uint32_t pos, uint32_t ratio) {
+    const uint32_t window = indexer_key_window();
+    if (!window || !ratio) return 0;
+    const uint32_t vis = (uint32_t)(((uint64_t)pos + 1u) / ratio);
+    return vis > window ? vis - window : 0u;
 }
 
 static int indexscores_chunk(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,

@@ -3078,7 +3078,8 @@ static bool indexer_head_slots_overlap(const myds_metal_buffer_t *a,uint64_t a_b
 int myds_metal_indexer_head_slots_dispatch(myds_metal_buffer_t *scores,
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *weights,
     const myds_metal_buffer_t *cache,const myds_metal_buffer_t *mask,
-    uint32_t n_comp,uint32_t n_heads,bool cache_bf16,bool *encoded,bool *unavailable) {
+    uint32_t n_comp,uint32_t n_heads,bool cache_bf16,uint32_t first_row,
+    bool *encoded,bool *unavailable) {
     if(encoded)*encoded=false;
     if(unavailable)*unavailable=false;
     if(!g_initialized || !g_indexer_head_slots || !indexer_head_slots_geometry()) {
@@ -3098,8 +3099,9 @@ int myds_metal_indexer_head_slots_dispatch(myds_metal_buffer_t *scores,
        indexer_head_slots_overlap(scores,score_bytes,weights,32u*4u) ||
        indexer_head_slots_overlap(scores,score_bytes,cache,cache_bytes) ||
        (mask && indexer_head_slots_overlap(scores,score_bytes,mask,mask_bytes))) return 0;
-    struct {uint32_t n_rows,n_head,head_dim,cache_f16;float scale;uint32_t has_mask;} args={
-        n_comp,n_heads,128u,cache_bf16?2u:0u,1.0f/64.0f,mask?1u:0u};
+    struct {uint32_t n_rows,n_head,head_dim,cache_f16;float scale;uint32_t has_mask;
+            uint32_t first_row;} args={
+        n_comp,n_heads,128u,cache_bf16?2u:0u,1.0f/64.0f,mask?1u:0u,first_row};
     const myds_metal_buffer_t *buffers[]={q,weights,cache,scores,mask?mask:scores};
     @autoreleasepool {
         id<MTLCommandBuffer> cb=g_batch_cb?g_batch_cb:[g_queue commandBuffer];

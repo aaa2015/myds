@@ -130,18 +130,24 @@ int myds_v41_gpu_carry_stage(myds_v41_gpu_scratch_t *s,const myds_metal_buffer_t
     uint32_t base_pos);
 int myds_v41_gpu_pool2_pairs(myds_metal_buffer_t *out,const myds_metal_buffer_t *kv,
     const myds_metal_buffer_t *scores,uint32_t width,uint32_t pairs);
+/* 距离窗口在当前查询位置上的下界（压缩键行号）。0 = 无下界。
+ * 由 MYDS_INDEXER_KEY_WINDOW 与当前 pos/ratio 算出：vis = (pos+1)/ratio，
+ * lo = vis>window ? vis-window : 0。prefill 由内核自己算逐 tile/逐行下界，
+ * decode 只处理单个查询，所以 host 算一次、四个评分器共用同一个值。
+ * ★ 必须传【这个查询自己的】pos，不能传 chunk 起点。 */
+uint32_t myds_v41_gpu_indexer_window_first_row(uint32_t pos, uint32_t ratio);
 int myds_v41_gpu_indexscores(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
     const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,
-    uint32_t n_comp,uint32_t n_heads);
+    uint32_t n_comp,uint32_t n_heads,uint32_t first_row);
 int myds_v41_gpu_indexscores_bf16(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
     const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,
-    uint32_t n_comp,uint32_t n_heads);
+    uint32_t n_comp,uint32_t n_heads,uint32_t first_row);
 int myds_v41_gpu_indexscores_masked(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
     const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,
-    const myds_metal_buffer_t *mask,uint32_t n_comp,uint32_t n_heads);
+    const myds_metal_buffer_t *mask,uint32_t n_comp,uint32_t n_heads,uint32_t first_row);
 int myds_v41_gpu_indexscores_masked_bf16(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
     const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,
-    const myds_metal_buffer_t *mask,uint32_t n_comp,uint32_t n_heads);
+    const myds_metal_buffer_t *mask,uint32_t n_comp,uint32_t n_heads,uint32_t first_row);
 /* Initialization-time MYDS_INDEXER_HEAD_SLOTS accepts only absent/0/1. The
  * explicit candidate supports one scalar query, 32 heads and head_dim=128;
  * F32/BF16 keys and an optional original block mask retain their old meaning.
@@ -160,7 +166,7 @@ void myds_v41_gpu_indexer_head_slots_counters(
 int myds_v41_gpu_indexscores_head_slots(myds_metal_buffer_t *scores,
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *weights,
     const myds_metal_buffer_t *cache,const myds_metal_buffer_t *mask,
-    uint32_t n_comp,uint32_t n_heads,bool cache_bf16);
+    uint32_t n_comp,uint32_t n_heads,bool cache_bf16,uint32_t first_row);
 /* Optional 32-head decode scorer: expand the unique selected block IDs (8
  * original rows/block), write the original dense score locations, and leave
  * every other row at -INFINITY. The caller must pass all allowed block IDs
@@ -171,7 +177,8 @@ int myds_v41_gpu_indexscores_head_slots(myds_metal_buffer_t *scores,
 int myds_v41_gpu_indexscores_selected_blocks_bf16(myds_metal_buffer_t *scores,
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *weights,
     const myds_metal_buffer_t *cache,const myds_metal_buffer_t *mask,
-    const myds_metal_buffer_t *block_ids,uint32_t n_comp,uint32_t n_selected_blocks);
+    const myds_metal_buffer_t *block_ids,uint32_t n_comp,uint32_t n_selected_blocks,
+    uint32_t first_row);
 typedef struct {
     uint64_t requests, encoded, unavailable, dense_rows, scored_row_slots;
 } myds_v41_gpu_indexer_compact_counters_t;

@@ -127,7 +127,7 @@ int myds_metal_indexer_head_slots_enabled(void);
 int myds_metal_indexer_head_slots_dispatch(myds_metal_buffer_t *scores,
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *weights,
     const myds_metal_buffer_t *cache,const myds_metal_buffer_t *mask,
-    uint32_t n_comp,uint32_t n_heads,bool cache_bf16,
+    uint32_t n_comp,uint32_t n_heads,bool cache_bf16,uint32_t first_row,
     bool *encoded,bool *unavailable);
 
 /* Initialization-time LM-head experiment. MYDS_LM_HEAD_Q8_NR0 accepts only
