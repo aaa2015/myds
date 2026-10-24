@@ -115,20 +115,26 @@ def rotate_one(path, today, dry_run):
             out.writelines(lines)
         moved += len(lines)
 
-    # 原子替换：先写临时文件，再 rename。
-    # 服务那边是 O_APPEND，下一次 write 会落到新文件的末尾。
-    d = os.path.dirname(path) or '.'
-    fd, tmp = tempfile.mkstemp(prefix='.rotate-', dir=d)
-    try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as out:
-            out.writelines(keep_lines)
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    # ★ 必须【原地重写】，不能用 rename/os.replace。
+    #
+    # 踩过的坑（2026-10-24 实测）：os.replace 会在同一路径上创建一个【新 inode】。
+    # 谁持有旧 inode，谁就立刻失联：
+    #   · 服务进程的 stdout（`>>` 打开的 fd）仍指向旧 inode，
+    #     而旧 inode 的链接数归零后被内核回收 ⇒ 之后写入的日志【静默丢失】
+    #     （不报错，文件里就是不出现），直到服务重启重新 open 为止。
+    #   · 用户的 `tail -f` 同样跟着旧 inode，于是「再也看不到新日志」。
+    #   （`tail -F` 会按名字重开，才不受影响。）
+    #
+    # 原地重写保持 inode 不变，O_APPEND 保证服务的下一次 write 落到新末尾。
+    #
+    # 竞态窗口：从读完到重写之间，若服务恰好写了新行，会被本次 truncate 覆盖。
+    # 该任务定在 00:05（无流量），窗口只有毫秒级，可以接受；
+    # 不要把它改成高频轮转。
+    payload = ''.join(keep_lines)
+    with open(path, 'r+b') as f:
+        f.seek(0)
+        f.write(payload.encode('utf-8'))
+        f.truncate()
 
     return moved, size
 
