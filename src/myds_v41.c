@@ -3925,8 +3925,18 @@ static inline int32_t sample_and_verify_token(const float *logits, uint32_t voca
                                              const myds_config_t *cfg, myds_context_t *ctx) {
     float temp = cfg ? cfg->temperature : 0.0f;
     float rep_pen = (cfg && cfg->repetition_penalty > 0.0f) ? cfg->repetition_penalty : 1.0f;
-    bool has_rep_pen = (rep_pen > 1.0f);
-    if (temp <= 0.0f && !has_rep_pen) {
+    const float pres_pen = cfg ? cfg->presence_penalty : 0.0f;
+
+    /* 2026-10-24：快速贪婪路径的准入条件必须覆盖【所有】惩罚。
+     *
+     * 原条件只看 rep_pen > 1.0f ：
+     *   · presence_penalty 完全没考虑 ⇒ 无论客户端设成多少，temp=0 时都被静默忽略。
+     *     实测 pres_pen=2.0 与 0.0 输出逐字相同，因为压根没进采样器。
+     *   · rep_pen < 1.0（鼓励重复）也不满足 > 1.0 ⇒ 同样被绕过。
+     * 现在只要任一惩罚偏离默认值，就退回通用采样器，让 PEN_APPLY 生效。
+     * 惩罚全默认时仍走这条 NEON 快速路径，性能不变。 */
+    const bool has_penalty = (rep_pen != 1.0f) || (pres_pen != 0.0f);
+    if (temp <= 0.0f && !has_penalty) {
         bool finite_ok = true;
         int32_t tok = myds_sample_greedy_finite_neon(logits, vocab_size, &finite_ok);
         if (__builtin_expect(!finite_ok, 0)) return -1;
