@@ -3536,6 +3536,16 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             }
         }
         myds_context_set_config(ctx, &req_cfg);
+        /* 2026-10-24：打印【生效值】而不是请求里的原始值。
+         * 两者不同正是「配了但没生效」的来源：原始值可能是 -1（未提供），
+         * 也可能被范围校验拒绝，而行首那条日志只反映字面量。
+         * 这一行紧跟在 set_config 之后，内容就是采样器实际会读到的 cfg。 */
+        MYDS_LOG_I("[%s:%d] effective sampling: temp=%.3f, top_p=%.3f, top_k=%u, "
+                   "min_p=%.3f, rep_pen=%.3f, pres_pen=%.3f, thinking=%d",
+                   client_ip, client_port,
+                   (double)req_cfg.temperature, (double)req_cfg.top_p, req_cfg.top_k,
+                   (double)req_cfg.min_p, (double)req_cfg.repetition_penalty,
+                   (double)req_cfg.presence_penalty, req_thinking_now ? 1 : 0);
 
         myds_stop_reason_t stop_reason = MYDS_STOP_EOS;
         uint32_t prompt_tokens = 0;
