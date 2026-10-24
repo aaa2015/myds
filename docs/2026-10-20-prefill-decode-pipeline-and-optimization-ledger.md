@@ -13095,8 +13095,11 @@ FIFO（新实现）：存活 combo2,3,4,5   ← 最新的 4 套，符合直觉
 
 | store | 文件 | 槽数 | 每槽容量 | 名义 |
 |---|---|---:|---:|---:|
-| anchor | `kvanchor-v1-*.bin` | **16** | 65536 tok | 8.9 GB |
-| prompt-end | `kvends-v1-*.bin` | **64** | 65536 tok | 35.6 GB |
+| anchor | `kvanchor-v1-*.bin` | **16** | 65536 tok | 2.7 GiB |
+| prompt-end | `kvends-v1-*.bin` | **64** | 65536 tok | 11.0 GiB |
+
+> **更正（§96.2）**：本节初稿写的 8.9 GB / 35.6 GB 是**凭估计**算的（按 570 MiB/槽），
+> 实机启动日志实测为 **175.6 MiB/槽 ⇒ 2.7 GiB + 11.0 GiB**。数值以 §96.2 为准。
 
 **文件是稀疏的**：实测现有 `kvends` 名义 448 MB / 实占 11 MB（2.5%）。
 单人实际用 3 + 5 条 ⇒ **真实占用约 4.5 GB**。
@@ -13158,3 +13161,113 @@ LFU 的缺陷就是从一行启动日志里读出来的，不是从性能数据�
 
 已挂进 `make test`（`ALL_TESTS += $(TEST_KVDSK_FIFO)`），实测通过。
 原有的 `test_kvdsk`（含 LFU 用例）也仍通过 —— 两条路径互不影响。
+
+---
+
+## §96 kvdisk 双 store 上线实测 + 三个新发现（2026-10-24）
+
+### 96.1 部署链路（含一个我自己挖的坑）
+
+源码以 macmini 为准，macstudio 只作生产：本轮把 studio 从 10 月 22 日的旧树（`myds_v41.c` 7873 行）
+同步到 8462 行后重编，两机二进制逐字节一致（`80288dae…`，901,368 B）。
+
+**metallib 不能重编**：studio 上的 `bin/myds.metallib` 是只读且正是生产哈希
+（`c692d821aed4…`，4,159,096 B）。`make bin/myds` 会连带重编它并报
+`LLVM ERROR: Failed to write`。正确做法：`touch bin/myds.metallib` 让其看起来比源码新，
+只编 C 二进制。本轮未改任何 `.metal`，哈希全程未变。
+
+**⚠️ 配置是两份，不是一个「单一权威来源」**：`~/Projects/myfleet/myds.conf` 在
+macmini 与 macstudio 各有一份，`start_fleet.sh` 会把其中一份推给另一端
+（日志「📡 正在流式同步配置到 Mac Mini」）。我改 mini 的那份，production 读的是 studio 的那份，
+两者当时已经不同步：studio 多出 `MYDS_PREFILL_MOE_WORKSPACE` / `MYDS_PREFILL_PROMPT_VIEW_CLEAR` /
+`MYDS_INDEXER_TILED` 三项。**结论：以后改配置必须两端都核对，改完读 `--dump-config` 不算完，
+还要看另一端的实际文件。**
+
+### 96.2 双 store 在真机上的容量（实测，替代 §95 的估计值）
+
+启动日志原文：
+
+```
+kvdisk: prompt-cache store · 64 槽 × 65536 tok (176 MiB/槽) = 名义 11.0 GiB
+kvdisk: anchor store      · 16 槽 × 65536 tok (176 MiB/槽) = 名义 2.7 GiB
+kvdisk: 分段网格上限 11264 tok ⇒ 超过此值的 prompt 必须靠 tail 才能缓存
+```
+
+**176 MiB/槽的验算**（我最初心算成 110 MiB，错在漏了三个 ratio=2 的 owner）：
+
+```
+tail(11264 → 65536):
+  owner 0,1,2（ratio 2 各一份）: 3 × (32768−5632) × 1280 B = 104,202,240 B
+  owner 3（ratio 1）           : (65536−11264) × 1280 B     =  69,468,160 B
+固定部分: 64 + 12 + 16384 + 40×128×512×4 + 21×32           =  10,502,892 B
+合计 184,173,292 B = 175.6 MiB  ✅ 与实测一致
+```
+
+`sizeof(myds_engram_history_t) = 12 B`（实测，非估计）。
+
+### 96.3 ★ 真 bug ①：锚点被 14 MiB 的旧门挡死
+
+§95 拆分 store 时把 stride 参数化了，但**三处仍用旧的全局 `V41_LOWKV_END_STRIDE`**（默认 14 MiB）：
+
+| 位置 | 后果 |
+|---|---|
+| `lowkv_open_stores` 的预算计算 | 预算漏算 anchor store |
+| prompt-end 写路径的 `end_bytes <= …` | 长 prompt 被静默拒写 |
+| **anchor 写路径的 `anchor_bytes > …`** | **52K 系统提示词约 88 MiB ⇒ 永远进不去** |
+
+已全部改为各自的 `v41_end_stride_for(...)`，并把 anchor 计入预算。
+`MYDS_KV_DSK_END_MIB` 随之作废：保留探测只为**告警**（否则设了旧变量以为生效）。
+
+### 96.4 ★ 真 bug ②：基础段在写盘时已经不存在了
+
+52K 系统提示词实测（`system+tools=54003 tok`），anchor 在 RAM 里捕获成功：
+
+```
+prefix cache: captured persistent anchor snapshot at pos 54003 (slot 43)
+```
+
+但 **`kvanchor` 文件始终 0 条有效**，且**没有任何成功或失败日志**（这是静默失败）。
+
+**根因链**：
+
+1. 前缀快照要先写出 21 个「基础段」`[0, 11264)`，即 `lowkv_ensure_segment` 从
+   `g->compressed[o] / g->index_cache[o]` 读实时 KV；
+2. 但后缀收缩只保留 `layers >= 20` 的尾部行：
+   `suffix shrink: front=all shift=512 valid_from=53491`；
+3. owner 3（层 20..39）的头部行 `[0, 11264)` **已被丢弃** ⇒ 段写不出来 ⇒ 整条快照作废。
+
+**范围**：任何超过 ring 容量（11264 token）的 prompt 都受影响 —— 也就是 tail 机制存在的**唯一理由**恰好不可写。
+
+**已加日志**（两条路径原本都是纯静默）：
+
+```
+kvdisk: anchor 位置 %u 无法落盘：第 %d 段（共 %u）取不到 KV；多半是后缀收缩已丢弃头部行
+kvdisk: prompt-end 位置 %u 无法落盘：第 %d 段（共 %u）取不到 KV；…
+```
+
+### 96.5 ★ 真 bug ③（阻塞上线）：开启 kvdisk 后长 prompt 在续批阶段崩溃
+
+`MYDS_KV_DSK` 一开，同一个 54,012 token 请求在 prefill 末尾的 8-token 续批处必崩：
+
+```
+exception: EXC_BAD_ACCESS (SIGSEGV), KERN_INVALID_ADDRESS at 0x0000010e0000001c
+faulting thread:
+  myds_v41_prefill_tokens +170084
+  myds_v41_prefill_tokens +169964
+  myds_generate_internal +52444
+```
+
+两次复现（18:15:26 / 18:18:23 两份 `.ips`），另一次表现为**卡死**而非崩溃。
+崩溃点不在写盘代码里，`prefill_tokens` 这一点上唯一被 kvdisk 改变的是**快照捕获**
+（`snap_enabled` 由 `MYDS_KV_DSK` 决定）。⇒ **这是启用快照后才暴露的潜伏缺陷，不是 §95/§96 引入的。**
+
+**当前处置**：配置回滚到改动前（1791 B / `19b738e8` / 51 项，与原始备份逐字节一致），
+production 已重启并冒烟通过（`content":"ok"`）。**kvdisk 未上线。**
+
+### 96.6 一条方法论教训
+
+我在 §95 里把「570 MiB/槽、35.6 GiB」当成结论写进账本，实际是**心算估计**。真机一跑就差 3.2 倍。
+这与 §C.13「不要凭记忆引用性能数字」是同一个坑，只是换成了「容量」。
+
+**规则补充**：涉及容量/尺寸的数字，要么写出完整算式并逐项核对（含「有几个同 ratio 的 owner」这类计数），
+要么等实机日志，**不许在两者都没做的情况下写进账本**。

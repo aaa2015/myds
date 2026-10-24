@@ -912,19 +912,16 @@ static uint64_t v41_end_stride_for(uint32_t max_tokens) {
     return bytes;
 }
 
-static uint64_t v41_lowkv_end_stride(void) {
-    static uint64_t cached = 0;
-    if (cached) return cached;
-    uint64_t mib = V41_LOWKV_END_STRIDE_DEFAULT_MIB;
+/* 2026-10-24：MYDS_KV_DSK_END_MIB 已被两个按 store 的容量参数取代
+ * （MYDS_PROMPT_CACHE_MAX_TOKENS / MYDS_ANCHOR_MAX_TOKENS）。
+ * 保留这个探测只为【警告】——否则有人设了旧变量、以为生效，而实际被忽略。 */
+static void v41_lowkv_warn_obsolete_end_mib(void) {
     const char *e = getenv("MYDS_KV_DSK_END_MIB");
     if (e && *e) {
-        const long v = atol(e);
-        if (v >= 1 && v <= (long)V41_LOWKV_END_STRIDE_MAX_MIB) mib = (uint64_t)v;
+        MYDS_LOG_W("kvdisk: MYDS_KV_DSK_END_MIB=%s 已废弃且【不生效】；"
+                   "改用 MYDS_PROMPT_CACHE_MAX_TOKENS / MYDS_ANCHOR_MAX_TOKENS（单位 token）", e);
     }
-    cached = mib * 1048576ull;
-    return cached;
 }
-#define V41_LOWKV_END_STRIDE v41_lowkv_end_stride()
 #define V41_LOWKV_ENTRY_IS_END 0x80000000u
 #define V41_LOWKV_REF_BYTES 32u
 #define V41_CACHE_BYTES  2u
@@ -2070,13 +2067,18 @@ static const char *dir_of(const char *path) {
 
 static bool lowkv_open_stores(myds_v41_context_t *g, const char *snap_path,
     const char *segment_path, const char *end_path, uint64_t identity, uint32_t ways, uint64_t budget) {
+    v41_lowkv_warn_obsolete_end_mib();
     const uint32_t entries = MYDS_SNAP_PINNED * ways;
     const uint64_t snapshot_stride = lowkv_payload_bytes(lowkv_segment_end(MYDS_SNAP_PINNED - 1u));
     const uint64_t segment_stride = lowkv_segment_bytes(0, MYDS_SNAP_MIN);
-    const uint64_t end_stride = V41_LOWKV_END_STRIDE;
+    /* 2026-10-24：两个 store 各有自己的 stride —— 共用会让 64 个 prompt 槽
+     * 也按 system prompt 的 65536 tok 付磁盘。两者都必须计入预算。 */
+    const uint64_t end_stride = v41_end_stride_for(v41_prompt_cache_max_tokens());
+    const uint64_t anchor_stride = v41_end_stride_for(v41_anchor_max_tokens());
     const uint64_t total = lowkv_store_file_bytes(entries, snapshot_stride) +
         lowkv_store_file_bytes(entries, segment_stride) +
-        lowkv_store_file_bytes(V41_LOWKV_ENDS_MAX, end_stride);
+        lowkv_store_file_bytes(v41_prompt_cache_slots(), end_stride) +
+        lowkv_store_file_bytes(v41_anchor_slots(), anchor_stride);
     if (!segment_stride || (budget && total > budget)) {
         MYDS_LOG_E("kvdisk: snapshot + segments + ends require %.1f MiB, budget %.1f MiB",
             (double)total / 1048576.0, (double)budget / 1048576.0);
@@ -2100,7 +2102,6 @@ static bool lowkv_open_stores(myds_v41_context_t *g, const char *snap_path,
         char anchor_path[1300];
         snprintf(anchor_path, sizeof(anchor_path), "%s/kvanchor-v1-%016llx.bin",
                  dir_of(end_path), (unsigned long long)end_id);
-        const uint64_t anchor_stride = v41_end_stride_for(v41_anchor_max_tokens());
         const uint64_t anchor_id = myds_kvdsk_identity("v41-lowkv-anchor-v1", &identity, 1);
         g->low_anchor = myds_kvdsk_open(anchor_path, anchor_id,
                                         v41_anchor_slots(), anchor_stride, 0);
@@ -2339,19 +2340,22 @@ bool myds_v41_low_kv_save(myds_v41_context_t *g, const int32_t *tokens, uint32_t
             const uint32_t be = lowkv_base_segment_end(bc);
             const uint64_t end_hash = myds_kvdsk_hash_tokens(tokens, p_end);
             const uint64_t end_bytes = lowkv_end_payload_bytes(p_end, bc, be);
-            if (end_bytes <= V41_LOWKV_END_STRIDE) {
+            const uint64_t pc_stride = v41_end_stride_for(v41_prompt_cache_max_tokens());
+            if (end_bytes <= pc_stride) {
                 bool already = false;
-                const uint32_t end_slot = lowkv_pick_end_entry(g, g->low_ends, p_end, end_hash, end_bytes, &already, V41_LOWKV_END_STRIDE);
+                const uint32_t end_slot = lowkv_pick_end_entry(g, g->low_ends, p_end, end_hash, end_bytes, &already, pc_stride);
                 if (end_slot != V41_LOWKV_NO_ENTRY) {
                     lowkv_segment_ref_t refs[MYDS_SNAP_PINNED];
                     unsigned char *stage = (unsigned char *)malloc(V41_LOWKV_STAGE);
                     bool end_ok = (stage != NULL);
+                    int bad_j = -1;
                     for (uint32_t j = 0; j < bc && end_ok; ++j) {
                         if (!have_hash[j]) {
                             prefix_hashes[j] = myds_kvdsk_hash_tokens(tokens, lowkv_segment_end(j));
                             have_hash[j] = true;
                         }
                         end_ok = lowkv_ensure_segment(g, j, prefix_hashes[j], stage, &refs[j]);
+                        if (!end_ok) bad_j = (int)j;
                     }
                     if (end_ok) {
                         if (!already || !lowkv_end_refs_match(g, g->low_ends, end_slot, bc, refs)) {
@@ -2365,6 +2369,12 @@ bool myds_v41_low_kv_save(myds_v41_context_t *g, const int32_t *tokens, uint32_t
                             }
                         }
                     } else {
+                        /* 2026-10-24：原先是纯静默（ok=false 无日志）。实测长 prompt 必然走到这里：
+                         * 后缀收缩只保留 layers>=20 的尾部行，而基础段 [0,base_end) 需要头部行
+                         * ⇒ 每段的 owner 3 都取不到 ⇒ 整条快照写不出来，且日志一片安静。 */
+                        MYDS_LOG_W("kvdisk: prompt-end 位置 %u 无法落盘：第 %d 段（共 %u）取不到 KV；"
+                                   "多半是后缀收缩已丢弃头部行（valid_from 之后有效）",
+                                   p_end, bad_j, bc);
                         ok = false;
                     }
                     free(stage);
@@ -2386,20 +2396,24 @@ bool myds_v41_low_kv_save(myds_v41_context_t *g, const int32_t *tokens, uint32_t
             const uint32_t be_anchor = lowkv_segment_end(MYDS_SNAP_PINNED - 1u);
             const uint64_t anchor_hash = myds_kvdsk_hash_tokens(tokens, p_anchor);
             const uint64_t anchor_bytes = lowkv_end_payload_bytes(p_anchor, bc_anchor, be_anchor);
-            if (anchor_bytes > V41_LOWKV_END_STRIDE) {
-                MYDS_LOG_W("kvdisk: anchor at %u needs %.1f MiB > end stride %.1f MiB; "
-                           "raise MYDS_KV_DSK_END_MIB to persist it",
+            /* ★ 曾用全局 V41_LOWKV_END_STRIDE（默认 14 MiB）当门 ⇒ 52K 系统提示词
+             * 约 140 MiB 被直接挡掉，锚点从未落盘。必须用 anchor 自己的 stride。 */
+            const uint64_t an_stride = v41_end_stride_for(v41_anchor_max_tokens());
+            if (anchor_bytes > an_stride) {
+                MYDS_LOG_W("kvdisk: anchor at %u needs %.1f MiB > anchor stride %.1f MiB; "
+                           "raise MYDS_ANCHOR_MAX_TOKENS to persist it",
                            p_anchor, (double)anchor_bytes / 1048576.0,
-                           (double)V41_LOWKV_END_STRIDE / 1048576.0);
+                           (double)an_stride / 1048576.0);
             } else {
                 bool anchor_already = false;
-                const uint32_t anchor_entry = lowkv_pick_end_entry(g, g->low_anchor, p_anchor, anchor_hash, anchor_bytes, &anchor_already, v41_end_stride_for(v41_anchor_max_tokens()));
+                const uint32_t anchor_entry = lowkv_pick_end_entry(g, g->low_anchor, p_anchor, anchor_hash, anchor_bytes, &anchor_already, an_stride);
                 if (anchor_entry == V41_LOWKV_NO_ENTRY) {
                     MYDS_LOG_W("kvdisk: anchor at %u found no end slot", p_anchor);
                 } else if (!anchor_already) {
                     lowkv_segment_ref_t anchor_refs[MYDS_SNAP_PINNED];
                     unsigned char *astage = (unsigned char *)malloc(V41_LOWKV_STAGE);
                     bool anchor_ok = (astage != NULL);
+                    int anchor_bad_j = -1;
                     /* ★ 不依赖 have_hash：单 chunk prefill（macroblock 自适应）时
                      * snap_pos[1..21] 全为 0，job 循环不跑，prefix_hashes 是空的。
                      * 这里直接按 tokens 前缀算哈希 —— lowkv_ensure_segment 从
@@ -2407,6 +2421,7 @@ bool myds_v41_low_kv_save(myds_v41_context_t *g, const int32_t *tokens, uint32_t
                     for (uint32_t j = 0; j < bc_anchor && anchor_ok; ++j) {
                         const uint64_t h = myds_kvdsk_hash_tokens(tokens, lowkv_segment_end(j));
                         anchor_ok = h && lowkv_ensure_segment(g, j, h, astage, &anchor_refs[j]);
+                        if (!anchor_ok) anchor_bad_j = (int)j;
                     }
                     if (anchor_ok) {
                         const double ta0 = lowkv_now_ms();
@@ -2418,6 +2433,10 @@ bool myds_v41_low_kv_save(myds_v41_context_t *g, const int32_t *tokens, uint32_t
                         } else {
                             MYDS_LOG_W("kvdisk: anchor 位置 %u 写盘失败", p_anchor);
                         }
+                    } else {
+                        MYDS_LOG_W("kvdisk: anchor 位置 %u 无法落盘：第 %d 段（共 %u）取不到 KV；"
+                                   "多半是后缀收缩已丢弃头部行 ⇒ 系统提示词缓存对长 prompt 不生效",
+                                   p_anchor, anchor_bad_j, bc_anchor);
                     }
                     free(astage);
                 }
