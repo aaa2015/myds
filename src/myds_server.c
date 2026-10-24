@@ -711,6 +711,30 @@ float json_extract_float_field(const char *json, const char *key, float default_
     return (float)atof(p);
 }
 
+/* response_format 分类。
+ * ★ 只看 response_format 键之后的 512 字节：取值就在那里。不设边界的旧写法
+ *   在整个 body 里 strstr，提示词/工具描述里出现 "json_schema" 也会被当成请求
+ *   参数 —— 于是「写了个 JSON 示例」的提示词会突然拿到 400。
+ * json_schema 先判：它的对象里嵌着同名键，也可能嵌 json_object 字样。 */
+int server_response_format_kind(const char *body) {
+    if (!body) return SERVER_RF_NONE;
+    static const char kKey[] = "\"response_format\"";
+    const char *rf = strstr(body, kKey);
+    if (!rf) return SERVER_RF_NONE;
+    const char *p = rf + sizeof(kKey) - 1u;
+    size_t remaining = strlen(p);
+    if (remaining > 512u) remaining = 512u;
+    static const char kSchema[] = "\"json_schema\"";   /* 13 字节 */
+    static const char kObject[] = "\"json_object\"";   /* 13 字节 */
+    for (size_t i = 0; i + sizeof(kSchema) - 1u <= remaining; i++) {
+        if (memcmp(p + i, kSchema, sizeof(kSchema) - 1u) == 0) return SERVER_RF_JSON_SCHEMA;
+    }
+    for (size_t i = 0; i + sizeof(kObject) - 1u <= remaining; i++) {
+        if (memcmp(p + i, kObject, sizeof(kObject) - 1u) == 0) return SERVER_RF_JSON_OBJECT;
+    }
+    return SERVER_RF_NONE;
+}
+
 /* Find matching closing brace '}' considering nested braces and string literals */
 const char *find_matching_brace(const char *start) {
     if (!start || *start != '{') return NULL;
@@ -3287,13 +3311,26 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         float rep_pen = json_extract_float_field(body, "repetition_penalty", -1.0f);
         float pres_pen = json_extract_float_field(body, "presence_penalty", -1.0f);
         int include_usage = (strstr(body, "\"include_usage\":true") != NULL || strstr(body, "\"include_usage\": true") != NULL);
-        /* 官方 DeepInfer 借鉴：Structured output response_format 处理 */
-        bool req_json_mode = false;
-        const char *rf_pos = strstr(body, "\"response_format\"");
-        if (rf_pos) {
-            if (strstr(rf_pos, "\"json_object\"") || strstr(rf_pos, "\"json_schema\"")) {
-                req_json_mode = true;
-            }
+        /* Structured output response_format：本引擎【没有】约束解码器。
+         * 2026-10-25：此前这里只把 json_object/json_schema 记成一个布尔并打印日志，
+         * 客户端以为输出受语法约束，实际拿到的是自由文本 —— 这是静默说谎。
+         * 现在：json_schema 自带语法合约，直接 400 拒绝；json_object 保留接受
+         * （不少客户端只是「希望」JSON 而自带重试），但显式告警。 */
+        const int rf_kind = server_response_format_kind(body);
+        if (rf_kind == SERVER_RF_JSON_SCHEMA) {
+            MYDS_LOG_W("[%s:%d] 拒绝 response_format=json_schema：无约束解码，语法会被忽略",
+                       client_ip, client_port);
+            send_response(client_fd, 400, "Bad Request", "application/json",
+                          "{\"error\":{\"message\":\"response_format.json_schema is not supported: "
+                          "this engine has no constrained decoding, so the grammar would be silently ignored\"}}");
+            free(req_buf);
+            close(client_fd);
+            return;
+        }
+        const bool req_json_mode = (rf_kind == SERVER_RF_JSON_OBJECT);
+        if (req_json_mode) {
+            MYDS_LOG_W("[%s:%d] response_format=json_object 未强制：无约束解码，输出不保证是合法 JSON",
+                       client_ip, client_port);
         }
 
         size_t prompt_cap = (total_read * 4 > 65536) ? (total_read * 4 + 8192) : 65536;

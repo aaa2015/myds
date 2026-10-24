@@ -232,6 +232,28 @@ int main(void) {
         printf("  [PASS] thinking effort → budget mapping\n");
     }
 
+    /* response_format 分类：本引擎无约束解码器。
+     * 旧行为：json_schema 被静默接受，只打一行日志，客户端以为输出受语法约束。
+     * 现在 handler 对 json_schema 直接 400，对 json_object 只告警 —— 判定逻辑
+     * 在这里钉死三件事：只在 response_format 之后找、schema 优先于 object、
+     * 提示词里出现的同名字样不算请求参数。 */
+    {
+        assert(server_response_format_kind(NULL) == SERVER_RF_NONE);
+        assert(server_response_format_kind("{\"input\":\"hi\"}") == SERVER_RF_NONE);
+        /* 没有 response_format 这个键 —— 哪怕正文里出现 json_schema 字样也不算参数。 */
+        assert(server_response_format_kind(
+            "{\"input\":\"please answer with json_schema json_object\"}") == SERVER_RF_NONE);
+        assert(server_response_format_kind(
+            "{\"response_format\":{\"type\":\"text\"}}") == SERVER_RF_NONE);
+        assert(server_response_format_kind(
+            "{\"response_format\":{\"type\":\"json_object\"}}") == SERVER_RF_JSON_OBJECT);
+        /* schema 对象内部嵌着同名键，也必须分类成 SCHEMA 而不是 OBJECT。 */
+        assert(server_response_format_kind(
+            "{\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{"
+            "\"name\":\"card\",\"schema\":{\"type\":\"object\"}}}}") == SERVER_RF_JSON_SCHEMA);
+        printf("  [PASS] response_format classification (json_schema rejected, json_object warned)\n");
+    }
+
     printf("====================================================\n");
     printf("  ALL SERVER PROTOCOL TESTS PASSED CLEANLY!\n");
     printf("====================================================\n");

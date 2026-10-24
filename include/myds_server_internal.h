@@ -99,6 +99,15 @@ const char *resp_id_saved_text(const char *id);
 unsigned long long resp_id_live_tools_sig(void);
 /* 工具集指纹（供单测与续跑一致性校验）。0 = 无 tools。 */
 unsigned long long server_tools_signature(const char *body, size_t scratch_cap);
+
+/* response_format 分类（供单测与请求校验共用）。
+ * 0 = 未指定 / 1 = json_object / 2 = json_schema。
+ * 本引擎没有约束解码器，所以 handler 对 2 直接 400，对 1 只告警 ——
+ * 判定逻辑抽出来单测，免得「静默接受一个不会生效的语法约定」再回归。 */
+int server_response_format_kind(const char *body);
+#define SERVER_RF_NONE        0
+#define SERVER_RF_JSON_OBJECT 1
+#define SERVER_RF_JSON_SCHEMA 2
 bool resp_id_is_live(const char *id);
 bool resp_id_seen(const char *id);
 void resp_id_invalidate_all(void);
