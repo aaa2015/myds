@@ -220,6 +220,8 @@ struct myds_context {
      *   覆盖 prompt 与生成的全部 token，顺序天然正确，调用方无需改动。
      * 只保留最近 MYDS_PENALTY_WINDOW 个：惩罚作用于「近期上下文」，
      * 而非全部历史（全量会让长上下文下每个 token 的采样退化成 O(n)。 */
+    /* 每请求只打一次采样器内部状态（证明惩罚确实被采样器看到）。 */
+    uint32_t             sampler_trace_once;
     int32_t              recent_tokens[256];
     uint32_t             recent_count;   /* 0..256，已填充个数 */
     uint32_t             recent_next;    /* 下一个写入下标 */

@@ -1469,6 +1469,7 @@ myds_config_t myds_context_get_config(const myds_context_t *ctx) {
 void myds_context_set_config(myds_context_t *ctx, const myds_config_t *cfg) {
     if (!ctx || !cfg) return;
     ctx->cfg = *cfg;
+    ctx->sampler_trace_once = 0;   /* 每个请求允许打一次采样器诊断 */
     /* Changing sampling options cannot grow the already allocated KV buffers. */
     if (ctx->cfg.max_seq_len == 0 || ctx->cfg.max_seq_len > ctx->kv_capacity) {
         ctx->cfg.max_seq_len = ctx->kv_capacity;
@@ -1520,6 +1521,16 @@ int32_t myds_sample_next_token(
     const bool has_rep_pen = (rep_pen != 1.0f && recent && n_recent > 0);
     const bool has_pres_pen = (pres_pen != 0.0f && recent && n_recent > 0);
     const bool has_penalty = has_rep_pen || has_pres_pen;
+
+    /* 2026-10-24：每个请求打一次采样器【内部】看到的状态。
+     * 行首日志只能证明值到达服务端，这一行才能证明它到达了采样器。 */
+    if (ctx && !ctx->sampler_trace_once) {
+        ctx->sampler_trace_once = 1;
+        MYDS_LOG_I("sampler: pres_pen=%.3f, rep_pen=%.3f, n_recent=%zu, "
+                   "has_pres=%d, has_rep=%d, temp=%.3f",
+                   (double)pres_pen, (double)rep_pen, n_recent,
+                   has_pres_pen ? 1 : 0, has_rep_pen ? 1 : 0, (double)temp);
+    }
 
     /* 近期 token 的哈希集合：避免原来的 O(vocab × n) 双重循环
      * （vocab≈129k、窗口 256 ⇒ 每次采样 3300 万次比较）。
