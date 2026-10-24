@@ -1785,8 +1785,10 @@ int myds_metal_init(const char *shader_dir) {
         const char *dir = shader_dir ? shader_dir : "metal";
         NSArray<NSString *> *shader_files = @[
             @"flash_attn.metal",
+            @"myds_prefill_attention_multihead.metal",
             @"dense.metal",
             @"moe.metal",
+            @"myds_qkv_dual.metal",
             @"myds_iq2_v41.metal",
             @"myds_q4_v41.metal",
             @"dsv4_hc.metal",

@@ -489,6 +489,23 @@ $(BUILD_DIR)/trace_model.o: tools/trace_model.c | $(BUILD_DIR)
 $(BIN_DIR)/trace_model: $(filter-out $(BUILD_DIR)/myds_server.o,$(OBJS_C)) $(OBJS_M) $(BUILD_DIR)/trace_model.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
 
+# Diagnostic-only objects: normal inference never compiles the capture observer.
+$(BUILD_DIR)/myds_v41_attention_capture.o: src/myds_v41.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -DMYDS_ATTENTION_MULTIHEAD_CAPTURE -MMD -MP -c $< -o $@
+$(BUILD_DIR)/myds_v41_gpu_attention_capture.o: src/myds_v41_gpu.c tools/attention_multihead_capture.inc | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -DMYDS_ATTENTION_MULTIHEAD_CAPTURE -MMD -MP -c $< -o $@
+$(BUILD_DIR)/capture_attention_multihead.o: tools/capture_attention_multihead.c tools/reference/trace_input.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+$(BIN_DIR)/capture_attention_multihead: $(filter-out $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o,$(OBJS_C)) $(OBJS_M) $(BUILD_DIR)/myds_v41_attention_capture.o $(BUILD_DIR)/myds_v41_gpu_attention_capture.o $(BUILD_DIR)/capture_attention_multihead.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
+
+$(BUILD_DIR)/myds_v41_outa_capture.o: src/myds_v41.c tools/outa_capture.inc | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -DMYDS_OUTA_CAPTURE -MMD -MP -c $< -o $@
+$(BUILD_DIR)/capture_output_a.o: tools/capture_output_a.c tools/reference/trace_input.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+$(BIN_DIR)/capture_output_a: $(filter-out $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_v41.o,$(OBJS_C)) $(OBJS_M) $(BUILD_DIR)/myds_v41_outa_capture.o $(BUILD_DIR)/capture_output_a.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
+
 # Explicit full-model correctness gate; never part of the model-free test suite.
 $(BUILD_DIR)/test_v41_decode_state.o: tools/test_v41_decode_state.c tools/reference/trace_input.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
@@ -688,6 +705,14 @@ $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_v41_gpu.o: src/myds_decode_candidate
 
 # Build-only tools; GPU execution belongs to an exclusive experiment window.
 $(BIN_DIR)/bench_iq2_v41: tools/bench_iq2_v41.m | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) $< $(LDFLAGS) -o $@
+$(BIN_DIR)/bench_iq2_signed4: tools/bench_iq2_signed4.m $(BUILD_DIR)/myds_gguf.o | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) $< $(BUILD_DIR)/myds_gguf.o $(LDFLAGS) -o $@
+$(BIN_DIR)/bench_qkv_dual: tools/bench_qkv_dual.m $(BUILD_DIR)/myds_gguf.o | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) $< $(BUILD_DIR)/myds_gguf.o $(LDFLAGS) -o $@
+$(BIN_DIR)/bench_attention_multihead: tools/bench_attention_multihead.m $(BUILD_DIR)/myds_gguf.o | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) $< $(BUILD_DIR)/myds_gguf.o $(LDFLAGS) -o $@
+$(BIN_DIR)/bench_attention_multihead_diagnostic: tools/bench_attention_multihead_diagnostic.m | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) $< $(LDFLAGS) -o $@
 $(BIN_DIR)/bench_q4_v41: tools/bench_q4_v41.m $(BUILD_DIR)/myds_gguf.o | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) $< $(BUILD_DIR)/myds_gguf.o $(LDFLAGS) -o $@

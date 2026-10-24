@@ -25,6 +25,10 @@
 #include <arm_neon.h>
 #endif
 
+#ifdef MYDS_OUTA_CAPTURE
+#include "../tools/outa_capture.inc"
+#endif
+
 #define V41_LAYERS 40u
 #define V41_DIM 5120u
 #define V41_HEADS 64u
@@ -4142,6 +4146,11 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
                 myds_metal_barrier_buffer(ctx->attn_heads);
             }
         }
+#ifdef MYDS_OUTA_CAPTURE
+        CHECK(myds_outa_capture_input(ctx->attn_heads, il, pos, need_logits,
+            ordinary_decode_allowed, trace_on, attention_rope_consumed, compressed,
+            base->attn_output_a_type));
+#endif
         CHECK(myds_metal_attn_output_a_bf16(ctx->attn_low,base->attn_output_a,ctx->attn_heads,8,4096,1024,base->attn_output_a_type));
         const bool prestage_engram = engram_prestage_enabled && (il == 0 || il == 13);
         /* 2026-10-21 实验（MYDS_ENGRAM_CPU=1）：engram_kv 的 F16 GEMV 交给 CPU。
@@ -7531,6 +7540,10 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                         if (!myds_metal_buffer_update_sub_view(cw->cur_selected_view, prompt_selected,
                                 (size_t)c_start * sel_bytes, (size_t)c_len * sel_bytes)) goto fail;
                     }
+#ifdef MYDS_ATTENTION_MULTIHEAD_CAPTURE
+                    extern void myds_attention_multihead_capture_set_layer(uint32_t);
+                    myds_attention_multihead_capture_set_layer(il);
+#endif
                     if (!myds_v41_gpu_attention_chunk_bf16(cw->attn_heads_buf, base->attn_sinks, cw->q_buf,
                             cw->kv_act_buf,
                             n_comp ? g->compressed[owner_for(il)] : NULL,

@@ -1221,10 +1221,12 @@ static inline void myds_iq2_v41_signed4_impl(
         }
         y4 += 32 * 32;
     }
+    // Captures are indexed by routed expert slot, while i11 is the shared
+    // one-token input slot and is always zero for all six experts.
     device float *dst_gate_f32 =
-        (device float *)dst_gate + (uint64_t)i12 * 2304 * 6 + (uint64_t)i11 * 2304;
+        (device float *)dst_gate + (uint64_t)i12 * 2304 * 6 + (uint64_t)idx * 2304;
     device float *dst_up_f32 =
-        (device float *)dst_up + (uint64_t)i12 * 2304 * 6 + (uint64_t)i11 * 2304;
+        (device float *)dst_up + (uint64_t)i12 * 2304 * 6 + (uint64_t)idx * 2304;
     const uint64_t pair_row = (uint64_t)i12 * (uint64_t)6 + (uint64_t)idx;
     device float *dst_mid_f32 =
         (device float *)(dst_mid + pair_row * 9216u);
@@ -1397,10 +1399,11 @@ static inline void myds_iq2_v41_shape64_capture_impl(
         }
         y4 += 32 * 32;
     }
+    // Preserve a separate raw gate/up row range for every routed expert.
     device float *dst_gate_f32 =
-        (device float *)dst_gate + (uint64_t)i12 * 2304 * 6 + (uint64_t)i11 * 2304;
+        (device float *)dst_gate + (uint64_t)i12 * 2304 * 6 + (uint64_t)idx * 2304;
     device float *dst_up_f32 =
-        (device float *)dst_up + (uint64_t)i12 * 2304 * 6 + (uint64_t)i11 * 2304;
+        (device float *)dst_up + (uint64_t)i12 * 2304 * 6 + (uint64_t)idx * 2304;
     const uint64_t pair_row = (uint64_t)i12 * (uint64_t)6 + (uint64_t)idx;
     device float *dst_mid_f32 =
         (device float *)(dst_mid + pair_row * 9216u);

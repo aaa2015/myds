@@ -1457,6 +1457,10 @@ struct myds_attn_gather_args {
     uint32_t rows, top_k, n_comp, valid_from, mask_stride, c_start, base_pos, ratio;
 };
 
+#ifdef MYDS_ATTENTION_MULTIHEAD_CAPTURE
+#include "../tools/attention_multihead_capture.inc"
+#endif
+
 /* 进程级开关：默认【开】。MYDS_ATTN_GATHER=0 可关回旧路径。 */
 static int attn_gather_enabled(void) {
     static int cached = -1;
@@ -1625,6 +1629,11 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
     const myds_metal_buffer_t *b[]={q,kv_sel,kv_sel,s->mask_chunk,sinks,s->pad,heads};
     const myds_metal_constant_t c[]={{400,true,1},{401,true,1},{402,true,0},{403,true,0},{404,true,0},
         {405,true,0},{420,false,512},{421,false,512},{422,false,1},{423,false,1}};
+#ifdef MYDS_ATTENTION_MULTIHEAD_CAPTURE
+    if(!mh_capture_prefill(&a,q,kv_sel,s->mask_chunk,sinks,base_pos,c_start,c_len,
+        n_comp,top_k,ratio,use_gather,use_matrix,s->attn_vec_head_first &&
+        !s->attn_vec_head_first_unavailable))return 0;
+#endif
     int matrix_encoded=0;
     if(use_matrix){
         /* Keep a unchanged: an unavailable matrix PSO/32KiB workspace must fall
