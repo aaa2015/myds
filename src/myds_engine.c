@@ -3471,7 +3471,17 @@ static int myds_generate_internal(myds_context_t *ctx,
                     break;
                 }
             }
-            if (anchor_pos >= 4u && anchor_pos < (uint32_t)n_prompt - 1u && anchor_pos <= 1024u &&
+            /* 2026-10-24：锚点上限改为可配置。原写死 1024，而实测主流 agent 远超：
+             *   20,000 字符 → 5,607 tok；60,000 → 18,271；180,000 → 52,249（OpenClaw 实测）
+             * MYDS_ANCHOR_MAX_TOKENS 默认 65536，覆盖主流 agent（含工具定义）。
+             * 注意：能存多深还受分段网格限制（当前 11264），存不下时 store_slot 自己会拒。 */
+            const char *anchor_max_env = getenv("MYDS_ANCHOR_MAX_TOKENS");
+            uint32_t anchor_max = 65536u;
+            if (anchor_max_env && *anchor_max_env) {
+                const long v = atol(anchor_max_env);
+                if (v >= 4 && v <= 1048576) anchor_max = (uint32_t)v;
+            }
+            if (anchor_pos >= 4u && anchor_pos < (uint32_t)n_prompt - 1u && anchor_pos <= anchor_max &&
                 (ctx->anchor_len == 0 || memcmp(prompt_tokens, ctx->anchor_tokens, (size_t)anchor_pos * sizeof(int32_t)) != 0)) {
                 /* 阶段 1：先 prefill 到系统提示词锚点（pos=anchor_pos） */
                 int res0 = myds_prefill_tokens(ctx, prompt_tokens, (int32_t)anchor_pos, cancel_flag);
