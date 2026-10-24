@@ -65,6 +65,8 @@ bool myds_kvdsk_slot_touch(myds_kvdsk_t *k, uint32_t slot);
 /* 读命中数。★ 淘汰要用的判据：命中过 = 这份快照真的在被用，
  * 比「刚写进来的」更值得保留（ds4 的 KV_CACHE_MIN_EFFECTIVE_HITS 是同一个理由）。 */
 bool myds_kvdsk_slot_hits(const myds_kvdsk_t *k, uint32_t slot, uint32_t *hits);
+/* 2026-10-24：该槽的写入时刻（微秒，wall clock）。旧文件为 0。 */
+bool myds_kvdsk_slot_written_us(const myds_kvdsk_t *k, uint32_t slot, uint64_t *written_us);
 /* 置空某槽（写之前必须先调；发现坏数据时也用它作废）。 */
 bool myds_kvdsk_slot_clear(myds_kvdsk_t *k, uint32_t slot);
 /* 当前非空条目数（诊断用）。 */

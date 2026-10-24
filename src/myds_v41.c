@@ -1533,9 +1533,20 @@ static uint32_t lowkv_pick_end_entry(myds_v41_context_t *g, uint32_t p, uint64_t
     if (already_here) *already_here = false;
     if (!g || !g->low_ends || total_bytes > V41_LOWKV_END_STRIDE) return V41_LOWKV_NO_ENTRY;
 
+    /* 2026-10-24：淘汰策略从 LFU 改为 FIFO（丢最老的）。
+     *
+     * 原实现比较 hits（命中数），取最小者淘汰。这有个致命顺序问题：
+     * 新写入的条目 hits 初始为 0，而它还没被用过；下一套新组合进来时，
+     * 它是全场最小的 ⇒ 立刻把自己上一套挤掉。连写 N 套，前 N-1 套全丢。
+     * 更糟的是 hits 只增不减，三周前的热门条目（hits 很大）永不淘汰，
+     * 昨天的（hits=0）优先阵亡。
+     *
+     * FIFO 没有这个问题：按写入时刻排队，写满后丢最早的那条。
+     * 旧文件里写的时刻为 0（该字段是本次新增）⇒ 视为最老，先被淘汰，正好。
+     * 单人使用、条目数远小于 32，命中率不是这条策略的优化目标。 */
     uint32_t empty_slot = V41_LOWKV_NO_ENTRY;
-    uint32_t victim_slot = 0;
-    uint32_t min_hits = UINT32_MAX;
+    uint32_t victim_slot = V41_LOWKV_NO_ENTRY;
+    uint64_t oldest_us = UINT64_MAX;
 
     for (uint32_t s = 0; s < V41_LOWKV_ENDS_MAX; ++s) {
         uint32_t pos = 0; uint64_t h = 0, used = 0;
@@ -1544,10 +1555,10 @@ static uint32_t lowkv_pick_end_entry(myds_v41_context_t *g, uint32_t p, uint64_t
                 if (already_here) *already_here = true;
                 return s;
             }
-            uint32_t hits = 0;
-            (void)myds_kvdsk_slot_hits(g->low_ends, s, &hits);
-            if (hits < min_hits) {
-                min_hits = hits;
+            uint64_t written = 0;
+            (void)myds_kvdsk_slot_written_us(g->low_ends, s, &written);
+            if (written < oldest_us) {
+                oldest_us = written;
                 victim_slot = s;
             }
         } else {
@@ -2077,7 +2088,7 @@ bool myds_v41_low_kv_enable(myds_v41_context_t *g, const char *dir) {
                (double)stride / 1048576.0,
                (unsigned)MYDS_SNAP_MIN, (unsigned)deepest, path);
     MYDS_LOG_I("kvdisk: 同一位置可容纳 %u 套不同的「system + tools」—— 它们的哈希不同，"
-               "互不顶替；只有全部占满才按命中数淘汰", (unsigned)ways);
+               "互不顶替；只有全部占满才淘汰最老的一条（FIFO）", (unsigned)ways);
     return true;
 }
 

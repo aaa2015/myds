@@ -23,6 +23,7 @@
  * 万一 payload 与条目落盘不一致，读时的 CRC 会把这条作废 —— 两道都要。
  */
 #include "myds_kvdsk.h"
+#include <time.h>
 #include "myds_log.h"
 
 #include <errno.h>
@@ -176,6 +177,16 @@ static int entry_write_body(const myds_kvdsk_t *k, uint32_t slot, uint32_t hits,
     put_u64(e + 16, used_bytes);
     put_u32(e + 24, state);
     put_u64(e + 32, crc);          /* u64：校验和随 payload 规模一起长大 */
+    /* 2026-10-24：写入时刻（u64 微秒，offset 40，原空闲区）。
+     * 仅用于 FIFO 淘汰：槽满时丢最老的一条，而不是「命中数最少」的那条。
+     * 用的是 wall clock —— 它不带单调保证，但只用于相对排序，够用。 */
+    {
+        struct timespec ts;
+        uint64_t now_us = 0;
+        if (clock_gettime(CLOCK_REALTIME, &ts) == 0)
+            now_us = (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+        put_u64(e + 40, now_us);
+    }
     return write_at(k->fd, e, KVDSK_ENTRY_BYTES, entry_offset(slot));
 }
 
@@ -225,6 +236,16 @@ bool myds_kvdsk_slot_touch(myds_kvdsk_t *k, uint32_t slot) {
     unsigned char hits[4];
     put_u32(hits, get_u32(e + 4) + 1u);
     return write_at(k->fd, hits, 4, entry_offset(slot) + 4u) ? true : false;
+}
+
+/* 2026-10-24：读取该槽的写入时刻（微秒）。旧文件里是 0 ⇒ 视为最老。 */
+bool myds_kvdsk_slot_written_us(const myds_kvdsk_t *k, uint32_t slot, uint64_t *written_us) {
+    if (!k || slot >= k->slots || !written_us) return false;
+    unsigned char e[KVDSK_ENTRY_BYTES];
+    if (!entry_read(k, slot, e)) return false;
+    if (get_u32(e + 0) == 0u) return false;
+    *written_us = get_u64(e + 40);
+    return true;
 }
 
 bool myds_kvdsk_slot_hits(const myds_kvdsk_t *k, uint32_t slot, uint32_t *hits) {
