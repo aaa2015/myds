@@ -364,7 +364,7 @@ make bench
 支持的标准端点：
 - `GET /health`：服务健康检查
 - `GET /v1/models`：获取已加载的模型列表
-- `POST /v1/responses` 或 `/responses`：原生支持 OpenAI Responses API 格式（`mycode` 客户端默认协议），完整支持流式 SSE (`event: response.output_text.delta`, `response.completed` 等) 与非流式 JSON (`output` 消息数组)
+- `POST /v1/responses` 或 `/responses`：原生支持 OpenAI Responses API 格式，完整支持流式 SSE (`event: response.output_text.delta`, `response.completed` 等) 与非流式 JSON (`output` 消息数组)
 - `POST /v1/chat/completions` 或 `/chat/completions`：支持标准 OpenAI Chat Completions 协议（流式 SSE 与非流式 JSON）
 - 请求体参数兼容性：全面支持 `instructions`（系统指令）、`input`（消息数组或纯文本，自动展开 `input_text` 复杂结构）、`messages`、`max_output_tokens` / `max_tokens`、`temperature` 与 `top_p`
 
