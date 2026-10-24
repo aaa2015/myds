@@ -37,6 +37,9 @@ static int is_comment_or_blank(const char *line) {
 }
 
 int myds_configfile_load(const char *path, bool override_env) {
+    /* override_env 自 2026-10-24 起被忽略：配置文件永远优先。
+     * 保留参数只为不改动头文件签名。 */
+    (void)override_env;
     if (!path || !*path) return -1;
     FILE *f = fopen(path, "r");
     if (!f) {
@@ -46,7 +49,7 @@ int myds_configfile_load(const char *path, bool override_env) {
     }
 
     char line[CF_MAX_LINE];
-    int set = 0, skipped_env = 0, skipped_bad = 0, overrode = 0;
+    int set = 0, skipped_env = 0, skipped_bad = 0;
 
     while (fgets(line, sizeof(line), f)) {
         if (is_comment_or_blank(line)) continue;
@@ -72,24 +75,19 @@ int myds_configfile_load(const char *path, bool override_env) {
         if (strncmp(key, "MYDS_", 5) != 0) { skipped_env++; continue; }
         if (!*key) { skipped_bad++; continue; }
 
-        const char *cur = getenv(key);
-        if (cur && !override_env) {
-            /* 环境变量优先。这不是错误，但值得记数——调用方会打印出来，
-             * 让人一眼看到「配置文件里有这条，但被环境变量盖住了」。 */
-            overrode++;
-            continue;
-        }
+        /* 2026-10-24：不再读取环境变量、也不再为「覆盖」报警。
+         *
+         * 配置文件是 MYDS_* 的唯一来源：读到什么就写什么，无条件 setenv。
+         * 进程启动时的环境变量里即使有同名项，也会被这里直接覆盖，且不产生任何日志 ——
+         * 因为按现在的设计那不算「冲突」，只是配置生效。
+         *
+         * （setenv 仍是必需的：引擎各处通过 getenv 取值，配置文件只是把值灌进去。） */
         if (setenv(key, val, 1) != 0) { skipped_bad++; continue; }
         set++;
     }
     fclose(f);
 
-    MYDS_LOG_I("config: 已加载 %s —— 生效 %d 条%s%s",
-               path, set,
-               overrode ? "，" : "",
-               overrode ? "（另有若干条被环境变量覆盖）" : "");
-    if (overrode)
-        MYDS_LOG_I("config: 其中 %d 条因环境变量已存在而跳过（环境变量优先）", overrode);
+    MYDS_LOG_I("config: 已加载 %s —— 生效 %d 条", path, set);
     if (skipped_env)
         MYDS_LOG_W("config: 跳过 %d 条非 MYDS_ 前缀的键（只允许 MYDS_*）", skipped_env);
     if (skipped_bad)
@@ -149,39 +147,3 @@ int myds_configfile_count(const char *path) {
     return n;
 }
 
-int myds_configfile_diff(const char *path) {
-    FILE *f = fopen(path, "r");
-    if (!f) return -1;
-    char line[CF_MAX_LINE];
-    int diff = 0, same = 0, missing = 0;
-
-    while (fgets(line, sizeof(line), f)) {
-        if (is_comment_or_blank(line)) continue;
-        rstrip(line, strlen(line));
-        char *eq = strchr(line, '=');
-        if (!eq) continue;
-        *eq = '\0';
-        char *key = line;
-        while (*key == ' ' || *key == '\t') ++key;
-        char *val = eq + 1;
-        while (*val == ' ' || *val == '\t') ++val;
-        strip_trailing_comment(val);
-
-        const char *cur = getenv(key);
-        if (!cur) {
-            /* 配置文件里有、进程里没有：它是被命令行参数等其它途径决定的，
-             * 或该变量根本没被任何 getenv 读取（视为无效配置）。 */
-            MYDS_LOG_W("config-diff: %s 在配置里但未生效（值=%s）", key, val);
-            missing++;
-        } else if (strcmp(cur, val) != 0) {
-            MYDS_LOG_W("config-diff: %s 实际=%s 配置=%s", key, cur, val);
-            diff++;
-        } else {
-            same++;
-        }
-    }
-    fclose(f);
-
-    MYDS_LOG_I("config-diff: 一致 %d / 不同 %d / 未生效 %d", same, diff, missing);
-    return diff + missing;
-}

@@ -98,8 +98,13 @@ static int load_config_early(int argc, char *argv[]) {
     }
     if (!path) return 0;   /* 没有配置文件不是错误 */
 
-    /* 配置文件不覆盖已存在的环境变量：保住"临时覆盖一次"的能力 */
-    return myds_configfile_load(path, false);
+    /* 2026-10-24：配置文件优先。
+     *
+     * 原设计允许环境变量盖住配置（"临时覆盖一次"），实测里这会造成两个真相源：
+     * 同一个开关在不同地方看到不同的值，排查时先要确认谁生效。
+     * 现在配置文件是唯一来源；环境变量里的 MYDS_* 会被配置值覆盖。
+     * 唯一例外是 MYDS_CONFIG 本身（它在上方已读过，只用于定位本文件）。 */
+    return myds_configfile_load(path, true);
 }
 
 int main(int argc, char *argv[]) {
@@ -111,9 +116,6 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--dump-config") == 0) {
             const int n = myds_configfile_dump_env(argv[i + 1]);
             return n >= 0 ? 0 : 1;
-        }
-        if (strcmp(argv[i], "--check-config") == 0) {
-            return myds_configfile_diff(argv[i + 1]) >= 0 ? 0 : 1;
         }
     }
     (void)cfg_n;

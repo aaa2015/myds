@@ -42,7 +42,6 @@ int myds_configfile_dump_env(const char *path);
 
 /* 比对：配置文件中、与实际环境变量不同的项。
  * 只报告，不修改。返回差异条数；<0 表示打不开。 */
-int myds_configfile_diff(const char *path);
 
 /* 配置文件里 KEY 的个数（不含注释）。<0 = 打不开。 */
 int myds_configfile_count(const char *path);
