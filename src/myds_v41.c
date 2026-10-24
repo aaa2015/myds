@@ -7004,6 +7004,10 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
      * 的 GPU 时间。prof_wait_ffn_router 测的是「Attention+FFN+Shared+Routing 全部」，
      * 不能用来算 shared expert 的效率。需 MYDS_PROFILE_PREFILL=1 且 MYDS_PROFILE_SHARED=1。 */
     double prof_wait_shared = 0, prof_wait_pre_shared = 0;
+    /* 2026-10-24：把 pre-shared flush 切成 Step5(AttnOutB) / Step6(HC FFN In) 两段。
+     * MYDS_PROFILE_STEP56=1 + MYDS_PROFILE_SHARED=1。 */
+    double prof_wait_step5 = 0, prof_wait_step6 = 0;
+    const bool opt_prof_step56 = getenv("MYDS_PROFILE_STEP56") != NULL;
     const bool opt_prof_shared = getenv("MYDS_PROFILE_SHARED") != NULL;
     opt_prof_attn_sub = getenv("MYDS_PROFILE_ATTN_SUB") != NULL;
     /* 诊断：把「Wait MoE」这个窗口拆开 —— 它实际包含 Step5..8 全部（attn_out 投影、
@@ -7638,6 +7642,12 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 phase = "batched attention output b";
                 CHECK(project_batch(cw->attn_out_buf, base->attn_output_b, cw->attn_low_buf, V41_DIM, 8192, c_len, base->attn_output_b_type, true));
                 TIME_ACC(prof_step5);
+                  if (do_prof && opt_prof_step56) {
+                      TIME_START();
+                      CHECK(myds_metal_commit_batch());
+                      TIME_ACC(prof_wait_step5);
+                      CHECK(myds_metal_begin_batch());
+                  }
                 if (do_prof && opt_prof_moe) {
                     TIME_START();
                     CHECK(myds_metal_commit_batch());
@@ -7715,6 +7725,12 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     }
                 }
                 TIME_ACC(prof_step6);
+                  if (do_prof && opt_prof_step56) {
+                      TIME_START();
+                      CHECK(myds_metal_commit_batch());
+                      TIME_ACC(prof_wait_step6);
+                      CHECK(myds_metal_begin_batch());
+                  }
 
                   if (do_prof && opt_prof_shared) {
                       TIME_START();
@@ -8136,6 +8152,10 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         if (opt_prof_shared) {
             printf("  shared-expert GEMM   : %8.2f ms  (router+gate+up+down+swiglu)\n", prof_wait_shared);
             printf("  pre-shared flush     : %8.2f ms\n", prof_wait_pre_shared);
+            if (opt_prof_step56) {
+                printf("    of which Step5 AttnOutB: %8.2f ms\n", prof_wait_step5);
+                printf("    of which Step6 HC FFN In: %8.2f ms\n", prof_wait_step6);
+            }
         }
         printf("Wait FFN+R (GPU)      : %8.2f ms\n", prof_wait_ffn_router);
         printf("Step 8 (MoE dispatch) : %8.2f ms\n", prof_step8);
