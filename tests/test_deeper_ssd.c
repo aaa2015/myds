@@ -395,18 +395,25 @@ static void test_deeper_prompt_end_eviction(const char *path) {
     assert(ends);
 
     int32_t *tokens = deeper_tokens();
-    /* Fill all 32 end slots with different positions 2101, 2103, ..., 2163 */
-    for (uint32_t i = 0; i < 32u; ++i) {
+    /* 2026-10-24：槽数现在由 MYDS_PROMPT_CACHE_SLOTS 决定（默认 64），
+     * 不能再写死 32。这里直接从 store 读真实槽数，填满后再写一条触发淘汰。
+     * ★ 淘汰策略同时从 LFU 改成 FIFO：victim 是【最早写入】的那条。
+     *   下面按「先写满、再只读不写」的方式构造 ⇒ 两条策略选中的都是槽 0，
+     *   但断言的依据是 FIFO（读不会让条目变新）。 */
+    const uint32_t nslots = myds_kvdsk_slot_count(ends);
+    assert(nslots >= 2u);
+    for (uint32_t i = 0; i < nslots; ++i) {
         const uint32_t p = 2101u + i * 2u;
         assert(myds_v41_snapshot_store_now(g, p));
         assert(myds_v41_low_kv_save(g, tokens, p + 1u));
         uint32_t meta_p = 0;
         assert(myds_kvdsk_slot_meta(ends, i, &meta_p, NULL, NULL) && meta_p == p);
     }
-    assert(myds_kvdsk_live_entries(ends) == 32u);
+    assert(myds_kvdsk_live_entries(ends) == nslots);
 
-    /* Touch slots 1..31 so they have hits >= 1, leave slot 0 with 0 hits */
-    for (uint32_t i = 1; i < 32u; ++i) {
+    /* 读一遍部分条目：命中计数上升，但 FIFO 下它们【不会】因此变新。
+     * 只读前 32 条 —— 更深的 p 依赖 fixture 的基础段布局，不在本用例的验证范围。 */
+    for (uint32_t i = 1; i < nslots && i < 32u; ++i) {
         const uint32_t p = 2101u + i * 2u;
         assert(myds_v41_low_kv_load_deeper(g, tokens, 1024, p) == p);
         uint32_t hits = 0;
@@ -415,20 +422,39 @@ static void test_deeper_prompt_end_eviction(const char *path) {
     uint32_t hits0 = 0;
     assert(myds_kvdsk_slot_hits(ends, 0, &hits0) && hits0 == 0);
 
-    /* Save a 33rd prompt end at p = 2165.
-     * Slot 0 has 0 hits, so slot 0 MUST be the victim. */
-    const uint32_t p33 = 2101u + 32u * 2u;
+    /* 再写一条：槽满 ⇒ 淘汰【最早写入】的槽 0（不是「命中最少」——
+     * 若按 LFU 也会选中槽 0，所以这里额外验证「读不会改变先后」下一条用例）。 */
+    const uint32_t p33 = 2101u + nslots * 2u;
     assert(myds_v41_snapshot_store_now(g, p33));
     assert(myds_v41_low_kv_save(g, tokens, p33 + 1u));
 
-    /* Verify slot 0 is now p33 (2165) */
     uint32_t meta_p0 = 0;
     assert(myds_kvdsk_slot_meta(ends, 0, &meta_p0, NULL, NULL) && meta_p0 == p33);
 
-    /* Verify slots 1..31 still retain their original positions */
-    for (uint32_t i = 1; i < 32u; ++i) {
+    /* 其余条目保持原位 */
+    for (uint32_t i = 1; i < nslots; ++i) {
         uint32_t meta_pi = 0;
         assert(myds_kvdsk_slot_meta(ends, i, &meta_pi, NULL, NULL) && meta_pi == 2101u + i * 2u);
+    }
+
+    /* ★ FIFO 与 LFU 的分界断言。
+     * 若按 LFU（旧实现）：槽 0 的 hits 恒为 0 ⇒ 后面每次淘汰都砸槽 0。
+     * 若按 FIFO（现实现）：槽 0 刚写过、最新 ⇒ 永远不该被动。
+     *
+     * 注意：同一位置 + 同一 hash 的保存是 no-op（"内容没变不重写"），
+     * 所以要让某槽"变新"必须写【新位置】。 */
+    {
+        const uint32_t p_re = p33 + 2u;      /* 写进最老的槽 1 */
+        assert(myds_v41_snapshot_store_now(g, p_re));
+        assert(myds_v41_low_kv_save(g, tokens, p_re + 1u));
+        const uint32_t p_next = p33 + 4u;    /* 再写一条：应淘汰最老的槽 2 */
+        assert(myds_v41_snapshot_store_now(g, p_next));
+        assert(myds_v41_low_kv_save(g, tokens, p_next + 1u));
+
+        uint32_t mp0 = 0, mp1 = 0, mp2 = 0;
+        assert(myds_kvdsk_slot_meta(ends, 0, &mp0, NULL, NULL) && mp0 == p33);      /* 未被 LFU 砸掉 */
+        assert(myds_kvdsk_slot_meta(ends, 1, &mp1, NULL, NULL) && mp1 == p_re);
+        assert(myds_kvdsk_slot_meta(ends, 2, &mp2, NULL, NULL) && mp2 == p_next);
     }
 
     myds_v41_context_free(g);

@@ -60,6 +60,14 @@ struct myds_kvdsk {
     int      writing;
     uint32_t write_slot;
     uint64_t write_crc;
+    /* 2026-10-24：写入先后（FIFO 淘汰用）。**只在内存里**，不落盘。
+     * ★ 为什么不能落盘：异步写盘的完成顺序不确定 ⇒ 落盘的时刻/序号会随调度变化，
+     *   而 test_p2_lowkv_async_bit_identical 要求「同样的操作两次跑出逐字节相同的文件」。
+     *   做法：打开时按槽序给现存条目发从小到大的年龄，之后每次写入取更大值 ⇒
+     *   「本进程新写的」永远比「打开时已有的」年轻，跨重启也成立；
+     *   而同一次运行的写入顺序不影响文件字节（offset 40 恒为 0）。 */
+    uint64_t  next_age;
+    uint64_t *slot_age;   /* 每槽年龄；0 = 空槽 */
 };
 
 static char g_open_error[512];
@@ -168,7 +176,7 @@ static int entry_read(const myds_kvdsk_t *k, uint32_t slot, unsigned char out[KV
 /* 只写「提交点」之外的部分（position 留在最后单独写）。 */
 static int entry_write_body(const myds_kvdsk_t *k, uint32_t slot, uint32_t hits,
                             uint64_t prefix_hash, uint64_t used_bytes,
-                            uint64_t crc, uint32_t state) {
+                            uint64_t crc, uint32_t state, uint64_t next_seq) {
     unsigned char e[KVDSK_ENTRY_BYTES];
     memset(e, 0, sizeof(e));
     put_u32(e + 0, 0u);                 /* position：body 阶段一律 0 */
@@ -177,16 +185,9 @@ static int entry_write_body(const myds_kvdsk_t *k, uint32_t slot, uint32_t hits,
     put_u64(e + 16, used_bytes);
     put_u32(e + 24, state);
     put_u64(e + 32, crc);          /* u64：校验和随 payload 规模一起长大 */
-    /* 2026-10-24：写入时刻（u64 微秒，offset 40，原空闲区）。
-     * 仅用于 FIFO 淘汰：槽满时丢最老的一条，而不是「命中数最少」的那条。
-     * 用的是 wall clock —— 它不带单调保证，但只用于相对排序，够用。 */
-    {
-        struct timespec ts;
-        uint64_t now_us = 0;
-        if (clock_gettime(CLOCK_REALTIME, &ts) == 0)
-            now_us = (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
-        put_u64(e + 40, now_us);
-    }
+    /* offset 40 的写入先后 **不落盘**（见 struct 里的理由），恒为 0；
+     * FIFO 顺序只存在内存的 slot_age[] 里。 */
+    put_u64(e + 40, 0ull);
     return write_at(k->fd, e, KVDSK_ENTRY_BYTES, entry_offset(slot));
 }
 
@@ -198,7 +199,8 @@ static int entry_write_position(const myds_kvdsk_t *k, uint32_t slot, uint32_t p
 
 bool myds_kvdsk_slot_clear(myds_kvdsk_t *k, uint32_t slot) {
     if (!k || slot >= k->slots) return false;
-    if (!entry_write_body(k, slot, 0u, 0u, 0u, 0u, KVDSK_STATE_EMPTY)) return false;
+    if (!entry_write_body(k, slot, 0u, 0u, 0u, 0u, KVDSK_STATE_EMPTY, 0u)) return false;
+    if (k->slot_age && slot < k->slots) k->slot_age[slot] = 0u;
     return entry_write_position(k, slot, 0u) ? true : false;
 }
 
@@ -243,13 +245,14 @@ bool myds_kvdsk_slot_touch(myds_kvdsk_t *k, uint32_t slot) {
     return write_at(k->fd, hits, 4, entry_offset(slot) + 4u) ? true : false;
 }
 
-/* 2026-10-24：读取该槽的写入时刻（微秒）。旧文件里是 0 ⇒ 视为最老。 */
+/* 2026-10-24：该槽的写入先后（越大越新）。**内存态**，不读文件：
+ *   · 打开时已有的条目按槽序获得较小值（彼此之间以槽序为准，可复现）
+ *   · 本进程写入的条目获得更大值 ⇒ 永远不会被当成「最老」先淘汰
+ * 空槽返回 false。名字保留 written_us 以兼容既有调用点与单测。 */
 bool myds_kvdsk_slot_written_us(const myds_kvdsk_t *k, uint32_t slot, uint64_t *written_us) {
-    if (!k || slot >= k->slots || !written_us) return false;
-    unsigned char e[KVDSK_ENTRY_BYTES];
-    if (!entry_read(k, slot, e)) return false;
-    if (get_u32(e + 0) == 0u) return false;
-    *written_us = get_u64(e + 40);
+    if (!k || slot >= k->slots || !written_us || !k->slot_age) return false;
+    if (k->slot_age[slot] == 0u) return false;
+    *written_us = k->slot_age[slot];
     return true;
 }
 
@@ -362,7 +365,9 @@ bool myds_kvdsk_write_finish(myds_kvdsk_t *k, uint32_t slot, uint32_t position,
     k->writing = 0;
     if (position == 0u || used_bytes == 0u || used_bytes > k->slot_stride) return false;
     const uint64_t crc = k->write_crc;
-    if (!entry_write_body(k, slot, 0u, prefix_hash, used_bytes, crc, KVDSK_STATE_VALID)) return false;
+    if (!entry_write_body(k, slot, 0u, prefix_hash, used_bytes, crc, KVDSK_STATE_VALID, 0u))
+        return false;
+    if (k->slot_age && slot < k->slots) k->slot_age[slot] = ++k->next_age;
     return entry_write_position(k, slot, position) ? true : false;
 }
 
@@ -475,11 +480,25 @@ myds_kvdsk_t *myds_kvdsk_open(const char *path, uint64_t identity,
         MYDS_LOG_I("kvdisk: %s 复用（identity %016llx，%u 槽，%u 条有效）",
                    path, (unsigned long long)identity, slots, myds_kvdsk_live_entries(k));
     }
+    /* 2026-10-24：按槽序给打开时已有的条目发年龄（0 = 空槽）。
+     * 槽序而非写入顺序 ⇒ 同一份文件每次打开得到相同的年龄分布，行为可复现。 */
+    k->slot_age = (uint64_t *)calloc(slots, sizeof(uint64_t));
+    if (!k->slot_age) {
+        snprintf(g_open_error, sizeof(g_open_error), "年龄表分配失败 [%s]", path);
+        close(k->fd); free(k); return NULL;
+    }
+    for (uint32_t sl = 0; sl < slots; ++sl) {
+        unsigned char e[KVDSK_ENTRY_BYTES];
+        if (!entry_read(k, sl, e)) continue;
+        if (get_u32(e + 0) == 0u) continue;      /* 空槽 */
+        k->slot_age[sl] = ++k->next_age;
+    }
     return k;
 }
 
 void myds_kvdsk_close(myds_kvdsk_t *k) {
     if (!k) return;
     if (k->fd >= 0) close(k->fd);
+    free(k->slot_age);
     free(k);
 }

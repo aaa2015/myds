@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -230,6 +231,25 @@ static void test_p1_metal_fused_add_fallback(void) {
     printf("  [PASS] P1-1: Metal fused add BF16 and GPU fallback chain are bit-exact identical (memcmp == 0)\n");
 }
 
+/* 2026-10-24：原先逐个 unlink 预期文件名。kvdisk 拆出 kvanchor store 后
+ * 该清单就漏了 —— 断言直接 abort。改为清空目录：以后再加文件也不会破。
+ * 返回 0 = 目录已删掉。 */
+static int remove_tree(const char *dir) {
+    DIR *d = opendir(dir);
+    if (!d) return -1;
+    struct dirent *e;
+    int rc = 0;
+    while ((e = readdir(d)) != NULL) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        char p[1400];
+        snprintf(p, sizeof(p), "%s/%s", dir, e->d_name);
+        if (unlink(p) != 0) { rc = -1; }
+    }
+    closedir(d);
+    if (rc == 0 && rmdir(dir) != 0) rc = -1;
+    return rc;
+}
+
 static void test_p1_unmapped_engram_identity(void) {
     char path[] = "/tmp/test_myds_engram_unmapped_XXXXXX";
     int fd = mkstemp(path);
@@ -312,14 +332,7 @@ static void test_p1_unmapped_engram_identity(void) {
     myds_v41_context_free(ctx);
 
     /* Clean up temporary test files */
-    char bin_path[1200];
-    snprintf(bin_path, sizeof(bin_path), "%s/kvlow-v3-%016llx.bin", tmp_kvdsk_dir, (unsigned long long)id_mut);
-    assert(unlink(bin_path) == 0);
-    snprintf(bin_path, sizeof(bin_path), "%s/kvsegments-v1-%016llx.bin", tmp_kvdsk_dir, (unsigned long long)id_mut);
-    assert(unlink(bin_path) == 0);
-    snprintf(bin_path, sizeof(bin_path), "%s/kvends-v1-%016llx.bin", tmp_kvdsk_dir, (unsigned long long)id_mut);
-    assert(unlink(bin_path) == 0);
-    assert(rmdir(tmp_kvdsk_dir) == 0);
+    assert(remove_tree(tmp_kvdsk_dir) == 0);
 
     close(fd);
     unlink(path);
@@ -1245,35 +1258,46 @@ static void test_p1_snapshot_overwrite_failure(void) {
 static void test_p1_macroblock_prefill_invariants(void) {
     /* 1. Test macroblock size environment resolution & clamping */
     unsetenv("MYDS_PREFILL_MACROBLOCK_SIZE");
-    assert(myds_v41_resolve_macroblock_size() == 8192u);
+    assert(myds_v41_resolve_macroblock_size(8192u) == 8192u);
+
+    /* 2026-10-24：env 未设时块大小按本次 prefill 的 token 数自适应
+     * （k = ceil(n / 106496)，再把 n 均分给 k 块，最后向上取 512 的倍数）。
+     * 这三条锁定实测值：54003 → 54272 与生产日志一致。 */
+    assert(myds_v41_resolve_macroblock_size(54003u) == 54272u);
+    assert(myds_v41_resolve_macroblock_size(150000u) == 75264u);
+    assert(myds_v41_resolve_macroblock_size(0u) == 512u);  /* n=0 走最小块，不得除零 */
 
     setenv("MYDS_PREFILL_MACROBLOCK_SIZE", "200", 1);
-    assert(myds_v41_resolve_macroblock_size() == 512u); /* clamp min */
+    assert(myds_v41_resolve_macroblock_size(8192u) == 512u); /* clamp min */
 
     setenv("MYDS_PREFILL_MACROBLOCK_SIZE", "1000", 1);
-    assert(myds_v41_resolve_macroblock_size() == 1024u); /* round up to multiple of 512 */
+    assert(myds_v41_resolve_macroblock_size(8192u) == 1024u); /* round up to multiple of 512 */
 
     setenv("MYDS_PREFILL_MACROBLOCK_SIZE", "2048", 1);
-    assert(myds_v41_resolve_macroblock_size() == 2048u);
+    assert(myds_v41_resolve_macroblock_size(8192u) == 2048u);
 
+    /* 2026-10-24：硬上限已从 16384 提到 131072（MYDS_MACROBLOCK_HARD_MAX），
+     * 32768 现在被如实接受；真正的夹取发生在 131072。 */
     setenv("MYDS_PREFILL_MACROBLOCK_SIZE", "32768", 1);
-    assert(myds_v41_resolve_macroblock_size() == 16384u); /* clamp max */
+    assert(myds_v41_resolve_macroblock_size(8192u) == 32768u);
+    setenv("MYDS_PREFILL_MACROBLOCK_SIZE", "200000", 1);
+    assert(myds_v41_resolve_macroblock_size(8192u) == 131072u); /* clamp max */
 
     /* Negative, zero, and malformed inputs must safely fall back to default without integer underflow */
     setenv("MYDS_PREFILL_MACROBLOCK_SIZE", "-1", 1);
-    assert(myds_v41_resolve_macroblock_size() == 8192u);
+    assert(myds_v41_resolve_macroblock_size(8192u) == 8192u);
 
     setenv("MYDS_PREFILL_MACROBLOCK_SIZE", "-100", 1);
-    assert(myds_v41_resolve_macroblock_size() == 8192u);
+    assert(myds_v41_resolve_macroblock_size(8192u) == 8192u);
 
     setenv("MYDS_PREFILL_MACROBLOCK_SIZE", "0", 1);
-    assert(myds_v41_resolve_macroblock_size() == 8192u);
+    assert(myds_v41_resolve_macroblock_size(8192u) == 8192u);
 
     setenv("MYDS_PREFILL_MACROBLOCK_SIZE", "invalid", 1);
-    assert(myds_v41_resolve_macroblock_size() == 8192u);
+    assert(myds_v41_resolve_macroblock_size(8192u) == 8192u);
 
     unsetenv("MYDS_PREFILL_MACROBLOCK_SIZE");
-    assert(myds_v41_resolve_macroblock_size() == 8192u);
+    assert(myds_v41_resolve_macroblock_size(8192u) == 8192u);
 
     /* 2. Test carry staging across macroblock boundaries */
     if (!myds_metal_init(NULL)) {
@@ -1530,29 +1554,47 @@ static void test_lowkv_combined_budget(void) {
     const uint64_t snapshot_stride = 64u + sizeof(myds_engram_history_t) +
         40u * 128u * 512u * sizeof(float) + MYDS_SNAP_PINNED * 32u;
     const uint64_t segment_stride = lk_expected_segment_bytes(0, MYDS_SNAP_MIN);
-    const uint64_t end_entries = 32u;
-    const uint64_t end_stride = 14680064ull;
+    /* 2026-10-24：ends / anchor 的槽数与每槽容量已参数化，不能再写死
+     * （原来写死 32 槽 × 14 MiB）。直接问运行时，测试就不会再随参数漂移。
+     * anchor 是独立文件，也同样计入预算。 */
+    const uint64_t end_entries = (uint64_t)myds_v41_prompt_cache_slots();
+    const uint64_t end_stride = myds_v41_end_stride_for(myds_v41_prompt_cache_max_tokens());
     const uint64_t end_base = (4096u + end_entries * 64u + 4095u) / 4096u * 4096u;
     const uint64_t end_file_bytes = end_base + end_entries * end_stride;
-    const uint64_t total = 2u * base + entries * (snapshot_stride + segment_stride) + end_file_bytes;
+    const uint64_t an_entries = (uint64_t)myds_v41_anchor_slots();
+    const uint64_t an_stride = myds_v41_end_stride_for(myds_v41_anchor_max_tokens());
+    const uint64_t an_base = (4096u + an_entries * 64u + 4095u) / 4096u * 4096u;
+    const uint64_t an_file_bytes = an_base + an_entries * an_stride;
+    const uint64_t total = 2u * base + entries * (snapshot_stride + segment_stride) +
+                           end_file_bytes + an_file_bytes;
     char mb[32]; snprintf(mb, sizeof(mb), "%llu", (unsigned long long)(total >> 20));
     setenv("MYDS_KV_DSK_WAYS", "1", 1); setenv("MYDS_KV_DSK_BUDGET_MB", mb, 1);
     myds_v41_context_t *g = myds_v41_context_create_for_model(&model); assert(g);
     assert(!myds_v41_low_kv_enable(g, dir));
     assert(!myds_v41_low_kv_enabled(g));
-    assert(access(snapshots, F_OK) == -1 && access(segments, F_OK) == -1 && access(ends, F_OK) == -1);
+    /* anchor store 的文件名用 ends 的【派生 identity】（不是模型 identity）——
+     * 与 kvends-v1-*.bin 的后缀因此不同，见 lowkv_open_stores。 */
+    char anchor_path[512];
+    const uint64_t anchor_file_id = myds_kvdsk_identity("v41-lowkv-ends-v1", &identity, 1);
+    snprintf(anchor_path, sizeof(anchor_path), "%s/kvanchor-v1-%016llx.bin", dir,
+             (unsigned long long)(anchor_file_id ? anchor_file_id : identity));
+    assert(access(snapshots, F_OK) == -1 && access(segments, F_OK) == -1 &&
+           access(ends, F_OK) == -1 && access(anchor_path, F_OK) == -1);
     /* Budget rejection must leave the same context able to open both stores. */
     snprintf(mb, sizeof(mb), "%llu", (unsigned long long)((total + (1u << 20) - 1u) >> 20));
     setenv("MYDS_KV_DSK_BUDGET_MB", mb, 1);
     assert(myds_v41_low_kv_enable(g, dir));
-    struct stat snap_stat, seg_stat, end_stat;
-    assert(stat(snapshots, &snap_stat) == 0 && stat(segments, &seg_stat) == 0 && stat(ends, &end_stat) == 0);
+    struct stat snap_stat, seg_stat, end_stat, an_stat;
+    assert(stat(snapshots, &snap_stat) == 0 && stat(segments, &seg_stat) == 0 &&
+           stat(ends, &end_stat) == 0 && stat(anchor_path, &an_stat) == 0);
     assert((uint64_t)snap_stat.st_size == base + entries * snapshot_stride);
     assert((uint64_t)seg_stat.st_size == base + entries * segment_stride);
     assert((uint64_t)end_stat.st_size == end_file_bytes);
-    assert((uint64_t)snap_stat.st_size + (uint64_t)seg_stat.st_size + (uint64_t)end_stat.st_size == total);
+    assert((uint64_t)an_stat.st_size == an_file_bytes);
+    assert((uint64_t)snap_stat.st_size + (uint64_t)seg_stat.st_size +
+           (uint64_t)end_stat.st_size + (uint64_t)an_stat.st_size == total);
     myds_v41_context_free(g);
-    assert(unlink(snapshots) == 0 && unlink(segments) == 0 && unlink(ends) == 0 && rmdir(dir) == 0);
+    assert(remove_tree(dir) == 0);
     unsetenv("MYDS_KV_DSK_WAYS"); unsetenv("MYDS_KV_DSK_BUDGET_MB");
     printf("  [PASS] SSD combined budget: exact %llu B includes headers/tables for snapshot, segment, and ends stores; rejection creates no files and retry succeeds\n",
         (unsigned long long)total);
@@ -1610,6 +1652,23 @@ static void lk_remove_store(const char *path) {
     char segments[512]; snprintf(segments, sizeof(segments), "%s.segments", path);
     char ends[512]; snprintf(ends, sizeof(ends), "%s.ends", path);
     unlink(path); unlink(segments); unlink(ends);
+    /* 2026-10-24：anchor 已是独立 store，文件名 = 目录/kvanchor-v1-<ends 派生 id>.bin。
+     * 名字里带 identity，不方便反推 ⇒ 直接按前缀扫目录删，避免残留让 rmdir 失败。 */
+    char dirbuf[512];
+    snprintf(dirbuf, sizeof(dirbuf), "%s", path);
+    char *slash = strrchr(dirbuf, '/');
+    if (!slash) return;
+    *slash = '\0';
+    DIR *d = opendir(dirbuf);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strncmp(e->d_name, "kvanchor-v1-", 12) != 0) continue;
+        char p[1100];
+        snprintf(p, sizeof(p), "%s/%s", dirbuf, e->d_name);
+        unlink(p);
+    }
+    closedir(d);
 }
 
 static void test_shared_lowkv_segments(void) {

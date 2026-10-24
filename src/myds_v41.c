@@ -881,22 +881,22 @@ static uint32_t v41_env_u32(const char *name, uint32_t def, uint32_t lo, uint32_
     }
     return (uint32_t)v;
 }
-static uint32_t v41_anchor_slots(void) {
+uint32_t myds_v41_anchor_slots(void) {
     static uint32_t cached = 0;
     if (!cached) cached = v41_env_u32("MYDS_ANCHOR_SLOTS", 16u, 1u, 64u);
     return cached;
 }
-static uint32_t v41_prompt_cache_slots(void) {
+uint32_t myds_v41_prompt_cache_slots(void) {
     static uint32_t cached = 0;
     if (!cached) cached = v41_env_u32("MYDS_PROMPT_CACHE_SLOTS", 64u, 1u, 256u);
     return cached;
 }
-static uint32_t v41_anchor_max_tokens(void) {
+uint32_t myds_v41_anchor_max_tokens(void) {
     static uint32_t cached = 0;
     if (!cached) cached = v41_env_u32("MYDS_ANCHOR_MAX_TOKENS", 65536u, 1024u, 1048576u);
     return cached;
 }
-static uint32_t v41_prompt_cache_max_tokens(void) {
+uint32_t myds_v41_prompt_cache_max_tokens(void) {
     static uint32_t cached = 0;
     if (!cached) cached = v41_env_u32("MYDS_PROMPT_CACHE_MAX_TOKENS", 65536u, 1024u, 1048576u);
     return cached;
@@ -905,7 +905,7 @@ static uint32_t lowkv_segment_end(uint32_t base_count);
 static uint64_t lowkv_end_payload_bytes(uint32_t p, uint32_t base_count, uint32_t base_end);
 
 /* 该位置需要多大的 end payload（token 数按对应上限截断后估算） */
-static uint64_t v41_end_stride_for(uint32_t max_tokens) {
+uint64_t myds_v41_end_stride_for(uint32_t max_tokens) {
     const uint32_t be = lowkv_segment_end(MYDS_SNAP_PINNED - 1u);
     const uint32_t p = max_tokens > be ? max_tokens : be;
     uint64_t bytes = lowkv_end_payload_bytes(p, MYDS_SNAP_PINNED, be);
@@ -2073,12 +2073,12 @@ static bool lowkv_open_stores(myds_v41_context_t *g, const char *snap_path,
     const uint64_t segment_stride = lowkv_segment_bytes(0, MYDS_SNAP_MIN);
     /* 2026-10-24：两个 store 各有自己的 stride —— 共用会让 64 个 prompt 槽
      * 也按 system prompt 的 65536 tok 付磁盘。两者都必须计入预算。 */
-    const uint64_t end_stride = v41_end_stride_for(v41_prompt_cache_max_tokens());
-    const uint64_t anchor_stride = v41_end_stride_for(v41_anchor_max_tokens());
+    const uint64_t end_stride = myds_v41_end_stride_for(myds_v41_prompt_cache_max_tokens());
+    const uint64_t anchor_stride = myds_v41_end_stride_for(myds_v41_anchor_max_tokens());
     const uint64_t total = lowkv_store_file_bytes(entries, snapshot_stride) +
         lowkv_store_file_bytes(entries, segment_stride) +
-        lowkv_store_file_bytes(v41_prompt_cache_slots(), end_stride) +
-        lowkv_store_file_bytes(v41_anchor_slots(), anchor_stride);
+        lowkv_store_file_bytes(myds_v41_prompt_cache_slots(), end_stride) +
+        lowkv_store_file_bytes(myds_v41_anchor_slots(), anchor_stride);
     if (!segment_stride || (budget && total > budget)) {
         MYDS_LOG_E("kvdisk: snapshot + segments + ends require %.1f MiB, budget %.1f MiB",
             (double)total / 1048576.0, (double)budget / 1048576.0);
@@ -2091,7 +2091,7 @@ static bool lowkv_open_stores(myds_v41_context_t *g, const char *snap_path,
     if (!g->low_segments) return false;
     g->low_store = myds_kvdsk_open(snap_path, snapshot_id, entries, snapshot_stride, 0);
     if (!g->low_store) { myds_kvdsk_close(g->low_segments); g->low_segments = NULL; return false; }
-    g->low_ends = myds_kvdsk_open(end_path, end_id, v41_prompt_cache_slots(), end_stride, 0);
+    g->low_ends = myds_kvdsk_open(end_path, end_id, myds_v41_prompt_cache_slots(), end_stride, 0);
     if (!g->low_ends) {
         myds_kvdsk_close(g->low_store); g->low_store = NULL;
         myds_kvdsk_close(g->low_segments); g->low_segments = NULL;
@@ -2104,7 +2104,7 @@ static bool lowkv_open_stores(myds_v41_context_t *g, const char *snap_path,
                  dir_of(end_path), (unsigned long long)end_id);
         const uint64_t anchor_id = myds_kvdsk_identity("v41-lowkv-anchor-v1", &identity, 1);
         g->low_anchor = myds_kvdsk_open(anchor_path, anchor_id,
-                                        v41_anchor_slots(), anchor_stride, 0);
+                                        myds_v41_anchor_slots(), anchor_stride, 0);
         if (!g->low_anchor) {
             MYDS_LOG_W("kvdisk: anchor store 打开失败（%s）⇒ system prompt 缓存不可用",
                        myds_kvdsk_open_error());
@@ -2116,12 +2116,12 @@ static bool lowkv_open_stores(myds_v41_context_t *g, const char *snap_path,
      * 这条日志是「为什么某个 prompt 没进缓存」的第一现场：
      * 每槽能装多少 token、有几槽、名义/实际磁盘。 */
     {
-        const uint32_t pc_tok = v41_prompt_cache_max_tokens();
-        const uint32_t an_tok = v41_anchor_max_tokens();
-        const uint32_t pc_slots = v41_prompt_cache_slots();
-        const uint32_t an_slots = v41_anchor_slots();
-        const uint64_t pc_stride = v41_end_stride_for(pc_tok);
-        const uint64_t an_stride = v41_end_stride_for(an_tok);
+        const uint32_t pc_tok = myds_v41_prompt_cache_max_tokens();
+        const uint32_t an_tok = myds_v41_anchor_max_tokens();
+        const uint32_t pc_slots = myds_v41_prompt_cache_slots();
+        const uint32_t an_slots = myds_v41_anchor_slots();
+        const uint64_t pc_stride = myds_v41_end_stride_for(pc_tok);
+        const uint64_t an_stride = myds_v41_end_stride_for(an_tok);
         MYDS_LOG_I("kvdisk: prompt-cache store · %u 槽 × %u tok (%.0f MiB/槽) = 名义 %.1f GiB",
                    pc_slots, pc_tok, (double)pc_stride / 1048576.0,
                    (double)pc_slots * (double)pc_stride / 1073741824.0);
@@ -2340,7 +2340,7 @@ bool myds_v41_low_kv_save(myds_v41_context_t *g, const int32_t *tokens, uint32_t
             const uint32_t be = lowkv_base_segment_end(bc);
             const uint64_t end_hash = myds_kvdsk_hash_tokens(tokens, p_end);
             const uint64_t end_bytes = lowkv_end_payload_bytes(p_end, bc, be);
-            const uint64_t pc_stride = v41_end_stride_for(v41_prompt_cache_max_tokens());
+            const uint64_t pc_stride = myds_v41_end_stride_for(myds_v41_prompt_cache_max_tokens());
             if (end_bytes <= pc_stride) {
                 bool already = false;
                 const uint32_t end_slot = lowkv_pick_end_entry(g, g->low_ends, p_end, end_hash, end_bytes, &already, pc_stride);
@@ -2398,7 +2398,7 @@ bool myds_v41_low_kv_save(myds_v41_context_t *g, const int32_t *tokens, uint32_t
             const uint64_t anchor_bytes = lowkv_end_payload_bytes(p_anchor, bc_anchor, be_anchor);
             /* ★ 曾用全局 V41_LOWKV_END_STRIDE（默认 14 MiB）当门 ⇒ 52K 系统提示词
              * 约 140 MiB 被直接挡掉，锚点从未落盘。必须用 anchor 自己的 stride。 */
-            const uint64_t an_stride = v41_end_stride_for(v41_anchor_max_tokens());
+            const uint64_t an_stride = myds_v41_end_stride_for(myds_v41_anchor_max_tokens());
             if (anchor_bytes > an_stride) {
                 MYDS_LOG_W("kvdisk: anchor at %u needs %.1f MiB > anchor stride %.1f MiB; "
                            "raise MYDS_ANCHOR_MAX_TOKENS to persist it",
@@ -6906,9 +6906,16 @@ uint32_t myds_v41_resolve_macroblock_size(uint32_t n_tokens) {
          * 块数越少越好，但单块超过 ~100K 后锥形裁剪开始吃亏（131072 那块最差）。
          * 所以取：k = ceil(n / SINGLE_MAX)，再把 n 均分给 k 块。
          * 均分比「先填满再收尾」好得多：87:13 的切分比 50:50 慢 6.2%。 */
-        const uint32_t k = (n_tokens + (uint32_t)MYDS_MACROBLOCK_AUTO_MAX - 1u) /
-                           (uint32_t)MYDS_MACROBLOCK_AUTO_MAX;
-        val = (long)((n_tokens + k - 1u) / k);
+        /* ★ n_tokens == 0 时 k 也是 0 ⇒ 下面 (n + k - 1) / k 是【除零】。
+         * 实测（2026-10-24 单测触发）会走到 UB。空 prompt 没有分块语义，
+         * 直接退回 env 路径的最小值 512。 */
+        if (n_tokens == 0u) {
+            val = 512L;
+        } else {
+            const uint32_t k = (n_tokens + (uint32_t)MYDS_MACROBLOCK_AUTO_MAX - 1u) /
+                               (uint32_t)MYDS_MACROBLOCK_AUTO_MAX;
+            val = (long)((n_tokens + k - 1u) / k);
+        }
     }
     if (val < 512L) val = 512L;
     if (val > MYDS_MACROBLOCK_HARD_MAX) val = MYDS_MACROBLOCK_HARD_MAX;

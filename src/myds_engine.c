@@ -1198,6 +1198,21 @@ myds_context_t *myds_context_create(myds_model_t *model, const myds_config_t *cf
     myds_context_t *ctx = (myds_context_t *)calloc(1, sizeof(myds_context_t));
     if (!ctx) return NULL;
     ctx->model = model;
+    /* 2026-10-24：锚点 token 缓冲按上限动态分配（原固定 1024，超长系统提示词会溢出）。 */
+    {
+        uint32_t cap = 65536u;
+        const char *e = getenv("MYDS_ANCHOR_MAX_TOKENS");
+        if (e && *e) {
+            const long v = atol(e);
+            if (v >= 4 && v <= 1048576) cap = (uint32_t)v;
+        }
+        ctx->anchor_tokens = (int32_t *)malloc((size_t)cap * sizeof(int32_t));
+        if (ctx->anchor_tokens) {
+            ctx->anchor_cap = cap;
+        } else {
+            MYDS_LOG_W("prefix cache: 锚点缓冲分配失败（%u tok）⇒ 锚点功能关闭", cap);
+        }
+    }
     if (cfg) {
         ctx->cfg = *cfg;
     } else {
@@ -1420,6 +1435,7 @@ void myds_context_free(myds_context_t *ctx) {
     if (ctx->sample_probs)   free(ctx->sample_probs);
     if (ctx->sample_indices) free(ctx->sample_indices);
     if (ctx->sample_cands)   free(ctx->sample_cands);
+    free(ctx->anchor_tokens);
     free(ctx);
 }
 
@@ -3336,7 +3352,7 @@ static int myds_generate_internal(myds_context_t *ctx,
             }
             if (ap >= 4u && ap < (uint32_t)n_prompt - 1u) {
                 const uint32_t got = myds_v41_low_kv_load_anchor(ctx->v41, prompt_tokens, ap);
-                if (got == ap) {
+                if (got == ap && ap <= ctx->anchor_cap && ctx->anchor_tokens) {
                     memcpy(ctx->anchor_tokens, prompt_tokens, (size_t)ap * sizeof(int32_t));
                     ctx->anchor_len = ap;
                     MYDS_LOG_I("prefix cache: anchor restored from disk at decision time · %u tok", ap);
@@ -3527,14 +3543,21 @@ static int myds_generate_internal(myds_context_t *ctx,
                 const long v = atol(anchor_max_env);
                 if (v >= 4 && v <= 1048576) anchor_max = (uint32_t)v;
             }
-            if (anchor_pos >= 4u && anchor_pos < (uint32_t)n_prompt - 1u && anchor_pos <= anchor_max &&
-                (ctx->anchor_len == 0 || memcmp(prompt_tokens, ctx->anchor_tokens, (size_t)anchor_pos * sizeof(int32_t)) != 0)) {
+            /* ★ 必须同时受 anchor_cap 约束：数组容量可能与 anchor_max 不同
+             *   （分配失败时 cap=0 ⇒ 整个锚点路径关闭）。 */
+            const uint32_t anchor_limit = anchor_max < ctx->anchor_cap ? anchor_max : ctx->anchor_cap;
+            if (anchor_pos >= 4u && anchor_pos < (uint32_t)n_prompt - 1u && anchor_pos <= anchor_limit &&
+                ctx->anchor_tokens &&
+                (ctx->anchor_len == 0 || memcmp(prompt_tokens, ctx->anchor_tokens,
+                                                (size_t)anchor_pos * sizeof(int32_t)) != 0)) {
                 /* 阶段 1：先 prefill 到系统提示词锚点（pos=anchor_pos） */
                 int res0 = myds_prefill_tokens(ctx, prompt_tokens, (int32_t)anchor_pos, cancel_flag);
                 if (res0 == 1) {
                     if (myds_v41_snapshot_store_slot(ctx->v41, MYDS_V41_ANCHOR_SLOT, anchor_pos)) {
-                        memcpy(ctx->anchor_tokens, prompt_tokens, (size_t)anchor_pos * sizeof(int32_t));
-                        ctx->anchor_len = anchor_pos;
+                        if (anchor_pos <= ctx->anchor_cap) {
+                            memcpy(ctx->anchor_tokens, prompt_tokens, (size_t)anchor_pos * sizeof(int32_t));
+                            ctx->anchor_len = anchor_pos;
+                        }
                         MYDS_LOG_I("prefix cache: captured persistent anchor snapshot at pos %u (slot %u)",
                                    anchor_pos, MYDS_V41_ANCHOR_SLOT);
                     }

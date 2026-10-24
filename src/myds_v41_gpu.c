@@ -1532,7 +1532,7 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
 
     /* 2026-10-24 诊断：gather 与 flash-attn 分段计时（MYDS_PROFILE_ATTN_SUB=1）。 */
     extern int  opt_prof_attn_sub;
-    extern void myds_v41_gpu_attn_sub_add(int slot, double sec);
+    extern void myds_v41_gpu_attn_sub_add(int slot, double sec);  /* 弱默认见文件末尾 */
     const double t_sub0 = opt_prof_attn_sub ? myds_metal_host_time() : 0.0;
 
     /* 诊断：把压缩键数强行调小，【只影响 attention 读取的 K/V 量，不影响 dispatch 结构】，
@@ -2615,4 +2615,14 @@ int myds_v41_gpu_attention_direct_rope_fuse(myds_metal_buffer_t *heads,const myd
     if (!ok) {attention_register_count(AR_FAILURES);return attention_rope_failure();}
     *rope_consumed=true;
     return 1;
+}
+
+/* 2026-10-24：attention 分段计时的钩子原先只定义在 myds_v41.c 里，
+ * 而 test_metal 只链接 myds_v41_gpu.o ⇒ §88 起 `make test` 链接失败
+ * （Undefined symbols: _myds_v41_gpu_attn_sub_add / _opt_prof_attn_sub）。
+ * 这里给弱默认：单独链接 gpu.o 时用空实现；生产链入 myds_v41.o 时强定义胜出，
+ * 行为与之前完全一致。 */
+__attribute__((weak)) int opt_prof_attn_sub = 0;
+__attribute__((weak)) void myds_v41_gpu_attn_sub_add(int slot, double sec) {
+    (void)slot; (void)sec;
 }

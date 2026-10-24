@@ -128,7 +128,13 @@ struct myds_context {
     uint32_t             pcache_len;
     uint32_t             pcache_cap;
     /* 常量前缀锚点快照（系统提示词等）：跨非连续请求持久复用 */
-    int32_t              anchor_tokens[1024];
+    /* 2026-10-24：原为固定 anchor_tokens[1024]。§90 把锚点上限改成可配置
+     * （MYDS_ANCHOR_MAX_TOKENS，默认 65536）却没同步这里 ⇒ 任何 >1024 token 的
+     * 系统提示词都会把 216 KB 写进 4 KB 数组，砸穿紧随其后的 anchor_len 与
+     * img_emb_data/start/count/n（实测 SIGSEGV 在 prefill 的图像注入路径）。
+     * 改为按上限动态分配；所有读写都必须先比对 anchor_cap。 */
+    int32_t             *anchor_tokens;   /* 容量 anchor_cap，0 = 功能关闭 */
+    uint32_t             anchor_cap;
     uint32_t             anchor_len;
     /* previous_response_id：本请求传入的 prompt 只是【新增后缀】，前缀由 pcache_tokens 提供。
      * 一次性标志（引擎消费后自清），由服务端在收到该字段时设置。 */
@@ -270,6 +276,14 @@ uint64_t myds_v41_snapshot_allocated_bytes(const myds_v41_context_t *g);
 myds_metal_buffer_t *myds_v41_snapshot_get_compressed(myds_v41_context_t *g, uint32_t o);
 myds_metal_buffer_t *myds_v41_snapshot_get_index_cache(myds_v41_context_t *g, uint32_t o);
 uint32_t myds_v41_resolve_macroblock_size(uint32_t n_tokens);
+
+/* 2026-10-24：kvdisk 两个 store 的容量参数（对外只读，供单测按真实值算预算）。
+ * 都是「每次进程解析一次 env 后缓存」的值。 */
+uint32_t myds_v41_prompt_cache_slots(void);
+uint32_t myds_v41_prompt_cache_max_tokens(void);
+uint32_t myds_v41_anchor_slots(void);
+uint32_t myds_v41_anchor_max_tokens(void);
+uint64_t myds_v41_end_stride_for(uint32_t max_tokens);   /* 每槽字节数（含 header/tail） */
 bool myds_validate_fp8_block_size(const gguf_file_t *gf, const char *arch);
 
 #ifdef __cplusplus

@@ -13245,7 +13245,11 @@ kvdisk: anchor 位置 %u 无法落盘：第 %d 段（共 %u）取不到 KV；多
 kvdisk: prompt-end 位置 %u 无法落盘：第 %d 段（共 %u）取不到 KV；…
 ```
 
-### 96.5 ★ 真 bug ③（阻塞上线）：开启 kvdisk 后长 prompt 在续批阶段崩溃
+### 96.5 ~~★ 真 bug ③（阻塞上线）：开启 kvdisk 后长 prompt 在续批阶段崩溃~~
+
+> **本节归因错误，已被 §97 推翻。** 崩溃与 kvdisk **无关**：把 `MYDS_KV_DSK` 关掉后
+> 同一个 54K 请求照样崩。真因是 `anchor_tokens[1024]` 固定数组溢出（§97.1）。
+> 下面保留原文作为「我如何误判」的记录。
 
 `MYDS_KV_DSK` 一开，同一个 54,012 token 请求在 prefill 末尾的 8-token 续批处必崩：
 
@@ -13271,3 +13275,91 @@ production 已重启并冒烟通过（`content":"ok"`）。**kvdisk 未上线。
 
 **规则补充**：涉及容量/尺寸的数字，要么写出完整算式并逐项核对（含「有几个同 ratio 的 owner」这类计数），
 要么等实机日志，**不许在两者都没做的情况下写进账本**。
+
+---
+
+## §97 长 prompt 崩溃的真因：锚点缓冲溢出（不是 kvdisk）+ 四个连环缺陷（2026-10-24）
+
+### 97.1 真因：`anchor_tokens` 是固定 1024，上限却被我改成了 65536
+
+```
+offset 104   : int32_t anchor_tokens[1024]   ← 固定 4,096 字节
+offset 4200  : uint32_t anchor_len           ← 紧接着
+offset 4872  : float **img_emb_data          ← 被砸穿
+```
+
+§90 把锚点判定门从写死的 `anchor_pos <= 1024` 放开到 `MYDS_ANCHOR_MAX_TOKENS`（默认 65536），
+**但没有同步这个数组**。于是 54,003 token 的系统提示词捕获时：
+
+```
+memcpy(ctx->anchor_tokens, prompt_tokens, 54003 * 4 = 216,012 B)   // 写进 4,096 B
+⇒ 越界 211,916 B ⇒ 砸掉 anchor_len 与 img_emb_data/start/count/n
+```
+
+### 97.2 证据链（这段值得留档：没有调试符号也能定位到字段）
+
+1. `.ips` 崩溃帧 `myds_v41_prefill_tokens +170084`，`EXC_BAD_ACCESS` at `0x10E0000001C`；
+2. `atos` 无符号 → 用 `imageOffset` 反算 vmaddr `0x100029864`，`llvm-objdump` 显示崩溃指令：
+   `100029864: ldr w13, [x12, x11, lsl #2]` —— 读一个 `int32` 数组；
+3. 崩溃现场寄存器 `x12 = 0x10E0000001C`（= 故障地址本身，`x11 = 0`），
+   而 `x12 = [x21 + 0x1310]`、`x10 = [x21 + 0x1320] = 46012`；
+4. `clang -Xclang -fdump-record-layouts` 拿到 `myds_context` 的字段偏移：
+   `0x1308 img_emb_data / 0x1310 img_emb_start / 0x1318 img_emb_count / 0x1320 img_emb_n`；
+5. 这三个字段只由「加图片嵌入」写（`myds_context_add_image_embeddings`），
+   **纯文本请求根本不会碰** ⇒ 是别处越界写进来的；查布局发现 `anchor_tokens` 正好在 `anchor_len` 之前。
+
+> 教训：`0x10E0000001C`、`0x1600003875` 这种「高 32 位与低 32 位都像整数」的野指针，
+> 典型来源是**用 int32 数据覆盖了指针字段**，不是指针被 free 后复用。
+
+### 97.3 决定性实验：关掉 kvdisk 仍崩
+
+```
+MYDS_KV_DSK 未设（kvdisk 全程未启用）
+54,012 token 请求 → http=000，进程消失，新 .ips
+```
+
+⇒ §96.5 的归因（「开启 kvdisk 后」）**错误**，已在该节加标注。
+
+### 97.4 修法
+
+1. `anchor_tokens` 改动态分配：`int32_t *anchor_tokens; uint32_t anchor_cap;`
+   容量 = `MYDS_ANCHOR_MAX_TOKENS`（默认 65536 ⇒ 256 KB）；分配失败则整条锚点路径关闭（cap=0）；
+2. 三处访问全部加门（恢复 / 捕获 memcmp / 捕获 memcpy），并把
+   `min(anchor_max, anchor_cap)` 作为有效上限；
+3. 释放：`myds_context_free` 里 free。
+
+### 97.5 真机验证（最终二进制 `6524bb22`）
+
+| 场景 | 耗时 | 结果 |
+|---|---:|---|
+| 冷跑 54,012 token（系统提示词 54,003） | **86 s** | `ok`，进程存活 |
+| 同一请求再来一次 | **0 s** | 全量命中，`reuse 54011 tok` |
+| 同系统提示词、**换 user 问题** | **0 s** | `yes` —— 锚点命中 54,003 tok |
+| 系统提示词**改一行** | **85 s** | 全量 prefill ⇒ 正确失效，无假命中 |
+
+**「同一套 system + tools、换问题」从 85 秒变成 0 秒** —— 这是 system prompt cache 的本职。
+
+### 97.6 顺带修掉的四个缺陷（都在 `make test` 上暴露）
+
+| # | 缺陷 | 由来 | 处置 |
+|---|---|---|---|
+| 1 | `make test` 链接失败：`opt_prof_attn_sub` / `myds_v41_gpu_attn_sub_add` 未定义 | §88 把 profiling 钩子定义在 `myds_v41.c`，而 `test_metal` 只链接 `myds_v41_gpu.o` | gpu.c 加**弱默认**，生产链接强定义胜出 |
+| 2 | `resolve_macroblock_size()` 参数不匹配；硬上限从 16384 提到 131072 后期望过期 | 宏块自适应改动 | 测试补 `n_tokens`，期望改为 32768/131072，并**锁定自适应契约**（54003→54272 与生产日志一致） |
+| 3 | `n_tokens == 0` 时 `k = 0` ⇒ **除零**（UB） | 自适应公式 | 显式 `n_tokens==0 ⇒ 512`（env 路径最小值） |
+| 4 | 两个 Python 套件依赖 `docs/benchmarks/…`（**git 里 0 个文件**） | 证据树从未入库 | 缺证据时 **SKIP**（退出码 0）并打印原因，不再刷 70 个 FileNotFoundError |
+
+### 97.7 一个重要的设计约束：kvdisk 文件必须「同操作同字节」
+
+`test_p2_lowkv_async_bit_identical` 要求「同步写」与「异步写」产生的 store 文件**逐字节相同**。
+我在 §95 为了 FIFO 往条目表塞了**墙钟微秒**（offset 40），直接违反它 —— 而且改成
+持久化序号也不行：异步完成顺序不确定 ⇒ 每次运行号段分配不同 ⇒ 字节仍不同。
+
+**最终做法：写入先后只存内存**（`uint64_t *slot_age`，打开时按槽序发号，之后写入取更大值），
+offset 40 恒为 0 ⇒ 文件确定性恢复；而「本进程新写的永远比打开时已有的新」这个 FIFO 关键性质仍然成立。
+判别性单测：重写某槽后再触发淘汰，victim 必须是最老的另一槽，而**不是**「命中最少」的槽 0。
+
+### 97.8 现状
+
+- **kvdisk 仍未启用**（生产配置保持原样 51 项）。§96.4 的「基础段在写盘时已不存在」仍未解，
+  那是落盘路径的设计问题，与本节无关。
+- **RAM 锚点已生效**：这是本轮真正的收益（同 system 换问题 85 s → 0 s），不依赖 kvdisk。

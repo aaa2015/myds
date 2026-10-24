@@ -111,37 +111,45 @@ static void test_empty_before_evict_and_oldest_evicted(void) {
     myds_kvdsk_close(k);
 }
 
-/* ── 4. 旧文件（written_us == 0）被当作最老 ── */
-static void test_zero_timestamp_is_oldest(void) {
+/* ── 4. 重开后：已有条目按槽序获得年龄，且都比「本进程新写的」老 ──
+ *
+ * 2026-10-24 契约变更：写入先后不再落盘（异步写盘顺序不确定，落盘会让
+ * 「同样操作两次跑」产生不同字节，与 test_p2_lowkv_async_bit_identical 冲突）。
+ * 年龄只在内存里：打开时按槽序发号，之后写入取更大值。
+ * 这条断言锁的是「FIFO 不会因为重启而把新写的当成最老」。 */
+static void test_reopen_makes_existing_older(void) {
     myds_kvdsk_t *k = open_fresh(4, 4096);
     CHECK(k != NULL, "open");
     if (!k) return;
 
-    /* 模拟「升级前写的条目」：把条目表里 offset 40 的 8 字节写回 0。
-     * 布局：文件头 4096 B，条目表每项 64 B，写入时刻在项内 +40。 */
     put(k, 0, 50, 0xCC);
-    {
-        FILE *f = fopen(g_path, "r+b");
-        CHECK(f != NULL, "重开文件以清时间戳");
-        if (f) {
-            unsigned char zero[8] = {0};
-            const long at = 4096L + 40L;
-            CHECK(fseek(f, at, SEEK_SET) == 0, "定位槽 0 时间戳");
-            CHECK(fwrite(zero, 1, sizeof(zero), f) == sizeof(zero), "写零时间戳");
-            fclose(f);
-        }
-    }
-    uint64_t w = 123;
-    CHECK(myds_kvdsk_slot_written_us(k, 0, &w) == true, "槽 0 仍应可读");
-    CHECK(w == 0, "清掉后应读回 0，实际 %llu", (unsigned long long)w);
-
-    usleep(2000);
     put(k, 1, 60, 0xCD);
-    uint64_t w1 = 0;
-    CHECK(myds_kvdsk_slot_written_us(k, 1, &w1) && w1 > 0, "槽 1 应有真实时刻");
 
-    /* 0 < w1 ⇒ 槽 0 会被判为最老并被优先淘汰 */
-    CHECK(0 < w1, "0 时刻应小于真实时刻 ⇒ 视为最老");
+    uint64_t a0 = 0, a1 = 0;
+    CHECK(myds_kvdsk_slot_written_us(k, 0, &a0), "槽 0 应有年龄");
+    CHECK(myds_kvdsk_slot_written_us(k, 1, &a1), "槽 1 应有年龄");
+    CHECK(a0 < a1, "同进程内后写的更新（%llu vs %llu）",
+          (unsigned long long)a0, (unsigned long long)a1);
+    myds_kvdsk_close(k);
+
+    /* 重开：两个已有条目重新发号，槽序越小越老 */
+    k = myds_kvdsk_open(g_path, 0x1234ull, 4, 4096, 0);
+    CHECK(k != NULL, "reopen");
+    if (!k) return;
+    uint64_t b0 = 0, b1 = 0;
+    CHECK(myds_kvdsk_slot_written_us(k, 0, &b0), "重开后槽 0 仍应有年龄");
+    CHECK(myds_kvdsk_slot_written_us(k, 1, &b1), "重开后槽 1 仍应有年龄");
+    CHECK(b0 < b1, "重开后按槽序（%llu vs %llu）",
+          (unsigned long long)b0, (unsigned long long)b1);
+    uint64_t e = 1;
+    CHECK(myds_kvdsk_slot_written_us(k, 2, &e) == false, "空槽仍返回 false");
+
+    /* 本进程新写的一条必须比所有已有条目都新 ⇒ FIFO 不会先淘汰它 */
+    put(k, 2, 70, 0xCE);
+    uint64_t c2 = 0;
+    CHECK(myds_kvdsk_slot_written_us(k, 2, &c2), "新写槽 2 应有年龄");
+    CHECK(c2 > b1, "新写的必须比重开时已有的都新（%llu vs %llu）",
+          (unsigned long long)c2, (unsigned long long)b1);
 
     myds_kvdsk_close(k);
 }
@@ -163,7 +171,7 @@ int main(void) {
     printf("myds 端快照 FIFO 淘汰与写入时刻\n");
     test_written_us_is_readable_and_increasing();
     test_empty_before_evict_and_oldest_evicted();
-    test_zero_timestamp_is_oldest();
+    test_reopen_makes_existing_older();
     test_slot_count();
 
     if (failures) { printf("\n❌ %d 项失败\n", failures); return 1; }
