@@ -6987,6 +6987,11 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     double prof_step1 = 0, prof_step2 = 0, prof_step3 = 0, prof_step4 = 0, prof_step5 = 0;
     double prof_step6 = 0, prof_step7 = 0, prof_step8 = 0;
     double prof_wait_qkv = 0, prof_wait_swa = 0, prof_wait_ffn_router = 0, prof_wait_moe = 0;
+    /* 2026-10-24：单独测 Step7（router gate + shared gate/up/down 四个 GEMM + swiglu）
+     * 的 GPU 时间。prof_wait_ffn_router 测的是「Attention+FFN+Shared+Routing 全部」，
+     * 不能用来算 shared expert 的效率。需 MYDS_PROFILE_PREFILL=1 且 MYDS_PROFILE_SHARED=1。 */
+    double prof_wait_shared = 0, prof_wait_pre_shared = 0;
+    const bool opt_prof_shared = getenv("MYDS_PROFILE_SHARED") != NULL;
     /* 诊断：把「Wait MoE」这个窗口拆开 —— 它实际包含 Step5..8 全部（attn_out 投影、
      * FFN In、shared+router、MoE GEMM、以及 epilogue 的 add_bf16/hc_expand），
      * 所以不能直接当成「MoE 的耗时」。三段在 MYDS_PROFILE_MOE=1 时才测。 */
@@ -7687,6 +7692,12 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 }
                 TIME_ACC(prof_step6);
 
+                  if (do_prof && opt_prof_shared) {
+                      TIME_START();
+                      CHECK(myds_metal_commit_batch());
+                      TIME_ACC(prof_wait_pre_shared);
+                      CHECK(myds_metal_begin_batch());
+                  }
                 /* Step 7: Batched Router Gate & Shared Experts (reads 10 MB shared weights + 1.5 MB router ONCE) */
                 TIME_START();
                 phase = "batched MoE shared and router";
@@ -7697,6 +7708,13 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 CHECK(myds_v41_shared_swiglu(cw->shared_swiglu_buf, cw->shared_gate_buf, cw->shared_up_buf, width * c_len, m->swiglu_clamp_exp));
                 CHECK(project_batch(cur_shared, base->shared_down, cw->shared_swiglu_buf, V41_DIM, width, c_len, base->shared_down_type, true));
 
+                  if (do_prof && opt_prof_shared) {
+                      TIME_START();
+                      CHECK(myds_metal_commit_batch());
+                      TIME_ACC(prof_wait_shared);
+                      CHECK(myds_metal_begin_batch());
+                  }
+                  
                 /* Step 7b: Batched MoE routing for all tokens in chunk on GPU */
                 phase = "batched MoE routing";
                 uint32_t k = m->n_activated_experts;
@@ -8080,6 +8098,10 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         printf("Step 5 (Attn Out B)   : %8.2f ms\n", prof_step5);
         printf("Step 6 (HC FFN In)    : %8.2f ms\n", prof_step6);
         printf("Step 7 (Shared+Route) : %8.2f ms\n", prof_step7);
+        if (opt_prof_shared) {
+            printf("  shared-expert GEMM   : %8.2f ms  (router+gate+up+down+swiglu)\n", prof_wait_shared);
+            printf("  pre-shared flush     : %8.2f ms\n", prof_wait_pre_shared);
+        }
         printf("Wait FFN+R (GPU)      : %8.2f ms\n", prof_wait_ffn_router);
         printf("Step 8 (MoE dispatch) : %8.2f ms\n", prof_step8);
         if (opt_prof_step1) {
