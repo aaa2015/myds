@@ -3463,6 +3463,33 @@ static int myds_generate_internal(myds_context_t *ctx,
         const char *anch_env = getenv("MYDS_ANCHOR_SNAPSHOT");
         bool anchor_enabled = (anch_env == NULL || atoi(anch_env) != 0);
 
+        /* 2026-10-24：把「系统提示词有多大」变成可观测指标。
+         * anchor_pos = 第一个 <|User|> 之后的位置 ⇒ 就是 system+tools 段的 token 数。
+         * 无条件扫描并每请求打一行，用来核对 MYDS_ANCHOR_MAX_TOKENS 与存储容量是否够。 */
+        {
+            uint32_t sys_tok = 0;
+            for (uint32_t i = 0; i < (uint32_t)n_prompt - 1u; i++) {
+                if (prompt_tokens[i] == 128803) { sys_tok = i + 1u; break; }
+            }
+            const uint32_t ring_cap = 1024u + 20u * 512u;   /* MYDS_SNAP_MIN + (PINNED-1)*STRIDE = 11264 */
+            if (sys_tok) {
+                MYDS_LOG_I("prompt split: system+tools=%u tok / total=%d tok (%.1f%%), "
+                           "ring_capacity=%u, %s",
+                           sys_tok, n_prompt, 100.0 * (double)sys_tok / (double)n_prompt,
+                           ring_cap, sys_tok <= ring_cap ? "ring covers it" : "TAIL NEEDED (ring too shallow)");
+                /* 系统提示词超过 64K 上限：明确告警，便于发现主流 agent 已超出支持范围。
+                 * 超过后锚点不会被捕获（anchor_pos > anchor_max 时只做普通全量 prefill），
+                 * 表现是「每次请求都重算系统提示词」，不是错误但会白烧几十秒 prefill。 */
+                if (sys_tok > 65536u) {
+                    MYDS_LOG_W("prompt split: system prompt is %u tok, exceeds the 64K anchor budget "
+                               "(65536). Anchor caching will be SKIPPED for this request; every request "
+                               "will re-prefill it. Raise MYDS_ANCHOR_MAX_TOKENS if the storage can hold it.",
+                               sys_tok);
+                }
+            } else {
+                MYDS_LOG_I("prompt split: no <|User|> marker, total=%d tok", n_prompt);
+            }
+        }
         if (pcache_on && anchor_enabled && ctx->v41 && resume_from == 0) {
             uint32_t anchor_pos = 0;
             for (uint32_t i = 0; i < (uint32_t)n_prompt - 1u; i++) {
