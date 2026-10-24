@@ -211,6 +211,18 @@ struct myds_context {
     /* Sampler persistent scratch buffers (zero malloc churn per token) */
     float               *sample_probs;
     int32_t             *sample_indices;
+
+    /* 2026-10-24：近期 token 环形缓冲，供采样器的 presence / repetition 惩罚使用。
+     *
+     * ★ 为什么必须自己维护：采样函数 myds_sample_next_token 的 prev_tokens 参数
+     *   在两处生产调用点都是 (NULL, 0)，于是 has_rep_pen 恒为 false ——
+     *   repetition_penalty 配了也从未生效。这里在每次 forward 入口记录，
+     *   覆盖 prompt 与生成的全部 token，顺序天然正确，调用方无需改动。
+     * 只保留最近 MYDS_PENALTY_WINDOW 个：惩罚作用于「近期上下文」，
+     * 而非全部历史（全量会让长上下文下每个 token 的采样退化成 O(n)。 */
+    int32_t              recent_tokens[256];
+    uint32_t             recent_count;   /* 0..256，已填充个数 */
+    uint32_t             recent_next;    /* 下一个写入下标 */
     void                *sample_cands;
     uint64_t             rng_state;
 
@@ -243,6 +255,9 @@ myds_model_t *myds_model_load_diagnostic(const char *model_path);
 bool myds_trace_active(void);
 bool myds_trace_f32(const char *stage, uint32_t layer, uint32_t pos,
                     const myds_metal_buffer_t *buffer, size_t count);
+
+/* 记录一个进入模型的 token（prompt 与生成同等对待）。 */
+void myds_note_recent_token(myds_context_t *ctx, int32_t token_id);
 
 int32_t myds_sample_next_token(
     const float         *logits,

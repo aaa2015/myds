@@ -184,6 +184,7 @@ int main(int argc, char *argv[]) {
         .top_k              = cfg_u32_env("MYDS_TOP_K", 40u, 0u, 1048576u),
         .min_p              = cfg_f32_env("MYDS_MIN_P", 0.0f, 0.0f, 1.0f),
         .repetition_penalty = cfg_f32_env("MYDS_REPETITION_PENALTY", 1.0f, 0.0f, 4.0f),
+        .presence_penalty   = cfg_f32_env("MYDS_PRESENCE_PENALTY", 0.0f, -2.0f, 2.0f),
         .seed               = (int32_t)time(NULL),
         .stream             = true,
     };
@@ -289,10 +290,10 @@ int main(int argc, char *argv[]) {
      * 此前只打 ctx/max_new/temp/top_p，top_k / min_p / repetition_penalty
      * 即使配了也无从确认 —— 「配了但不生效」正是这类配置最难发现的地方。 */
     MYDS_LOG_I("Starting myds (ctx_size=%u, max_new_tokens=%u, temp=%.2f, top_p=%.2f, "
-               "top_k=%u, min_p=%.3f, rep_pen=%.3f, thinking=%s)",
+               "top_k=%u, min_p=%.3f, rep_pen=%.3f, pres_pen=%.3f, thinking=%s)",
                cfg.max_seq_len, cfg.max_new_tokens, cfg.temperature, cfg.top_p,
                cfg.top_k, (double)cfg.min_p, (double)cfg.repetition_penalty,
-               cfg.thinking_mode ? "on" : "off");
+               (double)cfg.presence_penalty, cfg.thinking_mode ? "on" : "off");
     MYDS_LOG_I("Loading model file: %s", model_path);
 
     double load_t0 = myds_now_s();

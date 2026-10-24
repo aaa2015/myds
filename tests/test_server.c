@@ -140,6 +140,28 @@ int main(void) {
         printf("  [PASS] min_p / repetition_penalty request-level parsing\n");
     }
 
+    /* 8b. presence_penalty 的请求级解析（2026-10-24 新增）
+     * 与 min_p / repetition_penalty 同一套「缺省探测」语义：
+     * 没提供 ⇒ 沿用启动配置；显式 0.0 ⇒ 本次关闭。 */
+    {
+        const char *absent = "{\"temperature\": 0.7}";
+        assert(json_extract_float_field(absent, "presence_penalty", -1.0f) < 0.0f);
+
+        const char *pos = "{\"presence_penalty\": 0.8}";
+        float v = json_extract_float_field(pos, "presence_penalty", -1.0f);
+        assert(v > 0.79f && v < 0.81f);
+
+        /* 负值合法（OpenAI 允许 [-2,2]，负值鼓励重复） */
+        const char *neg = "{\"presence_penalty\": -1.5}";
+        v = json_extract_float_field(neg, "presence_penalty", -1.0f);
+        assert(v > -1.51f && v < -1.49f);
+
+        /* 显式 0.0 必须与「未提供」区分开 */
+        const char *zero = "{\"presence_penalty\": 0.0}";
+        assert(json_extract_float_field(zero, "presence_penalty", -1.0f) == 0.0f);
+        printf("  [PASS] presence_penalty request-level parsing\n");
+    }
+
     /* 9. 思考模式：reasoning 对象形式（2026-10-24）
      *
      * mycode / OpenAI Responses 生态用 "reasoning": {"effort": "high"} 表达强度。

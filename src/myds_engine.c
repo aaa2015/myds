@@ -1475,6 +1475,22 @@ void myds_context_set_config(myds_context_t *ctx, const myds_config_t *cfg) {
     }
 }
 
+static inline bool pen_seen_in(const int32_t *keys, int32_t t) {
+    uint32_t h = ((uint32_t)t * 2654435761u) & 1023u;
+    for (uint32_t probe = 0; probe < 1024u; ++probe) {
+        const int32_t k = keys[h];
+        if (k == t) return true;
+        if (k == -1) return false;
+        h = (h + 1u) & 1023u;
+    }
+    return false;
+}
+
+static inline bool pen_seen_linear(const int32_t *tokens, size_t n, int32_t t) {
+    for (size_t i = 0; i < n; ++i) if (tokens[i] == t) return true;
+    return false;
+}
+
 int32_t myds_sample_next_token(
     const float         *logits,
     uint32_t             vocab_size,
@@ -1490,13 +1506,59 @@ int32_t myds_sample_next_token(
     uint32_t top_k = cfg ? cfg->top_k : 0;
     float min_p = cfg ? cfg->min_p : 0.0f;
     float rep_pen = (cfg && cfg->repetition_penalty > 0.0f) ? cfg->repetition_penalty : 1.0f;
-    bool has_rep_pen = (rep_pen > 1.0f && prev_tokens && n_prev_tokens > 0);
+    const float pres_pen = cfg ? cfg->presence_penalty : 0.0f;
+
+    /* 2026-10-24：近期 token 的来源。
+     * 优先用调用方给的（单测走这条），否则用 ctx 里的环形缓冲 —— 两处生产调用点
+     * 都传 (NULL, 0)，不兜底的话重复/存在惩罚永远不会生效。 */
+    const int32_t *recent = prev_tokens;
+    size_t         n_recent = n_prev_tokens;
+    if ((!recent || n_recent == 0) && ctx && ctx->recent_count > 0) {
+        recent = ctx->recent_tokens;
+        n_recent = ctx->recent_count;
+    }
+    const bool has_rep_pen = (rep_pen != 1.0f && recent && n_recent > 0);
+    const bool has_pres_pen = (pres_pen != 0.0f && recent && n_recent > 0);
+    const bool has_penalty = has_rep_pen || has_pres_pen;
+
+    /* 近期 token 的哈希集合：避免原来的 O(vocab × n) 双重循环
+     * （vocab≈129k、窗口 256 ⇒ 每次采样 3300 万次比较）。
+     * 表 1024 槽、开放寻址、-1 为空位；窗口 ≤ 512 时负载 ≤ 50%。
+     * 惩罚全关时【不建表】，默认路径开销与改动前完全一致。 */
+    enum { PEN_SLOT = 1024 };
+    int32_t pen_keys[PEN_SLOT];
+    bool    pen_ok = false;
+    if (has_penalty && n_recent <= (size_t)(PEN_SLOT / 2)) {
+        for (int k = 0; k < PEN_SLOT; k++) pen_keys[k] = -1;
+        for (size_t p = 0; p < n_recent; ++p) {
+            const int32_t t = recent[p];
+            if (t < 0) continue;
+            uint32_t h = ((uint32_t)t * 2654435761u) & (uint32_t)(PEN_SLOT - 1);
+            while (pen_keys[h] != -1 && pen_keys[h] != t) h = (h + 1u) & (uint32_t)(PEN_SLOT - 1);
+            pen_keys[h] = t;
+        }
+        pen_ok = true;
+    }
+    /* 窗口过大建不起表时退回线性扫描：结果一致，只是慢，
+     * 不会静默变成「不惩罚」。 */
+    #define PEN_SEEN(i) (pen_ok ? pen_seen_in(pen_keys, (int32_t)(i)) \
+                         : pen_seen_linear(recent, n_recent, (int32_t)(i)))
+    /* presence：出现过就减一个常数（与次数无关）。
+     * repetition：出现过就按比例缩放。二者都只影响出现过的 token。 */
+    #define PEN_APPLY(l, i) do { \
+        if (has_penalty && PEN_SEEN(i)) { \
+            float _pl = (l); \
+            if (has_pres_pen) _pl -= pres_pen; \
+            if (has_rep_pen) _pl = (_pl > 0.0f) ? (_pl / rep_pen) : (_pl * rep_pen); \
+            (l) = _pl; \
+        } \
+    } while (0)
 
     /* 1. Greedy argmax check (if temp <= 0) */
     if (temp <= 0.0f) {
         int32_t best_id = 0;
         float max_l = logits[0];
-        if (!has_rep_pen) {
+        if (!has_penalty) {
             for (uint32_t i = 1; i < vocab_size; i++) {
                 if (logits[i] > max_l) {
                     max_l = logits[i];
@@ -1505,20 +1567,11 @@ int32_t myds_sample_next_token(
             }
             return best_id;
         }
-        for (size_t p = 0; p < n_prev_tokens; p++) {
-            if (prev_tokens[p] == 0) {
-                max_l = (max_l > 0.0f) ? (max_l / rep_pen) : (max_l * rep_pen);
-                break;
-            }
-        }
+        /* token 0 也可能被惩罚，与其余 token 走同一条规则。 */
+        PEN_APPLY(max_l, 0);
         for (uint32_t i = 1; i < vocab_size; i++) {
             float l = logits[i];
-            for (size_t p = 0; p < n_prev_tokens; p++) {
-                if (prev_tokens[p] == (int32_t)i) {
-                    l = (l > 0.0f) ? (l / rep_pen) : (l * rep_pen);
-                    break;
-                }
-            }
+            PEN_APPLY(l, i);
             if (l > max_l) {
                 max_l = l;
                 best_id = (int32_t)i;
@@ -1529,19 +1582,14 @@ int32_t myds_sample_next_token(
 
     /* 2. Repetition penalty check & max logit search in single linear pass */
     float max_l = -INFINITY;
-    if (!has_rep_pen) {
+    if (!has_penalty) {
         for (uint32_t i = 0; i < vocab_size; i++) {
             if (logits[i] > max_l) max_l = logits[i];
         }
     } else {
         for (uint32_t i = 0; i < vocab_size; i++) {
             float l = logits[i];
-            for (size_t p = 0; p < n_prev_tokens; p++) {
-                if (prev_tokens[p] == (int32_t)i) {
-                    l = (l > 0.0f) ? (l / rep_pen) : (l * rep_pen);
-                    break;
-                }
-            }
+            PEN_APPLY(l, i);
             if (l > max_l) max_l = l;
         }
     }
@@ -1553,7 +1601,7 @@ int32_t myds_sample_next_token(
     float inv_temp = 1.0f / temp;
     float sum_exp = 0.0f;
     uint32_t n_cands = 0;
-    if (!has_rep_pen) {
+    if (!has_penalty) {
         for (uint32_t i = 0; i < vocab_size; i++) {
             float diff = (logits[i] - max_l) * inv_temp;
             if (diff >= -20.0f) {
@@ -1567,12 +1615,7 @@ int32_t myds_sample_next_token(
     } else {
         for (uint32_t i = 0; i < vocab_size; i++) {
             float l = logits[i];
-            for (size_t p = 0; p < n_prev_tokens; p++) {
-                if (prev_tokens[p] == (int32_t)i) {
-                    l = (l > 0.0f) ? (l / rep_pen) : (l * rep_pen);
-                    break;
-                }
-            }
+            PEN_APPLY(l, i);
             float diff = (l - max_l) * inv_temp;
             if (diff >= -20.0f) {
                 float e = expf(diff);
@@ -1583,6 +1626,9 @@ int32_t myds_sample_next_token(
             }
         }
     }
+
+    #undef PEN_APPLY
+    #undef PEN_SEEN
 
     if (n_cands == 0) {
         if (!ctx || !ctx->sample_probs) { free(probs); free(indices); }
@@ -2211,7 +2257,20 @@ bool myds_trace_f32(const char *stage, uint32_t layer, uint32_t pos,
     return written == count && closed == 0;
 }
 
+/* 记录近期 token（环形缓冲，容量 256）。
+ * 放在 forward 入口调用：v41 与非 v41 两条路径都经过这里，
+ * prompt token 与生成 token 一视同仁，顺序与方法实际处理顺序一致。 */
+void myds_note_recent_token(myds_context_t *ctx, int32_t token_id) {
+    if (!ctx || token_id < 0) return;
+    const uint32_t cap = (uint32_t)(sizeof(ctx->recent_tokens) / sizeof(ctx->recent_tokens[0]));
+    if (cap == 0u) return;
+    ctx->recent_tokens[ctx->recent_next] = token_id;
+    ctx->recent_next = (ctx->recent_next + 1u) % cap;
+    if (ctx->recent_count < cap) ctx->recent_count++;
+}
+
 static int32_t myds_forward_token_internal(myds_context_t *ctx, int32_t token_id, uint32_t pos, bool need_logits) {
+    myds_note_recent_token(ctx, token_id);
     if (ctx->v41) return myds_v41_forward(ctx, token_id, pos, need_logits);
     myds_model_t *m = ctx->model;
     uint32_t dim = m->dim;

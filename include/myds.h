@@ -41,6 +41,10 @@ typedef struct {
     uint32_t top_k;             /* Top-k sampling (0 = disabled, default: 40) */
     float    min_p;             /* Min-p sampling (0.0 = disabled, default: 0.0) */
     float    repetition_penalty; /* Repetition penalty (1.0 = disabled, default: 1.0) */
+    /* Presence penalty（2026-10-24）：token 在近期上下文出现过就【减去】该值，
+     * 与出现的次数无关（按次数加权的是 frequency penalty，本实现不提供）。
+     * 0.0 = 关闭；正值抑制重复，负值鼓励重复。OpenAI 的取值范围是 [-2, 2]。 */
+    float    presence_penalty;   /* Presence penalty (0.0 = disabled, default: 0.0) */
     int32_t  seed;              /* Random seed */
     /* ⚠️ 2026-10-24 审计：本字段全库【只写不读】—— main.c 初始化、engine 复位，
      * 没有任何读取点。流式与否实际由调用方传不传回调（myds_generate_bytes_ex）

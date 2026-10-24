@@ -913,6 +913,37 @@ int main(int argc, char **argv) {
         int32_t prev[1] = {2};
         myds_config_t cfg = {.temperature = 0.0f, .top_p = 1.0f, .repetition_penalty = 2.0f};
         int32_t picked = myds_sample_next_token(logits, 8, &cfg, NULL, prev, 1);
+        (void)picked;
+
+        /* 2026-10-24：presence_penalty 语义
+         *   token 在近期上下文出现过 ⇒ 该 token 的 logit 减 pres_pen，与出现次数无关。
+         * 构造：token 2 的 logit 比 token 5 高 0.5；pres_pen=1.0 应把 token 2 压到
+         * token 5 之下 ⇒ 选中 5。pres_pen=0 时应选中 2。 */
+        {
+            float l2[8] = {0};
+            l2[2] = 2.0f; l2[5] = 1.5f;
+            myds_config_t c0 = cfg;
+            c0.temperature = 0.0f;          /* greedy，结果确定 */
+            c0.repetition_penalty = 1.0f;
+            c0.presence_penalty = 0.0f;
+            int32_t prev2[1] = {2};
+            assert(myds_sample_next_token(l2, 8, &c0, NULL, prev2, 1) == 2);
+
+            c0.presence_penalty = 1.0f;      /* 2.0 - 1.0 = 1.0 < 1.5 */
+            assert(myds_sample_next_token(l2, 8, &c0, NULL, prev2, 1) == 5);
+
+            c0.presence_penalty = 0.2f;      /* 2.0 - 0.2 = 1.8 > 1.5 */
+            assert(myds_sample_next_token(l2, 8, &c0, NULL, prev2, 1) == 2);
+
+            /* 负值鼓励重复：2.0 + 1.0 = 3.0 */
+            c0.presence_penalty = -1.0f;
+            assert(myds_sample_next_token(l2, 8, &c0, NULL, prev2, 1) == 2);
+
+            /* 与出现次数无关：token 2 出现 3 次，仍只减一次 */
+            int32_t prev3[3] = {2, 2, 2};
+            c0.presence_penalty = 1.0f;
+            assert(myds_sample_next_token(l2, 8, &c0, NULL, prev3, 3) == 5);
+        }
         assert(picked == 5);
         printf("  [PASS] Production repetition penalty: token 2 penalized -> token 5 selected\n");
     }

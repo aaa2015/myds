@@ -3285,6 +3285,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
          * 这里补上 per-request 入口。默认 -1 表示「本次未指定」，不覆盖启动配置。 */
         float min_p = json_extract_float_field(body, "min_p", -1.0f);
         float rep_pen = json_extract_float_field(body, "repetition_penalty", -1.0f);
+        float pres_pen = json_extract_float_field(body, "presence_penalty", -1.0f);
         int include_usage = (strstr(body, "\"include_usage\":true") != NULL || strstr(body, "\"include_usage\": true") != NULL);
 
         size_t prompt_cap = (total_read * 4 > 65536) ? (total_read * 4 + 8192) : 65536;
@@ -3508,6 +3509,16 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 req_cfg.min_p = min_p;
             } else {
                 MYDS_LOG_W("[%s:%d] min_p=%.3f 超出 [0,1]，忽略该字段", client_ip, client_port, min_p);
+            }
+        }
+        /* presence_penalty 语义：0.0 = 关闭；OpenAI 取值范围 [-2, 2]。
+         * 正值抑制已出现的 token，负值鼓励。 */
+        if (pres_pen != -1.0f) {
+            if (pres_pen >= -2.0f && pres_pen <= 2.0f) {
+                req_cfg.presence_penalty = pres_pen;
+            } else {
+                MYDS_LOG_W("[%s:%d] presence_penalty=%.3f 超出 [-2,2]，忽略该字段",
+                           client_ip, client_port, pres_pen);
             }
         }
         /* repetition_penalty 语义：1.0 = 关闭；常用范围 (1.0, 2.0]。<=0 视为非法。 */
