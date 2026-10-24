@@ -6993,6 +6993,11 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     double prof_wait_attnB = 0, prof_wait_ffnpre = 0, prof_wait_moe_gemm = 0;
     uint64_t disp_ringattn = 0, disp_compressor = 0;   /* 诊断：分段 dispatch 数 */
     double prof_wait_indexer = 0;   /* 诊断：Step 4 里 indexer 部分的 GPU 等待 */
+    /* 2026-10-24：indexer 逐层累加（需 MYDS_PROFILE_PREFILL=1 且 MYDS_PROFILE_IDX_LAYER=1）。
+     * 用来判定 indexer 的 FLOP 效率是 18% 还是 59%：取决于 ratio=2 的 18 层各占 ~470 ms，
+     * 还是 40 层均摊 ~217 ms。只取时间戳，不插 CB、不额外 commit，不放大被测对象。 */
+    double prof_idx_layer[V41_LAYERS] = {0};
+    const bool opt_prof_idx_layer = getenv("MYDS_PROFILE_IDX_LAYER") != NULL;
     double prof_wait_attn2 = 0;     /* 诊断：ring+attention 的 GPU 等待 */
     double prof_wait_bf16 = 0;      /* 诊断：attn_heads 的 bf16 转换 */
     uint64_t disp_step14 = 0, disp_step58 = 0, disp_layer_all = 0;  /* 诊断 */
@@ -7491,7 +7496,16 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 if (do_prof && opt_prof_split) {
                     TIME_START();
                     CHECK(myds_metal_commit_batch());
-                    TIME_ACC(prof_wait_indexer);
+                    if (opt_prof_idx_layer && il < V41_LAYERS) {
+                        /* 与 TIME_ACC 同一时刻取值，保证两处可对账 */
+                        gettimeofday(&ptv1, NULL);
+                        const double idx_dt = (ptv1.tv_sec - ptv0.tv_sec) * 1000.0 +
+                                              (ptv1.tv_usec - ptv0.tv_usec) / 1000.0;
+                        prof_wait_indexer += idx_dt;
+                        prof_idx_layer[il] += idx_dt;
+                    } else {
+                        TIME_ACC(prof_wait_indexer);
+                    }
                     CHECK(myds_metal_begin_batch());
                 }
 
@@ -8042,6 +8056,23 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         printf("Wait SWA (GPU)        : %8.2f ms\n", prof_wait_swa);
         if (opt_prof_split)
             printf("  ...of which indexer  : %8.2f ms\n", prof_wait_indexer);
+        if (opt_prof_idx_layer) {
+            printf("  --- indexer per layer (ms) ---\n");
+            double idx_sum = 0, idx_r2 = 0, idx_other = 0;
+            uint32_t n_r2 = 0, n_other = 0;
+            for (uint32_t l = 0; l < V41_LAYERS; l++) {
+                printf("    layer %2u : %9.2f\n", l, prof_idx_layer[l]);
+                idx_sum += prof_idx_layer[l];
+                if (l >= 2 && l < 20) { idx_r2 += prof_idx_layer[l]; n_r2++; }
+                else { idx_other += prof_idx_layer[l]; n_other++; }
+            }
+            printf("  --- indexer 分组 ---\n");
+            printf("    ratio=2 (layer 2-19)     : %9.2f ms  avg %.2f  (%u 层)\n",
+                   idx_r2, n_r2 ? idx_r2 / n_r2 : 0.0, n_r2);
+            printf("    other   (0-1, 20-39)     : %9.2f ms  avg %.2f  (%u 层)\n",
+                   idx_other, n_other ? idx_other / n_other : 0.0, n_other);
+            printf("    per-layer sum            : %9.2f ms  (vs %.2f)\n", idx_sum, prof_wait_indexer);
+        }
         if (opt_prof_split2)
             printf("  ...ring+attention    : %8.2f ms\n", prof_wait_attn2);
         if (opt_prof_split3)
