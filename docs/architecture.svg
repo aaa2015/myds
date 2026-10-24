@@ -1,0 +1,140 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 760" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#57606a"/>
+    </marker>
+    <style>
+      .title { font-size: 15px; font-weight: 600; fill: #1f2328; }
+      .sub   { font-size: 11px; fill: #57606a; }
+      .box   { fill: #ffffff; stroke: #d0d7de; stroke-width: 1.2; rx: 6; }
+      .box-hi{ fill: #fff8e6; stroke: #bf8700; stroke-width: 1.4; rx: 6; }
+      .box-cu{ fill: #ffeceb; stroke: #cf222e; stroke-width: 1.4; rx: 6; }
+      .box-ok{ fill: #eaf7ee; stroke: #1a7f37; stroke-width: 1.4; rx: 6; }
+      .lbl   { font-size: 12px; font-weight: 500; fill: #1f2328; }
+      .ms    { font-size: 10px; fill: #57606a; }
+      .pct   { font-size: 10px; font-weight: 600; }
+      .lane  { fill: none; stroke: #57606a; stroke-width: 1.3; marker-end: url(#arrow); }
+      .hdr   { font-size: 13px; font-weight: 600; fill: #1f2328; }
+    </style>
+  </defs>
+
+  <rect width="960" height="760" fill="#f6f8fa"/>
+
+  <text x="24" y="32" class="hdr">myds · DeepSeek-V4.1-Flash-1017-Q2 · M2 Ultra</text>
+  <text x="24" y="50" class="sub">40 层，每层两个子层。数字为实测耗时（48,491-token prefill；单-token decode）。</text>
+
+  <!-- ============ PREFILL ============ -->
+  <text x="24" y="86" class="title">Prefill — 79.04 s / 48,491 tok = 614 t/s</text>
+  <text x="24" y="102" class="sub">每 chunk 2048 token，macroblock 自适应；按实测效率分类：已到顶 / 有空间 / 不计</text>
+
+  <!-- Row: prefill pipeline -->
+  <rect x="24"  y="118" width="150" height="62" class="box"/>
+  <text x="38" y="140" class="lbl">Engram + Embed</text>
+  <text x="38" y="157" class="ms">1.16 s</text>
+  <text x="38" y="171" class="ms">SSD pread, 排序后读</text>
+
+  <rect x="190" y="118" width="150" height="62" class="box-ok"/>
+  <text x="204" y="140" class="lbl">Wait Proj</text>
+  <text x="204" y="157" class="ms">8.74 s</text>
+  <text x="204" y="171" class="pct" fill="#1a7f37">76% 峰值</text>
+
+  <rect x="356" y="118" width="176" height="62" class="box-cu"/>
+  <text x="370" y="140" class="lbl">flash-attention</text>
+  <text x="370" y="157" class="ms">16.35 s</text>
+  <text x="370" y="171" class="pct" fill="#cf222e">18% 峰值 · smem 锁死</text>
+
+  <rect x="548" y="118" width="150" height="62" class="box-hi"/>
+  <text x="562" y="140" class="lbl">indexer</text>
+  <text x="562" y="157" class="ms">7.36 s · 只 8 层</text>
+  <text x="562" y="171" class="pct" fill="#bf8700">9% SIMT</text>
+
+  <rect x="714" y="118" width="150" height="62" class="box-ok"/>
+  <text x="728" y="140" class="lbl">Step5 AttnOutB</text>
+  <text x="728" y="157" class="ms">4.80 s</text>
+  <text x="728" y="171" class="pct" fill="#1a7f37">62% 峰值</text>
+
+  <!-- second row -->
+  <rect x="24"  y="196" width="150" height="62" class="box-ok"/>
+  <text x="38" y="218" class="lbl">shared GEMM</text>
+  <text x="38" y="235" class="ms">4.54 s</text>
+  <text x="38" y="249" class="pct" fill="#1a7f37">59% 峰值</text>
+
+  <rect x="190" y="196" width="150" height="62" class="box-ok"/>
+  <text x="204" y="218" class="lbl">Wait MoE</text>
+  <text x="204" y="235" class="ms">27.18 s</text>
+  <text x="204" y="249" class="pct" fill="#1a7f37">57% 峰值</text>
+
+  <rect x="356" y="196" width="176" height="62" class="box"/>
+  <text x="370" y="218" class="lbl">Step6 HC FFN In</text>
+  <text x="370" y="235" class="ms">1.54 s</text>
+  <text x="370" y="249" class="ms">7 次 dispatch 的发射开销</text>
+
+  <rect x="548" y="196" width="150" height="62" class="box"/>
+  <text x="562" y="218" class="lbl">gather + ring</text>
+  <text x="562" y="235" class="ms">1.34 s</text>
+  <text x="562" y="249" class="ms">6.7% / 1.1%（已排除）</text>
+
+  <rect x="714" y="196" width="150" height="62" class="box-hi"/>
+  <text x="728" y="218" class="lbl">未归类</text>
+  <text x="728" y="235" class="ms">~6.3 s</text>
+  <text x="728" y="249" class="ms">7.3%</text>
+
+  <!-- classification legend -->
+  <rect x="24" y="276" width="840" height="54" fill="#ffffff" stroke="#d0d7de" stroke-width="1" rx="6"/>
+  <text x="38" y="296" class="lbl">按效率分类（79.04 s 里已归类 92.7%）</text>
+  <rect x="38" y="304" width="12" height="12" fill="#eaf7ee" stroke="#1a7f37"/>
+  <text x="56" y="314" class="ms">已到顶 57.3% — 实测 57–76% of FP16 峰值</text>
+  <rect x="288" y="304" width="12" height="12" fill="#fff8e6" stroke="#bf8700"/>
+  <text x="306" y="314" class="ms">有空间 30.2% — 但受硬件约束</text>
+  <rect x="516" y="304" width="12" height="12" fill="#ffeceb" stroke="#cf222e"/>
+  <text x="534" y="314" class="ms">smem 天花板 — 32 KB 装不下 16 头</text>
+  <rect x="748" y="304" width="12" height="12" fill="#ffffff" stroke="#d0d7de"/>
+  <text x="766" y="314" class="ms">不计 3.7%</text>
+
+  <!-- ============ DECODE ============ -->
+  <text x="24" y="368" class="title">Decode — 22.74 ms / token = 43.97 t/s</text>
+  <text x="24" y="384" class="sub">几乎不随上下文衰减：150K 时仍有 ~41.5 t/s。GPU 在 command buffer 粒度 100% 驻留（空隙 0.07%）。</text>
+
+  <!-- decode bars -->
+  <g>
+    <rect x="24" y="400" width="460" height="34" class="box-ok"/>
+    <text x="38" y="421" class="lbl">dense_gemv</text>
+    <text x="300" y="421" class="ms">12.70 ms · 56% · <tspan class="pct" fill="#1a7f37">70.6% 峰值</tspan></text>
+
+    <rect x="24" y="442" width="340" height="34" class="box-cu"/>
+    <text x="38" y="463" class="lbl">moe_routed</text>
+    <text x="200" y="463" class="ms">9.37 ms · 41% · <tspan class="pct" fill="#cf222e">35.2% 峰值</tspan></text>
+
+    <rect x="24" y="484" width="80" height="34" class="box"/>
+    <text x="38" y="505" class="lbl">其余</text>
+    <text x="120" y="505" class="ms">0.7 ms · 3%</text>
+  </g>
+
+  <!-- MoE decomposition callout -->
+  <rect x="500" y="400" width="364" height="118" fill="#ffffff" stroke="#cf222e" stroke-width="1.2" rx="6"/>
+  <text x="516" y="420" class="lbl">MoE 的 244 GB/s 是怎么来的</text>
+  <text x="516" y="440" class="ms">721 GB/s　连续纯读（硬件峰值 724）</text>
+  <text x="516" y="458" class="ms">　↓ −28%　散读（6 个专家动态选）</text>
+  <text x="516" y="476" class="ms">522 GB/s　散读纯读</text>
+  <text x="516" y="494" class="ms">　↓ −43%　拆包装（查表 + 符号 + 掩码）</text>
+  <text x="516" y="512" class="ms">244 GB/s　实测（FMA 另占 9%，依赖链 0%）</text>
+
+  <!-- ============ BOTTOM: what it means ============ -->
+  <rect x="24" y="540" width="840" height="112" fill="#ffffff" stroke="#d0d7de" stroke-width="1" rx="6"/>
+  <text x="38" y="562" class="hdr">三条边界的实测依据（决定了所有优化方向是否成立）</text>
+
+  <text x="38" y="586" class="lbl">GPU 有空闲吗？</text>
+  <text x="170" y="586" class="ms">驻留 99.9–100%，1398 MHz 满频，104 W　⇒ 所有「重叠 / 消气泡」方案无效</text>
+
+  <text x="38" y="608" class="lbl">CPU 是瓶颈吗？</text>
+  <text x="170" y="608" class="ms">功耗 4.6 W（峰值约 50 W）= 10%　⇒ 所有「CPU 异步 / 卸载」方案无效</text>
+
+  <text x="38" y="630" class="lbl">带宽受限吗？</text>
+  <text x="170" y="630" class="ms">DRAM 14 GB/s = 峰值 2%　⇒ 所有「省带宽」方案无效</text>
+
+  <!-- footer -->
+  <text x="24" y="676" class="title">结论</text>
+  <text x="24" y="696" class="sub">在「不改模型、不买设备、逐位等价」三条约束下，prefill 与 decode 都已无两位数收益方向。</text>
+  <text x="24" y="714" class="sub">唯一还开着的两位数方向是放弃 0-ULP 去换 flash-attention 的 11–14%（其 18% 效率源于 32 KB smem 装不下 16 头）。</text>
+  <text x="24" y="736" class="sub">完整证据与每一次失败尝试：docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md</text>
+</svg>
