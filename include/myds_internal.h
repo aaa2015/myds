@@ -6,7 +6,9 @@
 #include "myds_tokenizer.h"
 #include "myds_metal.h"
 #include "myds_v41.h"
+#include "myds_snapshot_slots.h"   /* MYDS_ANCHOR_SLOTS_MAX / myds_anchor_slot */
 #include <stdbool.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -133,9 +135,15 @@ struct myds_context {
      * 系统提示词都会把 216 KB 写进 4 KB 数组，砸穿紧随其后的 anchor_len 与
      * img_emb_data/start/count/n（实测 SIGSEGV 在 prefill 的图像注入路径）。
      * 改为按上限动态分配；所有读写都必须先比对 anchor_cap。 */
-    int32_t             *anchor_tokens;   /* 容量 anchor_cap，0 = 功能关闭 */
-    uint32_t             anchor_cap;
-    uint32_t             anchor_len;
+    /* 2026-10-24：锚点从「单套」改成「多套」——按 MYDS_ANCHOR_SLOTS（默认 16）。
+     * 第 i 套占锚点槽 myds_anchor_slot(i)，token 前缀在 anchor_tokens[i]。
+     * 判定时遍历全部套、取【最长命中】；捕获时优先填空槽，满了替换最短的一套
+     * （最短的前缀复用价值最低）。 */
+    int32_t             *anchor_tokens[MYDS_ANCHOR_SLOTS_MAX];  /* 每套容量 anchor_cap */
+    uint32_t             anchor_len[MYDS_ANCHOR_SLOTS_MAX];     /* 0 = 空套 */
+    uint32_t             anchor_n;       /* 已占用套数（仅用于日志/统计） */
+    uint32_t             anchor_slots;   /* 运行时生效的套数上限（MYDS_ANCHOR_SLOTS） */
+    uint32_t             anchor_cap;     /* 每套的 token 容量（<= MYDS_ANCHOR_MAX_TOKENS） */
     /* previous_response_id：本请求传入的 prompt 只是【新增后缀】，前缀由 pcache_tokens 提供。
      * 一次性标志（引擎消费后自清），由服务端在收到该字段时设置。 */
     bool                 continue_from_cache;
@@ -284,6 +292,36 @@ uint32_t myds_v41_prompt_cache_max_tokens(void);
 uint32_t myds_v41_anchor_slots(void);
 uint32_t myds_v41_anchor_max_tokens(void);
 uint64_t myds_v41_end_stride_for(uint32_t max_tokens);   /* 每槽字节数（含 header/tail） */
+
+/* 2026-10-24：多套锚点的「最长前缀命中」选择器。
+ *
+ * 放在头文件里的 static inline，而不是 .c 里的外部函数：它是纯逻辑、无状态，
+ * 这样 engine 与单测都能直接用，单测不必为它链接整个 myds_v41.o。
+ *
+ * 为什么要有这条逻辑：若只取第一个命中，短前缀会抢走长前缀的请求，
+ * 长的那套就白存了 —— 多套的意义就是各前缀各得其所。
+ *
+ * 返回命中的 token 数（0 = 无命中），*out_index 给套号（UINT32_MAX = 无）。
+ * 命中的长度必须【严格小于】n_prompt：前缀缓存不能吃掉最后一个 token，
+ * 否则剩余 prefill 长度为负。 */
+static inline uint32_t myds_v41_anchor_pick(const int32_t *prompt, uint32_t n_prompt,
+                                            int32_t *const *anchors, const uint32_t *lens,
+                                            uint32_t count, uint32_t *out_index) {
+    if (out_index) *out_index = UINT32_MAX;
+    if (!prompt || !anchors || !lens || !n_prompt || !count) return 0;
+    uint32_t best_len = 0, best_i = UINT32_MAX;
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t L = lens[i];
+        if (!L || !anchors[i]) continue;
+        if (L >= n_prompt) continue;            /* 留至少一个 token 给 decode */
+        if (L <= best_len) continue;            /* 已有更长命中 */
+        if (memcmp(prompt, anchors[i], (size_t)L * sizeof(int32_t)) == 0) {
+            best_len = L; best_i = i;
+        }
+    }
+    if (best_i != UINT32_MAX && out_index) *out_index = best_i;
+    return best_len;
+}
 bool myds_validate_fp8_block_size(const gguf_file_t *gf, const char *arch);
 
 #ifdef __cplusplus

@@ -29,6 +29,27 @@
 #define MYDS_SNAP_MIN      1024u /* 低于此长度不值得存（太浅的前缀复用价值低） */
 #define MYDS_SNAP_PINNED   21u   /* 固定槽数量：覆盖位置 1024 .. 1024+(PINNED-1)*STRIDE = 11264 */
 
+/* 2026-10-24：常驻锚点（system prompt）独立槽区，紧接在 MYDS_SNAP_SLOTS 之后。
+ *
+ * ★ 为什么不能复用槽 43：44 个槽的分配是「槽 0 = prompt-end，槽 1..21 = 固定低位区，
+ *   槽 22..43 = ring 取模复用」。原实现让锚点独占槽 43，等于从 ring 里切走一个。
+ *   现在锚点要 N 套（MYDS_ANCHOR_SLOTS，默认 16），若从 ring 里切 16 个，
+ *   ring 只剩 6 个 ⇒ 深位置 RAM 快照覆盖从 22×512 步掉到 6×512 步，
+ *   长 prompt 的兄弟请求命中会明显退化。
+ *   所以锚点开在 44 之后的独立区：ring 公式与落槽分布一个字都不动。
+ *
+ * 槽是【按需分配】的（snapshot_ensure_slot），所以把容量上限提高不会预占内存；
+ * 真正用了几套 system prompt 才分配几个槽（约 10.5 MB/套）。 */
+#define MYDS_ANCHOR_SLOTS_MAX 16u   /* 数组容量上限，运行时用 MYDS_ANCHOR_SLOTS（1..16） */
+
+/* 槽数组的真实容量：常规 44 槽 + 锚点区上限。 */
+#define MYDS_SLOT_CAPACITY  (MYDS_SNAP_SLOTS + MYDS_ANCHOR_SLOTS_MAX)
+
+/* 锚点区的第 i 个槽。i 必须 < 运行时生效的锚点槽数。 */
+static inline uint32_t myds_anchor_slot(uint32_t i) {
+    return MYDS_SNAP_SLOTS + i;
+}
+
 /* 位置 p 的快照该放哪个槽。`is_last` 表示这是本次序列的末尾点。
  * 调用方需保证 p >= MYDS_SNAP_MIN（更浅的点本就不存）。 */
 static inline uint32_t myds_snap_slot_for(uint32_t p, int is_last) {

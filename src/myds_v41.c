@@ -90,8 +90,11 @@ struct myds_v41_model {
 #include "myds_snapshot_slots.h"
 #include "myds_kvdsk.h"
 #include "myds_lowkv_policy.h"
-#define V41_SNAP_SLOTS   MYDS_SNAP_SLOTS
-#define V41_ANCHOR_SLOT  MYDS_V41_ANCHOR_SLOT
+#define V41_SNAP_SLOTS   MYDS_SNAP_SLOTS     /* 常规槽数（0 / 1..21 / ring 22..43） */
+#define V41_SLOT_CAPACITY MYDS_SLOT_CAPACITY  /* 数组容量：常规 + 锚点区 */
+/* 2026-10-24：锚点不再占用 ring 里的槽 43，改用独立槽区的首槽。
+ * 槽是 44 起 —— 见 MYDS_ANCHOR_SLOTS_MAX 的说明。 */
+#define V41_ANCHOR_SLOT  myds_anchor_slot(0u)
 /* 快照点必须是 chunk 边界；512 同时满足 ratio(2)/32 键块的对齐要求。
  * ★ 它还是【偶数】这一点是承重的：压缩器的 pool2 跨位置有状态（previous_kv/previous_score），
  *   但只在【奇数】位置被读取 —— 从偶数位置续跑时它先被本位置覆盖，因此无需进快照。
@@ -123,12 +126,12 @@ struct myds_v41_context {
     myds_metal_buffer_t *engram_rows[2], *engram_kv;
     myds_metal_buffer_t *window[V41_LAYERS];
     /* 快照：每槽把 V41_LAYERS 层的窗口环连续存放（40 x 256 KB = 10.5 MB/槽） */
-    myds_metal_buffer_t *snap_window[V41_SNAP_SLOTS];
-    uint32_t              snap_pos[V41_SNAP_SLOTS];      /* 0 = 空槽，仅全部层与压缩器状态写入后才对外发布 */
-    uint32_t              snap_staged_pos[V41_SNAP_SLOTS]; /* 准备中尚未发布的快照位置 */
-    myds_engram_history_t snap_engram[V41_SNAP_SLOTS];
-    myds_metal_buffer_t *snap_prev_kv[V41_SNAP_SLOTS][4];
-    myds_metal_buffer_t *snap_prev_score[V41_SNAP_SLOTS][4];
+    myds_metal_buffer_t *snap_window[V41_SLOT_CAPACITY];
+    uint32_t              snap_pos[V41_SLOT_CAPACITY];      /* 0 = 空槽，仅全部层与压缩器状态写入后才对外发布 */
+    uint32_t              snap_staged_pos[V41_SLOT_CAPACITY]; /* 准备中尚未发布的快照位置 */
+    myds_engram_history_t snap_engram[V41_SLOT_CAPACITY];
+    myds_metal_buffer_t *snap_prev_kv[V41_SLOT_CAPACITY][4];
+    myds_metal_buffer_t *snap_prev_score[V41_SLOT_CAPACITY][4];
     bool                  snap_enabled;
     /* 低位区 KV 的磁盘存储（NULL = 未启用）。由引擎在创建后显式打开。 */
     myds_kvdsk_t         *low_store;
@@ -185,7 +188,7 @@ static void lowkv_join(myds_v41_context_t *g);   /* 低位区后台写盘的汇�
 /* Allocate a slot only when it is first captured. Disabled snapshots own no
  * slot buffers; published slots always have the complete set of resources. */
 static bool snapshot_ensure_slot(myds_v41_context_t *g, uint32_t s) {
-    if (!g || !g->snap_enabled || s >= V41_SNAP_SLOTS) return false;
+    if (!g || !g->snap_enabled || s >= V41_SLOT_CAPACITY) return false;
     if (!g->snap_window[s])
         g->snap_window[s] = myds_metal_buffer_alloc((size_t)V41_LAYERS * V41_WINDOW * V41_HEAD_DIM * 4u);
     if (!g->snap_window[s]) return false;
@@ -201,7 +204,8 @@ void myds_v41_snapshot_clear(myds_v41_context_t *g, uint32_t keep_up_to) {
     if (!g) return;
     lowkv_join(g);   /* 每个请求开头都会走到这里（engine 在 prefill/decode 之前调） */
     for (uint32_t s = 0; s < V41_SNAP_SLOTS; ++s) {
-        if (s == V41_ANCHOR_SLOT) continue; /* 常量锚点槽跨请求持久保留，不受常规清理影响 */
+        /* 锚点区在 V41_SNAP_SLOTS 之后，本循环天然不触及 ⇒ 跨请求持久保留。
+         * 这里不再需要按槽号 skip。 */
         if (g->snap_pos[s] > keep_up_to) g->snap_pos[s] = 0;
         if (g->snap_staged_pos[s] > keep_up_to) g->snap_staged_pos[s] = 0;
     }
@@ -212,9 +216,9 @@ void myds_v41_snapshot_clear(myds_v41_context_t *g, uint32_t keep_up_to) {
  * 下一个兄弟请求又要全量重跑 —— 实测就是这样退化的（第 2 次命中 40x，第 3 次全量）。
  * 末尾点恰好是「下一个兄弟请求最可能用到的」那一个，所以给它一个固定槽、每次覆盖。 */
 static uint32_t snapshot_slot_for(uint32_t p, bool is_last) {
-    uint32_t s = myds_snap_slot_for(p, is_last ? 1 : 0);
-    if (s == V41_ANCHOR_SLOT) s = 42u; /* 保护 slot 43 专供常驻锚点 */
-    return s;
+    /* 锚点已迁到独立槽区（>= MYDS_SNAP_SLOTS），ring 落在 22..43 内，
+     * 两者不再交集 ⇒ 原先「落在 43 就改道 42」的保护不再需要。 */
+    return myds_snap_slot_for(p, is_last ? 1 : 0);
 }
 
 /* Retain every checkpoint the configured suffix window can actually publish.
@@ -334,7 +338,7 @@ static bool snapshot_store_window(myds_v41_context_t *g, uint32_t il, uint32_t p
  * ★ 批量提交：40 层窗口 + 4 previous KV + 4 previous score = 48 次复制编进同一 CB。
  * ★ 事务一致性：覆盖 slot 前先清除其 snap_pos 与 snap_staged_pos。 */
 bool myds_v41_snapshot_store_slot(myds_v41_context_t *g, uint32_t slot, uint32_t p) {
-    if (!g || !g->snap_enabled || !p || p < 4u || slot >= V41_SNAP_SLOTS) return false;
+    if (!g || !g->snap_enabled || !p || p < 4u || slot >= V41_SLOT_CAPACITY) return false;
     lowkv_join(g);
     /* 首次覆盖指定 slot 前使原发布标签和 staged 标记失效。 */
     g->snap_pos[slot] = 0;
@@ -385,7 +389,12 @@ bool myds_v41_snapshot_store_now(myds_v41_context_t *g, uint32_t p) {
     return myds_v41_snapshot_store_slot(g, 0, p);
 }
 
-/* 在 [0, common] 内选最大的快照点 */
+/* 在 [0, common] 内选最大的快照点。
+ *
+ * ★ 刻意【不】扫描锚点区（>= V41_SNAP_SLOTS）。锚点槽里留的是「上一次那套 system
+ *   提示词」的位置；若把它当普通候选点，system 变了但长度恰好覆盖 common 时就会
+ *   从【错误的状态】续跑 —— 那是静默的错误输出，比慢一点严重得多。
+ *   锚点只能经由 engine 里显式的 token 前缀比对来使用。 */
 uint32_t myds_v41_snapshot_best(const myds_v41_context_t *g, uint32_t common) {
     if (!g->snap_enabled) return 0;
     uint32_t best = 0;
@@ -398,7 +407,10 @@ uint32_t myds_v41_snapshot_best(const myds_v41_context_t *g, uint32_t common) {
 bool myds_v41_snapshot_restore(myds_v41_context_t *g, uint32_t p) {
     lowkv_join(g);   /* restore 会改活窗口环；与线程读的 snap_window 同源 */
     if (!myds_metal_commit_batch()) return false;
-    for (uint32_t s = 0; s < V41_SNAP_SLOTS; ++s) {
+    /* 2026-10-24：遍历到 V41_SLOT_CAPACITY（含锚点区）。锚点槽是「位置 p 的可续跑状态」，
+     * 恢复时按 p 精确匹配 ⇒ 只有在 engine 已确认前缀一致、并把 resume_from 设成
+     * anchor_len 之后才会命中，不存在误用。 */
+    for (uint32_t s = 0; s < V41_SLOT_CAPACITY; ++s) {
         if (g->snap_pos[s] != p) continue;
         /* 开一个新 batch，把全部复制编进同一 command buffer。 */
         if (!myds_metal_begin_batch()) return false;
@@ -736,11 +748,11 @@ fail:
 }
 
 uint32_t myds_v41_snapshot_get_pos(const myds_v41_context_t *g, uint32_t slot) {
-    return (g && slot < V41_SNAP_SLOTS) ? g->snap_pos[slot] : 0;
+    return (g && slot < V41_SLOT_CAPACITY) ? g->snap_pos[slot] : 0;
 }
 
 uint32_t myds_v41_snapshot_get_staged_pos(const myds_v41_context_t *g, uint32_t slot) {
-    return (g && slot < V41_SNAP_SLOTS) ? g->snap_staged_pos[slot] : 0;
+    return (g && slot < V41_SLOT_CAPACITY) ? g->snap_staged_pos[slot] : 0;
 }
 
 myds_metal_buffer_t *myds_v41_snapshot_get_window(myds_v41_context_t *g, uint32_t layer) {
@@ -2641,7 +2653,7 @@ void myds_v41_low_kv_fixture_fail_segment(myds_v41_context_t *g, uint32_t end) {
 }
 
 void myds_v41_snapshot_fixture_publish(myds_v41_context_t *g, uint32_t slot, uint32_t p) {
-    if (!g || slot >= V41_SNAP_SLOTS) return;
+    if (!g || slot >= V41_SLOT_CAPACITY) return;
     if (g->engram) g->snap_engram[slot] = g->engram->history;
     g->snap_pos[slot] = p;
 }
