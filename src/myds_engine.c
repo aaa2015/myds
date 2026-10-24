@@ -3498,6 +3498,18 @@ static int myds_generate_internal(myds_context_t *ctx,
                     break;
                 }
             }
+            /* 2026-10-24：重启后 ctx->anchor_len == 0，但磁盘上可能已有该位置的锚点。
+             * 先尝试从 kvdisk 恢复（含 tail），成功就直接用，跳过系统提示词重算。
+             * 实测 52K tok 的系统提示词 ≈ 88 秒 prefill，恢复约 100 ms。 */
+            if (anchor_pos >= 4u && anchor_pos < (uint32_t)n_prompt - 1u &&
+                ctx->anchor_len == 0 && ctx->v41) {
+                const uint32_t got = myds_v41_low_kv_load_anchor(ctx->v41, prompt_tokens, anchor_pos);
+                if (got == anchor_pos) {
+                    memcpy(ctx->anchor_tokens, prompt_tokens, (size_t)anchor_pos * sizeof(int32_t));
+                    ctx->anchor_len = anchor_pos;
+                    MYDS_LOG_I("prefix cache: anchor restored from disk · %u tok · skip system-prompt re-prefill", anchor_pos);
+                }
+            }
             /* 2026-10-24：锚点上限改为可配置。原写死 1024，而实测主流 agent 远超：
              *   20,000 字符 → 5,607 tok；60,000 → 18,271；180,000 → 52,249（OpenClaw 实测）
              * MYDS_ANCHOR_MAX_TOKENS 默认 65536，覆盖主流 agent（含工具定义）。

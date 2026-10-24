@@ -850,7 +850,26 @@ const float *myds_v41_diagnostic_current_pre(const myds_v41_context_t *g) {
 #define V41_LOWKV_SEG_ABI 1u
 #define V41_LOWKV_END_ABI 0x34314531u /* '41E1' prompt-end snapshot */
 #define V41_LOWKV_ENDS_MAX 32u
-#define V41_LOWKV_END_STRIDE 14680064ull /* 14 MiB */
+#define V41_LOWKV_END_STRIDE_DEFAULT_MIB 14u
+#define V41_LOWKV_END_STRIDE_MAX_MIB     512u
+/* 2026-10-24：end/anchor 快照的每槽 stride 改为可配置。
+ *
+ * 原来写死 14 MiB，只够 [base_end, p) 的 tail ≈ 1000 token。
+ * 主流 agent 的系统提示词远超（实测 52249 tok），tail 需要 ~131 MiB。
+ * MYDS_KV_DSK_END_MIB 默认 14（保持旧行为），可设到 512。 */
+static uint64_t v41_lowkv_end_stride(void) {
+    static uint64_t cached = 0;
+    if (cached) return cached;
+    uint64_t mib = V41_LOWKV_END_STRIDE_DEFAULT_MIB;
+    const char *e = getenv("MYDS_KV_DSK_END_MIB");
+    if (e && *e) {
+        const long v = atol(e);
+        if (v >= 1 && v <= (long)V41_LOWKV_END_STRIDE_MAX_MIB) mib = (uint64_t)v;
+    }
+    cached = mib * 1048576ull;
+    return cached;
+}
+#define V41_LOWKV_END_STRIDE v41_lowkv_end_stride()
 #define V41_LOWKV_ENTRY_IS_END 0x80000000u
 #define V41_LOWKV_REF_BYTES 32u
 #define V41_CACHE_BYTES  2u
@@ -1563,7 +1582,7 @@ static bool lowkv_end_refs_match(myds_v41_context_t *g, uint32_t entry,
 
 static bool lowkv_write_end_slot(myds_v41_context_t *g, uint32_t entry,
     uint32_t p, uint64_t hash, uint32_t base_count, uint32_t base_end,
-    const lowkv_segment_ref_t *refs, unsigned char *stage) {
+    const lowkv_segment_ref_t *refs, unsigned char *stage, uint32_t src_slot) {
     const uint32_t window_bytes = V41_WINDOW * V41_HEAD_DIM * 4u;
     const uint64_t total_bytes = lowkv_end_payload_bytes(p, base_count, base_end);
 
@@ -1585,15 +1604,15 @@ static bool lowkv_write_end_slot(myds_v41_context_t *g, uint32_t entry,
     uint64_t off = V41_LOWKV_HEADER;
 
     /* 1. Engram history (12 bytes) */
-    if (!myds_kvdsk_write_chunk(g->low_ends, off, &g->snap_engram[0], sizeof(myds_engram_history_t))) goto bad;
+    if (!myds_kvdsk_write_chunk(g->low_ends, off, &g->snap_engram[src_slot], sizeof(myds_engram_history_t))) goto bad;
     off += sizeof(myds_engram_history_t);
 
     /* 2. Prev KV (4 * 2048) & Score (4 * 2048) = 16384 bytes */
     for (uint32_t o = 0; o < 4u; ++o) {
-        if (!lowkv_emit(g->low_ends, g->snap_prev_kv[0][o], 512u * 4u, stage, &off, 0)) goto bad;
+        if (!lowkv_emit(g->low_ends, g->snap_prev_kv[src_slot][o], 512u * 4u, stage, &off, 0)) goto bad;
     }
     for (uint32_t o = 0; o < 4u; ++o) {
-        if (!lowkv_emit(g->low_ends, g->snap_prev_score[0][o], 512u * 4u, stage, &off, 0)) goto bad;
+        if (!lowkv_emit(g->low_ends, g->snap_prev_score[src_slot][o], 512u * 4u, stage, &off, 0)) goto bad;
     }
 
     /* 3. Window (40 layers * window_bytes) */
@@ -2215,7 +2234,7 @@ bool myds_v41_low_kv_save(myds_v41_context_t *g, const int32_t *tokens, uint32_t
                     if (end_ok) {
                         if (!already || !lowkv_end_refs_match(g, end_slot, bc, refs)) {
                             const double t_end0 = lowkv_now_ms();
-                            if (lowkv_write_end_slot(g, end_slot, p_end, end_hash, bc, be, refs, stage)) {
+                            if (lowkv_write_end_slot(g, end_slot, p_end, end_hash, bc, be, refs, stage, 0)) {
                                 MYDS_LOG_I("kvdisk: prompt-end 快照落盘成功 · 槽 %u · 位置 %u (base %u, tail %u) · %.1f MiB · %.1f ms",
                                            end_slot, p_end, be, p_end - be, (double)end_bytes / 1048576.0, lowkv_now_ms() - t_end0);
                             } else {
@@ -2227,6 +2246,58 @@ bool myds_v41_low_kv_save(myds_v41_context_t *g, const int32_t *tokens, uint32_t
                         ok = false;
                     }
                     free(stage);
+                }
+            }
+        }
+
+        /* 2026-10-24：锚点（system prompt）落盘。
+         *
+         * 与 prompt-end 同一套 end 快照格式，差别：
+         *   · 源槽是 RAM 的 slot 43（V41_ANCHOR_SLOT），不是 slot 0
+         *   · base 用满 21 段（[0, 11264)），tail 覆盖 [11264, anchor_pos)
+         *   · 需 MYDS_KV_DSK_END_MIB 足够大（52K 系统提示词约 140 MiB）
+         *
+         * 重启后系统提示词段可直接复用（实测 52K tok ≈ 88 秒 prefill）。 */
+        if (g->snap_pos[V41_ANCHOR_SLOT] > MYDS_SNAP_MIN && g->low_ends) {
+            const uint32_t p_anchor = g->snap_pos[V41_ANCHOR_SLOT];
+            const uint32_t bc_anchor = MYDS_SNAP_PINNED;
+            const uint32_t be_anchor = lowkv_segment_end(MYDS_SNAP_PINNED - 1u);
+            const uint64_t anchor_hash = myds_kvdsk_hash_tokens(tokens, p_anchor);
+            const uint64_t anchor_bytes = lowkv_end_payload_bytes(p_anchor, bc_anchor, be_anchor);
+            if (anchor_bytes > V41_LOWKV_END_STRIDE) {
+                MYDS_LOG_W("kvdisk: anchor at %u needs %.1f MiB > end stride %.1f MiB; "
+                           "raise MYDS_KV_DSK_END_MIB to persist it",
+                           p_anchor, (double)anchor_bytes / 1048576.0,
+                           (double)V41_LOWKV_END_STRIDE / 1048576.0);
+            } else {
+                bool anchor_already = false;
+                const uint32_t anchor_entry = lowkv_pick_end_entry(g, p_anchor, anchor_hash, anchor_bytes, &anchor_already);
+                if (anchor_entry == V41_LOWKV_NO_ENTRY) {
+                    MYDS_LOG_W("kvdisk: anchor at %u found no end slot", p_anchor);
+                } else if (!anchor_already) {
+                    lowkv_segment_ref_t anchor_refs[MYDS_SNAP_PINNED];
+                    unsigned char *astage = (unsigned char *)malloc(V41_LOWKV_STAGE);
+                    bool anchor_ok = (astage != NULL);
+                    /* ★ 不依赖 have_hash：单 chunk prefill（macroblock 自适应）时
+                     * snap_pos[1..21] 全为 0，job 循环不跑，prefix_hashes 是空的。
+                     * 这里直接按 tokens 前缀算哈希 —— lowkv_ensure_segment 从
+                     * g->compressed/index_cache 读实时 KV，prefill 刚结束仍然有效。 */
+                    for (uint32_t j = 0; j < bc_anchor && anchor_ok; ++j) {
+                        const uint64_t h = myds_kvdsk_hash_tokens(tokens, lowkv_segment_end(j));
+                        anchor_ok = h && lowkv_ensure_segment(g, j, h, astage, &anchor_refs[j]);
+                    }
+                    if (anchor_ok) {
+                        const double ta0 = lowkv_now_ms();
+                        if (lowkv_write_end_slot(g, anchor_entry, p_anchor, anchor_hash,
+                                                 bc_anchor, be_anchor, anchor_refs, astage, V41_ANCHOR_SLOT)) {
+                            MYDS_LOG_I("kvdisk: anchor 落盘成功 · 槽 %u · 位置 %u (base %u, tail %u) · %.1f MiB · %.1f ms",
+                                       anchor_entry, p_anchor, be_anchor, p_anchor - be_anchor,
+                                       (double)anchor_bytes / 1048576.0, lowkv_now_ms() - ta0);
+                        } else {
+                            MYDS_LOG_W("kvdisk: anchor 位置 %u 写盘失败", p_anchor);
+                        }
+                    }
+                    free(astage);
                 }
             }
         }
@@ -2333,6 +2404,37 @@ uint32_t myds_v41_low_kv_load_deeper(myds_v41_context_t *g, const int32_t *token
     MYDS_LOG_I("kvdisk: 命中位置 %u (%s) ⇒ 免掉 %u 个 token 的 prefill (load+publish %.3f ms)",
                best_pos, is_end ? "prompt-end" : "pinned", best_pos, lowkv_now_ms() - started_ms);
     return best_pos;
+}
+
+/* 2026-10-24：重启后恢复系统提示词锚点。
+ *
+ * 锚点在 RAM 里是 slot 43，落盘时用 end 快照格式（与 prompt-end 同构）。
+ * 重启后 anchor_len == 0，引擎会重新扫描 <|User|> 得到 anchor_pos，
+ * 然后调用本函数：若磁盘上恰有该位置的条目且前缀哈希匹配，就恢复到 slot 43。
+ *
+ * 恢复后 ctx->anchor_len 仍需由引擎设置 —— 本函数只负责 RAM 状态。
+ * 返回恢复到的位置（0 = 无可用条目）。 */
+uint32_t myds_v41_low_kv_load_anchor(myds_v41_context_t *g, const int32_t *tokens, uint32_t anchor_pos) {
+    if (!g || !g->low_ends || !tokens || anchor_pos <= MYDS_SNAP_MIN) return 0;
+    if (!myds_metal_commit_batch()) return 0;
+    const uint64_t want_hash = myds_kvdsk_hash_tokens(tokens, anchor_pos);
+    const double t0 = lowkv_now_ms();
+    for (uint32_t e = 0; e < V41_LOWKV_ENDS_MAX; ++e) {
+        uint32_t pos = 0; uint64_t hash = 0, used = 0;
+        if (!myds_kvdsk_slot_meta(g->low_ends, e, &pos, &hash, &used)) continue;
+        if (pos != anchor_pos || hash != want_hash) continue;
+        lowkv_restore_stage_t stage = {0};
+        const bool ok = lowkv_stage_slot(g, e | V41_LOWKV_ENTRY_IS_END, anchor_pos, tokens, &stage) &&
+                        lowkv_publish_stage(g, V41_ANCHOR_SLOT, anchor_pos, &stage);
+        if (ok) {
+            MYDS_LOG_I("kvdisk: 锚点恢复成功 · 位置 %u · %.1f MiB · %.1f ms",
+                       anchor_pos, (double)used / 1048576.0, lowkv_now_ms() - t0);
+            return anchor_pos;
+        }
+        lowkv_restore_stage_free(&stage);
+    }
+    MYDS_LOG_I("kvdisk: 无可用锚点条目 at %u（首次运行或预算不足）", anchor_pos);
+    return 0;
 }
 
 uint32_t myds_v41_low_kv_load(myds_v41_context_t *g, const int32_t *tokens,

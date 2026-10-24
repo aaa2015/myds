@@ -102,6 +102,10 @@ uint32_t myds_v41_low_kv_load(myds_v41_context_t *context, const int32_t *tokens
  * when the earlier metadata probe has become unavailable. */
 uint32_t myds_v41_low_kv_load_deeper(myds_v41_context_t *context, const int32_t *tokens,
                                      uint32_t memory_position, uint32_t max_position);
+
+/* 2026-10-24：重启后恢复系统提示词锚点到 slot 43。返回恢复位置，0=无。 */
+uint32_t myds_v41_low_kv_load_anchor(myds_v41_context_t *context, const int32_t *tokens,
+                                    uint32_t anchor_pos);
 /* 落盘条目的诊断信息（命中数 / 有效数），供日志与测试读取。 */
 void     myds_v41_low_kv_stats(const myds_v41_context_t *context,
                                uint32_t *live_entries, uint32_t *slots);
