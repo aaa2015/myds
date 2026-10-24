@@ -12,7 +12,7 @@
  *   它【不能】证明的：
  *     · MYDS_YOCO_COMPACT=1 时输出与 =0 是否语义等价
  *     · consumer 层窗口被 memset 清零后，decode 推进 12 步是否喂零
- *     · 前缀缓存中间快照能否发布（keep=140 不是 512 倍数）
+ *     · 前缀缓存中间快照能否发布（keep 必须是 V41_SNAP_STRIDE=512 的倍数）
  *
  *   真正的行为验证需要：同一 prompt 在开关两臂各跑一次，比对输出与质量指标。
  *   在那之前，MYDS_YOCO_COMPACT 必须保持默认关闭。
@@ -78,9 +78,17 @@ static void test_yoco_compact_bounds(uint32_t n_tokens, uint32_t keep_tokens) {
 int main(void) {
     printf("[TEST] Testing YoCo Compact prefill scheduling bounds...\n");
 
-    const uint32_t keep_tokens = 140u;
+    /* 2026-10-25：140 → 512。
+     * 140 有两个量化后确认的缺陷：
+     *   ① 窗口 128 需要前 127 个 token 预热（consumer 层的 window 被 memset 清零，
+     *      carry_stage 只搬 window 不读 KV cache ⇒ 零窗口逐位污染）。
+     *      keep=140 时精确 token 只有 140-127 = 13 个，decode 第 1 步就要 128 个
+     *      真实历史 ⇒ decode 也错。安全下限 = 128 + 127 = 255。
+     *   ② 140 不是 V41_SNAP_STRIDE(512) 的倍数 ⇒ 中途快照点发布不出来。
+     * 512 同时满足两条。 */
+    const uint32_t keep_tokens = 512u;
     const uint32_t test_lens[] = {
-        1u, 16u, 64u, 128u, 140u, 141u, 256u, 512u, 1024u, 2048u, 4096u, 8192u, 16384u, 32768u, 65536u
+        1u, 16u, 64u, 128u, 255u, 256u, 511u, 512u, 513u, 1024u, 2048u, 4096u, 8192u, 16384u, 32768u, 65536u
     };
 
     uint64_t total_moe_avoided = 0;
@@ -100,7 +108,7 @@ int main(void) {
     /* Verify 32K context savings */
     const uint32_t n_32k = 32768u;
     const uint64_t avoided_32k = (uint64_t)(n_32k - keep_tokens) * 20u;
-    REQUIRE(avoided_32k == (32768 - 140) * 20); /* 652,560 token-layer MoE evaluations saved! */
+    REQUIRE(avoided_32k == (32768 - 512) * 20); /* 645,120 token-layer MoE evaluations saved! */
 
     printf("[PASS] YoCo Compact prefill scheduling passed for all %zu test lengths!\n",
            sizeof(test_lens) / sizeof(test_lens[0]));

@@ -7285,15 +7285,48 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
      * 默认关（0），保持绝对 0-ULP 基线；设 MYDS_YOCO_COMPACT=1 开启。 */
     const char *yoco_compact_env = getenv("MYDS_YOCO_COMPACT");
     const bool opt_yoco_compact = (yoco_compact_env && atoi(yoco_compact_env) != 0);
-    uint32_t yoco_keep_tokens = 140u;
+
+    /* 2026-10-25 收紧：keep_tokens 的默认值与下限 128/140 → V41_SNAP_STRIDE(512)。
+     *
+     * 原值 140 有两个真问题（都是量出来的，不是估的）：
+     *
+     * ① 窗口污染。consumer 层从 sh_full_rel 起跑时 g->window[il] 被 memset 清零，
+     *    而 carry_stage 只是把 window 搬到暂存区（不读 KV cache）⇒ 搬的全是零。
+     *    位置 p 的 KV 坏 ⇒ p+1 的窗口含坏值 ⇒ 逐位传播、永不恢复。
+     *    要位置 p 的输出可用，需要它的 128 长度窗口全是真值 ⇒ 保留区前 127 个
+     *    只能算「预热」。keep=140 时真正精确的只有 140-127 = 13 个 token。
+     *    decode 第 1 步就要 [N-127, N-1]，其中前 114 个是坏的 ⇒ decode 也错。
+     *    ⇒ 安全下限是 128 + 127 = 255。
+     *
+     * ② 快照网格。keep=140 不是 V41_SNAP_STRIDE 的倍数，chunk 末端落不到 512
+     *    网格上，前缀缓存的中间快照点无法发布（见 prefill_snapshot_grid_shift
+     *    的注释），长 prompt 复用退化。
+     *
+     * 取 512 同时满足：>= 255（窗口可预热）、是 512 的倍数（快照可发布）。
+     * 代价：跳过 N-512 而不是 N-140 —— N=300K 时覆盖率 99.83% vs 99.95%，
+     * 差 0.12 个百分点，相对收益几乎不变。 */
+    uint32_t yoco_keep_tokens = V41_SNAP_STRIDE;
     {
         const char *yke = getenv("MYDS_YOCO_KEEP_TOKENS");
         if (yke && *yke) {
             long v = atol(yke);
-            if (v >= 128) yoco_keep_tokens = (uint32_t)v;
-            else if (v > 0) {
-                MYDS_LOG_W("MYDS_YOCO_KEEP_TOKENS=%ld 小于滑窗 128，重置为 128", v);
-                yoco_keep_tokens = 128u;
+            const long kmin = (long)(V41_WINDOW + V41_WINDOW - 1u);   /* 255 */
+            if (v < kmin) {
+                MYDS_LOG_W("MYDS_YOCO_KEEP_TOKENS=%ld 小于安全下限 %ld"
+                           "（窗口 %u 需要前 %u 个 token 预热，否则 KV 从零窗口逐位污染）"
+                           " ⇒ 重置为 %ld",
+                           v, kmin, (unsigned)V41_WINDOW, (unsigned)(V41_WINDOW - 1u), kmin);
+                yoco_keep_tokens = (uint32_t)kmin;
+            } else {
+                yoco_keep_tokens = (uint32_t)v;
+            }
+            /* 对齐到快照网格：否则中途快照点发布不出来 */
+            const uint32_t aligned = ((yoco_keep_tokens + V41_SNAP_STRIDE - 1u) / V41_SNAP_STRIDE) * V41_SNAP_STRIDE;
+            if (aligned != yoco_keep_tokens) {
+                MYDS_LOG_W("MYDS_YOCO_KEEP_TOKENS=%u 不是 %u 的倍数，"
+                           "对齐到 %u 以保证前缀快照点可发布",
+                           yoco_keep_tokens, (unsigned)V41_SNAP_STRIDE, aligned);
+                yoco_keep_tokens = aligned;
             }
         }
     }
@@ -7534,8 +7567,15 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 if (!shrink_logged) {
                     shrink_logged = true;
                     if (opt_yoco_compact) {
-                        MYDS_LOG_I("V4.1 suffix shrink[YOCO COMPACT]: keep_tokens=%u (total=%u, consumer start=%u)",
-                                   yoco_keep_tokens, base_pos + n_tokens, sh_s_global);
+                        /* 如实打印：前 127 个是窗口预热（不精确），后面才可信。
+                         * 不写清楚的话，看到 keep=512 会误以为 512 个都精确。 */
+                        MYDS_LOG_W("V4.1 suffix shrink[YOCO COMPACT — 近似，非 0-ULP]: "
+                                   "keep_tokens=%u, 其中前 %u 个仅用于窗口预热（输出不精确），"
+                                   "可信区间 = 末尾 %u 个 (total=%u, consumer start=%u)",
+                                   yoco_keep_tokens, (unsigned)(V41_WINDOW - 1u),
+                                   (unsigned)(yoco_keep_tokens > V41_WINDOW - 1u
+                                              ? yoco_keep_tokens - (V41_WINDOW - 1u) : 0u),
+                                   base_pos + n_tokens, sh_s_global);
                     } else {
                         MYDS_LOG_I("V4.1 suffix shrink[snapshot-guard v2]: front=%s shift=%u valid_from=%u "
                                    "(total=%u, layer20 rows=%u..%u of %u)",
