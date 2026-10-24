@@ -3936,7 +3936,18 @@ static inline int32_t sample_and_verify_token(const float *logits, uint32_t voca
      * 现在只要任一惩罚偏离默认值，就退回通用采样器，让 PEN_APPLY 生效。
      * 惩罚全默认时仍走这条 NEON 快速路径，性能不变。 */
     const bool has_penalty = (rep_pen != 1.0f) || (pres_pen != 0.0f);
-    if (temp <= 0.0f && !has_penalty) {
+
+    /* 2026-10-25：结构化输出的 bitmask 也必须在快速路径的准入条件里。
+     *
+     * myds_sample_greedy_finite_neon 是纯 argmax，它看不到 bitmask ⇒
+     * 若设了 bitmask 仍走这条路径，约束会被静默丢弃。而结构化输出几乎
+     * 必然用 temp=0，等于「功能完全失效且无任何提示」。
+     *
+     * 这与今天 presence_penalty 被同一条路径吞掉是同一个形状：
+     * 快速路径的准入条件必须覆盖【所有】会影响结果的因素。 */
+    const bool has_bitmask = (cfg && cfg->logit_bitmask != NULL)
+                             || (ctx && ctx->logit_bitmask != NULL);
+    if (temp <= 0.0f && !has_penalty && !has_bitmask) {
         bool finite_ok = true;
         int32_t tok = myds_sample_greedy_finite_neon(logits, vocab_size, &finite_ok);
         if (__builtin_expect(!finite_ok, 0)) return -1;

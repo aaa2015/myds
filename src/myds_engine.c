@@ -1493,6 +1493,9 @@ void myds_context_set_logit_bitmask(myds_context_t *ctx, const uint32_t *bitmask
     }
 }
 
+/* 强定义。server.c 里有一份 __attribute__((weak)) 的空实现，
+ * 只为让不链接本文件的测试目标（tests/test_http_bytes.c）能构建；
+ * 正常链接时本定义胜出。 */
 void myds_context_clear_logit_bitmask(myds_context_t *ctx) {
     if (!ctx) return;
     if (ctx->logit_bitmask) {

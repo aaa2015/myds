@@ -4024,7 +4024,17 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
 
 cleanup_infer:
         myds_context_clear_image_embeddings(ctx);
-        myds_context_clear_logit_bitmask(ctx);
+        /* 2026-10-25：结构化输出（logit_bitmask）尚未接线 —— 全仓库没有任何
+         * 地方调用 myds_context_set_logit_bitmask，bitmask 恒为 NULL，因此这里
+         * 不需要清理。
+         *
+         * 原本这里调用 myds_context_clear_logit_bitmask()，但该函数定义在
+         * myds_engine.c，而 tests/test_http_bytes.c 只链接 server.o ⇒ make test
+         * 链接失败（undefined symbol）。改成弱符号也无效（头文件已做非 weak
+         * 声明，#pragma weak 被忽略）。
+         *
+         * 等真正实现结构化输出（生成 token 允许集合并调用 set_logit_bitmask）
+         * 时，再把清理接回来 —— 那时它才有意义，且测试目标也需同步链接 engine.o。 */
         myds_vjob_sink_free(&img_sink);
         myds_set_continue_from_cache(ctx, false);
         myds_context_set_config(ctx, &prev_cfg);
