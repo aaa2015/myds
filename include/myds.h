@@ -42,7 +42,11 @@ typedef struct {
     float    min_p;             /* Min-p sampling (0.0 = disabled, default: 0.0) */
     float    repetition_penalty; /* Repetition penalty (1.0 = disabled, default: 1.0) */
     int32_t  seed;              /* Random seed */
-    bool     stream;            /* Stream output tokens to callback */
+    /* ⚠️ 2026-10-24 审计：本字段全库【只写不读】—— main.c 初始化、engine 复位，
+     * 没有任何读取点。流式与否实际由调用方传不传回调（myds_generate_bytes_ex）
+     * 决定，与服务端请求体的 "stream" 也无关（那是 myds_server.c 自己解析的）。
+     * 保留仅为 ABI 兼容；新代码不要依赖它。 */
+    bool     stream;            /* Deprecated: set but never read; see note above. */
     bool     thinking_mode;     /* Enable thinking / reasoning mode (default: false) */
 } myds_config_t;
 
