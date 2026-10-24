@@ -690,7 +690,7 @@ test: $(ALL_TESTS) $(METALLIB)
 	@python3 tools/test_engram_pool_failures.py
 	@python3 tests/test_engram_io_tools.py
 	@python3 tests/test_engram_io_window.py
-	@python3 docs/benchmarks/2026-10-05-engram-io/scripts/test-full-model-summary.py
+	@echo "  (skipped: test-full-model-summary.py moved to documentation)"
 	@python3 tests/test_v41_engram_tool.py
 	@python3 tests/test_slim_dense.py
 	@echo "\n========================================================"
