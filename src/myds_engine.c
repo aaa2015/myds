@@ -3326,6 +3326,24 @@ static int myds_generate_internal(myds_context_t *ctx,
             MYDS_LOG_I("prefix cache: skipped - no common prefix with the cached %u tokens", ctx->pcache_len);
         }
 
+        /* 2026-10-24：重启后 ctx->anchor_len == 0，但磁盘上可能已有该位置的锚点。
+         * ★ 必须在下面的 RAM 判定【之前】恢复：否则 resume_from 已定为 0，
+         * 这次请求仍会全量 prefill，恢复只对下一次生效（实测踩到）。 */
+        if (pcache_on && ctx->v41 && resume_from == 0 && ctx->anchor_len == 0) {
+            uint32_t ap = 0;
+            for (uint32_t i = 0; i < (uint32_t)n_prompt - 1u; i++) {
+                if (prompt_tokens[i] == 128803) { ap = i + 1u; break; }
+            }
+            if (ap >= 4u && ap < (uint32_t)n_prompt - 1u) {
+                const uint32_t got = myds_v41_low_kv_load_anchor(ctx->v41, prompt_tokens, ap);
+                if (got == ap) {
+                    memcpy(ctx->anchor_tokens, prompt_tokens, (size_t)ap * sizeof(int32_t));
+                    ctx->anchor_len = ap;
+                    MYDS_LOG_I("prefix cache: anchor restored from disk at decision time · %u tok", ap);
+                }
+            }
+        }
+
         /* Check if prompt matches persistent anchor snapshot (e.g. System Prompt) */
         if (pcache_on && ctx->v41 && resume_from == 0 && ctx->anchor_len > 0 &&
             (uint32_t)n_prompt > ctx->anchor_len) {
@@ -3498,18 +3516,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                     break;
                 }
             }
-            /* 2026-10-24：重启后 ctx->anchor_len == 0，但磁盘上可能已有该位置的锚点。
-             * 先尝试从 kvdisk 恢复（含 tail），成功就直接用，跳过系统提示词重算。
-             * 实测 52K tok 的系统提示词 ≈ 88 秒 prefill，恢复约 100 ms。 */
-            if (anchor_pos >= 4u && anchor_pos < (uint32_t)n_prompt - 1u &&
-                ctx->anchor_len == 0 && ctx->v41) {
-                const uint32_t got = myds_v41_low_kv_load_anchor(ctx->v41, prompt_tokens, anchor_pos);
-                if (got == anchor_pos) {
-                    memcpy(ctx->anchor_tokens, prompt_tokens, (size_t)anchor_pos * sizeof(int32_t));
-                    ctx->anchor_len = anchor_pos;
-                    MYDS_LOG_I("prefix cache: anchor restored from disk · %u tok · skip system-prompt re-prefill", anchor_pos);
-                }
-            }
+            /* 锚点磁盘恢复已移到 resume_from 决策之前（见上方），此处不再重复。 */
             /* 2026-10-24：锚点上限改为可配置。原写死 1024，而实测主流 agent 远超：
              *   20,000 字符 → 5,607 tok；60,000 → 18,271；180,000 → 52,249（OpenClaw 实测）
              * MYDS_ANCHOR_MAX_TOKENS 默认 65536，覆盖主流 agent（含工具定义）。

@@ -202,6 +202,11 @@ bool myds_kvdsk_slot_clear(myds_kvdsk_t *k, uint32_t slot) {
     return entry_write_position(k, slot, 0u) ? true : false;
 }
 
+/* 2026-10-24：暴露槽数，供 v41 侧按 store 校验 entry 下标。 */
+uint32_t myds_kvdsk_slot_count(const myds_kvdsk_t *k) {
+    return k ? k->slots : 0u;
+}
+
 bool myds_kvdsk_slot_meta(const myds_kvdsk_t *k, uint32_t slot,
                           uint32_t *position, uint64_t *prefix_hash, uint64_t *used_bytes) {
     if (!k || slot >= k->slots) return false;

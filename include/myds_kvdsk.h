@@ -53,6 +53,8 @@ void          myds_kvdsk_close(myds_kvdsk_t *k);
 const char   *myds_kvdsk_open_error(void);
 
 /* ── 条目元信息（不读 payload）── */
+/* 2026-10-24：该 store 的槽数。 */
+uint32_t myds_kvdsk_slot_count(const myds_kvdsk_t *k);
 bool myds_kvdsk_slot_meta(const myds_kvdsk_t *k, uint32_t slot,
                           uint32_t *position, uint64_t *prefix_hash, uint64_t *used_bytes);
 /* Inspect a committed payload range without starting a read transaction or
