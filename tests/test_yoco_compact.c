@@ -1,5 +1,21 @@
-/* Unit test for YoCo SWA Bounded Replay (MYDS_YOCO_COMPACT)
- * Verifies mathematical properties, layer scheduling bounds, and MoE token reductions.
+/* test_yoco_compact.c — YoCo Compact 的【公式复算】测试
+ *
+ * ⚠️ 范围声明（2026-10-25 审核后补）：
+ *
+ *   本测试【不调用任何 myds 引擎函数】，不跑任何前向，不比对任何输出。
+ *   它把 src/myds_v41.c 里 sh_need / s_global 的算式在这里重新实现一遍，
+ *   再断言自己的算式自洽。这是「公式复算」，不是「行为验证」。
+ *
+ *   它能抓到什么：算式被改错时（例如 keep_tokens 忘了减、边界夹取写反）
+ *   这里会失败 —— 有一点价值，但不能证明引擎跑出来的结果正确。
+ *
+ *   它【不能】证明的：
+ *     · MYDS_YOCO_COMPACT=1 时输出与 =0 是否语义等价
+ *     · consumer 层窗口被 memset 清零后，decode 推进 12 步是否喂零
+ *     · 前缀缓存中间快照能否发布（keep=140 不是 512 倍数）
+ *
+ *   真正的行为验证需要：同一 prompt 在开关两臂各跑一次，比对输出与质量指标。
+ *   在那之前，MYDS_YOCO_COMPACT 必须保持默认关闭。
  */
 #define _POSIX_C_SOURCE 200809L
 #define _DARWIN_C_SOURCE
