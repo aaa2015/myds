@@ -3451,12 +3451,17 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         }
         const bool req_has_instructions = json_has_top_field(body, "instructions");
         const bool req_has_tools = json_has_top_field(body, "tools");
-        MYDS_LOG_I("[%s:%d] %s %s (protocol=%s, stream=%s, max_tokens=%d, temp=%.2f, top_p=%.2f, top_k=%d, "
+        /* 2026-10-24：把 min_p / rep_pen / pres_pen 也打出来。
+         * 此前只打 temp/top_p/top_k，另外三个即使客户端发了也无从确认 ——
+         * 「客户端以为设了、服务端没收到/没应用」正是最难查的一类。 */
+        MYDS_LOG_I("[%s:%d] %s %s (protocol=%s, stream=%s, max_tokens=%d, temp=%.2f, top_p=%.2f, "
+                   "top_k=%d, min_p=%.3f, rep_pen=%.3f, pres_pen=%.3f, "
                    "prompt_chars=%zu, body=%zd, has_instructions=%d, has_tools=%d)",
                    client_ip, client_port, method, path,
                    is_responses_endpoint ? "Responses" : "ChatCompletions",
                    stream ? "true" : "false",
                    max_tokens, temp, top_p, top_k,
+                   (double)min_p, (double)rep_pen, (double)pres_pen,
                    strlen(prompt), total_read, req_has_instructions ? 1 : 0, req_has_tools ? 1 : 0);
 
         /* 恢复模式下 prefix cache 是空的（重启所致），必须走【普通全量 prefill】：
