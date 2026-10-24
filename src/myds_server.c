@@ -18,6 +18,7 @@
 #include <poll.h>
 #include <stdatomic.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <netinet/in.h>
@@ -219,6 +220,112 @@ static unsigned        g_resp_id_ring = 0;         /* 下一个写入位置 */
 static unsigned long   g_resp_id_seq = 0;
 static pthread_mutex_t g_resp_id_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* ── 2026-10-24：响应状态的持久化 ──
+ *
+ * 问题：上面的注册表是静态数组，进程重启即清空。而客户端一旦改用
+ * previous_response_id（suffix 模式），就不再重发历史 —— 服务端一重启，
+ * 它手上的 id 变成 unknown，客户端却没有可 replay 的完整输入，会话直接断掉。
+ *
+ * kvdisk 只存 KV 字节，不存「这些字节对应哪些 token」。所以必须在这里补上
+ * 【完整的累积提示词文本】：
+ *
+ *   turn 1（完整模式）：accumulated = 本次渲染出的完整 prompt
+ *   turn N（suffix 模式）：accumulated = 上一轮 accumulated + 本次新增部分
+ *
+ * 重启后即使 pcache 空了，也能用 accumulated + 本次 suffix 重建出与客户端
+ * 原本会发送的【逐字节相同】的输入，退回普通 prefill（正确性优先，速度次之）。
+ * 若 kvdisk 里恰好还有对应前缀的 KV，普通路径自己会命中。
+ *
+ * 若磁盘上没有可用状态，仍按原逻辑返回 400，绝不静默丢上下文。
+ */
+#define RESP_STATE_MAGIC "MYDSRSP1"
+#define RESP_STATE_VERSION 1u
+static char   *g_resp_text[RESP_ID_SLOTS];      /* 累积提示词（堆） */
+static bool    g_resp_state_loaded = false;
+static char    g_resp_state_path[1200];
+
+static void resp_state_path(char *out, size_t cap) {
+    const char *env = getenv("MYDS_RESP_STATE");
+    if (env && *env) { snprintf(out, cap, "%s", env); return; }
+    const char *home = getenv("HOME");
+    snprintf(out, cap, "%s/.cache/myds/responses.idx", home && *home ? home : ".");
+}
+
+static void resp_state_load_once(void) {
+    if (g_resp_state_loaded) return;
+    g_resp_state_loaded = true;
+    resp_state_path(g_resp_state_path, sizeof(g_resp_state_path));
+    FILE *f = fopen(g_resp_state_path, "rb");
+    if (!f) return;
+    char magic[8];
+    uint32_t ver = 0, n = 0;
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, RESP_STATE_MAGIC, 8) != 0) { fclose(f); return; }
+    if (fread(&ver, sizeof(ver), 1, f) != 1 || ver != RESP_STATE_VERSION) { fclose(f); return; }
+    if (fread(&n, sizeof(n), 1, f) != 1 || n > RESP_ID_SLOTS) { fclose(f); return; }
+    pthread_mutex_lock(&g_resp_id_mutex);
+    for (uint32_t i = 0; i < n; ++i) {
+        unsigned long long sig = 0;
+        uint32_t len = 0;
+        char id[64] = {0};
+        if (fread(&sig, sizeof(sig), 1, f) != 1) break;
+        if (fread(&len, sizeof(len), 1, f) != 1) break;
+        if (fread(id, 1, sizeof(id), f) != sizeof(id)) break;
+        if (len > (64u << 20)) break;                 /* 单条上限 64 MiB，防坏文件 */
+        char *text = (char *)malloc((size_t)len + 1u);
+        if (!text) break;
+        if (len && fread(text, 1, len, f) != len) { free(text); break; }
+        text[len] = '\0';
+        snprintf(g_resp_ids[i], sizeof(g_resp_ids[i]), "%s", id);
+        g_resp_tools_sig[i] = sig;
+        free(g_resp_text[i]);
+        g_resp_text[i] = text;
+    }
+    g_resp_id_ring = (unsigned)(n % RESP_ID_SLOTS);
+    pthread_mutex_unlock(&g_resp_id_mutex);
+    fclose(f);
+    MYDS_LOG_I("response state: loaded %u slot(s) from %s", n, g_resp_state_path);
+}
+
+static void resp_state_save_locked(void) {
+    resp_state_path(g_resp_state_path, sizeof(g_resp_state_path));
+    char tmp[1300];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", g_resp_state_path);
+    char dir[1200];
+    snprintf(dir, sizeof(dir), "%s", g_resp_state_path);
+    char *slash = strrchr(dir, '/');
+    if (slash) { *slash = '\0'; mkdir(dir, 0700); }
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return;
+    uint32_t ver = RESP_STATE_VERSION, n = RESP_ID_SLOTS;
+    bool ok = fwrite(RESP_STATE_MAGIC, 1, 8, f) == 8 &&
+              fwrite(&ver, sizeof(ver), 1, f) == 1 &&
+              fwrite(&n, sizeof(n), 1, f) == 1;
+    for (uint32_t i = 0; ok && i < RESP_ID_SLOTS; ++i) {
+        const char *t = g_resp_text[i] ? g_resp_text[i] : "";
+        uint32_t len = (uint32_t)strlen(t);
+        ok = fwrite(&g_resp_tools_sig[i], sizeof(g_resp_tools_sig[i]), 1, f) == 1 &&
+             fwrite(&len, sizeof(len), 1, f) == 1 &&
+             fwrite(g_resp_ids[i], 1, 64, f) == 64 &&
+             (len == 0 || fwrite(t, 1, len, f) == len);
+    }
+    fclose(f);
+    if (ok) (void)rename(tmp, g_resp_state_path);
+    else    (void)remove(tmp);
+}
+
+/* 取某个 id 对应的累积提示词（无则 NULL）。返回内部指针，调用方不得释放。 */
+const char *resp_id_saved_text(const char *id) {
+    if (!id || !id[0]) return NULL;
+    resp_state_load_once();
+    const char *out = NULL;
+    pthread_mutex_lock(&g_resp_id_mutex);
+    for (unsigned i = 0; i < RESP_ID_SLOTS; ++i)
+        if (g_resp_ids[i][0] && strcmp(g_resp_ids[i], id) == 0) { out = g_resp_text[i]; break; }
+    pthread_mutex_unlock(&g_resp_id_mutex);
+    return out;
+}
+
+
 void resp_id_new(char *out, size_t cap) {
     unsigned long n;
     pthread_mutex_lock(&g_resp_id_mutex);
@@ -228,11 +335,26 @@ void resp_id_new(char *out, size_t cap) {
 }
 /* 一次响应完成后登记：它成为唯一「活」的 id。sig = 本次请求所用工具集指纹（0 表示无 tools）。 */
 void resp_id_register(const char *id, unsigned long long tools_sig) {
+    resp_id_register_text(id, tools_sig, NULL);
+}
+
+/* accumulated = 本轮结束后的【完整累积提示词】。NULL 表示本次不更新文本（保留旧的）。 */
+void resp_id_register_text(const char *id, unsigned long long tools_sig, const char *accumulated) {
     if (!id || !id[0]) return;
+    resp_state_load_once();
+    char *copy = NULL;
+    if (accumulated) {
+        size_t n = strlen(accumulated);
+        copy = (char *)malloc(n + 1u);
+        if (copy) memcpy(copy, accumulated, n + 1u);
+    }
     pthread_mutex_lock(&g_resp_id_mutex);
-    snprintf(g_resp_ids[g_resp_id_ring], sizeof(g_resp_ids[0]), "%s", id);
-    g_resp_tools_sig[g_resp_id_ring] = tools_sig;
+    unsigned slot = g_resp_id_ring;
+    snprintf(g_resp_ids[slot], sizeof(g_resp_ids[0]), "%s", id);
+    g_resp_tools_sig[slot] = tools_sig;
+    if (copy) { free(g_resp_text[slot]); g_resp_text[slot] = copy; }
     g_resp_id_ring = (g_resp_id_ring + 1u) % RESP_ID_SLOTS;
+    resp_state_save_locked();
     pthread_mutex_unlock(&g_resp_id_mutex);
 }
 /* 当前「活」响应的工具指纹；无活响应时返回 0。 */
@@ -270,9 +392,11 @@ void resp_id_invalidate_all(void) {
     pthread_mutex_lock(&g_resp_id_mutex);
     for (unsigned i = 0; i < RESP_ID_SLOTS; ++i) {
         g_resp_ids[i][0] = '\0';
+        free(g_resp_text[i]); g_resp_text[i] = NULL;
         g_resp_tools_sig[i] = 0ull;
     }
     g_resp_id_ring = 0;
+    resp_state_save_locked();
     pthread_mutex_unlock(&g_resp_id_mutex);
 }
 
@@ -3153,7 +3277,21 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         double   dspark_prop_ms_before = ctx->dspark ? ctx->dspark->propose_ms : 0.0;
         double   dspark_ver_ms_before  = ctx->dspark ? ctx->dspark->verify_ms : 0.0;
 
+        /* 2026-10-24：重启后 pcache 为空，但若该 id 的【完整累积提示词】已持久化，
+         * 就不必杀请求 —— 用「持久化前缀 + 本次 suffix」重建出客户端原本会发送的完整输入，
+         * 退回普通 prefill。正确性优先；若 kvdisk 里还有对应前缀的 KV，普通路径会自己命中。 */
+        bool resp_recover = false;
         if (is_continuation && (!resp_id_is_live(prev_id) || myds_context_get_pcache_len(ctx) == 0)) {
+            const char *saved = resp_id_saved_text(prev_id);
+            if (saved && saved[0] && myds_context_get_pcache_len(ctx) == 0) {
+                resp_recover = true;
+                MYDS_LOG_I("[%s:%d] previous_response_id '%s' state survived restart; "
+                           "reconstructing full prompt from persisted prefix (%zu chars)",
+                           client_ip, client_port, prev_id, strlen(saved));
+            }
+        }
+        if (is_continuation && !resp_recover &&
+            (!resp_id_is_live(prev_id) || myds_context_get_pcache_len(ctx) == 0)) {
             t_infer_slot_depth = 0;
             pthread_mutex_unlock(&g_infer_mutex);
             server_release_infer_slot();
@@ -3220,6 +3358,30 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             return;
         }
 
+
+        /* 重建：把持久化前缀拼到本次新增部分之前。解析 suffix 时已跳过 BOS/instructions/tools，
+         * 所以直接前缀拼接即可复现客户端原本会发送的完整输入。 */
+        if (resp_recover) {
+            const char *saved = resp_id_saved_text(prev_id);
+            if (saved && saved[0]) {
+                const size_t plen = strlen(saved), slen = strlen(prompt), need = plen + slen + 1u;
+                char *full = (char *)malloc(need);
+                if (!full) {
+                    t_infer_slot_depth = 0;
+                    pthread_mutex_unlock(&g_infer_mutex);
+                    server_release_infer_slot();
+                    send_response(client_fd, 500, "Internal Server Error", "application/json",
+                                  "{\"error\":{\"message\":\"Out of memory rebuilding continuation\",\"type\":\"server_error\"}}");
+                    myds_vjob_sink_free(&img_sink);
+                    free(prompt); free(req_buf); close(client_fd); return;
+                }
+                memcpy(full, saved, plen);
+                memcpy(full + plen, prompt, slen + 1u);
+                free(prompt);
+                prompt = full;
+                prompt_cap = need;
+            }
+        }
         const bool req_has_instructions = json_has_top_field(body, "instructions");
         const bool req_has_tools = json_has_top_field(body, "tools");
         MYDS_LOG_I("[%s:%d] %s %s (protocol=%s, stream=%s, max_tokens=%d, temp=%.2f, top_p=%.2f, top_k=%d, "
@@ -3230,7 +3392,9 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                    max_tokens, temp, top_p, top_k,
                    strlen(prompt), total_read, req_has_instructions ? 1 : 0, req_has_tools ? 1 : 0);
 
-        if (is_continuation) myds_set_continue_from_cache(ctx, true);
+        /* 恢复模式下 prefix cache 是空的（重启所致），必须走【普通全量 prefill】：
+         * 不能置 continue_from_cache，否则引擎会因 pcache_len==0 直接报错。 */
+        if (is_continuation && !resp_recover) myds_set_continue_from_cache(ctx, true);
 
         /* Apply request configuration overrides if provided */
         myds_config_t req_cfg = prev_cfg;
@@ -3609,7 +3773,23 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
 
         if (stop_reason != MYDS_STOP_ERROR && stop_reason != MYDS_STOP_CANCELLED && transport_ok) {
             /* 续跑自身不重渲 tools ⇒ 它不改变「当前活响应」的工具集，沿用上一轮指纹。 */
-            resp_id_register(resp_id, is_continuation ? resp_id_live_tools_sig() : tools_sig);
+            /* 累积提示词：完整模式直接存本次 prompt；suffix 模式存「上一轮前缀 + 本次新增」。
+             * 这是重启后能重建输入的唯一依据 —— kvdisk 只存 KV 字节，不存 token 归属。 */
+            {
+                const char *prev_text = is_continuation ? resp_id_saved_text(prev_id) : NULL;
+                char *accum = NULL;
+                if (prev_text && prev_text[0]) {
+                    const size_t a = strlen(prev_text), b = strlen(prompt);
+                    accum = (char *)malloc(a + b + 1u);
+                    if (accum) { memcpy(accum, prev_text, a); memcpy(accum + a, prompt, b + 1u); }
+                } else {
+                    const size_t b = strlen(prompt);
+                    accum = (char *)malloc(b + 1u);
+                    if (accum) memcpy(accum, prompt, b + 1u);
+                }
+                resp_id_register_text(resp_id, is_continuation ? resp_id_live_tools_sig() : tools_sig, accum);
+                free(accum);
+            }
         } else {
             resp_id_invalidate_all();
         }

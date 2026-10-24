@@ -1,6 +1,6 @@
 # prefill / decode 全链路、已采纳优化与排除记录
 
-- 最后更新：**2026-10-24 14:10（§68–§92 全链路效率普查完成。prefill 57.3% 已到顶、30.2% 受硬约束；唯一采纳 §85 TILED −1.73%。生产 PID55488 已核验）**
+- 最后更新：**2026-10-24 16:50（§68–§92 全链路效率普查完成。prefill 57.3% 已到顶、30.2% 受硬约束；唯一采纳 §85 TILED −1.73%。生产 PID55488 已核验）**
 - 主机：macstudio — M2 Ultra，76 核 GPU，**206 GB 统一内存**（=192 GiB，Metal 上限 201.9 GB）；
   带宽理论峰值 **800 GB/s**，实测可达 **724 GB/s**（§0.1），纯读基准最高 799 GB/s（§46.1）
 - 系统：**macOS 27.0.1 (26A434)**，kernel 27.0.0（§42）
@@ -6113,6 +6113,12 @@ weight_digest ^= gen;
 ## §43 关闭 kvlow、复测 90K（2026-10-22）
 
 ### 43.1 关闭 kvlow：零收益、零代价，但消除一个设计缺陷
+
+> **⚠️ 2026-10-24 失效声明（§93）**：本节「零收益」的结论**作废**。
+> 那个 A/B 只测了写盘成本——identity bug（§42.4）让缓存**从未命中**，
+> 所以两臂都测不到读盘收益。修复 companion digest 后实测：
+> 1103-token prompt 的 prefill **3.61 s → 0.08 s（45×）**。
+> 详见 §93。
 
 A/B（30K prompt，只差 `MYDS_KV_DSK` 是否存在）：
 
@@ -12832,3 +12838,208 @@ metallib  4159096 B  c692d821aed43ecc  ✅
 一起拷，顺手带了两个主制品。
 
 **已恢复，生产 pid 55488，health ok，制品身份与原采纳一致。**
+
+---
+
+## §93 kvdisk **不是零收益，是被 identity bug 废掉的**——§43 结论作废（2026-10-24）
+
+### 93.1 §43.1 的 A/B 测错了对象
+
+§43.1 记录：
+
+> A/B（30K prompt，只差 `MYDS_KV_DSK` 是否存在）：638.3 vs 638.2 t/s，**无差异（0.02%，噪声）**。
+
+**这个 A/B 只证明了「写盘成本可忽略」，从未证明「读盘收益」。**
+
+原因：§42.4 已经查出 identity 的问题——模型没有 `manifest digest` 元数据时，
+代码走 `load_generation`（`getpid ^ time ^ counter`），**每个进程一个 identity**。
+既然永不命中，A/B 两臂都只能测到「写」，测不到「读」。
+
+**⇒ §43「kvdisk 零收益」的结论在方法上不成立。已在 §43 加失效声明。**
+
+### 93.2 修复：companion digest
+
+`lowkv_read_companion_digest()`（`src/myds_v41.c:1090`）**早就实现了**读
+`<model>.digest` / `<model>.sha256` 的能力，只是从来没给模型放过这个文件。
+
+**两个坑：**
+
+1. **只放真实文件旁不够。** 生产走的是符号链接路径
+   （`~/.lmstudio/models/.../xxx.gguf → ~/hf-1017/xxx.gguf`），
+   `fopen("<symlink>.digest")` 在**符号链接所在目录**找，找不到真实文件旁那份。
+   **必须在符号链接旁也放一份。**
+
+2. **内容只需一个 SHA256 行**，`SHA256=<64 hex>`，取模型前 1 MiB 即可
+   （本项目既有指纹约定；不必对 362 GB 全量哈希）。
+
+**修复后实测**（两次独立重启）：
+
+```
+kvdisk: 发现模型伴侣指纹文件: 43948333c8eb0172...
+kvdisk: kvlow-v3-a603ebcb4c5a5301.bin 复用（identity 69b8e83a2591d0ea）
+kvdisk: kvlow-v3-a603ebcb4c5a5301.bin 复用（identity 69b8e83a2591d0ea）
+```
+
+**⇒ identity 稳定，跨进程复用成立。**
+
+### 93.3 收益有多大：短 prompt 快 45 倍
+
+1103-token prompt，三次独立进程：
+
+| 轮 | prefill | 说明 |
+|---|---:|---|
+| run1（冷，首次写盘 13.1 MiB / 6.1 ms） | **3.61 s** | |
+| run2（命中） | **0.08 s** | **45×** |
+| run3（命中） | **0.08 s** | |
+
+```
+kvdisk: 命中位置 1102 (prompt-end) ⇒ 免掉 1102 个 token 的 prefill (load+publish 4.783 ms)
+```
+
+**写盘成本 6.1 ms，命中省 3.5 s ⇒ 投入产出比约 570:1。**
+
+### 93.4 但长 prompt 存不上：两个硬限制
+
+30K prompt 实测：**63 槽，0 条有效，`du` 48K（全稀疏，payload 未写）**。
+
+**限制 ①：end-snapshot 预算 14 MiB 装不下 tail**
+
+```
+V41_LOWKV_END_STRIDE = 14 MiB
+固定部分（header 64 + engram + prev_kv/score 16384 + SWA 环 40×128×512×4）
+    = 10.02 MiB（已占 72%）
+留给 tail ≈ 3.98 MiB ≈ 800–1000 token
+30K prompt 的 tail = 18735 token ⇒ 53–102 MiB  ❌
+```
+
+`lowkv_end_payload_bytes()` 超过 `V41_LOWKV_END_STRIDE` 时**整条跳过**，
+连 pinned 段一起跳过。
+
+**限制 ②：pinned 网格只覆盖 1024..11264**
+
+21 槽 × 512 stride。即使能存，最远也只到 11264 位置。
+
+**⇒ kvdisk 当前的实际可用域是「prompt 落点距 pinned 边界 ≤ 约 1000 token」，
+30K 以上全部落空。**
+
+### 93.5 下一步：把 pinned 段从 end-snapshot 门里解耦
+
+**思路**：pinned 段（1024..11264）与 end-snapshot 是两套独立机制，
+不该因为整份快照超预算就一起放弃。
+
+**收益估算**（30K prompt）：若 pinned 段能存到 11264，
+则下次同前缀请求可从 11264 续跑，prefill 只算 18735 token
+⇒ 省 `11264/30000 = 37.5%` 的 prefill。
+
+**这是 kvdisk 真正能发挥作用的场景**——系统提示 + 工具定义几乎不变，
+用户内容每次不同。当前设计只优化「完全相同的前缀」，而实际工作流是「共同前缀 + 变化尾部」。
+
+**待验证**：30K 那次连 pinned 段都没写，怀疑是 suffix-shrink 的门
+（`sp > s_clamped_39`）把 `snap_pos[1..21]` 全拒了。需要跑一次
+`MYDS_NO_SUFFIX_SHRINK=1` 的 30K 对比确认。
+
+### 93.6 结论
+
+| 项 | 判定 |
+|---|---|
+| §43「kvdisk 零收益」 | ❌ **作废**（A/B 从未命中，测不到收益） |
+| kvdisk 本身的写盘成本 | ✅ 可忽略（13 MiB / 6 ms） |
+| 命中收益 | ✅ **45×**（1103 token，3.61 s → 0.08 s） |
+| 30K 长 prompt | ❌ **存不上**（14 MiB 预算 + 11264 pinned 上界） |
+| 生产已恢复 | ✅ `MYDS_KV_DSK` 加回配置，55 项，两次重启均命中 |
+| 下一步 | **pinned 段解耦**，让「共同前缀 + 变化尾部」能吃收益 |
+
+---
+
+## §94 服务重启后 `previous_response_id` 不再断会话：持久化响应状态（2026-10-24）
+
+### 94.1 问题：一个可用性缺陷，不是性能问题
+
+客户端改用 `previous_response_id`（suffix 模式）后**不再重发历史**。
+而服务端的状态全在 RAM：
+
+| 状态 | 存放位置 | 重启后 |
+|---|---|---|
+| 响应 id 注册表 | `static char g_resp_ids[4][64]` | ❌ 全丢 |
+| 工具集指纹 | `static unsigned long long g_resp_tools_sig[4]` | ❌ 全丢 |
+| pcache 序列 | `ctx->pcache_tokens` | ❌ 丢 |
+| **token 序列本身** | **从未持久化** | ❌ **从未存在** |
+
+**最致命的是第四行**：`resp_id_register(id, tools_sig)` 只存了 id 和指纹，
+**没有任何地方存「这段 KV 对应哪些 token」**。而 `parse_chat_prompt_suffix_ex()` 的注释写着
+「只渲染新增部分，前缀由引擎的缓存序列提供」。
+
+⇒ **重启后即使 kvdisk 把 KV 一个字节不差地存着，也没法用——不知道该配哪些 token。**
+
+原报错还指向一个客户端做不到的动作：
+
+```
+"previous_response_id '%s' is not the most recent response
+ (this server keeps one live state); replay the full input instead"
+```
+
+**用 suffix 模式的客户端按设计就没有完整输入，无法 replay。**
+
+### 94.2 修法：持久化「完整累积提示词」
+
+新增 `~/.cache/myds/responses.idx`（可用 `MYDS_RESP_STATE` 覆盖），格式：
+
+```
+magic "MYDSRSP1" | u32 version | u32 n_slots
+每个槽：u64 tools_sig | u32 text_len | char id[64] | char text[text_len]
+```
+
+**累积规则**：
+
+```
+turn 1（完整模式）    accumulated = 本次渲染出的完整 prompt
+turn N（suffix 模式） accumulated = 上一轮 accumulated + 本次新增部分
+```
+
+**重启后的恢复**：若 `resp_id` 在磁盘上、而 `pcache_len == 0`，
+则用 `accumulated + 本次 suffix` 重建出**与客户端原本会发送的逐字节相同的输入**，
+退回普通全量 prefill。
+
+**关键实现细节（踩过的坑）**：
+
+1. **不能置 `continue_from_cache`**。恢复模式下置了它，引擎会因 `pcache_len==0` 直接报错
+   （`previous_response_id: continuation requested but prefix cache is empty`）。
+   必须走普通路径。
+2. **持久化层必须放在 `resp_id_register` 之前**（C 的前向声明顺序）。
+3. **`resp_id_invalidate_all()` 也要落盘**，否则重启后读到的是失效的旧状态。
+
+### 94.3 实测：重启后能记住重启前的内容
+
+```
+请求 1（完整）: "记住一个数字：42。只回复 OK。"
+  → id = resp_myds_1_2869，持久化文件 427 B
+
+杀进程（模拟重启），新进程启动
+
+请求 2（续跑）: {"input":"那个数字是多少？只回复数字。","previous_response_id":"resp_myds_1_2869"}
+  → 日志: state survived restart; reconstructing full prompt from persisted prefix
+  → 回复: "42"                      ← 正确
+  → usage: input_tokens=26（13 原 + 13 新，完整重建）
+```
+
+**⇒ 会话不再因重启而断。**
+
+### 94.4 代价与边界
+
+| 项 | 值 |
+|---|---|
+| 磁盘 | 427 B / 4 槽（示例；与 prompt 长度线性，30K token ≈ 160 KB） |
+| 重启后首次续跑 | 走全量 prefill（无 RAM 缓存），比热续跑慢 |
+| 若 kvdisk 命中 | 普通路径自己会命中，仍能拿回提速 |
+| 只有 id 与本轮不匹配 | 仍按原逻辑 400（`expired` / `unknown` 区分保留） |
+
+**⇒ 正确性优先，速度次之**：先保证「不丢上下文」，再看能不能复用 KV。
+
+### 94.5 仍未修的两处（后续）
+
+1. **anchor（系统提示词快照）不落盘**：`slot 43` 不在 `low_kv_save` 的
+   `s = 1..MYDS_SNAP_PINNED` + slot 0 范围内 ⇒ 重启后系统提示词段要重算。
+2. **`anchor_pos <= 1024` 是裸魔数**（`src/myds_engine.c:3474`，无注释说明理由）：
+   带工具定义的系统提示词常超过 1024 token ⇒ 锚点在最需要的场景下永不触发。
+
+**这两条与 §93 的 kvdisk 修复合起来，才构成「长系统提示 + 重启 + 续跑」的完整链路。**

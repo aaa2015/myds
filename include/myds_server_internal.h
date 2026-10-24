@@ -94,6 +94,8 @@ bool parse_chat_prompt_suffix_ex(const char *body, char *out_prompt, size_t max_
  * tools_sig = 该轮所用工具集的指纹（0 = 无 tools）；续跑时用于拒绝「中途换工具集」。 */
 void resp_id_new(char *out, size_t cap);
 void resp_id_register(const char *id, unsigned long long tools_sig);
+void resp_id_register_text(const char *id, unsigned long long tools_sig, const char *accumulated);
+const char *resp_id_saved_text(const char *id);
 unsigned long long resp_id_live_tools_sig(void);
 /* 工具集指纹（供单测与续跑一致性校验）。0 = 无 tools。 */
 unsigned long long server_tools_signature(const char *body, size_t scratch_cap);

@@ -472,7 +472,7 @@ set -o pipefail
 make -B -j8 all bin/bench_phase 2>&1 | tee "$MYDS_REPRO_OUT/build.log"
 make test 2>&1 | tee "$MYDS_REPRO_OUT/unit-tests.log"
 make test-tail-init 2>&1 | tee "$MYDS_REPRO_OUT/tail-init.log"
-python3 $MYDS_EVIDENCE/benchmarks/2026-10-05-optimization/protocol/selftest-summarize-final.py \
+python3 tools/protocol/selftest-summarize-final.py \
   > "$MYDS_REPRO_OUT/measurement-audit-selftest.json"
 python3 tools/bench_reproduce.py verify
 # 仅在基准测量快照检出上：python3 tools/bench_reproduce.py verify --check-source
@@ -637,7 +637,7 @@ python3 tools/bench_reproduce.py compare \
 仅复算已保存主对照数据，无需 GPU 或 GGUF：
 
 ```sh
-python3 $MYDS_EVIDENCE/benchmarks/2026-10-05-optimization/protocol/summarize-final.py \
+python3 tools/protocol/summarize-final.py \
   $MYDS_EVIDENCE/benchmarks/2026-10-05-optimization/raw/exclusive-20261005T022233Z \
   --out "$MYDS_REPRO_OUT/saved-result-audit"
 ```
