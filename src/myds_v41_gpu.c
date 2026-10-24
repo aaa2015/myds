@@ -617,9 +617,14 @@ static int indexscores_chunk(myds_metal_buffer_t *scores,const myds_metal_buffer
         const uint32_t gx = (n_comp + 31u) / 32u;
         const uint32_t gy = (n_tokens + 7u) / 8u;
         const size_t smem = (8u * 128u + 32u * 128u + 8u * 32u) * sizeof(float);
-        return dispatch(cache_bf16?"kernel_dsv4_indexer_scores_tiled_bf16":
-                        "kernel_dsv4_indexer_scores_tiled_f32", &ta, sizeof(ta), b, 4,
-                        gx, gy, 1, 32, 4, 1, smem);
+        /* 2026-10-24 §91：MYDS_INDEXER_SGBAR=1 走 warp 屏障变体（仅降级 #2/#3）。 */
+        const char *sgbar = getenv("MYDS_INDEXER_SGBAR");
+        const int use_sgbar = sgbar && strcmp(sgbar, "0") != 0;
+        return dispatch(use_sgbar ? (cache_bf16?"kernel_dsv4_indexer_scores_tiled_sg_bf16":
+                                    "kernel_dsv4_indexer_scores_tiled_sg_f32")
+                                  : (cache_bf16?"kernel_dsv4_indexer_scores_tiled_bf16":
+                                    "kernel_dsv4_indexer_scores_tiled_f32"),
+                        &ta, sizeof(ta), b, 4, gx, gy, 1, 32, 4, 1, smem);
     }
     struct {uint32_t n_rows,n_head,head_dim,cache_f16;float scale;
             uint32_t n_tokens,causal_start,causal_ratio,pad;} a={

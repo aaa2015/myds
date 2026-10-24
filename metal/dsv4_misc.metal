@@ -6561,7 +6561,7 @@ static inline float dsv4_indexer_dot128_shared_q(
 //     score[t,c] = sum_h relu(dot(Q[t,h], K[c])) * W[t,h] * scale
 //
 // Causal masking is applied on store so invisible compressed rows become -inf.
-template<bool BF16>
+template<bool BF16, bool WARP_ONLY = false>
 kernel void kernel_dsv4_indexer_scores_tiled_storage(
         constant ds4_metal_args_dsv4_indexer_scores_fused & args,
         device const char *q,
@@ -6663,7 +6663,12 @@ kernel void kernel_dsv4_indexer_scores_tiled_storage(
 
         simdgroup_store(mdot, dot + (uint)sg * TS, TN, 0, false);
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        /* 2026-10-24 §91：dot 的读写都在本 simdgroup 的列块内
+         * （写 dot[0..7][sg*8..sg*8+8)，读 dot[row][sg*8+(lane&7)]），
+         * 无跨 simdgroup 依赖 ⇒ WARP_ONLY 下改用 warp 内屏障。
+         * 只改屏障，不动任何算术表达式 ⇒ 0-ULP 由构造保证。 */
+        if (WARP_ONLY) simdgroup_barrier(mem_flags::mem_threadgroup);
+        else           threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (token0 < args.n_tokens && comp0 < args.n_comp) {
             device const float *w = (device const float *)(weights +
@@ -6678,7 +6683,8 @@ kernel void kernel_dsv4_indexer_scores_tiled_storage(
             acc1 += max(s, 0.0f) * (w[head] * args.scale);
         }
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (WARP_ONLY) simdgroup_barrier(mem_flags::mem_threadgroup);
+        else           threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     if (token0 < args.n_tokens && comp0 < args.n_comp) {
@@ -6700,6 +6706,12 @@ template [[host_name("kernel_dsv4_indexer_scores_tiled_f32")]]
 kernel dsv4_indexer_scores_tiled_storage_t kernel_dsv4_indexer_scores_tiled_storage<false>;
 template [[host_name("kernel_dsv4_indexer_scores_tiled_bf16")]]
 kernel dsv4_indexer_scores_tiled_storage_t kernel_dsv4_indexer_scores_tiled_storage<true>;
+/* 2026-10-24 §91：warp 内屏障变体（仅降级 #2/#3 两个屏障）。 */
+typedef decltype(kernel_dsv4_indexer_scores_tiled_storage<false, true>) dsv4_indexer_scores_tiled_sg_t;
+template [[host_name("kernel_dsv4_indexer_scores_tiled_sg_f32")]]
+kernel dsv4_indexer_scores_tiled_sg_t kernel_dsv4_indexer_scores_tiled_storage<false, true>;
+template [[host_name("kernel_dsv4_indexer_scores_tiled_sg_bf16")]]
+kernel dsv4_indexer_scores_tiled_sg_t kernel_dsv4_indexer_scores_tiled_storage<true, true>;
 
 kernel void kernel_dsv4_indexer_scores_tiled(
         constant ds4_metal_args_dsv4_indexer_scores_fused & args,
