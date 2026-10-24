@@ -251,6 +251,24 @@ int main(void) {
         assert(server_response_format_kind(
             "{\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{"
             "\"name\":\"card\",\"schema\":{\"type\":\"object\"}}}}") == SERVER_RF_JSON_SCHEMA);
+        /* ★ 关键负例：无关的【嵌套】对象带同名键，不能被当成请求参数。
+         * 旧实现对整个 body 做 strstr("response_format")，这个用例会返回
+         * JSON_SCHEMA 而把整整一个无关请求 400 掉（已用旧实现实测）。
+         * 另外两个是【文档性】用例：JSON 要求引号转义，所以提示词里的同名
+         * 文字在原始字节里是 \\\"response_format\\\"，旧实现本来就不会误判（也实测
+         * 验证过）。保留它们是为了锁住「以后改用全文搜索也不能命中」。 */
+        assert(server_response_format_kind(
+            "{\"metadata\":{\"response_format\":{\"type\":\"json_schema\"}}}") == SERVER_RF_NONE);
+        assert(server_response_format_kind(
+            "{\"input\":\"请告诉我 \\\"response_format\\\": {\\\"type\\\": \\\"json_schema\\\"} 该怎么写\"}"
+            ) == SERVER_RF_NONE);
+        assert(server_response_format_kind(
+            "{\"messages\":[{\"role\":\"user\",\"content\":\"how do I use \\\"response_format\\\" "
+            "with json_schema?\"}]}") == SERVER_RF_NONE);
+        /* 顶层正常但前面有别的字段、且含字符串转义，仍要正确识别。 */
+        assert(server_response_format_kind(
+            "{\"model\":\"m\",\"note\":\"a \\\"quoted\\\" word\","
+            "\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{}}}") == SERVER_RF_JSON_SCHEMA);
         printf("  [PASS] response_format classification (json_schema rejected, json_object warned)\n");
     }
 

@@ -711,26 +711,89 @@ float json_extract_float_field(const char *json, const char *key, float default_
     return (float)atof(p);
 }
 
+/* 取顶层键的值区间（不深入嵌套）。返回指向值首字符的指针，*len 为区间长。
+ *
+ * 为什么不直接 strstr：2026-10-25 修的就是那个误判 —— 一个无关的【嵌套】对象
+ * 只要带同名键，就会被当成请求参数：
+ *   {"metadata":{"response_format":{"type":"json_schema"}}}  ⇒ 整请求被 400
+ * 注意【不是】提示词里的文字引起的：JSON 要求引号转义，字符串内部的同名文字
+ * 在原始字节里是 \"response_format\"，strstr("response_format") 根本不会命中
+ * （已用旧实现实测验证）。真正会命中的只有真实键名，而真实键名可能在任意深度。
+ * 这里与 json_has_top_field 同一套扫描规则：跟踪括号深度、跳过字符串字面量，
+ * 只在 depth==1 处匹配键且后面紧跟 ':'。
+ *
+ * 值区间：以 { 或 [ 开头时按括号配对（同样跳字符串），否则到本层 , 或 } 为止。
+ * 值不存在/格式异常时返回 NULL。 */
+static const char *json_top_field_value(const char *body, const char *key, size_t *len) {
+    if (len) *len = 0;
+    if (!body || !key) return NULL;
+    const size_t klen = strlen(key);
+    int depth = 0;
+    const char *p = body;
+    while (*p) {
+        if (*p == '{' || *p == '[') { ++depth; ++p; continue; }
+        if (*p == '}' || *p == ']') { --depth; ++p; continue; }
+        if (*p != '"') { ++p; continue; }
+        const char *start = p + 1;
+        const char *q = start;
+        while (*q) {
+            if (*q == '\\') { q += 2; continue; }
+            if (*q == '"') break;
+            ++q;
+        }
+        if (!*q) break;
+        const char *after = q + 1;
+        while (*after == ' ' || *after == '\t' || *after == '\r' || *after == '\n') ++after;
+        if (depth == 1 && *after == ':' && (size_t)(q - start) == klen &&
+            !strncmp(start, key, klen)) {
+            const char *v = after + 1;
+            while (*v == ' ' || *v == '\t' || *v == '\r' || *v == '\n') ++v;
+            const char *end = v;
+            if (*v == '{' || *v == '[') {
+                int d = 0;
+                while (*end) {
+                    if (*end == '\\') { end += 2; continue; }
+                    if (*end == '"') {
+                        ++end;
+                        while (*end) {
+                            if (*end == '\\') { end += 2; continue; }
+                            if (*end == '"') { ++end; break; }
+                            ++end;
+                        }
+                        continue;
+                    }
+                    if (*end == '{' || *end == '[') ++d;
+                    else if (*end == '}' || *end == ']') { --d; if (d == 0) { ++end; break; } }
+                    ++end;
+                }
+            } else {
+                while (*end && *end != ',' && *end != '}') ++end;
+            }
+            if (len) *len = (size_t)(end - v);
+            return v;
+        }
+        p = q + 1;
+    }
+    return NULL;
+}
+
 /* response_format 分类。
- * ★ 只看 response_format 键之后的 512 字节：取值就在那里。不设边界的旧写法
- *   在整个 body 里 strstr，提示词/工具描述里出现 "json_schema" 也会被当成请求
- *   参数 —— 于是「写了个 JSON 示例」的提示词会突然拿到 400。
+ * ★ 只看【顶层】 response_format 的值，且在其值区间内找类型名。
+ *   不以 raw body 全文 strstr —— 那会让任意深度的同名嵌套键（例如
+ *   metadata.response_format）被当成请求参数，直接 400 掉一个无关请求。
  * json_schema 先判：它的对象里嵌着同名键，也可能嵌 json_object 字样。 */
 int server_response_format_kind(const char *body) {
     if (!body) return SERVER_RF_NONE;
-    static const char kKey[] = "\"response_format\"";
-    const char *rf = strstr(body, kKey);
-    if (!rf) return SERVER_RF_NONE;
-    const char *p = rf + sizeof(kKey) - 1u;
-    size_t remaining = strlen(p);
-    if (remaining > 512u) remaining = 512u;
-    static const char kSchema[] = "\"json_schema\"";   /* 13 字节 */
-    static const char kObject[] = "\"json_object\"";   /* 13 字节 */
-    for (size_t i = 0; i + sizeof(kSchema) - 1u <= remaining; i++) {
-        if (memcmp(p + i, kSchema, sizeof(kSchema) - 1u) == 0) return SERVER_RF_JSON_SCHEMA;
+    size_t vlen = 0;
+    const char *v = json_top_field_value(body, "response_format", &vlen);
+    if (!v || !vlen) return SERVER_RF_NONE;
+    static const char kSchema[] = "\"json_schema\"";
+    static const char kObject[] = "\"json_object\"";
+    for (size_t i = 0; i + sizeof(kSchema) - 1u <= vlen; i++) {
+        if (memcmp(v + i, kSchema, sizeof(kSchema) - 1u) == 0) return SERVER_RF_JSON_SCHEMA;
     }
-    for (size_t i = 0; i + sizeof(kObject) - 1u <= remaining; i++) {
-        if (memcmp(p + i, kObject, sizeof(kObject) - 1u) == 0) return SERVER_RF_JSON_OBJECT;
+    for (size_t i = 0; i + sizeof(kObject) - 1u <= vlen; i++) {
+        if (memcmp(v + i, kObject, sizeof(kObject) - 1u) == 0) return SERVER_RF_JSON_OBJECT;
     }
     return SERVER_RF_NONE;
 }
@@ -3248,6 +3311,10 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
 
     if (is_chat_endpoint || is_responses_endpoint) {
         double t_start = myds_server_now_s();
+        /* 请求到达时刻（解析前）。与 t_start 分开保留：t_start 会在拿到推理名额后
+         * 重置成「开始推理」的时刻，而 wall 必须仍是【端到端】——外部监控和压测
+         * 工具拿它跟客户端实测比。两者混用会让并发排队看起来像引擎变慢。 */
+        const double t_arrive = t_start;
         double t_first = 0.0;
         double t_last = 0.0;
 
@@ -3389,8 +3456,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
          * 请求，wall 全是等锁）。现在从拿到锁开始重新计时。 */
         const double t_slot = myds_server_now_s();
         const double queue_s = (t_slot > t_start) ? (t_slot - t_start) : 0.0;
-        t_start = t_slot;
-        /* ★ 先作废上一次的 prefill 统计。
+        t_start = t_slot;        /* ★ 先作废上一次的 prefill 统计。
          * 下面可能因 cancel_flag 短路而根本不调 generate，那时引擎内的重置也不会跑；
          * 不作废就会把【上一个请求】的 token 数当成这个请求的打进日志。 */
         myds_context_reset_prefill_stats(ctx);
@@ -3831,10 +3897,16 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             t_last = ns.t_last;
             if (!generated || ns.failed) {
                 resp_id_invalidate_all();
-                stop_reason = MYDS_STOP_ERROR;
+                /* ★ 与流式分支保持一致：客户端断连不是服务端错误。
+                 * 2026-10-25：此前这里无条件写 MYDS_STOP_ERROR，于是非流式请求
+                 * 因客户端超时断开时会被记成 finish_reason=error，并向已关闭的
+                 * socket 再发一次 500。cancel_flag 单独成案。 */
+                stop_reason = ns.cancel_flag ? MYDS_STOP_CANCELLED : MYDS_STOP_ERROR;
                 transport_ok = false;
-                send_response(client_fd, 500, "Internal Server Error", "application/json",
-                              "{\"error\":{\"message\":\"Inference or response allocation failed\",\"type\":\"server_error\"}}");
+                if (stop_reason == MYDS_STOP_ERROR) {
+                    send_response(client_fd, 500, "Internal Server Error", "application/json",
+                                  "{\"error\":{\"message\":\"Inference or response allocation failed\",\"type\":\"server_error\"}}");
+                }
             } else if (!ns.cancel_flag) {
                 char *escaped = json_escape_alloc(ns.buf, ns.len);
                 char *alias_json = json_escape_alloc(model_alias ? model_alias : "myds",
@@ -3998,11 +4070,19 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         }
 
         double t_end = myds_server_now_s();
-        double wall_s = t_end - t_start;
-        double prefill_s = (final_tokens > 0 && t_first > t_start) ? (t_first - t_start) : wall_s;
+        /* 三种时间分开报，不再混成一个 wall：
+         *   wall  = 端到端（客户端看到的），含排队；外部监控/压测拿它与客户端实测比。
+         *   infer = 拿到推理名额之后的时间，即引擎实际消耗。
+         *   queue = 等推理名额的时间。
+         * 2026-10-25 之前 wall 包含排队，导致并发时把等锁当成引擎变慢；
+         * 中间一版又把 wall 改成不含排队，反而让「wall 与客户端不符」。
+         * 两个都有问题，所以三个数各报一个。 */
+        double infer_s = t_end - t_start;
+        double wall_s = t_end - t_arrive;
+        double prefill_s = (final_tokens > 0 && t_first > t_start) ? (t_first - t_start) : infer_s;
         double ttft_s = prefill_s;
         double decode_s = (final_tokens > 1 && t_last > t_first) ? (t_last - t_first) : 0.0;
-        double decode_tps = (decode_s > 0.0 && final_tokens > 1) ? ((double)(final_tokens - 1) / decode_s) : ((wall_s > 0.0) ? ((double)final_tokens / wall_s) : 0.0);
+        double decode_tps = (decode_s > 0.0 && final_tokens > 1) ? ((double)(final_tokens - 1) / decode_s) : ((infer_s > 0.0) ? ((double)final_tokens / infer_s) : 0.0);
         const char *final_finish_str = (stop_reason == MYDS_STOP_LENGTH || stop_reason == MYDS_STOP_CTX_FULL) ? "length" : (stop_reason == MYDS_STOP_CANCELLED ? "cancelled" : (stop_reason == MYDS_STOP_ERROR ? "error" : "stop"));
 
         /* prefill 速率直接取自引擎的 prefill 阶段计时，不用 ttft 反推：
@@ -4031,11 +4111,11 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                      pf.prefill_tokens, pf.prefill_seconds, pf_tps, pf.cached_tokens);
         }
         MYDS_LOG_I("[%s:%d] Completed %s %s - prompt: %u tok, prefill: %s, ttft: %.3fs, "
-                   "decode: %u tok in %.3fs = %.2f t/s, wall: %.3fs (queue %.3fs), finish_reason: %s",
+                   "decode: %u tok in %.3fs = %.2f t/s, wall: %.3fs (infer %.3fs, queue %.3fs), finish_reason: %s",
                    client_ip, client_port,
                    is_responses_endpoint ? "Responses" : "ChatCompletions",
                    path, prompt_tokens, prefill_str, ttft_s,
-                   final_tokens, decode_s, decode_tps, wall_s, queue_s, final_finish_str);
+                   final_tokens, decode_s, decode_tps, wall_s, infer_s, queue_s, final_finish_str);
         if (ctx->dspark && ctx->dspark->proposed_tokens > dspark_prop_before) {
             uint64_t req_prop = ctx->dspark->proposed_tokens - dspark_prop_before;
             uint64_t req_acc  = ctx->dspark->accepted_tokens - dspark_acc_before;
