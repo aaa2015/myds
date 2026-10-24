@@ -905,17 +905,35 @@ int main(int argc, char **argv) {
         assert(picked == 2); /* 10.5f is maximum at index 2 */
         printf("  [PASS] Production greedy argmax token selection (index 2 picked)\n");
 
-        /* Structured output bitmask filter: disallow token 2, allow tokens 1, 3, 5 */
+        /* Structured output bitmask filter: disallow token 2, allow tokens 1, 3, 5.
+         *
+         * 2026-10-25：bitmask 改为 ctx 独占所有权（myds_config_t 里的字段已删，
+         * 那会造成 cfg/ctx 双重所有权 → clear 后悬空 → 下一次请求 use-after-free）。
+         * 因此这里必须给真实 ctx，不能再传 NULL。 */
+        myds_context_t cx;
+        memset(&cx, 0, sizeof cx);
         uint32_t bm[1] = {(1u << 1) | (1u << 3) | (1u << 5)};
-        myds_config_t cfg_bm = {.temperature = 0.0f, .logit_bitmask = bm};
-        int32_t picked_bm = myds_sample_next_token(logits, 8, &cfg_bm, NULL, NULL, 0);
+        cx.logit_bitmask = bm;
+        cx.logit_bitmask_words = 1;
+
+        myds_config_t cfg_bm = {.temperature = 0.0f};
+        int32_t picked_bm = myds_sample_next_token(logits, 8, &cfg_bm, &cx, NULL, 0);
         assert(picked_bm == 5); /* Token 5 (8.9f) is highest among allowed {1, 3, 5} */
 
-        /* Also test temperature sampling under bitmask */
+        /* temperature 路径同样必须遵守 bitmask */
         cfg_bm.temperature = 0.8f;
         cfg_bm.seed = 42;
-        int32_t picked_temp = myds_sample_next_token(logits, 8, &cfg_bm, NULL, NULL, 0);
+        int32_t picked_temp = myds_sample_next_token(logits, 8, &cfg_bm, &cx, NULL, 0);
         assert(picked_temp == 1 || picked_temp == 3 || picked_temp == 5);
+
+        /* ★ 全禁时的边界：不得崩溃，返回值必须落在词表内 */
+        uint32_t allzero[1] = {0u};
+        cx.logit_bitmask = allzero;
+        const int32_t none_ok = myds_sample_next_token(logits, 8, &cfg_bm, &cx, NULL, 0);
+        assert(none_ok >= 0 && none_ok < 8);
+
+        cx.logit_bitmask = NULL;
+        cx.logit_bitmask_words = 0;
         printf("  [PASS] Structured output logit bitmask filter (disallowed token 2, selected %d)\n", picked_bm);
     }
 

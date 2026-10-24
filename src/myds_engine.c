@@ -1455,6 +1455,7 @@ void myds_context_free(myds_context_t *ctx) {
     if (ctx->sample_indices) free(ctx->sample_indices);
     if (ctx->sample_cands)   free(ctx->sample_cands);
     if (ctx->logit_bitmask)  free(ctx->logit_bitmask);
+    ctx->logit_bitmask_words = 0;
     for (uint32_t i = 0; i < MYDS_ANCHOR_SLOTS_MAX; ++i) free(ctx->anchor_tokens[i]);
     free(ctx);
 }
@@ -1483,14 +1484,22 @@ void myds_context_set_logit_bitmask(myds_context_t *ctx, const uint32_t *bitmask
         myds_context_clear_logit_bitmask(ctx);
         return;
     }
-    const uint32_t vocab = ctx->model ? ctx->model->vocab_size : 129280u;
+    if (!ctx->model) return;   /* 拿不到 vocab 就无法确定长度，宁可不设也不猜 */
+    const uint32_t vocab = ctx->model->vocab_size;
+    if (vocab == 0) return;
     const uint32_t n_words = (vocab + 31u) / 32u;
-    if (!ctx->logit_bitmask) {
-        ctx->logit_bitmask = (uint32_t *)malloc(n_words * sizeof(uint32_t));
+
+    /* ★ 2026-10-25：原实现只在指针为 NULL 时 malloc，之后无条件按【当前】
+     * n_words 做 memcpy。若先以小 vocab 分配、再以大 vocab 调用，memcpy
+     * 会写出缓冲区末尾 —— 堆溢出。现在按实际容量重新分配。 */
+    if (ctx->logit_bitmask_words != n_words) {
+        uint32_t *nb = (uint32_t *)realloc(ctx->logit_bitmask,
+                                           (size_t)n_words * sizeof(uint32_t));
+        if (!nb) return;                     /* 分配失败：保持原状，不静默截断 */
+        ctx->logit_bitmask = nb;
+        ctx->logit_bitmask_words = n_words;
     }
-    if (ctx->logit_bitmask) {
-        memcpy(ctx->logit_bitmask, bitmask, n_words * sizeof(uint32_t));
-    }
+    memcpy(ctx->logit_bitmask, bitmask, (size_t)n_words * sizeof(uint32_t));
 }
 
 /* 强定义。server.c 里有一份 __attribute__((weak)) 的空实现，
@@ -1502,6 +1511,7 @@ void myds_context_clear_logit_bitmask(myds_context_t *ctx) {
         free(ctx->logit_bitmask);
         ctx->logit_bitmask = NULL;
     }
+    ctx->logit_bitmask_words = 0;   /* 容量必须同步归零，否则下次 set 会误判足够 */
 }
 
 static inline bool pen_seen_in(const int32_t *keys, int32_t t) {
@@ -1594,8 +1604,8 @@ int32_t myds_sample_next_token(
     } while (0)
 
     /* 官方 DeepInfer 借鉴：Structured output token bitmask filter */
-    const uint32_t *bitmask = (cfg && cfg->logit_bitmask) ? cfg->logit_bitmask
-                            : (ctx ? ctx->logit_bitmask : NULL);
+    /* 单一来源：只有 ctx 拥有 bitmask（cfg 里的字段已删，见 myds.h 的说明）。 */
+    const uint32_t *bitmask = ctx ? ctx->logit_bitmask : NULL;
     #define BITMASK_ALLOWED(bm, tok) (!(bm) || (((bm)[(uint32_t)(tok) >> 5] >> ((uint32_t)(tok) & 31)) & 1u))
 
     /* 1. Greedy argmax check (if temp <= 0) */

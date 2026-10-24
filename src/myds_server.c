@@ -4024,17 +4024,28 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
 
 cleanup_infer:
         myds_context_clear_image_embeddings(ctx);
-        /* 2026-10-25：结构化输出（logit_bitmask）尚未接线 —— 全仓库没有任何
-         * 地方调用 myds_context_set_logit_bitmask，bitmask 恒为 NULL，因此这里
-         * 不需要清理。
+        /* 2026-10-25：清理本请求可能设置的结构化输出 bitmask。
          *
-         * 原本这里调用 myds_context_clear_logit_bitmask()，但该函数定义在
-         * myds_engine.c，而 tests/test_http_bytes.c 只链接 server.o ⇒ make test
-         * 链接失败（undefined symbol）。改成弱符号也无效（头文件已做非 weak
-         * 声明，#pragma weak 被忽略）。
+         * ★ 必须清：bitmask 存在 ctx 上（ctx 跨请求复用），不清就会把上一个
+         * 请求的 token 白名单带到下一个请求 —— 那是功能错误，也是越权风险。
          *
-         * 等真正实现结构化输出（生成 token 允许集合并调用 set_logit_bitmask）
-         * 时，再把清理接回来 —— 那时它才有意义，且测试目标也需同步链接 engine.o。 */
+         * ★ 为什么内联而不是调 myds_context_clear_logit_bitmask()：
+         * 那个函数在 myds_engine.c，而 tests/test_http_bytes.c 只编译 server.c
+         * （它 #include 了本文件），链接期会 undefined symbol ⇒ make test 失败。
+         * server.c 已 include myds_internal.h，ctx 定义可见，直接内联即可。
+         * 逻辑与 engine 版完全一致（含容量归零），改一处必须同步改另一处。 */
+        /* ★ 必须检查 ctx：handle_client 的 ctx 参数允许为 NULL
+         * （tests/test_http_bytes.c 就传 NULL 模拟无 model 场景）。
+         * 我第一版内联时漏了这个判断，直接把 ctx->logit_bitmask 解引用，
+         * 测试立刻 SIGSEGV（退出码 139）。engine 版函数开头有 if (!ctx) return;
+         * 内联时【必须把等价的保护一起搬过来】。 */
+        if (ctx) {
+            if (ctx->logit_bitmask) {
+                free(ctx->logit_bitmask);
+                ctx->logit_bitmask = NULL;
+            }
+            ctx->logit_bitmask_words = 0;
+        }
         myds_vjob_sink_free(&img_sink);
         myds_set_continue_from_cache(ctx, false);
         myds_context_set_config(ctx, &prev_cfg);

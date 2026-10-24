@@ -228,7 +228,11 @@ struct myds_context {
     void                *sample_cands;
     uint64_t             rng_state;
     /* Structured output token bitmask (borrowed from DeepInfer) */
+    /* 结构化输出 bitmask：ctx 独占所有权。
+     * logit_bitmask_words 记录已分配的 uint32 数量 —— 没有它就无法在
+     * vocab 变化时判断现有缓冲够不够，会导致 memcpy 堆溢出。 */
     uint32_t            *logit_bitmask;
+    uint32_t             logit_bitmask_words;
 
     /* ── 图片嵌入注入（视觉）──
      * 序列位置 [img_emb_start, img_emb_start + img_emb_count) 的嵌入不用词表查表，

@@ -52,10 +52,17 @@ typedef struct {
      * 保留仅为 ABI 兼容；新代码不要依赖它。 */
     bool     stream;            /* Deprecated: set but never read; see note above. */
     bool     thinking_mode;     /* Enable thinking / reasoning mode (default: false) */
-    /* 官方 DeepInfer 借鉴：Structured output token bitmask filter。
-     * 若非 NULL，指向大小为 ceil(vocab_size / 32) 个 uint32 的位掩码数组。
-     * 只有第 (token >> 5) 个 uint32 的第 (token & 31) 位为 1 时才允许采样该 token。 */
-    const uint32_t *logit_bitmask;
+    /* 2026-10-25：结构化输出的 bitmask 【不放在这里】。
+     *
+     * 原设计在 myds_config_t 里放了 const uint32_t *logit_bitmask，与
+     * myds_context_t.logit_bitmask 形成双重所有权。配合 server 的
+     *     myds_config_t prev_cfg = myds_context_get_config(ctx);
+     *     myds_config_t req_cfg  = prev_cfg;
+     * 就会把同一个指针复制进 ctx->cfg —— clear 释放 ctx->logit_bitmask 之后，
+     * ctx->cfg.logit_bitmask 立刻悬空，下一次请求 use-after-free。
+     *
+     * 改为单一所有权：只有 ctx 拥有 bitmask，通过
+     * myds_context_set_logit_bitmask / clear_logit_bitmask 管理。 */
 } myds_config_t;
 
 typedef void (*myds_stream_callback_t)(const char *piece, int32_t token_id, void *user_data);

@@ -3945,8 +3945,8 @@ static inline int32_t sample_and_verify_token(const float *logits, uint32_t voca
      *
      * 这与今天 presence_penalty 被同一条路径吞掉是同一个形状：
      * 快速路径的准入条件必须覆盖【所有】会影响结果的因素。 */
-    const bool has_bitmask = (cfg && cfg->logit_bitmask != NULL)
-                             || (ctx && ctx->logit_bitmask != NULL);
+    /* 单一来源：bitmask 由 ctx 独占（myds_config_t 里已无此字段）。 */
+    const bool has_bitmask = (ctx && ctx->logit_bitmask != NULL);
     if (temp <= 0.0f && !has_penalty && !has_bitmask) {
         bool finite_ok = true;
         int32_t tok = myds_sample_greedy_finite_neon(logits, vocab_size, &finite_ok);
