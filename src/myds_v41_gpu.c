@@ -1525,6 +1525,11 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
        (n_comp&&(!comp_kv||!(comp_bf16?bf16s(comp_kv,(uint64_t)n_comp*512):floats(comp_kv,(uint64_t)n_comp*512))||
                  !ids||!floats(ids,(uint64_t)c_len*top_k))))return 0;
 
+    /* 2026-10-24 诊断：gather 与 flash-attn 分段计时（MYDS_PROFILE_ATTN_SUB=1）。 */
+    extern int  opt_prof_attn_sub;
+    extern void myds_v41_gpu_attn_sub_add(int slot, double sec);
+    const double t_sub0 = opt_prof_attn_sub ? myds_metal_host_time() : 0.0;
+
     /* 诊断：把压缩键数强行调小，【只影响 attention 读取的 K/V 量，不影响 dispatch 结构】，
      * 用来判断这 8 秒是不是 K/V 带宽 bound。结果不完整，仅计时。 */
     if(__builtin_expect(s->keys_clamp > 0, 0)) {
@@ -1613,6 +1618,14 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
                          512u,c_len,1,128,1,1,0))return 0; }
     }
 
+    /* 2026-10-24 诊断（MYDS_PROFILE_ATTN_SUB=1）：把 gather 与 flash-attn 分开计时。
+     * gather 写完 gathered 本就要被 flash 读，此处 commit 不改变数值；
+     * 但会引入一次 CB 边界，属插桩失真 ⇒ 只能看【相对比例】。 */
+    if (opt_prof_attn_sub && use_gather) {
+        if (!myds_metal_commit_batch()) return 0;
+        myds_v41_gpu_attn_sub_add(0, myds_metal_host_time() - t_sub0);
+        if (!myds_metal_begin_batch()) return 0;
+    }
     const uint32_t kv_keys = use_gather ? 640u : keys_pad;
     struct flash_vec_args a={
         .ne01=(int32_t)c_len,.ne02=64,.ne03=1,.nb01=64u*2048u,.nb02=2048u,.nb03=64u*2048u,

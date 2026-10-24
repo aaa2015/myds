@@ -6676,6 +6676,19 @@ uint32_t myds_v41_resolve_macroblock_size(uint32_t n_tokens) {
     return macroblock_size;
 }
 
+/* 2026-10-24 诊断：gather vs flash-attn 的 host 侧计时（MYDS_PROFILE_ATTN_SUB=1）。 */
+int    opt_prof_attn_sub = 0;
+static double g_attn_sub[2] = {0, 0};
+static double g_attn_sub_calls[2] = {0, 0};
+double myds_v41_gpu_attn_sub_get(int slot, double *calls) {
+    if (slot < 0 || slot >= 2) return 0.0;
+    if (calls) *calls = g_attn_sub_calls[slot];
+    return g_attn_sub[slot];
+}
+void myds_v41_gpu_attn_sub_add(int slot, double sec) {
+    if (slot >= 0 && slot < 2) { g_attn_sub[slot] += sec; g_attn_sub_calls[slot] += 1; }
+}
+
 int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                             uint32_t n_tokens, volatile int *cancel_flag) {
     /* MYDS_PROFILE_ALLOC=1：只给「入口 → 层循环」这段未计时区加打点。
@@ -6992,6 +7005,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
      * 不能用来算 shared expert 的效率。需 MYDS_PROFILE_PREFILL=1 且 MYDS_PROFILE_SHARED=1。 */
     double prof_wait_shared = 0, prof_wait_pre_shared = 0;
     const bool opt_prof_shared = getenv("MYDS_PROFILE_SHARED") != NULL;
+    opt_prof_attn_sub = getenv("MYDS_PROFILE_ATTN_SUB") != NULL;
     /* 诊断：把「Wait MoE」这个窗口拆开 —— 它实际包含 Step5..8 全部（attn_out 投影、
      * FFN In、shared+router、MoE GEMM、以及 epilogue 的 add_bf16/hc_expand），
      * 所以不能直接当成「MoE 的耗时」。三段在 MYDS_PROFILE_MOE=1 时才测。 */
@@ -8106,6 +8120,13 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             if (opt_prof_attn_split) {
                 printf("  ...carry+window_ring : %8.2f ms\n", prof_wait_carryring);
                 printf("  ...chunk_attention   : %8.2f ms\n", prof_wait_attn2 - prof_wait_carryring);
+            if (opt_prof_attn_sub) {
+                extern double myds_v41_gpu_attn_sub_get(int slot, double *calls);
+                double c0 = 0, c1 = 0;
+                const double g0 = myds_v41_gpu_attn_sub_get(0, &c0);
+                const double g1 = myds_v41_gpu_attn_sub_get(1, &c1);
+                printf("  ...gather(host)      : %8.2f ms  (%d calls, %.3f ms/call)\n", g0*1000.0, (int)c0, c0>0?g0*1000.0/c0:0.0);
+            }
             }
         if (opt_prof_split3)
             printf("  ...bf16(attn_heads)  : %8.2f ms  (rope = remainder)\n", prof_wait_bf16);
