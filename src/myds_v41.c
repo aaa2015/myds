@@ -7004,6 +7004,10 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     double prof_idx_layer[V41_LAYERS] = {0};
     const bool opt_prof_idx_layer = getenv("MYDS_PROFILE_IDX_LAYER") != NULL;
     double prof_wait_attn2 = 0;     /* 诊断：ring+attention 的 GPU 等待 */
+    /* 2026-10-24：把 attn2（carry+ring+chunk attention）再切一刀。
+     * MYDS_PROFILE_ATTN_SPLIT=1 + MYDS_PROFILE_SPLIT2=1。 */
+    double prof_wait_carryring = 0;
+    const bool opt_prof_attn_split = getenv("MYDS_PROFILE_ATTN_SPLIT") != NULL;
     double prof_wait_bf16 = 0;      /* 诊断：attn_heads 的 bf16 转换 */
     uint64_t disp_step14 = 0, disp_step58 = 0, disp_layer_all = 0;  /* 诊断 */
     uint64_t disp_step4loop = 0;  /* 诊断：仅 Step4 逐 token 循环 */
@@ -7554,6 +7558,12 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 else {
                 {
                     uint32_t n_comp = compressed ? (mb_base_pos + c_start + c_len) / ratio : 0;
+                if (do_prof && opt_prof_attn_split) {
+                    TIME_START();
+                    CHECK(myds_metal_commit_batch());
+                    TIME_ACC(prof_wait_carryring);
+                    CHECK(myds_metal_begin_batch());
+                }
                     phase = "chunk attention";
                     if (n_comp) {
                         if (!myds_metal_buffer_update_sub_view(cw->cur_selected_view, prompt_selected,
@@ -8093,6 +8103,10 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         }
         if (opt_prof_split2)
             printf("  ...ring+attention    : %8.2f ms\n", prof_wait_attn2);
+            if (opt_prof_attn_split) {
+                printf("  ...carry+window_ring : %8.2f ms\n", prof_wait_carryring);
+                printf("  ...chunk_attention   : %8.2f ms\n", prof_wait_attn2 - prof_wait_carryring);
+            }
         if (opt_prof_split3)
             printf("  ...bf16(attn_heads)  : %8.2f ms  (rope = remainder)\n", prof_wait_bf16);
         printf("Step 5 (Attn Out B)   : %8.2f ms\n", prof_step5);
