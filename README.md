@@ -5,7 +5,7 @@
 >
 > *Origin & disclaimer: copied from ds4; wholly written by LLMs (DeepSeek, Gemini, Sol, Opus); just for better use on M2 Ultra / 192 GB.*
 
-**当前 native engine 已完整实现 DeepSeek V4.1 文本计算图（HC、Engram、压缩 KV、indexer），并通过与 ds4 oracle 的逐位验收；生产 8181 正在运行 DeepSeek-V4.1-Flash Q2。** 正确性门禁默认放行已验收特性，`MYDS_DENY_V41=1` 可不重编译地恢复「拒绝加载」（紧急刹车）。
+**当前 native engine 已完整实现 DeepSeek V4.1 文本计算图（HC、Engram、压缩 KV、indexer），并通过与 ds4 oracle 的逐位验收。**
 
 验收依据与门禁规则记在性能账本的「方法论教训」与「已证否清单」两节；**性能现状、瓶颈归因与优化边界的唯一权威记录是 prefill/decode 全链路与优化账本，只读 §0.0（一页结论）即可掌握全部。** 单元测试通过不等于真实模型逐位对齐，改动数值路径仍须过同等门禁。
 
@@ -358,7 +358,7 @@ make bench
 `myds` 内置 POSIX HTTP 服务端。只有模型加载通过后才会启动监听：
 
 ```bash
-./bin/myds -m /path/to/deepseek.gguf --port 8181 --host 0.0.0.0 --alias local-myds
+./bin/myds -m /path/to/deepseek.gguf --port 8080 --host 0.0.0.0 --alias myds
 ```
 
 支持的标准端点：
@@ -507,7 +507,7 @@ python3 tools/bench_reproduce.py verify
 
 先在 Mac Studio 安排独占窗口：确认生产请求结束，暂停推理服务和其他 GPU benchmark，
 完成后重启推理服务并检查 `/health`。
-`tools/bench_reproduce.py run` 会检查已知推理/benchmark 进程与 8181 监听，
+`tools/bench_reproduce.py run` 会检查已知推理/benchmark 进程与默认端口监听，
 发现仍在运行时退出；服务暂停与恢复由窗口管理者负责。
 
 ```sh
