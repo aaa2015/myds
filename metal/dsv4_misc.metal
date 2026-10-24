@@ -2184,7 +2184,11 @@ kernel void kernel_glm_indexer_score_chunk_direct(
  *   × 8 个查询 token（在线程组共享内存 qtg/wtg 中被全部 16 个压缩键行复用）。
  * - 压缩键读取带宽降低 8×，查询 Q/weights 读取带宽降低 16×，线程组数量减少 128×。
  * - 每个 (tok, row) 对内的 lane 级 float4 dot、simd_sum(s) 以及 head = 0..31 顺序累加
- *   与 kernel_glm_indexer_score_chunk_direct 100% 逐位全同（bit-exact）。 */
+ *   与 kernel_glm_indexer_score_chunk_direct 同构，但【不是逐位相同】：direct 走
+ *   scratch[tid] + 树形归约，这里走 float4 dot + simd_sum，归约次序不同。
+ *   2026-10-25 实测 tok=0,row=0 就差 1 ULP（bd0e5310 vs bd0e530f），
+ *   见 tests/test_indexer_window.c 的说明。别再写「bit-exact」——那个说法
+ *   从来只在端到端 logits 上验过，score 层并不成立。 */
 kernel void kernel_myds_indexer_score_chunk_exact(
         constant ds4_metal_args_glm_indexer_score_chunk & args,
         device const char *q,
@@ -2207,14 +2211,19 @@ kernel void kernel_myds_indexer_score_chunk_exact(
     const uint tile_tokens = last_tok - tok_base;
     const uint max_vis = (args.causal_start + (last_tok - 1u) + 1u) / args.causal_ratio;
 
-    /* 2026-10-25：距离窗口下界。window=0 ⇒ min_vis=0 ⇒ 下面的下界条件永不成立
-     * ⇒ 与改动前逐位等价（0-ULP 门禁可验）。
-     * window>0 ⇒ 距可见上限超过 window 的整块直接跳过，把 O(N²) 降到 O(N×window)。 */
-    const uint min_vis = (args.window && max_vis > args.window)
-                         ? (max_vis - args.window) : 0u;
+    /* 2026-10-25：距离窗口下界。
+     * ★ 下界必须按【块内最早的那个 token】算，不能用 max_vis（块内最晚 token）。
+     *   下界随可见上限单调递增，所以最早的 token 给出块内最小下界：只有
+     *   row < tile_min_vis 才能保证对块内每个 token 都越界。用 max_vis 算会
+     *   把 token 0..6 仍需要的行整块填成 -INF（每块最多误丢 max_vis - vis_0 行，
+     *   ratio=1 时是 7 行）。
+     * window=0 ⇒ tile_min_vis=0 ⇒ 下界条件永不成立 ⇒ 与改动前逐位等价。 */
+    const uint vis_0 = (args.causal_start + tok_base + 1u) / args.causal_ratio;
+    const uint tile_min_vis = (args.window && vis_0 > args.window)
+                              ? (vis_0 - args.window) : 0u;
 
-    /* 整块早退：超出因果上限（未来）或超出距离窗口（太早）都填 -INF 返回 */
-    if (row_base >= max_vis || (min_vis && row_base + 16u <= min_vis)) {
+    /* 整块早退：超出因果上限（未来）或整块低于距离窗口（太早）都填 -INF 返回 */
+    if (row_base >= max_vis || (tile_min_vis && row_base + 16u <= tile_min_vis)) {
         const uint cell_t = (uint)tid >> 4;
         const uint cell_c = (uint)tid & 15u;
         const uint cell_tok = tok_base + cell_t;
@@ -2268,9 +2277,14 @@ kernel void kernel_myds_indexer_score_chunk_exact(
         for (uint t = 0; t < tile_tokens; t++) {
             const uint vis_t = (args.causal_start + tok_base + t + 1u) / args.causal_ratio;
             if (sg_row0 >= vis_t) continue;
+            /* 逐 token 窗口下界：整块早退只挡住「对全块都越界」的行，边界那一块
+             * 里的旧行仍要靠这里逐行剔掉，否则窗口语义只到 16 行 tile 粒度。 */
+            const uint lo_t = (args.window && vis_t > args.window)
+                              ? (vis_t - args.window) : 0u;
             const float4 q4 = qtg[t * 32u + (uint)lane];
             const float w = wtg[t * 32u + head];
             FOR_UNROLL (uint r = 0; r < 4u; r++) {
+                if (sg_row0 + r < lo_t) continue;
                 float s = dot(q4, k_reg[r]);
                 s = simd_sum(s);
                 const float contrib = max(s * args.scale, 0.0f) * w;
@@ -2288,7 +2302,9 @@ kernel void kernel_myds_indexer_score_chunk_exact(
     const uint out_row = sg_row0 + out_r;
     if (out_tok < args.n_tokens && out_row < args.n_rows) {
         const uint vis = (args.causal_start + out_tok + 1u) / args.causal_ratio;
-        scores[(uint64_t)out_tok * args.n_rows + out_row] = (out_row < vis) ? acc : -INFINITY;
+        const uint lo = (args.window && vis > args.window) ? (vis - args.window) : 0u;
+        scores[(uint64_t)out_tok * args.n_rows + out_row] =
+            (out_row < vis && out_row >= lo) ? acc : -INFINITY;
     }
 }
 

@@ -590,20 +590,29 @@ int myds_v41_gpu_indexscores_selected_blocks_bf16(myds_metal_buffer_t *scores,
  * 复杂度从 O(N²) 降到 O(N × window)，代价是模型失去远距离检索能力。
  *
  * 生产默认不设。开启前必须评估长文质量（当前无自动化基准）。 */
-static uint32_t indexer_key_window(void) {
-    static uint32_t cached = UINT32_MAX;   /* 哨兵：未解析 */
-    if (cached != UINT32_MAX) return cached;
-    cached = 0;
+static uint32_t indexer_key_window_value = 0;
+static pthread_once_t indexer_key_window_once = PTHREAD_ONCE_INIT;
+
+static void indexer_key_window_init(void) {
     const char *e = getenv("MYDS_INDEXER_KEY_WINDOW");
     if (e && *e) {
         const long v = atol(e);
-        if (v > 0) cached = (uint32_t)v;
+        if (v > 0) indexer_key_window_value = (uint32_t)v;
     }
-    if (cached) {
+    if (indexer_key_window_value) {
         MYDS_LOG_W("indexer: key 方向窗口 %u（非 0-ULP —— 更早的压缩键不参与 top-k）",
-                   cached);
+                   indexer_key_window_value);
     }
-    return cached;
+}
+
+/* ★ 用 pthread_once 而不是「哨兵 + 首次解析」：后者是先写 cached=0 再 getenv，
+ * 两个线程同时进来时第二个可能读到写了一半的状态，且日志会重复打。
+ * pthread_once 由 libpthread 保证只执行一次且对后续调用可见。
+ * 副作用：同一进程内 getenv 的修改不再生效（此前可以），测试若要换值
+ * 必须在首次调用前设置 —— 这是刻意的，避免运行期语义漂移。 */
+static uint32_t indexer_key_window(void) {
+    pthread_once(&indexer_key_window_once, indexer_key_window_init);
+    return indexer_key_window_value;
 }
 
 static int indexscores_chunk(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,

@@ -63,6 +63,7 @@ TEST_PREFILL_SHORT_SNAPSHOT = $(BIN_DIR)/test_prefill_short_snapshot
 TEST_PREFILL_SHRINK_GRID = $(BIN_DIR)/test_prefill_shrink_grid
 TEST_PREFILL_SHRINK_GRID_GUARDED = $(BIN_DIR)/test_prefill_shrink_grid_guarded
 TEST_YOCO_COMPACT = $(BIN_DIR)/test_yoco_compact
+TEST_INDEXER_WINDOW = $(BIN_DIR)/test_indexer_window
 TEST_TOPK_THRESHOLD = $(BIN_DIR)/test_topk_threshold
 TEST_F16_BF16_FUSE = $(BIN_DIR)/test_f16_bf16_fuse
 TEST_INDEXER_ROPE_QUANT = $(BIN_DIR)/test_indexer_rope_quant
@@ -118,7 +119,7 @@ METALLIB = $(BIN_DIR)/myds.metallib
 METAL_SRCS = $(wildcard metal/*.metal)
 
 ALL_TESTS = $(TEST_METAL) $(TEST_V41_GPU) $(TEST_ATTN_POLICY) $(TEST_ATTN_VEC) $(TEST_QKV_FUSION) $(TEST_DECODE_Q8) $(TEST_MOE_DOWN_NSG) $(TEST_DEEPER_SSD) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE) $(TEST_CPU) $(TEST_ENGRAM) $(TEST_ALIGN) $(TEST_PLD) $(TEST_KVDSK) $(TEST_P1) $(TEST_DSPARK_ROLLBACK) $(TEST_DSPARK_CAPTURE) $(TEST_DSPARK_ROUTER) $(TEST_V41_ROUTER) $(TEST_BATCH2_SHARED_PAIR) $(TEST_DSPARK_ATTN) $(TEST_DSPARK_MOE) $(TEST_DSPARK_PROPOSAL) $(TEST_BATCH2_PARITY) $(TEST_BATCH2_E2E) $(TEST_Q4_BF16_PARITY) $(TEST_TREE_SPEC) $(TEST_ENGINE_DEPTH2)
-ALL_TESTS += $(TEST_METAL_RESIDENCY) $(TEST_TEARDOWN_ORDER) $(TEST_DECODE_SPLIT) $(TEST_KVDSK_FIFO) $(TEST_ANCHOR_SLOTS) $(TEST_YOCO_COMPACT)
+ALL_TESTS += $(TEST_METAL_RESIDENCY) $(TEST_TEARDOWN_ORDER) $(TEST_DECODE_SPLIT) $(TEST_KVDSK_FIFO) $(TEST_ANCHOR_SLOTS) $(TEST_YOCO_COMPACT) $(TEST_INDEXER_WINDOW)
 
 .PHONY: all test clean bench metallib build-tail-init test-tail-init
 
@@ -433,6 +434,10 @@ $(TEST_PREFILL_SHRINK_GRID_GUARDED): tests/test_prefill_shrink_grid_guarded.c sr
 $(TEST_YOCO_COMPACT): tests/test_yoco_compact.c | $(BIN_DIR)
 	$(CC) $(CFLAGS) -Iinclude -o $@ $<
 
+# 需要 GPU：窗口下界在 Metal 内核里，只能用 direct 内核做独立参考臂。
+$(TEST_INDEXER_WINDOW): tests/test_indexer_window.c $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(CFLAGS) -Iinclude -o $@ $< $(filter %.o,$^) $(LDFLAGS)
+
 $(TEST_DEPTH2_SHARED3): tests/test_depth2_shared3.m src/myds_metal.m src/myds_decode_candidates.inc $(wildcard include/*.h) $(OBJS_C) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc -o $@ $< $(OBJS_C) $(LDFLAGS)
 
@@ -708,6 +713,9 @@ test: $(ALL_TESTS) $(METALLIB)
 	@python3 tests/test_slim_dense.py
 	@echo ""
 	@./$(TEST_YOCO_COMPACT)
+	@./$(TEST_INDEXER_WINDOW)
+	@MYDS_INDEXER_KEY_WINDOW=8 ./$(TEST_INDEXER_WINDOW)
+	@MYDS_INDEXER_KEY_WINDOW=20 ./$(TEST_INDEXER_WINDOW)
 	@echo "\n========================================================"
 	@echo "      ALL TEST SUITES PASSED CLEANLY & SUCCESSFULLY!    "
 	@echo "========================================================"
