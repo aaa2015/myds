@@ -77,17 +77,25 @@ def rotate_one(path, today, dry_run):
 
     groups = split_lines_by_date(path, today)
 
-    # 只有「日期 < today」的组需要归档；无时间戳的前导行（cur_date is None）也算旧
+    # 按【每组自己的日期】分类，不用「遇到今天就全保留」的状态机。
+    #
+    # 为什么：时间戳理论上单调，但重启、NTP 回拨、手工插入都会造成乱序。
+    # 第一版用 seen_today 标志，遇到第一个 10-24 之后的所有行都当今天保留，
+    # 于是夹在后面的 10-23 行被漏归档 —— 实测踩到（假日志在第 227 行）。
+    #
+    # 无日期的组（date is None）只可能出现在文件最开头（已被 split_lines_by_date
+    # 并入其后第一组），这里若仍出现，视为「未知日期」，保守地跟着最近的上一个日期。
     old_groups = []
     keep_lines = []
-    seen_today = False
+    last_seen = None
     for d, lines in groups:
-        if d is not None and d >= today:
-            seen_today = True
-        if seen_today:
-            keep_lines.extend(lines)
+        eff = d if d is not None else last_seen
+        if d is not None:
+            last_seen = d
+        if eff is not None and eff < today:
+            old_groups.append((eff, lines))
         else:
-            old_groups.append((d, lines))
+            keep_lines.extend(lines)
 
     if not old_groups:
         return 0, size
