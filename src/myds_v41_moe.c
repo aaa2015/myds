@@ -237,9 +237,15 @@ int myds_v41_route_batch(myds_metal_buffer_t *selected, myds_metal_buffer_t *wei
  * 输出格式：每次 myds_v41_moe_weight_hist_report() 打印一行，
  * 分位数为「每个 token 的最小槽位权重」，另附全量槽位分布。 */
 #define MOE_WH_BINS 20
+/* 最小槽位权重的对数刻度直方图（2026-10-25 第二版）：
+ * 第一版用线性 20 桶（每桶 0.05），结果全部落在 <0.25 里 ——
+ * 分不清 0.001 还是 0.2，而这个差别决定能不能跳。
+ * 改用对数桶：1e-4 到 1e0，每十倍一个区间再分 4 小格。 */
+#define MOE_WH_LOG_BINS 20
 static _Atomic uint64_t moe_wh_total;
 static _Atomic uint64_t moe_wh_min_hist[MOE_WH_BINS];   /* 每 token 最小槽位权重 */
 static _Atomic uint64_t moe_wh_all_hist[MOE_WH_BINS];   /* 所有槽位权重 */
+static _Atomic uint64_t moe_wh_log[MOE_WH_LOG_BINS];    /* 最小权重的对数刻度 */
 static _Atomic uint32_t moe_wh_tokens;
 
 static int moe_wh_bin(float w) {
@@ -247,6 +253,16 @@ static int moe_wh_bin(float w) {
     if (w >= 1.0f) return MOE_WH_BINS - 1;
     int b = (int)(w * (float)MOE_WH_BINS);
     return b < 0 ? 0 : (b >= MOE_WH_BINS ? MOE_WH_BINS - 1 : b);
+}
+
+/* 1e-4 ... 1e0，每十倍 4 格（即每格 ×1.78）。返回 0..19。 */
+static int moe_wh_logbin(float w) {
+    if (!(w > 0.0f)) return 0;
+    if (w >= 1.0f) return MOE_WH_LOG_BINS - 1;
+    if (w < 1e-4f) return 0;
+    const double t = (log10((double)w) + 4.0) * 5.0;   /* 0..20 */
+    int b = (int)t;
+    return b < 0 ? 0 : (b >= MOE_WH_LOG_BINS ? MOE_WH_LOG_BINS - 1 : b);
 }
 
 void myds_v41_moe_weight_hist_observe(myds_metal_buffer_t *weights, uint32_t rows, uint32_t top_k);
@@ -268,6 +284,7 @@ void myds_v41_moe_weight_hist_observe(myds_metal_buffer_t *weights, uint32_t row
         }
         if (isfinite(mn)) {
             atomic_fetch_add_explicit(&moe_wh_min_hist[moe_wh_bin(mn)], 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&moe_wh_log[moe_wh_logbin(mn)], 1, memory_order_relaxed);
             atomic_fetch_add_explicit(&moe_wh_tokens, 1, memory_order_relaxed);
             atomic_fetch_add_explicit(&moe_wh_total, 1, memory_order_relaxed);
         }
@@ -286,6 +303,32 @@ void myds_v41_moe_weight_hist_report(const char *tag, bool reset) {
                        : atomic_load_explicit(&moe_wh_all_hist[i], memory_order_relaxed);
     }
     if (reset) atomic_store_explicit(&moe_wh_tokens, 0, memory_order_relaxed);
+    /* ── 第二版：最小权重的对数刻度分布（这才是判据）──
+     * 打印 8 个阈值上的累积占比：跳掉最小槽位会让多少 token 少算超过 x 的权重。*/
+    {
+        uint64_t logs[MOE_WH_LOG_BINS];
+        for (int i = 0; i < MOE_WH_LOG_BINS; i++) {
+            logs[i] = reset ? atomic_exchange_explicit(&moe_wh_log[i], 0, memory_order_relaxed)
+                            : atomic_load_explicit(&moe_wh_log[i], memory_order_relaxed);
+        }
+        static const double thresh[] = {1e-4, 1e-3, 1e-2, 5e-2, 1e-1, 0.2, 0.3, 0.5};
+        char buf[512];
+        size_t o = 0;
+        uint64_t cum = 0;
+        int bi = 0;
+        for (size_t ti = 0; ti < sizeof(thresh) / sizeof(*thresh); ti++) {
+            /* 累加所有上界 <= thresh[ti] 的桶 */
+            while (bi < MOE_WH_LOG_BINS) {
+                const double hi = pow(10.0, (double)(bi + 1) / 5.0 - 4.0);
+                cum += logs[bi];
+                bi++;
+                if (hi >= thresh[ti] * 0.999) break;
+            }
+            o += (size_t)snprintf(buf + o, sizeof(buf) - o, "<%.0e:%.1f%% ", thresh[ti],
+                                  100.0 * (double)cum / (double)n);
+        }
+        MYDS_LOG_I("[%s] 最小槽位权重（对数刻度，%u token）%s", tag ? tag : "moe-hist", (unsigned)n, buf);
+    }
     /* 累积到「权重 < x」的 token 占比（用来回答“跳掉最小槽位会丢掉多少”） */
     double cum = 0.0;
     char line[512];
