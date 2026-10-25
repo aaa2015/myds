@@ -1,5 +1,11 @@
 # prefill / decode 全链路、已采纳优化与排除记录
 
+> **关于文中出现的路径**：本账本里大量引用了 `benchmarks/…`、`tests/…`、`bin/…` 这类
+> 路径，写作时用反引号而不是链接。那批**原始测量产物**（tensor dump、JSON 运行态、
+> 打包存档，合计数 GB）并未随源码仓库发布，所以它们在本仓库中**不可直接点击**。
+> 数值本身仍然可信（每条都附了方法与判据），但无法仅凭本仓库独立复现——
+> 复现需要用本仓库的代码与 scripts 重跑。
+
 - 最后更新：**2026-10-24 18:08（§68–§92 全链路效率普查完成。prefill 57.3% 已到顶、30.2% 受硬约束；唯一采纳 §85 TILED −1.73%。生产 PID55488 已核验）**
 - 主机：macstudio — M2 Ultra，76 核 GPU，**206 GB 统一内存**（=192 GiB，Metal 上限 201.9 GB）；
   带宽理论峰值 **800 GB/s**，实测可达 **724 GB/s**（§0.1），纯读基准最高 799 GB/s（§46.1）
@@ -2632,13 +2638,13 @@ MoE down 实测 286–353 GB/s，**与 82K 线程的模拟上限完全吻合**�
 ### 16.4 prefill chunk：+4.5% 是被政策拒绝的，而政策已经失效
 
 - `chunk=1024` 实测 **+4.5%**，当时以「会改变输出文本、破坏 chunk 不变性」拒绝
-  （[2026-10-01-prefix-cache-deploy.md §3](2026-10-01-prefix-cache-deploy.md)）
+  （`2026-10-01-prefix-cache-deploy.md`）
 - 同一份文档里 prefix cache 上线时已**明确放弃** chunk 不变性 ⇒ 拒绝理由不再成立
 - 机理：每个 512 chunk 的 MoE 几乎要把 384 个专家都读一遍。按 §2.3 反推
   （9 tok：约 54/384 的专家权重 ≈ 21.5 GB / 67 ms；604 tok：2 个 chunk ≈ 306 GB / 875 ms），
   MoE 有效带宽约 **320~350 GB/s**，基本是在搬专家权重 ⇒ chunk 越大，每 token 分摊的权重流量越少
 - 上限 `MYDS_V41_CHUNK_MAX` = 2048；2048 档未测过速度
-- **前置检查**：确认 [PREFILL_OPTIMIZATION_SPEC.md §0.5](../PREFILL_OPTIMIZATION_SPEC.md) 的滑窗环形缓冲 bug
+- **前置检查**：确认 `PREFILL_OPTIMIZATION_SPEC.md` 的滑窗环形缓冲 bug
   在当前代码中已修复（§2.1 已有 window ring，但未逐行核对）
 - 验收口径：**语义等价**（temp=0 任务级一致 + NLL 不劣化），不是 0-ULP
 
@@ -2904,7 +2910,7 @@ export MYDS_PREFILL_MACROBLOCK_SIZE=8192
 - 每次循环线程跨越 3.87 MB 专家权重跳跃访存，破坏了连续预取。
 - §13.7 曾尝试直接接入全模型，但遭遇 `layer 40: output head` 错误崩溃，当时推测为中间缓冲可见性 bug 而回滚，并留待 **D3 以独立单测方式彻底重做**。
 
-依据方法论原则（「先写单测证明 0-ULP，再接生产路径」），本节构建了完全独立的组件级验证与测试工具 [tests/test_moe_q2_down_expertz.m](file://$HOME/Projects/myds/tests/test_moe_q2_down_expertz.m)，在真实 M2 Ultra 硬件上完成了严密的数学等价性推导与微基准测量。
+依据方法论原则（「先写单测证明 0-ULP，再接生产路径」），本节构建了完全独立的组件级验证与测试工具 `tests/test_moe_q2_down_expertz.m`，在真实 M2 Ultra 硬件上完成了严密的数学等价性推导与微基准测量。
 
 ### 20.2 方案设计：Candidate A 与 Candidate B
 
@@ -2988,7 +2994,7 @@ export MYDS_PREFILL_MACROBLOCK_SIZE=8192
    - **性能收益极度平庸**：在流水线批次下，扣除 3.93 MB 显存搬运税后，单层仅能缩短 4.8 µs，换算到全模型 40 层仅能节省 **0.19 ms/token（收益 < 0.8%）**；若在非流水线或并发竞争窗口下，因多趟调度开销甚至倒亏 +6.9%。
 2. **交付决策**：
    - 坚决**不采纳上线**，保持生产环境基准状态（42.8 tok/s）。
-   - 保留单测工具 [tests/test_moe_q2_down_expertz.m](file://$HOME/Projects/myds/tests/test_moe_q2_down_expertz.m) 与二进制 [bin/test_moe_q2_down_expertz](file://$HOME/Projects/myds/bin/test_moe_q2_down_expertz)，作为彻底终结该假说的科学实证资产。
+   - 保留单测工具 `tests/test_moe_q2_down_expertz.m` 与二进制 `bin/test_moe_q2_down_expertz`，作为彻底终结该假说的科学实证资产。
 
 ## 21. decode 单层的 cohort 依赖图与关键路径实测（2026-10-21）
 
@@ -4296,7 +4302,7 @@ Q4_K 目前只用于 shared expert 和 dense 层。
 
 ### 28.2 0-ULP 实测逐位一致（原题「数学证明」已按 §28.6-B 修正）
 
-在 [tests/test_q4_bf16_parity.m](file://$HOME/Projects/myds/tests/test_q4_bf16_parity.m) 中对所有 Dense Q4 算子在真实随机权重与高方差输入下进行逐位比对：
+在 `tests/test_q4_bf16_parity.m` 中对所有 Dense Q4 算子在真实随机权重与高方差输入下进行逐位比对：
 - `myds_metal_v41_gemv_bf16`（1280x5120）：NR2 vs NR4 输出 **100% 逐位一致（diff == 0）**；
 - `myds_metal_attn_output_a_bf16`（8 组 × 1024 rank）：NR2 vs NR4 输出 **100% 逐位一致（diff == 0）**；
 - `myds_v41_shared_gate_up_swiglu` 与 `batch2_projection_probe`：**100% 逐位一致（diff == 0）**。
@@ -4304,7 +4310,7 @@ Q4_K 目前只用于 shared expert 和 dense 层。
 
 ### 28.3 6 大 Dense Q4 Site 隔离微基准实测（M2 Ultra, 1000 轮单测）
 
-利用 [tests/bench_dense_q4_sites.m](file://$HOME/Projects/myds/tests/bench_dense_q4_sites.m) 在 M2 Ultra 上独立度量各个 Site：
+利用 `tests/bench_dense_q4_sites.m` 在 M2 Ultra 上独立度量各个 Site：
 
 | Site ID | 算子名称 | 张量维度 | NR2 耗时 (带宽) | NR4 耗时 (带宽) | 相对变化 (Δ) | 物理性质 |
 |---|---|---|---:|---:|---:|---|
@@ -9827,8 +9833,8 @@ off = args.offs[0] + (uint64_t)gid * 16u;      /* 只有一次乘加 */
   前 1 MiB 指纹不是完整模型 SHA，也不是完整 GGUF metadata/header SHA。
 - 执行代码来源为 `086da8b` 加本轮未提交的 capture 索引修复和组件工具。
   完整实际执行源码与二进制分别保存在
-  [executed-source.tar.gz](../benchmarks/2026-10-23-iq2-signed4/executed-source.tar.gz) 和
-  [executed-artifacts.tar.gz](../benchmarks/2026-10-23-iq2-signed4/executed-artifacts.tar.gz)。
+  `benchmarks/2026-10-23-iq2-signed4/executed-source.tar.gz` 和
+  `benchmarks/2026-10-23-iq2-signed4/executed-artifacts.tar.gz`。
   实际 probe metallib SHA256：`af5b068e55fe00f8d65b514223d86a10dcad2e05a9693e88ac820a8f5adb374a`。
   冻结生产 metallib SHA256：`c692d821aed43ecce1cd9003f11e19083cbe5ce2923bef44a8df23c1182dfc81`。
 
@@ -9892,11 +9898,11 @@ capture 逐 F32 bits 一致；每张量 13,824 个 F32，全部写入、finite�
 - **全模型 A1/B/A2、全模型 logits、HTTP 采纳验收：未运行，未声称通过。**
 - **生产采纳：否。** 原型只保留为独立组件实验，host 没有新增运行时调用者或开关。
 
-独立 CPU 复核报告：[independent-review.json](../benchmarks/2026-10-23-iq2-signed4/independent-review.json)。
-实验裁定与归档指纹：[experiment-result.json](../benchmarks/2026-10-23-iq2-signed4/experiment-result.json)。
+独立 CPU 复核报告：`benchmarks/2026-10-23-iq2-signed4/independent-review.json`。
+实验裁定与归档指纹：`benchmarks/2026-10-23-iq2-signed4/experiment-result.json`。
 原始 gate/up/MID、guards、逐样本 GPU 时间戳、真实 trace、输入 SHA、制品及恢复记录均归档在
-[raw-window-1.tar.gz](../benchmarks/2026-10-23-iq2-signed4/raw-window-1.tar.gz)，逐文件指纹见
-[raw-files.json](../benchmarks/2026-10-23-iq2-signed4/raw-files.json)。
+`benchmarks/2026-10-23-iq2-signed4/raw-window-1.tar.gz`，逐文件指纹见
+`benchmarks/2026-10-23-iq2-signed4/raw-files.json`。
 
 归档解包后的 CPU 复核方式（在仓库根目录执行，不提交 GPU 工作）：
 
@@ -9970,7 +9976,7 @@ CPU host-only 正控、8 个 capture/模型负控，以及 8 个 alias/尺寸/�
 
 只读检查确认实际 GGUF 的 **40 层 × Qa/KV = 80 张权重均为 Q4_K（type=12）**。
 完整 metadata 区间检查见
-[all-qkv-descriptors.json](../benchmarks/2026-10-23-qkv-dual/all-qkv-descriptors.json)；
+`benchmarks/2026-10-23-qkv-dual/all-qkv-descriptors.json`；
 该项没有读取全部 80 张权重的 payload。
 本轮 GPU 实测层 **0/19/39**：Qa 为 `5120×1280`、**3,686,400 B**，
 KV 为 `5120×512`、**1,474,560 B**。raw 保留六张权重的完整原始 bytes、file offset 和 SHA256。
@@ -9984,8 +9990,8 @@ KV 为 `5120×512`、**1,474,560 B**。raw 保留六张权重的完整原始 byt
 这是短上下文组件范围，没有覆盖完整生成、长上下文、prefix reuse 或取消恢复语义。
 
 执行源码为本地 `086da8b` 基础上的隔离 source stage，实际内容以
-[executed-source.tar.gz](../benchmarks/2026-10-23-qkv-dual/executed-source.tar.gz) 为准；
-实际二进制见 [executed-artifacts.tar.gz](../benchmarks/2026-10-23-qkv-dual/executed-artifacts.tar.gz)。
+`benchmarks/2026-10-23-qkv-dual/executed-source.tar.gz` 为准；
+实际二进制见 `benchmarks/2026-10-23-qkv-dual/executed-artifacts.tar.gz`。
 停止服务前冻结的 **178 个 stage/protocol 输入 SHA** 在窗口结束后再次核对一致。
 
 | 执行制品 | SHA256 |
@@ -10050,19 +10056,19 @@ native 为 64 次 dispatch，dual 为 32 次。共 **324 个正式计时 CB + 36
 - **生产采纳：否。** 保留独立实验原型和证据，没有增加生产调用者、启用开关或替换生产制品。
 
 独立 raw 重算报告见
-[independent-review.json](../benchmarks/2026-10-23-qkv-dual/independent-review.json)，
+`benchmarks/2026-10-23-qkv-dual/independent-review.json`，
 从实际 GGUF 只读解析并重算六张完整权重的报告见
-[independent-live-source-review.json](../benchmarks/2026-10-23-qkv-dual/independent-live-source-review.json)，
+`benchmarks/2026-10-23-qkv-dual/independent-live-source-review.json`，
 生产恢复审计见
-[independent-live-review.json](../benchmarks/2026-10-23-qkv-dual/independent-live-review.json)，
+`benchmarks/2026-10-23-qkv-dual/independent-live-review.json`，
 最终裁定与归档指纹见
-[experiment-result.json](../benchmarks/2026-10-23-qkv-dual/experiment-result.json)。
+`benchmarks/2026-10-23-qkv-dual/experiment-result.json`。
 全部原始 CB 时间戳、Qa/KV、guards、权重、输入、trace、prepare、窗口与恢复记录保存于
-[raw-window-1.tar.gz](../benchmarks/2026-10-23-qkv-dual/raw-window-1.tar.gz)，
-逐文件 SHA 见 [raw-files.json](../benchmarks/2026-10-23-qkv-dual/raw-files.json)。
+`benchmarks/2026-10-23-qkv-dual/raw-window-1.tar.gz`，
+逐文件 SHA 见 `benchmarks/2026-10-23-qkv-dual/raw-files.json`。
 归档保留 **686 个原始文件、36,369,100 B**；全部归档 bytes/SHA 已逐项核对，
 解包后重新执行独立审核仍得到相同否决结论，见
-[archive-validation.json](../benchmarks/2026-10-23-qkv-dual/archive-validation.json)。
+`benchmarks/2026-10-23-qkv-dual/archive-validation.json`。
 
 归档解包后的 CPU 复核（在仓库根目录执行，不提交 GPU 工作）：
 
@@ -10079,7 +10085,7 @@ python3 tools/review_qkv_dual_artifacts.py \
 退出码 0 表示证据有效，复核结果仍应为 `decision=reject_component_performance`。
 复核器另有有效合成 CPU 正控及 5 个拒绝负控（raw SHA、更新 SHA 后非 0-ULP、guard、
 中位数摘要、缺失 CB），结果见
-[reviewer-cpu-self-test.json](../benchmarks/2026-10-23-qkv-dual/reviewer-cpu-self-test.json)。
+`benchmarks/2026-10-23-qkv-dual/reviewer-cpu-self-test.json`。
 
 ### 74.6 窗口与恢复
 
@@ -10183,10 +10189,10 @@ H2 与 production native 有 **61,341,894 / 67,108,864** 个表示位不一致�
 本轮在第一次失败后停止：**H4、其他两层 GPU 正确性和全部性能计时均未运行**。
 三个真实层输入已捕获，不等于 R1 三层 GPU 都通过。
 原执行源码/制品见
-[window1-executed-source.tar.gz](../benchmarks/2026-10-23-attention-multihead/window1-executed-source.tar.gz)、
-[window1-executed-artifacts.tar.gz](../benchmarks/2026-10-23-attention-multihead/window1-executed-artifacts.tar.gz)，
+`benchmarks/2026-10-23-attention-multihead/window1-executed-source.tar.gz`、
+`benchmarks/2026-10-23-attention-multihead/window1-executed-artifacts.tar.gz`，
 独立完整 raw 复核见
-[window1-failure-review.json](../benchmarks/2026-10-23-attention-multihead/window1-failure-review.json)。
+`benchmarks/2026-10-23-attention-multihead/window1-failure-review.json`。
 
 ### 75.4 算术诊断：保留 observer 扰动，不能据此认定根因
 
@@ -10204,20 +10210,20 @@ H2 与 production native 有 **61,341,894 / 67,108,864** 个表示位不一致�
 - **诊断没有性能数据**。未把 FMA、寄存器溢出、缓存或 shared load 问题写成已证根因。
 
 独立复核见
-[diagnostic1-independent-review.json](../benchmarks/2026-10-23-attention-multihead/evidence/diagnostic1-independent-review.json)。
+`benchmarks/2026-10-23-attention-multihead/evidence/diagnostic1-independent-review.json`。
 诊断运行时 stage 的每个预绑定 SHA 对应源码和制品分别存于
-[diagnostic1-executed-source.tar.gz](../benchmarks/2026-10-23-attention-multihead/diagnostic1-executed-source.tar.gz)、
-[diagnostic1-executed-artifacts.tar.gz](../benchmarks/2026-10-23-attention-multihead/diagnostic1-executed-artifacts.tar.gz)。
+`benchmarks/2026-10-23-attention-multihead/diagnostic1-executed-source.tar.gz`、
+`benchmarks/2026-10-23-attention-multihead/diagnostic1-executed-artifacts.tar.gz`。
 实际诊断 harness 单独保存于
-[diagnostic1-benchmark.tar.gz](../benchmarks/2026-10-23-attention-multihead/diagnostic1-benchmark.tar.gz)，
+`benchmarks/2026-10-23-attention-multihead/diagnostic1-benchmark.tar.gz`，
 其 binary SHA256 `f921f72a4b2ed434b4b26a88b33434756a649b80879945c8b070ec775c072c8d`
 与诊断运行前冻结记录及独立 raw 复核一致。
 该 stage 后续用于 R2；归档时对已变更的文件按诊断前冻结 SHA 从原 R1 stage/归档精确恢复，
 196 个预绑定 stage member 全部逐 SHA 对上，方法与逐项记录见
-[diagnostic1-source-recovery.json](../benchmarks/2026-10-23-attention-multihead/diagnostic1-source-recovery.json)。
+`benchmarks/2026-10-23-attention-multihead/diagnostic1-source-recovery.json`。
 生成的 debug/policy 源码、构建工具、日志与库另保存在
-[diagnostic1-generated-build.tar.gz](../benchmarks/2026-10-23-attention-multihead/diagnostic1-generated-build.tar.gz)，
-成员 SHA 见 [diagnostic1-generated-build-files.json](../benchmarks/2026-10-23-attention-multihead/diagnostic1-generated-build-files.json)。
+`benchmarks/2026-10-23-attention-multihead/diagnostic1-generated-build.tar.gz`，
+成员 SHA 见 `benchmarks/2026-10-23-attention-multihead/diagnostic1-generated-build-files.json`。
 
 ### 75.5 R2：K-only 修订版，三层完整输出全部 0-ULP
 
@@ -10238,9 +10244,9 @@ H2 与 production native 有 **61,341,894 / 67,108,864** 个表示位不一致�
 
 独立 reader 将 **192 个源码成员 + 4 个执行制品 + protocol** 与停止生产前冻结的
 `stage-inputs.json` 全部绑定，见
-[window2-executed-source.tar.gz](../benchmarks/2026-10-23-attention-multihead/window2-executed-source.tar.gz)、
-[window2-executed-artifacts.tar.gz](../benchmarks/2026-10-23-attention-multihead/window2-executed-artifacts.tar.gz) 和
-[window2-independent-review.json](../benchmarks/2026-10-23-attention-multihead/evidence/window2-independent-review.json)。
+`benchmarks/2026-10-23-attention-multihead/window2-executed-source.tar.gz`、
+`benchmarks/2026-10-23-attention-multihead/window2-executed-artifacts.tar.gz` 和
+`benchmarks/2026-10-23-attention-multihead/evidence/window2-independent-review.json`。
 **0-ULP 结论限所测层/完整 shape；没有全模型 logits/token/状态等价证据。**
 
 ### 75.6 GPU 性能：在稳定 production concurrent 对照下明显退化
@@ -10286,11 +10292,11 @@ H4 **−122.25% 至 −124.89%**；包含 supplemental 的全部组最大漂移�
   未启用开关、未覆盖生产 binary/metallib/config。
 
 最终机器可读裁定与证据指纹见
-[experiment-result.json](../benchmarks/2026-10-23-attention-multihead/experiment-result.json)。
+`benchmarks/2026-10-23-attention-multihead/experiment-result.json`。
 六个原始目录（R1、诊断、R2 及三次 prepare）共 **299 个逻辑文件、17,177,069,195 B**，
-保存于 [raw.tar.gz](../benchmarks/2026-10-23-attention-multihead/raw.tar.gz)，
+保存于 `benchmarks/2026-10-23-attention-multihead/raw.tar.gz`，
 逐逻辑路径 bytes/SHA 与恢复方式见
-[raw-files.json](../benchmarks/2026-10-23-attention-multihead/raw-files.json)。
+`benchmarks/2026-10-23-attention-multihead/raw-files.json`。
 压缩包 **1,442,943,790 B**、SHA256
 `55cbc6d686c45e679b2a2f6ef4100dfa4272b2a07d187fe4711e1d297f02cda3`。
 **84 份实体内容 + 209 个 tar hardlink + 6 个精确 KV 重建流**，
@@ -10298,10 +10304,10 @@ H4 **−122.25% 至 −124.89%**；包含 supplemental 的全部组最大漂移�
 所有其它文件完整入包；归档内字典/IDs 可逐 bytes 重建原 KV，已流式重算完整 SHA。
 
 远端对 229 个原始独立 inode 重算 SHA、对全部归档内容重算 SHA，再在本机离线重复核验通过：
-[archive-validation.json](../benchmarks/2026-10-23-attention-multihead/archive-validation.json)、
-[local-archive-review.json](../benchmarks/2026-10-23-attention-multihead/local-archive-review.json)。
+`benchmarks/2026-10-23-attention-multihead/archive-validation.json`、
+`benchmarks/2026-10-23-attention-multihead/local-archive-review.json`。
 归档工具的 5 个篡改负控见
-[archive-cpu-self-test.json](../benchmarks/2026-10-23-attention-multihead/archive-cpu-self-test.json)；
+`benchmarks/2026-10-23-attention-multihead/archive-cpu-self-test.json`；
 host-only 正/负控只证明 ABI、尺寸、alias、mask、字典与身份拒绝合同，没有冒充 GPU 证据。
 
 本机从仓库根目录复核归档（不连接远端，不提交 GPU 工作，不展开 8 GB KV）：
@@ -10328,7 +10334,7 @@ python3 tools/review_attention_multihead_artifacts.py \
 退出码 0 表示证据有效，复核结果仍为 `decision=reject_component_performance`；
 无须恢复虚拟 raw KV 文件，reader 使用已绑定原 observer SHA 的字典流重建。
 本机已从本地 raw tar 实际解包并执行上述完整 CPU 复核，再次得到同一裁定，见
-[local-window2-replay-review.json](../benchmarks/2026-10-23-attention-multihead/local-window2-replay-review.json)。
+`benchmarks/2026-10-23-attention-multihead/local-window2-replay-review.json`。
 
 ### 75.8 三次实验窗口与生产恢复
 
@@ -10339,9 +10345,9 @@ run 不隐式 build；advisory lock 和 monitor 在独占窗口有效。
 
 | 窗口 | 服务 PID 变化 | 独立恢复证据 |
 |---|---|---|
-| R1 | 80555 → 92574 | [independent-live-review.json](../benchmarks/2026-10-23-attention-multihead/independent-live-review.json) |
-| 诊断 | 92574 → 99662 | [diagnostic1-independent-live-review.json](../benchmarks/2026-10-23-attention-multihead/diagnostic1-independent-live-review.json) |
-| R2 | 99662 → **18512** | [window2-independent-live-review.json](../benchmarks/2026-10-23-attention-multihead/window2-independent-live-review.json)，**33/33 项通过** |
+| R1 | 80555 → 92574 | `benchmarks/2026-10-23-attention-multihead/independent-live-review.json` |
+| 诊断 | 92574 → 99662 | `benchmarks/2026-10-23-attention-multihead/diagnostic1-independent-live-review.json` |
+| R2 | 99662 → **18512** | `benchmarks/2026-10-23-attention-multihead/window2-independent-live-review.json`，**33/33 项通过** |
 
 R2 独立 live 快照为 **2026-10-23 21:38:04 +08:00**：原始 argv、
 继承的 **2 个 MYDS** 原始 bytes、原 config bytes/stat/SHA、**51 个有效配置**、cwd/log、nice=0、
@@ -10371,20 +10377,20 @@ remote canonical HEAD 仍为 `5437df0`，原 dirty 文件的路径/状态一致�
 | §75 H2/H4 | 共享 TG tile 的两个实现增加 scratch/同步后明显慢；R2 位一致 | 原有 per-query gathered KV 物化已最优，或任何源数据复用都无效 |
 
 读取生产 KERN argv/继承环境、原配置、制品、模型身份和进程清单，见
-[production-readonly.json](../benchmarks/2026-10-23-next-directions/production-readonly.json)。
+`benchmarks/2026-10-23-next-directions/production-readonly.json`。
 快照时间为 **2026-10-23 22:08:53 +08:00**，仍为 PID **18512**、nice=0、health=ok，
 无其它模型/bench/capture 进程或持有的实验锁；binary/metallib/config 的完整 SHA 与 §75 相同。
 
 **源码身份另有边界**：remote canonical HEAD 是 `5437df0`，其 tracked source 与本地实验树有
 **16 路径差异**，不能把本地新代码当作已经部署，也不能用 canonical HEAD 代替 binary 的 source identity。
 后续全模型比较必须保留冻结生产制品，并让同 build 的候选关闭臂先通过 production gold 的数值/状态门。
-最初只读关联见 [production-build-provenance.json](../benchmarks/2026-10-23-next-directions/production-build-provenance.json)，保留该时点尚未证明源码身份的结论。
+最初只读关联见 `benchmarks/2026-10-23-next-directions/production-build-provenance.json`，保留该时点尚未证明源码身份的结论。
 随后已完成**实际重建**：从 `868d94e9e3168aeadac478e75d096d992b6bc92e`、tree
 `e15b384cf75edec41a3ca83a393701e979a25b5e` 精选 91 个源码文件，在已记录的工具链下
 `make -j4 bin/myds` 返回 0，所得 binary 和 metallib 的**完整 SHA256 均与生产完全一致**。
 这关闭了“存在一份可复现生产制品的源码基线”这个缺口；不能声称唯一确定了历史编译命令。
-见 [production-rebuild-review.json](../benchmarks/2026-10-23-next-directions/production-rebuild-review.json)
-及 [生产源码与重建制品证据](../benchmarks/2026-10-23-next-directions/production-rebuild/source-manifest.json)。
+见 `benchmarks/2026-10-23-next-directions/production-rebuild-review.json`
+及 `benchmarks/2026-10-23-next-directions/production-rebuild/source-manifest.json`。
 重建仅 CPU/build，未运行模型或 GPU。原 byteproof stage 保持不变；下一候选从新的 exact868 副本接入。
 
 ### 76.2 新候选：共享源 F16 slab + row IDs，保留单头原生数学
@@ -10452,23 +10458,23 @@ same-probe 也为 **−109.971% / −111.350% / −111.967%**，不支持跨库�
 ### 76.5 独立复核、归档与恢复
 
 独立 raw 审核见
-[indirect1-independent-review.json](../benchmarks/2026-10-23-next-directions/indirect1-independent-review.json)，
+`benchmarks/2026-10-23-next-directions/indirect1-independent-review.json`，
 生产恢复见
-[indirect1-independent-live-review.json](../benchmarks/2026-10-23-next-directions/indirect1-independent-live-review.json)。
+`benchmarks/2026-10-23-next-directions/indirect1-independent-live-review.json`。
 逐 SHA 核验 **197 个源文件 + 5 个 bin/library + 19 个外部真实 payload/描述 + protocol = 222 项**。
 执行源码和制品保存在
-[executed-source.tar.gz](../benchmarks/2026-10-23-next-directions/indirect/myds-attention-indirect-window1-executed-source.tar.gz)、
-[executed-artifacts.tar.gz](../benchmarks/2026-10-23-next-directions/indirect/myds-attention-indirect-window1-executed-artifacts.tar.gz)。
+`benchmarks/2026-10-23-next-directions/indirect/myds-attention-indirect-window1-executed-source.tar.gz`、
+`benchmarks/2026-10-23-next-directions/indirect/myds-attention-indirect-window1-executed-artifacts.tar.gz`。
 
 两个目录（prepare + run）共 **119 个逻辑文件、4,952,526,803 B**，
 用 **40 份实体内容 + 79 个 tar hardlink** 无损归档，无虚拟 KV 流；实体 payload **1,647,831,178 B**。
-[raw.tar.gz](../benchmarks/2026-10-23-next-directions/indirect/raw.tar.gz)
+`benchmarks/2026-10-23-next-directions/indirect/raw.tar.gz`
 为 **1,186,267,060 B**，SHA256
 `0e38db0dbe019dc321953ba4697d5cdeeca108a8601fcfd107369e1fac05a0b9`。
-逐逻辑路径 SHA 见 [raw-files.json](../benchmarks/2026-10-23-next-directions/indirect/raw-files.json)，
+逐逻辑路径 SHA 见 `benchmarks/2026-10-23-next-directions/indirect/raw-files.json`，
 远端源文件集合/全部原始 bytes 再核和本地离线复核均通过：
-[archive-validation.json](../benchmarks/2026-10-23-next-directions/indirect/archive-validation.json)、
-[local-archive-review.json](../benchmarks/2026-10-23-next-directions/indirect/local-archive-review.json)。
+`benchmarks/2026-10-23-next-directions/indirect/archive-validation.json`、
+`benchmarks/2026-10-23-next-directions/indirect/local-archive-review.json`。
 原始远端 stage、输入与输出均保留。
 
 生产恢复 **18512 → 44758**；**2026-10-23 22:24:48 +08:00** 独立 live 审计 **35/35** 项通过：
@@ -10522,7 +10528,7 @@ observer 中的 12 次同步仅用于 capture，计时在不含 observer 的独�
 原方法每个 CB **8 repeats × 4 inputs = 32 projections**，1 warmup + 9 formal，
 每层 × production/probe 两 controls 严格交错 A1/B/A2，共 **180 CB / 162 formal / 18 warmup**。
 R1 某生产对照漂移 2.947%，本轮不把其约 5.6%–11.2% 正向读数作为性能合格。
-随后在 R2/R3 数据之前冻结了 [复制计划](../benchmarks/2026-10-23-next-directions/output-a-replication-plan.json)：
+随后在 R2/R3 数据之前冻结了 `benchmarks/2026-10-23-next-directions/output-a-replication-plan.json`：
 两个追加窗口中，两 controls × 三层均须绝对漂移 ≤2%、保守收益严格 >2%；最多两个追加窗口。
 
 | 短 CB 窗口 | production 三组门 | 完整六组复制门 | 阻断 |
@@ -10531,22 +10537,22 @@ R1 某生产对照漂移 2.947%，本轮不把其约 5.6%–11.2% 正向读数�
 | R2 | 通过 | **失败** | L19 same-probe 收益 +0.865%，漂移 −5.758% |
 | R3 | 通过 | **失败** | L39 same-probe 收益 −0.440%，漂移 −5.283% |
 
-独立原始审核：[R1](../benchmarks/2026-10-23-next-directions/output-a1-independent-review.json)、
-[R2](../benchmarks/2026-10-23-next-directions/output-a2-independent-review.json)、
-[R3](../benchmarks/2026-10-23-next-directions/output-a3-independent-review.json)，
-以及 [预声明复制门裁定](../benchmarks/2026-10-23-next-directions/output-a-replication-independent-review.json)。
+独立原始审核：`benchmarks/2026-10-23-next-directions/output-a1-independent-review.json`、
+`benchmarks/2026-10-23-next-directions/output-a2-independent-review.json`、
+`benchmarks/2026-10-23-next-directions/output-a3-independent-review.json`，
+以及 `benchmarks/2026-10-23-next-directions/output-a-replication-independent-review.json`。
 **原 32-projection 方法没有通过冻结门；这不等于已经证明候选吞吐退化，也不能批准全模型。**
 三个窗口的源码/制品和 12 个真实捕获输入完全相同。
 
 ### 77.4 单独冻结的长 CB 方法：两次独立窗口全部过门
 
 原结果不改写、不合并。另在任何长 CB 数据之前保存
-[steady-plan](../benchmarks/2026-10-23-next-directions/output-a-steady-plan.json)，
+`benchmarks/2026-10-23-next-directions/output-a-steady-plan.json`，
 只调整测量长度：每 CB **256 repeats × 4 = 1024 projections**、1 warmup + 15 formal，
 共 **288 CB / 270 formal / 18 warmup**。要求两个新窗口的所有六组均通过原阈值；最多两窗口。
 
 新 harness / runner 是独立源文件，原文件保持原样。
-[精确差异证明](../benchmarks/2026-10-23-next-directions/output-a-steady-method/generated-diff-proof.json)
+`benchmarks/2026-10-23-next-directions/output-a-steady-method/generated-diff-proof.json`
 表明逆向列出的编辑可逐 bytes 恢复原文件：shader、helper、数学、geometry、IO 和 parity 未改。
 本机编译及 **39 条 CPU host controls** 通过；额外合成负控证明“production 三组通过、probe 有漂移”会被整体拒绝。
 新方法只减少短 CB 相对时间变动的影响；调度、DVFS、后台活动是设计动机假设，没有硬件测量证明它们是旧漂移原因。
@@ -10563,9 +10569,9 @@ R1 某生产对照漂移 2.947%，本轮不把其约 5.6%–11.2% 正向读数�
 | S2 | 39 | 29.575562 | 27.339437 | 29.597005 | +7.561% | +0.073% |
 
 两个 controls 全部 12 组收益 **+7.184431%–+7.571580%**，最大绝对漂移 **0.138738%**。
-[独立 S1](../benchmarks/2026-10-23-next-directions/output-a-steady1-independent-review.json)、
-[独立 S2](../benchmarks/2026-10-23-next-directions/output-a-steady2-independent-review.json)、
-[冻结计划聚合裁定](../benchmarks/2026-10-23-next-directions/output-a-steady-independent-replication-review.json)
+`benchmarks/2026-10-23-next-directions/output-a-steady1-independent-review.json`、
+`benchmarks/2026-10-23-next-directions/output-a-steady2-independent-review.json`、
+`benchmarks/2026-10-23-next-directions/output-a-steady-independent-replication-review.json`
 逐项核了每轮 36 份输出、288 个 raw timestamp、`/1024` 归一化、严格顺序、三份真实权重、capture、
 202 个 source / 6 个实际预绑定 bin/library 和生产恢复。
 只归档实际预绑定的 6 个制品；stage 中未绑定的旧短 bench 不冒称为本窗口执行依赖。
@@ -10577,7 +10583,7 @@ R1 某生产对照漂移 2.947%，本轮不把其约 5.6%–11.2% 正向读数�
 
 ### 77.5 全模型接入、生产 gold 与冻结协议
 
-[最小接入 patch](../benchmarks/2026-10-23-next-directions/output-a-fixed-integration/out-a-fixed-wrapper.patch)
+`benchmarks/2026-10-23-next-directions/output-a-fixed-integration/out-a-fixed-wrapper.patch`
 SHA256 `23e6767b228a8c2e5997b6fbd5cea9baa6d86bb238e0b494564e1bb77b7e9d5d`，
 在新的 exact868 副本上只改 4 个原文件并增加同 bytes shader，原主仓库生产路径不接入。
 `MYDS_ATTN_OUT_A_FIXED_WRAPPER` 严格 unset/0/1、默认 **0**；
@@ -10587,8 +10593,8 @@ PSO 初始化显式失败不能冒充启用。保留 encoder、buffer offsets、
 不增加 commit/wait/拷贝；任何 fallback 只能发生在候选编码之前。
 有效 shape 的越界/alias 直接失败，编码后不重试。
 
-[接入构建报告](../benchmarks/2026-10-23-next-directions/output-a-fixed-integration-review.json)
-和 [完整模型 harness 构建报告](../benchmarks/2026-10-23-next-directions/output-a-fullmodel-harness/build-review.json)
+`benchmarks/2026-10-23-next-directions/output-a-fixed-integration-review.json`
+和 `benchmarks/2026-10-23-next-directions/output-a-fullmodel-harness/build-review.json`
 均为 build-only，不作为 GPU 证据。远端随后从相同 source 实际重建，两个 stage 的产物完整 SHA 与本机完全一致：
 
 | 制品 | 完整 SHA256 |
@@ -10600,7 +10606,7 @@ PSO 初始化显式失败不能冒充启用。保留 encoder、buffer offsets、
 | same-build 候选 library | `3e37f3957dbb6b84cd7bc2a10bf888becc97279f799f1e7db40381355ea768ea` |
 | same-build 候选 harness | `95ff679cb946abb61b2e6457c57febba75df4ad6df8a01c8612a5768726b7f4a` |
 
-性能数据前保存的 [fullmodel-plan](../benchmarks/2026-10-23-next-directions/output-a-fullmodel-plan.json)
+性能数据前保存的 `benchmarks/2026-10-23-next-directions/output-a-fullmodel-plan.json`
 SHA256 为 `cbb3f910400c52b25f24372167e4a7a3521b5b65dbf36970711d93b49b8b77df`。
 使用原 **10 prompt tokens / 800 prompt tokens** 两请求、每个 **256 output tokens**、greedy/seed42、
 max context **327680**，并保留全部 **51 项实际生产配置**，尤其 prefix cache、PLD、concurrent 不改。
@@ -10622,7 +10628,7 @@ context/RNG/prefix/anchor、live Engram tail、40 层 chronological active KV、
 per-sample 模式/symbol、NR2/NSG4/FC6004、total/decode requests==encoded、fallback/ineligible/failures=0、
 RF/register 原 provider 合同同时检查，候选编码数还须覆盖全部 eligible RF layer。
 
-状态范围的 [独立源审查](../benchmarks/2026-10-23-next-directions/output-a-fullmodel-harness-independent-review.json)
+状态范围的 `benchmarks/2026-10-23-next-directions/output-a-fullmodel-harness-independent-review.json`
 明确不比较历史 snapshot 的 Engram tail、unpublished staged capacity、磁盘缓存 payload、
 未初始化容量/allocator padding 或 scratch，**不能称为全部历史状态证明**。
 44 个 published/staged tags 全量保存并逐 bytes 比较，要求 `<=next` 且互斥；
@@ -10650,7 +10656,7 @@ prefill A1/B/A2 分别为 **0.133252 / 0.133332 / 0.133308 s** 和
 保守回退 **+0.060037% / −0.005625%**，均通过对应稳定性/回退门。
 主阻断是两个 decode 收益均小于预声明严格 >2% 下限，**不是数值错误，也不是对照明显漂移**。
 
-[独立完整原始审核](../benchmarks/2026-10-23-next-directions/output-a-fullmodel1-independent-review.json)
+`benchmarks/2026-10-23-next-directions/output-a-fullmodel1-independent-review.json`
 重新计算所有时间/中位数/两业务门，并核查 SHA/FNV 与物理 bytes、所有 adopted/provider 计数、
 实际环境、原始 request/prompt 身份、source/binary/library 绑定及恢复。
 不把 7.5% 的重复权重组件收益换算成同量级全模型收益；本轮测到的完整 native 收益仅约 **0.36%–0.40%**。
@@ -10669,7 +10675,7 @@ exact868 `main.c:218–226` 在 `MYDS_DSPARK=0` 时不会仅因存在 `DSPARK_FI
 ### 77.7 独立 reader 的版本修正、完整证据与恢复
 
 执行 runner SHA256 为 `2b683ac2e52172ab8bc340fabc5fcd15b1e4465b738fadb3a101021177b3cb51`。
-[最终 runner CPU 控制](../benchmarks/2026-10-23-next-directions/output-a-fullmodel-final-runner-cpu-controls.json)
+`benchmarks/2026-10-23-next-directions/output-a-fullmodel-final-runner-cpu-controls.json`
 保留 3 项 parser 宽容点，未标为全绿；独立 reader 额外核每项 state FNV、实际额外 selector、
 255 个 callback interval 的总和。这三项实际 raw 均通过严格复核。
 
@@ -10685,32 +10691,32 @@ exact868 `main.c:218–226` 在 `MYDS_DSPARK=0` 时不会仅因存在 `DSPARK_FI
 
 全模型 source / protocol 归档 **196 项**（189 个源文件及 7 个已绑定 request/计划/报告 JSON），
 实际执行/对照制品 **6 项**，所有 **202 项** stage inputs 逐 SHA 与归档成员相符：
-[executed source](../benchmarks/2026-10-23-next-directions/output-a-fullmodel/myds-output-a-fullmodel-20261023-executed-archive/source.tar.gz)、
-[executed artifacts](../benchmarks/2026-10-23-next-directions/output-a-fullmodel/myds-output-a-fullmodel-20261023-executed-archive/artifacts.tar.gz)、
-[原路径绑定与 SHA](../benchmarks/2026-10-23-next-directions/output-a-fullmodel/myds-output-a-fullmodel-20261023-executed-archive/archive-bindings.json)。
+`benchmarks/2026-10-23-next-directions/output-a-fullmodel/myds-output-a-fullmodel-20261023-executed-archive/source.tar.gz`、
+`benchmarks/2026-10-23-next-directions/output-a-fullmodel/myds-output-a-fullmodel-20261023-executed-archive/artifacts.tar.gz`、
+`benchmarks/2026-10-23-next-directions/output-a-fullmodel/myds-output-a-fullmodel-20261023-executed-archive/archive-bindings.json`。
 本机下载后逐个实际成员 bytes/SHA 再核通过。
 
 prepare + run 的 **4,823 个逻辑文件、734,948,712 B** 完整保存，
 4,491 份相同内容以 tar hardlink 无损去重、没有虚拟 KV 流。
-[raw.tar.gz](../benchmarks/2026-10-23-next-directions/output-a-fullmodel/raw/raw.tar.gz)
+`benchmarks/2026-10-23-next-directions/output-a-fullmodel/raw/raw.tar.gz`
 为 **18,762,570 B**，SHA256
 `cd420f9021a70f98363025c9812f96ab2713598703828d25d948ca783062b8f8`。
-[原始文件清单](../benchmarks/2026-10-23-next-directions/output-a-fullmodel/raw/raw-files.json)、
-[远端原 bytes 再核](../benchmarks/2026-10-23-next-directions/output-a-fullmodel/raw/archive-validation.json)、
-[本机离线 tar 再核](../benchmarks/2026-10-23-next-directions/output-a-fullmodel/raw/local-archive-validation.json)
+`benchmarks/2026-10-23-next-directions/output-a-fullmodel/raw/raw-files.json`、
+`benchmarks/2026-10-23-next-directions/output-a-fullmodel/raw/archive-validation.json`、
+`benchmarks/2026-10-23-next-directions/output-a-fullmodel/raw/local-archive-validation.json`
 全部通过，原始 remote stage/输入/输出保留。
 模型仍按真实路径、362,142,629,888 B/stat/首 1 MiB SHA 冻结，未声称重新 SHA 整份 362 GB GGUF。
 
 最终生产恢复 **61285 → 84075**；**2026-10-23 23:34:48 +08:00** 独立 live 审计
-**43/43 项通过**，见 [独立恢复报告](../benchmarks/2026-10-23-next-directions/output-a-fullmodel1-independent-live-review.json)。
+**43/43 项通过**，见 `benchmarks/2026-10-23-next-directions/output-a-fullmodel1-independent-live-review.json`。
 原 argv bytes、原 2 项继承 MYDS、51 项有效配置、config bytes/stat/SHA、cwd/log、nice=0、
 活 binary inode/hash、metallib 优先级、模型 stat/header、health、锁空闲/无残留进程均一致；
 gold 的原生产 binary/library 及 91 个核心源文件再次匹配 exact868 与本窗口 freeze。
 canonical HEAD 和原 dirty path/status 一致，未在该 dirty checkout 构建或部署。
 
 最终 reader 的完整版本、原失败报告、可逆差异证明及 37 项控制保存在
-[reader 证据目录](../benchmarks/2026-10-23-next-directions/output-a-fullmodel-reader/v3-cpu-controls.json)；
-[review-tools.tar.gz](../benchmarks/2026-10-23-next-directions/output-a-fullmodel-reader/review-tools.tar.gz)
+`benchmarks/2026-10-23-next-directions/output-a-fullmodel-reader/v3-cpu-controls.json`；
+`benchmarks/2026-10-23-next-directions/output-a-fullmodel-reader/review-tools.tar.gz`
 SHA256 为 `750a5ca60b9799107e23f305a9370290891fd921fc47e8a66cfcf0ae831b25b7`。
 同一真实模型仍在 Mac Studio 时，可对保留的原路径执行纯 CPU 复核，不会运行模型或 Metal：
 
@@ -10732,7 +10738,7 @@ python3 tools/review_output_a_fullmodel_artifacts_v3.py \
 
 ## §78 保留的静态假设：MoE prefill 工作区按 MM / fallback 分配，**尚无速度证据**（2026-10-23）
 
-[独立源码短审计](../benchmarks/2026-10-23-next-directions/unverified-moe-prefill-workspace.md)
+`benchmarks/2026-10-23-next-directions/unverified-moe-prefill-workspace.md`
 绑定已复现生产制品的 exact868 源：MM 主路径不使用整宏块的 gate/up F32 数组，MID 实际按 F16 写/读，
 但当前工作区按三张整宏块 F32 申请。生产 chunk=2048、`MOE_CHUNKS=9` 实际钳为 8，
 满足条件的长 prefill 可申请 B=16384；长请求之后 capacity 不会随短请求自动缩小。
@@ -10767,9 +10773,9 @@ F32 池按实际批行数增长，三张新 owner 完整申请后才发布；失
 完整 chunk workspace 扩容也先完成新工厂，再交换句柄；移除只在旧路径创建/销毁、prefill 不消费的三组 per-token scratch views。
 原始 dispatcher 数学、33 份 Metal 源和 metallib bytes 不变。
 
-[首次 GPU 前冻结协议](../benchmarks/2026-10-24-moe-workspace/experiment-plan.json)
+`benchmarks/2026-10-24-moe-workspace/experiment-plan.json`
 SHA `38614f84a3d25bbc90f81c092483896ad774a74a667d05d6e11b2804fb37eb43`；
-[PSO 语义修正版](../benchmarks/2026-10-24-moe-workspace/experiment-plan-v2.json)
+`benchmarks/2026-10-24-moe-workspace/experiment-plan-v2.json`
 SHA `55b43f634c43dd8c9c078cbc948bf41763fab9d6eba4cdbe725e758e002a9f20`。
 后者在首次 GPU 前纠正：map/pair/down 是 MM 专用要求，可回 F32；`sum6` 是共同要求，缺失时必须在编码前拒绝。
 未改样本数、时间、内存或采纳阈值。
@@ -10792,9 +10798,9 @@ SHA `55b43f634c43dd8c9c078cbc948bf41763fab9d6eba4cdbe725e758e002a9f20`。
 
 v2 对同一候选构建的 **off/on 共同补齐释放**，并补齐 res/pre/current-Engram views 的追踪与故障注入。
 因此后续同构建 A1/B/A2 仅比较 arena 选择，**不把共同修复的释放收益计入 MoE arena 收益**。
-[修订说明](../benchmarks/2026-10-24-moe-workspace/implementation-revisions.json)、
-[v2 最小 patch](../benchmarks/2026-10-24-moe-workspace/prototype/moe-workspace-core-v2.patch)、
-[CPU 所有权控制](../benchmarks/2026-10-24-moe-workspace/prototype/factory-cleanup-cpu-review.json)
+`benchmarks/2026-10-24-moe-workspace/implementation-revisions.json`、
+`benchmarks/2026-10-24-moe-workspace/prototype/moe-workspace-core-v2.patch`、
+`benchmarks/2026-10-24-moe-workspace/prototype/factory-cleanup-cpu-review.json`
 及 v1 源/制品完整保留。
 修复后的真实 Metal 工厂创建/增长/失败/重试门通过，实际 1090 个 dry allocation trace 位置按各 site 与首/中/末代表点覆盖，
 不是声称在 GPU 上穷举全部 ordinal；CPU 元数据替身另穷举 1090 项。
@@ -10814,7 +10820,7 @@ OOM 是确定性 allocation-NULL 注入，没有制造系统内存耗尽。
 功能诊断另外覆盖 map/pair/down 各自缺失后的 33 行 F32 fallback、一次完整 B16384 F32 fallback、
 shared sum6 缺失时两个实现均零 dispatch/poison 不变后原句柄恢复、fallback 三次 owner 分配分别 NULL 后原池保留并重试、
 以及长→短同工作区复用和 quiescent trim。
-[组件独立原始审核](../benchmarks/2026-10-24-moe-workspace/window3-independent-review.json)
+`benchmarks/2026-10-24-moe-workspace/window3-independent-review.json`
 确认实际 provider/完整输出与原始模型区间，不以声明的成功标志替代原 bytes。
 
 ### 79.4 生产 concurrent 组件 GPU 时间与实际内存分别报告
@@ -10832,7 +10838,7 @@ shared sum6 缺失时两个实现均零 dispatch/poison 不变后原句柄恢复
 这没有证明全模型变快或物理峰值已经减少相同数值。
 原始数据有 5 个真实内存检查点：before_create/after_create/after_encode/after_completed/after_free，
 各保存 `device.currentAllocatedSize`、TASK_VM_INFO `phys_footprint`、RSS。
-[独立检查点复核](../benchmarks/2026-10-24-moe-workspace/window3-memory-checkpoints-independent-review.json)
+`benchmarks/2026-10-24-moe-workspace/window3-memory-checkpoints-independent-review.json`
 显示 task footprint 存在跨臂延迟记账：层0/19的 completed−before_create 中位分别为 A1=0、B=−2,259,615,744、A2=+2,259,615,744 B，RSS delta 为0。
 这些检查点不能被解释成精确物理峰值收益；全模型另以相同 10ms sampler 对原始 observation 重算峰值。
 
@@ -10841,13 +10847,13 @@ shared sum6 缺失时两个实现均零 dispatch/poison 不变后原句柄恢复
 
 ### 79.5 同上下文恢复与全模型门
 
-[恢复矩阵](../benchmarks/2026-10-24-moe-workspace/failure-recovery-plan-v2.json)
+`benchmarks/2026-10-24-moe-workspace/failure-recovery-plan-v2.json`
 在相关 GPU 前冻结：4 scenarios × 温度0/0.7 × off/on，共16次真实模型执行、8份独立 pair 审核；
 warm/recovery 为 pf7k，failure/cancel 为 pf16k，恢复8输出，seed42，不手动 reset RNG。
 确定进度点取消与真正异步线程置标志分开；中断时未定义的部分 live cache 不冒充全状态，
 已发布快照按自己的 position 导出，成功恢复再比较完整 live/snapshot/历史 Engram/RNG/logits/token/text。
 本门实际16/16 native 与8/8独立pair审核全部通过，见
-[恢复总报告](../benchmarks/2026-10-24-moe-workspace/recovery-window1-review.json)。
+`benchmarks/2026-10-24-moe-workspace/recovery-window1-review.json`。
 确定点取消与真实异步取消均在首次输出之前生效，恢复仍使用原上下文，无RNG reset。
 首个确定点样本 actual progress为1；取消后next=0而Engram/staged可为15186，按中断合同合法导出，
 成功恢复next/Engram=6924、pcache_len=6924、输出8token；该pair的156份完整恢复文件共54,196,307 B逐byte一致。
@@ -10856,7 +10862,7 @@ warm/recovery 为 pf7k，failure/cancel 为 pf16k，恢复8输出，seed42，不
 
 恢复窗口finally **34590→45250**，独立live **41/41**通过：原argv/raw env、51有效配置、config bytes/stat/SHA、
 bin/lib inode/SHA、cwd/log、nice=0、模型stat/header、health、锁空闲/无竞者、默认关闭、canonical dirty状态与gold91源匹配。
-[独立live复核](../benchmarks/2026-10-24-moe-workspace/recovery1-independent-live-review.json)
+`benchmarks/2026-10-24-moe-workspace/recovery1-independent-live-review.json`
 不以health替代上述身份与状态门。
 本窗口237项执行输入（225source、12制品）封存后逐SHA通过，随后才进入gold/off/on与正式A1/B/A2。
 
@@ -10896,17 +10902,17 @@ decode对照漂移分别−0.806891% / −0.060331%。pf7k的prefill漂移已超
 10ms观察峰值也不等于精确硬件最大值。
 预声明采纳要求两个workload均满足时间/物理内存不退化门，并且每组各自满足物理峰值至少减少256MiB，
 或prefill耗时下降>2%且实际内存不退化。**pf7k未达到物理收益门，且时间对照不稳；pf16k单组通过不足以采纳。**
-[控制器原始裁定](../benchmarks/2026-10-24-moe-workspace/fullmodel-window1-summary.json)
+`benchmarks/2026-10-24-moe-workspace/fullmodel-window1-summary.json`
 为 `fullmodel_rejected_gain_or_controls`，`production_adoption=false`。
 窗口finally恢复原生产服务 **45250→58639**，原binary/metallib/config保持。
-[独立全量复核](../benchmarks/2026-10-24-moe-workspace/fullmodel1-independent-review-v2.json)
+`benchmarks/2026-10-24-moe-workspace/fullmodel1-independent-review-v2.json`
 验证36样本、5580份状态载荷的完整原bytes、全部10ms内存trace、执行源码/制品/模型区间/51环境以及门限复算；
-[本地无损raw的第二次复核](../benchmarks/2026-10-24-moe-workspace/fullmodel1-local-raw-independent-review.json)
+`benchmarks/2026-10-24-moe-workspace/fullmodel1-local-raw-independent-review.json`
 给出相同裁定。GPU/model没有在reader中重跑。
 
 执行时冻结的原reader `f0536cca…` 首次严格拒绝，原因是它把留存的旧版plan也算作执行plan，错误要求输入目录只有一份plan。
-原reader与[原始拒绝报告](../benchmarks/2026-10-24-moe-workspace/fullmodel-evidence/f053-original-rejection.json)保留。
-另存的[v2 reader](../../tools/review_moe_workspace_fullmodel_artifacts_v2.py)
+原reader与`benchmarks/2026-10-24-moe-workspace/fullmodel-evidence/f053-original-rejection.json`保留。
+另存的`tools/review_moe_workspace_fullmodel_artifacts_v2.py`
 `568e9a2dfafdc2e83dc2cc3aa689d1910933adadd82d5ee164186ddca8b798c1`
 只修复plan选择：所有历史/当前plan仍逐SHA检查，且必须恰好一份内容等于执行protocol并匹配summary所冻结SHA。
 8项CPU正负控覆盖只有旧plan、两份匹配plan及当前plan SHA错误等拒绝情况；
@@ -10916,14 +10922,14 @@ decode对照漂移分别−0.806891% / −0.060331%。pf7k的prefill漂移已超
 ### 79.7 成功扩容复用：实际分配峰值回退，不能只看 fresh context 稳态
 
 故障恢复门只证明“申请失败后能恢复”，不覆盖成功扩容时新旧完整工作区同时存活的峰值。
-在相关GPU前另冻结[补充协议](../benchmarks/2026-10-24-moe-workspace/reuse-growth-plan.json)
+在相关GPU前另冻结`benchmarks/2026-10-24-moe-workspace/reuse-growth-plan.json`
 SHA `f4473d7b634f5b63502e53f3ac38ad8a0bde8edcd5b98e344cce842d889fd40e`：
 正常生产API、同一ctx连续 warm pf7k→grow pf16k→retain pf7k，每次8输出，temperature0/seed42，
 保留51有效生产环境、cache/PLD选择，不手动reset cache或RNG。
 严格A1(off)/B(on)/A2(off)，每臂仅一个三请求序列，总9次生成；这是内存/正确性诊断，**不增加正式时间cohort**。
 三臂都实际完成 C2048/B8192→C2048/B16384，并在后续短请求保留B16384。
 
-[独立raw复核](../benchmarks/2026-10-24-moe-workspace/reuse1-independent-review.json)
+`benchmarks/2026-10-24-moe-workspace/reuse1-independent-review.json`
 验证9次成功生成的完整logits、tokens/text、活跃缓存、已发布历史快照、Engram和RNG；
 6对逐阶段比较共936个文件、378,172,010 B全bytes一致。
 没有插入GPU wait、故障宏或factory observer。
@@ -10951,7 +10957,7 @@ B的Metal分配峰值比A1高 **1.919739 GiB**、比A2高 **2.223221 GiB**。
 
 执行stage245项输入（232source、13制品）均在复核前封存。
 原reader `2f53aa71…` 首次因缺失外部CPU helper模块而在import阶段失败，原脚本与失败log保留；没有产生伪造的raw结论。
-另存[standalone v2 reader](../../tools/review_moe_workspace_reuse_artifacts_v2.py)
+另存`tools/review_moe_workspace_reuse_artifacts_v2.py`
 `9b60e49e6397413a0c422254808c7257a6681031a05dfb4cbb50b9d8466039a1`，
 仅内嵌原CPU字节helper，并在输出中补充B−A1/B−A2字段；原门限/公式/执行stage/raw不变，33项CPU控通过。
 
@@ -10962,9 +10968,9 @@ B的Metal分配峰值比A1高 **1.919739 GiB**、比A2高 **2.223221 GiB**。
 组件0-ULP、功能恢复与局部节约均保留为有效结果，但不覆盖上述失败。
 
 当前仓库含此前多轮实验未提交更改，HEAD与已复建生产源不同。
-已另外保留[current→原型的3-way集成patch及CPU构建审查](../benchmarks/2026-10-24-moe-workspace/prototype/current-integration/README.md)，
+已另外保留`benchmarks/2026-10-24-moe-workspace/prototype/current-integration/README.md`，
 **未应用到主工作树**；该合并版本只有CPU构建证据，其binary/metallib与实际GPU测试的exact868不同，不能称已获GPU验收。
-实际测试的[v2核心patch](../benchmarks/2026-10-24-moe-workspace/prototype/moe-workspace-core-v2.patch)
+实际测试的`benchmarks/2026-10-24-moe-workspace/prototype/moe-workspace-core-v2.patch`
 SHA `0a98cc025192cf092340ef2cb0dbfdd35de2c0612b2824d0009a2aa5aff0502e`
 以及完整执行source/bin档保留，避免只留下失效/tmp路径。
 §79.2发现的既有kv_gathered释放遗漏属于单独正确性/资源所有权问题，本轮off/on共用修复不计作候选收益，未借此替换原生产制品。
@@ -10973,22 +10979,22 @@ SHA `0a98cc025192cf092340ef2cb0dbfdd35de2c0612b2824d0009a2aa5aff0502e`
 绑定UTC `2026-10-23T17:45:46.280002Z–17:45:46.325837Z`，检查原argv bytes、原2个继承MYDS项、
 51有效环境、config bytes/stat/SHA、binary/metallib stat/inode/SHA、模型stat与首1MiB、nice0、cwd/log、
 health、锁空闲/无竞者、候选关闭，以及canonical HEAD/path-status与exact868 gold91核心源。
-[最终独立恢复报告](../benchmarks/2026-10-24-moe-workspace/final-independent-live-review.json)
+`benchmarks/2026-10-24-moe-workspace/final-independent-live-review.json`
 SHA `5f3f9516d1eb28c720bcfe334aa092740cb79b3508610722265fac6b4dd6862d`。
 这不声称canonical已有dirty文件的内容获逐byte恢复：窗口前只捕获HEAD与path/status，相关工作树本轮没有用于构建或改写。
 
 原始数据按执行窗口无损归档，raw SHA/逻辑路径/硬链接逐一复核，本地物化后还可再次复核：
 
-- [组件及首轮失败历史索引](../benchmarks/2026-10-24-moe-workspace/component-evidence-index.json)
-- [16次取消/故障恢复索引](../benchmarks/2026-10-24-moe-workspace/recovery-evidence/index.json)
-- [36样本全模型索引](../benchmarks/2026-10-24-moe-workspace/fullmodel-evidence/index.json)
-- [9次同上下文成功扩容复用索引](../benchmarks/2026-10-24-moe-workspace/reuse-evidence/index.json)
+- `benchmarks/2026-10-24-moe-workspace/component-evidence-index.json`
+- `benchmarks/2026-10-24-moe-workspace/recovery-evidence/index.json`
+- `benchmarks/2026-10-24-moe-workspace/fullmodel-evidence/index.json`
+- `benchmarks/2026-10-24-moe-workspace/reuse-evidence/index.json`
 
 权重仍为原GGUF的model-backed完整tensor区间；本地不复制整362GB GGUF或全部11.47GB组件权重。
 OOM证据仍是实际Metal allocator的确定性NULL注入，不等于经过系统内存压力耗尽测试。
 所有内存采样均按其API口径报告，未经测量的DRAM流量/整机wired节约/精确峰值/吞吐收益均不计入成果。
 
-[本轮统一裁定与证据SHA清单](../benchmarks/2026-10-24-moe-workspace/experiment-result.json)汇总各级门、实际测量、失败理由、源码边界和最终恢复，不替代各窗口原始证据。
+`benchmarks/2026-10-24-moe-workspace/experiment-result.json`汇总各级门、实际测量、失败理由、源码边界和最终恢复，不替代各窗口原始证据。
 
 
 ---
@@ -11002,9 +11008,9 @@ C/geometry/mode变化仍可能完整重建，不声称本轮消除了所有扩�
 
 ### 80.1 GPU前冻结方案与源码、OOM合同
 
-[新实验协议](../benchmarks/2026-10-24-moe-localgrow/experiment-plan.json)
+`benchmarks/2026-10-24-moe-localgrow/experiment-plan.json`
 SHA `fde7b74283dc680657f34ee00d74fdb704f4176ac1597d9cb20ac9544a66f9ea`。
-[首版协议](../benchmarks/2026-10-24-moe-localgrow/experiment-plan-v1.json) `af93dca8…`完整留存。
+`benchmarks/2026-10-24-moe-localgrow/experiment-plan-v1.json` `af93dca8…`完整留存。
 修订发生在任何GPU实验前：源码trace显示ordinal1为host metadata，故加ordinal3实际Metal-owner NULL恢复；
 取消改为先同ctx warm7k后取消16k，确保实际经过新增localgrow分支。20次native/10份pair恢复，
 时间/内存阈值、正式采样数和工作负载没有因这次修订改变。
@@ -11017,15 +11023,15 @@ setup不另要求256MiB收益，不重分类§79原fresh-context失败。
 正常growth observer显式注册、无env/TESTING/额外GPUwait，在所有新旧局部owner同时live及旧owner释放后采CPU/task/device读数，
 配合10ms原始采样；请求容量、Metal当前分配、phys_footprint、RSS和时间分别报告。
 
-[已实现的exact868累计核心patch](../benchmarks/2026-10-24-moe-localgrow/prototype/localgrow-core-v3/exact868-to-localgrow.patch)
-及[v2→局部扩容patch](../benchmarks/2026-10-24-moe-localgrow/prototype/localgrow-core-v3/v2-to-localgrow.patch)保留在独立源树；
+`benchmarks/2026-10-24-moe-localgrow/prototype/localgrow-core-v3/exact868-to-localgrow.patch`
+及`benchmarks/2026-10-24-moe-localgrow/prototype/localgrow-core-v3/v2-to-localgrow.patch`保留在独立源树；
 未应用到主工作树，未替换生产制品。
 所有新owner/view/arena和metadata成功后才清除旧动态bindings并发布；失败只释放新资源，保留旧CW/B/MoE代次/owner-view IDs。
 同一CW成功增长后，新arena的requests/dispatch按代重新累计，CW累计计数延续；需分别按阶段delta对账。
 
 实际抽取factory/arena/grow函数体的ASan/UBSan CPU元数据替身已覆盖MM/MV×alias/nonalias全部176个NULL ordinal，
 旧struct（除attempt/failure计数）、owner/view/refcount逐一保持，原句柄重试成功，最终归零。
-[CPU与源码证据目录](../benchmarks/2026-10-24-moe-localgrow/prototype/localgrow-core-v3/README.md)
+`benchmarks/2026-10-24-moe-localgrow/prototype/localgrow-core-v3/README.md`
 同时证明十个算术/provider/free/stat函数及33份Metal源码与父v2逐byte相同，metallib保持生产`c692d821…`。
 这些CPU结果只证明对应元数据/生命周期合同，不提前算作GPU性能或实际物理内存收益。
 
@@ -11042,7 +11048,7 @@ setup不另要求256MiB收益，不重分类§79原fresh-context失败。
 
 随后在NEW冻结stage重走原9steps，全部功能通过后才运行本轮**首个**90-CB计时cohort；
 窗口`component-window2`完成，finally恢复79141→84219。
-[独立组件全量报告](../benchmarks/2026-10-24-moe-localgrow/component2-independent-review.json)
+`benchmarks/2026-10-24-moe-localgrow/component2-independent-review.json`
 `a2f07bcc81e244c7cae719fe2df0a25babe69e4c598514b1cee58c983de84d23`
 确认真实捕获的10个case、对应native provider的完整F32输出与guard/finite、完整9权重区间，
 以及额外16份局部增长输出比较均通过。
@@ -11069,7 +11075,7 @@ layer39保守GPU回退1.143776%仍在预先2%门内，如实保留，不说成�
 **不拿该off host时间/峰值充当生产engine的free-first成本**。
 后续正常engine的O1 layout与lifetime observer才用于生产成功扩容峰值门。
 
-[组件联合证据入口](../benchmarks/2026-10-24-moe-localgrow/component-evidence/index.json)
+`benchmarks/2026-10-24-moe-localgrow/component-evidence/index.json`
 保留两个窗口及reader失败/修正历史，完整源/制品/逻辑raw路径逐SHA审核。
 只对已验证immutable原始payload按size+SHA+完整memcmp进行跨窗口/跨实验硬链接去重，原bytes与路径均保留；
 这是归档空间优化，不是模型内存收益。
@@ -11079,7 +11085,7 @@ layer39保守GPU回退1.143776%仍在预先2%门内，如实保留，不说成�
 正常成功增长探针前，完成20次native/10组off/on恢复对照，
 覆盖deterministic cancel、独立线程async cancel、ordinal1分配失败、ordinal3实际Metal owner失败、shared-sum PSO缺失，
 各含temperature=0与0.7；每次同ctx先7k warm，再16k中断/失败，再7k恢复8token，不手动reset RNG。
-[独立全量重放报告](../benchmarks/2026-10-24-moe-localgrow/recovery1-independent-review.json)
+`benchmarks/2026-10-24-moe-localgrow/recovery1-independent-review.json`
 SHA `1209f18bd185d4b6d34df7777fa90bee92ee728709334d8b285457e0224c057a`
 确认268项执行source/bin/input、91项exact生产gold源、20份原始native summary与10份pair report一致，恢复门通过。
 
@@ -11098,7 +11104,7 @@ temperature0的1/4、temperature0.7的4/4。异步中间态按各自有效范围
 
 该窗口738.48秒（包含20次模型装载、诊断导出与独立reader，不作为请求延迟），
 finally恢复84219→95628。窗口后独立live审计41/41通过，
-[恢复现场报告](../benchmarks/2026-10-24-moe-localgrow/recovery1-independent-live-review.json)保留。
+`benchmarks/2026-10-24-moe-localgrow/recovery1-independent-live-review.json`保留。
 后续正常sequence controller冻结的是已被独立复核的小型原top report
 `recovery-review.json`（11259B，SHA `718374e44550ca72b30bf893d169060ec5a4d436ab5feeab0d13b1b6470cf47b`），
 不以controller自报代替全量重放。
@@ -11112,7 +11118,7 @@ normal binary不含TESTING/fault/cancel符号，候选normal native SHA `26e8f3b
 metallib仍`c692d821…`，与已通过组件的四份核心源相同。
 
 执行结束后先封存269项source/bin/input，再用实际冻结的`34c1c4b0…` reader独立重放。
-[正常增长独立报告](../benchmarks/2026-10-24-moe-localgrow/probe1-independent-review.json)
+`benchmarks/2026-10-24-moe-localgrow/probe1-independent-review.json`
 SHA `de2d5235ad49279fff746e80d15815e3caeb6dd8574dbd0bcfcc42039def0ef8`确认：
 九次生成的全部原始输出、logits和规定有效状态逐byte一致；候选同CW增长一次，
 全部C owner/fixed-view tuple及动态binding wrapper保持，仅替换七组B acc、down/arena；
@@ -11144,7 +11150,7 @@ B的Metal最大值来自同步LOCAL_READY点（普通10ms采样最高171,778,211
 为分别报告耗时，下面保留本次实际原始prefill秒数。**本组是无warmup/每臂单次、8输出的功能/峰值probe，
 不是正式性能cohort，不能据此宣称加速或延迟验收。** 同步observer的CPU成本计入generation wall，
 阶段间原始state导出不计入三次generation wall之和；全部decode/wall/内存原读数见
-[正常增长小摘要](../benchmarks/2026-10-24-moe-localgrow/probe1-summary.json)。
+`benchmarks/2026-10-24-moe-localgrow/probe1-summary.json`。
 
 | 阶段 | A1 prefill s | B prefill s | A2 prefill s |
 |---|---:|---:|---:|
@@ -11166,7 +11172,7 @@ B的Metal最大值来自同步LOCAL_READY点（普通10ms采样最高171,778,211
 组件/功能probe时间或已归档的历史v2失败重新归类为生产收益。
 
 实际GPU使用exact868基线上的独立v3源树，四份最终core与可复建累计patch已保留于
-[localgrow-core-v3](../benchmarks/2026-10-24-moe-localgrow/prototype/localgrow-core-v3/README.md)。
+`benchmarks/2026-10-24-moe-localgrow/prototype/localgrow-core-v3/README.md`。
 累计patch SHA `782d0b0d6e7c27b18b351f3cdbda42089197efcfb488f8f492e7f076778fbc69`，
 v2增量patch SHA `9b6b74b055b62d16b3c7f1820cb5ef4be88efbe49f5f9f8c9604230201435541`。
 原型未应用到当前主工作树，未替换生产binary/metallib/config；§79既有kv_gathered修复仍为off/on共用前置，
@@ -11174,7 +11180,7 @@ v2增量patch SHA `9b6b74b055b62d16b3c7f1820cb5ef4be88efbe49f5f9f8c9604230201435
 
 最后窗口后独立live审计 **41/41**通过，绑定95628→99701，
 UTC `2026-10-23T18:44:48.708287+00:00–18:44:48.878774+00:00`。
-[最终独立现场报告](../benchmarks/2026-10-24-moe-localgrow/final-independent-live-review.json)
+`benchmarks/2026-10-24-moe-localgrow/final-independent-live-review.json`
 SHA `f2970990aadc6f004984dda71b8cd0044e013ed3d080b242a69c6e585d63e081`。
 原argv bytes、2个继承MYDS项、51有效项、config bytes/stat/SHA、binary/metallib stat/inode/SHA、
 模型stat与首1MiB、nice0/cwd/log、health、锁空闲/无剩余native、候选关闭、canonical HEAD/path-status及91项gold源均通过。
@@ -11182,13 +11188,13 @@ SHA `f2970990aadc6f004984dda71b8cd0044e013ed3d080b242a69c6e585d63e081`。
 
 原始输出、状态、布局、内存样本、失败历史及实际执行source/bin均无损归档并在本地逐SHA验证：
 
-- [组件两窗口与reader修正历史](../benchmarks/2026-10-24-moe-localgrow/component-evidence/index.json)
-- [20次恢复与双端重放](../benchmarks/2026-10-24-moe-localgrow/recovery-evidence/index.json)
-- [9次正常成功增长与负峰值门](../benchmarks/2026-10-24-moe-localgrow/probe-evidence/index.json)
+- `benchmarks/2026-10-24-moe-localgrow/component-evidence/index.json`
+- `benchmarks/2026-10-24-moe-localgrow/recovery-evidence/index.json`
+- `benchmarks/2026-10-24-moe-localgrow/probe-evidence/index.json`
 
 原GGUF完整tensor区间仍为model-backed权重，不复制整362GB模型。
 归档中相同immutable payload的硬链接复用只节约证据磁盘，不记作模型性能收益。
-[统一实验裁定与叶证据SHA清单](../benchmarks/2026-10-24-moe-localgrow/experiment-result.json)
+`benchmarks/2026-10-24-moe-localgrow/experiment-result.json`
 汇总各门、实际观测、未运行范围、源码边界和最终恢复，原始各级报告继续保留。
 
 ---
@@ -11205,7 +11211,7 @@ warm cap7168旧六prompt资源请求合计955,695,104B；另有旧id-map的16,77
 随后§81.2已以实际resource IDs、deferred ADD/drain链和同构建0/1/0干预验证了资源滞留及本组物理峰影响，
 §81.4再独立验证相对原生产基线的正常增长物理回退已经消除。正式采纳仍须等待§81.5完整门。
 
-[GPU前冻结的新方案](../benchmarks/2026-10-24-moe-phys-cause/experiment-plan.json)
+`benchmarks/2026-10-24-moe-phys-cause/experiment-plan.json`
 SHA `a83127b1427b09b703883150f3ec6e8e90e7ecdead3f48b798c7755368bd9d9c`。
 候选使用默认关闭的新开关`MYDS_PREFILL_PROMPT_VIEW_CLEAR`：仅compact且prompt组需增长时，
 先成功分配六个新owner，再于quiescent点完整校验并清空六个旧view引用，最后释放旧owner并发布新组。
@@ -11220,7 +11226,7 @@ SHA `a83127b1427b09b703883150f3ec6e8e90e7ecdead3f48b798c7755368bd9d9c`。
 详细deferred事件只用于因果诊断，不在正式计时注册。
 
 §80完成时的整份台账已按原bytes保留为
-[历史SHA快照](../benchmarks/2026-10-24-moe-phys-cause/prior-ledger-snapshot.md)
+`benchmarks/2026-10-24-moe-phys-cause/prior-ledger-snapshot.md`
 `8162b13e33b6bacd119148a38902eaee5f3fea3800089f91c2357bdcacc06ae6`，
 以便重核旧result绑定的台账版本；不改旧实验raw、报告、门限或失败结论。
 
@@ -11234,7 +11240,7 @@ actual prompt九个分配/clear场景、尾块/fallback/PSO与局部增长检查
 -0.076181%/-0.007033%/-0.987418%，均在原2%组件门内；
 实际device分配分别减少2,259,615,744/2,259,615,744/2,264,924,160B。
 这不证明全模型物理峰值或耗时收益。完整执行与原reader序列化误判修正链见
-[组件证据索引](../benchmarks/2026-10-24-moe-phys-cause/component-evidence/index.json)。
+`benchmarks/2026-10-24-moe-phys-cause/component-evidence/index.json`。
 
 首次因果窗口`causal-window1`完成C0a三次生成后，C1在模型载入前返回参数错误，
 错误为`Prompt clearing requires compact workspace mode`。入口在Metal初始化前读取了
@@ -11250,7 +11256,7 @@ finally已按原身份恢复13264→19175，两个候选开关仍关闭。
 初始化后effective模式核对，actual main CPU 62项和4个严格语法检查通过；取消/恢复入口同类问题一并修复。
 独立恢复后处理器另外修正了JSON规范化副本不应与原计划bytes强行同SHA的问题，
 仍要求唯一归档原计划实际SHA与协议对象完全相等。见
-[入口与协议修复报告](../benchmarks/2026-10-24-moe-phys-cause/entry-guard-fix/validation-summary.json)。
+`benchmarks/2026-10-24-moe-phys-cause/entry-guard-fix/validation-summary.json`。
 
 完整`causal-window2`执行同一candidate binary，workspace全为1、clear为0/1/0，
 每臂同context setup7k→grow16k→retain7k各8输出，共9次生成。
@@ -11269,8 +11275,8 @@ finally已按原身份恢复13264→19175，两个候选开关仍关闭。
 | process phys_footprint | 12,065,261,760 | 11,109,221,800 | 12,065,278,048 | -956,039,960 | -956,056,248 |
 | RSS | 161,583,742,976 | 160,677,199,872 | 161,583,824,896 | -906,543,104 | -906,625,024 |
 
-完整主证据见[因果干预无损索引](../benchmarks/2026-10-24-moe-phys-cause/causal2-evidence/index.json)
-与[独立小报告](../benchmarks/2026-10-24-moe-phys-cause/causal2-smalltop.json)。
+完整主证据见`benchmarks/2026-10-24-moe-phys-cause/causal2-evidence/index.json`
+与`benchmarks/2026-10-24-moe-phys-cause/causal2-smalltop.json`。
 
 本次干预的保守phys峰下降911.751MiB。三臂全局Metal最大值均来自更早的MoE LOCAL_READY，
 此时新旧MoE池同时存活；MoE AFTER_FREE均为169,684,287,488B。
@@ -11300,7 +11306,7 @@ compact localgrow在prompt扩容之前失败，保持原prompt组。
 shared-PSO与prompt first/last NULL仍各自保留原合同，不改任何0-ULP、物理收益、回退或时间门。
 原reader/失败报告不改；新reader `6db3b178…` 的60项CPU控制通过。
 原10个native的5pair经新旧适用reader完整SHA/FNV及逐byte独立重放通过，离线再次核验一致。
-见[原失败窗口、独立prefix与无损证据](../benchmarks/2026-10-24-moe-phys-cause/recovery-evidence/failed-window1/index.json)。
+见`benchmarks/2026-10-24-moe-phys-cause/recovery-evidence/failed-window1/index.json`。
 
 冻结计划固定28个场景矩阵，但未要求单service窗口；各native均为独立进程和context，
 各pair之间无状态连接，且此组不计性能。
@@ -11311,7 +11317,7 @@ shared-PSO与prompt first/last NULL仍各自保留原合同，不改任何0-ULP�
 完整28/14门已由独立两窗口汇总reader重新读取全部raw后通过：8,932个有效状态文件重新散列，
 4,382个完整文件、1,517,497,584B逐byte比较，30个阶段的计数与离线复核一致。
 模型完整stat/首1MiB、实际critical source/native/library、两次finally链均通过。
-[统一恢复索引](../benchmarks/2026-10-24-moe-phys-cause/recovery-evidence/index.json)
+`benchmarks/2026-10-24-moe-phys-cause/recovery-evidence/index.json`
 SHA `0342dd5d655c46f2fbad2cd467874e31e2ebf1e4bba2ffc783be2ce31d112bb0`。
 最终独立小top SHA `9e21d8a109b66befb2bf47c609dd2ddb2b2e522fdeb39df1dafa214086bd2649`，
 long SHA `1252ce1fe8d02b0084d7482ac47d565277145117a2894055e877b8045ef064ba`。
@@ -11366,10 +11372,10 @@ READY处task值不能替代生成区间的phys最大值。
 因此正式窗口仍使用原controller小top，并在NEW formal inputs中额外冻结独立long及绑定receipt，
 没有修改原inputs或frozen reader。finally恢复46484→52751。
 
-见[正常probe独立完整报告](../benchmarks/2026-10-24-moe-phys-cause/probe1-independent-review.json)、
-[控制器绑定receipt](../benchmarks/2026-10-24-moe-phys-cause/probe-evidence/controller-binding-receipt.json)、
-[峰值实际源点](../benchmarks/2026-10-24-moe-phys-cause/probe-evidence/growth-peak-source-summary.json)及
-[无损归档索引](../benchmarks/2026-10-24-moe-phys-cause/probe-evidence/index.json)。
+见`benchmarks/2026-10-24-moe-phys-cause/probe1-independent-review.json`、
+`benchmarks/2026-10-24-moe-phys-cause/probe-evidence/controller-binding-receipt.json`、
+`benchmarks/2026-10-24-moe-phys-cause/probe-evidence/growth-peak-source-summary.json`及
+`benchmarks/2026-10-24-moe-phys-cause/probe-evidence/index.json`。
 索引SHA `b9002d8de4b3de7e39753d8bb66a6103e729d5e99d6683f263e95d29fb051bea`，
 20个leaf逐个核验；原raw 1,474路径、739,008,336B逻辑内容，325 source+24 artifacts均已封存。
 此门只授予正式18次correctness及唯一36次performance验证资格，不直接授予采纳。
@@ -11424,9 +11430,9 @@ phys为-455,737,320B，Metal为-1,910,292,480B，原128MiB回退门未改。
 但导出的触页历史仍属于本协议，不能冒称未观测HTTP生产服务的连续绝对内存峰值。
 详细deferred observer未注册，无额外GPU commit/wait，普通CPU observer成本包含在generation wall。
 
-[原控制器summary](../benchmarks/2026-10-24-moe-phys-cause/full1-controller-summary.json)记录
+`benchmarks/2026-10-24-moe-phys-cause/full1-controller-summary.json`记录
 全部54次生成、原门判定和finally恢复52751→68466。最后一个窗口后已完成
-[独立现场恢复41项核验](../benchmarks/2026-10-24-moe-phys-cause/final-independent-live-review.json)，
+`benchmarks/2026-10-24-moe-phys-cause/final-independent-live-review.json`，
 41/41通过，SHA `b33ccf72c28e5ea44ea4c0e490276a71030052e8959aeb0805f8aca2e2483e9e`；
 原binary/config inode与SHA、metallib、完整argv/cwd/log/nice0、原51环境、模型stat/header、
 gold91文件与8187监听恢复一致，没有残留benchmark或窗口锁。
@@ -11441,11 +11447,11 @@ canonical对照仍仅是原HEAD和7个path/status，不把未提前捕获的dirt
 全部54次生成的metadata/sample/time/memory/layout/observer/state数值与远端独立结果逐值相等；
 不把路径搬迁后的long SHA不同冒称为原报告bytes相等。
 
-见[完整全模型无损索引](../benchmarks/2026-10-24-moe-phys-cause/full-evidence/index.json)
+见`benchmarks/2026-10-24-moe-phys-cause/full-evidence/index.json`
 （SHA `979caf731a95d92fa5877e1ec3d16c1d90d2632a899d5bf098b136994e6c3886`）、
-[独立小总览](../benchmarks/2026-10-24-moe-phys-cause/full1-independent-local-summary.json)、
-[原frozen独立long](../benchmarks/2026-10-24-moe-phys-cause/full-evidence/independent/full-independent-review.json)与
-[本地离线闭环](../benchmarks/2026-10-24-moe-phys-cause/full-evidence/offline/closure.json)。
+`benchmarks/2026-10-24-moe-phys-cause/full1-independent-local-summary.json`、
+`benchmarks/2026-10-24-moe-phys-cause/full-evidence/independent/full-independent-review.json`与
+`benchmarks/2026-10-24-moe-phys-cause/full-evidence/offline/closure.json`。
 
 
 ### 81.6 精确实测制品采纳、原inode备份与独立新现场核验
@@ -11454,7 +11460,7 @@ canonical对照仍仅是原HEAD和7个path/status，不把未提前捕获的dirt
 只读`--prepare`以实际manifest `c3d6d2db74352653883a9bde5a9212c57e796e6ea728a1e5579721f08a4fb8d8`
 完成，且没有service操作。随后同一manifest的唯一实际`--run`返回
 `adopted_exact_artifact`、`production_adoption=true`。
-[采纳receipt](../benchmarks/2026-10-24-moe-phys-cause/adoption-evidence/adoption-receipt.json)
+`benchmarks/2026-10-24-moe-phys-cause/adoption-evidence/adoption-receipt.json`
 SHA `e223b6a7811b8fb0e2fa132851f5d5732e051ba64535dc9d5c5a8cab1264b6bf`，
 原服务68466→新服务73069；无需另跑正式cohort。
 
@@ -11482,9 +11488,9 @@ server未导出workspace counter HTTP接口：当前开关与实际被接受bina
 采纳过程保存并核验其HEAD、7条path/status、tracked binary diff与1个untracked内容hash，
 完整dirty内容相对stop前snapshot保持，未把该HEAD冒称为实测源码。
 本地main core4同样保持本轮开始时的SHA；已实现代码以
-[exact868累计patch](../benchmarks/2026-10-24-moe-phys-cause/prototype/promptclear-core-v4/exact868-to-promptclear.patch)、
-[v3→本轮clear差分](../benchmarks/2026-10-24-moe-phys-cause/prototype/promptclear-core-v4/v3-to-promptclear.patch)和
-[核心源码归档](../benchmarks/2026-10-24-moe-phys-cause/prototype/promptclear-core-v4/core-source.tar.gz)完整保留。
+`benchmarks/2026-10-24-moe-phys-cause/prototype/promptclear-core-v4/exact868-to-promptclear.patch`、
+`benchmarks/2026-10-24-moe-phys-cause/prototype/promptclear-core-v4/v3-to-promptclear.patch`和
+`benchmarks/2026-10-24-moe-phys-cause/prototype/promptclear-core-v4/core-source.tar.gz`完整保留。
 
 实际采纳后另执行新只读核验器 `f9dab1b3…`，独立从当前PID73069读取身份，
 **40/40**检查通过；原§81.5的41项报告只作采纳前原服务恢复基线。
@@ -11496,18 +11502,18 @@ listener/health、无竞争进程/锁、release每文件及328source+24artifact�
 在第一个空记录结束KERN_PROCARGS2环境，不将尾部storage视作环境。
 原完整非MYDS环境只保留远端0600私密恢复文件；仓库/release/公开报告仅有digest/count，不复制这些值。
 
-[采纳后独立现场long](../benchmarks/2026-10-24-moe-phys-cause/adoption-live-evidence/actual-audit/independent-review.json)
+`benchmarks/2026-10-24-moe-phys-cause/adoption-live-evidence/actual-audit/independent-review.json`
 SHA `d7ad493cf0a1b10eb198edc899f83d84dde190c61fc8d6e3a55a270126c31e5e`；
-[独立现场证据索引](../benchmarks/2026-10-24-moe-phys-cause/adoption-live-evidence/index.json)
+`benchmarks/2026-10-24-moe-phys-cause/adoption-live-evidence/index.json`
 SHA `c944ef6b92d8d3bdc0960eba2612664e2280bf5268ddc4a84cdebe4f3aabbc22`。
-[采纳统一索引](../benchmarks/2026-10-24-moe-phys-cause/adoption-evidence/index.json)
+`benchmarks/2026-10-24-moe-phys-cause/adoption-evidence/index.json`
 SHA `05dd5c7577442d59698dcc6815e96c26ad56832b03d6d61c214cbafebae80549`，
 绑定manifest、prepare、baseline oracle、实际receipt、持久release与新现场报告。
 
 **最终裁定：采纳本轮exact868+v4内存优化组合。**
 已消除§80观察到的phys峰回退，正式主负载物理收益超过原门且时间非退化；
 不将近零时间变化记为提速，不改变§73–§80已排除实现或旧cohort结论。
-[统一实验结果与叶证据SHA清单](../benchmarks/2026-10-24-moe-phys-cause/experiment-result.json)
+`benchmarks/2026-10-24-moe-phys-cause/experiment-result.json`
 汇总机制、全部阶段、正式内存/时间、源码边界和最终采纳现场身份。
 
 ## §82 exact868+v4 prefill Step7 局部资源屏障原型：0-ULP通过，组件门未通过，不采纳（2026-10-24）
@@ -11535,8 +11541,8 @@ shared gate/up各自MM+原BF16舍入→SwiGLU→down+原BF16舍入，末尾join�
 不混接数学fallback。scope没有新增CPU wait、commit或取消点。候选core95 manifest `8cf03bd6…35da0`，
 实际改变三份既有runtime文件及一个新内部header，其余新增文件为host/proof工具。
 263项CPU合同及reverse91原字节证明通过；这些不冒称GPU故障/恢复验证。
-[原型、可逆patch与源码证明](../benchmarks/2026-10-24-prefill-latency-v4/prototype/README.md)
-及[生产路径分析](../benchmarks/2026-10-24-prefill-latency-v4/production-analysis.md)完整保留。
+`benchmarks/2026-10-24-prefill-latency-v4/prototype/README.md`
+及`benchmarks/2026-10-24-prefill-latency-v4/production-analysis.md`完整保留。
 
 ### 82.2 真实权重与完整0-ULP
 
@@ -11555,7 +11561,7 @@ actual oracle要求gold/native/candidate三者完全一致。每个选中B记录
 
 最终独立reader为`fd9c5b891ee57d8ebc63869176ba66c9e5d91ff4a15f80e29ea887ef08226661`，
 其41项CPU格式/负控制与真实20区间、完整42记录实际复核分别成立。
-[功能门报告](../benchmarks/2026-10-24-prefill-latency-v4/resume-v4/actual/functional-review.json)
+`benchmarks/2026-10-24-prefill-latency-v4/resume-v4/actual/functional-review.json`
 明确functional=true、component=false；数值通过不等于速度采纳。
 
 ### 82.3 唯一生产concurrent GPU组件组
@@ -11575,14 +11581,14 @@ actual oracle要求gold/native/candidate三者完全一致。每个选中B记录
 **最终组件门false。** layer8在有效控制漂移内没有达到收益门；layer19对照又越界，
 所以其负值不能单独用来证明稳定的因果回退。layer0的正值也不能覆盖其余层。
 本轮没有timeline/counters因果分解，不将结果归因于已测得的spill、occupancy或热状态。
-[组件完整报告](../benchmarks/2026-10-24-prefill-latency-v4/resume-v4/actual/component-review.json)
+`benchmarks/2026-10-24-prefill-latency-v4/resume-v4/actual/component-review.json`
 SHA `04b68ac483cadaa18b3bc01b49e0f869d095ee43d190c8f35245e604a5d90ceb`。
 
 **未运行全模型18正确性＋36 A1/B/A2、未运行新候选GPU故障/正常异步取消恢复，未采纳。**
 全模型工具虽已准备并经CPU/语法控制，仍明确held/unrun；不能沿用§81的28/14恢复结果给新候选背书。
 若组件过门，原冻结全模型规则是workspace/clear始终1、只切Step7，grow16k和retain7k每项保守prefill严格>2%，
 decode/setup/总wall及phys回退门同时成立，内存节省不能替代速度利润。
-[未执行的全模型工具及剩余恢复门](../benchmarks/2026-10-24-prefill-latency-v4/fullmodel-prep/README.md)。
+`benchmarks/2026-10-24-prefill-latency-v4/fullmodel-prep/README.md`。
 
 ### 82.4 工具合同拒绝、续跑来源与不可改写的历史
 
@@ -11616,13 +11622,13 @@ oracle/warmup/phase逻辑表达式的整数0/1；bool字段仍须精确bool。
 
 三档共2946成员逐SHA完整核验，原生hardlink保留真实完整bytes，不使用虚拟payload。
 各档有独立index及无损materialized raw，私密完整环境恢复文件不进入公开归档。
-[续跑归档独立核验](../benchmarks/2026-10-24-prefill-latency-v4/resume-v4/verified/independent-archive-review.json)。
+`benchmarks/2026-10-24-prefill-latency-v4/resume-v4/verified/independent-archive-review.json`。
 
 归档完成后另运行新只读wrapper独立重放完整6/42/90和20个GGUF实际权重区间，
 输出报告与原组件报告**SHA完全相同**`04b68ac4…`，expected negative exit1。
-[独立重放receipt](../benchmarks/2026-10-24-prefill-latency-v4/independent-component-review/receipt.json)
+`benchmarks/2026-10-24-prefill-latency-v4/independent-component-review/receipt.json`
 SHA `3e8d70feb298dfab0e72c41e1e4b069d2f16f8aeecfdc8e29d6e2eec2049bc8f`；
-[不导入reader的Decimal时间戳复算](../benchmarks/2026-10-24-prefill-latency-v4/independent-component-review/raw-timing-recompute.json)
+`benchmarks/2026-10-24-prefill-latency-v4/independent-component-review/raw-timing-recompute.json`
 独立确认90=81formal+9warmup及三层原利润/漂移裁定。全过程不重跑native或GPU、不改变旧raw。
 
 ### 82.5 生产恢复与裁定
@@ -11632,7 +11638,7 @@ listener PID**28940**与最终restored.json/receipt一致。bin9cf2/libc692/conf
 完整初始22原字节digest、原argv/cwd/log/nice0、main/vision stat＋首1MiB、
 gold91/candidate95/capture92/harness8实际源、durable release20文件＋352归档成员均核验。
 新Step7开关在生产有效/继承/config均缺席。审计不提交GPU、completion或service/config修改。
-[最终独立现场](../benchmarks/2026-10-24-prefill-latency-v4/resume-v4/final-audit-resume-actual/independent-review.json)
+`benchmarks/2026-10-24-prefill-latency-v4/resume-v4/final-audit-resume-actual/independent-review.json`
 SHA `e24f3f3bc7df69102614ca7f62f112b404dfc0759274f55fad4b53152f6c5619`，
 明确restored identity=true，同时保留window_status=`component_rejected_performance`。
 
@@ -11643,7 +11649,7 @@ SHA `e24f3f3bc7df69102614ca7f62f112b404dfc0759274f55fad4b53152f6c5619`，
 当前7k/16k请求不具备这个收益空间。应先只读计数实际长请求的有效tile覆盖再决定是否做原型，
 不能重复扩大indexer scratch或已证否的consumer融合，不能将该静态候选记为已实现/有收益。
 
-[本轮统一实验结果与证据索引](../benchmarks/2026-10-24-prefill-latency-v4/experiment-result.json)
+`benchmarks/2026-10-24-prefill-latency-v4/experiment-result.json`
 绑定baseline、候选源码、三档原始归档、唯一组件组、独立重放、最终现场及未执行阶段。
 
 
@@ -11670,7 +11676,7 @@ GPU前冻结计划SHA `5ab5010e0884041b3e2f74a94fdfcb340d9f83b6edb796faafe15d0bb
 strict分子只计完整8query×16key且8行两mask块全拒绝的tile；分母是原causal提前退出后全部active tile，含尾tile。
 原causal已跳过项、query/key尾tile及仅由causal边界形成的额外空间不进strict分子。
 代理按**逐dispatch** `score_GPU_span × strict_skip/causal_active`加总，再除对应ordinary prefill wall。
-[冻结ROI定义](../benchmarks/2026-10-24-indexscore-mask-survey/evidence/roi-screen-policy-v1.json)。
+`benchmarks/2026-10-24-indexscore-mask-survey/evidence/roi-screen-policy-v1.json`。
 
 ### 83.2 完整实际统计与时间
 
@@ -11726,25 +11732,25 @@ NEW portable reader `f0edbe2166a7e8f4a1db8d926fa8d0ac084e233b6f2f9d54a5c39ea5d49
 两次CPU重放完整报告逐byte一致，998328B，SHA **`25eba9d9e27c0dcb3970974f700c41fbf52072dfb482dc42d49ba8f42e2c44f5`**。
 不import reader的Decimal/byte-LUT独立核6153条、逐dispatch加权、全部mask与尾tile；最大聚合误差1.663e−16。
 补表processor首次十进制打印值容差错误也完整保留，NEW版本恢复原binary64再Decimal运算，未修改旧raw/门。
-[独立小摘要及完整证据入口](../benchmarks/2026-10-24-indexscore-mask-survey/evidence/independent-replay-v2/summary.json)。
+`benchmarks/2026-10-24-indexscore-mask-survey/evidence/independent-replay-v2/summary.json`。
 
 完整归档1738成员、99490206B原始payload，tar46622657B，SHA
 `31bbe1c3f28462d5d0340b7638ef1dcada910824accbc0df6d9da266f9cded75`。
 远端逐原件重哈、本地完整物化均pass；私密完整环境文件在读取/归档前排除。
-[归档receipt](../benchmarks/2026-10-24-indexscore-mask-survey/complete-archive-receipt.json)记录物理tar/index/receipt和远端/本地独立核验SHA。
+`benchmarks/2026-10-24-indexscore-mask-survey/complete-archive-receipt.json`记录物理tar/index/receipt和远端/本地独立核验SHA。
 
 ### 83.5 生产恢复、结论与交接
 
 最后GPU窗finally恢复后，全新只读auditor独立现场通过：**PID51482**、9cf2/c692/config79e、完整53/初始22原字节digest、
 原argv/cwd/log/nice0、main/vision stat+首1MiB、gold91/observer92/harness2及durable release20+352归档均核同。
-[现场报告](../benchmarks/2026-10-24-indexscore-mask-survey/evidence/actual-final/production-audit.json)
+`benchmarks/2026-10-24-indexscore-mask-survey/evidence/actual-final/production-audit.json`
 SHA `89bae42e4f8afaeaf6936addd7c1a3b8bd3430862fd08ecf773bac2db3095c8a`。
 监测最大phys约20.87GiB、system wired约170.57GiB，175/185GiB门未放宽；无竞争benchmark。
 
 **本轮未实现skip、未运行候选0-ULP/生产组件/全模型A1/B/A2、未采纳，无prefill提速成果可宣称。**
 真实权重统计、独立回放、完整保存与生产恢复均已完成，无后台工作。
-[统一结果](../benchmarks/2026-10-24-indexscore-mask-survey/experiment-result.json)；
-[后续模型交接](2026-10-24-indexscore-mask-survey-handoff.md)。
+`benchmarks/2026-10-24-indexscore-mask-survey/experiment-result.json`；
+`2026-10-24-indexscore-mask-survey-handoff.md`。
 
 ---
 
