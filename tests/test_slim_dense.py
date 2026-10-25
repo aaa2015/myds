@@ -257,6 +257,127 @@ class SlimDenseTests(unittest.TestCase):
         self.assertEqual(orig_sha, after_sha)
         os.rename(partial_src, self.src_path)
 
+    def test_collision_journal_tmp_input_rejected(self):
+        """回归（2026-10-25）：input 恰好叫 <out>.journal.json.tmp 时必须被拒。
+
+        write_atomic_journal 先写 <journal>.tmp 再 rename，而旧的碰撞检查只覆盖
+        output / .partial / .journal.json 三个路径。于是：
+            in  = x.gguf.journal.json.tmp
+            out = x.gguf   ⇒  journal.tmp == in  ⇒  open("w") 直接截断源模型
+        本测试不仅要拒绝，还要证明源文件字节未变。
+        """
+        out_path = self.dst_path
+        tmp_src = out_path + ".journal.json.tmp"
+        os.rename(self.src_path, tmp_src)
+        with open(tmp_src, "rb") as f:
+            orig_sha = hashlib.sha256(f.read()).hexdigest()
+            orig_size = os.path.getsize(tmp_src)
+
+        cmd = [sys.executable, "tools/slim_dense_q4.py", "--in", tmp_src, "--out", out_path]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0, "input 与 journal 临时文件同名时必须拒绝")
+        self.assertIn("resolves to the same real path", res.stderr)
+
+        with open(tmp_src, "rb") as f:
+            after_sha = hashlib.sha256(f.read()).hexdigest()
+        self.assertEqual(orig_sha, after_sha, "源文件被截断——这正是本修复要防止的数据丢失")
+        self.assertEqual(orig_size, os.path.getsize(tmp_src))
+        os.rename(tmp_src, self.src_path)
+
+    def test_resume_rejects_replaced_source_same_header(self):
+        """回归（2026-10-25）：header/尺寸/张量数全相同，但内容被换过 → 必须拒。
+
+        旧的 resume 只绑定 source_header_sha256，而它只覆盖 header 字节，
+        不含任何 tensor 数据。于是把源换成「同架构、同量化、不同检查点」的
+        另一份模型，resume 会接受，产出前半旧、后半新的拼接体而不报错。
+
+        构造：先完整跑一次拿到真实产物，再用真实的 journal 字段重写一份
+        只把 source_identity.mtime_ns 改掉的 journal ⇒ 必须被识破。
+        """
+        # 先完整转换一次，得到含有真实 source_identity 的 journal 语义
+        cmd = [sys.executable, "tools/slim_dense_q4.py", "--in", self.src_path,
+               "--out", self.dst_path, "--threads", "2"]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+        st = os.stat(self.src_path)
+        # 把成品当作 partial，并伪造一份“同一 header 但源已被换”的 journal。
+        # ★ 这里必须用【真实的】header sha，否则旧代码自己就会拒，
+        #   测试就变成空转（验证不到新的 identity 检查）。
+        partial_path = self.dst_path + ".partial"
+        journal_path = self.dst_path + ".journal.json"
+        os.rename(self.dst_path, partial_path)
+
+        real_header_len, n_tensors, alignment = self._gguf_header_geometry(self.src_path)
+        with open(self.src_path, "rb") as f:
+            real_header_sha = hashlib.sha256(f.read(real_header_len)).hexdigest()
+
+        with open(journal_path, "w") as f:
+            json.dump({
+                "completed_tensor_idx": 0,
+                "source_header_sha256": real_header_sha,
+                "source_size": st.st_size,
+                "n_tensors": n_tensors,
+                "alignment": alignment,
+                "target_count": 1,
+                "source_identity": {
+                    "size": st.st_size,
+                    "mtime_ns": st.st_mtime_ns + 1_000_000_000,   # 假装被改过
+                    "dev": st.st_dev,
+                    "ino": st.st_ino,
+                },
+            }, f)
+
+        cmd = [sys.executable, "tools/slim_dense_q4.py", "--in", self.src_path,
+               "--out", self.dst_path, "--resume"]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0, "源文件被替换后 resume 必须拒绝")
+        # 必须是被 source_identity 拒的，而不是被 header 检查拒的
+        self.assertIn("源文件已不是当初开始转换的那份", res.stderr,
+                      f"不是被 identity 检查拒绝的（说明测试空转了）: {res.stderr}")
+        self.assertIn("修改时间", res.stderr)
+
+    @staticmethod
+    def _gguf_header_geometry(path: str):
+        """返回 (header 字节长度, n_tensors, alignment)。与工具的解析保持一致。"""
+        with open(path, "rb") as f:
+            magic = f.read(4)
+            assert magic == b"GGUF", magic
+            ver, n_tensors, n_kv = struct.unpack("<IQQ", f.read(20))
+            assert ver in (2, 3), ver
+            alignment = 32
+            scalar = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+            for _ in range(n_kv):
+                klen = struct.unpack("<Q", f.read(8))[0]
+                key = f.read(klen).decode()
+                vtype = struct.unpack("<I", f.read(4))[0]
+                if vtype == 8:                      # string
+                    ln = struct.unpack("<Q", f.read(8))[0]
+                    f.seek(ln, os.SEEK_CUR)
+                elif vtype == 9:                    # array
+                    etype, cnt = struct.unpack("<IQ", f.read(12))
+                    if etype == 8:
+                        for _ in range(cnt):
+                            ln = struct.unpack("<Q", f.read(8))[0]
+                            f.seek(ln, os.SEEK_CUR)
+                    else:
+                        f.seek(scalar[etype] * cnt, os.SEEK_CUR)
+                else:
+                    if key == "general.alignment":
+                        # 值就在接下来 4 字节里（GGUF_TYPE_UINT32）
+                        pos = f.tell()
+                        alignment = struct.unpack("<I", f.read(4))[0]
+                        continue
+                    f.seek(scalar[vtype], os.SEEK_CUR)
+            for _ in range(n_tensors):
+                nlen = struct.unpack("<Q", f.read(8))[0]
+                f.seek(nlen, os.SEEK_CUR)
+                nd = struct.unpack("<I", f.read(4))[0]
+                f.seek(8 * nd, os.SEEK_CUR)
+                f.seek(4, os.SEEK_CUR)      # type
+                f.seek(8, os.SEEK_CUR)      # offset
+            return f.tell(), n_tensors, alignment
+
     def test_resume_source_mismatch_rejected(self):
         # F2: resume with modified source header/size is rejected
         journal_path = self.dst_path + ".journal.json"

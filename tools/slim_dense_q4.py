@@ -140,6 +140,30 @@ def check_file_collision(in_path: str, candidate_path: str, role: str):
             pass
 
 
+def derived_paths(out_path: str) -> dict[str, str]:
+    """Every path this tool may write to for a given output path.
+
+    2026-10-25: the journal is written through `<journal>.tmp` and then renamed
+    (write_atomic_journal). That temporary was missing from the collision check,
+    so an input named exactly `<output>.journal.json.tmp` would be truncated by
+    the open("w") inside the journal writer - the source model destroyed by the
+    tool that is supposed to only read it. Enumerating the writes in one place
+    stops the next temporary file from being forgotten too.
+    """
+    journal = out_path + ".journal.json"
+    return {
+        "output file": out_path,
+        "partial file": out_path + ".partial",
+        "journal file": journal,
+        "journal temporary file": journal + ".tmp",
+    }
+
+
+def refuse_any_collision(in_path: str, out_path: str):
+    for role, path in derived_paths(out_path).items():
+        check_file_collision(in_path, path, role)
+
+
 def load_quants_library(custom_path: str | None = None) -> tuple[ctypes.CDLL, str, str]:
     """Load libds4quants library. Returns (lib, resolved_path, sha256_hex)."""
     suffix = "dylib" if sys.platform == "darwin" else "so"
@@ -273,10 +297,10 @@ def main():
     if not os.path.isfile(in_path):
         sys.exit(f"Error: input file {in_path} does not exist")
 
-    # Protection against in-place overwriting of the original baseline
-    check_file_collision(in_path, out_path, "output file")
-    check_file_collision(in_path, partial_path, "partial file")
-    check_file_collision(in_path, journal_path, "journal file")
+    # Protection against in-place overwriting of the original baseline.
+    # 2026-10-25: covers every derived path, including the journal's temporary
+    # file (see derived_paths).
+    refuse_any_collision(in_path, out_path)
 
     if os.path.exists(out_path) and not args.force:
         sys.exit(f"Error: output file {out_path} already exists. Use --force or specify a different path.")
@@ -346,6 +370,29 @@ def main():
     out_data_bytes = curr_offset
     total_out_size = in_data_start + out_data_bytes
     in_file_size = os.path.getsize(in_path)
+
+    # ── 源文件内容身份（2026-10-25）────────────────────────────
+    #
+    # 原先 resume 只绑定 source_header_sha256，而那个 sha 只覆盖
+    # [0, in_header_end) 的 **header 字节**，不含任何 tensor 数据。
+    # 后果：把源文件换成一个“header 相同、大小相同、张量个数相同”的另一份模型
+    # （同架构不同检查点完全可能），resume 会得意地接受，然后构造出
+    # 【前一半来自旧文件、后一半来自新文件】的拼接体，不报任何错。
+    #
+    # 这里加 stat 身份（dev/ino/mtime_ns）。它不能代替内容哈希，但能在
+    # 零 I/O 代价下抓住现实中的两类事故：
+    #   ① 原地修改了源文件
+    #   ② 同路径换了另一份文件
+    # 跨路径拷贝（inode 变）会保守拒绝——这是安全的方向：宁可重跑，
+    # 不能默认接受一个无法验证的来源。
+    src_stat = os.stat(in_path)
+    source_identity = {
+        "size": in_file_size,
+        "mtime_ns": src_stat.st_mtime_ns,
+        "dev": src_stat.st_dev,
+        "ino": src_stat.st_ino,
+    }
+
     savings_bytes = target_q8_bytes - target_q4_bytes
 
     if target_q8_bytes > 0:
@@ -431,6 +478,28 @@ def main():
                 f"  Journal: header_sha={saved_hdr_sha}, size={saved_src_sz}, nt={saved_nt}, lib_sha={saved_lib_sha}, align={saved_align}\n"
                 f"  Current: header_sha={source_header_sha256}, size={in_file_size}, nt={n_tensors}, lib_sha={quants_lib_sha256}, align={alignment}"
             )
+
+        # 源文件内容身份（2026-10-25）。旧 journal 没有这个字段，
+        # 那种情况下的 resume 继续走上面的 header 检查——但会明确告知。
+        saved_ident = journal_data.get("source_identity")
+        if saved_ident is None:
+            print("[RESUME] ⚠ journal 没有 source_identity 字段（旧版本生成）；"
+                  "本次 resume 仅校验 header/大小/张量数，不校验文件内容。")
+        else:
+            changed = []
+            for key, label in (("size", "文件大小"),
+                               ("mtime_ns", "修改时间"),
+                               ("dev", "设备号"),
+                               ("ino", "inode")):
+                if saved_ident.get(key) != source_identity.get(key):
+                    changed.append(f"{label}: journal={saved_ident.get(key)} current={source_identity.get(key)}")
+            if changed:
+                sys.exit(
+                    "Error: Resume rejected! 源文件已不是当初开始转换的那份。\n"
+                    "  " + "\n  ".join(changed) + "\n"
+                    "  已完成的张量来自旧文件，继续会把两份模型拼成一个文件而不报错。\n"
+                    "  如果确实是同一份数据的拷贝，请删除 .partial 与 .journal.json 后重新转换。"
+                )
 
         start_idx = journal_data.get("completed_tensor_idx", 0)
         if not (0 <= start_idx <= n_tensors):
@@ -537,6 +606,7 @@ def main():
                     "tensor_name": t.name,
                     "source_header_sha256": source_header_sha256,
                     "source_size": in_file_size,
+                    "source_identity": source_identity,
                     "n_tensors": n_tensors,
                     "quants_lib_path": quants_lib_path,
                     "quants_lib_sha256": quants_lib_sha256,
