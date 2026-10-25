@@ -246,6 +246,11 @@ static _Atomic uint64_t moe_wh_total;
 static _Atomic uint64_t moe_wh_min_hist[MOE_WH_BINS];   /* 每 token 最小槽位权重 */
 static _Atomic uint64_t moe_wh_all_hist[MOE_WH_BINS];   /* 所有槽位权重 */
 static _Atomic uint64_t moe_wh_log[MOE_WH_LOG_BINS];    /* 最小权重的对数刻度 */
+/* 2026-10-25 第三版：每个 token 有多少个槽位低于阈值。
+ * 只看最小值只能回答“能否跳 1 个”；这个能回答“能否跳 2/3 个”。 */
+#define MOE_WH_THRESH 4
+static const float moe_wh_thr[MOE_WH_THRESH] = {1e-2f, 5e-2f, 1e-1f, 2e-1f};
+static _Atomic uint64_t moe_wh_cnt[MOE_WH_THRESH][7];  /* 低于阈值的槽位数 0..6 */
 static _Atomic uint32_t moe_wh_tokens;
 
 static int moe_wh_bin(float w) {
@@ -277,11 +282,16 @@ void myds_v41_moe_weight_hist_observe(myds_metal_buffer_t *weights, uint32_t row
     for (uint32_t r = 0; r < rows; r++) {
         const float *row = w + (size_t)r * top_k;
         float mn = INFINITY;
+        uint32_t below[MOE_WH_THRESH] = {0};
         for (uint32_t k = 0; k < top_k; k++) {
             const float v = row[k];
             atomic_fetch_add_explicit(&moe_wh_all_hist[moe_wh_bin(v)], 1, memory_order_relaxed);
             if (v < mn) mn = v;
+            for (int t = 0; t < MOE_WH_THRESH; t++)
+                if (v < moe_wh_thr[t]) below[t]++;
         }
+        for (int t = 0; t < MOE_WH_THRESH; t++)
+            atomic_fetch_add_explicit(&moe_wh_cnt[t][below[t] > 6u ? 6u : below[t]], 1, memory_order_relaxed);
         if (isfinite(mn)) {
             atomic_fetch_add_explicit(&moe_wh_min_hist[moe_wh_bin(mn)], 1, memory_order_relaxed);
             atomic_fetch_add_explicit(&moe_wh_log[moe_wh_logbin(mn)], 1, memory_order_relaxed);
@@ -328,6 +338,27 @@ void myds_v41_moe_weight_hist_report(const char *tag, bool reset) {
                                   100.0 * (double)cum / (double)n);
         }
         MYDS_LOG_I("[%s] 最小槽位权重（对数刻度，%u token）%s", tag ? tag : "moe-hist", (unsigned)n, buf);
+    }
+    /* ── 第三版：每个 token 有多少个槽位可跳 / 累计可省字节占比 ── */
+    for (int t = 0; t < MOE_WH_THRESH; t++) {
+        uint64_t cnt[7];
+        uint64_t saved_slots = 0;
+        for (int i = 0; i < 7; i++) {
+            cnt[i] = reset ? atomic_exchange_explicit(&moe_wh_cnt[t][i], 0, memory_order_relaxed)
+                           : atomic_load_explicit(&moe_wh_cnt[t][i], memory_order_relaxed);
+            saved_slots += cnt[i] * (uint64_t)i;
+        }
+        char b2[384];
+        size_t o2 = 0;
+        for (int i = 0; i <= 6; i++) {
+            o2 += (size_t)snprintf(b2 + o2, sizeof(b2) - o2, "%d槽:%.1f%% ", i,
+                                   100.0 * (double)cnt[i] / (double)n);
+            if (i == 3) break;   /* 4 个以上合并显示下一行 */
+        }
+        MYDS_LOG_I("[%s] 权重<%.0e 的槽位数分布 %s ⇒ 平均每 token 可跳 %.2f 个槽位（%.1f%% 字节）",
+                   tag ? tag : "moe-hist", (double)moe_wh_thr[t], b2,
+                   (double)saved_slots / (double)n,
+                   100.0 * (double)saved_slots / ((double)n * 6.0));
     }
     /* 累积到「权重 < x」的 token 占比（用来回答“跳掉最小槽位会丢掉多少”） */
     double cum = 0.0;
