@@ -297,11 +297,11 @@ static const char *unimplemented_graph_feature(const gguf_file_t *gf) {
  *   ⚠️ 2026-10-25：以下三个路径在本仓库中【不存在】（证据树从未入库，见账本 §97.6）。
  *      保留名字仅为追溯历史；当前可用的证据入口是：
  *        docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md
- *        docs/CORRECTNESS_STATUS.md（0-ULP 开关清单与实测）
+ *        mydsdoc/correctness/2026-10-25-ulp-switches/（0-ULP 开关清单与实测）
  *   原记（已失效路径）：
  *   证据  docs/verification/2026-09-29-batched-prefill-parity.md
  *         docs/verification/2026-09-29-decode-optimization-verification.md
- *         docs/CORRECTNESS_STATUS.md（第三轮 "原生全阶段补齐"）
+ *         mydsdoc/correctness/2026-09-29/（第三轮 "原生全阶段补齐"）
  *   方法  以 ds4 的 scalar 路径为【外部参照】，myds scalar/batched 为【内部一致】；
  *         覆盖 embedding / attn_norm / q_rope / attn_out / layer_out /
  *         route_* / ffnblock / logits（全 129280 值）等每位置 84 个阶段张量；
@@ -376,7 +376,7 @@ static myds_model_t *model_load_internal(const char *model_path, bool diagnostic
     if (missing_feature && !allowed) {
         MYDS_LOG_E("Cannot run this model correctly: native graph has not passed the correctness gate for %s. "
                    "Refusing inference rather than silently skipping model operations. "
-                   "See docs/CORRECTNESS_STATUS.md.", missing_feature);
+                   "See the mydsdoc repository, correctness/2026-10-25-ulp-switches/.", missing_feature);
         gguf_close(gf);
         return NULL;
     }
@@ -384,7 +384,7 @@ static myds_model_t *model_load_internal(const char *model_path, bool diagnostic
         MYDS_LOG_W("DIAGNOSTIC ONLY: unvalidated graph (%s); logits require independent comparison",
                    missing_feature);
     } else if (missing_feature && !gate_force_off) {
-        MYDS_LOG_I("V4.1 native graph enabled: %s (verified — see docs/CORRECTNESS_STATUS.md)",
+        MYDS_LOG_I("V4.1 native graph enabled: %s (verified — see mydsdoc correctness/2026-10-25-ulp-switches/)",
                    missing_feature);
     }
     if (!myds_metal_init("metal")) {

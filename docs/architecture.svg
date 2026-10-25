@@ -18,7 +18,7 @@
     </style>
   </defs>
 
-  <rect width="960" height="760" fill="#f6f8fa"/>
+  <rect width="960" height="812" fill="#f6f8fa"/>
 
   <text x="24" y="32" class="hdr">myds · DeepSeek-V4.1-Flash-1017-Q2 · M2 Ultra</text>
   <text x="24" y="50" class="sub">40 层，每层两个子层。数字为实测耗时（48,491-token prefill；单-token decode）。</text>
@@ -120,21 +120,23 @@
   <text x="516" y="512" class="ms">244 GB/s　实测（FMA 另占 9%，依赖链 0%）</text>
 
   <!-- ============ BOTTOM: what it means ============ -->
-  <rect x="24" y="540" width="840" height="112" fill="#ffffff" stroke="#d0d7de" stroke-width="1" rx="6"/>
+  <rect x="24" y="540" width="840" height="130" fill="#ffffff" stroke="#d0d7de" stroke-width="1" rx="6"/>
   <text x="38" y="562" class="hdr">三条边界的实测依据（决定了所有优化方向是否成立）</text>
 
   <text x="38" y="586" class="lbl">GPU 有空闲吗？</text>
-  <text x="170" y="586" class="ms">驻留 99.9–100%，1398 MHz 满频，104 W　⇒ 所有「重叠 / 消气泡」方案无效</text>
+  <text x="170" y="586" class="ms">驻留 99.9–100%，1398 MHz 满频；prefill 104 W / decode 67 W　⇒ 两者均无空隙</text>
+  <text x="170" y="600" class="ms">⚠ decode 的低功耗是【访存受限】的特征（每 token 必读 7.55 GB），不是调度空隙</text>
 
-  <text x="38" y="608" class="lbl">CPU 是瓶颈吗？</text>
-  <text x="170" y="608" class="ms">功耗 4.6 W（峰值约 50 W）= 10%　⇒ 所有「CPU 异步 / 卸载」方案无效</text>
+  <text x="38" y="618" class="lbl">CPU 是瓶颈吗？</text>
+  <text x="170" y="618" class="ms">功耗 4.6 W（峰值约 50 W）= 10%　⇒ 所有「CPU 异步 / 卸载」方案无效</text>
 
-  <text x="38" y="630" class="lbl">带宽受限吗？</text>
-  <text x="170" y="630" class="ms">DRAM 14 GB/s = 峰值 2%　⇒ 所有「省带宽」方案无效</text>
+  <text x="38" y="638" class="lbl">带宽受限吗？</text>
+  <text x="170" y="638" class="ms">DRAM 14 GB/s = 峰值 2%　⇒ 所有「省带宽」方案无效</text>
 
   <!-- footer -->
-  <text x="24" y="676" class="title">结论</text>
-  <text x="24" y="696" class="sub">在「不改模型、不买设备、逐位等价」三条约束下，prefill 与 decode 都已无两位数收益方向。</text>
-  <text x="24" y="714" class="sub">唯一还开着的两位数方向是放弃 0-ULP 去换 flash-attention 的 11–14%（其 18% 效率源于 32 KB smem 装不下 16 头）。</text>
-  <text x="24" y="736" class="sub">完整证据与每一次失败尝试：docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md</text>
+  <text x="24" y="700" class="title">结论</text>
+  <text x="24" y="720" class="sub">在「不改模型、不买设备、逐位等价」三条约束下，prefill 与 decode 都已无两位数收益方向。</text>
+  <text x="24" y="738" class="sub">放宽 0-ULP 曾被认为是唯一剩余路径；2026-10-25 实测其子项仅 +0.82% / +1.2%，投机解码 −6.6%。</text>
+  <text x="24" y="756" class="sub">若重启性能方向，应从模型侧入手（专家布局 / 分层量化 / KV 分层驻留），而非 kernel 内找并发。</text>
+  <text x="24" y="774" class="sub">完整证据与每一次失败尝试：docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md</text>
 </svg>

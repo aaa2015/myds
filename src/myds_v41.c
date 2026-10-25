@@ -7263,7 +7263,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                                (base_pos + n_tokens) >= shrink_min;
     /* 收缩前置段的「有效快照窗口」：
      * （原引用 docs/verification/2026-10-03-suffix-shrink-snapshot.md 在仓库中不存在，
-     *   证据树从未入库，见账本 §97.6；当前入口是账本 §17 与 docs/CORRECTNESS_STATUS.md）
+     *   证据树从未入库，见账本 §97.6；当前入口是账本 §17 与 mydsdoc/correctness/2026-10-25-ulp-switches/）
      * 层 il 的窗口环在 p 处【内容正确】的前提是 p ≥ B - shift（推导见层循环里的注释）。
      *   shift = 0（默认）⇒ 与 6a 完全一致：只有 macroblock 末尾能发布快照，
      *                    前置段仍从 S(il)-127 起跳（零额外开销）。

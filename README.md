@@ -64,7 +64,8 @@ prefill 与 decode 都已无两位数收益方向。
 > **2026-10-25 修正**：原文此处写「剩下的路要么放弃 0-ULP 换 attention 的 11–14%，
 > 要么换更大内存的硬件」。**前半句不成立。** 放宽 0-ULP 后逐条实测的子项：
 > 专家进 grid.z **+0.82%**、专家权重截断 **+1.2%**、PLD 投机 **−6.6%**（倒亏），
-> 其余子项需改模型或被明确排除。详见[CORRECTNESS_STATUS](docs/CORRECTNESS_STATUS.md) 与账本 §100/§101。
+> 其余子项需改模型或被明确排除。详见 mydsdoc 仓库
+> `correctness/2026-10-25-ulp-switches/`（0-ULP 开关清单与实测）与账本 §100/§101。
 >
 > 若将来要重启性能方向，应从**模型侧**入手（专家布局重排 / 分层量化 / KV 分层驻留），
 > 而不是继续在 kernel 内找并发。
@@ -685,4 +686,6 @@ layout 按 replay recipe 从同一 GGUF 提取。QKV 的 stdout 含启动信息�
 
 **0-ULP 与非 0-ULP 开关的完整清单**（每个开关做什么、实测代价与收益、
 日志如何确认生效、哪个单测覆盖它、以及那个单测**不能**证明什么）：
-见 **[docs/CORRECTNESS_STATUS.md](docs/CORRECTNESS_STATUS.md)**。
+见 **mydsdoc 仓库的 `correctness/2026-10-25-ulp-switches/`**。
+
+> 本仓库只保留源码与性能账本；其余文档（含上面的开关清单）均在 **mydsdoc** 仓库。
