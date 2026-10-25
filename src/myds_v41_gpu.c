@@ -594,7 +594,20 @@ int myds_v41_gpu_indexscores_selected_blocks_bf16(myds_metal_buffer_t *scores,
  * 设成 >0 后，只有距可见上限最近的 window 个压缩键参与打分，更早的填 -INF。
  * 复杂度从 O(N²) 降到 O(N × window)，代价是模型失去远距离检索能力。
  *
- * 生产默认不设。开启前必须评估长文质量（当前无自动化基准）。 */
+ * 🔴 2026-10-25 实测：这个开关【不该进生产】，见 docs/ 账本 §98。
+ *   大海捞针探针（18,920 tok，第 1 条埋「ZEPHYR-7734 / 林工」，末尾提问）：
+ *     · 基线（无窗口）   → 林工                    ✅
+ *     · window=512      → 无法确定                ❌
+ *     · window=4096     → 张伟（编的）            ❌❌
+ *     · window=8192     → 无法填写                ❌
+ *   ⇒ 只要 needle 落在窗口外就必然失败，而【窗口大小只决定“编”还是“认”，
+ *     与安全性无关】。15% 的 prefill 提速换不来“安静地编造”，因为下游无法识别。
+ *
+ * 对比：YOCO COMPACT 在同一个探针下答对（它截断的是 consumer 层计算范围，
+ * Layer 20 仍产全序列压缩 KV ⇒ 远距离信息经压缩 KV 依然可达）。
+ *
+ * 保留本开关的理由仅剩：可测量的对照基线 + tests/test_indexer_window.c 的语义门禁。
+ * 生产默认不设。开启前必须过一遍长文质量评估（当前无自动化基准）。 */
 static uint32_t indexer_key_window_value = 0;
 static pthread_once_t indexer_key_window_once = PTHREAD_ONCE_INIT;
 

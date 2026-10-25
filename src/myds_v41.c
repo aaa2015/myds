@@ -5443,6 +5443,8 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         myds_metal_barrier_buffer(ws->router_logits_b2);
         CHECK(myds_v41_route_batch(ws->selected_ids_b2, ws->selected_w_b2, ws->route_probs_b2, ws->route_scores_b2,
                                    ws->router_logits_b2, base->router_bias, 384, 6, m->routed_scaling_factor, 2));
+        /* 纯观测（MYDS_MOE_WEIGHT_HIST=1 时才读回，否则一行不执行） */
+        myds_v41_moe_weight_hist_observe(ws->selected_w_b2, 2, 6);
         const myds_metal_buffer_t *route_out_deps[] = { ws->selected_ids_b2, ws->selected_w_b2 };
         myds_metal_barrier_buffers(route_out_deps, 2);
 
@@ -6158,6 +6160,7 @@ static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *t
 
         CHECK(myds_v41_route_batch(ws->selected_ids_b2, ws->selected_w_b2, ws->route_probs_b2, ws->route_scores_b2,
                                    ws->router_logits_b2, base->router_bias, 384, 6, m->routed_scaling_factor, 3));
+        myds_v41_moe_weight_hist_observe(ws->selected_w_b2, 3, 6);
         myds_metal_barrier_buffer(ws->selected_ids_b2);
         myds_metal_barrier_buffer(ws->selected_w_b2);
 
@@ -8136,6 +8139,10 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                                            cw->route_probs_buf, cw->route_scores_buf,
                                            cw->router_logits_buf, base->router_bias,
                                            m->n_routed_experts, k, m->routed_scaling_factor, c_len));
+                /* 纯观测：cur_w 是整块 rows×k 缓冲，但 prefill 的 c_len 可能上千，
+                 * 全量读回会把观测代价放大到不可接受 ⇒ 只取前 8 行做样本。
+                 * decode 路径已在 5444/6159 逐 token 全量统计，样本量足够。 */
+                if (c_len) myds_v41_moe_weight_hist_observe(cur_w, c_len < 8u ? c_len : 8u, k);
                 if (trace_on) {
                     for (uint32_t t = 0; t < c_len; t++) {
                         uint32_t pos = mb_base_pos + c_start + t;   /* TRACE 需要 pos */

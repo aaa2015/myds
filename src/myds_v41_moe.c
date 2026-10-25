@@ -225,6 +225,91 @@ int myds_v41_route_batch(myds_metal_buffer_t *selected, myds_metal_buffer_t *wei
                             experts, top_k, scale, rows, true);
 }
 
+/* ── 纯观测：专家权重分布直方图（2026-10-25）────────────────────────
+ *
+ * 目的：回答「top-k 里最弱的那个专家，其路由权重到底多小」——
+ * 这决定能否自适应截断（跳掉贡献可忽略的槽位）。
+ *
+ * ★ 本函数【不修改任何计算】：只在路由写完后把 weights 读回主机侧累加直方图。
+ *   它会造成一次 GPU 同步（readback），所以只在 MYDS_MOE_WEIGHT_HIST=1 时启用，
+ *   并且不能用于性能测量——那是观测代价，不是引擎行为。
+ *
+ * 输出格式：每次 myds_v41_moe_weight_hist_report() 打印一行，
+ * 分位数为「每个 token 的最小槽位权重」，另附全量槽位分布。 */
+#define MOE_WH_BINS 20
+static _Atomic uint64_t moe_wh_total;
+static _Atomic uint64_t moe_wh_min_hist[MOE_WH_BINS];   /* 每 token 最小槽位权重 */
+static _Atomic uint64_t moe_wh_all_hist[MOE_WH_BINS];   /* 所有槽位权重 */
+static _Atomic uint32_t moe_wh_tokens;
+
+static int moe_wh_bin(float w) {
+    if (!(w > 0.0f)) return 0;
+    if (w >= 1.0f) return MOE_WH_BINS - 1;
+    int b = (int)(w * (float)MOE_WH_BINS);
+    return b < 0 ? 0 : (b >= MOE_WH_BINS ? MOE_WH_BINS - 1 : b);
+}
+
+void myds_v41_moe_weight_hist_observe(myds_metal_buffer_t *weights, uint32_t rows, uint32_t top_k);
+void myds_v41_moe_weight_hist_observe(myds_metal_buffer_t *weights, uint32_t rows, uint32_t top_k) {
+    if (!weights || !rows || !top_k) return;
+    const char *e = getenv("MYDS_MOE_WEIGHT_HIST");
+    if (!e || atoi(e) == 0) return;
+    /* 必须先等到 GPU 写完，否则读到旧数据（§52 教训）。 */
+    myds_metal_barrier_buffer(weights);
+    const float *w = (const float *)myds_metal_buffer_data(weights);
+    if (!w) return;
+    for (uint32_t r = 0; r < rows; r++) {
+        const float *row = w + (size_t)r * top_k;
+        float mn = INFINITY;
+        for (uint32_t k = 0; k < top_k; k++) {
+            const float v = row[k];
+            atomic_fetch_add_explicit(&moe_wh_all_hist[moe_wh_bin(v)], 1, memory_order_relaxed);
+            if (v < mn) mn = v;
+        }
+        if (isfinite(mn)) {
+            atomic_fetch_add_explicit(&moe_wh_min_hist[moe_wh_bin(mn)], 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&moe_wh_tokens, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&moe_wh_total, 1, memory_order_relaxed);
+        }
+    }
+}
+
+void myds_v41_moe_weight_hist_report(const char *tag, bool reset);
+void myds_v41_moe_weight_hist_report(const char *tag, bool reset) {
+    const uint32_t n = atomic_load_explicit(&moe_wh_tokens, memory_order_relaxed);
+    if (!n) return;
+    uint64_t mn[MOE_WH_BINS], all[MOE_WH_BINS];
+    for (int i = 0; i < MOE_WH_BINS; i++) {
+        mn[i] = reset ? atomic_exchange_explicit(&moe_wh_min_hist[i], 0, memory_order_relaxed)
+                      : atomic_load_explicit(&moe_wh_min_hist[i], memory_order_relaxed);
+        all[i] = reset ? atomic_exchange_explicit(&moe_wh_all_hist[i], 0, memory_order_relaxed)
+                       : atomic_load_explicit(&moe_wh_all_hist[i], memory_order_relaxed);
+    }
+    if (reset) atomic_store_explicit(&moe_wh_tokens, 0, memory_order_relaxed);
+    /* 累积到「权重 < x」的 token 占比（用来回答“跳掉最小槽位会丢掉多少”） */
+    double cum = 0.0;
+    char line[512];
+    size_t off = 0;
+    for (int i = 0; i < MOE_WH_BINS; i++) {
+        cum += (double)mn[i];
+        const double hi = (double)(i + 1) / (double)MOE_WH_BINS;
+        if (i == 4 || i == 9 || i == 14 || i == 19) {   /* 0.25 / 0.50 / 0.75 / 1.00 */
+            off += (size_t)snprintf(line + off, sizeof(line) - off,
+                                    "<%.2f:%.1f%% ", hi, 100.0 * cum / (double)n);
+        }
+    }
+    MYDS_LOG_I("[%s] MoE 权重直方图: %u token，最小槽位权重累积分布 %s",
+               tag ? tag : "moe-hist", (unsigned)n, line);
+    off = 0;
+    for (int i = 0; i < MOE_WH_BINS; i += 5) {
+        off += (size_t)snprintf(line + off, sizeof(line) - off,
+                                "[%.2f-%.2f):%.1f%% ",
+                                (double)i / MOE_WH_BINS, (double)(i + 5) / MOE_WH_BINS,
+                                (double)all[i] * 100.0 / ((double)n * 6.0));
+    }
+    MYDS_LOG_I("[%s] MoE 全槽位权重分布 %s", tag ? tag : "moe-hist", line);
+}
+
 int myds_v41_route(myds_metal_buffer_t *selected, myds_metal_buffer_t *weights,
     myds_metal_buffer_t *probs, myds_metal_buffer_t *scores,
     const myds_metal_buffer_t *logits, const myds_metal_buffer_t *bias,

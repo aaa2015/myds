@@ -13,6 +13,17 @@ int myds_v41_route_batch(myds_metal_buffer_t *selected, myds_metal_buffer_t *wei
     myds_metal_buffer_t *probabilities, myds_metal_buffer_t *scores,
     const myds_metal_buffer_t *logits, const myds_metal_buffer_t *bias,
     uint32_t n_experts, uint32_t top_k, float scale, uint32_t rows);
+/* ── 纯观测：专家权重分布（2026-10-25）──
+ *
+ * 回答一个问题：「top-k 里最弱的那个专家，权重到底多小」——
+ * 这决定能否自适应截断（跳掉贡献可忽略的槽位）来减少 MoE 的 2.39 GB/token。
+ *
+ * ★ 不修改任何计算。但会做一次 readback 同步，所以：
+ *   · 只在 MYDS_MOE_WEIGHT_HIST=1 时生效，否则一行不执行；
+ *   · 【不能用于性能测量】——读回是观测代价，不是引擎行为。
+ * weights 是 rows*top_k 连续 F32。observe 累加，report 打印并清零。 */
+void myds_v41_moe_weight_hist_observe(myds_metal_buffer_t *weights, uint32_t rows, uint32_t top_k);
+void myds_v41_moe_weight_hist_report(const char *tag, bool reset);
 /* MYDS_ROUTE_SIMD_SHUFFLE accepts absent/0/1, default 0, at each route entry.
  * Mode1 selects an independent exact all-in-one PSO and never falls back.
  * Requests count validated eligible calls; encoded counts successful host

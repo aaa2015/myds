@@ -3,6 +3,7 @@
 #include "myds_gguf.h"
 #include "myds_tokenizer.h"
 #include "myds_v41.h"
+#include "myds_v41_moe.h"
 #include "myds_align.h"
 #include "myds_log.h"
 #include "myds_cpu.h"
@@ -4706,6 +4707,9 @@ static int myds_generate_internal(myds_context_t *ctx,
 
     decode_cycle_finish(ctx);
     ctx->decode_metrics_active = false;
+    /* 纯观测：本次请求的 MoE 专家权重分布（MYDS_MOE_WEIGHT_HIST=1 才有输出）。
+     * 放在请求末尾、reset=true ⇒ 每次请求一份独立分布，便于按请求/按模型对比。 */
+    myds_v41_moe_weight_hist_report("moe-hist", true);
     myds_dspark_capture_end_request(ctx->dspark,
         success && stop_reason != MYDS_STOP_ERROR && stop_reason != MYDS_STOP_CANCELLED);
     if (stop_reason == MYDS_STOP_ERROR || !success) ctx->pcache_len = 0;
