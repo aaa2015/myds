@@ -15,7 +15,10 @@ typedef struct {
 } reader_t;
 
 static inline bool read_bytes(reader_t *r, void *dst, size_t n) {
-    if (r->pos + n > r->size) return false;
+    /* 2026-10-25: 溢出安全。原写法 `r->pos + n > r->size` 在 n 接近 SIZE_MAX 时
+     * 会回绕成小数从而通过检查，随后 memcpy 一次巨量拷贝。公开仓库会迎来 fuzz 输入，
+     * 所以改成减法形式：只有 n <= size-pos 才成立，不产生回绕。 */
+    if (n > r->size || r->pos > r->size - n) return false;
     memcpy(dst, r->data + r->pos, n);
     r->pos += n;
     return true;
@@ -239,7 +242,21 @@ gguf_file_t *gguf_open(const char *path) {
             return NULL;
         }
         if (strcmp(gf->kvs[i].key, "general.alignment") == 0) {
-            gf->alignment = gf->kvs[i].value.val_u32 ? gf->kvs[i].value.val_u32 : gf->kvs[i].value.val_u64;
+            /* 2026-10-25: 只在值非 0 时采用。原写法 `a ? a : b` 在 a==0 时回落到
+             * b，而 b（val_u64）与同一 union 的 val_u32 重叠 ⇒ 实际拿到的不是文件
+             * 声明的值。另外 alignment==0 会让后面的 ceil 除法除零。 */
+            const uint32_t a = gf->kvs[i].value.val_u32;
+            if (a != 0) {
+                if (a > (1u << 20)) {
+                    fprintf(stderr, "gguf_open: general.alignment=%u too large (max 1048576)\n", a);
+                    gguf_close(gf);
+                    return NULL;
+                }
+                gf->alignment = a;
+            } else {
+                fprintf(stderr, "gguf_open: general.alignment=0 ignored, keeping %llu\n",
+                        (unsigned long long)gf->alignment);
+            }
         }
     }
 
@@ -278,18 +295,51 @@ gguf_file_t *gguf_open(const char *path) {
 
     /* Calculate data alignment */
     size_t align = gf->alignment;
+    if (align == 0) align = 1;   /* 防御：上面的解析已拦住 0，这里再兜一层 */
     gf->tensor_data_offset = (r.pos + align - 1) / align * align;
 
-    for (uint64_t i = 0; i < tensor_count; i++) {
-        size_t abs_offset = gf->tensor_data_offset + gf->tensors[i].offset;
-        gf->tensors[i].data = (const void *)(gf->mmap_addr + abs_offset);
+    /* 2026-10-25: tensor 数据区必须落在映射范围内。
+     * 原实现只算 data = mmap_addr + abs_offset 就返回，不做任何边界检查，
+     * 于是任何被篡改/截断的 GGUF 都会让后续读取越界 —— 公开仓库会迎来 fuzz 输入，
+     * 崩在 mmap 外是确定会发生的。 */
+    if (gf->tensor_data_offset > gf->mmap_size) {
+        fprintf(stderr, "gguf_open: tensor data offset %llu beyond mapped size %zu\n",
+                (unsigned long long)gf->tensor_data_offset, gf->mmap_size);
+        gguf_close(gf);
+        return NULL;
+    }
+    const size_t data_avail = gf->mmap_size - gf->tensor_data_offset;
 
-        /* Calculate tensor size */
+    for (uint64_t i = 0; i < tensor_count; i++) {
+        const size_t abs_offset = gf->tensor_data_offset + gf->tensors[i].offset;
+
+        /* 元素数乘法溢出检查 + 类型合法性 */
         size_t n_elements = 1;
         for (uint32_t d = 0; d < gf->tensors[i].n_dims; d++) {
-            n_elements *= gf->tensors[i].dims[d];
+            const uint64_t dim = gf->tensors[i].dims[d];
+            if (dim != 0 && n_elements > SIZE_MAX / (size_t)dim) {
+                fprintf(stderr, "gguf_open: tensor %s has overflowing element count\n",
+                        gf->tensors[i].name);
+                gguf_close(gf);
+                return NULL;
+            }
+            n_elements *= (size_t)dim;
         }
-        gf->tensors[i].size_bytes = ggml_type_row_size(gf->tensors[i].type, n_elements);
+
+        const size_t row = ggml_type_row_size(gf->tensors[i].type, n_elements);
+        gf->tensors[i].size_bytes = row;
+
+        /* 区间必须在映射内：offset 相对数据区，长度不能超过剩余空间 */
+        if (abs_offset > gf->mmap_size || row > gf->mmap_size - abs_offset) {
+            fprintf(stderr,
+                    "gguf_open: tensor %s out of bounds (offset=%zu size=%zu, mapped=%zu)\n",
+                    gf->tensors[i].name,
+                    (size_t)abs_offset, row, gf->mmap_size);
+            gguf_close(gf);
+            return NULL;
+        }
+        (void)data_avail;
+        gf->tensors[i].data = (const void *)(gf->mmap_addr + abs_offset);
     }
 
     return gf;

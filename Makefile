@@ -743,3 +743,10 @@ $(BIN_DIR)/bench_moe_down_overlap: tools/bench_moe_down_overlap.m $(BUILD_DIR)/m
 	$(CC) $(OBJCFLAGS) $< $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
 .PHONY: build-decode-next-candidates
 build-decode-next-candidates: $(BIN_DIR)/bench_iq2_v41 $(BIN_DIR)/bench_q4_v41 $(BIN_DIR)/bench_moe_down_overlap
+
+# 畸形 GGUF 边界防护（2026-10-25）。只链接 gguf 层，不需要 GPU。
+TEST_GGUF_BOUNDS = $(BIN_DIR)/test_gguf_bounds
+ALL_TESTS += $(TEST_GGUF_BOUNDS)
+
+$(TEST_GGUF_BOUNDS): tests/test_gguf_bounds.c $(BUILD_DIR)/myds_gguf.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) -Iinclude -o $@ $< $(BUILD_DIR)/myds_gguf.o $(LDFLAGS)
