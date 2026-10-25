@@ -756,6 +756,8 @@ layout 按 replay recipe 从同一 GGUF 提取。QKV 的 stdout 含启动信息�
 | **ggml / llama.cpp** | MIT | 经 ds4 继承的量化布局、CPU 量化/点积逻辑、部分 kernel；另有直接移植：`src/myds_metal.m` 的 residency keep-alive（llama.cpp PR #17766，ggerganov）、residency set 未被引用时的处理（#26082）；`tools/score.c` 的 perplexity 分块协议复刻 | `LICENSE`（同上版权行）+ 代码内注释 |
 | **IRIS**（antirez） | MIT | `third_party/iris/jpeg.h`、`png.h`（IRIS 的 JPEG/PNG 解码器，含 ds4 的解码上限补丁） | `third_party/iris/LICENSE`（独立全文）+ 文件内注释 |
 | **DeepSeek** | 模型许可 | V4/V4.1 架构与 GGUF 张量约定 | `LICENSE` |
+| **DeepInfer**（deepseek-ai） | **Apache-2.0** | **算法参考，非代码复制**。官方参考实现是 Python + tilelang（CUDA/Ascend），本仓库是 C + Metal，只借鉴了两个**算法设计**：① YoCo SWA Bounded Replay（`MYDS_YOCO_COMPACT` / `MYDS_YOCO_KEEP_TOKENS` 对应其 `yoco_mode` / `keep_tokens`）；② 结构化输出的 logit bitmask 过滤。算法本身不受版权保护，实现逐行为本仓库独立编写 | 各实现点注释 + 本表 |
+| **deepseek-recipe**（deepseek-ai） | **MIT** | **参数口径对齐，非代码复制**：`max_tokens` 的官方分档（非思考 8192 / 思考 65536 / effort=max 131072，各自再被上下文压低）按其 `src/request/mod.rs` 对齐。数值是事实，不受版权保护 | `src/myds_server.c` 注释 + 本表 |
 | vLLM / omlx / mlx | — | **仅思路参考**：一份优化规格文档综合了它们的做法，**没有代码复制**，因此不产生署名义务 | commit 描述 |
 
 ### 为什么 LICENSE 里没有单独的 "llama.cpp" 行
@@ -771,6 +773,22 @@ MIT 的义务是随分发附带版权声明与许可文本，这条已经满足�
 
 `LICENSE` 与 `third_party/iris/LICENSE` 必须一并保留。MIT 不要求公开源码，
 但要求保留版权声明——删掉 LICENSE 再分发是不合规的。
+
+### 关于 DeepInfer（Apache-2.0）的说明
+
+本仓库**没有包含 DeepInfer 的任何源代码**，因此不构成 Apache-2.0 意义上的
+derivative work（衍生作品）。Apache-2.0 的归属声明义务针对的是「复制、修改、
+分发其源代码」；这里借鉴的是**不受版权保护的算法思想**。
+
+但两件事仍然做了，因为它们是对的：
+
+1. **明确致谢**：`src/myds_v41.c`（YoCo）、`src/myds_engine.c`（bitmask）、
+   `include/myds_internal.h` 三处注释都写明「官方 DeepInfer 借鉴」。
+2. **本表列出**：让读者一眼能看到算法来源，而不用去翻注释。
+
+如果你认为这种程度的借鉴仍应附带 Apache-2.0 全文，可以提出——但按该许可证的字面
+范围，纯算法参考不触发它。（对比：llama.cpp 的 residency 代码是**被移植**的，
+所以它的归属声明是硬义务；这里不是。）
 
 ### 这份清单是怎么核出来的
 
