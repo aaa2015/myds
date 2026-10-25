@@ -43,12 +43,21 @@ static inline bool read_f32(reader_t *r, float *v) {
 static char *read_string(reader_t *r) {
     uint64_t len = 0;
     if (!read_u64(r, &len)) return NULL;
-    if (r->pos + len > r->size) return NULL;
-    char *s = (char *)malloc(len + 1);
+    /* 2026-10-25: 三处都要查，缺一不可。
+     *   ① 剩余空间：用减法形式，`r->pos + len` 会回绕。
+     *      len=UINT64_MAX 时 pos+len 回绕成 31，旧写法通过 ⇒ 下一步崩。
+     *   ② len+1 回绕：len=UINT64_MAX 时 malloc(len+1) 等价于 malloc(0),
+     *      返回一个小块但有效，随后 memcpy 巨量 ⇒ ASan negative-size-param。
+     *   ③ malloc 上限：len 合法但巨大时不要让 malloc 直接失败。
+     * ★ 这个函数不经过 read_bytes()，所以那边修了这里依然会崩——
+     *   上一版就是漏了这一点。 */
+    if (len >= r->size || len > r->size - r->pos) return NULL;
+    if (len > (uint64_t)SIZE_MAX - 1) return NULL;
+    char *s = (char *)malloc((size_t)len + 1);
     if (!s) return NULL;
-    memcpy(s, r->data + r->pos, len);
+    memcpy(s, r->data + r->pos, (size_t)len);
     s[len] = '\0';
-    r->pos += len;
+    r->pos += (size_t)len;
     return s;
 }
 
@@ -76,8 +85,13 @@ static bool read_kv_value(reader_t *r, gguf_type type, gguf_kv_t *kv) {
             if (!read_u32(r, &elem_type) || !read_u64(r, &count)) return false;
             kv->value.val_arr.elem_type = (gguf_type)elem_type;
             kv->value.val_arr.count = count;
+            /* 2026-10-25: count 必须能放进 size_t，且与元素尺寸相乘不得回绕。
+             * 否则 `calloc(count, sizeof(char*))` 会得到一个小块，
+             * 而循环里的 count 次写入直接跑出块外。 */
+            if (count > (uint64_t)SIZE_MAX) return false;
             if (elem_type == GGUF_TYPE_STRING) {
-                char **strs = (char **)calloc(count, sizeof(char *));
+                if (count > (uint64_t)SIZE_MAX / sizeof(char *)) return false;
+                char **strs = (char **)calloc((size_t)count, sizeof(char *));
                 if (!strs) return false;
                 for (uint64_t i = 0; i < count; i++) {
                     strs[i] = read_string(r);
@@ -90,16 +104,18 @@ static bool read_kv_value(reader_t *r, gguf_type type, gguf_kv_t *kv) {
                 kv->value.val_arr.data = strs;
                 return true;
             } else if (elem_type == GGUF_TYPE_FLOAT32) {
-                float *arr = (float *)malloc(count * sizeof(float));
-                if (!arr || !read_bytes(r, arr, count * sizeof(float))) {
+                if (count > (uint64_t)SIZE_MAX / sizeof(float)) return false;
+                float *arr = (float *)malloc((size_t)count * sizeof(float));
+                if (!arr || !read_bytes(r, arr, (size_t)count * sizeof(float))) {
                     free(arr);
                     return false;
                 }
                 kv->value.val_arr.data = arr;
                 return true;
             } else if (elem_type == GGUF_TYPE_INT32) {
-                int32_t *arr = (int32_t *)malloc(count * sizeof(int32_t));
-                if (!arr || !read_bytes(r, arr, count * sizeof(int32_t))) {
+                if (count > (uint64_t)SIZE_MAX / sizeof(int32_t)) return false;
+                int32_t *arr = (int32_t *)malloc((size_t)count * sizeof(int32_t));
+                if (!arr || !read_bytes(r, arr, (size_t)count * sizeof(int32_t))) {
                     free(arr);
                     return false;
                 }
@@ -122,8 +138,8 @@ static bool read_kv_value(reader_t *r, gguf_type type, gguf_kv_t *kv) {
                     case GGUF_TYPE_FLOAT64: elem_sz = 8; break;
                     default: return false;
                 }
-                void *buf = malloc(count * elem_sz);
-                if (!buf || !read_bytes(r, buf, count * elem_sz)) {
+                void *buf = malloc((size_t)count * elem_sz);
+                if (!buf || !read_bytes(r, buf, (size_t)count * elem_sz)) {
                     free(buf);
                     return false;
                 }
@@ -150,6 +166,40 @@ size_t ggml_type_row_size(ggml_type type, size_t row_len) {
         case GGML_TYPE_IQ2_XXS: return (row_len / 256) * 66;
         case GGML_TYPE_MXFP4: return (row_len / 32) * 17;
         default:              return row_len * 2; /* fallback */
+    }
+}
+
+bool ggml_type_row_size_checked(ggml_type type, size_t row_len, size_t *out) {
+    if (!out) return false;
+    /* 2026-10-25: 非分块类型是直接乘法，元素数极大时会回绕。
+     * 例：F32 且 row_len = 2^62 ⇒ 2^62*4 = 0 ⇒ size_bytes=0，
+     * 边界检查全部通过，但其实指向一个巨大张量。
+     * 分块类型（Q*_K / Q8_0 等）先除以块长，不会回绕，直接放行。 */
+    switch (type) {
+        case GGML_TYPE_F32:
+            if (row_len > SIZE_MAX / sizeof(float)) return false;
+            *out = row_len * sizeof(float);
+            return true;
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
+            if (row_len > SIZE_MAX / sizeof(uint16_t)) return false;
+            *out = row_len * sizeof(uint16_t);
+            return true;
+        case GGML_TYPE_I8:
+            *out = row_len;
+            return true;
+        case GGML_TYPE_Q8_0:
+            if (row_len / 32u > SIZE_MAX / (sizeof(uint16_t) + 32u)) return false;
+            *out = (row_len / 32u) * (sizeof(uint16_t) + 32u);
+            return true;
+        case GGML_TYPE_Q4_0:
+            if (row_len / 32u > SIZE_MAX / (sizeof(uint16_t) + 16u)) return false;
+            *out = (row_len / 32u) * (sizeof(uint16_t) + 16u);
+            return true;
+        default:
+            /* 其余类型都是块量化，块长 ≥ 32，不会回绕 */
+            *out = ggml_type_row_size(type, row_len);
+            return true;
     }
 }
 
@@ -227,6 +277,7 @@ gguf_file_t *gguf_open(const char *path) {
     gf->fd = fd;
     gf->mmap_addr = addr;
     gf->mmap_size = mmap_size;
+    gf->file_size = size;      /* 2026-10-25: 真实长度，边界校验用它而非 mmap_size */
     gf->version = version;
     gf->tensor_count = tensor_count;
     gf->metadata_kv_count = kv_count;
@@ -235,6 +286,15 @@ gguf_file_t *gguf_open(const char *path) {
 
     for (uint64_t i = 0; i < kv_count; i++) {
         gf->kvs[i].key = read_string(&r);
+        /* 2026-10-25: key 必须检查 NULL。read_string 现在会因长度越界/溢出
+         * 返回 NULL，而下一行的 strcmp 会直接解引用它。
+         * 旧版之所以没暴露，是因为它根本不返回 NULL（直接崩在 memcpy 里）。 */
+        if (!gf->kvs[i].key) {
+            fprintf(stderr, "gguf_open: failed reading metadata key %llu\n",
+                    (unsigned long long)i);
+            gguf_close(gf);
+            return NULL;
+        }
         uint32_t type = 0;
         if (!read_u32(&r, &type) || !read_kv_value(&r, (gguf_type)type, &gf->kvs[i])) {
             fprintf(stderr, "gguf_open: failed reading metadata kv %llu\n", (unsigned long long)i);
@@ -298,20 +358,36 @@ gguf_file_t *gguf_open(const char *path) {
     if (align == 0) align = 1;   /* 防御：上面的解析已拦住 0，这里再兜一层 */
     gf->tensor_data_offset = (r.pos + align - 1) / align * align;
 
-    /* 2026-10-25: tensor 数据区必须落在映射范围内。
-     * 原实现只算 data = mmap_addr + abs_offset 就返回，不做任何边界检查，
-     * 于是任何被篡改/截断的 GGUF 都会让后续读取越界 —— 公开仓库会迎来 fuzz 输入，
-     * 崩在 mmap 外是确定会发生的。 */
-    if (gf->tensor_data_offset > gf->mmap_size) {
-        fprintf(stderr, "gguf_open: tensor data offset %llu beyond mapped size %zu\n",
-                (unsigned long long)gf->tensor_data_offset, gf->mmap_size);
+    /* 2026-10-25（第二版）：边界一律以【st_size】为准，不能用 mmap_size。
+     * mmap 是按页取整的，一个 57 字节的垃圾文件 mmap_size 是 16384，
+     * 拿它校验等于把整个页都当成合法数据 —— 上一版就漏在这里。
+     * 另：先查相对 offset 本身，再做加法，避免 abs_offset 回绕成 0。 */
+    if (gf->tensor_data_offset > gf->file_size && tensor_count > 0) {
+        fprintf(stderr, "gguf_open: tensor data offset %llu beyond file size %zu\n",
+                (unsigned long long)gf->tensor_data_offset, gf->file_size);
         gguf_close(gf);
         return NULL;
     }
-    const size_t data_avail = gf->mmap_size - gf->tensor_data_offset;
+    /* ★ tensor_count == 0 时允许对齐填充越过 EOF：tokenizer-only 的 GGUF
+     *   本来就没有数据区，而对齐会把偏移推到文件尾之后。这不是损坏。 */
+    const size_t data_avail = (gf->tensor_data_offset <= gf->file_size)
+                              ? (size_t)(gf->file_size - (size_t)gf->tensor_data_offset)
+                              : 0u;
 
     for (uint64_t i = 0; i < tensor_count; i++) {
-        const size_t abs_offset = gf->tensor_data_offset + gf->tensors[i].offset;
+        /* 先查相对 offset，再算绝对位置。
+         * 直接写 `tensor_data_offset + offset` 在 offset 极大时会回绕成 0，
+         * 于是张量指针指到文件头，边界检查也全部失效。 */
+        if (gf->tensors[i].offset > (uint64_t)data_avail) {
+            fprintf(stderr,
+                    "gguf_open: tensor %s offset %llu beyond data region (%zu bytes)\n",
+                    gf->tensors[i].name,
+                    (unsigned long long)gf->tensors[i].offset, data_avail);
+            gguf_close(gf);
+            return NULL;
+        }
+        const size_t rel_offset = (size_t)gf->tensors[i].offset;
+        const size_t abs_offset = (size_t)gf->tensor_data_offset + rel_offset;
 
         /* 元素数乘法溢出检查 + 类型合法性 */
         size_t n_elements = 1;
@@ -326,19 +402,26 @@ gguf_file_t *gguf_open(const char *path) {
             n_elements *= (size_t)dim;
         }
 
-        const size_t row = ggml_type_row_size(gf->tensors[i].type, n_elements);
-        gf->tensors[i].size_bytes = row;
-
-        /* 区间必须在映射内：offset 相对数据区，长度不能超过剩余空间 */
-        if (abs_offset > gf->mmap_size || row > gf->mmap_size - abs_offset) {
-            fprintf(stderr,
-                    "gguf_open: tensor %s out of bounds (offset=%zu size=%zu, mapped=%zu)\n",
-                    gf->tensors[i].name,
-                    (size_t)abs_offset, row, gf->mmap_size);
+        size_t row = 0;
+        if (!ggml_type_row_size_checked(gf->tensors[i].type, n_elements, &row)) {
+            fprintf(stderr, "gguf_open: tensor %s byte size overflows size_t\n",
+                    gf->tensors[i].name);
             gguf_close(gf);
             return NULL;
         }
-        (void)data_avail;
+        gf->tensors[i].size_bytes = row;
+
+        /* 区间必须在【真实文件】内。已排除 abs_offset 回绕，
+         * 但 row 本身也可能因元素数×类型字节数回绕成小值，
+         * 所以还要确认 row 不为 0 时确实落在剩余空间内。 */
+        if (row > (size_t)data_avail - rel_offset) {
+            fprintf(stderr,
+                    "gguf_open: tensor %s out of bounds (offset=%zu size=%zu, data region=%zu)\n",
+                    gf->tensors[i].name, rel_offset, row, data_avail);
+            gguf_close(gf);
+            return NULL;
+        }
+        (void)abs_offset;
         gf->tensors[i].data = (const void *)(gf->mmap_addr + abs_offset);
     }
 

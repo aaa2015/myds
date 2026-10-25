@@ -4343,7 +4343,18 @@ int myds_server_start(myds_context_t *ctx, const char *host, int port, const cha
     if (!host || strcmp(host, "0.0.0.0") == 0 || strlen(host) == 0) {
         addr.sin_addr.s_addr = INADDR_ANY;
     } else {
-        inet_pton(AF_INET, host, &addr.sin_addr);
+        /* 2026-10-25: 必须检查返回值。inet_pton 失败时返回 0 且【不修改】目标，
+         * 而 addr 刚被 memset 清零 ⇒ sin_addr 保持 0 = INADDR_ANY = 0.0.0.0。
+         * 于是 `--host localhost`（不是点分十进制）会默默监听全部接口，
+         * 而日志依旧打印 localhost —— 这是静默提权，比默认值问题严重得多。
+         * 这里只接受 IPv4 点分十进制；主机名请用 --host 0.0.0.0 显式表达意图。 */
+        if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+            MYDS_LOG_E("拒绝启动：无法解析 --host '%s'。只接受 IPv4 点分十进制地址"
+                       "（如 127.0.0.1 / 0.0.0.0）；主机名请直接写目标地址。", host);
+            close(g_server_fd);
+            g_server_fd = -1;
+            return 1;
+        }
     }
 
     if (bind(g_server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {

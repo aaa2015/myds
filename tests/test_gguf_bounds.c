@@ -23,8 +23,17 @@
 
 static int failures;
 
-#define CHECK(x) do { if (!(x)) { \
-    fprintf(stderr, "FAIL %s:%d %s\n", __FILE__, __LINE__, #x); return 0; } } while (0)
+/* 2026-10-25: CHECK 在 main 里直接 `return 0`，而 main 的成功返回值也是 0
+ * ⇒ 断言失败时进程仍然以 0 退出，CI 会把失败当通过。已实测：与未修复的解析器
+ * 链接时它确实打印了 FAIL，但退出码是 0。
+ *
+ * 现在统一走 tests_failed()：打印后 exit(1)。helper 函数里的 CHECK 也一样。 */
+static void tests_failed(const char *file, int line, const char *expr) {
+    fprintf(stderr, "FAIL %s:%d %s\n", file, line, expr);
+    exit(1);
+}
+
+#define CHECK(x) do { if (!(x)) tests_failed(__FILE__, __LINE__, #x); } while (0)
 
 /* ── 最小 GGUF 构造器 ── */
 typedef struct {
@@ -78,14 +87,17 @@ static int write_tmp(builder *b, const char *path) {
     return 1;
 }
 
-/* 期望 gguf_open 失败；若它返回非 NULL 则说明防护缺失 */
+/* 期望 gguf_open 失败；若它返回非 NULL 则说明防护缺失。
+ * 失败时直接 exit(1)（经 CHECK），不再靠 main 的返回值——那是上一版的缺陷。 */
 static int expect_reject(const char *label, builder *b) {
     const char *path = "/tmp/test_gguf_bounds.gguf";
-    if (!write_tmp(b, path)) { fprintf(stderr, "  cannot write %s\n", path); return 0; }
+    if (!write_tmp(b, path)) {
+        fprintf(stderr, "  cannot write %s\n", path);
+        return 0;
+    }
     gguf_file_t *gf = gguf_open(path);
     const int ok = (gf == NULL);
     if (gf) {
-        /* 不该成功；但仍要安全关闭 */
         gguf_close(gf);
         fprintf(stderr, "  ✗ %s: gguf_open 接受了畸形文件\n", label);
         failures++;
@@ -140,9 +152,10 @@ int main(void) {
     b.len += tail_pad;
     CHECK(expect_reject("维度乘积溢出", &b));
 
-    /* case 5: kv 字符串长度超过文件（read_bytes 溢出门径）
-     * 注意：builder 的缓冲区是固定的 4096 字节，不能用一个巨大的长度值去
-     * 触发 write，所以这里手工写一个短文件，只放 header + 一个荒谬的 key 长度。 */
+    /* case 5: kv 字符串长度超过文件（read_string 没有经过 read_bytes）
+     * 报告里复现的具体形状：len = 2^64-1 ⇒ len+1 回绕成 0，
+     * malloc(0) 返回有效小块，随后 memcpy 已为负大小 ⇒ ASan negative-size-param。
+     * 旧实现下本用例应触发 ASan 或崩溃。 */
     {
         builder tiny;
         memset(&tiny, 0, sizeof(tiny));
@@ -151,8 +164,41 @@ int main(void) {
         put_u32(&tiny, 3);
         put_u64(&tiny, 0);                      /* n_tensors */
         put_u64(&tiny, 1);                      /* n_kv */
-        put_u64(&tiny, (uint64_t)1 << 40);      /* 声称的 key 长度远超文件 */
-        CHECK(expect_reject("kv 长度字段越界", &tiny));
+        put_u64(&tiny, UINT64_MAX);             /* len = 2^64-1 */
+        CHECK(expect_reject("kv 长度 = UINT64_MAX（len+1 回绕）", &tiny));
+    }
+
+    /* case 6: 只有 header、完全没有 tensor payload。
+     * mmap_size 是按页取整的，拿它校验会把这个垃圾文件当成合法。 */
+    {
+        builder hdr;
+        memset(&hdr, 0, sizeof(hdr));
+        hdr.len = 0;
+        put(&hdr, "GGUF", 4);
+        put_u32(&hdr, 3);
+        put_u64(&hdr, 1);                       /* 1 个张量 */
+        put_u64(&hdr, 0);                       /* 0 个 kv */
+        tensor_desc(&hdr, "t", 8, 0, 0);       /* 声明 8 个 F32 = 32 字节 */
+        /* 不追加任何 payload，文件结束 */
+        CHECK(expect_reject("无 tensor payload", &hdr));
+    }
+
+    /* case 7: 张量 offset 极大，与数据区起点相加回绕。
+     * 旧实现下 data 指针会指到文件头。 */
+    {
+        gguf_header(&b, 1, 0);
+        tensor_desc(&b, "wrap", 8, 0, (UINT64_MAX - 16384 + 1));
+        b.len += 64;
+        CHECK(expect_reject("offset 加法回绕", &b));
+    }
+
+    /* case 8: F32 元素数 = 2^62，乘 4 回绕成 0 字节。
+     * 旧实现返回 size_bytes=0，边界检查全部通过。 */
+    {
+        gguf_header(&b, 1, 0);
+        tensor_desc(&b, "f32huge", ((uint64_t)1 << 62), 0 /* F32 */, 0);
+        b.len += 64;
+        CHECK(expect_reject("F32 元素数×4 回绕", &b));
     }
 
     printf("\n%s\n", failures ? "存在未拦截的用例" : "全部边界防护生效");

@@ -392,8 +392,15 @@ make bench
 `myds` 内置 POSIX HTTP 服务端。只有模型加载通过后才会启动监听：
 
 ```bash
-./bin/myds -m /path/to/deepseek.gguf --port 8080 --host 0.0.0.0 --alias myds
+# 默认只监听 127.0.0.1（服务端没有鉴权）。
+./bin/myds -m /path/to/deepseek.gguf --port 8080 --alias myds
+
+# 要对外提供服务，必须显式指定 --host，并在前面放一层带鉴权的反代：
+# ./bin/myds -m ... --port 8080 --host 0.0.0.0 --alias myds
 ```
+
+> ⚠️ `--host` 只接受 IPv4 点分十进制地址（`127.0.0.1` / `0.0.0.0` / 具体网卡 IP）。
+> 传主机名（如 `localhost`）会**拒绝启动**——旧版会默默退回监听全部接口。
 
 支持的标准端点：
 - `GET /health`：服务健康检查
@@ -411,7 +418,7 @@ Usage:
 Options:
   -m, --model <path>      Path to DeepSeek GGUF model (required)
   --port <port>           Run HTTP server on specified port
-  --host <host>           Host to listen on (default: 0.0.0.0)
+  --host <host>           Host to listen on (default: 127.0.0.1; no auth, use a proxied 0.0.0.0 only)
   --alias <name>          Model alias for API responses (default: myds)
   -p, --prompt <string>   Prompt string (if omitted and no --port, starts interactive chat)
   -n, --max-tokens <int>  Max tokens to generate (default: 256)

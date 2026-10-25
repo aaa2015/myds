@@ -119,7 +119,15 @@ METALLIB = $(BIN_DIR)/myds.metallib
 METAL_SRCS = $(wildcard metal/*.metal)
 
 ALL_TESTS = $(TEST_METAL) $(TEST_V41_GPU) $(TEST_ATTN_POLICY) $(TEST_ATTN_VEC) $(TEST_QKV_FUSION) $(TEST_DECODE_Q8) $(TEST_MOE_DOWN_NSG) $(TEST_DEEPER_SSD) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE) $(TEST_CPU) $(TEST_ENGRAM) $(TEST_ALIGN) $(TEST_PLD) $(TEST_KVDSK) $(TEST_P1) $(TEST_DSPARK_ROLLBACK) $(TEST_DSPARK_CAPTURE) $(TEST_DSPARK_ROUTER) $(TEST_V41_ROUTER) $(TEST_BATCH2_SHARED_PAIR) $(TEST_DSPARK_ATTN) $(TEST_DSPARK_MOE) $(TEST_DSPARK_PROPOSAL) $(TEST_BATCH2_PARITY) $(TEST_BATCH2_E2E) $(TEST_Q4_BF16_PARITY) $(TEST_TREE_SPEC) $(TEST_ENGINE_DEPTH2)
-ALL_TESTS += $(TEST_METAL_RESIDENCY) $(TEST_TEARDOWN_ORDER) $(TEST_DECODE_SPLIT) $(TEST_KVDSK_FIFO) $(TEST_ANCHOR_SLOTS) $(TEST_YOCO_COMPACT) $(TEST_INDEXER_WINDOW)
+# 畸形 GGUF 边界防护（2026-10-25）。只链接 gguf 层，不需要 GPU。
+# ★ 必须在 ALL_TESTS 被 all:/test: 引用【之前】定义并追加：
+#   Make 的先决条件在读取时就展开，晚于 all:/test: 的 += 不会进入那两个目标。
+TEST_GGUF_BOUNDS = $(BIN_DIR)/test_gguf_bounds
+
+$(TEST_GGUF_BOUNDS): tests/test_gguf_bounds.c $(BUILD_DIR)/myds_gguf.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) -Iinclude -o $@ $< $(BUILD_DIR)/myds_gguf.o $(LDFLAGS)
+
+ALL_TESTS += $(TEST_METAL_RESIDENCY) $(TEST_TEARDOWN_ORDER) $(TEST_DECODE_SPLIT) $(TEST_KVDSK_FIFO) $(TEST_ANCHOR_SLOTS) $(TEST_YOCO_COMPACT) $(TEST_INDEXER_WINDOW) $(TEST_GGUF_BOUNDS)
 
 .PHONY: all test clean bench metallib build-tail-init test-tail-init
 
@@ -710,7 +718,17 @@ test: $(ALL_TESTS) $(METALLIB)
 	@python3 tests/test_engram_io_window.py
 	@echo "  (skipped: test-full-model-summary.py moved to the separate documentation repository)"
 	@python3 tests/test_v41_engram_tool.py
-	@python3 tests/test_slim_dense.py
+	@# 2026-10-25: slim_dense 需要外部库 libds4quants（不随源码发布）。
+	@# 缺库时整套测试会失败，而新用户 clone 下来必然缺 —— 那不是他们的错。
+	@# 这里先探测：有库就真跑，没库就明确 SKIP（退出码 0，但打印原因）。
+	@if ls ../ds4/gguf-tools/libds4quants.* ../../ds4/gguf-tools/libds4quants.* \
+	       $$HOME/Projects/ds4/gguf-tools/libds4quants.* 2>/dev/null | head -1 | grep -q . \
+	    || [ -n "$$MYDS_QUANTS_LIB" ]; then \
+	    python3 tests/test_slim_dense.py; \
+	else \
+	    echo "  SKIP tests/test_slim_dense.py (需要外部库 libds4quants，未找到；"; \
+	    echo "       参见 README「一个不属于本仓库的运行时依赖」，或用 --quants-lib 指定)"; \
+	fi
 	@echo ""
 	@./$(TEST_YOCO_COMPACT)
 	@./$(TEST_INDEXER_WINDOW)
@@ -752,10 +770,3 @@ $(BIN_DIR)/bench_moe_down_overlap: tools/bench_moe_down_overlap.m $(BUILD_DIR)/m
 	$(CC) $(OBJCFLAGS) $< $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
 .PHONY: build-decode-next-candidates
 build-decode-next-candidates: $(BIN_DIR)/bench_iq2_v41 $(BIN_DIR)/bench_q4_v41 $(BIN_DIR)/bench_moe_down_overlap
-
-# 畸形 GGUF 边界防护（2026-10-25）。只链接 gguf 层，不需要 GPU。
-TEST_GGUF_BOUNDS = $(BIN_DIR)/test_gguf_bounds
-ALL_TESTS += $(TEST_GGUF_BOUNDS)
-
-$(TEST_GGUF_BOUNDS): tests/test_gguf_bounds.c $(BUILD_DIR)/myds_gguf.o | $(BIN_DIR)
-	$(CC) $(CFLAGS) -Iinclude -o $@ $< $(BUILD_DIR)/myds_gguf.o $(LDFLAGS)

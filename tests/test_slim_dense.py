@@ -412,30 +412,29 @@ class SlimDenseTests(unittest.TestCase):
         journal_path = self.dst_path + ".journal.json"
         os.rename(self.dst_path, partial_path)
 
+        # 用与工具一致的解析器算出 header 长度，别手写一遍（容易漏字段）
+        hdr_end, nt_hdr, _align = self._gguf_header_geometry(self.src_path)
+        # 输出 header 与输入等长（工具断言过），从 partial 里可以直接解析确认
+        partial_hdr_len, _, _ = self._gguf_header_geometry(partial_path)
+        assert partial_hdr_len == hdr_end, f"header 长度不一致: src={hdr_end} out={partial_hdr_len}"
         with open(self.src_path, "rb") as f:
-            # Read header up to data_start
-            f.seek(0)
-            f.read(4)
-            _, nt, nk = struct.unpack("<IQQ", f.read(20))
-            def rs():
-                l = struct.unpack("<Q", f.read(8))[0]
-                return f.read(l)
-            for _ in range(nk):
-                rs()
-                vt = struct.unpack("<I", f.read(4))[0]
-                if vt == 4: f.seek(4, os.SEEK_CUR)
-                elif vt == 8: rs()
-            for _ in range(nt):
-                rs()
-                nd = struct.unpack("<I", f.read(4))[0]
-                f.seek(8 * nd + 12, os.SEEK_CUR)
-            hdr_end = f.tell()
-            f.seek(0)
             hdr_sha = hashlib.sha256(f.read(hdr_end)).hexdigest()
 
         # Load quants library to get sha
         from tools.slim_dense_q4 import load_quants_library
         _, _, lib_sha = load_quants_library(None)
+
+        # 2026-10-25: journal 现在要求 source_identity、partial_header_sha256、
+        # completed_data_sha256/bytes —— 否则 resume 无法发现 partial 内容被改，
+        # 只能靠文件大小，而那是不够的（见工具里的长注释）。
+        # 这里按新契约写一份完整 journal。
+        st = os.stat(self.src_path)
+        partial_size = os.path.getsize(partial_path)
+        with open(partial_path, "rb") as pf:
+            full = pf.read()
+        # 输出 header 与输入 header 等长（工具断言 len(out_header) == in_header_end），
+        # 内容不同（offset 重算过），所以直接从 partial 里取等长前缀。
+        partial_header = full[:hdr_end]
 
         with open(journal_path, "w") as jf:
             json.dump({
@@ -443,6 +442,16 @@ class SlimDenseTests(unittest.TestCase):
                 "tensor_name": "blk.0.attn_output_a.weight",
                 "source_header_sha256": hdr_sha,
                 "source_size": os.path.getsize(self.src_path),
+                "source_identity": {
+                    "size": st.st_size,
+                    "mtime_ns": st.st_mtime_ns,
+                    "dev": st.st_dev,
+                    "ino": st.st_ino,
+                },
+                "partial_header_sha256": hashlib.sha256(partial_header).hexdigest(),
+                "out_header_bytes": hdr_end,
+                "completed_data_sha256": hashlib.sha256(full[:partial_size]).hexdigest(),
+                "completed_data_bytes": partial_size,
                 "n_tensors": 3,
                 "quants_lib_sha256": lib_sha,
                 "alignment": GGUF_ALIGNMENT,
@@ -455,6 +464,95 @@ class SlimDenseTests(unittest.TestCase):
         self.assertIn("All 3 tensors already completed. Finalizing output file", res.stdout)
         self.assertTrue(os.path.exists(self.dst_path))
         self.assertFalse(os.path.exists(journal_path))
+
+    def test_resume_rejects_old_format_journal(self):
+        """2026-10-25：缺 source_identity 的旧 journal 必须拒绝，而不是警告后继续。
+
+        旧版只比大小，于是“上一轮第一张量 + 新一轮第二张量”的拼接体能被发布。
+        """
+        journal_path = self.dst_path + ".journal.json"
+        partial_path = self.dst_path + ".partial"
+        with open(partial_path, "wb") as f:
+            f.write(b"\0" * 4096)
+        hdr_len, nt, _al = self._gguf_header_geometry(self.src_path)
+        with open(self.src_path, "rb") as f:
+            real_hdr_sha = hashlib.sha256(f.read(hdr_len)).hexdigest()
+        with open(journal_path, "w") as jf:
+            json.dump({
+                "completed_tensor_idx": 1,
+                "source_header_sha256": real_hdr_sha,
+                "source_size": os.path.getsize(self.src_path),
+                "n_tensors": nt,
+                "alignment": GGUF_ALIGNMENT,
+            }, jf)
+        cmd = [sys.executable, "tools/slim_dense_q4.py", "--in", self.src_path,
+               "--out", self.dst_path, "--resume"]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0, "旧格式 journal 必须拒绝")
+        # 必须是被 identity 检查拒的（而不是撞上 header 不符的旧检查）——否则是空转
+        self.assertIn("source_identity", res.stderr,
+                      f"不是被 identity 检查拒绝的（测试空转了）: {res.stderr}")
+
+    def test_resume_rejects_corrupted_partial(self):
+        """2026-10-25：partial 内容被改（大小不变）必须拒绝。
+
+        覆盖报告的两种复现：
+          ① 改已完成区段的内容
+          ② 把 partial 头改成 BAD!
+        """
+        # 先完整跑一次得到合法产物
+        cmd = [sys.executable, "tools/slim_dense_q4.py", "--in", self.src_path,
+               "--out", self.dst_path, "--threads", "2"]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+        partial_path = self.dst_path + ".partial"
+        journal_path = self.dst_path + ".journal.json"
+        os.rename(self.dst_path, partial_path)
+
+        st = os.stat(self.src_path)
+        hdr_len, nt, align_out = self._gguf_header_geometry(self.src_path)
+        with open(self.src_path, "rb") as f:
+            real_src_hdr_sha = hashlib.sha256(f.read(hdr_len)).hexdigest()
+        with open(partial_path, "rb") as pf:
+            full = pf.read()
+        good_journal = {
+            "completed_tensor_idx": nt,
+            "source_header_sha256": real_src_hdr_sha,
+            "source_size": st.st_size,
+            "source_identity": {"size": st.st_size, "mtime_ns": st.st_mtime_ns,
+                                 "dev": st.st_dev, "ino": st.st_ino},
+            "partial_header_sha256": hashlib.sha256(full[:hdr_len]).hexdigest(),
+            "out_header_bytes": hdr_len,
+            "completed_data_sha256": hashlib.sha256(full).hexdigest(),
+            "completed_data_bytes": len(full),
+            "n_tensors": nt,
+            "alignment": align_out,
+            "quants_lib_path": "",
+            "quants_lib_sha256": None,
+        }
+
+        # ① 改头部
+        corrupted = bytearray(full)
+        corrupted[0:4] = b"BAD!"
+        with open(partial_path, "wb") as f:
+            f.write(corrupted)
+        with open(journal_path, "w") as jf:
+            json.dump(good_journal, jf)
+        res = subprocess.run([sys.executable, "tools/slim_dense_q4.py", "--in", self.src_path,
+                              "--out", self.dst_path, "--resume"], capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0, "partial 头被改必须拒绝")
+
+        # ② 改中间某字节（头部完好）
+        corrupted = bytearray(full)
+        corrupted[-1] ^= 0xFF
+        with open(partial_path, "wb") as f:
+            f.write(corrupted)
+        with open(journal_path, "w") as jf:
+            json.dump(good_journal, jf)
+        res = subprocess.run([sys.executable, "tools/slim_dense_q4.py", "--in", self.src_path,
+                              "--out", self.dst_path, "--resume"], capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0, "partial 内容被改必须拒绝")
 
     def test_zero_target_dry_run(self):
         # F8: zero targets in dry-run should not divide by zero

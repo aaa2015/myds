@@ -104,7 +104,8 @@ typedef struct {
 typedef struct {
     int            fd;
     uint8_t       *mmap_addr;
-    size_t         mmap_size;
+    size_t         mmap_size;      /* 按页取整后的映射长度，【不是】文件长度 */
+    size_t         file_size;      /* st_size：真实文件长度，所有边界校验用这个 */
     uint32_t       version;
     uint64_t       tensor_count;
     uint64_t       metadata_kv_count;
@@ -128,6 +129,9 @@ const char  *gguf_get_str(const gguf_file_t *f, const char *key, const char *def
 bool         gguf_get_bool(const gguf_file_t *f, const char *key, bool def);
 
 size_t       ggml_type_row_size(ggml_type type, size_t row_len);
+/* 带回绕检查的变体：元素数过大会返回 false，而不是得到一个回绕后的小值。
+ * gguf_open 用这个；其他调用方语义不变。 */
+bool         ggml_type_row_size_checked(ggml_type type, size_t row_len, size_t *out);
 const char  *ggml_type_name(ggml_type type);
 
 #ifdef __cplusplus

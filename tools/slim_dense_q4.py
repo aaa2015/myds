@@ -496,13 +496,18 @@ def main():
                 f"  Current: header_sha={source_header_sha256}, size={in_file_size}, nt={n_tensors}, lib_sha={quants_lib_sha256}, align={alignment}"
             )
 
-        # 源文件内容身份（2026-10-25）。旧 journal 没有这个字段，
-        # 那种情况下的 resume 继续走上面的 header 检查——但会明确告知。
+        # 源文件内容身份（2026-10-25）。
+        # ★ 旧 journal 没有这些字段，而旧的检查只能证明“header 一样”。
+        #   报告里已复现：用旧 journal 可以把「上一轮第一张量 + 新一轮第二张量」
+        #   拼成一个文件而不报错。继续跑就是发布一个未被校验的产物，所以直接拒。
         saved_ident = journal_data.get("source_identity")
         if saved_ident is None:
-            print("[RESUME] ⚠ journal 没有 source_identity 字段（旧版本生成）；"
-                  "本次 resume 仅校验 header/大小/张量数，不校验文件内容。")
-        else:
+            sys.exit(
+                "Error: Resume rejected! 该 journal 由旧版本生成，缺少 source_identity，\n"
+                "  无法确认 partial 里的已完成张量来自当前这个源文件。\n"
+                "  请删除 .partial 与 .journal.json 后重新转换。"
+            )
+        if True:
             changed = []
             for key, label in (("size", "文件大小"),
                                ("mtime_ns", "修改时间"),
@@ -522,7 +527,68 @@ def main():
         if not (0 <= start_idx <= n_tensors):
             sys.exit(f"Error: Invalid completed_tensor_idx {start_idx} in journal (total tensors: {n_tensors})")
 
+        # 2026-10-25: partial 完整性。
+        #
+        # 旧实现只比较文件大小。于是两个真实可行的破坏都能通过：
+        #   ① 改动已完成区段的内容（大小不变）⇒ 损坏数据被当成产出发布
+        #   ② 把 partial 的头改成 BAD!（大小不变）⇒ 仍被重命名为正式输出
+        # 两者都不需要任何特殊权限，只要这份文件在磁盘上就够了。
+        #
+        # 做法：journal 里存下已写入区段的 sha256 与输出 header 的 sha256，
+        # resume 时重算并比对。读一遍 partial 比“发布一个悄悄损坏的模型”便宜得多。
         partial_size = os.path.getsize(partial_path)
+        # 必须用 journal 记录的长度：resume 分支在 out_header 构建之前就跑了，
+        # 这里拿不到本次算出的 header 长度（旧版回落到 len(out_header) 是错的）。
+        _hdr_len = journal_data.get("out_header_bytes")
+        if not isinstance(_hdr_len, int) or _hdr_len <= 0:
+            sys.exit(
+                "Error: Resume rejected! journal 缺少 out_header_bytes，"
+                "无法定位 partial 的输出 header。\n"
+                "  请删除 .partial 与 .journal.json 后重新转换。"
+            )
+        with open(partial_path, "rb") as pf:
+            partial_head = pf.read(_hdr_len)
+        saved_head_sha = journal_data.get("partial_header_sha256")
+        if saved_head_sha is None:
+            sys.exit(
+                "Error: Resume rejected! 该 journal 由旧版本生成，没有 partial_header_sha256。\n"
+                "  旧版本只校验文件大小，无法发现 partial 内容被改动。\n"
+                "  请删除 .partial 与 .journal.json 后重新转换（宁可重跑，不发布未经校验的输出）。"
+            )
+        if hashlib.sha256(partial_head).hexdigest() != saved_head_sha:
+            sys.exit(
+                f"Error: Resume rejected! partial 的输出 header 与 journal 记录不一致。\n"
+                f"  文件可能被改动过，或与当前参数不匹配。\n"
+                f"  请删除 {partial_path} 与 {journal_path} 后重新转换。"
+            )
+
+        # 已完成区段的完整性：单独存一份滚动 sha（仅覆盖已写字节）
+        saved_data_sha = journal_data.get("completed_data_sha256")
+        saved_data_len = journal_data.get("completed_data_bytes")
+        if saved_data_sha is None or saved_data_len is None:
+            sys.exit(
+                "Error: Resume rejected! journal 缺少 completed_data_sha256/completed_data_bytes。\n"
+                "  请删除 .partial 与 .journal.json 后重新转换。"
+            )
+        if saved_data_len > partial_size:
+            sys.exit(f"Error: Resume rejected! journal 声称已完成 {saved_data_len} 字节，"
+                     f"但 partial 只有 {partial_size} 字节。")
+        h = hashlib.sha256()
+        remaining = saved_data_len
+        with open(partial_path, "rb") as pf:
+            while remaining > 0:
+                chunk = pf.read(min(1 << 20, remaining))
+                if not chunk:
+                    break
+                h.update(chunk)
+                remaining -= len(chunk)
+        if remaining != 0 or h.hexdigest() != saved_data_sha:
+            sys.exit(
+                f"Error: Resume rejected! partial 已完成区段的内容与 journal 记录不一致。\n"
+                f"  已完成的张量可能被改动，继续只会把损坏数据发布出去。\n"
+                f"  请删除 {partial_path} 与 {journal_path} 后重新转换。"
+            )
+
         if start_idx == n_tensors:
             if partial_size != total_out_size:
                 sys.exit(f"Error: All tensors completed in journal, but partial file size ({partial_size}) != expected ({total_out_size})")
@@ -617,6 +683,22 @@ def main():
                 fout.flush()
                 os.fsync(fout.fileno())
 
+                # 2026-10-25: 记录「已写入区段」的滚动 sha 与长度，
+                # 供 resume 时验证 partial 未被篡改（仅比大小是不够的，见 resume 分支）。
+                completed_bytes = fout.tell()
+                h = hashlib.sha256()
+                fout.seek(0)
+                left = completed_bytes
+                while left > 0:
+                    chunk = fout.read(min(1 << 20, left))
+                    if not chunk:
+                        break
+                    h.update(chunk)
+                    left -= len(chunk)
+                fout.seek(completed_bytes)
+                completed_data_sha = h.hexdigest()
+                partial_header_sha = hashlib.sha256(out_header).hexdigest()
+
                 # Write journal atomically
                 write_atomic_journal(journal_path, {
                     "completed_tensor_idx": i + 1,
@@ -624,6 +706,10 @@ def main():
                     "source_header_sha256": source_header_sha256,
                     "source_size": in_file_size,
                     "source_identity": source_identity,
+                    "partial_header_sha256": partial_header_sha,
+                    "out_header_bytes": len(out_header),
+                    "completed_data_sha256": completed_data_sha,
+                    "completed_data_bytes": completed_bytes,
                     "n_tensors": n_tensors,
                     "quants_lib_path": quants_lib_path,
                     "quants_lib_sha256": quants_lib_sha256,
