@@ -252,6 +252,12 @@ static _Atomic uint64_t moe_wh_log[MOE_WH_LOG_BINS];    /* 最小权重的对数
 static const float moe_wh_thr[MOE_WH_THRESH] = {1e-2f, 5e-2f, 1e-1f, 2e-1f};
 static _Atomic uint64_t moe_wh_cnt[MOE_WH_THRESH][7];  /* 低于阈值的槽位数 0..6 */
 static _Atomic uint32_t moe_wh_tokens;
+/* 自洽检查（2026-10-25）：路由权重按定义【每行 6 个之和 ≈ 1.0】。
+ * 如果读到的是交错/错位的 buffer，和会明显偏离 1 —— 那是观测 bug，不是模型特征。
+ * 不先过这一关，后面所有“可跳 N 个槽位”的结论都不可信。 */
+static _Atomic uint64_t moe_wh_row_ok;      /* |sum-1| <= 0.02 */
+static _Atomic uint64_t moe_wh_row_bad;
+static _Atomic uint64_t moe_wh_summilli;    /* sum*1000 累加，用于报均值 */
 
 static int moe_wh_bin(float w) {
     if (!(w > 0.0f)) return 0;
@@ -292,6 +298,14 @@ void myds_v41_moe_weight_hist_observe(myds_metal_buffer_t *weights, uint32_t row
         }
         for (int t = 0; t < MOE_WH_THRESH; t++)
             atomic_fetch_add_explicit(&moe_wh_cnt[t][below[t] > 6u ? 6u : below[t]], 1, memory_order_relaxed);
+        /* 自洽：6 个权重之和应 ≈ 1.0 */
+        {
+            double sum = 0.0;
+            for (uint32_t k = 0; k < top_k; k++) sum += (double)row[k];
+            atomic_fetch_add_explicit(&moe_wh_summilli, (uint64_t)(sum * 1000.0 + 0.5), memory_order_relaxed);
+            if (fabs(sum - 1.0) <= 0.02) atomic_fetch_add_explicit(&moe_wh_row_ok, 1, memory_order_relaxed);
+            else atomic_fetch_add_explicit(&moe_wh_row_bad, 1, memory_order_relaxed);
+        }
         if (isfinite(mn)) {
             atomic_fetch_add_explicit(&moe_wh_min_hist[moe_wh_bin(mn)], 1, memory_order_relaxed);
             atomic_fetch_add_explicit(&moe_wh_log[moe_wh_logbin(mn)], 1, memory_order_relaxed);
@@ -313,6 +327,25 @@ void myds_v41_moe_weight_hist_report(const char *tag, bool reset) {
                        : atomic_load_explicit(&moe_wh_all_hist[i], memory_order_relaxed);
     }
     if (reset) atomic_store_explicit(&moe_wh_tokens, 0, memory_order_relaxed);
+    /* ── 自洽检查必须在所有结论之前：和不为 1 就说明读错 buffer 了 ── */
+    {
+        const uint64_t ok = reset ? atomic_exchange_explicit(&moe_wh_row_ok, 0, memory_order_relaxed)
+                                  : atomic_load_explicit(&moe_wh_row_ok, memory_order_relaxed);
+        const uint64_t bad = reset ? atomic_exchange_explicit(&moe_wh_row_bad, 0, memory_order_relaxed)
+                                   : atomic_load_explicit(&moe_wh_row_bad, memory_order_relaxed);
+        const uint64_t sm = reset ? atomic_exchange_explicit(&moe_wh_summilli, 0, memory_order_relaxed)
+                                  : atomic_load_explicit(&moe_wh_summilli, memory_order_relaxed);
+        const double mean_sum = (ok + bad) ? (double)sm / 1000.0 / (double)(ok + bad) : 0.0;
+        if (bad) {
+            MYDS_LOG_W("[%s] ⚠️ 路由权重和异常：%llu 行中 %llu 行 |sum-1|>0.02（均值 %.4f）"
+                       " ⇒ 观测可能读错 buffer，下面的分布不可信",
+                       tag ? tag : "moe-hist", (unsigned long long)(ok + bad),
+                       (unsigned long long)bad, mean_sum);
+        } else {
+            MYDS_LOG_I("[%s] 自洽检查通过：%llu 行权重和均值 %.4f（全部 |sum-1|<=0.02）",
+                       tag ? tag : "moe-hist", (unsigned long long)ok, mean_sum);
+        }
+    }
     /* ── 第二版：最小权重的对数刻度分布（这才是判据）──
      * 打印 8 个阈值上的累积占比：跳掉最小槽位会让多少 token 少算超过 x 的权重。*/
     {
