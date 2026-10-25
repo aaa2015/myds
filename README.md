@@ -742,3 +742,39 @@ layout 按 replay recipe 从同一 GGUF 提取。QKV 的 stdout 含启动信息�
 日志如何确认生效、哪个单测覆盖它、以及那个单测**不能**证明什么）：
 见 **[docs/ULP_SWITCHES.md](docs/ULP_SWITCHES.md)**。
 
+
+---
+
+## 来源与致谢（Provenance）
+
+这个项目不是一个从零开始的实现。它**明确建立在若干 MIT 项目之上**，其中一部分是
+源码级移植。下表是完整清单，**任何一条都不是"仅供参考"**——除了最后一行。
+
+| 上游 | 许可 | 本仓库如何使用 | 声明位置 |
+|---|---|---|---|
+| **antirez/ds4** | MIT | 派生基础；`src/myds_engram.c`、`src/myds_vispre.c`、`include/myds_vispre.h`、`metal/visenc.metal`、`metal/dsv4_misc.metal` 中的 indexer 打分部分是**忠实移植**（算术次序与常量一字不改，以便逐层对拍） | `LICENSE` + 各文件头注释 |
+| **ggml / llama.cpp** | MIT | 经 ds4 继承的量化布局、CPU 量化/点积逻辑、部分 kernel；另有直接移植：`src/myds_metal.m` 的 residency keep-alive（llama.cpp PR #17766，ggerganov）、residency set 未被引用时的处理（#26082）；`tools/score.c` 的 perplexity 分块协议复刻 | `LICENSE`（同上版权行）+ 代码内注释 |
+| **IRIS**（antirez） | MIT | `third_party/iris/jpeg.h`、`png.h`（IRIS 的 JPEG/PNG 解码器，含 ds4 的解码上限补丁） | `third_party/iris/LICENSE`（独立全文）+ 文件内注释 |
+| **DeepSeek** | 模型许可 | V4/V4.1 架构与 GGUF 张量约定 | `LICENSE` |
+| vLLM / omlx / mlx | — | **仅思路参考**：一份优化规格文档综合了它们的做法，**没有代码复制**，因此不产生署名义务 | commit 描述 |
+
+### 为什么 LICENSE 里没有单独的 "llama.cpp" 行
+
+因为不需要：**llama.cpp 的 LICENSE 首行就是 `Copyright (c) 2023-2026 The ggml authors`**，
+与本仓库 `LICENSE` 中的版权行**逐字相同**（2026-10-25 核对 upstream `LICENSE`）。
+MIT 的义务是随分发附带版权声明与许可文本，这条已经满足。
+
+同理，ds4 的 `LICENSE` 也是这三行（ds4.c authors / ggml authors / DeepSeek），
+本仓库原样继承。
+
+### 如果你要再分发
+
+`LICENSE` 与 `third_party/iris/LICENSE` 必须一并保留。MIT 不要求公开源码，
+但要求保留版权声明——删掉 LICENSE 再分发是不合规的。
+
+### 这份清单是怎么核出来的
+
+不是凭记忆写的：`git log` 全文检索 `移植/adapted/ported from/取自/照抄` 与
+`llama.cpp/ggml/vLLM/mlx` 得到候选，再逐个打开源文件确认是**代码移植**还是**思路参考**，
+最后用上游 `LICENSE` 原文核对版权行。已知的移植点见上表；如果发现遗漏，
+请开 issue —— 这类问题宁可多报。
