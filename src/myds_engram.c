@@ -179,6 +179,28 @@ error: {
     }
 }
 
+/* 2026-10-25 byte-split：行数据只能从复合映射读。
+ *
+ * 字节分段的张量跨越多个分片，一行 264 字节也可能跨边界 ⇒ 没有单一
+ * (fd, offset) 能表达它。映射已经是连续的，所以直接 memcpy。
+ *
+ * 仍然 dup 一份 src_fd：表的关闭语义、clone、以及「fd < 0 即为未打开」的
+ * 既有判断都依赖它，少这一份会让两条路径的行为分叉。 */
+bool myds_engram_table_open_map(myds_engram_table_t *table, int src_fd,
+                               const uint8_t *map, uint64_t map_size,
+                               uint64_t offset, uint32_t rows) {
+    if (!table) return fail(EINVAL);
+    *table = (myds_engram_table_t){.fd = -1};
+    const uint64_t bytes = (uint64_t)rows * MYDS_ENGRAM_ROW_BYTES;
+    if (!map || src_fd < 0 || !rows || map_size > INT64_MAX ||
+        offset > map_size || bytes > map_size - offset)
+        return fail(EINVAL);
+    int fd = fcntl(src_fd, F_DUPFD_CLOEXEC, 0);
+    if (fd < 0) return false;
+    *table = (myds_engram_table_t){.fd = fd, .map = map, .offset = offset, .rows = rows};
+    return true;
+}
+
 void myds_engram_table_close(myds_engram_table_t *table) {
     if (!table) return;
     if (table->fd >= 0) close(table->fd);
@@ -281,12 +303,16 @@ bool myds_engram_read(const myds_engram_table_t *table, const uint32_t *rows,
             continue;
         }
         uint64_t offset = table->offset + (uint64_t)rows[i] * sizeof(raw);
-        size_t done = 0;
-        while (done < sizeof(raw)) {
-            ssize_t n = pread(table->fd, raw + done, sizeof(raw) - done, (off_t)(offset + done));
-            if (n < 0 && errno == EINTR) continue;
-            if (n <= 0) return n == 0 ? fail(EIO) : false;
-            done += (size_t)n;
+        if (table->map) {
+            memcpy(raw, table->map + offset, sizeof(raw));
+        } else {
+            size_t done = 0;
+            while (done < sizeof(raw)) {
+                ssize_t n = pread(table->fd, raw + done, sizeof(raw) - done, (off_t)(offset + done));
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) return n == 0 ? fail(EIO) : false;
+                done += (size_t)n;
+            }
         }
         if (!myds_engram_decode_row(raw, out + i * MYDS_ENGRAM_DIM)) return false;
     }
@@ -302,6 +328,7 @@ enum {
 };
 typedef struct {
     int fd, error, retry_errno;
+    const uint8_t *map;   /* 非空 ⇒ 从复合映射拷贝，忽略 fd（byte-split） */
     uint64_t offset;
     uint8_t raw[MYDS_ENGRAM_ROW_BYTES];
 } engram_io_job_t;
@@ -325,6 +352,11 @@ struct myds_engram_reader {
 };
 
 static void read_raw_job(engram_io_job_t *job) {
+    if (job->map) {
+        memcpy(job->raw, job->map + job->offset, sizeof(job->raw));
+        job->error = 0;
+        return;
+    }
     size_t done = 0;
     while (done < sizeof(job->raw)) {
         ssize_t n = pread(job->fd, job->raw + done, sizeof(job->raw) - done,
@@ -485,6 +517,7 @@ bool myds_engram_reader_read_token(myds_engram_reader_t *r,
             if (previous < col) { map[layer][col] = map[layer][previous]; continue; }
             map[layer][col] = jobs;
             r->jobs[jobs].fd = tables[layer].fd;
+            r->jobs[jobs].map = tables[layer].map;
             r->jobs[jobs].offset = tables[layer].offset +
                                   (uint64_t)rows[layer][col] * MYDS_ENGRAM_ROW_BYTES;
             r->jobs[jobs].error = 0;
@@ -673,9 +706,19 @@ myds_engram_t *myds_engram_create(const gguf_file_t *gf, const char *path,
          * 分片 fd 与文件内绝对偏移。 */
         int src_fd = -1;
         uint64_t src_offset = 0;
-        if (!gguf_tensor_source(gf, table, &src_fd, &src_offset)) goto invalid;
-        if (!myds_engram_table_open_fd(&e->table[i], src_fd, src_offset,
-                                       e->layout.rows[i])) goto error;
+        if (gf->byte_split) {
+            /* 字节分段：表可能横跨分片，行也可能跨边界 ⇒ 只能从复合映射读。
+             * 偏移仍用「逻辑文件内绝对偏移」，与单文件语义一致。 */
+            if (!table->data || !gf->mmap_addr) goto invalid;
+            if (!myds_engram_table_open_map(&e->table[i], gf->fd, gf->mmap_addr,
+                                            (uint64_t)gf->mmap_size,
+                                            gf->tensor_data_offset + table->offset,
+                                            e->layout.rows[i])) goto error;
+        } else {
+            if (!gguf_tensor_source(gf, table, &src_fd, &src_offset)) goto invalid;
+            if (!myds_engram_table_open_fd(&e->table[i], src_fd, src_offset,
+                                           e->layout.rows[i])) goto error;
+        }
         snprintf(name, sizeof(name), "blk.%u.engram_kv.weight", e->layer_ids[i]);
         e->projection[i] = gguf_find_tensor(gf, name);
         snprintf(name, sizeof(name), "blk.%u.engram_q_norm.weight", e->layer_ids[i]);
@@ -714,6 +757,7 @@ myds_engram_t *myds_engram_clone(const myds_engram_t *source) {
     if (!copy) return NULL;
     memcpy(copy, source, sizeof(*copy));
     copy->reader = NULL;
+    /* map 指针随结构体 memcpy 复制，指向同一段映射（生命周期由 gguf_file_t 持有）。 */
     for (int i = 0; i < MYDS_ENGRAM_LAYERS; ++i) copy->table[i].fd = -1;
     for (int i = 0; i < MYDS_ENGRAM_LAYERS; ++i) {
         copy->table[i].fd = fcntl(source->table[i].fd, F_DUPFD_CLOEXEC, 0);
@@ -763,6 +807,13 @@ bool myds_engram_unmap_tables(gguf_file_t *gf, const myds_engram_t *e) {
         return !tables[0]->data && !tables[1]->data ? true : fail(EINVAL);
     if (e->table[1].offset > gf->mmap_size ||
         tables[1]->size_bytes > gf->mmap_size - e->table[1].offset) return fail(EINVAL);
+    if (gf->byte_split) {
+        /* 字节分段下这段映射【不是】disk-only 的：engram 的行就从它读，
+         * 因为一行 264 字节也可能跨越分片边界，没有单一 (fd, offset) 能表达。
+         * 布局已按上面的规则校验过，这里保留映射并返回成功 —— 回收它会让
+         * 后续行读取 SIGSEGV。 */
+        return true;
+    }
     if (munmap(gf->mmap_addr + start, gf->mmap_size - (size_t)start) != 0) return false;
     gf->mmap_size = (size_t)start;
     tables[0]->data = tables[1]->data = NULL;
@@ -896,6 +947,7 @@ static bool prepare_batch_step(myds_engram_t *e, const int32_t *tokens,
                     ht_job[h] = (int16_t)jobs;
                     map[t][layer][col] = jobs;
                     r->batch_jobs[jobs].fd = e->table[layer].fd;
+                    r->batch_jobs[jobs].map = e->table[layer].map;
                     r->batch_jobs[jobs].offset = e->table[layer].offset +
                                                  (uint64_t)rid * MYDS_ENGRAM_ROW_BYTES;
                     r->batch_jobs[jobs].error = 0;

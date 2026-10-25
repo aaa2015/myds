@@ -4,6 +4,7 @@ typedef struct {
     myds_metal_buffer_t *out;
     const myds_metal_buffer_t *weight, *input;
     bool shared_q4_nb;
+    bool input_pending; /* Candidate: join SharedGU MID with routed MID. */
 } shared_down_job_t;
 _Static_assert(sizeof(struct ds4_metal_args_mul_mv)==112u,"Q4 host/shader ABI");
 _Static_assert(sizeof(struct ds4_metal_args_mul_mv_id)==136u,"IQ2/Q2 host/shader ABI");

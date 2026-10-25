@@ -46,7 +46,15 @@ bool myds_engram_hash(const myds_engram_layout_t *layout,
                      const int32_t *tokens, const uint8_t *mask, size_t count,
                      uint32_t *rows);
 
-typedef struct { int fd; uint64_t offset; uint32_t rows; } myds_engram_table_t;
+/* `map` 非空时行读取走映射拷贝，`fd` 只用于生命周期与派生（byte-split 模式）。
+ * 为什么需要它：字节分段的张量可能横跨两个分片，264 字节的行也能跨边界，
+ * 没有任何单一 (fd, offset) 能表达一个跨片的行。 */
+typedef struct {
+    int fd;
+    const uint8_t *map;
+    uint64_t offset;
+    uint32_t rows;
+} myds_engram_table_t;
 /* Separate pread descriptor; no full-table read or GPU map. On macOS,
  * MYDS_ENGRAM_NOCACHE requests F_NOCACHE/no-readahead for diagnostics. That
  * switch alone does not prove a cache miss or physical SSD transfer. */
@@ -56,6 +64,11 @@ bool myds_engram_table_open(myds_engram_table_t *table, const char *path,
  * 拆片后张量分散在多个文件，path 版本无法表达「这个张量在 part 3」。 */
 bool myds_engram_table_open_fd(myds_engram_table_t *table, int src_fd,
                               uint64_t offset, uint32_t rows);
+/* 映射版本（byte-split）：行直接从 map + offset 读取，边界按 map_size 校验。
+ * 仍 dup 一份 src_fd，使 fd 的生命周期语义与其他表一致。 */
+bool myds_engram_table_open_map(myds_engram_table_t *table, int src_fd,
+                               const uint8_t *map, uint64_t map_size,
+                               uint64_t offset, uint32_t rows);
 void myds_engram_table_close(myds_engram_table_t *table);
 /* Each row is 256 E4M3FN bytes followed by eight E8M0 scale bytes. Invalid
  * encodings, nonfinite results and short reads fail; output is then invalid.
@@ -118,7 +131,11 @@ myds_engram_t *myds_engram_clone(const myds_engram_t *engram);
 bool myds_engram_set_io_threads(myds_engram_t *engram, unsigned workers);
 /* Reject overlapping/non-tail layouts; unmap only page-aligned disk-only tail.
  * Call before publishing model pointers/GPU views. Sets table data pointers to
- * NULL and shrinks mmap_size; projection/norm/metadata remain valid. */
+ * NULL and shrinks mmap_size; projection/norm/metadata remain valid.
+ *
+ * byte-split 例外：那种模式下尾部映射**不是** disk-only（行从映射读，一行可跨
+ * 分片），所以只做同样的布局校验，**不解映射**并返回 true。调用方不应假设
+ * 返回后张量指针已失效。 */
 bool myds_engram_unmap_tables(gguf_file_t *gf, const myds_engram_t *engram);
 void myds_engram_free(myds_engram_t *engram);
 void myds_engram_reset(myds_engram_t *engram);

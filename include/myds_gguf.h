@@ -146,6 +146,11 @@ void         gguf_close(gguf_file_t *f);
  * engram 的 pread 路径必须用这个，不能自己拼 gf->fd + tensor_data_offset。 */
 bool gguf_tensor_source(const gguf_file_t *f, const gguf_tensor_t *t,
                         int *fd, uint64_t *file_offset);
+/* 读取张量内部 offset..offset+len 的字节。映射可用时直接 memcpy；否则按
+ * gguf_tensor_source 找到正确的分片 fd 再 pread。跨越分片边界的张量在字节
+ * 分段模式下只走映射 —— 单个 (fd, offset) 表达不了跨片位置。 */
+bool gguf_tensor_read(const gguf_file_t *f, const gguf_tensor_t *t,
+                      void *dst, uint64_t offset, size_t len);
 
 const gguf_kv_t     *gguf_find_key(const gguf_file_t *f, const char *key);
 const gguf_tensor_t *gguf_find_tensor(const gguf_file_t *f, const char *name);

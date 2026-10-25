@@ -602,6 +602,76 @@ static void test_model(void) {
     printf("Engram: metadata/tensor validation, two-table transaction, reset passed\n");
 }
 
+/* byte-split: 行从复合映射读，与 pread 路径必须逐字节一致。
+ *
+ * 这个测试存在的理由：字节分段的张量跨分片，行也可能跨边界 —— 没有单一
+ * (fd, offset) 能表达。如果哪天有人把 map 路径删了或者偏移算错，
+ * 这里会直接失败，而不是等到跑真模型时读到垃圾数据。 */
+static void test_mapped_rows(void) {
+    char path[] = "/tmp/myds-engram-mapped.XXXXXX";
+    int fd = mkstemp(path);
+    assert(fd >= 0);
+    const uint32_t rows = 64;
+    const uint64_t total = (uint64_t)rows * MYDS_ENGRAM_ROW_BYTES;
+    assert(ftruncate(fd, (off_t)(total + MYDS_ENGRAM_ROW_BYTES)) == 0);
+    uint8_t *data = mmap(NULL, (size_t)(total + MYDS_ENGRAM_ROW_BYTES),
+                         PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    assert(data != MAP_FAILED);
+    /* 每行填可区分的内容：code 与 scale 都在合法域内，解码才是有限的。 */
+    for (uint32_t r = 0; r < rows; ++r) {
+        uint8_t *row = data + (uint64_t)r * MYDS_ENGRAM_ROW_BYTES;
+        /* E4M3FN 的 0x7F 是 NaN，用 %120 把编码限制在 0..0x77 的有限域内，
+         * 否则解码会按设计拒绝（EDOM），测试就测不到读路径。 */
+        for (int i = 0; i < MYDS_ENGRAM_DIM; ++i) row[i] = (uint8_t)((r * 7u + (uint32_t)i) % 120u);
+        for (int i = 0; i < 8; ++i) row[MYDS_ENGRAM_DIM + i] = (uint8_t)(100 + i);
+    }
+
+    /* 表从第二行开始，长度 rows-2：偏移非零才测得出偏移没算错。 */
+    const uint64_t offset = MYDS_ENGRAM_ROW_BYTES;
+    myds_engram_table_t by_fd = {0}, by_map = {0};
+    assert(myds_engram_table_open_fd(&by_fd, fd, offset, rows - 2));
+    assert(myds_engram_table_open_map(&by_map, fd, data, total + MYDS_ENGRAM_ROW_BYTES,
+                                      offset, rows - 2));
+    uint32_t ids[MYDS_ENGRAM_COLS];
+    float a[MYDS_ENGRAM_COLS * MYDS_ENGRAM_DIM], b[MYDS_ENGRAM_COLS * MYDS_ENGRAM_DIM];
+    for (uint32_t base = 0; base + MYDS_ENGRAM_COLS <= rows - 2; base += MYDS_ENGRAM_COLS) {
+        for (int i = 0; i < MYDS_ENGRAM_COLS; ++i) ids[i] = base + (uint32_t)i;
+        assert(myds_engram_read(&by_fd, ids, MYDS_ENGRAM_COLS, a));
+        assert(myds_engram_read(&by_map, ids, MYDS_ENGRAM_COLS, b));
+        assert(memcmp(a, b, sizeof(a)) == 0);
+    }
+
+    /* 并发路径也要覆盖：作业结构里另存了 map 指针，漏了这一处就只在
+     * 多线程时读错，单线程测试看不出来。 */
+    {
+        myds_engram_reader_t *reader = myds_engram_reader_create(4);
+        assert(reader != NULL);
+        myds_engram_table_t serial_tab[MYDS_ENGRAM_LAYERS] = { by_fd, by_fd };
+        myds_engram_table_t mapped_tab[MYDS_ENGRAM_LAYERS] = { by_map, by_map };
+        uint32_t want[MYDS_ENGRAM_LAYERS][MYDS_ENGRAM_COLS];
+        float got_serial[MYDS_ENGRAM_LAYERS][MYDS_ENGRAM_INPUT_DIM];
+        float got_mapped[MYDS_ENGRAM_LAYERS][MYDS_ENGRAM_INPUT_DIM];
+        for (int l = 0; l < MYDS_ENGRAM_LAYERS; ++l)
+            for (int c = 0; c < MYDS_ENGRAM_COLS; ++c)
+                want[l][c] = (uint32_t)(c * 2 + l);
+        assert(myds_engram_reader_read_token(reader, serial_tab, (const uint32_t (*)[MYDS_ENGRAM_COLS])want,
+                                             got_serial));
+        assert(myds_engram_reader_read_token(reader, mapped_tab, (const uint32_t (*)[MYDS_ENGRAM_COLS])want,
+                                             got_mapped));
+        assert(memcmp(got_serial, got_mapped, sizeof(got_serial)) == 0);
+        myds_engram_reader_free(reader);
+    }
+
+    /* 越界必须被拒绝，而不是读到相邻数据 */
+    assert(!myds_engram_table_open_map(&by_map, fd, data, total, offset, rows));
+    assert(!myds_engram_table_open_map(&by_map, fd, NULL, total, offset, 1));
+    myds_engram_table_close(&by_fd);
+    myds_engram_table_close(&by_map);
+    assert(munmap(data, (size_t)(total + MYDS_ENGRAM_ROW_BYTES)) == 0);
+    close(fd); unlink(path);
+    printf("Engram: mapped rows byte-identical to pread rows, out-of-range map rejected passed\n");
+}
+
 static void test_unmap(void) {
     long page = sysconf(_SC_PAGESIZE);
     assert(page > 0);
@@ -652,7 +722,7 @@ static void test_unmap(void) {
 }
 
 int main(void) {
-    test_decode_table(); test_decode_rounding_modes(); test_hash(); test_decode(); test_disk(); test_parallel_disk(); test_gate(); test_model(); test_unmap();
+    test_decode_table(); test_decode_rounding_modes(); test_hash(); test_decode(); test_disk(); test_parallel_disk(); test_gate(); test_model(); test_mapped_rows(); test_unmap();
     puts("Engram: all tests passed");
     return 0;
 }

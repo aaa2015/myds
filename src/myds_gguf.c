@@ -1,6 +1,7 @@
 #include "myds_gguf.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -887,6 +888,46 @@ bool gguf_tensor_source(const gguf_file_t *f, const gguf_tensor_t *t,
     if (file_offset) *file_offset = f->tensor_data_offset + t->offset;
     return true;
 }
+/* 读取张量内部的一段字节。
+ *
+ * 为什么必须集中到一个函数：拆片后「张量在哪个文件、偏移多少」不再等于
+ * 「gf->fd + tensor_data_offset + offset」。直接 pread 的调用方会读到 part 0 的
+ * 错误位置 —— 如果偏移恰好落在 part 0 范围内，还会【静默读到错数据】，
+ * 那比报错更糟。
+ *
+ *   · 张量已映射（单文件 / 按张量分片 / 字节分段的复合映射）⇒ 直接 memcpy；
+ *   · 未映射（调用方做过 unmap）⇒ 用 gguf_tensor_source 取正确分片 fd 再 pread。
+ *
+ * 两种情况都做边界校验，offset+len 不得越过张量末尾。 */
+bool gguf_tensor_read(const gguf_file_t *f, const gguf_tensor_t *t,
+                      void *dst, uint64_t offset, size_t len) {
+    if (!f || !t || (len && !dst)) { errno = EINVAL; return false; }
+    if (offset > t->size_bytes || (uint64_t)len > t->size_bytes - offset) {
+        errno = EINVAL;
+        return false;
+    }
+    if (!len) return true;
+    if (t->data) {
+        memcpy(dst, (const uint8_t *)t->data + offset, len);
+        return true;
+    }
+    int fd = -1;
+    uint64_t base = 0;
+    if (!gguf_tensor_source(f, t, &fd, &base)) { errno = EINVAL; return false; }
+    uint8_t *out = (uint8_t *)dst;
+    size_t done = 0;
+    while (done < len) {
+        ssize_t n = pread(fd, out + done, len - done, (off_t)(base + offset + done));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (n == 0) { errno = EIO; return false; }
+        done += (size_t)n;
+    }
+    return true;
+}
+
 void gguf_close(gguf_file_t *f) {
     if (!f) return;
     free_kvs(f->kvs, f->metadata_kv_count);

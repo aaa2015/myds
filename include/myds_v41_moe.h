@@ -151,6 +151,14 @@ int myds_dspark_shared_swiglu(myds_metal_buffer_t *out,
     uint32_t width, float clamp_val);
 
 #define MYDS_V41_MOE_HAS_FFN_HC_OVERLAP 1
+/* Default-off ordinary scalar decode schedule. It retains the reference Q4
+ * SharedGU provider, issues it beside HC/router, and joins its MID only at the
+ * routed-MID -> paired Down boundary. Shared NB, tracing and kprof are outside
+ * this experiment. Counters record accepted host dispatches, not GPU success. */
+int myds_v41_decode_shared_gu_early_parse_mode(void);
+int myds_v41_decode_shared_gu_early_enabled(void);
+void myds_v41_decode_shared_gu_early_counters(myds_metal_decode_candidate_counters_t *out, bool reset);
+void myds_v41_decode_shared_gu_early_provider_counters(myds_metal_decode_candidate_counters_t *out, bool reset);
 int myds_v41_ffn_hc_overlap_parse_mode(void);
 int myds_v41_ffn_hc_overlap_enabled(void);
 void myds_v41_ffn_hc_overlap_reset_mode(void);

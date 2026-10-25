@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
-"""decode_fixed.py — 固定 128 token 的 decode 基准（撞上限，避免 EOS 抖动）。
+"""Fixed-output online decode screening, using final usage token counts.
 
-用法: decode_fixed.py <port> [alias]
-
-· max_tokens=128 且提示词设计为不会提前结束
-· temperature=0
-· 每个 prompt 预热一次丢弃，再测 3 次
-· 只统计 chunks >= 120 的样本（撞上限才算有效）
+Usage: decode_fixed.py <port> [alias] [--tokens 128] [--jsonl PATH]
+Every prompt gets one discarded warmup and three formal samples. A sample must
+finish at its requested token limit, with final usage and [DONE]. HTTP exposes
+visible text arrivals, not exact generated-token timing; native decode is the
+authority for formal performance acceptance.
 """
+import argparse
 import json
 import statistics as st
-import sys
-import time
-import urllib.request
 
-port = int(sys.argv[1])
-alias = sys.argv[2] if len(sys.argv) > 2 else "local-myds-deepseek-v4.1-flash-q2"
-N = 128
+try:
+    from .stream_bench import BenchmarkError, request_stream
+except ImportError:
+    from stream_bench import BenchmarkError, request_stream
+
 
 PROMPTS = [
     "Write a long detailed technical explanation of how a modern CPU pipeline works, covering fetch, decode, execute, memory access and writeback stages.",
@@ -25,61 +24,54 @@ PROMPTS = [
 ]
 
 
-def once(prompt):
-    body = json.dumps({
-        "model": alias,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": N, "temperature": 0, "stream": True,
-        "stream_options": {"include_usage": True},
-    }).encode()
-    req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions",
-                                 data=body, headers={"Content-Type": "application/json"})
-    t0 = time.monotonic()
-    ttft = None
-    chunks = 0
-    fin = None
-    with urllib.request.urlopen(req, timeout=900) as r:
-        for raw in r:
-            line = raw.decode("utf-8", "replace").strip()
-            if not line.startswith("data:"):
-                continue
-            p = line[5:].strip()
-            if p == "[DONE]":
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("port", type=int)
+    parser.add_argument("alias", nargs="?", default="local-myds-deepseek-v4.1-flash-q2")
+    parser.add_argument("--tokens", type=int, default=128)
+    parser.add_argument("--jsonl", help="append complete timing/usage records (including warmups and rejections)")
+    args = parser.parse_args(argv)
+    if args.tokens < 2:
+        parser.error("--tokens must be at least 2 for decode")
+    print("HTTP decode estimate=(usage.completion_tokens-1)/(last_text-first_text). "
+          "UTF-8/reasoning buffering and invisible tokens can shift the estimate; native timing is authoritative.")
+    good = []
+    for pi, prompt in enumerate(PROMPTS):
+        warmup_ok = True
+        for run in range(-1, 3):
+            if not warmup_ok:
                 break
+            label = "warmup" if run < 0 else "r%d" % run
+            record = {"prompt_index": pi, "run": run, "warmup": run < 0,
+                      "requested_tokens": args.tokens, "port": args.port, "alias": args.alias}
             try:
-                d = json.loads(p)
-            except Exception:
-                continue
-            ch = d.get("choices") or []
-            if not ch:
-                continue
-            if ch[0].get("finish_reason"):
-                fin = ch[0]["finish_reason"]
-            delta = ch[0].get("delta", {})
-            piece = delta.get("content") or delta.get("reasoning_content")
-            if piece:
-                if ttft is None:
-                    ttft = time.monotonic() - t0
-                chunks += 1
-    total = time.monotonic() - t0
-    dec = total - (ttft or 0)
-    return {"ttft": ttft, "chunks": chunks, "finish": fin,
-            "tok_s": (chunks / dec) if dec > 0 and chunks else None}
+                row = request_stream(args.port, args.alias, prompt, args.tokens, timeout=900)
+                record.update(row)
+                rate = row["decode_est_tok_s"]
+                if rate is None:
+                    raise BenchmarkError("no measurable visible decode interval")
+                record["accepted"] = True
+            except BenchmarkError as exc:
+                record.update(accepted=False, error=str(exc))
+                print("  p%d %s: rejected: %s" % (pi, label, exc), flush=True)
+                if run < 0:
+                    warmup_ok = False
+            else:
+                if run >= 0:
+                    good.append(rate)
+                    print("  p%d %s: %d tokens / %d text chunks  %.2f est tok/s  finish=%s" %
+                          (pi, label, row["output_tokens"], row["text_chunks"], rate, row["finish"]), flush=True)
+            if args.jsonl:
+                with open(args.jsonl, "a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(record, allow_nan=False) + "\n")
+    if good:
+        median = st.median(good)
+        print("  Valid samples %d/9; HTTP decode estimate median=%.2f tok/s (%.2f ms/interval)" %
+              (len(good), median, 1000 / median))
+    else:
+        print("  No valid samples")
+    return 0 if len(good) == 9 else 1
 
 
-rows = []
-for pi, p in enumerate(PROMPTS):
-    once(p)                      # 预热
-    for r in range(3):
-        m = once(p)
-        ok = (m["chunks"] or 0) >= 120
-        rows.append((pi, m, ok))
-        print(f"  p{pi} r{r}: {m['chunks']} chunks  {m['tok_s']:.2f} tok/s  "
-              f"finish={m['finish']}  {'✓' if ok else '✗样本不足'}", flush=True)
-
-good = [m["tok_s"] for _, m, ok in rows if ok]
-if good:
-    print(f"  ── 有效样本 {len(good)}/{len(rows)}  median={st.median(good):.2f} tok/s "
-          f"({1000/st.median(good):.2f} ms/token) ──")
-else:
-    print("  ── 无有效样本 ──")
+if __name__ == "__main__":
+    raise SystemExit(main())

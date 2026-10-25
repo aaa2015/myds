@@ -1320,20 +1320,21 @@ static uint64_t lowkv_identity(const myds_model_t *m) {
                     if (t->data) {
                         digest_update(&weight_digest, t->data, t->size_bytes);
                     } else if (m->gf->fd >= 0) {
-                        /* 解除映射后的张量（例如 Engram unmap 后的表）：通过文件描述符流式读取校验 */
+                        /* 解除映射后的张量（例如 Engram unmap 后的表）：流式读取校验。
+                         * 必须走 gguf_tensor_read —— 自己拼 gf->fd + tensor_data_offset
+                         * 在字节分段下会读错分片。 */
                         uint8_t chunk[65536];
-                        uint64_t file_offset = m->gf->tensor_data_offset + t->offset;
+                        uint64_t file_offset = 0;
                         size_t remaining = t->size_bytes;
                         while (remaining > 0) {
                             size_t to_read = remaining < sizeof(chunk) ? remaining : sizeof(chunk);
-                            ssize_t nread = pread(m->gf->fd, chunk, to_read, (off_t)file_offset);
-                            if (nread <= 0 || (size_t)nread != to_read) {
+                            if (!gguf_tensor_read(m->gf, t, chunk, file_offset, to_read)) {
                                 digest_error = true;
                                 break;
                             }
-                            digest_update(&weight_digest, chunk, (size_t)nread);
-                            file_offset += (uint64_t)nread;
-                            remaining -= (size_t)nread;
+                            digest_update(&weight_digest, chunk, to_read);
+                            file_offset += (uint64_t)to_read;
+                            remaining -= to_read;
                         }
                         if (digest_error) break;
                     } else {
@@ -1388,10 +1389,8 @@ static uint64_t lowkv_identity(const myds_model_t *m) {
                         memcpy(&w1, b, s1);
                         memcpy(&w2, b + mid, s2);
                     } else if (m->gf->fd >= 0) {
-                        uint64_t file_offset = m->gf->tensor_data_offset + t->offset;
-                        ssize_t r1 = pread(m->gf->fd, &w1, s1, (off_t)file_offset);
-                        ssize_t r2 = pread(m->gf->fd, &w2, s2, (off_t)(file_offset + mid));
-                        if (r1 <= 0 || (size_t)r1 != s1 || r2 <= 0 || (size_t)r2 != s2) {
+                        if (!gguf_tensor_read(m->gf, t, &w1, 0, s1) ||
+                            !gguf_tensor_read(m->gf, t, &w2, mid, s2)) {
                             MYDS_LOG_W("kvdisk: 大模型抽样权重读取失败");
                             return 0;
                         }
@@ -2828,6 +2827,9 @@ myds_v41_model_t *myds_v41_model_create(myds_model_t *m, const char *path) {
         v->engram_k[i]=wrap(v->engram->k_norm[i]);
         if (!v->engram_proj[i] || !v->engram_q[i] || !v->engram_k[i]) goto fail;
     }
+    if (m->gf->byte_split)
+        MYDS_LOG_I("byte-split: Engram rows read from the composite mapping; "
+                   "the model mapping stays resident (a 264-byte row can straddle two parts)");
     if (!myds_engram_unmap_tables(m->gf,v->engram)) goto fail;
     MYDS_LOG_I("Native V4.1 diagnostic graph: HC4, Engram disk rows, SWA128, 4 KV owners");
     return v;
