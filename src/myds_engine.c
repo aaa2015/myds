@@ -294,6 +294,11 @@ static const char *unimplemented_graph_feature(const gguf_file_t *gf) {
  *
  * 但截至 2026-09-29，它们已全部实现，并通过了独立的三方逐位对照：
  *
+ *   ⚠️ 2026-10-25：以下三个路径在本仓库中【不存在】（证据树从未入库，见账本 §97.6）。
+ *      保留名字仅为追溯历史；当前可用的证据入口是：
+ *        docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md
+ *        docs/CORRECTNESS_STATUS.md（0-ULP 开关清单与实测）
+ *   原记（已失效路径）：
  *   证据  docs/verification/2026-09-29-batched-prefill-parity.md
  *         docs/verification/2026-09-29-decode-optimization-verification.md
  *         docs/CORRECTNESS_STATUS.md（第三轮 "原生全阶段补齐"）
