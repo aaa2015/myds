@@ -52,6 +52,10 @@ typedef struct { int fd; uint64_t offset; uint32_t rows; } myds_engram_table_t;
  * switch alone does not prove a cache miss or physical SSD transfer. */
 bool myds_engram_table_open(myds_engram_table_t *table, const char *path,
                            uint64_t offset, uint32_t rows);
+/* split GGUF 版本：从已打开的分片 fd 派生（dup，避免与 gguf_close 双关）。
+ * 拆片后张量分散在多个文件，path 版本无法表达「这个张量在 part 3」。 */
+bool myds_engram_table_open_fd(myds_engram_table_t *table, int src_fd,
+                              uint64_t offset, uint32_t rows);
 void myds_engram_table_close(myds_engram_table_t *table);
 /* Each row is 256 E4M3FN bytes followed by eight E8M0 scale bytes. Invalid
  * encodings, nonfinite results and short reads fail; output is then invalid.

@@ -1,8 +1,10 @@
 #include "myds_gguf.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -221,239 +223,446 @@ const char *ggml_type_name(ggml_type type) {
     }
 }
 
-gguf_file_t *gguf_open(const char *path) {
+
+/* ── split GGUF 支持（2026-10-25）──────────────────────────────────
+ *
+ * llama.cpp 的 `gguf-split` 产出 `<prefix>-00001-of-00005.gguf` 形式的多个文件：
+ * 每个都是【完整合法的 GGUF】，各带自己的 header / KV / 张量子集。
+ * HF 上超过单文件上限的权重都用这种形式发布，所以 myds 必须能直接吃第一个分片。
+ *
+ * 设计取舍：
+ *   · metadata 只取 part 0 的 —— llama.cpp 在每个分片都写了同一份 KV，
+ *     但只有 part 0 是权威；多余的直接释放。
+ *   · 一致性校验只做「版本 / alignment / 张量总数 == 各分片之和 / 名字不重复」。
+ *     逐字段比对所有分片的 KV 代价太大且没有实际收益。
+ *   · 每个张量记下所属分片与文件内绝对偏移（gguf_tensor_t.part / file_offset）。
+ *     engram 的 pread 路径必须用 gguf_tensor_source()，否则会从 part 0 读错位置。
+ *   · n_parts == 1 时所有路径与改动前完全一致（单文件仍是单次 mmap）。
+ */
+
+static void free_kvs(gguf_kv_t *kvs, uint64_t n) {
+    if (!kvs) return;
+    for (uint64_t i = 0; i < n; i++) {
+        free(kvs[i].key);
+        if (kvs[i].type == GGUF_TYPE_STRING) {
+            free(kvs[i].value.val_str);
+        } else if (kvs[i].type == GGUF_TYPE_ARRAY) {
+            if (kvs[i].value.val_arr.elem_type == GGUF_TYPE_STRING) {
+                char **strs = (char **)kvs[i].value.val_arr.data;
+                if (strs) {
+                    for (uint64_t j = 0; j < kvs[i].value.val_arr.count; j++) free(strs[j]);
+                    free(strs);
+                }
+            } else {
+                free(kvs[i].value.val_arr.data);
+            }
+        }
+    }
+    free(kvs);
+}
+
+/* 解析 split 文件名 <dir><prefix>-<idx>-of-<total>.gguf。
+ * 成功时把「目录 + prefix + '-'」写进 prefix_out，方便直接拼其它分片路径。 */
+static bool split_parse_name(const char *path, char *prefix_out, size_t prefix_cap,
+                            uint32_t *idx, uint32_t *total, int *idx_width) {
+    if (!path || !prefix_out || prefix_cap == 0) return false;
+    const char *slash = strrchr(path, '/');
+    const char *base = slash ? slash + 1 : path;
+    const size_t blen = strlen(base);
+    if (blen < 6) return false;
+    if (strcasecmp(base + blen - 5, ".gguf") != 0) return false;
+    const char *end = base + blen - 5;         /* 指向 ".gguf" 前，即 total 数字之后 */
+
+    /* total：结尾的连续数字 */
+    const char *tot_end = end;
+    const char *tot_start = tot_end;
+    while (tot_start > base && isdigit((unsigned char)tot_start[-1])) tot_start--;
+    if (tot_start == tot_end) return false;
+    if (tot_end - tot_start > 6) return false;
+    if (tot_start - base < 4 || strncmp(tot_start - 4, "-of-", 4) != 0) return false;
+
+    /* idx：位于 "-of-" 之前 */
+    const char *ix_end = tot_start - 4;
+    const char *ix_start = ix_end;
+    while (ix_start > base && isdigit((unsigned char)ix_start[-1])) ix_start--;
+    if (ix_start == ix_end) return false;
+    if (ix_end - ix_start > 6) return false;
+    if (ix_start == base || ix_start[-1] != '-') return false;
+
+    char tmp[32];
+    const size_t n = (size_t)(tot_end - tot_start);
+    if (n >= sizeof(tmp)) return false;
+    memcpy(tmp, tot_start, n);
+    tmp[n] = '\0';
+    const long t = strtol(tmp, NULL, 10);
+    if (t < 2 || t > 99999) return false;
+
+    const size_t m = (size_t)(ix_end - ix_start);
+    memcpy(tmp, ix_start, m);
+    tmp[m] = '\0';
+    const long i = strtol(tmp, NULL, 10);
+    if (i < 1 || i > t) return false;
+
+    /* ix_start 指向 idx 的首位数字；它前面那个字符是分隔符 '-'，
+     * 拼接时要把它排掉，否则会得到 "prefix--00001-of-..."。 */
+    const size_t pre_len = (size_t)(ix_start - path) - 1u;
+    if (pre_len + 1 >= prefix_cap) return false;
+    memcpy(prefix_out, path, pre_len);
+    prefix_out[pre_len] = '\0';
+
+    if (idx) *idx = (uint32_t)i;
+    if (total) *total = (uint32_t)t;
+    if (idx_width) *idx_width = (int)m;
+    return true;
+}
+
+typedef struct {
+    gguf_kv_t     *kvs;
+    uint64_t       kv_count;
+    gguf_tensor_t *tensors;
+    uint64_t       tensor_count;
+    uint32_t       version;
+    uint64_t       alignment;
+} part_parse_t;
+
+/* mmap 一个分片并解析它的 header / KV / 张量，同时做边界校验。
+ * 返回的张量 offset 仍是文件内相对值，data 指向该分片自己的映射。 */
+static bool parse_part(const char *path, gguf_part_t *pt, part_parse_t *out) {
+    memset(pt, 0, sizeof(*pt));
+    pt->fd = -1;
+    memset(out, 0, sizeof(*out));
+
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
         perror("gguf_open: open");
-        return NULL;
+        return false;
     }
-
 #if defined(__APPLE__) && defined(F_NOCACHE)
-    /* 旁路系统文件缓存，避免统一内存架构下同时存在 Unified Page Cache 和 Metal 映射产生 2x 显存占用 */
     (void)fcntl(fd, F_NOCACHE, 1);
 #endif
-
     struct stat st;
-    if (fstat(fd, &st) != 0) {
-        close(fd);
-        return NULL;
-    }
-
-    size_t size = (size_t)st.st_size;
-    size_t page_sz = (size_t)getpagesize();
-    size_t mmap_size = ((size + page_sz - 1) / page_sz) * page_sz;
+    if (fstat(fd, &st) != 0) { close(fd); return false; }
+    const size_t size = (size_t)st.st_size;
+    const size_t page_sz = (size_t)getpagesize();
+    const size_t mmap_size = ((size + page_sz - 1) / page_sz) * page_sz;
     uint8_t *addr = (uint8_t *)mmap(NULL, mmap_size, PROT_READ, MAP_SHARED, fd, 0);
-    if (addr == MAP_FAILED) {
-        perror("gguf_open: mmap");
-        close(fd);
-        return NULL;
-    }
+    if (addr == MAP_FAILED) { perror("gguf_open: mmap"); close(fd); return false; }
+
+    pt->fd = fd;
+    pt->mmap_addr = addr;
+    pt->mmap_size = mmap_size;
+    pt->file_size = size;
 
     reader_t r = { .data = addr, .size = size, .pos = 0 };
-    uint32_t magic = 0;
-    if (!read_u32(&r, &magic) || magic != GGUF_MAGIC) {
-        fprintf(stderr, "gguf_open: invalid magic (expected 0x%08x, got 0x%08x)\n", GGUF_MAGIC, magic);
-        munmap(addr, size);
-        close(fd);
-        return NULL;
-    }
-
-    uint32_t version = 0;
-    if (!read_u32(&r, &version) || (version != 2 && version != 3)) {
-        fprintf(stderr, "gguf_open: unsupported GGUF version %u\n", version);
-        munmap(addr, size);
-        close(fd);
-        return NULL;
-    }
-
+    uint32_t magic = 0, version = 0;
     uint64_t tensor_count = 0, kv_count = 0;
-    if (!read_u64(&r, &tensor_count) || !read_u64(&r, &kv_count)) {
-        munmap(addr, size);
-        close(fd);
-        return NULL;
+    if (!read_u32(&r, &magic) || magic != GGUF_MAGIC ||
+        !read_u32(&r, &version) || (version != 2 && version != 3) ||
+        !read_u64(&r, &tensor_count) || !read_u64(&r, &kv_count)) {
+        fprintf(stderr, "gguf_open: %s: invalid header\n", path);
+        goto fail;
     }
 
-    gguf_file_t *gf = (gguf_file_t *)calloc(1, sizeof(gguf_file_t));
-    gf->fd = fd;
-    gf->mmap_addr = addr;
-    gf->mmap_size = mmap_size;
-    gf->file_size = size;      /* 2026-10-25: 真实长度，边界校验用它而非 mmap_size */
-    gf->version = version;
-    gf->tensor_count = tensor_count;
-    gf->metadata_kv_count = kv_count;
-    gf->alignment = 32; /* default */
-    gf->kvs = (gguf_kv_t *)calloc(kv_count, sizeof(gguf_kv_t));
+    out->version = version;
+    out->kv_count = kv_count;
+    out->tensor_count = tensor_count;
+    out->alignment = 32;
+    out->kvs = (gguf_kv_t *)calloc(kv_count ? kv_count : 1, sizeof(gguf_kv_t));
+    if (!out->kvs) goto fail;
 
     for (uint64_t i = 0; i < kv_count; i++) {
-        gf->kvs[i].key = read_string(&r);
-        /* 2026-10-25: key 必须检查 NULL。read_string 现在会因长度越界/溢出
-         * 返回 NULL，而下一行的 strcmp 会直接解引用它。
-         * 旧版之所以没暴露，是因为它根本不返回 NULL（直接崩在 memcpy 里）。 */
-        if (!gf->kvs[i].key) {
-            fprintf(stderr, "gguf_open: failed reading metadata key %llu\n",
-                    (unsigned long long)i);
-            gguf_close(gf);
-            return NULL;
+        out->kvs[i].key = read_string(&r);
+        if (!out->kvs[i].key) {
+            fprintf(stderr, "gguf_open: %s: failed reading metadata key %llu\n",
+                    path, (unsigned long long)i);
+            goto fail;
         }
         uint32_t type = 0;
-        if (!read_u32(&r, &type) || !read_kv_value(&r, (gguf_type)type, &gf->kvs[i])) {
-            fprintf(stderr, "gguf_open: failed reading metadata kv %llu\n", (unsigned long long)i);
-            gguf_close(gf);
-            return NULL;
+        if (!read_u32(&r, &type) || !read_kv_value(&r, (gguf_type)type, &out->kvs[i])) {
+            fprintf(stderr, "gguf_open: %s: failed reading metadata kv %llu\n",
+                    path, (unsigned long long)i);
+            goto fail;
         }
-        if (strcmp(gf->kvs[i].key, "general.alignment") == 0) {
-            /* 2026-10-25: 只在值非 0 时采用。原写法 `a ? a : b` 在 a==0 时回落到
-             * b，而 b（val_u64）与同一 union 的 val_u32 重叠 ⇒ 实际拿到的不是文件
-             * 声明的值。另外 alignment==0 会让后面的 ceil 除法除零。 */
-            const uint32_t a = gf->kvs[i].value.val_u32;
+        if (strcmp(out->kvs[i].key, "general.alignment") == 0) {
+            const uint32_t a = out->kvs[i].value.val_u32;
             if (a != 0) {
                 if (a > (1u << 20)) {
-                    fprintf(stderr, "gguf_open: general.alignment=%u too large (max 1048576)\n", a);
-                    gguf_close(gf);
-                    return NULL;
+                    fprintf(stderr, "gguf_open: %s: general.alignment=%u too large\n", path, a);
+                    goto fail;
                 }
-                gf->alignment = a;
+                out->alignment = a;
             } else {
-                fprintf(stderr, "gguf_open: general.alignment=0 ignored, keeping %llu\n",
-                        (unsigned long long)gf->alignment);
+                fprintf(stderr, "gguf_open: %s: general.alignment=0 ignored, keeping %llu\n",
+                        path, (unsigned long long)out->alignment);
             }
         }
     }
 
-    gf->tensors = (gguf_tensor_t *)calloc(tensor_count, sizeof(gguf_tensor_t));
+    out->tensors = (gguf_tensor_t *)calloc(tensor_count ? tensor_count : 1,
+                                          sizeof(gguf_tensor_t));
+    if (!out->tensors) goto fail;
+
     for (uint64_t i = 0; i < tensor_count; i++) {
         char *name = read_string(&r);
-        if (!name) {
-            gguf_close(gf);
-            return NULL;
-        }
-        strncpy(gf->tensors[i].name, name, sizeof(gf->tensors[i].name) - 1);
+        if (!name) goto fail;
+        strncpy(out->tensors[i].name, name, sizeof(out->tensors[i].name) - 1);
         free(name);
 
         uint32_t n_dims = 0;
-        if (!read_u32(&r, &n_dims) || n_dims > GGUF_MAX_DIMS) {
-            gguf_close(gf);
-            return NULL;
-        }
-        gf->tensors[i].n_dims = n_dims;
+        if (!read_u32(&r, &n_dims) || n_dims > GGUF_MAX_DIMS) goto fail;
+        out->tensors[i].n_dims = n_dims;
         for (uint32_t d = 0; d < n_dims; d++) {
-            if (!read_u64(&r, &gf->tensors[i].dims[d])) {
-                gguf_close(gf);
-                return NULL;
-            }
+            if (!read_u64(&r, &out->tensors[i].dims[d])) goto fail;
         }
-
         uint32_t type = 0;
         uint64_t offset = 0;
-        if (!read_u32(&r, &type) || !read_u64(&r, &offset)) {
-            gguf_close(gf);
-            return NULL;
-        }
-        gf->tensors[i].type = (ggml_type)type;
-        gf->tensors[i].offset = offset;
+        if (!read_u32(&r, &type) || !read_u64(&r, &offset)) goto fail;
+        out->tensors[i].type = (ggml_type)type;
+        out->tensors[i].offset = offset;
     }
 
-    /* Calculate data alignment */
-    size_t align = gf->alignment;
-    if (align == 0) align = 1;   /* 防御：上面的解析已拦住 0，这里再兜一层 */
-    gf->tensor_data_offset = (r.pos + align - 1) / align * align;
-
-    /* 2026-10-25（第二版）：边界一律以【st_size】为准，不能用 mmap_size。
-     * mmap 是按页取整的，一个 57 字节的垃圾文件 mmap_size 是 16384，
-     * 拿它校验等于把整个页都当成合法数据 —— 上一版就漏在这里。
-     * 另：先查相对 offset 本身，再做加法，避免 abs_offset 回绕成 0。 */
-    if (gf->tensor_data_offset > gf->file_size && tensor_count > 0) {
-        fprintf(stderr, "gguf_open: tensor data offset %llu beyond file size %zu\n",
-                (unsigned long long)gf->tensor_data_offset, gf->file_size);
-        gguf_close(gf);
-        return NULL;
+    {
+        size_t align = (size_t)out->alignment;
+        if (align == 0) align = 1;
+        pt->tensor_data_offset = ((uint64_t)r.pos + align - 1) / align * align;
     }
-    /* ★ tensor_count == 0 时允许对齐填充越过 EOF：tokenizer-only 的 GGUF
-     *   本来就没有数据区，而对齐会把偏移推到文件尾之后。这不是损坏。 */
-    const size_t data_avail = (gf->tensor_data_offset <= gf->file_size)
-                              ? (size_t)(gf->file_size - (size_t)gf->tensor_data_offset)
-                              : 0u;
+
+    if (pt->tensor_data_offset > pt->file_size && tensor_count > 0) {
+        fprintf(stderr, "gguf_open: %s: tensor data offset %llu beyond file size %zu\n",
+                path, (unsigned long long)pt->tensor_data_offset, pt->file_size);
+        goto fail;
+    }
+    const size_t data_avail = (pt->tensor_data_offset <= pt->file_size)
+                              ? (size_t)(pt->file_size - (size_t)pt->tensor_data_offset) : 0u;
 
     for (uint64_t i = 0; i < tensor_count; i++) {
-        /* 先查相对 offset，再算绝对位置。
-         * 直接写 `tensor_data_offset + offset` 在 offset 极大时会回绕成 0，
-         * 于是张量指针指到文件头，边界检查也全部失效。 */
-        if (gf->tensors[i].offset > (uint64_t)data_avail) {
-            fprintf(stderr,
-                    "gguf_open: tensor %s offset %llu beyond data region (%zu bytes)\n",
-                    gf->tensors[i].name,
-                    (unsigned long long)gf->tensors[i].offset, data_avail);
-            gguf_close(gf);
-            return NULL;
+        if (out->tensors[i].offset > (uint64_t)data_avail) {
+            fprintf(stderr, "gguf_open: %s: tensor %s offset %llu beyond data region (%zu)\n",
+                    path, out->tensors[i].name,
+                    (unsigned long long)out->tensors[i].offset, data_avail);
+            goto fail;
         }
-        const size_t rel_offset = (size_t)gf->tensors[i].offset;
-        const size_t abs_offset = (size_t)gf->tensor_data_offset + rel_offset;
+        const size_t rel = (size_t)out->tensors[i].offset;
 
-        /* 元素数乘法溢出检查 + 类型合法性 */
         size_t n_elements = 1;
-        for (uint32_t d = 0; d < gf->tensors[i].n_dims; d++) {
-            const uint64_t dim = gf->tensors[i].dims[d];
+        for (uint32_t d = 0; d < out->tensors[i].n_dims; d++) {
+            const uint64_t dim = out->tensors[i].dims[d];
             if (dim != 0 && n_elements > SIZE_MAX / (size_t)dim) {
-                fprintf(stderr, "gguf_open: tensor %s has overflowing element count\n",
-                        gf->tensors[i].name);
-                gguf_close(gf);
-                return NULL;
+                fprintf(stderr, "gguf_open: %s: tensor %s element count overflows\n",
+                        path, out->tensors[i].name);
+                goto fail;
             }
             n_elements *= (size_t)dim;
         }
-
         size_t row = 0;
-        if (!ggml_type_row_size_checked(gf->tensors[i].type, n_elements, &row)) {
-            fprintf(stderr, "gguf_open: tensor %s byte size overflows size_t\n",
-                    gf->tensors[i].name);
-            gguf_close(gf);
-            return NULL;
+        if (!ggml_type_row_size_checked(out->tensors[i].type, n_elements, &row)) {
+            fprintf(stderr, "gguf_open: %s: tensor %s byte size overflows\n",
+                    path, out->tensors[i].name);
+            goto fail;
         }
-        gf->tensors[i].size_bytes = row;
+        if (row > (size_t)data_avail - rel) {
+            fprintf(stderr, "gguf_open: %s: tensor %s out of bounds (%zu > %zu)\n",
+                    path, out->tensors[i].name, row, (size_t)data_avail - rel);
+            goto fail;
+        }
+        out->tensors[i].size_bytes = row;
+        out->tensors[i].file_offset = pt->tensor_data_offset + (uint64_t)rel;
+        out->tensors[i].data = (const void *)(pt->mmap_addr + out->tensors[i].file_offset);
+    }
+    return true;
 
-        /* 区间必须在【真实文件】内。已排除 abs_offset 回绕，
-         * 但 row 本身也可能因元素数×类型字节数回绕成小值，
-         * 所以还要确认 row 不为 0 时确实落在剩余空间内。 */
-        if (row > (size_t)data_avail - rel_offset) {
-            fprintf(stderr,
-                    "gguf_open: tensor %s out of bounds (offset=%zu size=%zu, data region=%zu)\n",
-                    gf->tensors[i].name, rel_offset, row, data_avail);
-            gguf_close(gf);
-            return NULL;
+fail:
+    free_kvs(out->kvs, out->kv_count);
+    free(out->tensors);
+    memset(out, 0, sizeof(*out));
+    if (pt->mmap_addr) munmap(pt->mmap_addr, pt->mmap_size);
+    if (pt->fd >= 0) close(pt->fd);
+    memset(pt, 0, sizeof(*pt));
+    pt->fd = -1;
+    return false;
+}
+
+static gguf_file_t *gguf_open_split(const char *any_part, const char *prefix,
+                                    uint32_t total, int width) {
+    gguf_file_t *gf = (gguf_file_t *)calloc(1, sizeof(gguf_file_t));
+    if (!gf) return NULL;
+    gf->fd = -1;
+    gf->n_parts = total;
+    gf->parts = (gguf_part_t *)calloc(total, sizeof(gguf_part_t));
+    if (!gf->parts) { free(gf); return NULL; }
+    for (uint32_t i = 0; i < total; i++) gf->parts[i].fd = -1;
+
+    /* 先收集所有分片的张量数与名字，最后一次性分配合并数组 */
+    uint64_t merged_count = 0;
+    uint32_t version = 0;
+    uint64_t alignment = 0;
+    for (uint32_t i = 1; i <= total; i++) {
+        char path[4096];
+        const int n = snprintf(path, sizeof(path), "%s-%0*u-of-%0*u.gguf",
+                               prefix, width, i, width, total);
+        if (n <= 0 || (size_t)n >= sizeof(path)) {
+            fprintf(stderr, "gguf_open: split path too long\n");
+            goto fail;
         }
-        (void)abs_offset;
-        gf->tensors[i].data = (const void *)(gf->mmap_addr + abs_offset);
+        part_parse_t pp;
+        if (!parse_part(path, &gf->parts[i - 1], &pp)) {
+            fprintf(stderr, "gguf_open: split part %u/%u failed: %s\n", i, total, path);
+            goto fail;
+        }
+        if (i == 1) {
+            version = pp.version;
+            alignment = pp.alignment;
+            gf->kvs = pp.kvs;
+            gf->metadata_kv_count = pp.kv_count;
+            gf->version = version;
+            gf->alignment = alignment;
+        } else {
+            /* 其余分片的 KV 丢掉：只有 part 0 是权威 */
+            free_kvs(pp.kvs, pp.kv_count);
+            if (pp.version != version) {
+                fprintf(stderr, "gguf_open: split part %u version mismatch (%u vs %u)\n",
+                        i, pp.version, version);
+                free(pp.tensors);
+                goto fail;
+            }
+            if (pp.alignment != alignment) {
+                fprintf(stderr, "gguf_open: split part %u alignment mismatch (%llu vs %llu)\n",
+                        i, (unsigned long long)pp.alignment, (unsigned long long)alignment);
+                free(pp.tensors);
+                goto fail;
+            }
+        }
+        merged_count += pp.tensor_count;
+        /* 张量先暂存到该 part 的临时槽：借用 parts[i-1] 的字段存不下，
+         * 所以用一个链表式临时数组挂在 gf 上不合适 —— 这里改用
+         * 二次遍历：先把每个分片的张量数量记下来，再统一拷贝。 */
+        free(pp.tensors);   /* 见下方 second pass，这里只做校验 */
+        pp.tensors = NULL;
     }
 
+    /* 二次遍历：分配合并数组并填充 */
+    gf->tensors = (gguf_tensor_t *)calloc(merged_count ? merged_count : 1,
+                                          sizeof(gguf_tensor_t));
+    if (!gf->tensors) goto fail;
+    gf->tensor_count = merged_count;
+
+    uint64_t w = 0;
+    for (uint32_t i = 1; i <= total; i++) {
+        char path[4096];
+        snprintf(path, sizeof(path), "%s-%0*u-of-%0*u.gguf", prefix, width, i, width, total);
+        part_parse_t pp;
+        gguf_part_t tmp;
+        if (!parse_part(path, &tmp, &pp)) goto fail;
+        /* 复用第一次已经映射好的分片：把 tmp 的映射还给 gf->parts[i-1] 之外的释放 */
+        munmap(tmp.mmap_addr, tmp.mmap_size);
+        close(tmp.fd);
+        free_kvs(pp.kvs, pp.kv_count);
+
+        for (uint64_t k = 0; k < pp.tensor_count; k++) {
+            gguf_tensor_t t = pp.tensors[k];
+            t.part = (uint16_t)(i - 1);
+            t.data = (const void *)(gf->parts[i - 1].mmap_addr + t.file_offset);
+            gf->tensors[w++] = t;
+        }
+        free(pp.tensors);
+    }
+
+    gf->fd = gf->parts[0].fd;
+    gf->mmap_addr = gf->parts[0].mmap_addr;
+    gf->mmap_size = gf->parts[0].mmap_size;
+    gf->file_size = gf->parts[0].file_size;
+    gf->tensor_data_offset = gf->parts[0].tensor_data_offset;
+
+    /* 名字唯一性 */
+    for (uint64_t a = 0; a < gf->tensor_count; a++) {
+        for (uint64_t b = a + 1; b < gf->tensor_count; b++) {
+            if (strcmp(gf->tensors[a].name, gf->tensors[b].name) == 0) {
+                fprintf(stderr, "gguf_open: duplicate tensor across split parts: %s\n",
+                        gf->tensors[a].name);
+                goto fail;
+            }
+        }
+    }
+
+    /* 不用 MYDS_LOG_*：gguf 层被 test_gguf 单独链接，那里没有 myds_log.o。 */
+    fprintf(stderr, "gguf: %u-part split, %llu tensors, prefix %s\n",
+            total, (unsigned long long)gf->tensor_count, prefix);
+    (void)any_part;
+    return gf;
+
+fail:
+    gguf_close(gf);
+    return NULL;
+}
+
+gguf_file_t *gguf_open(const char *path) {
+    char prefix[4096];
+    uint32_t idx = 0, total = 0;
+    int width = 0;
+    if (split_parse_name(path, prefix, sizeof(prefix), &idx, &total, &width) && total > 1) {
+        return gguf_open_split(path, prefix, total, width);
+    }
+
+    gguf_file_t *gf = (gguf_file_t *)calloc(1, sizeof(gguf_file_t));
+    if (!gf) return NULL;
+    gf->fd = -1;
+    gf->n_parts = 1;
+    gf->parts = (gguf_part_t *)calloc(1, sizeof(gguf_part_t));
+    if (!gf->parts) { free(gf); return NULL; }
+    gf->parts[0].fd = -1;
+
+    part_parse_t pp;
+    if (!parse_part(path, &gf->parts[0], &pp)) {
+        free(gf->parts);
+        free(gf);
+        return NULL;
+    }
+
+    gf->fd = gf->parts[0].fd;
+    gf->mmap_addr = gf->parts[0].mmap_addr;
+    gf->mmap_size = gf->parts[0].mmap_size;
+    gf->file_size = gf->parts[0].file_size;
+    gf->tensor_data_offset = gf->parts[0].tensor_data_offset;
+    gf->version = pp.version;
+    gf->alignment = pp.alignment;
+    gf->tensor_count = pp.tensor_count;
+    gf->metadata_kv_count = pp.kv_count;
+    gf->kvs = pp.kvs;
+    gf->tensors = pp.tensors;
     return gf;
 }
 
+bool gguf_tensor_source(const gguf_file_t *f, const gguf_tensor_t *t,
+                        int *fd, uint64_t *file_offset) {
+    if (!f || !t) return false;
+    if (f->parts && f->n_parts && t->part < f->n_parts) {
+        const gguf_part_t *pt = &f->parts[t->part];
+        if (pt->fd < 0 || t->file_offset >= pt->file_size) return false;
+        if (fd) *fd = pt->fd;
+        if (file_offset) *file_offset = t->file_offset;
+        return true;
+    }
+    /* 兼容路径：调用方可以手工构造 gguf_file_t（单测就是这么做的，
+     * 只填 fd/kvs/tensors，没有 parts）。那种结构只有单文件语义，
+     * 所以按改动前的算法拼 fd + (tensor_data_offset + tensor.offset)。 */
+    if (f->fd < 0) return false;
+    if (fd) *fd = f->fd;
+    if (file_offset) *file_offset = f->tensor_data_offset + t->offset;
+    return true;
+}
 void gguf_close(gguf_file_t *f) {
     if (!f) return;
-    if (f->kvs) {
-        for (uint64_t i = 0; i < f->metadata_kv_count; i++) {
-            free(f->kvs[i].key);
-            if (f->kvs[i].type == GGUF_TYPE_STRING) {
-                free(f->kvs[i].value.val_str);
-            } else if (f->kvs[i].type == GGUF_TYPE_ARRAY) {
-                if (f->kvs[i].value.val_arr.elem_type == GGUF_TYPE_STRING) {
-                    char **strs = (char **)f->kvs[i].value.val_arr.data;
-                    if (strs) {
-                        for (uint64_t j = 0; j < f->kvs[i].value.val_arr.count; j++) {
-                            free(strs[j]);
-                        }
-                        free(strs);
-                    }
-                } else {
-                    free(f->kvs[i].value.val_arr.data);
-                }
-            }
+    free_kvs(f->kvs, f->metadata_kv_count);
+    free(f->tensors);
+    /* 2026-10-25 split：逐个分片解映射与关 fd。
+     * 单文件时 n_parts == 1，行为与改动前一致（它只映射一次）。 */
+    if (f->parts) {
+        for (uint32_t i = 0; i < f->n_parts; i++) {
+            if (f->parts[i].mmap_addr) munmap(f->parts[i].mmap_addr, f->parts[i].mmap_size);
+            if (f->parts[i].fd >= 0) close(f->parts[i].fd);
         }
-        free(f->kvs);
+        free(f->parts);
     }
-    if (f->tensors) free(f->tensors);
-    if (f->mmap_addr) munmap(f->mmap_addr, f->mmap_size);
-    if (f->fd >= 0) close(f->fd);
     free(f);
 }
 

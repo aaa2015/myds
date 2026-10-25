@@ -96,27 +96,51 @@ typedef struct {
     uint32_t    n_dims;
     uint64_t    dims[GGUF_MAX_DIMS];
     ggml_type   type;
-    uint64_t    offset;
-    const void *data;      /* Direct pointer into mmap file */
+    uint64_t    offset;      /* 相对于该分片数据区的偏移，与文件里的原始值一致 */
+    const void *data;        /* Direct pointer into that part's mmap */
     size_t      size_bytes;
+    /* 2026-10-25 split GGUF：这个张量存在哪个分片，以及在那个文件里的绝对偏移。
+     * 单文件时 part 恒为 0；engram 的 pread 路径必须用这两个字段，
+     * 否则拆片后会从 part 0 读一个位于 part 3 的张量。 */
+    uint16_t    part;
+    uint64_t    file_offset;
 } gguf_tensor_t;
 
+/* 一个分片的映射状态。单文件时 n_parts == 1。 */
 typedef struct {
-    int            fd;
-    uint8_t       *mmap_addr;
-    size_t         mmap_size;      /* 按页取整后的映射长度，【不是】文件长度 */
-    size_t         file_size;      /* st_size：真实文件长度，所有边界校验用这个 */
+    int      fd;
+    uint8_t *mmap_addr;
+    size_t   mmap_size;
+    size_t   file_size;
+    uint64_t tensor_data_offset;   /* 该分片自己的数据区起点 */
+} gguf_part_t;
+
+typedef struct {
+    int            fd;            /* = parts[0].fd，保留兼容 */
+    uint8_t       *mmap_addr;     /* = parts[0].mmap_addr */
+    size_t         mmap_size;     /* = parts[0].mmap_size */
+    size_t         file_size;     /* = parts[0].file_size */
     uint32_t       version;
     uint64_t       tensor_count;
     uint64_t       metadata_kv_count;
     gguf_kv_t     *kvs;
     gguf_tensor_t *tensors;
     uint64_t       alignment;
-    uint64_t       tensor_data_offset;
+    uint64_t       tensor_data_offset;   /* = parts[0] 的，保留兼容 */
+    /* 2026-10-25 split GGUF（llama.cpp `model-00001-of-00005.gguf` 形式）：
+     * 每个分片都是完整合法的 GGUF，各带自己的 header 与张量子集。
+     * n_parts == 1 时行为与改动前完全一致。 */
+    gguf_part_t   *parts;
+    uint32_t       n_parts;
 } gguf_file_t;
 
 gguf_file_t *gguf_open(const char *path);
 void         gguf_close(gguf_file_t *f);
+
+/* 取出张量数据所在的文件句柄与绝对偏移（split 感知）。
+ * engram 的 pread 路径必须用这个，不能自己拼 gf->fd + tensor_data_offset。 */
+bool gguf_tensor_source(const gguf_file_t *f, const gguf_tensor_t *t,
+                        int *fd, uint64_t *file_offset);
 
 const gguf_kv_t     *gguf_find_key(const gguf_file_t *f, const char *key);
 const gguf_tensor_t *gguf_find_tensor(const gguf_file_t *f, const char *name);

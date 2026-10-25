@@ -142,6 +142,43 @@ error: {
     }
 }
 
+/* 2026-10-25 split GGUF：从【已经打开的】gf 分片 fd 派生一个独立的 table fd。
+ *
+ * 为什么 dup 而不是直接复用 gf->parts[i].fd：table 的关闭语义是「关掉自己这一份」，
+ * 直接共用会让 gguf_close 与 engram_close 争相关同一个 fd（double close）。
+ * dup 保留同一个文件偏移语义（pread 本来就无状态），成本只是一个 fd。
+ *
+ * 为什么需要这个变体：拆片后张量分散在多个文件里，路径也不再是"模型路径"，
+ * 所以不能再走 path 版本。 */
+bool myds_engram_table_open_fd(myds_engram_table_t *table, int src_fd,
+                              uint64_t offset, uint32_t rows) {
+    if (!table) return fail(EINVAL);
+    *table = (myds_engram_table_t){.fd = -1};
+    const uint64_t bytes = (uint64_t)rows * MYDS_ENGRAM_ROW_BYTES;
+    if (src_fd < 0 || !rows || offset > INT64_MAX || bytes > INT64_MAX - offset)
+        return fail(EINVAL);
+    int fd = fcntl(src_fd, F_DUPFD_CLOEXEC, 0);
+    if (fd < 0) return false;
+    struct stat st;
+    if (fstat(fd, &st) != 0) goto error;
+    if (!S_ISREG(st.st_mode) || st.st_size < 0 || offset + bytes > (uint64_t)st.st_size) {
+        errno = EINVAL;
+        goto error;
+    }
+#ifdef __APPLE__
+    if (getenv("MYDS_ENGRAM_NOCACHE")) {
+        if (fcntl(fd, F_NOCACHE, 1) != 0 || fcntl(fd, F_RDAHEAD, 0) != 0) goto error;
+    }
+#endif
+    *table = (myds_engram_table_t){.fd = fd, .offset = offset, .rows = rows};
+    return true;
+error: {
+        int saved = errno;
+        close(fd);
+        return fail(saved);
+    }
+}
+
 void myds_engram_table_close(myds_engram_table_t *table) {
     if (!table) return;
     if (table->fd >= 0) close(table->fd);
@@ -624,20 +661,21 @@ myds_engram_t *myds_engram_create(const gguf_file_t *gf, const char *path,
     e->layout.pad_id = gguf_get_u32(gf, "deepseek41.engram.pad_id", UINT32_MAX);
     if (!myds_engram_layout_valid(&e->layout)) goto invalid;
     e->width = width;
-    struct stat model_stat;
-    if (fstat(gf->fd, &model_stat) != 0) goto error;
     for (int i = 0; i < MYDS_ENGRAM_LAYERS; ++i) {
         char name[128];
         snprintf(name, sizeof(name), "blk.%u.engram_embd.weight", e->layer_ids[i]);
         const gguf_tensor_t *table = gguf_find_tensor(gf, name);
-        if (!shape(table, GGML_TYPE_I8, MYDS_ENGRAM_ROW_BYTES, e->layout.rows[i]) ||
-            table->offset > UINT64_MAX - gf->tensor_data_offset) goto invalid;
-        if (!myds_engram_table_open(&e->table[i], path, gf->tensor_data_offset + table->offset,
-                                   e->layout.rows[i])) goto error;
-        struct stat table_stat;
-        if (fstat(e->table[i].fd, &table_stat) != 0) goto error;
-        if (model_stat.st_dev != table_stat.st_dev || model_stat.st_ino != table_stat.st_ino)
+        if (!shape(table, GGML_TYPE_I8, MYDS_ENGRAM_ROW_BYTES, e->layout.rows[i]))
             goto invalid;
+        /* 2026-10-25 split GGUF：不能再自己拼 gf->fd + gf->tensor_data_offset。
+         * 拆片后这个张量可能在 part 3，而 gf->fd 只是 part 0 —— 那样会从错误的
+         * 文件读、且偏移也是错的（甚至越界）。gguf_tensor_source 给出正确的
+         * 分片 fd 与文件内绝对偏移。 */
+        int src_fd = -1;
+        uint64_t src_offset = 0;
+        if (!gguf_tensor_source(gf, table, &src_fd, &src_offset)) goto invalid;
+        if (!myds_engram_table_open_fd(&e->table[i], src_fd, src_offset,
+                                       e->layout.rows[i])) goto error;
         snprintf(name, sizeof(name), "blk.%u.engram_kv.weight", e->layer_ids[i]);
         e->projection[i] = gguf_find_tensor(gf, name);
         snprintf(name, sizeof(name), "blk.%u.engram_q_norm.weight", e->layer_ids[i]);
