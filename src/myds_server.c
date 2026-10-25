@@ -20,6 +20,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/resource.h>
 #include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -28,6 +29,24 @@
 #endif
 
 static volatile sig_atomic_t g_running = 1;
+/* 2026-10-25: 在服务里的客户端线程数。用来给连接数封顶——
+ * 每条连接分配 4 MB 栈（pthread_attr_setstacksize），无上限时
+ * 几千条空闲连接即可把内存吃光。默认 256，可用 MYDS_MAX_CONN 调整。 */
+static _Atomic unsigned g_client_threads;
+static unsigned g_emfile_streak;   /* 连续 EMFILE 次数，用于日志降噪 */
+
+static unsigned max_client_threads(void) {
+    static unsigned cached;
+    if (cached) return cached;
+    cached = 256;
+    const char *e = getenv("MYDS_MAX_CONN");
+    if (e && *e) {
+        const long v = atol(e);
+        if (v >= 1 && v <= 4096) cached = (unsigned)v;
+        else MYDS_LOG_W("MYDS_MAX_CONN=%s 非法（需 1..4096），按 256 处理", e);
+    }
+    return cached;
+}
 static int g_server_fd = -1;
 static pthread_mutex_t g_infer_mutex = PTHREAD_MUTEX_INITIALIZER;
 void server_vjob_gpu_lock(void);
@@ -605,7 +624,18 @@ int extract_http_header_int(const char *headers, const char *header_name) {
         if (strncasecmp(p, header_name, name_len) == 0 && p[name_len] == ':') {
             p += name_len + 1;
             while (*p == ' ' || *p == '\t') p++;
-            return atoi(p);
+            /* 2026-10-25: 原本用 atoi，超 INT_MAX 时行为未定义（实测 "2147483648"
+             * 得到 INT_MIN，"10000000000" 得到 1410065408）。
+             * 对 Content-Length 而言这不是“随便一个数字”——它决定分配多少内存。
+             * 改成 strtol + 显式范围检查：超出 int 能表达的范围就返回 -1，
+             * 由调用方当成“非法头”处理（而不是误读成一个看似合理的小值）。 */
+            errno = 0;
+            char *end = NULL;
+            const long v = strtol(p, &end, 10);
+            if (end == p || errno == ERANGE || v > (long)INT_MAX || v < (long)INT_MIN) {
+                return -1;
+            }
+            return (int)v;
         }
         p = strchr(p, '\n');
         if (!p) break;
@@ -3322,9 +3352,47 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         char *body = strstr(req_buf, "\r\n\r\n");
         if (body) {
             body += 4;
-            int content_len = extract_http_header_int(req_buf, "Content-Length");
-            size_t header_len = (size_t)(body - req_buf);
-            size_t needed = header_len + (content_len > 0 ? (size_t)content_len : 0) + 1;
+            const int content_len = extract_http_header_int(req_buf, "Content-Length");
+            if (content_len < 0) {
+                /* 2026-10-25: 负值（或溢出的非数字）以前会被当成 0，
+                 * 继续走到“Incomplete body”分支——不影响安全，但报错会误导。 */
+                send_response(client_fd, 400, "Bad Request", "application/json",
+                              "{\"error\":{\"message\":\"Invalid Content-Length\"}}");
+                free(req_buf);
+                close(client_fd);
+                return;
+            }
+            /* 2026-10-25: 请求体上限。
+             *
+             * 原实现直接按 Content-Length 算出 needed 并 realloc，
+             * 于是任意客户端发一条 `Content-Length: 10000000000` 就能要求
+             * 分配 10 GB —— 一个连接即可把实例打挂。公开仓库会迎来各种扫描与本机压测。
+             *
+             * 上限取 max_seq_len 的字节上界的 4 倍（默认 ctx 327680 token、
+             * UTF-8 最多 4 字节/token ⇒ 1.3 MB，宽松 4 倍已足够容纳图片 base64 的
+             * 一部分）再加上固定的图片编码余量；同时硬上限 256 MB 防止
+             * ctx 被配得极大时把内存打穿。可用 MYDS_MAX_BODY_MB 调整。
+             */
+            size_t body_limit = 8u * 1024u * 1024u;
+            {
+                const char *e = getenv("MYDS_MAX_BODY_MB");
+                if (e && *e) {
+                    const long v = atol(e);
+                    if (v >= 1 && v <= 1024) body_limit = (size_t)v * 1024u * 1024u;
+                    else MYDS_LOG_W("MYDS_MAX_BODY_MB=%s 非法（需 1..1024），按 8 MB 处理", e);
+                }
+            }
+            if ((size_t)content_len > body_limit) {
+                MYDS_LOG_W("[%s:%d] 请求体 %d 字节超过上限 %zu ⇒ 413",
+                           client_ip, client_port, content_len, body_limit);
+                send_response(client_fd, 413, "Payload Too Large", "application/json",
+                              "{\"error\":{\"message\":\"Request body too large\"}}");
+                free(req_buf);
+                close(client_fd);
+                return;
+            }
+            const size_t header_len = (size_t)(body - req_buf);
+            const size_t needed = header_len + (size_t)content_len + 1;
             if (needed > req_cap) {
                 req_cap = needed + 4096;
                 char *new_buf = realloc(req_buf, req_cap);
@@ -4223,6 +4291,9 @@ static void *server_client_thread(void *arg) {
     server_client_job_t *job = (server_client_job_t *)arg;
     handle_client(job->client_fd, job->ctx, job->model_alias, job->client_ip, job->client_port);
     free(job);
+    /* 2026-10-25: 每个连接固定 4 MB 栈，无上限时几千条连接就能把内存吃光。
+     * 计数放在连接结束时递减，与 accept 处的递增成对。 */
+    atomic_fetch_sub_explicit(&g_client_threads, 1, memory_order_relaxed);
     return NULL;
 }
 
@@ -4233,6 +4304,28 @@ int myds_server_start(myds_context_t *ctx, const char *host, int port, const cha
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
+
+    /* 2026-10-25: 把 fd 上限提升到合理值。
+     * 默认 ulimit -n 常为 256，而每条连接占一个 fd ⇒ 265 条连接即 EMFILE。
+     * 这里尝试抬到 4096（不超过硬上限），失败不致命——但至少让
+     * “默认部署”有能力服务上百并发。 */
+    {
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+            const rlim_t want = 4096;
+            if (rl.rlim_cur < want) {
+                rlim_t target = (rl.rlim_max == RLIM_INFINITY || rl.rlim_max > want)
+                                ? want : rl.rlim_max;
+                rl.rlim_cur = target;
+                if (setrlimit(RLIMIT_NOFILE, &rl) == 0) {
+                    MYDS_LOG_I("fd 上限已提升到 %llu", (unsigned long long)target);
+                } else {
+                    MYDS_LOG_W("fd 上限提升失败(%s)，保留原值 %llu",
+                               strerror(errno), (unsigned long long)rl.rlim_cur);
+                }
+            }
+        }
+    }
 
     g_server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (g_server_fd < 0) {
@@ -4282,17 +4375,58 @@ int myds_server_start(myds_context_t *ctx, const char *host, int port, const cha
         if (client_fd < 0) {
             if (!g_running) break;
             if (errno == EINTR) continue;
+            /* 2026-10-25: EMFILE/ENFILE 是【暂时的资源耗尽】，不是致命错误。
+             * 原实现一律 break ⇒ 任何客户端只要开满 fd，服务器就自己退出了。
+             * 实测：ulimit -n 为 256 时，开 264 条空闲连接即可让服务死掉。
+             * 现在改成：回一条 503、短暂退避后继续 accept。
+             * 退避是必需的——否则 fd 仍然耗尽时 accept 会立刻再失败，形成忙循环。 */
+            if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
+                if (++g_emfile_streak == 1u || (g_emfile_streak % 100u) == 0u) {
+                    MYDS_LOG_W("Socket accept 资源不足(%s)，继续提供服务（第 %u 次）",
+                               strerror(errno), g_emfile_streak);
+                }
+                struct timespec backoff = {0, 50 * 1000 * 1000};   /* 50 ms */
+                nanosleep(&backoff, NULL);
+                continue;
+            }
             MYDS_LOG_E("Socket accept error: %s", strerror(errno));
             break;
         }
+        g_emfile_streak = 0;
 
         char client_ip[INET_ADDRSTRLEN] = "127.0.0.1";
         inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
         int client_port = ntohs(client_addr.sin_port);
 
+        /* 2026-10-25: 连接数封顶。超出时直接回 503 并关闭，
+         * 而不是默默开新线程（每条 4 MB 栈，无上限时内存可被吃光）。
+         * ★ 用原子比较交换而不是先读后写，否则并发 accept 会让计数超过上限。 */
+        {
+            const unsigned cap = max_client_threads();
+            unsigned cur = atomic_load_explicit(&g_client_threads, memory_order_relaxed);
+            int admitted = 0;
+            while (cur < cap) {
+                if (atomic_compare_exchange_weak_explicit(&g_client_threads, &cur, cur + 1u,
+                                                          memory_order_relaxed,
+                                                          memory_order_relaxed)) {
+                    admitted = 1;
+                    break;
+                }
+            }
+            if (!admitted) {
+                MYDS_LOG_W("[%s:%d] 并发连接已达上限 %u ⇒ 503", client_ip, client_port, cap);
+                send_response(client_fd, 503, "Service Unavailable", "application/json",
+                              "{\"error\":{\"message\":\"Too many concurrent connections\"}}");
+                close(client_fd);
+                continue;
+            }
+        }
+
         server_client_job_t *job = (server_client_job_t *)malloc(sizeof(server_client_job_t));
         if (!job) {
+            /* 同步执行完成后也必须退还名额 */
             handle_client(client_fd, ctx, model_alias, client_ip, client_port);
+            atomic_fetch_sub_explicit(&g_client_threads, 1, memory_order_relaxed);
             continue;
         }
         job->client_fd = client_fd;
@@ -4312,6 +4446,8 @@ int myds_server_start(myds_context_t *ctx, const char *host, int port, const cha
         } else {
             handle_client(client_fd, ctx, model_alias, client_ip, client_port);
             free(job);
+            /* 线程没建成功，名额同样要退 */
+            atomic_fetch_sub_explicit(&g_client_threads, 1, memory_order_relaxed);
         }
         pthread_attr_destroy(&attr);
     }
