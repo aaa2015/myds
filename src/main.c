@@ -22,7 +22,7 @@ static void print_usage(const char *prog) {
     printf("Options:\n");
     printf("  -m, --model <path>      Path to DeepSeek V4/V4.1 GGUF model (required)\n");
     printf("  --port <port>           Run HTTP server on specified port\n");
-    printf("  --host <host>           Host to listen on (default: 0.0.0.0)\n");
+    printf("  --host <host>           Host to listen on (default: 127.0.0.1; no auth, use a proxied 0.0.0.0 only)\n");
     printf("  --alias <name>          Model alias for API responses (default: myds)\n");
     printf("  --vision <file>         Vision encoder GGUF (enables image input; omit = text only)\n");
     printf("  --dspark, --mtp-model <path>  DSpark support model GGUF for speculative decoding\n");
@@ -181,7 +181,10 @@ int main(int argc, char *argv[]) {
 #endif
     const char *model_path = NULL;
     const char *prompt = NULL;
-    const char *host = "0.0.0.0";
+    /* 2026-10-25: 默认只监听回环。服务端没有任何认证，绑定 0.0.0.0 等于
+     * 把推理接口连同模型暴露给整个网段。要对外提供服务需显式 --host 0.0.0.0，
+     * 并在前面放一层带鉴权的反代。 */
+    const char *host = "127.0.0.1";
     const char *alias = "myds";
     const char *vision_path = NULL;
     const char *dspark_path = NULL;

@@ -716,6 +716,15 @@ test: $(ALL_TESTS) $(METALLIB)
 	@./$(TEST_INDEXER_WINDOW)
 	@MYDS_INDEXER_KEY_WINDOW=8 ./$(TEST_INDEXER_WINDOW)
 	@MYDS_INDEXER_KEY_WINDOW=20 ./$(TEST_INDEXER_WINDOW)
+	@./$(TEST_GGUF_BOUNDS)
+	@echo ""
+	# 2026-10-25: 以下五个一直在 ALL_TESTS 里却从未被 test 目标执行。
+	# 加进来是为了让「make test 全绿」这句话真的覆盖它们。
+	@./$(TEST_Q4_BF16_PARITY)
+	@./$(TEST_METAL_RESIDENCY)
+	@./$(TEST_TEARDOWN_ORDER)
+	@./$(TEST_KVDSK_FIFO)
+	@./$(TEST_ANCHOR_SLOTS)
 	@echo "\n========================================================"
 	@echo "      ALL TEST SUITES PASSED CLEANLY & SUCCESSFULLY!    "
 	@echo "========================================================"

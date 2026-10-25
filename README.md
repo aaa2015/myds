@@ -159,6 +159,28 @@ prefill 与 decode 都已无两位数收益方向。
   - 内置 merge-rank byte BPE、JoyAI 预分词、显式字节长度解码与 UTF-8 流式输出
   - `make` 构建本地程序与测试；另有独立 HF tokenizer 与 ds4 tensor 对照工具
 
+### 一个不属于本仓库的运行时依赖
+
+`tools/slim_dense_q4.py` （把 dense 权重从 Q8_0 压到 Q4_K）**需要 `libds4quants`**。
+那个库是 Q4_K 量化内核的分发产物，不随本仓库发布，所以 **fresh clone 直接跑会报
+找不到库**——这是预期行为，不是安装残缺。
+
+两种供法：
+
+```bash
+# ① 显式指定
+python3 tools/slim_dense_q4.py --in model-q8.gguf --out model-q4.gguf \
+       --quants-lib /path/to/libds4quants.dylib
+
+# ② 放到默认搜索位置之一
+#   <repo>/ds4/gguf-tools/libds4quants.{dylib,so}
+#   ~/Projects/ds4/gguf-tools/libds4quants.{dylib,so}
+```
+
+**没有纯 Python 回退实现**：Q4_K 的分块量化必须与推理内核逐位一致，
+用 numpy 重写一遍只会得到“看起来对但和 kernel 不同”的权重。
+报错信息会把所有搜索路径与两种供法都打出来。
+
 ---
 
 ## 项目结构

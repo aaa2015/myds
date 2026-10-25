@@ -192,7 +192,24 @@ def load_quants_library(custom_path: str | None = None) -> tuple[ctypes.CDLL, st
             with open(resolved, "rb") as f:
                 lib_sha = hashlib.sha256(f.read()).hexdigest()
             return lib, resolved, lib_sha
-    sys.exit(f"Error: Could not locate libds4quants.{suffix}. Tried: {paths}")
+
+    # 2026-10-25: 报错必须告诉调用方【怎么办】，而不是只列一串路径。
+    # 这个库不属于本仓库（它是 Q4_K 量化内核的分发产物），所以 clone 下来
+    # 必然没有它；把所有查找路径和获取方式写清楚，比“找不到”有用得多。
+    tried = "\n".join(f"    {p}" for p in paths)
+    sys.exit(
+        f"Error: libds4quants.{suffix} not found.\n"
+        f"\n"
+        f"This library implements the Q8_0 -> Q4_K quantiser and is distributed with the\n"
+        f"engine's build, not with this source tree, so a fresh clone will not contain it.\n"
+        f"\n"
+        f"Searched:\n{tried}\n"
+        f"\n"
+        f"Provide it explicitly with --quants-lib <path>, or build it and place it at\n"
+        f"  <repo>/ds4/gguf-tools/libds4quants.{suffix}\n"
+        f"The conversion cannot proceed without it; there is no pure-Python fallback\n"
+        f"because Q4_K requires the exact same rounding as the inference kernel."
+    )
 
 
 def _setup_lib(lib: ctypes.CDLL):
