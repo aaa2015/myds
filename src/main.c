@@ -117,11 +117,27 @@ static float cfg_f32_env(const char *key, float def, float lo, float hi) {
 }
 
 static int load_config_early(int argc, char *argv[]) {
-    const char *path = NULL;
-    /* --config <path> 优先 */
+    /* ★ 2026-10-25：--config 可重复，按出现顺序叠加（后者覆盖前者）。
+     *
+     * 为什么不满足于单文件：近似开关（如 MYDS_YOCO_COMPACT）必须按【服务】区分，
+     * 而配置文件是 MYDS_* 的唯一来源（下面 override_env 的那段说明）。
+     * 如果只能给一个文件，想让一个臂开近似就得整份复制 myds.conf ——
+     * 两份全量配置必然慢慢漂移，而漂移的后果是“对比实验的变量不止一个”。
+     * 允许叠加后，覆盖文件可以只写差异行：
+     *     --config myds.conf --config myds.conf.non0ulp
+     * 主文件仍是唯一全量真源，覆盖文件只表达本臂的偏离。
+     *
+     * 注意：这里刻意【不】因为某个文件读失败就中止 —— 缺文件时打警告并继续，
+     * 与下面候选路径的宽容度保持一致；真正需要硬失败的是“一个都没读到”。 */
+    int loaded = 0;
     for (int i = 1; i + 1 < argc; i++) {
-        if (strcmp(argv[i], "--config") == 0) { path = argv[i + 1]; break; }
+        if (strcmp(argv[i], "--config") != 0) continue;
+        if (myds_configfile_load(argv[i + 1], true) > 0) loaded++;
+        i++;   /* 跳过路径值，避免把它误当成下一个 flag */
     }
+    if (loaded > 0) return loaded;
+
+    const char *path = NULL;
     if (!path) {
         const char *e = getenv("MYDS_CONFIG");
         if (e && *e) path = e;
