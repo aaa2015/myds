@@ -252,6 +252,12 @@ static _Atomic uint64_t moe_wh_log[MOE_WH_LOG_BINS];    /* 最小权重的对数
 static const float moe_wh_thr[MOE_WH_THRESH] = {1e-2f, 5e-2f, 1e-1f, 2e-1f};
 static _Atomic uint64_t moe_wh_cnt[MOE_WH_THRESH][7];  /* 低于阈值的槽位数 0..6 */
 static _Atomic uint32_t moe_wh_tokens;
+/* 原始值样本（2026-10-25）：和不对时直接看前几行到底写了什么。
+ * 不再猜布局、不再猜缩放因子 —— 先看清楚再下结论。 */
+#define MOE_WH_SAMPLE_ROWS 3
+static float moe_wh_sample[MOE_WH_SAMPLE_ROWS][8];
+static _Atomic uint32_t moe_wh_sample_rows;
+static _Atomic uint32_t moe_wh_sample_k;
 /* 自洽检查（2026-10-25）：路由权重按定义【每行 6 个之和 ≈ 1.0】。
  * 如果读到的是交错/错位的 buffer，和会明显偏离 1 —— 那是观测 bug，不是模型特征。
  * 不先过这一关，后面所有“可跳 N 个槽位”的结论都不可信。 */
@@ -285,6 +291,15 @@ void myds_v41_moe_weight_hist_observe(myds_metal_buffer_t *weights, uint32_t row
     myds_metal_barrier_buffer(weights);
     const float *w = (const float *)myds_metal_buffer_data(weights);
     if (!w) return;
+    /* 只采一次样本（第一次调用时的前 3 行） */
+    if (atomic_load_explicit(&moe_wh_sample_rows, memory_order_relaxed) == 0u) {
+        const uint32_t ns = rows < MOE_WH_SAMPLE_ROWS ? rows : MOE_WH_SAMPLE_ROWS;
+        for (uint32_t r = 0; r < ns; r++)
+            for (uint32_t k = 0; k < 8u; k++)
+                moe_wh_sample[r][k] = (k < top_k) ? w[(size_t)r * top_k + k] : 0.0f;
+        atomic_store_explicit(&moe_wh_sample_k, top_k, memory_order_relaxed);
+        atomic_store_explicit(&moe_wh_sample_rows, ns, memory_order_relaxed);
+    }
     for (uint32_t r = 0; r < rows; r++) {
         const float *row = w + (size_t)r * top_k;
         float mn = INFINITY;
@@ -327,6 +342,25 @@ void myds_v41_moe_weight_hist_report(const char *tag, bool reset) {
                        : atomic_load_explicit(&moe_wh_all_hist[i], memory_order_relaxed);
     }
     if (reset) atomic_store_explicit(&moe_wh_tokens, 0, memory_order_relaxed);
+    /* ── 原始值样本：布局/缩放存在疑问时，先看清楚实际数字 ── */
+    {
+        const uint32_t sr = reset ? atomic_exchange_explicit(&moe_wh_sample_rows, 0, memory_order_relaxed)
+                                  : atomic_load_explicit(&moe_wh_sample_rows, memory_order_relaxed);
+        const uint32_t sk = atomic_load_explicit(&moe_wh_sample_k, memory_order_relaxed);
+        if (sr) {
+            char b0[384];
+            size_t o0 = 0;
+            o0 += (size_t)snprintf(b0 + o0, sizeof(b0) - o0, "top_k=%u | ", sk);
+            for (uint32_t r = 0; r < sr; r++) {
+                o0 += (size_t)snprintf(b0 + o0, sizeof(b0) - o0, "row%u=[", r);
+                for (uint32_t k = 0; k < sk && k < 8u; k++)
+                    o0 += (size_t)snprintf(b0 + o0, sizeof(b0) - o0, "%.5f%s",
+                                           (double)moe_wh_sample[r][k], k + 1u < sk ? "," : "");
+                o0 += (size_t)snprintf(b0 + o0, sizeof(b0) - o0, "] ");
+            }
+            MYDS_LOG_I("[%s] 原始权重样本 %s", tag ? tag : "moe-hist", b0);
+        }
+    }
     /* ── 自洽检查必须在所有结论之前：和不为 1 就说明读错 buffer 了 ── */
     {
         const uint64_t ok = reset ? atomic_exchange_explicit(&moe_wh_row_ok, 0, memory_order_relaxed)
