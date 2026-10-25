@@ -2662,7 +2662,8 @@ MoE down 实测 286–353 GB/s，**与 82K 线程的模拟上限完全吻合**�
 
 ## 17. P1 实测落锤：Prefill Chunk 2048 与 Macroblock 8192（2026-10-21）
 
-> 验证脚本与原始数据归档于 `docs/verification/2026-10-21-prefill-chunk-macroblock-ab/`。
+> ⚠️ 原注：验证脚本与原始数据归档于 `docs/verification/2026-10-21-prefill-chunk-macroblock-ab/`——
+> 该目录未随仓库发布（证据树不入库，见 §97.6）。本节数字由下面的实测表自证。
 > 测试主机：macstudio（M2 Ultra 192 GB，76 核 GPU）；二进制：`c921666fef49fac8ece6ccd287b123b9`。
 > 注入全部 49 个生产环境变量，通过单飞安全锁在生产端口启闭实例，测试完毕已自动恢复生产 8187。
 
@@ -6768,8 +6769,7 @@ if (moe_off == cw->moe_batch || c_start + c_len == mb_len ||
 差一个数量级。同时按 §0.5 第 7 条（死代码比没实现更危险），启用前必须先用
 `tests/test_pld.c` 证明它算得对，不能凭「有现成的」就接线。
 
-**方案引用的 96% 接受率**出自 `bench_synthetic --prompt-tokens 512`（`docs/verification/
-2026-10-15-prefill-and-decode-regression-fix.md:122`），是**合成重复文本**，必然虚高。
+**方案引用的 96% 接受率**出自 `bench_synthetic --prompt-tokens 512`（原 `docs/verification/2026-10-15-prefill-and-decode-regression-fix.md:122`，该文件未随仓库发布），是**合成重复文本**，必然虚高。
 真实对话场景的接受率**从未测过**。
 
 ### 49.2 事实错误二：`prompt_res` 内存算错 2.5 倍

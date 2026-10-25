@@ -294,14 +294,9 @@ static const char *unimplemented_graph_feature(const gguf_file_t *gf) {
  *
  * 但截至 2026-09-29，它们已全部实现，并通过了独立的三方逐位对照：
  *
- *   ⚠️ 2026-10-25：以下三个路径在本仓库中【不存在】（证据树从未入库，见账本 §97.6）。
- *      保留名字仅为追溯历史；当前可用的证据入口是：
+ *   ⚠️ 2026-10-25：原引用的三份证据文档未随仓库发布。
+ *      当前可用的证据入口是性能账本：
  *        docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md
- *        docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md（§98/§100）
- *   原记（已失效路径）：
- *   证据  docs/verification/2026-09-29-batched-prefill-parity.md
- *         docs/verification/2026-09-29-decode-optimization-verification.md
- *         docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md
  *   方法  以 ds4 的 scalar 路径为【外部参照】，myds scalar/batched 为【内部一致】；
  *         覆盖 embedding / attn_norm / q_rope / attn_out / layer_out /
  *         route_* / ffnblock / logits（全 129280 值）等每位置 84 个阶段张量；

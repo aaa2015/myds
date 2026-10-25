@@ -839,7 +839,8 @@ int myds_metal_indexer_topk_threshold_stats(uint32_t words[9],bool reset) {
  *   只挂 queue        6.99 s → 每次请求都付 ~2.9 s（= 心跳已停的等价状态）
  *   挂 queue + 5 ms 心跳   0.19 s
  *   心跳保活 30 s < 空闲   2.92 s（因果对照：心跳停 ⇒ 又冷）
- *   → 详见 docs/verification/2026-09-29-per-request-latency-root-cause.md §14
+ *   → 依据见性能账本（原 docs/verification/2026-09-29-per-request-latency-root-cause.md §14，
+ *     该文件未随仓库发布）
  *
  * 开关：
  *   MYDS_NO_RESIDENCY_HB=1        整体关闭（应急回退，无需重编译）
@@ -6546,7 +6547,8 @@ static int routed_moe_batch_impl(
              *   SLOTS6 备用路径已于同日【删除】: 实测它能运行但【输出错误】
              *   (15.94 t/s + 乱码; 对比 FUSED 27.07 t/s + 逐位正确)。它是条会
              *   静默产出错误结果的路径 —— 宁可响亮失败, 也不要静默出错。
-             *   依据: docs/verification/2026-09-29-gpu-bottleneck-ablation.md §3/§9 */
+             *   依据: 性能账本（原 docs/verification/2026-09-29-gpu-bottleneck-ablation.md §3/§9，
+             *   该文件未随仓库发布） */
             if (q2_v41_allowed && moe_q2_v41_producer() && g_pso_moe_sum6_v41_q2_k) {
                 MYDS_LOG_I("MoE path: FUSED (2-step) with explicit V4.1 Q2 down");
             } else if (g_pso_moe_pair_swiglu_iq2_xxs && g_pso_moe_sum6_q2_k) {

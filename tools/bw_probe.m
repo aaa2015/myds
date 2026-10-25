@@ -1,7 +1,8 @@
 /* 吞吐 vs 片段尺寸探测（诊断工具）
  *
  * 用途：回答「某段代码的有效带宽为什么低于峰值」。
- * 结论与用法见 docs/verification/2026-09-29-gpu-bottleneck-ablation.md §9.1。
+ * 结论与用法见性能账本（原 docs/verification/2026-09-29-gpu-bottleneck-ablation.md §9.1，
+ * 该文件未随仓库发布）。
  *
  * 手动编译（Makefile 未收录，避免改动公共构建目标）:
  *   make bin/myds && cc -O3 -Wall -Wextra -Iinclude -fobjc-arc -c tools/bw_probe.m -o build/bw_probe.o

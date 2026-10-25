@@ -682,3 +682,4 @@ layout 按 replay recipe 从同一 GGUF 提取。QKV 的 stdout 含启动信息�
 
 支持图片输入（DeepSeek-V4.1-Flash-Vision），启动加 `--vision <编码器.gguf>`。
 使用、原理、验证与**明确不做**的范围：见 **docs/VISION.md**。
+
