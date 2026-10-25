@@ -327,6 +327,11 @@ typedef struct {
 
 /* mmap 一个分片并解析它的 header / KV / 张量，同时做边界校验。
  * 返回的张量 offset 仍是文件内相对值，data 指向该分片自己的映射。 */
+static bool parse_mapped(uint8_t *addr, size_t size, const char *path,
+                         gguf_part_t *pt, part_parse_t *out);
+
+/* 只做映射，解析交给 parse_mapped。拆开是为了让字节分段（多个文件拼成
+ * 一个连续 VA）能复用同一套解析与边界校验。 */
 static bool parse_part(const char *path, gguf_part_t *pt, part_parse_t *out) {
     memset(pt, 0, sizeof(*pt));
     pt->fd = -1;
@@ -353,6 +358,23 @@ static bool parse_part(const char *path, gguf_part_t *pt, part_parse_t *out) {
     pt->mmap_size = mmap_size;
     pt->file_size = size;
 
+    if (!parse_mapped(addr, size, path, pt, out)) {
+        munmap(addr, mmap_size);
+        close(fd);
+        memset(pt, 0, sizeof(*pt));
+        pt->fd = -1;
+        return false;
+    }
+    return true;
+}
+
+/* 从已映射的缓冲区解析 header/KV/张量，并做全部边界校验。
+ * addr 可以来自单文件、某个分片，或字节分段拼出的连续映射。 */
+static bool parse_mapped(uint8_t *addr, size_t size, const char *path,
+                         gguf_part_t *pt, part_parse_t *out) {
+    memset(out, 0, sizeof(*out));
+    pt->mmap_addr = addr;
+    pt->file_size = size;
     reader_t r = { .data = addr, .size = size, .pos = 0 };
     uint32_t magic = 0, version = 0;
     uint64_t tensor_count = 0, kv_count = 0;
@@ -472,14 +494,213 @@ static bool parse_part(const char *path, gguf_part_t *pt, part_parse_t *out) {
     return true;
 
 fail:
+    /* 只释放解析出来的数据结构；映射的所有权属于调用方。 */
     free_kvs(out->kvs, out->kv_count);
     free(out->tensors);
     memset(out, 0, sizeof(*out));
-    if (pt->mmap_addr) munmap(pt->mmap_addr, pt->mmap_size);
-    if (pt->fd >= 0) close(pt->fd);
-    memset(pt, 0, sizeof(*pt));
-    pt->fd = -1;
+    pt->mmap_addr = NULL;
+    pt->mmap_size = 0;
+    pt->tensor_data_offset = 0;
     return false;
+}
+
+/* ── 字节分段（contiguous byte-range parts）─────────────────────────────
+ *
+ * 为什么需要它：llama.cpp 的 split 按【张量边界】切，每个分片都是合法 GGUF。
+ * 但我们的权重里有两个 94.42 GiB 的 engram 张量，单个就超过托管方的单文件
+ * 上限 ⇒ 按张量切也传不上去。这种情况下只能按【固定字节长度】切，每片不是
+ * 合法 GGUF，合起来才是。
+ *
+ * 设计：把各分片映射进一段【连续的虚拟地址】，对上层完全等价于一个文件。
+ *   · 分片用 MAP_FIXED 逐个盖到预留区间上，偏移 = (i-1)*chunk。
+ *   · chunk 必须是页对齐的（1 MiB 对齐就满足），否则相邻分片的页会重叠。
+ *   · 因此 parsemapped 拿到的就是一个 size = total 的连续缓冲区，
+ *     所有既有边界校验与张量指针逻辑一行都不用改。
+ *
+ * 校验（缺片绝不能静默通过 —— 少了中间一片会让后半段整体错位）：
+ *   · 清单文件存在且字段自洽
+ *   · 除最后一片外，每片大小都等于清单里的 chunk
+ *   · 各片大小之和等于清单里的 total
+ *   · chunk 页对齐
+ *
+ * 清单格式（`<base>.parts`，纯文本，几十字节）：
+ *     myds-split 1
+ *     parts 8
+ *     chunk 45268074496
+ *     total 362142629888
+ */
+typedef struct {
+    uint32_t parts;
+    uint64_t chunk;
+    uint64_t total;
+} byte_split_t;
+
+/* 从 "<...>.partNN" 推出 base；失败返回 false（说明不是这种命名）。 */
+static bool byte_split_base(const char *path, char *base, size_t cap) {
+    if (!path || !base || cap == 0) return false;
+    const size_t n = strlen(path);
+    const char *dot = NULL;
+    for (size_t i = n; i > 0; i--) {
+        if (path[i - 1] == '.') { dot = path + i - 1; break; }
+    }
+    if (!dot) return false;
+    /* dot 指向 ".part01" 的那个点，所以从 dot 开始比。 */
+    if (strncmp(dot, ".part", 5) != 0) return false;
+    /* digit 从 ".part" 之后开始（dot+5），不是 dot+1 —— 否则会把 "part01"
+     * 当成数字串，isdigit('p') 为假，整个识别就永远失败。 */
+    const char *digits = dot + 5;
+    if (!*digits) return false;
+    for (const char *q = digits; *q; q++) if (!isdigit((unsigned char)*q)) return false;
+    if (strlen(digits) < 2) return false;
+    const size_t pre = (size_t)(dot - path);
+    if (pre + 1 >= cap) return false;
+    memcpy(base, path, pre);
+    base[pre] = '\0';
+    return pre > 0;
+}
+
+static bool byte_split_manifest(const char *base, byte_split_t *m) {
+    char path[4096];
+    const int n = snprintf(path, sizeof(path), "%s.parts", base);
+    if (n <= 0 || (size_t)n >= sizeof(path)) return false;
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    char line[256];
+    uint32_t ver = 0, parts = 0;
+    uint64_t chunk = 0, total = 0;
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long long a = 0, b = 0;
+        if (sscanf(line, "myds-split %u", &ver) == 1) continue;
+        if (sscanf(line, "parts %llu", &a) == 1) { parts = (uint32_t)a; continue; }
+        if (sscanf(line, "chunk %llu", &a) == 1) { chunk = a; continue; }
+        if (sscanf(line, "total %llu", &a) == 1) { total = a; continue; }
+        (void)b;
+    }
+    fclose(f);
+    if (ver != 1 || parts < 2 || !chunk || !total) return false;
+    if (chunk % (uint64_t)getpagesize() != 0) {
+        fprintf(stderr, "gguf_open: %s.parts: chunk %llu not page aligned\n", base,
+                (unsigned long long)chunk);
+        return false;
+    }
+    if ((uint64_t)(parts - 1) * chunk >= total + chunk) return false;
+    m->parts = parts;
+    m->chunk = chunk;
+    m->total = total;
+    return true;
+}
+
+static gguf_file_t *gguf_open_byte_split(const char *base, const byte_split_t *m) {
+    if (m->parts > 65535u) return NULL;
+    const size_t page = (size_t)getpagesize();
+    const size_t total_size = (size_t)m->total;
+    if (total_size != m->total) return NULL;   /* 32 位下放不下 */
+    const size_t reserve = (total_size + page - 1) / page * page;
+
+    /* 预留整段地址空间，再逐片 MAP_FIXED 覆盖。预留本身不占物理内存。 */
+    uint8_t *root = (uint8_t *)mmap(NULL, reserve, PROT_NONE,
+                                    MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (root == MAP_FAILED) {
+        fprintf(stderr, "gguf_open: cannot reserve %zu bytes of address space\n", reserve);
+        return NULL;
+    }
+
+    gguf_file_t *gf = (gguf_file_t *)calloc(1, sizeof(gguf_file_t));
+    if (!gf) goto fail_root;
+    gf->fd = -1;
+    gf->n_parts = 1;
+    gf->parts = (gguf_part_t *)calloc(1, sizeof(gguf_part_t));
+    if (!gf->parts) { free(gf); goto fail_root; }
+    gf->parts[0].fd = -1;
+
+    struct { int fd; uint8_t *addr; size_t len; } segs[65536];
+    uint32_t nseg = 0;
+    uint64_t covered = 0;
+    for (uint32_t i = 1; i <= m->parts; i++) {
+        char path[4096];
+        const int n = snprintf(path, sizeof(path), "%s.part%02u", base, i);
+        if (n <= 0 || (size_t)n >= sizeof(path)) goto fail_segs;
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) {
+            fprintf(stderr, "gguf_open: byte-split part %u/%u missing: %s\n",
+                    i, m->parts, path);
+            goto fail_segs;
+        }
+#if defined(__APPLE__) && defined(F_NOCACHE)
+        (void)fcntl(fd, F_NOCACHE, 1);
+#endif
+        struct stat st;
+        if (fstat(fd, &st) != 0) { close(fd); goto fail_segs; }
+        const size_t sz = (size_t)st.st_size;
+        const size_t want = (i < m->parts) ? (size_t)m->chunk : (size_t)(m->total - covered);
+        if (sz != want) {
+            fprintf(stderr, "gguf_open: byte-split part %u/%u size %zu, expected %zu\n",
+                    i, m->parts, sz, want);
+            close(fd);
+            goto fail_segs;
+        }
+        const size_t maplen = (sz + page - 1) / page * page;
+        uint8_t *dst = root + (size_t)covered;
+        void *got = mmap(dst, maplen, PROT_READ, MAP_SHARED | MAP_FIXED, fd, 0);
+        if (got == MAP_FAILED) {
+            fprintf(stderr, "gguf_open: byte-split part %u/%u cannot map at %p\n",
+                    i, m->parts, (void *)dst);
+            close(fd);
+            goto fail_segs;
+        }
+        segs[nseg].fd = fd;
+        segs[nseg].addr = dst;
+        segs[nseg].len = maplen;
+        nseg++;
+        covered += sz;
+    }
+    if (covered != m->total) {
+        fprintf(stderr, "gguf_open: byte-split covered %llu of %llu bytes\n",
+                (unsigned long long)covered, (unsigned long long)m->total);
+        goto fail_segs;
+    }
+
+    part_parse_t pp;
+    if (!parse_mapped(root, total_size, base, &gf->parts[0], &pp)) goto fail_segs;
+    gf->parts[0].fd = segs[0].fd;
+    gf->parts[0].mmap_addr = root;
+    gf->parts[0].mmap_size = reserve;
+
+    gf->fd = segs[0].fd;
+    gf->mmap_addr = root;
+    gf->mmap_size = reserve;
+    gf->file_size = total_size;
+    gf->tensor_data_offset = gf->parts[0].tensor_data_offset;
+    gf->version = pp.version;
+    gf->alignment = pp.alignment;
+    gf->tensor_count = pp.tensor_count;
+    gf->metadata_kv_count = pp.kv_count;
+    gf->kvs = pp.kvs;
+    gf->tensors = pp.tensors;
+    /* 标记：字节分段模式下 gguf_tensor_source 不可用（engram 必须走映射）。 */
+    gf->byte_split = 1;
+
+    /* 其余分片的 fd 保留打开：gguf_close 统一关闭。
+     * 记录方式：用 parts[0] 之后的空间不够（n_parts==1），所以这里
+     * 复用 fd 字段把首个 fd 存下，其余 fd 由 segs 的局部数组承载 ——
+     * 为避免复杂化，直接把多余 fd 关掉：映射已建立，pread 不再需要
+     * （engram 在 byte_split 模式走映射读取）。 */
+    for (uint32_t i = 1; i < nseg; i++) close(segs[i].fd);
+    fprintf(stderr, "gguf: byte-split %u parts, %llu bytes, %llu tensors\n",
+            m->parts, (unsigned long long)m->total,
+            (unsigned long long)gf->tensor_count);
+    return gf;
+
+fail_segs:
+    for (uint32_t i = 0; i < nseg; i++) {
+        if (segs[i].addr) munmap(segs[i].addr, segs[i].len);
+        if (segs[i].fd >= 0) close(segs[i].fd);
+    }
+    free(gf->parts);
+    free(gf);
+fail_root:
+    munmap(root, reserve);
+    return NULL;
 }
 
 static gguf_file_t *gguf_open_split(const char *any_part, const char *prefix,
@@ -596,6 +817,22 @@ fail:
 }
 
 gguf_file_t *gguf_open(const char *path) {
+    /* ① 字节分段（我们自己上传用的形式） */
+    {
+        char base[4096];
+        if (byte_split_base(path, base, sizeof(base))) {
+            byte_split_t m;
+            if (byte_split_manifest(base, &m)) {
+                return gguf_open_byte_split(base, &m);
+            }
+            fprintf(stderr,
+                    "gguf_open: %s looks like a byte-split part but %s.parts is missing "
+                    "or invalid; refusing rather than guessing the layout\n",
+                    path, base);
+            return NULL;
+        }
+    }
+    /* ② llama.cpp 的按张量 split：<prefix>-00001-of-00005.gguf */
     char prefix[4096];
     uint32_t idx = 0, total = 0;
     int width = 0;

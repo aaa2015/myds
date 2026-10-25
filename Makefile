@@ -124,6 +124,7 @@ ALL_TESTS = $(TEST_METAL) $(TEST_V41_GPU) $(TEST_ATTN_POLICY) $(TEST_ATTN_VEC) $
 #   Make 的先决条件在读取时就展开，晚于 all:/test: 的 += 不会进入那两个目标。
 TEST_GGUF_BOUNDS = $(BIN_DIR)/test_gguf_bounds
 TEST_GGUF_SPLIT = $(BIN_DIR)/test_gguf_split
+TEST_GGUF_BYTE_SPLIT = $(BIN_DIR)/test_gguf_byte_split
 
 $(TEST_GGUF_BOUNDS): tests/test_gguf_bounds.c $(BUILD_DIR)/myds_gguf.o | $(BIN_DIR)
 	$(CC) $(CFLAGS) -Iinclude -o $@ $< $(BUILD_DIR)/myds_gguf.o $(LDFLAGS)
@@ -132,7 +133,11 @@ $(TEST_GGUF_BOUNDS): tests/test_gguf_bounds.c $(BUILD_DIR)/myds_gguf.o | $(BIN_D
 $(TEST_GGUF_SPLIT): tests/test_gguf_split.c $(BUILD_DIR)/myds_gguf.o | $(BIN_DIR)
 	$(CC) $(CFLAGS) -Iinclude -o $@ $< $(BUILD_DIR)/myds_gguf.o $(LDFLAGS)
 
-ALL_TESTS += $(TEST_METAL_RESIDENCY) $(TEST_TEARDOWN_ORDER) $(TEST_DECODE_SPLIT) $(TEST_KVDSK_FIFO) $(TEST_ANCHOR_SLOTS) $(TEST_YOCO_COMPACT) $(TEST_INDEXER_WINDOW) $(TEST_GGUF_BOUNDS) $(TEST_GGUF_SPLIT)
+# 字节分段：固定长度切片 + 清单，验证跨片张量与缺片检测
+$(TEST_GGUF_BYTE_SPLIT): tests/test_gguf_byte_split.c $(BUILD_DIR)/myds_gguf.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) -Iinclude -o $@ $< $(BUILD_DIR)/myds_gguf.o $(LDFLAGS)
+
+ALL_TESTS += $(TEST_METAL_RESIDENCY) $(TEST_TEARDOWN_ORDER) $(TEST_DECODE_SPLIT) $(TEST_KVDSK_FIFO) $(TEST_ANCHOR_SLOTS) $(TEST_YOCO_COMPACT) $(TEST_INDEXER_WINDOW) $(TEST_GGUF_BOUNDS) $(TEST_GGUF_SPLIT) $(TEST_GGUF_BYTE_SPLIT)
 
 .PHONY: all test clean bench metallib build-tail-init test-tail-init
 
@@ -741,6 +746,7 @@ test: $(ALL_TESTS) $(METALLIB)
 	@MYDS_INDEXER_KEY_WINDOW=20 ./$(TEST_INDEXER_WINDOW)
 	@./$(TEST_GGUF_BOUNDS)
 	@./$(TEST_GGUF_SPLIT)
+	@./$(TEST_GGUF_BYTE_SPLIT)
 	@echo ""
 	# 2026-10-25: 以下五个一直在 ALL_TESTS 里却从未被 test 目标执行。
 	# 加进来是为了让「make test 全绿」这句话真的覆盖它们。

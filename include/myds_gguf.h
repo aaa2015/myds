@@ -132,6 +132,11 @@ typedef struct {
      * n_parts == 1 时行为与改动前完全一致。 */
     gguf_part_t   *parts;
     uint32_t       n_parts;
+    /* 2026-10-25 byte-split：多个固定长度字节分片被映射进一段连续 VA，
+     * 对上层等价于一个文件。这种模式下 gguf_tensor_source 不适用 ——
+     * 单个张量可能横跨两个分片，没有能表达它的单一 (fd, offset)。
+     * 需要 fd 的调用方（engram）必须改用 tensor->data 指向的映射。 */
+    bool           byte_split;
 } gguf_file_t;
 
 gguf_file_t *gguf_open(const char *path);
