@@ -297,6 +297,7 @@ static const char *unimplemented_graph_feature(const gguf_file_t *gf) {
  *   ⚠️ 2026-10-25：原引用的三份证据文档未随仓库发布。
  *      当前可用的证据入口是性能账本：
  *        docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md
+ *        docs/ULP_SWITCHES.md（0-ULP 开关清单与实测）
  *   方法  以 ds4 的 scalar 路径为【外部参照】，myds scalar/batched 为【内部一致】；
  *         覆盖 embedding / attn_norm / q_rope / attn_out / layer_out /
  *         route_* / ffnblock / logits（全 129280 值）等每位置 84 个阶段张量；
@@ -371,7 +372,7 @@ static myds_model_t *model_load_internal(const char *model_path, bool diagnostic
     if (missing_feature && !allowed) {
         MYDS_LOG_E("Cannot run this model correctly: native graph has not passed the correctness gate for %s. "
                    "Refusing inference rather than silently skipping model operations. "
-                   "See docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md.", missing_feature);
+                   "See docs/ULP_SWITCHES.md and the performance ledger.", missing_feature);
         gguf_close(gf);
         return NULL;
     }
@@ -379,7 +380,7 @@ static myds_model_t *model_load_internal(const char *model_path, bool diagnostic
         MYDS_LOG_W("DIAGNOSTIC ONLY: unvalidated graph (%s); logits require independent comparison",
                    missing_feature);
     } else if (missing_feature && !gate_force_off) {
-        MYDS_LOG_I("V4.1 native graph enabled: %s (verified — see the performance ledger)",
+        MYDS_LOG_I("V4.1 native graph enabled: %s (verified — see docs/ULP_SWITCHES.md)",
                    missing_feature);
     }
     if (!myds_metal_init("metal")) {
