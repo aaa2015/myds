@@ -1,5 +1,25 @@
 # DeepSeek V4.1 reference engine and tensor trace
 
+## 许可与来源（合规声明）
+
+本目录的工具用于构建**独立参照实现**，它们引用的是上游项目 **ds4**
+（`antirez/ds4` 的派生，本仓库 LICENSE 中的 "The ds4.c authors"）。
+
+| 项 | 值 |
+|---|---|
+| 上游许可 | **MIT** |
+| 本仓库如何使用 | 仅通过 `prepare_ds4.py` 从**调用方本机**的 ds4 源码导出并在本地编译；本仓库**不分发** ds4 的源码或二进制 |
+| 固定版本 | commit `6f873ad7f5940ab8556abc41ae510853118ecc4a` |
+| 导出规模 | **85 个文件 / 11,298,462 字节**（实测，2026-10-25） |
+| 归档 SHA256 | `bb67197f7444b6c43a045c4b444451c3ef74ce2b9df57b0e5c010f2975198b94` |
+
+**为什么本仓库不含 ds4 源码**：MIT 允许再分发，但把上游代码复制进来会让
+"哪个版本是权威"变得含糊，也使许可追溯更复杂。当前做法是要求使用者
+自备 ds4 源码（`--source-repo`），由脚本导出固定 commit 的闭包。
+
+**如果你要再分发本仓库**：上面这张表就是需要原样保留的署名信息；MIT 要求
+保留版权声明与许可文本，二者在本仓库的 `LICENSE` 中已包含。
+
 These tools construct an isolated, deterministic ds4 reference from commit
 `6f873ad7f5940ab8556abc41ae510853118ecc4a`. They read Git objects or a verified
 source archive. They never copy a ds4 working tree, overwrite an existing build,
@@ -22,8 +42,9 @@ python3 tools/reference/prepare_ds4.py \
   --build
 ```
 
-The selected source closure has 82 files and 11,279,442 bytes; its gzip archive
-is about 1.7 MiB. The uncompressed Git archive SHA256 is pinned in the script:
+The script verifies the **uncompressed** archive against the pinned hash below
+before it writes anything; the gzip wrapper is not part of the identity. Measured
+on 2026-10-25: 85 files, 11,298,462 bytes, gzip archive 1,833,776 bytes (1.75 MiB).
 
 ```text
 bb67197f7444b6c43a045c4b444451c3ef74ce2b9df57b0e5c010f2975198b94

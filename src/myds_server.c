@@ -241,6 +241,23 @@ static pthread_mutex_t g_resp_id_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* ── 2026-10-24：响应状态的持久化 ──
  *
+ * 🔒 隐私声明（2026-10-25 补充）
+ *
+ * 为了跨重启续跑，本机制会把【完整的累积提示词文本】以【明文】写入
+ *   $HOME/.cache/myds/responses.idx
+ * 文件权限为 0600（仅属主可读），但【未加密】。这意味着：
+ *   · 你向本服务发过的全部对话内容都会落盘，可能包含代码、密钥、个人数据；
+ *   · 同机的其他进程只要能读到该用户的文件，就能拿到这些内容；
+ *   · 备份/快照工具会把它们一并带走。
+ *
+ * 如果这不适合你的部署：
+ *   · 把 HOME 指到一个临时目录（缓存随之隔离）；
+ *   · 或定期删除该文件（代价是重启后无法续跑 previous_response_id）；
+ *   · 上游客户端也可以不用 previous_response_id，改为每轮重发完整历史。
+ *
+ * 为什么必须存文本而不是只存 token：kvdisk 只存 KV 字节，不存“这些字节
+ * 对应哪些 token”，没有文本就无法在重启后重建输入。
+ *
  * 问题：上面的注册表是静态数组，进程重启即清空。而客户端一旦改用
  * previous_response_id（suffix 模式），就不再重发历史 —— 服务端一重启，
  * 它手上的 id 变成 unknown，客户端却没有可 replay 的完整输入，会话直接断掉。
@@ -315,6 +332,10 @@ static void resp_state_save_locked(void) {
     if (slash) { *slash = '\0'; mkdir(dir, 0700); }
     FILE *f = fopen(tmp, "wb");
     if (!f) return;
+    /* 2026-10-25: 显式收窄到 0600。目录已经 0700，但【文件】之前没设权限，
+     * 受 umask 影响实测落成 0644 —— 同机其他用户能读到完整的对话文本。
+     * 这里在写入【前】就 chmod，而不是写完再改，避免中间窗口可读。 */
+    (void)chmod(tmp, 0600);
     uint32_t ver = RESP_STATE_VERSION, n = RESP_ID_SLOTS;
     bool ok = fwrite(RESP_STATE_MAGIC, 1, 8, f) == 8 &&
               fwrite(&ver, sizeof(ver), 1, f) == 1 &&
@@ -327,6 +348,8 @@ static void resp_state_save_locked(void) {
              fwrite(g_resp_ids[i], 1, 64, f) == 64 &&
              (len == 0 || fwrite(t, 1, len, f) == len);
     }
+    fflush(f);
+    (void)chmod(tmp, 0600);   /* 冗余设置：确保 rename 后仍是 0600 */
     fclose(f);
     if (ok) (void)rename(tmp, g_resp_state_path);
     else    (void)remove(tmp);
@@ -1599,6 +1622,34 @@ static bool prompt_render_tool_call_items(prompt_buffer_t *out, const prompt_jso
 
 /* 失败原因（供日志与报错使用）。调用方每次进入前不必清空 —— 每个失败路径都会写它。 */
 static bool g_server_default_thinking = false;
+
+/* ── CORS（2026-10-25）────────────────────────────────────────
+ *
+ * 默认仍是 `*`：这个服务原本就是给本机/内网工具直接调的，收紧默认值会
+ * 默默弄坏现有的浏览器页面。但“无鉴权 + 任意源”这个组合必须能被关掉，
+ * 否则把服务放到反向代理后面时，浏览器端可以任意页面对它发请求。
+ *
+ * MYDS_CORS_ORIGIN 的取值：
+ *   未设 / `*`        → 保持旧行为
+ *   `none`            → 不发送任何 CORS 头（纯后端/同源部署）
+ *   具体 origin       → 只回这一个（如 https://example.com）
+ *
+ * 注意：这里按需求“回显”而不是做复杂校验——多 origin 名单用逗号会引入
+ * 解析与回显错误的风险，而 CORS 本身不是安全边界（它只约束浏览器读取响应）。
+ * 真正的安全手段是鉴权与本机监听。 */
+static const char *cors_origin_header(void) {
+    static const char *cached = NULL;
+    static bool resolved = false;
+    if (resolved) return cached;
+    resolved = true;
+    cached = "*";
+    const char *e = getenv("MYDS_CORS_ORIGIN");
+    if (!e || !*e) return cached;
+    if (strcmp(e, "none") == 0) { cached = NULL; return cached; }
+    cached = e;
+    MYDS_LOG_I("CORS allow-origin = %s", cached);
+    return cached;
+}
 
 /* 从请求体的 `reasoning` **对象**里读 effort。
  *
@@ -3202,16 +3253,24 @@ failed:
 
 static bool send_response(int fd, int code, const char *status, const char *content_type, const char *body) {
     size_t body_len = body ? strlen(body) : 0;
-    char header[512];
+    char header[1024];
+    /* 2026-10-25: CORS 可关可限，见 cors_origin_header()。 */
+    char cors[600] = "";
+    const char *origin = cors_origin_header();
+    if (origin) {
+        snprintf(cors, sizeof(cors),
+                 "Access-Control-Allow-Origin: %s\r\n"
+                 "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+                 "Access-Control-Allow-Headers: *\r\n",
+                 origin);
+    }
     int hlen = snprintf(header, sizeof(header),
                         "HTTP/1.1 %d %s\r\n"
                         "Content-Type: %s\r\n"
                         "Content-Length: %zu\r\n"
-                        "Access-Control-Allow-Origin: *\r\n"
-                        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-                        "Access-Control-Allow-Headers: *\r\n"
+                        "%s"
                         "Connection: close\r\n\r\n",
-                        code, status, content_type, body_len);
+                        code, status, content_type, body_len, cors);
     if (hlen < 0 || (size_t)hlen >= sizeof(header)) return false;
     if (!myds_server_send_all(fd, header, (size_t)hlen)) return false;
     return body_len == 0 || myds_server_send_all(fd, body, body_len);
@@ -3265,6 +3324,25 @@ static bool inject_image_embeddings(myds_context_t *ctx, const char *prompt,
 
 static void handle_client(int client_fd, myds_context_t *ctx, const char *model_alias, const char *client_ip, int client_port) {
     pthread_once(&g_vjob_lock_once, init_vjob_gpu_lock);
+    /* ── 接收截止时间（2026-10-25）─────────────────────────
+     * SO_RCVTIMEO 是【每次 recv】的超时。攻击者每 29 秒发 1 个字节，
+     * 就能把这个连接永远挂在半开状态——每次 recv 都“没超时”，
+     * 而总时长无上限。配合连接数上限，几百条 drip 就能把名额占满。
+     *
+     * 这里加一个【整体】接收 deadline：从进入 handle_client 开始计时，
+     * 超过 MYDS_RECV_DEADLINE_S（默认 120s）就放弃这条连接。
+     * 120s 足够传 8 MB 体（即使慢速网络也够），但不足以被无限拖延。
+     */
+    const char *dl_env = getenv("MYDS_RECV_DEADLINE_S");
+    double recv_deadline_s = 120.0;
+    if (dl_env && *dl_env) {
+        const double v = atof(dl_env);
+        if (v >= 5.0 && v <= 3600.0) recv_deadline_s = v;
+        else MYDS_LOG_W("MYDS_RECV_DEADLINE_S=%s 非法（5..3600），按 120 处理", dl_env);
+    }
+    const double recv_start = myds_server_now_s();
+#define RECV_DEADLINE_HIT() (myds_server_now_s() - recv_start > recv_deadline_s)
+
     /* Protect against slowloris and stalled connections */
     struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -3281,6 +3359,15 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
 
     /* Read HTTP headers */
     while (total_read < (ssize_t)req_cap - 1) {
+        if (RECV_DEADLINE_HIT()) {
+            MYDS_LOG_W("[%s:%d] 接收超时（整体 deadline %.0fs），已读 %zd 字节 ⇒ 408",
+                       client_ip, client_port, recv_deadline_s, total_read);
+            send_response(client_fd, 408, "Request Timeout", "application/json",
+                          "{\"error\":{\"message\":\"Request body not received in time\"}}");
+            free(req_buf);
+            close(client_fd);
+            return;
+        }
         ssize_t n = recv(client_fd, req_buf + total_read, req_cap - 1 - total_read, 0);
         if (n <= 0) break;
         total_read += n;
@@ -3301,13 +3388,22 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
     /* CORS preflight */
     if (strcmp(method, "OPTIONS") == 0) {
         MYDS_LOG_D("[%s:%d] OPTIONS %s (CORS preflight)", client_ip, client_port, path);
-        const char *cors_res =
-            "HTTP/1.1 204 No Content\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
-            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-            "Access-Control-Allow-Headers: *\r\n"
-            "Connection: close\r\n\r\n";
-        (void)myds_server_send_all(client_fd, cors_res, strlen(cors_res));
+        char cors_res_buf[700];
+        const char *origin_pre = cors_origin_header();
+        if (origin_pre) {
+            snprintf(cors_res_buf, sizeof(cors_res_buf),
+                     "HTTP/1.1 204 No Content\r\n"
+                     "Access-Control-Allow-Origin: %s\r\n"
+                     "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+                     "Access-Control-Allow-Headers: *\r\n"
+                     "Connection: close\r\n\r\n", origin_pre);
+        } else {
+            /* MYDS_CORS_ORIGIN=none：不发布任何 CORS 头，OPTIONS 仍回 204 */
+            snprintf(cors_res_buf, sizeof(cors_res_buf),
+                     "HTTP/1.1 204 No Content\r\n"
+                     "Connection: close\r\n\r\n");
+        }
+        (void)myds_server_send_all(client_fd, cors_res_buf, strlen(cors_res_buf));
         free(req_buf);
         close(client_fd);
         return;
@@ -3409,6 +3505,15 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             }
             ssize_t body_have = total_read - (ssize_t)header_len;
             while (body_have < content_len && total_read < (ssize_t)req_cap - 1) {
+                if (RECV_DEADLINE_HIT()) {
+                    MYDS_LOG_W("[%s:%d] 接收 body 超时（整体 deadline %.0fs）⇒ 408",
+                               client_ip, client_port, recv_deadline_s);
+                    send_response(client_fd, 408, "Request Timeout", "application/json",
+                                  "{\"error\":{\"message\":\"Request body not received in time\"}}");
+                    free(req_buf);
+                    close(client_fd);
+                    return;
+                }
                 ssize_t n = recv(client_fd, req_buf + total_read, req_cap - 1 - total_read, 0);
                 if (n <= 0) break;
                 total_read += n;
@@ -3755,12 +3860,24 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         bool transport_ok = true;
         const bool req_thinking = extract_request_thinking_mode(body, g_server_default_thinking);
         if (stream) {
-            const char *sse_header =
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: text/event-stream\r\n"
-                "Cache-Control: no-cache\r\n"
-                "Access-Control-Allow-Origin: *\r\n"
-                "Connection: close\r\n\r\n";
+            /* 2026-10-25: SSE 也要尊重 CORS 设置。origin 为空时整行省略。 */
+            char sse_header_buf[768];
+            const char *origin_sse = cors_origin_header();
+            if (origin_sse) {
+                snprintf(sse_header_buf, sizeof(sse_header_buf),
+                         "HTTP/1.1 200 OK\r\n"
+                         "Content-Type: text/event-stream\r\n"
+                         "Cache-Control: no-cache\r\n"
+                         "Access-Control-Allow-Origin: %s\r\n"
+                         "Connection: close\r\n\r\n", origin_sse);
+            } else {
+                snprintf(sse_header_buf, sizeof(sse_header_buf),
+                         "HTTP/1.1 200 OK\r\n"
+                         "Content-Type: text/event-stream\r\n"
+                         "Cache-Control: no-cache\r\n"
+                         "Connection: close\r\n\r\n");
+            }
+            const char *sse_header = sse_header_buf;
             const char *initial = NULL;
             if (is_responses_endpoint) {
                 if (req_thinking) {

@@ -183,14 +183,33 @@ def require_uninstrumented_environment(environment):
 
 
 def verify(args):
+    """校验已提交证据的 SHA。
+
+    2026-10-25: 证据树（docs/benchmarks/…）未随源码仓库发布（见账本卷首与 §97.6），
+    所以旧实现在 fresh clone 上不是“报告缺失”，而是直接 FileNotFoundError 崩溃。
+    “没东西可校验” 与 “校验失败” 是两件不同的事：前者应当明确 SKIP 并退出 0，
+    后者必须退出非 0。这里的区分很重要 —— 把缺失当失败会让 CI 永远红，
+    把失败当缺失会让损坏悄悄流过去。
+    """
     errors = []
     checked = 0
+    missing_dirs = []
     for relative in ('2026-10-05-phase', '2026-10-05-optimization'):
         directory = ROOT / 'docs/benchmarks' / relative
-        if relative.endswith('optimization'):
-            entries = json.loads((directory / 'files.sha256.json').read_text())
-        else:
-            entries = json.loads((directory / 'manifest.json').read_text())['sha256']
+        if not directory.is_dir():
+            missing_dirs.append(relative)
+            continue
+        spec = 'files.sha256.json' if relative.endswith('optimization') else 'manifest.json'
+        spec_path = directory / spec
+        if not spec_path.is_file():
+            errors.append(f'{relative}: 目录存在但缺少 {spec}')
+            continue
+        try:
+            raw = json.loads(spec_path.read_text())
+            entries = raw if relative.endswith('optimization') else raw['sha256']
+        except Exception as exc:                       # noqa: BLE001
+            errors.append(f'{relative}: 无法解析 {spec}: {exc}')
+            continue
         for name, expected in entries.items():
             path = directory / name
             digest = expected['sha256'] if isinstance(expected, dict) else expected
@@ -199,14 +218,36 @@ def verify(args):
             elif isinstance(expected, dict) and path.stat().st_size != expected['bytes']:
                 errors.append(str(path) + ': size')
             checked += 1
+
     if args.check_source:
-        manifest = json.loads((EVIDENCE / 'manifest.json').read_text())
-        for name, digest in manifest['production_source_sha256'].items():
-            path = ROOT / name
-            if not path.is_file() or sha(path) != digest:
-                errors.append('source: ' + name)
-            checked += 1
-    print(json.dumps({'verified': not errors, 'files_checked': checked, 'errors': errors}))
+        manifest_path = EVIDENCE / 'manifest.json'
+        if not manifest_path.is_file():
+            missing_dirs.append('evidence/manifest.json')
+        else:
+            try:
+                manifest = json.loads(manifest_path.read_text())
+                for name, digest in manifest['production_source_sha256'].items():
+                    path = ROOT / name
+                    if not path.is_file() or sha(path) != digest:
+                        errors.append('source: ' + name)
+                    checked += 1
+            except Exception as exc:                   # noqa: BLE001
+                errors.append(f'无法解析 evidence/manifest.json: {exc}')
+
+    skipped = bool(missing_dirs) and checked == 0 and not errors
+    out = {
+        'verified': not errors,
+        'files_checked': checked,
+        'errors': errors,
+    }
+    if missing_dirs:
+        out['skipped'] = True
+        out['missing'] = missing_dirs
+        out['reason'] = ('证据归档未随源码仓库发布；这里只做“有则校验”，'
+                         '无则明确跳过。复现需用本仓库代码重跑基准，'
+                         '不能仅凭本仓库数据验证历史数值。')
+        del skipped
+    print(json.dumps(out, ensure_ascii=False))
     return int(bool(errors))
 
 
