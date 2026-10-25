@@ -4107,11 +4107,11 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         } else {
             double pf_tps = (pf.prefill_seconds > 0.0)
                                 ? (double)pf.prefill_tokens / pf.prefill_seconds : 0.0;
-            snprintf(prefill_str, sizeof(prefill_str), "%u tok in %.3fs = %.1f t/s (cached %u)",
+            snprintf(prefill_str, sizeof(prefill_str), "%u tok in %.1fs = %.1f t/s (cached %u)",
                      pf.prefill_tokens, pf.prefill_seconds, pf_tps, pf.cached_tokens);
         }
-        MYDS_LOG_I("[%s:%d] Completed %s %s - prompt: %u tok, prefill: %s, ttft: %.3fs, "
-                   "decode: %u tok in %.3fs = %.2f t/s, wall: %.3fs (infer %.3fs, queue %.3fs), finish_reason: %s",
+        MYDS_LOG_I("[%s:%d] Completed %s %s - prompt: %u tok, prefill: %s, ttft: %.1fs, "
+                   "decode: %u tok in %.1fs = %.1f t/s, wall: %.1fs (infer %.1fs, queue %.1fs), finish_reason: %s",
                    client_ip, client_port,
                    is_responses_endpoint ? "Responses" : "ChatCompletions",
                    path, prompt_tokens, prefill_str, ttft_s,
