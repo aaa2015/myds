@@ -287,8 +287,17 @@ void myds_v41_moe_weight_hist_observe(myds_metal_buffer_t *weights, uint32_t row
     if (!weights || !rows || !top_k) return;
     const char *e = getenv("MYDS_MOE_WEIGHT_HIST");
     if (!e || atoi(e) == 0) return;
-    /* 必须先等到 GPU 写完，否则读到旧数据（§52 教训）。 */
-    myds_metal_barrier_buffer(weights);
+    /* ★ 必须真正等 GPU 写完，否则读到旧数据（§52 教训）。
+     * 第一版只用 barrier_buffer，结果读到【全零】——因为路由 dispatch 还在未提交的
+     * batch 里。三步缺一不可：
+     *   flush_batch()  → commit 并置 g_batch_cb=nil，不等待
+     *   commit_batch() → g_batch_cb 为 nil ⇒ wait_inflight_commands() 真正排空
+     *   begin_batch()  → 重建 batch，否则后续 dispatch 没有 encoder
+     * 这会让观测期变慢，但观测不计入性能结论，所以可接受。 */
+    if (!myds_metal_get_auto_barrier()) myds_metal_barrier();
+    if (!myds_metal_flush_batch()) return;
+    if (!myds_metal_commit_batch()) return;
+    if (!myds_metal_begin_batch()) return;
     const float *w = (const float *)myds_metal_buffer_data(weights);
     if (!w) return;
     /* 只采一次样本（第一次调用时的前 3 行） */
