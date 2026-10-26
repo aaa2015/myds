@@ -2012,6 +2012,22 @@ int myds_metal_init(const char *shader_dir) {
                 "}\n"
             ];
 
+            /* Append after the entire original TU, as in the qualified v2
+             * probe. Keep its virtual filename and exact shader bytes; do not
+             * change the native source ordering or runtime compiler options. */
+            NSString *register_only_path = [dir_used stringByAppendingPathComponent:
+                @"myds_indexer_register_only.metal"];
+            NSError *register_only_error = nil;
+            NSString *register_only_source = [NSString stringWithContentsOfFile:register_only_path
+                encoding:NSUTF8StringEncoding error:&register_only_error];
+            if (!register_only_source) {
+                fprintf(stderr, "myds_metal: failed reading shader '%s': %s\n",
+                    [register_only_path UTF8String], [[register_only_error localizedDescription] UTF8String]);
+                return 0;
+            }
+            [full_source appendFormat:@"\n#line 1 \"myds_indexer_register_only.metal.inc\"\n%@",
+                register_only_source];
+
             MTLCompileOptions *options = [MTLCompileOptions new];
             options.preprocessorMacros = @{@"DS4_METAL_HC_STABLE": @"1",
                                            @"DS4_METAL_NORM_RSQRT_DISABLE": @"1"};
@@ -2028,7 +2044,7 @@ int myds_metal_init(const char *shader_dir) {
             g_library = [g_device newLibraryWithSource:full_source options:options error:&compile_err];
             if (g_library)
                 myds_log(MYDS_LOG_INFO, "myds_metal: shaders loaded from %s (%lu files)",
-                         dir_used ? [dir_used UTF8String] : "?", (unsigned long)[shader_files count]);
+                         dir_used ? [dir_used UTF8String] : "?", (unsigned long)[shader_files count] + 1u);
             if (!g_library) {
                 fprintf(stderr, "myds_metal: Metal shader compilation failed: %s\n",
                         [[compile_err localizedDescription] UTF8String]);

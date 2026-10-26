@@ -1,9 +1,0 @@
-{
-  "passed": true,
-  "gpu_work_submitted": false,
-  "observer_identifiers_absent_in_normal_preprocessing": true,
-  "files": {
-    "normal-myds_v41_gpu.i": "f5ecc5e488ccb5a84a5b8506d0e7dc108353368613a6ac7248ab6330ed413bb7",
-    "normal-myds_v41.i": "7e353b4828cb40a32b98281a922d7ccc839dceb987806f696826d9d4786864f6"
-  }
-}

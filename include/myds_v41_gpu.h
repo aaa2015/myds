@@ -185,6 +185,33 @@ typedef struct {
 void myds_v41_gpu_indexer_compact_counters(myds_v41_gpu_indexer_compact_counters_t *out, bool reset);
 /* Diagnostic fixture only: emulate absent optional PSOs before any dispatch. */
 void myds_v41_gpu_inject_indexer_compact_unavailable(bool enabled);
+/* Default-on prefill-only register-only scorer (MYDS_INDEXER_REGISTER_ONLY:
+ * absent/1=on, 0=off). Parse after configuration loading. Original public
+ * chunk APIs below always retain their original selector and never encode
+ * this candidate. */
+int myds_v41_gpu_indexer_register_only_enabled(void);
+const char *myds_v41_gpu_indexer_register_only_selected_kernel(bool cache_bf16);
+typedef struct {
+    uint64_t requests, encoded, fallbacks, failures, f32_dispatches, bf16_dispatches;
+} myds_v41_gpu_indexer_register_only_counters_t;
+/* Host-only process-wide counters. Reset at idle sample boundaries only.
+ * Encoded counts active-batch dispatch acceptance, not GPU completion. Normal
+ * ineligible/reference calls are not candidate fallbacks. */
+void myds_v41_gpu_indexer_register_only_counters(
+    myds_v41_gpu_indexer_register_only_counters_t *out,bool reset);
+/* Narrow initial scope: ordinary/no trace, active batch/no exclusive kprof,
+ * BF16-only/heads32/dim128, ratio2, 512<n_comp<=16384, 8<=n_tokens<=2048, end<=32768, key-window/SG=0.
+ * Candidate has zero threadgroup memory. F32 getter and dispatch count stay NULL/0.
+ * In production mode, candidate bounds/dispatch rejections gracefully fall back to
+ * the reference chunk scorer and track fallbacks. Strict fail-closed behavior can
+ * be enforced via MYDS_INDEXER_REGISTER_ONLY_STRICT=1.
+ * Returns 1 on success (encoded or fallback), 0 on unrecoverable failure. */
+int myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped(
+    myds_v41_gpu_scratch_t *scratch,myds_metal_buffer_t *scores,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *cache,uint32_t n_comp,uint32_t n_heads,
+    uint32_t n_tokens,uint32_t causal_start,uint32_t causal_ratio,
+    bool cache_bf16,bool ordinary_prefill_allowed);
 /* 整 chunk 批量版（n_tokens 行 × n_comp 列，行主序，行步长 n_comp）。只支持
  * n_heads == 32；每行的因果宽度 = (causal_start + row + 1) / causal_ratio，
  * 与逐 token 的 count 相同；行数不够的格子写 -INFINITY。 */

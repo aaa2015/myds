@@ -1,9 +1,0 @@
-{
-  "kind": "M2_frozen_private_source_prebuild",
-  "source_files_verified": 548,
-  "source_inventory_sha256": "7791166d7a9a6ef29eaa2336c665919ee041ec1eae47e32027d6a656b44adec7",
-  "source_archive_sha256": "1082aa4a71aefef2a3d1b2d5b0d6c00e47bd374b203b9dbc9e72fbc166f554bb",
-  "clang": "Apple clang version 21.0.0 (clang-2100.3.34.2)\nTarget: arm64-apple-darwin27.0.0\nThread model: posix\nInstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin\n",
-  "sdk_path": "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk",
-  "gpu_work_submitted": false
-}

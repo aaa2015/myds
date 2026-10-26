@@ -1,9 +1,0 @@
-{
-  "tools/build_indexer_k_resident_probe.py": "62daaf06371245f818659098461a22b769c48c869e1313e9c0f99b08987b58cb",
-  "tools/build_metallib.py": "546bc8960fe9ce0171000e7fbd0ad6665b9b9108296d76047eeceb5bc1af20e6",
-  "tools/bench_indexer_k_resident.m": "ce5b10589eaa674603b2b0489b77008f5947c6edd1e1b7ad21da4d2a235e165b",
-  "tools/bench_attention_multihead.m": "0ecf74b04fb06d89f59322c51e43751441dc37e636c21406007a4a446bd93797",
-  "metal/dsv4_misc.metal": "7fe23a7707e97758c3127caadfb2bc3b6818c1c6ba9d30a73f632563b82f3d57",
-  "src/myds_gguf.c": "302c75d3aed17c4c0487fe612657fd00487ba64731309756037fcc49bb9caadf",
-  "include/myds_gguf.h": "3c94ccf8ff4748e1afd190178732aa2769a535594723a6d3fdf5c0672ffa412b"
-}

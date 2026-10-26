@@ -1,1 +1,0 @@
-[2026-10-26 00:11:05.022] [INFO] config: 已加载 /tmp/myds-indexer-r2-real-local-20261025/deployed/myds.conf —— 生效 62 条

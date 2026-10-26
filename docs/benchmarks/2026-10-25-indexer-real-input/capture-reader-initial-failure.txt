@@ -1,8 +1,0 @@
-Traceback (most recent call last):
-  File "/private/tmp/myds-indexer-r2-20261025/source/tools/review_indexer_capture.py", line 147, in <module>
-    main()
-  File "/private/tmp/myds-indexer-r2-20261025/source/tools/review_indexer_capture.py", line 41, in main
-    check(env_lines and all(s.startswith('MYDS_') and '=' in s for s in env_lines), 'MYDS-only environment')
-  File "/private/tmp/myds-indexer-r2-20261025/source/tools/review_indexer_capture.py", line 17, in check
-    raise ValueError(label)
-ValueError: MYDS-only environment

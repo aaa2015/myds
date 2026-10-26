@@ -1,7 +1,0 @@
-PASS: attention HC overlap + indexer decode overlap + KV reuse + FFN HC overlap host schedule, cohorts, strict env, exclusions, aliasing guards, counters, and failure recovery
-{"kind":"actual_scheduler_bindings","position":0,"dummy_finish_calls":40,"actual_q_finish_calls":0,"eligible_narrow_layer_calls":32,"gpu_work_submitted":false}
-{"kind":"actual_scheduler_bindings","position":1,"dummy_finish_calls":40,"actual_q_finish_calls":0,"eligible_narrow_layer_calls":32,"gpu_work_submitted":false}
-{"kind":"actual_scheduler_bindings","position":127,"dummy_finish_calls":40,"actual_q_finish_calls":0,"eligible_narrow_layer_calls":32,"gpu_work_submitted":false}
-{"kind":"actual_scheduler_bindings","position":128,"dummy_finish_calls":40,"actual_q_finish_calls":0,"eligible_narrow_layer_calls":32,"gpu_work_submitted":false}
-{"kind":"actual_scheduler_bindings","position":2047,"dummy_finish_calls":40,"actual_q_finish_calls":0,"eligible_narrow_layer_calls":32,"gpu_work_submitted":false}
-{"kind":"kv_only_finish_source_host_contract","passed":true,"all_layer_calls":200,"narrow_layer_calls":160,"long_narrow_calls":32,"failure_stages":4,"distinct_handle_same_start_and_offset4096_overlap_rejected_before_finish":true,"gpu_work_submitted":false}

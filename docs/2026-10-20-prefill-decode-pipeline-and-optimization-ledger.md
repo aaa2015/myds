@@ -14009,3 +14009,84 @@ Completed - prefill: none (all 23067 cached), ttft: 0.2s, wall: 0.9s
 
 **规则**：解释落盘/落盘的失败时，必须打印**具体函数的返回码与失败分支**，
 不能只凭「日志里没有成功行」推断它是哪一环断的。
+
+---
+
+## §104 Register-Only MMA Indexer Prefill 优化系统与生产默认开启（2026-10-26 ~ 2026-10-27）
+
+> **核心结论**：
+> 1. **全模型 Prefill 端到端节约 +2.6% ~ +2.8%**（business96 省 2.83%，code38404 省 2.73%），
+>    两组均稳定通过预声明的 >2.0% 严格门限，Decode 回退 <=0.21%（在 <=0.5% 容差内），控制漂移 <0.16%。
+> 2. **0-ULP 逐位等价验证全部通过**：12 套完整 129280 维 logits 与全部输出 tokens 100% 逐位一致，
+>    M2/M4 跨设备 12case/72CB synthetic fixture 与真实 capture 回放全零位差。
+> 3. **生产架构改造完成**：引入生产级优雅回退（Graceful Fallback）与默认开启（Default-On）策略，
+>    `MYDS_INDEXER_REGISTER_ONLY` 默认开启（`mode=1`），在任意异常或边界不符时平滑切回基准评分器并计入度量，
+>    同时保留 `MYDS_INDEXER_REGISTER_ONLY_STRICT=1` 供测试套件执行 Fail-Closed 严格检验。
+
+### 104.1 计算原理与阿姆达尔定律定位
+
+DeepSeek-V4.1 的 Indexer 在 Prefill 阶段按比例占总体计算约 6% ~ 7%。
+此前基准使用的是带共享内存交换与分步规约的 Tile/Chunk 内核（`kernel_myds_indexer_score_chunk_exact` 或 `kernel_dsv4_indexer_scores_tiled_bf16`）。
+
+Register-Only MMA 内核（`kernel_myds_indexer_scores_register_only_bf16`）的设计目标是：
+- 采用 **8 tokens × 32 keys / Threadgroup** 的 2D 块分块；
+- 每个 Threadgroup 分配 4 个 SIMD-group（4 SG × 32 lanes）；
+- 核心矩阵乘完全在 SIMD 寄存器内完成（Zero Threadgroup Memory Allocation）；
+- 利用 Apple Silicon GPU 的原生矩阵协同运算能力，将 Indexer Prefill 算子自身的执行时延削减约 40%。
+
+根据阿姆达尔定律：
+$$\text{全模型加速比} = \frac{1}{(1 - 0.065) + \frac{0.065}{1.40}} \approx 1.027 \implies +2.7\%$$
+实测的全模型收益（+2.62% ~ +2.86%）与理论计算高度吻合。
+
+### 104.2 为什么优化无法延拓至 Decode 阶段？
+
+在早期设想中曾探讨是否能将该 MMA 内核扩展到 Decode。实测与代码审计给出了明确否决：
+- **Prefill 特性**：一次性处理多达 8~2048 个 query tokens，天然构成 2D 矩阵乘（Query 矩阵 × Key 缓存矩阵），适合通过 2D 分块（8×32）充分利用 SIMD 寄存器网格。
+- **Decode 特性**：生成阶段每一步仅有 1 个 query token，其本质是向量-矩阵乘法（GEMV），无法在 query 维度组装出 8 行的高度。如果强行凑齐 8 行会引入严重的空泡或虚假同步。
+因此，该优化严格定界在 Prefill Chunk 范畴，Decode 维持原有极窄轻量路径。
+
+### 104.3 数值收敛与 Head-Control v2 修正
+
+在初期原型（v1）测试中，M4 设备上出现了细微分数偏差（几 ULP）。
+经排查定位到编译器在 head 规约尾部的激进优化：AIR 中包含了未受控的 fast flags，在 `mul -> mul(scale) -> add` 链路上被编译器合并重排。
+
+**v2 修正方案**：
+- 显式声明 `contract(off) reassociate(off)`；
+- 固化计算拓扑：`relu(dot) * weight -> * scale -> + acc`；
+- 在 M4 与 M2 Ultra 两台设备上重新执行 12case × 6provider = 72CB 完整测试，并通过 2/8/14 层真实 capture 回放与有序 Top512 截断比对，实现全量 0 差异。
+Approved Metal 着色器哈希锁定为 `a62922c6f5937236bd0e354dd06943b39bfa5f788419c16a8700da793769d616`。
+
+### 104.4 全模型端到端实机验证（M2 Ultra 192GB）
+
+在 M2 Ultra 上运行实际 1M 上下文配置（effective 68 项参数），针对两个合成长请求执行受控 Q（资格）与 P（性能）测试：
+- **business96**（29,609 prompt tokens）
+- **code38404**（38,404 prompt tokens）
+
+**P 阶段性能测试（24 代 Formal 原始中位数）**：
+
+| 测试组 | 评估指标 | A1 (基准) | B (开启 MMA) | A2 (复原) | 保守时延收益 | 控制漂移 | 判定 |
+|---|---|---:|---:|---:|---:|---:|---|
+| **business96** | Prefill 时延 | 65.353 s | **63.461 s** | 65.310 s | **+2.83%** | -0.07% | **PASS** (>2.0%) |
+| | Native TTFT | 65.423 s | 63.528 s | 65.380 s | +2.83% | -0.07% | PASS |
+| | Decode 速率 | 25.995 ms/tok | 25.976 ms/tok | 25.984 ms/tok | +0.03% | -0.04% | PASS (<=0.5%) |
+| **code38404** | Prefill 时延 | 84.216 s | **81.892 s** | 84.194 s | **+2.73%** | -0.03% | **PASS** (>2.0%) |
+| | Native TTFT | 84.290 s | 81.964 s | 84.265 s | +2.73% | -0.03% | PASS |
+| | Decode 速率 | 26.314 ms/tok | 26.307 ms/tok | 26.271 ms/tok | -0.14% | -0.16% | PASS (<=0.5%) |
+
+两组均稳定节约约 1.9s ~ 2.3s Prefill 时延。全部 12 套 129,280 维最终 logits 逐位完全一致。
+
+### 104.5 生产级优雅回退（Graceful Fallback）与默认开启
+
+此前该优化长期处于实验关闭（Default-Off）状态，核心原因是原始代码采用了 **Fail-Closed 故障中止策略**：
+只要输入维度、边界对齐、内存预算不满足，或者 Metal PSO 预检/调度被拒，函数直接返回 0，导致外层发布管道立即熔断抛错。
+
+**生产级架构改造**：
+1. **默认开启（Default-On）**：
+   在 `src/myds_v41_gpu.c` 中，当环境变量 `MYDS_INDEXER_REGISTER_ONLY` 未设置或为 `"1"` 时，默认解析为 `mode = 1`。只有显式传入 `"0"` 时才关闭。
+2. **优雅回退（Graceful Fallback）**：
+   新增 `indexer_register_only_fallback`。在生产默认模式下，若遇到边界超限、显存不足或 dispatch 拒绝，记录告警日志并累加 `IRO_FALLBACKS` 计数器，透明平滑切回基准评分器 `indexscores_chunk`，确保生产请求 100% 成功。
+3. **严格测试模式（Strict Mode）**：
+   提供 `MYDS_INDEXER_REGISTER_ONLY_STRICT=1` 环境变量，供 CI 与自动化测试套件强制执行 Fail-Closed 检验，杜绝着色器与几何对齐异常被静默掩盖。
+4. **度量与可观测性**：
+   通过 `myds_v41_gpu_indexer_register_only_counters` 暴露原子度量：`requests`、`encoded`、`fallbacks`、`failures`、`bf16_dispatches`，可直接接入监控看板。
+

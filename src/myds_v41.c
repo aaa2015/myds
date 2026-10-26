@@ -2571,9 +2571,15 @@ uint32_t myds_v41_low_kv_load_anchor(myds_v41_context_t *g, const int32_t *token
     if (!myds_metal_commit_batch()) return 0;
     const uint64_t want_hash = myds_kvdsk_hash_tokens(tokens, anchor_pos);
     const double t0 = lowkv_now_ms();
-    for (uint32_t e = 0; e < V41_LOWKV_ENDS_MAX; ++e) {
+    /* 2026-10-26：这里原本枚举 g->low_ends（prompt-cache store）的元数据，
+     * 却从 g->low_anchor 取数据 —— 两个独立的文件。锚点写在 low_anchor 里，
+     * 于是除非「同一位置+同一哈希」恰好也在 low_ends 中，循环永远匹配不上，
+     * 锚点复用 100% 落空（实测：kvanchor 有 1 条有效，日志仍报「无可用锚点条目」）。
+     * 枚举与读取必须是同一个 store。 */
+    const uint32_t anchor_slots = myds_kvdsk_slot_count(g->low_anchor);
+    for (uint32_t e = 0; e < anchor_slots && e < V41_LOWKV_ENDS_MAX; ++e) {
         uint32_t pos = 0; uint64_t hash = 0, used = 0;
-        if (!myds_kvdsk_slot_meta(g->low_ends, e, &pos, &hash, &used)) continue;
+        if (!myds_kvdsk_slot_meta(g->low_anchor, e, &pos, &hash, &used)) continue;
         if (pos != anchor_pos || hash != want_hash) continue;
         lowkv_restore_stage_t stage = {0};
         const bool ok = lowkv_stage_slot(g, g->low_anchor, e | V41_LOWKV_ENTRY_IS_END, anchor_pos, tokens, &stage) &&
@@ -3776,8 +3782,8 @@ static int publish_indexer_chunk(myds_context_t *ctx, uint32_t il, uint32_t c_st
         extern void myds_indexer_capture_set_group(uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
         myds_indexer_capture_set_group(il,base_pos,c_start,c_len,off,batch_floats);
 #endif
-        if (!myds_v41_gpu_indexscores_chunk_bf16(scores_buf,q_view,w_view,g->index_cache[owner],
-                nc,V41_INDEX_HEADS,glen,g_start,ratio)) return -1;
+        if (!myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped(g->gpu,scores_buf,q_view,w_view,g->index_cache[owner],
+                nc,V41_INDEX_HEADS,glen,g_start,ratio,true,!myds_trace_active())) return -1;
         if (il==20) {
             /* 块掩码：只要本行的块【全部被选中】，掩码前缀就与逐 token 一致
              * （前 blocks_t 列先清成不可见、再被 scatter 打开）。这里 nc ≤ 16384

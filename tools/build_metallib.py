@@ -8,6 +8,7 @@ import os
 import sys
 import subprocess
 import argparse
+import shutil
 
 SHADER_FILES = [
     "flash_attn.metal",
@@ -40,6 +41,12 @@ SHADER_FILES = [
     "myds_chunk.metal",
     "visenc.metal",
 ]
+
+# Preserve the complete validated native TU (including COPY_KERNELS) as a
+# byte-exact prefix. The virtual filename is the one used by the GPU-qualified
+# head-control v2 probe; the installed .metal file is the identical fragment.
+REGISTER_ONLY_SHADER = "myds_indexer_register_only.metal"
+REGISTER_ONLY_MARKER = '\n#line 1 "myds_indexer_register_only.metal.inc"\n'
 
 PREAMBLE = """#include <metal_stdlib>
 using namespace metal;
@@ -135,6 +142,7 @@ def main():
     os.makedirs(bin_dir, exist_ok=True)
 
     combined_metal = os.path.join(build_dir, "myds_all.metal")
+    compiler_metal = os.path.join(build_dir, "all.metal")
     air_file = os.path.join(build_dir, "myds_all.air")
     metallib_file = os.path.join(bin_dir, "myds.metallib")
 
@@ -149,6 +157,13 @@ def main():
             with open(src_path, "r", encoding="utf-8") as sf:
                 out.write(f'\n#line 1 "{fn}"\n' + sf.read())
         out.write(COPY_KERNELS + "\n")
+        with open(os.path.join(metal_dir, REGISTER_ONLY_SHADER), "r", encoding="utf-8") as sf:
+            out.write(REGISTER_ONLY_MARKER + sf.read())
+
+    # Metal embeds the input basename in static-initializer symbols. Preserve
+    # the inspectable assembly above, but compile the qualified all.metal name
+    # so identical source and flags reproduce the qualified library bytes.
+    shutil.copyfile(combined_metal, compiler_metal)
 
     env = os.environ.copy()
     if "DEVELOPER_DIR" not in env:
@@ -180,7 +195,7 @@ def main():
     _extra = os.environ.get("MYDS_METALLIB_DEFINES", "").split()
     compile_cmd += _extra
     compile_cmd += [
-        "-c", combined_metal,
+        "-c", compiler_metal,
         "-o", air_file,
     ]
     res = subprocess.run(compile_cmd, env=env)

@@ -100,6 +100,64 @@ void myds_v41_gpu_attention_counters(myds_v41_gpu_attention_counters_t *out, boo
         .original_vec_encoded = v[AC_ORIGINAL], .matrix_encoded = v[AC_MATRIX],
         .matrix_fallbacks = v[AC_MATRIX_FALLBACKS]};
 }
+/* Register-only prefill scorer: policy is immutable after the first
+ * getter, which must run after config load. No PSO is touched by this getter. */
+enum { IRO_REQUESTS,IRO_ENCODED,IRO_FALLBACKS,IRO_FAILURES,IRO_F32,IRO_BF16,IRO_COUNT };
+static _Atomic uint64_t indexer_register_only_counters[IRO_COUNT];
+static pthread_once_t indexer_register_only_once=PTHREAD_ONCE_INIT;
+static int indexer_register_only_mode;
+static void indexer_register_only_init(void) {
+    const char *value=getenv("MYDS_INDEXER_REGISTER_ONLY");
+    if(!value||!strcmp(value,"1"))indexer_register_only_mode=1;
+    else if(!strcmp(value,"0"))indexer_register_only_mode=0;
+    else {
+        indexer_register_only_mode=-1;
+        MYDS_LOG_E("MYDS_INDEXER_REGISTER_ONLY must be exactly absent, 0 or 1");
+    }
+}
+int myds_v41_gpu_indexer_register_only_enabled(void) {
+    pthread_once(&indexer_register_only_once,indexer_register_only_init);
+    return indexer_register_only_mode;
+}
+const char *myds_v41_gpu_indexer_register_only_selected_kernel(bool bf16) {
+    if(myds_v41_gpu_indexer_register_only_enabled()!=1)return NULL;
+    return bf16?"kernel_myds_indexer_scores_register_only_bf16":NULL;
+}
+void myds_v41_gpu_indexer_register_only_counters(
+    myds_v41_gpu_indexer_register_only_counters_t *out,bool reset) {
+    uint64_t v[IRO_COUNT];
+    for(unsigned i=0;i<IRO_COUNT;i++)v[i]=reset?
+        atomic_exchange_explicit(&indexer_register_only_counters[i],0u,memory_order_relaxed):
+        atomic_load_explicit(&indexer_register_only_counters[i],memory_order_relaxed);
+    if(out)*out=(myds_v41_gpu_indexer_register_only_counters_t){v[0],v[1],v[2],v[3],v[4],v[5]};
+}
+static int indexer_register_only_failure(const char *reason) {
+    atomic_fetch_add_explicit(&indexer_register_only_counters[IRO_FAILURES],1u,memory_order_relaxed);
+    MYDS_LOG_E("register-only prefill indexer failed: %s; refusing native fallback",reason);
+    return 0;
+}
+static int indexscores_chunk(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
+    const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,
+    uint32_t n_comp,uint32_t n_heads,uint32_t n_tokens,uint32_t causal_start,
+    uint32_t causal_ratio,bool cache_bf16);
+static int indexer_register_only_fallback(
+    myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
+    const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,
+    uint32_t n_comp,uint32_t n_heads,uint32_t n_tokens,uint32_t causal_start,
+    uint32_t causal_ratio,bool cache_bf16,const char *reason) {
+    const char *strict=getenv("MYDS_INDEXER_REGISTER_ONLY_STRICT");
+    if(strict&&strcmp(strict,"0")!=0) {
+        atomic_fetch_add_explicit(&indexer_register_only_counters[IRO_FAILURES],1u,memory_order_relaxed);
+        MYDS_LOG_E("register-only prefill indexer failed: %s; strict mode refusing native fallback",reason);
+        return 0;
+    }
+    atomic_fetch_add_explicit(&indexer_register_only_counters[IRO_FALLBACKS],1u,memory_order_relaxed);
+    MYDS_LOG_W("register-only prefill indexer fallback: %s; falling back to reference chunk scorer",reason);
+    int rc=indexscores_chunk(scores,q,weights,cache,n_comp,n_heads,n_tokens,
+                             causal_start,causal_ratio,cache_bf16);
+    if(!rc) atomic_fetch_add_explicit(&indexer_register_only_counters[IRO_FAILURES],1u,memory_order_relaxed);
+    return rc;
+}
 static int floats(const myds_metal_buffer_t *b,uint64_t n) {
     return b && n && n<=myds_metal_buffer_size(b)/4 && myds_metal_buffer_offset(b)%4==0;
 }
@@ -149,7 +207,8 @@ size_t myds_v41_gpu_chunk_workspace_bytes(const myds_v41_gpu_scratch_t *s) {
     return s ? myds_metal_buffer_size(s->kv_chunk)+myds_metal_buffer_size(s->mask_chunk) : 0;
 }
 myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp) {
-    if (myds_v41_gpu_attention_packed_register_enabled()<0 || myds_v41_attention_rope_fuse_enabled()<0 ||
+    if (myds_v41_gpu_indexer_register_only_enabled()<0 ||
+        myds_v41_gpu_attention_packed_register_enabled()<0 || myds_v41_attention_rope_fuse_enabled()<0 ||
         myds_v41_gpu_attention_direct_pack_fuse_enabled()<0) return NULL;
     if(!max_comp || max_comp>1048576) return NULL;
     myds_v41_gpu_scratch_t *s=calloc(1,sizeof(*s));
@@ -754,6 +813,91 @@ int myds_v41_gpu_indexscores_chunk_bf16(myds_metal_buffer_t *scores,const myds_m
     const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,uint32_t n_comp,
     uint32_t n_heads,uint32_t n_tokens,uint32_t causal_start,uint32_t causal_ratio) {
     return indexscores_chunk(scores,q,weights,cache,n_comp,n_heads,n_tokens,causal_start,causal_ratio,true);
+}
+struct indexer_register_only_args {
+    uint32_t n_comp,n_tokens,n_head,head_dim,pos0,ratio;
+    uint64_t q_token_stride,q_head_stride,weights_token_stride;
+    uint64_t index_row_stride,score_token_stride;
+    float scale;
+};
+_Static_assert(sizeof(struct indexer_register_only_args)==72u,"register-only original tiled ABI");
+_Static_assert(offsetof(struct indexer_register_only_args,q_token_stride)==24u &&
+               offsetof(struct indexer_register_only_args,score_token_stride)==56u &&
+               offsetof(struct indexer_register_only_args,scale)==64u,"register-only original tiled offsets");
+int myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped(
+    myds_v41_gpu_scratch_t *scratch,myds_metal_buffer_t *scores,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *cache,uint32_t n_comp,uint32_t n_heads,
+    uint32_t n_tokens,uint32_t causal_start,uint32_t causal_ratio,
+    bool cache_bf16,bool ordinary_prefill_allowed) {
+    atomic_fetch_add_explicit(&indexer_register_only_counters[IRO_REQUESTS],1u,memory_order_relaxed);
+    const int mode=myds_v41_gpu_indexer_register_only_enabled();
+    if(mode<0)return indexer_register_only_failure("invalid configuration");
+    /* Preserve the complete original selector for disabled/other scopes. In
+     * particular public scalar/chunk APIs never arrive through this entry. */
+    if(!mode||!ordinary_prefill_allowed)
+        return indexscores_chunk(scores,q,weights,cache,n_comp,n_heads,n_tokens,
+                                 causal_start,causal_ratio,cache_bf16);
+    const uint64_t end=(uint64_t)causal_start+n_tokens;
+    const char *sgbar=getenv("MYDS_INDEXER_SGBAR");
+    /* Initial device gate covers ratio2 owners in the first32K only. Larger,
+     * smaller, ratio1 and diagnostic requests are legitimate reference calls,
+     * not eligible-candidate fallbacks. No new allocation or group splitting. */
+    if(!cache_bf16||n_heads!=32u||!n_tokens||!causal_ratio||causal_start==UINT32_MAX||
+       causal_ratio!=2u||n_comp<=512u||n_comp>16384u||n_tokens<8u||
+       n_tokens>MYDS_CHUNK_MAXC||end>32768u||!myds_metal_batch_active()||
+       myds_metal_kprof_exclusive()||indexer_key_window()||
+       (sgbar&&strcmp(sgbar,"0")!=0))
+        return indexscores_chunk(scores,q,weights,cache,n_comp,n_heads,n_tokens,
+                                 causal_start,causal_ratio,cache_bf16);
+    if(!scratch||n_comp>scratch->max_comp||n_comp>scratch->key_comp_max||
+       !scratch->batch_floats||(uint64_t)n_comp*n_tokens>scratch->batch_floats||
+       n_comp!=end/2u||(uint64_t)causal_start+1u<2u)
+        return indexer_register_only_fallback(scores,q,weights,cache,n_comp,n_heads,n_tokens,
+                                              causal_start,causal_ratio,cache_bf16,
+                                              "ordinary group bounds/budget/causal tuple");
+    const uint64_t score_bytes=(uint64_t)n_comp*n_tokens*4u;
+    const uint64_t q_bytes=(uint64_t)n_tokens*32u*128u*4u;
+    const uint64_t w_bytes=(uint64_t)n_tokens*32u*4u;
+    const uint64_t cache_bytes=(uint64_t)n_comp*128u*(cache_bf16?2u:4u);
+    if(score_bytes>SIZE_MAX||q_bytes>SIZE_MAX||w_bytes>SIZE_MAX||cache_bytes>SIZE_MAX||
+       !myds_metal_buffer_native_range(scores,score_bytes,4u)||
+       !myds_metal_buffer_native_range(q,q_bytes,4u)||
+       !myds_metal_buffer_native_range(weights,w_bytes,4u)||
+       !myds_metal_buffer_native_range(cache,cache_bytes,cache_bf16?2u:4u)||
+       buffer_ranges_overlap(scores,(size_t)score_bytes,q,(size_t)q_bytes)||
+       buffer_ranges_overlap(scores,(size_t)score_bytes,weights,(size_t)w_bytes)||
+       buffer_ranges_overlap(scores,(size_t)score_bytes,cache,(size_t)cache_bytes))
+        return indexer_register_only_fallback(scores,q,weights,cache,n_comp,n_heads,n_tokens,
+                                              causal_start,causal_ratio,cache_bf16,
+                                              "complete native ranges/alignment/writer alias");
+    const uint32_t threads[]={32u,4u,1u};
+    const size_t smem=0u;
+    /* Re-resolve against the current library: do not cache readiness across
+     * Metal cleanup/reinit. Preflight itself creates no CB or GPU work. */
+    const char *bf16="kernel_myds_indexer_scores_register_only_bf16";
+    if(!myds_metal_kernel_constants_preflight(bf16,threads,smem,NULL,0u))
+        return indexer_register_only_fallback(scores,q,weights,cache,n_comp,n_heads,n_tokens,
+                                              causal_start,causal_ratio,cache_bf16,bf16);
+    struct indexer_register_only_args a;
+    memset(&a,0,sizeof(a));
+    a.n_comp=n_comp;a.n_tokens=n_tokens;a.n_head=32u;a.head_dim=128u;
+    a.pos0=causal_start;a.ratio=2u;a.q_token_stride=32u*128u*4u;
+    a.q_head_stride=128u*4u;a.weights_token_stride=32u*4u;
+    a.index_row_stride=128u*(cache_bf16?2u:4u);
+    a.score_token_stride=(uint64_t)n_comp*4u;a.scale=1.0f/64.0f;
+    const myds_metal_buffer_t *b[]={q,weights,cache,scores};
+    const char *name=bf16;
+    if(!dispatch(name,&a,sizeof(a),b,4u,(n_comp+31u)/32u,(n_tokens+7u)/8u,1u,
+                 32u,4u,1u,smem))
+        return indexer_register_only_fallback(scores,q,weights,cache,n_comp,n_heads,n_tokens,
+                                              causal_start,causal_ratio,cache_bf16,
+                                              "candidate dispatch rejected");
+    /* Active-batch bridge returns1 after metal_dispatch; later GPU completion
+     * is an independent enclosing-batch gate, not this host encoding count. */
+    atomic_fetch_add_explicit(&indexer_register_only_counters[IRO_ENCODED],1u,memory_order_relaxed);
+    atomic_fetch_add_explicit(&indexer_register_only_counters[IRO_BF16],1u,memory_order_relaxed);
+    return 1;
 }
 /* 按行批量（rows 行）。mask_stride 是 block_mask 的行步长（float）；
  * 逐 token 调用传 rows=1、start=pos、mask_stride=(n_comp+7)/8（与改前一致）。 */

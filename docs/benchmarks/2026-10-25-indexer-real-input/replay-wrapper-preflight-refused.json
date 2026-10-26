@@ -1,6 +1,0 @@
-{
-  "gpu_work_submitted": false,
-  "timing_started": false,
-  "reason": "window wrapper FileNotFoundError before child launch: canonical config is sibling myfleet/myds.conf, not myds/myfleet/myds.conf",
-  "time_epoch": 1792935638.634232
-}

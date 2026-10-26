@@ -1,9 +1,0 @@
-{
-  "status": "correctly_blocked_missing_actual_QLong_qualification_report",
-  "source_target_inputs_and_frozen_gate_preflight_reached_prerequisite": true,
-  "protocol_sha256": "6b75f5c8f2f53c8f99c3277a0b846e810200169320e98c2b25ea3b7a9e7876c2",
-  "reader_sha256": "ad07d6369661d740131cc835d732c0cee2d78ddf46ee6377b529f04cf438ed42",
-  "GPU_submitted": false,
-  "native_binary_executed": false,
-  "synthetic_qualification_report_used": false
-}

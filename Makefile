@@ -139,7 +139,7 @@ $(TEST_GGUF_BYTE_SPLIT): tests/test_gguf_byte_split.c $(BUILD_DIR)/myds_gguf.o |
 
 ALL_TESTS += $(TEST_METAL_RESIDENCY) $(TEST_TEARDOWN_ORDER) $(TEST_DECODE_SPLIT) $(TEST_KVDSK_FIFO) $(TEST_ANCHOR_SLOTS) $(TEST_YOCO_COMPACT) $(TEST_INDEXER_WINDOW) $(TEST_GGUF_BOUNDS) $(TEST_GGUF_SPLIT) $(TEST_GGUF_BYTE_SPLIT)
 
-.PHONY: all test clean bench metallib build-tail-init test-tail-init
+.PHONY: all test clean bench metallib build-tail-init test-tail-init test-indexer-register-only-host test-register-only-http-bridge test-register-only-service-window
 
 # Rebuild consumers when public or internal layouts change.
 -include $(wildcard $(BUILD_DIR)/*.d)
@@ -148,6 +148,17 @@ ALL_TESTS += $(TEST_METAL_RESIDENCY) $(TEST_TEARDOWN_ORDER) $(TEST_DECODE_SPLIT)
 all: $(TARGET) $(ALL_TESTS) $(DUMP_TENSORS) $(METALLIB)
 
 metallib: $(METALLIB)
+
+# Host-only scope, dispatch-failure and publisher propagation regression. This
+# target never initializes Metal or loads model weights.
+test-indexer-register-only-host:
+	python3 -B tests/test_indexer_register_only_host.py
+
+test-register-only-http-bridge:
+	python3 -B tests/test_register_only_http_bridge.py
+
+test-register-only-service-window:
+	python3 -B tests/test_register_only_service_window.py
 
 # Optional real-library init/failure/retry regression. The separate build target
 # compiles only; test-tail-init executes GPU work and is scheduled explicitly.
@@ -724,6 +735,9 @@ test: $(ALL_TESTS) $(METALLIB)
 	@python3 tests/test_http_bytes.py
 	@python3 tests/test_stream_bench.py
 	@python3 tests/test_indexer_k_resident_builder.py
+	@python3 -B tests/test_indexer_register_only_host.py
+	@python3 -B tests/test_register_only_http_bridge.py
+	@python3 -B tests/test_register_only_service_window.py
 	@python3 tests/test_indexer_k_capture_reader.py
 	@python3 tests/test_indexer_fullmodel_driver.py
 	@python3 tests/test_indexer_stability_reader.py

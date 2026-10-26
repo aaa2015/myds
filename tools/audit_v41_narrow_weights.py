@@ -733,7 +733,10 @@ def main():
     p.add_argument("--output",required=True,help="JSON audit report, separate from every model/source input")
     p.add_argument("--cc",default=os.environ.get("CC","cc"),help="C compiler executable, not a shell command")
     p.add_argument("--artifact-dir",help="absolute NEW directory retaining actual compiler inputs/binary/logs; default OUTPUT.artifacts")
-    p.add_argument("--upstream-patches",default=str(Path(__file__).resolve().parents[1]/"docs/benchmarks/2026-10-26-upstream-plan-review/upstream-commits"))
+    up = Path(__file__).resolve().parents[1]/"docs/benchmarks/2026-10-26-upstream-plan-review/upstream-commits"
+    if not up.exists():
+        up = Path(__file__).resolve().parents[2]/"mydsdoc/benchmarks/2026-10-26-upstream-plan-review/upstream-commits"
+    p.add_argument("--upstream-patches",default=str(up))
     return run(p.parse_args())
 
 

@@ -1,9 +1,0 @@
-{
-  "kind": "qb_rope_builder_cpu_controls",
-  "passed": true,
-  "negative_source_contracts_rejected": 2,
-  "source_records_verified": 36,
-  "complete_native_prefix_verified": true,
-  "uniform_reduction_and_two_bf16_source_order_verified": true,
-  "gpu_work_submitted": false
-}

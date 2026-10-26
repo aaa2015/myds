@@ -18,6 +18,8 @@ SPEC = importlib.util.spec_from_file_location("narrow_audit",ROOT/"tools/audit_v
 A = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(A)
 PATCHES = ROOT/"docs/benchmarks/2026-10-26-upstream-plan-review/upstream-commits"
+if not PATCHES.exists():
+    PATCHES = ROOT.parent/"mydsdoc/benchmarks/2026-10-26-upstream-plan-review/upstream-commits"
 
 
 def ggstr(s):
