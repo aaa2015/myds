@@ -106,11 +106,20 @@ static int floats(const myds_metal_buffer_t *b,uint64_t n) {
 static int bf16s(const myds_metal_buffer_t *b,uint64_t n) {
     return b && n && n<=myds_metal_buffer_size(b)/2 && myds_metal_buffer_offset(b)%2==0;
 }
+#ifdef MYDS_INDEXER_CAPTURE
+static void indexer_capture_note_dispatch(const char *,const uint32_t[3],const uint32_t[3],size_t,int);
+#endif
 static int dispatch(const char *name,const void *args,size_t bytes,
     const myds_metal_buffer_t *const *b,size_t n,uint32_t x,uint32_t y,uint32_t z,
     uint32_t tx,uint32_t ty,uint32_t tz,size_t smem) {
     const uint32_t groups[]={x,y,z},threads[]={tx,ty,tz};
+#ifdef MYDS_INDEXER_CAPTURE
+    int result=myds_metal_dispatch_kernel(name,args,bytes,b,n,groups,threads,smem);
+    indexer_capture_note_dispatch(name,groups,threads,smem,result);
+    return result;
+#else
     return myds_metal_dispatch_kernel(name,args,bytes,b,n,groups,threads,smem);
+#endif
 }
 static int specialized(const char *name,const void *args,size_t bytes,
     const myds_metal_buffer_t *const *b,size_t n,uint32_t x,uint32_t y,uint32_t z,
@@ -649,6 +658,10 @@ uint32_t myds_v41_gpu_indexer_window_first_row(uint32_t pos, uint32_t ratio) {
     return vis > window ? vis - window : 0u;
 }
 
+#ifdef MYDS_INDEXER_CAPTURE
+#include "../tools/indexer_capture.inc"
+#endif
+
 static int indexscores_chunk(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
     const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,uint32_t n_comp,
     uint32_t n_heads,uint32_t n_tokens,uint32_t causal_start,uint32_t causal_ratio,bool cache_bf16) {
@@ -660,6 +673,11 @@ static int indexscores_chunk(myds_metal_buffer_t *scores,const myds_metal_buffer
     const char *tiled_env = getenv("MYDS_INDEXER_TILED");
     int opt_tiled = (tiled_env && atoi(tiled_env) > 0) ? 1 : 0;
     const myds_metal_buffer_t *b[]={q,weights,cache,scores};
+#ifdef MYDS_INDEXER_CAPTURE
+    const int capture=indexer_capture_before(q,weights,cache,n_comp,n_heads,n_tokens,
+                                            causal_start,causal_ratio,cache_bf16);
+    if(capture<0)return 0;
+#endif
     if (opt_tiled && n_tokens >= 8 && !indexer_key_window()) {
         struct {
             uint32_t n_comp, n_tokens, n_head, head_dim, pos0, ratio;
@@ -686,11 +704,21 @@ static int indexscores_chunk(myds_metal_buffer_t *scores,const myds_metal_buffer
         /* 2026-10-24 §91：MYDS_INDEXER_SGBAR=1 走 warp 屏障变体（仅降级 #2/#3）。 */
         const char *sgbar = getenv("MYDS_INDEXER_SGBAR");
         const int use_sgbar = sgbar && strcmp(sgbar, "0") != 0;
+#ifdef MYDS_INDEXER_CAPTURE
+        const char *provider=use_sgbar ? (cache_bf16?"kernel_dsv4_indexer_scores_tiled_sg_bf16":
+                                    "kernel_dsv4_indexer_scores_tiled_sg_f32")
+                                  : (cache_bf16?"kernel_dsv4_indexer_scores_tiled_bf16":
+                                    "kernel_dsv4_indexer_scores_tiled_f32");
+        int result=dispatch(provider,&ta,sizeof(ta),b,4,gx,gy,1,32,4,1,smem);
+        return indexer_capture_after(capture,result,provider,&ta,sizeof(ta),scores,n_comp,n_tokens,
+                                     causal_start,causal_ratio,cache_bf16,gx,gy,smem);
+#else
         return dispatch(use_sgbar ? (cache_bf16?"kernel_dsv4_indexer_scores_tiled_sg_bf16":
                                     "kernel_dsv4_indexer_scores_tiled_sg_f32")
                                   : (cache_bf16?"kernel_dsv4_indexer_scores_tiled_bf16":
                                     "kernel_dsv4_indexer_scores_tiled_f32"),
                         &ta, sizeof(ta), b, 4, gx, gy, 1, 32, 4, 1, smem);
+#endif
     }
     struct {uint32_t n_rows,n_head,head_dim,cache_f16;float scale;
             uint32_t n_tokens,causal_start,causal_ratio,window;} a={
@@ -700,10 +728,22 @@ static int indexscores_chunk(myds_metal_buffer_t *scores,const myds_metal_buffer
     if ((!exact_env || strcmp(exact_env, "0") != 0) &&
         dispatch("kernel_myds_indexer_score_chunk_exact", &a, sizeof(a), b, 4,
                  (n_comp + 15u) / 16u, (n_tokens + 7u) / 8u, 1, 32, 4, 1, 1280u * 4u)) {
+#ifdef MYDS_INDEXER_CAPTURE
+        return indexer_capture_after(capture,1,"kernel_myds_indexer_score_chunk_exact",&a,sizeof(a),
+            scores,n_comp,n_tokens,causal_start,causal_ratio,cache_bf16,(n_comp+15u)/16u,(n_tokens+7u)/8u,1280u*4u);
+#else
         return 1;
+#endif
     }
+#ifdef MYDS_INDEXER_CAPTURE
+    int result=dispatch("kernel_glm_indexer_score_chunk_direct",&a,sizeof(a),b,4,
+        n_comp,n_tokens,1,32,4,1,132u*4);
+    return indexer_capture_after(capture,result,"kernel_glm_indexer_score_chunk_direct",&a,sizeof(a),
+        scores,n_comp,n_tokens,causal_start,causal_ratio,cache_bf16,n_comp,n_tokens,132u*4u);
+#else
     return dispatch("kernel_glm_indexer_score_chunk_direct",&a,sizeof(a),b,4,
         n_comp,n_tokens,1,32,4,1,132u*4);
+#endif
 }
 int myds_v41_gpu_indexscores_chunk(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
     const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,uint32_t n_comp,

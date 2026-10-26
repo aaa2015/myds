@@ -1,0 +1,27 @@
+--- /tmp/myds-kv-only-finish-reader-20261025/review_kv_only_finish.py
++++ /tmp/myds-kv-only-finish-reader-v2-20261026/review_kv_only_finish_v2.py
+@@ -140,7 +140,7 @@
+         slot = body[start:start+2048] == actual_kv
+     record = dict(kind="parity", stage="phase1", case=i, layer=layer, position=pos, compressed=layer >= 2,
+         provider=provider, role=role, bytes=SIZES[role], mismatches=bad, first_mismatch=first,
+-        guards=intact, finite_bf16_required=role != "dummy_q", finite_bf16=fmt,
++        guards=intact, finite_bf16_required=int(role != "dummy_q"), finite_bf16=fmt,
+         untouched_window_mismatches=untouched, current_window_slot_equals_complete_kv=slot,
+         expectation="complete-before-bytes-dead-dummy-remains-unmodified" if provider == 2 and role == "dummy_q" else "actual-golden-output-complete-bytes",
+         sha256=digest(body))
+@@ -229,7 +229,14 @@
+         for pair in args.path_map:
+             old, new = pair.split("=", 1); self.maps.append((Path(old), Path(new)))
+         self.maps.sort(key=lambda x: len(str(x[0])), reverse=True)
+-        self.report = dict(schema_version=1, reader_sha256=sha(__file__), review_completed=False, correctness_passed=False,
++        self.report = dict(schema_version=1, reader_sha256=sha(__file__),
++            reader_revision=2, old_reader_sha256="db555ce6e7450e11c119785a9738f8e33338ca72918d7aeba8e57221a9e5c816",
++            repaired_reader_sha256=sha(__file__), repair_scope=dict(
++                field="finite_bf16_required", producer_expression="@(r!=0)",
++                old_computed_type="bool", producer_and_repaired_computed_type="int 0/1",
++                bool_substitution_allowed=False, numeric_guards_completion_provenance_gates_changed=False,
++                old_reader_rejection_classification="reader declaration-type error; not a GPU numerical failure"),
++            review_completed=False, correctness_passed=False,
+             GPU_correctness_evaluated=False, timing_evaluated=False, performance_acceptance=False, production_adoption=False,
+             fullmodel_evidence=False, scope="one synthetic device complete-output correctness cohort; no speed or runtime adoption")
+ 

@@ -1,0 +1,103 @@
+{
+  "captured_at": "2026-10-25T17:32:00.003091+00:00",
+  "kind": "CPU and source review only",
+  "workspace_head": "224dc70a839af1468c68c277384fa489ea55afbd",
+  "workspace_dirty": true,
+  "proposal_original_path": "/Users/fangqingyuan/.gemini/antigravity-ide/brain/3d5b3923-370d-4918-a651-b95c0d4253f9/ds41_perf_analysis_and_adoption_plan.md",
+  "proposal_sha256": "e0314a33d21d5058aa8f98640883f07d7b001a76d199211d5f1c806722a4759b",
+  "source_sha256": {
+    "Makefile": "2249a5dea7ca3a1bc4fec5dc66714d5c32630905ebda0af6757e91974f98d6a9",
+    "README.md": "dc24fbc12b6d114daf2fd5d80862d4a7c8e9be847aff5fc1dd8b050ebb798dc9",
+    "eval/stream_bench.py": "ddfd3f8973fbbf0c26c7c36cb7b716441982731b0e3680e674b11943fe8e1d88",
+    "eval/decode_fixed.py": "a4236ef2fea087a461f50631572e5160ec41824d86c5d65713c64062fd64fc28",
+    "eval/prefill_decode_bench.py": "54e2f3844f8c99372190d983dc68f5eedcdf438b00488863998175ee7930d4cd",
+    "src/myds_engine.c": "a8a5169ec08581c31ba34e3631c07a406fb641e560420655c8578075ed3cf600",
+    "src/myds_v41.c": "8738b2137ac97feddef5f73146668e2d7d0bcc518eee1ef72356f8c57904f26f",
+    "src/myds_v41_gpu.c": "cfb53593e1fdce3a82fcc294bca00b0d8e57ba47bdca8ad5b20fde0c91e09115",
+    "src/myds_v41_moe.c": "b1445b3f207ae60a0071c0ac5825cf795447e1c2d57592aaf2e13c3cea4a66eb",
+    "src/myds_engram.c": "4851e619afc6b137fd873cc0a7478037035dd451bd96b4454a84c57279b8b602",
+    "src/myds_metal.m": "f65be0b12471f75a8b305e42095e905a18e0227da1d4b8e13494fe95bd3b76b1",
+    "src/myds_decode_candidates.inc": "a11bc77045a1e01447e2c2fa67f0c5e743929b7f7db899f380e8322d7db6a286",
+    "include/myds_engram.h": "13ad8b71d888a5606d10113b19c846bd65f7b36194f5de5c2c56e91c3ca7c08e",
+    "metal/dsv4_misc.metal": "7fe23a7707e97758c3127caadfb2bc3b6818c1c6ba9d30a73f632563b82f3d57",
+    "metal/dsv4_hc.metal": "7f5e44ce6108285740cca97a4c81e8c271d0631ed784f459baa63b3d01260bfc",
+    "metal/dsv41.metal": "7a15599dc6d329715c610b581b2babcce46580187707b8d87565e795b41ed1a2",
+    "metal/moe.metal": "78cb927e7884254832f3c37e97b1c4952c1a1863555616693f3b35fb787f5776",
+    "metal/myds_q4_v41.metal": "6487878f399cd24b3e3c357cc161a10944a558465f2d0eb680251418a4ab22d0",
+    "tools/build_indexer_k_resident_probe.py": "4397aa14dd32d28a93e6b76366453c42131e5510c38f827a6c54e778c813eecc",
+    "tools/bench_output_a_fullmodel.c": "81401c1903fcf65b82b77826d67397bbae6991b2b3d5c12e0466dfe7f13d90b2",
+    "docs/2026-10-25-indexer-observer-and-qb-rope-review.md": "9f40ea2590868dcde4354e111588b9b647e50e02122f6072a653a644402c391e",
+    "docs/2026-10-26-decode-kv-only-finish-review.md": "4fae063585e7275eeb886081cd68208c4968870b76cc1f25071e8a1d3c0cac67",
+    "docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md": "8f09bd36bc732a768148ce72393aea10ad6adf1c7c5502a6d6fb3e05ec454fbc"
+  },
+  "commands": [
+    {
+      "argv": [
+        "make",
+        "-n",
+        "test-indexer-mma"
+      ],
+      "exit_code": 2,
+      "stdout": "",
+      "stderr": "make: *** No rule to make target `test-indexer-mma'.  Stop.\n"
+    },
+    {
+      "argv": [
+        "make",
+        "-n",
+        "test-decode-literal-shapes"
+      ],
+      "exit_code": 2,
+      "stdout": "",
+      "stderr": "make: *** No rule to make target `test-decode-literal-shapes'.  Stop.\n"
+    },
+    {
+      "argv": [
+        "make",
+        "-n",
+        "test-split-collapse"
+      ],
+      "exit_code": 2,
+      "stdout": "",
+      "stderr": "make: *** No rule to make target `test-split-collapse'.  Stop.\n"
+    },
+    {
+      "argv": [
+        "python3",
+        "eval/stream_bench.py",
+        "--url",
+        "http://127.0.0.1:8099/v1",
+        "--max-tokens",
+        "128",
+        "--jsonl",
+        "/tmp/myds-plan-review-unused.jsonl"
+      ],
+      "exit_code": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "python3",
+        "eval/decode_fixed.py",
+        "--help"
+      ],
+      "exit_code": 0,
+      "stdout": "usage: decode_fixed.py [-h] [--tokens TOKENS] [--jsonl JSONL] port [alias]\n\nFixed-output online decode screening, using final usage token counts. Usage:\ndecode_fixed.py <port> [alias] [--tokens 128] [--jsonl PATH] Every prompt gets\none discarded warmup and three formal samples. A sample must finish at its\nrequested token limit, with final usage and [DONE]. HTTP exposes visible text\narrivals, not exact generated-token timing; native decode is the authority for\nformal performance acceptance.\n\npositional arguments:\n  port\n  alias\n\noptions:\n  -h, --help       show this help message and exit\n  --tokens TOKENS\n  --jsonl JSONL    append complete timing/usage records (including warmups and\n                   rejections)\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "python3",
+        "eval/prefill_decode_bench.py",
+        "--help"
+      ],
+      "exit_code": 0,
+      "stdout": "usage: prefill_decode_bench.py [-h] [--decode-tokens DECODE_TOKENS]\n                               [--jsonl JSONL]\n                               port [ctx_sizes ...]\n\nOnline TTFT and decode screening, using final usage token counts. Usage:\nprefill_decode_bench.py <port> [ctx_sizes...] [--decode-tokens 512] [--jsonl\nPATH] Prefill requests use max_tokens=1 and a random leading nonce.\ntokens/TTFT is an end-to-end estimate including cache/restore, first-token\nwork and HTTP transport. usage.prompt_tokens alone cannot prove a cache miss:\ninspect server evidence. Decode timing from visible text cannot replace native\ngenerated-token timing.\n\npositional arguments:\n  port\n  ctx_sizes\n\noptions:\n  -h, --help            show this help message and exit\n  --decode-tokens DECODE_TOKENS\n  --jsonl JSONL         append complete timing/usage records (including\n                        warmups and rejections)\n",
+      "stderr": ""
+    }
+  ],
+  "bin_myds_bench_exists": false,
+  "GPU_benchmarks_or_service_mutations": false,
+  "runtime_or_source_code_edits": false
+}

@@ -1,0 +1,32 @@
+{
+  "MYDS_inherited": {},
+  "adoption_cohort": false,
+  "argv": [
+    "/private/tmp/myds-indexer-r3-20261025/diagnostic-build-v3/bench_indexer_stability",
+    "--capture-json",
+    "/private/tmp/myds-indexer-r2-20261025/capture-verified.json",
+    "--metallib",
+    "/private/tmp/myds-indexer-r2-20261025/full-build/probe.metallib",
+    "--native-metallib",
+    "/private/tmp/myds-indexer-r2-20261025/deployed/myds.metallib",
+    "--config",
+    "/private/tmp/myds-indexer-r2-20261025/deployed/myds.conf",
+    "--out-dir",
+    "/private/tmp/myds-indexer-r3-20261025/diagnostic-window/outputs",
+    "--protocol",
+    "/private/tmp/myds-indexer-r3-20261025/diagnostic-protocol.json"
+  ],
+  "binary_sha256": "d0ff2240ec7f3b8672e1d80c4e2136e61ca7ff18b6f0157a95dcdf5d9c9ed8c1",
+  "build_manifest_sha256": "a88cd81132ed03a7f460724e51d06817dc2b983c91fa07ed6ddbcf03e3fa1967",
+  "capture_json_sha256": "e7200c786445bf0946ef5fb7bdbe59b95bfd3de4118ec611583f9553752f5b6d",
+  "config_sha256": "0a3524b030a73916f7684d841b912c6e978c680825a3c3520ca18188f35a2cff",
+  "cwd": "/private/tmp/myds-indexer-r3-20261025/gpu-cwd",
+  "exclusive_recognized_process_check": true,
+  "fullmodel": false,
+  "native_sha256": "3837102396703da59e0eebbc0de1fdc58b68b3a3a5ec5d07504b351c67a29ba9",
+  "probe_sha256": "9df7ed2a5212d54d4475480bf6388d2f66ce24c93bb3a8b003f2b789806d6982",
+  "protocol_sha256": "76c032bda7af0673eb3d7de77762d546aa9f8b1c3cd8b6bb9bc596a0536a111f",
+  "started_epoch": 1792937186.9543328,
+  "timeout_s": 300,
+  "wrapper_sha256": "f656e4cee61fc5c7f641281e68d086160caa1cf662c7126303d2e082e52219d3"
+}

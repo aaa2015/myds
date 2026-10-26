@@ -1,0 +1,803 @@
+{
+  "schema_version": 1,
+  "capture_kind": "myds_real_prefill_indexer",
+  "status": "verified_cpu_only",
+  "capture_directory": "/private/tmp/myds-indexer-r2-20261025/capture-window/raw",
+  "files": {
+    "capture-meta.json": {
+      "path": "capture-meta.json",
+      "bytes": 555,
+      "sha256": "c022d1ea7d74d7ba51dc991baca9443e185d4febb5148030ea8c4af72dd7d944"
+    },
+    "capture-records.jsonl": {
+      "path": "capture-records.jsonl",
+      "bytes": 1654,
+      "sha256": "7d8f144b18412b373bacae15aa6d70b9c727ff9bc36b8e2d2ae052580ad50841"
+    },
+    "effective-myds.env": {
+      "path": "effective-myds.env",
+      "bytes": 1874,
+      "sha256": "51f5a6052084ef776212a16aa9b0d7df23c95d7c6e52dc2d93b6a6814eb5ed2c"
+    },
+    "input-token-ids.i32": {
+      "path": "input-token-ids.i32",
+      "bytes": 131072,
+      "sha256": "eb6687ff37d57bd5b5d990687e2541403d6ef199463cea2a9c4ba5ad1d8dce83"
+    },
+    "layer-14-args72.bin": {
+      "path": "layer-14-args72.bin",
+      "bytes": 72,
+      "sha256": "f2ff6777125b5edc6d0f92c93c10c7e7f5cb40cb492f572f4600527deb7aae49"
+    },
+    "layer-14-cache.bin": {
+      "path": "layer-14-cache.bin",
+      "bytes": 3948544,
+      "sha256": "4eb940d7ef03ed272a671e3bfba02f609ccc2af2947a0d312c64f2e55c1dc3c3"
+    },
+    "layer-14-native-args.bin": {
+      "path": "layer-14-native-args.bin",
+      "bytes": 36,
+      "sha256": "360a6804f466a45d1d237cfb368938b2c52d17ec911673e47a8bf886a8c081a2"
+    },
+    "layer-14-q-f32.bin": {
+      "path": "layer-14-q-f32.bin",
+      "bytes": 2097152,
+      "sha256": "1408c6c570764b9a51108bb2e010fcadb1a74812073564511d24c913d8d8f979"
+    },
+    "layer-14-scores-f32.bin": {
+      "path": "layer-14-scores-f32.bin",
+      "bytes": 7897088,
+      "sha256": "b5540b742f6dd65136e6ad69021e7345d48cacae5befb753faf531b1bf16e573"
+    },
+    "layer-14-selected-i32.bin": {
+      "path": "layer-14-selected-i32.bin",
+      "bytes": 262144,
+      "sha256": "96c830d01c895382335d98364d2cf3bc69cf0ccc8db7c9e108684ccb31ae0d03"
+    },
+    "layer-14-weights-f32.bin": {
+      "path": "layer-14-weights-f32.bin",
+      "bytes": 16384,
+      "sha256": "168cdcfd6e2730d26cd18527727791218c505cb41adc47f97b146e77bcb4e9c7"
+    },
+    "layer-2-args72.bin": {
+      "path": "layer-2-args72.bin",
+      "bytes": 72,
+      "sha256": "f2ff6777125b5edc6d0f92c93c10c7e7f5cb40cb492f572f4600527deb7aae49"
+    },
+    "layer-2-cache.bin": {
+      "path": "layer-2-cache.bin",
+      "bytes": 3948544,
+      "sha256": "d56f3814100b008580c4c6d06b30508b407eecf320aa6bc6d9960af640388b33"
+    },
+    "layer-2-native-args.bin": {
+      "path": "layer-2-native-args.bin",
+      "bytes": 36,
+      "sha256": "360a6804f466a45d1d237cfb368938b2c52d17ec911673e47a8bf886a8c081a2"
+    },
+    "layer-2-q-f32.bin": {
+      "path": "layer-2-q-f32.bin",
+      "bytes": 2097152,
+      "sha256": "23804cabb6758c603f20d834af6931fb009d6e433d790d774217b4d247aa95ed"
+    },
+    "layer-2-scores-f32.bin": {
+      "path": "layer-2-scores-f32.bin",
+      "bytes": 7897088,
+      "sha256": "b1751be80a89a2bbd698236a3a0c5ac1caee8c1e98fab2d097928f9e053843ff"
+    },
+    "layer-2-selected-i32.bin": {
+      "path": "layer-2-selected-i32.bin",
+      "bytes": 262144,
+      "sha256": "cf2b46056e3874b1424d68d6a1d10b562ab2b7a9782f2773276e1b809da5315d"
+    },
+    "layer-2-weights-f32.bin": {
+      "path": "layer-2-weights-f32.bin",
+      "bytes": 16384,
+      "sha256": "d69a080f4fc6110fa4cc2e3b8db5039be030c4e9352b516ae38ed05cff5d0a5f"
+    },
+    "layer-8-args72.bin": {
+      "path": "layer-8-args72.bin",
+      "bytes": 72,
+      "sha256": "f2ff6777125b5edc6d0f92c93c10c7e7f5cb40cb492f572f4600527deb7aae49"
+    },
+    "layer-8-cache.bin": {
+      "path": "layer-8-cache.bin",
+      "bytes": 3948544,
+      "sha256": "8314eb58b2ed3a0770ba96cfcca2412b108dffe116df801ae22a735257299bb5"
+    },
+    "layer-8-native-args.bin": {
+      "path": "layer-8-native-args.bin",
+      "bytes": 36,
+      "sha256": "360a6804f466a45d1d237cfb368938b2c52d17ec911673e47a8bf886a8c081a2"
+    },
+    "layer-8-q-f32.bin": {
+      "path": "layer-8-q-f32.bin",
+      "bytes": 2097152,
+      "sha256": "82b080026b0735f7812acf3a5aff804bbeda3f05aba9c4d697c038ffebfcf12d"
+    },
+    "layer-8-scores-f32.bin": {
+      "path": "layer-8-scores-f32.bin",
+      "bytes": 7897088,
+      "sha256": "d33df3b3e923319b5d9a55b717fa7eea55e2dba840ea683b28f00220d321a3dc"
+    },
+    "layer-8-selected-i32.bin": {
+      "path": "layer-8-selected-i32.bin",
+      "bytes": 262144,
+      "sha256": "f20068fb1305cdafcb5685aa5e7a68be3433ee3fc62b157d331e071ac736707d"
+    },
+    "layer-8-weights-f32.bin": {
+      "path": "layer-8-weights-f32.bin",
+      "bytes": 16384,
+      "sha256": "66a6d6bc11bff93a2de9f1ff4eab75f628a7f708a27e686b6cfdf6ddfc8339b0"
+    },
+    "selected-records.jsonl": {
+      "path": "selected-records.jsonl",
+      "bytes": 4057,
+      "sha256": "b09971abdbb47f5fea2397897bd18d1c593c2ab98d0bcfaecb4d48c23762d9f2"
+    }
+  },
+  "cases": [
+    {
+      "schema_version": 1,
+      "layer": 2,
+      "base_pos": 0,
+      "c_start": 30720,
+      "c_len": 2048,
+      "group_off": 0,
+      "batch_floats": 2097152,
+      "n_comp": 15424,
+      "n_tokens": 128,
+      "n_heads": 32,
+      "head_dim": 128,
+      "pos0": 30720,
+      "ratio": 2,
+      "cache_bf16": true,
+      "key_window": 0,
+      "provider": "kernel_myds_indexer_score_chunk_exact",
+      "native_args_bytes": 36,
+      "grid": [
+        964,
+        16,
+        1
+      ],
+      "threads": [
+        32,
+        4,
+        1
+      ],
+      "dynamic_threadgroup_bytes": 5120,
+      "q_bytes": 2097152,
+      "weights_bytes": 16384,
+      "cache_bytes": 3948544,
+      "scores_bytes": 7897088,
+      "observer_commit_wait": true,
+      "performance_from_capture": false,
+      "full_scores": true,
+      "synthetic": false,
+      "payloads": {
+        "args72": {
+          "path": "layer-2-args72.bin",
+          "bytes": 72,
+          "sha256": "f2ff6777125b5edc6d0f92c93c10c7e7f5cb40cb492f572f4600527deb7aae49"
+        },
+        "native-args": {
+          "path": "layer-2-native-args.bin",
+          "bytes": 36,
+          "sha256": "360a6804f466a45d1d237cfb368938b2c52d17ec911673e47a8bf886a8c081a2"
+        },
+        "q-f32": {
+          "path": "layer-2-q-f32.bin",
+          "bytes": 2097152,
+          "sha256": "23804cabb6758c603f20d834af6931fb009d6e433d790d774217b4d247aa95ed"
+        },
+        "weights-f32": {
+          "path": "layer-2-weights-f32.bin",
+          "bytes": 16384,
+          "sha256": "d69a080f4fc6110fa4cc2e3b8db5039be030c4e9352b516ae38ed05cff5d0a5f"
+        },
+        "cache": {
+          "path": "layer-2-cache.bin",
+          "bytes": 3948544,
+          "sha256": "d56f3814100b008580c4c6d06b30508b407eecf320aa6bc6d9960af640388b33"
+        },
+        "scores-f32": {
+          "path": "layer-2-scores-f32.bin",
+          "bytes": 7897088,
+          "sha256": "b1751be80a89a2bbd698236a3a0c5ac1caee8c1e98fab2d097928f9e053843ff"
+        },
+        "selected-i32": {
+          "path": "layer-2-selected-i32.bin",
+          "bytes": 262144,
+          "sha256": "cf2b46056e3874b1424d68d6a1d10b562ab2b7a9782f2773276e1b809da5315d"
+        }
+      },
+      "invisible_minus_inf_count": 4096,
+      "actual_topk_consumer": {
+        "layer": 2,
+        "n_tokens": 128,
+        "n_comp": 15424,
+        "pos0": 30720,
+        "ratio": 2,
+        "top": 512,
+        "ordered_ids_complete": true,
+        "mask_filter_between_scores_and_topk": false,
+        "prefix_requests": 1,
+        "prefix_encoded": 1,
+        "prefix_unavailable": 0,
+        "nan_fuse_encoded": 1,
+        "nan_shuffle_encoded": 0,
+        "dispatches": [
+          {
+            "kernel": "kernel_myds_argsort_f32_i32_desc_causal_partition_nan",
+            "grid": [
+              2048,
+              1,
+              1
+            ],
+            "threads": [
+              1024,
+              1,
+              1
+            ],
+            "dynamic_threadgroup_bytes": 8192,
+            "host_accepted": true
+          },
+          {
+            "kernel": "kernel_myds_argsort_merge_f32_i32_desc_causal_partition_prefix_guarded",
+            "grid": [
+              2048,
+              1,
+              1
+            ],
+            "threads": [
+              512,
+              1,
+              1
+            ],
+            "dynamic_threadgroup_bytes": 0,
+            "host_accepted": true
+          },
+          {
+            "kernel": "kernel_myds_argsort_merge_f32_i32_desc_causal_partition_prefix_guarded",
+            "grid": [
+              1024,
+              1,
+              1
+            ],
+            "threads": [
+              512,
+              1,
+              1
+            ],
+            "dynamic_threadgroup_bytes": 0,
+            "host_accepted": true
+          },
+          {
+            "kernel": "kernel_myds_argsort_merge_f32_i32_desc_causal_partition_prefix_guarded",
+            "grid": [
+              512,
+              1,
+              1
+            ],
+            "threads": [
+              512,
+              1,
+              1
+            ],
+            "dynamic_threadgroup_bytes": 0,
+            "host_accepted": true
+          },
+          {
+            "kernel": "kernel_myds_argsort_merge_f32_i32_desc_causal_partition_prefix_guarded",
+            "grid": [
+              256,
+              1,
+              1
+            ],
+            "threads": [
+              512,
+              1,
+              1
+            ],
+            "dynamic_threadgroup_bytes": 0,
+            "host_accepted": true
+          },
+          {
+            "kernel": "kernel_myds_argsort_merge_f32_i32_desc_causal_partition_prefix_guarded",
+            "grid": [
+              128,
+              1,
+              1
+            ],
+            "threads": [
+              512,
+              1,
+              1
+            ],
+            "dynamic_threadgroup_bytes": 0,
+            "host_accepted": true
+          }
+        ],
+        "observer_commit_wait": true,
+        "performance_from_capture": false
+      },
+      "candidate_topk_replayed": false
+    },
+    {
+      "schema_version": 1,
+      "layer": 8,
+      "base_pos": 0,
+      "c_start": 30720,
+      "c_len": 2048,
+      "group_off": 0,
+      "batch_floats": 2097152,
+      "n_comp": 15424,
+      "n_tokens": 128,
+      "n_heads": 32,
+      "head_dim": 128,
+      "pos0": 30720,
+      "ratio": 2,
+      "cache_bf16": true,
+      "key_window": 0,
+      "provider": "kernel_myds_indexer_score_chunk_exact",
+      "native_args_bytes": 36,
+      "grid": [
+        964,
+        16,
+        1
+      ],
+      "threads": [
+        32,
+        4,
+        1
+      ],
+      "dynamic_threadgroup_bytes": 5120,
+      "q_bytes": 2097152,
+      "weights_bytes": 16384,
+      "cache_bytes": 3948544,
+      "scores_bytes": 7897088,
+      "observer_commit_wait": true,
+      "performance_from_capture": false,
+      "full_scores": true,
+      "synthetic": false,
+      "payloads": {
+        "args72": {
+          "path": "layer-8-args72.bin",
+          "bytes": 72,
+          "sha256": "f2ff6777125b5edc6d0f92c93c10c7e7f5cb40cb492f572f4600527deb7aae49"
+        },
+        "native-args": {
+          "path": "layer-8-native-args.bin",
+          "bytes": 36,
+          "sha256": "360a6804f466a45d1d237cfb368938b2c52d17ec911673e47a8bf886a8c081a2"
+        },
+        "q-f32": {
+          "path": "layer-8-q-f32.bin",
+          "bytes": 2097152,
+          "sha256": "82b080026b0735f7812acf3a5aff804bbeda3f05aba9c4d697c038ffebfcf12d"
+        },
+        "weights-f32": {
+          "path": "layer-8-weights-f32.bin",
+          "bytes": 16384,
+          "sha256": "66a6d6bc11bff93a2de9f1ff4eab75f628a7f708a27e686b6cfdf6ddfc8339b0"
+        },
+        "cache": {
+          "path": "layer-8-cache.bin",
+          "bytes": 3948544,
+          "sha256": "8314eb58b2ed3a0770ba96cfcca2412b108dffe116df801ae22a735257299bb5"
+        },
+        "scores-f32": {
+          "path": "layer-8-scores-f32.bin",
+          "bytes": 7897088,
+          "sha256": "d33df3b3e923319b5d9a55b717fa7eea55e2dba840ea683b28f00220d321a3dc"
+        },
+        "selected-i32": {
+          "path": "layer-8-selected-i32.bin",
+          "bytes": 262144,
+          "sha256": "f20068fb1305cdafcb5685aa5e7a68be3433ee3fc62b157d331e071ac736707d"
+        }
+      },
+      "invisible_minus_inf_count": 4096,
+      "actual_topk_consumer": {
+        "layer": 8,
+        "n_tokens": 128,
+        "n_comp": 15424,
+        "pos0": 30720,
+        "ratio": 2,
+        "top": 512,
+        "ordered_ids_complete": true,
+        "mask_filter_between_scores_and_topk": false,
+        "prefix_requests": 1,
+        "prefix_encoded": 1,
+        "prefix_unavailable": 0,
+        "nan_fuse_encoded": 1,
+        "nan_shuffle_encoded": 0,
+        "dispatches": [
+          {
+            "kernel": "kernel_myds_argsort_f32_i32_desc_causal_partition_nan",
+            "grid": [
+              2048,
+              1,
+              1
+            ],
+            "threads": [
+              1024,
+              1,
+              1
+            ],
+            "dynamic_threadgroup_bytes": 8192,
+            "host_accepted": true
+          },
+          {
+            "kernel": "kernel_myds_argsort_merge_f32_i32_desc_causal_partition_prefix_guarded",
+            "grid": [
+              2048,
+              1,
+              1
+            ],
+            "threads": [
+              512,
+              1,
+              1
+            ],
+            "dynamic_threadgroup_bytes": 0,
+            "host_accepted": true
+          },
+          {
+            "kernel": "kernel_myds_argsort_merge_f32_i32_desc_causal_partition_prefix_guarded",
+            "grid": [
+              1024,
+              1,
+              1
+            ],
+            "threads": [
+              512,
+              1,
+              1
+            ],
+            "dynamic_threadgroup_bytes": 0,
+            "host_accepted": true
+          },
+          {
+            "kernel": "kernel_myds_argsort_merge_f32_i32_desc_causal_partition_prefix_guarded",
+            "grid": [
+              512,
+              1,
+              1
+            ],
+            "threads": [
+              512,
+              1,
+              1
+            ],
+            "dynamic_threadgroup_bytes": 0,
+            "host_accepted": true
+          },
+          {
+            "kernel": "kernel_myds_argsort_merge_f32_i32_desc_causal_partition_prefix_guarded",
+            "grid": [
+              256,
+              1,
+              1
+            ],
+            "threads": [
+              512,
+              1,
+              1
+            ],
+            "dynamic_threadgroup_bytes": 0,
+            "host_accepted": true
+          },
+          {
+            "kernel": "kernel_myds_argsort_merge_f32_i32_desc_causal_partition_prefix_guarded",
+            "grid": [
+              128,
+              1,
+              1
+            ],
+            "threads": [
+              512,
+              1,
+              1
+            ],
+            "dynamic_threadgroup_bytes": 0,
+            "host_accepted": true
+          }
+        ],
+        "observer_commit_wait": true,
+        "performance_from_capture": false
+      },
+      "candidate_topk_replayed": false
+    },
+    {
+      "schema_version": 1,
+      "layer": 14,
+      "base_pos": 0,
+      "c_start": 30720,
+      "c_len": 2048,
+      "group_off": 0,
+      "batch_floats": 2097152,
+      "n_comp": 15424,
+      "n_tokens": 128,
+      "n_heads": 32,
+      "head_dim": 128,
+      "pos0": 30720,
+      "ratio": 2,
+      "cache_bf16": true,
+      "key_window": 0,
+      "provider": "kernel_myds_indexer_score_chunk_exact",
+      "native_args_bytes": 36,
+      "grid": [
+        964,
+        16,
+        1
+      ],
+      "threads": [
+        32,
+        4,
+        1
+      ],
+      "dynamic_threadgroup_bytes": 5120,
+      "q_bytes": 2097152,
+      "weights_bytes": 16384,
+      "cache_bytes": 3948544,
+      "scores_bytes": 7897088,
+      "observer_commit_wait": true,
+      "performance_from_capture": false,
+      "full_scores": true,
+      "synthetic": false,
+      "payloads": {
+        "args72": {
+          "path": "layer-14-args72.bin",
+          "bytes": 72,
+          "sha256": "f2ff6777125b5edc6d0f92c93c10c7e7f5cb40cb492f572f4600527deb7aae49"
+        },
+        "native-args": {
+          "path": "layer-14-native-args.bin",
+          "bytes": 36,
+          "sha256": "360a6804f466a45d1d237cfb368938b2c52d17ec911673e47a8bf886a8c081a2"
+        },
+        "q-f32": {
+          "path": "layer-14-q-f32.bin",
+          "bytes": 2097152,
+          "sha256": "1408c6c570764b9a51108bb2e010fcadb1a74812073564511d24c913d8d8f979"
+        },
+        "weights-f32": {
+          "path": "layer-14-weights-f32.bin",
+          "bytes": 16384,
+          "sha256": "168cdcfd6e2730d26cd18527727791218c505cb41adc47f97b146e77bcb4e9c7"
+        },
+        "cache": {
+          "path": "layer-14-cache.bin",
+          "bytes": 3948544,
+          "sha256": "4eb940d7ef03ed272a671e3bfba02f609ccc2af2947a0d312c64f2e55c1dc3c3"
+        },
+        "scores-f32": {
+          "path": "layer-14-scores-f32.bin",
+          "bytes": 7897088,
+          "sha256": "b5540b742f6dd65136e6ad69021e7345d48cacae5befb753faf531b1bf16e573"
+        },
+        "selected-i32": {
+          "path": "layer-14-selected-i32.bin",
+          "bytes": 262144,
+          "sha256": "96c830d01c895382335d98364d2cf3bc69cf0ccc8db7c9e108684ccb31ae0d03"
+        }
+      },
+      "invisible_minus_inf_count": 4096,
+      "actual_topk_consumer": {
+        "layer": 14,
+        "n_tokens": 128,
+        "n_comp": 15424,
+        "pos0": 30720,
+        "ratio": 2,
+        "top": 512,
+        "ordered_ids_complete": true,
+        "mask_filter_between_scores_and_topk": false,
+        "prefix_requests": 1,
+        "prefix_encoded": 1,
+        "prefix_unavailable": 0,
+        "nan_fuse_encoded": 1,
+        "nan_shuffle_encoded": 0,
+        "dispatches": [
+          {
+            "kernel": "kernel_myds_argsort_f32_i32_desc_causal_partition_nan",
+            "grid": [
+              2048,
+              1,
+              1
+            ],
+            "threads": [
+              1024,
+              1,
+              1
+            ],
+            "dynamic_threadgroup_bytes": 8192,
+            "host_accepted": true
+          },
+          {
+            "kernel": "kernel_myds_argsort_merge_f32_i32_desc_causal_partition_prefix_guarded",
+            "grid": [
+              2048,
+              1,
+              1
+            ],
+            "threads": [
+              512,
+              1,
+              1
+            ],
+            "dynamic_threadgroup_bytes": 0,
+            "host_accepted": true
+          },
+          {
+            "kernel": "kernel_myds_argsort_merge_f32_i32_desc_causal_partition_prefix_guarded",
+            "grid": [
+              1024,
+              1,
+              1
+            ],
+            "threads": [
+              512,
+              1,
+              1
+            ],
+            "dynamic_threadgroup_bytes": 0,
+            "host_accepted": true
+          },
+          {
+            "kernel": "kernel_myds_argsort_merge_f32_i32_desc_causal_partition_prefix_guarded",
+            "grid": [
+              512,
+              1,
+              1
+            ],
+            "threads": [
+              512,
+              1,
+              1
+            ],
+            "dynamic_threadgroup_bytes": 0,
+            "host_accepted": true
+          },
+          {
+            "kernel": "kernel_myds_argsort_merge_f32_i32_desc_causal_partition_prefix_guarded",
+            "grid": [
+              256,
+              1,
+              1
+            ],
+            "threads": [
+              512,
+              1,
+              1
+            ],
+            "dynamic_threadgroup_bytes": 0,
+            "host_accepted": true
+          },
+          {
+            "kernel": "kernel_myds_argsort_merge_f32_i32_desc_causal_partition_prefix_guarded",
+            "grid": [
+              128,
+              1,
+              1
+            ],
+            "threads": [
+              512,
+              1,
+              1
+            ],
+            "dynamic_threadgroup_bytes": 0,
+            "host_accepted": true
+          }
+        ],
+        "observer_commit_wait": true,
+        "performance_from_capture": false
+      },
+      "candidate_topk_replayed": false
+    }
+  ],
+  "metadata": {
+    "schema_version": 1,
+    "capture_kind": "myds_real_prefill_indexer",
+    "tokens": 32768,
+    "context_capacity": 327680,
+    "layers": [
+      2,
+      8,
+      14
+    ],
+    "chunk_global_start": 30720,
+    "batch_floats": 2097152,
+    "model_size": 362142629888,
+    "model_inode": 8037134,
+    "model_mtime_s": 1792321832,
+    "model_mtime_ns": 447159977,
+    "config_size": 6815,
+    "token_file_size": 168206,
+    "direct_prefill_tokens": true,
+    "real_model_forward": true,
+    "config_overwrites_environment": true,
+    "observer_commit_wait": true,
+    "performance_from_capture": false,
+    "loaded_metallib_path": "/tmp/myds-indexer-r2-20261025/capture-build/myds.metallib"
+  },
+  "effective_myds": {
+    "MYDS_ANCHOR_MAX_TOKENS": "65536",
+    "MYDS_ANCHOR_SLOTS": "16",
+    "MYDS_ATTN_DIRECT_PACK_FUSE": "0",
+    "MYDS_ATTN_HC_OVERLAP": "1",
+    "MYDS_ATTN_INDEXER_EARLY": "1",
+    "MYDS_ATTN_KV_REUSE": "1",
+    "MYDS_ATTN_PACKED_REGISTER": "1",
+    "MYDS_ATTN_ROPE_FUSE": "1",
+    "MYDS_BATCH2_AUTO_BARRIER": "0",
+    "MYDS_BATCH2_DECODE_SPLIT": "10",
+    "MYDS_BATCH2_Q4_SHARED": "1",
+    "MYDS_BATCH2_Q8_SHARED": "1",
+    "MYDS_BATCH2_SPEC": "0",
+    "MYDS_BATCH2_TRACE_GPU": "0",
+    "MYDS_CHUNK_KEY_MAX": "524288",
+    "MYDS_CTX_SIZE": "327680",
+    "MYDS_DECODE_SPLIT": "20",
+    "MYDS_DEFAULT_REASONING_EFFORT": "high",
+    "MYDS_DENSE_Q4_NR0": "2",
+    "MYDS_DENSE_Q4_V41": "1",
+    "MYDS_DENSE_Q4_V41_HEAD_REFERENCE": "0",
+    "MYDS_DENSE_Q4_V41_NB": "1",
+    "MYDS_DSPARK": "0",
+    "MYDS_DSPARK_DEBUG": "0",
+    "MYDS_DSPARK_FILE": "/Users/fangqingyuan/Projects/ds4/gguf/DeepSeek-V4.1-Flash-DSpark-draft-Q2K-Q4K.gguf",
+    "MYDS_DSPARK_NO_MARKOV": "0",
+    "MYDS_F16_GEMV_BF16_FUSE": "1",
+    "MYDS_FFN_HC_OVERLAP": "1",
+    "MYDS_INDEXER_BATCH_FLOATS": "2097152",
+    "MYDS_INDEXER_DECODE_OVERLAP": "1",
+    "MYDS_INDEXER_HEAD_SLOTS": "1",
+    "MYDS_INDEXER_ROPE_QUANT_FUSE": "1",
+    "MYDS_INDEXER_TOPK_NAN_FUSE": "1",
+    "MYDS_INDEXER_TOPK_PREFIX_MERGE": "1",
+    "MYDS_LM_HEAD_Q8_NR0": "2",
+    "MYDS_MAX_NEW_TOKENS": "262144",
+    "MYDS_METAL_CONCURRENT": "1",
+    "MYDS_MIN_P": "0.0",
+    "MYDS_MOE_BATCH_DEDUP": "0",
+    "MYDS_MOE_BATCH_MAX_TOKENS": "16384",
+    "MYDS_MOE_CHUNKS": "9",
+    "MYDS_MOE_CONCURRENT": "1",
+    "MYDS_MOE_DOWN_NSG": "4",
+    "MYDS_MOE_DOWN_OVERLAP": "1",
+    "MYDS_MOE_HC_OVERLAP": "1",
+    "MYDS_MOE_IQ2_POPCNT_SIGN": "1",
+    "MYDS_MOE_IQ2_V41": "0",
+    "MYDS_MOE_NSG": "2",
+    "MYDS_MOE_Q2_V41": "1",
+    "MYDS_PLD": "1",
+    "MYDS_PREFILL_CHUNK_SIZE": "2048",
+    "MYDS_PREFIX_CACHE": "1",
+    "MYDS_PRESENCE_PENALTY": "0.0",
+    "MYDS_REPETITION_PENALTY": "1.0",
+    "MYDS_RESIDENCY_KEEP_ALIVE_S": "86400",
+    "MYDS_ROUTE_SIMD_SHUFFLE": "1",
+    "MYDS_SHARED_Q4_V41_NB": "0",
+    "MYDS_SUFFIX_SHRINK_SHIFT": "512",
+    "MYDS_TOPK_THRESHOLD": "1",
+    "MYDS_TOP_K": "0",
+    "MYDS_YOCO_COMPACT": "0",
+    "MYDS_YOCO_KEEP_TOKENS": "512"
+  },
+  "environment_count": 62,
+  "config_values_matched": true,
+  "config_declared_unique_count": 62,
+  "effective_extra_myds_keys": [],
+  "build_manifest_path": "/private/tmp/myds-indexer-r2-20261025/capture-build/build-manifest.json",
+  "build_manifest_sha256": "4fdcc0bf3720b7ea7e0341b66218b5fadc85c0bf47ffe32a05ba268bb76abf94",
+  "capture_binary_sha256": "617f63dd86554cd22ae9267fde1b24489d146a185c8e25dd85328688a344839e",
+  "loaded_metallib_path": "/tmp/myds-indexer-r2-20261025/capture-build/myds.metallib",
+  "loaded_metallib_sha256": "3837102396703da59e0eebbc0de1fdc58b68b3a3a5ec5d07504b351c67a29ba9",
+  "tokens_file_sha256": "60286d7416c862b0bf6e8370c12bf5b1021ebb42b4d1025b5cb4fe958a1e583a",
+  "config_sha256": "0a3524b030a73916f7684d841b912c6e978c680825a3c3520ca18188f35a2cff",
+  "model_path": "/Users/fangqingyuan/hf-1017/DeepSeek-V4.1-Flash-1017-Q2-dense-q4-imx-cliecy.gguf",
+  "model_header_1MiB_sha256": "43948333c8eb0172613384abb5d5e1fe2fd02f40a1ede88afc1cbf22bef1cb68",
+  "whole_model_payload_sha256": false,
+  "replay_gpu_submitted": false,
+  "performance_from_capture": false
+}

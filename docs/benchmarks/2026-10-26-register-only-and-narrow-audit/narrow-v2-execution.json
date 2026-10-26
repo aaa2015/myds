@@ -1,0 +1,23 @@
+{
+  "argv": [
+    "python3",
+    "-B",
+    "/private/tmp/myds-register-only-20261026/narrow-v2/source/tools/audit_v41_narrow_weights.py",
+    "--model",
+    "/Users/fangqingyuan/hf-1017/DeepSeek-V4.1-Flash-1017-Q2-dense-q4-imx-cliecy.gguf",
+    "--output",
+    "/private/tmp/myds-register-only-20261026/narrow-v2/audit.json",
+    "--artifact-dir",
+    "/private/tmp/myds-register-only-20261026/narrow-v2/artifacts",
+    "--cc",
+    "/usr/bin/clang",
+    "--upstream-patches",
+    "/private/tmp/myds-register-only-20261026/narrow-v2/source/docs/benchmarks/2026-10-26-upstream-plan-review/upstream-commits"
+  ],
+  "DEVELOPER_DIR": "/Applications/Xcode.app/Contents/Developer",
+  "start": 1792969309.826472,
+  "end": 1792969316.256835,
+  "returncode": 0,
+  "model_write_authorized": false,
+  "GPU_work": false
+}

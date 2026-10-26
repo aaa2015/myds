@@ -1,0 +1,110 @@
+[
+  {
+    "elapsed_s": 0.023194209,
+    "recognized": [
+      {
+        "pid": 98956,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/matched-build-v2/bench_indexer_matched_replay"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 0.3069905,
+    "recognized": [
+      {
+        "pid": 98956,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/matched-build-v2/bench_indexer_matched_replay"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 0.589580875,
+    "recognized": [
+      {
+        "pid": 98956,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/matched-build-v2/bench_indexer_matched_replay"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 0.872805584,
+    "recognized": [
+      {
+        "pid": 98956,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/matched-build-v2/bench_indexer_matched_replay"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 1.155475584,
+    "recognized": [
+      {
+        "pid": 98956,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/matched-build-v2/bench_indexer_matched_replay"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 1.438064292,
+    "recognized": [
+      {
+        "pid": 98956,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/matched-build-v2/bench_indexer_matched_replay"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 1.7199905,
+    "recognized": [
+      {
+        "pid": 98956,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/matched-build-v2/bench_indexer_matched_replay"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 2.0033391249999997,
+    "recognized": [
+      {
+        "pid": 98956,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/matched-build-v2/bench_indexer_matched_replay"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 2.286449459,
+    "recognized": [
+      {
+        "pid": 98956,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/matched-build-v2/bench_indexer_matched_replay"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 2.5684313339999996,
+    "recognized": [
+      {
+        "pid": 98956,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/matched-build-v2/bench_indexer_matched_replay"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 2.8508074999999997,
+    "recognized": [
+      {
+        "pid": 98956,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/matched-build-v2/bench_indexer_matched_replay"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 3.133990542,
+    "recognized": [
+      {
+        "pid": 98956,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/matched-build-v2/bench_indexer_matched_replay"
+      }
+    ]
+  }
+]

@@ -1,0 +1,249 @@
+{
+  "copy_scope": "small metadata/manifests/patches/selected AIR modules, no payload buffers/binaries/libraries",
+  "files": [
+    {
+      "bytes": 91082,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-qb-rope-M2-independent-review-20261025.json",
+      "path": "qb-rope-M2-independent-review.json",
+      "sha256": "05a58fcc02913037092151a33a91b1425a5996e0d2f6fbec4b9ceb322111757b"
+    },
+    {
+      "bytes": 10898,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/review_qb_rope_M2_20261025.py",
+      "path": "qb-rope-M2-review-reader.py",
+      "sha256": "536ec321680015d5afdc165e31809bb8194b389579d78c8998b1cd9441062f1e"
+    },
+    {
+      "bytes": 523,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-indexer-r3-local-20261025/qb-rope-target-protocol.json",
+      "path": "qb-rope-M2-target-protocol.json",
+      "sha256": "da3bf91020857284849377d036ae9570edc7d5df3c378c2be692d905dfa7e9d2"
+    },
+    {
+      "bytes": 1457,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-indexer-r3-local-20261025/qb-rope-target-screen/execution-plan.json",
+      "path": "qb-rope-M2-execution-plan.json",
+      "sha256": "7c71e5b75e7a02fbb128122f42adf77d5a6917e5bae02a131ebb3095a7c3142e"
+    },
+    {
+      "bytes": 1096,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-indexer-r3-local-20261025/qb-rope-target-screen/window.json",
+      "path": "qb-rope-M2-window.json",
+      "sha256": "b89e09712f5e45c8e624fef5a95ccc01ed485eb0da08fb7cf0d77f151fb8b3d0"
+    },
+    {
+      "bytes": 787,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-indexer-r3-local-20261025/qb-rope-target-screen/monitor.json",
+      "path": "qb-rope-M2-monitor.json",
+      "sha256": "2d680891ef5e7e5f2c59d42921b134abd4ecbe4db55e1317d74bf726744954b4"
+    },
+    {
+      "bytes": 511904,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-indexer-r3-local-20261025/qb-rope-target-screen/outputs/artifact-manifest.json",
+      "path": "qb-rope-M2-artifact-manifest.json",
+      "sha256": "fe993dd40afae5cbcfdbd3a062bfa404bd30c6c11db3b9503e705e047066f15e"
+    },
+    {
+      "bytes": 221736,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-indexer-r3-local-20261025/qb-rope-target-screen/stdout.jsonl",
+      "path": "qb-rope-M2.jsonl",
+      "sha256": "06f8f54281f475fe620222c0701dffaf5da03740158ed1f525493d454c6a02cc"
+    },
+    {
+      "bytes": 80,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-indexer-r3-local-20261025/qb-rope-target-screen/stderr.txt",
+      "path": "qb-rope-M2.stderr.txt",
+      "sha256": "4cdc656f77035cb491f88e09d289ef0031d888810a0db94f1ee4d5ce97e6ef72"
+    },
+    {
+      "bytes": 306073,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-indexer-r3-local-20261025/matched-formal-review.json",
+      "path": "private-runtime-authorizing-matched-formal-review.json",
+      "sha256": "7a50c7122d8d70905b7f77ead07b52e59bea87acf4af199ee109fecb4cc20508"
+    },
+    {
+      "bytes": 18821,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-indexer-k-runtime-plan-20261025.md",
+      "path": "private-runtime-original-plan.md",
+      "sha256": "65f35b2be005cb106fbc5d4c5e07574f62cd134bf088229553426af5ebf75baf"
+    },
+    {
+      "bytes": 84695,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-indexer-k-runtime-20261025/seed-manifest.json",
+      "path": "private-runtime-seed-manifest.json",
+      "sha256": "e7eebd0cdf9329dc33c5d479d5d8979f15e6049ed4af816cc624c1250f564c89"
+    },
+    {
+      "bytes": 99201,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-indexer-k-runtime-20261025/build-manifest.json",
+      "path": "private-runtime-build-manifest.json",
+      "sha256": "e21a9a2dfd27fb9c771bf3d6f9c49f534a9689db0c3fa7e66bdcaf461e7b0896"
+    },
+    {
+      "bytes": 1180,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-indexer-k-runtime-20261025/delivery-manifest.json",
+      "path": "private-runtime-delivery-manifest.json",
+      "sha256": "64090d162f4e973283dc806549f5f1a84e336ebf8220936a93580b8c03aa45d5"
+    },
+    {
+      "bytes": 12350,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-indexer-k-runtime-20261025/runtime-core.patch",
+      "path": "private-runtime-runtime-core.patch",
+      "sha256": "7234dd1668b4a1941c1526200846efbce1422653c01b444a945bcbafe8e7126a"
+    },
+    {
+      "bytes": 27490,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-indexer-k-runtime-20261025/runtime-with-host-fixtures.patch",
+      "path": "private-runtime-runtime-with-host-fixtures.patch",
+      "sha256": "5e3c53c152113c29364a5e64af79eb43998b87193489ce13b194de761ba1df2f"
+    },
+    {
+      "bytes": 266,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-indexer-k-runtime-20261025/patch-byteproof.json",
+      "path": "private-runtime-patch-byteproof.json",
+      "sha256": "f48e161ecc08d36cf0b6719671735c73e9cd16eb7842c3cc62cc5d453563751b"
+    },
+    {
+      "bytes": 2826,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-indexer-k-runtime-20261025/selector-host-fixture-results.json",
+      "path": "private-runtime-selector-host-fixture-results.json",
+      "sha256": "b240ecdbed81dc35e00a7f1b7b79f474193abc9c0d82fe012db0ff847f119cf4"
+    },
+    {
+      "bytes": 132,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-indexer-k-runtime-20261025/publisher-host-fixture.stdout.jsonl",
+      "path": "private-runtime-publisher-host-fixture.stdout.jsonl",
+      "sha256": "e2ec43c7840cd04e6a6689f0c689ed3b7c10042c98fb630e594c2cd6cab3226d"
+    },
+    {
+      "bytes": 322,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-indexer-k-runtime-20261025/normal-preprocessor-review.json",
+      "path": "private-runtime-normal-preprocessor-review.json",
+      "sha256": "34d1fac0c29dbd2e5f481a678ca395e973106efec540122374644545ed0687a5"
+    },
+    {
+      "bytes": 28686,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-indexer-k-runtime-20261025/preflight-results.json",
+      "path": "private-runtime-preflight-results.json",
+      "sha256": "86f5bff0c4bf18ccc0746997c494b0c25dfd1a7804c60ab2a1cbb283e968dbb5"
+    },
+    {
+      "bytes": 111,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-indexer-k-runtime-20261025/fullmodel-driver-cpu.stderr.log",
+      "path": "private-runtime-fullmodel-driver-cpu.stderr.log",
+      "sha256": "040444c7454cf2bdbc797fd54f0a3463d1b579a714a7af75186f6c1f5aac1ca8"
+    },
+    {
+      "bytes": 5635,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-indexer-k-runtime-20261025/cpu-build.stdout.log",
+      "path": "private-runtime-cpu-build.stdout.log",
+      "sha256": "2ca343b156e3528bacfb3d7c3814b8d6b5f25347ca1bf9ee5b51585463e2f79e"
+    },
+    {
+      "bytes": 1687,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-indexer-k-runtime-20261025/cpu-build.stderr.log",
+      "path": "private-runtime-cpu-build.stderr.log",
+      "sha256": "3e270a1371fc8c1cc1586532e267050e755d4b8d17f6c492fbbf68c3e534bdb5"
+    },
+    {
+      "bytes": 2655,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-indexer-k-runtime-20261025/target-build-manifest.json",
+      "path": "private-runtime-target-build-manifest.json",
+      "sha256": "6f1f51486a6ac13af0067852299c8a38c953bfc36901f9ef5f3fb530a4dae055"
+    },
+    {
+      "bytes": 641,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-indexer-k-runtime-20261025/target-source-check.json",
+      "path": "private-runtime-target-source-check.json",
+      "sha256": "e0aec735cfb0bba5aec25c371707ecdd42387811ec829db0be7e62a272d37505"
+    },
+    {
+      "bytes": 6566,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-indexer-k-runtime-20261025/target-build.stdout",
+      "path": "private-runtime-target-build.stdout",
+      "sha256": "13a53d42fe7f0f1706e4f2254674ac23f44375b384ffdb821c7b20804b16298f"
+    },
+    {
+      "bytes": 1687,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-indexer-k-runtime-20261025/target-build.stderr",
+      "path": "private-runtime-target-build.stderr",
+      "sha256": "c494cf16dc25d8665e4e6f9559884287d4d87cebe82f837c8f7ef837d6cf9b5e"
+    },
+    {
+      "bytes": 3395,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-indexer-k-runtime-20261025/IMPLEMENTATION.md",
+      "path": "private-runtime-IMPLEMENTATION.md",
+      "sha256": "393cf5d84a858d7772f125b0733ee1060da7eb1d11e6d791168bff6ed9165224"
+    },
+    {
+      "bytes": 8019,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-qb-rope-ir-review-20261025/probe.kernel_dsv41_rope.ll",
+      "path": "qb-rope-ir-probe.kernel_dsv41_rope.ll",
+      "sha256": "dc64450b4fef09d38df236061a380fea94fdc769b2d35785496218a441603d16"
+    },
+    {
+      "bytes": 22830,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-qb-rope-ir-review-20261025/actual_gold.kernel_myds_q4_v41_qb_nb_bf16.ll",
+      "path": "qb-rope-ir-actual_gold.kernel_myds_q4_v41_qb_nb_bf16.ll",
+      "sha256": "2ae2333543c5f0739682ebb9085f7f68c77992fd8405576e9e2ed6862b127dc2"
+    },
+    {
+      "bytes": 8019,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-qb-rope-ir-review-20261025/actual_gold.kernel_dsv41_rope.ll",
+      "path": "qb-rope-ir-actual_gold.kernel_dsv41_rope.ll",
+      "sha256": "dc64450b4fef09d38df236061a380fea94fdc769b2d35785496218a441603d16"
+    },
+    {
+      "bytes": 27411,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-qb-rope-ir-review-20261025/probe.kernel_myds_probe_qb_rope_nb_bf16.ll",
+      "path": "qb-rope-ir-probe.kernel_myds_probe_qb_rope_nb_bf16.ll",
+      "sha256": "d39d1b9c5632d25665b879f6ac6dc9f3851d53b6668bef8548cfaa99f4a76033"
+    },
+    {
+      "bytes": 22820,
+      "copied_bytes_exact": true,
+      "original_path": "/tmp/myds-qb-rope-ir-review-20261025/probe.kernel_myds_q4_v41_qb_nb_bf16.ll",
+      "path": "qb-rope-ir-probe.kernel_myds_q4_v41_qb_nb_bf16.ll",
+      "sha256": "1f0eab461d8a556095a59f34aa5c1b044e8311c2f0abcee91ff2c626bdf10ae6"
+    }
+  ],
+  "files_copied": 34,
+  "gpu_work_submitted": false,
+  "kind": "decode_source_audit_evidence_copies",
+  "main_report_or_Makefile_or_evidence_index_modified": false,
+  "schema_version": 1,
+  "total_bytes": 1533081
+}

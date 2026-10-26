@@ -46,9 +46,14 @@ def main(argv=None):
                   "requested_tokens": tokens, "port": args.port, "alias": alias}
         try:
             row = request_stream(args.port, alias, prompt, tokens)
+            if phase == "ttft" and (row["prompt_tokens"] <= 0 or row["ttft_s"] <= 0):
+                raise BenchmarkError("no measurable prompt/TTFT", row)
+            if phase == "decode" and row["decode_est_tok_s"] is None:
+                raise BenchmarkError("no measurable visible decode interval", row)
             record.update(row, accepted=True)
             return row
         except BenchmarkError as exc:
+            record.update(exc.metadata)
             record.update(accepted=False, error=str(exc))
             raise
         finally:
@@ -65,8 +70,6 @@ def main(argv=None):
         try:
             row = call(prompt, 1, "ttft", size)
             ptok, ttft = row["prompt_tokens"], row["ttft_s"]
-            if ptok <= 0 or ttft <= 0:
-                raise BenchmarkError("no measurable prompt/TTFT")
         except BenchmarkError as exc:
             failed = True
             print("  %7d rejected: %s" % (size, exc))
@@ -84,8 +87,6 @@ def main(argv=None):
         try:
             row = call(prompt, args.decode_tokens, "decode", run, warmup=run < 0)
             rate = row["decode_est_tok_s"]
-            if rate is None:
-                raise BenchmarkError("no measurable visible decode interval")
         except BenchmarkError as exc:
             failed = True
             print("  %s rejected: %s" % (label, exc))

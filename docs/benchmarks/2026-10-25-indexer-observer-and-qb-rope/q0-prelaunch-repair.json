@@ -1,0 +1,12 @@
+{
+  "old_protocol_sha256": "49f72faa056ac28fb5af87d82bb0c6ffe1aa377e5a318e9c8da52edd340e3648",
+  "new_protocol_sha256": "3b63d9e878aa02cdcfa9496c5e85da2d0ddca3ae1bfd58a420fc02029a022bb6",
+  "changed_protocol_fields": [
+    "window_root",
+    "model_prefix_path"
+  ],
+  "repair": "preserve executable mode755 on same-byte gold binary; previous attempt child_pid null, no model/GPU sample",
+  "same_binary_source_library_request_parameters": true,
+  "old_window_retained": "/private/tmp/myds-indexer-r3-20261025/runtime/Q0-window",
+  "new_window": "/private/tmp/myds-indexer-r3-20261025/runtime/Q0-window-v2"
+}

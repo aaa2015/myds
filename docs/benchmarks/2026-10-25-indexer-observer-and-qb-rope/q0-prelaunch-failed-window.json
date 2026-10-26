@@ -1,0 +1,290 @@
+{
+  "abort_reason": "provider collection stopped: G_lib",
+  "canonical_after": {
+    "/Users/fangqingyuan/Projects/myds/bin/myds": {
+      "bytes": 937240,
+      "canonical_path": "/Users/fangqingyuan/Projects/myds/bin/myds",
+      "device": 16777233,
+      "inode": 8860607,
+      "mtime_ns": 1792933480112041807,
+      "path": "/Users/fangqingyuan/Projects/myds/bin/myds",
+      "sha256": "2b4d56958c1b3c16223f109c7a1e860b6153ad88e5c85fc70dcd44c98012cb83"
+    },
+    "/Users/fangqingyuan/Projects/myds/bin/myds.metallib": {
+      "bytes": 4277140,
+      "canonical_path": "/Users/fangqingyuan/Projects/myds/bin/myds.metallib",
+      "device": 16777233,
+      "inode": 8857144,
+      "mtime_ns": 1792933479969705143,
+      "path": "/Users/fangqingyuan/Projects/myds/bin/myds.metallib",
+      "sha256": "3837102396703da59e0eebbc0de1fdc58b68b3a3a5ec5d07504b351c67a29ba9"
+    },
+    "/Users/fangqingyuan/Projects/myds/build/myds_all.air": {
+      "bytes": 1281840,
+      "canonical_path": "/Users/fangqingyuan/Projects/myds/build/myds_all.air",
+      "device": 16777233,
+      "inode": 8860560,
+      "mtime_ns": 1792933479406369940,
+      "path": "/Users/fangqingyuan/Projects/myds/build/myds_all.air",
+      "sha256": "09d67ef89c8d227ba8142f65efe49cf6e1ccfd661a1820d35719cd308814f617"
+    },
+    "/Users/fangqingyuan/Projects/myds/build/myds_all.metal": {
+      "bytes": 1574167,
+      "canonical_path": "/Users/fangqingyuan/Projects/myds/build/myds_all.metal",
+      "device": 16777233,
+      "inode": 6300213,
+      "mtime_ns": 1792933475801420383,
+      "path": "/Users/fangqingyuan/Projects/myds/build/myds_all.metal",
+      "sha256": "bc6603c97ec24af7597f6b10c7ed2a7bfe1344379733a0a4df780250a13f3224"
+    },
+    "/Users/fangqingyuan/Projects/myfleet/myds.conf": {
+      "bytes": 6815,
+      "canonical_path": "/Users/fangqingyuan/Projects/myfleet/myds.conf",
+      "device": 16777233,
+      "inode": 8850906,
+      "mtime_ns": 1792905648000000000,
+      "path": "/Users/fangqingyuan/Projects/myfleet/myds.conf",
+      "sha256": "0a3524b030a73916f7684d841b912c6e978c680825a3c3520ca18188f35a2cff"
+    }
+  },
+  "canonical_before": {
+    "/Users/fangqingyuan/Projects/myds/bin/myds": {
+      "bytes": 937240,
+      "canonical_path": "/Users/fangqingyuan/Projects/myds/bin/myds",
+      "device": 16777233,
+      "inode": 8860607,
+      "mtime_ns": 1792933480112041807,
+      "path": "/Users/fangqingyuan/Projects/myds/bin/myds",
+      "sha256": "2b4d56958c1b3c16223f109c7a1e860b6153ad88e5c85fc70dcd44c98012cb83"
+    },
+    "/Users/fangqingyuan/Projects/myds/bin/myds.metallib": {
+      "bytes": 4277140,
+      "canonical_path": "/Users/fangqingyuan/Projects/myds/bin/myds.metallib",
+      "device": 16777233,
+      "inode": 8857144,
+      "mtime_ns": 1792933479969705143,
+      "path": "/Users/fangqingyuan/Projects/myds/bin/myds.metallib",
+      "sha256": "3837102396703da59e0eebbc0de1fdc58b68b3a3a5ec5d07504b351c67a29ba9"
+    },
+    "/Users/fangqingyuan/Projects/myds/build/myds_all.air": {
+      "bytes": 1281840,
+      "canonical_path": "/Users/fangqingyuan/Projects/myds/build/myds_all.air",
+      "device": 16777233,
+      "inode": 8860560,
+      "mtime_ns": 1792933479406369940,
+      "path": "/Users/fangqingyuan/Projects/myds/build/myds_all.air",
+      "sha256": "09d67ef89c8d227ba8142f65efe49cf6e1ccfd661a1820d35719cd308814f617"
+    },
+    "/Users/fangqingyuan/Projects/myds/build/myds_all.metal": {
+      "bytes": 1574167,
+      "canonical_path": "/Users/fangqingyuan/Projects/myds/build/myds_all.metal",
+      "device": 16777233,
+      "inode": 6300213,
+      "mtime_ns": 1792933475801420383,
+      "path": "/Users/fangqingyuan/Projects/myds/build/myds_all.metal",
+      "sha256": "bc6603c97ec24af7597f6b10c7ed2a7bfe1344379733a0a4df780250a13f3224"
+    },
+    "/Users/fangqingyuan/Projects/myfleet/myds.conf": {
+      "bytes": 6815,
+      "canonical_path": "/Users/fangqingyuan/Projects/myfleet/myds.conf",
+      "device": 16777233,
+      "inode": 8850906,
+      "mtime_ns": 1792905648000000000,
+      "path": "/Users/fangqingyuan/Projects/myfleet/myds.conf",
+      "sha256": "0a3524b030a73916f7684d841b912c6e978c680825a3c3520ca18188f35a2cff"
+    }
+  },
+  "canonical_unchanged": true,
+  "execution_complete": false,
+  "external_reader_required": true,
+  "finished_epoch": 1792941269.373259,
+  "fullmodel_speedup_proven": false,
+  "lock_held_through_final_checks": true,
+  "model_after": {
+    "bytes": 362142629888,
+    "canonical_path": "/Users/fangqingyuan/hf-1017/DeepSeek-V4.1-Flash-1017-Q2-dense-q4-imx-cliecy.gguf",
+    "device": 16777233,
+    "inode": 8037134,
+    "mtime_ns": 1792321832447159977,
+    "path": "/Users/fangqingyuan/hf-1017/DeepSeek-V4.1-Flash-1017-Q2-dense-q4-imx-cliecy.gguf",
+    "prefix_bytes": 1048576,
+    "prefix_sha256": "43948333c8eb0172613384abb5d5e1fe2fd02f40a1ede88afc1cbf22bef1cb68",
+    "whole_model_payload_sha256_verified": false
+  },
+  "model_before": {
+    "bytes": 362142629888,
+    "canonical_path": "/Users/fangqingyuan/hf-1017/DeepSeek-V4.1-Flash-1017-Q2-dense-q4-imx-cliecy.gguf",
+    "device": 16777233,
+    "inode": 8037134,
+    "mtime_ns": 1792321832447159977,
+    "path": "/Users/fangqingyuan/hf-1017/DeepSeek-V4.1-Flash-1017-Q2-dense-q4-imx-cliecy.gguf",
+    "prefix_bytes": 1048576,
+    "prefix_sha256": "43948333c8eb0172613384abb5d5e1fe2fd02f40a1ede88afc1cbf22bef1cb68",
+    "whole_model_payload_sha256_verified": false
+  },
+  "model_prefix": {
+    "bytes": 1048576,
+    "path": "/private/tmp/myds-indexer-r3-20261025/runtime/Q0-window/model-prefix.bin",
+    "sha256": "43948333c8eb0172613384abb5d5e1fe2fd02f40a1ede88afc1cbf22bef1cb68"
+  },
+  "model_unchanged": true,
+  "performance_acceptance": false,
+  "production_acceptance": false,
+  "protocol_sha256": "49f72faa056ac28fb5af87d82bb0c6ffe1aa377e5a318e9c8da52edd340e3648",
+  "providers": [
+    {
+      "abort_reason": "PermissionError: [Errno 13] Permission denied: '/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel'",
+      "canonical_after": {
+        "/Users/fangqingyuan/Projects/myds/bin/myds": {
+          "bytes": 937240,
+          "canonical_path": "/Users/fangqingyuan/Projects/myds/bin/myds",
+          "device": 16777233,
+          "inode": 8860607,
+          "mtime_ns": 1792933480112041807,
+          "path": "/Users/fangqingyuan/Projects/myds/bin/myds",
+          "sha256": "2b4d56958c1b3c16223f109c7a1e860b6153ad88e5c85fc70dcd44c98012cb83"
+        },
+        "/Users/fangqingyuan/Projects/myds/bin/myds.metallib": {
+          "bytes": 4277140,
+          "canonical_path": "/Users/fangqingyuan/Projects/myds/bin/myds.metallib",
+          "device": 16777233,
+          "inode": 8857144,
+          "mtime_ns": 1792933479969705143,
+          "path": "/Users/fangqingyuan/Projects/myds/bin/myds.metallib",
+          "sha256": "3837102396703da59e0eebbc0de1fdc58b68b3a3a5ec5d07504b351c67a29ba9"
+        },
+        "/Users/fangqingyuan/Projects/myds/build/myds_all.air": {
+          "bytes": 1281840,
+          "canonical_path": "/Users/fangqingyuan/Projects/myds/build/myds_all.air",
+          "device": 16777233,
+          "inode": 8860560,
+          "mtime_ns": 1792933479406369940,
+          "path": "/Users/fangqingyuan/Projects/myds/build/myds_all.air",
+          "sha256": "09d67ef89c8d227ba8142f65efe49cf6e1ccfd661a1820d35719cd308814f617"
+        },
+        "/Users/fangqingyuan/Projects/myds/build/myds_all.metal": {
+          "bytes": 1574167,
+          "canonical_path": "/Users/fangqingyuan/Projects/myds/build/myds_all.metal",
+          "device": 16777233,
+          "inode": 6300213,
+          "mtime_ns": 1792933475801420383,
+          "path": "/Users/fangqingyuan/Projects/myds/build/myds_all.metal",
+          "sha256": "bc6603c97ec24af7597f6b10c7ed2a7bfe1344379733a0a4df780250a13f3224"
+        },
+        "/Users/fangqingyuan/Projects/myfleet/myds.conf": {
+          "bytes": 6815,
+          "canonical_path": "/Users/fangqingyuan/Projects/myfleet/myds.conf",
+          "device": 16777233,
+          "inode": 8850906,
+          "mtime_ns": 1792905648000000000,
+          "path": "/Users/fangqingyuan/Projects/myfleet/myds.conf",
+          "sha256": "0a3524b030a73916f7684d841b912c6e978c680825a3c3520ca18188f35a2cff"
+        }
+      },
+      "canonical_before": {
+        "/Users/fangqingyuan/Projects/myds/bin/myds": {
+          "bytes": 937240,
+          "canonical_path": "/Users/fangqingyuan/Projects/myds/bin/myds",
+          "device": 16777233,
+          "inode": 8860607,
+          "mtime_ns": 1792933480112041807,
+          "path": "/Users/fangqingyuan/Projects/myds/bin/myds",
+          "sha256": "2b4d56958c1b3c16223f109c7a1e860b6153ad88e5c85fc70dcd44c98012cb83"
+        },
+        "/Users/fangqingyuan/Projects/myds/bin/myds.metallib": {
+          "bytes": 4277140,
+          "canonical_path": "/Users/fangqingyuan/Projects/myds/bin/myds.metallib",
+          "device": 16777233,
+          "inode": 8857144,
+          "mtime_ns": 1792933479969705143,
+          "path": "/Users/fangqingyuan/Projects/myds/bin/myds.metallib",
+          "sha256": "3837102396703da59e0eebbc0de1fdc58b68b3a3a5ec5d07504b351c67a29ba9"
+        },
+        "/Users/fangqingyuan/Projects/myds/build/myds_all.air": {
+          "bytes": 1281840,
+          "canonical_path": "/Users/fangqingyuan/Projects/myds/build/myds_all.air",
+          "device": 16777233,
+          "inode": 8860560,
+          "mtime_ns": 1792933479406369940,
+          "path": "/Users/fangqingyuan/Projects/myds/build/myds_all.air",
+          "sha256": "09d67ef89c8d227ba8142f65efe49cf6e1ccfd661a1820d35719cd308814f617"
+        },
+        "/Users/fangqingyuan/Projects/myds/build/myds_all.metal": {
+          "bytes": 1574167,
+          "canonical_path": "/Users/fangqingyuan/Projects/myds/build/myds_all.metal",
+          "device": 16777233,
+          "inode": 6300213,
+          "mtime_ns": 1792933475801420383,
+          "path": "/Users/fangqingyuan/Projects/myds/build/myds_all.metal",
+          "sha256": "bc6603c97ec24af7597f6b10c7ed2a7bfe1344379733a0a4df780250a13f3224"
+        },
+        "/Users/fangqingyuan/Projects/myfleet/myds.conf": {
+          "bytes": 6815,
+          "canonical_path": "/Users/fangqingyuan/Projects/myfleet/myds.conf",
+          "device": 16777233,
+          "inode": 8850906,
+          "mtime_ns": 1792905648000000000,
+          "path": "/Users/fangqingyuan/Projects/myfleet/myds.conf",
+          "sha256": "0a3524b030a73916f7684d841b912c6e978c680825a3c3520ca18188f35a2cff"
+        }
+      },
+      "canonical_unchanged": true,
+      "child_pid": null,
+      "elapsed_s": 0.03464179200000002,
+      "exit_code": null,
+      "expected_loaded_library_path": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/myds.metallib",
+      "external_reader_required": true,
+      "finished_epoch": 1792941269.34806,
+      "mode": 0,
+      "model_after": {
+        "bytes": 362142629888,
+        "canonical_path": "/Users/fangqingyuan/hf-1017/DeepSeek-V4.1-Flash-1017-Q2-dense-q4-imx-cliecy.gguf",
+        "device": 16777233,
+        "inode": 8037134,
+        "mtime_ns": 1792321832447159977,
+        "path": "/Users/fangqingyuan/hf-1017/DeepSeek-V4.1-Flash-1017-Q2-dense-q4-imx-cliecy.gguf",
+        "prefix_bytes": 1048576,
+        "prefix_sha256": "43948333c8eb0172613384abb5d5e1fe2fd02f40a1ede88afc1cbf22bef1cb68",
+        "whole_model_payload_sha256_verified": false
+      },
+      "model_before": {
+        "bytes": 362142629888,
+        "canonical_path": "/Users/fangqingyuan/hf-1017/DeepSeek-V4.1-Flash-1017-Q2-dense-q4-imx-cliecy.gguf",
+        "device": 16777233,
+        "inode": 8037134,
+        "mtime_ns": 1792321832447159977,
+        "path": "/Users/fangqingyuan/hf-1017/DeepSeek-V4.1-Flash-1017-Q2-dense-q4-imx-cliecy.gguf",
+        "prefix_bytes": 1048576,
+        "prefix_sha256": "43948333c8eb0172613384abb5d5e1fe2fd02f40a1ede88afc1cbf22bef1cb68",
+        "whole_model_payload_sha256_verified": false
+      },
+      "model_unchanged": true,
+      "performance_acceptance": false,
+      "protocol_sha256": "49f72faa056ac28fb5af87d82bb0c6ffe1aa377e5a318e9c8da52edd340e3648",
+      "provider": "G_lib",
+      "qualification_passed": null,
+      "raw_inventory_sha256": "7478d0bb97f2d9e5fa41a211e93f9b7205cc61340cfbd70ca4e853c8173f0fda",
+      "raw_tree_sha256": "ef0fed6831697d7eceade578a1b4acb94021ac4fe3863a54335fc15a17c78dc5",
+      "reader_sha256": "c6e9d4d2a2a35eb642e7b9fc062b7974a2a761a853bec147ddccf1b2965a5d70",
+      "recognized_after": [],
+      "recognized_before": [],
+      "schema_version": 1,
+      "stage": "Q0",
+      "started_epoch": 1792941269.313417,
+      "wrapper_sha256": "a09ea1525426c7149e4b7ded74738fca08d0b8d4f468eac04ce161476c0588b8"
+    }
+  ],
+  "qualification_passed": null,
+  "reader_sha256": "c6e9d4d2a2a35eb642e7b9fc062b7974a2a761a853bec147ddccf1b2965a5d70",
+  "recognized_after": [],
+  "recognized_before": [],
+  "run_order": [
+    "G_lib",
+    "off",
+    "on"
+  ],
+  "schema_version": 1,
+  "service_or_production_mutation_performed": false,
+  "stage": "Q0",
+  "wrapper_sha256": "a09ea1525426c7149e4b7ded74738fca08d0b8d4f468eac04ce161476c0588b8"
+}

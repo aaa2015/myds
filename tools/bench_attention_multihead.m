@@ -231,13 +231,17 @@ static id<MTLCommandBuffer> run(id<MTLCommandQueue> queue,fixture *f,unsigned pr
 static void validate(fixture *f,unsigned provider,BOOL save_output) {
     size_t bytes=(size_t)f->rows*QUERY_BYTES,first=SIZE_MAX;
     size_t bad=mismatches(body(f->out[0]),body(f->out[provider]),bytes,&first);
-    BOOL ok=!bad&&finite_f32(body(f->out[provider]),bytes)&&written(body(f->out[provider]),bytes)&&guards(f->out[provider],bytes);
+    BOOL finite=finite_f32(body(f->out[provider]),bytes);
+    BOOL fully_written=written(body(f->out[provider]),bytes);
+    BOOL guards_ok=guards(f->out[provider],bytes);
+    BOOL ok=!bad&&finite&&fully_written&&guards_ok;
     if(save_output){
         dump([NSString stringWithFormat:@"parity-case-%03u-provider-%u-output",f->index,provider],f->out[provider],bytes);
         emit(@{@"kind":@"parity",@"mode":@"concurrent",@"case":@(f->index),@"layer":@(f->layer),@"provider":@(provider),
             @"rows":@(f->rows),@"keys":@640,@"output_bytes":@(bytes),@"mismatches":@(bad),
-            @"first_mismatch":first==SIZE_MAX?(id)[NSNull null]:@(first),@"full_f32_bit_exact":@(ok),
-            @"finite_guards_written":@(ok),@"completed_cb":@YES});
+            @"first_mismatch":first==SIZE_MAX?(id)[NSNull null]:@(first),@"full_f32_bit_exact":@(!bad),
+            @"finite":@(finite),@"fully_written":@(fully_written),@"guards_ok":@(guards_ok),
+            @"finite_guards_written":@(finite&&fully_written&&guards_ok),@"completed_cb":@YES});
     }
     need(ok,"complete attention output bits/finite/written/guards");
 }

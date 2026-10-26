@@ -1,0 +1,102 @@
+{
+  "GPU_work_submitted": false,
+  "binary": {
+    "bytes": 955216,
+    "path": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+    "sha256": "a4288dd88714bc32fcc2f54897fb636e5ed6660caca229c7cf391ba709dfaf05"
+  },
+  "binary_minos": {
+    "bytes": 238,
+    "path": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-binary-minos.txt",
+    "sha256": "1ecb8b843dafce3420763086a19995336aa9ff499045c7581b6867e383ccef64"
+  },
+  "build_logs": {
+    "stderr": {
+      "bytes": 1687,
+      "path": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-build.stderr",
+      "sha256": "c494cf16dc25d8665e4e6f9559884287d4d87cebe82f837c8f7ef837d6cf9b5e"
+    },
+    "stdout": {
+      "bytes": 11456,
+      "path": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-build.stdout",
+      "sha256": "6f318257e014a78f4626e6ca1cdd979acb90d958c2201b64d815f1f203b24dbc"
+    }
+  },
+  "clang": "Apple clang version 21.0.0 (clang-2100.3.34.2)\nTarget: arm64-apple-darwin27.0.0\nThread model: posix\nInstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin",
+  "clang_path": "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang",
+  "command_cwd": "/private/tmp/myds-decode-kv-only-runtime-20261025/source",
+  "commands": [
+    [
+      "make",
+      "-f",
+      "tools/decode_kv_only_fullmodel.mk",
+      "-j4",
+      "BUILD_DIR=/private/tmp/myds-decode-kv-only-runtime-20261025/target-objects",
+      "BIN_DIR=/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin",
+      "DECODE_KV_ADAPTER_HEADER=tools/decode_kv_only_runtime_adapter.inc",
+      "DEPLOY_TARGET=26.0",
+      "CC=/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang",
+      "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel"
+    ]
+  ],
+  "compile_environment": {
+    "CFLAGS": "-O3 -Wall -Wextra -std=c11 -Iinclude -Ithird_party -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk",
+    "DEVELOPER_DIR": "/Applications/Xcode.app/Contents/Developer",
+    "LDFLAGS": "-framework Foundation -framework Metal -lm -lpthread -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk",
+    "OBJCFLAGS": "-O3 -Wall -Wextra -Iinclude -fobjc-arc -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "SDKROOT": "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk"
+  },
+  "compile_only_pass": true,
+  "cpu_brand": "Apple M2 Ultra",
+  "gold_binary": {
+    "bytes": 955216,
+    "path": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-gold/bench_decode_kv_only_fullmodel",
+    "sha256": "a4288dd88714bc32fcc2f54897fb636e5ed6660caca229c7cf391ba709dfaf05"
+  },
+  "gpu_work_submitted": false,
+  "helper": {
+    "bytes": 13553,
+    "path": "/private/tmp/myds-decode-kv-only-target-prep-20261026/prepare_m2_target.py",
+    "sha256": "b27f7649db1891fe658f45635ac48113e987890ca00e6742214d4d44b6330c42"
+  },
+  "kind": "M2_private_decode_kv_only_runtime_target_build",
+  "libraries": {
+    "G_lib": {
+      "bytes": 4277140,
+      "path": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-gold/myds.metallib",
+      "sha256": "3837102396703da59e0eebbc0de1fdc58b68b3a3a5ec5d07504b351c67a29ba9"
+    },
+    "private": {
+      "bytes": 4282682,
+      "path": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/myds.metallib",
+      "sha256": "d12ddb1ec806f1daa3848e9687e468aba3ea80d1e91aa3d4081c16eb4852facd"
+    }
+  },
+  "preflight": {
+    "bytes": 30444,
+    "path": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-preflight.json",
+    "sha256": "91db7ddf75daace712bdb2b20381c96c6bebcb047ed70f8c078f64bb6c150ab3"
+  },
+  "production_deployed": false,
+  "runtime_core_patch": {
+    "bytes": 8613,
+    "path": "/private/tmp/myds-decode-kv-only-runtime-20261025/runtime-core.patch",
+    "sha256": "a90f298262864ef61c7c3e7e68c271bd5ceb3cf741eeae1962ce402bb22f4a02"
+  },
+  "schema_version": 1,
+  "sdk_path": "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk",
+  "sdk_version": "27.0",
+  "source_build_manifest": {
+    "bytes": 91405,
+    "path": "/private/tmp/myds-decode-kv-only-runtime-20261025/build-manifest.json",
+    "sha256": "6b4e04fa67914aec0bd8636b298a0aa832349e2de4dd496c6a7de0623e55a82d"
+  },
+  "source_check": {
+    "bytes": 86792,
+    "path": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-source-check.json",
+    "sha256": "391efae9e76a78c1bc439f00778071a7ef8b2a0118c0c8d818ecb33e0ec57762"
+  },
+  "source_inventory_sha256": "3c41008d2b886e61ee2641254f3504e7bc555cfdc0dda0fcb9d4f48910fbe3db",
+  "subject": "decode_kv_only_finish"
+}

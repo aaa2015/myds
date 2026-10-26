@@ -1,0 +1,144 @@
+{
+  "kind": "existing_real_capture_revalidated_for_new_correctness_only_replay",
+  "capture_verified_json": {
+    "path": "/tmp/myds-indexer-r2-real-local-20261025/capture-verified.json",
+    "bytes": 24248,
+    "sha256": "e7200c786445bf0946ef5fb7bdbe59b95bfd3de4118ec611583f9553752f5b6d"
+  },
+  "capture_root": "/tmp/myds-indexer-r2-real-local-20261025/capture-window/raw",
+  "files": [
+    {
+      "path": "/tmp/myds-indexer-r2-real-local-20261025/capture-window/raw/capture-meta.json",
+      "bytes": 555,
+      "sha256": "c022d1ea7d74d7ba51dc991baca9443e185d4febb5148030ea8c4af72dd7d944"
+    },
+    {
+      "path": "/tmp/myds-indexer-r2-real-local-20261025/capture-window/raw/capture-records.jsonl",
+      "bytes": 1654,
+      "sha256": "7d8f144b18412b373bacae15aa6d70b9c727ff9bc36b8e2d2ae052580ad50841"
+    },
+    {
+      "path": "/tmp/myds-indexer-r2-real-local-20261025/capture-window/raw/effective-myds.env",
+      "bytes": 1874,
+      "sha256": "51f5a6052084ef776212a16aa9b0d7df23c95d7c6e52dc2d93b6a6814eb5ed2c"
+    },
+    {
+      "path": "/tmp/myds-indexer-r2-real-local-20261025/capture-window/raw/input-token-ids.i32",
+      "bytes": 131072,
+      "sha256": "eb6687ff37d57bd5b5d990687e2541403d6ef199463cea2a9c4ba5ad1d8dce83"
+    },
+    {
+      "path": "/tmp/myds-indexer-r2-real-local-20261025/capture-window/raw/layer-14-args72.bin",
+      "bytes": 72,
+      "sha256": "f2ff6777125b5edc6d0f92c93c10c7e7f5cb40cb492f572f4600527deb7aae49"
+    },
+    {
+      "path": "/tmp/myds-indexer-r2-real-local-20261025/capture-window/raw/layer-14-cache.bin",
+      "bytes": 3948544,
+      "sha256": "4eb940d7ef03ed272a671e3bfba02f609ccc2af2947a0d312c64f2e55c1dc3c3"
+    },
+    {
+      "path": "/tmp/myds-indexer-r2-real-local-20261025/capture-window/raw/layer-14-native-args.bin",
+      "bytes": 36,
+      "sha256": "360a6804f466a45d1d237cfb368938b2c52d17ec911673e47a8bf886a8c081a2"
+    },
+    {
+      "path": "/tmp/myds-indexer-r2-real-local-20261025/capture-window/raw/layer-14-q-f32.bin",
+      "bytes": 2097152,
+      "sha256": "1408c6c570764b9a51108bb2e010fcadb1a74812073564511d24c913d8d8f979"
+    },
+    {
+      "path": "/tmp/myds-indexer-r2-real-local-20261025/capture-window/raw/layer-14-scores-f32.bin",
+      "bytes": 7897088,
+      "sha256": "b5540b742f6dd65136e6ad69021e7345d48cacae5befb753faf531b1bf16e573"
+    },
+    {
+      "path": "/tmp/myds-indexer-r2-real-local-20261025/capture-window/raw/layer-14-selected-i32.bin",
+      "bytes": 262144,
+      "sha256": "96c830d01c895382335d98364d2cf3bc69cf0ccc8db7c9e108684ccb31ae0d03"
+    },
+    {
+      "path": "/tmp/myds-indexer-r2-real-local-20261025/capture-window/raw/layer-14-weights-f32.bin",
+      "bytes": 16384,
+      "sha256": "168cdcfd6e2730d26cd18527727791218c505cb41adc47f97b146e77bcb4e9c7"
+    },
+    {
+      "path": "/tmp/myds-indexer-r2-real-local-20261025/capture-window/raw/layer-2-args72.bin",
+      "bytes": 72,
+      "sha256": "f2ff6777125b5edc6d0f92c93c10c7e7f5cb40cb492f572f4600527deb7aae49"
+    },
+    {
+      "path": "/tmp/myds-indexer-r2-real-local-20261025/capture-window/raw/layer-2-cache.bin",
+      "bytes": 3948544,
+      "sha256": "d56f3814100b008580c4c6d06b30508b407eecf320aa6bc6d9960af640388b33"
+    },
+    {
+      "path": "/tmp/myds-indexer-r2-real-local-20261025/capture-window/raw/layer-2-native-args.bin",
+      "bytes": 36,
+      "sha256": "360a6804f466a45d1d237cfb368938b2c52d17ec911673e47a8bf886a8c081a2"
+    },
+    {
+      "path": "/tmp/myds-indexer-r2-real-local-20261025/capture-window/raw/layer-2-q-f32.bin",
+      "bytes": 2097152,
+      "sha256": "23804cabb6758c603f20d834af6931fb009d6e433d790d774217b4d247aa95ed"
+    },
+    {
+      "path": "/tmp/myds-indexer-r2-real-local-20261025/capture-window/raw/layer-2-scores-f32.bin",
+      "bytes": 7897088,
+      "sha256": "b1751be80a89a2bbd698236a3a0c5ac1caee8c1e98fab2d097928f9e053843ff"
+    },
+    {
+      "path": "/tmp/myds-indexer-r2-real-local-20261025/capture-window/raw/layer-2-selected-i32.bin",
+      "bytes": 262144,
+      "sha256": "cf2b46056e3874b1424d68d6a1d10b562ab2b7a9782f2773276e1b809da5315d"
+    },
+    {
+      "path": "/tmp/myds-indexer-r2-real-local-20261025/capture-window/raw/layer-2-weights-f32.bin",
+      "bytes": 16384,
+      "sha256": "d69a080f4fc6110fa4cc2e3b8db5039be030c4e9352b516ae38ed05cff5d0a5f"
+    },
+    {
+      "path": "/tmp/myds-indexer-r2-real-local-20261025/capture-window/raw/layer-8-args72.bin",
+      "bytes": 72,
+      "sha256": "f2ff6777125b5edc6d0f92c93c10c7e7f5cb40cb492f572f4600527deb7aae49"
+    },
+    {
+      "path": "/tmp/myds-indexer-r2-real-local-20261025/capture-window/raw/layer-8-cache.bin",
+      "bytes": 3948544,
+      "sha256": "8314eb58b2ed3a0770ba96cfcca2412b108dffe116df801ae22a735257299bb5"
+    },
+    {
+      "path": "/tmp/myds-indexer-r2-real-local-20261025/capture-window/raw/layer-8-native-args.bin",
+      "bytes": 36,
+      "sha256": "360a6804f466a45d1d237cfb368938b2c52d17ec911673e47a8bf886a8c081a2"
+    },
+    {
+      "path": "/tmp/myds-indexer-r2-real-local-20261025/capture-window/raw/layer-8-q-f32.bin",
+      "bytes": 2097152,
+      "sha256": "82b080026b0735f7812acf3a5aff804bbeda3f05aba9c4d697c038ffebfcf12d"
+    },
+    {
+      "path": "/tmp/myds-indexer-r2-real-local-20261025/capture-window/raw/layer-8-scores-f32.bin",
+      "bytes": 7897088,
+      "sha256": "d33df3b3e923319b5d9a55b717fa7eea55e2dba840ea683b28f00220d321a3dc"
+    },
+    {
+      "path": "/tmp/myds-indexer-r2-real-local-20261025/capture-window/raw/layer-8-selected-i32.bin",
+      "bytes": 262144,
+      "sha256": "f20068fb1305cdafcb5685aa5e7a68be3433ee3fc62b157d331e071ac736707d"
+    },
+    {
+      "path": "/tmp/myds-indexer-r2-real-local-20261025/capture-window/raw/layer-8-weights-f32.bin",
+      "bytes": 16384,
+      "sha256": "66a6d6bc11bff93a2de9f1ff4eab75f628a7f708a27e686b6cfdf6ddfc8339b0"
+    },
+    {
+      "path": "/tmp/myds-indexer-r2-real-local-20261025/capture-window/raw/selected-records.jsonl",
+      "bytes": 4057,
+      "sha256": "b09971abdbb47f5fea2397897bd18d1c593c2ab98d0bcfaecb4d48c23762d9f2"
+    }
+  ],
+  "performance_evidence": false,
+  "origin": "prior real-model observed prefill at32768tokens; not live production traffic; observer_commit_wait=true",
+  "logical_bytes": 42803472
+}

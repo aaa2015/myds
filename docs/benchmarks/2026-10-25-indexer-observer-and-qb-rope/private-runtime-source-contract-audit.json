@@ -1,0 +1,60 @@
+{
+  "GPU_or_remote_or_service_action_by_this_audit": false,
+  "Q0_independent_acceptance_not_inferred_from_six_completed_generations": true,
+  "audit_cpu_only": true,
+  "component_gate_authorized_implementation": true,
+  "copy_manifest": "decode-source-audit-evidence-copies.json",
+  "fullmodel_or_HTTP_acceptance_determined_by_this_audit": false,
+  "kind": "private_runtime_source_and_qb_rope_acceptance_audit",
+  "narrow_scope": {
+    "active_batch_no_exclusive_kprof": true,
+    "dim": 128,
+    "end_max": 32768,
+    "full_native_spans_no_writer_reader_alias": true,
+    "heads": 32,
+    "key_window": 0,
+    "keys_exclusive_min": 512,
+    "keys_inclusive_max": 16384,
+    "n_comp_equals_end_div2": true,
+    "ordinary_no_trace": true,
+    "ratio": 2,
+    "scratch_budget_unchanged": true,
+    "sgbar": 0,
+    "tokens_max": 2048,
+    "tokens_min": 8
+  },
+  "production_adoption": false,
+  "qb_rope_M4_and_M2_numerical_gate_passed": false,
+  "qb_rope_no_source_change_or_FMA_retest": true,
+  "qb_rope_timing_started": false,
+  "reference_function_byte_proofs": {
+    "int myds_v41_gpu_indexscores_chunk(": {
+      "byte_exact": true,
+      "bytes": 379,
+      "sha256": "eefcdc3d89efbad30ce33bf2d84e9e394841e829d8672e6f005aef0eaf0abdb3"
+    },
+    "int myds_v41_gpu_indexscores_chunk_bf16(": {
+      "byte_exact": true,
+      "bytes": 383,
+      "sha256": "636bd7ab1377fe643ee9dc7e9ddb20e3f30f8a0d703d30afefbb7a18f824cc78"
+    },
+    "static int indexscores_chunk(": {
+      "byte_exact": true,
+      "bytes": 4726,
+      "sha256": "e4e2ef7aec4650ced52cdc93a46f70a076ba139c5c0193433db2cfa6dce09969"
+    }
+  },
+  "runtime_build_manifest_sha256": "e21a9a2dfd27fb9c771bf3d6f9c49f534a9689db0c3fa7e66bdcaf461e7b0896",
+  "runtime_source_inventory_sha256": "7791166d7a9a6ef29eaa2336c665919ee041ec1eae47e32027d6a656b44adec7",
+  "runtime_source_inventory_verified": 548,
+  "schema_version": 1,
+  "source_contract_checks_passed": true,
+  "target_mirror_files_sha_verified": {
+    "target-bin/bench_indexer_fullmodel": "e8cc04b81300bec6a8b8c671f1477723dfbaf67581edfbb7338094f2d48d8afa",
+    "target-bin/myds.metallib": "9df7ed2a5212d54d4475480bf6388d2f66ce24c93bb3a8b003f2b789806d6982",
+    "target-gold/bench_indexer_fullmodel": "e8cc04b81300bec6a8b8c671f1477723dfbaf67581edfbb7338094f2d48d8afa",
+    "target-gold/myds.metallib": "3837102396703da59e0eebbc0de1fdc58b68b3a3a5ec5d07504b351c67a29ba9"
+  },
+  "timestamp_local": "2026-10-25T23:23:08.901066+08:00",
+  "unique_publisher_call_only_edit": true
+}

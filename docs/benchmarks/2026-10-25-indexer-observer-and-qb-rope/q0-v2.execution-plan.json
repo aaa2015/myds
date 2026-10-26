@@ -1,0 +1,15 @@
+{
+  "performance_acceptance": false,
+  "protocol_sha256": "3b63d9e878aa02cdcfa9496c5e85da2d0ddca3ae1bfd58a420fc02029a022bb6",
+  "reader_sha256": "c6e9d4d2a2a35eb642e7b9fc062b7974a2a761a853bec147ddccf1b2965a5d70",
+  "run_order": [
+    "G_lib",
+    "off",
+    "on"
+  ],
+  "shared_lock_path": "/tmp/myds-codex-decode-window.lock",
+  "stage": "Q0",
+  "started_epoch": 1792941370.950655,
+  "timeout_s": 600,
+  "wrapper_sha256": "a09ea1525426c7149e4b7ded74738fca08d0b8d4f468eac04ce161476c0588b8"
+}

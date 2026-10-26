@@ -414,7 +414,8 @@ int myds_v41_gpu_pack_bf16(myds_metal_buffer_t *dst, size_t dst_elem_offset,
 int myds_v41_gpu_indexscores_head_slots(myds_metal_buffer_t *scores,
     const myds_metal_buffer_t *q, const myds_metal_buffer_t *weights,
     const myds_metal_buffer_t *cache, const myds_metal_buffer_t *mask,
-    uint32_t n_comp, uint32_t n_heads, bool cache_bf16) {
+    uint32_t n_comp, uint32_t n_heads, bool cache_bf16, uint32_t first_row) {
+    (void)first_row;
     (void)scores; (void)q; (void)weights; (void)cache; (void)mask; (void)n_comp; (void)n_heads; (void)cache_bf16;
     return record("indexscores_head_slots");
 }
@@ -422,7 +423,8 @@ int myds_v41_gpu_indexscores_head_slots(myds_metal_buffer_t *scores,
 int myds_v41_gpu_indexscores_masked_bf16(myds_metal_buffer_t *scores,
     const myds_metal_buffer_t *q, const myds_metal_buffer_t *weights,
     const myds_metal_buffer_t *cache, const myds_metal_buffer_t *mask,
-    uint32_t n_comp, uint32_t n_heads) {
+    uint32_t n_comp, uint32_t n_heads, uint32_t first_row) {
+    (void)first_row;
     (void)scores; (void)q; (void)weights; (void)cache; (void)mask; (void)n_comp; (void)n_heads;
     return record("indexscores_masked_bf16");
 }
@@ -828,3 +830,8 @@ int main(void) {
     puts("PASS: attention HC overlap + indexer decode overlap + KV reuse + FFN HC overlap host schedule, cohorts, strict env, exclusions, aliasing guards, counters, and failure recovery");
     return 0;
 }
+
+/* Compatibility stubs for the current scorer window API and kprof guard.
+ * These CPU fixtures do not execute shaders or validate window arithmetic. */
+int myds_metal_kprof_exclusive(void) { return 0; }
+uint32_t myds_v41_gpu_indexer_window_first_row(uint32_t pos,uint32_t ratio) { (void)pos;(void)ratio;return 0; }

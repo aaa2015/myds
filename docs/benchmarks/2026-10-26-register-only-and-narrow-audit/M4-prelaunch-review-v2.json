@@ -1,0 +1,266 @@
+{
+  "adoption_eligible": false,
+  "build_proof": {
+    "combined_source_sha256": "b46254ccf5a3a51098f457a223c561b733020b1c9cd2613ee75a27604f5568bd",
+    "host_fixture": {
+      "case_count": 12,
+      "gpu_completion_count": 0,
+      "host_fixture_manifest_sha256": "792992943beb569e8cc8ba0815efa0353f800f7afd8a0bfdc991ef26f34c84e3",
+      "input_features": [
+        [
+          {
+            "negative_zero_count": 0,
+            "non_bf16_representable_f32_count": 0,
+            "positive_zero_count": 3,
+            "subnormal_count": 0
+          },
+          {
+            "negative_zero_count": 0,
+            "non_bf16_representable_f32_count": 0,
+            "positive_zero_count": 0,
+            "subnormal_count": 0
+          },
+          {
+            "negative_zero_count": 0,
+            "non_bf16_representable_f32_count": 0,
+            "positive_zero_count": 14,
+            "subnormal_count": 0
+          }
+        ],
+        [
+          {
+            "negative_zero_count": 96,
+            "non_bf16_representable_f32_count": 29727,
+            "positive_zero_count": 99,
+            "subnormal_count": 0
+          },
+          {
+            "negative_zero_count": 1,
+            "non_bf16_representable_f32_count": 238,
+            "positive_zero_count": 1,
+            "subnormal_count": 0
+          },
+          {
+            "negative_zero_count": 0,
+            "non_bf16_representable_f32_count": 0,
+            "positive_zero_count": 6,
+            "subnormal_count": 0
+          }
+        ],
+        [
+          {
+            "negative_zero_count": 49,
+            "non_bf16_representable_f32_count": 49875,
+            "positive_zero_count": 57,
+            "subnormal_count": 194
+          },
+          {
+            "negative_zero_count": 1,
+            "non_bf16_representable_f32_count": 389,
+            "positive_zero_count": 1,
+            "subnormal_count": 2
+          },
+          {
+            "negative_zero_count": 104,
+            "non_bf16_representable_f32_count": 0,
+            "positive_zero_count": 121,
+            "subnormal_count": 414
+          }
+        ],
+        [
+          {
+            "negative_zero_count": 0,
+            "non_bf16_representable_f32_count": 0,
+            "positive_zero_count": 17,
+            "subnormal_count": 0
+          },
+          {
+            "negative_zero_count": 0,
+            "non_bf16_representable_f32_count": 0,
+            "positive_zero_count": 0,
+            "subnormal_count": 0
+          },
+          {
+            "negative_zero_count": 0,
+            "non_bf16_representable_f32_count": 0,
+            "positive_zero_count": 8,
+            "subnormal_count": 0
+          }
+        ],
+        [
+          {
+            "negative_zero_count": 350,
+            "non_bf16_representable_f32_count": 109098,
+            "positive_zero_count": 364,
+            "subnormal_count": 0
+          },
+          {
+            "negative_zero_count": 3,
+            "non_bf16_representable_f32_count": 865,
+            "positive_zero_count": 3,
+            "subnormal_count": 0
+          },
+          {
+            "negative_zero_count": 0,
+            "non_bf16_representable_f32_count": 0,
+            "positive_zero_count": 13,
+            "subnormal_count": 0
+          }
+        ],
+        [
+          {
+            "negative_zero_count": 26,
+            "non_bf16_representable_f32_count": 26464,
+            "positive_zero_count": 35,
+            "subnormal_count": 104
+          },
+          {
+            "negative_zero_count": 1,
+            "non_bf16_representable_f32_count": 205,
+            "positive_zero_count": 1,
+            "subnormal_count": 1
+          },
+          {
+            "negative_zero_count": 1652,
+            "non_bf16_representable_f32_count": 0,
+            "positive_zero_count": 1920,
+            "subnormal_count": 6604
+          }
+        ],
+        [
+          {
+            "negative_zero_count": 0,
+            "non_bf16_representable_f32_count": 0,
+            "positive_zero_count": 5,
+            "subnormal_count": 0
+          },
+          {
+            "negative_zero_count": 0,
+            "non_bf16_representable_f32_count": 0,
+            "positive_zero_count": 0,
+            "subnormal_count": 0
+          },
+          {
+            "negative_zero_count": 0,
+            "non_bf16_representable_f32_count": 0,
+            "positive_zero_count": 269,
+            "subnormal_count": 0
+          }
+        ],
+        [
+          {
+            "negative_zero_count": 159,
+            "non_bf16_representable_f32_count": 49611,
+            "positive_zero_count": 166,
+            "subnormal_count": 0
+          },
+          {
+            "negative_zero_count": 1,
+            "non_bf16_representable_f32_count": 374,
+            "positive_zero_count": 2,
+            "subnormal_count": 0
+          },
+          {
+            "negative_zero_count": 0,
+            "non_bf16_representable_f32_count": 0,
+            "positive_zero_count": 8,
+            "subnormal_count": 0
+          }
+        ],
+        [
+          {
+            "negative_zero_count": 413,
+            "non_bf16_representable_f32_count": 425553,
+            "positive_zero_count": 475,
+            "subnormal_count": 1652
+          },
+          {
+            "negative_zero_count": 4,
+            "non_bf16_representable_f32_count": 3338,
+            "positive_zero_count": 4,
+            "subnormal_count": 13
+          },
+          {
+            "negative_zero_count": 1555,
+            "non_bf16_representable_f32_count": 0,
+            "positive_zero_count": 1803,
+            "subnormal_count": 6220
+          }
+        ],
+        [
+          {
+            "negative_zero_count": 0,
+            "non_bf16_representable_f32_count": 0,
+            "positive_zero_count": 1013,
+            "subnormal_count": 0
+          },
+          {
+            "negative_zero_count": 0,
+            "non_bf16_representable_f32_count": 0,
+            "positive_zero_count": 6,
+            "subnormal_count": 0
+          },
+          {
+            "negative_zero_count": 0,
+            "non_bf16_representable_f32_count": 0,
+            "positive_zero_count": 6,
+            "subnormal_count": 0
+          }
+        ],
+        [
+          {
+            "negative_zero_count": 85,
+            "non_bf16_representable_f32_count": 26444,
+            "positive_zero_count": 92,
+            "subnormal_count": 0
+          },
+          {
+            "negative_zero_count": 1,
+            "non_bf16_representable_f32_count": 211,
+            "positive_zero_count": 1,
+            "subnormal_count": 0
+          },
+          {
+            "negative_zero_count": 0,
+            "non_bf16_representable_f32_count": 0,
+            "positive_zero_count": 16,
+            "subnormal_count": 0
+          }
+        ],
+        [
+          {
+            "negative_zero_count": 29,
+            "non_bf16_representable_f32_count": 29972,
+            "positive_zero_count": 38,
+            "subnormal_count": 116
+          },
+          {
+            "negative_zero_count": 1,
+            "non_bf16_representable_f32_count": 236,
+            "positive_zero_count": 1,
+            "subnormal_count": 1
+          },
+          {
+            "negative_zero_count": 55,
+            "non_bf16_representable_f32_count": 0,
+            "positive_zero_count": 65,
+            "subnormal_count": 220
+          }
+        ]
+      ],
+      "raw_file_count": 242
+    },
+    "native_source_sha256": "bc6603c97ec24af7597f6b10c7ed2a7bfe1344379733a0a4df780250a13f3224",
+    "production_shader_count": 29,
+    "source_file_count": 33,
+    "source_identity_sha256": "2e066adbe75558f235178bd2caed0d66127587494dee813949007a865cfeec88"
+  },
+  "classification": "cpu_prelaunch_identity_passed",
+  "evidence_valid": true,
+  "gpu_work_submitted": false,
+  "numerical_passed": false,
+  "performance_evaluated": false,
+  "protocol_sha256": "02a026d8fca523a693848b3b1d57eafaa37f1f756659a5c90fd923b16272fdfd",
+  "reader_sha256": "d4d41f62d66f4789ee97bf6755cc336e7860c638a3035c9854f529e474f7ae21",
+  "schema_version": 1
+}

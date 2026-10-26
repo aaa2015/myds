@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "kind": "independent_kv_only_finish_reader_cpu_freeze",
+  "GPU_work_submitted": false,
+  "native_harness_launched": false,
+  "existing_frozen_inputs_modified": false,
+  "CPU_tests": {
+    "count": 13,
+    "passed": true,
+    "exit_code": 0,
+    "includes_full_3535_file_CPU_fixture": true,
+    "CPU_fixture_is_GPU_evidence": false
+  },
+  "host_preparation_valid": true,
+  "GPU_correctness_evaluated": false,
+  "correctness_passed": false,
+  "performance_acceptance": false,
+  "production_adoption": false,
+  "artifacts": {
+    "review_kv_only_finish.py": {
+      "path": "/tmp/myds-kv-only-finish-reader-20261025/review_kv_only_finish.py",
+      "bytes": 26665,
+      "sha256": "db555ce6e7450e11c119785a9738f8e33338ca72918d7aeba8e57221a9e5c816"
+    },
+    "test_review_kv_only_finish.py": {
+      "path": "/tmp/myds-kv-only-finish-reader-20261025/test_review_kv_only_finish.py",
+      "bytes": 16679,
+      "sha256": "5c07bd87657a15bc871ef7e953113956e40844a907e8b46d1fae9d32cba0ae40"
+    },
+    "README.md": {
+      "path": "/tmp/myds-kv-only-finish-reader-20261025/README.md",
+      "bytes": 3843,
+      "sha256": "87edfd0099f94bca0352a0ff11e4e27f62a2b1e138f1e704db95d7ecfee7b942"
+    },
+    "host-preparation-review-final.json": {
+      "path": "/tmp/myds-kv-only-finish-reader-20261025/host-preparation-review-final.json",
+      "bytes": 1110,
+      "sha256": "aeb46ff4eaa4cf12c68547c44232d28b9e8330a08f5695d1e4529c2ce6bf576f"
+    },
+    "cpu-tests-final.stdout.txt": {
+      "path": "/tmp/myds-kv-only-finish-reader-20261025/cpu-tests-final.stdout.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "cpu-tests-final.stderr.txt": {
+      "path": "/tmp/myds-kv-only-finish-reader-20261025/cpu-tests-final.stderr.txt",
+      "bytes": 2242,
+      "sha256": "7ce752749128650d77a4d9f96b8f3ea0a817dc542326720c77ab050c06329503"
+    }
+  },
+  "input_protocol": {
+    "path": "/tmp/myds-kv-only-finish-probe-20261025/component-correctness-protocol-v1.json",
+    "bytes": 3524,
+    "sha256": "76a066e601e9788b24550d0014d21acdc3e4a285d6672c9696a0e19cfb046b00"
+  },
+  "input_build_manifest": {
+    "path": "/tmp/myds-kv-only-finish-probe-final-v1-20261025/source-identity.json",
+    "bytes": 14053,
+    "sha256": "5d8d279bd6d6287402d71dabec84c89c5fb1b6740547ab7ced87fe24e690b2c4"
+  }
+}

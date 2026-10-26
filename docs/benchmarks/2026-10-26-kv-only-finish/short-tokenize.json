@@ -1,0 +1,1 @@
+{"prompt_renderer":"parse_chat_prompt","tokenizer":"target_gguf_metadata","add_bos":true,"prompt_tokens":11,"prompt_bytes":107,"request_bytes":331,"bos_id":0,"eos_id":1,"token_encoding":"little_endian_int32","gguf_metadata_prefix_bytes":5832704,"model_loader_called":false,"metal_initialized":false}

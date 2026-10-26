@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "kind": "real_indexer_component_protocol",
+  "model": "/Users/fangqingyuan/hf-1017/DeepSeek-V4.1-Flash-1017-Q2-dense-q4-imx-cliecy.gguf",
+  "tokenizer": "actual target GGUF and native parse_chat_prompt",
+  "rendered_tokens_available": 38404,
+  "tokens_used": 32768,
+  "scope": "first32768 actual rendered token IDs; observer is correctness-only",
+  "layers": [
+    2,
+    8,
+    14
+  ],
+  "global_chunk_start": 30720,
+  "batch_floats": 2097152,
+  "require_actual_shape": true,
+  "expected_context_capacity": 327680,
+  "config": "frozen deployed/myds.conf byte exact; no selector overrides",
+  "capture_provider": "actual config default; do not force TILED",
+  "replay_providers": [
+    "deployed_actual_exact",
+    "deployed_tiled",
+    "full_TU_tiled",
+    "full_TU_k_resident"
+  ],
+  "correctness": {
+    "tiled_candidate": "all F32 score bits, canonical -Infinity, complete inputs and guards",
+    "actual_exact": "separate score differences plus actual ordered TopK IDs; no silent parity relabel"
+  },
+  "performance": {
+    "mode": "concurrent",
+    "exclusive_recognized_process_check": true,
+    "warmup_groups": 1,
+    "formal_aba_groups": 9,
+    "controls": [
+      "deployed_tiled",
+      "full_TU_tiled"
+    ],
+    "max_abs_control_drift_percent": 2.0,
+    "min_conservative_time_saved_percent_strict": 2.0,
+    "every_layer_every_control_required": true,
+    "one_formal_cohort": true
+  },
+  "fullmodel_gate": "Only after real component correctness and all six performance groups pass; >=1 warmup and3 samples native/HTTP with exact output/logit/state comparisons; >2% fullmodel adoption, no threshold relaxation",
+  "fullmodel_run": false,
+  "production_adoption": false,
+  "input_sha256": {
+    "request-32k-source.json": "36347a9246fee47e33aa24b016e8540794220da1120fe2e0a3a2d349c7cc5eb6",
+    "tokenized.prompt.txt": "840703fef91593be32d07ca4f2d95349b6f40408d74f7af2b9eafb7570ed2d59",
+    "tokenized.tokens.i32le.bin": "729017dfe550527833a9617801e362f5cadbd3574e11b30c20ff2faba30721e4",
+    "capture-tokens.txt": "60286d7416c862b0bf6e8370c12bf5b1021ebb42b4d1025b5cb4fe958a1e583a",
+    "capture-tokens.i32le.bin": "eb6687ff37d57bd5b5d990687e2541403d6ef199463cea2a9c4ba5ad1d8dce83",
+    "deployed/myds.conf": "0a3524b030a73916f7684d841b912c6e978c680825a3c3520ca18188f35a2cff"
+  }
+}

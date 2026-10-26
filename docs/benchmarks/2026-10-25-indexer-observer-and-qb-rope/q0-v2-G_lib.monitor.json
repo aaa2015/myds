@@ -1,0 +1,2405 @@
+[
+  {
+    "elapsed_s": 0.022750417000000023,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 0.318847584,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 0.6377855840000001,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 0.9318173750000001,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 1.224648959,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 1.517452375,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 1.807675834,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 2.091689,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 2.3766531250000003,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 2.660053875,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 2.938798125,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 3.2231140000000003,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 3.504544959,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 3.790216917,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 4.0754097499999995,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 4.359402333999999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 4.64185675,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 4.928910624999999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 5.213108291999999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 5.49677075,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 5.779890709,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 6.064742417,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 6.348424458999999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 6.63403575,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 6.918233,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 7.200686875,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 7.4847832919999995,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 7.769045584,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 8.053250667,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 8.337762750000001,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 8.622537917,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 8.906669875,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 9.191197834,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 9.475100042000001,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 9.7602905,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 10.043549084,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 10.329732875000001,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 10.614177542,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 10.897784167000001,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 11.181523292,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 11.466379417,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 11.75028575,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 12.034700125,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 12.318056709,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 12.602259167,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 12.886120709,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 13.171593917000001,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 13.4559095,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 13.7419015,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 14.027298834,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 14.311688042,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 14.597183459,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 14.88371675,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 15.168437459,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 15.452947042,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 15.738000084000001,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 16.022257417,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 16.307296209,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 16.590377084,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 16.875691375,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 17.159649625,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 17.440351708999998,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 17.725255999999998,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 18.009451166999998,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 18.293659416999997,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 18.578480125,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 18.8631805,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 19.146997917,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 19.431240209,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 19.716392416999998,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 20.000403499999997,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 20.2846975,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 20.568893959,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 20.842627874999998,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 21.128107209,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 21.412454417,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 21.689152209,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 21.971939209,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 22.256331874999997,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 22.539961291999997,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 22.823896625,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 23.108550124999997,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 23.392183749999997,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 23.675956417,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 23.9598285,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 24.244522167,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 24.528882874999997,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 24.813653624999997,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 25.099523166999997,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 25.384003417,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 25.669068084,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 25.953654584,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 26.23826,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 26.52379925,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 26.808399834,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 27.093500084,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 27.377839542,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 27.663534084,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 27.947929917,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 28.232594167,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 28.516371666999998,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 28.80125175,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 29.085722042,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 29.370519625,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 29.654424333999998,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 29.94025675,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 30.224678209,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 30.508522167,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 30.79310225,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 31.078235209,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 31.362619624999997,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 31.648096416999998,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 31.936373249999995,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 32.219978583999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 32.499879792,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 32.781778917,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 33.060830834,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 33.335882084,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 33.622426917,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 33.902335375,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 34.179396834,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 34.464790209,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 34.746506834,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 35.031223499999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 35.307915625,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 35.584426834,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 35.858842584,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 36.143612917,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 36.419915584,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 36.696686834,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 36.981344166999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 37.2735705,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 37.548638374999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 37.832468084,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 38.116244542,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 38.398679875,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 38.672788583999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 38.956222374999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 39.239348792,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 39.521270834,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 39.8048785,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 40.086054792,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 40.368713584,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 40.65099625,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 40.934025749999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 41.215329542,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 41.498371375,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 41.779654084,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 42.057796042,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 42.339225834,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 42.621746875,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 42.903202917,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 43.176577292,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 43.460025834,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 43.73329975,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 44.016715,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 44.300107374999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 44.582654125,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 44.864367584,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 45.145509583999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 45.428341417,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 45.709735084,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 45.992393667,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 46.274549166999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 46.558274209,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 46.841133041999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 47.122872334,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 47.405935584,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 47.688052375,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 47.970108249999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 48.252383334,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 48.534502208999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 48.815591375,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 49.098191625,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 49.381413042,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 49.663036125,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 49.94459525,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 50.226157375,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 50.511407334,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 50.795030875,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 51.069402959,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 51.348206792,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 51.630965459,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 51.905984458999995,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 52.185769625,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 52.464625749999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 52.748171041999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 53.030498625,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 53.306019542,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 53.582901,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 53.866567208999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 54.141170625,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 54.417219584,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 54.702607167,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 54.983113124999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 55.267450042,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 55.547736416999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 55.832536749999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 56.117020249999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 56.390754375,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 56.676214625,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 56.955017874999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 57.236779999999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 57.518435124999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 57.805992959,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 58.091128,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 58.3736995,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 58.655013959,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 58.937263875,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 59.218816792,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 59.501927125,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 59.783204417,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 60.066227999999995,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 60.347270959,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 60.629572375,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 60.9107225,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 61.194294209,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 61.477664542,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 61.7538115,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 62.035772875,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 62.310023625,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 62.5879355,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 62.871283749999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 63.153203417,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 63.429992459,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 63.707884584,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 63.989213500000005,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 64.2642255,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 64.545864667,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 64.830611042,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 65.111526625,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 65.39418875,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 65.676184709,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 65.958206709,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 66.24166591699999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 66.524635084,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 66.807139375,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 67.09088237499999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 67.36610775,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 67.645159625,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 67.926376917,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 68.21042824999999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 68.48661475,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 68.764151125,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 69.042068292,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 69.32167275,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 69.605220834,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 69.886811375,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 70.170213792,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 70.454094709,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 70.73718124999999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 71.012518875,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 71.294325542,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 71.579597167,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 71.85858725,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 72.1419375,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 72.42127320899999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 72.70655574999999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 72.983141875,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 73.262835959,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 73.548269834,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 73.823922834,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 74.101922584,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 74.378410584,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 74.65601504199999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 74.940242625,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  },
+  {
+    "elapsed_s": 75.219043042,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-gold/bench_indexer_fullmodel",
+        "pid": 22421
+      }
+    ]
+  }
+]

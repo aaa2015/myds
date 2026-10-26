@@ -1,0 +1,102 @@
+{
+  "schema_version": 1,
+  "passed": true,
+  "device": "Apple M2 Ultra",
+  "fixture_kind": "deterministic_synthetic",
+  "raw_files_verified": 160,
+  "cases": 16,
+  "parity_records": 48,
+  "timing_records": 144,
+  "checked_score_cells": 28343598,
+  "checked_output_bytes": 113450160,
+  "visible_nan_values_observed": 10,
+  "invisible_cells_checked": 1152,
+  "summaries": [
+    {
+      "case": 6,
+      "control": 0,
+      "bf16": 0,
+      "a1_us": 1536.3749989774078,
+      "b_us": 1363.2083137053996,
+      "a2_us": 1566.0416684113443,
+      "conservative_time_saved_percent": 11.271121008039431,
+      "control_drift_percent": 1.930952368639316
+    },
+    {
+      "case": 6,
+      "control": 1,
+      "bf16": 0,
+      "a1_us": 1572.1250092610717,
+      "b_us": 1371.458318317309,
+      "a2_us": 1555.625000037253,
+      "conservative_time_saved_percent": 11.838758165723329,
+      "control_drift_percent": -1.0495354457578432
+    },
+    {
+      "case": 7,
+      "control": 0,
+      "bf16": 0,
+      "a1_us": 10876.708314754069,
+      "b_us": 9434.125007828698,
+      "a2_us": 10874.500003410503,
+      "conservative_time_saved_percent": 13.245436527013377,
+      "control_drift_percent": -0.02030312186058758
+    },
+    {
+      "case": 7,
+      "control": 1,
+      "bf16": 0,
+      "a1_us": 10865.333344554529,
+      "b_us": 9466.291667195037,
+      "a2_us": 10839.83332500793,
+      "conservative_time_saved_percent": 12.671243335855342,
+      "control_drift_percent": -0.23469155283099008
+    },
+    {
+      "case": 14,
+      "control": 0,
+      "bf16": 1,
+      "a1_us": 1518.4999792836607,
+      "b_us": 1375.7499982602894,
+      "a2_us": 1564.0833298675716,
+      "conservative_time_saved_percent": 9.400723277632995,
+      "control_drift_percent": 3.001867053394003
+    },
+    {
+      "case": 14,
+      "control": 1,
+      "bf16": 1,
+      "a1_us": 1568.6250117141753,
+      "b_us": 1375.7916749455035,
+      "a2_us": 1534.374983748421,
+      "conservative_time_saved_percent": 10.33536850395621,
+      "control_drift_percent": -2.1834426781405347
+    },
+    {
+      "case": 15,
+      "control": 0,
+      "bf16": 1,
+      "a1_us": 10907.125019002706,
+      "b_us": 9439.874993404374,
+      "a2_us": 10870.91668159701,
+      "conservative_time_saved_percent": 13.163946795905401,
+      "control_drift_percent": -0.331969582659164
+    },
+    {
+      "case": 15,
+      "control": 1,
+      "bf16": 1,
+      "a1_us": 10879.416659008712,
+      "b_us": 9423.916664673015,
+      "a2_us": 10829.625010956079,
+      "conservative_time_saved_percent": 12.980212563786287,
+      "control_drift_percent": -0.45766836231428965
+    }
+  ],
+  "fullmodel_speedup_proven": false,
+  "production_adoption": false,
+  "source_identity_sha256": "0676ccb241c1f569b5b4e2e103125ecba0e0e2a3f9181e796163df5c70806481",
+  "manifest_sha256": "e28aaa119ccba8ff8eb59a2ee6a1464b791999b95b50ac4eacacf62acdef0622",
+  "jsonl_sha256": "5c7511bb9cff22dad9c5d688e387524ddd17e16fb4dcb5d737e6c6cf569c9a29",
+  "reader_sha256": "02b52cf6f65a06cb1ba716064e00a98a254487c4db855b6363d7a86b15e58d58"
+}

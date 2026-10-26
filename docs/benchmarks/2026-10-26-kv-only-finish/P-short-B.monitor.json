@@ -1,0 +1,1172 @@
+[
+  {
+    "elapsed_s": 0.023735125000001744,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 0.3073353330000046,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 0.5924495420000042,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 0.8756230000000045,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 1.1591499170000006,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 1.4425457500000007,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 1.7278364579999987,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 2.0106921249999985,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 2.2940581249999994,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 2.578080875000005,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 2.861648041999999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 3.144853957999999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 3.4282021249999985,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 3.7119317920000015,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 3.9954275420000016,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 4.278972457999998,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 4.562401458000004,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 4.846457042000004,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 5.129819250000004,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 5.413540042000001,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 5.696213125,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 5.979594167000002,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 6.262630958000003,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 6.546029875000002,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 6.826541042000002,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 7.110273750000005,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 7.394014958,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 7.677568749999999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 7.961633708000001,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 8.244955500000003,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 8.528782458000002,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 8.812418042000004,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 9.097573375000003,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 9.381913542,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 9.662804375,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 9.937360167000001,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 10.215234625,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 10.497335750000005,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 10.777188458000005,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 11.06025425,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 11.343801333000002,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 11.626655249999999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 11.906799958,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 12.189409667,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 12.473992417000005,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 12.756744875000003,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 13.039674708,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 13.322130000000001,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 13.60555325,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 13.888234666999999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 14.171049666999998,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 14.451671875000002,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 14.731799000000002,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 15.015252750000002,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 15.294075124999999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 15.5745225,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 15.852513167000005,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 16.136030500000004,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 16.418905042,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 16.698095958000003,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 16.981289875,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 17.261084375000003,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 17.534771208000002,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 17.817945167000005,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 18.100647083,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 18.381127292000002,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 18.664111417,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 18.946933167000005,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 19.222987042,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 19.497124,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 19.779825125000002,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 20.06226575,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 20.344714250000003,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 20.622828,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 20.897333958000004,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 21.170523667000005,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 21.453454958000002,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 21.732771,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 22.015864625,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 22.299592375000003,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 22.582651875000003,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 22.86406025,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 23.147022583000002,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 23.429914625000002,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 23.705690667,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 23.981215500000005,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 24.258503375000004,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 24.540530042,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 24.82366425,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 25.108009625,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 25.384575083,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 25.667440792,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 25.944367458000002,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 26.220207667000004,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 26.501883583,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 26.780454375000005,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 27.063731167,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 27.344826917,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 27.62823975,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 27.911838083,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 28.194981958000007,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 28.479183874999997,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 28.762405082999997,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 29.036985417000004,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 29.317632542000005,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 29.601739708000004,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 29.885155750000003,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 30.162897292000004,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 30.441165333000008,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 30.723085042,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 31.006274417000007,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 31.289366125000008,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 31.570173833000005,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 31.854731832999995,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 32.138236,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 32.421551375,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 32.704457583,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 32.987517458000006,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 33.2698715,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 33.546313542,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 33.82333620800001,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 34.096594292,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 34.37973950000001,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 34.663197875,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 34.94797008300001,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 35.234225625,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 35.517323958,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 35.802653083,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 36.087403,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  },
+  {
+    "elapsed_s": 36.37301470800001,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-decode-kv-only-runtime-20261025/target-bin/bench_decode_kv_only_fullmodel",
+        "pid": 81515
+      }
+    ]
+  }
+]

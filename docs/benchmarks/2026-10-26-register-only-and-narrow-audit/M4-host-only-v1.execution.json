@@ -1,0 +1,22 @@
+{
+  "argv": [
+    "/private/tmp/myds-register-only-final-build-v2-20261026/bench_indexer_register_only",
+    "--host-only",
+    "--deployed-metallib",
+    "/tmp/myds-indexer-r2-real-local-20261025/deployed/myds.metallib",
+    "--native-metallib",
+    "/private/tmp/myds-register-only-final-build-v2-20261026/native.metallib",
+    "--probe-metallib",
+    "/private/tmp/myds-register-only-final-build-v2-20261026/probe.metallib",
+    "--build-identity",
+    "/private/tmp/myds-register-only-final-build-v2-20261026/build-manifest.json",
+    "--harness-source",
+    "/private/tmp/myds-register-only-final-build-v2-20261026/source/tools/bench_indexer_register_only.m",
+    "--out-dir",
+    "/private/tmp/myds-register-only-mma-20261026/M4-host-only-v1"
+  ],
+  "returncode": 0,
+  "start": 1792969010.7351522,
+  "end": 1792969011.5282922,
+  "GPU_requested": false
+}

@@ -1,0 +1,166 @@
+Q_B forward RoPE decode audit and frozen v1 screening, 2026-10-25
+
+This work changed only two new private tools in /Users/fangqingyuan/Projects/myds:
+  tools/build_qb_rope_probe.py
+  tools/bench_qb_rope_probe.m
+No production runtime/shader/prefill registration was changed. Both tools and
+/tmp/myds-qb-rope-probe-build-v1-20261025 are frozen. Child agent performed local
+CPU/Metal compilation and --host-only only. Root performed the sole M4 GPU
+screen, after freezing protocol.json. No GPU retest has occurred.
+
+CURRENT DECISION
+Frozen v1 is rejected on exact numerical correctness. Actual deployed native
+Q_B+RoPE and same-full-TU native Q_B+RoPE match all 114 complete outputs.
+Candidate differs at three individual rotated im coordinates. There are no
+phase2 timing records. No speed claim, integration, adoption or model-quality
+claim is supported. The adjacent BF16 discrepancy is not a 1-F32-ULP result.
+
+PRIOR DIRECTIONS RECONCILED AGAINST CURRENT SOURCE/HISTORY
+* Late layer index-filter removal is absent on the default optimized path:
+  src/myds_v41.c:4169-4213 selects myds_v41_decode_attn_indexer_scoped;
+  src/myds_v41_moe.c:2644-2687 passes the optional mask into head-slot scoring
+  and then selects TopK, with no post-scorer filter for late index layers.
+  Filter calls remain at src/myds_v41_moe.c:2222 and src/myds_v41.c:3573 in
+  other/reference paths. Removing those calls does not optimize default decode.
+* Ordinary Output_A fixed wrapper was already component-positive and exact but
+  failed the frozen full-model benefit gate: ledger section77, lines10649-10668,
+  10-prompt conservative saving .356890%, 800-prompt .404154%, strict >2% gate.
+  This is not zero observed benefit; it is insufficient for adoption.
+* QB NR4 regrouping was already rejected by concurrent full-model evidence,
+  ledger lines4482-4499. This new probe preserves NR2/NSG4 and changes only the
+  forward RoPE boundary, not NR grouping or the attention inverse-RoPE RF path.
+* The earlier SharedGU-cross-barrier hypothesis was withdrawn. Scoped resource
+  lists do not prove selective completion across a compute memory barrier.
+* DS4 upstream b64d3e0 already fuses compressor emit finalization on ratio4,
+  reporting only .4-.5% M5 full-model benefit. V4.1 ratio1/2 finalize is an
+  unported adaptation, not a new general mechanism; it was deprioritized.
+
+NARROW CANDIDATE AND ACTUAL DEFAULT CALL CHAIN
+  src/myds_v41.c:4213 -> myds_v41_decode_attn_indexer_scoped
+  src/myds_v41_moe.c:2432 -> want_kv_reuse && !is_idx branch
+  :2441 original qkv_finish produces window/partial scratch
+  :2442 original full Q_B 32768 x 1280 Q4_K NR2 NB/BF16
+  :2447 original cohort4 resource join
+  :2448 original forward Q RoPE, 64 heads, width512, last64 dimensions
+  :2449 original window prestage
+  :2453 original attention input resource join
+  Original Q4 provider ABI and complete alias/range checks:
+  src/myds_decode_candidates.inc:184-225. Original shader dot and reduction:
+  metal/myds_q4_v41.metal:29-96; full QB native symbol at :108.
+  Exact frequency table: src/myds_v41_gpu.c:262-282. Original RoPE device
+  operations: metal/dsv41.metal:83-95. Original host RoPE ABI: GPU C :285-294.
+
+  Only 32 non-index-source layer ids were considered. Source ids excluded:
+  2,8,14,20,24,28,32,36. Layers0/1 use raw frequencies; the other30 use compressed
+  frequencies (ratio !=0). Position is below1048576. Future runtime eligibility
+  must inspect actual QB per-site NR selection including NR4_MASK, actual NB,
+  NSG4/FC6004, ordinary scalar decode/need_logits/no trace/no exclusive kprof,
+  all original pipeline prerequisites and exact complete native buffer ranges.
+  The primitive probe itself does not register or exercise runtime eligibility.
+
+  Each SIMDgroup computes an even adjacent output row pair, so last64-of512
+  forward rotation pairs can be processed after the two original simd_sum calls
+  and first BF16 bit truncations. Candidate stores the same unrotated values
+  and applies original precise cos/sin, affine expressions and second BF16 to
+  rotated pairs. Original K loop text is retained and reverse-edit restores the
+  original Q4 body bytes exactly. All32 lanes execute each collective.
+
+  Potential work removed if valid:32 small RoPE dispatches/token, 32768 bytes
+  tail read+write/layer =1048576 bytes/token. This is not a speed estimate.
+  Saved traffic is only .139% of the 32 QB layers'754974720 weight bytes. RoPE
+  currently overlaps window prestage; moved trig extends QB's earlier cohort.
+  2048 rotating pairs/layer move from64 densely active RoPE SIMDgroups into
+  2048 Q4 SIMDgroups with lane0 trig, potentially slowing residency. No >2%
+  full-model upper bound follows from source or from command-buffer gap data.
+
+PRIVATE BUILD AND CPU VALIDATION
+Builder reproduces production PREAMBLE, original29 shader order/raw bytes and
+COPY_KERNELS as a byte-exact1574167-byte native prefix, then appends only the
+candidate function. It compiles native.metallib and probe.metallib, never using
+an extracted native template as gold. Original host frequency initialization
+bytes are frozen into frozen_rope_init.inc. Git head is optional context;
+individual frozen file bytes/SHA are authoritative in this dirty workspace.
+
+Exact command executed:
+  python3 tools/build_qb_rope_probe.py --source-root /Users/fangqingyuan/Projects/myds --out-dir /tmp/myds-qb-rope-probe-build-v1-20261025
+Both complete Metal TUs and -Wall -Wextra -Werror Objective-C compile passed.
+The native and appended Metal compile each retained17 pre-existing warnings.
+CPU controls verified all36 source records, full-prefix byte equality, reverse
+body proof, uniform reductions/first and second BF16 source order, and rejected
+two changed source-contract anchors. Evidence:
+  /tmp/myds-qb-rope-builder-cpu-controls-20261025.json
+Host-only verified114 case metadata/344 full raw payload sizes and SHA,32 layer
+ids and both frequency modes, with0 device/pipeline/CB records:
+  /tmp/myds-qb-rope-host-only-cpu-review-20261025.json
+The host-only golden-path placeholder was build/native.metallib; no GPU load
+was done and it was never claimed as deployed identity.
+
+ROOT'S SOLE M4 SCREEN
+Frozen protocol/argv/window/monitor/stdout/stderr/raw outputs:
+  /tmp/myds-qb-rope-gpu-screen-20261025
+Actual golden library was the frozen deployed M2 universal AIR library, loaded
+by exact URL on local Apple M4. Root ran --synthetic --timing, but fail-closed
+correctness blocked timing after all114 cases x3providers x32768 F32 outputs.
+All32 logical eligible layer ids have pos0/1/327679; extra layer0/3/39 boundary
+positions127/128/16383/16384/65535/65536 give114 cases. These use one shared
+synthetic full23.59MB Q4 matrix and synthetic BF16 qr_norm vectors, not32 real
+model layer matrices. The complete numerical gate was three-provider native
+actual/original-same-full-TU/new-full-TU. Five direct PSOs are required, with
+actual loaded library SHA, exact geometry and no fallback. Phase1 saves every
+complete output, prefix/suffix guards, before and post full inputs even on
+failure. Host-only returns before MTLCreateSystemDefaultDevice.
+
+INDEPENDENT RAW REVIEW (child, CPU only)
+  /tmp/myds-qb-rope-screen-independent-review-20261025.json
+  /tmp/review_qb_rope_gpu_screen_20261025.py
+Verified1715 raw/identity file sizes and SHA, all directory entries accounted;
+342 complete outputs =11206656 finite BF16-format F32;914 guard files of64B
+all0xa5;115 post inputs totaling24176640B match complete before raw bytes;
+all before inputs/args match independent host-only deterministic generation.
+All342 GPU CBs completed in ordered case/provider sequence. Actual vs probe
+native114/114 outputs are byte-equal. Candidate111/114 are byte-equal. No
+unrotated value differs, but the exact gate fails with the following3 values:
+  case8, L3, pos327679, compressed=True, row32761, head63, dim505, im:
+    0x3fe10000 (1.7578125) -> 0x3fe00000 (1.75), abs=0.0078125, BF16_ULP=1, F32_ULP=65536
+  case92, L38, pos327679, compressed=True, row21989, head42, dim485, im:
+    0x41b00000 (22.0) -> 0x41af0000 (21.875), abs=0.125, BF16_ULP=1, F32_ULP=65536
+  case99, L0, pos16384, compressed=False, row6115, head11, dim483, im:
+    0xbf860000 (-1.046875) -> 0xbf870000 (-1.0546875), abs=0.0078125, BF16_ULP=1, F32_ULP=65536
+The third mismatch is uncompressed layer0 at16384, not compressed327679.
+Max absolute error=.125; max relative to gold=.007462686567164179 (.746269%).
+Source/binaries/libraries remained frozen. Exit1 was expected exact-gate refusal.
+
+READ-ONLY ACTUAL AIR EVIDENCE AND LIMIT OF ATTRIBUTION
+metal-objdump disassembled actual golden and probe metallibs (CPU only):
+  /tmp/myds-qb-rope-ir-review-20261025
+Actual gold and probe original kernel_dsv41_rope AIR modules are byte-identical.
+Actual gold/probe original QB AIR modules are byte-identical after only TU
+constructor filename symbol normalization (myds_all.metal -> all.metal).
+This reinforces the complete native-output identity gate. Candidate failure is
+not explained away by an isolated-template gold or mismatched native provider.
+
+Concrete AIR change at the im affine sum:
+  actual gold: re*sin then im*cos; fadd fast uses (im*cos, re*sin)
+  candidate:   re*sin then im*cos; fadd fast uses (re*sin, im*cos)
+Gold calls sin then cos; candidate calls cos then sin. Both have fast flags.
+The first and second BF16 integer bit rounding remain present in candidate AIR.
+Operand-commuted F32 add alone is identical for the finite nonzero values.
+Different contraction/lowering around a BF16 boundary is consistent with the
+im-only adjacent-BF16 discrepancies, but AIR does not prove GPU contraction
+choice or independently establish identical pre-RoPE first-BF16 tail inputs.
+No certain repair has been proven. Do not blindly disable FMA, swap source
+expressions or run further GPU tests to seek a pass. Retain this exact frozen
+failure; no runtime implementation or performance result exists.
+
+FROZEN ARTIFACT IDENTITIES
+  native_source_sha256: bc6603c97ec24af7597f6b10c7ed2a7bfe1344379733a0a4df780250a13f3224
+  combined_source_sha256: dcb0ba45582c4afc3e89761fa506d75542de458b3e7aba58fe567d7f89a2c70e
+  candidate_fragment_sha256: 766208e9e8d9be34eb69fbecfe3f60db618d034d1931c24e4110ac7bf78ebc6c
+  host_rope_init_sha256: cf3cf7fd697d517517d78ae15c4d83ac8444b1138b71b9fc5b1e1532b708a0a8
+  binary_sha256: a83ded3a48db8f4ad59ba0d61f4930ca79602b11b30c9ee6667c43d37a4c2f82
+  metallib_sha256: a23f6bb4cc5498d3cc2914900dda7075e84de730f9e96b70ad11cb99a3efed45
+  native_metallib_sha256: db7f9b071feb102a47d17051c2f5b6ec7de0cf3e18df46e5beaa912f8cb334f0
+  tools/build_qb_rope_probe.py: 7add0d6410eeef457bcdbc62b33f52f8cc310dd833237ae61d946bcbde6bc751
+  tools/bench_qb_rope_probe.m: fed5ac5dd9105cf36e647f38fc1f8dc32fca14d09951a1c38792a46c26f3efbb
+  source-identity.json: 92c2e6bb2e6e3ef104282a471c5c413f4f82bb20b57d29fbdf6b3a826096f3b4
+  actual deployed gold library: 3837102396703da59e0eebbc0de1fdc58b68b3a3a5ec5d07504b351c67a29ba9

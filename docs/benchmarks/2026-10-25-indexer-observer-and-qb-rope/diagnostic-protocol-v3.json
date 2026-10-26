@@ -1,0 +1,172 @@
+{
+  "schema_version": 3,
+  "kind": "indexer_predecessor_stability_diagnostic",
+  "adoption_cohort": false,
+  "layer": 2,
+  "shape": [
+    128,
+    15424
+  ],
+  "warmup_rounds": 1,
+  "formal_rounds": 12,
+  "timing_records": 468,
+  "phase_order": "round0 warmup:0..8; formal odd rounds:8..0; formal even rounds:0..8. Six formal forward and six reverse blocks; every legacy/balanced pair is measured in both orders six times.",
+  "steps": [
+    "conditioner",
+    "A1",
+    "B",
+    "A2"
+  ],
+  "phases": [
+    {
+      "name": "sham_exact_inline",
+      "conditioner": 0,
+      "arms": [
+        0,
+        0,
+        0
+      ],
+      "deferred_validation": false,
+      "distinct_outputs": false
+    },
+    {
+      "name": "sham_tiled_inline",
+      "conditioner": 1,
+      "arms": [
+        1,
+        1,
+        1
+      ],
+      "deferred_validation": false,
+      "distinct_outputs": false
+    },
+    {
+      "name": "sham_candidate_inline",
+      "conditioner": 2,
+      "arms": [
+        2,
+        2,
+        2
+      ],
+      "deferred_validation": false,
+      "distinct_outputs": false
+    },
+    {
+      "name": "legacy_tiled_inline",
+      "conditioner": 1,
+      "arms": [
+        1,
+        2,
+        1
+      ],
+      "deferred_validation": false,
+      "distinct_outputs": false
+    },
+    {
+      "name": "balanced_tiled_inline",
+      "conditioner": 2,
+      "arms": [
+        1,
+        2,
+        1
+      ],
+      "deferred_validation": false,
+      "distinct_outputs": false
+    },
+    {
+      "name": "legacy_tiled_deferred",
+      "conditioner": 1,
+      "arms": [
+        1,
+        2,
+        1
+      ],
+      "deferred_validation": true,
+      "distinct_outputs": false
+    },
+    {
+      "name": "balanced_tiled_deferred",
+      "conditioner": 2,
+      "arms": [
+        1,
+        2,
+        1
+      ],
+      "deferred_validation": true,
+      "distinct_outputs": false
+    },
+    {
+      "name": "legacy_tiled_distinct",
+      "conditioner": 1,
+      "arms": [
+        1,
+        2,
+        1
+      ],
+      "deferred_validation": false,
+      "distinct_outputs": true
+    },
+    {
+      "name": "balanced_tiled_distinct",
+      "conditioner": 2,
+      "arms": [
+        1,
+        2,
+        1
+      ],
+      "deferred_validation": false,
+      "distinct_outputs": true
+    }
+  ],
+  "outputs": "shared modes slot=provider; distinct modes slot=step; four stable physical MTLBuffers",
+  "common_snapshot": "CPU memcpy full scores and guards immediately after each GPU wait, all modes. No validation sampling. Every CB raw saved, hardlinks only after complete SHA identity.",
+  "inline_validation": "two complete word comparisons, finite/poison/causal scan and SHA between CBs; record host times",
+  "deferred_validation": "same validation after all four CBs; complete output snapshots retained. No JSON or raw writes between four CBs in any phase.",
+  "providers": [
+    "deployed_actual_exact",
+    "full_TU_TILED",
+    "full_TU_K_resident"
+  ],
+  "scope": "diagnostic only; controlled intervention, not an exact replay of old observer; no frequency/cache attribution without counters",
+  "correctness": "initial three scorers and actual TopK pass; all468 outputs full compare to same-provider immutable reference, all guards and input postbytes exact",
+  "numeric_failure": "preserve all visible raw and stop; no performance interpretation",
+  "decision_rule": {
+    "sham_stability_max_abs_median_slot_drift_percent": 0.5,
+    "balanced_inline_max_abs_median_slot_drift_percent": 0.5,
+    "within_round_conditioning_reduction_positive_pairs_min": 10,
+    "formal_component_adoption_eligible_from_diagnostic": false,
+    "next_stage": "Only when numerical+sham+predecessor diagnostic rule supports a measurement correction, freeze a separate balanced-conditioning real component cohort, preserving >2% savings and <=2% abs drift gates for all3layers x2controls. No candidate math/source changes.",
+    "sham_formula": "For each of three sham phases:100*(max(median(A1),median(B),median(A2))/min(median(A1),median(B),median(A2))-1)<=0.5",
+    "legacy_reproduction_formula": "100*(1-median(A2)/median(A1))>=0.5 in legacy_tiled_inline",
+    "balanced_stability_formula": "abs(100*(median(A2)/median(A1)-1))<=0.5 in balanced_tiled_inline; B is a different provider",
+    "within_round_conditioning_formula": "Each formal round r:abs(100*(A2_r/A1_r-1)_legacy_tiled_inline)-abs(100*(A2_r/A1_r-1)_balanced_tiled_inline). Median reduction>=0.5 pp and strictly-positive reductions>=10/12.",
+    "decision_phases": [
+      "sham_exact_inline",
+      "sham_tiled_inline",
+      "sham_candidate_inline",
+      "legacy_tiled_inline",
+      "balanced_tiled_inline"
+    ],
+    "descriptive_only_phases": [
+      "legacy_tiled_deferred",
+      "balanced_tiled_deferred",
+      "legacy_tiled_distinct",
+      "balanced_tiled_distinct"
+    ],
+    "legacy_reproduction_min_A2_faster_percent_inclusive": 0.5,
+    "within_round_conditioning_reduction_min_median_percentage_points_inclusive": 0.5
+  },
+  "old_cohort_preserved": true,
+  "old_joint_gate_remains_failed": true,
+  "fullmodel_run": false,
+  "production_adoption": false,
+  "capture_json_sha256": "e7200c786445bf0946ef5fb7bdbe59b95bfd3de4118ec611583f9553752f5b6d",
+  "probe_sha256": "9df7ed2a5212d54d4475480bf6388d2f66ce24c93bb3a8b003f2b789806d6982",
+  "native_sha256": "3837102396703da59e0eebbc0de1fdc58b68b3a3a5ec5d07504b351c67a29ba9",
+  "limitations": [
+    "Deterministic six forward/six reverse formal phase blocks balance first-order phase order; this is not randomized and does not erase all prior-resource/device history.",
+    "A conditioner intervention changes preceding GPU work plus its CPU observation; it cannot uniquely isolate hardware frequency, cache state, or a single microarchitectural mechanism.",
+    "The diagnostic does not yield adoption eligibility even when measurement-correction support gates pass."
+  ],
+  "revision_reason_before_any_diagnostic_GPU": "Independent review found cyclic rotation placed legacy before balanced in11/12 formal rounds. Replace with six forward/six reverse blocks before data collection; decision thresholds and samples unchanged."
+}

@@ -1,0 +1,206 @@
+--- a/include/myds_v41_gpu.h
++++ b/include/myds_v41_gpu.h
+@@ -185,6 +185,29 @@
+ void myds_v41_gpu_indexer_compact_counters(myds_v41_gpu_indexer_compact_counters_t *out, bool reset);
+ /* Diagnostic fixture only: emulate absent optional PSOs before any dispatch. */
+ void myds_v41_gpu_inject_indexer_compact_unavailable(bool enabled);
++/* Private default-off prefill-only K-resident experiment. Only absent/0/1 are
++ * valid; parse after configuration loading. Original public chunk APIs below
++ * always retain their original selector and never encode this candidate. */
++int myds_v41_gpu_indexer_k_resident_enabled(void);
++const char *myds_v41_gpu_indexer_k_resident_selected_kernel(bool cache_bf16);
++typedef struct {
++    uint64_t requests, encoded, fallbacks, failures, f32_dispatches, bf16_dispatches;
++} myds_v41_gpu_indexer_k_resident_counters_t;
++/* Host-only process-wide counters. Reset at idle sample boundaries only.
++ * Encoded counts active-batch dispatch acceptance, not GPU completion. Normal
++ * ineligible/reference calls are not candidate fallbacks. */
++void myds_v41_gpu_indexer_k_resident_counters(
++    myds_v41_gpu_indexer_k_resident_counters_t *out,bool reset);
++/* Narrow initial scope: ordinary/no trace, active batch/no exclusive kprof,
++ * ratio2, 512<n_comp<=16384, 8<=n_tokens<=2048, end<=32768, key-window/SG=0.
++ * Strict full spans/budget/alias/PSO failures never retry a native scorer.
++ * Returns0 on failure; the publishing caller must fail its in-flight prefill. */
++int myds_v41_gpu_indexscores_prefill_chunk_scoped(
++    myds_v41_gpu_scratch_t *scratch,myds_metal_buffer_t *scores,
++    const myds_metal_buffer_t *q,const myds_metal_buffer_t *weights,
++    const myds_metal_buffer_t *cache,uint32_t n_comp,uint32_t n_heads,
++    uint32_t n_tokens,uint32_t causal_start,uint32_t causal_ratio,
++    bool cache_bf16,bool ordinary_prefill_allowed);
+ /* 整 chunk 批量版（n_tokens 行 × n_comp 列，行主序，行步长 n_comp）。只支持
+  * n_heads == 32；每行的因果宽度 = (causal_start + row + 1) / causal_ratio，
+  * 与逐 token 的 count 相同；行数不够的格子写 -INFINITY。 */
+--- a/src/myds_v41.c
++++ b/src/myds_v41.c
+@@ -3776,8 +3776,8 @@
+         extern void myds_indexer_capture_set_group(uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
+         myds_indexer_capture_set_group(il,base_pos,c_start,c_len,off,batch_floats);
+ #endif
+-        if (!myds_v41_gpu_indexscores_chunk_bf16(scores_buf,q_view,w_view,g->index_cache[owner],
+-                nc,V41_INDEX_HEADS,glen,g_start,ratio)) return -1;
++        if (!myds_v41_gpu_indexscores_prefill_chunk_scoped(g->gpu,scores_buf,q_view,w_view,g->index_cache[owner],
++                nc,V41_INDEX_HEADS,glen,g_start,ratio,true,!myds_trace_active())) return -1;
+         if (il==20) {
+             /* 块掩码：只要本行的块【全部被选中】，掩码前缀就与逐 token 一致
+              * （前 blocks_t 列先清成不可见、再被 scatter 打开）。这里 nc ≤ 16384
+--- a/src/myds_v41_gpu.c
++++ b/src/myds_v41_gpu.c
+@@ -100,6 +100,43 @@
+         .original_vec_encoded = v[AC_ORIGINAL], .matrix_encoded = v[AC_MATRIX],
+         .matrix_fallbacks = v[AC_MATRIX_FALLBACKS]};
+ }
++/* Private K-resident runtime experiment: policy is immutable after the first
++ * getter, which must run after config load. No PSO is touched by this getter. */
++enum { IK_REQUESTS,IK_ENCODED,IK_FALLBACKS,IK_FAILURES,IK_F32,IK_BF16,IK_COUNT };
++static _Atomic uint64_t indexer_k_counters[IK_COUNT];
++static pthread_once_t indexer_k_once=PTHREAD_ONCE_INIT;
++static int indexer_k_mode;
++static void indexer_k_init(void) {
++    const char *value=getenv("MYDS_INDEXER_K_RESIDENT");
++    if(!value||!strcmp(value,"0"))indexer_k_mode=0;
++    else if(!strcmp(value,"1"))indexer_k_mode=1;
++    else {
++        indexer_k_mode=-1;
++        MYDS_LOG_E("MYDS_INDEXER_K_RESIDENT must be exactly absent, 0 or 1");
++    }
++}
++int myds_v41_gpu_indexer_k_resident_enabled(void) {
++    pthread_once(&indexer_k_once,indexer_k_init);
++    return indexer_k_mode;
++}
++const char *myds_v41_gpu_indexer_k_resident_selected_kernel(bool bf16) {
++    if(myds_v41_gpu_indexer_k_resident_enabled()!=1)return NULL;
++    return bf16?"kernel_myds_indexer_scores_k_resident_bf16":
++                "kernel_myds_indexer_scores_k_resident_f32";
++}
++void myds_v41_gpu_indexer_k_resident_counters(
++    myds_v41_gpu_indexer_k_resident_counters_t *out,bool reset) {
++    uint64_t v[IK_COUNT];
++    for(unsigned i=0;i<IK_COUNT;i++)v[i]=reset?
++        atomic_exchange_explicit(&indexer_k_counters[i],0u,memory_order_relaxed):
++        atomic_load_explicit(&indexer_k_counters[i],memory_order_relaxed);
++    if(out)*out=(myds_v41_gpu_indexer_k_resident_counters_t){v[0],v[1],v[2],v[3],v[4],v[5]};
++}
++static int indexer_k_failure(const char *reason) {
++    atomic_fetch_add_explicit(&indexer_k_counters[IK_FAILURES],1u,memory_order_relaxed);
++    MYDS_LOG_E("K-resident prefill indexer failed: %s; refusing native fallback",reason);
++    return 0;
++}
+ static int floats(const myds_metal_buffer_t *b,uint64_t n) {
+     return b && n && n<=myds_metal_buffer_size(b)/4 && myds_metal_buffer_offset(b)%4==0;
+ }
+@@ -149,7 +186,8 @@
+     return s ? myds_metal_buffer_size(s->kv_chunk)+myds_metal_buffer_size(s->mask_chunk) : 0;
+ }
+ myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp) {
+-    if (myds_v41_gpu_attention_packed_register_enabled()<0 || myds_v41_attention_rope_fuse_enabled()<0 ||
++    if (myds_v41_gpu_indexer_k_resident_enabled()<0 ||
++        myds_v41_gpu_attention_packed_register_enabled()<0 || myds_v41_attention_rope_fuse_enabled()<0 ||
+         myds_v41_gpu_attention_direct_pack_fuse_enabled()<0) return NULL;
+     if(!max_comp || max_comp>1048576) return NULL;
+     myds_v41_gpu_scratch_t *s=calloc(1,sizeof(*s));
+@@ -754,6 +792,87 @@
+     const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,uint32_t n_comp,
+     uint32_t n_heads,uint32_t n_tokens,uint32_t causal_start,uint32_t causal_ratio) {
+     return indexscores_chunk(scores,q,weights,cache,n_comp,n_heads,n_tokens,causal_start,causal_ratio,true);
++}
++struct indexer_k_args {
++    uint32_t n_comp,n_tokens,n_head,head_dim,pos0,ratio;
++    uint64_t q_token_stride,q_head_stride,weights_token_stride;
++    uint64_t index_row_stride,score_token_stride;
++    float scale;
++};
++_Static_assert(sizeof(struct indexer_k_args)==72u,"K-resident original tiled ABI");
++_Static_assert(offsetof(struct indexer_k_args,q_token_stride)==24u &&
++               offsetof(struct indexer_k_args,score_token_stride)==56u &&
++               offsetof(struct indexer_k_args,scale)==64u,"K-resident original tiled offsets");
++int myds_v41_gpu_indexscores_prefill_chunk_scoped(
++    myds_v41_gpu_scratch_t *scratch,myds_metal_buffer_t *scores,
++    const myds_metal_buffer_t *q,const myds_metal_buffer_t *weights,
++    const myds_metal_buffer_t *cache,uint32_t n_comp,uint32_t n_heads,
++    uint32_t n_tokens,uint32_t causal_start,uint32_t causal_ratio,
++    bool cache_bf16,bool ordinary_prefill_allowed) {
++    atomic_fetch_add_explicit(&indexer_k_counters[IK_REQUESTS],1u,memory_order_relaxed);
++    const int mode=myds_v41_gpu_indexer_k_resident_enabled();
++    if(mode<0)return indexer_k_failure("invalid configuration");
++    /* Preserve the complete original selector for disabled/other scopes. In
++     * particular public scalar/chunk APIs never arrive through this entry. */
++    if(!mode||!ordinary_prefill_allowed)
++        return indexscores_chunk(scores,q,weights,cache,n_comp,n_heads,n_tokens,
++                                 causal_start,causal_ratio,cache_bf16);
++    if(n_heads!=32u||!n_comp||!n_tokens||!causal_ratio||causal_start==UINT32_MAX)
++        return indexer_k_failure("invalid ordinary chunk shape");
++    const uint64_t end=(uint64_t)causal_start+n_tokens;
++    const char *sgbar=getenv("MYDS_INDEXER_SGBAR");
++    /* Initial device gate covers ratio2 owners in the first32K only. Larger,
++     * smaller, ratio1 and diagnostic requests are legitimate reference calls,
++     * not eligible-candidate fallbacks. No new allocation or group splitting. */
++    if(causal_ratio!=2u||n_comp<=512u||n_comp>16384u||n_tokens<8u||
++       n_tokens>MYDS_CHUNK_MAXC||end>32768u||!myds_metal_batch_active()||
++       myds_metal_kprof_exclusive()||indexer_key_window()||
++       (sgbar&&strcmp(sgbar,"0")!=0))
++        return indexscores_chunk(scores,q,weights,cache,n_comp,n_heads,n_tokens,
++                                 causal_start,causal_ratio,cache_bf16);
++    if(!scratch||n_comp>scratch->max_comp||n_comp>scratch->key_comp_max||
++       !scratch->batch_floats||(uint64_t)n_comp*n_tokens>scratch->batch_floats||
++       n_comp!=end/2u||(uint64_t)causal_start+1u<2u)
++        return indexer_k_failure("ordinary group bounds/budget/causal tuple");
++    const uint64_t score_bytes=(uint64_t)n_comp*n_tokens*4u;
++    const uint64_t q_bytes=(uint64_t)n_tokens*32u*128u*4u;
++    const uint64_t w_bytes=(uint64_t)n_tokens*32u*4u;
++    const uint64_t cache_bytes=(uint64_t)n_comp*128u*(cache_bf16?2u:4u);
++    if(score_bytes>SIZE_MAX||q_bytes>SIZE_MAX||w_bytes>SIZE_MAX||cache_bytes>SIZE_MAX||
++       !myds_metal_buffer_native_range(scores,score_bytes,4u)||
++       !myds_metal_buffer_native_range(q,q_bytes,4u)||
++       !myds_metal_buffer_native_range(weights,w_bytes,4u)||
++       !myds_metal_buffer_native_range(cache,cache_bytes,cache_bf16?2u:4u)||
++       buffer_ranges_overlap(scores,(size_t)score_bytes,q,(size_t)q_bytes)||
++       buffer_ranges_overlap(scores,(size_t)score_bytes,weights,(size_t)w_bytes)||
++       buffer_ranges_overlap(scores,(size_t)score_bytes,cache,(size_t)cache_bytes))
++        return indexer_k_failure("complete native ranges/alignment/writer alias");
++    const uint32_t threads[]={32u,4u,1u};
++    const size_t smem=21504u;
++    /* Re-resolve against the current library: do not cache readiness across
++     * Metal cleanup/reinit. Preflight itself creates no CB or GPU work. */
++    const char *f32="kernel_myds_indexer_scores_k_resident_f32";
++    const char *bf16="kernel_myds_indexer_scores_k_resident_bf16";
++    if(!myds_metal_kernel_constants_preflight(f32,threads,smem,NULL,0u))
++        return indexer_k_failure(f32);
++    if(!myds_metal_kernel_constants_preflight(bf16,threads,smem,NULL,0u))
++        return indexer_k_failure(bf16);
++    struct indexer_k_args a;
++    memset(&a,0,sizeof(a));
++    a.n_comp=n_comp;a.n_tokens=n_tokens;a.n_head=32u;a.head_dim=128u;
++    a.pos0=causal_start;a.ratio=2u;a.q_token_stride=32u*128u*4u;
++    a.q_head_stride=128u*4u;a.weights_token_stride=32u*4u;
++    a.index_row_stride=128u*(cache_bf16?2u:4u);
++    a.score_token_stride=(uint64_t)n_comp*4u;a.scale=1.0f/64.0f;
++    const myds_metal_buffer_t *b[]={q,weights,cache,scores};
++    const char *name=cache_bf16?bf16:f32;
++    if(!dispatch(name,&a,sizeof(a),b,4u,(n_comp+31u)/32u,(n_tokens+7u)/8u,1u,
++                 32u,4u,1u,smem))return indexer_k_failure("candidate dispatch rejected");
++    /* Active-batch bridge returns1 after metal_dispatch; later GPU completion
++     * is an independent enclosing-batch gate, not this host encoding count. */
++    atomic_fetch_add_explicit(&indexer_k_counters[IK_ENCODED],1u,memory_order_relaxed);
++    atomic_fetch_add_explicit(&indexer_k_counters[cache_bf16?IK_BF16:IK_F32],1u,memory_order_relaxed);
++    return 1;
+ }
+ /* 按行批量（rows 行）。mask_stride 是 block_mask 的行步长（float）；
+  * 逐 token 调用传 rows=1、start=pos、mask_stride=(n_comp+7)/8（与改前一致）。 */
+--- /dev/null
++++ b/tools/indexer_k_runtime_adapter.inc
+@@ -0,0 +1,14 @@
++/* Private fullmodel witness adapter: exact field mapping, no GPU operations. */
++#include "myds_v41_gpu.h"
++static int bench_indexer_adapter_mode(void) {
++    return myds_v41_gpu_indexer_k_resident_enabled();
++}
++static const char *bench_indexer_adapter_symbol(bool bf16) {
++    return myds_v41_gpu_indexer_k_resident_selected_kernel(bf16);
++}
++static void bench_indexer_adapter_counters(bench_indexer_provider_counters_t *out,bool reset) {
++    myds_v41_gpu_indexer_k_resident_counters_t v;
++    myds_v41_gpu_indexer_k_resident_counters(out?&v:NULL,reset);
++    if(out)*out=(bench_indexer_provider_counters_t){v.requests,v.encoded,v.fallbacks,
++        v.failures,v.f32_dispatches,v.bf16_dispatches};
++}

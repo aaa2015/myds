@@ -1,0 +1,139 @@
+--- a/include/myds_v41_gpu.h
++++ b/include/myds_v41_gpu.h
+@@ -102,6 +102,19 @@
+  * Missing fused kernel / copy injection / overlapping storage use originals. */
+ int myds_v41_gpu_qkv_finish(myds_metal_buffer_t *q,myds_metal_buffer_t *kv,
+     myds_metal_buffer_t *window,uint32_t pos,bool compressed);
++/* Private ordinary scalar non-index-source KV_REUSE experiment. Public
++ * qkv_finish stays reference. Counters count host encode acceptance, not GPU
++ * completion. Reset only at an idle request boundary. */
++typedef struct {
++    uint64_t requests,eligible,encoded,references,fallbacks,failures;
++} myds_v41_gpu_decode_kv_only_finish_counters_t;
++int myds_v41_gpu_decode_kv_only_finish_enabled(void);
++const char *myds_v41_gpu_decode_kv_only_finish_selected_kernel(void);
++void myds_v41_gpu_decode_kv_only_finish_counters(
++    myds_v41_gpu_decode_kv_only_finish_counters_t *out,bool reset);
++int myds_v41_gpu_decode_kv_only_finish_scoped(myds_v41_gpu_scratch_t *scratch,
++    myds_metal_buffer_t *dummy_q,myds_metal_buffer_t *kv,myds_metal_buffer_t *window,
++    uint32_t layer,uint32_t pos,bool compressed,bool ordinary_allowed);
+ /* 0 BF16, 1 FP8 E8M0 scales, 2 FP4 E8M0 scales, 3 FP4 E4M3 scales. */
+ int myds_v41_gpu_quant(myds_metal_buffer_t *x,uint32_t width,uint32_t rows,uint32_t mode);
+ /* Explicit opt-in diagnostic API: one contiguous indexer row, heads1 or
+--- a/src/myds_v41_gpu.c
++++ b/src/myds_v41_gpu.c
+@@ -137,6 +137,37 @@
+     MYDS_LOG_E("K-resident prefill indexer failed: %s; refusing native fallback",reason);
+     return 0;
+ }
++/* Private decode KV-only policy. Config must be loaded before this immutable
++ * host getter; it touches no PSO/device. One component-screened symbol only. */
++enum { DK_REQUESTS,DK_ELIGIBLE,DK_ENCODED,DK_REFERENCES,DK_FALLBACKS,DK_FAILURES,DK_COUNT };
++static _Atomic uint64_t decode_kv_counts[DK_COUNT];
++static pthread_once_t decode_kv_once=PTHREAD_ONCE_INIT;
++static int decode_kv_mode;
++static const char decode_kv_symbol[]="kernel_myds_probe_kv_only_finish";
++static void decode_kv_init(void) {
++    const char *v=getenv("MYDS_DECODE_KV_ONLY_FINISH");
++    if(!v||!strcmp(v,"0"))decode_kv_mode=0;
++    else if(!strcmp(v,"1"))decode_kv_mode=1;
++    else { decode_kv_mode=-1; MYDS_LOG_E("MYDS_DECODE_KV_ONLY_FINISH must be absent, 0 or 1"); }
++}
++int myds_v41_gpu_decode_kv_only_finish_enabled(void) {
++    pthread_once(&decode_kv_once,decode_kv_init); return decode_kv_mode;
++}
++const char *myds_v41_gpu_decode_kv_only_finish_selected_kernel(void) {
++    return myds_v41_gpu_decode_kv_only_finish_enabled()==1?decode_kv_symbol:NULL;
++}
++void myds_v41_gpu_decode_kv_only_finish_counters(
++    myds_v41_gpu_decode_kv_only_finish_counters_t *out,bool reset) {
++    uint64_t v[DK_COUNT];
++    for(unsigned i=0;i<DK_COUNT;i++)v[i]=reset?
++        atomic_exchange_explicit(&decode_kv_counts[i],0u,memory_order_relaxed):
++        atomic_load_explicit(&decode_kv_counts[i],memory_order_relaxed);
++    if(out)*out=(myds_v41_gpu_decode_kv_only_finish_counters_t){v[0],v[1],v[2],v[3],v[4],v[5]};
++}
++static int decode_kv_failure(const char *reason) {
++    atomic_fetch_add_explicit(&decode_kv_counts[DK_FAILURES],1u,memory_order_relaxed);
++    MYDS_LOG_E("Decode KV-only finish failed: %s; refusing eligible fallback",reason); return 0;
++}
+ static int floats(const myds_metal_buffer_t *b,uint64_t n) {
+     return b && n && n<=myds_metal_buffer_size(b)/4 && myds_metal_buffer_offset(b)%4==0;
+ }
+@@ -186,7 +217,8 @@
+     return s ? myds_metal_buffer_size(s->kv_chunk)+myds_metal_buffer_size(s->mask_chunk) : 0;
+ }
+ myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp) {
+-    if (myds_v41_gpu_indexer_k_resident_enabled()<0 ||
++    if (myds_v41_gpu_decode_kv_only_finish_enabled()<0 ||
++        myds_v41_gpu_indexer_k_resident_enabled()<0 ||
+         myds_v41_gpu_attention_packed_register_enabled()<0 || myds_v41_attention_rope_fuse_enabled()<0 ||
+         myds_v41_gpu_attention_direct_pack_fuse_enabled()<0) return NULL;
+     if(!max_comp || max_comp>1048576) return NULL;
+@@ -470,6 +502,54 @@
+     memcpy(a.frequencies,rope_frequencies[compressed?1:0],sizeof(a.frequencies));
+     const myds_metal_buffer_t *b[]={q,kv,window};
+     return dispatch("kernel_dsv41_qkv_finish",&a,sizeof(a),b,3,80,1,1,32,1,1,0);
++}
++static int decode_kv_reference(myds_metal_buffer_t *q,myds_metal_buffer_t *kv,
++    myds_metal_buffer_t *window,uint32_t pos,bool compressed) {
++    atomic_fetch_add_explicit(&decode_kv_counts[DK_REFERENCES],1u,memory_order_relaxed);
++    if(!myds_v41_gpu_qkv_finish(q,kv,window,pos,compressed))return decode_kv_failure("reference encode");
++    return 1;
++}
++/* Only the caller-proven dead dummy Q may use this API. No public reference
++ * API or index-source/spec/batch2 call is redirected here. Preserve all caller
++ * joins, including partial, and every mode/failure boundary. */
++int myds_v41_gpu_decode_kv_only_finish_scoped(myds_v41_gpu_scratch_t *scratch,
++    myds_metal_buffer_t *dummy_q,myds_metal_buffer_t *kv,myds_metal_buffer_t *window,
++    uint32_t layer,uint32_t pos,bool compressed,bool ordinary_allowed) {
++    atomic_fetch_add_explicit(&decode_kv_counts[DK_REQUESTS],1u,memory_order_relaxed);
++    const int mode=myds_v41_gpu_decode_kv_only_finish_enabled();
++    if(mode<0)return decode_kv_failure("invalid mode");
++    if(!mode)return decode_kv_reference(dummy_q,kv,window,pos,compressed);
++    const bool index_source=layer==2u||layer==8u||layer==14u||layer==20u||
++        (layer>=24u&&layer<40u&&layer%4u==0u);
++    const bool policy=ordinary_allowed&&!myds_trace_active()&&layer<40u&&!index_source&&pos<327680u&&
++        myds_v41_attn_kv_reuse_enabled()==1&&myds_v41_attention_rope_fuse_enabled()==1&&
++        myds_v41_gpu_attention_packed_register_enabled()==1&&
++        myds_v41_gpu_attention_flash_dec_enabled()==0&&myds_metal_batch_active()&&
++        !myds_metal_kprof_exclusive()&&!myds_metal_get_auto_barrier()&&myds_metal_get_concurrent();
++    if(!policy)return decode_kv_reference(dummy_q,kv,window,pos,compressed);
++    atomic_fetch_add_explicit(&decode_kv_counts[DK_ELIGIBLE],1u,memory_order_relaxed);
++    const size_t partial_bytes=64u*514u*32u*4u;
++    if(!scratch||dummy_q!=scratch->partial||compressed!=(layer>=2u)||
++       !myds_metal_buffer_native_range(dummy_q,partial_bytes,16u)||
++       !myds_metal_buffer_native_range(kv,2048u,16u)||
++       !myds_metal_buffer_native_range(window,262144u,16u)||
++       buffer_ranges_overlap(dummy_q,partial_bytes,kv,2048u)||
++       buffer_ranges_overlap(dummy_q,partial_bytes,window,262144u)||
++       buffer_ranges_overlap(kv,2048u,window,262144u))
++        return decode_kv_failure("owned complete native ranges/alignment/alias/compressed scope");
++    const uint32_t threads[]={32u,1u,1u};
++    if(!myds_metal_kernel_constants_preflight(decode_kv_symbol,threads,0u,NULL,0u))
++        return decode_kv_failure("required screened PSO unavailable");
++    pthread_once(&rope_once,init_rope);
++    struct { uint32_t pos,pad; float frequencies[32]; } a={pos,0u,{0}};
++    _Static_assert(sizeof(a)==136u,"screened original finish ABI");
++    _Static_assert(offsetof(__typeof__(a),frequencies)==8u,"screened frequency offset");
++    memcpy(a.frequencies,rope_frequencies[compressed?1:0],sizeof(a.frequencies));
++    const myds_metal_buffer_t *buffers[]={dummy_q,kv,window};
++    if(!dispatch(decode_kv_symbol,&a,sizeof(a),buffers,3u,80u,1u,1u,32u,1u,1u,0u))
++        return decode_kv_failure("candidate encode rejected");
++    atomic_fetch_add_explicit(&decode_kv_counts[DK_ENCODED],1u,memory_order_relaxed);
++    return 1;
+ }
+ /* 整 chunk 的 pool2：tail=0 ⇒ 第 p 对读 kv/scores 的第 2p、2p+1 行，
+  * 与逐 token 版（previous_* 保存前一个偶数位）结果逐位相同：每个输出元素独立计算。 */
+--- a/src/myds_v41_moe.c
++++ b/src/myds_v41_moe.c
+@@ -2438,7 +2438,8 @@
+                     args->attn_scale, args->attn_base, 5120u, args->hc_eps));
+                 atomic_fetch_add_explicit(&attn_hc_overlap_encoded, 1, memory_order_relaxed);
+             }
+-            STAGE_CHECK(myds_v41_gpu_qkv_finish(partial_scratch, ctx->kv_act, args->window, pos, compressed));
++            STAGE_CHECK(myds_v41_gpu_decode_kv_only_finish_scoped(args->gpu_scratch,
++                partial_scratch,ctx->kv_act,args->window,il,pos,compressed,ordinary_decode_allowed&&!trace_on));
+             STAGE_CHECK(myds_metal_dense_q4_v41(ctx->q, base->attn_q_b, ctx->qr_norm, 64u * 512u, 1280u, true));
+             const myds_metal_buffer_t *cohort4[] = {
+                 ctx->q, args->window, partial_scratch, kv_f16_scratch,

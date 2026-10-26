@@ -1,0 +1,48 @@
+{
+  "kind": "final_readonly_postrun_identity",
+  "time_epoch": 1792947246.789762,
+  "canonical_unchanged": true,
+  "canonical": [
+    {
+      "path": "/Users/fangqingyuan/Projects/myds/bin/myds",
+      "bytes": 937240,
+      "sha256": "2b4d56958c1b3c16223f109c7a1e860b6153ad88e5c85fc70dcd44c98012cb83",
+      "matches_frozen": true
+    },
+    {
+      "path": "/Users/fangqingyuan/Projects/myds/bin/myds.metallib",
+      "bytes": 4277140,
+      "sha256": "3837102396703da59e0eebbc0de1fdc58b68b3a3a5ec5d07504b351c67a29ba9",
+      "matches_frozen": true
+    },
+    {
+      "path": "/Users/fangqingyuan/Projects/myds/build/myds_all.metal",
+      "bytes": 1574167,
+      "sha256": "bc6603c97ec24af7597f6b10c7ed2a7bfe1344379733a0a4df780250a13f3224",
+      "matches_frozen": true
+    },
+    {
+      "path": "/Users/fangqingyuan/Projects/myds/build/myds_all.air",
+      "bytes": 1281840,
+      "sha256": "09d67ef89c8d227ba8142f65efe49cf6e1ccfd661a1820d35719cd308814f617",
+      "matches_frozen": true
+    },
+    {
+      "path": "/Users/fangqingyuan/Projects/myfleet/myds.conf",
+      "bytes": 6815,
+      "sha256": "0a3524b030a73916f7684d841b912c6e978c680825a3c3520ca18188f35a2cff",
+      "matches_frozen": true
+    }
+  ],
+  "model_stat_and_prefix": {
+    "bytes": 362142629888,
+    "inode": 8037134,
+    "mtime_ns": 1792321832447159977,
+    "prefix_bytes": 1048576,
+    "prefix_sha256": "43948333c8eb0172613384abb5d5e1fe2fd02f40a1ede88afc1cbf22bef1cb68"
+  },
+  "whole_model_payload_sha256_verified": false,
+  "recognized_model_benchmark_processes": [],
+  "production_deployment_performed": false,
+  "service_mutation_performed": false
+}

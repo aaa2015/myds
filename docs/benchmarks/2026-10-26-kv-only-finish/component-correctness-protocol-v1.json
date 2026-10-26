@@ -1,0 +1,94 @@
+{
+  "M4_and_M2_separate_device_judgments": true,
+  "all_provider_geometry": {
+    "args_bytes": 136,
+    "dynamic_tg_bytes": 0,
+    "groups": [
+      80,
+      1,
+      1
+    ],
+    "post_dispatch_resource_barrier": [
+      "dummy_q",
+      "kv",
+      "window"
+    ],
+    "slots": [
+      "args",
+      "dummy_q",
+      "kv",
+      "window"
+    ],
+    "threads": [
+      32,
+      1,
+      1
+    ]
+  },
+  "binary_sha256": "02fbae976b68ec8c24ec6b0298e4452e5369629069d24156bae70bdf77452660",
+  "build_manifest_path": "/tmp/myds-kv-only-finish-probe-final-v1-20261025/source-identity.json",
+  "build_manifest_sha256": "5d8d279bd6d6287402d71dabec84c89c5fb1b6740547ab7ced87fe24e690b2c4",
+  "candidate_symbol": "kernel_myds_probe_kv_only_finish",
+  "cases": 114,
+  "dispatches_per_command_buffer": 1,
+  "expected_phase1_command_buffers": 342,
+  "fullmodel_gate_needed_after_component": true,
+  "golden_metallib_path": "/tmp/myds-indexer-r2-real-local-20261025/deployed/myds.metallib",
+  "golden_metallib_sha256": "3837102396703da59e0eebbc0de1fdc58b68b3a3a5ec5d07504b351c67a29ba9",
+  "gpu_submitted_during_preparation": false,
+  "kind": "kv_only_finish_frozen_component_correctness_protocol",
+  "must_pass": [
+    "Actual gold versus full-TU native: complete dummy_q, KV and whole window bytes exactly equal.",
+    "Candidate versus actual gold: complete 512 F32 KV and all 65536 F32 window cells exactly equal.",
+    "Candidate dummy_q complete128KiB exactly equals before bytes; native dummy output may differ from before and is not candidate oracle.",
+    "All guards for all roles/providers remainA5; full window slots exceptpos%128 unchanged; current slot512values exactly equals complete KV.",
+    "All semantic KV/window F32 values finite and BF16, inputs/args/provenance hashes re-read independently.",
+    "Explicit path/PSO/grid binding witnesses, no fallback, GPU completion status for every CB.",
+    "Everycase/provider complete raw saved even if any numerical gate fails; no timing after numerical failure."
+  ],
+  "native_source_prefix_sha256": "bc6603c97ec24af7597f6b10c7ed2a7bfe1344379733a0a4df780250a13f3224",
+  "native_symbol": "kernel_dsv41_qkv_finish",
+  "positions": {
+    "every_narrow_layer": [
+      0,
+      1,
+      327679
+    ],
+    "extra_layers": [
+      0,
+      3,
+      39
+    ],
+    "extra_positions": [
+      127,
+      128,
+      16383,
+      16384,
+      65535,
+      65536
+    ]
+  },
+  "probe_metallib_sha256": "d12ddb1ec806f1daa3848e9687e468aba3ea80d1e91aa3d4081c16eb4852facd",
+  "providers": [
+    "actual deployed original qkv_finish",
+    "full-TU probe native original qkv_finish",
+    "full-TU candidate KV-only qkv_finish"
+  ],
+  "raw_schema": {
+    "after": "phase1.caseNNN.providerP.{dummy_q,kv,window}.raw with .prefix-guard.raw and .suffix-guard.raw",
+    "before": "caseNNN.{dummy_q,kv,window}.before.raw and caseNNN.args136.raw",
+    "jsonl": "stdout JSON lines kinds case/host_contract/loaded_library/pipeline/gpu_completion/parity; failures persist manifest/stderr",
+    "manifest": "artifact-manifest.json carries every file size/SHA and all parity/completion/counter records",
+    "sizes": {
+      "args": 136,
+      "dummy_q": 131072,
+      "each_guard": 64,
+      "kv": 2048,
+      "window": 262144
+    }
+  },
+  "schema_version": 1,
+  "scope": "synthetic correctness only; no runtime selection or adoption",
+  "superseded_unrun_draft": "/tmp/myds-kv-only-finish-probe-build-v1-20261025 used16TG; noGPU and not this protocol",
+  "timing_requested_by_this_protocol": false
+}

@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "kind": "register_only_head_control_v2_CPU_IR_gate",
+  "v1_native_and_v1_probe_and_v2_native_instructions_equal_after_metadata_ID_normalization_and_resolved_attributes": true,
+  "native_metadata_graph_identity_not_independently_proven_by_ID_stripping": true,
+  "v1_candidate_equals_v2_before_head_epilogue_after_ID_normalization": true,
+  "v2_head_fmul_count": 4,
+  "v2_head_fadd_count": 2,
+  "v2_head_has_contract_or_reassoc_flags": false,
+  "v2_head_instructions": [
+    "  %177 = fmul nnan ninf nsz arcp afn float %174, %176",
+    "  %179 = fmul nnan ninf nsz arcp afn float %177, %178",
+    "  %180 = fadd nnan ninf nsz arcp afn float %126, %179",
+    "  %194 = fmul nnan ninf nsz arcp afn float %191, %193",
+    "  %196 = fmul nnan ninf nsz arcp afn float %194, %195",
+    "  %197 = fadd nnan ninf nsz arcp afn float %127, %196"
+  ],
+  "MMA_intrinsic_type_and_16_block_order_unchanged": true,
+  "global_compile_flags_unchanged": [
+    "-mmacosx-version-min=15.0",
+    "-O3",
+    "-ffast-math",
+    "-DDS4_METAL_HC_STABLE=1",
+    "-DDS4_METAL_NORM_RSQRT_DISABLE=1"
+  ],
+  "native_source_sha256": "bc6603c97ec24af7597f6b10c7ed2a7bfe1344379733a0a4df780250a13f3224",
+  "evidence_limit": "AIR is before device backend. No GPU execution or proof that device code honors the intended rounding has occurred.",
+  "v2_build_manifest": {
+    "path": "/private/tmp/myds-register-only-head-control-build-v2-20261026/build-manifest.json",
+    "bytes": 4509,
+    "sha256": "f6d7d3575ad52dbb3d939ae89fa7655db71cea2725e6bc4defa39c42859f9874"
+  },
+  "v2_library": {
+    "path": "/private/tmp/myds-register-only-head-control-build-v2-20261026/probe.metallib",
+    "bytes": 4283287,
+    "sha256": "fe55793346e15119fce4e0f40d4bf6d3023fc3694ffc231e66b8a89e3ae0f74d"
+  },
+  "v1_source_snapshot": {
+    "path": "/tmp/myds-register-only-mma-diagnostic-v1-20261026/snapshot-manifest.json",
+    "bytes": 1277,
+    "sha256": "e193379f5961756208da43db87aa413d39c5a0f336a1e52a2049cc40d2bf7b6d"
+  },
+  "v2_source_inverse": {
+    "path": "/tmp/myds-register-only-mma-diagnostic-v1-20261026/head-control-v2/source-transform.json",
+    "bytes": 4345,
+    "sha256": "6349b4aa38f5b14e3c3847a3c14326edd8d68773e2d677727b1fd26aa0757a71"
+  },
+  "GPU_work_submitted": false,
+  "numerical_passed": false,
+  "performance_evaluated": false
+}

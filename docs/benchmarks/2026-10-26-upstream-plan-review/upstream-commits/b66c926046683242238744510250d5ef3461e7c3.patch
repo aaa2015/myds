@@ -1,0 +1,452 @@
+commit b66c926046683242238744510250d5ef3461e7c3
+Author:     Mark Shank <mark.shank@gmail.com>
+AuthorDate: Wed Oct 21 11:52:09 2026 -0400
+Commit:     Mark Shank <mark.shank@gmail.com>
+CommitDate: Wed Oct 21 15:49:18 2026 -0400
+
+    Compile V4.1's fixed decode shapes into its decode matvecs
+    
+    Some V4.1 decode matrix-vector products always run with the same sizes: the attention q_a and kv projections, the MoE gate and up projections, the attention output projection and the FFN's hyper-connection merge. They now use kernel variants with those sizes written in as constants, so the compiler can unroll the loops and fold the index math. The results are bit-identical. This extends Ivan Fioravanti's fixed-size kernels to more calls.
+    
+    DS4_METAL_DISABLE_V41_LITERAL_SHAPES=1 uses the general kernels.
+
+diff --git a/ds4_gpu.h b/ds4_gpu.h
+index 835a447..5469742 100644
+--- a/ds4_gpu.h
++++ b/ds4_gpu.h
+@@ -50,6 +50,7 @@ void ds4_gpu_cleanup(void);
+  * "0" means not set. */
+ enum {
+     DS4_GPU_V41_DEFERRED_HC = 1u << 0,
++    DS4_GPU_V41_LITERAL_SHAPES = 1u << 1,
+ };
+ uint32_t ds4_gpu_v41_off(void);
+ #endif
+diff --git a/ds4_metal.m b/ds4_metal.m
+index 9f8f485..21a00eb 100644
+--- a/ds4_metal.m
++++ b/ds4_metal.m
+@@ -442,6 +442,7 @@ uint32_t ds4_gpu_v41_off(void) {
+     if (!g_v41_off_read) {
+         static const char *names[] = {   /* in bit order */
+             "DS4_METAL_DISABLE_V41_DEFERRED_HC",
++            "DS4_METAL_DISABLE_V41_LITERAL_SHAPES",
+         };
+         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
+             const char *v = getenv(names[i]);
+@@ -501,6 +502,8 @@ static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route
+ static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_sum6_fixed_route_pipeline_nsg1;
+ static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_pipeline_nsg1;
+ static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_pipeline_nsg1;
++/* The same pair at the V4.1 Flash shape with that shape as literals (nil: the static pipeline above serves it). */
++static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_pipeline_nsg1;
+ static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_pipeline_nsg1;
+ static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_pair_swiglu_tp_static_pipeline_nsg1;
+ static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_sum6_tp_full_rows_static_pipeline_nsg1;
+@@ -8304,6 +8307,9 @@ int ds4_gpu_init(void) {
+         g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_pipeline_nsg1 =
+             ds4_gpu_new_mul_mv_tg_multiple_pipeline(
+                 "kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_f32", 1);
++        g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_pipeline_nsg1 =
++            ds4_gpu_new_mul_mv_tg_multiple_pipeline(
++                "kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_f32", 1);
+         g_moe_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_pipeline_nsg1 =
+             ds4_gpu_new_mul_mv_tg_multiple_pipeline(
+                 "kernel_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_f32", 1);
+@@ -11913,6 +11919,7 @@ void ds4_gpu_cleanup(void) {
+         g_moe_mul_mv_id_mxfp4_sum6_fixed_route_pipeline_nsg1 = nil;
+         g_moe_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_pipeline_nsg1 = nil;
+         g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_pipeline_nsg1 = nil;
++        g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_pipeline_nsg1 = nil;
+         g_moe_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_pipeline_nsg1 = nil;
+         g_moe_mul_mv_id_mxfp4_pair_swiglu_tp_static_pipeline_nsg1 = nil;
+         g_moe_mul_mv_id_mxfp4_sum6_tp_full_rows_static_pipeline_nsg1 = nil;
+@@ -20206,8 +20213,13 @@ int ds4_gpu_dsv41_project_pair_q8(ds4_gpu_tensor *out_a, ds4_gpu_tensor *out_b,
+         ds4_gpu_q8_0_matvec_args args_a = ds4_gpu_make_q8_0_mv_args(in_dim, out_a_dim);
+         ds4_gpu_q8_0_matvec_args args_b = ds4_gpu_make_q8_0_mv_args(in_dim, out_b_dim);
+         args_a.nr0 = args_b.nr0 = dispatch.nr0;
++        /* the V4.1 q_a/kv shape: the kernel with that shape's arguments as literals */
++        const bool literal = in_dim == 5120u && out_a_dim == 1280u && out_b_dim == 512u && dispatch.nr0 == 2 &&
++            ds4_gpu_v41_on(DS4_GPU_V41_LITERAL_SHAPES);
++        if (literal) DS4_TEST_NOTE("kernel_mul_mv_q8_0_f32_bf16_pair_qa_kv");
+         id<MTLComputePipelineState> pipeline =
+-            ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_q8_0_f32_bf16_pair", dispatch.nsg);
++            ds4_gpu_get_mul_mv_pipeline(literal ? "kernel_mul_mv_q8_0_f32_bf16_pair_qa_kv"
++                                                : "kernel_mul_mv_q8_0_f32_bf16_pair", dispatch.nsg);
+         if (!pipeline) return 0;
+         const NSUInteger nr0 = (NSUInteger)dispatch.nr0;
+         const NSUInteger groups = ((NSUInteger)out_a_dim + nr0 - 1u) / nr0 +
+@@ -41724,6 +41736,17 @@ int ds4_gpu_routed_moe_one_tensor(
+                 pair_swiglu_nsg = 1;
+             }
+         }
++        /* the static-trip pair at the V4.1 Flash shape (every literal its kernel assumes is checked here) */
++        if (pair_swiglu_pipeline == g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_pipeline_nsg1 &&
++            use_mxfp4_moe_decode_static_trip_pair && pair_swiglu_nsg == 1 &&
++            gate_args.ne00 == 5120 && gate_args.ne01 == 2304 && gate_args.ne02 == 384 && gate_args.nb01 == 2720 &&
++            gate_args.nb02 == 2304ull * 2720ull && gate_args.ne0 == 2304 && gate_args.nei0 == 6 && gate_args.nei1 == 1 &&
++            gate_args.ne11 == 1 && gate_args.tp_world == 1 && gate_args.tp_expert_base == 0 &&
++            g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_pipeline_nsg1 != nil &&
++            ds4_gpu_v41_on(DS4_GPU_V41_LITERAL_SHAPES)) {
++            pair_swiglu_pipeline = g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_pipeline_nsg1;
++            DS4_TEST_NOTE("kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_f32");
++        }
+         const bool use_iq2_pair_pack2 =
+             gate_type == DS4_METAL_TENSOR_IQ2_XXS && n_tokens == 1 &&
+             n_expert == 6 && n_total_expert == 256 &&
+@@ -47187,7 +47210,14 @@ static int ds4_gpu_hc_expand_split_impl(
+         };
+         id<MTLComputePipelineState> expand_pipeline = g_hc_expand_pipeline;
+         uint64_t n_elem = (uint64_t)n_embd * n_hc * n_tokens64;
+-        if (n_hc == 4) {
++        /* the single-host one-token join with an add and bf16 rounding (the V4.1 decode FFN join) */
++        const bool literal = n_hc == 4 && n_embd == 5120 && n_tokens64 == 1 && block_add && round_bf16 &&
++            !ds4_gpu_tp_world_is_two() && ds4_gpu_v41_on(DS4_GPU_V41_LITERAL_SHAPES);
++        if (literal) {
++            expand_pipeline = ds4_gpu_get_pipeline("kernel_dsv4_hc_expand4_serial_add_bf16");
++            n_elem = (uint64_t)n_embd;
++            DS4_TEST_NOTE("kernel_dsv4_hc_expand4_serial_add_bf16");
++        } else if (n_hc == 4) {
+             expand_pipeline = ds4_gpu_hot_pipeline(g_dsv4_hc_expand4_pipeline,
+                                                       "kernel_dsv4_hc_expand4");
+             n_elem = (uint64_t)n_embd * n_tokens64;
+@@ -49456,6 +49486,12 @@ int ds4_gpu_dsv41_matmul_expand_rows(ds4_gpu_tensor *out_hc, const void *model_m
+         id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(
+             rows > 1u ? "kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_rows_seq4" : "kernel_mul_mv_q8_0_f32_bf16io_hc_expand4",
+             dispatch.nsg);
++        /* the one-row 8192 -> 5120 call without an add (the single-host attention output-B) */
++        if (rows == 1u && in_dim == 8192u && out_dim == 5120u && !add && dispatch.nr0 == 2 &&
++            ds4_gpu_v41_on(DS4_GPU_V41_LITERAL_SHAPES)) {
++            pipeline = ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_static", dispatch.nsg);
++            DS4_TEST_NOTE("kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_static");
++        }
+         if (!pipeline) return 0;
+         int owned = 0;
+         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+diff --git a/metal/dense.metal b/metal/dense.metal
+index b918534..1bb9637 100644
+--- a/metal/dense.metal
++++ b/metal/dense.metal
+@@ -823,6 +823,37 @@ kernel void kernel_mul_mv_q8_0_f32_bf16io_hc_expand4(
+         args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, nullptr, &hc, add, residual, post, comb);
+ }
+ 
++/* A one-row Q8_0 matvec's arguments (nr0 2); called with literals, they fold into the address arithmetic. */
++static inline ds4_metal_args_mul_mv ds4_q8_0_static_args(int in, int out) {
++    const ulong row = (ulong)(in / 32) * 34;
++    return ds4_metal_args_mul_mv{in, out, 1, 34, row, row * out, row * out, in, 1, 1, 4,
++                                 (ulong)in * 4, (ulong)in * 4, (ulong)in * 4, out, 1, 2, 1, 1};
++}
++
++/* Attention output-B into the HC streams at its V4.1 shape (8192 -> 5120) as literals. */
++constant ds4_metal_args_mv_hc_expand4 ds4_hc_static_8192_5120 = { /*.n_embd =*/ 5120, /*.has_add =*/ 0, /*.split_stride =*/ 24 };
++
++[[host_name("kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_static")]]
++kernel void kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_static(
++        constant ds4_metal_args_mul_mv & args,
++        device const char * src0,
++        device const char * src1,
++        device       char * dst,
++        constant ds4_metal_args_mv_hc_expand4 & hc,
++        device const float * add,
++        device const float * residual,
++        device const float * post,
++        device const float * comb,
++        threadgroup  char * shmem [[threadgroup(0)]],
++        uint3  tgpig[[threadgroup_position_in_grid]],
++        ushort tiisg[[thread_index_in_simdgroup]],
++        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
++    (void)args; (void)hc;
++    ds4_metal_args_mul_mv sa = ds4_q8_0_static_args(8192, 5120);
++    kernel_mul_mv_q8_0_f32_rope_impl<N_R0_Q8_0, thread ds4_metal_args_mul_mv &, true, true, false, false, true>(
++        sa, src0, src1, dst, shmem, tgpig, tiisg, sgitg, nullptr, &ds4_hc_static_8192_5120, add, residual, post, comb);
++}
++
+ // Two Q8_0 matrices over one activation row in one dispatch: the leading
+ // threadgroups take the first matrix's row groups, the rest the second's.
+ [[host_name("kernel_mul_mv_q8_0_f32_bf16_pair")]]
+@@ -847,6 +878,31 @@ kernel void kernel_mul_mv_q8_0_f32_bf16_pair(
+     }
+ }
+ 
++/* The q_a/kv pair at its V4.1 decode shape (5120 -> 1280, 5120 -> 512) as literals. */
++[[host_name("kernel_mul_mv_q8_0_f32_bf16_pair_qa_kv")]]
++kernel void kernel_mul_mv_q8_0_f32_bf16_pair_qa_kv(
++        constant ds4_metal_args_mul_mv & args_a,
++        constant ds4_metal_args_mul_mv & args_b,
++        device const char * src0_a,
++        device const char * src0_b,
++        device const char * src1,
++        device       char * dst_a,
++        device       char * dst_b,
++        threadgroup  char * shmem [[threadgroup(0)]],
++        uint3  tgpig[[threadgroup_position_in_grid]],
++        ushort tiisg[[thread_index_in_simdgroup]],
++        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
++    (void)args_a; (void)args_b;
++    if (tgpig.x < 640u) {
++        ds4_metal_args_mul_mv sa = ds4_q8_0_static_args(5120, 1280);
++        kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, thread ds4_metal_args_mul_mv &, true>(sa, src0_a, src1, dst_a, shmem, tgpig, tiisg, sgitg);
++    } else {
++        ds4_metal_args_mul_mv sa = ds4_q8_0_static_args(5120, 512);
++        tgpig.x -= 640u;
++        kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, thread ds4_metal_args_mul_mv &, true>(sa, src0_b, src1, dst_b, shmem, tgpig, tiisg, sgitg);
++    }
++}
++
+ // Q8_0 matvec whose output is this rank's TP partial in its slab slot: same
+ // K walk and reduction tree as kernel_mul_mv_q8_0_f32_impl, plus the checked
+ // poll-gate flag published by the last-arriving threadgroup (see
+diff --git a/metal/dsv4_hc.metal b/metal/dsv4_hc.metal
+index ff5ef9a..eb9bf41 100644
+--- a/metal/dsv4_hc.metal
++++ b/metal/dsv4_hc.metal
+@@ -751,6 +751,39 @@ kernel void kernel_dsv4_hc_expand4(
+     }
+ }
+ 
++// kernel_dsv4_hc_expand4 at the V4.1 FFN join's shape (5120 x 4, one token, add and bf16 rounding) as literals.
++kernel void kernel_dsv4_hc_expand4_serial_add_bf16(
++        device  const float * block_out [[buffer(1)]],
++        device  const float * residual  [[buffer(2)]],
++        device  const float * post      [[buffer(3)]],
++        device  const float * comb      [[buffer(4)]],
++        device  const float * block_add [[buffer(5)]],
++        device        float * dst       [[buffer(6)]],
++        uint gid [[thread_position_in_grid]]) {
++    if (gid >= 5120u) {
++        return;
++    }
++
++    const uint d = gid;
++    const float block_v = ds4_bf16_round(block_out[d] + block_add[d]);
++
++    const float r0 = residual[d];
++    const float r1 = residual[5120u + d];
++    const float r2 = residual[2u*5120u + d];
++    const float r3 = residual[3u*5120u + d];
++
++    for (uint dst_hc = 0; dst_hc < 4u; ++dst_hc) {
++        float acc = block_v * post[dst_hc];
++
++        acc += comb[dst_hc + 0u] * r0;
++        acc += comb[dst_hc + 4u] * r1;
++        acc += comb[dst_hc + 8u] * r2;
++        acc += comb[dst_hc + 12u] * r3;
++
++        dst[dst_hc*5120u + d] = ds4_bf16_round(acc);
++    }
++}
++
+ // Decode-time FFN tail fusion:
+ //
+ //     shared_out = shared_mid @ Wshared_down
+diff --git a/metal/moe.metal b/metal/moe.metal
+index 8fbe597..43ae3a7 100644
+--- a/metal/moe.metal
++++ b/metal/moe.metal
+@@ -5018,6 +5018,51 @@ kernel void kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_f32(
+     (void)tiitg;
+ }
+ 
++/* kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_f32 at the V4.1 shape (5120 -> 2304, 384 experts, six
++ * selected, one token) with every shape and stride as literals. */
++kernel void kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_f32(
++        constant ds4_metal_args_mul_mv_id &args,
++        constant ds4_metal_dsv4_moe_swiglu_weight_args &act,
++        device const char *src0_gate,
++        device const char *src0_up,
++        device const char *src1,
++        device char *dst_gate,
++        device char *dst_up,
++        device char *dst_mid,
++        device const char *ids,
++        device const char *weights,
++        threadgroup char *shmem [[threadgroup(0)]],
++        uint3 tgpig [[threadgroup_position_in_grid]],
++        ushort tiitg [[thread_index_in_threadgroup]],
++        ushort tiisg [[thread_index_in_simdgroup]],
++        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
++    constexpr uint64_t V41_ROWS = 2304, V41_EXPERT_BYTES = 2304ull * 2720ull;
++    (void)args;
++    ds4_metal_args_mul_mv_id sa = {};
++    sa.nei0 = 6; sa.nei1 = 1; sa.nbi1 = 24;
++    sa.ne00 = 5120; sa.ne01 = 2304; sa.ne02 = 384;
++    sa.nb00 = 136; sa.nb01 = 2720; sa.nb02 = V41_EXPERT_BYTES;
++    sa.ne10 = 5120; sa.ne11 = 1; sa.ne12 = 1; sa.ne13 = 1;
++    sa.nb10 = 4; sa.nb11 = 20480; sa.nb12 = 20480;
++    sa.ne0 = 2304; sa.ne1 = 6; sa.nb1 = 9216; sa.nr0 = N_R0_MXFP4;
++    sa.tp_rank = 0; sa.tp_world = 1; sa.tp_addend = 0; sa.tp_expert_base = 0;
++    const int idx = (int)tgpig.z;
++    const int32_t expert = ((device const int32_t *)ids)[idx];
++    const uint64_t pair_row = (uint64_t)idx;
++    device const float *route = (device const float *)(weights + pair_row * sizeof(float));
++    device char *gate_cur = dst_gate + pair_row * V41_ROWS * sizeof(float);
++    device char *up_cur = dst_up + pair_row * V41_ROWS * sizeof(float);
++    device char *mid_cur = dst_mid + pair_row * V41_ROWS * sizeof(float);
++    device const char *gate_expert = src0_gate + (int64_t)expert * (int64_t)V41_EXPERT_BYTES;
++    device const char *up_expert = src0_up + (int64_t)expert * (int64_t)V41_EXPERT_BYTES;
++    tgpig.z = 0;
++    kernel_mul_mv_mxfp4_pair_swiglu_static_impl<thread ds4_metal_args_mul_mv_id &,
++        DS4_MXFP4_PAIR_STATIC_NB_V41, DS4_MXFP4_PAIR_STATIC_NB_V41>(
++        sa, act, gate_expert, up_expert, src1, gate_cur, up_cur, mid_cur,
++        route[0], shmem, tgpig, tiisg, sgitg);
++    (void)tiitg;
++}
++
+ /* TP-safe exact-shape sibling. The resident model view starts at this rank's
+  * first expert, while IDs remain global, so preserve the ownership test and
+  * rebase before entering the same compile-time-unrolled implementation. */
+diff --git a/tests/test_deepseek41_metal.c b/tests/test_deepseek41_metal.c
+index 3ac8e81..889d97e 100644
+--- a/tests/test_deepseek41_metal.c
++++ b/tests/test_deepseek41_metal.c
+@@ -5,6 +5,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <sys/mman.h>
+ #include <time.h>
+ #include <unistd.h>
+ 
+@@ -733,6 +734,120 @@ static int check_sparse_gather(void) {
+     return 1;
+ }
+ 
++#ifdef __APPLE__
++/* Random Q8_0 weights [rows][cols] at page-aligned memory (scales around 2^-8). */
++static void *q8_weights(uint32_t rows, uint32_t cols, uint64_t *bytes) {
++    typedef struct { uint16_t d; int8_t qs[32]; } q8_block;
++    *bytes = (uint64_t)rows * cols / 32 * sizeof(q8_block);
++    void *model = NULL;
++    if (posix_memalign(&model, getpagesize(), *bytes) != 0) return NULL;
++    q8_block *w = model;
++    for (uint64_t i = 0; i < *bytes / sizeof(*w); i++) {
++        w[i].d = (uint16_t)(0x1c00 + (int)(random_value() * 8192) % 1024);
++        for (int j = 0; j < 32; j++) w[i].qs[j] = (int8_t)((int)(random_value() * 8192) % 127);
++    }
++    return model;
++}
++
++/* Run one call as built, where kernel must run once, then with the V4.1 paths in off; the outputs must match. */
++#define LITERAL_PAIR(off, kernel, out, bytes, call) do { \
++        const uint64_t runs_ = ds4_gpu_test_kernel_runs(kernel); \
++        CHECK(ds4_gpu_begin_commands() && (call) && ds4_gpu_end_commands() && ds4_gpu_synchronize()); \
++        CHECK(ds4_gpu_test_kernel_runs(kernel) == runs_ + 1); \
++        void *lit_ = malloc(bytes); \
++        CHECK(lit_); \
++        memcpy(lit_, ds4_gpu_tensor_contents(out), bytes); \
++        ds4_gpu_test_set_v41_off(off); \
++        const int gen_ok_ = ds4_gpu_begin_commands() && (call) && ds4_gpu_end_commands() && ds4_gpu_synchronize(); \
++        ds4_gpu_test_set_v41_off(0); \
++        CHECK(gen_ok_ && ds4_gpu_test_kernel_runs(kernel) == runs_ + 1); \
++        CHECK(!memcmp(lit_, ds4_gpu_tensor_contents(out), bytes)); \
++        free(lit_); \
++    } while (0)
++
++/* The V4.1 decode calls that take literal-shape kernels give the generic kernels' bits. */
++static int check_literal_shapes(void) {
++    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
++    {   /* attention output-B into the HC streams: 8192 -> 5120, one row, no add */
++        uint64_t wb = 0;
++        void *model = q8_weights(5120, 8192, &wb);
++        CHECK(model && ds4_gpu_set_model_map(model, wb));
++        ds4_gpu_tensor *x = upload(NULL, 8192 * 4), *res = upload(NULL, 4 * 5120 * 4), *split = upload(NULL, 24 * 4);
++        ds4_gpu_tensor *out = upload(NULL, 4 * 5120 * 4);
++        CHECK(x && res && split && out);
++        float *h = ds4_gpu_tensor_contents(x), *r = ds4_gpu_tensor_contents(res), *sp = ds4_gpu_tensor_contents(split);
++        for (int i = 0; i < 8192; i++) h[i] = random_value();
++        for (int i = 0; i < 4 * 5120; i++) r[i] = random_value();
++        for (int i = 0; i < 24; i++) sp[i] = random_value() / 4.0f;
++        LITERAL_PAIR(DS4_GPU_V41_LITERAL_SHAPES, "kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_static", out, 4 * 5120 * 4,
++                     ds4_gpu_dsv41_matmul_expand_rows(out, model, wb, 0, 8192, 5120, x, NULL, res, split, 4, 1));
++        ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(res); ds4_gpu_tensor_free(split); ds4_gpu_tensor_free(out);
++        free(model);
++    }
++    {   /* the serial FFN join: shared + routed into the HC streams, one token, bf16 rounding */
++        ds4_gpu_tensor *blk = upload(NULL, 5120 * 4), *add = upload(NULL, 5120 * 4), *res = upload(NULL, 4 * 5120 * 4);
++        ds4_gpu_tensor *split = upload(NULL, 24 * 4), *out = upload(NULL, 4 * 5120 * 4);
++        CHECK(blk && add && res && split && out);
++        float *b = ds4_gpu_tensor_contents(blk), *a = ds4_gpu_tensor_contents(add);
++        float *r = ds4_gpu_tensor_contents(res), *sp = ds4_gpu_tensor_contents(split);
++        for (int i = 0; i < 5120; i++) { b[i] = random_value(); a[i] = random_value(); }
++        for (int i = 0; i < 4 * 5120; i++) r[i] = random_value();
++        for (int i = 0; i < 24; i++) sp[i] = random_value() / 4.0f;
++        LITERAL_PAIR(DS4_GPU_V41_LITERAL_SHAPES, "kernel_dsv4_hc_expand4_serial_add_bf16", out, 4 * 5120 * 4,
++                     ds4_gpu_hc_expand_split_add_bf16_tensor(out, blk, add, res, split, 5120, 4));
++        ds4_gpu_tensor_free(blk); ds4_gpu_tensor_free(add); ds4_gpu_tensor_free(res);
++        ds4_gpu_tensor_free(split); ds4_gpu_tensor_free(out);
++    }
++    {   /* the attention q_a/kv pair: 5120 -> 1280 and 5120 -> 512, one row, bf16 outputs */
++        uint64_t wb = 0;
++        void *model = q8_weights(1280 + 512, 5120, &wb);
++        CHECK(model && ds4_gpu_set_model_map(model, wb));
++        const uint64_t off_b = 1280ull * (5120 / 32) * 34;
++        ds4_gpu_tensor *x = upload(NULL, 5120 * 4), *qa = upload(NULL, 1280 * 4), *kv = upload(NULL, 512 * 4);
++        CHECK(x && qa && kv);
++        float *h = ds4_gpu_tensor_contents(x);
++        for (int i = 0; i < 5120; i++) h[i] = random_value();
++        for (int i = 0; i < 2; i++)
++            LITERAL_PAIR(DS4_GPU_V41_LITERAL_SHAPES, "kernel_mul_mv_q8_0_f32_bf16_pair_qa_kv", i ? kv : qa,
++                         i ? 512 * 4 : 1280 * 4, ds4_gpu_dsv41_project_pair_q8(qa, kv, model, wb, 0, off_b, 5120, 1280, 512, x));
++        ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(qa); ds4_gpu_tensor_free(kv);
++        free(model);
++    }
++    if (ds4_gpu_device_is_pre_m5_apple_silicon()) {
++        /* MoE gate/up of one token, 6 of 384 MXFP4 experts (5120 -> 2304), into the down projection. Only the routed
++         * experts are written: up reads the gate experts one row on, down (5120 x 1224 bytes) from byte 0. */
++        const uint64_t row = 2720, expert = 2304 * row, page = (uint64_t)getpagesize();
++        const uint64_t map_bytes = (384 * expert + row + page - 1) / page * page;
++        unsigned char *map = mmap(NULL, map_bytes, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
++        CHECK(map != MAP_FAILED && ds4_gpu_set_model_map(map, map_bytes));
++        const int32_t sel[6] = {3, 77, 150, 200, 301, 383};
++        const float weights[6] = {0.3f, 0.25f, 0.2f, 0.12f, 0.08f, 0.05f};
++        for (int e = 0; e < 6; e++)
++            for (uint64_t i = (uint64_t)sel[e] * expert; i < (uint64_t)(sel[e] + 1) * expert + row; i++) {
++                (void)random_value();
++                map[i] = i % 17 ? (unsigned char)(seed >> 5) : (unsigned char)(118 + seed % 8);   /* e8m0 scales */
++            }
++        ds4_gpu_tensor *x = upload(NULL, 5120 * 4), *st = upload(sel, sizeof(sel)), *wt = upload(weights, sizeof(weights));
++        ds4_gpu_tensor *t[5];
++        for (int i = 0; i < 5; i++) t[i] = upload(NULL, 6 * 5120 * 4);
++        CHECK(x && st && wt && t[0] && t[1] && t[2] && t[3] && t[4]);
++        float *h = ds4_gpu_tensor_contents(x);
++        for (int i = 0; i < 5120; i++) h[i] = random_value();
++        LITERAL_PAIR(DS4_GPU_V41_LITERAL_SHAPES, "kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_f32",
++                     t[2], 6 * 2304 * 4, ds4_gpu_routed_moe_one_tensor(t[4], t[0], t[1], t[2], t[3], map, map_bytes,
++                     0, row, 0, 39, 39, expert, row, expert, 1224, 5120, 2304, 5120, st, wt, 384, 6, 10.0f, x, NULL,
++                     0, true));
++        for (int i = 0; i < 5; i++) ds4_gpu_tensor_free(t[i]);
++        ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(st); ds4_gpu_tensor_free(wt);
++        /* map stays: the model views may wrap it */
++    }
++    fprintf(stderr, "V4.1 literal shapes (output-B HC, serial HC join, q_a/kv pair, MoE gate/up) == generic PASS\n");
++    return 1;
++}
++#else
++static int check_literal_shapes(void) { return 1; }
++#endif
++
+ static int check_attention_output(bool large) {
+     enum { GROUP = 4096, RANK = 1024, GROUPS = 8, OUT = 5120 };
+     const uint32_t ROWS = large ? 8192u : 513u;
+@@ -1805,6 +1920,11 @@ int main(int argc, char **argv) {
+         ds4_gpu_cleanup();
+         return ok ? 0 : 1;
+     }
++    if (argc == 2 && !strcmp(argv[1], "--literal-shapes")) {
++        const int ok = ds4_gpu_init() && check_literal_shapes();
++        ds4_gpu_cleanup();
++        return ok ? 0 : 1;
++    }
+     if (argc != 1) return 2;
+     int ok = ds4_gpu_init() && check_router() && check_quantization() && check_engram() && check_rope_stride() &&
+              check_rope_quantize() && check_deferred_hc() && check_pool() && check_candidates() && check_candidates_batch(16449, 17, 16400) &&
+@@ -1812,6 +1932,7 @@ int main(int argc, char **argv) {
+              check_index_score_wide() && check_index_candidates() && check_embedding() && check_index_projection() && check_general_topk() &&
+              check_topk_select() && check_causal_topk() && check_indexer_all() && check_compact_carry() &&
+              check_attention_output(false) && check_tp_attention();
++    ok = ok && check_literal_shapes();
+     ds4_gpu_cleanup();
+     return ok ? 0 : 1;
+ }

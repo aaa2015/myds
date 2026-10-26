@@ -1,0 +1,4149 @@
+{
+  "GPU_work_submitted": false,
+  "argv": [
+    "/private/tmp/myds-register-only-20261026/narrow-v2/source/tools/audit_v41_narrow_weights.py",
+    "--model",
+    "/Users/fangqingyuan/hf-1017/DeepSeek-V4.1-Flash-1017-Q2-dense-q4-imx-cliecy.gguf",
+    "--output",
+    "/private/tmp/myds-register-only-20261026/narrow-v2/audit.json",
+    "--artifact-dir",
+    "/private/tmp/myds-register-only-20261026/narrow-v2/artifacts",
+    "--cc",
+    "/usr/bin/clang",
+    "--upstream-patches",
+    "/private/tmp/myds-register-only-20261026/narrow-v2/source/docs/benchmarks/2026-10-26-upstream-plan-review/upstream-commits"
+  ],
+  "arithmetic_equivalence_or_performance_proven": false,
+  "artifact_directory": "/private/tmp/myds-register-only-20261026/narrow-v2/artifacts",
+  "artifact_manifest": {
+    "bytes": 1683,
+    "path": "/private/tmp/myds-register-only-20261026/narrow-v2/artifacts/artifact-manifest.json",
+    "sha256": "48b54e9170fa8129fbba070d29f014a71962e37b8b41bcb752197d1d96e7edd4"
+  },
+  "audit_completed": true,
+  "elapsed_seconds": 6.332735042,
+  "errors": [],
+  "exit_code": 0,
+  "expected_targets": [
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.0.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.1.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.2.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.3.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.4.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.5.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.6.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.7.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.8.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.9.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.10.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.11.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.12.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.13.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.14.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.15.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.16.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.17.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.18.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.19.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.20.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.21.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.22.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.23.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.24.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.25.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.26.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.27.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.28.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.29.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.30.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.31.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.32.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.33.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.34.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.35.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.36.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.37.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.38.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        5120,
+        384
+      ],
+      "family": "router",
+      "name": "blk.39.ffn_gate_inp.weight",
+      "source_type": "F32"
+    },
+    {
+      "dims": [
+        1280,
+        4096
+      ],
+      "family": "index_qb",
+      "name": "blk.2.indexer.attn_q_b.weight",
+      "source_type": "F16"
+    },
+    {
+      "dims": [
+        1280,
+        4096
+      ],
+      "family": "index_qb",
+      "name": "blk.8.indexer.attn_q_b.weight",
+      "source_type": "F16"
+    },
+    {
+      "dims": [
+        1280,
+        4096
+      ],
+      "family": "index_qb",
+      "name": "blk.14.indexer.attn_q_b.weight",
+      "source_type": "F16"
+    },
+    {
+      "dims": [
+        1280,
+        4096
+      ],
+      "family": "index_qb",
+      "name": "blk.20.indexer.attn_q_b.weight",
+      "source_type": "F16"
+    },
+    {
+      "dims": [
+        1280,
+        4096
+      ],
+      "family": "index_qb",
+      "name": "blk.24.indexer.attn_q_b.weight",
+      "source_type": "F16"
+    },
+    {
+      "dims": [
+        1280,
+        4096
+      ],
+      "family": "index_qb",
+      "name": "blk.28.indexer.attn_q_b.weight",
+      "source_type": "F16"
+    },
+    {
+      "dims": [
+        1280,
+        4096
+      ],
+      "family": "index_qb",
+      "name": "blk.32.indexer.attn_q_b.weight",
+      "source_type": "F16"
+    },
+    {
+      "dims": [
+        1280,
+        4096
+      ],
+      "family": "index_qb",
+      "name": "blk.36.indexer.attn_q_b.weight",
+      "source_type": "F16"
+    },
+    {
+      "dims": [
+        6144,
+        25600
+      ],
+      "family": "engram",
+      "name": "blk.1.engram_kv.weight",
+      "source_type": "F16"
+    },
+    {
+      "dims": [
+        6144,
+        25600
+      ],
+      "family": "engram",
+      "name": "blk.14.engram_kv.weight",
+      "source_type": "F16"
+    }
+  ],
+  "families": {
+    "engram": {
+      "all_tensors_qualify": true,
+      "counts": {
+        "blocks": 307200,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 314572800,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 7049,
+        "normal": 302387904,
+        "positive_zero": 7095,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 12170752,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 314572800
+      },
+      "first_rejection": null,
+      "gate_failures": [],
+      "potential_code_payload_bytes": 314572800,
+      "potential_scale_payload_bytes": 1228800,
+      "qualified_code_payload_bytes": 314572800,
+      "qualified_scale_payload_bytes": 1228800,
+      "qualified_tensor_count": 2,
+      "source_bytes_scanned": 629145600,
+      "source_tensor_manifest_hash_definition": "SHA256 of canonical JSON array of name/type/dims/source_sha256, in expected target order; not raw concatenated model bytes",
+      "source_tensor_manifest_sha256": "77047518badc0b60fa226b1e87aa3ce8349ebea5393a2c54169d25722af4d690",
+      "tensor_count": 2,
+      "upstream_fallback_scope": "each Engram table qualifies independently"
+    },
+    "index_qb": {
+      "all_tensors_qualify": true,
+      "counts": {
+        "blocks": 40960,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 41943040,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 251,
+        "normal": 41886384,
+        "positive_zero": 274,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 56131,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 41943040
+      },
+      "first_rejection": null,
+      "gate_failures": [],
+      "potential_code_payload_bytes": 41943040,
+      "potential_scale_payload_bytes": 163840,
+      "qualified_code_payload_bytes": 41943040,
+      "qualified_scale_payload_bytes": 163840,
+      "qualified_tensor_count": 8,
+      "source_bytes_scanned": 83886080,
+      "source_tensor_manifest_hash_definition": "SHA256 of canonical JSON array of name/type/dims/source_sha256, in expected target order; not raw concatenated model bytes",
+      "source_tensor_manifest_sha256": "1ba106e3ee1fea4fdc33d46e5513094f1cb477287964eb206b775a94cba46850",
+      "tensor_count": 8,
+      "upstream_fallback_scope": "all index-QB layers retain F16 if any index layer fails"
+    },
+    "router": {
+      "all_tensors_qualify": true,
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 78643200,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 78643200,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "first_rejection": null,
+      "gate_failures": [],
+      "potential_code_payload_bytes": 157286400,
+      "potential_scale_payload_bytes": 0,
+      "qualified_code_payload_bytes": 157286400,
+      "qualified_scale_payload_bytes": 0,
+      "qualified_tensor_count": 40,
+      "source_bytes_scanned": 314572800,
+      "source_tensor_manifest_hash_definition": "SHA256 of canonical JSON array of name/type/dims/source_sha256, in expected target order; not raw concatenated model bytes",
+      "source_tensor_manifest_sha256": "c80e46c81ad89c66d142a40a1b3e9ddf1e5aff3552e4a4e30734a169e7bea2f6",
+      "tensor_count": 40,
+      "upstream_fallback_scope": "all routers retain F32 after any router failure"
+    }
+  },
+  "full_model_sha256": null,
+  "host": {
+    "libc": [
+      "",
+      ""
+    ],
+    "machine": "arm64",
+    "platform": "macOS-27.0.1-arm64-arm-64bit",
+    "python": "3.9.6 (default, Aug 17 2026, 12:07:42) \n[Clang 21.0.0 (clang-2100.3.34.1)]"
+  },
+  "identity_scope": "all GGUF headers, all target payload bytes, per-file stat before/after; not non-target payload contents",
+  "kind": "v41_narrow_weights_CPU_bit_reversibility_audit",
+  "model": {
+    "byte_split_manifest": null,
+    "headers": [
+      {
+        "alignment": 16384,
+        "data_offset": 5832704,
+        "header_sha256": "7baf442ff9232539bdcd65f215f3168c5164e5935602d2f5ac626d16e16a4e76",
+        "metadata": {
+          "deepseek41.calibration": "imatrix",
+          "deepseek41.candidate_block_size": 8,
+          "deepseek41.candidate_source_layer_id": 20,
+          "deepseek41.candidate_topk_blocks": 2048,
+          "deepseek41.compress_ratios": {
+            "count": 40,
+            "element_type": 4
+          },
+          "deepseek41.compress_rope_theta": 160000,
+          "deepseek41.config": "{\"architectures\":[\"DeepseekV41ForCausalLM\"],\"bos_token_id\":0,\"dtype\":\"bfloat16\",\"eos_token_id\":1,\"image_token_id\":129264,\"model_type\":\"deepseek_v41\",\"pad_token_id\":2,\"quantization_config\":{\"activation_scheme\":\"dynamic\",\"expert_dtype\":\"fp4\",\"quant_method\":\"fp8\",\"scale_fmt\":\"ue8m0\",\"weight_block_size\":[32,32]},\"text_config\":{\"attention_bias\":false,\"attention_dropout\":0.0,\"candidate_block_size\":8,\"candidate_source_layer_id\":20,\"candidate_topk_blocks\":2048,\"compress_ratios\":[0,0,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0],\"compress_rope_theta\":160000,\"dspark_block_size\":5,\"dspark_markov_rank\":256,\"dspark_n_routed_experts\":128,\"dspark_noise_token_id\":128799,\"dspark_num_experts_per_tok\":3,\"dspark_target_layer_ids\":[37,38,39],\"engram_compressed_vocab_size\":99092,\"engram_head_dim\":256,\"engram_layer_ids\":[1,14],\"engram_max_ngram_size\":4,\"engram_n_heads\":8,\"engram_num_embeddings\":[384006168,384016682],\"engram_pad_token_id\":2,\"engram_vocab_size\":16000000,\"hc_eps\":1e-06,\"hc_mult\":4,\"hc_sinkhorn_iters\":20,\"head_dim\":512,\"hidden_act\":\"silu\",\"hidden_size\":5120,\"index_head_dim\":128,\"index_n_heads\":32,\"index_source_layer_ids\":[2,8,14,20,24,28,32,36],\"index_topk\":512,\"initializer_range\":0.02,\"kv_source_layer_ids\":[2,8,14,20],\"max_position_embeddings\":1048576,\"model_type\":\"deepseek_v41_text\",\"moe_intermediate_size\":2304,\"n_routed_experts\":384,\"n_shared_experts\":1,\"norm_topk_prob\":true,\"num_attention_heads\":64,\"num_experts_per_tok\":6,\"num_hidden_layers\":40,\"num_key_value_heads\":1,\"num_nextn_predict_layers\":3,\"o_groups\":8,\"o_lora_rank\":1024,\"q_lora_rank\":1280,\"qk_rope_head_dim\":64,\"rms_norm_eps\":1e-20,\"rope_scaling\":{\"beta_fast\":32,\"beta_slow\":1,\"factor\":16,\"original_max_position_embeddings\":65536,\"rope_type\":\"yarn\"},\"rope_theta\":10000,\"routed_scaling_factor\":1.5,\"scoring_func\":\"sqrtsoftplus\",\"sliding_window\":128,\"swiglu_limit\":10.0,\"tie_word_embeddings\":false,\"topk_method\":\"noaux_tc\",\"use_cache\":true,\"vocab_size\":129280},\"transformers_version\":\"5.6.0\",\"vision_config\":{\"downsample_ratio\":3,\"hidden_size\":1024,\"intermediate_size\":2816,\"max_image_tokens\":1024,\"max_wh_ratio\":null,\"min_pixels\":295936,\"model_type\":\"deepseek_v41_vision\",\"num_attention_heads\":16,\"num_hidden_layers\":32,\"patch_size\":14,\"rope_theta\":10000}}",
+          "deepseek41.engram.compressed_vocab_size": 99092,
+          "deepseek41.engram.encoding": "e4m3_e8m0_32_row264",
+          "deepseek41.engram.layer_ids": [
+            1,
+            14
+          ],
+          "deepseek41.engram.multipliers": {
+            "count": 8,
+            "element_type": 10
+          },
+          "deepseek41.engram.pad_id": 2,
+          "deepseek41.engram.primes": {
+            "count": 48,
+            "element_type": 4
+          },
+          "deepseek41.engram.rows": {
+            "count": 2,
+            "element_type": 4
+          },
+          "deepseek41.engram.token_map": {
+            "count": 129280,
+            "element_type": 4
+          },
+          "deepseek41.hc_eps": 9.999999974752427e-07,
+          "deepseek41.hc_mult": 4,
+          "deepseek41.hc_sinkhorn_iters": 20,
+          "deepseek41.head_dim": 512,
+          "deepseek41.hidden_act": "silu",
+          "deepseek41.hidden_size": 5120,
+          "deepseek41.index_head_dim": 128,
+          "deepseek41.index_n_heads": 32,
+          "deepseek41.index_source_layer_ids": [
+            2,
+            8,
+            14,
+            20,
+            24,
+            28,
+            32,
+            36
+          ],
+          "deepseek41.index_topk": 512,
+          "deepseek41.kv_source_layer_ids": [
+            2,
+            8,
+            14,
+            20
+          ],
+          "deepseek41.max_position_embeddings": 1048576,
+          "deepseek41.moe_intermediate_size": 2304,
+          "deepseek41.n_routed_experts": 384,
+          "deepseek41.n_shared_experts": 1,
+          "deepseek41.norm_topk_prob": 1,
+          "deepseek41.num_attention_heads": 64,
+          "deepseek41.num_experts_per_tok": 6,
+          "deepseek41.num_hidden_layers": 40,
+          "deepseek41.num_key_value_heads": 1,
+          "deepseek41.o_groups": 8,
+          "deepseek41.o_lora_rank": 1024,
+          "deepseek41.q_lora_rank": 1280,
+          "deepseek41.qk_rope_head_dim": 64,
+          "deepseek41.quantization": "IQ2_XXS gate/up, Q2_K down; Q4_K attention/shared/head",
+          "deepseek41.rms_norm_eps": 9.999999682655225e-21,
+          "deepseek41.rope_scaling.beta_fast": 32.0,
+          "deepseek41.rope_scaling.beta_slow": 1.0,
+          "deepseek41.rope_scaling.factor": 16.0,
+          "deepseek41.rope_scaling.original_max_position_embeddings": 65536.0,
+          "deepseek41.rope_theta": 10000,
+          "deepseek41.routed_scaling_factor": 1.5,
+          "deepseek41.scoring_func": "sqrtsoftplus",
+          "deepseek41.sliding_window": 128,
+          "deepseek41.swiglu_limit": 10.0,
+          "deepseek41.topk_method": "noaux_tc",
+          "deepseek41.vocab_size": 129280,
+          "general.alignment": 16384,
+          "general.architecture": "deepseek41",
+          "general.name": "DeepSeek V4.1 Flash 1017",
+          "general.source.revision": "1bae0e1088993b9b82de08f59de5be5a34e42170",
+          "general.source.url": "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017"
+        },
+        "metadata_array_types": {
+          "deepseek41.compress_ratios": 4,
+          "deepseek41.engram.layer_ids": 4,
+          "deepseek41.engram.multipliers": 10,
+          "deepseek41.engram.primes": 4,
+          "deepseek41.engram.rows": 4,
+          "deepseek41.engram.token_map": 4,
+          "deepseek41.index_source_layer_ids": 4,
+          "deepseek41.kv_source_layer_ids": 4
+        },
+        "metadata_count": 67,
+        "metadata_types": {
+          "deepseek41.calibration": 8,
+          "deepseek41.candidate_block_size": 4,
+          "deepseek41.candidate_source_layer_id": 4,
+          "deepseek41.candidate_topk_blocks": 4,
+          "deepseek41.compress_ratios": 9,
+          "deepseek41.compress_rope_theta": 4,
+          "deepseek41.config": 8,
+          "deepseek41.engram.compressed_vocab_size": 4,
+          "deepseek41.engram.encoding": 8,
+          "deepseek41.engram.layer_ids": 9,
+          "deepseek41.engram.multipliers": 9,
+          "deepseek41.engram.pad_id": 4,
+          "deepseek41.engram.primes": 9,
+          "deepseek41.engram.rows": 9,
+          "deepseek41.engram.token_map": 9,
+          "deepseek41.hc_eps": 6,
+          "deepseek41.hc_mult": 4,
+          "deepseek41.hc_sinkhorn_iters": 4,
+          "deepseek41.head_dim": 4,
+          "deepseek41.hidden_act": 8,
+          "deepseek41.hidden_size": 4,
+          "deepseek41.index_head_dim": 4,
+          "deepseek41.index_n_heads": 4,
+          "deepseek41.index_source_layer_ids": 9,
+          "deepseek41.index_topk": 4,
+          "deepseek41.kv_source_layer_ids": 9,
+          "deepseek41.max_position_embeddings": 4,
+          "deepseek41.moe_intermediate_size": 4,
+          "deepseek41.n_routed_experts": 4,
+          "deepseek41.n_shared_experts": 4,
+          "deepseek41.norm_topk_prob": 7,
+          "deepseek41.num_attention_heads": 4,
+          "deepseek41.num_experts_per_tok": 4,
+          "deepseek41.num_hidden_layers": 4,
+          "deepseek41.num_key_value_heads": 4,
+          "deepseek41.o_groups": 4,
+          "deepseek41.o_lora_rank": 4,
+          "deepseek41.q_lora_rank": 4,
+          "deepseek41.qk_rope_head_dim": 4,
+          "deepseek41.quantization": 8,
+          "deepseek41.rms_norm_eps": 6,
+          "deepseek41.rope_scaling.beta_fast": 6,
+          "deepseek41.rope_scaling.beta_slow": 6,
+          "deepseek41.rope_scaling.factor": 6,
+          "deepseek41.rope_scaling.original_max_position_embeddings": 6,
+          "deepseek41.rope_theta": 4,
+          "deepseek41.routed_scaling_factor": 6,
+          "deepseek41.scoring_func": 8,
+          "deepseek41.sliding_window": 4,
+          "deepseek41.swiglu_limit": 6,
+          "deepseek41.topk_method": 8,
+          "deepseek41.vocab_size": 4,
+          "general.alignment": 4,
+          "general.architecture": 8,
+          "general.name": 8,
+          "general.source.revision": 8,
+          "general.source.url": 8
+        },
+        "metadata_value_identities": {
+          "deepseek41.calibration": {
+            "bytes": 15,
+            "sha256": "69d4563aa6ad04405c4e772986b998d30f4120459ed21627c2309922e5bc45a2",
+            "type": 8
+          },
+          "deepseek41.candidate_block_size": {
+            "bytes": 4,
+            "sha256": "dc765660b06ee03dd16fd7ca5b957e8c805161ac2c4af28c5a100ab2ab432ca1",
+            "type": 4
+          },
+          "deepseek41.candidate_source_layer_id": {
+            "bytes": 4,
+            "sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "type": 4
+          },
+          "deepseek41.candidate_topk_blocks": {
+            "bytes": 4,
+            "sha256": "cbfd218787df784c39fbc4f4fad92a8f28e2a880430c210b6d0d8dc133c07e66",
+            "type": 4
+          },
+          "deepseek41.compress_ratios": {
+            "bytes": 172,
+            "sha256": "a9375001442f801d16199f680eabf1715f3cd6dc8f6206fcdb2204dce91e128d",
+            "type": 9
+          },
+          "deepseek41.compress_rope_theta": {
+            "bytes": 4,
+            "sha256": "22ccc3cbdbadc62037eea6f5eafdcc4a270728bc733a1662e5ca4f0fa6eaad31",
+            "type": 4
+          },
+          "deepseek41.config": {
+            "bytes": 2278,
+            "sha256": "abcd781156e895053c45303aba6c411fa31f881a949044d05a050efeef6a9817",
+            "type": 8
+          },
+          "deepseek41.engram.compressed_vocab_size": {
+            "bytes": 4,
+            "sha256": "7345fb617803b5149d2e671a3d4b497d0686c5dfd694252c77cc21bfbf27dfd6",
+            "type": 4
+          },
+          "deepseek41.engram.encoding": {
+            "bytes": 27,
+            "sha256": "e83b0e723695413fbee260aee9d50239f43f3d68bec788fd9c322811eb9d1766",
+            "type": 8
+          },
+          "deepseek41.engram.layer_ids": {
+            "bytes": 20,
+            "sha256": "f8b05f45c30211f37891377c515952624228caf29d8cdb5db74383a820cdcb95",
+            "type": 9
+          },
+          "deepseek41.engram.multipliers": {
+            "bytes": 76,
+            "sha256": "0cd64a0ada0fe49ec9511ef8a4b1538a60847d1fc7c6ef1cb988b915d13296e6",
+            "type": 9
+          },
+          "deepseek41.engram.pad_id": {
+            "bytes": 4,
+            "sha256": "26b25d457597a7b0463f9620f666dd10aa2c4373a505967c7c8d70922a2d6ece",
+            "type": 4
+          },
+          "deepseek41.engram.primes": {
+            "bytes": 204,
+            "sha256": "b90647fed8087e4912a6ff76155ef81c1de3d54ff7663b97ef5df2841a087702",
+            "type": 9
+          },
+          "deepseek41.engram.rows": {
+            "bytes": 20,
+            "sha256": "c359842cabd23a5725c9b8f5b313b816c94881e556d54426d63ec6597324603f",
+            "type": 9
+          },
+          "deepseek41.engram.token_map": {
+            "bytes": 517132,
+            "sha256": "aa1fa34bd77f902bc30f5f5674d19fbf2a7b308c2aec7cc9bf437387ce6e6143",
+            "type": 9
+          },
+          "deepseek41.hc_eps": {
+            "bytes": 4,
+            "sha256": "498983d3523edee13fe8f5185f80bc0741b90fa7e7b6298319e77da62cf744bb",
+            "type": 6
+          },
+          "deepseek41.hc_mult": {
+            "bytes": 4,
+            "sha256": "fb5e512425fc9449316ec95969ebe71e2d576dbab833d61e2a5b9330fd70ee02",
+            "type": 4
+          },
+          "deepseek41.hc_sinkhorn_iters": {
+            "bytes": 4,
+            "sha256": "447e12701a0d03cf90a4ad7f02f1a045b35d284e26fe520440edb116d76bf700",
+            "type": 4
+          },
+          "deepseek41.head_dim": {
+            "bytes": 4,
+            "sha256": "bc3817c13bc4e6f192a840895fa937d252db153efb89bb14a6c2ddf1f9c55409",
+            "type": 4
+          },
+          "deepseek41.hidden_act": {
+            "bytes": 12,
+            "sha256": "b37091aa36809729dae09ce818263e61d3bd25c2ae6c37fcf487824d297f961b",
+            "type": 8
+          },
+          "deepseek41.hidden_size": {
+            "bytes": 4,
+            "sha256": "43f546957dbb486973153fda6064f5d8df41d392daf83b14c5ac05baea644d0a",
+            "type": 4
+          },
+          "deepseek41.index_head_dim": {
+            "bytes": 4,
+            "sha256": "50c8ba3a6170f0a2fb6736ece8a603576ef6309a35e810911599bc6211b554a9",
+            "type": 4
+          },
+          "deepseek41.index_n_heads": {
+            "bytes": 4,
+            "sha256": "8d71b3faab8201459ad37ef499beb336ba88bdcfa0f51ee6f0a46ec3192d750a",
+            "type": 4
+          },
+          "deepseek41.index_source_layer_ids": {
+            "bytes": 44,
+            "sha256": "500e9a2a593d1b3d975500e208b24b79f6791862842b92b6baabe3f11ae7b3b0",
+            "type": 9
+          },
+          "deepseek41.index_topk": {
+            "bytes": 4,
+            "sha256": "bc3817c13bc4e6f192a840895fa937d252db153efb89bb14a6c2ddf1f9c55409",
+            "type": 4
+          },
+          "deepseek41.kv_source_layer_ids": {
+            "bytes": 28,
+            "sha256": "66845a9c6129ca8bf0d6ad8ca3d1aa7e155c38f1fce09976ddefb29ad878e32d",
+            "type": 9
+          },
+          "deepseek41.max_position_embeddings": {
+            "bytes": 4,
+            "sha256": "6e90b5d2b8ce7b775b3f74bafd0a28d18344b287eff41d0cf938f18344ea8fa2",
+            "type": 4
+          },
+          "deepseek41.moe_intermediate_size": {
+            "bytes": 4,
+            "sha256": "fd50cee538a3798d17dde484f9d935860a88fe8dd6cd2341254ab5d558b0b67f",
+            "type": 4
+          },
+          "deepseek41.n_routed_experts": {
+            "bytes": 4,
+            "sha256": "d6fdf1608d1f8ebee507044ae1898e3fdbda97b1b0debe89e16d390494319968",
+            "type": 4
+          },
+          "deepseek41.n_shared_experts": {
+            "bytes": 4,
+            "sha256": "67abdd721024f0ff4e0b3f4c2fc13bc5bad42d0b7851d456d88d203d15aaa450",
+            "type": 4
+          },
+          "deepseek41.norm_topk_prob": {
+            "bytes": 1,
+            "sha256": "4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a",
+            "type": 7
+          },
+          "deepseek41.num_attention_heads": {
+            "bytes": 4,
+            "sha256": "c31425b44a7ed682a3356bf6820141e1584a15c43b6d6793f552e5d4621586f7",
+            "type": 4
+          },
+          "deepseek41.num_experts_per_tok": {
+            "bytes": 4,
+            "sha256": "7aa8ca4a02506da9133d8f889678b76f716ce45d02e22fdb7b70a15e56a0eff8",
+            "type": 4
+          },
+          "deepseek41.num_hidden_layers": {
+            "bytes": 4,
+            "sha256": "1a00f51f3029fa4b7e61b9bf7aa9de5a64798857872981f7e056e4f437171955",
+            "type": 4
+          },
+          "deepseek41.num_key_value_heads": {
+            "bytes": 4,
+            "sha256": "67abdd721024f0ff4e0b3f4c2fc13bc5bad42d0b7851d456d88d203d15aaa450",
+            "type": 4
+          },
+          "deepseek41.o_groups": {
+            "bytes": 4,
+            "sha256": "dc765660b06ee03dd16fd7ca5b957e8c805161ac2c4af28c5a100ab2ab432ca1",
+            "type": 4
+          },
+          "deepseek41.o_lora_rank": {
+            "bytes": 4,
+            "sha256": "6e1ae50c2c807c6630b5a02ea29761a723e422e503100fc2ee23f2d715d3a001",
+            "type": 4
+          },
+          "deepseek41.q_lora_rank": {
+            "bytes": 4,
+            "sha256": "05db705de1d67525a820002dc8c4c6c5b8ab3617b0fb391177f8a44b16d2db40",
+            "type": 4
+          },
+          "deepseek41.qk_rope_head_dim": {
+            "bytes": 4,
+            "sha256": "c31425b44a7ed682a3356bf6820141e1584a15c43b6d6793f552e5d4621586f7",
+            "type": 4
+          },
+          "deepseek41.quantization": {
+            "bytes": 62,
+            "sha256": "7ea44b0e2bbc6b883991d04dc98fc6e1fd7f0d5eaef25ffc9850fc64a8292c48",
+            "type": 8
+          },
+          "deepseek41.rms_norm_eps": {
+            "bytes": 4,
+            "sha256": "6dff7c7c50f1543854765270504719763dad4409b22e16a281c71077ee265878",
+            "type": 6
+          },
+          "deepseek41.rope_scaling.beta_fast": {
+            "bytes": 4,
+            "sha256": "825ac1bb838d399fb1ba55a6247e2c8c7a0c3ec25898f3c94dbfb51fa6e73951",
+            "type": 6
+          },
+          "deepseek41.rope_scaling.beta_slow": {
+            "bytes": 4,
+            "sha256": "e00e5eb9444182f352323374ef4e08ebcb784725fdd4fd612d7730540b3e0c8c",
+            "type": 6
+          },
+          "deepseek41.rope_scaling.factor": {
+            "bytes": 4,
+            "sha256": "140efb356462f70dd1c7f1dfb10bcc07d0f14d439043fb9e9d50f4d7be71ea96",
+            "type": 6
+          },
+          "deepseek41.rope_scaling.original_max_position_embeddings": {
+            "bytes": 4,
+            "sha256": "c57897b6c9d44e8cb9a73227a9e206cdb59cc4c3fc5094fdb3815bbb6a885cf8",
+            "type": 6
+          },
+          "deepseek41.rope_theta": {
+            "bytes": 4,
+            "sha256": "85884be0c0b39bef4125bf61faf5a9c3d2de559c39e33e5d2d772ff710287bb8",
+            "type": 4
+          },
+          "deepseek41.routed_scaling_factor": {
+            "bytes": 4,
+            "sha256": "c0e336a5f371ef22cd534e094269f2c1a9635cd080b71ffa671086832d3b60b7",
+            "type": 6
+          },
+          "deepseek41.scoring_func": {
+            "bytes": 20,
+            "sha256": "e95104904f0fbfeff31cb50a15a503ed277ee4bf291c9399ba2c6deb08888c6c",
+            "type": 8
+          },
+          "deepseek41.sliding_window": {
+            "bytes": 4,
+            "sha256": "50c8ba3a6170f0a2fb6736ece8a603576ef6309a35e810911599bc6211b554a9",
+            "type": 4
+          },
+          "deepseek41.swiglu_limit": {
+            "bytes": 4,
+            "sha256": "80c8a717ccd70c8809eb78e6a9591c003e11c721fe0ccaf62fd592abda1a5593",
+            "type": 6
+          },
+          "deepseek41.topk_method": {
+            "bytes": 16,
+            "sha256": "d483a2b61671f74191862cab1ef5bfc2208743b499cef603b556435ce7a138a2",
+            "type": 8
+          },
+          "deepseek41.vocab_size": {
+            "bytes": 4,
+            "sha256": "91f7f422a560e643106bc921f619cd1559ac535e350df5e6876dca9c2cffa604",
+            "type": 4
+          },
+          "general.alignment": {
+            "bytes": 4,
+            "sha256": "c9a41c78ed4170c1826be3b5da55e87f4ba32107a5595dd34baeb0cba2570eb1",
+            "type": 4
+          },
+          "general.architecture": {
+            "bytes": 18,
+            "sha256": "1878eefc36f817d03511f02fb2df9314b5904d75c92219e4c966213b5da74716",
+            "type": 8
+          },
+          "general.name": {
+            "bytes": 32,
+            "sha256": "661deef5257fffb17a39fec7a9780fb8dfd19d08414fec9652ce54bf6065d2fc",
+            "type": 8
+          },
+          "general.source.revision": {
+            "bytes": 48,
+            "sha256": "b6a317537d7cb826e00e423dcdabc0abff03381ad98755758a65638ab93002d1",
+            "type": 8
+          },
+          "general.source.url": {
+            "bytes": 67,
+            "sha256": "a1052177009aea076a5cd42e1fe1458968b8052bf185014acfc57ac8273bd0db",
+            "type": 8
+          },
+          "quantize.imatrix.file": {
+            "bytes": 26,
+            "sha256": "b840652fea8e40f532afdb53871617d331876829f363bc1dfef16548e3a4c66b",
+            "type": 8
+          },
+          "tokenizer.ggml.add_bos_token": {
+            "bytes": 1,
+            "sha256": "4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a",
+            "type": 7
+          },
+          "tokenizer.ggml.add_eos_token": {
+            "bytes": 1,
+            "sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+            "type": 7
+          },
+          "tokenizer.ggml.bos_token_id": {
+            "bytes": 4,
+            "sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+            "type": 4
+          },
+          "tokenizer.ggml.eos_token_id": {
+            "bytes": 4,
+            "sha256": "67abdd721024f0ff4e0b3f4c2fc13bc5bad42d0b7851d456d88d203d15aaa450",
+            "type": 4
+          },
+          "tokenizer.ggml.merges": {
+            "bytes": 2399033,
+            "sha256": "3d8dedce2c0fdd0bfd3a23b71d0b0c53e7b11d4626363bb105c71bf7000911a9",
+            "type": 9
+          },
+          "tokenizer.ggml.model": {
+            "bytes": 12,
+            "sha256": "8ea11b17a0d9f84d44a620494a4e65be9ff28fc28694262b12835d8ba0351868",
+            "type": 8
+          },
+          "tokenizer.ggml.pre": {
+            "bytes": 17,
+            "sha256": "3c14d4c61f4fd4a647e015cb924ab5bc69a7f240b5ebdd309a78ed0eece48557",
+            "type": 8
+          },
+          "tokenizer.ggml.token_type": {
+            "bytes": 517132,
+            "sha256": "83c0ad3d92f832aa4ee826f756ee9590453e78d6aaf0917668cf86ee6fc0b2eb",
+            "type": 9
+          },
+          "tokenizer.ggml.tokens": {
+            "bytes": 2323707,
+            "sha256": "491ddebaab4e7ebc9c782bfa370c64d55c5e2dfdc1ffc3c7e8e8ff7e3c8fdc80",
+            "type": 9
+          }
+        },
+        "tensor_count": 1046,
+        "version": 3
+      }
+    ],
+    "input": "/Users/fangqingyuan/hf-1017/DeepSeek-V4.1-Flash-1017-Q2-dense-q4-imx-cliecy.gguf",
+    "kind": "single"
+  },
+  "model_file_identity": [
+    {
+      "after_fd": {
+        "st_ctime_ns": 1792321832451171087,
+        "st_dev": 16777233,
+        "st_ino": 8037134,
+        "st_mtime_ns": 1792321832447159977,
+        "st_size": 362142629888
+      },
+      "after_path": {
+        "st_ctime_ns": 1792321832451171087,
+        "st_dev": 16777233,
+        "st_ino": 8037134,
+        "st_mtime_ns": 1792321832447159977,
+        "st_size": 362142629888
+      },
+      "before": {
+        "st_ctime_ns": 1792321832451171087,
+        "st_dev": 16777233,
+        "st_ino": 8037134,
+        "st_mtime_ns": 1792321832447159977,
+        "st_size": 362142629888
+      },
+      "path": "/Users/fangqingyuan/hf-1017/DeepSeek-V4.1-Flash-1017-Q2-dense-q4-imx-cliecy.gguf",
+      "realpath": "/Users/fangqingyuan/hf-1017/DeepSeek-V4.1-Flash-1017-Q2-dense-q4-imx-cliecy.gguf",
+      "unchanged": true
+    }
+  ],
+  "model_modified": false,
+  "policies": {
+    "e4m3": "original encoder and e0,e0+1,e0-1 search; reject nonfinite blocks before undefined scale calculation",
+    "failed_blocks": "complete count; values_without_accepted_block is not the individually unencodable-value count",
+    "router": "upstream low-16-bit test and raw BF16 re-expansion; finite-weight qualification is a separate stricter gate",
+    "under_witness_scale_mismatch_count": "number of values rejected by the exact encoder or differing in F32 shader reconstruction under the e0 witness scale; not approximate quantization"
+  },
+  "qualification_passed": true,
+  "schema_version": 1,
+  "scope_binding": {
+    "architecture": {
+      "gguf_type": 8,
+      "key": "general.architecture",
+      "value": "deepseek41"
+    },
+    "layers": {
+      "alias_policy": "primary then fallback; simultaneous aliases must agree exactly",
+      "present_aliases": [
+        {
+          "gguf_type": 4,
+          "key": "deepseek41.num_hidden_layers",
+          "metadata_value_sha256": "1a00f51f3029fa4b7e61b9bf7aa9de5a64798857872981f7e056e4f437171955",
+          "value": 40
+        }
+      ],
+      "selected_gguf_type": 4,
+      "selected_key": "deepseek41.num_hidden_layers",
+      "value": 40
+    },
+    "width": {
+      "alias_policy": "primary then fallback; simultaneous aliases must agree exactly",
+      "present_aliases": [
+        {
+          "gguf_type": 4,
+          "key": "deepseek41.hidden_size",
+          "metadata_value_sha256": "43f546957dbb486973153fda6064f5d8df41d392daf83b14c5ac05baea644d0a",
+          "value": 5120
+        }
+      ],
+      "selected_gguf_type": 4,
+      "selected_key": "deepseek41.hidden_size",
+      "value": 5120
+    }
+  },
+  "tensors": [
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "f9c67489d1b40f9921b6d040ddd67858a9e68ab63c9116049b7d5c265d8f8c44",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 1775386624,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.0.ffn_gate_inp.weight",
+      "offset": 1769553920,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "4148495518e70bb6dda647fe6ca875da660193e4a97792ea9dbe0f93abbc5119",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "4148495518e70bb6dda647fe6ca875da660193e4a97792ea9dbe0f93abbc5119",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "c80fe3b6b23f5e830024b02d2ab4a4c9be7c56b2b2b6b144ab94fef8d3c1e2a3",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 5698617344,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.1.ffn_gate_inp.weight",
+      "offset": 5692784640,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "150ea885466ba163156e02fe72981dd7cf218605739f3c09f8b4fab046ad4c11",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "150ea885466ba163156e02fe72981dd7cf218605739f3c09f8b4fab046ad4c11",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "7d68a504d7a6487a2b423992c44695b1738b72092a4714b1482255b4e26a4ec4",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 9958047744,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.2.ffn_gate_inp.weight",
+      "offset": 9952215040,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "107dabc778011768dad47f04fa24c6950cf363074fb67b6db337296a00eb1bb9",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "107dabc778011768dad47f04fa24c6950cf363074fb67b6db337296a00eb1bb9",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "9f76adb759faa2dc55102550f6407862831d637d85340280af893c9aaebb4799",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 13881278464,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.3.ffn_gate_inp.weight",
+      "offset": 13875445760,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "bc0938f107a1f75df84c7d02ef48c93e4e45d03c46c252f536b7294cdad9e1ef",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "bc0938f107a1f75df84c7d02ef48c93e4e45d03c46c252f536b7294cdad9e1ef",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "59764d5d4d9be6537dce686fe2c4070569bb67aa2322c69b4c809f122582cd9d",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 17804509184,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.4.ffn_gate_inp.weight",
+      "offset": 17798676480,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "10a396f46a01080802bb51370ac1909a16d35790ec8a32bf9adc22400e3b9696",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "10a396f46a01080802bb51370ac1909a16d35790ec8a32bf9adc22400e3b9696",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "c04e64bcf7e8b67f96b8c2bf29c4905dc112ad22808710a890601bed8025f6cd",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 21727739904,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.5.ffn_gate_inp.weight",
+      "offset": 21721907200,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "c440323138683f34f9b26ccbb8cf1c3a8519cc5e83fe094a071e5ae89174c226",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "c440323138683f34f9b26ccbb8cf1c3a8519cc5e83fe094a071e5ae89174c226",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "6e46b2f91b46aad3420f3dab6dedca03aebf94540f3819dd0c96f29aa5d0dc34",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 25650970624,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.6.ffn_gate_inp.weight",
+      "offset": 25645137920,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "9974ccaff10f0bb78328ba5d29dc6ab5a309c260d33de80cf04ce9496e93102f",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "9974ccaff10f0bb78328ba5d29dc6ab5a309c260d33de80cf04ce9496e93102f",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "289b63b9646c81e34cc68f50db1b08e2b8bfcb201a9bfb13fa5e68e2a42da73b",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 29574201344,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.7.ffn_gate_inp.weight",
+      "offset": 29568368640,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "58d92160240bcc167700ffeebae3b3c51f001207f27b7fb40181d61555d331fc",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "58d92160240bcc167700ffeebae3b3c51f001207f27b7fb40181d61555d331fc",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "40ced9b0cab98c29a71b015c9de32f3ed1acdc6fdc89818bfa84df9058363800",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 33518895104,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.8.ffn_gate_inp.weight",
+      "offset": 33513062400,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "33fdac5e93b4fb9ad201672983f2e26cea81e93632fde9602ca9e72b57b34530",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "33fdac5e93b4fb9ad201672983f2e26cea81e93632fde9602ca9e72b57b34530",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "9a5d5205ee807f651ccb75793ca5afa47352dec4a2d9e4bd07b3dcd49db514e8",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 37442125824,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.9.ffn_gate_inp.weight",
+      "offset": 37436293120,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "db685063fc01e04b1b24e5e37dd0a1f483f2b68481ca774680cc78b023fe2c7d",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "db685063fc01e04b1b24e5e37dd0a1f483f2b68481ca774680cc78b023fe2c7d",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "4e1108a7e371a9678e171b30ac233a869483a2771455e2cdc85360998114ada7",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 41365356544,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.10.ffn_gate_inp.weight",
+      "offset": 41359523840,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "dca4b6c60fb928f6544056842c3c1d943bde7fc12cfe242625e2639bbe9d7167",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "dca4b6c60fb928f6544056842c3c1d943bde7fc12cfe242625e2639bbe9d7167",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "b13711827872915286c274123436fedde0d0b9f9684a23bc4303c388ecbad0f0",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 45288587264,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.11.ffn_gate_inp.weight",
+      "offset": 45282754560,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "bbf31e3c40332740cbd5affb9f5a459568336c2ae96a18443f8fa20fe0eea3bf",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "bbf31e3c40332740cbd5affb9f5a459568336c2ae96a18443f8fa20fe0eea3bf",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "a13c17be0a45f2451981c844a9d8a53c347e6f203f1e9ed0f4b0a6b2d8a7857e",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 49211817984,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.12.ffn_gate_inp.weight",
+      "offset": 49205985280,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "77d3e221742a46227338e9a7448fe407939c330e76d00cd11e8a39d17cb4639a",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "77d3e221742a46227338e9a7448fe407939c330e76d00cd11e8a39d17cb4639a",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "cd36b8c28deb50bc710bec4a8c5f5df1c891616788b0e6d91a4beef8b5730645",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 53135048704,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.13.ffn_gate_inp.weight",
+      "offset": 53129216000,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "5c3ff9adc15771e45a37fd3f994c3a6272f9e04814cf5c307d1a7724683ca596",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "5c3ff9adc15771e45a37fd3f994c3a6272f9e04814cf5c307d1a7724683ca596",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "c7c27ca3abe6d5739765cc74eee7b76d1a2caf06e3392b46db8694f997c00f89",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 57079742464,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.14.ffn_gate_inp.weight",
+      "offset": 57073909760,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "baab5a8505a7a2afd54c3eac65144dcd2732207f845eba7bf34d3c08063371f2",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "baab5a8505a7a2afd54c3eac65144dcd2732207f845eba7bf34d3c08063371f2",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "18e1144086c5ce22fccd8203fb566780ef4ad4be5b4da6175474c90f641f0815",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 61317709824,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.15.ffn_gate_inp.weight",
+      "offset": 61311877120,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "1823c8e553710b51d8c1d3b6dde74778f49e5d620d9477bca1f58382333310b8",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "1823c8e553710b51d8c1d3b6dde74778f49e5d620d9477bca1f58382333310b8",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "7ae0501985935f580489835ff33ffa028f4f2238235df587450ee0eded97fdf8",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 65240940544,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.16.ffn_gate_inp.weight",
+      "offset": 65235107840,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "0798ce26a70c590e324f75262366396a86e45f481cd9ae46d2abcf47fcde5302",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "0798ce26a70c590e324f75262366396a86e45f481cd9ae46d2abcf47fcde5302",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "1a84915d3c5ecf5492713df08d01de22e1ea883bc7fbb486bcca39b7b48f0131",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 69164171264,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.17.ffn_gate_inp.weight",
+      "offset": 69158338560,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "f105680387e6911c1ccddfbc3ead89048d7d618cfb6985a927bc0b7bf2a70a91",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "f105680387e6911c1ccddfbc3ead89048d7d618cfb6985a927bc0b7bf2a70a91",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "cca714eabc83870bc1f6278c4fb5acbd617b0aa74c3c8890871c563a6843fcde",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 73087401984,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.18.ffn_gate_inp.weight",
+      "offset": 73081569280,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "7a56600ad1e10de76caef13bc9b0fc9b44992a70687286bf98f77d3efdbbc450",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "7a56600ad1e10de76caef13bc9b0fc9b44992a70687286bf98f77d3efdbbc450",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "4553725606e3323e845c599ea7945c5b559c041250445dc48a8791bd1126da50",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 77010632704,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.19.ffn_gate_inp.weight",
+      "offset": 77004800000,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "6ef58aa5ed64468c903378751759c8733a337b277eb8c2d9da764760d89ca801",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "6ef58aa5ed64468c903378751759c8733a337b277eb8c2d9da764760d89ca801",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "b9510e8cbe7fb53e2cd04bc81cfafe19ebd0f4fd185439394c186801eec7bc11",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 80950083584,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.20.ffn_gate_inp.weight",
+      "offset": 80944250880,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "7e03c61dbf5ac30cb5e3987612c8b02acdc887a5dbfa3ee5280ec72aa71bd932",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "7e03c61dbf5ac30cb5e3987612c8b02acdc887a5dbfa3ee5280ec72aa71bd932",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "412437d2ab0969455a386cac97f630230162c8a30acb20985bf37f21815e000a",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 84873314304,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.21.ffn_gate_inp.weight",
+      "offset": 84867481600,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "d921a5eaf4b7fa379e6a9e7f138d577abf776886de0103032b8e615fd0a05d91",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "d921a5eaf4b7fa379e6a9e7f138d577abf776886de0103032b8e615fd0a05d91",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "29dfaee78f093b6e4ddc6cccd2c0ad5c183540336a7bcba9d2d7ed45e2f0d6a5",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 88796545024,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.22.ffn_gate_inp.weight",
+      "offset": 88790712320,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "675813f9ce0614a75ab0914c22ccccb006b6788c838a5110f6bea576ad1ef3b0",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "675813f9ce0614a75ab0914c22ccccb006b6788c838a5110f6bea576ad1ef3b0",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "8d08e3b6d59b56cab49c619ae8aa2d151281a7dd916a8dd5f7c4994eeb5bd077",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 92719775744,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.23.ffn_gate_inp.weight",
+      "offset": 92713943040,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "9f532624f85d5b3895c8ca2bec7f710349695d4a64cc79cedb8c6f24025025c7",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "9f532624f85d5b3895c8ca2bec7f710349695d4a64cc79cedb8c6f24025025c7",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "35f10adeef2a5b7608559e57a6bf92bf6561f6907b6a02c7c5444721fb976f63",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 96653819904,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.24.ffn_gate_inp.weight",
+      "offset": 96647987200,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "5519fa5890b8ab18ecbacd4be80c193268658903bd82d1d728f5221b0324d767",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "5519fa5890b8ab18ecbacd4be80c193268658903bd82d1d728f5221b0324d767",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "d560a3a37a280e445525410d93f10a9224bad76e5d838a9f4a5cd392b79865f4",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 100577050624,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.25.ffn_gate_inp.weight",
+      "offset": 100571217920,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "da61ff5f7427144972a7b8335382c460937939b20ae9f5476f1310efaed37131",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "da61ff5f7427144972a7b8335382c460937939b20ae9f5476f1310efaed37131",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "4993b79b0df3a51c53b0ad700b259244a3a134de0ff036b179a7231bdbdb0e7c",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 104500281344,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.26.ffn_gate_inp.weight",
+      "offset": 104494448640,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "d3afb6f937de88e5be77920ced667b83d8564fd59d7bbec47f505f5d096249c2",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "d3afb6f937de88e5be77920ced667b83d8564fd59d7bbec47f505f5d096249c2",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "79c1a5d88b3fb127da04556544061e4b9a4c5a257a03ad28b456e3ffdcc4f8f4",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 108423512064,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.27.ffn_gate_inp.weight",
+      "offset": 108417679360,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "293ed602b2565cea99364f589ca114748592403da1260c285c50e1eb57548c6d",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "293ed602b2565cea99364f589ca114748592403da1260c285c50e1eb57548c6d",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "a7d28d90db36088ce695e0b22a7c16ccde2cad76fe6dee4d0ad82e97726a1a24",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 112357556224,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.28.ffn_gate_inp.weight",
+      "offset": 112351723520,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "88af6d33391697fefd44602278535905029df3bd35657e8508b7ec36a873ef7e",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "88af6d33391697fefd44602278535905029df3bd35657e8508b7ec36a873ef7e",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "7417a4a626f4b8e26ca5507065139fab6124d3e074bfb279487fda4f42e7b1e1",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 116280786944,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.29.ffn_gate_inp.weight",
+      "offset": 116274954240,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "86c3f23b582916330649b5c1cc77b82ac509a6482029a672522baf52cee4cb83",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "86c3f23b582916330649b5c1cc77b82ac509a6482029a672522baf52cee4cb83",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "0dc2c19cfcebf5308008d5e26d2efb5cba3e3f6acbadb7b5b4258e20338a8136",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 120204017664,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.30.ffn_gate_inp.weight",
+      "offset": 120198184960,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "fb3fdd87377ae2041c7891282f411c18d2f123c38b0c653b51fb07903634f5a8",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "fb3fdd87377ae2041c7891282f411c18d2f123c38b0c653b51fb07903634f5a8",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "bf2bf5116a84e4ea54f767bedb52466325fb50de935b0f58606cff237dcb3e42",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 124127248384,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.31.ffn_gate_inp.weight",
+      "offset": 124121415680,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "1f9c3bae016a2c4a258234d4cb1bddfa269de39bd409893cd4e2ccb1b5f8821b",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "1f9c3bae016a2c4a258234d4cb1bddfa269de39bd409893cd4e2ccb1b5f8821b",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "3faa4155df8ab1e831276ec0cf9420937e7fea3a80aee5b91c824f809ccb1554",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 128061292544,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.32.ffn_gate_inp.weight",
+      "offset": 128055459840,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "5448b537b2de088b91acc8e1f1ed6ccbea6a38fecbd2abff1ccd5ae6390d50d2",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "5448b537b2de088b91acc8e1f1ed6ccbea6a38fecbd2abff1ccd5ae6390d50d2",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "9cf2b65d500ebfa7e2a4b9f5015e71f9fa3334b29d4111afb7b106a239122d9f",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 131984523264,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.33.ffn_gate_inp.weight",
+      "offset": 131978690560,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "4a8738676c3010759a70e91d92190e2a1d2a7e45cc213ed9d1b5c56d446e76d0",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "4a8738676c3010759a70e91d92190e2a1d2a7e45cc213ed9d1b5c56d446e76d0",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "1f2df3bdbf032afd1a029b373602c60654a6339eac9ae03202eb3684c63af992",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 135907753984,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.34.ffn_gate_inp.weight",
+      "offset": 135901921280,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "1ceef383e8d0e0373a6fe7ca7793368e1151038ed295db91eee3a9c77a53ee8b",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "1ceef383e8d0e0373a6fe7ca7793368e1151038ed295db91eee3a9c77a53ee8b",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "0bbecccb25255cc9d5b7ada100738f6d2bc0dd25a16550d4950ded54c11ca21d",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 139830984704,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.35.ffn_gate_inp.weight",
+      "offset": 139825152000,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "b6c85d0efcfec874f8f06d78e465e5de5ef53a25657e096830e6217c8d2c42e9",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "b6c85d0efcfec874f8f06d78e465e5de5ef53a25657e096830e6217c8d2c42e9",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "f72abc4c1af444b141101dc43451632a6e1c6658a0ae94d2f8fac896b97cf9a5",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 143765028864,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.36.ffn_gate_inp.weight",
+      "offset": 143759196160,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "f1ff6a0a0a88cd9c268341680f876c5e9eeaf782e3478c54d6c7ca6015b76887",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "f1ff6a0a0a88cd9c268341680f876c5e9eeaf782e3478c54d6c7ca6015b76887",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "6034d785918348a03f66c2ae84c8b8139e8a55eff84041baa08ac4c591985269",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 147688259584,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.37.ffn_gate_inp.weight",
+      "offset": 147682426880,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "6e06dacad6f9bc26cad7d56dac4cc041f7fe12d08882fe84d136027984e66f3e",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "6e06dacad6f9bc26cad7d56dac4cc041f7fe12d08882fe84d136027984e66f3e",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "d2918245720c1eefdeebbdc9798e3b9be20d6fd8d8dcc60996424697cc0c4d03",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 151611490304,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.38.ffn_gate_inp.weight",
+      "offset": 151605657600,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "7a46874b04bfef3439a0966ddf02df4392d441cebf56673ff78b21b55175a08f",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "7a46874b04bfef3439a0966ddf02df4392d441cebf56673ff78b21b55175a08f",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F32",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": null,
+      "bytes": 7864320,
+      "code_payload_bytes": 3932160,
+      "codes_stream_sha256": "3cb34de7f01df3d479072f3e3a946355604149590297702df6714a035ad572e0",
+      "counts": {
+        "blocks": 0,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 1966080,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 0,
+        "normal": 1966080,
+        "positive_zero": 0,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 0,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 0
+      },
+      "dims": [
+        5120,
+        384
+      ],
+      "expected_dims": [
+        5120,
+        384
+      ],
+      "expected_type": "F32",
+      "family": "router",
+      "file_offset": 155534721024,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": null,
+      "name": "blk.39.ffn_gate_inp.weight",
+      "offset": 155528888320,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "1e266305339156d62437809affbeab8273f8107c1a4a1f41a513762e6000b092",
+      "scale_payload_bytes": 0,
+      "scales_stream_sha256": null,
+      "source_bytes_scanned": 7864320,
+      "source_sha256": "1e266305339156d62437809affbeab8273f8107c1a4a1f41a513762e6000b092",
+      "streams_form_valid_complete_representation": true,
+      "type": 0,
+      "valid_scales": null
+    },
+    {
+      "actual_type_name": "F16",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": "3a27e509ac8e64a3fdaaca5a2447aca654ed489d993fa1e3cb6df22b7786d551",
+      "bytes": 10485760,
+      "code_payload_bytes": 5242880,
+      "codes_stream_sha256": "d569123f38a2dd89625e3f3c8b2915c3e4798d44bda1f6d91fc2ee91d9fe5029",
+      "counts": {
+        "blocks": 5120,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 5242880,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 30,
+        "normal": 5236077,
+        "positive_zero": 38,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 6735,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 5242880
+      },
+      "dims": [
+        1280,
+        4096
+      ],
+      "expected_dims": [
+        1280,
+        4096
+      ],
+      "expected_type": "F16",
+      "family": "index_qb",
+      "file_offset": 9947234304,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": {
+        "code": 0,
+        "mask": 0,
+        "reconstructed_f16_bits": "0x7e00",
+        "scale_f32_bits": "0x7fc00000"
+      },
+      "name": "blk.2.indexer.attn_q_b.weight",
+      "offset": 9941401600,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "8eff6f6c03f4ae75c44673b7b0e3fa9cab4de09b36a4e296683be30b0067d3b3",
+      "scale_payload_bytes": 20480,
+      "scales_stream_sha256": "a412518d55cc02a13b8b6de6c74d577925935cfea9b5d6def1972ea44e3d5b65",
+      "source_bytes_scanned": 10485760,
+      "source_sha256": "8eff6f6c03f4ae75c44673b7b0e3fa9cab4de09b36a4e296683be30b0067d3b3",
+      "streams_form_valid_complete_representation": true,
+      "type": 1,
+      "valid_scales": {
+        "count": 5120,
+        "max": 0.0078125,
+        "min": 0.0001220703125
+      }
+    },
+    {
+      "actual_type_name": "F16",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": "3a27e509ac8e64a3fdaaca5a2447aca654ed489d993fa1e3cb6df22b7786d551",
+      "bytes": 10485760,
+      "code_payload_bytes": 5242880,
+      "codes_stream_sha256": "ef41e30060fa5d608a152c122df8838c33091145815a9a028d92c6bc8334e4ea",
+      "counts": {
+        "blocks": 5120,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 5242880,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 27,
+        "normal": 5234801,
+        "positive_zero": 33,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 8019,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 5242880
+      },
+      "dims": [
+        1280,
+        4096
+      ],
+      "expected_dims": [
+        1280,
+        4096
+      ],
+      "expected_type": "F16",
+      "family": "index_qb",
+      "file_offset": 33508081664,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": {
+        "code": 0,
+        "mask": 0,
+        "reconstructed_f16_bits": "0x7e00",
+        "scale_f32_bits": "0x7fc00000"
+      },
+      "name": "blk.8.indexer.attn_q_b.weight",
+      "offset": 33502248960,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "48afa5b8713ec5f88b3d7dabe16fdc0a267def4f9c031a98dd05e3311fcef52f",
+      "scale_payload_bytes": 20480,
+      "scales_stream_sha256": "180932498038fda1598d3f04795dc84836c9cea6d7130e3308c2820399bd5105",
+      "source_bytes_scanned": 10485760,
+      "source_sha256": "48afa5b8713ec5f88b3d7dabe16fdc0a267def4f9c031a98dd05e3311fcef52f",
+      "streams_form_valid_complete_representation": true,
+      "type": 1,
+      "valid_scales": {
+        "count": 5120,
+        "max": 0.001953125,
+        "min": 0.0001220703125
+      }
+    },
+    {
+      "actual_type_name": "F16",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": "3a27e509ac8e64a3fdaaca5a2447aca654ed489d993fa1e3cb6df22b7786d551",
+      "bytes": 10485760,
+      "code_payload_bytes": 5242880,
+      "codes_stream_sha256": "7b9682f480ac1ec2f0428b012f07ee1bccade544aac65c4eb998a0b6aa2bab7c",
+      "counts": {
+        "blocks": 5120,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 5242880,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 37,
+        "normal": 5236536,
+        "positive_zero": 31,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 6276,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 5242880
+      },
+      "dims": [
+        1280,
+        4096
+      ],
+      "expected_dims": [
+        1280,
+        4096
+      ],
+      "expected_type": "F16",
+      "family": "index_qb",
+      "file_offset": 57068929024,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": {
+        "code": 0,
+        "mask": 0,
+        "reconstructed_f16_bits": "0x7e00",
+        "scale_f32_bits": "0x7fc00000"
+      },
+      "name": "blk.14.indexer.attn_q_b.weight",
+      "offset": 57063096320,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "1a2609220ea157cb2f0a554649de24e716d3cae15d5cda46a421c9ef1a3cc1e2",
+      "scale_payload_bytes": 20480,
+      "scales_stream_sha256": "a8aadfd756be7ef00a9fbeebd8e64c258fa1f6ea8cf895df65dcfc62505bb24b",
+      "source_bytes_scanned": 10485760,
+      "source_sha256": "1a2609220ea157cb2f0a554649de24e716d3cae15d5cda46a421c9ef1a3cc1e2",
+      "streams_form_valid_complete_representation": true,
+      "type": 1,
+      "valid_scales": {
+        "count": 5120,
+        "max": 0.00390625,
+        "min": 0.000244140625
+      }
+    },
+    {
+      "actual_type_name": "F16",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": "3a27e509ac8e64a3fdaaca5a2447aca654ed489d993fa1e3cb6df22b7786d551",
+      "bytes": 10485760,
+      "code_payload_bytes": 5242880,
+      "codes_stream_sha256": "42115f8f81f48185658f2a43829852e656fb8eb14373f933737f4c73ffe22b51",
+      "counts": {
+        "blocks": 5120,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 5242880,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 23,
+        "normal": 5237641,
+        "positive_zero": 25,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 5191,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 5242880
+      },
+      "dims": [
+        1280,
+        4096
+      ],
+      "expected_dims": [
+        1280,
+        4096
+      ],
+      "expected_type": "F16",
+      "family": "index_qb",
+      "file_offset": 80939270144,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": {
+        "code": 0,
+        "mask": 0,
+        "reconstructed_f16_bits": "0x7e00",
+        "scale_f32_bits": "0x7fc00000"
+      },
+      "name": "blk.20.indexer.attn_q_b.weight",
+      "offset": 80933437440,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "3736a55a4d15513c7c97f423f9406f9a7dc7150849c0bf12e7f39344cd5f542e",
+      "scale_payload_bytes": 20480,
+      "scales_stream_sha256": "5858937a552a1002bbb09e06961fe5c0afbc2d6685d9b76602fffd4dc3a063ba",
+      "source_bytes_scanned": 10485760,
+      "source_sha256": "3736a55a4d15513c7c97f423f9406f9a7dc7150849c0bf12e7f39344cd5f542e",
+      "streams_form_valid_complete_representation": true,
+      "type": 1,
+      "valid_scales": {
+        "count": 5120,
+        "max": 0.00390625,
+        "min": 0.000244140625
+      }
+    },
+    {
+      "actual_type_name": "F16",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": "3a27e509ac8e64a3fdaaca5a2447aca654ed489d993fa1e3cb6df22b7786d551",
+      "bytes": 10485760,
+      "code_payload_bytes": 5242880,
+      "codes_stream_sha256": "3b4ae91bcb8ecbe5b646aaf83372f6613c2df6a5c12b0c900ac48789be35a59f",
+      "counts": {
+        "blocks": 5120,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 5242880,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 31,
+        "normal": 5232907,
+        "positive_zero": 34,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 9908,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 5242880
+      },
+      "dims": [
+        1280,
+        4096
+      ],
+      "expected_dims": [
+        1280,
+        4096
+      ],
+      "expected_type": "F16",
+      "family": "index_qb",
+      "file_offset": 96643006464,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": {
+        "code": 0,
+        "mask": 0,
+        "reconstructed_f16_bits": "0x7e00",
+        "scale_f32_bits": "0x7fc00000"
+      },
+      "name": "blk.24.indexer.attn_q_b.weight",
+      "offset": 96637173760,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "31717c56ff7c6439234c3de6f54f546639b89609baf33a8dd3949a6ac2b115fc",
+      "scale_payload_bytes": 20480,
+      "scales_stream_sha256": "e5bdc9af6967d092a202d40e0efcbf523d9c1dab9abaed1004a6fd869180b369",
+      "source_bytes_scanned": 10485760,
+      "source_sha256": "31717c56ff7c6439234c3de6f54f546639b89609baf33a8dd3949a6ac2b115fc",
+      "streams_form_valid_complete_representation": true,
+      "type": 1,
+      "valid_scales": {
+        "count": 5120,
+        "max": 0.001953125,
+        "min": 0.0001220703125
+      }
+    },
+    {
+      "actual_type_name": "F16",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": "3a27e509ac8e64a3fdaaca5a2447aca654ed489d993fa1e3cb6df22b7786d551",
+      "bytes": 10485760,
+      "code_payload_bytes": 5242880,
+      "codes_stream_sha256": "5fbeb059712ecc092c1eeb0086462035be39bf769c403ce1cc1b25a8a6e9d48a",
+      "counts": {
+        "blocks": 5120,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 5242880,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 31,
+        "normal": 5235988,
+        "positive_zero": 34,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 6827,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 5242880
+      },
+      "dims": [
+        1280,
+        4096
+      ],
+      "expected_dims": [
+        1280,
+        4096
+      ],
+      "expected_type": "F16",
+      "family": "index_qb",
+      "file_offset": 112346742784,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": {
+        "code": 0,
+        "mask": 0,
+        "reconstructed_f16_bits": "0x7e00",
+        "scale_f32_bits": "0x7fc00000"
+      },
+      "name": "blk.28.indexer.attn_q_b.weight",
+      "offset": 112340910080,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "b46568d3bca25745da9d2c9a3321596937a350f4f582fe7de81f36fdf49abf9b",
+      "scale_payload_bytes": 20480,
+      "scales_stream_sha256": "ac2b07f7e7fbdf5dc821beaa846d9743be12ed42274fea2c018b2502d1645c0e",
+      "source_bytes_scanned": 10485760,
+      "source_sha256": "b46568d3bca25745da9d2c9a3321596937a350f4f582fe7de81f36fdf49abf9b",
+      "streams_form_valid_complete_representation": true,
+      "type": 1,
+      "valid_scales": {
+        "count": 5120,
+        "max": 0.001953125,
+        "min": 0.000244140625
+      }
+    },
+    {
+      "actual_type_name": "F16",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": "3a27e509ac8e64a3fdaaca5a2447aca654ed489d993fa1e3cb6df22b7786d551",
+      "bytes": 10485760,
+      "code_payload_bytes": 5242880,
+      "codes_stream_sha256": "9933578ac25272c120cd6c5bba44934665142e86efa8fb39f02c54813751f2b0",
+      "counts": {
+        "blocks": 5120,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 5242880,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 40,
+        "normal": 5236549,
+        "positive_zero": 46,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 6245,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 5242880
+      },
+      "dims": [
+        1280,
+        4096
+      ],
+      "expected_dims": [
+        1280,
+        4096
+      ],
+      "expected_type": "F16",
+      "family": "index_qb",
+      "file_offset": 128050479104,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": {
+        "code": 0,
+        "mask": 0,
+        "reconstructed_f16_bits": "0x7e00",
+        "scale_f32_bits": "0x7fc00000"
+      },
+      "name": "blk.32.indexer.attn_q_b.weight",
+      "offset": 128044646400,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "ec864ab6eb39d591abbbe4bdcdc8936a6c9f1207ce3b995a1ed8388a2b40c9f2",
+      "scale_payload_bytes": 20480,
+      "scales_stream_sha256": "39464812a18fe1ff9305b7a56ecd5b275432a3725ce90e5a82dbdd868ab0dea4",
+      "source_bytes_scanned": 10485760,
+      "source_sha256": "ec864ab6eb39d591abbbe4bdcdc8936a6c9f1207ce3b995a1ed8388a2b40c9f2",
+      "streams_form_valid_complete_representation": true,
+      "type": 1,
+      "valid_scales": {
+        "count": 5120,
+        "max": 0.00390625,
+        "min": 0.000244140625
+      }
+    },
+    {
+      "actual_type_name": "F16",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": "3a27e509ac8e64a3fdaaca5a2447aca654ed489d993fa1e3cb6df22b7786d551",
+      "bytes": 10485760,
+      "code_payload_bytes": 5242880,
+      "codes_stream_sha256": "2a4d72eafa25865e4e6e02326bc5dc97e6d7b8fe0606f29d651c81be99e0f3b7",
+      "counts": {
+        "blocks": 5120,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 5242880,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 32,
+        "normal": 5235885,
+        "positive_zero": 33,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 6930,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 5242880
+      },
+      "dims": [
+        1280,
+        4096
+      ],
+      "expected_dims": [
+        1280,
+        4096
+      ],
+      "expected_type": "F16",
+      "family": "index_qb",
+      "file_offset": 143754215424,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": {
+        "code": 0,
+        "mask": 0,
+        "reconstructed_f16_bits": "0x7e00",
+        "scale_f32_bits": "0x7fc00000"
+      },
+      "name": "blk.36.indexer.attn_q_b.weight",
+      "offset": 143748382720,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "39d98359d668356f782418bacd4102ebc6d75522465e759765418948f482917e",
+      "scale_payload_bytes": 20480,
+      "scales_stream_sha256": "809f1508b4b57b73dba27c4f91ea71bc55eed17c23a2d014ac7f143d2b237cb0",
+      "source_bytes_scanned": 10485760,
+      "source_sha256": "39d98359d668356f782418bacd4102ebc6d75522465e759765418948f482917e",
+      "streams_form_valid_complete_representation": true,
+      "type": 1,
+      "valid_scales": {
+        "count": 5120,
+        "max": 0.001953125,
+        "min": 0.0001220703125
+      }
+    },
+    {
+      "actual_type_name": "F16",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": "04fb3ecac8080a0f567b803fe8aa39dae2ae50462f8f66a07ace03d3a44e0dfa",
+      "bytes": 314572800,
+      "code_payload_bytes": 157286400,
+      "codes_stream_sha256": "e60f7f5175c19b196b0835a731900feb3e2ce0841bd35fc20c31f223af0b522e",
+      "counts": {
+        "blocks": 153600,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 157286400,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 2849,
+        "normal": 150611470,
+        "positive_zero": 2849,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 6669232,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 157286400
+      },
+      "dims": [
+        6144,
+        25600
+      ],
+      "expected_dims": [
+        6144,
+        25600
+      ],
+      "expected_type": "F16",
+      "family": "engram",
+      "file_offset": 9548644352,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": {
+        "code": 0,
+        "mask": 0,
+        "reconstructed_f16_bits": "0x7e00",
+        "scale_f32_bits": "0x7fc00000"
+      },
+      "name": "blk.1.engram_kv.weight",
+      "offset": 9542811648,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "c6ffe18e81831005a67673566678364db2f988884b4a558924ffec14a620b6f8",
+      "scale_payload_bytes": 614400,
+      "scales_stream_sha256": "53032792f402a300d159ffef6e44861ff57310e4b8318c6aab15e0008076b1bf",
+      "source_bytes_scanned": 314572800,
+      "source_sha256": "c6ffe18e81831005a67673566678364db2f988884b4a558924ffec14a620b6f8",
+      "streams_form_valid_complete_representation": true,
+      "type": 1,
+      "valid_scales": {
+        "count": 153600,
+        "max": 0.0009765625,
+        "min": 3.814697265625e-06
+      }
+    },
+    {
+      "actual_type_name": "F16",
+      "bits_reversible": true,
+      "block_valid_mask_sha256": "04fb3ecac8080a0f567b803fe8aa39dae2ae50462f8f66a07ace03d3a44e0dfa",
+      "bytes": 314572800,
+      "code_payload_bytes": 157286400,
+      "codes_stream_sha256": "fa9d24d5cb9951c52682975ebee368f00ca4cef96b4aab231fa820325aaff150",
+      "counts": {
+        "blocks": 153600,
+        "blocks_without_finite_witness_scale": 0,
+        "elements": 157286400,
+        "failed_blocks": 0,
+        "failed_scale_trials": 0,
+        "infinity": 0,
+        "invalid_scales": 0,
+        "nan": 0,
+        "negative_zero": 4200,
+        "normal": 151776434,
+        "positive_zero": 4246,
+        "roundtrip_mismatches": 0,
+        "shader_f32_mismatches": 0,
+        "subnormal": 5501520,
+        "under_witness_scale_mismatch_count": 0,
+        "unencodable_at_all_scales": 0,
+        "values_without_accepted_block": 0,
+        "witness_scale_values_tested": 157286400
+      },
+      "dims": [
+        6144,
+        25600
+      ],
+      "expected_dims": [
+        6144,
+        25600
+      ],
+      "expected_type": "F16",
+      "family": "engram",
+      "file_offset": 60929769472,
+      "finite_weights": true,
+      "first_failure": null,
+      "first_nonfinite": null,
+      "invalid_block_placeholders": {
+        "code": 0,
+        "mask": 0,
+        "reconstructed_f16_bits": "0x7e00",
+        "scale_f32_bits": "0x7fc00000"
+      },
+      "name": "blk.14.engram_kv.weight",
+      "offset": 60923936768,
+      "part_index": 0,
+      "qualification_passed": true,
+      "qualification_rejection_reasons": [],
+      "reconstructed_stream_sha256": "a1dbebeb0da215c2e5cf235b4d5d01bf25e2a261c9e30398d95b23c3912d2a67",
+      "scale_payload_bytes": 614400,
+      "scales_stream_sha256": "dda59fb805a6019d7fb4c8ef5c8ddc18d2a9ff323df22a41815c512e5dcdbcdb",
+      "source_bytes_scanned": 314572800,
+      "source_sha256": "a1dbebeb0da215c2e5cf235b4d5d01bf25e2a261c9e30398d95b23c3912d2a67",
+      "streams_form_valid_complete_representation": true,
+      "type": 1,
+      "valid_scales": {
+        "count": 153600,
+        "max": 0.00390625,
+        "min": 3.814697265625e-06
+      }
+    }
+  ],
+  "tool": {
+    "bytes": 39997,
+    "path": "/private/tmp/myds-register-only-20261026/narrow-v2/source/tools/audit_v41_narrow_weights.py",
+    "sha256": "f1e9a600b732a26f01042babe0b5fe4b672a2842196d0f60c3f3c042d3cdcc55"
+  },
+  "worker": {
+    "argv": [
+      "/usr/bin/clang",
+      "-std=c11",
+      "-O2",
+      "-fno-fast-math",
+      "-ffp-contract=off",
+      "-fPIC",
+      "-dynamiclib",
+      "/private/tmp/myds-register-only-20261026/narrow-v2/artifacts/v41_narrow_weights_worker.c",
+      "-o",
+      "/private/tmp/myds-register-only-20261026/narrow-v2/artifacts/worker.dylib",
+      "-lm"
+    ],
+    "binary": {
+      "bytes": 33824,
+      "path": "/private/tmp/myds-register-only-20261026/narrow-v2/artifacts/worker.dylib",
+      "sha256": "644f47df4fde60210b13b23128a074cdff5786a98a83d50115264418a600f4a8"
+    },
+    "compile_command": {
+      "bytes": 668,
+      "path": "/private/tmp/myds-register-only-20261026/narrow-v2/artifacts/compile-command.json",
+      "sha256": "bbfe47b6f168408246913f77d688d2261dc1e1d3cc7ac07bb4db14c8b66d077e"
+    },
+    "compile_environment": {
+      "DEVELOPER_DIR": "/Applications/Xcode.app/Contents/Developer",
+      "LC_ALL": "C",
+      "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+      "SDKROOT": "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+      "TMPDIR": "/var/folders/sw/v0kpgmv90r5714m_w2s_lzfh0000gn/T/"
+    },
+    "compile_stderr": {
+      "bytes": 0,
+      "path": "/private/tmp/myds-register-only-20261026/narrow-v2/artifacts/compile-stderr.txt",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "compile_stdout": {
+      "bytes": 0,
+      "path": "/private/tmp/myds-register-only-20261026/narrow-v2/artifacts/compile-stdout.txt",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "compiler_version": "Apple clang version 21.0.0 (clang-2100.3.34.2)\nTarget: arm64-apple-darwin27.0.0\nThread model: posix\nInstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin\n",
+    "encoder_body_sha256": "3496010d0a376d313c5d4140be2b6cd8d02d111cc3f0c92a5fef32003871c00e",
+    "original_source": {
+      "bytes": 9318,
+      "path": "/private/tmp/myds-register-only-20261026/narrow-v2/source/tools/v41_narrow_weights_worker.c",
+      "sha256": "712f41c2d89d9835bf2e0d4ebaf6db1eab02df3233eb73cd7f7281cc856e1fa7"
+    },
+    "source": {
+      "bytes": 9318,
+      "path": "/private/tmp/myds-register-only-20261026/narrow-v2/artifacts/v41_narrow_weights_worker.c",
+      "sha256": "712f41c2d89d9835bf2e0d4ebaf6db1eab02df3233eb73cd7f7281cc856e1fa7"
+    },
+    "stderr": "",
+    "stdout": "",
+    "upstream_patches": [
+      {
+        "bytes": 24142,
+        "commit": "7d9903b2ed6bd74c14aed06a89a591a14d613e9e",
+        "path": "/private/tmp/myds-register-only-20261026/narrow-v2/source/docs/benchmarks/2026-10-26-upstream-plan-review/upstream-commits/7d9903b2ed6bd74c14aed06a89a591a14d613e9e.patch",
+        "sha256": "c64a447efd6b41f815ba48be37db742da43cd0dfa1a37509c275ee427ef9db6a"
+      },
+      {
+        "bytes": 39558,
+        "commit": "55b1e75e64ec66b458e5cd5cf0944bec20590ae8",
+        "path": "/private/tmp/myds-register-only-20261026/narrow-v2/source/docs/benchmarks/2026-10-26-upstream-plan-review/upstream-commits/55b1e75e64ec66b458e5cd5cf0944bec20590ae8.patch",
+        "sha256": "17883c1499b92b18bf02f47d9a886a77a1b647acb74357dd769185613aef37fb"
+      }
+    ]
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "abort_reason": null,
+  "canonical_after": {
+    "/Users/fangqingyuan/Projects/myds/bin/myds": "2b4d56958c1b3c16223f109c7a1e860b6153ad88e5c85fc70dcd44c98012cb83",
+    "/Users/fangqingyuan/Projects/myds/bin/myds.metallib": "3837102396703da59e0eebbc0de1fdc58b68b3a3a5ec5d07504b351c67a29ba9",
+    "/Users/fangqingyuan/Projects/myfleet/myds.conf": "0a3524b030a73916f7684d841b912c6e978c680825a3c3520ca18188f35a2cff"
+  },
+  "canonical_before": {
+    "/Users/fangqingyuan/Projects/myds/bin/myds": "2b4d56958c1b3c16223f109c7a1e860b6153ad88e5c85fc70dcd44c98012cb83",
+    "/Users/fangqingyuan/Projects/myds/bin/myds.metallib": "3837102396703da59e0eebbc0de1fdc58b68b3a3a5ec5d07504b351c67a29ba9",
+    "/Users/fangqingyuan/Projects/myfleet/myds.conf": "0a3524b030a73916f7684d841b912c6e978c680825a3c3520ca18188f35a2cff"
+  },
+  "canonical_unchanged": true,
+  "child_pid": 90197,
+  "elapsed_s": 2.8293075830000003,
+  "exit_code": 0,
+  "finished_epoch": 1792937780.491325,
+  "mode": "sham",
+  "protocol_sha256": "c58e7ca77b6b5c0cb2377b5deecb16a9fe6cd1cc8ef8458918088e3ec3a2e9e9",
+  "recognized_after": [],
+  "recognized_before": [],
+  "run_index": 1
+}

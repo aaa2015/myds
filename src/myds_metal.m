@@ -6207,29 +6207,6 @@ static void moe_split_point(id<MTLCommandBuffer> *cbp,
     *encp = get_compute_encoder(*cbp);
 }
 
-/* The candidate's provider witness counts the actual late MID resource join.
- * No device arithmetic, queue submission or CPU wait is added. */
-static _Atomic uint64_t g_early_shared_gu_requests, g_early_shared_gu_encoded, g_early_shared_gu_failures;
-void myds_metal_decode_shared_gu_early_counters(myds_metal_decode_candidate_counters_t *out, bool reset) {
-#define EARLY_SHARED_COUNT(field) (reset ? atomic_exchange_explicit(&g_early_shared_gu_##field,0,memory_order_relaxed) : atomic_load_explicit(&g_early_shared_gu_##field,memory_order_relaxed))
-    const myds_metal_decode_candidate_counters_t value={EARLY_SHARED_COUNT(requests),EARLY_SHARED_COUNT(encoded),EARLY_SHARED_COUNT(failures)};
-    if (out) *out=value;
-#undef EARLY_SHARED_COUNT
-}
-static void routed_moe_mid_join(id<MTLComputeCommandEncoder> enc,
-    const myds_metal_buffer_t *mid, const shared_down_job_t *shared_down) {
-    if (g_auto_barrier) {
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-    } else if (shared_down && shared_down->input_pending) {
-        id<MTLResource> resources[]={mid->mtl_buf,shared_down->input->mtl_buf};
-        [enc memoryBarrierWithResources:resources count:2];
-        atomic_fetch_add_explicit(&g_early_shared_gu_encoded,1,memory_order_relaxed);
-    } else {
-        id<MTLResource> resource=mid->mtl_buf;
-        [enc memoryBarrierWithResources:&resource count:1];
-    }
-}
-
 static int routed_moe_batch_impl(
     myds_metal_buffer_t       *moe_out,
     const myds_metal_buffer_t *x_in,
@@ -6715,7 +6692,12 @@ static int routed_moe_batch_impl(
                 metal_dispatch(enc, gate_up_name, MTLSizeMake(row_groups_gate, 1, pairs),
                     MTLSizeMake(32, nsg_gate, 1));
                 if (use_iq2_v41) atomic_fetch_add_explicit(&g_decode_candidates[DC_IQ2][1],1,memory_order_relaxed);
-                routed_moe_mid_join(enc,scratch_mid,shared_down);
+                if (g_auto_barrier) {
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                } else {
+                    id<MTLResource> res = scratch_mid->mtl_buf;
+                    [enc memoryBarrierWithResources:&res count:1];
+                }
                 if (g_kp_on && g_batch_cb && cb == g_batch_cb && enc == g_batch_enc) enc = get_compute_encoder(cb);   /* kprof: time down separately */
                 if (use_q2_v41 && !enc) return 0;
 
@@ -8031,7 +8013,7 @@ static int routed_moe_down_overlap_scoped_impl(
     myds_metal_buffer_t *shared_out,
     const myds_metal_buffer_t *shared_weight,
     const myds_metal_buffer_t *shared_input,
-    ggml_type shared_type, bool shared_nb_allowed, bool shared_input_pending) {
+    ggml_type shared_type, bool shared_nb_allowed) {
     if (shared_nb_allowed) {
         atomic_fetch_add_explicit(&g_decode_candidates[DC_SHARED_Q4_NB][0],1,memory_order_relaxed);
         if (!g_shared_q4_v41_nb) return decode_candidate_failure(DC_SHARED_Q4_NB,"Down NB+HC provider not enabled");
@@ -8061,7 +8043,7 @@ static int routed_moe_down_overlap_scoped_impl(
         decode_candidate_overlap(shared_weight,6635520u,moe_out,20480u) ||
         decode_candidate_overlap(shared_weight,6635520u,scratch_mid,55296u))
         return shared_down_scoped_failure(shared_nb_allowed,"shared reader overlaps routed writer");
-    const shared_down_job_t job={shared_out,shared_weight,shared_input,shared_nb_allowed,shared_input_pending};
+    const shared_down_job_t job={shared_out,shared_weight,shared_input,shared_nb_allowed};
     int ok=routed_moe_scoped_impl(moe_out, x_in, gate_exps, up_exps, down_exps, selected_ids, selected_weights,
         scratch_gate, scratch_up, scratch_mid, scratch_down, dim, expert_dim,
         n_routed_experts, n_activated_experts, gate_type, up_type, down_type,
@@ -8096,40 +8078,7 @@ int myds_metal_routed_moe_down_overlap_scoped(
     ggml_type shared_type) {
     return routed_moe_down_overlap_scoped_impl(moe_out,x_in,gate_exps,up_exps,down_exps,selected_ids,selected_weights,
         scratch_gate,scratch_up,scratch_mid,scratch_down,dim,expert_dim,n_routed_experts,n_activated_experts,
-        gate_type,up_type,down_type,clamp_val,ordinary_decode_allowed,shared_out,shared_weight,shared_input,shared_type,false,false);
-}
-
-int myds_metal_routed_moe_down_overlap_early_shared_scoped(
-    myds_metal_buffer_t       *moe_out,
-    const myds_metal_buffer_t *x_in,
-    const myds_metal_buffer_t *gate_exps,
-    const myds_metal_buffer_t *up_exps,
-    const myds_metal_buffer_t *down_exps,
-    const myds_metal_buffer_t *selected_ids,
-    const myds_metal_buffer_t *selected_weights,
-    myds_metal_buffer_t       *scratch_gate,
-    myds_metal_buffer_t       *scratch_up,
-    myds_metal_buffer_t       *scratch_mid,
-    myds_metal_buffer_t       *scratch_down,
-    uint32_t                   dim,
-    uint32_t                   expert_dim,
-    uint32_t                   n_routed_experts,
-    uint32_t                   n_activated_experts,
-    ggml_type                  gate_type,
-    ggml_type                  up_type,
-    ggml_type                  down_type,
-    float                      clamp_val,
-    bool                       ordinary_decode_allowed,
-    myds_metal_buffer_t *shared_out,
-    const myds_metal_buffer_t *shared_weight,
-    const myds_metal_buffer_t *shared_input,
-    ggml_type shared_type) {
-    atomic_fetch_add_explicit(&g_early_shared_gu_requests,1,memory_order_relaxed);
-    const int ok = routed_moe_down_overlap_scoped_impl(moe_out,x_in,gate_exps,up_exps,down_exps,selected_ids,selected_weights,
-        scratch_gate,scratch_up,scratch_mid,scratch_down,dim,expert_dim,n_routed_experts,n_activated_experts,
-        gate_type,up_type,down_type,clamp_val,ordinary_decode_allowed,shared_out,shared_weight,shared_input,shared_type,false,true);
-    if (!ok) atomic_fetch_add_explicit(&g_early_shared_gu_failures,1,memory_order_relaxed);
-    return ok;
+        gate_type,up_type,down_type,clamp_val,ordinary_decode_allowed,shared_out,shared_weight,shared_input,shared_type,false);
 }
 
 int myds_metal_routed_moe_down_overlap_nbhc_scoped(
@@ -8159,7 +8108,7 @@ int myds_metal_routed_moe_down_overlap_nbhc_scoped(
     ggml_type shared_type) {
     return routed_moe_down_overlap_scoped_impl(moe_out,x_in,gate_exps,up_exps,down_exps,selected_ids,selected_weights,
         scratch_gate,scratch_up,scratch_mid,scratch_down,dim,expert_dim,n_routed_experts,n_activated_experts,
-        gate_type,up_type,down_type,clamp_val,ordinary_decode_allowed,shared_out,shared_weight,shared_input,shared_type,true,false);
+        gate_type,up_type,down_type,clamp_val,ordinary_decode_allowed,shared_out,shared_weight,shared_input,shared_type,true);
 }
 
 /* 诊断：纯读带宽（不做任何解码）。用于判定 MoE 的瓶颈是解码还是访存。 */

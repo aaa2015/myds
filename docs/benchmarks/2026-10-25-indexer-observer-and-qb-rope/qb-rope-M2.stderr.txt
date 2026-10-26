@@ -1,0 +1,1 @@
+qb_rope_probe: all phase1 outputs and input/guard raw saved; exact gate refused

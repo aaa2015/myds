@@ -1,0 +1,146 @@
+{
+  "passed": true,
+  "runs": [
+    {
+      "value": null,
+      "kind": "parse",
+      "returncode": 0,
+      "stdout": "{\"mode\":0,\"parse\":true,\"gpu\":false}\n",
+      "stderr": ""
+    },
+    {
+      "value": null,
+      "kind": "run",
+      "returncode": 0,
+      "stdout": "{\"mode\":0,\"checks\":1,\"gpu\":false}\n",
+      "stderr": ""
+    },
+    {
+      "value": "0",
+      "kind": "parse",
+      "returncode": 0,
+      "stdout": "{\"mode\":0,\"parse\":true,\"gpu\":false}\n",
+      "stderr": ""
+    },
+    {
+      "value": "0",
+      "kind": "run",
+      "returncode": 0,
+      "stdout": "{\"mode\":0,\"checks\":1,\"gpu\":false}\n",
+      "stderr": ""
+    },
+    {
+      "value": "1",
+      "kind": "parse",
+      "returncode": 0,
+      "stdout": "{\"mode\":1,\"parse\":true,\"gpu\":false}\n",
+      "stderr": ""
+    },
+    {
+      "value": "1",
+      "kind": "run",
+      "returncode": 0,
+      "stdout": "{\"mode\":1,\"checks\":235,\"actual_source_included\":true,\"gpu\":false}\n",
+      "stderr": ""
+    },
+    {
+      "value": "",
+      "kind": "parse",
+      "returncode": 0,
+      "stdout": "{\"mode\":-1,\"parse\":true,\"gpu\":false}\n",
+      "stderr": ""
+    },
+    {
+      "value": "",
+      "kind": "run",
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "value": "01",
+      "kind": "parse",
+      "returncode": 0,
+      "stdout": "{\"mode\":-1,\"parse\":true,\"gpu\":false}\n",
+      "stderr": ""
+    },
+    {
+      "value": "01",
+      "kind": "run",
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "value": "true",
+      "kind": "parse",
+      "returncode": 0,
+      "stdout": "{\"mode\":-1,\"parse\":true,\"gpu\":false}\n",
+      "stderr": ""
+    },
+    {
+      "value": "true",
+      "kind": "run",
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "value": "2",
+      "kind": "parse",
+      "returncode": 0,
+      "stdout": "{\"mode\":-1,\"parse\":true,\"gpu\":false}\n",
+      "stderr": ""
+    },
+    {
+      "value": "2",
+      "kind": "run",
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "value": "-1",
+      "kind": "parse",
+      "returncode": 0,
+      "stdout": "{\"mode\":-1,\"parse\":true,\"gpu\":false}\n",
+      "stderr": ""
+    },
+    {
+      "value": "-1",
+      "kind": "run",
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "value": "1x",
+      "kind": "parse",
+      "returncode": 0,
+      "stdout": "{\"mode\":-1,\"parse\":true,\"gpu\":false}\n",
+      "stderr": ""
+    },
+    {
+      "value": "1x",
+      "kind": "run",
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "value": " 1",
+      "kind": "parse",
+      "returncode": 0,
+      "stdout": "{\"mode\":-1,\"parse\":true,\"gpu\":false}\n",
+      "stderr": ""
+    },
+    {
+      "value": " 1",
+      "kind": "run",
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    }
+  ],
+  "gpu": false
+}

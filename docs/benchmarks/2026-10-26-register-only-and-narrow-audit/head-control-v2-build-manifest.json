@@ -1,0 +1,128 @@
+{
+  "schema_version": 1,
+  "kind": "indexer_register_only_full_library_build",
+  "selected_symbol": "kernel_myds_indexer_scores_register_only_bf16",
+  "native_oracle_symbol": "kernel_dsv4_indexer_scores_tiled_bf16",
+  "source_identity": {
+    "path": "/private/tmp/myds-register-only-head-control-build-v2-20261026/source-identity.json",
+    "bytes": 24563,
+    "sha256": "e777b2316654b76a9f5566b533e76d02c3243e2ff5ee07dcab697e3645dc5365"
+  },
+  "native_source_bytes": 1574167,
+  "native_source_sha256": "bc6603c97ec24af7597f6b10c7ed2a7bfe1344379733a0a4df780250a13f3224",
+  "combined_source_sha256": "f717bb15666a91c8b34f169be575f7f3053fbc979204aba3d42712fd5e943609",
+  "compile_only_pass": true,
+  "compilation_skipped": false,
+  "gpu_work_submitted": false,
+  "production_adoption": false,
+  "runtime_connected": false,
+  "commands": [
+    [
+      "xcrun",
+      "-sdk",
+      "macosx",
+      "metal",
+      "-mmacosx-version-min=15.0",
+      "-O3",
+      "-ffast-math",
+      "-DDS4_METAL_HC_STABLE=1",
+      "-DDS4_METAL_NORM_RSQRT_DISABLE=1",
+      "-c",
+      "/private/tmp/myds-register-only-head-control-build-v2-20261026/native.metal",
+      "-o",
+      "/private/tmp/myds-register-only-head-control-build-v2-20261026/native.air"
+    ],
+    [
+      "xcrun",
+      "-sdk",
+      "macosx",
+      "metallib",
+      "/private/tmp/myds-register-only-head-control-build-v2-20261026/native.air",
+      "-o",
+      "/private/tmp/myds-register-only-head-control-build-v2-20261026/native.metallib"
+    ],
+    [
+      "xcrun",
+      "-sdk",
+      "macosx",
+      "metal",
+      "-mmacosx-version-min=15.0",
+      "-O3",
+      "-ffast-math",
+      "-DDS4_METAL_HC_STABLE=1",
+      "-DDS4_METAL_NORM_RSQRT_DISABLE=1",
+      "-c",
+      "/private/tmp/myds-register-only-head-control-build-v2-20261026/all.metal",
+      "-o",
+      "/private/tmp/myds-register-only-head-control-build-v2-20261026/probe.air"
+    ],
+    [
+      "xcrun",
+      "-sdk",
+      "macosx",
+      "metallib",
+      "/private/tmp/myds-register-only-head-control-build-v2-20261026/probe.air",
+      "-o",
+      "/private/tmp/myds-register-only-head-control-build-v2-20261026/probe.metallib"
+    ],
+    [
+      "xcrun",
+      "clang",
+      "-O2",
+      "-fobjc-arc",
+      "-Wno-deprecated-declarations",
+      "-mmacosx-version-min=26.0",
+      "-framework",
+      "Foundation",
+      "-framework",
+      "Metal",
+      "/private/tmp/myds-register-only-head-control-build-v2-20261026/source/tools/bench_indexer_register_only.m",
+      "-o",
+      "/private/tmp/myds-register-only-head-control-build-v2-20261026/bench_indexer_register_only"
+    ]
+  ],
+  "artifacts": {
+    "native.air": {
+      "path": "/private/tmp/myds-register-only-head-control-build-v2-20261026/native.air",
+      "bytes": 1281888,
+      "sha256": "ea4b3c89b0e39a523c99cf12678732ae9169d5d40a309c7b4ba7a514272ccea3"
+    },
+    "probe.air": {
+      "path": "/private/tmp/myds-register-only-head-control-build-v2-20261026/probe.air",
+      "bytes": 1284384,
+      "sha256": "a7ff48bc602b10649544357367bfa280fb25e59df38b3133840b5cab7dec5754"
+    },
+    "native.metallib": {
+      "path": "/private/tmp/myds-register-only-head-control-build-v2-20261026/native.metallib",
+      "bytes": 4276708,
+      "sha256": "db7f9b071feb102a47d17051c2f5b6ec7de0cf3e18df46e5beaa912f8cb334f0"
+    },
+    "probe.metallib": {
+      "path": "/private/tmp/myds-register-only-head-control-build-v2-20261026/probe.metallib",
+      "bytes": 4283287,
+      "sha256": "fe55793346e15119fce4e0f40d4bf6d3023fc3694ffc231e66b8a89e3ae0f74d"
+    },
+    "compile.log": {
+      "path": "/private/tmp/myds-register-only-head-control-build-v2-20261026/compile.log",
+      "bytes": 17435,
+      "sha256": "959a307bb7d858127c621648d0ee38689d8d81a3ed510eba3272283621da4cd4"
+    },
+    "bench_indexer_register_only": {
+      "path": "/private/tmp/myds-register-only-head-control-build-v2-20261026/bench_indexer_register_only",
+      "bytes": 73640,
+      "sha256": "c2603ae40bf0a711519885190911cd9a463f91fad795233438cdbb72f6dcf427"
+    }
+  },
+  "metallibs": {
+    "native": {
+      "path": "/private/tmp/myds-register-only-head-control-build-v2-20261026/native.metallib",
+      "bytes": 4276708,
+      "sha256": "db7f9b071feb102a47d17051c2f5b6ec7de0cf3e18df46e5beaa912f8cb334f0"
+    },
+    "probe": {
+      "path": "/private/tmp/myds-register-only-head-control-build-v2-20261026/probe.metallib",
+      "bytes": 4283287,
+      "sha256": "fe55793346e15119fce4e0f40d4bf6d3023fc3694ffc231e66b8a89e3ae0f74d"
+    }
+  }
+}

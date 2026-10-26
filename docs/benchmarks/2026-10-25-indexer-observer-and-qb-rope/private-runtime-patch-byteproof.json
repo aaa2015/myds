@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "patch_sha256": "5e3c53c152113c29364a5e64af79eb43998b87193489ce13b194de761ba1df2f",
+  "forward_apply_matches_all_548_source_bytes": true,
+  "reverse_restores_all_545_seed_files_and_removes_new_files": true,
+  "gpu_work_submitted": false
+}

@@ -1,0 +1,12 @@
+{
+  "kind": "independent_root_raw_only_KV_finish_screen",
+  "scope": "raw numerical/guards/completion only; provenance delegated to separately frozen reader",
+  "files": 3535,
+  "raw_bytes": 180401269,
+  "command_buffers": 342,
+  "cases": 114,
+  "finite_KV_window_F32_values": 22588416,
+  "all_numerical_passed": true,
+  "intentional_candidate_dummyQ_differs_native_cases": 114,
+  "failures": []
+}

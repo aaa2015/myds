@@ -1653,44 +1653,12 @@ int myds_dspark_moe(myds_metal_buffer_t *moe_out,
 
 static _Atomic uint64_t ffn_hc_overlap_requests, ffn_hc_overlap_encoded, ffn_hc_overlap_failures;
 static _Atomic int ffn_hc_overlap_mode;
-static _Atomic int decode_shared_gu_early_mode;
-static _Atomic uint64_t decode_shared_gu_early_requests, decode_shared_gu_early_encoded, decode_shared_gu_early_failures;
-static _Atomic uint64_t decode_shared_gu_provider_requests, decode_shared_gu_provider_encoded, decode_shared_gu_provider_failures;
-
-int myds_v41_decode_shared_gu_early_parse_mode(void) {
-    const char *v=getenv("MYDS_DECODE_SHARED_GU_EARLY");
-    const int mode=(!v || !strcmp(v,"0")) ? 0 : !strcmp(v,"1") ? 1 : -1;
-    if (mode<0) MYDS_LOG_E("MYDS_DECODE_SHARED_GU_EARLY must be exactly 0 or 1");
-    atomic_store_explicit(&decode_shared_gu_early_mode,mode,memory_order_relaxed);
-    return mode;
-}
-int myds_v41_decode_shared_gu_early_enabled(void) {
-    return atomic_load_explicit(&decode_shared_gu_early_mode,memory_order_relaxed);
-}
-void myds_v41_decode_shared_gu_early_counters(myds_metal_decode_candidate_counters_t *out, bool reset) {
-#define SHARED_GU_COUNT(field) (reset ? atomic_exchange_explicit(&decode_shared_gu_early_##field,0,memory_order_relaxed) : atomic_load_explicit(&decode_shared_gu_early_##field,memory_order_relaxed))
-    const myds_metal_decode_candidate_counters_t value={SHARED_GU_COUNT(requests),SHARED_GU_COUNT(encoded),SHARED_GU_COUNT(failures)};
-    if (out) *out=value;
-#undef SHARED_GU_COUNT
-}
-void myds_v41_decode_shared_gu_early_provider_counters(myds_metal_decode_candidate_counters_t *out, bool reset) {
-#define SHARED_GU_COUNT(field) (reset ? atomic_exchange_explicit(&decode_shared_gu_provider_##field,0,memory_order_relaxed) : atomic_load_explicit(&decode_shared_gu_provider_##field,memory_order_relaxed))
-    const myds_metal_decode_candidate_counters_t value={SHARED_GU_COUNT(requests),SHARED_GU_COUNT(encoded),SHARED_GU_COUNT(failures)};
-    if (out) *out=value;
-#undef SHARED_GU_COUNT
-}
 
 int myds_v41_ffn_hc_overlap_parse_mode(void) {
     const char *v = getenv("MYDS_FFN_HC_OVERLAP");
     const int mode = (!v || !strcmp(v, "0")) ? 0 : !strcmp(v, "1") ? 1 : -1;
     if (mode < 0) MYDS_LOG_E("MYDS_FFN_HC_OVERLAP must be exactly 0 or 1");
     atomic_store_explicit(&ffn_hc_overlap_mode, mode, memory_order_relaxed);
-    const int early=myds_v41_decode_shared_gu_early_parse_mode();
-    if (early<0) return -1;
-    if (early==1 && mode!=1) {
-        MYDS_LOG_E("MYDS_DECODE_SHARED_GU_EARLY=1 requires MYDS_FFN_HC_OVERLAP=1");
-        return -1;
-    }
     return mode;
 }
 
@@ -1745,35 +1713,6 @@ static bool ffn_hc_scratch_independent(myds_context_t *ctx, uint32_t layer,
     return true;
 }
 
-/* Moving SharedGU above router/mix and its MID join below routed GU adds
- * overlap with both cohorts. Conservatively reject any overlapping byte span
- * between the SharedGU writer and every concurrent reader/writer, including
- * the complete expert tensors. Disjoint views of one MTLBuffer remain legal;
- * the resource barrier may serialize those views but cannot omit a hazard. */
-static bool early_shared_gu_scratch_independent(myds_context_t *ctx, uint32_t layer,
-    const myds_metal_buffer_t *residual, const myds_metal_buffer_t *after_attn,
-    const myds_metal_buffer_t *attn_split, const myds_metal_buffer_t *ffn_split,
-    const myds_metal_buffer_t *fn, const myds_metal_buffer_t *scale,
-    const myds_metal_buffer_t *base, const myds_metal_buffer_t *flat_norm,
-    const myds_metal_buffer_t *mix) {
-    const myds_layer_t *l=&ctx->model->layers[layer];
-    const myds_metal_buffer_t *writer=ctx->shared_swiglu_out;
-    const size_t writer_bytes=2304u*sizeof(float);
-    const uintptr_t a=(uintptr_t)myds_metal_buffer_data((myds_metal_buffer_t *)writer);
-    if (!a || writer_bytes>myds_metal_buffer_size(writer) || writer_bytes>UINTPTR_MAX-a) return false;
-    const myds_metal_buffer_t *others[]={residual,after_attn,attn_split,ffn_split,fn,scale,base,flat_norm,mix,
-        ctx->ffn_norm_out,ctx->x,ctx->router_logits,l->router_gate,l->router_bias,
-        l->shared_gate,l->shared_up,l->shared_down,ctx->shared_out,
-        l->ffn_gate_exps,l->ffn_up_exps,l->ffn_down_exps,ctx->selected_ids,ctx->selected_weights,
-        ctx->moe_gate,ctx->moe_up,ctx->moe_mid,ctx->moe_down,ctx->moe_out,ctx->ffn_out};
-    for (unsigned i=0;i<sizeof(others)/sizeof(*others);++i) {
-        const uintptr_t b=(uintptr_t)myds_metal_buffer_data((myds_metal_buffer_t *)others[i]);
-        const size_t bytes=myds_metal_buffer_size(others[i]);
-        if (!b || !bytes || bytes>UINTPTR_MAX-b || (a<=b ? b-a<writer_bytes : a-b<bytes)) return false;
-    }
-    return true;
-}
-
 int myds_v41_moe_ffn_hc_overlap_scoped(myds_context_t *ctx, uint32_t layer, uint32_t token, uint32_t pos,
     myds_metal_buffer_t *residual,
     const myds_metal_buffer_t *after_attn,
@@ -1790,19 +1729,14 @@ int myds_v41_moe_ffn_hc_overlap_scoped(myds_context_t *ctx, uint32_t layer, uint
     const int ffn_hc_mode = myds_v41_ffn_hc_overlap_enabled();
     const int hc_overlap = myds_v41_moe_hc_overlap_enabled();
     if (ffn_hc_mode != 1 || hc_overlap < 0) return 0;
-    const int early_mode=myds_v41_decode_shared_gu_early_enabled();
-    if (early_mode<0) return 0;
 
     const bool trace_on = myds_trace_active();
     if (!ordinary_decode_allowed || trace_on) return 0;
-    const bool early_shared_gu=early_mode==1;
-    if (early_shared_gu) atomic_fetch_add_explicit(&decode_shared_gu_early_requests,1,memory_order_relaxed);
 
     atomic_fetch_add_explicit(&ffn_hc_overlap_requests, 1, memory_order_relaxed);
     if (hc_overlap) atomic_fetch_add_explicit(&hc_overlap_requests, 1, memory_order_relaxed);
 
     if (!ctx || !ctx->model || !ctx->model->layers || layer >= ctx->model->n_layers) {
-        if (early_shared_gu) atomic_fetch_add_explicit(&decode_shared_gu_early_failures,1,memory_order_relaxed);
         atomic_fetch_add_explicit(&ffn_hc_overlap_failures, 1, memory_order_relaxed);
         if (hc_overlap) atomic_fetch_add_explicit(&hc_overlap_failures, 1, memory_order_relaxed);
         return 0;
@@ -1824,14 +1758,7 @@ int myds_v41_moe_ffn_hc_overlap_scoped(myds_context_t *ctx, uint32_t layer, uint
         l->ffn_down_exps_type == GGML_TYPE_Q2_K && l->shared_gate_type == GGML_TYPE_Q4_K &&
         l->shared_up_type == GGML_TYPE_Q4_K && l->shared_down_type == GGML_TYPE_Q4_K &&
         residual && after_attn && attn_split && ffn_split && ffn_fn && ffn_scale && ffn_base && flat_norm && mix;
-    const bool early_eligible=!early_shared_gu ||
-        (m->n_layers==40u && !myds_metal_kprof_exclusive() &&
-         !myds_metal_shared_q4_v41_nb_enabled() &&
-         isfinite(m->swiglu_clamp_exp) && m->swiglu_clamp_exp>=0.0f &&
-         early_shared_gu_scratch_independent(ctx,layer,residual,after_attn,attn_split,ffn_split,
-             ffn_fn,ffn_scale,ffn_base,flat_norm,mix));
-    if (!eligible || !early_eligible) {
-        if (early_shared_gu) atomic_fetch_add_explicit(&decode_shared_gu_early_failures,1,memory_order_relaxed);
+    if (!eligible) {
         atomic_fetch_add_explicit(&ffn_hc_overlap_failures, 1, memory_order_relaxed);
         if (hc_overlap) atomic_fetch_add_explicit(&hc_overlap_failures, 1, memory_order_relaxed);
         MYDS_LOG_E("FFN HC overlap ordinary scope preconditions failed; refusing fallback");
@@ -1861,20 +1788,6 @@ int myds_v41_moe_ffn_hc_overlap_scoped(myds_context_t *ctx, uint32_t layer, uint
         myds_metal_barrier_buffers(cohort0, 2);
     }
 
-    if (early_shared_gu) {
-        /* Close previous SharedDown readers before reusing its MID. The input
-         * normalization has just been joined by cohort0. The unchanged Q4
-         * provider writes only this disjoint MID; router/mix may proceed. */
-        myds_metal_barrier_buffer(ctx->shared_swiglu_out);
-        atomic_fetch_add_explicit(&decode_shared_gu_provider_requests,1,memory_order_relaxed);
-        if (!myds_v41_shared_gate_up_swiglu(ctx->shared_swiglu_out,l->shared_gate,l->shared_up,
-                ctx->ffn_norm_out,width,dim,l->shared_gate_type,l->shared_up_type,m->swiglu_clamp_exp)) {
-            atomic_fetch_add_explicit(&decode_shared_gu_provider_failures,1,memory_order_relaxed);
-            goto failed;
-        }
-        atomic_fetch_add_explicit(&decode_shared_gu_provider_encoded,1,memory_order_relaxed);
-    }
-
     /* Cohort 1: HC mix projection (983 KB F16 weights) and Router GEMV (3.9 MB F32
      * weights) run concurrently so router_logits is ready for Cohort 2 as early as possible. */
     if (fuse_hc) {
@@ -1896,16 +1809,15 @@ int myds_v41_moe_ffn_hc_overlap_scoped(myds_context_t *ctx, uint32_t layer, uint
     FFN_HC_CHECK(route_batch_impl(ctx->selected_ids, ctx->selected_weights, ctx->moe_gate,
         ctx->moe_up, ctx->router_logits, l->router_bias, m->n_routed_experts, k,
         m->routed_scaling_factor, 1, false));
-    if (!early_shared_gu) FFN_HC_CHECK(myds_metal_shared_q4_v41_nb_enabled()
+    FFN_HC_CHECK(myds_metal_shared_q4_v41_nb_enabled()
         ? myds_metal_shared_q4_v41_nb_gate_up(ctx->shared_swiglu_out, l->shared_gate, l->shared_up,
             ctx->ffn_norm_out, width, dim, m->swiglu_clamp_exp)
         : myds_v41_shared_gate_up_swiglu(ctx->shared_swiglu_out, l->shared_gate,
             l->shared_up, ctx->ffn_norm_out, width, dim, l->shared_gate_type, l->shared_up_type, m->swiglu_clamp_exp));
     const myds_metal_buffer_t *cohort2[] = {
-        ctx->selected_ids, ctx->selected_weights, ctx->moe_gate, ctx->moe_up,
-        early_shared_gu ? NULL : ctx->shared_swiglu_out
+        ctx->selected_ids, ctx->selected_weights, ctx->moe_gate, ctx->moe_up, ctx->shared_swiglu_out
     };
-    myds_metal_barrier_buffers(cohort2, early_shared_gu ? 4u : 5u);
+    myds_metal_barrier_buffers(cohort2, 5);
 
     /* 2026-10-21 探针（MYDS_MOE_ROUTE_PROBE=1）：在单层统计【相邻 token 的专家重合率】。
      * 目的：判断「用上一个 token 的路由预取下一个 token 的专家权重」是否有意义。
@@ -1960,7 +1872,6 @@ int myds_v41_moe_ffn_hc_overlap_scoped(myds_context_t *ctx, uint32_t layer, uint
         myds_metal_buffer_t *, myds_metal_buffer_t *, myds_metal_buffer_t *, uint32_t, uint32_t,
         uint32_t, uint32_t, ggml_type, ggml_type, ggml_type, float, bool, myds_metal_buffer_t *,
         const myds_metal_buffer_t *, const myds_metal_buffer_t *, ggml_type) =
-        early_shared_gu ? myds_metal_routed_moe_down_overlap_early_shared_scoped :
         myds_metal_shared_q4_v41_nb_enabled() ? myds_metal_routed_moe_down_overlap_nbhc_scoped :
             myds_metal_routed_moe_down_overlap_scoped;
     FFN_HC_CHECK(down_encode(ctx->moe_out, ctx->ffn_norm_out,
@@ -1975,16 +1886,9 @@ int myds_v41_moe_ffn_hc_overlap_scoped(myds_context_t *ctx, uint32_t layer, uint
     myds_metal_barrier_buffer(residual);
     myds_metal_set_auto_barrier(previous_auto);
     myds_metal_set_concurrent(previous_concurrent);
-    if (early_shared_gu) atomic_fetch_add_explicit(&decode_shared_gu_early_encoded,1,memory_order_relaxed);
 #undef FFN_HC_CHECK
     return 1;
 failed:
-    if (early_shared_gu) {
-        /* A partial candidate never retries native math. Join its independent
-         * writers before the caller's existing batch-failure cleanup. */
-        myds_metal_barrier();
-        atomic_fetch_add_explicit(&decode_shared_gu_early_failures,1,memory_order_relaxed);
-    }
     atomic_fetch_add_explicit(&ffn_hc_overlap_failures, 1, memory_order_relaxed);
     if (hc_overlap) atomic_fetch_add_explicit(&hc_overlap_failures, 1, memory_order_relaxed);
     myds_metal_set_auto_barrier(previous_auto);

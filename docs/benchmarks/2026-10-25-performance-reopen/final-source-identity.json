@@ -1,0 +1,29 @@
+{
+  "initial_head": "59e7989",
+  "observed_head": "224dc70a839af1468c68c277384fa489ea55afbd",
+  "source_files": {
+    "Makefile": "3aec1fa030de5b694297cd4be0e31d7f6be9a4db9e5b64981822d16f0a81ff4f",
+    "eval/stream_bench.py": "ddfd3f8973fbbf0c26c7c36cb7b716441982731b0e3680e674b11943fe8e1d88",
+    "eval/decode_fixed.py": "a4236ef2fea087a461f50631572e5160ec41824d86c5d65713c64062fd64fc28",
+    "eval/prefill_decode_bench.py": "54e2f3844f8c99372190d983dc68f5eedcdf438b00488863998175ee7930d4cd",
+    "tests/test_stream_bench.py": "d25878dc929d23b04914856ad781653d34efb378a2f779e841f330b16c375229",
+    "metal/dsv4_misc.metal": "7fe23a7707e97758c3127caadfb2bc3b6818c1c6ba9d30a73f632563b82f3d57",
+    "metal/flash_attn.metal": "503fc1ec7fb94130f4e44c1a1147bf182d11c9993cc0688e8ed2f4993df7bdc6",
+    "tools/build_indexer_k_resident_probe.py": "c29b9f171f1a7992fb7a92f35328e038f94917513d4d1f41b48b60a451664878",
+    "tools/bench_indexer_k_resident.m": "ce5b10589eaa674603b2b0489b77008f5947c6edd1e1b7ad21da4d2a235e165b",
+    "tools/review_indexer_k_resident.py": "02b52cf6f65a06cb1ba716064e00a98a254487c4db855b6363d7a86b15e58d58",
+    "tools/build_prefill_output_register_probe.py": "62efd8081e147613aa95725139a078b86ca7d78ca076972deee0c0be59091a98",
+    "tools/bench_prefill_output_register.m": "af71763d7b254d31e7c1566cee55e20bf38fcd523bb38b7698a13ccd0e502f1f",
+    "tools/bench_attention_multihead.m": "0ecf74b04fb06d89f59322c51e43751441dc37e636c21406007a4a446bd93797"
+  },
+  "scope": "Saved files and small raw JSONL reports; full GPU score/output buffers remain in the recorded /private/tmp directories",
+  "test_summary": {
+    "stream_bench_cpu_tests": 13,
+    "core_staged_build": "passed",
+    "default_runtime_candidate_removed": true,
+    "attention_host_storage_and_rejection_cases": 13,
+    "attention_abi_invalid_args_rejected": 6,
+    "report_local_links_checked": 17
+  },
+  "staged_core_binary_sha256": "d71e5d37f1f3ec15e3071ed3cb6beff514bc2d7f73727eb31162a0d616441a53"
+}

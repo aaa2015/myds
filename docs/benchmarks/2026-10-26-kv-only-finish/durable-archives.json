@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "scope": "complete archived immutable evidence roots listed per manifest; GGUF model payload excluded",
+  "verified_archives": [
+    {
+      "schema_version": 1,
+      "archive_writer_revision": 2,
+      "archive_writer_sha256": "097f578984beff11196cea69f31c1e3e097f9b969ad41972e50274b715fc49b7",
+      "kind": "m2_durable_lossless_evidence_archive",
+      "archive": {
+        "path": "/Users/fangqingyuan/Benchmarks/myds/2026-10-26-metal-performance/m2-evidence.tar.gz",
+        "bytes": 410470514,
+        "sha256": "8eed83847903254c6efcb6ac55bb842b7726c3edd5224a8038ebf507b95900b1"
+      },
+      "file_count": 22705,
+      "directory_count": 395,
+      "logical_file_bytes": 11255161100,
+      "stored_regular_payload_bytes": 829120373,
+      "hardlink_dedup_only_immutable_raw_payloads": true,
+      "hardlink_entries": 16833,
+      "all_archived_regular_payload_SHA_verified": true,
+      "all_hardlinks_resolved_to_prior_equal_SHA_size": true,
+      "empty_directories_preserved": true,
+      "original_files_modified_or_deleted": false,
+      "omitted_python_caches": true,
+      "model_GGUF_payload_included": false,
+      "roots": [
+        "myds-indexer-r2-20261025",
+        "myds-indexer-r3-20261025",
+        "myds-indexer-k-runtime-20261025",
+        "myds-decode-kv-only-runtime-20261025",
+        "myds-decode-kv-only-validation-20261026",
+        "myds-kv-only-finish-M2-screen-20261026",
+        "myds-kv-only-finish-probe-final-v1-20261025",
+        "myds-kv-only-finish-probe-20261025",
+        "myds-kv-only-finish-reader-v2-20261026",
+        "myds-decode-kv-only-target-prep-20261026",
+        "myds-decode-kv-only-payload-20261026"
+      ],
+      "elapsed_s": 20.277082417,
+      "archive_host": "macstudio",
+      "full_manifest": {
+        "path": "/Users/fangqingyuan/Benchmarks/myds/2026-10-26-metal-performance/m2-archive-manifest.json",
+        "bytes": 7257238,
+        "sha256": "ceefffd474a3787bff4eb9df150c88d064200e0125b78d4671c1f14e6a5adbd1"
+      }
+    },
+    {
+      "schema_version": 1,
+      "kind": "m4_durable_lossless_evidence_archive",
+      "archive": {
+        "path": "/Users/fangqingyuan/Benchmarks/myds/2026-10-26-metal-performance/m4-evidence.tar.gz",
+        "bytes": 132645112,
+        "sha256": "e4a5dc46ee207633d1404432e66572f1c2c1a1e2879f6fe4998e39dc18e6a746"
+      },
+      "file_count": 8828,
+      "directory_count": 113,
+      "logical_file_bytes": 470729171,
+      "stored_regular_payload_bytes": 281586323,
+      "hardlink_dedup_only_immutable_raw_payloads": true,
+      "hardlink_entries": 4774,
+      "all_archived_regular_payload_SHA_verified": true,
+      "all_hardlinks_resolved_to_prior_equal_SHA_size": true,
+      "empty_directories_preserved": true,
+      "original_files_modified_or_deleted": false,
+      "omitted_python_caches": true,
+      "model_GGUF_payload_included": false,
+      "roots": [
+        "myds-indexer-k-runtime-20261025",
+        "myds-decode-kv-only-runtime-20261025",
+        "myds-kv-only-finish-probe-final-v1-20261025",
+        "myds-kv-only-finish-probe-20261025",
+        "myds-kv-only-finish-probe-host-only-v1-20261025",
+        "myds-kv-only-finish-reader-20261025",
+        "myds-kv-only-finish-reader-v2-20261026",
+        "myds-kv-only-finish-M4-screen-20261025",
+        "myds-qb-rope-probe-build-v1-20261025",
+        "myds-qb-rope-gpu-screen-20261025",
+        "myds-release-scope-audit-20261026",
+        "myds-decode-kv-only-fullmodel-reader-20261026",
+        "myds-decode-kv-only-target-prep-20261026"
+      ],
+      "elapsed_s": 4.891358833061531,
+      "archive_host": "local_and_macstudio_copy",
+      "full_manifest": {
+        "path": "/Users/fangqingyuan/Benchmarks/myds/2026-10-26-metal-performance/m4-archive-manifest.json",
+        "bytes": 2431278,
+        "sha256": "1edc10fc17b5b344d32d49e20c0befab0540b4da333261e6b1588ac0222e84c3"
+      }
+    }
+  ],
+  "raw_hardlinks_transparently_lossless": true,
+  "original_evidence_unchanged": true,
+  "read_only_extraction_for_replay": true,
+  "rebuilds_require_fresh_output_directories": true
+}

@@ -1,0 +1,22 @@
+{
+  "model": "local-myds-deepseek-v4.1-flash-q2",
+  "messages": [
+    {
+      "role": "system",
+      "content": "你是企业运营审阅员。根据给定的合成中文说明、代码和数据表逐项分析，保持编号、单位与计算过程一致。"
+    },
+    {
+      "role": "user",
+      "content": "2026年第四季度运营审阅档案。以下公司、订单和指标均为合成数据；各记录编号不同。\n\n记录00000：华东运营中心，产品仓储扫描终端，负责人团队T00。\n本周专题：采购到货延迟与促销需求叠加，需要区分缺货和系统预留量。订单批次ORD-00000具有独立账期，\n不能把不同记录的期末库存相加后当作同一仓库余额。客户要求按承诺日期拆分延期原因，\n财务要求先核对净出货，再解释运输补贴，质检要求保留缺陷样本而非只报告平均值。\n日期|需求量|到货量|期初库存|缺陷件|单价元|运输成本元\n2026-10-01|431|421|163|3|155|591\n2026-11-01|448|432|172|4|158|674\n\n```python\ndef audit_batch_0(demand, received, stock, defects, unit_price, shipping):\n    usable = max(received - defects, 0)\n    fulfilled = min(demand, stock + usable)\n    delayed = max(demand - fulfilled, 0)\n    revenue = fulfilled * unit_price\n    return {\"fulfilled\": fulfilled, \"delayed\": delayed,\n            \"ending_stock\": stock + usable - fulfilled,\n            \"revenue_after_shipping\": revenue - shipping}\n```\n核对重点：比较两行记录中需求、到货和缺陷变化；识别代码对负可用量的处理；\n解释收入扣运输费后的含义，不能将其直接称为净利润。补充每个字段来源和检查顺序。\n\n记录00001：华南运营中心，产品工业传感器，负责人团队T01。\n本周专题：退货批次在跨仓调拨时出现重复状态，业务人员正在核对事件顺序。订单批次ORD-00001具有独立账期，\n不能把不同记录的期末库存相加后当作同一仓库余额。客户要求按承诺日期拆分延期原因，\n财务要求先核对净出货，再解释运输补贴，质检要求保留缺陷样本而非只报告平均值。\n日期|需求量|到货量|期初库存|缺陷件|单价元|运输成本元\n2026-10-02|188|221|163|13|129|614\n2026-11-02|205|232|172|14|132|697\n\n```python\ndef audit_batch_1(demand, received, stock, defects, unit_price, shipping):\n    usable = max(received - defects, 0)\n    fulfilled = min(demand, stock + usable)\n    delayed = max(demand - fulfilled, 0)\n    revenue = fulfilled * unit_price\n    return {\"fulfilled\": fulfilled, \"delayed\": delayed,\n            \"ending_stock\": stock + usable - fulfilled,\n            \"revenue_after_shipping\": revenue - shipping}\n```\n核对重点：比较两行记录中需求、到货和缺陷变化；识别代码对负可用量的处理；\n解释收入扣运输费后的含义，不能将其直接称为净利润。补充每个字段来源和检查顺序。\n\n请把上述合成业务记录作为一份完整的运营审阅材料。现在开始输出一份很长的中文审阅报告，\n至少写出256条连续编号的分析，不要只给摘要，也不要提前宣布完成。每条都引用具体记录编号、\n日期或数据字段，说明计算过程、代码行为、业务含义和下一项核对动作。先依次分析前64个记录，\n再分析后面的记录，最后比较地区和产品之间的差异。每条至少写三句完整解释，避免复用上一条。\n从“1. 记录00000的需求与供给核对”开始，紧接着写详细正文。不要复述任务要求。\n\n本材料只有记录00000和记录00001，不要杜撰更多记录。请仅针对这两条记录和上述代码，写一篇至少4096个汉字的详细中文分析，依次解释每个数据字段、逐行复核代码、展示计算过程、比较两个日期和两条记录，并给出具体核对步骤。请持续展开完整正文，不要只给摘要，不要提前收尾。\n"
+    }
+  ],
+  "max_tokens": 256,
+  "temperature": 0,
+  "top_p": 1,
+  "top_k": 0,
+  "min_p": 0,
+  "repetition_penalty": 1,
+  "seed": 42,
+  "stream": false,
+  "thinking": false
+}

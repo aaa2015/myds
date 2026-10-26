@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "kind": "independent_QLong_frozen_protocol_static_audit",
+  "read_only": true,
+  "GPU_or_native_binary_executed": false,
+  "frozen_inputs_changed": false,
+  "identities": {
+    "protocol": "c8a8b00c495befc64cdf7833fa0ffb0f32a1ec658c8f1a7bf7c525811c8f4d3d",
+    "wrapper": "dfd5d12aef3090840e268bf7c7a353d91fead36dc9ef5fb0c46dd215b491fc84",
+    "reader": "2a803c71deb0d0e6cad98bc302cf03b6a07f79918e428326c6fd60e5f359a806",
+    "core": "f20b70993ca97adaaf84529122732f71abce1cdc58a087b2bad8ef1c2f2d4dcd"
+  },
+  "blocking_gate_gap_found": false,
+  "verified_gates": [
+    "Two explicit workloads and six original serial processes; exact prefix ordering and disjoint workload/provider directories.",
+    "All prelaunch protocol/wrapper/reader/core/source/target/library/request/config/prerequisite bindings retained and independently checked.",
+    "Every raw state/logit/token/output payload is inventory-rehashed and checked against schema2 extents/FNV; finite logits and byte comparisons across G_lib/off/on plus within-arm repeatability.",
+    "Positive actual candidate encoding before first callback, exact selected symbols, six monotone counters, no candidate decode encoding, no fallback/failure.",
+    "All12 fully parsed generations required for long qualification; numerical/integrity failure prohibits P; collector exit0 never equals qualification."
+  ],
+  "interpretation_limits": [
+    {
+      "scope": "qualification_only",
+      "detail": "Warm1+verify1 is not a performance cohort. P_eligible and formal_performance_cohort_eligible mean permission to prepare a separately frozen P, not measured speed or production adoption."
+    },
+    {
+      "scope": "G_lib",
+      "detail": "Same private C executable and deployed library only; deployed executable/source and HTTP wire bridges remain unproven."
+    },
+    {
+      "scope": "request_provenance",
+      "detail": "Business96 is deterministic synthetic business/code/data; code38404 repeats engineering material and explicitly clones output/sampling. Neither is evidence of production workload distribution."
+    },
+    {
+      "scope": "numerical_export",
+      "detail": "Final full-vocabulary logits and final live/published schema2 state, all output tokens/bytes. No per-token logits, all intermediates, historical snapshot Engram tails, persistent disk payload, cancellation/recovery or cached-request behavior."
+    },
+    {
+      "scope": "identity_and_exclusivity",
+      "detail": "Model stat plus complete1MiB prefix, not wholeGGUF SHA. Recognized-process lock/monitor scope is not proof that every possible GPU client was absent."
+    },
+    {
+      "scope": "aborted_window_classification",
+      "detail": "Timeout/competition/identity abort is rejected as invalid window evidence rather than candidate numeric or performance failure; preserve raw and do not retry to pass."
+    }
+  ],
+  "independent_CPU_prelaunch_report": "/tmp/myds-indexer-r3-local-20261025/fullmodel-qlong-cpu-prelaunch.json",
+  "reviewer_next_action": "Wait for root-fetched complete raw, then rerun frozen independent reader offline; no GPU or frozen-source edits."
+}

@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "kind": "register_only_local_head_control_v2_source_inverse",
+  "v1_candidate": {
+    "path": "/private/tmp/myds-register-only-mma-diagnostic-v1-20261026/snapshot/tools/indexer_register_only.metal.inc",
+    "bytes": 5519,
+    "sha256": "a0e6ea89dbe80862593ec0b89b02bdacf75efd83271d53c3a9b0c18f0adbfecb"
+  },
+  "v2_candidate": {
+    "path": "/private/tmp/myds-register-only-mma-diagnostic-v1-20261026/head-control-v2/indexer_register_only_head_control_v2.metal.inc",
+    "bytes": 5843,
+    "sha256": "a62922c6f5937236bd0e354dd06943b39bfa5f788419c16a8700da793769d616"
+  },
+  "candidate_edits": [
+    {
+      "name": "head_epilogue_0",
+      "before": "            if (live && comp0 < args.n_comp) {\n                device const float *w = (device const float *)(weights +\n                    (ulong)token * args.weights_token_stride);\n                const float s = mdot.thread_elements()[0];\n                acc0 += max(s, 0.0f) * (w[head] * args.scale);\n            }",
+      "after": "            if (live && comp0 < args.n_comp) {\n                #pragma clang fp contract(off) reassociate(off)\n                device const float *w = (device const float *)(weights +\n                    (ulong)token * args.weights_token_stride);\n                const float s = mdot.thread_elements()[0];\n                const float weighted = max(s, 0.0f) * w[head];\n                const float scaled = weighted * args.scale;\n                acc0 = scaled + acc0;\n            }"
+    },
+    {
+      "name": "head_epilogue_1",
+      "before": "            if (live && comp1 < args.n_comp) {\n                device const float *w = (device const float *)(weights +\n                    (ulong)token * args.weights_token_stride);\n                const float s = mdot.thread_elements()[1];\n                acc1 += max(s, 0.0f) * (w[head] * args.scale);\n            }",
+      "after": "            if (live && comp1 < args.n_comp) {\n                #pragma clang fp contract(off) reassociate(off)\n                device const float *w = (device const float *)(weights +\n                    (ulong)token * args.weights_token_stride);\n                const float s = mdot.thread_elements()[1];\n                const float weighted = max(s, 0.0f) * w[head];\n                const float scaled = weighted * args.scale;\n                acc1 = scaled + acc1;\n            }"
+    }
+  ],
+  "candidate_inverse_restores_v1_exact": true,
+  "v1_builder": {
+    "path": "/private/tmp/myds-register-only-mma-diagnostic-v1-20261026/snapshot/tools/build_indexer_register_only_probe.py",
+    "bytes": 17907,
+    "sha256": "52125e53ea95a77e0251abb4ed86173e01e73fc68ce99532d7d7d9c25c16eac6"
+  },
+  "v2_builder": {
+    "path": "/private/tmp/myds-register-only-mma-diagnostic-v1-20261026/head-control-v2/build_indexer_register_only_probe_v2.py",
+    "bytes": 18363,
+    "sha256": "d896e376a8541fb605a8d61e15b11a44c3fcf5d5fb6c95b8f7a26597475da9b4"
+  },
+  "builder_edits": [
+    {
+      "before": "    require(template.count(expr) == 2 and candidate.count(expr) == 2, \"Preserve LOCAL native head accumulation expression twice\")",
+      "after": "    require(template.count(expr) == 2 and\n            candidate.count(\"#pragma clang fp contract(off) reassociate(off)\") == 2 and\n            candidate.count(\"const float weighted = max(s, 0.0f) * w[head];\") == 2 and\n            candidate.count(\"const float scaled = weighted * args.scale;\") == 2 and\n            all(candidate.count(f\"acc{part} = scaled + acc{part};\") == 1 for part in (0,1)),\n            \"V2 exact local head mul/mul/add with contraction and reassociation disabled\")"
+    },
+    {
+      "before": "local_accumulation_expression=expr,",
+      "after": "local_accumulation_expression=\"relu(dot)*weight -> *scale -> +acc; local contract(off)/reassociate(off)\", native_source_expression=expr,"
+    }
+  ],
+  "builder_inverse_restores_v1_exact": true,
+  "MMA_loads_scope_geometry_and_global_compile_flags_unchanged": true,
+  "motivation": "Native/candidate AIR have same fast mul/mul/add; independent CPU 36/36 visible-cell models predict native separate head ops vs candidate fused head; this v2 is one locally constrained falsifiable change, not GPU proof.",
+  "GPU_work_submitted": false,
+  "numerical_passed": false,
+  "performance_evaluated": false
+}

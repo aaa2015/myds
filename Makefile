@@ -722,6 +722,20 @@ test: $(ALL_TESTS) $(METALLIB)
 	@python3 tests/test_decode_q8_contract.py
 	@echo ""
 	@python3 tests/test_http_bytes.py
+	@python3 tests/test_stream_bench.py
+	@python3 tests/test_indexer_k_resident_builder.py
+	@python3 tests/test_indexer_k_capture_reader.py
+	@python3 tests/test_indexer_fullmodel_driver.py
+	@python3 tests/test_indexer_stability_reader.py
+	@python3 tests/test_indexer_observer_builder.py
+	@python3 tests/test_indexer_observer_reader.py
+	@python3 tests/test_indexer_matched_builder.py
+	@python3 tests/test_indexer_matched_reader.py
+	@python3 tests/test_indexer_fullmodel_reader.py
+	@python3 tests/test_indexer_fullmodel_reader_v2.py
+	@python3 tests/test_indexer_fullmodel_long_reader.py
+	@python3 tests/test_indexer_fullmodel_performance_reader.py
+	@python3 tests/test_decode_kv_only_fullmodel_reader.py
 	@python3 tests/test_bench_reproduce.py
 	@python3 tools/test_engram_pool_failures.py
 	@python3 tests/test_engram_io_tools.py

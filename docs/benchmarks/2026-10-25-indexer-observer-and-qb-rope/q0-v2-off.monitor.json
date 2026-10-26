@@ -1,0 +1,1748 @@
+[
+  {
+    "elapsed_s": 0.023645207999990703,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 0.342875707999994,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 0.6254634999999951,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 0.9079252919999874,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 1.189895749999991,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 1.4720135829999919,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 1.7556741249999988,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 2.039686874999987,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 2.3230328749999956,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 2.606669999999994,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 2.8897476249999983,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 3.174061957999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 3.4568761249999937,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 3.740416666999991,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 4.0236493329999945,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 4.307497624999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 4.591064582999991,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 4.874052832999993,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 5.157242999999994,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 5.440724291999999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 5.723933291999998,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 6.0070057499999905,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 6.290180249999992,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 6.5739784999999955,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 6.85749470799999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 7.141066332999998,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 7.424200666999994,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 7.707675457999997,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 7.991806083,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 8.275701041999994,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 8.55966541699999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 8.843543791999991,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 9.127283207999994,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 9.411231457999989,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 9.694978124999992,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 9.978590124999997,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 10.262088332999994,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 10.545997916999994,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 10.829590374999995,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 11.115748832999998,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 11.391622916999992,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 11.673565582999998,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 11.950224041999988,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 12.224407207999988,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 12.498033832999994,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 12.772846582999989,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 13.057576708,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 13.341502832999993,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 13.627248957999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 13.911725582999992,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 14.192803291999994,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 14.468137374999998,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 14.753103374999995,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 15.031492041999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 15.305173582999998,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 15.584976957999999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 15.865093541999997,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 16.148877833,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 16.434652166999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 16.72055675,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 17.002728832999992,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 17.28381020799999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 17.56675962499999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 17.839356124999995,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 18.122762332999997,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 18.400924332999992,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 18.68391958299999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 18.956056082999993,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 19.23571495799999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 19.512321916999994,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 19.796311541999998,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 20.078195332999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 20.354341332999994,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 20.637649999999994,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 20.920476207999997,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 21.20272887499999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 21.48570662499999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 21.768951666999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 22.051119,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 22.334604166999995,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 22.615691833,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 22.895289707999993,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 23.177762625,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 23.46184016699999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 23.742905124999993,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 24.025322249999988,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 24.30877908299999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 24.591981917,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 24.873358458,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 25.149012291999995,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 25.425193082999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 25.705150666999998,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 25.98108562499999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 26.260425291999994,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 26.537171916999995,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 26.818007374999993,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 27.093110457999998,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 27.372457499999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 27.649797957999994,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 27.929183749999993,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 28.212830624999995,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 28.490129166999992,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 28.772508666999997,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 29.049947874999987,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 29.333101582999987,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 29.615326582999998,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 29.897869416999995,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 30.181219374999998,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 30.464708916999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 30.747956291999998,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 31.031282332999993,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 31.31431991699999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 31.59403329199999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 31.877815583,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 32.16122558299999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 32.44293341699999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 32.721533707999995,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 33.00811183299999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 33.28522637499999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 33.57069804199999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 33.846926208,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 34.133401707999994,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 34.420492624999994,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 34.706616125,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 34.994151624999986,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 35.27154899999999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 35.55831591699999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 35.845049667,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 36.132075375,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 36.41906095799999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 36.70452670799999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 36.99028912499999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 37.276266207999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 37.565887667,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 37.84880333299999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 38.130521042,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 38.41364899999999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 38.69527170799999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 38.97826649999999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 39.260418417,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 39.54356887499999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 39.825721167,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 40.108561583,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 40.391577999999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 40.675966417,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 40.95913012499999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 41.24176354199999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 41.52463133299999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 41.80832516699999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 42.09280804199999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 42.37494637499999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 42.65853879199999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 42.940067666999994,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 43.22377791699999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 43.505737624999995,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 43.78898862499999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 44.070453375,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 44.3566685,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 44.638230332999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 44.921552542,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 45.20323662499999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 45.487054042,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 45.76877708299999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 46.051441374999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 46.33272920799999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 46.617624832999994,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 46.89916691699999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 47.18215737499999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 47.464438625,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 47.748740332999986,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 48.030319082999995,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 48.312430917,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 48.595924583,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 48.877744582999995,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 49.15933199999999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 49.44213870799999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 49.72510558299999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 50.007290041999994,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 50.28927216699999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 50.57243679199999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 50.855791708,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 51.13939066699999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 51.42222099999999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 51.70574724999999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 51.98947470799999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 52.26656245799998,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 52.551853832999996,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 52.8376705,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 53.12222299999999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 53.40696441699998,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 53.68902995799999,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 53.975024042,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 54.25693099999998,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  },
+  {
+    "elapsed_s": 54.54132812500001,
+    "recognized": [
+      {
+        "comm": "/private/tmp/myds-indexer-k-runtime-20261025/target-bin/bench_indexer_fullmodel",
+        "pid": 23357
+      }
+    ]
+  }
+]

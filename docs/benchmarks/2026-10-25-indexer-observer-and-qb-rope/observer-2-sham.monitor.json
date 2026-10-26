@@ -1,0 +1,92 @@
+[
+  {
+    "elapsed_s": 0.023207458999999986,
+    "recognized": [
+      {
+        "pid": 90236,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/observer-build/bench_indexer_observer_probe"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 0.30766012499999995,
+    "recognized": [
+      {
+        "pid": 90236,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/observer-build/bench_indexer_observer_probe"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 0.5908575419999993,
+    "recognized": [
+      {
+        "pid": 90236,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/observer-build/bench_indexer_observer_probe"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 0.8733882089999998,
+    "recognized": [
+      {
+        "pid": 90236,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/observer-build/bench_indexer_observer_probe"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 1.156537792,
+    "recognized": [
+      {
+        "pid": 90236,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/observer-build/bench_indexer_observer_probe"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 1.4385989589999992,
+    "recognized": [
+      {
+        "pid": 90236,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/observer-build/bench_indexer_observer_probe"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 1.7211183749999996,
+    "recognized": [
+      {
+        "pid": 90236,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/observer-build/bench_indexer_observer_probe"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 2.0040559999999994,
+    "recognized": [
+      {
+        "pid": 90236,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/observer-build/bench_indexer_observer_probe"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 2.2865980840000004,
+    "recognized": [
+      {
+        "pid": 90236,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/observer-build/bench_indexer_observer_probe"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 2.5705087499999992,
+    "recognized": [
+      {
+        "pid": 90236,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/observer-build/bench_indexer_observer_probe"
+      }
+    ]
+  }
+]

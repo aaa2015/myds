@@ -103,11 +103,53 @@ kernel prefill_output_register_t probe_prefill_output_register<{TYPES}>;
                           reverse_edits_restore_native_byte_for_byte=True)
 
 
+def explicit_rounding(generated):
+    """One separately identified ablation; the R1 shader remains unchanged."""
+    new_symbol = "kernel_myds_prefill_output_register_round_f16_dk512_dv512"
+    changes = [
+        ("output_acc[ii] *= ms;",
+         "output_acc[ii] = precise::fma(output_acc[ii], float4(ms), float4(0.0f));", 2),
+        ("output_acc[ii] += lo[ii];",
+         "output_acc[ii] = precise::fma(float4(1.0f), output_acc[ii], lo[ii]);", 1),
+        ("(float4) output_acc[i/NW]*S;",
+         "precise::fma((float4)output_acc[i/NW], float4(S), float4(0.0f));", 1),
+        (SYMBOL, new_symbol, 1),
+    ]
+    for before, after, count in changes:
+        if generated.count(before) != count:
+            raise ValueError("Explicit-rounding edit anchor changed")
+        generated = generated.replace(before, after)
+    return generated, new_symbol, [dict(before=a, after=b, count=c) for a, b, c in changes]
+
+
+def capture_harness(source, symbol):
+    """Keep the real capture's existing complete input/provenance validation."""
+    before = '''    NSArray *names=@[@"kernel_myds_flash_attn_vec_head_first_f16_dk512_dv512",@"kernel_myds_flash_attn_vec_head_first_f16_dk512_dv512",
+        @"kernel_myds_prefill_attention_head2_f16_dk512_dv512",@"kernel_myds_prefill_attention_head4_f16_dk512_dv512"];
+    const unsigned batches[4]={1,1,2,4},smem[4]={3328,3328,23040,29696};'''
+    after = f'''    NSArray *names=@[@"kernel_myds_flash_attn_vec_head_first_f16_dk512_dv512",@"kernel_myds_flash_attn_vec_head_first_f16_dk512_dv512",
+        @"{symbol}"];
+    const unsigned batches[3]={{1,1,1}},smem[3]={{3328,3328,3328}};'''
+    edits = [(before, after, 1),
+             ("out[4]", "out[3]", 1), ("provider>=4", "provider>=3", 1),
+             ("psos[4]", "psos[3]", 1), ("p<4", "p<3", 3),
+             ("candidate<4", "candidate<3", 1),
+             ('@"providers":@4', '@"providers":@3', 1),
+             ('@"prefill_attention_multihead_real_capture"', '@"prefill_output_register_real_capture"', 1)]
+    for old, new, count in edits:
+        if source.count(old) != count:
+            raise ValueError("Capture-harness anchor changed: " + repr(old))
+        source = source.replace(old, new)
+    return source, [dict(before=a, after=b, count=c) for a, b, c in edits]
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--source-root", type=Path, required=True)
     p.add_argument("--out-dir", type=Path, required=True)
     p.add_argument("--emit-only", action="store_true")
+    p.add_argument("--build-harnesses", action="store_true")
+    p.add_argument("--explicit-rounding", action="store_true")
     a = p.parse_args()
     root = a.source_root.resolve(strict=True)
     out = a.out_dir.resolve()
@@ -117,6 +159,9 @@ def main():
     generated, proof = generate(source)
     if (root / "metal/myds_prefill_output_register.metal").read_text() != generated:
         raise ValueError("Checked-in probe differs from the exact transformation")
+    symbol, rounding_edits = SYMBOL, []
+    if a.explicit_rounding:
+        generated, symbol, rounding_edits = explicit_rounding(generated)
     out.mkdir(parents=True)
     (out / "probe.metal").write_text(generated)
     spec = importlib.util.spec_from_file_location("build", root / "tools/build_metallib.py")
@@ -124,11 +169,16 @@ def main():
     spec.loader.exec_module(build)
     (out / "all.metal").write_text(build.PREAMBLE + '\n#line 1 "flash_attn.metal"\n' +
                                    source + '\n#line 1 "probe.metal"\n' + generated)
-    identity = dict(schema_version=1, symbol=SYMBOL, source_root=str(root),
+    identity = dict(schema_version=1, symbol=symbol, source_root=str(root),
                     native_flash_sha256=sha(source.encode()), probe_sha256=sha(generated.encode()),
                     builder_sha256=sha(Path(__file__).read_bytes()), proof=proof,
                     production_registered=False, gpu_work_submitted=False,
-                    compile_only_pass=False)
+                    compile_only_pass=False,
+                    build_metallib_script_sha256=sha((root / "tools/build_metallib.py").read_bytes()),
+                    preamble_sha256=sha(build.PREAMBLE.encode()),
+                    combined_source_sha256=sha((out / "all.metal").read_bytes()))
+    identity.update(explicit_rounding_ablation=a.explicit_rounding,
+                    explicit_rounding_edits=rounding_edits)
     if not a.emit_only:
         commands = [
             ["xcrun", "-sdk", "macosx", "metal", "-mmacosx-version-min=26.0", "-O3",
@@ -146,6 +196,39 @@ def main():
                 subprocess.run(command, env=env, stdout=log, stderr=log, check=True)
         identity.update(compile_only_pass=True, commands=commands,
                         metallib_sha256=sha((out / "probe.metallib").read_bytes()))
+    if a.build_harnesses:
+        if a.emit_only:
+            raise ValueError("--build-harnesses requires compilation")
+        snapshots = {}
+        for rel in ("tools/bench_prefill_output_register.m", "tools/bench_attention_multihead.m",
+                    "src/myds_gguf.c", "include/myds_gguf.h"):
+            data = (root / rel).read_bytes()
+            snapshots[rel] = sha(data)
+            (out / Path(rel).name).write_bytes(data)
+        synthetic = (out / "bench_prefill_output_register.m").read_text()
+        if symbol != SYMBOL:
+            synthetic = synthetic.replace(SYMBOL, symbol)
+        (out / "bench_prefill_output_register.m").write_text(synthetic)
+        capture, harness_edits = capture_harness((out / "bench_attention_multihead.m").read_text(), symbol)
+        (out / "bench_capture.m").write_text(capture)
+        compile_commands = []
+        with (out / "harness-compile.log").open("w") as log:
+            for source_name, binary_name in (("bench_prefill_output_register.m", "bench_synthetic"),
+                                             ("bench_capture.m", "bench_capture")):
+                command = ["xcrun", "clang", "-O3", "-fobjc-arc", "-Wno-deprecated-declarations",
+                           "-mmacosx-version-min=26.0", "-I" + str(out), str(out / source_name),
+                           str(out / "myds_gguf.c"), "-framework", "Foundation", "-framework", "Metal",
+                           "-o", str(out / binary_name)]
+                compile_commands.append(command)
+                log.write(json.dumps(command) + "\n")
+                log.flush()
+                subprocess.run(command, env=env, stdout=log, stderr=log, check=True)
+        identity.update(harness_input_sha256=snapshots, capture_harness_edits=harness_edits,
+                        harness_compile_commands=compile_commands,
+                        synthetic_harness_sha256=sha((out / "bench_prefill_output_register.m").read_bytes()),
+                        capture_harness_sha256=sha((out / "bench_capture.m").read_bytes()),
+                        synthetic_binary_sha256=sha((out / "bench_synthetic").read_bytes()),
+                        capture_binary_sha256=sha((out / "bench_capture").read_bytes()))
     (out / "source-identity.json").write_text(json.dumps(identity, indent=2) + "\n")
     print(json.dumps(identity, indent=2))
 

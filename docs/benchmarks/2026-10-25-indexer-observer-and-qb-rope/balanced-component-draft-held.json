@@ -1,0 +1,184 @@
+{
+  "schema_version": 1,
+  "kind": "indexer_balanced_conditioning_component_protocol_draft",
+  "status": "draft_not_frozen_not_executed",
+  "execution_authorized_by_this_file": false,
+  "gpu_work_submitted": false,
+  "adoption_eligible_from_this_draft": false,
+  "activation_prerequisites": {
+    "diagnostic_protocol_sha256": "76c032bda7af0673eb3d7de77762d546aa9f8b1c3cd8b6bb9bc596a0536a111f",
+    "diagnostic_independent_reader_required": true,
+    "diagnostic_numeric_gate_required": "passed",
+    "diagnostic_measurement_correction_support_required": true,
+    "diagnostic_performance_samples_used_for_adoption": false,
+    "before_gpu_freeze": [
+      "Root reviews the independent diagnostic report and explicitly selects this measurement correction using the predeclared primary inline conditioner rule, not candidate speed or descriptive phase maxima.",
+      "Freeze a separate new harness/build/reader/protocol manifest with exact SHA256 and CPU mutation-test results.",
+      "Freeze complete execution argv, actual effective config, immutable capture/library/source/binary identities, process/exclusivity observations and final fullmodel prerequisites."
+    ],
+    "if_diagnostic_rule_fails": "Do not run this cohort; archive draft. No additional sample, threshold change or alternate diagnostic phase selection."
+  },
+  "relationship_to_previous_evidence": {
+    "old_r2_protocol_sha256": "ca89e5fac09106159b298892842195f1c021a42efd1970e7589fd4dd9938d982",
+    "old_r2_joint_gate_remains": "failed",
+    "old_r2_and_diagnostic_samples_in_new_statistics": false,
+    "reason_for_new_protocol": "Explicit measurement intervention aligns A1/A2 immediate GPU provider and output reuse, retaining original arithmetic, controls and gates.",
+    "this_is_not_a_retry_of_the_original_aba_protocol": true,
+    "only_one_new_frozen_cohort": true,
+    "no_retry_until_pass": true
+  },
+  "frozen_inputs": {
+    "capture_verified_sha256": "e7200c786445bf0946ef5fb7bdbe59b95bfd3de4118ec611583f9553752f5b6d",
+    "native_metallib_sha256": "3837102396703da59e0eebbc0de1fdc58b68b3a3a5ec5d07504b351c67a29ba9",
+    "probe_metallib_sha256": "9df7ed2a5212d54d4475480bf6388d2f66ce24c93bb3a8b003f2b789806d6982",
+    "full_native_source_sha256": "bc6603c97ec24af7597f6b10c7ed2a7bfe1344379733a0a4df780250a13f3224",
+    "config_sha256": "0a3524b030a73916f7684d841b912c6e978c680825a3c3520ca18188f35a2cff",
+    "config_contract": "Captured deployed config bytes and complete effective environment; PREFIX_CACHE=1, PLD=1; no selector override.",
+    "model_request_scope": "Same frozen first32768 captured tokens; one repeated-engineering request, not production workload distribution.",
+    "layers": [
+      2,
+      8,
+      14
+    ],
+    "shape": [
+      128,
+      15424
+    ],
+    "cache_dtype": "BF16",
+    "full_model_run_in_this_cohort": false,
+    "shader_math_or_compilation_context_change_allowed": false,
+    "all_input_args_provider_geometry_and_bytes_rechecked": true
+  },
+  "providers": [
+    {
+      "id": 0,
+      "role": "actual_exact_control",
+      "library": "native",
+      "symbol": "captured_actual_default_provider_symbol",
+      "args": "captured original native ABI bytes; preserve original geometry/dynamic threadgroup memory"
+    },
+    {
+      "id": 1,
+      "role": "TILED_control",
+      "library": "probe",
+      "symbol": "kernel_dsv4_indexer_scores_tiled_bf16",
+      "args": "unchanged complete-TU canonical args; original replay geometry/dynamic threadgroup memory"
+    },
+    {
+      "id": 2,
+      "role": "candidate_and_conditioner",
+      "library": "probe",
+      "symbol": "kernel_myds_indexer_scores_k_resident_bf16",
+      "args": "unchanged complete-TU canonical args; original replay geometry/dynamic threadgroup memory"
+    }
+  ],
+  "measurement": {
+    "mode": "concurrent one compute dispatch per command buffer, synchronous wait unchanged",
+    "groups_in_fixed_order": [
+      {
+        "layer": 2,
+        "control": 0
+      },
+      {
+        "layer": 2,
+        "control": 1
+      },
+      {
+        "layer": 8,
+        "control": 0
+      },
+      {
+        "layer": 8,
+        "control": 1
+      },
+      {
+        "layer": 14,
+        "control": 0
+      },
+      {
+        "layer": 14,
+        "control": 1
+      }
+    ],
+    "sample_order": [
+      "conditioner_candidate",
+      "A1_control",
+      "B_candidate",
+      "A2_control"
+    ],
+    "warmup_samples_per_group": 1,
+    "formal_samples_per_group": 9,
+    "conditioner_is_performance_sample": false,
+    "timing_record_count": 240,
+    "conditioner_timing_record_count": 60,
+    "warmup_conditioner_count": 6,
+    "formal_conditioner_count": 54,
+    "warmup_arm_timing_count": 18,
+    "formal_arm_timing_count": 162,
+    "numerical_and_topk_extra_command_buffers": "Separate from 240; count and save independently.",
+    "output_resource_policy": "Three stable provider-specific physical output buffers allocated once per layer before that layer timing groups, slot=actual provider. A1/A2 share the control slot; conditioner/B share candidate slot. No per-sample allocation or distinct-output alternative.",
+    "matched_control_condition": "A1 and A2 both immediately follow a candidate CB. In every formal sample, both reuse their shared control output after exactly two compute dispatches: previous A2 -> conditioner -> A1; A1 -> B -> A2. The warmup seeds the first formal reuse history.",
+    "first_warmup_history": "First warmup output history is not assumed initialized/matched; no warmup value enters performance statistics.",
+    "observer_policy": "Fixed inline primary mode of the diagnostic, chosen before inspecting candidate savings: after every CB wait take complete score/guard CPU snapshots and run the same two complete comparisons, finite/causal/poison scan and SHA. Emit JSON and write raw only after all four CBs. No CPU verification sampling; conditioners have identical observation work.",
+    "poison_and_guards": "Preserve frozen replay body poison each dispatch and original guard policy. Never repair or refill a damaged guard after a failing CB. Save failure outputs before refusing.",
+    "no_parameter_selection": "Do not tune sample count, warmup, sleep, order, provider, slot policy, observer mode or thresholds using diagnostic candidate speed or this cohort results.",
+    "host_clock": "Record host-host deltas using named host clock; calculate GPU-GPU intervals from Metal timestamps. Do not subtract across clock epochs without an independently established mapping.",
+    "timed_quantity": "Each measured arm GPU CB span only. Conditioner duration and host observer duration are excluded from arm median speedup, yet recorded in full; no engine end-to-end speed claim."
+  },
+  "raw_evidence": {
+    "every_record_including_conditioner": [
+      "plan SHA, source/build/binary/library/config identities",
+      "layer/control/sample/arm and warmup flag",
+      "actual selected symbol/provider/ABI args/grid/threads/dynamic threadgroup bytes",
+      "global sequence and actual previous provider/output slot",
+      "stable output resource identity and reuse-distance witness",
+      "GPU start/end/span and host poison/commit/wait/snapshot/validation times with named clock",
+      "full raw score bytes and full leading/trailing guard bytes; SHA256; source paths",
+      "mismatches to captured actual and immutable TILED reference; finite/causal/poison/guard checks; no trust in emitted pass booleans"
+    ],
+    "full_inputs_before_and_after": "All original Q/W/K cache and argument raw bytes plus guards, exact sizes and full SHA256; no input-only checksum claim.",
+    "deduplication": "Allowed only when complete bytes are preserved/materializable and full SHA and byte equality are verified; never sample or drop repeated records.",
+    "failure_policy": "Save all currently visible complete raw, input/guard post-state and failure reason, mark cohort invalid and stop. No performance interpretation or replacement samples."
+  },
+  "correctness": {
+    "before_any_formal_timing": "Original all-three-layer, all-three-provider numerical and actual ordered Top512 gate must pass; no timing-only fallback.",
+    "actual_exact": "Every actual-control output bit equals captured actual scores.",
+    "tiled_and_candidate": "Every output bit equals immutable TILED reference, including canonical negative infinity; candidate equals TILED for every complete output, not tolerance.",
+    "exact_to_tiled_difference": "Preserve original 4 L2 score-cell differences; report as a known provider difference, never label exact-to-TILED scores bit-identical.",
+    "actual_topk": "Complete actual deployed Top512 ordered IDs for all three providers/layers match captured IDs before timing; preserve original raw TopK outputs and consumer configuration.",
+    "conditioners": "All 60 complete candidate outputs and guards pass the same candidate numerical contract, have complete raw/SHA/timestamps, and remain excluded from performance statistics.",
+    "all_inputs_unchanged": "Complete original input bytes and guards before/after exact.",
+    "fullmodel_or_downstream_correctness_proven": false
+  },
+  "performance": {
+    "formal_arm_records_expected": 162,
+    "group_count": 6,
+    "formal_samples_per_arm_per_group": 9,
+    "group_statistics": "For each layer/control separately, A1=median(9 formal A1 gpu_us), B=median(9 formal B gpu_us), A2=median(9 formal A2 gpu_us). No pooling, trimming, best-of, paired-ratio substitution, warmup or conditioner inclusion.",
+    "control_drift_percent_formula": "100*(A2/A1-1)",
+    "conservative_time_saved_percent_formula": "100*(1-B/min(A1,A2))",
+    "max_abs_control_drift_percent_inclusive": 2.0,
+    "min_conservative_time_saved_percent_strict": 2.0,
+    "every_layer_every_control_required": true,
+    "joint_pass": "All identity/integrity/numerical/TopK/input/guard/exclusivity gates AND every one of the six drift and strict-savings gates pass.",
+    "exit_zero_is_joint_pass": false,
+    "reader_recomputes_from_saved_raw": true,
+    "missing_duplicate_nonpositive_nonfinite_or_out_of_order_record": "refuse cohort; no statistical interpretation",
+    "no_adjustment_or_additional_gpu_sample_after_result": true
+  },
+  "interpretation_boundaries": [
+    "This intervention matches immediate predecessor provider and logical output-reuse distance for A1 and A2; it does not match the immediate predecessor of measured B to those of A1/A2. B follows control, whereas A1/A2 follow candidate.",
+    "The added conditioner does not recreate ordinary full-model scheduling or establish a unique DVFS/cache/host mechanism.",
+    "GPU span saving applies only to this independently frozen conditioned component protocol. It is not intrinsic isolated-kernel proof, engine speedup, HTTP TTFT, stable decode speed, or production workload evidence.",
+    "A successful new cohort does not erase or reinterpret the original R2 failed joint gate and cannot be pooled with diagnosis.",
+    "The primary inline observer and fixed candidate conditioner are specified from control-stability hypotheses. Deferred/distinct diagnostic phases cannot be selected because they show a larger candidate saving."
+  ],
+  "after_joint_gate": {
+    "if_any_gate_fails": "Stop candidate progression; preserve complete failure. Do not run fullmodel or register candidate runtime from this result.",
+    "if_all_gates_pass": "May prepare a separately authorized/frozen fullmodel native and HTTP A1/B/A2 gate; no runtime or production adoption from component success alone.",
+    "fullmodel_minimum": "At least one warmup and three formal samples per A1/B/A2 arm, both required workloads, complete logits/tokens/output/state/bytes, prefill and decode separated, provider/symbol/adoption witnesses, exact effective production config and restoration; >2% fullmodel saving and frozen control drift gates.",
+    "fullmodel_driver_status": "Prepared only, never executed with model/GPU at time of this draft.",
+    "runtime_candidate_registered": false,
+    "production_adoption": false
+  }
+}

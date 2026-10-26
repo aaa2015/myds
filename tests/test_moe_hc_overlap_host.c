@@ -209,3 +209,5 @@ int main(void) {
     puts("PASS: actual MoE C HC schedule, three cohorts, strict env,101 exclusions,scratch guards,counters,stage failures,caller restoration; CPU recording stubs only");
     return 0;
 }
+
+int myds_metal_kprof_exclusive(void) { return 0; }

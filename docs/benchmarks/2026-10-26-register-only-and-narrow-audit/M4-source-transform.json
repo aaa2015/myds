@@ -1,0 +1,13 @@
+{
+  "kind": "complete_TU_append_inverse",
+  "complete_native_prefix_byte_exact": true,
+  "inverse_remove_only_recorded_suffix_restores_native_byte_for_byte": true,
+  "native_bytes": 1574167,
+  "native_sha256": "bc6603c97ec24af7597f6b10c7ed2a7bfe1344379733a0a4df780250a13f3224",
+  "append_marker": "\n#line 1 \"myds_indexer_register_only.metal.inc\"\n",
+  "candidate_source_begin": 1574215,
+  "candidate_source_bytes": 5519,
+  "candidate_source_sha256": "a0e6ea89dbe80862593ec0b89b02bdacf75efd83271d53c3a9b0c18f0adbfecb",
+  "combined_bytes": 1579734,
+  "combined_sha256": "b46254ccf5a3a51098f457a223c561b733020b1c9cd2613ee75a27604f5568bd"
+}

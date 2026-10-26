@@ -1,0 +1,227 @@
+[
+  {
+    "elapsed_s": 0.02295791600000001,
+    "recognized": [
+      {
+        "pid": 84927,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/diagnostic-build-v3/bench_indexer_stability"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 0.306460833,
+    "recognized": [
+      {
+        "pid": 84927,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/diagnostic-build-v3/bench_indexer_stability"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 0.590161208,
+    "recognized": [
+      {
+        "pid": 84927,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/diagnostic-build-v3/bench_indexer_stability"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 0.873972375,
+    "recognized": [
+      {
+        "pid": 84927,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/diagnostic-build-v3/bench_indexer_stability"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 1.1565092909999999,
+    "recognized": [
+      {
+        "pid": 84927,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/diagnostic-build-v3/bench_indexer_stability"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 1.440333833,
+    "recognized": [
+      {
+        "pid": 84927,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/diagnostic-build-v3/bench_indexer_stability"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 1.724306916,
+    "recognized": [
+      {
+        "pid": 84927,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/diagnostic-build-v3/bench_indexer_stability"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 2.0081491660000004,
+    "recognized": [
+      {
+        "pid": 84927,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/diagnostic-build-v3/bench_indexer_stability"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 2.292267958,
+    "recognized": [
+      {
+        "pid": 84927,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/diagnostic-build-v3/bench_indexer_stability"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 2.57551325,
+    "recognized": [
+      {
+        "pid": 84927,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/diagnostic-build-v3/bench_indexer_stability"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 2.859777583,
+    "recognized": [
+      {
+        "pid": 84927,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/diagnostic-build-v3/bench_indexer_stability"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 3.144132791,
+    "recognized": [
+      {
+        "pid": 84927,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/diagnostic-build-v3/bench_indexer_stability"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 3.424949541,
+    "recognized": [
+      {
+        "pid": 84927,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/diagnostic-build-v3/bench_indexer_stability"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 3.710851458,
+    "recognized": [
+      {
+        "pid": 84927,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/diagnostic-build-v3/bench_indexer_stability"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 3.995209041,
+    "recognized": [
+      {
+        "pid": 84927,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/diagnostic-build-v3/bench_indexer_stability"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 4.279318333,
+    "recognized": [
+      {
+        "pid": 84927,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/diagnostic-build-v3/bench_indexer_stability"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 4.562780083,
+    "recognized": [
+      {
+        "pid": 84927,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/diagnostic-build-v3/bench_indexer_stability"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 4.846908916,
+    "recognized": [
+      {
+        "pid": 84927,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/diagnostic-build-v3/bench_indexer_stability"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 5.131183916,
+    "recognized": [
+      {
+        "pid": 84927,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/diagnostic-build-v3/bench_indexer_stability"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 5.415000416,
+    "recognized": [
+      {
+        "pid": 84927,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/diagnostic-build-v3/bench_indexer_stability"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 5.6918918750000005,
+    "recognized": [
+      {
+        "pid": 84927,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/diagnostic-build-v3/bench_indexer_stability"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 5.975227875,
+    "recognized": [
+      {
+        "pid": 84927,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/diagnostic-build-v3/bench_indexer_stability"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 6.260125791,
+    "recognized": [
+      {
+        "pid": 84927,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/diagnostic-build-v3/bench_indexer_stability"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 6.537972875,
+    "recognized": [
+      {
+        "pid": 84927,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/diagnostic-build-v3/bench_indexer_stability"
+      }
+    ]
+  },
+  {
+    "elapsed_s": 6.822282416,
+    "recognized": [
+      {
+        "pid": 84927,
+        "comm": "/private/tmp/myds-indexer-r3-20261025/diagnostic-build-v3/bench_indexer_stability"
+      }
+    ]
+  }
+]

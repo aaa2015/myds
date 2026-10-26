@@ -1,0 +1,102 @@
+[
+  {
+    "time": 1792934725.260312,
+    "processes": [
+      {
+        "pid": 62826,
+        "name": "bench_indexer_k_resident",
+        "permitted": true
+      }
+    ]
+  },
+  {
+    "time": 1792934725.5455968,
+    "processes": [
+      {
+        "pid": 62826,
+        "name": "bench_indexer_k_resident",
+        "permitted": true
+      }
+    ]
+  },
+  {
+    "time": 1792934725.831882,
+    "processes": [
+      {
+        "pid": 62826,
+        "name": "bench_indexer_k_resident",
+        "permitted": true
+      }
+    ]
+  },
+  {
+    "time": 1792934726.1180842,
+    "processes": [
+      {
+        "pid": 62826,
+        "name": "bench_indexer_k_resident",
+        "permitted": true
+      }
+    ]
+  },
+  {
+    "time": 1792934726.404076,
+    "processes": [
+      {
+        "pid": 62826,
+        "name": "bench_indexer_k_resident",
+        "permitted": true
+      }
+    ]
+  },
+  {
+    "time": 1792934726.689481,
+    "processes": [
+      {
+        "pid": 62826,
+        "name": "bench_indexer_k_resident",
+        "permitted": true
+      }
+    ]
+  },
+  {
+    "time": 1792934726.972812,
+    "processes": [
+      {
+        "pid": 62826,
+        "name": "bench_indexer_k_resident",
+        "permitted": true
+      }
+    ]
+  },
+  {
+    "time": 1792934727.260017,
+    "processes": [
+      {
+        "pid": 62826,
+        "name": "bench_indexer_k_resident",
+        "permitted": true
+      }
+    ]
+  },
+  {
+    "time": 1792934727.541703,
+    "processes": [
+      {
+        "pid": 62826,
+        "name": "bench_indexer_k_resident",
+        "permitted": true
+      }
+    ]
+  },
+  {
+    "time": 1792934727.825726,
+    "processes": [
+      {
+        "pid": 62826,
+        "name": "bench_indexer_k_resident",
+        "permitted": true
+      }
+    ]
+  }
+]

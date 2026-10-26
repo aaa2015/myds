@@ -1,0 +1,270 @@
+{
+  "alias_contract": {
+    "actual_source_guard": "decode_spans_disjoint uses myds_metal_buffer_data view-start addresses and complete buffer_size ranges, not handle equality; partial full extent included when check_kv_reuse",
+    "harness_actual_gpu_buffers": "separate newBuffer allocations per provider/role, size/offset checks and complete guards; not executed on GPU by this audit",
+    "mock_data_plus4096_alias_rejected": true,
+    "mock_fixture_distinct_handles": true,
+    "mock_pointer_values_are_not_actual_MTL_allocations": true,
+    "mock_same_data_address_alias_rejected": true,
+    "real_MTL_allocation_lifetime_validation_not_executed": true
+  },
+  "all_runtime_qkv_finish_call_sites": [
+    {
+      "binding": "actual ctx.q, reference/no-scope branch; excluded",
+      "line": 2345,
+      "path": "src/myds_v41_moe.c"
+    },
+    {
+      "binding": "scratch.partial, non-index-source KV_REUSE branch; initial eligible scope",
+      "line": 2441,
+      "path": "src/myds_v41_moe.c"
+    },
+    {
+      "binding": "actual ctx.q, alternate no-indexer-overlap branch; excluded",
+      "line": 2462,
+      "path": "src/myds_v41_moe.c"
+    },
+    {
+      "binding": "scratch.partial, index-source KV_REUSE branch; initial excluded",
+      "line": 2560,
+      "path": "src/myds_v41_moe.c"
+    },
+    {
+      "binding": "actual ctx.q when no KV_REUSE; excluded",
+      "line": 2595,
+      "path": "src/myds_v41_moe.c"
+    },
+    {
+      "binding": "actual ctx.q; excluded",
+      "line": 4272,
+      "path": "src/myds_v41.c"
+    },
+    {
+      "binding": "actual ctx.q; excluded",
+      "line": 4352,
+      "path": "src/myds_v41.c"
+    },
+    {
+      "binding": "actual ctx.q; excluded",
+      "line": 4384,
+      "path": "src/myds_v41.c"
+    },
+    {
+      "binding": "batch2 actual q; excluded",
+      "line": 4728,
+      "path": "src/myds_v41.c"
+    }
+  ],
+  "build_manifest": {
+    "path": "/tmp/myds-kv-only-finish-probe-final-v1-20261025/source-identity.json",
+    "sha256": "5d8d279bd6d6287402d71dabec84c89c5fb1b6740547ab7ced87fe24e690b2c4"
+  },
+  "dummy_dataflow": {
+    "actual_q_separate": "QB -> ctx.q followed by independent forward RoPE, unchanged",
+    "all_existing_resource_barriers_retained": true,
+    "allocation_bytes": 4210688,
+    "dummy_q_accessed_bytes_per_direction": 16384,
+    "dummy_q_accessed_elements": 4096,
+    "dummy_q_declared_range_bytes": 131072,
+    "normal_register_readers": "dispatch_register_attention register_buffers contains q,kv_f16,kv_f16,mask,sinks,pad,heads; no partial handle/range",
+    "normal_register_return": "attention_direct_impl returns immediately after register path, no subsequent partial reduce",
+    "other_consumers": "FLASH_DEC split/reduce and generic vec/reduce own partial producer then fence/reduce; initial candidate explicitly excludes these alternatives",
+    "reads_after_fail": "scope resets reuse state and restores modes, outer v41 fail commits pending batch before invalidating graph; no new retry/fallback/readback",
+    "scratch_not_deallocated_or_resized": true
+  },
+  "gpu_work_submitted": false,
+  "history": {
+    "introduced_dummy_use_commit": "21c131c",
+    "ledger_existing_qkv_profile": "old 0.265ms/29call grid80 figure is serialized profiling context, not current speed upper bound",
+    "no_prior_KV_only_trial_found_in_ledger_or_bounded_history_search": true,
+    "not_global_decode_ceiling_proof": true
+  },
+  "host_fixture_records": [
+    {
+      "actual_q_finish_calls": 0,
+      "dummy_finish_calls": 40,
+      "eligible_narrow_layer_calls": 32,
+      "gpu_work_submitted": false,
+      "kind": "actual_scheduler_bindings",
+      "position": 0
+    },
+    {
+      "actual_q_finish_calls": 0,
+      "dummy_finish_calls": 40,
+      "eligible_narrow_layer_calls": 32,
+      "gpu_work_submitted": false,
+      "kind": "actual_scheduler_bindings",
+      "position": 1
+    },
+    {
+      "actual_q_finish_calls": 0,
+      "dummy_finish_calls": 40,
+      "eligible_narrow_layer_calls": 32,
+      "gpu_work_submitted": false,
+      "kind": "actual_scheduler_bindings",
+      "position": 127
+    },
+    {
+      "actual_q_finish_calls": 0,
+      "dummy_finish_calls": 40,
+      "eligible_narrow_layer_calls": 32,
+      "gpu_work_submitted": false,
+      "kind": "actual_scheduler_bindings",
+      "position": 128
+    },
+    {
+      "actual_q_finish_calls": 0,
+      "dummy_finish_calls": 40,
+      "eligible_narrow_layer_calls": 32,
+      "gpu_work_submitted": false,
+      "kind": "actual_scheduler_bindings",
+      "position": 2047
+    },
+    {
+      "all_layer_calls": 200,
+      "distinct_handle_same_start_and_offset4096_overlap_rejected_before_finish": true,
+      "failure_stages": 4,
+      "gpu_work_submitted": false,
+      "kind": "kv_only_finish_source_host_contract",
+      "long_narrow_calls": 32,
+      "narrow_layer_calls": 160,
+      "passed": true
+    }
+  ],
+  "kind": "kv_only_finish_private_source_contract_cpu_audit",
+  "limitations": [
+    "CPU source/fixture evidence does not prove GPU bytes, lifetime behavior, target device performance or fullmodel equivalence.",
+    "No current graph speedup estimate: Q_B may dominate the cohort even after deleting all dummy work.",
+    "Same source expressions under fast math remain subject to target component full-output gates."
+  ],
+  "narrow_scope": {
+    "flash_dec": 0,
+    "index_source_and_batch2_and_generic_public_calls_excluded": true,
+    "kv_reuse": 1,
+    "layers_per_token": 32,
+    "need_logits": true,
+    "non_index_source_layers": [
+      0,
+      1,
+      3,
+      4,
+      5,
+      6,
+      7,
+      9,
+      10,
+      11,
+      12,
+      13,
+      15,
+      16,
+      17,
+      18,
+      19,
+      21,
+      22,
+      23,
+      25,
+      26,
+      27,
+      29,
+      30,
+      31,
+      33,
+      34,
+      35,
+      37,
+      38,
+      39
+    ],
+    "ordinary_scalar_decode": true,
+    "register_attention": 1,
+    "rf": 1,
+    "swa_nraw": "min(pos+1,128), >=1 for every legal scalar pos",
+    "trace": false
+  },
+  "new_private_probe_only": true,
+  "new_shader_source_proof": {
+    "candidate_kv_branch_sha256": "1ede8212085089d2fd82e817ebf845a0516c0551623a4bd2701a38939e8bdc0b",
+    "complete_kv_branch_bytes_unchanged": true,
+    "deleted_dummy_q_branch": "    if(group<64u) {\n        const float theta=float(args.pos)*args.frequencies[lane];\n        const float c=precise::cos(theta),s=precise::sin(theta);\n        const uint i=group*512u+448u+2u*lane;\n        const float re=q[i],im=q[i+1u];\n        q[i]=dsv41_bf16(re*c-im*s);\n        q[i+1u]=dsv41_bf16(re*s+im*c);\n        return;\n    }\n",
+    "exact_edits": [
+      {
+        "after": "kernel void kernel_myds_probe_kv_only_finish(",
+        "before": "kernel void kernel_dsv41_qkv_finish("
+      },
+      {
+        "after": "    if(group<64u) return;\n",
+        "before": "    if(group<64u) {\n        const float theta=float(args.pos)*args.frequencies[lane];\n        const float c=precise::cos(theta),s=precise::sin(theta);\n        const uint i=group*512u+448u+2u*lane;\n        const float re=q[i],im=q[i+1u];\n        q[i]=dsv41_bf16(re*c-im*s);\n        q[i+1u]=dsv41_bf16(re*s+im*c);\n        return;\n    }\n"
+      }
+    ],
+    "kv_branch_sha256": "1ede8212085089d2fd82e817ebf845a0516c0551623a4bd2701a38939e8bdc0b",
+    "no_dispatch_or_barrier_removed": true,
+    "numerical_equivalence_gpu_unverified": true,
+    "original_buffer_order_retained": [
+      "args",
+      "dummy_q",
+      "kv",
+      "window"
+    ],
+    "original_kernel_sha256": "7b495f30f84433e428e73dd7aac6cf801924881d91eeae48c4520f93333b5efc",
+    "original_kv_group_mapping": "all 80 original groups and lane 0..31 unchanged; Q groups0..63 return before reads or trig",
+    "reverse_edits_restore_original_body_bytes": true
+  },
+  "parent_private_source_inventory_sha256": "7791166d7a9a6ef29eaa2336c665919ee041ec1eae47e32027d6a656b44adec7",
+  "private_source_root": "/tmp/myds-indexer-k-runtime-20261025/source",
+  "production_config": {
+    "entries": 62,
+    "path": "/tmp/myds-indexer-r2-real-local-20261025/deployed/myds.conf",
+    "sha256": "0a3524b030a73916f7684d841b912c6e978c680825a3c3520ca18188f35a2cff"
+  },
+  "runtime_source_modified": false,
+  "schema_version": 1,
+  "source_hashes": {
+    "metal/dsv41.metal": {
+      "bytes": 26736,
+      "sha256": "7a15599dc6d329715c610b581b2babcce46580187707b8d87565e795b41ed1a2"
+    },
+    "metal/flash_attn.metal": {
+      "bytes": 115672,
+      "sha256": "503fc1ec7fb94130f4e44c1a1147bf182d11c9993cc0688e8ed2f4993df7bdc6"
+    },
+    "src/myds_metal.m": {
+      "bytes": 414603,
+      "sha256": "f65be0b12471f75a8b305e42095e905a18e0227da1d4b8e13494fe95bd3b76b1"
+    },
+    "src/myds_v41.c": {
+      "bytes": 473658,
+      "sha256": "0a533b45d93b6e1c19ab2d129795513156b415874cef090c769b311cc8758765"
+    },
+    "src/myds_v41_gpu.c": {
+      "bytes": 169125,
+      "sha256": "c580fea37d7966d2e21a43101fa5cdb39a7ae3ec4e8ba650150f197a5d6aaff3"
+    },
+    "src/myds_v41_moe.c": {
+      "bytes": 147241,
+      "sha256": "b1445b3f207ae60a0071c0ac5825cf795447e1c2d57592aaf2e13c3cea4a66eb"
+    },
+    "tests/test_attn_indexer_overlap_host.c": {
+      "bytes": 37478,
+      "sha256": "27e06fdfdd3e5ac5932a1ba1107a3b2d834e834bbab37a7a110fec969b78c2f3"
+    }
+  },
+  "work_removed_per_narrow_token": {
+    "barriers_removed": 0,
+    "dispatches_removed": 0,
+    "dummy_q_f32_values_read": 131072,
+    "dummy_q_f32_values_written": 131072,
+    "dummy_q_tgs_early_return": 2048,
+    "logical_read_plus_write_bytes": 1048576,
+    "pair_rotations": 65536,
+    "physical_dram_bytes_or_speedup_measured": false,
+    "precise_cos_calls": 65536,
+    "precise_sin_calls": 65536,
+    "tg_dispatch_grid_unchanged": [
+      80,
+      1,
+      1
+    ]
+  }
+}

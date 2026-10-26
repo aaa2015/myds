@@ -1,0 +1,11 @@
+{
+  "kind": "qb_rope_host_only_independent_cpu_review",
+  "passed": true,
+  "case_count": 114,
+  "full_payloads_sha_verified": 344,
+  "eligible_layer_count": 32,
+  "gpu_command_buffers_submitted": 0,
+  "gpu_record_count": 0,
+  "both_frequency_modes": true,
+  "host_only_gold_is_build_native_not_deployed": true
+}

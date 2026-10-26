@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "kind": "register_only_failed_v1_exact_source_diagnostic_snapshot",
+  "files": [
+    {
+      "original": "/Users/fangqingyuan/Projects/myds/tools/build_indexer_register_only_probe.py",
+      "snapshot": "/tmp/myds-register-only-mma-diagnostic-v1-20261026/snapshot/tools/build_indexer_register_only_probe.py",
+      "bytes": 17907,
+      "sha256": "52125e53ea95a77e0251abb4ed86173e01e73fc68ce99532d7d7d9c25c16eac6"
+    },
+    {
+      "original": "/Users/fangqingyuan/Projects/myds/tools/indexer_register_only.metal.inc",
+      "snapshot": "/tmp/myds-register-only-mma-diagnostic-v1-20261026/snapshot/tools/indexer_register_only.metal.inc",
+      "bytes": 5519,
+      "sha256": "a0e6ea89dbe80862593ec0b89b02bdacf75efd83271d53c3a9b0c18f0adbfecb"
+    },
+    {
+      "original": "/Users/fangqingyuan/Projects/myds/tests/test_indexer_register_only_builder.py",
+      "snapshot": "/tmp/myds-register-only-mma-diagnostic-v1-20261026/snapshot/tests/test_indexer_register_only_builder.py",
+      "bytes": 11254,
+      "sha256": "5c96f07e4b76a29c0c05f2823b1dab4c6c543dbd5e5782333837c92412334d56"
+    }
+  ],
+  "GPU_work_submitted": false,
+  "v1_sources_modified": false,
+  "scope": "Preserve failed v1 before CPU source/AIR diagnosis; no runtime or GPU edits"
+}

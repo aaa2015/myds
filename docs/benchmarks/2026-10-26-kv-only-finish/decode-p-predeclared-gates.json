@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "kind": "decode_KV_only_P_gates_frozen_before_native_Q_or_P_data",
+  "root_approved_before_native_data": true,
+  "subject": "decode_kv_only_finish",
+  "performance_gate": {
+    "all_workloads_and_all_secondary_gates_required": true,
+    "formal_median_samples_per_arm": 3,
+    "warmup_run": 0,
+    "formal_runs": [
+      1,
+      2,
+      3
+    ],
+    "primary_metric": "decode_ms_per_token",
+    "primary_saved_percent_formula": "100*(1-B/min(A1,A2))",
+    "primary_min_saved_percent_strict": 2.0,
+    "signed_control_drift_percent_formula": "100*(A2/A1-1)",
+    "control_drift_metrics": [
+      "prefill_s",
+      "ttft_s",
+      "decode_ms_per_token"
+    ],
+    "max_abs_control_drift_percent_inclusive": 1.0,
+    "nonregression_metrics": [
+      "prefill_s",
+      "ttft_s"
+    ],
+    "nonregression_percent_formula": "100*(B/min(A1,A2)-1)",
+    "max_nonregression_percent_inclusive": 0.5,
+    "denominator": "Per workload and metric, sort the three formal runs1,2,3 separately for A1/B/A2 and select each raw median; no pooling, trimming, replacement or retry.",
+    "arithmetic": "Raw JSON decimal string to Fraction; exact rational comparisons, no floating epsilon or rounded display gates.",
+    "threshold_basis": "Prospective root-approved 2026-10-26 before decode KV-only native Q/P data; original K/R2/component gates and their outcomes unchanged.",
+    "total_native_generations": 24,
+    "total_warmup_generations": 6,
+    "total_formal_generations": 18,
+    "no_spec_numerical_state_raw_provider_and_identity_gates_before_performance": true,
+    "all_warm_and_formal_generations_require_exact_N256": true,
+    "TTFT_or_prefill_speedup_claim_requires_own_evidence": true
+  },
+  "request_contract": {
+    "output_tokens": 256,
+    "max_seq_len": 327680,
+    "warmup_runs": 1,
+    "temperature": 0,
+    "top_p": 1,
+    "top_k": 0,
+    "min_p": 0,
+    "repetition_penalty": 1,
+    "seed": 42,
+    "stream": false,
+    "thinking": false,
+    "token_format": "little_endian_int32_raw",
+    "renderer": "parse_chat_prompt",
+    "tokenizer": "target_gguf_metadata",
+    "actual_prompt_counts_from_target_not_nominal": true,
+    "no_request_length_retuning": true
+  },
+  "request_body_artifacts": {
+    "short": {
+      "path": "/private/tmp/myds-decode-kv-only-validation-20261026/short-source.json",
+      "bytes": 331,
+      "sha256": "bcb0d0f3db8b309499714e66f7056fdac51038ba01f95e565cfc4d9f09a6d088"
+    },
+    "business2": {
+      "path": "/private/tmp/myds-decode-kv-only-validation-20261026/business2-source.json",
+      "bytes": 4200,
+      "sha256": "5b48f3d489ada3a13b738746b8a32de4a148c677ffebcbe688c6f31d509bda8c"
+    }
+  },
+  "private_binary": {
+    "path": "/private/tmp/myds-decode-kv-only-runtime-20261025/bin/bench_decode_kv_only_fullmodel",
+    "bytes": 955216,
+    "sha256": "a4288dd88714bc32fcc2f54897fb636e5ed6660caca229c7cf391ba709dfaf05"
+  },
+  "private_library": {
+    "path": "/private/tmp/myds-decode-kv-only-runtime-20261025/bin/myds.metallib",
+    "bytes": 4282682,
+    "sha256": "d12ddb1ec806f1daa3848e9687e468aba3ea80d1e91aa3d4081c16eb4852facd"
+  },
+  "no_retuning_from_Q_or_P_results": true,
+  "nominal_10_and_800_prompt_tokens_are_not_gates": true
+}

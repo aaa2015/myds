@@ -1,0 +1,934 @@
+commit f0b4f55fcc3164be9637879fbbc635385ca213d9
+Author:     Mark Shank <mark.shank@gmail.com>
+AuthorDate: Wed Oct 21 11:53:25 2026 -0400
+Commit:     Mark Shank <mark.shank@gmail.com>
+CommitDate: Wed Oct 21 15:49:56 2026 -0400
+
+    Compute one RoPE table per V4.1 decode token
+    
+    Every layer computed the same RoPE cos/sin values for the current position, in both the attention and the indexer. Decode now computes them once per token into a small table at the start of the step, and the layers read it.
+    
+    With the table, the kernel that finishes attention can also undo the RoPE rotation and round to bf16 as it writes its output, so the next projection becomes a plain Q8_0 matrix-vector product. In the indexer, applying RoPE and quantizing the query to FP4 are now one kernel instead of two. The results are bit-identical.
+    
+    DS4_METAL_DISABLE_V41_ROPE_TABLE=1 computes RoPE in each layer as before.
+
+diff --git a/ds4.c b/ds4.c
+index 1ce8bf6..f19ddca 100644
+--- a/ds4.c
++++ b/ds4.c
+@@ -40976,6 +40976,10 @@ typedef struct {
+     uint32_t tp_world, tp_rank;
+     bool tp_gate_fused, shared_done, hc_attn_deferred, hc_ffn_deferred, scalar_decode, kv_stored;
+     bool low_unrounded;   /* TP: low's BF16 rounding is left to its kslice consumer */
++    /* Metal: one decode step's RoPE coefficient table, valid for position rope_tab_pos - 1 while that step runs
++     * (0: none). */
++    ds4_gpu_tensor *rope_tab;
++    uint32_t rope_tab_pos;
+     ds4_gpu_tensor *tp_logits_half, *selected_half, *route_weights_half;
+     ds4_gpu_tensor **tp_out, **tp_in;
+     ds4_gpu_tensor **tp_batch_out, **tp_batch_in;
+@@ -41022,6 +41026,7 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
+     ds4_gpu_tensor_free(g->tp_logits_half);
+     ds4_gpu_tensor_free(g->selected_half);
+     ds4_gpu_tensor_free(g->route_weights_half);
++    ds4_gpu_tensor_free(g->rope_tab);
+     for (uint32_t i = 0; g->rows_view && i < g->prefill_cap; i++) {
+ #define DS41_ROW_FREE(name, count) ds4_gpu_tensor_free(g->rows_view[i].name);
+         DS41_PREFILL_ROWS(DS41_ROW_FREE)
+@@ -41279,6 +41284,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
+         }
+         ds41_narrow_resident(m, w);
+     }
++#ifdef __APPLE__
++    g->rope_tab = ds4_gpu_tensor_alloc(64u * 2u * sizeof(float));   /* optional: without it decode computes (cos, sin) */
++#endif
+     fprintf(stderr, "ds4: V4.1 static context buffers %.2f MiB (ctx=%u), Engram disk-only\n",
+             (double)ds41_graph_bytes(ctx) / 1048576.0, ctx);
+     return true;
+@@ -41660,15 +41668,23 @@ static bool ds41_hc_mix(ds41_gpu_graph *g, const ds4_model *m,
+ }
+ 
+ /* rope_il >= 0: the heads still carry their rope; that layer's inverse rope
+- * folds into the projection (else it runs first). */
++ * folds into the projection (else it runs first). transformed: the decode
++ * reduce already applied it (and the bf16 rounding). */
+ static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
+-                               const ds4_layer_weights *l, int rope_il) {
++                               const ds4_layer_weights *l, int rope_il, bool transformed) {
+     const uint32_t groups = DS4_N_OUT_GROUP / g->tp_world;
+     const uint32_t group0 = g->tp_rank * groups;
+     uint64_t output_row;
+     if (!tensor_nbytes(l->attn_output_a->type, 4096, &output_row)) return false;
+     const uint64_t offset = l->attn_output_a->abs_offset + (uint64_t)group0 * 1024u * output_row;
+     const bool compressed = rope_il >= 0 && ds4_layer_compress_ratio((uint32_t)rope_il) != 0;
++#ifdef __APPLE__
++    if (transformed) {
++        if (!ds4_gpu_dsv41_attention_low_plain(g->low, m->map, m->size, offset, 4096, 1024, groups, g->heads))
++            return false;
++        return l->attn_output_b->type == DS4_TENSOR_Q8_0 || ds41_bf16(g->low, groups * DS4_N_LORA_O);
++    }
++#endif
+     const bool fused = rope_il >= 0 &&
+         ds4_gpu_dsv41_attention_low(g->low, m->map, m->size, offset, 4096, 1024, groups,
+                                     g->heads, g->pos, compressed);
+@@ -41708,13 +41724,13 @@ static bool ds41_attention_b(ds41_gpu_graph *g, const ds4_model *m,
+ 
+ static bool ds41_attention_output(ds41_gpu_graph *g, const ds4_model *m,
+                                   const ds4_layer_weights *l, int rope_il, ds4_gpu_tensor *out) {
+-    return ds41_attention_low(g, m, l, rope_il) && ds41_attention_b(g, m, l, out);
++    return ds41_attention_low(g, m, l, rope_il, false) && ds41_attention_b(g, m, l, out);
+ }
+ 
+ /* The attention output expanded straight into the HC streams. */
+ static bool ds41_attention_expand(ds41_gpu_graph *g, const ds4_model *m,
+-                                  const ds4_layer_weights *l, int rope_il) {
+-    if (!ds41_attention_low(g, m, l, rope_il)) return false;
++                                  const ds4_layer_weights *l, int rope_il, bool transformed) {
++    if (!ds41_attention_low(g, m, l, rope_il, transformed)) return false;
+     if (l->attn_output_b->type == DS4_TENSOR_Q8_0 && !ds41_expand_fusion_off() &&
+         ds4_gpu_dsv41_matmul_expand_rows(g->after_attn, m->map, m->size, l->attn_output_b->abs_offset,
+             l->attn_output_b->dim[0], l->attn_output_b->dim[1], g->low, NULL, g->residual,
+@@ -41796,6 +41812,19 @@ static bool ds41_attention_pick(ds41_gpu_graph *g, uint32_t il) {
+         ds4_gpu_dsv41_indexer_topk_tensor(g->selected_comp, g->index_scores, n_comp, 1, top));
+ }
+ 
++/* The index query's rope + FP4_E8M0 quantization: one dispatch on a compressed layer with this step's RoPE table,
++ * else the rope and the quantization. */
++static bool ds41_index_q_rope_quantize(ds41_gpu_graph *g, uint32_t il, uint32_t pos) {
++#ifdef __APPLE__
++    if (ds4_layer_compress_ratio(il) != 0 && g->rope_tab_pos == pos + 1u && g->tp_world == 1 &&
++        ds4_gpu_dsv41_rope_quantize_heads_tab(g->index_q, 128, DS4_N_INDEXER_HEAD, pos, true, DS4_V41_FP4_E8M0,
++                                              g->rope_tab))
++        return true;
++#endif
++    return ds41_rope(g->index_q, DS4_N_INDEXER_HEAD, 128, il, pos, false) &&
++        ds4_gpu_dsv41_quantize(g->index_q, 128, DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0);
++}
++
+ /* The index-source q projection, BF16-rounded: from the E4M3 copy when it is
+  * built (the F16 matvec's bits), else the F16 tensor. */
+ static bool ds41_index_q_project(ds41_gpu_graph *g, const ds4_model *m,
+@@ -41817,8 +41846,7 @@ static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *
+     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
+     if (n_comp && ds41_index_source(il)) {
+         if (!ds41_index_q_project(g, m, l, il) ||
+-            !ds41_rope(g->index_q, DS4_N_INDEXER_HEAD, 128, il, pos, false) ||
+-            !ds4_gpu_dsv41_quantize(g->index_q, 128, DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
++            !ds41_index_q_rope_quantize(g, il, pos) ||
+             !ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, true)) return false;
+ #ifdef __APPLE__
+         /* past layer 20 only its candidate blocks can be selected */
+@@ -41901,6 +41929,11 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
+         (!g->kv_stored && !ds41_rope_store(g->kv, g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
+                          DS4_N_HEAD_DIM, il, pos, DS4_V41_FP8_E8M0)) ||
+         !ds41_attention_select(g, m, l, il)) return false;
++#ifdef __APPLE__
++    /* with this step's RoPE table, the scalar decode's reduce writes the heads the low projection reads */
++    const bool arm = !projected && g->tp_world == 1 && g->rope_tab_pos == pos + 1u;
++    if (arm) ds4_gpu_dsv41_heads_once_arm(g->rope_tab, ratio != 0);
++#endif
+     const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
+     const uint32_t n_raw = pos + 1u < 128u ? pos + 1u : 128u;
+     const uint64_t sinks = l->attn_sinks->abs_offset + (uint64_t)head0 * sizeof(float);
+@@ -41908,18 +41941,24 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
+     const bool staged = n_comp && ds4_gpu_dsv41_attention_decode(g->heads, m->map, m->size, sinks,
+             g->q, g->window[il], n_raw, 128, (pos + 1u - n_raw) % 128u, g->compressed[owner],
+             g->selected_comp, g->selected_kv, n_comp, attended, heads, DS4_N_HEAD_DIM);
+-    if (!staged &&
+-        ((n_comp && !ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
+-                                             g->selected_comp, n_comp, attended)) ||
+-         !ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size, sinks,
++    const bool decoded = staged ||
++        ((!n_comp || ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
++                                             g->selected_comp, n_comp, attended)) &&
++         ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size, sinks,
+             g->q, g->window[il], n_raw, 128, (pos + 1u - n_raw) % 128u,
+             g->selected_kv, 0, attended, NULL, 0,
+-            heads, DS4_N_HEAD_DIM))) return false;
++            heads, DS4_N_HEAD_DIM));
++#ifdef __APPLE__
++    const bool transformed = arm && ds4_gpu_dsv41_heads_once_take();
++#else
++    const bool transformed = false;
++#endif
++    if (!decoded) return false;
+     /* a caller that projects the heads itself gets them roped */
+     if (projected)
+         return ds4_gpu_dsv41_rope_bf16(g->heads, DS4_N_HEAD_DIM, heads, 1, pos,
+                                        ds4_layer_compress_ratio(il) != 0, true) != 0;
+-    if (g->tp_world != 2) return ds41_attention_expand(g, m, l, (int)il);
++    if (g->tp_world != 2) return ds41_attention_expand(g, m, l, (int)il, transformed);
+     ds4_gpu_tensor *out = g->block;
+ #ifdef __APPLE__
+     if (!ds41_tp_slab_off()) {
+@@ -43107,6 +43146,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model
+                                  : "DS4_METAL_DISABLE_V41_DECODE_QUEUE");
+     const bool queued_head = queue_layers && logits && g->tp_world == 1 && !ds41_queued_head_off();
+     g->scalar_decode = true;
++    g->rope_tab_pos = 0;
++#ifdef __APPLE__
++    if (logits && g->rope_tab && g->tp_world == 1 && !g->streaming && !g->quality && !layer_resident &&
++        !(ds4_gpu_v41_off() & DS4_GPU_V41_ROPE_TABLE) && ds4_gpu_commands_active() &&
++        ds4_gpu_dsv41_rope_coeff_table(g->rope_tab, g->pos))
++        g->rope_tab_pos = g->pos + 1u;   /* the step's RoPE table, read by the decode reduce and the index query */
++#endif
+     g->tp_gate_fused = g->tp_world == 2 && !ds41_tp_gate_expand_off() &&
+         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
+     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+@@ -43154,6 +43200,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model
+             ok = ds4_gpu_flush_commands() != 0;
+     }
+     g->scalar_decode = false;
++    g->rope_tab_pos = 0;
+     g->tp_gate_fused = false;
+     for (uint32_t i = 0; i < 2; i++)
+         if (rows[i]) ds4_engram_read_batch_finish(rows[i]);   /* a failure before layer 1 */
+@@ -43804,7 +43851,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
+                     for (uint32_t t = 0; ok && t < count; t++) {
+                         row.heads = g->rows_view[t].heads;
+                         row.low = g->rows_view[t].low;
+-                        ok = ds41_attention_low(&row, m, l, -1);
++                        ok = ds41_attention_low(&row, m, l, -1, false);
+                     }
+                     if (ok) ok = ds41_matmul_batch(g->batch.block, m, l->attn_output_b,
+                                                    g->batch.low, count, true);
+diff --git a/ds4_deepseek41_gpu.h b/ds4_deepseek41_gpu.h
+index 760388b..d1801d8 100644
+--- a/ds4_deepseek41_gpu.h
++++ b/ds4_deepseek41_gpu.h
+@@ -271,6 +271,21 @@ int ds4_gpu_dsv41_matmul_expand_rows(ds4_gpu_tensor *out_hc, const void *model_m
+ int ds4_gpu_dsv41_attention_low(ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
+                                 uint64_t out_a_offset, uint32_t group_dim, uint32_t rank,
+                                 uint32_t n_groups, ds4_gpu_tensor *heads, uint32_t pos, bool compressed);
++/* Metal: one decode step's RoPE coefficient table (64 float2: (cos, sin) of float(pos) * frequency, entries 0..31
++ * raw, 32..63 compressed). rope_quantize_heads_tab: rope + quantization of heads rows of width in place, in one
++ * dispatch reading it. heads_once_arm: the next single-row decode reduce of 64 heads x 512 writes its heads already
++ * bf16-rounded and inverse-roped with the table; take returns 1 when it did (and disarms), and attention_low_plain
++ * then projects them. reduce_check (test entry): that reduce on tmp's partials, plain or transformed. */
++int ds4_gpu_dsv41_rope_coeff_table(ds4_gpu_tensor *tab, uint32_t pos);
++int ds4_gpu_dsv41_rope_quantize_heads_tab(ds4_gpu_tensor *x, uint32_t width, uint32_t heads, uint32_t start,
++                                          bool compressed, ds4_v41_activation_format format, const ds4_gpu_tensor *tab);
++void ds4_gpu_dsv41_heads_once_arm(const ds4_gpu_tensor *tab, bool compressed);
++int ds4_gpu_dsv41_heads_once_take(void);
++int ds4_gpu_dsv41_attention_low_plain(ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
++                                      uint64_t out_a_offset, uint32_t group_dim, uint32_t rank,
++                                      uint32_t n_groups, const ds4_gpu_tensor *heads);
++int ds4_gpu_dsv41_flash_attn_reduce_check(ds4_gpu_tensor *heads, const ds4_gpu_tensor *tmp, uint32_t nrows,
++                                          int transform, const ds4_gpu_tensor *tab, bool compressed);
+ /* Two weighted RMS norms rounded to bf16 in one dispatch. */
+ int ds4_gpu_dsv41_norm_pair_rows(ds4_gpu_tensor *out0, const ds4_gpu_tensor *x0, uint64_t weight0_offset, uint32_t n0,
+                                  ds4_gpu_tensor *out1, const ds4_gpu_tensor *x1, uint64_t weight1_offset, uint32_t n1,
+diff --git a/ds4_gpu.h b/ds4_gpu.h
+index f6056c1..b71b925 100644
+--- a/ds4_gpu.h
++++ b/ds4_gpu.h
+@@ -53,6 +53,7 @@ enum {
+     DS4_GPU_V41_LITERAL_SHAPES = 1u << 1,
+     DS4_GPU_V41_INDEXER_E4M3 = 1u << 2,
+     DS4_GPU_V41_MODEL_TRACKED = 1u << 3,   /* opt-out: DS4_METAL_MODEL_TRACKED */
++    DS4_GPU_V41_ROPE_TABLE = 1u << 4,
+     DS4_GPU_V41_PLAIN_READERS = 1u << 29,   /* test only: the narrow readers' own kernels */
+ };
+ uint32_t ds4_gpu_v41_off(void);
+diff --git a/ds4_metal.m b/ds4_metal.m
+index 2783988..42e78ef 100644
+--- a/ds4_metal.m
++++ b/ds4_metal.m
+@@ -445,6 +445,7 @@ uint32_t ds4_gpu_v41_off(void) {
+             "DS4_METAL_DISABLE_V41_LITERAL_SHAPES",
+             "DS4_METAL_DISABLE_V41_INDEXER_E4M3",
+             "DS4_METAL_MODEL_TRACKED",
++            "DS4_METAL_DISABLE_V41_ROPE_TABLE",
+         };
+         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
+             const char *v = getenv(names[i]);
+@@ -3880,21 +3881,23 @@ int ds4_gpu_decode_attn_rope_fuse_available(void) {
+     return 1;
+ }
+ 
++/* heads: V4.1's kernel_dsv41_flash_attn_vec_reduce_heads, the same reduce with the transforming writer. */
+ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_reduce_pipeline(
+         int32_t dv,
+-        int32_t nwg) {
++        int32_t nwg,
++        bool heads) {
+     /* Same per-layer memo pattern as the vec getter above. */
+-    static int32_t memo_dv, memo_nwg;
+-    static id<MTLComputePipelineState> memo_pipeline;
+-    if (memo_pipeline && memo_dv == dv && memo_nwg == nwg) {
+-        return memo_pipeline;
++    static int32_t memo_dv[2], memo_nwg[2];
++    static id<MTLComputePipelineState> memo_pipeline[2];
++    if (memo_pipeline[heads] && memo_dv[heads] == dv && memo_nwg[heads] == nwg) {
++        return memo_pipeline[heads];
+     }
+ 
+-    NSString *key = [NSString stringWithFormat:@"kernel_flash_attn_ext_vec_reduce_dv=%d_nwg=%d",
+-                     (int)dv, (int)nwg];
++    const char *name = heads ? "kernel_dsv41_flash_attn_vec_reduce_heads" : "kernel_flash_attn_ext_vec_reduce";
++    NSString *key = [NSString stringWithFormat:@"%s_dv=%d_nwg=%d", name, (int)dv, (int)nwg];
+     id<MTLComputePipelineState> cached = [g_pipeline_cache objectForKey:key];
+     if (cached) {
+-        memo_dv = dv; memo_nwg = nwg; memo_pipeline = cached;
++        memo_dv[heads] = dv; memo_nwg[heads] = nwg; memo_pipeline[heads] = cached;
+         return cached;
+     }
+ 
+@@ -3903,11 +3906,11 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_reduce_pipeline(
+     [constants setConstantValue:&nwg type:MTLDataTypeInt atIndex:501];
+ 
+     NSError *error = nil;
+-    id<MTLFunction> fn = [g_library newFunctionWithName:@"kernel_flash_attn_ext_vec_reduce"
++    id<MTLFunction> fn = [g_library newFunctionWithName:@(name)
+                                          constantValues:constants
+                                                   error:&error];
+     if (!fn) {
+-        fprintf(stderr, "ds4: Metal kernel_flash_attn_ext_vec_reduce function not found: %s\n",
++        fprintf(stderr, "ds4: Metal %s function not found: %s\n", name,
+                 [[error localizedDescription] UTF8String]);
+         return nil;
+     }
+@@ -3915,16 +3918,53 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_reduce_pipeline(
+     error = nil;
+     id<MTLComputePipelineState> pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+     if (!pipeline) {
+-        fprintf(stderr, "ds4: Metal kernel_flash_attn_ext_vec_reduce pipeline failed: %s\n",
++        fprintf(stderr, "ds4: Metal %s pipeline failed: %s\n", name,
+                 [[error localizedDescription] UTF8String]);
+         return nil;
+     }
+ 
+     [g_pipeline_cache setObject:pipeline forKey:key];
+-    memo_dv = dv; memo_nwg = nwg; memo_pipeline = pipeline;
++    memo_dv[heads] = dv; memo_nwg[heads] = nwg; memo_pipeline[heads] = pipeline;
+     return pipeline;
+ }
+ 
++/* Heads transformed once (see ds4_deepseek41_gpu.h): the one-shot arm and the consumed flag. */
++static const ds4_gpu_tensor *g_heads_once_tab;
++static NSUInteger g_heads_once_tab_off;
++static int g_heads_once_used;
++/* The reduce pipeline of one single-row decode call: the transforming reduce when armed and the shape is the V4.1
++ * one (64 heads x 512, split 32); the arm is cleared either way. ds4_gpu_heads_once_bind binds the table. */
++static id<MTLComputePipelineState> ds4_gpu_heads_once_reduce(id<MTLComputePipelineState> plain, uint32_t nrows,
++                                                             uint32_t head_dim, uint32_t nwg, int *transformed) {
++    *transformed = 0;
++    if (!g_heads_once_tab) return plain;
++    const ds4_gpu_tensor *tab = g_heads_once_tab; g_heads_once_tab = NULL;
++    if (nrows != 64u || head_dim != 512u || nwg != 32u || !ds4_gpu_tensor_buffer(tab)) return plain;
++    id<MTLComputePipelineState> p = ds4_gpu_get_flash_attn_reduce_pipeline((int32_t)head_dim, (int32_t)nwg, true);
++    if (!p) return plain;
++    g_heads_once_tab = tab;   /* kept for the bind below, cleared by ds4_gpu_heads_once_bind */
++    *transformed = 1;
++    return p;
++}
++static void ds4_gpu_heads_once_bind(id<MTLComputeCommandEncoder> enc) {
++    [enc setBuffer:ds4_gpu_tensor_buffer(g_heads_once_tab)
++            offset:ds4_gpu_tensor_offset(g_heads_once_tab) + g_heads_once_tab_off atIndex:3];
++    g_heads_once_tab = NULL;
++    g_heads_once_used = 1;
++    DS4_TEST_NOTE("kernel_dsv41_flash_attn_vec_reduce_heads");
++}
++void ds4_gpu_dsv41_heads_once_arm(const ds4_gpu_tensor *tab, bool compressed) {
++    g_heads_once_tab = tab && ds4_gpu_tensor_bytes(tab) >= 64u * 2u * sizeof(float) ? tab : NULL;
++    g_heads_once_tab_off = compressed ? 32u * 2u * sizeof(float) : 0u;
++    g_heads_once_used = 0;
++}
++int ds4_gpu_dsv41_heads_once_take(void) {
++    const int used = g_heads_once_used;
++    g_heads_once_used = 0;
++    g_heads_once_tab = NULL;
++    return used;
++}
++
+ static uint32_t ds4_gpu_flash_attn_vec_nsg(uint32_t n_keys, uint32_t nwg, uint32_t ncpsg) {
+     uint32_t nsg = 1;
+     while (2u * nwg * nsg * ncpsg < n_keys && nsg < 4u) {
+@@ -28810,7 +28850,7 @@ static int ds4_gpu_encode_flash_attention_raw_heads(
+                                               (int32_t)nsg,
+                                               (int32_t)nwg);
+     id<MTLComputePipelineState> reduce_pipeline =
+-        ds4_gpu_get_flash_attn_reduce_pipeline((int32_t)head_dim, (int32_t)nwg);
++        ds4_gpu_get_flash_attn_reduce_pipeline((int32_t)head_dim, (int32_t)nwg, false);
+     if (!vec_pipeline || !reduce_pipeline) return 0;
+ 
+     if (!ds4_gpu_encode_copy_raw_ring_to_f16(cb,
+@@ -28914,11 +28954,15 @@ static int ds4_gpu_encode_flash_attention_raw_heads(
+     ds4_gpu_flash_attn_reduce_args reduce_args = {
+         .nrows = (int32_t)nrows,
+     };
++    int heads_once = 0;
++    id<MTLComputePipelineState> reduce_pso =
++        ds4_gpu_heads_once_reduce(reduce_pipeline, (uint32_t)nrows, head_dim, nwg, &heads_once);
+     enc = ds4_gpu_compute_encoder(cb);
+-    [enc setComputePipelineState:reduce_pipeline];
++    [enc setComputePipelineState:reduce_pso];
+     [enc setBytes:&reduce_args length:sizeof(reduce_args) atIndex:0];
+     [enc setBuffer:g_flash_attn_tmp_buffer offset:0 atIndex:1];
+     [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:2];
++    if (heads_once) ds4_gpu_heads_once_bind(enc);
+     [enc dispatchThreadgroups:MTLSizeMake(nrows, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(32u * nwg, 1, 1)];
+     ds4_gpu_end_compute_encoder(cb, enc);
+@@ -29613,7 +29657,7 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_vec(
+                                               (int32_t)nsg,
+                                               (int32_t)nwg);
+     id<MTLComputePipelineState> reduce_pipeline =
+-        ds4_gpu_get_flash_attn_reduce_pipeline((int32_t)head_dim, (int32_t)nwg);
++        ds4_gpu_get_flash_attn_reduce_pipeline((int32_t)head_dim, (int32_t)nwg, false);
+     if (!vec_pipeline || !reduce_pipeline) return 0;
+ 
+     if (has_kvpad) {
+@@ -30183,7 +30227,7 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads(
+                                               (int32_t)nsg,
+                                               (int32_t)nwg);
+     id<MTLComputePipelineState> reduce_pipeline =
+-        ds4_gpu_get_flash_attn_reduce_pipeline((int32_t)head_dim, (int32_t)nwg);
++        ds4_gpu_get_flash_attn_reduce_pipeline((int32_t)head_dim, (int32_t)nwg, false);
+     if (!vec_pipeline || !reduce_pipeline) return 0;
+ 
+     if (!ds4_gpu_encode_cpy_f32_f16_1d(cb,
+@@ -30477,7 +30521,7 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
+             (int32_t)nsg, (int32_t)nwg);
+         reduce_pipeline =
+             ds4_gpu_get_flash_attn_reduce_pipeline((int32_t)head_dim,
+-                                                     (int32_t)nwg);
++                                                     (int32_t)nwg, false);
+         if (!vec_pipeline || !reduce_pipeline) return 0;
+     }
+ 
+@@ -30646,10 +30690,14 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
+     g_decode_attn_rope_fuse = 0;
+     if (fuse_rope) g_decode_attn_rope_fuse_used = 1;
+     id<MTLComputePipelineState> reduce_pso = reduce_pipeline;
++    int heads_once = 0;   /* calls without the generic RoPE fusion only */
+     if (fuse_rope) {
++        g_heads_once_tab = NULL;
+         reduce_pso = ds4_gpu_get_flash_attn_reduce_rope_pipeline((int32_t)head_dim,
+                                                                    (int32_t)nwg);
+         if (!reduce_pso) return 0;
++    } else {
++        reduce_pso = ds4_gpu_heads_once_reduce(reduce_pipeline, (uint32_t)nrows, head_dim, nwg, &heads_once);
+     }
+     enc = ds4_gpu_compute_encoder(cb);
+     [enc setComputePipelineState:reduce_pso];
+@@ -30660,6 +30708,7 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
+         [enc setBytes:&g_decode_attn_rope_args
+                length:sizeof(g_decode_attn_rope_args) atIndex:3];
+     }
++    if (heads_once) ds4_gpu_heads_once_bind(enc);
+     [enc dispatchThreadgroups:MTLSizeMake(nrows, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(32u * nwg, 1, 1)];
+     ds4_gpu_end_compute_encoder(cb, enc);
+@@ -49602,43 +49651,118 @@ int ds4_gpu_dsv41_matmul_expand_rows(ds4_gpu_tensor *out_hc, const void *model_m
+     }
+ }
+ 
++int ds4_gpu_dsv41_rope_coeff_table(ds4_gpu_tensor *tab, uint32_t pos) {
++    if (!g_initialized && !ds4_gpu_init()) return 0;
++    if (!tab || pos >= 1048576u || ds4_gpu_tensor_bytes(tab) < 64u * 2u * sizeof(float)) return 0;
++    @autoreleasepool {
++        /* the same argument structs the low kernels receive at this position (the sign does not enter the table) */
++        const ds4_gpu_mv_rope_args raw = ds4_gpu_dsv41_mv_rope_args(512u, pos, false, true);
++        const ds4_gpu_mv_rope_args comp = ds4_gpu_dsv41_mv_rope_args(512u, pos, true, true);
++        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_rope_coeff_table");
++        if (!pipeline) return 0;
++        DS4_TEST_NOTE("kernel_dsv41_rope_coeff_table");
++        int owned = 0;
++        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
++        id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
++        if (!enc) return 0;
++        [enc setComputePipelineState:pipeline];
++        [enc setBytes:&raw length:sizeof(raw) atIndex:0];
++        [enc setBytes:&comp length:sizeof(comp) atIndex:1];
++        [enc setBuffer:ds4_gpu_tensor_buffer(tab) offset:ds4_gpu_tensor_offset(tab) atIndex:2];
++        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
++        /* the low dispatches read the table next (a serial encoder orders them; a concurrent one needs this) */
++        if (enc.dispatchType == MTLDispatchTypeConcurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
++        ds4_gpu_end_compute_encoder(cb, enc);
++        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 RoPE coefficient table");
++    }
++}
++
++/* The decode indexer query's rope + quantization over every head, in place, in one dispatch reading the step's RoPE
++ * coefficient table. */
++int ds4_gpu_dsv41_rope_quantize_heads_tab(ds4_gpu_tensor *x, uint32_t width, uint32_t heads, uint32_t start,
++                                          bool compressed, ds4_v41_activation_format format, const ds4_gpu_tensor *tab) {
++    const uint32_t block = format == DS4_V41_FP4_E4M3 ? 16u : 32u;
++    if (width < 64u || width % block || !heads || heads > 65535u || format < DS4_V41_FP8_E8M0 ||
++        format > DS4_V41_FP4_E4M3 || start >= 1048576u || !dsv41_tensor_has_floats(x, (uint64_t)width * heads) ||
++        !tab || ds4_gpu_tensor_bytes(tab) < 64u * 2u * sizeof(float)) return 0;
++    if (!g_initialized && !ds4_gpu_init()) return 0;
++    @autoreleasepool {
++        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_rope_quantize_heads_tab");
++        if (!pipeline) return 0;
++        DS4_TEST_NOTE("kernel_dsv41_rope_quantize_heads_tab");
++        /* the arguments ds4_gpu_dsv41_rope_quantize passes (the same frequencies as the separate rope) */
++        struct {
++            uint32_t width, start, inverse, mode;
++            float frequencies[32];
++        } args = {width, start, 0u, (uint32_t)format, {0}};
++        memcpy(args.frequencies, ds4_gpu_dsv41_rope_frequencies(compressed), sizeof(args.frequencies));
++        int owned = 0;
++        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
++        id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
++        if (!enc) return 0;
++        [enc setComputePipelineState:pipeline];
++        [enc setBytes:&args length:sizeof(args) atIndex:0];
++        [enc setBuffer:ds4_gpu_tensor_buffer(x) offset:ds4_gpu_tensor_offset(x) atIndex:1];
++        [enc setBuffer:ds4_gpu_tensor_buffer(tab)
++                offset:ds4_gpu_tensor_offset(tab) + (compressed ? 32u * 2u * sizeof(float) : 0u) atIndex:2];
++        [enc dispatchThreadgroups:MTLSizeMake(width / block, heads, 1)
++             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
++        ds4_gpu_end_compute_encoder(cb, enc);
++        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 indexer query rope + quantization");
++    }
++}
++
++/* The attention-output low projection: n_groups heads of group_dim against rank Q8_0 rows each, nr0 2. */
++static ds4_gpu_mul_mv_id_args ds4_gpu_dsv41_low_args(uint32_t group_dim, uint32_t rank, uint32_t n_groups) {
++    const uint64_t row_a_bytes = (uint64_t)(group_dim / 32u) * 34u;
++    return (ds4_gpu_mul_mv_id_args){
++        .nei0 = (int32_t)n_groups,
++        .nei1 = 1,
++        .nbi1 = 0,
++        .ne00 = (int32_t)group_dim,
++        .ne01 = (int32_t)rank,
++        .ne02 = (int32_t)n_groups,
++        .nb00 = 34,
++        .nb01 = row_a_bytes,
++        .nb02 = (uint64_t)rank * row_a_bytes,
++        .ne10 = (int32_t)group_dim,
++        .ne11 = (int32_t)n_groups,
++        .ne12 = 1,
++        .ne13 = 1,
++        .nb10 = sizeof(float),
++        .nb11 = (uint64_t)group_dim * sizeof(float),
++        .nb12 = (uint64_t)n_groups * group_dim * sizeof(float),
++        .ne0 = (int32_t)rank,
++        .ne1 = (int32_t)n_groups,
++        .nb1 = (uint64_t)rank * sizeof(float),
++        .nr0 = 2,
++    };
++}
++
++/* The low projection's weights as a model view, after checking the buffers (nil: invalid). */
++static id<MTLBuffer> ds4_gpu_dsv41_low_weights(const ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
++                                               uint64_t out_a_offset, uint32_t group_dim, uint32_t rank,
++                                               uint32_t n_groups, const ds4_gpu_tensor *heads, uint64_t *inner) {
++    if (!low || !heads || !model_map || !group_dim || group_dim % 512u || !rank || !n_groups ||
++        (uint64_t)n_groups * rank > UINT32_MAX) return nil;
++    const uint64_t out_a_bytes = (uint64_t)n_groups * rank * (group_dim / 32u) * 34u;
++    if (out_a_offset > model_size || out_a_bytes > model_size - out_a_offset ||
++        ds4_gpu_tensor_bytes(heads) < (uint64_t)n_groups * group_dim * sizeof(float) ||
++        ds4_gpu_tensor_bytes(low) < (uint64_t)n_groups * rank * sizeof(float)) return nil;
++    return ds4_gpu_wrap_model_range(model_map, model_size, out_a_offset, out_a_bytes, inner);
++}
++
+ int ds4_gpu_dsv41_attention_low(ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
+                                 uint64_t out_a_offset, uint32_t group_dim, uint32_t rank,
+                                 uint32_t n_groups, ds4_gpu_tensor *heads, uint32_t pos, bool compressed) {
+     if (!g_initialized && !ds4_gpu_init()) return 0;
+-    if (!low || !heads || !model_map || !group_dim || group_dim % 512u || !rank || !n_groups ||
+-        pos >= 1048576u || (uint64_t)n_groups * rank > UINT32_MAX) return 0;
++    if (pos >= 1048576u) return 0;
+     @autoreleasepool {
+-        const uint64_t row_a_bytes = (uint64_t)(group_dim / 32u) * 34u;
+-        const uint64_t out_a_bytes = (uint64_t)n_groups * rank * row_a_bytes;
+-        if (out_a_offset > model_size || out_a_bytes > model_size - out_a_offset ||
+-            ds4_gpu_tensor_bytes(heads) < (uint64_t)n_groups * group_dim * sizeof(float) ||
+-            ds4_gpu_tensor_bytes(low) < (uint64_t)n_groups * rank * sizeof(float)) return 0;
+         uint64_t inner = 0;
+-        id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map, model_size, out_a_offset, out_a_bytes, &inner);
++        id<MTLBuffer> wbuf = ds4_gpu_dsv41_low_weights(low, model_map, model_size, out_a_offset, group_dim, rank,
++                                                       n_groups, heads, &inner);
+         if (!wbuf) return 0;
+-        ds4_gpu_mul_mv_id_args args = {
+-            .nei0 = (int32_t)n_groups,
+-            .nei1 = 1,
+-            .nbi1 = 0,
+-            .ne00 = (int32_t)group_dim,
+-            .ne01 = (int32_t)rank,
+-            .ne02 = (int32_t)n_groups,
+-            .nb00 = 34,
+-            .nb01 = row_a_bytes,
+-            .nb02 = (uint64_t)rank * row_a_bytes,
+-            .ne10 = (int32_t)group_dim,
+-            .ne11 = (int32_t)n_groups,
+-            .ne12 = 1,
+-            .ne13 = 1,
+-            .nb10 = sizeof(float),
+-            .nb11 = (uint64_t)group_dim * sizeof(float),
+-            .nb12 = (uint64_t)n_groups * group_dim * sizeof(float),
+-            .ne0 = (int32_t)rank,
+-            .ne1 = (int32_t)n_groups,
+-            .nb1 = (uint64_t)rank * sizeof(float),
+-            .nr0 = 2,
+-        };
++        const ds4_gpu_mul_mv_id_args args = ds4_gpu_dsv41_low_args(group_dim, rank, n_groups);
+         const ds4_gpu_mv_rope_args rope = ds4_gpu_dsv41_mv_rope_args(512u, pos, compressed, true);
+         id<MTLComputePipelineState> pipeline =
+             ds4_gpu_get_mul_mv_pipeline("kernel_dsv4_attn_out_low_q8_0_f32_rope", 4);
+@@ -49661,6 +49785,66 @@ int ds4_gpu_dsv41_attention_low(ds4_gpu_tensor *low, const void *model_map, uint
+     }
+ }
+ 
++int ds4_gpu_dsv41_attention_low_plain(ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
++                                      uint64_t out_a_offset, uint32_t group_dim, uint32_t rank,
++                                      uint32_t n_groups, const ds4_gpu_tensor *heads) {
++    if (!g_initialized && !ds4_gpu_init()) return 0;
++    @autoreleasepool {
++        uint64_t inner = 0;
++        id<MTLBuffer> wbuf = ds4_gpu_dsv41_low_weights(low, model_map, model_size, out_a_offset, group_dim, rank,
++                                                       n_groups, heads, &inner);
++        if (!wbuf) return 0;
++        const ds4_gpu_mul_mv_id_args args = ds4_gpu_dsv41_low_args(group_dim, rank, n_groups);
++        const bool literal = group_dim == 4096u && rank == 1024u && n_groups == 8u &&
++            ds4_gpu_v41_on(DS4_GPU_V41_LITERAL_SHAPES);
++        if (literal) DS4_TEST_NOTE("kernel_dsv4_attn_out_low_q8_0_f32_static");
++        id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(
++            literal ? "kernel_dsv4_attn_out_low_q8_0_f32_static" : "kernel_dsv4_attn_out_low_q8_0_f32", 4);
++        int owned = 0;
++        id<MTLCommandBuffer> cb = pipeline ? ds4_gpu_command_buffer(&owned) : nil;
++        if (!cb || !ds4_gpu_encode_attn_out_low_q8_direct(cb, pipeline, &args, wbuf, (NSUInteger)inner,
++                ds4_gpu_tensor_buffer(heads), ds4_gpu_tensor_offset(heads), ds4_gpu_tensor_buffer(low),
++                ds4_gpu_tensor_offset(low), 32u * 2u * sizeof(float), 4, true)) return 0;
++        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 attention low projection (transformed heads)");
++    }
++}
++
++/* Test entry: the single-row decode reduce of nrows heads from the partials in tmp, plain or (transform) armed with
++ * tab as ds41_attention arms it; a check call never hands transformed heads to the graph. */
++int ds4_gpu_dsv41_flash_attn_reduce_check(ds4_gpu_tensor *heads, const ds4_gpu_tensor *tmp, uint32_t nrows,
++                                          int transform, const ds4_gpu_tensor *tab, bool compressed) {
++    if (!g_initialized && !ds4_gpu_init()) return 0;
++    const uint32_t dv = 512u, nwg = 32u;
++    if (!heads || !tmp || !nrows || nrows > 4096u || (transform && (!tab || nrows != 64u)) ||
++        ds4_gpu_tensor_bytes(heads) < (uint64_t)nrows * dv * sizeof(float) ||
++        ds4_gpu_tensor_bytes(tmp) < (uint64_t)nrows * (dv * nwg + 2u * nwg) * sizeof(float)) return 0;
++    @autoreleasepool {
++        id<MTLComputePipelineState> plain = ds4_gpu_get_flash_attn_reduce_pipeline((int32_t)dv, (int32_t)nwg, false);
++        if (!plain) return 0;
++        int heads_once = 0;
++        id<MTLComputePipelineState> pso = plain;
++        if (transform) {
++            ds4_gpu_dsv41_heads_once_arm(tab, compressed);
++            pso = ds4_gpu_heads_once_reduce(plain, nrows, dv, nwg, &heads_once);
++            if (!heads_once) { g_heads_once_tab = NULL; return 0; }
++        }
++        int owned = 0;
++        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
++        id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
++        if (!enc) { g_heads_once_tab = NULL; return 0; }
++        ds4_gpu_flash_attn_reduce_args reduce_args = { .nrows = (int32_t)nrows };
++        [enc setComputePipelineState:pso];
++        [enc setBytes:&reduce_args length:sizeof(reduce_args) atIndex:0];
++        [enc setBuffer:ds4_gpu_tensor_buffer(tmp) offset:ds4_gpu_tensor_offset(tmp) atIndex:1];
++        [enc setBuffer:ds4_gpu_tensor_buffer(heads) offset:ds4_gpu_tensor_offset(heads) atIndex:2];
++        if (heads_once) ds4_gpu_heads_once_bind(enc);
++        [enc dispatchThreadgroups:MTLSizeMake(nrows, 1, 1) threadsPerThreadgroup:MTLSizeMake(32u * nwg, 1, 1)];
++        ds4_gpu_end_compute_encoder(cb, enc);
++        g_heads_once_used = 0;
++        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 decode reduce (check entry)");
++    }
++}
++
+ int ds4_gpu_dsv41_norm_pair_rows(ds4_gpu_tensor *out0, const ds4_gpu_tensor *x0, uint64_t weight0_offset, uint32_t n0,
+                             ds4_gpu_tensor *out1, const ds4_gpu_tensor *x1, uint64_t weight1_offset, uint32_t n1,
+                             const void *model_map, uint64_t model_size, float eps, uint32_t rows) {
+diff --git a/metal/dsv41.metal b/metal/dsv41.metal
+index 93e66bb..9bbdda6 100644
+--- a/metal/dsv41.metal
++++ b/metal/dsv41.metal
+@@ -208,6 +208,45 @@ kernel void kernel_dsv41_rope_quantize(
+     dsv41_rope_quantize_body(args, x, dst, group, lane);
+ }
+ 
++/* The decode indexer query's rope and quantization in one dispatch over every head, in place: dsv41_rope_quantize_body
++ * with (cos, sin) read from the step's RoPE table (the same theta and contraction, so the same bits). */
++kernel void kernel_dsv41_rope_quantize_heads_tab(
++        constant ds4_metal_args_dsv41_rope_quantize &args,
++        device float *x,
++        device const float2 *tab,
++        uint2 group [[threadgroup_position_in_grid]],
++        uint lane [[thread_index_in_simdgroup]]) {
++    device float *row = x + (ulong)group.y * args.width;
++    const uint block = args.mode == 3u ? 16u : 32u;
++    const uint column = group.x * block + lane;
++    const bool valid = lane < block && column < args.width;
++    float value = valid ? row[column] : 0.0f;
++    const float other = simd_shuffle_xor(value, 1u);
++    const uint rotary = args.width - 64u;
++    if (valid && column >= rotary) {
++        const float2 cs = tab[(column - rotary) >> 1u];
++        const float c = cs.x;
++        const float s = args.inverse ? -cs.y : cs.y;
++        const float re = (column & 1u) ? other : value;
++        const float im = (column & 1u) ? value : other;
++        /* the contraction kernel_dsv41_rope compiles to */
++        value = (column & 1u) ? dsv41_bf16(fma(im, c, re * s)) : dsv41_bf16(fma(re, c, -(im * s)));
++    }
++    value = dsv41_bf16(value);
++    const float amax = simd_max(abs(value));
++    float result = value;
++    if (args.mode == 1u) {
++        const float scale = dsv41_pow2_ceil(max(amax, 1.0e-4f) * (1.0f / 448.0f));
++        result = copysign(dsv4_e4m3fn_dequant(abs(value) / scale), value) * scale;
++    } else if (args.mode == 2u || args.mode == 3u) {
++        const float scale = args.mode == 3u
++            ? dsv4_e4m3fn_dequant(max(amax, 0.01171875f) / 6.0f)
++            : dsv41_pow2_ceil(max(amax, 7.052966104933725e-38f) * (1.0f / 6.0f));
++        result = copysign(dsv4_e2m1fn_dequant(abs(value) / scale), value) * scale;
++    }
++    if (valid) row[column] = dsv41_bf16(result);
++}
++
+ struct ds4_metal_args_dsv41_norm_pair {
+     uint n0, n1, ntg0, ntg1;
+     float eps;
+@@ -666,3 +705,17 @@ kernel void kernel_dsv41_query_deferred_hc(
+         } else { q[row] = re; q[row + 1u] = im; }
+     }
+ }
++
++/* The decode reduce of flash_attn.metal with V4.1's transforming writer. */
++kernel void kernel_dsv41_flash_attn_vec_reduce_heads(
++        constant ds4_metal_args_flash_attn_ext_vec_reduce & args,
++        device  const char * htmp,
++        device        char * dst,
++        device const float2 * rope_tab,
++        uint   tgpig[[threadgroup_position_in_grid]],
++        ushort tiisg[[thread_index_in_simdgroup]],
++        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
++    ds4_flash_attn_vec_reduce_row<true>(args, htmp, dst, rope_tab, tgpig, tiisg, sgitg,
++                                        (short)FC_flash_attn_ext_vec_reduce_NWG,
++                                        (short)FC_flash_attn_ext_vec_reduce_DV);
++}
+diff --git a/metal/dsv4_rope.metal b/metal/dsv4_rope.metal
+index 279365c..204d34e 100644
+--- a/metal/dsv4_rope.metal
++++ b/metal/dsv4_rope.metal
+@@ -600,7 +600,7 @@ kernel void kernel_flash_attn_ext_vec_reduce_rope(
+         ushort tiitg[[thread_index_in_threadgroup]],
+         ushort tiisg[[thread_index_in_simdgroup]],
+         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+-    ds4_flash_attn_vec_reduce_row(args, htmp, dst, tgpig, tiisg, sgitg,
++    ds4_flash_attn_vec_reduce_row(args, htmp, dst, nullptr, tgpig, tiisg, sgitg,
+                                   (short)FC_flash_attn_ext_vec_reduce_NWG,
+                                   (short)FC_flash_attn_ext_vec_reduce_DV);
+ 
+diff --git a/metal/flash_attn.metal b/metal/flash_attn.metal
+index e3232a7..9619460 100644
+--- a/metal/flash_attn.metal
++++ b/metal/flash_attn.metal
+@@ -1396,15 +1396,21 @@ template [[host_name("kernel_flash_attn_ext_vec_f16_dk512_dv512")]]  kernel flas
+ constant int32_t FC_flash_attn_ext_vec_reduce_DV  [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 0)]];
+ constant int32_t FC_flash_attn_ext_vec_reduce_NWG [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 1)]];
+ 
++static inline float ds4_bf16_round(float v);
++
+ // Reduces split-K decode FlashAttention partials. It combines each workgroup's
+ // output vector and softmax (sum,max) pair into the final attention result.
+ /* Shared and deliberately noinline so the split-K reduction is compiled once and
+  * every caller gets identical codegen. The RoPE-fused sibling in dsv4_rope.metal
+- * calls this same body, which is what keeps the fusion bit-exact. */
++ * calls this same body, which is what keeps the fusion bit-exact.
++ * HEADS (V4.1 decode) writes the low projection's input instead: each head bf16-rounded and its rotary tail
++ * inverse-roped from the step's table, as the rope low kernel does it (ds4_bf16_round is idempotent). */
++template <bool HEADS = false>
+ static __attribute__((noinline)) void ds4_flash_attn_vec_reduce_row(
+         constant ds4_metal_args_flash_attn_ext_vec_reduce & args,
+         device  const char * htmp,
+         device        char * dst,
++        device const float2 * rope_tab,
+         uint   tgpig,
+         ushort tiisg,
+         ushort sgitg,
+@@ -1434,7 +1440,24 @@ static __attribute__((noinline)) void ds4_flash_attn_vec_reduce_row(
+         const float4 v = simd_sum(htmp4[i*NWG_ + iwg]*ms);
+ 
+         if (iwg == 0) {
+-            dst4[i] = v*S;
++            if (!HEADS) {
++                dst4[i] = v*S;
++            } else {
++                const float4 t = v*S;
++                float4 r = float4(ds4_bf16_round(t.x), ds4_bf16_round(t.y), ds4_bf16_round(t.z), ds4_bf16_round(t.w));
++                if (i >= DV4 - 16) {
++                    const short p0 = 2*(i - (DV4 - 16));
++                    const float2 c0 = rope_tab[p0];
++                    const float2 c1 = rope_tab[p0 + 1];
++                    const float s0 = -c0.y, s1 = -c1.y;
++                    const float re0 = r.x, im0 = r.y, re1 = r.z, im1 = r.w;
++                    r.x = ds4_bf16_round(fma(re0, c0.x, -(im0 * s0)));
++                    r.y = ds4_bf16_round(fma(im0, c0.x, re0 * s0));
++                    r.z = ds4_bf16_round(fma(re1, c1.x, -(im1 * s1)));
++                    r.w = ds4_bf16_round(fma(im1, c1.x, re1 * s1));
++                }
++                dst4[i] = r;
++            }
+         }
+     }
+ }
+@@ -1446,7 +1469,7 @@ kernel void kernel_flash_attn_ext_vec_reduce(
+         uint   tgpig[[threadgroup_position_in_grid]],
+         ushort tiisg[[thread_index_in_simdgroup]],
+         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+-    ds4_flash_attn_vec_reduce_row(args, htmp, dst, tgpig, tiisg, sgitg,
++    ds4_flash_attn_vec_reduce_row(args, htmp, dst, nullptr, tgpig, tiisg, sgitg,
+                                   (short)FC_flash_attn_ext_vec_reduce_NWG,
+                                   (short)FC_flash_attn_ext_vec_reduce_DV);
+ }
+diff --git a/metal/moe.metal b/metal/moe.metal
+index 43ae3a7..82132f7 100644
+--- a/metal/moe.metal
++++ b/metal/moe.metal
+@@ -3546,6 +3546,50 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32_rope(
+         args0, src0_cur, src1_cur, dst_cur, shmem, tgpig, tiisg, sgitg, &rope);
+ }
+ 
++/* kernel_dsv4_attn_out_low_q8_0_f32 at the V4.1 decode shape (4096, 1024, 8) as literals. */
++kernel void kernel_dsv4_attn_out_low_q8_0_f32_static(
++        constant ds4_metal_args_mul_mv_id & args,
++        device const char * src0s,
++        device const char * src1,
++        device       char * dst,
++        threadgroup  char * shmem [[threadgroup(0)]],
++        uint3  tgpig[[threadgroup_position_in_grid]],
++        ushort tiisg[[thread_index_in_simdgroup]],
++        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
++    (void)args;
++    const int iid1 = tgpig.z/8;
++    const int idx  = tgpig.z%8;
++
++    tgpig.z = 0;
++
++    const int64_t i11 = idx % 8;
++    const int64_t i12 = iid1;
++
++    device const char * src0_cur = src0s + idx*(1024ull*4352ull);
++    device const char * src1_cur = src1  + i11*16384ull + i12*(8ull*16384ull);
++    device       char * dst_cur  = dst   + (idx*1024 + i12*8*1024)*sizeof(float);
++
++    ds4_metal_args_mul_mv args0 = ds4_q8_0_static_args(4096, 1024);
++
++    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, thread ds4_metal_args_mul_mv &>(
++        args0, src0_cur, src1_cur, dst_cur, shmem, tgpig, tiisg, sgitg);
++}
++
++/* One decode step's RoPE table: float2(cos, sin) of float(start) * frequency, raw 0..31 and compressed 32..63, the
++ * rope low kernels' own expression. */
++kernel void kernel_dsv41_rope_coeff_table(
++        constant ds4_metal_args_mv_rope & raw,
++        constant ds4_metal_args_mv_rope & comp,
++        device float2 * tab,
++        uint tid [[thread_position_in_grid]]) {
++    if (tid >= 64u) return;
++    constant ds4_metal_args_mv_rope * r = tid < 32u ? &raw : &comp;
++    const float theta = float(r->start) * r->frequencies[tid & 31u];
++    float c;
++    const float sn = precise::sincos(theta, c);
++    tab[tid] = float2(c, sn);
++}
++
+ kernel void kernel_dsv4_attn_out_low_q4_K_f32(
+         constant ds4_metal_args_mul_mv_id & args,
+         device const char * src0s,
+diff --git a/tests/test_deepseek41_metal.c b/tests/test_deepseek41_metal.c
+index b11e4f1..b7c7c47 100644
+--- a/tests/test_deepseek41_metal.c
++++ b/tests/test_deepseek41_metal.c
+@@ -765,6 +765,65 @@ static void *q8_weights(uint32_t rows, uint32_t cols, uint64_t *bytes) {
+         free(lit_); \
+     } while (0)
+ 
++/* One RoPE table per decode token. From the same attention partials: the reduce that writes the heads inverse-roped
++ * and bf16-rounded, then the plain low (literal and generic), gives the plain reduce and inline-rope low's bits; the
++ * indexer query's one-dispatch rope + quantize gives rope then quantize. Raw and compressed, up to the 1M limit. */
++static int check_rope_tab(void) {
++    enum { GROUP = 4096, RANK = 1024, GROUPS = 8, NROWS = 64, DV = 512, NWG = 32, QN = 32 * 128 };
++    const uint64_t hb = (uint64_t)NROWS * DV * 4, lb = (uint64_t)GROUPS * RANK * 4;
++    const uint64_t tn = (uint64_t)NROWS * (DV * NWG + 2u * NWG);
++    uint64_t wb = 0;
++    void *model = q8_weights(GROUPS * RANK, GROUP, &wb);
++    float *t = malloc(tn * 4), *qref = malloc(QN * 4);
++    CHECK(model && t && qref && ds4_gpu_set_model_map(model, wb));
++    for (uint64_t i = 0; i < (uint64_t)NROWS * DV * NWG; i++) t[i] = random_value();
++    for (uint64_t i = (uint64_t)NROWS * DV * NWG; i < tn; i += 2) {
++        t[i] = fabsf(random_value()) + 0.25f;   /* S */
++        t[i + 1] = random_value();              /* M */
++    }
++    ds4_gpu_tensor *tmp = upload(t, tn * 4), *plain = upload(NULL, hb), *once = upload(NULL, hb);
++    ds4_gpu_tensor *q = upload(NULL, QN * 4), *tab = upload(NULL, 512);
++    ds4_gpu_tensor *low[3] = {upload(NULL, lb), upload(NULL, lb), upload(NULL, lb)};
++    CHECK(tmp && plain && once && q && tab && low[0] && low[1] && low[2]);
++    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
++    const uint32_t positions[] = {0, 1, 8191, 1048575};
++    for (size_t pi = 0; pi < sizeof(positions) / sizeof(*positions); pi++) for (int compressed = 0; compressed < 2; compressed++) {
++        const uint32_t pos = positions[pi];
++        const uint64_t reduce = ds4_gpu_test_kernel_runs("kernel_dsv41_flash_attn_vec_reduce_heads");
++        const uint64_t literal = ds4_gpu_test_kernel_runs("kernel_dsv4_attn_out_low_q8_0_f32_static");
++        CHECK(ds4_gpu_begin_commands() && ds4_gpu_dsv41_rope_coeff_table(tab, pos));
++        CHECK(ds4_gpu_dsv41_flash_attn_reduce_check(plain, tmp, NROWS, 0, NULL, false));
++        CHECK(ds4_gpu_dsv41_flash_attn_reduce_check(once, tmp, NROWS, 1, tab, compressed));
++        CHECK(ds4_gpu_dsv41_attention_low_plain(low[1], model, wb, 0, GROUP, RANK, GROUPS, once));
++        CHECK(ds4_gpu_end_commands() && ds4_gpu_synchronize());
++        /* the indexer query from the plain heads */
++        CHECK(ds4_gpu_tensor_write(q, 0, ds4_gpu_tensor_contents(plain), QN * 4) && ds4_gpu_begin_commands());
++        CHECK(ds4_gpu_dsv41_rope(q, 128, 32, 1, pos, compressed, false));
++        CHECK(ds4_gpu_dsv41_quantize(q, 128, 32, DS4_V41_FP4_E8M0));
++        CHECK(ds4_gpu_end_commands() && ds4_gpu_tensor_read(q, 0, qref, QN * 4));
++        CHECK(ds4_gpu_tensor_write(q, 0, ds4_gpu_tensor_contents(plain), QN * 4) && ds4_gpu_begin_commands());
++        CHECK(ds4_gpu_dsv41_rope_quantize_heads_tab(q, 128, 32, pos, compressed, DS4_V41_FP4_E8M0, tab));
++        CHECK(ds4_gpu_end_commands() && ds4_gpu_synchronize() && !memcmp(qref, ds4_gpu_tensor_contents(q), QN * 4));
++        /* the inline-rope low on the plain heads, and the generic plain low on the transformed ones */
++        CHECK(ds4_gpu_begin_commands());
++        CHECK(ds4_gpu_dsv41_attention_low(low[0], model, wb, 0, GROUP, RANK, GROUPS, plain, pos, compressed));
++        ds4_gpu_test_set_v41_off(DS4_GPU_V41_LITERAL_SHAPES);
++        const int ok = ds4_gpu_dsv41_attention_low_plain(low[2], model, wb, 0, GROUP, RANK, GROUPS, once);
++        ds4_gpu_test_set_v41_off(0);
++        CHECK(ok && ds4_gpu_end_commands() && ds4_gpu_synchronize());
++        CHECK(!memcmp(ds4_gpu_tensor_contents(low[0]), ds4_gpu_tensor_contents(low[1]), lb));
++        CHECK(!memcmp(ds4_gpu_tensor_contents(low[0]), ds4_gpu_tensor_contents(low[2]), lb));
++        CHECK(ds4_gpu_test_kernel_runs("kernel_dsv41_flash_attn_vec_reduce_heads") == reduce + 1);
++        CHECK(ds4_gpu_test_kernel_runs("kernel_dsv4_attn_out_low_q8_0_f32_static") == literal + 1);
++    }
++    ds4_gpu_tensor *tensors[] = {tmp, plain, once, q, tab, low[0], low[1], low[2]};
++    for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
++    free(t); free(qref); free(model);
++    fprintf(stderr, "V4.1 RoPE table: transformed heads + plain low == inline rope low; indexer query rope + quantize "
++            "in one dispatch == two PASS\n");
++    return 1;
++}
++
+ /* The V4.1 decode calls that take literal-shape kernels give the generic kernels' bits. */
+ static int check_literal_shapes(void) {
+     ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+@@ -845,6 +904,7 @@ static int check_literal_shapes(void) {
+     return 1;
+ }
+ #else
++static int check_rope_tab(void) { return 1; }
+ static int check_literal_shapes(void) { return 1; }
+ #endif
+ 
+@@ -2005,6 +2065,11 @@ int main(int argc, char **argv) {
+         ds4_gpu_cleanup();
+         return ok ? 0 : 1;
+     }
++    if (argc == 2 && !strcmp(argv[1], "--rope-tab")) {
++        const int ok = ds4_gpu_init() && check_rope_tab();
++        ds4_gpu_cleanup();
++        return ok ? 0 : 1;
++    }
+     if (argc == 2 && !strcmp(argv[1], "--literal-shapes")) {
+         const int ok = ds4_gpu_init() && check_literal_shapes();
+         ds4_gpu_cleanup();
+@@ -2019,6 +2084,7 @@ int main(int argc, char **argv) {
+              check_attention_output(false) && check_tp_attention();
+     ok = ok && check_literal_shapes();
+     ok = ok && check_e4m3_copies();
++    ok = ok && check_rope_tab();
+     ds4_gpu_cleanup();
+     return ok ? 0 : 1;
+ }

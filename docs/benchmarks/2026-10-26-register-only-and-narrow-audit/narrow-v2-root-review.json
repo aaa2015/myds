@@ -1,0 +1,14 @@
+{
+  "kind": "root_independent_narrow_CPU_audit_summary",
+  "actual_tensor_count": 50,
+  "all_qualify": true,
+  "all_source_reconstructed_SHA_equal": true,
+  "total_source_bytes_scanned": 1027604480,
+  "total_elements": 435159040,
+  "scales_bytes": 1392640,
+  "code_BF16_payload_bytes": 513802240,
+  "archive_sha256": "824785f76223d7f4fb650224d6896345b29bf0d39191ed1bbbee3bc59c1e4eea",
+  "CPU_only": true,
+  "GPU_arithmetic_equivalence_proven": false,
+  "performance_proven": false
+}

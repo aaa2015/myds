@@ -1,0 +1,492 @@
+{
+  "kind": "official_GitHub_read_only_upstream_source_snapshot",
+  "remote": "https://github.com/kernelpool/ds4.git",
+  "branch": "ds41-perf",
+  "head": "72ccf363174c3e1acf840b3661a956d4fb321071",
+  "captured": "2026-10-26T01:28:26.925633+08:00",
+  "GPU_or_benchmark_executed": false,
+  "workspace_refs_touched": false,
+  "commits": [
+    {
+      "short": "0f9b03c",
+      "sha": "0f9b03c9df6500585b433fe2e9e68ace6b1ba0b4",
+      "url": "https://github.com/kernelpool/ds4/commit/0f9b03c9df6500585b433fe2e9e68ace6b1ba0b4",
+      "changed_paths": [
+        "ds4_metal.m",
+        "metal/dsv4_misc.metal"
+      ],
+      "snapshot_files": [
+        {
+          "path": "ds4_metal.m",
+          "bytes": 2435053,
+          "sha256": "a086323b2272eeac8e1d4f7a6cd5accc8c2ceec34deeedc943937cd49d0999f7"
+        },
+        {
+          "path": "metal/dsv4_misc.metal",
+          "bytes": 293973,
+          "sha256": "137e5866b1be7e092c60fef0729bb5e3770d8326193619b9f43a663473969546"
+        }
+      ],
+      "patch_sha256": "e364035455e0b9927e92d8ef227f76584a40c702d2dcbf4a232b06880e96befd",
+      "is_branch_ancestor": true
+    },
+    {
+      "short": "b66c926",
+      "sha": "b66c926046683242238744510250d5ef3461e7c3",
+      "url": "https://github.com/kernelpool/ds4/commit/b66c926046683242238744510250d5ef3461e7c3",
+      "changed_paths": [
+        "ds4_gpu.h",
+        "ds4_metal.m",
+        "metal/dense.metal",
+        "metal/dsv4_hc.metal",
+        "metal/moe.metal",
+        "tests/test_deepseek41_metal.c"
+      ],
+      "snapshot_files": [
+        {
+          "path": "ds4_gpu.h",
+          "bytes": 161878,
+          "sha256": "75024f43e29826f57b005fab4fa55b0aed21329c66b879714d601bf25145be5d"
+        },
+        {
+          "path": "ds4_metal.m",
+          "bytes": 2453830,
+          "sha256": "313b358be49f9d892fc546607dd64c1ef9229396df0ef10f760ea128b7bc8c6e"
+        },
+        {
+          "path": "metal/dense.metal",
+          "bytes": 151886,
+          "sha256": "42fc162f9883a3aa534570d8fab314fe0329c0abccf5bcdb50690b29196f6ddd"
+        },
+        {
+          "path": "metal/dsv4_hc.metal",
+          "bytes": 77607,
+          "sha256": "d29693d5a7ec30c5fa014bfeb8d1e1e2761423a5127d176297988adcd820a39c"
+        },
+        {
+          "path": "metal/moe.metal",
+          "bytes": 436561,
+          "sha256": "0c4840e4337a1f797f539af0a7970fca55409441063df4b8a533bb548bdb211f"
+        },
+        {
+          "path": "tests/test_deepseek41_metal.c",
+          "bytes": 109019,
+          "sha256": "016879d5bb14ecbc90b9465ebf1444bfbc5ba1ce931db3259797f107488d4221"
+        }
+      ],
+      "patch_sha256": "60c236ce90e31eb226c17c96973243eaf7911ba44b69203a05ebcb49df7e15ba",
+      "is_branch_ancestor": true
+    },
+    {
+      "short": "55b1e75",
+      "sha": "55b1e75e64ec66b458e5cd5cf0944bec20590ae8",
+      "url": "https://github.com/kernelpool/ds4/commit/55b1e75e64ec66b458e5cd5cf0944bec20590ae8",
+      "changed_paths": [
+        "ds4.c",
+        "ds4_gpu.h",
+        "ds4_metal.m",
+        "metal/dense.metal",
+        "tests/test_deepseek41_metal.c"
+      ],
+      "snapshot_files": [
+        {
+          "path": "ds4.c",
+          "bytes": 4009237,
+          "sha256": "183b7d1eee39afbde5a98262ad690f35719d772f085c758445d77baf9d23a71c"
+        },
+        {
+          "path": "ds4_gpu.h",
+          "bytes": 162566,
+          "sha256": "92d1f18e624f688b82b3649883687eef7c4c9ad564e7c0ff11af01ef06e9f5f9"
+        },
+        {
+          "path": "ds4_metal.m",
+          "bytes": 2458508,
+          "sha256": "dc24187f34333e5a0e34c1ead3ccf2a366bbabf0cea5bcaef11431dea32cf258"
+        },
+        {
+          "path": "metal/dense.metal",
+          "bytes": 158722,
+          "sha256": "1198c59792dc232e790166291aa7a40d9ac846bde8e3ae961258551c7ee25b43"
+        },
+        {
+          "path": "tests/test_deepseek41_metal.c",
+          "bytes": 114294,
+          "sha256": "94ce66a61b919c600d3016ab5bc58b56393983ea9296bba199533cc40e46006d"
+        }
+      ],
+      "patch_sha256": "17883c1499b92b18bf02f47d9a886a77a1b647acb74357dd769185613aef37fb",
+      "is_branch_ancestor": true
+    },
+    {
+      "short": "7d9903b",
+      "sha": "7d9903b2ed6bd74c14aed06a89a591a14d613e9e",
+      "url": "https://github.com/kernelpool/ds4/commit/7d9903b2ed6bd74c14aed06a89a591a14d613e9e",
+      "changed_paths": [
+        "ds4.c",
+        "ds4_gpu.h",
+        "ds4_metal.m",
+        "metal/dense.metal"
+      ],
+      "snapshot_files": [
+        {
+          "path": "ds4.c",
+          "bytes": 3991700,
+          "sha256": "9d0e3655b4603a649d15b5776dfa77ae7fd1378b427f6b4dce9ee7abd7d0395f"
+        },
+        {
+          "path": "ds4_gpu.h",
+          "bytes": 159513,
+          "sha256": "39638c09eb29887dfd56936ba122061fdd5d9f081c9b8ab24e085e132ec9875e"
+        },
+        {
+          "path": "ds4_metal.m",
+          "bytes": 2434054,
+          "sha256": "b3733697130402ee217ed8b597528b056fe752602a4a63a67ba85b525c7de7ca"
+        },
+        {
+          "path": "metal/dense.metal",
+          "bytes": 143567,
+          "sha256": "a9b3a7a0a7020267e1b94d09bcf5e50d6a7e2630fc62af228a8a2784e02d974c"
+        }
+      ],
+      "patch_sha256": "c64a447efd6b41f815ba48be37db742da43cd0dfa1a37509c275ee427ef9db6a",
+      "is_branch_ancestor": true
+    },
+    {
+      "short": "f0b4f55",
+      "sha": "f0b4f55fcc3164be9637879fbbc635385ca213d9",
+      "url": "https://github.com/kernelpool/ds4/commit/f0b4f55fcc3164be9637879fbbc635385ca213d9",
+      "changed_paths": [
+        "ds4.c",
+        "ds4_deepseek41_gpu.h",
+        "ds4_gpu.h",
+        "ds4_metal.m",
+        "metal/dsv41.metal",
+        "metal/dsv4_rope.metal",
+        "metal/flash_attn.metal",
+        "metal/moe.metal",
+        "tests/test_deepseek41_metal.c"
+      ],
+      "snapshot_files": [
+        {
+          "path": "ds4.c",
+          "bytes": 4011557,
+          "sha256": "33941dcbd98f3426723ece78564b41ca856b737ce30371b6b01650c038663418"
+        },
+        {
+          "path": "ds4_deepseek41_gpu.h",
+          "bytes": 21082,
+          "sha256": "f5f42c6b2d0e4bae5f54a9bec07e823521df9ced014bc06dbee3b7c634ddf30d"
+        },
+        {
+          "path": "ds4_gpu.h",
+          "bytes": 162604,
+          "sha256": "f212c2cd2d2299eeaa4e3f8cdd6849009a3d43935efdba43f51b02be6afdb348"
+        },
+        {
+          "path": "ds4_metal.m",
+          "bytes": 2469875,
+          "sha256": "8c5ede6b3cafc61835b95817a77aa2edb6302fe7776949033f2fbf14a63139d4"
+        },
+        {
+          "path": "metal/dsv41.metal",
+          "bytes": 31058,
+          "sha256": "480173933f50e4305c51507bde045cc3461fa0d48ee21457ac057eadf9c6b15d"
+        },
+        {
+          "path": "metal/dsv4_rope.metal",
+          "bytes": 35989,
+          "sha256": "6d02fdf3577cb705b2311d208cb12b59da6d3be799fe558f6afb3393aafc3238"
+        },
+        {
+          "path": "metal/flash_attn.metal",
+          "bytes": 63002,
+          "sha256": "50b7bdd361030f82c3df07e287f6deeb00c849d02b44e135973d4f9364c6fb07"
+        },
+        {
+          "path": "metal/moe.metal",
+          "bytes": 438320,
+          "sha256": "c5f5d968be87ade2a48697b78efa99581fab8412943bbac1d8f26e02090cf5b7"
+        },
+        {
+          "path": "tests/test_deepseek41_metal.c",
+          "bytes": 118958,
+          "sha256": "d0b5d0fdb4c3c9c511edb393c133220af241734477f5ab07f278372c977fc1a4"
+        }
+      ],
+      "patch_sha256": "f39546d1c5ab876f33e7b1a53cfa0db2ef9e8db5714c30e01bec1c0b301ae746",
+      "is_branch_ancestor": true
+    },
+    {
+      "short": "64ceeea",
+      "sha": "64ceeea4f51408a00a7e9f69b0171e1b71292de9",
+      "url": "https://github.com/kernelpool/ds4/commit/64ceeea4f51408a00a7e9f69b0171e1b71292de9",
+      "changed_paths": [
+        "ds4.c",
+        "ds4_deepseek41_gpu.h",
+        "ds4_gpu.h",
+        "ds4_metal.m",
+        "metal/dsv4_misc.metal",
+        "tests/test_deepseek41_metal.c"
+      ],
+      "snapshot_files": [
+        {
+          "path": "ds4.c",
+          "bytes": 4014204,
+          "sha256": "884f6413beac3d2a68a2f05f12bf870275daf85204e168ada72044da522f42d0"
+        },
+        {
+          "path": "ds4_deepseek41_gpu.h",
+          "bytes": 21712,
+          "sha256": "52bc9b93619a858d74e31f7acb6607612b31e57e967a37f3f77db872a62e32dc"
+        },
+        {
+          "path": "ds4_gpu.h",
+          "bytes": 162682,
+          "sha256": "a3e6e07d4ad4c6e69e0c504b0d3502f568a13b110eb11530c24a173f1f3b3547"
+        },
+        {
+          "path": "ds4_metal.m",
+          "bytes": 2478295,
+          "sha256": "6592ed50a8c4a03906713ee09e814fa7e985b52626d19d06c8ddfd9b22c57d73"
+        },
+        {
+          "path": "metal/dsv4_misc.metal",
+          "bytes": 299983,
+          "sha256": "2babd3cfe1e670107b5c1f612e8da599d4c4663f35cb690d55b6b154be5ccdc6"
+        },
+        {
+          "path": "tests/test_deepseek41_metal.c",
+          "bytes": 127786,
+          "sha256": "80e64c7a05c277b256faa6b73ddf14de6cd28fdcacadef55888030a0c8986327"
+        }
+      ],
+      "patch_sha256": "480a562be9b98ea2454f3e4bc36157710b050c0ff4cba41d3d9b0e8869bded6f",
+      "is_branch_ancestor": true
+    },
+    {
+      "short": "2d5ef0d",
+      "sha": "2d5ef0d3c12885e67b99860daa0032ce366bf419",
+      "url": "https://github.com/kernelpool/ds4/commit/2d5ef0d3c12885e67b99860daa0032ce366bf419",
+      "changed_paths": [
+        "ds4.c",
+        "ds4_deepseek41_gpu.h",
+        "ds4_metal.m",
+        "metal/dsv41.metal",
+        "metal/dsv4_misc.metal",
+        "tests/test_deepseek41_metal.c"
+      ],
+      "snapshot_files": [
+        {
+          "path": "ds4.c",
+          "bytes": 3993535,
+          "sha256": "e5448f2fb2785b809efcf6e95019beaa2dd584f7737396680410310f683793c1"
+        },
+        {
+          "path": "ds4_deepseek41_gpu.h",
+          "bytes": 18967,
+          "sha256": "c308900223b191f48047bc51a3539085bc217de0a8e43c93e603f5177c5fdbcb"
+        },
+        {
+          "path": "ds4_metal.m",
+          "bytes": 2442207,
+          "sha256": "503604bd0bf1bea42245cead53581a55f983c92f861dcdd989202844ae0ebbdd"
+        },
+        {
+          "path": "metal/dsv41.metal",
+          "bytes": 29029,
+          "sha256": "dbc86a2cf98a7668678289f58b2f77539d0dbce1abdf8d8d12a74634e9941d34"
+        },
+        {
+          "path": "metal/dsv4_misc.metal",
+          "bytes": 289088,
+          "sha256": "3bd20e42a2604f6970789572bf70a4797f5840162554c38cfa96be212bb2855f"
+        },
+        {
+          "path": "tests/test_deepseek41_metal.c",
+          "bytes": 95478,
+          "sha256": "09900d7088a0f34d903a7b791dbb6ce6f272749531274eeb2ebdbc388ae95f3c"
+        }
+      ],
+      "patch_sha256": "459c93c20704957c65298e8008b0bb07c59b5c1f362750d6446fbeb52f5dcabd",
+      "is_branch_ancestor": true
+    },
+    {
+      "short": "e99dc21",
+      "sha": "e99dc2175175f2eb8af317b09f34989d8db96c5e",
+      "url": "https://github.com/kernelpool/ds4/commit/e99dc2175175f2eb8af317b09f34989d8db96c5e",
+      "changed_paths": [
+        "ds4_gpu.h",
+        "ds4_metal.m",
+        "metal/dsv41.metal",
+        "tests/test_deepseek41_metal.c"
+      ],
+      "snapshot_files": [
+        {
+          "path": "ds4_gpu.h",
+          "bytes": 162644,
+          "sha256": "c8f7858f00402b56b62f4427cb45386fdee87f0c8da5da117ee2b56c1b02c607"
+        },
+        {
+          "path": "ds4_metal.m",
+          "bytes": 2473177,
+          "sha256": "4e923c457dcfc592a87c417b56aa9605d81adfb858b88316f98b4833bef02daa"
+        },
+        {
+          "path": "metal/dsv41.metal",
+          "bytes": 36661,
+          "sha256": "2983be3772f070587bc1e66eaf95ae1d94eee30b9d1bada69b76c18b7293fda8"
+        },
+        {
+          "path": "tests/test_deepseek41_metal.c",
+          "bytes": 122544,
+          "sha256": "31413bb4aface31c346aa2ce2df89232fc18fe5e21c1b925de498cc7130cb135"
+        }
+      ],
+      "patch_sha256": "7ed875be7a942d9c08ce78940beabd4c3503e153689b516c7f36c855e9dc51c4",
+      "is_branch_ancestor": true
+    },
+    {
+      "short": "4ff3af6",
+      "sha": "4ff3af604facebc487772613751f63319bd7dfa8",
+      "url": "https://github.com/kernelpool/ds4/commit/4ff3af604facebc487772613751f63319bd7dfa8",
+      "changed_paths": [
+        "ds4.c",
+        "ds4_deepseek41_gpu.h",
+        "ds4_gpu.h",
+        "ds4_metal.m",
+        "metal/argsort.metal",
+        "tests/test_deepseek41_metal.c"
+      ],
+      "snapshot_files": [
+        {
+          "path": "ds4.c",
+          "bytes": 4014618,
+          "sha256": "d464cbd788e7c935ce76f0295afb9c3674a2c0937bd6e62a6408f7072412fa46"
+        },
+        {
+          "path": "ds4_deepseek41_gpu.h",
+          "bytes": 21874,
+          "sha256": "84abf0bd9e2ceead814d37c7276509d3d970705b7fa50b71c7a76ad17ff97ca9"
+        },
+        {
+          "path": "ds4_gpu.h",
+          "bytes": 162823,
+          "sha256": "c16162d867dde26aea63da88b2eba5349400372a29479ac9a15f46dad48050c7"
+        },
+        {
+          "path": "ds4_metal.m",
+          "bytes": 2482785,
+          "sha256": "45b9967c2fe2ea497339e6cff209708c604e0c03a691b47b19a5db1f7b43c69c"
+        },
+        {
+          "path": "metal/argsort.metal",
+          "bytes": 32716,
+          "sha256": "223e213784b4e119e1359dae7d4c43647bfa99d461f9f2aed34116e68f18e17e"
+        },
+        {
+          "path": "tests/test_deepseek41_metal.c",
+          "bytes": 134838,
+          "sha256": "7e0e3d2f8546465d2680f38cec5ebce433a1578816c398d68bdf4aa244338cf7"
+        }
+      ],
+      "patch_sha256": "a9ce1f0893aeaeada46afea44c657a465d3a02b59822942ddc7783999ab03004",
+      "is_branch_ancestor": true
+    },
+    {
+      "short": "bdae764",
+      "sha": "bdae7640ef05954fffa11d87360dc8c130aa85fc",
+      "url": "https://github.com/kernelpool/ds4/commit/bdae7640ef05954fffa11d87360dc8c130aa85fc",
+      "changed_paths": [
+        "ds4.c",
+        "ds4_engram.c",
+        "ds4_engram.h"
+      ],
+      "snapshot_files": [
+        {
+          "path": "ds4.c",
+          "bytes": 3996738,
+          "sha256": "d8903f0d993f19c0df59bdb2fbb0bd412a983a259d733d8119c6fb4a30e16172"
+        },
+        {
+          "path": "ds4_engram.c",
+          "bytes": 23248,
+          "sha256": "6e366c82c08304218b6bae18cceb95ccb74533ee3effd385f25ed7ba41f017e6"
+        },
+        {
+          "path": "ds4_engram.h",
+          "bytes": 4167,
+          "sha256": "b665119a712cbef3540da8bb8579dcfbc0656ed345430e2f7ac56a75c51ee682"
+        }
+      ],
+      "patch_sha256": "41f7ddea05f649503d8c88441ab754f3f9e8c218ff46b990486522498679f897",
+      "is_branch_ancestor": true
+    },
+    {
+      "short": "187f46b",
+      "sha": "187f46b4fa1fe358a802832a0c19dffd7759a0e2",
+      "url": "https://github.com/kernelpool/ds4/commit/187f46b4fa1fe358a802832a0c19dffd7759a0e2",
+      "changed_paths": [
+        "ds4_bench.c",
+        "ds4_metal.m"
+      ],
+      "snapshot_files": [
+        {
+          "path": "ds4_bench.c",
+          "bytes": 41543,
+          "sha256": "77d9928c231870d802482f760a7d1b7324a8d64925dcb4471f4c2c1ce4ec2068"
+        },
+        {
+          "path": "ds4_metal.m",
+          "bytes": 2438274,
+          "sha256": "1761ac0851a129a8aaaefc4f0d56a6ce55845da23090d6785bba5a5ac0c6a11a"
+        }
+      ],
+      "patch_sha256": "2e52435c8e43cedbe4b6b15b79ff63e9a0790566cce8baea494210ea99de9d68",
+      "is_branch_ancestor": true
+    },
+    {
+      "short": "72ccf36",
+      "sha": "72ccf363174c3e1acf840b3661a956d4fb321071",
+      "url": "https://github.com/kernelpool/ds4/commit/72ccf363174c3e1acf840b3661a956d4fb321071",
+      "changed_paths": [
+        ".gitignore",
+        "Makefile",
+        "ds4.c",
+        "ds4_gpu.h",
+        "ds4_metal.m",
+        "tests/test_deepseek41_preencode.c"
+      ],
+      "snapshot_files": [
+        {
+          "path": ".gitignore",
+          "bytes": 2754,
+          "sha256": "3000deb9932566177fd2277f2636d7de9e04afbd601dfbc5fe91960823c91755"
+        },
+        {
+          "path": "Makefile",
+          "bytes": 63532,
+          "sha256": "f2285f4b1069a31fd4db16b116cdf722eb793d98d57693176d3b6382ce49cf9c"
+        },
+        {
+          "path": "ds4.c",
+          "bytes": 4014903,
+          "sha256": "9e01d66378f8caaf0390315be14769f878b7e9d3717ebc9dcbe14bf99f31bc82"
+        },
+        {
+          "path": "ds4_gpu.h",
+          "bytes": 162823,
+          "sha256": "c16162d867dde26aea63da88b2eba5349400372a29479ac9a15f46dad48050c7"
+        },
+        {
+          "path": "ds4_metal.m",
+          "bytes": 2482785,
+          "sha256": "45b9967c2fe2ea497339e6cff209708c604e0c03a691b47b19a5db1f7b43c69c"
+        }
+      ],
+      "patch_sha256": "094f6f671b1aaf8879cca56e5fb4ab7e5e2ade4a0d6fa5e09b941feedf22e55c",
+      "is_branch_ancestor": true
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "kind": "full_translation_unit_identity_gate",
+  "source_identity_sha256": "17508152ff937172a1473cdf11ed614a5fe3a5a2117cdb31e9b89ea236a188d0",
+  "complete_original_source_sha256": "bc6603c97ec24af7597f6b10c7ed2a7bfe1344379733a0a4df780250a13f3224",
+  "deployed_source_sha256": "bc6603c97ec24af7597f6b10c7ed2a7bfe1344379733a0a4df780250a13f3224",
+  "expected": "all scores bits/guards/input bytes identical across deployed native, same-build native and candidate",
+  "exclusive_recognized_process_check": true,
+  "fullmodel": false,
+  "production_adoption": false,
+  "argv": [
+    "/private/tmp/myds-indexer-r2-20261025/full-build/bench_indexer_k_resident",
+    "--metallib",
+    "/private/tmp/myds-indexer-r2-20261025/full-build/probe.metallib",
+    "--native-metallib",
+    "/private/tmp/myds-indexer-r2-20261025/deployed/myds.metallib",
+    "--out-dir",
+    "/private/tmp/myds-indexer-r2-20261025/full-identity/synthetic"
+  ]
+}

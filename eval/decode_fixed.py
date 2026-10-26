@@ -52,6 +52,7 @@ def main(argv=None):
                     raise BenchmarkError("no measurable visible decode interval")
                 record["accepted"] = True
             except BenchmarkError as exc:
+                record.update(exc.metadata)
                 record.update(accepted=False, error=str(exc))
                 print("  p%d %s: rejected: %s" % (pi, label, exc), flush=True)
                 if run < 0:

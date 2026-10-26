@@ -1,0 +1,166 @@
+{
+  "decision": "Reject frozen v1 on exact numerical gate; no timing or runtime integration. Native identity gate passed. Do not label as a perf regression or all-Q_B-fusion impossibility.",
+  "execution": {
+    "all_completed_command_buffers": 342,
+    "case_count": 114,
+    "eligible_layer_count": 32,
+    "exit_code": 1,
+    "expected_fail_closed": true,
+    "ordered_cases_then_providers": true,
+    "timing_record_count": 0
+  },
+  "identity": {
+    "actual_gold_library_sha256": "3837102396703da59e0eebbc0de1fdc58b68b3a3a5ec5d07504b351c67a29ba9",
+    "binary_sha256": "a83ded3a48db8f4ad59ba0d61f4930ca79602b11b30c9ee6667c43d37a4c2f82",
+    "build_manifest_sha256": "92c2e6bb2e6e3ef104282a471c5c413f4f82bb20b57d29fbdf6b3a826096f3b4",
+    "native_full_tu_source_sha256": "bc6603c97ec24af7597f6b10c7ed2a7bfe1344379733a0a4df780250a13f3224",
+    "probe_library_sha256": "a23f6bb4cc5498d3cc2914900dda7075e84de730f9e96b70ad11cb99a3efed45",
+    "tools_still_frozen": true
+  },
+  "ir": {
+    "actual_gold_qb_equal_probe_qb_after_only_TU_ctor_symbol_filename_normalization": true,
+    "actual_gold_rope_module_byte_equal_probe_rope": true,
+    "actual_gold_rope_module_sha256": "dc64450b4fef09d38df236061a380fea94fdc769b2d35785496218a441603d16",
+    "artifacts": [
+      {
+        "bytes": 8019,
+        "path": "/tmp/myds-qb-rope-ir-review-20261025/actual_gold.kernel_dsv41_rope.ll",
+        "sha256": "dc64450b4fef09d38df236061a380fea94fdc769b2d35785496218a441603d16"
+      },
+      {
+        "bytes": 22830,
+        "path": "/tmp/myds-qb-rope-ir-review-20261025/actual_gold.kernel_myds_q4_v41_qb_nb_bf16.ll",
+        "sha256": "2ae2333543c5f0739682ebb9085f7f68c77992fd8405576e9e2ed6862b127dc2"
+      },
+      {
+        "bytes": 8019,
+        "path": "/tmp/myds-qb-rope-ir-review-20261025/probe.kernel_dsv41_rope.ll",
+        "sha256": "dc64450b4fef09d38df236061a380fea94fdc769b2d35785496218a441603d16"
+      },
+      {
+        "bytes": 27411,
+        "path": "/tmp/myds-qb-rope-ir-review-20261025/probe.kernel_myds_probe_qb_rope_nb_bf16.ll",
+        "sha256": "d39d1b9c5632d25665b879f6ac6dc9f3851d53b6668bef8548cfaa99f4a76033"
+      },
+      {
+        "bytes": 22820,
+        "path": "/tmp/myds-qb-rope-ir-review-20261025/probe.kernel_myds_q4_v41_qb_nb_bf16.ll",
+        "sha256": "1f0eab461d8a556095a59f34aa5c1b044e8311c2f0abcee91ff2c626bdf10ae6"
+      }
+    ],
+    "causal_hypotheses": [
+      "Different contraction/lowering of the two fast im products near a BF16 rounding boundary is consistent with all three im-only adjacent-BF16 differences.",
+      "AIR alone does not prove which multiply contracts or exclude a changed first-BF16 Q_B tail input; no deterministic fix is established."
+    ],
+    "confirmed_facts": [
+      "Actual gold and probe native RoPE AIR modules are byte-identical.",
+      "Actual gold and probe native Q_B AIR modules are identical after only translation-unit constructor filename symbol normalization.",
+      "Both modules carry fast floating-point operations; precise source namespace alone does not pin every AIR affine contraction.",
+      "Gold im result adds im*cos then re*sin in AIR; candidate im result adds re*sin then im*cos. This is a concrete AIR order difference, not proof of the GPU machine-level cause."
+    ],
+    "no_gpu_retest_or_source_mutation": true,
+    "repair_proven": false
+  },
+  "kind": "qb_forward_rope_gpu_screen_independent_raw_review",
+  "numerical_gate_passed": false,
+  "parity": {
+    "actual_vs_candidate_complete_equal_pairs": 111,
+    "actual_vs_same_probe_native_complete_equal_pairs": 114,
+    "all_output_f32_finite_and_bf16": true,
+    "all_unrotated_f32_equal": true,
+    "candidate_mismatching_cases": 3,
+    "candidate_mismatching_f32": 3,
+    "differences": [
+      {
+        "absolute_error": 0.0078125,
+        "bf16_ulp_distance": 1,
+        "candidate_bf16": "0x3fe0",
+        "candidate_f32": 1.75,
+        "candidate_u32": "0x3fe00000",
+        "case": 8,
+        "component": "im",
+        "compressed": true,
+        "f32_ulp_distance": 65536,
+        "gold_bf16": "0x3fe1",
+        "gold_f32": 1.7578125,
+        "gold_u32": "0x3fe10000",
+        "head": 63,
+        "head_dimension": 505,
+        "layer": 3,
+        "position": 327679,
+        "relative_error_to_gold": 0.0044444444444444444,
+        "rope_pair": 28,
+        "row": 32761
+      },
+      {
+        "absolute_error": 0.125,
+        "bf16_ulp_distance": 1,
+        "candidate_bf16": "0x41af",
+        "candidate_f32": 21.875,
+        "candidate_u32": "0x41af0000",
+        "case": 92,
+        "component": "im",
+        "compressed": true,
+        "f32_ulp_distance": 65536,
+        "gold_bf16": "0x41b0",
+        "gold_f32": 22.0,
+        "gold_u32": "0x41b00000",
+        "head": 42,
+        "head_dimension": 485,
+        "layer": 38,
+        "position": 327679,
+        "relative_error_to_gold": 0.005681818181818182,
+        "rope_pair": 18,
+        "row": 21989
+      },
+      {
+        "absolute_error": 0.0078125,
+        "bf16_ulp_distance": 1,
+        "candidate_bf16": "0xbf87",
+        "candidate_f32": -1.0546875,
+        "candidate_u32": "0xbf870000",
+        "case": 99,
+        "component": "im",
+        "compressed": false,
+        "f32_ulp_distance": 65536,
+        "gold_bf16": "0xbf86",
+        "gold_f32": -1.046875,
+        "gold_u32": "0xbf860000",
+        "head": 11,
+        "head_dimension": 483,
+        "layer": 0,
+        "position": 16384,
+        "relative_error_to_gold": 0.007462686567164179,
+        "rope_pair": 17,
+        "row": 6115
+      }
+    ],
+    "max_absolute_error": 0.125,
+    "max_bf16_ulp_distance": 1,
+    "max_f32_ulp_distance": 65536,
+    "max_relative_error_to_gold": 0.007462686567164179
+  },
+  "performance_timing_started": false,
+  "production_adoption": false,
+  "protocol_sha256": "3feb4360b4aa8bcb1bddba2a5d619ec70e898c9079871b3da2e4f2b39207059c",
+  "raw": {
+    "all_directory_files_accounted": true,
+    "all_guards_0xa5": true,
+    "all_input_post_raw_equal_before": true,
+    "complete_outputs": 342,
+    "files_sha_size_verified": 1715,
+    "guard_bytes_each": 64,
+    "guard_files_verified": 914,
+    "host_only_before_inputs_and_args_all_byte_equal": true,
+    "input_post_bytes_compared": 24176640,
+    "input_records_verified": 115,
+    "output_f32_verified": 11206656
+  },
+  "raw_manifest_sha256": "9efcb855035895d92ed40bdcc41c32860e4a3a05941523fbe760ada2ab973444",
+  "raw_root": "/tmp/myds-qb-rope-gpu-screen-20261025",
+  "review_completed": true,
+  "schema_version": 1,
+  "scope": "M4 synthetic complete-output screen, never real-model inference",
+  "source_root_head_context": "224dc70a839af1468c68c277384fa489ea55afbd",
+  "stdout_sha256": "d434232f7b62cab69e33eecbdd155a6bb03b9fada28d6f3c37921b335c391890"
+}

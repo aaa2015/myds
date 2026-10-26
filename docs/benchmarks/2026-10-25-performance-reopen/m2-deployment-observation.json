@@ -1,0 +1,82 @@
+{
+  "config_sha256": "0a3524b030a73916f7684d841b912c6e978c680825a3c3520ca18188f35a2cff",
+  "configured_values": 62,
+  "selected_config": {
+    "MYDS_PREFILL_ATTN": null,
+    "MYDS_ATTN_VEC_HEAD_FIRST": null,
+    "MYDS_INDEXER_TILED": null,
+    "MYDS_INDEXER_CHUNK_EXACT": null,
+    "MYDS_INDEXER_KEY_WINDOW": null,
+    "MYDS_METAL_CONCURRENT": "1",
+    "MYDS_MOE_NSG": "2",
+    "MYDS_MOE_DOWN_NSG": "4",
+    "MYDS_PREFIX_CACHE": "1",
+    "MYDS_PLD": "1",
+    "MYDS_YOCO_COMPACT": "0"
+  },
+  "runs": {
+    "myds-indexer-k-screen-20261025": {
+      "artifacts_before": {
+        "/Users/fangqingyuan/Projects/myds/bin/myds": "2b4d56958c1b3c16223f109c7a1e860b6153ad88e5c85fc70dcd44c98012cb83",
+        "/Users/fangqingyuan/Projects/myds/bin/myds.metallib": "3837102396703da59e0eebbc0de1fdc58b68b3a3a5ec5d07504b351c67a29ba9",
+        "/Users/fangqingyuan/Projects/myfleet/myds.conf": "0a3524b030a73916f7684d841b912c6e978c680825a3c3520ca18188f35a2cff"
+      },
+      "artifacts_after": {
+        "/Users/fangqingyuan/Projects/myds/bin/myds": "2b4d56958c1b3c16223f109c7a1e860b6153ad88e5c85fc70dcd44c98012cb83",
+        "/Users/fangqingyuan/Projects/myds/bin/myds.metallib": "3837102396703da59e0eebbc0de1fdc58b68b3a3a5ec5d07504b351c67a29ba9",
+        "/Users/fangqingyuan/Projects/myfleet/myds.conf": "0a3524b030a73916f7684d841b912c6e978c680825a3c3520ca18188f35a2cff"
+      },
+      "artifacts_identical": true,
+      "myds_listener_before": [
+        "myds      52300 fangqingyuan   13u  IPv4 0x8eeee74bca15b24d      0t0  TCP 127.0.0.1:8099 (LISTEN)"
+      ],
+      "myds_listener_after": [
+        "myds      52300 fangqingyuan   13u  IPv4 0x8eeee74bca15b24d      0t0  TCP 127.0.0.1:8099 (LISTEN)"
+      ],
+      "service_stop_or_start": false,
+      "exclusive": false
+    },
+    "myds-indexer-k-samebuild-screen-20261025": {
+      "artifacts_before": {
+        "/Users/fangqingyuan/Projects/myds/bin/myds": "2b4d56958c1b3c16223f109c7a1e860b6153ad88e5c85fc70dcd44c98012cb83",
+        "/Users/fangqingyuan/Projects/myds/bin/myds.metallib": "3837102396703da59e0eebbc0de1fdc58b68b3a3a5ec5d07504b351c67a29ba9",
+        "/Users/fangqingyuan/Projects/myfleet/myds.conf": "0a3524b030a73916f7684d841b912c6e978c680825a3c3520ca18188f35a2cff"
+      },
+      "artifacts_after": {
+        "/Users/fangqingyuan/Projects/myds/bin/myds": "2b4d56958c1b3c16223f109c7a1e860b6153ad88e5c85fc70dcd44c98012cb83",
+        "/Users/fangqingyuan/Projects/myds/bin/myds.metallib": "3837102396703da59e0eebbc0de1fdc58b68b3a3a5ec5d07504b351c67a29ba9",
+        "/Users/fangqingyuan/Projects/myfleet/myds.conf": "0a3524b030a73916f7684d841b912c6e978c680825a3c3520ca18188f35a2cff"
+      },
+      "artifacts_identical": true,
+      "myds_listener_before": [
+        "myds      52300 fangqingyuan   13u  IPv4 0x8eeee74bca15b24d      0t0  TCP 127.0.0.1:8099 (LISTEN)"
+      ],
+      "myds_listener_after": [
+        "myds      52300 fangqingyuan   13u  IPv4 0x8eeee74bca15b24d      0t0  TCP 127.0.0.1:8099 (LISTEN)"
+      ],
+      "service_stop_or_start": false,
+      "exclusive": false
+    },
+    "myds-indexer-k-min15-screen-20261025": {
+      "artifacts_before": {
+        "/Users/fangqingyuan/Projects/myds/bin/myds": "2b4d56958c1b3c16223f109c7a1e860b6153ad88e5c85fc70dcd44c98012cb83",
+        "/Users/fangqingyuan/Projects/myds/bin/myds.metallib": "3837102396703da59e0eebbc0de1fdc58b68b3a3a5ec5d07504b351c67a29ba9",
+        "/Users/fangqingyuan/Projects/myfleet/myds.conf": "0a3524b030a73916f7684d841b912c6e978c680825a3c3520ca18188f35a2cff"
+      },
+      "artifacts_after": {
+        "/Users/fangqingyuan/Projects/myds/bin/myds": "2b4d56958c1b3c16223f109c7a1e860b6153ad88e5c85fc70dcd44c98012cb83",
+        "/Users/fangqingyuan/Projects/myds/bin/myds.metallib": "3837102396703da59e0eebbc0de1fdc58b68b3a3a5ec5d07504b351c67a29ba9",
+        "/Users/fangqingyuan/Projects/myfleet/myds.conf": "0a3524b030a73916f7684d841b912c6e978c680825a3c3520ca18188f35a2cff"
+      },
+      "artifacts_identical": true,
+      "myds_listener_before": [
+        "myds      52300 fangqingyuan   13u  IPv4 0x8eeee74bca15b24d      0t0  TCP 127.0.0.1:8099 (LISTEN)"
+      ],
+      "myds_listener_after": [
+        "myds      52300 fangqingyuan   13u  IPv4 0x8eeee74bca15b24d      0t0  TCP 127.0.0.1:8099 (LISTEN)"
+      ],
+      "service_stop_or_start": false,
+      "exclusive": false
+    }
+  }
+}

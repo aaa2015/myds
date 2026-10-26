@@ -1,0 +1,11 @@
+{
+  "source_sha_unchanged": true,
+  "verified_source_files": 23,
+  "verified_upstream_patch_sha": 12,
+  "pinned_upstream_commit_count": 136,
+  "checked_local_links": 32,
+  "missing_local_links": [],
+  "new_GPU_or_service_work": false,
+  "report_sha256": "1abf5fed8e59de53a0b23d5ef94b02c6a4de278ed44ebbfbad89c32a47fbcb9e",
+  "peer_source_review": "prefill, decode, and upstream reviewers report no substantive factual objection; two wording refinements incorporated"
+}

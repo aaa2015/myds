@@ -1,0 +1,26 @@
+{
+  "kind": "qb_forward_rope_synthetic_screen",
+  "adoption_cohort": false,
+  "argv": [
+    "/tmp/myds-qb-rope-probe-build-v1-20261025/bench_qb_rope_probe",
+    "--synthetic",
+    "--timing",
+    "--metallib",
+    "/tmp/myds-qb-rope-probe-build-v1-20261025/probe.metallib",
+    "--golden-metallib",
+    "/tmp/myds-indexer-r2-real-local-20261025/deployed/myds.metallib",
+    "--build-manifest",
+    "/tmp/myds-qb-rope-probe-build-v1-20261025/source-identity.json",
+    "--out-dir",
+    "/tmp/myds-qb-rope-gpu-screen-20261025/outputs"
+  ],
+  "build_manifest_sha256": "92c2e6bb2e6e3ef104282a471c5c413f4f82bb20b57d29fbdf6b3a826096f3b4",
+  "binary_sha256": "a83ded3a48db8f4ad59ba0d61f4930ca79602b11b30c9ee6667c43d37a4c2f82",
+  "probe_sha256": "a23f6bb4cc5498d3cc2914900dda7075e84de730f9e96b70ad11cb99a3efed45",
+  "golden_sha256": "3837102396703da59e0eebbc0de1fdc58b68b3a3a5ec5d07504b351c67a29ba9",
+  "exclusive_recognized_process_check": true,
+  "phase1": "all114cases threeproviders fulloutput bits/inputs/guards before timing",
+  "phase2": "single fixed3cases x2controls x(1warm+9formal)x3arms,64reps perCB",
+  "fullmodel": false,
+  "production_adoption": false
+}

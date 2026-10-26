@@ -1,0 +1,13 @@
+{
+  "kind": "qb_forward_rope_frozen_v1_M2_correctness_only",
+  "adoption_cohort": false,
+  "timing_requested": false,
+  "frozen_binary_sha256": "a83ded3a48db8f4ad59ba0d61f4930ca79602b11b30c9ee6667c43d37a4c2f82",
+  "probe_sha256": "a23f6bb4cc5498d3cc2914900dda7075e84de730f9e96b70ad11cb99a3efed45",
+  "cases": 114,
+  "providers": 3,
+  "same_344_before_payloads_vs_M4_required_for_cross_device_input_identity": true,
+  "M4_failure_permanently_preserved": true,
+  "fullmodel_eligible": false,
+  "production_adoption": false
+}

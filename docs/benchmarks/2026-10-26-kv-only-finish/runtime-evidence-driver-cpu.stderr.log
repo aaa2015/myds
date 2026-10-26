@@ -1,0 +1,25 @@
+test_decode_only_candidate_rejected (test_decode_kv_only_fullmodel_driver.Contracts.test_decode_only_candidate_rejected) ... ok
+test_forbidden_fallback_failure_reference (test_decode_kv_only_fullmodel_driver.Contracts.test_forbidden_fallback_failure_reference) ... ok
+test_generator_reverse_and_untouched_lifecycle (test_decode_kv_only_fullmodel_driver.Contracts.test_generator_reverse_and_untouched_lifecycle) ... ok
+test_invalid_mode_pre_model (test_decode_kv_only_fullmodel_driver.Contracts.test_invalid_mode_pre_model) ... ok
+test_no_api_refuses_run (test_decode_kv_only_fullmodel_driver.Contracts.test_no_api_refuses_run) ... ok
+test_no_or_wrong_symbol (test_decode_kv_only_fullmodel_driver.Contracts.test_no_or_wrong_symbol) ... ok
+test_observed_N_must_match_requested (test_decode_kv_only_fullmodel_driver.Contracts.test_observed_N_must_match_requested) ... ok
+test_positive_candidate_256_dynamic (test_decode_kv_only_fullmodel_driver.Contracts.test_positive_candidate_256_dynamic) ... ok
+test_positive_candidate_first_and_decode (test_decode_kv_only_fullmodel_driver.Contracts.test_positive_candidate_first_and_decode) ... ok
+test_positive_control_256_dynamic (test_decode_kv_only_fullmodel_driver.Contracts.test_positive_control_256_dynamic) ... ok
+test_positive_control_reference (test_decode_kv_only_fullmodel_driver.Contracts.test_positive_control_reference) ... ok
+test_prefill_only_candidate_rejected (test_decode_kv_only_fullmodel_driver.Contracts.test_prefill_only_candidate_rejected) ... ok
+test_preflight_json_subject_mode_before_base (test_decode_kv_only_fullmodel_driver.Contracts.test_preflight_json_subject_mode_before_base) ... ok
+test_regression_null (test_decode_kv_only_fullmodel_driver.Contracts.test_regression_null) ... ok
+test_spec_draft_telemetry_rejected (test_decode_kv_only_fullmodel_driver.Contracts.test_spec_draft_telemetry_rejected) ... ok
+test_state_actual_export_schema2 (test_decode_kv_only_fullmodel_driver.Contracts.test_state_actual_export_schema2) ... ok
+test_state_bad_bounds_refused (test_decode_kv_only_fullmodel_driver.Contracts.test_state_bad_bounds_refused) ... ok
+test_state_only_two_string_edits (test_decode_kv_only_fullmodel_driver.Contracts.test_state_only_two_string_edits) ... ok
+test_wrong_first_layer_counts (test_decode_kv_only_fullmodel_driver.Contracts.test_wrong_first_layer_counts) ... ok
+test_wrong_total_or_requests (test_decode_kv_only_fullmodel_driver.Contracts.test_wrong_total_or_requests) ... ok
+
+----------------------------------------------------------------------
+Ran 20 tests in 1.235s
+
+OK

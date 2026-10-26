@@ -1,0 +1,126 @@
+{
+  "passed": true,
+  "gpu_work_submitted": false,
+  "runs": [
+    {
+      "value": null,
+      "case": "parse",
+      "returncode": 0,
+      "stdout": "{\"parse\":true,\"mode\":0,\"gpu_work\":false}\n",
+      "stderr": ""
+    },
+    {
+      "value": null,
+      "case": "matrix",
+      "returncode": 0,
+      "stdout": "{\"controls\":3,\"mode\":0,\"gpu_work\":false}\n",
+      "stderr": ""
+    },
+    {
+      "value": "0",
+      "case": "parse",
+      "returncode": 0,
+      "stdout": "{\"parse\":true,\"mode\":0,\"gpu_work\":false}\n",
+      "stderr": ""
+    },
+    {
+      "value": "0",
+      "case": "matrix",
+      "returncode": 0,
+      "stdout": "{\"controls\":3,\"mode\":0,\"gpu_work\":false}\n",
+      "stderr": ""
+    },
+    {
+      "value": "1",
+      "case": "parse",
+      "returncode": 0,
+      "stdout": "{\"parse\":true,\"mode\":1,\"gpu_work\":false}\n",
+      "stderr": ""
+    },
+    {
+      "value": "1",
+      "case": "matrix",
+      "returncode": 0,
+      "stdout": "{\"controls\":48,\"mode\":1,\"gpu_work\":false,\"actual_source_included\":true}\n",
+      "stderr": ""
+    },
+    {
+      "value": "",
+      "case": "parse",
+      "returncode": 0,
+      "stdout": "{\"parse\":true,\"mode\":-1,\"gpu_work\":false}\n",
+      "stderr": ""
+    },
+    {
+      "value": "01",
+      "case": "parse",
+      "returncode": 0,
+      "stdout": "{\"parse\":true,\"mode\":-1,\"gpu_work\":false}\n",
+      "stderr": ""
+    },
+    {
+      "value": "true",
+      "case": "parse",
+      "returncode": 0,
+      "stdout": "{\"parse\":true,\"mode\":-1,\"gpu_work\":false}\n",
+      "stderr": ""
+    },
+    {
+      "value": "2",
+      "case": "parse",
+      "returncode": 0,
+      "stdout": "{\"parse\":true,\"mode\":-1,\"gpu_work\":false}\n",
+      "stderr": ""
+    },
+    {
+      "value": "-1",
+      "case": "parse",
+      "returncode": 0,
+      "stdout": "{\"parse\":true,\"mode\":-1,\"gpu_work\":false}\n",
+      "stderr": ""
+    },
+    {
+      "value": "1",
+      "window": 8,
+      "case": "matrix",
+      "returncode": 0,
+      "stdout": "{\"window_reference\":true,\"gpu_work\":false}\n",
+      "stderr": ""
+    },
+    {
+      "value": "",
+      "case": "invalid_actual_scoped_call",
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "value": "01",
+      "case": "invalid_actual_scoped_call",
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "value": "true",
+      "case": "invalid_actual_scoped_call",
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "value": "2",
+      "case": "invalid_actual_scoped_call",
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "value": "-1",
+      "case": "invalid_actual_scoped_call",
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "performance_acceptance": false,
+  "prerequisite_report": {
+    "bytes": 2581,
+    "path": "/private/tmp/myds-decode-kv-only-validation-20261026/component-M2-review.json",
+    "sha256": "2c5433f72107d3461e5f4cb2cde9171aa747068c58e7b74908c60005d4211edc"
+  },
+  "protocol_sha256": "d3281ddbb92874a15010bf986262079f37d48464c8180044ae093df9b44ec839",
+  "reader_sha256": "9e7d77f1befc73008925c2478404396adffbb1f8991cbfa8ad5e9ed80fc8822b",
+  "run_order": [
+    {
+      "provider": "G_lib",
+      "workload": "short"
+    },
+    {
+      "provider": "off",
+      "workload": "short"
+    },
+    {
+      "provider": "on",
+      "workload": "short"
+    },
+    {
+      "provider": "G_lib",
+      "workload": "business2"
+    },
+    {
+      "provider": "off",
+      "workload": "business2"
+    },
+    {
+      "provider": "on",
+      "workload": "business2"
+    }
+  ],
+  "shared_lock_path": "/tmp/myds-codex-decode-window.lock",
+  "stage": "Q",
+  "started_epoch": 1792946258.613037,
+  "timeout_s": 600,
+  "wrapper_sha256": "89115a92e524729f53785f30165e5ed50d8b900cf649e40feb2e62794a05145d"
+}

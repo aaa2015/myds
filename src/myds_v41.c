@@ -3772,6 +3772,10 @@ static int publish_indexer_chunk(myds_context_t *ctx, uint32_t il, uint32_t c_st
             !myds_metal_buffer_update_sub_view(mask_view,prompt_block_mask,
                 (size_t)(c_start+off)*mask_bytes,(size_t)glen*mask_bytes)) return -1;
         /* 分数表：glen 行 × nc 列，行主序。 */
+#ifdef MYDS_INDEXER_CAPTURE
+        extern void myds_indexer_capture_set_group(uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
+        myds_indexer_capture_set_group(il,base_pos,c_start,c_len,off,batch_floats);
+#endif
         if (!myds_v41_gpu_indexscores_chunk_bf16(scores_buf,q_view,w_view,g->index_cache[owner],
                 nc,V41_INDEX_HEADS,glen,g_start,ratio)) return -1;
         if (il==20) {
@@ -3797,8 +3801,16 @@ static int publish_indexer_chunk(myds_context_t *ctx, uint32_t il, uint32_t c_st
             }
         }
         /* 最终选择：top 取全局 V41_TOPK（≤ nc），逐行宽度由因果参数限制到 count。 */
+#ifdef MYDS_INDEXER_CAPTURE
+        extern int myds_indexer_capture_topk_begin(void);
+        extern int myds_indexer_capture_selected(const myds_metal_buffer_t *,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
+        if(!myds_indexer_capture_topk_begin())return -1;
+#endif
         if (!myds_v41_gpu_topk_causal(sel_view,scores_buf,nc,nc<V41_TOPK?nc:V41_TOPK,
                 glen,g_start,ratio,g->gpu)) return -1;
+#ifdef MYDS_INDEXER_CAPTURE
+        if(!myds_indexer_capture_selected(sel_view,nc,glen,g_start,ratio,nc<V41_TOPK?nc:V41_TOPK))return -1;
+#endif
         off+=glen;
     }
     return 1;

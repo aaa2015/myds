@@ -1,0 +1,74 @@
+{
+  "m2-deployed-native-gate.jsonl": {
+    "bytes": 2376,
+    "sha256": "41196efbeaf07044a5a0837a0f9b1fff1197f31a90b1960d3386af8c822aa09e"
+  },
+  "m2-source-identity.json": {
+    "bytes": 3609,
+    "sha256": "0676ccb241c1f569b5b4e2e103125ecba0e0e2a3f9181e796163df5c70806481"
+  },
+  "m2-protocol.json": {
+    "bytes": 498,
+    "sha256": "3994dbc75ecbff6ffcfe63a2470a10c68b5ede1863c5d573e54589d182064b40"
+  },
+  "m2-deployment-observation.json": {
+    "bytes": 4335,
+    "sha256": "fe469ed823eb8f9a4d27960d82381e3c7eb6500a19e3c3994fe74d8d0128ab3f"
+  },
+  "m2-deployed-native-gate-review.json": {
+    "bytes": 2497,
+    "sha256": "c57a301d8fa4f910bb6aee7a5eba801682fa487f136e704194e9e304d03e2396"
+  },
+  "m4-indexer-source-identity.json": {
+    "bytes": 3599,
+    "sha256": "00f2f3ea1123aaec98446074c342a4eda52f513198acf7ba8061ffc182490ecc"
+  },
+  "m2-min15-source-identity.json": {
+    "bytes": 3657,
+    "sha256": "62547bec23577b024d4865eecf275f20f12e9b320dfc963b33f07bd8a0a89635"
+  },
+  "m4-indexer.jsonl": {
+    "bytes": 46352,
+    "sha256": "a1b980672e05d994929648a4871ebba6cda45b8cc5540ff42e5160dfe77ed81f"
+  },
+  "final-source-identity.json": {
+    "bytes": 1981,
+    "sha256": "3c86ad000bacbea7f7569f6989300c6d2485c93c5d96a59501139241fdd29e80"
+  },
+  "m2-samebuild.jsonl": {
+    "bytes": 46451,
+    "sha256": "5c7511bb9cff22dad9c5d688e387524ddd17e16fb4dcb5d737e6c6cf569c9a29"
+  },
+  "m2-samebuild-review.json": {
+    "bytes": 3059,
+    "sha256": "5c00eb4574ad51235ded9755ae305492aa58097cd9c250ddf7e9526493ab25aa"
+  },
+  "indexer-inputs-sha256.json": {
+    "bytes": 703,
+    "sha256": "b4589c7aa802e2aa9cfca6072c6f2be525a95272dde13065c69b78658fadf971"
+  },
+  "m4-indexer-review.json": {
+    "bytes": 3041,
+    "sha256": "ade8f1665554ad17ce2a55693821b11f5986fe39fc6ec1bd35b1b664d2b4f22e"
+  },
+  "decode-candidate-withdrawal.json": {
+    "bytes": 1968,
+    "sha256": "e48955b222ad77a8d87df4aace990fe4f815a085b5ea18350aa5e2312b653931"
+  },
+  "m2-deployed-native-min15-gate.jsonl": {
+    "bytes": 2376,
+    "sha256": "41196efbeaf07044a5a0837a0f9b1fff1197f31a90b1960d3386af8c822aa09e"
+  },
+  "so4-m4-independent-review.json": {
+    "bytes": 1149,
+    "sha256": "862ebeffd215116638e0b4a822cf407243f29a20e3ef6548fa6301505836dfa3"
+  },
+  "m2-min15-protocol.json": {
+    "bytes": 540,
+    "sha256": "c2a4b3b0dad2cd9847d6e7a5a1dc9f773cac2fea244e7b20c8c6ac1c48223f6b"
+  },
+  "m2-deployed-native-min15-gate-review.json": {
+    "bytes": 2497,
+    "sha256": "273c857b520eaf6d425e481eef88201e68fd880149e0c11f88443022c82ce80c"
+  }
+}

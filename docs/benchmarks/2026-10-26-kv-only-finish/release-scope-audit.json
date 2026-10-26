@@ -1,0 +1,515 @@
+{
+  "schema_version": 1,
+  "kind": "CPU_only_final_release_scope_and_document_audit",
+  "snapshot_time": "2026-10-26T00:52:11.289849+08:00",
+  "GPU_or_remote_operations": false,
+  "repo_files_modified_by_audit": false,
+  "release_scope_blockers": [],
+  "report_snapshots": [
+    {
+      "path": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "bytes": 20594,
+      "sha256": "491f7a7f9feb2e0957311a83dde8f3e7e2096eda459393bf3adc69d5d610db00"
+    },
+    {
+      "path": "/Users/fangqingyuan/Projects/myds/docs/2026-10-26-decode-kv-only-finish-review.md",
+      "bytes": 8861,
+      "sha256": "e93fb574d6650c14eb02db0d2df039b62340bf863ff04f3ce7ebe12ad871234d"
+    }
+  ],
+  "relative_links_checked": 47,
+  "broken_relative_links": [],
+  "relative_link_inventory": [
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 5,
+      "target": "2026-10-26-decode-kv-only-finish-review.md",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/2026-10-26-decode-kv-only-finish-review.md",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 7,
+      "target": "2026-10-25-prefill-decode-performance-review.md",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-prefill-decode-performance-review.md",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 11,
+      "target": "benchmarks/2026-10-25-indexer-observer-and-qb-rope/old-cohort-timing-forensics.json",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-25-indexer-observer-and-qb-rope/old-cohort-timing-forensics.json",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 15,
+      "target": "../tools/bench_indexer_k_capture.m",
+      "resolved": "/Users/fangqingyuan/Projects/myds/tools/bench_indexer_k_capture.m",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 19,
+      "target": "benchmarks/2026-10-25-indexer-observer-and-qb-rope/diagnostic-protocol-v3.json",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-25-indexer-observer-and-qb-rope/diagnostic-protocol-v3.json",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 21,
+      "target": "../tools/build_indexer_stability.py",
+      "resolved": "/Users/fangqingyuan/Projects/myds/tools/build_indexer_stability.py",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 21,
+      "target": "../tools/bench_indexer_stability.m",
+      "resolved": "/Users/fangqingyuan/Projects/myds/tools/bench_indexer_stability.m",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 21,
+      "target": "../tools/review_indexer_stability.py",
+      "resolved": "/Users/fangqingyuan/Projects/myds/tools/review_indexer_stability.py",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 33,
+      "target": "benchmarks/2026-10-25-indexer-observer-and-qb-rope/diagnostic-independent-review.json",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-25-indexer-observer-and-qb-rope/diagnostic-independent-review.json",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 39,
+      "target": "benchmarks/2026-10-25-indexer-observer-and-qb-rope/observer-protocol.json",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-25-indexer-observer-and-qb-rope/observer-protocol.json",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 41,
+      "target": "../tools/build_indexer_observer_probe.py",
+      "resolved": "/Users/fangqingyuan/Projects/myds/tools/build_indexer_observer_probe.py",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 58,
+      "target": "../tools/build_indexer_matched_replay.py",
+      "resolved": "/Users/fangqingyuan/Projects/myds/tools/build_indexer_matched_replay.py",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 60,
+      "target": "benchmarks/2026-10-25-indexer-observer-and-qb-rope/matched-protocol.json",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-25-indexer-observer-and-qb-rope/matched-protocol.json",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 71,
+      "target": "benchmarks/2026-10-25-indexer-observer-and-qb-rope/matched-calibration-review.json",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-25-indexer-observer-and-qb-rope/matched-calibration-review.json",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 71,
+      "target": "benchmarks/2026-10-25-indexer-observer-and-qb-rope/matched-formal-review.json",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-25-indexer-observer-and-qb-rope/matched-formal-review.json",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 85,
+      "target": "../tools/review_indexer_fullmodel_v2.py",
+      "resolved": "/Users/fangqingyuan/Projects/myds/tools/review_indexer_fullmodel_v2.py",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 85,
+      "target": "benchmarks/2026-10-25-indexer-observer-and-qb-rope/fullmodel-q0-v2-review.json",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-25-indexer-observer-and-qb-rope/fullmodel-q0-v2-review.json",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 85,
+      "target": "benchmarks/2026-10-25-indexer-observer-and-qb-rope/fullmodel-q0-v2-canonical-review.json",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-25-indexer-observer-and-qb-rope/fullmodel-q0-v2-canonical-review.json",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 85,
+      "target": "benchmarks/2026-10-25-indexer-observer-and-qb-rope/q0-root-raw-byte-review.json",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-25-indexer-observer-and-qb-rope/q0-root-raw-byte-review.json",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 91,
+      "target": "benchmarks/2026-10-25-indexer-observer-and-qb-rope/fullmodel-qlong-protocol.json",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-25-indexer-observer-and-qb-rope/fullmodel-qlong-protocol.json",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 93,
+      "target": "../tools/review_indexer_fullmodel_long.py",
+      "resolved": "/Users/fangqingyuan/Projects/myds/tools/review_indexer_fullmodel_long.py",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 95,
+      "target": "benchmarks/2026-10-25-indexer-observer-and-qb-rope/fullmodel-qlong-review.json",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-25-indexer-observer-and-qb-rope/fullmodel-qlong-review.json",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 95,
+      "target": "benchmarks/2026-10-25-indexer-observer-and-qb-rope/qlong-business96-root-raw-review.json",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-25-indexer-observer-and-qb-rope/qlong-business96-root-raw-review.json",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 95,
+      "target": "benchmarks/2026-10-25-indexer-observer-and-qb-rope/qlong-code38404-root-raw-review.json",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-25-indexer-observer-and-qb-rope/qlong-code38404-root-raw-review.json",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 99,
+      "target": "benchmarks/2026-10-25-indexer-observer-and-qb-rope/fullmodel-p-predeclared-gates.json",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-25-indexer-observer-and-qb-rope/fullmodel-p-predeclared-gates.json",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 99,
+      "target": "benchmarks/2026-10-25-indexer-observer-and-qb-rope/fullmodel-p-protocol.json",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-25-indexer-observer-and-qb-rope/fullmodel-p-protocol.json",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 99,
+      "target": "../tools/review_indexer_fullmodel_performance.py",
+      "resolved": "/Users/fangqingyuan/Projects/myds/tools/review_indexer_fullmodel_performance.py",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 119,
+      "target": "benchmarks/2026-10-25-indexer-observer-and-qb-rope/fullmodel-p-review.json",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-25-indexer-observer-and-qb-rope/fullmodel-p-review.json",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 127,
+      "target": "../tools/build_qb_rope_probe.py",
+      "resolved": "/Users/fangqingyuan/Projects/myds/tools/build_qb_rope_probe.py",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 127,
+      "target": "../tools/bench_qb_rope_probe.m",
+      "resolved": "/Users/fangqingyuan/Projects/myds/tools/bench_qb_rope_probe.m",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 137,
+      "target": "benchmarks/2026-10-25-indexer-observer-and-qb-rope/qb-rope-independent-review.json",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-25-indexer-observer-and-qb-rope/qb-rope-independent-review.json",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 141,
+      "target": "benchmarks/2026-10-25-indexer-observer-and-qb-rope/qb-rope-M2-independent-review.json",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-25-indexer-observer-and-qb-rope/qb-rope-M2-independent-review.json",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+      "line": 145,
+      "target": "benchmarks/2026-10-25-indexer-observer-and-qb-rope/evidence-index.json",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-25-indexer-observer-and-qb-rope/evidence-index.json",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-26-decode-kv-only-finish-review.md",
+      "line": 11,
+      "target": "benchmarks/2026-10-26-kv-only-finish/source-contract-and-reproduction.md",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-26-kv-only-finish/source-contract-and-reproduction.md",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-26-decode-kv-only-finish-review.md",
+      "line": 17,
+      "target": "benchmarks/2026-10-26-kv-only-finish/component-correctness-protocol-v1.json",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-26-kv-only-finish/component-correctness-protocol-v1.json",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-26-decode-kv-only-finish-review.md",
+      "line": 29,
+      "target": "benchmarks/2026-10-26-kv-only-finish/M4.original-reader-failure.json",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-26-kv-only-finish/M4.original-reader-failure.json",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-26-decode-kv-only-finish-review.md",
+      "line": 29,
+      "target": "benchmarks/2026-10-26-kv-only-finish/M4.independent-review-v2.json",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-26-kv-only-finish/M4.independent-review-v2.json",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-26-decode-kv-only-finish-review.md",
+      "line": 29,
+      "target": "benchmarks/2026-10-26-kv-only-finish/M4.root-raw-review.json",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-26-kv-only-finish/M4.root-raw-review.json",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-26-decode-kv-only-finish-review.md",
+      "line": 33,
+      "target": "benchmarks/2026-10-26-kv-only-finish/private-runtime-plan.md",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-26-kv-only-finish/private-runtime-plan.md",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-26-decode-kv-only-finish-review.md",
+      "line": 39,
+      "target": "benchmarks/2026-10-26-kv-only-finish/runtime-IMPLEMENTATION.md",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-26-kv-only-finish/runtime-IMPLEMENTATION.md",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-26-decode-kv-only-finish-review.md",
+      "line": 39,
+      "target": "benchmarks/2026-10-26-kv-only-finish/runtime-build-manifest.json",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-26-kv-only-finish/runtime-build-manifest.json",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-26-decode-kv-only-finish-review.md",
+      "line": 39,
+      "target": "benchmarks/2026-10-26-kv-only-finish/runtime-patch-byteproof.json",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-26-kv-only-finish/runtime-patch-byteproof.json",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-26-decode-kv-only-finish-review.md",
+      "line": 41,
+      "target": "benchmarks/2026-10-26-kv-only-finish/M2.independent-review-v2.json",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-26-kv-only-finish/M2.independent-review-v2.json",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-26-decode-kv-only-finish-review.md",
+      "line": 43,
+      "target": "benchmarks/2026-10-26-kv-only-finish/target-build-manifest.json",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-26-kv-only-finish/target-build-manifest.json",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-26-decode-kv-only-finish-review.md",
+      "line": 47,
+      "target": "benchmarks/2026-10-26-kv-only-finish/decode-fullmodel-Q-review.json",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-26-kv-only-finish/decode-fullmodel-Q-review.json",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-26-decode-kv-only-finish-review.md",
+      "line": 47,
+      "target": "benchmarks/2026-10-26-kv-only-finish/decode-fullmodel-Q-peer-review.json",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-26-kv-only-finish/decode-fullmodel-Q-peer-review.json",
+      "exists": true
+    },
+    {
+      "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-26-decode-kv-only-finish-review.md",
+      "line": 49,
+      "target": "benchmarks/2026-10-26-kv-only-finish/evidence-index.json",
+      "resolved": "/Users/fangqingyuan/Projects/myds/docs/benchmarks/2026-10-26-kv-only-finish/evidence-index.json",
+      "exists": true
+    }
+  ],
+  "workspace_runtime_flag_and_symbol_scan": {
+    "folders": [
+      "src",
+      "include",
+      "metal"
+    ],
+    "needles": [
+      "MYDS_INDEXER_K_RESIDENT",
+      "MYDS_DECODE_KV_ONLY_FINISH",
+      "kernel_myds_indexer_scores_k_resident",
+      "kernel_myds_probe_kv_only_finish"
+    ],
+    "matches": []
+  },
+  "existing_workspace_dirty_diff_scope": "MYDS_INDEXER_CAPTURE ifdefs and withdrawn SharedGU candidate; preserved, not newly reverted; Makefile diff only adds test invocations. No new K/KV C/header/Metal runtime path integrated.",
+  "private_inventories": [
+    {
+      "root": "/tmp/myds-indexer-k-runtime-20261025",
+      "build_manifest": {
+        "path": "/tmp/myds-indexer-k-runtime-20261025/build-manifest.json",
+        "bytes": 99201,
+        "sha256": "e21a9a2dfd27fb9c771bf3d6f9c49f534a9689db0c3fa7e66bdcaf461e7b0896"
+      },
+      "inventoried_count": 548,
+      "every_inventoried_size_SHA_matches": true,
+      "compiler_visible_file_set_matches": true,
+      "inventory_digest": "7791166d7a9a6ef29eaa2336c665919ee041ec1eae47e32027d6a656b44adec7",
+      "excluded_generated_python_cache": [
+        "tools/__pycache__/prepare_indexer_fullmodel.cpython-315.pyc"
+      ]
+    },
+    {
+      "root": "/tmp/myds-decode-kv-only-runtime-20261025",
+      "build_manifest": {
+        "path": "/tmp/myds-decode-kv-only-runtime-20261025/build-manifest.json",
+        "bytes": 91405,
+        "sha256": "6b4e04fa67914aec0bd8636b298a0aa832349e2de4dd496c6a7de0623e55a82d"
+      },
+      "inventoried_count": 556,
+      "every_inventoried_size_SHA_matches": true,
+      "compiler_visible_file_set_matches": true,
+      "inventory_digest": "3c41008d2b886e61ee2641254f3504e7bc555cfdc0dda0fcb9d4f48910fbe3db",
+      "excluded_generated_python_cache": []
+    }
+  ],
+  "KV_seed548_descriptors_equal_frozen_K548_descriptors": true,
+  "canonical_evidence": [
+    {
+      "window": {
+        "path": "/tmp/myds-indexer-r3-local-20261025/runtime/P-window/window.json",
+        "bytes": 47794,
+        "sha256": "47cacce3db584d7e33d4c1b6f56c42aab53387ff1415da8746885872bdb1b1be"
+      },
+      "canonical_unchanged": true,
+      "canonical_before_equals_after": true,
+      "model_unchanged": true,
+      "service_or_production_mutation_performed": false,
+      "canonical_files": {
+        "/Users/fangqingyuan/Projects/myds/bin/myds": {
+          "sha256": "2b4d56958c1b3c16223f109c7a1e860b6153ad88e5c85fc70dcd44c98012cb83",
+          "bytes": 937240
+        },
+        "/Users/fangqingyuan/Projects/myds/bin/myds.metallib": {
+          "sha256": "3837102396703da59e0eebbc0de1fdc58b68b3a3a5ec5d07504b351c67a29ba9",
+          "bytes": 4277140
+        },
+        "/Users/fangqingyuan/Projects/myds/build/myds_all.air": {
+          "sha256": "09d67ef89c8d227ba8142f65efe49cf6e1ccfd661a1820d35719cd308814f617",
+          "bytes": 1281840
+        },
+        "/Users/fangqingyuan/Projects/myds/build/myds_all.metal": {
+          "sha256": "bc6603c97ec24af7597f6b10c7ed2a7bfe1344379733a0a4df780250a13f3224",
+          "bytes": 1574167
+        },
+        "/Users/fangqingyuan/Projects/myfleet/myds.conf": {
+          "sha256": "0a3524b030a73916f7684d841b912c6e978c680825a3c3520ca18188f35a2cff",
+          "bytes": 6815
+        }
+      }
+    },
+    {
+      "window": {
+        "path": "/tmp/myds-decode-kv-only-validation-20261026/runtime/Q-window/window.json",
+        "bytes": 47838,
+        "sha256": "39737f686c18a7332255eb852927b07f8d0f9c9b4eeb993396b1450b8ccbd0e8"
+      },
+      "canonical_unchanged": true,
+      "canonical_before_equals_after": true,
+      "model_unchanged": true,
+      "service_or_production_mutation_performed": false,
+      "canonical_files": {
+        "/Users/fangqingyuan/Projects/myds/bin/myds": {
+          "sha256": "2b4d56958c1b3c16223f109c7a1e860b6153ad88e5c85fc70dcd44c98012cb83",
+          "bytes": 937240
+        },
+        "/Users/fangqingyuan/Projects/myds/bin/myds.metallib": {
+          "sha256": "3837102396703da59e0eebbc0de1fdc58b68b3a3a5ec5d07504b351c67a29ba9",
+          "bytes": 4277140
+        },
+        "/Users/fangqingyuan/Projects/myds/build/myds_all.air": {
+          "sha256": "09d67ef89c8d227ba8142f65efe49cf6e1ccfd661a1820d35719cd308814f617",
+          "bytes": 1281840
+        },
+        "/Users/fangqingyuan/Projects/myds/build/myds_all.metal": {
+          "sha256": "bc6603c97ec24af7597f6b10c7ed2a7bfe1344379733a0a4df780250a13f3224",
+          "bytes": 1574167
+        },
+        "/Users/fangqingyuan/Projects/myfleet/myds.conf": {
+          "sha256": "0a3524b030a73916f7684d841b912c6e978c680825a3c3520ca18188f35a2cff",
+          "bytes": 6815
+        }
+      }
+    }
+  ],
+  "canonical_scope_limit": "Local retained closed K P and new KV Q windows verify unchanged before/after canonical identities and private execution paths. No live remote/service-state poll was performed; currently running new KV P is not certified by this audit.",
+  "K_P_claims_checked": {
+    "report_sha256": "5fc89462d60ceb08d58e684ea380affe85d049b950b134a0a05976195bd86c64",
+    "native_generation_count": 24,
+    "numerical_gates_passed": true,
+    "native_fullmodel_gate_passed": false,
+    "performance_acceptance": false,
+    "outcome": "P_performance_gate_failed_no_retry",
+    "raw_inventory_files": 4116,
+    "raw_logical_bytes": 3388834915
+  },
+  "nonblocking_clarification": {
+    "source": "/Users/fangqingyuan/Projects/myds/docs/2026-10-25-indexer-observer-and-qb-rope-review.md",
+    "line": 71,
+    "issue": "Complete scores passed means the frozen gate, not all-provider bit identity. Candidate equals TILED bitwise; L2 TILED/candidate differ in four score cells from actual exact; ordered Top512 remain equal. Older main report already discloses this, but repeating beside the new matched result prevents overreading.",
+    "evidence": {
+      "matched_report_sha256": "7a50c7122d8d70905b7f77ead07b52e59bea87acf4af199ee109fecb4cc20508",
+      "L2_candidate_mismatches_to_actual": {
+        "mismatches": 4,
+        "first_mismatch": {
+          "index": 123392,
+          "reference_bits": "0x40961cf6",
+          "actual_bits": "0x40961cf5"
+        },
+        "max_abs_error": 9.5367431640625e-07,
+        "max_finite_ulp_distance": 2
+      },
+      "L2_candidate_mismatches_to_tiled": {
+        "mismatches": 0,
+        "first_mismatch": null,
+        "max_abs_error": 0.0,
+        "max_finite_ulp_distance": 0
+      }
+    }
+  },
+  "known_pending_editorial_updates_not_new_failures": [
+    {
+      "file": "/Users/fangqingyuan/Projects/myds/docs/2026-10-26-decode-kv-only-finish-review.md",
+      "lines": [
+        3,
+        33,
+        35,
+        45
+      ],
+      "note": "Root already knows Q has formally passed and P is running. Synchronize stage tense and N256 primary example when updating after actual results; do not mark ongoing P passed. Current N64 example is a supported fixture example, with N256 contract explicit in line37 and stage line45."
+    }
+  ],
+  "evidence_index_freshness": "Not certified; root will rebuild indices separately. All linked target paths currently exist."
+}

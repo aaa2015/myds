@@ -1,0 +1,20 @@
+{
+  "argv": [
+    "/private/tmp/myds-indexer-r2-20261025/capture-build/capture_indexer_k",
+    "/Users/fangqingyuan/hf-1017/DeepSeek-V4.1-Flash-1017-Q2-dense-q4-imx-cliecy.gguf",
+    "--tokens-file",
+    "/private/tmp/myds-indexer-r2-20261025/capture-tokens.txt",
+    "--out-dir",
+    "/private/tmp/myds-indexer-r2-20261025/capture-window/raw",
+    "--config",
+    "/private/tmp/myds-indexer-r2-20261025/deployed/myds.conf"
+  ],
+  "cwd": "/private/tmp/myds-indexer-r2-20261025/capture-cwd",
+  "capture_binary_sha256": "617f63dd86554cd22ae9267fde1b24489d146a185c8e25dd85328688a344839e",
+  "library_sha256": "3837102396703da59e0eebbc0de1fdc58b68b3a3a5ec5d07504b351c67a29ba9",
+  "frozen_config_sha256": "0a3524b030a73916f7684d841b912c6e978c680825a3c3520ca18188f35a2cff",
+  "protocol_sha256": "afc2c273ac284e42cf08af17119ffc0be915031584a708fcfde59236c8240b9a",
+  "MYDS_environment_inherited": {},
+  "purpose": "correctness-only real32k inputs and actual provider witness",
+  "performance_from_capture": false
+}

@@ -1,0 +1,70 @@
+{
+  "kind": "independent_root_raw_only_comparator",
+  "scope": "complete manifested state/output/token bytes and final logits; not provenance/schema certification",
+  "root": "/tmp/myds-indexer-r3-local-20261025/runtime/QLong-window/code38404",
+  "rows": [
+    {
+      "provider": "G_lib",
+      "run": 0,
+      "state_files": 169,
+      "raw_bytes": 155258680,
+      "logits_elements": 129280,
+      "logits_sha256": "1fcee1e62d9ab488033c357a48602594cc83891b9f1635a40b13c5b89728afbc",
+      "all_equal": true,
+      "differences": []
+    },
+    {
+      "provider": "G_lib",
+      "run": 1,
+      "state_files": 169,
+      "raw_bytes": 155258680,
+      "logits_elements": 129280,
+      "logits_sha256": "1fcee1e62d9ab488033c357a48602594cc83891b9f1635a40b13c5b89728afbc",
+      "all_equal": true,
+      "differences": []
+    },
+    {
+      "provider": "off",
+      "run": 0,
+      "state_files": 169,
+      "raw_bytes": 155258680,
+      "logits_elements": 129280,
+      "logits_sha256": "1fcee1e62d9ab488033c357a48602594cc83891b9f1635a40b13c5b89728afbc",
+      "all_equal": true,
+      "differences": []
+    },
+    {
+      "provider": "off",
+      "run": 1,
+      "state_files": 169,
+      "raw_bytes": 155258680,
+      "logits_elements": 129280,
+      "logits_sha256": "1fcee1e62d9ab488033c357a48602594cc83891b9f1635a40b13c5b89728afbc",
+      "all_equal": true,
+      "differences": []
+    },
+    {
+      "provider": "on",
+      "run": 0,
+      "state_files": 169,
+      "raw_bytes": 155258680,
+      "logits_elements": 129280,
+      "logits_sha256": "1fcee1e62d9ab488033c357a48602594cc83891b9f1635a40b13c5b89728afbc",
+      "all_equal": true,
+      "differences": []
+    },
+    {
+      "provider": "on",
+      "run": 1,
+      "state_files": 169,
+      "raw_bytes": 155258680,
+      "logits_elements": 129280,
+      "logits_sha256": "1fcee1e62d9ab488033c357a48602594cc83891b9f1635a40b13c5b89728afbc",
+      "all_equal": true,
+      "differences": []
+    }
+  ],
+  "failures": [],
+  "raw_bytes": 931552080,
+  "all_equal": true
+}

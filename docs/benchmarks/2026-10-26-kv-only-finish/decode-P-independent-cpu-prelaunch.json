@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "kind": "independent_CPU_only_final_decode_P_prelaunch_pending_real_Q",
+  "frozen_artifacts_inputs_target_preflight_and_Q_protocol_checks_passed": true,
+  "initialize_passed": false,
+  "blocked_as_required_by_missing_actual_Q_report": true,
+  "expected_missing": "/tmp/myds-decode-kv-only-validation-20261026/decode-fullmodel-Q-review.json",
+  "reader_sha256": "9e7d77f1befc73008925c2478404396adffbb1f8991cbfa8ad5e9ed80fc8822b",
+  "protocol_sha256": "b3ff4106ac5ff88a3a1e6a1b566e3a7fd2b9efeff5ab9f75b29ef1e4f302d436",
+  "GPU_work_submitted": false
+}
