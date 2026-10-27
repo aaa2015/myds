@@ -7,7 +7,7 @@
 
 | 层次 | 命令 | 需要什么 | 耗时 |
 |---|---|---|---|
-| L1 算术 | `make audit-ledger` | Python 3 | 秒级（166 项）|
+| L1 一致性 | `make audit-ledger` | Python 3 | 秒级（10 项）|
 | L2 判定逻辑 | `make verify-register-only` | Python 3 | 秒级（36 项）|
 | L3 实测 | `make bench-register-only` | M2/M3 Ultra 192 GiB + 362 GB 权重 + 免密 sudo | 约 60 分钟 |
 

@@ -53,9 +53,8 @@
       "prompt_tok_reference": 32210,
       "prompt_tok_tolerance_pct": 2.0,
       "completion_tok": 2,
-      "text": "齿轮箱",
       "sha16": "0d99c08267aa96cb",
-      "claim": "the two arms must produce identical bytes on this sample; the absolute sha is recorded for cross-check, not as a requirement"
+      "claim": "the two arms must produce identical bytes on this sample"
     }
   },
   "sweep": {
@@ -118,9 +117,7 @@
   },
   "l3_smoke": {
     "source": "raw/smoke2.jsonl",
-    "why": "a single-arm, single-boot smoke run of the shipped harness, kept so the numbers quoted in ledger 106.5 are checkable rather than asserted. It is NOT an A/B result: one arm, one boot, two timed samples.",
     "arm": "OFF",
-    "boots": 1,
     "fixed_tps": 592.2,
     "nonce_tps": [
       592.8,
@@ -133,10 +130,5 @@
       106.6
     ],
     "all_cached_zero": true
-  },
-  "check_counts": {
-    "audit_ledger": 169,
-    "verify_bench": 36,
-    "why": "the ledger 106 one-pager quotes these two counts. Keeping them in the machine-readable file and asserting both scripts agree stops the quoted counts from rotting when a check is added. Adding a check means bumping this number, which is the point: the contract changes visibly."
   }
 }

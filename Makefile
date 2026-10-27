@@ -139,7 +139,7 @@ $(TEST_GGUF_BYTE_SPLIT): tests/test_gguf_byte_split.c $(BUILD_DIR)/myds_gguf.o |
 
 ALL_TESTS += $(TEST_METAL_RESIDENCY) $(TEST_TEARDOWN_ORDER) $(TEST_DECODE_SPLIT) $(TEST_KVDSK_FIFO) $(TEST_ANCHOR_SLOTS) $(TEST_YOCO_COMPACT) $(TEST_INDEXER_WINDOW) $(TEST_GGUF_BOUNDS) $(TEST_GGUF_SPLIT) $(TEST_GGUF_BYTE_SPLIT)
 
-.PHONY: all test clean bench metallib build-tail-init test-tail-init test-indexer-register-only-host test-register-only-http-bridge test-register-only-service-window audit-ledger bench-register-only corpus-check verify-register-only
+.PHONY: all test clean bench metallib build-tail-init test-tail-init test-indexer-register-only-host test-register-only-http-bridge test-register-only-service-window audit-ledger gen-ledger bench-register-only corpus-check verify-register-only
 
 # Rebuild consumers when public or internal layouts change.
 -include $(wildcard $(BUILD_DIR)/*.d)
@@ -164,6 +164,11 @@ test-register-only-service-window:
 # mismatch. Needs no GPU; the raw rows ship with the repository.
 audit-ledger:
 	python3 -B tools/audit_ledger_105.py
+
+# Regenerate the ledger's §105/§106 tables and expected.json from raw/*.jsonl.
+# Run this after touching anything under benchmarks/register_only_2026-10-27/raw/.
+gen-ledger:
+	python3 -B tools/gen_ledger_tables.py --write
 
 # --- register-only benchmark reproduction -------------------------------------
 # corpus-check, verify-register-only and audit-ledger run anywhere (no GPU, no model).

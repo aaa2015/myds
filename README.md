@@ -12,7 +12,7 @@
 **不相信这些数字？不用下载 337 GB 权重、也不需要 M2 Ultra。** 仓库自带可复现数据包，两条命令即可复核：
 
 ```bash
-make audit-ledger          # 账本每个数字 vs 原始 JSONL，166 项，不符即 exit 1
+make audit-ledger          # 表格是否等于重算结果 + 6 条不变量，不符即 exit 1
 make verify-register-only  # 判定逻辑自检：能接受真数据、会拒绝假数据
 ```
 

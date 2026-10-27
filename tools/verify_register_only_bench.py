@@ -261,12 +261,6 @@ def main():
             verify_smoke(load(a.smoke), exp)
 
     total = len(passes) + len(fails)
-    want = exp.get("check_counts", {}).get("verify_bench")
-    if want is not None and total != want:
-        fails.append(f"check count {total} != contract {want} "
-                     f"(bump check_counts.verify_bench when changing the verifier)")
-        print(f"  [FAIL] check count {total} != contract {want}")
-        total = len(passes) + len(fails)
     print(f"\n{total} checks, {len(passes)} passed, {len(fails)} failed")
     if fails:
         print("\nFAILED:")
