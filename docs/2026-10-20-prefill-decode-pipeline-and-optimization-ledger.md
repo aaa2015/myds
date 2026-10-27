@@ -6,11 +6,11 @@
 > 全部成立**（主机线程阻塞于 `wait_command_buffer`）；且当时未读 GPU、观察窗口（32.5 min）短于实际耗时（41.1 min）。
 > 详见 §102。§41 原文按冻结身份保留，不删改。
 
-> **2026-10-26 正式续查结论**：K-resident 的私有 runtime 通过7,540-token与两条长请求的完整数值/状态资格门；唯一双长请求24代 A1/B/A2 的 prefill 保守节约为 **1.591% /1.514%**，未达冻结 >2% 门，decode 无回退门也失败，**不采纳、不重试、未进入HTTP/生产**。组件40%不等于全模型40%，旧R2和468诊断失败均保留。[完整正式结果](2026-10-25-indexer-observer-and-qb-rope-review.md)。另一个[删除占位Q无用RoPE的decode候选](2026-10-26-decode-kv-only-finish-review.md)独立通过M4/M2组件、12代全模型资格和24代正式数值/采用门，但decode保守收益仅 **−0.088% /+0.214%**，所有控制与secondary门通过，primary不足2%，同样不采纳、无重试。两候选未联合开启，canonical制品/配置最终五项SHA均未变。
+> **2026-10-26 正式续查结论**：K-resident 的私有 runtime 通过7,540-token与两条长请求的完整数值/状态资格门；唯一双长请求24代 A1/B/A2 的 prefill 保守节约为 **1.591% /1.514%**，未达冻结 >2% 门，decode 无回退门也失败，**不采纳、不重试、未进入HTTP/生产**。组件40%不等于全模型40%，旧R2和468诊断失败均保留。完整正式结果见 `mydsdoc/verification/2026-10-25-indexer-observer-and-qb-rope-review.md`。另一个删除占位Q无用RoPE的decode候选，见 `mydsdoc/verification/2026-10-26-decode-kv-only-finish-review.md`独立通过M4/M2组件、12代全模型资格和24代正式数值/采用门，但decode保守收益仅 **−0.088% /+0.214%**，所有控制与secondary门通过，primary不足2%，同样不采纳、无重试。两候选未联合开启，canonical制品/配置最终五项SHA均未变。
 
-> **2026-10-25 后续实验**：旧 replay 同 PSO null 对照复现 1.31%–1.84% 的控制顺序偏移；匹配控制输出复用距离的新测量先通过三层 null 校准，再通过六组组件门，K-resident 相对 actual exact 保守节约 40.17%–40.49%、相对 TILED 12.76%–13.02%，最大控制漂移 0.06935%。新证据只支持推进独立快照内 default-off runtime 与全模型资格验证；下文 R2 失败保留。Q_B→forward RoPE v1 在 M4/M2 的逐位门失败，停止计时与接入。见[观察者与私有全模型续查](2026-10-25-indexer-observer-and-qb-rope-review.md)。
+> **2026-10-25 后续实验**：旧 replay 同 PSO null 对照复现 1.31%–1.84% 的控制顺序偏移；匹配控制输出复用距离的新测量先通过三层 null 校准，再通过六组组件门，K-resident 相对 actual exact 保守节约 40.17%–40.49%、相对 TILED 12.76%–13.02%，最大控制漂移 0.06935%。新证据只支持推进独立快照内 default-off runtime 与全模型资格验证；下文 R2 失败保留。Q_B→forward RoPE v1 在 M4/M2 的逐位门失败，停止计时与接入。见 `mydsdoc/verification/2026-10-25-indexer-observer-and-qb-rope-review.md`（观察者与私有全模型续查）。
 
-> **2026-10-25 续查更新**：indexer K 跨 head 驻留候选的完整生产编译单元已关闭外部原生身份门。真实 32K 请求在 layers 2/8/14 捕获实际 default exact、128×15424 BF16 输入；候选与 TILED 全 scores 位一致，三 provider 完整有序 Top512 等于捕获。唯一正式真实组件 cohort 相对 actual exact 节约 40.10%–40.32%，相对 TILED 额外节约 12.47%–12.88%；但 layer2/TILED 控制漂移 −2.0846% 超过冻结 ±2% 门，六组联合门失败，未重跑、未接入 runtime、未进行全模型或生产采纳。§89 的 matrix 资源约束不能外推到默认 vec，§71 的 CB 间隙不能约束所有 overlap，§92 的单个变体不能封死其他 indexer 方案。完整实验、4 个 exact→TILED score 差异、所有失败控制及证据见 [10 月 25 日续查报告](2026-10-25-prefill-decode-performance-review.md)。下文历史实验数值、旧服务 PID/配置按各自冻结身份保留。
+> **2026-10-25 续查更新**：indexer K 跨 head 驻留候选的完整生产编译单元已关闭外部原生身份门。真实 32K 请求在 layers 2/8/14 捕获实际 default exact、128×15424 BF16 输入；候选与 TILED 全 scores 位一致，三 provider 完整有序 Top512 等于捕获。唯一正式真实组件 cohort 相对 actual exact 节约 40.10%–40.32%，相对 TILED 额外节约 12.47%–12.88%；但 layer2/TILED 控制漂移 −2.0846% 超过冻结 ±2% 门，六组联合门失败，未重跑、未接入 runtime、未进行全模型或生产采纳。§89 的 matrix 资源约束不能外推到默认 vec，§71 的 CB 间隙不能约束所有 overlap，§92 的单个变体不能封死其他 indexer 方案。完整实验、4 个 exact→TILED score 差异、所有失败控制及证据见 `mydsdoc/verification/2026-10-25-prefill-decode-performance-review.md`（10 月 25 日续查报告）。下文历史实验数值、旧服务 PID/配置按各自冻结身份保留。
 
 > **关于文中出现的路径**：本账本里大量引用了 `benchmarks/…`、`tests/…`、`bin/…` 这类
 > 路径，写作时用反引号而不是链接。那批**原始测量产物**（tensor dump、JSON 运行态、
@@ -18,7 +18,9 @@
 > 数值本身仍然可信（每条都附了方法与判据），但无法仅凭本仓库独立复现——
 > 复现需要用本仓库的代码与 scripts 重跑。
 
-- 最后更新：**2026-10-24 18:08（§68–§92 全链路效率普查完成。prefill 57.3% 已到顶、30.2% 受硬约束；唯一采纳 §85 TILED −1.73%。生产 PID55488 已核验）**
+- 最后更新：**2026-10-27 08:20（§105 记录 register-only MMA indexer 的生产部署与 A/B 定案：32K prefill off 591.7 → on 617.7 t/s = +4.39%，控制漂移 +0.186%，生产已默认开启）**
+- 部署制品核验（§105.6，2026-10-27）：macstudio 8187；binary `a97976e0a2e2aced…` / 库 `fe55793346e15119…` / 配置 `735e0dc7…`；与 macmini 逐字节相同
+> **注意**：§92.7 的 PID55488 / `9cf2a670…` / `c692d821…` / 54 项配置是 **2026-10-24 的冻结身份**，已被 §105.6 取代，仅作历史对照。
 - 主机：macstudio — M2 Ultra，76 核 GPU，**206 GB 统一内存**（=192 GiB，Metal 上限 201.9 GB）；
   带宽理论峰值 **800 GB/s**，实测可达 **724 GB/s**（§0.1），纯读基准最高 799 GB/s（§46.1）
 - 系统：**macOS 27.0.1 (26A434)**，kernel 27.0.0（§42）
@@ -14090,3 +14092,184 @@ Approved Metal 着色器哈希锁定为 `a62922c6f5937236bd0e354dd06943b39bfa5f7
 4. **度量与可观测性**：
    通过 `myds_v41_gpu_indexer_register_only_counters` 暴露原子度量：`requests`、`encoded`、`fallbacks`、`failures`、`bf16_dispatches`，可直接接入监控看板。
 
+
+---
+
+## §105 Register-Only MMA Indexer 的生产部署与实测定案（2026-10-27）
+
+> **一页结论**：
+> 1. **方案**：把 indexer 的 prefill 打分算子从「分块 + threadgroup 交换 + 分步规约」换成
+>    **纯寄存器 SIMD-group MMA**（8 token × 32 key / TG，4 SG，零 threadgroup 内存），
+>    用 0-ULP 手段保证逐位等价，**默认开启**（`MYDS_INDEXER_REGISTER_ONLY` 缺省即 on）。
+> 2. **A/B 定案（同口径、同机、同二进制、同配置）**：32,223-token prefill
+>    **off 591.7 t/s → on 617.7 t/s = +4.39%**，控制漂移 **+0.186%**，off 臂三次离散 0.1%。
+>    臂分离由进程内原子计数器硬证明（on/off 的 `encoded` 分别为 1,620 / 0）。
+> 3. **生产现状**：8187 已默认开启并在跑，`encoded` 计数持续增长、`fallbacks = failures = 0`。
+> 4. **与 §104 外推的出入**：§104 按「indexer 占 6.5%、算子 −40%」推出 +2.7%，实测 +4.39%。
+>    两种自洽解释都需要独立测 indexer 占比才能定论，**本节不宣称归因**。
+> 5. **不变的边界**：只在 `end ≤ 32768`、`n_comp ∈ (512, 16384]`、`n_tokens ∈ [8, 2048]`、
+>    ratio=2、BF16、无 key-window、非 trace 的普通 prefill 上生效。**90K 以上收益≈0**。
+
+### 105.1 方案（与 §104 的关系）
+
+§104 记的是候选的设计、数值验证与默认开启改造。本节记**部署落地后的实测**，并补充
+§104 没有的两件事：**同口径 A/B** 与 **部署后的全档位性能表**。
+
+算子要点（复核自 `metal/myds_indexer_register_only.metal`，与
+`tools/indexer_register_only_head_control_v2.metal.inc` **逐字节相同**）：
+
+- 几何：threads `32×4×1`，grid `⌈n_comp/32⌉ × ⌈n_tokens/8⌉`，动态 threadgroup 内存 **0 B**；
+- 每个 lane 持 2 个相邻键列，`simdgroup_float8x8` 做 `Q·Kᵀ`，K 常驻寄存器（`resident_k[16]`）；
+- 数值拓扑固定为 `relu(dot) * weight → * scale → + acc`，并用
+  `#pragma clang fp contract(off) reassociate(off)` 禁止编译器合并重排（v1→v2 的修正点）；
+- 不可见的键列无条件写 `-INFINITY`，保证 **dense score 契约**不变；
+- 失败路径：生产模式**优雅回退**到参考 chunk 打分器并计入 `IRO_FALLBACKS`；
+  `MYDS_INDEXER_REGISTER_ONLY_STRICT=1` 时改为 fail-closed（供 CI）。
+
+准入判定在 host 侧一次算清，与内核内的守卫**逐条对齐**：
+`cache_bf16 && n_heads==32 && ratio==2 && 512 < n_comp ≤ 16384 && 8 ≤ n_tokens ≤ 2048 &&
+pos0+n_tokens ≤ 32768 && batch active && !kprof_exclusive && key_window==0 && !trace`。
+不满足者**不算 fallback**（设计内不适用），直接走参考选择器。
+
+### 105.2 A/B 实验设计与结果
+
+**口径（逐条声明，缺一不可比）**：
+
+| 项 | 值 |
+|---|---|
+| 主机 | macstudio，M2 Ultra（76 核 GPU），192 GiB；**独占**，无其它模型/bench 进程 |
+| 系统 | macOS 27.0.1（26A434），kernel 27.0.0 |
+| 二进制 | `bin/myds` SHA256 `a97976e0a2e2aced…`（macmini 与 macstudio **逐字节相同**） |
+| 库 | `bin/myds.metallib` SHA256 `fe55793346e15119…` |
+| 配置 | `myfleet/myds.conf` SHA256 `735e0dc7…`（**未**设置 `MYDS_INDEXER_REGISTER_ONLY`） |
+| 采样 | `temperature=0`，单槽，`max_new_tokens=16`，HTTP 流式，prompt 唯一 nonce 避免 prefix-cache |
+| 每臂 | 1 次预热 + **3 次正式**，取中位数 |
+| 臂序 | A1(off) → B(on) → A2(off)，两侧夹控制臂用于测漂移 |
+
+**结果**（32,223-token prefill，判据 = myds 自己的日志行 `prefill: N tok in Xs = Y t/s`）：
+
+| 臂 | `MYDS_INDEXER_REGISTER_ONLY` | 三次实测 t/s | 中位 | `encoded` | `fallbacks` |
+|---|---|---:|---:|---:|---:|
+| A1 | `0` | 591.7 / 591.6 / 592.2 | **591.7** | **0** | 0 |
+| B | `1` | 617.7 / 577.4 / 618.2 | **617.7** | **1,620** | 0 |
+| A2 | `0` | 591.9 / 592.8 / 592.8 | **592.8** | **0** | 0 |
+
+- **保守收益 = 617.7 / min(591.7, 592.8) − 1 = +4.394%**
+- **控制漂移 = A2/A1 − 1 = +0.186%**（门限 ±1.0%，通过）
+- **off 臂离散 0.1%**（591.6–592.2），基线干净到可以分辨 1% 级差异
+- **B 臂第 2 次 577.4 是孤立低值**（比同臂另两次低 6.6%），中位数不受影响。
+  **本节的结论只取中位数，不取任何单次值。**
+- 每臂 `requests` 均为 2,316：同一 prompt 切出的 chunk 总数相同，
+  **on/off 的差别只在 `encoded`（1,620 vs 0）**，不存在"off 臂少干活"的混淆。
+
+**臂分离的硬证据**：进程内原子计数器（lldb 读 `myds_v41_gpu_indexer_register_only_counters`）。
+on 臂 1,620 次编码全部是 BF16 dispatch，`fallbacks=failures=f32=0`；
+off 臂 `encoded` 恒为 0。**这说明两组跑的不是同一条路径，收益不是环境噪声。**
+
+### 105.3 与 §104 外推的出入（不宣称归因）
+
+§104 用阿姆达尔定律给出：`1 / ((1−0.065) + 0.065×0.6) = 1.0267 ⇒ +2.7%`，
+其中「indexer 占 6.5%、算子自身 −40%（时间变成 0.6 倍）」。
+
+实测 +4.39% 与之不符。两种自洽解法：
+
+| 假设 | 推出 | 是否合理 |
+|---|---|---|
+| 算子确为 −40%（x=0.6） | indexer 占比 **约 10.5%** | 与 §68 全链路普查的「indexer 9%」接近，**更可能** |
+| 占比确为 6.5% | 算子自身 **约 −65%** | 与组件实测的 40% 不符，可能性低 |
+
+**所以：`+4.39%` 是事实，`indexer 占 10.5%` 是推断。**
+要定论必须在同口径下独立测 indexer 在全模型里的实际占比，本节不越界。
+
+### 105.4 部署后全档位实测（默认开启，无任何覆盖）
+
+**Prefill**（`cached: 0`，`queue: 0.0s`）：
+
+| prompt tokens | 时延 | 吞吐 t/s |
+|---:|---:|---:|
+| 1,022 | 3.3 s | 309.8 |
+| 2,626 | 6.8 s | 383.8 |
+| 4,055 | 8.8 s | 458.4 |
+| 7,053 | 13.3 s | 528.5 / 528.5 / 528.3 |
+| 8,079 | 14.9 s | 541.7 |
+| 8,111 | 15.1 s | 538.0 |
+| 16,126 | 27.4 s | 587.8 |
+| 32,222 | 52.3 s | 615.7 |
+| 32,254 | 52.4 s | 615.1 |
+
+峰值出现在 32K 档 **615.7 t/s**，与账本「32K 附近见顶」一致。
+短 prompt 只有 310–458 t/s 是**固定开销被摊薄不足**（约 1.6–2 s/请求），不是缺陷。
+
+**Decode**（生成 token 数取实际产出）：
+
+| 上下文 | 生成 tokens | 吞吐 t/s | ms/token |
+|---:|---:|---:|---:|
+| 55（短） | 198 / 197 / 219 | **42.0 / 42.2 / 42.1** | 23.8 |
+| 8,112 | 128 | 39.8 | 25.1 |
+| 32,255 | 96 | 37.8 | 26.5 |
+
+decode 随上下文增长衰减（8K −5.5%、32K −10.2%），是 attention 键数增长的算术必然，
+与 §0 的机理一致；**本优化不覆盖 decode**（§104.2 已论证 GEMV 无法凑出 8 行）。
+
+### 105.5 与旧账本数字的差异：口径不同，不构成退化
+
+| 指标 | 账本旧值 | 本次实测 | 差 |
+|---|---:|---:|---|
+| 8K prefill | 571.8 | 541.7 | −5.3% |
+| 32K prefill | 641.3 | 615.7（off 591.7） | −4.0% |
+| decode（短） | 22.74 ms = 44.0 t/s | 23.8 ms = 42.0 t/s | −4.7% |
+
+**这些差值不能用来说明变慢**，因为口径不同：
+
+1. **配置不同**：本次 `MYDS_CHUNK_KEY_MAX=1048576`（账本口径为 `524288`），
+   RSS **154 GB vs 账本 148.4 GB**，多出的约 5.6 GB 正是翻倍后的 chunk 工作区；
+2. **测量方式不同**：本次走 HTTP 服务、单次；账本用 bench 二进制、N 次中位数；
+3. **无 warmup** 的档位（1K/2.6K/4K）固定开销占比更高；
+4. **内存余量只有 14–22 GB**，swap 已用约 390 MB。
+
+按本合同「跨时间/跨配置对比前必须先核对口径」的铁律，
+此处正确结论是**数据不足**，不是退化。要判退化需同口径前后各 ≥3 次。
+
+### 105.6 部署事实（可复核）
+
+deploy 链路：`myfleet/deploy.sh` → rsync 舰队 2,294 文件 →
+`sync_myds.sh` rsync 源码（**双侧源码树指纹 `0f94c8a80cf8cfe0` 一致**）→
+macstudio 上编译到临时目录后**原子替换 46 个二进制**（不原地覆盖，避免运行中进程 SIGBUS）→
+`start_fleet.sh` 点火。
+
+- 源码：macmini `main @ 691bc26`，工作树干净
+- 二进制 `a97976e0…` / 库 `fe557933…` / 配置 `735e0dc7…`，两侧逐个 SHA 相同
+- 进程启动时间晚于二进制 mtime ⇒ 跑的确是新产物
+- 启动日志：`loaded precompiled library … (all required V4.1 kernels verified)`
+- 回滚快照 `~/Projects/myds/.deploy-prev/`（15 MB）已就位
+
+### 105.7 遗留问题（未解决，记录在案）
+
+1. **计数器没有生产出口**：`myds_v41_gpu_indexer_register_only_counters` 只有 C API，
+   `/health`、日志里都看不到。§104.5 说"可直接接入监控看板"，实际**没有任何接线**。
+   本次 A/B 靠 lldb attach 才读到 —— 生产环境不会有人这么做。
+   **建议**：给 `/health` 或新增 `/debug/counters` 加只读 JSON 出口。
+2. **非法值会阻止启动**：`MYDS_INDEXER_REGISTER_ONLY=true` 这类值会让
+   `myds_v41_gpu_scratch_create` 返回 NULL ⇒ 启动失败。与相邻开关行为一致，
+   但该变量名很新，**配置文档应点名**。
+3. **ABI 双份定义**：C 侧 `struct indexer_register_only_args`（有 `_Static_assert` 锁 72 字节）
+   与 metal 侧 `ds4_metal_args_dsv4_indexer_scores_fused` 是两份定义，
+   只有 `tools/build_indexer_register_only_probe_v2.py` 会交叉校验；**生产 make 里没有这道校验**。
+   一旦有人改 metal 结构而不改 C，会静默错位。建议把 ABI 校验挂进 `make test`。
+4. **收益覆盖面被门限卡在 32K**：`end ≤ 32768` 意味着只有 ≤32K 的 prompt、
+   或长 prompt 的**前 32K** 吃到加速。90K–500K 场景收益≈0。
+   README 主打的长上下文数字不受影响，**但汇报时不得说成"全链路 +4%"**。
+
+### 105.8 方法论教训（本轮新增）
+
+1. **原子计数器的 reset 不可依赖**：`myds_v41_gpu_indexer_register_only_counters(NULL, 1)`
+   在 lldb 里静默失败（`(void)func(...)` 这种写法也不报错），
+   结果读到"重置后 requests=144"这种自相矛盾的数。
+   **读计数一律用两次取值的差分，不要造零点。**
+2. **单次值不能报数**：B 臂出现过一次 577.4（比同臂另两次低 6.6%）。
+   若只跑一次就下结论，会得出"+2.4%"这种与真值差 2 个点的结果。**中位数 + 离散度是最低要求。**
+3. **A/B 必须夹控制臂**：A1 与 A2 同为 off、相隔 4 分钟，差异 0.186%。
+   没有 A2 就无法排除"顺序效应"（机器越跑越快/越慢）。
+4. **部署验证要证明"跑的是新产物且真的在跑"**：只核 SHA 不够（可能启动失败回退到旧进程），
+   只核健康检查也不够（可能新进程但开关没生效）。
+   **必须叠加：进程启动时间 > 产物 mtime + 运行期计数器增量。**
