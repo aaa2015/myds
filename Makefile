@@ -139,7 +139,7 @@ $(TEST_GGUF_BYTE_SPLIT): tests/test_gguf_byte_split.c $(BUILD_DIR)/myds_gguf.o |
 
 ALL_TESTS += $(TEST_METAL_RESIDENCY) $(TEST_TEARDOWN_ORDER) $(TEST_DECODE_SPLIT) $(TEST_KVDSK_FIFO) $(TEST_ANCHOR_SLOTS) $(TEST_YOCO_COMPACT) $(TEST_INDEXER_WINDOW) $(TEST_GGUF_BOUNDS) $(TEST_GGUF_SPLIT) $(TEST_GGUF_BYTE_SPLIT)
 
-.PHONY: all test clean bench metallib build-tail-init test-tail-init test-indexer-register-only-host test-register-only-http-bridge test-register-only-service-window audit-ledger
+.PHONY: all test clean bench metallib build-tail-init test-tail-init test-indexer-register-only-host test-register-only-http-bridge test-register-only-service-window audit-ledger bench-register-only corpus-check verify-register-only
 
 # Rebuild consumers when public or internal layouts change.
 -include $(wildcard $(BUILD_DIR)/*.d)
@@ -161,10 +161,24 @@ test-register-only-service-window:
 	python3 -B tests/test_register_only_service_window.py
 
 # Re-derive every performance figure in ledger §105 from the raw JSONL and fail on any
-# mismatch. Not part of `test`: it needs the private evidence tree under mydsdoc, which
-# is not in this repository. Run it after touching §105, or in any review of those numbers.
+# mismatch. Needs no GPU; the raw rows ship with the repository.
 audit-ledger:
 	python3 -B tools/audit_ledger_105.py
+
+# --- register-only benchmark reproduction -------------------------------------
+# corpus-check, verify-register-only and audit-ledger run anywhere (no GPU, no model).
+# They are the parts an outside reader can actually execute.
+corpus-check:
+	python3 -B tools/make_register_only_corpus.py --check
+
+verify-register-only:
+	python3 -B tools/verify_register_only_bench.py --historical
+
+# These two need the real server: 192 GiB machine, 362 GB weights, passwordless sudo
+# for lldb (counters) and powermetrics (GPU). See docs/REPRODUCE-register-only.md.
+bench-register-only:
+	python3 -B tools/bench_register_only_ab.py --out benchmarks/register_only_2026-10-27/runs/ab.jsonl
+	python3 -B tools/bench_register_only_sweep.py --out benchmarks/register_only_2026-10-27/runs/sweep.jsonl
 
 # Optional real-library init/failure/retry regression. The separate build target
 # compiles only; test-tail-init executes GPU work and is scheduled explicitly.

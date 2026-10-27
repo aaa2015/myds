@@ -17,7 +17,7 @@ Exit code 1 if any figure in the ledger disagrees with the recomputation.
 import json, re, statistics as st, sys
 from pathlib import Path
 
-RAW = Path.home() / "Projects/mydsdoc/benchmarks/2026-10-27-deploy-ab-8187/raw"
+RAW = Path.home() / "Projects/myds/benchmarks/register_only_2026-10-27/raw"
 LEDGER = Path.home() / "Projects/myds/docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md"
 
 # Fail loudly and specifically if the evidence is not on this machine. An audit that
@@ -25,8 +25,9 @@ LEDGER = Path.home() / "Projects/myds/docs/2026-10-20-prefill-decode-pipeline-an
 for p in (RAW / "rig.jsonl", RAW / "sweep2.jsonl", RAW / "dec2.jsonl", LEDGER):
     if not p.exists():
         sys.exit(f"MISSING EVIDENCE: {p}\n"
-                 f"The §105 numbers cannot be checked without it. "
-                 f"Restore the raw JSONL (see mydsdoc benchmarks/2026-10-27-deploy-ab-8187/raw/).")
+                 f"The §105 numbers cannot be checked without it. It ships with this "
+                 f"repository under benchmarks/register_only_2026-10-27/raw/; if it is "
+                 f"absent, the checkout is incomplete rather than the numbers wrong.")
 
 problems, checks = [], []
 

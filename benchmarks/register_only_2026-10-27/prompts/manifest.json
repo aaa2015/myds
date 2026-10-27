@@ -1,0 +1,157 @@
+{
+ "ab_fixed.txt": {
+  "bytes": 156082,
+  "chars": 52032,
+  "sha256": "12efcb53d116f7ef192052a9b80edf791803d9218a546c3088939dcfd244c003"
+ },
+ "d_32k__v0.txt": {
+  "bytes": 156189,
+  "chars": 52071,
+  "sha256": "5d720cd697cba08c399ed3cd9497f6a503974d8730b7cd3a89b9c1cb1d132321"
+ },
+ "d_32k__v1.txt": {
+  "bytes": 156189,
+  "chars": 52071,
+  "sha256": "ccd18706c42c3ef7862674d1904c25297d1266333f49d0858dd74797e8bac91a"
+ },
+ "d_32k__v2.txt": {
+  "bytes": 156189,
+  "chars": 52071,
+  "sha256": "45b2d96a80ebf137db582cdd038ae4ca489f53b39b3e8371c6cf0106503e519e"
+ },
+ "d_8k__v0.txt": {
+  "bytes": 39189,
+  "chars": 13071,
+  "sha256": "49f0a0d57b4df5005da0fcd88f3bae9e9b361cd290cb19d0eebecc363f32252e"
+ },
+ "d_8k__v1.txt": {
+  "bytes": 39189,
+  "chars": 13071,
+  "sha256": "7b9c3bd85378a8ab87f7ff9631f81aaa1893cbca5c270d12bc66d16052af56ad"
+ },
+ "d_8k__v2.txt": {
+  "bytes": 39189,
+  "chars": 13071,
+  "sha256": "d684c0e6060880e8cbff0eeeb4808af560da2396b784eb0c23b9f10fe158813a"
+ },
+ "d_short__v0.txt": {
+  "bytes": 187,
+  "chars": 69,
+  "sha256": "c200537c042ee5c99cb3cfe4c15b70712875a40776f82563dff7e88e6bd6cd92"
+ },
+ "d_short__v1.txt": {
+  "bytes": 187,
+  "chars": 69,
+  "sha256": "8863d30deffa0d98aa825e816799fdb9bd42598c51f3ca9799103b7c4f019068"
+ },
+ "d_short__v2.txt": {
+  "bytes": 187,
+  "chars": 69,
+  "sha256": "98fb4a449dbc5c7fce87a0a625da5dcec7e1bf6c89c591c5d6a24d2d425f2f6f"
+ },
+ "p0.2k__v0.txt": {
+  "bytes": 2782,
+  "chars": 932,
+  "sha256": "47e1a7f5aed7563a7bc12f9a7e9ed31bc992fdfc91fc8f2e9832d1dc43c074e9"
+ },
+ "p0.2k__v1.txt": {
+  "bytes": 2782,
+  "chars": 932,
+  "sha256": "df8dcdd74384bbfc0a626c602d127dcda0522000b486565c550e4c3ae3d5089d"
+ },
+ "p0.2k__v2.txt": {
+  "bytes": 2782,
+  "chars": 932,
+  "sha256": "291b4a0082d9aaaeab11323cc9b6ebdac7d019e8c8244f4493cf141b9b3057f1"
+ },
+ "p1.6k__v0.txt": {
+  "bytes": 4882,
+  "chars": 1632,
+  "sha256": "67020544fdfc08043fcd85d05835c28593716336c526d3f7fe526bb54672ab24"
+ },
+ "p1.6k__v1.txt": {
+  "bytes": 4882,
+  "chars": 1632,
+  "sha256": "9c8ad1ef8f112b9fb7e4e16f29f8efeda95bea02da75e9c6658433ce1160e389"
+ },
+ "p1.6k__v2.txt": {
+  "bytes": 4882,
+  "chars": 1632,
+  "sha256": "af551a3872ba9fb3189dd0eaec805b582d4a6d81b2e50ce126a7cb99eb14ef35"
+ },
+ "p13k__v0.txt": {
+  "bytes": 39082,
+  "chars": 13032,
+  "sha256": "aaf30366bd86690b0fea9faf6009748babe6eec7908de32f42992ee34cebbd03"
+ },
+ "p13k__v1.txt": {
+  "bytes": 39082,
+  "chars": 13032,
+  "sha256": "d297c57f367090d637ba181a3052c941f9a48637a6bfae3db18834be7bce4f63"
+ },
+ "p13k__v2.txt": {
+  "bytes": 39082,
+  "chars": 13032,
+  "sha256": "9d5d1558fe85f516b66a221838176ef830738b54a31c425bad28e3b150a0b943"
+ },
+ "p26k__v0.txt": {
+  "bytes": 78082,
+  "chars": 26032,
+  "sha256": "3f01cad3a3fb8ce9a6b78cf1c731ccd39ed63f8f1487d22d7ab88fde82e3aa83"
+ },
+ "p26k__v1.txt": {
+  "bytes": 78082,
+  "chars": 26032,
+  "sha256": "a7576f7c926a30d0f2bf272a9ad4b1026771d5a86f901bda536df389dd2f83ec"
+ },
+ "p26k__v2.txt": {
+  "bytes": 78082,
+  "chars": 26032,
+  "sha256": "0636fd9059b7f628303d85246884ad311a4a6b5e689384fc6b5ab1b602545579"
+ },
+ "p32k_ab__v0.txt": {
+  "bytes": 156082,
+  "chars": 52032,
+  "sha256": "1a22b57b104b130cb1fa1e7ca8811c9bef2233416f2c3625f757f63eab40f337"
+ },
+ "p32k_ab__v1.txt": {
+  "bytes": 156082,
+  "chars": 52032,
+  "sha256": "949e4bd360327c7a3f98cef44b67574d0f68810488f03d42f1026c51e95ce3e2"
+ },
+ "p32k_ab__v2.txt": {
+  "bytes": 156082,
+  "chars": 52032,
+  "sha256": "f28543a7d0ab653f36dece3ed7d3b55f7abbb92f32fff15df569a9de226e72df"
+ },
+ "p52k__v0.txt": {
+  "bytes": 156082,
+  "chars": 52032,
+  "sha256": "1a22b57b104b130cb1fa1e7ca8811c9bef2233416f2c3625f757f63eab40f337"
+ },
+ "p52k__v1.txt": {
+  "bytes": 156082,
+  "chars": 52032,
+  "sha256": "949e4bd360327c7a3f98cef44b67574d0f68810488f03d42f1026c51e95ce3e2"
+ },
+ "p52k__v2.txt": {
+  "bytes": 156082,
+  "chars": 52032,
+  "sha256": "f28543a7d0ab653f36dece3ed7d3b55f7abbb92f32fff15df569a9de226e72df"
+ },
+ "p6.5k__v0.txt": {
+  "bytes": 19582,
+  "chars": 6532,
+  "sha256": "c952030f5adf054671ee613872c981ecb9f6aae70dff2f44ed77ba6ae65d6212"
+ },
+ "p6.5k__v1.txt": {
+  "bytes": 19582,
+  "chars": 6532,
+  "sha256": "c490c4d24c7bef22452adbe9528ce8414a05f7297e62906d872d2b91bba8be8d"
+ },
+ "p6.5k__v2.txt": {
+  "bytes": 19582,
+  "chars": 6532,
+  "sha256": "520e43ed3dc2088ca26596513a31f2d3e7f2031497ab450191150a5a22620493"
+ }
+}

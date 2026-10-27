@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "kind": "register_only_bench_expectations",
+  "measured_on": {
+    "host": "macstudio (M2 Ultra, 76-core GPU, 192 GiB unified)",
+    "os": "macOS 27.0.1 (26A434), kernel 27.0.0",
+    "date": "2026-10-27",
+    "binary_sha256": "a97976e0a2e2aced06349c203ee7d4d4244688178eee907281a08e3aded2f1dd",
+    "metallib_sha256": "fe55793346e15119fce4e0f40d4bf6d3023fc3694ffc231e66b8a89e3ae0f74d",
+    "config_sha256": "735e0dc73fbbf7483dba0bffe4ad379a4dab910bb734d3a6708df65c8edc16d7",
+    "note": "Same binary, library and config are required for the tolerances below to mean anything. A different MYDS_CHUNK_KEY_MAX moves throughput by several percent on its own (ledger 105.7)."
+  },
+  "tolerances": {
+    "tps_pct": 2.0,
+    "prompt_tok_pct": 2.0,
+    "gain_pp": 1.5,
+    "gpu_residency_min": 95.0,
+    "gpu_power_w": [85.0, 125.0],
+    "why": "tps_pct covers thermal and page-cache drift between sessions on the same machine (observed run-to-run spread within one session was 0.135%). gain_pp is wider because it is a difference of two such numbers. prompt_tok_pct is loose on purpose: the frozen corpus tags differ from the historical per-run nonces, so exact token equality is not expected; a drift beyond 2% means the corpus or the tokenizer changed."
+  },
+  "ab": {
+    "case": "p32k_ab",
+    "arms": {
+      "OFF": {"median_tps": 593.1, "min_tps": 592.8, "max_tps": 593.6, "n": 9},
+      "ON": {"median_tps": 618.9, "min_tps": 618.7, "max_tps": 619.1, "n": 9}
+    },
+    "gain_pct": 4.35,
+    "paired_gain_pct": 4.34,
+    "control_drift_pct": {"OFF": 0.067, "ON": 0.048},
+    "requests_per_boot": 2897,
+    "encoded_per_boot": {"OFF": 0, "ON": 2025},
+    "encoding_rate_pct": 69.9,
+    "fixed_sample": {
+      "prompt_tok_reference": 32210,
+      "prompt_tok_tolerance_pct": 2.0,
+      "completion_tok": 2,
+      "text": "齿轮箱",
+      "sha16": "0d99c08267aa96cb",
+      "claim": "the two arms must produce identical bytes on this sample; the absolute sha is recorded for cross-check, not as a requirement"
+    }
+  },
+  "sweep": {
+    "p0.2k": {"prompt_tok_reference": 592, "median_prefill_tps": 246.8},
+    "p1.6k": {"prompt_tok_reference": 1026, "median_prefill_tps": 319.0},
+    "p6.5k": {"prompt_tok_reference": 4059, "median_prefill_tps": 453.6},
+    "p13k": {"prompt_tok_reference": 8081, "median_prefill_tps": 539.5},
+    "p26k": {"prompt_tok_reference": 16128, "median_prefill_tps": 592.7},
+    "p52k": {"prompt_tok_reference": 32224, "median_prefill_tps": 616.4}
+  },
+  "decode": {
+    "d_short": {"prompt_tok_reference": 43, "decode_tokens": 256, "median_decode_tps": 42.0},
+    "d_8k": {"prompt_tok_reference": 8111, "decode_tokens": 160, "median_decode_tps": 39.6},
+    "d_32k": {"prompt_tok_reference": 32254, "decode_tokens": 160, "median_decode_tps": 38.2}
+  },
+  "gpu": {
+    "residency_median_pct": 100.0,
+    "frequency_peak_mhz": 1398,
+    "power_median_w": {"OFF": 104.2, "ON": 106.0},
+    "claim": "both arms must be saturated; if one arm sits far below 95% residency the comparison is invalid rather than fast"
+  },
+  "invariants": {
+    "cached_must_be_zero": true,
+    "arms_must_differ_in_encoded": true,
+    "fallbacks_and_failures_must_be_zero": true,
+    "why": "a non-zero cached row did no prefill; identical encoded counts would mean the arm switch never took effect; a fallback means the candidate declined to run, so the arm measured the reference path"
+  }
+}
