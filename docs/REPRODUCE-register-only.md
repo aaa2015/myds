@@ -118,17 +118,29 @@ PREFLIGHT FAILED — nothing was started, no service was touched:
     can panic from wired exhaustion. Refusing to start.
 ```
 
-### 4.0.1 工具与语料必须先到那台机器上
+### 4.0.1 工具与语料怎么到那台机器上
 
-`deploy.sh` 的 `SYNC_DIRS` 包含 `tools` 与 `docs`，**不包含 `benchmarks`**。所以要么在目标机器上
-从仓库直接 clone，要么手动补一次：
+**2026-10-27 起 `sync_myds.sh` 的 `SYNC_DIRS` 已包含 `benchmarks`**，所以正常跑
+`deploy.sh` 或 `sync_myds.sh` 就会把语料、原始 JSONL 与 `expected.json` 一起带过去，
+不需要手工补。
+
+如果看到 `make audit-ledger` 报 `marker missing` 或证据缺失，说明那台机器上的副本是旧的，
+按下面的方式补一次即可：
 
 ```bash
-rsync -a tools/ <host>:~/Projects/myds/tools/
-rsync -a benchmarks/ <host>:~/Projects/myds/benchmarks/
+# 在权威侧，而不是在目标机上
+cd ~/Projects/myfleet && ./sync_myds.sh
 ```
 
-然后在那台机器上 `python3 tools/make_register_only_corpus.py --check` 确认语料完整。
+`sync_myds.sh` 会在同步前后各算一次源码树指纹（其中包含 `benchmarks` 下的
+`*.txt` / `*.jsonl` / `*.json`），两侧不一致会直接中止 —— 也就是说「传过去了但传错」
+会被拦住，不靠人眼核对。
+
+同步后在那台机器上确认：
+
+```bash
+cd ~/Projects/myds && make corpus-check && make audit-ledger
+```
 
 ### 4.1 硬件与软件前置条件
 
