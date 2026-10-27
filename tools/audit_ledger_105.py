@@ -305,16 +305,27 @@ if sec106:
                        "expected.json").read_text())
     tol = expj["tolerances"]
 
-    chk("106 quotes tps tolerance", f"±{tol['tps_pct']:.1f}%" in sec106,
-        f"expected ±{tol['tps_pct']}%")
-    chk("106 quotes gain tolerance", f"±{tol['gain_pp']:.1f} 个百分点" in sec106,
-        f"expected ±{tol['gain_pp']}pp")
-    chk("106 quotes prompt token tolerance", f"±{tol['prompt_tok_pct']:.1f}%" in sec106,
-        f"expected ±{tol['prompt_tok_pct']}%")
-    chk("106 quotes gpu residency min", f"≥{tol['gpu_residency_min']:.0f}%" in sec106,
-        f"expected >= {tol['gpu_residency_min']}%")
-    chk("106 quotes gpu power band",
-        f"{tol['gpu_power_w'][0]:.0f}–{tol['gpu_power_w'][1]:.0f} W" in sec106,
+    # Each tolerance must be quoted in ITS OWN table row. A plain substring search
+    # is not enough: "±2.0%" appears in two different rows, so an earlier version of
+    # this check passed while the throughput row had been edited to ±5.0%.
+    def row_has(row_label, expected):
+        pat = r"\|\s*" + re.escape(row_label) + r"\s*\|[^|]*" + re.escape(expected)
+        return re.search(pat, sec106) is not None
+
+    chk("106 throughput row quotes its tolerance",
+        row_has("prefill / decode 吞吐", f"±{tol['tps_pct']:.1f}%"),
+        f"expected ±{tol['tps_pct']}% in that row")
+    chk("106 gain row quotes its tolerance",
+        row_has("A/B 收益", f"±{tol['gain_pp']:.1f} 个百分点"),
+        f"expected ±{tol['gain_pp']}pp in that row")
+    chk("106 prompt-token row quotes its tolerance",
+        row_has("prompt token 数", f"±{tol['prompt_tok_pct']:.1f}%"),
+        f"expected ±{tol['prompt_tok_pct']}% in that row")
+    chk("106 gpu residency row quotes its floor",
+        row_has("GPU 活跃驻留", f"≥{tol['gpu_residency_min']:.0f}%"),
+        f"expected >= {tol['gpu_residency_min']}% in that row")
+    chk("106 gpu power row quotes its band",
+        row_has("GPU 功耗", f"{tol['gpu_power_w'][0]:.0f}–{tol['gpu_power_w'][1]:.0f} W"),
         str(tol['gpu_power_w']))
 
     for name, needle in (("cached", "cached"), ("encoded", "encoded"),
@@ -342,6 +353,20 @@ if sec106:
     chk("106 lists exactly five explicit limits",
         sum(sec106.count(f"\n{i}. **不能") for i in range(1, 6)) == 5,
         "limit list changed")
+
+# ---------- the quoted check counts must match reality (self-referential, on purpose) ----------
+counts = expj.get("check_counts", {}) if "expj" in dir() else {}
+if counts:
+    chk(f"106 quotes the audit count {counts['audit_ledger']}",
+        f"{counts['audit_ledger']} 项" in sec106, "ledger count stale")
+    chk(f"106 quotes the verifier count {counts['verify_bench']}",
+        f"{counts['verify_bench']} 项" in sec106, "ledger count stale")
+    # +1 accounts for this very check, which is not yet in len(checks)
+    total_now = len(checks) + 1
+    chk(f"this run reports {counts['audit_ledger']} checks",
+        total_now == counts["audit_ledger"],
+        f"script would report {total_now}, expected.json says {counts['audit_ledger']}; "
+        f"bump check_counts.audit_ledger when adding or removing a check")
 
 print(f"checks: {len(checks)}  passed: {sum(1 for _, ok, _ in checks if ok)}  failed: {len(problems)}")
 for n, ok, d in checks:
