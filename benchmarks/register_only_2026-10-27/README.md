@@ -7,8 +7,8 @@
 
 | 层次 | 命令 | 需要什么 | 耗时 |
 |---|---|---|---|
-| L1 算术 | `make audit-ledger` | Python 3 | 秒级 |
-| L2 判定逻辑 | `make verify-register-only` | Python 3 | 秒级 |
+| L1 算术 | `make audit-ledger` | Python 3 | 秒级（166 项）|
+| L2 判定逻辑 | `make verify-register-only` | Python 3 | 秒级（36 项）|
 | L3 实测 | `make bench-register-only` | M2/M3 Ultra 192 GiB + 362 GB 权重 + 免密 sudo | 约 60 分钟 |
 
 **L1/L2 不需要 GPU、不需要模型、不需要本机是 Mac。**
@@ -23,8 +23,9 @@ prompts/            31 个语料文件 + manifest.json
                     6 个 prefill 尺寸 + 1 个 A/B 尺寸 + 3 个 decode 场景，
                     各 3 个变体，另加 1 个专供"固定样本"的文件
                     变体存在的唯一原因：避开服务端 prefix cache
-raw/                rig.jsonl / sweep2.jsonl / dec2.jsonl
-                    账本 §105 每个数字的原始出处，逐行保留，未做任何汇总
+raw/                rig.jsonl / sweep2.jsonl / dec2.jsonl / smoke2.jsonl
+                    账本 §105 每个数字的原始出处，逐行保留，未做任何汇总；
+                    smoke2.jsonl 是 §106.5 单臂冒烟的四行原始记录
 expected.json       期望值 + 容差 + 为什么这样定
 runs/               你自己跑出来的结果放这里（不入库）
 ```

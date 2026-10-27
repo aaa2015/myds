@@ -292,6 +292,57 @@ for bad, label, marker in (("591.7", "old OFF median", "577.4"),
         ok = marker in ctx
     chk(f"ledger free of retracted {label}", ok, "present outside a retraction context")
 
+# ---------- §106: reproducibility section must agree with expected.json ----------
+ledger_all = ledger
+try:
+    sec106 = ledger_all[ledger_all.index("## §106"):]
+except ValueError:
+    sec106 = ""
+chk("ledger has a §106 reproducibility section", bool(sec106), "missing")
+
+if sec106:
+    expj = json.loads((Path.home() / "Projects/myds/benchmarks/register_only_2026-10-27/"
+                       "expected.json").read_text())
+    tol = expj["tolerances"]
+
+    chk("106 quotes tps tolerance", f"±{tol['tps_pct']:.1f}%" in sec106,
+        f"expected ±{tol['tps_pct']}%")
+    chk("106 quotes gain tolerance", f"±{tol['gain_pp']:.1f} 个百分点" in sec106,
+        f"expected ±{tol['gain_pp']}pp")
+    chk("106 quotes prompt token tolerance", f"±{tol['prompt_tok_pct']:.1f}%" in sec106,
+        f"expected ±{tol['prompt_tok_pct']}%")
+    chk("106 quotes gpu residency min", f"≥{tol['gpu_residency_min']:.0f}%" in sec106,
+        f"expected >= {tol['gpu_residency_min']}%")
+    chk("106 quotes gpu power band",
+        f"{tol['gpu_power_w'][0]:.0f}–{tol['gpu_power_w'][1]:.0f} W" in sec106,
+        str(tol['gpu_power_w']))
+
+    for name, needle in (("cached", "cached"), ("encoded", "encoded"),
+                         ("fallbacks", "fallbacks")):
+        chk(f"106 states the {name} invariant", needle in sec106, "not mentioned")
+
+    for rel in ("benchmarks/register_only_2026-10-27/expected.json",
+                "benchmarks/register_only_2026-10-27/README.md",
+                "benchmarks/register_only_2026-10-27/raw/smoke2.jsonl",
+                "docs/REPRODUCE-register-only.md"):
+        chk(f"106 references exist: {rel}",
+            (Path.home() / "Projects/myds" / rel).exists(), "missing file")
+
+    smoke_rows = [json.loads(l) for l in
+                  (Path.home() / "Projects/myds/benchmarks/register_only_2026-10-27/raw/"
+                   "smoke2.jsonl").read_text().splitlines() if l.strip()]
+    sruns = [r for r in smoke_rows if r.get("kind") == "run"]
+    fx = [r["tps"] for r in sruns if r.get("sample") == "fixed"]
+    nc = sorted(r["tps"] for r in sruns if r.get("sample") == "nonce")
+    chk("106.5 smoke fixed tps matches data", any(abs(t - 592.2) < 0.05 for t in fx), str(fx))
+    chk("106.5 smoke nonce tps matches data", nc == [592.8, 592.8], str(nc))
+    chk("106.5 smoke fixed tps quoted", "592.2" in sec106, "missing")
+    chk("106.5 smoke nonce tps quoted", "592.8 / 592.8" in sec106, "missing")
+    chk("106 states the arithmetic check count", "147" in sec106, "missing")
+    chk("106 lists exactly five explicit limits",
+        sum(sec106.count(f"\n{i}. **不能") for i in range(1, 6)) == 5,
+        "limit list changed")
+
 print(f"checks: {len(checks)}  passed: {sum(1 for _, ok, _ in checks if ok)}  failed: {len(problems)}")
 for n, ok, d in checks:
     if not ok:

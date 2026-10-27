@@ -35,7 +35,7 @@
 
 ```bash
 make audit-ledger
-# checks: 147  passed: 147  failed: 0
+# checks: 166  passed: 166  failed: 0
 ```
 
 `tools/audit_ledger_105.py` 从 `benchmarks/register_only_2026-10-27/raw/*.jsonl`
@@ -43,7 +43,8 @@ make audit-ledger
 两臂 sha、计数器差分、GPU 六种残值组合、线性拟合参数与残差），
 再逐项与账本 §105 的**文字**比对。任何一项不符即 `exit 1`。
 
-它还会检查账本里**不许再出现**已撤回的数字（`591.7` / `617.7` / `4.39` / `1,620`），
+它还会把账本 §106 的六个容差与
+`expected.json` 逐项对齐（改了一边忘了另一边就报错），并检查账本里**不许再出现**已撤回的数字（`591.7` / `617.7` / `4.39` / `1,620`），
 仅允许它们出现在明确的撤回语句里。
 
 **为什么这层重要**：账本数字是手工从 JSON 抄进 Markdown 的。手抄就是错误入口。
@@ -55,7 +56,7 @@ make audit-ledger
 
 ```bash
 make verify-register-only
-# 30 checks, 30 passed, 0 failed
+# 36 checks, 36 passed, 0 failed
 # VERDICT: PASS — the measured run is consistent with the recorded results
 ```
 

@@ -183,6 +183,38 @@ def verify_sweep(rows, exp, check_decode=True):
               near(m, want["median_decode_tps"], tol["tps_pct"]), f"got {m:.1f}")
 
 
+def verify_smoke(rows, exp):
+    """The single-arm smoke run is not an A/B; it only shows the shipped harness
+    works and produces the same order of numbers. Checking it keeps ledger 106.5
+    from being another unsourced claim."""
+    want = exp.get("l3_smoke")
+    if not want:
+        return
+    print("\nL3 smoke (single arm, single boot)")
+    runs = [r for r in rows if r.get("kind") == "run"]
+    if not runs:
+        check("smoke rows present", False, "none")
+        return
+    check("smoke arms are OFF only", {r["arm"] for r in runs} == {want["arm"]},
+          str({r["arm"] for r in runs}))
+    check("smoke rows all cached=0", all(r.get("cached") == 0 for r in runs),
+          str([r.get("cached") for r in runs]))
+    fx = [r for r in runs if r.get("sample") == "fixed"]
+    check(f"smoke fixed tps ~ {want['fixed_tps']}",
+          any(near(r["tps"], want["fixed_tps"], 1.0) for r in fx),
+          str([r["tps"] for r in fx]))
+    nc = sorted(r["tps"] for r in runs if r.get("sample") == "nonce")
+    check("smoke nonce tps match",
+          nc == sorted(want["nonce_tps"]), str(nc))
+    g = [r["gpu_detail"] for r in runs if r.get("gpu_detail")]
+    if g:
+        check("smoke GPU residency 100%",
+              all(x["res_median"] == want["gpu_residency"] for x in g),
+              str([x["res_median"] for x in g]))
+        pw = sorted(round(x["power_median_mw"] / 1000, 1) for x in g)
+        check("smoke GPU power matches", pw == sorted(want["gpu_power_w"]), str(pw))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -190,6 +222,7 @@ def main():
     ap.add_argument("--sweep", help="sweep JSONL from bench_register_only_sweep.py")
     ap.add_argument("--historical", action="store_true",
                     help="self-test against the archived data the ledger cites")
+    ap.add_argument("--smoke", help="optional: a single-arm smoke JSONL to sanity-check")
     a = ap.parse_args()
 
     exp = json.loads(EXPECTED.read_text())
@@ -200,6 +233,9 @@ def main():
         # the archived sweep records d_8k/d_32k with only 2 generated tokens, so its
         # decode columns are excluded here; dec2.jsonl is checked instead.
         verify_sweep(load(HIST_SWEEP), exp, check_decode=False)
+        smoke = BENCH / "raw" / "smoke2.jsonl"
+        if smoke.exists():
+            verify_smoke(load(smoke), exp)
         # decode from dec2
         print("\nDecode (from dec2.jsonl)")
         dec = {}
@@ -221,6 +257,8 @@ def main():
             verify_ab(load(a.ab), exp)
         if a.sweep:
             verify_sweep(load(a.sweep), exp)
+        if a.smoke:
+            verify_smoke(load(a.smoke), exp)
 
     total = len(passes) + len(fails)
     print(f"\n{total} checks, {len(passes)} passed, {len(fails)} failed")
