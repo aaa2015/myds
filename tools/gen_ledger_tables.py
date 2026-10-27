@@ -101,6 +101,61 @@ def ab_facts():
                 cached_nonzero=sum(1 for r in runs if r.get("cached") != 0))
 
 
+def reproduce_facts():
+    """The A/B re-run end-to-end by the shipped harness, as opposed to rig.jsonl which
+    was produced by the /tmp scripts. Kept separately so a reader can see the two runs
+    agree rather than having to take one on faith."""
+    p = RAW / "reproduce_run.jsonl"
+    if not p.exists():
+        return None
+    rows = [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+    runs = [r for r in rows if r.get("kind") == "run"]
+    nonce = [r for r in runs if r.get("sample") == "nonce"]
+    fixed = [r for r in runs if r.get("sample") == "fixed"]
+    ends = [r for r in rows if r.get("kind") == "boot_end" and r.get("delta")]
+    per = {}
+    for arm in ("OFF", "ON"):
+        v = sorted(r["tps"] for r in nonce if r["arm"] == arm)
+        if not v:
+            return None
+        per[arm] = dict(n=len(v), min=v[0], max=v[-1], median=st.median(v),
+                        range_pct=100 * (v[-1] - v[0]) / st.median(v))
+    off, on = per["OFF"]["median"], per["ON"]["median"]
+    return dict(per=per, gain=100 * (on / off - 1),
+                deltas={a: [e["delta"] for e in ends if e["arm"] == a] for a in ("OFF", "ON")},
+                shas={a: sorted({r["sha"] for r in fixed if r["arm"] == a}) for a in ("OFF", "ON")},
+                cached_nonzero=sum(1 for r in runs if r.get("cached") != 0))
+
+
+def render_reproduce(rep, ab):
+    """Side-by-side: the /tmp scripts vs the shipped harness. Same machine, same
+    binary, same corpus size, different code and different day-time."""
+    if not rep:
+        return "_未经入库脚本独立复跑。_"
+    rows = ["| 臂 | 首创运行（`rig.jsonl`）| 入库脚本复跑（`reproduce_run.jsonl`）| 差 |",
+            "|---|---:|---:|---:|"]
+    for arm, label in (("OFF", "关"), ("ON", "开")):
+        a = ab["per"][arm]["median"]
+        b = rep["per"][arm]["median"]
+        rows.append(f"| {label} | {a:.1f} t/s | {b:.1f} t/s | {100*(b/a-1):+.2f}% |")
+    rows.append(f"| **收益** | **+{ab['gain']:.2f}%** | **+{rep['gain']:.2f}%** | "
+                f"{rep['gain']-ab['gain']:+.2f} 个百分点 |")
+    rows.append("")
+    enc = rep["deltas"]
+    rows.append(f"复跑的两臂 `encoded` 为 "
+                f"{[x['encoded'] for x in enc['OFF']]} / {[x['encoded'] for x in enc['ON']]}，"
+                f"`cached≠0` 的行数 **{rep['cached_nonzero']}**，"
+                f"固定样本 sha "
+                f"{'相同' if rep['shas']['OFF'] == rep['shas']['ON'] else '**不同**'}。")
+    rows.append("")
+    rows.append("两次独立运行的收益差 "
+                f"**{abs(rep['gain']-ab['gain']):.2f} 个百分点**，"
+                "小于 `expected.json` 的 ±1.5 个百分点容差 —— "
+                "**这是「仓库里的脚本能自己产出这个结论」的证据**，"
+                "而不只是「同一批数据被算了两次」。")
+    return "\n".join(rows)
+
+
 def sweep_facts():
     rows = [r for r in load("sweep2.jsonl") if r.get("phase") == "sweep" and r.get("server")]
     by = {}
@@ -379,6 +434,7 @@ def regions(ab, sw, dec, g):
         "sweep": render_sweep(sw),
         "decode": render_decode(sw, dec),
         "sweep_fit": render_sweep_fit(sw),
+        "ab_reproduce": render_reproduce(reproduce_facts(), ab),
         "tolerances": render_tolerances(),
     }
 

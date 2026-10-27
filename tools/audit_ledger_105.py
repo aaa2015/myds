@@ -82,6 +82,27 @@ def main():
               st.stdev([r["tps"] for r in nonce if r["arm"] == a]) for a in ("OFF", "ON")),
           f"OFF {med['OFF']:.1f} vs ON {med['ON']:.1f}")
 
+    # the same invariants must hold on the independent rerun by the shipped harness
+    repro = RAW / "reproduce_run.jsonl"
+    if repro.exists():
+        rr = [json.loads(l) for l in repro.read_text().splitlines() if l.strip()]
+        r_runs = [r for r in rr if r.get("kind") == "run"]
+        r_fixed = [r for r in r_runs if r.get("sample") == "fixed"]
+        r_ends = [r for r in rr if r.get("kind") == "boot_end" and r.get("delta")]
+        check("rerun: every timed row reported cached=0",
+              all(r.get("cached") == 0 for r in r_runs),
+              str([(r["arm"], r["boot"], r.get("cached")) for r in r_runs if r.get("cached") != 0]))
+        r_enc = {a: sorted({e["delta"]["encoded"] for e in r_ends if e["arm"] == a})
+                 for a in ("OFF", "ON")}
+        check("rerun: arms differ in encoded chunks", r_enc["OFF"] == [0] and r_enc["ON"] and
+              r_enc["ON"][0] > 0, str(r_enc))
+        r_fb = [(e["arm"], e["delta"]["fallbacks"], e["delta"]["failures"]) for e in r_ends
+                if e["delta"]["fallbacks"] or e["delta"]["failures"]]
+        check("rerun: no fallbacks and no failures", not r_fb, str(r_fb))
+        r_sha = {a: sorted({r["sha"] for r in r_fixed if r["arm"] == a}) for a in ("OFF", "ON")}
+        check("rerun: both arms produced identical bytes", r_sha["OFF"] == r_sha["ON"] and
+              len(r_sha["OFF"]) == 1, str(r_sha))
+
     print("\nfreshness (tables are generated, not transcribed)")
     sys.path.insert(0, str(ROOT / "tools"))
     import gen_ledger_tables as gen  # noqa: E402

@@ -23,7 +23,8 @@ prompts/            31 个语料文件 + manifest.json
                     6 个 prefill 尺寸 + 1 个 A/B 尺寸 + 3 个 decode 场景，
                     各 3 个变体，另加 1 个专供"固定样本"的文件
                     变体存在的唯一原因：避开服务端 prefix cache
-raw/                rig.jsonl / sweep2.jsonl / dec2.jsonl / smoke2.jsonl
+raw/                rig.jsonl / sweep2.jsonl / dec2.jsonl / smoke2.jsonl /
+                    reproduce_run.jsonl（入库脚本从头复跑，§105.3.1）
                     账本 §105 每个数字的原始出处，逐行保留，未做任何汇总；
                     smoke2.jsonl 是 §106.5 单臂冒烟的四行原始记录
 expected.json       期望值 + 容差 + 为什么这样定

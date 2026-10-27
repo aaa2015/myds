@@ -51,10 +51,10 @@ def load(path):
     return [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
 
 
-def verify_ab(rows, exp):
+def verify_ab(rows, exp, label=""):
     tol = exp["tolerances"]
     e = exp["ab"]
-    print("\nA/B")
+    print(f"\nA/B{(' — ' + label) if label else ''}")
     runs = [r for r in rows if r.get("kind") == "run"]
     nonce = [r for r in runs if r.get("sample") == "nonce"]
     fixed = [r for r in runs if r.get("sample") == "fixed"]
@@ -236,6 +236,11 @@ def main():
         smoke = BENCH / "raw" / "smoke2.jsonl"
         if smoke.exists():
             verify_smoke(load(smoke), exp)
+        # the end-to-end rerun by the shipped harness: same expectations, different run
+        repro = BENCH / "raw" / "reproduce_run.jsonl"
+        if repro.exists():
+            print("\nA/B rerun by the shipped harness (raw/reproduce_run.jsonl)")
+            verify_ab(load(repro), exp, label="rerun")
         # decode from dec2
         print("\nDecode (from dec2.jsonl)")
         dec = {}
