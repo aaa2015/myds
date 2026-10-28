@@ -1,0 +1,34 @@
+[2026-10-28 20:55:12.581] [ERROR] input_image 被拒: 服务端未启用视觉（启动时没给 --vision？）
+  [PASS] V4.1 exact chat templates, Unicode input, structured text parts, large input and explicit parse/capacity errors
+  [PASS] Long tool and schema runs, layered escapes, and all prompt capacities
+  [PASS] V4.1 DSML tool definitions, assistant tool_calls, tool results and rejections
+  [PASS] V4.1 DSML completion parsing: content split, parameter kinds, escaping, two calls, malformed fallback
+  [PASS] V4.1 streaming DSML: the call block is withheld from content, including the newlines before it
+  [PASS] tool call events are valid JSON in both protocols (arguments escaped)
+  [PASS] finish events carry the aggregate text in all four places
+  [PASS] Responses text+call merge into one assistant turn (single EOS)
+[2026-10-28 20:55:12.756] [INFO] response state: loaded 4 slot(s) from /Users/fangqingyuan/.cache/myds/responses.idx
+  [PASS] previous_response_id registry: only newest live; expired vs unknown; invalidate_all
+  [PASS] previous_response_id suffix render: items only, no BOS/instructions/tools
+  [PASS] tools signature: no-tools=0, format-independent, change-detecting; survives registration
+  [PASS] thinking mode (CoT/Reasoning) prompt formatting, request parsing, streaming deltas & Responses API lifecycle
+====================================================
+       Running myds Server API Unit Tests           
+====================================================
+  [PASS] JSON byte escaping: NUL, known UTF-8, invalid sequences, truncated code points and capacity errors
+  [PASS] Production SSE/Responses callbacks and collection: split UTF-8, NUL, invalid/truncated UTF-8, long controls, socket short writes and allocation overflow
+  [PASS] Async SSE FIFO/copied bytes, allocation/thread failures, bounded slow-reader cancellation, total drain deadline and disconnect join
+  [PASS] Omitted API token limits follow official per-mode tiers and server caps
+  [PASS] Endpoint route matching (/responses, /chat/completions, /health, /models)
+  [PASS] Parameter extraction and max_output_tokens precedence
+  [PASS] Multi-turn conversation prompt construction with instructions
+  [PASS] Responses API non-streaming JSON structure compliance
+  [PASS] JSON special character escaping (newlines, quotes, tabs)
+  [PASS] Responses API SSE events protocol compliance
+  [PASS] P0-2 finish_reason mapping and P0-3 real usage tokens
+  [PASS] P0-4 stream_options.include_usage detection and usage chunk compliance
+  [PASS] P1-2 dynamic prompt buffer parsing with >16KB content without truncation
+====================================================
+      ALL SERVER API UNIT TESTS PASSED!             
+====================================================
+PASS: exhausted prompt buffers do not scan into a protected input page

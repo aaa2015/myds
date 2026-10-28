@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "kind": "indexer_register_only_full_library_build",
+  "selected_symbol": "kernel_myds_indexer_scores_register_only_bf16",
+  "native_oracle_symbol": "kernel_dsv4_indexer_scores_tiled_bf16",
+  "source_identity": {
+    "path": "/private/tmp/myds-indexer-long-20261028-aa-identity/build/source-identity.json",
+    "bytes": 24752,
+    "sha256": "1e4b864e2e533573699b5fb10c6090a57198a6f9d6f6ee6e5d5ace3e9afdeca6"
+  },
+  "native_source_bytes": 1574167,
+  "native_source_sha256": "bc6603c97ec24af7597f6b10c7ed2a7bfe1344379733a0a4df780250a13f3224",
+  "combined_source_sha256": "21b3fec7d995b21eb5722bc87e3bd847a2dca843e22a86673eaeecd935297846",
+  "compile_only_pass": true,
+  "compilation_skipped": false,
+  "gpu_work_submitted": false,
+  "production_adoption": false,
+  "runtime_connected": false,
+  "commands": [
+    [
+      "xcrun",
+      "-sdk",
+      "macosx",
+      "metal",
+      "-mmacosx-version-min=15.0",
+      "-O3",
+      "-ffast-math",
+      "-DDS4_METAL_HC_STABLE=1",
+      "-DDS4_METAL_NORM_RSQRT_DISABLE=1",
+      "-c",
+      "/private/tmp/myds-indexer-long-20261028-aa-identity/build/native.metal",
+      "-o",
+      "/private/tmp/myds-indexer-long-20261028-aa-identity/build/native.air"
+    ],
+    [
+      "xcrun",
+      "-sdk",
+      "macosx",
+      "metallib",
+      "/private/tmp/myds-indexer-long-20261028-aa-identity/build/native.air",
+      "-o",
+      "/private/tmp/myds-indexer-long-20261028-aa-identity/build/native.metallib"
+    ],
+    [
+      "xcrun",
+      "-sdk",
+      "macosx",
+      "metal",
+      "-mmacosx-version-min=15.0",
+      "-O3",
+      "-ffast-math",
+      "-DDS4_METAL_HC_STABLE=1",
+      "-DDS4_METAL_NORM_RSQRT_DISABLE=1",
+      "-c",
+      "/private/tmp/myds-indexer-long-20261028-aa-identity/build/all.metal",
+      "-o",
+      "/private/tmp/myds-indexer-long-20261028-aa-identity/build/probe.air"
+    ],
+    [
+      "xcrun",
+      "-sdk",
+      "macosx",
+      "metallib",
+      "/private/tmp/myds-indexer-long-20261028-aa-identity/build/probe.air",
+      "-o",
+      "/private/tmp/myds-indexer-long-20261028-aa-identity/build/probe.metallib"
+    ],
+    [
+      "xcrun",
+      "clang",
+      "-O2",
+      "-fobjc-arc",
+      "-Wno-deprecated-declarations",
+      "-mmacosx-version-min=26.0",
+      "-I",
+      "/Users/fangqingyuan/Projects/myds/include",
+      "-I",
+      "/Users/fangqingyuan/Projects/myds/src",
+      "-framework",
+      "Foundation",
+      "-framework",
+      "Metal",
+      "/private/tmp/myds-indexer-long-20261028-aa-identity/build/source/tools/bench_indexer_register_only.m",
+      "/Users/fangqingyuan/Projects/myds/src/myds_v41_gpu.c",
+      "/Users/fangqingyuan/Projects/myds/src/myds_metal.m",
+      "/Users/fangqingyuan/Projects/myds/src/myds_gguf.c",
+      "/Users/fangqingyuan/Projects/myds/src/myds_log.c",
+      "-lm",
+      "-lpthread",
+      "-o",
+      "/private/tmp/myds-indexer-long-20261028-aa-identity/build/bench_indexer_register_only"
+    ]
+  ],
+  "artifacts": {
+    "native.air": {
+      "path": "/private/tmp/myds-indexer-long-20261028-aa-identity/build/native.air",
+      "bytes": 1281872,
+      "sha256": "c5f3debaff7df27eaa62a99fe0117b3e26bd27af86d6cd5b7f73e14d2d944c8a"
+    },
+    "probe.air": {
+      "path": "/private/tmp/myds-indexer-long-20261028-aa-identity/build/probe.air",
+      "bytes": 1284368,
+      "sha256": "9acb580caedc565962e02fb6e0a5916c8707b7d148339209b08812fc4e143a29"
+    },
+    "native.metallib": {
+      "path": "/private/tmp/myds-indexer-long-20261028-aa-identity/build/native.metallib",
+      "bytes": 4276708,
+      "sha256": "db7f9b071feb102a47d17051c2f5b6ec7de0cf3e18df46e5beaa912f8cb334f0"
+    },
+    "probe.metallib": {
+      "path": "/private/tmp/myds-indexer-long-20261028-aa-identity/build/probe.metallib",
+      "bytes": 4283287,
+      "sha256": "ca65e99eb422851cfca547a5494433f7bc9bf363216f65425fbc3feabbf68332"
+    },
+    "compile.log": {
+      "path": "/private/tmp/myds-indexer-long-20261028-aa-identity/build/compile.log",
+      "bytes": 17718,
+      "sha256": "24b3d684d2d2a14c3fc971ce679a87822d47352843a726aaf575eb27009df21a"
+    },
+    "bench_indexer_register_only": {
+      "path": "/private/tmp/myds-indexer-long-20261028-aa-identity/build/bench_indexer_register_only",
+      "bytes": 366456,
+      "sha256": "79306374f268b4f5a19faa9ae19f4c5e5fb3b4053958d89ffe1317119cd4cc56"
+    }
+  },
+  "metallibs": {
+    "native": {
+      "path": "/private/tmp/myds-indexer-long-20261028-aa-identity/build/native.metallib",
+      "bytes": 4276708,
+      "sha256": "db7f9b071feb102a47d17051c2f5b6ec7de0cf3e18df46e5beaa912f8cb334f0"
+    },
+    "probe": {
+      "path": "/private/tmp/myds-indexer-long-20261028-aa-identity/build/probe.metallib",
+      "bytes": 4283287,
+      "sha256": "ca65e99eb422851cfca547a5494433f7bc9bf363216f65425fbc3feabbf68332"
+    }
+  }
+}

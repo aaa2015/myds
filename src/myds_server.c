@@ -1147,6 +1147,19 @@ static bool prompt_append(prompt_buffer_t *b, const char *text) {
     if (b->length >= b->capacity || length >= b->capacity - b->length) { b->overflow = true; return false; }
     memcpy(b->data + b->length, text, length + 1); b->length += length; return true;
 }
+/* Append a run of ordinary bytes with the same overflow behavior as appending
+ * each byte separately. Unlike prompt_append_n, a run which does not fit must
+ * leave the largest possible prefix in the output before reporting overflow. */
+static bool prompt_append_run(prompt_buffer_t *b, const char *text, size_t length) {
+    if (b->length >= b->capacity) { b->overflow = true; return false; }
+    const size_t available = b->capacity - b->length - 1u;
+    if (length > available) {
+        if (available && !prompt_append_n(b, text, available)) return false;
+        b->overflow = true;
+        return false;
+    }
+    return prompt_append_n(b, text, length);
+}
 /* 处理一个 input_image 内容块：取出 data URL、解码、编一次图，
  * 然后把它对应的【占位文本】追加进提示词。向量本身留在 sink 里，
  * 等提示词全部拼好后由调用方按位置注入。 */
@@ -1199,14 +1212,27 @@ static bool prompt_content_image(const prompt_json_t *j, const prompt_json_node_
 
 static bool prompt_tool_text(prompt_buffer_t *out, const char *text) {
     if (!prompt_append(out, "<tool_result>")) return false;
-    for (const char *p = text; *p; ++p) {
+    const char *run = text, *p = text;
+    for (; *p; ++p) {
+        /* Stop as soon as the next byte cannot fit: the old byte-at-a-time
+         * loop did not scan the rest of an oversized value on failure. */
+        if ((size_t)(p - run) >= out->capacity - out->length - 1u) {
+            if (!prompt_append_run(out, run, (size_t)(p - run))) return false;
+            out->overflow = true;
+            return false;
+        }
+        if (*p != '<' && *p != '&') continue;
         const char *q = p;
         if (*q == '&') { ++q; while (!strncmp(q, "amp;", 4)) q += 4; }
         bool escape = !strncmp(p, "</tool_result>", 14) || (*p == '&' && !strncmp(q, "lt;/tool_result>", 16));
-        char byte[2] = {*p, 0};
-        if (!prompt_append(out, escape ? (*p == '<' ? "&lt;" : "&amp;") : byte)) return false;
+        if (escape) {
+            if ((p != run && !prompt_append_run(out, run, (size_t)(p - run))) ||
+                !prompt_append(out, *p == '<' ? "&lt;" : "&amp;")) return false;
+            run = p + 1;
+        }
     }
-    return prompt_append(out, "</tool_result>");
+    return (p == run || prompt_append_run(out, run, (size_t)(p - run))) &&
+           prompt_append(out, "</tool_result>");
 }
 
 static bool prompt_content(const prompt_json_t *j, const prompt_json_node_t *content,

@@ -1,0 +1,17 @@
+{
+  "baseline_shader_sha256": "a62922c6f5937236bd0e354dd06943b39bfa5f788419c16a8700da793769d616",
+  "candidate_sha256": "824f83a16d7cbe4352e5cc88446a7a5ecdbf472543d621d3713e4c3c905e05e7",
+  "source_fixture_sha256": "c16e661bb244a986a9896014d30472573d5857b8a9eb10cb6f9d6eba0041cc9f",
+  "fixture_sha256": "113ea561b7a0bc59a7303ef4f70cd55015a5120cfed28a37ad37322a9a0d7b95",
+  "builder_sha256": "91a8a0af17a65ee74bd13bd7d95f86312808ff50b84ecdab4039f3ac771c3771",
+  "changes": [
+    "shader n_comp upper bound 16384 -> 65536",
+    "shader end upper bound 32768 -> 131072",
+    "fixture long cases/scope and SHA-only buffer evidence",
+    "actual runtime Top512 GPU comparison",
+    "builder scope metadata and fixture link inputs"
+  ],
+  "topk_helper_sha256": "9ec1c9d5410b4547a275fa1756a6722d7acc74813acd2031802acd358d32a667",
+  "runtime_connected": false,
+  "production_adoption": false
+}

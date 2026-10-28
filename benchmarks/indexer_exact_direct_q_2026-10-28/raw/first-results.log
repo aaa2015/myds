@@ -1,0 +1,87 @@
+{"candidate_library_path":"\/tmp\/myds-indexer-exact-direct-q-v2-20261028\/probe.metallib","candidate_library_sha256":"9cbe9746e47c2726eb08464406e3fbd1089fcf63e473d0bc1b23a31dd99047f4","deployed_path":"\/Users\/fangqingyuan\/Projects\/myds\/bin\/myds.metallib","deployed_sha256":"fe55793346e15119fce4e0f40d4bf6d3023fc3694ffc231e66b8a89e3ae0f74d","device":"Apple M4","kind":"identity","symbols":["kernel_myds_indexer_score_chunk_exact (deployed)","kernel_myds_indexer_score_chunk_exact (same TU)","probe_indexer_exact_direct_q"]}
+[2026-10-28 20:47:19.624] [INFO] myds_metal: loaded precompiled library from /Users/fangqingyuan/Projects/myds/bin/myds.metallib (all required V4.1 kernels verified)
+[2026-10-28 20:47:19.633] [INFO] Shared Q4 V41 NB: 0 (ordinary NB+HC GU2304x5120/Down5120x2304, NR2/NSG4)
+[2026-10-28 20:47:19.633] [INFO] myds_metal: Initialized successfully on GPU: Apple M4
+[2026-10-28 20:47:19.633] [INFO] Indexer head slots: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 20:47:19.633] [INFO] Indexer topk threshold: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 20:47:19.633] [INFO] Indexer topk NaN shuffle: 0 (reference; reference partition geometry)
+[2026-10-28 20:47:19.633] [INFO] Routed MoE geometry: IQ2 NSG=2, Q2 down NSG=2 (inherited)
+[2026-10-28 20:47:19.633] [INFO] Routed MoE IQ2 LUT: threadgroup (reference)
+[2026-10-28 20:47:19.633] [INFO] Batch2 Q8 shared weights: disabled (scalar reference)
+[2026-10-28 20:47:19.633] [INFO] LM-head Q8 rows per threadgroup: 2 (reference; single token, large output, NSG8)
+[2026-10-28 20:47:19.633] [INFO] Dense Q4 rows per threadgroup: 2 (reference; explicit ordinary scalar scope), NSG=4
+[2026-10-28 20:47:19.633] [INFO] F16 GEMV BF16 fuse: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 20:47:19.633] [INFO] Indexer RoPE quant fuse: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 20:47:19.633] [INFO] Routed MoE Q2 sum cache: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 20:47:19.633] [INFO] Routed MoE Q2 sum cache fused: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 20:47:19.633] [INFO] Decode candidates: down overlap=0, IQ2 V4.1=0, Dense Q4 V4.1=0 (ordinary scalar only)
+[2026-10-28 20:47:19.633] [INFO] Routed MoE Q2 V4.1: 0 (ordinary scalar F32 MID only; 5120/2304/384/6, NR2, down NSG2/4; MM, trace and unscoped paths retain reference)
+[2026-10-28 20:47:19.633] [INFO] Attention flash-decoding: 0 (reference (single-TG in-register 14-NSG))
+[2026-10-28 20:47:19.633] [INFO] HC mix norm pre-fusion: 0 (reference (separate norm + GEMV))
+{"case":0,"causal":true,"deployed_vs_direct_q_bit_mismatches":0,"deployed_vs_same_tu_bit_mismatches":0,"guards":true,"inputs_intact":true,"keys":16385,"kind":"correctness","pass":true,"start":32762,"tokens":8,"top512":{"candidate_top512_sha256":"a3a41051982cd05f36140d0bbe0acbdeb0355aad425ee55d7d48efd439c14873","exact_aa_first_mismatch_index":null,"exact_aa_ordered_id_mismatches":0,"exact_repeat_top512_sha256":"a3a41051982cd05f36140d0bbe0acbdeb0355aad425ee55d7d48efd439c14873","exact_top512_sha256":"a3a41051982cd05f36140d0bbe0acbdeb0355aad425ee55d7d48efd439c14873","first_candidate_id":null,"first_exact_id":null,"first_mismatch_index":null,"gpu_batches_completed":3,"guards_and_causal_ids_valid":true,"nan_fuse_encoded":3,"ordered_id_mismatches":0,"prefix_encoded":3,"production_topk":true}}
+{"arm":"A1","case":0,"dispatches":3,"gpu_seconds":0.0069140000268816948,"kind":"timing","order":0,"sample":0,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"B","case":0,"dispatches":3,"gpu_seconds":0.006513708271086216,"kind":"timing","order":1,"sample":0,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A2","case":0,"dispatches":3,"gpu_seconds":0.0059923748485743999,"kind":"timing","order":2,"sample":0,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A1","case":0,"dispatches":3,"gpu_seconds":0.0060027916915714741,"kind":"timing","order":0,"sample":1,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"B","case":0,"dispatches":3,"gpu_seconds":0.0065139583311975002,"kind":"timing","order":1,"sample":1,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A2","case":0,"dispatches":3,"gpu_seconds":0.0060297499876469374,"kind":"timing","order":2,"sample":1,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A1","case":0,"dispatches":3,"gpu_seconds":0.006222833413630724,"kind":"timing","order":0,"sample":2,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"B","case":0,"dispatches":3,"gpu_seconds":0.0065175832714885473,"kind":"timing","order":1,"sample":2,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A2","case":0,"dispatches":3,"gpu_seconds":0.0060000414960086346,"kind":"timing","order":2,"sample":2,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A1","case":0,"dispatches":3,"gpu_seconds":0.0060973749496042728,"kind":"timing","order":0,"sample":3,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"B","case":0,"dispatches":3,"gpu_seconds":0.0065960832871496677,"kind":"timing","order":1,"sample":3,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A2","case":0,"dispatches":3,"gpu_seconds":0.0061370416078716516,"kind":"timing","order":2,"sample":3,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A1","case":0,"dispatches":3,"gpu_seconds":0.0060643749311566353,"kind":"timing","order":0,"sample":4,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"B","case":0,"dispatches":3,"gpu_seconds":0.0065242501441389322,"kind":"timing","order":1,"sample":4,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A2","case":0,"dispatches":3,"gpu_seconds":0.0059906251262873411,"kind":"timing","order":2,"sample":4,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A1","case":0,"dispatches":3,"gpu_seconds":0.0060654585249722004,"kind":"timing","order":0,"sample":5,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"B","case":0,"dispatches":3,"gpu_seconds":0.0065251248888671398,"kind":"timing","order":1,"sample":5,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A2","case":0,"dispatches":3,"gpu_seconds":0.0059907499235123396,"kind":"timing","order":2,"sample":5,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A1","case":0,"dispatches":3,"gpu_seconds":0.0059906251262873411,"kind":"timing","order":0,"sample":6,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"B","case":0,"dispatches":3,"gpu_seconds":0.0065137916244566441,"kind":"timing","order":1,"sample":6,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A2","case":0,"dispatches":3,"gpu_seconds":0.005993416765704751,"kind":"timing","order":2,"sample":6,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"case":1,"causal":true,"deployed_vs_direct_q_bit_mismatches":0,"deployed_vs_same_tu_bit_mismatches":0,"guards":true,"inputs_intact":true,"keys":32768,"kind":"correctness","pass":true,"start":65505,"tokens":31,"top512":{"candidate_top512_sha256":"2713c896c2049fc88e699741ff14130b842bd185c72c4fbc3b4fe60e78a93a52","exact_aa_first_mismatch_index":null,"exact_aa_ordered_id_mismatches":0,"exact_repeat_top512_sha256":"2713c896c2049fc88e699741ff14130b842bd185c72c4fbc3b4fe60e78a93a52","exact_top512_sha256":"2713c896c2049fc88e699741ff14130b842bd185c72c4fbc3b4fe60e78a93a52","first_candidate_id":null,"first_exact_id":null,"first_mismatch_index":null,"gpu_batches_completed":3,"guards_and_causal_ids_valid":true,"nan_fuse_encoded":3,"ordered_id_mismatches":0,"prefix_encoded":3,"production_topk":true}}
+{"arm":"A1","case":1,"dispatches":3,"gpu_seconds":0.046751625137403607,"kind":"timing","order":0,"sample":0,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"B","case":1,"dispatches":3,"gpu_seconds":0.051192875020205975,"kind":"timing","order":1,"sample":0,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A2","case":1,"dispatches":3,"gpu_seconds":0.046841833274811506,"kind":"timing","order":2,"sample":0,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A1","case":1,"dispatches":3,"gpu_seconds":0.047473583370447159,"kind":"timing","order":0,"sample":1,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"B","case":1,"dispatches":3,"gpu_seconds":0.050796000054106116,"kind":"timing","order":1,"sample":1,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A2","case":1,"dispatches":3,"gpu_seconds":0.046690999995917082,"kind":"timing","order":2,"sample":1,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A1","case":1,"dispatches":3,"gpu_seconds":0.047142375027760863,"kind":"timing","order":0,"sample":2,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"B","case":1,"dispatches":3,"gpu_seconds":0.050627500051632524,"kind":"timing","order":1,"sample":2,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A2","case":1,"dispatches":3,"gpu_seconds":0.0473556665237993,"kind":"timing","order":2,"sample":2,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A1","case":1,"dispatches":3,"gpu_seconds":0.046986875124275684,"kind":"timing","order":0,"sample":3,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"B","case":1,"dispatches":3,"gpu_seconds":0.050688874907791615,"kind":"timing","order":1,"sample":3,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A2","case":1,"dispatches":3,"gpu_seconds":0.047412500018253922,"kind":"timing","order":2,"sample":3,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A1","case":1,"dispatches":3,"gpu_seconds":0.046734750038012862,"kind":"timing","order":0,"sample":4,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"B","case":1,"dispatches":3,"gpu_seconds":0.051090541761368513,"kind":"timing","order":1,"sample":4,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A2","case":1,"dispatches":3,"gpu_seconds":0.04669087496586144,"kind":"timing","order":2,"sample":4,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A1","case":1,"dispatches":3,"gpu_seconds":0.04693154152482748,"kind":"timing","order":0,"sample":5,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"B","case":1,"dispatches":3,"gpu_seconds":0.051081041805446148,"kind":"timing","order":1,"sample":5,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A2","case":1,"dispatches":3,"gpu_seconds":0.047626041574403644,"kind":"timing","order":2,"sample":5,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A1","case":1,"dispatches":3,"gpu_seconds":0.047303416766226292,"kind":"timing","order":0,"sample":6,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"B","case":1,"dispatches":3,"gpu_seconds":0.050673749996349216,"kind":"timing","order":1,"sample":6,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A2","case":1,"dispatches":3,"gpu_seconds":0.046718999976292253,"kind":"timing","order":2,"sample":6,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"case":2,"causal":true,"deployed_vs_direct_q_bit_mismatches":0,"deployed_vs_same_tu_bit_mismatches":0,"guards":true,"inputs_intact":true,"keys":65536,"kind":"correctness","pass":true,"start":131040,"tokens":32,"top512":{"candidate_top512_sha256":"c429c99b2b60eda3f345b082a26cd977404773bb836e623a180fac2a208af0bc","exact_aa_first_mismatch_index":null,"exact_aa_ordered_id_mismatches":0,"exact_repeat_top512_sha256":"c429c99b2b60eda3f345b082a26cd977404773bb836e623a180fac2a208af0bc","exact_top512_sha256":"c429c99b2b60eda3f345b082a26cd977404773bb836e623a180fac2a208af0bc","first_candidate_id":null,"first_exact_id":null,"first_mismatch_index":null,"gpu_batches_completed":3,"guards_and_causal_ids_valid":true,"nan_fuse_encoded":3,"ordered_id_mismatches":0,"prefix_encoded":3,"production_topk":true}}
+{"arm":"A1","case":2,"dispatches":3,"gpu_seconds":0.095725500024855137,"kind":"timing","order":0,"sample":0,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"B","case":2,"dispatches":3,"gpu_seconds":0.10385137493722141,"kind":"timing","order":1,"sample":0,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A2","case":2,"dispatches":3,"gpu_seconds":0.095573749858886003,"kind":"timing","order":2,"sample":0,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A1","case":2,"dispatches":3,"gpu_seconds":0.097531500039622188,"kind":"timing","order":0,"sample":1,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"B","case":2,"dispatches":3,"gpu_seconds":0.10502799996174872,"kind":"timing","order":1,"sample":1,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A2","case":2,"dispatches":3,"gpu_seconds":0.097066458547487855,"kind":"timing","order":2,"sample":1,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A1","case":2,"dispatches":3,"gpu_seconds":0.097494000103324652,"kind":"timing","order":0,"sample":2,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"B","case":2,"dispatches":3,"gpu_seconds":0.10492137493565679,"kind":"timing","order":1,"sample":2,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A2","case":2,"dispatches":3,"gpu_seconds":0.096786124864593148,"kind":"timing","order":2,"sample":2,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A1","case":2,"dispatches":3,"gpu_seconds":0.096659375121816993,"kind":"timing","order":0,"sample":3,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"B","case":2,"dispatches":3,"gpu_seconds":0.10524312499910593,"kind":"timing","order":1,"sample":3,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A2","case":2,"dispatches":3,"gpu_seconds":0.097170749912038445,"kind":"timing","order":2,"sample":3,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A1","case":2,"dispatches":3,"gpu_seconds":0.09725808328948915,"kind":"timing","order":0,"sample":4,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"B","case":2,"dispatches":3,"gpu_seconds":0.10572933335788548,"kind":"timing","order":1,"sample":4,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A2","case":2,"dispatches":3,"gpu_seconds":0.09662945824675262,"kind":"timing","order":2,"sample":4,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A1","case":2,"dispatches":3,"gpu_seconds":0.096117249922826886,"kind":"timing","order":0,"sample":5,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"B","case":2,"dispatches":3,"gpu_seconds":0.10396662494167686,"kind":"timing","order":1,"sample":5,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A2","case":2,"dispatches":3,"gpu_seconds":0.09608349995687604,"kind":"timing","order":2,"sample":5,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A1","case":2,"dispatches":3,"gpu_seconds":0.09620949998497963,"kind":"timing","order":0,"sample":6,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"B","case":2,"dispatches":3,"gpu_seconds":0.10385299986228347,"kind":"timing","order":1,"sample":6,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A2","case":2,"dispatches":3,"gpu_seconds":0.095094125019386411,"kind":"timing","order":2,"sample":6,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"correctness_passed":true,"kind":"complete","production_adoption":false}

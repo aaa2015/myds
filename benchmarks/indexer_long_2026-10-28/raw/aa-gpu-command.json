@@ -1,0 +1,15 @@
+[
+  "/private/tmp/myds-indexer-long-20261028-aa-identity/build/bench_indexer_register_only",
+  "--native-metallib",
+  "/private/tmp/myds-indexer-long-20261028-aa-identity/build/native.metallib",
+  "--probe-metallib",
+  "/private/tmp/myds-indexer-long-20261028-aa-identity/build/probe.metallib",
+  "--deployed-metallib",
+  "/Users/fangqingyuan/Projects/myds/bin/myds.metallib",
+  "--build-identity",
+  "/private/tmp/myds-indexer-long-20261028-aa-identity/build/source-identity.json",
+  "--harness-source",
+  "/private/tmp/myds-indexer-long-20261028-aa-identity/fixture.m",
+  "--out-dir",
+  "/private/tmp/myds-indexer-long-20261028-aa-identity/gpu"
+]

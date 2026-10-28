@@ -5,6 +5,14 @@
 > 1,548 个输入完整 token ID 对照、118 个 HF 独立参考用例通过。
 > 这是分词组件收益，未测新的 GPU 或端到端吞吐，未替换生产服务。
 
+> **2026-10-28 后续候选筛查（§108）**：register-only 简单扩大到 128K，在 M4
+> 合成输入与生产 Top512 的有序 ID 对照中失败；采样器在两份历史 logits 上的
+> CPU 成本低于本轮 2% 预筛参考。两条均未接入生产，也未宣称实际推理提速。
+
+> **2026-10-28 新候选（§109）**：exact indexer 直接读取 Q 的变体在 M4
+> 组件计时中未获收益；请求渲染合并连续普通字节后，macstudio 合成工具结果解析
+> 获得毫秒级组件收益，完整输出及失败契约通过对照。未测全模型或 HTTP TTFT。
+
 > **2026-10-26 更正：600K「静默挂起」不成立。** 同口径复测 600,281 token（6 个 macroblock），
 > 完整跑完 **2465.9 s = 243.4 t/s**，峰值 wired **184.9 GB**，decode 24.8 t/s，正常 `finish_reason: length`。
 > §41.3 的「死锁」判定用的是「CPU 不干活 + 内存不涨 + 日志不动」三条，**这三条在 GPU-bound 的 prefill 里
@@ -14555,3 +14563,88 @@ prefill/decode 或 HTTP TTFT 数字。生产进程保持 PID 13659，制品 SHA 
 register-only 的全局位置 32K 以外覆盖仍需新资格验证。本轮没有改变其 host/shader
 准入。该内核的分数位级 oracle 为 TILED，既有 exact 桥接允许 score 差异，不能直接
 把旧 fixture 的冻结范围改大后宣称已过原全模型门。
+
+---
+
+## §108 长范围 indexer 与采样器的低成本筛查（2026-10-28）
+
+**结论：两条候选均未采纳，生产推理实现没有改动。** 本轮从 `f829591` 出发，
+生产 `myds` / metallib / config SHA 分别为 `a97976e0…` / `fe557933…` / `735e0dc7…`。
+本节的组件检查不是全模型或服务部署验收。
+
+### 长范围 register-only：当前实现未通过数值门
+
+候选仅在隔离构建中把 register-only 的 `n_comp` 上限从 16,384 扩到 65,536、
+绝对结束位置从 32,768 扩到 131,072，原有生产 shader 和 host 接入保持不变。
+8 组 ratio=2 合成输入覆盖这两个边界及奇偶、padding、尾块。M4 上完成 48 次
+评分器 GPU command buffer：扩范围候选与 TILED 的完整 score 位模式一致，但
+部署配置未启用 TILED，源码在相关范围首选 actual exact；本轮未捕获生产实次 provider。
+
+把 actual exact 和候选的完整 scores 分别交给生产 `myds_v41_gpu_topk_causal`
+后，8 组中 5 组的 **有序 Top512 ID** 存在差异，共 14 个位置；同一 exact score
+执行两次的 A/A 对照 8 组均无差异。prefix merge、NaN fuse 编码计数、完成状态、
+guard 和因果范围检查均通过。该结果触发预设数值门，停止 runtime 接入和性能试验。
+
+**边界**：这是 M4 上合成输入的有序 ID 对照，不证明 Top512 成员集合或真实模型
+最终 logits 已发生变化，也不证明 M2 的结果；本轮未进行 macstudio GPU 实验。
+原始 tensor/ID 仅保存哈希，不能仅凭归档独立重算差异；复现需要运行 fixture。
+程序、身份、原始事件和各轮差异见
+[`benchmarks/indexer_long_2026-10-28/README.md`](../benchmarks/indexer_long_2026-10-28/README.md)。
+
+### 实际采样参数下的 CPU 成本筛查
+
+用历史两份 129,280 维最终 logits，在 macstudio CPU 上运行实际 V4.1 采样入口，
+采用 `temperature=1, top_p=1, top_k=0, min_p=0`、预分配工作区，每条输入预热
+32 次并测 201 次。两轮的中位数分别为 business96 **337/341 µs**、code38404
+**356/355 µs**。以历史约 23.6 ms/token 为粗略分母，即使完全消除全部采样
+成本也只有约 1.4–1.5%；这不是同口径的端到端上界，仅用于决定不继续实现。
+输入仅两个历史最终状态，不能外推到全部随机生成和请求分布。两轮数据与复现
+方法见 [`benchmarks/sampler_screen_2026-10-28/README.md`](../benchmarks/sampler_screen_2026-10-28/README.md)。
+
+### 服务窗口与配置限制
+
+当前 macstudio 生产进程 `nice=5`，原有独占窗口脚本只接受 `nice=0`，且恢复时
+没有恢复当前生产 stdin/stdout/stderr 的文件句柄语义；因此不能直接用于本轮
+真实模型独占测试。没有停止或重启服务。本轮还核实生产上下文与
+`MYDS_CHUNK_KEY_MAX` 为 1,048,576；简单降到 524,288 会损失现有长上下文能力，
+且 §105.7 的历史吞吐差异并未归因到该配置，不应据此修改生产。
+
+---
+
+## §109 Exact indexer 与请求渲染（2026-10-28）
+
+### Exact indexer 直接读取 Q：组件筛查未获收益
+
+在隔离构建中，将 actual exact scorer 每个 head 的 Q/weights threadgroup 暂存
+改为各 SIMD group 直接从 device 读取，移除两道 TG 屏障；浮点 dot、simd_sum、
+scale、ReLU、权重和 head 累加顺序保留。该变体不同于 §92 的 TILED 屏障降级
+及 §108 的 MMA 扩范围方案；原生产 shader 和 runtime 未修改。
+
+M4 上三组 ratio=2 合成长范围形状完整 scores 与 deployed exact 逐位一致，实际
+Top512 的 exact A/A 和候选对照一致，后续独立 correctness-only 检查证实全部 score
+均被写入。按同 TU exact A1 / 候选 B / exact A2 测 7 轮、每个 CB 3 个无别名
+dispatch，控制漂移合格的两组中候选分别慢 **8.442% / 8.581%**；第三组控制漂移
+**1.188%** 超过参考 1% 门，不据此下精确回退结论。结果仅适用于 M4 合成组件，
+不能外推为 M2 或全模型表现；本候选停止接入。各轮与可复现方法见
+[`benchmarks/indexer_exact_direct_q_2026-10-28/README.md`](../benchmarks/indexer_exact_direct_q_2026-10-28/README.md)。
+
+### 请求渲染：按连续普通字节追加
+
+`src/myds_server.c` 的工具结果渲染此前逐字节调用 append；候选将无须转义的
+连续字节合并追加。`</tool_result>`、多层
+`&amp;…lt;/tool_result>` 与 UTF-8 的行为保持；缓冲空间不足时仍
+按原逻辑写入可容纳前缀、标记 overflow 并及时停止扫描。protected-page 测试
+验证小输出空间不会导致扫描整个无终止符长输入。
+
+macstudio M2 Ultra 的 CPU-only `parse_chat_prompt_ex` A/B 使用相同构建参数、
+每臂 9 个交错样本，包含解析 JSON，不加载模型或初始化 GPU。两份项目源码作为
+工具返回时，完整请求体分别 241,622 / 484,116 字节，解析中位耗时从
+**2.293→1.281 ms / 4.247→2.187 ms**；普通 user 消息作为对照基本不变。
+两臂在 70 个合成/项目文本、随机及非法 JSON/UTF-8 用例中对比完整输出缓冲、
+返回状态、错误原因与两侧 guard，均一致。同源码 A/A 最大中位差 0.25%。
+另测密集转义：schema 的连续段方案出现稳定回退，按预设门槛撤除；最终密集
+schema 耗时恢复持平、密集 tool 降低约 48%。
+这些是组件数据，不等于 HTTP TTFT 或 prefill/decode 的增益。
+
+复现、原始样本和边界见
+[`benchmarks/prompt_render_2026-10-28/README.md`](../benchmarks/prompt_render_2026-10-28/README.md)。

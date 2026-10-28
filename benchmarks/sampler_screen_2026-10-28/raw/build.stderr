@@ -1,0 +1,20 @@
+In file included from tools/bench_sampler_screen.c:8:
+tools/../src/myds_v41.c:4641:23: warning: variable 'acc_wall' set but not used [-Wunused-but-set-variable]
+ 4641 |         static double acc_wall = 0, acc_cpu = 0; static int n = 0;
+      |                       ^
+tools/../src/myds_v41.c:4641:37: warning: variable 'acc_cpu' set but not used [-Wunused-but-set-variable]
+ 4641 |         static double acc_wall = 0, acc_cpu = 0; static int n = 0;
+      |                                     ^
+tools/../src/myds_v41.c:4641:61: warning: variable 'n' set but not used [-Wunused-but-set-variable]
+ 4641 |         static double acc_wall = 0, acc_cpu = 0; static int n = 0;
+      |                                                             ^
+tools/../src/myds_v41.c:8532:13: warning: misleading indentation; statement is not part of the previous 'if' [-Wmisleading-indentation]
+ 8532 |             if (opt_prof_attn_split) {
+      |             ^
+tools/../src/myds_v41.c:8530:9: note: previous statement is here
+ 8530 |         if (opt_prof_split2)
+      |         ^
+tools/../src/myds_v41.c:8539:30: warning: unused variable 'g1' [-Wunused-variable]
+ 8539 |                 const double g1 = myds_v41_gpu_attn_sub_get(1, &c1);
+      |                              ^~
+5 warnings generated.

@@ -1,0 +1,84 @@
+{
+  "artifacts": {
+    "build/bench_indexer_register_only": {
+      "rebuilt_sha256": "837d4648e13de3915d1e45dab34586c10b58d60f35b20d8e27dc504687c6bc55",
+      "tested_sha256": "837d4648e13de3915d1e45dab34586c10b58d60f35b20d8e27dc504687c6bc55"
+    },
+    "build/native.metallib": {
+      "rebuilt_sha256": "db7f9b071feb102a47d17051c2f5b6ec7de0cf3e18df46e5beaa912f8cb334f0",
+      "tested_sha256": "db7f9b071feb102a47d17051c2f5b6ec7de0cf3e18df46e5beaa912f8cb334f0"
+    },
+    "build/probe.metallib": {
+      "rebuilt_sha256": "ca65e99eb422851cfca547a5494433f7bc9bf363216f65425fbc3feabbf68332",
+      "tested_sha256": "ca65e99eb422851cfca547a5494433f7bc9bf363216f65425fbc3feabbf68332"
+    }
+  },
+  "note": "After failed GPU gate, build-only rerun, no GPU work. Fixture and artifacts exactly match tested run. Runtime source hashes from rebuild, same rebuilt binary SHA.",
+  "rebuilt_derivation": {
+    "baseline_shader_sha256": "a62922c6f5937236bd0e354dd06943b39bfa5f788419c16a8700da793769d616",
+    "builder_sha256": "91a8a0af17a65ee74bd13bd7d95f86312808ff50b84ecdab4039f3ac771c3771",
+    "candidate_sha256": "824f83a16d7cbe4352e5cc88446a7a5ecdbf472543d621d3713e4c3c905e05e7",
+    "changes": [
+      "shader n_comp upper bound 16384 -> 65536",
+      "shader end upper bound 32768 -> 131072",
+      "fixture long cases/scope and SHA-only buffer evidence",
+      "actual runtime Top512 GPU comparison",
+      "builder scope metadata and fixture link inputs"
+    ],
+    "fixture_sha256": "113ea561b7a0bc59a7303ef4f70cd55015a5120cfed28a37ad37322a9a0d7b95",
+    "production_adoption": false,
+    "runtime_connected": false,
+    "runtime_input_sha256": {
+      "include/myds.h": "dd51a48e7f02eeb549f7de7fec6ce25e234207bc62c195b0e12cbd65160a526a",
+      "include/myds_align.h": "27db712ed10840fa27a2703dcd14c390f31cd0f666abb51db04e6f21d2a62476",
+      "include/myds_configfile.h": "a1a303cb7350e99cbf3bf8efad12c0aca367b77ebdce8d7b2c268456440b3ae9",
+      "include/myds_cpu.h": "31d872795cc2ef1713f1a51e43d16c02cd3889b03ee8cc4ab440dc41e87fe7d0",
+      "include/myds_dspark.h": "4e39abe8cbb8744a0f38a0975e6ce993c3f5f3f6945dfcc76029fd14a44d460f",
+      "include/myds_engram.h": "13ad8b71d888a5606d10113b19c846bd65f7b36194f5de5c2c56e91c3ca7c08e",
+      "include/myds_gguf.h": "3c94ccf8ff4748e1afd190178732aa2769a535594723a6d3fdf5c0672ffa412b",
+      "include/myds_internal.h": "62401c128c64f83b6f6e1d620e1beb61c1e362523c2b57b009a720ee9ba57ecb",
+      "include/myds_kvdsk.h": "6985fc333a44edb7a1b742cc4e0563ecea702d37af9ed0f6c66359aaf6f80064",
+      "include/myds_log.h": "96da7e04b593b5a17ac4dfa6ba0fc694fb11928a167e3f7690e74228a71faa9e",
+      "include/myds_lowkv_policy.h": "def5dc1dec946fc06af0fa04338be57f42baad28e2ee65567d73f3682e282a6c",
+      "include/myds_metal.h": "293866f9e2d9e8e19bd5778efc6fafe936c7059c4facf67fab3782e780aa97f7",
+      "include/myds_moe_cpu.h": "b4087827a191de2e4ae03d3a9682e58e1f5d92b941c2cbbebaf0c1f1a9dfddc4",
+      "include/myds_pld.h": "d5900389894ee34ab3189bd08a2eb38f284c0b6dae4060600fed71c73c4353b5",
+      "include/myds_server.h": "2e5fa57fead8a0c92258683da2ae983e935425f1aee491492d4e29ff183cec40",
+      "include/myds_server_internal.h": "a2dea31de54f3317eda21abac6d14643c6ef36a58f47b1859c05b372af1e5c52",
+      "include/myds_snapshot_slots.h": "c4032f47df64a4979d5a6f194aeaecd57ce8d607f1df47bfd5fbff5f68f918bd",
+      "include/myds_tokenizer.h": "292cc9c3ce212cdeb08d9beb4f92a84660b248e8c677c04790b93229e26b451c",
+      "include/myds_v41.h": "abdbe3553653902ccfc135d3dbd351cf22c07d72392516b7d312064edf6b9b79",
+      "include/myds_v41_decode.h": "616fffa71022b9342db70d3df54ffab93037c35e58a3441c42e577873e217348",
+      "include/myds_v41_gpu.h": "77c006345d211487b44ca73c5f0f274e3291035893ac780649ec4e5a18681691",
+      "include/myds_v41_moe.h": "7184adfa9cefe0c8ea3c810f6e023e766a8c108237f296955260be486757583b",
+      "include/myds_visfwd.h": "e188c8e488591be257ec1170331b78f01b6db4132ded5a7938ef1c564d998d13",
+      "include/myds_vispre.h": "addb28dd5286289001717abe81b7995fa6599f5a69e65dd558019c12ce7711be",
+      "include/myds_visw.h": "d8425832a8d1425c7e0cfa13fc9c2ecca2e94e8fbc46e881ec03791617b0affa",
+      "include/myds_vjob.h": "7710ea311702951206f183d762d12b89b867cf72b21ffcd98420565818b449b3",
+      "src/myds_decode_candidates.inc": "a11bc77045a1e01447e2c2fa67f0c5e743929b7f7db899f380e8322d7db6a286",
+      "src/myds_gguf.c": "302c75d3aed17c4c0487fe612657fd00487ba64731309756037fcc49bb9caadf",
+      "src/myds_log.c": "f6eff9e828fc882e3d5f0ed7ccd033c0bcd91fefb345fe8634ef8512179082b5",
+      "src/myds_metal.m": "9405ce8100262330dd4af15e8d15c152c85fb72809adc54143068b83cdbb058c",
+      "src/myds_v41_gpu.c": "ca30228eddbafb4dbce35175d276c42ff803f51543d131d3ed7471e90ffb01e7"
+    },
+    "source_fixture_sha256": "c16e661bb244a986a9896014d30472573d5857b8a9eb10cb6f9d6eba0041cc9f",
+    "topk_helper_sha256": "9ec1c9d5410b4547a275fa1756a6722d7acc74813acd2031802acd358d32a667"
+  },
+  "tested_derivation": {
+    "baseline_shader_sha256": "a62922c6f5937236bd0e354dd06943b39bfa5f788419c16a8700da793769d616",
+    "builder_sha256": "91a8a0af17a65ee74bd13bd7d95f86312808ff50b84ecdab4039f3ac771c3771",
+    "candidate_sha256": "824f83a16d7cbe4352e5cc88446a7a5ecdbf472543d621d3713e4c3c905e05e7",
+    "changes": [
+      "shader n_comp upper bound 16384 -> 65536",
+      "shader end upper bound 32768 -> 131072",
+      "fixture long cases/scope and SHA-only buffer evidence",
+      "actual runtime Top512 GPU comparison",
+      "builder scope metadata and fixture link inputs"
+    ],
+    "fixture_sha256": "113ea561b7a0bc59a7303ef4f70cd55015a5120cfed28a37ad37322a9a0d7b95",
+    "production_adoption": false,
+    "runtime_connected": false,
+    "source_fixture_sha256": "c16e661bb244a986a9896014d30472573d5857b8a9eb10cb6f9d6eba0041cc9f",
+    "topk_helper_sha256": "9ec1c9d5410b4547a275fa1756a6722d7acc74813acd2031802acd358d32a667"
+  }
+}

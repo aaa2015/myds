@@ -81,6 +81,7 @@ TEST_TOKENIZER_WORKSPACE = $(BIN_DIR)/test_tokenizer_workspace
 TEST_SERVER = $(BIN_DIR)/test_server
 TEST_LOG = $(BIN_DIR)/test_log
 TEST_SERVER_API = $(BIN_DIR)/test_server_api
+TEST_PROMPT_RENDER_BOUNDS = $(BIN_DIR)/test_prompt_render_bounds
 TEST_ENGINE = $(BIN_DIR)/test_engine
 TEST_CPU = $(BIN_DIR)/test_cpu
 TEST_ENGRAM = $(BIN_DIR)/test_engram
@@ -140,6 +141,7 @@ $(TEST_GGUF_BYTE_SPLIT): tests/test_gguf_byte_split.c $(BUILD_DIR)/myds_gguf.o |
 
 ALL_TESTS += $(TEST_METAL_RESIDENCY) $(TEST_TEARDOWN_ORDER) $(TEST_DECODE_SPLIT) $(TEST_KVDSK_FIFO) $(TEST_ANCHOR_SLOTS) $(TEST_YOCO_COMPACT) $(TEST_INDEXER_WINDOW) $(TEST_GGUF_BOUNDS) $(TEST_GGUF_SPLIT) $(TEST_GGUF_BYTE_SPLIT)
 ALL_TESTS += $(TEST_TOKENIZER_WORKSPACE)
+ALL_TESTS += $(TEST_PROMPT_RENDER_BOUNDS)
 
 .PHONY: all test clean bench metallib build-tail-init test-tail-init test-indexer-register-only-host test-register-only-http-bridge test-register-only-service-window audit-ledger gen-ledger bench-register-only corpus-check verify-register-only
 
@@ -557,6 +559,10 @@ $(TEST_LOG): $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_log.o | $(BIN_DIR)
 $(TEST_SERVER_API): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_vjob.o $(BUILD_DIR)/myds_vispre.o $(BUILD_DIR)/myds_visw.o $(BUILD_DIR)/myds_visfwd.o $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_engram_cpu.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_server_api.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
 
+# CPU-only failure-path gate; includes server.c to exercise its private renderers.
+$(TEST_PROMPT_RENDER_BOUNDS): tests/test_prompt_render_bounds.c src/myds_server.c $(wildcard include/*.h) $(BUILD_DIR)/myds_log.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) $< $(BUILD_DIR)/myds_log.o $(LDFLAGS) -Wl,-dead_strip -o $@
+
 $(TEST_ENGINE): $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_engram_cpu.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_engine.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
 
@@ -727,6 +733,7 @@ test: $(ALL_TESTS) $(METALLIB)
 	@./$(TEST_LOG)
 	@echo ""
 	@./$(TEST_SERVER_API)
+	@./$(TEST_PROMPT_RENDER_BOUNDS)
 	@echo ""
 	@./$(TEST_ENGINE)
 	@echo ""

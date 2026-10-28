@@ -385,6 +385,68 @@ static void generate_responses_api_json(const char *model_alias, const char *gen
              10 + token_count);
 }
 
+/* The caller must receive a complete prompt or an empty result, and no write
+ * may escape the supplied capacity. Exercise every capacity, including zero. */
+static void assert_prompt_capacities(const char *body, const char *expected) {
+    const size_t length = strlen(expected);
+    unsigned char *storage = malloc(length + 3u);
+    assert(storage);
+    for (size_t cap = 0; cap <= length + 1u; ++cap) {
+        memset(storage, 0xa5, length + 3u);
+        char *out = (char *)storage + 1;
+        const char *reason = NULL;
+        bool ok = parse_chat_prompt_ex(body, out, cap, &reason);
+        assert(storage[0] == 0xa5 && storage[cap + 1u] == 0xa5);
+        if (cap <= length) {
+            assert(!ok && reason);
+            if (cap) assert(out[0] == 0);
+        } else {
+            assert(ok && strcmp(out, expected) == 0);
+        }
+    }
+    free(storage);
+}
+
+static void test_prompt_long_escape_runs(void) {
+    enum { RUN = 4096, CAP = 16384 };
+    char *body = malloc(CAP), *expected = malloc(CAP), *actual = malloc(CAP);
+    assert(body && expected && actual);
+    const char *tool_head = "{\"input\":[{\"type\":\"function_call_output\",\"output\":\"";
+    const char *tool_tail = "</tool_result>&lt;/tool_result>&amp;lt;/tool_result>"
+                            "&amp;amp;lt;/tool_result><not_tool>&foo中🙂";
+    const char *escaped_tail = "&lt;/tool_result>&amp;lt;/tool_result>&amp;amp;lt;/tool_result>"
+                               "&amp;amp;amp;lt;/tool_result><not_tool>&foo中🙂";
+    size_t n = (size_t)snprintf(body, CAP, "%s", tool_head);
+    memset(body + n, 'a', RUN); n += RUN;
+    assert(snprintf(body + n, CAP - n, "%s\"}]}", tool_tail) > 0);
+    n = (size_t)snprintf(expected, CAP, "<｜begin▁of▁sentence｜><｜User｜><tool_result>");
+    memset(expected + n, 'a', RUN); n += RUN;
+    assert(snprintf(expected + n, CAP - n, "%s</tool_result><｜Assistant｜></think>", escaped_tail) > 0);
+    assert(parse_chat_prompt(body, actual, CAP) && strcmp(actual, expected) == 0);
+    assert_prompt_capacities(body, expected);
+
+    /* A schema description traverses the JSON serializer, including ordinary
+     * runs, every short control escape, generic control, quotes, slash and UTF-8. */
+    const char *schema_head = "{\"input\":\"ok\",\"tools\":[{\"type\":\"function\",\"function\":{"
+                              "\"name\":\"inspect\",\"description\":\"";
+    const char *schema_tail = "\\n\\r\\t\\b\\f\\u0001\\\"\\\\中🙂\",\"parameters\":{\"type\":\"object\"}}}]}";
+    n = (size_t)snprintf(body, CAP, "%s", schema_head);
+    memset(body + n, 'z', RUN); n += RUN;
+    assert(snprintf(body + n, CAP - n, "%s", schema_tail) > 0);
+    assert(parse_chat_prompt(body, actual, CAP));
+    const char *needle_head = "\"description\": \"";
+    n = (size_t)snprintf(expected, CAP, "%s", needle_head);
+    memset(expected + n, 'z', RUN); n += RUN;
+    assert(snprintf(expected + n, CAP - n, "\\n\\r\\t\\b\\f\\u0001\\\"\\\\中🙂\"") > 0);
+    assert(strstr(actual, expected));
+    /* Reuse a successful full output as the boundary oracle after checking the
+     * independently specified serialized schema fragment above. */
+    memcpy(expected, actual, strlen(actual) + 1u);
+    assert_prompt_capacities(body, expected);
+    free(actual); free(expected); free(body);
+    printf("  [PASS] Long tool and schema runs, layered escapes, and all prompt capacities\n");
+}
+
 static void test_deepseek41_chat_templates(void) {
     const struct { const char *body; const char *expected; } cases[] = {
         {"{\"input\":\"Hello\"}", "<｜begin▁of▁sentence｜><｜User｜>Hello<｜Assistant｜></think>"},
@@ -1278,6 +1340,7 @@ int main(int argc, char **argv) {
         free(output); return ok ? 0 : 1;
     }
     test_deepseek41_chat_templates();
+    test_prompt_long_escape_runs();
     test_deepseek41_tool_calls();
     test_deepseek41_dsml_parse();
     test_deepseek41_stream_tool_calls();
