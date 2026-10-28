@@ -1,0 +1,104 @@
+["xcrun", "-sdk", "macosx", "metal", "-mmacosx-version-min=15.0", "-O3", "-ffast-math", "-DDS4_METAL_HC_STABLE=1", "-DDS4_METAL_NORM_RSQRT_DISABLE=1", "-c", "/private/tmp/myds-maskskip-runtime-v2-20261028/all.metal", "-o", "/private/tmp/myds-maskskip-runtime-v2-20261028/probe.air"]
+flash_attn.metal:2098:21: warning: unused variable 'SH' [-Wunused-variable]
+    constexpr short SH = 128;
+                    ^
+flash_attn.metal:2398:21: warning: unused variable 'SH' [-Wunused-variable]
+    constexpr short SH = 128;
+                    ^
+moe.metal:12012:9: warning: 'SUMF_ADD' macro redefined [-Wmacro-redefined]
+#define SUMF_ADD(r, v) do { \
+        ^
+moe.metal:11882:9: note: previous definition is here
+#define SUMF_ADD(r, v) do { sumf[r] += (v); } while (0)
+        ^
+moe.metal:12024:9: warning: 'SUMF_ACC' macro redefined [-Wmacro-redefined]
+#define SUMF_ACC(r) (sumf_hi[r] + sumf_lo[r])
+        ^
+moe.metal:11883:9: note: previous definition is here
+#define SUMF_ACC(r) sumf[r]
+        ^
+dsv4_hc.metal:1569:36: warning: 'mem_device_and_threadgroup' is deprecated: use mem_device or mem_threadgroup instead [-Wdeprecated-declarations]
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+                                   ^
+/private/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v27.1.266.1.soIMWc/Metal.xctoolchain/usr/metal/32023/lib/clang/32023/include/metal/metal_compute:27:30: note: 'mem_device_and_threadgroup' has been explicitly marked deprecated here
+  mem_device_and_threadgroup METAL_DEPRECATED("use mem_device or mem_threadgroup instead") = mem_device | mem_threadgroup
+                             ^
+/private/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v27.1.266.1.soIMWc/Metal.xctoolchain/usr/metal/32023/lib/clang/32023/include/metal/metal_types:17:47: note: expanded from macro 'METAL_DEPRECATED'
+#define METAL_DEPRECATED(M...) __attribute__((deprecated(M)))
+                                              ^
+dsv4_hc.metal:1748:36: warning: 'mem_device_and_threadgroup' is deprecated: use mem_device or mem_threadgroup instead [-Wdeprecated-declarations]
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+                                   ^
+/private/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v27.1.266.1.soIMWc/Metal.xctoolchain/usr/metal/32023/lib/clang/32023/include/metal/metal_compute:27:30: note: 'mem_device_and_threadgroup' has been explicitly marked deprecated here
+  mem_device_and_threadgroup METAL_DEPRECATED("use mem_device or mem_threadgroup instead") = mem_device | mem_threadgroup
+                             ^
+/private/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v27.1.266.1.soIMWc/Metal.xctoolchain/usr/metal/32023/lib/clang/32023/include/metal/metal_types:17:47: note: expanded from macro 'METAL_DEPRECATED'
+#define METAL_DEPRECATED(M...) __attribute__((deprecated(M)))
+                                              ^
+dsv4_hc.metal:1760:36: warning: 'mem_device_and_threadgroup' is deprecated: use mem_device or mem_threadgroup instead [-Wdeprecated-declarations]
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+                                   ^
+/private/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v27.1.266.1.soIMWc/Metal.xctoolchain/usr/metal/32023/lib/clang/32023/include/metal/metal_compute:27:30: note: 'mem_device_and_threadgroup' has been explicitly marked deprecated here
+  mem_device_and_threadgroup METAL_DEPRECATED("use mem_device or mem_threadgroup instead") = mem_device | mem_threadgroup
+                             ^
+/private/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v27.1.266.1.soIMWc/Metal.xctoolchain/usr/metal/32023/lib/clang/32023/include/metal/metal_types:17:47: note: expanded from macro 'METAL_DEPRECATED'
+#define METAL_DEPRECATED(M...) __attribute__((deprecated(M)))
+                                              ^
+dsv4_rope.metal:531:36: warning: 'mem_device_and_threadgroup' is deprecated: use mem_device or mem_threadgroup instead [-Wdeprecated-declarations]
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+                                   ^
+/private/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v27.1.266.1.soIMWc/Metal.xctoolchain/usr/metal/32023/lib/clang/32023/include/metal/metal_compute:27:30: note: 'mem_device_and_threadgroup' has been explicitly marked deprecated here
+  mem_device_and_threadgroup METAL_DEPRECATED("use mem_device or mem_threadgroup instead") = mem_device | mem_threadgroup
+                             ^
+/private/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v27.1.266.1.soIMWc/Metal.xctoolchain/usr/metal/32023/lib/clang/32023/include/metal/metal_types:17:47: note: expanded from macro 'METAL_DEPRECATED'
+#define METAL_DEPRECATED(M...) __attribute__((deprecated(M)))
+                                              ^
+norm.metal:350:36: warning: 'mem_device_and_threadgroup' is deprecated: use mem_device or mem_threadgroup instead [-Wdeprecated-declarations]
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+                                   ^
+/private/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v27.1.266.1.soIMWc/Metal.xctoolchain/usr/metal/32023/lib/clang/32023/include/metal/metal_compute:27:30: note: 'mem_device_and_threadgroup' has been explicitly marked deprecated here
+  mem_device_and_threadgroup METAL_DEPRECATED("use mem_device or mem_threadgroup instead") = mem_device | mem_threadgroup
+                             ^
+/private/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v27.1.266.1.soIMWc/Metal.xctoolchain/usr/metal/32023/lib/clang/32023/include/metal/metal_types:17:47: note: expanded from macro 'METAL_DEPRECATED'
+#define METAL_DEPRECATED(M...) __attribute__((deprecated(M)))
+                                              ^
+norm.metal:365:36: warning: 'mem_device_and_threadgroup' is deprecated: use mem_device or mem_threadgroup instead [-Wdeprecated-declarations]
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+                                   ^
+/private/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v27.1.266.1.soIMWc/Metal.xctoolchain/usr/metal/32023/lib/clang/32023/include/metal/metal_compute:27:30: note: 'mem_device_and_threadgroup' has been explicitly marked deprecated here
+  mem_device_and_threadgroup METAL_DEPRECATED("use mem_device or mem_threadgroup instead") = mem_device | mem_threadgroup
+                             ^
+/private/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v27.1.266.1.soIMWc/Metal.xctoolchain/usr/metal/32023/lib/clang/32023/include/metal/metal_types:17:47: note: expanded from macro 'METAL_DEPRECATED'
+#define METAL_DEPRECATED(M...) __attribute__((deprecated(M)))
+                                              ^
+moe.metal:633:21: warning: unused function 'ds4_glm_q2_K_value' [-Wunused-function]
+static inline float ds4_glm_q2_K_value(device const block_q2_K *blocks, uint k) {
+                    ^
+moe.metal:667:21: warning: unused function 'ds4_glm_q5_K_value' [-Wunused-function]
+static inline float ds4_glm_q5_K_value(device const block_q5_K *blocks, uint k) {
+                    ^
+moe.metal:682:21: warning: unused function 'ds4_glm_q6_K_value' [-Wunused-function]
+static inline float ds4_glm_q6_K_value(device const block_q6_K *blocks, uint k) {
+                    ^
+dsv4_misc.metal:5841:20: warning: unused function 'dsv4_attend_f32_row_as_f16' [-Wunused-function]
+static inline void dsv4_attend_f32_row_as_f16(
+                   ^
+dsv4_misc.metal:5930:20: warning: unused function 'dsv4_attend_shared_f32_row_as_f16_at' [-Wunused-function]
+static inline void dsv4_attend_shared_f32_row_as_f16_at(
+                   ^
+dsv4_misc.metal:6586:21: warning: unused function 'dsv4_indexer_dot128_shared_q' [-Wunused-function]
+static inline float dsv4_indexer_dot128_shared_q(
+                    ^
+sum_rows.metal:31:21: warning: unused function 'sum' [-Wunused-function]
+static inline float sum(float4 x) {
+                    ^
+17 warnings generated.
+["xcrun", "-sdk", "macosx", "metallib", "/private/tmp/myds-maskskip-runtime-v2-20261028/probe.air", "-o", "/private/tmp/myds-maskskip-runtime-v2-20261028/probe.metallib"]
+["xcrun", "clang", "-O3", "-Wall", "-Wextra", "-mmacosx-version-min=26.0", "-I/Users/fangqingyuan/Projects/myds/include", "-I/Users/fangqingyuan/Projects/myds/third_party", "-I/Users/fangqingyuan/Projects/myds/tools", "-fobjc-arc", "-Wno-deprecated-declarations", "-Werror", "-c", "/Users/fangqingyuan/Projects/myds/tools/bench_indexer_mask_skip.m", "-o", "/private/tmp/myds-maskskip-runtime-v2-20261028/bench_indexer_mask_skip.o"]
+/Users/fangqingyuan/Projects/myds/tools/bench_indexer_mask_skip.m:43:68: error: use of undeclared identifier 'ids'
+   43 |     myds_metal_buffer_free(scores);myds_metal_buffer_free(mask);if(ids)myds_metal_buffer_free(ids);return result;
+      |                                                                    ^~~
+/Users/fangqingyuan/Projects/myds/tools/bench_indexer_mask_skip.m:43:95: error: use of undeclared identifier 'ids'
+   43 |     myds_metal_buffer_free(scores);myds_metal_buffer_free(mask);if(ids)myds_metal_buffer_free(ids);return result;
+      |                                                                                               ^~~
+2 errors generated.

@@ -1,0 +1,20 @@
+{
+  "purpose": "exploratory 96K warm append end-to-end screen",
+  "arms": [
+    "A1 off",
+    "B on",
+    "A2 off"
+  ],
+  "samples_per_arm": 1,
+  "threshold_percent": 1.0,
+  "control_drift_percent_max": 1.0,
+  "metrics": [
+    "warm generation wall",
+    "warm prefill wall",
+    "first callback"
+  ],
+  "comparison": "compare B to faster of A1/A2; report each arm; require matching outputs and cache geometry",
+  "exclusivity": "unproven; GPU idle sampled before test",
+  "stop": "no retries or sample replacement; stop if nonpositive or drift above gate",
+  "qualification": "not production or formal acceptance"
+}

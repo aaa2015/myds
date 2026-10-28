@@ -1,0 +1,71 @@
+{
+  "AA_drift_pct": -0.8579780985613294,
+  "AA_pass": true,
+  "ABA_drift_pct": -0.12799446361539957,
+  "conservative_saved_pct": -5.724464701340848,
+  "correctness": "four scenarios passed full score bytes and ordered production Top512 on M4",
+  "device": "Apple M4",
+  "files": {
+    "correctness-candidate.metal": {
+      "bytes": 5883,
+      "sha256": "212eb52eb18b62970820fe7ae7774adbea15cbe874cb4c6de3643add11585a54"
+    },
+    "correctness-compile.log": {
+      "bytes": 11726,
+      "sha256": "5569d87809a3e7c2afe242c89bf7f630f7d14a7bb04d991bede5b8b310011402"
+    },
+    "correctness-gpu.stderr": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "correctness-identity.json": {
+      "bytes": 15047,
+      "sha256": "fdf2f6d3617170a3a8bdc4b294e78fef8944981fe76ab3fe922c3c918f8c9457"
+    },
+    "correctness-results.jsonl": {
+      "bytes": 5974,
+      "sha256": "97ad41a2902ee79d5728dfaf8156c3565200de6c83ba7fba408d2ed521cfe4c4"
+    },
+    "screen-candidate.metal": {
+      "bytes": 5883,
+      "sha256": "212eb52eb18b62970820fe7ae7774adbea15cbe874cb4c6de3643add11585a54"
+    },
+    "screen-compile.log": {
+      "bytes": 11641,
+      "sha256": "420844b1a2a8f111bd01fab06c00763d9ba98a6591784441e15da84119deb086"
+    },
+    "screen-gpu.stderr": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "screen-identity.json": {
+      "bytes": 14962,
+      "sha256": "c98c774d344fe4eeb06e33b2ed1c5a4c3b313d361f90f3e8985f0186d3f09d8b"
+    },
+    "screen-results.jsonl": {
+      "bytes": 10717,
+      "sha256": "cf9cb417a77d3896540800c274f1b71480db386ac1148f95ae36bdfe08d48f56"
+    }
+  },
+  "frozen_gate": {
+    "max_abs_drift_pct_inclusive": 2,
+    "min_saved_pct_inclusive": 15
+  },
+  "gate_pass": false,
+  "inputs": "synthetic F32 Q/W (BF16-like or full F32 with signed zeros), BF16 K, geometries from historical 96K ratio2 dispatch records",
+  "kind": "isolated_exact_indexer_twohead_screen",
+  "medians_seconds": {
+    "A1": 0.09359141672030091,
+    "A2": 0.09347162488847971,
+    "B": 0.09882237506099045
+  },
+  "outcome": "stop_no_production_or_remote_test",
+  "schema_version": 1,
+  "screen_case": {
+    "causal_start": 73080,
+    "keys": 36568,
+    "ratio": 2,
+    "tokens": 56
+  },
+  "time_scope": "three disjoint scorer dispatches per command buffer, isolated GPU timestamps; not production graph or full-model"
+}

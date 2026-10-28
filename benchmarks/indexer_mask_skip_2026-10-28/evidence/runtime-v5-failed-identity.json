@@ -1,0 +1,427 @@
+{
+  "baseline_exact_shader_sha256": "c223a67e3477e96e299cbb0edc032da002a60e4f293dcfb4a605724240103144",
+  "candidate_sha256": "a07744941bdbb1ced96dc7a52360a769de65b35fb0c0aaf93ed6059831e51cb1",
+  "runtime_candidate_sha256": "e02a1354dfa7dab20de3a0cd276b6937f1065c2a110dd859d50eadc3a065ccb8",
+  "runtime_probe_shader_exact": true,
+  "native_prefix_sha256": "261853f9a4d13a7065e487e3032917fa767d8737c4e7e69c74e1b2c9327f09ba",
+  "combined_sha256": "650249c7bba57b969d96a87ef2438c8aa2e083abc74115d9ef458e2fef693096",
+  "reverse_exact": true,
+  "production_runtime_connected": false,
+  "shader_files": [
+    {
+      "index": 0,
+      "path": "metal/flash_attn.metal",
+      "bytes": 115672,
+      "sha256": "503fc1ec7fb94130f4e44c1a1147bf182d11c9993cc0688e8ed2f4993df7bdc6",
+      "source_begin": 775,
+      "source_end": 116447
+    },
+    {
+      "index": 1,
+      "path": "metal/myds_prefill_attention_multihead.metal",
+      "bytes": 9128,
+      "sha256": "8391b78f701b1f0d72dee554f0b78fc69f174aa188fa8814f6d10bf043e21444",
+      "source_begin": 116497,
+      "source_end": 125625
+    },
+    {
+      "index": 2,
+      "path": "metal/dense.metal",
+      "bytes": 136409,
+      "sha256": "efdc3e24cf13b6d8651f4dd4a728a453f2a4d1b2295cef41135516ea628bed55",
+      "source_begin": 125648,
+      "source_end": 262057
+    },
+    {
+      "index": 3,
+      "path": "metal/moe.metal",
+      "bytes": 536872,
+      "sha256": "78cb927e7884254832f3c37e97b1c4952c1a1863555616693f3b35fb787f5776",
+      "source_begin": 262078,
+      "source_end": 798950
+    },
+    {
+      "index": 4,
+      "path": "metal/myds_qkv_dual.metal",
+      "bytes": 2216,
+      "sha256": "45d69c1d0cdc7ab0bb30d8200cddaeeba7514729ec895c6185728bbfb979d6d6",
+      "source_begin": 798981,
+      "source_end": 801197
+    },
+    {
+      "index": 5,
+      "path": "metal/myds_iq2_v41.metal",
+      "bytes": 82944,
+      "sha256": "5b4998a1e34d3710ea7f49050e9241bde1e98cc5eecff98a6c54cf90b7820080",
+      "source_begin": 801227,
+      "source_end": 884171
+    },
+    {
+      "index": 6,
+      "path": "metal/myds_q4_v41.metal",
+      "bytes": 6362,
+      "sha256": "6487878f399cd24b3e3c357cc161a10944a558465f2d0eb680251418a4ab22d0",
+      "source_begin": 884200,
+      "source_end": 890562
+    },
+    {
+      "index": 7,
+      "path": "metal/dsv4_hc.metal",
+      "bytes": 70494,
+      "sha256": "7f5e44ce6108285740cca97a4c81e8c271d0631ed784f459baa63b3d01260bfc",
+      "source_begin": 890587,
+      "source_end": 961081
+    },
+    {
+      "index": 8,
+      "path": "metal/unary.metal",
+      "bytes": 10104,
+      "sha256": "4607dbea21501230a193f8a333b1bd543d566f405568a094d6faf2c17cb0c5cf",
+      "source_begin": 961104,
+      "source_end": 971208
+    },
+    {
+      "index": 9,
+      "path": "metal/dsv4_kv.metal",
+      "bytes": 23221,
+      "sha256": "87334bd001a306dcdf8e344f7f47938d67d6887889a3da7282cba0d25b36d172",
+      "source_begin": 971233,
+      "source_end": 994454
+    },
+    {
+      "index": 10,
+      "path": "metal/dsv41.metal",
+      "bytes": 26736,
+      "sha256": "7a15599dc6d329715c610b581b2babcce46580187707b8d87565e795b41ed1a2",
+      "source_begin": 994477,
+      "source_end": 1021213
+    },
+    {
+      "index": 11,
+      "path": "metal/myds_v41_moe.metal",
+      "bytes": 61328,
+      "sha256": "d731dfbe42b6ce94aabd70a5bc4472b4168b2913d4ce82c0d84982a2fd75c0e4",
+      "source_begin": 1021243,
+      "source_end": 1082571
+    },
+    {
+      "index": 12,
+      "path": "metal/dsv4_rope.metal",
+      "bytes": 35989,
+      "sha256": "a6e86dcf24d35a0014c92b7542c7c2ba8b3815c853f5d636da94cb1df1c05ccd",
+      "source_begin": 1082598,
+      "source_end": 1118587
+    },
+    {
+      "index": 13,
+      "path": "metal/dsv4_misc.metal",
+      "bytes": 333267,
+      "sha256": "b6df3c8f103d76c691f14ae71893382df7d537c0a40a2afa5d2bb06114f76599",
+      "source_begin": 1118614,
+      "source_end": 1451881
+    },
+    {
+      "index": 14,
+      "path": "metal/argsort.metal",
+      "bytes": 29598,
+      "sha256": "7bcdcb48366f71cb9adf6fdb27429b614eeab24821947a6710e2a65b3f88cc17",
+      "source_begin": 1451906,
+      "source_end": 1481504
+    },
+    {
+      "index": 15,
+      "path": "metal/topk_threshold.metal",
+      "bytes": 8600,
+      "sha256": "8fb93312ccf29f934668954a202244df60e5e7cfd62680c7c74137161a369fc0",
+      "source_begin": 1481536,
+      "source_end": 1490136
+    },
+    {
+      "index": 16,
+      "path": "metal/cpy.metal",
+      "bytes": 10154,
+      "sha256": "df8cabe88c33076c16a54cfb88a00133b68ea5cbfc1742ac79608c84d4456cd4",
+      "source_begin": 1490157,
+      "source_end": 1500311
+    },
+    {
+      "index": 17,
+      "path": "metal/concat.metal",
+      "bytes": 1932,
+      "sha256": "04fb0fc2a3b51015444e330290b979a56e4cac82aee523afa2b42e361ab23da7",
+      "source_begin": 1500335,
+      "source_end": 1502267
+    },
+    {
+      "index": 18,
+      "path": "metal/get_rows.metal",
+      "bytes": 6976,
+      "sha256": "bd3b352a6ffb138ae5e391db97b211f8386d417365eac2caa3730f55a075aa3a",
+      "source_begin": 1502293,
+      "source_end": 1509269
+    },
+    {
+      "index": 19,
+      "path": "metal/sum_rows.metal",
+      "bytes": 2737,
+      "sha256": "7e1f3ad3f945b1f6f59aa2d8ee5bf464052d989a632c33ea95ce50d3c4fbf0fc",
+      "source_begin": 1509295,
+      "source_end": 1512032
+    },
+    {
+      "index": 20,
+      "path": "metal/softmax.metal",
+      "bytes": 7679,
+      "sha256": "6eaa6ce78c4b221b3c7fe45647d6eb42f165201992a243d77d04cf2668fb7664",
+      "source_begin": 1512057,
+      "source_end": 1519736
+    },
+    {
+      "index": 21,
+      "path": "metal/repeat.metal",
+      "bytes": 1640,
+      "sha256": "2c6142b47a2007d246f5eb6e7395047627bb6dfa02c649311d16620da35007cd",
+      "source_begin": 1519760,
+      "source_end": 1521400
+    },
+    {
+      "index": 22,
+      "path": "metal/glu.metal",
+      "bytes": 3070,
+      "sha256": "6d226a91566d625b3a4b141ecadcb4d796bdc02de19211d891e215c530c812ca",
+      "source_begin": 1521421,
+      "source_end": 1524491
+    },
+    {
+      "index": 23,
+      "path": "metal/norm.metal",
+      "bytes": 15567,
+      "sha256": "fd89688ae3ac8a473f731da0051121239bff2c6767674d091832f1e5cfd698c8",
+      "source_begin": 1524513,
+      "source_end": 1540080
+    },
+    {
+      "index": 24,
+      "path": "metal/pureread.metal",
+      "bytes": 9244,
+      "sha256": "3b0e187104c924c85f180552d00b26894161a4766f6b34071bc655b452ac0992",
+      "source_begin": 1540106,
+      "source_end": 1549350
+    },
+    {
+      "index": 25,
+      "path": "metal/bin.metal",
+      "bytes": 7401,
+      "sha256": "66f7c42264b1cfb7b1e42380c94093f963dc1f0792f43e79b5588892f882d5b6",
+      "source_begin": 1549371,
+      "source_end": 1556772
+    },
+    {
+      "index": 26,
+      "path": "metal/set_rows.metal",
+      "bytes": 1909,
+      "sha256": "25f597bf5f5fb5a3791efc68e3182539727609f09c45750ef9376ed430d7a029",
+      "source_begin": 1556798,
+      "source_end": 1558707
+    },
+    {
+      "index": 27,
+      "path": "metal/myds_chunk.metal",
+      "bytes": 7394,
+      "sha256": "2cdfbd0c96b47cfa81c26ca6b2194874f42bd766b8c02efacd86f15d2808bda1",
+      "source_begin": 1558735,
+      "source_end": 1566129
+    },
+    {
+      "index": 28,
+      "path": "metal/visenc.metal",
+      "bytes": 12988,
+      "sha256": "dced00348fbf19e3d1d6c9e4bb39cd457114819bdd576468d3a1dbf22d807165",
+      "source_begin": 1566153,
+      "source_end": 1579141
+    }
+  ],
+  "inputs": {
+    "tools/bench_indexer_mask_skip.m": "c8d6038f79db7d4f7356bfb7fbfb783d74479bc7acf37c8e7be2dbacd78b3d72",
+    "tools/indexer_mask_skip_topk.inc": "bd677323a01c21a52d74fbfcd3d7d20cd52ae2108c263ac7d54d9b9fe92ea65b",
+    "src/myds_v41_gpu.c": "554498ce8773f669868598a532d96fe2413dca7b798dcc595bb48df5593fb4ae",
+    "src/myds_gguf.c": "302c75d3aed17c4c0487fe612657fd00487ba64731309756037fcc49bb9caadf",
+    "src/myds_log.c": "f6eff9e828fc882e3d5f0ed7ccd033c0bcd91fefb345fe8634ef8512179082b5",
+    "src/myds_configfile.c": "bee10fedbe188a30e5f6a746c770d271e4065a10b126c06aae6e0e83e984c161",
+    "src/myds_metal.m": "9405ce8100262330dd4af15e8d15c152c85fb72809adc54143068b83cdbb058c",
+    "include/myds.h": "dd51a48e7f02eeb549f7de7fec6ce25e234207bc62c195b0e12cbd65160a526a",
+    "include/myds_align.h": "27db712ed10840fa27a2703dcd14c390f31cd0f666abb51db04e6f21d2a62476",
+    "include/myds_configfile.h": "a1a303cb7350e99cbf3bf8efad12c0aca367b77ebdce8d7b2c268456440b3ae9",
+    "include/myds_cpu.h": "31d872795cc2ef1713f1a51e43d16c02cd3889b03ee8cc4ab440dc41e87fe7d0",
+    "include/myds_dspark.h": "4e39abe8cbb8744a0f38a0975e6ce993c3f5f3f6945dfcc76029fd14a44d460f",
+    "include/myds_engram.h": "13ad8b71d888a5606d10113b19c846bd65f7b36194f5de5c2c56e91c3ca7c08e",
+    "include/myds_gguf.h": "3c94ccf8ff4748e1afd190178732aa2769a535594723a6d3fdf5c0672ffa412b",
+    "include/myds_internal.h": "62401c128c64f83b6f6e1d620e1beb61c1e362523c2b57b009a720ee9ba57ecb",
+    "include/myds_kvdsk.h": "6985fc333a44edb7a1b742cc4e0563ecea702d37af9ed0f6c66359aaf6f80064",
+    "include/myds_log.h": "96da7e04b593b5a17ac4dfa6ba0fc694fb11928a167e3f7690e74228a71faa9e",
+    "include/myds_lowkv_policy.h": "def5dc1dec946fc06af0fa04338be57f42baad28e2ee65567d73f3682e282a6c",
+    "include/myds_metal.h": "293866f9e2d9e8e19bd5778efc6fafe936c7059c4facf67fab3782e780aa97f7",
+    "include/myds_moe_cpu.h": "b4087827a191de2e4ae03d3a9682e58e1f5d92b941c2cbbebaf0c1f1a9dfddc4",
+    "include/myds_pld.h": "d5900389894ee34ab3189bd08a2eb38f284c0b6dae4060600fed71c73c4353b5",
+    "include/myds_server.h": "2e5fa57fead8a0c92258683da2ae983e935425f1aee491492d4e29ff183cec40",
+    "include/myds_server_internal.h": "a2dea31de54f3317eda21abac6d14643c6ef36a58f47b1859c05b372af1e5c52",
+    "include/myds_snapshot_slots.h": "c4032f47df64a4979d5a6f194aeaecd57ce8d607f1df47bfd5fbff5f68f918bd",
+    "include/myds_tokenizer.h": "292cc9c3ce212cdeb08d9beb4f92a84660b248e8c677c04790b93229e26b451c",
+    "include/myds_v41.h": "abdbe3553653902ccfc135d3dbd351cf22c07d72392516b7d312064edf6b9b79",
+    "include/myds_v41_decode.h": "616fffa71022b9342db70d3df54ffab93037c35e58a3441c42e577873e217348",
+    "include/myds_v41_gpu.h": "8243f9a9dc5e09c4a84fcaa0ed4e3220566d48adb8dd064e3c06cbd1c6344546",
+    "include/myds_v41_moe.h": "7184adfa9cefe0c8ea3c810f6e023e766a8c108237f296955260be486757583b",
+    "include/myds_visfwd.h": "e188c8e488591be257ec1170331b78f01b6db4132ded5a7938ef1c564d998d13",
+    "include/myds_vispre.h": "addb28dd5286289001717abe81b7995fa6599f5a69e65dd558019c12ce7711be",
+    "include/myds_visw.h": "d8425832a8d1425c7e0cfa13fc9c2ecca2e94e8fbc46e881ec03791617b0affa",
+    "include/myds_vjob.h": "7710ea311702951206f183d762d12b89b867cf72b21ffcd98420565818b449b3"
+  },
+  "build_metallib_sha256": "622f3e41e11e1d82930fdce1f0a8c784b32855822327a4017a664f6b8382c006",
+  "commands": [
+    [
+      "xcrun",
+      "-sdk",
+      "macosx",
+      "metal",
+      "-mmacosx-version-min=15.0",
+      "-O3",
+      "-ffast-math",
+      "-DDS4_METAL_HC_STABLE=1",
+      "-DDS4_METAL_NORM_RSQRT_DISABLE=1",
+      "-c",
+      "/private/tmp/myds-maskskip-runtime-v5-20261028/all.metal",
+      "-o",
+      "/private/tmp/myds-maskskip-runtime-v5-20261028/probe.air"
+    ],
+    [
+      "xcrun",
+      "-sdk",
+      "macosx",
+      "metallib",
+      "/private/tmp/myds-maskskip-runtime-v5-20261028/probe.air",
+      "-o",
+      "/private/tmp/myds-maskskip-runtime-v5-20261028/probe.metallib"
+    ],
+    [
+      "xcrun",
+      "clang",
+      "-O3",
+      "-Wall",
+      "-Wextra",
+      "-mmacosx-version-min=26.0",
+      "-I/Users/fangqingyuan/Projects/myds/include",
+      "-I/Users/fangqingyuan/Projects/myds/third_party",
+      "-I/Users/fangqingyuan/Projects/myds/tools",
+      "-fobjc-arc",
+      "-Wno-deprecated-declarations",
+      "-Werror",
+      "-c",
+      "/Users/fangqingyuan/Projects/myds/tools/bench_indexer_mask_skip.m",
+      "-o",
+      "/private/tmp/myds-maskskip-runtime-v5-20261028/bench_indexer_mask_skip.o"
+    ],
+    [
+      "xcrun",
+      "clang",
+      "-O3",
+      "-Wall",
+      "-Wextra",
+      "-mmacosx-version-min=26.0",
+      "-I/Users/fangqingyuan/Projects/myds/include",
+      "-I/Users/fangqingyuan/Projects/myds/third_party",
+      "-I/Users/fangqingyuan/Projects/myds/tools",
+      "-std=c11",
+      "-DMYDS_INDEXER_MASK_SKIP_TESTING",
+      "-c",
+      "/Users/fangqingyuan/Projects/myds/src/myds_v41_gpu.c",
+      "-o",
+      "/private/tmp/myds-maskskip-runtime-v5-20261028/myds_v41_gpu.o"
+    ],
+    [
+      "xcrun",
+      "clang",
+      "-O3",
+      "-Wall",
+      "-Wextra",
+      "-mmacosx-version-min=26.0",
+      "-I/Users/fangqingyuan/Projects/myds/include",
+      "-I/Users/fangqingyuan/Projects/myds/third_party",
+      "-I/Users/fangqingyuan/Projects/myds/tools",
+      "-std=c11",
+      "-c",
+      "/Users/fangqingyuan/Projects/myds/src/myds_gguf.c",
+      "-o",
+      "/private/tmp/myds-maskskip-runtime-v5-20261028/myds_gguf.o"
+    ],
+    [
+      "xcrun",
+      "clang",
+      "-O3",
+      "-Wall",
+      "-Wextra",
+      "-mmacosx-version-min=26.0",
+      "-I/Users/fangqingyuan/Projects/myds/include",
+      "-I/Users/fangqingyuan/Projects/myds/third_party",
+      "-I/Users/fangqingyuan/Projects/myds/tools",
+      "-std=c11",
+      "-c",
+      "/Users/fangqingyuan/Projects/myds/src/myds_log.c",
+      "-o",
+      "/private/tmp/myds-maskskip-runtime-v5-20261028/myds_log.o"
+    ],
+    [
+      "xcrun",
+      "clang",
+      "-O3",
+      "-Wall",
+      "-Wextra",
+      "-mmacosx-version-min=26.0",
+      "-I/Users/fangqingyuan/Projects/myds/include",
+      "-I/Users/fangqingyuan/Projects/myds/third_party",
+      "-I/Users/fangqingyuan/Projects/myds/tools",
+      "-std=c11",
+      "-c",
+      "/Users/fangqingyuan/Projects/myds/src/myds_configfile.c",
+      "-o",
+      "/private/tmp/myds-maskskip-runtime-v5-20261028/myds_configfile.o"
+    ],
+    [
+      "xcrun",
+      "clang",
+      "-O3",
+      "-Wall",
+      "-Wextra",
+      "-mmacosx-version-min=26.0",
+      "-I/Users/fangqingyuan/Projects/myds/include",
+      "-I/Users/fangqingyuan/Projects/myds/third_party",
+      "-I/Users/fangqingyuan/Projects/myds/tools",
+      "-fobjc-arc",
+      "-Wno-deprecated-declarations",
+      "-c",
+      "/Users/fangqingyuan/Projects/myds/src/myds_metal.m",
+      "-o",
+      "/private/tmp/myds-maskskip-runtime-v5-20261028/myds_metal.o"
+    ],
+    [
+      "xcrun",
+      "clang",
+      "-mmacosx-version-min=26.0",
+      "/private/tmp/myds-maskskip-runtime-v5-20261028/bench_indexer_mask_skip.o",
+      "/private/tmp/myds-maskskip-runtime-v5-20261028/myds_v41_gpu.o",
+      "/private/tmp/myds-maskskip-runtime-v5-20261028/myds_gguf.o",
+      "/private/tmp/myds-maskskip-runtime-v5-20261028/myds_log.o",
+      "/private/tmp/myds-maskskip-runtime-v5-20261028/myds_configfile.o",
+      "/private/tmp/myds-maskskip-runtime-v5-20261028/myds_metal.o",
+      "-framework",
+      "Foundation",
+      "-framework",
+      "Metal",
+      "-lm",
+      "-lpthread",
+      "-o",
+      "/private/tmp/myds-maskskip-runtime-v5-20261028/probe"
+    ]
+  ],
+  "metallib_sha256": "fbdd33f078a9bfd10baecfcda6f71bebe9011e1eac31a4f3dd6b9428ab23078e",
+  "binary_sha256": "d6e6ab310874655e876a6b12d109e35e0f4d32ed514d7faa6533b463b5b44ea1"
+}

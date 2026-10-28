@@ -14648,3 +14648,35 @@ schema 耗时恢复持平、密集 tool 降低约 48%。
 
 复现、原始样本和边界见
 [`benchmarks/prompt_render_2026-10-28/README.md`](../benchmarks/prompt_render_2026-10-28/README.md)。
+
+---
+
+## §110 长上下文 mask-skip 与双 head staging 筛查（2026-10-28）
+
+本轮以实际请求节省严格超过 1% 为目标。mask-skip 在 ratio-1 的后四个
+indexer consumer 中，按 query 和 8-key mask 块跳过被屏蔽项，保留原 filter
+与 TopK。独立 M4 组件测试通过完整 postfilter score 与有序 Top512 比较；
+它们并不构成真实模型或请求级收益。
+
+macstudio M2 Ultra 的真实 96K cold setup→warm append 单次 A1/B/A2 中，
+热请求总耗时分别为 **11.821566 / 10.676632 / 11.642780 秒**。按较快对照，
+候选快 8.2983%，但 A1→A2 漂移 **−1.5124%**，超过测试前冻结的 1% 上限，
+因此热请求性能筛查未通过。cold setup 加 warm 两次 generation 总耗时按较快
+对照计算只节约 **0.9451%**，未达到本轮严格大于 1% 的要求；不包含模型加载。
+每臂同一 context，warm 实际复用 98304 token，重算 1983 token；输出最多 1 token，
+缓存几何和输出一致，B 的 warm 候选编码 304 次、失败 0。整个窗口的 GPU 独占
+未证明，这不是正式性能、完整 logits/state 或服务验收。
+
+按预设止损，不继续该候选的 Q/P，不重新挑选或放宽门限。实际接入已从正常源码
+撤回并保存为补丁。原服务恢复后 `/health` 正常、监听 PID 34332、nice 5；
+二进制、磁盘 Metal 库和配置 SHA 与窗口前一致，内存缓存未保留。身份、每臂
+原始 summary、限制和复现材料见
+[`benchmarks/indexer_mask_skip_2026-10-28/README.md`](../benchmarks/indexer_mask_skip_2026-10-28/README.md)。
+
+另一隔离假设将 exact scorer 相邻两 head 的 Q 一并暂存，减少 threadgroup
+barrier，保持原 head 累加次序。M4 四组真实调度几何与合成输入通过完整 score
+和有序 Top512 比较；预先冻结的 36568 keys × 56 queries 组件筛查中，
+A1/B/A2 中位为 **93.591 / 98.822 / 93.472 ms**，B 相对较快对照**慢 5.724%**，
+控制漂移 −0.128%。该结果只代表该 M4 组件，按成本门停止，不接入生产。
+原始数据和复现见
+[`benchmarks/indexer_twohead_2026-10-28/README.md`](../benchmarks/indexer_twohead_2026-10-28/README.md)。

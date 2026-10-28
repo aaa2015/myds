@@ -1,0 +1,362 @@
+diff --git a/include/myds_v41_gpu.h b/include/myds_v41_gpu.h
+index 70883a0..16db55f 100644
+--- a/include/myds_v41_gpu.h
++++ b/include/myds_v41_gpu.h
+@@ -199,6 +199,20 @@ typedef struct {
+  * ineligible/reference calls are not candidate fallbacks. */
+ void myds_v41_gpu_indexer_register_only_counters(
+     myds_v41_gpu_indexer_register_only_counters_t *out,bool reset);
++/* Default-off mask-skip candidate, scoped to ratio 1 and >16384 keys.
++ * Returns 1 if encoded, 0 if ineligible or
++ * unavailable before encoding, -1 on attempted dispatch failure. The original
++ * bit filter must run before scores are consumed. */
++typedef struct { uint64_t requests, encoded, unavailable, failures; } myds_v41_gpu_mask_skip_counters_t;
++void myds_v41_gpu_mask_skip_counters(myds_v41_gpu_mask_skip_counters_t *out, bool reset);
++/* Diagnostic injection: 1 simulates the reference PSO missing, 2 the
++ * candidate PSO missing. Only change between completed batches. */
++void myds_v41_gpu_inject_mask_skip_unavailable(uint32_t which);
++int myds_v41_gpu_indexscores_mask_skip_prefill(myds_metal_buffer_t *scores,
++    const myds_metal_buffer_t *q, const myds_metal_buffer_t *weights,
++    const myds_metal_buffer_t *cache, const myds_metal_buffer_t *mask,
++    uint32_t n_comp, uint32_t n_tokens, uint32_t causal_start,
++    uint32_t causal_ratio, uint32_t mask_stride_words);
+ /* Narrow initial scope: ordinary/no trace, active batch/no exclusive kprof,
+  * BF16-only/heads32/dim128, ratio2, 512<n_comp<=16384, 8<=n_tokens<=2048, end<=32768, key-window/SG=0.
+  * Candidate has zero threadgroup memory. F32 getter and dispatch count stay NULL/0.
+diff --git a/metal/dsv4_misc.metal b/metal/dsv4_misc.metal
+index 1787c01..e054a51 100644
+--- a/metal/dsv4_misc.metal
++++ b/metal/dsv4_misc.metal
+@@ -8155,3 +8155,136 @@ kernel void kernel_dsv41_kv_rope_quant_batch(
+     }
+ }
+ 
++/* Default-off ordinary ratio-1 consumer candidate. Filter remains mandatory. */
++struct myds_indexer_mask_skip_args {
++    uint n_rows, n_head, head_dim, cache_f16;
++    float scale;
++    uint n_tokens, causal_start, causal_ratio, window, mask_stride;
++};
++kernel void kernel_myds_indexer_score_chunk_mask_skip(
++        constant myds_indexer_mask_skip_args & args,
++        device const char *q,
++        device const float *weights,
++        device const char *indexer_key_cache,
++        device float *scores,
++        device const uint *mask_words,
++        threadgroup float *shared [[threadgroup(0)]],
++        uint2 tgpid [[threadgroup_position_in_grid]],
++        ushort tid [[thread_index_in_threadgroup]],
++        ushort lane [[thread_index_in_simdgroup]],
++        ushort sg [[simdgroup_index_in_threadgroup]]) {
++    const uint row_base = tgpid.x * 16u;
++    const uint tok_base = tgpid.y * 8u;
++    if (row_base >= args.n_rows || tok_base >= args.n_tokens ||
++        args.n_head != 32u || args.head_dim != 128u) {
++        return;
++    }
++
++    const uint last_tok = min(tok_base + 8u, args.n_tokens);
++    const uint tile_tokens = last_tok - tok_base;
++    const uint max_vis = (args.causal_start + (last_tok - 1u) + 1u) / args.causal_ratio;
++
++    /* 2026-10-25：距离窗口下界。
++     * ★ 下界必须按【块内最早的那个 token】算，不能用 max_vis（块内最晚 token）。
++     *   下界随可见上限单调递增，所以最早的 token 给出块内最小下界：只有
++     *   row < tile_min_vis 才能保证对块内每个 token 都越界。用 max_vis 算会
++     *   把 token 0..6 仍需要的行整块填成 -INF（每块最多误丢 max_vis - vis_0 行，
++     *   ratio=1 时是 7 行）。
++     * window=0 ⇒ tile_min_vis=0 ⇒ 下界条件永不成立 ⇒ 与改动前逐位等价。 */
++    const uint vis_0 = (args.causal_start + tok_base + 1u) / args.causal_ratio;
++    const uint tile_min_vis = (args.window && vis_0 > args.window)
++                              ? (vis_0 - args.window) : 0u;
++
++    /* 整块早退：超出因果上限（未来）或整块低于距离窗口（太早）都填 -INF 返回 */
++    if (row_base >= max_vis || (tile_min_vis && row_base + 16u <= tile_min_vis)) {
++        const uint cell_t = (uint)tid >> 4;
++        const uint cell_c = (uint)tid & 15u;
++        const uint cell_tok = tok_base + cell_t;
++        const uint cell_row = row_base + cell_c;
++        if (cell_tok < args.n_tokens && cell_row < args.n_rows) {
++            scores[(uint64_t)cell_tok * args.n_rows + cell_row] = -INFINITY;
++        }
++        return;
++    }
++
++    float4 k_reg[4];
++    const uint sg_row0 = row_base + (uint)sg * 4u;
++    FOR_UNROLL (uint r = 0; r < 4u; r++) {
++        const uint row = sg_row0 + r;
++        if (row < args.n_rows && row < max_vis) {
++            const uint64_t base_idx = (uint64_t)row * 128u + (uint)lane * 4u;
++            k_reg[r] = float4(
++                glm_cache_load_f32_or_f16(indexer_key_cache, base_idx + 0u, args.cache_f16),
++                glm_cache_load_f32_or_f16(indexer_key_cache, base_idx + 1u, args.cache_f16),
++                glm_cache_load_f32_or_f16(indexer_key_cache, base_idx + 2u, args.cache_f16),
++                glm_cache_load_f32_or_f16(indexer_key_cache, base_idx + 3u, args.cache_f16));
++        } else {
++            k_reg[r] = float4(0.0f);
++        }
++    }
++
++    threadgroup float4 *qtg = (threadgroup float4 *)shared;       /* 256 float4 = 1024 floats */
++    threadgroup float  *wtg = (threadgroup float *)(qtg + 256u);  /* 256 floats */
++
++    for (uint i = tid; i < tile_tokens * 32u; i += 128u) {
++        const uint t = i >> 5;
++        const uint h = i & 31u;
++        const uint tok = tok_base + t;
++        wtg[i] = weights[(uint64_t)tok * 32u + h];
++    }
++
++    uint allowed_queries = 0u;
++    if (sg_row0 < args.n_rows) {
++        const uint block = sg_row0 >> 3;
++        for (uint t = 0u; t < tile_tokens; ++t) {
++            const uint word = mask_words[(uint64_t)(tok_base + t) * args.mask_stride + (block >> 5)];
++            if (word & (1u << (block & 31u))) allowed_queries |= 1u << t;
++        }
++    }
++    float acc = 0.0f;
++    const uint q_vec_count = tile_tokens * 32u;
++
++    for (uint head = 0; head < 32u; head++) {
++        for (uint i = tid; i < q_vec_count; i += 128u) {
++            const uint t = i >> 5;
++            const uint l = i & 31u;
++            const uint tok = tok_base + t;
++            device const float4 *q4_ptr = (device const float4 *)(q +
++                ((uint64_t)tok * 32u + head) * 128u * sizeof(float));
++            qtg[i] = q4_ptr[l];
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++
++        for (uint t = 0; t < tile_tokens; t++) {
++            const uint vis_t = (args.causal_start + tok_base + t + 1u) / args.causal_ratio;
++            if (sg_row0 >= vis_t || !(allowed_queries & (1u << t))) continue;
++            /* 逐 token 窗口下界：整块早退只挡住「对全块都越界」的行，边界那一块
++             * 里的旧行仍要靠这里逐行剔掉，否则窗口语义只到 16 行 tile 粒度。 */
++            const uint lo_t = (args.window && vis_t > args.window)
++                              ? (vis_t - args.window) : 0u;
++            const float4 q4 = qtg[t * 32u + (uint)lane];
++            const float w = wtg[t * 32u + head];
++            FOR_UNROLL (uint r = 0; r < 4u; r++) {
++                if (sg_row0 + r < lo_t) continue;
++                float s = dot(q4, k_reg[r]);
++                s = simd_sum(s);
++                const float contrib = max(s * args.scale, 0.0f) * w;
++                if ((uint)lane == (t * 4u + r)) {
++                    acc += contrib;
++                }
++            }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++
++    const uint out_t = (uint)lane >> 2;
++    const uint out_r = (uint)lane & 3u;
++    const uint out_tok = tok_base + out_t;
++    const uint out_row = sg_row0 + out_r;
++    if (out_tok < args.n_tokens && out_row < args.n_rows) {
++        const uint vis = (args.causal_start + out_tok + 1u) / args.causal_ratio;
++        const uint lo = (args.window && vis > args.window) ? (vis - args.window) : 0u;
++        scores[(uint64_t)out_tok * args.n_rows + out_row] =
++            (out_row < vis && out_row >= lo) ? acc : -INFINITY;
++    }
++}
+diff --git a/src/myds_v41.c b/src/myds_v41.c
+index 1a169a5..e267b34 100644
+--- a/src/myds_v41.c
++++ b/src/myds_v41.c
+@@ -3782,8 +3782,14 @@ static int publish_indexer_chunk(myds_context_t *ctx, uint32_t il, uint32_t c_st
+         extern void myds_indexer_capture_set_group(uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
+         myds_indexer_capture_set_group(il,base_pos,c_start,c_len,off,batch_floats);
+ #endif
+-        if (!myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped(g->gpu,scores_buf,q_view,w_view,g->index_cache[owner],
+-                nc,V41_INDEX_HEADS,glen,g_start,ratio,true,!myds_trace_active())) return -1;
++        int mask_skip=0;
++        if (il>20u && mask_bits && !myds_trace_active())
++            mask_skip=myds_v41_gpu_indexscores_mask_skip_prefill(scores_buf,q_view,w_view,
++                g->index_cache[owner],mask_view,nc,glen,g_start,ratio,mask_units);
++        if (mask_skip<0) return -1;
++        if (!mask_skip && !myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped(g->gpu,
++                scores_buf,q_view,w_view,g->index_cache[owner],nc,V41_INDEX_HEADS,glen,g_start,
++                ratio,true,!myds_trace_active())) return -1;
+         if (il==20) {
+             /* 块掩码：只要本行的块【全部被选中】，掩码前缀就与逐 token 一致
+              * （前 blocks_t 列先清成不可见、再被 scatter 打开）。这里 nc ≤ 16384
+diff --git a/src/myds_v41_gpu.c b/src/myds_v41_gpu.c
+index d16b0b0..3d58850 100644
+--- a/src/myds_v41_gpu.c
++++ b/src/myds_v41_gpu.c
+@@ -106,6 +106,7 @@ enum { IRO_REQUESTS,IRO_ENCODED,IRO_FALLBACKS,IRO_FAILURES,IRO_F32,IRO_BF16,IRO_
+ static _Atomic uint64_t indexer_register_only_counters[IRO_COUNT];
+ static pthread_once_t indexer_register_only_once=PTHREAD_ONCE_INIT;
+ static int indexer_register_only_mode;
++static uint32_t indexer_mask_skip_test_unavailable;
+ static void indexer_register_only_init(void) {
+     const char *value=getenv("MYDS_INDEXER_REGISTER_ONLY");
+     if(!value||!strcmp(value,"1"))indexer_register_only_mode=1;
+@@ -784,7 +785,12 @@ static int indexscores_chunk(myds_metal_buffer_t *scores,const myds_metal_buffer
+         n_comp,n_heads,128,cache_bf16?2u:0u,1.0f/64.0f,n_tokens,causal_start,causal_ratio,
+         indexer_key_window()};
+     const char *exact_env = getenv("MYDS_INDEXER_CHUNK_EXACT");
+-    if ((!exact_env || strcmp(exact_env, "0") != 0) &&
++    int exact_requested = !exact_env || strcmp(exact_env, "0") != 0;
++#ifdef MYDS_INDEXER_MASK_SKIP_TESTING
++    /* Exercise the existing direct fallback when the exact PSO is missing. */
++    if (indexer_mask_skip_test_unavailable == 1u) exact_requested = 0;
++#endif
++    if (exact_requested &&
+         dispatch("kernel_myds_indexer_score_chunk_exact", &a, sizeof(a), b, 4,
+                  (n_comp + 15u) / 16u, (n_tokens + 7u) / 8u, 1, 32, 4, 1, 1280u * 4u)) {
+ #ifdef MYDS_INDEXER_CAPTURE
+@@ -814,6 +820,74 @@ int myds_v41_gpu_indexscores_chunk_bf16(myds_metal_buffer_t *scores,const myds_m
+     uint32_t n_heads,uint32_t n_tokens,uint32_t causal_start,uint32_t causal_ratio) {
+     return indexscores_chunk(scores,q,weights,cache,n_comp,n_heads,n_tokens,causal_start,causal_ratio,true);
+ }
++enum { IMS_REQUESTS, IMS_ENCODED, IMS_UNAVAILABLE, IMS_FAILURES, IMS_COUNT };
++static _Atomic uint64_t indexer_mask_skip_counts[IMS_COUNT];
++void myds_v41_gpu_inject_mask_skip_unavailable(uint32_t which) {
++    indexer_mask_skip_test_unavailable=which;
++}
++void myds_v41_gpu_mask_skip_counters(myds_v41_gpu_mask_skip_counters_t *out, bool reset) {
++    uint64_t v[IMS_COUNT];
++    for (unsigned i=0;i<IMS_COUNT;i++) v[i]=reset ?
++        atomic_exchange_explicit(&indexer_mask_skip_counts[i],0u,memory_order_relaxed) :
++        atomic_load_explicit(&indexer_mask_skip_counts[i],memory_order_relaxed);
++    if(out)*out=(myds_v41_gpu_mask_skip_counters_t){v[0],v[1],v[2],v[3]};
++}
++/* Only the engine's bit-mask consumer calls this optional entry. The caller
++ * must execute the original filter and must not retry after dispatch failure. */
++int myds_v41_gpu_indexscores_mask_skip_prefill(myds_metal_buffer_t *scores,
++    const myds_metal_buffer_t *q,const myds_metal_buffer_t *weights,
++    const myds_metal_buffer_t *cache,const myds_metal_buffer_t *mask,
++    uint32_t n_comp,uint32_t n_tokens,uint32_t causal_start,
++    uint32_t causal_ratio,uint32_t stride) {
++#ifdef MYDS_INDEXER_CAPTURE
++    (void)scores;(void)q;(void)weights;(void)cache;(void)mask;(void)n_comp;
++    (void)n_tokens;(void)causal_start;(void)causal_ratio;(void)stride;
++    return 0;
++#else
++    const char *enabled=getenv("MYDS_INDEXER_MASK_SKIP"),*tiled=getenv("MYDS_INDEXER_TILED"),
++        *exact=getenv("MYDS_INDEXER_CHUNK_EXACT");
++    if(!enabled||strcmp(enabled,"1")||causal_ratio!=1u||n_comp<=16384u||!n_tokens||
++       n_comp>MYDS_CHUNK_KEY_MAX_LIMIT||n_tokens>MYDS_CHUNK_MAXC||
++       n_comp>UINT32_MAX-255u||n_tokens>UINT32_MAX-7u||
++       (uint64_t)causal_start+n_tokens>UINT32_MAX||
++       (tiled&&atoi(tiled)>0)||(exact&&!strcmp(exact,"0"))||indexer_key_window()||
++       !myds_metal_batch_active()||!myds_metal_get_auto_barrier()||myds_metal_kprof_exclusive())return 0;
++    atomic_fetch_add_explicit(&indexer_mask_skip_counts[IMS_REQUESTS],1u,memory_order_relaxed);
++    const uint64_t sb=(uint64_t)n_comp*n_tokens*4u,qb=(uint64_t)n_tokens*32u*128u*4u,
++        wb=(uint64_t)n_tokens*32u*4u,kb=(uint64_t)n_comp*128u*2u,mb=(uint64_t)stride*n_tokens*4u;
++    if((uint64_t)stride<((uint64_t)n_comp+255u)/256u||sb>SIZE_MAX||qb>SIZE_MAX||wb>SIZE_MAX||
++       kb>SIZE_MAX||mb>SIZE_MAX||!myds_metal_buffer_native_range(scores,sb,4u)||
++       !myds_metal_buffer_native_range(q,qb,4u)||!myds_metal_buffer_native_range(weights,wb,4u)||
++       !myds_metal_buffer_native_range(cache,kb,2u)||!myds_metal_buffer_native_range(mask,mb,4u)||
++       buffer_ranges_overlap(scores,(size_t)sb,q,(size_t)qb)||
++       buffer_ranges_overlap(scores,(size_t)sb,weights,(size_t)wb)||
++       buffer_ranges_overlap(scores,(size_t)sb,cache,(size_t)kb)||
++       buffer_ranges_overlap(scores,(size_t)sb,mask,(size_t)mb)) {
++        atomic_fetch_add_explicit(&indexer_mask_skip_counts[IMS_UNAVAILABLE],1u,memory_order_relaxed);
++        return 0;
++    }
++    const char *name="kernel_myds_indexer_score_chunk_mask_skip";
++    const uint32_t threads[]={32u,4u,1u};
++    if(indexer_mask_skip_test_unavailable==1u || indexer_mask_skip_test_unavailable==2u ||
++       !myds_metal_kernel_constants_preflight("kernel_myds_indexer_score_chunk_exact",threads,5120u,NULL,0u) ||
++       !myds_metal_kernel_constants_preflight(name,threads,5120u,NULL,0u)) {
++        atomic_fetch_add_explicit(&indexer_mask_skip_counts[IMS_UNAVAILABLE],1u,memory_order_relaxed);
++        return 0;
++    }
++    struct {uint32_t n_rows,n_head,head_dim,cache_f16;float scale;
++            uint32_t n_tokens,causal_start,causal_ratio,window,mask_stride;} a={
++        n_comp,32u,128u,2u,1.0f/64.0f,n_tokens,causal_start,1u,0u,stride};
++    _Static_assert(sizeof(a)==40u,"mask skip shader ABI");
++    const myds_metal_buffer_t *buffers[]={q,weights,cache,scores,mask};
++    if(!dispatch(name,&a,sizeof(a),buffers,5u,(n_comp+15u)/16u,(n_tokens+7u)/8u,1u,
++                 32u,4u,1u,5120u)) {
++        atomic_fetch_add_explicit(&indexer_mask_skip_counts[IMS_FAILURES],1u,memory_order_relaxed);
++        return -1;
++    }
++    atomic_fetch_add_explicit(&indexer_mask_skip_counts[IMS_ENCODED],1u,memory_order_relaxed);
++    return 1;
++#endif
++}
+ struct indexer_register_only_args {
+     uint32_t n_comp,n_tokens,n_head,head_dim,pos0,ratio;
+     uint64_t q_token_stride,q_head_stride,weights_token_stride;
+diff --git a/tests/test_indexer_register_only_host.py b/tests/test_indexer_register_only_host.py
+index c553b2c..33e3f3b 100644
+--- a/tests/test_indexer_register_only_host.py
++++ b/tests/test_indexer_register_only_host.py
+@@ -76,6 +76,7 @@ class RegisterOnlyHostTests(unittest.TestCase):
+                                 capture_output=True, text=True)
+         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+         self.assertIn('"no_repeat_rope_or_consumers":true', result.stdout)
++        self.assertIn('"mask_skip_failure_and_filter_contract":true', result.stdout)
+ 
+     def test_offline_writer_preserves_native_prefix_and_qualified_fragment(self):
+         spec = importlib.util.spec_from_file_location("register_only_production_builder",
+diff --git a/tests/test_indexer_register_only_publisher_host.c b/tests/test_indexer_register_only_publisher_host.c
+index 7b5fc2a..a916c9c 100644
+--- a/tests/test_indexer_register_only_publisher_host.c
++++ b/tests/test_indexer_register_only_publisher_host.c
+@@ -7,7 +7,9 @@
+ struct myds_metal_buffer {size_t size;};
+ static struct myds_metal_buffer scores={2097152u*4u},blocks={2097152u*4u},sel={2097152u*4u};
+ static unsigned rope_calls,scoped_calls,after_scorer_calls,fallback_rope_calls;
+-static bool trace_on;
++static bool trace_on, consumer_test;
++static int mask_skip_result;
++static unsigned mask_skip_calls;
+ void myds_log(myds_log_level_t level,const char *fmt,...) {}
+ bool myds_trace_active(void){return trace_on;}
+ size_t myds_metal_buffer_size(const myds_metal_buffer_t *b){return b?b->size:0;}
+@@ -16,10 +18,19 @@ uint32_t myds_v41_gpu_indexer_batch_floats(const myds_v41_gpu_scratch_t*s){retur
+ myds_metal_buffer_t *myds_v41_gpu_indexer_scores(const myds_v41_gpu_scratch_t*s){return &scores;}
+ myds_metal_buffer_t *myds_v41_gpu_indexer_blocks(const myds_v41_gpu_scratch_t*s){return &blocks;}
+ myds_metal_buffer_t *myds_v41_gpu_indexer_block_selected(const myds_v41_gpu_scratch_t*s){return &sel;}
+-int myds_v41_gpu_indexer_rope_quant_batch(myds_metal_buffer_t*x,myds_metal_buffer_t*d,size_t off,uint32_t h,uint32_t start,uint32_t rows,uint32_t stride,bool compressed){assert(h==32&&start==30720&&rows==2048&&stride==1&&compressed);rope_calls++;return 1;}
++int myds_v41_gpu_indexer_rope_quant_batch(myds_metal_buffer_t*x,myds_metal_buffer_t*d,size_t off,uint32_t h,uint32_t start,uint32_t rows,uint32_t stride,bool compressed){assert(h==32&&start==(consumer_test?20000u:30720u)&&rows==(consumer_test?64u:2048u)&&stride==1&&compressed);rope_calls++;return 1;}
+ int myds_v41_gpu_rope_batch(myds_metal_buffer_t*x,uint32_t d,uint32_t h,uint32_t start,uint32_t rows,bool c,bool inv){fallback_rope_calls++;return 1;}
+ int myds_v41_gpu_quant(myds_metal_buffer_t*x,uint32_t width,uint32_t rows,uint32_t mode){fallback_rope_calls++;return 1;}
+-int myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped(myds_v41_gpu_scratch_t*s,myds_metal_buffer_t*y,const myds_metal_buffer_t*q,const myds_metal_buffer_t*w,const myds_metal_buffer_t*k,uint32_t nc,uint32_t nh,uint32_t nt,uint32_t start,uint32_t ratio,bool bf,bool ordinary){assert(rope_calls==1&&nc==15424&&nt==128&&start==30720&&ratio==2&&nh==32&&bf&&ordinary==!trace_on);scoped_calls++;return 0;}
++int myds_v41_gpu_indexscores_mask_skip_prefill(myds_metal_buffer_t*y,const myds_metal_buffer_t*q,const myds_metal_buffer_t*w,const myds_metal_buffer_t*k,const myds_metal_buffer_t*m,uint32_t nc,uint32_t nt,uint32_t start,uint32_t ratio,uint32_t stride){
++    assert(consumer_test&&rope_calls==1&&nc==20064&&nt==64&&start==20000&&ratio==1&&stride==8192&&m);
++    mask_skip_calls++;return mask_skip_result;
++}
++int myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped(myds_v41_gpu_scratch_t*s,myds_metal_buffer_t*y,const myds_metal_buffer_t*q,const myds_metal_buffer_t*w,const myds_metal_buffer_t*k,uint32_t nc,uint32_t nh,uint32_t nt,uint32_t start,uint32_t ratio,bool bf,bool ordinary){
++    assert(rope_calls==1&&nh==32&&bf&&ordinary==!trace_on);
++    if(consumer_test)assert(nc==20064&&nt==64&&start==20000&&ratio==1);
++    else assert(nc==15424&&nt==128&&start==30720&&ratio==2);
++    scoped_calls++;return consumer_test?1:0;
++}
+ int myds_v41_gpu_candidates_rows(myds_metal_buffer_t*a,const myds_metal_buffer_t*b,uint32_t c,uint32_t d,uint32_t e,uint32_t f,uint32_t g){after_scorer_calls++;return 1;}
+ int myds_v41_gpu_filter_rows(myds_metal_buffer_t*a,const myds_metal_buffer_t*b,uint32_t c,uint32_t d,uint32_t e,uint32_t f,uint32_t g){after_scorer_calls++;return 1;}
+ int myds_v41_gpu_filter_rows_bits(myds_metal_buffer_t*a,const myds_metal_buffer_t*b,uint32_t c,uint32_t d,uint32_t e,uint32_t f,uint32_t g){after_scorer_calls++;return 1;}
+@@ -35,5 +46,23 @@ int main(void) {
+         int result=publish_indexer_chunk(&ctx,2,0,2048,30720,&q,&w,&selected,2048,&mask,32768,false,&qv,&wv,&sv,&mv);
+         assert(result==-1&&rope_calls==1&&scoped_calls==1&&!after_scorer_calls&&!fallback_rope_calls);
+     }
+-    puts("{\"actual_publisher_scorer_failure_is_minus1\":true,\"trace_scope_forwarded\":true,\"no_repeat_rope_or_consumers\":true,\"gpu_work\":false}");return 0;
++    /* Exercise the actual consumer branch: an encoded candidate must be
++     * followed by the original filter and top-k; a failed encode must stop,
++     * and an ineligible candidate must retain the original selector. */
++    consumer_test=true;g.index_cache[3]=&cache;
++    for(int mode=-1;mode<=1;mode++) {
++        trace_on=false;mask_skip_result=mode;
++        rope_calls=scoped_calls=after_scorer_calls=fallback_rope_calls=mask_skip_calls=0;
++        int result=publish_indexer_chunk(&ctx,24,0,64,20000,&q,&w,&selected,2048,&mask,32768,true,&qv,&wv,&sv,&mv);
++        assert(mask_skip_calls==1&&rope_calls==1&&!fallback_rope_calls);
++        if(mode<0) assert(result==-1&&!scoped_calls&&!after_scorer_calls);
++        else assert(result==1&&scoped_calls==(unsigned)(mode==0)&&after_scorer_calls==2);
++    }
++    for(unsigned t=0;t<2;t++) {
++        trace_on=t!=0;mask_skip_result=1;
++        rope_calls=scoped_calls=after_scorer_calls=fallback_rope_calls=mask_skip_calls=0;
++        int result=publish_indexer_chunk(&ctx,24,0,64,20000,&q,&w,&selected,2048,&mask,32768,t!=0,&qv,&wv,&sv,&mv);
++        assert(result==1&&!mask_skip_calls&&scoped_calls==1&&after_scorer_calls==2);
++    }
++    puts("{\"actual_publisher_scorer_failure_is_minus1\":true,\"trace_scope_forwarded\":true,\"no_repeat_rope_or_consumers\":true,\"mask_skip_failure_and_filter_contract\":true,\"gpu_work\":false}");return 0;
+ }

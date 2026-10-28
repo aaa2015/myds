@@ -1,0 +1,49 @@
+{"candidate_library_path":"\/tmp\/myds-maskskip-boundary-20261028\/myds.metallib","candidate_library_sha256":"fbdd33f078a9bfd10baecfcda6f71bebe9011e1eac31a4f3dd6b9428ab23078e","deployed_path":"\/Users\/fangqingyuan\/Projects\/myds\/bin\/myds.metallib","deployed_sha256":"fe55793346e15119fce4e0f40d4bf6d3023fc3694ffc231e66b8a89e3ae0f74d","device":"Apple M4","kind":"identity","symbols":["kernel_myds_indexer_score_chunk_exact (deployed)","kernel_myds_indexer_score_chunk_exact (same TU)","probe_indexer_mask_skip"]}
+[2026-10-28 21:42:11.413] [INFO] myds_metal: loaded precompiled library from /tmp/myds-maskskip-boundary-20261028/myds.metallib (all required V4.1 kernels verified)
+[2026-10-28 21:42:11.422] [INFO] Shared Q4 V41 NB: 0 (ordinary NB+HC GU2304x5120/Down5120x2304, NR2/NSG4)
+[2026-10-28 21:42:11.422] [INFO] myds_metal: Initialized successfully on GPU: Apple M4
+[2026-10-28 21:42:11.422] [INFO] Indexer head slots: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 21:42:11.422] [INFO] Indexer topk threshold: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 21:42:11.422] [INFO] Indexer topk NaN shuffle: 0 (reference; reference partition geometry)
+[2026-10-28 21:42:11.422] [INFO] Routed MoE geometry: IQ2 NSG=2, Q2 down NSG=2 (inherited)
+[2026-10-28 21:42:11.422] [INFO] Routed MoE IQ2 LUT: threadgroup (reference)
+[2026-10-28 21:42:11.422] [INFO] Batch2 Q8 shared weights: disabled (scalar reference)
+[2026-10-28 21:42:11.422] [INFO] LM-head Q8 rows per threadgroup: 2 (reference; single token, large output, NSG8)
+[2026-10-28 21:42:11.422] [INFO] Dense Q4 rows per threadgroup: 2 (reference; explicit ordinary scalar scope), NSG=4
+[2026-10-28 21:42:11.422] [INFO] F16 GEMV BF16 fuse: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 21:42:11.422] [INFO] Indexer RoPE quant fuse: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 21:42:11.422] [INFO] Routed MoE Q2 sum cache: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 21:42:11.422] [INFO] Routed MoE Q2 sum cache fused: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 21:42:11.422] [INFO] Decode candidates: down overlap=0, IQ2 V4.1=0, Dense Q4 V4.1=0 (ordinary scalar only)
+[2026-10-28 21:42:11.422] [INFO] Routed MoE Q2 V4.1: 0 (ordinary scalar F32 MID only; 5120/2304/384/6, NR2, down NSG2/4; MM, trace and unscoped paths retain reference)
+[2026-10-28 21:42:11.422] [INFO] Attention flash-decoding: 0 (reference (single-TG in-register 14-NSG))
+[2026-10-28 21:42:11.422] [INFO] HC mix norm pre-fusion: 0 (reference (separate norm + GEMV))
+{"actual_runtime_mask_skip":1,"case":12,"causal_and_mask":true,"deployed_vs_mask_skip_filtered_bit_mismatches":0,"deployed_vs_same_tu_bit_mismatches":0,"guards":true,"inputs_intact":true,"keys":16385,"kind":"correctness","mask_profile":12,"mask_seed":91,"mask_stride":66,"pass":true,"ratio":1,"runtime_filtered_equal":true,"same_batch_mask_producer":0,"simulated_pso_fallback":1,"start":16384,"tokens":1,"top512":{"candidate_top512_sha256":"91be83ede0d220c1d930c2e86fca05d4c7bb709637981bbd8cd2684c2b482645","exact_aa_first_mismatch_index":null,"exact_aa_ordered_id_mismatches":0,"exact_repeat_top512_sha256":"91be83ede0d220c1d930c2e86fca05d4c7bb709637981bbd8cd2684c2b482645","exact_top512_sha256":"91be83ede0d220c1d930c2e86fca05d4c7bb709637981bbd8cd2684c2b482645","first_candidate_id":null,"first_exact_id":null,"first_mismatch_index":null,"gpu_batches_completed":3,"guards_and_causal_ids_valid":true,"nan_fuse_encoded":3,"ordered_id_mismatches":0,"prefix_encoded":3,"production_topk":true}}
+{"a1_seconds":0.0018401248380541801,"a2_seconds":0.0018333334010094404,"case":12,"kind":"control_timing","sample":0}
+{"a1_seconds":0.0018398333340883255,"a2_seconds":0.0018316248897463083,"case":12,"kind":"control_timing","sample":1}
+{"a1_seconds":0.0019596249330788851,"a2_seconds":0.0018372500780969858,"case":12,"kind":"control_timing","sample":2}
+{"a1_seconds":0.0018361667171120644,"a2_seconds":0.0018485833425074816,"case":12,"kind":"control_timing","sample":3}
+{"a1_seconds":0.0018515000119805336,"a2_seconds":0.0018459165003150702,"case":12,"kind":"control_timing","sample":4}
+{"case":12,"drift":-0.0015622635474200619,"kind":"control_gate","limit":0.02,"median_a1_seconds":0.0018401248380541801,"median_a2_seconds":0.0018372500780969858,"pass":true}
+{"arm":"A1","case":12,"dispatches":3,"gpu_seconds":0.0018478750716894865,"kind":"timing","order":0,"sample":0,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"B","case":12,"dispatches":3,"gpu_seconds":0.0018629999831318855,"kind":"timing","order":1,"sample":0,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A2","case":12,"dispatches":3,"gpu_seconds":0.0018524166662245989,"kind":"timing","order":2,"sample":0,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A1","case":12,"dispatches":3,"gpu_seconds":0.0018573750276118517,"kind":"timing","order":0,"sample":1,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"B","case":12,"dispatches":3,"gpu_seconds":0.0018791251350194216,"kind":"timing","order":1,"sample":1,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A2","case":12,"dispatches":3,"gpu_seconds":0.0018375001382082701,"kind":"timing","order":2,"sample":1,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A1","case":12,"dispatches":3,"gpu_seconds":0.0018350000027567148,"kind":"timing","order":0,"sample":2,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"B","case":12,"dispatches":3,"gpu_seconds":0.0018691665027290583,"kind":"timing","order":1,"sample":2,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A2","case":12,"dispatches":3,"gpu_seconds":0.001922624884173274,"kind":"timing","order":2,"sample":2,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A1","case":12,"dispatches":3,"gpu_seconds":0.0021988335065543652,"kind":"timing","order":0,"sample":3,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"B","case":12,"dispatches":3,"gpu_seconds":0.0018724999390542507,"kind":"timing","order":1,"sample":3,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A2","case":12,"dispatches":3,"gpu_seconds":0.0018377499654889107,"kind":"timing","order":2,"sample":3,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A1","case":12,"dispatches":3,"gpu_seconds":0.0018321250099688768,"kind":"timing","order":0,"sample":4,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"B","case":12,"dispatches":3,"gpu_seconds":0.0018704584799706936,"kind":"timing","order":1,"sample":4,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A2","case":12,"dispatches":3,"gpu_seconds":0.0018343748524785042,"kind":"timing","order":2,"sample":4,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A1","case":12,"dispatches":3,"gpu_seconds":0.0020602915901690722,"kind":"timing","order":0,"sample":5,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"B","case":12,"dispatches":3,"gpu_seconds":0.0018682081717997789,"kind":"timing","order":1,"sample":5,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A2","case":12,"dispatches":3,"gpu_seconds":0.0018421248532831669,"kind":"timing","order":2,"sample":5,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A1","case":12,"dispatches":3,"gpu_seconds":0.0018362500704824924,"kind":"timing","order":0,"sample":6,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"B","case":12,"dispatches":3,"gpu_seconds":0.0016045416705310345,"kind":"timing","order":1,"sample":6,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"arm":"A2","case":12,"dispatches":3,"gpu_seconds":0.0017634164541959763,"kind":"timing","order":2,"sample":6,"scope":"concurrent_encoder_cb_gpu_timestamps"}
+{"correctness_only":false,"correctness_passed":true,"kind":"complete","production_adoption":false}

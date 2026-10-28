@@ -1,0 +1,121 @@
+{
+  "config_loaded_entries" : 64,
+  "config_path" : "\/Users\/fangqingyuan\/Projects\/myds-experiments\/mask-skip-screen-20261028.wkqllxnG\/config-on.conf",
+  "config_sha256" : "158066b199699fc2011736e32bf5f1f52d3f37de914893f86a1378b303347aee",
+  "effective_myds_environment" : {
+    "count" : 64,
+    "encoding" : "sorted raw MYDS_ key=value bytes including NUL terminator",
+    "sha256" : "cd02b22d20c9e3f22bca84995e44a7ec5e04be5bc33f77f0048d5094b0d04c25"
+  },
+  "environment_note" : "null means unset; actual provider and code defaults require independent verification",
+  "executable_path" : "\/Users\/fangqingyuan\/Projects\/myds-experiments\/mask-skip-screen-20261028.wkqllxnG\/bin\/bench_indexer_mask_warm",
+  "executable_sha256" : "26808cbf5a3dce97e736129a5a355928459097104ef07dced871db0aadd7b65e",
+  "kind" : "ordinary_warm_prefill_screen",
+  "mask_skip_cold_counters" : {
+    "encoded" : 317,
+    "failures" : 0,
+    "requests" : 317,
+    "unavailable" : 0
+  },
+  "mask_skip_expected" : "on",
+  "mask_skip_warm_counters" : {
+    "encoded" : 304,
+    "failures" : 0,
+    "requests" : 304,
+    "unavailable" : 0
+  },
+  "metallib_path" : "\/Users\/fangqingyuan\/Projects\/myds-experiments\/mask-skip-screen-20261028.wkqllxnG\/bin\/myds.metallib",
+  "metallib_sha256" : "c695e4922c021f08559e0fe72f1b9841b4efa8748c4576da90caa2804df13bcf",
+  "model_bytes" : 362142629888,
+  "model_header_bytes" : 1048576,
+  "model_header_sha256" : "43948333c8eb0172613384abb5d5e1fe2fd02f40a1ede88afc1cbf22bef1cb68",
+  "model_path" : "\/Users\/fangqingyuan\/.lmstudio\/models\/antirez\/deepseek-v4.1-flash-1017\/DeepSeek-V4.1-Flash-1017-Q2-dense-q4-imx-cliecy.gguf",
+  "observer" : false,
+  "parameters" : {
+    "max_new_tokens" : 1,
+    "max_seq_len" : 1048576,
+    "seed" : 42,
+    "temperature" : 0,
+    "top_p" : 1
+  },
+  "phases" : [
+    {
+      "actual_tokens" : 98409,
+      "batch2_calls" : 0,
+      "cached_tokens" : 0,
+      "draft_cycles" : 0,
+      "first_callback_seconds" : 223.35599604166055,
+      "generation_seconds" : 223.35600370833708,
+      "output" : {
+        "bytes" : 9,
+        "path" : "cold-output.bin",
+        "sha256" : "a52d704cc3acb44b353c767dec99f7a54155bb0e369769e1b69977bb71e07c37"
+      },
+      "output_token_ids" : {
+        "bytes" : 4,
+        "path" : "cold-output-token-ids.i32le.bin",
+        "sha256" : "dedfdece21830ac821592698993ccd212416444a2f3ca5aa17622ef83609c5c3"
+      },
+      "pcache_len_after" : 98409,
+      "pcache_len_before" : 0,
+      "phase" : "cold",
+      "pld_cycles" : 0,
+      "prefill_seconds" : 223.284583,
+      "prefill_tokens" : 98408,
+      "prompt_bytes" : 306843,
+      "prompt_path" : "\/Users\/fangqingyuan\/Projects\/myds-experiments\/mask-skip-screen-20261028.wkqllxnG\/inputs\/c96-base.prompt.txt",
+      "prompt_sha256" : "d0a3c722eeb5e3e88a074113655e07ed7bae3d35276df3e68970957697c552d1",
+      "stop_reason" : 1,
+      "tokens_bytes" : 393636,
+      "tokens_path" : "\/Users\/fangqingyuan\/Projects\/myds-experiments\/mask-skip-screen-20261028.wkqllxnG\/inputs\/c96-base.tokens.i32le.bin",
+      "tokens_sha256" : "f9af6f93f4a7d8c8fb32369ac58d7a42047499140c21ab4764b6a5c43a062e8e"
+    },
+    {
+      "actual_tokens" : 100288,
+      "batch2_calls" : 0,
+      "cached_tokens" : 98304,
+      "draft_cycles" : 0,
+      "first_callback_seconds" : 10.676628874993185,
+      "generation_seconds" : 10.676632416652865,
+      "output" : {
+        "bytes" : 9,
+        "path" : "warm_append-output.bin",
+        "sha256" : "a52d704cc3acb44b353c767dec99f7a54155bb0e369769e1b69977bb71e07c37"
+      },
+      "output_token_ids" : {
+        "bytes" : 4,
+        "path" : "warm_append-output-token-ids.i32le.bin",
+        "sha256" : "dedfdece21830ac821592698993ccd212416444a2f3ca5aa17622ef83609c5c3"
+      },
+      "pcache_len_after" : 100288,
+      "pcache_len_before" : 98409,
+      "phase" : "warm_append",
+      "pld_cycles" : 0,
+      "prefill_seconds" : 10.615164,
+      "prefill_tokens" : 1983,
+      "prompt_bytes" : 314000,
+      "prompt_path" : "\/Users\/fangqingyuan\/Projects\/myds-experiments\/mask-skip-screen-20261028.wkqllxnG\/inputs\/c96-append.prompt.txt",
+      "prompt_sha256" : "cd732dc5db7b8a65b03d1d57e44374d3c03d580af8f652063c0bffd454ca3e50",
+      "stop_reason" : 1,
+      "tokens_bytes" : 401152,
+      "tokens_path" : "\/Users\/fangqingyuan\/Projects\/myds-experiments\/mask-skip-screen-20261028.wkqllxnG\/inputs\/c96-append.tokens.i32le.bin",
+      "tokens_sha256" : "5559b81ea0160cc78837a6e837d749835f78fe36ca2b9ca5900b7d2f6aa17d98"
+    }
+  ],
+  "post_run_myds_environment" : {
+    "count" : 64,
+    "encoding" : "sorted raw MYDS_ key=value bytes including NUL terminator",
+    "sha256" : "cd02b22d20c9e3f22bca84995e44a7ec5e04be5bc33f77f0048d5094b0d04c25"
+  },
+  "schema_version" : 1,
+  "selected_environment" : {
+    "MYDS_INDEXER_BATCH_FLOATS" : "2097152",
+    "MYDS_INDEXER_MASK_SKIP" : "1",
+    "MYDS_INDEXER_REGISTER_ONLY" : null,
+    "MYDS_INDEXER_TILED" : null,
+    "MYDS_METAL_CONCURRENT" : "1",
+    "MYDS_MOE_CONCURRENT" : "1",
+    "MYDS_PREFILL_ATTN" : null,
+    "MYDS_PREFIX_CACHE" : "1"
+  }
+}
