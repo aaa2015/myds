@@ -77,6 +77,7 @@ Q2_SUM_CACHE_FUSED_ORACLE = $(BIN_DIR)/q2_sum_cache_fused_oracle.metallib
 TEST_DEEPER_SSD = $(BIN_DIR)/test_deeper_ssd
 TEST_GGUF = $(BIN_DIR)/test_gguf
 TEST_TOKENIZER = $(BIN_DIR)/test_tokenizer
+TEST_TOKENIZER_WORKSPACE = $(BIN_DIR)/test_tokenizer_workspace
 TEST_SERVER = $(BIN_DIR)/test_server
 TEST_LOG = $(BIN_DIR)/test_log
 TEST_SERVER_API = $(BIN_DIR)/test_server_api
@@ -138,6 +139,7 @@ $(TEST_GGUF_BYTE_SPLIT): tests/test_gguf_byte_split.c $(BUILD_DIR)/myds_gguf.o |
 	$(CC) $(CFLAGS) -Iinclude -o $@ $< $(BUILD_DIR)/myds_gguf.o $(LDFLAGS)
 
 ALL_TESTS += $(TEST_METAL_RESIDENCY) $(TEST_TEARDOWN_ORDER) $(TEST_DECODE_SPLIT) $(TEST_KVDSK_FIFO) $(TEST_ANCHOR_SLOTS) $(TEST_YOCO_COMPACT) $(TEST_INDEXER_WINDOW) $(TEST_GGUF_BOUNDS) $(TEST_GGUF_SPLIT) $(TEST_GGUF_BYTE_SPLIT)
+ALL_TESTS += $(TEST_TOKENIZER_WORKSPACE)
 
 .PHONY: all test clean bench metallib build-tail-init test-tail-init test-indexer-register-only-host test-register-only-http-bridge test-register-only-service-window audit-ledger gen-ledger bench-register-only corpus-check verify-register-only
 
@@ -432,6 +434,15 @@ $(TEST_GGUF): $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/test_gguf.o | $(BIN_DIR)
 $(TEST_TOKENIZER): $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/test_tokenizer.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@
 
+# CPU-only lifecycle gate: the test includes tokenizer.c to inject failures.
+$(TEST_TOKENIZER_WORKSPACE): tests/test_tokenizer_workspace.c src/myds_tokenizer.c src/myds_tokenizer_unicode.h include/myds_tokenizer.h include/myds_gguf.h $(BUILD_DIR)/myds_gguf.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) $< $(BUILD_DIR)/myds_gguf.o -lpthread -o $@
+
+.PHONY: test-tokenizer
+test-tokenizer: $(TEST_TOKENIZER) $(TEST_TOKENIZER_WORKSPACE)
+	./$(TEST_TOKENIZER)
+	./$(TEST_TOKENIZER_WORKSPACE)
+
 $(TEST_SERVER): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_vjob.o $(BUILD_DIR)/myds_vispre.o $(BUILD_DIR)/myds_visw.o $(BUILD_DIR)/myds_visfwd.o $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_engram_cpu.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_server.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
 
@@ -699,6 +710,7 @@ test: $(ALL_TESTS) $(METALLIB)
 	@./$(TEST_GGUF)
 	@echo ""
 	@./$(TEST_TOKENIZER)
+	@./$(TEST_TOKENIZER_WORKSPACE)
 	@echo ""
 	@./$(TEST_METAL)
 	@./$(TEST_V41_GPU)

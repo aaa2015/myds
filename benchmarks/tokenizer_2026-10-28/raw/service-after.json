@@ -1,0 +1,14 @@
+{
+  "time_utc": "2026-10-28T11:57:14Z",
+  "host": "macstudio.local",
+  "platform": "macOS-27.2-arm64-arm-64bit",
+  "process": "  PID  ELAPSED  %CPU COMMAND\n13659 12:52:14   0.2 /Users/fangqingyuan/Projects/myfleet/../myds/bin/myds --config /Users/fangqingyuan/Projects/myfleet/myds.conf -m /Users/fangqingyuan/Projects/myfleet/../../.lmstudio/models/antirez/deepseek-v4.1-flash-1017/DeepSeek-V4.1-Flash-1017-Q2-dense-q4-imx-cliecy.gguf --port 8187 --host 0.0.0.0 --ctx-size 1048576 --alias local-deepseek-flash --temp 1.0 --top-p 1.0 --max-tokens 262144 --thinking off --vision /Users/fangqingyuan/Projects/myfleet/../../.lmstudio/models/antirez/deepseek-v4.1-flash-1017/DeepSeek-V4.1-Flash-1017-Vision.gguf\n",
+  "health": {
+    "status": "ok"
+  },
+  "sha256": {
+    "bin/myds": "a97976e0a2e2aced06349c203ee7d4d4244688178eee907281a08e3aded2f1dd",
+    "bin/myds.metallib": "fe55793346e15119fce4e0f40d4bf6d3023fc3694ffc231e66b8a89e3ae0f74d"
+  },
+  "memsize": "206158430208"
+}

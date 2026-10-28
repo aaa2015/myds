@@ -1,0 +1,237 @@
+{"baseline_ref": null, "baseline_revision": null, "baseline_source": "/private/tmp/myds-tokenizer-20261028.4JRrr5/baseline.c", "candidate_source": "/private/tmp/myds-tokenizer-20261028.4JRrr5/src/myds_tokenizer.c", "compile_commands": [["clang", "-O3", "-std=c11", "-Wall", "-Wextra", "-mmacosx-version-min=26.0", "-I", "/var/folders/sw/v0kpgmv90r5714m_w2s_lzfh0000gn/T/myds-tokenizer-ab-_ci8_h4u", "-Dmyds_tokenizer_load=baseline_tokenizer_load", "-Dmyds_tokenizer_free=baseline_tokenizer_free", "-Dmyds_tokenizer_encode=baseline_tokenizer_encode", "-Dmyds_tokenizer_encode_bytes=baseline_tokenizer_encode_bytes", "-Dmyds_tokenizer_decode_bytes=baseline_tokenizer_decode_bytes", "-Dmyds_tokenizer_decode_piece=baseline_tokenizer_decode_piece", "-c", "/var/folders/sw/v0kpgmv90r5714m_w2s_lzfh0000gn/T/myds-tokenizer-ab-_ci8_h4u/baseline.c", "-o", "/var/folders/sw/v0kpgmv90r5714m_w2s_lzfh0000gn/T/myds-tokenizer-ab-_ci8_h4u/baseline.o"], ["clang", "-O3", "-std=c11", "-Wall", "-Wextra", "-mmacosx-version-min=26.0", "-I", "/var/folders/sw/v0kpgmv90r5714m_w2s_lzfh0000gn/T/myds-tokenizer-ab-_ci8_h4u", "-c", "/var/folders/sw/v0kpgmv90r5714m_w2s_lzfh0000gn/T/myds-tokenizer-ab-_ci8_h4u/candidate.c", "-o", "/var/folders/sw/v0kpgmv90r5714m_w2s_lzfh0000gn/T/myds-tokenizer-ab-_ci8_h4u/candidate.o"], ["clang", "-O3", "-std=c11", "-Wall", "-Wextra", "-mmacosx-version-min=26.0", "-I", "/var/folders/sw/v0kpgmv90r5714m_w2s_lzfh0000gn/T/myds-tokenizer-ab-_ci8_h4u", "-c", "/var/folders/sw/v0kpgmv90r5714m_w2s_lzfh0000gn/T/myds-tokenizer-ab-_ci8_h4u/gguf.c", "-o", "/var/folders/sw/v0kpgmv90r5714m_w2s_lzfh0000gn/T/myds-tokenizer-ab-_ci8_h4u/gguf.o"], ["clang", "-O3", "-std=c11", "-Wall", "-Wextra", "-mmacosx-version-min=26.0", "-I", "/var/folders/sw/v0kpgmv90r5714m_w2s_lzfh0000gn/T/myds-tokenizer-ab-_ci8_h4u", "-c", "/var/folders/sw/v0kpgmv90r5714m_w2s_lzfh0000gn/T/myds-tokenizer-ab-_ci8_h4u/worker.c", "-o", "/var/folders/sw/v0kpgmv90r5714m_w2s_lzfh0000gn/T/myds-tokenizer-ab-_ci8_h4u/worker.o"], ["clang", "-mmacosx-version-min=26.0", "/var/folders/sw/v0kpgmv90r5714m_w2s_lzfh0000gn/T/myds-tokenizer-ab-_ci8_h4u/baseline.o", "/var/folders/sw/v0kpgmv90r5714m_w2s_lzfh0000gn/T/myds-tokenizer-ab-_ci8_h4u/candidate.o", "/var/folders/sw/v0kpgmv90r5714m_w2s_lzfh0000gn/T/myds-tokenizer-ab-_ci8_h4u/gguf.o", "/var/folders/sw/v0kpgmv90r5714m_w2s_lzfh0000gn/T/myds-tokenizer-ab-_ci8_h4u/worker.o", "-o", "/var/folders/sw/v0kpgmv90r5714m_w2s_lzfh0000gn/T/myds-tokenizer-ab-_ci8_h4u/bench_tokenizer"]], "compiler": "Apple clang version 21.0.0 (clang-2100.3.34.2)", "host": "macstudio.local", "kind": "provenance", "machine": "arm64", "min_batch_ms": 100.0, "platform": "macOS-27.2-arm64-arm-64bit", "samples_per_arm": 15, "sources_sha256": {"baseline.c": "808c432023f5fa2534a4464fbbc7816bb54d86ac44921ba9b7ec2d45e5fcf144", "candidate.c": "17bc8fbe8c4d91f84686db1b67f82c0a8a11dc5d05fe00ad43f4eed9fcf5db7e", "gguf.c": "302c75d3aed17c4c0487fe612657fd00487ba64731309756037fcc49bb9caadf", "myds_gguf.h": "3c94ccf8ff4748e1afd190178732aa2769a535594723a6d3fdf5c0672ffa412b", "myds_tokenizer.h": "292cc9c3ce212cdeb08d9beb4f92a84660b248e8c677c04790b93229e26b451c", "myds_tokenizer_unicode.h": "bfb6f1a5149a813f18212f6216ce10468b962f7e7bd3e88329ef823de1854808", "worker.c": "ee18446a40867de1dad4e58dba45e300d13e429f6a2c83c6506770e49f7ff9f6"}, "timestamp_utc": "2026-10-28T11:55:04Z", "timing_scope": "encode_bytes only; output buffer preallocated; add_bos=false; CPU only; no end-to-end inference claim"}
+{"binary_sha256": "39e3a92ae02c36400e58cefc7f9d322c513df3552c2aedc8b5796fada4c45bec", "kind": "build", "success": true}
+{"kind": "model_metadata", "metadata_bytes": 5762919, "metadata_sha256": "54ae6209c1bc4babbccd2ffc1d627f7ab1058501b2bda951293f994542b77b84", "payload_read": false, "source_bytes": 362142629888, "source_mtime_ns": 1792321832447159977, "source_path": "/Users/fangqingyuan/hf-1017/DeepSeek-V4.1-Flash-1017-Q2-dense-q4-imx-cliecy.gguf", "source_tensor_count": 1046, "tensor_free_gguf_sha256": "86e4916e054314978b1a09424ed24b699afd3dd8175ea66af6325cf61f488bdf"}
+{"bytes": 39, "kind": "input", "path": "/private/tmp/myds-tokenizer-20261028.4JRrr5/corpus/short_ascii.txt", "prompt_index": 0, "sha256": "8878a87a5926b1101198880080ba524be08c9f16bb3ac5ed9c879b95b70e6a09"}
+{"bytes": 47, "kind": "input", "path": "/private/tmp/myds-tokenizer-20261028.4JRrr5/corpus/short_mixed.txt", "prompt_index": 1, "sha256": "c61d8d1893b58bf1786256aebc4853ec8efd6c413f6427b87c8fe6598231d2c5"}
+{"bytes": 262035, "kind": "input", "path": "/private/tmp/myds-tokenizer-20261028.4JRrr5/corpus/english_256k.txt", "prompt_index": 2, "sha256": "9588f5c150bbd3ad1b22291fb159d08646bcf55b793d0d6551ae2bd535e9edee"}
+{"bytes": 262143, "kind": "input", "path": "/private/tmp/myds-tokenizer-20261028.4JRrr5/corpus/code_256k.txt", "prompt_index": 3, "sha256": "87539cfd30fbd7a160b18bb850622494d1f56017a3fdb52f798b35fdb1a830fa"}
+{"bytes": 131005, "kind": "input", "path": "/private/tmp/myds-tokenizer-20261028.4JRrr5/corpus/chinese_128k.txt", "prompt_index": 4, "sha256": "abf059169941b697d36a23ef856b61269754d3d59332dd901fdc0c97cab6e360"}
+{"bytes": 524043, "kind": "input", "path": "/private/tmp/myds-tokenizer-20261028.4JRrr5/corpus/mixed_512k.txt", "prompt_index": 5, "sha256": "395bf36c950095a4e2d5258c236909da90bb23413f1fba282bcfdbdbe2129e34"}
+{"bytes": 24593, "kind": "input", "path": "/private/tmp/myds-tokenizer-20261028.4JRrr5/corpus/long_piece.txt", "prompt_index": 6, "sha256": "373b6e8b8636da2bdd5d06bed243fd9043533911c1a3e7d9f41cd13dd30de173"}
+{"command": ["/var/folders/sw/v0kpgmv90r5714m_w2s_lzfh0000gn/T/myds-tokenizer-ab-_ci8_h4u/bench_tokenizer", "/var/folders/sw/v0kpgmv90r5714m_w2s_lzfh0000gn/T/myds-tokenizer-ab-_ci8_h4u/metadata.gguf", "15", "100.0", "256", "20261028", "/var/folders/sw/v0kpgmv90r5714m_w2s_lzfh0000gn/T/myds-tokenizer-ab-_ci8_h4u/prompt-0.bin", "/var/folders/sw/v0kpgmv90r5714m_w2s_lzfh0000gn/T/myds-tokenizer-ab-_ci8_h4u/prompt-1.bin", "/var/folders/sw/v0kpgmv90r5714m_w2s_lzfh0000gn/T/myds-tokenizer-ab-_ci8_h4u/prompt-2.bin", "/var/folders/sw/v0kpgmv90r5714m_w2s_lzfh0000gn/T/myds-tokenizer-ab-_ci8_h4u/prompt-3.bin", "/var/folders/sw/v0kpgmv90r5714m_w2s_lzfh0000gn/T/myds-tokenizer-ab-_ci8_h4u/prompt-4.bin", "/var/folders/sw/v0kpgmv90r5714m_w2s_lzfh0000gn/T/myds-tokenizer-ab-_ci8_h4u/prompt-5.bin", "/var/folders/sw/v0kpgmv90r5714m_w2s_lzfh0000gn/T/myds-tokenizer-ab-_ci8_h4u/prompt-6.bin"], "kind": "run"}
+{"input_cases": 1541, "kind": "correctness", "pass": true, "random_cases": 256, "scope": "random_and_specials", "seed": 20261028, "special_cases": 1283}
+{"bytes": 39, "kind": "correctness", "pass": true, "prompt_index": 0, "scope": "prompt", "tokens": 8}
+{"baseline_ns": 2000, "candidate_ns": 1000, "kind": "warmup", "prompt_index": 0, "repetitions": 100000}
+{"arm": "baseline", "elapsed_ns": 134285000, "kind": "sample", "ns_per_encode": 1342.85, "order": 0, "prompt_index": 0, "repetitions": 100000, "sample": 0}
+{"arm": "candidate", "elapsed_ns": 76639000, "kind": "sample", "ns_per_encode": 766.39, "order": 1, "prompt_index": 0, "repetitions": 100000, "sample": 0}
+{"arm": "candidate", "elapsed_ns": 76402000, "kind": "sample", "ns_per_encode": 764.02, "order": 0, "prompt_index": 0, "repetitions": 100000, "sample": 1}
+{"arm": "baseline", "elapsed_ns": 131283000, "kind": "sample", "ns_per_encode": 1312.83, "order": 1, "prompt_index": 0, "repetitions": 100000, "sample": 1}
+{"arm": "baseline", "elapsed_ns": 131205000, "kind": "sample", "ns_per_encode": 1312.05, "order": 0, "prompt_index": 0, "repetitions": 100000, "sample": 2}
+{"arm": "candidate", "elapsed_ns": 76728000, "kind": "sample", "ns_per_encode": 767.28, "order": 1, "prompt_index": 0, "repetitions": 100000, "sample": 2}
+{"arm": "candidate", "elapsed_ns": 76653000, "kind": "sample", "ns_per_encode": 766.53, "order": 0, "prompt_index": 0, "repetitions": 100000, "sample": 3}
+{"arm": "baseline", "elapsed_ns": 131240000, "kind": "sample", "ns_per_encode": 1312.4, "order": 1, "prompt_index": 0, "repetitions": 100000, "sample": 3}
+{"arm": "baseline", "elapsed_ns": 130916000, "kind": "sample", "ns_per_encode": 1309.16, "order": 0, "prompt_index": 0, "repetitions": 100000, "sample": 4}
+{"arm": "candidate", "elapsed_ns": 76410000, "kind": "sample", "ns_per_encode": 764.1, "order": 1, "prompt_index": 0, "repetitions": 100000, "sample": 4}
+{"arm": "candidate", "elapsed_ns": 76356000, "kind": "sample", "ns_per_encode": 763.56, "order": 0, "prompt_index": 0, "repetitions": 100000, "sample": 5}
+{"arm": "baseline", "elapsed_ns": 131050000, "kind": "sample", "ns_per_encode": 1310.5, "order": 1, "prompt_index": 0, "repetitions": 100000, "sample": 5}
+{"arm": "baseline", "elapsed_ns": 131173000, "kind": "sample", "ns_per_encode": 1311.73, "order": 0, "prompt_index": 0, "repetitions": 100000, "sample": 6}
+{"arm": "candidate", "elapsed_ns": 76569000, "kind": "sample", "ns_per_encode": 765.69, "order": 1, "prompt_index": 0, "repetitions": 100000, "sample": 6}
+{"arm": "candidate", "elapsed_ns": 76285000, "kind": "sample", "ns_per_encode": 762.85, "order": 0, "prompt_index": 0, "repetitions": 100000, "sample": 7}
+{"arm": "baseline", "elapsed_ns": 131253000, "kind": "sample", "ns_per_encode": 1312.53, "order": 1, "prompt_index": 0, "repetitions": 100000, "sample": 7}
+{"arm": "baseline", "elapsed_ns": 131113000, "kind": "sample", "ns_per_encode": 1311.13, "order": 0, "prompt_index": 0, "repetitions": 100000, "sample": 8}
+{"arm": "candidate", "elapsed_ns": 76406000, "kind": "sample", "ns_per_encode": 764.06, "order": 1, "prompt_index": 0, "repetitions": 100000, "sample": 8}
+{"arm": "candidate", "elapsed_ns": 76641000, "kind": "sample", "ns_per_encode": 766.41, "order": 0, "prompt_index": 0, "repetitions": 100000, "sample": 9}
+{"arm": "baseline", "elapsed_ns": 131299000, "kind": "sample", "ns_per_encode": 1312.99, "order": 1, "prompt_index": 0, "repetitions": 100000, "sample": 9}
+{"arm": "baseline", "elapsed_ns": 131515000, "kind": "sample", "ns_per_encode": 1315.15, "order": 0, "prompt_index": 0, "repetitions": 100000, "sample": 10}
+{"arm": "candidate", "elapsed_ns": 76381000, "kind": "sample", "ns_per_encode": 763.81, "order": 1, "prompt_index": 0, "repetitions": 100000, "sample": 10}
+{"arm": "candidate", "elapsed_ns": 76363000, "kind": "sample", "ns_per_encode": 763.63, "order": 0, "prompt_index": 0, "repetitions": 100000, "sample": 11}
+{"arm": "baseline", "elapsed_ns": 131398000, "kind": "sample", "ns_per_encode": 1313.98, "order": 1, "prompt_index": 0, "repetitions": 100000, "sample": 11}
+{"arm": "baseline", "elapsed_ns": 131532000, "kind": "sample", "ns_per_encode": 1315.32, "order": 0, "prompt_index": 0, "repetitions": 100000, "sample": 12}
+{"arm": "candidate", "elapsed_ns": 76467000, "kind": "sample", "ns_per_encode": 764.67, "order": 1, "prompt_index": 0, "repetitions": 100000, "sample": 12}
+{"arm": "candidate", "elapsed_ns": 76405000, "kind": "sample", "ns_per_encode": 764.05, "order": 0, "prompt_index": 0, "repetitions": 100000, "sample": 13}
+{"arm": "baseline", "elapsed_ns": 131462000, "kind": "sample", "ns_per_encode": 1314.62, "order": 1, "prompt_index": 0, "repetitions": 100000, "sample": 13}
+{"arm": "baseline", "elapsed_ns": 131360000, "kind": "sample", "ns_per_encode": 1313.6, "order": 0, "prompt_index": 0, "repetitions": 100000, "sample": 14}
+{"arm": "candidate", "elapsed_ns": 76617000, "kind": "sample", "ns_per_encode": 766.17, "order": 1, "prompt_index": 0, "repetitions": 100000, "sample": 14}
+{"bytes": 47, "kind": "correctness", "pass": true, "prompt_index": 1, "scope": "prompt", "tokens": 11}
+{"baseline_ns": 4000, "candidate_ns": 4000, "kind": "warmup", "prompt_index": 1, "repetitions": 25000}
+{"arm": "baseline", "elapsed_ns": 80833000, "kind": "sample", "ns_per_encode": 3233.32, "order": 0, "prompt_index": 1, "repetitions": 25000, "sample": 0}
+{"arm": "candidate", "elapsed_ns": 73790000, "kind": "sample", "ns_per_encode": 2951.6, "order": 1, "prompt_index": 1, "repetitions": 25000, "sample": 0}
+{"arm": "candidate", "elapsed_ns": 73883000, "kind": "sample", "ns_per_encode": 2955.32, "order": 0, "prompt_index": 1, "repetitions": 25000, "sample": 1}
+{"arm": "baseline", "elapsed_ns": 80552000, "kind": "sample", "ns_per_encode": 3222.08, "order": 1, "prompt_index": 1, "repetitions": 25000, "sample": 1}
+{"arm": "baseline", "elapsed_ns": 80461000, "kind": "sample", "ns_per_encode": 3218.44, "order": 0, "prompt_index": 1, "repetitions": 25000, "sample": 2}
+{"arm": "candidate", "elapsed_ns": 73760000, "kind": "sample", "ns_per_encode": 2950.4, "order": 1, "prompt_index": 1, "repetitions": 25000, "sample": 2}
+{"arm": "candidate", "elapsed_ns": 73888000, "kind": "sample", "ns_per_encode": 2955.52, "order": 0, "prompt_index": 1, "repetitions": 25000, "sample": 3}
+{"arm": "baseline", "elapsed_ns": 80476000, "kind": "sample", "ns_per_encode": 3219.04, "order": 1, "prompt_index": 1, "repetitions": 25000, "sample": 3}
+{"arm": "baseline", "elapsed_ns": 80581000, "kind": "sample", "ns_per_encode": 3223.24, "order": 0, "prompt_index": 1, "repetitions": 25000, "sample": 4}
+{"arm": "candidate", "elapsed_ns": 73849000, "kind": "sample", "ns_per_encode": 2953.96, "order": 1, "prompt_index": 1, "repetitions": 25000, "sample": 4}
+{"arm": "candidate", "elapsed_ns": 73971000, "kind": "sample", "ns_per_encode": 2958.84, "order": 0, "prompt_index": 1, "repetitions": 25000, "sample": 5}
+{"arm": "baseline", "elapsed_ns": 80473000, "kind": "sample", "ns_per_encode": 3218.92, "order": 1, "prompt_index": 1, "repetitions": 25000, "sample": 5}
+{"arm": "baseline", "elapsed_ns": 80537000, "kind": "sample", "ns_per_encode": 3221.48, "order": 0, "prompt_index": 1, "repetitions": 25000, "sample": 6}
+{"arm": "candidate", "elapsed_ns": 73728000, "kind": "sample", "ns_per_encode": 2949.12, "order": 1, "prompt_index": 1, "repetitions": 25000, "sample": 6}
+{"arm": "candidate", "elapsed_ns": 73799000, "kind": "sample", "ns_per_encode": 2951.96, "order": 0, "prompt_index": 1, "repetitions": 25000, "sample": 7}
+{"arm": "baseline", "elapsed_ns": 80426000, "kind": "sample", "ns_per_encode": 3217.04, "order": 1, "prompt_index": 1, "repetitions": 25000, "sample": 7}
+{"arm": "baseline", "elapsed_ns": 80393000, "kind": "sample", "ns_per_encode": 3215.72, "order": 0, "prompt_index": 1, "repetitions": 25000, "sample": 8}
+{"arm": "candidate", "elapsed_ns": 73850000, "kind": "sample", "ns_per_encode": 2954.0, "order": 1, "prompt_index": 1, "repetitions": 25000, "sample": 8}
+{"arm": "candidate", "elapsed_ns": 73745000, "kind": "sample", "ns_per_encode": 2949.8, "order": 0, "prompt_index": 1, "repetitions": 25000, "sample": 9}
+{"arm": "baseline", "elapsed_ns": 80603000, "kind": "sample", "ns_per_encode": 3224.12, "order": 1, "prompt_index": 1, "repetitions": 25000, "sample": 9}
+{"arm": "baseline", "elapsed_ns": 80445000, "kind": "sample", "ns_per_encode": 3217.8, "order": 0, "prompt_index": 1, "repetitions": 25000, "sample": 10}
+{"arm": "candidate", "elapsed_ns": 73847000, "kind": "sample", "ns_per_encode": 2953.88, "order": 1, "prompt_index": 1, "repetitions": 25000, "sample": 10}
+{"arm": "candidate", "elapsed_ns": 73843000, "kind": "sample", "ns_per_encode": 2953.72, "order": 0, "prompt_index": 1, "repetitions": 25000, "sample": 11}
+{"arm": "baseline", "elapsed_ns": 80427000, "kind": "sample", "ns_per_encode": 3217.08, "order": 1, "prompt_index": 1, "repetitions": 25000, "sample": 11}
+{"arm": "baseline", "elapsed_ns": 80512000, "kind": "sample", "ns_per_encode": 3220.48, "order": 0, "prompt_index": 1, "repetitions": 25000, "sample": 12}
+{"arm": "candidate", "elapsed_ns": 73693000, "kind": "sample", "ns_per_encode": 2947.72, "order": 1, "prompt_index": 1, "repetitions": 25000, "sample": 12}
+{"arm": "candidate", "elapsed_ns": 73794000, "kind": "sample", "ns_per_encode": 2951.76, "order": 0, "prompt_index": 1, "repetitions": 25000, "sample": 13}
+{"arm": "baseline", "elapsed_ns": 80487000, "kind": "sample", "ns_per_encode": 3219.48, "order": 1, "prompt_index": 1, "repetitions": 25000, "sample": 13}
+{"arm": "baseline", "elapsed_ns": 80331000, "kind": "sample", "ns_per_encode": 3213.24, "order": 0, "prompt_index": 1, "repetitions": 25000, "sample": 14}
+{"arm": "candidate", "elapsed_ns": 73795000, "kind": "sample", "ns_per_encode": 2951.8, "order": 1, "prompt_index": 1, "repetitions": 25000, "sample": 14}
+{"bytes": 262035, "kind": "correctness", "pass": true, "prompt_index": 2, "scope": "prompt", "tokens": 48525}
+{"baseline_ns": 9737000, "candidate_ns": 5006000, "kind": "warmup", "prompt_index": 2, "repetitions": 20}
+{"arm": "baseline", "elapsed_ns": 194685000, "kind": "sample", "ns_per_encode": 9734250.0, "order": 0, "prompt_index": 2, "repetitions": 20, "sample": 0}
+{"arm": "candidate", "elapsed_ns": 99634000, "kind": "sample", "ns_per_encode": 4981700.0, "order": 1, "prompt_index": 2, "repetitions": 20, "sample": 0}
+{"arm": "candidate", "elapsed_ns": 99562000, "kind": "sample", "ns_per_encode": 4978100.0, "order": 0, "prompt_index": 2, "repetitions": 20, "sample": 1}
+{"arm": "baseline", "elapsed_ns": 194800000, "kind": "sample", "ns_per_encode": 9740000.0, "order": 1, "prompt_index": 2, "repetitions": 20, "sample": 1}
+{"arm": "baseline", "elapsed_ns": 194887000, "kind": "sample", "ns_per_encode": 9744350.0, "order": 0, "prompt_index": 2, "repetitions": 20, "sample": 2}
+{"arm": "candidate", "elapsed_ns": 99769000, "kind": "sample", "ns_per_encode": 4988450.0, "order": 1, "prompt_index": 2, "repetitions": 20, "sample": 2}
+{"arm": "candidate", "elapsed_ns": 99703000, "kind": "sample", "ns_per_encode": 4985150.0, "order": 0, "prompt_index": 2, "repetitions": 20, "sample": 3}
+{"arm": "baseline", "elapsed_ns": 194555000, "kind": "sample", "ns_per_encode": 9727750.0, "order": 1, "prompt_index": 2, "repetitions": 20, "sample": 3}
+{"arm": "baseline", "elapsed_ns": 195209000, "kind": "sample", "ns_per_encode": 9760450.0, "order": 0, "prompt_index": 2, "repetitions": 20, "sample": 4}
+{"arm": "candidate", "elapsed_ns": 99588000, "kind": "sample", "ns_per_encode": 4979400.0, "order": 1, "prompt_index": 2, "repetitions": 20, "sample": 4}
+{"arm": "candidate", "elapsed_ns": 99458000, "kind": "sample", "ns_per_encode": 4972900.0, "order": 0, "prompt_index": 2, "repetitions": 20, "sample": 5}
+{"arm": "baseline", "elapsed_ns": 195118000, "kind": "sample", "ns_per_encode": 9755900.0, "order": 1, "prompt_index": 2, "repetitions": 20, "sample": 5}
+{"arm": "baseline", "elapsed_ns": 195086000, "kind": "sample", "ns_per_encode": 9754300.0, "order": 0, "prompt_index": 2, "repetitions": 20, "sample": 6}
+{"arm": "candidate", "elapsed_ns": 99505000, "kind": "sample", "ns_per_encode": 4975250.0, "order": 1, "prompt_index": 2, "repetitions": 20, "sample": 6}
+{"arm": "candidate", "elapsed_ns": 99595000, "kind": "sample", "ns_per_encode": 4979750.0, "order": 0, "prompt_index": 2, "repetitions": 20, "sample": 7}
+{"arm": "baseline", "elapsed_ns": 195171000, "kind": "sample", "ns_per_encode": 9758550.0, "order": 1, "prompt_index": 2, "repetitions": 20, "sample": 7}
+{"arm": "baseline", "elapsed_ns": 195133000, "kind": "sample", "ns_per_encode": 9756650.0, "order": 0, "prompt_index": 2, "repetitions": 20, "sample": 8}
+{"arm": "candidate", "elapsed_ns": 99811000, "kind": "sample", "ns_per_encode": 4990550.0, "order": 1, "prompt_index": 2, "repetitions": 20, "sample": 8}
+{"arm": "candidate", "elapsed_ns": 99611000, "kind": "sample", "ns_per_encode": 4980550.0, "order": 0, "prompt_index": 2, "repetitions": 20, "sample": 9}
+{"arm": "baseline", "elapsed_ns": 194398000, "kind": "sample", "ns_per_encode": 9719900.0, "order": 1, "prompt_index": 2, "repetitions": 20, "sample": 9}
+{"arm": "baseline", "elapsed_ns": 194845000, "kind": "sample", "ns_per_encode": 9742250.0, "order": 0, "prompt_index": 2, "repetitions": 20, "sample": 10}
+{"arm": "candidate", "elapsed_ns": 99626000, "kind": "sample", "ns_per_encode": 4981300.0, "order": 1, "prompt_index": 2, "repetitions": 20, "sample": 10}
+{"arm": "candidate", "elapsed_ns": 99495000, "kind": "sample", "ns_per_encode": 4974750.0, "order": 0, "prompt_index": 2, "repetitions": 20, "sample": 11}
+{"arm": "baseline", "elapsed_ns": 194776000, "kind": "sample", "ns_per_encode": 9738800.0, "order": 1, "prompt_index": 2, "repetitions": 20, "sample": 11}
+{"arm": "baseline", "elapsed_ns": 194747000, "kind": "sample", "ns_per_encode": 9737350.0, "order": 0, "prompt_index": 2, "repetitions": 20, "sample": 12}
+{"arm": "candidate", "elapsed_ns": 99550000, "kind": "sample", "ns_per_encode": 4977500.0, "order": 1, "prompt_index": 2, "repetitions": 20, "sample": 12}
+{"arm": "candidate", "elapsed_ns": 99548000, "kind": "sample", "ns_per_encode": 4977400.0, "order": 0, "prompt_index": 2, "repetitions": 20, "sample": 13}
+{"arm": "baseline", "elapsed_ns": 195197000, "kind": "sample", "ns_per_encode": 9759850.0, "order": 1, "prompt_index": 2, "repetitions": 20, "sample": 13}
+{"arm": "baseline", "elapsed_ns": 194168000, "kind": "sample", "ns_per_encode": 9708400.0, "order": 0, "prompt_index": 2, "repetitions": 20, "sample": 14}
+{"arm": "candidate", "elapsed_ns": 99568000, "kind": "sample", "ns_per_encode": 4978400.0, "order": 1, "prompt_index": 2, "repetitions": 20, "sample": 14}
+{"bytes": 262143, "kind": "correctness", "pass": true, "prompt_index": 3, "scope": "prompt", "tokens": 75411}
+{"baseline_ns": 10272000, "candidate_ns": 4747000, "kind": "warmup", "prompt_index": 3, "repetitions": 22}
+{"arm": "baseline", "elapsed_ns": 222691000, "kind": "sample", "ns_per_encode": 10122318.181818, "order": 0, "prompt_index": 3, "repetitions": 22, "sample": 0}
+{"arm": "candidate", "elapsed_ns": 103828000, "kind": "sample", "ns_per_encode": 4719454.545455, "order": 1, "prompt_index": 3, "repetitions": 22, "sample": 0}
+{"arm": "candidate", "elapsed_ns": 103468000, "kind": "sample", "ns_per_encode": 4703090.909091, "order": 0, "prompt_index": 3, "repetitions": 22, "sample": 1}
+{"arm": "baseline", "elapsed_ns": 223298000, "kind": "sample", "ns_per_encode": 10149909.090909, "order": 1, "prompt_index": 3, "repetitions": 22, "sample": 1}
+{"arm": "baseline", "elapsed_ns": 223701000, "kind": "sample", "ns_per_encode": 10168227.272727, "order": 0, "prompt_index": 3, "repetitions": 22, "sample": 2}
+{"arm": "candidate", "elapsed_ns": 102970000, "kind": "sample", "ns_per_encode": 4680454.545455, "order": 1, "prompt_index": 3, "repetitions": 22, "sample": 2}
+{"arm": "candidate", "elapsed_ns": 103186000, "kind": "sample", "ns_per_encode": 4690272.727273, "order": 0, "prompt_index": 3, "repetitions": 22, "sample": 3}
+{"arm": "baseline", "elapsed_ns": 222437000, "kind": "sample", "ns_per_encode": 10110772.727273, "order": 1, "prompt_index": 3, "repetitions": 22, "sample": 3}
+{"arm": "baseline", "elapsed_ns": 222285000, "kind": "sample", "ns_per_encode": 10103863.636364, "order": 0, "prompt_index": 3, "repetitions": 22, "sample": 4}
+{"arm": "candidate", "elapsed_ns": 102932000, "kind": "sample", "ns_per_encode": 4678727.272727, "order": 1, "prompt_index": 3, "repetitions": 22, "sample": 4}
+{"arm": "candidate", "elapsed_ns": 102825000, "kind": "sample", "ns_per_encode": 4673863.636364, "order": 0, "prompt_index": 3, "repetitions": 22, "sample": 5}
+{"arm": "baseline", "elapsed_ns": 222086000, "kind": "sample", "ns_per_encode": 10094818.181818, "order": 1, "prompt_index": 3, "repetitions": 22, "sample": 5}
+{"arm": "baseline", "elapsed_ns": 222131000, "kind": "sample", "ns_per_encode": 10096863.636364, "order": 0, "prompt_index": 3, "repetitions": 22, "sample": 6}
+{"arm": "candidate", "elapsed_ns": 102583000, "kind": "sample", "ns_per_encode": 4662863.636364, "order": 1, "prompt_index": 3, "repetitions": 22, "sample": 6}
+{"arm": "candidate", "elapsed_ns": 102705000, "kind": "sample", "ns_per_encode": 4668409.090909, "order": 0, "prompt_index": 3, "repetitions": 22, "sample": 7}
+{"arm": "baseline", "elapsed_ns": 221369000, "kind": "sample", "ns_per_encode": 10062227.272727, "order": 1, "prompt_index": 3, "repetitions": 22, "sample": 7}
+{"arm": "baseline", "elapsed_ns": 221383000, "kind": "sample", "ns_per_encode": 10062863.636364, "order": 0, "prompt_index": 3, "repetitions": 22, "sample": 8}
+{"arm": "candidate", "elapsed_ns": 103266000, "kind": "sample", "ns_per_encode": 4693909.090909, "order": 1, "prompt_index": 3, "repetitions": 22, "sample": 8}
+{"arm": "candidate", "elapsed_ns": 103057000, "kind": "sample", "ns_per_encode": 4684409.090909, "order": 0, "prompt_index": 3, "repetitions": 22, "sample": 9}
+{"arm": "baseline", "elapsed_ns": 221311000, "kind": "sample", "ns_per_encode": 10059590.909091, "order": 1, "prompt_index": 3, "repetitions": 22, "sample": 9}
+{"arm": "baseline", "elapsed_ns": 220982000, "kind": "sample", "ns_per_encode": 10044636.363636, "order": 0, "prompt_index": 3, "repetitions": 22, "sample": 10}
+{"arm": "candidate", "elapsed_ns": 102925000, "kind": "sample", "ns_per_encode": 4678409.090909, "order": 1, "prompt_index": 3, "repetitions": 22, "sample": 10}
+{"arm": "candidate", "elapsed_ns": 102889000, "kind": "sample", "ns_per_encode": 4676772.727273, "order": 0, "prompt_index": 3, "repetitions": 22, "sample": 11}
+{"arm": "baseline", "elapsed_ns": 222486000, "kind": "sample", "ns_per_encode": 10113000.0, "order": 1, "prompt_index": 3, "repetitions": 22, "sample": 11}
+{"arm": "baseline", "elapsed_ns": 222364000, "kind": "sample", "ns_per_encode": 10107454.545455, "order": 0, "prompt_index": 3, "repetitions": 22, "sample": 12}
+{"arm": "candidate", "elapsed_ns": 102923000, "kind": "sample", "ns_per_encode": 4678318.181818, "order": 1, "prompt_index": 3, "repetitions": 22, "sample": 12}
+{"arm": "candidate", "elapsed_ns": 102802000, "kind": "sample", "ns_per_encode": 4672818.181818, "order": 0, "prompt_index": 3, "repetitions": 22, "sample": 13}
+{"arm": "baseline", "elapsed_ns": 223065000, "kind": "sample", "ns_per_encode": 10139318.181818, "order": 1, "prompt_index": 3, "repetitions": 22, "sample": 13}
+{"arm": "baseline", "elapsed_ns": 222061000, "kind": "sample", "ns_per_encode": 10093681.818182, "order": 0, "prompt_index": 3, "repetitions": 22, "sample": 14}
+{"arm": "candidate", "elapsed_ns": 102607000, "kind": "sample", "ns_per_encode": 4663954.545455, "order": 1, "prompt_index": 3, "repetitions": 22, "sample": 14}
+{"bytes": 131005, "kind": "correctness", "pass": true, "prompt_index": 4, "scope": "prompt", "tokens": 21670}
+{"baseline_ns": 6506000, "candidate_ns": 6302000, "kind": "warmup", "prompt_index": 4, "repetitions": 16}
+{"arm": "baseline", "elapsed_ns": 104144000, "kind": "sample", "ns_per_encode": 6509000.0, "order": 0, "prompt_index": 4, "repetitions": 16, "sample": 0}
+{"arm": "candidate", "elapsed_ns": 100755000, "kind": "sample", "ns_per_encode": 6297187.5, "order": 1, "prompt_index": 4, "repetitions": 16, "sample": 0}
+{"arm": "candidate", "elapsed_ns": 100770000, "kind": "sample", "ns_per_encode": 6298125.0, "order": 0, "prompt_index": 4, "repetitions": 16, "sample": 1}
+{"arm": "baseline", "elapsed_ns": 104346000, "kind": "sample", "ns_per_encode": 6521625.0, "order": 1, "prompt_index": 4, "repetitions": 16, "sample": 1}
+{"arm": "baseline", "elapsed_ns": 104155000, "kind": "sample", "ns_per_encode": 6509687.5, "order": 0, "prompt_index": 4, "repetitions": 16, "sample": 2}
+{"arm": "candidate", "elapsed_ns": 100484000, "kind": "sample", "ns_per_encode": 6280250.0, "order": 1, "prompt_index": 4, "repetitions": 16, "sample": 2}
+{"arm": "candidate", "elapsed_ns": 101024000, "kind": "sample", "ns_per_encode": 6314000.0, "order": 0, "prompt_index": 4, "repetitions": 16, "sample": 3}
+{"arm": "baseline", "elapsed_ns": 104268000, "kind": "sample", "ns_per_encode": 6516750.0, "order": 1, "prompt_index": 4, "repetitions": 16, "sample": 3}
+{"arm": "baseline", "elapsed_ns": 103970000, "kind": "sample", "ns_per_encode": 6498125.0, "order": 0, "prompt_index": 4, "repetitions": 16, "sample": 4}
+{"arm": "candidate", "elapsed_ns": 100775000, "kind": "sample", "ns_per_encode": 6298437.5, "order": 1, "prompt_index": 4, "repetitions": 16, "sample": 4}
+{"arm": "candidate", "elapsed_ns": 100712000, "kind": "sample", "ns_per_encode": 6294500.0, "order": 0, "prompt_index": 4, "repetitions": 16, "sample": 5}
+{"arm": "baseline", "elapsed_ns": 104079000, "kind": "sample", "ns_per_encode": 6504937.5, "order": 1, "prompt_index": 4, "repetitions": 16, "sample": 5}
+{"arm": "baseline", "elapsed_ns": 104613000, "kind": "sample", "ns_per_encode": 6538312.5, "order": 0, "prompt_index": 4, "repetitions": 16, "sample": 6}
+{"arm": "candidate", "elapsed_ns": 100913000, "kind": "sample", "ns_per_encode": 6307062.5, "order": 1, "prompt_index": 4, "repetitions": 16, "sample": 6}
+{"arm": "candidate", "elapsed_ns": 100848000, "kind": "sample", "ns_per_encode": 6303000.0, "order": 0, "prompt_index": 4, "repetitions": 16, "sample": 7}
+{"arm": "baseline", "elapsed_ns": 104797000, "kind": "sample", "ns_per_encode": 6549812.5, "order": 1, "prompt_index": 4, "repetitions": 16, "sample": 7}
+{"arm": "baseline", "elapsed_ns": 104410000, "kind": "sample", "ns_per_encode": 6525625.0, "order": 0, "prompt_index": 4, "repetitions": 16, "sample": 8}
+{"arm": "candidate", "elapsed_ns": 100908000, "kind": "sample", "ns_per_encode": 6306750.0, "order": 1, "prompt_index": 4, "repetitions": 16, "sample": 8}
+{"arm": "candidate", "elapsed_ns": 100854000, "kind": "sample", "ns_per_encode": 6303375.0, "order": 0, "prompt_index": 4, "repetitions": 16, "sample": 9}
+{"arm": "baseline", "elapsed_ns": 104423000, "kind": "sample", "ns_per_encode": 6526437.5, "order": 1, "prompt_index": 4, "repetitions": 16, "sample": 9}
+{"arm": "baseline", "elapsed_ns": 104326000, "kind": "sample", "ns_per_encode": 6520375.0, "order": 0, "prompt_index": 4, "repetitions": 16, "sample": 10}
+{"arm": "candidate", "elapsed_ns": 100911000, "kind": "sample", "ns_per_encode": 6306937.5, "order": 1, "prompt_index": 4, "repetitions": 16, "sample": 10}
+{"arm": "candidate", "elapsed_ns": 101136000, "kind": "sample", "ns_per_encode": 6321000.0, "order": 0, "prompt_index": 4, "repetitions": 16, "sample": 11}
+{"arm": "baseline", "elapsed_ns": 104450000, "kind": "sample", "ns_per_encode": 6528125.0, "order": 1, "prompt_index": 4, "repetitions": 16, "sample": 11}
+{"arm": "baseline", "elapsed_ns": 104375000, "kind": "sample", "ns_per_encode": 6523437.5, "order": 0, "prompt_index": 4, "repetitions": 16, "sample": 12}
+{"arm": "candidate", "elapsed_ns": 100893000, "kind": "sample", "ns_per_encode": 6305812.5, "order": 1, "prompt_index": 4, "repetitions": 16, "sample": 12}
+{"arm": "candidate", "elapsed_ns": 101079000, "kind": "sample", "ns_per_encode": 6317437.5, "order": 0, "prompt_index": 4, "repetitions": 16, "sample": 13}
+{"arm": "baseline", "elapsed_ns": 104542000, "kind": "sample", "ns_per_encode": 6533875.0, "order": 1, "prompt_index": 4, "repetitions": 16, "sample": 13}
+{"arm": "baseline", "elapsed_ns": 104738000, "kind": "sample", "ns_per_encode": 6546125.0, "order": 0, "prompt_index": 4, "repetitions": 16, "sample": 14}
+{"arm": "candidate", "elapsed_ns": 101024000, "kind": "sample", "ns_per_encode": 6314000.0, "order": 1, "prompt_index": 4, "repetitions": 16, "sample": 14}
+{"bytes": 524043, "kind": "correctness", "pass": true, "prompt_index": 5, "scope": "prompt", "tokens": 147807}
+{"baseline_ns": 22499000, "candidate_ns": 14988000, "kind": "warmup", "prompt_index": 5, "repetitions": 7}
+{"arm": "baseline", "elapsed_ns": 157409000, "kind": "sample", "ns_per_encode": 22487000.0, "order": 0, "prompt_index": 5, "repetitions": 7, "sample": 0}
+{"arm": "candidate", "elapsed_ns": 104836000, "kind": "sample", "ns_per_encode": 14976571.428571, "order": 1, "prompt_index": 5, "repetitions": 7, "sample": 0}
+{"arm": "candidate", "elapsed_ns": 104994000, "kind": "sample", "ns_per_encode": 14999142.857143, "order": 0, "prompt_index": 5, "repetitions": 7, "sample": 1}
+{"arm": "baseline", "elapsed_ns": 157410000, "kind": "sample", "ns_per_encode": 22487142.857143, "order": 1, "prompt_index": 5, "repetitions": 7, "sample": 1}
+{"arm": "baseline", "elapsed_ns": 157742000, "kind": "sample", "ns_per_encode": 22534571.428571, "order": 0, "prompt_index": 5, "repetitions": 7, "sample": 2}
+{"arm": "candidate", "elapsed_ns": 104641000, "kind": "sample", "ns_per_encode": 14948714.285714, "order": 1, "prompt_index": 5, "repetitions": 7, "sample": 2}
+{"arm": "candidate", "elapsed_ns": 105205000, "kind": "sample", "ns_per_encode": 15029285.714286, "order": 0, "prompt_index": 5, "repetitions": 7, "sample": 3}
+{"arm": "baseline", "elapsed_ns": 157811000, "kind": "sample", "ns_per_encode": 22544428.571429, "order": 1, "prompt_index": 5, "repetitions": 7, "sample": 3}
+{"arm": "baseline", "elapsed_ns": 157870000, "kind": "sample", "ns_per_encode": 22552857.142857, "order": 0, "prompt_index": 5, "repetitions": 7, "sample": 4}
+{"arm": "candidate", "elapsed_ns": 104756000, "kind": "sample", "ns_per_encode": 14965142.857143, "order": 1, "prompt_index": 5, "repetitions": 7, "sample": 4}
+{"arm": "candidate", "elapsed_ns": 104936000, "kind": "sample", "ns_per_encode": 14990857.142857, "order": 0, "prompt_index": 5, "repetitions": 7, "sample": 5}
+{"arm": "baseline", "elapsed_ns": 157600000, "kind": "sample", "ns_per_encode": 22514285.714286, "order": 1, "prompt_index": 5, "repetitions": 7, "sample": 5}
+{"arm": "baseline", "elapsed_ns": 157702000, "kind": "sample", "ns_per_encode": 22528857.142857, "order": 0, "prompt_index": 5, "repetitions": 7, "sample": 6}
+{"arm": "candidate", "elapsed_ns": 104648000, "kind": "sample", "ns_per_encode": 14949714.285714, "order": 1, "prompt_index": 5, "repetitions": 7, "sample": 6}
+{"arm": "candidate", "elapsed_ns": 104971000, "kind": "sample", "ns_per_encode": 14995857.142857, "order": 0, "prompt_index": 5, "repetitions": 7, "sample": 7}
+{"arm": "baseline", "elapsed_ns": 157329000, "kind": "sample", "ns_per_encode": 22475571.428571, "order": 1, "prompt_index": 5, "repetitions": 7, "sample": 7}
+{"arm": "baseline", "elapsed_ns": 157530000, "kind": "sample", "ns_per_encode": 22504285.714286, "order": 0, "prompt_index": 5, "repetitions": 7, "sample": 8}
+{"arm": "candidate", "elapsed_ns": 104848000, "kind": "sample", "ns_per_encode": 14978285.714286, "order": 1, "prompt_index": 5, "repetitions": 7, "sample": 8}
+{"arm": "candidate", "elapsed_ns": 104991000, "kind": "sample", "ns_per_encode": 14998714.285714, "order": 0, "prompt_index": 5, "repetitions": 7, "sample": 9}
+{"arm": "baseline", "elapsed_ns": 157225000, "kind": "sample", "ns_per_encode": 22460714.285714, "order": 1, "prompt_index": 5, "repetitions": 7, "sample": 9}
+{"arm": "baseline", "elapsed_ns": 157314000, "kind": "sample", "ns_per_encode": 22473428.571429, "order": 0, "prompt_index": 5, "repetitions": 7, "sample": 10}
+{"arm": "candidate", "elapsed_ns": 104833000, "kind": "sample", "ns_per_encode": 14976142.857143, "order": 1, "prompt_index": 5, "repetitions": 7, "sample": 10}
+{"arm": "candidate", "elapsed_ns": 104845000, "kind": "sample", "ns_per_encode": 14977857.142857, "order": 0, "prompt_index": 5, "repetitions": 7, "sample": 11}
+{"arm": "baseline", "elapsed_ns": 157271000, "kind": "sample", "ns_per_encode": 22467285.714286, "order": 1, "prompt_index": 5, "repetitions": 7, "sample": 11}
+{"arm": "baseline", "elapsed_ns": 157360000, "kind": "sample", "ns_per_encode": 22480000.0, "order": 0, "prompt_index": 5, "repetitions": 7, "sample": 12}
+{"arm": "candidate", "elapsed_ns": 104700000, "kind": "sample", "ns_per_encode": 14957142.857143, "order": 1, "prompt_index": 5, "repetitions": 7, "sample": 12}
+{"arm": "candidate", "elapsed_ns": 104880000, "kind": "sample", "ns_per_encode": 14982857.142857, "order": 0, "prompt_index": 5, "repetitions": 7, "sample": 13}
+{"arm": "baseline", "elapsed_ns": 157413000, "kind": "sample", "ns_per_encode": 22487571.428571, "order": 1, "prompt_index": 5, "repetitions": 7, "sample": 13}
+{"arm": "baseline", "elapsed_ns": 157446000, "kind": "sample", "ns_per_encode": 22492285.714286, "order": 0, "prompt_index": 5, "repetitions": 7, "sample": 14}
+{"arm": "candidate", "elapsed_ns": 104820000, "kind": "sample", "ns_per_encode": 14974285.714286, "order": 1, "prompt_index": 5, "repetitions": 7, "sample": 14}
+{"bytes": 24593, "kind": "correctness", "pass": true, "prompt_index": 6, "scope": "prompt", "tokens": 6148}
+{"baseline_ns": 3395000, "candidate_ns": 3281000, "kind": "warmup", "prompt_index": 6, "repetitions": 31}
+{"arm": "baseline", "elapsed_ns": 105870000, "kind": "sample", "ns_per_encode": 3415161.290323, "order": 0, "prompt_index": 6, "repetitions": 31, "sample": 0}
+{"arm": "candidate", "elapsed_ns": 102938000, "kind": "sample", "ns_per_encode": 3320580.645161, "order": 1, "prompt_index": 6, "repetitions": 31, "sample": 0}
+{"arm": "candidate", "elapsed_ns": 102946000, "kind": "sample", "ns_per_encode": 3320838.709677, "order": 0, "prompt_index": 6, "repetitions": 31, "sample": 1}
+{"arm": "baseline", "elapsed_ns": 105581000, "kind": "sample", "ns_per_encode": 3405838.709677, "order": 1, "prompt_index": 6, "repetitions": 31, "sample": 1}
+{"arm": "baseline", "elapsed_ns": 106078000, "kind": "sample", "ns_per_encode": 3421870.967742, "order": 0, "prompt_index": 6, "repetitions": 31, "sample": 2}
+{"arm": "candidate", "elapsed_ns": 103143000, "kind": "sample", "ns_per_encode": 3327193.548387, "order": 1, "prompt_index": 6, "repetitions": 31, "sample": 2}
+{"arm": "candidate", "elapsed_ns": 103104000, "kind": "sample", "ns_per_encode": 3325935.483871, "order": 0, "prompt_index": 6, "repetitions": 31, "sample": 3}
+{"arm": "baseline", "elapsed_ns": 105874000, "kind": "sample", "ns_per_encode": 3415290.322581, "order": 1, "prompt_index": 6, "repetitions": 31, "sample": 3}
+{"arm": "baseline", "elapsed_ns": 105794000, "kind": "sample", "ns_per_encode": 3412709.677419, "order": 0, "prompt_index": 6, "repetitions": 31, "sample": 4}
+{"arm": "candidate", "elapsed_ns": 102860000, "kind": "sample", "ns_per_encode": 3318064.516129, "order": 1, "prompt_index": 6, "repetitions": 31, "sample": 4}
+{"arm": "candidate", "elapsed_ns": 103126000, "kind": "sample", "ns_per_encode": 3326645.16129, "order": 0, "prompt_index": 6, "repetitions": 31, "sample": 5}
+{"arm": "baseline", "elapsed_ns": 105750000, "kind": "sample", "ns_per_encode": 3411290.322581, "order": 1, "prompt_index": 6, "repetitions": 31, "sample": 5}
+{"arm": "baseline", "elapsed_ns": 105713000, "kind": "sample", "ns_per_encode": 3410096.774194, "order": 0, "prompt_index": 6, "repetitions": 31, "sample": 6}
+{"arm": "candidate", "elapsed_ns": 102951000, "kind": "sample", "ns_per_encode": 3321000.0, "order": 1, "prompt_index": 6, "repetitions": 31, "sample": 6}
+{"arm": "candidate", "elapsed_ns": 103163000, "kind": "sample", "ns_per_encode": 3327838.709677, "order": 0, "prompt_index": 6, "repetitions": 31, "sample": 7}
+{"arm": "baseline", "elapsed_ns": 105696000, "kind": "sample", "ns_per_encode": 3409548.387097, "order": 1, "prompt_index": 6, "repetitions": 31, "sample": 7}
+{"arm": "baseline", "elapsed_ns": 105605000, "kind": "sample", "ns_per_encode": 3406612.903226, "order": 0, "prompt_index": 6, "repetitions": 31, "sample": 8}
+{"arm": "candidate", "elapsed_ns": 103288000, "kind": "sample", "ns_per_encode": 3331870.967742, "order": 1, "prompt_index": 6, "repetitions": 31, "sample": 8}
+{"arm": "candidate", "elapsed_ns": 102919000, "kind": "sample", "ns_per_encode": 3319967.741935, "order": 0, "prompt_index": 6, "repetitions": 31, "sample": 9}
+{"arm": "baseline", "elapsed_ns": 105676000, "kind": "sample", "ns_per_encode": 3408903.225806, "order": 1, "prompt_index": 6, "repetitions": 31, "sample": 9}
+{"arm": "baseline", "elapsed_ns": 105692000, "kind": "sample", "ns_per_encode": 3409419.354839, "order": 0, "prompt_index": 6, "repetitions": 31, "sample": 10}
+{"arm": "candidate", "elapsed_ns": 103203000, "kind": "sample", "ns_per_encode": 3329129.032258, "order": 1, "prompt_index": 6, "repetitions": 31, "sample": 10}
+{"arm": "candidate", "elapsed_ns": 103090000, "kind": "sample", "ns_per_encode": 3325483.870968, "order": 0, "prompt_index": 6, "repetitions": 31, "sample": 11}
+{"arm": "baseline", "elapsed_ns": 105800000, "kind": "sample", "ns_per_encode": 3412903.225806, "order": 1, "prompt_index": 6, "repetitions": 31, "sample": 11}
+{"arm": "baseline", "elapsed_ns": 105741000, "kind": "sample", "ns_per_encode": 3411000.0, "order": 0, "prompt_index": 6, "repetitions": 31, "sample": 12}
+{"arm": "candidate", "elapsed_ns": 103084000, "kind": "sample", "ns_per_encode": 3325290.322581, "order": 1, "prompt_index": 6, "repetitions": 31, "sample": 12}
+{"arm": "candidate", "elapsed_ns": 102966000, "kind": "sample", "ns_per_encode": 3321483.870968, "order": 0, "prompt_index": 6, "repetitions": 31, "sample": 13}
+{"arm": "baseline", "elapsed_ns": 105851000, "kind": "sample", "ns_per_encode": 3414548.387097, "order": 1, "prompt_index": 6, "repetitions": 31, "sample": 13}
+{"arm": "baseline", "elapsed_ns": 105899000, "kind": "sample", "ns_per_encode": 3416096.774194, "order": 0, "prompt_index": 6, "repetitions": 31, "sample": 14}
+{"arm": "candidate", "elapsed_ns": 102965000, "kind": "sample", "ns_per_encode": 3321451.612903, "order": 1, "prompt_index": 6, "repetitions": 31, "sample": 14}
+{"kind": "summary", "pass": true, "prompts": [{"baseline": {"max_ms": 0.0013428499999999998, "median_ms": 0.0013128299999999999, "min_ms": 0.0013091600000000002, "n": 15, "stdev_ms": 7.964547755672038e-06}, "candidate": {"max_ms": 0.00076728, "median_ms": 0.0007641, "min_ms": 0.00076285, "n": 15, "stdev_ms": 1.3822283596046049e-06}, "latency_reduction_percent": 41.797490916569544, "prompt_index": 0, "speedup_ratio": 1.7181389870435806}, {"baseline": {"max_ms": 0.00323332, "median_ms": 0.00321904, "min_ms": 0.0032132399999999996, "n": 15, "stdev_ms": 4.647822634104671e-06}, "candidate": {"max_ms": 0.0029588400000000003, "median_ms": 0.00295196, "min_ms": 0.0029477199999999996, "n": 15, "stdev_ms": 2.8399463442282623e-06}, "latency_reduction_percent": 8.296883542919623, "prompt_index": 1, "speedup_ratio": 1.0904754806975703}, {"baseline": {"max_ms": 9.76045, "median_ms": 9.74225, "min_ms": 9.7084, "n": 15, "stdev_ms": 0.015604230958606188}, "candidate": {"max_ms": 4.99055, "median_ms": 4.9794, "min_ms": 4.9729, "n": 15, "stdev_ms": 0.004885542325016109}, "latency_reduction_percent": 48.88860376196464, "prompt_index": 2, "speedup_ratio": 1.956510824597341}, {"baseline": {"max_ms": 10.168227272727, "median_ms": 10.103863636364, "min_ms": 10.044636363636, "n": 15, "stdev_ms": 0.03491599662256957}, "candidate": {"max_ms": 4.719454545455, "median_ms": 4.678409090909, "min_ms": 4.6628636363639995, "n": 15, "stdev_ms": 0.015015354859057034}, "latency_reduction_percent": 53.696830645345266, "prompt_index": 3, "speedup_ratio": 2.159679378188121}, {"baseline": {"max_ms": 6.5498125, "median_ms": 6.5234375, "min_ms": 6.498125, "n": 15, "stdev_ms": 0.014673007033892769}, "candidate": {"max_ms": 6.321, "median_ms": 6.3058125, "min_ms": 6.28025, "n": 15, "stdev_ms": 0.010218532926921136}, "latency_reduction_percent": 3.336047904191616, "prompt_index": 4, "speedup_ratio": 1.0345118095408006}, {"baseline": {"max_ms": 22.552857142857, "median_ms": 22.487571428571, "min_ms": 22.460714285714, "n": 15, "stdev_ms": 0.02912598884902402}, "candidate": {"max_ms": 15.029285714285999, "median_ms": 14.977857142857001, "min_ms": 14.948714285714, "n": 15, "stdev_ms": 0.02109374236499678}, "latency_reduction_percent": 33.3949546733745, "prompt_index": 5, "speedup_ratio": 1.5013877628880585}, {"baseline": {"max_ms": 3.4218709677419996, "median_ms": 3.4112903225810003, "min_ms": 3.405838709677, "n": 15, "stdev_ms": 0.0041153948659749815}, "candidate": {"max_ms": 3.3318709677419998, "median_ms": 3.325290322581, "min_ms": 3.318064516129, "n": 15, "stdev_ms": 0.003984705162191748}, "latency_reduction_percent": 2.521040189125042, "prompt_index": 6, "speedup_ratio": 1.0258624034767736}], "scope": "CPU tokenizer only; no model inference or GPU performance measured"}

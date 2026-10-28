@@ -1,0 +1,138 @@
+{
+  "output": "/private/tmp/myds-tokenizer-20261028.4JRrr5/raw/macstudio-ab.jsonl",
+  "prompts": [
+    {
+      "prompt_index": 0,
+      "baseline": {
+        "n": 15,
+        "median_ms": 0.0013128299999999999,
+        "min_ms": 0.0013091600000000002,
+        "max_ms": 0.0013428499999999998,
+        "stdev_ms": 7.964547755672038e-06
+      },
+      "candidate": {
+        "n": 15,
+        "median_ms": 0.0007641,
+        "min_ms": 0.00076285,
+        "max_ms": 0.00076728,
+        "stdev_ms": 1.3822283596046049e-06
+      },
+      "speedup_ratio": 1.7181389870435806,
+      "latency_reduction_percent": 41.797490916569544
+    },
+    {
+      "prompt_index": 1,
+      "baseline": {
+        "n": 15,
+        "median_ms": 0.00321904,
+        "min_ms": 0.0032132399999999996,
+        "max_ms": 0.00323332,
+        "stdev_ms": 4.647822634104671e-06
+      },
+      "candidate": {
+        "n": 15,
+        "median_ms": 0.00295196,
+        "min_ms": 0.0029477199999999996,
+        "max_ms": 0.0029588400000000003,
+        "stdev_ms": 2.8399463442282623e-06
+      },
+      "speedup_ratio": 1.0904754806975703,
+      "latency_reduction_percent": 8.296883542919623
+    },
+    {
+      "prompt_index": 2,
+      "baseline": {
+        "n": 15,
+        "median_ms": 9.74225,
+        "min_ms": 9.7084,
+        "max_ms": 9.76045,
+        "stdev_ms": 0.015604230958606188
+      },
+      "candidate": {
+        "n": 15,
+        "median_ms": 4.9794,
+        "min_ms": 4.9729,
+        "max_ms": 4.99055,
+        "stdev_ms": 0.004885542325016109
+      },
+      "speedup_ratio": 1.956510824597341,
+      "latency_reduction_percent": 48.88860376196464
+    },
+    {
+      "prompt_index": 3,
+      "baseline": {
+        "n": 15,
+        "median_ms": 10.103863636364,
+        "min_ms": 10.044636363636,
+        "max_ms": 10.168227272727,
+        "stdev_ms": 0.03491599662256957
+      },
+      "candidate": {
+        "n": 15,
+        "median_ms": 4.678409090909,
+        "min_ms": 4.6628636363639995,
+        "max_ms": 4.719454545455,
+        "stdev_ms": 0.015015354859057034
+      },
+      "speedup_ratio": 2.159679378188121,
+      "latency_reduction_percent": 53.696830645345266
+    },
+    {
+      "prompt_index": 4,
+      "baseline": {
+        "n": 15,
+        "median_ms": 6.5234375,
+        "min_ms": 6.498125,
+        "max_ms": 6.5498125,
+        "stdev_ms": 0.014673007033892769
+      },
+      "candidate": {
+        "n": 15,
+        "median_ms": 6.3058125,
+        "min_ms": 6.28025,
+        "max_ms": 6.321,
+        "stdev_ms": 0.010218532926921136
+      },
+      "speedup_ratio": 1.0345118095408006,
+      "latency_reduction_percent": 3.336047904191616
+    },
+    {
+      "prompt_index": 5,
+      "baseline": {
+        "n": 15,
+        "median_ms": 22.487571428571,
+        "min_ms": 22.460714285714,
+        "max_ms": 22.552857142857,
+        "stdev_ms": 0.02912598884902402
+      },
+      "candidate": {
+        "n": 15,
+        "median_ms": 14.977857142857001,
+        "min_ms": 14.948714285714,
+        "max_ms": 15.029285714285999,
+        "stdev_ms": 0.02109374236499678
+      },
+      "speedup_ratio": 1.5013877628880585,
+      "latency_reduction_percent": 33.3949546733745
+    },
+    {
+      "prompt_index": 6,
+      "baseline": {
+        "n": 15,
+        "median_ms": 3.4112903225810003,
+        "min_ms": 3.405838709677,
+        "max_ms": 3.4218709677419996,
+        "stdev_ms": 0.0041153948659749815
+      },
+      "candidate": {
+        "n": 15,
+        "median_ms": 3.325290322581,
+        "min_ms": 3.318064516129,
+        "max_ms": 3.3318709677419998,
+        "stdev_ms": 0.003984705162191748
+      },
+      "speedup_ratio": 1.0258624034767736,
+      "latency_reduction_percent": 2.521040189125042
+    }
+  ]
+}

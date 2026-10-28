@@ -1,0 +1,30 @@
+{
+  "chinese_128k.txt": {
+    "bytes": 131005,
+    "sha256": "abf059169941b697d36a23ef856b61269754d3d59332dd901fdc0c97cab6e360"
+  },
+  "code_256k.txt": {
+    "bytes": 262143,
+    "sha256": "87539cfd30fbd7a160b18bb850622494d1f56017a3fdb52f798b35fdb1a830fa"
+  },
+  "english_256k.txt": {
+    "bytes": 262035,
+    "sha256": "9588f5c150bbd3ad1b22291fb159d08646bcf55b793d0d6551ae2bd535e9edee"
+  },
+  "long_piece.txt": {
+    "bytes": 24593,
+    "sha256": "373b6e8b8636da2bdd5d06bed243fd9043533911c1a3e7d9f41cd13dd30de173"
+  },
+  "mixed_512k.txt": {
+    "bytes": 524043,
+    "sha256": "395bf36c950095a4e2d5258c236909da90bb23413f1fba282bcfdbdbe2129e34"
+  },
+  "short_ascii.txt": {
+    "bytes": 39,
+    "sha256": "8878a87a5926b1101198880080ba524be08c9f16bb3ac5ed9c879b95b70e6a09"
+  },
+  "short_mixed.txt": {
+    "bytes": 47,
+    "sha256": "c61d8d1893b58bf1786256aebc4853ec8efd6c413f6427b87c8fe6598231d2c5"
+  }
+}

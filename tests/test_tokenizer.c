@@ -313,6 +313,44 @@ static int test_byte_bpe_unknown_and_gpt2(void) {
     return 1;
 }
 
+static int test_byte_bpe_piece_reuse(void) {
+    const char *path = "/tmp/test_myds_piece_reuse.gguf";
+    ASSERT_TRUE(create_byte_bpe_gguf(path, false, false));
+    gguf_file_t *gf = gguf_open(path); ASSERT_TRUE(gf != NULL);
+    myds_tokenizer_t *tok = myds_tokenizer_load(gf); ASSERT_TRUE(tok != NULL);
+    /* Grow on powers of two and their boundaries, then revisit short pieces.
+     * Special tokens divide encode_bpe calls within this same encode request. */
+    static const size_t lengths[] = {1, 31, 32, 33, 255, 256, 257, 4097, 2, 65, 3, 1};
+    char text[8192]; int32_t expected[1024], ids[1025];
+    size_t bytes = 0; int32_t count = 0;
+    for (size_t j = 0; j < sizeof(lengths)/sizeof(lengths[0]); ++j) {
+        size_t n = lengths[j];
+        memset(text + bytes, 'a', n); bytes += n;
+        while (n >= 256) { expected[count++] = 272; n -= 256; }
+        for (unsigned power = 7; power > 0; --power) {
+            size_t size = (size_t)1 << power;
+            if (n >= size) { expected[count++] = 264 + (int32_t)power; n -= size; }
+        }
+        if (n) expected[count++] = 'a';
+        memcpy(text + bytes, "\nabc<S>1234</S>", 15); bytes += 15;
+        expected[count++] = '\n'; expected[count++] = 'a'; expected[count++] = 260;
+        expected[count++] = 256; expected[count++] = 263; expected[count++] = '4';
+        expected[count++] = 257;
+    }
+    ASSERT_TRUE(myds_tokenizer_encode_bytes(tok, text, bytes, ids, 1024, false) == count);
+    ASSERT_TRUE(!memcmp(ids, expected, (size_t)count * sizeof(*ids)));
+    ASSERT_TRUE(myds_tokenizer_encode_bytes(tok, text, bytes, NULL, 0, false) == count);
+    for (int32_t capacity = 0; capacity <= count; ++capacity) {
+        ids[capacity] = -999;
+        ASSERT_TRUE(myds_tokenizer_encode_bytes(tok, text, bytes, ids, capacity, false) == count);
+        ASSERT_TRUE(!memcmp(ids, expected, (size_t)capacity * sizeof(*ids)));
+        ASSERT_TRUE(ids[capacity] == -999);
+    }
+    myds_tokenizer_free(tok); gguf_close(gf); unlink(path);
+    printf("  [PASS] Long/short BPE pieces and specials preserve IDs, counts, and capacity guards\n");
+    return 1;
+}
+
 /* Metadata-only reference probe: no model tensors or GPU are evaluated. */
 static int dump_reference(const char *path, const char *text) {
     gguf_file_t *gf = gguf_open(path);
@@ -356,16 +394,17 @@ int main(int argc, char **argv) {
     passed += test_byte_bpe_known_answers();
     passed += test_byte_bpe_binary_decode();
     passed += test_byte_bpe_unknown_and_gpt2();
+    passed += test_byte_bpe_piece_reuse();
 
     unlink(temp_file);
 
     printf("====================================================\n");
-    if (passed == 7) {
+    if (passed == 8) {
         printf("  ALL TOKENIZER UNIT TESTS PASSED!\n");
         printf("====================================================\n");
         return 0;
     } else {
-        printf("  TOKENIZER TESTS FAILED (passed %d/7)\n", passed);
+        printf("  TOKENIZER TESTS FAILED (passed %d/8)\n", passed);
         return 1;
     }
 }

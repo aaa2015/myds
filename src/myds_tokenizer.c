@@ -248,6 +248,9 @@ static int emit(output_t *out, int32_t id) {
 typedef struct { int32_t id; size_t prev, next, version; } symbol_t;
 typedef struct { size_t left, right, left_version, right_version; const merge_t *merge; } candidate_t;
 typedef struct { candidate_t *items; size_t size, capacity; } heap_t;
+/* One encode call owns its scratch space. Pieces may reuse storage, but neither
+ * the tokenizer nor concurrent callers retain any mutable merge state. */
+typedef struct { symbol_t *symbols; size_t capacity; heap_t heap; } bpe_workspace_t;
 static bool candidate_before(candidate_t a, candidate_t b) {
     return a.merge->rank < b.merge->rank || (a.merge->rank == b.merge->rank && a.left < b.left);
 }
@@ -280,37 +283,63 @@ static candidate_t heap_pop(heap_t *h) {
     if (h->size) h->items[i] = last;
     return result;
 }
-static int bpe_piece(const myds_tokenizer_t *tok, const char *text, size_t n, output_t *out) {
+static int bpe_piece(const myds_tokenizer_t *tok, const char *text, size_t n, output_t *out,
+                     bpe_workspace_t *workspace) {
     const tokenizer_impl_t *p = tok->impl;
     if (!n) return 0;
     if (n > SIZE_MAX / sizeof(symbol_t)) return MYDS_TOKENIZER_ERROR_NOMEM;
-    symbol_t *s = malloc(n * sizeof(*s));
-    heap_t h = {0}; int err = 0;
-    if (!s) return MYDS_TOKENIZER_ERROR_NOMEM;
+    if (n > workspace->capacity) {
+        size_t capacity = workspace->capacity ? workspace->capacity : 32;
+        while (capacity < n) {
+            if (capacity > SIZE_MAX / sizeof(symbol_t) / 2) { capacity = n; break; }
+            capacity *= 2;
+        }
+        symbol_t *symbols = realloc(workspace->symbols, capacity * sizeof(*symbols));
+        if (!symbols) return MYDS_TOKENIZER_ERROR_NOMEM;
+        workspace->symbols = symbols; workspace->capacity = capacity;
+    }
+    symbol_t *s = workspace->symbols;
+    heap_t *h = &workspace->heap;
+    h->size = 0;
+    int err = 0;
     for (size_t i = 0; i < n; ++i) {
         int32_t id = p->byte_ids[(uint8_t)text[i]];
-        if (id < 0) { err = MYDS_TOKENIZER_ERROR_UNKNOWN_BYTE; goto done; }
+        if (id < 0) return MYDS_TOKENIZER_ERROR_UNKNOWN_BYTE;
         s[i] = (symbol_t){id, i ? i - 1 : n, i + 1, 0};
     }
-    for (size_t i = 0; i + 1 < n; ++i) if ((err = heap_offer(&h, p, s, i, n))) goto done;
-    while (h.size) {
-        candidate_t c = heap_pop(&h);
+    for (size_t i = 0; i + 1 < n; ++i) if ((err = heap_offer(h, p, s, i, n))) return err;
+    while (h->size) {
+        candidate_t c = heap_pop(h);
         size_t a = c.left, b = c.right;
         if (s[a].version != c.left_version || s[b].version != c.right_version || s[a].next != b) continue;
         s[a].id = c.merge->result; s[a].next = s[b].next; ++s[a].version; ++s[b].version;
         if (s[a].next < n) s[s[a].next].prev = a;
-        if ((err = heap_offer(&h, p, s, s[a].prev, n)) || (err = heap_offer(&h, p, s, a, n))) goto done;
+        if ((err = heap_offer(h, p, s, s[a].prev, n)) || (err = heap_offer(h, p, s, a, n))) return err;
     }
     for (size_t i = 0; i < n; i = s[i].next) if ((err = emit(out, s[i].id))) break;
-done:
-    free(s); free(h.items); return err;
+    return err;
 }
 
 /* Unicode classes are fixed to the generated Unicode version, not process locale. */
+static unsigned tokenizer_unicode_class(uint32_t cp) {
+    /* Exact ASCII projection of myds_unicode_ranges (including symbols as
+     * U_PUNCT and only Unicode White_Space, not locale-specific whitespace). */
+    static const uint8_t ascii_class[128] = {
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 16, 16, 16, 16, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        16, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 8, 8, 8, 8, 8, 8,
+        8, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 8, 8, 8, 8, 8,
+        8, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 8, 8, 8, 8, 0,
+    };
+    return cp < sizeof(ascii_class) ? ascii_class[cp] : myds_unicode_class(cp);
+}
 typedef struct { uint32_t cp; size_t next; unsigned cls; } character_t;
 static character_t char_at(const char *s, size_t n, size_t pos) {
     character_t c = {UINT32_MAX, pos, 0};
-    if (pos < n) { c.next += utf8_read(s + pos, n - pos, &c.cp); c.cls = myds_unicode_class(c.cp); }
+    if (pos < n) { c.next += utf8_read(s + pos, n - pos, &c.cp); c.cls = tokenizer_unicode_class(c.cp); }
     return c;
 }
 static bool cjk(uint32_t c) { return (c >= 0x4e00 && c <= 0x9fa5) || (c >= 0x3040 && c <= 0x30ff); }
@@ -363,7 +392,8 @@ static size_t text_piece_end(const char *s, size_t n, size_t pos, bool joyai) {
     /* Split(Isolated) preserves unmatched text too. */
     return c.next;
 }
-static int encode_bpe(const myds_tokenizer_t *tok, const char *s, size_t n, output_t *out) {
+static int encode_bpe(const myds_tokenizer_t *tok, const char *s, size_t n, output_t *out,
+                      bpe_workspace_t *workspace) {
     const tokenizer_impl_t *p = tok->impl;
     size_t pos = 0;
     while (pos < n) {
@@ -388,13 +418,13 @@ static int encode_bpe(const myds_tokenizer_t *tok, const char *s, size_t n, outp
              * word would make long text with no digits quadratic. */
             while (pos < limit) {
                 end = text_piece_end(s, limit, pos, p->joyai);
-                int err = bpe_piece(tok, s + pos, end - pos, out);
+                int err = bpe_piece(tok, s + pos, end - pos, out, workspace);
                 if (err) return err;
                 pos = end;
             }
             continue;
         }
-        int err = bpe_piece(tok, s + pos, end - pos, out);
+        int err = bpe_piece(tok, s + pos, end - pos, out, workspace);
         if (err) return err;
         pos = end;
     }
@@ -424,6 +454,7 @@ int32_t myds_tokenizer_encode_bytes(const myds_tokenizer_t *tok, const char *tex
         if (!already_present && (err = emit(&out, tok->bos_id))) return err;
     }
     if (!p->byte_bpe) { err = encode_plain(tok, text, len, &out); return err ? err : out.count; }
+    bpe_workspace_t workspace = {0};
     size_t plain = 0, pos = 0;
     while (pos < len) {
         if (!p->special_prefix[(uint8_t)text[pos]]) { ++pos; continue; }
@@ -433,10 +464,13 @@ int32_t myds_tokenizer_encode_bytes(const myds_tokenizer_t *tok, const char *tex
             if (v->len > best && v->len <= len - pos && !memcmp(text + pos, v->text, v->len)) { special = id; best = v->len; }
         }
         if (special < 0) { ++pos; continue; }
-        if ((err = encode_bpe(tok, text + plain, pos - plain, &out)) || (err = emit(&out, special))) return err;
+        if ((err = encode_bpe(tok, text + plain, pos - plain, &out, &workspace)) ||
+            (err = emit(&out, special))) goto done;
         pos += best; plain = pos;
     }
-    err = encode_bpe(tok, text ? text + plain : "", len - plain, &out);
+    err = encode_bpe(tok, text ? text + plain : "", len - plain, &out, &workspace);
+done:
+    free(workspace.symbols); free(workspace.heap.items);
     return err ? err : out.count;
 }
 int32_t myds_tokenizer_encode(const myds_tokenizer_t *tok, const char *text, int32_t *out_tokens,

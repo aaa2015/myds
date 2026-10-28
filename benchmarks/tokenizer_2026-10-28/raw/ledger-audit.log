@@ -1,0 +1,100 @@
+python3 -B tools/audit_ledger_105.py
+invariants
+  [PASS] every timed row reported cached=0
+  [PASS] the arms differ in encoded chunks (switch took effect)
+  [PASS] both arms did identical work (same requests per boot)
+  [PASS] no fallbacks and no failures
+  [PASS] both arms produced identical bytes on the fixed prompt
+  [PASS] the ON arm is faster, and by a margin far above its spread
+  [PASS] rerun: every timed row reported cached=0
+  [PASS] rerun: arms differ in encoded chunks
+  [PASS] rerun: no fallbacks and no failures
+  [PASS] rerun: both arms produced identical bytes
+
+freshness (tables are generated, not transcribed)
+  [PASS] ledger generated regions are current
+  [PASS] expected.json is current
+
+corpus
+  [PASS] every manifest entry matches a file of the recorded size
+  [PASS] no extra prompt files beyond the manifest
+
+0 failure(s)
+VERDICT: PASS — invariants held, tables are current, corpus is intact
+python3 -B tools/verify_register_only_bench.py --historical
+self-test against archived data:
+  /Users/fangqingyuan/Projects/myds/benchmarks/register_only_2026-10-27/raw/rig.jsonl
+  /Users/fangqingyuan/Projects/myds/benchmarks/register_only_2026-10-27/raw/sweep2.jsonl
+
+A/B
+  [PASS] all rows reported cached=0
+  [PASS] OFF median t/s within 2.0% of 593.1
+  [PASS] OFF spread is tight (<=1%)
+  [PASS] ON median t/s within 2.0% of 618.9
+  [PASS] ON spread is tight (<=1%)
+  [PASS] gain within 1.5pp of 4.35%
+  [PASS] gain is positive (the point of the experiment)
+  [PASS] OFF requests constant across boots
+  [PASS] OFF encoded ~ 0
+  [PASS] OFF no fallbacks/failures
+  [PASS] ON requests constant across boots
+  [PASS] ON encoded ~ 2025
+  [PASS] ON no fallbacks/failures
+  [PASS] both arms produced identical output bytes on the fixed prompt
+  [PASS] fixed prompt tokenised near 32210
+
+Sweep
+  [PASS] all sweep rows cached=0
+  [PASS] p0.2k prefill median within 2.0% of 246.8
+  [PASS] p0.2k prompt tokenised near 592
+  [PASS] p1.6k prefill median within 2.0% of 319.0
+  [PASS] p1.6k prompt tokenised near 1026
+  [PASS] p6.5k prefill median within 2.0% of 453.6
+  [PASS] p6.5k prompt tokenised near 4059
+  [PASS] p13k prefill median within 2.0% of 539.5
+  [PASS] p13k prompt tokenised near 8081
+  [PASS] p26k prefill median within 2.0% of 592.7
+  [PASS] p26k prompt tokenised near 16128
+  [PASS] p52k prefill median within 2.0% of 616.4
+  [PASS] p52k prompt tokenised near 32224
+  [note] decode skipped in this file: the archived sweep generated only 2 tokens for d_8k/d_32k, so those rates are meaningless. dec2.jsonl replaces them.
+
+L3 smoke (single arm, single boot)
+  [PASS] smoke arms are OFF only
+  [PASS] smoke rows all cached=0
+  [PASS] smoke fixed tps ~ 592.2
+  [PASS] smoke nonce tps match
+  [PASS] smoke GPU residency 100%
+  [PASS] smoke GPU power matches
+
+A/B rerun by the shipped harness (raw/reproduce_run.jsonl)
+
+A/B — rerun
+  [PASS] all rows reported cached=0
+  [PASS] OFF median t/s within 2.0% of 593.1
+  [PASS] OFF spread is tight (<=1%)
+  [PASS] ON median t/s within 2.0% of 618.9
+  [PASS] ON spread is tight (<=1%)
+  [PASS] gain within 1.5pp of 4.35%
+  [PASS] gain is positive (the point of the experiment)
+  [PASS] OFF requests constant across boots
+  [PASS] OFF encoded ~ 0
+  [PASS] OFF no fallbacks/failures
+  [PASS] ON requests constant across boots
+  [PASS] ON encoded ~ 2025
+  [PASS] ON no fallbacks/failures
+  [PASS] both arms produced identical output bytes on the fixed prompt
+  [PASS] fixed prompt tokenised near 32210
+  [PASS] OFF GPU residency >= 95.0%
+  [PASS] OFF reached 1398 MHz
+  [PASS] OFF power median in 85.0-125.0 W
+  [PASS] ON GPU residency >= 95.0%
+  [PASS] ON reached 1398 MHz
+  [PASS] ON power median in 85.0-125.0 W
+
+Decode (from dec2.jsonl)
+  [PASS] d_8k decode median within 2.0% of 39.6
+  [PASS] d_32k decode median within 2.0% of 38.2
+
+57 checks, 57 passed, 0 failed
+VERDICT: PASS — the measured run is consistent with the recorded results

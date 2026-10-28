@@ -1,0 +1,350 @@
+[2026-10-28 19:54:37.649] [INFO] myds_metal: loaded precompiled library from ./bin/myds.metallib (all required V4.1 kernels verified)
+[2026-10-28 19:54:37.661] [INFO] Shared Q4 V41 NB: 0 (ordinary NB+HC GU2304x5120/Down5120x2304, NR2/NSG4)
+[2026-10-28 19:54:37.661] [INFO] myds_metal: Initialized successfully on GPU: Apple M4
+[2026-10-28 19:54:37.661] [INFO] Indexer head slots: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 19:54:37.661] [INFO] Indexer topk threshold: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 19:54:37.661] [INFO] Indexer topk NaN shuffle: 0 (reference; reference partition geometry)
+[2026-10-28 19:54:37.661] [INFO] Routed MoE geometry: IQ2 NSG=2, Q2 down NSG=2 (inherited)
+[2026-10-28 19:54:37.661] [INFO] Routed MoE IQ2 LUT: threadgroup (reference)
+[2026-10-28 19:54:37.661] [INFO] Batch2 Q8 shared weights: disabled (scalar reference)
+[2026-10-28 19:54:37.661] [INFO] LM-head Q8 rows per threadgroup: 2 (reference; single token, large output, NSG8)
+[2026-10-28 19:54:37.661] [INFO] Dense Q4 rows per threadgroup: 2 (reference; explicit ordinary scalar scope), NSG=4
+[2026-10-28 19:54:37.661] [INFO] F16 GEMV BF16 fuse: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 19:54:37.661] [INFO] Indexer RoPE quant fuse: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 19:54:37.661] [INFO] Routed MoE Q2 sum cache: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 19:54:37.661] [INFO] Routed MoE Q2 sum cache fused: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 19:54:37.661] [INFO] Decode candidates: down overlap=0, IQ2 V4.1=0, Dense Q4 V4.1=0 (ordinary scalar only)
+[2026-10-28 19:54:37.661] [INFO] Routed MoE Q2 V4.1: 0 (ordinary scalar F32 MID only; 5120/2304/384/6, NR2, down NSG2/4; MM, trace and unscoped paths retain reference)
+[2026-10-28 19:54:37.661] [INFO] Attention flash-decoding: 0 (reference (single-TG in-register 14-NSG))
+[2026-10-28 19:54:37.661] [INFO] HC mix norm pre-fusion: 0 (reference (separate norm + GEMV))
+[2026-10-28 19:54:37.662] [INFO] prefix cache: 锚点 16 套 × 最多 65536 tok（槽 44..59）
+[2026-10-28 19:54:37.662] [INFO] prefix cache: prompt 4 tok, cached 4, common prefix 4 -> resume from snapshot at 3 (reuse 3 tok, still to prefill 0)
+[2026-10-28 19:54:37.666] [INFO] prompt split: no <|User|> marker, total=4 tok
+[2026-10-28 19:54:37.666] [INFO] prefix cache: prompt 4 tok, cached 8, common prefix 4 -> resume from snapshot at 3 (reuse 3 tok, still to prefill 0)
+[2026-10-28 19:54:37.667] [INFO] prompt split: no <|User|> marker, total=4 tok
+[2026-10-28 19:54:37.667] [INFO] prefix cache: prompt 4 tok, cached 8, common prefix 4 -> resume from snapshot at 3 (reuse 3 tok, still to prefill 0)
+[2026-10-28 19:54:37.668] [INFO] prompt split: no <|User|> marker, total=4 tok
+[2026-10-28 19:54:37.668] [INFO] prefix cache: skipped - common prefix 4 of cached 8, but no snapshot within it (the state cannot be rewound, so this restarts from 0)
+[2026-10-28 19:54:37.668] [INFO] prefix cache divergence at 4: c[1]=97:a c[2]=98:b c[3]=99:c c[4]=1:\x01 c[5]=97:a p[1]=97:a p[2]=98:b p[3]=99:c p[4]=<end> 
+[2026-10-28 19:54:37.668] [INFO] prompt split: no <|User|> marker, total=4 tok
+[2026-10-28 19:54:37.668] [WARN] prefix cache invalidated: prefill returned -2
+[2026-10-28 19:54:37.668] [INFO] prefix cache: nothing cached yet (this is the first request)
+[2026-10-28 19:54:37.668] [INFO] prompt split: no <|User|> marker, total=11 tok
+[2026-10-28 19:54:37.670] [INFO] MoE path: FUSED (2-step) — verified bit-exact
+[2026-10-28 19:54:37.671] [INFO] sampler: pres_pen=0.000, rep_pen=1.000, n_recent=1, has_pres=0, has_rep=0, temp=0.000
+[2026-10-28 19:54:37.671] [INFO] prefix cache: 锚点 16 套 × 最多 65536 tok（槽 44..59）
+[2026-10-28 19:54:37.672] [INFO] prefix cache: nothing cached yet (this is the first request)
+[2026-10-28 19:54:37.672] [INFO] prompt split: no <|User|> marker, total=11 tok
+[2026-10-28 19:54:37.675] [INFO] sampler: pres_pen=0.000, rep_pen=1.000, n_recent=1, has_pres=0, has_rep=0, temp=0.000
+[2026-10-28 19:54:37.675] [INFO] prefix cache: skipped - common prefix 4 of cached 11, but no snapshot within it (the state cannot be rewound, so this restarts from 0)
+[2026-10-28 19:54:37.675] [INFO] prefix cache divergence at 4: c[1]=97:a c[2]=98:b c[3]=99:c c[4]=100:d c[5]=101:e p[1]=97:a p[2]=98:b p[3]=99:c p[4]=<end> 
+[2026-10-28 19:54:37.675] [INFO] prompt split: no <|User|> marker, total=4 tok
+[2026-10-28 19:54:37.679] [INFO] prefix cache: 锚点 16 套 × 最多 65536 tok（槽 44..59）
+[2026-10-28 19:54:37.679] [INFO] prefix cache: nothing cached yet (this is the first request)
+[2026-10-28 19:54:37.679] [INFO] prompt split: no <|User|> marker, total=4 tok
+[2026-10-28 19:54:37.683] [INFO] sampler: pres_pen=0.000, rep_pen=1.000, n_recent=4, has_pres=0, has_rep=0, temp=0.000
+[2026-10-28 19:54:37.683] [INFO] prefix cache: skipped - common prefix 4 of cached 4, but no snapshot within it (the state cannot be rewound, so this restarts from 0)
+[2026-10-28 19:54:37.683] [INFO] prompt split: no <|User|> marker, total=4 tok
+[2026-10-28 19:54:37.686] [INFO] prefix cache: 锚点 16 套 × 最多 65536 tok（槽 44..59）
+[2026-10-28 19:54:37.686] [INFO] prefix cache: nothing cached yet (this is the first request)
+[2026-10-28 19:54:37.686] [INFO] prompt split: no <|User|> marker, total=4 tok
+[2026-10-28 19:54:37.689] [INFO] sampler: pres_pen=0.000, rep_pen=1.000, n_recent=4, has_pres=0, has_rep=0, temp=0.000
+[2026-10-28 19:54:37.689] [INFO] prefix cache: prompt 6 tok, cached 4, common prefix 4 -> resume from cached prefix
+[2026-10-28 19:54:37.689] [INFO] prompt split: no <|User|> marker, total=6 tok
+[2026-10-28 19:54:37.690] [INFO] prefix cache: 锚点 16 套 × 最多 65536 tok（槽 44..59）
+[2026-10-28 19:54:37.690] [INFO] prefix cache: nothing cached yet (this is the first request)
+[2026-10-28 19:54:37.690] [INFO] prompt split: no <|User|> marker, total=6 tok
+[2026-10-28 19:54:37.693] [INFO] sampler: pres_pen=0.000, rep_pen=1.000, n_recent=1, has_pres=0, has_rep=0, temp=0.000
+[2026-10-28 19:54:37.693] [INFO] prefix cache: prompt 11 tok, cached 6, common prefix 6 -> resume from cached prefix
+[2026-10-28 19:54:37.693] [INFO] prompt split: no <|User|> marker, total=11 tok
+[2026-10-28 19:54:37.698] [INFO] prefix cache: 锚点 16 套 × 最多 65536 tok（槽 44..59）
+[2026-10-28 19:54:37.698] [INFO] prefix cache: nothing cached yet (this is the first request)
+[2026-10-28 19:54:37.698] [INFO] prompt split: no <|User|> marker, total=11 tok
+[2026-10-28 19:54:37.700] [INFO] sampler: pres_pen=0.000, rep_pen=1.000, n_recent=1, has_pres=0, has_rep=0, temp=0.000
+[2026-10-28 19:54:37.700] [INFO] prefix cache: skipped - common prefix 4 of cached 11, but no snapshot within it (the state cannot be rewound, so this restarts from 0)
+[2026-10-28 19:54:37.700] [INFO] prefix cache divergence at 4: c[1]=97:a c[2]=98:b c[3]=99:c c[4]=1:\x01 c[5]=97:a p[1]=97:a p[2]=98:b p[3]=99:c p[4]=<end> 
+[2026-10-28 19:54:37.700] [INFO] prompt split: no <|User|> marker, total=4 tok
+[2026-10-28 19:54:37.703] [INFO] prefix cache: 锚点 16 套 × 最多 65536 tok（槽 44..59）
+[2026-10-28 19:54:37.703] [INFO] prefix cache: nothing cached yet (this is the first request)
+[2026-10-28 19:54:37.703] [INFO] prompt split: no <|User|> marker, total=4 tok
+[2026-10-28 19:54:37.706] [INFO] sampler: pres_pen=0.000, rep_pen=1.000, n_recent=4, has_pres=0, has_rep=0, temp=0.000
+[2026-10-28 19:54:37.706] [INFO] prefix cache: prompt 11 tok, cached 4, common prefix 4 -> resume from cached prefix
+[2026-10-28 19:54:37.706] [INFO] prompt split: no <|User|> marker, total=11 tok
+[2026-10-28 19:54:37.708] [INFO] prefix cache: 锚点 16 套 × 最多 65536 tok（槽 44..59）
+[2026-10-28 19:54:37.708] [INFO] prefix cache: nothing cached yet (this is the first request)
+[2026-10-28 19:54:37.708] [INFO] prompt split: no <|User|> marker, total=11 tok
+[2026-10-28 19:54:37.712] [INFO] sampler: pres_pen=0.000, rep_pen=1.000, n_recent=1, has_pres=0, has_rep=0, temp=0.000
+[2026-10-28 19:54:37.712] [INFO] prefix cache: skipped - common prefix 4 of cached 11, but no snapshot within it (the state cannot be rewound, so this restarts from 0)
+[2026-10-28 19:54:37.712] [INFO] prefix cache divergence at 4: c[1]=97:a c[2]=98:b c[3]=99:c c[4]=2147483647:? c[5]=2147483647:? p[1]=97:a p[2]=98:b p[3]=99:c p[4]=<end> 
+[2026-10-28 19:54:37.712] [INFO] prompt split: no <|User|> marker, total=4 tok
+[2026-10-28 19:54:37.715] [INFO] prefix cache: 锚点 16 套 × 最多 65536 tok（槽 44..59）
+[2026-10-28 19:54:37.715] [INFO] prefix cache: nothing cached yet (this is the first request)
+[2026-10-28 19:54:37.715] [INFO] prompt split: no <|User|> marker, total=4 tok
+[2026-10-28 19:54:37.718] [INFO] sampler: pres_pen=0.000, rep_pen=1.000, n_recent=4, has_pres=0, has_rep=0, temp=0.000
+[2026-10-28 19:54:37.718] [INFO] prefix cache: prompt 11 tok, cached 4, common prefix 4 -> resume from cached prefix
+[2026-10-28 19:54:37.718] [INFO] prompt split: no <|User|> marker, total=11 tok
+[2026-10-28 19:54:37.720] [INFO] prefix cache: 锚点 16 套 × 最多 65536 tok（槽 44..59）
+[2026-10-28 19:54:37.720] [INFO] prefix cache: nothing cached yet (this is the first request)
+[2026-10-28 19:54:37.720] [INFO] prompt split: no <|User|> marker, total=11 tok
+[2026-10-28 19:54:37.722] [INFO] sampler: pres_pen=0.000, rep_pen=1.000, n_recent=1, has_pres=0, has_rep=0, temp=0.000
+[2026-10-28 19:54:37.722] [INFO] prefix cache: skipped - common prefix 4 of cached 11, but no snapshot within it (the state cannot be rewound, so this restarts from 0)
+[2026-10-28 19:54:37.722] [INFO] prefix cache divergence at 4: c[1]=97:\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n 
+[2026-10-28 19:54:37.722] [INFO] prompt split: no <|User|> marker, total=4 tok
+[2026-10-28 19:54:37.725] [INFO] prefix cache: 锚点 16 套 × 最多 65536 tok（槽 44..59）
+[2026-10-28 19:54:37.725] [INFO] prefix cache: nothing cached yet (this is the first request)
+[2026-10-28 19:54:37.725] [INFO] prompt split: no <|User|> marker, total=4 tok
+[2026-10-28 19:54:37.727] [INFO] sampler: pres_pen=0.000, rep_pen=1.000, n_recent=4, has_pres=0, has_rep=0, temp=0.000
+  [PASS] Production generate prefix bounds: short/equal/snapshot-end, matching/poisoned tails and successful continuation with cold-logit parity
+[2026-10-28 19:54:37.758] [INFO] myds_metal: loaded precompiled library from ./bin/myds.metallib (all required V4.1 kernels verified)
+[2026-10-28 19:54:37.760] [INFO] Shared Q4 V41 NB: 0 (ordinary NB+HC GU2304x5120/Down5120x2304, NR2/NSG4)
+[2026-10-28 19:54:37.760] [INFO] myds_metal: Initialized successfully on GPU: Apple M4
+[2026-10-28 19:54:37.760] [INFO] Indexer head slots: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 19:54:37.760] [INFO] Indexer topk threshold: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 19:54:37.760] [INFO] Indexer topk NaN shuffle: 0 (reference; reference partition geometry)
+[2026-10-28 19:54:37.760] [INFO] Routed MoE geometry: IQ2 NSG=2, Q2 down NSG=2 (inherited)
+[2026-10-28 19:54:37.760] [INFO] Routed MoE IQ2 LUT: threadgroup (reference)
+[2026-10-28 19:54:37.760] [INFO] Batch2 Q8 shared weights: disabled (scalar reference)
+[2026-10-28 19:54:37.760] [INFO] LM-head Q8 rows per threadgroup: 2 (reference; single token, large output, NSG8)
+[2026-10-28 19:54:37.760] [INFO] Dense Q4 rows per threadgroup: 2 (reference; explicit ordinary scalar scope), NSG=4
+[2026-10-28 19:54:37.760] [INFO] F16 GEMV BF16 fuse: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 19:54:37.760] [INFO] Indexer RoPE quant fuse: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 19:54:37.760] [INFO] Routed MoE Q2 sum cache: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 19:54:37.761] [INFO] Routed MoE Q2 sum cache fused: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 19:54:37.761] [INFO] Decode candidates: down overlap=0, IQ2 V4.1=0, Dense Q4 V4.1=0 (ordinary scalar only)
+[2026-10-28 19:54:37.761] [INFO] Routed MoE Q2 V4.1: 0 (ordinary scalar F32 MID only; 5120/2304/384/6, NR2, down NSG2/4; MM, trace and unscoped paths retain reference)
+[2026-10-28 19:54:37.761] [INFO] Attention flash-decoding: 0 (reference (single-TG in-register 14-NSG))
+[2026-10-28 19:54:37.761] [INFO] HC mix norm pre-fusion: 0 (reference (separate norm + GEMV))
+[2026-10-28 19:54:37.761] [INFO] prefix cache: 锚点 16 套 × 最多 65536 tok（槽 44..59）
+[2026-10-28 19:54:37.761] [INFO] prefix cache: nothing cached yet (this is the first request)
+[2026-10-28 19:54:37.761] [INFO] prompt split: no <|User|> marker, total=11 tok
+[2026-10-28 19:54:37.764] [INFO] MoE path: FUSED (2-step) — verified bit-exact
+EMPTY_DECODE_CACHE consumed=10 cached=10 expected=10
+[2026-10-28 19:54:37.764] [INFO] prefix cache: prompt 13 tok, cached 10, common prefix 10 -> resume from cached prefix
+[2026-10-28 19:54:37.765] [INFO] prompt split: no <|User|> marker, total=13 tok
+[2026-10-28 19:54:37.767] [INFO] sampler: pres_pen=0.000, rep_pen=1.000, n_recent=3, has_pres=0, has_rep=0, temp=0.000
+[2026-10-28 19:54:37.767] [INFO] prefix cache: 锚点 16 套 × 最多 65536 tok（槽 44..59）
+[2026-10-28 19:54:37.767] [INFO] prefix cache: nothing cached yet (this is the first request)
+[2026-10-28 19:54:37.767] [INFO] prompt split: no <|User|> marker, total=13 tok
+[2026-10-28 19:54:37.769] [INFO] sampler: pres_pen=0.000, rep_pen=1.000, n_recent=1, has_pres=0, has_rep=0, temp=0.000
+[2026-10-28 19:54:37.769] [INFO] prefix cache: 锚点 16 套 × 最多 65536 tok（槽 44..59）
+[2026-10-28 19:54:37.769] [INFO] prefix cache: nothing cached yet (this is the first request)
+[2026-10-28 19:54:37.769] [INFO] prompt split: no <|User|> marker, total=13 tok
+[2026-10-28 19:54:37.772] [INFO] sampler: pres_pen=0.000, rep_pen=1.000, n_recent=1, has_pres=0, has_rep=0, temp=0.000
+  [PASS] Zero-output real tiny-model request retains only consumed prefix; same-context continuation KV/state/logits match cold replay
+[2026-10-28 19:54:37.805] [INFO] myds_metal: loaded precompiled library from ./bin/myds.metallib (all required V4.1 kernels verified)
+[2026-10-28 19:54:37.808] [INFO] Shared Q4 V41 NB: 0 (ordinary NB+HC GU2304x5120/Down5120x2304, NR2/NSG4)
+[2026-10-28 19:54:37.808] [INFO] myds_metal: Initialized successfully on GPU: Apple M4
+[2026-10-28 19:54:37.808] [INFO] Indexer head slots: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 19:54:37.808] [INFO] Indexer topk threshold: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 19:54:37.808] [INFO] Indexer topk NaN shuffle: 0 (reference; reference partition geometry)
+[2026-10-28 19:54:37.808] [INFO] Routed MoE geometry: IQ2 NSG=2, Q2 down NSG=2 (inherited)
+[2026-10-28 19:54:37.808] [INFO] Routed MoE IQ2 LUT: threadgroup (reference)
+[2026-10-28 19:54:37.808] [INFO] Batch2 Q8 shared weights: disabled (scalar reference)
+[2026-10-28 19:54:37.808] [INFO] LM-head Q8 rows per threadgroup: 2 (reference; single token, large output, NSG8)
+[2026-10-28 19:54:37.808] [INFO] Dense Q4 rows per threadgroup: 2 (reference; explicit ordinary scalar scope), NSG=4
+[2026-10-28 19:54:37.808] [INFO] F16 GEMV BF16 fuse: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 19:54:37.808] [INFO] Indexer RoPE quant fuse: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 19:54:37.808] [INFO] Routed MoE Q2 sum cache: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 19:54:37.808] [INFO] Routed MoE Q2 sum cache fused: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 19:54:37.808] [INFO] Decode candidates: down overlap=0, IQ2 V4.1=0, Dense Q4 V4.1=0 (ordinary scalar only)
+[2026-10-28 19:54:37.808] [INFO] Routed MoE Q2 V4.1: 0 (ordinary scalar F32 MID only; 5120/2304/384/6, NR2, down NSG2/4; MM, trace and unscoped paths retain reference)
+[2026-10-28 19:54:37.808] [INFO] Attention flash-decoding: 0 (reference (single-TG in-register 14-NSG))
+[2026-10-28 19:54:37.808] [INFO] HC mix norm pre-fusion: 0 (reference (separate norm + GEMV))
+[2026-10-28 19:54:37.808] [INFO] prefix cache: 锚点 16 套 × 最多 65536 tok（槽 44..59）
+[2026-10-28 19:54:37.808] [INFO] prefix cache: off (MYDS_PREFIX_CACHE=0)
+[2026-10-28 19:54:37.808] [INFO] prompt split: no <|User|> marker, total=5 tok
+[2026-10-28 19:54:37.811] [INFO] MoE path: FUSED (2-step) — verified bit-exact
+[2026-10-28 19:54:37.815] [INFO] sampler: pres_pen=0.000, rep_pen=1.000, n_recent=5, has_pres=0, has_rep=0, temp=0.000
+[2026-10-28 19:54:37.819] [INFO] prefix cache: off (MYDS_PREFIX_CACHE=0)
+[2026-10-28 19:54:37.819] [INFO] prompt split: no <|User|> marker, total=5 tok
+[2026-10-28 19:54:37.828] [INFO] prefix cache: off (MYDS_PREFIX_CACHE=0)
+[2026-10-28 19:54:37.828] [INFO] prompt split: no <|User|> marker, total=5 tok
+[2026-10-28 19:54:37.831] [INFO] prefix cache: off (MYDS_PREFIX_CACHE=0)
+[2026-10-28 19:54:37.831] [INFO] prompt split: no <|User|> marker, total=5 tok
+[2026-10-28 19:54:37.834] [INFO] prefix cache: off (MYDS_PREFIX_CACHE=0)
+[2026-10-28 19:54:37.834] [INFO] prompt split: no <|User|> marker, total=5 tok
+[2026-10-28 19:54:37.837] [INFO] sampler: pres_pen=0.000, rep_pen=1.000, n_recent=39, has_pres=0, has_rep=0, temp=0.000
+[2026-10-28 19:54:37.929] [INFO] PLD speculative: 4 cycles, 4/4 tokens accepted (100.0%)
+[2026-10-28 19:54:37.929] [INFO] prefix cache: off (MYDS_PREFIX_CACHE=0)
+[2026-10-28 19:54:37.929] [INFO] prompt split: no <|User|> marker, total=5 tok
+[2026-10-28 19:54:37.932] [INFO] DSpark Markov bias additive scale: 1.00 (no_markov=0)
+[2026-10-28 19:54:37.932] [INFO] DSpark confidence head threshold: 0.00
+  [PASS] Real tiny-model decode counters, EOS/reset/cancel/token parity and cycle-cost backoff
+====================================================
+       Running myds Engine Sampling Unit Tests      
+====================================================
+  [PASS] prefix cache reports every outcome, including the two skipped cases
+  [PASS] snapshot slots keep the constant prefix pinned (44 slots, 21 pinned up to pos 11264)
+[2026-10-28 19:54:37.971] [INFO] myds_metal: loaded precompiled library from ./bin/myds.metallib (all required V4.1 kernels verified)
+[2026-10-28 19:54:37.973] [INFO] Shared Q4 V41 NB: 0 (ordinary NB+HC GU2304x5120/Down5120x2304, NR2/NSG4)
+[2026-10-28 19:54:37.974] [INFO] myds_metal: Initialized successfully on GPU: Apple M4
+[2026-10-28 19:54:37.974] [INFO] Indexer head slots: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 19:54:37.974] [INFO] Indexer topk threshold: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 19:54:37.974] [INFO] Indexer topk NaN shuffle: 0 (reference; reference partition geometry)
+[2026-10-28 19:54:37.974] [INFO] Routed MoE geometry: IQ2 NSG=2, Q2 down NSG=2 (inherited)
+[2026-10-28 19:54:37.974] [INFO] Routed MoE IQ2 LUT: threadgroup (reference)
+[2026-10-28 19:54:37.974] [INFO] Batch2 Q8 shared weights: disabled (scalar reference)
+[2026-10-28 19:54:37.974] [INFO] LM-head Q8 rows per threadgroup: 2 (reference; single token, large output, NSG8)
+[2026-10-28 19:54:37.974] [INFO] Dense Q4 rows per threadgroup: 2 (reference; explicit ordinary scalar scope), NSG=4
+[2026-10-28 19:54:37.974] [INFO] F16 GEMV BF16 fuse: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 19:54:37.974] [INFO] Indexer RoPE quant fuse: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 19:54:37.974] [INFO] Routed MoE Q2 sum cache: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 19:54:37.974] [INFO] Routed MoE Q2 sum cache fused: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 19:54:37.974] [INFO] Decode candidates: down overlap=0, IQ2 V4.1=0, Dense Q4 V4.1=0 (ordinary scalar only)
+[2026-10-28 19:54:37.974] [INFO] Routed MoE Q2 V4.1: 0 (ordinary scalar F32 MID only; 5120/2304/384/6, NR2, down NSG2/4; MM, trace and unscoped paths retain reference)
+[2026-10-28 19:54:37.974] [INFO] Attention flash-decoding: 0 (reference (single-TG in-register 14-NSG))
+[2026-10-28 19:54:37.974] [INFO] HC mix norm pre-fusion: 0 (reference (separate norm + GEMV))
+[2026-10-28 19:54:37.974] [INFO] prefix cache: 锚点 16 套 × 最多 65536 tok（槽 44..59）
+[2026-10-28 19:54:37.974] [INFO] prefix cache: off (MYDS_PREFIX_CACHE=0)
+[2026-10-28 19:54:37.974] [INFO] prompt split: no <|User|> marker, total=12 tok
+[2026-10-28 19:54:37.977] [INFO] MoE path: FUSED (2-step) — verified bit-exact
+[2026-10-28 19:54:37.979] [INFO] sampler: pres_pen=0.000, rep_pen=1.000, n_recent=1, has_pres=0, has_rep=0, temp=0.000
+[2026-10-28 19:54:37.979] [ERROR] Prompt length (4001 tokens) exceeds maximum sequence context (1024)
+[2026-10-28 19:54:37.979] [INFO] prefix cache: off (MYDS_PREFIX_CACHE=0)
+[2026-10-28 19:54:37.979] [INFO] prompt split: no <|User|> marker, total=12 tok
+[2026-10-28 19:54:37.981] [INFO] prefix cache: off (MYDS_PREFIX_CACHE=0)
+[2026-10-28 19:54:37.981] [INFO] prompt split: no <|User|> marker, total=12 tok
+  [PASS] prefill stats: failure path reports zeros with valid=0, never the previous request
+  [PASS] Production greedy argmax token selection (index 2 picked)
+[2026-10-28 19:54:37.985] [INFO] sampler: pres_pen=0.000, rep_pen=1.000, n_recent=0, has_pres=0, has_rep=0, temp=0.000
+  [PASS] Structured output logit bitmask filter (disallowed token 2, selected 5)
+[2026-10-28 19:54:37.985] [INFO] sampler: pres_pen=0.000, rep_pen=1.000, n_recent=0, has_pres=0, has_rep=0, temp=0.000
+  [PASS] Production repetition penalty: token 2 penalized -> token 5 selected
+  [PASS] Production top-k truncation constraint (only top 2 candidate tokens sampled)
+  [PASS] Production top-p nucleus spans the mass prefix (185/200 samples beyond the top 1024)
+  [PASS] Production min-p probability threshold filtering
+  [PASS] RoPE decoupled angular frequency calculation
+[2026-10-28 19:54:38.015] [INFO] V4.1 native graph enabled: HC multi-stream residual connections (verified — see docs/ULP_SWITCHES.md)
+[2026-10-28 19:54:38.016] [INFO] myds_metal: loaded precompiled library from ./bin/myds.metallib (all required V4.1 kernels verified)
+[2026-10-28 19:54:38.018] [INFO] Shared Q4 V41 NB: 0 (ordinary NB+HC GU2304x5120/Down5120x2304, NR2/NSG4)
+[2026-10-28 19:54:38.018] [INFO] myds_metal: Initialized successfully on GPU: Apple M4
+[2026-10-28 19:54:38.018] [INFO] Indexer head slots: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 19:54:38.018] [INFO] Indexer topk threshold: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 19:54:38.018] [INFO] Indexer topk NaN shuffle: 0 (reference; reference partition geometry)
+[2026-10-28 19:54:38.018] [INFO] Routed MoE geometry: IQ2 NSG=2, Q2 down NSG=2 (inherited)
+[2026-10-28 19:54:38.018] [INFO] Routed MoE IQ2 LUT: threadgroup (reference)
+[2026-10-28 19:54:38.018] [INFO] Batch2 Q8 shared weights: disabled (scalar reference)
+[2026-10-28 19:54:38.018] [INFO] LM-head Q8 rows per threadgroup: 2 (reference; single token, large output, NSG8)
+[2026-10-28 19:54:38.018] [INFO] Dense Q4 rows per threadgroup: 2 (reference; explicit ordinary scalar scope), NSG=4
+[2026-10-28 19:54:38.018] [INFO] F16 GEMV BF16 fuse: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 19:54:38.018] [INFO] Indexer RoPE quant fuse: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 19:54:38.018] [INFO] Routed MoE Q2 sum cache: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 19:54:38.018] [INFO] Routed MoE Q2 sum cache fused: 0 (reference; explicit ordinary scalar scope)
+[2026-10-28 19:54:38.018] [INFO] Decode candidates: down overlap=0, IQ2 V4.1=0, Dense Q4 V4.1=0 (ordinary scalar only)
+[2026-10-28 19:54:38.018] [INFO] Routed MoE Q2 V4.1: 0 (ordinary scalar F32 MID only; 5120/2304/384/6, NR2, down NSG2/4; MM, trace and unscoped paths retain reference)
+[2026-10-28 19:54:38.018] [INFO] Attention flash-decoding: 0 (reference (single-TG in-register 14-NSG))
+[2026-10-28 19:54:38.018] [INFO] HC mix norm pre-fusion: 0 (reference (separate norm + GEMV))
+[2026-10-28 19:54:38.018] [INFO] Opened GGUF model: /tmp/test_myds_unsupported_hc.gguf (tensors: 1, kv_pairs: 10)
+[2026-10-28 19:54:38.018] [ERROR] Missing required embedding tensor 'token_embd.weight' (T0-3 gate)
+  [PASS] Required unimplemented HC graph is rejected before inference
+  [PASS] DeepSeek V4/V4.1 architecture enforcement & V2/V3 rejection
+[2026-10-28 19:54:38.018] [INFO] FP8 tile block size validated for 'deepseek41.weight_block_size': [32, 32]
+[2026-10-28 19:54:38.018] [ERROR] DeepSeek V4.1 FP8 tile block size mismatch for key 'deepseek41.weight_block_size': expected [32, 32], got [128, 128]. (128x128 is legacy V4 block size; using it with V4.1 causes silent dequantization corruption).
+[2026-10-28 19:54:38.018] [ERROR] DeepSeek V4.1 FP8 tile block size mismatch for key 'quantization_config.weight_block_size': expected [32, 32], got [128, 128]. (128x128 is legacy V4 block size; using it with V4.1 causes silent dequantization corruption).
+[2026-10-28 19:54:38.018] [INFO] FP8 tile block size validated for 'quantization_config.weight_block_size': [32, 32]
+[2026-10-28 19:54:38.018] [ERROR] DeepSeek V4.1 FP8 tile block size mismatch for key 'quantization_config.weight_block_size': expected [32, 32], got [128, 128]. (128x128 is legacy V4 block size; using it with V4.1 causes silent dequantization corruption).
+[2026-10-28 19:54:38.018] [INFO] FP8 tile block size validated for 'quantization_config.weight_block_size': [32, 32]
+  [PASS] DeepSeek V4.1 FP8 tile block size 32x32 defense validation (128x128 rejected)
+[2026-10-28 19:54:38.018] [INFO] Opened GGUF model: /tmp/test_myds_gate_mla.gguf (tensors: 3, kv_pairs: 10)
+[2026-10-28 19:54:38.018] [ERROR] Layer 0 missing required attention norm tensor 'blk.0.attn_norm.weight' (T0-3 gate)
+  [PASS] T0-3 gate: MLA model without MHA tensors rejected fail-fast
+[2026-10-28 19:54:38.019] [INFO] Opened GGUF model: /tmp/test_myds_gate_moe.gguf (tensors: 3, kv_pairs: 10)
+[2026-10-28 19:54:38.019] [INFO] MoE enabled: 64 routed experts (top-6 active, scale=1.00, exp_dim=2304, clamp=10.0), 0 shared experts
+[2026-10-28 19:54:38.019] [ERROR] Layer 0 missing required attention norm tensor 'blk.0.attn_norm.weight' (T0-3 gate)
+  [PASS] T0-4 gate: MoE model with routed experts rejected fail-fast
+[2026-10-28 19:54:38.019] [INFO] Opened GGUF model: /tmp/test_myds_gate_quant.gguf (tensors: 5, kv_pairs: 10)
+[2026-10-28 19:54:38.019] [ERROR] Layer 0 missing required attention K tensor 'blk.0.attn_k.weight' (T0-3 gate)
+  [PASS] T0-1 gate: Unsupported quantization (Q4_K) rejected fail-fast
+[2026-10-28 19:54:38.019] [INFO] Opened GGUF model: /tmp/test_myds_gate_missing.gguf (tensors: 2, kv_pairs: 10)
+[2026-10-28 19:54:38.019] [ERROR] Layer 0 missing required attention norm tensor 'blk.0.attn_norm.weight' (T0-3 gate)
+  [PASS] T0-3 gate: Missing required attention/FFN tensors rejected fail-fast
+[2026-10-28 19:54:38.019] [INFO] Opened GGUF model: /tmp/test_myds_mla_forward.gguf (tensors: 16, kv_pairs: 10)
+[2026-10-28 19:54:38.021] [INFO] Residency keep-alive: 16 allocations, queue-attached, keep_alive=180s, period=5ms
+[2026-10-28 19:54:38.022] [INFO] prefix cache: 锚点 16 套 × 最多 65536 tok（槽 44..59）
+[2026-10-28 19:54:38.023] [INFO] sampler: pres_pen=0.000, rep_pen=1.000, n_recent=1, has_pres=0, has_rep=0, temp=0.000
+[2026-10-28 19:54:38.023] [INFO] prefix cache: off (MYDS_PREFIX_CACHE=0)
+[2026-10-28 19:54:38.023] [INFO] prompt split: no <|User|> marker, total=6 tok
+[2026-10-28 19:54:38.026] [INFO] sampler: pres_pen=0.000, rep_pen=1.000, n_recent=8, has_pres=0, has_rep=0, temp=0.000
+  [PASS] MLA forward pass & latent KV cache cross-attention verified
+[2026-10-28 19:54:38.026] [INFO] prefix cache: 锚点 16 套 × 最多 65536 tok（槽 44..59）
+[2026-10-28 19:54:38.026] [INFO] prefix cache: 锚点 16 套 × 最多 65536 tok（槽 44..59）
+[2026-10-28 19:54:38.027] [INFO] sampler: pres_pen=0.000, rep_pen=1.000, n_recent=1, has_pres=0, has_rep=0, temp=0.000
+[2026-10-28 19:54:38.030] [INFO] prefix cache: off (MYDS_PREFIX_CACHE=0)
+[2026-10-28 19:54:38.030] [INFO] prompt split: no <|User|> marker, total=6 tok
+[2026-10-28 19:54:38.032] [INFO] sampler: pres_pen=0.000, rep_pen=1.000, n_recent=1, has_pres=0, has_rep=0, temp=0.000
+[2026-10-28 19:54:38.036] [INFO] prefix cache: off (MYDS_PREFIX_CACHE=0)
+[2026-10-28 19:54:38.036] [INFO] prompt split: no <|User|> marker, total=6 tok
+[2026-10-28 19:54:38.051] [INFO] prefix cache: off (MYDS_PREFIX_CACHE=0)
+[2026-10-28 19:54:38.051] [INFO] prompt split: no <|User|> marker, total=18 tok
+[2026-10-28 19:54:38.059] [INFO] prefix cache: off (MYDS_PREFIX_CACHE=0)
+[2026-10-28 19:54:38.059] [INFO] prompt split: no <|User|> marker, total=6 tok
+[2026-10-28 19:54:38.060] [INFO] prefix cache: off (MYDS_PREFIX_CACHE=0)
+[2026-10-28 19:54:38.060] [INFO] prompt split: no <|User|> marker, total=23 tok
+[2026-10-28 19:54:38.060] [WARN] prefix cache invalidated: prefill returned -2
+[2026-10-28 19:54:38.064] [INFO] prefix cache: off (MYDS_PREFIX_CACHE=0)
+[2026-10-28 19:54:38.064] [INFO] prompt split: no <|User|> marker, total=6 tok
+[2026-10-28 19:54:38.376] [INFO] prefix cache: off (MYDS_PREFIX_CACHE=0)
+[2026-10-28 19:54:38.376] [INFO] prompt split: no <|User|> marker, total=514 tok
+  [PASS] Prefill short/long/short workspace reuse, 512-token boundary, output equivalence, cancellation and KV capacity
+[2026-10-28 19:54:38.409] [INFO] prefix cache: 锚点 16 套 × 最多 65536 tok（槽 44..59）
+[2026-10-28 19:54:38.409] [INFO] prefix cache: 锚点 16 套 × 最多 65536 tok（槽 44..59）
+[2026-10-28 19:54:38.410] [INFO] sampler: pres_pen=0.000, rep_pen=1.000, n_recent=1, has_pres=0, has_rep=0, temp=0.000
+[2026-10-28 19:54:38.413] [INFO] prefix cache: off (MYDS_PREFIX_CACHE=0)
+[2026-10-28 19:54:38.413] [INFO] prompt split: no <|User|> marker, total=6 tok
+[2026-10-28 19:54:38.415] [INFO] sampler: pres_pen=0.000, rep_pen=1.000, n_recent=1, has_pres=0, has_rep=0, temp=0.000
+[2026-10-28 19:54:38.418] [INFO] prefix cache: off (MYDS_PREFIX_CACHE=0)
+[2026-10-28 19:54:38.418] [INFO] prompt split: no <|User|> marker, total=6 tok
+[2026-10-28 19:54:38.430] [INFO] prefix cache: off (MYDS_PREFIX_CACHE=0)
+[2026-10-28 19:54:38.430] [INFO] prompt split: no <|User|> marker, total=18 tok
+[2026-10-28 19:54:38.436] [INFO] prefix cache: off (MYDS_PREFIX_CACHE=0)
+[2026-10-28 19:54:38.436] [INFO] prompt split: no <|User|> marker, total=6 tok
+[2026-10-28 19:54:38.437] [INFO] prefix cache: off (MYDS_PREFIX_CACHE=0)
+[2026-10-28 19:54:38.437] [INFO] prompt split: no <|User|> marker, total=23 tok
+[2026-10-28 19:54:38.437] [WARN] prefix cache invalidated: prefill returned -2
+[2026-10-28 19:54:38.440] [INFO] prefix cache: off (MYDS_PREFIX_CACHE=0)
+[2026-10-28 19:54:38.440] [INFO] prompt split: no <|User|> marker, total=6 tok
+[2026-10-28 19:54:38.732] [INFO] prefix cache: off (MYDS_PREFIX_CACHE=0)
+[2026-10-28 19:54:38.733] [INFO] prompt split: no <|User|> marker, total=514 tok
+  [PASS] Prefill short/long/short workspace reuse, 512-token boundary, output equivalence, cancellation and KV capacity
+[2026-10-28 19:54:38.765] [INFO] prefix cache: 锚点 16 套 × 最多 65536 tok（槽 44..59）
+[2026-10-28 19:54:38.765] [INFO] prefix cache: 锚点 16 套 × 最多 65536 tok（槽 44..59）
+[2026-10-28 19:54:38.765] [INFO] prefix cache: 锚点 16 套 × 最多 65536 tok（槽 44..59）
+[2026-10-28 19:54:38.766] [INFO] sampler: pres_pen=0.000, rep_pen=1.000, n_recent=1, has_pres=0, has_rep=0, temp=0.000
+[2026-10-28 19:54:38.766] [ERROR] Embedding lookup failed for token -1 (vocab 256)
+[2026-10-28 19:54:38.766] [ERROR] Embedding lookup failed for token 256 (vocab 256)
+[2026-10-28 19:54:38.766] [INFO] sampler: pres_pen=0.000, rep_pen=1.000, n_recent=1, has_pres=0, has_rep=0, temp=0.000
+[2026-10-28 19:54:38.769] [INFO] prefix cache: off (MYDS_PREFIX_CACHE=0)
+[2026-10-28 19:54:38.769] [INFO] prompt split: no <|User|> marker, total=6 tok
+[2026-10-28 19:54:38.771] [INFO] sampler: pres_pen=0.000, rep_pen=1.000, n_recent=1, has_pres=0, has_rep=0, temp=0.000
+[2026-10-28 19:54:38.772] [INFO] prefix cache: off (MYDS_PREFIX_CACHE=0)
+[2026-10-28 19:54:38.772] [INFO] prompt split: no <|User|> marker, total=3 tok
+  [PASS] F16 embedding known values, bounds, decode and chunk prefill against independent F32 weights
+[2026-10-28 19:54:38.774] [INFO] Opened GGUF model: /tmp/test_myds_vocabulary_shapes.gguf (tensors: 12, kv_pairs: 10)
+[2026-10-28 19:54:38.775] [INFO] Opened GGUF model: /tmp/test_myds_vocabulary_shapes.gguf (tensors: 12, kv_pairs: 10)
+[2026-10-28 19:54:38.775] [ERROR] Embedding shape must match hidden dimension 64 and tokenizer vocabulary 16
+[2026-10-28 19:54:38.775] [INFO] Opened GGUF model: /tmp/test_myds_vocabulary_shapes.gguf (tensors: 12, kv_pairs: 10)
+[2026-10-28 19:54:38.775] [ERROR] Embedding shape must match hidden dimension 64 and tokenizer vocabulary 16
+[2026-10-28 19:54:38.775] [INFO] Opened GGUF model: /tmp/test_myds_vocabulary_shapes.gguf (tensors: 12, kv_pairs: 10)
+[2026-10-28 19:54:38.775] [ERROR] Embedding shape must match hidden dimension 64 and tokenizer vocabulary 16
+[2026-10-28 19:54:38.775] [INFO] Opened GGUF model: /tmp/test_myds_vocabulary_shapes.gguf (tensors: 12, kv_pairs: 10)
+[2026-10-28 19:54:38.775] [ERROR] LM head shape must match embedding dimension 64 and vocabulary 16
+[2026-10-28 19:54:38.775] [INFO] Opened GGUF model: /tmp/test_myds_vocabulary_shapes.gguf (tensors: 12, kv_pairs: 10)
+[2026-10-28 19:54:38.775] [ERROR] LM head shape must match embedding dimension 64 and vocabulary 16
+[2026-10-28 19:54:38.775] [INFO] Opened GGUF model: /tmp/test_myds_vocabulary_shapes.gguf (tensors: 12, kv_pairs: 10)
+[2026-10-28 19:54:38.775] [ERROR] LM head shape must match embedding dimension 64 and vocabulary 16
+[2026-10-28 19:54:38.775] [INFO] Opened GGUF model: /tmp/test_myds_vocabulary_shapes.gguf (tensors: 12, kv_pairs: 10)
+[2026-10-28 19:54:38.775] [ERROR] Output norm must be a one-dimensional F32 tensor of length 64
+[2026-10-28 19:54:38.776] [INFO] Opened GGUF model: /tmp/test_myds_vocabulary_shapes.gguf (tensors: 12, kv_pairs: 10)
+[2026-10-28 19:54:38.776] [ERROR] Output norm must be a one-dimensional F32 tensor of length 64
+[2026-10-28 19:54:38.776] [INFO] Opened GGUF model: /tmp/test_myds_vocabulary_shapes.gguf (tensors: 12, kv_pairs: 10)
+[2026-10-28 19:54:38.776] [ERROR] Output norm must be a one-dimensional F32 tensor of length 64
+  [PASS] Tokenizer/embedding/output vocabulary, dimensions and norm type/shape loader contracts
+[2026-10-28 19:54:38.776] [INFO] prefix cache: 锚点 16 套 × 最多 65536 tok（槽 44..59）
+[2026-10-28 19:54:38.777] [INFO] sampler: pres_pen=0.000, rep_pen=1.000, n_recent=1, has_pres=0, has_rep=0, temp=0.000
+[2026-10-28 19:54:38.777] [INFO] prefix cache: off (MYDS_PREFIX_CACHE=0)
+[2026-10-28 19:54:38.777] [INFO] prompt split: no <|User|> marker, total=2 tok
+[2026-10-28 19:54:38.777] [ERROR] Generation step 0 failed
+  [PASS] Invalid sampled token returns generation error without an empty success callback
+====================================================
+   ALL ENGINE UNIT & GATE TESTS PASSED!             
+====================================================

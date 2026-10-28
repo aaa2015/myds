@@ -1,0 +1,15 @@
+====================================================
+      Running myds BPE Tokenizer Unit Tests         
+====================================================
+  [PASS] Tokenizer vocabulary loading and metadata
+  [PASS] Tokenizer BPE encoding and byte-fallback
+  [PASS] Tokenizer decoding & byte token translation
+  [PASS] Tokenizer 256-byte fallback mode
+  [PASS] Byte-BPE known IDs, rank order, pre-tokenization, and special tokens
+  [PASS] Binary decoding preserves all 256 bytes, NUL, and split UTF-8
+  [PASS] Missing-byte errors are explicit; GPT-2 metadata selects its split rules
+  [PASS] Long/short BPE pieces and specials preserve IDs, counts, and capacity guards
+====================================================
+  ALL TOKENIZER UNIT TESTS PASSED!
+====================================================
+PASS: Unicode oracle, 12 allocation failures, cleanup, and concurrent encoding

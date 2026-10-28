@@ -1,5 +1,10 @@
 # prefill / decode 全链路、已采纳优化与排除记录
 
+> **2026-10-28 CPU 分词更新（§107）**：实现等价 ASCII 分类快路径及请求内 BPE 工作区复用。
+> macstudio 真实词表、15 对交错样本验证英文/代码/多语言混合分词耗时下降约 33–54%；
+> 1,548 个输入完整 token ID 对照、118 个 HF 独立参考用例通过。
+> 这是分词组件收益，未测新的 GPU 或端到端吞吐，未替换生产服务。
+
 > **2026-10-26 更正：600K「静默挂起」不成立。** 同口径复测 600,281 token（6 个 macroblock），
 > 完整跑完 **2465.9 s = 243.4 t/s**，峰值 wired **184.9 GB**，decode 24.8 t/s，正常 `finish_reason: length`。
 > §41.3 的「死锁」判定用的是「CPU 不干活 + 内存不涨 + 日志不动」三条，**这三条在 GPU-bound 的 prefill 里
@@ -14514,3 +14519,39 @@ L3 **必须在持有权重的机器上本地执行**（脚本用 `pgrep -x myds`
 **判断一份性能数据是否可信，不该依赖读者是否愿意相信作者。**
 本节能提供的保证是：数字可被重算、容差可被检查、无效数据会被判死、
 边界写在结论旁边。
+
+---
+
+## §107 CPU 分词：ASCII 分类与请求内工作区复用（2026-10-28）
+
+本轮在阅读现有优化与证否记录后，检查了 GPU 准入范围和 CPU 请求路径。
+本次采纳到源码的改动位于 `src/myds_tokenizer.c`：
+
+1. ASCII 字符分类从 Unicode 范围二分查找改为严格等价的 128 项表，非 ASCII
+   保留原有查找。测试穷举 Unicode 范围及无效码点，与原表逐一比较。
+2. BPE 的 symbols 和候选 heap 在单次 encode 调用内复用，跨词片和特殊 token
+   分段沿用容量，每个词片重新初始化状态。调用结束或失败时统一释放；tokenizer
+   对象仍只读，独立调用和并发调用之间不保留可变状态。
+
+macstudio（M2 Ultra 192 GiB、macOS 27.2）上用实际 129,280 词表、7 个可生成的合成输入，
+同进程两套源码、同编译参数、预热后每臂 15 样本、AB/BA 交错验证。英文、代码、
+多语言混合的分词耗时下降约 33–54%，绝对节约约 5–8 ms。四个场景的同源码 A/A
+对照最大中位差约 0.98%；中文及超长词片的小收益保留原始数字，不作为主要主张。
+
+**数值与范围边界**：1,548 个输入通过完整 token IDs、BOS、count-only、截断输出与
+哨兵校验，另有 118 个 Hugging Face 独立参考用例通过。新增 12 个分配失败点、
+错误清理、恢复编码与共享 tokenizer 并发验证；ASan/UBSan、tokenizer、server API、
+engine gates 通过。未改模型数值路径，也未运行本轮全模型 logits/state 门。
+
+**不把分词比例解释成推理比例**：正式计时仅包含 `encode_bytes`；没有新的 GPU
+prefill/decode 或 HTTP TTFT 数字。生产进程保持 PID 13659，制品 SHA 与 §105 一致；
+本轮只在隔离目录测试，未部署候选可执行文件。
+
+完整结果、原始 JSONL、源码/输入身份和复现命令见
+[`benchmarks/tokenizer_2026-10-28/README.md`](../benchmarks/tokenizer_2026-10-28/README.md)。
+正式性能来源为其中 `raw/macstudio-ab.jsonl`，不是早期 pilot 的最小值。
+
+**仍未关闭的 GPU 问题**：§105.7 的 `CHUNK_KEY_MAX` 两配置差异仍未隔离归因；
+register-only 的全局位置 32K 以外覆盖仍需新资格验证。本轮没有改变其 host/shader
+准入。该内核的分数位级 oracle 为 TILED，既有 exact 桥接允许 score 差异，不能直接
+把旧 fixture 的冻结范围改大后宣称已过原全模型门。
