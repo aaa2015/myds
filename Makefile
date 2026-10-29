@@ -30,6 +30,7 @@ BUILD_DIR = build
 #   直到有人引用它们才在链接期暴露。我第一版就漏了三个（vispre/visw/visfwd），
 #   而当时所有测试仍然全过，因为没人用到它们。
 SRCS_C = src/myds_cpu.c src/myds_log.c src/myds_configfile.c src/myds_gguf.c src/myds_tokenizer.c \
+         src/myds_knobs.c \
          src/myds_engine.c src/myds_v41.c src/myds_v41_gpu.c src/myds_v41_moe.c src/myds_v41_decode.c \
          src/myds_engram.c src/myds_engram_cpu.c src/myds_moe_cpu.c src/myds_dspark.c \
          src/myds_vispre.c src/myds_visw.c src/myds_visfwd.c src/myds_vjob.c \
@@ -143,7 +144,12 @@ ALL_TESTS += $(TEST_METAL_RESIDENCY) $(TEST_TEARDOWN_ORDER) $(TEST_DECODE_SPLIT)
 ALL_TESTS += $(TEST_TOKENIZER_WORKSPACE)
 ALL_TESTS += $(TEST_PROMPT_RENDER_BOUNDS)
 
-.PHONY: all test clean bench metallib build-tail-init test-tail-init test-indexer-register-only-host test-register-only-http-bridge test-register-only-service-window audit-ledger gen-ledger bench-register-only corpus-check verify-register-only
+.PHONY: all test clean bench metallib build-tail-init test-tail-init test-indexer-register-only-host test-register-only-http-bridge test-register-only-service-window audit-ledger gen-ledger bench-register-only corpus-check verify-register-only check-knobs
+
+# The knob inventory must match the source. A new MYDS_* read site that is not
+# registered here is how a config key ends up set-but-unread (MYDS_TOPK_THRESHOLD).
+check-knobs:
+	@python3 tools/knob_inventory.py --check
 
 # Rebuild consumers when public or internal layouts change.
 -include $(wildcard $(BUILD_DIR)/*.d)
@@ -709,7 +715,7 @@ vis-crosscheck:
 
 .PHONY: vis-crosscheck
 
-test: $(ALL_TESTS) $(METALLIB)
+test: check-knobs $(ALL_TESTS) $(METALLIB)
 	@echo "\n========================================================"
 	@echo "               RUNNING ALL UNIT TESTS                   "
 	@echo "========================================================"

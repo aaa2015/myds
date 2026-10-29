@@ -6,6 +6,7 @@
 #include "myds_metal.h"
 #include "myds_log.h"
 #include "myds_configfile.h"
+#include "myds_knobs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,6 +38,9 @@ static void print_usage(const char *prog) {
     printf("  --pld                   Enable Prompt-Lookup Decoding (speculative draft)\n");
     printf("  --no-pld                Disable Prompt-Lookup Decoding\n");
     printf("  -h, --help              Show this help message\n");
+    printf("  --print-config [-v]     Report which MYDS_* keys this build reads;\n");
+    printf("                          exit 2 if any set key is read by nothing\n");
+    printf("  --dump-config <path>    Write the effective MYDS_* environment to a file\n");
 }
 
 static inline double myds_now_s(void) {
@@ -169,6 +173,18 @@ int main(int argc, char *argv[]) {
             const int n = myds_configfile_dump_env(argv[i + 1]);
             return n >= 0 ? 0 : 1;
         }
+    }
+    /* --print-config：不加载模型，回答「配置写的键，到底有没有代码在读」。
+     * 存在的理由：MYDS_TOPK_THRESHOLD=1 在生产 conf 里躺了 4 天而无人读取，
+     * 配置声称开、实际全关。这类错误不会报错，只会安静地改掉对照实验的前提。
+     * 未知键一律 exit 2，让它进 CI 门而不是进复盘文档。 */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--print-config") != 0) continue;
+        bool verbose = false;
+        for (int j = 1; j < argc; j++)
+            if (!strcmp(argv[j], "--verbose") || !strcmp(argv[j], "-v")) verbose = true;
+        const int unread = myds_knobs_report(1u | 2u | (verbose ? 4u : 0u), verbose);
+        return unread < 0 ? 1 : (unread ? 2 : 0);
     }
     (void)cfg_n;
 
