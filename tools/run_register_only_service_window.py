@@ -126,6 +126,30 @@ def process_cwd(pid):
     return Path(names[0]).resolve()
 
 
+def process_nice(pid):
+    raw = query('ps', '-p', str(pid), '-o', 'nice=')
+    need(raw.lstrip('-').isdigit(), 'cannot read process niceness')
+    return int(raw)
+
+
+def stdio_targets(pid):
+    """fd 0/1/2 -> absolute path, None when that descriptor is not a file.
+
+    Production inherits stdin from start_fleet.sh's `while read ... done <
+    $CONFIG_FILE` loop and appends stdout/stderr to its service log. A restore
+    that silently swaps these for /dev/null and private files changes the
+    process it claims to have preserved (ledger §108)."""
+    rows = query('lsof', '-nP', '-a', '-p', str(pid), '-d', '0,1,2', '-Fn').splitlines()
+    found, fd = {}, None
+    for row in rows:
+        if row.startswith('f'):
+            fd = row[1:]
+        elif row.startswith('n') and fd is not None:
+            found[fd] = row[1:]
+            fd = None
+    return {key: found.get(key) for key in ('0', '1', '2')}
+
+
 def processes():
     rows = []
     for line in query('ps', '-axo', 'pid=,comm=').splitlines():
@@ -201,8 +225,8 @@ class Window:
         positions = [i for i, arg in enumerate(argv) if arg == '--port']
         need(len(positions) == 1 and positions[0] + 1 < len(argv) and
              argv[positions[0] + 1] == str(a.port), 'original port differs')
-        need(int(query('ps', '-p', str(a.pid), '-o', 'nice=')) == 0,
-             'nondefault scheduling needs explicit preservation implementation')
+        nice = process_nice(a.pid)
+        stdio = stdio_targets(a.pid)
         need(processes() == [(a.pid, 'myds')], 'other inference work prevents exclusive window')
         start = query('ps', '-p', str(a.pid), '-o', 'lstart=')
         # Match the precompiled library search paths used by myds_metal_init
@@ -239,7 +263,8 @@ class Window:
             environment_sha256=hashlib.sha256(json.dumps(env, sort_keys=True,
                 ensure_ascii=True, separators=(',', ':')).encode()).hexdigest(),
             MYDS_environment={k: v for k, v in env.items() if k.startswith('MYDS_')},
-            identities=identities, experiment_command=a.command)
+            identities=identities, experiment_command=a.command,
+            nice=nice, stdio=stdio)
         self.persist(critical=True); self.verify()
         need(process_arguments(a.pid) == captured and
              query('ps', '-p', str(a.pid), '-o', 'lstart=') == start,
@@ -297,15 +322,47 @@ class Window:
             except subprocess.TimeoutExpired as exc:
                 raise RuntimeError('owned experiment remains; no SIGKILL or overlapping restore') from exc
 
+    def _apply_priority(self):
+        """Give the restored child the original niceness before execve.
+
+        `nice -n N` is relative, so it cannot express "exactly N" when the
+        window runner itself has a non-zero niceness; setpriority in the child
+        is the only way to reproduce the value that was observed.
+        """
+        nice = self.state.get('nice', 0)
+        if nice:
+            os.setpriority(os.PRIO_PROCESS, 0, nice)
+
     def restore(self):
         self.drain_experiment(); self.wait_original_exit(); self.verify()
         remaining = processes()
         need(not remaining, f'unknown inference processes remain; no signals sent: {remaining}')
-        with (self.a.root / 'restored.stdout').open('xb') as out, (self.a.root / 'restored.stderr').open('xb') as err:
+        # Re-create the original stdio instead of pointing it at private evidence
+        # files: the restored process is equivalent only if it writes where the
+        # stopped one wrote. The paths and their digests are kept as evidence.
+        targets = self.state.get('stdio') or {}
+        stdin_target = targets.get('0')
+        stdin_handle = None
+        if stdin_target and Path(stdin_target).is_file() and os.access(stdin_target, os.R_OK):
+            stdin_handle = open(stdin_target, 'rb')
+        out = err = None
+        try:
+            if targets.get('1') or targets.get('2'):
+                need(targets.get('1') and targets.get('2'),
+                     'partial stdout/stderr capture: refusing to guess the missing one')
+                out, err = open(targets['1'], 'ab'), open(targets['2'], 'ab')
+            else:
+                out, err = ((self.a.root / 'restored.stdout').open('xb'),
+                            (self.a.root / 'restored.stderr').open('xb'))
             self.restored_child = subprocess.Popen(self.state['argv'],
                 executable=self.state['executable'], cwd=self.state['cwd'],
-                env=self.state['environment'], stdin=subprocess.DEVNULL,
-                stdout=out, stderr=err, start_new_session=True)
+                env=self.state['environment'], stdin=stdin_handle or subprocess.DEVNULL,
+                stdout=out, stderr=err, start_new_session=True,
+                preexec_fn=self._apply_priority)
+        finally:
+            for handle in (stdin_handle, out, err):
+                if handle is not None:
+                    handle.close()
         child = self.restored_child; self.state['restored_pid'] = child.pid; self.persist()
         deadline = time.monotonic() + self.a.restore_timeout
         while time.monotonic() < deadline:
@@ -324,7 +381,13 @@ class Window:
         need(process_arguments(child.pid) == {k: self.state[k] for k in ('executable', 'argv', 'environment')},
              'restored argv/executable/full initial environment differs')
         need(process_cwd(child.pid) == Path(self.state['cwd']), 'restored cwd differs')
-        need(int(query('ps', '-p', str(child.pid), '-o', 'nice=')) == 0, 'restored nice differs')
+        need(int(query('ps', '-p', str(child.pid), '-o', 'nice=')) == self.state.get('nice', 0),
+             'restored nice differs')
+        restored_stdio = stdio_targets(child.pid)
+        for fd, expected in (self.state.get('stdio') or {}).items():
+            if expected and Path(expected).exists():
+                need(restored_stdio.get(fd) == expected,
+                     f'restored stdio[{fd}] differs: {restored_stdio.get(fd)} != {expected}')
         listener = query('lsof', '-nP', '-a', '-p', str(child.pid),
                          '-iTCP:' + str(self.a.port), '-sTCP:LISTEN', '-Fp')
         need('p' + str(child.pid) in listener.splitlines(), 'health listener is not restored child')
