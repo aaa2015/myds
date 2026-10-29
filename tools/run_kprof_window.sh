@@ -55,13 +55,17 @@ python3 -c "import sys; sys.path.insert(0,'tools'); import bench_reproduce; benc
 vm_stat > "$out/vm-before.txt"; sysctl vm.swapusage > "$out/swap-before.txt"
 
 # Production decode settings minus speculation / KV disk / prefix cache.
+# NOTE 2026-10-30: this list used to set MYDS_TOPK_THRESHOLD=1, which no code
+# reads (the real key is MYDS_INDEXER_TOPK_THRESHOLD, default false, non-0-ULP).
+# Past kprof decode breakdowns therefore ran with the threshold path OFF.
+# Verify any config mirror with: tools/knob_inventory.py --check --conf <file>
 common=(MYDS_PREFIX_CACHE=0 MYDS_PLD=0 MYDS_KV_DSK=0
   MYDS_ATTN_INDEXER_EARLY=1 MYDS_BATCH2_AUTO_BARRIER=0 MYDS_DECODE_SPLIT=20
   MYDS_F16_GEMV_BF16_FUSE=1 MYDS_INDEXER_HEAD_SLOTS=1 MYDS_INDEXER_ROPE_QUANT_FUSE=1
   MYDS_INDEXER_TOPK_NAN_FUSE=1 MYDS_INDEXER_TOPK_PREFIX_MERGE=1 MYDS_LM_HEAD_Q8_NR0=4
   MYDS_METAL_CONCURRENT=1 MYDS_MOE_CONCURRENT=1 MYDS_MOE_NSG=4 MYDS_MOE_CHUNKS=9
   MYDS_PREFILL_CHUNK_SIZE=512 MYDS_RESIDENCY_KEEP_ALIVE_S=86400
-  MYDS_SUFFIX_SHRINK_SHIFT=512 MYDS_TOPK_THRESHOLD=1 MYDS_DENSE_Q4_NR0=2)
+  MYDS_SUFFIX_SHRINK_SHIFT=512 MYDS_DENSE_Q4_NR0=2)
 printf '%s\n' "${common[@]}" > "$out/env.txt"
 
 run_case() { # name request max_seq
