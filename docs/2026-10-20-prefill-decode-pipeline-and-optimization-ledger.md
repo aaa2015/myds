@@ -15227,8 +15227,13 @@ macmini 上连续两次**干净构建**（独立 `BUILD_DIR`）均为 `6ce62f86�
 | CLT 自带 metal 编译器 | **无** | **无** |
 | `xcodebuild -downloadComponent` 可用 | 是（Xcode 路径有 metal） | 已修 |
 
-macmini 的 `make test` 需要 metal 来生成 metallib，而那个 metal 只随 Xcode 提供。
-所以**没有**把 macmini 的 `xcode-select` 切到 CLT —— 那会让 macmini 无法跑测试。
+> ⚠️ **2026-10-30 21:5x 修正（§121）**：本段原写「macmini 的 Xcode 路径有 metal」。
+> **实测该说法错误**：macmini **同样缺 Metal Toolchain 组件**，
+> 拿一个真实 `.metal` 文件执行 `xcrun -sdk macosx metal -c` 报
+> `cannot execute tool 'metal' due to missing Metal Toolchain`。
+> 此前那次「只出 warning 就通过」的探测用的是 `/dev/null` 作输入，没有真正调用编译器。
+> ⇒ **两台机器都缺**；macmini 至今没有任何机器能重编 shader 本地验证，
+> `make test` 在 macmini 上之所以通过，是因为 metallib 是预置的（不重建）。
 因此 macmini 的**默认**构建仍是旧 clang；要产出与 macstudio 一致的制品，
 必须显式 `DEVELOPER_DIR=/Library/Developer/CommandLineTools`。
 
@@ -15471,10 +15476,16 @@ dispatch 抬高（114.7 vs 33.6 每层）是真的，但「每 token 一次」�
 **② 观测面有效，灵敏度 1 个 BF16 ULP。** `gross` 是有效性门：若它也相同，
 说明 kernel 不在执行路径上、或 dump 是瞎的。它变了，`bf16ulp` 也变了。
 
-**③ 但观测面对两类改动是盲的。** `f32ulp` 与 `reorder` 均为 identical——
-不是比对失灵，而是**这两类差异被 BF16 舍入抹平，最终 logits 真的没变**。
-⇒ 用 logits 比对判定 shader 改动安全时，**会漏掉舍入前的小量扰动与等价的累加重排**。
-要覆盖这一类，必须比对 BF16 之前的中间值，而不是最终输出。**本仓库目前没有那个钩子。**
+**③ 观测面对「舍入前的小量扰动」是盲的。** `f32ulp` 为 identical——
+不是比对失灵，而是 1 个 f32 ULP 的改动被 BF16 舍入抹平，最终 logits 真的没变。
+⇒ 用 logits 比对判定 shader 改动安全时，**会漏掉舍入前的亚量子扰动**。
+
+> ⚠️ **2026-10-30 21:5x 修正（§121）**：本段最初把 `reorder` 与 `f32ulp` 并列，说两者都是
+> 「被 BF16 抹平」。**这是错的。** 用送进 kernel 的通用参数检查证实：
+> 反转累加顺序后，**舍入前的累加器 0/5120 个元素发生变化**——即**根本没有产生差异**，
+> 因为 `-ffast-math` 允许编译器自由结合浮点加法，源码级换序被规范成同一段机器码。
+> ⇒ `reorder` 臂**没有测试任何东西**，它不能用来证明观测面「盲于重排」。
+> 真正的盲区只有亚量子扰动（`f32ulp` 已证实），重排能否被看见**仍然未知**。
 
 ### 对 §118 结论的影响
 
@@ -15492,3 +15503,73 @@ dispatch 抬高（114.7 vs 33.6 每层）是真的，但「每 token 一次」�
 原始数据：
 [`benchmarks/ulp_negctl_2026-10-30/`](../benchmarks/ulp_negctl_2026-10-30/README.md)
 （`run.jsonl` SHA `854daa6e…`、`manifest.json`、四份 `.patch`）。
+
+---
+
+## §121 舍入前中值探针：`reorder` 臂其实什么都没测（2026-10-30）
+
+**结论三条：① 做成了舍入前累加器探针，有效性门通过；② 用它证实 §120 的 `reorder` 臂
+在舍入前就是 0 差异——`-ffast-math` 把源码级换序规范掉了，该臂没有测试任何东西；
+③ macmini 同样缺 Metal 工具链，§117 那句话是错的。**
+
+### 工具
+
+`tests/probe_hc_norm_acc.c` + `tools/hc_norm_acc_margin.py`：给 kernel 打
+「把 `sum_out[i00] = v` 改成 `= acc`」的补丁（**所有臂都打**，故补丁不是变量），
+再用合成输入调度 kernel、把累加器 dump 成 f32。**不需要模型、不需要窗口**，
+GPU 只跑几微秒；因此它不是生产测量，只是组件级算术观测。
+
+**踩错三次，每次都是同一形状——「补丁没命中被执行的那段代码」：**
+
+1. 先补丁 `kernel_myds_v41_hc_sum_rmsnorm`（`dsv4_hc.metal`），dump 出来
+   **100% 都是 BF16 可表示**的值 ⇒ 说明拿到的还是舍入后的值。
+   实际 host 入口 `myds_metal_v41_hc_sum_rmsnorm_batch` 调度的是
+   **`kernel_myds_v41_hc_sum_rmsnorm_batch`（`dsv4_misc.metal`）**，是另一个 kernel。
+2. 改对 kernel 后，补丁在**整个文件**里命中 2 次 ⇒ 改为先在 kernel 体内定位再替换。
+3. 有效性门 `gross` 一开始把扰动加在 `v` 上（dump 之后），
+   **dump 到的 `acc` 当然不变**，读数 0/5120。扰动必须施加在**被 dump 的量**上。
+
+这三条现在都变成了断言：kernel 名/文件显式写死；
+补丁在 kernel 体内必须恰好命中 1 次；
+dump 若 100% BF16 可表示则直接 abort（「补丁没生效、拿到的是舍入后的值」）。
+
+### 测量结果（M4，5120 元素，合成输入）
+
+| 臂 | 舍入前差异 | max **|Δ|/BF16 量子** |
+|---|---|---|
+| `gross`（dump 值 ×1.0009765625） | **5120/5120** | **0.2499** |
+| `reorder`（c0..c3 → c3..c0） | **0/5120** | **0.0000** |
+
+`gross` 就是有效性门：它不动就说明探针没看到被执行的那段代码。
+它动了（全部元素、约四分之一个量子），探针成立。
+
+### 由此更正 §120
+
+`reorder` 在**舍入前**就没有任何差异 ⇒ **不是 BF16 抹平了它，是它从未产生差异**。
+原因：`tools/build_metallib.py` 固定带 `-ffast-math`，编译器可自由结合浮点加法，
+源码级换序被规范成同一段机器码。
+
+⇒ §120 里「观测面盲于重排」的说法**不成立**：那个臂什么也没测。
+**真正的盲区只有亚量子扰动**——`f32ulp`（整数位操作 +1 ULP，编译器无法消解）
+确实被 BF16 舍入抹平，这一条仍然成立且有证据。
+
+重排类改动能否被看到，**目前仍未知**；要测它必须构造一个编译器无法规范化的重排
+（例如在两个累加点之间插入无法被代数化简的操作），本轮未做。
+
+### 一个不能忽略的数据局限
+
+合成填充用的是二进制能精确表示的dyadic 值，导致 **81/5120（1.58%）个元素恰好落在
+BF16 舍入的 tie 上**（剩余裕度 0.0000 量子）。真实数据不会这样聚集。
+因此本轮的「到边界裕度分布」**不能代表真实分布**，只能用于两臂对比。
+`gross` 的 0.25 量子读数与结论不依赖这一点。
+
+### 仍需处理
+
+**macmini 也没有 Metal Toolchain**（真实 `.metal` 文件直接报错）。
+本轮绕法：库在 macstudio 上构建、探针在 macmini 上跑（库只是数据，不绑定机器）。
+但这意味着 macmini 上 `make test` 从未真正重建过 metallib，只是用了预置件。
+**要彻底闭环，macmini 也需要 `xcodebuild -downloadComponent MetalToolchain`。**
+
+### 原始数据
+
+`benchmarks/hc_norm_acc_2026-10-30/`（构造脚本、四份 dump 的 SHA、两库 SHA、结果 JSONL）。

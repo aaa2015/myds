@@ -113,6 +113,7 @@ TEST_TREE_SPEC = $(BIN_DIR)/test_tree_spec
 TEST_ENGINE_DEPTH2 = $(BIN_DIR)/test_engine_depth2
 TEST_DECODE_SPLIT = $(BIN_DIR)/test_decode_split
 TEST_RMS_FUSED_VS_FALLBACK = $(BIN_DIR)/test_rms_fused_vs_fallback
+PROBE_HC_NORM_ACC = $(BIN_DIR)/probe_hc_norm_acc
 BENCH_SYNTHETIC = $(BIN_DIR)/bench_synthetic
 BENCH_METAL = $(BIN_DIR)/bench_metal
 BENCH_PHASE = $(BIN_DIR)/bench_phase
@@ -584,6 +585,11 @@ $(TEST_DECODE_SPLIT): tests/test_decode_split.c $(filter-out $(BUILD_DIR)/main.o
 # 显式执行：MYDS_HC_RMSNORM_FUSED=1 MYDS_RMS_NTH=640 ./bin/test_rms_fused_vs_fallback 3
 $(TEST_RMS_FUSED_VS_FALLBACK): tests/test_rms_fused_vs_fallback.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -Iinclude -o $@ tests/test_rms_fused_vs_fallback.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS)
+
+# Dumps the pre-BF16 accumulator of hc_sum_rmsnorm; used by
+# tools/hc_norm_acc_margin.py (ledger §121). Not part of `make test`.
+$(PROBE_HC_NORM_ACC): tests/probe_hc_norm_acc.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) | $(BIN_DIR)
+	$(CC) $(CFLAGS) -Iinclude -o $@ tests/probe_hc_norm_acc.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS)
 
 $(TEST_LOG): $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_log.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@

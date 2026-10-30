@@ -1,0 +1,4 @@
+{"dim": 5120, "kind": "plan", "machine": "macmini M4", "n_tok": 1, "note": "libraries built on macstudio (has Metal toolchain), probe run on macmini"}
+{"arm": "gross", "differing_elements": 5120, "elements": 5120, "kind": "validity_gate", "max_delta_over_quantum": 0.249939, "pass_": true}
+{"arm": "reorder", "conclusion": "reorder produces no change at pre-rounding depth; -ffast-math canonicalises the source-level reordering", "differing_elements": 0, "elements": 5120, "kind": "measurement", "max_delta_over_quantum": 0.0}
+{"bf16_ties": 81, "elements": 5120, "kind": "limitation", "note": "synthetic dyadic fill places 1.58% of values exactly on BF16 ties; margin distribution is not representative of real data"}
