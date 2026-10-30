@@ -1,0 +1,16 @@
+--- /Users/fangqingyuan/Projects/myds/metal/dsv4_hc.metal	2026-10-25 19:05:46
++++ /private/tmp/negctl/tree/reorder/metal/dsv4_hc.metal	2026-10-30 21:30:21
+@@ -1159,10 +1159,10 @@
+         const float4 c3 = r3[i00];
+ 
+         float4 acc = 0.0f;
+-        acc += c0 * w0;
+-        acc += c1 * w1;
++        acc += c3 * w3; /* NEGCTL reversed accumulation */
+         acc += c2 * w2;
+-        acc += c3 * w3;
++        acc += c1 * w1;
++        acc += c0 * w0;
+ 
+         const float4 v = dsv41_bf16_round_f32x4(acc);
+         if (args.has_sum_out) {

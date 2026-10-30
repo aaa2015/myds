@@ -1,0 +1,13 @@
+--- /Users/fangqingyuan/Projects/myds/metal/dsv4_hc.metal	2026-10-25 19:05:46
++++ /private/tmp/negctl/tree/bf16ulp/metal/dsv4_hc.metal	2026-10-30 21:30:16
+@@ -1193,7 +1193,9 @@
+         const float4 v = (reg_idx < 4) ? v_reg[reg_idx] : (args.has_sum_out ? sum_out[i00] : float4(0.0f));
+         reg_idx++;
+         const float4 norm_v = (v * scale) * norm_w[i00];
+-        dst[i00] = round_bf16 ? dsv41_bf16_round_f32x4(norm_v) : norm_v;
++        float4 negctl_o = round_bf16 ? dsv41_bf16_round_f32x4(norm_v) : norm_v;
++        if (i00 == 0) { negctl_o.x = as_type<float>(as_type<uint>(negctl_o.x) + 0x10000u); } /* NEGCTL +1 bf16 ulp */
++        dst[i00] = negctl_o;
+     }
+ }
+ 

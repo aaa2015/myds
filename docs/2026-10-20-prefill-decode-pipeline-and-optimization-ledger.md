@@ -15423,3 +15423,72 @@ dispatch 抬高（114.7 vs 33.6 每层）是真的，但「每 token 一次」�
 `benchmarks/warm_append_2026-10-30/raw/` 下 `e2-engine-profile.txt`（§114/§115 的 MoE 行）、
 `e1-engine-profile.txt`（E1 六档）、`e2-phase-lines.jsonl`（§113 的层耗时）。
 本节所有数字均可由这三个文件直接读出，未新增任何测量。
+
+---
+
+## §120 0-ULP 比对的负向对照：观测面已标定（2026-10-30）
+
+**结论：§118 的缺口补上了。比对能检出 shader 级数值改动，灵敏度到 1 个 BF16 ULP；
+基线确定性实测成立（18/18 单一 digest）。同时发现它对两类改动是盲的。**
+
+### 为什么必须做这个
+
+§118 证明「两套 metallib 在测试输入上输出相同」，但它的负向对照**全部没能制造失败**：
+翻字节（落在未用区）、`-DDS4_MOE_REVERSE_EXPERTS=1`（路径未被触发）。
+**一个打不出差异的对照，说明不了观测面有效。** 且 §118 里还有两条同库同输入不同结果的记录，
+使「基线确定性」本身也可疑。
+
+### 方法：在隔离树里打补丁，不动 `metal/`
+
+`tools/ulp_negative_control.py prepare` 复制 `metal/` 与构建脚本到隔离树，
+每臂打一处文本补丁（**先断言目标在目标 kernel 内恰好出现 1 次**），
+同一工具链同一 session 构建，未打补丁那份作 baseline ⇒ 补丁是唯一变量。
+构建出的库**不部署**。
+
+目标：`kernel_myds_v41_hc_sum_rmsnorm`（`metal/dsv4_hc.metal`）——
+`score` 的逐 token forward 每次注意力/FFN 前与最终输出 norm 都走它。
+
+**关键先验**：该路径输出经 BF16 舍入。舍入前的 f32 级扰动通常被吸收，
+这是 §118 打不出差异的合理猜测。故灵敏度臂改为**在舍入之后**动 1 个 BF16 ULP。
+
+### 结果
+
+| 臂 | 扰动 | 预期 | 实测 | digest |
+|---|---|---|---|---|
+| — | baseline | identical | **18/18 同一值** | `a993fd95…` |
+| gross | 输出 ×(1+2⁻⁶) | differ | **differ** | `9c79e12e…` |
+| bf16ulp | 舍入后 +1 BF16 ULP，单元素 | differ | **differ** | `7b5cf057…` |
+| f32ulp | 舍入前 +1 f32 ULP，单元素 | 记录 | **identical** | `a993fd95…` |
+| reorder | HC 加权和四项累加顺序反转 | 记录 | **identical** | `a993fd95…` |
+
+`valid=True`，`invalid_reasons=[]`，`baseline_distinct=1`，`detects_bf16_ulp=True`。
+
+### 三点结论
+
+**① 基线确定性成立。** 同一库 18 个冷进程，digest 只有一个值。
+⇒ §118 那两次「同库不同结果」**不是基线不稳**；它们未能复现，仍按未解释方差记录，不追认为噪声。
+
+**② 观测面有效，灵敏度 1 个 BF16 ULP。** `gross` 是有效性门：若它也相同，
+说明 kernel 不在执行路径上、或 dump 是瞎的。它变了，`bf16ulp` 也变了。
+
+**③ 但观测面对两类改动是盲的。** `f32ulp` 与 `reorder` 均为 identical——
+不是比对失灵，而是**这两类差异被 BF16 舍入抹平，最终 logits 真的没变**。
+⇒ 用 logits 比对判定 shader 改动安全时，**会漏掉舍入前的小量扰动与等价的累加重排**。
+要覆盖这一类，必须比对 BF16 之前的中间值，而不是最终输出。**本仓库目前没有那个钩子。**
+
+### 对 §118 结论的影响
+
+§118 的「两套库在测试输入上逐位相同」**加强了**：
+现在知道这个比对能看见 1 BF16 ULP 的改动，而它看不见差异 ⇒ 那是真的没差异。
+但覆盖面仍是：单输入、23 位置、逐 token 路径；**批处理 prefill 未覆盖**。
+
+### 边界
+
+- `gross` 是 1.6% 乘性扰动，只用于验证观测面有效，不是真实 bug 形态。
+- 未覆盖批处理 prefill；未测长上下文、decode、并发。
+- 补丁与构建脚本随 `run.jsonl` 一并归档，可离线复算库哈希。
+- 窗口结束后生产恢复，独立 `gpu_window.py verify` 与基线一致。
+
+原始数据：
+[`benchmarks/ulp_negctl_2026-10-30/`](../benchmarks/ulp_negctl_2026-10-30/README.md)
+（`run.jsonl` SHA `854daa6e…`、`manifest.json`、四份 `.patch`）。

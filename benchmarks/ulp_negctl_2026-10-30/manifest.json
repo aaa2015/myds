@@ -1,0 +1,35 @@
+{
+  "kind": "manifest",
+  "created": "2026-10-30T21:30:09+0800",
+  "repo_root": "/Users/fangqingyuan/Projects/myds",
+  "repo_head": "5437df02700039af4c0f25e88a2dbdc78a3eba2c",
+  "score_sha256": "4bad269d2c5374ba6169ca7211fb5e11c9e8bf1d91f0ac9f6eefcce633e432ca",
+  "kernel": "kernel void kernel_myds_v41_hc_sum_rmsnorm(",
+  "arms": {
+    "baseline": {
+      "metallib_sha256": "719242c9adf3cb48ff4c34643e73b26a213f23646860c6f4a62a1207c5ad8687",
+      "expect": "identical",
+      "gate": false
+    },
+    "gross": {
+      "metallib_sha256": "c33311b3547a4af5927b65b8056ff176f6a93c7334dcea87ad7f6b00df466ac6",
+      "expect": "differ",
+      "gate": true
+    },
+    "bf16ulp": {
+      "metallib_sha256": "6a407a9fc583f25caa36a2ee2326fa6768d0d0d4b03e9c2fbdb6be629ff3b293",
+      "expect": "differ",
+      "gate": false
+    },
+    "f32ulp": {
+      "metallib_sha256": "3b5767328590e99f2ca961cbee592549b5a0348d4bd3aab64750677f8211db05",
+      "expect": "informational",
+      "gate": false
+    },
+    "reorder": {
+      "metallib_sha256": "efa0003026d251e48b0fc97ce46f8923d9751bb0b459a0afbcded5cfc77e984a",
+      "expect": "informational",
+      "gate": false
+    }
+  }
+}
