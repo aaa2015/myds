@@ -40,13 +40,16 @@
 static myds_debug_state_provider_t g_debug_state_provider = NULL;
 static myds_debug_predicate_t g_debug_enabled = NULL;
 static myds_debug_loopback_t g_debug_is_loopback = NULL;
+static myds_debug_token_t g_debug_token_ok = NULL;
 
 void myds_server_set_debug_provider(myds_debug_state_provider_t state,
                                     myds_debug_predicate_t enabled,
-                                    myds_debug_loopback_t is_loopback) {
+                                    myds_debug_loopback_t is_loopback,
+                                    myds_debug_token_t token_ok) {
     g_debug_state_provider = state;
     g_debug_enabled = enabled;
     g_debug_is_loopback = is_loopback;
+    g_debug_token_ok = token_ok;
 }
 
 #if defined(__APPLE__)
@@ -684,6 +687,34 @@ int extract_http_header_int(const char *headers, const char *header_name) {
                 return -1;
             }
             return (int)v;
+        }
+        p = strchr(p, '\n');
+        if (!p) break;
+        p++;
+    }
+    return 0;
+}
+
+/* Copy one header value into `out`. Returns true when the header was present.
+ *
+ * Trimmed of trailing CR/LF and surrounding spaces; truncated silently if `cap` is
+ * too small, which for a caller comparing a secret means "will not match" rather
+ * than "matches a prefix". */
+int extract_http_header_str(const char *headers, const char *header_name,
+                            char *out, size_t cap) {
+    if (!headers || !header_name || !out || cap == 0) return 0;
+    out[0] = 0;
+    const size_t name_len = strlen(header_name);
+    const char *p = headers;
+    while (*p) {
+        if (strncasecmp(p, header_name, name_len) == 0 && p[name_len] == ':') {
+            p += name_len + 1;
+            while (*p == ' ' || *p == '\t') p++;
+            size_t n = 0;
+            while (*p && *p != '\r' && *p != '\n' && n + 1 < cap) out[n++] = *p++;
+            while (n && (out[n - 1] == ' ' || out[n - 1] == '\t')) n--;
+            out[n] = 0;
+            return 1;
         }
         p = strchr(p, '\n');
         if (!p) break;
@@ -3529,15 +3560,23 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
      * atomically zeroes the counters, which would destroy the arm separation that
      * every A/B in the ledger relies on. A read must never subtract evidence. */
     if (strcmp(path, "/debug/state") == 0) {
+        /* Two independent controls, because either alone is insufficient:
+         *   loopback -- cheap, but a co-located reverse proxy satisfies it;
+         *   token    -- survives proxies, and fails closed when unset. */
+        char presented[256] = "";
+        extract_http_header_str(req_buf, "X-Debug-Token", presented, sizeof presented);
+        const bool loopback = g_debug_is_loopback != NULL && g_debug_is_loopback(client_ip);
+        const bool token_ok = g_debug_token_ok != NULL && g_debug_token_ok(presented);
         const bool open = g_debug_state_provider != NULL && g_debug_enabled != NULL &&
-                          g_debug_is_loopback != NULL &&
-                          g_debug_enabled() && g_debug_is_loopback(client_ip);
+                          g_debug_enabled() && loopback && token_ok;
         if (!open) {
-            MYDS_LOG_W("[%s:%d] GET /debug/state -> 404 (registered %s, switch %s, loopback %s)",
+            MYDS_LOG_W("[%s:%d] GET /debug/state -> 404 (registered %s, switch %s, "
+                       "loopback %s, token %s)",
                        client_ip, client_port,
                        g_debug_state_provider ? "yes" : "no",
                        (g_debug_enabled && g_debug_enabled()) ? "on" : "off",
-                       (g_debug_is_loopback && g_debug_is_loopback(client_ip)) ? "yes" : "no");
+                       loopback ? "yes" : "no",
+                       presented[0] ? (token_ok ? "ok" : "mismatch") : "absent");
             send_response(client_fd, 404, "Not Found", "application/json",
                           "{\"error\":\"not found\"}");
             free(req_buf);

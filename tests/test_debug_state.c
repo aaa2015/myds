@@ -50,22 +50,58 @@ int main(int argc, char **argv) {
            missing, missing[0] == 0 ? "true" : "false");
     if (missing[0] != 0) ++failures;  /* a zero-filled digest would look real */
 
-    /* Loopback classification: the endpoint's only access control. */
-    printf("{\"kind\":\"loopback\",\"127\":%s,\"::1\":%s,\"v4mapped\":%s,"
+    /* Loopback classification.
+     *
+     * The listener is AF_INET and the peer address comes from inet_ntop(AF_INET)
+     * into char[16], so an IPv6 string can never reach this function. The earlier
+     * version asserted "::1" was accepted -- testing a path production cannot take,
+     * which reads as IPv6 coverage that does not exist. Non-IPv4 input must now be
+     * rejected, and that is what gets asserted. */
+    printf("{\"kind\":\"loopback\",\"127.0.0.1\":%s,\"127.0.0.2\":%s,\"ipv6_rejected\":%s,"
            "\"lan\":%s,\"null\":%s}\n",
            myds_debug_is_loopback("127.0.0.1") ? "true" : "false",
-           myds_debug_is_loopback("::1") ? "true" : "false",
-           myds_debug_is_loopback("::ffff:127.0.0.1") ? "true" : "false",
+           myds_debug_is_loopback("127.0.0.2") ? "true" : "false",
+           !myds_debug_is_loopback("::1") ? "true" : "false",
            myds_debug_is_loopback("192.168.1.50") ? "true" : "false",
            myds_debug_is_loopback(NULL) ? "true" : "false");
-    /* The endpoint's only access control. A false positive here publishes state. */
     const int loop_ok = myds_debug_is_loopback("127.0.0.1") &&
-                        myds_debug_is_loopback("::1") &&
-                        myds_debug_is_loopback("::ffff:127.0.0.1") &&
+                        myds_debug_is_loopback("127.0.0.2") &&
+                        !myds_debug_is_loopback("::1") &&            /* unreachable, must not claim it */
+                        !myds_debug_is_loopback("::ffff:127.0.0.1") &&
                         !myds_debug_is_loopback("192.168.1.50") &&
                         !myds_debug_is_loopback("10.0.0.7") &&
+                        !myds_debug_is_loopback("127.0.0.1.evil") && /* no prefix match */
+                        !myds_debug_is_loopback("1271.0.0.1") &&
                         !myds_debug_is_loopback(NULL);
     if (!loop_ok) ++failures;
+
+    /* Token gate. Fail-closed when unset; exact match when set; a prefix must not
+     * pass, since a proxy operator could otherwise brute-force it one byte at a time. */
+    unsetenv("MYDS_DEBUG_TOKEN");
+    const int token_unset_ok = !myds_debug_token_configured() &&
+                               !myds_debug_token_ok("") &&
+                               !myds_debug_token_ok(NULL) &&
+                               !myds_debug_token_ok("anything");
+    setenv("MYDS_DEBUG_TOKEN", "s3cret", 1);
+    const int token_set_ok = myds_debug_token_configured() &&
+                             myds_debug_token_ok("s3cret") &&
+                             !myds_debug_token_ok("s3cre") &&
+                             !myds_debug_token_ok("s3cretX") &&
+                             !myds_debug_token_ok("") &&
+                             !myds_debug_token_ok(NULL);
+    unsetenv("MYDS_DEBUG_TOKEN");
+    printf("{\"kind\":\"token\",\"fail_closed_when_unset\":%s,\"exact_match\":%s}\n",
+           token_unset_ok ? "true" : "false", token_set_ok ? "true" : "false");
+    if (!token_unset_ok || !token_set_ok) ++failures;
+
+    /* Truncation must produce a valid object that says so, never a half-written
+     * one. The old EMIT ran `used` past cap and silently dropped everything after. */
+    char tiny[192];
+    myds_debug_state_json(tiny, sizeof tiny, NULL);
+    const int trunc_ok = tiny[0] == '{' && strstr(tiny, "truncated") != NULL;
+    printf("{\"kind\":\"truncation\",\"reports_instead_of_cutting\":%s,\"body\":\"%s\"}\n",
+           trunc_ok ? "true" : "false", tiny);
+    if (!trunc_ok) ++failures;
     /* The payload must be non-empty and carry every top-level section. */
     const int shape_ok = state[0] == '{' && strstr(state, "\"build\"") &&
                          strstr(state, "\"knobs\"") && strstr(state, "\"counters\"");

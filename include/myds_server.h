@@ -29,6 +29,8 @@ typedef void (*myds_debug_state_provider_t)(char *out, size_t cap,
                                             const struct myds_context *ctx);
 typedef bool (*myds_debug_predicate_t)(void);
 typedef bool (*myds_debug_loopback_t)(const char *ip);
+typedef bool (*myds_debug_token_t)(const char *presented);
 void myds_server_set_debug_provider(myds_debug_state_provider_t state,
                                     myds_debug_predicate_t enabled,
-                                    myds_debug_loopback_t is_loopback);
+                                    myds_debug_loopback_t is_loopback,
+                                    myds_debug_token_t token_ok);

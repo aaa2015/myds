@@ -21,8 +21,14 @@ struct myds_context;
 /* Is the endpoint allowed at all? Requires MYDS_DEBUG_ENDPOINT=1. */
 bool myds_debug_enabled(void);
 
-/* The endpoint's only access control: the server has no authentication. */
+/* IPv4 loopback test over the dotted quad the server produces (AF_INET only). */
 bool myds_debug_is_loopback(const char *ip);
+
+/* Shared-secret gate. Loopback is not sufficient on its own: a reverse proxy on
+ * the same host connects from 127.0.0.1. Fail-closed -- if MYDS_DEBUG_TOKEN is
+ * unset the endpoint stays shut even with MYDS_DEBUG_ENDPOINT=1. */
+bool myds_debug_token_configured(void);
+bool myds_debug_token_ok(const char *presented);
 
 /* SHA256 of a file as lowercase hex, or "" when unreadable. Callers emit null
  * rather than a zero digest so "unknown" cannot be mistaken for "identity". */

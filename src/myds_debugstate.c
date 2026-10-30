@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <math.h>
 #if defined(__APPLE__)
@@ -34,19 +35,75 @@
  *      encoded 0 vs 2025"). A debug read must never subtract evidence.
  *   3. Read-only. No command buffer, no commit, no residency change.
  */
+/* Same reasoning as myds_debug_token_configured: no cache. */
 bool myds_debug_enabled(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *value = getenv("MYDS_DEBUG_ENDPOINT");
-        cached = (value && *value && strcmp(value, "0") != 0) ? 1 : 0;
-    }
-    return cached == 1;
+    const char *value = getenv("MYDS_DEBUG_ENDPOINT");
+    return value && *value && strcmp(value, "0") != 0;
 }
 
+/* Loopback check over the *IPv4 dotted-quad the server actually produces*.
+ *
+ * Two corrections over the first version:
+ *
+ * 1. It accepted "::1" and "::ffff:127.*". Those can never arrive: the listener is
+ *    AF_INET, the peer address is read with inet_ntop(AF_INET, ...) into a
+ *    char[16]. The branches were unreachable, and a unit test asserted they were
+ *    true -- testing a path production cannot take, which reads as IPv6 coverage
+ *    that does not exist. Anything non-IPv4 is now rejected explicitly, and the
+ *    test asserts that rejection instead.
+ *
+ * 2. 127.0.0.0/8 is checked numerically rather than by string compare, so
+ *    127.0.0.2 (also loopback) is accepted and "127.0.0.1.evil" is not.
+ *
+ * This is still only a network-layer control. A reverse proxy running on the same
+ * host connects from 127.0.0.1 and would pass it -- see the token gate below.
+ */
 bool myds_debug_is_loopback(const char *ip) {
     if (!ip) return false;
-    return strcmp(ip, "127.0.0.1") == 0 || strcmp(ip, "::1") == 0 ||
-           strncmp(ip, "::ffff:127.", 11) == 0;
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    char tail = 0;
+    if (sscanf(ip, "%u.%u.%u.%u%c", &a, &b, &c, &d, &tail) != 4) return false;
+    if (a > 255u || b > 255u || c > 255u || d > 255u) return false;
+    return a == 127u;
+}
+
+/* Shared-secret gate.
+ *
+ * The loopback rule alone is not sufficient: any reverse proxy co-located with the
+ * server connects from 127.0.0.1, so "loopback" does not mean "local operator". A
+ * token that the caller must read from the process environment or log closes that
+ * hole without depending on where the connection came from.
+ *
+ * Fail-closed: if the switch is on but MYDS_DEBUG_TOKEN is empty, the endpoint stays
+ * shut. An operator who enables the endpoint and forgets the token gets a 404, not
+ * an open report.
+ */
+/* Read on every call, not cached.
+ *
+ * A static cache here made the value depend on when it was first read: the unit
+ * test sets the token after an unset check and the cache handed back the stale
+ * answer. This is a debug path -- one getenv per request is not worth the hazard,
+ * and an operator changing the token expects it to take effect.
+ */
+bool myds_debug_token_configured(void) {
+    const char *value = getenv("MYDS_DEBUG_TOKEN");
+    return value && *value;
+}
+
+bool myds_debug_token_ok(const char *presented) {
+    const char *expected = getenv("MYDS_DEBUG_TOKEN");
+    if (!expected || !*expected) return false;   /* fail closed */
+    if (!presented) return false;
+    const size_t elen = strlen(expected), plen = strlen(presented);
+    /* Constant-time over the longer of the two: a length-dependent early exit
+     * would leak the secret's length to a local prober. */
+    unsigned diff = (unsigned)(elen ^ plen);
+    for (size_t i = 0; i < elen || i < plen; ++i) {
+        const unsigned char e = i < elen ? (unsigned char)expected[i] : 0;
+        const unsigned char p = i < plen ? (unsigned char)presented[i] : 0;
+        diff |= (unsigned)(e ^ p);
+    }
+    return diff == 0;
 }
 
 /* SHA256 of a file, computed once. Returns "" when unreadable, so the caller can
@@ -119,17 +176,38 @@ void myds_debug_sha256_file(const char *path, char out[65]) {
     out[64] = 0;
 }
 
+/* Identity is computed once per process.
+ *
+ * It used to be recomputed on every request: ~5.2 MB read and hashed (938 KB
+ * binary + 4.2 MB metallib). Page cache makes it cheap but not free, and a poll
+ * loop turns a debug endpoint into continuous disk traffic. Neither value can
+ * change while the process is alive -- the binary is already mapped and the
+ * library is loaded -- so once is strictly correct.
+ */
+typedef struct { char binary[65]; char metallib[65]; char binary_path[4096]; } debug_identity_t;
+static debug_identity_t g_identity;
+static pthread_once_t g_identity_once = PTHREAD_ONCE_INIT;
+
+static void identity_init(void) {
+    memset(&g_identity, 0, sizeof g_identity);
+#if defined(__APPLE__)
+    uint32_t size = sizeof(g_identity.binary_path);
+    if (_NSGetExecutablePath(g_identity.binary_path, &size) != 0)
+        g_identity.binary_path[0] = 0;
+#endif
+    myds_debug_sha256_file(g_identity.binary_path[0] ? g_identity.binary_path : NULL,
+                           g_identity.binary);
+    myds_debug_sha256_file(myds_metal_loaded_library_path(), g_identity.metallib);
+}
+
 /* Emit one JSON object describing the live process. Fields whose source is
  * unavailable are null, never a plausible zero. */
 void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx) {
-    char binary[65] = {0}, metallib[65] = {0};
-    char binary_path[4096] = {0};
-#if defined(__APPLE__)
-    uint32_t size = sizeof(binary_path);
-    if (_NSGetExecutablePath(binary_path, &size) != 0) binary_path[0] = 0;
-#endif
-    myds_debug_sha256_file(binary_path[0] ? binary_path : NULL, binary);
-    myds_debug_sha256_file(myds_metal_loaded_library_path(), metallib);
+    if (!out || cap < 64) return;
+    pthread_once(&g_identity_once, identity_init);
+    const char *binary = g_identity.binary;
+    const char *metallib = g_identity.metallib;
+    const char *binary_path = g_identity.binary_path;
 
     /* reset=false: see point 2 above. */
     myds_v41_gpu_indexer_register_only_counters_t ro;
@@ -142,12 +220,20 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
     int unread = 0;
     for (int i = 0; i < n; ++i) if (n > 0 && !seen[i].knob) ++unread;
 
+    /* Truncation used to be silent and produced invalid JSON: snprintf returns the
+     * length it WOULD have written, so `used += w` ran past cap, every later EMIT
+     * was skipped, and the caller got a half-written object with no signal.
+     * Now a truncation is detected and replaced with a small but valid object that
+     * says so -- a parser can tell "report was cut" from "report says zero". */
     size_t used = 0;
+    bool truncated = false;
     #define EMIT(...) do {                                                       \
         if (used < cap) {                                                        \
             const int w = snprintf(out + used, cap - used, __VA_ARGS__);         \
-            if (w > 0) used += (size_t)w;                                        \
-        }                                                                        \
+            if (w < 0) { truncated = true; }                                      \
+            else if ((size_t)w >= cap - used) { truncated = true; }               \
+            else { used += (size_t)w; }                                           \
+        } else { truncated = true; }                                              \
     } while (0)
 
     EMIT("{\"build\":{\"binary_sha256\":%s%s%s,\"metallib_sha256\":%s%s%s,",
@@ -169,5 +255,11 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
     EMIT("\"state_capture\":\"point-in-time; prefix-cache miss reasons are log-only, "
          "not counted here\"}\n");
     #undef EMIT
+    if (truncated) {
+        snprintf(out, cap,
+                 "{\"error\":\"state report truncated\",\"required_capacity\":%zu,"
+                 "\"note\":\"raise the buffer in myds_server.c, do not parse a partial "
+                 "object\"}\n", used + 1);
+    }
 }
 

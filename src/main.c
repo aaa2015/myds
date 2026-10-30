@@ -390,7 +390,7 @@ int main(int argc, char *argv[]) {
          * depend on the knob inventory, the GPU counters or the Metal library
          * path; see include/myds_debugstate.h. */
         myds_server_set_debug_provider(myds_debug_state_json, myds_debug_enabled,
-                                       myds_debug_is_loopback);
+                                       myds_debug_is_loopback, myds_debug_token_ok);
         int rc = myds_server_start(ctx, host, port, alias);
         myds_context_free(ctx);
         myds_model_free(model);
