@@ -14823,3 +14823,77 @@ n=1/格；未测 8,192 追加、decode、并发；语料为合成/仓库文本�
 窗口内完成，`memory_released_gib=176.8`，恢复后独立 verify **PASS**。
 原始 12 行见
 [`benchmarks/warm_append_2026-10-30/raw/e2-cycle1.jsonl`](../benchmarks/warm_append_2026-10-30/raw/e2-cycle1.jsonl)（SHA `284aae5e…`）。
+
+---
+
+## §113 热追加归因：不在服务端阶段，在 prefill 内部的小批退化（2026-10-30）
+
+**结论：§112 的每 token 2× 成本与 1.4–1.9 s 固定成本，97.9–99.9% 落在 prefill 内部。
+`engine − prefill − decode` 只有 53–102 ms，把「快照恢复 / 工作区 / 分词 / 前缀查找」
+这几个候选一次排除。** 进一步拆 prefill 显示：小批量的 dispatch 数量与 MoE 效率是主因。
+
+### 方法
+
+生产二进制换成含 `MYDS_REQUEST_PHASES` 的 `227ae371…`（`ca1a17d`），
+窗口内重跑 §112 的形状（160k / 470k，追加 512 / 2048），
+再用 `MYDS_PROFILE_PREFILL=1 MYDS_PROFILE_MOE=1` 跑 160k 一档取引擎内部拆分。
+
+### 第一层：服务端阶段占比
+
+| 请求 | engine s | prefill s | 占比 | decode s | unattributed s |
+|---|---:|---:|---:|---:|---:|
+| cold 160k | 55.327 | 55.219 | 99.8% | 0.027 | **0.081** |
+| warm 160k +512 | 3.731 | 3.652 | 97.9% | 0.026 | **0.053** |
+| warm 160k +2048 | 8.779 | 8.661 | 98.7% | 0.027 | **0.091** |
+| cold 470k | 181.636 | 181.516 | 99.9% | 0.028 | **0.093** |
+| warm 470k +512 | 5.186 | 5.076 | 97.9% | 0.028 | **0.082** |
+| warm 470k +2048 | 12.611 | 12.481 | 99.0% | 0.028 | **0.102** |
+
+`queue + render + setup` 合计 8–11 ms。**方案里「snapshot_restore / workspace_ensure」两个
+候选按此直接排除**，不需要再对它们做实验。
+
+### 第二层：prefill 内部按 token 归一
+
+| 请求 | 总有 ms/tok | MoE GEMM | attn_out B | FFN-in+router | 其余 |
+|---|---:|---:|---:|---:|---:|
+| cold 160k（33,834 tok，17 chunk） | 1.71 | 0.57 | 0.101 | 0.130 | 0.91 |
+| warm +512（802 tok，1 chunk） | 4.86 | **1.58** | 0.238 | 0.310 | **2.74** |
+| warm +2048（2,570 tok，2 chunk） | 3.47 | 0.96 | 0.169 | 0.219 | 2.12 |
+
+（"其余" = 总墙钟 − MoE − attn − FFN；含 Step1–4 派发、indexer、compressor。）
+
+### 第三层：dispatch 数量才是主因
+
+| 请求 | chunk / MoE batch | layer-iter | 总 dispatch | 每 layer-iter | Step4 loop | 每 token |
+|---|---:|---:|---:|---:|---:|---:|
+| cold 160k | 2048 / 16384 | 680 | 22,843 | **33.6** | 8,769 | 0.68 |
+| warm +512 | **802 / 802** | 40 | 4,587 | **114.7** | 1,783 | **5.72** |
+| warm +2048 | 2048 / 4096 | 80 | 7,397 | 92.5 | 3,594 | 2.88 |
+
+**小批量把每 layer-iteration 的 dispatch 数抬高 3.4 倍，每 token 抬高 8.5 倍。**
+`n=802 < chunk 上限 2048` 时 chunk 直接取 802，`moe_chunks=1`、MoE batch 只有 802 tok，
+逐 token 路径覆盖全部 token。这不是新发现的 bug，是「追加量小于 chunk」时的退化形状。
+
+### 判定（按方案预声明的门）
+
+- 不是「快照恢复 / 工作区」⇒ B3 里这两个修法不适用。
+- 主因落在 **小批 MoE + Step4 逐 token 派发**，两者都在方案允许的修法清单内。
+- attention 本体每 token 也从 0.101 涨到 0.238 ms（位置更高、键更多），
+  这部分是**算术边界**，按 §0.10 记为边界，不重开 indexer。
+
+### 未做，且不能顺手做
+
+**没有改 chunk。** 账本 §17/§20 记过：chunk 从 512 变 1024 会改变输出文本（归约次序变）。
+所以「把追加的 chunk 固定成 2048 再补零」不是配置调整，是数值路径改动，
+必须先过 0-ULP 资格。本轮不给修法，只给归因。
+
+### 生产变更
+
+本轮把 macstudio 生产二进制从 `bbe8aa66…`（10-29）换成 `227ae371…`（`ca1a17d`，
+新增 `MYDS_REQUEST_PHASES`，默认关闭）。metallib `fe557933…` 与 config `735e0dc7…` 未变。
+部署走 `myfleet/sync_myds.sh`（源码树指纹一致 `d2ec426a…`、临时目录重编译、原子替换、
+`.deploy-prev` 回滚快照）。**§105.6 记的 `a97976e0…` 与 §111 记的 `bbe8aa66…` 均已过期。**
+三次窗口结束后独立 `gpu_window.py verify` 全部 **PASS**（nice=5、stdio、三 SHA、cwd）。
+
+原始数据：`benchmarks/warm_append_2026-10-30/raw/e2-phase-cycle1.jsonl`、
+`e2-phase-lines.jsonl`、`e2-phase-profile.jsonl`、`e2-engine-profile.txt`。

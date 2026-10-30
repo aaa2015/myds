@@ -1,0 +1,6 @@
+{"queue":0.003713,"render":0.003457,"setup":0.003284,"engine":55.326853,"prefill":55.219007,"decode":0.027141,"engine_unattributed":0.080705,"prompt_tok":33835,"cached_tok":0,"out_tok":2,"stream":false}
+{"queue":0.002166,"render":0.002284,"setup":0.002450,"engine":3.731176,"prefill":3.651836,"decode":0.026265,"engine_unattributed":0.053075,"prompt_tok":34595,"cached_tok":33792,"out_tok":2,"stream":false}
+{"queue":0.005243,"render":0.003943,"setup":0.003482,"engine":8.778998,"prefill":8.660548,"decode":0.027321,"engine_unattributed":0.091129,"prompt_tok":36875,"cached_tok":34304,"out_tok":2,"stream":false}
+{"queue":0.010022,"render":0.007320,"setup":0.009572,"engine":181.636159,"prefill":181.515741,"decode":0.027801,"engine_unattributed":0.092617,"prompt_tok":99357,"cached_tok":0,"out_tok":2,"stream":false}
+{"queue":0.013416,"render":0.007896,"setup":0.007727,"engine":5.185958,"prefill":5.075756,"decode":0.027709,"engine_unattributed":0.082493,"prompt_tok":100117,"cached_tok":99328,"out_tok":2,"stream":false}
+{"queue":0.013969,"render":0.007879,"setup":0.008235,"engine":12.611107,"prefill":12.481082,"decode":0.027710,"engine_unattributed":0.102315,"prompt_tok":102397,"cached_tok":99840,"out_tok":2,"stream":false}

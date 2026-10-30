@@ -1,0 +1,30 @@
+Wait MoE (GPU)        :   539.73 ms
+  ...attn_out B       :  3406.02 ms
+  ...FFN-in+sh+router :  4410.33 ms
+  ===> MoE GEMMs      : 19130.48 ms
+Total Layers Wall     : 57843.12 ms
+Step1-4 dispatches    :      14917
+Step5-8 dispatches    :       7926
+Layer dispatches total:      22843
+Layer iterations      :        680
+Step4 loop dispatches :       8769
+Wait MoE (GPU)        :    43.55 ms
+  ...attn_out B       :   190.76 ms
+  ...FFN-in+sh+router :   248.39 ms
+  ===> MoE GEMMs      :  1266.57 ms
+Total Layers Wall     :  3900.88 ms
+Step1-4 dispatches    :       2991
+Step5-8 dispatches    :       1596
+Layer dispatches total:       4587
+Layer iterations      :         40
+Step4 loop dispatches :       1783
+Wait MoE (GPU)        :    70.73 ms
+  ...attn_out B       :   434.58 ms
+  ...FFN-in+sh+router :   562.27 ms
+  ===> MoE GEMMs      :  2469.81 ms
+Total Layers Wall     :  8925.61 ms
+Step1-4 dispatches    :       5212
+Step5-8 dispatches    :       2185
+Layer dispatches total:       7397
+Layer iterations      :         80
+Step4 loop dispatches :       3594

@@ -87,3 +87,38 @@ python3 benchmarks/warm_append_2026-10-30/analyze.py /tmp/e2b.jsonl
 - 语料是合成/仓库文本，不是真实流量分布。
 - 单次窗口内跑完，`memory_released_gib=176.8`，恢复后
   `gpu_window.py verify` 判定 **PASS**（nice=5、stdio、三项 SHA、cwd 全一致）。
+
+---
+
+# 第二阶段：归因（2026-10-30，含 `MYDS_REQUEST_PHASES`）
+
+生产二进制换成 `227ae371…`（含 §112 之后新增的请求阶段计时）后重跑。
+
+## 服务端阶段：97.9–99.9% 是 prefill
+
+| 请求 | engine s | prefill s | 占比 | unattributed s |
+|---|---:|---:|---:|---:|
+| cold 160k | 55.327 | 55.219 | 99.8% | 0.081 |
+| warm 160k +512 | 3.731 | 3.652 | 97.9% | 0.053 |
+| warm 160k +2048 | 8.779 | 8.661 | 98.7% | 0.091 |
+| cold 470k | 181.636 | 181.516 | 99.9% | 0.093 |
+| warm 470k +512 | 5.186 | 5.076 | 97.9% | 0.082 |
+| warm 470k +2048 | 12.611 | 12.481 | 99.0% | 0.102 |
+
+`queue+render+setup` 合计 8–11 ms。**快照恢复、工作区、分词、前缀查找全部排除。**
+
+## prefill 内部：小批退化
+
+| 请求 | 总 ms/tok | MoE | attn | FFN | 其余 | dispatch/iter | dispatch/token |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| cold 160k | 1.71 | 0.57 | 0.101 | 0.130 | 0.91 | 33.6 | 0.68 |
+| warm +512 | 4.86 | 1.58 | 0.238 | 0.310 | 2.74 | **114.7** | **5.72** |
+| warm +2048 | 3.47 | 0.96 | 0.169 | 0.219 | 2.12 | 92.5 | 2.88 |
+
+`n=802 < chunk 2048` 时 chunk 取 802、`moe_chunks=1`、MoE batch 仅 802 tok，
+逐 token 路径覆盖全部 token ⇒ 每 layer-iteration 的 dispatch 高 3.4 倍。
+
+**没有改 chunk**：§17/§20 记过 chunk 变更会改变输出文本（归约次序），
+属数值路径改动，须先过 0-ULP。本轮只给归因。
+
+复现：加 `--server-env MYDS_PROFILE_PREFILL=1 --server-env MYDS_PROFILE_MOE=1`。

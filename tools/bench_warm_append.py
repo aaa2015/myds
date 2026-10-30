@@ -277,6 +277,10 @@ def main():
     ap.add_argument("--sizes", default="8k")
     ap.add_argument("--appends", default="512")
     ap.add_argument("--reps", type=int, default=1)
+    ap.add_argument("--server-env", action="append", default=[],
+                    metavar="KEY=VALUE",
+                    help="extra environment for the server this driver starts "
+                         "(e.g. --server-env MYDS_PROFILE_MOE=1 to split prefill)")
     ap.add_argument("--reuse-server", action="store_true",
                     help="measure an already-running server instead of booting per repetition")
     for key, value in DEFAULTS.items():
@@ -316,7 +320,13 @@ def main():
     try:
         if not a.reuse_server:
             available = wait_memory(a.mem_floor_gb)
-            startup = owned.start(a, logfile, {})
+            extra = {}
+            for item in a.server_env:
+                if "=" not in item:
+                    ap.error(f"--server-env needs KEY=VALUE, got {item!r}")
+                key, value = item.split("=", 1)
+                extra[key] = value
+            startup = owned.start(a, logfile, extra)
             emit(out, dict(kind="boot", startup_s=startup,
                            available_gb=round(available, 1)))
             log(f"booted in {startup}s")
