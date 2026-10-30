@@ -1,0 +1,26 @@
+position pos-000001.f32, 129280 elements
+  huge          118272  91.4851%
+  65-4096 ulp    10826   8.3741%
+  5-64 ulp         171   0.1323%
+  2-4 ulp            8   0.0062%
+  1 ulp              2   0.0015%
+  identical          1   0.0008%
+
+examples of huge differences (index, jit, cache, ulp):
+  [     0] jit=-1.649256  cache=-1.650431  ulp=9859
+  [     2] jit=3.385032  cache=3.380057  ulp=20870
+  [     3] jit=6.479639  cache=6.481695  ulp=4313
+  [     4] jit=8.001919  cache=8.010014  ulp=8488
+  [     5] jit=6.283143  cache=6.288789  ulp=11840
+  [     6] jit=6.565104  cache=6.574316  ulp=19320
+
+sorted arrays equal (same multiset): False
+  sorted positions that differ: 129276 / 129280
+positions: 1644
+argmax differs on 8 of 1644 positions
+  first flip: pos-000028.f32 jit_argmax=1840 cache_argmax=1895 (jit=19.7515 cache=19.6314)
+smallest top1-top2 margin: 0.001839 at pos-000025.f32
+
+Interpretation: a ~0.1% relative perturbation only flips argmax where the
+winner and runner-up differ by less than that. The reported margin is the
+tightest case in this input, so it bounds how often a flip can happen.
