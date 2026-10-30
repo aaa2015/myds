@@ -164,12 +164,18 @@ $(TEST_DEBUG_STATE): tests/test_debug_state.c src/myds_debugstate.c $(wildcard i
 		$(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_metal.o \
 		$(LDFLAGS) -Wl,-dead_strip -o $@
 
-.PHONY: all test clean bench metallib build-tail-init test-tail-init test-indexer-register-only-host test-register-only-http-bridge test-register-only-service-window audit-ledger gen-ledger bench-register-only corpus-check verify-register-only check-knobs
+.PHONY: all test clean bench check-toolchain metallib build-tail-init test-tail-init test-indexer-register-only-host test-register-only-http-bridge test-register-only-service-window audit-ledger gen-ledger bench-register-only corpus-check verify-register-only check-knobs
 
 # The knob inventory must match the source. A new MYDS_* read site that is not
 # registered here is how a config key ends up set-but-unread (MYDS_TOPK_THRESHOLD).
 check-knobs:
 	@python3 tools/knob_inventory.py --check
+
+# A byte-identity claim is undecidable without both versions (ledger §117).
+# Informational by default; CI or a deploy may pass EXPECT_CLANG/EXPECT_SDK.
+check-toolchain:
+	@python3 tools/build_identity.py $(if $(EXPECT_CLANG),--expect-clang $(EXPECT_CLANG)) \
+		$(if $(EXPECT_SDK),--expect-sdk $(EXPECT_SDK))
 
 # Rebuild consumers when public or internal layouts change.
 -include $(wildcard $(BUILD_DIR)/*.d)

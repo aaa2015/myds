@@ -1,0 +1,8 @@
+{
+  "clang_banner": "Apple clang version 21.0.0 (clang-2100.4.1.1)",
+  "clang_version": "2100.4.1.1",
+  "developer_dir": "/Library/Developer/CommandLineTools",
+  "host": "macmini",
+  "sdk_path": "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+  "sdk_version": "27.2"
+}

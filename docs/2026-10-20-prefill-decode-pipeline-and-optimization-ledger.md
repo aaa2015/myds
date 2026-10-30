@@ -32,7 +32,12 @@
 > 复现需要用本仓库的代码与 scripts 重跑。
 
 - 最后更新：**2026-10-27 09:40（§105 已脚本审计：32K prefill 关 593.1 → 开 618.9 t/s = +4.35%，每臂 9 样本、离散 0.135%/0.065%、配对估计 +4.34%、两臂输出逐字节相同、GPU 并发采样确证 100% 驻留；生产已默认开启。全部数字可由 `make audit-ledger` 从原始 JSONL 重算验证；可复现性与审计边界见 §106）**
-- 部署制品核验（§105.6，2026-10-27）：macstudio 8187；binary `a97976e0a2e2aced…` / 库 `fe55793346e15119…` / 配置 `735e0dc7…`；与 macmini 逐字节相同
+> ⚠️ **2026-10-30 勘误（§117）**：本行原写「binary `a97976e0…`，与 macmini 逐字节相同」。
+> **该断言已作废**：① `a97976e0…` 已过期（此后两次部署，当前为 `6ce62f86…`）；
+> ② 「逐字节相同」依赖**编译器与 SDK 版本完全一致**，而两台机器曾不一致
+> （macmini Xcode 27.1 / clang `2100.3.34.2` / SDK 27.0 vs macstudio Xcode 27.2 / `2100.4.1.1` / SDK 27.2）。
+> 实测：同源码在 macmini 上用旧工具链得 `972cdce2…`，用与新工具链一致的 CLT 27.2 得 `6ce62f86…`（= macstudio）。
+> **跨机逐字节相同只在工具链一致时成立**；同机干净构建的确定性已单独验证。详见 §117。
 > **注意**：§92.7 的 PID55488 / `9cf2a670…` / `c692d821…` / 54 项配置是 **2026-10-24 的冻结身份**，已被 §105.6 取代，仅作历史对照。
 - 主机：macstudio — M2 Ultra，76 核 GPU，**206 GB 统一内存**（=192 GiB，Metal 上限 201.9 GB）；
   带宽理论峰值 **800 GB/s**，实测可达 **724 GB/s**（§0.1），纯读基准最高 799 GB/s（§46.1）
@@ -15118,3 +15123,97 @@ use: xcodebuild -downloadComponent MetalToolchain
 HTTP 层已验；`/debug/state` **未**在生产配置下常开（保持默认关）。
 未在并发或长跑下观察其开销（实现为一次 environ 遍历 + 一次计数器读 + 两次文件哈希，
 其中文件哈希每次请求重算 —— **若将来频繁轮询，应改为启动时算一次**，当前未优化因为默认关闭）。
+
+---
+
+## §117 勘误：可复现性的真实边界（2026-10-30）
+
+**结论：三条旧断言需要更正，一条仍然成立。** 全部按下述实测重写，不做推测。
+
+### 一、作废：「与 macmini 逐字节相同」
+
+§105.6 及其卷首摘要称部署 binary `a97976e0…` 与 macmini 逐字节相同。现状：
+
+| 事实 | 值 |
+|---|---|
+| 该 binary 是否仍是当前制品 | **否**（此后两次部署：`bbe8aa66…` → `6ce62f86…`） |
+| 跨机一致是否无条件成立 | **否**，取决于编译器与 SDK 版本 |
+
+实测矩阵（同一份源码，逐文件哈希已核对一致，`metallib` 预置后 `touch` 以隔离 shader 变量）：
+
+| 机器 | 工具链 | clang | SDK | 产出 binary |
+|---|---|---|---:|---:|
+| macmini | Xcode 27.1（默认 `cc` 路径） | `2100.3.34.2` | 27.2（升级后） | `972cdce2…` |
+| macmini | CLT 27.2（`DEVELOPER_DIR=…/CommandLineTools`） | `2100.4.1.1` | 27.2 | **`6ce62f86…`** |
+| macstudio | Xcode 27.2（部署脚本所设） | `2100.4.1.1` | 27.2 | **`6ce62f86…`** |
+
+⇒ **跨机逐字节相同成立，但前提是 clang `2100.4.1.1` + SDK 27.2。**
+macmini 升级前是 `2100.3.34.2` + SDK 27.0，那时跨机不可能相同。
+
+### 二、仍成立：同机干净构建的确定性
+
+macmini 上连续两次**干净构建**（独立 `BUILD_DIR`）均为 `6ce62f86…`，
+同编译器下增量构建亦得同一值。⇒ **同机确定性成立**，这条不受影响。
+
+> 期间曾观察到同一台机器先后得 `0f6bdb41…` 与 `972cdce2…`。原因是 CLT 升级把
+> macmini 可见的 SDK 从 27.0 换成了 27.2，**编译器没变而 SDK 变了**。
+> 两个变量都必须钉住，只钉 clang 不够。这一点原先没人写下来。
+
+### 三、新增边界：`metallib` 不跨工具链可复现
+
+修复 macstudio 的 Metal 工具链后（见四），新组件 `Metal Toolchain 27B47` 重编
+同一份 `.metal` 源码：
+
+| 制品 | SHA256 前缀 | 大小 |
+|---|---|---:|
+| 已部署 `bin/myds.metallib` | `fe557933…` | 4,283,287 B |
+| 新工具链重编 | `719242c9…` | 4,283,287 B |
+
+大小与 MTLB 头部（前 32 字节）相同，**18,978 字节（0.44%）内容不同** ⇒
+是真实的代码生成差异，不是时间戳。
+
+**⇒ 重建 `metallib` 等于更换 GPU 代码，必须重新过 0-ULP 资格。**
+这也是 §116 那次部署坚持「预置已部署 metallib 并哈希自证」的原因：
+不是为了省事，是为了不悄悄换掉 shader。
+
+### 四、环境修复记录
+
+**macstudio Metal 工具链**：`xcodebuild -downloadComponent MetalToolchain`
+（838.9 MB，`Metal Toolchain 27B47`）。修前 `xcrun metal` 报
+`missing Metal Toolchain`，修后 `metal -c` 正常产出 `.air`。
+**这解除了「任何触及 shader 的部署都无法进行」的硬阻塞。**
+
+**macmini clang**：`softwareupdate --install "Command Line Tools for Xcode 27.2"`
+（521 MB）。CLT 从 `27.0.0.0` 升到 27.2，clang 从 `2100.3.34.2` 升到 `2100.4.1.1`。
+
+**残留不对称（必须知道，不要假装已解决）**：
+
+| | macmini | macstudio |
+|---|---|---|
+| 默认 `xcrun` 路径（`xcode-select`） | `/Applications/Xcode.app`（27.1，clang 旧） | `/Library/Developer/CommandLineTools` |
+| 部署脚本实际使用 | —（权威侧不编译，只在 macstudio 编） | `DEVELOPER_DIR=Xcode.app`（27.2） |
+| CLT 自带 metal 编译器 | **无** | **无** |
+| `xcodebuild -downloadComponent` 可用 | 是（Xcode 路径有 metal） | 已修 |
+
+macmini 的 `make test` 需要 metal 来生成 metallib，而那个 metal 只随 Xcode 提供。
+所以**没有**把 macmini 的 `xcode-select` 切到 CLT —— 那会让 macmini 无法跑测试。
+因此 macmini 的**默认**构建仍是旧 clang；要产出与 macstudio 一致的制品，
+必须显式 `DEVELOPER_DIR=/Library/Developer/CommandLineTools`。
+
+### 五、因此，可复现性的正确表述
+
+1. **数字可复算**：账本表格由 `make audit-ledger` 从原始 JSONL 重算（§106 机制，未变）。
+2. **同机同工具链可复现**：干净构建确定（本节二）。
+3. **跨机可复现**：仅当 clang `2100.4.1.1` + SDK 27.2 两侧一致（本节一）。
+4. **metallib 不可跨工具链复现**（本节三）——换工具链即换 shader，需重新 0-ULP。
+
+**今后任何「与 X 逐字节相同」的断言，必须同时给出 clang 版本与 SDK 版本**，
+否则该断言不可判定。这条已写进卷首摘要。
+
+### 边界
+
+macmini 未安装 Xcode 27.2（`softwareupdate` 只提供 CLT 27.2），故 macmini 的
+默认 Xcode 路径无法与新工具链对齐；这不影响部署（macstudio 编译），
+但意味着 macmini 上「随手 `make`」得到的二进制与产物不一致。
+未验证 macmini 与 macstudio 在**同工具链**下的 `metallib` 是否也一致
+（macmini 的 Xcode 路径有 metal 但 clang 旧，无法构造该组合）。
