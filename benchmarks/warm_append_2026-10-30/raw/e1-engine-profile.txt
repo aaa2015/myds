@@ -1,0 +1,42 @@
+[2026-10-30 14:25:20.007] [INFO] prefill batching: chunk=228 macroblock=512 moe_chunks=1 (=> MoE batch = 228 tok, guard=16384) [n=228]
+Wait MoE (GPU)        :    14.76 ms
+  ...attn_out B       :    66.96 ms
+  ...FFN-in+sh+router :    84.38 ms
+  ===> MoE GEMMs      :   644.80 ms
+Total Layers Wall     :  1256.77 ms
+Layer iterations      :         40
+[2026-10-30 14:25:21.854] [INFO] prefill batching: chunk=440 macroblock=512 moe_chunks=1 (=> MoE batch = 440 tok, guard=16384) [n=439]
+Wait MoE (GPU)        :    20.07 ms
+  ...attn_out B       :   102.32 ms
+  ...FFN-in+sh+router :   134.49 ms
+  ===> MoE GEMMs      :   878.95 ms
+Total Layers Wall     :  1735.19 ms
+Layer iterations      :         40
+[2026-10-30 14:25:24.181] [INFO] prefill batching: chunk=650 macroblock=1024 moe_chunks=1 (=> MoE batch = 650 tok, guard=16384) [n=650]
+Wait MoE (GPU)        :    34.82 ms
+  ...attn_out B       :   158.68 ms
+  ...FFN-in+sh+router :   210.25 ms
+  ===> MoE GEMMs      :  1358.95 ms
+Total Layers Wall     :  2665.04 ms
+Layer iterations      :         40
+[2026-10-30 14:25:27.454] [INFO] prefill batching: chunk=1074 macroblock=1536 moe_chunks=1 (=> MoE batch = 1074 tok, guard=16384) [n=1073]
+Wait MoE (GPU)        :    45.21 ms
+  ...attn_out B       :   227.55 ms
+  ...FFN-in+sh+router :   300.02 ms
+  ===> MoE GEMMs      :  1706.42 ms
+Total Layers Wall     :  3758.76 ms
+Layer iterations      :         40
+[2026-10-30 14:25:31.839] [INFO] prefill batching: chunk=2048 macroblock=2560 moe_chunks=2 (=> MoE batch = 4096 tok, guard=16384) [n=2129]
+Wait MoE (GPU)        :    65.49 ms
+  ...attn_out B       :   373.29 ms
+  ...FFN-in+sh+router :   487.77 ms
+  ===> MoE GEMMs      :  2243.83 ms
+Total Layers Wall     :  5916.54 ms
+Layer iterations      :         80
+[2026-10-30 14:25:38.388] [INFO] prefill batching: chunk=2048 macroblock=4608 moe_chunks=3 (=> MoE batch = 6144 tok, guard=16384) [n=4242]
+Wait MoE (GPU)        :   101.41 ms
+  ...attn_out B       :   586.16 ms
+  ...FFN-in+sh+router :   758.93 ms
+  ===> MoE GEMMs      :  3305.40 ms
+Total Layers Wall     :  9359.50 ms
+Layer iterations      :        120
