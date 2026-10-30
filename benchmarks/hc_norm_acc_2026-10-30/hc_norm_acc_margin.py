@@ -144,6 +144,52 @@ def bf16_quantum(value):
     return 2.0 ** (exponent - 7)
 
 
+def _hash(x):
+    x ^= x >> 16; x = (x * 0x7FEB352D) & 0xFFFFFFFF
+    x ^= x >> 15; x = (x * 0x846CA68B) & 0xFFFFFFFF
+    x ^= x >> 16
+    return x
+
+
+def _fill_value(i, seed):
+    """Mirror of the probe's filler; integer construction, so exact to replicate."""
+    h = _hash(((i * 2654435761) & 0xFFFFFFFF) ^ ((seed * 0x9E3779B9) & 0xFFFFFFFF))
+    mant = h & 0x007FFFFF
+    expo = 118 + ((h >> 23) % 8)
+    bits = (expo << 23) | mant
+    value = struct.unpack("<f", struct.pack("<I", bits))[0]
+    return -value if h & 0x80000000 else value
+
+
+def _f32(x):
+    return struct.unpack("<f", struct.pack("<f", x))[0]
+
+
+def ordering_gate(dim):
+    """Does this input even permit distinguishing accumulation order?
+
+    The first probe fill was dyadic, so four products summed exactly in f32 and the
+    two orders were bit-identical by construction -- the `reorder` arm could not
+    have detected anything, whatever the compiler did. This gate emulates both
+    orders in f32 on the same fill and refuses to proceed when they agree, exactly
+    as `gross` gates whether the dump is live at all.
+    """
+    res = [_fill_value(i, 3) for i in range(4 * dim)]
+    w = [_fill_value(i, 7) for i in range(4)]
+    differ = 0
+    for i in range(dim):
+        c = [res[r * dim + i] for r in range(4)]
+        fwd = _f32(0.0)
+        for k in range(4):
+            fwd = _f32(fwd + _f32(c[k] * w[k]))
+        rev = _f32(0.0)
+        for k in (3, 2, 1, 0):
+            rev = _f32(rev + _f32(c[k] * w[k]))
+        if fwd != rev:
+            differ += 1
+    return differ, dim
+
+
 def check_pre_rounding(path, arm):
     """A pre-rounding dump must contain values BF16 cannot represent.
 
@@ -284,6 +330,18 @@ def main():
             for arm, d in dirs.items()}
     if len(set(libs.values())) != len(libs):
         raise SystemExit("two arms produced the same library; the reorder had no effect")
+
+    order_differ, order_total = ordering_gate(a.dim)
+    emit(out, dict(kind="ordering_gate", elements=order_total,
+                   f32_forward_vs_reversed_differing=order_differ,
+                   fraction=order_differ / order_total if order_total else 0.0))
+    if order_differ == 0:
+        raise SystemExit(
+            "ordering gate failed: emulated f32 forward and reversed agree on every "
+            "element, so this input cannot distinguish accumulation order and the "
+            "reorder arm would measure nothing (this is how the first fill failed)")
+    log(f"ordering gate: {order_differ}/{order_total} elements differ between the two "
+        f"orders ({100*order_differ/order_total:.1f}%)")
 
     frac = {arm: check_pre_rounding(d, arm) for arm, d in dumps.items()}
     emit(out, dict(kind="pre_rounding_check",

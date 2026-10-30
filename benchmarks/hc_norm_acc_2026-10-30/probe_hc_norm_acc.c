@@ -22,18 +22,41 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <stdbool.h>
 #include "myds_metal.h"
+
+/* Deterministic full-precision filler.
+ *
+ * The first version of this probe used dyadic values (integer / 1024), which made
+ * every product need at most 18 significant bits; four such terms sum EXACTLY in
+ * f32, and exact addition is order independent, so that input could not detect a
+ * reordering no matter what the compiler did. Measured: f32 forward and f32
+ * reversed agreed on 5120/5120 elements and both equalled the exact double sum.
+ *
+ * A randomised 24-bit mantissa makes the products need ~48 bits, so the sum
+ * rounds and the association order becomes observable. tools/hc_norm_acc_margin.py
+ * refuses to run unless emulating the two orders on this fill actually disagrees.
+ */
+static uint32_t negctl_hash(uint32_t x) {
+    x ^= x >> 16; x *= 0x7feb352du;
+    x ^= x >> 15; x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
 
 static void fill(myds_metal_buffer_t *b, unsigned seed) {
     float *p = myds_metal_buffer_data(b);
     const size_t n = myds_metal_buffer_size(b) / 4;
     for (size_t i = 0; i < n; i++) {
-        /* Deterministic, mixed magnitude, both signs: rounding margins are
-         * magnitude dependent and a single-scale fill would hide that. */
-        const float mag = (float)(1u + ((uint32_t)(i * 2654435761u + seed) % 97u)) / 64.0f;
-        const float sign = ((i + seed) & 1u) ? 1.0f : -1.0f;
-        p[i] = sign * mag * ((float)((int)((i * 7u + seed) % 31u) - 15) / 16.0f);
+        const uint32_t h = negctl_hash((uint32_t)i * 2654435761u ^ (seed * 0x9e3779b9u));
+        const uint32_t mant = h & 0x007FFFFFu;          /* full 23-bit mantissa */
+        const uint32_t expo = 118u + ((h >> 23) % 8u);  /* magnitudes 2^-9 .. 2^-2 */
+        const uint32_t bits = (expo << 23) | mant;
+        float v;
+        memcpy(&v, &bits, sizeof v);
+        if (h & 0x80000000u) v = -v;
+        p[i] = v;
     }
 }
 

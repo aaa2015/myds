@@ -1,0 +1,8 @@
+{"dim": 5120, "kind": "plan", "n_tok": 1, "note": "both arms carry the same accumulator-dump patch; the only difference is the reorder", "probe": "/Users/fangqingyuan/Projects/myds/bin/probe_hc_norm_acc", "repo": "/Users/fangqingyuan/Projects/myds"}
+{"arm": "baseline", "kind": "run", "loaded_library": "/tmp/ml5/baseline/myds.metallib", "loaded_ok": true}
+{"arm": "gross", "kind": "run", "loaded_library": "/tmp/ml5/gross/myds.metallib", "loaded_ok": true}
+{"arm": "reorder", "kind": "run", "loaded_library": "/tmp/ml5/reorder/myds.metallib", "loaded_ok": true}
+{"elements": 5120, "f32_forward_vs_reversed_differing": 2028, "fraction": 0.39609375, "kind": "ordering_gate"}
+{"bf16_representable_fraction": {"baseline": 0.0, "gross": 0.0, "reorder": 0.0}, "kind": "pre_rounding_check", "note": "must be < 1.0; 1.0 means the dump is post-rounding"}
+{"differing_elements": 2400, "elements": 5120, "fraction_differing": 0.46875, "kind": "margin", "label": "reorder_vs_baseline", "max_abs_delta": 7.450580596923828e-09, "max_delta_over_quantum": 0.0032958984375, "median_delta_over_quantum": 1.52587890625e-05, "p99_delta_over_quantum": 0.0002288818359375}
+{"differing_elements": 2400, "elements": 5120, "kind": "verdict", "library_sha256": {"baseline": "4276ad6ae7e51830", "gross": "4edb920694d6ea36", "reorder": "638f22e0c86d10ed"}, "max_below_half_quantum": true, "max_delta_over_quantum": 0.0032958984375, "p99_delta_over_quantum": 0.0002288818359375}
