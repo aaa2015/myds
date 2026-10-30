@@ -116,7 +116,12 @@ python3 benchmarks/warm_append_2026-10-30/analyze.py /tmp/e2b.jsonl
 | warm +2048 | 3.47 | 0.96 | 0.169 | 0.219 | 2.12 | 92.5 | 2.88 |
 
 `n=802 < chunk 2048` 时 chunk 取 802、`moe_chunks=1`、MoE batch 仅 802 tok，
-逐 token 路径覆盖全部 token ⇒ 每 layer-iteration 的 dispatch 高 3.4 倍。
+每 layer-iteration 的 dispatch 高 3.4 倍。
+
+> ⚠️ **2026-10-30 修正**：初版写「逐 token 路径覆盖全部 token」是错的。
+> 实测 Step4 loop 1,783 次 / 40 个 layer-iteration = **44.6 次每层**，
+> 若逐 token 覆盖 802 个 token 应为 802 次 —— 差约 18 倍。dispatch 增加是真的，
+> 但「每 token 一次」的解释不成立。见账本 §119。
 
 **没有改 chunk**：§17/§20 记过 chunk 变更会改变输出文本（归约次序），
 属数值路径改动，须先过 0-ULP。本轮只给归因。
@@ -159,9 +164,14 @@ python3 benchmarks/warm_append_2026-10-30/analyze.py /tmp/e2b.jsonl
 **更慢 3.3 s。** 这条曲线在动手前就否掉了它，省掉一轮会以「更慢」收尾的
 数值路径改动与 0-ULP 资格。
 
-## 结论
+## 结论（2026-10-30 修正）
 
-G1 记为边界，B3 不立项。唯一杠杆是跨请求合批（§100.3/§101.1 已排除）；
+> ⚠️ 初版写「MoE 每 chunk 恒定 ~1.1 s ⇒ 专家权重流边界」。**已被 E1 数据推翻**：
+> mc=1 时 MoE 从 645 ms（228 tok）涨到 1,706 ms（1,073 tok），即 +1.26 ms/token。
+> 「恒定」只在 mc≥2 且 chunk 被 2,048 填满时成立，是填满的巧合。
+> 且 warm+512 的层时间里 **56%（2,195 ms）落在 Step1–4/indexer/compressor，未分解**。
+
+G1 记为**部分归因**，B3 不立项（未识别出可执行修法，不等于已证明是算术边界）。唯一杠杆是跨请求合批（§100.3/§101.1 已排除）；
 若将来重开，收益上界 = `1.89 s × (1 − 1/并发数)`，且不改数值路径。
 
 复现：`--appends 512,1024,2048,4096`，原始 `raw/e2-curve.jsonl`。
