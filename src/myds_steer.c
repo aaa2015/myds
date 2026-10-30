@@ -60,6 +60,16 @@ myds_steer_t *myds_steer_load(const char *path, float alpha_override,
 
     strncpy(st->path, path, sizeof(st->path) - 1);
 
+    if (strstr(path, "GLP-27") || strstr(path, "glp-27") || strstr(path, "glp27")) {
+        strncpy(st->name, "glp27", sizeof(st->name) - 1);
+    } else if (strstr(path, "GLP-39") || strstr(path, "glp-39") || strstr(path, "glp39")) {
+        strncpy(st->name, "glp39", sizeof(st->name) - 1);
+    } else {
+        const char *slash = strrchr(path, '/');
+        const char *base = slash ? slash + 1 : path;
+        strncpy(st->name, base, sizeof(st->name) - 1);
+    }
+
     /* 1. Read Metadata */
     st->spec_version = gguf_get_u32(gf, "glp.spec_version", 1);
     st->alpha_default = gguf_get_f32(gf, "glp.alpha_default", 1.0f);

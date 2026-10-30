@@ -129,6 +129,13 @@ int main(int argc, char **argv) {
     assert(fabsf(dot_vec_after) < 1e-4f);
     printf("Single Vector Steering test PASSED!\n");
 
+    // 5. Test Steer Profile Names
+    printf("\n--- Testing Profile Naming ---\n");
+    assert(strcmp(st1->name, "glp39") == 0);
+    assert(strcmp(st2->name, "glp27") == 0);
+    printf("st1 name: %s, st2 name: %s\n", st1->name, st2->name);
+    printf("Profile naming test PASSED!\n");
+
     // Cleanup
     free(host_res); free(host_res_after); free(host_dir);
     free(host_vec); free(host_vec_after);

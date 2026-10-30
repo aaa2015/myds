@@ -3739,6 +3739,11 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         float min_p = json_extract_float_field(body, "min_p", -1.0f);
         float rep_pen = json_extract_float_field(body, "repetition_penalty", -1.0f);
         float pres_pen = json_extract_float_field(body, "presence_penalty", -1.0f);
+        char req_steer_name[64] = {0};
+        json_extract_string_field(body, "steer", req_steer_name, sizeof(req_steer_name));
+        if (req_steer_name[0] == '\0') {
+            json_extract_string_field(body, "steer_mode", req_steer_name, sizeof(req_steer_name));
+        }
         float req_steer_alpha = json_extract_float_field(body, "steer_alpha", -1.0f);
         int req_steer_enable = json_extract_int_field(body, "steer_enable", -1);
         if (req_steer_enable < 0) {
@@ -4045,20 +4050,39 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         uint32_t prompt_tokens = 0;
         uint32_t final_tokens = 0;
 
+        myds_steer_t *prev_steer = ctx ? ctx->steer : NULL;
         float prev_steer_alpha = -1.0f;
         int prev_steer_enabled = -1;
-        if (ctx && ctx->steer) {
-            prev_steer_alpha = ctx->steer->alpha_effective;
-            prev_steer_enabled = ctx->steer->enabled ? 1 : 0;
-            if (req_steer_alpha >= 0.0f) {
-                ctx->steer->alpha_effective = req_steer_alpha;
+        if (ctx) {
+            if (req_steer_name[0] != '\0') {
+                if (strcasecmp(req_steer_name, "none") == 0 ||
+                    strcasecmp(req_steer_name, "off") == 0 ||
+                    strcasecmp(req_steer_name, "false") == 0) {
+                    req_steer_enable = 0;
+                } else {
+                    myds_steer_t *found = myds_context_find_steer(ctx, req_steer_name);
+                    if (found) {
+                        ctx->steer = found;
+                        if (req_steer_enable < 0) req_steer_enable = 1;
+                    } else {
+                        MYDS_LOG_W("[%s:%d] steer profile '%s' not found", client_ip, client_port, req_steer_name);
+                    }
+                }
             }
-            if (req_steer_enable >= 0) {
-                ctx->steer->enabled = (req_steer_enable != 0);
-            }
-            if (req_steer_alpha >= 0.0f || req_steer_enable >= 0) {
-                MYDS_LOG_I("[%s:%d] dynamic steer override: alpha=%.3f, enabled=%d",
-                           client_ip, client_port, ctx->steer->alpha_effective, ctx->steer->enabled ? 1 : 0);
+
+            if (ctx->steer) {
+                prev_steer_alpha = ctx->steer->alpha_effective;
+                prev_steer_enabled = ctx->steer->enabled ? 1 : 0;
+                if (req_steer_alpha >= 0.0f) {
+                    ctx->steer->alpha_effective = req_steer_alpha;
+                }
+                if (req_steer_enable >= 0) {
+                    ctx->steer->enabled = (req_steer_enable != 0);
+                }
+                if (req_steer_alpha >= 0.0f || req_steer_enable >= 0 || req_steer_name[0] != '\0') {
+                    MYDS_LOG_I("[%s:%d] dynamic steer override: profile=%s, alpha=%.3f, enabled=%d",
+                               client_ip, client_port, ctx->steer->name, ctx->steer->alpha_effective, ctx->steer->enabled ? 1 : 0);
+                }
             }
         }
 
@@ -4643,6 +4667,7 @@ cleanup_infer:
                 if (prev_steer_alpha >= 0.0f) ctx->steer->alpha_effective = prev_steer_alpha;
                 if (prev_steer_enabled >= 0) ctx->steer->enabled = (prev_steer_enabled != 0);
             }
+            ctx->steer = prev_steer;
         }
         myds_vjob_sink_free(&img_sink);
         myds_set_continue_from_cache(ctx, false);

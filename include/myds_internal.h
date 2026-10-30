@@ -116,7 +116,10 @@ struct myds_context {
     myds_model_t        *model;
     myds_v41_context_t  *v41;
     myds_dspark_t       *dspark;
-    myds_steer_t        *steer;
+#define MYDS_MAX_STEER_PROFILES 4
+    myds_steer_t        *steer;                     /* Active steering profile */
+    myds_steer_t        *steers[MYDS_MAX_STEER_PROFILES]; /* All loaded profiles */
+    uint32_t             num_steers;
     myds_config_t        cfg;
     uint32_t             pos;
     uint32_t             kv_capacity; /* Allocated KV rows; cfg may request a smaller limit. */

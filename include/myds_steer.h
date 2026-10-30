@@ -21,6 +21,7 @@ typedef enum {
 typedef struct myds_steer {
     bool enabled;
     char path[512];
+    char name[64];           /* Identifier name, e.g. "glp27", "glp39" */
     float alpha_default;     /* Alpha from GGUF file */
     float alpha_override;    /* CLI/env override (-1 if not set) */
     float alpha_effective;   /* Currently effective alpha */

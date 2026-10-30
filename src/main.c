@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <time.h>
 #include <unistd.h>
 #if defined(__APPLE__)
@@ -404,12 +405,26 @@ int main(int argc, char *argv[]) {
     }
 
     /* GLP 控制向量 / 隐空间消融子系统 */
-    if (steer_path && *steer_path && steer_enable) {
-        myds_steer_t *st = myds_steer_load(steer_path, steer_alpha, steer_mode, steer_layers);
-        if (!st) {
-            MYDS_LOG_E("GLP 控制向量加载失败（%s）—— 本次不启用消融", steer_path);
-        } else {
-            myds_context_set_steer(ctx, st);
+    if (steer_path && *steer_path) {
+        char path_buf[1024];
+        strncpy(path_buf, steer_path, sizeof(path_buf) - 1);
+        path_buf[sizeof(path_buf) - 1] = '\0';
+        char *saveptr = NULL;
+        char *p = strtok_r(path_buf, ",", &saveptr);
+        while (p) {
+            while (*p && isspace((unsigned char)*p)) p++;
+            if (*p) {
+                myds_steer_t *st = myds_steer_load(p, steer_alpha, steer_mode, steer_layers);
+                if (!st) {
+                    MYDS_LOG_E("GLP 控制向量加载失败（%s）", p);
+                } else {
+                    st->enabled = (steer_enable != 0);
+                    myds_context_add_steer(ctx, st);
+                    MYDS_LOG_I("GLP 控制向量已注册: [%s] (enabled=%d, alpha=%.3f, mode=%d)",
+                               st->name, st->enabled ? 1 : 0, st->alpha_effective, st->mode);
+                }
+            }
+            p = strtok_r(NULL, ",", &saveptr);
         }
     }
 

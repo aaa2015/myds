@@ -14,6 +14,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <ctype.h>
 #include <math.h>
 #include <time.h>
 #include <sys/time.h>
@@ -1411,10 +1413,14 @@ void myds_context_free(myds_context_t *ctx) {
         myds_dspark_free(ctx->dspark);
         ctx->dspark = NULL;
     }
-    if (ctx->steer) {
-        myds_steer_free(ctx->steer);
-        ctx->steer = NULL;
+    for (uint32_t i = 0; i < ctx->num_steers; i++) {
+        if (ctx->steers[i]) {
+            myds_steer_free(ctx->steers[i]);
+            ctx->steers[i] = NULL;
+        }
     }
+    ctx->steer = NULL;
+    ctx->num_steers = 0;
     myds_context_clear_image_embeddings(ctx);
     myds_v41_context_free(ctx->v41);
     free_prefill_chunk(ctx->prefill_chunk);
@@ -1522,11 +1528,53 @@ void myds_context_clear_logit_bitmask(myds_context_t *ctx) {
 }
 
 void myds_context_set_steer(myds_context_t *ctx, myds_steer_t *steer) {
-    if (ctx) ctx->steer = steer;
+    if (!ctx) return;
+    ctx->steer = steer;
+    if (steer) {
+        bool found = false;
+        for (uint32_t i = 0; i < ctx->num_steers; i++) {
+            if (ctx->steers[i] == steer) { found = true; break; }
+        }
+        if (!found && ctx->num_steers < MYDS_MAX_STEER_PROFILES) {
+            ctx->steers[ctx->num_steers++] = steer;
+        }
+    }
+}
+
+void myds_context_add_steer(myds_context_t *ctx, myds_steer_t *steer) {
+    if (!ctx || !steer) return;
+    for (uint32_t i = 0; i < ctx->num_steers; i++) {
+        if (ctx->steers[i] == steer) return;
+    }
+    if (ctx->num_steers < MYDS_MAX_STEER_PROFILES) {
+        ctx->steers[ctx->num_steers++] = steer;
+        if (!ctx->steer) ctx->steer = steer;
+    }
 }
 
 myds_steer_t *myds_context_get_steer(const myds_context_t *ctx) {
     return ctx ? ctx->steer : NULL;
+}
+
+static inline bool myds_steer_contains_ci(const char *haystack, const char *needle) {
+    if (!haystack || !needle) return false;
+    size_t nlen = strlen(needle);
+    if (nlen == 0) return true;
+    for (const char *h = haystack; *h; h++) {
+        if (strncasecmp(h, needle, nlen) == 0) return true;
+    }
+    return false;
+}
+
+myds_steer_t *myds_context_find_steer(const myds_context_t *ctx, const char *name) {
+    if (!ctx || !name || !*name) return NULL;
+    for (uint32_t i = 0; i < ctx->num_steers; i++) {
+        myds_steer_t *st = ctx->steers[i];
+        if (!st) continue;
+        if (strcasecmp(st->name, name) == 0) return st;
+        if (myds_steer_contains_ci(st->path, name)) return st;
+    }
+    return NULL;
 }
 
 static inline bool pen_seen_in(const int32_t *keys, int32_t t) {
