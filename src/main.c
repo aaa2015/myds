@@ -7,6 +7,7 @@
 #include "myds_log.h"
 #include "myds_configfile.h"
 #include "myds_knobs.h"
+#include "myds_debugstate.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -385,6 +386,11 @@ int main(int argc, char *argv[]) {
 
     if (port > 0) {
         /* HTTP Server Mode for Fleet deployment */
+        /* Register /debug/state. Kept out of myds_server.c so that file does not
+         * depend on the knob inventory, the GPU counters or the Metal library
+         * path; see include/myds_debugstate.h. */
+        myds_server_set_debug_provider(myds_debug_state_json, myds_debug_enabled,
+                                       myds_debug_is_loopback);
         int rc = myds_server_start(ctx, host, port, alias);
         myds_context_free(ctx);
         myds_model_free(model);

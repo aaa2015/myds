@@ -7,7 +7,7 @@
 | 项 | 状态 | 产物 | 账本 |
 |---|---|---|---|
 | P0-1 `--print-config` + knob 清单 | **完成** | `tools/knob_inventory.py`、`include/myds_knobs_generated.h`、`myds --print-config`、`make check-knobs` | §A.2 之后 |
-| P0-2 `/debug/state` 端点 | **未做** | — | — |
+| P0-2 `/debug/state` 端点 | **完成**（CPU 层验证；HTTP 层待窗口） | `src/myds_debugstate.c`、`myds --print-config` 同源的 knob 视图 | 待补 §116 |
 | P0-3 ABI 交叉校验 | **跳过**（评估为包装，非新能力） | — | — |
 | P0-4 独占窗口 | **完成并以真机验证** | `tools/run_register_only_service_window.py`（nice/stdio 保留 + 内存回收门）、`tools/gpu_window.py`（只读核对） | §108 后续 |
 | P0-5 请求阶段计时 | **完成并已部署** | `MYDS_REQUEST_PHASES=1` | §111 → §113 |
@@ -53,8 +53,30 @@
 而不是一个更快的数字。跨请求合批仍是唯一未排除的杠杆，其收益上界已写入
 §114/§115（`1.22–1.89 s × (1 − 1/并发数)`），且不改数值路径。
 
+## P0-2 说明
+
+`GET /debug/state` 已实现：默认关闭（`MYDS_DEBUG_ENDPOINT=1` 才开）、**且仅回环**，
+关闭时返回 404 而不是 403（无鉴权的服务不该确认隐藏端点的存在）。
+内容：binary/metallib SHA256、knob 统计（known/set/unread）、
+register-only 计数器、prefix cache 长度。
+
+**三条硬约束写在代码注释里**：
+1. 计数器访问器必须 `reset=false` —— 传 true 会 `atomic_exchange` 清零，
+   直接毁掉账本里每次 A/B 依赖的臂分离（§105 的「requests 恒 2897、encoded 0 vs 2025」）。
+   读操作永远不允许减去证据。
+2. 只读：不插 command buffer、不 commit、不改驻留。
+3. 实现放在独立的 `myds_debugstate.c`，由 `main.c` 通过函数指针注册。
+   理由：`myds_server.c` 若直接依赖 knob 清单 / GPU 计数器 / Metal 路径，
+   会波及所有 `include server.c` 的轻量测试 —— 今天已因此踩过一次。
+
+**验证**：`tests/test_debug_state.c` 用系统 `shasum` 对拍手写 SHA256（不自证）、
+检查 JSON 结构、确认缺失文件返回空而不是假零、确认回环判定的五个边界。
+反向对照：给错哈希则 exit 1。
+
+**未验证**：HTTP 层（404/200 分支的真实收发）。起第二个 myds 实例会占 ~300 GB
+并触发 wired panic，所以只能在部署或窗口内验证。
+
 ## 仍未做
 
-- P0-2 `/debug/state`（计数器的生产出口；当时评估优先级低于 P0-5）
 - §105.6 / §111 / §113 的制品身份已三次过期，任何引用旧 SHA 的对照实验都指向不存在的二进制
 - 跨请求合批的重新评估（若重开，本文件的收益上界可直接用）

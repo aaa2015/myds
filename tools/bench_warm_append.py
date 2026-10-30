@@ -281,6 +281,9 @@ def main():
                     metavar="KEY=VALUE",
                     help="extra environment for the server this driver starts "
                          "(e.g. --server-env MYDS_PROFILE_MOE=1 to split prefill)")
+    ap.add_argument("--cold-only", action="store_true",
+                    help="measure cold prefill only; useful for the short-prompt "
+                         "fixed-cost decomposition (E1)")
     ap.add_argument("--reuse-server", action="store_true",
                     help="measure an already-running server instead of booting per repetition")
     for key, value in DEFAULTS.items():
@@ -307,7 +310,7 @@ def main():
                      "(this driver only ever starts and stops its own server)")
 
     sizes = [s for s in a.sizes.split(",") if s]
-    appends = [int(x) for x in a.appends.split(",") if x]
+    appends = [] if a.cold_only else [int(x) for x in a.appends.split(",") if x]
     logfile = Path(a.workdir) / "logs" / "local-deepseek-flash.log"
 
     emit(out, dict(kind="plan", sizes=sizes, appends=appends, reps=a.reps,

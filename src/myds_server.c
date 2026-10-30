@@ -24,6 +24,31 @@
 #include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+/* Implemented in myds_debugstate.c, which is linked only into full builds.
+ * Declared weak so that including myds_server.c for other reasons does not pull
+ * the knob inventory, the GPU counters and the Metal library path into that
+ * target. A NULL pointer here means "not linked", and the endpoint reports 404. */
+/* /debug/state is registered by the full binary rather than linked implicitly.
+ *
+ * A weak symbol was tried first and does not survive this toolchain's link rules
+ * for a strong declaration elsewhere; more importantly, either approach would tie
+ * myds_server.c to the knob inventory, the GPU counters and the Metal library
+ * path, which breaks every lightweight test that includes this file. That already
+ * happened once today with a different function. A provider pointer keeps
+ * myds_server.c's dependency set unchanged and makes "not linked" an explicit,
+ * observable state instead of a linker accident. */
+static myds_debug_state_provider_t g_debug_state_provider = NULL;
+static myds_debug_predicate_t g_debug_enabled = NULL;
+static myds_debug_loopback_t g_debug_is_loopback = NULL;
+
+void myds_server_set_debug_provider(myds_debug_state_provider_t state,
+                                    myds_debug_predicate_t enabled,
+                                    myds_debug_loopback_t is_loopback) {
+    g_debug_state_provider = state;
+    g_debug_enabled = enabled;
+    g_debug_is_loopback = is_loopback;
+}
+
 #if defined(__APPLE__)
 #include <pthread/qos.h>
 #endif
@@ -3488,6 +3513,41 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                      "Connection: close\r\n\r\n");
         }
         (void)myds_server_send_all(client_fd, cors_res_buf, strlen(cors_res_buf));
+        free(req_buf);
+        close(client_fd);
+        return;
+    }
+
+    /* GET /debug/state.
+     *
+     * myds_debug_state_json is linked only into full builds (weak declaration
+     * below), so a test that includes this file for other reasons still links.
+     * Closed means 404, not 403: an unauthenticated server should not confirm
+     * that a hidden endpoint exists.
+     *
+     * The counter accessor inside is called with reset=false. With reset=true it
+     * atomically zeroes the counters, which would destroy the arm separation that
+     * every A/B in the ledger relies on. A read must never subtract evidence. */
+    if (strcmp(path, "/debug/state") == 0) {
+        const bool open = g_debug_state_provider != NULL && g_debug_enabled != NULL &&
+                          g_debug_is_loopback != NULL &&
+                          g_debug_enabled() && g_debug_is_loopback(client_ip);
+        if (!open) {
+            MYDS_LOG_W("[%s:%d] GET /debug/state -> 404 (registered %s, switch %s, loopback %s)",
+                       client_ip, client_port,
+                       g_debug_state_provider ? "yes" : "no",
+                       (g_debug_enabled && g_debug_enabled()) ? "on" : "off",
+                       (g_debug_is_loopback && g_debug_is_loopback(client_ip)) ? "yes" : "no");
+            send_response(client_fd, 404, "Not Found", "application/json",
+                          "{\"error\":\"not found\"}");
+            free(req_buf);
+            close(client_fd);
+            return;
+        }
+        char state[2048];
+        g_debug_state_provider(state, sizeof(state), ctx);
+        MYDS_LOG_I("[%s:%d] GET /debug/state -> 200 OK", client_ip, client_port);
+        send_response(client_fd, 200, "OK", "application/json", state);
         free(req_buf);
         close(client_fd);
         return;

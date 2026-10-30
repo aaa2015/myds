@@ -30,7 +30,7 @@ BUILD_DIR = build
 #   直到有人引用它们才在链接期暴露。我第一版就漏了三个（vispre/visw/visfwd），
 #   而当时所有测试仍然全过，因为没人用到它们。
 SRCS_C = src/myds_cpu.c src/myds_log.c src/myds_configfile.c src/myds_gguf.c src/myds_tokenizer.c \
-         src/myds_knobs.c \
+         src/myds_knobs.c src/myds_debugstate.c \
          src/myds_engine.c src/myds_v41.c src/myds_v41_gpu.c src/myds_v41_moe.c src/myds_v41_decode.c \
          src/myds_engram.c src/myds_engram_cpu.c src/myds_moe_cpu.c src/myds_dspark.c \
          src/myds_vispre.c src/myds_visw.c src/myds_visfwd.c src/myds_vjob.c \
@@ -84,6 +84,7 @@ TEST_LOG = $(BIN_DIR)/test_log
 TEST_SERVER_API = $(BIN_DIR)/test_server_api
 TEST_PROMPT_RENDER_BOUNDS = $(BIN_DIR)/test_prompt_render_bounds
 TEST_REQUEST_PHASES_JSON = $(BIN_DIR)/test_request_phases_json
+TEST_DEBUG_STATE = $(BIN_DIR)/test_debug_state
 TEST_ENGINE = $(BIN_DIR)/test_engine
 TEST_CPU = $(BIN_DIR)/test_cpu
 TEST_ENGRAM = $(BIN_DIR)/test_engram
@@ -145,12 +146,23 @@ ALL_TESTS += $(TEST_METAL_RESIDENCY) $(TEST_TEARDOWN_ORDER) $(TEST_DECODE_SPLIT)
 ALL_TESTS += $(TEST_TOKENIZER_WORKSPACE)
 ALL_TESTS += $(TEST_PROMPT_RENDER_BOUNDS)
 ALL_TESTS += $(TEST_REQUEST_PHASES_JSON)
+ALL_TESTS += $(TEST_DEBUG_STATE)
 
 # CPU-only: exercises the request_phases formatter. A printf whose argument types
 # drift from its format string compiles cleanly and emits unparsable JSON, which a
 # parser then drops silently -- so "it compiled" is not evidence.
 $(TEST_REQUEST_PHASES_JSON): tests/test_request_phases_json.c src/myds_server.c $(wildcard include/*.h) $(BUILD_DIR)/myds_log.o | $(BIN_DIR)
 	$(CC) $(CFLAGS) $< $(BUILD_DIR)/myds_log.o $(LDFLAGS) -Wl,-dead_strip -o $@
+
+# CPU-only: checks the /debug/state payload. The SHA256 in myds_server.c is
+# hand-rolled, so it is compared against the system's own digest rather than
+# against itself -- a wrong hash would make every reported identity fiction.
+$(TEST_DEBUG_STATE): tests/test_debug_state.c src/myds_debugstate.c $(wildcard include/*.h) \
+		$(BUILD_DIR)/myds_knobs.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/myds_v41_gpu.o \
+		$(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_metal.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) $< $(BUILD_DIR)/myds_knobs.o $(BUILD_DIR)/myds_log.o \
+		$(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_metal.o \
+		$(LDFLAGS) -Wl,-dead_strip -o $@
 
 .PHONY: all test clean bench metallib build-tail-init test-tail-init test-indexer-register-only-host test-register-only-http-bridge test-register-only-service-window audit-ledger gen-ledger bench-register-only corpus-check verify-register-only check-knobs
 
@@ -459,7 +471,7 @@ test-tokenizer: $(TEST_TOKENIZER) $(TEST_TOKENIZER_WORKSPACE)
 	./$(TEST_TOKENIZER)
 	./$(TEST_TOKENIZER_WORKSPACE)
 
-$(TEST_SERVER): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_vjob.o $(BUILD_DIR)/myds_vispre.o $(BUILD_DIR)/myds_visw.o $(BUILD_DIR)/myds_visfwd.o $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_engram_cpu.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_server.o $(METALLIB) | $(BIN_DIR)
+$(TEST_SERVER): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_vjob.o $(BUILD_DIR)/myds_vispre.o $(BUILD_DIR)/myds_visw.o $(BUILD_DIR)/myds_visfwd.o $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_engram_cpu.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_knobs.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_server.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
 
 # 图片块区间对齐：纯头文件（myds_align.h），不需要任何 .c。
@@ -570,7 +582,7 @@ $(TEST_RMS_FUSED_VS_FALLBACK): tests/test_rms_fused_vs_fallback.c $(filter-out $
 $(TEST_LOG): $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_log.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@
 
-$(TEST_SERVER_API): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_vjob.o $(BUILD_DIR)/myds_vispre.o $(BUILD_DIR)/myds_visw.o $(BUILD_DIR)/myds_visfwd.o $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_engram_cpu.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_server_api.o $(METALLIB) | $(BIN_DIR)
+$(TEST_SERVER_API): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_vjob.o $(BUILD_DIR)/myds_vispre.o $(BUILD_DIR)/myds_visw.o $(BUILD_DIR)/myds_visfwd.o $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_engram_cpu.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_knobs.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_server_api.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
 
 # CPU-only failure-path gate; includes server.c to exercise its private renderers.
@@ -749,6 +761,7 @@ test: check-knobs $(ALL_TESTS) $(METALLIB)
 	@./$(TEST_SERVER_API)
 	@./$(TEST_PROMPT_RENDER_BOUNDS)
 	@python3 tests/test_request_phases_json.py ./$(TEST_REQUEST_PHASES_JSON)
+	@./$(TEST_DEBUG_STATE) ./$(TEST_DEBUG_STATE) `shasum -a 256 ./$(TEST_DEBUG_STATE) | cut -d' ' -f1`
 	@echo ""
 	@./$(TEST_ENGINE)
 	@echo ""
