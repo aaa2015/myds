@@ -1,0 +1,8 @@
+{"detail": "status=200 json=True", "kind": "check", "name": "token_present_opens", "pass_": true}
+{"detail": "status=404", "kind": "check", "name": "token_absent_closed", "pass_": true}
+{"detail": "status=404", "kind": "check", "name": "token_prefix_rejected", "pass_": true}
+{"detail": "status=404", "kind": "check", "name": "token_extension_rejected", "pass_": true}
+{"detail": "status=404", "kind": "check", "name": "token_wrong_rejected", "pass_": true}
+{"detail": "status=404", "kind": "check", "name": "fails_closed_without_token", "pass_": true}
+{"detail": "status=404", "kind": "check", "name": "no_token_any_value_closed", "pass_": true}
+{"available_gb": 184.3, "failures": 0, "kind": "teardown", "pass_": true}
