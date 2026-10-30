@@ -15032,3 +15032,89 @@ MoE 两形态的拟合为**[推断]**，需要用更多档位确认。
 生产 `227ae371…`、nice=5，窗口结束独立 verify **PASS**。
 原始数据 `benchmarks/warm_append_2026-10-30/raw/e1-cold-sweep.jsonl`、
 `e1-engine-profile.txt`。
+
+---
+
+## §116 `/debug/state` 上线并在真机验证（2026-10-30）
+
+**结论：端点按设计工作——默认关闭、仅回环、读不改变证据；并独立复现了 §P0-1 的死键缺陷。
+同时暴露出两个环境问题（Metal 工具链缺失、跨机工具链漂移），都必须记账。**
+
+### 设计约束与理由
+
+| 约束 | 理由 |
+|---|---|
+| `MYDS_DEBUG_ENDPOINT=1` 才开 | 服务端无任何鉴权，常开等于把配置与流量形状发给能连上端口的人 |
+| 仅回环（`127.0.0.1` / `::1` / `::ffff:127.*`） | 同上；这是唯一的访问控制 |
+| 关闭返 **404** 而非 403 | 无鉴权的服务不该确认隐藏端点存在 |
+| 计数器 **`reset=false`** | 传 `true` 会 `atomic_exchange` 清零，直接毁掉账本每次 A/B 依赖的臂分离（§105「requests 恒 2897、encoded 0 vs 2025」）。**读操作不允许减去证据** |
+| 实现独立成 `src/myds_debugstate.c`，由 `main.c` 函数指针注册 | 见下「三次接线」 |
+
+### 三次接线（前两次都失败，且是同一个错）
+
+1. **直接写进 `myds_server.c`** ⇒ 该文件新增对 knob 清单 / GPU 计数器 / Metal 路径的依赖，
+   打断 4 个 `include myds_server.c` 的轻量测试。
+   **这与当天早些时候 `record_effective` 引发的是同一个错误：给被广泛 include 的文件加依赖。**
+2. **改 `weak` / `weak_import`** ⇒ 本工具链下有强声明时解析失败，链接仍报未定义。
+3. **独立单元 + 函数指针注册** ⇒ 通过。「未链接」变成显式可观测状态（返回 404），不再是链接偶然。
+
+### 真机验证（macstudio，二进制 `6ce62f86…`）
+
+| 场景 | 结果 |
+|---|---|
+| 默认（开关关）本机请求 | **404**，日志 `(registered yes, switch off, loopback yes)` |
+| 开关开，本机请求 | **200**，三段齐全 `build/knobs/counters` |
+| 开关开，**从 macmini 局域网请求** | **404**，日志 `(registered yes, switch on, loopback no)` |
+| 同刻本机再请求（对照） | **200** |
+
+第三条是唯一能证明回环门的方式：同一台服务器、同一时刻，`192.168.88.4` 被拒、`127.0.0.1` 放行。
+
+返回体实测（开关开、本机）：
+
+```json
+{"build":{"binary_sha256":"6ce62f86…","metallib_sha256":"fe557933…","binary_path":"…/bin/myds"},
+ "knobs":{"known":237,"set":64,"unread":1},
+ "counters":{"indexer_register_only":{"requests":0,"encoded":0,…},"prefix_cache_len":0},
+ "state_capture":"point-in-time; prefix-cache miss reasons are log-only, not counted here"}
+```
+
+`binary_sha256` 与部署制品一致、`metallib_sha256` 与部署库一致 ⇒ 身份自证成立。
+
+### ★ 端点独立复现了死键
+
+`unread: 1` 不是工具 bug：**macstudio 的 `myfleet/myds.conf` 仍是旧版（`735e0dc7…`，63 键），
+其中第 109 行正是 §P0-1 那个死键 `MYDS_TOPK_THRESHOLD=1`。**
+新端点在完全独立的一条路径上（读 environ 对照清单）报出了同一个缺陷。
+macmini 侧的配置已删该键，macstudio 侧未同步（该仓库处于分叉状态，未擅自改动）。
+
+### 环境问题一：macstudio 缺 Metal 工具链
+
+`sync_myds.sh` 本次在 metallib 步骤失败：
+
+```
+error: cannot execute tool 'metal' due to missing Metal Toolchain;
+use: xcodebuild -downloadComponent MetalToolchain
+```
+
+`/Applications/Xcode.app/.../usr/bin/metal` 存在，但组件未下载（Xcode 27 把 metal 拆成可下载组件）。
+**这会阻塞任何触及 shader 的部署。** 本次未安装组件，改用可验证的绕法：
+本轮 diff 无任何 `.metal` 改动（`git diff --name-only 227ae371..HEAD | grep metal` 为空），
+故把已部署的 metallib 预置进 staging 目录并 `touch`，让 make 跳过重建；
+脚本随后**比对哈希**（`fe557933…` 前后一致）才继续。`bin/` 原子替换、`.deploy-prev` 快照照常。
+
+### 环境问题二：跨机工具链漂移，二进制不再逐字节相同
+
+| 机器 | clang |
+|---|---|
+| macmini | `Apple clang version 21.0.0 (clang-2100.3.34.2)` |
+| macstudio | `Apple clang version 21.0.0 (clang-2100.4.1.1)`（Xcode 27.2） |
+
+同一份源码（逐文件哈希一致）产出 **`0f6bdb41…` vs `6ce62f86…`**。
+⇒ §105.6「与 macmini 逐字节相同」的断言**已不再成立**，任何依赖该断言的对照需要重新表述。
+这不是缺陷，是口径必须更新：**同机可复现仍然成立，跨机不再成立。**
+
+### 边界
+
+HTTP 层已验；`/debug/state` **未**在生产配置下常开（保持默认关）。
+未在并发或长跑下观察其开销（实现为一次 environ 遍历 + 一次计数器读 + 两次文件哈希，
+其中文件哈希每次请求重算 —— **若将来频繁轮询，应改为启动时算一次**，当前未优化因为默认关闭）。

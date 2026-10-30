@@ -1,0 +1,4 @@
+{"kind": "loopback_200", "status": 200, "pass_": true, "sections": {"build": true, "knobs": true, "counters": true}, "body": "{\"build\":{\"binary_sha256\":\"6ce62f86923d370536343bb40fa680984b52e978d68d0c4fc1eea2cdc6d38116\",\"metallib_sha256\":\"fe55793346e15119fce4e0f40d4bf6d3023fc3694ffc231e66b8a89e3ae0f74d\",\"binary_path\":\"/Users/fangqingyuan/Projects/myds/bin/myds\"},\"knobs\":{\"known\":237,\"set\":64,\"unread\":1},\"counters\":{\"indexer_register_only\":{\"requests\":0,\"encoded\":0,\"fallbacks\":0,\"failures\":0,\"f32_dispatches\":0,\"bf16_dispatches\":0},\"prefix_cache_len\":0},\"state_capture\":\"point-in-time; prefix-cache miss reasons are log-only, not counted here\"}\n"}
+{"kind": "loopback_404_switch_off", "status": 404, "pass_": true, "body": "{\"error\":\"not found\"}"}
+{"kind": "note", "text": "LAN probe is issued by the caller from another host and appended separately"}
+{"kind": "teardown", "available_gb": 188.0, "failures": 0, "pass_": true}

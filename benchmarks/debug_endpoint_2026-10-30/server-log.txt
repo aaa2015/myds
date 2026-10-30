@@ -1,0 +1,6 @@
+[2026-10-30 15:45:58.472] [WARN] [127.0.0.1:59818] GET /debug/state -> 404 (registered yes, switch off, loopback yes)
+[2026-10-30 15:47:17.221] [INFO] [127.0.0.1:59839] GET /debug/state -> 200 OK
+[2026-10-30 15:47:17.249] [INFO] [127.0.0.1:59840] GET /debug/state -> 200 OK
+[2026-10-30 15:47:20.562] [INFO] [127.0.0.1:59842] GET /debug/state -> 200 OK
+[2026-10-30 15:47:23.439] [WARN] [192.168.88.4:57246] GET /debug/state -> 404 (registered yes, switch on, loopback no)
+[2026-10-30 15:47:23.521] [INFO] [127.0.0.1:59844] GET /debug/state -> 200 OK
