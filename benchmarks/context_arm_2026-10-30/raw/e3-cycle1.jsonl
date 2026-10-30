@@ -1,0 +1,26 @@
+{"kind": "plan", "cycles": 1, "arms": [{"arm": "A", "ctx": 1048576, "chunk_key_max": "1048576"}, {"arm": "B", "ctx": 1048576, "chunk_key_max": "524288"}, {"arm": "D", "ctx": 524288, "chunk_key_max": "524288"}, {"arm": "C", "ctx": 524288, "chunk_key_max": "1048576"}], "sizes": ["8k", "32k"], "samples": 2, "corpus": "/Users/fangqingyuan/Projects/myds/benchmarks/register_only_2026-10-27/prompts", "note": "C is expected to equal B via the key_max>max_comp clamp; disagreement between B and C voids the run", "binary_sha": "bbe8aa664f6a44f23a03782872d591cb68d584d81193c2a725e0f5933b590661"}
+{"kind": "boot", "cycle": 0, "arm": "A", "available_gb": 188.3, "startup_s": 8.0, "pid": 61829, "ctx_in_argv": "1048576", "chunk_key_max_in_env": "1048576", "ctx_expected": "1048576", "chunk_key_max_expected": "1048576"}
+{"kind": "sample", "cycle": 0, "arm": "A", "size": "8k", "sample": 0, "wall_s": 15.249, "prompt_file": "d_8k__v0.txt", "prompt_tok": 8100, "prefill_tok": 8099, "prefill_s": 15.2, "tps": 533.9, "cached": 0}
+{"kind": "sample", "cycle": 0, "arm": "A", "size": "8k", "sample": 1, "wall_s": 15.177, "prompt_file": "d_8k__v1.txt", "prompt_tok": 8100, "prefill_tok": 8099, "prefill_s": 15.1, "tps": 536.4, "cached": 0}
+{"kind": "sample", "cycle": 0, "arm": "A", "size": "32k", "sample": 0, "wall_s": 52.599, "prompt_file": "d_32k__v0.txt", "prompt_tok": 32243, "prefill_tok": 32242, "prefill_s": 52.5, "tps": 614.3, "cached": 0}
+{"kind": "sample", "cycle": 0, "arm": "A", "size": "32k", "sample": 1, "wall_s": 52.505, "prompt_file": "d_32k__v1.txt", "prompt_tok": 32243, "prefill_tok": 32242, "prefill_s": 52.4, "tps": 615.4, "cached": 0}
+{"kind": "decode", "cycle": 0, "arm": "A", "tokens": 160, "wall_s": 4.338, "ms_per_token": 27.11}
+{"kind": "boot", "cycle": 0, "arm": "B", "available_gb": 187.6, "startup_s": 8.0, "pid": 61871, "ctx_in_argv": "1048576", "chunk_key_max_in_env": "524288", "ctx_expected": "1048576", "chunk_key_max_expected": "524288"}
+{"kind": "sample", "cycle": 0, "arm": "B", "size": "8k", "sample": 0, "wall_s": 15.251, "prompt_file": "d_8k__v0.txt", "prompt_tok": 8100, "prefill_tok": 8099, "prefill_s": 15.2, "tps": 533.9, "cached": 0}
+{"kind": "sample", "cycle": 0, "arm": "B", "size": "8k", "sample": 1, "wall_s": 15.18, "prompt_file": "d_8k__v1.txt", "prompt_tok": 8100, "prefill_tok": 8099, "prefill_s": 15.1, "tps": 536.6, "cached": 0}
+{"kind": "sample", "cycle": 0, "arm": "B", "size": "32k", "sample": 0, "wall_s": 52.531, "prompt_file": "d_32k__v0.txt", "prompt_tok": 32243, "prefill_tok": 32242, "prefill_s": 52.4, "tps": 615.1, "cached": 0}
+{"kind": "sample", "cycle": 0, "arm": "B", "size": "32k", "sample": 1, "wall_s": 52.555, "prompt_file": "d_32k__v1.txt", "prompt_tok": 32243, "prefill_tok": 32242, "prefill_s": 52.4, "tps": 614.8, "cached": 0}
+{"kind": "decode", "cycle": 0, "arm": "B", "tokens": 160, "wall_s": 4.34, "ms_per_token": 27.13}
+{"kind": "boot", "cycle": 0, "arm": "D", "available_gb": 187.6, "startup_s": 8.0, "pid": 61889, "ctx_in_argv": "524288", "chunk_key_max_in_env": "524288", "ctx_expected": "524288", "chunk_key_max_expected": "524288"}
+{"kind": "sample", "cycle": 0, "arm": "D", "size": "8k", "sample": 0, "wall_s": 15.231, "prompt_file": "d_8k__v0.txt", "prompt_tok": 8100, "prefill_tok": 8099, "prefill_s": 15.2, "tps": 534.2, "cached": 0}
+{"kind": "sample", "cycle": 0, "arm": "D", "size": "8k", "sample": 1, "wall_s": 15.162, "prompt_file": "d_8k__v1.txt", "prompt_tok": 8100, "prefill_tok": 8099, "prefill_s": 15.1, "tps": 536.7, "cached": 0}
+{"kind": "sample", "cycle": 0, "arm": "D", "size": "32k", "sample": 0, "wall_s": 52.513, "prompt_file": "d_32k__v0.txt", "prompt_tok": 32243, "prefill_tok": 32242, "prefill_s": 52.4, "tps": 615.1, "cached": 0}
+{"kind": "sample", "cycle": 0, "arm": "D", "size": "32k", "sample": 1, "wall_s": 53.548, "prompt_file": "d_32k__v1.txt", "prompt_tok": 32243, "prefill_tok": 32242, "prefill_s": 53.4, "tps": 603.2, "cached": 0}
+{"kind": "decode", "cycle": 0, "arm": "D", "tokens": 160, "wall_s": 4.35, "ms_per_token": 27.19}
+{"kind": "boot", "cycle": 0, "arm": "C", "available_gb": 187.6, "startup_s": 8.0, "pid": 61910, "ctx_in_argv": "524288", "chunk_key_max_in_env": "1048576", "ctx_expected": "524288", "chunk_key_max_expected": "1048576"}
+{"kind": "sample", "cycle": 0, "arm": "C", "size": "8k", "sample": 0, "wall_s": 16.339, "prompt_file": "d_8k__v0.txt", "prompt_tok": 8100, "prefill_tok": 8099, "prefill_s": 16.3, "tps": 497.9, "cached": 0}
+{"kind": "sample", "cycle": 0, "arm": "C", "size": "8k", "sample": 1, "wall_s": 15.167, "prompt_file": "d_8k__v1.txt", "prompt_tok": 8100, "prefill_tok": 8099, "prefill_s": 15.1, "tps": 536.6, "cached": 0}
+{"kind": "sample", "cycle": 0, "arm": "C", "size": "32k", "sample": 0, "wall_s": 52.779, "prompt_file": "d_32k__v0.txt", "prompt_tok": 32243, "prefill_tok": 32242, "prefill_s": 52.7, "tps": 612.0, "cached": 0}
+{"kind": "sample", "cycle": 0, "arm": "C", "size": "32k", "sample": 1, "wall_s": 52.681, "prompt_file": "d_32k__v1.txt", "prompt_tok": 32243, "prefill_tok": 32242, "prefill_s": 52.6, "tps": 613.1, "cached": 0}
+{"kind": "decode", "cycle": 0, "arm": "C", "tokens": 160, "wall_s": 4.346, "ms_per_token": 27.16}
+{"kind": "teardown", "available_gb": 187.6}
