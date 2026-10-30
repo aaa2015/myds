@@ -2,6 +2,7 @@
  * See include/myds_debugstate.h for why it is a separate translation unit. */
 #include "myds_debugstate.h"
 #include "myds.h"
+#include "myds_steer.h"
 #include "myds_knobs.h"
 #include "myds_v41_gpu.h"
 #include "myds_metal.h"
@@ -251,6 +252,17 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          (unsigned long long)ro.fallbacks, (unsigned long long)ro.failures,
          (unsigned long long)ro.f32_dispatches, (unsigned long long)ro.bf16_dispatches,
          ctx ? myds_context_get_pcache_len(ctx) : 0u);
+
+    const myds_steer_t *st = ctx ? myds_context_get_steer(ctx) : NULL;
+    if (st) {
+        EMIT("\"steer\":{\"enabled\":%s,\"active_profile\":\"%s\",\"alpha\":%.3f,\"mode\":%u},",
+             st->enabled ? "true" : "false",
+             st->name,
+             (double)st->alpha_effective,
+             (unsigned)st->mode);
+    } else {
+        EMIT("\"steer\":null,");
+    }
 
     EMIT("\"state_capture\":\"point-in-time; prefix-cache miss reasons are log-only, "
          "not counted here\"}\n");

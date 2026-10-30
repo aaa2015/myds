@@ -152,8 +152,8 @@ ALL_TESTS += $(TEST_DEBUG_STATE)
 ALL_TESTS += $(TEST_STEER)
 
 TEST_STEER = $(BIN_DIR)/test_steer
-$(TEST_STEER): tests/test_steer.c $(BUILD_DIR)/myds_steer.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
-	$(CC) $(CFLAGS) -Iinclude -o $@ $< $(BUILD_DIR)/myds_steer.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_log.o $(LDFLAGS)
+$(TEST_STEER): tests/test_steer.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
+	$(CC) $(CFLAGS) -Iinclude -o $@ tests/test_steer.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS)
 
 # CPU-only: exercises the request_phases formatter. A printf whose argument types
 # drift from its format string compiles cleanly and emits unparsable JSON, which a

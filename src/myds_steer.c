@@ -9,7 +9,7 @@
 #include <string.h>
 #include <ctype.h>
 
-static void parse_layer_filter(const char *filter, bool *mask, uint32_t max_layers) {
+void myds_steer_parse_layer_filter(const char *filter, bool *mask, uint32_t max_layers) {
     for (uint32_t i = 0; i < max_layers; i++) mask[i] = true;
     if (!filter || !*filter || strcmp(filter, "all") == 0 || strcmp(filter, "auto") == 0) return;
 
@@ -23,7 +23,7 @@ static void parse_layer_filter(const char *filter, bool *mask, uint32_t max_laye
     char *token = strtok_r(buf, ",", &saveptr);
     while (token) {
         while (*token && isspace((unsigned char)*token)) token++;
-        char *dash = strchr(token, '-');
+        char *dash = strchr(token[0] == '-' ? token + 1 : token, '-');
         if (dash) {
             *dash = '\0';
             int start = atoi(token);
@@ -94,7 +94,7 @@ myds_steer_t *myds_steer_load(const char *path, float alpha_override,
 
     /* 3. Layer Filter */
     bool allowed_layers[MYDS_STEER_MAX_LAYERS];
-    parse_layer_filter(layers_filter, allowed_layers, MYDS_STEER_MAX_LAYERS);
+    myds_steer_parse_layer_filter(layers_filter, allowed_layers, MYDS_STEER_MAX_LAYERS);
 
     /* 4. Load Direction Tensors */
     uint32_t min_active = MYDS_STEER_MAX_LAYERS, max_active = 0;
@@ -156,6 +156,7 @@ myds_steer_t *myds_steer_load(const char *path, float alpha_override,
 
 void myds_steer_free(myds_steer_t *st) {
     if (!st) return;
+    MYDS_LOG_I("GLP steer: releasing profile [%s] (%s)", st->name, st->path);
     for (uint32_t l = 0; l < MYDS_STEER_MAX_LAYERS; l++) {
         if (st->directions[l]) {
             myds_metal_buffer_free(st->directions[l]);
@@ -168,6 +169,7 @@ void myds_steer_free(myds_steer_t *st) {
 
 void myds_steer_set_alpha(myds_steer_t *st, float alpha) {
     if (!st) return;
+    float old_alpha = st->alpha_effective;
     if (alpha >= 0.0f) {
         st->alpha_effective = alpha;
         st->alpha_override = alpha;
@@ -175,9 +177,13 @@ void myds_steer_set_alpha(myds_steer_t *st, float alpha) {
         st->alpha_effective = st->alpha_default;
         st->alpha_override = -1.0f;
     }
+    MYDS_LOG_I("GLP steer [%s]: alpha changed %.3f -> %.3f", st->name, old_alpha, st->alpha_effective);
 }
 
 void myds_steer_set_enabled(myds_steer_t *st, bool enabled) {
     if (!st) return;
-    st->enabled = enabled;
+    if (st->enabled != enabled) {
+        st->enabled = enabled;
+        MYDS_LOG_I("GLP steer [%s]: %s (alpha=%.3f)", st->name, enabled ? "ENABLED" : "DISABLED", st->alpha_effective);
+    }
 }

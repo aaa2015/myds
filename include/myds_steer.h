@@ -47,6 +47,9 @@ typedef struct myds_steer {
 myds_steer_t *myds_steer_load(const char *path, float alpha_override,
                               myds_steer_mode_t mode, const char *layers_filter);
 
+/* Parse layer filter string (e.g. "11-37", "1,5,10-15", "all") into mask. */
+void myds_steer_parse_layer_filter(const char *filter, bool *mask, uint32_t max_layers);
+
 /* Free steer instance and its metal buffers. */
 void myds_steer_free(myds_steer_t *st);
 

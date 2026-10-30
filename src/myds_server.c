@@ -4540,12 +4540,20 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             snprintf(prefill_str, sizeof(prefill_str), "%u tok in %.1fs = %.1f t/s (cached %u)",
                      pf.prefill_tokens, pf.prefill_seconds, pf_tps, pf.cached_tokens);
         }
+        char steer_summary[64] = "";
+        if (ctx && ctx->steer && ctx->steer->enabled && ctx->steer->alpha_effective > 0.0f) {
+            snprintf(steer_summary, sizeof(steer_summary), ", steer: %s(a=%.2f)",
+                     ctx->steer->name, ctx->steer->alpha_effective);
+        } else if (ctx && ctx->steer && !ctx->steer->enabled) {
+            snprintf(steer_summary, sizeof(steer_summary), ", steer: disabled");
+        }
+
         MYDS_LOG_I("[%s:%d] Completed %s %s - prompt: %u tok, prefill: %s, ttft: %.1fs, "
-                   "decode: %u tok in %.1fs = %.1f t/s, wall: %.1fs (infer %.1fs, queue %.1fs), finish_reason: %s",
+                   "decode: %u tok in %.1fs = %.1f t/s, wall: %.1fs (infer %.1fs, queue %.1fs), finish_reason: %s%s",
                    client_ip, client_port,
                    is_responses_endpoint ? "Responses" : "ChatCompletions",
                    path, prompt_tokens, prefill_str, ttft_s,
-                   final_tokens, decode_s, decode_tps, wall_s, infer_s, queue_s, final_finish_str);
+                   final_tokens, decode_s, decode_tps, wall_s, infer_s, queue_s, final_finish_str, steer_summary);
         if (phases) {
             /* One machine-readable line, emitted only under MYDS_REQUEST_PHASES=1.
              *
