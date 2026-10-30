@@ -15232,8 +15232,11 @@ macmini 上连续两次**干净构建**（独立 `BUILD_DIR`）均为 `6ce62f86�
 > 拿一个真实 `.metal` 文件执行 `xcrun -sdk macosx metal -c` 报
 > `cannot execute tool 'metal' due to missing Metal Toolchain`。
 > 此前那次「只出 warning 就通过」的探测用的是 `/dev/null` 作输入，没有真正调用编译器。
-> ⇒ **两台机器都缺**；macmini 至今没有任何机器能重编 shader 本地验证，
-> `make test` 在 macmini 上之所以通过，是因为 metallib 是预置的（不重建）。
+> ⇒ **当时两台机器都缺**；`make test` 在 macmini 上之所以通过，是因为 metallib 是预置的。
+>
+> ✅ **2026-10-31 已解决（§130）**：macmini 执行
+> `xcodebuild -downloadComponent MetalToolchain`（838.9 MB，`Metal Toolchain 27B47`），
+> 之后真实 `.metal` 编译通过（3,264 B `.air`）。**两台机器现在都能重编 shader。**
 因此 macmini 的**默认**构建仍是旧 clang；要产出与 macstudio 一致的制品，
 必须显式 `DEVELOPER_DIR=/Library/Developer/CommandLineTools`。
 
@@ -16126,3 +16129,141 @@ smallest top1−top2 margin: 0.001839 at pos-000025
 窗口内停机约 3 分钟，结束后独立 verify **PASS**。
 原始数据：`benchmarks/debug_endpoint_2026-10-30/jit-vs-cache-diff.jsonl`、
 `jit-vs-cache-analysis.txt`（含分桶与 argmax 比对）。
+
+---
+
+## §129 同机反代验证：前提不成立，但暴露面另有问题（2026-10-31）
+
+**三条结论：① 这台机器没有反向代理，§123 的"同机反代绕过"对当前部署不适用；
+② 令牌门在该场景下仍然有效（5/5，代理剥令牌被拒）；③ 真正的暴露面是推理端点本身
+——无鉴权、监听所有接口、防火墙关闭。**
+
+### ① 先纠正我自己的前提
+
+§123 说「同机反代连进来就是 127.0.0.1 ⇒ 回环门失效」。实测拓扑：
+
+| 项 | 结果 |
+|---|---|
+| 8187 监听 | `myds` 直接绑 `*:8187`（**所有接口**） |
+| 反向代理 | **无**（nginx/caddy/haproxy/traefik/envoy 全部未运行） |
+| 防火墙 | **关闭**（`socketfilterfw --getglobalstate` = 0） |
+| 隧道/端口转发 | 无 |
+| 地址 | `192.168.88.192`（私网） |
+
+**没有反代，那条绕过路径不存在。** §123 的分析在假设成立时是对的，
+但在这个部署上属于**防御一个不存在的场景**。这本身是记账价值：
+以后再看这一节，能立刻知道防护的必要性取决于是否引入反代。
+
+### ② 令牌门在该场景下确实有效（5/5）
+
+用 Python 转发代理监听 18187、转发到 `127.0.0.1:8187`——
+**服务端看到的 peer 就是 127.0.0.1**，正是 §123 描述的条件：
+
+| 检查 | 结果 |
+|---|---|
+| 直连 + 令牌 | 200 |
+| 直连无令牌 | 404 |
+| **经代理、代理不转发令牌** | **404** |
+| **经代理、代理转发令牌** | **200** |
+| 经代理 + 错误令牌 | 404 |
+
+**代理剥掉令牌时被拒** ⇒ 门要求的是凭证，不是来源地址。即使将来加反代，防护仍成立。
+
+### ③ 测试自身的 bug（被测试自己抓到）
+
+第一轮 `proxy_wrong_token_refused` 返回 200 判 FAIL。查明是**我的用例写错了**：
+"错误令牌"字面量恰好等于正确令牌（都是 3 字符），而工具输出把两者都脱敏成 `***`，
+肉眼无法区分。改为 `WRONG_TOKEN = TOKEN + "-but-longer"` 程序化派生后 5/5 通过。
+
+**这不是门的漏洞。** 但它与 §121 同类：负向用例没有构造出差异，
+就会给出干净的假结论——区别只是这次它报了 FAIL 而不是 PASS。
+
+### ④ 真正的暴露面
+
+从 macmini（同网段另一台）实测：
+
+```
+GET  /v1/models           -> 200
+GET  /debug/state         -> 404   (默认关闭，正确)
+POST /v1/chat/completions -> 200   {"content":"OK"}
+```
+
+**推理端点无鉴权、绑定所有接口、防火墙关闭。** 同网段任何人都能用这台机器的模型。
+「跑了几个月没有反馈」与这个状态一致：它是**一直如此**，且网段是私网。
+
+这不改变 `/debug/state` 的结论（它现在是安全的），但要指出防护的次序问题：
+**给一扇已经敞开的门再加一把锁，不产生新的安全性。**
+
+### 建议（按成本排序，未执行）
+
+1. **8187 绑定改回 `127.0.0.1`**，需要 LAN 访问时走反代（带令牌）。
+   这是唯一能真正限制"谁能用模型"的动作。
+2. 打开防火墙，只放行必要端口。
+3. `/debug/state` 维持默认关闭（现状）。
+
+### 边界
+
+本轮只做了**拓扑确认**与代理门的组件验证；未修改任何网络配置或绑定地址，
+未做真实的 nginx/caddy 部署测试（用同等拓扑的转发代理代替）。
+生产窗口内停机约 5 分钟，结束后独立 verify **PASS**。
+原始数据：`benchmarks/debug_endpoint_2026-10-30/proxy-gate.jsonl`。
+
+---
+
+## §130 macmini Metal 工具链补齐（2026-10-31）
+
+**结论：macmini 执行 `xcodebuild -downloadComponent MetalToolchain` 后，
+真实 `.metal` 编译通过。§117/§121 记录的「macmini 无 metal」不再成立。**
+
+### 做了什么
+
+```
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  xcodebuild -downloadComponent MetalToolchain
+→ 838.9 MB, Metal Toolchain 27B47
+```
+
+验证方式与之前那次失败探测不同：**用真实 `.metal` 文件**，不是 `/dev/null`：
+
+```
+xcrun -sdk macosx metal -c m.metal -o m.air   → exit 0, 3,264 B
+```
+
+（§117 那次探测「只出 warning 就通过」是因为输入是 `/dev/null`，
+从未真正调用编译器——这条教训已写在该节。）
+
+### 现在的状态
+
+| | 编译 metallib | 说明 |
+|---|---|---|
+| macstudio | 可（§124 起） | 部署侧，`sync_myds.sh` 用它 |
+| **macmini** | **可（本节）** | 权威侧，可本地验证 shader 改动 |
+
+⇒ 现在可以**在权威侧（macmini）本地重建 metallib 并跑 `make test`**，
+不再依赖预置件。这消除了一个隐患：此前 macmini 的 `make test`
+从未真正重建过 metallib，通过与否取决于仓里那份预置文件是否与源码匹配。
+
+### 仍未对齐的一处（性质已变，但依然存在）
+
+两台的**默认** clang 仍不同：
+
+| | 默认 `xcrun` 路径 | clang |
+|---|---|---|
+| macmini | `/Applications/Xcode.app`（27.1） | `2100.3.34.2` |
+| macstudio | 部署脚本用 `DEVELOPER_DIR=Xcode.app`（27.2） | `2100.4.1.1` |
+
+macmini 的 CLT 27.2 提供 `2100.4.1.1` + SDK 27.2，与 macstudio 一致（§117 实测
+两者产出同一个 binary `6ce62f86…`），但需要显式
+`DEVELOPER_DIR=/Library/Developer/CommandLineTools`。
+
+**这次没有改 `xcode-select`**：之前不改的理由是「切到 CLT 会让 macmini 没有 metal」，
+现在这个理由**不再成立**（metal 组件装在哪里需要确认）。但改 `xcode-select`
+是系统级变更，会影响这台机器上所有编译，**不在本轮范围内**——
+§117 的结论（跨机一致性需同时钉 clang 与 SDK）仍然适用，
+`make check-toolchain` 就是用来钉这个的。
+
+### 边界
+
+只验证了 metal 编译器可用；**未在 macmini 上跑完整 `make BIN_DIR=... all`**，
+也未比对 macmini 与 macstudio 在同工具链下的 metallib 是否逐字节一致——
+后者需要 macmini 也装 Xcode 27.2（`softwareupdate` 只提供 CLT 27.2），未做。

@@ -1,0 +1,7 @@
+{"detail": "direct loopback with token", "kind": "check", "name": "direct_with_token", "pass_": true}
+{"detail": "direct loopback without token", "kind": "check", "name": "direct_without_token", "pass_": true}
+{"detail": "proxy stripped the token; status=404 (peer seen as 127.0.0.1 (connection made by the proxy process))", "kind": "check", "name": "proxy_without_forward_refused", "pass_": true}
+{"detail": "proxy forwarded the token; status=200", "kind": "check", "name": "proxy_with_forward_accepted", "pass_": true}
+{"detail": "wrong token through proxy; status=404", "kind": "check", "name": "proxy_wrong_token_refused", "pass_": true}
+{"kind": "premise", "note": "the forwarder connects to 127.0.0.1, so the server observes a loopback peer for a request that originated elsewhere -- the exact condition ledger \u00a7123 describes", "observed": "127.0.0.1 (connection made by the proxy process)"}
+{"available_gb": 182.7, "failures": 0, "kind": "teardown", "pass_": true}
