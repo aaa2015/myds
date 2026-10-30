@@ -141,6 +141,37 @@ def _(root):
          f"restore did not append to the original log: {kwargs.get('stdout')}")
 
 
+@case("memory_release_gate_refuses_to_spawn_early")
+def _(root):
+    """The gate must block while the old mapping is still resident.
+
+    Spawning a replacement into an unreleased 362 GB mapping is the documented
+    panic shape on this machine, so the failure mode is what this pins.
+    """
+    readings = iter([20.0, 40.0, 80.0])
+    original = module.available_gib
+    module.available_gib = lambda: next(readings, 80.0)
+    try:
+        try:
+            module.wait_for_memory_release(150.0, 0.15)
+        except RuntimeError as exc:
+            need('refusing to spawn' in str(exc), f'unexpected message: {exc}')
+        else:
+            raise AssertionError('gate allowed a spawn before memory was released')
+    finally:
+        module.available_gib = original
+
+    # And it returns as soon as the threshold is met, so a healthy stop is not slowed.
+    readings = iter([149.0, 151.0])
+    module.available_gib = lambda: next(readings, 151.0)
+    try:
+        released, samples = module.wait_for_memory_release(150.0, 5.0)
+    finally:
+        module.available_gib = original
+    need(released >= 150.0, f'released {released}')
+    need(samples[-1] >= 150.0, f'samples {samples}')
+
+
 def main():
     results = []
     with tempfile.TemporaryDirectory(prefix="myds-window-nice-cpu-") as temp:

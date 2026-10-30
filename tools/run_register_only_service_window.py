@@ -10,6 +10,7 @@ import ctypes
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import struct
@@ -126,12 +127,6 @@ def process_cwd(pid):
     return Path(names[0]).resolve()
 
 
-def process_nice(pid):
-    raw = query('ps', '-p', str(pid), '-o', 'nice=')
-    need(raw.lstrip('-').isdigit(), 'cannot read process niceness')
-    return int(raw)
-
-
 def stdio_targets(pid):
     """fd 0/1/2 -> absolute path, None when that descriptor is not a file.
 
@@ -148,6 +143,55 @@ def stdio_targets(pid):
             found[fd] = row[1:]
             fd = None
     return {key: found.get(key) for key in ('0', '1', '2')}
+
+
+def process_nice(pid):
+    raw = query('ps', '-p', str(pid), '-o', 'nice=')
+    need(raw.lstrip('-').isdigit(), 'cannot read process niceness')
+    return int(raw)
+
+
+def process_rss_gib(pid):
+    raw = query('ps', '-p', str(pid), '-o', 'rss=')
+    need(raw.isdigit(), 'cannot read process resident size')
+    return int(raw) / float(1 << 20)
+
+
+def available_gib():
+    """free + inactive + speculative, in GiB -- the same quantity start_fleet.sh
+    uses for its launch threshold."""
+    stats = {}
+    for line in query('vm_stat').splitlines():
+        match = re.match(r'Pages (free|inactive|speculative):\s+(\d+)', line)
+        if match:
+            stats[match.group(1)] = int(match.group(2))
+    need(set(stats) == {'free', 'inactive', 'speculative'},
+         'vm_stat available-memory counters missing')
+    return sum(stats.values()) * 16384 / float(1 << 30)
+
+
+def wait_for_memory_release(min_gib, timeout):
+    """Wait until the stopped process's mappings are actually reclaimed.
+
+    The PID disappears long before the kernel finishes tearing down a 362 GB
+    mapping. Spawning the replacement immediately is how this machine panicked
+    twice (myfleet/start_fleet.sh documents both: 2026-10-18 had two myds
+    processes paging in the same weights). The observable that matters is free
+    memory, not process existence, so that is what this waits on.
+    """
+    observed = []
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        available = available_gib()
+        observed.append(round(available, 1))
+        if available >= min_gib:
+            return available, observed
+        time.sleep(2.0)
+    raise RuntimeError(
+        'available memory did not return to %.1f GiB within %.0fs (observed %s); '
+        'refusing to spawn a replacement while the old mapping may still be resident '
+        '-- the service is stopped, run myfleet/start_fleet.sh once memory is back'
+        % (min_gib, timeout, observed[-6:]))
 
 
 def processes():
@@ -227,6 +271,11 @@ class Window:
              argv[positions[0] + 1] == str(a.port), 'original port differs')
         nice = process_nice(a.pid)
         stdio = stdio_targets(a.pid)
+        # Self-calibrating release threshold: whatever this process holds resident
+        # has to come back before a replacement may start. No magic number.
+        available_before = available_gib()
+        resident_gib = process_rss_gib(a.pid)
+        release_target = available_before + 0.9 * resident_gib
         need(processes() == [(a.pid, 'myds')], 'other inference work prevents exclusive window')
         start = query('ps', '-p', str(a.pid), '-o', 'lstart=')
         # Match the precompiled library search paths used by myds_metal_init
@@ -264,7 +313,10 @@ class Window:
                 ensure_ascii=True, separators=(',', ':')).encode()).hexdigest(),
             MYDS_environment={k: v for k, v in env.items() if k.startswith('MYDS_')},
             identities=identities, experiment_command=a.command,
-            nice=nice, stdio=stdio)
+            nice=nice, stdio=stdio,
+            available_before_gib=round(available_before, 1),
+            resident_gib=round(resident_gib, 1),
+            release_target_gib=round(release_target, 1))
         self.persist(critical=True); self.verify()
         need(process_arguments(a.pid) == captured and
              query('ps', '-p', str(a.pid), '-o', 'lstart=') == start,
@@ -337,6 +389,15 @@ class Window:
         self.drain_experiment(); self.wait_original_exit(); self.verify()
         remaining = processes()
         need(not remaining, f'unknown inference processes remain; no signals sent: {remaining}')
+        # The PID exits long before the kernel finishes releasing a multi-hundred-
+        # gigabyte mapping. Wait on memory, which is the thing that matters.
+        target = float(self.state.get('release_target_gib') or 0)
+        if target > 0:
+            released, samples = wait_for_memory_release(
+                target, getattr(self.a, 'memory_timeout', 240.0))
+            self.state['memory_released_gib'] = round(released, 1)
+            self.state['memory_samples'] = samples[-8:]
+            self.persist()
         # Re-create the original stdio instead of pointing it at private evidence
         # files: the restored process is equivalent only if it writes where the
         # stopped one wrote. The paths and their digests are kept as evidence.
@@ -456,6 +517,8 @@ def main(argv=None):
     p.add_argument('--drain-timeout', type=float, default=75,
                    help='owned experiment cleanup budget, separate from original service stop')
     p.add_argument('--restore-timeout', type=float, default=120)
+    p.add_argument('--memory-timeout', type=float, default=240,
+                   help='budget for the stopped mapping to be reclaimed before restore')
     p.add_argument('command', nargs=argparse.REMAINDER)
     args = p.parse_args(argv)
     args.command = args.command[1:] if args.command[:1] == ['--'] else args.command
