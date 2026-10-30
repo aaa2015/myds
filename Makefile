@@ -83,6 +83,7 @@ TEST_SERVER = $(BIN_DIR)/test_server
 TEST_LOG = $(BIN_DIR)/test_log
 TEST_SERVER_API = $(BIN_DIR)/test_server_api
 TEST_PROMPT_RENDER_BOUNDS = $(BIN_DIR)/test_prompt_render_bounds
+TEST_REQUEST_PHASES_JSON = $(BIN_DIR)/test_request_phases_json
 TEST_ENGINE = $(BIN_DIR)/test_engine
 TEST_CPU = $(BIN_DIR)/test_cpu
 TEST_ENGRAM = $(BIN_DIR)/test_engram
@@ -143,6 +144,13 @@ $(TEST_GGUF_BYTE_SPLIT): tests/test_gguf_byte_split.c $(BUILD_DIR)/myds_gguf.o |
 ALL_TESTS += $(TEST_METAL_RESIDENCY) $(TEST_TEARDOWN_ORDER) $(TEST_DECODE_SPLIT) $(TEST_KVDSK_FIFO) $(TEST_ANCHOR_SLOTS) $(TEST_YOCO_COMPACT) $(TEST_INDEXER_WINDOW) $(TEST_GGUF_BOUNDS) $(TEST_GGUF_SPLIT) $(TEST_GGUF_BYTE_SPLIT)
 ALL_TESTS += $(TEST_TOKENIZER_WORKSPACE)
 ALL_TESTS += $(TEST_PROMPT_RENDER_BOUNDS)
+ALL_TESTS += $(TEST_REQUEST_PHASES_JSON)
+
+# CPU-only: exercises the request_phases formatter. A printf whose argument types
+# drift from its format string compiles cleanly and emits unparsable JSON, which a
+# parser then drops silently -- so "it compiled" is not evidence.
+$(TEST_REQUEST_PHASES_JSON): tests/test_request_phases_json.c src/myds_server.c $(wildcard include/*.h) $(BUILD_DIR)/myds_log.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) $< $(BUILD_DIR)/myds_log.o $(LDFLAGS) -Wl,-dead_strip -o $@
 
 .PHONY: all test clean bench metallib build-tail-init test-tail-init test-indexer-register-only-host test-register-only-http-bridge test-register-only-service-window audit-ledger gen-ledger bench-register-only corpus-check verify-register-only check-knobs
 
@@ -740,6 +748,7 @@ test: check-knobs $(ALL_TESTS) $(METALLIB)
 	@echo ""
 	@./$(TEST_SERVER_API)
 	@./$(TEST_PROMPT_RENDER_BOUNDS)
+	@python3 tests/test_request_phases_json.py ./$(TEST_REQUEST_PHASES_JSON)
 	@echo ""
 	@./$(TEST_ENGINE)
 	@echo ""

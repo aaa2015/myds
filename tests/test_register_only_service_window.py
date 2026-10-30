@@ -83,6 +83,12 @@ class WindowTests(unittest.TestCase):
             return 'frozen start'
         if args[0] == 'lsof' and '-sTCP:LISTEN' in args:
             return 'p900003\nf1'
+        # stdio capture: an empty answer means "no descriptor resolves to a file",
+        # which selects the fallback branch. The branch that reuses the original
+        # stdio targets is covered by tools/test_run_service_window_nice_cpu.py
+        # against real files.
+        if args[0] == 'lsof' and '-d' in args and '0,1,2' in args:
+            return ''
         raise AssertionError('unexpected real query: ' + repr(args))
 
     def popen(self, command, **kwargs):
@@ -92,6 +98,11 @@ class WindowTests(unittest.TestCase):
         return child
 
     def run_window(self, popen=None, writer=None, capture=None):
+        # available_gib/process_rss_gib are pinned so the released-memory gate
+        # cannot block here: a resident size of 0 makes the target equal the
+        # pre-stop reading, satisfied on the first sample. The gate's own logic is
+        # exercised with injected readings in
+        # tools/test_run_service_window_nice_cpu.py.
         output = io.StringIO()
         response = io.StringIO('{"status":"ok"}'); response.status = 200
         with mock.patch.object(m, 'process_arguments', side_effect=capture or (lambda pid: copy.deepcopy(self.captured))), \
@@ -101,6 +112,8 @@ class WindowTests(unittest.TestCase):
              mock.patch.object(m.os, 'kill', side_effect=self.kill) as kill, \
              mock.patch.object(m.subprocess, 'run', return_value=types.SimpleNamespace(returncode=1, stdout='')), \
              mock.patch.object(m.subprocess, 'Popen', side_effect=popen or self.popen), \
+             mock.patch.object(m, 'available_gib', return_value=200.0), \
+             mock.patch.object(m, 'process_rss_gib', return_value=0.0), \
              mock.patch.object(m.urllib.request, 'urlopen', return_value=response), \
              mock.patch.object(m.time, 'sleep'), \
              mock.patch.object(m.signal, 'signal'), \

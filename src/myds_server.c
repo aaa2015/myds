@@ -2558,6 +2558,64 @@ void myds_free_tool_calls(myds_tool_call_t *calls, size_t count) {
     free(calls);
 }
 
+/* MYDS_REQUEST_PHASES=1 prints one JSON line per finished request with the
+ * server-side stage split (queue / render / setup / engine). Parsed once: this
+ * sits on the request path and a getenv per request is avoidable noise.
+ *
+ * Deliberately only clock_gettime around existing boundaries. Ledger §B.3: the
+ * instrumentation must not perturb what it measures, so nothing here inserts a
+ * command buffer or forces a commit inside the engine. */
+static bool myds_server_request_phases_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *value = getenv("MYDS_REQUEST_PHASES");
+        cached = (value && *value && strcmp(value, "0") != 0) ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+/* Build the request_phases JSON body. Pure formatting so it can be unit-tested
+ * without a model: a printf whose argument types drift from the format string
+ * compiles fine and produces unparsable output, which is worse than no logging.
+ *
+ * Every unavailable stage is emitted as null rather than 0.0 -- a printed 0.0 is
+ * indistinguishable from "measured, took no time", and that is how a fabricated
+ * number reaches a ledger. */
+typedef struct {
+    double queue_s;
+    double render_s;      /* < 0 => not measured */
+    double setup_s;       /* < 0 => not measured */
+    double engine_s;      /* < 0 => not measured */
+    double prefill_s;     /* < 0 => not measured */
+    double decode_s;      /* < 0 => not measured */
+    double unattributed_s;
+    uint32_t prompt_tokens;
+    uint32_t cached_tokens;
+    uint32_t out_tokens;
+    int stream;
+} myds_request_phases_t;
+
+static void myds_request_phases_json(const myds_request_phases_t *p, char *out, size_t cap) {
+    char render[32] = "null", setup[32] = "null", engine[32] = "null";
+    char prefill[32] = "null", decode[32] = "null", unattr[32] = "null";
+    if (p->render_s >= 0.0) snprintf(render, sizeof(render), "%.6f", p->render_s);
+    if (p->setup_s >= 0.0) snprintf(setup, sizeof(setup), "%.6f", p->setup_s);
+    if (p->engine_s >= 0.0) snprintf(engine, sizeof(engine), "%.6f", p->engine_s);
+    if (p->prefill_s >= 0.0) snprintf(prefill, sizeof(prefill), "%.6f", p->prefill_s);
+    if (p->decode_s >= 0.0) snprintf(decode, sizeof(decode), "%.6f", p->decode_s);
+    /* Negative is meaningful here (t_last precedes the engine's return), so it is
+     * printed as-is; only NaN means "could not be computed" and becomes null. */
+    if (p->unattributed_s == p->unattributed_s)
+        snprintf(unattr, sizeof(unattr), "%.6f", p->unattributed_s);
+    snprintf(out, cap,
+             "{\"queue\":%.6f,\"render\":%s,\"setup\":%s,\"engine\":%s,"
+             "\"prefill\":%s,\"decode\":%s,\"engine_unattributed\":%s,"
+             "\"prompt_tok\":%u,\"cached_tok\":%u,\"out_tok\":%u,\"stream\":%s}",
+             p->queue_s, render, setup, engine, prefill, decode, unattr,
+             p->prompt_tokens, p->cached_tokens, p->out_tokens,
+             p->stream ? "true" : "false");
+}
+
 static inline double myds_server_now_s(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -3469,6 +3527,11 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         const double t_arrive = t_start;
         double t_first = 0.0;
         double t_last = 0.0;
+        /* Stage boundaries for MYDS_REQUEST_PHASES. All zero when the switch is
+         * off, so the emission code can detect "not measured" instead of
+         * reporting a plausible-looking 0.0 s. */
+        const bool phases = myds_server_request_phases_enabled();
+        double t_render_begin = 0.0, t_render_end = 0.0, t_generate_begin = 0.0;
 
         /* Find body start and read complete body */
         char *body = strstr(req_buf, "\r\n\r\n");
@@ -3724,9 +3787,11 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         }
 
         const char *parse_reason = NULL;
+        if (phases) t_render_begin = myds_server_now_s();
         const bool parsed_ok = is_continuation
             ? parse_chat_prompt_suffix_vis(body, prompt, prompt_cap, &parse_reason, &img_sink)
             : parse_chat_prompt_vis(body, prompt, prompt_cap, &parse_reason, &img_sink);
+        if (phases) t_render_end = myds_server_now_s();
         if (!parsed_ok) {
             MYDS_LOG_W("[%s:%d] rejected (400): %s%s%s [body=%zd bytes, prompt_cap=%zu]",
                        client_ip, client_port, parse_reason,
@@ -3885,6 +3950,11 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
 
         bool transport_ok = true;
         const bool req_thinking = extract_request_thinking_mode(body, g_server_default_thinking);
+        /* Everything from here to the engine call is setup: config application,
+         * image-embedding injection, response-header construction. E1 needs this
+         * split because the short-prompt intercept may not be prefill at all.
+         * The setup interval is t_render_end -> t_generate_begin, so no separate
+         * timestamp is needed here. */
         if (stream) {
             /* 2026-10-25: SSE 也要尊重 CORS 设置。origin 为空时整行省略。 */
             char sse_header_buf[768];
@@ -3939,6 +4009,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 sctx.cancel_flag = 1;
                 if (!sctx.writer) sctx.failed = true;
             }
+            if (phases) t_generate_begin = myds_server_now_s();
             int generated = !sctx.cancel_flag && myds_generate_bytes_ex(ctx, prompt, myds_server_sse_callback, &sctx,
                                                                        &stop_reason, &prompt_tokens, &sctx.cancel_flag);
             myds_context_clear_image_embeddings(ctx); myds_vjob_sink_free(&img_sink);
@@ -4097,6 +4168,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             free(sctx.acc); sctx.acc = NULL;   /* 每请求一份累积缓冲，必须释放 */
         } else {
             myds_non_stream_ctx_t ns = {.client_fd = client_fd};
+            if (phases) t_generate_begin = myds_server_now_s();
             int generated = myds_generate_bytes_ex(ctx, prompt, myds_server_non_stream_callback, &ns,
                                                    &stop_reason, &prompt_tokens, &ns.cancel_flag);
             myds_context_clear_image_embeddings(ctx); myds_vjob_sink_free(&img_sink);
@@ -4327,6 +4399,52 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                    is_responses_endpoint ? "Responses" : "ChatCompletions",
                    path, prompt_tokens, prefill_str, ttft_s,
                    final_tokens, decode_s, decode_tps, wall_s, infer_s, queue_s, final_finish_str);
+        if (phases) {
+            /* One machine-readable line, emitted only under MYDS_REQUEST_PHASES=1.
+             *
+             * Each field is null when that stage did not exist for this request
+             * (early return, cancellation, engine never called), because a printed
+             * 0.0 is indistinguishable from "measured, took no time" -- and that is
+             * how a fabricated number ends up in a ledger.
+             *
+             * `engine` is the total time inside generate(); `prefill` and `decode`
+             * come from the engine's own counters. engine - prefill - decode is what
+             * the engine does not attribute: tokenize, workspace setup, prefix
+             * lookup, snapshot restore, first-sample latency. */
+            const bool have_render = t_render_end > 0.0 && t_render_begin > 0.0;
+            /* t_last is the time of the last decoded token, which the engine
+             * reports slightly before generate() actually returns. A request that
+             * decoded nothing leaves it at 0, so "engine" needs both. */
+            const bool have_generate = t_generate_begin > 0.0 && t_last > 0.0 &&
+                                       t_last >= t_generate_begin;
+            const bool have_decode = final_tokens > 1 && t_last > t_first && t_first > 0.0;
+            const double render_s = have_render ? (t_render_end - t_render_begin) : 0.0;
+            const double setup_s = (have_generate && have_render) ? (t_generate_begin - t_render_end) : 0.0;
+            const double engine_s = have_generate ? (t_last - t_generate_begin) : 0.0;
+            const double decode_phase_s = have_decode ? (t_last - t_first) : 0.0;
+            const double unattributed_s = (have_generate && pf.valid)
+                ? engine_s - pf.prefill_seconds - decode_phase_s : 0.0;
+            myds_request_phases_t phases_record = {
+                .queue_s = queue_s,
+                .render_s = have_render ? render_s : -1.0,
+                .setup_s = (have_generate && have_render) ? setup_s : -1.0,
+                .engine_s = have_generate ? engine_s : -1.0,
+                .prefill_s = pf.valid ? pf.prefill_seconds : -1.0,
+                .decode_s = have_decode ? decode_phase_s : -1.0,
+                .unattributed_s = (have_generate && pf.valid) ? unattributed_s : (0.0 / 0.0),
+                .prompt_tokens = prompt_tokens,
+                .cached_tokens = pf.valid ? pf.cached_tokens : 0u,
+                .out_tokens = final_tokens,
+                .stream = stream ? 1 : 0,
+            };
+            char phases_json[512];
+            myds_request_phases_json(&phases_record, phases_json, sizeof(phases_json));
+            /* t_last precedes the engine's return by the last callback, so
+             * engine_unattributed can come out slightly negative on a short
+             * request. It bounds "neither prefill nor decode", it is not an exact
+             * stage cost; a large negative means the split itself is wrong. */
+            MYDS_LOG_I("[%s:%d] request_phases %s", client_ip, client_port, phases_json);
+        }
         if (ctx->dspark && ctx->dspark->proposed_tokens > dspark_prop_before) {
             uint64_t req_prop = ctx->dspark->proposed_tokens - dspark_prop_before;
             uint64_t req_acc  = ctx->dspark->accepted_tokens - dspark_acc_before;

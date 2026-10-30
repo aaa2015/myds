@@ -131,7 +131,7 @@ static const myds_knob_t myds_knobs_generated[] = {
     {"MYDS_KV_DSK_WAYS", "src/myds_v41.c", 2162, 1},
     {"MYDS_LM_HEAD_Q8_NR0", "src/myds_metal.m", 663, 1},
     {"MYDS_LOG_LEVEL", "src/myds_log.c", 23, 1},
-    {"MYDS_MAX_BODY_MB", "src/myds_server.c", 3500, 1},
+    {"MYDS_MAX_BODY_MB", "src/myds_server.c", 3563, 1},
     {"MYDS_MAX_CONN", "src/myds_server.c", 42, 1},
     {"MYDS_MAX_NEW_TOKENS", "src/main.c", 216, 0},
     {"MYDS_MAX_QUEUE_DEPTH", "src/myds_server.c", 191, 1},
@@ -210,8 +210,9 @@ static const myds_knob_t myds_knobs_generated[] = {
     {"MYDS_QKV_NR0", "src/myds_metal.m", 5016, 1},
     {"MYDS_QKV_PIPELINE", "src/myds_v41.c", 4109, 1},
     {"MYDS_QUEUE_TIMEOUT_MS", "src/myds_server.c", 185, 1},
-    {"MYDS_RECV_DEADLINE_S", "src/myds_server.c", 3362, 1},
+    {"MYDS_RECV_DEADLINE_S", "src/myds_server.c", 3420, 1},
     {"MYDS_REPETITION_PENALTY", "src/main.c", 221, 0},
+    {"MYDS_REQUEST_PHASES", "src/myds_server.c", 2571, 1},
     {"MYDS_RESIDENCY_HB_MS", "src/myds_metal.m", 882, 1},
     {"MYDS_RESIDENCY_KEEP_ALIVE_S", "src/myds_metal.m", 880, 1},
     {"MYDS_RESP_STATE", "src/myds_server.c", 284, 1},
@@ -229,7 +230,7 @@ static const myds_knob_t myds_knobs_generated[] = {
     {"MYDS_SKIP_Q_ROPE", "src/myds_v41.c", 7249, 1},
     {"MYDS_SPEC_COST_SCHEDULER", "src/myds_engine.c", 3244, 0},
     {"MYDS_SPEC_SERIAL_PROBE", "src/myds_engine.c", 3406, 0},
-    {"MYDS_SSE_DRAIN_TIMEOUT_MS", "src/myds_server.c", 2596, 1},
+    {"MYDS_SSE_DRAIN_TIMEOUT_MS", "src/myds_server.c", 2654, 1},
     {"MYDS_SUFFIX_SHRINK", "src/myds_v41.c", 7267, 1},
     {"MYDS_SUFFIX_SHRINK_MACROBLOCK", "src/myds_v41.c", 7400, 1},
     {"MYDS_SUFFIX_SHRINK_MIN_TOKENS", "src/myds_v41.c", 7277, 1},
@@ -248,8 +249,8 @@ static const myds_knob_t myds_knobs_generated[] = {
     {"MYDS_YOCO_KEEP_TOKENS", "src/myds_v41.c", 7338, 1},
 };
 
-#define MYDS_KNOB_COUNT 235u
-#define MYDS_KNOB_DIRECT_COUNT 213u
+#define MYDS_KNOB_COUNT 236u
+#define MYDS_KNOB_DIRECT_COUNT 214u
 #define MYDS_KNOB_WRAPPED_COUNT 22u
 #define MYDS_KNOB_HELPERS "capture_parse_flag,cfg_f32_env,cfg_u32_env,decode_candidate_parse,decode_env_enabled,env_default_on,env_is_one_literal,env_not_zero_literal,qkv_fusion_enabled,v41_env_u32"
 
