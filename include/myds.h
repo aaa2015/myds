@@ -83,6 +83,9 @@ myds_config_t   myds_context_get_config(const myds_context_t *ctx);
 void            myds_context_set_config(myds_context_t *ctx, const myds_config_t *cfg);
 void            myds_context_set_logit_bitmask(myds_context_t *ctx, const uint32_t *bitmask);
 void            myds_context_clear_logit_bitmask(myds_context_t *ctx);
+struct myds_steer;
+void            myds_context_set_steer(myds_context_t *ctx, struct myds_steer *steer);
+struct myds_steer *myds_context_get_steer(const myds_context_t *ctx);
 
 /* 最近一次请求的 prefill 统计（供服务端日志/工具使用）。
  * 「prefill 速度」这个词有歧义：这里 prefill_tokens 是【真正被 prefilled 的 token 数】，

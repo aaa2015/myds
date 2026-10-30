@@ -3,6 +3,7 @@
  * Keep this graph diagnostic until the recorded whole-model gates pass. */
 #include "myds_internal.h"
 #include "myds_engram.h"
+#include "myds_steer.h"
 #include "myds_v41_gpu.h"
 #include "myds_v41_moe.h"
 #include "myds_v41_decode.h"
@@ -4522,6 +4523,11 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
         if (prestage_engram && !engram_skip_round) {
             CHECK(myds_metal_v41_bf16(g->engram_kv, 5u * V41_DIM));
         }
+        if (ctx->steer && ctx->steer->enabled && ctx->steer->mode == MYDS_STEER_MODE_V3_DUAL &&
+            myds_steer_is_layer_active(ctx->steer, il)) {
+            CHECK(myds_metal_steer_vec(ctx->attn_out, ctx->steer->directions[il],
+                                       ctx->steer->alpha_effective, V41_DIM, 1));
+        }
         TRACE("attn_out",ctx->attn_out,V41_DIM);
         phase="HC FFN input";
         if (fine_pipeline) {
@@ -4556,6 +4562,10 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
             CHECK(myds_v41_moe_pipeline_scoped(ctx,il,(uint32_t)token,pos,g->residual,g->after_attn,g->ffn_split,l->ffn_fn,l->ffn_scale,l->ffn_base,g->flat_norm,g->mix,v->hc_eps,ordinary_decode_allowed && need_logits && !trace_on));
         }
         TRACE("layer_out",g->residual,4*V41_DIM);
+        if (ctx->steer && ctx->steer->enabled && myds_steer_is_layer_active(ctx->steer, il)) {
+            CHECK(myds_metal_steer_hc_residual(g->residual, ctx->steer->directions[il],
+                                               ctx->steer->alpha_effective, V41_DIM, 1));
+        }
         if (ctx->dspark) {
             int dspark_slot = myds_dspark_target_slot(ctx->dspark, il);
             if (dspark_slot >= 0) {
@@ -8033,6 +8043,11 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 TIME_START();
                 phase = "batched attention output b";
                 CHECK(project_batch(cw->attn_out_buf, base->attn_output_b, cw->attn_low_buf, V41_DIM, 8192, c_len, base->attn_output_b_type, true));
+                if (ctx->steer && ctx->steer->enabled && ctx->steer->mode == MYDS_STEER_MODE_V3_DUAL &&
+                    myds_steer_is_layer_active(ctx->steer, il)) {
+                    CHECK(myds_metal_steer_vec(cw->attn_out_buf, ctx->steer->directions[il],
+                                               ctx->steer->alpha_effective, V41_DIM, c_len));
+                }
                 TIME_ACC(prof_step5);
                   if (do_prof && opt_prof_step56) {
                       TIME_START();
@@ -8419,6 +8434,11 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                                 }
                                 if (!traced) goto fail;
                             }
+                        }
+
+                        if (ctx->steer && ctx->steer->enabled && myds_steer_is_layer_active(ctx->steer, il)) {
+                            CHECK(myds_metal_steer_hc_residual(cw->layer_out_buf, ctx->steer->directions[il],
+                                                               ctx->steer->alpha_effective, V41_DIM, e_len));
                         }
 
                         CHECK(myds_metal_buffer_copy(prompt_res, (size_t)e_start * res_tok_bytes,

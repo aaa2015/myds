@@ -8329,3 +8329,106 @@ int myds_metal_dspark_moe_f16(
     }
     return 1;
 }
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * GLP Control Vector / Activation Steering Dispatches
+ * ────────────────────────────────────────────────────────────────────────── */
+
+struct myds_steer_metal_args {
+    uint32_t dim;
+    float    alpha;
+    uint32_t n_tokens;
+};
+
+int myds_metal_steer_vec(
+    myds_metal_buffer_t *h,
+    const myds_metal_buffer_t *dir,
+    float alpha,
+    uint32_t dim,
+    uint32_t n_tokens)
+{
+    if (!g_initialized || !h || !dir || !dim || (dim % 4 != 0) || !n_tokens) return 0;
+    if (!v41_floats(h, (uint64_t)dim * n_tokens) || !v41_floats(dir, dim)) return 0;
+    if (fabsf(alpha) < 1e-7f) return 1; /* no-op fast path */
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pso = resolve_kernel_pipeline("kernel_myds_steer_vec", NULL, 0);
+        if (!pso) return 0;
+
+        struct myds_steer_metal_args args = {
+            .dim = dim,
+            .alpha = alpha,
+            .n_tokens = n_tokens,
+        };
+
+        id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
+        if (!enc) return 0;
+        if (g_batch_cb && g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        [enc setComputePipelineState:pso];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:h->mtl_buf offset:h->offset atIndex:1];
+        [enc setBuffer:dir->mtl_buf offset:dir->offset atIndex:2];
+        [enc setThreadgroupMemoryLength:32 * sizeof(float) atIndex:0];
+
+        MTLSize threadsPerTG = MTLSizeMake(256, 1, 1);
+        MTLSize grid = MTLSizeMake(256, n_tokens, 1);
+        [enc dispatchThreads:grid threadsPerThreadgroup:threadsPerTG];
+
+        if (!g_batch_cb) {
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+        }
+        return 1;
+    }
+}
+
+int myds_metal_steer_hc_residual(
+    myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *dir,
+    float alpha,
+    uint32_t dim,
+    uint32_t n_tokens)
+{
+    if (!g_initialized || !residual || !dir || !dim || (dim % 4 != 0) || !n_tokens) return 0;
+    if (!v41_floats(residual, 4ull * dim * n_tokens) || !v41_floats(dir, dim)) return 0;
+    if (fabsf(alpha) < 1e-7f) return 1; /* no-op fast path */
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pso = resolve_kernel_pipeline("kernel_myds_steer_hc_residual", NULL, 0);
+        if (!pso) return 0;
+
+        struct myds_steer_metal_args args = {
+            .dim = dim,
+            .alpha = alpha,
+            .n_tokens = n_tokens,
+        };
+
+        id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
+        if (!enc) return 0;
+        if (g_batch_cb && g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        [enc setComputePipelineState:pso];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:residual->mtl_buf offset:residual->offset atIndex:1];
+        [enc setBuffer:dir->mtl_buf offset:dir->offset atIndex:2];
+        [enc setThreadgroupMemoryLength:32 * sizeof(float) atIndex:0];
+
+        MTLSize threadsPerTG = MTLSizeMake(256, 1, 1);
+        MTLSize grid = MTLSizeMake(256, n_tokens, 1);
+        [enc dispatchThreads:grid threadsPerThreadgroup:threadsPerTG];
+
+        if (!g_batch_cb) {
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+        }
+        return 1;
+    }
+}
+

@@ -40,6 +40,7 @@ SHADER_FILES = [
     "set_rows.metal",
     "myds_chunk.metal",
     "visenc.metal",
+    "myds_steer.metal",
 ]
 
 # Preserve the complete validated native TU (including COPY_KERNELS) as a

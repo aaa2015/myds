@@ -3,6 +3,7 @@
 #include "myds_internal.h"
 #include "myds_dspark.h"
 #include "myds_vjob.h"
+#include "myds_steer.h"
 #include "myds_log.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -3738,6 +3739,12 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         float min_p = json_extract_float_field(body, "min_p", -1.0f);
         float rep_pen = json_extract_float_field(body, "repetition_penalty", -1.0f);
         float pres_pen = json_extract_float_field(body, "presence_penalty", -1.0f);
+        float req_steer_alpha = json_extract_float_field(body, "steer_alpha", -1.0f);
+        int req_steer_enable = json_extract_int_field(body, "steer_enable", -1);
+        if (req_steer_enable < 0) {
+            if (strstr(body, "\"steer_enable\":true") || strstr(body, "\"steer_enable\": true")) req_steer_enable = 1;
+            else if (strstr(body, "\"steer_enable\":false") || strstr(body, "\"steer_enable\": false")) req_steer_enable = 0;
+        }
         int include_usage = (strstr(body, "\"include_usage\":true") != NULL || strstr(body, "\"include_usage\": true") != NULL);
         /* Structured output response_format：本引擎【没有】约束解码器。
          * 2026-10-25：此前这里只把 json_object/json_schema 记成一个布尔并打印日志，
@@ -4037,6 +4044,23 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         myds_stop_reason_t stop_reason = MYDS_STOP_EOS;
         uint32_t prompt_tokens = 0;
         uint32_t final_tokens = 0;
+
+        float prev_steer_alpha = -1.0f;
+        int prev_steer_enabled = -1;
+        if (ctx && ctx->steer) {
+            prev_steer_alpha = ctx->steer->alpha_effective;
+            prev_steer_enabled = ctx->steer->enabled ? 1 : 0;
+            if (req_steer_alpha >= 0.0f) {
+                ctx->steer->alpha_effective = req_steer_alpha;
+            }
+            if (req_steer_enable >= 0) {
+                ctx->steer->enabled = (req_steer_enable != 0);
+            }
+            if (req_steer_alpha >= 0.0f || req_steer_enable >= 0) {
+                MYDS_LOG_I("[%s:%d] dynamic steer override: alpha=%.3f, enabled=%d",
+                           client_ip, client_port, ctx->steer->alpha_effective, ctx->steer->enabled ? 1 : 0);
+            }
+        }
 
         /* 视觉注入：提示词已拼好，把所有图片块的逐位置向量交给引擎。
          * ★ 必须在 generate 之前；在发送 200 响应头之前完成，避免注入失败时向客户端连发 200 + 400 */
@@ -4615,6 +4639,10 @@ cleanup_infer:
                 ctx->logit_bitmask = NULL;
             }
             ctx->logit_bitmask_words = 0;
+            if (ctx->steer) {
+                if (prev_steer_alpha >= 0.0f) ctx->steer->alpha_effective = prev_steer_alpha;
+                if (prev_steer_enabled >= 0) ctx->steer->enabled = (prev_steer_enabled != 0);
+            }
         }
         myds_vjob_sink_free(&img_sink);
         myds_set_continue_from_cache(ctx, false);

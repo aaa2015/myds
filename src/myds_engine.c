@@ -1,6 +1,7 @@
 #include "myds.h"
 #include "myds_metal.h"
 #include "myds_gguf.h"
+#include "myds_steer.h"
 #include "myds_tokenizer.h"
 #include "myds_v41.h"
 #include "myds_v41_moe.h"
@@ -1410,6 +1411,10 @@ void myds_context_free(myds_context_t *ctx) {
         myds_dspark_free(ctx->dspark);
         ctx->dspark = NULL;
     }
+    if (ctx->steer) {
+        myds_steer_free(ctx->steer);
+        ctx->steer = NULL;
+    }
     myds_context_clear_image_embeddings(ctx);
     myds_v41_context_free(ctx->v41);
     free_prefill_chunk(ctx->prefill_chunk);
@@ -1514,6 +1519,14 @@ void myds_context_clear_logit_bitmask(myds_context_t *ctx) {
         ctx->logit_bitmask = NULL;
     }
     ctx->logit_bitmask_words = 0;   /* 容量必须同步归零，否则下次 set 会误判足够 */
+}
+
+void myds_context_set_steer(myds_context_t *ctx, myds_steer_t *steer) {
+    if (ctx) ctx->steer = steer;
+}
+
+myds_steer_t *myds_context_get_steer(const myds_context_t *ctx) {
+    return ctx ? ctx->steer : NULL;
 }
 
 static inline bool pen_seen_in(const int32_t *keys, int32_t t) {

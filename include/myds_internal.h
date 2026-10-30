@@ -110,11 +110,13 @@ struct myds_model {
 
 typedef struct myds_prefill_chunk myds_prefill_chunk_t;
 typedef struct myds_dspark myds_dspark_t;
+typedef struct myds_steer myds_steer_t;
 
 struct myds_context {
     myds_model_t        *model;
     myds_v41_context_t  *v41;
     myds_dspark_t       *dspark;
+    myds_steer_t        *steer;
     myds_config_t        cfg;
     uint32_t             pos;
     uint32_t             kv_capacity; /* Allocated KV rows; cfg may request a smaller limit. */

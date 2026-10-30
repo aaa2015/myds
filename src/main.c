@@ -3,6 +3,7 @@
 #include "myds_server.h"
 #include "myds_vjob.h"
 #include "myds_dspark.h"
+#include "myds_steer.h"
 #include "myds_metal.h"
 #include "myds_log.h"
 #include "myds_configfile.h"
@@ -36,6 +37,12 @@ static void print_usage(const char *prog) {
     printf("  --top-p <float>         Nucleus top-p sampling cutoff (default: 0.9)\n");
     printf("  --thinking [on|off]     Enable thinking / reasoning mode (default: off)\n");
     printf("  --no-thinking           Disable thinking / reasoning mode\n");
+    printf("  --steer-vector <path>   Path to GLP control vector GGUF file\n");
+    printf("  --steer-alpha <float>   Steering strength multiplier (default: from file)\n");
+    printf("  --steer-mode <auto|v2|v3> Steering mode (auto, v2=residual_only, v3=dual)\n");
+    printf("  --steer-layers <range>  Steering active layer range (e.g. 11-37, default: all in file)\n");
+    printf("  --steer-enable [0|1]    Enable or disable steering (default: 1 if vector provided)\n");
+    printf("  --no-steer              Disable steering\n");
     printf("  --pld                   Enable Prompt-Lookup Decoding (speculative draft)\n");
     printf("  --no-pld                Disable Prompt-Lookup Decoding\n");
     printf("  -h, --help              Show this help message\n");
@@ -225,6 +232,25 @@ int main(int argc, char *argv[]) {
         .stream             = true,
     };
 
+    const char *steer_path = getenv("MYDS_STEER_PATH");
+    float steer_alpha = -1.0f;
+    const char *steer_alpha_env = getenv("MYDS_STEER_ALPHA");
+    if (steer_alpha_env && *steer_alpha_env) {
+        steer_alpha = (float)atof(steer_alpha_env);
+    }
+    myds_steer_mode_t steer_mode = MYDS_STEER_MODE_AUTO;
+    const char *steer_mode_env = getenv("MYDS_STEER_MODE");
+    if (steer_mode_env) {
+        if (!strcmp(steer_mode_env, "v2") || !strcmp(steer_mode_env, "residual_only")) steer_mode = MYDS_STEER_MODE_V2_RESIDUAL_ONLY;
+        else if (!strcmp(steer_mode_env, "v3") || !strcmp(steer_mode_env, "dual")) steer_mode = MYDS_STEER_MODE_V3_DUAL;
+    }
+    const char *steer_layers = getenv("MYDS_STEER_LAYERS");
+    int steer_enable = 1;
+    const char *steer_enable_env = getenv("MYDS_STEER_ENABLE");
+    if (steer_enable_env) {
+        steer_enable = atoi(steer_enable_env);
+    }
+
     for (int i = 1; i < argc; i++) {
         if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) && i + 1 < argc) {
             model_path = argv[++i];
@@ -288,6 +314,21 @@ int main(int argc, char *argv[]) {
             setenv("MYDS_PLD", "1", 1);
         } else if (strcmp(argv[i], "--no-pld") == 0) {
             setenv("MYDS_PLD", "0", 1);
+        } else if (strcmp(argv[i], "--steer-vector") == 0 && i + 1 < argc) {
+            steer_path = argv[++i];
+        } else if (strcmp(argv[i], "--steer-alpha") == 0 && i + 1 < argc) {
+            steer_alpha = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--steer-mode") == 0 && i + 1 < argc) {
+            const char *mstr = argv[++i];
+            if (!strcmp(mstr, "v2") || !strcmp(mstr, "residual_only")) steer_mode = MYDS_STEER_MODE_V2_RESIDUAL_ONLY;
+            else if (!strcmp(mstr, "v3") || !strcmp(mstr, "dual")) steer_mode = MYDS_STEER_MODE_V3_DUAL;
+            else steer_mode = MYDS_STEER_MODE_AUTO;
+        } else if (strcmp(argv[i], "--steer-layers") == 0 && i + 1 < argc) {
+            steer_layers = argv[++i];
+        } else if (strcmp(argv[i], "--steer-enable") == 0 && i + 1 < argc) {
+            steer_enable = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--no-steer") == 0) {
+            steer_enable = 0;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -359,6 +400,16 @@ int main(int argc, char *argv[]) {
             MYDS_LOG_E("视觉编码器初始化失败（%s）—— 本次以【纯文本】模式运行", vision_path);
         } else {
             MYDS_LOG_I("多模态已启用：接受 input_image（image_url 需为 data: base64 URL）");
+        }
+    }
+
+    /* GLP 控制向量 / 隐空间消融子系统 */
+    if (steer_path && *steer_path && steer_enable) {
+        myds_steer_t *st = myds_steer_load(steer_path, steer_alpha, steer_mode, steer_layers);
+        if (!st) {
+            MYDS_LOG_E("GLP 控制向量加载失败（%s）—— 本次不启用消融", steer_path);
+        } else {
+            myds_context_set_steer(ctx, st);
         }
     }
 

@@ -866,6 +866,13 @@ int myds_metal_v41_hc_split_batch(myds_metal_buffer_t *split,
     const myds_metal_buffer_t *mix, const myds_metal_buffer_t *scale,
     const myds_metal_buffer_t *base, uint32_t n_tokens, float hc_eps);
 
+/* GLP Control Vector / Activation Steering kernels */
+int myds_metal_steer_vec(myds_metal_buffer_t *h,
+    const myds_metal_buffer_t *dir, float alpha, uint32_t dim, uint32_t n_tokens);
+
+int myds_metal_steer_hc_residual(myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *dir, float alpha, uint32_t dim, uint32_t n_tokens);
+
 #ifdef __cplusplus
 }
 #endif
