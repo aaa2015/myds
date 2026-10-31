@@ -17181,3 +17181,68 @@ binary `52ebc2a3`、metallib `787f9d7d`、配置 `e06930b`、生产态内测、c
 本次为做 metallib A/B 临时换过 metallib 并重启两次，已恢复
 `787f9d7d` + 重启，最终 PID `76945`，health ok。
 `MYDS_INDEXER_TILED=1` 保留（有正收益、0-ULP 已验、不满足条件时自动回退）。
+
+---
+
+## §142 部署链收敛：删 sync_myds.sh，fleet.conf 去掉 E=3（2026-10-31）
+
+**结论：源码同步脚本删除、E=3 归零、重启责任移进 `deploy_artifact.sh`，
+端到端实跑通过，数值不变。**
+
+### 变更
+
+| 项 | 之前 | 现在 |
+|---|---|---|
+| `myfleet/sync_myds.sh` | 只传源码（`--exclude=bin`），指望远端 make | **删除** |
+| `deploy.sh` 的 myds 分支 | 调 `sync_myds.sh` | 调 `tools/deploy_artifact.sh --no-restart` |
+| `fleet.conf` 8187 的 E 列 | `3`（智能重启） | `1`（未跑才启） |
+| 重启责任 | `start_fleet.sh` 比对 mtime | **`deploy_artifact.sh` 自己 stop → start** |
+
+**为什么删 sync_myds.sh**：macstudio 无 Metal 工具链（`xcrun -f metal` 无输出），
+它**从来就无法编译 metallib** ⇒ 「传源码让远端 make」是一个目标机做不到的模型（§138）。
+
+**为什么去掉 E=3**：E=3 的存在意义就是「产物变了才重启」。现在重启由
+`deploy_artifact.sh` 显式完成，mtime 比对只剩副作用面。E=1 也让 8187 与
+fleet.conf 其余 113 行一致。
+
+### ★ 连带缺陷（已修）：E=1 会让部署静默失效
+
+把 E 从 3 改成 1 之后，`start_fleet.sh` 对在跑的进程只打印「已经在位」并跳过。
+若 `deploy_artifact.sh` 仍只调 start_fleet.sh，则**产物落地了但进程还跑旧二进制，
+而输出看起来是成功的** —— 正是本轮一直在抓的那类静默失效。
+
+修法（`tools/deploy_artifact.sh`）：
+1. 定位 8187 的 listener PID
+2. **校验命令行确实含 `bin/myds`，否则拒绝 kill**（防止误杀）
+3. SIGTERM → 6 秒后升级 SIGKILL → 等进程真正退出（150 GB 映射归还后才允许下一次 mmap）
+4. 停止失败 `exit 1` 且不启动，不留半更新状态
+5. `--no-restart` 的提示改为实话：「运行中的进程仍是旧二进制」
+
+### 验证（生产实跑）
+
+```
+部署前 pid = 76945
+  停止 pid 76945 / 已退出，内存已归还
+  启动 ... [OK] (8s)
+  health {"status":"ok"}
+部署后 pid = 87960
+```
+
+E=1 语义单独验证（裸跑 start_fleet.sh）：
+```
+调用前 pid=87960 → 调用后 pid=87960   ✅ 未重启，进程保持
+```
+
+数值不变（同 prompt、greedy）：
+```
+sha = 140f67a5e054   ← 与今日基线逐位相同
+```
+
+### 边界
+
+- ~~`deploy.sh` 的 myds 分支传 `--no-restart` 会导致静默失效~~ **已修**（`d843012`）：
+  E=1 下末尾那次 `start_fleet.sh` 不重启在跑的进程，所以 `deploy.sh` **不能**传
+  `--no-restart`，改由 `deploy_artifact.sh` 自己 stop/start；末尾的 start_fleet.sh
+  发现已在跑自然跳过，不会重复重启。
+  **教训：改 E 列的同时必须重审所有依赖它的重启路径** —— 这处就是差点漏掉的静默失效。
+- `autoreview/reports/mylpe/...` 里仍有一处 `sync_myds.sh` 提及，属历史归档，不改。
