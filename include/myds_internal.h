@@ -182,8 +182,17 @@ struct myds_context {
     myds_loop_guard_t    loop_guard;
     bool                 loop_detected;
 
-    /* 自适应投机解码控制器（借鉴 Project Maya spec::Controller） */
+    /* 自适应投机解码控制器（借鉴 Project Maya spec::Controller）。
+     *
+     * ⚠ 默认关闭（opt-in）。它赖以成立的前提是「验证成本 ~1.28× 单步」，
+     * 而本仓库账本 §100.3/§4.16 的实测是 49.18 ms/call vs 23.55 ms/token ⇒ 2.09×。
+     * 2.09× 下收支平衡需要接受率 q ≥ 1.09（数学上不可达），所以任何基于
+     * 接受率的门禁都无法把投机变成净赚。保留代码是为了能继续测量，
+     * 不是因为它已被证明有效。见 docs/MAYA_ADOPTED_OPTIMIZATIONS.md。 */
+    bool                 spec_adaptive;        /* MYDS_SPEC_ADAPTIVE=1 时启用门禁 */
+    bool                 spec_prior_ready;     /* 先验是否已初始化（不用浮点值当标志位） */
     double               spec_pld_q[4];        /* 各 N-gram 长度桶 (2, 3, 4, 5+) 的在线 EMA 接受率 */
+    uint32_t             spec_pld_samples[4];  /* 各桶的已观测样本数；样本不足时强制试探 */
     uint32_t             spec_last_pld_bucket; /* 当前在飞 PLD 草稿所在的长度桶 */
 
     /* Metal activation buffers */

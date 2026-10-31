@@ -151,14 +151,31 @@ void            myds_last_decode_stats(const myds_context_t *ctx, myds_decode_st
 bool            myds_last_decode_cycle(const myds_context_t *ctx, uint32_t index,
                                       myds_decode_cycle_t *out);
 
-/* Generation termination reasons */
+/* Generation termination reasons.
+ *
+ * MYDS_STOP_LOOP_GUARD is appended rather than inserted: earlier members keep
+ * their numeric values so anything that already persists or compares them stays
+ * valid. */
 typedef enum {
     MYDS_STOP_EOS = 0,
     MYDS_STOP_LENGTH,
     MYDS_STOP_CTX_FULL,
     MYDS_STOP_ERROR,
-    MYDS_STOP_CANCELLED
+    MYDS_STOP_CANCELLED,
+    /* LoopGuard tripped on a periodic repetition. This is NOT an error and NOT
+     * a user-requested stop: the prefix already emitted is well-formed, which
+     * is exactly why it must be reported apart from EOS. Folding it into EOS
+     * makes a truncated answer indistinguishable from a finished one. */
+    MYDS_STOP_LOOP_GUARD
 } myds_stop_reason_t;
+
+/* Reasons that must end generation wherever the decoder checks for a stop.
+ * LOOP_GUARD belongs here: continuing would emit more of the repetition the
+ * detector has just identified. ERROR is deliberately absent — every call site
+ * tracks `success` separately, and conflating the two would hide the error path. */
+static inline bool myds_stop_is_terminal(myds_stop_reason_t r) {
+    return r == MYDS_STOP_EOS || r == MYDS_STOP_CANCELLED || r == MYDS_STOP_LOOP_GUARD;
+}
 
 /* Generation */
 /* previous_response_id：置位后，下一次 generate 把引擎缓存的序列当作 prompt 前缀，

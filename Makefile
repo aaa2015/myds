@@ -92,6 +92,7 @@ TEST_CPU = $(BIN_DIR)/test_cpu
 TEST_ENGRAM = $(BIN_DIR)/test_engram
 TEST_ALIGN = $(BIN_DIR)/test_align
 TEST_PLD = $(BIN_DIR)/test_pld
+TEST_LOOP_GUARD = $(BIN_DIR)/test_loop_guard
 TEST_KVDSK = $(BIN_DIR)/test_kvdsk
 TEST_KVDSK_FIFO = $(BIN_DIR)/test_kvdsk_fifo
 TEST_ANCHOR_SLOTS = $(BIN_DIR)/test_anchor_slots
@@ -126,7 +127,7 @@ DUMP_TENSORS = $(BIN_DIR)/dump_tensors
 METALLIB = $(BIN_DIR)/myds.metallib
 METAL_SRCS = $(wildcard metal/*.metal)
 
-ALL_TESTS = $(TEST_METAL) $(TEST_V41_GPU) $(TEST_ATTN_POLICY) $(TEST_ATTN_VEC) $(TEST_QKV_FUSION) $(TEST_DECODE_Q8) $(TEST_MOE_DOWN_NSG) $(TEST_DEEPER_SSD) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE) $(TEST_CPU) $(TEST_ENGRAM) $(TEST_ALIGN) $(TEST_PLD) $(TEST_KVDSK) $(TEST_P1) $(TEST_DSPARK_ROLLBACK) $(TEST_DSPARK_CAPTURE) $(TEST_DSPARK_ROUTER) $(TEST_V41_ROUTER) $(TEST_BATCH2_SHARED_PAIR) $(TEST_DSPARK_ATTN) $(TEST_DSPARK_MOE) $(TEST_DSPARK_PROPOSAL) $(TEST_BATCH2_PARITY) $(TEST_BATCH2_E2E) $(TEST_Q4_BF16_PARITY) $(TEST_TREE_SPEC) $(TEST_ENGINE_DEPTH2)
+ALL_TESTS = $(TEST_METAL) $(TEST_V41_GPU) $(TEST_ATTN_POLICY) $(TEST_ATTN_VEC) $(TEST_QKV_FUSION) $(TEST_DECODE_Q8) $(TEST_MOE_DOWN_NSG) $(TEST_DEEPER_SSD) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE) $(TEST_CPU) $(TEST_ENGRAM) $(TEST_ALIGN) $(TEST_PLD) $(TEST_LOOP_GUARD) $(TEST_KVDSK) $(TEST_P1) $(TEST_DSPARK_ROLLBACK) $(TEST_DSPARK_CAPTURE) $(TEST_DSPARK_ROUTER) $(TEST_V41_ROUTER) $(TEST_BATCH2_SHARED_PAIR) $(TEST_DSPARK_ATTN) $(TEST_DSPARK_MOE) $(TEST_DSPARK_PROPOSAL) $(TEST_BATCH2_PARITY) $(TEST_BATCH2_E2E) $(TEST_Q4_BF16_PARITY) $(TEST_TREE_SPEC) $(TEST_ENGINE_DEPTH2)
 # 畸形 GGUF 边界防护（2026-10-25）。只链接 gguf 层，不需要 GPU。
 # ★ 必须在 ALL_TESTS 被 all:/test: 引用【之前】定义并追加：
 #   Make 的先决条件在读取时就展开，晚于 all:/test: 的 += 不会进入那两个目标。
@@ -502,6 +503,9 @@ $(TEST_ALIGN): tests/test_align.c include/myds_align.h | $(BIN_DIR)
 $(TEST_PLD): tests/test_pld.c include/myds_pld.h | $(BIN_DIR)
 	$(CC) $(CFLAGS) -Iinclude -o $@ tests/test_pld.c
 
+$(TEST_LOOP_GUARD): tests/test_loop_guard.c include/myds_loop_guard.h | $(BIN_DIR)
+	$(CC) $(CFLAGS) -Iinclude -o $@ tests/test_loop_guard.c
+
 # 低位区 KV 落盘：只需要存储层与日志，不需要模型（也就不必占着跑生产的机器开第二个实例）。
 $(TEST_KVDSK): tests/test_kvdsk.c include/myds_kvdsk.h $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_log.o | $(BIN_DIR)
 	$(CC) $(CFLAGS) -Iinclude -o $@ tests/test_kvdsk.c $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_log.o
@@ -797,6 +801,7 @@ test: check-knobs $(ALL_TESTS) $(METALLIB)
 	@./$(TEST_ALIGN)
 	@echo ""
 	@./$(TEST_PLD)
+	@./$(TEST_LOOP_GUARD)
 	@echo ""
 	@./$(TEST_KVDSK)
 	@echo ""

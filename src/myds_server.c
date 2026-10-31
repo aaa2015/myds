@@ -4280,7 +4280,10 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                         (void)myds_server_sse_send(&sctx, error_event, strlen(error_event));
                     }
                 } else if (!stool_count && !sctx.failed && !sctx.cancel_flag) {
-                    const char *finish = (stop_reason == MYDS_STOP_LENGTH || stop_reason == MYDS_STOP_CTX_FULL) ? "length" : "stop";
+                    /* LOOP_GUARD 归入 "length"：输出确实被截断了，客户端必须能分辨。
+                     * 映射成 "stop" 会让半截答案看起来像正常收尾（原实现的问题）。 */
+                    const char *finish = (stop_reason == MYDS_STOP_LENGTH || stop_reason == MYDS_STOP_CTX_FULL ||
+                                          stop_reason == MYDS_STOP_LOOP_GUARD) ? "length" : "stop";
                     char chunk[512];
                     int len = snprintf(chunk, sizeof(chunk),
                         "data: {\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"%s\"}]}\n\n", finish);
@@ -4342,7 +4345,10 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 char *alias_json = json_escape_alloc(model_alias ? model_alias : "myds",
                                                      strlen(model_alias ? model_alias : "myds"));
                 char *response = NULL;
-                const char *finish = (stop_reason == MYDS_STOP_LENGTH || stop_reason == MYDS_STOP_CTX_FULL) ? "length" : "stop";
+                /* LOOP_GUARD 归入 "length"：输出确实被截断了，客户端必须能分辨。
+                 * 映射成 "stop" 会让半截答案看起来像正常收尾（原实现的问题）。 */
+                const char *finish = (stop_reason == MYDS_STOP_LENGTH || stop_reason == MYDS_STOP_CTX_FULL ||
+                                      stop_reason == MYDS_STOP_LOOP_GUARD) ? "length" : "stop";
                 long now = (long)time(NULL);
 
                 /* 模型可能在正文之后用 DSML 块发起工具调用 ⇒ 拆出来，按各自协议输出。 */
@@ -4513,7 +4519,11 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         double ttft_s = prefill_s;
         double decode_s = (final_tokens > 1 && t_last > t_first) ? (t_last - t_first) : 0.0;
         double decode_tps = (decode_s > 0.0 && final_tokens > 1) ? ((double)(final_tokens - 1) / decode_s) : ((infer_s > 0.0) ? ((double)final_tokens / infer_s) : 0.0);
-        const char *final_finish_str = (stop_reason == MYDS_STOP_LENGTH || stop_reason == MYDS_STOP_CTX_FULL) ? "length" : (stop_reason == MYDS_STOP_CANCELLED ? "cancelled" : (stop_reason == MYDS_STOP_ERROR ? "error" : "stop"));
+        const char *final_finish_str =
+            (stop_reason == MYDS_STOP_LENGTH || stop_reason == MYDS_STOP_CTX_FULL ||
+             stop_reason == MYDS_STOP_LOOP_GUARD) ? "length"
+            : (stop_reason == MYDS_STOP_CANCELLED ? "cancelled"
+            : (stop_reason == MYDS_STOP_ERROR ? "error" : "stop"));
 
         /* prefill 速率直接取自引擎的 prefill 阶段计时，不用 ttft 反推：
          * ttft 混了排队/分词/首个解码步，反推会低估速率（实测差数倍），
@@ -4726,10 +4736,15 @@ int myds_server_start(myds_context_t *ctx, const char *host, int port, const cha
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
-    /* 服务端默认开启 LoopGuard 防护（防止低比特生成死循环，可通过 MYDS_LOOP_GUARD=0 禁用） */
-    if (getenv("MYDS_LOOP_GUARD") == NULL) {
-        setenv("MYDS_LOOP_GUARD", "1", 0);
-    }
+    /* LoopGuard 默认【关闭】，需要显式 MYDS_LOOP_GUARD=1 才启用。
+     *
+     * 2026-11-01 验收改判：原实现默认开启，但假阳性率从未测量过。
+     * 把真实文本喂给同一份检测器（周期 4、连续 4 次即触发）实测：
+     *   src/myds_engine.c   74,700 tok ⇒ 23 次触发
+     *   docs 账本           397,908 tok ⇒ 172 次触发
+     * 触发窗口全是 `|---|---|---|`、`────────────` 这类表格分隔行和注释框线，
+     * 不是死循环。默认开启等于用「截断正常回答」去防一个未观测到的风险。
+     * 等官方套件上有假阳性读数之后，再决定默认值。 */
 
     /* 2026-10-25: 把 fd 上限提升到合理值。
      * 默认 ulimit -n 常为 256，而每条连接占一个 fd ⇒ 265 条连接即 EMFILE。
