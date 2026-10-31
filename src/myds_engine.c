@@ -3223,6 +3223,18 @@ static void decode_emit(myds_context_t *ctx, myds_stream_callback_t cb,
     ctx->decode_stats.output_tokens++;
     if (bytes_cb) bytes_cb(piece, length, token, user_data);
     else if (cb) cb(piece, token, user_data);
+    if (myds_loop_guard_feed(&ctx->loop_guard, token)) {
+        MYDS_LOG_W("LoopGuard: detected repeating loop (period=%u, reps=%u), terminating generation to prevent runaway output",
+                   ctx->loop_guard.detected_period, ctx->loop_guard.detected_reps);
+        ctx->loop_detected = true;
+    }
+}
+
+static inline uint32_t pld_bucket(uint32_t ng) {
+    if (ng <= 2) return 0;
+    if (ng == 3) return 1;
+    if (ng == 4) return 2;
+    return 3;
 }
 
 static uint32_t decode_pld_propose(myds_context_t *ctx, const int32_t *history,
@@ -3230,8 +3242,25 @@ static uint32_t decode_pld_propose(myds_context_t *ctx, const int32_t *history,
                                   int32_t *draft) {
     const double start = ctx->decode_stats.timing_enabled ? decode_now_ms() : 0.0;
     ctx->decode_stats.pld_queries++;
+
+    uint32_t matched_ng = 0;
+    const uint32_t count = myds_pld_propose_ex(history, length, cfg, draft, &matched_ng);
+    if (count > 0) {
+        uint32_t b = pld_bucket(matched_ng);
+        ctx->spec_last_pld_bucket = b;
+
+        /* 自适应投机代价控制（借鉴 Project Maya spec::Controller）：
+         * 验证多 token 时快照与 MoE 访存会引入额外开销。
+         * 若当前 N-gram 长度桶的历史接受率低于收支平衡点 0.38，
+         * 说明该模式假阳性高（如通用散文中偶然凑巧的 2-gram），
+         * 主动放弃投机草稿，退回原生的单步解码，避免 -6.6% 的倒亏。 */
+        if (ctx->spec_pld_q[b] < 0.38) {
+            if (ctx->decode_stats.timing_enabled) ctx->decode_stats.pld_ms += decode_now_ms() - start;
+            return 0;
+        }
+    }
+
     ctx->decode_cycle_speculative = true;
-    const uint32_t count = myds_pld_propose(history, length, cfg, draft);
     if (ctx->decode_stats.timing_enabled) ctx->decode_stats.pld_ms += decode_now_ms() - start;
     return count;
 }
@@ -3303,6 +3332,20 @@ static int myds_generate_internal(myds_context_t *ctx,
     ctx->decode_target_ms = 0.0;
     ctx->decode_costly_cycles = ctx->decode_cost_backoff = 0;
     ctx->decode_cost_scheduler = decode_env_enabled("MYDS_SPEC_COST_SCHEDULER");
+
+    /* LoopGuard 初始化（通过 MYDS_LOOP_GUARD=1 启用，服务默认开启） */
+    const bool lg_enabled = decode_env_enabled("MYDS_LOOP_GUARD");
+    myds_loop_guard_init(&ctx->loop_guard, lg_enabled);
+    ctx->loop_detected = false;
+
+    /* 自适应投机代价控制器先验接受率（借鉴 Project Maya spec::Controller） */
+    if (ctx->spec_pld_q[0] == 0.0 && ctx->spec_pld_q[1] == 0.0) {
+        ctx->spec_pld_q[0] = 0.35; /* match_len == 2 */
+        ctx->spec_pld_q[1] = 0.60; /* match_len == 3 */
+        ctx->spec_pld_q[2] = 0.80; /* match_len == 4 */
+        ctx->spec_pld_q[3] = 0.92; /* match_len >= 5 */
+    }
+
     const bool record_decode_cycles = decode_env_enabled("MYDS_DECODE_METRICS");
     ctx->decode_stats.timing_enabled = record_decode_cycles || ctx->decode_cost_scheduler;
     const uint32_t cycle_capacity = ctx->cfg.max_new_tokens < ctx->cfg.max_seq_len
@@ -3900,6 +3943,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                     break;
                 }
                 decode_emit(ctx, cb, bytes_cb, piece, piece_len, next_token, user_data);
+                if (ctx->loop_detected) { stop_reason = MYDS_STOP_EOS; break; }
                 cur_token = next_token;
                 continue;
             }
@@ -3993,6 +4037,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                     break;
                 }
                 decode_emit(ctx, cb, bytes_cb, piece, piece_len, next_token, user_data);
+                if (ctx->loop_detected) { stop_reason = MYDS_STOP_EOS; break; }
                 cur_token = next_token;
                 continue;
             }
@@ -4072,6 +4117,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                     cur_token = out_tokens[i];
                     if (pld_history && pld_len < pld_cap) pld_history[pld_len++] = out_tokens[i];
                     decode_emit(ctx, cb, bytes_cb, piece, piece_len, out_tokens[i], user_data);
+                    if (ctx->loop_detected) { stop_reason = MYDS_STOP_EOS; break; }
                 }
                 const int32_t kept_inputs[3] = { seed, out_tokens[0], out_tokens[1] };
                 if (!decode_linear_keep(ctx, snap, (uint32_t)ret, keep, spec_pos, kept_inputs)) {
@@ -4177,8 +4223,11 @@ static int myds_generate_internal(myds_context_t *ctx,
                     }
                 }
                 if (matched) {
-                    if (accepted_from_pld) ctx->decode_stats.pld_accepted++;
-                    else {
+                    if (accepted_from_pld) {
+                        ctx->decode_stats.pld_accepted++;
+                        uint32_t b = ctx->spec_last_pld_bucket;
+                        if (b < 4) ctx->spec_pld_q[b] += 0.15 * (1.0 - ctx->spec_pld_q[b]);
+                    } else {
                         if (ctx->dspark) ctx->dspark->accepted_tokens++;
                         ctx->decode_stats.draft_accepted++;
                     }
@@ -4194,6 +4243,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                         break;
                     }
                     decode_emit(ctx, cb, bytes_cb, piece0, piece_len0, out_tokens[0], user_data);
+                    if (ctx->loop_detected) { stop_reason = MYDS_STOP_EOS; break; }
 
                     step++;
                     if (pld_history && pld_len < pld_cap) pld_history[pld_len++] = out_tokens[0];
@@ -4254,6 +4304,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                         break;
                     }
                     decode_emit(ctx, cb, bytes_cb, piece1, piece_len1, out_tokens[1], user_data);
+                    if (ctx->loop_detected) { stop_reason = MYDS_STOP_EOS; break; }
 
                     ctx->pos = spec_pos + 2u;
                     step++;
@@ -4266,6 +4317,10 @@ static int myds_generate_internal(myds_context_t *ctx,
                     }
                 } else {
                     // 推测树未命中！保留第 1 个真值
+                    if (checked_pld) {
+                        uint32_t b = ctx->spec_last_pld_bucket;
+                        if (b < 4) ctx->spec_pld_q[b] += 0.15 * (0.0 - ctx->spec_pld_q[b]);
+                    }
                     size_t piece_len = 0;
                     const char *piece = myds_tokenizer_decode_bytes(m->tokenizer, out_tokens[0], &piece_len);
                     if (!piece) {
@@ -4274,6 +4329,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                         break;
                     }
                     decode_emit(ctx, cb, bytes_cb, piece, piece_len, out_tokens[0], user_data);
+                    if (ctx->loop_detected) { stop_reason = MYDS_STOP_EOS; break; }
 
                     ctx->pos = spec_pos + 1u;
                     step++;
@@ -4379,6 +4435,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                     break;
                 }
                 decode_emit(ctx, cb, bytes_cb, piece, piece_len, true_next, user_data);
+                if (ctx->loop_detected) { stop_reason = MYDS_STOP_EOS; break; }
 
                 cur_token = true_next;
 
@@ -4472,6 +4529,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                     break;
                 }
                 decode_emit(ctx, cb, bytes_cb, piece, piece_len, next_token, user_data);
+                if (ctx->loop_detected) { stop_reason = MYDS_STOP_EOS; break; }
 
                 cur_token = next_token;
                 continue;
@@ -4524,6 +4582,8 @@ static int myds_generate_internal(myds_context_t *ctx,
                     // 第 1 个草稿 Token 命中！
                     pld_accepted++;
                     ctx->decode_stats.pld_accepted++;
+                    uint32_t b = ctx->spec_last_pld_bucket;
+                    if (b < 4) ctx->spec_pld_q[b] += 0.15 * (1.0 - ctx->spec_pld_q[b]);
 
                     // 1. 采纳第 1 个 Token (draft_tokens[0] / out_tokens[0])
                     if (pld_len < pld_cap) pld_history[pld_len++] = out_tokens[0];
@@ -4537,6 +4597,10 @@ static int myds_generate_internal(myds_context_t *ctx,
                         break;
                     }
                     decode_emit(ctx, cb, bytes_cb, piece0, piece_len0, out_tokens[0], user_data);
+                    if (ctx->loop_detected) {
+                        stop_reason = MYDS_STOP_EOS;
+                        break;
+                    }
 
                     step++;
 
@@ -4597,6 +4661,10 @@ static int myds_generate_internal(myds_context_t *ctx,
                         break;
                     }
                     decode_emit(ctx, cb, bytes_cb, piece1, piece_len1, out_tokens[1], user_data);
+                    if (ctx->loop_detected) {
+                        stop_reason = MYDS_STOP_EOS;
+                        break;
+                    }
 
                     ctx->pos = pld_pos + 2u;
                     step++;
@@ -4608,6 +4676,9 @@ static int myds_generate_internal(myds_context_t *ctx,
                     }
                 } else {
                     // 第 1 个草稿 Token 未命中！
+                    uint32_t b = ctx->spec_last_pld_bucket;
+                    if (b < 4) ctx->spec_pld_q[b] += 0.15 * (0.0 - ctx->spec_pld_q[b]);
+
                     // 回滚第 2 个槽位对 KV Cache 的污染修改，保留当前槽位的权威真值
                     /* The verifier already retains the authoritative first
                      * state on a miss; a second restore would clobber it. */
@@ -4623,6 +4694,10 @@ static int myds_generate_internal(myds_context_t *ctx,
                         break;
                     }
                     decode_emit(ctx, cb, bytes_cb, piece, piece_len, out_tokens[0], user_data);
+                    if (ctx->loop_detected) {
+                        stop_reason = MYDS_STOP_EOS;
+                        break;
+                    }
 
                     step++;
                     cur_token = out_tokens[0];
@@ -4685,6 +4760,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                     break;
                 }
                 decode_emit(ctx, cb, bytes_cb, piece, piece_len, true_next, user_data);
+                if (ctx->loop_detected) { stop_reason = MYDS_STOP_EOS; break; }
 
                 cur_token = true_next;
                 if (!matched) {

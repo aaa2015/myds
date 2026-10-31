@@ -7,6 +7,7 @@
 #include "myds_metal.h"
 #include "myds_v41.h"
 #include "myds_snapshot_slots.h"   /* MYDS_ANCHOR_SLOTS_MAX / myds_anchor_slot */
+#include "myds_loop_guard.h"
 #include <stdbool.h>
 #include <string.h>
 
@@ -176,6 +177,14 @@ struct myds_context {
     double               decode_target_ms;
     uint32_t             decode_costly_cycles;
     uint32_t             decode_cost_backoff;
+
+    /* LoopGuard: 周期性死循环检测器（借鉴 Project Maya LoopGuard） */
+    myds_loop_guard_t    loop_guard;
+    bool                 loop_detected;
+
+    /* 自适应投机解码控制器（借鉴 Project Maya spec::Controller） */
+    double               spec_pld_q[4];        /* 各 N-gram 长度桶 (2, 3, 4, 5+) 的在线 EMA 接受率 */
+    uint32_t             spec_last_pld_bucket; /* 当前在飞 PLD 草稿所在的长度桶 */
 
     /* Metal activation buffers */
     myds_metal_buffer_t *x;

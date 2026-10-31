@@ -46,18 +46,21 @@ static inline myds_pld_config_t myds_pld_default_config(int32_t eos_id) {
  * 在历史序列 tokens[0 .. pos-1] 中查找匹配末尾的 N-gram，并提取后续 token 作为草稿。
  *
  * 参数：
- *   tokens:    完整 token 序列缓冲区（包含 prompt 和已生成的 token）
- *   pos:       当前已生成的总 token 数量（即当前待预测位置）
- *   cfg:       PLD 配置参数
- *   out_draft: 接收提取到的 draft token 数组（至少需要 cfg.max_draft 空间）
+ *   tokens:         完整 token 序列缓冲区（包含 prompt 和已生成的 token）
+ *   pos:            当前已生成的总 token 数量（即当前待预测位置）
+ *   cfg:            PLD 配置参数
+ *   out_draft:      接收提取到的 draft token 数组（至少需要 cfg.max_draft 空间）
+ *   out_matched_ng: 输出实际匹配到的 N-gram 长度（可为 NULL）
  *
  * 返回：
  *   实际提取到的 draft token 数量（0 表示未匹配到任何可靠草稿）
  */
-static inline uint32_t myds_pld_propose(const int32_t *tokens,
-                                        uint32_t pos,
-                                        const myds_pld_config_t *cfg,
-                                        int32_t *out_draft) {
+static inline uint32_t myds_pld_propose_ex(const int32_t *tokens,
+                                           uint32_t pos,
+                                           const myds_pld_config_t *cfg,
+                                           int32_t *out_draft,
+                                           uint32_t *out_matched_ng) {
+    if (out_matched_ng) *out_matched_ng = 0;
     if (!tokens || !cfg || !out_draft || pos == 0 || cfg->max_draft == 0) return 0;
 
     const uint32_t min_ng = cfg->min_ngram ? cfg->min_ngram : 1;
@@ -100,6 +103,7 @@ static inline uint32_t myds_pld_propose(const int32_t *tokens,
                     }
                 }
                 if (actual > 0) {
+                    if (out_matched_ng) *out_matched_ng = ng;
                     return actual;
                 }
             }
@@ -107,6 +111,13 @@ static inline uint32_t myds_pld_propose(const int32_t *tokens,
     }
 
     return 0;
+}
+
+static inline uint32_t myds_pld_propose(const int32_t *tokens,
+                                        uint32_t pos,
+                                        const myds_pld_config_t *cfg,
+                                        int32_t *out_draft) {
+    return myds_pld_propose_ex(tokens, pos, cfg, out_draft, NULL);
 }
 
 #endif /* MYDS_PLD_H */

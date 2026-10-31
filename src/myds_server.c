@@ -4726,6 +4726,11 @@ int myds_server_start(myds_context_t *ctx, const char *host, int port, const cha
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
+    /* 服务端默认开启 LoopGuard 防护（防止低比特生成死循环，可通过 MYDS_LOOP_GUARD=0 禁用） */
+    if (getenv("MYDS_LOOP_GUARD") == NULL) {
+        setenv("MYDS_LOOP_GUARD", "1", 0);
+    }
+
     /* 2026-10-25: 把 fd 上限提升到合理值。
      * 默认 ulimit -n 常为 256，而每条连接占一个 fd ⇒ 265 条连接即 EMFILE。
      * 这里尝试抬到 4096（不超过硬上限），失败不致命——但至少让
