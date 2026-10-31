@@ -36,7 +36,7 @@ SRCS_C = src/myds_cpu.c src/myds_log.c src/myds_configfile.c src/myds_gguf.c src
          src/myds_vispre.c src/myds_visw.c src/myds_visfwd.c src/myds_vjob.c \
            src/myds_kvdsk.c \
          src/myds_server.c \
-         src/myds_steer.c
+         src/myds_steer.c src/myds_steer_alpha.c
 SRCS_M = src/myds_metal.m
 OBJS_C = $(patsubst src/%.c, $(BUILD_DIR)/%.o, $(SRCS_C))
 OBJS_M = $(patsubst src/%.m, $(BUILD_DIR)/%.o, $(SRCS_M))
@@ -80,6 +80,7 @@ TEST_DEEPER_SSD = $(BIN_DIR)/test_deeper_ssd
 TEST_GGUF = $(BIN_DIR)/test_gguf
 TEST_TOKENIZER = $(BIN_DIR)/test_tokenizer
 TEST_TOKENIZER_WORKSPACE = $(BIN_DIR)/test_tokenizer_workspace
+TEST_STEER_ALPHA = $(BIN_DIR)/test_steer_alpha
 TEST_SERVER = $(BIN_DIR)/test_server
 TEST_LOG = $(BIN_DIR)/test_log
 TEST_SERVER_API = $(BIN_DIR)/test_server_api
@@ -483,6 +484,12 @@ $(TEST_TOKENIZER_WORKSPACE): tests/test_tokenizer_workspace.c src/myds_tokenizer
 test-tokenizer: $(TEST_TOKENIZER) $(TEST_TOKENIZER_WORKSPACE)
 	./$(TEST_TOKENIZER)
 	./$(TEST_TOKENIZER_WORKSPACE)
+
+test-steer-alpha: $(TEST_STEER_ALPHA)
+	./$(TEST_STEER_ALPHA)
+
+$(TEST_STEER_ALPHA): tests/test_steer_alpha.c src/myds_steer_alpha.c include/myds_steer_alpha.h | $(BIN_DIR)
+	$(CC) $(CFLAGS) -Iinclude tests/test_steer_alpha.c src/myds_steer_alpha.c $(LDFLAGS) -o $@
 
 $(TEST_SERVER): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_vjob.o $(BUILD_DIR)/myds_vispre.o $(BUILD_DIR)/myds_visw.o $(BUILD_DIR)/myds_visfwd.o $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_engram_cpu.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_knobs.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/myds_steer.o $(BUILD_DIR)/test_server.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@

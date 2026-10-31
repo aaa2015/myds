@@ -4,6 +4,7 @@
 #include "myds_vjob.h"
 #include "myds_dspark.h"
 #include "myds_steer.h"
+#include "myds_steer_alpha.h"
 #include "myds_metal.h"
 #include "myds_log.h"
 #include "myds_configfile.h"
@@ -170,54 +171,6 @@ static int load_config_early(int argc, char *argv[]) {
      * 现在配置文件是唯一来源；环境变量里的 MYDS_* 会被配置值覆盖。
      * 唯一例外是 MYDS_CONFIG 本身（它在上方已读过，只用于定位本文件）。 */
     return myds_configfile_load(path, true);
-}
-
-/* MYDS_STEER_ALPHA 支持两种写法：
- *   1) 单个浮点数          "3.5"                -> 所有 profile 共用（旧行为，向后兼容）
- *   2) 分 profile 映射    "glp27:1.0,glp39:0.75" -> 各自独立；未列出的回落到文件默认(-1.0)
- *
- * 为什么需要第 2 种：一个 alpha 不可能同时正确。2026-10-31 实测（账本 §135–§137）
- * 在本机 Q2 权重上 glp39 的验证点是 0.75、glp27 是 1.0；共用一个值必然把其中一个
- * 推离它被测量时的运作点——glp27 用 3.5 会在 3/25 条上产生严重循环退化，
- * 而把 1.0 强行给 glp39 则会让它变成一个未被验证过的配置。
- *
- * 名字推导必须与 myds_steer.c 里的一致（那里决定 st->name），否则映射对不上。 */
-static float steer_alpha_for(const char *env, const char *profile_path)
-{
-    if (!env || !*env) return -1.0f;
-
-    /* 形式 1：纯浮点 => 全体共用 */
-    char *end = NULL;
-    float v = strtof(env, &end);
-    if (end && *end == '\0') return v;
-
-    /* 形式 2：name:alpha[,name:alpha...] */
-    char pname[64];
-    if (strstr(profile_path, "GLP-27") || strstr(profile_path, "glp-27") ||
-        strstr(profile_path, "glp27")) {
-        snprintf(pname, sizeof(pname), "glp27");
-    } else if (strstr(profile_path, "GLP-39") || strstr(profile_path, "glp-39") ||
-               strstr(profile_path, "glp39")) {
-        snprintf(pname, sizeof(pname), "glp39");
-    } else {
-        const char *slash = strrchr(profile_path, '/');
-        snprintf(pname, sizeof(pname), "%s", slash ? slash + 1 : profile_path);
-    }
-    const size_t nlen = strlen(pname);
-
-    for (const char *q = env; *q; ) {
-        while (*q == ',' || isspace((unsigned char)*q)) q++;
-        if (!*q) break;
-        const char *colon = strchr(q, ':');
-        if (!colon) break;                     /* 该项没有 ':' => 整串格式不符，停止 */
-        if ((size_t)(colon - q) == nlen && strncmp(q, pname, nlen) == 0) {
-            return (float)atof(colon + 1);
-        }
-        const char *comma = strchr(colon, ',');
-        if (!comma) break;
-        q = comma + 1;
-    }
-    return -1.0f;                              /* 未列出 => 用 profile 文件默认值 */
 }
 
 int main(int argc, char *argv[]) {
@@ -461,7 +414,7 @@ int main(int argc, char *argv[]) {
             if (*p) {
                 /* 优先级：CLI --steer-alpha > MYDS_STEER_ALPHA > profile 文件默认 */
                 float a = (steer_alpha >= 0.0f) ? steer_alpha
-                                                : steer_alpha_for(steer_alpha_env, p);
+                                                : myds_steer_alpha_for(steer_alpha_env, p);
                 myds_steer_t *st = myds_steer_load(p, a, steer_mode, steer_layers);
                 if (!st) {
                     MYDS_LOG_E("GLP 控制向量加载失败（%s）", p);
