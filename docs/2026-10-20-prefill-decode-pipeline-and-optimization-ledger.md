@@ -16833,3 +16833,94 @@ v3 13/25 打满 4096，v2 只有 1/25。
 α=1.0/2.0 各 10–11 条打满 4096（v2 仅 1 条），说明 v3 双钩更「能说」，
 但**打满 ≠ 退化**，判据是重复率。
 存盘 content 截断 1500 字符 ⇒ 循环统计基于前 1500 字符，可能低估长尾。
+
+---
+
+## §138 部署模型改为「产物下发」：macstudio 不再编译（2026-10-31）
+
+**结论：① macstudio 无法也不应编译；② 产物下发通道已建立并实测；
+③ 两个构建的二进制在本轮样本上逐位相同。**
+
+### 为什么必须这样
+
+`xcrun -f metal` 在 macstudio 上**无输出** ⇒ 没有 Metal 工具链。
+`bin/myds.metallib` 从来不可能在运行它的机器上复现。
+
+而旧流程 `sync_myds.sh` 的模型恰好相反：`--exclude='bin' --exclude='build'`，
+只传源码、指望远端 `make`。**这是一个从第一天就做不到的构建。**
+
+### 新通道 `tools/deploy_artifact.sh`（`6f9050b`）
+
+只传两个文件 —— 生产进程 `lsof` 里唯一打开的两个：
+
+```
+bin/myds            可执行文件
+bin/myds.metallib   Metal 内核库
+```
+
+不传源码、不在远端编译。护栏：
+- 远端旧产物先备份到 `bin/.prev-<时间戳>/`，回滚一条 `rsync -a`
+- 传完两端 sha256 比对，不一致 `exit 1`（不留半更新状态）
+- `--dry-run` / `--no-restart`
+- `src/include/Makefile` 脏树时告警并暂停 10 秒（脏树产物无法追到提交）
+- 只动这两个文件，`bench_*` / `test_*` 不动
+
+**重启走 E=3**：`start_fleet.sh` 比对（二进制 / metallib / start_fleet.sh / fleet.conf）
+的 mtime 与进程启动时刻。`rsync --no-times` 让远端取当前时间 ⇒ mtime 必更新 ⇒ 自动重启。
+不需要额外 kill。
+
+### 首次实跑的数值对照（这是关键）
+
+切换前二进制 `63b4cab8`（macstudio 编译，956088 B，10-31 06:37）
+→ 切换后 `1ef6cf71`（macmini 编译，956008 B，10-31 06:23）。
+
+**大小差 80 字节**（编译器/SDK 不同），所以必须先验证数值：
+3 组 prompt、`temperature=0`、greedy、`max_tokens=200`：
+
+| prompt | before | after | 结果 |
+|---|---|---|---|
+| plain 栈溢出 | `140f67a5e054d8bc` | `140f67a5e054d8bc` | SAME |
+| code 求最大值 | `4951e2abde83005a` | `4951e2abde83005a` | SAME |
+| explain 三次握手 | `15d713a7ee866fd6` | `15d713a7ee866fd6` | SAME |
+
+**3/3 逐位相同** ⇒ 80 字节差异不改变这类输出的数值路径。
+（这不等于全模型 logits 0-ULP 门，只是这三条 prompt 上的等价证据。）
+
+### 顺带修复：macstudio 的 `.git` 与部署代码脱节 10 天
+
+`git status` 曾显示 **8571 项删除 + 大量修改**。查明不是代码被改，是
+`.git` HEAD 停在 `5437df0`（**10-21**），而工作区是 macmini 10-31 的 rsync 镜像
+（`src+include+tests` 指纹两端一致 `75c79540601d6e07`）。
+
+两条血统**只有最初的 `Initial commit`（4-24）作共同祖先**，互不包含。
+
+风险：生产二进制从此工作区编译，而 `HEAD` 报 10-21 的提交 ⇒ 任何人
+`git checkout .` / `git reset --hard` 都会把工作区回滚到 10-21，**毁掉与线上对应的源码**。
+
+处置（可复原）：
+```
+git branch backup/lineage-2026-10-21 5437df0   # 钉住旧血统
+git reset --hard origin/main                   # .git 与部署代码对齐
+```
+结果：脏项 8571 → **2**（均为未跟踪目录），源码指纹不变，产物与生产不受影响。
+旧血统 `+512/−6834` 相对新线是纯子集（缺 `myds_steer.h/.c`、`myds_knobs.h/.c`、
+`myds_debugstate`、`configfile` 等整套模块），无独有内容需要救。
+
+### 最终状态
+
+| 项 | 值 |
+|---|---|
+| 生产 PID | `21831`（原 `87472` 已退出） |
+| 运行二进制 | `1ef6cf71`（macmini 构建） |
+| metallib | `787f9d7d`（未变） |
+| 备份 | `bin/.prev-20261031-201401/` |
+| 工作树 | 干净（2 个未跟踪目录） |
+| GLP | `glp27 enabled=0` / `glp39 enabled=0`（§136 保持） |
+
+### 边界
+
+- 只验了 3 条 prompt 的文本等价，**未跑全模型 logits/state 0-ULP 门**。
+  若要严格，应在 macmini 与 macstudio 上对同一 prompt 比对 logits 前 N 位。
+- 80 字节差异的**成因**仍未查（clang 21.0.0.1 vs macmini 的版本？SDK 差异？）。
+  现在它的实际影响被降为零（只有一个构建者），但它意味着
+  「同源码不同编译机 ⇒ 不同二进制」，跨机 0-ULP 断言必须附构建机身份。
