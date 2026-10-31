@@ -13,9 +13,9 @@
 #   bin/myds           可执行文件
 #   bin/myds.metallib  Metal 内核库
 #
-# 重启语义：不主动 kill。start_fleet.sh 的 E=3 会比对
-#   （二进制 / metallib / start_fleet.sh / fleet.conf）的 mtime 与进程启动时刻，
-#   产物落地后 mtime 必然更新 ⇒ 自动重启。所以本脚本【传完就能生效】。
+# 重启语义（2026-10-31 改）：fleet.conf 的 8187 已从 E=3 改为 E=1，
+#   E=1 不会因产物变化自动重启，所以本脚本【自己负责 stop → start】。
+#   停止前会校验 pid 的命令行确实含 bin/myds，避免误杀。
 #
 # 安全措施：
 #   · 传送前把远端旧产物备份到 bin/.prev-<时间戳>/，失败可一条 rsync 回滚
@@ -113,10 +113,40 @@ if [[ $MISMATCH -ne 0 ]]; then
     exit 1
 fi
 
-# ── 5) 启动 / 智能重启 ─────────────────────────────────────────────
+# ── 5) 重启 ───────────────────────────────────────────────
+# 2026-10-31：fleet.conf 里 8187 已从 E=3 改为 E=1。
+# E=3 原本靠「产物 mtime 比进程新」自动重启；E=1 只在没跑时启动。
+# 所以重启必须由本脚本自己负责 —— 否则产物落地了但进程还跑旧二进制，
+# 且 start_fleet.sh 会打印「已经在位」让人以为成功了。
 if [[ $DO_RESTART -eq 1 ]]; then
     echo
-    echo "🚀 调 start_fleet.sh（E=3 会因产物 mtime 更新而重启 8187）"
+    echo "🛑 停止 8187（E=1 不会自动重启，由本脚本负责）"
+    ssh "$REMOTE_HOST" '
+        PID=$(lsof -nP -t -a -iTCP:8187 -sTCP:LISTEN 2>/dev/null | head -1)
+        if [ -z "$PID" ]; then echo "   8187 没有在跑，直接启动"; exit 0; fi
+        CMD=$(ps -o command= -p "$PID" 2>/dev/null)
+        case "$CMD" in
+            *bin/myds*) : ;;
+            *) echo "   ⚠️ pid $PID 不是 myds，拒绝 kill"; exit 3 ;;
+        esac
+        echo "   停止 pid $PID"
+        kill -TERM "$PID" 2>/dev/null || true
+        for i in $(seq 1 30); do kill -0 "$PID" 2>/dev/null || break; sleep 0.2; done
+        if kill -0 "$PID" 2>/dev/null; then
+            echo "   SIGTERM 无效，SIGKILL"
+            kill -9 "$PID" 2>/dev/null || true
+            for i in $(seq 1 150); do kill -0 "$PID" 2>/dev/null || break; sleep 0.2; done
+        fi
+        if kill -0 "$PID" 2>/dev/null; then echo "   ❌ pid $PID 杀不掉"; exit 4; fi
+        echo "   已退出，内存已归还"
+    '
+    STOP_RC=$?
+    if [[ $STOP_RC -ne 0 ]]; then
+        echo "❌ 停止失败（rc=$STOP_RC），不启动。产物已就位，可人工处理。" >&2
+        exit 1
+    fi
+
+    echo "🚀 启动"
     ssh "$REMOTE_HOST" "export PATH=/opt/homebrew/bin:/usr/local/bin:\$PATH; \
         cd '$FLEET_DIR' && ./start_fleet.sh" 2>&1 | tail -15
     echo
@@ -125,7 +155,8 @@ if [[ $DO_RESTART -eq 1 ]]; then
     echo
 else
     echo
-    echo "ℹ️  已跳过启动。下次 start_fleet.sh 会因 mtime 更新自动重启 8187。"
+    echo "ℹ️  已跳过重启（--no-restart）。产物已就位，但【运行中的进程仍是旧二进制】；"
+    echo "   要生效需手动停掉 8187 再跑 start_fleet.sh（E=1 不会因产物变化自动重启）。"
 fi
 
 echo
