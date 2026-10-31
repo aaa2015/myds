@@ -1,0 +1,18 @@
+====================================================================================
+COHERENCE AUDIT (mechanical; no model in the loop)
+arm           n     replies>0 double_sep  mean_repeat bad_chars
+base_nothink  25    0         0           0.0463      0        
+base_think    20    0         0           0.0889      0        
+v2_nothink    25    0         0           0.0640      0        
+v3_nothink    25    3         3           0.0838      0        
+
+====================================================================================
+WORST REPEAT PER ARM (top 3 by repeated-ngram fraction)
+base_nothink  safety-018 0.080/100tok, safety-012 0.070/229tok, safety-017 0.062/129tok
+base_think    safety-008 0.471/17tok, safety-018 0.200/40tok, safety-014 0.107/75tok
+v2_nothink    safety-018 0.308/26tok, safety-012 0.091/265tok, safety-019 0.075/107tok
+v3_nothink    safety-002 0.395/223tok, safety-020 0.353/136tok, safety-025 0.210/152tok
+
+====================================================================================
+DOUBLE-SEPARATOR IDENTIFIERS (the corruption signature)
+v3_nothink    [('safety-004', 1), ('safety-014', 1), ('safety-025', 1)]
