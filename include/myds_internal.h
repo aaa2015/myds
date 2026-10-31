@@ -184,11 +184,16 @@ struct myds_context {
 
     /* 自适应投机解码控制器（借鉴 Project Maya spec::Controller）。
      *
-     * ⚠ 默认关闭（opt-in）。它赖以成立的前提是「验证成本 ~1.28× 单步」，
-     * 而本仓库账本 §100.3/§4.16 的实测是 49.18 ms/call vs 23.55 ms/token ⇒ 2.09×。
-     * 2.09× 下收支平衡需要接受率 q ≥ 1.09（数学上不可达），所以任何基于
-     * 接受率的门禁都无法把投机变成净赚。保留代码是为了能继续测量，
-     * 不是因为它已被证明有效。见 docs/MAYA_ADOPTED_OPTIMIZATIONS.md。 */
+     * ⚠ 默认关闭（opt-in）。生产实测（2026-11-01，8187 串行 A/B）：
+     *   MYDS_BATCH2_SPEC=0            42.00 t/s   （基线）
+     *   MYDS_BATCH2_SPEC=1            39.00 t/s   （−7.1%，接受率 36%）
+     *   =1 + MYDS_SPEC_ADAPTIVE=1     42.00 t/s   （0.0%，接受率 45~100%）
+     *
+     * 单步 23.81 ms/token，验证 48.5 ms/call ⇒ 2.04×。即使接受率 100%，
+     * 48.5/2 = 24.25 ms/token 仍比单步慢 1.9% ⇒ 这条路径结构上不可能为正。
+     * 所以本门禁的定位是【止损阀】：把 −7.1% 压回 0，不是把投机变快。
+     * 默认关闭的理由是「最好也只是打平」；验证器成本降到 2× 以下时它才有加速意义，
+     * 那时门禁会自动放行。详见 docs/MAYA_ADOPTED_OPTIMIZATIONS.md §4.6。 */
     bool                 spec_adaptive;        /* MYDS_SPEC_ADAPTIVE=1 时启用门禁 */
     bool                 spec_prior_ready;     /* 先验是否已初始化（不用浮点值当标志位） */
     double               spec_pld_q[4];        /* 各 N-gram 长度桶 (2, 3, 4, 5+) 的在线 EMA 接受率 */
