@@ -9,3 +9,10 @@ tests/verify_metal
 tests/test_metal
 scratch/
 *.metallib
+
+# 跑批结果目录：README 明确说「你自己跑出来的结果放这里（不入库）」。
+# 不加这条会一直以未跟踪状态出现在 git status 里，淹没真正需要看的改动。
+benchmarks/*/runs/
+# 旧同步机制（sync_myds.sh）的源码快照。已被 deploy_artifact.sh 取代，
+# 内容等价于某个历史提交（源码全在 git 里）⇒ 不跟踪。
+.deploy-prev/
