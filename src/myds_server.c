@@ -179,15 +179,36 @@ static inline uint32_t reported_completion_tokens(uint32_t content, bool eos) {
     return content + (eos ? 1u : 0u);
 }
 
-static void server_usage_extra_json(myds_context_t *ctx, uint32_t out_tokens,
-                                    double t_first, double t_last, double t_end,
-                                    bool eos_generated, char *out, size_t cap) {
+/* 一次算清、四处复用的计时结构。
+ *
+ * 为什么抽成结构体：同一组数字要出现在三个位置（usage 里的扁平字段、
+ * usage.timings、响应顶层的 timings），而客户端读的位置各不相同 ——
+ * mycode 读顶层 `timings` 或 `response.timings`，myagent 的 Flutter 层读
+ * `usage.prompt_tps`。三处各算一遍必然会漂。
+ *
+ * 口径（与 DeepSeek / llama.cpp 一致）：
+ *   prompt_n  本次真正跑过 prefill 的 token 数（不含命中缓存的）
+ *   cached    prompt_tokens - prompt_n —— 「没有花 prefill 算力」的那部分
+ *   predicted_n decode 步数，生成 EOS 时含求 EOS 的那一步
+ */
+typedef struct {
+    uint32_t prompt_n;
+    uint32_t dec_n;
+    uint32_t cached;
+    double   prompt_ms, prompt_ps;
+    double   dec_ms, dec_ps;
+} myds_timings_t;
+
+static void server_timings_compute(myds_context_t *ctx, uint32_t out_tokens,
+                                   double t_first, double t_end, bool eos_generated,
+                                   myds_timings_t *t) {
+    memset(t, 0, sizeof(*t));
     myds_prefill_stats_t pf;
     myds_last_prefill_stats(ctx, &pf);
 
     const bool have_prompt = pf.valid && pf.prompt_tokens > 0;
     const uint32_t prompt_tokens = have_prompt ? pf.prompt_tokens : 0u;
-    const uint32_t prompt_n = have_prompt ? pf.prefill_tokens : 0u;
+    t->prompt_n = have_prompt ? pf.prefill_tokens : 0u;
 
     /* cached 的定义是「没有花 prefill 算力的 prompt token」，即 prompt - prefill_n。
      *
@@ -196,58 +217,62 @@ static void server_usage_extra_json(myds_context_t *ctx, uint32_t out_tokens,
      * (prompt_tokens - cached_tokens) / ttft 反推 prefill 速率时，那个 +1 会让
      * 「全部命中」误显示成「1 token 用了 138ms = 7.2 t/s」。
      * 按「没重算」定义，全命中时残留为 0，客户端不会再编出一个速率。 */
-    const uint32_t cached = have_prompt ? (prompt_tokens - prompt_n) : 0u;
-    const double prompt_ms = (have_prompt && prompt_n > 0 && pf.prefill_seconds > 0.0)
+    t->cached = have_prompt ? (prompt_tokens - t->prompt_n) : 0u;
+
+    t->prompt_ms = (have_prompt && t->prompt_n > 0 && pf.prefill_seconds > 0.0)
         ? pf.prefill_seconds * 1000.0 : -1.0;
-    const double prompt_ps = (prompt_n > 0 && pf.prefill_seconds > 0.0)
-        ? (double)prompt_n / pf.prefill_seconds : -1.0;
+    t->prompt_ps = (t->prompt_n > 0 && pf.prefill_seconds > 0.0)
+        ? (double)t->prompt_n / pf.prefill_seconds : -1.0;
 
-    /* decode 步数与窗口：与日志、trace 用同一套判定（含 EOS 那一步）。 */
-    double dec_ms = -1.0, dec_ps = -1.0;
-    uint32_t dec_n = 0;
+    t->dec_ms = -1.0;
     if (out_tokens > 0 && t_first > 0.0 && t_end > t_first) {
-        dec_ms = (t_end - t_first) * 1000.0;
-        dec_n = eos_generated ? out_tokens : (out_tokens > 0 ? out_tokens - 1u : 0u);
+        t->dec_ms = (t_end - t_first) * 1000.0;
+        t->dec_n = eos_generated ? out_tokens : (out_tokens > 0 ? out_tokens - 1u : 0u);
     }
-    if (dec_n > 0 && dec_ms > 0.0) dec_ps = (double)dec_n / (dec_ms / 1000.0);
+    t->dec_ps = (t->dec_n > 0 && t->dec_ms > 0.0)
+        ? (double)t->dec_n / (t->dec_ms / 1000.0) : -1.0;
+}
 
+/* 只产出 timings 对象本身（不含前导逗号），供「放在哪」由调用方决定。 */
+static void server_timings_json(const myds_timings_t *t, char *out, size_t cap) {
     char pms[24] = "null", pps[24] = "null", dms[24] = "null", dps[24] = "null";
-    if (prompt_ms >= 0.0) snprintf(pms, sizeof(pms), "%.3f", prompt_ms);
-    if (prompt_ps >= 0.0) snprintf(pps, sizeof(pps), "%.2f", prompt_ps);
-    if (dec_ms >= 0.0) snprintf(dms, sizeof(dms), "%.3f", dec_ms);
-    if (dec_ps >= 0.0) snprintf(dps, sizeof(dps), "%.2f", dec_ps);
-
-    /* 补上 llama.cpp timings 里另外两个字段（每 token 毫秒），
-     * 少一个就可能让按字段名硬读的客户端拿到空值。 */
     char ptm[24] = "null", dtm[24] = "null";
-    if (prompt_ms >= 0.0 && prompt_n > 0) snprintf(ptm, sizeof(ptm), "%.4f", prompt_ms / prompt_n);
-    if (dec_ms >= 0.0 && dec_n > 0) snprintf(dtm, sizeof(dtm), "%.4f", dec_ms / dec_n);
+    if (t->prompt_ms >= 0.0) snprintf(pms, sizeof(pms), "%.3f", t->prompt_ms);
+    if (t->prompt_ps >= 0.0) snprintf(pps, sizeof(pps), "%.2f", t->prompt_ps);
+    if (t->dec_ms >= 0.0) snprintf(dms, sizeof(dms), "%.3f", t->dec_ms);
+    if (t->dec_ps >= 0.0) snprintf(dps, sizeof(dps), "%.2f", t->dec_ps);
+    if (t->prompt_ms >= 0.0 && t->prompt_n > 0)
+        snprintf(ptm, sizeof(ptm), "%.4f", t->prompt_ms / t->prompt_n);
+    if (t->dec_ms >= 0.0 && t->dec_n > 0)
+        snprintf(dtm, sizeof(dtm), "%.4f", t->dec_ms / t->dec_n);
 
-    /* cache_hit_rate 用百分比（0-100），与 trace 页面和常见看板一致；
-     * 取不到时 null 而不是 0。 */
-    char chr_buf[24] = "null";
-    if (have_prompt && prompt_tokens > 0)
+    snprintf(out, cap,
+             "{\"prompt_n\":%u,\"prompt_ms\":%s,\"prompt_per_token_ms\":%s,"
+             "\"prompt_per_second\":%s,\"predicted_n\":%u,\"predicted_ms\":%s,"
+             "\"predicted_per_token_ms\":%s,\"predicted_per_second\":%s,\"cache_n\":%u}",
+             t->prompt_n, pms, ptm, pps, t->dec_n, dms, dtm, dps, t->cached);
+}
+
+/* usage 里的扩展段。timings 在这份里是嵌套的（usage.timings），
+ * 同时把速率扁平化（prompt_tps 等）—— 不同客户端读不同位置。 */
+static void server_usage_extra_json(const myds_timings_t *t, char *out, size_t cap) {
+    char pps[24] = "null", dps[24] = "null", chr_buf[24] = "null";
+    if (t->prompt_ps >= 0.0) snprintf(pps, sizeof(pps), "%.2f", t->prompt_ps);
+    if (t->dec_ps >= 0.0) snprintf(dps, sizeof(dps), "%.2f", t->dec_ps);
+    if (t->cached + t->prompt_n > 0)
         snprintf(chr_buf, sizeof(chr_buf), "%.2f",
-                 100.0 * (double)cached / (double)prompt_tokens);
+                 100.0 * (double)t->cached / (double)(t->cached + t->prompt_n));
 
-    /* 扁平字段：客户端（myagent 等）读的是 prompt_tps / server_prompt_tps /
-     * completion_tps / server_predicted_tps，不是 timings 里的嵌套值。
-     * 两套名字都给，谁读哪套都能拿到服务器算好的数，不必自己反推 ——
-     * 它们自己反推时用 (prompt_tokens - cached_tokens) / ttft，在全命中时
-     * 会算出「1 token / 138ms = 7.2 t/s」这种数。 */
+    char tim[384];
+    server_timings_json(t, tim, sizeof(tim));
+
     snprintf(out, cap,
              ",\"prompt_tps\":%s,\"completion_tps\":%s,"
              "\"server_prompt_tps\":%s,\"server_predicted_tps\":%s"
              ",\"prompt_tokens_details\":{\"cached_tokens\":%u}"
              ",\"cache_hit_tokens\":%u,\"cache_hit_rate\":%s"
-             ",\"timings\":{\"prompt_n\":%u,\"prompt_ms\":%s,"
-             "\"prompt_per_token_ms\":%s,\"prompt_per_second\":%s,"
-             "\"predicted_n\":%u,\"predicted_ms\":%s,"
-             "\"predicted_per_token_ms\":%s,\"predicted_per_second\":%s,"
-             "\"cache_n\":%u}",
-             pps, dps, pps, dps,
-             cached, cached, chr_buf,
-             prompt_n, pms, ptm, pps, dec_n, dms, dtm, dps, cached);
+             ",\"timings\":%s",
+             pps, dps, pps, dps, t->cached, t->cached, chr_buf, tim);
 }
 
 static bool myds_server_request_phases_enabled(void) {
@@ -1307,6 +1332,21 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                         stop_reason = sctx.failed ? MYDS_STOP_ERROR : MYDS_STOP_CANCELLED;
                     }
                 }
+                /* 流式分支也要算一份 timings：response.completed 里要带它，
+                 * mycode 从 response.timings 读。此时生成已结束，t_end 取当前时刻。 */
+                myds_timings_t tim;
+                server_timings_compute(ctx, final_tokens, t_first, myds_server_now_s(),
+                                       (stop_reason == MYDS_STOP_EOS), &tim);
+                char top_timings[384];
+                server_timings_json(&tim, top_timings, sizeof(top_timings));
+                /* Responses 的 usage 明细。用 input_tokens_details 是 OpenAI
+                 * Responses 的标准位置；mycode 与官方 SDK 都认它。 */
+                char usage_det[96];
+                snprintf(usage_det, sizeof(usage_det),
+                         "\"input_tokens_details\":{\"cached_tokens\":%u},"
+                         "\"prompt_tokens_details\":{\"cached_tokens\":%u}",
+                         tim.cached, tim.cached);
+
                 /* 拆分 reasoning 与 content */
                 const char *reasoning_ptr = NULL;
                 size_t reasoning_len = 0;
@@ -1362,8 +1402,9 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                         char *items = responses_output_items_json_ex(
                             sctx.thinking, reasoning_ptr, reasoning_len, content_ptr, content_len, stool, stool_count);
                         const bool finished = items && sse_emit_responses_finish(
-                            &sctx, model_alias, resp_id, (unsigned)prompt_tokens, (unsigned)final_tokens,
-                            "", 0, items, 0);
+                            &sctx, model_alias, resp_id, (unsigned)prompt_tokens,
+                            (unsigned)reported_completion_tokens(final_tokens, stop_reason == MYDS_STOP_EOS),
+                            "", 0, items, 0, top_timings, usage_det);
                         free(items);
                         if (!finished) stop_reason = MYDS_STOP_ERROR;
                     }
@@ -1378,8 +1419,10 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                         sctx.thinking, reasoning_ptr, reasoning_len, content_ptr, content_len, NULL, 0);
                     int emit_text_events = (sctx.think_state != 1) ? 1 : 0;
                     const bool finished = items && sse_emit_responses_finish(
-                        &sctx, model_alias, resp_id, (unsigned)prompt_tokens, (unsigned)final_tokens,
-                        content_ptr, content_len, items, emit_text_events);
+                        &sctx, model_alias, resp_id, (unsigned)prompt_tokens,
+                            (unsigned)reported_completion_tokens(final_tokens, stop_reason == MYDS_STOP_EOS),
+                        content_ptr, content_len, items, emit_text_events, top_timings,
+                        usage_det);
                     free(items);
                     if (!finished) {
                         stop_reason = MYDS_STOP_ERROR;
@@ -1401,15 +1444,17 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                     if (sent && include_usage) {
                         /* 流式分支的这个 usage 块在 finish 事件之后才发，
                          * 此时 t_last 已定；t_end 取当前时刻（生成已经结束）。 */
-                        /* 768 不是随手写的：这段 JSON 现在约 400 字符（扁平字段 + timings 九个键）。
- * 原来 384，加了字段后被 snprintf 截断，末尾少一个括号，整个响应无法解析。
- * 截断的 JSON 比拒绝更糟 —— 客户端只说“解析失败”，看不出是我们截的。 */
-        char usage_extra[768];
-                        server_usage_extra_json(ctx, final_tokens, t_first, t_last,
-                                                myds_server_now_s(), (stop_reason == MYDS_STOP_EOS),
-                                                usage_extra, sizeof(usage_extra));
+                        /* 768 不是随手写的：这段 JSON 约 400 字符（扁平字段 + timings 九个键）。
+                         * 原来 384，加了字段后被 snprintf 截断，末尾少一个括号，整个响应无法解析。
+                         * 截断的 JSON 比拒绝更糟 —— 客户端只说“解析失败”，看不出是我们截的。 */
+                        char usage_extra[768];
+                        myds_timings_t tim;
+                        server_timings_compute(ctx, final_tokens, t_first,
+                                               myds_server_now_s(),
+                                               (stop_reason == MYDS_STOP_EOS), &tim);
+                        server_usage_extra_json(&tim, usage_extra, sizeof(usage_extra));
                         len = snprintf(chunk, sizeof(chunk),
-                            "data: {\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u%s}}\n\n",
+                            "data: {\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u%s}\n\n",
                             prompt_tokens, reported_completion_tokens(final_tokens, stop_reason == MYDS_STOP_EOS), prompt_tokens + reported_completion_tokens(final_tokens, stop_reason == MYDS_STOP_EOS), usage_extra);
                         sent = len > 0 && (size_t)len < sizeof(chunk) && myds_server_sse_send(&sctx, chunk, (size_t)len);
                     }
@@ -1466,13 +1511,18 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 char *response = NULL;
                 /* usage 扩展段（缓存明细 + timings）。必须在构造 response 之前算好，
                  * 因为 t_end 在这里就是「生成刚返回」的时刻。 */
-                /* 768 不是随手写的：这段 JSON 现在约 400 字符（扁平字段 + timings 九个键）。
- * 原来 384，加了字段后被 snprintf 截断，末尾少一个括号，整个响应无法解析。
- * 截断的 JSON 比拒绝更糟 —— 客户端只说“解析失败”，看不出是我们截的。 */
-        char usage_extra[768];
-                server_usage_extra_json(ctx, final_tokens, t_first, t_last,
-                                        myds_server_now_s(), (stop_reason == MYDS_STOP_EOS),
-                                        usage_extra, sizeof(usage_extra));
+                /* 768 不是随手写的：这段 JSON 约 400 字符（扁平字段 + timings 九个键）。
+                 * 原来 384，加了字段后被 snprintf 截断，末尾少一个括号，整个响应无法解析。
+                 * 截断的 JSON 比拒绝更糟 —— 客户端只说“解析失败”，看不出是我们截的。 */
+                char usage_extra[768];
+                myds_timings_t tim;
+                server_timings_compute(ctx, final_tokens, t_first, myds_server_now_s(),
+                                       (stop_reason == MYDS_STOP_EOS), &tim);
+                server_usage_extra_json(&tim, usage_extra, sizeof(usage_extra));
+                /* 顶层 timings —— mycode 的 ChatCompletionResponse.timings 读这里，
+                 * 不是 usage 里面。两份都给：不同客户端读不同位置。 */
+                char top_timings[384];
+                server_timings_json(&tim, top_timings, sizeof(top_timings));
                 /* LOOP_GUARD 归入 "length"：输出确实被截断了，客户端必须能分辨。
                  * 映射成 "stop" 会让半截答案看起来像正常收尾（原实现的问题）。 */
                 const char *finish = (stop_reason == MYDS_STOP_LENGTH || stop_reason == MYDS_STOP_CTX_FULL ||
@@ -1565,10 +1615,11 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                         response = items_json ? format_alloc(
                             "{\"id\":\"%s\",\"object\":\"response\",\"created_at\":%ld,"
                             "\"status\":\"completed\",\"model\":\"%s\",\"output\":%s,"
-                            "\"usage\":{\"input_tokens\":%u,\"output_tokens\":%u,\"total_tokens\":%u%s}}",
+                            "\"usage\":{\"input_tokens\":%u,\"output_tokens\":%u,\"total_tokens\":%u%s},\"timings\":%s}",
                             resp_id, now, alias_json, items_json,
-                            prompt_tokens, reported_completion_tokens(final_tokens, stop_reason == MYDS_STOP_EOS), prompt_tokens + reported_completion_tokens(final_tokens, stop_reason == MYDS_STOP_EOS),
-                            usage_extra) : NULL;
+                            prompt_tokens, reported_completion_tokens(final_tokens, stop_reason == MYDS_STOP_EOS),
+                            prompt_tokens + reported_completion_tokens(final_tokens, stop_reason == MYDS_STOP_EOS),
+                            usage_extra, top_timings) : NULL;
                     } else if (tool_count && calls_json && content_field) {
                         if (reasoning_escaped) {
                             response = format_alloc(
@@ -1576,18 +1627,18 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                                 "\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\","
                                 "\"content\":%s,\"reasoning_content\":\"%s\",\"tool_calls\":%s},"
                                 "\"finish_reason\":\"%s\"}],"
-                                "\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u%s}}",
+                                "\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u%s},\"timings\":%s}",
                                 now, alias_json, content_field, reasoning_escaped, calls_json, finish,
-                                prompt_tokens, reported_completion_tokens(final_tokens, stop_reason == MYDS_STOP_EOS), prompt_tokens + reported_completion_tokens(final_tokens, stop_reason == MYDS_STOP_EOS), usage_extra);
+                                prompt_tokens, reported_completion_tokens(final_tokens, stop_reason == MYDS_STOP_EOS), prompt_tokens + reported_completion_tokens(final_tokens, stop_reason == MYDS_STOP_EOS), usage_extra, top_timings);
                         } else {
                             response = format_alloc(
                                 "{\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion\",\"created\":%ld,"
                                 "\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\","
                                 "\"content\":%s,\"tool_calls\":%s},"
                                 "\"finish_reason\":\"%s\"}],"
-                                "\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u%s}}",
+                                "\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u%s},\"timings\":%s}",
                                 now, alias_json, content_field, calls_json, finish,
-                                prompt_tokens, reported_completion_tokens(final_tokens, stop_reason == MYDS_STOP_EOS), prompt_tokens + reported_completion_tokens(final_tokens, stop_reason == MYDS_STOP_EOS), usage_extra);
+                                prompt_tokens, reported_completion_tokens(final_tokens, stop_reason == MYDS_STOP_EOS), prompt_tokens + reported_completion_tokens(final_tokens, stop_reason == MYDS_STOP_EOS), usage_extra, top_timings);
                         }
                     } else {
                         if (reasoning_escaped) {
@@ -1595,15 +1646,15 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                                 "{\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion\",\"created\":%ld,"
                                 "\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\",\"reasoning_content\":\"%s\"},"
                                 "\"finish_reason\":\"%s\"}],"
-                                "\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u%s}}",
-                                now, alias_json, body_escaped, reasoning_escaped, finish, prompt_tokens, reported_completion_tokens(final_tokens, stop_reason == MYDS_STOP_EOS), prompt_tokens + reported_completion_tokens(final_tokens, stop_reason == MYDS_STOP_EOS), usage_extra);
+                                "\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u%s},\"timings\":%s}",
+                                now, alias_json, body_escaped, reasoning_escaped, finish, prompt_tokens, reported_completion_tokens(final_tokens, stop_reason == MYDS_STOP_EOS), prompt_tokens + reported_completion_tokens(final_tokens, stop_reason == MYDS_STOP_EOS), usage_extra, top_timings);
                         } else {
                             response = format_alloc(
                                 "{\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion\",\"created\":%ld,"
                                 "\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\"},"
                                 "\"finish_reason\":\"%s\"}],"
-                                "\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u%s}}",
-                                now, alias_json, body_escaped, finish, prompt_tokens, reported_completion_tokens(final_tokens, stop_reason == MYDS_STOP_EOS), prompt_tokens + reported_completion_tokens(final_tokens, stop_reason == MYDS_STOP_EOS), usage_extra);
+                                "\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u%s},\"timings\":%s}",
+                                now, alias_json, body_escaped, finish, prompt_tokens, reported_completion_tokens(final_tokens, stop_reason == MYDS_STOP_EOS), prompt_tokens + reported_completion_tokens(final_tokens, stop_reason == MYDS_STOP_EOS), usage_extra, top_timings);
                         }
                     }
                 }

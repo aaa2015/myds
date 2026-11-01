@@ -677,7 +677,9 @@ bool sse_emit_responses_finish(myds_sse_stream_ctx_t *sctx,
                                unsigned output_tokens,
                                const char *text, size_t text_len,
                                const char *output_items_json,
-                               int emit_text_events) {
+                               int emit_text_events,
+                               const char *timings_json,
+                               const char *usage_extra_json) {
     if (!sctx || sctx->cancel_flag || sctx->failed) return false;
     char *alias_json = json_escape_alloc(model_alias ? model_alias : "myds",
                                         strlen(model_alias ? model_alias : "myds"));
@@ -687,6 +689,23 @@ bool sse_emit_responses_finish(myds_sse_stream_ctx_t *sctx,
         free(text_json);
         return false;
     }
+    /* response.completed 里带 timings —— mycode 读的是 response.timings，
+     * 不是 usage.timings。
+     *
+     * 为什么放在这个事件而不是另发一个：客户端解析 response.completed 时
+     * 已经拿到了 id 与 usage，计时放在同一帧里，它一次就能对齐。
+     * timings_json 为空时这段整个不出现，不会留下 "timings":null 这种噪声。 */
+    char timings_frag[420] = "";
+    if (timings_json && timings_json[0])
+        snprintf(timings_frag, sizeof(timings_frag), ",\"timings\":%s", timings_json);
+
+    /* Responses 的 usage 里也要带缓存明细。
+     * mycode 的 responses_usage_to_usage 读 input_tokens_details.cached_tokens
+     * （也接受 prompt_tokens_details / cached_tokens）。不给的话，整条
+     * Responses 流的缓存命中永远是 0 —— 而它正是这个协议下唯一的缓存出口。 */
+    char usage_frag[160] = "";
+    if (usage_extra_json && usage_extra_json[0])
+        snprintf(usage_frag, sizeof(usage_frag), ",%s", usage_extra_json);
     const int out_idx = sctx ? sctx->msg_output_index : 0;
     const char *items = output_items_json ? output_items_json : "[]";
     char *completed = emit_text_events
@@ -698,14 +717,14 @@ bool sse_emit_responses_finish(myds_sse_stream_ctx_t *sctx,
             "event: response.output_item.done\n"
             "data: {\"type\":\"response.output_item.done\",\"output_index\":%d,\"item\":{\"type\":\"message\",\"id\":\"msg_myds_1\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"%s\"}]}}\n\n"
             "event: response.completed\n"
-            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"%s\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"%s\",\"output\":%s,\"usage\":{\"input_tokens\":%u,\"output_tokens\":%u,\"total_tokens\":%u}}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"%s\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"%s\",\"output\":%s,\"usage\":{\"input_tokens\":%u,\"output_tokens\":%u,\"total_tokens\":%u%s}%s}}\n\n",
             out_idx, text_json, out_idx, text_json, out_idx, text_json, resp_id, alias_json, items,
-            prompt_tokens, output_tokens, prompt_tokens + output_tokens)
+            prompt_tokens, output_tokens, prompt_tokens + output_tokens, usage_frag, timings_frag)
         : format_alloc(
             "event: response.completed\n"
-            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"%s\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"%s\",\"output\":%s,\"usage\":{\"input_tokens\":%u,\"output_tokens\":%u,\"total_tokens\":%u}}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"%s\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"%s\",\"output\":%s,\"usage\":{\"input_tokens\":%u,\"output_tokens\":%u,\"total_tokens\":%u%s}%s}}\n\n",
             resp_id, alias_json, items,
-            prompt_tokens, output_tokens, prompt_tokens + output_tokens);
+            prompt_tokens, output_tokens, prompt_tokens + output_tokens, usage_frag, timings_frag);
     free(alias_json);
     free(text_json);
     if (!completed) return false;

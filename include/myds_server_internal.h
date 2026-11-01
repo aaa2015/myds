@@ -222,7 +222,9 @@ bool sse_emit_responses_function_calls(myds_sse_stream_ctx_t *sctx,
 bool sse_emit_responses_finish(myds_sse_stream_ctx_t *sctx, const char *model_alias,
                                const char *resp_id, unsigned prompt_tokens, unsigned output_tokens,
                                const char *text, size_t text_len,
-                               const char *output_items_json, int emit_text_events);
+                               const char *output_items_json, int emit_text_events,
+                               const char *timings_json,
+                               const char *usage_extra_json);
 /* 文本响应的 output 数组（一条 message 项），内部自己转义。 */
 char *responses_output_message_json(const char *text, size_t text_len);
 /* Responses API 的 output 数组（包含思考、正文、工具调用） */

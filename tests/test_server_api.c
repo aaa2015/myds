@@ -918,7 +918,7 @@ static void test_responses_finish_carries_the_aggregate_text(void) {
     myds_sse_stream_ctx_t st = {.client_fd = s[0]};
     assert(myds_server_sse_writer_start(&st, 1024u * 1024u, 1000));
     assert(sse_emit_responses_finish(&st, "test-model", "resp_test_1", 10, 3,
-                                     text, tlen, items, 1));
+                                     text, tlen, items, 1, NULL, NULL));
     assert(myds_server_sse_writer_join(&st, false));
     assert(shutdown(s[0], SHUT_WR) == 0);
     close(s[0]);
@@ -949,7 +949,7 @@ static void test_responses_finish_carries_the_aggregate_text(void) {
     pthread_t r2; assert(pthread_create(&r2, NULL, capture_socket, &c2) == 0);
     myds_sse_stream_ctx_t st2 = {.client_fd = s2[0]};
     assert(myds_server_sse_writer_start(&st2, 1024u * 1024u, 1000));
-    assert(sse_emit_responses_finish(&st2, "test-model", "resp_test_2", 10, 3, "", 0, titems, 0));
+    assert(sse_emit_responses_finish(&st2, "test-model", "resp_test_2", 10, 3, "", 0, titems, 0, NULL, NULL));
     assert(myds_server_sse_writer_join(&st2, false));
     assert(shutdown(s2[0], SHUT_WR) == 0);
     close(s2[0]);
@@ -1308,7 +1308,7 @@ static void test_thinking_mode(void) {
 
         char *items = responses_output_items_json_ex(true, "Let me think", 12, "The answer is 42", 16, NULL, 0);
         assert(sse_emit_responses_finish(&st, "test-model", "resp_think_1", 10, 5,
-                                         "The answer is 42", 16, items, 1));
+                                         "The answer is 42", 16, items, 1, NULL, NULL));
         free(items);
 
         assert(myds_server_sse_writer_join(&st, false));
