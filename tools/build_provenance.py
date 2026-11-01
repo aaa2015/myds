@@ -237,15 +237,16 @@ def verify(file_rel: str) -> int:
     elif rec.get("effective_flags") != flags:
         problems.append("effective compile flags differ from the recorded build")
 
-    for rel, deps in (("bin/myds", build_files()), ("bin/myds.metallib", metal_files())):
-        art = ROOT / rel
-        if not art.exists() or not deps:
-            continue
-        t, f = newest_mtime_of(deps)
-        if t > mtime(art) + 1.0:
-            problems.append(f"{rel} predates {f}\n"
-                            "      it was never rebuilt after that edit, so it does "
-                            "not implement this source tree")
+    # 陈旧判定用【构建时记录的结果】，不在这里重算。
+    #
+    # 为什么：服务主机的源码是 git pull 来的、二进制是 rsync 来的，两者
+    # mtime 的先后完全不代表因果 —— pull 一次就会让所有源码「比二进制新」，
+    # 于是每台服务主机会永久报陈旧，而真正该报警的构建主机反倒可能漏掉。
+    # 构建主机在 write 时已经把答案算好并写进记录，这里只负责把它读出来。
+    for stale in (rec.get("stale_artifacts") or []):
+        problems.append(f"{stale}\n"
+                        "      the builder recorded this at build time: the artifact "
+                        "was not rebuilt after that edit")
 
     for rel, want in (rec.get("artifacts") or {}).items():
         got = sha256_file(ROOT / rel)
