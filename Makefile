@@ -835,6 +835,7 @@ test: check-knobs $(ALL_TESTS) $(METALLIB)
 	@python3 tests/test_decode_q8_contract.py
 	@echo ""
 	@python3 tests/test_http_bytes.py
+	@python3 tests/test_startup_gates.py
 	@python3 tests/test_stream_bench.py
 	@python3 tests/test_indexer_k_resident_builder.py
 	@python3 -B tests/test_indexer_register_only_host.py

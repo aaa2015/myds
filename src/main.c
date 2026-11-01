@@ -16,9 +16,100 @@
 #include <ctype.h>
 #include <time.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #if defined(__APPLE__)
 #include <pthread/qos.h>
 #endif
+
+/* ── 2026-11-01：模型加载【之前】的两道门 ─────────────────────────────
+ *
+ * 背景：原来的顺序是 model_load(148.4 GB) → context_create → server_start(bind)。
+ * 端口冲突只有在最后一步才发现，而那时内存已经压进去了 —— 两个实例同时在
+ * page in 同一份模型正是 10-18 / 10-22 两次 macOS Wired Panic 的成因。
+ * 这里把两道门提到最前，任何一道不过就 exit，分配 0 字节。
+ *
+ * 为什么是「探测端口」而不是「预绑定」：真要预绑定要把 listen fd 一路传进
+ * server_start，改动面大且容易和现有 accept 循环打架。探测 + 单实例锁已经
+ * 覆盖了「误起第二个」这个唯一真实场景；纯 TOCTOU 竞态在这里不构成风险，
+ * 因为触发它需要两个进程在同一毫秒内启动。
+ */
+#define MYDS_GPU_LOCK_PATH "/tmp/myds-gpu.lock"
+#define MYDS_INSTANCE_LOCK_PATH "/tmp/myds-instance.lock"
+
+static int g_instance_lock_fd = -1;
+
+/* 单实例锁。返回 0 = 拿到，-1 = 已有实例。
+ * 每个 --port 各一把锁，不同端口的实例互不干扰（8187 与 8181 是合法共存的）。 */
+static int take_instance_lock(int port) {
+    static char path[128];
+    if (port > 0) snprintf(path, sizeof(path), "%s-%d", MYDS_INSTANCE_LOCK_PATH, port);
+    else snprintf(path, sizeof(path), "%s", MYDS_INSTANCE_LOCK_PATH);
+    int fd = open(path, O_RDWR | O_CREAT, 0644);
+    if (fd < 0) {
+        MYDS_LOG_W("instance lock: 无法打开 %s (%s)，跳过单实例检查", path, strerror(errno));
+        return 0;
+    }
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        close(fd);
+        return -1;
+    }
+    g_instance_lock_fd = fd;   /* 故意不释放：进程退出时内核自动解 */
+    return 0;
+}
+
+/* 配置门禁：环境里存在【没有任何代码读取】的 MYDS_* 键 ⇒ 直接拒绝启动。
+ *
+ * 为什么要在正常启动路径上做，而不是只在 --print-config 里：MYDS_TOPK_THRESHOLD=1
+ * 曾在生产 conf 里躺了 4 天，配置声称开、实际全关，而这类错误不会报错、只会安静地
+ * 改掉对照实验的前提。只在人工跑 --print-config 时才检查，等于指望人记得跑。
+ *
+ * 退出码用 2（与 --print-config 一致），MYDS_STRICT_CONFIG=0 可显式降级为告警。
+ */
+static int verify_config_gate(void) {
+    static myds_knob_seen_t seen[1024];
+    const int n = myds_knobs_from_environ(seen, sizeof(seen) / sizeof(seen[0]));
+    if (n < 0) {
+        MYDS_LOG_E("config: MYDS_* 变量过多，无法核对（上限 %zu）", sizeof(seen) / sizeof(seen[0]));
+        return 2;
+    }
+    int unread = 0;
+    for (int i = 0; i < n; ++i) if (!seen[i].knob) ++unread;
+    if (!unread) return 0;
+
+    const char *soft = getenv("MYDS_STRICT_CONFIG");
+    const bool strict = !(soft && *soft && atoi(soft) == 0);
+    for (int i = 0; i < n; ++i) {
+        if (seen[i].knob) continue;
+        if (strict)
+            MYDS_LOG_E("config: %s=%s 没有任何代码读取（拼写错误？已被删除的开关？）",
+                       seen[i].name, seen[i].value);
+        else
+            MYDS_LOG_W("config: %s=%s 没有任何代码读取（MYDS_STRICT_CONFIG=0，仅告警）",
+                       seen[i].name, seen[i].value);
+    }
+    return strict ? 2 : 0;
+}
+
+/* 端口是否已被占用（尝试 connect）。返回 1 = 占用。 */
+static int port_in_use(const char *host, int port) {
+    if (port <= 0) return 0;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)port);
+    if (!host || !*host || strcmp(host, "0.0.0.0") == 0) sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    else if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return 0;
+    const int rc = connect(fd, (struct sockaddr *)&sa, sizeof(sa));
+    const int busy = (rc == 0);
+    close(fd);
+    return busy;
+}
 
 static void print_usage(const char *prog) {
     printf("myds - Minimal DeepSeek V4 / V4.1 Inference Engine on Apple Silicon Metal\n\n");
@@ -331,6 +422,47 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
+        } else if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
+            i++;   /* 已在 load_config_early 里消费过，这里只跳过它的值 */
+        } else {
+            /* ★ 2026-11-01：原来这里没有任何兜底分支，未识别的参数被静默忽略。
+             * 实测后果：`--temperature 0` / `--max_tokens 512` / `--ctx_size 8192`
+             * 三个「看起来对」的写法都不生效，而进程正常启动、日志只显示代码默认值。
+             * 这种失败比崩溃难查得多 —— 崩溃至少有人看。 */
+            MYDS_LOG_E("未知命令行参数: %s", argv[i]);
+            if (argv[i][0] == '-' && argv[i][1] == '-') {
+                MYDS_LOG_E("（注意：采样参数走配置文件或 MYDS_* 环境变量；"
+                           "命令行只认 --temp/--top-p/--max-tokens/--ctx-size 这几个写法）");
+            }
+            print_usage(argv[0]);
+            return 2;
+        }
+    }
+
+    /* ── 模型加载前的三道门（任何一道不过 ⇒ 0 字节 GPU 分配就退出）──
+     * 顺序有讲究：先验配置（不碰任何资源），再验端口（不碰 GPU），最后取锁。
+     * 反过来会让一次配置拼写错误白等 40 秒的模型加载。 */
+    {
+        const int cfg_rc = verify_config_gate();
+        if (cfg_rc != 0) {
+            MYDS_LOG_E("拒绝启动：配置门禁未通过（退出码 %d）", cfg_rc);
+            return cfg_rc;
+        }
+        const char *allow_multi = getenv("MYDS_ALLOW_MULTI_INSTANCE");
+        const bool multi_ok = allow_multi && *allow_multi && atoi(allow_multi) != 0;
+        if (!multi_ok) {
+            if (port_in_use(host, port)) {
+                MYDS_LOG_E("拒绝启动：端口 %d 已在监听。另一个实例可能正在跑。", port);
+                MYDS_LOG_E("  已加载模型再发现端口冲突会让两个进程同时 page in 同一份权重 ——");
+                MYDS_LOG_E("  那正是 10-18 / 10-22 两次 macOS Wired Panic 的成因。");
+                MYDS_LOG_E("  确认无实例后重试；确需多实例（如轻量单测）设 MYDS_ALLOW_MULTI_INSTANCE=1。");
+                return 3;
+            }
+            if (take_instance_lock(port) != 0) {
+                MYDS_LOG_E("拒绝启动：端口 %d 的单实例锁已被占用（另一个 myds 正在启动或运行）。", port);
+                MYDS_LOG_E("  确需多实例设 MYDS_ALLOW_MULTI_INSTANCE=1。");
+                return 3;
+            }
         }
     }
 

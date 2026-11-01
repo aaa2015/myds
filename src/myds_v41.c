@@ -2567,7 +2567,8 @@ uint32_t myds_v41_low_kv_load_deeper(myds_v41_context_t *g, const int32_t *token
  *
  * 恢复后 ctx->anchor_len 仍需由引擎设置 —— 本函数只负责 RAM 状态。
  * 返回恢复到的位置（0 = 无可用条目）。 */
-uint32_t myds_v41_low_kv_load_anchor(myds_v41_context_t *g, const int32_t *tokens, uint32_t anchor_pos) {
+uint32_t myds_v41_low_kv_load_anchor(myds_v41_context_t *g, const int32_t *tokens,
+                                     uint32_t anchor_pos, uint32_t slot) {
     if (!g || !g->low_anchor || !tokens || anchor_pos <= MYDS_SNAP_MIN) return 0;
     if (!myds_metal_commit_batch()) return 0;
     const uint64_t want_hash = myds_kvdsk_hash_tokens(tokens, anchor_pos);
@@ -2583,8 +2584,13 @@ uint32_t myds_v41_low_kv_load_anchor(myds_v41_context_t *g, const int32_t *token
         if (!myds_kvdsk_slot_meta(g->low_anchor, e, &pos, &hash, &used)) continue;
         if (pos != anchor_pos || hash != want_hash) continue;
         lowkv_restore_stage_t stage = {0};
+        /* ★ 2026-11-01：目标槽必须由调用方给。原来硬编码 V41_ANCHOR_SLOT（锚点 0 号槽），
+         * 而 engine 在返回后另挑一个 seat 记 token 前缀 ⇒ 磁盘恢复的状态和记名的槽对不上：
+         * 最坏情况是 anchor #0 的 token 记在别的 seat 上，下一次用该 seat 恢复时
+         * 装回的是另一套系统提示词的窗口环。 */
+        if (slot >= V41_SLOT_CAPACITY) return 0;
         const bool ok = lowkv_stage_slot(g, g->low_anchor, e | V41_LOWKV_ENTRY_IS_END, anchor_pos, tokens, &stage) &&
-                        lowkv_publish_stage(g, V41_ANCHOR_SLOT, anchor_pos, &stage);
+                        lowkv_publish_stage(g, slot, anchor_pos, &stage);
         if (ok) {
             MYDS_LOG_I("kvdisk: 锚点恢复成功 · 位置 %u · %.1f MiB · %.1f ms",
                        anchor_pos, (double)used / 1048576.0, lowkv_now_ms() - t0);
@@ -2967,7 +2973,11 @@ void myds_v41_context_free(myds_v41_context_t *g) {
     F(residual); F(after_attn); F(flat_norm); F(mix); F(attn_split); F(ffn_split); F(pre);
     F(engram_rows[0]); F(engram_rows[1]); F(engram_kv);
     for (uint32_t i=0;i<V41_LAYERS;i++) F(window[i]);
-    for (uint32_t si=0;si<V41_SNAP_SLOTS;si++) {
+    /* ★ 2026-11-01：上限必须是 V41_SLOT_CAPACITY（= SNAP_SLOTS + ANCHOR_SLOTS_MAX），
+     * 不是 V41_SNAP_SLOTS。数组声明是 [V41_SLOT_CAPACITY]，写成 SNAP_SLOTS 会漏掉
+     * 16 个锚点槽的 snap_window/snap_prev_kv/snap_prev_score（生产实测约 189 MiB
+     * 常驻内存永不归还）。进程退出时看不出来，长跑/反复 create 才暴露。 */
+    for (uint32_t si=0;si<V41_SLOT_CAPACITY;si++) {
         F(snap_window[si]);
         for (uint32_t i=0;i<4;i++) {
             F(snap_prev_kv[si][i]);

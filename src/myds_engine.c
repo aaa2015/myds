@@ -3605,23 +3605,26 @@ static int myds_generate_internal(myds_context_t *ctx,
             for (uint32_t i = 0; i < (uint32_t)n_prompt - 1u; i++) {
                 if (prompt_tokens[i] == 128803) { ap = i + 1u; break; }
             }
-            if (ap >= 4u && ap < (uint32_t)n_prompt - 1u) {
-                const uint32_t got = myds_v41_low_kv_load_anchor(ctx->v41, prompt_tokens, ap);
+            if (ap >= 4u && ap < (uint32_t)n_prompt - 1u && ctx->anchor_slots > 0) {
                 /* 2026-10-24：多套 —— 恢复进第一个空套；全都占满则替换最短的一套。
                  * （磁盘锚点目前对长 prompt 写入失败，见账本 §96.4；这条路径保留是为
-                 *   了短系统提示词能跨重启恢复。） */
-                if (got == ap && ap <= ctx->anchor_cap && ctx->anchor_slots > 0) {
-                    uint32_t seat = UINT32_MAX, shortest = UINT32_MAX;
-                    for (uint32_t i = 0; i < ctx->anchor_slots; ++i) {
-                        if (ctx->anchor_len[i] == 0) { seat = i; break; }
-                        if (ctx->anchor_len[i] < shortest) { shortest = ctx->anchor_len[i]; seat = i; }
-                    }
-                    if (seat != UINT32_MAX && ctx->anchor_tokens[seat]) {
+                 *   了短系统提示词能跨重启恢复。）
+                 * 2026-11-01：★ 先选 seat 再恢复。原来是「先恢复进写死的槽 44，再另选一个
+                 * seat 记前缀」——两者可以不是同一个，于是记着 A 的前缀却装着 B 的窗口环。 */
+                uint32_t seat = UINT32_MAX, shortest = UINT32_MAX;
+                for (uint32_t i = 0; i < ctx->anchor_slots; ++i) {
+                    if (ctx->anchor_len[i] == 0) { seat = i; break; }
+                    if (ctx->anchor_len[i] < shortest) { shortest = ctx->anchor_len[i]; seat = i; }
+                }
+                if (seat != UINT32_MAX && ctx->anchor_tokens[seat]) {
+                    const uint32_t slot = myds_anchor_slot(seat);
+                    const uint32_t got = myds_v41_low_kv_load_anchor(ctx->v41, prompt_tokens, ap, slot);
+                    if (got == ap && ap <= ctx->anchor_cap) {
                         memcpy(ctx->anchor_tokens[seat], prompt_tokens, (size_t)ap * sizeof(int32_t));
                         if (!ctx->anchor_len[seat]) ctx->anchor_n++;
                         ctx->anchor_len[seat] = ap;
-                        MYDS_LOG_I("prefix cache: anchor #%u restored from disk at decision time · %u tok",
-                                   seat, ap);
+                        MYDS_LOG_I("prefix cache: anchor #%u (slot %u) restored from disk at decision time · %u tok",
+                                   seat, slot, ap);
                     }
                 }
             }
