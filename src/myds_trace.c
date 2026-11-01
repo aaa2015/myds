@@ -258,15 +258,17 @@ const char *myds_trace_page_html(void) {
 "align-items:center;flex-wrap:nowrap;overflow:hidden}"
 "h1{font-size:14px;margin:0;font-weight:600}"
 ".meta{color:var(--dim);font-size:12px}"
-"#sys{margin-left:auto;display:flex;gap:12px;align-items:center;font-size:11px;"
+"#sys{margin-left:auto;display:flex;gap:26px;align-items:center;font-size:12px;"
 "flex-wrap:nowrap;white-space:nowrap}"
-/* 单行显示：条缩到 40px、间距 10px、字体 11px。原来 70px 条 + 14px 间距在
- * 1200px 宽的窗口里放不下，flex 就换行了 —— 而这一栏本来就只是背景信息，
- * 占两行不值得。 */
-".m{display:flex;align-items:center;gap:4px;color:var(--dim);font-size:11px;"
-"white-space:nowrap;flex:0 0 auto}"
+/* 单行显示，指标右对齐。这些值随窗口宽度自适应（条可收缩），
+ * 但绝不换行 —— 换行会把标题栏撑成多行。 */
+".m{display:flex;align-items:center;gap:8px;color:var(--dim);font-size:12px;"
+"white-space:nowrap;flex:0 1 auto;min-width:0}"
 ".m b{color:var(--fg);font-weight:600}"
-".bar{width:40px;height:5px;background:#252a33;border-radius:3px;overflow:hidden;flex:0 0 auto}"
+/* 条宽 110px，允许收缩到 40px：窗口变窄时先压条，绝不换行 ——
+ * 换行会把标题栏撑成三行，那才是真的难看。 */
+"#sys .bar{width:110px;min-width:40px;height:6px;background:#252a33;"
+"border-radius:3px;overflow:hidden;flex:0 1 auto}"
 ".bar i{display:block;height:100%;background:var(--acc)}"
 "#wrap{display:flex;height:calc(100vh - 41px)}"
 "#list{width:52%;overflow:auto;border-right:1px solid var(--line)}"
