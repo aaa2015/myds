@@ -2494,6 +2494,59 @@ static const char *dsml_attr(const char *p, const char *end, const char *key,
 
 /* 成功：content_len 收工具块之前的正文字节数；calls_out 与 count_out 收解析出的调用（调用方负责释放）。
  * 没有工具块时 count=0 且返回 true；格式不合格式时返回 false（调用方按纯文本处理）。 */
+/* 分类：这一段文本里的 DSML 工具块到底处于什么状态。
+ *
+ * 之所以要单独出一个分类器，而不是让调用方从「parse 返回 false」去猜：
+ *   · 没有工具块     ⇒ 正常正文，什么都不用做
+ *   · 有开有闭、结构有效 ⇒ 正常工具调用
+ *   · 有开无闭       ⇒ 被 max_tokens 截断 / 模型自己没写完
+ *   · 有开有闭、结构坏 ⇒ 模型吐出了不合语法的块
+ * 后两种的正确处置是【隔离】：既不能当工具调用执行，也不能把原始 XML 当正文发出去。
+ * 原实现两种都当成「格式不合 ⇒ 整段当正文」，于是在截断时把半截
+ * `<|DSML| calls><|DSML| invoke ...` 原样发给了客户端。 */
+myds_dsml_state_t myds_dsml_classify(const char *text, size_t len, size_t *content_len) {
+    if (content_len) *content_len = len;
+    if (!text || !len) return MYDS_DSML_NONE;
+    static const char *open_tag = "<" MYDS_DSML_S " calls>";
+    static const char *close_tag = "</" MYDS_DSML_S " calls>";
+    const char *end = text + len;
+    const char *body = dsml_find(text, end, open_tag);
+    if (!body) return MYDS_DSML_NONE;
+
+    /* 正文只到开标签之前（顺带削掉尾部空白，工具块通常跟在两个换行后面）。 */
+    const char *ce = body - strlen(open_tag);
+    while (ce > text && (ce[-1] == '\n' || ce[-1] == '\r' || ce[-1] == ' ' || ce[-1] == '\t')) --ce;
+    if (content_len) *content_len = (size_t)(ce - text);
+
+    if (!dsml_find(body, end, close_tag)) return MYDS_DSML_TRUNCATED;
+
+    /* 有闭标签 ⇒ 交给真正的解析器判断内部结构是否有效。
+     * 这里不返回 calls（调用方本来就要再解析一次），只做状态判定。 */
+    size_t cl = len;
+    myds_tool_call_t *calls = NULL;
+    size_t n = 0;
+    const bool ok = myds_parse_completion_tool_calls(text, len, &cl, &calls, &n);
+    for (size_t k = 0; k < n; ++k) { free(calls[k].id); free(calls[k].name); free(calls[k].arguments); }
+    free(calls);
+    return ok ? MYDS_DSML_COMPLETE : MYDS_DSML_MALFORMED;
+}
+
+/* 另一套方言探测（2026-11-01 实测发现）。
+ *
+ * 提示词模板要求模型输出 `<｜DSML｜calls>`，但实测这台机器上的 1017 权重
+ * 在 tools 已渲染（日志 has_tools=1）的情况下仍然吐 `<function_calls>` ——
+ * 即不带 `｜DSML｜` 前缀的同构写法。解析器认不出来，于是整块当正文发出去。
+ *
+ * 这属于【另一件事】（方言不匹配），不在本次「截断隔离」范围内，所以这里只做观测：
+ * 一旦正文里出现这类标记就告警，让它不再静默。不去猜着兼容 —— 多认一种方言
+ * 要连带定义转义/嵌套/歧义规则，得单独设计和验证。 */
+static bool dsml_looks_like_foreign_dialect(const char *text, size_t len) {
+    if (!text || !len) return false;
+    const char *end = text + len;
+    return dsml_find(text, end, "<function_calls>") != NULL ||
+           dsml_find(text, end, "<invoke name=") != NULL;
+}
+
 bool myds_parse_completion_tool_calls(const char *text, size_t len, size_t *content_len,
                                       myds_tool_call_t **calls_out, size_t *count_out) {
     static const char *open_tag = "<" MYDS_DSML_S " calls>";
@@ -4299,15 +4352,40 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 size_t scontent_len = sctx.acc_len;
                 myds_tool_call_t *stool = NULL;
                 size_t stool_count = 0;
-                if (!sctx.acc || !myds_parse_completion_tool_calls(sctx.acc, sctx.acc_len,
-                                                                 &scontent_len, &stool, &stool_count)) {
-                    scontent_len = sctx.acc_len; stool = NULL; stool_count = 0;
+                /* 有工具块但没能解析出来 ⇒ 输出是不完整的，finish_reason 必须反映这一点。 */
+                bool dsml_block_dropped = false;
+                /* ★ 2026-11-01：区分「没有工具块」和「工具块坏了」。
+                 * 原实现两者都走同一个 fallback（整段当正文），于是在被 max_tokens
+                 * 截断时把半截 `<|DSML| calls><|DSML| invoke ...` 原样当正文发给客户端。
+                 * 现在坏块【隔离】：正文只到开标签之前，块本身丢弃并记日志。 */
+                const myds_dsml_state_t dsml_state =
+                    sctx.acc ? myds_dsml_classify(sctx.acc, sctx.acc_len, &scontent_len)
+                             : MYDS_DSML_NONE;
+                if (dsml_state == MYDS_DSML_NONE ||
+                    (dsml_state != MYDS_DSML_NONE && sctx.acc &&
+                     myds_parse_completion_tool_calls(sctx.acc, sctx.acc_len,
+                                                      &scontent_len, &stool, &stool_count))) {
+                    /* 正常：要么没有工具块，要么解析成功（stool 可能为空） */
+                } else {
+                    stool = NULL; stool_count = 0;
+                    dsml_block_dropped = true;
+                    MYDS_LOG_W("[%s:%d] %s DSML tool block discarded (%zu chars withheld from content)",
+                               client_ip, client_port,
+                               dsml_state == MYDS_DSML_TRUNCATED ? "truncated" : "malformed",
+                               sctx.acc_len - scontent_len);
                 }
-                if (!stool_count && sctx.acc && sctx.emitted < sctx.acc_len) {
-                    /* 曾疑似进入工具块但格式不合 ⇒ 把没发出的正文补出去，绝不吞内容 */
+                if (!stool_count && dsml_state == MYDS_DSML_NONE && sctx.acc &&
+                    dsml_looks_like_foreign_dialect(sctx.acc, sctx.acc_len)) {
+                    MYDS_LOG_W("[%s:%d] tool-call markup found but this request's dialect is not "
+                               "|DSML|calls; it will be sent as plain content. The model emitted "
+                               "<function_calls>/<invoke> instead of the requested |DSML| form.",
+                               client_ip, client_port);
+                }
+                if (!stool_count && sctx.acc && sctx.emitted < scontent_len) {
+                    /* 只补发【正文】部分（emitted 之后、工具块之前）。绝不补发工具块本身。 */
                     bool replayed = sse_emit_content(&sctx, sctx.acc + sctx.emitted,
-                                                     sctx.acc_len - sctx.emitted, false);
-                    sctx.emitted = sctx.acc_len;
+                                                     scontent_len - sctx.emitted, false);
+                    sctx.emitted = scontent_len;
                     if (!replayed || sctx.failed || sctx.cancel_flag) {
                         stop_reason = sctx.failed ? MYDS_STOP_ERROR : MYDS_STOP_CANCELLED;
                     }
@@ -4394,8 +4472,11 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 } else if (!stool_count && !sctx.failed && !sctx.cancel_flag) {
                     /* LOOP_GUARD 归入 "length"：输出确实被截断了，客户端必须能分辨。
                      * 映射成 "stop" 会让半截答案看起来像正常收尾（原实现的问题）。 */
+                    /* 丢弃了残缺工具块 ⇒ 输出同样是不完整的，归入 "length"。
+                     * 归 "stop" 会让客户端以为这是一次完整收尾，正是本次要修的那类谎报。 */
                     const char *finish = (stop_reason == MYDS_STOP_LENGTH || stop_reason == MYDS_STOP_CTX_FULL ||
-                                          stop_reason == MYDS_STOP_LOOP_GUARD) ? "length" : "stop";
+                                          stop_reason == MYDS_STOP_LOOP_GUARD ||
+                                          dsml_block_dropped) ? "length" : "stop";
                     char chunk[512];
                     int len = snprintf(chunk, sizeof(chunk),
                         "data: {\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"%s\"}]}\n\n", finish);
@@ -4463,12 +4544,34 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                                       stop_reason == MYDS_STOP_LOOP_GUARD) ? "length" : "stop";
                 long now = (long)time(NULL);
 
-                /* 模型可能在正文之后用 DSML 块发起工具调用 ⇒ 拆出来，按各自协议输出。 */
+                /* 模型可能在正文之后用 DSML 块发起工具调用 ⇒ 拆出来，按各自协议输出。
+                 *
+                 * ★ 2026-11-01：原实现在解析失败时「整段当正文」，于是被 max_tokens 截断的
+                 * 半截 `<|DSML| calls><|DSML| invoke ...` 会原样出现在 content 里。
+                 * 现在按四态分类（见 myds_dsml_classify）：坏块【隔离】——正文只到开标签之前，
+                 * 块本身丢弃并告警，finish_reason 归入 "length"（不谎报完整）。 */
                 size_t tool_content_len = ns.len;
                 myds_tool_call_t *tool_calls = NULL;
                 size_t tool_count = 0;
-                if (!myds_parse_completion_tool_calls(ns.buf, ns.len, &tool_content_len, &tool_calls, &tool_count)) {
-                    tool_content_len = ns.len; tool_calls = NULL; tool_count = 0;   /* 格式不合 ⇒ 整段当正文 */
+                bool ns_dsml_dropped = false;
+                const myds_dsml_state_t ns_dsml = myds_dsml_classify(ns.buf, ns.len, &tool_content_len);
+                if (ns_dsml != MYDS_DSML_NONE &&
+                    !myds_parse_completion_tool_calls(ns.buf, ns.len, &tool_content_len,
+                                                      &tool_calls, &tool_count)) {
+                    tool_calls = NULL; tool_count = 0;
+                    ns_dsml_dropped = true;
+                    MYDS_LOG_W("[%s:%d] %s DSML tool block discarded (%zu chars withheld from content)",
+                               client_ip, client_port,
+                               ns_dsml == MYDS_DSML_TRUNCATED ? "truncated" : "malformed",
+                               ns.len - tool_content_len);
+                }
+
+                if (!tool_count && ns_dsml == MYDS_DSML_NONE &&
+                    dsml_looks_like_foreign_dialect(ns.buf, ns.len)) {
+                    MYDS_LOG_W("[%s:%d] tool-call markup found but this request's dialect is not "
+                               "|DSML|calls; it will be sent as plain content. The model emitted "
+                               "<function_calls>/<invoke> instead of the requested |DSML| form.",
+                               client_ip, client_port);
                 }
 
                 /* 拆分 reasoning 与 content */
@@ -4519,6 +4622,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 char *items_json = responses_output_items_json_ex(
                     req_thinking, reasoning_ptr, reasoning_len, content_ptr, content_len, tool_calls, tool_count);
                 char *content_field = body_escaped ? format_alloc("\"%s\"", body_escaped) : NULL;
+                if (ns_dsml_dropped) finish = "length";
                 if (tool_count) finish = "tool_calls";
 
                 if (body_escaped && alias_json) {

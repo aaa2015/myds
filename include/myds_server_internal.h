@@ -145,6 +145,16 @@ typedef struct { char *id; char *name; char *arguments; } myds_tool_call_t;
 /* 解析完成文本：*content_len 为工具块之前的正文字节数；
  * calls_out 与 count_out 为解析结果（调用方用 myds_free_tool_calls 释放）。
  * 无工具块 ⇒ count=0 且返回 true；格式不合 ⇒ 返回 false（调用方按纯文本处理）。 */
+/* DSML 工具块的状态。调用方据此决定「当正文发 / 当工具调用执行 / 隔离」。 */
+typedef enum {
+    MYDS_DSML_NONE = 0,    /* 没有 <|DSML| calls> */
+    MYDS_DSML_COMPLETE,    /* 有开有闭，内部结构有效 */
+    MYDS_DSML_TRUNCATED,   /* 有开无闭：被 max_tokens 截断或模型没写完 */
+    MYDS_DSML_MALFORMED    /* 有开有闭，但内部结构不合语法 */
+} myds_dsml_state_t;
+
+myds_dsml_state_t myds_dsml_classify(const char *text, size_t len, size_t *content_len);
+
 bool myds_parse_completion_tool_calls(const char *text, size_t len, size_t *content_len,
                                       myds_tool_call_t **calls_out, size_t *count_out);
 void myds_free_tool_calls(myds_tool_call_t *calls, size_t count);

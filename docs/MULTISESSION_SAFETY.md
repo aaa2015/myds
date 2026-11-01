@@ -177,7 +177,7 @@ prefill 会让 orchestrator 的路由请求排队超时（503）。
 低风险的最小版本：**同优先级下，`previous_response_id` 等于刚完成请求的
 排在前面**。这一条不需要新 header、不引入饥饿风险，且直接命中零开销续跑。
 
-### 低：残缺 DSML 隔离
+### ~~低：残缺 DSML 隔离~~ —— 已完成（见 §八）
 
 `myds_server.c:4194-4202` 的注释写着「把没发出的正文补出去，绝不吞内容」——
 在工具块解析失败时会把半截 DSML XML 当正文发给客户端。判据应是
@@ -317,3 +317,69 @@ void myds_context_set_liveness_probe(myds_context_t *ctx,
   检查后续请求不被堵。
 - 基线 7 个 prompt 的 sha 与改动前**逐一相同**（探针不改任何计算结果）。
 - `make test` 全绿。
+
+---
+
+## 八、DSML 工具块隔离（2026-11-01）
+
+### 原行为
+
+解析失败时「整段当正文」：
+
+```c
+if (!myds_parse_completion_tool_calls(...)) {
+    tool_content_len = ns.len; tool_calls = NULL; tool_count = 0;   /* 格式不合 ⇒ 整段当正文 */
+}
+```
+
+被 `max_tokens` 截断时，模型正写到一半：
+
+```
+...<|DSML| calls>
+<|DSML| invoke name="get_weather">
+<|DSML| parameter name="city"
+```
+
+整块原样进了 `content`。上层任何解析工具调用的代码都会拿到垃圾。
+
+（流式路径其实没漏 —— `sse_emit_bytes` 见到开标签就 `in_tool_block=true` 停了。
+漏的是收尾那一步：把 `emitted..acc_len` 整段补发。）
+
+### 改法：四态分类 + 隔离
+
+```c
+typedef enum { MYDS_DSML_NONE, MYDS_DSML_COMPLETE,
+               MYDS_DSML_TRUNCATED, MYDS_DSML_MALFORMED } myds_dsml_state_t;
+myds_dsml_state_t myds_dsml_classify(const char *text, size_t len, size_t *content_len);
+```
+
+| 状态 | 处置 |
+|---|---|
+| `NONE` | 全是正文 |
+| `COMPLETE` | 正常解析成 tool_calls |
+| `TRUNCATED` | **隔离**：正文只到开标签之前，块丢弃 + WARN，`finish_reason` 归 `"length"` |
+| `MALFORMED` | 同上（归 `"length"` 是因为输出确实不完整，不能谎报 `"stop"`） |
+
+`content_len` 一律只算开标签之前的部分（并削掉尾部空白），所以正文边界不依赖解析是否成功。
+
+### 另一个必须记下来的发现
+
+真机测试一开始「通过」了，但**是假通过**：我的泄漏判据只查 `｜DSML｜`，
+而模型实际吐出的是 `<function_calls>`（不带全角竖线）。
+
+日志确认 `has_tools=1` —— 工具定义确实渲染进了提示词，模板里也明确要求
+`｜DSML｜calls`。模型仍然用了另一套同构方言。于是解析器认不出来，整块当正文发。
+
+**这是另一件事（方言不匹配），不是截断问题。** 本次**不**去猜着兼容第二种方言：
+多认一种写法要连带定义转义、嵌套、歧义规则，得单独设计和验证。
+改为**让它在日志里现形**：
+
+> `[WARN] tool-call markup found but this request's dialect is not |DSML|calls; it will be sent as plain content.`
+
+### 验证
+
+- `tests/test_http_bytes.c` 新增 6 个 C 断言（NONE / COMPLETE / TRUNCATED /
+  MALFORMED / 空正文 / 空输入），进 `make test`，不需要模型。
+- `tests/dsml_truncation_live.py`（需模型）**当前是 FAIL 的，而且这就是正确结果**：
+  它如实报出 `<function_calls>` 泄漏，即上面那条方言问题。
+- 基线 7 个 prompt 的 sha 不变。

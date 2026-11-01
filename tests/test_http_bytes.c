@@ -58,6 +58,58 @@ int myds_generate_bytes_ex(myds_context_t *ctx, const char *prompt, myds_stream_
     return 1;
 }
 static void *handle(void *arg) { handle_client(*(int *)arg, NULL, "test-\"alias", "local", 1234); return NULL; }
+/* ── DSML 工具块隔离（2026-11-01）──────────────────────────────────
+ * 只测分类器与「正文边界」这一层：它决定客户端会不会收到原始 XML。
+ * 端到端（真模型 + 截断）见 tests/dsml_truncation_live.py。 */
+static void dsml_isolation_cases(void) {
+    const char *OPEN = "<" MYDS_DSML_S " calls>";
+    const char *CLOSE = "</" MYDS_DSML_S " calls>";
+    char buf[2048];
+    size_t clen;
+
+    /* 1) 没有工具块 ⇒ 全是正文 */
+    snprintf(buf, sizeof(buf), "plain answer with no tools");
+    clen = 0;
+    assert(myds_dsml_classify(buf, strlen(buf), &clen) == MYDS_DSML_NONE);
+    assert(clen == strlen(buf));
+
+    /* 2) 完整块 ⇒ COMPLETE，正文只到开标签之前（尾部空白削掉） */
+    snprintf(buf, sizeof(buf),
+             "here you go\n\n%s\n<" MYDS_DSML_S " invoke name=\"f\"><" MYDS_DSML_S
+             " parameter name=\"a\" string=\"true\">v</" MYDS_DSML_S " parameter></"
+             MYDS_DSML_S " invoke>\n%s\n", OPEN, CLOSE);
+    clen = 0;
+    assert(myds_dsml_classify(buf, strlen(buf), &clen) == MYDS_DSML_COMPLETE);
+    assert(clen == strlen("here you go"));
+
+    /* 3) 被截断（有开无闭）⇒ TRUNCATED，正文同样只到开标签之前。
+     *    这正是 max_tokens 打断工具调用时出现的形状。 */
+    snprintf(buf, sizeof(buf), "answer\n\n%s\n<" MYDS_DSML_S " invoke name=\"f\"><"
+             MYDS_DSML_S " parameter name=\"a", OPEN);
+    clen = 0;
+    assert(myds_dsml_classify(buf, strlen(buf), &clen) == MYDS_DSML_TRUNCATED);
+    assert(clen == strlen("answer"));
+
+    /* 4) 有开有闭但内部语法坏 ⇒ MALFORMED，正文依然只到开标签之前 */
+    snprintf(buf, sizeof(buf), "answer\n%s garbage %s", OPEN, CLOSE);
+    clen = 0;
+    assert(myds_dsml_classify(buf, strlen(buf), &clen) == MYDS_DSML_MALFORMED);
+    assert(clen == strlen("answer"));
+
+    /* 5) 开标签在一开头、正文为空 ⇒ content_len 必须是 0（不能退化成整段） */
+    snprintf(buf, sizeof(buf), "%s junk", OPEN);
+    clen = 999;
+    assert(myds_dsml_classify(buf, strlen(buf), &clen) == MYDS_DSML_TRUNCATED);
+    assert(clen == 0);
+
+    /* 6) 空输入 */
+    clen = 999;
+    assert(myds_dsml_classify("", 0, &clen) == MYDS_DSML_NONE);
+    assert(clen == 0);
+
+    puts("PASS DSML classification isolates truncated and malformed tool blocks from content");
+}
+
 int main(int argc, char **argv) {
     assert(argc == 2); /* Existing directory for the eight raw HTTP responses. */
     signal(SIGPIPE, SIG_IGN);
@@ -113,5 +165,6 @@ int main(int argc, char **argv) {
         close(sockets[1]);
     }
     puts("PASS raw NUL and incomplete Content-Length rejected before generation");
+    dsml_isolation_cases();
     return 0;
 }
