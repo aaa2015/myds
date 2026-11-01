@@ -14368,6 +14368,20 @@ macstudio 编译到临时目录后**原子替换 46 个二进制**（不原地�
 - 进程启动时间晚于二进制 mtime ⇒ 跑的确实是新产物
 - 启动日志 `loaded precompiled library … (all required V4.1 kernels verified)`
 - 回滚快照 `~/Projects/myds/.deploy-prev/`（15 MB）就位
+>
+> ⚠️ **2026-11-01 失效声明（部署机制已换）**：`.deploy-prev/` 已于 2026-11-01 删除。
+> 该目录是旧 `myfleet/sync_myds.sh`（源码 rsync + 远端重编译）留下的源码快照，
+> 已被 `myds/tools/deploy_artifact.sh`（macmini 构建 → 只传产物 → 两端 sha256 校验）取代。
+> **当前回滚点是 `bin/.prev-<时间戳>/`**（含 `myds` 与 `myds.metallib` 两个文件），
+> 由 `deploy_artifact.sh` 每次部署前自动创建：
+>
+> ```bash
+> ssh macstudio "cd ~/Projects/myds && ls -dt bin/.prev-* | head -3"
+> ssh macstudio "cd ~/Projects/myds && rsync -a bin/.prev-<时间戳>/ bin/"
+> ssh macstudio "export PATH=/opt/homebrew/bin:/usr/local/bin:\$PATH; cd ~/Projects/myfleet && ./start_fleet.sh"
+> ```
+>
+> 上面那条「`.deploy-prev` 回滚快照就位」是**当时的事实记录**，保留原样；按它操作会扑空。
 
 ### 105.9 遗留问题
 
@@ -14906,6 +14920,11 @@ n=1/格；未测 8,192 追加、decode、并发；语料为合成/仓库文本�
 新增 `MYDS_REQUEST_PHASES`，默认关闭）。metallib `fe557933…` 与 config `735e0dc7…` 未变。
 部署走 `myfleet/sync_myds.sh`（源码树指纹一致 `d2ec426a…`、临时目录重编译、原子替换、
 `.deploy-prev` 回滚快照）。**§105.6 记的 `a97976e0…` 与 §111 记的 `bbe8aa66…` 均已过期。**
+
+> ⚠️ **2026-11-01 失效声明**：上述 `sync_myds.sh` 链路已废，`.deploy-prev/` 已删除。
+> 现在用 `myds/tools/deploy_artifact.sh`（macmini 构建 → 只传产物 → 两端 sha256 校验 →
+> 自己 stop/start），回滚点是自动创建的 `bin/.prev-<时间戳>/`。
+> 上面这段是**当时的事实记录**，保留原样。
 三次窗口结束后独立 `gpu_window.py verify` 全部 **PASS**（nice=5、stdio、三 SHA、cwd）。
 
 原始数据：`benchmarks/warm_append_2026-10-30/raw/e2-phase-cycle1.jsonl`、
@@ -15138,6 +15157,11 @@ use: xcodebuild -downloadComponent MetalToolchain
 本轮 diff 无任何 `.metal` 改动（`git diff --name-only 227ae371..HEAD | grep metal` 为空），
 故把已部署的 metallib 预置进 staging 目录并 `touch`，让 make 跳过重建；
 脚本随后**比对哈希**（`fe557933…` 前后一致）才继续。`bin/` 原子替换、`.deploy-prev` 快照照常。
+
+> ⚠️ **2026-11-01 失效声明**：此处的 `.deploy-prev` 回滚快照描述**已不适用于当前机制**。
+> `.deploy-prev/` 已删除，现在的回滚点是 `bin/.prev-<时间戳>/`（含 `myds` + `myds.metallib`），
+> 由 `myds/tools/deploy_artifact.sh` 每次部署前自动创建。恢复：
+> `ssh macstudio "cd ~/Projects/myds && rsync -a bin/.prev-<时间戳>/ bin/"` 再跑 `start_fleet.sh`。
 
 ### 环境问题二：跨机工具链漂移，二进制不再逐字节相同
 
@@ -16375,10 +16399,19 @@ binary 未变，哑请求已发并丢弃，稳态验证通过。**
 1. 在 `git archive HEAD` 的干净树上构建 metallib → `719242c9`（与 §131 一致）
 2. 把该文件拷到 macstudio
 3. **单文件原子替换** `bin/myds.metallib`（旧进程仍持有旧 inode，运行不受影响）
-4. 备份旧文件到 `.deploy-prev/metallib/`
+4. 备份旧文件到 `bin/.prev-<时间戳>/`（**不是** `.deploy-prev/metallib/`，见下）
 5. 停服 → 等内存回收（瞬间到 170 GiB）→ `start_fleet.sh` + `renice 5`
 6. **发哑请求并丢弃**（§128 要求的预热）
 7. 验证稳态
+
+> ⚠️ **2026-11-01 失效声明**：本节原写「备份旧文件到 `.deploy-prev/metallib/`」——
+> **该目录不存在**，`.deploy-prev/` 是旧 `sync_myds.sh` 的源码快照（已删），从未存过 metallib。
+> 当前回滚点是 `bin/.prev-<时间戳>/`，由 `myds/tools/deploy_artifact.sh` **在每次部署前自动创建**，
+> 内含 `myds` 与 `myds.metallib`。手工替换 metallib 时请自己先 `cp bin/myds.metallib` 到这样一个目录：
+>
+> ```bash
+> ssh macstudio "cd ~/Projects/myds && mkdir -p bin/.prev-manual-\$(date +%Y%m%d-%H%M%S) && cp -p bin/myds.metallib bin/.prev-manual-*/"
+> ```
 
 替换前后逐项核验：metallib `fe557933…` → `719242c9…`，**binary 与替换前完全相同**，
 config 未变。
@@ -16409,10 +16442,19 @@ config 未变。
 
 ### 回滚
 
-```
-ssh macstudio 'cd ~/Projects/myds && cp .deploy-prev/metallib/myds.metallib bin/myds.metallib'
-```
-（然后按 §105.8 的流程重启；旧库 `fe557933…` 保留在 `.deploy-prev/metallib/`。）
+> ⚠️ **2026-11-01 失效声明**：`.deploy-prev/metallib/` **不存在**（该目录已删除，且它从来没存过
+> metallib —— 旧 `sync_myds.sh` 只快照源码树）。上面那条 `cp` 命令会扑空。
+>
+> 当前可用的回滚点是 `bin/.prev-<时间戳>/`，由 `myds/tools/deploy_artifact.sh` 在每次
+> 部署前自动创建，**同时包含 `myds` 与 `myds.metallib`**：
+>
+> ```bash
+> ssh macstudio "cd ~/Projects/myds && ls -dt bin/.prev-* | head -3"   # 挑一个时间点
+> ssh macstudio "cd ~/Projects/myds && rsync -a bin/.prev-<时间戳>/ bin/"
+> ssh macstudio "export PATH=/opt/homebrew/bin:/usr/local/bin:\$PATH; cd ~/Projects/myfleet && ./start_fleet.sh"
+> ```
+>
+> 注意 `bin/` 不在 git 里（`.gitignore` 第 2 行），所以这些快照是唯一的产物回滚依据。
 
 ### 未做
 

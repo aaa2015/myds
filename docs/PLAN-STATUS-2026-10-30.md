@@ -35,7 +35,15 @@
 
 ## P3 采纳与记录
 
-- 部署：`myfleet/sync_myds.sh`（指纹校验 + 临时目录重编译 + 原子替换 + `.deploy-prev`）
+- 部署（**当时**）：`myfleet/sync_myds.sh`（指纹校验 + 临时目录重编译 + 原子替换 + `.deploy-prev`）
+
+  > ⚠️ **2026-11-01 失效声明**：这条部署链路已废。macstudio 上没有 Metal 工具链
+  > （`xcrun -f metal` 无结果），"远端重编译"从来跑不通；`.deploy-prev/` 是它留下的
+  > 源码快照，已删除。
+  >
+  > 现在是 `myds/tools/deploy_artifact.sh`：**macmini 构建 → 只传
+  > `bin/myds` + `bin/myds.metallib` → 两端 sha256 校验 → 自己 stop/start**。
+  > 回滚点是自动创建的 `bin/.prev-<时间戳>/`。
 - 生产二进制：`bbe8aa66…` → **`227ae371…`**（`ca1a17d`），metallib/config 未变
 - `make audit-ledger` 每次提交后 PASS；`make test` 全绿
 

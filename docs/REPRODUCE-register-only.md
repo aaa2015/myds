@@ -127,27 +127,47 @@ PREFLIGHT FAILED — nothing was started, no service was touched:
 
 ### 4.0.1 工具与语料怎么到那台机器上
 
-**2026-10-27 起 `sync_myds.sh` 的 `SYNC_DIRS` 已包含 `benchmarks`**，所以正常跑
-`deploy.sh` 或 `sync_myds.sh` 就会把语料、原始 JSONL 与 `expected.json` 一起带过去，
-不需要手工补。
+> ⚠️ **2026-11-01 更正**：本节原先教人跑 `~/.myfleet/sync_myds.sh`。**该脚本已不存在**，
+> 而且现在的部署链**不再同步源码树**。照着旧文操作只会得到「文件不存在」，没有任何效果。
 
-如果看到 `make audit-ledger` 报 `marker missing` 或证据缺失，说明那台机器上的副本是旧的，
-按下面的方式补一次即可：
+**当前机制（两条完全独立的路径，别混）：**
+
+| 需要什么 | 用什么 | 传的是什么 |
+|---|---|---|
+| 只想更新**推理服务** | `myds/tools/deploy_artifact.sh` | 只有 `bin/myds` + `bin/myds.metallib` |
+| 要在那台机器上跑**语料 / 审计 / 测试** | `git pull`（或下面的 rsync） | 整个源码树（含 `benchmarks/`、`docs/`） |
+
+**因为 `bin/` 和跑批结果都不入 git，产物与源码必须分开同步 —— 这是刻意的。**
+`deploy.sh` 里的 `rsync` 只同步 `myfleet/` 目录，**不碰 `myds/`**。
+
+补源码/语料（在权威侧执行，不要反向）：
 
 ```bash
-# 在权威侧，而不是在目标机上
-cd ~/Projects/myfleet && ./sync_myds.sh
+# 首选：目标机本来就有 git 检出，直接拉
+ssh macstudio 'cd ~/Projects/myds && git pull --ff-only'
+
+# 兜底：目标机不是干净检出、或有未提交改动时，整树 rsync（不碰 bin/ 与 build/）
+rsync -az --delete \
+      --exclude='.git' --exclude='bin' --exclude='build' \
+      --exclude='scratch' --exclude='.deploy-prev' \
+      ~/Projects/myds/ macstudio:~/Projects/myds/
 ```
 
-`sync_myds.sh` 会在同步前后各算一次源码树指纹（其中包含 `benchmarks` 下的
-`*.txt` / `*.jsonl` / `*.json`），两侧不一致会直接中止 —— 也就是说「传过去了但传错」
-会被拦住，不靠人眼核对。
+核验两端源码树一致（`benchmarks/` 与 `docs/` 都算在指纹里）：
 
-同步后在那台机器上确认：
+```bash
+# 两边应打出同一个 sha256
+cd ~/Projects/myds && git rev-parse HEAD && git status --porcelain | wc -l
+```
+
+同步完成后在那台机器上确认：
 
 ```bash
 cd ~/Projects/myds && make corpus-check && make audit-ledger
 ```
+
+⚠️ 注意 `benchmarks/*/runs/` 已进 `.gitignore`（是跑批输出，不是语料）。**`git pull` 不会带它，
+`deploy_artifact.sh` 更不会。** 那台机器上自己跑出来的结果只存在本地，别指望同步过去。
 
 ### 4.1 硬件与软件前置条件
 
@@ -156,9 +176,17 @@ cd ~/Projects/myds && make corpus-check && make audit-ledger
 | 内存 | **≥192 GiB 统一内存** | 模型常驻 148–154 GB，工作区另有需求；低于此会在 prefill 时 OOM 或 panic |
 | 权重 | `DeepSeek-V4.1-Flash-1017-Q2-dense-q4-imx-cliecy.gguf`（362 GB） | 数字是这份权重量出来的，换量化结果不可比 |
 | 独占 | 无其它 myds / bench 进程 | 脚本启动前会检查，发现 >1 个即拒绝运行 |
-| Xcode | 命令行工具齐全（`xcrun metal` 可用） | 需要 `make metallib` |
+| Xcode | **只有权威侧需要**（`xcrun metal` 可用） | 需要 `make metallib`；目标机不需要，见下 |
 | sudo | **免密**（`sudo -n true` 通过） | 读原子计数器要 `lldb` attach，采 GPU 要 `powermetrics` |
 | 配置 | `MYDS_CHUNK_KEY_MAX=1048576`（本次口径） | 该值直接改变 chunk 工作区大小，是吞吐差异的主要嫌疑 |
+
+> ⚠️ **2026-11-01 补充**：目标机（macstudio）**没有 Metal 工具链**
+> —— 实测 `xcrun -f metal` 报 `unable to find utility "metal"`。
+> 这不影响本流程：`bin/myds.metallib` 由权威侧构建后随产物一起下发，
+> `corpus-check` / `audit-ledger` 与跑服务都不需要编译 shader。
+> **只有想在那台机器上跑 `make test` 才会撞墙**（它要现编 metallib）。
+> 以前那种「远端重编译」的部署模型正是因此行不通，已于 2026-11-01 废弃。
+
 
 如果 `sudo` 没有免密，脚本会在计数器那一步返回 `None`，验证器会报
 `counter deltas present` 失败——**这是设计如此**：没有计数器就无法证明两臂真的分开跑了，

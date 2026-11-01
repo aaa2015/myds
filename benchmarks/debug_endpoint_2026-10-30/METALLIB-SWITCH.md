@@ -30,7 +30,7 @@
 1. 干净树构建 metallib → `719242c9`
 2. 拷到 macstudio
 3. **单文件原子替换**（旧进程持有旧 inode，不受影响）
-4. 备份到 `.deploy-prev/metallib/`
+4. 备份到 `bin/.prev-<时间戳>/`（**不是** `.deploy-prev/metallib/` —— 见下方回滚说明）
 5. 停服 → 等内存回收 → `start_fleet.sh` + `renice 5`
 6. **发哑请求并丢弃**
 7. 验证
@@ -46,9 +46,19 @@
 
 ## 回滚
 
+> ⚠️ **2026-11-01 更新**：原来这里写的是 `cp .deploy-prev/metallib/myds.metallib …`，**该路径不存在**。
+> `.deploy-prev/` 是旧 `sync_myds.sh` 的源码快照（已删），从未存过 metallib。
+
+当前回滚点是 `bin/.prev-<时间戳>/`，由 `myds/tools/deploy_artifact.sh` 每次部署前自动创建，
+同时含 `myds` 与 `myds.metallib`：
+
 ```bash
-ssh macstudio 'cd ~/Projects/myds && cp .deploy-prev/metallib/myds.metallib bin/myds.metallib'
+ssh macstudio "cd ~/Projects/myds && ls -dt bin/.prev-* | head -3"    # 挑时间点
+ssh macstudio "cd ~/Projects/myds && rsync -a bin/.prev-<时间戳>/ bin/"
+ssh macstudio "export PATH=/opt/homebrew/bin:/usr/local/bin:\$PATH; cd ~/Projects/myfleet && ./start_fleet.sh"
 ```
+
+`bin/` 不在 git 里，所以这些快照是产物回滚的唯一依据。
 
 ## 未做（已知缺口）
 
