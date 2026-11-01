@@ -7,6 +7,7 @@
 #include "myds_log.h"
 #include "myds_trace.h"
 #include "myds_debugstate.h"
+#include "myds_sysstat.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -467,6 +468,18 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         }
         /* 注意 "/trace/api/requests" 也以 "/trace/api/request" 开头，
          * 靠上面的分支先返回才没出错。要求前缀之后就是结尾，去掉这个隐含顺序依赖。 */
+        if (strcmp(route, "/trace/api/system") == 0) {
+            char sys[512];
+            if (!myds_sysstat_json(sys, sizeof(sys))) {
+                send_response(client_fd, 500, "Internal Server Error", "application/json",
+                              "{\"error\":\"system stats unavailable\"}");
+            } else {
+                send_response(client_fd, 200, "OK", "application/json", sys);
+            }
+            free(req_buf);
+            close(client_fd);
+            return;
+        }
         if (strncmp(route, "/trace/api/request", 18) == 0 && route[18] == '\0') {
             /* ?seq=N。没有 seq 或解析失败一律 400 —— 静默给个默认值会让客户端
              * 以为自己在看请求 1，而实际看的是别的。 */
@@ -1632,6 +1645,16 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             trec.cached_tokens = phases_record.cached_tokens;
             trec.out_tokens = phases_record.out_tokens;
             trec.stream = phases_record.stream;
+            /* 三个速度指标。口径写清楚，因为页面上并排显示、很容易读串：
+             *   ttft        请求到达 → 第一个 token（含排队）
+             *   prefill_tps 引擎自报，只用真正跑过的 token 除以耗时（不含排队/分词）
+             *   decode_tps  生成阶段；取消/失败时是负值 ⇒ null，不是 0
+             * 原实现用 ttft 反推 prefill 速率，实测会让复用命中的轮次看起来极慢
+             * —— 固定开销摊在极少量 token 上。这里直接取引擎的计时。 */
+            trec.ttft_s = (final_tokens > 0 && t_first > t_arrive) ? (t_first - t_arrive) : -1.0;
+            trec.prefill_tps = (pf.valid && pf.prefill_seconds > 0.0)
+                ? (double)pf.prefill_tokens / pf.prefill_seconds : -1.0;
+            trec.decode_tps = (decode_s > 0.0 && final_tokens > 1) ? decode_tps : -1.0;
             /* layer_count 保持 0：引擎不默认给逐层计时，见 myds_trace.h 的说明。 */
             myds_trace_record(&trec);
 

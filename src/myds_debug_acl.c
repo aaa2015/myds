@@ -29,9 +29,9 @@
 typedef struct {
     uint32_t network;   /* 已按 mask 归一化 */
     uint32_t mask;
-} acl_entry_t;
+} myds_acl_entry_t;
 
-static acl_entry_t g_acl[MYDS_ACL_MAX];
+static myds_acl_entry_t g_acl[MYDS_ACL_MAX];
 static int g_acl_count = -1;   /* -1 = 尚未解析 */
 
 /* Loopback check over the *IPv4 dotted-quad the server actually produces*.

@@ -45,6 +45,13 @@ typedef struct {
     uint32_t cached_tokens;
     uint32_t out_tokens;
     int      stream;
+
+    /* 吞吐与延迟。同样遵守「未测量 = 负值 = null」：
+     * 取消的请求没有 decode 速度，早退的请求没有 TTFT，
+     * 把它们印成 0 t/s 会被读成「慢到零」，而真相是「没发生」。 */
+    double   ttft_s;        /* 首字时间：请求到达 → 第一个 token 吐出（含排队） */
+    double   prefill_tps;   /* 引擎自报的 prefill 速率 */
+    double   decode_tps;    /* 生成阶段速率 */
     /* 逐模型层耗时。**默认全 0 且 layer_count == 0** —— 引擎只在
      * MYDS_PROFILE_PREFILL=1 时才有逐层计时，而那个开关会把 prefill chunk
      * 退化成串行，不能为了页面好看默认打开。

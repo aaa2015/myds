@@ -15,7 +15,7 @@ DEPLOY_FLAGS := -mmacosx-version-min=$(DEPLOY_TARGET)
 # -Ithird_party: 视觉用的 iris 单头解码器（JPEG/PNG）
 CFLAGS ?= -O3 -Wall -Wextra -std=c11 -Iinclude -Ithird_party
 OBJCFLAGS ?= -O3 -Wall -Wextra -Iinclude -fobjc-arc
-LDFLAGS ?= -framework Foundation -framework Metal -lm -lpthread
+LDFLAGS ?= -framework Foundation -framework Metal -framework IOKit -framework CoreFoundation -lm -lpthread
 
 # 用 += 而不是写进 ?=：即使调用方覆盖了 CFLAGS，部署目标仍然生效。
 # （踩过：?= 的变量被外部覆盖后，后面的追加习惯性地跟着失效）
@@ -35,7 +35,7 @@ SRCS_C = src/myds_cpu.c src/myds_log.c src/myds_configfile.c src/myds_gguf.c src
          src/myds_engram.c src/myds_engram_cpu.c src/myds_moe_cpu.c src/myds_dspark.c \
          src/myds_vispre.c src/myds_visw.c src/myds_visfwd.c src/myds_vjob.c \
            src/myds_kvdsk.c \
-         src/myds_server.c src/myds_resp_store.c src/myds_infer_queue.c src/myds_dsml.c src/myds_proto_openai.c src/myds_http_io.c src/myds_trace.c src/myds_debug_acl.c \
+         src/myds_server.c src/myds_resp_store.c src/myds_infer_queue.c src/myds_dsml.c src/myds_proto_openai.c src/myds_http_io.c src/myds_trace.c src/myds_debug_acl.c src/myds_sysstat.c \
          src/myds_steer.c src/myds_steer_alpha.c
 SRCS_M = src/myds_metal.m
 OBJS_C = $(patsubst src/%.c, $(BUILD_DIR)/%.o, $(SRCS_C))
@@ -96,6 +96,7 @@ TEST_LOOP_GUARD = $(BIN_DIR)/test_loop_guard
 TEST_TRACE = $(BIN_DIR)/test_trace
 TEST_DSML = $(BIN_DIR)/test_dsml
 TEST_DEBUG_ACL = $(BIN_DIR)/test_debug_acl
+TEST_SYSSTAT = $(BIN_DIR)/test_sysstat
 TEST_KVDSK = $(BIN_DIR)/test_kvdsk
 TEST_KVDSK_FIFO = $(BIN_DIR)/test_kvdsk_fifo
 TEST_ANCHOR_SLOTS = $(BIN_DIR)/test_anchor_slots
@@ -130,7 +131,7 @@ DUMP_TENSORS = $(BIN_DIR)/dump_tensors
 METALLIB = $(BIN_DIR)/myds.metallib
 METAL_SRCS = $(wildcard metal/*.metal)
 
-ALL_TESTS = $(TEST_METAL) $(TEST_V41_GPU) $(TEST_ATTN_POLICY) $(TEST_ATTN_VEC) $(TEST_QKV_FUSION) $(TEST_DECODE_Q8) $(TEST_MOE_DOWN_NSG) $(TEST_DEEPER_SSD) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE) $(TEST_CPU) $(TEST_ENGRAM) $(TEST_ALIGN) $(TEST_PLD) $(TEST_LOOP_GUARD) $(TEST_TRACE) $(TEST_DSML) $(TEST_DEBUG_ACL) $(TEST_KVDSK) $(TEST_P1) $(TEST_DSPARK_ROLLBACK) $(TEST_DSPARK_CAPTURE) $(TEST_DSPARK_ROUTER) $(TEST_V41_ROUTER) $(TEST_BATCH2_SHARED_PAIR) $(TEST_DSPARK_ATTN) $(TEST_DSPARK_MOE) $(TEST_DSPARK_PROPOSAL) $(TEST_BATCH2_PARITY) $(TEST_BATCH2_E2E) $(TEST_Q4_BF16_PARITY) $(TEST_TREE_SPEC) $(TEST_ENGINE_DEPTH2)
+ALL_TESTS = $(TEST_METAL) $(TEST_V41_GPU) $(TEST_ATTN_POLICY) $(TEST_ATTN_VEC) $(TEST_QKV_FUSION) $(TEST_DECODE_Q8) $(TEST_MOE_DOWN_NSG) $(TEST_DEEPER_SSD) $(TEST_GGUF) $(TEST_TOKENIZER) $(TEST_SERVER) $(TEST_LOG) $(TEST_SERVER_API) $(TEST_ENGINE) $(TEST_CPU) $(TEST_ENGRAM) $(TEST_ALIGN) $(TEST_PLD) $(TEST_LOOP_GUARD) $(TEST_TRACE) $(TEST_DSML) $(TEST_DEBUG_ACL) $(TEST_SYSSTAT) $(TEST_KVDSK) $(TEST_P1) $(TEST_DSPARK_ROLLBACK) $(TEST_DSPARK_CAPTURE) $(TEST_DSPARK_ROUTER) $(TEST_V41_ROUTER) $(TEST_BATCH2_SHARED_PAIR) $(TEST_DSPARK_ATTN) $(TEST_DSPARK_MOE) $(TEST_DSPARK_PROPOSAL) $(TEST_BATCH2_PARITY) $(TEST_BATCH2_E2E) $(TEST_Q4_BF16_PARITY) $(TEST_TREE_SPEC) $(TEST_ENGINE_DEPTH2)
 # 畸形 GGUF 边界防护（2026-10-25）。只链接 gguf 层，不需要 GPU。
 # ★ 必须在 ALL_TESTS 被 all:/test: 引用【之前】定义并追加：
 #   Make 的先决条件在读取时就展开，晚于 all:/test: 的 += 不会进入那两个目标。
@@ -543,7 +544,7 @@ test-steer-alpha: $(TEST_STEER_ALPHA)
 $(TEST_STEER_ALPHA): tests/test_steer_alpha.c src/myds_steer_alpha.c include/myds_steer_alpha.h | $(BIN_DIR)
 	$(CC) $(CFLAGS) -Iinclude tests/test_steer_alpha.c src/myds_steer_alpha.c $(LDFLAGS) -o $@
 
-$(TEST_SERVER): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_resp_store.o $(BUILD_DIR)/myds_infer_queue.o $(BUILD_DIR)/myds_dsml.o $(BUILD_DIR)/myds_proto_openai.o $(BUILD_DIR)/myds_http_io.o $(BUILD_DIR)/myds_trace.o $(BUILD_DIR)/myds_debug_acl.o $(BUILD_DIR)/myds_vjob.o $(BUILD_DIR)/myds_vispre.o $(BUILD_DIR)/myds_visw.o $(BUILD_DIR)/myds_visfwd.o $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_engram_cpu.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_knobs.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/myds_steer.o $(BUILD_DIR)/test_server.o $(METALLIB) | $(BIN_DIR)
+$(TEST_SERVER): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_resp_store.o $(BUILD_DIR)/myds_infer_queue.o $(BUILD_DIR)/myds_dsml.o $(BUILD_DIR)/myds_proto_openai.o $(BUILD_DIR)/myds_http_io.o $(BUILD_DIR)/myds_trace.o $(BUILD_DIR)/myds_debug_acl.o $(BUILD_DIR)/myds_sysstat.o $(BUILD_DIR)/myds_vjob.o $(BUILD_DIR)/myds_vispre.o $(BUILD_DIR)/myds_visw.o $(BUILD_DIR)/myds_visfwd.o $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_engram_cpu.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_knobs.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/myds_steer.o $(BUILD_DIR)/test_server.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
 
 # 图片块区间对齐：纯头文件（myds_align.h），不需要任何 .c。
@@ -562,6 +563,10 @@ $(TEST_TRACE): tests/test_trace.c src/myds_trace.c include/myds_trace.h | $(BIN_
 
 $(TEST_DEBUG_ACL): tests/test_debug_acl.c src/myds_debug_acl.c include/myds_debugstate.h $(BUILD_DIR)/myds_log.o | $(BIN_DIR)
 	$(CC) $(CFLAGS) -Iinclude -o $@ tests/test_debug_acl.c src/myds_debug_acl.c $(BUILD_DIR)/myds_log.o -lpthread
+
+$(TEST_SYSSTAT): tests/test_sysstat.c src/myds_sysstat.c include/myds_sysstat.h $(BUILD_DIR)/myds_log.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) -Iinclude -o $@ tests/test_sysstat.c src/myds_sysstat.c $(BUILD_DIR)/myds_log.o \
+		-framework IOKit -framework CoreFoundation -lpthread
 
 # 解析器有自己的 TU，测试只链接它 + 日志；json_escape_alloc 在测试里给了等价实现。
 $(TEST_DSML): tests/test_dsml.c src/myds_dsml.c include/myds_server_internal.h $(BUILD_DIR)/myds_log.o | $(BIN_DIR)
@@ -672,7 +677,7 @@ $(PROBE_HC_NORM_ACC): tests/probe_hc_norm_acc.c $(filter-out $(BUILD_DIR)/main.o
 $(TEST_LOG): $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_log.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@
 
-$(TEST_SERVER_API): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_resp_store.o $(BUILD_DIR)/myds_infer_queue.o $(BUILD_DIR)/myds_dsml.o $(BUILD_DIR)/myds_proto_openai.o $(BUILD_DIR)/myds_http_io.o $(BUILD_DIR)/myds_trace.o $(BUILD_DIR)/myds_debug_acl.o $(BUILD_DIR)/myds_vjob.o $(BUILD_DIR)/myds_vispre.o $(BUILD_DIR)/myds_visw.o $(BUILD_DIR)/myds_visfwd.o $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_engram_cpu.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_knobs.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/myds_steer.o $(BUILD_DIR)/test_server_api.o $(METALLIB) | $(BIN_DIR)
+$(TEST_SERVER_API): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_resp_store.o $(BUILD_DIR)/myds_infer_queue.o $(BUILD_DIR)/myds_dsml.o $(BUILD_DIR)/myds_proto_openai.o $(BUILD_DIR)/myds_http_io.o $(BUILD_DIR)/myds_trace.o $(BUILD_DIR)/myds_debug_acl.o $(BUILD_DIR)/myds_sysstat.o $(BUILD_DIR)/myds_vjob.o $(BUILD_DIR)/myds_vispre.o $(BUILD_DIR)/myds_visw.o $(BUILD_DIR)/myds_visfwd.o $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_engram_cpu.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_knobs.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/myds_steer.o $(BUILD_DIR)/test_server_api.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
 
 # CPU-only failure-path gate; includes server.c to exercise its private renderers.
@@ -866,6 +871,7 @@ test: check-knobs $(ALL_TESTS) $(METALLIB)
 	@./$(TEST_TRACE)
 	@./$(TEST_DSML)
 	@./$(TEST_DEBUG_ACL)
+	@./$(TEST_SYSSTAT)
 	@echo ""
 	@./$(TEST_KVDSK)
 	@echo ""

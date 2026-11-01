@@ -181,6 +181,12 @@ static void jput_record(jbuf_t *b, const myds_trace_rec_t *r) {
     jput_stage(b, r->phases.unattributed_s);
     jputf(b, "},\"prompt_tokens\":%u,\"cached_tokens\":%u,\"out_tokens\":%u,\"stream\":%s",
           r->prompt_tokens, r->cached_tokens, r->out_tokens, r->stream ? "true" : "false");
+    jput(b, ",\"ttft\":");
+    jput_stage(b, r->ttft_s);
+    jput(b, ",\"prefill_tps\":");
+    jput_stage(b, r->prefill_tps);
+    jput(b, ",\"decode_tps\":");
+    jput_stage(b, r->decode_tps);
     /* layer_count == 0 时明确输出 null：页面据此显示「未测量」，
      * 而不是把空数组画成一条零线。 */
     if (r->layer_count == 0) {
@@ -248,7 +254,13 @@ const char *myds_trace_page_html(void) {
 "align-items:baseline;flex-wrap:wrap}"
 "h1{font-size:14px;margin:0;font-weight:600}"
 ".meta{color:var(--dim);font-size:12px}"
-"#wrap{display:flex;height:calc(100vh - 45px)}"
+"#sys{padding:6px 16px;border-bottom:1px solid var(--line);font-size:12px;"
+"display:flex;gap:18px;flex-wrap:wrap}"
+".m{display:flex;align-items:center;gap:6px;color:var(--dim)}"
+".m b{color:var(--fg);font-weight:600}"
+".bar{width:70px;height:6px;background:#252a33;border-radius:3px;overflow:hidden}"
+".bar i{display:block;height:100%;background:var(--acc)}"
+"#wrap{display:flex;height:calc(100vh - 78px)}"
 "#list{width:52%;overflow:auto;border-right:1px solid var(--line)}"
 "#detail{flex:1;overflow:auto;padding:14px 16px}"
 "table{width:100%;border-collapse:collapse}"
@@ -283,10 +295,13 @@ const char *myds_trace_page_html(void) {
 "</style></head><body>"
 "<header><h1>myds trace</h1><span class=\"meta\" id=\"hdr\">loading…</span>"
 "<span class=\"meta\">点击一行查看该请求的分层耗时</span></header>"
+"<div id=\"sys\"><span id=\"sysbox\" class=\"meta\">资源：采样中…</span></div>"
 "<div id=\"wrap\"><div id=\"list\"><table><thead><tr>"
 "<th>#</th><th>时间</th><th>path</th><th class=\"num\">prompt</th>"
-"<th class=\"num\">out</th><th class=\"num\">耗时</th><th>finish</th>"
-"</tr></thead><tbody id=\"rows\"><tr><td colspan=\"7\" class=\"empty\">loading…</td></tr>"
+"<th class=\"num\">out</th><th class=\"num\">TTFT</th>"
+"<th class=\"num\">prefill</th><th class=\"num\">decode</th>"
+"<th class=\"num\">总耗时</th><th>finish</th>"
+"</tr></thead><tbody id=\"rows\"><tr><td colspan=\"10\" class=\"empty\">loading…</td></tr>"
 "</tbody></table></div><div id=\"detail\"><div class=\"empty\">选择左侧任一请求</div></div></div>"
 "<script>"
 "const ST=[['queue','排队','--q'],['render','解析+渲染','--r'],['setup','进引擎前','--s'],"
@@ -313,7 +328,7 @@ const char *myds_trace_page_html(void) {
 "RECS=j.records||[];"
 "document.getElementById('hdr').textContent='count '+j.count+' / capacity '+j.capacity;"
 "const tb=document.getElementById('rows');"
-"if(!RECS.length){tb.innerHTML='<tr><td colspan=\"7\" class=\"empty\">"
+"if(!RECS.length){tb.innerHTML='<tr><td colspan=\"10\" class=\"empty\">"
 "暂无记录（先发一个请求）</td></tr>';return;}"
 "tb.innerHTML=RECS.map(rec=>{"
 "const p=rec.phases;const when=new Date(rec.epoch_ms).toLocaleTimeString();"
@@ -322,6 +337,9 @@ const char *myds_trace_page_html(void) {
 "+`<td>${rec.seq}</td><td>${when}</td><td>${esc(rec.path)}</td>`"
 "+`<td class=\"num\">${rec.prompt_tokens}</td>`"
 "+`<td class=\"num\">${rec.out_tokens}</td>`"
+"+`<td class=\"num\">${rec.ttft===null?'—':f(rec.ttft)}</td>`"
+"+`<td class=\"num\">${rec.prefill_tps===null?'—':rec.prefill_tps.toFixed(0)+' t/s'}</td>`"
+"+`<td class=\"num\">${rec.decode_tps===null?'—':rec.decode_tps.toFixed(1)+' t/s'}</td>`"
 "+`<td class=\"num\">${wall===null?'—':f(wall)}</td>`"
 "+`<td><span class=\"pill ${cls(rec.finish)}\">${esc(rec.finish)}</span></td>`"
 "+`</tr>`;}).join('');"
@@ -378,7 +396,27 @@ const char *myds_trace_page_html(void) {
 "x.fillText('layer '+(v.length-1),c.width-56,c.height-1);"
 "x.fillText(f(mx),2,10);"
 "}"
-"load();setInterval(load,3000);"
+/* 资源采样。null 表示取不到，显式显示「—」而不是 0 —— 0% 是空闲，
+ * 取不到是另一回事，页面不能把两者画成一样。 */
+"function meter(label,v,unit){"
+"if(v===null)return `<span class=\"m\">${label} <b>—</b></span>`;"
+"const pct=label.indexOf('内存')===0?0:Math.max(0,Math.min(100,v));"
+"return `<span class=\"m\">${label}<span class=\"bar\"><i style=\"width:${pct}%\"></i></span>`"
+"+`<b>${v.toFixed(1)}${unit}</b></span>`;}"
+"async function sysload(){"
+"try{const r=await fetch(api('/trace/api/system'));if(!r.ok)return;"
+"const s=await r.json();"
+"let h=meter('CPU',s.cpu_percent,'%');"
+"h+=meter('GPU',s.gpu_percent,'%');"
+"if(s.mem_used_gb!==null&&s.mem_total_gb){"
+"const pct=100*s.mem_used_gb/s.mem_total_gb;"
+"h+=`<span class=\"m\">内存<span class=\"bar\"><i style=\"width:${pct}%\"></i></span>`"
+"+`<b>${s.mem_used_gb.toFixed(1)} / ${s.mem_total_gb.toFixed(0)} GB (${pct.toFixed(0)}%)</b></span>`;}"
+"else h+=meter('内存',null,'');"
+"h+=`<span class=\"m\">进程 RSS <b>${s.self_rss_gb===null?'—':s.self_rss_gb.toFixed(1)+' GB'}</b></span>`;"
+"document.getElementById('sysbox').outerHTML=`<span id=\"sysbox\">${h}</span>`;"
+"}catch(e){}}"
+"load();sysload();setInterval(load,3000);setInterval(sysload,3000);"
 "</script></body></html>";
 }
 

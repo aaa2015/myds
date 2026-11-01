@@ -81,7 +81,9 @@ def run(output: Path, sanitize: bool) -> None:
         ]
         if sanitize:
             command += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
-        command += ["tests/test_http_bytes.c", "-lpthread", "-o", str(binary)]
+        command += ["tests/test_http_bytes.c", "-lpthread",
+                        "-framework", "IOKit", "-framework", "CoreFoundation",
+                        "-o", str(binary)]
         print("COMPILE", shlex.join(command), flush=True)
         subprocess.run(command, cwd=ROOT, check=True)
         subprocess.run([str(binary), str(output.resolve())], cwd=ROOT, check=True)

@@ -22,6 +22,7 @@
 #include "../src/myds_http_io.c"
 #include "../src/myds_trace.c"
 #include "../src/myds_debug_acl.c"
+#include "../src/myds_sysstat.c"
 
 int main(void) {
     /* Fully measured request. */
