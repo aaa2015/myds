@@ -62,6 +62,10 @@ typedef struct {
      * layer_count == 0 时页面必须显示「未测量」，不能画成一条平线。 */
     uint32_t layer_count;
     float    layer_ms[MYDS_TRACE_LAYERS_MAX];
+    /* 1 = 请求已到达但还没结束。页面据此显示「进行中」并用墙上时间算已耗时，
+     * 否则一次 40 秒的 prefill 在追踪里完全不可见 —— 只能等它结束才出现，
+     * 而这正是最需要看的时候。 */
+    int      in_flight;
 } myds_trace_rec_t;
 
 /* 初始化环形缓冲。capacity 上限 MYDS_TRACE_CAP_MAX；0 或过大都夹取。 */
@@ -70,6 +74,17 @@ void myds_trace_init(uint32_t capacity);
 /* 存一条。seq 与 epoch_ms 由本函数填写，调用方不用管。
  * 缓冲未初始化时自动按默认容量初始化，所以不必保证 init 先于 record。 */
 void myds_trace_record(myds_trace_rec_t *rec);
+
+/* 请求到达即登记，返回它的 seq；结束时用 myds_trace_complete 回填。
+ *
+ * 为什么要两段式：单段式（只在结束时写）会让长请求在整个执行期间不可见。
+ * 排查「现在卡在哪」时恰恰最需要看正在进行的那条，而不是等它结束。
+ *
+ * begin 只填 path / client / resp_id / epoch_ms，并把 in_flight 置 1；
+ * complete 按 seq 找回同一条，覆盖其余字段并清 in_flight。找不到（已被环形缓冲
+ * 挤掉）时静默丢弃 —— 那条记录本来就已经不在了，补一条新的反而会打乱顺序。 */
+uint64_t myds_trace_begin(const char *path, const char *client, const char *resp_id);
+void     myds_trace_complete(uint64_t seq, const myds_trace_rec_t *rec);
 
 /* 已记录的条数（不超过容量）与容量。 */
 uint32_t myds_trace_count(void);

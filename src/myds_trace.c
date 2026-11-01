@@ -59,6 +59,49 @@ void myds_trace_record(myds_trace_rec_t *rec) {
     pthread_mutex_unlock(&g_lock);
 }
 
+uint64_t myds_trace_begin(const char *path, const char *client, const char *resp_id) {
+    myds_trace_rec_t r;
+    memset(&r, 0, sizeof(r));
+    snprintf(r.path, sizeof(r.path), "%s", path ? path : "");
+    snprintf(r.client, sizeof(r.client), "%s", client ? client : "");
+    snprintf(r.resp_id, sizeof(r.resp_id), "%s", resp_id ? resp_id : "");
+    /* 各阶段先标成「未测量」(-1)，而不是 0：请求还没跑完，0 会被读成「瞬时完成」。 */
+    r.phases.queue_s = -1.0;
+    r.phases.render_s = -1.0;
+    r.phases.setup_s = -1.0;
+    r.phases.engine_s = -1.0;
+    r.phases.prefill_s = -1.0;
+    r.phases.decode_s = -1.0;
+    r.phases.unattributed_s = -1.0;
+    r.ttft_s = -1.0;
+    r.prefill_tps = -1.0;
+    r.decode_tps = -1.0;
+    r.in_flight = 1;
+    myds_trace_record(&r);
+    return r.seq;
+}
+
+void myds_trace_complete(uint64_t seq, const myds_trace_rec_t *rec) {
+    if (!rec || seq == 0) return;
+    pthread_mutex_lock(&g_lock);
+    if (g_ring) {
+        const uint32_t start = (g_next + g_cap - g_count) % g_cap;
+        for (uint32_t i = 0; i < g_count; ++i) {
+            myds_trace_rec_t *slot = &g_ring[(start + i) % g_cap];
+            if (slot->seq != seq) continue;
+            const int64_t epoch = slot->epoch_ms;
+            *slot = *rec;
+            /* seq 与到达时间是这条记录的身份，不能被结束时的副本覆盖：
+             * 覆盖了就不再是「同一个请求」，页面的选中状态会跳。 */
+            slot->seq = seq;
+            slot->epoch_ms = epoch;
+            slot->in_flight = 0;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+}
+
 uint32_t myds_trace_count(void) {
     pthread_mutex_lock(&g_lock);
     const uint32_t n = g_count;
@@ -181,7 +224,9 @@ static void jput_record(jbuf_t *b, const myds_trace_rec_t *r) {
     jput_stage(b, r->phases.decode_s);
     jput(b, ",\"unattributed\":");
     jput_stage(b, r->phases.unattributed_s);
-    jputf(b, "},\"prompt_tokens\":%u,\"cached_tokens\":%u,\"out_tokens\":%u,\"stream\":%s",
+    jputf(b, "},\"in_flight\":%s,\"prompt_tokens\":%u,\"cached_tokens\":%u,"
+          "\"out_tokens\":%u,\"stream\":%s",
+          r->in_flight ? "true" : "false",
           r->prompt_tokens, r->cached_tokens, r->out_tokens, r->stream ? "true" : "false");
     jput(b, ",\"ttft\":");
     jput_stage(b, r->ttft_s);
@@ -285,6 +330,7 @@ const char *myds_trace_page_html(void) {
 ".pill{display:inline-block;padding:0 5px;border-radius:3px;font-size:11px;"
 "background:#252a33;color:var(--dim)}"
 ".pill.len{background:#3a2a2a;color:#e08a8a}"
+".pill.run{background:#1e3a5f;color:#7fc0f0}"
 ".pill.err{background:#4a2020;color:#f0a0a0}"
 ".pill.stop{background:#22352a;color:#89c79a}"
 ".pill.tool{background:#2a3350;color:#9db4e8}"
@@ -344,7 +390,12 @@ const char *myds_trace_page_html(void) {
 "暂无记录（先发一个请求）</td></tr>';return;}"
 "tb.innerHTML=RECS.map(rec=>{"
 "const p=rec.phases;const when=new Date(rec.epoch_ms).toLocaleTimeString();"
-"const wall=p.engine===null?null:p.queue+(p.render||0)+(p.setup||0)+p.engine;"
+/* 进行中的请求没有 engine（阶段都是 null），用【墙上时间】算已耗时 ——
+ * 这是唯一能在跑完之前拿到的数。它包含排队，与完成后的口径不同，
+ * 所以单独标注，不冒充「总耗时」。 */
+"const wall=rec.in_flight?(Date.now()-rec.epoch_ms)/1000:"
+"(p.engine===null?null:(p.queue<0?0:p.queue)+(p.render>0?p.render:0)+"
+"(p.setup>0?p.setup:0)+p.engine);"
 "return `<tr data-seq=\"${rec.seq}\"${rec.seq===SEL?' class=\"sel\"':''}>`"
 "+`<td>${rec.seq}</td><td>${when}</td>`"
 /* resp_id 比 path 长：列表里截断显示，完整值仍在详情与 API 里。
@@ -356,7 +407,8 @@ const char *myds_trace_page_html(void) {
 "+`<td class=\"num\">${rec.prefill_tps===null?'—':rec.prefill_tps.toFixed(0)+' t/s'}</td>`"
 "+`<td class=\"num\">${rec.decode_tps===null?'—':rec.decode_tps.toFixed(1)+' t/s'}</td>`"
 "+`<td class=\"num\">${wall===null?'—':f(wall)}</td>`"
-"+`<td><span class=\"pill ${cls(rec.finish)}\">${esc(rec.finish)}</span></td>`"
+"+`<td>${rec.in_flight?'<span class=\"pill run\">进行中</span>':"
+"`<span class=\"pill ${cls(rec.finish)}\">${esc(rec.finish)}</span>`}</td>`"
 "+`</tr>`;}).join('');"
 "tb.querySelectorAll('tr[data-seq]').forEach(tr=>{"
 "tr.onclick=()=>{SEL=+tr.dataset.seq;"
@@ -370,6 +422,9 @@ const char *myds_trace_page_html(void) {
 "const measured=parts.filter(x=>x.val!==null&&x.val>0);"
 "const sum=measured.reduce((a,x)=>a+x.val,0);"
 "let html='<h2>请求 #'+rec.seq+' · '+esc(rec.path)+'</h2>';"
+"if(rec.in_flight){html+='<div class=\"warn\" style=\"margin-bottom:10px\">进行中 —— "
+"已耗时 '+(Date.now()-rec.epoch_ms)/1000<1?'<1':((Date.now()-rec.epoch_ms)/1000).toFixed(1)"
+"+' s（含排队）。阶段耗时尚未产出，完成后自动刷新。</div>';}"
 "html+='<table class=\"kv\">'"
 "+'<tr><td>时间</td><td>'+new Date(rec.epoch_ms).toLocaleString()+'</td></tr>'"
 "+'<tr><td>客户端</td><td>'+esc(rec.client)+'</td></tr>'"

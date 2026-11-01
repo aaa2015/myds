@@ -708,6 +708,26 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         const bool is_continuation = prev_id[0] != 0;
         char resp_id[64];
         resp_id_new(resp_id, sizeof(resp_id));
+        /* 请求一到达就登记一条 in_flight 记录，结束时再回填。
+         * 只写结尾的话，一次 40 秒的 prefill 在页面里完全不可见 ——
+         * 而「现在卡在哪」恰恰只能看正在进行的那条。 */
+        char trace_client[MYDS_TRACE_CLIENT_MAX];
+        snprintf(trace_client, sizeof(trace_client), "%s:%d", client_ip, client_port);
+        const uint64_t trace_seq = myds_trace_begin(path, trace_client, resp_id);
+        /* 早退时用它收尾：清掉 in_flight，阶段全部保持「未测量」。
+         * 不做这一步的话，被拒绝的请求会永远挂在页面上显示「进行中」。 */
+        myds_trace_rec_t trec_fail;
+        memset(&trec_fail, 0, sizeof(trec_fail));
+        snprintf(trec_fail.path, sizeof(trec_fail.path), "%s", path);
+        snprintf(trec_fail.client, sizeof(trec_fail.client), "%s", trace_client);
+        snprintf(trec_fail.resp_id, sizeof(trec_fail.resp_id), "%s", resp_id);
+        snprintf(trec_fail.finish, sizeof(trec_fail.finish), "rejected");
+        trec_fail.phases.queue_s = -1.0;  trec_fail.phases.render_s = -1.0;
+        trec_fail.phases.setup_s = -1.0;  trec_fail.phases.engine_s = -1.0;
+        trec_fail.phases.prefill_s = -1.0; trec_fail.phases.decode_s = -1.0;
+        trec_fail.phases.unattributed_s = -1.0;
+        trec_fail.ttft_s = -1.0; trec_fail.prefill_tps = -1.0; trec_fail.decode_tps = -1.0;
+        trec_fail.stream = stream ? 1 : 0;
         /* 排队与背压保护：在解析与任何 GPU 工作（包括视觉处理）前统一获取推理名额 */
         int q_timeout_ms = 60000;
         const char *to_env = getenv("MYDS_QUEUE_TIMEOUT_MS");
@@ -732,6 +752,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 : "{\"error\":{\"message\":\"Request timed out waiting in inference queue; please retry later\",\"type\":\"server_error\",\"code\":\"queue_timeout\"}}";
             send_response(client_fd, 503, "Service Unavailable", "application/json", err_json);
             myds_vjob_sink_free(&img_sink);
+            myds_trace_complete(trace_seq, &trec_fail);
             free(prompt); free(req_buf); close(client_fd); return;
         }
 
@@ -768,6 +789,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             pthread_mutex_unlock(&g_infer_mutex);
             server_release_infer_slot();
             myds_vjob_sink_free(&img_sink);
+            myds_trace_complete(trace_seq, &trec_fail);
             free(prompt); free(req_buf); close(client_fd); return;
         }
         /* 探针状态放在静态区：推理由 g_infer_mutex 串行化，同一时刻只有一个请求在跑，
@@ -821,6 +843,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                      "\"code\":\"unknown_previous_response_id\"}}", prev_id);
             send_response(client_fd, 400, "Bad Request", "application/json", err);
             myds_vjob_sink_free(&img_sink);
+            myds_trace_complete(trace_seq, &trec_fail);
             free(prompt); free(req_buf); close(client_fd); return;
         }
 
@@ -849,6 +872,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                           "previous_response_id to change tools\",\"type\":\"invalid_request_error\","
                           "\"code\":\"tools_changed_on_continuation\"}}");
             myds_vjob_sink_free(&img_sink);
+            myds_trace_complete(trace_seq, &trec_fail);
             free(prompt); free(req_buf); close(client_fd); return;
         }
 
@@ -895,6 +919,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                     send_response(client_fd, 500, "Internal Server Error", "application/json",
                                   "{\"error\":{\"message\":\"Out of memory rebuilding continuation\",\"type\":\"server_error\"}}");
                     myds_vjob_sink_free(&img_sink);
+                    myds_trace_complete(trace_seq, &trec_fail);
                     free(prompt); free(req_buf); close(client_fd); return;
                 }
                 memcpy(full, saved, plen);
@@ -1653,11 +1678,15 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
              * 原实现用 ttft 反推 prefill 速率，实测会让复用命中的轮次看起来极慢
              * —— 固定开销摊在极少量 token 上。这里直接取引擎的计时。 */
             trec.ttft_s = (final_tokens > 0 && t_first > t_arrive) ? (t_first - t_arrive) : -1.0;
-            trec.prefill_tps = (pf.valid && pf.prefill_seconds > 0.0)
+            /* 必须要求 prefill_tokens > 0：整个 prompt 都命中缓存时 tokens 是 0，
+             * 0/seconds 会算出 0.0 t/s —— 页面显示「prefill 0 t/s」，
+             * 读起来像「慢到零」，而真相是「这次没跑 prefill」。
+             * 没有 token 就没有速率，输出 null。 */
+            trec.prefill_tps = (pf.valid && pf.prefill_tokens > 0 && pf.prefill_seconds > 0.0)
                 ? (double)pf.prefill_tokens / pf.prefill_seconds : -1.0;
             trec.decode_tps = (decode_s > 0.0 && final_tokens > 1) ? decode_tps : -1.0;
             /* layer_count 保持 0：引擎不默认给逐层计时，见 myds_trace.h 的说明。 */
-            myds_trace_record(&trec);
+            myds_trace_complete(trace_seq, &trec);
 
             char phases_json[512];
             myds_request_phases_json(&phases_record, phases_json, sizeof(phases_json));

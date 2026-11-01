@@ -275,6 +275,61 @@ static void test_page_js_is_well_formed(void) {
  *
  * 用户报「那次请求慢」时手里有的是响应里的 id，不是追踪里的序号 ——
  * 两者对得上，这个页面才有排查价值。 */
+/* begin / complete 两段式：请求到达即可见，结束时回填。
+ *
+ * 为什么要单测这条：单段式写入会让长请求在整个执行期间不可见 ——
+ * 用户看到的正是「只有等数据全返回才出现这一条」。所以断言三件事：
+ * begin 之后立刻能查到、in_flight 为真、各阶段是「未测量」而不是 0。 */
+static void test_in_flight_visible_immediately(void) {
+    myds_trace_reset();
+    myds_trace_init(8);
+
+    const uint64_t seq = myds_trace_begin("/v1/chat/completions", "1.2.3.4:5", "resp_x");
+    CHECK(seq > 0);
+    CHECK(myds_trace_count() == 1);          /* 还没结束就能查到 */
+
+    myds_trace_rec_t got;
+    CHECK(myds_trace_get_by_seq(seq, &got));
+    CHECK(got.in_flight == 1);
+    CHECK(strcmp(got.resp_id, "resp_x") == 0);
+    /* 阶段必须是 -1（未测量）。若是 0，页面会显示「瞬时完成」。 */
+    CHECK(got.phases.engine_s < 0.0);
+    CHECK(got.phases.prefill_s < 0.0);
+    CHECK(got.ttft_s < 0.0);
+
+    char json[2048];
+    CHECK(myds_trace_list_json(json, sizeof(json)));
+    CHECK(strstr(json, "\"in_flight\":true") != NULL);
+
+    /* 结束回填：同一 seq，in_flight 清零，阶段有值 */
+    myds_trace_rec_t done;
+    memset(&done, 0, sizeof(done));
+    snprintf(done.path, sizeof(done.path), "/v1/chat/completions");
+    snprintf(done.resp_id, sizeof(done.resp_id), "resp_x");
+    snprintf(done.finish, sizeof(done.finish), "stop");
+    done.phases.engine_s = 1.25;
+    done.phases.queue_s = 0.01;
+    done.ttft_s = 0.30;
+    done.prefill_tps = 100.0;
+    done.decode_tps = 40.0;
+    myds_trace_complete(seq, &done);
+
+    CHECK(myds_trace_count() == 1);          /* 没有变成两条 */
+    CHECK(myds_trace_get_by_seq(seq, &got));
+    CHECK(got.in_flight == 0);
+    CHECK(got.phases.engine_s > 1.0);
+    CHECK(strcmp(got.finish, "stop") == 0);
+
+    /* complete 到已被挤掉的 seq：静默丢弃，不新增记录 */
+    myds_trace_reset();
+    myds_trace_init(2);
+    (void)myds_trace_begin("/a", "c", "r1");
+    (void)myds_trace_begin("/b", "c", "r2");
+    (void)myds_trace_begin("/c", "c", "r3");   /* r1 被挤掉 */
+    myds_trace_complete(1, &done);
+    CHECK(myds_trace_count() == 2);
+}
+
 static void test_resp_id_recorded(void) {
     myds_trace_reset();
     myds_trace_init(8);
@@ -395,6 +450,7 @@ int main(void) {
     test_capacity_clamped();
     test_wall_includes_engine();
     test_page_js_is_well_formed();
+    test_in_flight_visible_immediately();
     test_resp_id_recorded();
     test_page_script_refs_exist();
     test_token_is_injected_into_page();
