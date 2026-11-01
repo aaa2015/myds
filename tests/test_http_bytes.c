@@ -107,7 +107,32 @@ static void dsml_isolation_cases(void) {
     assert(myds_dsml_classify("", 0, &clen) == MYDS_DSML_NONE);
     assert(clen == 0);
 
+    /* 7) 另一套方言：<function_calls> 在【结尾】⇒ 认定为工具块，正文只到开标签之前 */
+    snprintf(buf, sizeof(buf),
+             "answer\n\n<function_calls>\n<invoke name=\"f\">\n"
+             "<parameter name=\"a\">v</parameter>\n</invoke>\n</function_calls>\n");
+    clen = 0;
+    assert(myds_dsml_classify(buf, strlen(buf), &clen) == MYDS_DSML_COMPLETE);
+    assert(clen == strlen("answer"));
+
+    /* 8) 同一方言出现在【正文中间】⇒ 不认，整段保持正文。
+     *    这条是安全边界：讲解/代码示例里引用这种标记不能被吞掉。 */
+    snprintf(buf, sizeof(buf),
+             "The markup looks like <function_calls>\n<invoke name=\"f\">\n</invoke>\n"
+             "</function_calls>\nbut remember it is only an example.");
+    clen = 0;
+    assert(myds_dsml_classify(buf, strlen(buf), &clen) == MYDS_DSML_NONE);
+    assert(clen == strlen(buf));
+
+    /* 9) <function_calls> 被截断（有开无闭）⇒ TRUNCATED */
+    snprintf(buf, sizeof(buf),
+             "answer\n\n<function_calls>\n<invoke name=\"f\">\n<parameter name=\"a\"");
+    clen = 0;
+    assert(myds_dsml_classify(buf, strlen(buf), &clen) == MYDS_DSML_TRUNCATED);
+    assert(clen == strlen("answer"));
+
     puts("PASS DSML classification isolates truncated and malformed tool blocks from content");
+    puts("PASS <function_calls> dialect accepted only as a trailing block");
 }
 
 int main(int argc, char **argv) {

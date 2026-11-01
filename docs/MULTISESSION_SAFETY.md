@@ -383,3 +383,68 @@ myds_dsml_state_t myds_dsml_classify(const char *text, size_t len, size_t *conte
 - `tests/dsml_truncation_live.py`（需模型）**当前是 FAIL 的，而且这就是正确结果**：
   它如实报出 `<function_calls>` 泄漏，即上面那条方言问题。
 - 基线 7 个 prompt 的 sha 不变。
+
+---
+
+## 九、更正：工具调用一直是能用的（2026-11-01 晚）
+
+上一节我写「这台机器上的工具调用目前根本不工作」。**这个判断是错的**，必须更正。
+
+### 错在哪
+
+我只用了一个 `max_tokens=30` 的请求做判断 —— 那次确实被截断了，输出的是半截块。
+把它当成「工具调用坏了」是把一次截断读成了系统性故障。
+
+重新测：
+
+| 测试 | 结果 |
+|---|---|
+| 20 个真实任务（中英文、单/多工具、读文件/跑命令/查天气） | **0 泄漏，全部 `finish=tool_calls`** |
+| 「What's the weather in Beijing?」`max_tokens=512` | `tool_calls=1`，参数 `{"city":"Beijing"}` 正确 |
+| 重启后第一个请求就是工具调用 | 正常 |
+
+### 真实存在的是什么
+
+有一个**措辞特定的**分支会让模型改用另一套方言，且**100% 可复现**：
+
+```
+Prompt A: "Check the weather in Beijing, Tokyo and Paris. Use the tool."
+          -> |DSML| calls  -> tool_calls=3  ✓
+
+Prompt B: "Use the get_weather tool to check the weather in San Francisco,
+           Beijing and Tokyo. Call the tool for all three."
+          -> <function_calls> （不带全角竖线） -> 原文泄漏进 content  ✗
+```
+
+两套结构完全同构，只是标签名差一个 `｜DSML｜` 前缀。25 个真实 prompt 里命中 1 个。
+
+### 修法：认第二套方言，但只认「结尾块」
+
+`dsml_dialect_pick()` 选方言，规则：
+
+* 先找 `｜DSML｜calls`，有就用（特殊 token，正文里几乎不可能出现）；
+* 否则看 `<function_calls>`，**必须满足**：闭合标签存在，且其后只剩空白。
+
+第二条是安全边界：正文里讲解或引用这种标记时（后面还有正文），**不认**，原样保留。
+DSML 方言不要求结尾，保持原行为。
+
+另外 `<function_calls>` 方言的参数常常不写 `string="true|false"`（实测模型只写
+`name=`），于是加了形状推断：能当 JSON 标量/容器解析的原样放，否则当字符串加引号。
+
+### 验证
+
+| 检查 | 结果 |
+|---|---|
+| Prompt B（原来必泄漏） | `finish=tool_calls`，`tool_calls=3`，content 干净 |
+| A/B 措辞交替 4 轮 | 8/8 正确 |
+| 20 个真实任务 | 0 泄漏 |
+| 正文中间出现 `<function_calls>` | 不认，整段保留（C 断言 case 8） |
+| 截断的 `<function_calls>` | `TRUNCATED`，正文只到标签前（case 9） |
+| 基线 7 个 prompt sha | 逐一不变 |
+| `make test` | 全绿 |
+
+### 教训
+
+**一个 `max_tokens=30` 的失败样本，不足以支撑「功能不可用」这种结论。**
+要下这种判断，至少得跑一批真实任务、并且把「截断」和「解析不了」分开测。
+这次是先下了结论、后来才补的对照组 —— 顺序反了。

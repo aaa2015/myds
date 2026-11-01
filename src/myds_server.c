@@ -2494,6 +2494,60 @@ static const char *dsml_attr(const char *p, const char *end, const char *key,
 
 /* 成功：content_len 收工具块之前的正文字节数；calls_out 与 count_out 收解析出的调用（调用方负责释放）。
  * 没有工具块时 count=0 且返回 true；格式不合格式时返回 false（调用方按纯文本处理）。 */
+/* ── 两套工具调用方言（2026-11-01 真机实测）────────────────────────
+ *
+ * 模板要求 `<｜DSML｜calls>`，但实测部分措辞下模型稳定输出另一套同构写法
+ * `<function_calls>`（不带全角竖线）。两套都是同一结构，只是标签名不同。
+ *
+ * 安全规则（关键）：**只接受"结尾块"** —— 工具块必须是输出的最后一段
+ * （后面只允许空白）。这样正文里引用了这种标记的讲解/代码片段不会被误吞。
+ * DSML 那套沿用原有行为（它本来就是特殊 token，正文里几乎不可能出现）。
+ */
+typedef struct {
+    const char *open_tag, *close_tag, *invoke_open, *invoke_close;
+    const char *param_open, *param_close;
+    bool        trailing_only;
+} dsml_dialect_t;
+
+static const char *dsml_dialect_pick(const char *text, const char *end, dsml_dialect_t *out) {
+    static const char *const S = "\xef\xbd\x9c" "DSML" "\xef\xbd\x9c";
+    static dsml_dialect_t dsml, plain;
+    static bool init = false;
+    if (!init) {
+        init = true;
+        /* 用静态缓冲拼标签，避免每次请求都 malloc。 */
+        static char b[8][64];
+        const size_t sl = strlen(S);
+        snprintf(b[0], 64, "<%.*s calls>",   (int)sl, S);
+        snprintf(b[1], 64, "</%.*s calls>",  (int)sl, S);
+        snprintf(b[2], 64, "<%.*s invoke",   (int)sl, S);
+        snprintf(b[3], 64, "</%.*s invoke>", (int)sl, S);
+        snprintf(b[4], 64, "<%.*s parameter",(int)sl, S);
+        snprintf(b[5], 64, "</%.*s parameter>", (int)sl, S);
+        dsml = (dsml_dialect_t){ b[0], b[1], b[2], b[3], b[4], b[5], false };
+        static char c[6][64];
+        snprintf(c[0], 64, "<function_calls>");
+        snprintf(c[1], 64, "</function_calls>");
+        snprintf(c[2], 64, "<invoke");
+        snprintf(c[3], 64, "</invoke>");
+        snprintf(c[4], 64, "<parameter");
+        snprintf(c[5], 64, "</parameter>");
+        plain = (dsml_dialect_t){ c[0], c[1], c[2], c[3], c[4], c[5], true };
+    }
+    /* 返回的是【开标签之后】的位置（与 dsml_find 的契约一致），不是标签本身。 */
+    const char *dbody = dsml_find(text, end, dsml.open_tag);
+    if (dbody) { if (out) *out = dsml; return dbody; }
+    const char *hit = dsml_find(text, end, plain.open_tag);
+    if (!hit) return NULL;
+    /* trailing_only：开标签之后必须能一路走到闭合标签，且闭合之后只剩空白。 */
+    const char *close = dsml_find(hit, end, plain.close_tag);
+    if (!close) return NULL;                     /* 截断 ⇒ 不算（交给 TRUNCATED 逻辑） */
+    for (const char *q = close; q < end; ++q)
+        if (*q != ' ' && *q != '\n' && *q != '\r' && *q != '\t') return NULL;
+    if (out) *out = plain;
+    return hit;   /* 开标签之后的位置 */
+}
+
 /* 分类：这一段文本里的 DSML 工具块到底处于什么状态。
  *
  * 之所以要单独出一个分类器，而不是让调用方从「parse 返回 false」去猜：
@@ -2507,11 +2561,24 @@ static const char *dsml_attr(const char *p, const char *end, const char *key,
 myds_dsml_state_t myds_dsml_classify(const char *text, size_t len, size_t *content_len) {
     if (content_len) *content_len = len;
     if (!text || !len) return MYDS_DSML_NONE;
-    static const char *open_tag = "<" MYDS_DSML_S " calls>";
-    static const char *close_tag = "</" MYDS_DSML_S " calls>";
     const char *end = text + len;
-    const char *body = dsml_find(text, end, open_tag);
-    if (!body) return MYDS_DSML_NONE;
+    dsml_dialect_t d;
+    const char *body = dsml_dialect_pick(text, end, &d);
+    const char *open_tag = d.open_tag;
+    const char *close_tag = d.close_tag;
+    if (!body) {
+        /* 有开标签但方言判定不成立（如 plain 方言被截断）⇒ 也要报 TRUNCATED，
+         * 否则截断的 <function_calls> 会整段当正文发出去。 */
+        static const char *plain_open = "<function_calls>";
+        const char *raw = dsml_find(text, end, plain_open);
+        if (raw && !dsml_find(raw, end, "</function_calls>")) {
+            const char *ce = raw - strlen(plain_open);
+            while (ce > text && (ce[-1] == '\n' || ce[-1] == '\r' || ce[-1] == ' ' || ce[-1] == '\t')) --ce;
+            if (content_len) *content_len = (size_t)(ce - text);
+            return MYDS_DSML_TRUNCATED;
+        }
+        return MYDS_DSML_NONE;
+    }
 
     /* 正文只到开标签之前（顺带削掉尾部空白，工具块通常跟在两个换行后面）。 */
     const char *ce = body - strlen(open_tag);
@@ -2549,14 +2616,16 @@ static bool dsml_looks_like_foreign_dialect(const char *text, size_t len) {
 
 bool myds_parse_completion_tool_calls(const char *text, size_t len, size_t *content_len,
                                       myds_tool_call_t **calls_out, size_t *count_out) {
-    static const char *open_tag = "<" MYDS_DSML_S " calls>";
-    static const char *close_tag = "</" MYDS_DSML_S " calls>";
-    static const char *invoke_open = "<" MYDS_DSML_S " invoke";
-    static const char *invoke_close = "</" MYDS_DSML_S " invoke>";
-    static const char *param_open = "<" MYDS_DSML_S " parameter";
-    static const char *param_close = "</" MYDS_DSML_S " parameter>";
     *calls_out = NULL; *count_out = 0; *content_len = len;
     const char *end = text + len;
+    dsml_dialect_t d;
+    if (!dsml_dialect_pick(text, end, &d)) return true;   /* 没有工具块 */
+    const char *open_tag = d.open_tag;
+    const char *close_tag = d.close_tag;
+    const char *invoke_open = d.invoke_open;
+    const char *invoke_close = d.invoke_close;
+    const char *param_open = d.param_open;
+    const char *param_close = d.param_close;
     const char *body = dsml_find(text, end, open_tag);
     if (!body) return true;
     const char *content_end = body - strlen(open_tag);
@@ -2591,7 +2660,15 @@ bool myds_parse_completion_tool_calls(const char *text, size_t len, size_t *cont
             const char *pk = NULL; size_t pk_len = 0;
             const char *sv = NULL; size_t sv_len = 0;
             if (!(p = dsml_attr(p, end, "name=", &pk, &pk_len))) { ok = false; break; }
-            if (!(p = dsml_attr(p, end, "string=", &sv, &sv_len))) { ok = false; break; }
+            /* string= 在 <function_calls> 方言里常常不写（实测模型只写 name=）。
+             * DSML 方言里它是必需的，缺失就说明结构不对。 */
+            {
+                const char *after_name = p;
+                if (!(p = dsml_attr(p, end, "string=", &sv, &sv_len))) {
+                    if (!d.trailing_only) { ok = false; break; }
+                    p = after_name;
+                }
+            }
             p = dsml_skip_ws(p, end);
             if (p >= end || *p != '>') { ok = false; break; }
             ++p;
@@ -2599,7 +2676,34 @@ bool myds_parse_completion_tool_calls(const char *text, size_t len, size_t *cont
             if (!vend) { ok = false; break; }
             size_t val_len = (size_t)(vend - strlen(param_close) - p);
             while (val_len && (p[val_len - 1] == '\n' || p[val_len - 1] == '\r')) --val_len;
-            bool is_str = (sv_len == 4 && !memcmp(sv, "true", 4));
+            /* 有 string= 就照它；没有（<function_calls> 方言常见）就按值的形状推断：
+             * 能当成 JSON 标量/容器的原样放，否则当字符串加引号。 */
+            bool is_str;
+            if (sv_len) {
+                is_str = (sv_len == 4 && !memcmp(sv, "true", 4));
+            } else {
+                const char *v = p;
+                size_t n = val_len;
+                while (n && (*v == ' ' || *v == '\n' || *v == '\r' || *v == '\t')) { ++v; --n; }
+                while (n && (v[n-1] == ' ' || v[n-1] == '\n' || v[n-1] == '\r' || v[n-1] == '\t')) --n;
+                bool scalarish = false;
+                if (n && (*v == '{' || *v == '[')) scalarish = true;
+                else if (n == 4 && (!memcmp(v,"true",4) || !memcmp(v,"null",4))) scalarish = true;
+                else if (n == 5 && !memcmp(v,"false",5)) scalarish = true;
+                else if (n) {
+                    /* 纯数字（含负号/小数点/指数）才算 */
+                    size_t k = 0;
+                    if (v[0] == '-' || v[0] == '+') k = 1;
+                    size_t digits = 0;
+                    for (; k < n; ++k) {
+                        if (v[k] >= '0' && v[k] <= '9') { digits++; continue; }
+                        if (v[k] == '.' || v[k] == 'e' || v[k] == 'E' || v[k] == '+' || v[k] == '-') continue;
+                        break;
+                    }
+                    scalarish = (k == n && digits > 0);
+                }
+                is_str = !scalarish;
+            }
             if (n_params++ && !dsml_put(&args, ", ", 2)) { ok = false; break; }
             if (!dsml_put(&args, "\"", 1) || !dsml_put(&args, pk, pk_len) || !dsml_put(&args, "\": ", 3)) {
                 ok = false; break;
