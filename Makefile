@@ -219,6 +219,13 @@ audit-ledger:
 doc-check:
 	python3 -B tools/doc_link_audit.py --strict
 
+# The ledger's adoption register (§0.3) must say, for every adopted change,
+# whether it is still in production. A row claiming to be live while naming a
+# MYDS_* knob that this build does not read is a failure -- that is exactly how
+# §81 disappeared for a week without anyone noticing.
+adoption-check:
+	python3 -B tools/adoption_register_check.py --strict
+
 # Regenerate the ledger's §105/§106 tables and expected.json from raw/*.jsonl.
 # Run this after touching anything under benchmarks/register_only_2026-10-27/raw/.
 gen-ledger:
@@ -846,6 +853,7 @@ test: check-knobs $(ALL_TESTS) $(METALLIB)
 	@python3 tests/test_http_bytes.py
 	@python3 tests/test_startup_gates.py
 	@$(MAKE) --no-print-directory doc-check
+	@$(MAKE) --no-print-directory adoption-check
 	@python3 tests/test_stream_bench.py
 	@python3 tests/test_indexer_k_resident_builder.py
 	@python3 -B tests/test_indexer_register_only_host.py
