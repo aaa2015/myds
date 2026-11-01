@@ -255,6 +255,7 @@ static const myds_knob_t myds_knobs_generated[] = {
     {"MYDS_TRACE_LAYER", "src/myds_engine.c", 2341, 1},
     {"MYDS_TRACE_POS", "src/myds_engine.c", 2342, 1},
     {"MYDS_TRACE_PREFIX", "src/myds_engine.c", 2327, 1},
+    {"MYDS_TRACE_RECORDS", "src/myds_server.c", 1745, 1},
     {"MYDS_TREE_SPEC", "src/myds_v41.c", 6509, 1},
     {"MYDS_V41_GEMV_NR0", "src/myds_metal.m", 4757, 1},
     {"MYDS_VIEW_CNT", "src/myds_metal.m", 2826, 1},
@@ -262,8 +263,8 @@ static const myds_knob_t myds_knobs_generated[] = {
     {"MYDS_YOCO_KEEP_TOKENS", "src/myds_v41.c", 7381, 1},
 };
 
-#define MYDS_KNOB_COUNT 249u
-#define MYDS_KNOB_DIRECT_COUNT 225u
+#define MYDS_KNOB_COUNT 250u
+#define MYDS_KNOB_DIRECT_COUNT 226u
 #define MYDS_KNOB_WRAPPED_COUNT 24u
 #define MYDS_KNOB_HELPERS "capture_parse_flag,cfg_f32_env,cfg_u32_env,decode_candidate_parse,decode_env_enabled,env_default_on,env_is_one_literal,env_not_zero_literal,qkv_fusion_enabled,v41_env_u32"
 

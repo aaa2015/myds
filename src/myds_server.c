@@ -1735,6 +1735,24 @@ int myds_server_start(myds_context_t *ctx, const char *host, int port, const cha
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
+    /* 请求追踪缓冲。默认 128 条（约 50 KB）；MYDS_TRACE_RECORDS 可调，上限 512。
+     *
+     * 在 start 时显式初始化，而不是等第一条 record 惰性分配：
+     * 否则 /trace 在还没有请求时报告 capacity=0，页面显示成「容量未知」——
+     * 那不是「没有数据」，是「还没准备」，两者该分开。 */
+    {
+        uint32_t cap = 128u;
+        const char *env = getenv("MYDS_TRACE_RECORDS");
+        if (env && *env) {
+            const long v = atol(env);
+            if (v > 0 && v <= 512) cap = (uint32_t)v;
+            else MYDS_LOG_W("MYDS_TRACE_RECORDS=%s 超出 (0,512]，用默认 128", env);
+        }
+        myds_trace_init(cap);
+        MYDS_LOG_I("request trace: %u records in the ring buffer (page: GET /trace)",
+                   cap);
+    }
+
     /* LoopGuard 默认【关闭】，需要显式 MYDS_LOOP_GUARD=1 才启用。
      *
      * 2026-11-01 验收改判：原实现默认开启，但假阳性率从未测量过。
