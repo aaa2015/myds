@@ -9871,6 +9871,28 @@ off = args.offs[0] + (uint64_t)gid * 16u;      /* 只有一次乘加 */
 > 本轮不进入全模型 A1/B/A2，不增加生产调用路径，不修改生产默认值。**
 > §72.6 的整数穷举可行性现在已有真实 GPU 证据；它没有转化为性能收益。
 
+### 73.0 证据可复核性声明（2026-11-01）
+
+> ⚠️ **本节引用的全部证据档案都不存在**：`benchmarks/2026-10-23-iq2-signed4/`
+> 在本仓库、在 `mydsdoc` 仓、在 git 全历史（1520 个提交）、在本机任何位置都找不到。
+> 引用它的 9 处（`executed-source.tar.gz`、`executed-artifacts.tar.gz`、
+> `raw-window-1.tar.gz`、`raw-files.json`、`experiment-result.json`、`independent-review.json`）
+> 全部无法打开。
+>
+> 另外，本节写的执行代码来源 **`086da8b` 这个提交在本仓库不存在**
+> （`git cat-file -t 086da8b` → Not a valid object name）。
+>
+> **因此可以复核的**：方法与代码 —— `tools/bench_iq2_signed4.m`、
+> `tools/review_iq2_signed4_artifacts.py`、`tools/gen_iq2_signed4_tables.py`、
+> `tests/test_bench_iq2_signed4_host.py` 都还在库里，重跑这条路是可行的。
+>
+> **不能复核的**：本节所有具体数字（**GPU 耗时增加约 21%**、5,248 B / 2,176 B 的
+> 内存占用、各组件的 0-ULP 判定、metallib SHA256）。这些数字是当时窗口里测出来的，
+> 原始数据已丢失，**任何人现在都无法重新算出它们**。
+>
+> 下面的「不采纳」裁定本身不受影响 —— 它是基于「组件变慢」下的决策，
+> 而这个方向即使数字略有出入也不会翻案。但**引用具体百分比时必须带上这条声明**。
+
 ### 73.1 实现与证据身份
 
 - 新增 `kernel_myds_iq2_v41_signed4_f32`，原始 IQ2 权重、每个 lane 的标量累加顺序、
@@ -10006,6 +10028,25 @@ python3 tools/review_iq2_signed4_artifacts.py \
 > 三层均未达到保守耗时收益严格 >2% 的要求。因此按用户指定顺序，
 > **本轮不接入全模型 A1/B/A2，不增加生产运行时调用者，不采纳。**
 > 这不是全模型退化结论，也没有证明任意双输出方案都无收益。
+
+### 74.0 证据可复核性声明（2026-11-01）
+
+> ⚠️ **本节引用的证据档案 `benchmarks/2026-10-23-qkv-dual/` 整目录不存在**
+> （本仓库无、`mydsdoc` 无、git 全历史无、本机全盘无）。涉及 14 处引用：
+> `executed-source.tar.gz`、`executed-artifacts.tar.gz`、`raw-window-1.tar.gz`、
+> `all-qkv-descriptors.json`、`raw-files.json`、`experiment-result.json`、
+> 三份 `independent*-review.json`、`archive-validation.json`、`reviewer-cpu-self-test.json`。
+>
+> 本节写的执行源码基线同为 **`086da8b`，该提交在本仓库不存在**。
+>
+> **可以复核的**：`tools/bench_qkv_dual.m`、`tools/review_qkv_dual_artifacts.py`、
+> `tools/run_qkv_dual_window.py`、`tests/test_bench_qkv_dual_host.py` 均仍在库中。
+>
+> **不能复核的**：**178 个 stage/protocol 输入 SHA** 的一致性核对、
+> 「两张参数块各 112 B」等实测值、以及所有 0-ULP 判定 —— 原始窗口数据已丢失。
+>
+> **不采纳的裁定不受影响**（生产并发模式下没测到有效收益），
+> 但引用上述数字时必须带上这条声明。
 
 ### 74.1 实现：独立权重、独立输出、一次派发
 
@@ -10169,6 +10210,29 @@ remote canonical HEAD 仍为 `5437df0`，原 6 个 tracked 修改及 `tools/rss_
 > 按冻结协议，**不进入全模型 A1/B/A2，不接入生产 dispatch，不采纳**。
 > 首版 R1 的正确性失败、诊断 observer 扰动及 R2 的负性能结果均独立保留。
 > 这组实验只排除所测 H2/H4 实现，不能推导所有多头布局都无收益或全模型退化比例。
+
+### 75.0 证据可复核性声明（2026-11-01）
+
+> ⚠️ **本节引用的证据目录 `benchmarks/2026-10-23-attention-multihead/` 整目录不存在**
+> （本仓库无、`mydsdoc` 无、git 全历史无、本机全盘无）。涉及 27 处引用，包括
+> `raw.tar.gz`、`window1-executed-*.tar.gz`、`window2-executed-*.tar.gz`、
+> `diagnostic1-*.tar.gz`、全部 `*-review.json`、`archive-validation.json`、
+> `experiment-result.json`、`raw-files.json`。
+>
+> **可以复核的**：工具链完整保留 —— `tools/bench_attention_multihead.m`、
+> `tools/bench_attention_multihead_diagnostic.m`、`tools/review_attention_multihead_*.py`
+> （三个复核器）、`tools/run_attention_multihead_window.py`、
+> `tools/capture_attention_multihead.c`、`tools/build_attention_multihead_policies.py`、
+> `tools/archive_attention_multihead_evidence.py`，以及四个对应 host 测试。
+> **这条路重跑是可行的，只是重跑的结果不会等于当时的结果。**
+>
+> **不能复核的**：本节所有具体数字与判定 —— 包括 75.3 的 R1 三层 0-ULP 失败结论、
+> 75.4 的算术诊断、以及窗口 2 的任何读数。原始窗口数据已丢失。
+>
+> ⚠️ **这条比其他两节更要紧**：§75 的结论是「**失败**」。
+> 一个失败结论的证据丢失，比一个否定结论的证据丢失更容易被误用 ——
+> 后来者可能把它当成「已证否」，而实际只是「当时测到失败、但测法已无法核对」。
+> 引用时请写成「当时测得失败（证据不可复核）」，不要写成「已证否」。
 
 ### 75.1 范围与实现
 
@@ -10420,6 +10484,17 @@ remote canonical HEAD 仍为 `5437df0`，原 dirty 文件的路径/状态一致�
 ---
 
 ## §76 三轮负结果之后的生产路径复核：**新增单头间接 KV 布局通过 0-ULP，但用时约 2.1 倍，停止推进**（2026-10-23）
+
+### 76.0 证据可复核性声明（2026-11-01）
+
+> ⚠️ **本节引用的证据目录不存在**：`benchmarks/2026-10-23-next-directions/`
+> —— 本仓库无、`mydsdoc` 仓无、git 全历史无、本机全盘无。本节共 40 处引用，
+> 其中包括的 `executed-source.tar.gz` / `executed-artifacts.tar.gz` / `raw*.tar.gz` /
+> `raw-files.json` / `experiment-result.json` / 各 `*-review.json` 全部无法打开。
+>
+> **可以复核的**：`tools/` 下该轮的 bench/review/window 脚本仍在库中，重跑路径可行（结果不会等于当时）。
+>
+> **不能复核的**：单头间接 KV 布局「用时约 2.1 倍」这一读数与全部 0-ULP 判定。
 
 ### 76.1 三轮结果能排除什么，不能排除什么
 
@@ -10816,6 +10891,17 @@ alias/free 顺序，以及 allocation failure 的原状态保全；现有 free-o
 
 **本节推进 §78 的静态假设。真实权重、生产 concurrent 组件与16次真实上下文恢复通过；正式全模型 A1/B/A2 未通过采纳门，原型不采纳、生产开关保持关闭。**
 
+### 79.0 证据可复核性声明（2026-11-01）
+
+> ⚠️ **本节引用的证据目录不存在**：`benchmarks/2026-10-24-moe-workspace/`
+> —— 本仓库无、`mydsdoc` 仓无、git 全历史无、本机全盘无。本节共 24 处引用，
+> 其中包括的 `executed-source.tar.gz` / `executed-artifacts.tar.gz` / `raw*.tar.gz` /
+> `raw-files.json` / `experiment-result.json` / 各 `*-review.json` 全部无法打开。
+>
+> **可以复核的**：`MYDS_PREFILL_MOE_WORKSPACE` 的实现与开关仍在 `src/`，可重跑组件门。
+>
+> **不能复核的**：16 次真实上下文恢复的通过记录、A1/B/A2 的采纳门读数。
+
 ### 79.1 冻结身份、实现与判定方法
 
 仍以 byte-exact 复建生产制品的 `868d94e9e3168aeadac478e75d096d992b6bc92e` 为源基线，
@@ -11062,6 +11148,17 @@ OOM证据仍是实际Metal allocator的确定性NULL注入，不等于经过系�
 C/geometry/mode变化仍可能完整重建，不声称本轮消除了所有扩容重叠。
 开关仍为默认关闭的`MYDS_PREFILL_MOE_WORKSPACE`，新实现以独立源码身份及normal layout `implementation_version=3`区分。
 
+### 80.0 证据可复核性声明（2026-11-01）
+
+> ⚠️ **本节引用的证据目录不存在**：`benchmarks/2026-10-24-moe-localgrow/`
+> —— 本仓库无、`mydsdoc` 仓无、git 全历史无、本机全盘无。本节共 17 处引用，
+> 其中包括的 `executed-source.tar.gz` / `executed-artifacts.tar.gz` / `raw*.tar.gz` /
+> `raw-files.json` / `experiment-result.json` / 各 `*-review.json` 全部无法打开。
+>
+> **可以复核的**：实验代码路径仍在库中。
+>
+> **不能复核的**：局部扩容的全部实测耗时与拒绝依据。
+
 ### 80.1 GPU前冻结方案与源码、OOM合同
 
 `benchmarks/2026-10-24-moe-localgrow/experiment-plan.json`
@@ -11286,6 +11383,48 @@ SHA `a83127b1427b09b703883150f3ec6e8e90e7ecdead3f48b798c7755368bd9d9c`。
 `8162b13e33b6bacd119148a38902eaee5f3fea3800089f91c2357bdcacc06ae6`，
 以便重核旧result绑定的台账版本；不改旧实验raw、报告、门限或失败结论。
 
+
+### 81.0 证据可复核性声明（2026-11-01）
+
+> ⚠️ **本节引用的证据目录不存在**：`benchmarks/2026-10-24-moe-phys-cause/`
+> —— 本仓库无、`mydsdoc` 仓无、git 全历史无、本机全盘无。本节共 26 处引用，
+> 其中包括的 `executed-source.tar.gz` / `executed-artifacts.tar.gz` / `raw*.tar.gz` /
+> `raw-files.json` / `experiment-result.json` / 各 `*-review.json` 全部无法打开。
+>
+> **可以复核的**：只剩正文里写的 `experiment-plan.json` 的 SHA 字符串本身
+> （`a83127b1…`），以及 `tools/` 下当时的 bench / review 脚本。
+>
+> **不能复核的**：resource ID / deferred ADD-drain 链的实际记录、0/1/0 干预读数、
+> 物理峰值回退的实测曲线，以及那个 SHA 指向的文件（它不存在，无法核对）。
+>
+> 🔴 **本节还有一个比证据丢失更严重的问题：标题声称「精确制品已采纳」，
+> 但对应的实现不在本仓库。**
+>
+> 2026-11-01 实测：
+> - `grep -rn MYDS_PREFILL_PROMPT_VIEW_CLEAR src/ include/` → **0 命中**
+> - `grep -rn MYDS_PREFILL_MOE_WORKSPACE src/ include/` → **0 命中**
+> - `include/myds_knobs_generated.h`（本仓库所有生效开关的权威清单）→ **两者都不在**
+> - `git log --all -S"myds_metal_prefill_prompt_view_clear_enabled" -- src/ include/` → **无任何提交**
+> - 生产 `myds.conf` → **未设置**
+>
+> 只有 `tools/bench_moe_workspace_fullmodel_promptclear.c` 这类**测量工具**还在引用它，
+> 而那些工具调用的 `myds_metal_prefill_prompt_view_clear_enabled()` 在 `src/` 里
+> 根本不存在 —— 也就是说 **那批工具现在链接不过**。
+>
+> **原因就在本节 81.1 的第一句**：「v4 core 保持独立 exact868 源树，
+> **主工作树尚未应用**」。也就是说：采纳的是那个独立源树里的制品，
+> 而主工作树（= 本仓库）从未合入。标题里的「精确制品已采纳」在账本内部
+> 并不矛盾，但它**对一个只看本节标题的读者是误导的**。
+>
+> **所以准确的说法是**：这段改动在独立 exact868 源树里被采纳，
+> 本仓库与生产 `myds.conf` 都没有它。凡是「本仓库现在的代码经过了这次优化」
+> 这类推断都是错的。
+>
+> ⚠️ 连带影响：`tools/bench_moe_workspace_fullmodel_promptclear.c` 与
+> `tools/moe_prompt_snapshot_promptclear.inc` 调用的
+> `myds_metal_prefill_prompt_view_clear_enabled()` 不在 `src/` 里，
+> **这批工具在本仓库里链接不过**。它们是为那棵独立源树准备的，
+> 留在 main 上属于跨树残留。是否清理，另行决定（不清也不会误导，只要知道原因）。
 
 ### 81.1 v4组件门与诊断入口失败记录
 
@@ -11573,6 +11712,17 @@ SHA `05dd5c7577442d59698dcc6815e96c26ad56832b03d6d61c214cbafebae80549`，
 汇总机制、全部阶段、正式内存/时间、源码边界和最终采纳现场身份。
 
 ## §82 exact868+v4 prefill Step7 局部资源屏障原型：0-ULP通过，组件门未通过，不采纳（2026-10-24）
+
+### 82.0 证据可复核性声明（2026-11-01）
+
+> ⚠️ **本节引用的证据目录不存在**：`benchmarks/2026-10-24-prefill-latency-v4/`
+> —— 本仓库无、`mydsdoc` 仓无、git 全历史无、本机全盘无。本节共 10 处引用，
+> 其中包括的 `executed-source.tar.gz` / `executed-artifacts.tar.gz` / `raw*.tar.gz` /
+> `raw-files.json` / `experiment-result.json` / 各 `*-review.json` 全部无法打开。
+>
+> **可以复核的**：原型代码路径仍在库中。
+>
+> **不能复核的**：Step7 局部资源屏障的 0-ULP 判定与组件门读数。
 
 ### 82.1 基线与新假设
 

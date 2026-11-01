@@ -46,10 +46,25 @@ GENERATED = {"bin", "build", "scratch"}
 # and that the two Python suites SKIP when it is missing. Reporting these as
 # fresh breakage would be noise; reporting them as nothing would hide the fact
 # that the archives do not exist anywhere on this machine.
-KNOWN_ABSENT_PREFIX = "docs/benchmarks/"
+KNOWN_ABSENT_PREFIXES = (
+    "docs/benchmarks/",
+    # Eight benchmark directories that are referenced by the ledger but exist
+    # nowhere: not here, not in the mydsdoc repository, not in git history
+    # (1520 commits), not anywhere on this host. Each has a 0.x "evidence
+    # auditability" notice in the section that cites it.
+    "benchmarks/2026-10-23-iq2-signed4/",
+    "benchmarks/2026-10-23-qkv-dual/",
+    "benchmarks/2026-10-23-attention-multihead/",
+    "benchmarks/2026-10-23-next-directions/",
+    "benchmarks/2026-10-24-moe-workspace/",
+    "benchmarks/2026-10-24-moe-localgrow/",
+    "benchmarks/2026-10-24-moe-phys-cause/",
+    "benchmarks/2026-10-24-prefill-latency-v4/",
+)
 KNOWN_ABSENT_NOTE = (
-    "evidence tree recorded as never committed (ledger line 13430); "
-    "the files are absent on this host too")
+    "evidence referenced by the ledger but present nowhere: not this repo, not "
+    "mydsdoc, not git history, not this host. Each citing section carries a "
+    "0.x evidence-auditability notice")
 
 # Arguments whose value is produced by the command itself.
 OUTPUT_FLAGS = ("--out", "--output", "--log", "-o", ">>", ">")
@@ -151,6 +166,18 @@ def classify_sibling(tok: str) -> tuple[str, Path] | None:
 CD_RE = re.compile(r"\bcd\s+(\S+)")
 
 
+# A benchmark evidence directory, wherever it appears (prose or code).
+# Trailing `-` and `-*` are stripped: `benchmarks/2026-10-23-*` is a glob in prose,
+# not a claim about one directory.
+BENCH_DIR_RE = re.compile(r"benchmarks/[0-9]{4}-[0-9]{2}-[0-9]{2}[a-z0-9-]*")
+
+# Evidence moved out of this repository into the documentation repo
+# (commit 754edd5 "keep only the pipeline ledger in this repo, move everything
+# else to the documentation repository"). Still exists, just elsewhere -- so we
+# verify it there instead of calling it broken.
+DOCS_REPO = Path.home() / "Projects" / "mydsdoc"
+
+
 def iter_code_blocks(path: Path):
     """Yield (line_no, line, cwd) where cwd is the block's current directory.
 
@@ -209,10 +236,34 @@ def main() -> int:
     missing: list[tuple[str, int, str, str]] = []
     sibling_missing: list[tuple[str, int, str, str]] = []
     known: set[str] = set()
-    n_paths = n_make = n_unverifiable = 0
+    n_paths = n_make = n_unverifiable = n_bench = 0
+    bench_missing: set[str] = set()
+    moved: set[str] = set()
 
     for md in md_files:
         rel_md = str(md.relative_to(ROOT))
+        # Every benchmark directory named anywhere in the file (prose included)
+        # must exist. The 93 references to the eight lost 2026-10-23/24 trees are
+        # mostly prose, so the code-block pass alone never sees them.
+        text = md.read_text(errors="replace")
+        for m in BENCH_DIR_RE.finditer(text):
+            tok = m.group(0).rstrip("-/")
+            while tok.endswith("-*"):
+                tok = tok[:-2].rstrip("-")
+            if "/" in tok.split("/", 1)[1] and not tok.split("/", 1)[1].count("/"):
+                pass
+            cand = ROOT / tok
+            if cand.is_dir():
+                continue
+            n_bench += 1
+            if any((tok + "/").startswith(pref) or tok == pref.rstrip("/")
+                   for pref in KNOWN_ABSENT_PREFIXES):
+                known.add(f"{rel_md}  {tok}")
+                continue
+            if (DOCS_REPO / tok).is_dir():
+                moved.add(f"{rel_md}  {tok}")
+                continue
+            bench_missing.add(f"{rel_md}  {tok}")
         for lineno, line, cwd in iter_code_blocks(md):
             for m in MAKE_RE.finditer(line):
                 target = m.group(2)
@@ -260,7 +311,11 @@ def main() -> int:
                 # dirs live in ~/Projects/myfleet). Those are real claims too;
                 # just not repo-relative.
                 in_repo = ROOT == cand or ROOT in cand.parents
-                if in_repo and str(cand.relative_to(ROOT)).startswith(KNOWN_ABSENT_PREFIX):
+                # Normalise with a trailing slash: a bare directory name must
+                # match a prefix that ends in "/", otherwise the known-absent
+                # list silently fails for exactly the entries it lists.
+                rel_cand = (str(cand.relative_to(ROOT)) if in_repo else "") + "/"
+                if in_repo and rel_cand.startswith(KNOWN_ABSENT_PREFIXES):
                     known.add(f"{rel_md}:{lineno}  {m.group(0)}")
                     continue
                 missing.append((rel_md, lineno, kind, m.group(0)))
@@ -268,6 +323,9 @@ def main() -> int:
     print(f"doc files     : {len(md_files)}")
     print(f"path claims   : {n_paths}")
     print(f"make refs     : {n_make}  ({len(targets)} rules in Makefile)")
+    if n_bench:
+        print(f"benchmark dirs: {n_bench} named -- {len(known)} known-absent, "
+              f"{len(moved)} moved to mydsdoc")
     if n_unverifiable:
         print(f"unverifiable  : {n_unverifiable}  (./x with no resolvable cd -- not guessed)")
     print()
@@ -278,8 +336,9 @@ def main() -> int:
             print(f"  {k}")
         print()
 
-    if not missing:
-        print("PASS -- every path and make target referenced from the docs resolves")
+    if not missing and not bench_missing:
+        print("PASS -- every path, benchmark directory and make target "
+              "referenced from the docs resolves")
         if known:
             print(f"       ({len(known)} reference(s) point at the known-absent evidence tree)")
         return 0
@@ -299,6 +358,19 @@ def main() -> int:
             print(f"  {ln:>7}  {kind:<12} {tok}")
         print()
 
+    if moved and args.verbose:
+        print("benchmark directories that now live in the documentation repo:")
+        for mv in sorted(moved):
+            print(f"  {mv}")
+        print()
+
+    if bench_missing:
+        print("benchmark directories named but missing here, in mydsdoc, "
+              "and not in the known-absent list:")
+        for b in sorted(bench_missing):
+            print(f"  {b}")
+        print()
+
     if sibling_missing:
         print("sibling-repo references (outside this checkout):")
         seen2: set = set()
@@ -310,9 +382,10 @@ def main() -> int:
             print(f"  {f}:{ln}  {tok}")
         print()
 
-    total = len(missing) + len(sibling_missing)
+    total = len(missing) + len(sibling_missing) + len(bench_missing)
     print(f"{total} broken reference(s) "
-          f"({len(missing)} in-repo, {len(sibling_missing)} sibling-repo)")
+          f"({len(missing)} in-repo, {len(sibling_missing)} sibling-repo, "
+          f"{len(bench_missing)} benchmark-dir)")
     return 1 if (args.strict and total) else 0
 
 
