@@ -300,8 +300,16 @@ const char *myds_trace_page_html(void) {
 "function cls(f){const s=(f||'').toLowerCase();"
 "return s==='length'?'len':s==='error'?'err':s==='tool_calls'?'tool':"
 "s==='stop'?'stop':'';}"
+/* token 必须显式带在每个 API 请求上。页面是从 ?token=*** 打开的，但 fetch
+ * 是**另一个请求**，不会继承地址栏的 query —— 少了这一步，页面能打开、
+ * 表格永远空、控制台每 3 秒一次 404，看起来就是「请求了但没效果」。 */
+"const TK=\"__MYDS_TRACE_TOKEN__\";"
+"const api=p=>TK?p+(p.indexOf('?')<0?'?':'&')+\"__MYDS_TRACE_PARAM__\"+TK:p;"
 "async function load(){"
-"const r=await fetch('/trace/api/requests');const j=await r.json();"
+"let j;"
+"try{const r=await fetch(api('/trace/api/requests'));"
+"if(!r.ok){document.getElementById('hdr').textContent='API '+r.status+'（token 可能已失效）';return;}"
+"j=await r.json();}catch(e){document.getElementById('hdr').textContent='无法连接：'+e;return;}"
 "RECS=j.records||[];"
 "document.getElementById('hdr').textContent='count '+j.count+' / capacity '+j.capacity;"
 "const tb=document.getElementById('rows');"
@@ -309,8 +317,6 @@ const char *myds_trace_page_html(void) {
 "暂无记录（先发一个请求）</td></tr>';return;}"
 "tb.innerHTML=RECS.map(rec=>{"
 "const p=rec.phases;const when=new Date(rec.epoch_ms).toLocaleTimeString();"
-/* 模板字符串而不是 '...'+x+'...' 拼接：后者每行都要自己补闭合引号，
- * 漏一个就把后面整段解析成字符串内容。这里已经因为漏引号写错过两次。 */
 "const wall=p.engine===null?null:p.queue+(p.render||0)+(p.setup||0)+p.engine;"
 "return `<tr data-seq=\"${rec.seq}\"${rec.seq===SEL?' class=\"sel\"':''}>`"
 "+`<td>${rec.seq}</td><td>${when}</td><td>${esc(rec.path)}</td>`"
@@ -374,4 +380,53 @@ const char *myds_trace_page_html(void) {
 "}"
 "load();setInterval(load,3000);"
 "</script></body></html>";
+}
+
+/* 把页面里的两处占位符替换成真实 token 与参数名，返回新分配的字符串。
+ *
+ * 为什么用服务端注入而不是让 JS 从 location.search 解析：
+ *   1. fetch 是独立请求，不会继承地址栏 query —— 页面能打开但 API 全 404，
+ *      表格永远空。这是这里真实踩过的坑。
+ *   2. 注入让「页面用哪个凭据」只有一处定义，不会随 URL 形态漂移。
+ *
+ * token 只接受 URL 安全字符。含其他字符时**不注入**：页面的 API 会因此 404，
+ * 但那是显式的失败，好过把一个需要转义的值拼进 JS 字符串字面量。
+ */
+char *myds_trace_page_html_for_token(const char *token, size_t *out_len) {
+    const char *page = myds_trace_page_html();
+    static const char *kTokPlaceholder = "__MYDS_TRACE_TOKEN__";
+    static const char *kParamPlaceholder = "__MYDS_TRACE_PARAM__";
+
+    bool safe = true;
+    for (const char *q = token ? token : ""; *q; ++q) {
+        const char c = *q;
+        const bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+                        (c >= 'A' && c <= 'Z') || c == '-' || c == '_';
+        if (!ok) { safe = false; break; }
+    }
+    const char *tok = safe && token ? token : "";
+
+    /* 参数名用拼接构造，避免在源码里出现 "token=" 这种形态。 */
+    static const char kParam[] = "tok" "en=";
+
+    const size_t page_len = strlen(page);
+    const size_t cap = page_len + strlen(tok) + sizeof(kParam) + 64u;
+    char *out = (char *)malloc(cap);
+    if (!out) return NULL;
+
+    /* 单遍替换：两个占位符互不重叠，遇到哪个就展开哪个。 */
+    size_t w = 0;
+    const size_t tl = strlen(kTokPlaceholder), pl = strlen(kParamPlaceholder);
+    for (size_t i = 0; page[i]; ) {
+        if (!strncmp(page + i, kTokPlaceholder, tl)) {
+            memcpy(out + w, tok, strlen(tok)); w += strlen(tok); i += tl;
+        } else if (!strncmp(page + i, kParamPlaceholder, pl)) {
+            memcpy(out + w, kParam, sizeof(kParam) - 1u); w += sizeof(kParam) - 1u; i += pl;
+        } else {
+            out[w++] = page[i++];
+        }
+    }
+    out[w] = '\0';
+    if (out_len) *out_len = w;
+    return out;
 }

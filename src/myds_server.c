@@ -437,8 +437,13 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         }
         if (strcmp(route, "/trace") == 0) {
             MYDS_LOG_I("[%s:%d] GET /trace -> 200 OK (page)", client_ip, client_port);
+            /* token 注入进页面脚本。原因见 myds_trace_page_html_for_token：
+             * 页面里的 fetch 不继承地址栏 query，少了注入就是「页面能开、
+             * 表格永远空、每 3 秒一次 404」。 */
+            char *page = myds_trace_page_html_for_token(presented, NULL);
             send_response(client_fd, 200, "OK", "text/html; charset=utf-8",
-                          myds_trace_page_html());
+                          page ? page : myds_trace_page_html());
+            free(page);
             free(req_buf);
             close(client_fd);
             return;

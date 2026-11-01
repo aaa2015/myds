@@ -82,8 +82,15 @@ void myds_trace_reset(void);
 bool myds_trace_list_json(char *out, size_t cap);
 bool myds_trace_detail_json(uint64_t seq, char *out, size_t cap);
 
-/* 页面本体（HTML）。返回静态字符串，不需要释放。 */
+/* 页面本体（HTML）的模板。占位符尚未替换，不要直接发给客户端。 */
 const char *myds_trace_page_html(void);
+
+/* 用真实 token 展开模板，返回新分配的字符串（调用方 free）。
+ *
+ * 必须用这个而不是直接发模板：页面里的 fetch 是独立请求，不会继承地址栏的
+ * query，所以 token 要由服务端注入到脚本里。token 含非 URL 安全字符时注入空串，
+ * 页面仍可打开但 API 会 404 —— 显式失败，好过拼出坏掉的 JS。 */
+char *myds_trace_page_html_for_token(const char *token, size_t *out_len);
 
 #ifdef __cplusplus
 }

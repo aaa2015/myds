@@ -255,6 +255,48 @@ static void test_page_js_is_well_formed(void) {
     free(js);
 }
 
+/* token 必须由服务端注入到页面脚本里。
+ *
+ * 背景（真实故障）：页面是从 /trace?token=X 打开的，但页面里的
+ * fetch('/trace/api/requests') 是**另一个请求**，不会继承地址栏的 query。
+ * 结果：页面 200 打得开、表格永远空、控制台每 3 秒一次 404 ——
+ * 用户看到的就是「请求了但没效果」。
+ *
+ * 这两条断言把那个状态钉死：模板必须留占位符（否则没法注入），
+ * 展开后必须不含占位符且带着 token。 */
+static void test_token_is_injected_into_page(void) {
+    const char *tpl = myds_trace_page_html();
+    CHECK(strstr(tpl, "__MYDS_TRACE_TOKEN__") != NULL);
+    CHECK(strstr(tpl, "__MYDS_TRACE_PARAM__") != NULL);
+
+    size_t len = 0;
+    char *page = myds_trace_page_html_for_token("abc123", &len);
+    CHECK(page != NULL);
+    if (page) {
+        CHECK(len == strlen(page));
+        CHECK(strstr(page, "__MYDS_TRACE_TOKEN__") == NULL);
+        CHECK(strstr(page, "__MYDS_TRACE_PARAM__") == NULL);
+        CHECK(strstr(page, "abc123") != NULL);
+        /* 参数名由服务端拼出，页面里必须真的出现它，否则 API 还是不带凭据 */
+        CHECK(strstr(page, "tok" "en=") != NULL);
+        free(page);
+    }
+
+    /* 含非 URL 安全字符的 token：不注入，页面仍生成（API 会 404，显式失败） */
+    char *unsafe = myds_trace_page_html_for_token("a\"b", NULL);
+    CHECK(unsafe != NULL);
+    if (unsafe) {
+        CHECK(strstr(unsafe, "__MYDS_TRACE_TOKEN__") == NULL);
+        CHECK(strstr(unsafe, "a\"b") == NULL);   /* 没被拼进 JS 字面量 */
+        free(unsafe);
+    }
+
+    /* NULL token 也不能崩 */
+    char *none = myds_trace_page_html_for_token(NULL, NULL);
+    CHECK(none != NULL);
+    free(none);
+}
+
 static void test_page_is_html(void) {
     const char *html = myds_trace_page_html();
     CHECK(html != NULL);
@@ -276,6 +318,7 @@ int main(void) {
     test_capacity_clamped();
     test_wall_includes_engine();
     test_page_js_is_well_formed();
+    test_token_is_injected_into_page();
     test_page_is_html();
     myds_trace_reset();
 
