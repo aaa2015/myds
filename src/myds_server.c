@@ -802,11 +802,12 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         }
 
         const char *parse_reason = NULL;
-        if (phases) t_render_begin = myds_server_now_s();
+        /* 时间戳无条件采集：/trace 页面读它们。开关只控制「打不打日志行」。 */
+        t_render_begin = myds_server_now_s();
         const bool parsed_ok = is_continuation
             ? parse_chat_prompt_suffix_vis(body, prompt, prompt_cap, &parse_reason, &img_sink)
             : parse_chat_prompt_vis(body, prompt, prompt_cap, &parse_reason, &img_sink);
-        if (phases) t_render_end = myds_server_now_s();
+        t_render_end = myds_server_now_s();
         if (!parsed_ok) {
             MYDS_LOG_W("[%s:%d] rejected (400): %s%s%s [body=%zd bytes, prompt_cap=%zu]",
                        client_ip, client_port, parse_reason,
@@ -1062,7 +1063,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 sctx.cancel_flag = 1;
                 if (!sctx.writer) sctx.failed = true;
             }
-            if (phases) t_generate_begin = myds_server_now_s();
+            t_generate_begin = myds_server_now_s();
             int generated = !sctx.cancel_flag && myds_generate_bytes_ex(ctx, prompt, myds_server_sse_callback, &sctx,
                                                                        &stop_reason, &prompt_tokens, &sctx.cancel_flag);
             myds_context_clear_image_embeddings(ctx); myds_vjob_sink_free(&img_sink);
@@ -1252,7 +1253,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             free(sctx.acc); sctx.acc = NULL;   /* 每请求一份累积缓冲，必须释放 */
         } else {
             myds_non_stream_ctx_t ns = {.client_fd = client_fd};
-            if (phases) t_generate_begin = myds_server_now_s();
+            t_generate_begin = myds_server_now_s();
             int generated = myds_generate_bytes_ex(ctx, prompt, myds_server_non_stream_callback, &ns,
                                                    &stop_reason, &prompt_tokens, &ns.cancel_flag);
             myds_context_clear_image_embeddings(ctx); myds_vjob_sink_free(&img_sink);
