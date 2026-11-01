@@ -455,10 +455,15 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             close(client_fd);
             return;
         }
-        if (strncmp(route, "/trace/api/request", 18) == 0) {
+        /* 注意 "/trace/api/requests" 也以 "/trace/api/request" 开头，
+         * 靠上面的分支先返回才没出错。要求前缀之后就是结尾，去掉这个隐含顺序依赖。 */
+        if (strncmp(route, "/trace/api/request", 18) == 0 && route[18] == '\0') {
             /* ?seq=N。没有 seq 或解析失败一律 400 —— 静默给个默认值会让客户端
              * 以为自己在看请求 1，而实际看的是别的。 */
-            const char *q = strstr(route, "seq=");
+            /* seq 必须从【原始 path】取，不能从 route —— route 在路由前已经被
+             * 切掉了 '?' 之后的部分，那里正是 query。第一版写成 route，
+             * 结果详情接口永远回 "missing or invalid seq"。 */
+            const char *q = strstr(path, "seq=");
             char *end = NULL;
             const unsigned long long seq = q ? strtoull(q + 4, &end, 10) : 0ull;
             if (!q || end == q + 4) {
