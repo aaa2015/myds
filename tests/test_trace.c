@@ -12,6 +12,7 @@
 #include "myds_trace.h"
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
@@ -210,6 +211,50 @@ static void test_wall_includes_engine(void) {
     CHECK(got.phases.engine_s < 0.0);
 }
 
+/* 页面里的 JS 必须是【能被解析】的。这一条比它听起来重要：
+ *
+ * 页面是 C 字符串拼出来的，一个漏掉的闭合引号会让整段 JS 变成字符串内容，
+ * 结果是「页面能打开、表格空白」—— 服务端没有任何错误，单测也全绿。
+ * 我写这段时在同一地方错了两次（'</td>+ 少了收尾引号）。
+ *
+ * 这里不追求完整校验：检查引号成对、括号成对、每行都以引号收尾，
+ * 足以抓住「拼接时漏引号」这一类。真正的语法检查交给构建外的一次 node --check。 */
+static int count_char(const char *s, char c) {
+    int n = 0;
+    for (; *s; ++s) if (*s == c) n++;
+    return n;
+}
+
+static void test_page_js_is_well_formed(void) {
+    const char *html = myds_trace_page_html();
+    const char *beg = strstr(html, "<script>");
+    const char *end = strstr(html, "</script>");
+    CHECK(beg && end && end > beg);
+    if (!beg || !end) return;
+
+    const size_t len = (size_t)(end - (beg + 8));
+    char *js = (char *)malloc(len + 1);
+    CHECK(js != NULL);
+    if (!js) return;
+    memcpy(js, beg + 8, len);
+    js[len] = '\0';
+
+    /* 引号必须成对（含模板字符串的反引号）。偶数是最低门槛，
+     * 但恰好能抓住「漏一个收尾引号」—— 那正是这里的真实缺陷。 */
+    CHECK(count_char(js, '\'') % 2 == 0);
+    CHECK(count_char(js, '\"') % 2 == 0);
+    CHECK(count_char(js, '`') % 2 == 0);
+    /* 花括号也必须配平，否则后面的事件绑定会被解析进错误的块 */
+    CHECK(count_char(js, '{') == count_char(js, '}'));
+    CHECK(count_char(js, '(') == count_char(js, ')'));
+
+    /* 列表渲染必须用模板字符串：'...'+x+'...' 的写法每行都要自己补引号，
+     * 这个文件在这里错过两次。断言它用的是模板形式，防止有人改回去。 */
+    CHECK(strstr(js, "return `<tr data-seq=") != NULL);
+
+    free(js);
+}
+
 static void test_page_is_html(void) {
     const char *html = myds_trace_page_html();
     CHECK(html != NULL);
@@ -230,6 +275,7 @@ int main(void) {
     test_detail_by_seq();
     test_capacity_clamped();
     test_wall_includes_engine();
+    test_page_js_is_well_formed();
     test_page_is_html();
     myds_trace_reset();
 
