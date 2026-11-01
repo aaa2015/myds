@@ -636,7 +636,7 @@ git log --all -S"myds_metal_prefill_prompt_view_clear_enabled" -- src/ include/
 
 ### 最终计数
 
-```
+```text
 doc files     : 39
 path claims   : 113
 benchmark dirs: 190 named -- 34 known-absent, 4 类 moved to mydsdoc
@@ -644,6 +644,9 @@ make refs     : 16
 unverifiable  : 17
 真断链        : 0
 ```
+
+（标 `text` 而不是留空：这是工具的输出样本，不是要执行的命令。
+留空会被当成 shell 块，里面的 `make refs : 16` 会被解析成一个叫 `refs` 的目标。）
 
 ### 还需要统帅定的一件事
 

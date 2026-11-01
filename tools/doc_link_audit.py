@@ -74,7 +74,9 @@ FENCE_RE = re.compile(r"^```([\w+-]*)")
 # Languages whose fenced blocks are commands the reader is meant to run.
 SHELL_LANGS = {"", "bash", "sh", "zsh", "shell", "console", "shell-session"}
 # One path-ish token: no whitespace, no shell metacharacters.
-TOKEN_RE = re.compile(r"[^\s'\"`|;&()<>]+")
+# Full-width punctuation must end a token too: Chinese prose writes
+# `include/myds_knobs_generated.h（说明）` with no space before the bracket.
+TOKEN_RE = re.compile(r"[^\s'\"`|;&()<>（）：，。、「」【】]+")
 MAKE_RE = re.compile(r"(?:^|[;&|]\s*)\s*(?:cd\s+[^\s;&|]+\s*&&\s*)*make\s+((?:-\S+\s+)*)([^\s;&|]+)")
 
 
@@ -239,6 +241,7 @@ def main() -> int:
     n_paths = n_make = n_unverifiable = n_bench = 0
     bench_missing: set[str] = set()
     moved: set[str] = set()
+    unverifiable_dirs: set[str] = set()
 
     for md in md_files:
         rel_md = str(md.relative_to(ROOT))
@@ -256,12 +259,26 @@ def main() -> int:
             if cand.is_dir():
                 continue
             n_bench += 1
-            if any((tok + "/").startswith(pref) or tok == pref.rstrip("/")
-                   for pref in KNOWN_ABSENT_PREFIXES):
+            # A family reference (`benchmarks/2026-10-23` after stripping `-*`)
+            # is a prefix of known-absent entries, not a directory that should
+            # exist on its own.
+            is_family = any(pref.startswith(tok + "-") or pref.startswith(tok + "/")
+                            for pref in KNOWN_ABSENT_PREFIXES)
+            if is_family or any((tok + "/").startswith(pref) or tok == pref.rstrip("/")
+                                for pref in KNOWN_ABSENT_PREFIXES):
                 known.add(f"{rel_md}  {tok}")
                 continue
-            if (DOCS_REPO / tok).is_dir():
-                moved.add(f"{rel_md}  {tok}")
+            if DOCS_REPO.is_dir():
+                if (DOCS_REPO / tok).is_dir():
+                    moved.add(f"{rel_md}  {tok}")
+                    continue
+            elif (tok + "/").startswith("benchmarks/2026-10-05") or tok == \
+                    "benchmarks/2026-10-24-indexscore-mask-survey":
+                # The documentation repo simply is not checked out on this host.
+                # "I cannot look there" is not "it is missing" -- treating the two
+                # the same is how a gate becomes machine-dependent and gets
+                # disabled. Counted as unverifiable instead.
+                unverifiable_dirs.add(f"{rel_md}  {tok}")
                 continue
             bench_missing.add(f"{rel_md}  {tok}")
         for lineno, line, cwd in iter_code_blocks(md):
@@ -324,8 +341,10 @@ def main() -> int:
     print(f"path claims   : {n_paths}")
     print(f"make refs     : {n_make}  ({len(targets)} rules in Makefile)")
     if n_bench:
+        extra = f", {len(unverifiable_dirs)} unverifiable (mydsdoc not checked out)" \
+            if unverifiable_dirs else ""
         print(f"benchmark dirs: {n_bench} named -- {len(known)} known-absent, "
-              f"{len(moved)} moved to mydsdoc")
+              f"{len(moved)} moved to mydsdoc{extra}")
     if n_unverifiable:
         print(f"unverifiable  : {n_unverifiable}  (./x with no resolvable cd -- not guessed)")
     print()
