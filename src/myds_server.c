@@ -152,6 +152,80 @@ static void handle_signal(int sig) {
  * Deliberately only clock_gettime around existing boundaries. Ledger §B.3: the
  * instrumentation must not perturb what it measures, so nothing here inserts a
  * command buffer or forces a commit inside the engine. */
+
+/* OpenAI usage 的扩展段：缓存明细 + llama.cpp 风格的 timings。
+ *
+ * 为什么要加：客户端（myagent 等）直接读服务器给的值，字段名沿用
+ * llama-server 的约定 —— prompt_n / prompt_ms / prompt_per_second /
+ * predicted_n / predicted_ms / predicted_per_second，外加 cache_n。
+ * 我们原来只发 prompt_tokens / completion_tokens / total_tokens，
+ * 于是同一块界面在参考实现上有数、在我们这里只能走兜底（显示 0.0）。
+ *
+ * 口径与 llama.cpp 一致：
+ *   prompt_n            本次真正跑过的 prompt token（不含命中缓存的部分）
+ *   prompt_per_second   prompt_n / prompt_ms
+ *   predicted_n         本次 decode 的步数
+ *   predicted_per_second predicted_n / predicted_ms
+ *   cache_n             命中前缀缓存的 token 数
+ *
+ * 取不到的值输出 null，不是 0 —— 0 会被读成「测了，是零」。
+ * 同时发 OpenAI 标准的 usage.prompt_tokens_details.cached_tokens，
+ * 让不认 timings 的客户端也能看到缓存命中。 */
+static void server_usage_extra_json(myds_context_t *ctx, uint32_t out_tokens,
+                                    double t_first, double t_last, double t_end,
+                                    char *out, size_t cap) {
+    myds_prefill_stats_t pf;
+    myds_last_prefill_stats(ctx, &pf);
+
+    const bool have_prompt = pf.valid && pf.prompt_tokens > 0;
+    const uint32_t cached = have_prompt ? pf.cached_tokens : 0u;
+    const uint32_t prompt_n = have_prompt ? pf.prefill_tokens : 0u;
+    const double prompt_ms = (have_prompt && pf.prefill_seconds > 0.0)
+        ? pf.prefill_seconds * 1000.0 : -1.0;
+    const double prompt_ps = (prompt_n > 0 && pf.prefill_seconds > 0.0)
+        ? (double)prompt_n / pf.prefill_seconds : -1.0;
+
+    /* decode 步数与窗口：与日志、trace 用同一套判定，避免三处算出不同的数。 */
+    double dec_ms = -1.0, dec_ps = -1.0;
+    uint32_t dec_n = 0;
+    if (out_tokens > 1 && t_last > t_first) {
+        dec_ms = (t_last - t_first) * 1000.0; dec_n = out_tokens - 1u;
+    } else if (out_tokens == 1 && t_end > t_first) {
+        dec_ms = (t_end - t_first) * 1000.0; dec_n = 1u;   /* 求 EOS 的那一步 */
+    }
+    if (dec_n > 0 && dec_ms > 0.0) dec_ps = (double)dec_n / (dec_ms / 1000.0);
+
+    char pms[24] = "null", pps[24] = "null", dms[24] = "null", dps[24] = "null";
+    if (prompt_ms >= 0.0) snprintf(pms, sizeof(pms), "%.3f", prompt_ms);
+    if (prompt_ps >= 0.0) snprintf(pps, sizeof(pps), "%.2f", prompt_ps);
+    if (dec_ms >= 0.0) snprintf(dms, sizeof(dms), "%.3f", dec_ms);
+    if (dec_ps >= 0.0) snprintf(dps, sizeof(dps), "%.2f", dec_ps);
+
+    /* 补上 llama.cpp timings 里另外两个字段（每 token 毫秒），
+     * 少一个就可能让按字段名硬读的客户端拿到空值。 */
+    char ptm[24] = "null", dtm[24] = "null";
+    if (prompt_ms >= 0.0 && prompt_n > 0) snprintf(ptm, sizeof(ptm), "%.4f", prompt_ms / prompt_n);
+    if (dec_ms >= 0.0 && dec_n > 0) snprintf(dtm, sizeof(dtm), "%.4f", dec_ms / dec_n);
+
+    /* cache_hit_rate 用百分比（0-100），与 trace 页面和常见看板一致；
+     * 取不到时 null 而不是 0。 */
+    char chr_buf[24] = "null";
+    if (have_prompt && pf.prompt_tokens > 0)
+        snprintf(chr_buf, sizeof(chr_buf), "%.2f",
+                 100.0 * (double)pf.cached_tokens / (double)pf.prompt_tokens);
+
+    snprintf(out, cap,
+             ",\"prompt_tokens_details\":{\"cached_tokens\":%u}"
+             ",\"cache_hit_tokens\":%u,\"cache_hit_rate\":%s"
+             ",\"timings\":{\"prompt_n\":%u,\"prompt_ms\":%s,"
+             "\"prompt_per_token_ms\":%s,\"prompt_per_second\":%s,"
+             "\"predicted_n\":%u,\"predicted_ms\":%s,"
+             "\"predicted_per_token_ms\":%s,\"predicted_per_second\":%s,"
+             "\"cache_n\":%u}",
+             cached, cached, chr_buf,
+             prompt_n, pms, ptm, pps, dec_n, dms, dtm, dps, cached);
+}
+
 static bool myds_server_request_phases_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -1301,9 +1375,15 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                         "data: {\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"%s\"}]}\n\n", finish);
                     bool sent = len > 0 && (size_t)len < sizeof(chunk) && myds_server_sse_send(&sctx, chunk, (size_t)len);
                     if (sent && include_usage) {
+                        /* 流式分支的这个 usage 块在 finish 事件之后才发，
+                         * 此时 t_last 已定；t_end 取当前时刻（生成已经结束）。 */
+                        char usage_extra[384];
+                        server_usage_extra_json(ctx, final_tokens, t_first, t_last,
+                                                myds_server_now_s(), usage_extra,
+                                                sizeof(usage_extra));
                         len = snprintf(chunk, sizeof(chunk),
-                            "data: {\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u}}\n\n",
-                            prompt_tokens, final_tokens, prompt_tokens + final_tokens);
+                            "data: {\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u%s}}\n\n",
+                            prompt_tokens, final_tokens, prompt_tokens + final_tokens, usage_extra);
                         sent = len > 0 && (size_t)len < sizeof(chunk) && myds_server_sse_send(&sctx, chunk, (size_t)len);
                     }
                     const char *done = "data: [DONE]\n\n";
@@ -1357,6 +1437,11 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 char *alias_json = json_escape_alloc(model_alias ? model_alias : "myds",
                                                      strlen(model_alias ? model_alias : "myds"));
                 char *response = NULL;
+                /* usage 扩展段（缓存明细 + timings）。必须在构造 response 之前算好，
+                 * 因为 t_end 在这里就是「生成刚返回」的时刻。 */
+                char usage_extra[384];
+                server_usage_extra_json(ctx, final_tokens, t_first, t_last,
+                                        myds_server_now_s(), usage_extra, sizeof(usage_extra));
                 /* LOOP_GUARD 归入 "length"：输出确实被截断了，客户端必须能分辨。
                  * 映射成 "stop" 会让半截答案看起来像正常收尾（原实现的问题）。 */
                 const char *finish = (stop_reason == MYDS_STOP_LENGTH || stop_reason == MYDS_STOP_CTX_FULL ||
@@ -1449,9 +1534,10 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                         response = items_json ? format_alloc(
                             "{\"id\":\"%s\",\"object\":\"response\",\"created_at\":%ld,"
                             "\"status\":\"completed\",\"model\":\"%s\",\"output\":%s,"
-                            "\"usage\":{\"input_tokens\":%u,\"output_tokens\":%u,\"total_tokens\":%u}}",
+                            "\"usage\":{\"input_tokens\":%u,\"output_tokens\":%u,\"total_tokens\":%u%s}}",
                             resp_id, now, alias_json, items_json,
-                            prompt_tokens, final_tokens, prompt_tokens + final_tokens) : NULL;
+                            prompt_tokens, final_tokens, prompt_tokens + final_tokens,
+                            usage_extra) : NULL;
                     } else if (tool_count && calls_json && content_field) {
                         if (reasoning_escaped) {
                             response = format_alloc(
@@ -1459,18 +1545,18 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                                 "\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\","
                                 "\"content\":%s,\"reasoning_content\":\"%s\",\"tool_calls\":%s},"
                                 "\"finish_reason\":\"%s\"}],"
-                                "\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u}}",
+                                "\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u%s}}",
                                 now, alias_json, content_field, reasoning_escaped, calls_json, finish,
-                                prompt_tokens, final_tokens, prompt_tokens + final_tokens);
+                                prompt_tokens, final_tokens, prompt_tokens + final_tokens, usage_extra);
                         } else {
                             response = format_alloc(
                                 "{\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion\",\"created\":%ld,"
                                 "\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\","
                                 "\"content\":%s,\"tool_calls\":%s},"
                                 "\"finish_reason\":\"%s\"}],"
-                                "\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u}}",
+                                "\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u%s}}",
                                 now, alias_json, content_field, calls_json, finish,
-                                prompt_tokens, final_tokens, prompt_tokens + final_tokens);
+                                prompt_tokens, final_tokens, prompt_tokens + final_tokens, usage_extra);
                         }
                     } else {
                         if (reasoning_escaped) {
@@ -1478,15 +1564,15 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                                 "{\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion\",\"created\":%ld,"
                                 "\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\",\"reasoning_content\":\"%s\"},"
                                 "\"finish_reason\":\"%s\"}],"
-                                "\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u}}",
-                                now, alias_json, body_escaped, reasoning_escaped, finish, prompt_tokens, final_tokens, prompt_tokens + final_tokens);
+                                "\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u%s}}",
+                                now, alias_json, body_escaped, reasoning_escaped, finish, prompt_tokens, final_tokens, prompt_tokens + final_tokens, usage_extra);
                         } else {
                             response = format_alloc(
                                 "{\"id\":\"chatcmpl-myds\",\"object\":\"chat.completion\",\"created\":%ld,"
                                 "\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\"},"
                                 "\"finish_reason\":\"%s\"}],"
-                                "\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u}}",
-                                now, alias_json, body_escaped, finish, prompt_tokens, final_tokens, prompt_tokens + final_tokens);
+                                "\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u%s}}",
+                                now, alias_json, body_escaped, finish, prompt_tokens, final_tokens, prompt_tokens + final_tokens, usage_extra);
                         }
                     }
                 }
@@ -1557,7 +1643,27 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         double wall_s = t_end - t_arrive;
         double prefill_s = (final_tokens > 0 && t_first > t_start) ? (t_first - t_start) : infer_s;
         double ttft_s = prefill_s;
-        double decode_s = (final_tokens > 1 && t_last > t_first) ? (t_last - t_first) : 0.0;
+        /* decode 窗口与计入的步数。
+         *
+         * out >= 2：(N-1) 个 token 落在 [第一个 token, 最后一个 token] 之间 ——
+         *           那 N-1 次前向正好产出这 N-1 个 token，口径干净。
+         * out == 1：内容只有 1 个 token，但引擎之后还跑了一次前向去求 EOS。
+         *           那一步是真实的 decode 工作，用 [第一个 token, 生成返回] 度量它。
+         *           远程 DeepSeek 把 EOS 计入 completion_tokens（内容只有 "y"
+         *           却报 出:2），于是它也能算出 49.1 t/s —— 那个数就是这一步。
+         *           不计这一步的话，out=1 永远是 n/a，而用户看到的是「远程有、我们没有」。
+         *
+         * 两者都记「每秒多少步前向」，不是「每秒多少内容 token」——
+         * 这一点在页面的 tooltip 里写明，避免和 completion token 计数混淆。 */
+        double decode_s = 0.0;
+        double decode_steps = 0.0;
+        if (final_tokens > 1 && t_last > t_first) {
+            decode_s = t_last - t_first;
+            decode_steps = (double)(final_tokens - 1);
+        } else if (final_tokens == 1 && t_end > t_first) {
+            decode_s = t_end - t_first;   /* 求 EOS 的那一次前向 */
+            decode_steps = 1.0;
+        }
         /* 没有 decode 阶段时**不给速率**（-1），不要拿 infer_s 凑一个。
          *
          * 原来的 fallback 是 final_tokens / infer_s。对 out=1 的请求，
@@ -1566,8 +1672,8 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
          * 看起来像「decode 慢到 0.6 t/s」，而真相是这次根本没有 decode 阶段
          * —— 那一个 token 的首字延迟已经算在 ttft 里了。
          * 编一个数比留空更难查：读者会去追一个不存在的问题。 */
-        const bool have_decode_phase = decode_s > 0.0 && final_tokens > 1;
-        double decode_tps = have_decode_phase ? ((double)(final_tokens - 1) / decode_s) : -1.0;
+        const bool have_decode_phase = decode_s > 0.0 && decode_steps > 0.0;
+        double decode_tps = have_decode_phase ? (decode_steps / decode_s) : -1.0;
         const char *final_finish_str =
             (stop_reason == MYDS_STOP_LENGTH || stop_reason == MYDS_STOP_CTX_FULL ||
              stop_reason == MYDS_STOP_LOOP_GUARD) ? "length"
@@ -1608,13 +1714,14 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         }
         /* decode 段的措辞。没有阶段时不打数字，直接说明原因 ——
          * 「1 tok in 0.0s = 0.6 t/s」这种行会让人去查一个不存在的问题。 */
-        char decode_str[96];
-        if (have_decode_phase)
+        char decode_str[128];
+        if (have_decode_phase && final_tokens > 1)
             snprintf(decode_str, sizeof(decode_str), "%u tok in %.1fs = %.1f t/s",
                      final_tokens, decode_s, decode_tps);
-        else if (final_tokens == 1)
+        else if (have_decode_phase)
+            /* out=1：一个内容 token + 一次求 EOS 的前向。数字是「秒/次前向」。 */
             snprintf(decode_str, sizeof(decode_str),
-                     "n/a (1 tok total; its latency is in ttft)");
+                     "1 tok, eos-step %.0fms = %.1f t/s", decode_s * 1000.0, decode_tps);
         else
             snprintf(decode_str, sizeof(decode_str), "n/a (%u tok total)", final_tokens);
 
@@ -1711,7 +1818,8 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
              * 没有 token 就没有速率，输出 null。 */
             trec.prefill_tps = (pf.valid && pf.prefill_tokens > 0 && pf.prefill_seconds > 0.0)
                 ? (double)pf.prefill_tokens / pf.prefill_seconds : -1.0;
-            trec.decode_tps = (decode_s > 0.0 && final_tokens > 1) ? decode_tps : -1.0;
+            /* 与日志用同一个判定：有 decode 窗口就给数（含 out=1 的 EOS 步）。 */
+            trec.decode_tps = (decode_s > 0.0 && decode_steps > 0.0) ? decode_tps : -1.0;
             /* layer_count 保持 0：引擎不默认给逐层计时，见 myds_trace.h 的说明。 */
             myds_trace_complete(trace_seq, &trec);
 

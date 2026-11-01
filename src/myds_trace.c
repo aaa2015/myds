@@ -416,7 +416,7 @@ const char *myds_trace_page_html(void) {
 "('命中 '+rec.cached_tokens+' / '+rec.prompt_tokens+' token');"
 "const ttTitle=rec.ttft===null?'本次没有产出 token（被拒绝或早退）':'请求到达 → 第一个 token，含排队';"
 "const pfTitle=rec.prefill_tps===null?'整个 prompt 命中缓存，本次没有跑 prefill':'引擎自报，不含排队与分词';"
-"const dcTitle=rec.decode_tps===null?'输出不超过 1 个 token，没有 decode 阶段':'生成阶段速率';"
+"const dcTitle=rec.decode_tps===null?'本次没有 decode 步':'生成阶段速率（每秒多少次前向）';"
 "const wall=rec.in_flight?(Date.now()-rec.epoch_ms)/1000:"
 "(p.engine===null?null:(p.queue<0?0:p.queue)+(p.render>0?p.render:0)+"
 "(p.setup>0?p.setup:0)+p.engine);"
