@@ -5,6 +5,7 @@
 #include "myds_vjob.h"
 #include "myds_steer.h"
 #include "myds_log.h"
+#include "myds_trace.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -380,6 +381,86 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
     if (strcmp(path, "/health") == 0 || strcmp(path, "/") == 0) {
         MYDS_LOG_D("[%s:%d] GET %s -> 200 OK", client_ip, client_port, path);
         send_response(client_fd, 200, "OK", "application/json", "{\"status\":\"ok\"}");
+        free(req_buf);
+        close(client_fd);
+        return;
+    }
+
+    /* GET /trace* — 请求追踪页面与数据。
+     *
+     * 与 /debug/state 同一套门槛（回环 + token + 开关），理由相同：这是未鉴权服务，
+     * 暴露「谁在什么时候发了什么请求、各自花了多久」属于运行数据，不能默认对全网开放。
+     * 但页面本身要能一眼打开，所以门槛与 debug 一致而不是更严。 */
+    if (strncmp(path, "/trace", 6) == 0) {
+        char presented[256] = "";
+        extract_http_header_str(req_buf, "X-Debug-Token", presented, sizeof presented);
+        const bool loopback = g_debug_is_loopback != NULL && g_debug_is_loopback(client_ip);
+        const bool token_ok = g_debug_token_ok != NULL && g_debug_token_ok(presented);
+        if (!(loopback && token_ok && g_debug_enabled && g_debug_enabled())) {
+            MYDS_LOG_W("[%s:%d] GET %s -> 404 (loopback %s, token %s)",
+                       client_ip, client_port, path,
+                       loopback ? "yes" : "no",
+                       presented[0] ? (token_ok ? "ok" : "mismatch") : "absent");
+            send_response(client_fd, 404, "Not Found", "application/json",
+                          "{\"error\":\"not found\"}");
+            free(req_buf);
+            close(client_fd);
+            return;
+        }
+        if (strcmp(path, "/trace") == 0) {
+            MYDS_LOG_I("[%s:%d] GET /trace -> 200 OK (page)", client_ip, client_port);
+            send_response(client_fd, 200, "OK", "text/html; charset=utf-8",
+                          myds_trace_page_html());
+            free(req_buf);
+            close(client_fd);
+            return;
+        }
+        if (strcmp(path, "/trace/api/requests") == 0) {
+            /* 列表可能很长：按容量上限（512 条）算，每条 ~300 B ⇒ 160 KB。
+             * 堆上分配，失败就 500 —— 发一段截断的 JSON 比不发更难查。 */
+            const size_t cap = 64u * 1024u + (size_t)myds_trace_capacity() * 512u;
+            char *json = (char *)malloc(cap);
+            if (!json || !myds_trace_list_json(json, cap)) {
+                free(json);
+                send_response(client_fd, 500, "Internal Server Error", "application/json",
+                              "{\"error\":\"trace buffer too small or unavailable\"}");
+            } else {
+                send_response(client_fd, 200, "OK", "application/json", json);
+                free(json);
+            }
+            free(req_buf);
+            close(client_fd);
+            return;
+        }
+        if (strncmp(path, "/trace/api/request", 18) == 0) {
+            /* ?seq=N。没有 seq 或解析失败一律 400 —— 静默给个默认值会让客户端
+             * 以为自己在看请求 1，而实际看的是别的。 */
+            const char *q = strstr(path, "seq=");
+            char *end = NULL;
+            const unsigned long long seq = q ? strtoull(q + 4, &end, 10) : 0ull;
+            if (!q || end == q + 4) {
+                send_response(client_fd, 400, "Bad Request", "application/json",
+                              "{\"error\":\"missing or invalid seq\"}");
+                free(req_buf);
+                close(client_fd);
+                return;
+            }
+            const size_t cap = 4096u;
+            char *json = (char *)malloc(cap);
+            if (!json || !myds_trace_detail_json(seq, json, cap)) {
+                free(json);
+                send_response(client_fd, 404, "Not Found", "application/json",
+                              "{\"error\":\"no such request (evicted or never seen)\"}");
+            } else {
+                send_response(client_fd, 200, "OK", "application/json", json);
+                free(json);
+            }
+            free(req_buf);
+            close(client_fd);
+            return;
+        }
+        send_response(client_fd, 404, "Not Found", "application/json",
+                      "{\"error\":\"not found\"}");
         free(req_buf);
         close(client_fd);
         return;
@@ -1452,7 +1533,13 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                    is_responses_endpoint ? "Responses" : "ChatCompletions",
                    path, prompt_tokens, prefill_str, ttft_s,
                    final_tokens, decode_s, decode_tps, wall_s, infer_s, queue_s, final_finish_str, steer_summary);
-        if (phases) {
+        /* 构造阶段分解并**无条件**存进环形缓冲（/trace 页面读它），
+         * 日志行仍只在 MYDS_REQUEST_PHASES=1 时打。
+         *
+         * 为什么记录不受开关控制：页面默认就该有数据，否则点开是空的，
+         * 使用者还得先知道有个环境变量才能看到东西 —— 那等于没有页面。
+         * 开销是复制十几个已经算好的 double，不在请求路径上新增任何测量。 */
+        {
             /* One machine-readable line, emitted only under MYDS_REQUEST_PHASES=1.
              *
              * Each field is null when that stage did not exist for this request
@@ -1490,13 +1577,33 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 .out_tokens = final_tokens,
                 .stream = stream ? 1 : 0,
             };
+            myds_trace_rec_t trec;
+            memset(&trec, 0, sizeof(trec));
+            snprintf(trec.path, sizeof(trec.path), "%s", path);
+            snprintf(trec.client, sizeof(trec.client), "%s:%d", client_ip, client_port);
+            snprintf(trec.finish, sizeof(trec.finish), "%s", final_finish_str);
+            trec.phases.queue_s = phases_record.queue_s;
+            trec.phases.render_s = phases_record.render_s;
+            trec.phases.setup_s = phases_record.setup_s;
+            trec.phases.engine_s = phases_record.engine_s;
+            trec.phases.prefill_s = phases_record.prefill_s;
+            trec.phases.decode_s = phases_record.decode_s;
+            trec.phases.unattributed_s = phases_record.unattributed_s;
+            trec.prompt_tokens = phases_record.prompt_tokens;
+            trec.cached_tokens = phases_record.cached_tokens;
+            trec.out_tokens = phases_record.out_tokens;
+            trec.stream = phases_record.stream;
+            /* layer_count 保持 0：引擎不默认给逐层计时，见 myds_trace.h 的说明。 */
+            myds_trace_record(&trec);
+
             char phases_json[512];
             myds_request_phases_json(&phases_record, phases_json, sizeof(phases_json));
             /* t_last precedes the engine's return by the last callback, so
              * engine_unattributed can come out slightly negative on a short
              * request. It bounds "neither prefill nor decode", it is not an exact
              * stage cost; a large negative means the split itself is wrong. */
-            MYDS_LOG_I("[%s:%d] request_phases %s", client_ip, client_port, phases_json);
+            if (phases)
+                MYDS_LOG_I("[%s:%d] request_phases %s", client_ip, client_port, phases_json);
         }
         if (ctx->dspark && ctx->dspark->proposed_tokens > dspark_prop_before) {
             uint64_t req_prop = ctx->dspark->proposed_tokens - dspark_prop_before;

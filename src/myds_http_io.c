@@ -100,9 +100,15 @@ unsigned myds_server_sse_drain_timeout_ms(void) {
 static bool sse_writer_stopped(myds_sse_writer_t *w) {
     pthread_mutex_lock(&w->lock);
     bool stopped = w->aborted;
-    if (w->closing && myds_server_now_s() >= w->drain_deadline) {
+    if (w->closing && !w->aborted && myds_server_now_s() >= w->drain_deadline) {
         w->failed = w->aborted = true;
         stopped = true;
+        /* 排空超时是**真**异常：客户端还连着（否则会是 EPIPE/ECONNRESET 路径），
+         * 但字节在规定时间内发不完 —— 要么对端读得极慢，要么我们自己写不动。
+         * 原实现静默置位，上层只看到「取消了」，查不到原因。 */
+        MYDS_LOG_W("sse: drain deadline hit with %zu bytes still pending "
+                   "(byte_limit %zu, timeout %ums) - dropping the stream",
+                   w->pending_bytes, w->byte_limit, w->drain_timeout_ms);
     }
     pthread_mutex_unlock(&w->lock);
     return stopped;
@@ -161,11 +167,22 @@ static void *sse_writer_thread(void *opaque) {
         if (!w->head) w->tail = NULL;
         pthread_mutex_unlock(&w->lock);
         /* The in-flight packet remains charged to the budget until fully sent. */
+        const int saved_errno = errno;
         const bool ok = sse_writer_send_packet(w, packet);
+        const int send_errno = ok ? 0 : errno;
+        (void)saved_errno;
         pthread_mutex_lock(&w->lock);
         w->pending_bytes -= sizeof(*packet) + packet->length;
         if (!ok) w->failed = w->aborted = true;
         pthread_mutex_unlock(&w->lock);
+        /* 客户端主动断开是**常态**（agent 每次取消都会），打 WARN 会刷爆日志，
+         * 也让真正的故障淹没。只有不属于「对端走了」的失败才值得一条 WARN。 */
+        if (!ok && send_errno != EPIPE && send_errno != ECONNRESET &&
+            send_errno != ENOTCONN && send_errno != 0) {
+            MYDS_LOG_W("sse: send failed with %zu bytes in flight (errno %d: %s) - "
+                       "this is not a clean client disconnect",
+                       packet->length, send_errno, strerror(send_errno));
+        }
         free(packet);
         if (!ok) { shutdown(w->fd, SHUT_RDWR); break; }
     }
@@ -233,7 +250,12 @@ bool myds_server_sse_send(myds_sse_stream_ctx_t *stream, const char *data, size_
             sse_packet_t *packet = NULL;
             if (sse_writer_injected_failure(2)) errno = ENOMEM;
             else packet = malloc(sizeof(*packet) + length);
-            if (!packet) { w->failed = w->aborted = true; stream->failed = true; ok = false; }
+            if (!packet) {
+                w->failed = w->aborted = true; stream->failed = true; ok = false;
+                MYDS_LOG_E("sse: cannot allocate a %zu-byte packet (byte_limit %zu, "
+                           "pending %zu) - streaming aborted",
+                           length, w->byte_limit, w->pending_bytes);
+            }
             else {
                 packet->next = NULL; packet->length = length;
                 memcpy(packet->data, data, length);

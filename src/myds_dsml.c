@@ -220,15 +220,27 @@ bool myds_parse_completion_tool_calls(const char *text, size_t len, size_t *cont
     if (!calls) return false;
     const char *p = body;
     bool ok = true;
+    /* 失败时必须能说出「在哪一步坏的」。原实现只返回 false，调用方只能报
+     * 「格式不合」——模型换了措辞、或被 max_tokens 切在半个属性上，都长这样，
+     * 而它们的处理方式完全不同。offset 是相对工具块起点的字节位置。 */
+    const char *fail_at = NULL;
+    const char *fail_why = NULL;
     while (ok) {
         p = dsml_skip_ws(p, end);
         if (dsml_match(p, end, close_tag)) { p += strlen(close_tag); break; }
-        if (!dsml_match(p, end, invoke_open)) { ok = false; break; }
+        if (!dsml_match(p, end, invoke_open)) {
+            ok = false; fail_at = p; fail_why = "expected <invoke> or </calls>"; break;
+        }
         p += strlen(invoke_open);
         const char *name = NULL; size_t name_len = 0;
-        if (!(p = dsml_attr(p, end, "name=", &name, &name_len))) { ok = false; break; }
+        const char *at_name = p;
+        if (!(p = dsml_attr(p, end, "name=", &name, &name_len))) {
+            ok = false; fail_at = at_name; fail_why = "<invoke> without name=\""; break;
+        }
         p = dsml_skip_ws(p, end);
-        if (p >= end || *p != '>') { ok = false; break; }
+        if (p >= end || *p != '>') {
+            ok = false; fail_at = p; fail_why = "<invoke> name attribute not followed by '>'"; break;
+        }
         ++p;
 
         dsml_buf_t args = {0};
@@ -237,25 +249,39 @@ bool myds_parse_completion_tool_calls(const char *text, size_t len, size_t *cont
         while (ok) {
             p = dsml_skip_ws(p, end);
             if (dsml_match(p, end, invoke_close)) { p += strlen(invoke_close); break; }
-            if (!dsml_match(p, end, param_open)) { ok = false; break; }
+            if (!dsml_match(p, end, param_open)) {
+                ok = false; fail_at = p; fail_why = "expected <parameter> or </invoke>"; break;
+            }
             p += strlen(param_open);
             const char *pk = NULL; size_t pk_len = 0;
             const char *sv = NULL; size_t sv_len = 0;
-            if (!(p = dsml_attr(p, end, "name=", &pk, &pk_len))) { ok = false; break; }
+            const char *at_pname = p;
+            if (!(p = dsml_attr(p, end, "name=", &pk, &pk_len))) {
+                ok = false; fail_at = at_pname; fail_why = "<parameter> without name=\""; break;
+            }
             /* string= 在 <function_calls> 方言里常常不写（实测模型只写 name=）。
              * DSML 方言里它是必需的，缺失就说明结构不对。 */
             {
                 const char *after_name = p;
                 if (!(p = dsml_attr(p, end, "string=", &sv, &sv_len))) {
-                    if (!d.trailing_only) { ok = false; break; }
+                    if (!d.trailing_only) {
+                        ok = false; fail_at = after_name;
+                        fail_why = "<parameter> without string=\" (required by the |DSML| dialect)";
+                        break;
+                    }
                     p = after_name;
                 }
             }
             p = dsml_skip_ws(p, end);
-            if (p >= end || *p != '>') { ok = false; break; }
+            if (p >= end || *p != '>') {
+                ok = false; fail_at = p;
+                fail_why = "<parameter> attributes not followed by '>'"; break;
+            }
             ++p;
             const char *vend = dsml_find(p, end, param_close);
-            if (!vend) { ok = false; break; }
+            if (!vend) {
+                ok = false; fail_at = p; fail_why = "<parameter> never closed"; break;
+            }
             size_t val_len = (size_t)(vend - strlen(param_close) - p);
             while (val_len && (p[val_len - 1] == '\n' || p[val_len - 1] == '\r')) --val_len;
             /* 有 string= 就照它；没有（<function_calls> 方言常见）就按值的形状推断：
@@ -321,6 +347,12 @@ bool myds_parse_completion_tool_calls(const char *text, size_t len, size_t *cont
         ++count;
     }
     if (!ok) {
+        /* 只在失败时说话（正常请求不打）。给出「第几步、为什么」，让调用方不必
+         * 再自己猜 —— 截断与语法错误在这一层是截然不同的两件事。 */
+        MYDS_LOG_W("dsml: tool block rejected at offset %ld (%zu bytes into the block): %s",
+                   (long)(fail_at ? fail_at - text : -1),
+                   (size_t)(fail_at ? fail_at - body : 0),
+                   fail_why ? fail_why : "unspecified");
         for (size_t k = 0; k < count; ++k) { free(calls[k].id); free(calls[k].name); free(calls[k].arguments); }
         free(calls);
         return false;
