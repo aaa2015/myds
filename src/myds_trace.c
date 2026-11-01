@@ -233,6 +233,8 @@ bool myds_trace_detail_json(uint64_t seq, char *out, size_t cap) {
  *   2. 时间线按【实测值】等比缩放，不按阶段名等分 —— 等分会把 3 ms 的 render
  *      画得和 40 s 的 prefill 一样宽，那是在用图形撒谎。
  */
+/* 列表里的「耗时」列 = 端到端，必须含 engine —— 它是最长的一段。
+ * 漏掉它会让一次 514 ms 的请求显示成 0.12 ms，而那是 queue+render+setup 的和。 */
 const char *myds_trace_page_html(void) {
     return
 "<!DOCTYPE html><html lang=\"zh\"><head><meta charset=\"utf-8\">"
@@ -295,8 +297,6 @@ const char *myds_trace_page_html(void) {
 "n<1?(n*1000).toFixed(1)+'ms':n.toFixed(2)+'s');"
 "const esc=s=>String(s).replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"
 "'\"':'&quot;',\"'\":'&#39;'}[c]));"
-"function total(p){return p.engine!==null?p.queue+(p.render||0)+(p.setup||0)+"
-"(p.engine-(p.prefill||0)-(p.decode||0)>0?0:0)+p.engine:null;}"
 "function cls(f){const s=(f||'').toLowerCase();"
 "return s==='length'?'len':s==='error'?'err':s==='tool_calls'?'tool':"
 "s==='stop'?'stop':'';}"
@@ -308,8 +308,9 @@ const char *myds_trace_page_html(void) {
 "if(!RECS.length){tb.innerHTML='<tr><td colspan=\"7\" class=\"empty\">"
 "暂无记录（先发一个请求）</td></tr>';return;}"
 "tb.innerHTML=RECS.map(rec=>{"
-"const p=rec.phases;const wall=p.engine===null?null:"
-"p.queue+(p.render||0)+(p.setup||0);"
+"const p=rec.phases;"
+"const wall=p.engine===null?null:"
+"p.queue+(p.render||0)+(p.setup||0)+p.engine;"
 "const when=new Date(rec.epoch_ms).toLocaleTimeString();"
 "return '<tr data-seq=\"'+rec.seq+'\"'+(rec.seq===SEL?' class=\"sel\"':'')+'>'"
 "+'<td>'+rec.seq+'</td><td>'+when+'</td>"

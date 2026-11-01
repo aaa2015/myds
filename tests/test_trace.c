@@ -176,6 +176,40 @@ static void test_capacity_clamped(void) {
     CHECK(myds_trace_capacity() == 512);
 }
 
+/* 页面里「耗时」列的口径必须是端到端（含 engine）。
+ *
+ * 这条守的不是 C 代码，而是那段内联 JS 的算法：它曾经漏了 engine，于是
+ * 514 ms 的请求在列表里显示成 0.12 ms —— 数值看着合理，量级错 4000 倍，
+ * 而这类错在页面上根本看不出来。这里把同一公式在 C 里算一遍对账。 */
+static void test_wall_includes_engine(void) {
+    myds_trace_reset();
+    myds_trace_init(8);
+    myds_trace_rec_t r;
+    fill(&r, "/v1/chat/completions", 0.514276);
+    r.phases.queue_s = 0.000034;
+    r.phases.render_s = 0.000013;
+    r.phases.setup_s = 0.000075;
+    myds_trace_record(&r);
+
+    myds_trace_rec_t got;
+    CHECK(myds_trace_get(0, &got));
+    /* 与页面 JS 完全相同的公式 */
+    const double wall = got.phases.queue_s + got.phases.render_s +
+                        got.phases.setup_s + got.phases.engine_s;
+    /* 漏掉 engine 会得到 0.000122，差 4000 倍，任何正常容差都能分开。 */
+    CHECK(wall > 0.514 && wall < 0.515);
+
+    /* 早退请求：engine 未测量 ⇒ 端到端不可知，页面显示 “—” 而不是 0。 */
+    myds_trace_reset();
+    myds_trace_init(8);
+    fill(&r, "/v1/chat/completions", -1.0);
+    r.phases.render_s = -1.0;
+    r.phases.setup_s = -1.0;
+    myds_trace_record(&r);
+    CHECK(myds_trace_get(0, &got));
+    CHECK(got.phases.engine_s < 0.0);
+}
+
 static void test_page_is_html(void) {
     const char *html = myds_trace_page_html();
     CHECK(html != NULL);
@@ -195,6 +229,7 @@ int main(void) {
     test_buffer_too_small_is_an_error();
     test_detail_by_seq();
     test_capacity_clamped();
+    test_wall_includes_engine();
     test_page_is_html();
     myds_trace_reset();
 
