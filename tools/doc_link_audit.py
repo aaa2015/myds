@@ -179,6 +179,15 @@ BENCH_DIR_RE = re.compile(r"benchmarks/[0-9]{4}-[0-9]{2}-[0-9]{2}[a-z0-9-]*")
 # verify it there instead of calling it broken.
 DOCS_REPO = Path.home() / "Projects" / "mydsdoc"
 
+# Evidence directories that live in the documentation repo, not here. Verified
+# once on a host that has both checkouts; re-verified whenever DOCS_REPO exists.
+MOVED_TO_DOCS = (
+    "benchmarks/2026-10-05-engram-io/",
+    "benchmarks/2026-10-05-optimization/",
+    "benchmarks/2026-10-05-phase/",
+    "benchmarks/2026-10-24-indexscore-mask-survey/",
+)
+
 
 def iter_code_blocks(path: Path):
     """Yield (line_no, line, cwd) where cwd is the block's current directory.
@@ -268,17 +277,20 @@ def main() -> int:
                                 for pref in KNOWN_ABSENT_PREFIXES):
                 known.add(f"{rel_md}  {tok}")
                 continue
-            if DOCS_REPO.is_dir():
-                if (DOCS_REPO / tok).is_dir():
-                    moved.add(f"{rel_md}  {tok}")
-                    continue
-            elif (tok + "/").startswith("benchmarks/2026-10-05") or tok == \
-                    "benchmarks/2026-10-24-indexscore-mask-survey":
-                # The documentation repo simply is not checked out on this host.
-                # "I cannot look there" is not "it is missing" -- treating the two
-                # the same is how a gate becomes machine-dependent and gets
-                # disabled. Counted as unverifiable instead.
-                unverifiable_dirs.add(f"{rel_md}  {tok}")
+            if (tok + "/").startswith(MOVED_TO_DOCS):
+                # This evidence moved to the documentation repository
+                # (754edd5: "keep only the pipeline ledger in this repo, move
+                # everything else"). Verify it there when that checkout exists;
+                # when it does not, say so instead of guessing. "I cannot look"
+                # is not "it is missing" -- a gate whose result depends on which
+                # host runs it gets switched off the first time it cries wolf.
+                if DOCS_REPO.is_dir():
+                    if (DOCS_REPO / tok).is_dir():
+                        moved.add(f"{rel_md}  {tok}")
+                    else:
+                        bench_missing.add(f"{rel_md}  {tok}")
+                else:
+                    unverifiable_dirs.add(f"{rel_md}  {tok}")
                 continue
             bench_missing.add(f"{rel_md}  {tok}")
         for lineno, line, cwd in iter_code_blocks(md):
