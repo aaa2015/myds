@@ -11384,47 +11384,104 @@ SHA `a83127b1427b09b703883150f3ec6e8e90e7ecdead3f48b798c7755368bd9d9c`。
 以便重核旧result绑定的台账版本；不改旧实验raw、报告、门限或失败结论。
 
 
-### 81.0 证据可复核性声明（2026-11-01）
+### 81.0 证据可复核性声明与后续追查（2026-11-01）
 
-> ⚠️ **本节引用的证据目录不存在**：`benchmarks/2026-10-24-moe-phys-cause/`
-> —— 本仓库无、`mydsdoc` 仓无、git 全历史无、本机全盘无。本节共 26 处引用，
-> 其中包括的 `executed-source.tar.gz` / `executed-artifacts.tar.gz` / `raw*.tar.gz` /
-> `raw-files.json` / `experiment-result.json` / 各 `*-review.json` 全部无法打开。
+> ⚠️ **本节正文引用的证据目录 `benchmarks/2026-10-24-moe-phys-cause/` 不存在**：
+> 本仓库无、`mydsdoc` 无、git 全历史无、本机全盘无。原因已查明 —— 见下。
 >
-> **可以复核的**：只剩正文里写的 `experiment-plan.json` 的 SHA 字符串本身
-> （`a83127b1…`），以及 `tools/` 下当时的 bench / review 脚本。
->
+> **可以复核的**：`tools/` 下当时的 bench / review 脚本仍在库中。
 > **不能复核的**：resource ID / deferred ADD-drain 链的实际记录、0/1/0 干预读数、
-> 物理峰值回退的实测曲线，以及那个 SHA 指向的文件（它不存在，无法核对）。
->
-> 🔴 **本节还有一个比证据丢失更严重的问题：标题声称「精确制品已采纳」，
-> 但对应的实现不在本仓库。**
->
-> 2026-11-01 实测：
-> - `grep -rn MYDS_PREFILL_PROMPT_VIEW_CLEAR src/ include/` → **0 命中**
-> - `grep -rn MYDS_PREFILL_MOE_WORKSPACE src/ include/` → **0 命中**
-> - `include/myds_knobs_generated.h`（本仓库所有生效开关的权威清单）→ **两者都不在**
-> - `git log --all -S"myds_metal_prefill_prompt_view_clear_enabled" -- src/ include/` → **无任何提交**
-> - 生产 `myds.conf` → **未设置**
->
-> 只有 `tools/bench_moe_workspace_fullmodel_promptclear.c` 这类**测量工具**还在引用它，
-> 而那些工具调用的 `myds_metal_prefill_prompt_view_clear_enabled()` 在 `src/` 里
-> 根本不存在 —— 也就是说 **那批工具现在链接不过**。
->
-> **原因就在本节 81.1 的第一句**：「v4 core 保持独立 exact868 源树，
-> **主工作树尚未应用**」。也就是说：采纳的是那个独立源树里的制品，
-> 而主工作树（= 本仓库）从未合入。标题里的「精确制品已采纳」在账本内部
-> 并不矛盾，但它**对一个只看本节标题的读者是误导的**。
->
-> **所以准确的说法是**：这段改动在独立 exact868 源树里被采纳，
-> 本仓库与生产 `myds.conf` 都没有它。凡是「本仓库现在的代码经过了这次优化」
-> 这类推断都是错的。
->
-> ⚠️ 连带影响：`tools/bench_moe_workspace_fullmodel_promptclear.c` 与
-> `tools/moe_prompt_snapshot_promptclear.inc` 调用的
-> `myds_metal_prefill_prompt_view_clear_enabled()` 不在 `src/` 里，
-> **这批工具在本仓库里链接不过**。它们是为那棵独立源树准备的，
-> 留在 main 上属于跨树残留。是否清理，另行决定（不清也不会误导，只要知道原因）。
+> 物理峰值回退的实测曲线，以及正文里 `a83127b1…` 那个 SHA 指向的文件（不存在）。
+
+#### 81.0.1 「已采纳」是不是真的？—— 是真的
+
+追查结论（2026-11-01，证据均在 macstudio 上）：
+
+| 证据 | 内容 |
+|---|---|
+| `~/Projects/myds-adoptions/promptclear-v4-20261024-run/summary.json` | `"production_adoption": true`、`"status": "adopted_exact_artifact"`、`"actual_pid": 73069`、`"bin_sha256": "9cf2a670…"`；**53 项配置，含 `MYDS_PREFILL_MOE_WORKSPACE=1` 与 `MYDS_PREFILL_PROMPT_VIEW_CLEAR=1`** |
+| `.../adoption-receipt.json` | `status: adopted_exact_artifact`、`production_adoption: true`、含 `original_inodes` 备份 |
+| `~/Projects/myds-releases/promptclear-v4-20261024-9cf2a670/artifacts/myds` | 903,656 B，SHA = `9cf2a670…`，`strings` 里确有那两个环境变量与校验分支 |
+| 同目录 `release-identity.json` | 写着 `"production_adoption": false` |
+
+最后一行**不是矛盾**：`release-identity.json` 的 mtime 是 07:39，
+`summary.json` / `adoption-receipt.json` 是 07:40。前者是**采纳前**拍的不可变快照，
+采纳本身在它之后一分钟发生。看到 `false` 就断定「没采纳」会读反。
+
+#### 81.0.2 证据为什么没了
+
+`adoption-input-manifest.json` 里 11 个证据路径（source/artifacts/gates/plan/probe）
+**全部指向 `/private/tmp/myds-moe-phys-cause-…`**。
+`/private/tmp` 在重启时被清理 —— 实测现在该前缀下一个目录都不剩。
+这不是「被删了」，是「一开始就没落到持久位置」。
+
+#### 81.0.3 真正的问题：采纳的东西现在不在生产里
+
+| 检查 | 2026-10-24 采纳时 | 现在（HEAD `420bf41`，bin `79616ba0…`） |
+|---|---|---|
+| binary 大小 | 903,656 B | **957,000 B** |
+| `MYDS_PREFILL_PROMPT_VIEW_CLEAR` | 字符串存在 | **0 命中** |
+| `MYDS_PREFILL_MOE_WORKSPACE` | 字符串存在 | **0 命中** |
+| 生产配置 | 54 项，两个 flag=1 | **两个 flag 都没有** |
+| 符号 `myds_metal_prefill_prompt_view_clear_enabled` | 存在 | **nm 无输出** |
+
+而且 **canonical 树从来没有这段代码**：9cf2 的四个核心文件 SHA 与
+`gold`（= 基线 `868d94e9`）和当前 HEAD 都不相同，说明采纳的是那棵
+**独立 exact868+v4 树**的产物，主工作树始终没合并。
+
+账本第 41 行说 `9cf2`「已被 §105.6 取代」——作为**冻结身份**是准确的，
+但**没有记下「那个功能也随之消失」**。10-27 之后任何一次从 canonical 的重建，
+都会静默丢掉它。
+
+#### 81.0.4 丢掉的代价与不丢的部分
+
+账本自己的结论是：**「耗时非退化，不宣称提速」**（总 wall 仅 +0.0684% 节约）。
+真正的收益是内存峰值，不是速度：
+
+- phys 峰（grow/retain）：**−432.750 / −432.766 MiB**
+- Metal 峰：**−1821.797 / −2160 MiB**
+
+按 192 GB / 生产 RSS ~157 GB 算，433 MiB 约 **0.2%**。所以**性能上损失很小**，
+不至于翻案。但**流程上是真事故**：一个过完全部门禁、有采纳收据的改动，
+在后续重建中无声消失，而账本没有一行记录这件事。
+
+#### 81.0.5 遗留的跨树残留
+
+`tools/bench_moe_workspace_fullmodel_promptclear.c`、
+`tools/moe_prompt_snapshot_promptclear.inc`、`tools/test_moe_promptclear_native_entry_cpu.py`
+调用 `myds_metal_prefill_prompt_view_clear_enabled()`，而该函数在 `src/` 里不存在。
+三者都**不在 `make test` 里**（已确认），所以不影响门禁，但**单独编译会失败**。
+它们是为那棵独立源树准备的。
+
+#### 81.0.6 好消息：源码完整保存，可以复活
+
+`~/Projects/myds-releases/promptclear-v4-20261024-9cf2a670/executed/source.tar.gz`
+（2,849,345 B，328 个文件）里含**两个完整 stage 源码树**。
+
+实测解包 `stages/stage-001` 的四个核心文件，与采纳记录里的 `core4.candidate`
+**逐字节一致**：
+
+| 文件 | SHA256（前 16 位） | 与 9cf2 candidate |
+|---|---|---|
+| `include/myds_internal.h` | `9869b7692fa8a7fb` | ✅ |
+| `include/myds_metal.h` | `3926c8a7eded05a9` | ✅ |
+| `src/myds_metal.m` | `28344f08a27c6c87` | ✅ |
+| `src/myds_v41.c` | `554387ef6d41612b` | ✅ |
+
+也就是说：**这套优化没有丢，只是没合并。** stage-001 是产生 9cf2 的那棵树。
+
+要复活，需要把 stage-001 的四文件（或对应 diff）合到当前 canonical，
+而 canonical 在这四个文件上已经走了很远（当前值与 stage-001 全部不同），
+所以**不是覆盖，是移植**，并且必须重新过 0-ULP 与组件门。
+
+#### 81.0.7 要回答的两个问题（需要统帅决定）
+
+1. **要不要移植回来？** 收益是内存峰值 −433 MiB / −2.1 GiB（Metal），
+   账本自述「不宣称提速」。代价是四文件移植 + 重跑门禁。
+   当前 192 GB / RSS ~157 GB 的余量下，这 0.2% 是否值得，需要判断。
+2. **要不要立一条规矩**：任何「独立源树采纳」都必须在账本记两件事 ——
+   ①采纳时的制品身份，②**它何时被取代、取代时该功能是否延续**。
+   这次缺的是②，于是丢了一个正式采纳的改动而无人记录。
 
 ### 81.1 v4组件门与诊断入口失败记录
 
