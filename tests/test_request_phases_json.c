@@ -18,6 +18,7 @@
 #include "../src/myds_resp_store.c"
 #include "../src/myds_infer_queue.c"
 #include "../src/myds_dsml.c"
+#include "../src/myds_proto_openai.c"
 
 int main(void) {
     /* Fully measured request. */

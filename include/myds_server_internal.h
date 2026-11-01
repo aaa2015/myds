@@ -75,6 +75,8 @@ void myds_server_non_stream_callback(const char *piece, size_t length, int32_t t
 
 void json_unescape_slice(const char *src, size_t len, char *dst, size_t dst_size);
 int extract_http_header_int(const char *headers, const char *header_name);
+int extract_http_header_str(const char *headers, const char *header_name,
+                            char *out, size_t out_size);
 int json_extract_string_field(const char *json, const char *key, char *out, size_t out_size);
 /* 顶层字段存在性（深度 1），避免误判 input 内容里的同名字样。 */
 bool json_has_top_field(const char *body, const char *key);
@@ -175,6 +177,16 @@ const char *dsml_find(const char *pos, const char *end, const char *lit);
 
 /* json_escape_alloc 转义但不加引号，供 dsml_put_escaped 使用。 */
 char *json_escape_alloc(const char *src, size_t length);
+/* UTF-8 跨 token 分片转义（SSE 每次只拿到一个 token 的字节）。 */
+bool escape_utf8_chunk(myds_utf8_state_t *state, const char *src, size_t length,
+                       bool final, char *dst, size_t dst_size, size_t *out_length);
+
+/* 服务级默认思考模式：--thinking 决定，请求可覆盖。 */
+extern bool g_server_default_thinking;
+int  extract_reasoning_object_effort(const char *body, char *out, size_t out_size);
+const char *cors_origin_header(void);
+/* OpenAI 的 tool_calls 数组（arguments 是 JSON 字符串）。 */
+char *openai_tool_calls_json(const myds_tool_call_t *calls, size_t count);
 
 myds_dsml_state_t myds_dsml_classify(const char *text, size_t len, size_t *content_len);
 /* 正文里出现了「另一套方言」的工具标记（如 <function_calls>）但要按纯文本发出去。
