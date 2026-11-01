@@ -22,6 +22,7 @@ extern "C" {
 #define MYDS_TRACE_PATH_MAX   48
 #define MYDS_TRACE_CLIENT_MAX 48
 #define MYDS_TRACE_FINISH_MAX 40
+#define MYDS_TRACE_RESPID_MAX 48
 
 /* 一个阶段的耗时。负值 = 该请求没有这个阶段（早退、取消、引擎未调用）。 */
 typedef struct {
@@ -40,6 +41,9 @@ typedef struct {
     char     path[MYDS_TRACE_PATH_MAX];
     char     client[MYDS_TRACE_CLIENT_MAX];
     char     finish[MYDS_TRACE_FINISH_MAX];  /* finish_reason 字符串 */
+    /* 客户端拿到的 response id。把它记进追踪的理由：用户报「那次请求慢」时，
+     * 手上有的是响应里的 id，不是这里的序号；两者能对上才有用。 */
+    char     resp_id[MYDS_TRACE_RESPID_MAX];
     myds_trace_phases_t phases;
     uint32_t prompt_tokens;
     uint32_t cached_tokens;

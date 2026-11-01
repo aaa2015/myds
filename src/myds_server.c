@@ -1634,6 +1634,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             snprintf(trec.path, sizeof(trec.path), "%s", path);
             snprintf(trec.client, sizeof(trec.client), "%s:%d", client_ip, client_port);
             snprintf(trec.finish, sizeof(trec.finish), "%s", final_finish_str);
+            snprintf(trec.resp_id, sizeof(trec.resp_id), "%s", resp_id);
             trec.phases.queue_s = phases_record.queue_s;
             trec.phases.render_s = phases_record.render_s;
             trec.phases.setup_s = phases_record.setup_s;

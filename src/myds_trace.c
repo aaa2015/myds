@@ -165,6 +165,8 @@ static void jput_record(jbuf_t *b, const myds_trace_rec_t *r) {
     jput_escaped(b, r->client);
     jput(b, "\",\"finish\":\"");
     jput_escaped(b, r->finish);
+    jput(b, "\",\"resp_id\":\"");
+    jput_escaped(b, r->resp_id);
     jput(b, "\",\"phases\":{\"queue\":");
     jput_stage(b, r->phases.queue_s);
     jput(b, ",\"render\":");
@@ -256,11 +258,15 @@ const char *myds_trace_page_html(void) {
 "align-items:center;flex-wrap:nowrap;overflow:hidden}"
 "h1{font-size:14px;margin:0;font-weight:600}"
 ".meta{color:var(--dim);font-size:12px}"
-"#sys{margin-left:auto;display:flex;gap:14px;align-items:center;font-size:12px;"
+"#sys{margin-left:auto;display:flex;gap:12px;align-items:center;font-size:11px;"
 "flex-wrap:nowrap;white-space:nowrap}"
-".m{display:flex;align-items:center;gap:6px;color:var(--dim)}"
+/* 单行显示：条缩到 40px、间距 10px、字体 11px。原来 70px 条 + 14px 间距在
+ * 1200px 宽的窗口里放不下，flex 就换行了 —— 而这一栏本来就只是背景信息，
+ * 占两行不值得。 */
+".m{display:flex;align-items:center;gap:4px;color:var(--dim);font-size:11px;"
+"white-space:nowrap;flex:0 0 auto}"
 ".m b{color:var(--fg);font-weight:600}"
-".bar{width:70px;height:6px;background:#252a33;border-radius:3px;overflow:hidden}"
+".bar{width:40px;height:5px;background:#252a33;border-radius:3px;overflow:hidden;flex:0 0 auto}"
 ".bar i{display:block;height:100%;background:var(--acc)}"
 "#wrap{display:flex;height:calc(100vh - 41px)}"
 "#list{width:52%;overflow:auto;border-right:1px solid var(--line)}"
@@ -269,6 +275,7 @@ const char *myds_trace_page_html(void) {
 "th,td{padding:5px 8px;text-align:left;white-space:nowrap;border-bottom:1px solid var(--line)}"
 "th{position:sticky;top:0;background:#161a20;color:var(--dim);font-weight:500;z-index:1}"
 "td.num{text-align:right}"
+".rid{max-width:210px;overflow:hidden;text-overflow:ellipsis}"
 "tbody tr{cursor:pointer}"
 "tbody tr:hover{background:#1a1f26}"
 "tbody tr.sel{background:#1e2b38}"
@@ -298,7 +305,7 @@ const char *myds_trace_page_html(void) {
 "<header><h1>myds trace</h1>"
 "<span id=\"sys\"><span id=\"sysbox\" class=\"m\">采样中…</span></span></header>"
 "<div id=\"wrap\"><div id=\"list\"><table><thead><tr>"
-"<th>#</th><th>时间</th><th>path</th><th class=\"num\">prompt</th>"
+"<th>#</th><th>时间</th><th>resp_id</th><th class=\"num\">prompt</th>"
 "<th class=\"num\">out</th><th class=\"num\">TTFT</th>"
 "<th class=\"num\">prefill</th><th class=\"num\">decode</th>"
 "<th class=\"num\">总耗时</th><th>finish</th>"
@@ -337,7 +344,10 @@ const char *myds_trace_page_html(void) {
 "const p=rec.phases;const when=new Date(rec.epoch_ms).toLocaleTimeString();"
 "const wall=p.engine===null?null:p.queue+(p.render||0)+(p.setup||0)+p.engine;"
 "return `<tr data-seq=\"${rec.seq}\"${rec.seq===SEL?' class=\"sel\"':''}>`"
-"+`<td>${rec.seq}</td><td>${when}</td><td>${esc(rec.path)}</td>`"
+"+`<td>${rec.seq}</td><td>${when}</td>`"
+/* resp_id 比 path 长：列表里截断显示，完整值仍在详情与 API 里。
+ * 截断用 CSS ellipsis 而不是 JS 切字符串 —— 切了就没法复制完整 id 了。 */
+"+`<td class=\"rid\" title=\"${esc(rec.resp_id)}\">${esc(rec.resp_id||'—')}</td>`"
 "+`<td class=\"num\">${rec.prompt_tokens}</td>`"
 "+`<td class=\"num\">${rec.out_tokens}</td>`"
 "+`<td class=\"num\">${rec.ttft===null?'—':f(rec.ttft)}</td>`"
@@ -414,9 +424,9 @@ const char *myds_trace_page_html(void) {
 "if(s.mem_used_gb!==null&&s.mem_total_gb){"
 "const pct=100*s.mem_used_gb/s.mem_total_gb;"
 "h+=`<span class=\"m\">内存<span class=\"bar\"><i style=\"width:${pct}%\"></i></span>`"
-"+`<b>${s.mem_used_gb.toFixed(1)} / ${s.mem_total_gb.toFixed(0)} GB (${pct.toFixed(0)}%)</b></span>`;}"
+"+`<b>${s.mem_used_gb.toFixed(0)}/${s.mem_total_gb.toFixed(0)}G ${pct.toFixed(0)}%</b></span>`;}"
 "else h+=meter('内存',null,'');"
-"h+=`<span class=\"m\">进程 RSS <b>${s.self_rss_gb===null?'—':s.self_rss_gb.toFixed(1)+' GB'}</b></span>`;"
+"h+=`<span class=\"m\">RSS <b>${s.self_rss_gb===null?'—':s.self_rss_gb.toFixed(0)+'G'}</b></span>`;"
 "document.getElementById('sysbox').outerHTML=`<span id=\"sysbox\">${h}</span>`;"
 "}catch(e){}}"
 "load();sysload();setInterval(load,3000);setInterval(sysload,3000);"

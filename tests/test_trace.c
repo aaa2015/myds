@@ -271,6 +271,32 @@ static void test_page_js_is_well_formed(void) {
  * 任何错误，因为写错误信息的那行自己抛了 TypeError。看起来就是「一直空白」。
  *
  * 检查方式：脚本里出现的 id 必须在 HTML 里作为 id="..." 存在。 */
+/* resp_id 必须进 JSON，且能被转义安全地带出去。
+ *
+ * 用户报「那次请求慢」时手里有的是响应里的 id，不是追踪里的序号 ——
+ * 两者对得上，这个页面才有排查价值。 */
+static void test_resp_id_recorded(void) {
+    myds_trace_reset();
+    myds_trace_init(8);
+    myds_trace_rec_t r;
+    fill(&r, "/v1/chat/completions", 1.0);
+    snprintf(r.resp_id, sizeof(r.resp_id), "resp_myds_7_abc123");
+    myds_trace_record(&r);
+
+    char buf[2048];
+    CHECK(myds_trace_list_json(buf, sizeof(buf)));
+    CHECK(strstr(buf, "\"resp_id\":\"resp_myds_7_abc123\"") != NULL);
+
+    /* 空 id 也要输出成空串而不是缺失：页面用 rec.resp_id||'—' 兜底，
+     * 字段缺失会让那一列在不同行之间抖动。 */
+    myds_trace_reset();
+    myds_trace_init(8);
+    fill(&r, "/v1/chat/completions", 1.0);
+    myds_trace_record(&r);
+    CHECK(myds_trace_list_json(buf, sizeof(buf)));
+    CHECK(strstr(buf, "\"resp_id\":\"\"") != NULL);
+}
+
 static void test_page_script_refs_exist(void) {
     const char *html = myds_trace_page_html();
     const char *sb = strstr(html, "<script>");
@@ -369,6 +395,7 @@ int main(void) {
     test_capacity_clamped();
     test_wall_includes_engine();
     test_page_js_is_well_formed();
+    test_resp_id_recorded();
     test_page_script_refs_exist();
     test_token_is_injected_into_page();
     test_page_is_html();
