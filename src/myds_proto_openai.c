@@ -115,6 +115,14 @@ char *json_escape_alloc(const char *src, size_t length) {
     return escaped;
 }
 
+/* API 省略 max_tokens 时的默认值。
+ * 2026-10-21: 对齐 deepseek-recipe 的官方口径（deepseek-recipe/src/request/mod.rs）：
+ *   - 非思考模式                    8192
+ *   - 思考模式                       65536
+ *   - 思考模式且 reasoning_effort=max 131072
+ * 之前一律 4096，实测会让"不传 max_tokens"的请求在 4096 token 处硬截断
+ * （completion_tokens=4096, finish_reason=length），而客户端根本无从得知。
+ * 仍然受 CLI 配置上限约束（configured_max_tokens），并保证至少 1。 */
 uint32_t myds_server_default_max_tokens(uint32_t configured_max_tokens, bool thinking,
                                         const char *reasoning_effort) {
     uint32_t want = 8192u;                                  /* DEFAULT_NON_THINKING_MAX_TOKENS */
@@ -1944,4 +1952,40 @@ char *responses_output_items_json_ex(bool thinking, const char *reasoning, size_
 char *responses_output_items_json(const char *content, size_t content_len,
                                   const myds_tool_call_t *calls, size_t count) {
     return responses_output_items_json_ex(false, NULL, 0, content, content_len, calls, count);
+}
+
+char *responses_output_message_json_ex(bool thinking, const char *reasoning, size_t reasoning_len,
+                                       const char *text, size_t text_len) {
+    return responses_output_items_json_ex(thinking, reasoning, reasoning_len, text, text_len, NULL, 0);
+}
+
+/* 文本响应的 output 数组：一条 message 项，文本与增量聚合后的完全一致。 */
+char *responses_output_message_json(const char *text, size_t text_len) {
+    return responses_output_message_json_ex(false, NULL, 0, text, text_len);
+}
+
+/* 工具调用响应的 output 数组（给 response.completed 用）。 */
+char *responses_function_calls_output_json(const myds_tool_call_t *calls, size_t count) {
+    dsml_buf_t out = {0};
+    bool ok = DSML_PUTS(&out, "[");
+    for (size_t i = 0; ok && i < count; ++i) {
+        char ids[32];
+        snprintf(ids, sizeof(ids), "fc_%zu", i + 1);
+        ok = (i == 0 || DSML_PUTS(&out, ",")) &&
+             DSML_PUTS(&out, "{\"type\":\"function_call\",\"id\":\"") &&
+             DSML_PUTS(&out, ids) &&
+             DSML_PUTS(&out, "\",\"call_id\":\"") &&
+             dsml_put_escaped(&out, calls[i].id, strlen(calls[i].id)) &&
+             DSML_PUTS(&out, "\",\"name\":\"") &&
+             dsml_put_escaped(&out, calls[i].name, strlen(calls[i].name)) &&
+             DSML_PUTS(&out, "\",\"arguments\":\"") &&
+             dsml_put_escaped(&out, calls[i].arguments, strlen(calls[i].arguments)) &&
+             DSML_PUTS(&out, "\",\"status\":\"completed\"}");
+    }
+    ok = ok && DSML_PUTS(&out, "]");
+    if (!ok) {
+        free(out.data);
+        return NULL;
+    }
+    return out.data;
 }

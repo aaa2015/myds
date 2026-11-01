@@ -56,6 +56,21 @@ typedef struct {
 } myds_non_stream_ctx_t;
 
 bool myds_server_send_all(int fd, const char *data, size_t length);
+/* 对端是否已关闭（非阻塞 peek）。SSE/非流式回调与 prefill 探针共用。 */
+bool client_disconnected(int fd);
+/* 引擎 prefill 期间回调它；配合 g_prefill_probe_fd 使用。 */
+bool server_client_alive_probe(void *user_data);
+extern int g_prefill_probe_fd;
+/* 单调时钟秒数（SSE 排空截止与请求分阶段计时共用）。 */
+double myds_server_now_s(void);
+/* 组成格式化串（alloc 所有权归调用方）。 */
+char *format_alloc(const char *format, ...);
+/* 把一段正文/收尾事件写进 SSE 流。handle_client 收尾时要用。 */
+bool sse_emit_content(myds_sse_stream_ctx_t *sctx, const char *piece, size_t length, bool final);
+bool sse_emit_responses_close_message(myds_sse_stream_ctx_t *sctx,
+                                      const char *text, size_t text_len);
+/* 一次性生成完整 HTTP 响应（含头部）。 */
+bool send_response(int fd, int code, const char *status, const char *content_type, const char *body);
 uint32_t myds_server_default_max_tokens(uint32_t configured_max_tokens, bool thinking,
                                         const char *reasoning_effort);
 void myds_server_sse_callback(const char *piece, size_t length, int32_t token_id, void *user_data);
