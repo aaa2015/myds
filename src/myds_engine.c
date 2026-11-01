@@ -3561,6 +3561,7 @@ static int myds_generate_internal(myds_context_t *ctx,
     }
     {
         bool snap_hit = false;
+        uint32_t anchor_slot_used = UINT32_MAX;   /* 命中的锚点槽（按槽恢复用） */
         uint32_t L = 0;                    /* 与【上一条请求序列】的公共前缀长度 */
         const bool have_prev = pcache_on && ctx->pcache_tokens && ctx->pcache_len;
         if (have_prev)
@@ -3605,7 +3606,7 @@ static int myds_generate_internal(myds_context_t *ctx,
             for (uint32_t i = 0; i < (uint32_t)n_prompt - 1u; i++) {
                 if (prompt_tokens[i] == 128803) { ap = i + 1u; break; }
             }
-            if (ap >= 4u && ap < (uint32_t)n_prompt - 1u && ctx->anchor_slots > 0) {
+            if (ap >= 4u && ap < (uint32_t)n_prompt - 1u && ctx->anchor_slots > 0 && ap <= L) {
                 /* 2026-10-24：多套 —— 恢复进第一个空套；全都占满则替换最短的一套。
                  * （磁盘锚点目前对长 prompt 写入失败，见账本 §96.4；这条路径保留是为
                  *   了短系统提示词能跨重启恢复。）
@@ -3638,13 +3639,33 @@ static int myds_generate_internal(myds_context_t *ctx,
             const uint32_t best_len = myds_v41_anchor_pick(
                 prompt_tokens, (uint32_t)n_prompt, ctx->anchor_tokens,
                 ctx->anchor_len, ctx->anchor_slots, &best_i);
-            if (best_len) {
+            /* ★ 2026-11-01：锚点能不能用，取决于【常驻的 compressed / index_cache
+             * 在 [0, best_len) 上是不是同一串 token 产生的】。
+             *
+             * 这两块缓冲是按位置索引的常驻数组（不是按会话隔离的），decode 直接读。
+             * 锚点槽只保存末尾 128 token 的窗口环与压缩器跨步状态，存不下 [0,len) 的
+             * 压缩 KV。所以「恢复锚点」只在前缀没被别人改写时才成立。
+             *
+             * L 就是「常驻序列」与本次 prompt 的公共前缀长度（见上方），
+             * 它恰好等于「[0, L) 的常驻状态确实来自这串 token」的保证。
+             * 于是判据只需一条：best_len <= L。
+             *
+             * 反例（实测）：ALPHA 与 BRAVO 两套系统提示词交替请求，
+             * 对 A 来说 L 只有十几，而锚点长 2742 —— 旧实现照样复用，
+             * 结果是 A 读着 B 的压缩 KV 答题，无日志无报错。 */
+            if (best_len && best_len <= L) {
                 resume_from = best_len;
                 snap_hit = true;
+                anchor_slot_used = myds_anchor_slot(best_i);
                 MYDS_LOG_I("prefix cache: prompt %d tok -> resume from ANCHOR #%u at %u "
                            "(reuse %u tok, still to prefill %u)",
                            n_prompt, best_i, best_len, best_len,
                            (uint32_t)n_prompt - 1u - best_len);
+            } else if (best_len) {
+                MYDS_LOG_W("prefix cache: ANCHOR #%u at %u NOT usable - the resident compressed KV "
+                           "only matches the first %u tokens (another session overwrote it). "
+                           "Full prefill instead of reusing a foreign state.",
+                           best_i, best_len, L);
             }
         }
 
@@ -3679,7 +3700,12 @@ static int myds_generate_internal(myds_context_t *ctx,
         }
 
         /* 快照续跑必须把状态装回去（engram tail + 各层窗口环）；装不回去就退回全量。 */
-        if (snap_hit && (!ctx->v41 || !myds_v41_snapshot_restore(ctx->v41, resume_from))) {
+        bool restored_ok = false;
+        if (snap_hit && ctx->v41)
+            restored_ok = (anchor_slot_used != UINT32_MAX)
+                ? myds_v41_snapshot_restore_slot(ctx->v41, anchor_slot_used, resume_from)
+                : myds_v41_snapshot_restore(ctx->v41, resume_from);
+        if (snap_hit && !restored_ok) {
             MYDS_LOG_W("prefix cache: snapshot restore at %u failed -> full prefill", resume_from);
             resume_from = 0;
         }

@@ -52,6 +52,9 @@ int myds_v41_engram_project_round_probe(const myds_v41_context_t *context,
  * 「客户端每次都当新对话、只带系统提示词」这一类（严格续写之外的）用法。 */
 uint32_t myds_v41_snapshot_best(const myds_v41_context_t *context, uint32_t common);
 bool     myds_v41_snapshot_restore(myds_v41_context_t *context, uint32_t position);
+/* 2026-11-01：按指定槽恢复。两个锚点可能同长不同前缀，按位置恢复会挑错槽。 */
+bool     myds_v41_snapshot_restore_slot(myds_v41_context_t *context, uint32_t slot,
+                                        uint32_t position);
 /* 丢弃位置 > keep_up_to 的快照（本次请求会从那里开始写，更早的点仍然有效）。 */
 void     myds_v41_snapshot_clear(myds_v41_context_t *context, uint32_t keep_up_to);
 /* prefill 结束后记下当前状态（末尾槽），供下一个共享前缀的请求复用。 */

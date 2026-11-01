@@ -405,14 +405,16 @@ uint32_t myds_v41_snapshot_best(const myds_v41_context_t *g, uint32_t common) {
 }
 /* 把某点的【全部】状态装回去：engram tail + 各层窗口环 + 压缩器跨步状态
  * ★ 批量提交：与 store_now 同理，48 次复制编进同一 command buffer。 */
-bool myds_v41_snapshot_restore(myds_v41_context_t *g, uint32_t p) {
-    lowkv_join(g);   /* restore 会改活窗口环；与线程读的 snap_window 同源 */
-    if (!myds_metal_commit_batch()) return false;
-    /* 2026-10-24：遍历到 V41_SLOT_CAPACITY（含锚点区）。锚点槽是「位置 p 的可续跑状态」，
-     * 恢复时按 p 精确匹配 ⇒ 只有在 engine 已确认前缀一致、并把 resume_from 设成
-     * anchor_len 之后才会命中，不存在误用。 */
-    for (uint32_t s = 0; s < V41_SLOT_CAPACITY; ++s) {
-        if (g->snap_pos[s] != p) continue;
+/* 2026-11-01：按【指定槽】恢复。
+ *
+ * 为什么必须能指定：两套不同的系统提示词可以恰好一样长（实测 ALPHA/BRAVO 都是
+ * 2742 tok 的情况很常见）。此时两个锚点槽的 snap_pos 相同，而下面的
+ * myds_v41_snapshot_restore 是「取第一个 snap_pos == p 的槽」——
+ * 于是一套前缀可能装上另一套的窗口环，正是本次要修的那类串台。
+ * engine 已经知道命中的是哪个套（best_i），就该照着那个槽装。 */
+static bool snapshot_restore_from_slot(myds_v41_context_t *g, uint32_t s, uint32_t p) {
+    if (!g || s >= V41_SLOT_CAPACITY || g->snap_pos[s] != p) return false;
+    {
         /* 开一个新 batch，把全部复制编进同一 command buffer。 */
         if (!myds_metal_begin_batch()) return false;
         const size_t bytes = (size_t)V41_WINDOW * V41_HEAD_DIM * 4u;
@@ -437,6 +439,27 @@ restore_fail:
         return false;
     }
     return false;
+}
+
+/* 按位置恢复（沿第一个 snap_pos == p 的槽）。
+ * 环形快照的槽是按 position/stride 分配的，不会重复；但有【锚点】参与时
+ * 同长度不同前缀的两个锚点会撞车 ⇒ 走锚点时请改用下面那个按槽号的版本。 */
+bool myds_v41_snapshot_restore(myds_v41_context_t *g, uint32_t p) {
+    lowkv_join(g);   /* restore 会改活窗口环；与线程读的 snap_window 同源 */
+    if (!myds_metal_commit_batch()) return false;
+    for (uint32_t s = 0; s < V41_SLOT_CAPACITY; ++s) {
+        if (g->snap_pos[s] != p) continue;
+        return snapshot_restore_from_slot(g, s, p);
+    }
+    return false;
+}
+
+/* 按【指定槽】恢复。engine 命中某个锚点时必须用它：同长度不同前缀的锚点
+ * 在 snap_pos 上无法区分，只能靠套号。 */
+bool myds_v41_snapshot_restore_slot(myds_v41_context_t *g, uint32_t slot, uint32_t p) {
+    lowkv_join(g);
+    if (!myds_metal_commit_batch()) return false;
+    return snapshot_restore_from_slot(g, slot, p);
 }
 
 /* ── 投机解码轻量状态快照与回退 ── */
