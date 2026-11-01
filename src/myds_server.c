@@ -394,6 +394,19 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
     if (strncmp(path, "/trace", 6) == 0) {
         char presented[256] = "";
         extract_http_header_str(req_buf, "X-Debug-Token", presented, sizeof presented);
+        /* 浏览器打不开一个需要自定义 header 的页面 —— 没有插件就带不上 X-Debug-Token。
+         * 所以允许 ?token=。取舍：token 会进浏览器历史与本机日志，对回环/内网可接受；
+         * 一旦要对外暴露这个页面，就必须改成 form POST 或会话 cookie。
+         * header 优先，query 只在 header 为空时使用，避免两者冲突时判断不清。 */
+        if (!presented[0]) {
+            const char *q = strstr(path, "token=");
+            if (q) {
+                size_t n = strcspn(q + 6, "&");
+                if (n >= sizeof(presented)) n = sizeof(presented) - 1;
+                memcpy(presented, q + 6, n);
+                presented[n] = '\0';
+            }
+        }
         const bool loopback = g_debug_is_loopback != NULL && g_debug_is_loopback(client_ip);
         const bool token_ok = g_debug_token_ok != NULL && g_debug_token_ok(presented);
         if (!(loopback && token_ok && g_debug_enabled && g_debug_enabled())) {
