@@ -120,7 +120,19 @@ fi
 # 记录在【构建侧】写（只有构建侧知道源码树状态），随产物一起送过去，
 # 由 `make deploy-check` 在运行侧核对。
 echo "🧾 记录构建溯源"
-python3 "$MYDS_SRC/tools/build_provenance.py" write --out bin/BUILD-INFO.json | sed 's/^/   /'
+PROV_OUT=$(python3 "$MYDS_SRC/tools/build_provenance.py" write --out bin/BUILD-INFO.json)
+echo "$PROV_OUT" | sed 's/^/   /'
+# 产物比源码旧 ⇒ 没重编过。这时部署等于把一个不代表当前源码的二进制推上去，
+# 而溯源记录会照着当前源码写，看起来一切正常。实测踩过：新增一个配置开关，
+# 头文件更新了但二进制没重链，生产启动被配置门禁拒绝（开关「没有代码读取」）。
+# 默认拒绝；确实想推旧产物时显式 --allow-stale。
+if echo "$PROV_OUT" | grep -q "STALE ARTIFACTS"; then
+    if [[ "${ALLOW_STALE:-0}" != "1" ]]; then
+        echo "❌ 产物比源码旧：先 make 再部署，或设 ALLOW_STALE=1 强制。" >&2
+        exit 1
+    fi
+    echo "⚠️  ALLOW_STALE=1：明知产物陈旧仍继续部署。"
+fi
 # 记录和检查器都要送到对端：部署只传产物不传源码，若目标机的检出停在旧提交，
 # `make deploy-check` 这个目标根本不存在 —— 而「两边不一致」恰恰最需要它。
 #

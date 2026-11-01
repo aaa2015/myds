@@ -101,6 +101,50 @@ def dirty_build_paths() -> list[str]:
     return [ln for ln in out.splitlines() if ln.strip()]
 
 
+def mtime(p: Path) -> float:
+    try:
+        return p.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+METAL_INPUTS = ("metal",)
+
+
+def metal_files() -> list[Path]:
+    """Only .metal sources: the metallib depends on these and nothing else here."""
+    base = ROOT / "metal"
+    if not base.exists():
+        return []
+    return [p for p in sorted(base.rglob("*.metal")) if p.is_file()]
+
+
+def newest_mtime_of(files: list[Path]) -> tuple[float, str]:
+    best_t, best_f = 0.0, ""
+    for p in files:
+        t = mtime(p)
+        if t > best_t:
+            best_t, best_f = t, p.relative_to(ROOT).as_posix()
+    return best_t, best_f
+
+
+def newest_source_mtime() -> tuple[float, str]:
+    """Newest mtime among build inputs, plus which file it was.
+
+    This is the check that the fingerprint cannot do. A fingerprint says "this
+    source tree", not "this binary was built from it". `make test` does not
+    rebuild bin/myds, so it is entirely possible to edit a source file, run the
+    suite, deploy, and ship a binary that predates the edit -- with a provenance
+    record that happily claims otherwise, because the record is written from the
+    source at deploy time.
+
+    That happened here: the CIDR switch was added to the knob header, the binary
+    was never relinked, and production refused to start because the compiled knob
+    table did not contain a name the source clearly read.
+    """
+    return newest_mtime_of(build_files())
+
+
 def sha256_file(p: Path) -> str:
     try:
         return hashlib.sha256(p.read_bytes()).hexdigest()
@@ -127,6 +171,20 @@ def write(out_rel: str) -> int:
             "bin/myds.metallib": sha256_file(ROOT / "bin" / "myds.metallib"),
         },
     }
+    # 陈旧检查：产物必须比所有构建输入都新。不满足就是「没重编」，
+    # 那份二进制不代表当前源码 —— 记录下来但必须让调用方看见。
+    # 每个产物只与它真正的输入比较。metallib 只依赖 .metal ——
+    # 拿它跟 C 头文件比会让每次改 C 代码都误报「metallib 陈旧」。
+    stale: list[str] = []
+    for rel, deps in (("bin/myds", build_files()), ("bin/myds.metallib", metal_files())):
+        art = ROOT / rel
+        if not art.exists() or not deps:
+            continue
+        t, f = newest_mtime_of(deps)
+        if t > mtime(art) + 1.0:
+            stale.append(f"{rel} is older than {f}")
+    rec["stale_artifacts"] = stale
+
     out = ROOT / out_rel
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(rec, indent=2) + "\n")
@@ -134,6 +192,10 @@ def write(out_rel: str) -> int:
     print(f"  commit            : {rec['commit_short']} ({rec['branch']})")
     print(f"  source fingerprint: {fp[:16]}  ({n} files)")
     print(f"  dirty build paths : {len(rec['dirty_build_paths'])}")
+    if rec["stale_artifacts"]:
+        print("  STALE ARTIFACTS -- the binary predates the source:")
+        for s_ in rec["stale_artifacts"]:
+            print(f"      {s_}")
     for ln in rec["dirty_build_paths"]:
         print(f"      {ln}")
     return 0
@@ -174,6 +236,16 @@ def verify(file_rel: str) -> int:
         problems.append(msg)
     elif rec.get("effective_flags") != flags:
         problems.append("effective compile flags differ from the recorded build")
+
+    for rel, deps in (("bin/myds", build_files()), ("bin/myds.metallib", metal_files())):
+        art = ROOT / rel
+        if not art.exists() or not deps:
+            continue
+        t, f = newest_mtime_of(deps)
+        if t > mtime(art) + 1.0:
+            problems.append(f"{rel} predates {f}\n"
+                            "      it was never rebuilt after that edit, so it does "
+                            "not implement this source tree")
 
     for rel, want in (rec.get("artifacts") or {}).items():
         got = sha256_file(ROOT / rel)
