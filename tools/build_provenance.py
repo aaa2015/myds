@@ -54,14 +54,22 @@ def build_files() -> list[Path]:
     return out
 
 
-def effective_flags() -> str:
-    """Ask make for the flags it would actually use. Empty if make is absent."""
+def effective_flags() -> tuple[str, str]:
+    """Ask make for the flags it would actually use.
+
+    Returns (flags, error). An empty flags with a non-empty error means "this
+    checkout cannot tell me", which is a different claim from "the flags are
+    different" -- conflating them would report a stale checkout as a rebuild.
+    """
     try:
         r = subprocess.run(["make", "--no-print-directory", "provenance-flags"],
                            cwd=ROOT, capture_output=True, text=True, timeout=60)
-        return r.stdout if r.returncode == 0 else ""
-    except Exception:
-        return ""
+    except Exception as e:
+        return "", f"could not run make: {e}"
+    if r.returncode != 0:
+        first = (r.stderr or r.stdout).strip().splitlines()
+        return "", (first[-1] if first else f"make exited {r.returncode}")
+    return r.stdout, ""
 
 
 def fingerprint() -> tuple[str, int, str]:
@@ -73,10 +81,10 @@ def fingerprint() -> tuple[str, int, str]:
         h.update(rel.encode())
         h.update(b"\0")
         h.update(hashlib.sha256(p.read_bytes()).digest())
-    flags = effective_flags()
+    flags, err = effective_flags()
     h.update(b"\0flags\0")
     h.update(flags.encode())
-    return h.hexdigest(), len(files), flags
+    return h.hexdigest(), len(files), (flags, err)
 
 
 def git(*args: str) -> str:
@@ -101,7 +109,9 @@ def sha256_file(p: Path) -> str:
 
 
 def write(out_rel: str) -> int:
-    fp, n, flags = fingerprint()
+    fp, n, (flags, flags_err) = fingerprint()
+    if flags_err:
+        print(f"WARN: could not read effective flags: {flags_err}")
     rec = {
         "schema_version": 1,
         "written_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -144,7 +154,7 @@ def verify(file_rel: str) -> int:
         print(f"FAIL -- {file_rel} is not readable JSON: {e}")
         return 1
 
-    fp, n, flags = fingerprint()
+    fp, n, (flags, flags_err) = fingerprint()
     rec_fp = rec.get("source_fingerprint", "")
     problems: list[str] = []
 
@@ -154,7 +164,15 @@ def verify(file_rel: str) -> int:
             f"      the deployed binary was built from different source than this checkout")
     if rec.get("source_file_count") != n:
         problems.append(f"build input count differs: recorded {rec.get('source_file_count')}, current {n}")
-    if rec.get("effective_flags") != flags:
+    if flags_err:
+        unsupported = "No rule to make target" in flags_err or "deploy-check" in flags_err
+        msg = (f"cannot read this checkout's build flags ({flags_err}).\n"
+               "      It predates the provenance targets, or make is unavailable, so\n"
+               "      source and deployment cannot be compared at all")
+        if unsupported:
+            msg += " -- pull this checkout first"
+        problems.append(msg)
+    elif rec.get("effective_flags") != flags:
         problems.append("effective compile flags differ from the recorded build")
 
     for rel, want in (rec.get("artifacts") or {}).items():
