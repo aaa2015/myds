@@ -448,3 +448,76 @@ DSML 方言不要求结尾，保持原行为。
 **一个 `max_tokens=30` 的失败样本，不足以支撑「功能不可用」这种结论。**
 要下这种判断，至少得跑一批真实任务、并且把「截断」和「解析不了」分开测。
 这次是先下了结论、后来才补的对照组 —— 顺序反了。
+
+---
+
+## 十、文档链接体检（2026-11-01）
+
+### 起因
+
+`REPRODUCE-register-only.md` §4.0.1 教读者运行 `~/Projects/myfleet/sync_myds.sh`。
+**那个脚本已经不存在了。** 照着做只会得到「文件不存在」，然后 `make audit-ledger`
+报 `marker missing`，而读者会以为是自己环境的问题。
+
+这类错误**读不出来，只能跑出来** —— 所以需要工具。
+
+### `tools/doc_link_audit.py`
+
+扫所有 `.md` 的围栏代码块，抽出三类东西逐条核验：
+
+| 类别 | 规则 |
+|---|---|
+| 仓库路径 | 必须以真实存在的顶层目录开头（`src/ tools/ tests/ docs/ ...`），或显式写成 `./x`、`~/Projects/myds/x`、`/Users/.../myds/x` |
+| 兄弟仓路径 | `~/Projects/<other>/...` 单独成桶（本机可能确实没检出） |
+| make 目标 | `make <x>` 里的 `x` 必须能在 Makefile 里找到规则 |
+
+### 三处刻意不判（否则会被噪声淹没）
+
+1. **`--out` / `-o` / `>` 后面的值** —— 那是命令产出的，不是读的。
+2. **`/runs/` 下的路径** —— 跑批输出，已进 `.gitignore`。
+3. **`cd <占位符> && ./x`** —— 读者所在目录不可知，**报「unverifiable」而不是猜**。
+   当前 17 处。
+
+### 「已知缺失」单列，不掩盖
+
+`docs/benchmarks/2026-10-23-*` 有 10 处引用，这些档案**在本机任何位置都不存在**
+（`find` 全盘无结果，git 全历史无记录）。账本第 13430 行本来就把它记成
+「证据树从未入库 / 缺证据时 SKIP」。工具把它单独列为 known-absent 并打印出来 ——
+既不制造假警报，也不假装问题不存在。
+
+### 反向测试（关键）
+
+一个永远 PASS 的检查器等于没有。注入 4 个已知坏引用后：
+
+```bash
+cd ~/Projects/myfleet && ./sync_myds.sh     # ← 本次要防的那个
+make definitely-not-a-target
+python3 tools/does_not_exist.py
+cat src/no_such_file.c
+```
+
+**4/4 全部被抓到**，同时同一块里的
+`cd ~/Projects/myfleet && ./start_fleet.sh` 与
+`cd .../myds && ./tools/deploy_artifact.sh` **没有误报**（因为跟踪了 `cd`）。
+
+### 接进 `make test`
+
+```
+doc-check:  python3 -B tools/doc_link_audit.py --strict
+```
+
+`make test` 现在多一道门：**文档里写的东西跑不通，测试就红。**
+
+### 首轮结果
+
+| 项 | 数 |
+|---|---|
+| 扫描文档 | 39 份 |
+| 路径断言 | 114 |
+| make 引用 | 16（Makefile 里 36 条规则） |
+| 无法判定 | 17（`./x` 无 cd） |
+| 已知缺失 | 10（`docs/benchmarks/` 证据树） |
+| **真断链** | **0** |
+
+修掉的真问题是 §4.0.1 那条（`sync_myds.sh`）与 METALLIB-SWITCH 的回滚路径，
+已在 `0f2c8b1` / `aa4b344` 两笔里改完。

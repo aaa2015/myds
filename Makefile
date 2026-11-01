@@ -210,6 +210,15 @@ test-register-only-service-window:
 audit-ledger:
 	python3 -B tools/audit_ledger_105.py
 
+# Every path, script and make target the docs tell a reader to run must exist.
+# Written after REPRODUCE-register-only.md spent weeks instructing readers to run
+# ~/Projects/myfleet/sync_myds.sh, which had been deleted -- a doc bug you can
+# only find by running the command, never by reading.
+# Blind spot, by design: `cd <placeholder> && ./x` is counted as unverifiable
+# rather than guessed at.
+doc-check:
+	python3 -B tools/doc_link_audit.py --strict
+
 # Regenerate the ledger's §105/§106 tables and expected.json from raw/*.jsonl.
 # Run this after touching anything under benchmarks/register_only_2026-10-27/raw/.
 gen-ledger:
@@ -836,6 +845,7 @@ test: check-knobs $(ALL_TESTS) $(METALLIB)
 	@echo ""
 	@python3 tests/test_http_bytes.py
 	@python3 tests/test_startup_gates.py
+	@$(MAKE) --no-print-directory doc-check
 	@python3 tests/test_stream_bench.py
 	@python3 tests/test_indexer_k_resident_builder.py
 	@python3 -B tests/test_indexer_register_only_host.py
