@@ -54,7 +54,10 @@ KNOWN_ABSENT_NOTE = (
 # Arguments whose value is produced by the command itself.
 OUTPUT_FLAGS = ("--out", "--output", "--log", "-o", ">>", ">")
 
-FENCE_RE = re.compile(r"^```(\w*)")
+FENCE_RE = re.compile(r"^```([\w+-]*)")
+
+# Languages whose fenced blocks are commands the reader is meant to run.
+SHELL_LANGS = {"", "bash", "sh", "zsh", "shell", "console", "shell-session"}
 # One path-ish token: no whitespace, no shell metacharacters.
 TOKEN_RE = re.compile(r"[^\s'\"`|;&()<>]+")
 MAKE_RE = re.compile(r"(?:^|[;&|]\s*)\s*(?:cd\s+[^\s;&|]+\s*&&\s*)*make\s+((?:-\S+\s+)*)([^\s;&|]+)")
@@ -156,13 +159,22 @@ def iter_code_blocks(path: Path):
     than a false hit).
     """
     inside = False
+    lang = ""
     cwd: Path | bool | None = None
     for n, line in enumerate(path.read_text(errors="replace").splitlines(), 1):
-        if FENCE_RE.match(line):
+        m = FENCE_RE.match(line)
+        if m:
             inside = not inside
-            cwd = None
+            if inside:
+                lang = m.group(1).lower()
+                cwd = None
             continue
         if not inside:
+            continue
+        # Only shell-ish blocks are instructions to run. A block tagged `text`
+        # or `c` may quote a command as an example (the audit's own negative
+        # test does exactly that) -- auditing it would be a false alarm.
+        if lang not in SHELL_LANGS:
             continue
         for m in CD_RE.finditer(line):
             target = m.group(1).strip("'\"")

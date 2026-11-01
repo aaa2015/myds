@@ -489,12 +489,15 @@ DSML 方言不要求结尾，保持原行为。
 
 一个永远 PASS 的检查器等于没有。注入 4 个已知坏引用后：
 
-```bash
+```text
 cd ~/Projects/myfleet && ./sync_myds.sh     # ← 本次要防的那个
 make definitely-not-a-target
 python3 tools/does_not_exist.py
 cat src/no_such_file.c
 ```
+
+（用 `text` 而不是 `bash` —— 工具只审 shell 块，否则这几个**故意写坏的例子**
+会被自己抓走。这不是绕过检查，是区分「要执行的命令」和「引用的文本」。）
 
 **4/4 全部被抓到**，同时同一块里的
 `cd ~/Projects/myfleet && ./start_fleet.sh` 与
