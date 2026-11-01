@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <signal.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -114,6 +115,17 @@ int server_response_format_kind(const char *body);
 bool resp_id_is_live(const char *id);
 bool resp_id_seen(const char *id);
 void resp_id_invalidate_all(void);
+
+/* 服务运行标志：信号处理器写它，多个地方读它。
+ * 2026-11-01 拆分时暴露出来 —— 队列的排队等待循环必须能看见服务正在关闭。 */
+extern volatile sig_atomic_t g_running;
+
+/* 推理名额队列（myds_infer_queue.c）。
+ * 返回 0 = 拿到名额；-1 = 队列已满；-2 = 排队超时。调用方拿到名额后
+ * 还要自己取 g_infer_mutex —— 队列只决定「轮到谁」，不决定「谁在跑」。 */
+int  server_acquire_infer_slot(int timeout_ms, int max_depth);
+void server_release_infer_slot(void);
+uint32_t server_infer_queue_depth(void);
 
 void server_vjob_gpu_lock(void);
 void server_vjob_gpu_unlock(void);

@@ -35,7 +35,7 @@ SRCS_C = src/myds_cpu.c src/myds_log.c src/myds_configfile.c src/myds_gguf.c src
          src/myds_engram.c src/myds_engram_cpu.c src/myds_moe_cpu.c src/myds_dspark.c \
          src/myds_vispre.c src/myds_visw.c src/myds_visfwd.c src/myds_vjob.c \
            src/myds_kvdsk.c \
-         src/myds_server.c src/myds_resp_store.c \
+         src/myds_server.c src/myds_resp_store.c src/myds_infer_queue.c \
          src/myds_steer.c src/myds_steer_alpha.c
 SRCS_M = src/myds_metal.m
 OBJS_C = $(patsubst src/%.c, $(BUILD_DIR)/%.o, $(SRCS_C))
@@ -514,7 +514,7 @@ test-kprof: $(TEST_KPROF)
 .PHONY: test-kprof
 
 # Metadata/tokenizer-only input audit. No Metal framework, model loader or GPU.
-$(BIN_DIR)/count_chat_tokens: tools/count_chat_tokens.c src/myds_server.c src/myds_resp_store.c src/myds_gguf.c src/myds_tokenizer.c src/myds_log.c $(wildcard include/*.h) src/myds_tokenizer_unicode.h | $(BIN_DIR)
+$(BIN_DIR)/count_chat_tokens: tools/count_chat_tokens.c src/myds_server.c src/myds_resp_store.c src/myds_infer_queue.c src/myds_gguf.c src/myds_tokenizer.c src/myds_log.c $(wildcard include/*.h) src/myds_tokenizer_unicode.h | $(BIN_DIR)
 	$(CC) $(CFLAGS) $(filter %.c,$^) -Wl,-dead_strip -lpthread -lm -o $@
 
 $(TEST_GGUF): $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/test_gguf.o | $(BIN_DIR)
@@ -538,7 +538,7 @@ test-steer-alpha: $(TEST_STEER_ALPHA)
 $(TEST_STEER_ALPHA): tests/test_steer_alpha.c src/myds_steer_alpha.c include/myds_steer_alpha.h | $(BIN_DIR)
 	$(CC) $(CFLAGS) -Iinclude tests/test_steer_alpha.c src/myds_steer_alpha.c $(LDFLAGS) -o $@
 
-$(TEST_SERVER): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_resp_store.o $(BUILD_DIR)/myds_vjob.o $(BUILD_DIR)/myds_vispre.o $(BUILD_DIR)/myds_visw.o $(BUILD_DIR)/myds_visfwd.o $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_engram_cpu.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_knobs.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/myds_steer.o $(BUILD_DIR)/test_server.o $(METALLIB) | $(BIN_DIR)
+$(TEST_SERVER): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_resp_store.o $(BUILD_DIR)/myds_infer_queue.o $(BUILD_DIR)/myds_vjob.o $(BUILD_DIR)/myds_vispre.o $(BUILD_DIR)/myds_visw.o $(BUILD_DIR)/myds_visfwd.o $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_engram_cpu.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_knobs.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/myds_steer.o $(BUILD_DIR)/test_server.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
 
 # 图片块区间对齐：纯头文件（myds_align.h），不需要任何 .c。
@@ -657,7 +657,7 @@ $(PROBE_HC_NORM_ACC): tests/probe_hc_norm_acc.c $(filter-out $(BUILD_DIR)/main.o
 $(TEST_LOG): $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_log.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@
 
-$(TEST_SERVER_API): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_resp_store.o $(BUILD_DIR)/myds_vjob.o $(BUILD_DIR)/myds_vispre.o $(BUILD_DIR)/myds_visw.o $(BUILD_DIR)/myds_visfwd.o $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_engram_cpu.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_knobs.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/myds_steer.o $(BUILD_DIR)/test_server_api.o $(METALLIB) | $(BIN_DIR)
+$(TEST_SERVER_API): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_resp_store.o $(BUILD_DIR)/myds_infer_queue.o $(BUILD_DIR)/myds_vjob.o $(BUILD_DIR)/myds_vispre.o $(BUILD_DIR)/myds_visw.o $(BUILD_DIR)/myds_visfwd.o $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_engram_cpu.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_knobs.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/myds_steer.o $(BUILD_DIR)/test_server_api.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
 
 # CPU-only failure-path gate; includes server.c to exercise its private renderers.
