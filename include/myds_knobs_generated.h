@@ -256,7 +256,7 @@ static const myds_knob_t myds_knobs_generated[] = {
     {"MYDS_TRACE_LAYER", "src/myds_engine.c", 2341, 1},
     {"MYDS_TRACE_POS", "src/myds_engine.c", 2342, 1},
     {"MYDS_TRACE_PREFIX", "src/myds_engine.c", 2327, 1},
-    {"MYDS_TRACE_RECORDS", "src/myds_server.c", 1837, 1},
+    {"MYDS_TRACE_RECORDS", "src/myds_server.c", 1843, 1},
     {"MYDS_TREE_SPEC", "src/myds_v41.c", 6509, 1},
     {"MYDS_V41_GEMV_NR0", "src/myds_metal.m", 4757, 1},
     {"MYDS_VIEW_CNT", "src/myds_metal.m", 2826, 1},

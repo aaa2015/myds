@@ -727,6 +727,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         trec_fail.phases.prefill_s = -1.0; trec_fail.phases.decode_s = -1.0;
         trec_fail.phases.unattributed_s = -1.0;
         trec_fail.ttft_s = -1.0; trec_fail.prefill_tps = -1.0; trec_fail.decode_tps = -1.0;
+        trec_fail.cache_hit_rate = -1.0;
         trec_fail.stream = stream ? 1 : 0;
         /* 排队与背压保护：在解析与任何 GPU 工作（包括视觉处理）前统一获取推理名额 */
         int q_timeout_ms = 60000;
@@ -1677,6 +1678,11 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
              *   decode_tps  生成阶段；取消/失败时是负值 ⇒ null，不是 0
              * 原实现用 ttft 反推 prefill 速率，实测会让复用命中的轮次看起来极慢
              * —— 固定开销摊在极少量 token 上。这里直接取引擎的计时。 */
+            /* 前缀缓存命中率。用 pf.cached_tokens 而不是 ctx 上的旧值 ——
+             * pf 是本请求的统计，ctx 上的值在早退时会是上一次请求的残值。
+             * 没有 prompt 统计 ⇒ 负值 ⇒ 页面显示「—」，不是 0%。 */
+            trec.cache_hit_rate = (pf.valid && pf.prompt_tokens > 0)
+                ? 100.0 * (double)pf.cached_tokens / (double)pf.prompt_tokens : -1.0;
             trec.ttft_s = (final_tokens > 0 && t_first > t_arrive) ? (t_first - t_arrive) : -1.0;
             /* 必须要求 prefill_tokens > 0：整个 prompt 都命中缓存时 tokens 是 0，
              * 0/seconds 会算出 0.0 t/s —— 页面显示「prefill 0 t/s」，

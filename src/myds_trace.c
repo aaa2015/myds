@@ -74,6 +74,7 @@ uint64_t myds_trace_begin(const char *path, const char *client, const char *resp
     r.phases.decode_s = -1.0;
     r.phases.unattributed_s = -1.0;
     r.ttft_s = -1.0;
+    r.cache_hit_rate = -1.0;
     r.prefill_tps = -1.0;
     r.decode_tps = -1.0;
     r.in_flight = 1;
@@ -228,6 +229,8 @@ static void jput_record(jbuf_t *b, const myds_trace_rec_t *r) {
           "\"out_tokens\":%u,\"stream\":%s",
           r->in_flight ? "true" : "false",
           r->prompt_tokens, r->cached_tokens, r->out_tokens, r->stream ? "true" : "false");
+    jput(b, ",\"cache_hit_rate\":");
+    jput_stage(b, r->cache_hit_rate);
     jput(b, ",\"ttft\":");
     jput_stage(b, r->ttft_s);
     jput(b, ",\"prefill_tps\":");
@@ -354,16 +357,25 @@ const char *myds_trace_page_html(void) {
 "<span id=\"sys\"><span id=\"sysbox\" class=\"m\">采样中…</span></span></header>"
 "<div id=\"wrap\"><div id=\"list\"><table><thead><tr>"
 "<th>#</th><th>时间</th><th>resp_id</th><th class=\"num\">prompt</th>"
-"<th class=\"num\">out</th><th class=\"num\">TTFT</th>"
+"<th class=\"num\">cache</th><th class=\"num\">out</th><th class=\"num\">TTFT</th>"
 "<th class=\"num\">prefill</th><th class=\"num\">decode</th>"
 "<th class=\"num\">总耗时</th><th>finish</th>"
-"</tr></thead><tbody id=\"rows\"><tr><td colspan=\"10\" class=\"empty\">loading…</td></tr>"
+"</tr></thead><tbody id=\"rows\"><tr><td colspan=\"11\" class=\"empty\">loading…</td></tr>"
 "</tbody></table></div><div id=\"detail\"><div class=\"empty\">选择左侧任一请求</div></div></div>"
 "<script>"
 "const ST=[['queue','排队','--q'],['render','解析+渲染','--r'],['setup','进引擎前','--s'],"
 "['engine','引擎总','--e'],['prefill','prefill','--p'],['decode','decode','--d'],"
 "['unattributed','未归因','--u']];"
 "let SEL=null,RECS=[];"
+/* 时间固定成 YYYY-MM-DD HH:MM:SS。
+ *
+ * 不用 toLocaleString / toLocaleTimeString：它们跟随浏览器 locale，
+ * 同一份日志在不同机器上显示不同格式（2026/11/2 与 2/11/2026），
+ * 对着日志排查时还得先换算。补零也是这个原因 —— 06:11 一眼能对齐，
+ * 6:11 不能。 */
+"const pad=n=>String(n).padStart(2,'0');"
+"const ts=ms=>{const d=new Date(ms);return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+"
+"pad(d.getDate())+' '+pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds());};"
 "const f=n=>n===null?null:(n<0.001?n*1e6<0.1?'<0.1us':(n*1e6).toFixed(1)+'us':"
 "n<1?(n*1000).toFixed(1)+'ms':n.toFixed(2)+'s');"
 "const esc=s=>String(s).replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"
@@ -380,16 +392,16 @@ const char *myds_trace_page_html(void) {
 "let j;"
 "try{const r=await fetch(api('/trace/api/requests'));"
 "if(!r.ok){document.getElementById('rows').innerHTML="
-"`<tr><td colspan=\"10\" class=\"empty\">API ${r.status} - token 可能已失效，或页面是旧的</td></tr>`;return;}"
+"`<tr><td colspan=\"11\" class=\"empty\">API ${r.status} - token 可能已失效，或页面是旧的</td></tr>`;return;}"
 "j=await r.json();}catch(e){"
-"document.getElementById('rows').innerHTML=`<tr><td colspan=\"10\" class=\"empty\">无法连接：${e}</td></tr>`;return;}"
+"document.getElementById('rows').innerHTML=`<tr><td colspan=\"11\" class=\"empty\">无法连接：${e}</td></tr>`;return;}"
 "RECS=j.records||[];"
 /* count/capacity 不再显示 —— 标题栏只放性能数据。容量信息仍然在 API 里。 */
 "const tb=document.getElementById('rows');"
-"if(!RECS.length){tb.innerHTML='<tr><td colspan=\"10\" class=\"empty\">"
+"if(!RECS.length){tb.innerHTML='<tr><td colspan=\"11\" class=\"empty\">"
 "暂无记录（先发一个请求）</td></tr>';return;}"
 "tb.innerHTML=RECS.map(rec=>{"
-"const p=rec.phases;const when=new Date(rec.epoch_ms).toLocaleTimeString();"
+"const p=rec.phases;const when=ts(rec.epoch_ms).slice(11);"
 /* 进行中的请求没有 engine（阶段都是 null），用【墙上时间】算已耗时 ——
  * 这是唯一能在跑完之前拿到的数。它包含排队，与完成后的口径不同，
  * 所以单独标注，不冒充「总耗时」。 */
@@ -398,6 +410,10 @@ const char *myds_trace_page_html(void) {
  *   prefill null = 整个 prompt 命中缓存，没有跑 prefill
  *   decode null = 输出 ≤1 个 token，没有生成阶段
  * 把原因藏起来，读者只能看到一排「—」，会以为数据没采到。 */
+/* 缓存命中率。null（没有前缀统计）显示「—」，不显示 0% ——
+ * 0% 是「查了，一个都没命中」，与「没查」是两件事。 */
+"const cacheTitle=rec.cache_hit_rate===null?'本请求没有前缀缓存统计':"
+"('命中 '+rec.cached_tokens+' / '+rec.prompt_tokens+' token');"
 "const ttTitle=rec.ttft===null?'本次没有产出 token（被拒绝或早退）':'请求到达 → 第一个 token，含排队';"
 "const pfTitle=rec.prefill_tps===null?'整个 prompt 命中缓存，本次没有跑 prefill':'引擎自报，不含排队与分词';"
 "const dcTitle=rec.decode_tps===null?'输出不超过 1 个 token，没有 decode 阶段':'生成阶段速率';"
@@ -410,6 +426,8 @@ const char *myds_trace_page_html(void) {
  * 截断用 CSS ellipsis 而不是 JS 切字符串 —— 切了就没法复制完整 id 了。 */
 "+`<td class=\"rid\" title=\"${esc(rec.resp_id)}\">${esc(rec.resp_id||'—')}</td>`"
 "+`<td class=\"num\">${rec.prompt_tokens}</td>`"
+"+`<td class=\"num\" title=\"${esc(cacheTitle)}\">`"
+"+`${rec.cache_hit_rate===null?'—':rec.cache_hit_rate.toFixed(0)+'%'}</td>`"
 "+`<td class=\"num\">${rec.out_tokens}</td>`"
 "+`<td class=\"num\" title=\"${esc(ttTitle)}\">${rec.ttft===null?'—':f(rec.ttft)}</td>`"
 "+`<td class=\"num\" title=\"${esc(pfTitle)}\">${rec.prefill_tps===null?'—':rec.prefill_tps.toFixed(0)+' t/s'}</td>`"
@@ -434,7 +452,7 @@ const char *myds_trace_page_html(void) {
 "已耗时 '+(Date.now()-rec.epoch_ms)/1000<1?'<1':((Date.now()-rec.epoch_ms)/1000).toFixed(1)"
 "+' s（含排队）。阶段耗时尚未产出，完成后自动刷新。</div>';}"
 "html+='<table class=\"kv\">'"
-"+'<tr><td>时间</td><td>'+new Date(rec.epoch_ms).toLocaleString()+'</td></tr>'"
+"+'<tr><td>时间</td><td>'+ts(rec.epoch_ms)+'</td></tr>'"
 "+'<tr><td>客户端</td><td>'+esc(rec.client)+'</td></tr>'"
 "+'<tr><td>finish</td><td><span class=\"pill '+cls(rec.finish)+'\">'+esc(rec.finish)"
 "+'</span></td></tr>'"

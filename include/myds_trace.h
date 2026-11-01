@@ -53,6 +53,11 @@ typedef struct {
     /* 吞吐与延迟。同样遵守「未测量 = 负值 = null」：
      * 取消的请求没有 decode 速度，早退的请求没有 TTFT，
      * 把它们印成 0 t/s 会被读成「慢到零」，而真相是「没发生」。 */
+    /* 前缀缓存命中率 = cached / prompt。
+     * 分母用 prompt_tokens 而不是「prompt - 1」：最后一个 token 留给 decode
+     * 是引擎的内部约定，对外讲命中率时按整段 prompt 算才符合直觉。
+     * 负值 = 未测量（请求早退/被拒，没有 prompt 统计）。 */
+    double   cache_hit_rate;
     double   ttft_s;        /* 首字时间：请求到达 → 第一个 token 吐出（含排队） */
     double   prefill_tps;   /* 引擎自报的 prefill 速率 */
     double   decode_tps;    /* 生成阶段速率 */

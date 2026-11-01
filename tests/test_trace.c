@@ -280,6 +280,48 @@ static void test_page_js_is_well_formed(void) {
  * 为什么要单测这条：单段式写入会让长请求在整个执行期间不可见 ——
  * 用户看到的正是「只有等数据全返回才出现这一条」。所以断言三件事：
  * begin 之后立刻能查到、in_flight 为真、各阶段是「未测量」而不是 0。 */
+/* 缓存命中率 = cached / prompt，且「没有统计」与「命中 0%」必须分得开。
+ *
+ * 0% 是查过、一个都没命中；null 是根本没查（早退/被拒）。
+ * 两者在页面上一个是「0%」一个是「—」，混了会让人以为缓存完全失效。 */
+static void test_cache_hit_rate(void) {
+    static const struct { uint32_t prompt, cached; double want; } cases[] = {
+        { 5925, 5918, 99.88 },   /* 高命中：多轮对话的典型值 */
+        { 5899, 5632, 95.47 },
+        {  100,    0,  0.00 },   /* 查了，一个都没命中 —— 这是 0%，不是 null */
+        { 1000,  250, 25.00 },
+    };
+    for (size_t i = 0; i < sizeof(cases)/sizeof(cases[0]); ++i) {
+        const double rate = cases[i].prompt
+            ? 100.0 * (double)cases[i].cached / (double)cases[i].prompt : -1.0;
+        const double d = rate - cases[i].want;
+        CHECK(d > -0.01 && d < 0.01);
+    }
+
+    /* 写进记录并检查 JSON */
+    myds_trace_reset();
+    myds_trace_init(8);
+    myds_trace_rec_t r;
+    fill(&r, "/v1/chat/completions", 1.0);
+    r.prompt_tokens = 1000;
+    r.cached_tokens = 250;
+    r.cache_hit_rate = 25.0;
+    myds_trace_record(&r);
+    char buf[2048];
+    CHECK(myds_trace_list_json(buf, sizeof(buf)));
+    CHECK(strstr(buf, "\"cache_hit_rate\":25.000000") != NULL);
+
+    /* 未测量 → null，不是 0 */
+    myds_trace_reset();
+    myds_trace_init(8);
+    fill(&r, "/v1/chat/completions", 1.0);
+    r.cache_hit_rate = -1.0;
+    myds_trace_record(&r);
+    CHECK(myds_trace_list_json(buf, sizeof(buf)));
+    CHECK(strstr(buf, "\"cache_hit_rate\":null") != NULL);
+    CHECK(strstr(buf, "\"cache_hit_rate\":0") == NULL);
+}
+
 static void test_in_flight_visible_immediately(void) {
     myds_trace_reset();
     myds_trace_init(8);
@@ -450,6 +492,7 @@ int main(void) {
     test_capacity_clamped();
     test_wall_includes_engine();
     test_page_js_is_well_formed();
+    test_cache_hit_rate();
     test_in_flight_visible_immediately();
     test_resp_id_recorded();
     test_page_script_refs_exist();
