@@ -3223,7 +3223,10 @@ static void decode_emit(myds_context_t *ctx, myds_stream_callback_t cb,
     ctx->decode_stats.output_tokens++;
     if (bytes_cb) bytes_cb(piece, length, token, user_data);
     else if (cb) cb(piece, token, user_data);
-    if (myds_loop_guard_feed(&ctx->loop_guard, token)) {
+    /* 命中过一次就不再喂：检测器的历史在命中后仍然保有重复序列，
+     * 于是【每一个后续 token 都会再报一次】—— 实测一个请求刷了 260 条 WARN。
+     * 真正的停止由调用方读 ctx->loop_detected 执行；这里只是避免日志风暴。 */
+    if (!ctx->loop_detected && myds_loop_guard_feed(&ctx->loop_guard, token)) {
         MYDS_LOG_W("LoopGuard: detected repeating loop (period=%u, reps=%u), terminating generation to prevent runaway output",
                    ctx->loop_guard.detected_period, ctx->loop_guard.detected_reps);
         ctx->loop_detected = true;
@@ -4871,6 +4874,18 @@ static int myds_generate_internal(myds_context_t *ctx,
                 break;
             }
             decode_emit(ctx, cb, bytes_cb, piece, piece_len, next_token, user_data);
+            /* ★ 2026-11-01 真机实测补漏：这条【纯自回归】路径上原本没有任何
+             * loop_detected 检查点。生产配置 BATCH2_SPEC=0 ⇒ use_spec=false ⇒
+             * 走的就是这里，于是 LoopGuard 每个 token 都报警却从不中断生成
+             * （实测一个请求 260 条 WARN，输出与关闭时逐字节相同）。
+             * 投机分支的 12 个检查点一个都没覆盖到它 —— 这正是"单测过、
+             * 端到端没测"的典型后果。 */
+            if (ctx->loop_detected) {
+                /* ctx->pos 在这条路径上恒等于"已消费 token 数"，
+                 * 不需要像投机分支那样补 spec_pos/pld_pos 偏移。 */
+                stop_reason = MYDS_STOP_LOOP_GUARD;
+                break;
+            }
 
             cur_token = next_token;
             if (ctx->pos >= ctx->cfg.max_seq_len) {
