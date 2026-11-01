@@ -7464,6 +7464,17 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     if (do_prof) gettimeofday(&ptv_all0, NULL);
 
     for (uint32_t mb_start = 0; mb_start < n_tokens; mb_start += macroblock_size) {
+        /* 2026-11-01：客户端存活探针。
+         * 一个 macroblock 可能要跑好几秒到几十秒（262K prompt 约 12 分钟），
+         * 而在此之前整段 prefill 期间没有任何东西会去看 socket ——
+         * 客户端 abort / 超时重连之后，服务端仍在把剩下的 token 全部算完。
+         * 放在 macroblock 边界而不是 layer/chunk 内部：粒度足够（默认为数秒），
+         * 且不会把一次阻塞 recv 塞进热点路径。 */
+        if (cancel_flag && !*cancel_flag && ctx->liveness_probe &&
+            !ctx->liveness_probe(ctx->liveness_probe_data)) {
+            *cancel_flag = 1;
+        }
+        if (cancel_flag && *cancel_flag) goto cancelled;
         uint32_t mb_len = n_tokens - mb_start;
         if (mb_len > macroblock_size) mb_len = macroblock_size;
         const uint32_t mb_base_pos = base_pos + mb_start;
@@ -7509,6 +7520,13 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         phase = "engram prepare";
         TIME_START();
         for (uint32_t t = 0; t < mb_len; ) {
+            /* 探针也要覆盖 engram 准备段：它是 prefill 里最先跑的一段，
+             * 大 prompt 下单这一段的耗时就能到秒级，不探就只能等它跑完。 */
+            if (cancel_flag && !*cancel_flag && ctx->liveness_probe &&
+                !ctx->liveness_probe(ctx->liveness_probe_data)) {
+                *cancel_flag = 1;
+            }
+            if (cancel_flag && *cancel_flag) goto cancelled;
             const uint32_t pos = mb_base_pos + t;
             uint32_t step = mb_len - t;
             const uint32_t next_snap = ((pos / V41_SNAP_STRIDE) + 1u) * V41_SNAP_STRIDE;
@@ -7534,6 +7552,13 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         float *prompt_res_f32 = (float *)myds_metal_buffer_data(prompt_res);
         float *prompt_pre_f32 = (float *)myds_metal_buffer_data(prompt_pre);
         for (uint32_t t = 0; t < mb_len; t++) {
+            /* 每 1024 token 探一次：recv 是系统调用，逐 token 探会把这里变成 syscall 热点；
+             * 1024 token 的 embedding 拷贝在毫秒级，粒度足够。 */
+            if ((t & 1023u) == 0u && cancel_flag && !*cancel_flag && ctx->liveness_probe &&
+                !ctx->liveness_probe(ctx->liveness_probe_data)) {
+                *cancel_flag = 1;
+            }
+            if (cancel_flag && *cancel_flag) goto cancelled;
             int32_t tok = tokens[mb_start + t];
             if (tok < 0 || (uint32_t)tok >= m->vocab_size) {
                 MYDS_LOG_E("V4.1 invalid token %d at pos %u", tok, mb_base_pos + t);
@@ -7657,6 +7682,19 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             }
 
             for (uint32_t c_start = sh_loop_rel; c_start < mb_len; ) {
+                /* ★ 2026-11-01：探针必须挂在【chunk】边界，不是 macroblock 边界。
+                 * 实测踩到：60K prompt 自适应出的 macroblock 就是 60416（整段一块），
+                 * 于是挂在 macroblock 上的探针一次都不会跑，客户端断开后仍然把
+                 * 6 万 token 全算完（>60s）。chunk 默认 2048，几秒一个，粒度才对。 */
+                if (cancel_flag && !*cancel_flag) {
+                    static int dbg = -1; if (dbg < 0) dbg = (getenv("MYDS_PROBE_DEBUG") != NULL);
+                    if (dbg) MYDS_LOG_I("probe: layer %u chunk@%u/%u fd-probe=%s", il, c_start, mb_len,
+                                        ctx->liveness_probe ? "registered" : "MISSING");
+                    if (ctx->liveness_probe && !ctx->liveness_probe(ctx->liveness_probe_data)) {
+                        *cancel_flag = 1;
+                        if (dbg) MYDS_LOG_I("probe: client gone at layer %u chunk@%u -> cancel", il, c_start);
+                    }
+                }
                 if (cancel_flag && *cancel_flag) goto cancelled;
                 uint32_t c_len = mb_len - c_start;
                 if (c_len > chunk_size) c_len = chunk_size;

@@ -151,6 +151,21 @@ void            myds_last_decode_stats(const myds_context_t *ctx, myds_decode_st
 bool            myds_last_decode_cycle(const myds_context_t *ctx, uint32_t index,
                                       myds_decode_cycle_t *out);
 
+/* 存活探针：返回 true = 客户端还在。
+ *
+ * 存在理由：prefill 可能跑数十秒到数分钟，而模型在 CPU/GPU 上跑，socket 不会自己报错。
+ * 没有探针时，客户端早已断开（abort / 超时重试 / 用户取消），服务端仍然跑完整个
+ * prefill —— 这是纯浪费，且在 agent 大量重连的场景下每天都在发生。
+ *
+ * 引擎在每个 macroblock 边界调一次，所以探针必须是【非阻塞、O(1)、绝不阻塞】的。
+ * server 侧的实现只是一个 recv(MSG_PEEK|MSG_DONTWAIT)。
+ *
+ * 契约：探针返回 false 等价于「外部取消」—— 引擎置 cancel_flag 并走既有的取消路径，
+ * 不会产生部分结果被当成成功。 */
+typedef bool (*myds_liveness_probe_t)(void *user_data);
+void myds_context_set_liveness_probe(myds_context_t *ctx, myds_liveness_probe_t probe,
+                                     void *user_data);
+
 /* Generation termination reasons.
  *
  * MYDS_STOP_LOOP_GUARD is appended rather than inserted: earlier members keep

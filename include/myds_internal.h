@@ -178,6 +178,10 @@ struct myds_context {
     uint32_t             decode_costly_cycles;
     uint32_t             decode_cost_backoff;
 
+    /* 客户端存活探针（server 注册；NULL = 不探测） */
+    myds_liveness_probe_t liveness_probe;
+    void                 *liveness_probe_data;
+
     /* LoopGuard: 周期性死循环检测器（借鉴 Project Maya LoopGuard） */
     myds_loop_guard_t    loop_guard;
     bool                 loop_detected;

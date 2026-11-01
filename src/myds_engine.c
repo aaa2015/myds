@@ -3047,6 +3047,16 @@ static bool model_supports_chunk_prefill(const myds_model_t *m) {
     return true;
 }
 
+/* 在 prefill 的长循环里调用：探针说客户端没了就置 cancel_flag。
+ * 只做「置标志」，不提前 return —— 让既有的取消路径统一处理清理，
+ * 这样探针失败与用户取消走完全相同的分支，不会多出一条需要单独验证的出口。 */
+static inline void prefill_probe_client(myds_context_t *ctx, volatile int *cancel_flag) {
+    if (!ctx || !cancel_flag || *cancel_flag) return;
+    if (ctx->liveness_probe && !ctx->liveness_probe(ctx->liveness_probe_data)) {
+        *cancel_flag = 1;
+    }
+}
+
 static int myds_prefill_tokens(myds_context_t *ctx, const int32_t *tokens, int32_t n_tokens, volatile int *cancel_flag) {
     if (n_tokens <= 0) return 1;
     myds_model_t *m = ctx->model;
@@ -3056,6 +3066,7 @@ static int myds_prefill_tokens(myds_context_t *ctx, const int32_t *tokens, int32
     if (m->v41) {
         if (getenv("MYDS_DISABLE_V41_PREFILL") || getenv("MYDS_TRACE_PREFIX")) {
             for (int32_t i = 0; i < n_tokens; i++) {
+                prefill_probe_client(ctx, cancel_flag);
                 if (cancel_flag && *cancel_flag) return -2;
                 if (myds_forward_token_internal(ctx, tokens[i], ctx->pos, false) < 0) return -1;
                 ctx->pos++;
@@ -3122,6 +3133,7 @@ static int myds_prefill_tokens(myds_context_t *ctx, const int32_t *tokens, int32
      * GEMV still reads weights for each token; only GEMM tiles share those loads. */
     for (uint32_t l = 0; l < m->n_layers; l++) {
         for (int32_t c_start = 0; c_start < n_tokens; c_start += (int32_t)chunk->capacity) {
+            prefill_probe_client(ctx, cancel_flag);
             if (cancel_flag && *cancel_flag) {
                 free(prompt_x);
                 return -2;
@@ -4943,6 +4955,13 @@ static int myds_generate_internal(myds_context_t *ctx,
 
 /* 最近一次请求的 prefill 统计。故意做成「读 ctx 上的字段」而不是改 generate 的签名：
  * 生成 API 的签名被库、单测、服务端多处依赖，加出参是多余的破坏。 */
+void myds_context_set_liveness_probe(myds_context_t *ctx, myds_liveness_probe_t probe,
+                                     void *user_data) {
+    if (!ctx) return;
+    ctx->liveness_probe = probe;
+    ctx->liveness_probe_data = probe ? user_data : NULL;
+}
+
 void myds_context_reset_prefill_stats(myds_context_t *ctx) {
     if (!ctx) return;
     ctx->last_prefill_valid = 0;

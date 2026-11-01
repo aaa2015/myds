@@ -159,7 +159,7 @@ prefix cache: ANCHOR #0 at 2743 NOT usable - the resident compressed KV only
    避免 BPE 边界合并差异）；
 2. 命中非最新槽 ⇒ 走内存级前缀恢复，而不是 400。
 
-### 中：断连剔除
+### ~~中：断连剔除~~ —— 已完成（见 §七）
 
 `client_disconnected()` 存在，但只在**每个 token 回调**里调用
 （`myds_server.c:3350 / 3369`）。Prefill 阶段（数十秒到数百秒）没有任何调用点，
@@ -257,3 +257,63 @@ A turn2 (prev=…_1)      → 400       ← 三秒前拿到的 id 就废了
 | 未知 id 仍拒绝 | 400 ✓ | 400 ✓ |
 
 复现脚本：`tests/previous_response_live.py`（需模型，不进 `make test`）。
+
+---
+
+## 七、prefill 期间断连剔除（2026-11-01）
+
+### 原行为
+
+`client_disconnected()` 存在，但只在**每个 token 的解码回调**里被调用。
+prefill 阶段一个 token 都不会回调，于是：
+
+> 客户端 abort / 超时重连 / 用户取消 ⇒ 服务端仍然把整段 prompt 算完。
+
+实测（macstudio 8187，60K prompt，3 秒后断开）：
+
+| | 旧二进制 | 新二进制 |
+|---|---|---|
+| 该请求的 wall | **>60 s（仍在跑）** | **3.0 s** |
+| 后续请求 | **503 queue_timeout（等了 60 s）** | **0.7 s 内返回 200** |
+| 日志 | 无任何取消痕迹 | `prefill: CANCELLED (planned 59990 tok)` |
+
+一个没人等的请求足以把整台机器堵住一分钟以上。
+
+### 实现：注册式探针
+
+引擎不知道 socket 的存在，所以走回调：
+
+```c
+typedef bool (*myds_liveness_probe_t)(void *user_data);
+void myds_context_set_liveness_probe(myds_context_t *ctx,
+                                     myds_liveness_probe_t probe, void *user_data);
+```
+
+服务端注册的实现就是 `recv(MSG_PEEK | MSG_DONTWAIT)`，非阻塞、O(1)。
+探针返回 false **等价于外部取消**：只置 `cancel_flag`，然后走既有的
+`goto cancelled` 路径 —— 不新增一条需要独立验证的出口。
+
+探针挂在四处（都是长循环）：
+
+| 位置 | 粒度 | 理由 |
+|---|---|---|
+| 出队后、进 GPU 前 | 一次 | 排队期间客户端可能已经走了，此时应零成本丢弃 |
+| engram 准备 | 每 64 token | prefill 里最先跑的一段，大 prompt 下本身就能到秒级 |
+| embedding 拷贝 | 每 1024 token | 逐 token 调用 `recv` 会变成 syscall 热点 |
+| chunk 主循环 | 每 chunk（默认 2048） | 真正干活的地方 |
+
+### 两个踩到的坑（都只有真机才暴露）
+
+1. **探针最初只挂在 macroblock 边界，等于从不触发。**
+   60K prompt 自适应出的 `macroblock=60416` —— 整段就是一块，边界只出现一次。
+   实测客户端断开后仍然把 60K 全算完。必须降到 chunk 粒度。
+2. **取消时日志把「计划量」当「已完成量」打印。**
+   `prefill: 19995 tok in 5.3s = 3762 t/s` 看着像跑完了，实际在第一个 chunk 就中止。
+   现改为 `prefill: CANCELLED (planned N tok, cached M)` —— 取消时不报速率。
+
+### 验证
+
+- `tests/prefill_disconnect_live.py`：发 60K prompt，3 秒后挂断，检查取消日志、
+  检查后续请求不被堵。
+- 基线 7 个 prompt 的 sha 与改动前**逐一相同**（探针不改任何计算结果）。
+- `make test` 全绿。

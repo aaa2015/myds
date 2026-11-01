@@ -2972,6 +2972,14 @@ static bool client_disconnected(int fd) {
     return r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK);
 }
 
+/* 引擎在 prefill 的 macroblock 边界回调它。
+ * 单个静态 fd：推理由 g_infer_mutex 串行化，同一时刻只有一个请求在生成。 */
+static int g_prefill_probe_fd = -1;
+static bool server_client_alive_probe(void *user_data) {
+    (void)user_data;
+    return !client_disconnected(g_prefill_probe_fd);
+}
+
 static bool sse_emit_reasoning(myds_sse_stream_ctx_t *sctx, const char *piece, size_t length, bool final) {
     if (sctx->cancel_flag || sse_transport_failed(sctx)) return false;
     if (length > (SIZE_MAX - 1) / 6 - sctx->utf8.pending_length) goto failed;
@@ -3902,6 +3910,26 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         double   dspark_prop_ms_before = ctx->dspark ? ctx->dspark->propose_ms : 0.0;
         double   dspark_ver_ms_before  = ctx->dspark ? ctx->dspark->verify_ms : 0.0;
 
+        /* ★ 2026-11-01：出队即验。
+         *
+         * 排队可能等几十秒。客户端在这段时间里 abort / 超时重连是常态（agent 的
+         * AbortSignal 尤其频繁）。原实现拿到锁之后不做任何存活确认就直接分词 +
+         * prefill —— 一个已经没人等的请求照样吃掉几秒到几分钟的 GPU。
+         * 这里在花任何算力之前先问一次；探针注册给引擎，prefill 期间继续复查。 */
+        if (client_disconnected(client_fd)) {
+            MYDS_LOG_I("[%s:%d] client gone while queued (waited %.1fs) -> dropped before any GPU work",
+                       client_ip, client_port, queue_s);
+            t_infer_slot_depth = 0;
+            pthread_mutex_unlock(&g_infer_mutex);
+            server_release_infer_slot();
+            myds_vjob_sink_free(&img_sink);
+            free(prompt); free(req_buf); close(client_fd); return;
+        }
+        /* 探针状态放在静态区：推理由 g_infer_mutex 串行化，同一时刻只有一个请求在跑，
+         * 所以一个槽就够；放栈上则会在函数返回后悬空（探针可能被引擎缓存）。 */
+        g_prefill_probe_fd = client_fd;
+        myds_context_set_liveness_probe(ctx, server_client_alive_probe, NULL);
+
         /* 2026-10-24：重启后 pcache 为空，但若该 id 的【完整累积提示词】已持久化，
          * 就不必杀请求 —— 用「持久化前缀 + 本次 suffix」重建出客户端原本会发送的完整输入，
          * 退回普通 prefill。正确性优先；若 kvdisk 里还有对应前缀的 KV，普通路径会自己命中。 */
@@ -4627,6 +4655,13 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             snprintf(prefill_str, sizeof(prefill_str), "not started");
         } else if (pf.prefill_tokens == 0) {
             snprintf(prefill_str, sizeof(prefill_str), "none (all %u cached)", pf.cached_tokens);
+        } else if (stop_reason == MYDS_STOP_CANCELLED) {
+            /* 取消时引擎的 prefill_tokens 仍是【计划量】，不是实际跑过的量。
+             * 原实现把它按速率打出来，于是「客户端早断开、prefill 在第一个 chunk 就中止」
+             * 会显示成「19995 tok in 5.3s = 3762 t/s」—— 看起来像跑完了。
+             * 取消时不给速率，只报计划量与事实。 */
+            snprintf(prefill_str, sizeof(prefill_str), "CANCELLED (planned %u tok, cached %u)",
+                     pf.prefill_tokens, pf.cached_tokens);
         } else if (stop_reason == MYDS_STOP_ERROR) {
             /* prefill 失败时不能按速率打。原来会打出「399952 tok in 0.000s = 33329333333.3 t/s」
              * 这种荒谬的成功行（实测），在排查事故时极具误导性 ——
@@ -4779,6 +4814,10 @@ cleanup_infer:
         myds_vjob_sink_free(&img_sink);
         myds_set_continue_from_cache(ctx, false);
         myds_context_set_config(ctx, &prev_cfg);
+        /* 摘掉探针：fd 马上就要 close，留着它下次可能命中一个复用了同号的
+         * 新连接 —— 那时探针会把「新连接还活着」当成「这个请求还活着」。 */
+        myds_context_set_liveness_probe(ctx, NULL, NULL);
+        g_prefill_probe_fd = -1;
         t_infer_slot_depth = 0;
         pthread_mutex_unlock(&g_infer_mutex);
         server_release_infer_slot();

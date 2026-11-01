@@ -24,6 +24,7 @@ void myds_context_reset_prefill_stats(myds_context_t *ctx) { (void)ctx; }
 void myds_set_continue_from_cache(myds_context_t *ctx, bool enable) { (void)ctx; (void)enable; }
 uint32_t myds_context_get_pcache_len(const myds_context_t *ctx) { (void)ctx; return 100; }
 myds_steer_t *myds_context_find_steer(const myds_context_t *ctx, const char *name) { (void)ctx; (void)name; return NULL; }
+void myds_context_set_liveness_probe(myds_context_t *ctx, myds_liveness_probe_t probe, void *user_data) { (void)ctx; (void)probe; (void)user_data; }
 void myds_vjob_set_gpu_lock(void (*lock_fn)(void), void (*unlock_fn)(void)) { (void)lock_fn; (void)unlock_fn; }
 const char *myds_vjob_placeholder(void) { return "<|image_pad|>"; }
 uint32_t myds_vjob_image_token_id(void) { return 0; }
