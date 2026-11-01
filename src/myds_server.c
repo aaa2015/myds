@@ -392,6 +392,16 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
      * 暴露「谁在什么时候发了什么请求、各自花了多久」属于运行数据，不能默认对全网开放。
      * 但页面本身要能一眼打开，所以门槛与 debug 一致而不是更严。 */
     if (strncmp(path, "/trace", 6) == 0) {
+        /* path 来自 sscanf("%255s")，**包含 query string**（`/trace?token=x` 是一个
+         * 完整 token）。所以路由前必须先切掉 `?` 之后的部分，否则 strcmp 全部落空 ——
+         * 第一版就是这样：带 ?token= 的页面直接 404，而 header 方式却是 200，
+         * 看起来像是「query 没被接受」，实际是路径没匹配上。
+         * 原 path 保留给 token 提取用。 */
+        char route[256];
+        snprintf(route, sizeof(route), "%s", path);
+        char *qmark = strchr(route, '?');
+        if (qmark) *qmark = '\0';
+
         char presented[256] = "";
         extract_http_header_str(req_buf, "X-Debug-Token", presented, sizeof presented);
         /* 浏览器打不开一个需要自定义 header 的页面 —— 没有插件就带不上 X-Debug-Token。
@@ -420,7 +430,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             close(client_fd);
             return;
         }
-        if (strcmp(path, "/trace") == 0) {
+        if (strcmp(route, "/trace") == 0) {
             MYDS_LOG_I("[%s:%d] GET /trace -> 200 OK (page)", client_ip, client_port);
             send_response(client_fd, 200, "OK", "text/html; charset=utf-8",
                           myds_trace_page_html());
@@ -428,7 +438,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             close(client_fd);
             return;
         }
-        if (strcmp(path, "/trace/api/requests") == 0) {
+        if (strcmp(route, "/trace/api/requests") == 0) {
             /* 列表可能很长：按容量上限（512 条）算，每条 ~300 B ⇒ 160 KB。
              * 堆上分配，失败就 500 —— 发一段截断的 JSON 比不发更难查。 */
             const size_t cap = 64u * 1024u + (size_t)myds_trace_capacity() * 512u;
@@ -445,10 +455,10 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             close(client_fd);
             return;
         }
-        if (strncmp(path, "/trace/api/request", 18) == 0) {
+        if (strncmp(route, "/trace/api/request", 18) == 0) {
             /* ?seq=N。没有 seq 或解析失败一律 400 —— 静默给个默认值会让客户端
              * 以为自己在看请求 1，而实际看的是别的。 */
-            const char *q = strstr(path, "seq=");
+            const char *q = strstr(route, "seq=");
             char *end = NULL;
             const unsigned long long seq = q ? strtoull(q + 4, &end, 10) : 0ull;
             if (!q || end == q + 4) {
