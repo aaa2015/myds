@@ -233,8 +233,16 @@ adoption-check:
 # Runs tools/build_provenance.py directly rather than a make target, because the
 # target may not exist on a host whose checkout predates this change -- and the
 # check is most useful exactly when the two sides disagree.
+# Tries the repo copy first, then the standalone one shipped into bin/ by
+# deploy_artifact.sh. The fallback exists because the case this check is most
+# useful for -- a stale checkout on the serving host -- is exactly when tools/
+# may be behind and bin/ is the only current copy.
 deploy-check:
-	python3 -B tools/build_provenance.py verify
+	@if [ -f tools/build_provenance.py ]; then \
+		python3 -B tools/build_provenance.py verify; \
+	else \
+		python3 -B bin/build_provenance.py verify; \
+	fi
 
 # Called by deploy_artifact.sh on the build host, after the artifacts exist.
 provenance:

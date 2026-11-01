@@ -121,14 +121,16 @@ fi
 # 由 `make deploy-check` 在运行侧核对。
 echo "🧾 记录构建溯源"
 python3 "$MYDS_SRC/tools/build_provenance.py" write --out bin/BUILD-INFO.json | sed 's/^/   /'
-# 记录【和检查器本身】都要送到对端：部署只传产物不传源码，
-# 若目标机的检出还停在旧提交，`make deploy-check` 这个目标根本不存在，
-# 而「两边不一致」恰恰是最需要这个检查的时候。
+# 记录和检查器都要送到对端：部署只传产物不传源码，若目标机的检出停在旧提交，
+# `make deploy-check` 这个目标根本不存在 —— 而「两边不一致」恰恰最需要它。
+#
+# ★ 检查器【不能】放到 tools/ 下：那是 git 跟踪的路径，送过去会变成未跟踪文件，
+#   下次 `git pull` 直接被它挡住（实测踩到：pull 报 Aborting）。
+#   放到 bin/ 里最干净 —— 两边都 gitignore，从不冲突。
 rsync -lpgoD --checksum --no-times bin/BUILD-INFO.json \
     "${REMOTE_HOST}:${REMOTE_MYDS}/bin/BUILD-INFO.json"
-ssh "$REMOTE_HOST" "mkdir -p '$REMOTE_MYDS/tools'" >/dev/null 2>&1 || true
 rsync -lpgoD --checksum --no-times tools/build_provenance.py \
-    "${REMOTE_HOST}:${REMOTE_MYDS}/tools/build_provenance.py"
+    "${REMOTE_HOST}:${REMOTE_MYDS}/bin/build_provenance.py"
 
 # ── 5) 重启 ───────────────────────────────────────────────
 # 2026-10-31：fleet.conf 里 8187 已从 E=3 改为 E=1。
