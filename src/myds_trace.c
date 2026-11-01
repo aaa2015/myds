@@ -393,6 +393,14 @@ const char *myds_trace_page_html(void) {
 /* 进行中的请求没有 engine（阶段都是 null），用【墙上时间】算已耗时 ——
  * 这是唯一能在跑完之前拿到的数。它包含排队，与完成后的口径不同，
  * 所以单独标注，不冒充「总耗时」。 */
+/* 「为什么没有值」写在 title 里。三个 null 各有不同原因：
+ *   TTFT  null = 本次没产出 token（被拒绝/早退）
+ *   prefill null = 整个 prompt 命中缓存，没有跑 prefill
+ *   decode null = 输出 ≤1 个 token，没有生成阶段
+ * 把原因藏起来，读者只能看到一排「—」，会以为数据没采到。 */
+"const ttTitle=rec.ttft===null?'本次没有产出 token（被拒绝或早退）':'请求到达 → 第一个 token，含排队';"
+"const pfTitle=rec.prefill_tps===null?'整个 prompt 命中缓存，本次没有跑 prefill':'引擎自报，不含排队与分词';"
+"const dcTitle=rec.decode_tps===null?'输出不超过 1 个 token，没有 decode 阶段':'生成阶段速率';"
 "const wall=rec.in_flight?(Date.now()-rec.epoch_ms)/1000:"
 "(p.engine===null?null:(p.queue<0?0:p.queue)+(p.render>0?p.render:0)+"
 "(p.setup>0?p.setup:0)+p.engine);"
@@ -403,9 +411,9 @@ const char *myds_trace_page_html(void) {
 "+`<td class=\"rid\" title=\"${esc(rec.resp_id)}\">${esc(rec.resp_id||'—')}</td>`"
 "+`<td class=\"num\">${rec.prompt_tokens}</td>`"
 "+`<td class=\"num\">${rec.out_tokens}</td>`"
-"+`<td class=\"num\">${rec.ttft===null?'—':f(rec.ttft)}</td>`"
-"+`<td class=\"num\">${rec.prefill_tps===null?'—':rec.prefill_tps.toFixed(0)+' t/s'}</td>`"
-"+`<td class=\"num\">${rec.decode_tps===null?'—':rec.decode_tps.toFixed(1)+' t/s'}</td>`"
+"+`<td class=\"num\" title=\"${esc(ttTitle)}\">${rec.ttft===null?'—':f(rec.ttft)}</td>`"
+"+`<td class=\"num\" title=\"${esc(pfTitle)}\">${rec.prefill_tps===null?'—':rec.prefill_tps.toFixed(0)+' t/s'}</td>`"
+"+`<td class=\"num\" title=\"${esc(dcTitle)}\">${rec.decode_tps===null?'—':rec.decode_tps.toFixed(1)+' t/s'}</td>`"
 "+`<td class=\"num\">${wall===null?'—':f(wall)}</td>`"
 "+`<td>${rec.in_flight?'<span class=\"pill run\">进行中</span>':"
 "`<span class=\"pill ${cls(rec.finish)}\">${esc(rec.finish)}</span>`}</td>`"
