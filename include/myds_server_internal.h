@@ -132,12 +132,6 @@ bool extract_request_thinking_mode(const char *body, bool default_val);
 int extract_request_reasoning_budget(const char *body, int default_budget);
 void split_reasoning_content(const char *text, size_t n, char **content_out, char **reasoning_out);
 
-#ifdef __cplusplus
-}
-#endif
-
-#endif /* MYDS_SERVER_INTERNAL_H */
-
 /* ── 工具调用（官方 DeepSeek-V4.1 DSML 格式，见 docs/DEEPSEEK_V41_PROMPT_FORMAT.md）──
  * 服务端把工具定义渲染进提示词，并把模型输出的 DSML 块解析成结构化调用。 */
 typedef struct { char *id; char *name; char *arguments; } myds_tool_call_t;
@@ -180,3 +174,9 @@ char *responses_output_items_json_ex(bool thinking, const char *reasoning, size_
                                      const myds_tool_call_t *calls, size_t count);
 /* 工具调用响应的 output 数组（给 response.completed 用）。 */
 char *responses_function_calls_output_json(const myds_tool_call_t *calls, size_t count);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* MYDS_SERVER_INTERNAL_H */

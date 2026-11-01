@@ -2,6 +2,8 @@
  * byte generator. This checks transport/serialization, not model correctness.
  * Compile and run through tests/test_http_bytes.py; no model/GPU is required. */
 #include "../src/myds_server.c"
+/* 2026-11-01 拆分：resp_store 已独立成编译单元，按同样方式并入本测试。 */
+#include "../src/myds_resp_store.c"
 #include <assert.h>
 static myds_config_t config = {.max_new_tokens = 262144, .max_seq_len = 8192};
 static int force_failure;
