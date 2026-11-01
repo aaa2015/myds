@@ -6,6 +6,7 @@
 #include "myds_steer.h"
 #include "myds_log.h"
 #include "myds_trace.h"
+#include "myds_debugstate.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -350,7 +351,9 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
          *   token    -- survives proxies, and fails closed when unset. */
         char presented[256] = "";
         extract_http_header_str(req_buf, "X-Debug-Token", presented, sizeof presented);
-        const bool loopback = g_debug_is_loopback != NULL && g_debug_is_loopback(client_ip);
+        /* 来源门槛：回环，或 MYDS_DEBUG_ALLOW_CIDR 列出的网段（默认只认回环）。
+         * token 仍然必需 —— 白名单只决定「从哪来」，不决定「是不是自己人」。 */
+        const bool loopback = myds_debug_ip_allowed(client_ip);
         const bool token_ok = g_debug_token_ok != NULL && g_debug_token_ok(presented);
         const bool open = g_debug_state_provider != NULL && g_debug_enabled != NULL &&
                           g_debug_enabled() && loopback && token_ok;
@@ -417,7 +420,9 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 presented[n] = '\0';
             }
         }
-        const bool loopback = g_debug_is_loopback != NULL && g_debug_is_loopback(client_ip);
+        /* 来源门槛：回环，或 MYDS_DEBUG_ALLOW_CIDR 列出的网段（默认只认回环）。
+         * token 仍然必需 —— 白名单只决定「从哪来」，不决定「是不是自己人」。 */
+        const bool loopback = myds_debug_ip_allowed(client_ip);
         const bool token_ok = g_debug_token_ok != NULL && g_debug_token_ok(presented);
         if (!(loopback && token_ok && g_debug_enabled && g_debug_enabled())) {
             MYDS_LOG_W("[%s:%d] GET %s -> 404 (loopback %s, token %s)",

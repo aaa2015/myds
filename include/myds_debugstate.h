@@ -24,6 +24,16 @@ bool myds_debug_enabled(void);
 /* IPv4 loopback test over the dotted quad the server produces (AF_INET only). */
 bool myds_debug_is_loopback(const char *ip);
 
+/* Source-address gate for /debug/state and /trace: loopback, plus anything listed
+ * in MYDS_DEBUG_ALLOW_CIDR (comma-separated CIDRs).
+ *
+ * Default behaviour is unchanged when the variable is unset -- loopback only.
+ * This is an *additive* control: it never rejects a source that loopback would
+ * have accepted. It also does not replace the token gate; both must pass.
+ * A malformed entry is dropped with a warning rather than widening to 0.0.0.0/0. */
+bool myds_debug_ip_allowed(const char *ip);
+void myds_debug_acl_reset_for_test(void);
+
 /* Shared-secret gate. Loopback is not sufficient on its own: a reverse proxy on
  * the same host connects from 127.0.0.1. Fail-closed -- if MYDS_DEBUG_TOKEN is
  * unset the endpoint stays shut even with MYDS_DEBUG_ENDPOINT=1. */

@@ -21,6 +21,7 @@
 #include "../src/myds_proto_openai.c"
 #include "../src/myds_http_io.c"
 #include "../src/myds_trace.c"
+#include "../src/myds_debug_acl.c"
 
 int main(void) {
     /* Fully measured request. */

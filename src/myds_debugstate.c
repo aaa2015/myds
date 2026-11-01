@@ -42,31 +42,6 @@ bool myds_debug_enabled(void) {
     return value && *value && strcmp(value, "0") != 0;
 }
 
-/* Loopback check over the *IPv4 dotted-quad the server actually produces*.
- *
- * Two corrections over the first version:
- *
- * 1. It accepted "::1" and "::ffff:127.*". Those can never arrive: the listener is
- *    AF_INET, the peer address is read with inet_ntop(AF_INET, ...) into a
- *    char[16]. The branches were unreachable, and a unit test asserted they were
- *    true -- testing a path production cannot take, which reads as IPv6 coverage
- *    that does not exist. Anything non-IPv4 is now rejected explicitly, and the
- *    test asserts that rejection instead.
- *
- * 2. 127.0.0.0/8 is checked numerically rather than by string compare, so
- *    127.0.0.2 (also loopback) is accepted and "127.0.0.1.evil" is not.
- *
- * This is still only a network-layer control. A reverse proxy running on the same
- * host connects from 127.0.0.1 and would pass it -- see the token gate below.
- */
-bool myds_debug_is_loopback(const char *ip) {
-    if (!ip) return false;
-    unsigned a = 0, b = 0, c = 0, d = 0;
-    char tail = 0;
-    if (sscanf(ip, "%u.%u.%u.%u%c", &a, &b, &c, &d, &tail) != 4) return false;
-    if (a > 255u || b > 255u || c > 255u || d > 255u) return false;
-    return a == 127u;
-}
 
 /* Shared-secret gate.
  *
