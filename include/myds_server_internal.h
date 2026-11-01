@@ -159,7 +159,27 @@ typedef enum {
     MYDS_DSML_MALFORMED    /* 有开有闭，但内部结构不合语法 */
 } myds_dsml_state_t;
 
+/* DSML 标签前缀（全角竖线）。合并在头里，免得两个编译单元各写一遍字面量。 */
+#define MYDS_DSML_S "\xef\xbd\x9c" "DSML" "\xef\xbd\x9c"
+
+/* 拼 JSON 的缓冲原语。导出给 SSE 发射与 Responses 输出构造使用；
+ * 唯一用途就是「拼工具调用 JSON」，所以与解析放在同一个编译单元。 */
+typedef struct { char *data; size_t len, cap; } dsml_buf_t;
+bool  dsml_put(dsml_buf_t *b, const char *p, size_t n);
+bool  dsml_putf(dsml_buf_t *b, const char *fmt, ...);
+bool  dsml_put_escaped(dsml_buf_t *b, const char *p, size_t n);
+char *dsml_dup(const char *p, size_t n);
+/* 找到 lit 并返回【其之后】的位置；未找到返回 NULL。 */
+const char *dsml_find(const char *pos, const char *end, const char *lit);
+#define DSML_PUTS(b, lit) dsml_put((b), (lit), strlen(lit))
+
+/* json_escape_alloc 转义但不加引号，供 dsml_put_escaped 使用。 */
+char *json_escape_alloc(const char *src, size_t length);
+
 myds_dsml_state_t myds_dsml_classify(const char *text, size_t len, size_t *content_len);
+/* 正文里出现了「另一套方言」的工具标记（如 <function_calls>）但要按纯文本发出去。
+ * 只在日志里用它提醒，不改变任何行为。 */
+bool dsml_looks_like_foreign_dialect(const char *text, size_t len);
 
 bool myds_parse_completion_tool_calls(const char *text, size_t len, size_t *content_len,
                                       myds_tool_call_t **calls_out, size_t *count_out);

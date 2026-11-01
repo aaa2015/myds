@@ -12,6 +12,7 @@
 /* 2026-11-01 拆分：resp_store 已独立成编译单元，按同样方式并入本测试。 */
 #include "../src/myds_resp_store.c"
 #include "../src/myds_infer_queue.c"
+#include "../src/myds_dsml.c"
 
 int main(void) {
     const size_t page = (size_t)sysconf(_SC_PAGESIZE);

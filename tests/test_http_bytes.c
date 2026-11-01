@@ -5,6 +5,7 @@
 /* 2026-11-01 拆分：resp_store 已独立成编译单元，按同样方式并入本测试。 */
 #include "../src/myds_resp_store.c"
 #include "../src/myds_infer_queue.c"
+#include "../src/myds_dsml.c"
 #include <assert.h>
 static myds_config_t config = {.max_new_tokens = 262144, .max_seq_len = 8192};
 static int force_failure;
