@@ -1558,7 +1558,16 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         double prefill_s = (final_tokens > 0 && t_first > t_start) ? (t_first - t_start) : infer_s;
         double ttft_s = prefill_s;
         double decode_s = (final_tokens > 1 && t_last > t_first) ? (t_last - t_first) : 0.0;
-        double decode_tps = (decode_s > 0.0 && final_tokens > 1) ? ((double)(final_tokens - 1) / decode_s) : ((infer_s > 0.0) ? ((double)final_tokens / infer_s) : 0.0);
+        /* 没有 decode 阶段时**不给速率**（-1），不要拿 infer_s 凑一个。
+         *
+         * 原来的 fallback 是 final_tokens / infer_s。对 out=1 的请求，
+         * 那等于「1 个 token 除以整个请求耗时」，会打出
+         *   decode: 1 tok in 0.0s = 0.6 t/s
+         * 看起来像「decode 慢到 0.6 t/s」，而真相是这次根本没有 decode 阶段
+         * —— 那一个 token 的首字延迟已经算在 ttft 里了。
+         * 编一个数比留空更难查：读者会去追一个不存在的问题。 */
+        const bool have_decode_phase = decode_s > 0.0 && final_tokens > 1;
+        double decode_tps = have_decode_phase ? ((double)(final_tokens - 1) / decode_s) : -1.0;
         const char *final_finish_str =
             (stop_reason == MYDS_STOP_LENGTH || stop_reason == MYDS_STOP_CTX_FULL ||
              stop_reason == MYDS_STOP_LOOP_GUARD) ? "length"
@@ -1597,6 +1606,18 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             snprintf(prefill_str, sizeof(prefill_str), "%u tok in %.1fs = %.1f t/s (cached %u)",
                      pf.prefill_tokens, pf.prefill_seconds, pf_tps, pf.cached_tokens);
         }
+        /* decode 段的措辞。没有阶段时不打数字，直接说明原因 ——
+         * 「1 tok in 0.0s = 0.6 t/s」这种行会让人去查一个不存在的问题。 */
+        char decode_str[96];
+        if (have_decode_phase)
+            snprintf(decode_str, sizeof(decode_str), "%u tok in %.1fs = %.1f t/s",
+                     final_tokens, decode_s, decode_tps);
+        else if (final_tokens == 1)
+            snprintf(decode_str, sizeof(decode_str),
+                     "n/a (1 tok total; its latency is in ttft)");
+        else
+            snprintf(decode_str, sizeof(decode_str), "n/a (%u tok total)", final_tokens);
+
         char steer_summary[64] = "";
         if (ctx && ctx->steer && ctx->steer->enabled && ctx->steer->alpha_effective > 0.0f) {
             snprintf(steer_summary, sizeof(steer_summary), ", steer: %s(a=%.2f)",
@@ -1606,11 +1627,11 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         }
 
         MYDS_LOG_I("[%s:%d] Completed %s %s - prompt: %u tok, prefill: %s, ttft: %.1fs, "
-                   "decode: %u tok in %.1fs = %.1f t/s, wall: %.1fs (infer %.1fs, queue %.1fs), finish_reason: %s%s",
+                   "decode: %s, wall: %.1fs (infer %.1fs, queue %.1fs), finish_reason: %s%s",
                    client_ip, client_port,
                    is_responses_endpoint ? "Responses" : "ChatCompletions",
                    path, prompt_tokens, prefill_str, ttft_s,
-                   final_tokens, decode_s, decode_tps, wall_s, infer_s, queue_s, final_finish_str, steer_summary);
+                   decode_str, wall_s, infer_s, queue_s, final_finish_str, steer_summary);
         /* 构造阶段分解并**无条件**存进环形缓冲（/trace 页面读它），
          * 日志行仍只在 MYDS_REQUEST_PHASES=1 时打。
          *
