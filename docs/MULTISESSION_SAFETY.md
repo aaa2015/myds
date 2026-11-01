@@ -145,7 +145,7 @@ prefix cache: ANCHOR #0 at 2743 NOT usable - the resident compressed KV only
 
 ## 四、其余待做项（按性价比排序）
 
-### 高：`previous_response_id` 多会话热恢复
+### ~~高：`previous_response_id` 多会话热恢复~~ —— 已完成（见 §五）
 
 `resp_id_is_live` 只承认 ring 里**最新一条**（`myds_server.c:441`），且
 `resp_recover` 只在 `pcache_len == 0` 时触发，否则直接 400：
@@ -197,5 +197,63 @@ prefill 会让 orchestrator 的路由请求排队超时（503）。
 | 锚点加 `best_len <= L` 判据 | 14.7K 系统提示词交替请求：修复前答 B、修复后答 A |
 | 锚点按槽恢复（`..._restore_slot`） | 同上 |
 | 生产撤除 `MYDS_ANCHOR_SNAPSHOT=0` | 交替 + 同会话两轮均正确 |
+| `previous_response_id` 多活（槽数可配，默认 16） | 旧二进制 400，新二进制 200 且答对 |
 
 生产部署后：7 个基线 prompt 的 sha 与改动前**逐一相同**，说明正常路径零行为变化。
+
+---
+
+## 六、`previous_response_id` 多活（2026-11-01）
+
+### 原行为与后果
+
+`resp_id_is_live()` 只承认 ring 里**最新一条**，其他一律 400：
+
+> `previous_response_id 'x' is not the most recent response (this server keeps one live state)`
+
+多会话交错时这是**必然**失败，不是偶发：
+
+```
+A turn1 (id=resp_…_1)   → 200
+B turn1 (id=resp_…_2)   → 200       ← 此刻 A 的 id 已经不是最新
+A turn2 (prev=…_1)      → 400       ← 三秒前拿到的 id 就废了
+```
+
+### 改法
+
+保留快路径，补一条恢复路径：
+
+| 情况 | 走哪条 | 代价 |
+|---|---|---|
+| id 就是最新 且 pcache 还活着 | 零拷贝续跑（原行为，未改） | 0 |
+| id 仍在表里但不是最新（或 pcache 已冷） | 累积文本 + 本次 suffix 重建完整输入，全量 prefill | 一次 prefill |
+| id 从未见过 | 400 `unknown_previous_response_id` | — |
+
+重建路径本来就有（原本只用于「服务重启后 pcache 为空」），这次只是把它的
+触发条件从「pcache 必须为空」放宽到「id 仍在表里」。正确性由既有的
+`tests/test_http_bytes.py` 与下面的实测覆盖。
+
+**槽数**：4 → 可配（`MYDS_RESP_SLOTS`，默认 16，上限 64）。4 个槽在三个会话
+交错一次之后就绕回来了。每个槽只是一份累积文本，16 个槽是几十 KB 的事。
+
+**顺带修掉两个会在多活之后才暴露的错**：
+
+1. 工具集校验原来拿「最近一次」的指纹比 —— 多活后 `prev_id` 很可能不是最新那条，
+   会把 A 的续跑按 B 的工具集判定。改为按**祖先 id** 查指纹（`resp_id_tools_sig`）。
+2. 登记新响应时同理，沿用的应是祖先的工具指纹。
+
+还有一个竞态：`resp_id_saved_text()` 解锁后返回内部指针，另一个线程登记新响应时
+会 free 它。新增 `resp_id_saved_text_copy()` 在锁内拷贝，新路径一律用它。
+
+### 实测（macstudio 8187，同一个测试跑新旧两个二进制）
+
+| 检查 | 旧二进制 | 新二进制 |
+|---|---|---|
+| A turn1 接受 | 200 | 200 |
+| B turn1 接受 | 200 | 200 |
+| **A turn2 不再 400** | **400 ✗** | **200 ✓** |
+| **A turn2 记得自己的上下文** | 空 ✗ | `Teal` ✓ |
+| **A turn2 没串到 B 的上下文** | （无输出） | `crimson` 未出现 ✓ |
+| 未知 id 仍拒绝 | 400 ✓ | 400 ✓ |
+
+复现脚本：`tests/previous_response_live.py`（需模型，不进 `make test`）。

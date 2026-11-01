@@ -249,12 +249,36 @@ int server_vjob_gpu_last_error(void) {
 /* ── previous_response_id：响应 id 注册表 ──
  * Responses API 允许客户端只发【新增内容】+ 上一次响应的 id，让服务端接着那次的状态跑。
  *
- * myds 是单槽：只有【最近一次】响应的状态还活着 —— 引擎的 pcache 序列正好停在它的末尾，
- * 连快照都不用恢复。所以这里只认「最近一次」，更早的 id 一律明确报错。
- * 这与 ds4 的取舍一致（它直接拒绝该字段），但比【静默忽略】安全得多：静默忽略会让客户端
- * 以为服务端持有历史，实际只渲染了新增的那几条 ⇒ 模型拿不到上下文却照常作答，输出静默错误。 */
-#define RESP_ID_SLOTS 4u
-static char            g_resp_ids[RESP_ID_SLOTS][64];
+ * 2026-11-01：单活 → 多活。
+ *
+ * 原设计只有【最近一次】响应的状态活着（pcache 恰好停在它末尾，连快照都不用恢复），
+ * 更早的 id 一律报错。这个取舍在单会话下没问题，但多会话 agent 交错时是【必然】失败：
+ * A 提问 → B 提问 → A 续跑，A 手里的 id 在这一刻已经不是最新。
+ *
+ * 现在保留快路径（最新 + pcache 在 ⇒ 零拷贝），并补一条恢复路径
+ * （id 仍在表里 ⇒ 用持久化累积文本重建完整输入，全量 prefill）。
+ * 只有真正未知的 id 才拒绝 —— 静默忽略永远不做，那会让模型拿不到上下文却照常作答。 */
+/* 2026-11-01：从 4 扩到可配置（默认 16）。
+ *
+ * 为什么：多会话 agent（orchestrator + N 个 worker + 子代理）交错调用 /v1/responses，
+ * 4 个槽在三个会话交错一次之后就绕回来了。而每个槽只是一份累积文本，
+ * 16 个槽的成本是几十 KB，不是内存问题。 */
+#define RESP_ID_SLOTS_DEFAULT 16u
+#define RESP_ID_SLOTS_MAX 64u
+static unsigned g_resp_id_slots = RESP_ID_SLOTS_DEFAULT;
+static void resp_id_slots_init(void) {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    const char *e = getenv("MYDS_RESP_SLOTS");
+    if (e && *e) {
+        const long v = atol(e);
+        if (v >= 1 && v <= (long)RESP_ID_SLOTS_MAX) g_resp_id_slots = (unsigned)v;
+        else MYDS_LOG_W("MYDS_RESP_SLOTS=%s 超出 [1,%u]，用默认 %u", e, RESP_ID_SLOTS_MAX, RESP_ID_SLOTS_DEFAULT);
+    }
+}
+#define RESP_ID_SLOTS (g_resp_id_slots)
+static char            g_resp_ids[RESP_ID_SLOTS_MAX][64];
 /* 每个响应登记时所用的【工具集指纹】。
  *
  * 为什么必须存：suffix 模式（previous_response_id）只渲染新增消息，
@@ -263,7 +287,7 @@ static char            g_resp_ids[RESP_ID_SLOTS][64];
  * 调用方只看到模型「假装没有这个工具」，无法定位。
  * 这里改为：登记响应时记下工具指纹；续跑时若带 tools 就比对，
  * 相同放行（等价于「重复声明未变」），不同则 400 明确报错。 */
-static unsigned long long g_resp_tools_sig[RESP_ID_SLOTS];
+static unsigned long long g_resp_tools_sig[RESP_ID_SLOTS_MAX];
 static unsigned        g_resp_id_ring = 0;         /* 下一个写入位置 */
 static unsigned long   g_resp_id_seq = 0;
 static pthread_mutex_t g_resp_id_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -305,7 +329,7 @@ static pthread_mutex_t g_resp_id_mutex = PTHREAD_MUTEX_INITIALIZER;
  */
 #define RESP_STATE_MAGIC "MYDSRSP1"
 #define RESP_STATE_VERSION 1u
-static char   *g_resp_text[RESP_ID_SLOTS];      /* 累积提示词（堆） */
+static char   *g_resp_text[RESP_ID_SLOTS_MAX];  /* 累积提示词（堆） */
 static bool    g_resp_state_loaded = false;
 static char    g_resp_state_path[1200];
 
@@ -319,6 +343,7 @@ static void resp_state_path(char *out, size_t cap) {
 static void resp_state_load_once(void) {
     if (g_resp_state_loaded) return;
     g_resp_state_loaded = true;
+    resp_id_slots_init();
     resp_state_path(g_resp_state_path, sizeof(g_resp_state_path));
     FILE *f = fopen(g_resp_state_path, "rb");
     if (!f) return;
@@ -326,7 +351,7 @@ static void resp_state_load_once(void) {
     uint32_t ver = 0, n = 0;
     if (fread(magic, 1, 8, f) != 8 || memcmp(magic, RESP_STATE_MAGIC, 8) != 0) { fclose(f); return; }
     if (fread(&ver, sizeof(ver), 1, f) != 1 || ver != RESP_STATE_VERSION) { fclose(f); return; }
-    if (fread(&n, sizeof(n), 1, f) != 1 || n > RESP_ID_SLOTS) { fclose(f); return; }
+    if (fread(&n, sizeof(n), 1, f) != 1 || n > RESP_ID_SLOTS_MAX) { fclose(f); return; }
     pthread_mutex_lock(&g_resp_id_mutex);
     for (uint32_t i = 0; i < n; ++i) {
         unsigned long long sig = 0;
@@ -384,7 +409,10 @@ static void resp_state_save_locked(void) {
     else    (void)remove(tmp);
 }
 
-/* 取某个 id 对应的累积提示词（无则 NULL）。返回内部指针，调用方不得释放。 */
+/* 取某个 id 对应的累积提示词（无则 NULL）。返回内部指针，调用方不得释放。
+ *
+ * ⚠ 这个接口有竞态：解锁后返回内部指针，另一个线程登记新响应时可能 free 掉它。
+ * 新代码请用 resp_id_saved_text_copy()。保留它是为了不动既有调用点的语义。 */
 const char *resp_id_saved_text(const char *id) {
     if (!id || !id[0]) return NULL;
     resp_state_load_once();
@@ -394,6 +422,27 @@ const char *resp_id_saved_text(const char *id) {
         if (g_resp_ids[i][0] && strcmp(g_resp_ids[i], id) == 0) { out = g_resp_text[i]; break; }
     pthread_mutex_unlock(&g_resp_id_mutex);
     return out;
+}
+
+/* 在锁内拷贝，调用方拿到的是自己的内存。返回拷贝的字节数，0 = 没有该 id。 */
+size_t resp_id_saved_text_copy(const char *id, char **out) {
+    if (out) *out = NULL;
+    if (!id || !id[0] || !out) return 0;
+    resp_state_load_once();
+    size_t n = 0;
+    pthread_mutex_lock(&g_resp_id_mutex);
+    for (unsigned i = 0; i < RESP_ID_SLOTS; ++i) {
+        if (!g_resp_ids[i][0] || strcmp(g_resp_ids[i], id) != 0) continue;
+        const char *t = g_resp_text[i];
+        if (t && *t) {
+            const size_t len = strlen(t);
+            char *copy = (char *)malloc(len + 1u);
+            if (copy) { memcpy(copy, t, len + 1u); *out = copy; n = len; }
+        }
+        break;
+    }
+    pthread_mutex_unlock(&g_resp_id_mutex);
+    return n;
 }
 
 
@@ -447,6 +496,19 @@ bool resp_id_is_live(const char *id) {
     pthread_mutex_unlock(&g_resp_id_mutex);
     return live;
 }
+/* 某个 id 登记时的工具集指纹。0 = 没有该 id 或它当时没带 tools。
+ * 多活续跑必须用【祖先 id】的指纹：累积文本来自那次响应，
+ * 用「最近一次」的指纹会把 A 的续跑按 B 的工具集校验。 */
+unsigned long long resp_id_tools_sig(const char *id) {
+    if (!id || !id[0]) return 0ull;
+    unsigned long long sig = 0ull;
+    pthread_mutex_lock(&g_resp_id_mutex);
+    for (unsigned i = 0; i < RESP_ID_SLOTS; ++i)
+        if (g_resp_ids[i][0] && strcmp(g_resp_ids[i], id) == 0) { sig = g_resp_tools_sig[i]; break; }
+    pthread_mutex_unlock(&g_resp_id_mutex);
+    return sig;
+}
+
 /* 是否见过（区分「过期」与「未知」，便于客户端判断） */
 bool resp_id_seen(const char *id) {
     if (!id || !id[0]) return false;
@@ -3843,29 +3905,47 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         /* 2026-10-24：重启后 pcache 为空，但若该 id 的【完整累积提示词】已持久化，
          * 就不必杀请求 —— 用「持久化前缀 + 本次 suffix」重建出客户端原本会发送的完整输入，
          * 退回普通 prefill。正确性优先；若 kvdisk 里还有对应前缀的 KV，普通路径会自己命中。 */
+        /* ★ 2026-11-01：单活 → 多活。
+         *
+         * 原实现只承认【最近一次】响应，更早的一律 400。多会话 agent 交错调用时
+         * 这是必然失败而不是偶发：A 提问 → B 提问 → A 续跑，A 手里的 id 在这一刻
+         * 就已经 expired，哪怕它三秒前才拿到。
+         *
+         * 现在两条路：
+         *   快路径   id 就是最近一次、且 pcache 还活着 ⇒ 零拷贝续跑（原行为不变）
+         *   恢复路径 id 仍在表里（但不一定最新）⇒ 用持久化的累积文本 + 本次 suffix
+         *            重建客户端原本会发送的完整输入，走普通全量 prefill。
+         *            正确性优先，速度次之；前缀缓存与锚点仍会自动命中能命中的部分。
+         * 只有【从未见过】的 id 才 400 —— 那种情况下服务端确实没有任何依据。 */
         bool resp_recover = false;
-        if (is_continuation && (!resp_id_is_live(prev_id) || myds_context_get_pcache_len(ctx) == 0)) {
-            const char *saved = resp_id_saved_text(prev_id);
-            if (saved && saved[0] && myds_context_get_pcache_len(ctx) == 0) {
+        const bool live_fast = is_continuation && resp_id_is_live(prev_id) &&
+                               myds_context_get_pcache_len(ctx) > 0;
+        if (is_continuation && !live_fast) {
+            char *saved = NULL;
+            const size_t saved_len = resp_id_saved_text_copy(prev_id, &saved);
+            if (saved_len > 0) {
                 resp_recover = true;
-                MYDS_LOG_I("[%s:%d] previous_response_id '%s' state survived restart; "
-                           "reconstructing full prompt from persisted prefix (%zu chars)",
-                           client_ip, client_port, prev_id, strlen(saved));
+                MYDS_LOG_I("[%s:%d] previous_response_id '%s' %s; reconstructing full prompt "
+                           "from persisted prefix (%zu chars) -> full prefill",
+                           client_ip, client_port, prev_id,
+                           resp_id_is_live(prev_id) ? "state is cold (pcache empty)"
+                                                    : "is not the most recent response",
+                           saved_len);
             }
+            free(saved);
         }
-        if (is_continuation && !resp_recover &&
-            (!resp_id_is_live(prev_id) || myds_context_get_pcache_len(ctx) == 0)) {
+        if (is_continuation && !resp_recover && !live_fast) {
             t_infer_slot_depth = 0;
             pthread_mutex_unlock(&g_infer_mutex);
             server_release_infer_slot();
-            MYDS_LOG_W("[%s:%d] previous_response_id rejected (%s): %s",
-                       client_ip, client_port,
-                       resp_id_seen(prev_id) ? "expired" : "unknown", prev_id);
+            MYDS_LOG_W("[%s:%d] previous_response_id rejected (unknown): %s",
+                       client_ip, client_port, prev_id);
             char err[512];
             snprintf(err, sizeof(err),
-                     "{\"error\":{\"message\":\"previous_response_id '%s' is not the most recent response "
-                     "(this server keeps one live state); replay the full input instead\","
-                     "\"type\":\"invalid_request_error\"}}", prev_id);
+                     "{\"error\":{\"message\":\"previous_response_id '%s' is unknown to this server "
+                     "(no stored prefix for it, and it is not the current one); replay the full input "
+                     "instead\",\"type\":\"invalid_request_error\","
+                     "\"code\":\"unknown_previous_response_id\"}}", prev_id);
             send_response(client_fd, 400, "Bad Request", "application/json", err);
             myds_vjob_sink_free(&img_sink);
             free(prompt); free(req_buf); close(client_fd); return;
@@ -3881,7 +3961,9 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
          *   · 带了但与指纹不同 ⇒ 400 明确报错，让调用方开启新对话
          * 仍然不渲染，只做一致性判定。 */
         const unsigned long long tools_sig = server_tools_signature(body, prompt_cap);
-        if (is_continuation && tools_sig != 0ull && resp_id_live_tools_sig() != tools_sig) {
+        /* ★ 2026-11-01：比对基准必须是【祖先 id】的工具指纹，不是「最近一次」的。
+         * 多活之后 prev_id 很可能不是最新那条，拿最新的指纹比会误报/漏报。 */
+        if (is_continuation && tools_sig != 0ull && resp_id_tools_sig(prev_id) != tools_sig) {
             t_infer_slot_depth = 0;
             pthread_mutex_unlock(&g_infer_mutex);
             server_release_infer_slot();
@@ -3927,7 +4009,8 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         /* 重建：把持久化前缀拼到本次新增部分之前。解析 suffix 时已跳过 BOS/instructions/tools，
          * 所以直接前缀拼接即可复现客户端原本会发送的完整输入。 */
         if (resp_recover) {
-            const char *saved = resp_id_saved_text(prev_id);
+            char *saved = NULL;
+            (void)resp_id_saved_text_copy(prev_id, &saved);
             if (saved && saved[0]) {
                 const size_t plen = strlen(saved), slen = strlen(prompt), need = plen + slen + 1u;
                 char *full = (char *)malloc(need);
@@ -3946,6 +4029,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 prompt = full;
                 prompt_cap = need;
             }
+            free(saved);
         }
         const bool req_has_instructions = json_has_top_field(body, "instructions");
         const bool req_has_tools = json_has_top_field(body, "tools");
@@ -4487,7 +4571,8 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             /* 累积提示词：完整模式直接存本次 prompt；suffix 模式存「上一轮前缀 + 本次新增」。
              * 这是重启后能重建输入的唯一依据 —— kvdisk 只存 KV 字节，不存 token 归属。 */
             {
-                const char *prev_text = is_continuation ? resp_id_saved_text(prev_id) : NULL;
+                char *prev_text = NULL;
+                if (is_continuation) (void)resp_id_saved_text_copy(prev_id, &prev_text);
                 char *accum = NULL;
                 if (prev_text && prev_text[0]) {
                     const size_t a = strlen(prev_text), b = strlen(prompt);
@@ -4498,7 +4583,11 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                     accum = (char *)malloc(b + 1u);
                     if (accum) memcpy(accum, prompt, b + 1u);
                 }
-                resp_id_register_text(resp_id, is_continuation ? resp_id_live_tools_sig() : tools_sig, accum);
+                free(prev_text);
+                const unsigned long long reg_sig = is_continuation
+                    ? (resp_id_tools_sig(prev_id) ? resp_id_tools_sig(prev_id) : resp_id_live_tools_sig())
+                    : tools_sig;
+                resp_id_register_text(resp_id, reg_sig, accum);
                 free(accum);
             }
         } else {

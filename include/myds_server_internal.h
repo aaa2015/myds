@@ -96,7 +96,10 @@ void resp_id_new(char *out, size_t cap);
 void resp_id_register(const char *id, unsigned long long tools_sig);
 void resp_id_register_text(const char *id, unsigned long long tools_sig, const char *accumulated);
 const char *resp_id_saved_text(const char *id);
+/* 在锁内拷贝，调用方负责 free(*out)。返回字节数，0 = 没有该 id。 */
+size_t resp_id_saved_text_copy(const char *id, char **out);
 unsigned long long resp_id_live_tools_sig(void);
+unsigned long long resp_id_tools_sig(const char *id);
 /* 工具集指纹（供单测与续跑一致性校验）。0 = 无 tools。 */
 unsigned long long server_tools_signature(const char *body, size_t scratch_cap);
 

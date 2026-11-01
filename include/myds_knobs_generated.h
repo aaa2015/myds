@@ -51,7 +51,7 @@ static const myds_knob_t myds_knobs_generated[] = {
     {"MYDS_COMMIT_PROF", "src/myds_v41.c", 4672, 1},
     {"MYDS_COMPRESSOR_PER_TOKEN", "src/myds_v41.c", 7293, 1},
     {"MYDS_CONFIG", "src/main.c", 247, 1},
-    {"MYDS_CORS_ORIGIN", "src/myds_server.c", 1729, 1},
+    {"MYDS_CORS_ORIGIN", "src/myds_server.c", 1791, 1},
     {"MYDS_CTX_SIZE", "src/main.c", 316, 0},
     {"MYDS_DEBUG_DISPATCH", "src/myds_metal.m", 3172, 1},
     {"MYDS_DEBUG_ENDPOINT", "src/myds_debugstate.c", 41, 1},
@@ -61,7 +61,7 @@ static const myds_knob_t myds_knobs_generated[] = {
     {"MYDS_DECODE_METRICS", "src/myds_engine.c", 3377, 0},
     {"MYDS_DECODE_Q8_FUSE_BF16", "src/myds_metal.m", 1759, 1},
     {"MYDS_DECODE_SPLIT", "src/myds_v41.c", 4116, 1},
-    {"MYDS_DEFAULT_REASONING_EFFORT", "src/myds_server.c", 1830, 1},
+    {"MYDS_DEFAULT_REASONING_EFFORT", "src/myds_server.c", 1892, 1},
     {"MYDS_DENSE_Q4_NR0", "src/myds_metal.m", 1753, 1},
     {"MYDS_DENSE_Q4_NR4_MASK", "src/myds_metal.m", 5034, 1},
     {"MYDS_DENSE_Q4_NSG", "src/myds_metal.m", 1753, 1},
@@ -135,7 +135,7 @@ static const myds_knob_t myds_knobs_generated[] = {
     {"MYDS_LM_HEAD_Q8_NR0", "src/myds_metal.m", 663, 1},
     {"MYDS_LOG_LEVEL", "src/myds_log.c", 23, 1},
     {"MYDS_LOOP_GUARD", "src/myds_engine.c", 3362, 0},
-    {"MYDS_MAX_BODY_MB", "src/myds_server.c", 3663, 1},
+    {"MYDS_MAX_BODY_MB", "src/myds_server.c", 3725, 1},
     {"MYDS_MAX_CONN", "src/myds_server.c", 71, 1},
     {"MYDS_MAX_NEW_TOKENS", "src/main.c", 317, 0},
     {"MYDS_MAX_QUEUE_DEPTH", "src/myds_server.c", 220, 1},
@@ -214,12 +214,13 @@ static const myds_knob_t myds_knobs_generated[] = {
     {"MYDS_QKV_NR0", "src/myds_metal.m", 5016, 1},
     {"MYDS_QKV_PIPELINE", "src/myds_v41.c", 4143, 1},
     {"MYDS_QUEUE_TIMEOUT_MS", "src/myds_server.c", 214, 1},
-    {"MYDS_RECV_DEADLINE_S", "src/myds_server.c", 3477, 1},
+    {"MYDS_RECV_DEADLINE_S", "src/myds_server.c", 3539, 1},
     {"MYDS_REPETITION_PENALTY", "src/main.c", 322, 0},
-    {"MYDS_REQUEST_PHASES", "src/myds_server.c", 2628, 1},
+    {"MYDS_REQUEST_PHASES", "src/myds_server.c", 2690, 1},
     {"MYDS_RESIDENCY_HB_MS", "src/myds_metal.m", 882, 1},
     {"MYDS_RESIDENCY_KEEP_ALIVE_S", "src/myds_metal.m", 880, 1},
-    {"MYDS_RESP_STATE", "src/myds_server.c", 313, 1},
+    {"MYDS_RESP_SLOTS", "src/myds_server.c", 273, 1},
+    {"MYDS_RESP_STATE", "src/myds_server.c", 337, 1},
     {"MYDS_RMS_NTH", "src/myds_metal.m", 3466, 1},
     {"MYDS_ROUTE_SIMD_SHUFFLE", "src/myds_v41_moe.c", 78, 1},
     {"MYDS_SHARED_FUSE", "src/myds_v41.c", 5467, 1},
@@ -235,7 +236,7 @@ static const myds_knob_t myds_knobs_generated[] = {
     {"MYDS_SPEC_ADAPTIVE", "src/myds_engine.c", 3368, 0},
     {"MYDS_SPEC_COST_SCHEDULER", "src/myds_engine.c", 3359, 0},
     {"MYDS_SPEC_SERIAL_PROBE", "src/myds_engine.c", 3538, 0},
-    {"MYDS_SSE_DRAIN_TIMEOUT_MS", "src/myds_server.c", 2711, 1},
+    {"MYDS_SSE_DRAIN_TIMEOUT_MS", "src/myds_server.c", 2773, 1},
     {"MYDS_STEER_ALPHA", "src/main.c", 330, 1},
     {"MYDS_STEER_ENABLE", "src/main.c", 339, 1},
     {"MYDS_STEER_LAYERS", "src/main.c", 337, 1},
@@ -260,8 +261,8 @@ static const myds_knob_t myds_knobs_generated[] = {
     {"MYDS_YOCO_KEEP_TOKENS", "src/myds_v41.c", 7381, 1},
 };
 
-#define MYDS_KNOB_COUNT 247u
-#define MYDS_KNOB_DIRECT_COUNT 223u
+#define MYDS_KNOB_COUNT 248u
+#define MYDS_KNOB_DIRECT_COUNT 224u
 #define MYDS_KNOB_WRAPPED_COUNT 24u
 #define MYDS_KNOB_HELPERS "capture_parse_flag,cfg_f32_env,cfg_u32_env,decode_candidate_parse,decode_env_enabled,env_default_on,env_is_one_literal,env_not_zero_literal,qkv_fusion_enabled,v41_env_u32"
 
