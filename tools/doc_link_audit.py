@@ -251,6 +251,7 @@ def main() -> int:
     bench_missing: set[str] = set()
     moved: set[str] = set()
     unverifiable_dirs: set[str] = set()
+    moved_stale: set[str] = set()
 
     for md in md_files:
         rel_md = str(md.relative_to(ROOT))
@@ -284,13 +285,18 @@ def main() -> int:
                 # when it does not, say so instead of guessing. "I cannot look"
                 # is not "it is missing" -- a gate whose result depends on which
                 # host runs it gets switched off the first time it cries wolf.
-                if DOCS_REPO.is_dir():
-                    if (DOCS_REPO / tok).is_dir():
-                        moved.add(f"{rel_md}  {tok}")
-                    else:
-                        bench_missing.add(f"{rel_md}  {tok}")
-                else:
+                # Only trust a checkout that actually is a git working tree.
+                # A bare leftover directory named mydsdoc (macstudio has one,
+                # holding a single stale benchmark) would otherwise turn a
+                # recorded fact into a false failure -- "the path exists" is not
+                # the same as "the evidence was checked".
+                trusted = DOCS_REPO.is_dir() and (DOCS_REPO / ".git").exists()
+                if not trusted:
                     unverifiable_dirs.add(f"{rel_md}  {tok}")
+                elif (DOCS_REPO / tok).is_dir():
+                    moved.add(f"{rel_md}  {tok}")
+                else:
+                    moved_stale.add(f"{rel_md}  {tok}")
                 continue
             bench_missing.add(f"{rel_md}  {tok}")
         for lineno, line, cwd in iter_code_blocks(md):
@@ -353,7 +359,7 @@ def main() -> int:
     print(f"path claims   : {n_paths}")
     print(f"make refs     : {n_make}  ({len(targets)} rules in Makefile)")
     if n_bench:
-        extra = f", {len(unverifiable_dirs)} unverifiable (mydsdoc not checked out)" \
+        extra = f", {len(unverifiable_dirs)} unverifiable (no mydsdoc checkout)" \
             if unverifiable_dirs else ""
         print(f"benchmark dirs: {n_bench} named -- {len(known)} known-absent, "
               f"{len(moved)} moved to mydsdoc{extra}")
@@ -387,6 +393,16 @@ def main() -> int:
                 continue
             seen.add(key)
             print(f"  {ln:>7}  {kind:<12} {tok}")
+        print()
+
+    if moved_stale:
+        # Warning, not failure: the docs repo is checked out but does not contain
+        # this evidence. That is worth seeing, but it is a fact about the other
+        # checkout, not about this repository's documentation.
+        print("WARNING -- recorded as moved to mydsdoc, but not found in the "
+              f"{DOCS_REPO} checkout ({len(moved_stale)}):")
+        for mv in sorted(moved_stale):
+            print(f"  {mv}")
         print()
 
     if moved and args.verbose:
