@@ -149,7 +149,7 @@ ssh macstudio 'cd ~/Projects/myds && git pull --ff-only'
 # 兜底：目标机不是干净检出、或有未提交改动时，整树 rsync（不碰 bin/ 与 build/）
 rsync -az --delete \
       --exclude='.git' --exclude='bin' --exclude='build' \
-      --exclude='scratch' --exclude='.deploy-prev' \
+      --exclude='scratch' --exclude='bin/.prev-*' \
       ~/Projects/myds/ macstudio:~/Projects/myds/
 ```
 
