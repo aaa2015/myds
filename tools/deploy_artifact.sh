@@ -113,6 +113,17 @@ if [[ $MISMATCH -ne 0 ]]; then
     exit 1
 fi
 
+# ── 4.5) 构建溯源 ─────────────────────────────────────────
+# bin/ 不在 git 里，二进制本身也不带 commit。没有这份记录，"线上跑的是哪个源码"
+# 只能靠回忆；改了 src 忘了重部署，两边会静默分叉，而且没有任何症状 ——
+# 直到有人对着当前代码去 debug 一个不由它产生的行为。
+# 记录在【构建侧】写（只有构建侧知道源码树状态），随产物一起送过去，
+# 由 `make deploy-check` 在运行侧核对。
+echo "🧾 记录构建溯源"
+python3 "$MYDS_SRC/tools/build_provenance.py" write --out bin/BUILD-INFO.json | sed 's/^/   /'
+rsync -lpgoD --checksum --no-times bin/BUILD-INFO.json \
+    "${REMOTE_HOST}:${REMOTE_MYDS}/bin/BUILD-INFO.json"
+
 # ── 5) 重启 ───────────────────────────────────────────────
 # 2026-10-31：fleet.conf 里 8187 已从 E=3 改为 E=1。
 # E=3 原本靠「产物 mtime 比进程新」自动重启；E=1 只在没跑时启动。
