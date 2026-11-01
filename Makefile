@@ -226,6 +226,28 @@ doc-check:
 adoption-check:
 	python3 -B tools/adoption_register_check.py --strict
 
+# Are the deployed artifacts actually built from this source tree?
+# bin/ is gitignored and the binary names no commit, so without this the link
+# between repo and production is implicit. Exit 2 = no record (older deploy).
+#
+# Runs tools/build_provenance.py directly rather than a make target, because the
+# target may not exist on a host whose checkout predates this change -- and the
+# check is most useful exactly when the two sides disagree.
+deploy-check:
+	python3 -B tools/build_provenance.py verify
+
+# Called by deploy_artifact.sh on the build host, after the artifacts exist.
+provenance:
+	python3 -B tools/build_provenance.py write
+
+# The effective compile/link flags, for build provenance.
+# Why not hash the Makefile text: adding an unrelated phony target would then
+# invalidate provenance and force a pointless rebuild. What actually determines
+# the binary is these flags plus the source contents.
+provenance-flags:
+	@printf 'CC=%s\nCFLAGS=%s\nOBJCFLAGS=%s\nLDFLAGS=%s\nDEPLOY_TARGET=%s\nSRCS_C=%s\nSRCS_M=%s\n' \
+		"$(CC)" "$(CFLAGS)" "$(OBJCFLAGS)" "$(LDFLAGS)" "$(DEPLOY_TARGET)" "$(SRCS_C)" "$(SRCS_M)"
+
 # Regenerate the ledger's §105/§106 tables and expected.json from raw/*.jsonl.
 # Run this after touching anything under benchmarks/register_only_2026-10-27/raw/.
 gen-ledger:
