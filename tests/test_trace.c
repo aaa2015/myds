@@ -264,6 +264,57 @@ static void test_page_js_is_well_formed(void) {
  *
  * 这两条断言把那个状态钉死：模板必须留占位符（否则没法注入），
  * 展开后必须不含占位符且带着 token。 */
+/* 页面脚本只能引用模板里真实存在的元素。
+ *
+ * 这条来自一次真实故障：删掉标题栏里的 count/容量显示时，一并删掉了 id="hdr"
+ * 的 span，而脚本里还有三处 getElementById('hdr') —— 请求出错时页面不会显示
+ * 任何错误，因为写错误信息的那行自己抛了 TypeError。看起来就是「一直空白」。
+ *
+ * 检查方式：脚本里出现的 id 必须在 HTML 里作为 id="..." 存在。 */
+static void test_page_script_refs_exist(void) {
+    const char *html = myds_trace_page_html();
+    const char *sb = strstr(html, "<script>");
+    CHECK(sb != NULL);
+    if (!sb) return;
+
+    /* 收集 getElementById('x') 里的 x */
+    const char *p = sb;
+    const char *needle = "getElementById('";
+    const size_t nl = strlen(needle);
+    int checked = 0;
+    while ((p = strstr(p, needle)) != NULL) {
+        p += nl;
+        const char *end = strchr(p, '\'');
+        if (!end) break;
+        char id[64];
+        const size_t n = (size_t)(end - p);
+        if (n == 0 || n >= sizeof(id)) continue;
+        memcpy(id, p, n);
+        id[n] = '\0';
+        /* 有少数元素是脚本运行时才建出来的（画布 lc 在选中请求后才有）。
+         * 把它们列成白名单，比放宽断言好：放宽了，真正的漏 id 也会被放过。 */
+        static const char *const runtime_created[] = { "lc" };
+        bool skip = false;
+        for (size_t k = 0; k < sizeof(runtime_created)/sizeof(runtime_created[0]); ++k)
+            if (!strcmp(id, runtime_created[k])) { skip = true; break; }
+        if (skip) continue;
+
+        /* 只在 <script> 之前找：脚本自己也会拼出 id="x" 的模板字符串
+         * （sysbox 就是这么重建自己的），拿整份文档搜会把脚本里的字符串
+         * 当成真实元素，断言就永远为真 —— 这一版的第一稿正是如此。 */
+        char attr[80];
+        snprintf(attr, sizeof(attr), "id=\"%s\"", id);
+        const size_t markup_len = (size_t)(sb - html);
+        bool found = false;
+        for (size_t i = 0; i + strlen(attr) <= markup_len; ++i) {
+            if (!memcmp(html + i, attr, strlen(attr))) { found = true; break; }
+        }
+        CHECK(found);
+        checked++;
+    }
+    CHECK(checked >= 3);   /* rows / sysbox / detail 至少三个 */
+}
+
 static void test_token_is_injected_into_page(void) {
     const char *tpl = myds_trace_page_html();
     CHECK(strstr(tpl, "__MYDS_TRACE_TOKEN__") != NULL);
@@ -318,6 +369,7 @@ int main(void) {
     test_capacity_clamped();
     test_wall_includes_engine();
     test_page_js_is_well_formed();
+    test_page_script_refs_exist();
     test_token_is_injected_into_page();
     test_page_is_html();
     myds_trace_reset();
