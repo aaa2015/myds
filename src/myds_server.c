@@ -1917,6 +1917,14 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                     trec.detail.decode_cbs = (uint32_t)pd.decode_cbs;
                     trec.detail.tokenize_s = pd.tokenize_s;
                     trec.detail.kvdsk_s = pd.kvdsk_s;
+                    memcpy(trec.detail.prefill_tag_gpu, pd.prefill_tag_gpu,
+                           sizeof(trec.detail.prefill_tag_gpu));
+                    memcpy(trec.detail.prefill_tag_cbs, pd.prefill_tag_cbs,
+                           sizeof(trec.detail.prefill_tag_cbs));
+                    memcpy(trec.detail.decode_tag_gpu, pd.decode_tag_gpu,
+                           sizeof(trec.detail.decode_tag_gpu));
+                    memcpy(trec.detail.decode_tag_cbs, pd.decode_tag_cbs,
+                           sizeof(trec.detail.decode_tag_cbs));
                 }
                 /* emit 是服务端量的，不走引擎。只有确实生成了 token 才有意义。 */
                 if (emit_measured_s >= 0.0) trec.detail.emit_s = emit_measured_s;

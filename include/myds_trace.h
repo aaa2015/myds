@@ -52,6 +52,12 @@ typedef struct {
     double emit_s;          /* 回调里把 token 交出去的累计（写 socket / 拼缓冲） */
     uint32_t prefill_cbs;
     uint32_t decode_cbs;
+    /* 按阶段标签的 GPU 忙时（下标即 myds_ph_tag_t，见 myds_metal.h）。
+     * 只用于页面的树状明细；为 0 的桶不输出。 */
+    double   prefill_tag_gpu[52];
+    uint64_t prefill_tag_cbs[52];   /* ★ 必须与引擎侧同宽：uint32 会与 uint64 错位 */
+    double   decode_tag_gpu[52];
+    uint64_t decode_tag_cbs[52];
 } myds_trace_detail_t;
 
 typedef struct {

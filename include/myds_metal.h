@@ -46,6 +46,41 @@ void myds_metal_dense_q4_v41_head_reference_counters(myds_metal_decode_candidate
  * span is the last completed CB, not a token or an entire split request. */
 const char *myds_metal_loaded_library_path(void);
 int myds_metal_last_completed_gpu_span(double *start_s, double *end_s);
+/* ── 阶段标签（2026-11-03）──────────────────────────────────────────
+ * 问题：一次 decode 把一个 token 的全部层编进少数几个 command buffer，
+ * 光看「GPU 忙」这个总数无法回答「哪一步在算」。
+ *
+ * 做法：在【提交的那一刻】把当前标签记在那个 CB 上，完成时按标签归集它的
+ * GPUStartTime..GPUEndTime。标签切换只是写一个 int，不新增 commit、不加锁。
+ *
+ * ★ 口径警告：两个 CB 在 GPU 上并行时，两个桶会同时增长，各桶相加可能
+ *   大于实际 GPU 墙钟。桶之间是「按提交归属」，不是互斥切片。 */
+typedef enum {
+    MYDS_PH_TAG_NONE = 0,
+    MYDS_PH_TAG_ENGRAM,       /* engram 投影 */
+    MYDS_PH_TAG_EMBED,        /* embedding 查表 */
+    MYDS_PH_TAG_NORM_MIX,     /* HC 归约 / RMSNorm / HC Mix */
+    MYDS_PH_TAG_QKV,          /* q_a / kv 投影 + norm */
+    MYDS_PH_TAG_QB,           /* q_b 大 GEMV */
+    MYDS_PH_TAG_ATTN,         /* SWA / chunk attention / rope / kv 写 */
+    MYDS_PH_TAG_ATTN_OUT,     /* attn_out_a + attn_out_b + HC expand */
+    MYDS_PH_TAG_FFN_IN,       /* ffn norm / HC mix */
+    MYDS_PH_TAG_SHARED_ROUTE, /* shared expert + router */
+    MYDS_PH_TAG_MOE,          /* 专家 GEMV + 聚合 */
+    MYDS_PH_TAG_HEAD,         /* output norm + lm_head */
+    MYDS_PH_TAG_OTHER,
+    /* 32 以上留给「内部分段」（decode 按 MYDS_DECODE_SPLIT 切出的段）。
+     * 连续编号，页面按 id-32 当作段号。 */
+    MYDS_PH_TAG_SEG_BASE = 32,
+    MYDS_PH_TAG_MAX = 52
+} myds_ph_tag_t;
+
+void myds_metal_phase_tag_set(int tag);
+int  myds_metal_phase_tag_get(void);
+/* 取走各标签自上次 take 以来的 GPU 忙时与 CB 数，并清零。
+ * 数组长度至少 MYDS_PH_TAG_MAX；索引即 myds_ph_tag_t。 */
+void myds_metal_phase_tags_take(double *gpu_s, uint64_t *cbs);
+
 /* ── 常开分阶段归因（2026-11-03）────────────────────────────────────
  * 每个 MTLCommandBuffer 完成时本来就带 GPUStartTime / GPUEndTime，读它们
  * 不需要任何额外的工作；wait 时间只在我们【已经阻塞】的那两个函数里取两次

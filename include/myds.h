@@ -130,6 +130,12 @@ typedef struct {
     double   kvdsk_s;      /* 磁盘 KV 快照的加载 + 应用 */
     uint64_t prefill_cbs;
     uint64_t decode_cbs;
+    /* 按阶段标签的 GPU 忙时（下标即 myds_ph_tag_t，见 myds_metal.h）。
+     * 页面的「树状明细」直接用这两个数组；为 0 的桶没有画。 */
+    double   prefill_tag_gpu[52];
+    uint64_t prefill_tag_cbs[52];
+    double   decode_tag_gpu[52];
+    uint64_t decode_tag_cbs[52];
     int      valid;
 } myds_phase_detail_t;
 

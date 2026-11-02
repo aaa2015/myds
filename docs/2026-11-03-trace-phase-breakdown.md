@@ -74,3 +74,57 @@
 
 4. **`engine - prefill - decode` 归因到的「其余」包含首字前的 head+采样**，
    不要把整块当成"未知开销"去找 bug。
+
+## 六、更细的一层：按阶段标签归集 GPU 时间（第二阶段）
+
+上面只到「prefill 的 GPU 忙 / decode 的 GPU 忙」。要知道**是哪一步在算**，
+需要在提交的那一刻就知道这个 command buffer 属于哪个阶段。
+
+做法：`myds_metal_phase_tag_set(tag)` 只是写一个 int。CB 提交时把当前标签存进
+与 inflight 数组对齐的表，完成时按标签把 `GPUEndTime-GPUStartTime` 累加进去。
+**不新增 commit、不加锁、不加等待。**
+
+标签：engram / embedding / 归一化+Mix / q_a,kv / q_b / attention / attn out /
+ffn 输入 / 共享专家+路由 / MoE / head+lm_head / 其它。
+
+### prefill 需要 `MYDS_PHASE_SPLIT=1`
+
+生产路径原本把整个 chunk 编进少数几个 CB，步骤之间没有提交点，标签无从生效。
+`MYDS_PHASE_SPLIT=1` 在步骤边界插入 **flush（只提交、不等待）**，让每个步骤
+各自成为一个 CB。仍是同一个 queue，顺序不变。
+
+**实测代价（macstudio，556 token prompt，各 3 次，交替重跑以避开前缀缓存）**
+
+| | prefill 墙钟 | CB 数 | decode |
+|---|---|---|---|
+| 关 | 2.135 / 2.136 / 2.191 s | 82 | 41.5 / 41.5 / 41.4 t/s |
+| 开 | 2.129 / 2.134 / 2.190 s | 723 | 41.4 / 41.5 / 41.5 t/s |
+
+中位数 2.136 vs 2.134 s，decode 完全相同 ⇒ **开销在噪声内**，因此生产默认开启。
+
+### 实测归因（同上那轮 prefill，2.13s / GPU 2.05s）
+
+| 阶段 | GPU 忙 | CB |
+|---|---|---|
+| MoE 专家 | 1170.0 ms (58%) | 80 |
+| attention | 381.7 ms (19%) | 81 |
+| 共享专家+路由 | 144.4 ms | 80 |
+| attn out | 122.2 ms | 80 |
+| q_b GEMV | 111.0 ms | 81 |
+| q_a/kv | 55.7 ms | 81 |
+| head+lm_head | 39.0 ms | 158 |
+| ffn 输入 | 28.2 ms | 80 |
+
+### decode 分段
+
+`MYDS_DECODE_SPLIT=20` 本来就把每个 token 切成 20 段（每段 2 层）。
+现在每段各带标签，页面直接列出「段 0..19 + head」的 GPU 时间。
+实测 200 token 时各段 200–280 ms，head 308 ms —— head 单独成桶，
+避免「最后一段总是最慢」的假象。
+
+## 七、又踩到的坑
+
+**引擎侧 `uint64_t` 计数拷进 trace 的 `uint32_t` 数组，整段错位。**
+`memcpy` 按目标大小拷，把 `uint64` 数组的前一半当成 52 个 `uint32`，
+于是「其它（OTHER, 12）」的 41 个 CB 显示成了 `#12 ... 41` 而 GPU 时间是 0 ——
+看起来像「有个神秘的 24 号阶段」。两边类型必须一致。

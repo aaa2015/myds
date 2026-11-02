@@ -414,9 +414,10 @@ static void test_page_script_refs_exist(void) {
         if (n == 0 || n >= sizeof(id)) continue;
         memcpy(id, p, n);
         id[n] = '\0';
-        /* 有少数元素是脚本运行时才建出来的（画布 lc 在选中请求后才有）。
-         * 把它们列成白名单，比放宽断言好：放宽了，真正的漏 id 也会被放过。 */
-        static const char *const runtime_created[] = { "lc" };
+        /* 有少数元素是脚本运行时才建出来的（画布 lc、右栏最大化按钮 maxR 都在
+         * 选中请求后随详情面板重建）。把它们列成白名单，比放宽断言好：
+         * 放宽了，真正的漏 id 也会被放过。 */
+        static const char *const runtime_created[] = { "lc", "maxR" };
         bool skip = false;
         for (size_t k = 0; k < sizeof(runtime_created)/sizeof(runtime_created[0]); ++k)
             if (!strcmp(id, runtime_created[k])) { skip = true; break; }

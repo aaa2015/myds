@@ -1476,10 +1476,46 @@ static double g_ph_gpu_busy_s = 0.0;
 static double g_ph_wait_s = 0.0;
 static uint64_t g_ph_cbs = 0;
 
+/* 阶段标签：当前值 + 按标签的累计。 */
+static int g_ph_tag_cur = MYDS_PH_TAG_NONE;
+static double g_ph_tag_gpu[MYDS_PH_TAG_MAX];
+static uint64_t g_ph_tag_cbs[MYDS_PH_TAG_MAX];
+/* 每个 inflight CB 自己的标签，与 g_inflight_cbs 下标对齐。 */
+static NSMutableArray<NSNumber *> *g_inflight_tags = nil;
+
+void myds_metal_phase_tag_set(int tag) {
+    g_ph_tag_cur = (tag > 0 && tag < MYDS_PH_TAG_MAX) ? tag : MYDS_PH_TAG_NONE;
+}
+
+int myds_metal_phase_tag_get(void) {
+    return g_ph_tag_cur;
+}
+
+void myds_metal_phase_tags_take(double *gpu_s, uint64_t *cbs) {
+    for (int i = 0; i < MYDS_PH_TAG_MAX; i++) {
+        if (gpu_s) gpu_s[i] = g_ph_tag_gpu[i];
+        if (cbs) cbs[i] = g_ph_tag_cbs[i];
+        g_ph_tag_gpu[i] = 0.0;
+        g_ph_tag_cbs[i] = 0;
+    }
+}
+
+static void ph_tag_note(int tag, double start, double end) {
+    if (tag <= 0 || tag >= MYDS_PH_TAG_MAX) tag = MYDS_PH_TAG_OTHER;
+    if (!(end > start) || start <= 0.0) return;
+    g_ph_tag_gpu[tag] += end - start;
+    g_ph_tag_cbs[tag]++;
+}
+
 void myds_metal_phase_reset(void) {
     g_ph_gpu_busy_s = 0.0;
     g_ph_wait_s = 0.0;
     g_ph_cbs = 0;
+    g_ph_tag_cur = MYDS_PH_TAG_NONE;
+    for (int i = 0; i < MYDS_PH_TAG_MAX; i++) {
+        g_ph_tag_gpu[i] = 0.0;
+        g_ph_tag_cbs[i] = 0;
+    }
 }
 
 void myds_metal_phase_take(double *gpu_busy_s, double *wait_s, uint64_t *cbs) {
@@ -1501,7 +1537,9 @@ static int wait_inflight_commands(void) {
     }
     int ok = 1;
     const double _w0 = myds_metal_host_time();
-    for (id<MTLCommandBuffer> cb in g_inflight_cbs) {
+    const NSUInteger n_inflight = [g_inflight_cbs count];
+    for (NSUInteger i = 0; i < n_inflight; i++) {
+        id<MTLCommandBuffer> cb = g_inflight_cbs[i];
         if (cb.status != MTLCommandBufferStatusCompleted) {
             [cb waitUntilCompleted];
         }
@@ -1512,10 +1550,14 @@ static int wait_inflight_commands(void) {
             if (isfinite(_s) && isfinite(_e) && _s > 0.0 && _e > _s) {
                 g_ph_gpu_busy_s += _e - _s;
                 g_ph_cbs++;
+                const int tag = (g_inflight_tags && i < [g_inflight_tags count])
+                    ? (int)[g_inflight_tags[i] integerValue] : MYDS_PH_TAG_OTHER;
+                ph_tag_note(tag, _s, _e);
             }
         }
         if (!command_buffer_result(cb)) ok = 0;
     }
+    if (g_inflight_tags) [g_inflight_tags removeAllObjects];
     {
         const double _w1 = myds_metal_host_time();
         if (_w1 > _w0) g_ph_wait_s += _w1 - _w0;
@@ -1600,7 +1642,12 @@ static int wait_command_buffer(id<MTLCommandBuffer> cb) {
             g_last_gpu_start > 0.0 && g_last_gpu_end > g_last_gpu_start;
         /* GPU 真正在算的时间。注意 GPU 时间戳与 CPU 时钟同域（mach_absolute_time），
          * 但与 wait 可以重叠 —— 见 myds_metal.h 的口径说明。 */
-        if (g_last_gpu_span_valid) g_ph_gpu_busy_s += g_last_gpu_end - g_last_gpu_start;
+        if (g_last_gpu_span_valid) {
+            g_ph_gpu_busy_s += g_last_gpu_end - g_last_gpu_start;
+            /* 直接 commit+wait 的这条：调用点的标签就是它的归属。
+             * （flush 走的是 inflight 路径，那里用提交时存下的标签。） */
+            ph_tag_note(g_ph_tag_cur, g_last_gpu_start, g_last_gpu_end);
+        }
     }
     g_ph_cbs++;
     return ok;
@@ -2747,7 +2794,10 @@ int myds_metal_flush_batch(void) {
     id<MTLCommandBuffer> cb = g_batch_cb;
     g_batch_cb = nil;
     if (!g_inflight_cbs) g_inflight_cbs = [[NSMutableArray alloc] initWithCapacity:64];
+    if (!g_inflight_tags) g_inflight_tags = [[NSMutableArray alloc] initWithCapacity:64];
     [g_inflight_cbs addObject:cb];
+    /* 标签与下标对齐：完成时按它在 inflight 里的位置取回标签。 */
+    [g_inflight_tags addObject:@(g_ph_tag_cur)];
     myds_metal_residency_keep_alive();
     gp_note_commit();
     [cb commit];
@@ -2781,7 +2831,10 @@ int myds_metal_commit_and_wait_event(uint64_t val) {
     id<MTLCommandBuffer> cb = g_batch_cb;
     g_batch_cb = nil;
     if (!g_inflight_cbs) g_inflight_cbs = [[NSMutableArray alloc] initWithCapacity:64];
+    if (!g_inflight_tags) g_inflight_tags = [[NSMutableArray alloc] initWithCapacity:64];
     [g_inflight_cbs addObject:cb];
+    /* 标签与下标对齐：完成时按它在 inflight 里的位置取回标签。 */
+    [g_inflight_tags addObject:@(g_ph_tag_cur)];
     myds_metal_residency_keep_alive();
     [cb commit];
     g_batch_commit_count++;

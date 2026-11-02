@@ -4177,6 +4177,9 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
     const bool engram_prestage_enabled = fine_pipeline && ffn_hc_mode == 1 &&
         g->engram_project_round_skip >= 0 &&
         ordinary_decode_allowed && need_logits && !trace_on && !myds_metal_get_auto_barrier();
+    /* decode 分段归因：第 0 段从循环开头算起，段尾在 split 处换标签。
+     * 只在 split 生效时才有多个 CB；没有 split 时整段就是一个 tag，仍然准确。 */
+    myds_metal_phase_tag_set(MYDS_PH_TAG_SEG_BASE);
     for (il=0;il<V41_LAYERS;il++) {
         const myds_layer_t *base=&m->layers[il];
         const v41_layer_t *l=&v->layers[il];
@@ -4609,8 +4612,20 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
             ((il + 1u) * (uint32_t)decode_split) / V41_LAYERS != (il * (uint32_t)decode_split) / V41_LAYERS) {
             CHECK(myds_metal_flush_batch());
             CHECK(myds_metal_begin_batch());
+            /* 段标签：flush 时 CB 已带上前一段的标签，这里给新开的 CB 换下一段。
+             * 零成本（写一个 int），目的是让页面能看出「哪一段慢」，
+             * 而不是只有一个 40 层合计的 GPU 忙时。 */
+            {
+                const uint32_t seg = ((il + 1u) * (uint32_t)decode_split) / V41_LAYERS;
+                const uint32_t segcap = (uint32_t)(MYDS_PH_TAG_MAX - MYDS_PH_TAG_SEG_BASE);
+                myds_metal_phase_tag_set(MYDS_PH_TAG_SEG_BASE +
+                    (int)(seg < segcap ? seg : segcap - 1u));
+            }
         }
     }
+    /* head 与 lm_head 单独成桶：它是一次大 GEMV + 采样，
+     * 混进最后一段会让「最后一段总是最慢」变成假象。 */
+    myds_metal_phase_tag_set(MYDS_PH_TAG_HEAD);
     phase="output head";
     int32_t next_tok = 0;
     if (need_logits) {
@@ -7281,6 +7296,23 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     }
 
     int do_prof = getenv("MYDS_PROFILE_PREFILL") ? 1 : 0;
+    /* 阶段切分（2026-11-03）：为了在【不串行化】的前提下拿到按阶段的 GPU 时间，
+     * 用 flush（只提交、不等待）在步骤边界换一个 command buffer。
+     * 每个 CB 在提交时记下当前标签，完成时按标签归集 GPU 时间。
+     *
+     * 默认关闭：flush 会增加提交次数，改变流水重叠形态。开了之后测到的
+     * GPU 归因是准的，但与「一次大 CB」的墙钟不完全等价 —— 页面会标出来。
+     * 关闭时行为与原来逐字节一致（一次 flush 都不多）。 */
+    const bool opt_phase_split = getenv("MYDS_PHASE_SPLIT") != NULL;
+#define PHASE_BOUNDARY(tag)                                                   \
+    do {                                                                      \
+        if (opt_phase_split) {                                                \
+            CHECK(myds_metal_flush_batch());                                  \
+            CHECK(myds_metal_begin_batch());                                  \
+            myds_metal_phase_tag_set(tag);                                    \
+        }                                                                     \
+    } while (0)
+    if (opt_phase_split) myds_metal_phase_tag_set(MYDS_PH_TAG_EMBED);
     const bool batch_trace_prefix = (getenv("MYDS_BATCH_TRACE_PREFIX") != NULL);
     const bool opt_disable_mm_engram = (getenv("MYDS_DISABLE_MM_ENGRAM") != NULL);
     const bool opt_skip_q_a = (getenv("MYDS_SKIP_Q_A") != NULL);
@@ -7545,6 +7577,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             t += step;
         }
         TIME_ACC(prof_engram);
+                PHASE_BOUNDARY(MYDS_PH_TAG_EMBED);
 
         phase = "embedding lookup";
         TIME_START();
@@ -7606,6 +7639,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             }
         }
         TIME_ACC(prof_embedding);
+                PHASE_BOUNDARY(MYDS_PH_TAG_NORM_MIX);
 
         phase = "layer loop";
         uint32_t moe_off = 0;   /* 当前 MoE 批已经攒了多少 token */
@@ -7838,6 +7872,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     }
                 }
                 TIME_ACC(prof_step1);
+                PHASE_BOUNDARY(MYDS_PH_TAG_QKV);
 
                 /* Step 2: Batched Q_A and KV projections (reads weights ONCE for all c_len tokens)
                  * ★ 前缀段（kv_only）只需要 KV（以及层 20 的压缩器，仅依赖 x_norm_buf）：Q_A/Q_B 都不必算。 */
@@ -7881,6 +7916,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     }
                 }
                 TIME_ACC(prof_step2);
+                PHASE_BOUNDARY(MYDS_PH_TAG_QB);
 
                 /* Step 3: Batched Q_B projection (reads 21 MB weight ONCE for all c_len tokens) */
                 TIME_START();
@@ -7902,6 +7938,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 }
                 }
                 TIME_ACC(prof_step3);
+                PHASE_BOUNDARY(MYDS_PH_TAG_ATTN);
 
                 if (do_prof) {
                     TIME_START();
@@ -8101,6 +8138,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 CHECK(a_ok);
                 CHECK(myds_metal_v41_bf16(cw->attn_low_buf, 8192 * c_len));
                 TIME_ACC(prof_step4);
+                PHASE_BOUNDARY(MYDS_PH_TAG_ATTN_OUT);
                 if (do_prof) { disp_mark4 = myds_metal_dispatch_count(); disp_step14 += disp_mark4 - disp_layer0; }  /* 诊断 */
 
                 if (do_prof) {
@@ -8120,6 +8158,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                                                ctx->steer->alpha_effective, V41_DIM, c_len));
                 }
                 TIME_ACC(prof_step5);
+                PHASE_BOUNDARY(MYDS_PH_TAG_FFN_IN);
                   if (do_prof && opt_prof_step56) {
                       TIME_START();
                       CHECK(myds_metal_commit_batch());
@@ -8203,6 +8242,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     }
                 }
                 TIME_ACC(prof_step6);
+                PHASE_BOUNDARY(MYDS_PH_TAG_SHARED_ROUTE);
                   if (do_prof && opt_prof_step56) {
                       TIME_START();
                       CHECK(myds_metal_commit_batch());
@@ -8263,6 +8303,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     }
                 }
                 TIME_ACC(prof_step7);
+                PHASE_BOUNDARY(MYDS_PH_TAG_MOE);
 
                 /* MYDS_PROFILE_ALLOC=1 附带：本层路由的专家 union。
                  * 决定 MoE 的读取下限——若 union << 384，说明只读部分专家是可能的。 */
@@ -8541,6 +8582,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                      * 而位置单调递增 ⇒ 同一个 p 不会再被访问。 */
                 }
                 TIME_ACC(prof_step8);
+                PHASE_BOUNDARY(MYDS_PH_TAG_HEAD);
 
                 TIME_START();
                 if (do_prof || trace_on || opt_sync_chunk || ++inflight_chunks >= 32u) {

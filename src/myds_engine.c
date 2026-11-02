@@ -3375,6 +3375,10 @@ static int myds_generate_internal(myds_context_t *ctx,
     ctx->ph_tokenize_s = 0.0;
     ctx->ph_kvdsk_s = 0.0;
     ctx->ph_valid = 1;
+    memset(ctx->ph_prefill_tag_gpu, 0, sizeof(ctx->ph_prefill_tag_gpu));
+    memset(ctx->ph_prefill_tag_cbs, 0, sizeof(ctx->ph_prefill_tag_cbs));
+    memset(ctx->ph_decode_tag_gpu, 0, sizeof(ctx->ph_decode_tag_gpu));
+    memset(ctx->ph_decode_tag_cbs, 0, sizeof(ctx->ph_decode_tag_cbs));
     myds_metal_phase_reset();
     myds_dspark_reset_proposal_state(ctx->dspark);
     ctx->decode_metrics_active = false;
@@ -3941,6 +3945,7 @@ static int myds_generate_internal(myds_context_t *ctx,
          * 注意 GPU 可能已经跑在 CPU 前面，所以 gpu_busy 与 wait 不必相加等于墙钟。 */
         myds_metal_phase_take(&ctx->ph_prefill_gpu_s, &ctx->ph_prefill_wait_s,
                               &ctx->ph_prefill_cbs);
+        myds_metal_phase_tags_take(ctx->ph_prefill_tag_gpu, ctx->ph_prefill_tag_cbs);
         /* 中途失败/取消时，状态可能只推进了一部分 ⇒ 整条缓存作废（下次全量重跑）。
          * 绝不能留下「pcache_len 说已缓存 n_prompt、而 GPU 状态只到一半」的组合：
          * 那会让下一个请求从错误的位置续跑（直接撞 base_pos != next_position 的检查）。 */
@@ -4969,6 +4974,7 @@ static int myds_generate_internal(myds_context_t *ctx,
     /* decode 结束取一次：自 prefill 那次 take 以来完成的所有 command buffer
      * 都属于 decode（包括投机验证、快照写入等）。 */
     myds_metal_phase_take(&ctx->ph_decode_gpu_s, &ctx->ph_decode_wait_s, &ctx->ph_decode_cbs);
+    myds_metal_phase_tags_take(ctx->ph_decode_tag_gpu, ctx->ph_decode_tag_cbs);
     /* 纯观测：本次请求的 MoE 专家权重分布（MYDS_MOE_WEIGHT_HIST=1 才有输出）。
      * 放在请求末尾、reset=true ⇒ 每次请求一份独立分布，便于按请求/按模型对比。 */
     myds_v41_moe_weight_hist_report("moe-hist", true);
@@ -5034,6 +5040,10 @@ void myds_context_reset_phase_detail(myds_context_t *ctx) {
     ctx->ph_tokenize_s = 0.0;
     ctx->ph_kvdsk_s = 0.0;
     ctx->ph_valid = 0;
+    memset(ctx->ph_prefill_tag_gpu, 0, sizeof(ctx->ph_prefill_tag_gpu));
+    memset(ctx->ph_prefill_tag_cbs, 0, sizeof(ctx->ph_prefill_tag_cbs));
+    memset(ctx->ph_decode_tag_gpu, 0, sizeof(ctx->ph_decode_tag_gpu));
+    memset(ctx->ph_decode_tag_cbs, 0, sizeof(ctx->ph_decode_tag_cbs));
 }
 
 void myds_last_phase_detail(const myds_context_t *ctx, myds_phase_detail_t *out) {
@@ -5048,6 +5058,10 @@ void myds_last_phase_detail(const myds_context_t *ctx, myds_phase_detail_t *out)
     out->decode_cbs = ctx->ph_decode_cbs;
     out->tokenize_s = ctx->ph_tokenize_s;
     out->kvdsk_s = ctx->ph_kvdsk_s;
+    memcpy(out->prefill_tag_gpu, ctx->ph_prefill_tag_gpu, sizeof(out->prefill_tag_gpu));
+    memcpy(out->prefill_tag_cbs, ctx->ph_prefill_tag_cbs, sizeof(out->prefill_tag_cbs));
+    memcpy(out->decode_tag_gpu, ctx->ph_decode_tag_gpu, sizeof(out->decode_tag_gpu));
+    memcpy(out->decode_tag_cbs, ctx->ph_decode_tag_cbs, sizeof(out->decode_tag_cbs));
     out->valid = 1;
 }
 bool myds_last_decode_cycle(const myds_context_t *ctx, uint32_t index, myds_decode_cycle_t *out) {

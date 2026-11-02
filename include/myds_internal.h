@@ -187,6 +187,12 @@ struct myds_context {
     double               ph_tokenize_s;   /* 分词（generate 内部，非 render） */
     double               ph_kvdsk_s;      /* 磁盘 KV 加载 + 应用 */
     int                  ph_valid;        /* 本请求是否量测过（0 ⇒ 全部 null） */
+    /* 按阶段的 GPU 忙时（prefill 与 decode 分开取，见 myds_metal.h 的标签）。
+     * 下标即 myds_ph_tag_t。口径：按提交归属，两个 CB 并行时各桶会同时增长。 */
+    double               ph_prefill_tag_gpu[52];
+    uint64_t             ph_prefill_tag_cbs[52];
+    double               ph_decode_tag_gpu[52];
+    uint64_t             ph_decode_tag_cbs[52];
     bool                 decode_metrics_active;
     myds_decode_cycle_t  *decode_cycles;
     uint32_t             decode_cycle_capacity;

@@ -239,8 +239,36 @@ static void jput_record(jbuf_t *b, const myds_trace_rec_t *r) {
     jput_stage(b, r->detail.kvdsk_s);
     jput(b, ",\"emit\":");
     jput_stage(b, r->detail.emit_s);
-    jputf(b, ",\"prefill_cbs\":%u,\"decode_cbs\":%u}",
+    jputf(b, ",\"prefill_cbs\":%u,\"decode_cbs\":%u",
           r->detail.prefill_cbs, r->detail.decode_cbs);
+    /* 阶段标签桶：只输出非零项，格式 [id,gpu秒,cb数]。
+     * 全为 0 时输出 null（未测量），不输出空数组冒充「测了但是零」。 */
+    {
+        bool any = false;
+        for (int i = 0; i < 52; i++)
+            if (r->detail.prefill_tag_cbs[i] || r->detail.decode_tag_cbs[i]) { any = true; break; }
+        if (!any) {
+            jput(b, ",\"ptags\":null,\"dtags\":null}");
+        } else {
+            jput(b, ",\"ptags\":[");
+            int n = 0;
+            for (int i = 0; i < 52; i++) {
+                if (!r->detail.prefill_tag_cbs[i]) continue;
+                jputf(b, "%s[%d,%.6f,%llu]", n++ ? "," : "", i,
+                      r->detail.prefill_tag_gpu[i],
+                      (unsigned long long)r->detail.prefill_tag_cbs[i]);
+            }
+            jput(b, "],\"dtags\":[");
+            n = 0;
+            for (int i = 0; i < 52; i++) {
+                if (!r->detail.decode_tag_cbs[i]) continue;
+                jputf(b, "%s[%d,%.6f,%llu]", n++ ? "," : "", i,
+                      r->detail.decode_tag_gpu[i],
+                      (unsigned long long)r->detail.decode_tag_cbs[i]);
+            }
+            jput(b, "]}");
+        }
+    }
     jputf(b, ",\"in_flight\":%s,\"prompt_tokens\":%u,\"cached_tokens\":%u,"
           "\"out_tokens\":%u,\"stream\":%s",
           r->in_flight ? "true" : "false",
@@ -335,6 +363,26 @@ const char *myds_trace_page_html(void) {
 "border-radius:3px;overflow:hidden;flex:0 1 auto}"
 ".bar i{display:block;height:100%;background:var(--acc)}"
 "#wrap{display:flex;height:calc(100vh - 41px)}"
+/* 最大化：把另一侧收成 0 宽，这一侧吃掉全部宽度。
+ * 用 display:none 而不是 width:0 —— 后者仍会保留边框与内边距，右边会留一条缝。 */
+"#wrap.max-left #detail{display:none}"
+"#wrap.max-left #list{width:100%}"
+"#wrap.max-right #list{display:none}"
+"#wrap.max-right #detail{flex:1}"
+".pmax{float:right;background:none;border:1px solid var(--line);color:var(--dim);"
+"cursor:pointer;font:inherit;font-size:11px;padding:1px 6px;border-radius:3px;margin-left:8px}"
+".pmax:hover{color:var(--fg);border-color:var(--acc)}"
+/* 树状明细：每级缩进 26px。14px 太窄，层级一多就分不清父子。 */
+".tree{font-size:12.5px;line-height:1.9;margin:6px 0 18px}"
+".tn{padding-left:0}"
+".tn .tn{padding-left:26px}"
+".tn .tn .tn{padding-left:52px}"
+".tnrow{display:flex;align-items:baseline;gap:10px}"
+".tlab{color:var(--dim);min-width:0}"
+".tval{color:var(--fg);font-variant-numeric:tabular-nums;margin-left:auto}"
+".tbranch{color:#3a4048;padding-right:6px}"
+".tbar{height:5px;border-radius:2px;margin:2px 0 4px 0;background:#252a33;overflow:hidden}"
+".tbar i{display:block;height:100%}"
 "#list{width:52%;overflow:auto;border-right:1px solid var(--line)}"
 "#detail{flex:1;overflow:auto;padding:14px 16px}"
 "table{width:100%;border-collapse:collapse}"
@@ -371,7 +419,11 @@ const char *myds_trace_page_html(void) {
 "</style></head><body>"
 "<header><h1>myds trace</h1>"
 "<span id=\"sys\"><span id=\"sysbox\" class=\"m\">采样中…</span></span></header>"
-"<div id=\"wrap\"><div id=\"list\"><table><thead><tr>"
+"<div id=\"wrap\"><div id=\"list\">"
+"<div style=\"padding:6px 12px 0\">"
+"<button class=\"pmax\" id=\"maxL\" title=\"最大化左侧\">⛶ 左侧</button>"
+"<span class=\"meta\">请求列表</span></div>"
+"<table><thead><tr>"
 "<th>#</th><th>时间</th><th>resp_id</th><th class=\"num\">prompt</th>"
 "<th class=\"num\">cache</th><th class=\"num\">out</th><th class=\"num\">TTFT</th>"
 "<th class=\"num\">prefill</th><th class=\"num\">decode</th>"
@@ -459,91 +511,87 @@ const char *myds_trace_page_html(void) {
 "}"
 "function show(seq){"
 "const rec=RECS.find(r=>r.seq===seq);if(!rec){return;}"
-"const p=rec.phases;"
-"const parts=ST.map(([k,label,v])=>({k,label,v,val:p[k]}));"
-/* 瀑布图只能画【互不包含】的阶段。
- * 引擎总 = prefill + decode + 未归因，把三个都画进去就是重复计数：
- * 一条 1s 的请求会画出 2s 的宽度，比例全错。
- * 所以 bar 用拆分后的阶段，图例仍列出引擎总（作为合计行）。 */
-"const BAR=['queue','render','setup','prefill','decode','unattributed'];"
-"const barParts=parts.filter(x=>BAR.indexOf(x.k)>=0);"
-"const measured=barParts.filter(x=>x.val!==null&&x.val>0);"
-"const sum=measured.reduce((a,x)=>a+x.val,0);"
-"let html='<h2>请求 #'+rec.seq+' · '+esc(rec.path)+'</h2>';"
-"if(rec.in_flight){html+='<div class=\"warn\" style=\"margin-bottom:10px\">进行中 —— "
-"已耗时 '+(Date.now()-rec.epoch_ms)/1000<1?'<1':((Date.now()-rec.epoch_ms)/1000).toFixed(1)"
-"+' s（含排队）。阶段耗时尚未产出，完成后自动刷新。</div>';}"
-"html+='<table class=\"kv\">'"
+"const p=rec.phases,d=rec.detail||{};"
+"const nn=v=>(v===null||v===undefined||v<0)?null:v;"
+"const sub=(a,b)=>(a!==null&&b!==null)?Math.max(0,a-b):null;"
+"const TAGS=['—','engram 投影','embedding','归一化+Mix','q_a/kv 投影','q_b GEMV','attention','attn out','ffn 输入','共享专家+路由','MoE 专家','head+lm_head','其它（未分段）'];"
+"const cell=v=>v===null?'<em class=warn>—</em>':f(v);"
+"const node=(label,val,lvl,note,extra)=>{"
+" let h='<div class=tnrow style=padding-left:'+(lvl*26)+'px>';"
+" h+='<span class=tbranch>'+(lvl?'└':'')+'</span>';"
+" h+='<span class=tlab>'+label+'</span>';"
+" h+='<span class=tval>'+cell(val)+'</span>';"
+" if(note)h+='<span class=meta style=margin-left:14px>'+note+'</span>';"
+" if(extra)h+=extra;"
+" return h+'</div>';};"
+"const bar=(v,mx,color)=>'<div class=tbar style=margin-left:26px><i style=width:'+"
+" Math.max(1,Math.min(100,100*v/(mx||1)))+'%;background:'+color+'></i></div>';"
+"let html='<div style=display:flex;align-items:center><h2 style=margin:0>请求 #'+rec.seq+' · '+esc(rec.path)+'</h2>';"
+"html+='<button class=pmax id=maxR style=margin-left:auto>⛶ 右侧</button></div>';"
+"if(rec.in_flight){html+='<div class=warn style=margin:8px 0>进行中 —— 已耗时 '+"
+" (Date.now()-rec.epoch_ms)/1000<1?'<1':((Date.now()-rec.epoch_ms)/1000).toFixed(1)+"
+" ' s（含排队）。阶段耗时尚未产出，完成后自动刷新。</div>';}"
+"html+='<table class=kv style=margin-top:8px>'"
 "+'<tr><td>时间</td><td>'+ts(rec.epoch_ms)+'</td></tr>'"
 "+'<tr><td>客户端</td><td>'+esc(rec.client)+'</td></tr>'"
-"+'<tr><td>finish</td><td><span class=\"pill '+cls(rec.finish)+'\">'+esc(rec.finish)"
-"+'</span></td></tr>'"
+"+'<tr><td>finish</td><td><span class=pill '+cls(rec.finish)+'>'+esc(rec.finish)+'</span></td></tr>'"
 "+'<tr><td>stream</td><td>'+(rec.stream?'true':'false')+'</td></tr>'"
 "+'<tr><td>prompt / cached</td><td>'+rec.prompt_tokens+' / '+rec.cached_tokens+'</td></tr>'"
 "+'<tr><td>输出</td><td>'+rec.out_tokens+' tok</td></tr></table>';"
-"html+='<div id=\"bar\">';"
-"barParts.forEach(x=>{if(x.val!==null&&x.val>0){"
-"const w=Math.max(0.4,(x.val/sum)*100);"
-"html+='<div style=\"width:'+w+'%;background:var('+x.v+')\" data-t=\"'+x.label+' '+f(x.val)+'\"></div>';}});"
-"html+='</div><div id=\"legend\">';"
-"parts.forEach(x=>{html+='<span><i style=\"background:var('+x.v+')\"></i>'+x.label+': '"
-"+ (x.val===null?'<em class=\"warn\">未测量</em>':f(x.val)) +'</span>';});"
-"html+='</div>';"
-/* ── 细粒度分解（2026-11-03）────────────────────────────────────
- * 三个数各自独立，不能相加：
- *   GPU 忙  = Σ(command buffer 的 GPUEnd - GPUStart)，GPU 真在算的时间
- *   阻塞等待 = CPU 卡在 waitUntilCompleted 的墙钟
- *   宿主     = 墙钟 - 等待（提交 kernel / 采样 / 分词）
- * 异步提交时 GPU 与 CPU 并行 ⇒ GPU 忙 与 等待 可重叠，
- * 相加去凑墙钟是错的，所以这里分开列，并写明白。 */
-"const d=rec.detail||{};"
-"const nn=v=>(v===null||v===undefined||v<0)?null:v;"
-"const pf=nn(p.prefill),pd=nn(p.decode),un=nn(p.unattributed);"
+"const pf=nn(p.prefill),pd=nn(p.decode),un=nn(p.unattributed),en=nn(p.engine);"
 "const pg=nn(d.prefill_gpu),pw=nn(d.prefill_wait);"
-"const dg=nn(d.decode_gpu),dw=nn(d.decode_wait);"
-"const tk=nn(d.tokenize),kv=nn(d.kvdsk),em=nn(d.emit);"
-"const sub=(a,b)=> (a!==null&&b!==null)?Math.max(0,a-b):null;"
-"const pfHost=sub(pf,pw),deHost=sub(sub(pd,dw),em);"
-"const unRest=sub(sub(un,tk),kv);"
-"const cell=v=>v===null?'<em class=\"warn\">—</em>':f(v);"
-"const row=(k,v,note)=>'<tr><td>'+k+'</td><td class=\"num\">'+cell(v)+'</td>'"
-"+'<td class=\"meta\" style=\"padding-left:14px\">'+(note||'')+'</td></tr>';"
-"html+='<h2>prefill 内部（'+ (d.prefill_cbs!==undefined?d.prefill_cbs+' 个 command buffer':'—') +'）</h2>';"
-"html+='<table class=\"kv\">';"
-"html+=row('prefill 墙钟',pf,'引擎自报');"
-"html+=row('GPU 忙',pg,'真正在算的时间');"
-"html+=row('阻塞等待',pw,'CPU 卡在 waitUntilCompleted');"
-"html+=row('宿主（提交+采样）',pfHost,'= 墙钟 - 等待；与 GPU 重叠');"
-"html+='</table>';"
-"html+='<h2>decode 内部（'+ (d.decode_cbs!==undefined?d.decode_cbs+' 个 command buffer':'—') +'）</h2>';"
-"html+='<table class=\"kv\">';"
-"html+=row('decode 墙钟',pd,'首个 token → 最后一个 token');"
-"html+=row('GPU 忙',dg,'真正在算的时间');"
-"html+=row('阻塞等待',dw,'CPU 卡在 waitUntilCompleted');"
-"html+=row('回调写出',em,'写 socket / 拼缓冲；客户端慢会变大');"
-"html+=row('宿主（提交+采样）',deHost,'= 墙钟 - 等待 - 写出');"
-"html+='</table>';"
-"html+='<h2>引擎未归因分解</h2>';"
-"html+='<table class=\"kv\">';"
-"html+=row('未归因合计',un,'引擎总 - prefill - decode');"
-"html+=row('其中 分词',tk,'tokenizer');"
-"html+=row('其中 KV 落盘加载',kv,'磁盘快照 load+apply');"
-"html+=row('其中 其余',unRest,'首字前 head+采样、快照写入等');"
-"html+='</table>';"
-"html+='<div class=\"meta\" style=\"margin:8px 0 14px\">GPU 忙 与 阻塞等待 会重叠（异步提交时'"
-"+'CPU 与 GPU 并行），所以两者相加不等于墙钟。跨口径比较前先核对：开关、并发、'"
-"+'prompt 长度、二进制版本。</div>';"
-"html+='<div id=\"layers\"><h2>逐模型层耗时</h2>';"
+"const dg=nn(d.decode_gpu),dw=nn(d.decode_wait),em=nn(d.emit);"
+"const tk=nn(d.tokenize),kv=nn(d.kvdsk);"
+"const pfHost=sub(pf,pw),deHost=sub(sub(pd,dw),em),unRest=sub(sub(un,tk),kv);"
+"html+='<h2>阶段树</h2><div class=tree>';"
+"html+=node('引擎总',en,0,'generate() 全程');"
+"html+=node('排队',nn(p.queue),1,'等推理名额');"
+"html+=node('解析+渲染',nn(p.render),1,'HTTP + 提示词渲染');"
+"html+=node('进引擎前',nn(p.setup),1,'配置应用 / 图片注入 / 响应头');"
+"html+=node('prefill',pf,1,'引擎自报的是真跑过的 token');"
+"html+=node('GPU 忙',pg,2,'Σ CB 的 GPU 时间');"
+"html+=node('阻塞等待',pw,2,'CPU 卡在 waitUntilCompleted');"
+"html+=node('宿主（提交+采样）',pfHost,2,'= 墙钟 - 等待；与 GPU 重叠');"
+"const pt=(d.ptags||[]).filter(x=>x[1]>0);"
+"if(pt.length){"
+" const mx=Math.max(...pt.map(x=>x[1]));"
+" html+='<div class=tnrow style=padding-left:52px><span class=tlab>按阶段（GPU 忙）</span></div>';"
+" pt.forEach(x=>{"
+"  const nm=x[0]>=32?('段 '+(x[0]-32)):(TAGS[x[0]]||('#'+x[0]));"
+"  html+=node(nm,x[1],3,x[2]+' 个 CB','');"
+"  html+=bar(x[1],mx,'var(--p)');});}"
+"html+=node('decode',pd,1,'首个 token → 最后一个 token');"
+"html+=node('GPU 忙',dg,2,'Σ CB 的 GPU 时间');"
+"html+=node('阻塞等待',dw,2,'CPU 卡在 waitUntilCompleted');"
+"html+=node('回调写出',em,2,'写 socket / 拼缓冲；客户端慢会变大');"
+"html+=node('宿主（提交+采样）',deHost,2,'= 墙钟 - 等待 - 写出');"
+"const dt=(d.dtags||[]).filter(x=>x[1]>0);"
+"if(dt.length){"
+" const mx=Math.max(...dt.map(x=>x[1]));"
+" html+='<div class=tnrow style=padding-left:52px><span class=tlab>按阶段（GPU 忙）</span></div>';"
+" dt.forEach(x=>{"
+"  const nm=x[0]>=32?('段 '+(x[0]-32)):(TAGS[x[0]]||('#'+x[0]));"
+"  html+=node(nm,x[1],3,x[2]+' 个 CB','');"
+"  html+=bar(x[1],mx,'var(--d)');});}"
+"html+=node('未归因',un,1,'引擎总 - prefill - decode');"
+"html+=node('分词',tk,2,'tokenizer');"
+"html+=node('KV 落盘加载',kv,2,'磁盘快照 load+apply');"
+"html+=node('其余',unRest,2,'首字前 head+采样、快照写入等');"
+"html+='</div>';"
+"html+='<div class=meta style=margin:-6px 0 16px>GPU 忙 与 阻塞等待 会重叠（异步提交时 CPU 与 GPU 并行），'+"
+" '所以两者相加不等于墙钟；各阶段桶按提交归属，两个 CB 并行时也会同时增长。</div>';"
+"html+='<div id=layers><h2>逐模型层耗时</h2>';"
 "if(rec.layers&&rec.layers.length){"
-"html+='<canvas id=\"lc\" width=\"900\" height=\"110\"></canvas>';"
-"html+='<div class=\"meta\">'+rec.layers.length+' 层，最大 '+f(Math.max(...rec.layers))+'</div>';"
+" html+='<canvas id=lc width=900 height=110></canvas>';"
+" html+='<div class=meta>'+rec.layers.length+' 层，最大 '+f(Math.max(...rec.layers))+'</div>';"
 "}else{"
-"html+='<div class=\"empty\">未测量。引擎只在 <code>MYDS_PROFILE_PREFILL=1</code> 时逐层计时，"
-"而该开关会把 prefill 的 chunk 退化成串行 —— 打开它测到的数不代表生产口径，"
-"所以这里不默认开，也不画一条平线冒充。</div>';"
-"}"
+" html+='<div class=empty>未测量。引擎只在 <code>MYDS_PROFILE_PREFILL=1</code> 时逐层计时，'+"
+" '而该开关会把 prefill 的 chunk 退化成串行 —— 打开它测到的数不代表生产口径，'+"
+" '所以这里不默认开，也不画一条平线冒充。</div>';}"
 "html+='</div>';"
 "document.getElementById('detail').innerHTML=html;"
+"const mr=document.getElementById('maxR');"
+"if(mr)mr.onclick=()=>document.getElementById('wrap').classList.toggle('max-right');"
 "if(rec.layers&&rec.layers.length)drawLayers(rec.layers);"
 "}"
 "function drawLayers(v){"
@@ -578,6 +626,8 @@ const char *myds_trace_page_html(void) {
 "h+=`<span class=\"m\">RSS <b>${s.self_rss_gb===null?'—':s.self_rss_gb.toFixed(0)+'G'}</b></span>`;"
 "document.getElementById('sysbox').outerHTML=`<span id=\"sysbox\">${h}</span>`;"
 "}catch(e){}}"
+"const ml=document.getElementById('maxL');"
+"if(ml)ml.onclick=()=>document.getElementById('wrap').classList.toggle('max-left');"
 "load();sysload();setInterval(load,3000);setInterval(sysload,3000);"
 "</script></body></html>";
 }
