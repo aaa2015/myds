@@ -893,6 +893,9 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
          * 下面可能因 cancel_flag 短路而根本不调 generate，那时引擎内的重置也不会跑；
          * 不作废就会把【上一个请求】的 token 数当成这个请求的打进日志。 */
         myds_context_reset_prefill_stats(ctx);
+        /* 同一理由，分阶段归因也必须作废：短路路径不跑 generate，
+         * 引擎内的重置不会执行，不在此清就会把上一请求的 gpu/wait 报出去。 */
+        myds_context_reset_phase_detail(ctx);
         myds_config_t prev_cfg = myds_context_get_config(ctx);
         uint64_t dspark_prop_before = ctx->dspark ? ctx->dspark->proposed_tokens : 0;
         uint64_t dspark_acc_before  = ctx->dspark ? ctx->dspark->accepted_tokens : 0;
@@ -1203,6 +1206,9 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         }
 
         bool transport_ok = true;
+        /* 回调写出累计。两条分支各写各的，出一分支后仍要能读 —— 所以放在外层。
+         * 初始 -1 = 未测量；只有真的生成过 token 的分支才改写。 */
+        double emit_measured_s = -1.0;
         const bool req_thinking = extract_request_thinking_mode(body, g_server_default_thinking);
         /* Everything from here to the engine call is setup: config application,
          * image-embedding injection, response-header construction. E1 needs this
@@ -1274,6 +1280,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             final_tokens = sctx.token_count;
             t_first = sctx.t_first;
             t_last = sctx.t_last;
+            emit_measured_s = sctx.emit_s;
             /* ★ 客户端断连不是服务端错误。
              * 2026-10-25：旧实现只看 !generated || sctx.failed，于是「对端在首字节之前
              * 就断开」被记成 finish_reason=error。而 generated 的短路求值
@@ -1492,6 +1499,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             final_tokens = ns.token_count;
             t_first = ns.t_first;
             t_last = ns.t_last;
+            emit_measured_s = ns.emit_s;
             if (!generated || ns.failed) {
                 resp_id_invalidate_all();
                 /* ★ 与流式分支保持一致：客户端断连不是服务端错误。
@@ -1895,6 +1903,24 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             trec.cached_tokens = phases_record.cached_tokens;
             trec.out_tokens = phases_record.out_tokens;
             trec.stream = phases_record.stream;
+            /* 细粒度分解。未量测的保持 -1（trace 初始值）⇒ JSON null ⇒ 页面「—」。
+             * 绝不因为“看起来应该差不多”就填个 0 或推算值。 */
+            {
+                myds_phase_detail_t pd;
+                myds_last_phase_detail(ctx, &pd);
+                if (pd.valid) {
+                    trec.detail.prefill_gpu_s = pd.prefill_gpu_s;
+                    trec.detail.prefill_wait_s = pd.prefill_wait_s;
+                    trec.detail.prefill_cbs = (uint32_t)pd.prefill_cbs;
+                    trec.detail.decode_gpu_s = pd.decode_gpu_s;
+                    trec.detail.decode_wait_s = pd.decode_wait_s;
+                    trec.detail.decode_cbs = (uint32_t)pd.decode_cbs;
+                    trec.detail.tokenize_s = pd.tokenize_s;
+                    trec.detail.kvdsk_s = pd.kvdsk_s;
+                }
+                /* emit 是服务端量的，不走引擎。只有确实生成了 token 才有意义。 */
+                if (emit_measured_s >= 0.0) trec.detail.emit_s = emit_measured_s;
+            }
             /* 三个速度指标。口径写清楚，因为页面上并排显示、很容易读串：
              *   ttft        请求到达 → 第一个 token（含排队）
              *   prefill_tps 引擎自报，只用真正跑过的 token 除以耗时（不含排队/分词）

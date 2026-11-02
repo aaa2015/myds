@@ -1469,6 +1469,28 @@ static int command_buffer_result(id<MTLCommandBuffer> cb) {
     return 0;
 }
 
+/* ── 常开分阶段归因（2026-11-03）────────────────────────────────────
+ * 见 myds_metal.h。这两组计数只依赖【已经存在的】同步点与 GPU 时间戳，
+ * 不新增 commit / 不加锁，因此度量本身不改变被测时序。 */
+static double g_ph_gpu_busy_s = 0.0;
+static double g_ph_wait_s = 0.0;
+static uint64_t g_ph_cbs = 0;
+
+void myds_metal_phase_reset(void) {
+    g_ph_gpu_busy_s = 0.0;
+    g_ph_wait_s = 0.0;
+    g_ph_cbs = 0;
+}
+
+void myds_metal_phase_take(double *gpu_busy_s, double *wait_s, uint64_t *cbs) {
+    if (gpu_busy_s) *gpu_busy_s = g_ph_gpu_busy_s;
+    if (wait_s) *wait_s = g_ph_wait_s;
+    if (cbs) *cbs = g_ph_cbs;
+    g_ph_gpu_busy_s = 0.0;
+    g_ph_wait_s = 0.0;
+    g_ph_cbs = 0;
+}
+
 static int wait_inflight_commands(void) {
     if (!g_inflight_cbs || [g_inflight_cbs count] == 0) {
         if (g_batch_released_buffers && [g_batch_released_buffers count] > 0) {
@@ -1478,11 +1500,25 @@ static int wait_inflight_commands(void) {
         return 1;
     }
     int ok = 1;
+    const double _w0 = myds_metal_host_time();
     for (id<MTLCommandBuffer> cb in g_inflight_cbs) {
         if (cb.status != MTLCommandBufferStatusCompleted) {
             [cb waitUntilCompleted];
         }
+        /* 异步 flush 的那批 command buffer 只在这里完成 —— 不在这里记账，
+         * decode 的 GPU 忙时就会严重偏低（实测只记到 1.5ms/token，而墙钟 20ms）。 */
+        {
+            const double _s = cb.GPUStartTime, _e = cb.GPUEndTime;
+            if (isfinite(_s) && isfinite(_e) && _s > 0.0 && _e > _s) {
+                g_ph_gpu_busy_s += _e - _s;
+                g_ph_cbs++;
+            }
+        }
         if (!command_buffer_result(cb)) ok = 0;
+    }
+    {
+        const double _w1 = myds_metal_host_time();
+        if (_w1 > _w0) g_ph_wait_s += _w1 - _w0;
     }
     [g_inflight_cbs removeAllObjects];
     release_completed_mapped_owners();
@@ -1535,7 +1571,12 @@ int myds_metal_gap_prof_take(double *first_commit, double *first_start, double *
 }
 
 static int wait_command_buffer(id<MTLCommandBuffer> cb) {
+    const double _cw0 = myds_metal_host_time();
     [cb waitUntilCompleted];
+    {
+        const double _cw1 = myds_metal_host_time();
+        if (_cw1 > _cw0) g_ph_wait_s += _cw1 - _cw0;
+    }
     if (g_gp_on == 1) {
         if (g_inflight_cbs) {
             for (id<MTLCommandBuffer> icb in g_inflight_cbs) {
@@ -1557,7 +1598,11 @@ static int wait_command_buffer(id<MTLCommandBuffer> cb) {
         g_last_gpu_end = cb.GPUEndTime;
         g_last_gpu_span_valid = isfinite(g_last_gpu_start) && isfinite(g_last_gpu_end) &&
             g_last_gpu_start > 0.0 && g_last_gpu_end > g_last_gpu_start;
+        /* GPU 真正在算的时间。注意 GPU 时间戳与 CPU 时钟同域（mach_absolute_time），
+         * 但与 wait 可以重叠 —— 见 myds_metal.h 的口径说明。 */
+        if (g_last_gpu_span_valid) g_ph_gpu_busy_s += g_last_gpu_end - g_last_gpu_start;
     }
+    g_ph_cbs++;
     return ok;
 }
 

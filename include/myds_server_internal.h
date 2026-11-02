@@ -39,6 +39,10 @@ typedef struct {
     bool thinking;
     int think_state;    /* 0: NONE, 1: REASONING, 2: CONTENT */
     int msg_output_index; /* 0 if !thinking, 1 if thinking */
+    /* 回调里真正花在「把 token 交出去」的墙钟累计（写 socket / 拼缓冲）。
+     * 为什么要单列：t_last - t_first 包含这段，客户端慢或网络拥塞会让 decode
+     * 看起来变慢，而 GPU 根本没事。不拆出来就只能猜。 */
+    double emit_s;
     /* Request-owned transport; only the producer mutates this stream context. */
     myds_sse_writer_t *writer;
 } myds_sse_stream_ctx_t;
@@ -53,6 +57,7 @@ typedef struct {
     uint32_t token_count;
     double t_first;
     double t_last;
+    double emit_s;      /* 同 sse 版：拼缓冲/写出累计，与服务端执行分开 */
 } myds_non_stream_ctx_t;
 
 bool myds_server_send_all(int fd, const char *data, size_t length);

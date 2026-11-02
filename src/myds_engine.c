@@ -3363,6 +3363,19 @@ static int myds_generate_internal(myds_context_t *ctx,
      * 注意：这只能盖住【进入了 generate】的情形。真正不进入的（客户端断连、
      * SSE 首写失败）由服务端调 myds_context_reset_prefill_stats() 负责。 */
     myds_context_reset_prefill_stats(ctx);
+    /* 分阶段归因：本请求重新起算，并把上一请求残留的 metal 计数清掉。
+     * 必须在这里（而不是分词之后）—— 早退路径也要留下 valid=1 的本请求零值，
+     * 否则服务端会读到上一个请求的 gpu/wait。 */
+    ctx->ph_prefill_gpu_s = 0.0;
+    ctx->ph_prefill_wait_s = 0.0;
+    ctx->ph_prefill_cbs = 0;
+    ctx->ph_decode_gpu_s = 0.0;
+    ctx->ph_decode_wait_s = 0.0;
+    ctx->ph_decode_cbs = 0;
+    ctx->ph_tokenize_s = 0.0;
+    ctx->ph_kvdsk_s = 0.0;
+    ctx->ph_valid = 1;
+    myds_metal_phase_reset();
     myds_dspark_reset_proposal_state(ctx->dspark);
     ctx->decode_metrics_active = false;
     ctx->decode_cycle_open = false;
@@ -3417,7 +3430,16 @@ static int myds_generate_internal(myds_context_t *ctx,
         return 0;
     }
 
-    int32_t n_prompt = myds_tokenizer_encode(m->tokenizer, prompt, prompt_tokens, (uint32_t)prompt_alloc_tokens, true);
+    int32_t n_prompt;
+    {
+        struct timespec _tk0, _tk1;
+        clock_gettime(CLOCK_MONOTONIC, &_tk0);
+        n_prompt = myds_tokenizer_encode(m->tokenizer, prompt, prompt_tokens, (uint32_t)prompt_alloc_tokens, true);
+        clock_gettime(CLOCK_MONOTONIC, &_tk1);
+        ctx->ph_tokenize_s = (double)(_tk1.tv_sec - _tk0.tv_sec) +
+                             (double)(_tk1.tv_nsec - _tk0.tv_nsec) / 1e9;
+        if (ctx->ph_tokenize_s < 0.0) ctx->ph_tokenize_s = 0.0;
+    }
     if (n_prompt <= 0) {
         free(prompt_tokens);
         if (out_reason) *out_reason = MYDS_STOP_ERROR;
@@ -3727,6 +3749,8 @@ static int myds_generate_internal(myds_context_t *ctx,
             const double ms = (double)(ended.tv_sec - disk_restore_started.tv_sec) * 1e3 +
                 (double)(ended.tv_nsec - disk_restore_started.tv_nsec) / 1e6;
             MYDS_LOG_I("prefix cache: DISK load+apply %.3f ms, selected %u tokens", ms, resume_from);
+            /* 归因：这就是「未归因」里的主要一块。只记实测，不记估算。 */
+            ctx->ph_kvdsk_s = ms / 1e3;
         }
         /* 清空：本次 prefill 会重建属于【本次序列】的点。否则可能用到「已被后续请求改写过的
          * 压缩 KV」所对应的旧点，把续跑接在错误的状态上。 */
@@ -3913,6 +3937,10 @@ static int myds_generate_internal(myds_context_t *ctx,
         clock_gettime(CLOCK_MONOTONIC, &_pf1);
         ctx->last_prefill_seconds = (double)(_pf1.tv_sec - _pf0.tv_sec) +
                                     (double)(_pf1.tv_nsec - _pf0.tv_nsec) / 1e9;
+        /* prefill 结束即取一次：这段时间内完成的 command buffer 全部属于 prefill。
+         * 注意 GPU 可能已经跑在 CPU 前面，所以 gpu_busy 与 wait 不必相加等于墙钟。 */
+        myds_metal_phase_take(&ctx->ph_prefill_gpu_s, &ctx->ph_prefill_wait_s,
+                              &ctx->ph_prefill_cbs);
         /* 中途失败/取消时，状态可能只推进了一部分 ⇒ 整条缓存作废（下次全量重跑）。
          * 绝不能留下「pcache_len 说已缓存 n_prompt、而 GPU 状态只到一半」的组合：
          * 那会让下一个请求从错误的位置续跑（直接撞 base_pos != next_position 的检查）。 */
@@ -4938,6 +4966,9 @@ static int myds_generate_internal(myds_context_t *ctx,
 
     decode_cycle_finish(ctx);
     ctx->decode_metrics_active = false;
+    /* decode 结束取一次：自 prefill 那次 take 以来完成的所有 command buffer
+     * 都属于 decode（包括投机验证、快照写入等）。 */
+    myds_metal_phase_take(&ctx->ph_decode_gpu_s, &ctx->ph_decode_wait_s, &ctx->ph_decode_cbs);
     /* 纯观测：本次请求的 MoE 专家权重分布（MYDS_MOE_WEIGHT_HIST=1 才有输出）。
      * 放在请求末尾、reset=true ⇒ 每次请求一份独立分布，便于按请求/按模型对比。 */
     myds_v41_moe_weight_hist_report("moe-hist", true);
@@ -4990,6 +5021,35 @@ void myds_last_decode_stats(const myds_context_t *ctx, myds_decode_stats_t *out)
     else memset(out, 0, sizeof(*out));
 }
 
+/* 分阶段归因。与 myds_prefill_stats 同一条规矩：
+ * 不是本请求写的就不外泄 —— 让调用方看到 valid=0，而不是上一个请求的 gpu/wait。 */
+void myds_context_reset_phase_detail(myds_context_t *ctx) {
+    if (!ctx) return;
+    ctx->ph_prefill_gpu_s = 0.0;
+    ctx->ph_prefill_wait_s = 0.0;
+    ctx->ph_prefill_cbs = 0;
+    ctx->ph_decode_gpu_s = 0.0;
+    ctx->ph_decode_wait_s = 0.0;
+    ctx->ph_decode_cbs = 0;
+    ctx->ph_tokenize_s = 0.0;
+    ctx->ph_kvdsk_s = 0.0;
+    ctx->ph_valid = 0;
+}
+
+void myds_last_phase_detail(const myds_context_t *ctx, myds_phase_detail_t *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if (!ctx || !ctx->ph_valid) return;
+    out->prefill_gpu_s = ctx->ph_prefill_gpu_s;
+    out->prefill_wait_s = ctx->ph_prefill_wait_s;
+    out->prefill_cbs = ctx->ph_prefill_cbs;
+    out->decode_gpu_s = ctx->ph_decode_gpu_s;
+    out->decode_wait_s = ctx->ph_decode_wait_s;
+    out->decode_cbs = ctx->ph_decode_cbs;
+    out->tokenize_s = ctx->ph_tokenize_s;
+    out->kvdsk_s = ctx->ph_kvdsk_s;
+    out->valid = 1;
+}
 bool myds_last_decode_cycle(const myds_context_t *ctx, uint32_t index, myds_decode_cycle_t *out) {
     if (!out) return false;
     memset(out, 0, sizeof(*out));

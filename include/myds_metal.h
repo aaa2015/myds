@@ -46,6 +46,23 @@ void myds_metal_dense_q4_v41_head_reference_counters(myds_metal_decode_candidate
  * span is the last completed CB, not a token or an entire split request. */
 const char *myds_metal_loaded_library_path(void);
 int myds_metal_last_completed_gpu_span(double *start_s, double *end_s);
+/* ── 常开分阶段归因（2026-11-03）────────────────────────────────────
+ * 每个 MTLCommandBuffer 完成时本来就带 GPUStartTime / GPUEndTime，读它们
+ * 不需要任何额外的工作；wait 时间只在我们【已经阻塞】的那两个函数里取两次
+ * 时间戳，不会新增同步点，因此不改变执行时序。
+ *
+ * phase_take 返回「自上次 take 以来的增量」并清零，调用方在阶段边界调用：
+ *   gpu_busy_s  Σ(GPUEndTime - GPUStartTime) —— GPU 真正在算的时间
+ *   wait_s      Σ 阻塞在 waitUntilCompleted 的墙钟
+ *   cbs         完成的 command buffer 个数
+ *
+ * 口径警告：异步提交时 GPU 可以与 CPU 并行，因此
+ *   wall ≠ gpu_busy + wait
+ * gpu_busy 是「GPU 忙了多久」，wait 是「CPU 被挡住多久」，两者可重叠。
+ * 页面必须分开显示，不能当成互斥的一段加起来填满 wall。 */
+void myds_metal_phase_take(double *gpu_busy_s, double *wait_s, uint64_t *cbs);
+void myds_metal_phase_reset(void);
+
 /* MYDS_TOKEN_GAP_PROF=1 diagnostics (default off, zero cost when off).
  * host_time uses the same clock as MTLCommandBuffer GPUStartTime. */
 double myds_metal_host_time(void);

@@ -35,6 +35,25 @@ typedef struct {
     double unattributed_s;  /* engine - prefill - decode；NaN = 算不出 */
 } myds_trace_phases_t;
 
+/* 细粒度分解（2026-11-03）。全部来自引擎的常开计数器。
+ *
+ * ★ 关键口径：gpu 与 wait **会重叠**。异步提交时 GPU 可以与 CPU 并行，
+ *   所以 gpu + wait 不必等于阶段墙钟。页面必须分开显示，不得相加。
+ *   host = 阶段墙钟 - wait（提交/调度/采样，全在 CPU）。
+ *
+ * 负值一律 = 未测量。绝不填 0。 */
+typedef struct {
+    double prefill_gpu_s;   /* prefill 期间 GPU 真正在算的时间 */
+    double prefill_wait_s;  /* prefill 期间阻塞在 waitUntilCompleted 的墙钟 */
+    double decode_gpu_s;
+    double decode_wait_s;
+    double tokenize_s;      /* 分词（在引擎内部，不属于服务端 render） */
+    double kvdsk_s;         /* 磁盘 KV 快照加载 + 应用 */
+    double emit_s;          /* 回调里把 token 交出去的累计（写 socket / 拼缓冲） */
+    uint32_t prefill_cbs;
+    uint32_t decode_cbs;
+} myds_trace_detail_t;
+
 typedef struct {
     uint64_t seq;                            /* 单调递增，1 起 */
     int64_t  epoch_ms;                       /* 请求到达的墙上时间 */
@@ -45,6 +64,7 @@ typedef struct {
      * 手上有的是响应里的 id，不是这里的序号；两者能对上才有用。 */
     char     resp_id[MYDS_TRACE_RESPID_MAX];
     myds_trace_phases_t phases;
+    myds_trace_detail_t detail;
     uint32_t prompt_tokens;
     uint32_t cached_tokens;
     uint32_t out_tokens;

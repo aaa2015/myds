@@ -745,7 +745,12 @@ void myds_server_sse_callback(const char *piece, size_t length, int32_t token_id
         sctx->cancel_flag = 1;
         return;
     }
-    (void)sse_emit_bytes(sctx, piece, length, false);
+    {
+        const double _e0 = myds_server_now_s();
+        (void)sse_emit_bytes(sctx, piece, length, false);
+        const double _e1 = myds_server_now_s();
+        if (_e1 > _e0) sctx->emit_s += _e1 - _e0;
+    }
 }
 
 bool myds_server_sse_finish(myds_sse_stream_ctx_t *sctx) {
@@ -765,21 +770,26 @@ void myds_server_non_stream_callback(const char *piece, size_t length, int32_t t
         return;
     }
     if (ns->len == SIZE_MAX || length > SIZE_MAX - ns->len - 1) goto failed;
-    size_t needed = ns->len + length + 1;
-    if (needed > ns->cap) {
-        size_t capacity = ns->cap ? ns->cap : 4096;
-        while (capacity < needed) {
-            if (capacity > SIZE_MAX / 2) { capacity = needed; break; }
-            capacity *= 2;
+    {
+        const double _e0 = myds_server_now_s();
+        size_t needed = ns->len + length + 1;
+        if (needed > ns->cap) {
+            size_t capacity = ns->cap ? ns->cap : 4096;
+            while (capacity < needed) {
+                if (capacity > SIZE_MAX / 2) { capacity = needed; break; }
+                capacity *= 2;
+            }
+            char *larger = realloc(ns->buf, capacity);
+            if (!larger) goto failed;
+            ns->buf = larger;
+            ns->cap = capacity;
         }
-        char *larger = realloc(ns->buf, capacity);
-        if (!larger) goto failed;
-        ns->buf = larger;
-        ns->cap = capacity;
+        if (length) memcpy(ns->buf + ns->len, piece, length);
+        ns->len += length;
+        ns->buf[ns->len] = '\0';
+        const double _e1 = myds_server_now_s();
+        if (_e1 > _e0) ns->emit_s += _e1 - _e0;
     }
-    if (length) memcpy(ns->buf + ns->len, piece, length);
-    ns->len += length;
-    ns->buf[ns->len] = '\0';
     return;
 failed:
     ns->failed = true;

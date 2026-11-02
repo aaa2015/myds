@@ -165,6 +165,28 @@ struct myds_context {
     int                  last_prefill_valid;
 
     myds_decode_stats_t   decode_stats;
+
+    /* ── 分阶段归因（2026-11-03，常开）─────────────────────────────
+     * 只写不读，供 myds_last_phase_detail 暴露给服务端/追踪页。
+     *
+     * 全部用【已经存在的同步点】取样，不新增 commit、不加锁：
+     *   gpu_busy  = Σ(GPUEndTime - GPUStartTime)
+     *   wait      = Σ 阻塞在 waitUntilCompleted 的墙钟
+     *   host      = wall - wait（提交/调度/采样/分词，全在 CPU）
+     *
+     * ★ 口径警告：异步提交时 GPU 与 CPU 并行，所以
+     *      wall ≠ gpu_busy + wait
+     *   gpu_busy 是「GPU 忙了多久」，wait 是「CPU 被挡住多久」。
+     *   页面必须分开画，不得相加去填满 wall。 */
+    double               ph_prefill_gpu_s;
+    double               ph_prefill_wait_s;
+    uint64_t             ph_prefill_cbs;
+    double               ph_decode_gpu_s;
+    double               ph_decode_wait_s;
+    uint64_t             ph_decode_cbs;
+    double               ph_tokenize_s;   /* 分词（generate 内部，非 render） */
+    double               ph_kvdsk_s;      /* 磁盘 KV 加载 + 应用 */
+    int                  ph_valid;        /* 本请求是否量测过（0 ⇒ 全部 null） */
     bool                 decode_metrics_active;
     myds_decode_cycle_t  *decode_cycles;
     uint32_t             decode_cycle_capacity;

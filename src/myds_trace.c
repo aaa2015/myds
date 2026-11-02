@@ -225,7 +225,23 @@ static void jput_record(jbuf_t *b, const myds_trace_rec_t *r) {
     jput_stage(b, r->phases.decode_s);
     jput(b, ",\"unattributed\":");
     jput_stage(b, r->phases.unattributed_s);
-    jputf(b, "},\"in_flight\":%s,\"prompt_tokens\":%u,\"cached_tokens\":%u,"
+    jput(b, "},\"detail\":{\"prefill_gpu\":");
+    jput_stage(b, r->detail.prefill_gpu_s);
+    jput(b, ",\"prefill_wait\":");
+    jput_stage(b, r->detail.prefill_wait_s);
+    jput(b, ",\"decode_gpu\":");
+    jput_stage(b, r->detail.decode_gpu_s);
+    jput(b, ",\"decode_wait\":");
+    jput_stage(b, r->detail.decode_wait_s);
+    jput(b, ",\"tokenize\":");
+    jput_stage(b, r->detail.tokenize_s);
+    jput(b, ",\"kvdsk\":");
+    jput_stage(b, r->detail.kvdsk_s);
+    jput(b, ",\"emit\":");
+    jput_stage(b, r->detail.emit_s);
+    jputf(b, ",\"prefill_cbs\":%u,\"decode_cbs\":%u}",
+          r->detail.prefill_cbs, r->detail.decode_cbs);
+    jputf(b, ",\"in_flight\":%s,\"prompt_tokens\":%u,\"cached_tokens\":%u,"
           "\"out_tokens\":%u,\"stream\":%s",
           r->in_flight ? "true" : "false",
           r->prompt_tokens, r->cached_tokens, r->out_tokens, r->stream ? "true" : "false");
@@ -445,7 +461,13 @@ const char *myds_trace_page_html(void) {
 "const rec=RECS.find(r=>r.seq===seq);if(!rec){return;}"
 "const p=rec.phases;"
 "const parts=ST.map(([k,label,v])=>({k,label,v,val:p[k]}));"
-"const measured=parts.filter(x=>x.val!==null&&x.val>0);"
+/* 瀑布图只能画【互不包含】的阶段。
+ * 引擎总 = prefill + decode + 未归因，把三个都画进去就是重复计数：
+ * 一条 1s 的请求会画出 2s 的宽度，比例全错。
+ * 所以 bar 用拆分后的阶段，图例仍列出引擎总（作为合计行）。 */
+"const BAR=['queue','render','setup','prefill','decode','unattributed'];"
+"const barParts=parts.filter(x=>BAR.indexOf(x.k)>=0);"
+"const measured=barParts.filter(x=>x.val!==null&&x.val>0);"
 "const sum=measured.reduce((a,x)=>a+x.val,0);"
 "let html='<h2>请求 #'+rec.seq+' · '+esc(rec.path)+'</h2>';"
 "if(rec.in_flight){html+='<div class=\"warn\" style=\"margin-bottom:10px\">进行中 —— "
@@ -460,13 +482,57 @@ const char *myds_trace_page_html(void) {
 "+'<tr><td>prompt / cached</td><td>'+rec.prompt_tokens+' / '+rec.cached_tokens+'</td></tr>'"
 "+'<tr><td>输出</td><td>'+rec.out_tokens+' tok</td></tr></table>';"
 "html+='<div id=\"bar\">';"
-"parts.forEach(x=>{if(x.val!==null&&x.val>0){"
+"barParts.forEach(x=>{if(x.val!==null&&x.val>0){"
 "const w=Math.max(0.4,(x.val/sum)*100);"
 "html+='<div style=\"width:'+w+'%;background:var('+x.v+')\" data-t=\"'+x.label+' '+f(x.val)+'\"></div>';}});"
 "html+='</div><div id=\"legend\">';"
 "parts.forEach(x=>{html+='<span><i style=\"background:var('+x.v+')\"></i>'+x.label+': '"
 "+ (x.val===null?'<em class=\"warn\">未测量</em>':f(x.val)) +'</span>';});"
 "html+='</div>';"
+/* ── 细粒度分解（2026-11-03）────────────────────────────────────
+ * 三个数各自独立，不能相加：
+ *   GPU 忙  = Σ(command buffer 的 GPUEnd - GPUStart)，GPU 真在算的时间
+ *   阻塞等待 = CPU 卡在 waitUntilCompleted 的墙钟
+ *   宿主     = 墙钟 - 等待（提交 kernel / 采样 / 分词）
+ * 异步提交时 GPU 与 CPU 并行 ⇒ GPU 忙 与 等待 可重叠，
+ * 相加去凑墙钟是错的，所以这里分开列，并写明白。 */
+"const d=rec.detail||{};"
+"const nn=v=>(v===null||v===undefined||v<0)?null:v;"
+"const pf=nn(p.prefill),pd=nn(p.decode),un=nn(p.unattributed);"
+"const pg=nn(d.prefill_gpu),pw=nn(d.prefill_wait);"
+"const dg=nn(d.decode_gpu),dw=nn(d.decode_wait);"
+"const tk=nn(d.tokenize),kv=nn(d.kvdsk),em=nn(d.emit);"
+"const sub=(a,b)=> (a!==null&&b!==null)?Math.max(0,a-b):null;"
+"const pfHost=sub(pf,pw),deHost=sub(sub(pd,dw),em);"
+"const unRest=sub(sub(un,tk),kv);"
+"const cell=v=>v===null?'<em class=\"warn\">—</em>':f(v);"
+"const row=(k,v,note)=>'<tr><td>'+k+'</td><td class=\"num\">'+cell(v)+'</td>'"
+"+'<td class=\"meta\" style=\"padding-left:14px\">'+(note||'')+'</td></tr>';"
+"html+='<h2>prefill 内部（'+ (d.prefill_cbs!==undefined?d.prefill_cbs+' 个 command buffer':'—') +'）</h2>';"
+"html+='<table class=\"kv\">';"
+"html+=row('prefill 墙钟',pf,'引擎自报');"
+"html+=row('GPU 忙',pg,'真正在算的时间');"
+"html+=row('阻塞等待',pw,'CPU 卡在 waitUntilCompleted');"
+"html+=row('宿主（提交+采样）',pfHost,'= 墙钟 - 等待；与 GPU 重叠');"
+"html+='</table>';"
+"html+='<h2>decode 内部（'+ (d.decode_cbs!==undefined?d.decode_cbs+' 个 command buffer':'—') +'）</h2>';"
+"html+='<table class=\"kv\">';"
+"html+=row('decode 墙钟',pd,'首个 token → 最后一个 token');"
+"html+=row('GPU 忙',dg,'真正在算的时间');"
+"html+=row('阻塞等待',dw,'CPU 卡在 waitUntilCompleted');"
+"html+=row('回调写出',em,'写 socket / 拼缓冲；客户端慢会变大');"
+"html+=row('宿主（提交+采样）',deHost,'= 墙钟 - 等待 - 写出');"
+"html+='</table>';"
+"html+='<h2>引擎未归因分解</h2>';"
+"html+='<table class=\"kv\">';"
+"html+=row('未归因合计',un,'引擎总 - prefill - decode');"
+"html+=row('其中 分词',tk,'tokenizer');"
+"html+=row('其中 KV 落盘加载',kv,'磁盘快照 load+apply');"
+"html+=row('其中 其余',unRest,'首字前 head+采样、快照写入等');"
+"html+='</table>';"
+"html+='<div class=\"meta\" style=\"margin:8px 0 14px\">GPU 忙 与 阻塞等待 会重叠（异步提交时'"
+"+'CPU 与 GPU 并行），所以两者相加不等于墙钟。跨口径比较前先核对：开关、并发、'"
+"+'prompt 长度、二进制版本。</div>';"
 "html+='<div id=\"layers\"><h2>逐模型层耗时</h2>';"
 "if(rec.layers&&rec.layers.length){"
 "html+='<canvas id=\"lc\" width=\"900\" height=\"110\"></canvas>';"

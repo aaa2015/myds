@@ -109,6 +109,31 @@ typedef struct {
 
 /* 读取最近一次生成（myds_generate*）的 prefill 统计；ctx 为 NULL 时清零返回。 */
 void            myds_last_prefill_stats(const myds_context_t *ctx, myds_prefill_stats_t *out);
+
+/* 分阶段归因（2026-11-03，常开，零额外同步点）。
+ *
+ * 口径（很重要，页面必须按这个读）：
+ *   gpu_s   Σ(GPUEndTime - GPUStartTime) —— GPU 真正在算的时间
+ *   wait_s  Σ 阻塞在 waitUntilCompleted 的墙钟
+ *   host    = 阶段墙钟 - wait_s（CPU 提交/调度/分词/采样）
+ *
+ * ★ 异步提交时 GPU 与 CPU 并行 ⇒ wall ≠ gpu_s + wait_s。
+ *   gpu_s 与 wait_s 可重叠，不能相加去凑满墙钟。
+ *
+ * valid == 0 ⇒ 本请求没有量测过（没进 generate / 早退），全部字段无意义。 */
+typedef struct {
+    double   prefill_gpu_s;
+    double   prefill_wait_s;
+    double   decode_gpu_s;
+    double   decode_wait_s;
+    double   tokenize_s;   /* 分词（在 generate 内部，不在服务端 render 阶段） */
+    double   kvdsk_s;      /* 磁盘 KV 快照的加载 + 应用 */
+    uint64_t prefill_cbs;
+    uint64_t decode_cbs;
+    int      valid;
+} myds_phase_detail_t;
+
+void            myds_last_phase_detail(const myds_context_t *ctx, myds_phase_detail_t *out);
 /* 显式作废上一次的 prefill 统计。
  *
  * 为什么服务端必须调它：调用方可能【根本不进入】myds_generate*。例如 SSE 首写
@@ -118,6 +143,9 @@ void            myds_last_prefill_stats(const myds_context_t *ctx, myds_prefill_
  * “prompt: 0 tok, prefill: FAILED after 15815 tok”）。
  * 调用时机：拿到推理名额之后、任何可能短路调用 generate 的分支之前。 */
 void            myds_context_reset_prefill_stats(myds_context_t *ctx);
+/* 分阶段归因清零。与 reset_prefill_stats 一样，服务端在【可能不进入 generate】
+ * 的分支之前调用，避免把上一请求的 gpu/wait 当成本次的报出去。 */
+void            myds_context_reset_phase_detail(myds_context_t *ctx);
 
 /* Per-request decode counters. Calls include attempted single-row and batch-2
  * target invocations; rows include attempted work and rejected future rows.
