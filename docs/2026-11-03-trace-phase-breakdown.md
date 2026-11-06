@@ -142,6 +142,10 @@ ffn 输入 / 共享专家+路由 / MoE / head+lm_head / 其它。
 - 每次 MoE 调用多 3 次 flush，×40 层。**尚未实测其对 prefill 墙钟的影响**，
   开启后不要拿墙钟与账本数字比较，须先按本文第六节的方法交替重测。
 - 只覆盖 prefill 的 mm 路径；decode 的 v41 路径（单 token）未细分。
+- **`a897cec` 起改为异步 flush**：`commit_batch()`（提交并等待）换成 `flush_batch()`
+  （只提交），inflight 达到 256 个 CB 时才真正排空。所以上面「多 3 次 flush」的代价
+  已经不再是逐次同步等待。9581fb2 里那个「prefill +1.56%」是在**同步版本**上测的，
+  换成异步后**作废**，不要再引用；当前数见第十节。
 
 ## 九、attention 与 decode 层内细分（2026-11-06）
 
@@ -172,3 +176,60 @@ decode 只在层内【没有并发作用域】的三处切（层开头、attenti
   `attn·rope+out_a` 347 ms，compressor/indexer/ring/投影合计约 140 ms。
   decode 每 token（7 个采样 token 的均值）：attn 前 4.6 ms、attention 归约+输出 6.9 ms、FFN 11.1 ms。
 - 样本量小（decode 采样仅 7 个 token），只能看量级，不要拿来做精细结论。
+
+## 十、性能验收：异步 flush 与 MoE 批拆分（2026-11-07）
+
+`a897cec` 改了三处会影响墙钟的东西：MoE 段内 flush 从 `commit_batch()`（同步等待）
+换成 `flush_batch()`（只提交，inflight ≥256 才排空）、`should_flush_moe_batch()` 用
+`next_chunk_max` 而非 `chunk_size` 判溢出、以及预热时预分配 chunk/prompt 工作区。
+
+### 口径（先读，否则数字会读错）
+
+- 机器：macstudio（M2 Ultra，192 GB），独占，无其它 myds 进程。
+- 两只二进制：`base` = `162d368`（改动前）、`new` = `a897cec` + 本节配套的 trace 修复。
+  `metal/` 源码在两个提交之间**零改动**，两只用同一份 `myds.metallib`（sha256 `787f9d7d…`）。
+- 配置：`myds.conf` 原样，仅把 `MYDS_KV_DSK` 注释掉（避免每请求写 GB 级快照混进墙钟）；
+  `MYDS_PHASE_SPLIT=1`、`MYDS_PHASE_SPLIT_MOE=1`（线上取值），`MYDS_MOE_CHUNKS=9`、
+  `MYDS_PREFILL_CHUNK_SIZE=2048`。
+- 请求：固定 prompt **22,800 token**，`temperature=0`、`max_tokens=32`、非流式；
+  每轮先发一次 `X-Myds-Warmup: 1` 的 306 token 探针，再发 A、B 两个**不同内容**的
+  22.8K prompt（内容不同 ⇒ 前缀缓存必然 miss）。
+- 交替：`base1, new1, base2, new2, base3, new3`，每只 3 轮 × 2 个请求 = 6 个样本。
+- 指标取自服务端自己的 `Completed` 日志行（`prefill: N tok in X s`），
+  明细（GPU 忙 / CB 数）取自 `/trace/api/requests`。
+
+### 结果
+
+| 指标（每只 3 轮 × 2 请求 = 6 样本） | base `162d368` | new `a897cec`+修复 | Δ |
+|---|---|---|---|
+| prefill 墙钟 · A（22,800 tok） | 47.5 s（47.5–47.7） | 46.5 s（46.4–46.5） | **−1.0 s / −2.1%** |
+| prefill 墙钟 · B（22,767 tok） | 47.3 s（47.3–47.6） | 46.3 s（46.3–46.7） | **−1.0 s / −2.1%** |
+| prefill 吞吐 | 479.9 t/s | 490.5 t/s | +2.2% |
+| GPU 忙（Σ CB 时间戳） | 36.75 s | 36.76 s | 0（噪声内） |
+| 阻塞等待 | 33.2 s | 33.9 s | +0.7 s（见下） |
+| 宿主（墙钟 − 等待） | 14.4 s | 12.5 s | **−1.9 s** |
+| prefill CB 数 | 2,925–2,935 | 2,657–2,671 | −9.2% |
+| decode | 38.3–38.9 t/s | 38.5–38.8 t/s | 无差别 |
+| 输出文本 | — | — | **12/12 逐字节相同** |
+
+两臂的样本区间**不重叠**（new 最大 46.7 s < base 最小 47.3 s），所以这 1.0 s 不是噪声。
+另：计时用的 new 二进制还差一处**只影响显示**的修复（in-flight 记录的 detail 也置 -1）。
+最终二进制（+该修复）另跑了第 4 轮 `new4`：prefill 46.5 s / 490.8 t/s / decode 38.8 t/s，
+落在上面 new 的区间内 ⇒ 该修复对耗时无影响。
+复现脚本与原始产物在 macstudio `~/bench/ab/`（`run_one.sh` / `driver.sh` / `results/`）。
+
+### 怎么读
+
+- **增益来自宿主侧提交，不是 GPU。** 两只的 `GPU 忙` 都是 36.7 s（逐次一致到 10 ms），
+  只有 CB 数与 prefill 墙钟变了 ⇒ 省下的是「提交后立刻等它完成」的那段串行时间。
+- **MoE 批拆分的修复在这组口径下没有体现**：22,800 token 的 macroblock 是 23,040，
+  MoE 批上限 16,384，8 个 chunk 攒满就必然要 flush 一次，走不到
+  「尾块放得进剩余批空间」那条被修的分支。它只在 `moe_batch` 接近 macroblock
+  长度时有效（如 5014 / 6144 那组），由 `tests/test_prefill_shrink_grid.c` 的穷举覆盖，
+  本轮**没有**对应的实机 A/B —— 不要把这轮的 −2.7% 算到它头上。
+- **预热预分配对 >16,384 token 的 prompt 不完整**：预热按
+  `cfg_chunk_size × cfg_moe_chunks = 2048 × 8 = 16384` 分配，而 22.8K prompt 的
+  macroblock 要 23,040，日志里仍会出现一次
+  `prefill prompt workspace expanded: tokens_cap=16384->23040`。要真正「预热完就不扩」，
+  预分配的上界应取 macroblock，而不是一个 MoE 批。
+- decode 速率 38.4–38.9 t/s 两臂无差别 —— 这个提交没碰 decode。

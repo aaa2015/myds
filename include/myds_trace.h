@@ -117,6 +117,15 @@ void myds_trace_record(myds_trace_rec_t *rec);
 uint64_t myds_trace_begin(const char *path, const char *client, const char *resp_id);
 void     myds_trace_complete(uint64_t seq, const myds_trace_rec_t *rec);
 
+/* 把一条记录里所有「未测量」字段置成 -1：phases / ttft / 三个速率 / detail 的
+ * 七个 double。
+ *
+ * 为什么要有这个函数：早退路径（503 拒绝、客户端断连、参数非法）原先只 memset 0
+ * 再手写 phases = -1，**漏掉了 detail**。于是 JSON 里 prefill_gpu 是 0.000000，
+ * 页面按「测过、几乎不花时间」渲染成 `<0.1us` —— 而真相是这个请求根本没进引擎。
+ * 这是本模块第一原则（未测量 != 0）的一个洞，靠调用方逐个记得补是补不住的。 */
+void     myds_trace_rec_mark_unmeasured(myds_trace_rec_t *rec);
+
 /* 已记录的条数（不超过容量）与容量。 */
 uint32_t myds_trace_count(void);
 uint32_t myds_trace_capacity(void);
@@ -137,6 +146,11 @@ void myds_trace_reset(void);
  * 任一缓冲不足返回 false（调用方据此回 500，而不是发出截断的 JSON ——
  * 截断的 JSON 客户端解析失败，反而更难查）。 */
 bool myds_trace_list_json(char *out, size_t cap);
+
+/* 列表 JSON 的最坏大小估算 —— 服务端必须按它分配缓冲，不能按「看起来差不多」。
+ * 实测最坏一条 1546 B（26 个 prefill 标签桶 + 23 个 decode 桶全非零），
+ * 这里按 2048 B/条留余量。返回 0 表示 capacity 非法。 */
+size_t myds_trace_list_json_max_bytes(uint32_t capacity);
 bool myds_trace_detail_json(uint64_t seq, char *out, size_t cap);
 
 /* 页面本体（HTML）的模板。占位符尚未替换，不要直接发给客户端。 */

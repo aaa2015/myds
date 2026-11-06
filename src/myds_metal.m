@@ -6315,7 +6315,10 @@ int myds_metal_moe_route(
  * 也不排空队列；代价是每个 MoE 调用多 3 次只提交不等待的 flush。 */
 static void moe_tag_point(id<MTLCommandBuffer> *cbp,
                           id<MTLComputeCommandEncoder> *encp, int next_tag) {
-    myds_metal_flush_batch();       /* 当前 CB 以现有标签异步提交（只提交不等待） */
+    /* 当前 CB 以现有标签异步提交。注意 flush_batch 在 inflight 达到 256 个时会
+     * 真的排空队列（见 myds_metal_flush_batch）—— 正常情况下这里是「只提交不等待」，
+     * 但不能把这个接口当成永不阻塞。 */
+    myds_metal_flush_batch();
     myds_metal_begin_batch();
     myds_metal_phase_tag_set(next_tag);
     *cbp = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];

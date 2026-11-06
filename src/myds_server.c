@@ -575,7 +575,13 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         if (strcmp(route, "/trace/api/requests") == 0) {
             /* 列表可能很长：按容量上限（512 条）算，每条 ~300 B ⇒ 160 KB。
              * 堆上分配，失败就 500 —— 发一段截断的 JSON 比不发更难查。 */
-            const size_t cap = 64u * 1024u + (size_t)myds_trace_capacity() * 512u;
+            /* 每条最坏约 1546 B（26 个 prefill 桶 + 23 个 decode 桶全非零时实测）。
+             * 原先按 512 B/条估：128 条实际要 197,821 B，而旧公式只给 135,168 B
+             * ⇒ list_json 返回 false ⇒ 整个接口 500 ⇒ 页面一行都不显示，
+             * 还把原因写成「token 可能已失效」。也就是说，按文档把
+             * PHASE_SPLIT_MOE/ATTN 打开、记录攒满之后，页面会毫无征兆地全空。
+             * 按 2048 B/条留余量。 */
+            const size_t cap = myds_trace_list_json_max_bytes(myds_trace_capacity());
             char *json = (char *)malloc(cap);
             if (!json || !myds_trace_list_json(json, cap)) {
                 free(json);
@@ -834,7 +840,15 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         /* 请求一到达就登记一条 in_flight 记录，结束时再回填。
          * 只写结尾的话，一次 40 秒的 prefill 在页面里完全不可见 ——
          * 而「现在卡在哪」恰恰只能看正在进行的那条。 */
-        const bool is_warmup_probe = myds_server_is_warmup_request(req_buf);
+        /* ★ 只看 header 不够：这个头会清 ctx->pcache_len（下一个请求丢全部前缀缓存），
+         * 且本次请求不进 trace。服务默认监听 0.0.0.0，外网一个 20 token 的请求
+         * 就能让别人的 40 s prefill 重跑一遍，而且页面上看不到这一次 —— 正好是
+         * 有人来查「我的请求为什么变慢」时会看的地方。与 /trace 同一套来源判定。 */
+        const bool warmup_hdr = myds_server_is_warmup_request(req_buf);
+        const bool is_warmup_probe = warmup_hdr && myds_debug_ip_allowed(client_ip);
+        if (warmup_hdr && !is_warmup_probe)
+            MYDS_LOG_W("[%s:%d] X-Myds-Warmup 被忽略：来源不在白名单（该头会清前缀缓存）",
+                       client_ip, client_port);
         char trace_client[MYDS_TRACE_CLIENT_MAX];
         snprintf(trace_client, sizeof(trace_client), "%s:%d", client_ip, client_port);
         const uint64_t trace_seq = is_warmup_probe ? 0 : myds_trace_begin(path, trace_client, resp_id);
@@ -846,12 +860,9 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         snprintf(trec_fail.client, sizeof(trec_fail.client), "%s", trace_client);
         snprintf(trec_fail.resp_id, sizeof(trec_fail.resp_id), "%s", resp_id);
         snprintf(trec_fail.finish, sizeof(trec_fail.finish), "rejected");
-        trec_fail.phases.queue_s = -1.0;  trec_fail.phases.render_s = -1.0;
-        trec_fail.phases.setup_s = -1.0;  trec_fail.phases.engine_s = -1.0;
-        trec_fail.phases.prefill_s = -1.0; trec_fail.phases.decode_s = -1.0;
-        trec_fail.phases.unattributed_s = -1.0;
-        trec_fail.ttft_s = -1.0; trec_fail.prefill_tps = -1.0; trec_fail.decode_tps = -1.0;
-        trec_fail.cache_hit_rate = -1.0;
+        /* 一个函数搞定 phases / 速率 / detail —— 原先手写这两行，漏了 detail，
+         * 于是被拒请求的 prefill_gpu 是 0.000000，页面显示成「<0.1us」。 */
+        myds_trace_rec_mark_unmeasured(&trec_fail);
         trec_fail.stream = stream ? 1 : 0;
         /* 排队与背压保护：在解析与任何 GPU 工作（包括视觉处理）前统一获取推理名额 */
         int q_timeout_ms = 60000;
@@ -1891,6 +1902,9 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             };
             myds_trace_rec_t trec;
             memset(&trec, 0, sizeof(trec));
+            /* detail 的默认值也必须是「未测量」：pd.valid == 0 时不能留 0，
+             * 否则页面把 GPU 忙画成 <0.1us。phases 下面会逐个赋值，不受影响。 */
+            myds_trace_rec_mark_unmeasured(&trec);
             snprintf(trec.path, sizeof(trec.path), "%s", path);
             snprintf(trec.client, sizeof(trec.client), "%s:%d", client_ip, client_port);
             snprintf(trec.finish, sizeof(trec.finish), "%s", final_finish_str);
@@ -2104,7 +2118,8 @@ int myds_server_start(myds_context_t *ctx, const char *host, int port, const cha
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
-    /* 请求追踪缓冲。默认 128 条（约 50 KB）；MYDS_TRACE_RECORDS 可调，上限 512。
+    /* 请求追踪缓冲。默认 128 条（约 190 KB；每条最坏 1.5 KB —— 阶段标签全开时
+     * 26 个 prefill 桶 + 23 个 decode 桶都有值）；MYDS_TRACE_RECORDS 可调，上限 512。
      *
      * 在 start 时显式初始化，而不是等第一条 record 惰性分配：
      * 否则 /trace 在还没有请求时报告 capacity=0，页面显示成「容量未知」——

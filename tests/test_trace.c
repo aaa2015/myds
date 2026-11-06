@@ -539,6 +539,95 @@ static void test_cached_prefill_incremental_display(void) {
     CHECK(strstr(detail_buf, "[14,0.045000,40]") != NULL);
 }
 
+/* 早退路径：phases 与 detail 必须【一起】是 null。
+ *
+ * 真实误读：503 被拒的请求原来只把 phases 置 -1，detail 留在 memset 的 0，
+ * 页面 f(0) 渲染成 `<0.1us` —— 读起来是「测了，GPU 基本不花时间」，
+ * 而此刻根本没有进引擎。这条测试把「漏一个字段」钉死。 */
+static void test_unmeasured_detail_is_null_not_zero(void) {
+    myds_trace_reset();
+    myds_trace_init(8);
+    myds_trace_rec_t r;
+    memset(&r, 0, sizeof(r));
+    snprintf(r.path, sizeof(r.path), "/v1/chat/completions");
+    snprintf(r.client, sizeof(r.client), "127.0.0.1:5000");
+    snprintf(r.finish, sizeof(r.finish), "rejected");
+    myds_trace_rec_mark_unmeasured(&r);
+    myds_trace_record(&r);
+
+    char buf[4096];
+    CHECK(myds_trace_list_json(buf, sizeof(buf)));
+    CHECK(strstr(buf, "\"prefill_gpu\":null") != NULL);
+    CHECK(strstr(buf, "\"prefill_wait\":null") != NULL);
+    CHECK(strstr(buf, "\"decode_gpu\":null") != NULL);
+    CHECK(strstr(buf, "\"decode_wait\":null") != NULL);
+    CHECK(strstr(buf, "\"tokenize\":null") != NULL);
+    CHECK(strstr(buf, "\"kvdsk\":null") != NULL);
+    CHECK(strstr(buf, "\"emit\":null") != NULL);
+    CHECK(strstr(buf, "\"engine\":null") != NULL);
+    CHECK(strstr(buf, "\"ttft\":null") != NULL);
+    CHECK(strstr(buf, "\"prefill_tps\":null") != NULL);
+    /* 不变量：整条记录里不许出现 "0.000000" 冒充实测值。 */
+    CHECK(strstr(buf, "0.000000") == NULL);
+}
+
+/* 最坏情况的列表 JSON 必须装得进 max_bytes。
+ *
+ * 真实事故场景：按文档把 PHASE_SPLIT_MOE(4) + PHASE_SPLIT_ATTN(6) + decode 分段(20)
+ * 全打开，128 条实际要 197,821 B，而服务端按 512 B/条只给了 135,168 B
+ * ⇒ list_json 返回 false ⇒ 接口 500 ⇒ 页面全空。这条测试锁住「估算 >= 实际」。 */
+static void test_list_json_worst_case_fits(void) {
+    for (uint32_t cap_recs = 8; cap_recs <= 512; cap_recs *= 8) {
+        myds_trace_reset();
+        myds_trace_init(cap_recs);
+        myds_trace_rec_t r;
+        for (uint32_t i = 0; i < cap_recs; i++) {
+            memset(&r, 0, sizeof(r));
+            snprintf(r.path, sizeof(r.path), "/v1/chat/completions");
+            snprintf(r.client, sizeof(r.client), "192.168.1.234:54321");
+            snprintf(r.resp_id, sizeof(r.resp_id), "resp_0123456789abcdef0123456789abcdef");
+            snprintf(r.finish, sizeof(r.finish), "stop");
+            r.phases.queue_s = 0.012345; r.phases.render_s = 1.234567;
+            r.phases.setup_s = 0.012345; r.phases.engine_s = 40.123456;
+            r.phases.prefill_s = 18.5; r.phases.decode_s = 21.0;
+            r.phases.unattributed_s = 0.6;
+            r.detail.prefill_gpu_s = 17.5; r.detail.prefill_wait_s = 0.4;
+            r.detail.decode_gpu_s = 20.9; r.detail.decode_wait_s = 0.2;
+            r.detail.tokenize_s = 0.05; r.detail.kvdsk_s = 0.3; r.detail.emit_s = 0.02;
+            for (int t = 1; t < 27; t++) {
+                r.detail.prefill_tag_gpu[t] = 0.7 + t * 0.01;
+                r.detail.prefill_tag_cbs[t] = 80;
+            }
+            for (int t = 23; t < 26; t++) {
+                r.detail.decode_tag_gpu[t] = 6.1; r.detail.decode_tag_cbs[t] = 200;
+            }
+            for (int t = 32; t < 52; t++) {
+                r.detail.decode_tag_gpu[t] = 0.9; r.detail.decode_tag_cbs[t] = 10;
+            }
+            r.prompt_tokens = 8421; r.cached_tokens = 8192; r.out_tokens = 512;
+            r.stream = 1; r.cache_hit_rate = 97.2; r.ttft_s = 18.9;
+            r.prefill_tps = 143.2; r.decode_tps = 24.4;
+            myds_trace_record(&r);
+        }
+        const size_t need = myds_trace_list_json_max_bytes(myds_trace_capacity());
+        char *buf = (char *)malloc(need);
+        CHECK(buf != NULL);
+        if (!buf) return;
+        CHECK(myds_trace_list_json(buf, need));
+        /* 反证：老公式（512 B/条）在 128 条以上确实装不下 —— 否则这条测试没在测东西。 */
+        if (myds_trace_capacity() >= 128) {
+            const size_t old_need = 64u * 1024u + (size_t)myds_trace_capacity() * 512u;
+            char *old_buf = (char *)malloc(old_need);
+            CHECK(old_buf != NULL);
+            if (old_buf) {
+                CHECK(!myds_trace_list_json(old_buf, old_need));
+                free(old_buf);
+            }
+        }
+        free(buf);
+    }
+}
+
 int main(void) {
     test_empty();
     test_unmeasured_is_null_not_zero();
@@ -549,6 +638,8 @@ int main(void) {
     test_buffer_too_small_is_an_error();
     test_detail_by_seq();
     test_capacity_clamped();
+    test_unmeasured_detail_is_null_not_zero();
+    test_list_json_worst_case_fits();
     test_wall_includes_engine();
     test_page_js_is_well_formed();
     test_cache_hit_rate();

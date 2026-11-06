@@ -65,21 +65,37 @@ uint64_t myds_trace_begin(const char *path, const char *client, const char *resp
     snprintf(r.path, sizeof(r.path), "%s", path ? path : "");
     snprintf(r.client, sizeof(r.client), "%s", client ? client : "");
     snprintf(r.resp_id, sizeof(r.resp_id), "%s", resp_id ? resp_id : "");
-    /* 各阶段先标成「未测量」(-1)，而不是 0：请求还没跑完，0 会被读成「瞬时完成」。 */
-    r.phases.queue_s = -1.0;
-    r.phases.render_s = -1.0;
-    r.phases.setup_s = -1.0;
-    r.phases.engine_s = -1.0;
-    r.phases.prefill_s = -1.0;
-    r.phases.decode_s = -1.0;
-    r.phases.unattributed_s = -1.0;
-    r.ttft_s = -1.0;
-    r.cache_hit_rate = -1.0;
-    r.prefill_tps = -1.0;
-    r.decode_tps = -1.0;
+    /* 各阶段先标成「未测量」(-1)，而不是 0：请求还没跑完，0 会被读成「瞬时完成」。
+     * detail 也要一起：这条记录会在页面上以「进行中」显示完整阶段树，
+     * 而 memset 的 0 在那棵树上会被渲染成 `<0.1us`。 */
+    myds_trace_rec_mark_unmeasured(&r);
     r.in_flight = 1;
     myds_trace_record(&r);
     return r.seq;
+}
+
+/* 显示在头文件里说明用途：早退路径必须整体置「未测量」。
+ * detail 的七个 double 也要，否则页面把 0 读成「测过，几乎不花时间」。 */
+void myds_trace_rec_mark_unmeasured(myds_trace_rec_t *rec) {
+    if (!rec) return;
+    rec->phases.queue_s = -1.0;
+    rec->phases.render_s = -1.0;
+    rec->phases.setup_s = -1.0;
+    rec->phases.engine_s = -1.0;
+    rec->phases.prefill_s = -1.0;
+    rec->phases.decode_s = -1.0;
+    rec->phases.unattributed_s = -1.0;
+    rec->ttft_s = -1.0;
+    rec->prefill_tps = -1.0;
+    rec->decode_tps = -1.0;
+    rec->cache_hit_rate = -1.0;
+    rec->detail.prefill_gpu_s = -1.0;
+    rec->detail.prefill_wait_s = -1.0;
+    rec->detail.decode_gpu_s = -1.0;
+    rec->detail.decode_wait_s = -1.0;
+    rec->detail.tokenize_s = -1.0;
+    rec->detail.kvdsk_s = -1.0;
+    rec->detail.emit_s = -1.0;
 }
 
 void myds_trace_complete(uint64_t seq, const myds_trace_rec_t *rec) {
@@ -293,19 +309,41 @@ static void jput_record(jbuf_t *b, const myds_trace_rec_t *r) {
     jput(b, "]}");
 }
 
+size_t myds_trace_list_json_max_bytes(uint32_t capacity) {
+    if (capacity > MYDS_TRACE_CAP_MAX) capacity = MYDS_TRACE_CAP_MAX;
+    return 64u * 1024u + (size_t)capacity * 2048u;
+}
+
 bool myds_trace_list_json(char *out, size_t cap) {
     if (!out || cap < 64u) return false;
+    /* 一次锁内快照。逐条 myds_trace_get() 是各自加锁的：格式化期间来一个新请求，
+     * 环形缓冲的起点会推移，同一次渲染里就可能重复一条、漏一条 —— 页面按 seq
+     * 去重的选择状态会跟着跳。拷贝 n 条（n <= 512，约 1 MB 上限）是这里最便宜的
+     * 正确做法。 */
+    myds_trace_rec_t *snap = NULL;
+    uint32_t n = 0, capacity = 0;
+    pthread_mutex_lock(&g_lock);
+    n = g_ring ? g_count : 0u;
+    capacity = g_cap;
+    if (n) {
+        snap = (myds_trace_rec_t *)malloc((size_t)n * sizeof(*snap));
+        if (snap) {
+            const uint32_t start = (g_next + g_cap - g_count) % g_cap;
+            for (uint32_t i = 0; i < n; ++i) snap[i] = g_ring[(start + i) % g_cap];
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+    if (n && !snap) return false;
+
     jbuf_t b = { out, cap, 0, true };
     out[0] = '\0';
-    jputf(&b, "{\"count\":%u,\"capacity\":%u,\"records\":[", myds_trace_count(), myds_trace_capacity());
-    const uint32_t n = myds_trace_count();
+    jputf(&b, "{\"count\":%u,\"capacity\":%u,\"records\":[", n, capacity);
     /* 最新的在前：页面默认就要看刚发生的。 */
     for (uint32_t i = 0; i < n && b.ok; ++i) {
-        myds_trace_rec_t r;
-        if (!myds_trace_get(n - 1u - i, &r)) continue;
         jput(&b, i ? "," : "");
-        jput_record(&b, &r);
+        jput_record(&b, &snap[n - 1u - i]);
     }
+    free(snap);
     jput(&b, "]}");
     return b.ok;
 }
@@ -434,7 +472,7 @@ const char *myds_trace_page_html(void) {
 "const ST=[['queue','排队','--q'],['render','解析+渲染','--r'],['setup','进引擎前','--s'],"
 "['engine','引擎总','--e'],['prefill','prefill','--p'],['decode','decode','--d'],"
 "['unattributed','未归因','--u']];"
-"let SEL=null,RECS=[];"
+"let SEL=null,RECS=[],LASTINFLIGHT=false;"
 /* 时间固定成 YYYY-MM-DD HH:MM:SS。
  *
  * 不用 toLocaleString / toLocaleTimeString：它们跟随浏览器 locale，
@@ -512,9 +550,16 @@ const char *myds_trace_page_html(void) {
 "tr.onclick=()=>{SEL=+tr.dataset.seq;"
 "tb.querySelectorAll('tr').forEach(x=>x.classList.remove('sel'));"
 "tr.classList.add('sel');show(SEL);};});"
+/* 详情面板也要跟着刷新。原先只有 onclick 调 show()，而 load() 每 3 秒重画列表，
+ * 于是一条进行中的请求跑完了、列表显示「已完成」，右侧却永远停在
+ * 「进行中 —— 已耗时 1.2 s」。只在该条仍在跑、或刚从「进行中」变成完成时补画一次，
+ * 之后不再动它 —— 否则每 3 秒重置一次滚动位置，没法读。 */
+"if(SEL!==null){const s=RECS.find(r=>r.seq===SEL);"
+"if(!s)SEL=null;else if(s.in_flight||LASTINFLIGHT)show(SEL);}"
 "}"
 "function show(seq){"
 "const rec=RECS.find(r=>r.seq===seq);if(!rec){return;}"
+"LASTINFLIGHT=!!rec.in_flight;"
 "const p=rec.phases,d=rec.detail||{};"
 "const nn=v=>(v===null||v===undefined||v<0)?null:v;"
 "const sub=(a,b)=>(a!==null&&b!==null)?Math.max(0,a-b):null;"
@@ -548,41 +593,47 @@ const char *myds_trace_page_html(void) {
 "const tk=nn(d.tokenize),kv=nn(d.kvdsk);"
 "const pfHost=sub(pf,pw),deHost=sub(sub(pd,dw),em),unRest=sub(sub(un,tk),kv);"
 "html+='<h2>阶段树</h2><div class=tree>';"
-"html+=node('引擎总',en,0,'generate() 全程');"
-"html+=node('排队',nn(p.queue),1,'等推理名额');"
-"html+=node('解析+渲染',nn(p.render),1,'HTTP + 提示词渲染');"
-"html+=node('进引擎前',nn(p.setup),1,'配置应用 / 图片注入 / 响应头');"
+/* 根必须是端到端。engine = t_last - t_generate_begin，**不含** queue/render/setup；
+ * 原先把「引擎总」当根，却把排队、解析渲染、进引擎前挂在它下面 —— 子项加起来
+ * 比父项还大，正是文档第五节第 3 条禁止的那类图。 */
+"const q0=nn(p.queue),r0=nn(p.render),s0=nn(p.setup);"
+"const e2e=(en!==null)?Math.max(0,q0||0)+Math.max(0,r0||0)+Math.max(0,s0||0)+en:null;"
+"html+=node('端到端（墙钟）',e2e,0,'排队 + 解析渲染 + 进引擎前 + 引擎');"
+"html+=node('排队',q0,1,'等推理名额');"
+"html+=node('解析+渲染',r0,1,'HTTP + 提示词渲染');"
+"html+=node('进引擎前',s0,1,'配置应用 / 图片注入 / 响应头');"
+"html+=node('引擎总',en,1,'generate() 全程');"
 "const pfTok=Math.max(0,(rec.prompt_tokens||0)-(rec.cached_tokens||0));"
 "const pfNote=rec.cached_tokens>0?('增量 '+pfTok+' tok · 复用 '+rec.cached_tokens+' tok'+(pf>0?' · 等效 '+Math.round(rec.prompt_tokens/pf)+' t/s':'')):'引擎自报的是真跑过的 token';"
-"html+=node('prefill',pf,1,pfNote);"
-"html+=node('GPU 忙',pg,2,'Σ CB 的 GPU 时间');"
-"html+=node('阻塞等待',pw,2,'CPU 卡在 waitUntilCompleted');"
-"html+=node('宿主（提交+采样）',pfHost,2,'= 墙钟 - 等待；与 GPU 重叠');"
+"html+=node('prefill',pf,2,pfNote);"
+"html+=node('GPU 忙',pg,3,'Σ CB 的 GPU 时间');"
+"html+=node('阻塞等待',pw,3,'CPU 卡在 waitUntilCompleted');"
+"html+=node('宿主（提交+采样）',pfHost,3,'= 墙钟 - 等待；与 GPU 重叠');"
 "const pt=(d.ptags||[]).filter(x=>x[1]>0);"
 "if(pt.length){"
 " const mx=Math.max(...pt.map(x=>x[1]));"
-" html+='<div class=tnrow style=padding-left:52px><span class=tlab>按阶段（GPU 忙）</span></div>';"
+" html+='<div class=tnrow style=padding-left:78px><span class=tlab>按阶段（GPU 忙）</span></div>';"
 " pt.forEach(x=>{"
 "  const nm=x[0]>=32?('段 '+(x[0]-32)):(TAGS[x[0]]||('#'+x[0]));"
-"  html+=node(nm,x[1],3,x[2]+' 个 CB','');"
+"  html+=node(nm,x[1],4,x[2]+' 个 CB','');"
 "  html+=bar(x[1],mx,'var(--p)');});}"
-"html+=node('decode',pd,1,'首个 token → 最后一个 token');"
-"html+=node('GPU 忙',dg,2,'Σ CB 的 GPU 时间');"
-"html+=node('阻塞等待',dw,2,'CPU 卡在 waitUntilCompleted');"
-"html+=node('回调写出',em,2,'写 socket / 拼缓冲；客户端慢会变大');"
-"html+=node('宿主（提交+采样）',deHost,2,'= 墙钟 - 等待 - 写出');"
+"html+=node('decode',pd,2,'首个 token → 最后一个 token');"
+"html+=node('GPU 忙',dg,3,'Σ CB 的 GPU 时间');"
+"html+=node('阻塞等待',dw,3,'CPU 卡在 waitUntilCompleted');"
+"html+=node('回调写出',em,3,'写 socket / 拼缓冲；客户端慢会变大');"
+"html+=node('宿主（提交+采样）',deHost,3,'= 墙钟 - 等待 - 写出');"
 "const dt=(d.dtags||[]).filter(x=>x[1]>0);"
 "if(dt.length){"
 " const mx=Math.max(...dt.map(x=>x[1]));"
-" html+='<div class=tnrow style=padding-left:52px><span class=tlab>按阶段（GPU 忙）</span></div>';"
+" html+='<div class=tnrow style=padding-left:78px><span class=tlab>按阶段（GPU 忙）</span></div>';"
 " dt.forEach(x=>{"
 "  const nm=x[0]>=32?('段 '+(x[0]-32)):(TAGS[x[0]]||('#'+x[0]));"
-"  html+=node(nm,x[1],3,x[2]+' 个 CB','');"
+"  html+=node(nm,x[1],4,x[2]+' 个 CB','');"
 "  html+=bar(x[1],mx,'var(--d)');});}"
-"html+=node('未归因',un,1,'引擎总 - prefill - decode');"
-"html+=node('分词',tk,2,'tokenizer');"
-"html+=node('KV 落盘加载',kv,2,'磁盘快照 load+apply');"
-"html+=node('其余',unRest,2,'首字前 head+采样、快照写入等');"
+"html+=node('未归因',un,2,'引擎总 - prefill - decode');"
+"html+=node('分词',tk,3,'tokenizer');"
+"html+=node('KV 落盘加载',kv,3,'磁盘快照 load+apply');"
+"html+=node('其余',unRest,3,'首字前 head+采样、快照写入等');"
 "html+='</div>';"
 "html+='<div class=meta style=margin:-6px 0 16px>GPU 忙 与 阻塞等待 会重叠（异步提交时 CPU 与 GPU 并行），'+"
 " '所以两者相加不等于墙钟；各阶段桶按提交归属，两个 CB 并行时也会同时增长。</div>';"
