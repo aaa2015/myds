@@ -30,6 +30,11 @@ void myds_last_prefill_stats(const myds_context_t *ctx, myds_prefill_stats_t *ou
     if (out) memset(out, 0, sizeof(*out));
 }
 void myds_context_reset_prefill_stats(myds_context_t *ctx) { (void)ctx; }
+void myds_last_phase_detail(const myds_context_t *ctx, myds_phase_detail_t *out) {
+    (void)ctx;
+    if (out) memset(out, 0, sizeof(*out));
+}
+void myds_context_reset_phase_detail(myds_context_t *ctx) { (void)ctx; }
 void myds_set_continue_from_cache(myds_context_t *ctx, bool enable) { (void)ctx; (void)enable; }
 uint32_t myds_context_get_pcache_len(const myds_context_t *ctx) { (void)ctx; return 100; }
 myds_steer_t *myds_context_find_steer(const myds_context_t *ctx, const char *name) { (void)ctx; (void)name; return NULL; }

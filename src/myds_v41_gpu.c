@@ -821,7 +821,16 @@ struct indexer_register_only_args {
     float scale;
 };
 _Static_assert(sizeof(struct indexer_register_only_args)==72u,"register-only original tiled ABI");
-_Static_assert(offsetof(struct indexer_register_only_args,q_token_stride)==24u &&
+_Static_assert(offsetof(struct indexer_register_only_args,n_comp)==0u &&
+               offsetof(struct indexer_register_only_args,n_tokens)==4u &&
+               offsetof(struct indexer_register_only_args,n_head)==8u &&
+               offsetof(struct indexer_register_only_args,head_dim)==12u &&
+               offsetof(struct indexer_register_only_args,pos0)==16u &&
+               offsetof(struct indexer_register_only_args,ratio)==20u &&
+               offsetof(struct indexer_register_only_args,q_token_stride)==24u &&
+               offsetof(struct indexer_register_only_args,q_head_stride)==32u &&
+               offsetof(struct indexer_register_only_args,weights_token_stride)==40u &&
+               offsetof(struct indexer_register_only_args,index_row_stride)==48u &&
                offsetof(struct indexer_register_only_args,score_token_stride)==56u &&
                offsetof(struct indexer_register_only_args,scale)==64u,"register-only original tiled offsets");
 int myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped(

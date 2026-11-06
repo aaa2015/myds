@@ -181,8 +181,25 @@ if [[ $DO_RESTART -eq 1 ]]; then
     ssh "$REMOTE_HOST" "export PATH=/opt/homebrew/bin:/usr/local/bin:\$PATH; \
         cd '$FLEET_DIR' && ./start_fleet.sh" 2>&1 | tail -15
     echo
-    echo "🩺 健康检查"
-    ssh "$REMOTE_HOST" 'sleep 3; curl -s -m 5 localhost:8187/health || echo "(no response)"'
+    echo "🩺 健康检查与冷启动预热（消除首请求 Metal JIT 尖峰，见账本 §128）"
+    ssh "$REMOTE_HOST" '
+        for i in $(seq 1 30); do
+            if curl -sf -m 2 http://127.0.0.1:8187/health >/dev/null 2>&1; then break; fi
+            sleep 1
+        done
+        curl -s -m 5 http://127.0.0.1:8187/health || echo "(no response)"
+        echo
+        STATE_JSON="$(curl -sf -m 5 http://127.0.0.1:8187/debug/state || true)"
+        if [[ -n "$STATE_JSON" ]] && echo "$STATE_JSON" | grep -q "\"unread\":0"; then
+            echo "   ✓ /debug/state knobs.unread == 0"
+        elif [[ -n "$STATE_JSON" ]]; then
+            echo "   ⚠️ /debug/state 检测到 unread 环境变量，请检查线上配置"
+        fi
+        curl -sf -m 30 http://127.0.0.1:8187/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -d "{\"model\":\"default\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":1,\"temperature\":0}" >/dev/null 2>&1 \
+            && echo "   ✓ 冷启动 1-token 预热完成" || echo "   ⚠️ 预热请求跳过或未完成"
+    '
     echo
 else
     echo

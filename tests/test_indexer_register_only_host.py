@@ -11,6 +11,7 @@ import importlib.util
 import io
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -23,7 +24,55 @@ ROOT = Path(__file__).resolve().parents[1]
 APPROVED_SHADER_SHA = "a62922c6f5937236bd0e354dd06943b39bfa5f788419c16a8700da793769d616"
 
 
+def _parse_struct_fields(source_text: str, struct_name: str) -> list[tuple[str, str]]:
+    match = re.search(
+        rf"struct\s+{re.escape(struct_name)}\s*\{{([^}}]+)\}}\s*;",
+        source_text,
+        re.MULTILINE | re.DOTALL,
+    )
+    if not match:
+        raise AssertionError(f"struct {struct_name} not found")
+    fields: list[tuple[str, str]] = []
+    for raw_stmt in match.group(1).split(";"):
+        stmt = raw_stmt.split("//", 1)[0].split("/*", 1)[0].strip()
+        if not stmt:
+            continue
+        m = re.match(r"^([A-Za-z0-9_]+)\s+(.+)$", stmt)
+        if not m:
+            raise AssertionError(f"Unparseable struct statement in {struct_name}: {stmt!r}")
+        ftype = m.group(1)
+        for raw_name in m.group(2).split(","):
+            fname = raw_name.strip()
+            if fname:
+                fields.append((ftype, fname))
+    return fields
+
+
 class RegisterOnlyHostTests(unittest.TestCase):
+    def test_c_and_metal_arg_struct_abi_match(self):
+        c_src = (ROOT / "src" / "myds_v41_gpu.c").read_text(encoding="utf-8")
+        metal_src = (ROOT / "metal" / "dsv4_misc.metal").read_text(encoding="utf-8")
+        c_fields = _parse_struct_fields(c_src, "indexer_register_only_args")
+        metal_fields = _parse_struct_fields(
+            metal_src, "ds4_metal_args_dsv4_indexer_scores_fused"
+        )
+        expected = [
+            ("uint32_t", "n_comp"),
+            ("uint32_t", "n_tokens"),
+            ("uint32_t", "n_head"),
+            ("uint32_t", "head_dim"),
+            ("uint32_t", "pos0"),
+            ("uint32_t", "ratio"),
+            ("uint64_t", "q_token_stride"),
+            ("uint64_t", "q_head_stride"),
+            ("uint64_t", "weights_token_stride"),
+            ("uint64_t", "index_row_stride"),
+            ("uint64_t", "score_token_stride"),
+            ("float", "scale"),
+        ]
+        self.assertEqual(c_fields, expected)
+        self.assertEqual(metal_fields, expected)
+
     @classmethod
     def setUpClass(cls):
         cls.temporary = tempfile.TemporaryDirectory(prefix="myds-register-only-host-")

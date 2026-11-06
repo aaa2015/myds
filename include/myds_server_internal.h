@@ -146,6 +146,9 @@ extern volatile sig_atomic_t g_running;
  * 返回 0 = 拿到名额；-1 = 队列已满；-2 = 排队超时。调用方拿到名额后
  * 还要自己取 g_infer_mutex —— 队列只决定「轮到谁」，不决定「谁在跑」。 */
 int  server_acquire_infer_slot(int timeout_ms, int max_depth);
+int  server_acquire_infer_slot_for(int timeout_ms, int max_depth, const char *want_prev_id);
+void server_infer_queue_set_active_resp_id(const char *resp_id);
+void server_infer_queue_set_active_resp_ids(const char *resp_id, const char *parent_resp_id);
 void server_release_infer_slot(void);
 uint32_t server_infer_queue_depth(void);
 

@@ -866,7 +866,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             if (v > 0) max_q_depth = v;
         }
 
-        int q_res = server_acquire_infer_slot(q_timeout_ms, max_q_depth);
+        int q_res = server_acquire_infer_slot_for(q_timeout_ms, max_q_depth, prev_id);
         if (q_res != 0) {
             MYDS_LOG_W("[%s:%d] server reject due to %s (depth=%u, timeout=%dms)",
                        client_ip, client_port, q_res == -1 ? "queue full" : "queue wait timeout",
@@ -1715,10 +1715,12 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                     ? (resp_id_tools_sig(prev_id) ? resp_id_tools_sig(prev_id) : resp_id_live_tools_sig())
                     : tools_sig;
                 resp_id_register_text(resp_id, reg_sig, accum);
+                server_infer_queue_set_active_resp_ids(resp_id, is_continuation ? prev_id : NULL);
                 free(accum);
             }
         } else {
             resp_id_invalidate_all();
+            server_infer_queue_set_active_resp_id(NULL);
         }
 
         double t_end = myds_server_now_s();

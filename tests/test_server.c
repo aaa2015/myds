@@ -3,7 +3,30 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <unistd.h>
 #include <assert.h>
+
+typedef struct {
+    int id;
+    const char *want_prev_id;
+    const char *next_active_id;
+    int *order;
+    int *order_n;
+    pthread_mutex_t *mu;
+} queue_affinity_worker_t;
+
+static void *queue_affinity_worker_fn(void *arg) {
+    queue_affinity_worker_t *w = (queue_affinity_worker_t *)arg;
+    int rc = server_acquire_infer_slot_for(5000, 32, w->want_prev_id);
+    assert(rc == 0);
+    pthread_mutex_lock(w->mu);
+    w->order[(*w->order_n)++] = w->id;
+    pthread_mutex_unlock(w->mu);
+    server_infer_queue_set_active_resp_id(w->next_active_id);
+    server_release_infer_slot();
+    return NULL;
+}
 
 int main(void) {
     printf("====================================================\n");
@@ -270,6 +293,40 @@ int main(void) {
             "{\"model\":\"m\",\"note\":\"a \\\"quoted\\\" word\","
             "\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{}}}") == SERVER_RF_JSON_SCHEMA);
         printf("  [PASS] response_format classification (json_schema rejected, json_object warned)\n");
+    }
+
+    /* 12. 推理队列 previous_response_id 前缀亲和调度与饥饿上限（最多连续插队 2 次） */
+    {
+        g_running = 1;
+        pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+        int order[4] = {-1, -1, -1, -1};
+        int order_n = 0;
+        queue_affinity_worker_t workers[4] = {
+            {0, NULL,      "resp_B1", order, &order_n, &mu},
+            {1, "resp_A1", "resp_A2", order, &order_n, &mu},
+            {2, "resp_A2", "resp_A3", order, &order_n, &mu},
+            {3, "resp_A3", "resp_A4", order, &order_n, &mu},
+        };
+        pthread_t th[4];
+
+        assert(server_acquire_infer_slot_for(1000, 32, NULL) == 0);
+        for (uint32_t i = 0; i < 4u; ++i) {
+            assert(pthread_create(&th[i], NULL, queue_affinity_worker_fn, &workers[i]) == 0);
+            while (server_infer_queue_depth() < i + 1u) {
+                usleep(500);
+            }
+        }
+        server_infer_queue_set_active_resp_id("resp_A1");
+        server_release_infer_slot();
+
+        for (uint32_t i = 0; i < 4u; ++i) {
+            pthread_join(th[i], NULL);
+        }
+        assert(order_n == 4);
+        /* A2(1) and A3(2) jump ahead via prefix affinity; A4(3) is capped at streak=2 so B1(0) runs next. */
+        assert(order[0] == 1 && order[1] == 2 && order[2] == 0 && order[3] == 3);
+        server_infer_queue_set_active_resp_id(NULL);
+        printf("  [PASS] inference queue prefix-affinity wakeup + 2-streak starvation cap\n");
     }
 
     printf("====================================================\n");

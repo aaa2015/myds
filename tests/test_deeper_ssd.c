@@ -387,6 +387,102 @@ static void test_deeper_prompt_end_snapshot(const char *path) {
     puts("  [PASS] prompt-end SSD snapshot (kvends-v1): odd-position previous state, tail rows, bit-exact restore, and transactional corruption rollback");
 }
 
+static void test_deeper_anchor_snapshot(const char *path) {
+    int32_t *tokens = deeper_tokens();
+    myds_v41_context_t *g = myds_v41_context_create_snapshot_fixture();
+    assert(g && myds_v41_low_kv_fixture_enable(g, path, 0x5EEDull, 2, false, DEEPER_CAP));
+
+    lk_fill_state(g);
+
+    const uint32_t p_anchor = 2180u;
+    const uint32_t anchor_slot = myds_anchor_slot(1u);
+    for (uint32_t l = 0; l < 40u; ++l) {
+        float *w = (float *)myds_metal_buffer_data(myds_v41_snapshot_get_window(g, l));
+        const size_t nw = myds_metal_buffer_size(myds_v41_snapshot_get_window(g, l)) / sizeof(float);
+        for (size_t k = 0; k < nw; ++k) w[k] = (float)(l * 1301u + k * 23u + 99u);
+    }
+    for (uint32_t o = 0; o < 4u; ++o) {
+        float *pkv = (float *)myds_metal_buffer_data(myds_v41_snapshot_get_previous_kv(g, o));
+        float *psc = (float *)myds_metal_buffer_data(myds_v41_snapshot_get_previous_score(g, o));
+        for (size_t k = 0; k < 512; ++k) {
+            pkv[k] = (float)(o * 2111u + k * 17u + 3u);
+            psc[k] = (float)(o * 3119u + k * 29u + 5u);
+        }
+        const uint32_t r = lk_ratio(o);
+        uint16_t *c = (uint16_t *)myds_metal_buffer_data(myds_v41_snapshot_get_compressed(g, o));
+        uint16_t *x = (uint16_t *)myds_metal_buffer_data(myds_v41_snapshot_get_index_cache(g, o));
+        for (uint32_t row = 2048u / r; row < (p_anchor + r - 1u) / r; ++row) {
+            for (size_t k = 0; k < 512; ++k) c[row * 512 + k] = (uint16_t)(0x6600u + (row * 41u + k) % 256u);
+            for (size_t k = 0; k < 128; ++k) x[row * 128 + k] = (uint16_t)(0xbb00u + (row * 43u + k) % 256u);
+        }
+    }
+    myds_v41_snapshot_set_engram_history(g, 111, 222, 333);
+    assert(myds_v41_snapshot_store_slot(g, anchor_slot, p_anchor));
+    assert(myds_v41_snapshot_get_pos(g, anchor_slot) == p_anchor);
+
+    for (uint32_t s = 0; s < MYDS_SNAP_SLOTS; ++s)
+        myds_v41_snapshot_fixture_publish(g, s, 0);
+    assert(myds_v41_snapshot_restore_slot(g, anchor_slot, p_anchor));
+    const uint64_t golden_anchor_state = deeper_state_hash(g);
+
+    /* Mutate live window and capture slot 0 (prompt-end) so snap_window[0] != snap_window[anchor_slot]. */
+    for (uint32_t l = 0; l < 40u; ++l) {
+        float *w = (float *)myds_metal_buffer_data(myds_v41_snapshot_get_window(g, l));
+        w[0] = -9999.0f;
+    }
+    assert(myds_v41_snapshot_store_now(g, 2305u));
+    assert(myds_v41_low_kv_save(g, tokens, 2306u));
+
+    /* Subsequent shorter request must not re-save or overread tokens beyond n_tokens. */
+    int32_t *short_tok = malloc(1100u * sizeof(*short_tok));
+    assert(short_tok);
+    for (uint32_t i = 0; i < 1100u; ++i) short_tok[i] = (int32_t)(90000u + i);
+    myds_v41_snapshot_clear(g, 0);
+    assert(myds_v41_snapshot_store_now(g, 1050u));
+    assert(myds_v41_low_kv_save(g, short_tok, 1100u));
+    free(short_tok);
+
+    /* Scramble RAM state and clear anchor slot in RAM, then reload from kvanchor-v1. */
+    lk_make_fork_state(g);
+    for (uint32_t l = 0; l < 40u; ++l)
+        memset(myds_metal_buffer_data(myds_v41_snapshot_get_window(g, l)), 0x44,
+               myds_metal_buffer_size(myds_v41_snapshot_get_window(g, l)));
+    for (uint32_t o = 0; o < 4u; ++o) {
+        memset(myds_metal_buffer_data(myds_v41_snapshot_get_previous_kv(g, o)), 0x44, 512 * 4);
+        memset(myds_metal_buffer_data(myds_v41_snapshot_get_previous_score(g, o)), 0x44, 512 * 4);
+    }
+    myds_v41_snapshot_fixture_publish(g, anchor_slot, 0);
+    assert(myds_v41_snapshot_get_pos(g, anchor_slot) == 0);
+
+    assert(myds_v41_low_kv_load_anchor(g, tokens, p_anchor, anchor_slot) == p_anchor);
+    assert(myds_v41_snapshot_get_pos(g, anchor_slot) == p_anchor);
+    assert(myds_v41_snapshot_restore_slot(g, anchor_slot, p_anchor));
+    assert(deeper_state_hash(g) == golden_anchor_state);
+
+    /* Verify FIFO segment eviction (not LFU): when way 0 has hits >= 1 (just touched above)
+     * and way 1 has a newly written anchor B (hits == 0), a subsequent distinct prompt C
+     * must evict the older way 0 instead of thrashing newly written anchor B (hits == 0). */
+    int32_t *tok_b = deeper_tokens();
+    int32_t *tok_c = deeper_tokens();
+    for (uint32_t i = 0; i < DEEPER_CAP; ++i) {
+        tok_b[i] += 100000;
+        tok_c[i] += 200000;
+    }
+    assert(myds_v41_snapshot_store_slot(g, anchor_slot, p_anchor));
+    assert(myds_v41_low_kv_save(g, tok_b, 2306u)); /* writes tok_b into oldest way, hits == 0 */
+    assert(myds_v41_snapshot_store_slot(g, anchor_slot, p_anchor));
+    assert(myds_v41_low_kv_save(g, tok_c, 2306u)); /* must evict older way, preserving tok_b */
+    assert(myds_v41_low_kv_load_anchor(g, tok_b, p_anchor, anchor_slot) == p_anchor);
+    assert(myds_v41_low_kv_load_anchor(g, tok_c, p_anchor, anchor_slot) == p_anchor);
+    free(tok_b);
+    free(tok_c);
+
+    myds_v41_context_free(g);
+    free(tokens);
+    lk_remove_store(path);
+    puts("  [PASS] anchor SSD snapshot (kvanchor-v1): non-zero anchor slot window isolation, sub-11K segment count, short-request isolation, and bit-exact restore");
+}
+
 static void test_deeper_prompt_end_eviction(const char *path) {
     myds_v41_context_t *g = myds_v41_context_create_snapshot_fixture();
     assert(g && myds_v41_low_kv_fixture_enable(g, path, 0x5EEDull, 2, false, DEEPER_CAP));
@@ -473,6 +569,7 @@ int main(int argc, char **argv) {
     char path[512]; snprintf(path, sizeof(path), "%s/kv.bin", dir);
     test_deeper_probe_and_success(path);
     test_deeper_prompt_end_snapshot(path);
+    test_deeper_anchor_snapshot(path);
     test_deeper_prompt_end_eviction(path);
     for (unsigned mode = 0; mode < 5; ++mode) test_deeper_failure_preserves_ram(path, mode);
     test_deeper_capacity_and_identity(path);
