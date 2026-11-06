@@ -4117,6 +4117,25 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
         const int n = e ? atoi(e) : 4;
         decode_split = (n > 1 && n <= (int)V41_LAYERS) ? n : 0;
     }
+    /* 层内细分采样（MYDS_PHASE_SPLIT_DECODE=N：每 N 个 token 做一次；未设/0 = 关）。
+     * 只在层内已有的【无并发作用域】边界切：attn 前 / attention 归约 / FFN。
+     * 被采样的 token 不做 decode_split 分段（两种标签不混用）。 */
+    static int dec_fine_n = -1;
+    static uint32_t dec_fine_ctr = 0;
+    if (dec_fine_n < 0) {
+        const char *e = getenv("MYDS_PHASE_SPLIT_DECODE");
+        dec_fine_n = e ? atoi(e) : 0;
+        if (dec_fine_n < 0) dec_fine_n = 0;
+    }
+    const bool dec_fine = dec_fine_n > 0 && !trace_on && (dec_fine_ctr++ % (uint32_t)dec_fine_n) == 0;
+#define DEC_FINE(tag)                                                         \
+    do {                                                                      \
+        if (dec_fine) {                                                       \
+            CHECK(myds_metal_flush_batch());                                  \
+            CHECK(myds_metal_begin_batch());                                  \
+            myds_metal_phase_tag_set(tag);                                    \
+        }                                                                     \
+    } while (0)
     int prev_auto_barrier = -1;
     int prev_concurrent = -1;
     bool fine_pipeline = false;
@@ -4185,6 +4204,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
         const v41_layer_t *l=&v->layers[il];
         const bool compressed=ratio_for(il)!=0;
         const uint32_t count=compressed?(pos+1u)/ratio_for(il):0;
+        DEC_FINE(MYDS_PH_TAG_DEC_PRE_ATTN);
         phase="HC attention input";
         if (il==1 || il==14) {
             uint32_t e=il==1?0:1;
@@ -4439,6 +4459,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
         }
         uint32_t top=count<V41_TOPK?count:V41_TOPK;
         uint32_t nraw=pos+1u<128?pos+1u:128;
+        DEC_FINE(MYDS_PH_TAG_DEC_ATTN);
         phase="attention reduction";
         static int attn_direct_enabled = -1;
         if (attn_direct_enabled < 0) {
@@ -4565,6 +4586,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
                                        ctx->steer->alpha_effective, V41_DIM, 1));
         }
         TRACE("attn_out",ctx->attn_out,V41_DIM);
+        DEC_FINE(MYDS_PH_TAG_DEC_FFN);
         phase="HC FFN input";
         if (fine_pipeline) {
             if (use_decode_attn_overlap) {
@@ -4608,7 +4630,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
                 CHECK(myds_dspark_capture_layer_to(ctx->dspark, il, g->residual, NULL));
             }
         }
-        if (decode_split && !trace_on && il + 1u < V41_LAYERS &&
+        if (decode_split && !trace_on && !dec_fine && il + 1u < V41_LAYERS &&
             ((il + 1u) * (uint32_t)decode_split) / V41_LAYERS != (il * (uint32_t)decode_split) / V41_LAYERS) {
             CHECK(myds_metal_flush_batch());
             CHECK(myds_metal_begin_batch());
@@ -7312,6 +7334,16 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             myds_metal_phase_tag_set(tag);                                    \
         }                                                                     \
     } while (0)
+    /* attention 内部细分：与 MoE 细分同理，只在 flush 处切开；默认关闭（见 trace 文档 §九）。 */
+    const bool opt_phase_attn = opt_phase_split && getenv("MYDS_PHASE_SPLIT_ATTN") != NULL;
+#define PHASE_FINE(tag)                                                       \
+    do {                                                                      \
+        if (opt_phase_attn) {                                                 \
+            CHECK(myds_metal_flush_batch());                                  \
+            CHECK(myds_metal_begin_batch());                                  \
+            myds_metal_phase_tag_set(tag);                                    \
+        }                                                                     \
+    } while (0)
     if (opt_phase_split) myds_metal_phase_tag_set(MYDS_PH_TAG_EMBED);
     const bool batch_trace_prefix = (getenv("MYDS_BATCH_TRACE_PREFIX") != NULL);
     const bool opt_disable_mm_engram = (getenv("MYDS_DISABLE_MM_ENGRAM") != NULL);
@@ -7649,6 +7681,10 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             const v41_layer_t *l = &v->layers[il];
             const bool compressed = ratio_for(il) != 0;
             moe_off = 0;
+            /* 每层开头换 NORM_MIX 标签（2026-11-06）：此前只在层循环【之前】换一次，
+             * 第 1 层之后各层的 HC 归一化/Mix 被记到上一层末尾的 MoE 标签里。
+             * 只在 MYDS_PHASE_SPLIT 开启时多一次 flush，关闭时零开销。 */
+            PHASE_BOUNDARY(MYDS_PH_TAG_NORM_MIX);
 
             /* ── 后缀收缩：本层只处理全局因果锥内的尾部行 ────────────────────────────
              * shift=0（默认）时参考点取【整条 prompt 的末尾】（base_pos + n_tokens）：
@@ -7949,6 +7985,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 
                 /* Step 4: SWA Attention reduction & indexer */
                 TIME_START();
+                PHASE_FINE(MYDS_PH_TAG_ATTN_PROJ);
                 uint32_t ratio = ratio_for(il);
                 if (ratio) {
                     if (kv_source(il)) {
@@ -7963,6 +8000,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     }
                 }
 
+                PHASE_FINE(MYDS_PH_TAG_ATTN_COMP);
                 uint64_t disp_loop0 = myds_metal_dispatch_count();  /* 诊断 */
                 if (kv_source(il)) {
                     phase = "compressed KV";
@@ -7985,6 +8023,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                         disp_compressor += myds_metal_dispatch_count() - dc0;
                     }
                 }
+                PHASE_FINE(MYDS_PH_TAG_ATTN_IDX);
                 if (index_source(il) && !kv_only) {
                     int batched = 0;
                     if (!opt_idx_per_token) {
@@ -8040,6 +8079,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     CHECK(myds_metal_begin_batch());
                 }
 
+                PHASE_FINE(MYDS_PH_TAG_ATTN_RING);
                 uint64_t dr0 = myds_metal_dispatch_count();   /* 诊断 */
                 /* carry：进入第一个【全量】chunk 之前，把前 127 行的 KV 从窗口环搬进
                  * 注意力 slab。收缩后这个位置不再是 c_start==0（前置段可能已经占掉
@@ -8092,6 +8132,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     TIME_ACC(prof_wait_carryring);
                     CHECK(myds_metal_begin_batch());
                 }
+                    PHASE_FINE(MYDS_PH_TAG_ATTN_CORE);
                     phase = "chunk attention";
                     if (n_comp) {
                         if (!myds_metal_buffer_update_sub_view(cw->cur_selected_view, prompt_selected,
@@ -8121,6 +8162,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     CHECK(myds_metal_begin_batch());
                 }
 
+                PHASE_FINE(MYDS_PH_TAG_ATTN_TAIL);
                 /* Batched inverse RoPE + BF16 rounding */
                 CHECK(myds_v41_gpu_rope_batch_round(cw->attn_heads_buf, 512, V41_HEADS, mb_base_pos + c_start, c_len, compressed, true));
                 disp_ringattn += myds_metal_dispatch_count() - dr0;   /* 诊断 */

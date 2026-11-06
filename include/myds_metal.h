@@ -69,6 +69,23 @@ typedef enum {
     MYDS_PH_TAG_MOE,          /* 专家 GEMV + 聚合 */
     MYDS_PH_TAG_HEAD,         /* output norm + lm_head */
     MYDS_PH_TAG_OTHER,
+    /* MoE 内部细分（仅 MYDS_PHASE_SPLIT 且 MYDS_PHASE_SPLIT_MOE=1 时出现，
+     * 只覆盖 prefill 的 mm 路径）。放在 OTHER 之后，不改变既有标签编号。 */
+    MYDS_PH_TAG_MOE_ROUTE,    /* 路由 id 分发（map0） */
+    MYDS_PH_TAG_MOE_GATEUP,   /* gate+up pair + SwiGLU */
+    MYDS_PH_TAG_MOE_DOWN,     /* down 投影 */
+    MYDS_PH_TAG_MOE_SUM,      /* 六专家求和 */
+    /* prefill attention 内部细分（MYDS_PHASE_SPLIT 且 MYDS_PHASE_SPLIT_ATTN=1） */
+    MYDS_PH_TAG_ATTN_PROJ,    /* compressor / indexer 的输入投影 */
+    MYDS_PH_TAG_ATTN_COMP,    /* 压缩 KV（compressor 发布） */
+    MYDS_PH_TAG_ATTN_IDX,     /* indexer 发布 */
+    MYDS_PH_TAG_ATTN_RING,    /* carry stage + 窗口环写入 */
+    MYDS_PH_TAG_ATTN_CORE,    /* chunk attention 本体 */
+    MYDS_PH_TAG_ATTN_TAIL,    /* 反 rope + out_a 投影（到 ATTN_OUT 边界为止） */
+    /* decode 层内细分（MYDS_PHASE_SPLIT_DECODE=N，每 N 个 token 采样一次） */
+    MYDS_PH_TAG_DEC_PRE_ATTN, /* HC attn 输入 + qkv 投影 + 压缩/indexer */
+    MYDS_PH_TAG_DEC_ATTN,     /* attention 归约 + 输出投影 */
+    MYDS_PH_TAG_DEC_FFN,      /* HC FFN 输入 + MoE（含层尾） */
     /* 32 以上留给「内部分段」（decode 按 MYDS_DECODE_SPLIT 切出的段）。
      * 连续编号，页面按 id-32 当作段号。 */
     MYDS_PH_TAG_SEG_BASE = 32,

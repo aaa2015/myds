@@ -6295,6 +6295,18 @@ int myds_metal_moe_route(
 /* 诊断：MoE 四步分步计时（MYDS_MOE_STEP_PROF=1 才开）。
  * 在每步 dispatch 后 commit+wait，从而把「MoE GEMMs」这个大窗口拆成
  * map0 / pair_swiglu / down / sum6 四段。默认零开销。 */
+/* MoE 内部按阶段标签归集 GPU 时间（MYDS_PHASE_SPLIT_MOE=1）。
+ * 与 MYDS_MOE_STEP_PROF 不同：这里量的是 Metal 记录的 GPU 时间戳，不是提交耗时，
+ * 也不排空队列；代价是每个 MoE 调用多 3 次只提交不等待的 flush。 */
+static int g_moe_tag_split = -1;
+static void moe_tag_point(id<MTLCommandBuffer> *cbp,
+                          id<MTLComputeCommandEncoder> *encp, int next_tag) {
+    myds_metal_commit_batch();      /* 当前 CB 以现有标签提交 */
+    myds_metal_begin_batch();
+    myds_metal_phase_tag_set(next_tag);
+    *cbp = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
+    *encp = get_compute_encoder(*cbp);
+}
 static int    g_moe_split = -1;
 static double g_moe_t_map0 = 0, g_moe_t_swiglu = 0, g_moe_t_down = 0, g_moe_t_sum = 0;
 static long   g_moe_split_calls = 0;
@@ -6486,6 +6498,10 @@ static int routed_moe_batch_impl(
             };
 
             /* Step 1: Map dispatch */
+            if (g_moe_tag_split < 0)
+                g_moe_tag_split = (getenv("MYDS_PHASE_SPLIT") && getenv("MYDS_PHASE_SPLIT_MOE")) ? 1 : 0;
+            const int moe_prev_tag = myds_metal_phase_tag_get();
+            if (g_moe_tag_split) myds_metal_phase_tag_set(MYDS_PH_TAG_MOE_ROUTE);
             [enc setComputePipelineState:g_pso_moe_mm_map0_ne20_6];
             [enc setBytes:&map_args length:sizeof(map_args) atIndex:0];
             [enc setBuffer:selected_ids->mtl_buf offset:selected_ids->offset atIndex:1];
@@ -6530,6 +6546,7 @@ static int routed_moe_batch_impl(
             }
             if (g_moe_split < 0) g_moe_split = getenv("MYDS_MOE_STEP_PROF") ? 1 : 0;
             if (g_moe_split) moe_split_point(&cb, &enc, &g_moe_t_map0);
+            if (g_moe_tag_split) moe_tag_point(&cb, &enc, MYDS_PH_TAG_MOE_GATEUP);
 
             if (g_auto_barrier) {
                 [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -6556,6 +6573,7 @@ static int routed_moe_batch_impl(
                                                   1),
                 MTLSizeMake(128, 1, 1));
             if (g_moe_split) moe_split_point(&cb, &enc, &g_moe_t_swiglu);
+            if (g_moe_tag_split) moe_tag_point(&cb, &enc, MYDS_PH_TAG_MOE_DOWN);
 
             if (g_auto_barrier) {
                 [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -6579,6 +6597,7 @@ static int routed_moe_batch_impl(
                                                   1),
                 MTLSizeMake(128, 1, 1));
             if (g_moe_split) moe_split_point(&cb, &enc, &g_moe_t_down);
+            if (g_moe_tag_split) moe_tag_point(&cb, &enc, MYDS_PH_TAG_MOE_SUM);
 
             if (g_auto_barrier) {
                 [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -6605,6 +6624,8 @@ static int routed_moe_batch_impl(
                     printf("[MOE-STEP] n=%ld  map0=%.0f  swiglu=%.0f  down=%.0f  sum6=%.0f ms\n",
                            g_moe_split_calls, g_moe_t_map0, g_moe_t_swiglu, g_moe_t_down, g_moe_t_sum);
             }
+            /* 求和之后的 kernel（HC expand 等）仍归原来的 MoE 阶段。 */
+            if (g_moe_tag_split) moe_tag_point(&cb, &enc, moe_prev_tag);
 
             if (g_batch_cb) {
                 if (g_auto_barrier) {

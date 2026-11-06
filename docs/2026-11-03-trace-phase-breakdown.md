@@ -100,7 +100,9 @@ ffn 输入 / 共享专家+路由 / MoE / head+lm_head / 其它。
 | 关 | 2.135 / 2.136 / 2.191 s | 82 | 41.5 / 41.5 / 41.4 t/s |
 | 开 | 2.129 / 2.134 / 2.190 s | 723 | 41.4 / 41.5 / 41.5 t/s |
 
-中位数 2.136 vs 2.134 s，decode 完全相同 ⇒ **开销在噪声内**，因此生产默认开启。
+中位数 2.136 vs 2.134 s，decode 完全相同 ⇒ **开销在噪声内**，**说明（2026-11-06 更正）**：代码里 `MYDS_PHASE_SPLIT` 是 `getenv(...) != NULL` 才生效，
+仓库内不设默认；线上由 myfleet 的 `myds.conf`（`MYDS_PHASE_SPLIT=1`）设置。
+所以「默认开启」只对 myfleet 部署成立，直接运行 `bin/myds` 需自己设置。
 
 ### 实测归因（同上那轮 prefill，2.13s / GPU 2.05s）
 
@@ -128,3 +130,45 @@ ffn 输入 / 共享专家+路由 / MoE / head+lm_head / 其它。
 `memcpy` 按目标大小拷，把 `uint64` 数组的前一半当成 52 个 `uint32`，
 于是「其它（OTHER, 12）」的 41 个 CB 显示成了 `#12 ... 41` 而 GPU 时间是 0 ——
 看起来像「有个神秘的 24 号阶段」。两边类型必须一致。
+
+## 八、MoE 内部细分（2026-11-06，`MYDS_PHASE_SPLIT_MOE=1`）
+
+需要同时设置 `MYDS_PHASE_SPLIT`。在 prefill 的 mm 路径（`n_tok >= MoE mm 阈值`）里，
+于 map0 / gate+up+SwiGLU / down / sum6 之间各做一次只提交、不等待的 flush，
+新增标签 `MoE·路由分发`、`MoE·gate+up+SwiGLU`、`MoE·down`、`MoE·求和`
+（编号 13–16，放在 OTHER 之后，不改变既有编号）。求和之后的 kernel 仍归原 `MoE 专家` 标签。
+
+- 量的是 Metal GPU 时间戳，不同于 `MYDS_MOE_STEP_PROF`（那个量的是提交耗时）。
+- 每次 MoE 调用多 3 次 flush，×40 层。**尚未实测其对 prefill 墙钟的影响**，
+  开启后不要拿墙钟与账本数字比较，须先按本文第六节的方法交替重测。
+- 只覆盖 prefill 的 mm 路径；decode 的 v41 路径（单 token）未细分。
+
+## 九、attention 与 decode 层内细分（2026-11-06）
+
+### 开关
+| 开关 | 作用 | 前提 |
+|---|---|---|
+| `MYDS_PHASE_SPLIT_ATTN=1` | prefill 的 attention 拆成 6 个标签 | 需 `MYDS_PHASE_SPLIT` |
+| `MYDS_PHASE_SPLIT_DECODE=N` | decode 每 N 个 token 采样一次，层内按 3 个子层切 | 独立；被采样的 token 不做 `DECODE_SPLIT` 分段 |
+
+均默认关闭，线上 `myds.conf` 里是注释掉的。
+
+### 新标签（编号 17–25，放在既有编号之后）
+prefill：`attn·compressor/indexer 投影`、`attn·压缩KV发布`、`attn·indexer发布`、`attn·carry+窗口环`、
+`attn·chunk attention`、`attn·rope+out_a`。
+decode：`decode·attn前(HC+投影+indexer)`、`decode·attention归约+输出`、`decode·FFN(HC+MoE)`。
+
+decode 只在层内【没有并发作用域】的三处切（层开头、attention 归约前、HC FFN 前）：
+生产路径的 qkv 投影、indexer、MoE 都在内部带并发作用域的函数里，在其中插 flush 会改变调度，所以没切。
+被采样 token 的 CB 数 = 采样 token 数 × 40，换算每 token 耗时时用它做分母。
+
+### 实测（macstudio，M2 Ultra，2026-11-06）
+- **输出逐位一致**：`temperature=0` 固定 prompt（2536 token，生成 112 token），开关全开 vs 全关，
+  两次都是冷启动（临时指向空的 `MYDS_KV_DSK` 目录，避免命中磁盘 KV），输出 sha256 相同（`63da14be…`）。
+  注意：第一次对比时 KV 来自磁盘缓存（"all 2535 cached"），prefill 并没有重算，所以不算数；以冷启动那次为准。
+- **代价**（`ATTN`+`DECODE` 全开 vs 基线，基线已含 `PHASE_SPLIT`+`PHASE_SPLIT_MOE`；各 6 次 prefill / 4 次 decode）：
+  prefill（约 8.4K token）18,189 → 18,371 ms，**+1.0%**；decode 40.83 → 40.61 t/s，**-0.55%**。
+- **读数示例**（2.5K token prompt 冷 prefill，GPU 忙 6.69 s）：`attn·chunk attention` 1.53 s，
+  `attn·rope+out_a` 347 ms，compressor/indexer/ring/投影合计约 140 ms。
+  decode 每 token（7 个采样 token 的均值）：attn 前 4.6 ms、attention 归约+输出 6.9 ms、FFN 11.1 ms。
+- 样本量小（decode 采样仅 7 个 token），只能看量级，不要拿来做精细结论。
