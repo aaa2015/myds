@@ -1478,6 +1478,7 @@ static uint64_t g_ph_cbs = 0;
 
 /* 阶段标签：当前值 + 按标签的累计。 */
 static int g_ph_tag_cur = MYDS_PH_TAG_NONE;
+static int g_moe_tag_split = -1;
 static double g_ph_tag_gpu[MYDS_PH_TAG_MAX];
 static uint64_t g_ph_tag_cbs[MYDS_PH_TAG_MAX];
 /* 每个 inflight CB 自己的标签，与 g_inflight_cbs 下标对齐。 */
@@ -1512,6 +1513,7 @@ void myds_metal_phase_reset(void) {
     g_ph_wait_s = 0.0;
     g_ph_cbs = 0;
     g_ph_tag_cur = MYDS_PH_TAG_NONE;
+    g_moe_tag_split = -1;
     for (int i = 0; i < MYDS_PH_TAG_MAX; i++) {
         g_ph_tag_gpu[i] = 0.0;
         g_ph_tag_cbs[i] = 0;
@@ -1868,7 +1870,15 @@ int myds_metal_init(const char *shader_dir) {
             return 0;
         }
 
-        g_queue = [g_device newCommandQueue];
+        g_queue = [g_device newCommandQueueWithMaxCommandBufferCount:512];
+        if (g_queue) {
+            MYDS_LOG_I("Metal command queue initialized (maxCommandBufferCount=512)");
+        } else {
+            g_queue = [g_device newCommandQueue];
+            if (g_queue) {
+                MYDS_LOG_W("Metal command queue fallback to default capacity (512 unsupported)");
+            }
+        }
         if (!g_queue) {
             fprintf(stderr, "myds_metal: failed to create Metal command queue\n");
             g_device = nil;
@@ -2802,6 +2812,11 @@ int myds_metal_flush_batch(void) {
     gp_note_commit();
     [cb commit];
     g_batch_commit_count++;
+    if ([g_inflight_cbs count] >= 256u) {
+        MYDS_LOG_D("Metal inflight CB threshold reached (%lu CBs), draining inflight queue",
+                   (unsigned long)[g_inflight_cbs count]);
+        return wait_inflight_commands();
+    }
     return 1;
 }
 
@@ -6298,10 +6313,9 @@ int myds_metal_moe_route(
 /* MoE 内部按阶段标签归集 GPU 时间（MYDS_PHASE_SPLIT_MOE=1）。
  * 与 MYDS_MOE_STEP_PROF 不同：这里量的是 Metal 记录的 GPU 时间戳，不是提交耗时，
  * 也不排空队列；代价是每个 MoE 调用多 3 次只提交不等待的 flush。 */
-static int g_moe_tag_split = -1;
 static void moe_tag_point(id<MTLCommandBuffer> *cbp,
                           id<MTLComputeCommandEncoder> *encp, int next_tag) {
-    myds_metal_commit_batch();      /* 当前 CB 以现有标签提交 */
+    myds_metal_flush_batch();       /* 当前 CB 以现有标签异步提交（只提交不等待） */
     myds_metal_begin_batch();
     myds_metal_phase_tag_set(next_tag);
     *cbp = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
@@ -6498,8 +6512,16 @@ static int routed_moe_batch_impl(
             };
 
             /* Step 1: Map dispatch */
-            if (g_moe_tag_split < 0)
+            if (g_moe_tag_split < 0) {
                 g_moe_tag_split = (getenv("MYDS_PHASE_SPLIT") && getenv("MYDS_PHASE_SPLIT_MOE")) ? 1 : 0;
+                if (g_moe_tag_split) {
+                    static bool logged_moe_tag_split = false;
+                    if (!logged_moe_tag_split) {
+                        MYDS_LOG_I("MoE phase tag split enabled (async flush mode, tags 13..16)");
+                        logged_moe_tag_split = true;
+                    }
+                }
+            }
             const int moe_prev_tag = myds_metal_phase_tag_get();
             if (g_moe_tag_split) myds_metal_phase_tag_set(MYDS_PH_TAG_MOE_ROUTE);
             [enc setComputePipelineState:g_pso_moe_mm_map0_ne20_6];

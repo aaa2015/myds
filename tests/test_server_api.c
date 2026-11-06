@@ -1570,6 +1570,29 @@ int main(int argc, char **argv) {
         printf("  [PASS] P1-2 dynamic prompt buffer parsing with >16KB content without truncation\n");
     }
 
+    /* 10. Test X-Myds-Warmup header detection for cold-start warmup probes */
+    {
+        assert(myds_server_is_warmup_request(
+            "POST /v1/chat/completions HTTP/1.1\r\n"
+            "Host: 127.0.0.1:8187\r\n"
+            "X-Myds-Warmup: 1\r\n"
+            "Content-Type: application/json\r\n\r\n"));
+        assert(myds_server_is_warmup_request(
+            "POST /v1/responses HTTP/1.1\r\n"
+            "x-myds-warmup:   1  \r\n\r\n"));
+        assert(!myds_server_is_warmup_request(
+            "POST /v1/chat/completions HTTP/1.1\r\n"
+            "X-Myds-Warmup: 0\r\n\r\n"));
+        assert(!myds_server_is_warmup_request(
+            "POST /v1/chat/completions HTTP/1.1\r\n"
+            "X-Myds-Warmup: 10\r\n\r\n"));
+        assert(!myds_server_is_warmup_request(
+            "POST /v1/chat/completions HTTP/1.1\r\n"
+            "Host: 127.0.0.1:8187\r\n\r\n"));
+        assert(!myds_server_is_warmup_request(NULL));
+        printf("  [PASS] X-Myds-Warmup header detection (case-insensitive, exact '1' match)\n");
+    }
+
     printf("====================================================\n");
     printf("      ALL SERVER API UNIT TESTS PASSED!             \n");
     printf("====================================================\n");

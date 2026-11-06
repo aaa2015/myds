@@ -7114,6 +7114,53 @@ void myds_v41_gpu_attn_sub_add(int slot, double sec) {
     if (slot >= 0 && slot < 2) { g_attn_sub[slot] += sec; g_attn_sub_calls[slot] += 1; }
 }
 
+/* 决定 prefill 工作区（chunk_ws 与 prompt_ws）的目标容量。
+ * 当开启跨 chunk MoE 批处理（cfg_moe_chunks > 1）且 n_tokens >= 32（例如冷启动预热探针或真实长请求）时，
+ * 直接一步到位按满配（cfg_chunk_size × cfg_moe_chunks）预分配工作区，避免后续对话增长时反复释放与重分配数 GiB Metal 缓冲。 */
+static inline void myds_v41_resolve_workspace_caps(
+    uint32_t n_tokens,
+    uint32_t cfg_chunk_size,
+    uint32_t chunk_size,
+    uint32_t cfg_moe_chunks,
+    uint32_t moe_chunks,
+    uint32_t mb_cap_needed,
+    uint32_t *out_ws_chunk_cap,
+    uint32_t *out_ws_moe_cap,
+    uint32_t *out_prompt_cap,
+    bool     *out_prealloc_full) {
+    const uint32_t moe_batch_tokens = chunk_size * moe_chunks;
+    const bool prealloc_full = (cfg_moe_chunks > 1u && n_tokens >= 32u);
+    const uint32_t ws_chunk_cap = prealloc_full ? cfg_chunk_size : chunk_size;
+    const uint32_t full_moe_cap = cfg_chunk_size * cfg_moe_chunks;
+    const uint32_t ws_moe_cap = prealloc_full
+        ? (full_moe_cap > moe_batch_tokens ? full_moe_cap : moe_batch_tokens)
+        : moe_batch_tokens;
+    uint32_t prompt_cap = (mb_cap_needed + 511u) / 512u * 512u;
+    if (prealloc_full && prompt_cap < ws_moe_cap) prompt_cap = ws_moe_cap;
+    if (out_ws_chunk_cap) *out_ws_chunk_cap = ws_chunk_cap;
+    if (out_ws_moe_cap) *out_ws_moe_cap = ws_moe_cap;
+    if (out_prompt_cap) *out_prompt_cap = prompt_cap;
+    if (out_prealloc_full) *out_prealloc_full = prealloc_full;
+}
+
+/* 判断当前 chunk 累积后是否需要立刻冲刷 MoE 批：
+ *   ① 攒满批容量（moe_off == moe_batch）；
+ *   ② 本层 macroblock 结束（next_rem == 0）；
+ *   ③ 下一个 chunk 的最大可能长度 next_chunk_max = min(chunk_size, next_rem) 放不进剩余批空间。
+ * 用 next_chunk_max 而非固定 chunk_size，避免当 shrink_shift 将倒数第二块对齐到 512 网格、
+ * 尾块 < chunk_size 时误判溢出而拆成两次全专家 MoE 调用。 */
+static inline bool myds_v41_should_flush_moe_batch(
+    uint32_t moe_off,
+    uint32_t moe_batch,
+    uint32_t c_start,
+    uint32_t c_len,
+    uint32_t mb_len,
+    uint32_t chunk_size) {
+    const uint32_t next_rem = (c_start + c_len < mb_len) ? (mb_len - (c_start + c_len)) : 0u;
+    const uint32_t next_chunk_max = next_rem < chunk_size ? next_rem : chunk_size;
+    return (moe_off == moe_batch || next_rem == 0u || moe_off + next_chunk_max > moe_batch);
+}
+
 int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                             uint32_t n_tokens, volatile int *cancel_flag) {
     /* MYDS_PROFILE_ALLOC=1：只给「入口 → 层循环」这段未计时区加打点。
@@ -7212,6 +7259,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         }
         chunk_size = V41_MAX_CHUNK;
     }
+    const uint32_t cfg_chunk_size = chunk_size;
     if (n_tokens < chunk_size) {
         chunk_size = n_tokens;
         if (chunk_size % 2u != 0) chunk_size++;
@@ -7254,10 +7302,15 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
      * 加大它不改变 attention 的数值，只是把 MoE 的调用次数降下来 —— MoE 每层要读
      * 全部 n_routed_experts 个 expert 的权重，与 token 数无关。 */
     uint32_t moe_chunks = 1;
+    uint32_t cfg_moe_chunks = 1;
     {
         const char *mc = getenv("MYDS_MOE_CHUNKS");
         if (mc) { int v = atoi(mc); if (v > 1) moe_chunks = (uint32_t)v; }
         if (moe_chunks > 16u) moe_chunks = 16u;
+        cfg_moe_chunks = moe_chunks;
+        if (cfg_moe_chunks > 1u && (size_t)cfg_chunk_size * cfg_moe_chunks > moe_batch_max_tokens())
+            cfg_moe_chunks = (uint32_t)(moe_batch_max_tokens() / cfg_chunk_size);
+        if (cfg_moe_chunks < 1u) cfg_moe_chunks = 1u;
         /* 内存护栏：批缓冲约 0.44 MB/token（MoE 的 gate/up/mid/down + 累积缓冲） */
         if (moe_chunks > 1u && (size_t)chunk_size * moe_chunks > moe_batch_max_tokens())
             moe_chunks = (uint32_t)(moe_batch_max_tokens() / chunk_size);
@@ -7268,10 +7321,22 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             if (moe_chunks < 1u) moe_chunks = 1u;
         }
     }
-    const uint32_t moe_batch_tokens = chunk_size * moe_chunks;
-    if (!g->chunk_ws || g->chunk_ws->capacity < chunk_size || g->chunk_ws->moe_batch < moe_batch_tokens) {
+    uint32_t ws_chunk_cap = 0, ws_moe_cap = 0, cap = 0;
+    bool prealloc_full_ws = false;
+    myds_v41_resolve_workspace_caps(n_tokens, cfg_chunk_size, chunk_size,
+                                    cfg_moe_chunks, moe_chunks, mb_cap_needed,
+                                    &ws_chunk_cap, &ws_moe_cap, &cap, &prealloc_full_ws);
+    if (!g->chunk_ws || g->chunk_ws->capacity < ws_chunk_cap || g->chunk_ws->moe_batch < ws_moe_cap) {
+        const uint32_t prev_chunk_cap = g->chunk_ws ? g->chunk_ws->capacity : 0u;
+        const uint32_t prev_moe_cap = g->chunk_ws ? g->chunk_ws->moe_batch : 0u;
         v41_chunk_workspace_free(g->chunk_ws);
-        g->chunk_ws = v41_chunk_workspace_create(chunk_size, m->moe_expert_dim, moe_batch_tokens);
+        g->chunk_ws = v41_chunk_workspace_create(ws_chunk_cap, m->moe_expert_dim, ws_moe_cap);
+        if (g->chunk_ws) {
+            MYDS_LOG_I("prefill chunk workspace %s: chunk_cap=%u->%u moe_batch=%u->%u (prealloc_full=%d, n=%u)",
+                       prev_chunk_cap ? "expanded" : "allocated",
+                       prev_chunk_cap, ws_chunk_cap, prev_moe_cap, ws_moe_cap,
+                       prealloc_full_ws ? 1 : 0, n_tokens);
+        }
     }
     v41_chunk_workspace_t *cw = g->chunk_ws;
 
@@ -7289,8 +7354,9 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             last_mb = macroblock_size; last_mc = moe_chunks; last_chunk = chunk_size;
         }
     }
-    uint32_t cap = (mb_cap_needed + 511u) / 512u * 512u;
     if (!prompt_ws_complete || g->prompt_tokens_cap < cap || g->prompt_mask_bytes_cap < mask_bytes) {
+        const uint32_t prev_prompt_cap = g->prompt_tokens_cap;
+        const size_t prev_mask_cap = g->prompt_mask_bytes_cap;
         size_t cap_res_size = (size_t)cap * 4u * V41_DIM;
         myds_metal_buffer_t *n_res = myds_metal_buffer_alloc(cap_res_size * sizeof(float));
         myds_metal_buffer_t *n_pre = myds_metal_buffer_alloc((size_t)cap * pre_tok_bytes);
@@ -7326,6 +7392,10 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         g->prompt_engram_buf[1] = n_engram1;
         g->prompt_tokens_cap = cap;
         g->prompt_mask_bytes_cap = mask_bytes;
+        MYDS_LOG_I("prefill prompt workspace %s: tokens_cap=%u->%u mask_bytes=%zu->%zu (prealloc_full=%d, n=%u)",
+                   prev_prompt_cap ? "expanded" : "allocated",
+                   prev_prompt_cap, cap, prev_mask_cap, mask_bytes,
+                   prealloc_full_ws ? 1 : 0, n_tokens);
     }
 
     double pf_alloc_ms = -1.0;
@@ -7644,7 +7714,6 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             t += step;
         }
         TIME_ACC(prof_engram);
-                PHASE_BOUNDARY(MYDS_PH_TAG_EMBED);
 
         phase = "embedding lookup";
         TIME_START();
@@ -7706,7 +7775,6 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             }
         }
         TIME_ACC(prof_embedding);
-                PHASE_BOUNDARY(MYDS_PH_TAG_NORM_MIX);
 
         phase = "layer loop";
         uint32_t moe_off = 0;   /* 当前 MoE 批已经攒了多少 token */
@@ -7716,10 +7784,6 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             const v41_layer_t *l = &v->layers[il];
             const bool compressed = ratio_for(il) != 0;
             moe_off = 0;
-            /* 每层开头换 NORM_MIX 标签（2026-11-06）：此前只在层循环【之前】换一次，
-             * 第 1 层之后各层的 HC 归一化/Mix 被记到上一层末尾的 MoE 标签里。
-             * 只在 MYDS_PHASE_SPLIT 开启时多一次 flush，关闭时零开销。 */
-            PHASE_BOUNDARY(MYDS_PH_TAG_NORM_MIX);
 
             /* ── 后缀收缩：本层只处理全局因果锥内的尾部行 ────────────────────────────
              * shift=0（默认）时参考点取【整条 prompt 的末尾】（base_pos + n_tokens）：
@@ -7843,6 +7907,9 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 }
 
                 CHECK(myds_metal_begin_batch());
+                if (opt_phase_split) {
+                    myds_metal_phase_tag_set((il == 1 || il == 14) ? MYDS_PH_TAG_ENGRAM : MYDS_PH_TAG_NORM_MIX);
+                }
 
                 myds_metal_buffer_update_sub_view(cw->cur_res_view, prompt_res, (size_t)c_start * res_tok_bytes, (size_t)c_len * res_tok_bytes);
                 myds_metal_buffer_update_sub_view(cw->cur_pre_view, prompt_pre, (size_t)c_start * pre_tok_bytes, (size_t)c_len * pre_tok_bytes);
@@ -7893,6 +7960,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     } else {
                         CHECK(myds_metal_v41_engram_add_batch(cw->cur_res_view, cw->engram_proj_buf[e], v->engram_q[e], v->engram_k[e], V41_DIM, c_len, m->norm_eps));
                     }
+                    PHASE_BOUNDARY(MYDS_PH_TAG_NORM_MIX);
                 }
 
                 /* Batched HC Mix: RMSNorm + GEMM + Split across the entire chunk */
@@ -8520,9 +8588,17 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                  *
                  * 只改「何时分组」，不改 c_len。若反过来把 c_len 削到 MoE 边界，chunk
                  * 端点就不在 512 网格上（例：113091+16384=129475，mod 512=451），
-                 * 会破坏快照发布。 */
-                if (moe_off == cw->moe_batch || c_start + c_len == mb_len ||
-                    (c_start + c_len < mb_len && moe_off + chunk_size > cw->moe_batch)) {
+                 * 会破坏快照发布。
+                 * ★ 下一个 chunk 的真实最大长度为 min(chunk_size, mb_len - (c_start + c_len))：
+                 *   不能直接用 chunk_size 作上界，否则当 shrink_shift=512 将倒数第二个 chunk
+                 *   对齐到 512 网格（例如 4993 tok 在 4096..4608 处切出 512 tok，仅剩 385 tok）时，
+                 *   4608 + 2048 > 6144 会误判溢出，把单 macroblock 拆成两次全专家 MoE 调用。 */
+                if (myds_v41_should_flush_moe_batch(moe_off, cw->moe_batch, c_start, c_len, mb_len, chunk_size)) {
+                    const uint32_t next_rem = (c_start + c_len < mb_len) ? (mb_len - (c_start + c_len)) : 0u;
+                    if (next_rem > 0u) {
+                        MYDS_LOG_D("prefill MoE mid-macroblock flush: il=%u moe_off=%u next_rem=%u moe_batch=%u",
+                                   il, moe_off, next_rem, cw->moe_batch);
+                    }
                     /* 注：本分支只在全量 chunk 里可达（moe_off 只在全量 chunk 里累加） */
                     const uint32_t mb_moe_len = moe_off;
                     const uint32_t mb_moe_start = c_start + c_len - mb_moe_len;   /* 本批在 prompt 里的起点 */
@@ -8659,7 +8735,6 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                      * 而位置单调递增 ⇒ 同一个 p 不会再被访问。 */
                 }
                 TIME_ACC(prof_step8);
-                PHASE_BOUNDARY(MYDS_PH_TAG_HEAD);
 
                 TIME_START();
                 if (do_prof || trace_on || opt_sync_chunk || ++inflight_chunks >= 32u) {

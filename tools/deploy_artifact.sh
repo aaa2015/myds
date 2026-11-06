@@ -197,8 +197,9 @@ if [[ $DO_RESTART -eq 1 ]]; then
         fi
         curl -sf -m 30 http://127.0.0.1:8187/v1/chat/completions \
             -H "Content-Type: application/json" \
-            -d "{\"model\":\"default\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":1,\"temperature\":0}" >/dev/null 2>&1 \
-            && echo "   ✓ 冷启动 1-token 预热完成" || echo "   ⚠️ 预热请求跳过或未完成"
+            -H "X-Myds-Warmup: 1" \
+            -d "{\"model\":\"default\",\"messages\":[{\"role\":\"user\",\"content\":\"warmup 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20\"}],\"max_tokens\":1,\"temperature\":0}" >/dev/null 2>&1 \
+            && echo "   ✓ 冷启动预热完成（含 MoE MM 内核与工作区缓冲）" || echo "   ⚠️ 预热请求跳过或未完成"
     '
     echo
 else

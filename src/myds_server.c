@@ -834,9 +834,10 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
         /* 请求一到达就登记一条 in_flight 记录，结束时再回填。
          * 只写结尾的话，一次 40 秒的 prefill 在页面里完全不可见 ——
          * 而「现在卡在哪」恰恰只能看正在进行的那条。 */
+        const bool is_warmup_probe = myds_server_is_warmup_request(req_buf);
         char trace_client[MYDS_TRACE_CLIENT_MAX];
         snprintf(trace_client, sizeof(trace_client), "%s:%d", client_ip, client_port);
-        const uint64_t trace_seq = myds_trace_begin(path, trace_client, resp_id);
+        const uint64_t trace_seq = is_warmup_probe ? 0 : myds_trace_begin(path, trace_client, resp_id);
         /* 早退时用它收尾：清掉 in_flight，阶段全部保持「未测量」。
          * 不做这一步的话，被拒绝的请求会永远挂在页面上显示「进行中」。 */
         myds_trace_rec_t trec_fail;
@@ -1693,7 +1694,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             free(ns.buf);
         }
 
-        if (stop_reason != MYDS_STOP_ERROR && stop_reason != MYDS_STOP_CANCELLED && transport_ok) {
+        if (!is_warmup_probe && stop_reason != MYDS_STOP_ERROR && stop_reason != MYDS_STOP_CANCELLED && transport_ok) {
             /* 续跑自身不重渲 tools ⇒ 它不改变「当前活响应」的工具集，沿用上一轮指纹。 */
             /* 累积提示词：完整模式直接存本次 prompt；suffix 模式存「上一轮前缀 + 本次新增」。
              * 这是重启后能重建输入的唯一依据 —— kvdisk 只存 KV 字节，不存 token 归属。 */
@@ -1966,6 +1967,12 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
              * stage cost; a large negative means the split itself is wrong. */
             if (phases)
                 MYDS_LOG_I("[%s:%d] request_phases %s", client_ip, client_port, phases_json);
+            if (is_warmup_probe) {
+                ctx->pcache_len = 0;
+                MYDS_LOG_I("[%s:%d] Warmup probe finished (X-Myds-Warmup: 1): prompt=%u tok, prefill=%.3fs, trace skipped & pcache reset",
+                           client_ip, client_port, prompt_tokens,
+                           pf.valid ? pf.prefill_seconds : prefill_s);
+            }
         }
         if (ctx->dspark && ctx->dspark->proposed_tokens > dspark_prop_before) {
             uint64_t req_prop = ctx->dspark->proposed_tokens - dspark_prop_before;

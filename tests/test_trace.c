@@ -481,6 +481,64 @@ static void test_page_is_html(void) {
     CHECK(strstr(html, "MYDS_PROFILE_PREFILL") != NULL);
 }
 
+/* 缓存高命中轮次的 prefill 速率口径。
+ *
+ * 背景（真实误读）：5962 tok 的请求命中 5951 tok 前缀缓存时，只增量跑 11 tok，
+ * 耗时 0.181s（TTFT 从 13.6s 降到 0.22s，提速 61 倍）。但算 11 tok 仍需扫一遍
+ * 40 层权重，11 / 0.181 = 61 t/s。若列表直接显示 "61 t/s" 而不标 "(+11)" 与等效吞吐，
+ * 用户会以为比冷缓存的 435 t/s 慢了 7 倍。 */
+static void test_cached_prefill_incremental_display(void) {
+    const char *html = myds_trace_page_html();
+    CHECK(html != NULL);
+    if (!html) return;
+
+    /* 列表与详情树必须包含增量 token 数、(+N) 标记与等效吞吐公式 */
+    CHECK(strstr(html, "const pfTok=Math.max(0,(rec.prompt_tokens||0)-(rec.cached_tokens||0));") != NULL);
+    CHECK(strstr(html, "const pfEff=(rec.cached_tokens>0&&p.prefill>0)?Math.round(rec.prompt_tokens/p.prefill):null;") != NULL);
+    CHECK(strstr(html, "增量 prefill ") != NULL);
+    CHECK(strstr(html, "(+'+pfTok+')") != NULL);
+    CHECK(strstr(html, "等效 ") != NULL);
+
+    /* 阶段标签表必须覆盖 prefill/MoE 各细分阶段 */
+    CHECK(strstr(html, "'engram 投影'") != NULL);
+    CHECK(strstr(html, "'归一化+Mix'") != NULL);
+    CHECK(strstr(html, "'head+lm_head'") != NULL);
+    CHECK(strstr(html, "'MoE·路由分发'") != NULL);
+    CHECK(strstr(html, "'MoE·gate+up+SwiGLU'") != NULL);
+    CHECK(strstr(html, "'MoE·down'") != NULL);
+    CHECK(strstr(html, "'MoE·求和'") != NULL);
+
+    /* C 侧对账：5962 tok 中复用 5951 tok，增量 11 tok 在 0.181s 完成 */
+    myds_trace_reset();
+    myds_trace_init(8);
+    myds_trace_rec_t r;
+    fill(&r, "/v1/responses", 0.678);
+    r.prompt_tokens = 5962;
+    r.cached_tokens = 5951;
+    r.cache_hit_rate = 100.0 * 5951.0 / 5962.0;
+    r.phases.prefill_s = 0.181;
+    r.prefill_tps = 11.0 / 0.181;
+    r.detail.prefill_tag_gpu[1] = 0.0012;
+    r.detail.prefill_tag_cbs[1] = 2;
+    r.detail.prefill_tag_gpu[14] = 0.0450;
+    r.detail.prefill_tag_cbs[14] = 40;
+    myds_trace_record(&r);
+
+    myds_trace_rec_t got;
+    CHECK(myds_trace_get(0, &got));
+    const uint32_t pf_tok = got.prompt_tokens > got.cached_tokens
+        ? (got.prompt_tokens - got.cached_tokens) : 0u;
+    const long pf_eff = (got.cached_tokens > 0 && got.phases.prefill_s > 0.0)
+        ? lround((double)got.prompt_tokens / got.phases.prefill_s) : 0;
+    CHECK(pf_tok == 11u);
+    CHECK(pf_eff == 32939);
+
+    char detail_buf[4096];
+    CHECK(myds_trace_detail_json(got.seq, detail_buf, sizeof(detail_buf)));
+    CHECK(strstr(detail_buf, "[1,0.001200,2]") != NULL);
+    CHECK(strstr(detail_buf, "[14,0.045000,40]") != NULL);
+}
+
 int main(void) {
     test_empty();
     test_unmeasured_is_null_not_zero();
@@ -499,6 +557,7 @@ int main(void) {
     test_page_script_refs_exist();
     test_token_is_injected_into_page();
     test_page_is_html();
+    test_cached_prefill_incremental_display();
     myds_trace_reset();
 
     if (failures) {

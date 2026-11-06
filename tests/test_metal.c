@@ -1497,6 +1497,68 @@ static int test_moe_batch_mm(void) {
         ASSERT_TRUE(isfinite(out[i]));
     }
 
+    /* Test 3: MYDS_PHASE_SPLIT=1 + MYDS_PHASE_SPLIT_MOE=1 async flush split
+     * must be 0-ULP bit-exact to unsplit MM output and attribute 1 CB to each
+     * of tags 13..16 (MYDS_PH_TAG_MOE_ROUTE..MYDS_PH_TAG_MOE_SUM). */
+    float *ref_mm = (float *)malloc(n_tok * dim * sizeof(float));
+    ASSERT_TRUE(ref_mm != NULL);
+    ASSERT_TRUE(myds_metal_routed_moe_batch(
+        moe_out, x_in, gate_exps, up_exps, down_exps,
+        selected_ids, selected_weights,
+        scratch_gate, scratch_up, scratch_mid, scratch_down,
+        dim, expert_dim, n_routed_experts, n_activated_experts, n_tok,
+        GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_K, 10.0f));
+    ASSERT_TRUE(myds_metal_commit_batch());
+    memcpy(ref_mm, myds_metal_buffer_data(moe_out), n_tok * dim * sizeof(float));
+
+    const char *old_ps = getenv("MYDS_PHASE_SPLIT");
+    const char *old_psm = getenv("MYDS_PHASE_SPLIT_MOE");
+    char *saved_ps = old_ps ? strdup(old_ps) : NULL;
+    char *saved_psm = old_psm ? strdup(old_psm) : NULL;
+    setenv("MYDS_PHASE_SPLIT", "1", 1);
+    setenv("MYDS_PHASE_SPLIT_MOE", "1", 1);
+    myds_metal_phase_reset();
+    memset(myds_metal_buffer_data(moe_out), 0xCD, n_tok * dim * sizeof(float));
+
+    ASSERT_TRUE(myds_metal_begin_batch());
+    myds_metal_phase_tag_set(MYDS_PH_TAG_MOE);
+    ASSERT_TRUE(myds_metal_routed_moe_batch(
+        moe_out, x_in, gate_exps, up_exps, down_exps,
+        selected_ids, selected_weights,
+        scratch_gate, scratch_up, scratch_mid, scratch_down,
+        dim, expert_dim, n_routed_experts, n_activated_experts, n_tok,
+        GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_K, 10.0f));
+    ASSERT_TRUE(myds_metal_commit_batch());
+
+    ASSERT_TRUE(memcmp(myds_metal_buffer_data(moe_out), ref_mm, n_tok * dim * sizeof(float)) == 0);
+    double tag_gpu[MYDS_PH_TAG_MAX] = {0};
+    uint64_t tag_cbs[MYDS_PH_TAG_MAX] = {0};
+    myds_metal_phase_tags_take(tag_gpu, tag_cbs);
+    ASSERT_TRUE(tag_cbs[MYDS_PH_TAG_MOE_ROUTE] == 1);
+    ASSERT_TRUE(tag_cbs[MYDS_PH_TAG_MOE_GATEUP] == 1);
+    ASSERT_TRUE(tag_cbs[MYDS_PH_TAG_MOE_DOWN] == 1);
+    ASSERT_TRUE(tag_cbs[MYDS_PH_TAG_MOE_SUM] == 1);
+
+    if (saved_ps) { setenv("MYDS_PHASE_SPLIT", saved_ps, 1); free(saved_ps); }
+    else unsetenv("MYDS_PHASE_SPLIT");
+    if (saved_psm) { setenv("MYDS_PHASE_SPLIT_MOE", saved_psm, 1); free(saved_psm); }
+    else unsetenv("MYDS_PHASE_SPLIT_MOE");
+    myds_metal_phase_reset();
+    free(ref_mm);
+
+    /* Test 4: Inflight CB threshold (>256 flushes) drains cleanly and preserves math */
+    for (uint32_t i = 0; i < dim; i++) x[i] = 1.0f;
+    memset(myds_metal_buffer_data(moe_out), 0, dim * sizeof(float));
+    for (uint32_t step = 0; step < 260u; step++) {
+        ASSERT_TRUE(myds_metal_begin_batch());
+        ASSERT_TRUE(myds_metal_add(moe_out, moe_out, x_in, dim));
+        ASSERT_TRUE(myds_metal_flush_batch());
+    }
+    ASSERT_TRUE(myds_metal_commit_batch());
+    for (uint32_t i = 0; i < dim; i++) {
+        ASSERT_NEAR(out[i], 260.0f, 1e-4f);
+    }
+
     myds_metal_buffer_free(moe_out);
     myds_metal_buffer_free(x_in);
     myds_metal_buffer_free(gate_exps);

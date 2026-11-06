@@ -97,6 +97,7 @@ void json_unescape_slice(const char *src, size_t len, char *dst, size_t dst_size
 int extract_http_header_int(const char *headers, const char *header_name);
 int extract_http_header_str(const char *headers, const char *header_name,
                             char *out, size_t out_size);
+bool myds_server_is_warmup_request(const char *headers);
 int json_extract_string_field(const char *json, const char *key, char *out, size_t out_size);
 /* 顶层字段存在性（深度 1），避免误判 input 内容里的同名字样。 */
 bool json_has_top_field(const char *body, const char *key);

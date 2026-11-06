@@ -241,6 +241,13 @@ int extract_http_header_str(const char *headers, const char *header_name,
     return 0;
 }
 
+bool myds_server_is_warmup_request(const char *headers) {
+    char warmup_hdr[16] = "";
+    if (!extract_http_header_str(headers, "X-Myds-Warmup", warmup_hdr, sizeof(warmup_hdr)))
+        return false;
+    return warmup_hdr[0] == '1' && warmup_hdr[1] == '\0';
+}
+
 /* Very simple JSON string value finder: searches for "key"\s*:\s*"value" */
 /* 判断 body 的【顶层】是否有某个 key。
  * 只认深度 1：input 里的消息内容也可能含 "tools" 之类的字样，不能被误判。
