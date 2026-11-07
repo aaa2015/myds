@@ -79,6 +79,8 @@ void myds_vis_image_free(myds_vis_image *image);
 /* ── 预处理（DeepSeek V4.1）── */
 int  myds_vis_preprocess(myds_vis_patches *out, const myds_vis_image *image,
                          char *error, size_t error_cap);
+int  myds_vis_preprocess_ex(myds_vis_patches *out, const myds_vis_image *image,
+                            uint32_t max_workers, char *error, size_t error_cap);
 void myds_vis_patches_free(myds_vis_patches *patches);
 
 /* ── 图片 token 序列骨架（V4.1 版）──

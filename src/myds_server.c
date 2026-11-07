@@ -372,6 +372,29 @@ static bool inject_image_embeddings(myds_context_t *ctx, const char *prompt,
     return true;
 }
 
+static void handle_client(int client_fd, myds_context_t *ctx, const char *model_alias, const char *client_ip, int client_port);
+
+bool myds_server_format_models_json(const char *model_alias, bool vision_enabled,
+                                    char *out, size_t out_cap) {
+    if (!out || out_cap == 0) return false;
+    out[0] = '\0';
+    const char *raw_id = (model_alias && model_alias[0]) ? model_alias : "myds";
+    char escaped_id[512];
+    if (!json_escape_bytes(raw_id, strlen(raw_id), escaped_id, sizeof(escaped_id), NULL)) {
+        return false;
+    }
+    const char *in_mods = vision_enabled ? "\"text\",\"image\"" : "\"text\"";
+    int n = snprintf(out, out_cap,
+                     "{\"object\":\"list\",\"data\":[{\"id\":\"%s\",\"object\":\"model\",\"owned_by\":\"myds\","
+                     "\"architecture\":{\"input_modalities\":[%s],\"output_modalities\":[\"text\"]}}]}",
+                     escaped_id, in_mods);
+    if (n < 0 || (size_t)n >= out_cap) {
+        out[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
 static void handle_client(int client_fd, myds_context_t *ctx, const char *model_alias, const char *client_ip, int client_port) {
     pthread_once(&g_vjob_lock_once, init_vjob_gpu_lock);
     /* ── 接收截止时间（2026-10-25）─────────────────────────
@@ -648,12 +671,16 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
 
     /* GET /v1/models */
     if (strcmp(path, "/v1/models") == 0) {
-        MYDS_LOG_I("[%s:%d] GET /v1/models -> 200 OK (alias: %s)", client_ip, client_port, model_alias ? model_alias : "myds");
-        char resp[512];
-        snprintf(resp, sizeof(resp),
-                 "{\"object\":\"list\",\"data\":[{\"id\":\"%s\",\"object\":\"model\",\"owned_by\":\"myds\"}]}",
-                 model_alias ? model_alias : "myds");
-        send_response(client_fd, 200, "OK", "application/json", resp);
+        const bool vis = myds_vjob_ready();
+        MYDS_LOG_I("[%s:%d] GET /v1/models -> 200 OK (alias: %s, vision: %d)",
+                   client_ip, client_port, model_alias ? model_alias : "myds", vis ? 1 : 0);
+        char resp[1024];
+        if (!myds_server_format_models_json(model_alias, vis, resp, sizeof(resp))) {
+            send_response(client_fd, 500, "Internal Server Error", "application/json",
+                          "{\"error\":\"failed to format model list\"}");
+        } else {
+            send_response(client_fd, 200, "OK", "application/json", resp);
+        }
         free(req_buf);
         close(client_fd);
         return;

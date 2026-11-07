@@ -535,6 +535,26 @@ static _Atomic uint64_t indexer_head_slots_requests;
 static _Atomic uint64_t indexer_head_slots_encoded;
 static _Atomic uint64_t indexer_head_slots_unavailable;
 static _Atomic uint64_t indexer_head_slots_failures;
+static bool v41_gpu_indexer_score_rows4_enabled(void) {
+    const char *v = getenv("MYDS_INDEXER_SCORE_ROWS4");
+    return !v || strcmp(v, "0") != 0;
+}
+static void v41_gpu_log_indexer_which(int path_id, const char *path_name, const char *kernel_name,
+    bool rows4, bool has_mask, bool cache_bf16, uint32_t first_row, uint32_t n_comp, uint32_t n_sel_blocks) {
+    if (!getenv("MYDS_ATTN_WHICH")) return;
+    static int seen[16][5];
+    static int nseen = 0;
+    const int k0 = path_id, k1 = (int)rows4, k2 = (int)has_mask, k3 = (int)cache_bf16, k4 = (int)(first_row > 0u);
+    for (int i = 0; i < nseen; ++i) {
+        if (seen[i][0] == k0 && seen[i][1] == k1 && seen[i][2] == k2 && seen[i][3] == k3 && seen[i][4] == k4) return;
+    }
+    if (nseen < 16) {
+        seen[nseen][0] = k0; seen[nseen][1] = k1; seen[nseen][2] = k2; seen[nseen][3] = k3; seen[nseen][4] = k4;
+        ++nseen;
+        MYDS_LOG_I("indexer-which#%d: path=%s kernel=%s rows4=%d has_mask=%d bf16=%d first_row=%u n_comp=%u n_selected_blocks=%u",
+                   nseen, path_name, kernel_name, k1, k2, k3, first_row, n_comp, n_sel_blocks);
+    }
+}
 int myds_v41_gpu_indexer_head_slots_enabled(void) {
     return myds_metal_indexer_head_slots_enabled();
 }
@@ -556,7 +576,13 @@ int myds_v41_gpu_indexscores_head_slots(myds_metal_buffer_t *scores,
     bool encoded=false,unavailable=false;
     const int ok=myds_metal_indexer_head_slots_dispatch(scores,q,weights,cache,mask,
         n_comp,n_heads,cache_bf16,first_row,&encoded,&unavailable);
-    if(encoded)atomic_fetch_add_explicit(&indexer_head_slots_encoded,1u,memory_order_relaxed);
+    if(encoded) {
+        atomic_fetch_add_explicit(&indexer_head_slots_encoded,1u,memory_order_relaxed);
+        const bool rows4 = v41_gpu_indexer_score_rows4_enabled();
+        v41_gpu_log_indexer_which(1, "head_slots",
+            rows4 ? "kernel_glm_indexer_score_one_rows4" : "kernel_myds_indexer_score_one_head_slots",
+            rows4, mask != NULL, cache_bf16, first_row, n_comp, 0u);
+    }
     if(unavailable)atomic_fetch_add_explicit(&indexer_head_slots_unavailable,1u,memory_order_relaxed);
     if(!ok)atomic_fetch_add_explicit(&indexer_head_slots_failures,1u,memory_order_relaxed);
     return ok;
@@ -573,8 +599,19 @@ static int indexscores(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
             uint32_t first_row;} a={
         n_comp,n_heads,128,cache_bf16?2u:0u,1.0f/64.0f,mask?1u:0u,first_row};
     const myds_metal_buffer_t *b[]={q,weights,cache,scores,mask?mask:scores};
-    return n_heads==32 ? dispatch("kernel_glm_indexer_score_one_direct",&a,sizeof(a),b,5,n_comp,1,1,32,4,1,132u*4)
-        : dispatch("kernel_glm_indexer_score_one",&a,sizeof(a),b,5,n_comp,1,1,32,1,1,32u*4);
+    if (n_heads == 32u) {
+        const bool rows4 = v41_gpu_indexer_score_rows4_enabled();
+        const int ok = rows4
+            ? dispatch("kernel_glm_indexer_score_one_rows4",&a,sizeof(a),b,5,(n_comp+15u)/16u,1,1,32,4,1,0)
+            : dispatch("kernel_glm_indexer_score_one_direct",&a,sizeof(a),b,5,n_comp,1,1,32,4,1,132u*4);
+        if (ok) {
+            v41_gpu_log_indexer_which(0, "direct",
+                rows4 ? "kernel_glm_indexer_score_one_rows4" : "kernel_glm_indexer_score_one_direct",
+                rows4, mask != NULL, cache_bf16, first_row, n_comp, 0u);
+        }
+        return ok;
+    }
+    return dispatch("kernel_glm_indexer_score_one",&a,sizeof(a),b,5,n_comp,1,1,32,1,1,32u*4);
 }
 int myds_v41_gpu_indexscores(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
     const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,uint32_t n_comp,
@@ -626,11 +663,16 @@ int myds_v41_gpu_indexscores_selected_blocks_bf16(myds_metal_buffer_t *scores,
        buffer_ranges_overlap(scores,score_bytes,mask,(size_t)((n_comp+7u)/8u)*4u)||
        (n_selected_blocks&&buffer_ranges_overlap(scores,score_bytes,block_ids,(size_t)n_selected_blocks*4u)))return -1;
     atomic_fetch_add_explicit(&indexer_compact_counters[IC_REQUESTS],1,memory_order_relaxed);
+    const bool rows4 = v41_gpu_indexer_score_rows4_enabled();
+    const char *sel_kernel = rows4
+        ? "kernel_myds_indexer_score_selected_blocks_rows4"
+        : "kernel_myds_indexer_score_selected_blocks_direct";
+    const uint32_t sel_min_threads = rows4 ? 64u : 128u;
     /* Probe both optional pipelines before filling any score. Missing kernels
      * can use the original scorer without observing partly changed buffers. */
     if(indexer_compact_test_unavailable||
        myds_metal_kernel_max_threads("kernel_myds_indexer_scores_fill")<256u||
-       (n_selected_blocks&&myds_metal_kernel_max_threads("kernel_myds_indexer_score_selected_blocks_direct")<128u)) {
+       (n_selected_blocks&&myds_metal_kernel_max_threads(sel_kernel)<sel_min_threads)) {
         atomic_fetch_add_explicit(&indexer_compact_counters[IC_UNAVAILABLE],1,memory_order_relaxed);
         return 0;
     }
@@ -644,13 +686,16 @@ int myds_v41_gpu_indexscores_selected_blocks_bf16(myds_metal_buffer_t *scores,
         struct {uint32_t n_rows,n_head,head_dim,cache_f16;float scale;
             uint32_t has_mask,n_selected_blocks,first_row;} a={n_comp,32u,128u,2u,1.0f/64.0f,1u,n_selected_blocks,first_row};
         const myds_metal_buffer_t *b[]={q,weights,cache,scores,mask,block_ids};
-        if(!dispatch("kernel_myds_indexer_score_selected_blocks_direct",&a,sizeof(a),b,6,
-                     n_selected_blocks*8u,1,1,32,4,1,132u*4))return -1;
+        const int sel_ok = rows4
+            ? dispatch(sel_kernel,&a,sizeof(a),b,6,n_selected_blocks,1,1,32,2,1,0)
+            : dispatch(sel_kernel,&a,sizeof(a),b,6,n_selected_blocks*8u,1,1,32,4,1,132u*4);
+        if(!sel_ok)return -1;
     }
     myds_metal_barrier_buffer(scores);
     atomic_fetch_add_explicit(&indexer_compact_counters[IC_ENCODED],1,memory_order_relaxed);
     atomic_fetch_add_explicit(&indexer_compact_counters[IC_DENSE_ROWS],n_comp,memory_order_relaxed);
     atomic_fetch_add_explicit(&indexer_compact_counters[IC_ROW_SLOTS],(uint64_t)n_selected_blocks*8u,memory_order_relaxed);
+    v41_gpu_log_indexer_which(2, "selected_blocks", sel_kernel, rows4, true, true, first_row, n_comp, n_selected_blocks);
     return 1;
 }
 /* 整 chunk 批量版：kernel_glm_indexer_score_chunk_direct 与 _direct 的线程/网格/smem

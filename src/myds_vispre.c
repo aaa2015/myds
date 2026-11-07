@@ -14,6 +14,7 @@
 
 #include <errno.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -225,9 +226,27 @@ static double vis_cubic(double x, double a) {
     return 0.0;
 }
 
-static void resize_rgb_bicubic(const uint8_t *src, uint32_t src_width,
-                               uint32_t src_height, float *dst, uint32_t dst_width,
-                               uint32_t dst_height, uint32_t dst_stride) {
+typedef struct {
+    const uint8_t *src;
+    uint32_t src_width;
+    uint32_t src_height;
+    float *dst;
+    uint32_t dst_width;
+    uint32_t dst_height;
+    uint32_t dst_stride;
+    uint32_t y_begin;
+    uint32_t y_end;
+} vis_resize_job_t;
+
+static void *resize_rgb_bicubic_rows(void *arg) {
+    const vis_resize_job_t *job = (const vis_resize_job_t *)arg;
+    const uint8_t *src = job->src;
+    uint32_t src_width = job->src_width;
+    uint32_t src_height = job->src_height;
+    float *dst = job->dst;
+    uint32_t dst_width = job->dst_width;
+    uint32_t dst_height = job->dst_height;
+    uint32_t dst_stride = job->dst_stride;
     double scale_x = (double)src_width / dst_width;
     double scale_y = (double)src_height / dst_height;
     double filter_x = scale_x >= 1.0 ? 1.0 / scale_x : 1.0;
@@ -235,7 +254,7 @@ static void resize_rgb_bicubic(const uint8_t *src, uint32_t src_width,
     double support_x = scale_x >= 1.0 ? 2.0 * scale_x : 2.0;
     double support_y = scale_y >= 1.0 ? 2.0 * scale_y : 2.0;
 
-    for (uint32_t dy = 0; dy < dst_height; dy++) {
+    for (uint32_t dy = job->y_begin; dy < job->y_end; dy++) {
         double center_y = scale_y * ((double)dy + 0.5);
         int y0 = (int)(center_y - support_y + 0.5);
         int y1 = (int)(center_y + support_y + 0.5);
@@ -271,6 +290,47 @@ static void resize_rgb_bicubic(const uint8_t *src, uint32_t src_width,
             }
         }
     }
+    return NULL;
+}
+
+static void resize_rgb_bicubic(const uint8_t *src, uint32_t src_width,
+                               uint32_t src_height, float *dst, uint32_t dst_width,
+                               uint32_t dst_height, uint32_t dst_stride,
+                               uint32_t max_workers) {
+    enum { MAX_WORKERS = 8 };
+    uint64_t work = (uint64_t)(src_width > dst_width ? src_width : dst_width) *
+                    (src_height > dst_height ? src_height : dst_height);
+    uint32_t workers = work >= 65536u ? (uint32_t)(work / 65536u) : 1u;
+    if (max_workers == 0 || max_workers > MAX_WORKERS) max_workers = MAX_WORKERS;
+    if (workers > max_workers) workers = max_workers;
+    if (workers > dst_height) workers = dst_height;
+    if (workers <= 1) {
+        vis_resize_job_t job = {
+            src, src_width, src_height, dst, dst_width, dst_height, dst_stride,
+            0, dst_height,
+        };
+        resize_rgb_bicubic_rows(&job);
+        return;
+    }
+
+    pthread_t threads[MAX_WORKERS];
+    vis_resize_job_t jobs[MAX_WORKERS];
+    uint32_t created = 0;
+    for (uint32_t i = 0; i < workers; i++) {
+        uint32_t y_begin = (uint32_t)((uint64_t)dst_height * i / workers);
+        uint32_t y_end = (uint32_t)((uint64_t)dst_height * (i + 1u) / workers);
+        jobs[i] = (vis_resize_job_t){
+            src, src_width, src_height, dst, dst_width, dst_height, dst_stride,
+            y_begin, y_end,
+        };
+        if (pthread_create(&threads[i], NULL, resize_rgb_bicubic_rows, &jobs[i]) != 0) {
+            jobs[i].y_end = dst_height;
+            resize_rgb_bicubic_rows(&jobs[i]);
+            break;
+        }
+        created++;
+    }
+    for (uint32_t i = 0; i < created; i++) pthread_join(threads[i], NULL);
 }
 
 /* ─────────────────── 尺寸规划 ─────────────────── */
@@ -334,8 +394,8 @@ static int vis_safe_resize(uint32_t height, uint32_t width, uint32_t *best_heigh
 
 /* ─────────────────── 预处理（V4.1）─────────────────── */
 
-int myds_vis_preprocess(myds_vis_patches *out, const myds_vis_image *image,
-                        char *error, size_t error_cap) {
+int myds_vis_preprocess_ex(myds_vis_patches *out, const myds_vis_image *image,
+                           uint32_t max_workers, char *error, size_t error_cap) {
     if (!out) return 0;
     memset(out, 0, sizeof(*out));
     if (!image || !image->rgb || image->width == 0 || image->height == 0) {
@@ -397,7 +457,7 @@ int myds_vis_preprocess(myds_vis_patches *out, const myds_vis_image *image,
 
     float *resized = canvas + ((size_t)offset_y * best_width + offset_x) * 3u;
     resize_rgb_bicubic(image->rgb, image->width, image->height, resized,
-                       content_width, content_height, best_width);
+                       content_width, content_height, best_width, max_workers);
     for (size_t i = 0; i < canvas_values; i++) {
         canvas[i] = canvas[i] / 127.5f - 1.0f;
     }
@@ -445,6 +505,11 @@ int myds_vis_preprocess(myds_vis_patches *out, const myds_vis_image *image,
     out->patch_count = patch_count;
     out->patches = patches;
     return 1;
+}
+
+int myds_vis_preprocess(myds_vis_patches *out, const myds_vis_image *image,
+                        char *error, size_t error_cap) {
+    return myds_vis_preprocess_ex(out, image, 8u, error, error_cap);
 }
 
 void myds_vis_patches_free(myds_vis_patches *patches) {

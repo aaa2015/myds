@@ -157,11 +157,16 @@ ALL_TESTS += $(TEST_TOKENIZER_WORKSPACE)
 ALL_TESTS += $(TEST_PROMPT_RENDER_BOUNDS)
 ALL_TESTS += $(TEST_REQUEST_PHASES_JSON)
 ALL_TESTS += $(TEST_DEBUG_STATE)
-ALL_TESTS += $(TEST_STEER)
-
 TEST_STEER = $(BIN_DIR)/test_steer
+TEST_VISPRE = $(BIN_DIR)/test_vispre
+ALL_TESTS += $(TEST_STEER)
+ALL_TESTS += $(TEST_VISPRE)
+
 $(TEST_STEER): tests/test_steer.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -Iinclude -o $@ tests/test_steer.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS)
+
+$(TEST_VISPRE): tests/test_vispre.c $(BUILD_DIR)/myds_vispre.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) -Iinclude -o $@ $< $(BUILD_DIR)/myds_vispre.o $(LDFLAGS)
 
 # CPU-only: exercises the request_phases formatter. A printf whose argument types
 # drift from its format string compiles cleanly and emits unparsable JSON, which a
@@ -971,6 +976,7 @@ test: check-knobs $(ALL_TESTS) $(METALLIB)
 	@./$(TEST_TEARDOWN_ORDER)
 	@./$(TEST_KVDSK_FIFO)
 	@./$(TEST_ANCHOR_SLOTS)
+	@./$(TEST_VISPRE)
 	@echo "\n========================================================"
 	@echo "      ALL TEST SUITES PASSED CLEANLY & SUCCESSFULLY!    "
 	@echo "========================================================"

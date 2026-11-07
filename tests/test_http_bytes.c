@@ -39,7 +39,9 @@ void myds_set_continue_from_cache(myds_context_t *ctx, bool enable) { (void)ctx;
 uint32_t myds_context_get_pcache_len(const myds_context_t *ctx) { (void)ctx; return 100; }
 myds_steer_t *myds_context_find_steer(const myds_context_t *ctx, const char *name) { (void)ctx; (void)name; return NULL; }
 void myds_context_set_liveness_probe(myds_context_t *ctx, myds_liveness_probe_t probe, void *user_data) { (void)ctx; (void)probe; (void)user_data; }
+static bool stub_vision_ready = false;
 void myds_vjob_set_gpu_lock(void (*lock_fn)(void), void (*unlock_fn)(void)) { (void)lock_fn; (void)unlock_fn; }
+bool myds_vjob_ready(void) { return stub_vision_ready; }
 const char *myds_vjob_placeholder(void) { return "<|image_pad|>"; }
 uint32_t myds_vjob_image_token_id(void) { return 0; }
 int myds_vjob_sink_add(myds_vjob_sink_t *sink, const uint8_t *encoded, size_t len,
@@ -204,6 +206,29 @@ int main(int argc, char **argv) {
         close(sockets[1]);
     }
     puts("PASS raw NUL and incomplete Content-Length rejected before generation");
+    for (unsigned vis = 0; vis < 2; vis++) {
+        int sockets[2];
+        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+        stub_vision_ready = (vis != 0);
+        const char *req = "GET /v1/models HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        assert(myds_server_send_all(sockets[1], req, strlen(req)));
+        handle_client(sockets[0], NULL, "test-\"alias", "local", 1234);
+        char response[1024] = {0};
+        assert(recv(sockets[1], response, sizeof(response) - 1, 0) > 0);
+        assert(strncmp(response, "HTTP/1.1 200 OK\r\n", 17) == 0);
+        assert(strstr(response, "\"id\":\"test-\\\"alias\"") != NULL);
+        assert(strstr(response, "\"object\":\"model\"") != NULL);
+        assert(strstr(response, "\"owned_by\":\"myds\"") != NULL);
+        if (vis) {
+            assert(strstr(response, "\"architecture\":{\"input_modalities\":[\"text\",\"image\"],\"output_modalities\":[\"text\"]}") != NULL);
+        } else {
+            assert(strstr(response, "\"architecture\":{\"input_modalities\":[\"text\"],\"output_modalities\":[\"text\"]}") != NULL);
+            assert(strstr(response, "\"image\"") == NULL);
+        }
+        close(sockets[1]);
+    }
+    stub_vision_ready = false;
+    puts("PASS GET /v1/models advertises text vs text+image modalities and escapes model alias");
     dsml_isolation_cases();
     return 0;
 }

@@ -395,6 +395,7 @@ static void hs_ambient(void) {
     const char *off[]={"MYDS_BATCH2_Q8_SHARED","MYDS_MOE_Q2_SUM_CACHE","MYDS_MOE_Q2_SUM_CACHE_FUSED","MYDS_MOE_IQ2_CONSTANT_LUT","MYDS_INDEXER_COMPACT_SCORER","MYDS_RESIDENCY_BYPASS","MYDS_V41_WEIGHT_STAGE"};
     for(unsigned i=0;i<sizeof(off)/sizeof(off[0]);i++)unsetenv(off[i]);
     HS_REQUIRE(!setenv("MYDS_METAL_CONCURRENT","0",1));
+    HS_REQUIRE(!setenv("MYDS_INDEXER_SCORE_ROWS4","0",1));
     HS_REQUIRE(!setenv("MYDS_INDEXER_TOPK_PREFIX_MERGE","1",1));HS_REQUIRE(!setenv("MYDS_INDEXER_TOPK_NAN_FUSE","1",1));
     g_hist_enabled=1;
 }

@@ -245,6 +245,10 @@ char *responses_output_items_json_ex(bool thinking, const char *reasoning, size_
 /* 工具调用响应的 output 数组（给 response.completed 用）。 */
 char *responses_function_calls_output_json(const myds_tool_call_t *calls, size_t count);
 
+/* GET /v1/models 响应构造（内部实现，供单测直接校验 vision 启用/未启用的 modalities）。 */
+bool myds_server_format_models_json(const char *model_alias, bool vision_enabled,
+                                    char *out, size_t out_cap);
+
 #ifdef __cplusplus
 }
 #endif

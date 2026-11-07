@@ -1593,6 +1593,28 @@ int main(int argc, char **argv) {
         printf("  [PASS] X-Myds-Warmup header detection (case-insensitive, exact '1' match)\n");
     }
 
+    /* 11. Test GET /v1/models JSON formatting with and without vision modalities */
+    {
+        char models_json[1024];
+        assert(myds_server_format_models_json("local-deepseek-flash", false, models_json, sizeof(models_json)));
+        assert(strcmp(models_json,
+            "{\"object\":\"list\",\"data\":[{\"id\":\"local-deepseek-flash\",\"object\":\"model\",\"owned_by\":\"myds\","
+            "\"architecture\":{\"input_modalities\":[\"text\"],\"output_modalities\":[\"text\"]}}]}") == 0);
+
+        assert(myds_server_format_models_json("local-deepseek-flash", true, models_json, sizeof(models_json)));
+        assert(strcmp(models_json,
+            "{\"object\":\"list\",\"data\":[{\"id\":\"local-deepseek-flash\",\"object\":\"model\",\"owned_by\":\"myds\","
+            "\"architecture\":{\"input_modalities\":[\"text\",\"image\"],\"output_modalities\":[\"text\"]}}]}") == 0);
+
+        /* Default fallback when alias is NULL or empty, and capacity boundary check */
+        assert(myds_server_format_models_json(NULL, false, models_json, sizeof(models_json)));
+        assert(strstr(models_json, "\"id\":\"myds\"") != NULL);
+        char tiny[32];
+        assert(!myds_server_format_models_json("local-deepseek-flash", true, tiny, sizeof(tiny)));
+        assert(tiny[0] == '\0');
+        printf("  [PASS] GET /v1/models modalities advertising (text vs text+image) and bounds checking\n");
+    }
+
     printf("====================================================\n");
     printf("      ALL SERVER API UNIT TESTS PASSED!             \n");
     printf("====================================================\n");

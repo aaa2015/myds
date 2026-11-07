@@ -168,10 +168,27 @@ static uint64_t                    g_shared_event_val = 0;
 static bool                        g_initialized = false;
 static bool g_indexer_head_slots = false;
 static id<MTLComputePipelineState> g_pso_indexer_head_slots = nil;
+static bool g_indexer_score_rows4 = false;
+static id<MTLComputePipelineState> g_pso_indexer_score_rows4 = nil;
 static uint32_t qkv_nr0(void);
 static uint32_t dense_q4_nr0(void);
 static uint32_t dense_q4_nsg(void);
 static uint32_t dense_q4_nr_site(unsigned site);
+static int indexer_score_rows4_parse_mode(void) {
+    const char *value = getenv("MYDS_INDEXER_SCORE_ROWS4");
+    if (!value || strcmp(value, "1") == 0) return 1;
+    if (strcmp(value, "0") == 0) return 0;
+    fprintf(stderr, "myds_metal: MYDS_INDEXER_SCORE_ROWS4 must be exactly 0 or 1\n");
+    return -1;
+}
+static bool indexer_score_rows4_geometry(void) {
+    return g_device && g_pso_indexer_score_rows4 && g_pso_indexer_score_rows4.device == g_device &&
+        g_pso_indexer_score_rows4.threadExecutionWidth == 32u &&
+        g_pso_indexer_score_rows4.maxTotalThreadsPerThreadgroup >= 128u &&
+        g_device.maxThreadsPerThreadgroup.width >= 32u &&
+        g_device.maxThreadsPerThreadgroup.height >= 4u &&
+        g_device.maxThreadsPerThreadgroup.depth >= 1u;
+}
 static int indexer_head_slots_parse_mode(void) {
     const char *value = getenv("MYDS_INDEXER_HEAD_SLOTS");
     if (!value || strcmp(value, "0") == 0) return 0;
@@ -1745,6 +1762,8 @@ int myds_metal_init(const char *shader_dir) {
 
     const int indexer_head_slots = indexer_head_slots_parse_mode();
     if (indexer_head_slots < 0) return 0;
+    const int indexer_score_rows4 = indexer_score_rows4_parse_mode();
+    if (indexer_score_rows4 < 0) return 0;
     const int indexer_topk_threshold=indexer_topk_threshold_parse_mode();
     if(indexer_topk_threshold<0)return 0;
     const int indexer_topk_nan_shuffle = indexer_topk_nan_shuffle_parse_mode();
@@ -1978,6 +1997,8 @@ int myds_metal_init(const char *shader_dir) {
                         @"kernel_dsv41_pool2",
                         @"kernel_glm_indexer_score_one",
                         @"kernel_glm_indexer_score_one_direct",
+                        @"kernel_glm_indexer_score_one_rows4",
+                        @"kernel_myds_indexer_score_selected_blocks_rows4",
                         @"kernel_glm_indexer_score_chunk_direct",
                         @"kernel_dsv4_indexer_scores_tiled_f32",
                         @"kernel_dsv4_indexer_scores_tiled_bf16",
@@ -2553,6 +2574,19 @@ int myds_metal_init(const char *shader_dir) {
             return 0;
         }
         g_indexer_head_slots = indexer_head_slots != 0;
+        {
+            NSError *rows4_error = nil;
+            id<MTLFunction> rows4_fn = [g_library newFunctionWithName:@"kernel_glm_indexer_score_one_rows4"];
+            if (rows4_fn) g_pso_indexer_score_rows4 = [g_device newComputePipelineStateWithFunction:rows4_fn error:&rows4_error];
+            if (indexer_score_rows4 && !indexer_score_rows4_geometry()) {
+                fprintf(stderr, "myds_metal: indexer score rows4 PSO/geometry unavailable (%s); refusing fallback\n",
+                    rows4_error.localizedDescription.UTF8String ?: "function or resource limit");
+                g_initialized = true;
+                myds_metal_cleanup();
+                return 0;
+            }
+            g_indexer_score_rows4 = indexer_score_rows4 != 0;
+        }
         if(indexer_topk_threshold&&!myds_metal_indexer_topk_threshold_prepare()) {
             g_initialized=true;myds_metal_cleanup();return 0;
         }
@@ -2578,6 +2612,8 @@ int myds_metal_init(const char *shader_dir) {
         MYDS_LOG_I("myds_metal: Initialized successfully on GPU: %s", [[g_device name] UTF8String]);
         MYDS_LOG_I("Indexer head slots: %d (%s; explicit ordinary scalar scope)",
                    g_indexer_head_slots, g_indexer_head_slots ? "F32 candidate" : "reference");
+        MYDS_LOG_I("Indexer score rows4: %d (%s; 4 rows/SIMD, 16 rows/TG register scorer)",
+                   g_indexer_score_rows4, g_indexer_score_rows4 ? "rows4" : "1-row smem reference");
         MYDS_LOG_I("Indexer topk threshold: %d (%s; explicit ordinary scalar scope)",
                    g_indexer_topk_threshold,g_indexer_topk_threshold?"F32 candidate":"reference");
         MYDS_LOG_I("Indexer topk NaN shuffle: %d (%s; reference partition geometry)",
@@ -2629,6 +2665,8 @@ void myds_metal_cleanup(void) {
     g_last_gpu_span_valid=false; g_last_gpu_start=0.0; g_last_gpu_end=0.0;
     g_pso_indexer_head_slots = nil;
     g_indexer_head_slots = false;
+    g_pso_indexer_score_rows4 = nil;
+    g_indexer_score_rows4 = false;
     g_indexer_topk_nan_shuffle = false;
     g_indexer_topk_threshold=false;
     myds_metal_buffer_free(g_indexer_topk_threshold_stats);
@@ -3212,7 +3250,9 @@ int myds_metal_indexer_head_slots_dispatch(myds_metal_buffer_t *scores,
     bool *encoded,bool *unavailable) {
     if(encoded)*encoded=false;
     if(unavailable)*unavailable=false;
-    if(!g_initialized || !g_indexer_head_slots || !indexer_head_slots_geometry()) {
+    const bool use_rows4 = (indexer_score_rows4_parse_mode() == 1);
+    if(!g_initialized || !g_indexer_head_slots || !indexer_head_slots_geometry() ||
+       (use_rows4 && !indexer_score_rows4_geometry())) {
         if(unavailable)*unavailable=true;
         return 0;
     }
@@ -3241,11 +3281,18 @@ int myds_metal_indexer_head_slots_dispatch(myds_metal_buffer_t *scores,
         /* Preserve the original generic scorer bridge's auto1 pre/post barriers.
          * Auto0 callers retain the same upstream/score-consumer/reuse joins. */
         if(g_batch_cb && g_auto_barrier)[enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        [enc setComputePipelineState:g_pso_indexer_head_slots];
-        [enc setBytes:&args length:sizeof(args) atIndex:0];
-        for(size_t i=0;i<5u;++i)[enc setBuffer:buffers[i]->mtl_buf offset:buffers[i]->offset atIndex:i+1];
-        [enc setThreadgroupMemoryLength:640u atIndex:0];
-        metal_dispatch(enc,"kernel_myds_indexer_score_one_head_slots",MTLSizeMake(n_comp,1u,1u),MTLSizeMake(32u,4u,1u));
+        if (use_rows4) {
+            [enc setComputePipelineState:g_pso_indexer_score_rows4];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            for(size_t i=0;i<5u;++i)[enc setBuffer:buffers[i]->mtl_buf offset:buffers[i]->offset atIndex:i+1];
+            metal_dispatch(enc,"kernel_glm_indexer_score_one_rows4",MTLSizeMake((n_comp+15u)/16u,1u,1u),MTLSizeMake(32u,4u,1u));
+        } else {
+            [enc setComputePipelineState:g_pso_indexer_head_slots];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            for(size_t i=0;i<5u;++i)[enc setBuffer:buffers[i]->mtl_buf offset:buffers[i]->offset atIndex:i+1];
+            [enc setThreadgroupMemoryLength:640u atIndex:0];
+            metal_dispatch(enc,"kernel_myds_indexer_score_one_head_slots",MTLSizeMake(n_comp,1u,1u),MTLSizeMake(32u,4u,1u));
+        }
         if(encoded)*encoded=true;
         return v41_finish(cb,enc);
     }

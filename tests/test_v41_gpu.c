@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define CHECK(c) do { if(!(c)){fprintf(stderr,"[FAIL] %s:%d: %s\n",__FILE__,__LINE__,#c);return 0;} } while(0)
 static void fill(myds_metal_buffer_t *b,unsigned seed) {
@@ -852,6 +853,190 @@ static int test_prefill_batch_fusions(void) {
     printf("  [PASS] prefill batch fusions (hc_expand4_batch, hc_sum_rmsnorm_scale_batch + gemv_batch_scaled, indexer/kv_rope_quant_batch) 0-ULP byte exact\n");
     return 1;
 }
+
+static int test_indexscores_rows4(void) {
+    const uint32_t shapes[]={1,2,3,4,7,8,9,15,16,17,31,32,33,65,512,2048,24576,100003,131077};
+    for(size_t si=0;si<sizeof(shapes)/sizeof(*shapes);si++) {
+        const uint32_t rows=shapes[si],blocks=(rows+7u)/8u,top=rows<512u?rows:512u;
+        const size_t score_bytes=(size_t)rows*4u;
+        myds_metal_buffer_t *keys=myds_metal_buffer_alloc((size_t)rows*128u*4u),
+            *packed=myds_metal_buffer_alloc((size_t)rows*128u*2u),
+            *q=myds_metal_buffer_alloc(32u*128u*4u),*w=myds_metal_buffer_alloc(32u*4u),
+            *mask=myds_metal_buffer_alloc((size_t)blocks*4u),*ids=myds_metal_buffer_alloc((size_t)blocks*4u),
+            *ref=myds_metal_buffer_alloc(score_bytes),*cand=myds_metal_buffer_alloc(score_bytes),
+            *sel_ref=myds_metal_buffer_alloc((size_t)top*4u),*sel_cand=myds_metal_buffer_alloc((size_t)top*4u);
+        CHECK(keys&&packed&&q&&w&&mask&&ids&&ref&&cand&&sel_ref&&sel_cand);
+        fill(keys,5u+(unsigned)si);fill(q,11u+(unsigned)si);
+        float *wp=myds_metal_buffer_data(w);
+        for(uint32_t h=0;h<32u;h++)wp[h]=0.125f+(float)((h*7u+si)%31u)/64.0f;
+        CHECK(myds_metal_begin_batch());
+        CHECK(myds_v41_gpu_quant(keys,128u,rows,2u));
+        CHECK(myds_v41_gpu_pack_bf16(packed,0,keys,0,(size_t)rows*128u));
+        CHECK(myds_metal_commit_batch());
+        const char *threshold=getenv("MYDS_ATTN_GATHER_MIN_KEYS");
+        char *saved_threshold=threshold?strdup(threshold):NULL;
+        CHECK(!threshold||saved_threshold);
+        CHECK(!setenv("MYDS_ATTN_GATHER_MIN_KEYS","0",1));
+        myds_v41_gpu_scratch_t *scratch=myds_v41_gpu_scratch_create(rows<2u?2u:rows);
+        int restore_err=saved_threshold?setenv("MYDS_ATTN_GATHER_MIN_KEYS",saved_threshold,1):unsetenv("MYDS_ATTN_GATHER_MIN_KEYS");
+        free(saved_threshold);CHECK(!restore_err&&scratch);
+
+        float *mp=myds_metal_buffer_data(mask);
+        int32_t *ip=myds_metal_buffer_data(ids);
+        uint32_t selected=0;
+        for(uint32_t bk=0;bk<blocks;bk++) {
+            const bool allow=(bk%3u!=1u)||(bk+1u==blocks);
+            mp[bk]=allow?0.0f:-INFINITY;
+            if(allow)ip[selected++]=(int32_t)bk;
+        }
+        const uint32_t first_rows[]={0u, rows>5u ? (rows/3u) : 1u};
+        for(size_t fi=0;fi<2u;fi++) {
+            const uint32_t first_row=first_rows[fi];
+            /* 1) F32 unmasked + masked */
+            if(rows<=24576u) {
+                CHECK(!setenv("MYDS_INDEXER_SCORE_ROWS4","0",1));
+                memset(myds_metal_buffer_data(ref),0xa5,score_bytes);
+                CHECK(myds_metal_begin_batch());
+                CHECK(myds_v41_gpu_indexscores_masked(ref,q,w,keys,fi?mask:NULL,rows,32u,first_row));
+                CHECK(myds_metal_commit_batch());
+
+                CHECK(!setenv("MYDS_INDEXER_SCORE_ROWS4","1",1));
+                memset(myds_metal_buffer_data(cand),0x5a,score_bytes);
+                CHECK(myds_metal_begin_batch());
+                CHECK(myds_v41_gpu_indexscores_masked(cand,q,w,keys,fi?mask:NULL,rows,32u,first_row));
+                CHECK(myds_metal_commit_batch());
+                CHECK(!memcmp(myds_metal_buffer_data(ref),myds_metal_buffer_data(cand),score_bytes));
+            }
+            /* 2) BF16 unmasked + masked + Top-K IDs */
+            for(int use_mask=0;use_mask<2;use_mask++) {
+                const myds_metal_buffer_t *m_arg=use_mask?mask:NULL;
+                CHECK(!setenv("MYDS_INDEXER_SCORE_ROWS4","0",1));
+                memset(myds_metal_buffer_data(ref),0xa5,score_bytes);
+                CHECK(myds_metal_begin_batch());
+                CHECK(myds_v41_gpu_indexscores_masked_bf16(ref,q,w,packed,m_arg,rows,32u,first_row));
+                CHECK(myds_v41_gpu_topk(sel_ref,ref,rows,top,scratch));
+                CHECK(myds_metal_commit_batch());
+
+                CHECK(!setenv("MYDS_INDEXER_SCORE_ROWS4","1",1));
+                memset(myds_metal_buffer_data(cand),0x5a,score_bytes);
+                CHECK(myds_metal_begin_batch());
+                CHECK(myds_v41_gpu_indexscores_masked_bf16(cand,q,w,packed,m_arg,rows,32u,first_row));
+                CHECK(myds_v41_gpu_topk(sel_cand,cand,rows,top,scratch));
+                CHECK(myds_metal_commit_batch());
+                CHECK(!memcmp(myds_metal_buffer_data(ref),myds_metal_buffer_data(cand),score_bytes));
+                CHECK(!memcmp(myds_metal_buffer_data(sel_ref),myds_metal_buffer_data(sel_cand),(size_t)top*4u));
+            }
+            /* 3) Selected blocks (compact scorer) */
+            CHECK(!setenv("MYDS_INDEXER_SCORE_ROWS4","0",1));
+            memset(myds_metal_buffer_data(ref),0xa5,score_bytes);
+            CHECK(myds_metal_begin_batch());
+            CHECK(myds_v41_gpu_indexscores_selected_blocks_bf16(ref,q,w,packed,mask,ids,rows,selected,first_row)==1);
+            CHECK(myds_metal_commit_batch());
+
+            CHECK(!setenv("MYDS_INDEXER_SCORE_ROWS4","1",1));
+            memset(myds_metal_buffer_data(cand),0x5a,score_bytes);
+            CHECK(myds_metal_begin_batch());
+            CHECK(myds_v41_gpu_indexscores_selected_blocks_bf16(cand,q,w,packed,mask,ids,rows,selected,first_row)==1);
+            CHECK(myds_metal_commit_batch());
+            CHECK(!memcmp(myds_metal_buffer_data(ref),myds_metal_buffer_data(cand),score_bytes));
+        }
+        myds_v41_gpu_scratch_free(scratch);
+        myds_metal_buffer_t *bufs[]={keys,packed,q,w,mask,ids,ref,cand,sel_ref,sel_cand};
+        for(size_t i=0;i<sizeof(bufs)/sizeof(*bufs);i++)myds_metal_buffer_free(bufs[i]);
+    }
+    unsetenv("MYDS_INDEXER_SCORE_ROWS4");
+    printf("  [PASS] rows4 vs 1-row smem scorer 0-ULP byte exact across 19 shapes (1..131077), F32/BF16, masked/window/selected_blocks & top-k IDs\n");
+    return 1;
+}
+
+static double mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+static int bench_indexscores_rows4(void) {
+    myds_metal_cleanup();
+    CHECK(!setenv("MYDS_INDEXER_HEAD_SLOTS","1",1));
+    CHECK(myds_metal_init("metal"));
+    CHECK(myds_v41_gpu_indexer_head_slots_enabled()==1);
+    const uint32_t shapes[]={512, 2048, 12288, 24576, 65536, 100000, 131072};
+    printf("=== Decode Indexer Scoring Alternating A/B Benchmark (5 rounds, 0-ULP verified every round) ===\n");
+    for(size_t si=0;si<sizeof(shapes)/sizeof(*shapes);si++) {
+        const uint32_t rows=shapes[si],blocks=(rows+7u)/8u;
+        const unsigned reps = (rows <= 2048u) ? 500u : (rows <= 24576u) ? 200u : 100u;
+        const size_t score_bytes=(size_t)rows*4u;
+        myds_metal_buffer_t *keys=myds_metal_buffer_alloc((size_t)rows*128u*4u),
+            *packed=myds_metal_buffer_alloc((size_t)rows*128u*2u),
+            *q=myds_metal_buffer_alloc(32u*128u*4u),*w=myds_metal_buffer_alloc(32u*4u),
+            *mask=myds_metal_buffer_alloc((size_t)blocks*4u),
+            *ref=myds_metal_buffer_alloc(score_bytes),*cand=myds_metal_buffer_alloc(score_bytes);
+        CHECK(keys&&packed&&q&&w&&mask&&ref&&cand);
+        fill(keys,17u+(unsigned)si);fill(q,23u+(unsigned)si);
+        float *wp=myds_metal_buffer_data(w);
+        for(uint32_t h=0;h<32u;h++)wp[h]=0.125f+(float)h/64.0f;
+        float *mp=myds_metal_buffer_data(mask);
+        for(uint32_t bk=0;bk<blocks;bk++)mp[bk]=(bk<2048u||(bk%4u==0u))?0.0f:-INFINITY;
+        CHECK(myds_metal_begin_batch());
+        CHECK(myds_v41_gpu_quant(keys,128u,rows,2u));
+        CHECK(myds_v41_gpu_pack_bf16(packed,0,keys,0,(size_t)rows*128u));
+        CHECK(myds_metal_commit_batch());
+
+        for(int path=0;path<2;path++) {
+            /* path 0: production head_slots unmasked (L0..20)
+             * path 1: production head_slots masked (L21..39) */
+            const myds_metal_buffer_t *m_arg = path ? mask : NULL;
+            /* Warmup both arms */
+            for(int arm=0;arm<2;arm++) {
+                CHECK(!setenv("MYDS_INDEXER_SCORE_ROWS4",arm?"1":"0",1));
+                CHECK(myds_metal_begin_batch());
+                for(unsigned r=0;r<16u;r++) {
+                    CHECK(myds_v41_gpu_indexscores_head_slots(arm?cand:ref,q,w,packed,m_arg,rows,32u,true,0u));
+                    myds_metal_barrier_buffer(arm?cand:ref);
+                }
+                CHECK(myds_metal_commit_batch());
+            }
+            CHECK(!memcmp(myds_metal_buffer_data(ref),myds_metal_buffer_data(cand),score_bytes));
+
+            double us_a[5], us_b[5];
+            for(int round=0;round<5;round++) {
+                for(int step=0;step<2;step++) {
+                    const int arm = (round % 2 == 0) ? step : (1 - step);
+                    CHECK(!setenv("MYDS_INDEXER_SCORE_ROWS4",arm?"1":"0",1));
+                    myds_metal_buffer_t *out = arm ? cand : ref;
+                    const double t0 = mono_ms();
+                    CHECK(myds_metal_begin_batch());
+                    for(unsigned r=0;r<reps;r++) {
+                        CHECK(myds_v41_gpu_indexscores_head_slots(out,q,w,packed,m_arg,rows,32u,true,0u));
+                        myds_metal_barrier_buffer(out);
+                    }
+                    CHECK(myds_metal_commit_batch());
+                    const double elapsed_us = (mono_ms() - t0) * 1000.0 / (double)reps;
+                    if(arm==0) us_a[round]=elapsed_us; else us_b[round]=elapsed_us;
+                }
+                CHECK(!memcmp(myds_metal_buffer_data(ref),myds_metal_buffer_data(cand),score_bytes));
+            }
+            double sum_a=0,min_a=us_a[0],max_a=us_a[0],sum_b=0,min_b=us_b[0],max_b=us_b[0];
+            for(int i=0;i<5;i++) {
+                sum_a+=us_a[i]; if(us_a[i]<min_a)min_a=us_a[i]; if(us_a[i]>max_a)max_a=us_a[i];
+                sum_b+=us_b[i]; if(us_b[i]<min_b)min_b=us_b[i]; if(us_b[i]>max_b)max_b=us_b[i];
+            }
+            const double mean_a=sum_a/5.0, mean_b=sum_b/5.0;
+            const double bytes_moved = (double)rows * 256.0 + (double)rows * 4.0 + 32.0 * 128.0 * 4.0;
+            const double gbs_a = (bytes_moved / (mean_a * 1e-6)) / 1e9;
+            const double gbs_b = (bytes_moved / (mean_b * 1e-6)) / 1e9;
+            printf("  n_comp=%-6u (%-7s) | A(1-row smem): %7.2f us [%7.2f, %7.2f] (%5.1f GB/s) | B(rows4 reg): %7.2f us [%7.2f, %7.2f] (%5.1f GB/s) | speedup=%.2fx (0-ULP)\n",
+                   rows, path ? "masked" : "unmask",
+                   mean_a, min_a, max_a, gbs_a,
+                   mean_b, min_b, max_b, gbs_b,
+                   mean_a / mean_b);
+        }
+        myds_metal_buffer_t *bufs[]={keys,packed,q,w,mask,ref,cand};
+        for(size_t i=0;i<sizeof(bufs)/sizeof(*bufs);i++)myds_metal_buffer_free(bufs[i]);
+    }
+    unsetenv("MYDS_INDEXER_SCORE_ROWS4");
+    return 1;
+}
 int main(int argc,char **argv) {
     int disabled=argc>1&&!strcmp(argv[1],"--slab");
     int threshold=argc>1&&!strcmp(argv[1],"--threshold");
@@ -862,8 +1047,11 @@ int main(int argc,char **argv) {
     if(argc>1&&!strcmp(argv[1],"--topk-prefix-only")) {
         int ok=test_topk_prefix();myds_metal_cleanup();return ok?0:1;
     }
+    if(argc>1&&!strcmp(argv[1],"--bench-rows4")) {
+        int ok=test_indexscores_rows4()&&bench_indexscores_rows4();myds_metal_cleanup();return ok?0:1;
+    }
     int ok=test_compact_resource()&&test_mixed_paths(disabled)&&test_slab_grow_carry()&&test_strategy_threshold(threshold)&&test_window_boundaries()&&
-           test_pack_and_gather()&&test_indexscores_bf16()&&test_indexscores_selected_blocks()&&test_topk_prefix()&&test_attention_bf16()&&test_partial_picks()&&
+           test_pack_and_gather()&&test_indexscores_bf16()&&test_indexscores_selected_blocks()&&test_indexscores_rows4()&&test_topk_prefix()&&test_attention_bf16()&&test_partial_picks()&&
            test_prefill_batch_fusions();
     myds_metal_cleanup();if(ok)printf("ALL V4.1 GPU REGRESSIONS PASSED (%s)\n",disabled?"gather disabled":threshold?"explicit threshold":"gather enabled");return ok?0:1;
 }
