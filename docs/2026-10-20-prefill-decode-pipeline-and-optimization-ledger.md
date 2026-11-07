@@ -19036,12 +19036,68 @@ D3（MoE down 专家进 grid.z）的独立组件测试。
 拉取后远端 `python3 tools/knob_fingerprint.py --check bin/myds --conf myds.conf`
 自查通过：二进制与源码 knob 集合一致，77 个 conf 键全认识。
 
-### 157.5 状态
+### 157.5 顺手扫了其它仓库，发现同类残留（**未处置，只报告**）
+
+按新加的纪律（见 §157.6）扫了一遍 `~/Projects` 下的仓库：
+
+| 仓库 | 残留 |
+|---|---|
+| `myds` | stash 空、无未合并分支 ✅ |
+| `myfleet` | stash 空 ✅ |
+| **`ds4`** | **1 个 stash + 14 个未合并分支 + 3 个 worktree** |
+
+**ds4 的 1 个 stash**：`2026-09-10`，`ds4_server.c` +33/−6。内容是
+「`--reasoning off` 不应锁定 `think_mode=NONE`，否则客户端无法重新启用思考」。
+**已进主线**（`ds4_server.c:16937` 的注释 `The effort stays at its default so a
+client can opt back in` 就是它）。⇒ 已存档并丢弃。
+
+**ds4 的分支里，有一组互相矛盾的提交**（`fix/dspark-snapshot-boundary-and-vision`）：
+
+| 提交 | 内容 |
+|---|---|
+| `da846f0` | 投机解码停止时**无条件** rewind |
+| `0cb5c28` | 又把 rewind **限制回 GLM**（担心 DeepSeek checkpoint 失效） |
+| `472c63d` | **再次去掉** GLM 限制（因为残留 draft token 会腐蚀会话） |
+| `a5dd946` | 复用 DSpark 快照做立即 rewind（`git cherry` 显示**已进主线**） |
+
+主线现在（`ds4_server.c:14835`）是无条件 rewind **再加 `strcmp(finish,"error")` 守卫**，
+比分支上任何一个版本都完善 ⇒ 那 3 个 `+`（未进主线）是**被更好实现取代**，不是遗漏。
+
+**但我没有动 ds4 的分支与 worktree。** 理由：
+
+1. ds4 不是本次任务范围（本次是 myds 的 trace / prefill / decode）。
+2. 14 个未合并分支里有 `pr-991`(44)/`pr-1003`/`pr-1000`/`pr-1033..1061` 等
+   **上游 PR 的镜像分支**，它们「未合并」是正常的（等上游合），删了会丢对照。
+3. 3 个 worktree（`ds4`、`ds4-pr1000`、`ds4-pr1003`）是并行工作区，
+   `fix/dspark-snapshot-boundary-and-vision` 正被 `ds4-pr1003` 占用（删不掉）。
+
+**结论：ds4 需要一次单独的「分支清点」，不是顺手能做的。** 已记录待办。
+
+### 157.6 新红线（已写进 AGENTS.md）
+
+> **特性被证否时，同一个动作里就清掉它对应的 WIP**（stash / branch / 实验分支）；
+> 丢掉前先存成 patch 到仓库外，再删。别指望以后有人回来扫。
+
+出处就是本节：D2/D3 在 10-21 当天判死，`wip-d2-d3` 却活了 17 天，
+而且它的功能**早已合进主线** —— 一条「既没用、又让人以为还有活」的残留。
+
+存档位置（都在仓库外，不进 git）：
+
+```
+~/myds-stash-archive/wip-d2-d3-20261021.patch          544 行 / 38 KB
+~/ds4-stash-archive/20261107/wip-20260910.patch        ds4_server.c +33/-6
+~/ds4-stash-archive/20261107/*.bundle                  3 个分支的完整 bundle（约 49 MB）
+```
+
+### 157.7 状态
 
 | 项 | 状态 |
 |---|---|
-| `wip-d2-d3` stash | **已存档并丢弃** |
+| `myds` 的 `wip-d2-d3` stash | **已存档并丢弃** |
+| `ds4` 的 stash | **已存档并丢弃**（功能已在主线） |
+| `ds4` 的 2 个非 PR 分支 | **已删**（`backup/wip-20260920`、`feat/reasoning-alias-options`，均已存档） |
+| `ds4` 的 14 个分支 / 3 个 worktree | **未动**，需单独清点（含上游 PR 镜像） |
 | macstudio 源码 | `a7cbfd0`（与 macmini 一致）|
 | 生产 | `34d3cf27`，PID 76747，`/health` ok（本节未重启）|
-| D2 / D3 | 仍为「已证否」，本次只是清理残留，不改变结论 |
+| D2 / D3 | 仍为「已证否」，本次只清理残留 |
 
