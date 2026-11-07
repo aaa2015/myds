@@ -971,6 +971,15 @@
       "prompt_file": null,
       "source": "legacy: 账本 §19（2026-10-21），本次仅引用",
       "comparable_to_ledger_105": false
+    },
+    {
+      "value": 678.5,
+      "unit": "t/s",
+      "kind": "throughput",
+      "where": "§158.6 部署 d206691b 后的 32K 冒烟",
+      "prompt_file": "p32k_ab__v0.txt",
+      "source": "corpus: 生产 8187，32,220 tok / 47.5 s",
+      "comparable_to_ledger_105": true
     }
   ]
 }
