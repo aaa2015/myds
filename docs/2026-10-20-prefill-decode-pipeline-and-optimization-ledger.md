@@ -12727,6 +12727,28 @@ attention 是**数值最敏感的环节之一**（softmax 对输入误差放大�
 
 ### 89.1 生产用的是哪个内核
 
+> 🔴 **2026-11-07 16:15 重大更正：这一节认错了内核。下面那段代码在 `use_matrix` 分支里，
+> 而 `MYDS_PREFILL_ATTN` 未设置时 `prefill_attn_variant = 0`（vec），
+> `use_matrix` **恒为 0** ⇒ 生产**从不**派发 `kernel_myds_flash_attn_heads_f16_dk512_dv512`。
+>
+> 实测（`MYDS_ATTN_WHICH=1`，32K prompt，见 §149）：
+>
+> ```
+> #1 use_gather=0 use_matrix=0 head_first=1  c_len=2048 n_comp=0      ← 首个 chunk
+> #2 use_gather=1 use_matrix=0 head_first=1  c_len=2048 n_comp=1024   ← 其余全部
+> ```
+>
+> ⇒ 生产的 prefill attention 是 **`kernel_myds_flash_attn_vec_head_first_f16_dk512_dv512`**
+> （`use_gather && attn_vec_head_first` 分支），模板是 **`kernel_flash_attn_ext_vec`**，
+> smem 布局 `so4 = shmem + 2*sgitg*PV + NSG*PK + NSG*SH`（第 1035 行），
+> **与本节算的 `Q*DK` 布局不是同一个 kernel。**
+>
+> **因此：本节 89.2 的 smem 账（32,768 B）、89.3–89.5 的 roofline 与「Q 被锁死」结论、
+> 89.6 的判定表，全部只适用于 heads/matrix 模板，不适用于生产走的 vec 模板。**
+> 原文保留，但引用前必须确认 `MYDS_PREFILL_ATTN=matrix`。
+
+### 89.1 生产用的是哪个内核（原文，已作废）
+
 `src/myds_v41_gpu.c:1684`：
 
 ```c
@@ -18206,4 +18228,89 @@ simdgroup_store(lo[ii], so + 8*sgitg + ii*8*NSG, PV, 0, false);  // 存回
 | P1 第一步改法 | 已确定（148.3 六步） |
 | P1 实施 | **未开始** |
 | 收益预期 | **不承诺数字**。tile 搬运清零是确定的，但 §55 记过「只改线程数吞吐无变化」的先例，必须实测 |
+
+## §149 生产 prefill attention 到底跑哪个 kernel：§89 认错了内核（2026-11-07 16:15）
+
+### 149.1 怎么查出来的
+
+先前我按 §89.1 的说法，把成本探针打在 `kernel_myds_flash_attn_heads_f16_dk512_dv512` 上，
+跑了两轮 32K 冷启动，两臂时间与**输出 sha 完全相同**（`c08773a966573ba6`，内容「齿轮」）。
+
+输出相同这件事本身就是判据：探针若真执行，O 没有重标定必然产出垃圾。一致 ⇒ 探针是死代码。
+
+根因一行 `grep` 就能查：`myds.conf` 里 **没有** `MYDS_PREFILL_ATTN` ⇒
+
+```c
+// myds_v41_gpu.c:240-243
+const char *av = getenv("MYDS_PREFILL_ATTN");
+if (!av) s->prefill_attn_variant = 0;                     // = vec
+// myds_v41_gpu.c:1821
+const int use_matrix = use_gather && (s->prefill_attn_variant==1 || ...);  // 恒 0
+```
+
+⇒ 第 1937 行那段 heads kernel **从不执行**。
+
+### 149.2 确证：加一条一次性组合日志
+
+成功的 dispatch 一直是沉默的（`MYDS_DEBUG_DISPATCH` 只在**失败**时打）。新增
+`MYDS_ATTN_WHICH=1`：记录**不同的 `(use_gather, use_matrix, head_first)` 组合**，每种一次
+（首个 chunk 往往 `n_comp=0`，只记一条会漏掉主体路径）。
+
+32K prompt 实测：
+
+```
+attn-which#1: variant=0 use_gather=0 use_matrix=0 matrix_encoded=0 head_first=1(hf_unavail=0) c_len=2048 n_comp=0
+attn-which#2: variant=0 use_gather=1 use_matrix=0 matrix_encoded=0 head_first=1(hf_unavail=0) c_len=2048 n_comp=1024
+```
+
+⇒ 生产 prefill attention 是 **`kernel_myds_flash_attn_vec_head_first_f16_dk512_dv512`**
+（`use_gather && attn_vec_head_first && !hf_unavail` 分支），
+退路才是 `kernel_flash_attn_ext_vec_f16_dk512_dv512`。
+两者都来自 **`kernel_flash_attn_ext_vec`** 模板。
+
+### 149.3 影响面：§89 整节的结论不适用于生产
+
+| §89 的说法 | 实际适用范围 |
+|---|---|
+| 生产内核是 `kernel_myds_flash_attn_heads_…` | ❌ 只在 `MYDS_PREFILL_ATTN=matrix` 时 |
+| smem 32,768 B 恰好顶格（`Q*DK` 布局） | ❌ 生产 `kernel_flash_attn_ext_vec` 是 `2*sgitg*PV + NSG*PK + NSG*SH` 布局 |
+| `Q = 8` 头每 TG、`NSG = 4` | ❌ 生产模板是 `OP_FLASH_ATTN_EXT_VEC_NQPSG = 1`、32 线程/组、单 SIMD group |
+| roofline 差 4.3 倍、上界 prefill +11~14% | ❌ 这是在 heads 模板上算的 |
+
+**⇒ §89 的「attention 被 smem 锁死」这个判断，对生产 kernel 尚未验证。**
+
+§89.1 已在原处加红框更正（原文保留），§89.2–89.6 引用前必须先确认 `MYDS_PREFILL_ATTN=matrix`。
+
+### 149.4 这也说明外部评审 P1 的前提有问题
+
+评审写「生产 kernel `kernel_myds_flash_attn_heads_f16_dk512_dv512`（Q=8, C=64, NSG=4）」
+—— 它照抄了 §89.1，因此**同样的错**。P1 的第二步（Q=16/NSG=8）针对的是 matrix 模板，
+而那条路径在生产上不被派发。
+
+### 149.5 我今天的连续错误，一并记账
+
+| # | 错 | 代价 |
+|---|---|---|
+| 1 | 15:41 把实例化里的 `true` 读成 `NSG=1` | 一次误判，已纠正 |
+| 2 | 15:52 把「两种划分」当成「所有权矛盾」 | 一次误判，已撤回 |
+| 3 | 16:01 照抄 §89.1 的内核名去改 kernel | **白跑两轮 32K 冷启动，测量无效** |
+| 4 | 16:01 用「输出变垃圾」当探针生效判据，但没先验证它真的是垃圾 | 本该立即发现异常 |
+
+**共同根因：动手之前没有先确认「这个 kernel 在生产上真的会被派发」。**
+判据只需一行 `grep MYDS_PREFILL_ATTN myds.conf`。
+
+⇒ **新增硬约束（本账本）**：任何针对特定 kernel 的优化，第一步必须是
+用 `MYDS_ATTN_WHICH=1`（或等价手段）拿到**该 kernel 真的被派发**的日志证据，
+再动代码。凭账本里的一句「生产内核是 X」就去改，已经证明会翻车两次。
+
+### 149.6 状态
+
+| 项 | 状态 |
+|---|---|
+| P1 成本探针 | **无效**（打错 kernel），结论作废 |
+| §89.1 | 已更正（生产走 vec 家族，不是 heads） |
+| §89.2–89.6 | 适用范围已限定为 `MYDS_PREFILL_ATTN=matrix` |
+| 生产 kernel 的真正 smem 布局 | **未测**，下一步要算 `kernel_flash_attn_ext_vec` 在 DK=DV=512、Q=1、NSG=? 下的实际占用 |
+| 生产 | 未受影响（metallib `787f9d7d…`，`/health` ok） |
+| 本轮收益 | **零**，只换来一个账本更正与一条硬约束 |
 

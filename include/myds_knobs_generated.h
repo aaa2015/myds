@@ -17,8 +17,8 @@ static const myds_knob_t myds_knobs_generated[] = {
     {"MYDS_ANCHOR_SLOTS", "src/myds_engine.c", 1217, 1},
     {"MYDS_ANCHOR_SNAPSHOT", "src/myds_engine.c", 3853, 1},
     {"MYDS_ATTN_DIRECT_PACK", "src/myds_v41.c", 4501, 1},
-    {"MYDS_ATTN_DIRECT_PACK_FUSE", "src/myds_v41_gpu.c", 2227, 1},
-    {"MYDS_ATTN_FLASH_DEC", "src/myds_v41_gpu.c", 2083, 1},
+    {"MYDS_ATTN_DIRECT_PACK_FUSE", "src/myds_v41_gpu.c", 2241, 1},
+    {"MYDS_ATTN_FLASH_DEC", "src/myds_v41_gpu.c", 2097, 1},
     {"MYDS_ATTN_FORCE_THREADS", "src/myds_metal.m", 3333, 1},
     {"MYDS_ATTN_GATHER", "src/myds_v41.c", 6893, 1},
     {"MYDS_ATTN_GATHER_MIN_KEYS", "src/myds_v41.c", 7740, 1},
@@ -26,15 +26,16 @@ static const myds_knob_t myds_knobs_generated[] = {
     {"MYDS_ATTN_INDEXER_EARLY", "src/myds_v41.c", 4405, 1},
     {"MYDS_ATTN_INDEXER_PIPELINE", "src/myds_v41.c", 4400, 1},
     {"MYDS_ATTN_KEYS_CLAMP", "src/myds_v41_gpu.c", 217, 1},
-    {"MYDS_ATTN_KV_REUSE", "src/myds_v41_gpu.c", 2099, 1},
+    {"MYDS_ATTN_KV_REUSE", "src/myds_v41_gpu.c", 2113, 1},
     {"MYDS_ATTN_OUTPUT_PIPELINE", "src/myds_v41.c", 4205, 1},
     {"MYDS_ATTN_OUT_A_FUSE_BF16", "src/myds_metal.m", 7659, 1},
     {"MYDS_ATTN_OUT_A_SHARED2", "src/myds_metal.m", 7663, 1},
-    {"MYDS_ATTN_PACKED_NSG", "src/myds_v41_gpu.c", 2041, 1},
-    {"MYDS_ATTN_PACKED_REDUCE", "src/myds_v41_gpu.c", 2042, 1},
-    {"MYDS_ATTN_PACKED_REGISTER", "src/myds_v41_gpu.c", 2036, 1},
-    {"MYDS_ATTN_ROPE_FUSE", "src/myds_v41_gpu.c", 2065, 1},
+    {"MYDS_ATTN_PACKED_NSG", "src/myds_v41_gpu.c", 2055, 1},
+    {"MYDS_ATTN_PACKED_REDUCE", "src/myds_v41_gpu.c", 2056, 1},
+    {"MYDS_ATTN_PACKED_REGISTER", "src/myds_v41_gpu.c", 2050, 1},
+    {"MYDS_ATTN_ROPE_FUSE", "src/myds_v41_gpu.c", 2079, 1},
     {"MYDS_ATTN_VEC_HEAD_FIRST", "src/myds_v41_gpu.c", 248, 1},
+    {"MYDS_ATTN_WHICH", "src/myds_v41_gpu.c", 1968, 1},
     {"MYDS_BATCH2_AUTO_BARRIER", "src/myds_v41.c", 5402, 1},
     {"MYDS_BATCH2_DECODE_SPLIT", "src/myds_v41.c", 5344, 1},
     {"MYDS_BATCH2_DENSE_SHARED", "src/myds_metal.m", 724, 1},
@@ -169,7 +170,7 @@ static const myds_knob_t myds_knobs_generated[] = {
     {"MYDS_MOE_Q2_V41", "src/myds_metal.m", 467, 1},
     {"MYDS_MOE_ROUTE_FUSE", "src/myds_v41_moe.c", 44, 1},
     {"MYDS_MOE_ROUTE_PROBE", "src/myds_v41_moe.c", 1832, 1},
-    {"MYDS_MOE_SOLO", "src/myds_v41.c", 8733, 1},
+    {"MYDS_MOE_SOLO", "src/myds_v41.c", 8741, 1},
     {"MYDS_MOE_STEP_PROF", "src/myds_metal.m", 6572, 1},
     {"MYDS_MOE_SYNC_SPLIT", "src/myds_metal.m", 6341, 1},
     {"MYDS_MOE_TILE_PROF", "src/myds_metal.m", 6540, 1},
@@ -196,7 +197,7 @@ static const myds_knob_t myds_knobs_generated[] = {
     {"MYDS_PREFILL_SYNC_CHUNK", "src/myds_v41.c", 7694, 1},
     {"MYDS_PREFIX_CACHE", "src/myds_engine.c", 3597, 1},
     {"MYDS_PRESENCE_PENALTY", "src/main.c", 323, 0},
-    {"MYDS_PROBE_DEBUG", "src/myds_v41.c", 7973, 1},
+    {"MYDS_PROBE_DEBUG", "src/myds_v41.c", 7981, 1},
     {"MYDS_PROF", "src/myds_engine.c", 107, 1},
     {"MYDS_PROFILE_ALLOC", "src/myds_v41.c", 7241, 1},
     {"MYDS_PROFILE_ATTN_SPLIT", "src/myds_v41.c", 7682, 1},
@@ -269,8 +270,8 @@ static const myds_knob_t myds_knobs_generated[] = {
     {"MYDS_YOCO_KEEP_TOKENS", "src/myds_v41.c", 7628, 1},
 };
 
-#define MYDS_KNOB_COUNT 256u
-#define MYDS_KNOB_DIRECT_COUNT 232u
+#define MYDS_KNOB_COUNT 257u
+#define MYDS_KNOB_DIRECT_COUNT 233u
 #define MYDS_KNOB_WRAPPED_COUNT 24u
 #define MYDS_KNOB_HELPERS "capture_parse_flag,cfg_f32_env,cfg_u32_env,decode_candidate_parse,decode_env_enabled,env_default_on,env_is_one_literal,env_not_zero_literal,qkv_fusion_enabled,v41_env_u32"
 

@@ -1959,6 +1959,28 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
                        c_len,n_comp,p0,(void *)s);
         }
     }
+    /* 2026-11-07 一次性诊断：把「实际派发了哪个 attention kernel」印出来。
+     * 起因：P1 的成本探针打在了 kernel_flash_attn_ext（heads）上，跑了两轮才发现
+     * 生产根本没走那条分支 —— MYDS_PREFILL_ATTN 未设 ⇒ variant=0 ⇒ use_matrix 恒 0。
+     * 三条分支谁生效，只有日志能说清；失败日志（MYDS_DEBUG_DISPATCH）只在失败时打，
+     * 成功的派发一直是沉默的。MYDS_ATTN_WHICH=1 才打印，每进程一次。 */
+    /* 只记【不同的组合】，每种一次：第一个 chunk 往往 n_comp=0、use_gather=0，
+     * 只看一条会漏掉后面的路径。哨兵数组很小，纯日志，无行为影响。 */
+    if (getenv("MYDS_ATTN_WHICH")) {
+        static int seen[16][3];
+        static int nseen = 0;
+        const int key0 = (int)use_gather, key1 = (int)use_matrix, key2 = (int)s->attn_vec_head_first;
+        int known = 0;
+        for (int i = 0; i < nseen; ++i)
+            if (seen[i][0] == key0 && seen[i][1] == key1 && seen[i][2] == key2) { known = 1; break; }
+        if (!known && nseen < 16) {
+            seen[nseen][0] = key0; seen[nseen][1] = key1; seen[nseen][2] = key2; ++nseen;
+            MYDS_LOG_I("attn-which#%d: variant=%u use_gather=%d use_matrix=%d matrix_encoded=%d "
+                       "head_first=%d(hf_unavail=%d) c_len=%u n_comp=%u",
+                       nseen, (unsigned)s->prefill_attn_variant, key0, key1, (int)matrix_encoded,
+                       key2, (int)s->attn_vec_head_first_unavailable, c_len, n_comp);
+        }
+    }
     if(!matrix_encoded){
         int vec_encoded=0;
         if(use_gather && s->attn_vec_head_first){
