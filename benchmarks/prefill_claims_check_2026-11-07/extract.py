@@ -32,6 +32,10 @@ ARMS = {
     "oct27.log":           ("691bc26 (2026-10-27)", "synthetic-random-words", "51c58fec367cbba7"),
     "ck512k.log":          ("HEAD b0b7b77", "synthetic-random-words", "e61b7b5c9252b1d3"),
     "ck1m.log":            ("HEAD b0b7b77", "synthetic-random-words", "e61b7b5c9252b1d3"),
+    # 2026-11-07 §143：engram IO 线程 8 vs 16，跑的是台账语料 p32k_ab__v0.txt。
+    # 同一二进制（HEAD f0fb04e 的父 a897cec 之后无 C 侧改动），只差一个环境变量。
+    "io8_server.log":      ("f0fb04e MYDS_ENGRAM_IO_THREADS=8",  "p32k_ab__v0.txt", "7185c1735f462aef"),
+    "io16_server.log":     ("f0fb04e MYDS_ENGRAM_IO_THREADS=16", "p32k_ab__v0.txt", "7185c1735f462aef"),
 }
 
 # 冒烟探针（X-Myds-Warmup）不是测量，剔掉。

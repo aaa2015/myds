@@ -153,6 +153,110 @@
       "prompt_file": "p32k_ab__v0.txt",
       "source": "corpus: 2026-11-07 08:20 实测，32,224 token，52.4 s",
       "comparable_to_ledger_105": true
+    },
+    {
+      "value": 41.83,
+      "kind": "decode",
+      "where": "§12.1 上下文缩放 prompt=2",
+      "prompt_file": null,
+      "source": "synthetic: 随机词 prompt 2 tok，解 200 tok",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 40.14,
+      "kind": "decode",
+      "where": "§12.1 上下文缩放 prompt=2445",
+      "prompt_file": null,
+      "source": "synthetic: 随机词 prompt 2445 tok，解 200 tok",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 39.31,
+      "kind": "decode",
+      "where": "§12.1 上下文缩放 prompt=9741",
+      "prompt_file": null,
+      "source": "synthetic: 随机词 prompt 9741 tok，解 200 tok",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 38.22,
+      "kind": "decode",
+      "where": "§12.1 上下文缩放 prompt=24398",
+      "prompt_file": null,
+      "source": "synthetic: 随机词 prompt 24398 tok，解 200 tok",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 42.4,
+      "kind": "decode",
+      "where": "§12.3 NR4 A/B，NR2 臂",
+      "prompt_file": null,
+      "source": "synthetic: 21 tok prompt，解 256 tok",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 42.5,
+      "kind": "decode",
+      "where": "§12.3 NR4 A/B，NR2 臂",
+      "prompt_file": null,
+      "source": "synthetic: 同上",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 40.6,
+      "kind": "decode",
+      "where": "§12.3 NR4 A/B，NR4 臂",
+      "prompt_file": null,
+      "source": "synthetic: 同上",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 41.0,
+      "kind": "decode",
+      "where": "§12.3 NR4 A/B，NR4 臂",
+      "prompt_file": null,
+      "source": "synthetic: 同上",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 619.5,
+      "kind": "prefill",
+      "where": "§13.4 engram IO=8 臂（prefill 32K）",
+      "prompt_file": "p32k_ab__v0.txt",
+      "source": "corpus: 2026-11-07 results/v_io8/server.log",
+      "comparable_to_ledger_105": true
+    },
+    {
+      "value": 642.3,
+      "kind": "prefill",
+      "where": "§13.4 engram IO=16 臂（prefill 32K）",
+      "prompt_file": "p32k_ab__v0.txt",
+      "source": "corpus: 2026-11-07 results/v_io16/server.log",
+      "comparable_to_ledger_105": true
+    },
+    {
+      "value": 42.3,
+      "kind": "decode",
+      "where": "§13.4 engram IO=8 臂（decode）",
+      "prompt_file": null,
+      "source": "synthetic: 21 tok prompt，解 256 tok",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 42.9,
+      "kind": "decode",
+      "where": "§13.4 engram IO=16 臂（decode）",
+      "prompt_file": null,
+      "source": "synthetic: 同上",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 43.0,
+      "kind": "decode",
+      "where": "§13.5 生产部署后实测",
+      "prompt_file": null,
+      "source": "synthetic: 生产 8187，21 tok prompt，解 256 tok",
+      "comparable_to_ledger_105": false
     }
   ]
 }
