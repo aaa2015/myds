@@ -34,7 +34,8 @@
         "§148",
         "§149",
         "§150",
-        "§151"
+        "§151",
+        "§152"
       ]
     }
   ],
@@ -593,6 +594,222 @@
       "prompt_file": "p32k_ab__v0.txt",
       "source": "corpus: 生产 8187，MYDS_ENGRAM_PREFILL_ASYNC 默认开，47.5 s",
       "comparable_to_ledger_105": true
+    },
+    {
+      "value": 7.21,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§152.2 vispre 256x256 1线程",
+      "prompt_file": null,
+      "source": "bench: bin/test_vispre --bench，5 轮交替",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 2.21,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§152.2 vispre 256x256 8线程",
+      "prompt_file": null,
+      "source": "bench: bin/test_vispre --bench，5 轮交替",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 7.16,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§152.2 vispre 512x512 1线程",
+      "prompt_file": null,
+      "source": "bench: bin/test_vispre --bench，5 轮交替",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 2.14,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§152.2 vispre 512x512 8线程",
+      "prompt_file": null,
+      "source": "bench: bin/test_vispre --bench，5 轮交替",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 19.33,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§152.2 vispre 1024x768 1线程",
+      "prompt_file": null,
+      "source": "bench: bin/test_vispre --bench，5 轮交替",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 4.73,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§152.2 vispre 1024x768 8线程",
+      "prompt_file": null,
+      "source": "bench: bin/test_vispre --bench，5 轮交替",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 240.76,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§152.2 vispre 4032x3024 1线程",
+      "prompt_file": null,
+      "source": "bench: bin/test_vispre --bench，5 轮交替",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 52.93,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§152.2 vispre 4032x3024 8线程",
+      "prompt_file": null,
+      "source": "bench: bin/test_vispre --bench，5 轮交替",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 187.8,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§152.2 vispre 4032x3024 省下",
+      "prompt_file": null,
+      "source": "bench: bin/test_vispre --bench，5 轮交替",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 8.61,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§152.3 n_comp=512 A",
+      "prompt_file": null,
+      "source": "bench: test_v41_gpu --bench-rows4",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 30.46,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§152.3 n_comp=512 B",
+      "prompt_file": null,
+      "source": "bench: test_v41_gpu --bench-rows4",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 20.16,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§152.3 n_comp=2048 A",
+      "prompt_file": null,
+      "source": "bench: test_v41_gpu --bench-rows4",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 28.91,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§152.3 n_comp=2048 B",
+      "prompt_file": null,
+      "source": "bench: test_v41_gpu --bench-rows4",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 52,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§152.3 28K 每层省",
+      "prompt_file": null,
+      "source": "bench 推导",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 380,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§152.3 28K 每 token 省",
+      "prompt_file": null,
+      "source": "推算：5层×52 + 3层×40",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 25.9,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§152.3 28K 每 token 墙钟",
+      "prompt_file": null,
+      "source": "1000/38.7",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 92,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§152.3 2K 每 token 净损失",
+      "prompt_file": null,
+      "source": "推算",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 24.5,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§152.3 2K 每 token 墙钟",
+      "prompt_file": null,
+      "source": "1000/40.8",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 40.9,
+      "unit": "t/s",
+      "kind": "throughput",
+      "where": "§152.3 端到端 decode",
+      "prompt_file": null,
+      "source": "synthetic: 21 tok warmup + 2.1K/28.4K prompt，解 200 tok",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 40.7,
+      "unit": "t/s",
+      "kind": "throughput",
+      "where": "§152.3 端到端 decode",
+      "prompt_file": null,
+      "source": "synthetic: 21 tok warmup + 2.1K/28.4K prompt，解 200 tok",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 40.6,
+      "unit": "t/s",
+      "kind": "throughput",
+      "where": "§152.3 端到端 decode",
+      "prompt_file": null,
+      "source": "synthetic: 21 tok warmup + 2.1K/28.4K prompt，解 200 tok",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 38.7,
+      "unit": "t/s",
+      "kind": "throughput",
+      "where": "§152.3 端到端 decode",
+      "prompt_file": null,
+      "source": "synthetic: 21 tok warmup + 2.1K/28.4K prompt，解 200 tok",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 38.5,
+      "unit": "t/s",
+      "kind": "throughput",
+      "where": "§152.3 端到端 decode",
+      "prompt_file": null,
+      "source": "synthetic: 21 tok warmup + 2.1K/28.4K prompt，解 200 tok",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 39.1,
+      "unit": "t/s",
+      "kind": "throughput",
+      "where": "§152.3 端到端 decode",
+      "prompt_file": null,
+      "source": "synthetic: 21 tok warmup + 2.1K/28.4K prompt，解 200 tok",
+      "comparable_to_ledger_105": false
     }
   ]
 }
