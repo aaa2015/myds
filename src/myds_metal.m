@@ -174,12 +174,34 @@ static uint32_t qkv_nr0(void);
 static uint32_t dense_q4_nr0(void);
 static uint32_t dense_q4_nsg(void);
 static uint32_t dense_q4_nr_site(unsigned site);
+/* 0 = 全关，1 = 按 n_comp 阈值（默认 auto），2 = 强制全开。
+ * §152.3 实测：rows4 在 n_comp=512 慢 3.5x、2048 慢 1.4x，12288 起才领先
+ * ⇒ 不能全局一刀切，按阈值分档。非法值取 0（宁慢不长上下文退化）。 */
 static int indexer_score_rows4_parse_mode(void) {
     const char *value = getenv("MYDS_INDEXER_SCORE_ROWS4");
-    if (!value || strcmp(value, "1") == 0) return 1;
+    if (!value || !*value) return 1;
     if (strcmp(value, "0") == 0) return 0;
-    fprintf(stderr, "myds_metal: MYDS_INDEXER_SCORE_ROWS4 must be exactly 0 or 1\n");
+    if (strcmp(value, "1") == 0) return 2;
+    if (strcmp(value, "auto") == 0) return 1;
+    fprintf(stderr, "myds_metal: MYDS_INDEXER_SCORE_ROWS4 must be 0, 1 or auto\n");
     return -1;
+}
+static uint32_t indexer_rows4_min_comp(void) {
+    static uint32_t cached;
+    if (cached) return cached;
+    long v = 8192;
+    const char *e = getenv("MYDS_INDEXER_ROWS4_MIN");
+    if (e && *e) { long n = strtol(e, NULL, 10); if (n >= 1024 && n <= 262144) v = n; }
+    cached = (uint32_t)v;
+    return cached;
+}
+/* 与 src/myds_v41_gpu.c 的 v41_gpu_indexer_score_rows4_enabled 必须同判据，
+ * 否则 host 侧日志与真实派发会对不上。 */
+static bool indexer_score_rows4_use(uint32_t n_comp) {
+    const int mode = indexer_score_rows4_parse_mode();
+    if (mode == 2) return true;
+    if (mode == 0) return false;
+    return n_comp >= indexer_rows4_min_comp();
 }
 static bool indexer_score_rows4_geometry(void) {
     return g_device && g_pso_indexer_score_rows4 && g_pso_indexer_score_rows4.device == g_device &&
@@ -2585,6 +2607,7 @@ int myds_metal_init(const char *shader_dir) {
                 myds_metal_cleanup();
                 return 0;
             }
+            /* 这里只表示「PSO 可用」，具体每条请求用不用由 indexer_score_rows4_use() 决定。 */
             g_indexer_score_rows4 = indexer_score_rows4 != 0;
         }
         if(indexer_topk_threshold&&!myds_metal_indexer_topk_threshold_prepare()) {
@@ -2612,8 +2635,11 @@ int myds_metal_init(const char *shader_dir) {
         MYDS_LOG_I("myds_metal: Initialized successfully on GPU: %s", [[g_device name] UTF8String]);
         MYDS_LOG_I("Indexer head slots: %d (%s; explicit ordinary scalar scope)",
                    g_indexer_head_slots, g_indexer_head_slots ? "F32 candidate" : "reference");
-        MYDS_LOG_I("Indexer score rows4: %d (%s; 4 rows/SIMD, 16 rows/TG register scorer)",
-                   g_indexer_score_rows4, g_indexer_score_rows4 ? "rows4" : "1-row smem reference");
+        MYDS_LOG_I("Indexer score rows4: %d (%s; n_comp>=%u uses rows4, below uses 1-row smem)",
+                   g_indexer_score_rows4,
+                   indexer_score_rows4 == 2 ? "forced on" :
+                   indexer_score_rows4 == 0 ? "off" : "auto",
+                   indexer_rows4_min_comp());
         MYDS_LOG_I("Indexer topk threshold: %d (%s; explicit ordinary scalar scope)",
                    g_indexer_topk_threshold,g_indexer_topk_threshold?"F32 candidate":"reference");
         MYDS_LOG_I("Indexer topk NaN shuffle: %d (%s; reference partition geometry)",
@@ -3250,7 +3276,7 @@ int myds_metal_indexer_head_slots_dispatch(myds_metal_buffer_t *scores,
     bool *encoded,bool *unavailable) {
     if(encoded)*encoded=false;
     if(unavailable)*unavailable=false;
-    const bool use_rows4 = (indexer_score_rows4_parse_mode() == 1);
+    const bool use_rows4 = indexer_score_rows4_use(n_comp);
     if(!g_initialized || !g_indexer_head_slots || !indexer_head_slots_geometry() ||
        (use_rows4 && !indexer_score_rows4_geometry())) {
         if(unavailable)*unavailable=true;

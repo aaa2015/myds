@@ -18701,3 +18701,87 @@ kernel 留在库里以备实施方加 `n_comp >= 8192` 阈值后重审，但生�
 | §152 rows4 | **驳回，生产关闭**；等实施方加阈值 |
 | rows4 端到端 0-ULP | 仍未做（既未采纳，不阻塞） |
 
+## §154 rows4 加 auto 阈值后重审：**通过**；workspace_free 加 magic 纵深防御（2026-11-07 17:58）
+
+§152.3 驳回 rows4 的唯一原因是「短上下文退化」。修法只有一行：按 `n_comp` 分档。
+本节是修完后的重审，以及第二件（workspace 健壮性）。
+
+### 154.1 改法：三档语义
+
+`MYDS_INDEXER_SCORE_ROWS4`：
+
+| 值 | 语义 |
+|---|---|
+| `0` | 全关（原 1-row smem） |
+| `auto`（**默认**） | **`n_comp >= MYDS_INDEXER_ROWS4_MIN`（默认 8192）才用 rows4**，否则走原版 |
+| `1` | 强制全开（不推荐：短上下文退化） |
+| 其他 | 取 0（宁慢长上下文，也不要在短上下文退化） |
+
+host 侧（`myds_v41_gpu.c`）与 metal 侧（`myds_metal.m`）用**同一判据**，
+否则日志与真实派发会对不上。
+
+**阈值 8192 的依据**：§152.3 的单算子交叉点在 2048–12288 之间；
+8192 处 rows4 已领先 1.34×，且 8192 以下整段走原版 ⇒ 短上下文零退化。
+
+### 154.2 分档实测（同一进程内三档都出现）
+
+`MYDS_ATTN_WHICH=1` 日志，一次 28K 请求：
+
+```
+indexer-which#1: kernel=kernel_myds_indexer_score_one_head_slots  rows4=0  n_comp=153    ← 预热
+indexer-which#2: kernel=kernel_glm_indexer_score_one_row4[sic]    rows4=1  n_comp=14217  ← 已越过阈值
+indexer-which#3: kernel=kernel_glm_indexer_score_one_rows4        rows4=1  n_comp=28435
+```
+
+启动日志同时显示 `Indexer score rows4: 1 (auto; n_comp>=8192 uses rows4, below uses 1-row smem)`。
+
+### 154.3 端到端验收（服务端口径，唯一 nonce 保证冷 prefill）
+
+| 上下文 | ref（全关） | **auto** | forced（全开） | 判定 |
+|---|---|---|---|---|
+| 2.1K | **40.8** t/s | **40.7** t/s | — | **−0.2%，门 4 通过**（要求 ≤0.5%） |
+| 28.4K | **38.7** t/s | **39.0** t/s | 39.0 | **+0.78%** |
+
+对比 §152.3 的「强制全开」：短上下文那档从 **−0.7%** 收到 **−0.2%**；
+长上下文保住了收益。
+
+### 154.4 0-ULP
+
+同一 prompt、`temperature=0`、两臂（`ref` vs `auto`）各一次，28.4K：
+
+```
+ULP d24k  ref=c6f1314ef60ff377723a…  auto=c6f1314ef60ff377723a…  IDENTICAL
+```
+
+**这是 §152 里唯一没做完的那道门，现已补齐。**
+
+### 154.5 第二件：`v41_chunk_workspace_free` 加 magic
+
+§152.6/§153 的两个崩溃已由 server 层 drain 根治。这条是**纵深防御**：
+
+```c
+struct v41_chunk_workspace_s {
+    uint32_t magic;      /* 必须是 V41_CHUNK_WS_MAGIC；free 先校验再抹掉 */
+    ...
+};
+```
+
+`free` 里先校验 magic、**立刻抹掉**再开始遍历。bad magic ⇒ 打印一行 WARN 后返回。
+
+**为什么值得加**：那个崩溃栈的栈顶永远落在那片指针数组的遍历里
+（`objc_release → myds_metal_buffer_free`），排查成本极高；
+一次 4 字节校验能把「垃圾指针遍历」变成「什么都不做」。
+
+**注意**：这只防「传进来的不是有效 workspace」。**没有**改
+「同一线程内 fail 之后重复 free 同一块内存」的语义 —— 那需要所有权重构，不在本轮。
+
+### 154.6 状态
+
+| 项 | 状态 |
+|---|---|
+| rows4 auto 阈值 | **实现并验收通过**（2.1K −0.2% / 28.4K +0.78% / 0-ULP 通过） |
+| `MYDS_INDEXER_ROWS4_MIN` | 新增 knob，默认 8192 |
+| workspace magic | 已加（纵深防御，不改变所有权语义） |
+| 生产 | 仍跑 `adeb1f4e` + `MYDS_INDEXER_SCORE_ROWS4=0`；**本轮改动未部署** |
+| 本轮本地产物 | `bin/myds` = `e6d2a1a0`（含 §154 两项） |
+

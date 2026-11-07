@@ -6643,7 +6643,9 @@ int myds_v41_forward_batch_spec(myds_context_t *ctx, const int32_t *tokens,
 }
 
 
+#define V41_CHUNK_WS_MAGIC 0x574d4353u   /* "WMCS"：见 v41_chunk_workspace_free 的说明 */
 struct v41_chunk_workspace_s {
+    uint32_t magic;      /* 必须是 V41_CHUNK_WS_MAGIC；free 会先校验再抹掉 */
     uint32_t capacity;
     myds_metal_buffer_t *x_buf;
     myds_metal_buffer_t *x_norm_buf;
@@ -6757,8 +6759,21 @@ struct v41_chunk_workspace_s {
     myds_metal_buffer_t *hc_mix_buf;
 };
 
+/* 2026-11-07：加 magic 校验。§152 的两个关机崩溃已由 server 层 drain 根治
+ * （§153），这里再补一道纵深防御：如果传进来的不是我们分配的、或者已经被释放过
+ * （magic 被抹掉），就直接返回而不是照着垃圾 capacity 遍历指针数组。
+ *
+ * 为什么值得加：那个崩溃点（objc_release → myds_metal_buffer_free）在
+ * prefill 中断场景里出现，栈顶永远在那片指针数组的遍历里，排查成本极高。
+ * 一次 4 字节校验能把「垃圾指针遍历」变成「什么都不做」。 */
 static void v41_chunk_workspace_free(v41_chunk_workspace_t *cw) {
     if (!cw) return;
+    if (cw->magic != V41_CHUNK_WS_MAGIC) {
+        MYDS_LOG_W("v41_chunk_workspace_free: bad magic 0x%08x (already freed or "
+                   "not a workspace) -- skipping teardown", cw->magic);
+        return;
+    }
+    cw->magic = 0;          /* 先抹掉：即使后面崩，也不会被当成有效 workspace 再 free 一次 */
     for (uint32_t t = 0; t < cw->capacity; t++) {
         if (cw->x[t]) myds_metal_buffer_free(cw->x[t]);
         if (cw->x_norm[t]) myds_metal_buffer_free(cw->x_norm[t]);
@@ -6873,6 +6888,7 @@ static v41_chunk_workspace_t *v41_chunk_workspace_create(uint32_t capacity, uint
     if (!capacity || capacity > V41_MAX_CHUNK) return NULL;
     v41_chunk_workspace_t *cw = calloc(1, sizeof(*cw));
     if (!cw) return NULL;
+    cw->magic = V41_CHUNK_WS_MAGIC;
     cw->capacity = capacity;
     size_t C = capacity;
     /* MoE 的批容量（token 数）—— 至少一个 chunk。调用方按 MYDS_MOE_CHUNKS 与 prompt

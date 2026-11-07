@@ -535,9 +535,41 @@ static _Atomic uint64_t indexer_head_slots_requests;
 static _Atomic uint64_t indexer_head_slots_encoded;
 static _Atomic uint64_t indexer_head_slots_unavailable;
 static _Atomic uint64_t indexer_head_slots_failures;
-static bool v41_gpu_indexer_score_rows4_enabled(void) {
+/* rows4 打分器是否启用。
+ *
+ * ★ 2026-11-07 §152.3 实测：rows4 在 n_comp=512 时慢 3.5×、2048 慢 1.4×，
+ *   12288 起才转领先（131072 达 1.94×）。而 ratio_for(l)=l<2?0:l<20?2:1，
+ *   indexer 的 8 层里 5 层 ratio=1 ⇒ n_comp ≈ 上下文长度
+ *   ⇒ 短上下文（生产主力）正好落在退化区。端到端：2.1K −0.3~0.7%，28.4K +1.29%。
+ *
+ * 所以不能「一开关全局生效」，必须按 n_comp 分档。三档语义：
+ *   MYDS_INDEXER_SCORE_ROWS4=0        全关（原 1-row smem）
+ *                          =1        全开（不推荐：短上下文退化）
+ *                          =auto     按阈值（默认）；n_comp >= MYDS_INDEXER_ROWS4_MIN 才用
+ *   其余非法值 ⇒ 全关（宁可慢一点长上下文，也不要在短上下文上退化）。 */
+static uint32_t v41_gpu_indexer_rows4_min(void) {
+    static int cached = -1;
+    if (cached >= 0) return (uint32_t)cached;
+    long v = 8192;
+    const char *e = getenv("MYDS_INDEXER_ROWS4_MIN");
+    if (e && *e) { long n = strtol(e, NULL, 10); if (n >= 1024 && n <= 262144) v = n; }
+    cached = (int)v;
+    return (uint32_t)v;
+}
+/* 返回 2 = 强制全开，1 = 按阈值，0 = 全关。 */
+static int v41_gpu_indexer_score_rows4_mode(void) {
     const char *v = getenv("MYDS_INDEXER_SCORE_ROWS4");
-    return !v || strcmp(v, "0") != 0;
+    if (!v || !*v) return 1;                 /* 默认 auto */
+    if (strcmp(v, "0") == 0) return 0;
+    if (strcmp(v, "1") == 0) return 2;
+    if (strcmp(v, "auto") == 0) return 1;
+    return 0;
+}
+static bool v41_gpu_indexer_score_rows4_enabled(uint32_t n_comp) {
+    const int mode = v41_gpu_indexer_score_rows4_mode();
+    if (mode == 2) return true;
+    if (mode == 0) return false;
+    return n_comp >= v41_gpu_indexer_rows4_min();
 }
 static void v41_gpu_log_indexer_which(int path_id, const char *path_name, const char *kernel_name,
     bool rows4, bool has_mask, bool cache_bf16, uint32_t first_row, uint32_t n_comp, uint32_t n_sel_blocks) {
@@ -578,7 +610,7 @@ int myds_v41_gpu_indexscores_head_slots(myds_metal_buffer_t *scores,
         n_comp,n_heads,cache_bf16,first_row,&encoded,&unavailable);
     if(encoded) {
         atomic_fetch_add_explicit(&indexer_head_slots_encoded,1u,memory_order_relaxed);
-        const bool rows4 = v41_gpu_indexer_score_rows4_enabled();
+        const bool rows4 = v41_gpu_indexer_score_rows4_enabled(n_comp);
         v41_gpu_log_indexer_which(1, "head_slots",
             rows4 ? "kernel_glm_indexer_score_one_rows4" : "kernel_myds_indexer_score_one_head_slots",
             rows4, mask != NULL, cache_bf16, first_row, n_comp, 0u);
@@ -600,7 +632,7 @@ static int indexscores(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
         n_comp,n_heads,128,cache_bf16?2u:0u,1.0f/64.0f,mask?1u:0u,first_row};
     const myds_metal_buffer_t *b[]={q,weights,cache,scores,mask?mask:scores};
     if (n_heads == 32u) {
-        const bool rows4 = v41_gpu_indexer_score_rows4_enabled();
+        const bool rows4 = v41_gpu_indexer_score_rows4_enabled(n_comp);
         const int ok = rows4
             ? dispatch("kernel_glm_indexer_score_one_rows4",&a,sizeof(a),b,5,(n_comp+15u)/16u,1,1,32,4,1,0)
             : dispatch("kernel_glm_indexer_score_one_direct",&a,sizeof(a),b,5,n_comp,1,1,32,4,1,132u*4);
@@ -663,7 +695,7 @@ int myds_v41_gpu_indexscores_selected_blocks_bf16(myds_metal_buffer_t *scores,
        buffer_ranges_overlap(scores,score_bytes,mask,(size_t)((n_comp+7u)/8u)*4u)||
        (n_selected_blocks&&buffer_ranges_overlap(scores,score_bytes,block_ids,(size_t)n_selected_blocks*4u)))return -1;
     atomic_fetch_add_explicit(&indexer_compact_counters[IC_REQUESTS],1,memory_order_relaxed);
-    const bool rows4 = v41_gpu_indexer_score_rows4_enabled();
+    const bool rows4 = v41_gpu_indexer_score_rows4_enabled(n_comp);
     const char *sel_kernel = rows4
         ? "kernel_myds_indexer_score_selected_blocks_rows4"
         : "kernel_myds_indexer_score_selected_blocks_direct";
