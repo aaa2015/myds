@@ -977,9 +977,9 @@
       "unit": "t/s",
       "kind": "throughput",
       "where": "§158.6 部署 d206691b 后的 32K 冒烟",
-      "prompt_file": "p32k_ab__v0.txt",
-      "source": "corpus: 生产 8187，32,220 tok / 47.5 s",
-      "comparable_to_ledger_105": true
+      "prompt_file": null,
+      "source": "synthetic smoke: 生产 8187，32,220 tok / 47.5 s。基语料 = benchmarks/register_only_2026-10-27/prompts/p32k_ab__v0.txt（内容 sha 1a22b57b104b130c 已核对一致），但每轮追加唯一 nonce 以保证冷 prefill，因此输入并非逐字节等于该语料文件 ⇒ prompt_file 记 null。单次部署冒烟，未入 runs.jsonl A/B 归档。",
+      "comparable_to_ledger_105": false
     }
   ]
 }

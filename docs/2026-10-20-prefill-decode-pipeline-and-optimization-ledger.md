@@ -19211,3 +19211,74 @@ accept 循环退出后 fd 已关，不会再进新连接。
 > 的中间构建。`make` 重编后被覆盖，真正的产物是 `d206691b`。
 > 判据不是记忆，是 `bin/BUILD-INFO.json` 里的 `commit` + `artifacts` —— 这次它救了我。
 
+### 158.7 我在 `4943ee5` 引入门禁失败，根因是 Makefile 注释撒谎（2026-11-08 06:56）
+
+外部复核（同一方）指出 `make claims-check` 在 `4943ee5` 以 rc=2 失败：
+
+```
+FAIL claim 678.5 t/s（§158.6 部署 d206691b 后的 32K 冒烟）
+     在 runs.jsonl 与台账原始行里都找不到对应测量
+```
+
+**我验证了，成立。** 而且这不是我"忘了跑"，是**这道门根本没被 `audit-ledger` 跑过**：
+
+```make
+audit-ledger:
+	python3 -B tools/audit_ledger_105.py          # ← 只跑这个
+
+# 单独跑「哪些数可以和台账比」这一条。audit-ledger 已包含它；   ← 假注释
+claims-check:
+	python3 -B tools/prefill_claims.py                          # 1/3
+	python3 -B benchmarks/.../extract.py --check                # 2/3  ← 从没被跑
+	python3 -B benchmarks/.../verify.py                         # 3/3  ← 从没被跑
+```
+
+`audit_ledger_105.py` 内部只调 `prefill_claims.validate`，也就是 **第 1/3 步**。
+第 2、3 步（runs.jsonl 一致性、可比 claim 的可溯源性）**从来没有进过 `audit-ledger`**。
+
+⇒ **和今天 §147/§148/§149 同一类病：注释说的与代码做的不一样。**
+我信了那句「已包含它」，于是只跑 `audit-ledger` 就提交了。
+
+**修法不是"下次记得跑"，是让它名副其实**：
+
+```make
+audit-ledger: claims-check      # 实测 0.13 s，没有理由不跑
+	python3 -B tools/audit_ledger_105.py
+```
+
+并把那段假注释替换成真实说明 + 这次事故的出处。
+
+### 158.8 数据修正：678.5 不该标 `comparable_to_ledger_105`
+
+`comparable_to_ledger_105: true` 的含义是「这个数可与台账 §105 的 618.9 t/s 直接比，
+因此必须能在 `runs.jsonl` 或台账原始行里溯源」。而 678.5 是**单次部署冒烟**，
+不在 A/B 归档里。§155/§156.7 的 679.0 早就正确地标了 `false`，是我没照着做。
+
+| 字段 | 原值 | 改为 |
+|---|---|---|
+| `comparable_to_ledger_105` | `true` | **`false`** |
+| `prompt_file` | `"p32k_ab__v0.txt"` | **`null`** |
+
+`prompt_file` 改 null 的理由要说清（这是一个"看起来该填、其实不该填"的字段）：
+
+- 基语料确实是 `benchmarks/register_only_2026-10-27/prompts/p32k_ab__v0.txt`，
+  `bench/ab/p32k_v0.json` 的 message 内容 sha256 前 16 位 = **`1a22b57b104b130c`**，
+  与该语料文件**逐字节一致**（我核对过）。
+- **但每轮追加了唯一 nonce**（`\n\n[v158 <rand>]`）以保证冷 prefill。
+  追加 nonce 后输入就不再逐字节等于语料文件 ⇒ **填 `prompt_file` 会变成谎报**。
+
+已把这两点写进该条目的 `source` 字段，作为下次照着填的模板。
+
+> **一条纪律**：`prompt_file` 只填「这次测量喂进去的就是那个文件、逐字节」。
+> 加了 nonce / 拼了别的内容，一律 `null` + 在 `source` 里说明改了哪里。
+
+### 158.9 状态
+
+| 项 | 状态 |
+|---|---|
+| `make claims-check` | **PASS**（含自测项「the claim checker rejects a synthetic number marked comparable」）|
+| `make audit-ledger` | **PASS**，且现在真的包含 claims-check 三步 |
+| 678.5 登记 | 已改为 `comparable_to_ledger_105:false`、`prompt_file:null` |
+| 生产 | 未受影响（`d206691b`，PID 31448，`/health` ok）|
+
+**这条自测项本来就能拦住** —— 说明门是对的，是门没被跑。工具没问题，流程有问题。

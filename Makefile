@@ -227,11 +227,20 @@ test-register-only-service-window:
 
 # Re-derive every performance figure in ledger §105 from the raw JSONL and fail on any
 # mismatch. Needs no GPU; the raw rows ship with the repository.
-audit-ledger:
+# ★ 2026-11-08：原先这里只有 audit_ledger_105.py，而下面 claims-check 的
+#   注释写着「audit-ledger 已包含它」—— 那是【假的】。audit_ledger_105.py 只
+#   调用 prefill_claims.validate（claims-check 的第 1/3 步），
+#   extract.py --check 与 verify.py（2、3 步）从来没被 audit-ledger 跑过。
+#   后果：4943ee5 登记了一条 comparable_to_ledger_105 但无法溯源的 678.5 t/s，
+#   audit-ledger 报 PASS，真正的门在 claims-check 里红着。教训：
+#   注释说「已包含」时，去读 Makefile 而不是信注释。
+#   现在让它名副其实：claims-check 是 audit-ledger 的前置依赖（实测 0.13 s）。
+audit-ledger: claims-check
 	python3 -B tools/audit_ledger_105.py
 
-# 单独跑「哪些数可以和台账比」这一条。audit-ledger 已包含它；
-# 单独留一个入口是因为改文档里的吞吐数字时只想跑这一秒级的检查。
+# 「登记的数字是否能在原始证据里找到」—— 三步走：
+#   1) 登记表自身自洽    2) runs.jsonl 与 raw/ 一致    3) 每条可比 claim 可溯源
+# 改文档里的吞吐数字时也可以只跑这一条（audit-ledger 会先跑它，故为幂等）。
 claims-check:
 	python3 -B tools/prefill_claims.py
 	python3 -B benchmarks/prefill_claims_check_2026-11-07/extract.py --check
