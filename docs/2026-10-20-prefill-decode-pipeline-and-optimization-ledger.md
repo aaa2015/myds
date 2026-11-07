@@ -18987,3 +18987,61 @@ git 拒绝覆盖）。这也是「手工传文件」与「走脚本」混用的�
 | macstudio 源码 | 已同步到 `9a26b5a1` |
 | 推理性能 | 三项冒烟全部与部署前一致 |
 
+## §157 清理 macstudio 上的陈旧 stash `wip-d2-d3`（2026-11-07 19:20）
+
+### 157.1 它是什么
+
+`git stash list` 里唯一一条：`wip-d2-d3`，基于 `62820ac2`（2026-10-21 06:35）。
+内容 7 个文件、345 增 17 删：D2（HC RMSNorm→mix 预融合）接入 MoE 路径 +
+D3（MoE down 专家进 grid.z）的独立组件测试。
+
+### 157.2 判定：功能已全部合并，且两项都已被证否
+
+逐符号核对，stash 引入的每一处 HEAD 都有：
+
+| 符号 | HEAD 出现次数 |
+|---|---:|
+| `myds_fuse_hc_norm_mix_mode` | 10 |
+| `myds_metal_set_fuse_hc_norm_mix_mode` | 4 |
+| `g_pso_hc_norm_mix_f16_cluster2` | 5 |
+| `ds4_metal_args_hc_norm_mix` | 14 |
+| `kernel_dsv4_hc_rms_norm_mix_f16_cluster2` | 7 |
+
+`src/myds_v41_moe.c` 里 7 处 `myds_fuse_hc_norm_mix_mode` / `hc_mix_norm_project_fused`
+与 stash 的接入点一一对应；`tests/test_hc_norm_mix_fuse.m`、
+`tests/test_moe_q2_down_expertz.m` 与 Makefile 目标都已在 HEAD。
+
+**而这两项在账本里已经判死**：
+
+- **§19（2026-10-21）D2**：微基准 −61%（−9.9 µs），但**接入引擎后关键路径净益为 0**；
+  A/B 实测 mode=1 40.86 每秒 token、mode=2 40.59 每秒 token，两者都**低于**基线 42.70 每秒 token。
+  ⇒ 已证否。
+- **§20（2026-10-21）D3**：两趟 3.93 MB 缓冲，理论 +2~4%，**实测仅 −0.19 ms（<0.8%）**，
+  且因加法不结合律**不可保 0-ULP**（必偏 1~12 ULP）⇒ 已证否。
+
+⇒ 这条 stash 是「已合并 + 已证否」的研究残留，留着只会让人以为还有未完成的工作。
+
+### 157.3 处理
+
+按 `trash > rm` 的原则先存档再丢弃：
+
+```
+~/myds-stash-archive/wip-d2-d3-20261021.patch   (544 行, 38134 B)
+```
+
+然后 `git stash drop stash@{0}`（`6dfecb60`）。工作树干净，`git stash list` 为空。
+
+### 157.4 顺带把 macstudio 同步到 `a7cbfd0`
+
+拉取后远端 `python3 tools/knob_fingerprint.py --check bin/myds --conf myds.conf`
+自查通过：二进制与源码 knob 集合一致，77 个 conf 键全认识。
+
+### 157.5 状态
+
+| 项 | 状态 |
+|---|---|
+| `wip-d2-d3` stash | **已存档并丢弃** |
+| macstudio 源码 | `a7cbfd0`（与 macmini 一致）|
+| 生产 | `34d3cf27`，PID 76747，`/health` ok（本节未重启）|
+| D2 / D3 | 仍为「已证否」，本次只是清理残留，不改变结论 |
+

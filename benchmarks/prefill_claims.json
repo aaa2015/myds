@@ -40,7 +40,8 @@
         "§154",
         "§155",
         "§156",
-        "§156"
+        "§156",
+        "§157"
       ]
     }
   ],
@@ -940,6 +941,33 @@
       "where": "§155 生产 A/B",
       "prompt_file": null,
       "source": "synthetic: 28.4K prompt + 200 tok 输出, temp 0, 生产 8187",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 40.86,
+      "unit": "t/s",
+      "kind": "throughput",
+      "where": "§157.2 引用账本 §19 的 D2 A/B（历史数字，非本次测量）",
+      "prompt_file": null,
+      "source": "legacy: 账本 §19（2026-10-21），本次仅引用",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 40.59,
+      "unit": "t/s",
+      "kind": "throughput",
+      "where": "§157.2 引用账本 §19 的 D2 A/B（历史数字，非本次测量）",
+      "prompt_file": null,
+      "source": "legacy: 账本 §19（2026-10-21），本次仅引用",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 42.7,
+      "unit": "t/s",
+      "kind": "throughput",
+      "where": "§157.2 引用账本 §19 的 D2 A/B（历史数字，非本次测量）",
+      "prompt_file": null,
+      "source": "legacy: 账本 §19（2026-10-21），本次仅引用",
       "comparable_to_ledger_105": false
     }
   ]
