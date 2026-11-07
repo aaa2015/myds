@@ -18785,3 +18785,81 @@ struct v41_chunk_workspace_s {
 | 生产 | 仍跑 `adeb1f4e` + `MYDS_INDEXER_SCORE_ROWS4=0`；**本轮改动未部署** |
 | 本轮本地产物 | `bin/myds` = `e6d2a1a0`（含 §154 两项） |
 
+## §155 部署 rows4-auto 并实测增益：长上下文 decode +0.91%，prefill 与短上下文 decode 无变化（2026-11-07 18:11）
+
+### 155.1 部署
+
+| 项 | 值 |
+|---|---|
+| `bin/myds` | **`e6d2a1a01be4f12d`**（含 §154 的 rows4 auto 阈值 + workspace magic） |
+| `bin/myds.metallib` | `d37bde4890ea2c5a`（未变，rows4 kernel 早已在库中） |
+| 配置 | `MYDS_INDEXER_SCORE_ROWS4=auto` + `MYDS_INDEXER_ROWS4_MIN=8192` |
+| 生产 | PID 64354，`/health` ok，启动日志 `Indexer score rows4: 1 (auto; n_comp>=8192 uses rows4, below uses 1-row smem)` |
+| 回滚点 | `bin/.prev-20261107-180114/` + `myds.conf.bak-rows4auto-<ts>` |
+
+### 155.2 ⚠️ 一条部署纪律：新旧二进制不兼容同一份 conf
+
+用旧二进制（`adeb1f4e`）配新 conf 会**拒绝启动**：
+
+```
+[ERROR] config: MYDS_INDEXER_ROWS4_MIN=8192 没有任何代码读取（拼写错误？已被删除的开关？）
+[ERROR] 拒绝启动：配置门禁未通过（退出码 2）
+```
+
+⇒ **回滚时必须同时回滚 conf**，否则服务起不来。这是配置门禁正确工作，
+但也是我第一次实测时踩到的坑（两轮 START_FAILED）。
+
+### 155.3 生产 A/B（同端口、同 prompt、唯一 nonce、交替各 2 轮）
+
+**长上下文 28.4K + 200 token 输出**（rows4 真正生效的口径）：
+
+| 轮 | old `adeb1f4e`（rows4=0） | new `e6d2a1a0`（rows4=auto） |
+|---|---:|---:|
+| 1 | 38.6 t/s | 38.9 t/s |
+| 2 | 38.6 t/s | 39.0 t/s |
+| **中位** | **38.6** | **38.95** |
+
+**+0.35 每秒 token = +0.91%。** 与 §154 的 bench 交替结果（38.7 → 39.0，+0.78%）一致。
+
+**prefill（32,221 tok，冷）**：
+
+| | prefill |
+|---|---:|
+| 部署前 | **679.1 t/s**（47.4 s） |
+| 部署后 | **679.0 t/s**（47.5 s） |
+
+**无变化**，符合预期 —— rows4 只在 decode 的 indexer 打分上生效，不在 prefill 路径。
+
+**短上下文 decode（21 tok prompt / 256 out）**：
+
+| | decode |
+|---|---|
+| 部署前 | 42.6 / 43.0 / 42.9 t/s |
+| 部署后 | 42.6 / 42.9 / 43.0 t/s |
+
+**无变化**，符合预期 —— `n_comp ≈ 21`，远低于 8192 阈值，走原版。
+
+### 155.4 增益的完整账（今天累计）
+
+| 改动 | 口径 | 增益 | 状态 |
+|---|---|---|---|
+| `MYDS_ENGRAM_IO_THREADS` 8→16 | decode 短 / 32K prefill | +1.4% / +3.7% | 已上线 |
+| P0 engram 后台线程 | 32K prefill | +5.9% | 已上线 |
+| **合计对 §105 基线** | **32K prefill** | **618.9 → 679.0 = +9.7%** | 已上线 |
+| vispre 多线程 | 4032×3024 图片预处理 | 240.76 → 52.93 毫秒（−188 毫秒） | 已上线 |
+| `/v1/models` modalities | 客户端能力发现 | 功能 | 已上线 |
+| 关机崩溃修复 | SIGTERM 中断 prefill | 从 SIGSEGV 变优雅退出 | 已上线 |
+| **rows4 auto** | **28.4K 上下文 decode** | **+0.91%** | **本次上线** |
+
+**decode 短上下文仍 42.9 t/s，§46.2「无两位数空间」的结论今天依然成立。**
+
+### 155.5 状态
+
+| 项 | 状态 |
+|---|---|
+| rows4 auto | **已上线**，长上下文 +0.91% |
+| prefill | 679.0 t/s（与部署前一致） |
+| 短上下文 decode | 42.9 t/s（与部署前一致） |
+| 生产 | PID 64354，`/health` ok |
+| 本地产物 | `bin/myds` = `e6d2a1a0`（与生产一致） |
+

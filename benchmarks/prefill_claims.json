@@ -37,7 +37,8 @@
         "§151",
         "§152",
         "§153",
-        "§154"
+        "§154",
+        "§155"
       ]
     }
   ],
@@ -865,6 +866,78 @@
       "where": "§154 分档",
       "prompt_file": null,
       "source": "synthetic: 2.1K/28.4K prompt + 200 tok 输出, temp 0",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 38.6,
+      "unit": "t/s",
+      "kind": "throughput",
+      "where": "§155 生产 A/B",
+      "prompt_file": null,
+      "source": "synthetic: 28.4K prompt + 200 tok 输出, temp 0, 生产 8187",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 38.9,
+      "unit": "t/s",
+      "kind": "throughput",
+      "where": "§155 生产 A/B",
+      "prompt_file": null,
+      "source": "synthetic: 28.4K prompt + 200 tok 输出, temp 0, 生产 8187",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 39.0,
+      "unit": "t/s",
+      "kind": "throughput",
+      "where": "§155 生产 A/B",
+      "prompt_file": null,
+      "source": "synthetic: 28.4K prompt + 200 tok 输出, temp 0, 生产 8187",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 679.1,
+      "unit": "t/s",
+      "kind": "throughput",
+      "where": "§155 生产 A/B",
+      "prompt_file": null,
+      "source": "synthetic: 28.4K prompt + 200 tok 输出, temp 0, 生产 8187",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 679.0,
+      "unit": "t/s",
+      "kind": "throughput",
+      "where": "§155 生产 A/B",
+      "prompt_file": null,
+      "source": "synthetic: 28.4K prompt + 200 tok 输出, temp 0, 生产 8187",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 42.6,
+      "unit": "t/s",
+      "kind": "throughput",
+      "where": "§155 生产 A/B",
+      "prompt_file": null,
+      "source": "synthetic: 28.4K prompt + 200 tok 输出, temp 0, 生产 8187",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 42.9,
+      "unit": "t/s",
+      "kind": "throughput",
+      "where": "§155 生产 A/B",
+      "prompt_file": null,
+      "source": "synthetic: 28.4K prompt + 200 tok 输出, temp 0, 生产 8187",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 43.0,
+      "unit": "t/s",
+      "kind": "throughput",
+      "where": "§155 生产 A/B",
+      "prompt_file": null,
+      "source": "synthetic: 28.4K prompt + 200 tok 输出, temp 0, 生产 8187",
       "comparable_to_ledger_105": false
     }
   ]
