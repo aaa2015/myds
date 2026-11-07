@@ -18607,3 +18607,72 @@ v41_engram_async_main        ← §146 新增的后台线程
 | P0 后台线程崩溃栈 | **待修**（我的代码） |
 | 生产 | 未部署 `09a6c96`；仍跑 `a79b410a`，`/health` ok |
 
+## §153 修掉 §152.6/152.7 的崩溃：关机时等在场请求退完，再释放 context（2026-11-07 17:40）
+
+### 153.1 根因是同一个：客户端线程 detach，关机不等它
+
+`src/myds_server.c:2324` 用 `pthread_create` + `pthread_detach` 起客户端线程，
+accept 循环退出后 `myds_server_start` **立刻返回**，`main.c:592` 紧接着
+`myds_context_free(ctx)`。**此时还在跑的请求线程在用已经释放的 ctx。**
+
+这一个结构缺陷同时产生了 §152 记录的两个崩溃栈：
+
+| 崩溃 | 栈 |
+|---|---|
+| 既有（与任何提交无关） | `objc_release → myds_metal_buffer_free → v41_chunk_workspace_free → myds_v41_prefill_tokens` |
+| §146 的 P0 | `myds_engram_decode_row → prepare_batch_step → v41_engram_async_main` |
+
+**判据（§152.6 已做）**：拿 P0 之前的二进制 `7185c173`（`nm` 确认无
+`v41_engram_async_main`）做同样操作，崩在**完全相同的栈** ⇒ 既有缺陷。
+我原以为是我的 P0 引入的，**这个判断错了**——P0 只是让这条路径更容易被触发（多了一个线程在跑）。
+
+### 153.2 修法
+
+`myds_server_start` 在 accept 循环结束后：
+
+1. 置 `g_draining`
+2. 轮询 `g_client_threads` 直到归零，**上限 120 s**（`MYDS_SHUTDOWN_DRAIN_S` 可调）
+3. 若超时仍有请求在跑：**不释放 context**，返回 **2**；`main.c` 看到 2 就跳过
+   `myds_context_free` / `myds_model_free`，让进程退出时由内核回收
+
+**为什么超时要「泄漏」而不是「释放」**：还有线程在读写那块内存，free 必然崩。
+泄漏一份、进程马上退出，比 SIGSEGV 好。
+
+**为什么上限是 120 s 而不是无限等**：32K prefill 约 50 s，262K 冷 prefill 约 12 min。
+后者等不完，所以给上限。超时是**显式日志**，不是静默。
+
+### 153.3 实测（`/tmp/myds-drain`，macstudio）
+
+| 场景 | 修复前 | 修复后 |
+|---|---|---|
+| **(a) prefill 中途 SIGTERM** | 请求被腰斩（12.19 s）、**崩溃 1 次** | 请求**跑完 47.455 s**、**崩溃 0**、日志 `Shutdown: all request threads drained` |
+| **(b) 空闲 SIGTERM** | — | **1 秒退出**（不引入额外延迟） |
+
+崩溃报告计数：基线 10 → 修复后 10（**新增 0**）。
+
+### 153.4 对部署脚本的影响
+
+`tools/deploy_artifact.sh` 是 stop → start。修复前，若 stop 时正有长 prefill，
+进程会 SIGSEGV（`stop_fleet` 看到的是「崩了」而不是「退出了」，可能误判）。
+修复后：正常退出；如果请求超 120 s 未完成，会打印
+`Shutdown: N request(s) still running after 120 s ⇒ skipping context teardown`。
+
+**这同时意味着 deploy 的 stop 最多可能等 120 s。** 若需要更快，可设
+`MYDS_SHUTDOWN_DRAIN_S=30` 之类；超时也是干净的（不崩）。
+
+### 153.5 未修的一项（明确记录）
+
+`v41_chunk_workspace_free` 在部分构造的 workspace 上解引用失效指针，**它本身的健壮性没改**。
+本次只是消除了「在别的线程还在用它时释放」这个触发条件。
+如果将来出现「同一线程内 fail 之后自己再 free 一次」的路径，仍可能崩。
+**这条待单独审。**
+
+### 153.6 状态
+
+| 项 | 状态 |
+|---|---|
+| 关机崩溃 | **已修**（两种场景实测 0 崩溃） |
+| `MYDS_SHUTDOWN_DRAIN_S` | 新增 knob，默认 120 |
+| 生产 | **未部署**（生产仍 `a79b410a`）；本次修复在 `bin/myds` = `adeb1f4e` |
+| §152 的 rows4 驳回、vispre 通过 | 不变，仍未部署 |
+

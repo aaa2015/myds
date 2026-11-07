@@ -66,6 +66,18 @@ volatile sig_atomic_t g_running = 1;
  * 几千条空闲连接即可把内存吃光。默认 256，可用 MYDS_MAX_CONN 调整。 */
 static _Atomic unsigned g_client_threads;
 static unsigned g_emfile_streak;   /* 连续 EMFILE 次数，用于日志降噪 */
+/* 2026-11-07：关机时不再接受新请求，并等已有请求线程退完再让 main 释放 context。
+ *
+ * 为什么必须有：客户端线程是 pthread_detach 的，accept 循环退出后
+ * myds_server_start 立刻返回，而 main 紧接着调 myds_context_free(ctx)。
+ * 此时还在跑的请求线程会用已经释放的 ctx / chunk_workspace / prompt_engram_buf。
+ *
+ * 实测两种崩溃都由此而来（栈相同，只是最后几帧不同）：
+ *   既有：objc_release → myds_metal_buffer_free → v41_chunk_workspace_free
+ *   本仓 P0：myds_engram_decode_row → prepare_batch_step → v41_engram_async_main
+ * 判据：拿 P0 之前的二进制 7185c173 做同样操作，崩在同一位置
+ * ⇒ 不是某次改动引入的，是「关机不等在跑请求」这个结构缺陷。 */
+static _Atomic int g_draining;
 
 static unsigned max_client_threads(void) {
     static unsigned cached;
@@ -2335,6 +2347,42 @@ int myds_server_start(myds_context_t *ctx, const char *host, int port, const cha
     if (g_server_fd >= 0) {
         close(g_server_fd);
         g_server_fd = -1;
+    }
+
+    /* ★ 等在场请求退完，再让 main 释放 context。
+     *
+     * 默认等 120 s：32K prefill 要 ~50 s，262K 冷 prefill 要 ~12 min ——
+     * 后者等不完，所以给上限而不是无限等。超时就【不释放】context：
+     * 宁可泄漏、让进程退出时由内核回收，也不能在别的线程还在写的时候 free。
+     * 这就是原实现崩掉的那个场景。 */
+    atomic_store_explicit(&g_draining, 1, memory_order_release);
+    {
+        const char *env = getenv("MYDS_SHUTDOWN_DRAIN_S");
+        long wait_s = 120;
+        if (env && *env) { long v = strtol(env, NULL, 10); if (v >= 0 && v <= 3600) wait_s = v; }
+        const unsigned n0 = atomic_load_explicit(&g_client_threads, memory_order_acquire);
+        if (n0) {
+            MYDS_LOG_I("Shutdown: waiting for %u in-flight request(s) (up to %ld s; "
+                       "MYDS_SHUTDOWN_DRAIN_S overrides)", n0, wait_s);
+            const int64_t deadline_ms = (int64_t)wait_s * 1000;
+            int64_t waited = 0;
+            while (atomic_load_explicit(&g_client_threads, memory_order_acquire) != 0u) {
+                if (waited >= deadline_ms) break;
+                struct timespec ts = {0, 5 * 1000 * 1000};   /* 5 ms */
+                nanosleep(&ts, NULL);
+                waited += 5;
+            }
+            const unsigned n1 = atomic_load_explicit(&g_client_threads, memory_order_acquire);
+            if (n1) {
+                /* 超时：context 绝不能释放（还有线程在用）。进程马上退出，
+                 * 内核会回收全部内存；泄漏一份比 SIGSEGV 好。 */
+                MYDS_LOG_E("Shutdown: %u request(s) still running after %ld s ⇒ "
+                           "skipping context teardown (process exit reclaims memory)",
+                           n1, wait_s);
+                return 2;   /* 特殊返回值：调用方不得 free context */
+            }
+            MYDS_LOG_I("Shutdown: all request threads drained");
+        }
     }
 
     MYDS_LOG_I("Server stopped gracefully");

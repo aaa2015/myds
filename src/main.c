@@ -591,6 +591,14 @@ int main(int argc, char *argv[]) {
         myds_server_set_debug_provider(myds_debug_state_json, myds_debug_enabled,
                                        myds_debug_is_loopback, myds_debug_token_ok);
         int rc = myds_server_start(ctx, host, port, alias);
+        /* rc == 2 表示关机时还有请求线程没退完（见 myds_server_start 的 drain 段）。
+         * 那种情况下 ctx/model 里仍有线程在读写，绝不能 free —— 交给进程退出回收。
+         * 这是 2026-11-07 定位的那个崩溃：detach 的客户端线程 + 立即 free ctx。 */
+        if (rc == 2) {
+            MYDS_LOG_E("main: request threads still running at shutdown; "
+                       "leaving context/model allocated (process exit reclaims)");
+            return 0;
+        }
         myds_context_free(ctx);
         myds_model_free(model);
         return rc;
