@@ -15,12 +15,20 @@
     "p32k_ab__v2.txt"
   ],
   "docs": [
-    "docs/2026-11-03-trace-phase-breakdown.md",
+    {
+      "path": "docs/2026-11-03-trace-phase-breakdown.md",
+      "only_sections": [
+        "## 十一、",
+        "## 十二、",
+        "## 十三、"
+      ]
+    },
     {
       "path": "docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md",
       "only_sections": [
         "§143",
-        "§144"
+        "§144",
+        "§145"
       ]
     }
   ],
@@ -263,6 +271,285 @@
       "where": "§13.5 生产部署后实测",
       "prompt_file": null,
       "source": "synthetic: 生产 8187，21 tok prompt，解 256 tok",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 4.43,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§十二 逐段归因 / §143.2 段表",
+      "prompt_file": null,
+      "source": "synthetic: 21 tok prompt，解 200/256 tok，trace dtags",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 4.45,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§十二 逐段归因 / §143.2 段表",
+      "prompt_file": null,
+      "source": "synthetic: 21 tok prompt，解 200/256 tok，trace dtags",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 4.62,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§十二 逐段归因 / §143.2 段表",
+      "prompt_file": null,
+      "source": "synthetic: 21 tok prompt，解 200/256 tok，trace dtags",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 4.78,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§十二 逐段归因 / §143.2 段表",
+      "prompt_file": null,
+      "source": "synthetic: 21 tok prompt，解 200/256 tok，trace dtags",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 5.36,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§十二 逐段归因 / §143.2 段表",
+      "prompt_file": null,
+      "source": "synthetic: 21 tok prompt，解 200/256 tok，trace dtags",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 5.37,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§十二 逐段归因 / §143.2 段表",
+      "prompt_file": null,
+      "source": "synthetic: 21 tok prompt，解 200/256 tok，trace dtags",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 5.38,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§十二 逐段归因 / §143.2 段表",
+      "prompt_file": null,
+      "source": "synthetic: 21 tok prompt，解 200/256 tok，trace dtags",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 5.4,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§十二 逐段归因 / §143.2 段表",
+      "prompt_file": null,
+      "source": "synthetic: 21 tok prompt，解 200/256 tok，trace dtags",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 5.94,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§十二 逐段归因 / §143.2 段表",
+      "prompt_file": null,
+      "source": "synthetic: 21 tok prompt，解 200/256 tok，trace dtags",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 11.15,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§十二 逐段归因 / §143.2 段表",
+      "prompt_file": null,
+      "source": "synthetic: 21 tok prompt，解 200/256 tok，trace dtags",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 11.62,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§十二 逐段归因 / §143.2 段表",
+      "prompt_file": null,
+      "source": "synthetic: 21 tok prompt，解 200/256 tok，trace dtags",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 1.81,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§十二 逐段归因 / §143.2 段表",
+      "prompt_file": null,
+      "source": "synthetic: 21 tok prompt，解 200/256 tok，trace dtags",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 1.88,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§十二 逐段归因 / §143.2 段表",
+      "prompt_file": null,
+      "source": "synthetic: 21 tok prompt，解 200/256 tok，trace dtags",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 1.45,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§十二 逐段归因 / §143.2 段表",
+      "prompt_file": null,
+      "source": "synthetic: 21 tok prompt，解 200/256 tok，trace dtags",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 23.9,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§十二 逐段归因 / §143.2 段表",
+      "prompt_file": null,
+      "source": "synthetic: 21 tok prompt，解 200/256 tok，trace dtags",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 23.15,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§十二 逐段归因 / §143.2 段表",
+      "prompt_file": null,
+      "source": "synthetic: 21 tok prompt，解 200/256 tok，trace dtags",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 33.3,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§十二 逐段归因 / §143.2 段表",
+      "prompt_file": null,
+      "source": "synthetic: 21 tok prompt，解 200/256 tok，trace dtags",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 24.12,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§十二 逐段归因 / §143.2 段表",
+      "prompt_file": null,
+      "source": "synthetic: 21 tok prompt，解 200/256 tok，trace dtags",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 0.76,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§12.1 ATTN 随上下文增长",
+      "prompt_file": null,
+      "source": "同上，2 tok → 24,398 tok",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 0.371,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§145.3 语料差值",
+      "prompt_file": null,
+      "source": "corpus: 台账语料 vs 随机词，归一化 ms/token",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 0.235,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§145.3 engram 差值",
+      "prompt_file": null,
+      "source": "corpus: 同上",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 0.136,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§145.3 其余差值",
+      "prompt_file": null,
+      "source": "corpus: 同上",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 1.638,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§145.3 台账语料 ms/token",
+      "prompt_file": null,
+      "source": "corpus: 52.76 s / 32,214 tok",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 2.008,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§145.3 随机词 ms/token",
+      "prompt_file": null,
+      "source": "corpus: 73.47 s / 36,586 tok",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 2945.0,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§145.3 engram 台账语料",
+      "prompt_file": null,
+      "source": "corpus: MYDS_PROFILE_PREFILL Engram Prepare",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 11933.0,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§145.3 engram 随机词",
+      "prompt_file": null,
+      "source": "corpus: 同上",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 4363.0,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§145.1 engram io8 32K",
+      "prompt_file": null,
+      "source": "corpus: MYDS_PROFILE_PREFILL, io8",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 2708.0,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§145.1 engram io16 32K",
+      "prompt_file": null,
+      "source": "corpus: MYDS_PROFILE_PREFILL, io16",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 1655.0,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§145.1 engram 差",
+      "prompt_file": null,
+      "source": "corpus: 4363-2708",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 1662.0,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§145.1 总 prefill 差",
+      "prompt_file": null,
+      "source": "corpus: 51.918s-50.256s",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 200.0,
+      "unit": "ms",
+      "kind": "latency",
+      "where": "§145.1 powermetrics 采样口径",
+      "prompt_file": null,
+      "source": "tool",
       "comparable_to_ledger_105": false
     }
   ]

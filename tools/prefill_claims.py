@@ -22,7 +22,12 @@ import re
 from pathlib import Path
 
 TOL = 0.05
-TPS_RE = re.compile(r"(\d+(?:\.\d+)?)\s*t/s")
+# 两类单位分开匹配：t/s 的容差是 0.05，ms 的容差是 0.5。
+# 只查 t/s 是不够的 —— §145 的载荷数字全在 ms 里（4363/2708/1655/1662），
+# 只查 t/s 会让那一节「通过」得毫无意义。
+# 允许千分位逗号：文档里写 "4,363 ms"，不加这条正则会把 655 当成独立数值。
+UNIT_RE = re.compile(r"(\d[\d,]*(?:\.\d+)?)\s*(t/s|ms)\b")
+UNIT_TOL = {"t/s": 0.05, "ms": 0.5}
 
 
 def _sha256(p):
@@ -84,7 +89,10 @@ def validate(registry, root, corpus=None):
     # 那些历史数字按各自冻结身份解读，不该被新规则追溯。真正要管的是
     # 「今天新写的结论」，所以按小节圈定检查范围 —— 但一旦圈定，那一节里
     # 每个数都必须有出处。
-    values = [float(c["value"]) for c in claims]
+    # 按单位分组：一个 claim 只在它声明的单位里参与比对
+    values = {}
+    for c in claims:
+        values.setdefault(c.get("unit", "t/s"), []).append(float(c["value"]))
     for entry in registry.get("docs", []):
         if isinstance(entry, str):
             path, only = entry, None
@@ -101,7 +109,8 @@ def validate(registry, root, corpus=None):
             # 每节从 "## §143" / "## §144" 这样的标题起，到下一个同级标题止
             regions = []
             for tag in only:
-                m = re.search(r"^## " + re.escape(tag) + r"\b", text, re.M)
+                pat = tag if tag.startswith("## ") else "## " + tag
+                m = re.search(r"^" + re.escape(pat) + r"\b", text, re.M)
                 if not m:
                     fails.append(f"{path} 里找不到小节 {tag}（登记的 only_sections 过期了？）")
                     continue
@@ -112,13 +121,15 @@ def validate(registry, root, corpus=None):
         seen = {}
         for lo, hi in regions:
             chunk = text[lo:hi]
-            for m in TPS_RE.finditer(chunk):
-                v = float(m.group(1))
-                seen.setdefault(round(v, 2), lo + m.start())
-        for v, pos in sorted(seen.items()):
-            if not any(abs(v - rv) <= TOL for rv in values):
+            for m in UNIT_RE.finditer(chunk):
+                v, unit = float(m.group(1).replace(",", "")), m.group(2)
+                seen.setdefault((unit, round(v, 2)), lo + m.start())
+        for (unit, v), pos in sorted(seen.items()):
+            pool = values.get(unit, [])
+            tol = UNIT_TOL.get(unit, TOL)
+            if not any(abs(v - rv) <= tol for rv in pool):
                 line = text[:pos].count("\n") + 1
-                fails.append(f"{path}:{line} 出现 {v} t/s 但寄存器里没有对应记录")
+                fails.append(f"{path}:{line} 出现 {v} {unit} 但寄存器里没有对应记录")
 
     notes.append(f"{len(claims)} 条 claim，{len(by_file)} 个语料文件，"
                  f"{len(registry.get('docs', []))} 篇文档")
