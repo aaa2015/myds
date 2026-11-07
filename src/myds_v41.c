@@ -7162,6 +7162,77 @@ static inline bool myds_v41_should_flush_moe_batch(
     return (moe_off == moe_batch || next_rem == 0u || moe_off + next_chunk_max > moe_batch);
 }
 
+
+/* ── prefill 的 engram 准备放到后台（MYDS_ENGRAM_PREFILL_ASYNC，默认开）──
+ *
+ * 为什么：2026-11-07 实测 32K prompt 的 Engram Prepare 要 2,708 ms（io16），
+ * 而它跑在【任何 GPU 工作之前】—— 这 2.7 s GPU 完全空闲。powermetrics 覆盖全程
+ * 只有 99.1% 的采样驻留 ≥99%，低的全部落在开头这一段。
+ *
+ * 做法：一个后台线程按顺序跑原来的 engram 循环，主线程立刻进入 chunk 循环。
+ * 依赖只有一处：il==1 要表 0 的 [c_start, c_start+c_len) 就绪，il==14 要表 1
+ * 的同区间就绪 —— 而两张表的同一区间是【同一次调用】产出的，所以一个进度计数器
+ * 就够。
+ *
+ * ★ 一个不能漏的隐藏依赖：snapshot_store_engram 在循环里写 g->snap_staged_pos[s]，
+ *   而层循环里的 snapshot_store_window 靠 `snap_staged_pos[s] != p` 决定是否跳过。
+ *   后台线程若落后，那条 KV 快照会被【静默丢弃】—— 不影响数值，但会丢前缀缓存。
+ *   所以最后一层之前必须等全量完成（实测那时早已完成，不增加延迟）。
+ *
+ * 0-ULP：engram 的取值、顺序、归约都没变，只是从「同步跑」变成「并发跑」。
+ * 线程只写 engram_all[0/1] 与 g->snap_*，主线程在 wait 点之前不读这些地址。 */
+typedef struct {
+    myds_v41_context_t *g;
+    myds_context_t     *ctx;
+    const int32_t      *tokens;
+    uint32_t            mb_start, mb_len, mb_base_pos, n_tokens;
+    const uint32_t     *s_clamped_39;
+    float              *out0, *out1;      /* engram_all[0] / engram_all[1] */
+    volatile int        progress;         /* 已产出的 token 数（含 0..progress-1） */
+    volatile int        failed;
+    volatile int        cancelled;
+    int                 enabled;          /* suffix_shrink 等条件下由调用方决定 */
+} v41_engram_async_t;
+
+static void *v41_engram_async_main(void *arg) {
+    v41_engram_async_t *a = (v41_engram_async_t *)arg;
+    for (uint32_t t = 0; t < a->mb_len; ) {
+        if (a->cancelled) break;          /* fail/cancel 路径要立刻退出，别让 join 卡满全量 */
+        const uint32_t pos = a->mb_base_pos + t;
+        uint32_t step = a->mb_len - t;
+        const uint32_t next_snap = ((pos / V41_SNAP_STRIDE) + 1u) * V41_SNAP_STRIDE;
+        if (next_snap - pos < step) step = next_snap - pos;
+        if (step > 64u) step = 64u;
+        if (!myds_engram_prepare_batch(a->g->engram, a->tokens + a->mb_start + t, step,
+                (uint64_t)pos,
+                a->out0 + (size_t)t * MYDS_ENGRAM_INPUT_DIM,
+                a->out1 + (size_t)t * MYDS_ENGRAM_INPUT_DIM)) {
+            MYDS_LOG_E("V4.1 engram prepare failed at pos %u (async)", pos);
+            a->failed = 1;
+            break;
+        }
+        const uint32_t sp_eng = pos + step;
+        if (!a->enabled || sp_eng > *a->s_clamped_39)
+            snapshot_store_engram(a->g, sp_eng, (a->mb_start + t + step) == a->n_tokens);
+        t += step;
+        __atomic_store_n(&a->progress, (int)t, __ATOMIC_RELEASE);
+    }
+    if (a->failed) __atomic_store_n(&a->progress, -1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+/* 等到 progress >= need。返 0 成功，-1 线程失败/被取消。 */
+static int v41_engram_async_wait(v41_engram_async_t *a, uint32_t need) {
+    for (;;) {
+        int p = __atomic_load_n(&a->progress, __ATOMIC_ACQUIRE);
+        if (p < 0) return -1;
+        if ((uint32_t)p >= need) return 0;
+        if (a->cancelled) return -1;
+        struct timespec ts = {0, 200000};   /* 200 µs：够细，又不用忙等 */
+        nanosleep(&ts, NULL);
+    }
+}
+
 int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                             uint32_t n_tokens, volatile int *cancel_flag) {
     /* MYDS_PROFILE_ALLOC=1：只给「入口 → 层循环」这段未计时区加打点。
@@ -7416,6 +7487,12 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         (float *)myds_metal_buffer_data(prompt_engram_buf[0]),
         (float *)myds_metal_buffer_data(prompt_engram_buf[1])
     };
+    /* 后台 engram 线程的状态必须活在函数作用域：fail/cancelled 两条退出路径都要
+     * 先 join 再释放 prompt_engram_buf，否则线程会往已释放的缓冲里写。 */
+    v41_engram_async_t eng_async;
+    bool               eng_async_on = false;
+    pthread_t          eng_async_th;
+    memset(&eng_async, 0, sizeof(eng_async));
 
     if (!prompt_res || !prompt_pre || !prompt_selected || !prompt_block_mask ||
         !engram_all[0] || !engram_all[1] || !cw) {
@@ -7689,30 +7766,66 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 
         phase = "engram prepare";
         TIME_START();
-        for (uint32_t t = 0; t < mb_len; ) {
-            /* 探针也要覆盖 engram 准备段：它是 prefill 里最先跑的一段，
-             * 大 prompt 下单这一段的耗时就能到秒级，不探就只能等它跑完。 */
-            if (cancel_flag && !*cancel_flag && ctx->liveness_probe &&
-                !ctx->liveness_probe(ctx->liveness_probe_data)) {
-                *cancel_flag = 1;
+        /* 2026-11-07（P0）：这一段原先同步跑完才进 chunk 循环，32K prompt 要 2.7 s，
+         * 期间 GPU 完全空闲。默认改为后台线程（MYDS_ENGRAM_PREFILL_ASYNC=0 可回退）。
+         * 同步路径保留原样，两条路走同一段逻辑，便于 A/B 与回退。 */
+        static int engram_async_env = -1;
+        if (engram_async_env < 0) {
+            const char *e = getenv("MYDS_ENGRAM_PREFILL_ASYNC");
+            engram_async_env = (!e || atoi(e) != 0) ? 1 : 0;
+        }
+        /* 上一个 macroblock 的线程可能还在跑（>106K 的 prompt 有多个 macroblock）。
+         * 必须先 join 再复用 eng_async 结构 —— 否则旧线程会往新结构里写进度，
+         * 并且 eng_async_th 被覆盖后永远 join 不到，等于线程泄漏。 */
+        if (eng_async_on) {
+            pthread_join(eng_async_th, NULL);
+            if (eng_async.failed) goto fail_hint_engram;
+            eng_async_on = false;
+        }
+        eng_async_on = false;
+        if (engram_async_env && mb_len > 256u) {
+            memset(&eng_async, 0, sizeof(eng_async));
+            eng_async.g = g; eng_async.ctx = ctx;
+            eng_async.tokens = tokens;
+            eng_async.mb_start = mb_start; eng_async.mb_len = mb_len;
+            eng_async.mb_base_pos = mb_base_pos; eng_async.n_tokens = n_tokens;
+            eng_async.s_clamped_39 = &s_clamped_39;
+            eng_async.out0 = engram_all[0]; eng_async.out1 = engram_all[1];
+            eng_async.enabled = suffix_shrink;
+            eng_async.progress = 0;
+            if (pthread_create(&eng_async_th, NULL, v41_engram_async_main, &eng_async) == 0) {
+                eng_async_on = true;
+                MYDS_LOG_I("prefill engram async: background thread started (%u tokens)", mb_len);
+            } else {
+                MYDS_LOG_W("prefill engram async: pthread_create failed, falling back to sync");
             }
-            if (cancel_flag && *cancel_flag) goto cancelled;
-            const uint32_t pos = mb_base_pos + t;
-            uint32_t step = mb_len - t;
-            const uint32_t next_snap = ((pos / V41_SNAP_STRIDE) + 1u) * V41_SNAP_STRIDE;
-            if (next_snap - pos < step) step = next_snap - pos;
-            if (step > 64u) step = 64u;
-            if (!myds_engram_prepare_batch(g->engram, tokens + mb_start + t, step, (uint64_t)pos,
-                    engram_all[0] + (size_t)t * MYDS_ENGRAM_INPUT_DIM,
-                    engram_all[1] + (size_t)t * MYDS_ENGRAM_INPUT_DIM)) {
-                MYDS_LOG_E("V4.1 engram prepare failed at pos %u", pos);
-                goto fail;
+        }
+        if (!eng_async_on) {
+            for (uint32_t t = 0; t < mb_len; ) {
+                /* 探针也要覆盖 engram 准备段：它是 prefill 里最先跑的一段，
+                 * 大 prompt 下单这一段的耗时就能到秒级，不探就只能等它跑完。 */
+                if (cancel_flag && !*cancel_flag && ctx->liveness_probe &&
+                    !ctx->liveness_probe(ctx->liveness_probe_data)) {
+                    *cancel_flag = 1;
+                }
+                if (cancel_flag && *cancel_flag) goto cancelled;
+                const uint32_t pos = mb_base_pos + t;
+                uint32_t step = mb_len - t;
+                const uint32_t next_snap = ((pos / V41_SNAP_STRIDE) + 1u) * V41_SNAP_STRIDE;
+                if (next_snap - pos < step) step = next_snap - pos;
+                if (step > 64u) step = 64u;
+                if (!myds_engram_prepare_batch(g->engram, tokens + mb_start + t, step, (uint64_t)pos,
+                        engram_all[0] + (size_t)t * MYDS_ENGRAM_INPUT_DIM,
+                        engram_all[1] + (size_t)t * MYDS_ENGRAM_INPUT_DIM)) {
+                    MYDS_LOG_E("V4.1 engram prepare failed at pos %u", pos);
+                    goto fail;
+                }
+                const uint32_t sp_eng = pos + step;
+                if (!suffix_shrink || sp_eng > s_clamped_39) {
+                    snapshot_store_engram(g, sp_eng, (mb_start + t + step) == n_tokens);
+                }
+                t += step;
             }
-            const uint32_t sp_eng = pos + step;
-            if (!suffix_shrink || sp_eng > s_clamped_39) {
-                snapshot_store_engram(g, sp_eng, (mb_start + t + step) == n_tokens);
-            }
-            t += step;
         }
         TIME_ACC(prof_engram);
 
@@ -7782,6 +7895,14 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         for (il = 0; il < V41_LAYERS; il++) {
             if (cancel_flag && *cancel_flag) goto cancelled;
             const myds_layer_t *base = &m->layers[il];
+            /* 最后一层之前必须等 engram 线程全部产出：层循环里的 snapshot_store_window
+             * 靠 snap_staged_pos[s] 判断是否跳过，落后就会【静默丢 KV 快照】。
+             * 实测 30 层时 engram 早已完成，这条 wait 不增加延迟，只是把顺序变成显式的。 */
+            if (eng_async_on && il + 1u >= V41_LAYERS &&
+                v41_engram_async_wait(&eng_async, mb_len) != 0) {
+                MYDS_LOG_E("prefill engram async failed before the last layer");
+                goto fail;
+            }
             const v41_layer_t *l = &v->layers[il];
             const bool compressed = ratio_for(il) != 0;
             moe_off = 0;
@@ -7902,6 +8023,14 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 
                 if (il == 1 || il == 14) {
                     uint32_t e = (il == 1 ? 0 : 1);
+                    /* 后台线程按 token 顺序产出，两张表同一 token 一起出来 ⇒
+                     * 一个进度计数器同时覆盖 il==1 与 il==14。 */
+                    if (eng_async_on &&
+                        v41_engram_async_wait(&eng_async, c_start + c_len) != 0) {
+                        MYDS_LOG_E("prefill engram async failed before layer %u chunk %u",
+                                   il, c_start);
+                        goto fail;
+                    }
                     CHECK(myds_metal_buffer_update_sub_view(cw->cur_engram_view[e], prompt_engram_buf[e],
                         (size_t)c_start * MYDS_ENGRAM_INPUT_DIM * sizeof(float),
                         (size_t)c_len * MYDS_ENGRAM_INPUT_DIM * sizeof(float)));
@@ -8878,6 +9007,14 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         fflush(stdout);
     }
 
+    /* 正常路径：本 macroblock 的 engram 线程收尾。到 il==14 就已经等过全量，
+     * 所以这里通常立刻返回；join 只是把资源与错误状态收干净。 */
+    if (eng_async_on) {
+        pthread_join(eng_async_th, NULL);
+        if (eng_async.failed) { eng_async_on = false; goto fail_hint_engram; }
+        eng_async_on = false;
+    }
+
     ctx->pos = base_pos + n_tokens;
     g->next_position = ctx->pos;
     g->valid = true;
@@ -8893,10 +9030,15 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     return 1;
 
 cancelled:
+    if (eng_async_on) { eng_async.cancelled = 1; pthread_join(eng_async_th, NULL); eng_async_on = false; }
     (void)myds_metal_commit_batch();
     return -2;
 
+fail_hint_engram:
+    MYDS_LOG_E("V4.1 prefill aborted: background engram thread failed");
 fail:
+    /* ★ 必须先 join 再 free：线程写的是 prompt_engram_buf，下面第 7、8 行会释放它。 */
+    if (eng_async_on) { eng_async.cancelled = 1; pthread_join(eng_async_th, NULL); eng_async_on = false; }
     MYDS_LOG_E("V4.1 prefill failed at layer %u: %s", il, phase);
     (void)myds_metal_commit_batch();
     g->valid = false;

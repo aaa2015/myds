@@ -36,6 +36,9 @@ ARMS = {
     # 同一二进制（HEAD f0fb04e 的父 a897cec 之后无 C 侧改动），只差一个环境变量。
     "io8_server.log":      ("f0fb04e MYDS_ENGRAM_IO_THREADS=8",  "p32k_ab__v0.txt", "7185c1735f462aef"),
     "io16_server.log":     ("f0fb04e MYDS_ENGRAM_IO_THREADS=16", "p32k_ab__v0.txt", "7185c1735f462aef"),
+    # 2026-11-07 §146：P0 后台线程，默认开；这里两臂只差 MYDS_ENGRAM_PREFILL_ASYNC。
+    "p0sync_server.log":   ("§146 sync  MYDS_ENGRAM_PREFILL_ASYNC=0", "p32k_ab__v0.txt", "a79b410a12f179df"),
+    "p0async_server.log":  ("§146 async MYDS_ENGRAM_PREFILL_ASYNC=1", "p32k_ab__v0.txt", "a79b410a12f179df"),
 }
 
 # 冒烟探针（X-Myds-Warmup）不是测量，剔掉。

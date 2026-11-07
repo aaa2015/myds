@@ -28,7 +28,8 @@
       "only_sections": [
         "§143",
         "§144",
-        "§145"
+        "§145",
+        "§146"
       ]
     }
   ],
@@ -550,6 +551,33 @@
       "where": "§145.1 powermetrics 采样口径",
       "prompt_file": null,
       "source": "tool",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 641.7,
+      "unit": "t/s",
+      "kind": "throughput",
+      "where": "§146.2 sync 臂（32K）",
+      "prompt_file": "p32k_ab__v0.txt",
+      "source": "corpus: results/p0_sync，服务端自报 50.2 s",
+      "comparable_to_ledger_105": true
+    },
+    {
+      "value": 679.4,
+      "unit": "t/s",
+      "kind": "throughput",
+      "where": "§146.2 async 臂（32K）",
+      "prompt_file": "p32k_ab__v0.txt",
+      "source": "corpus: results/p0_async，服务端自报 47.4 s",
+      "comparable_to_ledger_105": true
+    },
+    {
+      "value": 512.4,
+      "unit": "t/s",
+      "kind": "throughput",
+      "where": "§146.6 128K 双 macroblock",
+      "prompt_file": null,
+      "source": "synthetic: big128k，126,994 token，2 个 macroblock",
       "comparable_to_ledger_105": false
     }
   ]
