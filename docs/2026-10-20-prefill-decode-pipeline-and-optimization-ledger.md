@@ -18944,14 +18944,46 @@ make check-knob-pairing CONF=~/Projects/myfleet/myds.conf
 改用 `install`（换 inode）后正常。**这条 AGENTS.md 里已有，我还是踩了** ——
 说明「写进文档」不等于「形成反射」，这类操作应当只在脚本里做，手工路径不该存在。
 
-### 156.7 状态
+### 156.7 首次实战：用新脚本部署（2026-11-07 18:42）
+
+`34d3cf27` 通过 `tools/deploy_artifact.sh` 上线（第一次走带配对门的新脚本）：
+
+| 项 | 值 |
+|---|---|
+| `bin/myds` | **`34d3cf279773f2f2`** |
+| knob 指纹 | `2eb230c432b55c5e`（源码侧一致） |
+| 生产 | PID 76747，18:41:53 启动，`/health` ok |
+| 备份 | `bin/.prev-20261107-184139/` + **`myds.conf.bak-20261107-184139`**（成对首次） |
+
+部署后冒烟：
+
+| 项 | 部署前 | 部署后 |
+|---|---|---|
+| decode 256 tok（21 tok prompt） | 42.9 t/s | **42.9 t/s ×3** |
+| 32K 冷 prefill | 679.0 t/s | **679.0 t/s** |
+| 28.4K 上下文 decode | 39.0 t/s | **39.0 t/s** |
+
+**三项全部无变化** —— 符合预期：`34d3cf27` 相对 `e6d2a1a0` 只多了指纹功能与生成表重生成，
+不触碰任何推理路径。
+
+### 156.8 顺带同步了 macstudio 的源码检出
+
+远端原停在 `ec86430`（11-02），`knobs_generated.h` 只有 251 个 knob（当前 260）。
+`git pull --ff-only` 到 `9a26b5a1` 之后，远端 `python3 tools/knob_fingerprint.py --check`
+也能自查并通过（260 个 knob，77 个 conf 键全认识）。
+
+**注意**：拉取前必须删掉手工 scp 过去的 `tools/knob_fingerprint.py`（未跟踪文件，
+git 拒绝覆盖）。这也是「手工传文件」与「走脚本」混用的代价。
+
+### 156.9 状态
 
 | 项 | 状态 |
 |---|---|
-| `myds --knob-fingerprint` | 已实现 |
-| `tools/knob_fingerprint.py` | 已实现（三种用法 + 反向验证通过） |
+| `myds --knob-fingerprint` | 已实现并部署 |
+| `tools/knob_fingerprint.py` | 已实现（三种用法 + 反向验证） |
 | `make check-knob-pairing` | 已加 |
-| `deploy_artifact.sh` 门 | 已加（含 dry-run 与 conf 备份） |
-| 生产 | 未因本节改动重启；PID 64354 仍跑 `e6d2a1a0`（旧 inode） |
-| 新产物 | `bin/myds` = `20a217c1`（含指纹功能，**未部署**） |
+| `deploy_artifact.sh` 门 | 已加（含 dry-run 与成对 conf 备份） |
+| 生产 | **`34d3cf27`**，PID 76747，`/health` ok |
+| macstudio 源码 | 已同步到 `9a26b5a1` |
+| 推理性能 | 三项冒烟全部与部署前一致 |
 
