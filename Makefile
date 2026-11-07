@@ -126,6 +126,8 @@ BENCH_METAL = $(BIN_DIR)/bench_metal
 BENCH_PHASE = $(BIN_DIR)/bench_phase
 SCORE = $(BIN_DIR)/score
 BENCH_KPROF = $(BIN_DIR)/bench_kprof
+# decode 的 engram 行读取：串行 vs 线程池。不加载模型，只按真实偏移读行。
+BENCH_ENGRAM_ROWS = $(BIN_DIR)/bench_engram_rows
 BENCH_ENGRAM_IO = $(BIN_DIR)/bench_engram_io
 DUMP_TENSORS = $(BIN_DIR)/dump_tensors
 METALLIB = $(BIN_DIR)/myds.metallib
@@ -512,6 +514,10 @@ $(BENCH_PHASE): $(OBJS_C) $(OBJS_M) $(BUILD_DIR)/bench_phase.o $(METALLIB) | $(B
 # running it loads a full model, so it must never be part of all/test.
 $(SCORE): $(OBJS_C) $(OBJS_M) $(BUILD_DIR)/score.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
+
+$(BENCH_ENGRAM_ROWS): tools/bench_engram_rows.c $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) $< $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o \
+		$(LDFLAGS) -o $@
 
 # Opt-in per-kernel GPU timing harness (serialized encoders; see tools/kprof_report.py).
 $(BENCH_KPROF): $(OBJS_C) $(OBJS_M) $(BUILD_DIR)/bench_kprof.o $(METALLIB) | $(BIN_DIR)
