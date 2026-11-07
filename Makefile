@@ -216,6 +216,11 @@ test-register-only-service-window:
 audit-ledger:
 	python3 -B tools/audit_ledger_105.py
 
+# 单独跑「哪些数可以和台账比」这一条。audit-ledger 已包含它；
+# 单独留一个入口是因为改文档里的吞吐数字时只想跑这一秒级的检查。
+claims-check:
+	python3 -B tools/prefill_claims.py
+
 # Every path, script and make target the docs tell a reader to run must exist.
 # Written after REPRODUCE-register-only.md spent weeks instructing readers to run
 # ~/Projects/myfleet/sync_myds.sh, which had been deleted -- a doc bug you can

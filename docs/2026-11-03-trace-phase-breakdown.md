@@ -280,3 +280,12 @@ decode 只在层内【没有并发作用域】的三处切（层开头、attenti
 
 **prefill 吞吐 A/B 必须用 `benchmarks/register_only_2026-10-27/prompts/` 里的语料，
 并标注文件名。** 用生成文本得到的数只能和自己比，不能和台账比，也不能拿来说明回归。
+
+这条已经变成机器检查，不再靠记性：
+
+- **寄存器** `benchmarks/prefill_claims.json` —— 本文件里出现的每个 `t/s` 字面量
+  都必须在册，且写明 `prompt_file` 与 `comparable_to_ledger_105`。
+- **检查器** `tools/prefill_claims.py` —— `comparable_to_ledger_105: true` 必须指到
+  `ledger_corpus` 里的文件，且 sha256 与 manifest 一致；没有语料文件却声称可比，
+  直接失败（就是上面那次误判的形状）。
+- **门** `make audit-ledger` —— 跑它就会跑上面两条，外加三个自测，确认检查器本身有牙。

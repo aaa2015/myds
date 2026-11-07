@@ -11,8 +11,14 @@ What remains here is only what a generator cannot produce:
   * invariants     — semantic conditions that make a run valid or void
   * freshness      — the committed tables equal what regeneration would produce
   * corpus         — the prompts on disk are the ones the manifest describes
+  * claims         — a number may only be compared to the ledger if it came from
+                    the same corpus file (see tools/prefill_claims.py)
 
 Run `make audit-ledger`. Exit 1 on any failure. Needs no GPU and no model.
+
+`prefill claims` 一节的来历：2026-11-07 我用生成的 prompt 测出 prefill ≈490 t/s，
+与台账的 618.9 相比得出「掉了 20%」，去二分提交 —— 同语料重测是 619.4。
+生成器管不了这件事，所以单独一条规则：**要能和台账比，必须指到台账那份语料。**
 """
 import json
 import statistics as st
@@ -125,6 +131,23 @@ def main():
     check("no extra prompt files beyond the manifest",
           sorted(man) == sorted(p.name for p in (BENCH / "prompts").glob("*.txt")),
           "manifest and directory disagree; run make corpus-check")
+
+    # ── prefill claims ──────────────────────────────────────────────────────
+    # 生成器能保证「表里的数等于原始行里的数」，但保证不了「这个数能不能和台账比」——
+    # 那取决于它用的是不是同一份语料。2026-11-07 就是在这里翻的车。
+    print("\nprefill claims (which numbers may be compared to the ledger)")
+    sys.path.insert(0, str(ROOT / "tools"))
+    import prefill_claims  # noqa: E402
+
+    claim_reg = json.loads((ROOT / "benchmarks" / "prefill_claims.json").read_text())
+    claim_fails, claim_notes = prefill_claims.validate(claim_reg, ROOT)
+    check("claims register is consistent with the docs", not claim_fails,
+          "; ".join(claim_fails[:4]))
+    for note in claim_notes:
+        print(f"         {note}")
+    st_fails = prefill_claims.self_test(ROOT)
+    check("the claim checker rejects a synthetic number marked comparable", not st_fails,
+          "; ".join(st_fails))
 
     total = len(fails)
     print(f"\n{total} failure(s)")

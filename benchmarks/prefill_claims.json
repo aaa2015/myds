@@ -1,0 +1,150 @@
+{
+  "schema": 1,
+  "why": [
+    "2026-11-07 我犯了这个错：用生成的英文随机词 prompt 测得 prefill ≈490 t/s，",
+    "与台账 §105 的 618.9 t/s 相比，得出「prefill 掉了 20%」的结论，并据此去二分提交。",
+    "同一份语料（p32k_ab__v0.txt，32,224 token）在同一个二进制上是 619.4 t/s —— 差 0.1%。",
+    "真正的差异来自 prompt 内容：同 token 数下生成文本比真实语料低 25%（MoE 路由没有局部性）。",
+    "所以一个数能不能和台账比，不是看它多可信，而是看它用的是不是台账那份语料。",
+    "这个寄存器就是让这件事无法忘记：comparable_to_ledger_105=true 必须指到语料文件。"
+  ],
+  "corpus_dir": "benchmarks/register_only_2026-10-27/prompts",
+  "ledger_corpus": [
+    "p32k_ab__v0.txt",
+    "p32k_ab__v1.txt",
+    "p32k_ab__v2.txt"
+  ],
+  "docs": [
+    "docs/2026-11-03-trace-phase-breakdown.md"
+  ],
+  "claims": [
+    {
+      "value": 40.0,
+      "kind": "decode",
+      "where": "§三 常开为什么不影响性能",
+      "prompt_file": null,
+      "source": "legacy: 常开观测开销的定性说法，无对应测量文件",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 41.5,
+      "kind": "decode",
+      "where": "§六 MYDS_PHASE_SPLIT 代价表（2026-11-06，macstudio）",
+      "prompt_file": null,
+      "source": "legacy: 556 token prompt，未记录语料文件",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 41.4,
+      "kind": "decode",
+      "where": "§六 MYDS_PHASE_SPLIT 代价表（2026-11-06，macstudio）",
+      "prompt_file": null,
+      "source": "legacy: 同上",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 40.83,
+      "kind": "decode",
+      "where": "§九 attention/decode 细分代价（2026-11-06）",
+      "prompt_file": null,
+      "source": "legacy: 8.4K token prompt，未记录语料文件",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 40.61,
+      "kind": "decode",
+      "where": "§九 attention/decode 细分代价（2026-11-06）",
+      "prompt_file": null,
+      "source": "legacy: 同上",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 490.0,
+      "kind": "prefill",
+      "where": "§十 口径警告 / §十一 复盘",
+      "prompt_file": null,
+      "source": "synthetic: 生成的英文随机词 prompt（22.8K / 39K token），不作为基线",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 479.9,
+      "kind": "prefill",
+      "where": "§十 A/B 结果表，base 臂",
+      "prompt_file": null,
+      "source": "synthetic: 22,800 token 英文随机词 prompt",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 490.5,
+      "kind": "prefill",
+      "where": "§十 A/B 结果表，new 臂",
+      "prompt_file": null,
+      "source": "synthetic: 同上（同一 prompt 文件，两臂可比）",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 490.8,
+      "kind": "prefill",
+      "where": "§十 new4 第四轮",
+      "prompt_file": null,
+      "source": "synthetic: 同上",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 38.3,
+      "kind": "decode",
+      "where": "§十 A/B 结果表，decode 一栏",
+      "prompt_file": null,
+      "source": "synthetic: 22.8K prompt + 32 token 输出",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 38.9,
+      "kind": "decode",
+      "where": "§十 A/B 结果表 / §十 怎么读",
+      "prompt_file": null,
+      "source": "synthetic: 同上",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 38.5,
+      "kind": "decode",
+      "where": "§十 A/B 结果表",
+      "prompt_file": null,
+      "source": "synthetic: 同上",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 38.8,
+      "kind": "decode",
+      "where": "§十 new4 / 怎么读",
+      "prompt_file": null,
+      "source": "synthetic: 同上",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 38.4,
+      "kind": "decode",
+      "where": "§十 怎么读",
+      "prompt_file": null,
+      "source": "synthetic: 同上",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 618.9,
+      "kind": "prefill",
+      "where": "§十一 决定性对照，台账 §105 一栏",
+      "prompt_file": "p32k_ab__v0.txt",
+      "source": "corpus: 台账 §105 原始测量（raw/rig.jsonl，32,210–32,225 token）",
+      "comparable_to_ledger_105": true
+    },
+    {
+      "value": 619.4,
+      "kind": "prefill",
+      "where": "§十一 决定性对照，HEAD b0b7b77 一栏",
+      "prompt_file": "p32k_ab__v0.txt",
+      "source": "corpus: 2026-11-07 08:06 实测，32,223 token，52.0 s",
+      "comparable_to_ledger_105": true
+    }
+  ]
+}
