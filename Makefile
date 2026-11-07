@@ -193,6 +193,13 @@ $(TEST_DEBUG_STATE): tests/test_debug_state.c src/myds_debugstate.c src/myds_deb
 check-knobs:
 	@python3 tools/knob_inventory.py --check
 
+# 二进制与 conf 的配对：knob 集合指纹必须一致，且 conf 里的每个键都要被认识。
+# 2026-11-07：旧二进制配新 conf 会以退出码 2 拒绝启动（不认识 MYDS_INDEXER_ROWS4_MIN），
+# 回滚只换二进制不换 conf 就会把服务打死。这条让配对数机器判据。
+check-knob-pairing: $(TARGET)
+	@python3 tools/knob_fingerprint.py --check $(TARGET) \
+		$(if $(CONF),--conf $(CONF),)
+
 # A byte-identity claim is undecidable without both versions (ledger §117).
 # Informational by default; CI or a deploy may pass EXPECT_CLANG/EXPECT_SDK.
 check-toolchain:

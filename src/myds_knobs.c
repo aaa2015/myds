@@ -170,3 +170,38 @@ int myds_knobs_report(unsigned mode_mask, bool verbose) {
     printf("\nVERDICT: PASS -- every MYDS_* variable set here has a reading site.\n");
     return 0;
 }
+
+/* ── knob 集合指纹（2026-11-07，§156）──────────────────────────────
+ *
+ * 为什么需要：二进制与 myds.conf 现在是【成对】的。旧二进制不认识
+ * MYDS_INDEXER_ROWS4_MIN，配新 conf 会拒绝启动（退出码 2），
+ * 而回滚时如果只换二进制不换 conf，服务就起不来 —— 2026-11-07 实测踩到两轮。
+ *
+ * 指纹 = 本 build 认识的【全部 knob 名字】按字节序排序后做 FNV-1a 64。
+ * 它只取决于 include/myds_knobs_generated.h，也就是只取决于源码，
+ * 与编译器/SDK 无关 —— 所以两台机器上同一源码必然得到同一个指纹。
+ *
+ * conf 侧的期望值由 tools/knob_fingerprint.py 从源码算出；部署脚本比对两者。
+ * 不相等就意味着「这份 conf 里有这个二进制不认识的键」，回滚前必须先对账。
+ */
+uint64_t myds_knobs_fingerprint(void) {
+    /* 名字先收集排序：生成表的顺序取决于源码扫描顺序，不能直接拿来算哈希。 */
+    static const char *names[1024];
+    size_t n = 0;
+    for (size_t i = 0; i < MYDS_KNOB_COUNT && n < sizeof(names)/sizeof(names[0]); ++i)
+        names[n++] = myds_knobs_generated[i].name;
+    /* 插入排序：260 个元素，且只在启动/CLI 用一次。 */
+    for (size_t i = 1; i < n; ++i) {
+        const char *key = names[i];
+        size_t j = i;
+        while (j > 0 && strcmp(names[j - 1], key) > 0) { names[j] = names[j - 1]; --j; }
+        names[j] = key;
+    }
+    uint64_t h = 1469598103934665603ULL;          /* FNV-1a offset basis */
+    for (size_t i = 0; i < n; ++i) {
+        for (const char *p = names[i]; *p; ++p) { h ^= (unsigned char)*p; h *= 1099511628211ULL; }
+        h ^= 0x1Fu; h *= 1099511628211ULL;         /* 分隔符，避免前缀混淆 */
+    }
+    h ^= (uint64_t)n; h *= 1099511628211ULL;       /* 计入个数 */
+    return h;
+}

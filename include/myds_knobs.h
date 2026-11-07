@@ -14,6 +14,7 @@
 
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 typedef struct {
     const char *name;      /* "MYDS_..." */
@@ -53,6 +54,16 @@ int myds_knobs_report(unsigned mode_mask, bool verbose);
  * never call this simply do not appear, which is still better than presenting
  * the raw string as though it were the value actually in force. */
 void myds_knobs_record_effective(const char *name, const char *resolved);
+/* 本 build 认识的 knob 名字集合的 FNV-1a 64 指纹。
+ *
+ * 二进制与 myds.conf 现在是成对的：旧二进制不认新键会拒绝启动（退出码 2），
+ * 所以回滚时只换二进制会把服务打死。这个指纹让「配对」可机器判定：
+ * 部署脚本用 tools/knob_fingerprint.py 从源码算出期望值，与 `myds --knob-fingerprint`
+ * 的输出比对；不相等就说明 conf 里有这个二进制不认识的键。
+ *
+ * 只取决于源码（knobs_generated.h），与编译器/SDK 无关。 */
+uint64_t myds_knobs_fingerprint(void);
+
 int myds_knobs_effective_count(void);
 const char *myds_knobs_effective(const char *name);
 

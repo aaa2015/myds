@@ -18863,3 +18863,95 @@ struct v41_chunk_workspace_s {
 | 生产 | PID 64354，`/health` ok |
 | 本地产物 | `bin/myds` = `e6d2a1a0`（与生产一致） |
 
+## §156 二进制/conf 配对检查：knob 集合指纹（2026-11-07 18:25）
+
+### 156.1 为什么需要
+
+§155.2 记了一条实测踩到的坑：**旧二进制配新 conf 会拒绝启动**。
+
+```
+[ERROR] config: MYDS_INDEXER_ROWS4_MIN=8192 没有任何代码读取
+[ERROR] 拒绝启动：配置门禁未通过（退出码 2）
+```
+
+配置门禁拦得对，但后果是：**回滚时只换二进制不换 conf，服务就起不来。**
+两次 START_FAILED 之后我才意识到「二进制与 conf 现在是成对的」。
+
+原来的 `deploy_artifact.sh` 只保证「两端产物 sha 一致」，不保证「产物与 conf 相容」。
+
+### 156.2 判据：knob 集合指纹
+
+```
+指纹 = 本 build 认识的【全部 knob 名字】按字节序排序后的 FNV-1a 64
+```
+
+- **只取决于 `include/myds_knobs_generated.h`**，也就是只取决于源码
+- **与编译器 / SDK 无关** —— 同一源码在任何机器上都是同一个值（§117 的教训：
+  逐字节产物相同依赖工具链一致，但 knob 集合不依赖）
+
+两侧独立实现，必须逐位一致：
+
+| 侧 | 位置 |
+|---|---|
+| 二进制 | `myds --knob-fingerprint`（`src/myds_knobs.c:myds_knobs_fingerprint`） |
+| 源码 | `tools/knob_fingerprint.py --expect` |
+
+当前值：**`2eb230c432b55c5e`**，260 个 knob。两侧一致。
+
+### 156.3 三道用法
+
+```bash
+# 1) 只算源码侧期望值
+python3 tools/knob_fingerprint.py --expect
+
+# 2) 产物 vs 源码（产物是不是当前源码构建的）
+python3 tools/knob_fingerprint.py --check bin/myds
+
+# 3) 再加 conf 兼容性（conf 里的每个键是否都被这个二进制认识）
+python3 tools/knob_fingerprint.py --check bin/myds --conf ~/Projects/myfleet/myds.conf
+
+# make 目标
+make check-knob-pairing CONF=~/Projects/myfleet/myds.conf
+```
+
+### 156.4 接入部署脚本
+
+`tools/deploy_artifact.sh` 在**传送之前**新增一步「🔐 二进制 / conf 配对检查」，
+不通过就 `exit 1`，不传、不重启。同时：
+
+- **备份远端 conf**（`myds.conf.bak-<时间戳>`）—— 之前只备份产物，回滚时缺一半
+- dry-run 也跑这道门（只读，不改远端）
+
+### 156.5 三处实测验证
+
+| 场景 | 结果 |
+|---|---|
+| 新二进制 + 当前 conf | ✅ 指纹一致，74 个键全部认识 |
+| **老二进制（`adeb1f4e`）** | ❌ `不认识 --knob-fingerprint ⇒ 它比当前源码旧` —— **比指纹不等更直接的信号** |
+| 新二进制 + 故意加一个假的 `MYDS_THIS_KEY_DOES_NOT_EXIST` | ❌ `其中 1 个这个二进制不认识 —— 它会拒绝启动` |
+
+### 156.6 顺带查出两件真事
+
+**① macstudio 的源码检出停在 `ec86430`（11-02），而生产二进制是 11-07 构建的。**
+
+`git log --oneline -1` = `ec86430`，`knobs_generated.h` 里只有 251 个 knob（当前源码 260）。
+**源码与产物早已分叉**，正是溯源要防的那类问题。手工部署时没走 deploy 脚本，所以没被拦住。
+现在跑 `knob_fingerprint.py --check` 就会立刻报出来。
+
+**② 又一次踩到「覆盖写入正在运行的可执行文件会被 SIGKILL」。**
+
+用 `cp` 覆盖 macstudio 上正在运行的 `bin/myds` 之后，新二进制一执行就 `rc=137`（SIGKILL）。
+改用 `install`（换 inode）后正常。**这条 AGENTS.md 里已有，我还是踩了** ——
+说明「写进文档」不等于「形成反射」，这类操作应当只在脚本里做，手工路径不该存在。
+
+### 156.7 状态
+
+| 项 | 状态 |
+|---|---|
+| `myds --knob-fingerprint` | 已实现 |
+| `tools/knob_fingerprint.py` | 已实现（三种用法 + 反向验证通过） |
+| `make check-knob-pairing` | 已加 |
+| `deploy_artifact.sh` 门 | 已加（含 dry-run 与 conf 备份） |
+| 生产 | 未因本节改动重启；PID 64354 仍跑 `e6d2a1a0`（旧 inode） |
+| 新产物 | `bin/myds` = `20a217c1`（含指纹功能，**未部署**） |
+

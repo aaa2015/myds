@@ -142,6 +142,7 @@ static void print_usage(const char *prog) {
     printf("  --print-config [-v]     Report which MYDS_* keys this build reads;\n");
     printf("                          exit 2 if any set key is read by nothing\n");
     printf("  --dump-config <path>    Write the effective MYDS_* environment to a file\n");
+    printf("  --knob-fingerprint      Print this build's knob-name set fingerprint\n");
 }
 
 static inline double myds_now_s(void) {
@@ -280,6 +281,12 @@ int main(int argc, char *argv[]) {
      * 配置声称开、实际全关。这类错误不会报错，只会安静地改掉对照实验的前提。
      * 未知键一律 exit 2，让它进 CI 门而不是进复盘文档。 */
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--knob-fingerprint") == 0) {
+            /* 只打印指纹，不加载模型、不读 conf。部署脚本用它判断
+             * 「这份 conf 里的键，这个二进制是否都认识」。 */
+            printf("%016llx\n", (unsigned long long)myds_knobs_fingerprint());
+            return 0;
+        }
         if (strcmp(argv[i], "--print-config") != 0) continue;
         bool verbose = false;
         for (int j = 1; j < argc; j++)

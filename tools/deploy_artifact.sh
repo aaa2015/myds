@@ -70,10 +70,27 @@ if [[ -n "$(git status --porcelain -- src include Makefile 2>/dev/null)" ]]; the
     [[ $DRY_RUN -eq 1 ]] || sleep 10
 fi
 
+# ── 1.5) 二进制 / conf 配对检查（2026-11-07 教训）───────────────────
+# 二进制与 myds.conf 现在是成对的：旧二进制不认识新键（如 MYDS_INDEXER_ROWS4_MIN）
+# 会以退出码 2 拒绝启动，而回滚时若只换二进制不换 conf，服务就起不来 —— 实测踩了两轮。
+# 这里用 knob 集合指纹把「配对」变成机器判据：
+#   · 本地产物 vs 本地源码   —— 指纹必须一致，否则产物不代表当前源码
+#   · 现有 conf 的每个键      —— 必须都被这份产物认识，否则启动即失败
+echo
+echo "🔐 二进制 / conf 配对检查"
+if ! python3 "$MYDS_SRC/tools/knob_fingerprint.py" --check "$MYDS_SRC/bin/myds" \
+        --conf "$HOME/Projects/myfleet/myds.conf"; then
+    echo "❌ 配对检查未通过 —— 不要部署。" >&2
+    echo "   若确实是「源码落后于产物」：先在源码侧 git pull && make。" >&2
+    echo "   若确实是「conf 里有多余的键」：先改 conf 或回滚 conf 与二进制。" >&2
+    exit 1
+fi
+
 if [[ $DRY_RUN -eq 1 ]]; then
     echo
     echo "🔍 dry-run：将 rsync ${ARTIFACTS[*]} → ${REMOTE_HOST}:${REMOTE_MYDS}/bin/"
     echo "   （会先备份为 bin/.prev-<时间戳>/）"
+    echo "   （同时备份远端 conf 为 myds.conf.bak-<时间戳>，回滚时必须成对回滚）"
     [[ $DO_RESTART -eq 1 ]] && echo "   然后 ssh ${REMOTE_HOST} 'cd ${FLEET_DIR} && ./start_fleet.sh'"
     exit 0
 fi
@@ -87,6 +104,9 @@ ssh "$REMOTE_HOST" "cd '$REMOTE_MYDS' && mkdir -p '$PREV_DIR' && \
     for f in ${ARTIFACTS[*]}; do [ -f \"\$f\" ] && cp -p \"\$f\" '$PREV_DIR/' || true; done; \
     ls -1 '$PREV_DIR' | wc -l | tr -d ' '" | \
     xargs -I{} echo "   已备份 {} 个文件"
+# ★ conf 必须与二进制成对回滚：旧二进制不认识新键会拒绝启动。
+ssh "$REMOTE_HOST" "cp -p '$FLEET_DIR/myds.conf' '$FLEET_DIR/myds.conf.bak-${STAMP}'" \
+    && echo "   已备份远端 conf → myds.conf.bak-${STAMP}"
 
 # ── 3) 传送 ────────────────────────────────────────────────────────
 echo "🚚 传送产物 → ${REMOTE_HOST}:${REMOTE_MYDS}/bin/"
