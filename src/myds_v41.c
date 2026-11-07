@@ -4606,6 +4606,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
             };
             myds_metal_barrier_buffers(attn_low_deps, 2);
         }
+        DEC_FINE(MYDS_PH_TAG_DEC_ATTN_OUT);
         if (ordinary_decode_allowed && need_logits && !trace_on &&
             base->attn_output_b_type==GGML_TYPE_Q4_K && myds_metal_dense_q4_v41_enabled()) {
             CHECK(myds_metal_dense_q4_v41(ctx->attn_out,base->attn_output_b,ctx->attn_low,V41_DIM,8192,true));

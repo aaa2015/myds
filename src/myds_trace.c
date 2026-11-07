@@ -563,7 +563,7 @@ const char *myds_trace_page_html(void) {
 "const p=rec.phases,d=rec.detail||{};"
 "const nn=v=>(v===null||v===undefined||v<0)?null:v;"
 "const sub=(a,b)=>(a!==null&&b!==null)?Math.max(0,a-b):null;"
-"const TAGS=['—','engram 投影','embedding','归一化+Mix','q_a/kv 投影','q_b GEMV','attention','attn out','ffn 输入','共享专家+路由','MoE 专家','head+lm_head','其它（未分段）','MoE·路由分发','MoE·gate+up+SwiGLU','MoE·down','MoE·求和','attn·compressor/indexer 投影','attn·压缩KV发布','attn·indexer发布','attn·carry+窗口环','attn·chunk attention','attn·rope+out_a','decode·attn前(HC+投影+indexer)','decode·attention归约+输出','decode·FFN(HC+MoE)'];"
+"const TAGS=['—','engram 投影','embedding','归一化+Mix','q_a/kv 投影','q_b GEMV','attention','attn out','ffn 输入','共享专家+路由','MoE 专家','head+lm_head','其它（未分段）','MoE·路由分发','MoE·gate+up+SwiGLU','MoE·down','MoE·求和','attn·compressor/indexer 投影','attn·压缩KV发布','attn·indexer发布','attn·carry+窗口环','attn·chunk attention','attn·rope+out_a','decode·attn前(HC+投影+indexer)','decode·attention归约','decode·FFN(HC+MoE)','decode·attn输出投影'];"
 "const cell=v=>v===null?'<em class=warn>—</em>':f(v);"
 "const node=(label,val,lvl,note,extra)=>{"
 " let h='<div class=tnrow style=padding-left:'+(lvl*26)+'px>';"

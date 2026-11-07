@@ -84,8 +84,12 @@ typedef enum {
     MYDS_PH_TAG_ATTN_TAIL,    /* 反 rope + out_a 投影（到 ATTN_OUT 边界为止） */
     /* decode 层内细分（MYDS_PHASE_SPLIT_DECODE=N，每 N 个 token 采样一次） */
     MYDS_PH_TAG_DEC_PRE_ATTN, /* HC attn 输入 + qkv 投影 + 压缩/indexer */
-    MYDS_PH_TAG_DEC_ATTN,     /* attention 归约 + 输出投影 */
+    MYDS_PH_TAG_DEC_ATTN,     /* attention 归约 */
     MYDS_PH_TAG_DEC_FFN,      /* HC FFN 输入 + MoE（含层尾） */
+    /* 26：把 attn_output_b 投影从 DEC_ATTN 里分出来。2026-11-07 实测这条
+     * 与 attn_q_b 同为 944 MB/token 的 Q4_K 矩阵，单独量是 1.81 ms（522 GB/s），
+     * 此前混在 DEC_ATTN 里被误读成「attention 慢」。 */
+    MYDS_PH_TAG_DEC_ATTN_OUT,
     /* 32 以上留给「内部分段」（decode 按 MYDS_DECODE_SPLIT 切出的段）。
      * 连续编号，页面按 id-32 当作段号。 */
     MYDS_PH_TAG_SEG_BASE = 32,
