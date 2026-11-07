@@ -18037,3 +18037,89 @@ sync 与 async 两臂各 3 / 2 次请求的正文 sha256 **完全相同**：`0d9
 > 生产这个数的用途是**交叉验证**：它与 bench 的 async 臂差 0.2%，说明 P0 在生产配置下
 > 行为和 bench 一致。
 
+## §147 P1 预备核查：NSG 来自 function constant（不是模板参数）；以及一个必须先解开的所有权矛盾（2026-11-07 15:50）
+
+**本节不实施 P1，只记录两件核查结果。第二件是实施前必须解开的硬阻塞。**
+
+### 147.1 我读错了模板参数，所幸查清了
+
+先前我以为 `metal/flash_attn.metal:949` 的
+`…, 512, 512, 8, 64, true>` 里 `true` 是 `NSG=1`，并据此担心「`ms` 的行归属与 `lo` 的
+fragment 归属对不上」。
+
+**错了。** 读 `kernel_flash_attn_ext`（外层的导出模板，第 906 行）才看清它的签名是：
+
+```
+short DK, short DV, short Q = OP_FLASH_ATTN_EXT_NQPSG,
+short C = OP_FLASH_ATTN_EXT_NCPSG, bool HEAD_BATCH = false
+```
+
+**它根本没有 NSG 参数。** NSG 是**函数常量** `FC_flash_attn_ext_nsg`，在 kernel 里
+`switch` 出 4 或 8：
+
+```c
+switch (FC_flash_attn_ext_nsg) {
+    case 4: kernel_flash_attn_ext_impl<FWD_TMPL, 4, HEAD_BATCH>(FWD_ARGS); break;
+    case 8: kernel_flash_attn_ext_impl<FWD_TMPL, 8, HEAD_BATCH>(FWD_ARGS); break;
+}
+```
+
+所以那个 `true` 是 **HEAD_BATCH**。真实取值：
+
+| 项 | 值 | 来源 |
+|---|---|---|
+| DK, DV | 512, 512 | 实例化 |
+| Q, C | 8, 64 | 实例化 |
+| **HEAD_BATCH** | **true** | 实例化第 5 个参数 |
+| **NSG** | **4** | 函数常量 `{322,false,4}`（`myds_v41_gpu.c:1946`）+ dispatch `(32,4,1)`=128 线程 |
+
+⇒ **§89.2 记的「NSG=4」是对的**，我的怀疑作废。`Q=8 / C=64 / NSG=4` 确认。
+
+### 147.2 硬阻塞：O 的行所有权与 MMA tile 的所有权不自洽
+
+`so`（O 累加器）在 threadgroup memory，`so4` 是它的 float4 视图，**行距 = PV**（行主序）。
+
+按 `so4[j*PV4 + i]` 的用法，`j` 是**行**：
+
+- 缩放 `so4[j*PV4 + i] *= ms;` 里 `j = jj*NSG + sgitg`
+  ⇒ **行 j 只被 simdgroup `sgitg` 缩放**。NQ = Q/NSG = 2，所以 sgitg 拥有行
+  {sgitg, sgitg+4} —— 8 行分给 4 个 simdgroup，每 SG 2 行。
+- 列 `i` 用 `i = tiisg` 起、步长 NW=32 ⇒ **一个 simdgroup 内的 32 个线程铺满整个 DV 宽**。
+  即 O **不按列切分**。
+
+但 MMA 那侧写的是：
+
+```c
+simdgroup_load(lo[ii], so + 8*sgitg + ii*8*NSG, PV, 0, false);   // 加载
+...
+simdgroup_store(lo[ii], so + 8*sgitg + ii*8*NSG, PV, 0, false);  // 存回
+```
+
+**基址偏移 `8*sgitg + ii*8*NSG` 落在行 0 的列方向上**（指针 + 行距 PV）。
+若按行主序读，这个 tile 覆盖的是「行 0..7 × 某 8 列」，**与「sgitg 只拥有行 sgitg、sgitg+4」
+直接矛盾**。
+
+两种可能，**后果完全不同**：
+
+1. `so` 的实际布局不是行主序（`so4` 的 float4 视图与 `so` 的下标语义在此处不一致）；
+2. 或者这段 MMA 的 tile 覆盖全部 8 行、而 `ms` 的按行缩放另有其机制（例如
+   `j = jj*NSG + sgitg` 里的 `j` 在此上下文不是行号）。
+
+**解开之前不能动 `so`。** 猜错的直接后果是 softmax 重标定作用到错误的行 ——
+数值静默偏移，而且**大概率还能跑出「看起来合理」的文本**。这正是账本最忌讳的失败模式。
+
+### 147.3 实施前必须做的唯一一步（很便宜）
+
+在这段代码里加一条一次性诊断：把 `so` 的前 8 行 × 前 8 列 dump 出来，
+同时在 `ms` 缩放前后各 dump 一次，用 `MYDS_PROFILE_PREFILL` 式的开关控制。
+**一次 32 token 的前向就能看清所有权**，不需要跑全模型。
+
+在那之后 P1 第一步才有明确的改法。
+
+### 147.4 附带更正一个提法的适用条件
+
+外部评审写「Q=16、NSG=8、O 在寄存器 ⇒ 32768 B」。**NSG 不是模板参数**，
+它是 **function constant**，要改 NSG 得新增一条 `case 8:` 分支并在 host 侧下发
+`{322,false,8}`。这不改变可行性，但改变了工作量：不是改一个模板实参，而是
+加一条 kernel 分支 + 一处 host 常量 + 一处 grid 计算。
+
