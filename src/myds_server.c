@@ -76,8 +76,15 @@ static unsigned g_emfile_streak;   /* 连续 EMFILE 次数，用于日志降噪 
  *   既有：objc_release → myds_metal_buffer_free → v41_chunk_workspace_free
  *   本仓 P0：myds_engram_decode_row → prepare_batch_step → v41_engram_async_main
  * 判据：拿 P0 之前的二进制 7185c173 做同样操作，崩在同一位置
- * ⇒ 不是某次改动引入的，是「关机不等在跑请求」这个结构缺陷。 */
-static _Atomic int g_draining;
+ * ⇒ 不是某次改动引入的，是「关机不等在跑请求」这个结构缺陷。
+ *
+ * ★ 曾经有一个 `g_draining` 原子标志，只写不读（accept 循环退出后 fd 已关，
+ *   不会再进新连接，所以没有读者）。已删除：一个不被读取的标志会让人以为
+ *   「已经有 draining 语义」，而实际行为只由 g_client_threads 归零决定。
+ *   若将来要让超长 prefill 在 SIGTERM 时更快主动中断，需要的是在 prefill 的
+ *   分块循环里检查一个新的谓词（并明确「提前中断 = 请求被截断」这个语义），
+ *   而不是复用一个空标志。
+ */
 
 static unsigned max_client_threads(void) {
     static unsigned cached;
@@ -2355,7 +2362,6 @@ int myds_server_start(myds_context_t *ctx, const char *host, int port, const cha
      * 后者等不完，所以给上限而不是无限等。超时就【不释放】context：
      * 宁可泄漏、让进程退出时由内核回收，也不能在别的线程还在写的时候 free。
      * 这就是原实现崩掉的那个场景。 */
-    atomic_store_explicit(&g_draining, 1, memory_order_release);
     {
         const char *env = getenv("MYDS_SHUTDOWN_DRAIN_S");
         long wait_s = 120;

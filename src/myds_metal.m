@@ -200,7 +200,14 @@ static uint32_t indexer_rows4_min_comp(void) {
 static bool indexer_score_rows4_use(uint32_t n_comp) {
     const int mode = indexer_score_rows4_parse_mode();
     if (mode == 2) return true;
-    if (mode == 0) return false;
+    /* mode <= 0：0 = 全关，-1 = 非法值。
+     * 非法值必须与 src/myds_v41_gpu.c 的 v41_gpu_indexer_score_rows4_mode()
+     * 一致地取「全关」—— 那里 return 0。原先写成 `== 0`，
+     * 非法值(-1)会落到下面的 auto 分支，与注释「非法值取 0」相反。
+     * 正常启动时 myds_metal_init 会先拦住 mode < 0 并退出，所以这条只在
+     * 「init 之后运行时 setenv 非法值」（如单测）时可达；但注释与行为不一致
+     * 本身就是下一次误读的种子。 */
+    if (mode <= 0) return false;
     return n_comp >= indexer_rows4_min_comp();
 }
 static bool indexer_score_rows4_geometry(void) {

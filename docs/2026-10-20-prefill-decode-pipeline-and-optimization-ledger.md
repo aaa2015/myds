@@ -19108,3 +19108,80 @@ client can opt back in` 就是它）。⇒ 已存档并丢弃。
 | 生产 | `34d3cf27`，PID 76747，`/health` ok（本节未重启）|
 | D2 / D3 | 仍为「已证否」，本次只清理残留 |
 
+## §158 外部复核 `45841f9..53d8a1a`：两处细节成立、已修；一处是复核方自己写错（2026-11-08 06:50）
+
+外部（Gemini）读完了 §152–§157 的全部变更并跑了六道门（`check-knobs` /
+`check-knob-pairing` / `audit-ledger` / `claims-check` / `doc-check` /
+`adoption-check`），报告全绿，另提两条细节。**我逐条验证后才动代码。**
+
+### 158.1 成立并已修：`indexer_score_rows4_use` 的非法值兜底与注释相反
+
+```objc
+const int mode = indexer_score_rows4_parse_mode();   // 非法值返回 -1
+if (mode == 2) return true;
+if (mode == 0) return false;        // ← -1 落不到这里
+return n_comp >= indexer_rows4_min_comp();           // ← -1 走了 auto
+```
+
+而 `src/myds_v41_gpu.c` 的 `v41_gpu_indexer_score_rows4_mode()` 对非法值
+`return 0`（全关）。**同一件事两处实现不一致，且与 §154.1 写的
+「非法值取 0（宁可慢长上下文，也不要在短上下文退化）」相反。**
+
+修法：`if (mode <= 0) return false;`，并把「为什么是 `<=`」写进注释。
+
+**可达性**：正常启动时 `myds_metal_init` 会先拦 `mode < 0` 并退出，
+所以这条只在「init 之后运行时 `setenv` 非法值」（如单测）时可达。
+**但注释与行为相反本身就是下一次误读的种子** —— 今天已经因为「文档说的和代码做的不一样」
+翻车多次（§147、§148、§149），不值得留。
+
+### 158.2 成立并已修：`g_draining` 只写不读
+
+`src/myds_server.c` 里 `static _Atomic int g_draining;` 只有定义与一次
+`atomic_store_explicit(&g_draining, 1, ...)`，**没有任何读者** ——
+accept 循环退出后 fd 已关，不会再进新连接。
+
+**选择删除而不是「补一个读者」**：一个不被读取的标志会让人以为
+「已经存在 draining 语义」，而真实行为只由 `g_client_threads` 归零决定。
+这正是 §157 清理的那类「既没用、又让人以为还有活」的残留。
+
+若将来确实要让超长 prefill 在 SIGTERM 时更快主动中断，需要的是一条**新谓词**
+加一个明确的语义决定（**提前中断 = 请求被截断**），而不是复用一个空标志。
+这一点写进了代码注释。
+
+### 158.3 复核方自己写错的一处（不采纳，记录在案）
+
+复核报告称 workspace 的 magic 是 `0x4D59445357535031ULL`。
+**实际是 `0x574d4353u`（“WMCS”，4 字节）**：
+
+```c
+#define V41_CHUNK_WS_MAGIC 0x574d4353u   /* "WMCS" */
+```
+
+结构体字段是 `uint32_t magic`，校验用 `cw->magic != V41_CHUNK_WS_MAGIC`。
+`0x4D59445357535031ULL` 这个值在仓库里不存在。**按实际代码为准。**
+
+（这不算大事，但它说明「复核意见也要验」—— 与我今天对账本的态度一致。）
+
+### 158.4 顺带暴露的一个工具摩擦
+
+改 `src/myds_server.c`（删 `g_draining`）之后 `make check-knobs` 立刻报
+**STALE**：生成表锁了 getenv 的**行号**，删掉几行会让它整体漂移。
+必须重跑 `python3 tools/knob_inventory.py --write`。
+
+**但 knob 指纹没有变**（仍 `2eb230c432b55c5e`）—— 因为指纹只取**名字集合**，
+不含行号。这正是 §156.2 的设计意图：配对判据应当只随源码的「认哪些键」变化，
+而不随排版漂移。这条摩擦可以接受。
+
+### 158.5 状态
+
+| 项 | 状态 |
+|---|---|
+| `mode <= 0` | 已修 |
+| `g_draining` | 已删除（含说明性注释） |
+| 复核方 magic 值 | 与实际不符，未采纳 |
+| `check-knobs` | 重新生成后 PASS |
+| `check-knob-pairing` | PASS，指纹 `2eb230c432b55c5e` 不变 |
+| `audit-ledger` / `doc-check` / `claims-check` | 全 PASS |
+| `test_server_api` / `test_trace` | PASS |
+| 生产 | 仍 `34d3cf27`；本轮产物 `15f77cc5`（**未部署**，两处改动对生产行为无影响） |
+
