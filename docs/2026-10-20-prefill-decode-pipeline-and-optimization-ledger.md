@@ -19183,5 +19183,31 @@ accept 循环退出后 fd 已关，不会再进新连接。
 | `check-knob-pairing` | PASS，指纹 `2eb230c432b55c5e` 不变 |
 | `audit-ledger` / `doc-check` / `claims-check` | 全 PASS |
 | `test_server_api` / `test_trace` | PASS |
-| 生产 | 仍 `34d3cf27`；本轮产物 `15f77cc5`（**未部署**，两处改动对生产行为无影响） |
+| 生产 | **已部署 `d206691b72b36240`**（2026-11-08 06:48） |
+
+### 158.6 部署（2026-11-08 06:48）
+
+走 `deploy_artifact.sh`（含配对门）：
+
+| 项 | 值 |
+|---|---|
+| `bin/myds` | **`d206691b72b36240`** |
+| BUILD-INFO | commit `9b2fe68`，`dirty_build_paths: []`（干净树） |
+| 生产 | PID 31448，`/health` ok |
+| 备份 | `bin/.prev-20261108-064819/`（`34d3cf27`）+ 成对 conf 备份 |
+
+部署后冒烟：
+
+| 项 | 部署前 | 部署后 |
+|---|---|---|
+| decode 256 tok（21 tok prompt） | 42.9 t/s | **42.9 t/s ×3** |
+| 32K 冷 prefill | 679.0 t/s | **678.5 t/s**（−0.07%，噪声内）|
+| 28.4K 上下文 decode | 39.0 t/s | **39.0 t/s** |
+
+三项一致，符合预期：§158 的两处改动（`mode <= 0` 兜底、删 `g_draining`）
+对生产行为没有影响 —— 前者只在运行时 setenv 非法值可达，后者本就没有读者。
+
+> **一处我自己的记录失误**：我曾把"本轮产物"写成 `15f77cc5`，那是**修 §158 之前**
+> 的中间构建。`make` 重编后被覆盖，真正的产物是 `d206691b`。
+> 判据不是记忆，是 `bin/BUILD-INFO.json` 里的 `commit` + `artifacts` —— 这次它救了我。
 
