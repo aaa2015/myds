@@ -18667,12 +18667,37 @@ accept 循环退出后 `myds_server_start` **立刻返回**，`main.c:592` 紧�
 如果将来出现「同一线程内 fail 之后自己再 free 一次」的路径，仍可能崩。
 **这条待单独审。**
 
-### 153.6 状态
+### 153.6 部署（2026-11-07 17:45，已上线）
+
+| 项 | 值 |
+|---|---|
+| `bin/myds` | **`adeb1f4e4ab1ee03`**（含 §153 修复 + §152 的 vispre `/v1/models`） |
+| `bin/myds.metallib` | **`d37bde4890ea2c5a`**（含 rows4 kernel，但配置关闭它） |
+| 配置 | 新增 `MYDS_INDEXER_SCORE_ROWS4=0`（理由见 §152.3 驳回） |
+| 生产 PID | 61896，`/health` ok |
+| 回滚点 | `bin/.prev-20261107-174442/`（`a79b410a` + `787f9d7d`）+ `myds.conf.bak-drain-20261107-174442` |
+
+**为什么二进制和 metallib 必须一起换**：`09a6c96` 把
+`kernel_glm_indexer_score_one_rows4` / `kernel_myds_indexer_score_selected_blocks_rows4`
+加进了「必检内核」列表（`myds_metal.m:2000`），新二进制配老 metallib 会**拒绝启动**。
+
+**为什么 rows4 在配置里关掉**：§152.3 已驳回（短上下文 −0.3~0.7%）。
+kernel 留在库里以备实施方加 `n_comp >= 8192` 阈值后重审，但生产不走它。
+
+**部署后实测**：
+- decode `42.9 t/s` ×3（部署前 42.9，无变化）
+- 2.1K prompt 请求 10.898 s（与部署前 10.9 一致）
+- `Indexer score rows4: 0` 确认生效
+- 空闲 SIGTERM：**优雅退出，崩溃报告无新增**（最新仍是 17:34 的修复前报告）
+
+### 153.7 状态
 
 | 项 | 状态 |
 |---|---|
-| 关机崩溃 | **已修**（两种场景实测 0 崩溃） |
+| 关机崩溃 | **已修并已部署**（两种场景实测 0 崩溃） |
 | `MYDS_SHUTDOWN_DRAIN_S` | 新增 knob，默认 120 |
-| 生产 | **未部署**（生产仍 `a79b410a`）；本次修复在 `bin/myds` = `adeb1f4e` |
-| §152 的 rows4 驳回、vispre 通过 | 不变，仍未部署 |
+| §152 vispre | **已上线**（4032×3024 省 188 毫秒） |
+| §152 `/v1/models` | **已上线** |
+| §152 rows4 | **驳回，生产关闭**；等实施方加阈值 |
+| rows4 端到端 0-ULP | 仍未做（既未采纳，不阻塞） |
 
