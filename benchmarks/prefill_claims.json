@@ -15,7 +15,14 @@
     "p32k_ab__v2.txt"
   ],
   "docs": [
-    "docs/2026-11-03-trace-phase-breakdown.md"
+    "docs/2026-11-03-trace-phase-breakdown.md",
+    {
+      "path": "docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md",
+      "only_sections": [
+        "§143",
+        "§144"
+      ]
+    }
   ],
   "claims": [
     {
