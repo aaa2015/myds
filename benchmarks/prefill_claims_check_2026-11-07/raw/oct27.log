@@ -1,0 +1,100 @@
+[2026-11-07 07:53:08.379] [INFO] config: 已加载 /Users/fangqingyuan/bench/ab/myds-bench.conf —— 生效 73 条
+====================================================
+    myds: Minimal DeepSeek V4 / V4.1 Inference Engine   
+         Accelerated by Apple Silicon Metal         
+====================================================
+[2026-11-07 07:53:08.379] [INFO] Starting myds (ctx_size=1048576, max_new_tokens=200, temp=0.00, top_p=1.00, top_k=0, min_p=0.000, rep_pen=1.000, pres_pen=0.000, thinking=off)
+[2026-11-07 07:53:08.379] [INFO] Loading model file: /Users/fangqingyuan/.lmstudio/models/antirez/deepseek-v4.1-flash-1017/DeepSeek-V4.1-Flash-1017-Q2-dense-q4-imx-cliecy.gguf
+[2026-11-07 07:53:08.384] [INFO] V4.1 native graph enabled: HC multi-stream residual connections (verified — see docs/ULP_SWITCHES.md)
+[2026-11-07 07:53:08.405] [INFO] myds_metal: loaded precompiled library from /Users/fangqingyuan/bench/ab/bin/oct27/myds.metallib (all required V4.1 kernels verified)
+myds_metal: Dense Q4 V41 provider 0 = kernel_myds_q4_v41_head_addr_f32 (NR2/NSG4)
+myds_metal: Dense Q4 V41 provider 1 = kernel_myds_q4_v41_qb_nb_bf16 (NR2/NSG4)
+myds_metal: Dense Q4 V41 provider 2 = kernel_myds_q4_v41_ob_nb_bf16 (NR2/NSG4)
+[2026-11-07 07:53:08.409] [INFO] Shared Q4 V41 NB: 0 (ordinary NB+HC GU2304x5120/Down5120x2304, NR2/NSG4)
+[2026-11-07 07:53:08.409] [INFO] myds_metal: Initialized successfully on GPU: Apple M2 Ultra
+[2026-11-07 07:53:08.409] [INFO] Indexer head slots: 1 (F32 candidate; explicit ordinary scalar scope)
+[2026-11-07 07:53:08.409] [INFO] Indexer topk threshold: 0 (reference; explicit ordinary scalar scope)
+[2026-11-07 07:53:08.409] [INFO] Indexer topk NaN shuffle: 0 (reference; reference partition geometry)
+[2026-11-07 07:53:08.409] [INFO] Routed MoE geometry: IQ2 NSG=2, Q2 down NSG=4 (explicit)
+[2026-11-07 07:53:08.409] [INFO] Routed MoE IQ2 LUT: threadgroup (reference)
+[2026-11-07 07:53:08.409] [INFO] Routed MoE IQ2 gate/up sign: popcount (explicit, bit-exact)
+[2026-11-07 07:53:08.409] [INFO] Batch2 Q8 shared weights: enabled (explicit; TAIL, SHARED, QKV)
+[2026-11-07 07:53:08.409] [INFO] LM-head Q8 rows per threadgroup: 2 (reference; single token, large output, NSG8)
+[2026-11-07 07:53:08.409] [INFO] Dense Q4 rows per threadgroup: 2 (reference; explicit ordinary scalar scope), NSG=4
+[2026-11-07 07:53:08.409] [INFO] F16 GEMV BF16 fuse: 1 (fused store; explicit ordinary scalar scope)
+[2026-11-07 07:53:08.409] [INFO] Indexer RoPE quant fuse: 1 (SIMD candidate; explicit ordinary scalar scope)
+[2026-11-07 07:53:08.409] [INFO] Routed MoE Q2 sum cache: 0 (reference; explicit ordinary scalar scope)
+[2026-11-07 07:53:08.409] [INFO] Routed MoE Q2 sum cache fused: 0 (reference; explicit ordinary scalar scope)
+[2026-11-07 07:53:08.409] [INFO] Decode candidates: down overlap=1, IQ2 V4.1=0, Dense Q4 V4.1=1 (ordinary scalar only)
+[2026-11-07 07:53:08.409] [INFO] Routed MoE Q2 V4.1: 1 (ordinary scalar F32 MID only; 5120/2304/384/6, NR2, down NSG2/4; MM, trace and unscoped paths retain reference)
+[2026-11-07 07:53:08.409] [INFO] Attention flash-decoding: 0 (reference (single-TG in-register 14-NSG))
+[2026-11-07 07:53:08.409] [INFO] HC mix norm pre-fusion: 0 (reference (separate norm + GEMV))
+[2026-11-07 07:53:08.409] [INFO] Opened GGUF model: /Users/fangqingyuan/.lmstudio/models/antirez/deepseek-v4.1-flash-1017/DeepSeek-V4.1-Flash-1017-Q2-dense-q4-imx-cliecy.gguf (tensors: 1046, kv_pairs: 67)
+[2026-11-07 07:53:08.436] [INFO] MoE enabled: 384 routed experts (top-6 active, scale=1.50, exp_dim=2304, clamp=10.0), 1 shared experts
+[2026-11-07 07:53:08.446] [INFO] Engram SSD I/O: fixed, persistent raw-read pool (MYDS_ENGRAM_IO_THREADS: auto adapts, 1 serial, 2..16 pinned)
+[2026-11-07 07:53:08.446] [INFO] Native V4.1 diagnostic graph: HC4, Engram disk rows, SWA128, 4 KV owners
+[2026-11-07 07:53:15.061] [INFO] Residency keep-alive: 1004 allocations, queue-attached, keep_alive=86400s, period=5ms
+[2026-11-07 07:53:15.061] [INFO] Model loaded successfully in 6.68s
+====================================================
+ DeepSeek V4 / V4.1 Model Information
+====================================================
+ Architecture : deepseek41
+ Layers       : 40
+ Hidden Dim   : 5120
+ Attention    : MLA (64 heads, head_dim=512, q_rank=1280, kv_rank=512, rope_dim=64)
+ FFN Dim      : 20480
+ Vocab Size   : 129280
+ MoE Routed   : 384 experts (top-6 active), scale=1.50
+ MoE Shared   : 1 experts
+ Memory (mmap): 148.44 GB mapped, 147.70 GB resident (strategy: demand paged)
+====================================================
+[2026-11-07 07:53:15.061] [INFO] prefix cache: 锚点 16 套 × 最多 65536 tok（槽 44..59）
+[2026-11-07 07:53:15.061] [INFO] Engram projection round skip: 0 (reference; ordinary scalar decode, nontrace)
+[2026-11-07 07:53:15.062] [INFO] prefix snapshots: 44 slots (21 pinned for positions 1024..11264, 22 ring), stride 512
+[2026-11-07 07:53:15.063] [INFO] Inference context initialized
+[2026-11-07 07:53:15.602] [INFO] 视觉编码器已就绪: 32 层 · projection 5120 · image token 129264 · F32 1.81 GiB
+[2026-11-07 07:53:15.602] [INFO] 视觉占位符: <｜deepseek_image｜>（往返一致，1 个 token）
+[2026-11-07 07:53:15.602] [INFO] 多模态已启用：接受 input_image（image_url 需为 data: base64 URL）
+[2026-11-07 07:53:15.602] [INFO] fd 上限已提升到 4096
+[2026-11-07 07:53:15.602] [INFO] HTTP server listening on http://127.0.0.1:8187 (alias: bench)
+[2026-11-07 07:53:15.602] [INFO] Protocols active: OpenAI Responses API (/v1/responses) & Chat Completions (/v1/chat/completions)
+[2026-11-07 07:53:16.583] [INFO] [127.0.0.1:51503] POST /v1/chat/completions (protocol=ChatCompletions, stream=false, max_tokens=1, temp=0.00, top_p=-1.00, top_k=-1, min_p=-1.000, rep_pen=-1.000, pres_pen=-1.000, prompt_chars=1198, body=1420, has_instructions=0, has_tools=0)
+[2026-11-07 07:53:16.583] [INFO] [127.0.0.1:51503] effective sampling: temp=0.000, top_p=1.000, top_k=0, min_p=0.000, rep_pen=1.000, pres_pen=0.000, thinking=0
+[2026-11-07 07:53:16.583] [INFO] prefix cache: nothing cached yet (this is the first request)
+[2026-11-07 07:53:16.583] [INFO] prompt split: system+tools=2 tok / total=306 tok (0.7%), ring_capacity=11264, ring covers it
+[2026-11-07 07:53:16.583] [INFO] prompt block mask: bit-packed (1 bit / 8-block group)
+[2026-11-07 07:53:16.586] [INFO] prefill batching: chunk=306 macroblock=512 moe_chunks=1 (=> MoE batch = 306 tok, guard=16384) [n=305]
+[2026-11-07 07:53:16.762] [INFO] MoE batch path: MM (kernel_mul_mm_id pair_swiglu + q2_k_f16 + sum6) — active for n_tok >= 32
+[2026-11-07 07:53:17.998] [INFO] MoE path: FUSED (2-step) with explicit V4.1 Q2 down
+[2026-11-07 07:53:18.031] [INFO] [127.0.0.1:51503] Completed ChatCompletions /v1/chat/completions - prompt: 306 tok, prefill: 305 tok in 1.4s = 216.0 t/s (cached 0), ttft: 1.4s, decode: 1 tok in 0.0s = 0.7 t/s, wall: 1.4s (infer 1.4s, queue 0.0s), finish_reason: length
+[2026-11-07 07:53:18.043] [INFO] [127.0.0.1:51520] POST /v1/chat/completions (protocol=ChatCompletions, stream=false, max_tokens=160, temp=0.00, top_p=-1.00, top_k=-1, min_p=-1.000, rep_pen=-1.000, pres_pen=-1.000, prompt_chars=16891, body=17379, has_instructions=0, has_tools=0)
+[2026-11-07 07:53:18.043] [INFO] [127.0.0.1:51520] effective sampling: temp=0.000, top_p=1.000, top_k=0, min_p=0.000, rep_pen=1.000, pres_pen=0.000, thinking=0
+[2026-11-07 07:53:18.043] [INFO] prefix cache: skipped - common prefix 3 of cached 306, but no snapshot within it (the state cannot be rewound, so this restarts from 0)
+[2026-11-07 07:53:18.043] [INFO] prefix cache divergence at 3: c[0]=0:<｜begin▁of▁sentence｜> c[1]=128803:<｜User｜> c[2]=61:[ c[3]=12499:003 c[4]=15:- p[0]=0:<｜begin▁of▁sentence｜> p[1]=128803:<｜User｜> p[2]=61:[ p[3]=17726:410 p[4]=19:1 
+[2026-11-07 07:53:18.043] [INFO] prompt split: system+tools=2 tok / total=4857 tok (0.0%), ring_capacity=11264, ring covers it
+[2026-11-07 07:53:18.061] [INFO] prefill batching: chunk=2048 macroblock=5120 moe_chunks=3 (=> MoE batch = 6144 tok, guard=16384) [n=4856]
+[2026-11-07 07:53:26.100] [INFO] V4.1 suffix shrink[snapshot-guard v2]: front=all shift=512 valid_from=4344 (total=4856, layer20 rows=1930..4856 of 4856)
+[2026-11-07 07:53:34.094] [INFO] [127.0.0.1:51520] Completed ChatCompletions /v1/chat/completions - prompt: 4857 tok, prefill: 4856 tok in 12.1s = 402.4 t/s (cached 0), ttft: 12.1s, decode: 160 tok in 3.9s = 40.3 t/s, wall: 16.1s (infer 16.1s, queue 0.0s), finish_reason: length
+[2026-11-07 07:53:34.105] [INFO] [127.0.0.1:51656] POST /v1/chat/completions (protocol=ChatCompletions, stream=false, max_tokens=160, temp=0.00, top_p=-1.00, top_k=-1, min_p=-1.000, rep_pen=-1.000, pres_pen=-1.000, prompt_chars=67428, body=68818, has_instructions=0, has_tools=0)
+[2026-11-07 07:53:34.105] [INFO] [127.0.0.1:51656] effective sampling: temp=0.000, top_p=1.000, top_k=0, min_p=0.000, rep_pen=1.000, pres_pen=0.000, thinking=0
+[2026-11-07 07:53:34.109] [INFO] prefix cache: skipped - common prefix 4 of cached 5016, but no snapshot within it (the state cannot be rewound, so this restarts from 0)
+[2026-11-07 07:53:34.109] [INFO] prefix cache divergence at 4: c[1]=128803:<｜User｜> c[2]=61:[ c[3]=17726:410 c[4]=19:1 c[5]=15:- p[1]=128803:<｜User｜> p[2]=61:[ p[3]=17726:410 p[4]=20:2 p[5]=15:- 
+[2026-11-07 07:53:34.109] [INFO] prompt split: system+tools=2 tok / total=19428 tok (0.0%), ring_capacity=11264, ring covers it
+[2026-11-07 07:53:34.145] [INFO] prefill batching: chunk=2048 macroblock=19456 moe_chunks=8 (=> MoE batch = 16384 tok, guard=16384) [n=19427]
+[2026-11-07 07:54:18.753] [INFO] [127.0.0.1:51656] Completed ChatCompletions /v1/chat/completions - prompt: 19428 tok, prefill: 19427 tok in 40.5s = 479.6 t/s (cached 0), ttft: 40.6s, decode: 160 tok in 4.1s = 38.9 t/s, wall: 44.6s (infer 44.6s, queue 0.0s), finish_reason: length
+[2026-11-07 07:54:18.767] [INFO] [127.0.0.1:52010] POST /v1/chat/completions (protocol=ChatCompletions, stream=false, max_tokens=160, temp=0.00, top_p=-1.00, top_k=-1, min_p=-1.000, rep_pen=-1.000, pres_pen=-1.000, prompt_chars=135282, body=137876, has_instructions=0, has_tools=0)
+[2026-11-07 07:54:18.767] [INFO] [127.0.0.1:52010] effective sampling: temp=0.000, top_p=1.000, top_k=0, min_p=0.000, rep_pen=1.000, pres_pen=0.000, thinking=0
+[2026-11-07 07:54:18.773] [INFO] prefix cache: skipped - common prefix 4 of cached 19587, but no snapshot within it (the state cannot be rewound, so this restarts from 0)
+[2026-11-07 07:54:18.773] [INFO] prefix cache divergence at 4: c[1]=128803:<｜User｜> c[2]=61:[ c[3]=17726:410 c[4]=20:2 c[5]=15:- p[1]=128803:<｜User｜> p[2]=61:[ p[3]=17726:410 p[4]=21:3 p[5]=15:- 
+[2026-11-07 07:54:18.773] [INFO] prompt split: system+tools=2 tok / total=38981 tok (0.0%), ring_capacity=11264, ring covers it
+[2026-11-07 07:54:18.773] [INFO] prefill batching: chunk=2048 macroblock=39424 moe_chunks=8 (=> MoE batch = 16384 tok, guard=16384) [n=38980]
+[2026-11-07 07:55:39.243] [INFO] [127.0.0.1:52010] Completed ChatCompletions /v1/chat/completions - prompt: 38981 tok, prefill: 38980 tok in 78.4s = 497.0 t/s (cached 0), ttft: 78.5s, decode: 75 tok in 2.0s = 37.8 t/s, wall: 80.5s (infer 80.5s, queue 0.0s), finish_reason: stop
+[2026-11-07 07:55:39.258] [INFO] [127.0.0.1:52668] POST /v1/chat/completions (protocol=ChatCompletions, stream=false, max_tokens=160, temp=0.00, top_p=-1.00, top_k=-1, min_p=-1.000, rep_pen=-1.000, pres_pen=-1.000, prompt_chars=270578, body=275578, has_instructions=0, has_tools=0)
+[2026-11-07 07:55:39.259] [INFO] [127.0.0.1:52668] effective sampling: temp=0.000, top_p=1.000, top_k=0, min_p=0.000, rep_pen=1.000, pres_pen=0.000, thinking=0
+[2026-11-07 07:55:39.271] [INFO] prefix cache: skipped - common prefix 4 of cached 39056, but no snapshot within it (the state cannot be rewound, so this restarts from 0)
+[2026-11-07 07:55:39.271] [INFO] prefix cache divergence at 4: c[1]=128803:<｜User｜> c[2]=61:[ c[3]=17726:410 c[4]=21:3 c[5]=15:- p[1]=128803:<｜User｜> p[2]=61:[ p[3]=17726:410 p[4]=22:4 p[5]=15:- 
+[2026-11-07 07:55:39.271] [INFO] prompt split: system+tools=2 tok / total=77768 tok (0.0%), ring_capacity=11264, ring covers it
+[2026-11-07 07:55:39.271] [INFO] prefill batching: chunk=2048 macroblock=77824 moe_chunks=8 (=> MoE batch = 16384 tok, guard=16384) [n=77767]
+[2026-11-07 07:57:01.744] [WARN] [127.0.0.1:52883] server reject due to queue wait timeout (depth=0, timeout=60000ms)
+[2026-11-07 07:58:01.762] [WARN] [127.0.0.1:53426] server reject due to queue wait timeout (depth=0, timeout=60000ms)
+[2026-11-07 07:58:07.284] [INFO] Server stopped gracefully

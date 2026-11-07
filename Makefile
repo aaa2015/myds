@@ -220,6 +220,8 @@ audit-ledger:
 # 单独留一个入口是因为改文档里的吞吐数字时只想跑这一秒级的检查。
 claims-check:
 	python3 -B tools/prefill_claims.py
+	python3 -B benchmarks/prefill_claims_check_2026-11-07/extract.py --check
+	python3 -B benchmarks/prefill_claims_check_2026-11-07/verify.py
 
 # Every path, script and make target the docs tell a reader to run must exist.
 # Written after REPRODUCE-register-only.md spent weeks instructing readers to run

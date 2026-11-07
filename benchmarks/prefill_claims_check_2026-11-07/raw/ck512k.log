@@ -1,0 +1,91 @@
+[2026-11-07 07:58:15.002] [INFO] config: 已加载 ./myds-bench-ck512k.conf —— 生效 73 条
+====================================================
+    myds: Minimal DeepSeek V4 / V4.1 Inference Engine   
+         Accelerated by Apple Silicon Metal         
+====================================================
+[2026-11-07 07:58:15.002] [INFO] Starting myds (ctx_size=1048576, max_new_tokens=200, temp=0.00, top_p=1.00, top_k=0, min_p=0.000, rep_pen=1.000, pres_pen=0.000, thinking=off)
+[2026-11-07 07:58:15.002] [INFO] Loading model file: /Users/fangqingyuan/.lmstudio/models/antirez/deepseek-v4.1-flash-1017/DeepSeek-V4.1-Flash-1017-Q2-dense-q4-imx-cliecy.gguf
+[2026-11-07 07:58:15.009] [INFO] V4.1 native graph enabled: HC multi-stream residual connections (verified — see docs/ULP_SWITCHES.md)
+[2026-11-07 07:58:15.032] [INFO] Metal command queue initialized (maxCommandBufferCount=512)
+[2026-11-07 07:58:15.033] [INFO] myds_metal: loaded precompiled library from /Users/fangqingyuan/bench/ab/bin/new/myds.metallib (all required V4.1 kernels verified)
+myds_metal: Dense Q4 V41 provider 0 = kernel_myds_q4_v41_head_addr_f32 (NR2/NSG4)
+myds_metal: Dense Q4 V41 provider 1 = kernel_myds_q4_v41_qb_nb_bf16 (NR2/NSG4)
+myds_metal: Dense Q4 V41 provider 2 = kernel_myds_q4_v41_ob_nb_bf16 (NR2/NSG4)
+[2026-11-07 07:58:15.037] [INFO] Shared Q4 V41 NB: 0 (ordinary NB+HC GU2304x5120/Down5120x2304, NR2/NSG4)
+[2026-11-07 07:58:15.037] [INFO] myds_metal: Initialized successfully on GPU: Apple M2 Ultra
+[2026-11-07 07:58:15.037] [INFO] Indexer head slots: 1 (F32 candidate; explicit ordinary scalar scope)
+[2026-11-07 07:58:15.037] [INFO] Indexer topk threshold: 0 (reference; explicit ordinary scalar scope)
+[2026-11-07 07:58:15.037] [INFO] Indexer topk NaN shuffle: 0 (reference; reference partition geometry)
+[2026-11-07 07:58:15.037] [INFO] Routed MoE geometry: IQ2 NSG=2, Q2 down NSG=4 (explicit)
+[2026-11-07 07:58:15.037] [INFO] Routed MoE IQ2 LUT: threadgroup (reference)
+[2026-11-07 07:58:15.037] [INFO] Routed MoE IQ2 gate/up sign: popcount (explicit, bit-exact)
+[2026-11-07 07:58:15.037] [INFO] Batch2 Q8 shared weights: enabled (explicit; TAIL, SHARED, QKV)
+[2026-11-07 07:58:15.037] [INFO] LM-head Q8 rows per threadgroup: 2 (reference; single token, large output, NSG8)
+[2026-11-07 07:58:15.037] [INFO] Dense Q4 rows per threadgroup: 2 (reference; explicit ordinary scalar scope), NSG=4
+[2026-11-07 07:58:15.037] [INFO] F16 GEMV BF16 fuse: 1 (fused store; explicit ordinary scalar scope)
+[2026-11-07 07:58:15.037] [INFO] Indexer RoPE quant fuse: 1 (SIMD candidate; explicit ordinary scalar scope)
+[2026-11-07 07:58:15.037] [INFO] Routed MoE Q2 sum cache: 0 (reference; explicit ordinary scalar scope)
+[2026-11-07 07:58:15.037] [INFO] Routed MoE Q2 sum cache fused: 0 (reference; explicit ordinary scalar scope)
+[2026-11-07 07:58:15.037] [INFO] Decode candidates: down overlap=1, IQ2 V4.1=0, Dense Q4 V4.1=1 (ordinary scalar only)
+[2026-11-07 07:58:15.037] [INFO] Routed MoE Q2 V4.1: 1 (ordinary scalar F32 MID only; 5120/2304/384/6, NR2, down NSG2/4; MM, trace and unscoped paths retain reference)
+[2026-11-07 07:58:15.037] [INFO] Attention flash-decoding: 0 (reference (single-TG in-register 14-NSG))
+[2026-11-07 07:58:15.037] [INFO] HC mix norm pre-fusion: 0 (reference (separate norm + GEMV))
+[2026-11-07 07:58:15.037] [INFO] Opened GGUF model: /Users/fangqingyuan/.lmstudio/models/antirez/deepseek-v4.1-flash-1017/DeepSeek-V4.1-Flash-1017-Q2-dense-q4-imx-cliecy.gguf (tensors: 1046, kv_pairs: 67)
+[2026-11-07 07:58:15.063] [INFO] MoE enabled: 384 routed experts (top-6 active, scale=1.50, exp_dim=2304, clamp=10.0), 1 shared experts
+[2026-11-07 07:58:15.073] [INFO] Engram SSD I/O: fixed, persistent raw-read pool (MYDS_ENGRAM_IO_THREADS: auto adapts, 1 serial, 2..16 pinned)
+[2026-11-07 07:58:15.073] [INFO] Native V4.1 diagnostic graph: HC4, Engram disk rows, SWA128, 4 KV owners
+[2026-11-07 07:58:21.661] [INFO] Residency keep-alive: 1004 allocations, queue-attached, keep_alive=86400s, period=5ms
+[2026-11-07 07:58:21.661] [INFO] Model loaded successfully in 6.66s
+====================================================
+ DeepSeek V4 / V4.1 Model Information
+====================================================
+ Architecture : deepseek41
+ Layers       : 40
+ Hidden Dim   : 5120
+ Attention    : MLA (64 heads, head_dim=512, q_rank=1280, kv_rank=512, rope_dim=64)
+ FFN Dim      : 20480
+ Vocab Size   : 129280
+ MoE Routed   : 384 experts (top-6 active), scale=1.50
+ MoE Shared   : 1 experts
+ Memory (mmap): 148.44 GB mapped, 147.70 GB resident (strategy: demand paged)
+====================================================
+[2026-11-07 07:58:21.662] [INFO] prefix cache: 锚点 16 套 × 最多 65536 tok（槽 44..59）
+[2026-11-07 07:58:21.662] [INFO] Engram projection round skip: 0 (reference; ordinary scalar decode, nontrace)
+[2026-11-07 07:58:21.663] [INFO] prefix snapshots: 44 slots (21 pinned for positions 1024..11264, 22 ring), stride 512
+[2026-11-07 07:58:21.663] [INFO] Inference context initialized
+[2026-11-07 07:58:22.554] [INFO] 视觉编码器已就绪: 32 层 · projection 5120 · image token 129264 · F32 1.81 GiB
+[2026-11-07 07:58:22.554] [INFO] 视觉占位符: <｜deepseek_image｜>（往返一致，1 个 token）
+[2026-11-07 07:58:22.554] [INFO] 多模态已启用：接受 input_image（image_url 需为 data: base64 URL）
+[2026-11-07 07:58:22.555] [INFO] GLP Steering loaded: /Users/fangqingyuan/.lmstudio/models/msuiche/glp.deepseek-v41-flash-1017-GLP-27-L11-37-a3.5.gguf | Mode: Spec-v3 (Dual Hook) | Spec: v3 | Alpha: 1.000 [override] | Active layers: 27 (L11..L37)
+[2026-11-07 07:58:22.555] [INFO] GLP 控制向量已注册: [glp27] (enabled=0, alpha=1.000, mode=2)
+[2026-11-07 07:58:22.556] [INFO] GLP Steering loaded: /Users/fangqingyuan/.lmstudio/models/msuiche/glp.deepseek-v41-flash-1017-GLP-39-L1-39-a0.75.gguf | Mode: Spec-v2 (Residual Only) | Spec: v1 | Alpha: 0.750 [override] | Active layers: 39 (L1..L39)
+[2026-11-07 07:58:22.556] [INFO] GLP 控制向量已注册: [glp39] (enabled=0, alpha=0.750, mode=1)
+[2026-11-07 07:58:22.556] [INFO] request trace: 128 records in the ring buffer (page: GET /trace)
+[2026-11-07 07:58:22.556] [INFO] fd 上限已提升到 4096
+[2026-11-07 07:58:22.556] [INFO] HTTP server listening on http://127.0.0.1:8187 (alias: bench)
+[2026-11-07 07:58:22.556] [INFO] Protocols active: OpenAI Responses API (/v1/responses) & Chat Completions (/v1/chat/completions)
+[2026-11-07 07:58:23.205] [INFO] [127.0.0.1:54154] POST /v1/chat/completions (protocol=ChatCompletions, stream=false, max_tokens=1, temp=0.00, top_p=-1.00, top_k=-1, min_p=-1.000, rep_pen=-1.000, pres_pen=-1.000, prompt_chars=1198, body=1420, has_instructions=0, has_tools=0)
+[2026-11-07 07:58:23.205] [INFO] [127.0.0.1:54154] effective sampling: temp=0.000, top_p=1.000, top_k=0, min_p=0.000, rep_pen=1.000, pres_pen=0.000, thinking=0
+[2026-11-07 07:58:23.205] [INFO] prefix cache: nothing cached yet (this is the first request)
+[2026-11-07 07:58:23.205] [INFO] prompt split: system+tools=2 tok / total=306 tok (0.7%), ring_capacity=11264, ring covers it
+[2026-11-07 07:58:23.205] [INFO] prompt block mask: bit-packed (1 bit / 8-block group)
+[2026-11-07 07:58:23.223] [INFO] prefill chunk workspace allocated: chunk_cap=0->2048 moe_batch=0->16384 (prealloc_full=1, n=305)
+[2026-11-07 07:58:23.223] [INFO] prefill batching: chunk=306 macroblock=512 moe_chunks=1 (=> MoE batch = 306 tok, guard=16384) [n=305]
+[2026-11-07 07:58:23.223] [INFO] prefill prompt workspace allocated: tokens_cap=0->16384 mask_bytes=0->32 (prealloc_full=1, n=305)
+[2026-11-07 07:58:23.403] [INFO] MoE batch path: MM (kernel_mul_mm_id pair_swiglu + q2_k_f16 + sum6) — active for n_tok >= 32
+[2026-11-07 07:58:23.403] [INFO] MoE phase tag split enabled (async flush mode, tags 13..16)
+[2026-11-07 07:58:24.833] [INFO] MoE path: FUSED (2-step) with explicit V4.1 Q2 down
+[2026-11-07 07:58:24.872] [INFO] [127.0.0.1:54154] Completed ChatCompletions /v1/chat/completions - prompt: 306 tok, prefill: 305 tok in 1.6s = 187.7 t/s (cached 0), ttft: 1.7s, decode: n/a (1 tok total), wall: 1.7s (infer 1.7s, queue 0.0s), finish_reason: length, steer: disabled
+[2026-11-07 07:58:24.872] [INFO] [127.0.0.1:54154] Warmup probe finished (X-Myds-Warmup: 1): prompt=306 tok, prefill=1.625s, trace skipped & pcache reset
+[2026-11-07 07:58:24.883] [INFO] [127.0.0.1:54171] POST /v1/chat/completions (protocol=ChatCompletions, stream=false, max_tokens=160, temp=0.00, top_p=-1.00, top_k=-1, min_p=-1.000, rep_pen=-1.000, pres_pen=-1.000, prompt_chars=135282, body=137876, has_instructions=0, has_tools=0)
+[2026-11-07 07:58:24.883] [INFO] [127.0.0.1:54171] effective sampling: temp=0.000, top_p=1.000, top_k=0, min_p=0.000, rep_pen=1.000, pres_pen=0.000, thinking=0
+[2026-11-07 07:58:24.887] [INFO] prefix cache: nothing cached yet (this is the first request)
+[2026-11-07 07:58:24.887] [INFO] prompt split: system+tools=2 tok / total=38981 tok (0.0%), ring_capacity=11264, ring covers it
+[2026-11-07 07:58:24.887] [INFO] prefill batching: chunk=2048 macroblock=39424 moe_chunks=8 (=> MoE batch = 16384 tok, guard=16384) [n=38980]
+[2026-11-07 07:58:24.887] [INFO] prefill prompt workspace expanded: tokens_cap=16384->39424 mask_bytes=32->612 (prealloc_full=1, n=38980)
+[2026-11-07 07:59:37.163] [INFO] V4.1 suffix shrink[snapshot-guard v2]: front=all shift=512 valid_from=38468 (total=38980, layer20 rows=36054..38980 of 38980)
+[2026-11-07 07:59:45.211] [INFO] response state: loaded 16 slot(s) from /Users/fangqingyuan/.cache/myds/responses.idx
+[2026-11-07 07:59:45.212] [INFO] [127.0.0.1:54171] Completed ChatCompletions /v1/chat/completions - prompt: 38981 tok, prefill: 38980 tok in 78.3s = 498.0 t/s (cached 0), ttft: 78.3s, decode: 75 tok in 2.0s = 37.4 t/s, wall: 80.3s (infer 80.3s, queue 0.0s), finish_reason: stop, steer: disabled
+[2026-11-07 07:59:45.212] [INFO] Server stopped gracefully
+[2026-11-07 07:59:45.212] [INFO] GLP steer: releasing profile [glp27] (/Users/fangqingyuan/.lmstudio/models/msuiche/glp.deepseek-v41-flash-1017-GLP-27-L11-37-a3.5.gguf)
+[2026-11-07 07:59:45.212] [INFO] GLP steer: releasing profile [glp39] (/Users/fangqingyuan/.lmstudio/models/msuiche/glp.deepseek-v41-flash-1017-GLP-39-L1-39-a0.75.gguf)

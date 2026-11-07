@@ -135,7 +135,7 @@
       "kind": "prefill",
       "where": "§十一 决定性对照，台账 §105 一栏",
       "prompt_file": "p32k_ab__v0.txt",
-      "source": "corpus: 台账 §105 原始测量（raw/rig.jsonl，32,210–32,225 token）",
+      "source": "corpus: 台账 §105 自己的原始行 benchmarks/register_only_2026-10-27/raw/rig.jsonl",
       "comparable_to_ledger_105": true
     },
     {
@@ -144,6 +144,14 @@
       "where": "§十一 决定性对照，HEAD b0b7b77 一栏",
       "prompt_file": "p32k_ab__v0.txt",
       "source": "corpus: 2026-11-07 08:06 实测，32,223 token，52.0 s",
+      "comparable_to_ledger_105": true
+    },
+    {
+      "value": 615.2,
+      "kind": "prefill",
+      "where": "§十一 决定性对照的第三臂（691bc26）",
+      "prompt_file": "p32k_ab__v0.txt",
+      "source": "corpus: 2026-11-07 08:20 实测，32,224 token，52.4 s",
       "comparable_to_ledger_105": true
     }
   ]
