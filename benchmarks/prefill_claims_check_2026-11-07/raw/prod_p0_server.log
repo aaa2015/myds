@@ -1,0 +1,2 @@
+[2026-11-07 13:01:20.487] [INFO] prefill engram async: background thread started (32221 tokens)
+[2026-11-07 13:02:08.092] [INFO] [127.0.0.1:50401] Completed ChatCompletions /v1/chat/completions - prompt: 32222 tok, prefill: 32221 tok in 47.5s = 678.0 t/s (cached 0), ttft: 47.6s, decode: 2 tok in 0.0s = 38.2 t/s, wall: 47.6s (infer 47.6s, queue 0.0s), finish_reason: length, steer: disabled

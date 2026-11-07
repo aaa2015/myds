@@ -579,6 +579,15 @@
       "prompt_file": null,
       "source": "synthetic: big128k，126,994 token，2 个 macroblock",
       "comparable_to_ledger_105": false
+    },
+    {
+      "value": 678.0,
+      "unit": "t/s",
+      "kind": "throughput",
+      "where": "§146.8 生产部署后实测（32,221 tok，nonce 保证冷）",
+      "prompt_file": "p32k_ab__v0.txt",
+      "source": "corpus: 生产 8187，MYDS_ENGRAM_PREFILL_ASYNC 默认开，47.5 s",
+      "comparable_to_ledger_105": true
     }
   ]
 }

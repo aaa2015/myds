@@ -39,6 +39,8 @@ ARMS = {
     # 2026-11-07 §146：P0 后台线程，默认开；这里两臂只差 MYDS_ENGRAM_PREFILL_ASYNC。
     "p0sync_server.log":   ("§146 sync  MYDS_ENGRAM_PREFILL_ASYNC=0", "p32k_ab__v0.txt", "a79b410a12f179df"),
     "p0async_server.log":  ("§146 async MYDS_ENGRAM_PREFILL_ASYNC=1", "p32k_ab__v0.txt", "a79b410a12f179df"),
+    # §146.8 生产部署后实测。只有两行（线程启动 + Completed），是日志摘录而不是全量。
+    "prod_p0_server.log":  ("§146.8 生产 8187（默认开）", "p32k_ab__v0.txt", "a79b410a12f179df"),
 }
 
 # 冒烟探针（X-Myds-Warmup）不是测量，剔掉。
