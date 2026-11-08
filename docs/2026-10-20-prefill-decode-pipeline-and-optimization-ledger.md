@@ -20448,7 +20448,7 @@ dispatch 会成功（host 只查 `kernel_constants_preflight`），kernel 却立
 
 | 方案 | 上界 | 门禁(2%) | 核实状态 | 建议 |
 |---|---:|---|---|---|
-| **P-1** | +2.0~4.1% prefill | **过** | 代码全对，0-ULP 构造性成立 | **值得做，且是唯一过门的** |
+| **P-1** | +2.0~4.1% prefill | ~~过~~ | 代码全对、0-ULP 成立，**实测 −7.5%（寄存器压力）** | **已做并回滚，见 §167** |
 | P-2 | +1.0~1.8% prefill | 不过 | 「6 行」错，漏 4 处（含 kernel） | 32K 不做；长上下文另议 |
 | D-1 | +1.4% decode | 不过 | 诊断对，上界被高估 | 不做（第二次了） |
 | D-2 | +1.5% decode | 不过 | 禁用理由未查清 | 先查理由，不急着拆门 |
@@ -20459,4 +20459,131 @@ dispatch 会成功（host 只查 `kernel_constants_preflight`），kernel 却立
 `so4` 的 lane 槽位布局全部对得上），比上一份强；但**数字可靠性不足**
 （`DECODE_SPLIT=4`、`48.9 GB/tok` 两处硬错，且 P-2 漏了 kernel 侧拒绝分支，
 照做会静默出错）。**结论：可以当线索用，不能当依据用。**
+
+## §167 P-1 实施并证否：so4 进寄存器 0-ULP 通过，但 prefill **−7.5%**（2026-11-08 13:10）
+
+「采纳」= 做 P-1（flash_attn vec kernel 的 `so4`/`sq4` smem 往返改寄存器）。
+**实现了、0-ULP 通过、实测慢 7.5%，已回滚。**
+
+### 167.1 改了什么
+
+`metal/flash_attn.metal` 的 `kernel_flash_attn_ext_vec`：NSG==1 时把每 lane 独占的
+`o4_t so4[DV4/NL]`（4 个 float4）换成线程私有 `o4_t ro[OV]`，四条访问点全部分支：
+
+- 初始化 `so4[i*NL] = 0` → `ro[ii] = 0`
+- softmax 重标定 `so4[ii*NL] *= ms` → `ro[ii] *= ms`
+- 累加 `so4[ii*NL] += lo[ii]` → `ro[ii] += lo[ii]`
+- sinks 重标定 同上
+- 写出 `dst4[...] = so4[i]*S` → `for k: i = tiisg + k*NW; dst4[...] = ro[k]*S`
+
+NSG>1 的分支原样保留。**构造性论证成立**：`so4 += tiisg` 后每 lane 只访问
+`tiisg + ii*32`，跨 SG 归约循环在 NSG==1 时执行 0 次 ⇒ 换存储介质不改加法顺序。
+
+### 167.2 门 1（0-ULP）：通过
+
+同 binary、同 prompt、temp 0，各 3 次：
+
+| 臂 | 内容 sha |
+|---|---|
+| old（smem） | `f9d05972cc65cbf8` ×3 |
+| new（寄存器） | `f9d05972cc65cbf8` ×3 |
+
+**6/6 逐字节相同。** 论证与实际一致。
+
+### 167.3 门 2（吞吐）：−7.5%，两臂完全分离
+
+32,213 token 冷 prefill，三个不同语料变体：
+
+| 臂 | v0 | v1 | v2 | 中位 |
+|---|---:|---:|---:|---:|
+| **old（smem）** | 679.5 | 682.0 | 683.0 | **682.0 t/s** |
+| **new（寄存器）** | 615.9 | 630.6 | 651.2 | **630.6 t/s** |
+
+**new 的最大值 651.2 < old 的最小值 679.5 ⇒ 分离干净，不是噪声。**
+**⇒ −7.5%。**
+
+### 167.4 为什么慢：寄存器压力
+
+每线程多 16 个 32-bit 寄存器（4×float4）。这个 kernel 是
+`NE=1, Q=1, C=32, HEAD_FIRST` 的 32 线程/TG 配置，`mqk[32]`、`lo[DV4/NL]`、
+`q4`/`k4`/`v4` 指针本来就在抢同一批寄存器。
+增加到溢出后会**在栈上分配**，而那正是我们想避免的 smem 往返的等价物，
+外加 spill/fill 指令 —— 比原来的 smem 访问更贵。
+
+**提案自己写的失败条件就是「寄存器溢出或 occupancy 减半 ⇒ 回滚」。实测命中。**
+
+⚠️ **未直接取到 spill 计数**：`-emit-llvm` 的 IR 里没有 kernel 符号名，
+`xcrun metal` 也没有暴露 `-print-regusage`。**这是本轮的方法缺口**，
+将来若要再做寄存器化，应先用 `MTLCompileOptions` 拿 `maxTotalThreadsPerThreadgroup`
+或读 AIR 的 `.regcount`，而不是靠实测反推。
+
+### 167.5 回滚与可复现性
+
+| 项 | 值 |
+|---|---|
+| `metal/flash_attn.metal` | `git checkout` 回滚 |
+| 重建 metallib | **`d37bde4890ea2c5a`，4,310,930 B —— 与改动前逐字节相同** |
+| 结论 | 回归确实来自源码改动，不是构建差异 |
+
+### 167.6 本轮真正值钱的不是结论，是三个测量陷阱
+
+这一轮花了一个多小时在**测量方法**上，而不是在 kernel 上。三个坑都必须记下来，
+否则下次还会踩，而且**每一个都会给出看起来合理的假数据**。
+
+#### 陷阱 1：两个 150 GB 实例并存 ⇒ OOM 让请求静默失败
+
+`prod_guard.sh` 在脚本退出时把生产 8187 拉了起来，与探针 8188 同时加载模型
+（各约 150 GB，机器 192 GB）。请求返回 `prefill returned -1` +
+`command buffer failed: Insufficient Memory`，而 **curl 的 `-w %{time_total}` 照样打印**
+⇒ 看起来像「6.27 秒的 prefill」，实际是失败。
+
+**判据**：`-w` 的时间不是证据；必须同时断言响应体是 200 且日志里有 `prefill: N tok in`。
+
+#### 陷阱 2：`MYDS_RESP_STATE` 持久化 ⇒ 另一臂重放旧响应
+
+`$HOME/.cache/myds/responses.idx` 会存 16 个槽的累积提示词。
+第二个臂发出**完全相同的请求**时直接重放：`prefill: none (all 32219 cached)`，
+**0.137 秒**。设置 `MYDS_RESP_STATE=<per-arm 路径>` 只解决一半。
+
+#### 陷阱 3（最狠）：`MYDS_KV_DSK` 在 conf 里是开着的
+
+```
+myfleet/myds.conf:206: MYDS_KV_DSK=/Users/fangqingyuan/myds-kv      # 100 GB 预算
+```
+
+`kvdisk` 把 prompt-end KV 快照落盘，**跨进程、跨重启存活**。
+所以即使清空 `~/.cache/myds`、即使换 `MYDS_RESP_STATE`，第一个请求仍然是
+`prefix cache: DISK load+apply … selected 32219 tokens` ⇒ 免掉全部 prefill。
+
+**而且它是 conf 键 ⇒ 环境变量被无条件覆盖（§155.2）**，只能用 conf 副本改：
+每臂一份 `conf_<tag>`，`MYDS_KV_DSK` 指向**每臂独立的空目录**，开跑前 `rm -rf`。
+
+**最终固化的判据（已写进 `tools/probe_p1_attn_reg.sh`）**：
+
+```sh
+n_real=$(grep -ac "prefill: 322[0-9][0-9] tok in" "server_$tag.log")
+[ "$n_real" -lt 3 ] && { echo "!! 出现缓存重放，本轮数据无效"; return 1; }
+```
+
+**没有这条断言，前面三次跑出的全是假数据。** 这与 §26.10.1 的两次假阳性同源：
+「A/B 之前先证明两臂确实不同」，现在是「冷 prefill 之前先证明它真的冷」。
+
+### 167.7 处置
+
+| 项 | 状态 |
+|---|---|
+| `metal/flash_attn.metal` | 已回滚 |
+| metallib | `d37bde4890ea2c5a`（与生产一致） |
+| 二进制 | `38575e8d7a1b73d8`（未变） |
+| 生产 | pid 58899，`/health` ok |
+| `tools/probe_p1_attn_reg.sh` | **保留**，含三条陷阱的防护与断言 |
+
+### 167.8 对提案方记一笔
+
+这次的**代码事实全对**（模板参数、`so4` 的 lane 槽位、归约循环死代码、3328 B smem），
+**0-ULP 的构造性论证也对**（实测 6/6 逐字节相同）。
+
+**错的只有那一句「寄存器里省了也不丢什么」** —— 它没有评估寄存器预算。
+而它自己列出的失败条件恰好命中。**这说明那份失败条件清单是有价值的，
+价值就在于它能拦住作者自己的乐观估计。**
 
