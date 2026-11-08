@@ -69,8 +69,15 @@ def emit(path, rec):
 
 
 def pids():
-    r = subprocess.run(["pgrep", "-x", "myds"], capture_output=True, text=True)
-    return [int(x) for x in r.stdout.split()]
+    """只返回【监听本基准端口】的 myds 进程（§164）。
+
+    原实现是 `pgrep -x myds` —— 它会连带杀掉生产 8187 上的实例，
+    2026-11-08 07:10–07:25 那次 6 分半停机就是这么来的。
+    现在按端口收窄；再套一层 tools/with_prod_guard.sh 就能保证结束后恢复生产。
+    """
+    out = subprocess.run(["lsof", "-nP", "-iTCP:%d" % port, "-sTCP:LISTEN", "-t"],
+                         capture_output=True, text=True)
+    return [int(x) for x in out.stdout.split() if x.strip().isdigit()]
 
 
 def mem_gb():

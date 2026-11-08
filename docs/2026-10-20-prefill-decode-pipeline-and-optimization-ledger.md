@@ -20060,6 +20060,9 @@ prefill 678.5 t/s（32K 冷）。
    已排除：cron（只有日志轮转）、launchd（无相关任务）、统一日志（无 kill 记录）、
    循环脚本进程（无）。日志只有 `Server stopped gracefully`（仅 SIGTERM/SIGINT 可触发）。
    **根因未确认。若再来一次，当日所有测量作废。**
+   → **已于 2026-11-08 11:55 查清，见 §164**：机制是「多个脚本杀生产但不恢复」的结构缺陷；
+   触发者是哪个脚本**无法确定**（无审计痕迹），但已用两层守卫（`prod_guard.sh` /
+   `with_prod_guard.sh`）把它变成不可能静默发生。
 2. **43.0 vs 账本 43.97**：口径未对齐（21 tok vs ~30 tok prompt）。
    43.0 比中位低 2.2%（略超 1.3% 重复性）但高于同组最低值 42.87。
    **只能说「未确认」，不能说「没退化」。** 判定需固定 prompt、同端口、交替 ≥2 轮。
@@ -20086,4 +20089,156 @@ prefill 678.5 t/s（32K 冷）。
 4. **折算口径由执行计数（`cbs`）判定，不由 `out_tokens` 想当然。**
 5. **凡是「看起来很大的选项」，先用最便宜的方式量出真值再谈取舍。** P-2 就是这一条，
    它用一个 10 分钟窗口把「+11~14%」变成「+3.6%」，直接关掉了一个悬了很久的决策点。
+
+## §164 §163.6 遗留项 1 查清：生产停摆 6 分半是「脚本杀生产但不恢复」的结构缺陷（2026-11-08 11:55）
+
+§163.6 记了两个未解决项，这是第 1 项的结论。
+
+### 164.1 发生了什么（精确到秒）
+
+`logs/local-deepseek-flash.log` 里那一段（文件含 NUL 字节，必须 `tr -d '\000'` 后 grep，
+否则 grep 会静默当二进制处理 —— 这一点也记下来，我为此多花了两轮）：
+
+| 时间 | 事件 |
+|---|---|
+| 06:48:35 | 部署后启动（`FLEET_CMD` 行存在） |
+| 07:10:05 | 停止 |
+| 07:13:24 | 启动（**无 `FLEET_CMD` 行**） |
+| 07:15:48 | 停止 |
+| 07:18:38 | 启动（无 `FLEET_CMD`） |
+| 07:20:47 | 停止 |
+| 07:23:54 | 启动（无 `FLEET_CMD`） |
+| **07:25:04** | **停止，之后没有任何东西重启** |
+| 07:31:36 | 我手动拉起 |
+
+⇒ **停摆 6 分 32 秒。**
+
+### 164.2 那四次「启动」不是 start_fleet.sh 起的
+
+判据：`start_fleet.sh` 会在日志开头写 `FLEET_CMD:` 与分隔线，并且**截断日志**。
+这四次启动前的日志里没有 `FLEET_CMD` 行，日志也没被截断
+⇒ 是**某个脚本直接 exec `bin/myds`，并把 stdout 追加到生产日志**。
+
+每次实例做了什么（以 07:13–07:15 那次为例）：
+
+```
+07:13:31  request trace: 128 records … (page: GET /trace)
+07:14:02  POST /v1/chat/completions   max_tokens=256 temp=0
+07:14:09  Completed … prompt: 21 tok, prefill: 20 tok
+07:14:15  Completed … prompt: 21 tok (all cached)
+07:14:21  Completed … prompt: 21 tok (all cached)
+07:15:48  Server stopped gracefully
+```
+
+**形态 = 「起服务 → 3 次 256-token decode（21-token prompt）→ 停」。四轮，间隔约 5 分钟。**
+这与仓库里 `tools/accept_*.sh` **`for arm in 0 1 × for ctx in d2k d24k` 的四轮循环**一致。
+
+**触发者无法确定**：cron 只有日志轮转、launchd 无相关任务、统一日志无 kill 记录、
+没有 tmux/screen、没有存活脚本进程、非交互 shell 无 history。
+⇒ **只能确认机制，不能确认是谁点的。** 这一点如实记录，不猜。
+
+### 164.3 根因是结构性的：6 个脚本杀生产，0 个恢复
+
+| 脚本 | kill 生产 | 结束时恢复 |
+|---|---|---|
+| `accept_rows4_auto.sh` | ✅ | **❌** |
+| `accept_rows4_ulp.sh` | ✅ | **❌** |
+| `prod_ab_rows4.sh` | ✅ | **❌** |
+| `accept_indexer_rows4.sh` | ✅ | **❌** |
+| `repro_rows4_crash.sh` | ✅ | **❌** |
+| `bench_prod_before_after.sh` | ✅ | **❌** |
+
+更恶劣的一类：**按进程名杀**，与端口无关 ——
+
+```python
+# tools/bench_register_only_ab.py（原实现）
+def pids():
+    r = subprocess.run(["pgrep", "-x", "myds"], ...)   # ← 杀掉【所有】myds
+    return [int(x) for x in r.stdout.split()]
+```
+
+`tools/bench_context_arm.py` 同形。它们会连生产一起杀掉，然后 30 秒后 `SIGKILL`。
+
+**⇒ 只要有人跑其中任何一个并且中途被打断，生产就躺在地上，没有任何机制把它扶起来。**
+这正是 07:25–07:31 那 6 分半。
+
+### 164.4 修法：两层守卫（都已实测）
+
+#### 第一层 `tools/prod_guard.sh`（shell 脚本内 source）
+
+source 的那一刻记下生产进程的**完整命令行 + cwd（规范化成真实绝对路径）**，
+用 `trap … EXIT INT TERM HUP` 在脚本以任何方式结束时，若端口空则按原样重放。
+
+已接入上面 6 个 shell 脚本（各加一行 `. "$(dirname "$0")/prod_guard.sh"`，语法全过）。
+
+**踩到的两个坑（都是自检时才暴露的，值得记）**：
+
+1. 只记命令行不够 —— 生产的 argv0 是相对路径 `../myds/bin/myds`，
+   恢复时 cwd 不同 ⇒ `sh: ../myds/bin/myds: No such file or directory`，生产没起来。
+   **必须同时记 cwd。**
+2. 记了 cwd 仍不够 —— 命令行里混着 `$HOME/../myds/...` 这类串，重放会解析到错误位置。
+   **必须在捕获时把 argv0 规范成真实绝对路径**，并把整条恢复命令拼成字符串，
+   恢复时不再依赖任何变量展开。
+
+#### 第二层 `tools/with_prod_guard.sh`（万能包装器）
+
+仓库里有 **48 个 python 脚本**引用 8187，逐个改不现实。所以提供：
+
+```bash
+tools/with_prod_guard.sh python3 tools/bench_register_only_ab.py --rounds 2
+tools/with_prod_guard.sh ./tools/accept_rows4_ulp.sh
+tools/with_prod_guard.sh --dryrun <任何命令>     # 只打印将执行的恢复命令
+```
+
+记录 → 原样执行（stdin/stdout/退出码全透传）→ 退出时按需恢复。
+
+#### 附带修掉「按进程名杀」
+
+`bench_register_only_ab.py` / `bench_context_arm.py` 的 `pids()` 改成
+`lsof -nP -iTCP:<port> -sTCP:LISTEN -t` —— 只碰自己那个端口的实例。
+
+### 164.5 实测证据
+
+| 测试 | 结果 |
+|---|---|
+| `prod_guard.sh` 自检（dryrun） | 只打印，不动手 ✅ |
+| `prod_guard.sh` 端到端（source 后 kill 生产，脚本退出） | **自动拉起，`/health` ok** ✅ |
+| `with_prod_guard.sh` 端到端（包装 `kill -TERM`） | **自动拉起，pid 51654 `/health` ok** ✅ |
+| 6 个 shell 脚本 | `bash -n` 全通过 ✅ |
+| 2 个 python 脚本 | `ast.parse` 通过 ✅ |
+
+### 164.6 顺带发现：07:17:26 有一次**退出时** SIGSEGV（新缺陷，非本次停机原因）
+
+`myds-2026-11-08-071726.ips`：`EXC_BAD_ACCESS / SIGSEGV`，`byProc: exc handler`。
+崩在**进程退出路径**上：
+
+```
+thread 0: exit → __cxa_finalize_ranges → CoreAnalytics::atExitHandler
+          → dispatch_group_wait_slow        ← 卡在这里
+thread 1: myds  __myds_metal_residency_activate_block_invoke → usleep
+thread 2/3/4: 0 frames（已无栈）
+```
+
+**不是**这次反复起停的原因（它在 07:15:48 停止之后、07:18:38 启动之前，
+是上一个进程的 teardown）。但它是一个**真实的退出期竞态**：
+`exit()` 的 atExit 处理器在等 dispatch group，而 residency 后台块还在跑并访问
+已开始释放的内存。
+
+与 §153 同类（关机时序），但 §153 修的是「不等请求线程」，
+这一条是「atExit 与 residency 块」—— **尚未修，记为待办。**
+
+### 164.7 处置
+
+| 项 | 状态 |
+|---|---|
+| `tools/prod_guard.sh` | 新增，6 个 shell 脚本已接入 |
+| `tools/with_prod_guard.sh` | 新增（覆盖 48 个 python 脚本的通用入口） |
+| 2 个 `pgrep -x myds` | 已收窄为端口限定 |
+| 生产 | pid **51654**，`/health` ok，`d206691b` |
+| 退出期 SIGSEGV | **待办**（§164.6） |
+| 触发者身份 | **无法确定**，只确认了机制 |
+
+**纪律（新增）**：任何会动 8187 的脚本，必须满足其一 ——
+(a) source `tools/prod_guard.sh`；(b) 用 `tools/with_prod_guard.sh` 包起来。
+新增脚本评审时检查这一条。
 

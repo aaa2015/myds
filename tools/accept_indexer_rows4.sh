@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/prod_guard.sh"   # §164：退出时自动恢复生产 8187
 # §151 验收：indexer rows4 的端到端 A/B。
 # 两臂只差 MYDS_INDEXER_SCORE_ROWS4（0 = 1-row smem 原版，1 = rows4）。
 # 每个上下文长度各跑 3 轮，交替。

@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/prod_guard.sh"   # §164：退出时自动恢复生产 8187
 # §152 补测 + §154 验收：rows4 的 auto 阈值。
 #   auto（默认）: n_comp >= 8192 才用 rows4
 #   ref        : 强制 0（原 1-row smem）

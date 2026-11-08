@@ -83,8 +83,13 @@ def emit(path, record):
 
 
 def pids():
-    out = subprocess.run(["pgrep", "-x", "myds"], capture_output=True, text=True).stdout
-    return [int(x) for x in out.split()]
+    """只返回【监听本基准端口】的 myds 进程（§164）。
+
+    原实现是 `pgrep -x myds` —— 会连带杀掉生产 8187 上的实例。
+    """
+    out = subprocess.run(["lsof", "-nP", "-iTCP:%d" % DEFAULTS["port"], "-sTCP:LISTEN", "-t"],
+                         capture_output=True, text=True).stdout
+    return [int(x) for x in out.split() if x.strip().isdigit()]
 
 
 def mem_gb():

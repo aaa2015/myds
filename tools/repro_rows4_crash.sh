@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/prod_guard.sh"   # §164：退出时自动恢复生产 8187
 # §151 复现：rows4 在长上下文上段错误。
 # 每次追加唯一 nonce，避免 KV 磁盘快照命中（否则 prefill 不跑，复现不出）。
 set -u

@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/prod_guard.sh"   # §164：退出时自动恢复生产 8187
 # 生产级 A/B：旧二进制（adeb1f4e，rows4 关）vs 新二进制（e6d2a1a0，rows4 auto）
 # 28.4K prompt + 200 token 输出，交替各 2 轮。这是 rows4 真正生效的唯一口径。
 set -u

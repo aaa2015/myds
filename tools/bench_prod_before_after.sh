@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/prod_guard.sh"   # §164：退出时自动恢复生产 8187
 # 部署前后同口径对比：32K 冷 prefill + decode（各 3 次 decode、2 次 prefill）
 # 用法: bench_prod.sh <tag>
 set -u

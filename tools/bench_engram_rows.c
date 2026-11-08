@@ -74,6 +74,11 @@ int main(int argc, char **argv) {
     /* 每次读 48 行（2 层 × 24 列），与 decode 完全同形。
      * 行号用固定种子随机生成：既不是连续行（不会吃到 readahead），
      * 也不可重复（不会命中去重逻辑）。 */
+    /* 2026-11-08（§164）：hot 模式 = 同一批 48 行重复读。
+     * 用来分离「pread 成本」与「decode 成本」——
+     * 决定「预取进 page cache」能省多少。冷读 ≈ 4730 µs(串)/502 µs(池16)，
+     * 热读就只剩下 decode。 */
+    const int hot = argc > 4 && strcmp(argv[4], "hot") == 0;
     srand(20261107);
     double ser_us = 0, par_us = 0;
     int ser_n = 0, par_n = 0;
@@ -82,9 +87,11 @@ int main(int argc, char **argv) {
 
     /* 预热：让线程池起来、页表建立，不计时。 */
     for (int round = 0; round < rounds; ++round) {
-        for (int l = 0; l < MYDS_ENGRAM_LAYERS; ++l)
-            for (int c = 0; c < MYDS_ENGRAM_COLS; ++c)
-                rows[l][c] = (uint32_t)(((uint64_t)rand() * 2654435761u) % t[l].rows);
+        if (!hot || round == 0) {
+            for (int l = 0; l < MYDS_ENGRAM_LAYERS; ++l)
+                for (int c = 0; c < MYDS_ENGRAM_COLS; ++c)
+                    rows[l][c] = (uint32_t)(((uint64_t)rand() * 2654435761u) % t[l].rows);
+        }
 
         if (round < 4) {
             for (int l = 0; l < MYDS_ENGRAM_LAYERS; ++l)
@@ -116,6 +123,24 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* decode-only：不碰磁盘，只重复解码一个合法 raw 缓冲（§164）。
+     * code 取 0..126 循环（避开 code&127==127 的 EDOM 分支），
+     * scale 取 128..255 循环（避开 255 的 EDOM 分支）。 */
+    if (argc > 4 && strcmp(argv[4], "decode") == 0) {
+        static uint8_t raw[MYDS_ENGRAM_ROW_BYTES];
+        for (int i = 0; i < MYDS_ENGRAM_DIM; ++i) {
+            raw[i] = (uint8_t)(i % 127);
+            raw[MYDS_ENGRAM_DIM + i / 32] = (uint8_t)(128 + (i / 32));
+        }
+        const int reps = 20000;
+        const double t0 = now_us();
+        for (int i = 0; i < reps; ++i)
+            if (!myds_engram_decode_row(raw, out[0])) { fprintf(stderr, "decode failed\n"); return 1; }
+        const double row_us = (now_us() - t0) / reps;
+        printf("decode_us_per_ROW=%.3f  (x48 rows = %.1f us/token)\n", row_us, row_us * 48.0);
+        return 0;
+    }
+    printf("mode=%s\n", hot ? "hot(same 48 rows)" : "cold(random 48 rows)");
     printf("rounds,serial_us_per_token,pool_workers,pool_us_per_token,speedup\n");
     printf("%d,%.1f,%u,%s,%s\n", ser_n, ser_n ? ser_us / ser_n : 0.0, pool,
            par_n ? "" : "n/a",

@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(dirname "$0")/prod_guard.sh"   # §164：退出时自动恢复生产 8187
 # §151 第 2 道门：同 prompt、temp 0，两臂逐字节比对。
 # 与性能 A/B 分开：那边每次加 nonce 保证冷 prefill，会把 prompt 改掉。
 set -u
