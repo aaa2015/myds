@@ -980,6 +980,24 @@
       "prompt_file": null,
       "source": "synthetic smoke: 生产 8187，32,220 tok / 47.5 s。基语料 = benchmarks/register_only_2026-10-27/prompts/p32k_ab__v0.txt（内容 sha 1a22b57b104b130c 已核对一致），但每轮追加唯一 nonce 以保证冷 prefill，因此输入并非逐字节等于该语料文件 ⇒ prompt_file 记 null。单次部署冒烟，未入 runs.jsonl A/B 归档。",
       "comparable_to_ledger_105": false
+    },
+    {
+      "value": 682.3,
+      "unit": "t/s",
+      "kind": "throughput",
+      "where": "§161.3 P-2 vec 臂，32,213 tok",
+      "prompt_file": null,
+      "source": "corpus: benchmarks/register_only_2026-10-27/prompts/p32k_ab__v0/v1/v2.txt 三个变体各跑一次取中位（每次输入逐字节等于对应文件，未加 nonce）；因为中位跨越三个文件，prompt_file 记 null 而不是任选其一。探针 8188，二进制 d206691b / metallib d37bde48，conf 仅差 MYDS_PREFILL_ATTN 一行。不在 runs.jsonl A/B 归档内。",
+      "comparable_to_ledger_105": false
+    },
+    {
+      "value": 707.2,
+      "unit": "t/s",
+      "kind": "throughput",
+      "where": "§161.3 P-2 matrix 臂，32,213 tok",
+      "prompt_file": null,
+      "source": "corpus: benchmarks/register_only_2026-10-27/prompts/p32k_ab__v0/v1/v2.txt 三个变体各跑一次取中位（每次输入逐字节等于对应文件，未加 nonce）；因为中位跨越三个文件，prompt_file 记 null 而不是任选其一。探针 8188，二进制 d206691b / metallib d37bde48，conf 仅差 MYDS_PREFILL_ATTN 一行。不在 runs.jsonl A/B 归档内。",
+      "comparable_to_ledger_105": false
     }
   ]
 }
