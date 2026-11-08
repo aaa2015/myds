@@ -97,6 +97,11 @@ prefill 与 decode 都已无两位数收益方向。
 **这一节比性能数字更有用。** 如果你打算优化这个引擎，先看这张表——这些方向已经有人用真实权重、真实 GPU 窗口测过了，
 重复它们只会浪费时间。每一条后面都有明确的测量依据，细节在[性能账本](docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md)。
 
+> **动手测之前先读 [`docs/MEASUREMENT-DISCIPLINE.md`](docs/MEASUREMENT-DISCIPLINE.md)。**
+> 它回答「怎么保证测出来的数字不是假的」：`--config` 覆盖环境变量、三个让冷 prefill
+> 悄悄变成热启动的缓存、A/B 两臂必须先证明不同、`gpu_gap` 不可回收、
+> 0-ULP 通过不等于有收益。每一条都来自一次真实翻车，标了账本节号。
+
 ### MoE（14 个候选，全部未达标）
 
 | 尝试 | 结果 |
