@@ -265,6 +265,44 @@ static int load_config_early(int argc, char *argv[]) {
     return myds_configfile_load(path, true);
 }
 
+/* §165：退出时是否拆除 Metal 驱动层。
+ *
+ * 默认 0（不拆）。原因：2026-11-08 实测，即使心跳线程已经停掉，
+ * `myds_metal_cleanup()` 走到 `_MTLCommandQueue dealloc → -[IOGPUMetalDevice _purgeDevice]
+ * → IOGPUResourceListDestroy` 时仍会 EXC_BAD_ACCESS（6 次退出崩 1 次，
+ * 报告 myds-2026-11-08-120125.ips）。这是驱动层内部的释放时序问题，
+ * 我们改不了；但可以【选择不进入】它 —— 进程马上就结束了，内核会回收。
+ *
+ * 这与 §153 的取舍一致：宁可泄漏，也不要在关机时序上争。
+ * =1 恢复旧行为（完整 teardown），只用于复现/对照，不给生产用。
+ *
+ * 注意：一旦跳过 teardown，必须用 `_exit()` 而不是 `return`，
+ * 否则 atexit / __cxa_finalize / CoreAnalytics 仍会跑，把竞态又请回来。 */
+static int exit_metal_teardown_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("MYDS_EXIT_METAL_TEARDOWN");
+        cached = (e && *e && atoi(e) != 0) ? 1 : 0;
+    }
+    return cached;
+}
+
+/* 统一的正常退出：停心跳 → 释放自己的内存 → 有选择地拆驱动层。 */
+static void exit_after_cleanup(int rc, int free_ctx,
+                              myds_context_t *ctx, myds_model_t *model) {
+    myds_metal_residency_stop_at_exit();     /* §164.6：心跳必须先停 */
+    if (free_ctx) {
+        if (ctx) myds_context_free(ctx);
+        if (model) myds_model_free(model);
+    }
+    if (exit_metal_teardown_enabled()) {
+        myds_metal_cleanup();
+        return;                              /* 让 main 正常 return，保留 atexit */
+    }
+    fflush(NULL);
+    _exit(rc);                               /* §165：跳过驱动层拆除与 atexit */
+}
+
 int main(int argc, char *argv[]) {
     /* ★ 必须最先执行：下面所有函数都会 getenv */
     const int cfg_n = load_config_early(argc, argv);
@@ -517,6 +555,12 @@ int main(int argc, char *argv[]) {
         MYDS_LOG_E("Failed to load model from %s", model_path);
         return 1;
     }
+    /* §164.6 兜底：无论从哪条路径退出，都要先停 residency 心跳。
+     * atexit 是 LIFO —— 我们比系统框架晚注册，所以【先】于它们执行，
+     * 正好抢在 CoreAnalytics 的 atExitHandler 之前把线程收掉。
+     * 正常路径已经显式调用过，本函数幂等。 */
+    atexit(myds_metal_residency_stop_at_exit);
+
     double load_t1 = myds_now_s();
     double load_sec = load_t1 - load_t0;
     MYDS_LOG_I("Model loaded successfully in %.2fs", load_sec);
@@ -526,7 +570,7 @@ int main(int argc, char *argv[]) {
     myds_context_t *ctx = myds_context_create(model, &cfg);
     if (!ctx) {
         MYDS_LOG_E("Failed to create inference context");
-        myds_model_free(model);
+        exit_after_cleanup(1, 0, NULL, model);
         return 1;
     }
     MYDS_LOG_I("Inference context initialized");
@@ -573,8 +617,7 @@ int main(int argc, char *argv[]) {
         if (!ctx->dspark) {
             MYDS_LOG_E("Failed to load DSpark support model from %s", dspark_path);
             if (capture_mode != 0) {
-                myds_context_free(ctx);
-                myds_model_free(model);
+                exit_after_cleanup(1, 1, ctx, model);
                 return 1;
             }
         } else {
@@ -585,8 +628,7 @@ int main(int argc, char *argv[]) {
     }
     if (capture_mode != 0 && !ctx->dspark) {
         MYDS_LOG_E("DSpark capture bypass requires a loaded support model");
-        myds_context_free(ctx);
-        myds_model_free(model);
+        exit_after_cleanup(1, 1, ctx, model);
         return 1;
     }
 
@@ -601,13 +643,16 @@ int main(int argc, char *argv[]) {
         /* rc == 2 表示关机时还有请求线程没退完（见 myds_server_start 的 drain 段）。
          * 那种情况下 ctx/model 里仍有线程在读写，绝不能 free —— 交给进程退出回收。
          * 这是 2026-11-07 定位的那个崩溃：detach 的客户端线程 + 立即 free ctx。 */
+        /* §164.6 + §165：停心跳、按需释放、有选择地拆驱动层。
+         * rc==2 时不能 free ctx/model（线程还在用），但【可以且必须】停心跳 ——
+         * 它不碰 ctx/model。 */
         if (rc == 2) {
             MYDS_LOG_E("main: request threads still running at shutdown; "
                        "leaving context/model allocated (process exit reclaims)");
+            exit_after_cleanup(0, 0, NULL, NULL);
             return 0;
         }
-        myds_context_free(ctx);
-        myds_model_free(model);
+        exit_after_cleanup(rc, 1, ctx, model);
         return rc;
     }
 
@@ -711,7 +756,6 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    myds_context_free(ctx);
-    myds_model_free(model);
+    exit_after_cleanup(exit_code, 1, ctx, model);
     return exit_code;
 }

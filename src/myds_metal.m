@@ -1086,6 +1086,59 @@ void myds_metal_residency_stop(void) {
     g_res_heartbeat_group = nil;
 }
 
+/* 退出期专用：把心跳线程停掉，且【有界等待】。
+ *
+ * 2026-11-08 事故（账本 §164.6）：myds-2026-11-08-071726.ips 显示进程退出时
+ *   thread 0: exit -> __cxa_finalize_ranges -> CoreAnalytics::atExitHandler
+ *             -> dispatch_group_wait_slow
+ *   thread 1: __myds_metal_residency_activate_block_invoke -> usleep   ← 还活着
+ * 根因是 myds_metal_cleanup() 在 main 的三条退出路径上一次都没被调用，
+ * 心跳线程活到 exit()，与 atExit 处理器并发访问 Metal 对象 ⇒ SIGSEGV。
+ *
+ * 这里刻意不用 DISPATCH_TIME_FOREVER：万一 requestResidency 卡住，
+ * 退出会被永久挂起（那比崩溃更难诊断）。最多等 200 ms，超时就放着 ——
+ * 进程马上结束，内核会回收；关键是【不再有线程在 atExit 期间跑】。
+ *
+ * 幂等；没有心跳时是空操作；可在任何线程调用。 */
+/* 开关：默认 1（退出时收心跳）。=0 时恢复 2026-11-08 之前的行为 ——
+ * 存在只为让「退出期崩溃」可以被 A/B 复现，不是给生产用的回退。
+ * 配合 MYDS_RESIDENCY_HB_MS=1 可把竞态窗口放大约 5 倍。 */
+static int residency_exit_stop_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("MYDS_RESIDENCY_EXIT_STOP");
+        cached = (!e || !*e || atoi(e) != 0) ? 1 : 0;
+    }
+    return cached;
+}
+
+void myds_metal_residency_stop_at_exit(void) {
+    if (!residency_exit_stop_enabled()) return;
+    atomic_store_explicit(&g_res_stop, true, memory_order_relaxed);
+    dispatch_group_t g = g_res_heartbeat_group;
+    if (!g) return;
+    /* 5 ms 一拍，200 ms 足够让循环看到 stop 标志并退出。
+     * 用短超时轮询而不是一次长等，避免把退出拖成 200 ms 固定延迟。 */
+    int i_used = 0;
+    for (int i = 0; i < 40; ++i) {
+        i_used = i;
+        if (dispatch_group_wait(g, DISPATCH_TIME_NOW) == 0) break;
+        usleep(5000);
+        i_used = i + 1;
+    }
+    g_res_heartbeat_group = nil;
+    if (dispatch_group_wait(g, DISPATCH_TIME_NOW) != 0) {
+        /* 还没退：不 free、不 nil 之外的动作，只记一笔。进程结束会回收。 */
+        fprintf(stderr, "myds_metal: residency heartbeat still running at exit "
+                        "(giving up after 200 ms; process exit reclaims)\n");
+    } else {
+        /* 常态：心跳被停掉。记一行是为了将来能一眼看出
+         * 「这次退出时心跳确实活着并被收掉」—— 否则这条修复没有可观测证据。
+         * 每进程只在退出时打一次。 */
+        MYDS_LOG_I("Residency heartbeat stopped at exit (waited %d x 5ms)", i_used);
+    }
+}
+
 static void residency_cleanup(void) {
     myds_metal_residency_stop();
 #if TARGET_OS_OSX

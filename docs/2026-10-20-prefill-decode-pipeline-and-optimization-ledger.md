@@ -20235,10 +20235,119 @@ thread 2/3/4: 0 frames（已无栈）
 | `tools/with_prod_guard.sh` | 新增（覆盖 48 个 python 脚本的通用入口） |
 | 2 个 `pgrep -x myds` | 已收窄为端口限定 |
 | 生产 | pid **51654**，`/health` ok，`d206691b` |
-| 退出期 SIGSEGV | **待办**（§164.6） |
+| 退出期 SIGSEGV | **已修**，见 §165（两层原因，各自 A/B 证明） |
 | 触发者身份 | **无法确定**，只确认了机制 |
 
 **纪律（新增）**：任何会动 8187 的脚本，必须满足其一 ——
 (a) source `tools/prod_guard.sh`；(b) 用 `tools/with_prod_guard.sh` 包起来。
 新增脚本评审时检查这一条。
+
+## §165 退出期 SIGSEGV 修掉：两层原因，各自 A/B 证明（2026-11-08 12:10）
+
+§164.6 记了一条「退出期 SIGSEGV，尚未修」。本节是结论。
+
+### 165.1 第一层：心跳线程活到 exit()
+
+**代码事实**：`myds_metal_cleanup()` 在 `src/*.c` 里**一次都没被调用**
+（只有 `myds_metal.m` 内部诊断路径调用）。所以 server 正常退出时：
+
+- residency 心跳线程（`dispatch_group_async` 里的 usleep 循环）**从未被 stop**
+- 进程 `exit()` → `__cxa_finalize_ranges` → CoreAnalytics atExitHandler
+  在 `dispatch_group_wait_slow` 上与仍在跑的心跳并发 ⇒ SIGSEGV
+
+原始崩溃报告 `myds-2026-11-08-071726.ips` 直接给出两个线程：
+```
+thread 0: exit → __cxa_finalize_ranges → CoreAnalytics::atExitHandler → dispatch_group_wait_slow
+thread 1: __myds_metal_residency_activate_block_invoke → usleep
+```
+
+**修法**：新增 `myds_metal_residency_stop_at_exit()`
+（`src/myds_metal.m` + `include/myds_metal.h`）：
+
+- 停心跳，**有界等待**（最多 200 ms，每 5 ms 轮询一次）——
+  刻意不用 `DISPATCH_TIME_FOREVER`：万一 `requestResidency` 卡住，退出会被永久挂起，
+  那比崩溃更难诊断。
+- 幂等；未初始化时是空操作；任意线程可调。
+- main 的**每条**退出路径都调用（server 正常 / rc==2 / CLI / 三条提前返回），
+  并加 `atexit()` 兜底（LIFO ⇒ 先于系统框架执行）。
+
+**可观测证据**（新增日志）：每次退出打一行
+`Residency heartbeat stopped at exit (waited N x 5ms)`。
+实测 `N=1` ⇒ **心跳在退出时确实活着，需要等一个 5 ms 周期才收掉。**
+这条日志就是「bug 条件真实存在且已被消除」的直接证据。
+
+### 165.2 第二层：即使停了心跳，拆驱动层仍会崩
+
+心跳修好后做 A/B（`MYDS_RESIDENCY_HB_MS=1` 放大竞态窗口）：
+
+| 臂 | 配置 | 6 次退出崩溃数 |
+|---|---|---:|
+| OFF | `MYDS_RESIDENCY_EXIT_STOP=0`（旧行为） | **3 / 6（50%）** |
+| ON | 默认（停心跳） | **1 / 6（17%）** |
+
+⇒ **降了三分之二，但没归零。** 剩下的那次崩溃签名不同：
+
+```
+_MTLCommandQueue dealloc → -[IOGPUMetalDevice _purgeDevice]
+  → IOGPUMetalCommandBufferStoragePoolPurge → IOGPUResourceListDestroy
+  → _xzm_free_outlined            EXC_BAD_ACCESS
+```
+（`myds-2026-11-08-120125.ips`）
+
+这是 **Metal 驱动层自己的释放时序**问题：命令缓冲存储池与资源列表在 queue dealloc 时
+发生竞态。我们改不了驱动，但**可以选择不进入**这段代码。
+
+### 165.3 修法：退出时不拆驱动层（`MYDS_EXIT_METAL_TEARDOWN`，默认 0）
+
+新增统一退出函数 `exit_after_cleanup(rc, free_ctx, ctx, model)`：
+
+1. `myds_metal_residency_stop_at_exit()` —— 必须先停心跳
+2. 按需 `myds_context_free` / `myds_model_free`（自己的内存，安全）
+3. `MYDS_EXIT_METAL_TEARDOWN=1` ⇒ 走 `myds_metal_cleanup()` 后正常 return（旧行为）
+4. 默认 ⇒ `fflush(NULL)` + **`_exit(rc)`**
+
+**为什么必须 `_exit` 而不是 `return`**：`return` 会跑 atexit 与 `__cxa_finalize`，
+CoreAnalytics 与 dyld 的收尾会把竞态又请回来。`_exit` 直接交还给内核。
+
+**这与 §153 的取舍完全一致**：进程马上就结束了，内核会回收 wired 内存与 GPU 资源；
+宁可「不释放」，也不要在关机时序上争 —— 争输就是 SIGSEGV。
+
+### 165.4 决定性 A/B（同一二进制，`MYDS_RESIDENCY_HB_MS=1`）
+
+| 臂 | 配置 | 6 次退出崩溃数 | 率 |
+|---|---|---:|---:|
+| TEARDOWN | `MYDS_EXIT_METAL_TEARDOWN=1`（拆驱动层） | **2** | **33%** |
+| **SKIP** | 默认（不拆驱动层，`_exit`） | **0** | **0%** |
+
+`START crash=18 → TEARDOWN 18→20 → SKIP 20→20`。
+
+**⇒ 退出期崩溃已消除（本实验 6/6 干净）。**
+
+### 165.5 代价与风险
+
+| 项 | 评估 |
+|---|---|
+| 内存/GPU 资源不释放 | **无实质影响**：进程即将结束，内核回收 |
+| atexit 处理器（CoreAnalytics 等）不再运行 | **无影响**：那是遥测，不是功能 |
+| 非 0 退出码 | **保留**：`_exit(rc)` 原样传出 |
+| stdout 缓冲 | `fflush(NULL)` 已处理 |
+| 正常 return 路径仍可用 | `MYDS_EXIT_METAL_TEARDOWN=1` 保留旧行为 |
+
+### 165.6 状态
+
+| 项 | 值 |
+|---|---|
+| 二进制 | `38575e8d7a1b73d8`（本轮） |
+| 新 knob | `MYDS_RESIDENCY_EXIT_STOP`（默认 1）、`MYDS_EXIT_METAL_TEARDOWN`（默认 0） |
+| knob 指纹 | `c4c91538103b782e` |
+| 生产 | pid 54190，`/health` ok，decode 42.9 t/s |
+| 生产 conf | 未写这两个键 ⇒ 走默认（停心跳 + 不拆驱动层） |
+| 崩溃报告总数 | 20（本轮实验产生的 7 份，均为**故意用旧行为**复现出来的） |
+
+### 165.7 这两个 knob 不是给生产用的
+
+`MYDS_RESIDENCY_EXIT_STOP=0` 与 `MYDS_EXIT_METAL_TEARDOWN=1` 的唯一用途是
+**让这个崩溃可以被复现**。留着它们是为了将来换了 macOS / Xcode 之后，
+能一条命令验证「驱动层是否已经修好、要不要把 teardown 打开」。
+生产一律走默认。
 

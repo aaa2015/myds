@@ -137,6 +137,11 @@ int myds_metal_dense_q4_v41_qb_slice(myds_metal_buffer_t *out,
 /* Initialize Metal device, command queue, and compile DeepSeek shaders */
 int  myds_metal_init(const char *shader_dir);
 void myds_metal_cleanup(void);
+/* 退出期专用：停掉 residency 心跳线程，有界等待（最多 200 ms），幂等。
+ * main 的每条退出路径都应在 free context/model 之前调用它 —— 否则心跳线程
+ * 会活到 exit()，与 atExit 处理器并发访问 Metal 对象（2026-11-08 实测 SIGSEGV，
+ * 账本 §164.6）。可在未初始化时安全调用。 */
+void myds_metal_residency_stop_at_exit(void);
 
 /* Independent F16 GEMV BF16-store experiment. The parser performs no Metal
  * operation: absent/"0" -> 0, "1" -> 1, all other values -> -1. The mode is
