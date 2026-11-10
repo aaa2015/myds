@@ -18,6 +18,10 @@ bool myds_dspine_capture_is_enabled(void);
 /* Check if layer_idx is one of our tapped target layers; returns slot index or -1 */
 int  myds_dspine_capture_layer_slot(uint32_t layer_idx);
 
+/* Optional per-sequence override for loss_mask and deterministic shard filename */
+void myds_dspine_capture_set_override(const float *loss_mask, uint32_t n_tokens,
+                                      const char *exact_filepath);
+
 /* Begin capturing for a sequence of n_tokens */
 bool myds_dspine_capture_begin(uint32_t n_tokens, const int32_t *tokens);
 
@@ -40,4 +44,3 @@ bool myds_dspine_capture_finish_and_save(void);
 #endif
 
 #endif /* MYDS_DSPINE_CAPTURE_H */
-

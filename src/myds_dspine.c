@@ -57,6 +57,183 @@ static inline float dot_bf16_f32(const uint16_t *w, const float *x, size_t n) {
 #endif
 }
 
+static inline float dot_fp16_f32(const uint16_t *w, const float *x, size_t n) {
+#if defined(__ARM_NEON)
+    float32x4_t sum0 = vdupq_n_f32(0.0f);
+    float32x4_t sum1 = vdupq_n_f32(0.0f);
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        float16x8_t h = vld1q_f16((const float16_t *)(w + i));
+        float32x4_t f0 = vcvt_f32_f16(vget_low_f16(h));
+        float32x4_t f1 = vcvt_f32_f16(vget_high_f16(h));
+        sum0 = vmlaq_f32(sum0, f0, vld1q_f32(x + i));
+        sum1 = vmlaq_f32(sum1, f1, vld1q_f32(x + i + 4));
+    }
+    float total = vaddvq_f32(vaddq_f32(sum0, sum1));
+    for (; i < n; i++) {
+        total += myds_fp16_to_fp32(w[i]) * x[i];
+    }
+    return total;
+#else
+    float total = 0.0f;
+    for (size_t i = 0; i < n; i++) {
+        total += myds_fp16_to_fp32(w[i]) * x[i];
+    }
+    return total;
+#endif
+}
+
+static inline float dot_f32_128(const float *a, const float *b) {
+#if defined(__ARM_NEON)
+    float32x4_t s0 = vdupq_n_f32(0.0f);
+    float32x4_t s1 = vdupq_n_f32(0.0f);
+    float32x4_t s2 = vdupq_n_f32(0.0f);
+    float32x4_t s3 = vdupq_n_f32(0.0f);
+    for (uint32_t d = 0; d < 128; d += 16) {
+        s0 = vmlaq_f32(s0, vld1q_f32(a + d + 0),  vld1q_f32(b + d + 0));
+        s1 = vmlaq_f32(s1, vld1q_f32(a + d + 4),  vld1q_f32(b + d + 4));
+        s2 = vmlaq_f32(s2, vld1q_f32(a + d + 8),  vld1q_f32(b + d + 8));
+        s3 = vmlaq_f32(s3, vld1q_f32(a + d + 12), vld1q_f32(b + d + 12));
+    }
+    return vaddvq_f32(vaddq_f32(vaddq_f32(s0, s1), vaddq_f32(s2, s3)));
+#else
+    float sum = 0.0f;
+    for (uint32_t d = 0; d < 128; d++) sum += a[d] * b[d];
+    return sum;
+#endif
+}
+
+static inline void axpy_f32_128(float *out, float alpha, const float *v) {
+#if defined(__ARM_NEON)
+    float32x4_t a = vdupq_n_f32(alpha);
+    for (uint32_t d = 0; d < 128; d += 16) {
+        vst1q_f32(out + d + 0,  vmlaq_f32(vld1q_f32(out + d + 0),  a, vld1q_f32(v + d + 0)));
+        vst1q_f32(out + d + 4,  vmlaq_f32(vld1q_f32(out + d + 4),  a, vld1q_f32(v + d + 4)));
+        vst1q_f32(out + d + 8,  vmlaq_f32(vld1q_f32(out + d + 8),  a, vld1q_f32(v + d + 8)));
+        vst1q_f32(out + d + 12, vmlaq_f32(vld1q_f32(out + d + 12), a, vld1q_f32(v + d + 12)));
+    }
+#else
+    for (uint32_t d = 0; d < 128; d++) out[d] += alpha * v[d];
+#endif
+}
+
+/* Exact GGML Q4_K row dot product matching metal/dense.metal:2438-2484 */
+typedef struct {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t  scales[12];
+    uint8_t  qs[128];
+} dspine_block_q4_K_t;
+
+static inline float dot_q4_K_f32(const uint8_t *row_bytes, const float *x, uint32_t cols) {
+    const uint32_t n_blocks = cols / 256u;
+    const dspine_block_q4_K_t *blocks = (const dspine_block_q4_K_t *)row_bytes;
+    float total = 0.0f;
+    for (uint32_t b = 0; b < n_blocks; b++) {
+        const dspine_block_q4_K_t *xb = &blocks[b];
+        const float d = myds_fp16_to_fp32(xb->d);
+        const float dmin = myds_fp16_to_fp32(xb->dmin);
+        const uint8_t *sc = xb->scales;
+        const uint8_t *q = xb->qs;
+        const float *xb_x = x + (size_t)b * 256u;
+
+        for (int b64 = 0; b64 < 4; b64++) {
+            int j0 = b64 * 2;
+            int j1 = j0 + 1;
+            uint8_t sc0, m0, sc1, m1;
+            if (j0 < 4) {
+                sc0 = sc[j0] & 63u;
+                m0  = sc[j0 + 4] & 63u;
+            } else {
+                sc0 = (sc[j0 + 4] & 0x0fu) | ((sc[j0 - 4] & 0xc0u) >> 2);
+                m0  = (sc[j0 + 4] >> 4)    | ((sc[j0]     & 0xc0u) >> 2);
+            }
+            if (j1 < 4) {
+                sc1 = sc[j1] & 63u;
+                m1  = sc[j1 + 4] & 63u;
+            } else {
+                sc1 = (sc[j1 + 4] & 0x0fu) | ((sc[j1 - 4] & 0xc0u) >> 2);
+                m1  = (sc[j1 + 4] >> 4)    | ((sc[j1]     & 0xc0u) >> 2);
+            }
+            const float dl0 = d * (float)sc0;
+            const float ml0 = dmin * (float)m0;
+            const float dl1 = d * (float)sc1;
+            const float ml1 = dmin * (float)m1;
+
+            const uint8_t *q_sub = q + b64 * 32;
+            const float *x_lo = xb_x + b64 * 64;
+            const float *x_hi = x_lo + 32;
+            float sum_q0 = 0.0f, sum_x0 = 0.0f;
+            float sum_q1 = 0.0f, sum_x1 = 0.0f;
+            for (int l = 0; l < 32; l++) {
+                float xl0 = x_lo[l];
+                float xl1 = x_hi[l];
+                sum_q0 += (float)(q_sub[l] & 0x0fu) * xl0;
+                sum_x0 += xl0;
+                sum_q1 += (float)(q_sub[l] >> 4) * xl1;
+                sum_x1 += xl1;
+            }
+            total += (dl0 * sum_q0 - ml0 * sum_x0) + (dl1 * sum_q1 - ml1 * sum_x1);
+        }
+    }
+    return total;
+}
+
+/* Exact GGML Q8_0 row dot product (34 bytes per 32 elements) */
+static inline float dot_q8_0_f32(const uint8_t *row_bytes, const float *x, uint32_t cols) {
+    const uint32_t n_blocks = cols / 32u;
+    float total = 0.0f;
+    for (uint32_t b = 0; b < n_blocks; b++) {
+        const uint8_t *bp = row_bytes + (size_t)b * 34u;
+        uint16_t d_fp16;
+        memcpy(&d_fp16, bp, sizeof(uint16_t));
+        const float d = myds_fp16_to_fp32(d_fp16);
+        const int8_t *qs = (const int8_t *)(bp + 2);
+        const float *xb = x + (size_t)b * 32u;
+        float sub = 0.0f;
+        for (int i = 0; i < 32; i++) sub += (float)qs[i] * xb[i];
+        total += d * sub;
+    }
+    return total;
+}
+
+static bool score_output_row_cpu(const myds_model_t *m, uint32_t vocab_idx,
+                                 const float *x, uint32_t cols, float *out_score) {
+    const uint8_t *base = (const uint8_t *)myds_metal_buffer_data(m->output);
+    if (!base) return false;
+    switch (m->output_type) {
+        case GGML_TYPE_Q4_K: {
+            size_t row_bytes = ((size_t)cols / 256u) * 144u;
+            *out_score = dot_q4_K_f32(base + (size_t)vocab_idx * row_bytes, x, cols);
+            return true;
+        }
+        case GGML_TYPE_F16: {
+            const uint16_t *w = (const uint16_t *)base + (size_t)vocab_idx * cols;
+            *out_score = dot_fp16_f32(w, x, cols);
+            return true;
+        }
+        case GGML_TYPE_BF16: {
+            const uint16_t *w = (const uint16_t *)base + (size_t)vocab_idx * cols;
+            *out_score = dot_bf16_f32(w, x, cols);
+            return true;
+        }
+        case GGML_TYPE_Q8_0: {
+            size_t row_bytes = ((size_t)cols / 32u) * 34u;
+            *out_score = dot_q8_0_f32(base + (size_t)vocab_idx * row_bytes, x, cols);
+            return true;
+        }
+        case GGML_TYPE_F32: {
+            const float *w = (const float *)base + (size_t)vocab_idx * cols;
+            float s = 0.0f;
+            for (uint32_t i = 0; i < cols; i++) s += w[i] * x[i];
+            *out_score = s;
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
 static void matvec_bf16(float *out, const uint16_t *W, const float *x,
                         uint32_t rows, uint32_t cols) {
     for (uint32_t r = 0; r < rows; r++) {
@@ -95,6 +272,15 @@ static void rmsnorm(float *out, const float *x, const uint16_t *weight,
     }
 }
 
+/* SpecForge AdjacentInjection.feature: sqrt(rank) * F.normalize(projected.float(), dim=-1) */
+static void normalize_feature_512(float *feat) {
+    float sum_sq = 0.0f;
+    for (uint32_t r = 0; r < 512; r++) sum_sq += feat[r] * feat[r];
+    float norm = sqrtf(sum_sq);
+    float scale = sqrtf(512.0f) / (norm > 1e-12f ? norm : 1e-12f);
+    for (uint32_t r = 0; r < 512; r++) feat[r] *= scale;
+}
+
 static void swiglu(float *out, const float *gate, const float *up, uint32_t dim) {
     for (uint32_t i = 0; i < dim; i++) {
         float g = gate[i];
@@ -103,22 +289,78 @@ static void swiglu(float *out, const float *gate, const float *up, uint32_t dim)
     }
 }
 
-static void apply_rope(float *vec, uint32_t num_heads, uint32_t head_dim,
-                       uint32_t pos, float theta) {
+static void apply_rope_fast(float *vec, uint32_t num_heads, uint32_t head_dim,
+                            uint32_t pos, const float *inv_freq) {
+    float cos_a[64], sin_a[64];
+    const uint32_t half = head_dim / 2;
+    for (uint32_t i = 0; i < half; i++) {
+        float angle = (float)pos * inv_freq[i];
+        cos_a[i] = cosf(angle);
+        sin_a[i] = sinf(angle);
+    }
     for (uint32_t h = 0; h < num_heads; h++) {
         float *head = vec + (size_t)h * head_dim;
-        for (uint32_t i = 0; i < head_dim / 2; i++) {
-            float freq = 1.0f / powf(theta, (float)(2 * i) / (float)head_dim);
-            float angle = (float)pos * freq;
-            float cos_a = cosf(angle);
-            float sin_a = sinf(angle);
-
+        for (uint32_t i = 0; i < half; i++) {
             float x0 = head[i];
-            float x1 = head[i + head_dim / 2];
-            head[i] = x0 * cos_a - x1 * sin_a;
-            head[i + head_dim / 2] = x0 * sin_a + x1 * cos_a;
+            float x1 = head[i + half];
+            head[i] = x0 * cos_a[i] - x1 * sin_a[i];
+            head[i + half] = x0 * sin_a[i] + x1 * cos_a[i];
         }
     }
+}
+
+static void topk_f32(const float *logits, uint32_t vocab_size, uint32_t k,
+                     int32_t *out_ids) {
+    float top_v[MYDS_DSPINE_TOP_K];
+    int32_t top_i[MYDS_DSPINE_TOP_K];
+    if (k > MYDS_DSPINE_TOP_K) k = MYDS_DSPINE_TOP_K;
+    for (uint32_t j = 0; j < k; j++) {
+        top_v[j] = -1e38f;
+        top_i[j] = 0;
+    }
+    float min_top = -1e38f;
+    for (uint32_t v = 0; v < vocab_size; v++) {
+        float val = logits[v];
+        if (val <= min_top) continue;
+        /* Insert into descending array top_v[0..k-1] */
+        uint32_t pos = k - 1;
+        while (pos > 0 && val > top_v[pos - 1]) {
+            top_v[pos] = top_v[pos - 1];
+            top_i[pos] = top_i[pos - 1];
+            pos--;
+        }
+        top_v[pos] = val;
+        top_i[pos] = (int32_t)v;
+        min_top = top_v[k - 1];
+    }
+    for (uint32_t j = 0; j < k; j++) out_ids[j] = top_i[j];
+}
+
+static bool ensure_ctx_kv_capacity(myds_dspine_t *ds, uint32_t needed_len) {
+    if (needed_len <= ds->ctx_kv_cap) return true;
+    uint32_t new_cap = ds->ctx_kv_cap ? ds->ctx_kv_cap : 1024u;
+    while (new_cap < needed_len) new_cap *= 2u;
+
+    for (uint32_t l = 0; l < ds->num_layers; l++) {
+        float *nk = (float *)realloc(ds->ctx_k_cache[l], (size_t)new_cap * 1024u * sizeof(float));
+        if (!nk) return false;
+        ds->ctx_k_cache[l] = nk;
+
+        float *nv = (float *)realloc(ds->ctx_v_cache[l], (size_t)new_cap * 1024u * sizeof(float));
+        if (!nv) return false;
+        ds->ctx_v_cache[l] = nv;
+    }
+    uint32_t *np = (uint32_t *)realloc(ds->ctx_pos_cache, (size_t)new_cap * sizeof(uint32_t));
+    if (!np) return false;
+    ds->ctx_pos_cache = np;
+
+    float *ns = (float *)realloc(ds->attn_scores_scratch,
+                                 (size_t)(new_cap + MYDS_DSPINE_MAX_BLOCK) * sizeof(float));
+    if (!ns) return false;
+    ds->attn_scores_scratch = ns;
+
+    ds->ctx_kv_cap = new_cap;
+    return true;
 }
 
 static bool find_tensor_offset(const char *json, size_t json_len, const char *name,
@@ -176,6 +418,10 @@ myds_dspine_t *myds_dspine_create(void) {
     ds->mask_token_id = 129279;
     ds->mmap_fd = -1;
 
+    for (uint32_t i = 0; i < 64; i++) {
+        ds->rope_inv_freq[i] = 1.0f / powf(1000000.0f, (float)(2u * i) / 128.0f);
+    }
+
     const char *blk_env = getenv("MYDS_DSPINE_BLOCK_SIZE");
     if (blk_env && *blk_env) {
         int b = atoi(blk_env);
@@ -204,6 +450,12 @@ myds_dspine_t *myds_dspine_create(void) {
     ds->features_buf = myds_metal_buffer_alloc((size_t)MYDS_DSPINE_MAX_BLOCK * 512 * sizeof(float));
     ds->delta_buf = myds_metal_buffer_alloc((size_t)MYDS_DSPINE_MAX_BLOCK * ds->hidden_size * sizeof(float));
 
+    /* Batched context KV projection buffers */
+    ds->batch_th_buf = myds_metal_buffer_alloc((size_t)MYDS_DSPINE_CTX_BATCH_CAP * MYDS_DSPINE_TARGET_DIM * sizeof(float));
+    ds->batch_ctx_buf = myds_metal_buffer_alloc((size_t)MYDS_DSPINE_CTX_BATCH_CAP * ds->hidden_size * sizeof(float));
+    ds->batch_k_ctx_buf = myds_metal_buffer_alloc((size_t)MYDS_DSPINE_CTX_BATCH_CAP * 1024 * sizeof(float));
+    ds->batch_v_ctx_buf = myds_metal_buffer_alloc((size_t)MYDS_DSPINE_CTX_BATCH_CAP * 1024 * sizeof(float));
+
     /* Draft KV cache: max_block * num_layers * 2(K,V) * num_kv_heads * head_dim * sizeof(float) */
     size_t kv_bytes = (size_t)MYDS_DSPINE_MAX_BLOCK * ds->num_layers * 2 * ds->num_kv_heads * ds->head_dim * sizeof(float);
     ds->draft_kv_buf = myds_metal_buffer_alloc(kv_bytes);
@@ -214,12 +466,34 @@ myds_dspine_t *myds_dspine_create(void) {
         ds->spec_target_slots[i] = myds_metal_buffer_alloc(MYDS_DSPINE_TARGET_DIM * sizeof(float));
     }
 
+    /* HC stream mean weights {0.25, 0.25, 0.25, 0.25} & GPU sub-views */
+    ds->hc_mean_weights = myds_metal_buffer_alloc(4 * sizeof(float));
+    if (ds->hc_mean_weights) {
+        const float w4[4] = {0.25f, 0.25f, 0.25f, 0.25f};
+        myds_metal_buffer_write(ds->hc_mean_weights, 0, w4, sizeof(w4));
+    }
+    bool views_ok = (ds->hc_mean_weights != NULL);
+    for (int s = 0; s < MYDS_DSPINE_TARGET_LAYERS; s++) {
+        size_t off = (size_t)s * ds->hidden_size * sizeof(float);
+        size_t len = (size_t)ds->hidden_size * sizeof(float);
+        ds->target_slot_views[s] = ds->target_hidden_buf
+            ? myds_metal_buffer_sub_view(ds->target_hidden_buf, off, len) : NULL;
+        if (!ds->target_slot_views[s]) views_ok = false;
+        for (int r = 0; r < 3; r++) {
+            ds->spec_slot_views[r][s] = ds->spec_target_slots[r]
+                ? myds_metal_buffer_sub_view(ds->spec_target_slots[r], off, len) : NULL;
+            if (!ds->spec_slot_views[r][s]) views_ok = false;
+        }
+    }
+
     if (!ds->target_hidden_buf || !ds->ctx_feat_buf || !ds->x_buf || !ds->norm_buf ||
         !ds->attn_out_buf || !ds->ffn_out_buf || !ds->logits_buf || !ds->draft_kv_buf ||
         !ds->q_buf || !ds->k_buf || !ds->v_buf || !ds->k_ctx_buf || !ds->v_ctx_buf ||
         !ds->attn_in_buf || !ds->gate_buf || !ds->up_buf || !ds->glu_buf ||
         !ds->features_buf || !ds->delta_buf || !ds->spec_snap ||
-        !ds->spec_target_slots[0] || !ds->spec_target_slots[1] || !ds->spec_target_slots[2]) {
+        !ds->batch_th_buf || !ds->batch_ctx_buf || !ds->batch_k_ctx_buf || !ds->batch_v_ctx_buf ||
+        !ds->spec_target_slots[0] || !ds->spec_target_slots[1] || !ds->spec_target_slots[2] ||
+        !views_ok || !ensure_ctx_kv_capacity(ds, 4096u)) {
         MYDS_LOG_E("DSpine: failed to allocate scratch buffers");
         myds_dspine_free(ds);
         return NULL;
@@ -365,6 +639,14 @@ bool myds_dspine_load_weights(myds_dspine_t *ds, const char *weights_path) {
 void myds_dspine_free(myds_dspine_t *ds) {
     if (!ds) return;
 
+    for (int s = 0; s < MYDS_DSPINE_TARGET_LAYERS; s++) {
+        if (ds->target_slot_views[s]) myds_metal_buffer_free(ds->target_slot_views[s]);
+        for (int r = 0; r < 3; r++) {
+            if (ds->spec_slot_views[r][s]) myds_metal_buffer_free(ds->spec_slot_views[r][s]);
+        }
+    }
+    if (ds->hc_mean_weights) myds_metal_buffer_free(ds->hc_mean_weights);
+
     if (ds->target_hidden_buf) myds_metal_buffer_free(ds->target_hidden_buf);
     if (ds->ctx_feat_buf) myds_metal_buffer_free(ds->ctx_feat_buf);
     if (ds->x_buf) myds_metal_buffer_free(ds->x_buf);
@@ -383,6 +665,10 @@ void myds_dspine_free(myds_dspine_t *ds) {
     if (ds->glu_buf) myds_metal_buffer_free(ds->glu_buf);
     if (ds->features_buf) myds_metal_buffer_free(ds->features_buf);
     if (ds->delta_buf) myds_metal_buffer_free(ds->delta_buf);
+    if (ds->batch_th_buf) myds_metal_buffer_free(ds->batch_th_buf);
+    if (ds->batch_ctx_buf) myds_metal_buffer_free(ds->batch_ctx_buf);
+    if (ds->batch_k_ctx_buf) myds_metal_buffer_free(ds->batch_k_ctx_buf);
+    if (ds->batch_v_ctx_buf) myds_metal_buffer_free(ds->batch_v_ctx_buf);
     for (int i = 0; i < 3; i++) {
         if (ds->spec_target_slots[i]) myds_metal_buffer_free(ds->spec_target_slots[i]);
     }
@@ -390,6 +676,13 @@ void myds_dspine_free(myds_dspine_t *ds) {
     if (ds->tg_table) myds_metal_buffer_free(ds->tg_table);
     if (ds->tsv_table) myds_metal_buffer_free(ds->tsv_table);
     if (ds->spec_snap) free(ds->spec_snap);
+
+    for (uint32_t l = 0; l < MYDS_DSPINE_LAYERS; l++) {
+        free(ds->ctx_k_cache[l]);
+        free(ds->ctx_v_cache[l]);
+    }
+    free(ds->ctx_pos_cache);
+    free(ds->attn_scores_scratch);
 
     if (ds->fc_proj) myds_metal_buffer_free(ds->fc_proj);
     if (ds->hidden_norm) myds_metal_buffer_free(ds->hidden_norm);
@@ -429,59 +722,182 @@ void myds_dspine_free(myds_dspine_t *ds) {
     free(ds);
 }
 
-void myds_dspine_capture_target_layer(myds_dspine_t *ds, uint32_t layer_idx,
-                                      const myds_metal_buffer_t *residual_hc) {
-    if (!ds || !residual_hc || !ds->target_hidden_buf) return;
-    int slot = myds_dspine_capture_layer_slot(layer_idx);
-    if (slot < 0 || slot >= MYDS_DSPINE_TARGET_LAYERS) return;
-
-    /* Average 4 HC streams into single 5120-dim slot */
-    float *dst = (float *)myds_metal_buffer_data(ds->target_hidden_buf) + (size_t)slot * ds->hidden_size;
-    const float *src = (const float *)myds_metal_buffer_data((myds_metal_buffer_t *)residual_hc);
-    if (!dst || !src) return;
-
-    for (uint32_t d = 0; d < ds->hidden_size; d++) {
-        float sum = src[d] + src[ds->hidden_size + d] +
-                    src[2 * ds->hidden_size + d] + src[3 * ds->hidden_size + d];
-        dst[d] = sum * 0.25f;
-    }
-    ds->target_slots_captured |= (1u << slot);
+void myds_dspine_reset_context(myds_dspine_t *ds) {
+    if (!ds) return;
+    ds->ctx_kv_len = 0;
+    ds->pending_count = 0;
+    ds->pending_from_spec = false;
+    ds->target_slots_captured = 0;
 }
 
-void myds_dspine_capture_target_spec_layer(myds_dspine_t *ds, uint32_t layer_idx,
-                                           uint32_t token_row,
-                                           const myds_metal_buffer_t *residual_hc) {
-    if (!ds || !residual_hc || token_row >= 3) return;
-    int slot = myds_dspine_capture_layer_slot(layer_idx);
-    if (slot < 0 || slot >= MYDS_DSPINE_TARGET_LAYERS) return;
-    if (!ds->spec_target_slots[token_row]) return;
-
-    float *dst = (float *)myds_metal_buffer_data(ds->spec_target_slots[token_row]) +
-                 (size_t)slot * ds->hidden_size;
-    const float *src = (const float *)myds_metal_buffer_data((myds_metal_buffer_t *)residual_hc);
-    if (!dst || !src) return;
-
-    for (uint32_t d = 0; d < ds->hidden_size; d++) {
-        float sum = src[d] + src[ds->hidden_size + d] +
-                    src[2 * ds->hidden_size + d] + src[3 * ds->hidden_size + d];
-        dst[d] = sum * 0.25f;
+void myds_dspine_truncate_context(myds_dspine_t *ds, uint32_t max_pos) {
+    if (!ds) return;
+    while (ds->ctx_kv_len > 0 && ds->ctx_pos_cache[ds->ctx_kv_len - 1] >= max_pos) {
+        ds->ctx_kv_len--;
     }
 }
 
-void myds_dspine_capture_select_row(myds_dspine_t *ds, uint32_t selected_row) {
+bool myds_dspine_flush_pending(myds_dspine_t *ds, uint32_t next_pos) {
+    if (!ds || !ds->enabled || !ds->loaded) return true;
+    if (next_pos == 0) {
+        myds_dspine_reset_context(ds);
+        return true;
+    }
+    if (ds->pending_count > 0 && ds->pending_pos < next_pos) {
+        uint32_t cnt = ds->pending_count;
+        if (ds->pending_pos + cnt > next_pos) cnt = next_pos - ds->pending_pos;
+        bool ok = false;
+        if (ds->pending_from_spec) {
+            float spec_batch[3 * MYDS_DSPINE_TARGET_DIM];
+            if (cnt > 3u) cnt = 3u;
+            for (uint32_t r = 0; r < cnt; r++) {
+                memcpy(spec_batch + (size_t)r * MYDS_DSPINE_TARGET_DIM,
+                       myds_metal_buffer_data(ds->spec_target_slots[r]),
+                       MYDS_DSPINE_TARGET_DIM * sizeof(float));
+            }
+            ok = myds_dspine_append_context_batch(ds, spec_batch, ds->pending_pos, cnt);
+        } else {
+            const float *th = (const float *)myds_metal_buffer_data(ds->target_hidden_buf);
+            ok = myds_dspine_append_context_batch(ds, th, ds->pending_pos, 1u);
+        }
+        ds->pending_count = 0;
+        ds->pending_from_spec = false;
+        return ok;
+    }
+    myds_dspine_truncate_context(ds, next_pos);
+    ds->pending_count = 0;
+    ds->pending_from_spec = false;
+    return true;
+}
+
+bool myds_dspine_append_context_batch(myds_dspine_t *ds,
+                                      const float *target_hidden_batch,
+                                      uint32_t start_pos, uint32_t count) {
+    if (!ds || !ds->loaded || !target_hidden_batch || count == 0) return false;
+    myds_dspine_truncate_context(ds, start_pos);
+    if (!ensure_ctx_kv_capacity(ds, ds->ctx_kv_len + count)) return false;
+
+    const uint16_t *hn_w = (const uint16_t *)myds_metal_buffer_data(ds->hidden_norm);
+    float *th_gpu = (float *)myds_metal_buffer_data(ds->batch_th_buf);
+    float *ctx_gpu = (float *)myds_metal_buffer_data(ds->batch_ctx_buf);
+    float *k_gpu = (float *)myds_metal_buffer_data(ds->batch_k_ctx_buf);
+    float *v_gpu = (float *)myds_metal_buffer_data(ds->batch_v_ctx_buf);
+
+    for (uint32_t off = 0; off < count; off += MYDS_DSPINE_CTX_BATCH_CAP) {
+        uint32_t cur = count - off;
+        if (cur > MYDS_DSPINE_CTX_BATCH_CAP) cur = MYDS_DSPINE_CTX_BATCH_CAP;
+
+        memcpy(th_gpu, target_hidden_batch + (size_t)off * MYDS_DSPINE_TARGET_DIM,
+               (size_t)cur * MYDS_DSPINE_TARGET_DIM * sizeof(float));
+
+        /* 1. fc_proj [5120, 25600] @ th_gpu [cur, 25600] -> ctx_gpu [cur, 5120] */
+        if (!myds_metal_v41_gemv_batch(ds->batch_ctx_buf, ds->fc_proj, ds->batch_th_buf,
+                                       ds->hidden_size, MYDS_DSPINE_TARGET_DIM, cur, GGML_TYPE_BF16)) {
+            return false;
+        }
+        for (uint32_t i = 0; i < cur; i++) {
+            float *cf = ctx_gpu + (size_t)i * ds->hidden_size;
+            rmsnorm(cf, cf, hn_w, ds->hidden_size, 1e-6f);
+        }
+
+        /* 2. Per-layer k_proj, v_proj, k_norm, RoPE into ctx_k_cache / ctx_v_cache */
+        for (uint32_t l = 0; l < ds->num_layers; l++) {
+            myds_dspine_layer_t *layer = &ds->layers[l];
+            const uint16_t *kn_w = (const uint16_t *)myds_metal_buffer_data(layer->k_norm);
+
+            myds_metal_begin_batch();
+            myds_metal_v41_gemv_batch(ds->batch_k_ctx_buf, layer->k_proj, ds->batch_ctx_buf,
+                                      1024, ds->hidden_size, cur, GGML_TYPE_BF16);
+            myds_metal_v41_gemv_batch(ds->batch_v_ctx_buf, layer->v_proj, ds->batch_ctx_buf,
+                                      1024, ds->hidden_size, cur, GGML_TYPE_BF16);
+            if (!myds_metal_commit_batch()) return false;
+
+            float *dst_k_base = ds->ctx_k_cache[l] + (size_t)(ds->ctx_kv_len + off) * 1024u;
+            float *dst_v_base = ds->ctx_v_cache[l] + (size_t)(ds->ctx_kv_len + off) * 1024u;
+            memcpy(dst_v_base, v_gpu, (size_t)cur * 1024u * sizeof(float));
+
+            for (uint32_t i = 0; i < cur; i++) {
+                float *ki = k_gpu + (size_t)i * 1024u;
+                float *dst_k = dst_k_base + (size_t)i * 1024u;
+                for (uint32_t h = 0; h < ds->num_kv_heads; h++) {
+                    rmsnorm(dst_k + h * ds->head_dim, ki + h * ds->head_dim,
+                            kn_w, ds->head_dim, 1e-6f);
+                }
+                apply_rope_fast(dst_k, ds->num_kv_heads, ds->head_dim,
+                                start_pos + off + i, ds->rope_inv_freq);
+            }
+        }
+        for (uint32_t i = 0; i < cur; i++) {
+            ds->ctx_pos_cache[ds->ctx_kv_len + off + i] = start_pos + off + i;
+        }
+    }
+    ds->ctx_kv_len += count;
+    return true;
+}
+
+int myds_dspine_capture_target_layer(myds_dspine_t *ds, uint32_t layer_idx,
+                                     uint32_t pos,
+                                     const myds_metal_buffer_t *residual_hc) {
+    if (!ds || !ds->enabled || !residual_hc) return 1;
+    int slot = myds_dspine_capture_layer_slot(layer_idx);
+    if (slot < 0 || slot >= MYDS_DSPINE_TARGET_LAYERS) return 1;
+    if (!ds->target_slot_views[slot] || !ds->hc_mean_weights) return 0;
+
+    /* Encode 4-stream HC average directly on the active Metal command buffer */
+    if (!myds_metal_v41_hc_weighted_sum_round(ds->target_slot_views[slot], residual_hc,
+                                              ds->hc_mean_weights, ds->hidden_size, 0)) {
+        ds->target_slots_captured = 0;
+        ds->pending_count = 0;
+        return 0;
+    }
+    if (slot == 0) {
+        ds->target_slots_captured = 1u;
+        ds->pending_count = 0;
+        ds->pending_from_spec = false;
+    } else {
+        ds->target_slots_captured |= (1u << slot);
+    }
+    if (ds->target_slots_captured == 0x1Fu) {
+        ds->pending_pos = pos;
+        ds->pending_count = 1u;
+        ds->pending_from_spec = false;
+    }
+    return 1;
+}
+
+int myds_dspine_capture_target_spec_layer(myds_dspine_t *ds, uint32_t layer_idx,
+                                          uint32_t token_row,
+                                          const myds_metal_buffer_t *residual_hc) {
+    if (!ds || !ds->enabled || !residual_hc || token_row >= 3) return 1;
+    int slot = myds_dspine_capture_layer_slot(layer_idx);
+    if (slot < 0 || slot >= MYDS_DSPINE_TARGET_LAYERS) return 1;
+    if (!ds->spec_slot_views[token_row][slot] || !ds->hc_mean_weights) return 0;
+
+    return myds_metal_v41_hc_weighted_sum_round(ds->spec_slot_views[token_row][slot], residual_hc,
+                                                ds->hc_mean_weights, ds->hidden_size, 0);
+}
+
+void myds_dspine_capture_select_row(myds_dspine_t *ds, uint32_t base_pos,
+                                    uint32_t selected_row) {
     if (!ds || selected_row >= 3 || !ds->target_hidden_buf || !ds->spec_target_slots[selected_row]) return;
     memcpy(myds_metal_buffer_data(ds->target_hidden_buf),
            myds_metal_buffer_data(ds->spec_target_slots[selected_row]),
            MYDS_DSPINE_TARGET_DIM * sizeof(float));
-    ds->target_slots_captured = 0x1F;
+    ds->target_slots_captured = 0x1Fu;
+    ds->pending_pos = base_pos;
+    ds->pending_count = selected_row + 1u;
+    ds->pending_from_spec = true;
 }
 
 void myds_dspine_capture_invalidate(myds_dspine_t *ds) {
-    if (ds) ds->target_slots_captured = 0;
+    if (!ds) return;
+    ds->target_slots_captured = 0;
+    ds->pending_count = 0;
+    ds->pending_from_spec = false;
 }
 
 bool myds_dspine_capture_ready(const myds_dspine_t *ds) {
-    return ds && (ds->target_slots_captured == 0x1F);
+    return ds && (ds->target_slots_captured == 0x1Fu);
 }
 
 bool myds_dspine_build_tables(myds_dspine_t *ds, myds_model_t *base_model) {
@@ -504,6 +920,52 @@ bool myds_dspine_build_tables(myds_dspine_t *ds, myds_model_t *base_model) {
     return true;
 }
 
+/* SpecForge DSpineDraftModel.refine(hidden, predecessor_id) on final layer (l = 2) */
+static void dspine_refine_single(const myds_dspine_t *ds, const float *pre_inj,
+                                 int32_t pred_token_id, float *out_normed) {
+    const uint32_t l_last = ds->num_layers - 1u;
+    const uint16_t *readout_w = (const uint16_t *)myds_metal_buffer_data(ds->injection_readouts[l_last]);
+    const uint16_t *msg_w = (const uint16_t *)myds_metal_buffer_data(ds->injection_message);
+    const uint16_t *pred_w = (const uint16_t *)myds_metal_buffer_data(ds->injection_pred_gate);
+    const uint16_t *recv_w = (const uint16_t *)myds_metal_buffer_data(ds->injection_recv_gate);
+    const uint16_t *bias_w = (const uint16_t *)myds_metal_buffer_data(ds->injection_bias);
+    const uint16_t *write_w = (const uint16_t *)myds_metal_buffer_data(ds->injection_writes[l_last]);
+    const uint16_t *codes_table = (const uint16_t *)myds_metal_buffer_data(ds->transfer_codes);
+    const uint16_t *fn_w = (const uint16_t *)myds_metal_buffer_data(ds->final_norm);
+
+    float recv[512];
+    matvec_bf16(recv, readout_w, pre_inj, 512, ds->hidden_size);
+    normalize_feature_512(recv);
+
+    if (pred_token_id < 0 || (uint32_t)pred_token_id >= ds->vocab_size) pred_token_id = 0;
+    const float sqrt_rank = sqrtf(512.0f);
+    float pred[512];
+    const uint16_t *code = codes_table + (size_t)pred_token_id * 512u;
+    for (uint32_t r = 0; r < 512; r++) pred[r] = sqrt_rank * bf16_to_fp32(code[r]);
+
+    float g_recv[256], g_pred[256], msg[256], gated_msg[256];
+    matvec_bf16(g_recv, recv_w, recv, 256, 512);
+    matvec_bf16(g_pred, pred_w, pred, 256, 512);
+    matvec_bf16(msg, msg_w, pred, 256, 512);
+
+    for (uint32_t b = 0; b < 256; b++) {
+        float total_g = g_recv[b] + g_pred[b] + bf16_to_fp32(bias_w[b]);
+        gated_msg[b] = (1.0f / (1.0f + expf(-total_g))) * msg[b];
+    }
+
+    float delta[5120];
+    matvec_bf16(delta, write_w, gated_msg, ds->hidden_size, 256);
+
+    float norm_x = 0.0f;
+    for (uint32_t d = 0; d < ds->hidden_size; d++) norm_x += pre_inj[d] * pre_inj[d];
+    float scale = sqrtf(norm_x / (float)ds->hidden_size);
+
+    float refined[5120];
+    for (uint32_t d = 0; d < ds->hidden_size; d++) refined[d] = pre_inj[d] + scale * delta[d];
+
+    rmsnorm(out_normed, refined, fn_w, ds->hidden_size, 1e-6f);
+}
+
 uint32_t myds_dspine_propose(myds_dspine_t *ds, myds_context_t *ctx,
                              int32_t seed_token, uint32_t max_propose) {
     if (!ds || !ctx || !ds->enabled || !ds->loaded || max_propose == 0) return 0;
@@ -519,17 +981,45 @@ uint32_t myds_dspine_propose(myds_dspine_t *ds, myds_context_t *ctx,
     ds->cycles++;
     ds->draft_count = 0;
 
-    /* 1. Context Feature: fc_proj [5120, 25600] @ target_hidden [25600] -> [5120] */
-    myds_metal_v41_gemv_batch(ds->ctx_feat_buf, ds->fc_proj, ds->target_hidden_buf,
-                              ds->hidden_size, MYDS_DSPINE_TARGET_DIM, 1, GGML_TYPE_BF16);
-    float *ctx_f = (float *)myds_metal_buffer_data(ds->ctx_feat_buf);
-    const uint16_t *hn_w = (const uint16_t *)myds_metal_buffer_data(ds->hidden_norm);
-    rmsnorm(ctx_f, ctx_f, hn_w, ds->hidden_size, 1e-6f);
+    /* 1. Flush any pending captured target hidden states into ctx_k_cache / ctx_v_cache */
+    if (ds->pending_count > 0) {
+        if (ds->pending_from_spec) {
+            float spec_batch[3 * MYDS_DSPINE_TARGET_DIM];
+            uint32_t cnt = ds->pending_count <= 3u ? ds->pending_count : 3u;
+            for (uint32_t r = 0; r < cnt; r++) {
+                memcpy(spec_batch + (size_t)r * MYDS_DSPINE_TARGET_DIM,
+                       myds_metal_buffer_data(ds->spec_target_slots[r]),
+                       MYDS_DSPINE_TARGET_DIM * sizeof(float));
+            }
+            if (!myds_dspine_append_context_batch(ds, spec_batch, ds->pending_pos, cnt)) return 0;
+        } else {
+            const float *th = (const float *)myds_metal_buffer_data(ds->target_hidden_buf);
+            if (!myds_dspine_append_context_batch(ds, th, ds->pending_pos, 1u)) return 0;
+        }
+        ds->pending_count = 0;
+        ds->pending_from_spec = false;
+    } else if (ds->ctx_kv_len == 0) {
+        /* Standalone fallback when caller populated target_hidden_buf directly (unit tests) */
+        const float *th = (const float *)myds_metal_buffer_data(ds->target_hidden_buf);
+        uint32_t fb_pos = ctx->pos > 0 ? ctx->pos - 1u : 0u;
+        if (!myds_dspine_append_context_batch(ds, th, fb_pos, 1u)) return 0;
+    } else {
+        /* Ensure strictly kv_pos < anchor_pos (ctx->pos) */
+        myds_dspine_truncate_context(ds, ctx->pos);
+    }
+
+    const uint32_t ctx_len = ds->ctx_kv_len;
+    if (ctx_len == 0) return 0;
 
     /* 2. Lookup Embeddings for block: [seed, mask, mask, ...] */
     float *x = (float *)myds_metal_buffer_data(ds->x_buf);
     const myds_model_t *m = ctx->model;
-    const uint16_t *emb_table = (const uint16_t *)myds_metal_buffer_data(m->tok_embeddings);
+    const void *emb_raw = m && m->tok_embeddings ? myds_metal_buffer_data(m->tok_embeddings) : NULL;
+    if (!emb_raw) return 0;
+
+    const bool emb_bf16 = (m->tok_embeddings_type == GGML_TYPE_BF16);
+    const bool emb_f32 = (m->tok_embeddings_type == GGML_TYPE_F32) &&
+        (myds_metal_buffer_size(m->tok_embeddings) >= (size_t)ds->vocab_size * ds->hidden_size * sizeof(float));
 
     int32_t block_tokens[MYDS_DSPINE_MAX_BLOCK];
     block_tokens[0] = seed_token;
@@ -538,10 +1028,16 @@ uint32_t myds_dspine_propose(myds_dspine_t *ds, myds_context_t *ctx,
     for (uint32_t t = 0; t < T; t++) {
         int32_t tok = block_tokens[t];
         if (tok < 0 || (uint32_t)tok >= ds->vocab_size) tok = 0;
-        const uint16_t *tok_emb = emb_table + (size_t)tok * ds->hidden_size;
         float *xt = x + (size_t)t * ds->hidden_size;
-        for (uint32_t d = 0; d < ds->hidden_size; d++) {
-            xt[d] = myds_fp16_to_fp32(tok_emb[d]);
+        if (emb_f32) {
+            const float *tok_emb = (const float *)emb_raw + (size_t)tok * ds->hidden_size;
+            memcpy(xt, tok_emb, ds->hidden_size * sizeof(float));
+        } else if (emb_bf16) {
+            const uint16_t *tok_emb = (const uint16_t *)emb_raw + (size_t)tok * ds->hidden_size;
+            for (uint32_t d = 0; d < ds->hidden_size; d++) xt[d] = bf16_to_fp32(tok_emb[d]);
+        } else {
+            const uint16_t *tok_emb = (const uint16_t *)emb_raw + (size_t)tok * ds->hidden_size;
+            for (uint32_t d = 0; d < ds->hidden_size; d++) xt[d] = myds_fp16_to_fp32(tok_emb[d]);
         }
     }
 
@@ -553,12 +1049,12 @@ uint32_t myds_dspine_propose(myds_dspine_t *ds, myds_context_t *ctx,
     float *q_buf = (float *)myds_metal_buffer_data(ds->q_buf);
     float *k_buf = (float *)myds_metal_buffer_data(ds->k_buf);
     float *v_buf = (float *)myds_metal_buffer_data(ds->v_buf);
-    float *k_ctx_ptr = (float *)myds_metal_buffer_data(ds->k_ctx_buf);
-    float *v_ctx_ptr = (float *)myds_metal_buffer_data(ds->v_ctx_buf);
     float *gate_ptr = (float *)myds_metal_buffer_data(ds->gate_buf);
     float *up_ptr = (float *)myds_metal_buffer_data(ds->up_buf);
     float *glu_ptr = (float *)myds_metal_buffer_data(ds->glu_buf);
     float *feat_ptr = (float *)myds_metal_buffer_data(ds->features_buf);
+    float *scores = ds->attn_scores_scratch;
+    const float attn_scale = 1.0f / sqrtf((float)ds->head_dim);
 
     for (uint32_t l = 0; l < ds->num_layers; l++) {
         myds_dspine_layer_t *layer = &ds->layers[l];
@@ -574,80 +1070,75 @@ uint32_t myds_dspine_propose(myds_dspine_t *ds, myds_context_t *ctx,
                     in_norm_w, ds->hidden_size, 1e-6f);
         }
 
-        /* 3.2 Batched QKV on GPU */
+        /* 3.2 Batched Draft QKV on GPU (Context KV is already cached in ctx_k_cache / ctx_v_cache) */
         myds_metal_begin_batch();
-        myds_metal_v41_gemv_batch(ds->k_ctx_buf, layer->k_proj, ds->ctx_feat_buf, 1024, ds->hidden_size, 1, GGML_TYPE_BF16);
-        myds_metal_v41_gemv_batch(ds->v_ctx_buf, layer->v_proj, ds->ctx_feat_buf, 1024, ds->hidden_size, 1, GGML_TYPE_BF16);
         myds_metal_v41_gemv_batch(ds->q_buf, layer->q_proj, ds->norm_buf, ds->hidden_size, ds->hidden_size, T, GGML_TYPE_BF16);
         myds_metal_v41_gemv_batch(ds->k_buf, layer->k_proj, ds->norm_buf, 1024, ds->hidden_size, T, GGML_TYPE_BF16);
         myds_metal_v41_gemv_batch(ds->v_buf, layer->v_proj, ds->norm_buf, 1024, ds->hidden_size, T, GGML_TYPE_BF16);
         myds_metal_commit_batch();
 
-        /* 3.3 Q/K Norm and RoPE on CPU */
-        for (uint32_t h = 0; h < ds->num_kv_heads; h++) {
-            rmsnorm(k_ctx_ptr + h * ds->head_dim, k_ctx_ptr + h * ds->head_dim, kn_w, ds->head_dim, 1e-6f);
-        }
-        apply_rope(k_ctx_ptr, ds->num_kv_heads, ds->head_dim, ctx->pos, 1000000.0f);
-
+        /* 3.3 Q/K Norm and RoPE on CPU at exact positions ctx->pos + t (t = 0..T-1) */
         for (uint32_t t = 0; t < T; t++) {
             float *qt = q_buf + (size_t)t * ds->hidden_size;
-            float *kt = k_buf + (size_t)t * 1024;
+            float *kt = k_buf + (size_t)t * 1024u;
             for (uint32_t h = 0; h < ds->num_heads; h++) {
                 rmsnorm(qt + h * ds->head_dim, qt + h * ds->head_dim, qn_w, ds->head_dim, 1e-6f);
             }
             for (uint32_t h = 0; h < ds->num_kv_heads; h++) {
                 rmsnorm(kt + h * ds->head_dim, kt + h * ds->head_dim, kn_w, ds->head_dim, 1e-6f);
             }
-            apply_rope(qt, ds->num_heads, ds->head_dim, ctx->pos + t + 1, 1000000.0f);
-            apply_rope(kt, ds->num_kv_heads, ds->head_dim, ctx->pos + t + 1, 1000000.0f);
+            apply_rope_fast(qt, ds->num_heads, ds->head_dim, ctx->pos + t, ds->rope_inv_freq);
+            apply_rope_fast(kt, ds->num_kv_heads, ds->head_dim, ctx->pos + t, ds->rope_inv_freq);
         }
 
-        /* 3.4 Attention into attn_in */
+        /* 3.4 Attention over ctx_k_cache[0..ctx_len-1] + causal draft keys[0..t] */
+        const float *k_ctx_layer = ds->ctx_k_cache[l];
+        const float *v_ctx_layer = ds->ctx_v_cache[l];
+        const uint32_t gqa_ratio = ds->num_heads / ds->num_kv_heads;
+
         for (uint32_t t = 0; t < T; t++) {
-            float *qt = q_buf + (size_t)t * ds->hidden_size;
+            const float *qt = q_buf + (size_t)t * ds->hidden_size;
             float *heads_out = attn_in + (size_t)t * ds->hidden_size;
+            const uint32_t total_kv = ctx_len + t + 1u;
 
             for (uint32_t h = 0; h < ds->num_heads; h++) {
-                uint32_t kv_h = h / (ds->num_heads / ds->num_kv_heads);
-                const float *qh = qt + h * ds->head_dim;
+                const uint32_t kv_h = h / gqa_ratio;
+                const size_t kv_off = (size_t)kv_h * ds->head_dim;
+                const float *qh = qt + (size_t)h * ds->head_dim;
 
-                float scores[MYDS_DSPINE_MAX_BLOCK + 1];
-                /* Score against context */
-                const float *kh_ctx = k_ctx_ptr + kv_h * ds->head_dim;
-                float dot_c = 0.0f;
-                for (uint32_t d = 0; d < ds->head_dim; d++) dot_c += qh[d] * kh_ctx[d];
-                scores[0] = dot_c / sqrtf((float)ds->head_dim);
-
-                /* Scores against causal draft tokens 0..t */
+                float max_s = -1e38f;
+                for (uint32_t c = 0; c < ctx_len; c++) {
+                    const float *kh_c = k_ctx_layer + (size_t)c * 1024u + kv_off;
+                    float s = dot_f32_128(qh, kh_c) * attn_scale;
+                    scores[c] = s;
+                    if (s > max_s) max_s = s;
+                }
                 for (uint32_t j = 0; j <= t; j++) {
-                    const float *kh_j = k_buf + (size_t)j * 1024 + kv_h * ds->head_dim;
-                    float dot_j = 0.0f;
-                    for (uint32_t d = 0; d < ds->head_dim; d++) dot_j += qh[d] * kh_j[d];
-                    scores[1 + j] = dot_j / sqrtf((float)ds->head_dim);
+                    const float *kh_j = k_buf + (size_t)j * 1024u + kv_off;
+                    float s = dot_f32_128(qh, kh_j) * attn_scale;
+                    scores[ctx_len + j] = s;
+                    if (s > max_s) max_s = s;
                 }
 
-                /* Softmax */
-                float max_s = scores[0];
-                for (uint32_t j = 0; j <= t; j++) {
-                    if (scores[1 + j] > max_s) max_s = scores[1 + j];
-                }
                 float sum_exp = 0.0f;
-                for (uint32_t j = 0; j <= t + 1; j++) {
-                    scores[j] = expf(scores[j] - max_s);
-                    sum_exp += scores[j];
+                for (uint32_t j = 0; j < total_kv; j++) {
+                    float e = expf(scores[j] - max_s);
+                    scores[j] = e;
+                    sum_exp += e;
                 }
                 float inv_sum = 1.0f / sum_exp;
-                for (uint32_t j = 0; j <= t + 1; j++) scores[j] *= inv_sum;
 
-                /* Weighted sum over values */
-                float *out_h = heads_out + h * ds->head_dim;
-                const float *vh_ctx = v_ctx_ptr + kv_h * ds->head_dim;
-                for (uint32_t d = 0; d < ds->head_dim; d++) out_h[d] = scores[0] * vh_ctx[d];
-
+                float *out_h = heads_out + (size_t)h * ds->head_dim;
+                memset(out_h, 0, ds->head_dim * sizeof(float));
+                for (uint32_t c = 0; c < ctx_len; c++) {
+                    float w = scores[c] * inv_sum;
+                    const float *vh_c = v_ctx_layer + (size_t)c * 1024u + kv_off;
+                    axpy_f32_128(out_h, w, vh_c);
+                }
                 for (uint32_t j = 0; j <= t; j++) {
-                    const float *vh_j = v_buf + (size_t)j * 1024 + kv_h * ds->head_dim;
-                    float sj = scores[1 + j];
-                    for (uint32_t d = 0; d < ds->head_dim; d++) out_h[d] += sj * vh_j[d];
+                    float w = scores[ctx_len + j] * inv_sum;
+                    const float *vh_j = v_buf + (size_t)j * 1024u + kv_off;
+                    axpy_f32_128(out_h, w, vh_j);
                 }
             }
         }
@@ -691,16 +1182,19 @@ uint32_t myds_dspine_propose(myds_dspine_t *ds, myds_context_t *ctx,
             for (uint32_t d = 0; d < ds->hidden_size; d++) xt[d] += ft[d];
         }
 
+        /* Save final layer pre_injection before AdjacentInjection for discrete refinement tail */
+        if (l + 1u == ds->num_layers) {
+            memcpy(ds->pre_injection_l2, x, (size_t)T * ds->hidden_size * sizeof(float));
+        }
+
         /* 3.7 Code Bridge: Readout projection on GPU */
         myds_metal_v41_gemv_batch(ds->features_buf, ds->injection_readouts[l], ds->x_buf,
                                   512, ds->hidden_size, T, GGML_TYPE_BF16);
 
-        /* Features norm & scale */
+        /* Exact L2 normalization * sqrt(512) matching SpecForge AdjacentInjection.feature */
         float sqrt_rank = sqrtf(512.0f);
         for (uint32_t t = 0; t < T; t++) {
-            float *feat = feat_ptr + (size_t)t * 512;
-            rmsnorm(feat, feat, NULL, 512, 1e-6f);
-            for (uint32_t r = 0; r < 512; r++) feat[r] *= sqrt_rank;
+            normalize_feature_512(feat_ptr + (size_t)t * 512u);
         }
 
         /* Predecessors and write-backs */
@@ -711,13 +1205,14 @@ uint32_t myds_dspine_propose(myds_dspine_t *ds, myds_context_t *ctx,
         const uint16_t *write_w = (const uint16_t *)myds_metal_buffer_data(ds->injection_writes[l]);
         const uint16_t *codes_table = (const uint16_t *)myds_metal_buffer_data(ds->transfer_codes);
 
+        int32_t safe_seed = (seed_token >= 0 && (uint32_t)seed_token < ds->vocab_size) ? seed_token : 0;
         float P0[512];
-        const uint16_t *seed_code = codes_table + (size_t)seed_token * 512;
+        const uint16_t *seed_code = codes_table + (size_t)safe_seed * 512u;
         for (uint32_t r = 0; r < 512; r++) P0[r] = sqrt_rank * bf16_to_fp32(seed_code[r]);
 
         for (uint32_t t = 1; t < T; t++) {
-            const float *pred = (t == 1) ? P0 : (feat_ptr + (size_t)(t - 1) * 512);
-            const float *recv = feat_ptr + (size_t)t * 512;
+            const float *pred = (t == 1) ? P0 : (feat_ptr + (size_t)(t - 1) * 512u);
+            const float *recv = feat_ptr + (size_t)t * 512u;
 
             float g_recv[256], g_pred[256], msg[256], gate[256];
             matvec_bf16(g_recv, recv_w, recv, 256, 512);
@@ -741,7 +1236,7 @@ uint32_t myds_dspine_propose(myds_dspine_t *ds, myds_context_t *ctx,
         }
     }
 
-    /* 4. Final Norm & Candidate Selection */
+    /* 4. Final Norm & Candidate Selection + Discrete Predecessor Refinement Tail */
     const uint16_t *fn_w = (const uint16_t *)myds_metal_buffer_data(ds->final_norm);
     for (uint32_t t = 1; t < T; t++) {
         float *xt = x + (size_t)t * ds->hidden_size;
@@ -760,19 +1255,81 @@ uint32_t myds_dspine_propose(myds_dspine_t *ds, myds_context_t *ctx,
         }
         if (s_head_diag < 5) {
             s_head_diag++;
-            MYDS_LOG_I("[dspine-head-diag] ok_head=%d out_type=%d vocab=%u hidden=%u logit0=%.4f logit1=%.4f",
-                       ok_head, (int)m->output_type, m->vocab_size, ds->hidden_size,
+            MYDS_LOG_I("[dspine-head-diag] ok_head=%d out_type=%d vocab=%u ctx_kv=%u logit0=%.4f logit1=%.4f",
+                       ok_head, (int)m->output_type, m->vocab_size, ctx_len,
                        all_logits ? all_logits[0] : -999.0f, all_logits ? all_logits[1] : -999.0f);
         }
 
+        static int s_no_refine = -1;
+        if (s_no_refine < 0) {
+            const char *nr = getenv("MYDS_DSPINE_NO_REFINE");
+            s_no_refine = (nr && atoi(nr) != 0) ? 1 : 0;
+        }
+
+        const uint32_t K = ds->top_k <= MYDS_DSPINE_TOP_K ? ds->top_k : MYDS_DSPINE_TOP_K;
+        int32_t cand_ids[MYDS_DSPINE_MAX_BLOCK][MYDS_DSPINE_TOP_K];
+
+        /* First extract backbone argmax (for t=1) and top-K candidates (for t>=2) BEFORE any logits_buf reuse */
         for (uint32_t t = 1; t < T; t++) {
             const float *logits = all_logits + (size_t)(t - 1) * m->vocab_size;
-            float max_v = logits[0];
-            int32_t best_tok = 0;
-            for (uint32_t v = 1; v < m->vocab_size; v++) {
-                if (logits[v] > max_v) {
-                    max_v = logits[v];
-                    best_tok = (int32_t)v;
+            if (t == 1 || s_no_refine || K <= 1) {
+                float max_v = logits[0];
+                int32_t best_tok = 0;
+                for (uint32_t v = 1; v < m->vocab_size; v++) {
+                    if (logits[v] > max_v) {
+                        max_v = logits[v];
+                        best_tok = (int32_t)v;
+                    }
+                }
+                cand_ids[t - 1][0] = best_tok;
+            } else {
+                topk_f32(logits, m->vocab_size, K, cand_ids[t - 1]);
+            }
+        }
+
+        /* Position 0 (t=1): layer 2 AdjacentInjection already injected transfer_codes[seed_token] */
+        ds->draft_tokens[0] = cand_ids[0][0];
+        ds->draft_count = 1;
+        ds->proposed_tokens++;
+
+        /* Positions 1..T-2 (t=2..T-1): refine pre_injection_l2[t] with discrete draft_tokens[t-2] */
+        for (uint32_t t = 2; t < T; t++) {
+            int32_t best_tok = cand_ids[t - 1][0];
+            if (!s_no_refine && K > 1) {
+                float refined_norm[5120];
+                dspine_refine_single(ds, ds->pre_injection_l2 + (size_t)t * ds->hidden_size,
+                                     ds->draft_tokens[t - 2], refined_norm);
+
+                float best_score = -1e38f;
+                bool cpu_ok = true;
+                for (uint32_t k = 0; k < K; k++) {
+                    float sc = 0.0f;
+                    if (!score_output_row_cpu(m, (uint32_t)cand_ids[t - 1][k],
+                                              refined_norm, ds->hidden_size, &sc)) {
+                        cpu_ok = false;
+                        break;
+                    }
+                    if (k == 0 || sc > best_score) {
+                        best_score = sc;
+                        best_tok = cand_ids[t - 1][k];
+                    }
+                }
+                if (!cpu_ok) {
+                    /* GPU fallback for exotic lm_head quant types */
+                    memcpy(norm_buf, refined_norm, ds->hidden_size * sizeof(float));
+                    if (myds_metal_gemv_batch(ds->logits_buf, m->output, ds->norm_buf,
+                                              m->vocab_size, ds->hidden_size, 1, m->output_type)) {
+                        const float *ref_logits = (const float *)myds_metal_buffer_data(ds->logits_buf);
+                        best_score = ref_logits[cand_ids[t - 1][0]];
+                        best_tok = cand_ids[t - 1][0];
+                        for (uint32_t k = 1; k < K; k++) {
+                            float sc = ref_logits[cand_ids[t - 1][k]];
+                            if (sc > best_score) {
+                                best_score = sc;
+                                best_tok = cand_ids[t - 1][k];
+                            }
+                        }
+                    }
                 }
             }
             ds->draft_tokens[t - 1] = best_tok;

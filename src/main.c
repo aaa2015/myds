@@ -4,6 +4,7 @@
 #include "myds_vjob.h"
 #include "myds_dspark.h"
 #include "myds_dspine.h"
+#include "myds_dspine_capture.h"
 #include "myds_steer.h"
 #include "myds_steer_alpha.h"
 #include "myds_metal.h"
@@ -18,6 +19,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/file.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -125,6 +127,7 @@ static void print_usage(const char *prog) {
     printf("  --dspark, --mtp-model <path>  DSpark support model GGUF for speculative decoding\n");
     printf("  --dspark-draft <int>    Draft tokens per speculative cycle (default: 5)\n");
     printf("  --dspine <path>         DSpine draft model safetensors for speculative decoding\n");
+    printf("  --dspine-capture-jsonl <path>  Batch capture target hidden-state shards from token JSONL\n");
     printf("  -p, --prompt <string>   Prompt string (if omitted and no --port, starts interactive chat)\n");
     printf("  -n, --max-tokens <int>  Max tokens to generate (default: 256)\n");
     printf("  -c, --ctx, --ctx-size   Context window size (default: 4096)\n");
@@ -353,6 +356,7 @@ int main(int argc, char *argv[]) {
     const char *vision_path = NULL;
     const char *dspark_path = NULL;
     const char *dspine_path = getenv("MYDS_DSPINE_FILE");
+    const char *dspine_capture_jsonl = NULL;
     uint32_t dspark_draft = 0;
     int port = 0;
     bool print_tokens = false;
@@ -404,6 +408,8 @@ int main(int argc, char *argv[]) {
             dspark_path = argv[++i];
         } else if (strcmp(argv[i], "--dspine") == 0 && i + 1 < argc) {
             dspine_path = argv[++i];
+        } else if (strcmp(argv[i], "--dspine-capture-jsonl") == 0 && i + 1 < argc) {
+            dspine_capture_jsonl = argv[++i];
         } else if (strcmp(argv[i], "--dspark-draft") == 0 && i + 1 < argc) {
             dspark_draft = (uint32_t)atoi(argv[++i]);
         } else if ((strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--prompt") == 0) && i + 1 < argc) {
@@ -645,6 +651,119 @@ int main(int argc, char *argv[]) {
         MYDS_LOG_E("DSpark capture bypass requires a loaded support model");
         exit_after_cleanup(1, 1, ctx, model);
         return 1;
+    }
+
+    if (dspine_capture_jsonl) {
+        if (!myds_dspine_capture_is_enabled()) {
+            MYDS_LOG_E("--dspine-capture-jsonl requires MYDS_DSPINE_CAPTURE_DIR to be set");
+            exit_after_cleanup(1, 1, ctx, model);
+            return 1;
+        }
+        const char *cap_dir = getenv("MYDS_DSPINE_CAPTURE_DIR");
+        mkdir(cap_dir, 0755);
+        FILE *jf = fopen(dspine_capture_jsonl, "r");
+        if (!jf) {
+            MYDS_LOG_E("Failed to open capture JSONL: %s", dspine_capture_jsonl);
+            exit_after_cleanup(1, 1, ctx, model);
+            return 1;
+        }
+        size_t line_cap = 2 * 1024 * 1024;
+        char *line_buf = (char *)malloc(line_cap);
+        int32_t *seq_tokens = (int32_t *)malloc((size_t)cfg.max_seq_len * sizeof(int32_t));
+        float *seq_mask = (float *)malloc((size_t)cfg.max_seq_len * sizeof(float));
+        if (!line_buf || !seq_tokens || !seq_mask) {
+            MYDS_LOG_E("Out of memory allocating capture buffers");
+            free(line_buf); free(seq_tokens); free(seq_mask); fclose(jf);
+            exit_after_cleanup(1, 1, ctx, model);
+            return 1;
+        }
+
+        uint32_t row_idx = 0, captured_n = 0, skipped_n = 0;
+        uint64_t total_tok = 0;
+        double cap_t0 = myds_now_s();
+
+        while (fgets(line_buf, (int)line_cap, jf)) {
+            char shard_path[1024];
+            snprintf(shard_path, sizeof(shard_path), "%s/shard-%06u.safetensors", cap_dir, row_idx);
+            uint32_t cur_idx = row_idx++;
+
+            struct stat st_sh;
+            if (stat(shard_path, &st_sh) == 0 && st_sh.st_size > 128) {
+                skipped_n++;
+                continue;
+            }
+
+            const char *tok_key = strstr(line_buf, "\"tokens\"");
+            if (!tok_key) continue;
+            const char *br = strchr(tok_key, '[');
+            if (!br) continue;
+
+            uint32_t n_tok = 0;
+            const char *p = br + 1;
+            while (*p && *p != ']' && n_tok < cfg.max_seq_len) {
+                while (*p && (*p == ' ' || *p == ',' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+                if (*p == ']' || !*p) break;
+                char *endp = NULL;
+                long v = strtol(p, &endp, 10);
+                if (endp == p) break;
+                seq_tokens[n_tok++] = (int32_t)v;
+                p = endp;
+            }
+            if (n_tok < 16) continue;
+
+            bool has_mask = false;
+            const char *mask_key = strstr(line_buf, "\"loss_mask\"");
+            if (mask_key) {
+                const char *mbr = strchr(mask_key, '[');
+                if (mbr) {
+                    uint32_t n_m = 0;
+                    const char *mp = mbr + 1;
+                    while (*mp && *mp != ']' && n_m < n_tok) {
+                        while (*mp && (*mp == ' ' || *mp == ',' || *mp == '\t' || *mp == '\r' || *mp == '\n')) mp++;
+                        if (*mp == ']' || !*mp) break;
+                        char *endp = NULL;
+                        float mv = strtof(mp, &endp);
+                        if (endp == mp) break;
+                        seq_mask[n_m++] = mv;
+                        mp = endp;
+                    }
+                    if (n_m == n_tok) has_mask = true;
+                }
+            }
+
+            myds_dspine_capture_set_override(has_mask ? seq_mask : NULL, n_tok, shard_path);
+            ctx->pos = 0;
+            double seq_t0 = myds_now_s();
+            int prc = myds_v41_prefill_tokens(ctx, seq_tokens, n_tok, NULL);
+            double seq_s = myds_now_s() - seq_t0;
+            if (prc != 1) {
+                MYDS_LOG_E("Capture prefill failed on row %u (n_tok=%u, rc=%d)", cur_idx, n_tok, prc);
+                free(line_buf); free(seq_tokens); free(seq_mask); fclose(jf);
+                exit_after_cleanup(1, 1, ctx, model);
+                return 1;
+            }
+            captured_n++;
+            total_tok += n_tok;
+            double elapsed = myds_now_s() - cap_t0;
+            if (captured_n == 1 || captured_n % 5 == 0) {
+                MYDS_LOG_I("[dspine-capture] row=%u captured=%u (skipped=%u) seq_tok=%u (%.1f tok/s) total_tok=%llu avg=%.1f tok/s elapsed=%.1fs",
+                           cur_idx, captured_n, skipped_n, n_tok,
+                           seq_s > 0.0 ? (double)n_tok / seq_s : 0.0,
+                           (unsigned long long)total_tok,
+                           elapsed > 0.0 ? (double)total_tok / elapsed : 0.0,
+                           elapsed);
+            }
+        }
+        double total_s = myds_now_s() - cap_t0;
+        MYDS_LOG_I("[dspine-capture] DONE: captured=%u skipped=%u total_rows=%u total_tok=%llu in %.1fs (%.1f tok/s)",
+                   captured_n, skipped_n, row_idx, (unsigned long long)total_tok, total_s,
+                   total_s > 0.0 ? (double)total_tok / total_s : 0.0);
+        free(line_buf);
+        free(seq_tokens);
+        free(seq_mask);
+        fclose(jf);
+        exit_after_cleanup(0, 1, ctx, model);
+        return 0;
     }
 
     if (port > 0) {

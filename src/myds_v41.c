@@ -4127,21 +4127,31 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
     uint32_t il=0;
     const char *phase="input";
     myds_dspark_capture_invalidate(ctx->dspark);
-    if (ctx->dspine) myds_dspine_capture_invalidate(ctx->dspine);
     if (g) myds_v41_gpu_attn_kv_reuse_reset(g->gpu);
     if (!g || token<0 || (uint32_t)token>=m->vocab_size || pos>=g->capacity ||
-        pos>=ctx->cfg.max_seq_len) return -1;
+        pos>=ctx->cfg.max_seq_len) {
+        if (ctx->dspine) myds_dspine_capture_invalidate(ctx->dspine);
+        return -1;
+    }
     if (need_logits && ctx->decode_metrics_active) {
         ctx->decode_stats.target_forward_calls++;
         ctx->decode_stats.target_rows++;
     }
     const bool gap_prof = myds_metal_gap_prof_enabled() == 1;
     const double gp_t_entry = gap_prof ? myds_metal_host_time() : 0.0;
-    if (!myds_metal_commit_batch()) return -1;
+    if (!myds_metal_commit_batch()) {
+        if (ctx->dspine) myds_dspine_capture_invalidate(ctx->dspine);
+        return -1;
+    }
     if (pos==0) { g->next_position=0; g->valid=true; myds_engram_reset(g->engram); }
     if (!g->valid || pos!=g->next_position) {
+        if (ctx->dspine) myds_dspine_capture_invalidate(ctx->dspine);
         MYDS_LOG_E("V4.1 expected consecutive token position %u, received %u",g->next_position,pos);
         return -1;
+    }
+    if (ctx->dspine) {
+        (void)myds_dspine_flush_pending(ctx->dspine, pos);
+        myds_dspine_capture_invalidate(ctx->dspine);
     }
     const bool trace_on = myds_trace_active();
     const char *qkv_concurrent_env = getenv("MYDS_QKV_CONCURRENT");
@@ -4671,8 +4681,8 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
                 CHECK(myds_dspark_capture_layer_to(ctx->dspark, il, g->residual, NULL));
             }
         }
-        if (ctx->dspine) {
-            myds_dspine_capture_target_layer(ctx->dspine, il, g->residual);
+        if (ctx->dspine && ctx->dspine->enabled) {
+            CHECK(myds_dspine_capture_target_layer(ctx->dspine, il, pos, g->residual));
         }
         if (decode_split && !trace_on && !dec_fine && il + 1u < V41_LAYERS &&
             ((il + 1u) * (uint32_t)decode_split) / V41_LAYERS != (il * (uint32_t)decode_split) / V41_LAYERS) {
@@ -6002,15 +6012,20 @@ static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *t
 
     if (pos != 0 && (!g->valid || pos != g->next_position)) return -1;
     myds_dspark_capture_invalidate(ctx->dspark);
-    if (ctx->dspine) myds_dspine_capture_invalidate(ctx->dspine);
     if (!myds_metal_commit_batch()) {
+        if (ctx->dspine) myds_dspine_capture_invalidate(ctx->dspine);
         if (linear) { g->valid = false; myds_dspark_capture_poison(ctx->dspark); }
         return -1;
     }
     if (pos == 0) { g->next_position = 0; g->valid = true; myds_engram_reset(g->engram); }
     if (!g->valid || pos != g->next_position) {
+        if (ctx->dspine) myds_dspine_capture_invalidate(ctx->dspine);
         MYDS_LOG_E("V4.1 forward_tree_spec expected position %u, got %u", g->next_position, pos);
         return -1;
+    }
+    if (ctx->dspine) {
+        (void)myds_dspine_flush_pending(ctx->dspine, pos);
+        myds_dspine_capture_invalidate(ctx->dspine);
     }
 
     if (!g->batch2_ws) {
@@ -6346,9 +6361,9 @@ static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *t
                 }
             }
         }
-        if (ctx->dspine) {
+        if (ctx->dspine && ctx->dspine->enabled) {
             for (uint32_t t = 0; t < 3; t++) {
-                myds_dspine_capture_target_spec_layer(ctx->dspine, il, t, ws->v_residual[t]);
+                CHECK(myds_dspine_capture_target_spec_layer(ctx->dspine, il, t, ws->v_residual[t]));
             }
         }
 
@@ -6483,8 +6498,8 @@ static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *t
      * become observable; its final copy failure is a rollback failure path. */
     CHECK(linear ? myds_metal_commit_batch() : myds_metal_flush_batch());
     myds_dspark_capture_publish(ctx->dspark);
-    if (ctx->dspine) {
-        myds_dspine_capture_select_row(ctx->dspine, selected);
+    if (ctx->dspine && ctx->dspine->enabled) {
+        myds_dspine_capture_select_row(ctx->dspine, pos, selected);
     }
     myds_metal_set_auto_barrier(prev_auto_barrier);
     if (g->engram) {
@@ -7604,7 +7619,9 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         long v = atol(smin);
         if (v >= 0) shrink_min = (uint32_t)v;
     }
-    const bool suffix_shrink = !myds_dspine_capture_is_enabled() &&
+    const bool need_full_dspine_taps = myds_dspine_capture_is_enabled() ||
+                                       (ctx->dspine && ctx->dspine->enabled);
+    const bool suffix_shrink = !need_full_dspine_taps &&
                                opt_suffix_shrink && shrink_gather_ok &&
                                (base_pos + n_tokens) >= shrink_min;
     /* 收缩前置段的「有效快照窗口」：
@@ -7638,7 +7655,8 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
      * 消除递归因果锥 (1 + (39-il)*127) 带来的数万 token 重复计算。
      * 默认关（0），保持绝对 0-ULP 基线；设 MYDS_YOCO_COMPACT=1 开启。 */
     const char *yoco_compact_env = getenv("MYDS_YOCO_COMPACT");
-    const bool opt_yoco_compact = (yoco_compact_env && atoi(yoco_compact_env) != 0);
+    const bool opt_yoco_compact = !need_full_dspine_taps &&
+                                  (yoco_compact_env && atoi(yoco_compact_env) != 0);
 
     /* 2026-10-25 收紧：keep_tokens 的默认值与下限 128/140 → V41_SNAP_STRIDE(512)。
      *
@@ -7748,6 +7766,20 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 
     if (myds_dspine_capture_is_enabled()) {
         myds_dspine_capture_begin(n_tokens, tokens);
+    }
+
+    const bool live_dspine_ctx = !myds_dspine_capture_is_enabled() &&
+                                 ctx->dspine && ctx->dspine->enabled && ctx->dspine->loaded;
+    float *dspine_mb_th = NULL;
+    if (live_dspine_ctx) {
+        if (base_pos == 0) myds_dspine_reset_context(ctx->dspine);
+        else myds_dspine_truncate_context(ctx->dspine, base_pos);
+        uint32_t mb_cap = n_tokens < macroblock_size ? n_tokens : macroblock_size;
+        dspine_mb_th = (float *)malloc((size_t)mb_cap * MYDS_DSPINE_TARGET_DIM * sizeof(float));
+        if (!dspine_mb_th) {
+            MYDS_LOG_E("DSpine: failed to allocate prefill context staging buffer");
+            goto fail;
+        }
     }
 
     for (uint32_t mb_start = 0; mb_start < n_tokens; mb_start += macroblock_size) {
@@ -8923,15 +8955,32 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 c_start += c_len;
             } /* chunk loop */
 
-            if (myds_dspine_capture_is_enabled() && myds_dspine_capture_layer_slot(il) >= 0) {
+            int dspine_tap_slot = myds_dspine_capture_layer_slot(il);
+            if (dspine_tap_slot >= 0 && (myds_dspine_capture_is_enabled() || live_dspine_ctx)) {
+                inflight_chunks = 0;
                 CHECK(myds_metal_commit_batch());
                 const float *res_ptr = (const float *)myds_metal_buffer_data(prompt_res);
-                myds_dspine_capture_layer_hc(il, res_ptr, mb_start, mb_len);
-                CHECK(myds_metal_begin_batch());
+                if (myds_dspine_capture_is_enabled()) {
+                    myds_dspine_capture_layer_hc(il, res_ptr, mb_start, mb_len);
+                }
+                if (live_dspine_ctx && dspine_mb_th) {
+                    for (uint32_t ti = 0; ti < mb_len; ti++) {
+                        const float *s0 = res_ptr + (size_t)ti * 4u * V41_DIM;
+                        const float *s1 = s0 + V41_DIM;
+                        const float *s2 = s1 + V41_DIM;
+                        const float *s3 = s2 + V41_DIM;
+                        float *dst = dspine_mb_th + (size_t)ti * MYDS_DSPINE_TARGET_DIM +
+                                     (size_t)dspine_tap_slot * V41_DIM;
+                        for (uint32_t d = 0; d < V41_DIM; d++) {
+                            dst[d] = 0.25f * (s0[d] + s1[d] + s2[d] + s3[d]);
+                        }
+                    }
+                }
             }
         } /* layer loop */
 
         if (myds_dspine_capture_is_enabled()) {
+            inflight_chunks = 0;
             CHECK(myds_metal_commit_batch());
             for (uint32_t c_start = 0; c_start < mb_len; c_start += chunk_size) {
                 uint32_t c_len = mb_len - c_start;
@@ -8958,6 +9007,10 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
             }
             inflight_chunks = 0;
             CHECK(myds_metal_commit_batch());
+        }
+
+        if (live_dspine_ctx && dspine_mb_th) {
+            CHECK(myds_dspine_append_context_batch(ctx->dspine, dspine_mb_th, mb_base_pos, mb_len));
         }
     } /* macroblock loop */
 
@@ -9094,10 +9147,12 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     if (myds_dspine_capture_is_enabled()) {
         myds_dspine_capture_finish_and_save();
     }
+    free(dspine_mb_th);
 
     return 1;
 
 cancelled:
+    free(dspine_mb_th);
     if (eng_async_on) { eng_async.cancelled = 1; pthread_join(eng_async_th, NULL); eng_async_on = false; }
     (void)myds_metal_commit_batch();
     return -2;
@@ -9105,6 +9160,7 @@ cancelled:
 fail_hint_engram:
     MYDS_LOG_E("V4.1 prefill aborted: background engram thread failed");
 fail:
+    free(dspine_mb_th);
     /* ★ 必须先 join 再 free：线程写的是 prompt_engram_buf，下面第 7、8 行会释放它。 */
     if (eng_async_on) { eng_async.cancelled = 1; pthread_join(eng_async_th, NULL); eng_async_on = false; }
     MYDS_LOG_E("V4.1 prefill failed at layer %u: %s", il, phase);

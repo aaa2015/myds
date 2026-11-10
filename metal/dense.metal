@@ -1847,8 +1847,9 @@ kernel void kernel_mul_mv_t_t_4_b4(
 }
 
 typedef decltype(kernel_mul_mv_t_t_4_b4<half, half4, half, half4>) mul_mv_t_t_4_b4;
-template [[host_name("kernel_mul_mv_f32_f32_4_b4")]] kernel mul_mv_t_t_4_b4 kernel_mul_mv_t_t_4_b4<float, float4, float, float4>;
-template [[host_name("kernel_mul_mv_f16_f32_4_b4")]] kernel mul_mv_t_t_4_b4 kernel_mul_mv_t_t_4_b4<half,  half4,  float, float4>;
+template [[host_name("kernel_mul_mv_f32_f32_4_b4")]]  kernel mul_mv_t_t_4_b4 kernel_mul_mv_t_t_4_b4<float,  float4,  float, float4>;
+template [[host_name("kernel_mul_mv_f16_f32_4_b4")]]  kernel mul_mv_t_t_4_b4 kernel_mul_mv_t_t_4_b4<half,   half4,   float, float4>;
+template [[host_name("kernel_mul_mv_bf16_f32_4_b4")]] kernel mul_mv_t_t_4_b4 kernel_mul_mv_t_t_4_b4<bfloat, bfloat4, float, float4>;
 
 // DS4 compressor projections always compute two same-shaped F16 matvecs from
 // the same normalized activation: one for projected KV and one for pooling

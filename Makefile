@@ -628,8 +628,8 @@ $(TEST_DSPARK_ROLLBACK): tests/test_dspark_rollback.c $(filter-out $(BUILD_DIR)/
 $(TEST_DSPARK_CAPTURE): tests/test_dspark_capture.c src/myds_dspark.c $(wildcard include/*.h) $(filter-out $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ tests/test_dspark_capture.c $(filter-out $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS)
 
-$(TEST_DSPINE_CAPTURE): tests/test_dspine_capture.c $(BUILD_DIR)/myds_dspine_capture.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/myds_cpu.o $(METALLIB) | $(BIN_DIR)
-	$(CC) $(CFLAGS) $< $(BUILD_DIR)/myds_dspine_capture.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/myds_cpu.o $(LDFLAGS) -o $@
+$(TEST_DSPINE_CAPTURE): tests/test_dspine_capture.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
+	$(CC) $(CFLAGS) $< $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS) -o $@
 
 $(TEST_DSPINE_RUNTIME): tests/test_dspine_runtime.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) $< $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS) -o $@

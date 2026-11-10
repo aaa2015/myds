@@ -8,6 +8,14 @@
 #include <sys/time.h>
 #include <time.h>
 
+/* DeepSeek-V4.1-Flash-1017 special token IDs for automatic supervised loss_mask */
+#define V41_TOK_EOS       1
+#define V41_TOK_SYSTEM    128799
+#define V41_TOK_USER      128803
+#define V41_TOK_ASSISTANT 128804
+#define V41_TOK_THINK_BEG 128821
+#define V41_TOK_THINK_END 128822
+
 static int s_target_layers[MYDS_DSPINE_MAX_TAPS] = {2, 10, 20, 30, 38};
 static int s_num_taps = 5;
 static int s_init_done = 0;
@@ -18,6 +26,10 @@ static float *s_mask_buf = NULL;
 static uint16_t *s_hidden_buf = NULL;     /* [curr_tokens, num_taps * 5120] in BF16 */
 static uint16_t *s_last_norm_buf = NULL;  /* [curr_tokens, 5120] in BF16 */
 static uint32_t s_shard_counter = 0;
+
+static float *s_override_mask = NULL;
+static uint32_t s_override_n = 0;
+static char s_override_path[512] = {0};
 
 static inline uint16_t float_to_bf16(float f) {
     uint32_t x;
@@ -62,6 +74,77 @@ int myds_dspine_capture_layer_slot(uint32_t layer_idx) {
     return -1;
 }
 
+void myds_dspine_capture_set_override(const float *loss_mask, uint32_t n_tokens,
+                                      const char *exact_filepath) {
+    if (s_override_mask) {
+        free(s_override_mask);
+        s_override_mask = NULL;
+    }
+    s_override_n = 0;
+    s_override_path[0] = '\0';
+
+    if (loss_mask && n_tokens > 0) {
+        s_override_mask = (float *)malloc(n_tokens * sizeof(float));
+        if (s_override_mask) {
+            memcpy(s_override_mask, loss_mask, n_tokens * sizeof(float));
+            s_override_n = n_tokens;
+        }
+    }
+    if (exact_filepath && *exact_filepath) {
+        strncpy(s_override_path, exact_filepath, sizeof(s_override_path) - 1);
+        s_override_path[sizeof(s_override_path) - 1] = '\0';
+    }
+}
+
+static void fill_supervised_mask(float *mask, const int32_t *tokens, uint32_t n_tokens) {
+    if (!mask) return;
+    if (!tokens) {
+        for (uint32_t i = 0; i < n_tokens; i++) mask[i] = 1.0f;
+        return;
+    }
+    bool has_assistant = false;
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        if (tokens[i] == V41_TOK_ASSISTANT) {
+            has_assistant = true;
+            break;
+        }
+    }
+    if (!has_assistant) {
+        for (uint32_t i = 0; i < n_tokens; i++) mask[i] = 1.0f;
+        return;
+    }
+
+    bool on = false;
+    bool just_started = false;
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        int32_t t = tokens[i];
+        if (t == V41_TOK_ASSISTANT) {
+            on = true;
+            just_started = true;
+            mask[i] = 0.0f;
+            continue;
+        }
+        if (just_started) {
+            just_started = false;
+            if (t == V41_TOK_THINK_BEG || t == V41_TOK_THINK_END) {
+                mask[i] = 0.0f;
+                continue;
+            }
+        }
+        if (t == V41_TOK_EOS) {
+            mask[i] = on ? 1.0f : 0.0f;
+            on = false;
+            continue;
+        }
+        if (t == V41_TOK_USER || t == V41_TOK_SYSTEM) {
+            on = false;
+            mask[i] = 0.0f;
+            continue;
+        }
+        mask[i] = on ? 1.0f : 0.0f;
+    }
+}
+
 bool myds_dspine_capture_begin(uint32_t n_tokens, const int32_t *tokens) {
     if (!myds_dspine_capture_is_enabled() || n_tokens == 0) return false;
     ensure_init();
@@ -79,9 +162,16 @@ bool myds_dspine_capture_begin(uint32_t n_tokens, const int32_t *tokens) {
     }
     s_mask_buf = (float *)malloc(n_tokens * sizeof(float));
     if (s_mask_buf) {
-        for (uint32_t i = 0; i < n_tokens; i++) {
-            s_mask_buf[i] = 1.0f;
+        if (s_override_mask && s_override_n == n_tokens) {
+            memcpy(s_mask_buf, s_override_mask, n_tokens * sizeof(float));
+        } else {
+            fill_supervised_mask(s_mask_buf, tokens, n_tokens);
         }
+    }
+    if (s_override_mask) {
+        free(s_override_mask);
+        s_override_mask = NULL;
+        s_override_n = 0;
     }
 
     size_t hidden_elems = (size_t)n_tokens * s_num_taps * MYDS_DSPINE_DIM;
@@ -153,19 +243,26 @@ bool myds_dspine_capture_finish_and_save(void) {
     /* Ensure directory exists */
     mkdir(dir, 0755);
 
-    /* Construct unique path */
-    time_t now = time(NULL);
-    struct tm tm_buf;
-    localtime_r(&now, &tm_buf);
-
     char filepath[512];
-    snprintf(filepath, sizeof(filepath), "%s/shard-%04d%02d%02d-%02d%02d%02d-%05u.safetensors",
-             dir, tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,
-             tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, ++s_shard_counter);
+    char tmp_filepath[544];
+    if (s_override_path[0] != '\0') {
+        strncpy(filepath, s_override_path, sizeof(filepath) - 1);
+        filepath[sizeof(filepath) - 1] = '\0';
+        s_override_path[0] = '\0';
+        ++s_shard_counter;
+    } else {
+        time_t now = time(NULL);
+        struct tm tm_buf;
+        localtime_r(&now, &tm_buf);
+        snprintf(filepath, sizeof(filepath), "%s/shard-%04d%02d%02d-%02d%02d%02d-%05u.safetensors",
+                 dir, tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,
+                 tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, ++s_shard_counter);
+    }
+    snprintf(tmp_filepath, sizeof(tmp_filepath), "%s.tmp", filepath);
 
-    FILE *f = fopen(filepath, "wb");
+    FILE *f = fopen(tmp_filepath, "wb");
     if (!f) {
-        MYDS_LOG_E("DSpine capture: failed to open %s for writing", filepath);
+        MYDS_LOG_E("DSpine capture: failed to open %s for writing", tmp_filepath);
         return false;
     }
 
@@ -198,6 +295,7 @@ bool myds_dspine_capture_finish_and_save(void) {
 
     if (hlen <= 0 || (size_t)hlen >= sizeof(header_buf)) {
         fclose(f);
+        remove(tmp_filepath);
         return false;
     }
 
@@ -209,19 +307,23 @@ bool myds_dspine_capture_finish_and_save(void) {
     header_buf[hlen] = '\0';
 
     uint64_t n_header = (uint64_t)hlen;
-    fwrite(&n_header, sizeof(uint64_t), 1, f);
-    fwrite(header_buf, 1, hlen, f);
+    bool ok = (fwrite(&n_header, sizeof(uint64_t), 1, f) == 1) &&
+              (fwrite(header_buf, 1, (size_t)hlen, f) == (size_t)hlen) &&
+              (fwrite(s_tokens_buf, 1, ids_bytes, f) == ids_bytes) &&
+              (fwrite(s_mask_buf, 1, mask_bytes, f) == mask_bytes) &&
+              (fwrite(s_hidden_buf, 1, hidden_bytes, f) == hidden_bytes) &&
+              (fwrite(s_last_norm_buf, 1, last_norm_bytes, f) == last_norm_bytes);
 
-    /* Write binary buffers */
-    fwrite(s_tokens_buf, 1, ids_bytes, f);
-    fwrite(s_mask_buf, 1, mask_bytes, f);
-    fwrite(s_hidden_buf, 1, hidden_bytes, f);
-    fwrite(s_last_norm_buf, 1, last_norm_bytes, f);
+    if (fclose(f) != 0) ok = false;
 
-    fclose(f);
-
-    MYDS_LOG_I("DSpine capture: successfully saved %u tokens to %s (%.2f MB)",
-               T, filepath, (double)(sizeof(uint64_t) + hlen + off4) / (1024.0 * 1024.0));
+    if (!ok || rename(tmp_filepath, filepath) != 0) {
+        MYDS_LOG_E("DSpine capture: failed to write/rename shard %s", filepath);
+        remove(tmp_filepath);
+        ok = false;
+    } else {
+        MYDS_LOG_I("DSpine capture: successfully saved %u tokens to %s (%.2f MB)",
+                   T, filepath, (double)(sizeof(uint64_t) + (size_t)hlen + off4) / (1024.0 * 1024.0));
+    }
 
     /* Clean memory */
     free(s_tokens_buf); s_tokens_buf = NULL;
@@ -230,5 +332,5 @@ bool myds_dspine_capture_finish_and_save(void) {
     free(s_last_norm_buf); s_last_norm_buf = NULL;
     s_curr_tokens = 0;
 
-    return true;
+    return ok;
 }

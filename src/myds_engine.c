@@ -3644,7 +3644,7 @@ static int myds_generate_internal(myds_context_t *ctx,
         /* 2026-10-24：重启后 ctx->anchor_len == 0，但磁盘上可能已有该位置的锚点。
          * ★ 必须在下面的 RAM 判定【之前】恢复：否则 resume_from 已定为 0，
          * 这次请求仍会全量 prefill，恢复只对下一次生效（实测踩到）。 */
-        if (pcache_on && ctx->v41 && resume_from == 0 && ctx->anchor_n == 0) {
+        if (pcache_on && ctx->v41 && !(ctx->dspine && ctx->dspine->enabled) && resume_from == 0 && ctx->anchor_n == 0) {
             uint32_t ap = 0;
             for (uint32_t i = 0; i < (uint32_t)n_prompt - 1u; i++) {
                 if (prompt_tokens[i] == 128803) { ap = i + 1u; break; }
@@ -3700,7 +3700,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                            "(reuse %u tok, still to prefill %u)",
                            n_prompt, best_i, best_len, best_len,
                            (uint32_t)n_prompt - 1u - best_len);
-            } else if (best_len > resume_from) {
+            } else if (best_len > resume_from && !(ctx->dspine && ctx->dspine->enabled)) {
                 const uint32_t slot = myds_anchor_slot(best_i);
                 const uint32_t got = myds_v41_low_kv_load_anchor(ctx->v41, prompt_tokens, best_len, slot);
                 if (got == best_len) {
@@ -3732,7 +3732,7 @@ static int myds_generate_internal(myds_context_t *ctx,
          * MYDS_KV_DSK_PREFER_DEEPER=0 keeps the previous selection policy. */
         bool disk_loaded = false;
         struct timespec disk_restore_started = {0};
-        if (pcache_on && ctx->v41 && (prefer_deeper_disk_prefix() || resume_from == 0)) {
+        if (pcache_on && ctx->v41 && !(ctx->dspine && ctx->dspine->enabled) && (prefer_deeper_disk_prefix() || resume_from == 0)) {
             const uint32_t candidate = myds_v41_low_kv_probe_deeper(ctx->v41, prompt_tokens,
                                                                     resume_from, (uint32_t)n_prompt - 1u);
             if (candidate > resume_from) {
@@ -3840,6 +3840,14 @@ static int myds_generate_internal(myds_context_t *ctx,
     }
 
     ctx->pos = resume_from;
+    if (ctx->dspine && ctx->dspine->enabled) {
+        if (resume_from == 0) {
+            myds_dspine_reset_context(ctx->dspine);
+        } else {
+            myds_dspine_truncate_context(ctx->dspine, resume_from);
+            myds_dspine_capture_invalidate(ctx->dspine);
+        }
+    }
     int32_t cur_token = prompt_tokens[0];
 
     /* 2. Prefill phase (bypassing LM head & sampling for tokens 0..n_prompt-2) */
@@ -4083,8 +4091,12 @@ static int myds_generate_internal(myds_context_t *ctx,
 
             const bool cost_skip = decode_cost_skip(ctx) || (!serial_probe && max_gen - step < 2);
             if (ctx->dspine && ctx->dspine->enabled && linear_room && myds_dspine_capture_ready(ctx->dspine)) {
+                const uint64_t before_cycles = ctx->dspine->cycles;
+                const uint64_t before_proposed = ctx->dspine->proposed_tokens;
                 const double draft_start = ctx->decode_stats.timing_enabled ? decode_now_ms() : 0.0;
                 uint32_t n_dspine = myds_dspine_propose(ctx->dspine, ctx, cur_token, 2);
+                ctx->decode_stats.draft_cycles += ctx->dspine->cycles - before_cycles;
+                ctx->decode_stats.draft_proposed += ctx->dspine->proposed_tokens - before_proposed;
                 if (n_dspine >= 2) {
                     neural_count = n_dspine;
                     cand_a = ctx->dspine->draft_tokens[0];

@@ -5025,12 +5025,18 @@ int myds_metal_v41_gemv_batch(myds_metal_buffer_t *out,
         if (!use_b4) args.nr0 = (int32_t)v41_gemv_nr0;
         const unsigned nr0v = (unsigned)args.nr0;
         NSString *funcName = nil;
-        if (weight_type == GGML_TYPE_BF16) {
-            funcName = @"kernel_mul_mv_bf16_f32_4";
-        } else if (use_b4) {
-            funcName = weight_type == GGML_TYPE_F32 ? @"kernel_mul_mv_f32_f32_4_b4" : @"kernel_mul_mv_f16_f32_4_b4";
+        if (use_b4) {
+            if (weight_type == GGML_TYPE_BF16) {
+                funcName = @"kernel_mul_mv_bf16_f32_4_b4";
+            } else {
+                funcName = weight_type == GGML_TYPE_F32 ? @"kernel_mul_mv_f32_f32_4_b4" : @"kernel_mul_mv_f16_f32_4_b4";
+            }
         } else {
-            funcName = weight_type == GGML_TYPE_F32 ? @"kernel_mul_mv_f32_f32_4" : @"kernel_mul_mv_f16_f32_4";
+            if (weight_type == GGML_TYPE_BF16) {
+                funcName = @"kernel_mul_mv_bf16_f32_4";
+            } else {
+                funcName = weight_type == GGML_TYPE_F32 ? @"kernel_mul_mv_f32_f32_4" : @"kernel_mul_mv_f16_f32_4";
+            }
         }
         NSString *key = [NSString stringWithFormat:@"%@_%u", funcName, nsg];
         id<MTLComputePipelineState> pipeline = g_native_pipelines[key];

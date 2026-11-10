@@ -18,6 +18,7 @@ extern "C" {
 #define MYDS_DSPINE_TRANSFER_RANK 512
 #define MYDS_DSPINE_MESSAGE_SIZE 256
 #define MYDS_DSPINE_TOP_K 16
+#define MYDS_DSPINE_CTX_BATCH_CAP 64
 
 /* Layer weights for the dense DSpine draft Transformer */
 typedef struct {
@@ -75,6 +76,11 @@ typedef struct myds_dspine_s {
     myds_metal_buffer_t *tsv_table;      /* [129280, 512] */
     bool                 tables_ready;
 
+    /* GPU Capture Views & Weights (dispatched on active Metal CB) */
+    myds_metal_buffer_t *hc_mean_weights; /* [4] = {0.25, 0.25, 0.25, 0.25} */
+    myds_metal_buffer_t *target_slot_views[MYDS_DSPINE_TARGET_LAYERS];
+    myds_metal_buffer_t *spec_slot_views[3][MYDS_DSPINE_TARGET_LAYERS];
+
     /* Execution & Scratch Buffers */
     myds_metal_buffer_t *target_hidden_buf; /* [25600 * sizeof(float)] */
     myds_metal_buffer_t *ctx_feat_buf;      /* [5120 * sizeof(float)] */
@@ -97,6 +103,31 @@ typedef struct myds_dspine_s {
     myds_metal_buffer_t *glu_buf;      /* [max_block * intermediate_size * sizeof(float)] */
     myds_metal_buffer_t *features_buf; /* [max_block * 512 * sizeof(float)] */
     myds_metal_buffer_t *delta_buf;    /* [max_block * 5120 * sizeof(float)] */
+
+    /* Batched context KV projection buffers */
+    myds_metal_buffer_t *batch_th_buf;    /* [CTX_BATCH_CAP * 25600 * sizeof(float)] */
+    myds_metal_buffer_t *batch_ctx_buf;   /* [CTX_BATCH_CAP * 5120 * sizeof(float)] */
+    myds_metal_buffer_t *batch_k_ctx_buf; /* [CTX_BATCH_CAP * 1024 * sizeof(float)] */
+    myds_metal_buffer_t *batch_v_ctx_buf; /* [CTX_BATCH_CAP * 1024 * sizeof(float)] */
+
+    /* Full Context KV Cache across all prior context tokens [0 .. anchor_pos - 1] */
+    float   *ctx_k_cache[MYDS_DSPINE_LAYERS]; /* [cap * 1024] */
+    float   *ctx_v_cache[MYDS_DSPINE_LAYERS]; /* [cap * 1024] */
+    uint32_t *ctx_pos_cache;                  /* [cap] */
+    float   *attn_scores_scratch;             /* [cap + max_block] */
+    uint32_t ctx_kv_len;
+    uint32_t ctx_kv_cap;
+
+    /* Pending captured target slot(s) to flush into ctx_k_cache before propose */
+    uint32_t pending_pos;
+    uint32_t pending_count;
+    bool     pending_from_spec;
+
+    /* Precomputed RoPE inverse frequencies for head_dim=128 (theta=1e6) */
+    float    rope_inv_freq[64];
+
+    /* Layer 2 pre-injection states for discrete predecessor refinement tail */
+    float    pre_injection_l2[MYDS_DSPINE_MAX_BLOCK * 5120];
 
     /* Output candidates */
     int32_t  draft_tokens[MYDS_DSPINE_MAX_BLOCK];
@@ -123,13 +154,23 @@ myds_dspine_t *myds_dspine_create(void);
 bool           myds_dspine_load_weights(myds_dspine_t *ds, const char *weights_path);
 void           myds_dspine_free(myds_dspine_t *ds);
 
+/* Context KV cache management */
+void           myds_dspine_reset_context(myds_dspine_t *ds);
+void           myds_dspine_truncate_context(myds_dspine_t *ds, uint32_t max_pos);
+bool           myds_dspine_flush_pending(myds_dspine_t *ds, uint32_t next_pos);
+bool           myds_dspine_append_context_batch(myds_dspine_t *ds,
+                                                const float *target_hidden_batch,
+                                                uint32_t start_pos, uint32_t count);
+
 /* Capture hook during target model decode / prefill */
-void           myds_dspine_capture_target_layer(myds_dspine_t *ds, uint32_t layer_idx,
-                                               const myds_metal_buffer_t *residual_hc);
-void           myds_dspine_capture_target_spec_layer(myds_dspine_t *ds, uint32_t layer_idx,
-                                                    uint32_t token_row,
-                                                    const myds_metal_buffer_t *residual_hc);
-void           myds_dspine_capture_select_row(myds_dspine_t *ds, uint32_t selected_row);
+int            myds_dspine_capture_target_layer(myds_dspine_t *ds, uint32_t layer_idx,
+                                                uint32_t pos,
+                                                const myds_metal_buffer_t *residual_hc);
+int            myds_dspine_capture_target_spec_layer(myds_dspine_t *ds, uint32_t layer_idx,
+                                                     uint32_t token_row,
+                                                     const myds_metal_buffer_t *residual_hc);
+void           myds_dspine_capture_select_row(myds_dspine_t *ds, uint32_t base_pos,
+                                              uint32_t selected_row);
 void           myds_dspine_capture_invalidate(myds_dspine_t *ds);
 bool           myds_dspine_capture_ready(const myds_dspine_t *ds);
 
