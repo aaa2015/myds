@@ -8,6 +8,8 @@
 #include "myds_v41_moe.h"
 #include "myds_v41_decode.h"
 #include "myds_dspark.h"
+#include "myds_dspine.h"
+#include "myds_dspine_capture.h"
 #include "myds_cpu.h"
 #include "myds_log.h"
 #include <math.h>
@@ -524,6 +526,7 @@ static bool v41_spec_snapshot_restore(myds_context_t *ctx, const myds_v41_spec_s
     /* Whole rollback has no pre-step slot payload. Reject it as a drafter
      * input until the authoritative retry captures a complete fresh token. */
     myds_dspark_capture_invalidate(ctx->dspark);
+    if (ctx->dspine) myds_dspine_capture_invalidate(ctx->dspine);
 
     if (!myds_metal_commit_batch()) return false;
 
@@ -614,6 +617,7 @@ static bool v41_spec_snapshot_restore_partial_completed(myds_context_t *ctx,
 #undef VALID_BUFFER
     }
     myds_dspark_capture_invalidate(ctx->dspark);
+    if (ctx->dspine) myds_dspine_capture_invalidate(ctx->dspine);
     if (!completed && !myds_metal_commit_batch()) return false;
 
     ctx->pos = snap->pos + keep_count;
@@ -4123,6 +4127,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
     uint32_t il=0;
     const char *phase="input";
     myds_dspark_capture_invalidate(ctx->dspark);
+    if (ctx->dspine) myds_dspine_capture_invalidate(ctx->dspine);
     if (g) myds_v41_gpu_attn_kv_reuse_reset(g->gpu);
     if (!g || token<0 || (uint32_t)token>=m->vocab_size || pos>=g->capacity ||
         pos>=ctx->cfg.max_seq_len) return -1;
@@ -4666,6 +4671,9 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
                 CHECK(myds_dspark_capture_layer_to(ctx->dspark, il, g->residual, NULL));
             }
         }
+        if (ctx->dspine) {
+            myds_dspine_capture_target_layer(ctx->dspine, il, g->residual);
+        }
         if (decode_split && !trace_on && !dec_fine && il + 1u < V41_LAYERS &&
             ((il + 1u) * (uint32_t)decode_split) / V41_LAYERS != (il * (uint32_t)decode_split) / V41_LAYERS) {
             CHECK(myds_metal_flush_batch());
@@ -4734,6 +4742,7 @@ fail:
         myds_metal_set_concurrent(prev_concurrent);
     }
     myds_dspark_capture_invalidate(ctx->dspark);
+    if (ctx->dspine) myds_dspine_capture_invalidate(ctx->dspine);
     g->valid=false; return -1;
 #undef CHECK
 #undef TRACE
@@ -5316,6 +5325,7 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         pos >= ctx->cfg.max_seq_len || pos + 1u >= ctx->cfg.max_seq_len) return -1;
 
     myds_dspark_capture_invalidate(ctx->dspark);
+    if (ctx->dspine) myds_dspine_capture_invalidate(ctx->dspine);
     if (!myds_metal_commit_batch()) return -1;
     if (pos == 0) { g->next_position = 0; g->valid = true; myds_engram_reset(g->engram); }
     if (!g->valid || pos != g->next_position) {
@@ -5992,6 +6002,7 @@ static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *t
 
     if (pos != 0 && (!g->valid || pos != g->next_position)) return -1;
     myds_dspark_capture_invalidate(ctx->dspark);
+    if (ctx->dspine) myds_dspine_capture_invalidate(ctx->dspine);
     if (!myds_metal_commit_batch()) {
         if (linear) { g->valid = false; myds_dspark_capture_poison(ctx->dspark); }
         return -1;
@@ -6335,6 +6346,11 @@ static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *t
                 }
             }
         }
+        if (ctx->dspine) {
+            for (uint32_t t = 0; t < 3; t++) {
+                myds_dspine_capture_target_spec_layer(ctx->dspine, il, t, ws->v_residual[t]);
+            }
+        }
 
         if (decode_split && il + 1u < V41_LAYERS &&
             ((il + 1u) * (uint32_t)decode_split) / V41_LAYERS != (il * (uint32_t)decode_split) / V41_LAYERS) {
@@ -6467,6 +6483,9 @@ static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *t
      * become observable; its final copy failure is a rollback failure path. */
     CHECK(linear ? myds_metal_commit_batch() : myds_metal_flush_batch());
     myds_dspark_capture_publish(ctx->dspark);
+    if (ctx->dspine) {
+        myds_dspine_capture_select_row(ctx->dspine, selected);
+    }
     myds_metal_set_auto_barrier(prev_auto_barrier);
     if (g->engram) {
         g->engram->history = selected == 1 ? engram_hist_1 : selected == 2 ? engram_hist_2 : engram_hist_0;
@@ -7585,7 +7604,8 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         long v = atol(smin);
         if (v >= 0) shrink_min = (uint32_t)v;
     }
-    const bool suffix_shrink = opt_suffix_shrink && shrink_gather_ok &&
+    const bool suffix_shrink = !myds_dspine_capture_is_enabled() &&
+                               opt_suffix_shrink && shrink_gather_ok &&
                                (base_pos + n_tokens) >= shrink_min;
     /* 收缩前置段的「有效快照窗口」：
      * （原引用 docs/verification/2026-10-03-suffix-shrink-snapshot.md 在仓库中不存在，
@@ -7725,6 +7745,10 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     }
 
     if (do_prof) gettimeofday(&ptv_all0, NULL);
+
+    if (myds_dspine_capture_is_enabled()) {
+        myds_dspine_capture_begin(n_tokens, tokens);
+    }
 
     for (uint32_t mb_start = 0; mb_start < n_tokens; mb_start += macroblock_size) {
         /* 2026-11-01：客户端存活探针。
@@ -8898,7 +8922,31 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 }
                 c_start += c_len;
             } /* chunk loop */
+
+            if (myds_dspine_capture_is_enabled() && myds_dspine_capture_layer_slot(il) >= 0) {
+                CHECK(myds_metal_commit_batch());
+                const float *res_ptr = (const float *)myds_metal_buffer_data(prompt_res);
+                myds_dspine_capture_layer_hc(il, res_ptr, mb_start, mb_len);
+                CHECK(myds_metal_begin_batch());
+            }
         } /* layer loop */
+
+        if (myds_dspine_capture_is_enabled()) {
+            CHECK(myds_metal_commit_batch());
+            for (uint32_t c_start = 0; c_start < mb_len; c_start += chunk_size) {
+                uint32_t c_len = mb_len - c_start;
+                if (c_len > chunk_size) c_len = chunk_size;
+
+                CHECK(myds_metal_begin_batch());
+                myds_metal_buffer_update_sub_view(cw->cur_res_view, prompt_res, (size_t)c_start * res_tok_bytes, (size_t)c_len * res_tok_bytes);
+                myds_metal_buffer_update_sub_view(cw->cur_pre_view, prompt_pre, (size_t)c_start * pre_tok_bytes, (size_t)c_len * pre_tok_bytes);
+                CHECK(myds_metal_v41_hc_sum_rmsnorm_batch(cw->x_norm_buf, NULL, cw->cur_res_view, cw->cur_pre_view,
+                                                          m->output_norm, V41_DIM, c_len, pre_tok_bytes, m->norm_eps, true));
+                CHECK(myds_metal_commit_batch());
+                const float *norm_ptr = (const float *)myds_metal_buffer_data(cw->x_norm_buf);
+                myds_dspine_capture_last_norm(norm_ptr, mb_start + c_start, c_len);
+            }
+        }
 
         /* 每个 macroblock 跑完 40 层后，把该 macroblock 最后一个 token 的 residual / pre 保存进 g->residual / g->pre */
         {
@@ -9041,6 +9089,10 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         for (uint32_t i = 0; i < n_tokens; i++) {
             ctx->rng_state = ctx->rng_state * 6364136223846793005ULL + 1ULL;
         }
+    }
+
+    if (myds_dspine_capture_is_enabled()) {
+        myds_dspine_capture_finish_and_save();
     }
 
     return 1;

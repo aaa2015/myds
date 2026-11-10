@@ -32,7 +32,7 @@ BUILD_DIR = build
 SRCS_C = src/myds_cpu.c src/myds_log.c src/myds_configfile.c src/myds_gguf.c src/myds_tokenizer.c \
          src/myds_knobs.c src/myds_debugstate.c \
          src/myds_engine.c src/myds_v41.c src/myds_v41_gpu.c src/myds_v41_moe.c src/myds_v41_decode.c \
-         src/myds_engram.c src/myds_engram_cpu.c src/myds_moe_cpu.c src/myds_dspark.c \
+         src/myds_engram.c src/myds_engram_cpu.c src/myds_moe_cpu.c src/myds_dspark.c src/myds_dspine_capture.c src/myds_dspine.c \
          src/myds_vispre.c src/myds_visw.c src/myds_visfwd.c src/myds_vjob.c \
            src/myds_kvdsk.c \
          src/myds_server.c src/myds_resp_store.c src/myds_infer_queue.c src/myds_dsml.c src/myds_proto_openai.c src/myds_http_io.c src/myds_trace.c src/myds_debug_acl.c src/myds_sysstat.c \
@@ -112,6 +112,8 @@ TEST_DSPARK_ATTN = $(BIN_DIR)/test_dspark_attention
 TEST_DSPARK_MOE = $(BIN_DIR)/test_dspark_moe
 TEST_DSPARK_PROPOSAL = $(BIN_DIR)/test_dspark_proposal
 TEST_DSPARK_CAPTURE = $(BIN_DIR)/test_dspark_capture
+TEST_DSPINE_CAPTURE = $(BIN_DIR)/test_dspine_capture
+TEST_DSPINE_RUNTIME = $(BIN_DIR)/test_dspine_runtime
 TEST_BATCH2_PARITY = $(BIN_DIR)/test_batch2_parity
 TEST_BATCH2_E2E = $(BIN_DIR)/test_batch2_e2e
 TEST_Q4_BF16_PARITY = $(BIN_DIR)/test_q4_bf16_parity
@@ -578,7 +580,7 @@ test-steer-alpha: $(TEST_STEER_ALPHA)
 $(TEST_STEER_ALPHA): tests/test_steer_alpha.c src/myds_steer_alpha.c include/myds_steer_alpha.h | $(BIN_DIR)
 	$(CC) $(CFLAGS) -Iinclude tests/test_steer_alpha.c src/myds_steer_alpha.c $(LDFLAGS) -o $@
 
-$(TEST_SERVER): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_resp_store.o $(BUILD_DIR)/myds_infer_queue.o $(BUILD_DIR)/myds_dsml.o $(BUILD_DIR)/myds_proto_openai.o $(BUILD_DIR)/myds_http_io.o $(BUILD_DIR)/myds_trace.o $(BUILD_DIR)/myds_debug_acl.o $(BUILD_DIR)/myds_sysstat.o $(BUILD_DIR)/myds_vjob.o $(BUILD_DIR)/myds_vispre.o $(BUILD_DIR)/myds_visw.o $(BUILD_DIR)/myds_visfwd.o $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_engram_cpu.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_knobs.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/myds_steer.o $(BUILD_DIR)/test_server.o $(METALLIB) | $(BIN_DIR)
+$(TEST_SERVER): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_resp_store.o $(BUILD_DIR)/myds_infer_queue.o $(BUILD_DIR)/myds_dsml.o $(BUILD_DIR)/myds_proto_openai.o $(BUILD_DIR)/myds_http_io.o $(BUILD_DIR)/myds_trace.o $(BUILD_DIR)/myds_debug_acl.o $(BUILD_DIR)/myds_sysstat.o $(BUILD_DIR)/myds_vjob.o $(BUILD_DIR)/myds_vispre.o $(BUILD_DIR)/myds_visw.o $(BUILD_DIR)/myds_visfwd.o $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/myds_dspine_capture.o $(BUILD_DIR)/myds_dspine.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_engram_cpu.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_knobs.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/myds_steer.o $(BUILD_DIR)/test_server.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
 
 # 图片块区间对齐：纯头文件（myds_align.h），不需要任何 .c。
@@ -625,6 +627,12 @@ $(TEST_DSPARK_ROLLBACK): tests/test_dspark_rollback.c $(filter-out $(BUILD_DIR)/
 
 $(TEST_DSPARK_CAPTURE): tests/test_dspark_capture.c src/myds_dspark.c $(wildcard include/*.h) $(filter-out $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ tests/test_dspark_capture.c $(filter-out $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS)
+
+$(TEST_DSPINE_CAPTURE): tests/test_dspine_capture.c $(BUILD_DIR)/myds_dspine_capture.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/myds_cpu.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(CFLAGS) $< $(BUILD_DIR)/myds_dspine_capture.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/myds_cpu.o $(LDFLAGS) -o $@
+
+$(TEST_DSPINE_RUNTIME): tests/test_dspine_runtime.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
+	$(CC) $(CFLAGS) $< $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS) -o $@
 
 $(TEST_DSPARK_ROUTER): tests/test_dspark_router.c $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $< $(filter %.o,$^) $(LDFLAGS) -Wl,-dead_strip
@@ -711,14 +719,14 @@ $(PROBE_HC_NORM_ACC): tests/probe_hc_norm_acc.c $(filter-out $(BUILD_DIR)/main.o
 $(TEST_LOG): $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/test_log.o | $(BIN_DIR)
 	$(CC) $^ $(LDFLAGS) -o $@
 
-$(TEST_SERVER_API): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_resp_store.o $(BUILD_DIR)/myds_infer_queue.o $(BUILD_DIR)/myds_dsml.o $(BUILD_DIR)/myds_proto_openai.o $(BUILD_DIR)/myds_http_io.o $(BUILD_DIR)/myds_trace.o $(BUILD_DIR)/myds_debug_acl.o $(BUILD_DIR)/myds_sysstat.o $(BUILD_DIR)/myds_vjob.o $(BUILD_DIR)/myds_vispre.o $(BUILD_DIR)/myds_visw.o $(BUILD_DIR)/myds_visfwd.o $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_engram_cpu.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_knobs.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/myds_steer.o $(BUILD_DIR)/test_server_api.o $(METALLIB) | $(BIN_DIR)
+$(TEST_SERVER_API): $(BUILD_DIR)/myds_server.o $(BUILD_DIR)/myds_resp_store.o $(BUILD_DIR)/myds_infer_queue.o $(BUILD_DIR)/myds_dsml.o $(BUILD_DIR)/myds_proto_openai.o $(BUILD_DIR)/myds_http_io.o $(BUILD_DIR)/myds_trace.o $(BUILD_DIR)/myds_debug_acl.o $(BUILD_DIR)/myds_sysstat.o $(BUILD_DIR)/myds_vjob.o $(BUILD_DIR)/myds_vispre.o $(BUILD_DIR)/myds_visw.o $(BUILD_DIR)/myds_visfwd.o $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/myds_dspine_capture.o $(BUILD_DIR)/myds_dspine.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_engram_cpu.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_knobs.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/myds_steer.o $(BUILD_DIR)/test_server_api.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
 
 # CPU-only failure-path gate; includes server.c to exercise its private renderers.
 $(TEST_PROMPT_RENDER_BOUNDS): tests/test_prompt_render_bounds.c src/myds_server.c $(wildcard include/*.h) $(BUILD_DIR)/myds_log.o | $(BIN_DIR)
 	$(CC) $(CFLAGS) $< $(BUILD_DIR)/myds_log.o $(LDFLAGS) -Wl,-dead_strip -o $@
 
-$(TEST_ENGINE): $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_engram_cpu.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/myds_steer.o $(BUILD_DIR)/test_engine.o $(METALLIB) | $(BIN_DIR)
+$(TEST_ENGINE): $(BUILD_DIR)/myds_kvdsk.o $(BUILD_DIR)/myds_dspark.o $(BUILD_DIR)/myds_dspine_capture.o $(BUILD_DIR)/myds_dspine.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_v41.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_v41_moe.o $(BUILD_DIR)/myds_v41_decode.o $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_engram_cpu.o $(BUILD_DIR)/myds_cpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_tokenizer.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/myds_steer.o $(BUILD_DIR)/test_engine.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(filter %.o,$^) $(LDFLAGS) -o $@
 
 $(BUILD_DIR)/dump_tensors.o: tools/dump_tensors.c | $(BUILD_DIR)

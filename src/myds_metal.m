@@ -68,6 +68,7 @@ static id<MTLComputePipelineState> g_pso_add_bf16 = nil;
 static id<MTLComputePipelineState> g_pso_mul_mv_q8_0 = nil;
 static id<MTLComputePipelineState> g_pso_mul_mv_f32 = nil;
 static id<MTLComputePipelineState> g_pso_mul_mv_f16 = nil;
+static id<MTLComputePipelineState> g_pso_mul_mv_bf16 = nil;
 static id<MTLComputePipelineState> g_pso_mul_mv_q4_K = nil;
 static id<MTLComputePipelineState> g_pso_mul_mv_q4_K_r4 = nil;
 static id<MTLComputePipelineState> g_pso_mul_mv_q4_K_dense_bf16 = nil;
@@ -2338,6 +2339,12 @@ int myds_metal_init(const char *shader_dir) {
             g_pso_mul_mv_f16 = [g_device newComputePipelineStateWithFunction:fn error:nil];
         }
 
+        /* 7b. Build BF16 MatVec pipeline */
+        fn = [g_library newFunctionWithName:@"kernel_mul_mv_bf16_f32" constantValues:mv_constants error:nil];
+        if (fn) {
+            g_pso_mul_mv_bf16 = [g_device newComputePipelineStateWithFunction:fn error:nil];
+        }
+
         /* 8. Build Q4_K MatVec pipeline */
         fn = [g_library newFunctionWithName:@"kernel_mul_mv_q4_K_dense_f32" constantValues:mv_constants error:nil];
         if (fn) {
@@ -2777,6 +2784,7 @@ void myds_metal_cleanup(void) {
     g_pso_mul_mv_q8_0 = nil;
     g_pso_mul_mv_f32 = nil;
     g_pso_mul_mv_f16 = nil;
+    g_pso_mul_mv_bf16 = nil;
     g_pso_mul_mv_q4_K = nil;
     g_pso_mul_mv_q4_K_r4 = nil;
     g_pso_mul_mv_q4_K_dense_bf16 = nil;
@@ -4820,6 +4828,10 @@ int myds_metal_gemv_batch(
         pipeline = g_pso_mul_mv_f16;
         block_bytes = sizeof(uint16_t);
         row_bytes = (uint64_t)in_dim * block_bytes;
+    } else if (weight_type == GGML_TYPE_BF16) {
+        pipeline = g_pso_mul_mv_bf16;
+        block_bytes = sizeof(uint16_t);
+        row_bytes = (uint64_t)in_dim * block_bytes;
     } else {
         MYDS_LOG_E("myds_metal_gemv: unsupported GGML quantization type %d (%s) for GEMV out_dim=%u, in_dim=%u",
                    (int)weight_type, ggml_type_name(weight_type), out_dim, in_dim);
@@ -4963,7 +4975,7 @@ int myds_metal_v41_gemv_batch(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *weight, const myds_metal_buffer_t *input,
     uint32_t out_dim, uint32_t in_dim, uint32_t n_tok, ggml_type weight_type) {
     if (!out || !weight || !input || !out_dim || !in_dim || !n_tok ||
-        (weight_type != GGML_TYPE_F16 && weight_type != GGML_TYPE_F32) ||
+        (weight_type != GGML_TYPE_F16 && weight_type != GGML_TYPE_F32 && weight_type != GGML_TYPE_BF16) ||
         out_dim > INT32_MAX || in_dim > INT32_MAX || n_tok > INT32_MAX ||
         in_dim % 4u ||
         input->size / sizeof(float) / in_dim < n_tok ||
@@ -5013,7 +5025,9 @@ int myds_metal_v41_gemv_batch(myds_metal_buffer_t *out,
         if (!use_b4) args.nr0 = (int32_t)v41_gemv_nr0;
         const unsigned nr0v = (unsigned)args.nr0;
         NSString *funcName = nil;
-        if (use_b4) {
+        if (weight_type == GGML_TYPE_BF16) {
+            funcName = @"kernel_mul_mv_bf16_f32_4";
+        } else if (use_b4) {
             funcName = weight_type == GGML_TYPE_F32 ? @"kernel_mul_mv_f32_f32_4_b4" : @"kernel_mul_mv_f16_f32_4_b4";
         } else {
             funcName = weight_type == GGML_TYPE_F32 ? @"kernel_mul_mv_f32_f32_4" : @"kernel_mul_mv_f16_f32_4";

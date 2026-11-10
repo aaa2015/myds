@@ -9,6 +9,7 @@
 #include "myds_log.h"
 #include "myds_cpu.h"
 #include "myds_dspark.h"
+#include "myds_dspine.h"
 #include "myds_pld.h"
 
 #include <stdio.h>
@@ -1412,6 +1413,10 @@ void myds_context_free(myds_context_t *ctx) {
     if (ctx->dspark) {
         myds_dspark_free(ctx->dspark);
         ctx->dspark = NULL;
+    }
+    if (ctx->dspine) {
+        myds_dspine_free(ctx->dspine);
+        ctx->dspine = NULL;
     }
     for (uint32_t i = 0; i < ctx->num_steers; i++) {
         if (ctx->steers[i]) {
@@ -3576,7 +3581,7 @@ static int myds_generate_internal(myds_context_t *ctx,
     const bool serial_probe = decode_env_enabled("MYDS_SPEC_SERIAL_PROBE");
     const uint32_t dspark_depth = serial_probe ? 1u : myds_dspark_decode_depth(ctx);
     const bool spec_requested = !ctx->v41 || myds_v41_batch2_spec_requested(ctx) ||
-        (ctx->dspark && dspark_depth == 2u);
+        (ctx->dspark && dspark_depth == 2u) || (ctx->dspine != NULL);
     const bool use_spec = spec_requested || serial_probe;
     myds_dspark_capture_begin_request(ctx->dspark, use_spec && ctx->cfg.max_new_tokens > 1u);
 
@@ -4011,7 +4016,7 @@ static int myds_generate_internal(myds_context_t *ctx,
     int success = 1;
 
     ctx->decode_metrics_active = true;
-    if (ctx->dspark && use_spec) {
+    if ((ctx->dspine || ctx->dspark) && use_spec) {
         uint32_t step = 0;
         /* V4.1 capture belongs to the last input the target consumed. The
          * emitted cur_token is its successor and has not entered the target
@@ -4066,7 +4071,7 @@ static int myds_generate_internal(myds_context_t *ctx,
 
             /* Linear depth 2 needs room for the seed and both draft inputs.
              * Short tails retain the depth-1 verifier and its bonus output. */
-            const bool linear_room = dspark_depth == 2u && max_gen - step >= 3u &&
+            const bool linear_room = (dspark_depth == 2u || ctx->dspine != NULL) && max_gen - step >= 3u &&
                 ctx->cfg.max_seq_len - ctx->pos >= 3u;
             uint32_t draft_cap = ctx->v41 ? (linear_room ? 2u : 1u) :
                 (ctx->dspark ? ctx->dspark->block_size : 4);
@@ -4077,7 +4082,17 @@ static int myds_generate_internal(myds_context_t *ctx,
             uint32_t neural_count = 0;
 
             const bool cost_skip = decode_cost_skip(ctx) || (!serial_probe && max_gen - step < 2);
-            if (ctx->dspark && !cost_skip) {
+            if (ctx->dspine && ctx->dspine->enabled && myds_dspine_capture_ready(ctx->dspine)) {
+                const double draft_start = ctx->decode_stats.timing_enabled ? decode_now_ms() : 0.0;
+                uint32_t n_dspine = myds_dspine_propose(ctx->dspine, ctx, cur_token, 2);
+                if (n_dspine >= 2) {
+                    neural_count = n_dspine;
+                    cand_a = ctx->dspine->draft_tokens[0];
+                    ctx->decode_cycle_speculative = true;
+                }
+                if (ctx->decode_stats.timing_enabled)
+                    ctx->decode_stats.draft_ms += decode_now_ms() - draft_start;
+            } else if (ctx->dspark && !cost_skip) {
                 const uint64_t before_cycles = ctx->dspark->cycles;
                 const uint64_t before_proposed = ctx->dspark->proposed_tokens;
                 const bool backed_off = ctx->dspark->backoff_counter > 0;
@@ -4161,7 +4176,7 @@ static int myds_generate_internal(myds_context_t *ctx,
             struct timeval tv_ver0, tv_ver1;
             gettimeofday(&tv_ver0, NULL);
 
-            myds_v41_spec_snapshot_t *snap = ctx->dspark ? ctx->dspark->spec_snap : NULL;
+            myds_v41_spec_snapshot_t *snap = ctx->dspine ? ctx->dspine->spec_snap : (ctx->dspark ? ctx->dspark->spec_snap : NULL);
             bool snap_saved = false;
             if (snap) snap->valid = false;
 
@@ -4174,8 +4189,8 @@ static int myds_generate_internal(myds_context_t *ctx,
                 }
                 const uint32_t spec_pos = ctx->pos;
                 const int32_t seed = cur_token;
-                const int32_t inputs[3] = { seed, ctx->dspark->draft_tokens[0],
-                    ctx->dspark->draft_tokens[1] };
+                const int32_t *draft_toks = ctx->dspine ? ctx->dspine->draft_tokens : ctx->dspark->draft_tokens;
+                const int32_t inputs[3] = { seed, draft_toks[0], draft_toks[1] };
                 int32_t out_tokens[3] = { -1, -1, -1 };
                 const double verify_start = decode_now_ms();
                 int ret = myds_v41_forward_linear_spec_ex(ctx, inputs, 3u,
@@ -4186,7 +4201,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                      * publishing any result from the failed three-row graph. */
                     out_tokens[0] = myds_forward_token(ctx, seed, spec_pos);
                     if (out_tokens[0] >= 0 && (uint32_t)out_tokens[0] < m->tokenizer->vocab_size &&
-                        myds_dspark_capture_ready(ctx->dspark)) {
+                        (ctx->dspine ? myds_dspine_capture_ready(ctx->dspine) : myds_dspark_capture_ready(ctx->dspark))) {
                         ret = 1;
                         ctx->decode_stats.depth2_fallbacks++;
                         ctx->decode_stats.batch2_fallbacks++;
@@ -4244,14 +4259,20 @@ static int myds_generate_internal(myds_context_t *ctx,
                     /* An accepted draft is an input which remains consumed;
                      * the final authoritative output is the pending seed. */
                     accepted_in_cycle = keep - 1u;
-                    ctx->dspark->accepted_tokens += accepted_in_cycle;
+                    if (ctx->dspine) myds_dspine_rollback(ctx->dspine, accepted_in_cycle);
+                    else if (ctx->dspark) ctx->dspark->accepted_tokens += accepted_in_cycle;
                     ctx->decode_stats.draft_accepted += accepted_in_cycle;
                 }
                 gettimeofday(&tv_ver1, NULL);
-                ctx->dspark->verify_ms += (double)(tv_ver1.tv_sec - tv_ver0.tv_sec) * 1000.0 +
-                    (double)(tv_ver1.tv_usec - tv_ver0.tv_usec) / 1000.0;
-                if (success && stop_reason != MYDS_STOP_CANCELLED)
-                    decode_dspark_linear_backoff(ctx->dspark, accepted_in_cycle);
+                if (ctx->dspine) {
+                    ctx->dspine->verify_ms += (double)(tv_ver1.tv_sec - tv_ver0.tv_sec) * 1000.0 +
+                        (double)(tv_ver1.tv_usec - tv_ver0.tv_usec) / 1000.0;
+                } else if (ctx->dspark) {
+                    ctx->dspark->verify_ms += (double)(tv_ver1.tv_sec - tv_ver0.tv_sec) * 1000.0 +
+                        (double)(tv_ver1.tv_usec - tv_ver0.tv_usec) / 1000.0;
+                    if (success && stop_reason != MYDS_STOP_CANCELLED)
+                        decode_dspark_linear_backoff(ctx->dspark, accepted_in_cycle);
+                }
                 if (myds_stop_is_terminal(stop_reason) ||
                     !success || step >= max_gen) break;
                 continue;

@@ -3,6 +3,7 @@
 #include "myds_server.h"
 #include "myds_vjob.h"
 #include "myds_dspark.h"
+#include "myds_dspine.h"
 #include "myds_steer.h"
 #include "myds_steer_alpha.h"
 #include "myds_metal.h"
@@ -123,6 +124,7 @@ static void print_usage(const char *prog) {
     printf("  --vision <file>         Vision encoder GGUF (enables image input; omit = text only)\n");
     printf("  --dspark, --mtp-model <path>  DSpark support model GGUF for speculative decoding\n");
     printf("  --dspark-draft <int>    Draft tokens per speculative cycle (default: 5)\n");
+    printf("  --dspine <path>         DSpine draft model safetensors for speculative decoding\n");
     printf("  -p, --prompt <string>   Prompt string (if omitted and no --port, starts interactive chat)\n");
     printf("  -n, --max-tokens <int>  Max tokens to generate (default: 256)\n");
     printf("  -c, --ctx, --ctx-size   Context window size (default: 4096)\n");
@@ -350,6 +352,7 @@ int main(int argc, char *argv[]) {
     const char *alias = "myds";
     const char *vision_path = NULL;
     const char *dspark_path = NULL;
+    const char *dspine_path = getenv("MYDS_DSPINE_FILE");
     uint32_t dspark_draft = 0;
     int port = 0;
     bool print_tokens = false;
@@ -399,6 +402,8 @@ int main(int argc, char *argv[]) {
             vision_path = argv[++i];
         } else if ((strcmp(argv[i], "--dspark") == 0 || strcmp(argv[i], "--mtp-model") == 0) && i + 1 < argc) {
             dspark_path = argv[++i];
+        } else if (strcmp(argv[i], "--dspine") == 0 && i + 1 < argc) {
+            dspine_path = argv[++i];
         } else if (strcmp(argv[i], "--dspark-draft") == 0 && i + 1 < argc) {
             dspark_draft = (uint32_t)atoi(argv[++i]);
         } else if ((strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--prompt") == 0) && i + 1 < argc) {
@@ -626,6 +631,16 @@ int main(int argc, char *argv[]) {
                        ctx->dspark->block_size, ctx->dspark->stage_count, ctx->dspark->markov_rank);
         }
     }
+    if (dspine_path) {
+        ctx->dspine = myds_dspine_create();
+        if (!ctx->dspine || !myds_dspine_load_weights(ctx->dspine, dspine_path)) {
+            MYDS_LOG_E("Failed to load DSpine draft model from %s", dspine_path);
+            exit_after_cleanup(1, 1, ctx, model);
+            return 1;
+        }
+        MYDS_LOG_I("DSpine speculative decoding enabled: block_size=%u, layers=%u",
+                   ctx->dspine->block_size, ctx->dspine->num_layers);
+    }
     if (capture_mode != 0 && !ctx->dspark) {
         MYDS_LOG_E("DSpark capture bypass requires a loaded support model");
         exit_after_cleanup(1, 1, ctx, model);
@@ -706,6 +721,17 @@ int main(int argc, char *argv[]) {
                    acc_rate,
                    ctx->dspark->propose_ms,
                    ctx->dspark->cycles > 0 ? ctx->dspark->propose_ms / (double)ctx->dspark->cycles : 0.0);
+        }
+        if (ctx->dspine && ctx->dspine->proposed_tokens > 0) {
+            double acc_rate = 100.0 * (double)ctx->dspine->accepted_tokens / (double)ctx->dspine->proposed_tokens;
+            printf("DSpine speculative: cycles=%llu proposed=%llu accepted=%llu (%.2f%%) draft_time=%.2fms (avg %.2fms/cycle) verify_time=%.2fms\n",
+                   (unsigned long long)ctx->dspine->cycles,
+                   (unsigned long long)ctx->dspine->proposed_tokens,
+                   (unsigned long long)ctx->dspine->accepted_tokens,
+                   acc_rate,
+                   ctx->dspine->propose_ms,
+                   ctx->dspine->cycles > 0 ? ctx->dspine->propose_ms / (double)ctx->dspine->cycles : 0.0,
+                   ctx->dspine->verify_ms);
         }
         printf("----------------------------------------------------\n");
         MYDS_LOG_I("Generation metrics: load %.2fs | prefill %.2fs (%u tok, TTFT %.2fs) | decode %u tok in %.2fs = %.2f t/s | wall %.2fs | stop_reason: %d",

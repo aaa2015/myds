@@ -111,12 +111,14 @@ struct myds_model {
 
 typedef struct myds_prefill_chunk myds_prefill_chunk_t;
 typedef struct myds_dspark myds_dspark_t;
+typedef struct myds_dspine_s myds_dspine_t;
 typedef struct myds_steer myds_steer_t;
 
 struct myds_context {
     myds_model_t        *model;
     myds_v41_context_t  *v41;
     myds_dspark_t       *dspark;
+    myds_dspine_t       *dspine;
 #define MYDS_MAX_STEER_PROFILES 4
     myds_steer_t        *steer;                     /* Active steering profile */
     myds_steer_t        *steers[MYDS_MAX_STEER_PROFILES]; /* All loaded profiles */
