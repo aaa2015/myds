@@ -4082,7 +4082,7 @@ static int myds_generate_internal(myds_context_t *ctx,
             uint32_t neural_count = 0;
 
             const bool cost_skip = decode_cost_skip(ctx) || (!serial_probe && max_gen - step < 2);
-            if (ctx->dspine && ctx->dspine->enabled && myds_dspine_capture_ready(ctx->dspine)) {
+            if (ctx->dspine && ctx->dspine->enabled && linear_room && myds_dspine_capture_ready(ctx->dspine)) {
                 const double draft_start = ctx->decode_stats.timing_enabled ? decode_now_ms() : 0.0;
                 uint32_t n_dspine = myds_dspine_propose(ctx->dspine, ctx, cur_token, 2);
                 if (n_dspine >= 2) {
@@ -4490,7 +4490,10 @@ static int myds_generate_internal(myds_context_t *ctx,
                 }
 
                 gettimeofday(&tv_ver1, NULL);
-                if (ctx->dspark) {
+                if (ctx->dspine) {
+                    ctx->dspine->verify_ms += (double)(tv_ver1.tv_sec - tv_ver0.tv_sec) * 1000.0 +
+                                              (double)(tv_ver1.tv_usec - tv_ver0.tv_usec) / 1000.0;
+                } else if (ctx->dspark) {
                     ctx->dspark->verify_ms += (double)(tv_ver1.tv_sec - tv_ver0.tv_sec) * 1000.0 +
                                               (double)(tv_ver1.tv_usec - tv_ver0.tv_usec) / 1000.0;
 
@@ -4593,26 +4596,31 @@ static int myds_generate_internal(myds_context_t *ctx,
             }
 
             gettimeofday(&tv_ver1, NULL);
-            ctx->dspark->verify_ms += (double)(tv_ver1.tv_sec - tv_ver0.tv_sec) * 1000.0 +
-                                      (double)(tv_ver1.tv_usec - tv_ver0.tv_usec) / 1000.0;
+            if (ctx->dspine) {
+                ctx->dspine->verify_ms += (double)(tv_ver1.tv_sec - tv_ver0.tv_sec) * 1000.0 +
+                                          (double)(tv_ver1.tv_usec - tv_ver0.tv_usec) / 1000.0;
+            } else if (ctx->dspark) {
+                ctx->dspark->verify_ms += (double)(tv_ver1.tv_sec - tv_ver0.tv_sec) * 1000.0 +
+                                          (double)(tv_ver1.tv_usec - tv_ver0.tv_usec) / 1000.0;
 
-            static int s_backoff_thresh_old = -1;
-            if (__builtin_expect(s_backoff_thresh_old < 0, 0)) {
-                const char *e = getenv("MYDS_DSPARK_BACKOFF_THRESH");
-                s_backoff_thresh_old = e ? atoi(e) : 6;
-            }
-            if (!ctx->decode_pld_candidate && accepted_in_cycle == 0) {
-                ctx->dspark->consecutive_misses++;
-                if (s_backoff_thresh_old > 0) {
-                    if (ctx->dspark->consecutive_misses >= (uint32_t)s_backoff_thresh_old + 2) {
-                        ctx->dspark->backoff_counter = 8;
-                    } else if (ctx->dspark->consecutive_misses >= (uint32_t)s_backoff_thresh_old) {
-                        ctx->dspark->backoff_counter = 4;
-                    }
+                static int s_backoff_thresh_old = -1;
+                if (__builtin_expect(s_backoff_thresh_old < 0, 0)) {
+                    const char *e = getenv("MYDS_DSPARK_BACKOFF_THRESH");
+                    s_backoff_thresh_old = e ? atoi(e) : 6;
                 }
-            } else if (!ctx->decode_pld_candidate) {
-                ctx->dspark->consecutive_misses = 0;
-                ctx->dspark->backoff_counter = 0;
+                if (!ctx->decode_pld_candidate && accepted_in_cycle == 0) {
+                    ctx->dspark->consecutive_misses++;
+                    if (s_backoff_thresh_old > 0) {
+                        if (ctx->dspark->consecutive_misses >= (uint32_t)s_backoff_thresh_old + 2) {
+                            ctx->dspark->backoff_counter = 8;
+                        } else if (ctx->dspark->consecutive_misses >= (uint32_t)s_backoff_thresh_old) {
+                            ctx->dspark->backoff_counter = 4;
+                        }
+                    }
+                } else if (!ctx->decode_pld_candidate) {
+                    ctx->dspark->consecutive_misses = 0;
+                    ctx->dspark->backoff_counter = 0;
+                }
             }
 
             if (myds_stop_is_terminal(stop_reason) || !success) {

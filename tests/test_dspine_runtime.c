@@ -5,14 +5,14 @@
 #include <stdlib.h>
 #include <sys/time.h>
 
-int main(void) {
+int main(int argc, char **argv) {
     printf("[test_dspine_runtime] Creating DSpine runtime...\n");
     myds_dspine_t *ds = myds_dspine_create();
     assert(ds != NULL);
     assert(ds->hidden_size == 5120);
     assert(ds->num_layers == 3);
 
-    const char *checkpoint = "/tmp/dspine_model_out/model-000002.safetensors";
+    const char *checkpoint = (argc > 1) ? argv[1] : "/tmp/dspine_model_out/model-000002.safetensors";
     printf("[test_dspine_runtime] Loading weights from %s...\n", checkpoint);
     bool ok = myds_dspine_load_weights(ds, checkpoint);
     assert(ok && "Failed to load weights");
