@@ -749,9 +749,21 @@ uint32_t myds_dspine_propose(myds_dspine_t *ds, myds_context_t *ctx,
     }
 
     if (m && m->output) {
-        myds_metal_gemv_batch(ds->logits_buf, m->output, ds->norm_buf,
-                              m->vocab_size, ds->hidden_size, T - 1, m->output_type);
+        int ok_head = myds_metal_gemv_batch(ds->logits_buf, m->output, ds->norm_buf,
+                                            m->vocab_size, ds->hidden_size, T - 1, m->output_type);
         const float *all_logits = (const float *)myds_metal_buffer_data(ds->logits_buf);
+
+        static int s_head_diag = -1;
+        if (s_head_diag < 0) {
+            const char *dbg = getenv("MYDS_DSPINE_DEBUG");
+            s_head_diag = (dbg && atoi(dbg)) ? 0 : 999;
+        }
+        if (s_head_diag < 5) {
+            s_head_diag++;
+            MYDS_LOG_I("[dspine-head-diag] ok_head=%d out_type=%d vocab=%u hidden=%u logit0=%.4f logit1=%.4f",
+                       ok_head, (int)m->output_type, m->vocab_size, ds->hidden_size,
+                       all_logits ? all_logits[0] : -999.0f, all_logits ? all_logits[1] : -999.0f);
+        }
 
         for (uint32_t t = 1; t < T; t++) {
             const float *logits = all_logits + (size_t)(t - 1) * m->vocab_size;

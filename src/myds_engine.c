@@ -4195,6 +4195,18 @@ static int myds_generate_internal(myds_context_t *ctx,
                 const double verify_start = decode_now_ms();
                 int ret = myds_v41_forward_linear_spec_ex(ctx, inputs, 3u,
                     spec_pos, out_tokens, snap);
+                if (ctx->dspine) {
+                    static int s_dspine_diag = -1;
+                    if (s_dspine_diag < 0) {
+                        const char *dbg = getenv("MYDS_DSPINE_DEBUG");
+                        s_dspine_diag = (dbg && atoi(dbg)) ? 0 : 999;
+                    }
+                    if (s_dspine_diag < 10) {
+                        s_dspine_diag++;
+                        MYDS_LOG_I("[dspine-diag] pos=%u seed=%d draft0=%d draft1=%d -> auth0=%d ret=%d",
+                                   spec_pos, seed, draft_toks[0], draft_toks[1], out_tokens[0], ret);
+                    }
+                }
                 if (ret < 0 && myds_v41_linear_spec_retry_ready(ctx, snap)) {
                     /* The target has committed a complete restoration to the
                      * entry prefix. Recover only the original seed, without
