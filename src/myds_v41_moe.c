@@ -51,6 +51,23 @@ static inline int get_route_fuse_level(void) {
 static _Atomic uint64_t route_shuffle_requests, route_shuffle_encoded, route_shuffle_failures;
 static _Atomic uint64_t hc_overlap_requests, hc_overlap_encoded, hc_overlap_failures;
 static _Atomic int hc_overlap_mode;
+static _Atomic int moe_decode_topk_mode;
+int myds_v41_moe_decode_topk_parse_mode(void) {
+    const char *v = getenv("MYDS_MOE_DECODE_TOPK");
+    int mode = -1;
+    if (!v || !strcmp(v, "0")) mode = 0;
+    else if (v[0] >= '1' && v[0] <= '6' && v[1] == '\0') mode = v[0] - '0';
+    if (mode < 0) MYDS_LOG_E("MYDS_MOE_DECODE_TOPK must be 0 or an integer in 1..6");
+    atomic_store_explicit(&moe_decode_topk_mode, mode, memory_order_relaxed);
+    return mode;
+}
+uint32_t myds_v41_moe_decode_topk(uint32_t model_k) {
+    const int mode = atomic_load_explicit(&moe_decode_topk_mode, memory_order_relaxed);
+    return (mode >= 1 && (uint32_t)mode <= model_k) ? (uint32_t)mode : model_k;
+}
+void myds_v41_moe_decode_topk_reset_mode(void) {
+    atomic_store_explicit(&moe_decode_topk_mode, 0, memory_order_relaxed);
+}
 int myds_v41_moe_hc_overlap_parse_mode(void) {
     const char *v = getenv("MYDS_MOE_HC_OVERLAP");
     int mode=(!v || !strcmp(v,"0")) ? 0 : !strcmp(v,"1") ? 1 : -1;
@@ -96,7 +113,7 @@ static int route_batch_impl(myds_metal_buffer_t *selected, myds_metal_buffer_t *
     myds_metal_buffer_t *probs, myds_metal_buffer_t *scores,
     const myds_metal_buffer_t *logits, const myds_metal_buffer_t *bias,
     uint32_t experts, uint32_t top_k, float scale, uint32_t rows, bool emit_final_barrier) {
-    if (experts != 384 || top_k != 6 || !isfinite(scale) || scale <= 0 || rows == 0 ||
+    if (experts != 384 || top_k < 1u || top_k > 6u || !isfinite(scale) || scale <= 0 || rows == 0 ||
         !sized(selected, (size_t)top_k * rows) || !sized(weights, (size_t)top_k * rows) ||
         !sized(probs, (size_t)experts * rows) || !sized(scores, (size_t)experts * rows) ||
         !sized(logits, (size_t)experts * rows) || !sized(bias, experts)) return 0;
@@ -857,8 +874,8 @@ int myds_v41_moe_eval(myds_context_t *ctx, uint32_t layer, uint32_t pos,
     if (!ctx || !ctx->model || layer >= ctx->model->n_layers) return 0;
     myds_model_t *m = ctx->model;
     myds_layer_t *l = &m->layers[layer];
-    const uint32_t dim=m->dim, width=m->moe_expert_dim, k=m->n_activated_experts;
-    if (m->n_routed_experts!=384 || k!=6 || m->n_shared_experts!=1 ||
+    const uint32_t dim=m->dim, width=m->moe_expert_dim, k=myds_v41_moe_decode_topk(m->n_activated_experts);
+    if (m->n_routed_experts!=384 || m->n_activated_experts!=6 || k<1 || k>6 || m->n_shared_experts!=1 ||
         !dim || !width || dim%256 || width%256 ||
         l->ffn_gate_exps_type!=GGML_TYPE_IQ2_XXS ||
         l->ffn_up_exps_type!=GGML_TYPE_IQ2_XXS ||
@@ -915,10 +932,10 @@ static int moe_fused_scoped(myds_context_t *ctx, uint32_t layer, uint32_t token,
     if (!ctx || !ctx->model || layer >= ctx->model->n_layers) return 0;
     myds_model_t *m = ctx->model;
     myds_layer_t *l = &m->layers[layer];
-    const uint32_t dim = m->dim, width = m->moe_expert_dim, k = m->n_activated_experts;
+    const uint32_t dim = m->dim, width = m->moe_expert_dim, k = myds_v41_moe_decode_topk(m->n_activated_experts);
     const bool trace_on = myds_trace_active();
 
-    if (m->n_routed_experts != 384 || k != 6 || m->n_shared_experts != 1 ||
+    if (m->n_routed_experts != 384 || m->n_activated_experts != 6 || k < 1 || k > 6 || m->n_shared_experts != 1 ||
         !dim || !width || dim % 256 || width % 256 ||
         l->ffn_gate_exps_type != GGML_TYPE_IQ2_XXS ||
         l->ffn_up_exps_type != GGML_TYPE_IQ2_XXS ||
@@ -1213,7 +1230,7 @@ static int moe_hc_overlap_101(myds_context_t *ctx, uint32_t layer,
     myds_metal_buffer_t *flat_norm, myds_metal_buffer_t *mix, float hc_eps) {
     myds_model_t *m=ctx->model;
     myds_layer_t *l=&m->layers[layer];
-    const uint32_t dim=m->dim, width=m->moe_expert_dim, k=m->n_activated_experts;
+    const uint32_t dim=m->dim, width=m->moe_expert_dim, k=myds_v41_moe_decode_topk(m->n_activated_experts);
     const int previous_auto=myds_metal_get_auto_barrier();
     const int previous_concurrent=myds_metal_get_concurrent();
     myds_metal_set_auto_barrier(0);
@@ -1307,7 +1324,7 @@ int myds_v41_moe_pipeline_scoped(myds_context_t *ctx, uint32_t layer, uint32_t t
     if (!ctx || !ctx->model || layer >= ctx->model->n_layers) return 0;
     myds_model_t *m = ctx->model;
     myds_layer_t *l = &m->layers[layer];
-    const uint32_t dim = m->dim, width = m->moe_expert_dim, k = m->n_activated_experts;
+    const uint32_t dim = m->dim, width = m->moe_expert_dim, k = myds_v41_moe_decode_topk(m->n_activated_experts);
     const bool trace_on = myds_trace_active();
 
     const bool hc_overlap_eligible=hc_overlap && ordinary_decode_allowed && !trace_on &&
@@ -1315,7 +1332,7 @@ int myds_v41_moe_pipeline_scoped(myds_context_t *ctx, uint32_t layer, uint32_t t
         is_shared_fuse_enabled() && is_moe_fuse_expand_enabled() &&
         myds_metal_moe_down_overlap_enabled() && myds_metal_moe_q2_v41_enabled() &&
         !myds_metal_moe_iq2_v41_enabled() && myds_metal_dense_q4_v41_enabled() &&
-        dim==5120u && width==2304u && m->n_routed_experts==384u && k==6u && m->n_shared_experts==1u &&
+        dim==5120u && width==2304u && m->n_routed_experts==384u && m->n_activated_experts==6u && k>=1u && k<=6u && m->n_shared_experts==1u &&
         l->ffn_gate_exps_type==GGML_TYPE_IQ2_XXS && l->ffn_up_exps_type==GGML_TYPE_IQ2_XXS &&
         l->ffn_down_exps_type==GGML_TYPE_Q2_K && l->shared_gate_type==GGML_TYPE_Q4_K &&
         l->shared_up_type==GGML_TYPE_Q4_K && l->shared_down_type==GGML_TYPE_Q4_K &&
@@ -1351,7 +1368,7 @@ int myds_v41_moe_pipeline_scoped(myds_context_t *ctx, uint32_t layer, uint32_t t
         return 1;
     }
 
-    if (m->n_routed_experts != 384 || k != 6 || m->n_shared_experts != 1 ||
+    if (m->n_routed_experts != 384 || m->n_activated_experts != 6 || k < 1 || k > 6 || m->n_shared_experts != 1 ||
         !dim || !width || dim % 256 || width % 256 ||
         l->ffn_gate_exps_type != GGML_TYPE_IQ2_XXS ||
         l->ffn_up_exps_type != GGML_TYPE_IQ2_XXS ||
@@ -1743,7 +1760,7 @@ int myds_v41_moe_ffn_hc_overlap_scoped(myds_context_t *ctx, uint32_t layer, uint
     }
     myds_model_t *m = ctx->model;
     myds_layer_t *l = &m->layers[layer];
-    const uint32_t dim = m->dim, width = m->moe_expert_dim, k = m->n_activated_experts;
+    const uint32_t dim = m->dim, width = m->moe_expert_dim, k = myds_v41_moe_decode_topk(m->n_activated_experts);
 
     const char *fuse_hc_norm_env = getenv("MYDS_FUSE_HC_SUM_RMSNORM");
     const bool fuse_hc_norm_on = !fuse_hc_norm_env || atoi(fuse_hc_norm_env) != 0;
@@ -1752,7 +1769,7 @@ int myds_v41_moe_ffn_hc_overlap_scoped(myds_context_t *ctx, uint32_t layer, uint
         fuse_hc_norm_on &&
         myds_metal_moe_down_overlap_enabled() && myds_metal_moe_q2_v41_enabled() &&
         !myds_metal_moe_iq2_v41_enabled() && myds_metal_dense_q4_v41_enabled() &&
-        dim == 5120u && width == 2304u && m->n_routed_experts == 384u && k == 6u && m->n_shared_experts == 1u &&
+        dim == 5120u && width == 2304u && m->n_routed_experts == 384u && m->n_activated_experts == 6u && k >= 1u && k <= 6u && m->n_shared_experts == 1u &&
         isfinite(m->norm_eps) && m->norm_eps >= 0.0f && isfinite(hc_eps) && hc_eps >= 0.0f &&
         l->ffn_gate_exps_type == GGML_TYPE_IQ2_XXS && l->ffn_up_exps_type == GGML_TYPE_IQ2_XXS &&
         l->ffn_down_exps_type == GGML_TYPE_Q2_K && l->shared_gate_type == GGML_TYPE_Q4_K &&
@@ -1835,19 +1852,20 @@ int myds_v41_moe_ffn_hc_overlap_scoped(myds_context_t *ctx, uint32_t layer, uint
         if (route_probe && layer == 20) {
             const int32_t *ids = (const int32_t *)myds_metal_buffer_data(ctx->selected_ids);
             if (ids) {
+                const int nk = (int)k;
                 if (have_prev) {
                     int hit = 0, uni = 0;
-                    for (int a = 0; a < 6; a++)
-                        for (int b = 0; b < 6; b++)
+                    for (int a = 0; a < nk; a++)
+                        for (int b = 0; b < nk; b++)
                             if (prev_ids[a] == ids[b]) { hit++; break; }
                     /* 并集大小 */
                     int seen[12], ns = 0;
-                    for (int a = 0; a < 6; a++) {
+                    for (int a = 0; a < nk; a++) {
                         int dup = 0;
                         for (int k2 = 0; k2 < ns; k2++) if (seen[k2] == prev_ids[a]) { dup = 1; break; }
                         if (!dup) seen[ns++] = prev_ids[a];
                     }
-                    for (int b = 0; b < 6; b++) {
+                    for (int b = 0; b < nk; b++) {
                         int dup = 0;
                         for (int k2 = 0; k2 < ns; k2++) if (seen[k2] == ids[b]) { dup = 1; break; }
                         if (!dup) seen[ns++] = ids[b];
@@ -1855,11 +1873,11 @@ int myds_v41_moe_ffn_hc_overlap_scoped(myds_context_t *ctx, uint32_t layer, uint
                     uni = ns;
                     n_cmp++; n_hit += (uint64_t)hit; n_union += (uint64_t)uni;
                     if (n_cmp % 20 == 0)
-                        MYDS_LOG_I("ROUTE_PROBE L20: tokens=%llu avg_hit=%.2f/6 avg_union=%.2f/12 hit_rate=%.1f%%",
-                            (unsigned long long)n_cmp, (double)n_hit / n_cmp,
-                            (double)n_union / n_cmp, 100.0 * n_hit / (n_cmp * 6));
+                        MYDS_LOG_I("ROUTE_PROBE L20: tokens=%llu avg_hit=%.2f/%d avg_union=%.2f/%d hit_rate=%.1f%%",
+                            (unsigned long long)n_cmp, (double)n_hit / n_cmp, nk,
+                            (double)n_union / n_cmp, 2 * nk, 100.0 * n_hit / (n_cmp * (uint64_t)nk));
                 }
-                for (int a = 0; a < 6; a++) prev_ids[a] = ids[a];
+                for (int a = 0; a < nk; a++) prev_ids[a] = ids[a];
                 have_prev = 1;
             }
         }

@@ -11938,8 +11938,9 @@ kernel void kernel_mul_mv_id_q2_K_sum6_v41_f32(
     const int nb = 9;
     const int first_row = (tgpig.x * NSG + sgitg) * nr0;
     const uint token = tgpig.y;
-    device const int32_t *token_ids = (device const int32_t *)(ids + (uint64_t)token * 24u);
-    device const char *token_src1 = src1 + (uint64_t)token * 55296u;
+    const int n_exp = args.nei0;
+    device const int32_t *token_ids = (device const int32_t *)(ids + (uint64_t)token * (uint64_t)(n_exp * 4));
+    device const char *token_src1 = src1 + (uint64_t)token * (uint64_t)(n_exp * 9216);
 
     /* 2026-10-21：MoE down 的累加可切到 double-single（TwoSum 补偿）。
  *
@@ -11986,10 +11987,10 @@ kernel void kernel_mul_mv_id_q2_K_sum6_v41_f32(
      * 是否改变贪心输出文本」。这是模拟「CPU 做一部分专家、GPU 做另一部分」
      * 时必然出现的结合律改变。仅编译期开启，默认行为不变。 */
 #if defined(DS4_MOE_REVERSE_EXPERTS) && DS4_MOE_REVERSE_EXPERTS
-    for (int _slot_i = 0; _slot_i < 6; _slot_i++) {
-        const int expert_slot = 5 - _slot_i;
+    for (int _slot_i = 0; _slot_i < n_exp; _slot_i++) {
+        const int expert_slot = (n_exp - 1) - _slot_i;
 #else
-    for (int expert_slot = 0; expert_slot < 6; expert_slot++) {
+    for (int expert_slot = 0; expert_slot < n_exp; expert_slot++) {
 #endif
         const int32_t expert = token_ids[expert_slot];
         device const block_q2_K * x = (device const block_q2_K *)(src0s + (uint)expert*3870720u + (uint)first_row*756u);

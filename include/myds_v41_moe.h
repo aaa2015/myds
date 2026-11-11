@@ -46,6 +46,12 @@ int myds_v41_moe_hc_overlap_enabled(void);
 int myds_v41_moe_hc_overlap_parse_mode(void);
 void myds_v41_moe_hc_overlap_reset_mode(void);
 void myds_v41_moe_hc_overlap_counters(myds_metal_decode_candidate_counters_t *out, bool reset);
+/* MYDS_MOE_DECODE_TOPK: absent/0 -> 0 (use model's n_activated_experts=6),
+ * 1..6 -> override decode routed expert top-k while keeping prefill at full 6.
+ * Invalid values fail closed (-1) at context creation. */
+int myds_v41_moe_decode_topk_parse_mode(void);
+uint32_t myds_v41_moe_decode_topk(uint32_t model_k);
+void myds_v41_moe_decode_topk_reset_mode(void);
 int myds_v41_shared_swiglu(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *gate, const myds_metal_buffer_t *up,
     uint32_t width, float clamp);

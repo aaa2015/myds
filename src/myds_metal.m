@@ -6553,9 +6553,9 @@ static int routed_moe_batch_impl(
         !scratch_mid || !scratch_down || n_tok == 0) {
         return 0;
     }
-    /* This graph hardcodes IQ2_XXS gate/up, Q2_K down and a six-expert sum.
+    /* This graph uses IQ2_XXS gate/up, Q2_K down and a 1..6 expert sum.
      * DSpark's Q2_K/top-3 graph has a separate entry point. */
-    if (n_activated_experts != 6 || gate_type != GGML_TYPE_IQ2_XXS ||
+    if (n_activated_experts < 1u || n_activated_experts > 6u || gate_type != GGML_TYPE_IQ2_XXS ||
         up_type != GGML_TYPE_IQ2_XXS || down_type != GGML_TYPE_Q2_K) {
         return 0;
     }
@@ -6569,7 +6569,7 @@ static int routed_moe_batch_impl(
     if (q2_v41_allowed && (!moe_q2_v41_producer_geometry(g_moe_iq2_constant_lut) || !moe_q2_v41_geometry())) return 0;
 
     const bool use_iq2_v41=iq2_v41_allowed && g_moe_iq2_v41 && n_tok==1u &&
-        dim==5120u && expert_dim==2304u && n_routed_experts==384u;
+        dim==5120u && expert_dim==2304u && n_routed_experts==384u && n_activated_experts==6u;
     if (iq2_v41_allowed && (!use_iq2_v41 ||
         !decode_candidate_geometry(g_pso_moe_iq2_v41,(unsigned)g_moe_nsg,2176u))) return 0;
     @autoreleasepool {
@@ -6585,6 +6585,7 @@ static int routed_moe_batch_impl(
         int min_mm_tokens = get_moe_mm_min_tokens();
         bool can_use_mm = (min_mm_tokens > 0) &&
                           ((int)n_tok >= min_mm_tokens) &&
+                          (n_activated_experts == 6u) &&
                           (gate_type == GGML_TYPE_IQ2_XXS) &&
                           (up_type == GGML_TYPE_IQ2_XXS) &&
                           (down_type == GGML_TYPE_Q2_K) &&
@@ -6927,7 +6928,7 @@ static int routed_moe_batch_impl(
         const NSUInteger row_groups_down = (dim + rows_per_group_down - 1) / rows_per_group_down;
         const bool use_q2_v41 = q2_v41_allowed && g_moe_q2_v41 && n_tok == 1u &&
             dim == 5120u && expert_dim == 2304u && n_routed_experts == 384u &&
-            n_activated_experts == 6u && down_type == GGML_TYPE_Q2_K &&
+            n_activated_experts >= 1u && n_activated_experts <= 6u && down_type == GGML_TYPE_Q2_K &&
             down_args.nr0 == 2 && down_args.tp_world <= 1 && down_args.tp_expert_base == 0 &&
             (nsg_down == 2u || nsg_down == 4u);
         if (q2_v41_allowed && (!use_q2_v41 || !moe_q2_v41_geometry())) return 0;
@@ -6954,7 +6955,7 @@ static int routed_moe_batch_impl(
 
         if ((use_iq2_v41 ? g_pso_moe_iq2_v41 : (use_q2_v41 ? moe_q2_v41_producer() : g_pso_moe_pair_swiglu_iq2_xxs)) &&
             (use_q2_v41 ? g_pso_moe_sum6_v41_q2_k : g_pso_moe_sum6_q2_k)) {
-            bool use_batch_dedup = (n_tok == 2) && get_moe_batch_dedup_enabled() &&
+            bool use_batch_dedup = (n_tok == 2) && (n_activated_experts == 6u) && get_moe_batch_dedup_enabled() &&
                                    g_pso_moe_pair_swiglu_batch_iq2_xxs && g_pso_moe_sum6_batch_q2_k;
             static bool logged_moe_dedup = false;
             if (!logged_moe_dedup && n_tok == 2) {
@@ -7404,11 +7405,13 @@ static int routed_moe_scoped_impl(
     /* Only this caller-supplied public/nontrace scalar scope can select the
      * specialization. The ordinary batch helper remains the old provider. */
     if ((g_moe_q2_v41 || g_moe_iq2_v41 || shared_down) && ordinary_decode_allowed && dim == 5120u && expert_dim == 2304u &&
-        n_routed_experts == 384u && n_activated_experts == 6u &&
+        n_routed_experts == 384u && n_activated_experts >= 1u && n_activated_experts <= 6u &&
+        (!g_moe_iq2_v41 || n_activated_experts == 6u) &&
         gate_type == GGML_TYPE_IQ2_XXS && up_type == GGML_TYPE_IQ2_XXS && down_type == GGML_TYPE_Q2_K &&
         (g_moe_down_nsg == 2 || g_moe_down_nsg == 4)) {
         const int min_mm_tokens = get_moe_mm_min_tokens();
         const bool one_token_mm = min_mm_tokens > 0 && min_mm_tokens <= 1 &&
+            n_activated_experts == 6u &&
             g_pso_moe_mm_map0_ne20_6 && g_pso_moe_mm_iq2_pair_swiglu_f16 &&
             g_pso_moe_mm_q2_k_f16 && g_pso_moe_sum6;
         /* MM materializes F16 MID and has a different reduction tree. Keep
@@ -7420,16 +7423,17 @@ static int routed_moe_scoped_impl(
                 !moe_q2_v41_producer_geometry(g_moe_iq2_constant_lut) || !isfinite(clamp_val) || clamp_val < 0)
                 return scoped_moe_candidate_failure("runtime, PSO/geometry or clamp");
             const uint64_t out_bytes = 5120u * sizeof(float);
-            const uint64_t mid_bytes = 6u * 2304u * sizeof(float);
+            const uint64_t mid_bytes = (uint64_t)n_activated_experts * 2304u * sizeof(float);
+            const uint64_t sel_bytes = (uint64_t)n_activated_experts * sizeof(float);
             const myds_metal_buffer_t *readers[] = {x_in, gate_exps, up_exps, down_exps, selected_ids, selected_weights};
             const uint64_t reader_bytes[] = {out_bytes, 384ull * 2304u * 1320u,
-                384ull * 2304u * 1320u, 1486356480ull, 24u, 24u};
+                384ull * 2304u * 1320u, 1486356480ull, sel_bytes, sel_bytes};
             const size_t reader_align[] = {16u, 2u, 2u, 2u, 4u, 4u};
             if (!moe_q2_sum_cache_range(moe_out, out_bytes, 4u) ||
                 !moe_q2_sum_cache_range(scratch_mid, mid_bytes, 4u) ||
                 !moe_q2_sum_cache_range(scratch_gate, mid_bytes, 4u) ||
                 !moe_q2_sum_cache_range(scratch_up, mid_bytes, 4u) ||
-                !moe_q2_sum_cache_range(scratch_down, 6u * out_bytes, 4u))
+                !moe_q2_sum_cache_range(scratch_down, (uint64_t)n_activated_experts * out_bytes, 4u))
                 return scoped_moe_candidate_failure("output or scratch range/alignment");
             for (unsigned i = 0; i < 6u; ++i)
                 if (!moe_q2_sum_cache_range(readers[i], reader_bytes[i], reader_align[i]))
@@ -8354,7 +8358,7 @@ static int routed_moe_down_overlap_scoped_impl(
     }
     atomic_fetch_add_explicit(&g_decode_candidates[DC_OVERLAP][0],1,memory_order_relaxed);
     if (!g_initialized || !g_moe_down_overlap || !ordinary_decode_allowed ||
-        dim!=5120u || expert_dim!=2304u || n_routed_experts!=384u || n_activated_experts!=6u ||
+        dim!=5120u || expert_dim!=2304u || n_routed_experts!=384u || n_activated_experts<1u || n_activated_experts>6u ||
         gate_type!=GGML_TYPE_IQ2_XXS || up_type!=GGML_TYPE_IQ2_XXS || down_type!=GGML_TYPE_Q2_K ||
         shared_type!=GGML_TYPE_Q4_K || !g_batch_cb || g_auto_barrier ||
         !myds_metal_get_concurrent() || g_kp_on || (dense_q4_nr0()!=2u && dense_q4_nr0()!=4u) || dense_q4_nsg()!=4u ||
@@ -8363,19 +8367,22 @@ static int routed_moe_down_overlap_scoped_impl(
         !decode_candidate_range(shared_input,9216u,4u) ||
         !decode_candidate_range(shared_weight,6635520u,2u))
         return shared_down_scoped_failure(shared_nb_allowed,"scope, range, PSO or geometry");
+    const uint64_t sel_bytes=(uint64_t)n_activated_experts*4u;
+    const uint64_t mid_bytes=(uint64_t)n_activated_experts*9216u;
+    const uint64_t down_scratch_bytes=(uint64_t)n_activated_experts*20480u;
     const myds_metal_buffer_t *others[]={moe_out,x_in,gate_exps,up_exps,down_exps,
         selected_ids,selected_weights,scratch_gate,scratch_up,scratch_mid,scratch_down,shared_input,shared_weight};
     const uint64_t bytes[]={20480u,20480u,1167851520ull,1167851520ull,1486356480ull,
-        24u,24u,55296u,55296u,55296u,122880u,9216u,6635520u};
+        sel_bytes,sel_bytes,mid_bytes,mid_bytes,mid_bytes,down_scratch_bytes,9216u,6635520u};
     for (unsigned i=0;i<13u;++i) {
         if (!decode_candidate_range(others[i],bytes[i],i==2u||i==3u||i==4u||i==12u?2u:4u) ||
             decode_candidate_overlap(shared_out,20480u,others[i],bytes[i]))
             return shared_down_scoped_failure(shared_nb_allowed,"shared output overlaps another allocation");
     }
     if (decode_candidate_overlap(shared_input,9216u,moe_out,20480u) ||
-        decode_candidate_overlap(shared_input,9216u,scratch_mid,55296u) ||
+        decode_candidate_overlap(shared_input,9216u,scratch_mid,mid_bytes) ||
         decode_candidate_overlap(shared_weight,6635520u,moe_out,20480u) ||
-        decode_candidate_overlap(shared_weight,6635520u,scratch_mid,55296u))
+        decode_candidate_overlap(shared_weight,6635520u,scratch_mid,mid_bytes))
         return shared_down_scoped_failure(shared_nb_allowed,"shared reader overlaps routed writer");
     const shared_down_job_t job={shared_out,shared_weight,shared_input,shared_nb_allowed};
     int ok=routed_moe_scoped_impl(moe_out, x_in, gate_exps, up_exps, down_exps, selected_ids, selected_weights,
