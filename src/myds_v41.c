@@ -2981,9 +2981,12 @@ myds_v41_context_t *myds_v41_context_create(myds_context_t *ctx) {
     g->engram_project_round_skip = round_skip;
     MYDS_LOG_I("Engram projection round skip: %d (%s; ordinary scalar decode, nontrace)",
                round_skip, round_skip ? "skip" : "reference");
-    MYDS_LOG_I("MoE decode routed top-k: %u (prefill/model default: %u)",
-               myds_v41_moe_decode_topk(ctx->model->n_activated_experts),
-               ctx->model->n_activated_experts);
+    {
+        char topk_desc[128];
+        myds_v41_moe_decode_topk_summary(ctx->model->n_activated_experts, topk_desc, sizeof(topk_desc));
+        MYDS_LOG_I("MoE decode routed top-k: %s (prefill/model default: %u)",
+                   topk_desc, ctx->model->n_activated_experts);
+    }
     g->model = ctx->model;
     g->capacity=ctx->cfg.max_seq_len;
     g->engram=myds_engram_clone(ctx->model->v41->engram);
@@ -5600,7 +5603,7 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         CHECK(myds_v41_batch2_projection_probe(ws->v_shared_out, base->shared_down, ws->v_shared_swiglu, V41_DIM, 2304, base->shared_down_type, MYDS_V41_BATCH2_SHARED));
 
         /* 5. 同步 router_logits，执行路由打分与 Top-K 选择 */
-        const uint32_t k_dec = myds_v41_moe_decode_topk(m->n_activated_experts);
+        const uint32_t k_dec = myds_v41_moe_decode_topk_layer(il, m->n_activated_experts);
         myds_metal_barrier_buffer(ws->router_logits_b2);
         CHECK(myds_v41_route_batch(ws->selected_ids_b2, ws->selected_w_b2, ws->route_probs_b2, ws->route_scores_b2,
                                    ws->router_logits_b2, base->router_bias, 384, k_dec, m->routed_scaling_factor, 2));
@@ -6332,7 +6335,7 @@ static int v41_forward_three_row_spec_impl(myds_context_t *ctx, const int32_t *t
         CHECK(v41_three_row_projection(ws->v_router_logits, base->router_gate, ws->v_ffn_norm, 384, V41_DIM, base->router_gate_type, MYDS_V41_BATCH2_ROUTER, shared3, pos, il));
         myds_metal_barrier_buffer(ws->router_logits_b2);
 
-        const uint32_t k_b3 = shared3 ? 6u : myds_v41_moe_decode_topk(m->n_activated_experts);
+        const uint32_t k_b3 = shared3 ? 6u : myds_v41_moe_decode_topk_layer(il, m->n_activated_experts);
         CHECK(myds_v41_route_batch(ws->selected_ids_b2, ws->selected_w_b2, ws->route_probs_b2, ws->route_scores_b2,
                                    ws->router_logits_b2, base->router_bias, 384, k_b3, m->routed_scaling_factor, 3));
         myds_v41_moe_weight_hist_observe(ws->selected_w_b2, 3, k_b3);

@@ -206,6 +206,16 @@ int main(void) {
     assert(myds_v41_moe_hc_overlap_enabled()==1); /* Cached context mode. */
     myds_v41_moe_hc_overlap_reset_mode();assert(myds_v41_moe_hc_overlap_enabled()==0);
     assert(myds_v41_moe_hc_overlap_parse_mode()==-1);
+    setenv("MYDS_MOE_DECODE_TOPK","2,0-1:3,14-15:3,19:4,20:3,23:3,27:3,38:3,39:4",1);
+    assert(myds_v41_moe_decode_topk_parse_mode()==7);
+    assert(myds_v41_moe_decode_topk_layer(0,6)==3 && myds_v41_moe_decode_topk_layer(2,6)==2 &&
+           myds_v41_moe_decode_topk_layer(19,6)==4 && myds_v41_moe_decode_topk_layer(39,6)==4);
+    const char *bad_topk[]={"","01","7","0-19:2","40:3","5-2:3","2,0:0","2,"};
+    for(unsigned i=0;i<sizeof(bad_topk)/sizeof(*bad_topk);++i) {
+        setenv("MYDS_MOE_DECODE_TOPK",bad_topk[i],1);
+        assert(myds_v41_moe_decode_topk_parse_mode()==-1);
+    }
+    myds_v41_moe_decode_topk_reset_mode();assert(myds_v41_moe_decode_topk_layer(0,6)==6);
     puts("PASS: actual MoE C HC schedule, three cohorts, strict env,101 exclusions,scratch guards,counters,stage failures,caller restoration; CPU recording stubs only");
     return 0;
 }

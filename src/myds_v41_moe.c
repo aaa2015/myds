@@ -52,20 +52,158 @@ static _Atomic uint64_t route_shuffle_requests, route_shuffle_encoded, route_shu
 static _Atomic uint64_t hc_overlap_requests, hc_overlap_encoded, hc_overlap_failures;
 static _Atomic int hc_overlap_mode;
 static _Atomic int moe_decode_topk_mode;
+static _Atomic uint8_t moe_decode_topk_table[MYDS_V41_MOE_LAYERS];
+
+static bool parse_moe_layer_idx(const char *s, const char *e, uint32_t *out) {
+    if (!s || !e || s >= e) return false;
+    if (e - s > 1 && *s == '0') return false;
+    uint32_t val = 0;
+    for (const char *p = s; p < e; ++p) {
+        if (*p < '0' || *p > '9') return false;
+        val = val * 10u + (uint32_t)(*p - '0');
+        if (val >= MYDS_V41_MOE_LAYERS) return false;
+    }
+    *out = val;
+    return true;
+}
+
 int myds_v41_moe_decode_topk_parse_mode(void) {
     const char *v = getenv("MYDS_MOE_DECODE_TOPK");
-    int mode = -1;
-    if (!v || !strcmp(v, "0")) mode = 0;
-    else if (v[0] >= '1' && v[0] <= '6' && v[1] == '\0') mode = v[0] - '0';
-    if (mode < 0) MYDS_LOG_E("MYDS_MOE_DECODE_TOPK must be 0 or an integer in 1..6");
+    if (!v || !strcmp(v, "0")) {
+        for (uint32_t i = 0; i < MYDS_V41_MOE_LAYERS; ++i)
+            atomic_store_explicit(&moe_decode_topk_table[i], 0u, memory_order_relaxed);
+        atomic_store_explicit(&moe_decode_topk_mode, 0, memory_order_relaxed);
+        return 0;
+    }
+    if (v[0] >= '1' && v[0] <= '6' && v[1] == '\0') {
+        const uint8_t k = (uint8_t)(v[0] - '0');
+        for (uint32_t i = 0; i < MYDS_V41_MOE_LAYERS; ++i)
+            atomic_store_explicit(&moe_decode_topk_table[i], k, memory_order_relaxed);
+        atomic_store_explicit(&moe_decode_topk_mode, (int)k, memory_order_relaxed);
+        return (int)k;
+    }
+
+    uint8_t tmp[MYDS_V41_MOE_LAYERS] = {0};
+    bool ok = false;
+    const size_t len = strlen(v);
+    if (len == MYDS_V41_MOE_LAYERS && !strchr(v, ',') && !strchr(v, ':')) {
+        ok = true;
+        for (size_t i = 0; i < MYDS_V41_MOE_LAYERS; ++i) {
+            if (v[i] < '1' || v[i] > '6') { ok = false; break; }
+            tmp[i] = (uint8_t)(v[i] - '0');
+        }
+    } else if (len > 0 && strchr(v, ':') != NULL) {
+        const uint64_t full_mask = (1ULL << MYDS_V41_MOE_LAYERS) - 1ULL;
+        uint64_t assigned = 0ULL;
+        const char *p = v;
+        bool first = true;
+        ok = true;
+        while (ok) {
+            const char *comma = strchr(p, ',');
+            const char *end = comma ? comma : (v + len);
+            if (p == end) { ok = false; break; }
+            const char *colon = memchr(p, ':', (size_t)(end - p));
+            if (!colon) {
+                if (!first || (end - p) != 1 || *p < '1' || *p > '6' || !comma) {
+                    ok = false;
+                    break;
+                }
+                const uint8_t def_k = (uint8_t)(*p - '0');
+                for (uint32_t i = 0; i < MYDS_V41_MOE_LAYERS; ++i) tmp[i] = def_k;
+                assigned = full_mask;
+            } else {
+                if ((end - (colon + 1)) != 1 || colon[1] < '1' || colon[1] > '6') {
+                    ok = false;
+                    break;
+                }
+                const uint8_t k_val = (uint8_t)(colon[1] - '0');
+                const char *dash = memchr(p, '-', (size_t)(colon - p));
+                uint32_t lo = 0, hi = 0;
+                if (dash) {
+                    if (!parse_moe_layer_idx(p, dash, &lo) ||
+                        !parse_moe_layer_idx(dash + 1, colon, &hi) || lo > hi) {
+                        ok = false;
+                        break;
+                    }
+                } else {
+                    if (!parse_moe_layer_idx(p, colon, &lo)) {
+                        ok = false;
+                        break;
+                    }
+                    hi = lo;
+                }
+                for (uint32_t i = lo; i <= hi; ++i) {
+                    tmp[i] = k_val;
+                    assigned |= (1ULL << i);
+                }
+            }
+            first = false;
+            if (!comma) break;
+            p = comma + 1;
+        }
+        if (ok && assigned != full_mask) ok = false;
+    }
+
+    if (!ok) {
+        MYDS_LOG_E("MYDS_MOE_DECODE_TOPK must be 0, 1..6, 40 digits in 1..6, or [<def_k>,]<L|L1-L2>:<1..6>,...");
+        atomic_store_explicit(&moe_decode_topk_mode, -1, memory_order_relaxed);
+        return -1;
+    }
+
+    bool uniform = true;
+    for (uint32_t i = 0; i < MYDS_V41_MOE_LAYERS; ++i) {
+        if (tmp[i] != tmp[0]) uniform = false;
+        atomic_store_explicit(&moe_decode_topk_table[i], tmp[i], memory_order_relaxed);
+    }
+    const int mode = uniform ? (int)tmp[0] : 7;
     atomic_store_explicit(&moe_decode_topk_mode, mode, memory_order_relaxed);
     return mode;
 }
-uint32_t myds_v41_moe_decode_topk(uint32_t model_k) {
+
+uint32_t myds_v41_moe_decode_topk_layer(uint32_t layer, uint32_t model_k) {
     const int mode = atomic_load_explicit(&moe_decode_topk_mode, memory_order_relaxed);
-    return (mode >= 1 && (uint32_t)mode <= model_k) ? (uint32_t)mode : model_k;
+    if (mode >= 1 && mode <= 6) {
+        return (uint32_t)mode <= model_k ? (uint32_t)mode : model_k;
+    }
+    if (mode == 7 && layer < MYDS_V41_MOE_LAYERS) {
+        const uint32_t k = atomic_load_explicit(&moe_decode_topk_table[layer], memory_order_relaxed);
+        if (k >= 1u && k <= model_k) return k;
+    }
+    return model_k;
 }
+
+uint32_t myds_v41_moe_decode_topk(uint32_t model_k) {
+    return myds_v41_moe_decode_topk_layer(0u, model_k);
+}
+
+void myds_v41_moe_decode_topk_summary(uint32_t model_k, char *buf, size_t cap) {
+    if (!buf || !cap) return;
+    const int mode = atomic_load_explicit(&moe_decode_topk_mode, memory_order_relaxed);
+    if (mode <= 0) {
+        snprintf(buf, cap, "%u (model default)", model_k);
+        return;
+    }
+    if (mode >= 1 && mode <= 6) {
+        snprintf(buf, cap, "%u uniform", myds_v41_moe_decode_topk_layer(0u, model_k));
+        return;
+    }
+    uint32_t sum = 0, min_k = model_k, max_k = 0;
+    char sched[MYDS_V41_MOE_LAYERS + 1];
+    for (uint32_t i = 0; i < MYDS_V41_MOE_LAYERS; ++i) {
+        const uint32_t k = myds_v41_moe_decode_topk_layer(i, model_k);
+        sum += k;
+        if (k < min_k) min_k = k;
+        if (k > max_k) max_k = k;
+        sched[i] = (char)('0' + (k <= 9u ? k : 9u));
+    }
+    sched[MYDS_V41_MOE_LAYERS] = '\0';
+    snprintf(buf, cap, "per-layer mean=%.2f min=%u max=%u [%s]",
+             (double)sum / (double)MYDS_V41_MOE_LAYERS, min_k, max_k, sched);
+}
+
 void myds_v41_moe_decode_topk_reset_mode(void) {
+    for (uint32_t i = 0; i < MYDS_V41_MOE_LAYERS; ++i)
+        atomic_store_explicit(&moe_decode_topk_table[i], 0u, memory_order_relaxed);
     atomic_store_explicit(&moe_decode_topk_mode, 0, memory_order_relaxed);
 }
 int myds_v41_moe_hc_overlap_parse_mode(void) {
@@ -874,7 +1012,7 @@ int myds_v41_moe_eval(myds_context_t *ctx, uint32_t layer, uint32_t pos,
     if (!ctx || !ctx->model || layer >= ctx->model->n_layers) return 0;
     myds_model_t *m = ctx->model;
     myds_layer_t *l = &m->layers[layer];
-    const uint32_t dim=m->dim, width=m->moe_expert_dim, k=myds_v41_moe_decode_topk(m->n_activated_experts);
+    const uint32_t dim=m->dim, width=m->moe_expert_dim, k=myds_v41_moe_decode_topk_layer(layer, m->n_activated_experts);
     if (m->n_routed_experts!=384 || m->n_activated_experts!=6 || k<1 || k>6 || m->n_shared_experts!=1 ||
         !dim || !width || dim%256 || width%256 ||
         l->ffn_gate_exps_type!=GGML_TYPE_IQ2_XXS ||
@@ -932,7 +1070,7 @@ static int moe_fused_scoped(myds_context_t *ctx, uint32_t layer, uint32_t token,
     if (!ctx || !ctx->model || layer >= ctx->model->n_layers) return 0;
     myds_model_t *m = ctx->model;
     myds_layer_t *l = &m->layers[layer];
-    const uint32_t dim = m->dim, width = m->moe_expert_dim, k = myds_v41_moe_decode_topk(m->n_activated_experts);
+    const uint32_t dim = m->dim, width = m->moe_expert_dim, k = myds_v41_moe_decode_topk_layer(layer, m->n_activated_experts);
     const bool trace_on = myds_trace_active();
 
     if (m->n_routed_experts != 384 || m->n_activated_experts != 6 || k < 1 || k > 6 || m->n_shared_experts != 1 ||
@@ -1230,7 +1368,7 @@ static int moe_hc_overlap_101(myds_context_t *ctx, uint32_t layer,
     myds_metal_buffer_t *flat_norm, myds_metal_buffer_t *mix, float hc_eps) {
     myds_model_t *m=ctx->model;
     myds_layer_t *l=&m->layers[layer];
-    const uint32_t dim=m->dim, width=m->moe_expert_dim, k=myds_v41_moe_decode_topk(m->n_activated_experts);
+    const uint32_t dim=m->dim, width=m->moe_expert_dim, k=myds_v41_moe_decode_topk_layer(layer, m->n_activated_experts);
     const int previous_auto=myds_metal_get_auto_barrier();
     const int previous_concurrent=myds_metal_get_concurrent();
     myds_metal_set_auto_barrier(0);
@@ -1324,7 +1462,7 @@ int myds_v41_moe_pipeline_scoped(myds_context_t *ctx, uint32_t layer, uint32_t t
     if (!ctx || !ctx->model || layer >= ctx->model->n_layers) return 0;
     myds_model_t *m = ctx->model;
     myds_layer_t *l = &m->layers[layer];
-    const uint32_t dim = m->dim, width = m->moe_expert_dim, k = myds_v41_moe_decode_topk(m->n_activated_experts);
+    const uint32_t dim = m->dim, width = m->moe_expert_dim, k = myds_v41_moe_decode_topk_layer(layer, m->n_activated_experts);
     const bool trace_on = myds_trace_active();
 
     const bool hc_overlap_eligible=hc_overlap && ordinary_decode_allowed && !trace_on &&
@@ -1760,7 +1898,7 @@ int myds_v41_moe_ffn_hc_overlap_scoped(myds_context_t *ctx, uint32_t layer, uint
     }
     myds_model_t *m = ctx->model;
     myds_layer_t *l = &m->layers[layer];
-    const uint32_t dim = m->dim, width = m->moe_expert_dim, k = myds_v41_moe_decode_topk(m->n_activated_experts);
+    const uint32_t dim = m->dim, width = m->moe_expert_dim, k = myds_v41_moe_decode_topk_layer(layer, m->n_activated_experts);
 
     const char *fuse_hc_norm_env = getenv("MYDS_FUSE_HC_SUM_RMSNORM");
     const bool fuse_hc_norm_on = !fuse_hc_norm_env || atoi(fuse_hc_norm_env) != 0;

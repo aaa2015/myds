@@ -46,11 +46,17 @@ int myds_v41_moe_hc_overlap_enabled(void);
 int myds_v41_moe_hc_overlap_parse_mode(void);
 void myds_v41_moe_hc_overlap_reset_mode(void);
 void myds_v41_moe_hc_overlap_counters(myds_metal_decode_candidate_counters_t *out, bool reset);
-/* MYDS_MOE_DECODE_TOPK: absent/0 -> 0 (use model's n_activated_experts=6),
- * 1..6 -> override decode routed expert top-k while keeping prefill at full 6.
- * Invalid values fail closed (-1) at context creation. */
+#define MYDS_V41_MOE_LAYERS 40u
+/* MYDS_MOE_DECODE_TOPK:
+ *   - absent / "0": use model's n_activated_experts=6 on all layers
+ *   - "1".."6": uniform decode routed top-k across all 40 layers
+ *   - 40-char string of '1'..'6', or "<default_k>,<L|L1-L2>:<k>,..." (or full
+ *     40-layer coverage without default_k): per-layer decode routed top-k
+ * Prefill stays at full 6. Invalid values fail closed (-1) at context creation. */
 int myds_v41_moe_decode_topk_parse_mode(void);
 uint32_t myds_v41_moe_decode_topk(uint32_t model_k);
+uint32_t myds_v41_moe_decode_topk_layer(uint32_t layer, uint32_t model_k);
+void myds_v41_moe_decode_topk_summary(uint32_t model_k, char *buf, size_t cap);
 void myds_v41_moe_decode_topk_reset_mode(void);
 int myds_v41_shared_swiglu(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *gate, const myds_metal_buffer_t *up,
