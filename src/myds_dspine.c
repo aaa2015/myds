@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <math.h>
+#include <dispatch/dispatch.h>
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -241,6 +242,38 @@ static void matvec_bf16(float *out, const uint16_t *W, const float *x,
     }
 }
 
+static void matvec_typed(float *out, const myds_metal_buffer_t *W_buf, ggml_type wtype,
+                         const float *x, uint32_t rows, uint32_t cols) {
+    const uint8_t *base = (const uint8_t *)myds_metal_buffer_data((myds_metal_buffer_t *)W_buf);
+    if (wtype == GGML_TYPE_Q4_K) {
+        size_t row_bytes = ((size_t)cols / 256u) * 144u;
+        for (uint32_t r = 0; r < rows; r++) {
+            out[r] = dot_q4_K_f32(base + (size_t)r * row_bytes, x, cols);
+        }
+    } else if (wtype == GGML_TYPE_Q8_0) {
+        size_t row_bytes = ((size_t)cols / 32u) * 34u;
+        for (uint32_t r = 0; r < rows; r++) {
+            out[r] = dot_q8_0_f32(base + (size_t)r * row_bytes, x, cols);
+        }
+    } else {
+        matvec_bf16(out, (const uint16_t *)base, x, rows, cols);
+    }
+}
+
+static inline int dspine_gemv_batch(myds_metal_buffer_t *out,
+                                    const myds_metal_buffer_t *weight,
+                                    const myds_metal_buffer_t *input,
+                                    uint32_t out_dim, uint32_t in_dim,
+                                    uint32_t n_tok, ggml_type wtype) {
+    if (wtype == GGML_TYPE_Q4_K || wtype == GGML_TYPE_Q8_0) {
+        if (n_tok >= 8u) {
+            return myds_metal_mul_mm(out, weight, input, out_dim, in_dim, n_tok, wtype);
+        }
+        return myds_metal_gemv_batch(out, weight, input, out_dim, in_dim, n_tok, wtype);
+    }
+    return myds_metal_v41_gemv_batch(out, weight, input, out_dim, in_dim, n_tok, wtype);
+}
+
 static void rmsnorm(float *out, const float *x, const uint16_t *weight,
                     uint32_t dim, float eps) {
     float sum_sq = 0.0f;
@@ -355,7 +388,7 @@ static bool ensure_ctx_kv_capacity(myds_dspine_t *ds, uint32_t needed_len) {
     ds->ctx_pos_cache = np;
 
     float *ns = (float *)realloc(ds->attn_scores_scratch,
-                                 (size_t)(new_cap + MYDS_DSPINE_MAX_BLOCK) * sizeof(float));
+                                 (size_t)ds->num_heads * (new_cap + MYDS_DSPINE_MAX_BLOCK) * sizeof(float));
     if (!ns) return false;
     ds->attn_scores_scratch = ns;
 
@@ -382,15 +415,16 @@ static bool find_tensor_offset(const char *json, size_t json_len, const char *na
     return (*end >= *start);
 }
 
-static myds_metal_buffer_t *load_tensor(const char *data_base,
-                                        const char *json, size_t json_len,
-                                        const char *name) {
+static myds_metal_buffer_t *load_tensor_ex(const char *data_base,
+                                            const char *json, size_t json_len,
+                                            const char *name, size_t *out_bytes) {
     uint64_t start = 0, end = 0;
     if (!find_tensor_offset(json, json_len, name, &start, &end)) {
         MYDS_LOG_E("DSpine: tensor '%s' not found in safetensors header", name);
         return NULL;
     }
     size_t size = (size_t)(end - start);
+    if (out_bytes) *out_bytes = size;
     const void *ptr = data_base + start;
     myds_metal_buffer_t *buf = myds_metal_buffer_from_ptr(ptr, size);
     if (!buf) {
@@ -398,6 +432,41 @@ static myds_metal_buffer_t *load_tensor(const char *data_base,
         if (buf) {
             myds_metal_buffer_write(buf, 0, ptr, size);
         }
+    }
+    return buf;
+}
+
+static myds_metal_buffer_t *load_tensor(const char *data_base,
+                                        const char *json, size_t json_len,
+                                        const char *name) {
+    return load_tensor_ex(data_base, json, json_len, name, NULL);
+}
+
+static myds_metal_buffer_t *load_matrix_tensor(const char *data_base,
+                                               const char *json, size_t json_len,
+                                               const char *name,
+                                               uint32_t rows, uint32_t cols,
+                                               ggml_type *out_type) {
+    size_t nbytes = 0;
+    myds_metal_buffer_t *buf = load_tensor_ex(data_base, json, json_len, name, &nbytes);
+    if (!buf) return NULL;
+    const size_t bf16_bytes = (size_t)rows * cols * 2u;
+    const size_t q4k_bytes  = (cols % 256u == 0) ? (size_t)rows * (cols / 256u) * 144u : 0u;
+    const size_t q80_bytes  = (cols % 32u == 0)  ? (size_t)rows * (cols / 32u)  * 34u  : 0u;
+    const size_t f32_bytes  = (size_t)rows * cols * 4u;
+    if (nbytes == bf16_bytes) {
+        *out_type = GGML_TYPE_BF16;
+    } else if (q4k_bytes && nbytes == q4k_bytes) {
+        *out_type = GGML_TYPE_Q4_K;
+    } else if (q80_bytes && nbytes == q80_bytes) {
+        *out_type = GGML_TYPE_Q8_0;
+    } else if (nbytes == f32_bytes) {
+        *out_type = GGML_TYPE_F32;
+    } else {
+        MYDS_LOG_E("DSpine: tensor '%s' has unexpected byte size %zu for [%u, %u]",
+                   name, nbytes, rows, cols);
+        myds_metal_buffer_free(buf);
+        return NULL;
     }
     return buf;
 }
@@ -451,10 +520,11 @@ myds_dspine_t *myds_dspine_create(void) {
     ds->delta_buf = myds_metal_buffer_alloc((size_t)MYDS_DSPINE_MAX_BLOCK * ds->hidden_size * sizeof(float));
 
     /* Batched context KV projection buffers */
+    const size_t kv_batch_slice = (size_t)MYDS_DSPINE_CTX_BATCH_CAP * 1024 * sizeof(float);
     ds->batch_th_buf = myds_metal_buffer_alloc((size_t)MYDS_DSPINE_CTX_BATCH_CAP * MYDS_DSPINE_TARGET_DIM * sizeof(float));
     ds->batch_ctx_buf = myds_metal_buffer_alloc((size_t)MYDS_DSPINE_CTX_BATCH_CAP * ds->hidden_size * sizeof(float));
-    ds->batch_k_ctx_buf = myds_metal_buffer_alloc((size_t)MYDS_DSPINE_CTX_BATCH_CAP * 1024 * sizeof(float));
-    ds->batch_v_ctx_buf = myds_metal_buffer_alloc((size_t)MYDS_DSPINE_CTX_BATCH_CAP * 1024 * sizeof(float));
+    ds->batch_k_ctx_buf = myds_metal_buffer_alloc(MYDS_DSPINE_LAYERS * kv_batch_slice);
+    ds->batch_v_ctx_buf = myds_metal_buffer_alloc(MYDS_DSPINE_LAYERS * kv_batch_slice);
 
     /* Draft KV cache: max_block * num_layers * 2(K,V) * num_kv_heads * head_dim * sizeof(float) */
     size_t kv_bytes = (size_t)MYDS_DSPINE_MAX_BLOCK * ds->num_layers * 2 * ds->num_kv_heads * ds->head_dim * sizeof(float);
@@ -484,6 +554,13 @@ myds_dspine_t *myds_dspine_create(void) {
                 ? myds_metal_buffer_sub_view(ds->spec_target_slots[r], off, len) : NULL;
             if (!ds->spec_slot_views[r][s]) views_ok = false;
         }
+    }
+    for (int l = 0; l < MYDS_DSPINE_LAYERS; l++) {
+        ds->batch_k_views[l] = ds->batch_k_ctx_buf
+            ? myds_metal_buffer_sub_view(ds->batch_k_ctx_buf, (size_t)l * kv_batch_slice, kv_batch_slice) : NULL;
+        ds->batch_v_views[l] = ds->batch_v_ctx_buf
+            ? myds_metal_buffer_sub_view(ds->batch_v_ctx_buf, (size_t)l * kv_batch_slice, kv_batch_slice) : NULL;
+        if (!ds->batch_k_views[l] || !ds->batch_v_views[l]) views_ok = false;
     }
 
     if (!ds->target_hidden_buf || !ds->ctx_feat_buf || !ds->x_buf || !ds->norm_buf ||
@@ -544,7 +621,8 @@ bool myds_dspine_load_weights(myds_dspine_t *ds, const char *weights_path) {
     const char *data_base = (const char *)ds->mmap_addr + 8 + header_len;
 
     /* 1. Context Projector & Norm */
-    ds->fc_proj = load_tensor(data_base, header_json, (size_t)header_len, "fc.weight");
+    ds->fc_proj = load_matrix_tensor(data_base, header_json, (size_t)header_len, "fc.weight",
+                                     ds->hidden_size, MYDS_DSPINE_TARGET_DIM, &ds->fc_type);
     ds->hidden_norm = load_tensor(data_base, header_json, (size_t)header_len, "hidden_norm.weight");
     if (!ds->fc_proj || !ds->hidden_norm) return false;
 
@@ -557,16 +635,20 @@ bool myds_dspine_load_weights(myds_dspine_t *ds, const char *weights_path) {
         l->input_norm = load_tensor(data_base, header_json, (size_t)header_len, name);
 
         snprintf(name, sizeof(name), "layers.%u.self_attn.q_proj.weight", i);
-        l->q_proj = load_tensor(data_base, header_json, (size_t)header_len, name);
+        l->q_proj = load_matrix_tensor(data_base, header_json, (size_t)header_len, name,
+                                       ds->hidden_size, ds->hidden_size, &l->q_type);
 
         snprintf(name, sizeof(name), "layers.%u.self_attn.k_proj.weight", i);
-        l->k_proj = load_tensor(data_base, header_json, (size_t)header_len, name);
+        l->k_proj = load_matrix_tensor(data_base, header_json, (size_t)header_len, name,
+                                       1024u, ds->hidden_size, &l->k_type);
 
         snprintf(name, sizeof(name), "layers.%u.self_attn.v_proj.weight", i);
-        l->v_proj = load_tensor(data_base, header_json, (size_t)header_len, name);
+        l->v_proj = load_matrix_tensor(data_base, header_json, (size_t)header_len, name,
+                                       1024u, ds->hidden_size, &l->v_type);
 
         snprintf(name, sizeof(name), "layers.%u.self_attn.o_proj.weight", i);
-        l->o_proj = load_tensor(data_base, header_json, (size_t)header_len, name);
+        l->o_proj = load_matrix_tensor(data_base, header_json, (size_t)header_len, name,
+                                       ds->hidden_size, ds->hidden_size, &l->o_type);
 
         snprintf(name, sizeof(name), "layers.%u.self_attn.q_norm.weight", i);
         l->q_norm = load_tensor(data_base, header_json, (size_t)header_len, name);
@@ -578,13 +660,16 @@ bool myds_dspine_load_weights(myds_dspine_t *ds, const char *weights_path) {
         l->post_attn_norm = load_tensor(data_base, header_json, (size_t)header_len, name);
 
         snprintf(name, sizeof(name), "layers.%u.mlp.gate_proj.weight", i);
-        l->gate_proj = load_tensor(data_base, header_json, (size_t)header_len, name);
+        l->gate_proj = load_matrix_tensor(data_base, header_json, (size_t)header_len, name,
+                                          ds->intermediate_size, ds->hidden_size, &l->gate_type);
 
         snprintf(name, sizeof(name), "layers.%u.mlp.up_proj.weight", i);
-        l->up_proj = load_tensor(data_base, header_json, (size_t)header_len, name);
+        l->up_proj = load_matrix_tensor(data_base, header_json, (size_t)header_len, name,
+                                        ds->intermediate_size, ds->hidden_size, &l->up_type);
 
         snprintf(name, sizeof(name), "layers.%u.mlp.down_proj.weight", i);
-        l->down_proj = load_tensor(data_base, header_json, (size_t)header_len, name);
+        l->down_proj = load_matrix_tensor(data_base, header_json, (size_t)header_len, name,
+                                          ds->hidden_size, ds->intermediate_size, &l->down_type);
 
         if (!l->input_norm || !l->q_proj || !l->k_proj || !l->v_proj || !l->o_proj ||
             !l->q_norm || !l->k_norm || !l->post_attn_norm || !l->gate_proj ||
@@ -601,7 +686,8 @@ bool myds_dspine_load_weights(myds_dspine_t *ds, const char *weights_path) {
     /* 4. Code Bridge (Adjacent Causal Injection) */
     for (uint32_t i = 0; i < ds->num_layers; i++) {
         snprintf(name, sizeof(name), "injection.readouts.%u.weight", i);
-        ds->injection_readouts[i] = load_tensor(data_base, header_json, (size_t)header_len, name);
+        ds->injection_readouts[i] = load_matrix_tensor(data_base, header_json, (size_t)header_len, name,
+                                                       512u, ds->hidden_size, &ds->injection_readout_types[i]);
 
         snprintf(name, sizeof(name), "injection.writes.%u.weight", i);
         ds->injection_writes[i] = load_tensor(data_base, header_json, (size_t)header_len, name);
@@ -631,8 +717,8 @@ bool myds_dspine_load_weights(myds_dspine_t *ds, const char *weights_path) {
     }
 
     ds->loaded = true;
-    MYDS_LOG_I("DSpine: all 47 parameter tensors mapped successfully (zero-copy %zu MB)",
-               ds->mmap_size / (1024 * 1024));
+    MYDS_LOG_I("DSpine: all 47 parameter tensors mapped successfully (zero-copy %zu MB, backbone=%s)",
+               ds->mmap_size / (1024 * 1024), ggml_type_name(ds->layers[0].q_type));
     return true;
 }
 
@@ -644,6 +730,10 @@ void myds_dspine_free(myds_dspine_t *ds) {
         for (int r = 0; r < 3; r++) {
             if (ds->spec_slot_views[r][s]) myds_metal_buffer_free(ds->spec_slot_views[r][s]);
         }
+    }
+    for (int l = 0; l < MYDS_DSPINE_LAYERS; l++) {
+        if (ds->batch_k_views[l]) myds_metal_buffer_free(ds->batch_k_views[l]);
+        if (ds->batch_v_views[l]) myds_metal_buffer_free(ds->batch_v_views[l]);
     }
     if (ds->hc_mean_weights) myds_metal_buffer_free(ds->hc_mean_weights);
 
@@ -791,8 +881,8 @@ bool myds_dspine_append_context_batch(myds_dspine_t *ds,
                (size_t)cur * MYDS_DSPINE_TARGET_DIM * sizeof(float));
 
         /* 1. fc_proj [5120, 25600] @ th_gpu [cur, 25600] -> ctx_gpu [cur, 5120] */
-        if (!myds_metal_v41_gemv_batch(ds->batch_ctx_buf, ds->fc_proj, ds->batch_th_buf,
-                                       ds->hidden_size, MYDS_DSPINE_TARGET_DIM, cur, GGML_TYPE_BF16)) {
+        if (!dspine_gemv_batch(ds->batch_ctx_buf, ds->fc_proj, ds->batch_th_buf,
+                               ds->hidden_size, MYDS_DSPINE_TARGET_DIM, cur, ds->fc_type)) {
             return false;
         }
         for (uint32_t i = 0; i < cur; i++) {
@@ -800,24 +890,30 @@ bool myds_dspine_append_context_batch(myds_dspine_t *ds,
             rmsnorm(cf, cf, hn_w, ds->hidden_size, 1e-6f);
         }
 
-        /* 2. Per-layer k_proj, v_proj, k_norm, RoPE into ctx_k_cache / ctx_v_cache */
+        /* 2. All-layer k_proj, v_proj in a single GPU batch, then k_norm + RoPE into ctx_k_cache / ctx_v_cache */
+        myds_metal_begin_batch();
+        for (uint32_t l = 0; l < ds->num_layers; l++) {
+            myds_dspine_layer_t *layer = &ds->layers[l];
+            dspine_gemv_batch(ds->batch_k_views[l], layer->k_proj, ds->batch_ctx_buf,
+                              1024, ds->hidden_size, cur, layer->k_type);
+            dspine_gemv_batch(ds->batch_v_views[l], layer->v_proj, ds->batch_ctx_buf,
+                              1024, ds->hidden_size, cur, layer->v_type);
+        }
+        if (!myds_metal_commit_batch()) return false;
+
+        const size_t slice_floats = (size_t)MYDS_DSPINE_CTX_BATCH_CAP * 1024u;
         for (uint32_t l = 0; l < ds->num_layers; l++) {
             myds_dspine_layer_t *layer = &ds->layers[l];
             const uint16_t *kn_w = (const uint16_t *)myds_metal_buffer_data(layer->k_norm);
-
-            myds_metal_begin_batch();
-            myds_metal_v41_gemv_batch(ds->batch_k_ctx_buf, layer->k_proj, ds->batch_ctx_buf,
-                                      1024, ds->hidden_size, cur, GGML_TYPE_BF16);
-            myds_metal_v41_gemv_batch(ds->batch_v_ctx_buf, layer->v_proj, ds->batch_ctx_buf,
-                                      1024, ds->hidden_size, cur, GGML_TYPE_BF16);
-            if (!myds_metal_commit_batch()) return false;
+            const float *k_l = k_gpu + (size_t)l * slice_floats;
+            const float *v_l = v_gpu + (size_t)l * slice_floats;
 
             float *dst_k_base = ds->ctx_k_cache[l] + (size_t)(ds->ctx_kv_len + off) * 1024u;
             float *dst_v_base = ds->ctx_v_cache[l] + (size_t)(ds->ctx_kv_len + off) * 1024u;
-            memcpy(dst_v_base, v_gpu, (size_t)cur * 1024u * sizeof(float));
+            memcpy(dst_v_base, v_l, (size_t)cur * 1024u * sizeof(float));
 
             for (uint32_t i = 0; i < cur; i++) {
-                float *ki = k_gpu + (size_t)i * 1024u;
+                const float *ki = k_l + (size_t)i * 1024u;
                 float *dst_k = dst_k_base + (size_t)i * 1024u;
                 for (uint32_t h = 0; h < ds->num_kv_heads; h++) {
                     rmsnorm(dst_k + h * ds->head_dim, ki + h * ds->head_dim,
@@ -924,7 +1020,6 @@ bool myds_dspine_build_tables(myds_dspine_t *ds, myds_model_t *base_model) {
 static void dspine_refine_single(const myds_dspine_t *ds, const float *pre_inj,
                                  int32_t pred_token_id, float *out_normed) {
     const uint32_t l_last = ds->num_layers - 1u;
-    const uint16_t *readout_w = (const uint16_t *)myds_metal_buffer_data(ds->injection_readouts[l_last]);
     const uint16_t *msg_w = (const uint16_t *)myds_metal_buffer_data(ds->injection_message);
     const uint16_t *pred_w = (const uint16_t *)myds_metal_buffer_data(ds->injection_pred_gate);
     const uint16_t *recv_w = (const uint16_t *)myds_metal_buffer_data(ds->injection_recv_gate);
@@ -934,7 +1029,8 @@ static void dspine_refine_single(const myds_dspine_t *ds, const float *pre_inj,
     const uint16_t *fn_w = (const uint16_t *)myds_metal_buffer_data(ds->final_norm);
 
     float recv[512];
-    matvec_bf16(recv, readout_w, pre_inj, 512, ds->hidden_size);
+    matvec_typed(recv, ds->injection_readouts[l_last], ds->injection_readout_types[l_last],
+                 pre_inj, 512, ds->hidden_size);
     normalize_feature_512(recv);
 
     if (pred_token_id < 0 || (uint32_t)pred_token_id >= ds->vocab_size) pred_token_id = 0;
@@ -964,6 +1060,73 @@ static void dspine_refine_single(const myds_dspine_t *ds, const float *pre_inj,
     for (uint32_t d = 0; d < ds->hidden_size; d++) refined[d] = pre_inj[d] + scale * delta[d];
 
     rmsnorm(out_normed, refined, fn_w, ds->hidden_size, 1e-6f);
+}
+
+typedef struct {
+    const myds_dspine_t *ds;
+    const float *k_ctx_layer;
+    const float *v_ctx_layer;
+    const float *q_buf;
+    const float *k_buf;
+    const float *v_buf;
+    float *attn_in;
+    float *scores_base;
+    uint32_t scores_stride;
+    uint32_t ctx_len;
+    uint32_t T;
+    float attn_scale;
+} dspine_attn_job_t;
+
+static void dspine_attn_head_worker(void *arg, size_t h_idx) {
+    const dspine_attn_job_t *job = (const dspine_attn_job_t *)arg;
+    const myds_dspine_t *ds = job->ds;
+    const uint32_t h = (uint32_t)h_idx;
+    const uint32_t gqa_ratio = ds->num_heads / ds->num_kv_heads;
+    const uint32_t kv_h = h / gqa_ratio;
+    const size_t kv_off = (size_t)kv_h * ds->head_dim;
+    float *scores = job->scores_base + (size_t)h * job->scores_stride;
+    const uint32_t ctx_len = job->ctx_len;
+    const float attn_scale = job->attn_scale;
+
+    for (uint32_t t = 0; t < job->T; t++) {
+        const float *qh = job->q_buf + (size_t)t * ds->hidden_size + (size_t)h * ds->head_dim;
+        float *out_h = job->attn_in + (size_t)t * ds->hidden_size + (size_t)h * ds->head_dim;
+        const uint32_t total_kv = ctx_len + t + 1u;
+
+        float max_s = -1e38f;
+        for (uint32_t c = 0; c < ctx_len; c++) {
+            const float *kh_c = job->k_ctx_layer + (size_t)c * 1024u + kv_off;
+            float s = dot_f32_128(qh, kh_c) * attn_scale;
+            scores[c] = s;
+            if (s > max_s) max_s = s;
+        }
+        for (uint32_t j = 0; j <= t; j++) {
+            const float *kh_j = job->k_buf + (size_t)j * 1024u + kv_off;
+            float s = dot_f32_128(qh, kh_j) * attn_scale;
+            scores[ctx_len + j] = s;
+            if (s > max_s) max_s = s;
+        }
+
+        float sum_exp = 0.0f;
+        for (uint32_t j = 0; j < total_kv; j++) {
+            float e = expf(scores[j] - max_s);
+            scores[j] = e;
+            sum_exp += e;
+        }
+        float inv_sum = 1.0f / sum_exp;
+
+        memset(out_h, 0, ds->head_dim * sizeof(float));
+        for (uint32_t c = 0; c < ctx_len; c++) {
+            float w = scores[c] * inv_sum;
+            const float *vh_c = job->v_ctx_layer + (size_t)c * 1024u + kv_off;
+            axpy_f32_128(out_h, w, vh_c);
+        }
+        for (uint32_t j = 0; j <= t; j++) {
+            float w = scores[ctx_len + j] * inv_sum;
+            const float *vh_j = job->v_buf + (size_t)j * 1024u + kv_off;
+            axpy_f32_128(out_h, w, vh_j);
+        }
+    }
 }
 
 uint32_t myds_dspine_propose(myds_dspine_t *ds, myds_context_t *ctx,
@@ -1072,9 +1235,9 @@ uint32_t myds_dspine_propose(myds_dspine_t *ds, myds_context_t *ctx,
 
         /* 3.2 Batched Draft QKV on GPU (Context KV is already cached in ctx_k_cache / ctx_v_cache) */
         myds_metal_begin_batch();
-        myds_metal_v41_gemv_batch(ds->q_buf, layer->q_proj, ds->norm_buf, ds->hidden_size, ds->hidden_size, T, GGML_TYPE_BF16);
-        myds_metal_v41_gemv_batch(ds->k_buf, layer->k_proj, ds->norm_buf, 1024, ds->hidden_size, T, GGML_TYPE_BF16);
-        myds_metal_v41_gemv_batch(ds->v_buf, layer->v_proj, ds->norm_buf, 1024, ds->hidden_size, T, GGML_TYPE_BF16);
+        dspine_gemv_batch(ds->q_buf, layer->q_proj, ds->norm_buf, ds->hidden_size, ds->hidden_size, T, layer->q_type);
+        dspine_gemv_batch(ds->k_buf, layer->k_proj, ds->norm_buf, 1024, ds->hidden_size, T, layer->k_type);
+        dspine_gemv_batch(ds->v_buf, layer->v_proj, ds->norm_buf, 1024, ds->hidden_size, T, layer->v_type);
         myds_metal_commit_batch();
 
         /* 3.3 Q/K Norm and RoPE on CPU at exact positions ctx->pos + t (t = 0..T-1) */
@@ -1092,104 +1255,90 @@ uint32_t myds_dspine_propose(myds_dspine_t *ds, myds_context_t *ctx,
         }
 
         /* 3.4 Attention over ctx_k_cache[0..ctx_len-1] + causal draft keys[0..t] */
-        const float *k_ctx_layer = ds->ctx_k_cache[l];
-        const float *v_ctx_layer = ds->ctx_v_cache[l];
-        const uint32_t gqa_ratio = ds->num_heads / ds->num_kv_heads;
-
-        for (uint32_t t = 0; t < T; t++) {
-            const float *qt = q_buf + (size_t)t * ds->hidden_size;
-            float *heads_out = attn_in + (size_t)t * ds->hidden_size;
-            const uint32_t total_kv = ctx_len + t + 1u;
-
-            for (uint32_t h = 0; h < ds->num_heads; h++) {
-                const uint32_t kv_h = h / gqa_ratio;
-                const size_t kv_off = (size_t)kv_h * ds->head_dim;
-                const float *qh = qt + (size_t)h * ds->head_dim;
-
-                float max_s = -1e38f;
-                for (uint32_t c = 0; c < ctx_len; c++) {
-                    const float *kh_c = k_ctx_layer + (size_t)c * 1024u + kv_off;
-                    float s = dot_f32_128(qh, kh_c) * attn_scale;
-                    scores[c] = s;
-                    if (s > max_s) max_s = s;
-                }
-                for (uint32_t j = 0; j <= t; j++) {
-                    const float *kh_j = k_buf + (size_t)j * 1024u + kv_off;
-                    float s = dot_f32_128(qh, kh_j) * attn_scale;
-                    scores[ctx_len + j] = s;
-                    if (s > max_s) max_s = s;
-                }
-
-                float sum_exp = 0.0f;
-                for (uint32_t j = 0; j < total_kv; j++) {
-                    float e = expf(scores[j] - max_s);
-                    scores[j] = e;
-                    sum_exp += e;
-                }
-                float inv_sum = 1.0f / sum_exp;
-
-                float *out_h = heads_out + (size_t)h * ds->head_dim;
-                memset(out_h, 0, ds->head_dim * sizeof(float));
-                for (uint32_t c = 0; c < ctx_len; c++) {
-                    float w = scores[c] * inv_sum;
-                    const float *vh_c = v_ctx_layer + (size_t)c * 1024u + kv_off;
-                    axpy_f32_128(out_h, w, vh_c);
-                }
-                for (uint32_t j = 0; j <= t; j++) {
-                    float w = scores[ctx_len + j] * inv_sum;
-                    const float *vh_j = v_buf + (size_t)j * 1024u + kv_off;
-                    axpy_f32_128(out_h, w, vh_j);
-                }
+        dspine_attn_job_t ajob = {
+            .ds = ds,
+            .k_ctx_layer = ds->ctx_k_cache[l],
+            .v_ctx_layer = ds->ctx_v_cache[l],
+            .q_buf = q_buf,
+            .k_buf = k_buf,
+            .v_buf = v_buf,
+            .attn_in = attn_in,
+            .scores_base = scores,
+            .scores_stride = ds->ctx_kv_cap + MYDS_DSPINE_MAX_BLOCK,
+            .ctx_len = ctx_len,
+            .T = T,
+            .attn_scale = attn_scale,
+        };
+        if (ctx_len >= 64u) {
+            dispatch_apply_f((size_t)ds->num_heads,
+                             dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
+                             &ajob, dspine_attn_head_worker);
+        } else {
+            for (size_t h = 0; h < (size_t)ds->num_heads; h++) {
+                dspine_attn_head_worker(&ajob, h);
             }
         }
 
-        /* 3.5 Out projection on GPU */
-        myds_metal_v41_gemv_batch(ds->attn_out_buf, layer->o_proj, ds->attn_in_buf,
-                                  ds->hidden_size, ds->hidden_size, T, GGML_TYPE_BF16);
+        /* 3.5 Out projection + residual add on GPU */
+        myds_metal_begin_batch();
+        dspine_gemv_batch(ds->attn_out_buf, layer->o_proj, ds->attn_in_buf,
+                          ds->hidden_size, ds->hidden_size, T, layer->o_type);
+        bool add_attn_gpu = myds_metal_add(ds->x_buf, ds->x_buf, ds->attn_out_buf,
+                                           T * ds->hidden_size) != 0;
+        myds_metal_commit_batch();
 
-        /* Residual add + Post-Attention RMSNorm */
+        /* Post-Attention RMSNorm (with fallback residual add if GPU add unavailable) */
         for (uint32_t t = 0; t < T; t++) {
             float *xt = x + (size_t)t * ds->hidden_size;
-            float *at = attn_out + (size_t)t * ds->hidden_size;
-            for (uint32_t d = 0; d < ds->hidden_size; d++) xt[d] += at[d];
+            if (!add_attn_gpu) {
+                float *at = attn_out + (size_t)t * ds->hidden_size;
+                for (uint32_t d = 0; d < ds->hidden_size; d++) xt[d] += at[d];
+            }
             rmsnorm(norm_buf + (size_t)t * ds->hidden_size, xt, post_norm_w, ds->hidden_size, 1e-6f);
         }
 
-        /* 3.6 MLP Gate & Up on GPU */
+        /* 3.6 MLP Gate + Up + SwiGLU + Down + Residual Add + Code Bridge Readout in 1 GPU batch */
         myds_metal_begin_batch();
-        myds_metal_v41_gemv_batch(ds->gate_buf, layer->gate_proj, ds->norm_buf,
-                                  ds->intermediate_size, ds->hidden_size, T, GGML_TYPE_BF16);
-        myds_metal_v41_gemv_batch(ds->up_buf, layer->up_proj, ds->norm_buf,
-                                  ds->intermediate_size, ds->hidden_size, T, GGML_TYPE_BF16);
+        dspine_gemv_batch(ds->gate_buf, layer->gate_proj, ds->norm_buf,
+                          ds->intermediate_size, ds->hidden_size, T, layer->gate_type);
+        dspine_gemv_batch(ds->up_buf, layer->up_proj, ds->norm_buf,
+                          ds->intermediate_size, ds->hidden_size, T, layer->up_type);
+        bool ffn_fused = myds_metal_swiglu(ds->glu_buf, ds->gate_buf, ds->up_buf,
+                                           T * ds->intermediate_size) != 0;
+        if (ffn_fused) {
+            dspine_gemv_batch(ds->ffn_out_buf, layer->down_proj, ds->glu_buf,
+                              ds->hidden_size, ds->intermediate_size, T, layer->down_type);
+            ffn_fused = myds_metal_add(ds->x_buf, ds->x_buf, ds->ffn_out_buf,
+                                       T * ds->hidden_size) != 0;
+            if (ffn_fused) {
+                dspine_gemv_batch(ds->features_buf, ds->injection_readouts[l], ds->x_buf,
+                                  512, ds->hidden_size, T, ds->injection_readout_types[l]);
+            }
+        }
         myds_metal_commit_batch();
 
-        /* SwiGLU on CPU */
-        for (uint32_t t = 0; t < T; t++) {
-            swiglu(glu_ptr + (size_t)t * ds->intermediate_size,
-                   gate_ptr + (size_t)t * ds->intermediate_size,
-                   up_ptr + (size_t)t * ds->intermediate_size,
-                   ds->intermediate_size);
-        }
-
-        /* Down projection on GPU */
-        myds_metal_v41_gemv_batch(ds->ffn_out_buf, layer->down_proj, ds->glu_buf,
-                                  ds->hidden_size, ds->intermediate_size, T, GGML_TYPE_BF16);
-
-        /* Residual add */
-        for (uint32_t t = 0; t < T; t++) {
-            float *xt = x + (size_t)t * ds->hidden_size;
-            float *ft = ffn_out + (size_t)t * ds->hidden_size;
-            for (uint32_t d = 0; d < ds->hidden_size; d++) xt[d] += ft[d];
+        if (!ffn_fused) {
+            for (uint32_t t = 0; t < T; t++) {
+                swiglu(glu_ptr + (size_t)t * ds->intermediate_size,
+                       gate_ptr + (size_t)t * ds->intermediate_size,
+                       up_ptr + (size_t)t * ds->intermediate_size,
+                       ds->intermediate_size);
+            }
+            dspine_gemv_batch(ds->ffn_out_buf, layer->down_proj, ds->glu_buf,
+                              ds->hidden_size, ds->intermediate_size, T, layer->down_type);
+            for (uint32_t t = 0; t < T; t++) {
+                float *xt = x + (size_t)t * ds->hidden_size;
+                float *ft = ffn_out + (size_t)t * ds->hidden_size;
+                for (uint32_t d = 0; d < ds->hidden_size; d++) xt[d] += ft[d];
+            }
+            dspine_gemv_batch(ds->features_buf, ds->injection_readouts[l], ds->x_buf,
+                              512, ds->hidden_size, T, ds->injection_readout_types[l]);
         }
 
         /* Save final layer pre_injection before AdjacentInjection for discrete refinement tail */
         if (l + 1u == ds->num_layers) {
             memcpy(ds->pre_injection_l2, x, (size_t)T * ds->hidden_size * sizeof(float));
         }
-
-        /* 3.7 Code Bridge: Readout projection on GPU */
-        myds_metal_v41_gemv_batch(ds->features_buf, ds->injection_readouts[l], ds->x_buf,
-                                  512, ds->hidden_size, T, GGML_TYPE_BF16);
 
         /* Exact L2 normalization * sqrt(512) matching SpecForge AdjacentInjection.feature */
         float sqrt_rank = sqrtf(512.0f);

@@ -34,6 +34,14 @@ typedef struct {
     myds_metal_buffer_t *gate_proj;
     myds_metal_buffer_t *up_proj;
     myds_metal_buffer_t *down_proj;
+
+    ggml_type            q_type;
+    ggml_type            k_type;
+    ggml_type            v_type;
+    ggml_type            o_type;
+    ggml_type            gate_type;
+    ggml_type            up_type;
+    ggml_type            down_type;
 } myds_dspine_layer_t;
 
 /* Complete DSpine runtime state */
@@ -56,12 +64,14 @@ typedef struct myds_dspine_s {
 
     /* Model Weights */
     myds_metal_buffer_t *fc_proj;       /* [5120, 25600] */
+    ggml_type            fc_type;
     myds_metal_buffer_t *hidden_norm;   /* [5120] */
     myds_dspine_layer_t  layers[MYDS_DSPINE_LAYERS];
     myds_metal_buffer_t *final_norm;    /* [5120] */
 
     /* Code Bridge (Adjacent Causal Injection) */
     myds_metal_buffer_t *injection_readouts[MYDS_DSPINE_LAYERS]; /* [512, 5120] */
+    ggml_type            injection_readout_types[MYDS_DSPINE_LAYERS];
     myds_metal_buffer_t *injection_message;                      /* [256, 512] */
     myds_metal_buffer_t *injection_writes[MYDS_DSPINE_LAYERS];   /* [5120, 256] */
     myds_metal_buffer_t *injection_pred_gate;                    /* [256, 512] */
@@ -107,8 +117,10 @@ typedef struct myds_dspine_s {
     /* Batched context KV projection buffers */
     myds_metal_buffer_t *batch_th_buf;    /* [CTX_BATCH_CAP * 25600 * sizeof(float)] */
     myds_metal_buffer_t *batch_ctx_buf;   /* [CTX_BATCH_CAP * 5120 * sizeof(float)] */
-    myds_metal_buffer_t *batch_k_ctx_buf; /* [CTX_BATCH_CAP * 1024 * sizeof(float)] */
-    myds_metal_buffer_t *batch_v_ctx_buf; /* [CTX_BATCH_CAP * 1024 * sizeof(float)] */
+    myds_metal_buffer_t *batch_k_ctx_buf; /* [3 * CTX_BATCH_CAP * 1024 * sizeof(float)] */
+    myds_metal_buffer_t *batch_v_ctx_buf; /* [3 * CTX_BATCH_CAP * 1024 * sizeof(float)] */
+    myds_metal_buffer_t *batch_k_views[MYDS_DSPINE_LAYERS];
+    myds_metal_buffer_t *batch_v_views[MYDS_DSPINE_LAYERS];
 
     /* Full Context KV Cache across all prior context tokens [0 .. anchor_pos - 1] */
     float   *ctx_k_cache[MYDS_DSPINE_LAYERS]; /* [cap * 1024] */
