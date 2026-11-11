@@ -4334,11 +4334,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                 uint32_t spec_pos = ctx->pos;
                 const double verify_start = decode_now_ms();
                 int ret = myds_v41_forward_batch_spec_ex(ctx, tokens_to_forward, n_fwd, spec_pos, out_tokens, snap);
-                const double verify_elapsed = decode_now_ms() - verify_start;
-                ctx->decode_stats.verify_ms += verify_elapsed;
-                if (ctx->dspine && ctx->dspine->enabled && !ctx->decode_pld_candidate) {
-                    ctx->dspine->verify_ms += verify_elapsed;
-                }
+                ctx->decode_stats.verify_ms += decode_now_ms() - verify_start;
                 snap_saved = snap->valid;
                 if (ret < 0 || out_tokens[0] < 0 || (uint32_t)out_tokens[0] >= m->tokenizer->vocab_size) {
                     if (snap_saved) myds_v41_spec_snapshot_restore(ctx, snap);
