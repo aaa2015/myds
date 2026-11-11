@@ -4820,6 +4820,22 @@ int myds_metal_gemv_batch(
             }
             if (!pipeline) pipeline = g_pso_mul_mv_q4_K;
         }
+    } else if (weight_type == GGML_TYPE_IQ2_XXS) {
+        if (in_dim % 256u) return 0;
+        block_bytes = 66;
+        row_bytes = (uint64_t)(in_dim / 256u) * block_bytes;
+        nsg = 2u;
+        q4_nr0 = 4u;
+        NSString *key = @"iq2_xxs_2_4";
+        pipeline = g_native_pipelines[key];
+        if (!pipeline) {
+            id<MTLFunction> fn = [g_library newFunctionWithName:@"kernel_mul_mv_iq2_xxs_dense_f32"];
+            if (fn) {
+                pipeline = [g_device newComputePipelineStateWithFunction:fn error:nil];
+                if (!g_native_pipelines) g_native_pipelines = [NSMutableDictionary new];
+                if (pipeline) g_native_pipelines[key] = pipeline;
+            }
+        }
     } else if (weight_type == GGML_TYPE_F32) {
         pipeline = g_pso_mul_mv_f32;
         block_bytes = sizeof(float);
@@ -4860,7 +4876,7 @@ int myds_metal_gemv_batch(
             args.nb11 = (uint64_t)in_dim * sizeof(float);
             args.nb12 = (uint64_t)in_dim * n_tok * sizeof(float);
             args.nb13 = args.nb12;
-            const uint32_t nr0 = (weight_type == GGML_TYPE_Q4_K) ? q4_nr0 : 2u;
+            const uint32_t nr0 = (weight_type == GGML_TYPE_Q4_K || weight_type == GGML_TYPE_IQ2_XXS) ? q4_nr0 : 2u;
             args.ne0 = (int32_t)out_dim;
             args.ne1 = (int32_t)n_tok;
             args.nr0 = (int16_t)nr0;
@@ -4874,9 +4890,14 @@ int myds_metal_gemv_batch(
             [enc setBuffer:W->mtl_buf offset:W->offset atIndex:1];
             [enc setBuffer:x->mtl_buf offset:x->offset atIndex:2];
             [enc setBuffer:y->mtl_buf offset:y->offset atIndex:3];
-            [enc setThreadgroupMemoryLength:32 * nr0 * sizeof(float) atIndex:0];
+            const NSUInteger shmem_len = (weight_type == GGML_TYPE_IQ2_XXS) ? 2304u : (32u * nr0 * sizeof(float));
+            [enc setThreadgroupMemoryLength:shmem_len atIndex:0];
             /* Each token retains the single-vector lane assignment/reduction. */
-            if (weight_type == GGML_TYPE_Q4_K) {
+            if (weight_type == GGML_TYPE_IQ2_XXS) {
+                NSUInteger ngr = ((NSUInteger)out_dim + nsg * nr0 - 1) / (nsg * nr0);
+                metal_dispatch(enc, "gemv_iq2_xxs_batch", MTLSizeMake(ngr, n_tok, 1),
+                    MTLSizeMake(32, nsg, 1));
+            } else if (weight_type == GGML_TYPE_Q4_K) {
                 NSUInteger ngr = ((NSUInteger)out_dim + nsg * nr0 - 1) / (nsg * nr0);
                 metal_dispatch(enc, "gemv_q4_k_batch", MTLSizeMake(ngr, n_tok, 1),
                     MTLSizeMake(32, nsg, 1));

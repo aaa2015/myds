@@ -198,11 +198,127 @@ static inline float dot_q8_0_f32(const uint8_t *row_bytes, const float *x, uint3
     return total;
 }
 
+/* Exact GGML IQ2_XXS row dot product (66 bytes per 256 elements) */
+static const uint8_t dspine_ksigns_iq2xs[128] = {
+      0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
+    144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,
+    160,  33,  34, 163,  36, 165, 166,  39,  40, 169, 170,  43, 172,  45,  46, 175,
+     48, 177, 178,  51, 180,  53,  54, 183, 184,  57,  58, 187,  60, 189, 190,  63,
+    192,  65,  66, 195,  68, 197, 198,  71,  72, 201, 202,  75, 204,  77,  78, 207,
+     80, 209, 210,  83, 212,  85,  86, 215, 216,  89,  90, 219,  92, 221, 222,  95,
+     96, 225, 226,  99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
+    240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
+};
+
+static const uint64_t dspine_iq2xxs_grid[256] = {
+    0x0808080808080808ULL, 0x080808080808082bULL, 0x0808080808081919ULL, 0x0808080808082b08ULL,
+    0x0808080808082b2bULL, 0x0808080808190819ULL, 0x0808080808191908ULL, 0x08080808082b0808ULL,
+    0x08080808082b082bULL, 0x08080808082b2b08ULL, 0x08080808082b2b2bULL, 0x0808080819080819ULL,
+    0x0808080819081908ULL, 0x0808080819190808ULL, 0x0808080819192b08ULL, 0x08080808192b0819ULL,
+    0x08080808192b1908ULL, 0x080808082b080808ULL, 0x080808082b08082bULL, 0x080808082b082b2bULL,
+    0x080808082b2b082bULL, 0x0808081908080819ULL, 0x0808081908081908ULL, 0x0808081908190808ULL,
+    0x0808081908191919ULL, 0x0808081919080808ULL, 0x080808192b081908ULL, 0x080808192b192b08ULL,
+    0x0808082b08080808ULL, 0x0808082b0808082bULL, 0x0808082b082b082bULL, 0x0808082b2b08082bULL,
+    0x0808190808080819ULL, 0x0808190808081908ULL, 0x0808190808190808ULL, 0x08081908082b0819ULL,
+    0x08081908082b1908ULL, 0x0808190819080808ULL, 0x080819081908082bULL, 0x0808190819082b08ULL,
+    0x08081908192b0808ULL, 0x080819082b080819ULL, 0x080819082b081908ULL, 0x080819082b190808ULL,
+    0x080819082b2b1908ULL, 0x0808191908080808ULL, 0x080819190808082bULL, 0x0808191908082b08ULL,
+    0x08081919082b0808ULL, 0x080819191908192bULL, 0x08081919192b2b19ULL, 0x080819192b080808ULL,
+    0x080819192b190819ULL, 0x0808192b08082b19ULL, 0x0808192b08190808ULL, 0x0808192b19080808ULL,
+    0x0808192b2b081908ULL, 0x0808192b2b2b1908ULL, 0x08082b0808080808ULL, 0x08082b0808081919ULL,
+    0x08082b0808082b08ULL, 0x08082b0808191908ULL, 0x08082b08082b2b08ULL, 0x08082b0819080819ULL,
+    0x08082b0819081908ULL, 0x08082b0819190808ULL, 0x08082b081919082bULL, 0x08082b082b082b08ULL,
+    0x08082b1908081908ULL, 0x08082b1919080808ULL, 0x08082b2b0808082bULL, 0x08082b2b08191908ULL,
+    0x0819080808080819ULL, 0x0819080808081908ULL, 0x0819080808190808ULL, 0x08190808082b0819ULL,
+    0x0819080819080808ULL, 0x08190808192b0808ULL, 0x081908082b081908ULL, 0x081908082b190808ULL,
+    0x081908082b191919ULL, 0x0819081908080808ULL, 0x0819081908082b08ULL, 0x08190819082b0808ULL,
+    0x0819081919190808ULL, 0x0819081919192b2bULL, 0x081908192b080808ULL, 0x0819082b082b1908ULL,
+    0x0819082b19081919ULL, 0x0819190808080808ULL, 0x0819190808082b08ULL, 0x08191908082b0808ULL,
+    0x08191908082b1919ULL, 0x0819190819082b19ULL, 0x081919082b080808ULL, 0x0819191908192b08ULL,
+    0x08191919192b082bULL, 0x0819192b08080808ULL, 0x0819192b0819192bULL, 0x08192b0808080819ULL,
+    0x08192b0808081908ULL, 0x08192b0808190808ULL, 0x08192b0819080808ULL, 0x08192b082b080819ULL,
+    0x08192b1908080808ULL, 0x08192b1908081919ULL, 0x08192b192b2b0808ULL, 0x08192b2b19190819ULL,
+    0x082b080808080808ULL, 0x082b08080808082bULL, 0x082b080808082b2bULL, 0x082b080819081908ULL,
+    0x082b0808192b0819ULL, 0x082b08082b080808ULL, 0x082b08082b08082bULL, 0x082b0819082b2b19ULL,
+    0x082b081919082b08ULL, 0x082b082b08080808ULL, 0x082b082b0808082bULL, 0x082b190808080819ULL,
+    0x082b190808081908ULL, 0x082b190808190808ULL, 0x082b190819080808ULL, 0x082b19081919192bULL,
+    0x082b191908080808ULL, 0x082b191919080819ULL, 0x082b1919192b1908ULL, 0x082b192b2b190808ULL,
+    0x082b2b0808082b08ULL, 0x082b2b08082b0808ULL, 0x082b2b082b191908ULL, 0x082b2b2b19081908ULL,
+    0x1908080808080819ULL, 0x1908080808081908ULL, 0x1908080808190808ULL, 0x1908080808192b08ULL,
+    0x19080808082b0819ULL, 0x19080808082b1908ULL, 0x1908080819080808ULL, 0x1908080819082b08ULL,
+    0x190808081919192bULL, 0x19080808192b0808ULL, 0x190808082b080819ULL, 0x190808082b081908ULL,
+    0x190808082b190808ULL, 0x1908081908080808ULL, 0x19080819082b0808ULL, 0x19080819192b0819ULL,
+    0x190808192b080808ULL, 0x190808192b081919ULL, 0x1908082b08080819ULL, 0x1908082b08190808ULL,
+    0x1908082b19082b08ULL, 0x1908082b1919192bULL, 0x1908082b192b2b08ULL, 0x1908190808080808ULL,
+    0x1908190808082b08ULL, 0x19081908082b0808ULL, 0x190819082b080808ULL, 0x190819082b192b19ULL,
+    0x190819190819082bULL, 0x19081919082b1908ULL, 0x1908192b08080808ULL, 0x19082b0808080819ULL,
+    0x19082b0808081908ULL, 0x19082b0808190808ULL, 0x19082b0819080808ULL, 0x19082b0819081919ULL,
+    0x19082b1908080808ULL, 0x19082b1919192b08ULL, 0x19082b19192b0819ULL, 0x19082b192b08082bULL,
+    0x19082b2b19081919ULL, 0x19082b2b2b190808ULL, 0x1919080808080808ULL, 0x1919080808082b08ULL,
+    0x1919080808190819ULL, 0x1919080808192b19ULL, 0x19190808082b0808ULL, 0x191908082b080808ULL,
+    0x191908082b082b08ULL, 0x1919081908081908ULL, 0x191908191908082bULL, 0x191908192b2b1908ULL,
+    0x1919082b2b190819ULL, 0x191919082b190808ULL, 0x191919082b19082bULL, 0x1919191908082b2bULL,
+    0x1919192b08080819ULL, 0x1919192b19191908ULL, 0x19192b0808080808ULL, 0x19192b0808190819ULL,
+    0x19192b0808192b19ULL, 0x19192b08192b1908ULL, 0x19192b1919080808ULL, 0x19192b2b08082b08ULL,
+    0x192b080808081908ULL, 0x192b080808190808ULL, 0x192b080819080808ULL, 0x192b0808192b2b08ULL,
+    0x192b081908080808ULL, 0x192b081919191919ULL, 0x192b082b08192b08ULL, 0x192b082b192b0808ULL,
+    0x192b190808080808ULL, 0x192b190808081919ULL, 0x192b191908190808ULL, 0x192b19190819082bULL,
+    0x192b19192b081908ULL, 0x192b2b081908082bULL, 0x2b08080808080808ULL, 0x2b0808080808082bULL,
+    0x2b08080808082b2bULL, 0x2b08080819080819ULL, 0x2b0808082b08082bULL, 0x2b08081908081908ULL,
+    0x2b08081908192b08ULL, 0x2b08081919080808ULL, 0x2b08082b08190819ULL, 0x2b08190808080819ULL,
+    0x2b08190808081908ULL, 0x2b08190808190808ULL, 0x2b08190808191919ULL, 0x2b08190819080808ULL,
+    0x2b081908192b0808ULL, 0x2b08191908080808ULL, 0x2b0819191908192bULL, 0x2b0819192b191908ULL,
+    0x2b08192b08082b19ULL, 0x2b08192b19080808ULL, 0x2b08192b192b0808ULL, 0x2b082b080808082bULL,
+    0x2b082b1908081908ULL, 0x2b082b2b08190819ULL, 0x2b19080808081908ULL, 0x2b19080808190808ULL,
+    0x2b190808082b1908ULL, 0x2b19080819080808ULL, 0x2b1908082b2b0819ULL, 0x2b1908190819192bULL,
+    0x2b1908192b080808ULL, 0x2b19082b19081919ULL, 0x2b19190808080808ULL, 0x2b191908082b082bULL,
+    0x2b19190819081908ULL, 0x2b19191919190819ULL, 0x2b192b082b080819ULL, 0x2b192b19082b0808ULL,
+    0x2b2b08080808082bULL, 0x2b2b080819190808ULL, 0x2b2b08082b081919ULL, 0x2b2b081908082b19ULL,
+    0x2b2b082b08080808ULL, 0x2b2b190808192b08ULL, 0x2b2b2b0819190808ULL, 0x2b2b2b1908081908ULL,
+};
+
+static inline float dot_iq2_xxs_f32(const uint8_t *row_bytes, const float *x, uint32_t cols) {
+    const uint32_t n_blocks = cols / 256u;
+    float total = 0.0f;
+    for (uint32_t b = 0; b < n_blocks; b++) {
+        const uint8_t *bp = row_bytes + (size_t)b * 66u;
+        uint16_t d_fp16;
+        memcpy(&d_fp16, bp, sizeof(uint16_t));
+        const float db = myds_fp16_to_fp32(d_fp16);
+        const uint16_t *qs = (const uint16_t *)(bp + 2);
+        const float *xb = x + (size_t)b * 256u;
+        for (int ib = 0; ib < 8; ib++) {
+            const uint16_t *q2 = qs + 4 * ib;
+            const uint8_t *aux8 = (const uint8_t *)q2;
+            const uint32_t aux32 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+            const float dl = db * (0.5f + (float)(aux32 >> 28)) * 0.25f;
+            const float *yl = xb + 32 * ib;
+            float sub = 0.0f;
+            for (int l = 0; l < 4; l++) {
+                const uint64_t g64 = dspine_iq2xxs_grid[aux8[l]];
+                const uint8_t signs = dspine_ksigns_iq2xs[(aux32 >> (7 * l)) & 127u];
+                for (int j = 0; j < 8; j++) {
+                    const float g = (float)((g64 >> (8 * j)) & 0xFFu);
+                    const float s = (signs & (1u << j)) ? -1.0f : 1.0f;
+                    sub += yl[8 * l + j] * g * s;
+                }
+            }
+            total += dl * sub;
+        }
+    }
+    return total;
+}
+
 static bool score_output_row_cpu(const myds_model_t *m, uint32_t vocab_idx,
                                  const float *x, uint32_t cols, float *out_score) {
     const uint8_t *base = (const uint8_t *)myds_metal_buffer_data(m->output);
     if (!base) return false;
     switch (m->output_type) {
+        case GGML_TYPE_IQ2_XXS: {
+            size_t row_bytes = ((size_t)cols / 256u) * 66u;
+            *out_score = dot_iq2_xxs_f32(base + (size_t)vocab_idx * row_bytes, x, cols);
+            return true;
+        }
         case GGML_TYPE_Q4_K: {
             size_t row_bytes = ((size_t)cols / 256u) * 144u;
             *out_score = dot_q4_K_f32(base + (size_t)vocab_idx * row_bytes, x, cols);
@@ -245,7 +361,12 @@ static void matvec_bf16(float *out, const uint16_t *W, const float *x,
 static void matvec_typed(float *out, const myds_metal_buffer_t *W_buf, ggml_type wtype,
                          const float *x, uint32_t rows, uint32_t cols) {
     const uint8_t *base = (const uint8_t *)myds_metal_buffer_data((myds_metal_buffer_t *)W_buf);
-    if (wtype == GGML_TYPE_Q4_K) {
+    if (wtype == GGML_TYPE_IQ2_XXS) {
+        size_t row_bytes = ((size_t)cols / 256u) * 66u;
+        for (uint32_t r = 0; r < rows; r++) {
+            out[r] = dot_iq2_xxs_f32(base + (size_t)r * row_bytes, x, cols);
+        }
+    } else if (wtype == GGML_TYPE_Q4_K) {
         size_t row_bytes = ((size_t)cols / 256u) * 144u;
         for (uint32_t r = 0; r < rows; r++) {
             out[r] = dot_q4_K_f32(base + (size_t)r * row_bytes, x, cols);
@@ -265,6 +386,9 @@ static inline int dspine_gemv_batch(myds_metal_buffer_t *out,
                                     const myds_metal_buffer_t *input,
                                     uint32_t out_dim, uint32_t in_dim,
                                     uint32_t n_tok, ggml_type wtype) {
+    if (wtype == GGML_TYPE_IQ2_XXS) {
+        return myds_metal_gemv_batch(out, weight, input, out_dim, in_dim, n_tok, wtype);
+    }
     if (wtype == GGML_TYPE_Q4_K || wtype == GGML_TYPE_Q8_0) {
         if (n_tok >= 16u) {
             return myds_metal_mul_mm(out, weight, input, out_dim, in_dim, n_tok, wtype);
@@ -450,12 +574,15 @@ static myds_metal_buffer_t *load_matrix_tensor(const char *data_base,
     size_t nbytes = 0;
     myds_metal_buffer_t *buf = load_tensor_ex(data_base, json, json_len, name, &nbytes);
     if (!buf) return NULL;
-    const size_t bf16_bytes = (size_t)rows * cols * 2u;
-    const size_t q4k_bytes  = (cols % 256u == 0) ? (size_t)rows * (cols / 256u) * 144u : 0u;
-    const size_t q80_bytes  = (cols % 32u == 0)  ? (size_t)rows * (cols / 32u)  * 34u  : 0u;
-    const size_t f32_bytes  = (size_t)rows * cols * 4u;
+    const size_t bf16_bytes   = (size_t)rows * cols * 2u;
+    const size_t iq2xxs_bytes = (cols % 256u == 0) ? (size_t)rows * (cols / 256u) * 66u  : 0u;
+    const size_t q4k_bytes    = (cols % 256u == 0) ? (size_t)rows * (cols / 256u) * 144u : 0u;
+    const size_t q80_bytes    = (cols % 32u == 0)  ? (size_t)rows * (cols / 32u)  * 34u  : 0u;
+    const size_t f32_bytes    = (size_t)rows * cols * 4u;
     if (nbytes == bf16_bytes) {
         *out_type = GGML_TYPE_BF16;
+    } else if (iq2xxs_bytes && nbytes == iq2xxs_bytes) {
+        *out_type = GGML_TYPE_IQ2_XXS;
     } else if (q4k_bytes && nbytes == q4k_bytes) {
         *out_type = GGML_TYPE_Q4_K;
     } else if (q80_bytes && nbytes == q80_bytes) {

@@ -4078,9 +4078,13 @@ static int myds_generate_internal(myds_context_t *ctx,
             }
 
             /* Linear depth 2 needs room for the seed and both draft inputs.
-             * Short tails retain the depth-1 verifier and its bonus output. */
-            const bool linear_room = (dspark_depth == 2u || ctx->dspine != NULL) && max_gen - step >= 3u &&
-                ctx->cfg.max_seq_len - ctx->pos >= 3u;
+             * Default DSpine uses 1-token draft (Batch-2 fast verifier);
+             * MYDS_DSPINE_BLOCK_SIZE=3 explicitly selects 2-token linear depth 2. */
+            const uint32_t dspine_depth = (ctx->dspine && ctx->dspine->block_size == 3u) ? 2u : 1u;
+            const bool linear_room = (dspark_depth == 2u || (ctx->dspine != NULL && dspine_depth >= 2u)) &&
+                max_gen - step >= 3u && ctx->cfg.max_seq_len - ctx->pos >= 3u;
+            const bool dspine_room = linear_room || (ctx->dspine != NULL &&
+                max_gen - step >= 2u && ctx->cfg.max_seq_len - ctx->pos >= 2u);
             uint32_t draft_cap = ctx->v41 ? (linear_room ? 2u : 1u) :
                 (ctx->dspark ? ctx->dspark->block_size : 4);
             if (draft_cap > max_gen - step) draft_cap = max_gen - step;
@@ -4090,14 +4094,15 @@ static int myds_generate_internal(myds_context_t *ctx,
             uint32_t neural_count = 0;
 
             const bool cost_skip = decode_cost_skip(ctx) || (!serial_probe && max_gen - step < 2);
-            if (ctx->dspine && ctx->dspine->enabled && linear_room && myds_dspine_capture_ready(ctx->dspine)) {
+            if (ctx->dspine && ctx->dspine->enabled && !cost_skip && dspine_room && myds_dspine_capture_ready(ctx->dspine)) {
                 const uint64_t before_cycles = ctx->dspine->cycles;
                 const uint64_t before_proposed = ctx->dspine->proposed_tokens;
                 const double draft_start = ctx->decode_stats.timing_enabled ? decode_now_ms() : 0.0;
-                uint32_t n_dspine = myds_dspine_propose(ctx->dspine, ctx, cur_token, 2);
+                const uint32_t req_draft = linear_room ? 2u : 1u;
+                uint32_t n_dspine = myds_dspine_propose(ctx->dspine, ctx, cur_token, req_draft);
                 ctx->decode_stats.draft_cycles += ctx->dspine->cycles - before_cycles;
                 ctx->decode_stats.draft_proposed += ctx->dspine->proposed_tokens - before_proposed;
-                if (n_dspine >= 2) {
+                if (n_dspine >= req_draft) {
                     neural_count = n_dspine;
                     cand_a = ctx->dspine->draft_tokens[0];
                     ctx->decode_cycle_speculative = true;
@@ -4136,7 +4141,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                         cand_a = pld_draft[0];
                         ctx->decode_pld_candidate = true;
                     }
-                } else if (dspark_depth == 1u && cand_b < 0) {
+                } else if (ctx->dspark && dspark_depth == 1u && cand_b < 0) {
                     int32_t pld_draft[MYDS_PLD_DEFAULT_MAX_DRAFT];
                     myds_pld_config_t pld_cfg = myds_pld_default_config(m->tokenizer->eos_id);
                     uint32_t n_pld = decode_pld_propose(ctx, pld_history, pld_len, &pld_cfg, pld_draft);
@@ -4389,6 +4394,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                         spec_adaptive_update(ctx, ctx->spec_last_pld_bucket, true);
                     } else {
                         if (ctx->dspark) ctx->dspark->accepted_tokens++;
+                        else if (ctx->dspine) myds_dspine_rollback(ctx->dspine, 1u);
                         ctx->decode_stats.draft_accepted++;
                     }
                     if (!accepted_from_pld) accepted_in_cycle++;
@@ -4418,6 +4424,7 @@ static int myds_generate_internal(myds_context_t *ctx,
 
                     if (out_tokens[0] == m->tokenizer->eos_id) {
                         if (snap_saved) myds_v41_spec_snapshot_restore_partial(ctx, snap, 1);
+                        if (ctx->dspine && ctx->dspine->enabled) myds_dspine_capture_select_row(ctx->dspine, spec_pos, 0u);
                         ctx->pos = spec_pos + 1u;
                         stop_reason = MYDS_STOP_EOS;
                         break;
@@ -4425,6 +4432,7 @@ static int myds_generate_internal(myds_context_t *ctx,
 
                     if (step >= max_gen) {
                         if (snap_saved) myds_v41_spec_snapshot_restore_partial(ctx, snap, 1);
+                        if (ctx->dspine && ctx->dspine->enabled) myds_dspine_capture_select_row(ctx->dspine, spec_pos, 0u);
                         ctx->pos = spec_pos + 1u;
                         break;
                     }
@@ -4435,6 +4443,7 @@ static int myds_generate_internal(myds_context_t *ctx,
                             stop_reason = MYDS_STOP_ERROR;
                             success = 0;
                         } else {
+                            if (ctx->dspine && ctx->dspine->enabled) myds_dspine_capture_select_row(ctx->dspine, spec_pos, 0u);
                             stop_reason = MYDS_STOP_CANCELLED;
                         }
                         ctx->pos = spec_pos + 1u;

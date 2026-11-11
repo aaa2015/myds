@@ -5635,6 +5635,11 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
                 }
             }
         }
+        if (ctx->dspine && ctx->dspine->enabled) {
+            for (uint32_t t = 0; t < 2u; ++t) {
+                CHECK(myds_dspine_capture_target_spec_layer(ctx->dspine, il, t, ws->v_residual[t]));
+            }
+        }
 
         if (!trace_gpu && decode_split && il + 1u < V41_LAYERS &&
             ((il + 1u) * (uint32_t)decode_split) / V41_LAYERS != (il * (uint32_t)decode_split) / V41_LAYERS) {
@@ -5721,6 +5726,7 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         CHECK(v41_copy_dspark_slots(ctx, ws->dspark_slots[1]));
         CHECK(myds_metal_flush_batch());
         myds_dspark_capture_publish(ctx->dspark);
+        if (ctx->dspine && ctx->dspine->enabled) myds_dspine_capture_select_row(ctx->dspine, pos, 1u);
 
         myds_metal_set_auto_barrier(prev_auto_barrier);
         if (g->engram) {
@@ -5748,6 +5754,7 @@ static int v41_forward_batch2(myds_context_t *ctx, const int32_t *tokens,
         CHECK(v41_copy_dspark_slots(ctx, ws->dspark_slots[0]));
         CHECK(myds_metal_flush_batch());
         myds_dspark_capture_publish(ctx->dspark);
+        if (ctx->dspine && ctx->dspine->enabled) myds_dspine_capture_select_row(ctx->dspine, pos, 0u);
 
         myds_metal_set_auto_barrier(prev_auto_barrier);
         if (g->engram) {
@@ -6581,8 +6588,12 @@ bool myds_v41_linear_spec_retry_ready(const myds_context_t *ctx,
 }
 
 bool myds_v41_batch2_spec_requested(const myds_context_t *ctx) {
+    if (!ctx || ctx->img_emb_n != 0) return false;
     const char *e = getenv("MYDS_BATCH2_SPEC");
-    if (!ctx || !e || atoi(e) == 0 || ctx->img_emb_n != 0) return false;
+    if (ctx->dspine && ctx->dspine->enabled) {
+        return !e || atoi(e) != 0;
+    }
+    if (!e || atoi(e) == 0) return false;
     if (atoi(e) >= 2 || getenv("MYDS_BATCH2_SPEC_FORCE")) return true;
     return ctx->cfg.temperature <= 0.0f;
 }
