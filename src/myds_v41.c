@@ -6589,10 +6589,10 @@ bool myds_v41_linear_spec_retry_ready(const myds_context_t *ctx,
 
 bool myds_v41_batch2_spec_requested(const myds_context_t *ctx) {
     if (!ctx || ctx->img_emb_n != 0) return false;
-    const char *e = getenv("MYDS_BATCH2_SPEC");
     if (ctx->dspine && ctx->dspine->enabled) {
-        return !e || atoi(e) != 0;
+        return true;
     }
+    const char *e = getenv("MYDS_BATCH2_SPEC");
     if (!e || atoi(e) == 0) return false;
     if (atoi(e) >= 2 || getenv("MYDS_BATCH2_SPEC_FORCE")) return true;
     return ctx->cfg.temperature <= 0.0f;

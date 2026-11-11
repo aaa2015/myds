@@ -43,7 +43,7 @@ static const myds_knob_t myds_knobs_generated[] = {
     {"MYDS_BATCH2_Q4_SHARED", "src/myds_metal.m", 762, 1},
     {"MYDS_BATCH2_Q8_SHARED", "src/myds_metal.m", 754, 1},
     {"MYDS_BATCH2_SHARED", "src/myds_metal.m", 763, 1},
-    {"MYDS_BATCH2_SPEC", "src/myds_v41.c", 6592, 1},
+    {"MYDS_BATCH2_SPEC", "src/myds_v41.c", 6595, 1},
     {"MYDS_BATCH2_SPEC_FORCE", "src/myds_v41.c", 6597, 1},
     {"MYDS_BATCH2_TRACE_GPU", "src/myds_v41.c", 5432, 1},
     {"MYDS_BATCH_TRACE_PREFIX", "src/myds_engine.c", 2333, 1},
