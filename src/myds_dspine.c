@@ -266,7 +266,7 @@ static inline int dspine_gemv_batch(myds_metal_buffer_t *out,
                                     uint32_t out_dim, uint32_t in_dim,
                                     uint32_t n_tok, ggml_type wtype) {
     if (wtype == GGML_TYPE_Q4_K || wtype == GGML_TYPE_Q8_0) {
-        if (n_tok >= 8u) {
+        if (n_tok >= 16u) {
             return myds_metal_mul_mm(out, weight, input, out_dim, in_dim, n_tok, wtype);
         }
         return myds_metal_gemv_batch(out, weight, input, out_dim, in_dim, n_tok, wtype);
@@ -880,6 +880,31 @@ bool myds_dspine_append_context_batch(myds_dspine_t *ds,
         memcpy(th_gpu, target_hidden_batch + (size_t)off * MYDS_DSPINE_TARGET_DIM,
                (size_t)cur * MYDS_DSPINE_TARGET_DIM * sizeof(float));
 
+        /* kernel_mul_mm stages RHS activations in FP16 (max 65504), whereas unnormalized
+         * DeepSeek-V4.1 residual taps at BOS/sink positions reach ~2.8e5. Prescale rows
+         * by an exact power-of-2 before mul_mm and undo before rmsnorm. */
+        float row_restore[MYDS_DSPINE_CTX_BATCH_CAP];
+        const bool need_fp16_guard = (cur >= 16u) &&
+            (ds->fc_type == GGML_TYPE_Q4_K || ds->fc_type == GGML_TYPE_Q8_0);
+        for (uint32_t i = 0; i < cur; i++) {
+            row_restore[i] = 1.0f;
+            if (!need_fp16_guard) continue;
+            float *row = th_gpu + (size_t)i * MYDS_DSPINE_TARGET_DIM;
+            float max_a = 0.0f;
+            for (uint32_t d = 0; d < MYDS_DSPINE_TARGET_DIM; d++) {
+                float a = fabsf(row[d]);
+                if (a > max_a) max_a = a;
+            }
+            if (max_a > 1024.0f) {
+                int exp_val = 0;
+                (void)frexpf(max_a / 1024.0f, &exp_val);
+                float restore = ldexpf(1.0f, exp_val);
+                float inv_s = 1.0f / restore;
+                for (uint32_t d = 0; d < MYDS_DSPINE_TARGET_DIM; d++) row[d] *= inv_s;
+                row_restore[i] = restore;
+            }
+        }
+
         /* 1. fc_proj [5120, 25600] @ th_gpu [cur, 25600] -> ctx_gpu [cur, 5120] */
         if (!dspine_gemv_batch(ds->batch_ctx_buf, ds->fc_proj, ds->batch_th_buf,
                                ds->hidden_size, MYDS_DSPINE_TARGET_DIM, cur, ds->fc_type)) {
@@ -887,6 +912,10 @@ bool myds_dspine_append_context_batch(myds_dspine_t *ds,
         }
         for (uint32_t i = 0; i < cur; i++) {
             float *cf = ctx_gpu + (size_t)i * ds->hidden_size;
+            if (row_restore[i] != 1.0f) {
+                float rs = row_restore[i];
+                for (uint32_t d = 0; d < ds->hidden_size; d++) cf[d] *= rs;
+            }
             rmsnorm(cf, cf, hn_w, ds->hidden_size, 1e-6f);
         }
 
