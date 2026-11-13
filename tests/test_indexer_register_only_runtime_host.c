@@ -42,7 +42,7 @@ int myds_metal_dispatch_kernel(const char *name,const void *args,size_t size,
 }
 struct fixture {struct myds_v41_gpu_scratch s;struct myds_metal_buffer y,q,w,k;uint32_t nc,nt,start,ratio;bool bf16;};
 static void configure(struct fixture *f,uint32_t nc,uint32_t nt,uint32_t start,uint32_t ratio,bool bf) {
-    memset(f,0,sizeof(*f));f->s.max_comp=f->s.key_comp_max=1048576;f->s.batch_floats=4194304;
+    memset(f,0,sizeof(*f));f->s.max_comp=f->s.key_comp_max=1048576;f->s.batch_floats=8388608;
     f->nc=nc;f->nt=nt;f->start=start;f->ratio=ratio;f->bf16=bf;
     uint64_t bytes[]={nc*(uint64_t)nt*4,nt*16384ull,nt*128ull,nc*(bf?256ull:512ull)};
     struct myds_metal_buffer *v[]={&f->y,&f->q,&f->w,&f->k};
@@ -52,6 +52,7 @@ static void reset(void) {
     myds_v41_gpu_indexer_register_only_counters(NULL,true);preflight_calls=dispatch_calls=native_range_calls=log_calls=0;
     preflight_bad=dispatch_bad=NULL;batch=1;kprof=0;memset(dispatched,0,sizeof(dispatched));memset(&got,0,sizeof(got));
     unsetenv("MYDS_INDEXER_TILED");unsetenv("MYDS_INDEXER_SGBAR");unsetenv("MYDS_INDEXER_CHUNK_EXACT");
+    unsetenv("MYDS_INDEXER_RO_SMEM_Q");
 }
 static int call(struct fixture *f,bool ordinary) {
     return myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped(&f->s,&f->y,&f->q,&f->w,&f->k,
@@ -78,10 +79,16 @@ int main(int argc,char **argv) {
     assert(argc==2);int mode=myds_v41_gpu_indexer_register_only_enabled();struct fixture f;
     if(!strcmp(argv[1],"parse")) {
         const char *expected=getenv("EXPECT_MODE");assert(expected&&mode==atoi(expected));
+        const char *smem_q=getenv("MYDS_INDEXER_RO_SMEM_Q");
+        const int smem_mode=(!smem_q||!strcmp(smem_q,"1"))?1:(!strcmp(smem_q,"0")?0:-1);
         const char *f32=myds_v41_gpu_indexer_register_only_selected_kernel(false),*bf=myds_v41_gpu_indexer_register_only_selected_kernel(true);
-        assert(f32==NULL&&(mode==1)==(bf!=NULL));
-        if(mode==1){assert(!strcmp(bf,"kernel_myds_indexer_scores_register_only_bf16"));}
-        assert(!preflight_calls&&!dispatch_calls);printf("{\"parse\":true,\"mode\":%d,\"gpu_work\":false}\n",mode);return 0;
+        assert(f32==NULL);
+        if(mode==1&&smem_mode>=0) {
+            assert(bf!=NULL&&!strcmp(bf,smem_mode?"kernel_myds_indexer_scores_register_only_bf16":"kernel_myds_indexer_scores_register_only_0b_bf16"));
+        } else {
+            assert(bf==NULL);
+        }
+        assert(!preflight_calls&&!dispatch_calls);printf("{\"parse\":true,\"mode\":%d,\"smem_mode\":%d,\"gpu_work\":false}\n",mode,smem_mode);return 0;
     }
     configure(&f,15424,128,30720,2,true);reset();
     if(mode==0) {
@@ -107,7 +114,26 @@ int main(int argc,char **argv) {
     reset();configure(&f,16385,8,32762,2,true);assert(call(&f,true));counts(1,0,1);assert(got.ratio==2&&got.n_comp==16385);
     reset();configure(&f,65536,16,65520,1,true);assert(call(&f,true));counts(1,0,1);assert(got.ratio==1&&got.n_comp==65536);
     reset();configure(&f,524288,8,1048568,2,true);assert(call(&f,true));counts(1,0,1);assert(got.ratio==2&&got.n_comp==524288);
-    reset();configure(&f,1048576,8,1048568,1,true);f.s.batch_floats=8388608;assert(call(&f,true));counts(1,0,1);assert(got.ratio==1&&got.n_comp==1048576);
+    /* [P-I1] Default batch_floats=8388608 keeps 512K < nc <= 1M in register-only without manual override */
+    const uint32_t pi1_cases[][3]={
+        {524289,15,524274},
+        {600000,13,599987},
+        {750000,11,749989},
+        {920000,9,919991},
+        {1048576,8,1048568},
+    };
+    for(unsigned i=0;i<sizeof(pi1_cases)/sizeof(pi1_cases[0]);i++) {
+        reset();configure(&f,pi1_cases[i][0],pi1_cases[i][1],pi1_cases[i][2],1,true);
+        assert(f.s.batch_floats==8388608);
+        assert(call(&f,true));counts(1,0,1);
+        assert(got.ratio==1&&got.n_comp==pi1_cases[i][0]&&got.n_tokens==pi1_cases[i][1]);
+        assert(!strcmp(dispatched[0],"kernel_myds_indexer_scores_register_only_bf16"));
+    }
+    /* [P-I2s] MYDS_INDEXER_RO_SMEM_Q=0 selects 0B baseline; invalid value fails closed */
+    reset();configure(&f,65536,16,65520,1,true);setenv("MYDS_INDEXER_RO_SMEM_Q","0",1);
+    assert(call(&f,true));counts(1,0,1);assert(!strcmp(dispatched[0],"kernel_myds_indexer_scores_register_only_0b_bf16"));
+    reset();configure(&f,65536,16,65520,1,true);setenv("MYDS_INDEXER_RO_SMEM_Q","2",1);
+    assert(!call(&f,true));counts(0,1,0);assert(!dispatch_calls&&!preflight_calls);
     reset();configure(&f,15424,128,30720,2,true);assert(call(&f,false));counts(0,0,0);assert(!preflight_calls&&!native_range_calls);
     const uint32_t cases[][4]={{512,8,1016,2},{512,8,504,1},{1048577,8,1048569,1},{524288,8,1048569,2},{2048,8,6136,3},{1024,7,2041,2},{2048,2049,2047,2}};
     for(unsigned i=0;i<sizeof(cases)/sizeof(cases[0]);i++){reset();configure(&f,cases[i][0],cases[i][1],cases[i][2],cases[i][3],true);reference(&f);}

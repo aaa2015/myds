@@ -3623,6 +3623,28 @@ static int publish_indexer_one_impl(myds_context_t *ctx, uint32_t il, uint32_t p
         /* 2026-10-25：距离窗口下界。decode 是单查询，host 算一次给全部评分器共用；
          * 不传就又会变成「prefill 窗口、decode 全量」，两条路径的键集分叉。 */
         const uint32_t win_first = myds_v41_gpu_indexer_window_first_row(pos, ratio);
+        const bool compact_decode_scope = decode_single && ordinary_indexer_allowed &&
+            !in_block_mask && !out_block_mask && !myds_trace_active();
+        if (compact_decode_scope) {
+            CHECK(myds_v41_gpu_indexer_decode_compact_enabled() >= 0);
+        }
+        if (compact_decode_scope && il > 20u &&
+            myds_v41_gpu_indexer_decode_compact_ready(g->gpu, count)) {
+            myds_metal_buffer_t *sel = out_selected ? out_selected : g->selected;
+            if (!myds_metal_get_auto_barrier()) {
+                const myds_metal_buffer_t *c_deps[] = {
+                    q_buf, w_buf, g->index_cache[owner],
+                    myds_v41_gpu_scratch_compact_blocks(g->gpu),
+                    myds_v41_gpu_scratch_compact_scores(g->gpu),
+                    myds_v41_gpu_scratch_compact_rows(g->gpu)
+                };
+                myds_metal_barrier_buffers(c_deps, 6u);
+            }
+            CHECK(myds_v41_gpu_indexscores_compact_decode_bf16(g->gpu, q_buf, w_buf,
+                g->index_cache[owner], NULL, count, win_first));
+            CHECK(myds_v41_gpu_topk_compact_decode(sel, count, g->gpu));
+            return 1;
+        }
         if (!myds_metal_get_auto_barrier()) {
             const myds_metal_buffer_t *score_deps[] = { q_buf, w_buf, g->index_cache[owner] };
             myds_metal_barrier_buffers(score_deps, 3);
@@ -3652,8 +3674,18 @@ static int publish_indexer_one_impl(myds_context_t *ctx, uint32_t il, uint32_t p
             CHECK(myds_v41_gpu_topk(g->block_selected,g->block_scores,blocks,top,g->gpu));
             myds_metal_buffer_t *b_mask_out = out_block_mask ? out_block_mask : g->block_mask;
             if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->block_selected);
-            CHECK(myds_v41_gpu_topkmask(b_mask_out,g->block_selected,blocks,top));
-            if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(b_mask_out);
+            if (compact_decode_scope && top == (blocks < 2048u ? blocks : 2048u) &&
+                myds_v41_gpu_indexer_decode_compact_eligible(g->gpu, count)) {
+                CHECK(myds_v41_gpu_indexer_prepare_compact_blocks(g->gpu,
+                    g->block_selected, blocks, top, count));
+                if (!myds_metal_get_auto_barrier()) {
+                    myds_metal_barrier_buffer(myds_v41_gpu_scratch_compact_blocks(g->gpu));
+                }
+            } else {
+                if (compact_decode_scope) myds_v41_gpu_indexer_decode_compact_invalidate(g->gpu);
+                CHECK(myds_v41_gpu_topkmask(b_mask_out,g->block_selected,blocks,top));
+                if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(b_mask_out);
+            }
         } else if (il>20) {
             if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(g->index_scores);
             CHECK(myds_v41_gpu_filter(g->index_scores,b_mask,count,pos,ratio));
@@ -3733,14 +3765,32 @@ static int publish_and_select_batch2(myds_context_t *ctx, uint32_t il, uint32_t 
  * 组内 token 数 × 列数 ≤ 预算。返回 0 表示 1 行都放不下（调用方回退）。 */
 static uint32_t indexer_group_len(uint32_t c_len, uint32_t off, uint32_t base_pos,
                                   uint32_t c_start, uint32_t ratio, uint32_t batch_floats) {
-    uint32_t glen = c_len - off;
+    const uint32_t rem = c_len - off;
+    uint32_t glen = rem;
     for (;;) {
         uint32_t nc = (base_pos + c_start + off + glen) / ratio;
         /* 分数表的宽度至少要补到 V41_TOPK：批量 top-k 写 ids 的行步长是 top，
          * 而 prompt_selected 的行步长固定是 V41_TOPK，只有 top == V41_TOPK 时两者一致
          * （见 myds_v41_gpu.c 的 topk_rows_causal）。 */
         uint32_t width = nc < V41_TOPK ? V41_TOPK : nc;
-        if ((uint64_t)glen * width <= (uint64_t)batch_floats) return glen;
+        if ((uint64_t)glen * width <= (uint64_t)batch_floats) {
+            /* [P-I1] Balance subgroup length so 2048-token chunks at >512K..1M
+             * (where max glen is 8..14) never leave a 1..7-token remainder that
+             * silently drops out of register-only (n_tokens < 8). */
+            if (glen > 8u && glen < rem) {
+                const uint32_t max_nc = (base_pos + c_start + c_len) / ratio;
+                const uint32_t max_w = max_nc < V41_TOPK ? V41_TOPK : max_nc;
+                const uint32_t min_g = (uint32_t)((uint64_t)batch_floats / max_w);
+                if (min_g >= 8u && (rem + min_g - 1u) / min_g <= rem / 8u) {
+                    while (glen > 8u) {
+                        const uint32_t r = rem - glen;
+                        if ((r + min_g - 1u) / min_g <= r / 8u) break;
+                        --glen;
+                    }
+                }
+            }
+            return glen;
+        }
         uint32_t next = glen > 1u ? (uint32_t)((uint64_t)batch_floats / width) : 0u;
         if (!next || next >= glen) return 0;
         glen = next;

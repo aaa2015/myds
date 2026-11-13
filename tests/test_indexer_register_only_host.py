@@ -21,7 +21,7 @@ from unittest import mock
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
-APPROVED_SHADER_SHA = "012a55995344083180ed1134e569ac8b9aac426ca1bea4c5be34f7da4635e44c"
+APPROVED_SHADER_SHA = "beec7cd21ca7717901fd4dadc8416fb21913fda017f6cc1b88dd4fbae6b7fc8c"
 
 
 def _parse_struct_fields(source_text: str, struct_name: str) -> list[tuple[str, str]]:
@@ -113,11 +113,15 @@ class RegisterOnlyHostTests(unittest.TestCase):
         for value in (None, "0", "1", "", "2", "01", "true", " 1", "1 "):
             with self.subTest(parse=value):
                 self.run_selector(value, "parse")
+        for smem in ("0", "1", "2", ""):
+            with self.subTest(smem_parse=smem):
+                expect = "1" if smem in ("0", "1") else "-1"
+                self.run_selector("1", "parse", {"MYDS_INDEXER_RO_SMEM_Q": smem, "EXPECT_MODE": expect})
         for value in (None, "0", "1", "2"):
             with self.subTest(matrix=value):
                 output = self.run_selector(value, "matrix")
                 if value in (None, "1"):
-                    self.assertIn('"controls":58', output)
+                    self.assertIn('"controls":64', output)
         self.run_selector("1", "matrix", {"MYDS_INDEXER_KEY_WINDOW": "16"})
 
     def test_actual_publisher_stops_after_scorer_failure(self):
@@ -125,6 +129,7 @@ class RegisterOnlyHostTests(unittest.TestCase):
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('"no_repeat_rope_or_consumers":true', result.stdout)
+        self.assertIn('"p_i1_gt_512k_no_fallback":true', result.stdout)
 
     def test_offline_writer_preserves_native_prefix_and_qualified_fragment(self):
         spec = importlib.util.spec_from_file_location("register_only_production_builder",

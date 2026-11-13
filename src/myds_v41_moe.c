@@ -2352,6 +2352,22 @@ static int ref_publish_indexer_one(const myds_context_t *ctx,
     const myds_metal_buffer_t *b_mask = (il > 20u) ? args->block_mask : NULL;
     /* 距离窗口下界（压缩键行号）：单查询，host 算一次给两个评分器共用。 */
     const uint32_t win_first = myds_v41_gpu_indexer_window_first_row(args->pos, ratio);
+    if (ordinary_allowed && !myds_trace_active() && il > 20u &&
+        myds_v41_gpu_indexer_decode_compact_ready(args->gpu_scratch, count)) {
+        if (!myds_metal_get_auto_barrier()) {
+            const myds_metal_buffer_t *c_deps[] = {
+                args->index_q_buf, args->index_weights, args->index_cache,
+                myds_v41_gpu_scratch_compact_blocks(args->gpu_scratch),
+                myds_v41_gpu_scratch_compact_scores(args->gpu_scratch),
+                myds_v41_gpu_scratch_compact_rows(args->gpu_scratch)
+            };
+            myds_metal_barrier_buffers(c_deps, 6u);
+        }
+        CHECK(myds_v41_gpu_indexscores_compact_decode_bf16(args->gpu_scratch, args->index_q_buf,
+            args->index_weights, args->index_cache, NULL, count, win_first));
+        CHECK(myds_v41_gpu_topk_compact_decode(args->selected, count, args->gpu_scratch));
+        return 1;
+    }
     if (!myds_metal_get_auto_barrier()) {
         const myds_metal_buffer_t *score_deps[] = { args->index_q_buf, args->index_weights, args->index_cache };
         myds_metal_barrier_buffers(score_deps, 3);
@@ -2371,8 +2387,18 @@ static int ref_publish_indexer_one(const myds_context_t *ctx,
         if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(args->block_scores);
         CHECK(myds_v41_gpu_topk(args->block_selected, args->block_scores, blocks, top, args->gpu_scratch));
         if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(args->block_selected);
-        CHECK(myds_v41_gpu_topkmask(args->block_mask, args->block_selected, blocks, top));
-        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(args->block_mask);
+        if (ordinary_allowed && !myds_trace_active() &&
+            myds_v41_gpu_indexer_decode_compact_eligible(args->gpu_scratch, count)) {
+            CHECK(myds_v41_gpu_indexer_prepare_compact_blocks(args->gpu_scratch,
+                args->block_selected, blocks, top, count));
+            if (!myds_metal_get_auto_barrier()) {
+                myds_metal_barrier_buffer(myds_v41_gpu_scratch_compact_blocks(args->gpu_scratch));
+            }
+        } else {
+            myds_v41_gpu_indexer_decode_compact_invalidate(args->gpu_scratch);
+            CHECK(myds_v41_gpu_topkmask(args->block_mask, args->block_selected, blocks, top));
+            if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(args->block_mask);
+        }
     } else if (il > 20u) {
         if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(args->index_scores);
         CHECK(myds_v41_gpu_filter(args->index_scores, b_mask, count, args->pos, ratio));
@@ -2394,7 +2420,8 @@ int myds_v41_decode_attn_indexer_scoped(myds_context_t *ctx,
     const int attn_hc_mode = myds_v41_attn_hc_overlap_enabled();
     const int idx_overlap_mode = myds_v41_indexer_decode_overlap_enabled();
     const int kv_reuse_mode = myds_v41_attn_kv_reuse_enabled();
-    if (attn_hc_mode < 0 || idx_overlap_mode < 0 || kv_reuse_mode < 0) return 0;
+    const int decode_compact_mode = myds_v41_gpu_indexer_decode_compact_enabled();
+    if (attn_hc_mode < 0 || idx_overlap_mode < 0 || kv_reuse_mode < 0 || decode_compact_mode < 0) return 0;
 
     const bool trace_on = myds_trace_active();
     const bool in_idx_scope = !args || args->layer >= 40u || decode_index_source(args->layer);
@@ -2792,40 +2819,84 @@ int myds_v41_decode_attn_indexer_scoped(myds_context_t *ctx,
     if (count > 0u) {
         const uint32_t blocks = (count + 7u) / 8u;
         const bool need_block_mask = !want_kv_reuse || blocks > 2048u;
+        const bool prep_decode_compact = (il == 20u) && need_block_mask &&
+            ordinary_decode_allowed && !trace_on &&
+            myds_v41_gpu_indexer_decode_compact_eligible(args->gpu_scratch, count);
+        const bool use_decode_compact = (il > 20u) && need_block_mask &&
+            ordinary_decode_allowed && !trace_on &&
+            myds_v41_gpu_indexer_decode_compact_ready(args->gpu_scratch, count);
         const bool overlap_topk_qb = defer_idx_qb && (count < 512u || count > 1024u) &&
             !(il == 20u && need_block_mask);
         const uint32_t qb_c5_heads = kv_commit ? 16u : 4u;
         const uint32_t qb_c6_heads = !overlap_topk_qb ? 16u
             : (count > 1024u ? (kv_commit ? 16u : 28u) : (kv_commit ? 17u : 29u));
-        const myds_metal_buffer_t *b_mask = (il > 20u && need_block_mask) ? args->block_mask : NULL;
-        const myds_metal_buffer_t *score_deps[] = {
-            args->index_q_buf, args->index_weights, args->index_cache,
-            kv_commit ? args->compressed_kv : NULL, b_mask,
-            defer_idx_qb ? NULL : ctx->q, args->window,
-            want_kv_reuse ? myds_v41_gpu_scratch_kv_f16(args->gpu_scratch) : NULL,
-            want_kv_reuse ? myds_v41_gpu_scratch_pad(args->gpu_scratch) : NULL
-        };
-        myds_metal_barrier_buffers(score_deps, want_kv_reuse ? 9u : 7u);
-        if (want_kv_reuse) myds_v41_gpu_attn_kv_reuse_mark_fenced(args->gpu_scratch);
-        STAGE_CHECK(myds_v41_gpu_indexscores_head_slots(args->index_scores, args->index_q_buf,
-            args->index_weights, args->index_cache, b_mask, count, 32u, true,
-            myds_v41_gpu_indexer_window_first_row(pos, ratio)));
-        if (defer_idx_qb) {
-            STAGE_CHECK(myds_metal_dense_q4_v41_qb_slice(ctx->q, base->attn_q_b, ctx->qr_norm,
-                qb_c5_heads * 512u, qb_c6_heads * 512u, false));
-        }
-        if (overlap_topk_qb) {
-            const myds_metal_buffer_t *c6_deps[] = { args->index_scores, ctx->q };
-            myds_metal_barrier_buffers(c6_deps, 2);
+        const myds_metal_buffer_t *b_mask = (il > 20u && need_block_mask && !use_decode_compact)
+            ? args->block_mask : NULL;
+        if (use_decode_compact) {
+            const myds_metal_buffer_t *compact_score_deps[] = {
+                args->index_q_buf, args->index_weights, args->index_cache,
+                kv_commit ? args->compressed_kv : NULL,
+                myds_v41_gpu_scratch_compact_blocks(args->gpu_scratch),
+                myds_v41_gpu_scratch_compact_scores(args->gpu_scratch),
+                myds_v41_gpu_scratch_compact_rows(args->gpu_scratch),
+                defer_idx_qb ? NULL : ctx->q, args->window,
+                want_kv_reuse ? myds_v41_gpu_scratch_kv_f16(args->gpu_scratch) : NULL,
+                want_kv_reuse ? myds_v41_gpu_scratch_pad(args->gpu_scratch) : NULL
+            };
+            myds_metal_barrier_buffers(compact_score_deps, want_kv_reuse ? 11u : 9u);
+            if (want_kv_reuse) myds_v41_gpu_attn_kv_reuse_mark_fenced(args->gpu_scratch);
+            STAGE_CHECK(myds_v41_gpu_indexscores_compact_decode_bf16(args->gpu_scratch,
+                args->index_q_buf, args->index_weights, args->index_cache, NULL, count,
+                myds_v41_gpu_indexer_window_first_row(pos, ratio)));
+            if (defer_idx_qb) {
+                STAGE_CHECK(myds_metal_dense_q4_v41_qb_slice(ctx->q, base->attn_q_b, ctx->qr_norm,
+                    qb_c5_heads * 512u, qb_c6_heads * 512u, false));
+            }
+            const myds_metal_buffer_t *compact_c6_deps[] = {
+                myds_v41_gpu_scratch_compact_scores(args->gpu_scratch),
+                myds_v41_gpu_scratch_compact_rows(args->gpu_scratch),
+                myds_v41_gpu_scratch_compact_stage1(args->gpu_scratch),
+                overlap_topk_qb ? ctx->q : NULL
+            };
+            myds_metal_barrier_buffers(compact_c6_deps, overlap_topk_qb ? 4u : 3u);
         } else {
-            myds_metal_barrier_buffer(args->index_scores);
-        }
-        if (il == 20u && need_block_mask) {
-            const uint32_t top_blocks = blocks < 2048u ? blocks : 2048u;
-            STAGE_CHECK(myds_v41_gpu_candidates(args->block_scores, args->index_scores, count, pos, ratio));
-            myds_metal_barrier_buffer(args->block_scores);
-            STAGE_CHECK(myds_v41_gpu_topk(args->block_selected, args->block_scores, blocks, top_blocks, args->gpu_scratch));
-            STAGE_CHECK(myds_v41_gpu_topkmask(args->block_mask, args->block_selected, blocks, top_blocks));
+            const myds_metal_buffer_t *score_deps[] = {
+                args->index_q_buf, args->index_weights, args->index_cache,
+                kv_commit ? args->compressed_kv : NULL, b_mask,
+                defer_idx_qb ? NULL : ctx->q, args->window,
+                want_kv_reuse ? myds_v41_gpu_scratch_kv_f16(args->gpu_scratch) : NULL,
+                want_kv_reuse ? myds_v41_gpu_scratch_pad(args->gpu_scratch) : NULL
+            };
+            myds_metal_barrier_buffers(score_deps, want_kv_reuse ? 9u : 7u);
+            if (want_kv_reuse) myds_v41_gpu_attn_kv_reuse_mark_fenced(args->gpu_scratch);
+            STAGE_CHECK(myds_v41_gpu_indexscores_head_slots(args->index_scores, args->index_q_buf,
+                args->index_weights, args->index_cache, b_mask, count, 32u, true,
+                myds_v41_gpu_indexer_window_first_row(pos, ratio)));
+            if (defer_idx_qb) {
+                STAGE_CHECK(myds_metal_dense_q4_v41_qb_slice(ctx->q, base->attn_q_b, ctx->qr_norm,
+                    qb_c5_heads * 512u, qb_c6_heads * 512u, false));
+            }
+            if (overlap_topk_qb) {
+                const myds_metal_buffer_t *c6_deps[] = { args->index_scores, ctx->q };
+                myds_metal_barrier_buffers(c6_deps, 2);
+            } else {
+                myds_metal_barrier_buffer(args->index_scores);
+            }
+            if (il == 20u && need_block_mask) {
+                const uint32_t top_blocks = blocks < 2048u ? blocks : 2048u;
+                STAGE_CHECK(myds_v41_gpu_candidates(args->block_scores, args->index_scores, count, pos, ratio));
+                myds_metal_barrier_buffer(args->block_scores);
+                STAGE_CHECK(myds_v41_gpu_topk(args->block_selected, args->block_scores, blocks, top_blocks, args->gpu_scratch));
+                if (prep_decode_compact) {
+                    STAGE_CHECK(myds_v41_gpu_indexer_prepare_compact_blocks(args->gpu_scratch,
+                        args->block_selected, blocks, top_blocks, count));
+                } else {
+                    myds_v41_gpu_indexer_decode_compact_invalidate(args->gpu_scratch);
+                    STAGE_CHECK(myds_v41_gpu_topkmask(args->block_mask, args->block_selected, blocks, top_blocks));
+                }
+            } else if (il == 20u) {
+                myds_v41_gpu_indexer_decode_compact_invalidate(args->gpu_scratch);
+            }
         }
         if (defer_idx_qb) {
             if (want_attn_hc) {
@@ -2840,7 +2911,11 @@ int myds_v41_decode_attn_indexer_scoped(myds_context_t *ctx,
             }
         }
         const uint32_t top_k = count < 512u ? count : 512u;
-        STAGE_CHECK(myds_v41_gpu_topk(args->selected, args->index_scores, count, top_k, args->gpu_scratch));
+        if (use_decode_compact) {
+            STAGE_CHECK(myds_v41_gpu_topk_compact_decode(args->selected, count, args->gpu_scratch));
+        } else {
+            STAGE_CHECK(myds_v41_gpu_topk(args->selected, args->index_scores, count, top_k, args->gpu_scratch));
+        }
         if (defer_idx_qb) {
             const uint32_t qb_done_heads = myds_v41_gpu_attn_kv_reuse_qb_done(args->gpu_scratch);
             const uint32_t qb_c7_heads = qb_done_heads > (qb_c5_heads + qb_c6_heads)
