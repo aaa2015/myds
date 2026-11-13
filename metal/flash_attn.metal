@@ -943,9 +943,8 @@ typedef decltype(kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f
 template [[host_name("kernel_flash_attn_ext_f16_dk512_dv512")]]
 kernel flash_attn_ext_dk512_t kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 512, 512>;
 
-// Prefill experiment: an eight-head tile shares one query row's gathered KV.
-// Its output and sink indices remain in the caller's [query, head, dim] order.
-template [[host_name("kernel_myds_flash_attn_heads_f16_dk512_dv512")]]
+// Reference smem-O eight-head variant retained for A/B 0-ULP and timing checks.
+template [[host_name("kernel_myds_flash_attn_heads_smem_f16_dk512_dv512")]]
 kernel flash_attn_ext_dk512_t kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 512, 512, 8, 64, true>;
 
 // Host-visible prefill FlashAttention variant for GLM's 256-wide F16 K/V rows.
@@ -953,6 +952,449 @@ template [[host_name("kernel_flash_attn_ext_f16_dk256_dv256")]]
 kernel flash_attn_ext_dk256_t kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 256, 256>;
 
 #undef FA_NONVEC_TYPES
+
+// Register-resident output accumulator (Reg-O) FlashAttention for F16 K/V heads.
+// Eliminates the Q*PV float32 `so` bank (16 KiB at Q=8) and the unused 4 KiB
+// `sk/sv` dequant bank, keeping `simdgroup_float8x8 lo[QB][NO_COL]` (32 floats
+// per lane) live across K/V blocks and broadcasting per-row `ms` via `s_ms[Q]`.
+//
+// On Apple Silicon GPUs, an 8x8 `simdgroup_float8x8` fragment holds two
+// adjacent column elements of the SAME row per SIMD lane:
+//   row  = ((tiisg >> 2) & 4) | ((tiisg >> 1) & 3)   in [0, 7]
+//   col0 = ((tiisg >> 1) & 4) | ((tiisg & 1) << 1)   in {0, 2, 4, 6}
+//   col1 = col0 + 1                                  in {1, 3, 5, 7}
+template<
+    short DK,
+    short DV,
+    short Q,
+    short C,
+    short NSG,
+    bool HEAD_BATCH = true>
+void kernel_myds_flash_attn_heads_reg_o_impl(
+        constant ds4_metal_args_flash_attn_ext & args,
+        device const char * q,
+        device const char * k,
+        device const char * v,
+        device const char * mask,
+        device const char * sinks,
+        device const char * pad,
+        device const char * blk,
+        device       char * dst,
+        threadgroup  half * shmem_f16,
+        uint3   tgpig,
+        ushort  tiisg,
+        ushort  sgitg) {
+    const ushort iq3 = tgpig[2];
+    const ushort iq2 = tgpig[1];
+    const ushort iq1 = tgpig[0]*Q;
+
+#define NS10 (FC_flash_attn_ext_ns10)
+#define NS20 (FC_flash_attn_ext_ns20)
+
+    static_assert(DK == 512 && DV == 512, "Reg-O heads expects DK=512, DV=512");
+    static_assert(Q % 8 == 0 && Q % NSG == 0, "Q must be multiple of 8 and NSG");
+    static_assert((C / 8) % NSG == 0 && (C / 8) % 2 == 0, "C/8 must be divisible by NSG and 2");
+
+    constexpr short DK4    = DK/4;
+    constexpr short DK8    = DK/8;
+    constexpr short PV     = PAD2(DV, 64);
+    constexpr short PV8    = PV/8;
+    static_assert(PV8 % (2*NSG) == 0, "PV8 must be divisible by 2*NSG");
+
+    constexpr short NW     = N_SIMDWIDTH;
+    constexpr short QB     = Q/8;
+    constexpr short NQ     = Q/NSG;
+    constexpr short NO_COL = PV8/NSG;
+    static_assert(QB * NO_COL == 16, "exactly 16 simdgroup_float8x8 (32 floats/lane)");
+
+    constexpr short SH = 2*C;
+    constexpr short TS = 2*SH;
+
+    // Shared memory layout (no `so`, no `sk/sv`):
+    //   [0 .. Q*DK)                : sq      (Q*DK halves = 8 KiB @ Q=8, 16 KiB @ Q=16)
+    //   [Q*DK .. Q*(DK+TS))        : ss+sm2  (Q*256 halves = 4 KiB @ Q=8, 8 KiB @ Q=16)
+    //   [Q*(DK+TS) .. +2*Q)        : s_ms    (Q floats = 32 B @ Q=8, 64 B @ Q=16)
+    // Total dynamic smem: 12,320 B (Q=8, NSG=4) or 24,640 B (Q=16, NSG=8).
+    threadgroup half   * sq   = shmem_f16;
+    threadgroup half4  * sq4  = (threadgroup half4 *) shmem_f16;
+    threadgroup float  * ss   = (threadgroup float *) (shmem_f16 + Q*DK);
+    threadgroup float2 * ss2  = (threadgroup float2 *) (shmem_f16 + Q*DK);
+    threadgroup half2  * sm2  = (threadgroup half2 *) (shmem_f16 + Q*DK + 2*C);
+    threadgroup float  * s_ms = (threadgroup float *) (shmem_f16 + Q*(DK + TS));
+
+    const short lo_row = ((tiisg >> 2) & 4) | ((tiisg >> 1) & 3);
+    const short lo_col = ((tiisg >> 1) & 4) | ((tiisg & 1) << 1);
+
+    device const half2 * pm2[NQ];
+
+    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+        const short j = jj*NSG + sgitg;
+
+        pm2[jj] = (device const half2 *) ((device const char *) mask + (iq1 + j)*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
+    }
+
+    {
+        const int32_t nblk1 = ((args.ne01 + Q - 1)/Q);
+        const int32_t nblk0 = ((args.ne11 + C - 1)/C);
+
+        blk += (((iq3%args.ne33)*args.ne32 + (iq2%args.ne32))*nblk1 + iq1/Q)*nblk0;
+    }
+
+    {
+        q += iq1*args.nb01 + iq2*args.nb02 + iq3*args.nb03;
+
+        const short ikv2 = iq2/(args.ne02/args.ne_12_2);
+        const short ikv3 = iq3/(args.ne03/args.ne_12_3);
+
+        k += ikv2*args.nb12 + ikv3*args.nb13;
+        v += ikv2*args.nb22 + ikv3*args.nb23;
+    }
+
+    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+        const short j = jj*NSG + sgitg;
+
+        device const float4 * q4 = (device const float4 *) ((device const char *) q + j*args.nb01);
+
+        for (short i = tiisg; i < DK4; i += NW) {
+            if (iq1 + j < args.ne01) {
+                sq4[j*DK4 + i] = (half4) q4[i];
+            } else {
+                sq4[j*DK4 + i] = 0;
+            }
+        }
+
+        for (short i = tiisg; i < SH; i += NW) {
+            ss[j*SH + i] = 0.0f;
+        }
+    }
+
+    simdgroup_float8x8 lo[QB][NO_COL];
+    FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
+        FOR_UNROLL (short ii = 0; ii < NO_COL; ++ii) {
+            lo[qb][ii] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float S[NQ] = { [0 ... NQ-1] = 0.0f };
+
+    {
+        float M[NQ] = { [0 ... NQ-1] = -FLT_MAX/2 };
+
+        float slope = 1.0f;
+
+        if (FC_flash_attn_ext_has_bias) {
+            const short h = iq2;
+
+            const float base = h < args.n_head_log2 ? args.m0 : args.m1;
+            const short exph = h < args.n_head_log2 ? h + 1 : 2*(h - args.n_head_log2) + 1;
+
+            slope = pow(base, exph);
+        }
+
+        for (int ic0 = 0; ; ++ic0) {
+            int ic = ic0*C;
+            if (ic >= args.ne11) {
+                break;
+            }
+
+            if (FC_flash_attn_ext_has_kvpad && ic + C > args.ne11) {
+                k    = pad;
+                v    = k + args.nb11*C*args.ne_12_2*args.ne_12_3;
+                mask = v + args.nb21*C*args.ne_12_2*args.ne_12_3;
+
+                const short ikv2 = iq2/(args.ne02/args.ne_12_2);
+                const short ikv3 = iq3/(args.ne03/args.ne_12_3);
+
+                k += (ikv2 + ikv3*args.ne_12_2)*args.nb11*C;
+                v += (ikv2 + ikv3*args.ne_12_2)*args.nb21*C;
+
+                if (!FC_flash_attn_ext_has_mask) {
+                    threadgroup half * sm = (threadgroup half *) (sm2);
+
+                    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+                        const short j = jj*NSG + sgitg;
+
+                        for (short i = tiisg; i < C; i += NW) {
+                            if (ic + i >= args.ne11) {
+                                sm[2*j*SH + i] = -MAXHALF;
+                            }
+                        }
+                    }
+                } else {
+                    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+                        const short j = jj*NSG + sgitg;
+
+                        pm2[jj] = (device const half2 *) ((device const half *) mask +
+                                (iq1 + j)*C +
+                                (iq2%args.ne32)*(C*args.ne31) +
+                                (iq3%args.ne33)*(C*args.ne31*args.ne32));
+                    }
+                }
+
+                ic = 0;
+            }
+
+            char blk_cur = 1;
+
+            if (FC_flash_attn_ext_has_mask) {
+                blk_cur = blk[ic0];
+
+                if (blk_cur == 0) {
+                    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+                        pm2[jj] += NW;
+                    }
+
+                    continue;
+                }
+
+                if (blk_cur == 1) {
+                    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+                        const short j = jj*NSG + sgitg;
+
+                        if (FC_flash_attn_ext_bc_mask) {
+                            sm2[j*SH + tiisg] = (iq1 + j) < args.ne31 ? pm2[jj][tiisg] : half2(-MAXHALF, -MAXHALF);
+                        } else {
+                            sm2[j*SH + tiisg] = (iq1 + j) < args.ne01 ? pm2[jj][tiisg] : half2(-MAXHALF, -MAXHALF);
+                        }
+
+                        pm2[jj] += NW;
+                    }
+                } else if (blk_cur == 2) {
+                    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+                        pm2[jj] += NW;
+                    }
+                }
+            }
+
+            {
+                device      const half  * pk = (device const half *) (k + ic*args.nb11) + sgitg*(8*NS10);
+                threadgroup       float * ps = ss + sgitg*8;
+
+                constexpr short NC_QK = (C/8)/NSG;
+
+                FOR_UNROLL (short cc = 0; cc < NC_QK; ++cc) {
+                    simdgroup_float8x8 mqk[QB];
+                    FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
+                        mqk[qb] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+                    }
+
+                    #pragma unroll 16
+                    for (short i = 0; i < DK8/2; ++i) {
+                        simdgroup_barrier(mem_flags::mem_none);
+
+                        simdgroup_half8x8 mk[2];
+                        simdgroup_load(mk[0], pk + 0*8 + 16*i, NS10, 0, true);
+                        simdgroup_load(mk[1], pk + 1*8 + 16*i, NS10, 0, true);
+
+                        FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
+                            simdgroup_half8x8 mq[2];
+                            threadgroup const half * pq = sq + qb*8*DK;
+                            simdgroup_load(mq[0], pq + 0*8 + 16*i, DK);
+                            simdgroup_load(mq[1], pq + 1*8 + 16*i, DK);
+
+                            simdgroup_barrier(mem_flags::mem_none);
+
+                            simdgroup_multiply_accumulate(mqk[qb], mq[0], mk[0], mqk[qb]);
+                            simdgroup_multiply_accumulate(mqk[qb], mq[1], mk[1], mqk[qb]);
+                        }
+                    }
+
+                    FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
+                        simdgroup_store(mqk[qb], ps + qb*8*SH, SH, 0, false);
+                    }
+
+                    pk += 8*(NSG*NS10);
+                    ps += 8*NSG;
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+                const short j = jj*NSG + sgitg;
+
+                const float m = M[jj];
+
+                float2 s2 = ss2[j*SH/2 + tiisg]*args.scale;
+
+                if (FC_flash_attn_ext_has_scap) {
+                    s2 = args.logit_softcap*precise::tanh(s2);
+                }
+
+                if (blk_cur != 2) {
+                    if (FC_flash_attn_ext_has_bias) {
+                        s2 += float2(sm2[j*SH + tiisg])*slope;
+                    } else {
+                        s2 += float2(sm2[j*SH + tiisg]);
+                    }
+                }
+
+                M[jj] = simd_max(max(M[jj], max(s2[0], s2[1])));
+
+                const float  ms  = exp(m  - M[jj]);
+                const float2 vs2 = exp(s2 - M[jj]);
+
+                S[jj] = S[jj]*ms + simd_sum(vs2[0] + vs2[1]);
+
+                ss2[j*SH/2 + tiisg] = vs2;
+
+                if (tiisg == 0) {
+                    s_ms[j] = ms;
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            {
+                #pragma clang fp contract(off)
+                FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
+                    const float ms_r = s_ms[qb*8 + lo_row];
+                    FOR_UNROLL (short ii = 0; ii < NO_COL; ++ii) {
+                        lo[qb][ii].thread_elements()[0] *= ms_r;
+                        lo[qb][ii].thread_elements()[1] *= ms_r;
+                    }
+                }
+            }
+
+            {
+                device const half * pv = (device const half *) (v + ic*args.nb21) + 8*sgitg;
+
+                constexpr short NC_PV = (C/8)/2;
+
+                FOR_UNROLL (short cc = 0; cc < NC_PV; ++cc) {
+                    simdgroup_float8x8 vs[QB][2];
+
+                    FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
+                        simdgroup_load(vs[qb][0], ss + qb*8*SH + 16*cc + 0, SH, 0, false);
+                        simdgroup_load(vs[qb][1], ss + qb*8*SH + 16*cc + 8, SH, 0, false);
+                    }
+
+                    FOR_UNROLL (short ii = 0; ii < NO_COL/2; ++ii) {
+                        simdgroup_half8x8 mv[4];
+
+                        simdgroup_load(mv[0], pv + 0*NSG + 16*ii*NSG + 0*8*NS20, NS20, 0, false);
+                        simdgroup_load(mv[1], pv + 8*NSG + 16*ii*NSG + 0*8*NS20, NS20, 0, false);
+                        simdgroup_load(mv[2], pv + 0*NSG + 16*ii*NSG + 1*8*NS20, NS20, 0, false);
+                        simdgroup_load(mv[3], pv + 8*NSG + 16*ii*NSG + 1*8*NS20, NS20, 0, false);
+
+                        FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
+                            simdgroup_multiply_accumulate(lo[qb][2*ii + 0], vs[qb][0], mv[0], lo[qb][2*ii + 0]);
+                            simdgroup_multiply_accumulate(lo[qb][2*ii + 1], vs[qb][0], mv[1], lo[qb][2*ii + 1]);
+                            simdgroup_multiply_accumulate(lo[qb][2*ii + 0], vs[qb][1], mv[2], lo[qb][2*ii + 0]);
+                            simdgroup_multiply_accumulate(lo[qb][2*ii + 1], vs[qb][1], mv[3], lo[qb][2*ii + 1]);
+                        }
+                    }
+
+                    pv += 2*8*NS20;
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (FC_flash_attn_ext_has_sinks) {
+            FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+                const short j = jj*NSG + sgitg;
+
+                const float m = M[jj];
+                const float s = (tiisg == 0 && (!HEAD_BATCH || iq1 + j < args.ne01))
+                    ? ((device const float *) sinks)[HEAD_BATCH ? iq1 + j : iq2]
+                    : -FLT_MAX/2;
+
+                M[jj] = simd_max(max(M[jj], s));
+
+                const float ms = exp(m - M[jj]);
+                const float vs = exp(s - M[jj]);
+
+                S[jj] = S[jj]*ms + simd_sum(vs);
+
+                if (tiisg == 0) {
+                    s_ms[j] = ms;
+                }
+            }
+        }
+    }
+
+    threadgroup float * s_scale = ss;
+    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+        const short j = jj*NSG + sgitg;
+        const float scale = S[jj] == 0.0f ? 0.0f : 1.0f/S[jj];
+        if (tiisg == 0) {
+            s_scale[j] = scale;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (FC_flash_attn_ext_has_sinks) {
+        #pragma clang fp contract(off)
+        FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
+            const float ms_sink = s_ms[qb*8 + lo_row];
+            FOR_UNROLL (short ii = 0; ii < NO_COL; ++ii) {
+                lo[qb][ii].thread_elements()[0] *= ms_sink;
+                lo[qb][ii].thread_elements()[1] *= ms_sink;
+            }
+        }
+    }
+
+    FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
+        const short j = qb*8 + lo_row;
+        if (iq1 + j < args.ne01) {
+            #pragma clang fp contract(off)
+            const float scale = s_scale[j];
+            const uint64_t rid = HEAD_BATCH ? (uint64_t)iq2*args.ne1 + iq1 + j :
+                (uint64_t)iq3*args.ne2*args.ne1 + iq2 + (uint64_t)(iq1 + j)*args.ne1;
+            device float2 * dst2 = (device float2 *) ((device float *) dst + rid*DV);
+            FOR_UNROLL (short ii = 0; ii < NO_COL; ++ii) {
+                const short c2 = (8*sgitg + ii*8*NSG + lo_col) / 2;
+                dst2[c2] = float2(lo[qb][ii].thread_elements()[0] * scale,
+                                  lo[qb][ii].thread_elements()[1] * scale);
+            }
+        }
+    }
+
+#undef NS10
+#undef NS20
+}
+
+template<
+    short DK,
+    short DV,
+    short Q,
+    short C,
+    short NSG,
+    bool HEAD_BATCH = true>
+kernel void kernel_myds_flash_attn_heads_reg_o(
+        constant ds4_metal_args_flash_attn_ext & args,
+        device const char * q,
+        device const char * k,
+        device const char * v,
+        device const char * mask,
+        device const char * sinks,
+        device const char * pad,
+        device const char * blk,
+        device       char * dst,
+        threadgroup  half * shmem_f16 [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+    if (FC_flash_attn_ext_nsg == NSG) {
+        kernel_myds_flash_attn_heads_reg_o_impl<DK, DV, Q, C, NSG, HEAD_BATCH>(
+            args, q, k, v, mask, sinks, pad, blk, dst, shmem_f16, tgpig, tiisg, sgitg);
+    }
+}
+
+typedef decltype(kernel_myds_flash_attn_heads_reg_o<512, 512, 8, 64, 4, true>) flash_attn_heads_reg_o_t;
+
+// Step 1 (Q=8, C=64, NSG=4 Reg-O): 12,320 B smem (2 TGs = 256 threads/core).
+template [[host_name("kernel_myds_flash_attn_heads_f16_dk512_dv512")]]
+kernel flash_attn_heads_reg_o_t kernel_myds_flash_attn_heads_reg_o<512, 512, 8, 64, 4, true>;
+
+// Step 2 (Q=16, C=64, NSG=8 Reg-O): 24,640 B smem (1 TG = 256 threads/core).
+template [[host_name("kernel_myds_flash_attn_heads_q16_f16_dk512_dv512")]]
+kernel flash_attn_heads_reg_o_t kernel_myds_flash_attn_heads_reg_o<512, 512, 16, 64, 8, true>;
 
 constant bool FC_flash_attn_ext_vec_has_mask  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 0)]];
 constant bool FC_flash_attn_ext_vec_has_sinks [[function_constant(FC_FLASH_ATTN_EXT_VEC + 1)]];

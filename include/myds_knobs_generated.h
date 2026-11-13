@@ -17,23 +17,24 @@ static const myds_knob_t myds_knobs_generated[] = {
     {"MYDS_ANCHOR_SLOTS", "src/myds_engine.c", 1218, 1},
     {"MYDS_ANCHOR_SNAPSHOT", "src/myds_engine.c", 3866, 1},
     {"MYDS_ATTN_DIRECT_PACK", "src/myds_v41.c", 4523, 1},
-    {"MYDS_ATTN_DIRECT_PACK_FUSE", "src/myds_v41_gpu.c", 2327, 1},
-    {"MYDS_ATTN_FLASH_DEC", "src/myds_v41_gpu.c", 2183, 1},
+    {"MYDS_ATTN_DIRECT_PACK_FUSE", "src/myds_v41_gpu.c", 2344, 1},
+    {"MYDS_ATTN_FLASH_DEC", "src/myds_v41_gpu.c", 2200, 1},
     {"MYDS_ATTN_FORCE_THREADS", "src/myds_metal.m", 3474, 1},
     {"MYDS_ATTN_GATHER", "src/myds_v41.c", 6963, 1},
     {"MYDS_ATTN_GATHER_MIN_KEYS", "src/myds_v41.c", 7832, 1},
     {"MYDS_ATTN_HC_OVERLAP", "src/myds_v41_moe.c", 2060, 1},
+    {"MYDS_ATTN_HEADS_MODE", "src/myds_v41_gpu.c", 2012, 1},
     {"MYDS_ATTN_INDEXER_EARLY", "src/myds_v41.c", 4427, 1},
     {"MYDS_ATTN_INDEXER_PIPELINE", "src/myds_v41.c", 4422, 1},
     {"MYDS_ATTN_KEYS_CLAMP", "src/myds_v41_gpu.c", 217, 1},
-    {"MYDS_ATTN_KV_REUSE", "src/myds_v41_gpu.c", 2199, 1},
+    {"MYDS_ATTN_KV_REUSE", "src/myds_v41_gpu.c", 2216, 1},
     {"MYDS_ATTN_OUTPUT_PIPELINE", "src/myds_v41.c", 4227, 1},
     {"MYDS_ATTN_OUT_A_FUSE_BF16", "src/myds_metal.m", 7837, 1},
     {"MYDS_ATTN_OUT_A_SHARED2", "src/myds_metal.m", 7841, 1},
-    {"MYDS_ATTN_PACKED_NSG", "src/myds_v41_gpu.c", 2141, 1},
-    {"MYDS_ATTN_PACKED_REDUCE", "src/myds_v41_gpu.c", 2142, 1},
-    {"MYDS_ATTN_PACKED_REGISTER", "src/myds_v41_gpu.c", 2136, 1},
-    {"MYDS_ATTN_ROPE_FUSE", "src/myds_v41_gpu.c", 2165, 1},
+    {"MYDS_ATTN_PACKED_NSG", "src/myds_v41_gpu.c", 2158, 1},
+    {"MYDS_ATTN_PACKED_REDUCE", "src/myds_v41_gpu.c", 2159, 1},
+    {"MYDS_ATTN_PACKED_REGISTER", "src/myds_v41_gpu.c", 2153, 1},
+    {"MYDS_ATTN_ROPE_FUSE", "src/myds_v41_gpu.c", 2182, 1},
     {"MYDS_ATTN_VEC_HEAD_FIRST", "src/myds_v41_gpu.c", 248, 1},
     {"MYDS_ATTN_WHICH", "src/myds_v41_gpu.c", 576, 1},
     {"MYDS_BATCH2_AUTO_BARRIER", "src/myds_v41.c", 5429, 1},
@@ -282,8 +283,8 @@ static const myds_knob_t myds_knobs_generated[] = {
     {"MYDS_YOCO_KEEP_TOKENS", "src/myds_v41.c", 7702, 1},
 };
 
-#define MYDS_KNOB_COUNT 269u
-#define MYDS_KNOB_DIRECT_COUNT 245u
+#define MYDS_KNOB_COUNT 270u
+#define MYDS_KNOB_DIRECT_COUNT 246u
 #define MYDS_KNOB_WRAPPED_COUNT 24u
 #define MYDS_KNOB_HELPERS "capture_parse_flag,cfg_f32_env,cfg_u32_env,decode_candidate_parse,decode_env_enabled,env_default_on,env_is_one_literal,env_not_zero_literal,qkv_fusion_enabled,v41_env_u32"
 

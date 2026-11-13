@@ -60,11 +60,33 @@ static int unavailable(uint32_t kind){
     printf("PASS explicit matrix same-scratch retry kind=%u recovered=%llu\n",kind,(unsigned long long)recovered);
     myds_v41_gpu_scratch_free(vec);myds_v41_gpu_scratch_free(auto_s);myds_v41_gpu_scratch_free(explicit_s);cleanup(&f);return 1;
 }
+static int rego_heads_parity(uint32_t rows,uint32_t start,uint32_t ratio){
+    struct fixture f;CHECK(init(&f,rows,start,ratio));
+    const char *modes[3]={"smem","q8",NULL}; /* NULL exercises default active path (q16 Reg-O) */
+    for(int m=0;m<3;m++){
+        if(modes[m])setenv("MYDS_ATTN_HEADS_MODE",modes[m],1);
+        else unsetenv("MYDS_ATTN_HEADS_MODE");
+        myds_v41_gpu_scratch_t *s=scratch("matrix");CHECK(s);
+        CHECK(myds_metal_begin_batch());
+        if(start)CHECK(myds_v41_gpu_carry_stage(s,f.window,start<128u?start:128u));
+        CHECK(call(&f,s,m,1,1));
+        CHECK(myds_metal_commit_batch());
+        myds_v41_gpu_scratch_free(s);
+    }
+    unsetenv("MYDS_ATTN_HEADS_MODE");
+    size_t nbytes=(size_t)rows*64u*512u*4u;
+    CHECK(!memcmp(myds_metal_buffer_data(f.out[0]),myds_metal_buffer_data(f.out[1]),nbytes));
+    CHECK(!memcmp(myds_metal_buffer_data(f.out[0]),myds_metal_buffer_data(f.out[2]),nbytes));
+    printf("PASS rego heads 0-ULP rows=%u start=%u ratio=%u smem==q8==default(q16) byte exact\n",rows,start,ratio);
+    cleanup(&f);return 1;
+}
 int main(void){
     printf("ATTENTION POLICY compiled=%s %s\n",__DATE__,__TIME__);fflush(stdout);
     if(!myds_metal_init("metal"))return 1;setenv("MYDS_ATTN_GATHER","1",1);unsetenv("MYDS_ATTN_GATHER_MIN_KEYS");
     const uint32_t cases[][4]={{512,0,2,0},{512,512,2,1},{294,1536,2,1},{512,0,1,0},{256,256,1,1},{31,1024,2,0},{32,1024,2,1},{32,512,2,0},{512,510,2,0}};
     int ok=1;for(size_t i=0;i<sizeof(cases)/sizeof(*cases)&&ok;i++)ok=policy(cases[i][0],cases[i][1],cases[i][2],cases[i][3]);
+    const uint32_t rego_cases[][3]={{33,1280,2},{63,1280,2},{128,1280,2},{2048,1280,2}};
+    for(size_t i=0;i<sizeof(rego_cases)/sizeof(*rego_cases)&&ok;i++)ok=rego_heads_parity(rego_cases[i][0],rego_cases[i][1],rego_cases[i][2]);
     if(ok)ok=unavailable(1)&&unavailable(2);
     setenv("MYDS_PREFILL_ATTN","direct",1);myds_v41_gpu_scratch_t *bad=myds_v41_gpu_scratch_create(8192);if(bad){myds_v41_gpu_scratch_free(bad);ok=0;}
     myds_metal_cleanup();printf("ATTENTION POLICY %s\n",ok?"PASS":"FAIL");return ok?0:1;

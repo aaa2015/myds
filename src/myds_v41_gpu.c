@@ -1991,6 +1991,8 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
         !s->attn_vec_head_first_unavailable))return 0;
 #endif
     int matrix_encoded=0;
+    const char *matrix_kernel_used="none";
+    size_t matrix_smem_used=0;
     if(use_matrix){
         /* Keep a unchanged: an unavailable matrix PSO/32KiB workspace must fall
          * back with the original query/head axes and gathered-KV strides. */
@@ -2007,22 +2009,36 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
             64,640,64,(int32_t)c_len,1,0,(uint64_t)s->mask_u16*2u,
             (uint64_t)s->mask_u16*2u*c_len};
         _Static_assert(sizeof(ba)==48,"flash block scanner Metal ABI");
+        const char *hm=getenv("MYDS_ATTN_HEADS_MODE");
+        const int hm_smem=hm && !strcmp(hm,"smem");
+        const int hm_q8=hm && !strcmp(hm,"q8");
+        const int hm_q16=!hm_smem && !hm_q8;
+        const int32_t q_tile=hm_q16 ? 16 : 8;
+        const int32_t nsg=hm_q16 ? 8 : 4;
+        const uint32_t nblk1=(uint32_t)(64/q_tile);
         const myds_metal_buffer_t *bb[]={s->mask_chunk,s->attn_head_blocks};
-        const myds_metal_constant_t bc[]={{224,false,8},{225,false,64}};
+        const myds_metal_constant_t bc[]={{224,false,q_tile},{225,false,64}};
         if(ready)ready=specialized("kernel_flash_attn_ext_blk",&ba,sizeof(ba),bb,2,
-                                  10,8,c_len,32,1,1,0,bc,2);
+                                  10,nblk1,c_len,32,1,1,0,bc,2);
         const myds_metal_buffer_t *mb[]={q,kv_sel,kv_sel,s->mask_chunk,sinks,s->pad,s->attn_head_blocks,heads};
         const myds_metal_constant_t mc[]={{300,true,1},{301,true,1},{302,true,0},{303,true,0},
-            {304,true,0},{310,true,0},{320,false,512},{321,false,512},{322,false,4}};
+            {304,true,0},{310,true,0},{320,false,512},{321,false,512},{322,false,nsg}};
         /* Both diagnostic failures use the real PSO/dispatch validation path.
          * It returns before encoding a matrix dispatch for absent functions or
          * excessive shared memory. A prior scanner only modifies its flags. */
         const char *kernel=attn_matrix_test_failure==1?
             "kernel_myds_attention_test_missing_matrix_pso":
-            "kernel_myds_flash_attn_heads_f16_dk512_dv512";
-        const size_t smem=attn_matrix_test_failure==2?SIZE_MAX-15u:32768u;
-        if(ready)matrix_encoded=specialized(kernel,&ma,192,mb,8,8,c_len,1,32,4,1,smem,mc,9);
-        if(matrix_encoded)attn_count(AC_MATRIX);
+            (hm_smem?"kernel_myds_flash_attn_heads_smem_f16_dk512_dv512":
+             hm_q16?"kernel_myds_flash_attn_heads_q16_f16_dk512_dv512":
+                    "kernel_myds_flash_attn_heads_f16_dk512_dv512");
+        const size_t smem=attn_matrix_test_failure==2?SIZE_MAX-15u:
+            (hm_smem?32768u:hm_q16?24640u:12320u);
+        if(ready)matrix_encoded=specialized(kernel,&ma,192,mb,8,nblk1,c_len,1,32,(uint32_t)nsg,1,smem,mc,9);
+        if(matrix_encoded){
+            matrix_kernel_used=kernel;
+            matrix_smem_used=smem;
+            attn_count(AC_MATRIX);
+        }
         else{
             if(s->prefill_attn_variant!=2){ /* explicit matrix is strict */
                 MYDS_LOG_E("attention: MYDS_PREFILL_ATTN=matrix could not encode "
@@ -2054,8 +2070,9 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
         if (!known && nseen < 16) {
             seen[nseen][0] = key0; seen[nseen][1] = key1; seen[nseen][2] = key2; ++nseen;
             MYDS_LOG_I("attn-which#%d: variant=%u use_gather=%d use_matrix=%d matrix_encoded=%d "
-                       "head_first=%d(hf_unavail=%d) c_len=%u n_comp=%u",
+                       "matrix_kernel=%s matrix_smem=%zu head_first=%d(hf_unavail=%d) c_len=%u n_comp=%u",
                        nseen, (unsigned)s->prefill_attn_variant, key0, key1, (int)matrix_encoded,
+                       matrix_kernel_used, matrix_smem_used,
                        key2, (int)s->attn_vec_head_first_unavailable, c_len, n_comp);
         }
     }
