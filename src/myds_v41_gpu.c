@@ -926,19 +926,20 @@ int myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped(
                                  causal_start,causal_ratio,cache_bf16);
     const uint64_t end=(uint64_t)causal_start+n_tokens;
     const char *sgbar=getenv("MYDS_INDEXER_SGBAR");
-    /* Initial device gate covers ratio2 owners in the first32K only. Larger,
-     * smaller, ratio1 and diagnostic requests are legitimate reference calls,
-     * not eligible-candidate fallbacks. No new allocation or group splitting. */
+    _Static_assert(MYDS_CHUNK_MAXC==2048u,"sync shader args.n_tokens<=2048u guard");
+    /* Device gate covers ratio 1 and ratio 2 owners across the full 1M context.
+     * Smaller, non-owner and diagnostic requests are legitimate reference calls,
+     * not eligible-candidate fallbacks. */
     if(!cache_bf16||n_heads!=32u||!n_tokens||!causal_ratio||causal_start==UINT32_MAX||
-       causal_ratio!=2u||n_comp<=512u||n_comp>16384u||n_tokens<8u||
-       n_tokens>MYDS_CHUNK_MAXC||end>32768u||!myds_metal_batch_active()||
+       (causal_ratio!=1u&&causal_ratio!=2u)||n_comp<=512u||n_comp>1048576u||n_tokens<8u||
+       n_tokens>MYDS_CHUNK_MAXC||end>1048576u||!myds_metal_batch_active()||
        myds_metal_kprof_exclusive()||indexer_key_window()||
        (sgbar&&strcmp(sgbar,"0")!=0))
         return indexscores_chunk(scores,q,weights,cache,n_comp,n_heads,n_tokens,
                                  causal_start,causal_ratio,cache_bf16);
     if(!scratch||n_comp>scratch->max_comp||n_comp>scratch->key_comp_max||
        !scratch->batch_floats||(uint64_t)n_comp*n_tokens>scratch->batch_floats||
-       n_comp!=end/2u||(uint64_t)causal_start+1u<2u)
+       n_comp!=end/causal_ratio||(uint64_t)causal_start+1u<causal_ratio)
         return indexer_register_only_fallback(scores,q,weights,cache,n_comp,n_heads,n_tokens,
                                               causal_start,causal_ratio,cache_bf16,
                                               "ordinary group bounds/budget/causal tuple");
@@ -968,7 +969,7 @@ int myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped(
     struct indexer_register_only_args a;
     memset(&a,0,sizeof(a));
     a.n_comp=n_comp;a.n_tokens=n_tokens;a.n_head=32u;a.head_dim=128u;
-    a.pos0=causal_start;a.ratio=2u;a.q_token_stride=32u*128u*4u;
+    a.pos0=causal_start;a.ratio=causal_ratio;a.q_token_stride=32u*128u*4u;
     a.q_head_stride=128u*4u;a.weights_token_stride=32u*4u;
     a.index_row_stride=128u*(cache_bf16?2u:4u);
     a.score_token_stride=(uint64_t)n_comp*4u;a.scale=1.0f/64.0f;

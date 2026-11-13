@@ -240,6 +240,75 @@ static int test_indexscores_bf16(void) {
     myds_metal_buffer_free(w);myds_metal_buffer_free(a);myds_metal_buffer_free(b);myds_metal_buffer_free(mask);
     printf("  [PASS] BF16 index scores byte exact: scalar/direct/chunk/tiled, masked early exit and causal tails\n");return 1;
 }
+static int test_indexscores_register_only_long_and_ratio1(void) {
+    struct { uint32_t nc, nt, start, ratio; } cases[] = {
+        {513u,   513u, 0u,      1u}, /* ratio=1 from pos0=0 */
+        {2049u,  15u,  2034u,   1u}, /* ratio=1 unaligned n_comp & n_tokens */
+        {16385u, 9u,   16376u,  1u}, /* ratio=1 > 16K */
+        {32769u, 17u,  32752u,  1u}, /* ratio=1 end > 32K */
+        {65537u, 9u,   65528u,  1u}, /* ratio=1 > 64K non-tile-aligned */
+        {16385u, 8u,   32762u,  2u}, /* ratio=2 n_comp > 16K, end > 32K */
+        {16385u, 9u,   32762u,  2u}, /* ratio=2 odd end=32771 -> end/2=16385 */
+        {65536u, 31u,  131041u, 2u}, /* ratio=2 128K context */
+        {65537u, 33u,  131042u, 2u}, /* ratio=2 >128K odd end=131075, unaligned */
+    };
+    const uint32_t max_nc = 65537u, max_nt = 513u;
+    const size_t max_scores = (size_t)65537u * 33u; /* >= 513*513 */
+    CHECK(!setenv("MYDS_INDEXER_BATCH_FLOATS","4194304",1));
+    myds_v41_gpu_scratch_t *scratch = myds_v41_gpu_scratch_create(max_nc);
+    CHECK(scratch && myds_v41_gpu_indexer_batch_floats(scratch) == 4194304u);
+    myds_metal_buffer_t *keys = myds_metal_buffer_alloc((size_t)max_nc * 128u * 4u),
+                        *packed = myds_metal_buffer_alloc((size_t)max_nc * 128u * 2u),
+                        *q = myds_metal_buffer_alloc((size_t)max_nt * 32u * 128u * 4u),
+                        *w = myds_metal_buffer_alloc((size_t)max_nt * 32u * 4u),
+                        *ref = myds_metal_buffer_alloc(max_scores * 4u),
+                        *cand = myds_metal_buffer_alloc(max_scores * 4u);
+    CHECK(keys && packed && q && w && ref && cand);
+    fill(keys, 5u); fill(q, 13u);
+    float *wp = myds_metal_buffer_data(w);
+    for (size_t i = 0; i < (size_t)max_nt * 32u; i++) wp[i] = 0.0625f + (float)(i % 29u) / 32.0f;
+    CHECK(myds_metal_begin_batch());
+    CHECK(myds_v41_gpu_quant(keys, 128u, max_nc, 2u));
+    CHECK(myds_v41_gpu_pack_bf16(packed, 0u, keys, 0u, (size_t)max_nc * 128u));
+    CHECK(myds_metal_commit_batch());
+
+    CHECK(!setenv("MYDS_INDEXER_TILED","1",1));
+    CHECK(!setenv("MYDS_INDEXER_REGISTER_ONLY_STRICT","1",1));
+    CHECK(myds_v41_gpu_indexer_register_only_enabled() == 1);
+    for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
+        const uint32_t nc = cases[ci].nc, nt = cases[ci].nt, start = cases[ci].start, ratio = cases[ci].ratio;
+        const size_t count = (size_t)nc * nt;
+        CHECK(count <= max_scores);
+        memset(myds_metal_buffer_data(ref), 0x5a, count * 4u);
+        memset(myds_metal_buffer_data(cand), 0xa5, count * 4u);
+        myds_v41_gpu_indexer_register_only_counters(NULL, true);
+        CHECK(myds_metal_begin_batch());
+        CHECK(myds_v41_gpu_indexscores_chunk_bf16(ref, q, w, packed, nc, 32u, nt, start, ratio));
+        CHECK(myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped(
+            scratch, cand, q, w, packed, nc, 32u, nt, start, ratio, true, true));
+        CHECK(myds_metal_commit_batch());
+        myds_v41_gpu_indexer_register_only_counters_t ctr;
+        myds_v41_gpu_indexer_register_only_counters(&ctr, false);
+        CHECK(ctr.requests == 1u && ctr.encoded == 1u && ctr.bf16_dispatches == 1u &&
+              ctr.fallbacks == 0u && ctr.failures == 0u);
+        const float *rp = myds_metal_buffer_data(ref), *cp = myds_metal_buffer_data(cand);
+        CHECK(!memcmp(rp, cp, count * 4u));
+        for (uint32_t t = 0; t < nt; t += (nt > 4u ? nt / 3u : 1u)) {
+            const uint32_t vis = (start + t + 1u) / ratio < nc ? (start + t + 1u) / ratio : nc;
+            if (vis > 0u) CHECK(isfinite(cp[(size_t)t * nc + vis - 1u]));
+            if (vis < nc) CHECK(cp[(size_t)t * nc + vis] == -INFINITY && signbit(cp[(size_t)t * nc + vis]));
+            if (vis + 1u < nc) CHECK(cp[(size_t)t * nc + nc - 1u] == -INFINITY);
+        }
+    }
+    unsetenv("MYDS_INDEXER_TILED");
+    unsetenv("MYDS_INDEXER_REGISTER_ONLY_STRICT");
+    unsetenv("MYDS_INDEXER_BATCH_FLOATS");
+    myds_metal_buffer_free(keys); myds_metal_buffer_free(packed); myds_metal_buffer_free(q);
+    myds_metal_buffer_free(w); myds_metal_buffer_free(ref); myds_metal_buffer_free(cand);
+    myds_v41_gpu_scratch_free(scratch);
+    printf("  [PASS] register-only BF16 vs tiled BF16: 0-bit diff across ratio=1 & ratio=2 up to 128K+\n");
+    return 1;
+}
 static int test_indexscores_selected_blocks(void) {
     const uint32_t shapes[]={1,7,8,9,33,16385,32769,131077};
     myds_v41_gpu_indexer_compact_counters(NULL,true);
@@ -1051,7 +1120,7 @@ int main(int argc,char **argv) {
         int ok=test_indexscores_rows4()&&bench_indexscores_rows4();myds_metal_cleanup();return ok?0:1;
     }
     int ok=test_compact_resource()&&test_mixed_paths(disabled)&&test_slab_grow_carry()&&test_strategy_threshold(threshold)&&test_window_boundaries()&&
-           test_pack_and_gather()&&test_indexscores_bf16()&&test_indexscores_selected_blocks()&&test_indexscores_rows4()&&test_topk_prefix()&&test_attention_bf16()&&test_partial_picks()&&
+           test_pack_and_gather()&&test_indexscores_bf16()&&test_indexscores_register_only_long_and_ratio1()&&test_indexscores_selected_blocks()&&test_indexscores_rows4()&&test_topk_prefix()&&test_attention_bf16()&&test_partial_picks()&&
            test_prefill_batch_fusions();
     myds_metal_cleanup();if(ok)printf("ALL V4.1 GPU REGRESSIONS PASSED (%s)\n",disabled?"gather disabled":threshold?"explicit threshold":"gather enabled");return ok?0:1;
 }

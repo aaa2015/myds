@@ -227,8 +227,8 @@ static void reject_contract(void) {
     REJECT(matrix.view, matrix.view, matrix.view, mid.view, 256, 256, 8, 3, GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, NAN);
     REJECT(matrix.view, matrix.view, matrix.view, mid.view, 256, 256, 8, 3, GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, -1);
 #undef REJECT
-    /* The target entry point must reject Q2_K gate/up and top-3 before its
-     * hardcoded IQ2/sum6 graph can touch these tensors. */
+    /* The target entry point must reject Q2_K gate/up and out-of-range active
+     * counts (>6) before its IQ2/sum1..6 graph can touch these tensors. */
     CHECK(!myds_metal_routed_moe(out.view, x.view, matrix.view, matrix.view, matrix.view,
                                 ids.view, weights.view, mid.view, mid.view, mid.view, mid.view,
                                 256, 256, 8, 3, GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, 10));
@@ -237,7 +237,7 @@ static void reject_contract(void) {
                                 256, 256, 8, 6, GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, 10));
     CHECK(!myds_metal_routed_moe(out.view, x.view, matrix.view, matrix.view, matrix.view,
                                 ids.view, weights.view, mid.view, mid.view, mid.view, mid.view,
-                                256, 256, 8, 3, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_K, 10));
+                                256, 256, 8, 7, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_K, 10));
     CHECK(myds_metal_dispatch_count() == before);
     const uint8_t *mp = myds_metal_buffer_data(mid.view), *op = myds_metal_buffer_data(out.view);
     for (size_t i = 0; i < mid.bytes; ++i) CHECK(mp[i] == 0xa5);

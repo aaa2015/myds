@@ -92,9 +92,9 @@ static void routed_case(const char *directory,unsigned phase,uint32_t dim,uint32
     iq2_fill(gate,17); iq2_fill(up,71); q2_fill(down,29); activation_fill(x,43);
     selected_fill(ids,weights,tokens,active);
     struct guarded all[]={gate,up,down,x,ids,weights,sg,su,mid,sd,out};
-    if (active==3u) {
-        /* The target execution graph uses a fixed sum6 and cannot accept
-         * top-3. Verify rejection before any dispatch or buffer mutation. */
+    if (active>6u) {
+        /* The target execution graph supports 1..6 experts and rejects >6.
+         * Verify rejection before any dispatch or buffer mutation. */
         uint64_t before[sizeof(all)/sizeof(*all)];
         for (size_t i=0;i<sizeof(all)/sizeof(*all);i++)
             before[i]=fnv(myds_metal_buffer_data(all[i].owner),all[i].bytes+32u);
@@ -109,10 +109,10 @@ static void routed_case(const char *directory,unsigned phase,uint32_t dim,uint32
             REQUIRE(fnv(myds_metal_buffer_data(all[i].owner),all[i].bytes+32u)==before[i]);
             release(all[i]);
         }
-        printf("{\"kind\":\"top3_rejected\",\"phase\":%u,\"dim\":%u,\"width\":%u,"
-               "\"active\":3,\"tokens\":%u,\"batch\":%d,\"dispatches\":0,"
+        printf("{\"kind\":\"top7_rejected\",\"phase\":%u,\"dim\":%u,\"width\":%u,"
+               "\"active\":%u,\"tokens\":%u,\"batch\":%d,\"dispatches\":0,"
                "\"all_buffers_unchanged\":true,\"canaries\":true,\"pass\":true}\n",
-               phase,dim,width,tokens,batch);
+               phase,dim,width,active,tokens,batch);
         return;
     }
     if (batch) REQUIRE(myds_metal_begin_batch());
@@ -171,6 +171,7 @@ static void cases(const char *directory,unsigned phase) {
         routed_case(directory,phase,256,256,6,1,batch);
         routed_case(directory,phase,512,768,6,3,batch);
         routed_case(directory,phase,512,256,3,2,batch);
+        routed_case(directory,phase,512,256,7,2,batch);
     }
     routed_case(directory,phase,5120,2304,6,1,1);
     direct_q2_case(directory,phase,1,256);

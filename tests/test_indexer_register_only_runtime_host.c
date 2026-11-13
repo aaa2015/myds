@@ -42,7 +42,7 @@ int myds_metal_dispatch_kernel(const char *name,const void *args,size_t size,
 }
 struct fixture {struct myds_v41_gpu_scratch s;struct myds_metal_buffer y,q,w,k;uint32_t nc,nt,start,ratio;bool bf16;};
 static void configure(struct fixture *f,uint32_t nc,uint32_t nt,uint32_t start,uint32_t ratio,bool bf) {
-    memset(f,0,sizeof(*f));f->s.max_comp=f->s.key_comp_max=327680;f->s.batch_floats=2097152;
+    memset(f,0,sizeof(*f));f->s.max_comp=f->s.key_comp_max=1048576;f->s.batch_floats=4194304;
     f->nc=nc;f->nt=nt;f->start=start;f->ratio=ratio;f->bf16=bf;
     uint64_t bytes[]={nc*(uint64_t)nt*4,nt*16384ull,nt*128ull,nc*(bf?256ull:512ull)};
     struct myds_metal_buffer *v[]={&f->y,&f->q,&f->w,&f->k};
@@ -101,10 +101,15 @@ int main(int argc,char **argv) {
     assert(got.q_token_stride==16384&&got.q_head_stride==512&&got.weights_token_stride==128&&got.index_row_stride==256&&got.score_token_stride==61696&&got.scale==1.f/64.f);
     assert(got_buffers[0]==&f.q&&got_buffers[1]==&f.w&&got_buffers[2]==&f.k&&got_buffers[3]==&f.y);
     reset();configure(&f,1024,8,2040,2,false);reference(&f);
-    reset();configure(&f,513,9,1017,2,true);assert(call(&f,true));counts(1,0,1);
-    reset();configure(&f,16384,8,32760,2,true);assert(call(&f,true));counts(1,0,1);
+    reset();configure(&f,513,9,1017,2,true);assert(call(&f,true));counts(1,0,1);assert(got.ratio==2);
+    reset();configure(&f,513,513,0,1,true);assert(call(&f,true));counts(1,0,1);assert(got.ratio==1&&got.pos0==0&&got.n_comp==513);
+    reset();configure(&f,2048,8,2040,1,true);assert(call(&f,true));counts(1,0,1);assert(got.ratio==1&&got.n_comp==2048);
+    reset();configure(&f,16385,8,32762,2,true);assert(call(&f,true));counts(1,0,1);assert(got.ratio==2&&got.n_comp==16385);
+    reset();configure(&f,65536,16,65520,1,true);assert(call(&f,true));counts(1,0,1);assert(got.ratio==1&&got.n_comp==65536);
+    reset();configure(&f,524288,8,1048568,2,true);assert(call(&f,true));counts(1,0,1);assert(got.ratio==2&&got.n_comp==524288);
+    reset();configure(&f,1048576,8,1048568,1,true);f.s.batch_floats=8388608;assert(call(&f,true));counts(1,0,1);assert(got.ratio==1&&got.n_comp==1048576);
     reset();configure(&f,15424,128,30720,2,true);assert(call(&f,false));counts(0,0,0);assert(!preflight_calls&&!native_range_calls);
-    const uint32_t cases[][4]={{512,8,1016,2},{16385,8,32762,2},{2048,8,2040,1},{1024,7,2041,2},{16384,8,32761,2},{2048,2049,2047,2}};
+    const uint32_t cases[][4]={{512,8,1016,2},{512,8,504,1},{1048577,8,1048569,1},{524288,8,1048569,2},{2048,8,6136,3},{1024,7,2041,2},{2048,2049,2047,2}};
     for(unsigned i=0;i<sizeof(cases)/sizeof(cases[0]);i++){reset();configure(&f,cases[i][0],cases[i][1],cases[i][2],cases[i][3],true);reference(&f);}
     reset();configure(&f,15424,128,30720,2,true);batch=0;reference(&f);
     reset();kprof=1;reference(&f);
@@ -120,6 +125,8 @@ int main(int argc,char **argv) {
     reset();configure(&f,15424,128,30720,2,true);f.s.max_comp=15423;assert(!call(&f,true));counts(0,1,0);
     reset();configure(&f,15424,128,30720,2,true);f.s.key_comp_max=15423;assert(!call(&f,true));counts(0,1,0);
     reset();configure(&f,15424,128,30718,2,true);assert(!call(&f,true));counts(0,1,0);
+    reset();configure(&f,2048,8,2039,1,true);assert(!call(&f,true));counts(0,1,0);
+    reset();configure(&f,513,1026,0,2,true);assert(!call(&f,true));counts(0,1,0);
     reset();configure(&f,15424,128,30720,2,true);assert(!myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped(NULL,&f.y,&f.q,&f.w,&f.k,f.nc,32,f.nt,f.start,f.ratio,true,true));counts(0,1,0);
     reset();assert(!myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped(&f.s,&f.y,&f.q,&f.w,&f.k,f.nc,31,f.nt,f.start,f.ratio,true,true));counts(0,0,0);
     reset();configure(&f,15424,128,30720,2,true);preflight_bad="kernel_myds_indexer_scores_register_only_bf16";assert(!call(&f,true));counts(0,1,0);assert(!dispatch_calls&&preflight_calls==1);

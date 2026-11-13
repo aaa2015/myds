@@ -21,7 +21,7 @@ from unittest import mock
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
-APPROVED_SHADER_SHA = "a62922c6f5937236bd0e354dd06943b39bfa5f788419c16a8700da793769d616"
+APPROVED_SHADER_SHA = "012a55995344083180ed1134e569ac8b9aac426ca1bea4c5be34f7da4635e44c"
 
 
 def _parse_struct_fields(source_text: str, struct_name: str) -> list[tuple[str, str]]:
@@ -117,7 +117,7 @@ class RegisterOnlyHostTests(unittest.TestCase):
             with self.subTest(matrix=value):
                 output = self.run_selector(value, "matrix")
                 if value in (None, "1"):
-                    self.assertIn('"controls":50', output)
+                    self.assertIn('"controls":58', output)
         self.run_selector("1", "matrix", {"MYDS_INDEXER_KEY_WINDOW": "16"})
 
     def test_actual_publisher_stops_after_scorer_failure(self):

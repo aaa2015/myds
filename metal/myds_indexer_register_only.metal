@@ -19,10 +19,11 @@ kernel void kernel_myds_indexer_scores_register_only_bf16(
         ushort sg [[simdgroup_index_in_threadgroup]]) {
     // Uniform rejection before any write. Buffer spans/alignment/no-alias,
     // BF16 format, key-window=0 and 128-thread geometry are host preconditions.
-    if (args.n_head != 32u || args.head_dim != 128u || args.ratio != 2u ||
-        args.n_comp <= 512u || args.n_comp > 16384u ||
+    if (args.n_head != 32u || args.head_dim != 128u ||
+        (args.ratio != 1u && args.ratio != 2u) ||
+        args.n_comp <= 512u || args.n_comp > 1048576u ||
         args.n_tokens < 8u || args.n_tokens > 2048u ||
-        args.pos0 > 32768u - args.n_tokens || args.scale != 1.0f / 64.0f ||
+        args.pos0 > 1048576u - args.n_tokens || args.scale != 1.0f / 64.0f ||
         sg >= 4u) return;
 
     const uint token_base = tgpig.y * 8u;
