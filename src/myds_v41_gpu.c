@@ -2306,8 +2306,9 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
         _Static_assert(sizeof(ba)==48,"flash block scanner Metal ABI");
         const char *hm=getenv("MYDS_ATTN_HEADS_MODE");
         const int hm_smem=hm && !strcmp(hm,"smem");
-        const int hm_q8=hm && !strcmp(hm,"q8");
-        const int hm_q16=!hm_smem && !hm_q8;
+        const int hm_q16=hm && !strcmp(hm,"q16");
+        const int hm_q8=!hm_smem && !hm_q16;
+        (void)hm_q8;
         const int32_t q_tile=hm_q16 ? 16 : 8;
         const int32_t nsg=hm_q16 ? 8 : 4;
         const uint32_t nblk1=(uint32_t)(64/q_tile);

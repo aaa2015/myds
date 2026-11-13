@@ -62,7 +62,7 @@ static int unavailable(uint32_t kind){
 }
 static int rego_heads_parity(uint32_t rows,uint32_t start,uint32_t ratio){
     struct fixture f;CHECK(init(&f,rows,start,ratio));
-    const char *modes[3]={"smem","q8",NULL}; /* NULL exercises default active path (q16 Reg-O) */
+    const char *modes[3]={"smem","q16",NULL}; /* NULL exercises default active path (q8 Reg-O) */
     for(int m=0;m<3;m++){
         if(modes[m])setenv("MYDS_ATTN_HEADS_MODE",modes[m],1);
         else unsetenv("MYDS_ATTN_HEADS_MODE");
@@ -77,7 +77,7 @@ static int rego_heads_parity(uint32_t rows,uint32_t start,uint32_t ratio){
     size_t nbytes=(size_t)rows*64u*512u*4u;
     CHECK(!memcmp(myds_metal_buffer_data(f.out[0]),myds_metal_buffer_data(f.out[1]),nbytes));
     CHECK(!memcmp(myds_metal_buffer_data(f.out[0]),myds_metal_buffer_data(f.out[2]),nbytes));
-    printf("PASS rego heads 0-ULP rows=%u start=%u ratio=%u smem==q8==default(q16) byte exact\n",rows,start,ratio);
+    printf("PASS rego heads 0-ULP rows=%u start=%u ratio=%u smem==q16==default(q8) byte exact\n",rows,start,ratio);
     cleanup(&f);return 1;
 }
 int main(void){
