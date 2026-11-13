@@ -31,7 +31,8 @@
 > 数值本身仍然可信（每条都附了方法与判据），但无法仅凭本仓库独立复现——
 > 复现需要用本仓库的代码与 scripts 重跑。
 
-- 最后更新：**2026-11-12 13:00（§172）** —— 上线生产 `MYDS_MOE_DECODE_TOPK=3`（Decode 统一路由 Top-3，Prefill 保持完整 Top-6）：稳态 decode **42.9→49.1 t/s（+14.5%）**，端到端实测 **~38.5→45.2 t/s（+17%）**，`64K` 超长序列 **43.9 t/s**。否决浅层压至 `k=2` 的分层方案（`temp=0` 贪婪解码下削弱 EOS 引发 16K 复读，见 §172.3），并完成 14 套基准（含 `AIME 2026` 10/10、`HMMT Feb 2026` 7/10、`LCB v6` 7/10、`HLE` 64K 1/10、`SuperGPQA` 50.0%）6 小时近百万 token 验收（详见 §172）。
+- 最后更新：**2026-11-13 22:30（§173）** —— 联合上线 **A-1**（`7550c36`：`MYDS_INDEXER_REGISTER_ONLY` 放开 `ratio∈{1,2}` 与 `1M` 上下文门禁、修复 `a.ratio=causal_ratio` 潜伏硬编码，配对 `MYDS_INDEXER_BATCH_FLOATS=4194304`；严格 0-ULP）与 **B-1**（`MYDS_PREFILL_ATTN=auto`：`use_gather && c_len≥32 && p0/ratio≥256 && n_comp≥512` 时派发 `kernel_flash_attn_ext_blk` + `kernel_myds_flash_attn_heads_f16_dk512_dv512` FP32 累加矩阵注意力）：独占整机冷启动 prefill `32K` 中位 **680.8→717.5 t/s（+5.4%）**、`64K` **652.9→717.1 t/s（+9.8%）**、`128K` **549.9→672.1 t/s（+22.2%，单次省 42.6 s）**、`128K+2K` 热追加 **214.7→294.8 t/s（+37.4%）**；稳态 decode 保持 **49.1 t/s** 不变，NIAH `16K–128K` `4/4`、GPQA `5/5`、HumanEval `4/5` 逐题与 `vec` 基线零退化（详见 §173）。
+> 上一版：**2026-11-12 13:00（§172）** —— 上线生产 `MYDS_MOE_DECODE_TOPK=3`（Decode 统一路由 Top-3，Prefill 保持完整 Top-6）：稳态 decode **42.9→49.1 t/s（+14.5%）**，端到端实测 **~38.5→45.2 t/s（+17%）**，`64K` 超长序列 **43.9 t/s**。否决浅层压至 `k=2` 的分层方案（`temp=0` 贪婪解码下削弱 EOS 引发 16K 复读，见 §172.3），并完成 14 套基准（含 `AIME 2026` 10/10、`HMMT Feb 2026` 7/10、`LCB v6` 7/10、`HLE` 64K 1/10、`SuperGPQA` 50.0%）6 小时近百万 token 验收（详见 §172）。
 > 上一版：**2026-11-07 16:20（§143–§150）** —— **工作已暂停**（统帅令）。
   今日已上线：`MYDS_ENGRAM_IO_THREADS=16`（decode +1.4%）与 P0 engram 后台线程（32K prefill 641.7→679.4 t/s，+5.9%，0-ULP）；对 §105 基线 618.9 → 679.4 = **+9.8%**。
   账本今日三处自我更正：§144.4 归因（engram 63% 而非 MoE）、§147.2 撤回、**§89.1 认错内核**（生产跑 vec 家族，不是 heads；`MYDS_ATTN_WHICH=1` 取证）。
@@ -1014,6 +1015,8 @@ sudo powermetrics --samplers gpu_power -i 300    # 看 "GPU HW active residency"
 | `6040af3` | **kvdisk 默认关闭** | 零收益零代价（638.3 vs 638.2 t/s），清掉 667 套/7.8 GB 从未命中的缓存 | — | **在产** |
 | **§85 `MYDS_INDEXER_TILED=1`**（2026-10-24） | **indexer 颗粒度 128→256 对/TG** | **prefill −1.73%**（76.67→75.34 s @48.5K，3 轮） | **是**（**5,987 个 logits 文件逐字节一致**，`nll_sum` 恒 `167.508180918`） | **在产** |
 | **`3e5658e`+`070c4c9` / §172 `MYDS_MOE_DECODE_TOPK=3`**（2026-11-11） | **Decode 路由专家 Top-K 裁剪（6→3，重归一化；Prefill 保完整 Top-6）** | **decode +14.5%**（稳态 42.9→49.1 t/s；端到端 ~38.5→45.2 t/s，64K 仍 43.9 t/s） | **否**（有损近似；Prefill 保 0-ULP，Decode 经 14 套评测集验证无精度坍塌，见 §172） | **在产** |
+| **`7550c36` / §173 `MYDS_INDEXER_REGISTER_ONLY` + `MYDS_INDEXER_BATCH_FLOATS=4194304`**（2026-11-13） | **Indexer register-only 全范围放开（覆盖 `ratio∈{1,2}`、上限扩至 1M，修复 `a.ratio=causal_ratio` 硬编码）+ 评分缓冲 2M→4M floats** | **32K +1.3%**（680.8→689.3 t/s）、**64K +5.6%**（652.9→689.3 t/s）、**128K +17.6%**（549.9→646.4 t/s，省 35.0 s）、**128K+2K 热追加 +33.5%**（214.7→286.6 t/s） | **是**（M4 合成 `memcmp=0` + M2 Ultra 全模型 6 档短输出与 256-tok 长输出 SHA256 逐字节一致，见 §173） | **在产** |
+| **§173 `MYDS_PREFILL_ATTN=auto`**（2026-11-13） | **Prefill 注意力启用 `simdgroup_float8x8` 矩阵路径**（`use_gather && c_len≥32 && p0/ratio≥256 && n_comp≥512` 自动派发 `kernel_flash_attn_ext_blk` + `kernel_myds_flash_attn_heads_f16_dk512_dv512`，FP32 寄存器累加；叠加 A-1） | 叠加 A-1 总计：**32K +5.4%**（680.8→717.5 t/s）、**64K +9.8%**（652.9→717.1 t/s）、**128K +22.2%**（549.9→672.1 t/s，总省 42.6 s）、**128K+2K 热追加 +37.4%**（214.7→294.8 t/s） | **否**（FP32 矩阵归约次序与标量 `vec` 差 ~1 ULP；NIAH 16K–128K `4/4`、GPQA `5/5`、HumanEval `4/5` 逐题生成 token 数与 `vec` 完全一致，见 §173.4） | **在产** |
 
 #### 0.3.1 采纳登记规矩（2026-11-01 立）
 
@@ -20965,5 +20968,114 @@ decode-only            ：0.183 µs/行 ⇒ ×48 = 8.8 µs/token
 | 生产配置 | `MYDS_MOE_DECODE_TOPK=3`（双机舰队配置同步一致，`macstudio:8187` `PID 35051`，`/health` ok） |
 | 实测吞吐 | 稳态 decode **49.1 t/s**（端到端 ~45.2 t/s，`64K` 序列 43.9 t/s）；prefill 保持完整 `Top-6` 不变 |
 | 仓库门禁 | `audit-ledger` / `claims-check` / `check-knobs` / `check-knob-pairing` / `doc-check` / `adoption-check` 全 PASS |
+
+## §173 长上下文 Prefill 双项突围：Indexer `register-only` 全范围放开（`A-1`，严格 0-ULP）与 `simdgroup_float8x8` 矩阵注意力（`B-1`）联合上线（2026-11-13）
+
+本节清算 §160–§168 遗留的两条高确定性 Prefill 线索，在不损失任何评测质量（其中 `A-1` 保持全模型逐字节严格 0-ULP）的前提下，把 `32K`–`128K` 冷启动及 `128K+2K` 多轮热追加吞吐全面推上新台阶（`128K` 冷建 **549.9 → 672.1 t/s，+22.2%，单次省 42.6 s**；`128K+2K` 热追加 **214.7 → 294.8 t/s，+37.4%**）。
+
+### 173.1 根因复盘与历史障碍解除
+
+#### （1）`A-1`：Indexer `register-only` 为何此前卡在「前 32K 且仅浅层 `ratio=2`」（`P-2a` + `P-2b`）
+
+1. **历史回退参考系已变（§108 vs §85/§166.3）**：
+   §105 引入 `kernel_myds_indexer_scores_register_only_bf16` 时，保守锁定了 `ratio == 2`、`n_comp <= 16384`、`pos0 + n_tokens <= 32768`；§108 尝试扩到 `128K` 时因对比当时的未分块 `actual exact` 出现 Top-512 有序槽位平局差异而叫停（但 §108 当时已证实候选与 `TILED` 完整 score 位模式 **0 差异**）。当前生产自 §85 起常开 `MYDS_INDEXER_TILED=1`，越门请求实际回退的正是与 `register-only` 归约次序完全同构的 `TILED` 内核——这意味着放开 `register-only` 门禁在当前生产参考系下天然具备 **严格 0-ULP** 基础。
+2. **源码审查揪出两处潜伏的 `ratio=2` 硬编码陷阱（`src/myds_v41_gpu.c`）**：
+   单纯删掉首道门禁的 `causal_ratio != 2u` 并不能让深层 `L20..39`（`causal_ratio == 1`）正常工作，源码中还潜伏着两处隐式依赖 `ratio=2` 的实现缺陷：
+   - **第二道边界校验硬编码除 2**（原 `src/myds_v41_gpu.c:941`）：写了 `n_comp != end / 2u || (uint64_t)causal_start + 1u < 2u`。在 `causal_ratio == 1` 的后 20 层中 `n_comp == end`，该式恒真，导致 `ratio == 1` 请求 100% 掉入 `indexer_register_only_fallback`！必须改为通用不变量 `n_comp != end / causal_ratio || (uint64_t)causal_start + 1u < causal_ratio`。
+   - **Metal 参数结构体硬编码 `a.ratio = 2u`**（原 `src/myds_v41_gpu.c:971`）：向 GPU 传参时未传 `causal_ratio` 而写死了 `a.ratio = 2u`！一旦前两道门放行 `ratio == 1`，shader 内的因果可见键上界 `(pos0 + t + 1) / args.ratio` 会错误折半，直接破坏后 20 层注意力掩码。修复为 `a.ratio = causal_ratio`。
+   - **1M 上下文边界对齐**：生产配置 `MYDS_CTX_SIZE=1048576`、`MYDS_PREFILL_MAX_TOKENS=1048576`、`MYDS_CHUNK_KEY_MAX=1048576`，因此将宿主与 `metal/myds_indexer_register_only.metal:22-26` 的 `n_comp` 及 `end`（`pos0 + n_tokens`）上限统一从 `16384 / 32768` 放宽至 `1048576u`，并用 `_Static_assert(MYDS_CHUNK_MAXC == 2048u, ...)` 锁死宿主与 shader 的块长上界同步。
+3. **`P-2b`：评分缓冲 `MYDS_INDEXER_BATCH_FLOATS` 从 `2097152`（2M）配对扩至 `4194304`（4M，5 块等大缓冲合计增 `+40 MiB`）**：
+   `register-only` 要求单次派发满足 `n_comp * sub_tokens <= batch_floats`。原生产 `2097152` 在长上下文下被迫把每个 `2048` token 块切碎成大量小 `sub_tokens` 子批（例如 `128K` 冷建触发 `7,095` 次 indexer 请求）。`src/myds_v41_gpu.c:271-275` 共按 `batch_floats * 4` 分配 `chunk_scores`、`chunk_tmp_a`、`chunk_tmp_b`、`chunk_blocks`、`chunk_block_sel` 5 块缓冲；从 `2M` 扩至 `4M` 单块增 `+8 MiB`、5 块总计仅增 **`+40 MiB`**，即可使单次子批跨度翻倍、全模型 indexer + Top-512 派发总次数直接减半（`128K` 请求数 `7,095 → 3,588`），与 §29.6 曾证否的 `16M`（5 块暴增 `+280 MiB` 且当时无长程 `register-only` 配合）完全不同。
+
+#### （2）`B-1`：Prefill 矩阵注意力 `MYDS_PREFILL_ATTN=auto` 的准入重审
+
+- §160 / §161.3 已实测矩阵路径 `kernel_flash_attn_ext_blk` + `kernel_myds_flash_attn_heads_f16_dk512_dv512`（`src/myds_v41_gpu.c:2012, 2022`，`simdgroup_float8x8` FP32 寄存器累加，硬件矩阵乘加）在 32K 上较默认标量 `vec`（`head_first=1`：`kernel_myds_flash_attn_vec_head_first_f16_dk512_dv512`，`src/myds_v41_gpu.c:2069`）提速 `+3.6%`，当时仅因矩阵指令归约树与标量点积存在 `~1 ULP` 浮点舍入差异而搁置。
+- `MYDS_PREFILL_ATTN=auto`（`variant=2`，`src/myds_v41.c:7831`、`src/myds_v41_gpu.c:240-245, 1899-1900`）仅在满足 **`use_gather && c_len >= 32u && p0 / ratio >= 256u && n_comp >= 512u`** 的正式长块启用上述 `matrix` 内核组合（例如预热短块 `c_len=18, n_comp=9` 时 `attn-which#2` 实测保持 `use_matrix=0`，而正式 `c_len=2048, n_comp=2048` 时 `attn-which#3` 切换为 `use_matrix=1 matrix_encoded=1`），短前缀/短尾块与单步 decode 完全不动。按 §172 确立的真题验收门禁，对齐验证 `16K–128K` NIAH 与 `temp=0` 贪婪解码套件即可裁决是否上线。
+
+### 173.2 源码与测试提交（`7550c36`）
+
+- **提交**：`7550c3632ca2260e18d05cefc37efee667a2dded`（`feat(indexer): register-only gate covers ratio 1/2 up to 1M ctx + a.ratio lockstep fix (§173 A-1)`）
+- **核心改动**：
+  - `metal/myds_indexer_register_only.metal:22-27`：准入改为 `(args.ratio != 1u && args.ratio != 2u) || args.n_comp <= 512u || args.n_comp > 1048576u || args.n_tokens < 8u || args.n_tokens > 2048u || args.pos0 > 1048576u - args.n_tokens`；
+  - `src/myds_v41_gpu.c:929-972`：同步宿主准入、修复 `n_comp != end / causal_ratio` 与 `(uint64_t)causal_start + 1u < causal_ratio`、修复 `a.ratio = causal_ratio`；
+  - `include/myds_knobs_generated.h`：随行号偏移同步重生成（269 个开关，指纹 `3e137a378b40f8b3`）；
+  - **本地单测（Apple M4，`make -j8 test` 全绿）**：`tests/test_v41_gpu.c` 新增真 GPU 合成对照，覆盖 `ratio=1` 与 `ratio=2` 直至 `131K` 上下文的 `register_only` vs `TILED` 逐位 `memcmp == 0`；`tests/test_indexer_register_only_runtime_host.c` 扩展至 58 项宿主门禁断言；顺带修复 `tests/test_dspark_moe.c` 与 `tests/test_moe_down_nsg.{m,py}` 中 `3e5658e` 遗留的旧计数断言。
+
+### 173.3 Step B 真机独占窗口三臂对照实测（`macstudio` M2 Ultra）
+
+使用 `tools/with_prod_guard.sh` 在 `macstudio:8188` 独占整机执行三臂对照（原始记录归档于 `macstudio:/tmp/stepb_173/summary.json`）：
+- **`arm0_base`（原生产基线）**：`83cfaf9` 二进制（`6277002b…` / metallib `101ba200…`），`MYDS_INDEXER_BATCH_FLOATS=2097152`，`MYDS_PREFILL_ATTN` 未设（默认 `vec`）；
+- **`arm1_a1`（仅 `A-1`）**：`7550c36` 二进制（`8d5094f1…` / metallib `b9ebff00…`），`MYDS_INDEXER_BATCH_FLOATS=4194304`，`MYDS_PREFILL_ATTN` 未设（`vec`）；
+- **`arm2_a1_b1`（`A-1` + `B-1`）**：同 `7550c36` 二进制，加设 `MYDS_PREFILL_ATTN=auto`（日志 `attn-which#3` 实证 `variant=2 use_gather=1 use_matrix=1 matrix_encoded=1 c_len=2048 n_comp=2048`）。
+- 三臂均保持生产 `MYDS_PREFIX_CACHE=1`、`MYDS_PLD=1`、`MYDS_MOE_DECODE_TOPK=3`，每臂独立空 `MYDS_KV_DSK` 与 `MYDS_RESP_STATE`，冷启动请求全部核实 `cached_tok = 0`；全程崩溃计数 `20 → 20`（零新增 `.ips`）。
+
+| 场景（真实语料） | `prefill_tok` | `arm0_base`（原基线） | `arm1_a1`（仅 `A-1`，0-ULP） | `A-1` 提速 | **`arm2_a1_b1`（`A-1 + B-1`）** | **联合总提速（省时）** | `IRO encoded / req`（`arm0` → `arm1/2`） |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `cold_32k_v0` | 32,213 | 679.71 t/s (47.39s) | 686.68 t/s (46.91s) | +1.03% | **715.12 t/s** (45.05s) | **+5.21%** (−2.35s) | `405/581` → **`287/299`** |
+| `cold_32k_v1`（中位） | 32,213 | 680.78 t/s (47.32s) | 689.31 t/s (46.73s) | +1.25% | **717.48 t/s** (44.90s) | **+5.39%** (−2.42s) | `405/581` → **`287/299`** |
+| `cold_32k_v2` | 32,213 | 682.54 t/s (47.20s) | 690.34 t/s (46.66s) | +1.14% | **718.42 t/s** (44.84s) | **+5.26%** (−2.36s) | `405/581` → **`287/299`** |
+| `cold_64k` | 64,462 | 652.92 t/s (98.73s) | 689.33 t/s (93.51s) | +5.58% | **717.06 t/s** (89.90s) | **+9.82%** (−8.83s) | `417/1917` → **`949/979`** |
+| `cold_128k` | 128,911 | 549.88 t/s (234.43s) | 646.44 t/s (199.42s) | **+17.56%** | **672.06 t/s** (191.81s) | **+22.22% (−42.62s)** | `417/7095` → **`3556/3588`** |
+| `warm_128k_plus_2k`（`cached=128,512`） | 2,419 | 214.66 t/s (11.27s) | 286.60 t/s (8.44s) | **+33.51%** | **294.84 t/s** (8.20s) | **+37.35% (−3.06s)** | `0/799` → **`399/401`** |
+
+- **派发计数器闭环证据**：所有 18 次请求均满足 `fallbacks == 0, failures == 0, f32_dispatches == 0`；在 `128K` 冷建中，`register-only` 覆盖率从 `417 / 7,095`（5.9%，超过 32K 后全部退化为 `TILED` 且深层 `ratio=1` 为 0）跃升至 **`3,556 / 3,588`（99.1%）**；在 `128K+2K` 热追加中从 **`0 / 799`（0%）跃升至 `399 / 401`（99.5%）**。
+
+### 173.4 256-Token 长解码严格 0-ULP 补测与真题质量对等验收
+
+#### （1）`A-1` 全模型 256-Token 长输出严格 0-ULP 验证（`macstudio:/tmp/stepb_173/summary_ulp_long.json`）
+
+除上表 6 档默认输出 `arm0_base` 与 `arm1_a1` SHA256 6/6 全同外，专门将 `max_tokens` 设为 `256`（`temperature=0`）对全部 6 档重跑长解码对比（同时观测长上下文 decode 耗时无回退）：
+
+| 场景 | `prefill_tok` | `out_tok` / 字节数 | `ulp_arm0_base` SHA256 前 16 位 | `ulp_arm1_a1` SHA256 前 16 位 | 逐字节 0-ULP | 256-tok Decode 耗时（`arm0` vs `arm1`） |
+|---|---:|---:|---|---|:---:|---|
+| `cold_32k_v0` | 32,234 | 256 / 1,276 B | `0599ee0a49198c37` | `0599ee0a49198c37` | **PASS** | 5.71s vs 5.66s |
+| `cold_32k_v1` | 32,234 | 256 / 1,248 B | `7f6e2f53859c6133` | `7f6e2f53859c6133` | **PASS** | 5.67s vs 5.67s |
+| `cold_32k_v2` | 32,234 | 256 / 1,243 B | `481ddb451a502e20` | `481ddb451a502e20` | **PASS** | 5.68s vs 5.67s |
+| `cold_64k` | 64,483 | 256 / 1,248 B | `1bf67b475146d052` | `1bf67b475146d052` | **PASS** | 5.78s vs 5.77s |
+| `cold_128k` | 128,932 | 256 / 1,242 B | `57d169e10da8260d` | `57d169e10da8260d` | **PASS** | 5.97s vs 5.99s |
+| `warm_128k_plus_2k` | 2,440 | 256 / 1,272 B | `5c61b169baed26e3` | `5c61b169baed26e3` | **PASS** | 5.98s vs 5.95s |
+
+#### （2）`B-1`（`arm2_a1_b1`，`MYDS_PREFILL_ATTN=auto`）真题质量对等验证
+
+在相同口径（`--arm base_nothink`：`temperature=0.0, thinking=false, steer=none`）下对比 `ulp_arm0_base`（`vec`）与 `arm2_a1_b1`（`A-1 + B-1`）：
+
+| 评测集 | 规模 | `ulp_arm0_base`（`vec` 基线） | **`arm2_a1_b1`（`A-1 + B-1`）** | 逐题对等与停机核查 |
+|---|---:|---|---|---|
+| **NIAH 大海捞针**（16K / 32K / 64K / **128K** @ 50%） | 4 | §172.4 16K–64K `3/3` | **`4/4` (100%)** | `16K` (`447376`, 27.7s)、`32K` (52.9s)、`64K` (104.3s)、**`128K` (219.6s) 全部一次精确命中** |
+| **GPQA Diamond**（`--limit 5`） | 5 | **`5/5` (100%)**（418.6s） | **`5/5` (100%)**（419.4s） | 5 题生成 token 数逐题一致（`641 / 16384 / 810 / 411 / 1028`） |
+| **HumanEval**（`--limit 5`） | 5 | **脚本 `4/5`**（27.2s） | **脚本 `4/5`**（27.9s） | 5 题生成 token 数逐题一致（`225 / 302 / 146 / 154 / 232`），均仅 `#2` 因无语言标记漏提取，**零 `temp=0` EOS 死循环** |
+
+### 173.5 生产部署、制品溯源与一键回滚
+
+1. **磁盘 KV 缓存归档清理**：因 `B-1` 切换 prefill attention 累加路径，上线前已将 `macstudio:~/myds-kv/*` 旧缓存文件移至 `~/myds-kv.bak-pre173/`，避免新旧 FP16 KV 块混读。
+2. **双机舰队配置同步**：`macmini` 与 `macstudio` 的 `~/Projects/myfleet/myds.conf` 同步更新（双端 SHA256 均为 `3be2a1f4a8911fd9243a003298ce7484931750a2654c76b421da89cd5aaf7a4b`）：
+   - `MYDS_INDEXER_BATCH_FLOATS=4194304`（原 `2097152`）
+   - `MYDS_PREFILL_ATTN=auto`（新增显式配置）
+   - `MYDS_MOE_DECODE_TOPK=3`、`MYDS_PREFIX_CACHE=1`、`MYDS_PLD=1`、`MYDS_INDEXER_TILED=1` 保持不变。
+3. **线上运行态核验（`./tools/deploy_artifact.sh`）**：
+   - 源码提交：`7550c36`（`BUILD-INFO.json` 中 `dirty_build_paths: []`）；
+   - `bin/myds` SHA256：`8d5094f15f741df7c3c480da2a2d0a087a2866df7950931b589de23a95d987a7`；
+   - `bin/myds.metallib` SHA256：`b9ebff00ce43be7cfff491c3d3718a52d37a232a172b5562317a80ed93625df7`；
+   - Knob 指纹：`3e137a378b40f8b3`（`--print-config` 核验 79 项生效、`UNREAD (0)`）；
+   - 线上进程：`macstudio:8187` `PID 25393`，`/health` 返回 `{"status":"ok"}`，冷启动预热通过，崩溃计数维持 `20` 不变。
+4. **应急一键回滚命令**（在 `macstudio` 上同时回退制品与配对 `myds.conf`）：
+
+```text
+# 在 macstudio 上执行：恢复 §172 制品备份与更新前配置备份并重启舰队
+cp ~/Projects/myds/bin/.prev-20261113-220723/myds ~/Projects/myds/bin/myds
+cp ~/Projects/myds/bin/.prev-20261113-220723/myds.metallib ~/Projects/myds/bin/myds.metallib
+cp ~/Projects/myfleet/myds.conf.bak-173-20261113-220707 ~/Projects/myfleet/myds.conf
+rm -rf ~/myds-kv/*
+kill -TERM $(lsof -nP -iTCP:8187 -sTCP:LISTEN -t) && sleep 5
+cd ~/Projects/myfleet && ./start_fleet.sh
+```
+
+| 项 | 值 |
+|---|---|
+| 生产制品 | commit `7550c36`，binary `8d5094f1…`，metallib `b9ebff00…`，`macstudio:8187` `PID 25393`，`/health` ok |
+| 生产配置 | `myds.conf`（`3be2a1f4…`，双机一致）：`MYDS_INDEXER_BATCH_FLOATS=4194304` + `MYDS_PREFILL_ATTN=auto` + `MYDS_MOE_DECODE_TOPK=3` |
+| 当前基线 | prefill `32K` **717.5 t/s**、`64K` **717.1 t/s**、`128K` **672.1 t/s**、`128K+2K` 热追加 **294.8 t/s**；稳态 decode **49.1 t/s** |
+| 仓库门禁 | `check-knobs` / `check-knob-pairing` / `claims-check` / `audit-ledger` / `doc-check` / `adoption-check` / `test` 全 PASS |
+
 
 
