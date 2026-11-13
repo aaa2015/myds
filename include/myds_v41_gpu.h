@@ -185,10 +185,40 @@ typedef struct {
 void myds_v41_gpu_indexer_compact_counters(myds_v41_gpu_indexer_compact_counters_t *out, bool reset);
 /* Diagnostic fixture only: emulate absent optional PSOs before any dispatch. */
 void myds_v41_gpu_inject_indexer_compact_unavailable(bool enabled);
+/* Default-on 0-ULP compact <=16K decode scorer + Top-512 pipeline for il>20
+ * when count>16384 (MYDS_INDEXER_DECODE_COMPACT: absent/1=on, 0=off, else -1).
+ * Fully compatible with MYDS_INDEXER_DECODE_OVERLAP and zero CPU readback. */
+int myds_v41_gpu_indexer_decode_compact_enabled(void);
+typedef struct {
+    uint64_t prepare_requests, prepare_encoded;
+    uint64_t score_requests, score_encoded;
+    uint64_t topk_requests, topk_encoded;
+    uint64_t failures;
+} myds_v41_gpu_indexer_decode_compact_counters_t;
+void myds_v41_gpu_indexer_decode_compact_counters(
+    myds_v41_gpu_indexer_decode_compact_counters_t *out, bool reset);
+bool myds_v41_gpu_indexer_decode_compact_eligible(
+    const myds_v41_gpu_scratch_t *scratch, uint32_t n_comp);
+bool myds_v41_gpu_indexer_decode_compact_ready(
+    const myds_v41_gpu_scratch_t *scratch, uint32_t n_comp);
+void myds_v41_gpu_indexer_decode_compact_invalidate(myds_v41_gpu_scratch_t *scratch);
+const myds_metal_buffer_t *myds_v41_gpu_scratch_compact_blocks(const myds_v41_gpu_scratch_t *scratch);
+const myds_metal_buffer_t *myds_v41_gpu_scratch_compact_scores(const myds_v41_gpu_scratch_t *scratch);
+const myds_metal_buffer_t *myds_v41_gpu_scratch_compact_rows(const myds_v41_gpu_scratch_t *scratch);
+const myds_metal_buffer_t *myds_v41_gpu_scratch_compact_stage1(const myds_v41_gpu_scratch_t *scratch);
+int myds_v41_gpu_indexer_prepare_compact_blocks(myds_v41_gpu_scratch_t *scratch,
+    const myds_metal_buffer_t *block_selected, uint32_t n_blocks,
+    uint32_t top_blocks, uint32_t n_comp);
+int myds_v41_gpu_indexscores_compact_decode_bf16(myds_v41_gpu_scratch_t *scratch,
+    const myds_metal_buffer_t *q, const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *cache, const myds_metal_buffer_t *mask,
+    uint32_t n_comp, uint32_t first_row);
+int myds_v41_gpu_topk_compact_decode(myds_metal_buffer_t *ids,
+    uint32_t n_comp, myds_v41_gpu_scratch_t *scratch);
 /* Default-on prefill-only register-only scorer (MYDS_INDEXER_REGISTER_ONLY:
- * absent/1=on, 0=off). Parse after configuration loading. Original public
- * chunk APIs below always retain their original selector and never encode
- * this candidate. */
+ * absent/1=on, 0=off; MYDS_INDEXER_RO_SMEM_Q: absent/1=4KB Q-smem, 0=0B baseline).
+ * Parse after configuration loading. Original public chunk APIs below always
+ * retain their original selector and never encode this candidate. */
 int myds_v41_gpu_indexer_register_only_enabled(void);
 const char *myds_v41_gpu_indexer_register_only_selected_kernel(bool cache_bf16);
 typedef struct {
@@ -199,9 +229,10 @@ typedef struct {
  * ineligible/reference calls are not candidate fallbacks. */
 void myds_v41_gpu_indexer_register_only_counters(
     myds_v41_gpu_indexer_register_only_counters_t *out,bool reset);
-/* Narrow initial scope: ordinary/no trace, active batch/no exclusive kprof,
- * BF16-only/heads32/dim128, ratio2, 512<n_comp<=16384, 8<=n_tokens<=2048, end<=32768, key-window/SG=0.
- * Candidate has zero threadgroup memory. F32 getter and dispatch count stay NULL/0.
+/* Ordinary/no trace, active batch/no exclusive kprof, BF16-only/heads32/dim128,
+ * ratio in {1,2}, 512<n_comp<=1048576, 8<=n_tokens<=2048, end<=1048576, key-window/SG=0.
+ * Default kernel uses 4 KB static threadgroup memory for Q reuse across 4 simdgroups.
+ * F32 getter and dispatch count stay NULL/0.
  * In production mode, candidate bounds/dispatch rejections gracefully fall back to
  * the reference chunk scorer and track fallbacks. Strict fail-closed behavior can
  * be enforced via MYDS_INDEXER_REGISTER_ONLY_STRICT=1.

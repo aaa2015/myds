@@ -18,12 +18,14 @@
 struct myds_metal_buffer { size_t bytes, offset; void *data; };
 struct myds_v41_gpu_scratch { int dummy; };
 
-static struct myds_metal_buffer buffers[128];
+static struct myds_metal_buffer buffers[136];
 static struct myds_v41_gpu_scratch scratch_inst;
 static unsigned used, events;
 static const char *event_names[128], *failure;
 static int auto_barrier = 1, concurrent = 0, batch = 1, trace = 0;
 static int dense_q4 = 1, f16_bf16 = 1, idx_rope_quant = 1, head_slots = 1, topk_thresh = 0;
+static int decode_compact_mode = 1;
+static uint32_t stub_compact_prepared_count = 0u;
 
 static int record(const char *name) {
     assert(events < 128);
@@ -61,6 +63,67 @@ int myds_metal_f16_gemv_bf16_fuse_enabled(void) { return f16_bf16; }
 int myds_metal_indexer_rope_quant_fuse_enabled(void) { return idx_rope_quant; }
 int myds_v41_gpu_indexer_head_slots_enabled(void) { return head_slots; }
 int myds_v41_gpu_topk_threshold_enabled(void) { return topk_thresh; }
+int myds_v41_gpu_indexer_decode_compact_enabled(void) {
+    const char *v = getenv("MYDS_INDEXER_DECODE_COMPACT");
+    if (!v) return decode_compact_mode;
+    if (strcmp(v, "1") == 0) return 1;
+    if (strcmp(v, "0") == 0) return 0;
+    return -1;
+}
+bool myds_v41_gpu_indexer_decode_compact_eligible(const myds_v41_gpu_scratch_t *s, uint32_t n_comp) {
+    return s != NULL && n_comp > 16384u && myds_v41_gpu_indexer_decode_compact_enabled() == 1;
+}
+bool myds_v41_gpu_indexer_decode_compact_ready(const myds_v41_gpu_scratch_t *s, uint32_t n_comp) {
+    return myds_v41_gpu_indexer_decode_compact_eligible(s, n_comp) && stub_compact_prepared_count == n_comp;
+}
+void myds_v41_gpu_indexer_decode_compact_invalidate(myds_v41_gpu_scratch_t *s) {
+    (void)s;
+    stub_compact_prepared_count = 0u;
+}
+const myds_metal_buffer_t *myds_v41_gpu_scratch_compact_blocks(const myds_v41_gpu_scratch_t *s) {
+    (void)s;
+    return &buffers[128];
+}
+const myds_metal_buffer_t *myds_v41_gpu_scratch_compact_scores(const myds_v41_gpu_scratch_t *s) {
+    (void)s;
+    return &buffers[129];
+}
+const myds_metal_buffer_t *myds_v41_gpu_scratch_compact_rows(const myds_v41_gpu_scratch_t *s) {
+    (void)s;
+    return &buffers[130];
+}
+const myds_metal_buffer_t *myds_v41_gpu_scratch_compact_stage1(const myds_v41_gpu_scratch_t *s) {
+    (void)s;
+    return &buffers[131];
+}
+static uint32_t stub_qb_done = 0u;
+int myds_v41_gpu_indexer_prepare_compact_blocks(myds_v41_gpu_scratch_t *s,
+    const myds_metal_buffer_t *block_selected, uint32_t n_blocks,
+    uint32_t top_blocks, uint32_t n_comp) {
+    assert(s && block_selected && n_comp > 16384u && n_blocks == (n_comp + 7u) / 8u && top_blocks <= 2048u);
+    if (!record("prepare_compact_blocks")) {
+        stub_compact_prepared_count = 0u;
+        return 0;
+    }
+    stub_compact_prepared_count = n_comp;
+    return 1;
+}
+int myds_v41_gpu_indexscores_compact_decode_bf16(myds_v41_gpu_scratch_t *s,
+    const myds_metal_buffer_t *q, const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *cache, const myds_metal_buffer_t *mask,
+    uint32_t n_comp, uint32_t first_row) {
+    (void)mask; (void)first_row;
+    assert(s && q && weights && cache && n_comp > 16384u);
+    assert(stub_compact_prepared_count == n_comp);
+    return record("indexscores_compact_decode_bf16");
+}
+int myds_v41_gpu_topk_compact_decode(myds_metal_buffer_t *ids,
+    uint32_t n_comp, myds_v41_gpu_scratch_t *s) {
+    assert(ids && s && n_comp > 16384u);
+    assert(stub_compact_prepared_count == n_comp);
+    stub_qb_done = 64u;
+    return record("topk_compact_decode");
+}
 static int kv_reuse = 0;
 int myds_v41_attn_kv_reuse_enabled(void) { return kv_reuse; }
 void myds_v41_attn_kv_reuse_record_prestage_failure(void) {}
@@ -76,7 +139,6 @@ int myds_v41_gpu_attn_kv_reuse_prestage_window(myds_v41_gpu_scratch_t *s,
     return record("prestage_window");
 }
 void myds_v41_gpu_attn_kv_reuse_mark_fenced(myds_v41_gpu_scratch_t *s) { (void)s; }
-static uint32_t stub_qb_done = 0u;
 void myds_v41_gpu_attn_kv_reuse_defer_q_rope(myds_v41_gpu_scratch_t *s,
     myds_metal_buffer_t *q, bool compressed) {
     (void)s; (void)q; (void)compressed;
@@ -254,6 +316,7 @@ void myds_metal_barrier_buffers(const myds_metal_buffer_t *const *b, size_t n) {
         case 6: record("join_6"); break;
         case 7: record("join_7"); break;
         case 9: record("join_9"); break;
+        case 11: record("join_11"); break;
         default: record("join_n"); break;
     }
 }
@@ -578,6 +641,11 @@ int main(void) {
     buffers[127] = (struct myds_metal_buffer){
         16u << 20, 0, (void *)(uintptr_t)(UINT64_C(0x100000000) + 127u * UINT64_C(0x2000000))
     };
+    for (unsigned idx = 128u; idx < 132u; ++idx) {
+        buffers[idx] = (struct myds_metal_buffer){
+            16u << 20, 0, (void *)(uintptr_t)(UINT64_C(0x100000000) + idx * UINT64_C(0x2000000))
+        };
+    }
 #undef B
 
     /* 1. Default modes (both 0): reference path executes cleanly. */
@@ -827,7 +895,78 @@ int main(void) {
         assert(strcmp(event_names[i], expected_ffn[i]) == 0);
     }
 
-    puts("PASS: attention HC overlap + indexer decode overlap + KV reuse + FFN HC overlap host schedule, cohorts, strict env, exclusions, aliasing guards, counters, and failure recovery");
+    /* 10. [D-L1] MYDS_INDEXER_DECODE_COMPACT=1 at count > 16384 preserves INDEXER_DECODE_OVERLAP
+     *     (q_b_slice_1 + defer_q_rope + bind_topk_qb) on L20 & L24/28/32/36, and fails closed on bad env/failure. */
+    context.cfg.max_seq_len = 65536u;
+    args.capacity = 65536u;
+    args.compressed_kv->bytes = 128u << 20;
+    args.compressed_kv->data = (void *)(uintptr_t)UINT64_C(0x800000000);
+    args.index_cache->bytes = 128u << 20;
+    args.index_cache->data = (void *)(uintptr_t)UINT64_C(0x900000000);
+    setenv("MYDS_ATTN_HC_OVERLAP", "1", 1);
+    setenv("MYDS_INDEXER_DECODE_OVERLAP", "1", 1);
+    kv_reuse = 1;
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(*bad); ++i) {
+        setenv("MYDS_INDEXER_DECODE_COMPACT", bad[i], 1);
+        reset();
+        assert(myds_v41_gpu_indexer_decode_compact_enabled() == -1);
+        assert(!run_layer(20u, 32768u, true) && events == 0);
+    }
+    setenv("MYDS_INDEXER_DECODE_COMPACT", "1", 1);
+    reset();
+    stub_compact_prepared_count = 0u;
+    assert(run_layer(20u, 32768u, true));
+    assert(stub_compact_prepared_count == 32769u);
+    assert(strcmp(event_names[events - 6], "prepare_compact_blocks") == 0);
+    assert(strcmp(event_names[events - 5], "hc_mix_split") == 0);
+    assert(strcmp(event_names[events - 4], "defer_q_rope") == 0);
+    assert(strcmp(event_names[events - 3], "topk") == 0);
+    assert(strcmp(event_names[events - 2], "q_b_slice_1") == 0);
+    assert(strcmp(event_names[events - 1], "join_3") == 0);
+    for (unsigned i = 0; i < events; ++i) {
+        assert(strcmp(event_names[i], "topkmask") != 0);
+    }
+    events = 0;
+    assert(run_layer(24u, 32768u, true));
+    assert(strcmp(event_names[events - 9], "join_11") == 0);
+    assert(strcmp(event_names[events - 8], "indexscores_compact_decode_bf16") == 0);
+    assert(strcmp(event_names[events - 7], "q_b_slice_1") == 0);
+    assert(strcmp(event_names[events - 6], "join_4") == 0);
+    assert(strcmp(event_names[events - 5], "hc_mix_split") == 0);
+    assert(strcmp(event_names[events - 4], "defer_q_rope") == 0);
+    assert(strcmp(event_names[events - 3], "bind_topk_qb") == 0);
+    assert(strcmp(event_names[events - 2], "topk_compact_decode") == 0);
+    assert(strcmp(event_names[events - 1], "join_3") == 0);
+    assert_idx_counters(2, 2, 0);
+
+    /* Failure injection in compact stages restores encoder state and invalidates readiness. */
+    const char *compact_failures[] = {
+        "prepare_compact_blocks",
+        "indexscores_compact_decode_bf16",
+        "topk_compact_decode",
+    };
+    for (unsigned i = 0; i < 3u; ++i) {
+        reset();
+        stub_compact_prepared_count = (i == 0u) ? 0u : 32769u;
+        failure = compact_failures[i];
+        assert(!run_layer(i == 0u ? 20u : 24u, 32768u, true));
+        assert(auto_barrier == 1 && concurrent == 0);
+        if (i == 0u) assert(stub_compact_prepared_count == 0u);
+    }
+
+    /* MYDS_INDEXER_DECODE_COMPACT=0 cleanly selects the dense L24 overlap schedule. */
+    setenv("MYDS_INDEXER_DECODE_COMPACT", "0", 1);
+    reset();
+    stub_compact_prepared_count = 0u;
+    assert(run_layer(20u, 32768u, true));
+    events = 0;
+    assert(run_layer(24u, 32768u, true));
+    assert(strcmp(event_names[events - 8], "indexscores_head_slots") == 0);
+    assert(strcmp(event_names[events - 2], "topk") == 0);
+    unsetenv("MYDS_INDEXER_DECODE_COMPACT");
+    kv_reuse = 0;
+
+    puts("PASS: attention HC overlap + indexer decode overlap + [D-L1] compact decode + KV reuse + FFN HC overlap host schedule, cohorts, strict env, exclusions, aliasing guards, counters, and failure recovery");
     return 0;
 }
 

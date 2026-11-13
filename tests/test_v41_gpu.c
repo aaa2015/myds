@@ -254,9 +254,15 @@ static int test_indexscores_register_only_long_and_ratio1(void) {
     };
     const uint32_t max_nc = 65537u, max_nt = 513u;
     const size_t max_scores = (size_t)65537u * 33u; /* >= 513*513 */
-    CHECK(!setenv("MYDS_INDEXER_BATCH_FLOATS","4194304",1));
+    /* [P-I1] Unset MYDS_INDEXER_BATCH_FLOATS defaults to 8388608 when max_comp > 32768 */
+    unsetenv("MYDS_INDEXER_BATCH_FLOATS");
     myds_v41_gpu_scratch_t *scratch = myds_v41_gpu_scratch_create(max_nc);
-    CHECK(scratch && myds_v41_gpu_indexer_batch_floats(scratch) == 4194304u);
+    CHECK(scratch && myds_v41_gpu_indexer_batch_floats(scratch) == 8388608u);
+    CHECK(!setenv("MYDS_INDEXER_BATCH_FLOATS","4194304",1));
+    myds_v41_gpu_scratch_t *override_scratch = myds_v41_gpu_scratch_create(max_nc);
+    CHECK(override_scratch && myds_v41_gpu_indexer_batch_floats(override_scratch) == 4194304u);
+    myds_v41_gpu_scratch_free(override_scratch);
+    unsetenv("MYDS_INDEXER_BATCH_FLOATS");
     myds_metal_buffer_t *keys = myds_metal_buffer_alloc((size_t)max_nc * 128u * 4u),
                         *packed = myds_metal_buffer_alloc((size_t)max_nc * 128u * 2u),
                         *q = myds_metal_buffer_alloc((size_t)max_nt * 32u * 128u * 4u),
@@ -299,6 +305,23 @@ static int test_indexscores_register_only_long_and_ratio1(void) {
             if (vis < nc) CHECK(cp[(size_t)t * nc + vis] == -INFINITY && signbit(cp[(size_t)t * nc + vis]));
             if (vis + 1u < nc) CHECK(cp[(size_t)t * nc + nc - 1u] == -INFINITY);
         }
+    }
+    /* [P-I2s] Verify MYDS_INDEXER_RO_SMEM_Q=0 (0B baseline) vs =1 (4KB Q-reuse) vs TILED are 0-ULP identical */
+    {
+        const uint32_t nc = 65537u, nt = 33u, start = 131042u, ratio = 2u;
+        const size_t count = (size_t)nc * nt;
+        CHECK(!setenv("MYDS_INDEXER_RO_SMEM_Q","0",1));
+        CHECK(!strcmp(myds_v41_gpu_indexer_register_only_selected_kernel(true),
+                      "kernel_myds_indexer_scores_register_only_0b_bf16"));
+        memset(myds_metal_buffer_data(cand), 0x3c, count * 4u);
+        CHECK(myds_metal_begin_batch());
+        CHECK(myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped(
+            scratch, cand, q, w, packed, nc, 32u, nt, start, ratio, true, true));
+        CHECK(myds_metal_commit_batch());
+        CHECK(!memcmp(myds_metal_buffer_data(ref), myds_metal_buffer_data(cand), count * 4u));
+        unsetenv("MYDS_INDEXER_RO_SMEM_Q");
+        CHECK(!strcmp(myds_v41_gpu_indexer_register_only_selected_kernel(true),
+                      "kernel_myds_indexer_scores_register_only_bf16"));
     }
     unsetenv("MYDS_INDEXER_TILED");
     unsetenv("MYDS_INDEXER_REGISTER_ONLY_STRICT");
