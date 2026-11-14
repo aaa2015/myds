@@ -5,21 +5,23 @@
 >
 > *Origin & disclaimer: copied from ds4; wholly written by LLMs (DeepSeek, Gemini, Sol, Opus); just for better use on M2 Ultra / 192 GB.*
 
-**当前 native engine 已完整实现 DeepSeek V4.1 文本计算图（HC、Engram、压缩 KV、indexer），并通过与 ds4 oracle 的逐位验收。**
+**当前 native engine 已完整实现 DeepSeek V4.1 文本与视觉计算图（HC、Engram、压缩 KV、indexer、Vision Encoder），并通过与 ds4 oracle 的逐位验收。**
 
-验收依据与门禁规则记在性能账本的「方法论教训」与「已证否清单」两节；**性能现状、瓶颈归因与优化边界的唯一权威记录是 prefill/decode 全链路与优化账本，只读 §0.0（一页结论）即可掌握全部。** 单元测试通过不等于真实模型逐位对齐，改动数值路径仍须过同等门禁。
+验收依据与门禁规则记在[性能账本](docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md)的「方法论教训」与「已证否清单」两节；**性能现状、已采纳优化登记表（`§0.3`）与最新生产突破（`§143–§150`、`§172–§175`）以该账本为唯一权威记录**（`§0.0` 保留 2026-10-24 全链路普查快照，顶部摘要与 `§172–§175` 记录当前在产基线）。单元测试通过不等于真实模型逐位对齐，改动数值路径仍须过同等门禁。
 
-**2026-10-28 分词优化**：ASCII 分类查表与请求内 BPE 临时内存复用已实现。
+**2026-10-28 分词优化（§107）**：ASCII 分类查表与请求内 BPE 临时内存复用已实现。
 macstudio 实测英文/代码/多语言混合输入的 **CPU 分词耗时降低约 33–54%**，
 完整 token ID 对照与独立 HF 参考通过；这是分词组件收益，未测新的整次推理吞吐。
 原始样本、边界与复现命令见[分词性能记录](benchmarks/tokenizer_2026-10-28/README.md)，
 账本记录见 §107；本地门禁为 `make test-tokenizer`。
 
-**不相信这些数字？不用下载 337 GB 权重、也不需要 M2 Ultra。** 仓库自带可复现数据包，两条命令即可复核：
+**不相信这些数字？不用下载 362 GB 权重、也不需要 M2 Ultra。** 仓库自带可复现数据包与静态一致性门禁，几条命令即可复核：
 
 ```bash
-make audit-ledger          # 表格是否等于重算结果 + 6 条不变量，不符即 exit 1
+make audit-ledger          # 核验登记数字可溯源 + 从原始 JSONL 重算 §105 表格与 6 条不变量
 make verify-register-only  # 判定逻辑自检：能接受真数据、会拒绝假数据
+make doc-check             # 严格校验文档引用的仓库路径与 make 目标全部存在
+make adoption-check        # 校验账本 §0.3「在产」开关均存在于 include/myds_knobs_generated.h
 ```
 
 流程、容差理由与「这套复现不能证明什么」见 [`docs/REPRODUCE-register-only.md`](docs/REPRODUCE-register-only.md)，
@@ -31,64 +33,76 @@ make verify-register-only  # 判定逻辑自检：能接受真数据、会拒绝
 
 ![myds architecture](docs/architecture.svg)
 
-一张图看完：40 层里每个子层的实测耗时、按效率的分色（绿=已到顶 / 黄=有空间但受约束 /
-红=硬件天花板）、以及 decode 那 22.74 ms 的构成。**数字与[性能账本](docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md)一致，账本是唯一权威。**
+一张图看完 40 层里每个子层的结构与 2026-10-24 普查快照（48.5K prefill / 22.74 ms decode 构成；绿=已到顶 / 黄=有空间但受约束 / 红=硬件天花板）。此后经 **§143–§150** 与 **§172–§175** 多轮突破，图中黄框标注的 **flash-attention `32 KB` smem 限制**与 **indexer 全表打分/排序开销**均已被正面攻克，Decode 亦通过 `Top-3` 路由裁剪与 `O(16K)` 紧凑索引压至 **`~20.2 ms/tok`**——最新实测与演进见下节及[性能账本](docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md) `§0.3` / `§172–§175`。
 
 ---
 
 ## 实测性能
 
-**硬件**：Mac Studio，M2 Ultra（76 核 GPU），**192 GB 统一内存**（Apple 标称；十进制 206 GB，Metal 可用上限 201.9 GB），带宽实测峰值 724 GB/s。
-**模型**：DeepSeek-V4.1-Flash-1017-Q2，文件 362 GB，常驻 148.4 GB。
-**口径**：独占整机、`temperature=0`、无并发，同一台机器上测得。重复测量的离散度见账本 §0.1（90K 四次：587.6 vs 中位 597.4，差 1.7%）。
+- **硬件**：Mac Studio，Apple M2 Ultra（76 核 GPU，**96 MB SLC**），**192 GB 统一内存**（Apple 标称 192 GiB = 十进制 206 GB，Metal 可用上限 201.9 GB），统一内存理论带宽 800 GB/s（实测峰值 724–799 GB/s）。
+- **系统**：**macOS 27.0.1 (26A434)**（早期 2026-10-05 复现包测于 macOS 26.5.2）。
+- **模型**：`DeepSeek-V4.1-Flash-1017-Q2-dense-q4-imx-cliecy.gguf`（文件 362.14 GB，其中 56% 为稀疏 `pread` 的 Engram 表；常驻 wired ~148.4 GB）。
+- **测量口径（§173–§175 现行生产基线）**：通过 `tools/with_prod_guard.sh` 停产**独占整机**、`temperature=0`、`max_tokens=256`、无并发；保持生产配置（`MYDS_PREFIX_CACHE=1`、`MYDS_PLD=1`、`MYDS_PREFILL_ATTN=auto`、`MYDS_ATTN_HEADS_MODE=q8`、`MYDS_INDEXER_BATCH_FLOATS=8388608`、`MYDS_INDEXER_RO_SMEM_Q=1`、`MYDS_INDEXER_DECODE_COMPACT=1`、`MYDS_INDEXER_PREFILL_COMPACT=1`、`MYDS_MOE_DECODE_TOPK=3`、`MYDS_ENGRAM_IO_THREADS=16`）。冷启动使用台账真实语料（`benchmarks/register_only_2026-10-27/prompts/p32k_ab__v0.txt` 等同源拼接语料）并加唯一 nonce 前缀保证 `cached_tok = 0`（测量纪律见 [`docs/MEASUREMENT-DISCIPLINE.md`](docs/MEASUREMENT-DISCIPLINE.md)）。
 
-### Prefill
+### Prefill（§174 / §175 在产基线，2026-11-14）
 
-| prompt | 8K | 32K | 90K | 150K | 200K | 400K | 500K |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| **t/s** | 571.8 | **641.3** | 587.6 | 537.7 | 489.5 | 371.7 | 331.7 |
-| TTFT | 14.0 s | 49.9 s | 153 s | 279 s | 409 s | 1076 s | 1507 s |
+#### 1. 冷启动 Prefill（`cached_tok = 0`，`temp=0, max_tokens=256`）
 
-峰值在 **32K 附近**，之后随 attention 键数线性下降——这是算术强度的必然结果，不是实现低效。
+| 场景（真实语料） | 输入 Tokens | **吞吐（t/s）** | **TTFT / 耗时** | 对照说明 |
+|---|---:|---:|---:|---|
+| **32K 冷建**（3 样本中位） | 32,234 | **733.5**（§175 单测 733.7） | **43.9 s** | 较 10 月基线 `641.3 t/s (49.9 s)` 省 **6.0 s (+14.4%)** |
+| **64K 冷建** | 64,483 | **737.9** | **87.4 s** | 矩阵注意力 `q8` 双驻留 + `8M` `IRO` 峰值区 |
+| **128K 冷建** | 128,932 | **695.7–714.3** | **180.5–185.3 s** | 较 §172 末 `549.9 t/s (234.4 s)` 累计省 **49–54 s (+26.5%–29.9%)** |
 
-### Decode
+#### 2. 多轮对话热追加与超长续填（`MYDS_PREFIX_CACHE=1`，§174 + §175 `[P-L1]`）
 
-| prompt | 短 | 4K | 150K |
-|---|---:|---:|---:|
-| **t/s** | **43.97** | 41.30 | ~41.5 |
+| 场景 | 命中前缀 `cached` | 新增 `prefill_tok` | **吞吐（t/s）** | **耗时** | 收益归因 |
+|---|---:|---:|---:|---:|---|
+| **`128K + 2.4K` 多轮热追加**（3 样本中位） | 128,512 | 2,440–2,444 | **354.5** | **6.89 s** | §175 `[P-L1]` 较 §174 再提 **+9.49%**（省 0.66 s）；较 §172 末 `214.7 t/s (11.27 s)` 累计 **+65.1%** |
+| **`128K → 256K` 超长续填** | 128,512 | 129,307 | **610.1–618.3** | **209.1–212.0 s** | 较 §173 `552.6 t/s (234.0 s)` 省 **22.0–24.8 s (+10.4%–11.9%)** |
+| **`256K + 312` 超长热追加 prime**（3 样本中位） | 257,536 | 304–312 | **173.0** | **1.79 s** | §175 `[P-L1]` 较 §174 `149.3 t/s (2.08 s)` 再提 **+16.18%**（省 0.29 s） |
 
-decode 几乎不随上下文衰减（97 倍上下文只掉 12.8%）：**长上下文的代价全在 prefill**。
+> **历史超长上下文容量参考（2026-10-24 / §102，旧 `vec + TILED` 口径，未重跑 §173–§175 新核）**：
+> `200K` `489.5 t/s` (`408.5 s`) · `400K` `371.7 t/s` (`1076.1 s`) · `500K` `331.7 t/s` (`1507.1 s`，峰值 wired `178 GB`) · `600K` `243.4 t/s` (`2465.9 s`，`moe_chunks=8`，峰值 wired `184.9 GB`，正常完结)。当前生产 `MYDS_CTX_SIZE=1048576`、`MYDS_CHUNK_KEY_MAX=1048576`。
 
-### 关键边界：这里没有隐藏的余量
+### Decode（`256 tok`，`MYDS_MOE_DECODE_TOPK=3` + `MYDS_INDEXER_DECODE_COMPACT=1`）
 
-以 16.8K prompt = 26.3 s 为样本，三条「不是」决定了所有优化方向是否成立：
+| 上下文总长 | 短稳态（~56 tok） | 32K | 64K | 128K | 256K |
+|---|---:|---:|---:|---:|---:|
+| **t/s** | **~49.4** | **45.7–46.0** | **44.9** | **43.9–44.0** | **42.1–42.3** |
+| **ms/tok** | **20.2 ms** | 21.7–21.9 ms | 22.3 ms | 22.7–22.8 ms | 23.6–23.7 ms |
+
+跨 **4,600 倍上下文**（`56 tok → 257.8K`）Decode 仅衰减约 **14.6%**：§174 `[D-L1]` 将 `L24/28/32/36` 单步索引扫描从 `O(Context)` 封顶在 `O(16,384)`，长上下文代价被严格约束在 Prefill。（若设 `MYDS_MOE_DECODE_TOPK=0` 回退满血 `Top-6` 严格 0-ULP，短稳态为 `~42.9–44.0 t/s`。）
+
+### 物理边界与 2026-11 架构突围复盘（§143–§175）
+
+2026-10-24 的效率普查曾确认三条底层硬件事实（以 16.8K prompt 为样本）：
 
 | 疑问 | 实测 | 含义 |
 |---|---|---|
-| GPU 有空闲吗？ | 驻留 **99.9–100%**，1398 MHz 满频，104 W | 所有「重叠 / 消气泡」方案无效 |
-| CPU 是瓶颈吗？ | 功耗 **4.6 W**（峰值约 50 W）= 10% | 所有「CPU 异步 / 卸载」方案无效 |
-| 带宽受限吗？ | DRAM **14 GB/s = 峰值 2%** | 所有「省带宽」方案无效 |
+| GPU 算子间有空闲气泡吗？ | 计算期 GPU 驻留 **99.9–100%**，1398 MHz 满频，104 W | 纯 GPU 算子间「消气泡 / 改小屏障」（`intra_idle` 仅 0.07%）无效 |
+| CPU 计算能替 GPU 分担吗？ | CPU 算 MoE 慢 GPU **31.2 倍** | 把矩阵/MoE 算力卸载到 CPU 无效（但**消除 CPU 同步 I/O 阻塞 GPU** 有效，见下 ①） |
+| 常规 GEMM 受 DRAM 带宽限制吗？ | Prefill 主体 DRAM **14 GB/s**，重度依赖 **96 MB SLC** | 稠密投影已在 57–76% FP16 峰值；真正可挖的是**低占用率内核、冗余全局读写与超长上下文 `O(N²)` 无效扫描** |
 
-按实测效率普查，prefill 的 79 秒里 **57.3% 的块已在 57–76% 的 FP16 峰值**，
-30.2% 有空间但受硬件约束（flash-attention 被 32 KB threadgroup memory 锁死），
-3.7% 上界不足 2% 不值得做。完整分解、每一次失败尝试及其测量依据见
-[性能账本](docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md)。
+2026 年 10 月底曾据此得出「flash-attention 被 `32 KB` threadgroup memory 锁死、prefill 与 decode 均无两位数收益方向」的阶段性结论。**2026 年 11 月（§143–§175）在同一台 M2 Ultra、同一份 GGUF 权重上正面推翻了这一旧判断**，核心突破来自五步：
 
-**本仓库诚实的结论**：在这台机器上，「不改模型、不买设备」的约束下，
-prefill 与 decode 都已无两位数收益方向。
+1. **§143–§150（Engram I/O 并发隐藏 + §149 内核身份纠偏）**：
+   - `MYDS_ENGRAM_IO_THREADS=16`（decode `+1.4%`）配合 `MYDS_ENGRAM_PREFILL_ASYNC=1` 将 macroblock 入口原本同步阻塞 GPU `2.7 s` 的 SSD `pread`/解码移入后台线程（32K prefill `618.9 → 679.4 t/s`，**+9.8%**，严格 0-ULP）。
+   - **§149 关键纠偏**：通过新增 `MYDS_ATTN_WHICH=1` 取证发现，§89.1 误把当时默认未启用的 `matrix`（`heads`）内核当成了生产默认运行的 `vec` 内核（`kernel_myds_flash_attn_vec_head_first_f16_dk512_dv512`），由此立下仓库硬纪律：**优化任何 kernel 前，必须先拿到它在生产配置下真实被派发的日志/计数器证据**。
+2. **§172（`MYDS_MOE_DECODE_TOPK=3` 单步 Decode 路由裁剪，稳态 +14.5%）**：
+   - 仅在 `n_tokens == 1` 自回归解码阶段将每层路由专家从 `Top-6` 裁至统一 `Top-3` 并重归一化（Prefill 保持完整 `Top-6` 0-ULP，与 prefix cache 100% 兼容），稳态 Decode 从 `42.9` 跃升至 **`49.1 t/s`（+14.5%）**；真题排雷否决了会导致 `temp=0` EOS 停机失效的浅层 `k=2` 方案，并通过 14 套评测集（含 `AIME 2026` `10/10`、`GPQA` `5/5`、`HLE` 64K 连续 6 小时近百万 token 拷机）验收。
+3. **§173（`A-1` Indexer `register-only` 全范围放开 + `B-1` `MYDS_PREFILL_ATTN=auto` 矩阵注意力）**：
+   - 修复 `src/myds_v41_gpu.c` 中两处潜伏的 `ratio=2` 硬编码，将严格 0-ULP 的 `register_only` 打分放宽至 `ratio∈{1,2}` 与 `1M` 上下文（配对 `batch_floats` `2M→4M`）；同时在长块启用 `kernel_flash_attn_ext_blk` + `simdgroup_float8x8` 矩阵注意力（128K 冷建 **+22.2%，省 42.6 s**；`128K+2K` 热追加 **+37.4%**）。
+4. **§174（`[P-A1]` 寄存器 `O` 击穿 `32 KB` smem 墙 + Indexer `[P-I1]`/`[P-I2s]`/`[D-L1]`，对 §173 严格 0-ULP）**：
+   - **`[P-A1]` `MYDS_ATTN_HEADS_MODE=q8`**：利用 `V` 列块在 simdgroup 间正交的不变量，将 `O` 累加器从 `16 KB` threadgroup memory 移入寄存器 `lo[16]`，使 `heads` 内核 smem 从硬顶 **`32,768 B` 直降至 `12,320 B`**，在 M2 Ultra 上解锁 **2 TGs/core 双驻留延迟隐藏**（96 MB SLC 热命中下反超退回 1 TG/core 的 `q16`），正面打破 §89 的 `32 KB` smem 封锁；
+   - **`[P-I1]`** `MYDS_INDEXER_BATCH_FLOATS=8388608` 配对二次因果面积均摊尾块（全模型 `IRO` 派发减半、覆盖率 **100%**）+ **`[P-I2s]`** `MYDS_INDEXER_RO_SMEM_Q=1`（`4,096 B` XOR-swizzled smem `Q` 压缩 16× 全局重读，严守 `4 KB × 8 = 32 KB` 保满 `8 TGs/core`）；
+   - **`[D-L1]` `MYDS_INDEXER_DECODE_COMPACT=1`**：单步 Decode 后四层 `L24/28/32/36` 复用 `L20` 升序去重后的 `≤16,384` 候选集，将超长上下文索引耗时从 `O(Context)` 封顶为 `O(16K)`（`256K` Decode **+3.8%**）。
+5. **§175（`[P-L1]` `MYDS_INDEXER_PREFILL_COMPACT=1` 长文 Prefill YoCo 紧凑管线，严格 0-ULP）**：
+   - 针对长文 Prefill `L24/28/32/36`（`nc > 16384, pos0 ≥ 16384`），用无原子 SIMD 前缀和提取 8 行查询 tile 并集块表（`128K` 仅占全表 `12.6%`、`256K` 仅占 `6.4%–7.3%`），经 `4 KB` smem 紧凑 `register_only` 打分与批量 `≤16,384` 紧凑 Top-512（含同分/`<512` 分区双调重放），将单次子批扩至 `512` 行驻留 `96 MB SLC`（全局 scratch 仅净增 `+64 KiB`），使多轮热追加 `128K+2K` 再提 **+9.49%**、`256K+312` 再提 **+16.18%**。
 
-> **2026-10-25 修正**：原文此处写「剩下的路要么放弃 0-ULP 换 attention 的 11–14%，
-> 要么换更大内存的硬件」。**前半句不成立。** 放宽 0-ULP 后逐条实测的子项：
-> 专家进 grid.z **+0.82%**、专家权重截断 **+1.2%**、PLD 投机 **−6.6%**（倒亏），
-> 其余子项需改模型或被明确排除。详见账本 §100/§101，
-> 以及开关清单 [docs/ULP_SWITCHES.md](docs/ULP_SWITCHES.md)。
->
-> 若将来要重启性能方向，应从**模型侧**入手（专家布局重排 / 分层量化 / KV 分层驻留），
-> 而不是继续在 kernel 内找并发。
+> **2026-10-25 历史补充说明**：早期放宽 0-ULP 逐条实测的其他子项——专家进 `grid.z` **+0.82%**、专家权重截断 **+1.2%**、PLD 投机在无重复文本上 **−6.6%**——详见账本 §100/§101 及开关清单 [docs/ULP_SWITCHES.md](docs/ULP_SWITCHES.md)。
 
-**一个反例值得记住**：本仓库真实拿到的最大提速（单份代码审计 20 min → 4.1 min，5 倍）
-**不是来自内核优化**，而是修好了 `MYDS_PREFIX_CACHE` 的误用。这个项目的长期问题一直是
-「配置声称的值 ≠ 实际生效的值」，而不是算力。
+**一条工程铁律始终成立**：单份代码审计曾拿到的 5 倍提速（20 min → 4.1 min）来自修好 `MYDS_PREFIX_CACHE` 误用，而 §89/§149 的弯路来自「配置声称的值 ≠ 实际生效的内核」。为此仓库现已内置启动期 `verify_config_gate`（拒绝任何未被代码读取的 `MYDS_*` 拼写/废弃键）及 `make check-knobs` / `make check-knob-pairing` 静态门禁。
 
 ---
 
@@ -102,7 +116,7 @@ prefill 与 decode 都已无两位数收益方向。
 > 悄悄变成热启动的缓存、A/B 两臂必须先证明不同、`gpu_gap` 不可回收、
 > 0-ULP 通过不等于有收益。每一条都来自一次真实翻车，标了账本节号。
 
-### MoE（14 个候选，全部未达标）
+### MoE（14 个 0-ULP 候选 + 浅层 `Top-2` 有损候选）
 
 | 尝试 | 结果 |
 |---|---|
@@ -112,12 +126,13 @@ prefill 与 decode 都已无两位数收益方向。
 | 每 simdgroup 2 行（`NR0=2/NSG=4`） | **+77.9%** ⇒ 每 simdgroup **必须** 4 行 |
 | 5,248 B signed4 组合表 | 组件 **0-ULP 通过**，但耗时 **+20.5~21.0%** |
 | 热专家缓存 | 384 个专家全在用（745 万次选择覆盖 100%），**无冷专家可跳**；且 SLC 对同址复用 **零收益** |
+| Decode 浅层 `Top-2` / 深层 `Top-3` 分层裁剪（§172.3） | 吞吐 `50.5 t/s`，但 **`temp=0` 贪婪解码削弱 EOS logit 引发 16K 自检复读死循环**（HumanEval 耗时暴涨 19×）⇒ **证否淘汰**（统一 `Top-3` 稳定通过 14 套基准） |
 
 **MoE 的真实成本已量化**（三臂基准，同 dispatch 数、只差地址模式）：
 
 ```
 721 GB/s  连续纯读（硬件峰值 724）
-  ↓ −28%  散读（6 个专家动态选，物理不连续）
+  ↓ −28%  散读（动态选路由专家，物理不连续）
 522 GB/s
   ↓ −43%  拆包装（LDS 查表 + popcount 符号 + 掩码取反 + int8→float）
   ↓ −9%   FMA
@@ -131,32 +146,44 @@ prefill 与 decode 都已无两位数收益方向。
 | CPU 卸载 prefill MoE | **+1.7%**，不值得 | CPU 慢 GPU **31.2 倍** |
 | CPU 卸载 decode engram_kv | **−5.6%** | CPU 同步阻塞 1.43 ms，GPU 那 0.62 ms 本就在气泡里 |
 
-### Attention 与 dispatch（本轮 2026-10-24 普查）
+### Attention、Indexer 与 dispatch（已证否路径）
 
 | 方向 | 结论 |
 |---|---|
 | attention flash-decoding 拆两趟 | **−4.38%** |
 | RMSNorm→GEMV 前序融合 | 证否 |
-| 多头共享 K tile（H2/H4） | K-only 修订版 **0-ULP 通过**，但 concurrent 下退化 |
+| 多头共享 K tile（`vec` 路径 H2/H4） | K-only 修订版 **0-ULP 通过**，但 concurrent 下退化 |
 | 单头间接 KV 布局 | **0-ULP 通过**，但用时 **2.11 倍** |
 | dispatch 边界气泡 | 实测 **intra_idle 17.3 µs = 0.07%**（GPU 在 command buffer 粒度 100% 驻留） |
-| `simd_sum` 归约 / 屏障降级 | 组件 **0-ULP 通过**，indexer **−3.05%**，但 prefill **−0.18%（噪声内）** |
+| `simd_sum` 归约 / 屏障降级（§92） | 组件 **0-ULP 通过**，indexer **−3.05%**，但 prefill **−0.18%（噪声内）** |
+| `heads` 矩阵注意力盲选 `q16`（16 头/TG，`24,640 B` smem，§174.3） | Apple M4 微基准 **+85%**，但在 **M2 Ultra（96 MB SLC）上因退回 1 TG/core 反输 `q8`（2 TGs/core）−0.49%** ⇒ 跨芯片不可盲推 |
 
-### 结构性封死（不是实现问题，是硬件或模型问题）
+### 结构性边界（硬件、内存或模型约束）
 
-| 方向 | 阻断点 |
+| 方向 | 阻断点与最新进展 |
 |---|---|
-| flash-attention 提高每 TG 头数 | **32 KB threadgroup memory 装不下 16 头（需 60 KB）** ⇒ 18% 效率无法改善 |
+| `flash-attention` 提高每 TG 头数至 `Q=16` | **已部分攻克并定案（§174 `[P-A1]`）**：旧核把 `O` 放 smem 使 `Q=8` 顶满 `32,768 B`（1 TG/core）、`Q=16` 需 `60 KB` 不可编译；§174 将 `O` 移入寄存器后 **`q8` 降至 `12,320 B` 解锁 2 TGs/core 获显著收益**，而 `q16`（`24,640 B`）因卡在 1 TG/core 在 M2 Ultra 上反慢于 `q8` |
 | 换 FP8/BF16 主模型 | **统一内存墙**：FP8 需 ~510 GB，机器只有 192 GB |
 | DSpark 投机解码 | 最好 **11.1%** 接受率 × 3.04× 验证成本 ⇒ **净慢** |
+| `MYDS_INDEXER_KEY_WINDOW` 滑窗截断（§98） | 虽提速 ~15%，但 needle 落出窗口即**静默编造答案** ⇒ **严禁进生产** |
 | 多请求合批 | 单人顺序请求**无货可合**，且生产有单飞锁 |
 | TP=2 双机 | 需采购设备 |
 | 抬线程数超 448 | 实测无变化（早期数字来自同时改 nsg 常量，口径错误） |
 
-### 这一轮唯一采纳的改动
+### 关键已采纳里程碑汇总（§85–§175）
 
-`MYDS_INDEXER_TILED=1`：indexer 颗粒度 128→256 对/TG，**prefill −1.73%**，
-**5,987 个 logits 文件逐字节一致**（`nll_sum` 恒 `167.508180918`）。
+完整采纳与退役状态由账本 `§0.3` 维护，并由 `make adoption-check` 自动校验：
+
+| 节号 / 提交 | 核心改动 | 实测收益（M2 Ultra 独占） | 数值契约 |
+|---|---|---|---|
+| **§85** | `MYDS_INDEXER_TILED=1`（256 对/TG 分块打分） | 48.5K prefill **−1.73%** | 严格 0-ULP |
+| **§105** | `MYDS_INDEXER_REGISTER_ONLY=1`（首版浅层 32K `simdgroup_matrix` 打分） | 32K prefill **+4.35%**（593.1→618.9 t/s） | 严格 0-ULP |
+| **§107** | ASCII 分类快路径 + 请求内 BPE 工作区复用 | CPU 分词耗时 **−33%~−54%** | Token ID 逐位一致 |
+| **§146 + §148** | `MYDS_ENGRAM_IO_THREADS=16` + `MYDS_ENGRAM_PREFILL_ASYNC=1` 后台预读 | 32K prefill 累计 **+9.8%**（→679.4 t/s），decode **+1.4%** | 严格 0-ULP |
+| **§172**（`3e5658e`） | `MYDS_MOE_DECODE_TOPK=3`（仅单步 Decode Top-3 重归一化） | 稳态 decode **+14.5%**（42.9→49.1 t/s） | Prefill 0-ULP；14 套基准验收 |
+| **§173**（`7550c36`） | `A-1` `register_only` 放开 `ratio∈{1,2}` 至 `1M` + `B-1` `MYDS_PREFILL_ATTN=auto` | 32K **+5.4%**、64K **+9.8%**、128K **+22.2%（省 42.6 s）**、`128K+2K` **+37.4%** | `A-1` 严格 0-ULP；`B-1` FP32 矩阵归约 |
+| **§174**（`2636f6f`） | `[P-A1]` `heads_reg_o` `q8`（`12,320 B`，**2 TGs/core**）+ `[P-I1]` `8M` 二次均摊 + `[P-I2s]` `4 KB` smem `Q` + `[D-L1]` `O(16K)` 紧凑解码 | 较 §173：32K **+2.8%**（733.5 t/s）、64K **737.9 t/s**、128K **+8.9%（再省 16.4 s）**、`128K→256K` **+10.4%**、256K decode **+3.8%** | 对 §173 严格 0-ULP（9/9 档 SHA256 全同） |
+| **§175**（`194829e`） | `[P-L1]` `MYDS_INDEXER_PREFILL_COMPACT=1`（`L24..36` 8 行 tile 并集紧凑打分 + `≤16K` 紧凑 Top-512，子批 512 行） | 较 §174：`128K+2K` 热追加 **+9.49%**（354.5 t/s，省 0.66 s）、`256K+312` **+16.18%**（173.0 t/s，省 0.29 s） | 严格 0-ULP（10/10 档 SHA256 全同） |
 
 ---
 
@@ -208,175 +235,137 @@ python3 tools/slim_dense_q4.py --in model-q8.gguf --out model-q4.gguf \
 
 ```
 myds/
-├── Makefile                          # 极简构建规则 (make, make test, make clean)
-├── README.md                         # 项目设计与使用文档
-├── metal/                            # 迁移自 ds4 的 Metal 核心 Shader（共 24 个）
-│   ├── argsort.metal                 # Top-K 路由排序
-│   ├── bin.metal                     # 标量与张量二元计算
-│   ├── concat.metal                  # 张量拼接
-│   ├── cpy.metal                     # 快速连续内存与格式转换
+├── Makefile                          # 构建、测试、门禁与制品溯源规则
+├── README.md                         # 项目架构、实测基线与使用文档
+├── metal/                            # Metal 着色器源码（共 39 个 .metal + 1 个 LUT 生成脚本）
+│   ├── argsort.metal                 # Top-K 双调分区排序与因果前缀归并
+│   ├── bin.metal / concat.metal / cpy.metal / get_rows.metal / repeat.metal / set_rows.metal / sum_rows.metal / unary.metal
 │   ├── dense.metal                   # 量化 GEMV/GEMM (Q8_0, Q4_K, Q2_K, F16, F32)
 │   ├── dsv4_hc.metal                 # HC 多路残差（split / sinkhorn / 加权和 / RMSNorm）
-│   ├── dsv4_kv.metal                 # DeepSeek KV Cache 状态操作
-│   ├── dsv4_misc.metal               # DeepSeek 辅助算子
-│   ├── dsv4_rope.metal               # 解耦 RoPE 旋转位置编码
+│   ├── dsv4_kv.metal / dsv4_rope.metal # DeepSeek KV Cache 状态操作与解耦 RoPE
+│   ├── dsv4_misc.metal               # V4.1 辅助算子、TILED 打分、[D-L1] Decode 紧凑打分/Top-512、[P-L1] Prefill 8 行并集紧凑打分/Top-512
 │   ├── dsv41.metal                   # V4.1 专有算子（indexer / compressor / attention-out）
-│   ├── flash_attn.metal              # flash attention 核心（含 packed8 归约）
-│   ├── get_rows.metal                # 嵌入层查表操作
-│   ├── glu.metal                     # SwiGLU 激活函数
+│   ├── flash_attn.metal              # Flash Attention 主核（[P-A1] heads_reg_o q8/q16 寄存器累加、vec_head_first、ext_blk、packed8）
+│   ├── glu.metal / norm.metal / softmax.metal / topk_threshold.metal
 │   ├── moe.metal                     # 量化 MoE 专家 GEMV / 路由 / 累加（iq2_xxs, q2_K, q4_K …）
 │   ├── myds_chunk.metal              # 分块 prefill 的 chunk attention / compressor
-│   ├── myds_v41_moe.metal            # V4.1 shared-expert gate/up/SwiGLU 融合算子
-│   ├── norm.metal                    # RMSNorm 算子
-│   ├── repeat.metal                  # 广播重复
-│   ├── set_rows.metal                # 行级写入
-│   ├── softmax.metal                 # Softmax 与缩放
-│   ├── sum_rows.metal                # 行求和归约
-│   ├── topk_threshold.metal          # top-k 阈值筛选
-│   ├── unary.metal                   # 一元运算
-│   └── visenc.metal                  # 视觉编码器算子
-├── include/                          # 头文件定义（共 24 个）
-│   ├── myds.h                        # 推理引擎主接口与 V4/V4.1 架构判定
-│   ├── myds_internal.h               # 引擎内部共享
+│   ├── myds_indexer_register_only.metal # [P-I2s] 4 KB XOR-swizzled smem Q 复用 register-only Indexer 打分核（ratio 1/2，上限 1M）
+│   ├── myds_q4_v41.metal / myds_iq2_v41.metal / myds_qkv_dual.metal / myds_v41_moe.metal
+│   ├── myds_prefill_attention_indirect.metal / myds_prefill_attention_multihead.metal / myds_prefill_output_register.metal
+│   ├── myds_steer.metal              # GLP 残差控制向量（Steering）注入算子
+│   ├── visenc.metal                  # 视觉编码器算子
+│   └── probe_*.metal / pureread.metal # 带宽、反量化与候选算子微基准探针（7 个）
+├── include/                          # 头文件定义（共 36 个 .h）
+│   ├── myds.h / myds_internal.h      # 推理引擎主接口与内部共享结构
+│   ├── myds_knobs.h / myds_knobs_generated.h # 运行时开关注册表与自动生成清单（273 个键 + 指纹校验）
+│   ├── myds_configfile.h             # myds.conf 配置文件早期解析器
+│   ├── myds_debugstate.h / myds_trace.h / myds_sysstat.h # /debug/state、/trace 诊断状态与系统指标采集
 │   ├── myds_metal.h                  # Metal GPU 运行时与算子声明
-│   ├── myds_gguf.h                   # 极简 GGUF 格式解析器
-│   ├── myds_tokenizer.h              # DeepSeek BPE 分词器
-│   ├── myds_server.h                 # HTTP 服务端
-│   ├── myds_server_internal.h        # HTTP 服务端内部
-│   ├── myds_log.h                    # 微秒级线程安全结构化日志
-│   ├── myds_cpu.h                    # CPU 算子
-│   ├── myds_align.h                  # 对齐工具
-│   ├── myds_v41.h / _decode.h / _gpu.h / _moe.h   # V4.1 计算图 / decode / GPU / MoE
-│   ├── myds_engram.h                 # Engram 表读取
-│   ├── myds_kvdsk.h                  # 低位 KV 磁盘缓存
-│   ├── myds_lowkv_policy.h           # 低位 KV 策略
-│   ├── myds_snapshot_slots.h         # 内存前缀快照槽位
-│   ├── myds_dspark.h / myds_pld.h    # 投机解码 / PLD
-│   └── myds_vispre.h / _visw.h / _visfwd.h / _vjob.h   # 视觉：预处理 / 权重 / 前向 / 作业
-├── src/                              # 核心源码（共 19 个）
-│   ├── main.c                        # 命令行与交互终端入口
-│   ├── myds_engine.c                 # 前向传播流程、模型加载与投机解码调度
-│   ├── myds_cpu.c                    # CPU 数值算子（复用 RoPE 角度计算）
-│   ├── myds_metal.m                  # Metal 运行时与 GPU 算子分发
-│   ├── myds_gguf.c                   # GGUF 格式解析与 mmap 内存映射
-│   ├── myds_tokenizer.c              # BPE 编码与流式解码
-│   ├── myds_server.c                 # POSIX HTTP Server (OpenAI Responses / Chat)
-│   ├── myds_log.c                    # 结构化日志实现
-│   ├── myds_v41.c                    # V4.1 文本计算图（HC / 压缩 KV / indexer）
-│   ├── myds_v41_decode.c             # V4.1 decode 路径
-│   ├── myds_v41_gpu.c                # V4.1 GPU 算子与 PSO 组合
-│   ├── myds_v41_moe.c                # V4.1 MoE 路由与派发
-│   ├── myds_engram.c                 # Engram 表读取与并行 pread
-│   ├── myds_kvdsk.c                  # 低位 KV 磁盘缓存
-│   ├── myds_dspark.c                 # DSpark 投机解码
-│   ├── myds_vispre.c                 # 视觉：图片解码 / 预处理 / token 布局
-│   ├── myds_visw.c                   # 视觉：编码器权重加载
-│   ├── myds_visfwd.c                 # 视觉：编码器前向
-│   └── myds_vjob.c                   # 视觉作业
-└── tests/                            # C 单元/回归测试（39 个）+ 少量 Python 门禁
-    ├── test_gguf.c  test_tokenizer.c  test_engine.c  test_cpu.c  test_log.c  test_align.c
-    ├── test_metal.c  test_v41_gpu.c  test_attention_vec.c  test_attention_policy.c
-    ├── test_qkv_fusion.c  test_decode_q8_contract.c  test_v41_router.c  test_moe_shared3.c
-    ├── test_engram.c  test_engram_pool_failures.c  test_kvdsk.c  test_deeper_ssd.c
-    ├── test_server.c  test_server_api.c  test_http_bytes.c
-    ├── test_batch2_e2e.c  test_batch2_parity.c  test_batch2_shared_swiglu_pair.c
-    ├── test_tree_spec.c  test_pld.c  test_engine_depth2.c  test_depth2_shared_swiglu_shared3.c
-    ├── test_dspark_rollback.c  test_dspark_capture.c  test_dspark_router.c
-    │   test_dspark_moe.c  test_dspark_attention.c  test_dspark_proposal.c
-    ├── test_p1_regressions.c  test_kprof.c  test_metal_residency_lifecycle.c
-    └── test_teardown_order.c  test_visw.c
-    # Python 门禁：tests/test_http_bytes.py、tests/test_bench_reproduce.py、tests/test_engram_io_window.py 等
+│   ├── myds_gguf.h / myds_tokenizer.h # 极简 GGUF 解析器与 DeepSeek BPE 分词器
+│   ├── myds_server.h / myds_server_internal.h # HTTP 服务端与连接/队列内部接口
+│   ├── myds_v41.h / myds_v41_decode.h / myds_v41_gpu.h / myds_v41_moe.h # V4.1 计算图 / Decode / GPU / MoE
+│   ├── myds_engram.h / myds_kvdsk.h / myds_lowkv_policy.h / myds_snapshot_slots.h # Engram 读取与多级前缀/KV 缓存
+│   ├── myds_dspark.h / myds_dspine.h / myds_dspine_capture.h / myds_pld.h # 投机解码（DSpark / DSpine / PLD）
+│   ├── myds_steer.h / myds_steer_alpha.h / myds_loop_guard.h # 控制向量注入与复读保护
+│   ├── myds_vispre.h / myds_visw.h / myds_visfwd.h / myds_vjob.h # 视觉：预处理 / 权重 / 前向 / 作业
+│   └── myds_cpu.h / myds_moe_cpu.h / myds_log.h / myds_align.h
+├── src/                              # 核心源码（共 41 个文件：35 个 .c、1 个 .m、2 个内部表 .h、3 个 .inc）
+│   ├── main.c                        # CLI 入口、单实例锁、端口预检与启动期配置门禁（verify_config_gate）
+│   ├── myds_configfile.c / myds_knobs.c # 配置文件加载、MYDS_* 读取追踪与指纹输出
+│   ├── myds_debugstate.c / myds_debug_acl.c / myds_trace.c / myds_sysstat.c # /debug/state、/trace 与 CIDR+Token 鉴权
+│   ├── myds_engine.c                 # 前向传播调度、前缀快照恢复与投机解码状态机
+│   ├── myds_metal.m                  # Metal 运行时、PSO 缓存、Residency 保活与 GPU 算子分发
+│   ├── myds_gguf.c / myds_tokenizer.c # GGUF mmap 映射（含分片拼接）与 ASCII 快路径 BPE 分词器
+│   ├── myds_server.c / myds_http_io.c / myds_infer_queue.c / myds_proto_openai.c / myds_resp_store.c / myds_dsml.c # HTTP 服务端与协议栈
+│   ├── myds_v41.c                    # V4.1 主计算图（HC / 压缩 KV / YoCo / 异步 Engram / 分块调度）
+│   ├── myds_v41_decode.c / myds_v41_gpu.c / myds_v41_moe.c # V4.1 Decode、GPU 管线与 MoE 路由（含 Decode Top-K）
+│   ├── myds_engram.c / myds_engram_cpu.c / myds_kvdsk.c # Engram 并行/自适应 pread 与低位 KV 磁盘缓存
+│   ├── myds_dspark.c / myds_dspine.c / myds_dspine_capture.c # DSpark / DSpine 投机解码与特征采集
+│   ├── myds_steer.c / myds_steer_alpha.c # GLP 控制向量加载与动态缩放
+│   ├── myds_vispre.c / myds_visw.c / myds_visfwd.c / myds_vjob.c # 视觉编码全链路
+│   └── myds_cpu.c / myds_moe_cpu.c / myds_log.c # CPU 算子与微秒级结构化日志
+├── tools/                            # 部署、制品溯源、台账审计与基准复现脚本（deploy_artifact.sh、with_prod_guard.sh 等）
+├── docs/                             # 性能总账本、测量纪律、0-ULP 开关清单与视觉设计文档
+└── tests/                            # 单元/GPU 0-ULP/宿主门禁与回归测试（共 172 个文件：86 .c + 34 .m + 49 .py + 2 .sh + 1 .h，另含 images/）
+    ├── test_gguf.c  test_tokenizer.c  test_tokenizer_workspace.c  test_engine.c  test_cpu.c  test_log.c
+    ├── test_metal.c  test_v41_gpu.c  test_attention_vec.c  test_attention_policy.c  test_attention_heads_rego.m
+    ├── test_indexer_decode_compact.c  test_indexer_prefill_compact.m  test_attn_indexer_overlap_host.c
+    ├── test_indexer_register_only_runtime_host.c  test_indexer_register_only_publisher_host.c  test_indexer_register_only_host.py
+    ├── test_qkv_fusion.c  test_decode_q8_contract.c  test_v41_router.c  test_moe_down_nsg.m  test_moe_shared3.c
+    ├── test_engram.c  test_engram_pool_failures.c  test_kvdsk.c  test_anchor_slots.c  test_deeper_ssd.c
+    ├── test_server.c  test_server_api.c  test_http_bytes.c  test_debug_state.c  test_debug_acl.c  test_trace.c  test_dsml.c
+    ├── test_steer.c  test_steer_alpha.c  test_loop_guard.c  test_dspine_runtime.c  test_dspine_capture.c
+    └── test_p1_regressions.c  test_kprof.c  test_metal_residency_lifecycle.c  test_teardown_order.c  test_visw.c
 ```
 
 ---
 
 ## 编译与测试
 
-历史优化轮次的验收结果摘要（每轮均为同构建完整模型 A–B–A、短/800-token 业务输入）：
+早期优化轮次验收摘要与后续全部候选记录（含 §85 `TILED`、§105 `register_only`、§146/§148 Engram、§172 `MOE_DECODE_TOPK=3`、§173–§175 矩阵注意力与紧凑 Indexer）均统一维护在[性能账本](docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md)的 `§0.3`（已采纳）与 `§0.4`（已证否）两节——**该账本是性能结论的唯一权威。**
 
-| 轮次 | 内容 | decode 变化 |
-|---|---|---|
-| 2026-10-13 | Router SIMD shuffle、attention register、Q2 固定形状三个原生候选 | **−1.87% / −2.03%** |
-| 2026-10-14 | 上述组合部署上线后的复验 | **−1.85% / −1.98%** |
-
-更早的 Q2 down 独立 NSG、top-k 前缀合并裁剪、NaN 分类融合、Batch2 output-B Q8 双输入共享权重
-等候选，结论均已并入[性能账本](docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md)的
-已采纳 / 已证否两节——**该账本是性能结论的唯一权威，本 README 不重复维护这些数字。**
-
-测试关闭 profiler、内存前缀命中和 KV 磁盘命中，每组预热一次后正式运行三次。
-prefill 按实际处理的输入 token 计时，decode 按首次到末次输出回调之间的 token 间隔计时。
-基准固定 `temperature=0`、`top_p=1`、`top_k=0`、`min_p=0`、
-`repetition_penalty=1`、`seed=42`；greedy argmax 路径不读取采样随机数。
-长输入的耗时波动与「无 GPU 额外提交」的路径诊断当时另有补充验证，测到过两轮变慢；
-原始数据保留在证据包里，**不把复测的稳定收益当作所有运行的保证**。
+测试关闭 profiler，冷启动对照确保 `cached_tok = 0`（保持生产 `MYDS_PREFIX_CACHE=1` 并使用唯一 nonce 前缀），每组预热后正式采样取中位。
+基准固定 `temperature=0`、`top_p=1`、`top_k=0`、`min_p=0`、`repetition_penalty=1`、`seed=42`；greedy argmax 路径不读取采样随机数。
 2026-09-29 的早期性能记录只作历史状态说明，**已明确不代表可用性能**，不作基线。
-当前基线与边界见性能账本 **§0.0**。
 
-### 1. 编译项目
+### 1. 编译项目与生成构建溯源
 
 在项目根目录下直接运行：
 
 ```bash
-make
+make -j8 all          # 编译 bin/myds、bin/myds.metallib 及测试套件
+make provenance       # 生成 bin/BUILD-INFO.json（记录 commit、编译标志、源文件指纹与产物 SHA256）
 ```
-
-将在 `bin/` 目录下生成 `myds` 主程序以及独立的测试程序。
 
 ### 2. 运行单元测试套件
 
 ```bash
-make test
+make -j8 test
+make test-indexer-register-only-host   # Indexer register-only / prefill-compact 宿主门禁套件
+make test-tokenizer                    # 分词器正确性与工作区复用回归
 ```
 
-测试流程将自动编译并依次运行单元测试套件，包含下列基础测试以及
-Engram、KV 磁盘存储、前缀恢复、V4.1 GPU 和 HTTP 字节输出回归：
+`make test` 会先自动执行 `make check-knobs`，随后编译并运行 C / Metal / Python 回归套件，涵盖：
 
-1. **GGUF 模型解析器测试套件 (`bin/test_gguf`)**：
-   - [x] GGUF v2/v3 标量、字符串、布尔及动态数组元数据提取
-   - [x] 张量描述信息校验与 32 字节对齐 mmap 内存映射验证
-   - [x] 非法魔数（Magic）、损坏文件及不存在文件的容错处理
+1. **GGUF 模型解析器测试套件 (`bin/test_gguf`、`bin/test_gguf_bounds`、`bin/test_gguf_split`、`bin/test_gguf_byte_split`)**：
+   - [x] GGUF v2/v3 元数据提取、32 字节对齐 `mmap` 映射、分片拼接与畸形越界防护
    - [x] **DeepSeek V2 & V3 架构拦截校验**（严格拒绝 legacy V2/V3 模型）
 
-2. **DeepSeek BPE 分词器测试套件 (`bin/test_tokenizer`)**：
-   - [x] 词表加载与 BOS/EOS 特殊 Token 识别
-   - [x] Byte BPE 映射、merge rank、JoyAI 预分词与已知答案
-   - [x] Byte-Fallback `<0xHH>` 未登录字节回退处理
-   - [x] 逐 Token 还原文本与字节 Token 还原
-   - [x] 缺失词表时的 256 字节兜底模式验证
+2. **DeepSeek BPE 分词器测试套件 (`bin/test_tokenizer`、`bin/test_tokenizer_workspace`)**：
+   - [x] 词表加载、BOS/EOS 识别、ASCII 快路径 Byte BPE、JoyAI 预分词、`<0xHH>` 回退与工作区复用
 
-3. **Metal GPU 核心算子测试套件 (`bin/test_metal`)**：
-   - [x] **RMSNorm** 算子（与 CPU 基准对齐，浮点误差 < 1e-4）
-   - [x] **SwiGLU** 激活函数（与 CPU 基准对齐，浮点误差 < 1e-4）
-   - [x] **Decoupled RoPE** 解耦旋转编码（旋转前后向量模长守恒）
-   - [x] **DeepSeek-MoE Router** 专家路由（Sigmoid 门控打分、Top-K 选取与权重重整化）
-   - [x] **GEMV F32** 浮点矩阵向量乘法
-   - [x] **GEMV Q8_0** 量化反量化点积精度测试
-   - [x] **DeepSeek-MoE Sum** 多专家加权累加测试
-   - [x] **Add** 残差加法与广播
-   - [x] **Softmax** 归一化与单调性校验
-   - [x] **Buffer R/W** 统一内存边界读写安全测试
+3. **Metal GPU 核心算子与 V4.1 严格 0-ULP 套件 (`bin/test_metal`、`bin/test_v41_gpu`、`bin/test_attention_heads_rego`、`bin/test_indexer_decode_compact`、`bin/test_indexer_prefill_compact`)**：
+   - [x] RMSNorm / SwiGLU / Decoupled RoPE / MoE Router & Sum / Q8 & Q4 GEMV 精度与边界校验
+   - [x] `[P-A1]` `heads_reg_o`（`q8` / `q16` vs `smem`）PSO 零寄存器溢出与多长度/掩码逐位 `0-ULP`
+   - [x] `[P-I2s]` `register_only` `4 KB` XOR-swizzled smem `Q` vs `0 B` / `TILED` 逐位 `0-ULP`
+   - [x] `[D-L1]` 单步 Decode 与 `[P-L1]` 批量 Prefill `≤16,384` 紧凑打分 + 紧凑 Top-512（含分区内/边界同分与 `<512` 稀疏尾双调重放）逐位 `0-ULP`
 
-4. **HTTP 服务器并发测试套件 (`bin/test_server`)**：
-   - [x] Socket 生命周期与 HTTP 报文收发
-   - [x] 并发非阻塞请求测试
+4. **HTTP 服务端、协议栈与诊断鉴权测试套件 (`bin/test_server`、`bin/test_server_api`、`bin/test_debug_state`、`bin/test_debug_acl`、`bin/test_trace`、`bin/test_dsml`)**：
+   - [x] `/responses`、`/chat/completions`、`/health`、`/v1/models` 流式 SSE 与非流式 JSON 协议对齐
+   - [x] `/debug/state` 与 `/trace` 的回环/CIDR + Token 双重访问控制及原子计数器导出
 
 5. **微秒级结构化日志测试套件 (`bin/test_log`)**：
-   - [x] 日志级别过滤 (DEBUG / INFO / WARN / ERROR)
-   - [x] 多线程并发无锁写入安全性测试
+   - [x] 日志级别过滤 (DEBUG / INFO / WARN / ERROR) 与多线程并发安全性
 
-6. **OpenAI Responses API 协议测试套件 (`bin/test_server_api`)**：
-   - [x] 端点路由匹配 (`/responses`, `/chat/completions`, `/health`, `/models`)
-   - [x] 复杂输入参数优先级解析 (`max_output_tokens` 优先于 `max_tokens`)
-   - [x] Responses API 流式 SSE 事件与非流式 JSON 响应规范金标对齐
+6. **推理引擎、缓存与投机解码测试套件 (`bin/test_engine`、`bin/test_kvdsk`、`bin/test_anchor_slots`、`bin/test_pld`、`bin/test_dspark_*`、`bin/test_dspine_*`)**：
+   - [x] Greedy / Temperature / Top-p 采样、跨 512-token 前缀快照恢复、KV 磁盘段校验、取消恢复与投机回滚
 
-7. **推理引擎采样与架构判定测试套件 (`bin/test_engine`)**：
-   - [x] Greedy Argmax / Temperature / Softmax / Top-p 采样算法测试
-   - [x] **DeepSeek V4/V4.1 架构专有支持与 V2/V3 拦截测试**（`myds_is_supported_arch`）
-   - [x] Prefill 工作区扩容/复用、跨 512-token 边界、取消与恢复、KV 容量检查
-
-8. **CPU 数值回归 (`bin/test_cpu`)**：
+7. **CPU 数值回归 (`bin/test_cpu`)**：
    - [x] RoPE 在 288 组形状/位置/缩放/正反向组合下与原实现逐位一致
-   - [x] 逆旋转还原、无旋转及非法形状边界
+
+### 3. 自动化一致性与部署门禁（Verification Gates）
+
+任何代码、配置或台账改动在合入与上线前均须通过以下静态/溯源门禁（全部退码须为 `0`）：
+
+```bash
+make check-knobs         # 校验源码实际读取的全部 MYDS_* 键与 include/myds_knobs_generated.h 完全同步
+make check-knob-pairing  # 校验 bin/myds 开关指纹与舰队配置文件配对，杜绝未知/拼写错误环境变量静默失效
+make claims-check        # 校验登记的性能数字与 benchmarks/ 原始测量记录逐项可溯源
+make audit-ledger        # 运行 claims-check 并从原始 JSONL 重算复核台账 §105 统计表与不变量
+make doc-check           # 严格审计 Markdown 文档中引用的仓库文件路径与 make 目标全部真实存在
+make adoption-check      # 校验台账 §0.3 标记为「在产」的优化开关均存在于当前代码生成表
+make deploy-check        # 校验 bin/BUILD-INFO.json 与源码树指纹、二进制/metallib SHA256 一致且无脏构建路径
+```
 
 运行可复现的算子与合成模型基准：
 
@@ -386,7 +375,7 @@ make bench
 
 其中 `bench_metal` 在同一进程比较逐 token 与批量 GEMV，并检查逐位一致；
 `bench_synthetic` 生成小型 MLA + MoE GGUF，测量真实加载、预填充和解码路径。
-合成模型用于验证调度开销，真实模型性能请使用 `tools/bench.sh` 或 HTTP 基准。
+合成模型用于验证调度开销，真实模型性能请使用 `tools/with_prod_guard.sh` 独占窗口或 `tools/bench.sh`。
 
 ---
 
@@ -437,17 +426,25 @@ Usage:
   ./bin/myds -m <model.gguf> [options]
 
 Options:
-  -m, --model <path>      Path to DeepSeek GGUF model (required)
-  --port <port>           Run HTTP server on specified port
-  --host <host>           Host to listen on (default: 127.0.0.1; no auth, use a proxied 0.0.0.0 only)
-  --alias <name>          Model alias for API responses (default: myds)
-  -p, --prompt <string>   Prompt string (if omitted and no --port, starts interactive chat)
-  -n, --max-tokens <int>  Max tokens to generate (default: 256)
-  -c, --ctx, --ctx-size   Context window size (default: 4096)
-  --temp <float>          Sampling temperature (default: 0.7, 0.0 for greedy)
-  --top-p <float>         Nucleus top-p sampling cutoff (default: 0.9)
-  --seed <int>            Random seed (default: random)
-  -h, --help              Show this help message
+  -m, --model <path>        Path to DeepSeek V4/V4.1 GGUF model (required)
+  --config <path>           Load MYDS_* config file (repeatable, later overrides earlier & env)
+  --port <port>             Run HTTP server on specified port
+  --host <host>             Host to listen on (default: 127.0.0.1; no auth, use a proxied 0.0.0.0 only)
+  --alias <name>            Model alias for API responses (default: myds)
+  --vision <file>           Vision encoder GGUF (enables image input; omit = text only)
+  -p, --prompt <string>     Prompt string (if omitted and no --port, starts interactive chat)
+  -n, --max-tokens <int>    Max tokens to generate (default: 256, or MYDS_MAX_NEW_TOKENS)
+  -c, --ctx, --ctx-size     Context window size (default: 4096, or MYDS_CTX_SIZE)
+  --temp <float>            Sampling temperature (default: 0.7, 0.0 for greedy)
+  --top-p <float>           Nucleus top-p sampling cutoff (default: 0.9)
+  --seed <int>              Random seed (default: current timestamp)
+  --thinking [on|off]       Enable thinking / reasoning mode (default: off)
+  --pld / --no-pld          Enable / disable Prompt-Lookup Decoding
+  --steer-vector <path>     Path to GLP control vector GGUF (with --steer-alpha / --steer-mode)
+  --print-config [-v]       Report MYDS_* keys read by this build (exit 2 on any unread key)
+  --dump-config <path>      Write effective MYDS_* environment to a file
+  --knob-fingerprint        Print this build's knob-name set fingerprint
+  -h, --help                Show full help message
 ```
 
 ### 分片权重（split GGUF）
@@ -505,42 +502,41 @@ chunk attention 的 KV slab 和 mask 初始只分配窗口路径所需的 10.625
 压缩键容量仍覆盖配置的上下文；走 dense slab 且现有工作区不足时才扩容。
 内存前缀快照在首次捕获对应槽位时分配，已分配的槽位继续复用。
 compressed KV 与 index cache 保存已完成 BF16 舍入的上 16 位，读取时还原 F32；
-计算中间量保持原精度与归约顺序。
+计算中间量保持各自算子定义的精度与归约顺序。
 
-| 环境变量 | 默认值 | 行为 |
-| --- | --- | --- |
-| `MYDS_ATTN_GATHER_MIN_KEYS` | `0` | scratch 创建时捕获。压缩键数小于阈值时走 slab，达到阈值时在 gather 已启用且提供缓冲的条件下走 gather。合法范围为 `0..chunk_key_max`；非法值会拒绝工作区创建。阈值须按本机与负载测量。 |
-| `MYDS_ATTN_GATHER` | 启用 | 设为 `0` 关闭 gather，阈值不覆盖此开关。 |
-| `MYDS_ATTN_VEC_HEAD_FIRST` | 启用 | gathered prefill 的 vec attention 将 query/head 物理 grid 调换，保留每个 head 的算术与归约。设为 `0` 使用原排列。旧 metallib 缺新 PSO 时自动回退，并在 scratch 中缓存不可用状态；首次回退输出一条 WARN 日志，进程级计数可由 `myds_v41_gpu_attention_counters()` 读取。 |
-| `MYDS_PREFILL_ATTN` | `vec` | `matrix` 与 `auto` 是 compressed gather 的实验选项。矩阵归约会产生浮点差异，实测长输入生成 token 可变化；默认关闭。`auto` 的矩阵 PSO/共享内存不可用时回退 vec，显式 `matrix` 则返回失败。 |
-| `MYDS_PREFILL_INDEXER_PEEL` | 启用 | ratio=2 的索引层在绝对位置 0 保留没有可见压缩键的首行，其余行继续批处理，避免整个首块回退逐 token。首行 Q、selected 和 mask 保持不变；设为 `0` 恢复原回退路径。 |
-| `MYDS_PREFILL_SKIP_DEAD_KV` | 启用 | 后缀收缩时，跳过第 21–39 层中已经不需要保留窗口 KV、且没有压缩器工作的前缀块。保留原 chunk 边界、近端窗口、carry 和有效快照；trace 保留原路径。设为 `0` 恢复原归一化与调度。 |
-| `MYDS_PREFILL_SHRINK_GRID_GUARDED` | 启用 | 按实际可发布的 512 网格快照收紧后缀重算范围，并保留原 KV 分块边界和 MM/GEMV 数值路径。仅在 chunk=512、shift=512、非别名 MoE 累积区可容纳完整 macroblock、默认 MoE MM 阈值、dedup 关闭且 attention 为 vec／gather-min=0 时采用；其他配置与 trace 使用原路径。`0` 恢复原重算范围。 |
-| `MYDS_PREFILL_SHORT_END_SNAPSHOT` | 启用 | prefix cache 开启时，当 prompt 末尾位置 `p=prompt_tokens-1` 为 4–1023 时保存 RAM slot 0，使完全重复的短请求直接恢复 prompt-end 状态。周期与 SSD 快照仍从 1024 开始；额外 RAM 约 10 MiB。`0` 关闭短末尾快照。 |
-| `MYDS_QKV_FUSE_BF16` | 启用 | decode 的 Q8 QKV 投影把 BF16 舍入合并到 GEMV 写出；设为 `0` 恢复独立舍入 dispatch。trace 使用原路径。 |
-| `MYDS_QKV_FUSE_POST` | 启用 | decode 合并 Q/K RoPE、KV 量化及窗口写入，保留原舍入边界；设为 `0` 恢复原 dispatch。缺融合 PSO、别名或 copy 故障注入时回退原路径。 |
-| `MYDS_QKV_NR0` | `4` | 融合 Q8 GEMV 每组处理四个独立输出行；`2` 使用两个行的配置。归约顺序不变。 |
-| `MYDS_LM_HEAD_Q8_NR0` | `2` | 初始化时读取，严格接受 `2` 或 `4`；未设置时保留原路径。显式 `4` 在单 token、输出维度大于 65536 的 plain Q8_0 GEMV 中，每组处理四个独立输出行，保留 NSG8、原逐行 K 遍历/归约与完整 F32 logits。缺候选 PSO 时初始化失败并清理；候选 dispatch 失败返回错误。验收与当前采用状态见 LM-head 验证报告。 |
-| `MYDS_BATCH2_SPEC` | 关闭 | 显式 `1` 请求 greedy、无图片的真实 batch2；剩余输出/context 至少两步，DSpark 主候选仍要求 high-confidence。 |
-| `MYDS_BATCH2_Q8_SHARED` | `0` | 严格接受 `0` 或 `1`。显式 `1` 在 eligible Batch2 output-B Q8/BF16 投影中，让两个 token 复用同一量化权重读取，保留各自的累加、归约和舍入。trace、关闭原 decode BF16 fusion 或其他投影保持参考路径；缺候选 PSO 时初始化失败。需与真实 Batch2 整图计数和完整模型 A–B–A 一起验收。 |
-| `MYDS_SPEC_SERIAL_PROBE` | 关闭 | 显式 `1` 允许 V4.1 逐 token 验证的 DSpark/PLD 对照；默认未启用 batch2 时跳过这类草稿与快照工作。 |
-| `MYDS_SPEC_COST_SCHEDULER` | 关闭 | 显式 `1` 按整个周期成本与纯 target 基线比较，三个不划算周期后 backoff 16 个候选周期；每请求重置，需独立 A/B。 |
-| `MYDS_DECODE_METRICS` | 关闭 | 显式 `1` 收集 host 分项时间与原始周期；请求 counters 始终可读。成本调度器也启用累计计时，但不会单独开启原始周期数组。 |
-| `MYDS_QKV_CONCURRENT` | 关闭 | 显式设为 `1` 才在单 token QKV/Indexer 局部图创建 concurrent encoder，按资源同步独立分支；正常退出与失败都恢复进入前的 encoder/auto-barrier 设置。trace 与关闭 QKV pipeline 时保留参考路径。已有 `MYDS_METAL_CONCURRENT=1` 仍有原全局语义。 |
-| `MYDS_INDEXER_COMPACT_SCORER` | 关闭 | 显式设为 `1` 才在单 token decode 的 layer 24/28/32/36、历史行数超过 16384 时，按 layer 20 原 selected block IDs 派发评分。先填充 dense scores 为 `-INFINITY`，有效行写回原 ID；原 filter 与 dense top-k 分区/同分网络保持一致。缺可选 PSO 在写入前回退；开始派发后失败终止。prefill、trace 与批量投机保持参考评分路径。 |
-| `MYDS_INDEXER_TOPK_PREFIX_MERGE` | `0` | 显式 `1` 在至少 16 个原排序分区、`top<=512` 的原 eligibility 内裁剪中间 merge 输出。保留原 partition 与比较网络；含可见 NaN 的行使用 dense merge。 |
-| `MYDS_INDEXER_TOPK_NAN_FUSE` | `0` | 严格接受 `0` 或 `1`。同时开启 prefix merge 时，在原 sorter 中按 IEEE 位分类每个分区，替代独立分类 dispatch；空/future causal 分区明确写零。缺可选 PSO 或几何不支持原 `nth` 时，在写入前回退 dense。counter 表示 host 编码，不能当作实际 GPU 流量。 |
-| `MYDS_MOE_IQ2_TAIL_CULL` | 启用 | prefill MoE IQ2 up/gate 的尾 tile 跳过没有有效 token 的半 tile。`0` 恢复原 kernel；默认缺新 PSO 时回退原 kernel，显式 `1` 缺 PSO 时初始化失败并清理所有部分状态。 |
-| `MYDS_SSE_DRAIN_TIMEOUT_MS` | `1000` | SSE 完成时的整体排空期限，合法范围 `1..30000` ms；非法值使用默认值。 |
+> **注意区分「C 代码默认」与「生产 `myds.conf` 覆盖」**：通过 `--config` 加载的 `myds.conf` 会无条件覆盖同名进程环境变量（见 [`docs/MEASUREMENT-DISCIPLINE.md`](docs/MEASUREMENT-DISCIPLINE.md)）。启动时 `verify_config_gate` 会校验全部已设置的 `MYDS_*` 键均出现在 `include/myds_knobs_generated.h`（未识别键直接以退出码 `2` 拒绝启动）。
 
-两项 decode 实验均默认关闭。本地 M4 的非零组件检查验证 QKV/HC/Indexer 中间量、
-有效与屏蔽行分数及原 top-k IDs 逐位一致；Mac Studio 普通输入的 QKV A–B–A 未见额外收益，
-完整结果和配置见上述实测报告。
-compact scorer 只减少屏蔽行的空 threadgroup，并增加一次 dense `-INFINITY` 填充；
-它仍扫描原 dense top-k，不能承诺 top-k 加速。采纳前分别测量实际 GPU 重叠及
-长上下文整模型 A–B–A，报告路径计数、fallback、数值/状态回归和 P95/P99；本轮128k仍未测量。
-`myds_v41_gpu_indexer_compact_counters()` 提供请求、实际派发、缺 PSO 回退、dense 行数及
-实际派发行槽数，避免把请求开关当作已执行路径。
+| 环境变量 | C 代码默认 | 生产 `myds.conf` | 行为与门禁说明 |
+| --- | --- | --- | --- |
+| `MYDS_PREFILL_ATTN` | **`vec`** | **`auto`** | `vec` 强制标量向量注意力；`matrix` 强制矩阵注意力（编码失败直接报错）；**`auto`**（§173 `B-1`）在满足 `use_gather && c_len≥32 && p0/ratio≥256 && n_comp≥512` 的长块派发 `kernel_flash_attn_ext_blk` + `heads` 矩阵注意力（FP32 寄存器累加，与 `vec` 差 `~1 ULP`），短块自动走 `vec`，缺 PSO/共享内存超限回退 `vec`。 |
+| `MYDS_ATTN_HEADS_MODE` | **`q8`** | **`q8`** | §174 `[P-A1]` 矩阵注意力内核模式：`q8`（`kernel_myds_flash_attn_heads_f16_dk512_dv512`，寄存器 `lo[16]` 驻留 `O`，`12,320 B` smem，M2 Ultra 解锁 **2 TGs/core**）、`q16`（16 头/TG，`24,640 B` smem，1 TG/core）或 `smem`（旧 `32,768 B` smem 核，1 TG/core）；三模式输出逐位严格 0-ULP。 |
+| `MYDS_INDEXER_REGISTER_ONLY` | **`1`（启用）** | 未设（沿用 `1`） | §105 / §173 `A-1` Prefill `simdgroup_matrix` Indexer 打分器：覆盖 `ratio∈{1,2}`、`n_tokens∈[8,2048]`、`n_comp∈(512,1048576]`、`pos0+n_tokens≤1048576`，与 `TILED` 严格 0-ULP。设为 `0` 回退 `indexscores_chunk`；非法值拒绝创建工作区。计数见 `myds_v41_gpu_indexer_register_only_counters()`。 |
+| `MYDS_INDEXER_BATCH_FLOATS` | `max_comp>32768` 时 **`8388608`**（否则 `262144`） | **`8388608`** | §174 `[P-I1]` Prefill Indexer 评分/排序临时缓冲容量（合法显式范围 `65536..16777216`），配对 `indexer_group_len` 二次因果面积尾块均摊以消除 `<8` 行碎尾回退。 |
+| `MYDS_INDEXER_RO_SMEM_Q` | **`1`（启用）** | **`1`** | §174 `[P-I2s]`：`1` 启用 `4,096 B` XOR-swizzled smem `Q` 复用（省 16× 全局 `Q` 重读，保 `8 TGs/core` 满驻留）；`0` 切回 `0 B` smem 内核；严格 0-ULP。 |
+| `MYDS_INDEXER_DECODE_COMPACT` | **`1`（启用）** | **`1`** | §174 `[D-L1]`：单步 Decode 在 `n_comp > 16384` 时将 `L20` 选出的块升序去重，使后四层 `L24/28/32/36` 仅对 `≤16,384` 候选键紧凑打分与紧凑 Top-512（`O(Context)→O(16K)`，兼容 `MYDS_INDEXER_DECODE_OVERLAP=1`，严格 0-ULP）。`0` 关闭；计数见 `myds_v41_gpu_indexer_decode_compact_counters()`。 |
+| `MYDS_INDEXER_PREFILL_COMPACT` | **`1`（启用）** | 未设（沿用 `1`） | §175 `[P-L1]`：长文 Prefill 在 `il > 20`（`L24/28/32/36`）、`ratio=1`、`n_comp > 16384`、`pos0 ≥ 16384`、`n_tokens ≥ 8` 时，构建无原子 8 行查询 tile 并集紧凑块表并执行 `4 KB` smem 紧凑 `register_only` 打分 + 批量 `≤16,384` 紧凑 Top-512（子批扩至 `512` 行，严格 0-ULP）。`0` 回退稠密打分 + 位图过滤 + 稠密 `topk_causal`；计数见 `/debug/state` `counters.indexer_prefill_compact`。 |
+| `MYDS_INDEXER_TILED` | **`0`（关闭）** | **`1`** | §85 分块评分器（256 对/TG，严格 0-ULP）：当请求落在 `register_only` 门禁外（如 `n_comp ≤ 512` 或 `<8` 行）且 `n_tokens ≥ 8` 时作为 chunk 评分路径。 |
+| `MYDS_MOE_DECODE_TOPK` | **`0`（满血 `Top-6`）** | **`3`** | §172 单步 Decode（`n_tokens == 1`）MoE 路由专家激活数裁剪与概率重归一化（Prefill 始终保完整 `Top-6` 0-ULP）。支持 `0`、`1..6`、40 位数字串或 `[def_k,]L1-L2:k` 语法；非法值报错拒绝。 |
+| `MYDS_ENGRAM_IO_THREADS` | **`8`** | **`16`** | Engram 表 SSD `pread` 并发度：`1` 为串行，`2..16` 为每 context 独立常驻线程池，`auto` 为自适应控制器（§146 生产设 `16`，decode `+1.4%`）。 |
+| `MYDS_ENGRAM_PREFILL_ASYNC` | **`1`（启用）** | 未设（沿用 `1`） | §148：当 `mb_len > 256` 时将 macroblock 的 Engram 表 `pread` 与解码放到后台线程与 GPU 并发执行（32K prefill `+5.9%`，严格 0-ULP）；设 `0` 恢复同步准备。 |
+| `MYDS_ATTN_GATHER_MIN_KEYS` | `0` | 未设（沿用 `0`） | scratch 创建时捕获。压缩键数小于阈值时走 slab，达到阈值且 gather 开启时走 gather；合法范围 `0..chunk_key_max`。 |
+| `MYDS_ATTN_GATHER` | 启用（`1`） | 未设（沿用 `1`） | 设为 `0` 关闭 gather，阈值不覆盖此开关。 |
+| `MYDS_ATTN_VEC_HEAD_FIRST` | 启用（`1`） | 未设（沿用 `1`） | gathered prefill 的 `vec` attention 将 query/head 物理 grid 调换，保留每 head 归约。设为 `0` 用原排列；计数见 `myds_v41_gpu_attention_counters()`。 |
+| `MYDS_PREFILL_INDEXER_PEEL` | 启用（`1`） | 未设（沿用 `1`） | `ratio=2` 索引层在绝对位置 0 剥离无可见压缩键的首行，其余行继续批处理；设为 `0` 恢复原回退路径。 |
+| `MYDS_PREFILL_SKIP_DEAD_KV` | 启用（`1`） | 未设（沿用 `1`） | 后缀收缩时跳过第 21–39 层中无需保留窗口 KV 且无压缩器工作的前缀块；设为 `0` 恢复原调度。 |
+| `MYDS_PREFILL_SHRINK_GRID_GUARDED` | 启用（`1`） | 未设（不触发） | 仅在 `chunk=512`、`shift=512`、`MYDS_PREFILL_ATTN=vec`、`gather-min=0` 等条件同时满足时按 512 网格收紧后缀重算范围；生产 `chunk=2048` + `auto` 自动保持原后缀锥。 |
+| `MYDS_PREFILL_SHORT_END_SNAPSHOT` | 启用（`1`） | 未设（沿用 `1`） | prefix cache 开启且末尾位置 `p=prompt_tokens-1` 为 `4..1023` 时保存 RAM slot 0，重复短请求直接恢复末尾状态；`0` 关闭。 |
+| `MYDS_QKV_FUSE_BF16` / `MYDS_QKV_FUSE_POST` | 启用（`1`） | 未设（沿用 `1`） | Decode Q8 QKV 投影合并 BF16 舍入写出，以及合并 Q/K RoPE、KV 量化与窗口写入；设为 `0` 恢复独立 dispatch。 |
+| `MYDS_QKV_NR0` / `MYDS_LM_HEAD_Q8_NR0` | `4` / `2` | 未设（`4`） / `2` | 融合 Q8 QKV GEMV（`4` 或 `2`）与 LM-head plain Q8_0 GEMV（严格 `2` 或 `4`）每组输出行数。 |
+| `MYDS_BATCH2_SPEC` / `MYDS_BATCH2_Q8_SHARED` | 关闭（`0`） / `0` | `0` / `1` | Greedy 双 token 投机验证总开关与 Batch2 output-B Q8 共享权重读取（`BATCH2_SPEC=0` 时不触发 Batch2 路径）。 |
+| `MYDS_SPEC_SERIAL_PROBE` / `MYDS_SPEC_COST_SCHEDULER` | 关闭（`0`） | 未设（关闭） | 逐 token 投机对照探针与投机周期成本退避调度器。 |
+| `MYDS_DECODE_METRICS` / `MYDS_QKV_CONCURRENT` | 关闭（`0`） | 未设（关闭） | Decode host 分项计时与单 token QKV/Indexer 局部 concurrent encoder 实验开关（生产使用全局 `MYDS_METAL_CONCURRENT=1`）。 |
+| `MYDS_INDEXER_COMPACT_SCORER` | 关闭（`0`） | 未设（关闭） | 早期单步 Decode 稀疏写回稠密分数实验开关（仍扫稠密 Top-K）；现生产已被连同 Top-512 一起收敛为 `O(16K)` 的 `MYDS_INDEXER_DECODE_COMPACT=1`（`[D-L1]`）取代。 |
+| `MYDS_INDEXER_TOPK_PREFIX_MERGE` / `MYDS_INDEXER_TOPK_NAN_FUSE` | `0` / `0` | **`1` / `1`** | 稠密 `argsort` Top-K 在 `≥16` 分区、`top≤512` 时裁剪中间归并输出，并在排序核内融合 IEEE 位 NaN 分区分类（严格 0-ULP）。 |
+| `MYDS_MOE_IQ2_TAIL_CULL` | 启用（`1`） | 未设（沿用 `1`） | Prefill MoE IQ2 up/gate 尾 tile 跳过无有效 token 的半 tile；设为 `0` 恢复原 kernel。 |
+| `MYDS_SSE_DRAIN_TIMEOUT_MS` | `1000` | 未设（沿用 `1000`） | SSE 完成时的整体排空期限（合法范围 `1..30000` ms）。 |
+
+运行时诊断与原子计数器（`attention_counters`、`indexer_register_only`、`indexer_decode_compact`、`indexer_prefill_compact` 等）可通过代码 API 或受鉴权的 `GET /debug/state` 实时读取，用于严格履行 §149「必先验证实际派发路径而非仅看请求开关」的门禁要求。
 
 生产 SSE 输出使用每请求独立的 FIFO writer。队列上限为 1 MiB，包含包头和正在发送的包；
 入队不等待客户端 socket 或空闲队列容量。积压超限或断连会取消该请求，socket 在 writer
@@ -553,8 +549,8 @@ compact scorer 只减少屏蔽行的空 threadgroup，并增加一次 dense `-IN
 引用的段被覆盖或损坏时返回缓存 miss。相同内容再次保存不重写窗口或共享段，但仍读取
 并校验已有段。此存储改动不改变 `MYDS_KV_DSK_ASYNC` 的默认开关。
 
-针对这些改动的本地门禁为 `make test`。V4.1 GPU 回归分别运行默认 gather、关闭 gather、
-显式阈值三种配置，并覆盖同一 command batch 内的路径切换、工作区扩容和 BF16 缓存对照。
+针对这些改动的本地门禁为 `make test` 与 `make test-indexer-register-only-host`。V4.1 GPU 回归分别运行默认 gather、关闭 gather、
+显式阈值三种配置，并覆盖同一 command batch 内的路径切换、工作区扩容、BF16 缓存对照及 `[P-A1]` / `[P-I2s]` / `[D-L1]` / `[P-L1]` 全边界 0-ULP 校验。
 这些测试不替代真实 GGUF 模型的 logits、吞吐与 TTFT 验收。
 
 `make test` 还包含 QKV 两种行配置的非零逐位对照，以及 attention 的短块、carry、
@@ -662,6 +658,8 @@ forward 消耗；decode 为 `1000 * (last_callback-first_callback) / (output_tok
 不含首次 forward/TTFT。加载、HTTP 传输、队列等待不计入这两个指标。
 
 #### Engram SSD 并行读取
+
+> **2026-11-07 运行时与生产更新（§146 / §148 / §150）**：C 代码默认仍为 `8`（并新增 `MYDS_ENGRAM_IO_THREADS=auto` 自适应控制器），而生产 `myds.conf` 已提升为 **`MYDS_ENGRAM_IO_THREADS=16`**（decode `+1.4%`、32K prefill `+3.7%`）；同时 Prefill 新增默认开启的 **`MYDS_ENGRAM_PREFILL_ASYNC=1`**，在 `mb_len > 256` 时将 macroblock 的 Engram `pread`/解码移入后台线程与 GPU 重叠执行（32K prefill 再提 `+5.9%`，严格 0-ULP；设 `0` 可回退同步准备）。下文保留 2026-10-05 首版线程池的冻结复现记录。
 
 默认使用 8 个读取线程；`MYDS_ENGRAM_IO_THREADS=1` 使用原串行读取；`2..16` 使用每个 context 独立拥有的
 常驻线程池。只并行当前 token 的两张表共 48 行 raw `pread`，解码仍在调用线程按
