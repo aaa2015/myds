@@ -3887,7 +3887,46 @@ static int publish_indexer_chunk(myds_context_t *ctx, uint32_t il, uint32_t c_st
         if (!myds_v41_gpu_rope_batch(rope_q_buf,128,V41_INDEX_HEADS,base_pos + c_start,c_len,true,false)) return -1;
         if (!myds_v41_gpu_quant(rope_q_buf,128,V41_INDEX_HEADS*c_len,2)) return -1;
     }
+    bool allow_compact = (il > 20u && ratio == 1u && mask_bits);
+#ifdef MYDS_INDEXER_CAPTURE
+    allow_compact = false;
+#endif
+    const uint32_t max_compact_glen = allow_compact
+        ? myds_v41_gpu_indexer_prefill_compact_max_glen(g->gpu)
+        : 0u;
+    const uint32_t compact_top_blocks = allow_compact ? block_budget_cap(2048u) : 0u;
     for (uint32_t off=0; off<c_len; ) {
+        const uint32_t rem = c_len - off;
+        const uint32_t g_start_cand = base_pos + c_start + off;
+        if (allow_compact && max_compact_glen >= 8u && rem >= 8u &&
+            g_start_cand >= 16384u && (uint64_t)g_start_cand + rem <= 1048576u) {
+            uint32_t c_glen = rem <= max_compact_glen ? rem : max_compact_glen;
+            if (c_glen < rem && rem - c_glen < 8u && c_glen >= 16u) {
+                c_glen -= 8u;
+            }
+            const uint32_t c_nc = g_start_cand + c_glen;
+            const uint32_t c_mask_units = (uint32_t)(mask_bytes / 4u);
+            if (!myds_metal_buffer_update_sub_view(q_view,index_q_buf,
+                    (size_t)(input_skip+off)*V41_INDEX_HEADS*128u*sizeof(float),
+                    (size_t)c_glen*V41_INDEX_HEADS*128u*sizeof(float)) ||
+                !myds_metal_buffer_update_sub_view(w_view,index_weights_buf,
+                    (size_t)(input_skip+off)*V41_INDEX_HEADS*sizeof(float),
+                    (size_t)c_glen*V41_INDEX_HEADS*sizeof(float)) ||
+                !myds_metal_buffer_update_sub_view(sel_view,prompt_selected,
+                    (size_t)(c_start+off)*sel_bytes,(size_t)c_glen*sel_bytes) ||
+                !myds_metal_buffer_update_sub_view(mask_view,prompt_block_mask,
+                    (size_t)(c_start+off)*mask_bytes,(size_t)c_glen*mask_bytes)) return -1;
+            const int crc = myds_v41_gpu_indexer_prefill_compact_scoped(
+                g->gpu, sel_view, q_view, w_view, g->index_cache[owner], mask_view,
+                c_nc, c_glen, g_start_cand, ratio, c_mask_units, compact_top_blocks,
+                !myds_trace_active());
+            if (crc < 0) return -1;
+            if (crc > 0) {
+                off += c_glen;
+                continue;
+            }
+            allow_compact = false;
+        }
         const uint32_t glen=indexer_group_len(c_len,off,base_pos,c_start,ratio,batch_floats);
         const uint32_t nc_raw=(base_pos + c_start + off + glen)/ratio;
         const uint32_t nc=nc_raw<V41_TOPK?V41_TOPK:nc_raw;   /* 表宽（见上） */

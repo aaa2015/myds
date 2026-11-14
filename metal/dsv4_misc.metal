@@ -8984,4 +8984,795 @@ kernel void kernel_myds_compact_topk_final(
     }
 }
 
+// ============================================================================
+// [P-L1] Prefill YoCo (il > 20, ratio == 1, nc > 16384) Strict 0-ULP
+// 8-Row Tile-Union Register-Only Scorer + Batched <=16,384 Compact Top-512.
+// ============================================================================
+struct myds_indexer_prefill_compact_prep_args {
+    uint32_t n_comp;
+    uint32_t n_tokens;
+    uint32_t pos0;
+    uint32_t ratio;
+    uint32_t mask_units;
+    uint32_t u_stride;
+    uint32_t row_blk_off;
+    uint32_t union_blk_off;
+    uint32_t union_cnt_off;
+};
+
+struct myds_indexer_prefill_compact_score_args {
+    uint32_t n_comp;
+    uint32_t n_tokens;
+    uint32_t n_head;
+    uint32_t head_dim;
+    uint32_t pos0;
+    uint32_t ratio;
+    uint32_t u_stride;
+    uint32_t union_blk_off;
+    uint32_t union_cnt_off;
+    float    scale;
+    uint64_t q_token_stride;
+    uint64_t q_head_stride;
+    uint64_t weights_token_stride;
+    uint64_t index_row_stride;
+    uint64_t score_token_stride;
+};
+
+struct myds_prefill_compact_topk_args {
+    uint32_t n_comp;
+    uint32_t n_tokens;
+    uint32_t pos0;
+    uint32_t ratio;
+    uint32_t row_blk_off;
+};
+
+// Stage 1: 1 TG x 1024 threads per 8-row query tile.
+// Scans bit-packed YoCo mask_bits in 1024-word chunks and deterministically
+// emits strictly ascending per-row block IDs (row_blocks[r, 0..2047], -1 padded),
+// strictly ascending 8-row union block IDs (union_blocks[tile, 0..u_cnt-1]),
+// union_counts[tile], and uint16 destination column map tile_dst_col[tile, u, 0..7].
+kernel void kernel_myds_indexer_prefill_compact_prep(
+        constant myds_indexer_prefill_compact_prep_args &args [[buffer(0)]],
+        device const uint32_t *mask_bits                      [[buffer(1)]],
+        device uint32_t *meta_u32                             [[buffer(2)]],
+        device uint4 *tile_dst_col4                           [[buffer(3)]],
+        uint  t_tile [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    const uint r0 = t_tile * 8u;
+    if (r0 >= args.n_tokens || !args.ratio) return;
+
+    threadgroup uint32_t s_sg_u[32];
+    threadgroup uint32_t s_sg_r[8][32];
+    threadgroup uint32_t s_run_u;
+    threadgroup uint32_t s_run_r[8];
+
+    if (tid == 0u) {
+        s_run_u = 0u;
+        #pragma clang loop unroll(full)
+        for (uint j = 0u; j < 8u; j++) s_run_r[j] = 0u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint nr = min(8u, args.n_tokens - r0);
+    const uint n_blocks = (args.n_comp + 7u) / 8u;
+    const uint mask_words = min(args.mask_units, (n_blocks + 31u) / 32u);
+
+    device int32_t  *row_blocks   = (device int32_t *)(meta_u32 + args.row_blk_off);
+    device uint32_t *union_blocks = meta_u32 + args.union_blk_off;
+    device uint32_t *union_counts = meta_u32 + args.union_cnt_off;
+
+    #pragma clang loop unroll(full)
+    for (uint j = 0u; j < 8u; j++) {
+        if (j < nr) {
+            row_blocks[(ulong)(r0 + j) * 2048u + uint(tid)] = -1;
+            row_blocks[(ulong)(r0 + j) * 2048u + uint(tid) + 1024u] = -1;
+        }
+    }
+
+    for (uint w_base = 0u; w_base < mask_words; w_base += 1024u) {
+        const uint w_idx = w_base + uint(tid);
+        uint32_t w_row[8];
+        #pragma clang loop unroll(full)
+        for (uint j = 0u; j < 8u; j++) {
+            uint32_t m = 0u;
+            if (j < nr && w_idx < mask_words) {
+                const uint vis_j = min((args.pos0 + r0 + j + 1u) / args.ratio, args.n_comp);
+                const uint lim_blks = min(n_blocks, (vis_j + 7u) / 8u);
+                if (w_idx * 32u < lim_blks) {
+                    m = mask_bits[(ulong)(r0 + j) * args.mask_units + w_idx];
+                    const uint rem = lim_blks - w_idx * 32u;
+                    if (rem < 32u) m &= (1u << rem) - 1u;
+                }
+            }
+            w_row[j] = m;
+        }
+
+        uint32_t w_union = w_row[0] | w_row[1] | w_row[2] | w_row[3] |
+                           w_row[4] | w_row[5] | w_row[6] | w_row[7];
+        const uint cnt_u = popcount(w_union);
+        const uint pref_u = simd_prefix_exclusive_sum(cnt_u);
+        if (lane == 31u) s_sg_u[sg] = pref_u + cnt_u;
+
+        uint pref_r[8];
+        #pragma clang loop unroll(full)
+        for (uint j = 0u; j < 8u; j++) {
+            const uint cnt_r = popcount(w_row[j]);
+            pref_r[j] = simd_prefix_exclusive_sum(cnt_r);
+            if (lane == 31u) s_sg_r[j][sg] = pref_r[j] + cnt_r;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sg == 0u) {
+            const uint c = s_sg_u[lane];
+            const uint p = simd_prefix_exclusive_sum(c);
+            s_sg_u[lane] = s_run_u + p;
+            if (lane == 31u) s_run_u += p + c;
+        } else if (sg <= 8u) {
+            const uint j = uint(sg) - 1u;
+            const uint c = s_sg_r[j][lane];
+            const uint p = simd_prefix_exclusive_sum(c);
+            s_sg_r[j][lane] = s_run_r[j] + p;
+            if (lane == 31u) s_run_r[j] += p + c;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint u_pos = s_sg_u[sg] + pref_u;
+        uint r_pos[8];
+        #pragma clang loop unroll(full)
+        for (uint j = 0u; j < 8u; j++) r_pos[j] = s_sg_r[j][sg] + pref_r[j];
+
+        while (w_union != 0u) {
+            const uint bit = ctz(w_union);
+            w_union &= (w_union - 1u);
+            const uint blk = w_idx * 32u + bit;
+            uint cols[8];
+            #pragma clang loop unroll(full)
+            for (uint j = 0u; j < 8u; j++) {
+                uint dc = 0xffffu;
+                if (((w_row[j] >> bit) & 1u) != 0u) {
+                    const uint col = r_pos[j]++;
+                    if (col < 2048u && u_pos < args.u_stride) {
+                        row_blocks[(ulong)(r0 + j) * 2048u + col] = int32_t(blk);
+                        dc = col;
+                    }
+                }
+                cols[j] = dc;
+            }
+            if (u_pos < args.u_stride) {
+                const ulong u_off = (ulong)t_tile * args.u_stride + u_pos;
+                union_blocks[u_off] = blk;
+                tile_dst_col4[u_off] = uint4(cols[0] | (cols[1] << 16u),
+                                             cols[2] | (cols[3] << 16u),
+                                             cols[4] | (cols[5] << 16u),
+                                             cols[6] | (cols[7] << 16u));
+            }
+            u_pos++;
+        }
+
+        if (w_base + 1024u < mask_words) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (tid == 0u) {
+        union_counts[t_tile] = min(s_run_u, args.u_stride);
+    }
+}
+
+// Stage 2 (4 KB XOR-swizzled smem_q2 -> 8 TGs/core full occupancy):
+// Scores ONLY active 8-row union blocks using the exact simdgroup_float8x8
+// accumulation, ReLU, weight, and scale expression of register_only_bf16 (0-ULP).
+kernel void kernel_myds_indexer_scores_prefill_compact_ro_bf16(
+        constant myds_indexer_prefill_compact_score_args &args [[buffer(0)]],
+        device const char *q                                   [[buffer(1)]],
+        device const char *weights                             [[buffer(2)]],
+        device const char *index_comp                          [[buffer(3)]],
+        device char *scores                                    [[buffer(4)]],
+        device const uint32_t *meta_u32                        [[buffer(5)]],
+        device const ushort *tile_dst_col                      [[buffer(6)]],
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u ||
+        (args.ratio != 1u && args.ratio != 2u) ||
+        args.n_comp <= 512u || args.n_comp > 1048576u ||
+        args.n_tokens < 1u || args.n_tokens > 2048u ||
+        args.pos0 > 1048576u - args.n_tokens || args.scale != 1.0f / 64.0f ||
+        sg >= 4u) return;
+
+    const uint token_base = tgpig.y * 8u;
+    if (token_base >= args.n_tokens) return;
+
+    device const uint32_t *union_blocks = meta_u32 + args.union_blk_off;
+    device const uint32_t *union_counts = meta_u32 + args.union_cnt_off;
+    const uint u_cnt = union_counts[tgpig.y];
+    const uint u_base = tgpig.x * 4u;
+    if (u_base >= u_cnt) return;
+
+    const uint u_idx = u_base + uint(sg);
+    const bool sg_in_union = (u_idx < u_cnt);
+    const uint comp_base = sg_in_union
+        ? (union_blocks[(ulong)tgpig.y * args.u_stride + u_idx] * 8u)
+        : args.n_comp;
+
+    const short2 xy = dsv4_indexer_ro_0b_coord(lane);
+    const uint token = token_base + uint(xy.y);
+    const uint comp0 = comp_base + uint(xy.x);
+    const uint comp1 = comp0 + 1u;
+    const bool live = token < args.n_tokens;
+    const uint last_token = min(token_base + 8u, args.n_tokens);
+    const uint max_visible = min((args.pos0 + last_token) / args.ratio, args.n_comp);
+
+    const uint tg_min_comp_base = union_blocks[(ulong)tgpig.y * args.u_stride + u_base] * 8u;
+    if (tg_min_comp_base >= max_visible) {
+        if (sg_in_union && live) {
+            const ushort dst_blk = tile_dst_col[((ulong)tgpig.y * args.u_stride + u_idx) * 8u + uint(xy.y)];
+            if (dst_blk < 2048u) {
+                device float *dst = (device float *)(scores + (ulong)token * args.score_token_stride);
+                const uint dst0 = uint(dst_blk) * 8u + uint(xy.x);
+                dst[dst0] = -INFINITY;
+                dst[dst0 + 1u] = -INFINITY;
+            }
+        }
+        return;
+    }
+
+    threadgroup float2 smem_q2[512];
+    const uint tid = uint(sg) * 32u + uint(lane);
+    const uint lt = tid >> 6u;
+    const uint lc2 = tid & 63u;
+    const uint rd_t = uint(xy.y);
+    const uint rd_j = uint(xy.x) >> 1u;
+    const bool sg_active = sg_in_union && (comp_base < max_visible);
+
+    simdgroup_float8x8 resident_k[16];
+    if (sg_active) {
+        #pragma clang loop unroll(full)
+        for (uint db = 0; db < 16u; db++) {
+            const uint d = db * 8u + uint(xy.y);
+            float k0 = 0.0f, k1 = 0.0f;
+            if (comp0 < args.n_comp) {
+                device const ushort *row = (device const ushort *)(index_comp +
+                    (ulong)comp0 * args.index_row_stride);
+                k0 = as_type<float>(uint(row[d]) << 16u);
+            }
+            if (comp1 < args.n_comp) {
+                device const ushort *row = (device const ushort *)(index_comp +
+                    (ulong)comp1 * args.index_row_stride);
+                k1 = as_type<float>(uint(row[d]) << 16u);
+            }
+            resident_k[db].thread_elements()[0] = k0;
+            resident_k[db].thread_elements()[1] = k1;
+        }
+    }
+
+    float acc0 = 0.0f, acc1 = 0.0f;
+    for (uint head = 0; head < 32u; head++) {
+        #pragma clang loop unroll(full)
+        for (uint u = 0; u < 4u; u++) {
+            const uint t = u * 2u + lt;
+            const uint tok = token_base + t;
+            float2 v = float2(0.0f);
+            if (tok < args.n_tokens) {
+                device const packed_float2 *qh2 = (device const packed_float2 *)(q +
+                    (ulong)tok * args.q_token_stride + (ulong)head * args.q_head_stride);
+                v = float2(qh2[lc2]);
+            }
+            smem_q2[t * 64u + (lc2 ^ (t * 4u))] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sg_active) {
+            simdgroup_float8x8 mdot = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            #pragma clang loop unroll(full)
+            for (uint db = 0; db < 16u; db++) {
+                simdgroup_float8x8 mq;
+                const float2 qp = smem_q2[rd_t * 64u + ((db * 4u + rd_j) ^ (rd_t * 4u))];
+                mq.thread_elements()[0] = qp.x;
+                mq.thread_elements()[1] = qp.y;
+                simdgroup_multiply_accumulate(mdot, mq, resident_k[db], mdot);
+            }
+            if (live && comp0 < args.n_comp) {
+                #pragma clang fp contract(off) reassociate(off)
+                device const float *w = (device const float *)(weights +
+                    (ulong)token * args.weights_token_stride);
+                const float s = mdot.thread_elements()[0];
+                const float weighted = max(s, 0.0f) * w[head];
+                const float scaled = weighted * args.scale;
+                acc0 = scaled + acc0;
+            }
+            if (live && comp1 < args.n_comp) {
+                #pragma clang fp contract(off) reassociate(off)
+                device const float *w = (device const float *)(weights +
+                    (ulong)token * args.weights_token_stride);
+                const float s = mdot.thread_elements()[1];
+                const float weighted = max(s, 0.0f) * w[head];
+                const float scaled = weighted * args.scale;
+                acc1 = scaled + acc1;
+            }
+        }
+        if (head + 1u < 32u) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (sg_in_union && live) {
+        const ushort dst_blk = tile_dst_col[((ulong)tgpig.y * args.u_stride + u_idx) * 8u + uint(xy.y)];
+        if (dst_blk < 2048u) {
+            device float *dst = (device float *)(scores + (ulong)token * args.score_token_stride);
+            const uint dst0 = uint(dst_blk) * 8u + uint(xy.x);
+            if (sg_active) {
+                const uint visible = min((args.pos0 + token + 1u) / args.ratio, args.n_comp);
+                dst[dst0] = (comp0 < args.n_comp && comp0 < visible) ? acc0 : -INFINITY;
+                dst[dst0 + 1u] = (comp1 < args.n_comp && comp1 < visible) ? acc1 : -INFINITY;
+            } else {
+                dst[dst0] = -INFINITY;
+                dst[dst0 + 1u] = -INFINITY;
+            }
+        }
+    }
+}
+
+// 0B smem variant matching MYDS_INDEXER_RO_SMEM_Q=0.
+kernel void kernel_myds_indexer_scores_prefill_compact_ro_0b_bf16(
+        constant myds_indexer_prefill_compact_score_args &args [[buffer(0)]],
+        device const char *q                                   [[buffer(1)]],
+        device const char *weights                             [[buffer(2)]],
+        device const char *index_comp                          [[buffer(3)]],
+        device char *scores                                    [[buffer(4)]],
+        device const uint32_t *meta_u32                        [[buffer(5)]],
+        device const ushort *tile_dst_col                      [[buffer(6)]],
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u ||
+        (args.ratio != 1u && args.ratio != 2u) ||
+        args.n_comp <= 512u || args.n_comp > 1048576u ||
+        args.n_tokens < 1u || args.n_tokens > 2048u ||
+        args.pos0 > 1048576u - args.n_tokens || args.scale != 1.0f / 64.0f ||
+        sg >= 4u) return;
+
+    const uint token_base = tgpig.y * 8u;
+    if (token_base >= args.n_tokens) return;
+
+    device const uint32_t *union_blocks = meta_u32 + args.union_blk_off;
+    device const uint32_t *union_counts = meta_u32 + args.union_cnt_off;
+    const uint u_cnt = union_counts[tgpig.y];
+    const uint u_base = tgpig.x * 4u;
+    if (u_base >= u_cnt) return;
+
+    const uint u_idx = u_base + uint(sg);
+    if (u_idx >= u_cnt) return;
+    const uint comp_base = union_blocks[(ulong)tgpig.y * args.u_stride + u_idx] * 8u;
+
+    const short2 xy = dsv4_indexer_ro_0b_coord(lane);
+    const uint token = token_base + uint(xy.y);
+    const uint comp0 = comp_base + uint(xy.x);
+    const uint comp1 = comp0 + 1u;
+    const bool live = token < args.n_tokens;
+    const uint last_token = min(token_base + 8u, args.n_tokens);
+    const uint max_visible = min((args.pos0 + last_token) / args.ratio, args.n_comp);
+
+    float acc0 = 0.0f, acc1 = 0.0f;
+    const bool sg_active = (comp_base < max_visible);
+    if (sg_active) {
+        simdgroup_float8x8 resident_k[16];
+        #pragma clang loop unroll(full)
+        for (uint db = 0; db < 16u; db++) {
+            const uint d = db * 8u + uint(xy.y);
+            float k0 = 0.0f, k1 = 0.0f;
+            if (comp0 < args.n_comp) {
+                device const ushort *row = (device const ushort *)(index_comp +
+                    (ulong)comp0 * args.index_row_stride);
+                k0 = as_type<float>(uint(row[d]) << 16u);
+            }
+            if (comp1 < args.n_comp) {
+                device const ushort *row = (device const ushort *)(index_comp +
+                    (ulong)comp1 * args.index_row_stride);
+                k1 = as_type<float>(uint(row[d]) << 16u);
+            }
+            resident_k[db].thread_elements()[0] = k0;
+            resident_k[db].thread_elements()[1] = k1;
+        }
+
+        for (uint head = 0; head < 32u; head++) {
+            simdgroup_float8x8 mdot = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            #pragma clang loop unroll(full)
+            for (uint db = 0; db < 16u; db++) {
+                simdgroup_float8x8 mq;
+                float q0 = 0.0f, q1 = 0.0f;
+                if (live) {
+                    device const float *qh = (device const float *)(q +
+                        (ulong)token * args.q_token_stride + (ulong)head * args.q_head_stride);
+                    q0 = qh[db * 8u + uint(xy.x)];
+                    q1 = qh[db * 8u + uint(xy.x) + 1u];
+                }
+                mq.thread_elements()[0] = q0;
+                mq.thread_elements()[1] = q1;
+                simdgroup_multiply_accumulate(mdot, mq, resident_k[db], mdot);
+            }
+            if (live && comp0 < args.n_comp) {
+                #pragma clang fp contract(off) reassociate(off)
+                device const float *w = (device const float *)(weights +
+                    (ulong)token * args.weights_token_stride);
+                const float s = mdot.thread_elements()[0];
+                const float weighted = max(s, 0.0f) * w[head];
+                const float scaled = weighted * args.scale;
+                acc0 = scaled + acc0;
+            }
+            if (live && comp1 < args.n_comp) {
+                #pragma clang fp contract(off) reassociate(off)
+                device const float *w = (device const float *)(weights +
+                    (ulong)token * args.weights_token_stride);
+                const float s = mdot.thread_elements()[1];
+                const float weighted = max(s, 0.0f) * w[head];
+                const float scaled = weighted * args.scale;
+                acc1 = scaled + acc1;
+            }
+        }
+    }
+
+    if (live) {
+        const ushort dst_blk = tile_dst_col[((ulong)tgpig.y * args.u_stride + u_idx) * 8u + uint(xy.y)];
+        if (dst_blk < 2048u) {
+            device float *dst = (device float *)(scores + (ulong)token * args.score_token_stride);
+            const uint dst0 = uint(dst_blk) * 8u + uint(xy.x);
+            if (sg_active) {
+                const uint visible = min((args.pos0 + token + 1u) / args.ratio, args.n_comp);
+                dst[dst0] = (comp0 < args.n_comp && comp0 < visible) ? acc0 : -INFINITY;
+                dst[dst0 + 1u] = (comp1 < args.n_comp && comp1 < visible) ? acc1 : -INFINITY;
+            } else {
+                dst[dst0] = -INFINITY;
+                dst[dst0 + 1u] = -INFINITY;
+            }
+        }
+    }
+}
+
+// Stage 3a: (16, n_tokens, 1) TGs x 512 threads (8 KB smem -> 4 TGs/core).
+// Bitonic-sorts 1024 compact slots per TG by strict (score DESC, orig_row ASC)
+// and emits top 513 pairs (513th detects boundary ties).
+kernel void kernel_myds_prefill_compact_topk_stage1(
+        constant myds_prefill_compact_topk_args &args [[buffer(0)]],
+        device const float *compact_scores            [[buffer(1)]],
+        device const uint32_t *meta_u32               [[buffer(2)]],
+        device myds_compact_pair *stage1_out          [[buffer(3)]],
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_index_in_threadgroup]]) {
+    const uint tg = tgpig.x;
+    const uint row = tgpig.y;
+    if (tg >= 16u || row >= args.n_tokens || !args.ratio) return;
+
+    threadgroup myds_compact_pair s_p[1024];
+    const uint width = min(args.n_comp, (args.pos0 + row + 1u) / args.ratio);
+    device const int32_t *row_blocks =
+        (device const int32_t *)(meta_u32 + args.row_blk_off) + (ulong)row * 2048u;
+    device const float *row_scores = compact_scores + (ulong)row * 16384u;
+
+    const uint base = tg * 1024u;
+    const uint i0 = uint(tid);
+    const uint i1 = i0 + 512u;
+
+    {
+        const uint slot = base + i0;
+        const int32_t blk = row_blocks[slot >> 3u];
+        myds_compact_pair p = {-INFINITY, -1};
+        if (blk >= 0) {
+            const uint cand = uint(blk) * 8u + (slot & 7u);
+            if (cand < width) {
+                const float sc = row_scores[slot];
+                if (as_type<uint>(sc) != 0xff800000u) p = {sc, int32_t(cand)};
+            }
+        }
+        s_p[i0] = p;
+    }
+    {
+        const uint slot = base + i1;
+        const int32_t blk = row_blocks[slot >> 3u];
+        myds_compact_pair p = {-INFINITY, -1};
+        if (blk >= 0) {
+            const uint cand = uint(blk) * 8u + (slot & 7u);
+            if (cand < width) {
+                const float sc = row_scores[slot];
+                if (as_type<uint>(sc) != 0xff800000u) p = {sc, int32_t(cand)};
+            }
+        }
+        s_p[i1] = p;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint k = 2u; k <= 1024u; k <<= 1u) {
+        for (uint j = k >> 1u; j > 0u; j >>= 1u) {
+            const uint low = i0 & (j - 1u);
+            const uint ix0 = ((i0 - low) << 1u) + low;
+            const uint ix1 = ix0 | j;
+            const bool desc_dir = ((ix0 & k) == 0u);
+            const myds_compact_pair pa = s_p[ix0];
+            const myds_compact_pair pb = s_p[ix1];
+            bool a_before_b;
+            if (pa.row < 0 && pb.row < 0) a_before_b = (ix0 < ix1);
+            else a_before_b = myds_compact_pair_better(pa, pb);
+            if (a_before_b != desc_dir) {
+                s_p[ix0] = pb;
+                s_p[ix1] = pa;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    device myds_compact_pair *dst = stage1_out + ((ulong)row * 16u + tg) * 513u;
+    dst[i0] = s_p[i0];
+    if (i0 == 0u) dst[512u] = s_p[512u];
+}
+
+// Stage 3b: (4, n_tokens, 1) TGs x 512 threads. Merges 4x513 -> 513 per TG.
+kernel void kernel_myds_prefill_compact_topk_stage2(
+        constant myds_prefill_compact_topk_args &args [[buffer(0)]],
+        device const myds_compact_pair *stage1_in     [[buffer(1)]],
+        device myds_compact_pair *stage2_out          [[buffer(2)]],
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_index_in_threadgroup]]) {
+    const uint tg = tgpig.x;
+    const uint row = tgpig.y;
+    if (tg >= 4u || row >= args.n_tokens) return;
+
+    threadgroup myds_compact_pair s_m0[513];
+    threadgroup myds_compact_pair s_m1[513];
+    device const myds_compact_pair *base_in = stage1_in + ((ulong)row * 16u + tg * 4u) * 513u;
+    device const myds_compact_pair *r0 = base_in + 0u * 513u;
+    device const myds_compact_pair *r1 = base_in + 1u * 513u;
+    device const myds_compact_pair *r2 = base_in + 2u * 513u;
+    device const myds_compact_pair *r3 = base_in + 3u * 513u;
+
+    const int k = int(tid);
+    s_m0[k] = myds_compact_merge2_at_dev(r0, 513, r1, 513, k);
+    s_m1[k] = myds_compact_merge2_at_dev(r2, 513, r3, 513, k);
+    if (tid == 0u) {
+        s_m0[512] = myds_compact_merge2_at_dev(r0, 513, r1, 513, 512);
+        s_m1[512] = myds_compact_merge2_at_dev(r2, 513, r3, 513, 512);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device myds_compact_pair *dst = stage2_out + ((ulong)row * 4u + tg) * 513u;
+    dst[k] = myds_compact_merge2_at_tg(s_m0, 513, s_m1, 513, k);
+    if (tid == 0u) {
+        dst[512] = myds_compact_merge2_at_tg(s_m0, 513, s_m1, 513, 512);
+    }
+}
+
+// Stage 3c: (1, n_tokens, 1) TGs x 1024 threads. Merges 4x513 -> top 513 per row,
+// takes immediate fast-path when tie-free, or replays exact 1024-row dense bitonic
+// partitions on same-partition / boundary ties or <512 finite tail for 0-ULP parity.
+kernel void kernel_myds_prefill_compact_topk_final(
+        constant myds_prefill_compact_topk_args &args [[buffer(0)]],
+        device const myds_compact_pair *stage2_in     [[buffer(1)]],
+        device const uint32_t *meta_u32               [[buffer(2)]],
+        device const float *compact_scores            [[buffer(3)]],
+        device int32_t *selected                      [[buffer(4)]],
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    const uint row = tgpig.y;
+    if (tgpig.x >= 1u || row >= args.n_tokens || !args.ratio) return;
+    const uint width = min(args.n_comp, (args.pos0 + row + 1u) / args.ratio);
+    if (width == 0u) return;
+    const uint top_out = min(512u, width);
+
+    threadgroup myds_compact_pair s_m0[513];
+    threadgroup myds_compact_pair s_m1[513];
+    threadgroup myds_compact_pair s_top[513];
+    threadgroup int32_t shmem_i32[1024];
+    threadgroup float   shmem_f32[1024];
+    threadgroup uint32_t s_sg_u32[32];
+    threadgroup uint32_t s_cmd_u[6];
+    threadgroup float    s_cmd_f;
+
+    device const myds_compact_pair *base_in = stage2_in + (ulong)row * 4u * 513u;
+    device const myds_compact_pair *r0 = base_in + 0u * 513u;
+    device const myds_compact_pair *r1 = base_in + 1u * 513u;
+    device const myds_compact_pair *r2 = base_in + 2u * 513u;
+    device const myds_compact_pair *r3 = base_in + 3u * 513u;
+
+    device const int32_t *row_blocks =
+        (device const int32_t *)(meta_u32 + args.row_blk_off) + (ulong)row * 2048u;
+    device const float *row_scores = compact_scores + (ulong)row * 16384u;
+    device int32_t *row_selected = selected + (ulong)row * 512u;
+
+    if (tid < 512u) {
+        const int k = int(tid);
+        s_m0[k] = myds_compact_merge2_at_dev(r0, 513, r1, 513, k);
+        if (tid == 0u) s_m0[512] = myds_compact_merge2_at_dev(r0, 513, r1, 513, 512);
+    } else {
+        const int k = int(tid - 512u);
+        s_m1[k] = myds_compact_merge2_at_dev(r2, 513, r3, 513, k);
+        if (tid == 512u) s_m1[512] = myds_compact_merge2_at_dev(r2, 513, r3, 513, 512);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < 513u) {
+        s_top[tid] = myds_compact_merge2_at_tg(s_m0, 513, s_m1, 513, int(tid));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint local_same_part_tie = 0u;
+    if (tid + 1u < top_out) {
+        const myds_compact_pair p0 = s_top[tid];
+        const myds_compact_pair p1 = s_top[tid + 1u];
+        if (p0.row >= 0 && p1.row >= 0 && p0.score == p1.score &&
+            (uint(p0.row) >> 10u) == (uint(p1.row) >> 10u)) {
+            local_same_part_tie = 1u;
+        }
+    }
+    const uint sg_tie = simd_or(local_same_part_tie);
+    if (lane == 0u) s_sg_u32[sg] = sg_tie;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0u) {
+        uint any_tie = 0u;
+        for (uint s = 0u; s < 16u; s++) any_tie |= s_sg_u32[s];
+        const bool all_valid = (s_top[top_out - 1u].row >= 0);
+        const bool boundary_tie = all_valid && (top_out == 512u) &&
+                                  (s_top[512].row >= 0) &&
+                                  (s_top[512].score == s_top[511].score);
+        s_cmd_u[0] = (all_valid && !boundary_tie && !any_tie) ? 1u : 0u;
+        s_cmd_u[1] = boundary_tie ? 1u : 0u;
+        uint k_fin = top_out;
+        if (!all_valid) {
+            k_fin = 0u;
+            while (k_fin < top_out && s_top[k_fin].row >= 0) k_fin++;
+        }
+        uint k_gt = k_fin;
+        if (boundary_tie) {
+            const float tau = s_top[511].score;
+            k_gt = 0u;
+            while (k_gt < 512u && s_top[k_gt].score > tau) k_gt++;
+            s_cmd_f = tau;
+        }
+        s_cmd_u[2] = k_fin;
+        s_cmd_u[3] = k_gt;
+        s_cmd_u[4] = 0u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (s_cmd_u[0] != 0u) {
+        if (tid < top_out) row_selected[tid] = s_top[tid].row;
+        return;
+    }
+
+    const uint limit_strict = (s_cmd_u[1] != 0u) ? s_cmd_u[3] : s_cmd_u[2];
+    for (;;) {
+        if (tid == 0u) {
+            uint cur = s_cmd_u[4];
+            uint found = 0u;
+            while (cur + 1u < limit_strict) {
+                const float sc = s_top[cur].score;
+                const uint pt = uint(s_top[cur].row) >> 10u;
+                uint end = cur + 1u;
+                while (end < limit_strict && s_top[end].score == sc &&
+                       (uint(s_top[end].row) >> 10u) == pt) {
+                    end++;
+                }
+                if (end - cur > 1u) {
+                    s_cmd_u[5] = pt;
+                    s_cmd_u[4] = end;
+                    s_sg_u32[0] = cur;
+                    s_sg_u32[1] = end - cur;
+                    s_sg_u32[2] = as_type<uint>(sc);
+                    found = 1u;
+                    break;
+                }
+                cur = end;
+            }
+            if (!found) s_cmd_u[4] = limit_strict;
+            s_sg_u32[3] = found;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (s_sg_u32[3] == 0u) break;
+
+        const uint pt = s_cmd_u[5];
+        const uint out_pos = s_sg_u32[0];
+        const uint need_cnt = s_sg_u32[1];
+        const float target_sc = as_type<float>(s_sg_u32[2]);
+
+        myds_compact_replay_partition_1024(pt, width, row_blocks, row_scores,
+                                           shmem_i32, shmem_f32, tid);
+        if (tid == 0u) {
+            const int i00 = int(pt * 1024u);
+            uint written = 0u;
+            for (uint c = 0u; c < 512u && written < need_cnt; c++) {
+                const int idx = shmem_i32[c];
+                if (uint(idx) < width && shmem_f32[idx - i00] == target_sc) {
+                    s_top[out_pos + written] = {target_sc, idx};
+                    written++;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (s_cmd_u[1] != 0u) {
+        const float tau = s_cmd_f;
+        if (tid == 0u) {
+            s_cmd_u[4] = s_cmd_u[3];
+            s_cmd_u[5] = 0u;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        while (s_cmd_u[4] < 512u) {
+            const uint next_part = s_cmd_u[5];
+            uint min_p = 0xffffffffu;
+            #pragma clang loop unroll(full)
+            for (uint m = 0u; m < 16u; m++) {
+                const uint slot = uint(tid) + m * 1024u;
+                const int32_t blk = row_blocks[slot >> 3u];
+                if (blk >= 0) {
+                    const uint cand = uint(blk) * 8u + (slot & 7u);
+                    if (cand < width) {
+                        const uint p = cand >> 10u;
+                        if (p >= next_part) {
+                            const float sc = row_scores[slot];
+                            if (as_type<uint>(sc) != 0xff800000u && sc == tau) {
+                                min_p = min(min_p, p);
+                            }
+                        }
+                    }
+                }
+            }
+            const uint sg_min = simd_min(min_p);
+            if (lane == 0u) s_sg_u32[sg] = sg_min;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (sg == 0u) {
+                const uint v = simd_min(s_sg_u32[lane]);
+                if (lane == 0u) s_cmd_u[5] = v;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const uint p_cur = s_cmd_u[5];
+            if (p_cur == 0xffffffffu) break;
+
+            myds_compact_replay_partition_1024(p_cur, width, row_blocks, row_scores,
+                                               shmem_i32, shmem_f32, tid);
+            if (tid == 0u) {
+                const int i00 = int(p_cur * 1024u);
+                uint fill_pos = s_cmd_u[4];
+                for (uint c = 0u; c < 512u && fill_pos < 512u; c++) {
+                    const int idx = shmem_i32[c];
+                    if (uint(idx) < width && shmem_f32[idx - i00] == tau) {
+                        s_top[fill_pos++] = {tau, idx};
+                    }
+                }
+                s_cmd_u[4] = fill_pos;
+                s_cmd_u[5] = p_cur + 1u;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    for (uint p_inf = 0u; s_cmd_u[2] < top_out && p_inf * 1024u < width; p_inf++) {
+        myds_compact_replay_partition_1024(p_inf, width, row_blocks, row_scores,
+                                           shmem_i32, shmem_f32, tid);
+        if (tid == 0u) {
+            const int i00 = int(p_inf * 1024u);
+            uint fill_pos = s_cmd_u[2];
+            for (uint c = 0u; c < 512u && fill_pos < top_out; c++) {
+                const int idx = shmem_i32[c];
+                if (uint(idx) < width && as_type<uint>(shmem_f32[idx - i00]) == 0xff800000u) {
+                    s_top[fill_pos++] = {-INFINITY, idx};
+                }
+            }
+            s_cmd_u[2] = fill_pos;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid < top_out) {
+        row_selected[tid] = s_top[tid].row;
+    }
+}
+
+
 

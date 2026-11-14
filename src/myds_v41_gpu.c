@@ -227,6 +227,7 @@ size_t myds_v41_gpu_chunk_workspace_bytes(const myds_v41_gpu_scratch_t *s) {
 myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp) {
     if (myds_v41_gpu_indexer_register_only_enabled()<0 ||
         myds_v41_gpu_indexer_decode_compact_enabled()<0 ||
+        myds_v41_gpu_indexer_prefill_compact_enabled()<0 ||
         myds_v41_gpu_attention_packed_register_enabled()<0 || myds_v41_attention_rope_fuse_enabled()<0 ||
         myds_v41_gpu_attention_direct_pack_fuse_enabled()<0) return NULL;
     if(!max_comp || max_comp>1048576) return NULL;
@@ -288,7 +289,8 @@ myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp) {
     }
     s->batch_floats = batch_floats;
     s->chunk_scores=myds_metal_buffer_alloc((size_t)s->batch_floats*4u);
-    s->chunk_tmp_a=myds_metal_buffer_alloc((size_t)s->batch_floats*4u);
+    /* +batch_floats/512 floats (+64 KiB at 8M) fits [P-L1] 513-pair stage1 runs up to glen=512. */
+    s->chunk_tmp_a=myds_metal_buffer_alloc(((size_t)s->batch_floats+(size_t)(s->batch_floats/512u))*4u);
     s->chunk_tmp_b=myds_metal_buffer_alloc((size_t)s->batch_floats*4u);
     s->chunk_blocks=myds_metal_buffer_alloc((size_t)s->batch_floats*4u);
     s->chunk_block_sel=myds_metal_buffer_alloc((size_t)s->batch_floats*4u);
@@ -1279,6 +1281,298 @@ int myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped(
      * is an independent enclosing-batch gate, not this host encoding count. */
     atomic_fetch_add_explicit(&indexer_register_only_counters[IRO_ENCODED],1u,memory_order_relaxed);
     atomic_fetch_add_explicit(&indexer_register_only_counters[IRO_BF16],1u,memory_order_relaxed);
+    return 1;
+}
+
+/* ── [P-L1] Prefill YoCo (il > 20, ratio == 1, nc > 16384) 0-ULP Compact ── */
+enum {
+    IPC_REQUESTS, IPC_ENCODED, IPC_FALLBACKS, IPC_FAILURES,
+    IPC_ROWS_SCORED, IPC_UNION_CAP_BLOCKS, IPC_DENSE_BLOCKS, IPC_COUNT
+};
+static _Atomic uint64_t indexer_prefill_compact_cnt[IPC_COUNT];
+static bool indexer_prefill_compact_test_unavailable = false;
+
+int myds_v41_gpu_indexer_prefill_compact_enabled(void) {
+    const char *v = getenv("MYDS_INDEXER_PREFILL_COMPACT");
+    if (!v || !strcmp(v, "1")) return 1;
+    if (!strcmp(v, "0")) return 0;
+    MYDS_LOG_E("MYDS_INDEXER_PREFILL_COMPACT must be exactly absent, 0 or 1");
+    return -1;
+}
+
+void myds_v41_gpu_indexer_prefill_compact_counters(
+    myds_v41_gpu_indexer_prefill_compact_counters_t *out, bool reset) {
+    uint64_t v[IPC_COUNT];
+    for (unsigned i = 0; i < IPC_COUNT; ++i) {
+        v[i] = reset ? atomic_exchange_explicit(&indexer_prefill_compact_cnt[i], 0u, memory_order_relaxed)
+                     : atomic_load_explicit(&indexer_prefill_compact_cnt[i], memory_order_relaxed);
+    }
+    if (out) {
+        *out = (myds_v41_gpu_indexer_prefill_compact_counters_t){
+            v[IPC_REQUESTS], v[IPC_ENCODED], v[IPC_FALLBACKS], v[IPC_FAILURES],
+            v[IPC_ROWS_SCORED], v[IPC_UNION_CAP_BLOCKS], v[IPC_DENSE_BLOCKS]
+        };
+    }
+}
+
+void myds_v41_gpu_inject_indexer_prefill_compact_unavailable(bool enabled) {
+    indexer_prefill_compact_test_unavailable = enabled;
+}
+
+uint32_t myds_v41_gpu_indexer_prefill_compact_max_glen(
+    const myds_v41_gpu_scratch_t *s) {
+    if (!s || s->batch_floats < 131072u) return 0u;
+    const uint32_t g = (s->batch_floats / 16384u) & ~7u;
+    return g > 512u ? 512u : g;
+}
+
+struct indexer_prefill_compact_prep_args {
+    uint32_t n_comp, n_tokens, pos0, ratio, mask_units, u_stride;
+    uint32_t row_blk_off, union_blk_off, union_cnt_off;
+};
+_Static_assert(sizeof(struct indexer_prefill_compact_prep_args) == 36u,
+               "prefill compact prep args ABI");
+
+struct indexer_prefill_compact_score_args {
+    uint32_t n_comp, n_tokens, n_head, head_dim, pos0, ratio;
+    uint32_t u_stride, union_blk_off, union_cnt_off;
+    float    scale;
+    uint64_t q_token_stride, q_head_stride, weights_token_stride;
+    uint64_t index_row_stride, score_token_stride;
+};
+_Static_assert(sizeof(struct indexer_prefill_compact_score_args) == 80u,
+               "prefill compact score args ABI");
+
+struct prefill_compact_topk_args {
+    uint32_t n_comp, n_tokens, pos0, ratio, row_blk_off;
+};
+_Static_assert(sizeof(struct prefill_compact_topk_args) == 20u,
+               "prefill compact topk args ABI");
+
+static const char *prefill_compact_selected_score_kernel(void) {
+    const int ro = myds_v41_gpu_indexer_register_only_enabled();
+    if (ro <= 0) return NULL;
+    const char *smem_q = getenv("MYDS_INDEXER_RO_SMEM_Q");
+    if (!smem_q || !strcmp(smem_q, "1")) {
+        return "kernel_myds_indexer_scores_prefill_compact_ro_bf16";
+    }
+    if (!strcmp(smem_q, "0")) {
+        return "kernel_myds_indexer_scores_prefill_compact_ro_0b_bf16";
+    }
+    MYDS_LOG_E("MYDS_INDEXER_RO_SMEM_Q must be absent, 0, or 1");
+    return NULL;
+}
+
+int myds_v41_gpu_indexer_prefill_compact_bf16(
+    myds_v41_gpu_scratch_t *s, myds_metal_buffer_t *ids,
+    const myds_metal_buffer_t *q, const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *cache, const myds_metal_buffer_t *mask_bits,
+    uint32_t n_comp, uint32_t n_tokens, uint32_t causal_start,
+    uint32_t causal_ratio, uint32_t mask_units) {
+    if (indexer_prefill_compact_test_unavailable) return 0;
+    const uint32_t max_glen = myds_v41_gpu_indexer_prefill_compact_max_glen(s);
+    if (!s || !max_glen || !ids || !q || !weights || !cache || !mask_bits ||
+        !s->chunk_scores || !s->chunk_blocks || !s->chunk_block_sel ||
+        !s->chunk_tmp_a || !s->chunk_tmp_b) return 0;
+    if (!n_tokens || n_tokens > max_glen || !causal_ratio ||
+        (causal_ratio != 1u && causal_ratio != 2u) ||
+        n_comp <= 16384u || n_comp > 1048576u ||
+        n_comp > s->max_comp || n_comp > s->key_comp_max ||
+        causal_start > 1048576u - n_tokens ||
+        (uint64_t)causal_start + 1u < causal_ratio) return 0;
+
+    const uint32_t n_blocks = (n_comp + 7u) / 8u;
+    const uint32_t req_mask_words = (n_blocks + 31u) / 32u;
+    if (!mask_units || mask_units < req_mask_words) return 0;
+
+    const char *score_kernel = prefill_compact_selected_score_kernel();
+    if (!score_kernel) return -1;
+
+    const uint32_t n_tiles = (n_tokens + 7u) / 8u;
+    const uint32_t nr_cap = n_tokens < 8u ? n_tokens : 8u;
+    const uint32_t u_raw = nr_cap * 2048u < n_blocks ? nr_cap * 2048u : n_blocks;
+    uint32_t u_stride = (u_raw + 63u) & ~63u;
+    if (u_stride > 16384u) u_stride = 16384u;
+
+    const uint32_t row_blk_off = 0u;
+    const uint32_t union_blk_off = n_tokens * 2048u;
+    const uint32_t union_cnt_off = union_blk_off + n_tiles * u_stride;
+    const uint64_t meta_bytes = (uint64_t)(union_cnt_off + n_tiles) * sizeof(uint32_t);
+    const uint64_t dst_col_bytes = (uint64_t)n_tiles * u_stride * 8u * sizeof(uint16_t);
+    const uint64_t compact_score_bytes = (uint64_t)n_tokens * 16384u * sizeof(float);
+    const uint64_t stage1_bytes = (uint64_t)n_tokens * 16u * 513u * 8u;
+    const uint64_t stage2_bytes = (uint64_t)n_tokens * 4u * 513u * 8u;
+
+    const uint64_t ids_bytes = (uint64_t)n_tokens * 512u * sizeof(int32_t);
+    const uint64_t q_bytes = (uint64_t)n_tokens * 32u * 128u * sizeof(float);
+    const uint64_t w_bytes = (uint64_t)n_tokens * 32u * sizeof(float);
+    const uint64_t cache_bytes = (uint64_t)n_comp * 128u * sizeof(uint16_t);
+    const uint64_t mask_bytes = (uint64_t)n_tokens * mask_units * sizeof(uint32_t);
+
+    if (!myds_metal_buffer_native_range(ids, ids_bytes, 4u) ||
+        !myds_metal_buffer_native_range(q, q_bytes, 4u) ||
+        !myds_metal_buffer_native_range(weights, w_bytes, 4u) ||
+        !myds_metal_buffer_native_range(cache, cache_bytes, 2u) ||
+        !myds_metal_buffer_native_range(mask_bits, mask_bytes, 4u) ||
+        !myds_metal_buffer_native_range(s->chunk_scores, compact_score_bytes, 4u) ||
+        !myds_metal_buffer_native_range(s->chunk_block_sel, meta_bytes, 4u) ||
+        !myds_metal_buffer_native_range(s->chunk_blocks, dst_col_bytes, 16u) ||
+        !myds_metal_buffer_native_range(s->chunk_tmp_a, stage1_bytes, 8u) ||
+        !myds_metal_buffer_native_range(s->chunk_tmp_b, stage2_bytes, 8u) ||
+        buffer_ranges_overlap(ids, (size_t)ids_bytes, q, (size_t)q_bytes) ||
+        buffer_ranges_overlap(ids, (size_t)ids_bytes, weights, (size_t)w_bytes) ||
+        buffer_ranges_overlap(ids, (size_t)ids_bytes, cache, (size_t)cache_bytes) ||
+        buffer_ranges_overlap(ids, (size_t)ids_bytes, mask_bits, (size_t)mask_bytes)) {
+        return 0;
+    }
+
+    const uint32_t th_1024[] = {1024u, 1u, 1u};
+    const uint32_t th_score[] = {32u, 4u, 1u};
+    const uint32_t th_512[] = {512u, 1u, 1u};
+    if (myds_metal_kernel_max_threads("kernel_argsort_f32_i32_desc_causal") != 1024u ||
+        !myds_metal_kernel_constants_preflight("kernel_myds_indexer_prefill_compact_prep", th_1024, 0u, NULL, 0u) ||
+        !myds_metal_kernel_constants_preflight(score_kernel, th_score, 0u, NULL, 0u) ||
+        !myds_metal_kernel_constants_preflight("kernel_myds_prefill_compact_topk_stage1", th_512, 0u, NULL, 0u) ||
+        !myds_metal_kernel_constants_preflight("kernel_myds_prefill_compact_topk_stage2", th_512, 0u, NULL, 0u) ||
+        !myds_metal_kernel_constants_preflight("kernel_myds_prefill_compact_topk_final", th_1024, 0u, NULL, 0u)) {
+        return 0;
+    }
+
+    if (!myds_metal_get_auto_barrier()) {
+        const myds_metal_buffer_t *prep_deps[] = {mask_bits, s->chunk_block_sel, s->chunk_blocks};
+        myds_metal_barrier_buffers(prep_deps, 3u);
+    }
+    struct indexer_prefill_compact_prep_args pa = {
+        n_comp, n_tokens, causal_start, causal_ratio, mask_units, u_stride,
+        row_blk_off, union_blk_off, union_cnt_off
+    };
+    const myds_metal_buffer_t *b_prep[] = {mask_bits, s->chunk_block_sel, s->chunk_blocks};
+    if (!dispatch("kernel_myds_indexer_prefill_compact_prep", &pa, sizeof(pa), b_prep, 3u,
+                  n_tiles, 1u, 1u, 1024u, 1u, 1u, 0u)) {
+        return 0;
+    }
+
+    if (!myds_metal_get_auto_barrier()) {
+        const myds_metal_buffer_t *score_deps[] = {
+            q, weights, cache, s->chunk_block_sel, s->chunk_blocks, s->chunk_scores
+        };
+        myds_metal_barrier_buffers(score_deps, 6u);
+    }
+    struct indexer_prefill_compact_score_args sa = {
+        .n_comp = n_comp, .n_tokens = n_tokens, .n_head = 32u, .head_dim = 128u,
+        .pos0 = causal_start, .ratio = causal_ratio, .u_stride = u_stride,
+        .union_blk_off = union_blk_off, .union_cnt_off = union_cnt_off,
+        .scale = 1.0f / 64.0f,
+        .q_token_stride = 32u * 128u * sizeof(float),
+        .q_head_stride = 128u * sizeof(float),
+        .weights_token_stride = 32u * sizeof(float),
+        .index_row_stride = 128u * sizeof(uint16_t),
+        .score_token_stride = 16384u * sizeof(float)
+    };
+    const myds_metal_buffer_t *b_score[] = {
+        q, weights, cache, s->chunk_scores, s->chunk_block_sel, s->chunk_blocks
+    };
+    if (!dispatch(score_kernel, &sa, sizeof(sa), b_score, 6u,
+                  (u_stride + 3u) / 4u, n_tiles, 1u, 32u, 4u, 1u, 0u)) {
+        return 0;
+    }
+
+    if (!myds_metal_get_auto_barrier()) {
+        const myds_metal_buffer_t *s1_deps[] = {s->chunk_scores, s->chunk_tmp_a};
+        myds_metal_barrier_buffers(s1_deps, 2u);
+    }
+    struct prefill_compact_topk_args ta = {
+        n_comp, n_tokens, causal_start, causal_ratio, row_blk_off
+    };
+    const myds_metal_buffer_t *b_s1[] = {s->chunk_scores, s->chunk_block_sel, s->chunk_tmp_a};
+    if (!dispatch("kernel_myds_prefill_compact_topk_stage1", &ta, sizeof(ta), b_s1, 3u,
+                  16u, n_tokens, 1u, 512u, 1u, 1u, 0u)) {
+        return 0;
+    }
+
+    if (!myds_metal_get_auto_barrier()) {
+        const myds_metal_buffer_t *s2_deps[] = {s->chunk_tmp_a, s->chunk_tmp_b};
+        myds_metal_barrier_buffers(s2_deps, 2u);
+    }
+    const myds_metal_buffer_t *b_s2[] = {s->chunk_tmp_a, s->chunk_tmp_b};
+    if (!dispatch("kernel_myds_prefill_compact_topk_stage2", &ta, sizeof(ta), b_s2, 2u,
+                  4u, n_tokens, 1u, 512u, 1u, 1u, 0u)) {
+        return 0;
+    }
+
+    if (!myds_metal_get_auto_barrier()) {
+        const myds_metal_buffer_t *fin_deps[] = {s->chunk_tmp_b, ids};
+        myds_metal_barrier_buffers(fin_deps, 2u);
+    }
+    const myds_metal_buffer_t *b_fin[] = {
+        s->chunk_tmp_b, s->chunk_block_sel, s->chunk_scores, ids
+    };
+    if (!dispatch("kernel_myds_prefill_compact_topk_final", &ta, sizeof(ta), b_fin, 4u,
+                  1u, n_tokens, 1u, 1024u, 1u, 1u, 0u)) {
+        return -1;
+    }
+    if (!myds_metal_get_auto_barrier()) {
+        myds_metal_barrier_buffer(ids);
+    }
+    return 1;
+}
+
+int myds_v41_gpu_indexer_prefill_compact_scoped(
+    myds_v41_gpu_scratch_t *s, myds_metal_buffer_t *ids,
+    const myds_metal_buffer_t *q, const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *cache, const myds_metal_buffer_t *mask_bits,
+    uint32_t n_comp, uint32_t n_tokens, uint32_t causal_start,
+    uint32_t causal_ratio, uint32_t mask_units, uint32_t top_blocks_cap,
+    bool ordinary_prefill_allowed) {
+    atomic_fetch_add_explicit(&indexer_prefill_compact_cnt[IPC_REQUESTS], 1u, memory_order_relaxed);
+    const int mode = myds_v41_gpu_indexer_prefill_compact_enabled();
+    const int ro_mode = myds_v41_gpu_indexer_register_only_enabled();
+    if (mode < 0 || ro_mode < 0) {
+        atomic_fetch_add_explicit(&indexer_prefill_compact_cnt[IPC_FAILURES], 1u, memory_order_relaxed);
+        return -1;
+    }
+    if (!mode || !ro_mode || !ordinary_prefill_allowed) return 0;
+
+    const char *sgbar = getenv("MYDS_INDEXER_SGBAR");
+    const uint64_t end = (uint64_t)causal_start + n_tokens;
+    if (!s || causal_ratio != 1u || top_blocks_cap != 2048u ||
+        n_comp <= 16384u || n_comp > 1048576u || causal_start < 16384u ||
+        n_tokens < 8u || end > 1048576u || n_comp != end ||
+        (uint64_t)8u * n_comp > (uint64_t)s->batch_floats ||
+        !myds_metal_batch_active() || myds_metal_kprof_exclusive() ||
+        indexer_key_window() || myds_v41_gpu_topk_threshold_enabled() != 0 ||
+        (sgbar && strcmp(sgbar, "0") != 0)) {
+        return 0;
+    }
+    if (!prefill_compact_selected_score_kernel()) {
+        atomic_fetch_add_explicit(&indexer_prefill_compact_cnt[IPC_FAILURES], 1u, memory_order_relaxed);
+        return -1;
+    }
+
+    const int rc = myds_v41_gpu_indexer_prefill_compact_bf16(
+        s, ids, q, weights, cache, mask_bits,
+        n_comp, n_tokens, causal_start, causal_ratio, mask_units);
+    if (rc < 0) {
+        atomic_fetch_add_explicit(&indexer_prefill_compact_cnt[IPC_FAILURES], 1u, memory_order_relaxed);
+        return -1;
+    }
+    if (rc == 0) {
+        atomic_fetch_add_explicit(&indexer_prefill_compact_cnt[IPC_FALLBACKS], 1u, memory_order_relaxed);
+        return 0;
+    }
+
+    const uint32_t n_blocks = (n_comp + 7u) / 8u;
+    const uint32_t n_tiles = (n_tokens + 7u) / 8u;
+    const uint32_t u_raw = 8u * 2048u < n_blocks ? 8u * 2048u : n_blocks;
+    uint32_t u_stride = (u_raw + 63u) & ~63u;
+    if (u_stride > 16384u) u_stride = 16384u;
+
+    atomic_fetch_add_explicit(&indexer_prefill_compact_cnt[IPC_ENCODED], 1u, memory_order_relaxed);
+    atomic_fetch_add_explicit(&indexer_prefill_compact_cnt[IPC_ROWS_SCORED], n_tokens, memory_order_relaxed);
+    atomic_fetch_add_explicit(&indexer_prefill_compact_cnt[IPC_UNION_CAP_BLOCKS],
+                              (uint64_t)n_tiles * u_stride, memory_order_relaxed);
+    atomic_fetch_add_explicit(&indexer_prefill_compact_cnt[IPC_DENSE_BLOCKS],
+                              (uint64_t)n_tokens * n_blocks, memory_order_relaxed);
     return 1;
 }
 /* 按行批量（rows 行）。mask_stride 是 block_mask 的行步长（float）；

@@ -189,6 +189,9 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
     myds_v41_gpu_indexer_register_only_counters_t ro;
     memset(&ro, 0, sizeof(ro));
     myds_v41_gpu_indexer_register_only_counters(&ro, false);
+    myds_v41_gpu_indexer_prefill_compact_counters_t pc;
+    memset(&pc, 0, sizeof(pc));
+    myds_v41_gpu_indexer_prefill_compact_counters(&pc, false);
 
     /* Knob accounting, reusing the same inventory --print-config reports. */
     static myds_knob_seen_t seen[1024];
@@ -222,10 +225,16 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
 
     EMIT("\"counters\":{\"indexer_register_only\":{\"requests\":%llu,\"encoded\":%llu,"
          "\"fallbacks\":%llu,\"failures\":%llu,\"f32_dispatches\":%llu,"
-         "\"bf16_dispatches\":%llu},\"prefix_cache_len\":%u},",
+         "\"bf16_dispatches\":%llu},\"indexer_prefill_compact\":{\"requests\":%llu,"
+         "\"encoded\":%llu,\"fallbacks\":%llu,\"failures\":%llu,\"rows_scored\":%llu,"
+         "\"union_cap_blocks\":%llu,\"dense_blocks\":%llu},\"prefix_cache_len\":%u},",
          (unsigned long long)ro.requests, (unsigned long long)ro.encoded,
          (unsigned long long)ro.fallbacks, (unsigned long long)ro.failures,
          (unsigned long long)ro.f32_dispatches, (unsigned long long)ro.bf16_dispatches,
+         (unsigned long long)pc.requests, (unsigned long long)pc.encoded,
+         (unsigned long long)pc.fallbacks, (unsigned long long)pc.failures,
+         (unsigned long long)pc.rows_scored, (unsigned long long)pc.union_cap_blocks,
+         (unsigned long long)pc.dense_blocks,
          ctx ? myds_context_get_pcache_len(ctx) : 0u);
 
     const myds_steer_t *st = ctx ? myds_context_get_steer(ctx) : NULL;

@@ -215,6 +215,32 @@ int myds_v41_gpu_indexscores_compact_decode_bf16(myds_v41_gpu_scratch_t *scratch
     uint32_t n_comp, uint32_t first_row);
 int myds_v41_gpu_topk_compact_decode(myds_metal_buffer_t *ids,
     uint32_t n_comp, myds_v41_gpu_scratch_t *scratch);
+/* [P-L1] Default-on 0-ULP prefill YoCo (il>20, ratio==1, mask_bits, nc>16384,
+ * pos0>=16384) 8-row tile-union register-only scorer + batched <=16K Top-512
+ * (MYDS_INDEXER_PREFILL_COMPACT: absent/1=on, 0=off, else -1). */
+int myds_v41_gpu_indexer_prefill_compact_enabled(void);
+typedef struct {
+    uint64_t requests, encoded, fallbacks, failures;
+    uint64_t rows_scored, union_cap_blocks, dense_blocks;
+} myds_v41_gpu_indexer_prefill_compact_counters_t;
+void myds_v41_gpu_indexer_prefill_compact_counters(
+    myds_v41_gpu_indexer_prefill_compact_counters_t *out, bool reset);
+void myds_v41_gpu_inject_indexer_prefill_compact_unavailable(bool enabled);
+uint32_t myds_v41_gpu_indexer_prefill_compact_max_glen(
+    const myds_v41_gpu_scratch_t *scratch);
+int myds_v41_gpu_indexer_prefill_compact_bf16(
+    myds_v41_gpu_scratch_t *scratch, myds_metal_buffer_t *ids,
+    const myds_metal_buffer_t *q, const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *cache, const myds_metal_buffer_t *mask_bits,
+    uint32_t n_comp, uint32_t n_tokens, uint32_t causal_start,
+    uint32_t causal_ratio, uint32_t mask_units);
+int myds_v41_gpu_indexer_prefill_compact_scoped(
+    myds_v41_gpu_scratch_t *scratch, myds_metal_buffer_t *ids,
+    const myds_metal_buffer_t *q, const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *cache, const myds_metal_buffer_t *mask_bits,
+    uint32_t n_comp, uint32_t n_tokens, uint32_t causal_start,
+    uint32_t causal_ratio, uint32_t mask_units, uint32_t top_blocks_cap,
+    bool ordinary_prefill_allowed);
 /* Default-on prefill-only register-only scorer (MYDS_INDEXER_REGISTER_ONLY:
  * absent/1=on, 0=off; MYDS_INDEXER_RO_SMEM_Q: absent/1=4KB Q-smem, 0=0B baseline).
  * Parse after configuration loading. Original public chunk APIs below always
