@@ -33,7 +33,7 @@ make adoption-check        # 校验账本 §0.3「在产」开关均存在于 in
 
 ![myds architecture](docs/architecture.svg)
 
-一张图看完 40 层里每个子层的结构与 2026-10-24 普查快照（48.5K prefill / 22.74 ms decode 构成；绿=已到顶 / 黄=有空间但受约束 / 红=硬件天花板）。此后经 **§143–§150** 与 **§172–§175** 多轮突破，图中黄框标注的 **flash-attention `32 KB` smem 限制**与 **indexer 全表打分/排序开销**均已被正面攻克，Decode 亦通过 `Top-3` 路由裁剪与 `O(16K)` 紧凑索引压至 **`~20.2 ms/tok`**——最新实测与演进见下节及[性能账本](docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md) `§0.3` / `§172–§175`。
+一张图看完 40 层 V4.1 计算图里每个子层的职责、实测效率与 **§146–§175** 关键微架构突破（Engram 后台异步预读、Flash-Attention `q8` 寄存器驻留 `O` 解锁 `2 TGs/core`、Indexer `8M` `IRO` + `4 KB` smem `Q` + YoCo `≤16K` 紧凑打分/Top-512，以及 Decode `Top-3` 路由裁剪与 `O(16K)` 紧凑索引将单步耗时压至 **`~20.2 ms/tok`**）。**图中全部数字均对齐[性能账本](docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md) `§0.3` / `§172–§175` 唯一权威基线。**
 
 ---
 

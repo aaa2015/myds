@@ -1,16 +1,16 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 760" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 800" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#57606a"/>
     </marker>
     <style>
-      .title { font-size: 15px; font-weight: 600; fill: #1f2328; }
+      .title { font-size: 14px; font-weight: 600; fill: #1f2328; }
       .sub   { font-size: 11px; fill: #57606a; }
       .box   { fill: #ffffff; stroke: #d0d7de; stroke-width: 1.2; rx: 6; }
       .box-hi{ fill: #fff8e6; stroke: #bf8700; stroke-width: 1.4; rx: 6; }
       .box-cu{ fill: #ffeceb; stroke: #cf222e; stroke-width: 1.4; rx: 6; }
       .box-ok{ fill: #eaf7ee; stroke: #1a7f37; stroke-width: 1.4; rx: 6; }
-      .lbl   { font-size: 12px; font-weight: 500; fill: #1f2328; }
+      .lbl   { font-size: 12px; font-weight: 600; fill: #1f2328; }
       .ms    { font-size: 10px; fill: #57606a; }
       .pct   { font-size: 10px; font-weight: 600; }
       .lane  { fill: none; stroke: #57606a; stroke-width: 1.3; marker-end: url(#arrow); }
@@ -18,125 +18,136 @@
     </style>
   </defs>
 
-  <rect width="960" height="812" fill="#f6f8fa"/>
+  <rect width="960" height="800" fill="#f6f8fa"/>
 
-  <text x="24" y="32" class="hdr">myds · DeepSeek-V4.1-Flash-1017-Q2 · M2 Ultra</text>
-  <text x="24" y="50" class="sub">40 层，每层两个子层。数字为实测耗时（48,491-token prefill；单-token decode）。</text>
+  <!-- ============ HEADER ============ -->
+  <text x="20" y="30" class="hdr">myds · DeepSeek-V4.1-Flash-1017-Q2-dense-q4 · Apple M2 Ultra（76 GPU 核 · 96 MB SLC · 192 GiB）</text>
+  <text x="20" y="48" class="sub">40 层 V4.1 计算图（HC 多路残差 + Engram 稀疏表 + MLA 压缩 KV + 8 层 Indexer + 共享/路由 MoE）· §175 独占整机实测基线（2026-11-14）</text>
 
   <!-- ============ PREFILL ============ -->
-  <text x="24" y="86" class="title">Prefill — 79.04 s / 48,491 tok = 614 t/s</text>
-  <text x="24" y="102" class="sub">每 chunk 2048 token，macroblock 自适应；按实测效率分类：已到顶 / 有空间 / 不计</text>
+  <text x="20" y="80" class="title">Prefill — 冷建 32K 733.5 t/s（43.9 s）· 64K 737.9 t/s（87.4 s）· 128K 695.7–714.3 t/s（180.5–185.3 s）</text>
+  <text x="20" y="97" class="sub">多轮热追加（§175 [P-L1]）：128K+2.4K 354.5 t/s（6.89 s, +9.49%）· 128K→256K 610.1–618.3 t/s · 256K+312 173.0 t/s（1.79 s, +16.18%）</text>
 
-  <!-- Row: prefill pipeline -->
-  <rect x="24"  y="118" width="150" height="62" class="box"/>
-  <text x="38" y="140" class="lbl">Engram + Embed</text>
-  <text x="38" y="157" class="ms">1.16 s</text>
-  <text x="38" y="171" class="ms">SSD pread, 排序后读</text>
+  <!-- Row 1: prefill pipeline (5 cols: 190 + 152 + 206 + 206 + 134 + 4*8 = 920) -->
+  <rect x="20"  y="112" width="190" height="74" class="box-ok"/>
+  <text x="30"  y="131" class="lbl">Engram + Embed</text>
+  <text x="30"  y="147" class="ms">io_threads=16 + prefill_async=1</text>
+  <text x="30"  y="162" class="ms">后台 SSD pread 与 GPU 重叠</text>
+  <text x="30"  y="177" class="pct" fill="#1a7f37">§146/§148 · 32K +9.8%</text>
 
-  <rect x="190" y="118" width="150" height="62" class="box-ok"/>
-  <text x="204" y="140" class="lbl">Wait Proj</text>
-  <text x="204" y="157" class="ms">8.74 s</text>
-  <text x="204" y="171" class="pct" fill="#1a7f37">76% 峰值</text>
+  <rect x="218" y="112" width="152" height="74" class="box-ok"/>
+  <text x="228" y="131" class="lbl">Dense QKV / Proj</text>
+  <text x="228" y="147" class="ms">Q_A/KV_A/Q_B 稠密投影</text>
+  <text x="228" y="162" class="ms">48.5K 实测 8.74 s (11.1%)</text>
+  <text x="228" y="177" class="pct" fill="#1a7f37">76% FP16 峰值 · 已到顶</text>
 
-  <rect x="356" y="118" width="176" height="62" class="box-cu"/>
-  <text x="370" y="140" class="lbl">flash-attention</text>
-  <text x="370" y="157" class="ms">16.35 s</text>
-  <text x="370" y="171" class="pct" fill="#cf222e">18% 峰值 · smem 锁死</text>
+  <rect x="378" y="112" width="206" height="74" class="box-ok"/>
+  <text x="388" y="131" class="lbl">MLA Flash-Attn</text>
+  <text x="388" y="147" class="ms">auto + heads_reg_o (q8)</text>
+  <text x="388" y="162" class="ms">reg O lo[16]: smem 32,768→12,320 B</text>
+  <text x="388" y="177" class="pct" fill="#1a7f37">解锁 2 TGs/core (§173/§174 [P-A1])</text>
 
-  <rect x="548" y="118" width="150" height="62" class="box-hi"/>
-  <text x="562" y="140" class="lbl">indexer</text>
-  <text x="562" y="157" class="ms">7.36 s · 只 8 层</text>
-  <text x="562" y="171" class="pct" fill="#bf8700">9% SIMT</text>
+  <rect x="592" y="112" width="206" height="74" class="box-ok"/>
+  <text x="602" y="131" class="lbl">Indexer（8 层）</text>
+  <text x="602" y="147" class="ms">RO ratio∈{1,2} 1M · 8M IRO 100%</text>
+  <text x="602" y="162" class="ms">4 KB smem Q · 保 8 TGs/core</text>
+  <text x="602" y="177" class="pct" fill="#1a7f37">L24..36 8行并集 ≤16K Top-512 (§175)</text>
 
-  <rect x="714" y="118" width="150" height="62" class="box-ok"/>
-  <text x="728" y="140" class="lbl">Step5 AttnOutB</text>
-  <text x="728" y="157" class="ms">4.80 s</text>
-  <text x="728" y="171" class="pct" fill="#1a7f37">62% 峰值</text>
+  <rect x="806" y="112" width="134" height="74" class="box-ok"/>
+  <text x="816" y="131" class="lbl">Step5 AttnOutB</text>
+  <text x="816" y="147" class="ms">注意力输出稠密投影</text>
+  <text x="816" y="162" class="ms">48.5K 实测 4.80 s</text>
+  <text x="816" y="177" class="pct" fill="#1a7f37">62% 峰值 · 已到顶</text>
 
-  <!-- second row -->
-  <rect x="24"  y="196" width="150" height="62" class="box-ok"/>
-  <text x="38" y="218" class="lbl">shared GEMM</text>
-  <text x="38" y="235" class="ms">4.54 s</text>
-  <text x="38" y="249" class="pct" fill="#1a7f37">59% 峰值</text>
+  <!-- Row 2: prefill pipeline -->
+  <rect x="20"  y="198" width="190" height="74" class="box-ok"/>
+  <text x="30"  y="217" class="lbl">Shared Expert GEMM</text>
+  <text x="30"  y="233" class="ms">gate / up / SwiGLU 融合</text>
+  <text x="30"  y="248" class="ms">48.5K 实测 4.54 s（5.7%）</text>
+  <text x="30"  y="263" class="pct" fill="#1a7f37">59% FP16 峰值 · 已到顶</text>
 
-  <rect x="190" y="196" width="150" height="62" class="box-ok"/>
-  <text x="204" y="218" class="lbl">Wait MoE</text>
-  <text x="204" y="235" class="ms">27.18 s</text>
-  <text x="204" y="249" class="pct" fill="#1a7f37">57% 峰值</text>
+  <rect x="218" y="198" width="152" height="74" class="box-ok"/>
+  <text x="228" y="217" class="lbl">Routed MoE GEMM</text>
+  <text x="228" y="233" class="ms">Prefill Top-6 · 0-ULP</text>
+  <text x="228" y="248" class="ms">chunk=2048 · IQ2 尾裁剪</text>
+  <text x="228" y="263" class="pct" fill="#1a7f37">57% 峰值 · 已到顶</text>
 
-  <rect x="356" y="196" width="176" height="62" class="box"/>
-  <text x="370" y="218" class="lbl">Step6 HC FFN In</text>
-  <text x="370" y="235" class="ms">1.54 s</text>
-  <text x="370" y="249" class="ms">7 次 dispatch 的发射开销</text>
+  <rect x="378" y="198" width="206" height="74" class="box"/>
+  <text x="388" y="217" class="lbl">HC Split / Sinkhorn</text>
+  <text x="388" y="233" class="ms">Step6 多路残差混合与 RMSNorm</text>
+  <text x="388" y="248" class="ms">7 dispatches · 48.5K 实测 1.54 s</text>
+  <text x="388" y="263" class="ms">发射开销主导 · 上界 &lt;2%</text>
 
-  <rect x="548" y="196" width="150" height="62" class="box"/>
-  <text x="562" y="218" class="lbl">gather + ring</text>
-  <text x="562" y="235" class="ms">1.34 s</text>
-  <text x="562" y="249" class="ms">6.7% / 1.1%（已排除）</text>
+  <rect x="592" y="198" width="206" height="74" class="box"/>
+  <text x="602" y="217" class="lbl">KV Gather + Ring</text>
+  <text x="602" y="233" class="ms">压缩 BF16 KV 收集 + 128 近端窗</text>
+  <text x="602" y="248" class="ms">L20..39 共享 YoCo 压缩 KV</text>
+  <text x="602" y="263" class="ms">位打包掩码（200K 省 8 GB）</text>
 
-  <rect x="714" y="196" width="150" height="62" class="box-hi"/>
-  <text x="728" y="218" class="lbl">未归类</text>
-  <text x="728" y="235" class="ms">~6.3 s</text>
-  <text x="728" y="249" class="ms">7.3%</text>
+  <rect x="806" y="198" width="134" height="74" class="box"/>
+  <text x="816" y="217" class="lbl">Prefix / KV Cache</text>
+  <text x="816" y="233" class="ms">RAM 快照槽位复用</text>
+  <text x="816" y="248" class="ms">SSD kvlow-v3 分段</text>
+  <text x="816" y="263" class="ms">长对话前缀零重算</text>
 
-  <!-- classification legend -->
-  <rect x="24" y="276" width="840" height="54" fill="#ffffff" stroke="#d0d7de" stroke-width="1" rx="6"/>
-  <text x="38" y="296" class="lbl">按效率分类（79.04 s 里已归类 92.7%）</text>
-  <rect x="38" y="304" width="12" height="12" fill="#eaf7ee" stroke="#1a7f37"/>
-  <text x="56" y="314" class="ms">已到顶 57.3% — 实测 57–76% of FP16 峰值</text>
-  <rect x="288" y="304" width="12" height="12" fill="#fff8e6" stroke="#bf8700"/>
-  <text x="306" y="314" class="ms">有空间 30.2% — 但受硬件约束</text>
-  <rect x="516" y="304" width="12" height="12" fill="#ffeceb" stroke="#cf222e"/>
-  <text x="534" y="314" class="ms">smem 天花板 — 32 KB 装不下 16 头</text>
-  <rect x="748" y="304" width="12" height="12" fill="#ffffff" stroke="#d0d7de"/>
-  <text x="766" y="314" class="ms">不计 3.7%</text>
+  <!-- Classification legend -->
+  <rect x="20" y="286" width="920" height="50" fill="#ffffff" stroke="#d0d7de" stroke-width="1" rx="6"/>
+  <text x="34" y="305" class="lbl">子层状态图例（chunk=2048，自适应 macroblock，1M 上下文容量；§146–§175 已攻克旧 32 KB smem 墙与全表 Indexer 瓶颈）</text>
+  <rect x="34" y="315" width="12" height="12" fill="#eaf7ee" stroke="#1a7f37"/>
+  <text x="52" y="325" class="ms">已达高效率或 §146–§175 已攻克（稠密 57–76% 峰值 · Flash-Attn q8 双驻留 · 紧凑 Indexer）</text>
+  <rect x="536" y="315" width="12" height="12" fill="#fff8e6" stroke="#bf8700"/>
+  <text x="554" y="325" class="ms">物理散读/拆包有界约束（Decode Top-3 已减半）</text>
+  <rect x="812" y="315" width="12" height="12" fill="#ffffff" stroke="#d0d7de"/>
+  <text x="830" y="325" class="ms">轻量调度与缓存</text>
 
   <!-- ============ DECODE ============ -->
-  <text x="24" y="368" class="title">Decode — 22.74 ms / token = 43.97 t/s</text>
-  <text x="24" y="384" class="sub">几乎不随上下文衰减：150K 时仍有 ~41.5 t/s。GPU 在 command buffer 粒度 100% 驻留（空隙 0.07%）。</text>
+  <text x="20" y="368" class="title">Decode — ~20.2 ms / token = ~49.4 t/s（短稳态）· 32K 45.7–46.0 · 64K 44.9 · 128K 44.0 · 256K 42.1–42.3 t/s</text>
+  <text x="20" y="385" class="sub">跨 4,600× 上下文（56 → 257.8K）仅衰减 ~14.6%（[D-L1] 封顶 O(16K)）；command buffer 粒度 GPU 驻留 99.9–100%（空隙 0.07%）。</text>
 
-  <!-- decode bars -->
+  <!-- Decode bars -->
   <g>
-    <rect x="24" y="400" width="460" height="34" class="box-ok"/>
-    <text x="38" y="421" class="lbl">dense_gemv</text>
-    <text x="300" y="421" class="ms">12.70 ms · 56% · <tspan class="pct" fill="#1a7f37">70.6% 峰值</tspan></text>
+    <rect x="20" y="400" width="496" height="36" class="box-ok"/>
+    <text x="32" y="422" class="lbl">dense_gemv</text>
+    <text x="148" y="422" class="ms">~12.70 ms · ~63% · ~5.17 GB/tok · <tspan class="pct" fill="#1a7f37">70.6% 带宽峰值</tspan></text>
 
-    <rect x="24" y="442" width="340" height="34" class="box-cu"/>
-    <text x="38" y="463" class="lbl">moe_routed</text>
-    <text x="200" y="463" class="ms">9.37 ms · 41% · <tspan class="pct" fill="#cf222e">35.2% 峰值</tspan></text>
+    <rect x="20" y="444" width="252" height="36" class="box-hi"/>
+    <text x="32" y="466" class="lbl">moe_routed (Top-3)</text>
+    <text x="176" y="466" class="ms">~6.8 ms (34%)</text>
+    <text x="282" y="466" class="pct" fill="#bf8700">省 ~2.5 ms · §172 +14.5% (1.19 vs 2.39 GB)</text>
 
-    <rect x="24" y="484" width="80" height="34" class="box"/>
-    <text x="38" y="505" class="lbl">其余</text>
-    <text x="120" y="505" class="ms">0.7 ms · 3%</text>
+    <rect x="20" y="488" width="118" height="36" class="box"/>
+    <text x="30" y="510" class="lbl">indexer + misc</text>
+    <text x="148" y="510" class="ms">~0.7 ms (3%) · [D-L1] L24..36 O(16K) 紧凑 + OVERLAP (256K +3.8%)</text>
   </g>
 
   <!-- MoE decomposition callout -->
-  <rect x="500" y="400" width="364" height="118" fill="#ffffff" stroke="#cf222e" stroke-width="1.2" rx="6"/>
-  <text x="516" y="420" class="lbl">MoE 的 244 GB/s 是怎么来的</text>
-  <text x="516" y="440" class="ms">721 GB/s　连续纯读（硬件峰值 724）</text>
-  <text x="516" y="458" class="ms">　↓ −28%　散读（6 个专家动态选）</text>
-  <text x="516" y="476" class="ms">522 GB/s　散读纯读</text>
-  <text x="516" y="494" class="ms">　↓ −43%　拆包装（查表 + 符号 + 掩码）</text>
-  <text x="516" y="512" class="ms">244 GB/s　实测（FMA 另占 9%，依赖链 0%）</text>
+  <rect x="534" y="400" width="406" height="124" fill="#ffffff" stroke="#bf8700" stroke-width="1.2" rx="6"/>
+  <text x="546" y="419" class="lbl">MoE 路由专家 244 GB/s 物理分解与 §172 Top-3 裁剪</text>
+  <text x="546" y="437" class="ms">721 GB/s　连续纯读（M2 Ultra 实测峰值 724 GB/s）</text>
+  <text x="546" y="454" class="ms">　↓ −28%　动态专家散读（152.9 GB 池内物理不连续）→ 522 GB/s</text>
+  <text x="546" y="471" class="ms">　↓ −43%　IQ2 码本拆包（LDS 查表 + popcount 符号 + 掩码）</text>
+  <text x="546" y="488" class="ms">244 GB/s　单专家实测有效带宽（FMA 占 −9%，依赖链 0%）</text>
+  <text x="546" y="507" class="pct" fill="#bf8700">§172 Top-6→Top-3 砍半路由流量（1.19 GB）；浅层 Top-2 因 EOS 复读淘汰</text>
 
-  <!-- ============ BOTTOM: what it means ============ -->
-  <rect x="24" y="540" width="840" height="130" fill="#ffffff" stroke="#d0d7de" stroke-width="1" rx="6"/>
-  <text x="38" y="562" class="hdr">三条边界的实测依据（决定了所有优化方向是否成立）</text>
+  <!-- ============ BOTTOM: hardware boundaries ============ -->
+  <rect x="20" y="542" width="920" height="132" fill="#ffffff" stroke="#d0d7de" stroke-width="1" rx="6"/>
+  <text x="34" y="563" class="hdr">三条底层硬件与微架构边界（决定哪些优化有效、哪些必败）</text>
 
-  <text x="38" y="586" class="lbl">GPU 有空闲吗？</text>
-  <text x="170" y="586" class="ms">驻留 99.9–100%，1398 MHz 满频；prefill 104 W / decode 67 W　⇒ 两者均无空隙</text>
-  <text x="170" y="600" class="ms">⚠ decode 的低功耗是【访存受限】的特征（每 token 必读 7.55 GB），不是调度空隙</text>
+  <text x="34"  y="586" class="lbl">GPU 有空闲吗？</text>
+  <text x="154" y="586" class="ms">驻留 99.9–100%（1398 MHz 满频，CB 内空隙仅 17.3 µs = 0.07%）；Prefill 104 W（算力/SLC 密集）vs Decode ~67 W</text>
+  <text x="154" y="601" class="ms">⚠ Decode 低功耗是【访存受限】特征（Top-3 每步读 ~6.36 GB，Top-6 读 7.55 GB），不是调度气泡</text>
 
-  <text x="38" y="618" class="lbl">CPU 是瓶颈吗？</text>
-  <text x="170" y="618" class="ms">功耗 4.6 W（峰值约 50 W）= 10%　⇒ 所有「CPU 异步 / 卸载」方案无效</text>
+  <text x="34"  y="623" class="lbl">CPU 异构边界</text>
+  <text x="154" y="623" class="ms">CPU 算 MoE 慢 GPU 31.2 倍 ⇒ 算力卸载必败（engram_kv −5.6%）；但隐藏阻塞 GPU 的同步 SSD pread（§146/§148）在 32K 获 +9.8%</text>
 
-  <text x="38" y="638" class="lbl">带宽受限吗？</text>
-  <text x="170" y="638" class="ms">DRAM 14 GB/s = 峰值 2%　⇒ 所有「省带宽」方案无效</text>
+  <text x="34"  y="645" class="lbl">96 MB SLC 与驻留</text>
+  <text x="154" y="645" class="ms">Prefill DRAM 仅 ~14 GB/s 因工作集热命中 96 MB SLC ⇒ M2 Ultra 上 Flash-Attn q8（2 TGs/core）反超 q16（1 TG/core，§174.3），</text>
+  <text x="154" y="660" class="ms">且将 L24..36 Indexer 收敛为 ≤16K 紧凑块驻留 SLC 可彻底消除全表 O(Context) 冲刷（§174 [D-L1] / §175 [P-L1]）</text>
 
-  <!-- footer -->
-  <text x="24" y="700" class="title">结论</text>
-  <text x="24" y="720" class="sub">在「不改模型、不买设备、逐位等价」三条约束下，prefill 与 decode 都已无两位数收益方向。</text>
-  <text x="24" y="738" class="sub">放宽 0-ULP 曾被认为是唯一剩余路径；2026-10-25 实测其子项仅 +0.82% / +1.2%，投机解码 −6.6%。</text>
-  <text x="24" y="756" class="sub">若重启性能方向，应从模型侧入手（专家布局 / 分层量化 / KV 分层驻留），而非 kernel 内找并发。</text>
-  <text x="24" y="774" class="sub">完整证据与每一次失败尝试：docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md</text>
+  <!-- ============ FOOTER ============ -->
+  <text x="20" y="700" class="title">结论与演进（至 §175）</text>
+  <text x="20" y="719" class="sub">同机同 GGUF 权重下，§143–§175 将 32K / 64K / 128K 冷建推至 733.5 / 737.9 / 714.3 t/s，128K+2.4K 热追加累计 +65.1%（354.5 t/s），稳态 Decode 达 ~49.4 t/s。</text>
+  <text x="20" y="737" class="sub">严格 0-ULP 主干算子（稠密投影 57–76% 峰值、Flash-Attn q8 双驻留、Indexer 8M IRO + 4 KB smem Q + YoCo ≤16K 紧凑打分/排序）已逼近当前微架构上限。</text>
+  <text x="20" y="755" class="sub">后续潜在空间转向投机解码批量验证（如代码/JSON 场景 PLD B=4）或模型侧改动（专家布局 / 分层量化）；任何 kernel 改动须先履行 §149 派发取证门禁。</text>
+  <text x="20" y="773" class="sub">权威记录与测量纪律：docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md · docs/MEASUREMENT-DISCIPLINE.md</text>
 </svg>
