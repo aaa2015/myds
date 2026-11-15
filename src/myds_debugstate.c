@@ -226,7 +226,13 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
     EMIT("\"knobs\":{\"known\":%zu,\"set\":%d,\"unread\":%d},",
          myds_knob_count(), n, unread);
 
-    EMIT("\"counters\":{\"indexer_register_only\":{\"requests\":%llu,\"encoded\":%llu,"
+    const uint32_t idx_mode = myds_v41_gpu_indexer_key_cache_mode();
+    const uint32_t idx_row_bytes = myds_v41_indexer_cache_mode_row_bytes(idx_mode);
+    const char *idx_fmt = (idx_mode == MYDS_INDEXER_CACHE_FP4) ? "FP4-E2M1+UE8M0" :
+                          (idx_mode == MYDS_INDEXER_CACHE_BF16) ? "BF16" : "F32";
+
+    EMIT("\"counters\":{\"indexer_key_cache\":{\"mode\":%u,\"format\":\"%s\",\"row_bytes\":%u},"
+         "\"indexer_register_only\":{\"requests\":%llu,\"encoded\":%llu,"
          "\"fallbacks\":%llu,\"failures\":%llu,\"f32_dispatches\":%llu,"
          "\"bf16_dispatches\":%llu},\"indexer_prefill_compact\":{\"requests\":%llu,"
          "\"encoded\":%llu,\"fallbacks\":%llu,\"failures\":%llu,\"rows_scored\":%llu,"
@@ -234,6 +240,7 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          "\"requests\":%llu,\"encoded\":%llu,\"fallbacks\":%llu,\"failures\":%llu,"
          "\"rows\":%llu,\"l20_compact_requests\":%llu,\"l20_compact_encoded\":%llu,"
          "\"l20_compact_fallbacks\":%llu,\"l20_compact_rows\":%llu},\"prefix_cache_len\":%u},",
+         (unsigned)idx_mode, idx_fmt, (unsigned)idx_row_bytes,
          (unsigned long long)ro.requests, (unsigned long long)ro.encoded,
          (unsigned long long)ro.fallbacks, (unsigned long long)ro.failures,
          (unsigned long long)ro.f32_dispatches, (unsigned long long)ro.bf16_dispatches,

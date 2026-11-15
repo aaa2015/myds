@@ -34,6 +34,29 @@ void myds_v41_gpu_attention_direct_pack_fuse_counters(
  * destination uint16 words / source floats; no numerical conversion or rounding. */
 int myds_v41_gpu_pack_bf16(myds_metal_buffer_t *dst,size_t dst_offset_words,
     const myds_metal_buffer_t *src,size_t src_offset_floats,uint32_t count);
+
+/* Indexer key cache storage format (128 elements / row):
+ *   MYDS_INDEXER_CACHE_F32  = 0u (512 B/row, reference F32)
+ *   MYDS_INDEXER_CACHE_BF16 = 2u (256 B/row, packed BF16)
+ *   MYDS_INDEXER_CACHE_FP4  = 3u ( 68 B/row, lossless 0-ULP E2M1FN + UE8M0) */
+enum {
+    MYDS_INDEXER_CACHE_F32  = 0u,
+    MYDS_INDEXER_CACHE_BF16 = 2u,
+    MYDS_INDEXER_CACHE_FP4  = 3u
+};
+#define MYDS_INDEXER_KEY_BF16_ROW_BYTES 256u
+#define MYDS_INDEXER_KEY_FP4_ROW_BYTES  68u
+static inline uint32_t myds_v41_indexer_cache_mode_row_bytes(uint32_t cache_mode) {
+    return cache_mode == MYDS_INDEXER_CACHE_FP4 ? 68u
+         : (cache_mode == MYDS_INDEXER_CACHE_BF16 ? 256u : 512u);
+}
+int myds_v41_gpu_indexer_key_fp4_enabled(void);
+uint32_t myds_v41_gpu_indexer_key_cache_mode(void);
+uint32_t myds_v41_gpu_indexer_key_row_bytes(void);
+int myds_v41_gpu_pack_indexer_fp4(myds_metal_buffer_t *dst, size_t dst_row,
+    const myds_metal_buffer_t *src, size_t src_row, uint32_t n_rows);
+int myds_v41_gpu_pack_indexer_key(myds_metal_buffer_t *dst, size_t dst_row,
+    const myds_metal_buffer_t *src, size_t src_row, uint32_t n_rows, uint32_t cache_mode);
 /* chunk attention 的运行时几何量（由【配置的上下文】推出，见 scratch_create）。
  * 旧版把键上界写死成 16384，导致「配置 262144、实际 16384 就整个 prefill 失败」
  * （而且注释谎称会回退逐 token，代码里其实是 goto fail）。
@@ -113,6 +136,10 @@ int myds_v41_gpu_indexer_rope_quant(myds_metal_buffer_t *x,uint32_t heads,uint32
 int myds_v41_gpu_indexer_rope_quant_batch(myds_metal_buffer_t *x,
     myds_metal_buffer_t *packed_dst,size_t dst_offset_words,
     uint32_t heads,uint32_t start_pos,uint32_t rows,uint32_t stride,bool compressed);
+int myds_v41_gpu_indexer_rope_quant_batch_mode(myds_metal_buffer_t *x,
+    myds_metal_buffer_t *packed_dst,size_t dst_row,
+    uint32_t heads,uint32_t start_pos,uint32_t rows,uint32_t stride,bool compressed,
+    uint32_t cache_mode);
 int myds_v41_gpu_kv_rope_quant_batch(myds_metal_buffer_t *x,
     myds_metal_buffer_t *packed_dst,size_t dst_offset_words,
     uint32_t start_pos,uint32_t rows,uint32_t stride,bool compressed,uint32_t mode);
@@ -148,6 +175,13 @@ int myds_v41_gpu_indexscores_masked(myds_metal_buffer_t *scores,const myds_metal
 int myds_v41_gpu_indexscores_masked_bf16(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
     const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,
     const myds_metal_buffer_t *mask,uint32_t n_comp,uint32_t n_heads,uint32_t first_row);
+int myds_v41_gpu_indexscores_mode(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
+    const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,
+    uint32_t n_comp,uint32_t n_heads,uint32_t cache_mode,uint32_t first_row);
+int myds_v41_gpu_indexscores_masked_mode(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
+    const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,
+    const myds_metal_buffer_t *mask,uint32_t n_comp,uint32_t n_heads,uint32_t cache_mode,
+    uint32_t first_row);
 /* Initialization-time MYDS_INDEXER_HEAD_SLOTS accepts only absent/0/1. The
  * explicit candidate supports one scalar query, 32 heads and head_dim=128;
  * F32/BF16 keys and an optional original block mask retain their old meaning.
@@ -167,6 +201,10 @@ int myds_v41_gpu_indexscores_head_slots(myds_metal_buffer_t *scores,
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *weights,
     const myds_metal_buffer_t *cache,const myds_metal_buffer_t *mask,
     uint32_t n_comp,uint32_t n_heads,bool cache_bf16,uint32_t first_row);
+int myds_v41_gpu_indexscores_head_slots_mode(myds_metal_buffer_t *scores,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *cache,const myds_metal_buffer_t *mask,
+    uint32_t n_comp,uint32_t n_heads,uint32_t cache_mode,uint32_t first_row);
 /* Optional 32-head decode scorer: expand the unique selected block IDs (8
  * original rows/block), write the original dense score locations, and leave
  * every other row at -INFINITY. The caller must pass all allowed block IDs
@@ -179,6 +217,11 @@ int myds_v41_gpu_indexscores_selected_blocks_bf16(myds_metal_buffer_t *scores,
     const myds_metal_buffer_t *cache,const myds_metal_buffer_t *mask,
     const myds_metal_buffer_t *block_ids,uint32_t n_comp,uint32_t n_selected_blocks,
     uint32_t first_row);
+int myds_v41_gpu_indexscores_selected_blocks_mode(myds_metal_buffer_t *scores,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *cache,const myds_metal_buffer_t *mask,
+    const myds_metal_buffer_t *block_ids,uint32_t n_comp,uint32_t n_selected_blocks,
+    uint32_t cache_mode,uint32_t first_row);
 typedef struct {
     uint64_t requests, encoded, unavailable, dense_rows, scored_row_slots;
 } myds_v41_gpu_indexer_compact_counters_t;
@@ -213,6 +256,10 @@ int myds_v41_gpu_indexscores_compact_decode_bf16(myds_v41_gpu_scratch_t *scratch
     const myds_metal_buffer_t *q, const myds_metal_buffer_t *weights,
     const myds_metal_buffer_t *cache, const myds_metal_buffer_t *mask,
     uint32_t n_comp, uint32_t first_row);
+int myds_v41_gpu_indexscores_compact_decode_mode(myds_v41_gpu_scratch_t *scratch,
+    const myds_metal_buffer_t *q, const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *cache, const myds_metal_buffer_t *mask,
+    uint32_t n_comp, uint32_t cache_mode, uint32_t first_row);
 int myds_v41_gpu_topk_compact_decode(myds_metal_buffer_t *ids,
     uint32_t n_comp, myds_v41_gpu_scratch_t *scratch);
 /* [P-L1] Default-on 0-ULP prefill YoCo (il>20, ratio==1, mask_bits, nc>16384,
@@ -234,6 +281,12 @@ int myds_v41_gpu_indexer_prefill_compact_bf16(
     const myds_metal_buffer_t *cache, const myds_metal_buffer_t *mask_bits,
     uint32_t n_comp, uint32_t n_tokens, uint32_t causal_start,
     uint32_t causal_ratio, uint32_t mask_units);
+int myds_v41_gpu_indexer_prefill_compact_mode(
+    myds_v41_gpu_scratch_t *scratch, myds_metal_buffer_t *ids,
+    const myds_metal_buffer_t *q, const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *cache, const myds_metal_buffer_t *mask_bits,
+    uint32_t n_comp, uint32_t n_tokens, uint32_t causal_start,
+    uint32_t causal_ratio, uint32_t mask_units, uint32_t cache_mode);
 int myds_v41_gpu_indexer_prefill_compact_scoped(
     myds_v41_gpu_scratch_t *scratch, myds_metal_buffer_t *ids,
     const myds_metal_buffer_t *q, const myds_metal_buffer_t *weights,
@@ -241,6 +294,13 @@ int myds_v41_gpu_indexer_prefill_compact_scoped(
     uint32_t n_comp, uint32_t n_tokens, uint32_t causal_start,
     uint32_t causal_ratio, uint32_t mask_units, uint32_t top_blocks_cap,
     bool ordinary_prefill_allowed);
+int myds_v41_gpu_indexer_prefill_compact_scoped_mode(
+    myds_v41_gpu_scratch_t *scratch, myds_metal_buffer_t *ids,
+    const myds_metal_buffer_t *q, const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *cache, const myds_metal_buffer_t *mask_bits,
+    uint32_t n_comp, uint32_t n_tokens, uint32_t causal_start,
+    uint32_t causal_ratio, uint32_t mask_units, uint32_t top_blocks_cap,
+    uint32_t cache_mode, bool ordinary_prefill_allowed);
 /* [P-T1] Strict 0-ULP batched causal 2-pass radix/histogram Top-K
  * + 1024-partition bitonic tie-replay & L20 block-mask self-compact score
  * gather (MYDS_INDEXER_TOPK_RADIX_CAUSAL: absent/0=off, 1=on, else -1).
@@ -275,6 +335,7 @@ int myds_v41_gpu_indexer_l20_compact_topk_scoped(
  * retain their original selector and never encode this candidate. */
 int myds_v41_gpu_indexer_register_only_enabled(void);
 const char *myds_v41_gpu_indexer_register_only_selected_kernel(bool cache_bf16);
+const char *myds_v41_gpu_indexer_register_only_selected_kernel_mode(uint32_t cache_mode);
 typedef struct {
     uint64_t requests, encoded, fallbacks, failures, f32_dispatches, bf16_dispatches;
 } myds_v41_gpu_indexer_register_only_counters_t;
@@ -297,6 +358,12 @@ int myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped(
     const myds_metal_buffer_t *cache,uint32_t n_comp,uint32_t n_heads,
     uint32_t n_tokens,uint32_t causal_start,uint32_t causal_ratio,
     bool cache_bf16,bool ordinary_prefill_allowed);
+int myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped_mode(
+    myds_v41_gpu_scratch_t *scratch,myds_metal_buffer_t *scores,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *cache,uint32_t n_comp,uint32_t n_heads,
+    uint32_t n_tokens,uint32_t causal_start,uint32_t causal_ratio,
+    uint32_t cache_mode,bool ordinary_prefill_allowed);
 /* 整 chunk 批量版（n_tokens 行 × n_comp 列，行主序，行步长 n_comp）。只支持
  * n_heads == 32；每行的因果宽度 = (causal_start + row + 1) / causal_ratio，
  * 与逐 token 的 count 相同；行数不够的格子写 -INFINITY。 */
@@ -308,6 +375,10 @@ int myds_v41_gpu_indexscores_chunk_bf16(myds_metal_buffer_t *scores,const myds_m
     const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,
     uint32_t n_comp,uint32_t n_heads,uint32_t n_tokens,
     uint32_t causal_start,uint32_t causal_ratio);
+int myds_v41_gpu_indexscores_chunk_mode(myds_metal_buffer_t *scores,const myds_metal_buffer_t *q,
+    const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,
+    uint32_t n_comp,uint32_t n_heads,uint32_t n_tokens,
+    uint32_t causal_start,uint32_t causal_ratio,uint32_t cache_mode);
 /* 批量 indexer 的缓冲（分数表、top-k 中间结果、块分数、块选择结果）。
  * 调用方只用它们，不拥有它们（随 scratch 释放）。 */
 myds_metal_buffer_t *myds_v41_gpu_indexer_scores(const myds_v41_gpu_scratch_t *scratch);

@@ -1,0 +1,84 @@
+=== test_indexer_key_fp4 (4.25-bit E2M1FN + UE8M0, 68 B/row, 0-ULP) ===
+  [PASS] strict MYDS_INDEXER_KEY_FP4 env parsing & row-byte invariants
+[2026-11-15 17:35:57.014] [INFO] Metal command queue initialized (maxCommandBufferCount=512)
+[2026-11-15 17:35:57.015] [INFO] myds_metal: loaded precompiled library from ./bin/myds.metallib (all required V4.1 kernels verified)
+[2026-11-15 17:35:57.068] [INFO] Shared Q4 V41 NB: 0 (ordinary NB+HC GU2304x5120/Down5120x2304, NR2/NSG4)
+[2026-11-15 17:35:57.068] [INFO] myds_metal: Initialized successfully on GPU: Apple M2 Ultra
+[2026-11-15 17:35:57.068] [INFO] Indexer head slots: 1 (F32 candidate; explicit ordinary scalar scope)
+[2026-11-15 17:35:57.068] [INFO] Indexer score rows4: 1 (auto; n_comp>=8192 uses rows4, below uses 1-row smem)
+[2026-11-15 17:35:57.068] [INFO] Indexer topk threshold: 0 (reference; explicit ordinary scalar scope)
+[2026-11-15 17:35:57.068] [INFO] Indexer topk NaN shuffle: 0 (reference; reference partition geometry)
+[2026-11-15 17:35:57.068] [INFO] Routed MoE geometry: IQ2 NSG=2, Q2 down NSG=2 (inherited)
+[2026-11-15 17:35:57.068] [INFO] Routed MoE IQ2 LUT: threadgroup (reference)
+[2026-11-15 17:35:57.068] [INFO] Batch2 Q8 shared weights: disabled (scalar reference)
+[2026-11-15 17:35:57.068] [INFO] LM-head Q8 rows per threadgroup: 2 (reference; single token, large output, NSG8)
+[2026-11-15 17:35:57.068] [INFO] Dense Q4 rows per threadgroup: 2 (reference; explicit ordinary scalar scope), NSG=4
+[2026-11-15 17:35:57.068] [INFO] F16 GEMV BF16 fuse: 0 (reference; explicit ordinary scalar scope)
+[2026-11-15 17:35:57.068] [INFO] Indexer RoPE quant fuse: 1 (SIMD candidate; explicit ordinary scalar scope)
+[2026-11-15 17:35:57.068] [INFO] Routed MoE Q2 sum cache: 0 (reference; explicit ordinary scalar scope)
+[2026-11-15 17:35:57.068] [INFO] Routed MoE Q2 sum cache fused: 0 (reference; explicit ordinary scalar scope)
+[2026-11-15 17:35:57.068] [INFO] Decode candidates: down overlap=0, IQ2 V4.1=0, Dense Q4 V4.1=0 (ordinary scalar only)
+[2026-11-15 17:35:57.068] [INFO] Routed MoE Q2 V4.1: 0 (ordinary scalar F32 MID only; 5120/2304/384/6, NR2, down NSG2/4; MM, trace and unscoped paths retain reference)
+[2026-11-15 17:35:57.068] [INFO] Attention flash-decoding: 0 (reference (single-TG in-register 14-NSG))
+[2026-11-15 17:35:57.068] [INFO] HC mix norm pre-fusion: 0 (reference (separate norm + GEMV))
+  Verifying FP4 Metal PSO occupancy & static threadgroup memory:
+    kernel_dsv41_pack_indexer_fp4                        width=32 max_threads=1024 (bf16=   0) static_smem=   0 B
+    kernel_myds_indexer_scores_register_only_fp4         width=32 max_threads= 832 (bf16= 832) static_smem=4096 B
+    kernel_myds_indexer_scores_register_only_0b_fp4      width=32 max_threads=1024 (bf16=1024) static_smem=   0 B
+    kernel_myds_indexer_scores_prefill_compact_ro_fp4    width=32 max_threads= 768 (bf16= 768) static_smem=4096 B
+    kernel_myds_indexer_scores_prefill_compact_ro_0b_fp4 width=32 max_threads= 896 (bf16= 896) static_smem=   0 B
+    kernel_dsv4_indexer_scores_tiled_fp4                 width=32 max_threads=1024 (bf16=1024) static_smem=   0 B
+    kernel_dsv4_indexer_scores_tiled_sg_fp4              width=32 max_threads=1024 (bf16=1024) static_smem=   0 B
+  [PASS] exhaustive 16 x 256 = 4,096 (code4, exp_u8) states: 0-ULP GPU == CPU IEEE-754 (no NaN at 0*INF)
+  [PASS] 102,400+ rows (13.1M elems) + 4,096 midpoint/closed-subset rows: 0-ULP bit-exact across both GPU writers
+  [PASS] 0-ULP bit-exact score & Top-512 parity across all 14 Decode + Prefill GPU scorer paths
+[2026-11-15 17:35:57.491] [INFO] kvdisk: /tmp/test_myds_fp4_lowkv_6byuXk/snap.bin.segments 重建（identity 900bf266c26f0d8f，21 槽 × 2.7 MiB，共 56 MiB）
+[2026-11-15 17:35:57.491] [INFO] kvdisk: /tmp/test_myds_fp4_lowkv_6byuXk/snap.bin 重建（identity c40c1f32970e41d7，21 槽 × 10.0 MiB，共 210 MiB）
+[2026-11-15 17:35:57.492] [INFO] kvdisk: /tmp/test_myds_fp4_lowkv_6byuXk/snap.bin.ends 重建（identity 49b9f457667de38b，64 槽 × 151.3 MiB，共 9684 MiB）
+[2026-11-15 17:35:57.492] [INFO] kvdisk: /tmp/test_myds_fp4_lowkv_6byuXk/kvanchor-v1-49b9f457667de38b.bin 重建（identity 60cda5b15e528582，16 槽 × 151.3 MiB，共 2421 MiB）
+[2026-11-15 17:35:57.492] [INFO] kvdisk: prompt-cache store · 64 槽 × 65536 tok (151 MiB/槽) = 名义 9.5 GiB
+[2026-11-15 17:35:57.492] [INFO] kvdisk: anchor store      · 16 槽 × 65536 tok (151 MiB/槽) = 名义 2.4 GiB
+[2026-11-15 17:35:57.492] [INFO] kvdisk: 分段网格上限 11264 tok ⇒ 超过此值的 prompt 必须靠 tail 才能缓存
+[2026-11-15 17:35:57.503] [INFO] kvdisk: 同步写盘 2 条 · 24.0 MiB · 6.0 ms（首 token 前）
+[2026-11-15 17:35:57.508] [INFO] kvdisk: prompt-end 快照落盘成功 · 槽 0 · 位置 1599 (base 1536, tail 63) · 10.2 MiB · 3.4 ms
+[2026-11-15 17:35:57.510] [INFO] kvdisk: /tmp/test_myds_fp4_lowkv_6byuXk/snap.bin.segments 复用（identity 900bf266c26f0d8f，21 槽，2 条有效）
+[2026-11-15 17:35:57.510] [INFO] kvdisk: /tmp/test_myds_fp4_lowkv_6byuXk/snap.bin 复用（identity c40c1f32970e41d7，21 槽，2 条有效）
+[2026-11-15 17:35:57.510] [INFO] kvdisk: /tmp/test_myds_fp4_lowkv_6byuXk/snap.bin.ends 复用（identity 49b9f457667de38b，64 槽，1 条有效）
+[2026-11-15 17:35:57.510] [INFO] kvdisk: /tmp/test_myds_fp4_lowkv_6byuXk/kvanchor-v1-49b9f457667de38b.bin 复用（identity 60cda5b15e528582，16 槽，0 条有效）
+[2026-11-15 17:35:57.510] [INFO] kvdisk: prompt-cache store · 64 槽 × 65536 tok (151 MiB/槽) = 名义 9.5 GiB
+[2026-11-15 17:35:57.510] [INFO] kvdisk: anchor store      · 16 槽 × 65536 tok (151 MiB/槽) = 名义 2.4 GiB
+[2026-11-15 17:35:57.510] [INFO] kvdisk: 分段网格上限 11264 tok ⇒ 超过此值的 prompt 必须靠 tail 才能缓存
+[2026-11-15 17:35:57.515] [INFO] kvdisk: 命中位置 1599 (prompt-end) ⇒ 免掉 1599 个 token 的 prefill (load+publish 4.615 ms)
+[2026-11-15 17:35:57.516] [INFO] kvdisk: /tmp/test_myds_fp4_lowkv_6byuXk/snap.bin.segments 重建（identity a106f6525768f007，21 槽 × 3.1 MiB，共 66 MiB）
+[2026-11-15 17:35:57.516] [INFO] kvdisk: /tmp/test_myds_fp4_lowkv_6byuXk/snap.bin 重建（identity e34b3bf11e567f6f，21 槽 × 10.0 MiB，共 210 MiB）
+[2026-11-15 17:35:57.516] [INFO] kvdisk: /tmp/test_myds_fp4_lowkv_6byuXk/snap.bin.ends 重建（identity dc59abf74038e2c3，64 槽 × 175.6 MiB，共 11241 MiB）
+[2026-11-15 17:35:57.517] [INFO] kvdisk: /tmp/test_myds_fp4_lowkv_6byuXk/kvanchor-v1-dc59abf74038e2c3.bin 重建（identity 98bf8bc23daf5d26，16 槽 × 175.6 MiB，共 2810 MiB）
+[2026-11-15 17:35:57.517] [INFO] kvdisk: prompt-cache store · 64 槽 × 65536 tok (176 MiB/槽) = 名义 11.0 GiB
+[2026-11-15 17:35:57.517] [INFO] kvdisk: anchor store      · 16 槽 × 65536 tok (176 MiB/槽) = 名义 2.7 GiB
+[2026-11-15 17:35:57.517] [INFO] kvdisk: 分段网格上限 11264 tok ⇒ 超过此值的 prompt 必须靠 tail 才能缓存
+  [PASS] lowkv SSD segment + prompt-end round-trip (68 B/row) & cross-format isolation vs BF16
+=== Running 7-run median GPU microbenchmarks: BF16 (256 B/row) vs FP4 (68 B/row, -73.44%) ===
+  --- Prefill IRO Scorer (register_only_bf16 vs register_only_fp4) ---
+    IRO_32K_g256       (nc= 32768, glen=256): BF16   5.88 ms | FP4   6.03 ms | 0.97x
+    IRO_64K_g128       (nc= 65536, glen=128): BF16   5.91 ms | FP4   6.04 ms | 0.98x
+    IRO_128K_g64       (nc=131072, glen= 64): BF16   5.94 ms | FP4   6.06 ms | 0.98x
+    IRO_256K_g32       (nc=262144, glen= 32): BF16   5.97 ms | FP4   6.07 ms | 0.98x
+    IRO_128K_warm16    (nc=131072, glen= 16): BF16   1.67 ms | FP4   1.70 ms | 0.98x
+  --- Prefill [P-L1] YoCo Compact Pipeline (BF16 vs FP4) ---
+    PL1_128K_g512      (nc=131072, glen=512): BF16  40.54 ms | FP4  41.58 ms | 0.98x
+    PL1_256K_g304      (nc=262144, glen=304): BF16  27.75 ms | FP4  28.32 ms | 0.98x
+  --- Single-step Decode rows4 Scorer (per call & x4 layers, 10x amortized) ---
+    DEC_rows4_ 32K     (nc= 32768): BF16  0.128 ms (x4= 0.514 ms) | FP4  0.117 ms (x4= 0.467 ms) | 1.10x
+    DEC_rows4_ 64K     (nc= 65536): BF16  0.213 ms (x4= 0.851 ms) | FP4  0.193 ms (x4= 0.774 ms) | 1.10x
+    DEC_rows4_128K     (nc=131072): BF16  0.389 ms (x4= 1.558 ms) | FP4  0.354 ms (x4= 1.416 ms) | 1.10x
+    DEC_rows4_256K     (nc=262144): BF16  0.733 ms (x4= 2.933 ms) | FP4  0.658 ms (x4= 2.633 ms) | 1.11x
+    DEC_DL1_256K_16K   (nc=262144): BF16  0.136 ms (x4= 0.544 ms) | FP4  0.127 ms (x4= 0.508 ms) | 1.07x
+ALL test_indexer_key_fp4 CHECKS PASSED!
+[2026-11-15 17:35:56.977] [ERROR] MYDS_INDEXER_KEY_FP4 must be exactly absent, 0 or 1
+[2026-11-15 17:35:56.978] [ERROR] MYDS_INDEXER_KEY_FP4 must be exactly absent, 0 or 1
+[2026-11-15 17:35:56.978] [ERROR] MYDS_INDEXER_KEY_FP4 must be exactly absent, 0 or 1
+[2026-11-15 17:35:56.978] [ERROR] MYDS_INDEXER_KEY_FP4 must be exactly absent, 0 or 1
+[2026-11-15 17:35:56.978] [ERROR] MYDS_INDEXER_KEY_FP4 must be exactly absent, 0 or 1
+[2026-11-15 17:35:56.978] [ERROR] MYDS_INDEXER_KEY_FP4 must be exactly absent, 0 or 1
+[2026-11-15 17:35:56.978] [ERROR] MYDS_INDEXER_KEY_FP4 must be exactly absent, 0 or 1
+[2026-11-15 17:35:56.978] [ERROR] MYDS_INDEXER_KEY_FP4 must be exactly absent, 0 or 1

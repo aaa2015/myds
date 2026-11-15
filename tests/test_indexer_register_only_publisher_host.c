@@ -9,6 +9,7 @@ static struct myds_metal_buffer scores={8388608u*4u},blocks={8388608u*4u},sel={8
 static uint32_t stub_batch_floats=2097152u;
 static int scorer_ret=0;
 static uint32_t expected_start=30720u,expected_nc=15424u,expected_ratio=2u,expected_rows=2048u;
+static uint32_t expected_cache_mode=MYDS_INDEXER_CACHE_BF16;
 static unsigned rope_calls,scoped_calls,after_scorer_calls,fallback_rope_calls;
 static uint32_t sum_scoped_nt,min_scoped_nt,max_scoped_nt;
 static bool trace_on;
@@ -21,6 +22,8 @@ myds_metal_buffer_t *myds_v41_gpu_indexer_scores(const myds_v41_gpu_scratch_t*s)
 myds_metal_buffer_t *myds_v41_gpu_indexer_blocks(const myds_v41_gpu_scratch_t*s){return &blocks;}
 myds_metal_buffer_t *myds_v41_gpu_indexer_block_selected(const myds_v41_gpu_scratch_t*s){return &sel;}
 int myds_v41_gpu_indexer_rope_quant_batch(myds_metal_buffer_t*x,myds_metal_buffer_t*d,size_t off,uint32_t h,uint32_t start,uint32_t rows,uint32_t stride,bool compressed){assert(h==32&&start==expected_start&&rows==expected_rows&&stride==1&&compressed);rope_calls++;return 1;}
+int myds_v41_gpu_indexer_rope_quant_batch_mode(myds_metal_buffer_t*x,myds_metal_buffer_t*d,size_t off,uint32_t h,uint32_t start,uint32_t rows,uint32_t stride,bool compressed,uint32_t cache_mode){assert(d&&cache_mode==expected_cache_mode&&h==1&&start==expected_start&&rows==expected_rows&&(stride==1||stride==2)&&compressed);return 1;}
+int myds_v41_gpu_pack_indexer_key(myds_metal_buffer_t*dst,size_t dst_row,const myds_metal_buffer_t*src,size_t src_row,uint32_t n_rows,uint32_t cache_mode){fallback_rope_calls++;return 1;}
 int myds_v41_gpu_rope_batch(myds_metal_buffer_t*x,uint32_t d,uint32_t h,uint32_t start,uint32_t rows,bool c,bool inv){fallback_rope_calls++;return 1;}
 int myds_v41_gpu_quant(myds_metal_buffer_t*x,uint32_t width,uint32_t rows,uint32_t mode){fallback_rope_calls++;return 1;}
 int myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped(myds_v41_gpu_scratch_t*s,myds_metal_buffer_t*y,const myds_metal_buffer_t*q,const myds_metal_buffer_t*w,const myds_metal_buffer_t*k,uint32_t nc,uint32_t nh,uint32_t nt,uint32_t start,uint32_t ratio,bool bf,bool ordinary){
@@ -32,6 +35,10 @@ int myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped(myds_v41_gpu_scr
     if(nt<min_scoped_nt)min_scoped_nt=nt;
     if(nt>max_scoped_nt)max_scoped_nt=nt;
     return scorer_ret;
+}
+int myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped_mode(myds_v41_gpu_scratch_t*s,myds_metal_buffer_t*y,const myds_metal_buffer_t*q,const myds_metal_buffer_t*w,const myds_metal_buffer_t*k,uint32_t nc,uint32_t nh,uint32_t nt,uint32_t start,uint32_t ratio,uint32_t cache_mode,bool ordinary){
+    assert(cache_mode==expected_cache_mode);
+    return myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped(s,y,q,w,k,nc,nh,nt,start,ratio,cache_mode!=MYDS_INDEXER_CACHE_F32,ordinary);
 }
 int myds_v41_gpu_candidates_rows(myds_metal_buffer_t*a,const myds_metal_buffer_t*b,uint32_t c,uint32_t d,uint32_t e,uint32_t f,uint32_t g){after_scorer_calls++;return 1;}
 int myds_v41_gpu_filter_rows(myds_metal_buffer_t*a,const myds_metal_buffer_t*b,uint32_t c,uint32_t d,uint32_t e,uint32_t f,uint32_t g){after_scorer_calls++;return 1;}
@@ -65,6 +72,10 @@ int myds_v41_gpu_indexer_prefill_compact_scoped(myds_v41_gpu_scratch_t*s,myds_me
         if(nt>max_compact_nt)max_compact_nt=nt;
     }
     return compact_ret;
+}
+int myds_v41_gpu_indexer_prefill_compact_scoped_mode(myds_v41_gpu_scratch_t*s,myds_metal_buffer_t*ids,const myds_metal_buffer_t*q,const myds_metal_buffer_t*w,const myds_metal_buffer_t*k,const myds_metal_buffer_t*m,uint32_t nc,uint32_t nt,uint32_t start,uint32_t ratio,uint32_t mu,uint32_t tb,uint32_t cache_mode,bool ord){
+    assert(cache_mode==expected_cache_mode);
+    return myds_v41_gpu_indexer_prefill_compact_scoped(s,ids,q,w,k,m,nc,nt,start,ratio,mu,tb,ord);
 }
 int main(void) {
     myds_context_t ctx={0};myds_v41_context_t g={0};ctx.v41=&g;int opaque;g.gpu=(void*)&opaque;
@@ -136,5 +147,20 @@ int main(void) {
     assert(rope_calls==1&&scoped_calls==1&&l20_compact_calls==1&&!after_scorer_calls);
     l20_compact_ret=0;
 
-    puts("{\"actual_publisher_scorer_failure_is_minus1\":true,\"trace_scope_forwarded\":true,\"no_repeat_rope_or_consumers\":true,\"p_i1_gt_512k_no_fallback\":true,\"p_l1_publisher_verified\":true,\"p_t1_publisher_verified\":true,\"gpu_work\":false}");return 0;
+    /* [FP4] Verify 68 B/row FP4 index_cache mode forwards cleanly through L20 root and L24 compact. */
+    struct myds_metal_buffer cache_fp4={1048576u*68u};
+    for(unsigned i=0;i<8;i++)g.index_cache[i]=&cache_fp4;
+    g.index_cache_mode=MYDS_INDEXER_CACHE_FP4;
+    expected_cache_mode=MYDS_INDEXER_CACHE_FP4;
+    rope_calls=scoped_calls=after_scorer_calls=l20_compact_calls=compact_calls=fallback_rope_calls=0;
+    sum_scoped_nt=0;min_scoped_nt=UINT32_MAX;max_scoped_nt=0;
+    expected_start=129024u;expected_ratio=1u;scorer_ret=1;l20_compact_ret=1;
+    assert(publish_indexer_chunk(&ctx,20,0,2048,129024,&q,&w,&selected,2048,&mask,65536,true,&qv,&wv,&sv,&mv)==1);
+    assert(rope_calls==1&&l20_compact_calls==scoped_calls&&sum_scoped_nt==2048u&&!fallback_rope_calls);
+    rope_calls=scoped_calls=after_scorer_calls=compact_calls=0;
+    sum_compact_nt=0;min_compact_nt=UINT32_MAX;max_compact_nt=0;compact_ret=1;
+    assert(publish_indexer_chunk(&ctx,24,0,2048,129024,&q,&w,&selected,2048,&mask,65536,true,&qv,&wv,&sv,&mv)==1);
+    assert(rope_calls==1&&compact_calls==4&&sum_compact_nt==2048u&&!scoped_calls);
+
+    puts("{\"actual_publisher_scorer_failure_is_minus1\":true,\"trace_scope_forwarded\":true,\"no_repeat_rope_or_consumers\":true,\"p_i1_gt_512k_no_fallback\":true,\"p_l1_publisher_verified\":true,\"p_t1_publisher_verified\":true,\"fp4_publisher_verified\":true,\"gpu_work\":false}");return 0;
 }

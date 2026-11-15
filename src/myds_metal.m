@@ -3337,10 +3337,10 @@ static bool indexer_head_slots_overlap(const myds_metal_buffer_t *a,uint64_t a_b
     }
     return false;
 }
-int myds_metal_indexer_head_slots_dispatch(myds_metal_buffer_t *scores,
+int myds_metal_indexer_head_slots_dispatch_mode(myds_metal_buffer_t *scores,
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *weights,
     const myds_metal_buffer_t *cache,const myds_metal_buffer_t *mask,
-    uint32_t n_comp,uint32_t n_heads,bool cache_bf16,uint32_t first_row,
+    uint32_t n_comp,uint32_t n_heads,uint32_t cache_mode,uint32_t first_row,
     bool *encoded,bool *unavailable) {
     if(encoded)*encoded=false;
     if(unavailable)*unavailable=false;
@@ -3350,14 +3350,16 @@ int myds_metal_indexer_head_slots_dispatch(myds_metal_buffer_t *scores,
         if(unavailable)*unavailable=true;
         return 0;
     }
-    if(!n_comp || n_heads!=32u) return 0;
+    if(!n_comp || n_heads!=32u || (cache_mode!=0u && cache_mode!=2u && cache_mode!=3u)) return 0;
+    const uint64_t row_bytes = cache_mode==3u ? 68u : (cache_mode==2u ? 256u : 512u);
+    const size_t cache_align = cache_mode==2u ? 2u : 4u;
     const uint64_t score_bytes=(uint64_t)n_comp*4u;
-    const uint64_t cache_bytes=(uint64_t)n_comp*128u*(cache_bf16?2u:4u);
+    const uint64_t cache_bytes=(uint64_t)n_comp*row_bytes;
     const uint64_t mask_bytes=((uint64_t)n_comp+7u)/8u*4u;
     if(!indexer_head_slots_range(scores,score_bytes,4u) ||
        !indexer_head_slots_range(q,32u*128u*4u,16u) ||
        !indexer_head_slots_range(weights,32u*4u,4u) ||
-       !indexer_head_slots_range(cache,cache_bytes,cache_bf16?2u:4u) ||
+       !indexer_head_slots_range(cache,cache_bytes,cache_align) ||
        (mask && !indexer_head_slots_range(mask,mask_bytes,4u))) return 0;
     if(indexer_head_slots_overlap(scores,score_bytes,q,32u*128u*4u) ||
        indexer_head_slots_overlap(scores,score_bytes,weights,32u*4u) ||
@@ -3365,7 +3367,7 @@ int myds_metal_indexer_head_slots_dispatch(myds_metal_buffer_t *scores,
        (mask && indexer_head_slots_overlap(scores,score_bytes,mask,mask_bytes))) return 0;
     struct {uint32_t n_rows,n_head,head_dim,cache_f16;float scale;uint32_t has_mask;
             uint32_t first_row;} args={
-        n_comp,n_heads,128u,cache_bf16?2u:0u,1.0f/64.0f,mask?1u:0u,first_row};
+        n_comp,n_heads,128u,cache_mode,1.0f/64.0f,mask?1u:0u,first_row};
     const myds_metal_buffer_t *buffers[]={q,weights,cache,scores,mask?mask:scores};
     @autoreleasepool {
         id<MTLCommandBuffer> cb=g_batch_cb?g_batch_cb:[g_queue commandBuffer];
@@ -3390,6 +3392,14 @@ int myds_metal_indexer_head_slots_dispatch(myds_metal_buffer_t *scores,
         if(encoded)*encoded=true;
         return v41_finish(cb,enc);
     }
+}
+int myds_metal_indexer_head_slots_dispatch(myds_metal_buffer_t *scores,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *cache,const myds_metal_buffer_t *mask,
+    uint32_t n_comp,uint32_t n_heads,bool cache_bf16,uint32_t first_row,
+    bool *encoded,bool *unavailable) {
+    return myds_metal_indexer_head_slots_dispatch_mode(scores,q,weights,cache,mask,
+        n_comp,n_heads,cache_bf16?2u:0u,first_row,encoded,unavailable);
 }
 
 int myds_metal_dispatch_kernel(const char *name, const void *args, size_t args_size,

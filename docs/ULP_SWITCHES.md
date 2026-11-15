@@ -3,8 +3,8 @@
 本文是「哪些开关会改变输出、它们各自的实际风险、以及用什么证据判断」的单一入口。
 **结论全部来自实测，不是从代码推断的。**
 
-- 相关账本节：§98（YOCO vs indexer 窗口）、§99（专家权重）、§100/§101（0-ULP decode 封顶）、§172（`MYDS_MOE_DECODE_TOPK=3`）、§173–§176（矩阵注意力与严格 0-ULP 紧凑/Radix Indexer）
-- 对应单元测试：`tests/test_indexer_window.c`、`tests/test_yoco_compact.c`、`tests/test_moe_ds_kahan.c`、`tests/test_v41_router.c`、`tests/test_attention_heads_rego.m`、`tests/test_indexer_decode_compact.c`、`tests/test_indexer_prefill_compact.m`、`tests/test_indexer_topk_radix_pt1.m`
+- 相关账本节：§98（YOCO vs indexer 窗口）、§99（专家权重）、§100/§101（0-ULP decode 封顶）、§172（`MYDS_MOE_DECODE_TOPK=3`）、§173–§177（矩阵注意力、严格 0-ULP 紧凑/Radix Indexer 与原生 `4.25-bit` `FP4` Indexer `K` 缓存）
+- 对应单元测试：`tests/test_indexer_window.c`、`tests/test_yoco_compact.c`、`tests/test_moe_ds_kahan.c`、`tests/test_v41_router.c`、`tests/test_attention_heads_rego.m`、`tests/test_indexer_decode_compact.c`、`tests/test_indexer_prefill_compact.m`、`tests/test_indexer_topk_radix_pt1.m`、`tests/test_indexer_key_fp4.m`
 
 最后更新：2026-11-15
 
@@ -28,6 +28,7 @@
 | `MYDS_INDEXER_REGISTER_ONLY` / `MYDS_INDEXER_RO_SMEM_Q` | `1` / `1` | **否**（严格 0-ULP） | **生产开启** | 账本 §105 / §173 `A-1` / §174 `[P-I2s]` |
 | `MYDS_INDEXER_DECODE_COMPACT` / `MYDS_INDEXER_PREFILL_COMPACT` | `1` / `1` | **否**（严格 0-ULP，含 `1024` 分区双调同分重放） | **生产开启** | 账本 §174 `[D-L1]` / §175 `[P-L1]` |
 | `MYDS_INDEXER_TOPK_RADIX_CAUSAL` | `0` | **否**（严格 0-ULP，含 `-0/+0` 归一、`0.0f` 巨量同分早停与 `L20` 稠密重放） | **生产开启（`=1`）** | 账本 §176 `[P-T1]` |
+| `MYDS_INDEXER_KEY_FP4` | `0` | **否**（严格 0-ULP，`68 B/row` `E2M1FN+UE8M0` 原生打包，`4,096` 态穷举逐 bit 恒等 + 10/10 档 SHA256 全同） | **生产开启（`=1`）** | 账本 §177 |
 | `MYDS_YOCO_COMPACT` | `0` | 是 | **可用**（短上下文，生产默认 `0`） | 账本 §98 |
 | `MYDS_INDEXER_KEY_WINDOW` | 未设 | 是 | **禁止** | 账本 §98 |
 | `MYDS_MOE_EXPERTZ_DS` | `0` | 是 | 未采纳（+0.82%，非 0-ULP） | 账本 §20 |

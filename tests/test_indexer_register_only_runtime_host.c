@@ -172,6 +172,17 @@ int main(int argc,char **argv) {
     assert(!strcmp(dispatched[0],"kernel_myds_indexer_score_chunk_exact"));
     reset();assert(myds_v41_gpu_indexscores_chunk_bf16(&f.y,&f.q,&f.w,&f.k,f.nc,32,f.nt,f.start,f.ratio));
     myds_v41_gpu_indexer_register_only_counters_t c;myds_v41_gpu_indexer_register_only_counters(&c,false);assert(!c.requests&&!c.encoded&&!preflight_calls);
+    /* [FP4] Verify 68 B/row mode dispatches register_only_fp4 / 0b_fp4 with index_row_stride=68 without disturbing controls count. */
+    reset();configure(&f,15424,128,30720,2,true);
+    f.k.bytes=15424ull*68ull;f.k.native_bytes=f.k.bytes+256;
+    assert(myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped_mode(&f.s,&f.y,&f.q,&f.w,&f.k,f.nc,32,f.nt,f.start,f.ratio,MYDS_INDEXER_CACHE_FP4,true));
+    assert(dispatch_calls==1&&!strcmp(dispatched[0],"kernel_myds_indexer_scores_register_only_fp4")&&got.index_row_stride==68);
+    reset();configure(&f,15424,128,30720,2,true);
+    f.k.bytes=15424ull*68ull;f.k.native_bytes=f.k.bytes+256;
+    setenv("MYDS_INDEXER_RO_SMEM_Q","0",1);
+    assert(myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped_mode(&f.s,&f.y,&f.q,&f.w,&f.k,f.nc,32,f.nt,f.start,f.ratio,MYDS_INDEXER_CACHE_FP4,true));
+    assert(dispatch_calls==1&&!strcmp(dispatched[0],"kernel_myds_indexer_scores_register_only_0b_fp4")&&got.index_row_stride==68);
+    unsetenv("MYDS_INDEXER_RO_SMEM_Q");
     int before=dispatch_calls;myds_v41_gpu_indexer_register_only_counters(NULL,true);myds_v41_gpu_indexer_register_only_counters(&c,false);assert(!c.requests&&!c.encoded&&dispatch_calls==before);
     printf("{\"controls\":%u,\"mode\":1,\"gpu_work\":false,\"actual_source_included\":true}\n",controls);return 0;
 }

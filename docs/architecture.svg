@@ -22,7 +22,7 @@
 
   <!-- ============ HEADER ============ -->
   <text x="20" y="30" class="hdr">myds · DeepSeek-V4.1-Flash-1017-Q2-dense-q4 · Apple M2 Ultra（76 GPU 核 · 96 MB SLC · 192 GiB）</text>
-  <text x="20" y="48" class="sub">40 层 V4.1 计算图（HC 多路残差 + Engram 稀疏表 + MLA 压缩 KV + 8 层 Indexer + 共享/路由 MoE）· §176 独占整机实测基线（2026-11-15）</text>
+  <text x="20" y="48" class="sub">40 层 V4.1 计算图（HC 多路残差 + Engram 稀疏表 + MLA 压缩 KV + 8 层 Indexer + 共享/路由 MoE）· §177 独占整机实测基线（2026-11-15）</text>
 
   <!-- ============ PREFILL ============ -->
   <text x="20" y="80" class="title">Prefill — 冷建 32K 733.5–734.0 t/s（43.9 s）· 64K 737.9 t/s（87.4 s）· 128K 727.4 t/s（177.3 s）</text>
@@ -48,8 +48,8 @@
   <text x="388" y="177" class="pct" fill="#1a7f37">解锁 2 TGs/core (§173/§174 [P-A1])</text>
 
   <rect x="592" y="112" width="206" height="74" class="box-ok"/>
-  <text x="602" y="131" class="lbl">Indexer（8 层）</text>
-  <text x="602" y="147" class="ms">RO ratio∈{1,2} 1M · 8M IRO + 4 KB Q</text>
+  <text x="602" y="131" class="lbl">Indexer（8 层 · FP4 K 68 B）</text>
+  <text x="602" y="147" class="ms">RO 1M · 8M IRO + 4 KB Q · K −73.4% (§177)</text>
   <text x="602" y="162" class="ms">L2/8/14 Radix Top-512 + L20 收集 (§176)</text>
   <text x="602" y="177" class="pct" fill="#1a7f37">L24..36 8行并集 ≤16K Top-512 (§175)</text>
 
@@ -86,15 +86,15 @@
 
   <rect x="806" y="198" width="134" height="74" class="box"/>
   <text x="816" y="217" class="lbl">Prefix / KV Cache</text>
-  <text x="816" y="233" class="ms">RAM 快照槽位复用</text>
-  <text x="816" y="248" class="ms">SSD kvlow-v3 分段</text>
+  <text x="816" y="233" class="ms">256K RSS −1.28 GiB (§177)</text>
+  <text x="816" y="248" class="ms">SSD kvdisk −2.05 GiB</text>
   <text x="816" y="263" class="ms">长对话前缀零重算</text>
 
   <!-- Classification legend -->
   <rect x="20" y="286" width="920" height="50" fill="#ffffff" stroke="#d0d7de" stroke-width="1" rx="6"/>
-  <text x="34" y="305" class="lbl">子层状态图例（chunk=2048，自适应 macroblock，1M 上下文容量；§146–§176 已攻克旧 32 KB smem 墙与全表 Indexer 瓶颈）</text>
+  <text x="34" y="305" class="lbl">子层状态图例（chunk=2048，自适应 macroblock，1M 上下文容量；§146–§177 已攻克旧 32 KB smem 墙与 Indexer 算存瓶颈）</text>
   <rect x="34" y="315" width="12" height="12" fill="#eaf7ee" stroke="#1a7f37"/>
-  <text x="52" y="325" class="ms">已达高效率或 §146–§176 已攻克（稠密 57–76% 峰值 · Flash-Attn q8 双驻留 · Radix &amp; 紧凑 Indexer）</text>
+  <text x="52" y="325" class="ms">已达高效率或 §146–§177 已攻克（稠密 57–76% 峰值 · Flash-Attn q8 双驻留 · Radix/紧凑/FP4 Indexer）</text>
   <rect x="536" y="315" width="12" height="12" fill="#fff8e6" stroke="#bf8700"/>
   <text x="554" y="325" class="ms">物理散读/拆包有界约束（Decode Top-3 已减半）</text>
   <rect x="812" y="315" width="12" height="12" fill="#ffffff" stroke="#d0d7de"/>
@@ -117,7 +117,7 @@
 
     <rect x="20" y="488" width="118" height="36" class="box"/>
     <text x="30" y="510" class="lbl">indexer + misc</text>
-    <text x="148" y="510" class="ms">~0.7 ms (3%) · [D-L1] L24..36 O(16K) 紧凑 + OVERLAP (256K +3.8%)</text>
+    <text x="148" y="510" class="ms">~0.7 ms (3%) · [D-L1] O(16K) + §177 FP4 68B K (256K 再省 0.26 ms/tok)</text>
   </g>
 
   <!-- MoE decomposition callout -->
@@ -145,9 +145,9 @@
   <text x="154" y="660" class="ms">且 L2/8/14 Radix Top-K + L20..36 ≤16K 紧凑管线将排序工作集压入 SLC，消除 O(Context) 冲刷（§174–§176）</text>
 
   <!-- ============ FOOTER ============ -->
-  <text x="20" y="700" class="title">结论与演进（至 §176）</text>
-  <text x="20" y="719" class="sub">同机同 GGUF 权重下，§143–§176 将 32K / 64K / 128K 冷建推至 733.5–734.0 / 737.9 / 727.4 t/s，128K+2.4K 热追加达 367.4 t/s（+71.1%），稳态 Decode 达 ~49.4 t/s。</text>
-  <text x="20" y="737" class="sub">严格 0-ULP 主干算子（稠密投影 57–76% 峰值、Flash-Attn q8 双驻留、Indexer 8M IRO + 4 KB smem Q + Radix Top-K + YoCo ≤16K 紧凑管线）已逼近当前微架构上限。</text>
+  <text x="20" y="700" class="title">结论与演进（至 §177）</text>
+  <text x="20" y="719" class="sub">同机同 GGUF 权重下，§143–§177 将 32K / 64K / 128K 冷建推至 733.5–734.0 / 737.9 / 727.4 t/s，128K+2.4K 热追加达 367.4 t/s（+71.1%），稳态 Decode 达 ~49.4 t/s。</text>
+  <text x="20" y="737" class="sub">严格 0-ULP 主干算子（稠密投影 57–76% 峰值、Flash-Attn q8 双驻留、Indexer FP4 68 B/row K 缓存 −73.4% + Radix Top-K + YoCo ≤16K 紧凑管线）已逼近当前微架构上限。</text>
   <text x="20" y="755" class="sub">后续潜在空间转向投机解码批量验证（如代码/JSON 场景 PLD B=4）或模型侧改动（专家布局 / 分层量化）；任何 kernel 改动须先履行 §149 派发取证门禁。</text>
   <text x="20" y="773" class="sub">权威记录与测量纪律：docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md · docs/MEASUREMENT-DISCIPLINE.md</text>
 </svg>

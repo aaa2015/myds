@@ -191,6 +191,86 @@ kernel void kernel_dsv41_pack_bf16(
     if(gid<args.count)
         dst[args.dst_offset+gid]=ushort(as_type<uint>(src[args.src_offset+gid])>>16u);
 }
+
+// Lossless 0-ULP 4.25-bit (E2M1FN + UE8M0, 68 B/row) Indexer Key Cache helpers.
+// Row layout (68 bytes = 17 x uint32_t, 4-byte aligned):
+//   words[0..15] (bytes 0..63):  128 linear little-endian 4-bit code4 nibbles
+//                                ((sign << 3) | mag_idx in 0..7)
+//   words[16]    (bytes 64..67): 4 x UE8M0 biased exponents (exp_u8[block=0..3])
+static inline float myds_fp4_dequant_elem(uint code4, float scale) {
+    #pragma clang fp contract(off)
+    const uint mag = code4 & 7u;
+    const uint sign_u32 = (code4 & 8u) << 28u;
+    const uint m = select(mag, 0u, mag == 1u);
+    const float prod = as_type<float>(0x3f000000u + (m << 22u)) * scale;
+    const uint abs_bits = select(as_type<uint>(prod) & 0xffff0000u, 0u, mag == 0u);
+    return as_type<float>(sign_u32 | abs_bits);
+}
+
+static inline uint dsv41_e2m1fn_encode_mag(float ax_in) {
+    const float ax = min(ax_in, 6.0f);
+    uint best = 0u;
+    float best_diff = abs(ax - dsv4_e2m1fn_values[0]);
+    for (uint i = 1u; i < 8u; i++) {
+        const float diff = abs(ax - dsv4_e2m1fn_values[i]);
+        if (diff < best_diff || (diff == best_diff && ((i & 1u) == 0u) && ((best & 1u) != 0u))) {
+            best = i;
+            best_diff = diff;
+        }
+    }
+    return best;
+}
+
+static inline uint dsv41_fp4_encode_from_out(float out_v, float scale) {
+    const uint ubits = as_type<uint>(out_v);
+    const uint sign_bit = (ubits >> 28u) & 8u;
+    const uint abits = ubits & 0x7fffffffu;
+    uint mag = 0u;
+    if (abits >= 0x7f800000u) {
+        mag = 7u;
+    } else if (abits != 0u) {
+        mag = dsv41_e2m1fn_encode_mag(as_type<float>(abits) / scale);
+    }
+    return sign_bit | mag;
+}
+
+struct dsv41_pack_indexer_fp4_args {
+    ulong dst_row, src_row;
+    uint n_rows, pad;
+};
+kernel void kernel_dsv41_pack_indexer_fp4(
+        constant dsv41_pack_indexer_fp4_args &args [[buffer(0)]],
+        device const float *src                    [[buffer(1)]],
+        device uint *dst                           [[buffer(2)]],
+        uint row  [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    if (row >= args.n_rows) return;
+    device const float *src_r = src + (args.src_row + (ulong)row) * 128u;
+    device uint *dst_r = dst + (args.dst_row + (ulong)row) * 17u;
+    uint sc_pack = 0u;
+    for (uint block = 0u; block < 4u; ++block) {
+        const float out_v = dsv41_bf16(src_r[block * 32u + lane]);
+        const uint abits = as_type<uint>(out_v) & 0x7fffffffu;
+        const uint max_abits = simd_max(abits);
+        const float scale = (max_abits >= 0x7f800000u)
+            ? as_type<float>(0x7e800000u)
+            : dsv41_pow2_ceil(max(as_type<float>(max_abits), 7.052966104933725e-38f) * (1.0f / 6.0f));
+        const uint code4 = dsv41_fp4_encode_from_out(out_v, scale);
+        const uint sub = lane & 7u;
+        uint word = code4 << (sub * 4u);
+        word |= simd_shuffle_xor(word, 1u);
+        word |= simd_shuffle_xor(word, 2u);
+        word |= simd_shuffle_xor(word, 4u);
+        if (sub == 0u) {
+            dst_r[block * 4u + (lane >> 3u)] = word;
+        }
+        const uint exp_u8 = (as_type<uint>(scale) >> 23u) & 0xffu;
+        sc_pack |= (exp_u8 << (block * 8u));
+    }
+    if (lane == 0u) {
+        dst_r[16] = sc_pack;
+    }
+}
 kernel void kernel_dsv41_stage_bf16_f16(
         constant uint &count,
         device const ushort *src, device half *dst,

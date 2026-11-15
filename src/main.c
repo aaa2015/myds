@@ -8,6 +8,7 @@
 #include "myds_steer.h"
 #include "myds_steer_alpha.h"
 #include "myds_metal.h"
+#include "myds_v41_gpu.h"
 #include "myds_log.h"
 #include "myds_configfile.h"
 #include "myds_knobs.h"
@@ -343,6 +344,7 @@ int main(int argc, char *argv[]) {
     if (capture_mode < 0) return 1;
     if (myds_metal_f16_gemv_bf16_fuse_parse_mode() < 0) return 1;
     if (myds_metal_indexer_rope_quant_fuse_parse_mode() < 0) return 1;
+    if (myds_v41_gpu_indexer_key_fp4_enabled() < 0) return 1;
 #if defined(__APPLE__)
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 #endif

@@ -207,6 +207,11 @@ int myds_metal_indexer_head_slots_dispatch(myds_metal_buffer_t *scores,
     const myds_metal_buffer_t *cache,const myds_metal_buffer_t *mask,
     uint32_t n_comp,uint32_t n_heads,bool cache_bf16,uint32_t first_row,
     bool *encoded,bool *unavailable);
+int myds_metal_indexer_head_slots_dispatch_mode(myds_metal_buffer_t *scores,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *cache,const myds_metal_buffer_t *mask,
+    uint32_t n_comp,uint32_t n_heads,uint32_t cache_mode,uint32_t first_row,
+    bool *encoded,bool *unavailable);
 
 /* Initialization-time LM-head experiment. MYDS_LM_HEAD_Q8_NR0 accepts only
  * absent/2/4; absent and 2 retain the original path. NR4 applies solely to

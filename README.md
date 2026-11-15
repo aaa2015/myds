@@ -7,7 +7,7 @@
 
 **当前 native engine 已完整实现 DeepSeek V4.1 文本与视觉计算图（HC、Engram、压缩 KV、indexer、Vision Encoder），并通过与 ds4 oracle 的逐位验收。**
 
-验收依据与门禁规则记在[性能账本](docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md)的「方法论教训」与「已证否清单」两节；**性能现状、已采纳优化登记表（`§0.3`）与最新生产突破（`§143–§150`、`§172–§176`）以该账本为唯一权威记录**（`§0.0` 保留 2026-10-24 全链路普查快照，顶部摘要与 `§172–§176` 记录当前在产基线）。单元测试通过不等于真实模型逐位对齐，改动数值路径仍须过同等门禁。
+验收依据与门禁规则记在[性能账本](docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md)的「方法论教训」与「已证否清单」两节；**性能现状、已采纳优化登记表（`§0.3`）与最新生产突破（`§143–§150`、`§172–§177`）以该账本为唯一权威记录**（`§0.0` 保留 2026-10-24 全链路普查快照，顶部摘要与 `§172–§177` 记录当前在产基线）。单元测试通过不等于真实模型逐位对齐，改动数值路径仍须过同等门禁。
 
 **2026-10-28 分词优化（§107）**：ASCII 分类查表与请求内 BPE 临时内存复用已实现。
 macstudio 实测英文/代码/多语言混合输入的 **CPU 分词耗时降低约 33–54%**，
@@ -33,7 +33,7 @@ make adoption-check        # 校验账本 §0.3「在产」开关均存在于 in
 
 ![myds architecture](docs/architecture.svg)
 
-一张图看完 40 层 V4.1 计算图里每个子层的职责、实测效率与 **§146–§176** 关键微架构突破（Engram 后台异步预读、Flash-Attention `q8` 寄存器驻留 `O` 解锁 `2 TGs/core`、Indexer `8M` `IRO` + `4 KB` smem `Q` + `L2/8/14` 两趟 Radix Top-512 + `L20` 自紧凑收集 + YoCo `≤16K` 紧凑打分/Top-512，以及 Decode `Top-3` 路由裁剪与 `O(16K)` 紧凑索引将单步耗时压至 **`~20.2 ms/tok`**）。**图中全部数字均对齐[性能账本](docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md) `§0.3` / `§172–§176` 唯一权威基线。**
+一张图看完 40 层 V4.1 计算图里每个子层的职责、实测效率与 **§146–§177** 关键微架构突破（Engram 后台异步预读、Flash-Attention `q8` 寄存器驻留 `O` 解锁 `2 TGs/core`、Indexer 无损 `4.25-bit` `FP4`（`68 B/row`, `−73.4%`）`K` 缓存 + `8M` `IRO` + `4 KB` smem `Q` + `L2/8/14` 两趟 Radix Top-512 + `L20` 自紧凑收集 + YoCo `≤16K` 紧凑打分/Top-512，以及 Decode `Top-3` 路由裁剪与 `O(16K)` 紧凑索引将单步耗时压至 **`~20.2 ms/tok`**）。**图中全部数字均对齐[性能账本](docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md) `§0.3` / `§172–§177` 唯一权威基线。**
 
 ---
 
@@ -42,9 +42,9 @@ make adoption-check        # 校验账本 §0.3「在产」开关均存在于 in
 - **硬件**：Mac Studio，Apple M2 Ultra（76 核 GPU，**96 MB SLC**），**192 GB 统一内存**（Apple 标称 192 GiB = 十进制 206 GB，Metal 可用上限 201.9 GB），统一内存理论带宽 800 GB/s（实测峰值 724–799 GB/s）。
 - **系统**：**macOS 27.0.1 (26A434)**（早期 2026-10-05 复现包测于 macOS 26.5.2）。
 - **模型**：`DeepSeek-V4.1-Flash-1017-Q2-dense-q4-imx-cliecy.gguf`（文件 362.14 GB / 337.2 GiB，其中 56% 即 202.76 GB / 188.8 GiB 为两张稀疏 `pread` 的 `I8` Engram 表，路由专家为 `IQ2_XXS` `gate/up` + `Q2_K` `down`，稠密投影含 `Q4_K` imatrix；常驻 wired ~148.4 GB）。
-- **测量口径（§173–§176 现行生产基线）**：通过 `tools/with_prod_guard.sh` 停产**独占整机**、`temperature=0`、`max_tokens=256`、无并发；保持生产配置（`MYDS_PREFIX_CACHE=1`、`MYDS_PLD=1`、`MYDS_PREFILL_ATTN=auto`、`MYDS_ATTN_HEADS_MODE=q8`、`MYDS_INDEXER_BATCH_FLOATS=8388608`、`MYDS_INDEXER_RO_SMEM_Q=1`、`MYDS_INDEXER_DECODE_COMPACT=1`、`MYDS_INDEXER_PREFILL_COMPACT=1`、`MYDS_INDEXER_TOPK_RADIX_CAUSAL=1`、`MYDS_MOE_DECODE_TOPK=3`、`MYDS_ENGRAM_IO_THREADS=16`）。冷启动使用台账真实语料（`benchmarks/register_only_2026-10-27/prompts/p32k_ab__v0.txt` 等同源拼接语料）并加唯一 nonce 前缀保证 `cached_tok = 0`（测量纪律见 [`docs/MEASUREMENT-DISCIPLINE.md`](docs/MEASUREMENT-DISCIPLINE.md)）。
+- **测量口径（§173–§177 现行生产基线）**：通过 `tools/with_prod_guard.sh` 停产**独占整机**、`temperature=0`、`max_tokens=256`、无并发；保持生产配置（`MYDS_PREFIX_CACHE=1`、`MYDS_PLD=1`、`MYDS_PREFILL_ATTN=auto`、`MYDS_ATTN_HEADS_MODE=q8`、`MYDS_INDEXER_BATCH_FLOATS=8388608`、`MYDS_INDEXER_RO_SMEM_Q=1`、`MYDS_INDEXER_DECODE_COMPACT=1`、`MYDS_INDEXER_PREFILL_COMPACT=1`、`MYDS_INDEXER_TOPK_RADIX_CAUSAL=1`、`MYDS_INDEXER_KEY_FP4=1`、`MYDS_MOE_DECODE_TOPK=3`、`MYDS_ENGRAM_IO_THREADS=16`）。冷启动使用台账真实语料（`benchmarks/register_only_2026-10-27/prompts/p32k_ab__v0.txt` 等同源拼接语料）并加唯一 nonce 前缀保证 `cached_tok = 0`（测量纪律见 [`docs/MEASUREMENT-DISCIPLINE.md`](docs/MEASUREMENT-DISCIPLINE.md)）。
 
-### Prefill（§174–§176 在产基线，2026-11-15）
+### Prefill（§174–§177 在产基线，2026-11-15）
 
 #### 1. 冷启动 Prefill（`cached_tok = 0`，`temp=0, max_tokens=256`）
 
@@ -65,16 +65,16 @@ make adoption-check        # 校验账本 §0.3「在产」开关均存在于 in
 > **历史超长上下文容量参考（2026-10-24 / §102，旧 `vec + TILED` 口径，未重跑 §173–§176 新核）**：
 > `200K` `489.5 t/s` (`408.5 s`) · `400K` `371.7 t/s` (`1076.1 s`) · `500K` `331.7 t/s` (`1507.1 s`，峰值 wired `178 GB`) · `600K` `243.4 t/s` (`2465.9 s`，`moe_chunks=8`，峰值 wired `184.9 GB`，正常完结)。当前生产 `MYDS_CTX_SIZE=1048576`、`MYDS_CHUNK_KEY_MAX=1048576`。
 
-### Decode（`256 tok`，`MYDS_MOE_DECODE_TOPK=3` + `MYDS_INDEXER_DECODE_COMPACT=1`）
+### Decode（`256 tok`，`MYDS_MOE_DECODE_TOPK=3` + `MYDS_INDEXER_DECODE_COMPACT=1` + `MYDS_INDEXER_KEY_FP4=1`）
 
 | 上下文总长 | 短稳态（~56 tok） | 32K | 64K | 128K | 256K |
 |---|---:|---:|---:|---:|---:|
-| **t/s** | **~49.4** | **45.7–46.0** | **44.9** | **43.9–44.0** | **42.1–42.3** |
-| **ms/tok** | **20.2 ms** | 21.7–21.9 ms | 22.3 ms | 22.7–22.8 ms | 23.6–23.7 ms |
+| **t/s** | **~49.4** | **45.7–46.0** | **44.9** | **43.9–44.0** | **42.0–42.3** |
+| **ms/tok** | **20.2 ms** | 21.7–21.9 ms | 22.3 ms | 22.7–22.8 ms | 23.6–23.8 ms |
 
-跨 **4,600 倍上下文**（`56 tok → 257.8K`）Decode 仅衰减约 **14.6%**：§174 `[D-L1]` 将 `L24/28/32/36` 单步索引扫描从 `O(Context)` 封顶在 `O(16,384)`，长上下文代价被严格约束在 Prefill。（若设 `MYDS_MOE_DECODE_TOPK=0` 回退满血 `Top-6` 严格 0-ULP，短稳态为 `~42.9–44.0 t/s`。）
+跨 **4,600 倍上下文**（`56 tok → 257.8K`）Decode 仅衰减约 **14.6%**：§174 `[D-L1]` 将 `L24/28/32/36` 单步索引扫描从 `O(Context)` 封顶在 `O(16,384)`，§177 `MYDS_INDEXER_KEY_FP4=1` 再将 `L2/8/14/20` 及紧凑层的 `K` 缓存从 `256 B/row` 无损压至 `68 B/row`（`−73.44%`，`256K` Decode 再省 **`0.26 ms/tok`**，进程 `256K` 峰值 RSS 降 **`−1.28 GiB`**，`kvdisk` 盘占降 **`−2.05 GiB`**）。（若设 `MYDS_MOE_DECODE_TOPK=0` 回退满血 `Top-6` 严格 0-ULP，短稳态为 `~42.9–44.0 t/s`。）
 
-### 物理边界与 2026-11 架构突围复盘（§143–§176）
+### 物理边界与 2026-11 架构突围复盘（§143–§177）
 
 2026-10-24 的效率普查曾确认三条底层硬件事实（以 16.8K prompt 为样本）：
 
@@ -84,7 +84,7 @@ make adoption-check        # 校验账本 §0.3「在产」开关均存在于 in
 | CPU 计算能替 GPU 分担吗？ | CPU 算 MoE 慢 GPU **31.2 倍** | 把矩阵/MoE 算力卸载到 CPU 无效（但**消除 CPU 同步 I/O 阻塞 GPU** 有效，见下 ①） |
 | 常规 GEMM 受 DRAM 带宽限制吗？ | Prefill 主体 DRAM **14 GB/s**，重度依赖 **96 MB SLC** | 稠密投影已在 57–76% FP16 峰值；真正可挖的是**低占用率内核、冗余全局读写与超长上下文 `O(N²)` 无效扫描** |
 
-2026 年 10 月底曾据此得出「flash-attention 被 `32 KB` threadgroup memory 锁死、prefill 与 decode 均无两位数收益方向」的阶段性结论。**2026 年 11 月（§143–§176）在同一台 M2 Ultra、同一份 GGUF 权重上正面推翻了这一旧判断**，核心突破来自六步：
+2026 年 10 月底曾据此得出「flash-attention 被 `32 KB` threadgroup memory 锁死、prefill 与 decode 均无两位数收益方向」的阶段性结论。**2026 年 11 月（§143–§177）在同一台 M2 Ultra、同一份 GGUF 权重上正面推翻了这一旧判断**，核心突破来自七步：
 
 1. **§143–§150（Engram I/O 并发隐藏 + §149 内核身份纠偏）**：
    - `MYDS_ENGRAM_IO_THREADS=16`（decode `+1.4%`）配合 `MYDS_ENGRAM_PREFILL_ASYNC=1` 将 macroblock 入口原本同步阻塞 GPU `2.7 s` 的 SSD `pread`/解码移入后台线程（32K prefill `618.9 → 679.4 t/s`，**+9.8%**，严格 0-ULP）。
@@ -101,6 +101,8 @@ make adoption-check        # 校验账本 §0.3「在产」开关均存在于 in
    - 针对长文 Prefill `L24/28/32/36`（`nc > 16384, pos0 ≥ 16384`），用无原子 SIMD 前缀和提取 8 行查询 tile 并集块表（`128K` 仅占全表 `12.6%`、`256K` 仅占 `6.4%–7.3%`），经 `4 KB` smem 紧凑 `register_only` 打分与批量 `≤16,384` 紧凑 Top-512（含同分/`<512` 分区双调重放），将单次子批扩至 `512` 行驻留 `96 MB SLC`（全局 scratch 仅净增 `+64 KiB`），使多轮热追加 `128K+2K` 再提 **+9.49%**、`256K+312` 再提 **+16.18%**。
 6. **§176（`[P-T1]` `MYDS_INDEXER_TOPK_RADIX_CAUSAL=1` 根层两趟 Radix/直方图 Top-K + `L20` 自紧凑打分收集，严格 0-ULP）**：
    - 攻克 §175 后残留在 `L2/8/14`（不受 `MYDS_SUFFIX_SHRINK` 裁剪，全序列 `100%` 行执行）与 `L20` 的全表双调排序 + 多趟全局归并击穿 `96 MB SLC` 瓶颈：以 `4,096 B` 静态 smem（保 `8 TGs/core`）的批量因果两趟 256-bin IEEE-754 有序键直方图筛选 + `1024` 分区双调同分重放（含 ReLU `0.0f` 256K 路同分最低分区 `O(1)` 早停定理）替代全表排序（M2 Ultra 单算子提速 **`4.83×–6.76×`**），并在 `L20`（`nc > 16,384`）以 Radix Top-2048 选块后直接收集 `16,384` 个存活槽位做单趟紧凑 Top-512（消除第二次全表排序），使 `128K→256K` 续填再省 **11.83 s (+6.00%，达 655.3 t/s)**、`128K` 冷建推至 **727.4 t/s (177.3 s)**、`128K+2.4K` 热追加达 **367.4 t/s**。
+7. **§177（`MYDS_INDEXER_KEY_FP4=1` 无损 `4.25-bit` `E2M1FN+UE8M0` 原生打包 Indexer `K` 缓存，严格 0-ULP）**：
+   - 利用 `dsv4_indexer_rope_quant` 本就将每 `32` 维 `K` 量化至 `E2M1FN × UE8M0` 的数学性质，消除 `256 B/row` `BF16` 展开冗余，直接以 **`68 B/row`**（`64 B` nibbles + `4 B` scales，**`index_cache` 体积立降 `−73.44%`**，`1M` 上下文 `640 → 170 MiB`）存储并经 32 位 IEEE-754 等差位运算寄存器内联还原（`4,096` 态穷举逐 bit 恒等，Apple8/9 零 VGPR 占用退化，全模型 10/10 档 SHA256 与 §175.3/§176.3 四重全同）：在 `macstudio` 上启动后系统可用内存净增 **`+1.72 GB`**，`256K` 全套后进程峰值 RSS 实降 **`−1,312 MiB`（`−1.28 GiB`）**，`kvdisk` 16 路 SSD 盘占实降 **`−2.05 GiB`**，且 `256K` 单步 Decode 再省 **`0.262 ms/tok`（`+1.08%`，两臂零重叠）**。
 
 > **2026-10-25 历史补充说明**：早期放宽 0-ULP 逐条实测的其他子项——专家进 `grid.z` **+0.82%**、专家权重截断 **+1.2%**、PLD 投机在无重复文本上 **−6.6%**——详见账本 §100/§101 及开关清单 [docs/ULP_SWITCHES.md](docs/ULP_SWITCHES.md)。
 
@@ -799,7 +801,7 @@ layout 按 replay recipe 从同一 GGUF 提取。QKV 的 stdout 含启动信息�
 ## 来源与致谢（Provenance）
 
 这个项目不是一个从零开始的实现。它**明确建立在若干 MIT 项目之上**，其中一部分是
-源码级移植。下表是完整清单，**任何一条都不是"仅供参考"**——除了最后一行。
+源码级移植。下表是完整清单，**任何一条都不是"仅供参考"**——除了最后两行。
 
 | 上游 | 许可 | 本仓库如何使用 | 声明位置 |
 |---|---|---|---|
@@ -809,6 +811,7 @@ layout 按 replay recipe 从同一 GGUF 提取。QKV 的 stdout 含启动信息�
 | **DeepSeek** | 模型许可 | V4/V4.1 架构与 GGUF 张量约定 | `LICENSE` |
 | **DeepInfer**（deepseek-ai） | **Apache-2.0** | **算法参考，非代码复制**。官方参考实现是 Python + tilelang（CUDA/Ascend），本仓库是 C + Metal，只借鉴了两个**算法设计**：① YoCo SWA Bounded Replay（`MYDS_YOCO_COMPACT` / `MYDS_YOCO_KEEP_TOKENS` 对应其 `yoco_mode` / `keep_tokens`）；② 结构化输出的 logit bitmask 过滤。算法本身不受版权保护，实现逐行为本仓库独立编写 | 各实现点注释 + 本表 |
 | **deepseek-recipe**（deepseek-ai） | **MIT** | **参数口径对齐，非代码复制**：`max_tokens` 的官方分档（非思考 8192 / 思考 65536 / effort=max 131072，各自再被上下文压低）按其 `src/request/mod.rs` 对齐。数值是事实，不受版权保护 | `src/myds_server.c` 注释 + 本表 |
+| **basetenlabs/deepseek-ultrafast** | **Elastic-2.0** | **仅公开数学性质观察参考，零代码复制**：启发了 §177（`MYDS_INDEXER_KEY_FP4`）消除 V4.1 Indexer `K` 在 `E2M1FN + UE8M0` 量化后冗余展开为 `BF16` 的思路；本仓库 C + Metal 的 `68 B/row` 打包几何、32 位 IEEE-754 等差解码式、14 条 GPU 打分核与 `kvdisk` 双哈希隔离均为 100% 独立推导编写 | 账本 §177 + 本表 |
 | vLLM / omlx / mlx | — | **仅思路参考**：一份优化规格文档综合了它们的做法，**没有代码复制**，因此不产生署名义务 | commit 描述 |
 
 ### 为什么 LICENSE 里没有单独的 "llama.cpp" 行

@@ -117,6 +117,13 @@ int myds_v41_gpu_indexscores_compact_decode_bf16(myds_v41_gpu_scratch_t *s,
     assert(stub_compact_prepared_count == n_comp);
     return record("indexscores_compact_decode_bf16");
 }
+int myds_v41_gpu_indexscores_compact_decode_mode(myds_v41_gpu_scratch_t *s,
+    const myds_metal_buffer_t *q, const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *cache, const myds_metal_buffer_t *mask,
+    uint32_t n_comp, uint32_t cache_mode, uint32_t first_row) {
+    assert(cache_mode == MYDS_INDEXER_CACHE_BF16 || cache_mode == MYDS_INDEXER_CACHE_FP4);
+    return myds_v41_gpu_indexscores_compact_decode_bf16(s, q, weights, cache, mask, n_comp, first_row);
+}
 int myds_v41_gpu_topk_compact_decode(myds_metal_buffer_t *ids,
     uint32_t n_comp, myds_v41_gpu_scratch_t *s) {
     assert(ids && s && n_comp > 16384u);
@@ -474,6 +481,14 @@ int myds_v41_gpu_pack_bf16(myds_metal_buffer_t *dst, size_t dst_elem_offset,
     return record(count == 128u ? "pack_index_cache" : "pack_compressed_kv");
 }
 
+int myds_v41_gpu_pack_indexer_key(myds_metal_buffer_t *dst, size_t dst_row,
+    const myds_metal_buffer_t *src, size_t src_row,
+    uint32_t n_rows, uint32_t cache_mode) {
+    (void)dst; (void)dst_row; (void)src; (void)src_row;
+    assert(n_rows == 1u && (cache_mode == MYDS_INDEXER_CACHE_BF16 || cache_mode == MYDS_INDEXER_CACHE_FP4));
+    return record("pack_index_cache");
+}
+
 int myds_v41_gpu_indexscores_head_slots(myds_metal_buffer_t *scores,
     const myds_metal_buffer_t *q, const myds_metal_buffer_t *weights,
     const myds_metal_buffer_t *cache, const myds_metal_buffer_t *mask,
@@ -483,6 +498,15 @@ int myds_v41_gpu_indexscores_head_slots(myds_metal_buffer_t *scores,
     return record("indexscores_head_slots");
 }
 
+int myds_v41_gpu_indexscores_head_slots_mode(myds_metal_buffer_t *scores,
+    const myds_metal_buffer_t *q, const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *cache, const myds_metal_buffer_t *mask,
+    uint32_t n_comp, uint32_t n_heads, uint32_t cache_mode, uint32_t first_row) {
+    assert(cache_mode == MYDS_INDEXER_CACHE_BF16 || cache_mode == MYDS_INDEXER_CACHE_FP4);
+    return myds_v41_gpu_indexscores_head_slots(scores, q, weights, cache, mask, n_comp, n_heads,
+        cache_mode != MYDS_INDEXER_CACHE_F32, first_row);
+}
+
 int myds_v41_gpu_indexscores_masked_bf16(myds_metal_buffer_t *scores,
     const myds_metal_buffer_t *q, const myds_metal_buffer_t *weights,
     const myds_metal_buffer_t *cache, const myds_metal_buffer_t *mask,
@@ -490,6 +514,14 @@ int myds_v41_gpu_indexscores_masked_bf16(myds_metal_buffer_t *scores,
     (void)first_row;
     (void)scores; (void)q; (void)weights; (void)cache; (void)mask; (void)n_comp; (void)n_heads;
     return record("indexscores_masked_bf16");
+}
+
+int myds_v41_gpu_indexscores_masked_mode(myds_metal_buffer_t *scores,
+    const myds_metal_buffer_t *q, const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *cache, const myds_metal_buffer_t *mask,
+    uint32_t n_comp, uint32_t n_heads, uint32_t cache_mode, uint32_t first_row) {
+    assert(cache_mode == MYDS_INDEXER_CACHE_BF16 || cache_mode == MYDS_INDEXER_CACHE_FP4);
+    return myds_v41_gpu_indexscores_masked_bf16(scores, q, weights, cache, mask, n_comp, n_heads, first_row);
 }
 
 int myds_v41_gpu_candidates(myds_metal_buffer_t *blocks, const myds_metal_buffer_t *scores,
@@ -966,7 +998,25 @@ int main(void) {
     unsetenv("MYDS_INDEXER_DECODE_COMPACT");
     kv_reuse = 0;
 
-    puts("PASS: attention HC overlap + indexer decode overlap + [D-L1] compact decode + KV reuse + FFN HC overlap host schedule, cohorts, strict env, exclusions, aliasing guards, counters, and failure recovery");
+    /* 11. [FP4] MYDS_INDEXER_CACHE_FP4 (68 B/row) passes decode_layer_buffers_valid on compact 68 B/row buffer. */
+    setenv("MYDS_INDEXER_DECODE_COMPACT", "1", 1);
+    kv_reuse = 1;
+    args.index_cache_mode = MYDS_INDEXER_CACHE_FP4;
+    args.index_cache->bytes = 32769u * 68u;
+    reset();
+    stub_compact_prepared_count = 0u;
+    assert(run_layer(20u, 32768u, true));
+    assert(run_layer(24u, 32768u, true));
+    assert_idx_counters(2, 2, 0);
+    args.index_cache->bytes = 32769u * 68u - 1u;
+    reset();
+    assert(!run_layer(20u, 32768u, true) && events == 0);
+    args.index_cache_mode = MYDS_INDEXER_CACHE_BF16;
+    args.index_cache->bytes = 128u << 20;
+    unsetenv("MYDS_INDEXER_DECODE_COMPACT");
+    kv_reuse = 0;
+
+    puts("PASS: attention HC overlap + indexer decode overlap + [D-L1] compact decode + [FP4] 68B/row + KV reuse + FFN HC overlap host schedule, cohorts, strict env, exclusions, aliasing guards, counters, and failure recovery");
     return 0;
 }
 
