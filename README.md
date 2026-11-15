@@ -790,6 +790,9 @@ layout 按 replay recipe 从同一 GGUF 提取。QKV 的 stdout 含启动信息�
 日志如何确认生效、哪个单测覆盖它、以及那个单测**不能**证明什么）：
 见 **[docs/ULP_SWITCHES.md](docs/ULP_SWITCHES.md)**。
 
+**LLM 基于硬件的自治演进闭环**（面向 `M2 Ultra 192GB`、`M3 Ultra 256/512GB`、`M5 Ultra 256/512GB` 五款 Mac Studio 的硅基显微镜 `evo_silicon_probe`、结构化演进记忆 `evo_memory`、原子化物理裁判机 `evo_judge` 与单机分时自举守护器 `evo_supervisor`）：
+见 **[docs/SILICON-EVOLUTION.md](docs/SILICON-EVOLUTION.md)**。
+
 
 ---
 

@@ -132,6 +132,7 @@ BENCH_KPROF = $(BIN_DIR)/bench_kprof
 BENCH_ENGRAM_ROWS = $(BIN_DIR)/bench_engram_rows
 BENCH_ENGRAM_IO = $(BIN_DIR)/bench_engram_io
 DUMP_TENSORS = $(BIN_DIR)/dump_tensors
+EVO_PSO_PROBE = $(BIN_DIR)/evo_pso_probe
 METALLIB = $(BIN_DIR)/myds.metallib
 METAL_SRCS = $(wildcard metal/*.metal)
 
@@ -278,6 +279,24 @@ doc-check:
 # §81 disappeared for a week without anyone noticing.
 adoption-check:
 	python3 -B tools/adoption_register_check.py --strict
+
+# Silicon Self-Evolution infrastructure (Microscope, Memory, Judge, Supervisor).
+.PHONY: evo-probe evo-memory-check evo-judge evo-check
+
+$(EVO_PSO_PROBE): tools/evo_pso_probe.m | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) $< $(LDFLAGS) -o $@
+
+evo-probe: $(EVO_PSO_PROBE) $(METALLIB)
+	python3 -B tools/evo_silicon_probe.py --metallib $(METALLIB) --probe-bin $(EVO_PSO_PROBE)
+
+evo-memory-check:
+	python3 -B tools/evo_memory.py --check
+
+evo-judge: $(EVO_PSO_PROBE) $(METALLIB)
+	python3 -B tools/evo_judge.py --mode offline
+
+evo-check: $(EVO_PSO_PROBE) $(METALLIB) evo-memory-check
+	python3 -B tests/test_evo_loop.py
 
 # Are the deployed artifacts actually built from this source tree?
 # bin/ is gitignored and the binary names no commit, so without this the link
@@ -965,6 +984,7 @@ test: check-knobs $(ALL_TESTS) $(METALLIB)
 	@python3 tests/test_startup_gates.py
 	@$(MAKE) --no-print-directory doc-check
 	@$(MAKE) --no-print-directory adoption-check
+	@$(MAKE) --no-print-directory evo-check
 	@python3 tests/test_stream_bench.py
 	@python3 tests/test_indexer_k_resident_builder.py
 	@python3 -B tests/test_indexer_register_only_host.py
