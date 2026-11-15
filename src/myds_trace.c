@@ -382,23 +382,26 @@ const char *myds_trace_page_html(void) {
 "*{box-sizing:border-box}"
 "body{margin:0;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;"
 "background:var(--bg);color:var(--fg)}"
-/* 单行：标题在左，性能指标在右。用 margin-left:auto 把指标块推到头，
+/* 单行：标题在左，性能指标在右。用 margin-inline-start:auto 把指标块推到头，
  * 而不是 justify-content:space-between —— 后者在指标为空时会把标题也推偏。 */
 "header{padding:8px 16px;border-bottom:1px solid var(--line);display:flex;gap:14px;"
-"align-items:center;flex-wrap:nowrap;overflow:hidden}"
-"h1{font-size:14px;margin:0;font-weight:600}"
+"align-items:safe center;flex-wrap:nowrap;overflow-x:clip}"
+"h1{font-size:14px;margin:0;font-weight:600;white-space:nowrap;flex:0 0 auto}"
 ".meta{color:var(--dim);font-size:12px}"
-"#sys{margin-left:auto;display:flex;gap:26px;align-items:center;font-size:12px;"
-"flex-wrap:nowrap;white-space:nowrap}"
+/* 四个 .m 直接挂在 #sysbox 下，所以 flex 必须设在 #sysbox 本身：
+ * 若只设在 #sys 上，#sysbox 默认为 inline span，四个 display:flex 的 .m
+ * 就会作为块级弹性盒竖着叠成 4 行，把顶栏撑高。 */
+"#sys{margin-inline-start:auto;display:flex;align-items:safe center;min-inline-size:0}"
+"#sysbox{display:flex;gap:20px;align-items:safe center;font-size:12px;"
+"flex-wrap:nowrap;white-space:nowrap;min-inline-size:0;font-variant-numeric:tabular-nums}"
 /* 单行显示，指标右对齐。这些值随窗口宽度自适应（条可收缩），
  * 但绝不换行 —— 换行会把标题栏撑成多行。 */
-".m{display:flex;align-items:center;gap:8px;color:var(--dim);font-size:12px;"
-"white-space:nowrap;flex:0 1 auto;min-width:0}"
+".m{display:flex;align-items:safe center;gap:8px;color:var(--dim);font-size:12px;"
+"white-space:nowrap;flex:0 1 auto;min-inline-size:0}"
 ".m b{color:var(--fg);font-weight:600}"
-/* 条宽 110px，允许收缩到 40px：窗口变窄时先压条，绝不换行 ——
- * 换行会把标题栏撑成三行，那才是真的难看。 */
-"#sys .bar{width:110px;min-width:40px;height:6px;background:#252a33;"
-"border-radius:3px;overflow:hidden;flex:0 1 auto}"
+/* 条基准宽 88px，允许收缩到 36px：窗口变窄时先压条，绝不换行。 */
+"#sys .bar{flex:0 1 88px;min-inline-size:36px;block-size:6px;background:#252a33;"
+"border-radius:3px;overflow:clip}"
 ".bar i{display:block;height:100%;background:var(--acc)}"
 "#wrap{display:flex;height:calc(100vh - 41px)}"
 /* 最大化：把另一侧收成 0 宽，这一侧吃掉全部宽度。
@@ -456,7 +459,7 @@ const char *myds_trace_page_html(void) {
 "background:#000;padding:2px 5px;border-radius:3px;white-space:nowrap;font-size:11px}"
 "</style></head><body>"
 "<header><h1>myds trace</h1>"
-"<span id=\"sys\"><span id=\"sysbox\" class=\"m\">采样中…</span></span></header>"
+"<span id=\"sys\"><span id=\"sysbox\"><span class=\"m\">采样中…</span></span></span></header>"
 "<div id=\"wrap\"><div id=\"list\">"
 "<div style=\"padding:6px 12px 0\">"
 "<button class=\"pmax\" id=\"maxL\" title=\"最大化左侧\">⛶ 左侧</button>"
@@ -681,7 +684,7 @@ const char *myds_trace_page_html(void) {
 "+`<b>${s.mem_used_gb.toFixed(0)}/${s.mem_total_gb.toFixed(0)}G ${pct.toFixed(0)}%</b></span>`;}"
 "else h+=meter('内存',null,'');"
 "h+=`<span class=\"m\">RSS <b>${s.self_rss_gb===null?'—':s.self_rss_gb.toFixed(0)+'G'}</b></span>`;"
-"document.getElementById('sysbox').outerHTML=`<span id=\"sysbox\">${h}</span>`;"
+"document.getElementById('sysbox').innerHTML=h;"
 "}catch(e){}}"
 "const ml=document.getElementById('maxL');"
 "if(ml)ml.onclick=()=>document.getElementById('wrap').classList.toggle('max-left');"

@@ -481,6 +481,20 @@ static void test_page_is_html(void) {
     CHECK(strstr(html, "MYDS_PROFILE_PREFILL") != NULL);
 }
 
+/* 顶栏右侧 4 项资源指标（CPU / GPU / 内存 / RSS）必须横排为 1 行。
+ *
+ * 背景（真实故障）：4 个 `.m`（`display:flex`，块级弹性盒）直接挂在 `#sysbox` 下，
+ * 而 `display:flex` 原本只写在父级 `#sys` 上，`#sysbox` 默认为 inline `<span>`，
+ * 导致 4 个 `.m` 竖向叠成 4 行把顶栏撑高。锁住 `#sysbox` 自身带单行 flex 与 innerHTML 更新。 */
+static void test_sysbox_metrics_single_row_flex(void) {
+    const char *html = myds_trace_page_html();
+    CHECK(html != NULL);
+    if (!html) return;
+    CHECK(strstr(html, "#sysbox{display:flex;") != NULL);
+    CHECK(strstr(html, "flex-wrap:nowrap") != NULL);
+    CHECK(strstr(html, "getElementById('sysbox').innerHTML=h;") != NULL);
+}
+
 /* 缓存高命中轮次的 prefill 速率口径。
  *
  * 背景（真实误读）：5962 tok 的请求命中 5951 tok 前缀缓存时，只增量跑 11 tok，
@@ -648,6 +662,7 @@ int main(void) {
     test_page_script_refs_exist();
     test_token_is_injected_into_page();
     test_page_is_html();
+    test_sysbox_metrics_single_row_flex();
     test_cached_prefill_incremental_display();
     myds_trace_reset();
 
