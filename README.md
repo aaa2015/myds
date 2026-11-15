@@ -7,7 +7,7 @@
 
 **当前 native engine 已完整实现 DeepSeek V4.1 文本与视觉计算图（HC、Engram、压缩 KV、indexer、Vision Encoder），并通过与 ds4 oracle 的逐位验收。**
 
-验收依据与门禁规则记在[性能账本](docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md)的「方法论教训」与「已证否清单」两节；**性能现状、已采纳优化登记表（`§0.3`）与最新生产突破（`§143–§150`、`§172–§175`）以该账本为唯一权威记录**（`§0.0` 保留 2026-10-24 全链路普查快照，顶部摘要与 `§172–§175` 记录当前在产基线）。单元测试通过不等于真实模型逐位对齐，改动数值路径仍须过同等门禁。
+验收依据与门禁规则记在[性能账本](docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md)的「方法论教训」与「已证否清单」两节；**性能现状、已采纳优化登记表（`§0.3`）与最新生产突破（`§143–§150`、`§172–§176`）以该账本为唯一权威记录**（`§0.0` 保留 2026-10-24 全链路普查快照，顶部摘要与 `§172–§176` 记录当前在产基线）。单元测试通过不等于真实模型逐位对齐，改动数值路径仍须过同等门禁。
 
 **2026-10-28 分词优化（§107）**：ASCII 分类查表与请求内 BPE 临时内存复用已实现。
 macstudio 实测英文/代码/多语言混合输入的 **CPU 分词耗时降低约 33–54%**，
@@ -33,7 +33,7 @@ make adoption-check        # 校验账本 §0.3「在产」开关均存在于 in
 
 ![myds architecture](docs/architecture.svg)
 
-一张图看完 40 层 V4.1 计算图里每个子层的职责、实测效率与 **§146–§175** 关键微架构突破（Engram 后台异步预读、Flash-Attention `q8` 寄存器驻留 `O` 解锁 `2 TGs/core`、Indexer `8M` `IRO` + `4 KB` smem `Q` + YoCo `≤16K` 紧凑打分/Top-512，以及 Decode `Top-3` 路由裁剪与 `O(16K)` 紧凑索引将单步耗时压至 **`~20.2 ms/tok`**）。**图中全部数字均对齐[性能账本](docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md) `§0.3` / `§172–§175` 唯一权威基线。**
+一张图看完 40 层 V4.1 计算图里每个子层的职责、实测效率与 **§146–§176** 关键微架构突破（Engram 后台异步预读、Flash-Attention `q8` 寄存器驻留 `O` 解锁 `2 TGs/core`、Indexer `8M` `IRO` + `4 KB` smem `Q` + `L2/8/14` 两趟 Radix Top-512 + `L20` 自紧凑收集 + YoCo `≤16K` 紧凑打分/Top-512，以及 Decode `Top-3` 路由裁剪与 `O(16K)` 紧凑索引将单步耗时压至 **`~20.2 ms/tok`**）。**图中全部数字均对齐[性能账本](docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md) `§0.3` / `§172–§176` 唯一权威基线。**
 
 ---
 
@@ -41,28 +41,28 @@ make adoption-check        # 校验账本 §0.3「在产」开关均存在于 in
 
 - **硬件**：Mac Studio，Apple M2 Ultra（76 核 GPU，**96 MB SLC**），**192 GB 统一内存**（Apple 标称 192 GiB = 十进制 206 GB，Metal 可用上限 201.9 GB），统一内存理论带宽 800 GB/s（实测峰值 724–799 GB/s）。
 - **系统**：**macOS 27.0.1 (26A434)**（早期 2026-10-05 复现包测于 macOS 26.5.2）。
-- **模型**：`DeepSeek-V4.1-Flash-1017-Q2-dense-q4-imx-cliecy.gguf`（文件 362.14 GB，其中 56% 为稀疏 `pread` 的 Engram 表；常驻 wired ~148.4 GB）。
-- **测量口径（§173–§175 现行生产基线）**：通过 `tools/with_prod_guard.sh` 停产**独占整机**、`temperature=0`、`max_tokens=256`、无并发；保持生产配置（`MYDS_PREFIX_CACHE=1`、`MYDS_PLD=1`、`MYDS_PREFILL_ATTN=auto`、`MYDS_ATTN_HEADS_MODE=q8`、`MYDS_INDEXER_BATCH_FLOATS=8388608`、`MYDS_INDEXER_RO_SMEM_Q=1`、`MYDS_INDEXER_DECODE_COMPACT=1`、`MYDS_INDEXER_PREFILL_COMPACT=1`、`MYDS_MOE_DECODE_TOPK=3`、`MYDS_ENGRAM_IO_THREADS=16`）。冷启动使用台账真实语料（`benchmarks/register_only_2026-10-27/prompts/p32k_ab__v0.txt` 等同源拼接语料）并加唯一 nonce 前缀保证 `cached_tok = 0`（测量纪律见 [`docs/MEASUREMENT-DISCIPLINE.md`](docs/MEASUREMENT-DISCIPLINE.md)）。
+- **模型**：`DeepSeek-V4.1-Flash-1017-Q2-dense-q4-imx-cliecy.gguf`（文件 362.14 GB / 337.2 GiB，其中 56% 即 202.76 GB / 188.8 GiB 为两张稀疏 `pread` 的 `I8` Engram 表，路由专家为 `IQ2_XXS` `gate/up` + `Q2_K` `down`，稠密投影含 `Q4_K` imatrix；常驻 wired ~148.4 GB）。
+- **测量口径（§173–§176 现行生产基线）**：通过 `tools/with_prod_guard.sh` 停产**独占整机**、`temperature=0`、`max_tokens=256`、无并发；保持生产配置（`MYDS_PREFIX_CACHE=1`、`MYDS_PLD=1`、`MYDS_PREFILL_ATTN=auto`、`MYDS_ATTN_HEADS_MODE=q8`、`MYDS_INDEXER_BATCH_FLOATS=8388608`、`MYDS_INDEXER_RO_SMEM_Q=1`、`MYDS_INDEXER_DECODE_COMPACT=1`、`MYDS_INDEXER_PREFILL_COMPACT=1`、`MYDS_INDEXER_TOPK_RADIX_CAUSAL=1`、`MYDS_MOE_DECODE_TOPK=3`、`MYDS_ENGRAM_IO_THREADS=16`）。冷启动使用台账真实语料（`benchmarks/register_only_2026-10-27/prompts/p32k_ab__v0.txt` 等同源拼接语料）并加唯一 nonce 前缀保证 `cached_tok = 0`（测量纪律见 [`docs/MEASUREMENT-DISCIPLINE.md`](docs/MEASUREMENT-DISCIPLINE.md)）。
 
-### Prefill（§174 / §175 在产基线，2026-11-14）
+### Prefill（§174–§176 在产基线，2026-11-15）
 
 #### 1. 冷启动 Prefill（`cached_tok = 0`，`temp=0, max_tokens=256`）
 
 | 场景（真实语料） | 输入 Tokens | **吞吐（t/s）** | **TTFT / 耗时** | 对照说明 |
 |---|---:|---:|---:|---|
-| **32K 冷建**（3 样本中位） | 32,234 | **733.5**（§175 单测 733.7） | **43.9 s** | 较 10 月基线 `641.3 t/s (49.9 s)` 省 **6.0 s (+14.4%)** |
+| **32K 冷建**（3 样本中位 / §176 单测） | 32,234 | **733.5–734.0** | **43.9 s** | 较 10 月基线 `641.3 t/s (49.9 s)` 省 **6.0 s (+14.4%)** |
 | **64K 冷建** | 64,483 | **737.9** | **87.4 s** | 矩阵注意力 `q8` 双驻留 + `8M` `IRO` 峰值区 |
-| **128K 冷建** | 128,932 | **695.7–714.3** | **180.5–185.3 s** | 较 §172 末 `549.9 t/s (234.4 s)` 累计省 **49–54 s (+26.5%–29.9%)** |
+| **128K 冷建** | 128,932 | **727.4**（§175 为 714.3） | **177.3 s** | §176 `[P-T1]` 再省 **3.24 s (+1.83%)**；较 §172 末 `549.9 t/s (234.4 s)` 累计省 **57.1 s (+32.3%)** |
 
-#### 2. 多轮对话热追加与超长续填（`MYDS_PREFIX_CACHE=1`，§174 + §175 `[P-L1]`）
+#### 2. 多轮对话热追加与超长续填（`MYDS_PREFIX_CACHE=1`，§174 + §175 `[P-L1]` + §176 `[P-T1]`）
 
 | 场景 | 命中前缀 `cached` | 新增 `prefill_tok` | **吞吐（t/s）** | **耗时** | 收益归因 |
 |---|---:|---:|---:|---:|---|
-| **`128K + 2.4K` 多轮热追加**（3 样本中位） | 128,512 | 2,440–2,444 | **354.5** | **6.89 s** | §175 `[P-L1]` 较 §174 再提 **+9.49%**（省 0.66 s）；较 §172 末 `214.7 t/s (11.27 s)` 累计 **+65.1%** |
-| **`128K → 256K` 超长续填** | 128,512 | 129,307 | **610.1–618.3** | **209.1–212.0 s** | 较 §173 `552.6 t/s (234.0 s)` 省 **22.0–24.8 s (+10.4%–11.9%)** |
-| **`256K + 312` 超长热追加 prime**（3 样本中位） | 257,536 | 304–312 | **173.0** | **1.79 s** | §175 `[P-L1]` 较 §174 `149.3 t/s (2.08 s)` 再提 **+16.18%**（省 0.29 s） |
+| **`128K + 2.4K` 多轮热追加**（3 样本中位） | 128,512 | 2,440–2,444 | **367.4** | **6.65 s** | §176 `[P-T1]` 较 §175 `354.5 t/s` 再提 **+3.62%**（省 0.24 s）；较 §172 末 `214.7 t/s (11.27 s)` 累计 **+71.1%** |
+| **`128K → 256K` 超长续填** | 128,512 | 129,307 | **655.3** | **197.3 s** | §176 `[P-T1]` 较 §175 `618.3 t/s` 净省 **11.83 s (+6.00%)**；较 §173 `552.6 t/s (234.0 s)` 累计省 **36.7 s (+18.6%)** |
+| **`256K + 304..312` 超长热追加 prime**（3 样本中位） | 257,536 | 304–312 | **179.5** | **1.73 s** | §176 `[P-T1]` 较 §175 `173.0 t/s` 再提 **+3.72%**（较 §174 `149.3 t/s (2.08 s)` 累计 **+20.2%**） |
 
-> **历史超长上下文容量参考（2026-10-24 / §102，旧 `vec + TILED` 口径，未重跑 §173–§175 新核）**：
+> **历史超长上下文容量参考（2026-10-24 / §102，旧 `vec + TILED` 口径，未重跑 §173–§176 新核）**：
 > `200K` `489.5 t/s` (`408.5 s`) · `400K` `371.7 t/s` (`1076.1 s`) · `500K` `331.7 t/s` (`1507.1 s`，峰值 wired `178 GB`) · `600K` `243.4 t/s` (`2465.9 s`，`moe_chunks=8`，峰值 wired `184.9 GB`，正常完结)。当前生产 `MYDS_CTX_SIZE=1048576`、`MYDS_CHUNK_KEY_MAX=1048576`。
 
 ### Decode（`256 tok`，`MYDS_MOE_DECODE_TOPK=3` + `MYDS_INDEXER_DECODE_COMPACT=1`）
@@ -74,7 +74,7 @@ make adoption-check        # 校验账本 §0.3「在产」开关均存在于 in
 
 跨 **4,600 倍上下文**（`56 tok → 257.8K`）Decode 仅衰减约 **14.6%**：§174 `[D-L1]` 将 `L24/28/32/36` 单步索引扫描从 `O(Context)` 封顶在 `O(16,384)`，长上下文代价被严格约束在 Prefill。（若设 `MYDS_MOE_DECODE_TOPK=0` 回退满血 `Top-6` 严格 0-ULP，短稳态为 `~42.9–44.0 t/s`。）
 
-### 物理边界与 2026-11 架构突围复盘（§143–§175）
+### 物理边界与 2026-11 架构突围复盘（§143–§176）
 
 2026-10-24 的效率普查曾确认三条底层硬件事实（以 16.8K prompt 为样本）：
 
@@ -84,7 +84,7 @@ make adoption-check        # 校验账本 §0.3「在产」开关均存在于 in
 | CPU 计算能替 GPU 分担吗？ | CPU 算 MoE 慢 GPU **31.2 倍** | 把矩阵/MoE 算力卸载到 CPU 无效（但**消除 CPU 同步 I/O 阻塞 GPU** 有效，见下 ①） |
 | 常规 GEMM 受 DRAM 带宽限制吗？ | Prefill 主体 DRAM **14 GB/s**，重度依赖 **96 MB SLC** | 稠密投影已在 57–76% FP16 峰值；真正可挖的是**低占用率内核、冗余全局读写与超长上下文 `O(N²)` 无效扫描** |
 
-2026 年 10 月底曾据此得出「flash-attention 被 `32 KB` threadgroup memory 锁死、prefill 与 decode 均无两位数收益方向」的阶段性结论。**2026 年 11 月（§143–§175）在同一台 M2 Ultra、同一份 GGUF 权重上正面推翻了这一旧判断**，核心突破来自五步：
+2026 年 10 月底曾据此得出「flash-attention 被 `32 KB` threadgroup memory 锁死、prefill 与 decode 均无两位数收益方向」的阶段性结论。**2026 年 11 月（§143–§176）在同一台 M2 Ultra、同一份 GGUF 权重上正面推翻了这一旧判断**，核心突破来自六步：
 
 1. **§143–§150（Engram I/O 并发隐藏 + §149 内核身份纠偏）**：
    - `MYDS_ENGRAM_IO_THREADS=16`（decode `+1.4%`）配合 `MYDS_ENGRAM_PREFILL_ASYNC=1` 将 macroblock 入口原本同步阻塞 GPU `2.7 s` 的 SSD `pread`/解码移入后台线程（32K prefill `618.9 → 679.4 t/s`，**+9.8%**，严格 0-ULP）。
@@ -99,6 +99,8 @@ make adoption-check        # 校验账本 §0.3「在产」开关均存在于 in
    - **`[D-L1]` `MYDS_INDEXER_DECODE_COMPACT=1`**：单步 Decode 后四层 `L24/28/32/36` 复用 `L20` 升序去重后的 `≤16,384` 候选集，将超长上下文索引耗时从 `O(Context)` 封顶为 `O(16K)`（`256K` Decode **+3.8%**）。
 5. **§175（`[P-L1]` `MYDS_INDEXER_PREFILL_COMPACT=1` 长文 Prefill YoCo 紧凑管线，严格 0-ULP）**：
    - 针对长文 Prefill `L24/28/32/36`（`nc > 16384, pos0 ≥ 16384`），用无原子 SIMD 前缀和提取 8 行查询 tile 并集块表（`128K` 仅占全表 `12.6%`、`256K` 仅占 `6.4%–7.3%`），经 `4 KB` smem 紧凑 `register_only` 打分与批量 `≤16,384` 紧凑 Top-512（含同分/`<512` 分区双调重放），将单次子批扩至 `512` 行驻留 `96 MB SLC`（全局 scratch 仅净增 `+64 KiB`），使多轮热追加 `128K+2K` 再提 **+9.49%**、`256K+312` 再提 **+16.18%**。
+6. **§176（`[P-T1]` `MYDS_INDEXER_TOPK_RADIX_CAUSAL=1` 根层两趟 Radix/直方图 Top-K + `L20` 自紧凑打分收集，严格 0-ULP）**：
+   - 攻克 §175 后残留在 `L2/8/14`（不受 `MYDS_SUFFIX_SHRINK` 裁剪，全序列 `100%` 行执行）与 `L20` 的全表双调排序 + 多趟全局归并击穿 `96 MB SLC` 瓶颈：以 `4,096 B` 静态 smem（保 `8 TGs/core`）的批量因果两趟 256-bin IEEE-754 有序键直方图筛选 + `1024` 分区双调同分重放（含 ReLU `0.0f` 256K 路同分最低分区 `O(1)` 早停定理）替代全表排序（M2 Ultra 单算子提速 **`4.83×–6.76×`**），并在 `L20`（`nc > 16,384`）以 Radix Top-2048 选块后直接收集 `16,384` 个存活槽位做单趟紧凑 Top-512（消除第二次全表排序），使 `128K→256K` 续填再省 **11.83 s (+6.00%，达 655.3 t/s)**、`128K` 冷建推至 **727.4 t/s (177.3 s)**、`128K+2.4K` 热追加达 **367.4 t/s**。
 
 > **2026-10-25 历史补充说明**：早期放宽 0-ULP 逐条实测的其他子项——专家进 `grid.z` **+0.82%**、专家权重截断 **+1.2%**、PLD 投机在无重复文本上 **−6.6%**——详见账本 §100/§101 及开关清单 [docs/ULP_SWITCHES.md](docs/ULP_SWITCHES.md)。
 
@@ -170,7 +172,7 @@ make adoption-check        # 校验账本 §0.3「在产」开关均存在于 in
 | TP=2 双机 | 需采购设备 |
 | 抬线程数超 448 | 实测无变化（早期数字来自同时改 nsg 常量，口径错误） |
 
-### 关键已采纳里程碑汇总（§85–§175）
+### 关键已采纳里程碑汇总（§85–§176）
 
 完整采纳与退役状态由账本 `§0.3` 维护，并由 `make adoption-check` 自动校验：
 
@@ -184,6 +186,7 @@ make adoption-check        # 校验账本 §0.3「在产」开关均存在于 in
 | **§173**（`7550c36`） | `A-1` `register_only` 放开 `ratio∈{1,2}` 至 `1M` + `B-1` `MYDS_PREFILL_ATTN=auto` | 32K **+5.4%**、64K **+9.8%**、128K **+22.2%（省 42.6 s）**、`128K+2K` **+37.4%** | `A-1` 严格 0-ULP；`B-1` FP32 矩阵归约 |
 | **§174**（`2636f6f`） | `[P-A1]` `heads_reg_o` `q8`（`12,320 B`，**2 TGs/core**）+ `[P-I1]` `8M` 二次均摊 + `[P-I2s]` `4 KB` smem `Q` + `[D-L1]` `O(16K)` 紧凑解码 | 较 §173：32K **+2.8%**（733.5 t/s）、64K **737.9 t/s**、128K **+8.9%（再省 16.4 s）**、`128K→256K` **+10.4%**、256K decode **+3.8%** | 对 §173 严格 0-ULP（9/9 档 SHA256 全同） |
 | **§175**（`194829e`） | `[P-L1]` `MYDS_INDEXER_PREFILL_COMPACT=1`（`L24..36` 8 行 tile 并集紧凑打分 + `≤16K` 紧凑 Top-512，子批 512 行） | 较 §174：`128K+2K` 热追加 **+9.49%**（354.5 t/s，省 0.66 s）、`256K+312` **+16.18%**（173.0 t/s，省 0.29 s） | 严格 0-ULP（10/10 档 SHA256 全同） |
+| **§176**（`5918690`） | `[P-T1]` `MYDS_INDEXER_TOPK_RADIX_CAUSAL=1`（`L2/8/14` 批量因果两趟 Radix Top-512 + `L20` `top_blocks=2048` 自紧凑打分收集） | 较 §175：`128K→256K` **+6.00%**（655.3 t/s，净省 11.83 s）、`128K+2K` **+3.62%**（367.4 t/s）、`256K+304` **+3.72%**（179.5 t/s）、`128K` 冷建 **727.4 t/s**（净省 3.24 s） | 严格 0-ULP（10/10 档 SHA256 全同） |
 
 ---
 
@@ -243,7 +246,7 @@ myds/
 │   ├── dense.metal                   # 量化 GEMV/GEMM (Q8_0, Q4_K, Q2_K, F16, F32)
 │   ├── dsv4_hc.metal                 # HC 多路残差（split / sinkhorn / 加权和 / RMSNorm）
 │   ├── dsv4_kv.metal / dsv4_rope.metal # DeepSeek KV Cache 状态操作与解耦 RoPE
-│   ├── dsv4_misc.metal               # V4.1 辅助算子、TILED 打分、[D-L1] Decode 紧凑打分/Top-512、[P-L1] Prefill 8 行并集紧凑打分/Top-512
+│   ├── dsv4_misc.metal               # V4.1 辅助算子、TILED 打分、[D-L1]/[P-L1] 紧凑打分/Top-512、[P-T1] 两趟 Radix Top-K 与 L20 自紧凑收集
 │   ├── dsv41.metal                   # V4.1 专有算子（indexer / compressor / attention-out）
 │   ├── flash_attn.metal              # Flash Attention 主核（[P-A1] heads_reg_o q8/q16 寄存器累加、vec_head_first、ext_blk、packed8）
 │   ├── glu.metal / norm.metal / softmax.metal / topk_threshold.metal
@@ -257,7 +260,7 @@ myds/
 │   └── probe_*.metal / pureread.metal # 带宽、反量化与候选算子微基准探针（7 个）
 ├── include/                          # 头文件定义（共 36 个 .h）
 │   ├── myds.h / myds_internal.h      # 推理引擎主接口与内部共享结构
-│   ├── myds_knobs.h / myds_knobs_generated.h # 运行时开关注册表与自动生成清单（273 个键 + 指纹校验）
+│   ├── myds_knobs.h / myds_knobs_generated.h # 运行时开关注册表与自动生成清单（274 个键 + 指纹校验）
 │   ├── myds_configfile.h             # myds.conf 配置文件早期解析器
 │   ├── myds_debugstate.h / myds_trace.h / myds_sysstat.h # /debug/state、/trace 诊断状态与系统指标采集
 │   ├── myds_metal.h                  # Metal GPU 运行时与算子声明
@@ -286,10 +289,10 @@ myds/
 │   └── myds_cpu.c / myds_moe_cpu.c / myds_log.c # CPU 算子与微秒级结构化日志
 ├── tools/                            # 部署、制品溯源、台账审计与基准复现脚本（deploy_artifact.sh、with_prod_guard.sh 等）
 ├── docs/                             # 性能总账本、测量纪律、0-ULP 开关清单与视觉设计文档
-└── tests/                            # 单元/GPU 0-ULP/宿主门禁与回归测试（共 172 个文件：86 .c + 34 .m + 49 .py + 2 .sh + 1 .h，另含 images/）
+└── tests/                            # 单元/GPU 0-ULP/宿主门禁与回归测试（共 173 个文件：86 .c + 35 .m + 49 .py + 2 .sh + 1 .h，另含 images/）
     ├── test_gguf.c  test_tokenizer.c  test_tokenizer_workspace.c  test_engine.c  test_cpu.c  test_log.c
     ├── test_metal.c  test_v41_gpu.c  test_attention_vec.c  test_attention_policy.c  test_attention_heads_rego.m
-    ├── test_indexer_decode_compact.c  test_indexer_prefill_compact.m  test_attn_indexer_overlap_host.c
+    ├── test_indexer_decode_compact.c  test_indexer_prefill_compact.m  test_indexer_topk_radix_pt1.m  test_attn_indexer_overlap_host.c
     ├── test_indexer_register_only_runtime_host.c  test_indexer_register_only_publisher_host.c  test_indexer_register_only_host.py
     ├── test_qkv_fusion.c  test_decode_q8_contract.c  test_v41_router.c  test_moe_down_nsg.m  test_moe_shared3.c
     ├── test_engram.c  test_engram_pool_failures.c  test_kvdsk.c  test_anchor_slots.c  test_deeper_ssd.c
@@ -302,7 +305,7 @@ myds/
 
 ## 编译与测试
 
-早期优化轮次验收摘要与后续全部候选记录（含 §85 `TILED`、§105 `register_only`、§146/§148 Engram、§172 `MOE_DECODE_TOPK=3`、§173–§175 矩阵注意力与紧凑 Indexer）均统一维护在[性能账本](docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md)的 `§0.3`（已采纳）与 `§0.4`（已证否）两节——**该账本是性能结论的唯一权威。**
+早期优化轮次验收摘要与后续全部候选记录（含 §85 `TILED`、§105 `register_only`、§146/§148 Engram、§172 `MOE_DECODE_TOPK=3`、§173–§176 矩阵注意力、紧凑 Indexer 与两趟 Radix Top-K）均统一维护在[性能账本](docs/2026-10-20-prefill-decode-pipeline-and-optimization-ledger.md)的 `§0.3`（已采纳）与 `§0.4`（已证否）两节——**该账本是性能结论的唯一权威。**
 
 测试关闭 profiler，冷启动对照确保 `cached_tok = 0`（保持生产 `MYDS_PREFIX_CACHE=1` 并使用唯一 nonce 前缀），每组预热后正式采样取中位。
 基准固定 `temperature=0`、`top_p=1`、`top_k=0`、`min_p=0`、`repetition_penalty=1`、`seed=42`；greedy argmax 路径不读取采样随机数。
@@ -334,11 +337,12 @@ make test-tokenizer                    # 分词器正确性与工作区复用回
 2. **DeepSeek BPE 分词器测试套件 (`bin/test_tokenizer`、`bin/test_tokenizer_workspace`)**：
    - [x] 词表加载、BOS/EOS 识别、ASCII 快路径 Byte BPE、JoyAI 预分词、`<0xHH>` 回退与工作区复用
 
-3. **Metal GPU 核心算子与 V4.1 严格 0-ULP 套件 (`bin/test_metal`、`bin/test_v41_gpu`、`bin/test_attention_heads_rego`、`bin/test_indexer_decode_compact`、`bin/test_indexer_prefill_compact`)**：
+3. **Metal GPU 核心算子与 V4.1 严格 0-ULP 套件 (`bin/test_metal`、`bin/test_v41_gpu`、`bin/test_attention_heads_rego`、`bin/test_indexer_decode_compact`、`bin/test_indexer_prefill_compact`、`bin/test_indexer_topk_radix_pt1`)**：
    - [x] RMSNorm / SwiGLU / Decoupled RoPE / MoE Router & Sum / Q8 & Q4 GEMV 精度与边界校验
    - [x] `[P-A1]` `heads_reg_o`（`q8` / `q16` vs `smem`）PSO 零寄存器溢出与多长度/掩码逐位 `0-ULP`
    - [x] `[P-I2s]` `register_only` `4 KB` XOR-swizzled smem `Q` vs `0 B` / `TILED` 逐位 `0-ULP`
    - [x] `[D-L1]` 单步 Decode 与 `[P-L1]` 批量 Prefill `≤16,384` 紧凑打分 + 紧凑 Top-512（含分区内/边界同分与 `<512` 稀疏尾双调重放）逐位 `0-ULP`
+   - [x] `[P-T1]` `L2/8/14` 批量因果两趟 256-bin Radix Top-K（含 `-0/+0`、次正规数、`256K` 路 ReLU `0.0f` 同分早停、可见 `NaN`）与 `L20` `top_blocks=2048` 自紧凑打分收集逐位 `0-ULP`
 
 4. **HTTP 服务端、协议栈与诊断鉴权测试套件 (`bin/test_server`、`bin/test_server_api`、`bin/test_debug_state`、`bin/test_debug_acl`、`bin/test_trace`、`bin/test_dsml`)**：
    - [x] `/responses`、`/chat/completions`、`/health`、`/v1/models` 流式 SSE 与非流式 JSON 协议对齐
@@ -515,6 +519,7 @@ compressed KV 与 index cache 保存已完成 BF16 舍入的上 16 位，读取�
 | `MYDS_INDEXER_RO_SMEM_Q` | **`1`（启用）** | **`1`** | §174 `[P-I2s]`：`1` 启用 `4,096 B` XOR-swizzled smem `Q` 复用（省 16× 全局 `Q` 重读，保 `8 TGs/core` 满驻留）；`0` 切回 `0 B` smem 内核；严格 0-ULP。 |
 | `MYDS_INDEXER_DECODE_COMPACT` | **`1`（启用）** | **`1`** | §174 `[D-L1]`：单步 Decode 在 `n_comp > 16384` 时将 `L20` 选出的块升序去重，使后四层 `L24/28/32/36` 仅对 `≤16,384` 候选键紧凑打分与紧凑 Top-512（`O(Context)→O(16K)`，兼容 `MYDS_INDEXER_DECODE_OVERLAP=1`，严格 0-ULP）。`0` 关闭；计数见 `myds_v41_gpu_indexer_decode_compact_counters()`。 |
 | `MYDS_INDEXER_PREFILL_COMPACT` | **`1`（启用）** | 未设（沿用 `1`） | §175 `[P-L1]`：长文 Prefill 在 `il > 20`（`L24/28/32/36`）、`ratio=1`、`n_comp > 16384`、`pos0 ≥ 16384`、`n_tokens ≥ 8` 时，构建无原子 8 行查询 tile 并集紧凑块表并执行 `4 KB` smem 紧凑 `register_only` 打分 + 批量 `≤16,384` 紧凑 Top-512（子批扩至 `512` 行，严格 0-ULP）。`0` 回退稠密打分 + 位图过滤 + 稠密 `topk_causal`；计数见 `/debug/state` `counters.indexer_prefill_compact`。 |
+| `MYDS_INDEXER_TOPK_RADIX_CAUSAL` | **`0`（关闭）** | **`1`** | §176 `[P-T1]`：长文 Prefill 在 `L2/8/14`（`ratio=2, top=512, n_cols ≥ 16384`）以 `4 KB` smem 批量因果两趟 256-bin Radix/直方图阈值筛选 + `1024` 分区双调同分重放替代全表双调归并，并在 `L20`（`nc > 16384, top_blocks=2048`）以 Radix 选块后直接收集 `16,384` 个存活槽位做单趟紧凑 Top-512（严格 0-ULP，仅增 `+72 KiB` 元数据；非法值 fail-closed 报错拒绝）。计数见 `/debug/state` `counters.indexer_topk_radix_causal`。 |
 | `MYDS_INDEXER_TILED` | **`0`（关闭）** | **`1`** | §85 分块评分器（256 对/TG，严格 0-ULP）：当请求落在 `register_only` 门禁外（如 `n_comp ≤ 512` 或 `<8` 行）且 `n_tokens ≥ 8` 时作为 chunk 评分路径。 |
 | `MYDS_MOE_DECODE_TOPK` | **`0`（满血 `Top-6`）** | **`3`** | §172 单步 Decode（`n_tokens == 1`）MoE 路由专家激活数裁剪与概率重归一化（Prefill 始终保完整 `Top-6` 0-ULP）。支持 `0`、`1..6`、40 位数字串或 `[def_k,]L1-L2:k` 语法；非法值报错拒绝。 |
 | `MYDS_ENGRAM_IO_THREADS` | **`8`** | **`16`** | Engram 表 SSD `pread` 并发度：`1` 为串行，`2..16` 为每 context 独立常驻线程池，`auto` 为自适应控制器（§146 生产设 `16`，decode `+1.4%`）。 |
@@ -536,7 +541,7 @@ compressed KV 与 index cache 保存已完成 BF16 舍入的上 16 位，读取�
 | `MYDS_MOE_IQ2_TAIL_CULL` | 启用（`1`） | 未设（沿用 `1`） | Prefill MoE IQ2 up/gate 尾 tile 跳过无有效 token 的半 tile；设为 `0` 恢复原 kernel。 |
 | `MYDS_SSE_DRAIN_TIMEOUT_MS` | `1000` | 未设（沿用 `1000`） | SSE 完成时的整体排空期限（合法范围 `1..30000` ms）。 |
 
-运行时诊断与原子计数器（`attention_counters`、`indexer_register_only`、`indexer_decode_compact`、`indexer_prefill_compact` 等）可通过代码 API 或受鉴权的 `GET /debug/state` 实时读取，用于严格履行 §149「必先验证实际派发路径而非仅看请求开关」的门禁要求。
+运行时诊断与原子计数器（`attention_counters`、`indexer_register_only`、`indexer_decode_compact`、`indexer_prefill_compact`、`indexer_topk_radix_causal` 等）可通过代码 API 或受鉴权的 `GET /debug/state` 实时读取，用于严格履行 §149「必先验证实际派发路径而非仅看请求开关」的门禁要求。
 
 生产 SSE 输出使用每请求独立的 FIFO writer。队列上限为 1 MiB，包含包头和正在发送的包；
 入队不等待客户端 socket 或空闲队列容量。积压超限或断连会取消该请求，socket 在 writer
@@ -550,7 +555,7 @@ compressed KV 与 index cache 保存已完成 BF16 舍入的上 16 位，读取�
 并校验已有段。此存储改动不改变 `MYDS_KV_DSK_ASYNC` 的默认开关。
 
 针对这些改动的本地门禁为 `make test` 与 `make test-indexer-register-only-host`。V4.1 GPU 回归分别运行默认 gather、关闭 gather、
-显式阈值三种配置，并覆盖同一 command batch 内的路径切换、工作区扩容、BF16 缓存对照及 `[P-A1]` / `[P-I2s]` / `[D-L1]` / `[P-L1]` 全边界 0-ULP 校验。
+显式阈值三种配置，并覆盖同一 command batch 内的路径切换、工作区扩容、BF16 缓存对照及 `[P-A1]` / `[P-I2s]` / `[D-L1]` / `[P-L1]` / `[P-T1]` 全边界 0-ULP 校验。
 这些测试不替代真实 GGUF 模型的 logits、吞吐与 TTFT 验收。
 
 `make test` 还包含 QKV 两种行配置的非零逐位对照，以及 attention 的短块、carry、

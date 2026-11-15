@@ -3,18 +3,18 @@
 本文是「哪些开关会改变输出、它们各自的实际风险、以及用什么证据判断」的单一入口。
 **结论全部来自实测，不是从代码推断的。**
 
-- 相关账本节：§98（YOCO vs indexer 窗口）、§99（专家权重）、§100/§101（decode 封顶）
-- 对应单元测试：`tests/test_indexer_window.c`、`tests/test_yoco_compact.c`、`tests/test_moe_ds_kahan.c`
+- 相关账本节：§98（YOCO vs indexer 窗口）、§99（专家权重）、§100/§101（0-ULP decode 封顶）、§172（`MYDS_MOE_DECODE_TOPK=3`）、§173–§176（矩阵注意力与严格 0-ULP 紧凑/Radix Indexer）
+- 对应单元测试：`tests/test_indexer_window.c`、`tests/test_yoco_compact.c`、`tests/test_moe_ds_kahan.c`、`tests/test_v41_router.c`、`tests/test_attention_heads_rego.m`、`tests/test_indexer_decode_compact.c`、`tests/test_indexer_prefill_compact.m`、`tests/test_indexer_topk_radix_pt1.m`
 
-最后更新：2026-10-25
+最后更新：2026-11-15
 
 ---
 
 ## 0. 一句话结论
 
 **0-ULP 不是安全保障，是一条未经验证的禁令。**
-它曾经把整类「少算」方案挡在门外，而其中一部分（YOCO COMPACT）实测质量正常；
-另一部分（indexer 窗口）实测会静默编造。
+它曾经把整类「少算」方案挡在门外，而其中一部分（如 `MYDS_MOE_DECODE_TOPK=3` 与短文 `YOCO COMPACT`）实测质量正常；
+另一部分（如 `MYDS_INDEXER_KEY_WINDOW` 与浅层 `Top-2` Decode 路由）实测会静默编造或破坏 EOS 停机。
 **⇒ 每个近似开关必须单独测质量，不能靠「是否 0-ULP」一概判断。**
 
 ---
@@ -23,7 +23,12 @@
 
 | 开关 | 默认 | 是否改输出 | 状态 | 证据 |
 |---|---|---|---|---|
-| `MYDS_YOCO_COMPACT` | `0` | 是 | **可用**（短上下文） | 账本 §98 |
+| `MYDS_MOE_DECODE_TOPK` | `0`（满血 `Top-6`） | **是**（仅 `n_tokens==1` Decode 裁至 `Top-3` 重归一化；Prefill 始终保 `Top-6` 0-ULP） | **生产开启（`=3`）**；浅层 `k=2` 因 `temp=0` EOS 复读被禁 | 账本 §172（稳态 +14.5%，14 套基准验收） |
+| `MYDS_PREFILL_ATTN` | `vec` | **轻微**（`auto` 长块走 FP32 矩阵归约，与 `vec` 差 `~1 ULP`；`q8`/`q16`/`smem` 内部互为严格 0-ULP） | **生产开启（`=auto`，配 `MYDS_ATTN_HEADS_MODE=q8`）** | 账本 §173 `B-1` / §174 `[P-A1]` |
+| `MYDS_INDEXER_REGISTER_ONLY` / `MYDS_INDEXER_RO_SMEM_Q` | `1` / `1` | **否**（严格 0-ULP） | **生产开启** | 账本 §105 / §173 `A-1` / §174 `[P-I2s]` |
+| `MYDS_INDEXER_DECODE_COMPACT` / `MYDS_INDEXER_PREFILL_COMPACT` | `1` / `1` | **否**（严格 0-ULP，含 `1024` 分区双调同分重放） | **生产开启** | 账本 §174 `[D-L1]` / §175 `[P-L1]` |
+| `MYDS_INDEXER_TOPK_RADIX_CAUSAL` | `0` | **否**（严格 0-ULP，含 `-0/+0` 归一、`0.0f` 巨量同分早停与 `L20` 稠密重放） | **生产开启（`=1`）** | 账本 §176 `[P-T1]` |
+| `MYDS_YOCO_COMPACT` | `0` | 是 | **可用**（短上下文，生产默认 `0`） | 账本 §98 |
 | `MYDS_INDEXER_KEY_WINDOW` | 未设 | 是 | **禁止** | 账本 §98 |
 | `MYDS_MOE_EXPERTZ_DS` | `0` | 是 | 未采纳（+0.82%，非 0-ULP） | 账本 §20 |
 | `MYDS_MOE_WEIGHT_HIST` | 未设 | **否**（纯观测） | 诊断用 | 账本 §99 |
@@ -332,8 +337,8 @@ decode 吞吐按 `infer` 算，不是 `wall`。
 | PLD / batch2 投机 | — | **−6.6%**（接受率 37.3%） | 倒亏 |
 | indexer 窗口 | +15.1% | 质量失败 | **禁止** |
 
-**decode 的 43 t/s 已接近这套架构 + 这个量化形态的上限**
-（dense 70.6% 峰值，GPU 驻留 100%、满频 1398 MHz）。
+**严格 0-ULP（满血 `Top-6`）下 decode 的 ~43–44 t/s 已接近这套架构 + 这个量化形态的物理上限**
+（dense 70.6% 峰值，GPU 驻留 100%、满频 1398 MHz）；生产进一步突破至 **~49.4 t/s** 来自 §172 经 14 套基准质量验收的单步 Decode `MYDS_MOE_DECODE_TOPK=3` 路由裁剪（Prefill 仍保完整 `Top-6` 0-ULP），详见账本 §172。
 
 ---
 
