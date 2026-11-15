@@ -192,6 +192,9 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
     myds_v41_gpu_indexer_prefill_compact_counters_t pc;
     memset(&pc, 0, sizeof(pc));
     myds_v41_gpu_indexer_prefill_compact_counters(&pc, false);
+    myds_v41_gpu_topk_radix_causal_counters_t trc;
+    memset(&trc, 0, sizeof(trc));
+    myds_v41_gpu_topk_radix_causal_counters(&trc, false);
 
     /* Knob accounting, reusing the same inventory --print-config reports. */
     static myds_knob_seen_t seen[1024];
@@ -227,7 +230,10 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          "\"fallbacks\":%llu,\"failures\":%llu,\"f32_dispatches\":%llu,"
          "\"bf16_dispatches\":%llu},\"indexer_prefill_compact\":{\"requests\":%llu,"
          "\"encoded\":%llu,\"fallbacks\":%llu,\"failures\":%llu,\"rows_scored\":%llu,"
-         "\"union_cap_blocks\":%llu,\"dense_blocks\":%llu},\"prefix_cache_len\":%u},",
+         "\"union_cap_blocks\":%llu,\"dense_blocks\":%llu},\"indexer_topk_radix_causal\":{"
+         "\"requests\":%llu,\"encoded\":%llu,\"fallbacks\":%llu,\"failures\":%llu,"
+         "\"rows\":%llu,\"l20_compact_requests\":%llu,\"l20_compact_encoded\":%llu,"
+         "\"l20_compact_fallbacks\":%llu,\"l20_compact_rows\":%llu},\"prefix_cache_len\":%u},",
          (unsigned long long)ro.requests, (unsigned long long)ro.encoded,
          (unsigned long long)ro.fallbacks, (unsigned long long)ro.failures,
          (unsigned long long)ro.f32_dispatches, (unsigned long long)ro.bf16_dispatches,
@@ -235,6 +241,12 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          (unsigned long long)pc.fallbacks, (unsigned long long)pc.failures,
          (unsigned long long)pc.rows_scored, (unsigned long long)pc.union_cap_blocks,
          (unsigned long long)pc.dense_blocks,
+         (unsigned long long)trc.requests, (unsigned long long)trc.encoded,
+         (unsigned long long)trc.fallbacks, (unsigned long long)trc.failures,
+         (unsigned long long)trc.rows, (unsigned long long)trc.l20_compact_requests,
+         (unsigned long long)trc.l20_compact_encoded,
+         (unsigned long long)trc.l20_compact_fallbacks,
+         (unsigned long long)trc.l20_compact_rows,
          ctx ? myds_context_get_pcache_len(ctx) : 0u);
 
     const myds_steer_t *st = ctx ? myds_context_get_steer(ctx) : NULL;

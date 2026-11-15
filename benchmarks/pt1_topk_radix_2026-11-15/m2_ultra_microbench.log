@@ -1,0 +1,85 @@
+[2026-11-15 08:37:16.497] [INFO] Metal command queue initialized (maxCommandBufferCount=512)
+[2026-11-15 08:37:16.498] [INFO] myds_metal: loaded precompiled library from ./bin/myds.metallib (all required V4.1 kernels verified)
+[2026-11-15 08:37:16.503] [INFO] Shared Q4 V41 NB: 0 (ordinary NB+HC GU2304x5120/Down5120x2304, NR2/NSG4)
+[2026-11-15 08:37:16.503] [INFO] myds_metal: Initialized successfully on GPU: Apple M2 Ultra
+[2026-11-15 08:37:16.503] [INFO] Indexer head slots: 0 (reference; explicit ordinary scalar scope)
+[2026-11-15 08:37:16.503] [INFO] Indexer score rows4: 1 (auto; n_comp>=8192 uses rows4, below uses 1-row smem)
+[2026-11-15 08:37:16.503] [INFO] Indexer topk threshold: 0 (reference; explicit ordinary scalar scope)
+[2026-11-15 08:37:16.503] [INFO] Indexer topk NaN shuffle: 0 (reference; reference partition geometry)
+[2026-11-15 08:37:16.503] [INFO] Routed MoE geometry: IQ2 NSG=2, Q2 down NSG=2 (inherited)
+[2026-11-15 08:37:16.503] [INFO] Routed MoE IQ2 LUT: threadgroup (reference)
+[2026-11-15 08:37:16.503] [INFO] Batch2 Q8 shared weights: disabled (scalar reference)
+[2026-11-15 08:37:16.503] [INFO] LM-head Q8 rows per threadgroup: 2 (reference; single token, large output, NSG8)
+[2026-11-15 08:37:16.503] [INFO] Dense Q4 rows per threadgroup: 2 (reference; explicit ordinary scalar scope), NSG=4
+[2026-11-15 08:37:16.503] [INFO] F16 GEMV BF16 fuse: 0 (reference; explicit ordinary scalar scope)
+[2026-11-15 08:37:16.503] [INFO] Indexer RoPE quant fuse: 0 (reference; explicit ordinary scalar scope)
+[2026-11-15 08:37:16.503] [INFO] Routed MoE Q2 sum cache: 0 (reference; explicit ordinary scalar scope)
+[2026-11-15 08:37:16.503] [INFO] Routed MoE Q2 sum cache fused: 0 (reference; explicit ordinary scalar scope)
+[2026-11-15 08:37:16.503] [INFO] Decode candidates: down overlap=0, IQ2 V4.1=0, Dense Q4 V4.1=0 (ordinary scalar only)
+[2026-11-15 08:37:16.503] [INFO] Routed MoE Q2 V4.1: 0 (ordinary scalar F32 MID only; 5120/2304/384/6, NR2, down NSG2/4; MM, trace and unscoped paths retain reference)
+[2026-11-15 08:37:16.503] [INFO] Attention flash-decoding: 0 (reference (single-TG in-register 14-NSG))
+[2026-11-15 08:37:16.503] [INFO] HC mix norm pre-fusion: 0 (reference (separate norm + GEMV))
+[1/6] Verifying [P-T1] Metal PSO occupancy & static threadgroup memory...
+  kernel_myds_topk_radix_clear                 width=32 max_threads=1024 static_smem=    0 B
+  kernel_myds_topk_radix_pass1                 width=32 max_threads=1024 static_smem= 4096 B
+  kernel_myds_topk_radix_pivot                 width=32 max_threads=1024 static_smem= 4128 B
+  kernel_myds_topk_radix_gather                width=32 max_threads=1024 static_smem=   80 B
+  kernel_myds_topk_radix_final                 width=32 max_threads=1024 static_smem=24752 B
+  kernel_myds_topk_radix_nan_fallback          width=32 max_threads=1024 static_smem= 8192 B
+  kernel_myds_l20_candidate_blocks_nan         width=32 max_threads=1024 static_smem=    0 B
+  kernel_myds_l20_sort_blocks_2048             width=32 max_threads=1024 static_smem= 8192 B
+  kernel_myds_l20_gather_compact_scores        width=32 max_threads=1024 static_smem=    0 B
+  kernel_myds_l20_compact_topk_final           width=32 max_threads=1024 static_smem=20672 B
+[2/6] Verifying MYDS_INDEXER_TOPK_RADIX_CAUSAL knob parsing, fail-closed & fallback...
+[3/6] Running Part 1 Radix Top-K 0-ULP matrix (top={512,2048}, ratio={1,2}, nc={4K..256K})...
+  top=512  nc= 16384: all in-budget glens x ratio={1,2} -> PASS (0-ULP)
+  top=512  nc= 16385: all in-budget glens x ratio={1,2} -> PASS (0-ULP)
+  top=512  nc= 32768: all in-budget glens x ratio={1,2} -> PASS (0-ULP)
+  top=512  nc= 65536: all in-budget glens x ratio={1,2} -> PASS (0-ULP)
+  top=512  nc=131072: all in-budget glens x ratio={1,2} -> PASS (0-ULP)
+  top=512  nc=262144: all in-budget glens x ratio={1,2} -> PASS (0-ULP)
+  top=2048 nc=  4096: all in-budget glens x ratio={1,2} -> PASS (0-ULP)
+  top=2048 nc=  8192: all in-budget glens x ratio={1,2} -> PASS (0-ULP)
+  top=2048 nc= 16384: all in-budget glens x ratio={1,2} -> PASS (0-ULP)
+  top=2048 nc= 16385: all in-budget glens x ratio={1,2} -> PASS (0-ULP)
+  top=2048 nc= 32768: all in-budget glens x ratio={1,2} -> PASS (0-ULP)
+  top=2048 nc= 65536: all in-budget glens x ratio={1,2} -> PASS (0-ULP)
+[4/6] Running IEEE-754 & Tie Torture Suite (-0/+0, subnormals, 256K 0.0f ties, zoom, NaN)...
+  width=0..2049, 256K all-0.0f, -0/+0/subnormals, 16-val ties, coarse-bin zoom, +-INF, NaN -> PASS
+[5/6] Running Part 2 L20 Self-Compact Score Gather + Top-512 0-ULP matrix...
+  L20 nc= 16385: mask_view + sel_view memcmp==0 across all glens -> PASS
+  L20 nc= 32768: mask_view + sel_view memcmp==0 across all glens -> PASS
+  L20 nc= 65536: mask_view + sel_view memcmp==0 across all glens -> PASS
+  L20 nc=131072: mask_view + sel_view memcmp==0 across all glens -> PASS
+  L20 nc=262144: mask_view + sel_view memcmp==0 across all glens -> PASS
+  L20 dense-replay ties, hidden-NaN block, <512 -INF, straddle, 4-batch concurrent ab={0,1} -> PASS
+[6/6] Running 7-run median GPU microbenchmark vs Production Baseline (PREFIX_MERGE=1, NAN_FUSE=1)...
+  --- Part 1: Causal Top-512 (per sub-batch & x3 root layers L2/8/14) ---
+  L2/8/14_32K_g256     (nc= 32768, glen=256): PT1=0   3.19 ms (x3=  9.57 ms) | PT1=1   0.66 ms (x3=  1.98 ms) | 4.83x speedup
+  L2/8/14_64K_g128     (nc= 65536, glen=128): PT1=0   3.24 ms (x3=  9.73 ms) | PT1=1   0.61 ms (x3=  1.82 ms) | 5.36x speedup
+  L2/8/14_128K_g64     (nc=131072, glen= 64): PT1=0   3.30 ms (x3=  9.91 ms) | PT1=1   0.57 ms (x3=  1.71 ms) | 5.78x speedup
+  L2/8/14_256K_g32     (nc=262144, glen= 32): PT1=0   3.38 ms (x3= 10.14 ms) | PT1=1   0.50 ms (x3=  1.50 ms) | 6.76x speedup
+  L2/8/14_128K_warm16  (nc=131072, glen= 16): PT1=0   1.07 ms (x3=  3.22 ms) | PT1=1   0.35 ms (x3=  1.05 ms) | 3.06x speedup
+  --- Part 2: Full L20 Post-Scorer (candidates + top_blocks_2048 + maskbits + top_512) ---
+  L20_32K_g256         (nc= 32768, glen=256): PT1=0   3.74 ms | PT1=1   2.64 ms | 1.42x speedup
+  L20_64K_g128         (nc= 65536, glen=128): PT1=0   3.89 ms | PT1=1   1.85 ms | 2.10x speedup
+  L20_128K_g64         (nc=131072, glen= 64): PT1=0   4.03 ms | PT1=1   1.22 ms | 3.31x speedup
+  L20_256K_g32         (nc=262144, glen= 32): PT1=0   4.23 ms | PT1=1   1.11 ms | 3.80x speedup
+  L20_128K_warm16      (nc=131072, glen= 16): PT1=0   1.35 ms | PT1=1   0.96 ms | 1.41x speedup
+PASS: test_indexer_topk_radix_pt1 completed with 100% 0-ULP parity.
+[2026-11-15 08:37:16.707] [ERROR] MYDS_INDEXER_TOPK_RADIX_CAUSAL must be exactly absent, 0 or 1
+[2026-11-15 08:37:16.707] [ERROR] MYDS_INDEXER_TOPK_RADIX_CAUSAL must be exactly absent, 0 or 1
+[2026-11-15 08:37:16.707] [ERROR] MYDS_INDEXER_TOPK_RADIX_CAUSAL must be exactly absent, 0 or 1
+[2026-11-15 08:37:16.707] [ERROR] MYDS_INDEXER_TOPK_RADIX_CAUSAL must be exactly absent, 0 or 1
+[2026-11-15 08:37:16.707] [ERROR] MYDS_INDEXER_TOPK_RADIX_CAUSAL must be exactly absent, 0 or 1
+[2026-11-15 08:37:16.707] [ERROR] MYDS_INDEXER_TOPK_RADIX_CAUSAL must be exactly absent, 0 or 1
+[2026-11-15 08:37:16.707] [ERROR] MYDS_INDEXER_TOPK_RADIX_CAUSAL must be exactly absent, 0 or 1
+[2026-11-15 08:37:16.707] [ERROR] MYDS_INDEXER_TOPK_RADIX_CAUSAL must be exactly absent, 0 or 1
+[2026-11-15 08:37:16.707] [ERROR] MYDS_INDEXER_TOPK_RADIX_CAUSAL must be exactly absent, 0 or 1
+[2026-11-15 08:37:16.707] [ERROR] MYDS_INDEXER_TOPK_RADIX_CAUSAL must be exactly absent, 0 or 1
+[2026-11-15 08:37:16.707] [ERROR] MYDS_INDEXER_TOPK_RADIX_CAUSAL must be exactly absent, 0 or 1
+[2026-11-15 08:37:16.707] [ERROR] MYDS_INDEXER_TOPK_RADIX_CAUSAL must be exactly absent, 0 or 1
+[2026-11-15 08:37:16.707] [ERROR] MYDS_INDEXER_TOPK_RADIX_CAUSAL must be exactly absent, 0 or 1
+[2026-11-15 08:37:16.707] [ERROR] MYDS_INDEXER_TOPK_RADIX_CAUSAL must be exactly absent, 0 or 1
+[2026-11-15 08:37:16.707] [ERROR] MYDS_INDEXER_TOPK_RADIX_CAUSAL must be exactly absent, 0 or 1
+[2026-11-15 08:37:16.707] [ERROR] MYDS_INDEXER_TOPK_RADIX_CAUSAL must be exactly absent, 0 or 1

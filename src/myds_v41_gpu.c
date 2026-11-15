@@ -69,6 +69,7 @@ struct myds_v41_gpu_scratch {
     myds_metal_buffer_t *compact_sorted_blocks, *compact_scores, *compact_rows;
     myds_metal_buffer_t *compact_stage1, *compact_stage2;
     uint32_t compact_prepared_count;
+    myds_metal_buffer_t *radix_row_meta; /* [P-T1] 72 KiB per-row radix/NaN metadata */
 };
 static uint32_t attn_matrix_test_failure;
 void myds_v41_gpu_inject_attention_matrix_failure(uint32_t kind) {
@@ -228,6 +229,7 @@ myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp) {
     if (myds_v41_gpu_indexer_register_only_enabled()<0 ||
         myds_v41_gpu_indexer_decode_compact_enabled()<0 ||
         myds_v41_gpu_indexer_prefill_compact_enabled()<0 ||
+        myds_v41_gpu_topk_radix_causal_enabled()<0 ||
         myds_v41_gpu_attention_packed_register_enabled()<0 || myds_v41_attention_rope_fuse_enabled()<0 ||
         myds_v41_gpu_attention_direct_pack_fuse_enabled()<0) return NULL;
     if(!max_comp || max_comp>1048576) return NULL;
@@ -294,6 +296,9 @@ myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp) {
     s->chunk_tmp_b=myds_metal_buffer_alloc((size_t)s->batch_floats*4u);
     s->chunk_blocks=myds_metal_buffer_alloc((size_t)s->batch_floats*4u);
     s->chunk_block_sel=myds_metal_buffer_alloc((size_t)s->batch_floats*4u);
+    if (max_comp >= 4096u) {
+        s->radix_row_meta = myds_metal_buffer_alloc(2048u * 9u * sizeof(uint32_t));
+    }
     if (max_comp > 16384u) {
         s->compact_sorted_blocks = myds_metal_buffer_alloc(2048u * sizeof(int32_t));
         s->compact_scores        = myds_metal_buffer_alloc(16384u * sizeof(float));
@@ -304,6 +309,7 @@ myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp) {
     if(!s->sort_a||!s->sort_b||!s->kv_f16||!s->mask||!s->pad||!s->partial||!s->sv_view||!s->dv_view||
        !s->kv_chunk||!s->mask_chunk||!s->chunk_scores||!s->chunk_tmp_a||!s->chunk_tmp_b||
        !s->chunk_blocks||!s->chunk_block_sel||
+       (max_comp >= 4096u && !s->radix_row_meta)||
        (max_comp > 16384u && (!s->compact_sorted_blocks||!s->compact_scores||!s->compact_rows||
                               !s->compact_stage1||!s->compact_stage2))){
         myds_v41_gpu_scratch_free(s);return NULL;
@@ -323,6 +329,7 @@ void myds_v41_gpu_scratch_free(myds_v41_gpu_scratch_t *s) {
     myds_metal_buffer_free(s->threshold_parts);myds_metal_buffer_free(s->threshold_control);
     myds_metal_buffer_free(s->threshold_hist);myds_metal_buffer_free(s->threshold_offsets);
     myds_metal_buffer_free(s->threshold_pairs);
+    myds_metal_buffer_free(s->radix_row_meta);
     myds_metal_buffer_free(s->compact_sorted_blocks);myds_metal_buffer_free(s->compact_scores);
     myds_metal_buffer_free(s->compact_rows);myds_metal_buffer_free(s->compact_stage1);
     myds_metal_buffer_free(s->compact_stage2);
@@ -2319,6 +2326,514 @@ int myds_v41_gpu_topkmask_rows(myds_metal_buffer_t *mask,const myds_metal_buffer
     if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(mask);
     return dispatch("kernel_dsv4_topk_mask_scatter",&a,sizeof(a),b,2,
                (uint32_t)((scatter+255u)/256u),1,1,256,1,1,0);
+}
+
+/* ── [P-T1] Strict 0-ULP Batched Causal Radix Top-K & L20 Compact Gather ── */
+#define MYDS_PT1_MAX_ROWS    2048u
+#define MYDS_PT1_L20_NAN_OFF (MYDS_PT1_MAX_ROWS * 8u)
+
+enum {
+    TRC_REQUESTS, TRC_ENCODED, TRC_FALLBACKS, TRC_FAILURES, TRC_ROWS,
+    TRC_L20_REQUESTS, TRC_L20_ENCODED, TRC_L20_FALLBACKS, TRC_L20_ROWS,
+    TRC_COUNT
+};
+static _Atomic uint64_t topk_radix_causal_cnt[TRC_COUNT];
+static uint32_t topk_radix_causal_test_unavailable = 0u;
+
+int myds_v41_gpu_topk_radix_causal_enabled(void) {
+    const char *v = getenv("MYDS_INDEXER_TOPK_RADIX_CAUSAL");
+    if (!v || !strcmp(v, "0")) return 0;
+    if (!strcmp(v, "1")) return 1;
+    MYDS_LOG_E("MYDS_INDEXER_TOPK_RADIX_CAUSAL must be exactly absent, 0 or 1");
+    return -1;
+}
+
+void myds_v41_gpu_topk_radix_causal_counters(
+    myds_v41_gpu_topk_radix_causal_counters_t *out, bool reset) {
+    uint64_t v[TRC_COUNT];
+    for (unsigned i = 0; i < TRC_COUNT; ++i) {
+        v[i] = reset ? atomic_exchange_explicit(&topk_radix_causal_cnt[i], 0u, memory_order_relaxed)
+                     : atomic_load_explicit(&topk_radix_causal_cnt[i], memory_order_relaxed);
+    }
+    if (out) {
+        *out = (myds_v41_gpu_topk_radix_causal_counters_t){
+            v[TRC_REQUESTS], v[TRC_ENCODED], v[TRC_FALLBACKS], v[TRC_FAILURES], v[TRC_ROWS],
+            v[TRC_L20_REQUESTS], v[TRC_L20_ENCODED], v[TRC_L20_FALLBACKS], v[TRC_L20_ROWS]
+        };
+    }
+}
+
+void myds_v41_gpu_inject_topk_radix_causal_unavailable(uint32_t mask) {
+    topk_radix_causal_test_unavailable = mask;
+}
+
+struct topk_radix_clear_args {
+    uint32_t hist_words, meta_off, meta_words, pad;
+};
+_Static_assert(sizeof(struct topk_radix_clear_args) == 16u, "pt1 clear args ABI");
+
+struct topk_radix_args {
+    uint32_t n_cols, n_rows, top, causal_start, causal_ratio;
+    uint32_t n_sub, max_surv, layout, meta_off, meta_stride;
+};
+_Static_assert(sizeof(struct topk_radix_args) == 40u, "pt1 radix args ABI");
+
+struct l20_cand_args {
+    uint32_t width, rows, start, ratio, nan_off, pad0, pad1, pad2;
+};
+_Static_assert(sizeof(struct l20_cand_args) == 32u, "pt1 l20 cand args ABI");
+
+struct l20_sort_args {
+    uint32_t n_rows, nan_off;
+};
+_Static_assert(sizeof(struct l20_sort_args) == 8u, "pt1 l20 sort args ABI");
+
+struct l20_compact_final_args {
+    struct prefill_compact_topk_args base;
+    uint32_t nan_off;
+};
+_Static_assert(sizeof(struct l20_compact_final_args) == 24u, "pt1 l20 final args ABI");
+
+/* Returns 1 encoded, 0 preflight unavailable/unsupported (no writes), -1 mid-flight failure. */
+static int topk_rows_radix_causal_encode(
+    myds_v41_gpu_scratch_t *s, myds_metal_buffer_t *ids,
+    const myds_metal_buffer_t *scores, uint32_t n_cols, uint32_t top,
+    uint32_t n_rows, uint32_t causal_start, uint32_t causal_ratio) {
+    if (topk_radix_causal_test_unavailable & MYDS_TOPK_RADIX_CAUSAL_UNAVAILABLE_RADIX) {
+        return 0;
+    }
+    if (!s || !s->radix_row_meta || !s->chunk_tmp_a || !s->chunk_tmp_b ||
+        !ids || !scores || !n_rows || n_rows > MYDS_PT1_MAX_ROWS ||
+        !top || top > 2048u || top > n_cols ||
+        (causal_ratio != 1u && causal_ratio != 2u) ||
+        causal_start == UINT32_MAX ||
+        n_cols < (top <= 512u ? 16384u : 4096u) || n_cols > 1048576u) {
+        return 0;
+    }
+
+    if (myds_metal_kernel_max_threads("kernel_argsort_f32_i32_desc_causal") != 1024u) {
+        return 0;
+    }
+
+    const uint32_t n_sub    = (n_cols + 255u) / 256u;
+    const uint32_t max_surv = (top <= 512u) ? 2048u : 4096u;
+    const uint32_t npr      = (n_cols + 1023u) / 1024u;
+    const uint32_t layout   = (npr == 1u) ? top : n_cols;
+    if ((uint64_t)n_rows * layout > (uint64_t)s->batch_floats) {
+        return 0;
+    }
+
+    const uint64_t ids_bytes      = (uint64_t)n_rows * top * sizeof(int32_t);
+    const uint64_t scores_bytes   = (uint64_t)n_rows * n_cols * sizeof(float);
+    const uint64_t hist_sub_bytes = (uint64_t)n_rows * (1024u + n_sub) * sizeof(uint32_t);
+    const uint64_t surv_bytes     = (uint64_t)n_rows * max_surv * 2u * sizeof(uint32_t);
+    const uint64_t nan_tmp_bytes  = (uint64_t)n_rows * layout * sizeof(int32_t);
+    const uint64_t tmp_a_bytes    = surv_bytes > nan_tmp_bytes ? surv_bytes : nan_tmp_bytes;
+    const uint64_t tmp_b_bytes    = hist_sub_bytes > nan_tmp_bytes ? hist_sub_bytes : nan_tmp_bytes;
+    const uint64_t meta_bytes     = (uint64_t)n_rows * 8u * sizeof(uint32_t);
+
+    if (!myds_metal_buffer_native_range(ids, ids_bytes, 4u) ||
+        !myds_metal_buffer_native_range(scores, scores_bytes, 4u) ||
+        !myds_metal_buffer_native_range(s->chunk_tmp_a, tmp_a_bytes, 8u) ||
+        !myds_metal_buffer_native_range(s->chunk_tmp_b, tmp_b_bytes, 4u) ||
+        !myds_metal_buffer_native_range(s->radix_row_meta, meta_bytes, 4u) ||
+        buffer_ranges_overlap(ids, (size_t)ids_bytes, scores, (size_t)scores_bytes)) {
+        return 0;
+    }
+
+    const uint32_t th_256[]  = {256u, 1u, 1u};
+    const uint32_t th_1024[] = {1024u, 1u, 1u};
+    if (!myds_metal_kernel_constants_preflight("kernel_myds_topk_radix_clear", th_256, 0u, NULL, 0u) ||
+        !myds_metal_kernel_constants_preflight("kernel_myds_topk_radix_pass1", th_256, 0u, NULL, 0u) ||
+        !myds_metal_kernel_constants_preflight("kernel_myds_topk_radix_pivot", th_256, 0u, NULL, 0u) ||
+        !myds_metal_kernel_constants_preflight("kernel_myds_topk_radix_gather", th_256, 0u, NULL, 0u) ||
+        !myds_metal_kernel_constants_preflight("kernel_myds_topk_radix_final", th_1024, 0u, NULL, 0u) ||
+        !myds_metal_kernel_constants_preflight("kernel_myds_topk_radix_nan_fallback", th_1024, 0u, NULL, 0u)) {
+        return 0;
+    }
+
+    if (!myds_metal_get_auto_barrier()) {
+        const myds_metal_buffer_t *init_deps[] = {
+            scores, s->chunk_tmp_a, s->chunk_tmp_b, s->radix_row_meta, ids
+        };
+        myds_metal_barrier_buffers(init_deps, 5u);
+    }
+
+    const uint32_t hist_words = n_rows * 1024u;
+    const uint32_t meta_words = n_rows * 8u;
+    const uint32_t clear_total = hist_words + meta_words;
+    struct topk_radix_clear_args ca = {hist_words, 0u, meta_words, 0u};
+    const myds_metal_buffer_t *b_clear[] = {s->chunk_tmp_b, s->radix_row_meta};
+    if (!dispatch("kernel_myds_topk_radix_clear", &ca, sizeof(ca), b_clear, 2u,
+                  (clear_total + 255u) / 256u, 1u, 1u, 256u, 1u, 1u, 0u)) {
+        return -1;
+    }
+
+    if (!myds_metal_get_auto_barrier()) {
+        myds_metal_barrier_buffers(b_clear, 2u);
+    }
+
+    const uint32_t n_tiles = (n_cols + 4095u) / 4096u;
+    struct topk_radix_args ra = {
+        n_cols, n_rows, top, causal_start, causal_ratio,
+        n_sub, max_surv, layout, 0u, 8u
+    };
+    const myds_metal_buffer_t *b_p1[] = {scores, s->chunk_tmp_b, s->radix_row_meta};
+    if (!dispatch("kernel_myds_topk_radix_pass1", &ra, sizeof(ra), b_p1, 3u,
+                  n_tiles, n_rows, 1u, 256u, 1u, 1u, 0u)) {
+        return -1;
+    }
+
+    if (!myds_metal_get_auto_barrier()) {
+        myds_metal_barrier_buffers(b_clear, 2u);
+    }
+
+    if (!dispatch("kernel_myds_topk_radix_pivot", &ra, sizeof(ra), b_p1, 3u,
+                  n_rows, 1u, 1u, 256u, 1u, 1u, 0u)) {
+        return -1;
+    }
+
+    if (!myds_metal_get_auto_barrier()) {
+        myds_metal_barrier_buffer(s->radix_row_meta);
+    }
+
+    const myds_metal_buffer_t *b_gath[] = {
+        scores, s->chunk_tmp_b, s->radix_row_meta, s->chunk_tmp_a
+    };
+    if (!dispatch("kernel_myds_topk_radix_gather", &ra, sizeof(ra), b_gath, 4u,
+                  n_tiles, n_rows, 1u, 256u, 1u, 1u, 0u)) {
+        return -1;
+    }
+
+    if (!myds_metal_get_auto_barrier()) {
+        const myds_metal_buffer_t *fin_deps[] = {s->radix_row_meta, s->chunk_tmp_a};
+        myds_metal_barrier_buffers(fin_deps, 2u);
+    }
+
+    const myds_metal_buffer_t *b_fin[] = {
+        scores, s->chunk_tmp_b, s->radix_row_meta, s->chunk_tmp_a, ids
+    };
+    if (!dispatch("kernel_myds_topk_radix_final", &ra, sizeof(ra), b_fin, 5u,
+                  n_rows, 1u, 1u, 1024u, 1u, 1u, 0u)) {
+        return -1;
+    }
+
+    if (!myds_metal_get_auto_barrier()) {
+        const myds_metal_buffer_t *nan_deps[] = {s->chunk_tmp_a, s->chunk_tmp_b, ids};
+        myds_metal_barrier_buffers(nan_deps, 3u);
+    }
+
+    struct topk_radix_args na = ra;
+    na.meta_off = 2u;
+    na.meta_stride = 8u;
+    const myds_metal_buffer_t *b_nan[] = {
+        scores, s->radix_row_meta, s->chunk_tmp_a, s->chunk_tmp_b, ids
+    };
+    if (!dispatch("kernel_myds_topk_radix_nan_fallback", &na, sizeof(na), b_nan, 5u,
+                  n_rows, 1u, 1u, 1024u, 1u, 1u, 0u)) {
+        return -1;
+    }
+
+    if (!myds_metal_get_auto_barrier()) {
+        const myds_metal_buffer_t *exit_deps[] = {ids, s->chunk_tmp_a, s->chunk_tmp_b};
+        myds_metal_barrier_buffers(exit_deps, 3u);
+    }
+    return 1;
+}
+
+int myds_v41_gpu_topk_radix_causal_scoped(
+    myds_v41_gpu_scratch_t *s, myds_metal_buffer_t *ids,
+    const myds_metal_buffer_t *scores, uint32_t n_cols, uint32_t top,
+    uint32_t n_rows, uint32_t causal_start, uint32_t causal_ratio,
+    bool ordinary_prefill_allowed) {
+    atomic_fetch_add_explicit(&topk_radix_causal_cnt[TRC_REQUESTS], 1u, memory_order_relaxed);
+    const int mode = myds_v41_gpu_topk_radix_causal_enabled();
+    if (mode < 0) {
+        atomic_fetch_add_explicit(&topk_radix_causal_cnt[TRC_FAILURES], 1u, memory_order_relaxed);
+        return 0;
+    }
+    const bool in_scope = (mode == 1) && ordinary_prefill_allowed &&
+        s && !myds_metal_kprof_exclusive() && myds_metal_batch_active() &&
+        !myds_v41_gpu_topk_nan_shuffle_enabled() &&
+        (causal_ratio == 1u || causal_ratio == 2u) &&
+        n_rows >= 1u && n_rows <= MYDS_PT1_MAX_ROWS &&
+        top >= 1u && top <= 2048u && top <= n_cols &&
+        n_cols >= (top <= 512u ? 16384u : 4096u) && n_cols <= 1048576u;
+    if (!in_scope) {
+        return myds_v41_gpu_topk_causal(ids, scores, n_cols, top, n_rows,
+                                        causal_start, causal_ratio, s);
+    }
+
+    const int rc = topk_rows_radix_causal_encode(
+        s, ids, scores, n_cols, top, n_rows, causal_start, causal_ratio);
+    if (rc < 0) {
+        atomic_fetch_add_explicit(&topk_radix_causal_cnt[TRC_FAILURES], 1u, memory_order_relaxed);
+        return 0;
+    }
+    if (rc == 0) {
+        atomic_fetch_add_explicit(&topk_radix_causal_cnt[TRC_FALLBACKS], 1u, memory_order_relaxed);
+        return myds_v41_gpu_topk_causal(ids, scores, n_cols, top, n_rows,
+                                        causal_start, causal_ratio, s);
+    }
+
+    atomic_fetch_add_explicit(&topk_radix_causal_cnt[TRC_ENCODED], 1u, memory_order_relaxed);
+    atomic_fetch_add_explicit(&topk_radix_causal_cnt[TRC_ROWS], n_rows, memory_order_relaxed);
+    return 1;
+}
+
+static int indexer_l20_compact_topk_encode(
+    myds_v41_gpu_scratch_t *s, myds_metal_buffer_t *ids,
+    myds_metal_buffer_t *mask, const myds_metal_buffer_t *scores,
+    uint32_t n_comp, uint32_t n_tokens, uint32_t causal_start,
+    uint32_t causal_ratio, uint32_t mask_stride, bool mask_bits,
+    bool ordinary_prefill_allowed) {
+    if (topk_radix_causal_test_unavailable & MYDS_TOPK_RADIX_CAUSAL_UNAVAILABLE_L20) {
+        return 0;
+    }
+    const uint32_t max_glen = myds_v41_gpu_indexer_prefill_compact_max_glen(s);
+    if (!s || !max_glen || !ids || !mask || !scores || !s->radix_row_meta ||
+        !s->chunk_blocks || !s->chunk_block_sel || !s->chunk_tmp_a || !s->chunk_tmp_b) {
+        return 0;
+    }
+    if (!n_tokens || n_tokens > max_glen || n_tokens > MYDS_PT1_MAX_ROWS ||
+        (causal_ratio != 1u && causal_ratio != 2u) ||
+        n_comp <= 16384u || n_comp > 1048576u ||
+        (uint64_t)n_tokens * n_comp > (uint64_t)s->batch_floats ||
+        causal_start == UINT32_MAX ||
+        ((causal_start + 1u) / causal_ratio) < 2048u) {
+        return 0;
+    }
+
+    const uint32_t blocks = (n_comp + 7u) / 8u;
+    if (blocks < 2048u || !mask_stride) return 0;
+    if (mask_bits) {
+        const uint32_t req_words = (blocks + 31u) / 32u;
+        if (mask_stride < req_words) return 0;
+    } else {
+        if (mask_stride < blocks) return 0;
+    }
+
+    const uint64_t ids_bytes     = (uint64_t)n_tokens * 512u * sizeof(int32_t);
+    const uint64_t scores_bytes  = (uint64_t)n_tokens * n_comp * sizeof(float);
+    const uint64_t mask_bytes    = (uint64_t)n_tokens * mask_stride * sizeof(uint32_t);
+    const uint64_t cand_bytes    = (uint64_t)n_tokens * blocks * sizeof(float);
+    const uint64_t compact_bytes = (uint64_t)n_tokens * 16384u * sizeof(float);
+    const uint64_t blk_buf_bytes = cand_bytes > compact_bytes ? cand_bytes : compact_bytes;
+    const uint64_t sel_bytes     = (uint64_t)n_tokens * 2048u * sizeof(int32_t);
+    const uint64_t stage1_bytes  = (uint64_t)n_tokens * 16u * 513u * 8u;
+    const uint64_t stage2_bytes  = (uint64_t)n_tokens * 4u * 513u * 8u;
+    const uint64_t nan_tmp_bytes = (uint64_t)n_tokens * n_comp * sizeof(int32_t);
+    const uint64_t tmp_a_bytes   = stage1_bytes > nan_tmp_bytes ? stage1_bytes : nan_tmp_bytes;
+    const uint64_t tmp_b_bytes   = stage2_bytes > nan_tmp_bytes ? stage2_bytes : nan_tmp_bytes;
+    const uint64_t meta_bytes    = (uint64_t)(MYDS_PT1_L20_NAN_OFF + n_tokens) * sizeof(uint32_t);
+
+    if (!myds_metal_buffer_native_range(ids, ids_bytes, 4u) ||
+        !myds_metal_buffer_native_range(scores, scores_bytes, 4u) ||
+        !myds_metal_buffer_native_range(mask, mask_bytes, 4u) ||
+        !myds_metal_buffer_native_range(s->chunk_blocks, blk_buf_bytes, 16u) ||
+        !myds_metal_buffer_native_range(s->chunk_block_sel, sel_bytes, 4u) ||
+        !myds_metal_buffer_native_range(s->chunk_tmp_a, tmp_a_bytes, 8u) ||
+        !myds_metal_buffer_native_range(s->chunk_tmp_b, tmp_b_bytes, 8u) ||
+        !myds_metal_buffer_native_range(s->radix_row_meta, meta_bytes, 4u) ||
+        buffer_ranges_overlap(ids, (size_t)ids_bytes, scores, (size_t)scores_bytes) ||
+        buffer_ranges_overlap(ids, (size_t)ids_bytes, mask, (size_t)mask_bytes) ||
+        buffer_ranges_overlap(mask, (size_t)mask_bytes, scores, (size_t)scores_bytes)) {
+        return 0;
+    }
+
+    const uint32_t th_256[]  = {256u, 1u, 1u};
+    const uint32_t th_512[]  = {512u, 1u, 1u};
+    const uint32_t th_1024[] = {1024u, 1u, 1u};
+    if (myds_metal_kernel_max_threads("kernel_argsort_f32_i32_desc_causal") != 1024u ||
+        !myds_metal_kernel_constants_preflight("kernel_myds_topk_radix_clear", th_256, 0u, NULL, 0u) ||
+        !myds_metal_kernel_constants_preflight("kernel_myds_l20_candidate_blocks_nan", th_256, 0u, NULL, 0u) ||
+        !myds_metal_kernel_constants_preflight("kernel_myds_l20_sort_blocks_2048", th_1024, 0u, NULL, 0u) ||
+        !myds_metal_kernel_constants_preflight("kernel_myds_l20_gather_compact_scores", th_256, 0u, NULL, 0u) ||
+        !myds_metal_kernel_constants_preflight("kernel_myds_prefill_compact_topk_stage1", th_512, 0u, NULL, 0u) ||
+        !myds_metal_kernel_constants_preflight("kernel_myds_prefill_compact_topk_stage2", th_512, 0u, NULL, 0u) ||
+        !myds_metal_kernel_constants_preflight("kernel_myds_l20_compact_topk_final", th_1024, 0u, NULL, 0u) ||
+        !myds_metal_kernel_constants_preflight("kernel_myds_topk_radix_nan_fallback", th_1024, 0u, NULL, 0u)) {
+        return 0;
+    }
+
+    if (!myds_metal_get_auto_barrier()) {
+        const myds_metal_buffer_t *init_deps[] = {
+            scores, s->chunk_blocks, s->chunk_block_sel,
+            s->chunk_tmp_a, s->chunk_tmp_b, s->radix_row_meta, mask, ids
+        };
+        myds_metal_barrier_buffers(init_deps, 8u);
+    }
+
+    /* 1. Clear L20 visible-NaN flags in disjoint tail of radix_row_meta. */
+    struct topk_radix_clear_args ca = {0u, MYDS_PT1_L20_NAN_OFF, n_tokens, 0u};
+    const myds_metal_buffer_t *b_clr[] = {s->chunk_tmp_b, s->radix_row_meta};
+    if (!dispatch("kernel_myds_topk_radix_clear", &ca, sizeof(ca), b_clr, 2u,
+                  (n_tokens + 255u) / 256u, 1u, 1u, 256u, 1u, 1u, 0u)) {
+        return -1;
+    }
+    if (!myds_metal_get_auto_barrier()) {
+        myds_metal_barrier_buffer(s->radix_row_meta);
+    }
+
+    /* 2. Compute exact candidate_blocks + per-row visible NaN flag. */
+    struct l20_cand_args cda = {n_comp, n_tokens, causal_start, causal_ratio, MYDS_PT1_L20_NAN_OFF, 0u, 0u, 0u};
+    const myds_metal_buffer_t *b_cand[] = {scores, s->chunk_blocks, s->radix_row_meta};
+    if (!dispatch("kernel_myds_l20_candidate_blocks_nan", &cda, sizeof(cda), b_cand, 3u,
+                  (blocks + 255u) / 256u, n_tokens, 1u, 256u, 1u, 1u, 0u)) {
+        return -1;
+    }
+    if (!myds_metal_get_auto_barrier()) {
+        const myds_metal_buffer_t *cand_deps[] = {s->chunk_blocks, s->radix_row_meta};
+        myds_metal_barrier_buffers(cand_deps, 2u);
+    }
+
+    /* 3. Select top_blocks = 2048 from blocks_buf (uses Radix Top-2048 when blocks >= 4096). */
+    if (!myds_v41_gpu_topk_radix_causal_scoped(
+            s, s->chunk_block_sel, s->chunk_blocks, blocks, 2048u,
+            n_tokens, causal_start, causal_ratio, ordinary_prefill_allowed)) {
+        return -1;
+    }
+    if (!myds_metal_get_auto_barrier()) {
+        const myds_metal_buffer_t *bsel_deps[] = {
+            s->chunk_block_sel, s->chunk_tmp_a, s->chunk_tmp_b
+        };
+        myds_metal_barrier_buffers(bsel_deps, 3u);
+    }
+
+    /* 4. Scatter L20 block mask (bit-packed or float). */
+    if (mask_bits) {
+        if (!myds_v41_gpu_maskbits_rows(mask, s->chunk_block_sel, blocks, 2048u, n_tokens, mask_stride)) {
+            return -1;
+        }
+    } else {
+        if (!myds_v41_gpu_topkmask_rows(mask, s->chunk_block_sel, blocks, 2048u, n_tokens, mask_stride)) {
+            return -1;
+        }
+    }
+    if (!myds_metal_get_auto_barrier()) {
+        const myds_metal_buffer_t *mask_deps[] = {mask, s->chunk_block_sel};
+        myds_metal_barrier_buffers(mask_deps, 2u);
+    }
+
+    /* 5. Sort 2,048 selected block IDs strictly ascending per row in 8 KB smem. */
+    struct l20_sort_args sa = {n_tokens, MYDS_PT1_L20_NAN_OFF};
+    const myds_metal_buffer_t *b_sort[] = {s->chunk_block_sel, s->radix_row_meta};
+    if (!dispatch("kernel_myds_l20_sort_blocks_2048", &sa, sizeof(sa), b_sort, 2u,
+                  n_tokens, 1u, 1u, 1024u, 1u, 1u, 0u)) {
+        return -1;
+    }
+    if (!myds_metal_get_auto_barrier()) {
+        const myds_metal_buffer_t *g_deps[] = {s->chunk_block_sel, s->chunk_blocks};
+        myds_metal_barrier_buffers(g_deps, 2u);
+    }
+
+    /* 6. Gather 2,048 x 8 = 16,384 scores per row from dense scores into chunk_blocks. */
+    const myds_metal_buffer_t *b_gath[] = {
+        scores, s->chunk_block_sel, s->radix_row_meta, s->chunk_blocks
+    };
+    if (!dispatch("kernel_myds_l20_gather_compact_scores", &cda, sizeof(cda), b_gath, 4u,
+                  8u, n_tokens, 1u, 256u, 1u, 1u, 0u)) {
+        return -1;
+    }
+    if (!myds_metal_get_auto_barrier()) {
+        const myds_metal_buffer_t *s1_deps[] = {s->chunk_blocks, s->chunk_tmp_a};
+        myds_metal_barrier_buffers(s1_deps, 2u);
+    }
+
+    /* 7. Run 16,384 -> 512 compact Top-512 (stage1 + stage2 + L20 dense-replay final). */
+    struct prefill_compact_topk_args ta = {n_comp, n_tokens, causal_start, causal_ratio, 0u};
+    const myds_metal_buffer_t *b_s1[] = {s->chunk_blocks, s->chunk_block_sel, s->chunk_tmp_a};
+    if (!dispatch("kernel_myds_prefill_compact_topk_stage1", &ta, sizeof(ta), b_s1, 3u,
+                  16u, n_tokens, 1u, 512u, 1u, 1u, 0u)) {
+        return -1;
+    }
+    if (!myds_metal_get_auto_barrier()) {
+        const myds_metal_buffer_t *s2_deps[] = {s->chunk_tmp_a, s->chunk_tmp_b};
+        myds_metal_barrier_buffers(s2_deps, 2u);
+    }
+
+    const myds_metal_buffer_t *b_s2[] = {s->chunk_tmp_a, s->chunk_tmp_b};
+    if (!dispatch("kernel_myds_prefill_compact_topk_stage2", &ta, sizeof(ta), b_s2, 2u,
+                  4u, n_tokens, 1u, 512u, 1u, 1u, 0u)) {
+        return -1;
+    }
+    if (!myds_metal_get_auto_barrier()) {
+        const myds_metal_buffer_t *fin_deps[] = {s->chunk_tmp_b, ids};
+        myds_metal_barrier_buffers(fin_deps, 2u);
+    }
+
+    struct l20_compact_final_args lfa = {ta, MYDS_PT1_L20_NAN_OFF};
+    const myds_metal_buffer_t *b_fin[] = {
+        s->chunk_tmp_b, s->chunk_block_sel, s->chunk_blocks, scores, s->radix_row_meta, ids
+    };
+    if (!dispatch("kernel_myds_l20_compact_topk_final", &lfa, sizeof(lfa), b_fin, 6u,
+                  1u, n_tokens, 1u, 1024u, 1u, 1u, 0u)) {
+        return -1;
+    }
+    if (!myds_metal_get_auto_barrier()) {
+        const myds_metal_buffer_t *nan_deps[] = {s->chunk_tmp_a, s->chunk_tmp_b, ids};
+        myds_metal_barrier_buffers(nan_deps, 3u);
+    }
+
+    /* 8. Guarded 0-ULP NaN fallback for any L20 row with visible IEEE NaN. */
+    struct topk_radix_args na = {
+        n_comp, n_tokens, 512u, causal_start, causal_ratio,
+        (n_comp + 255u) / 256u, 2048u, n_comp, MYDS_PT1_L20_NAN_OFF, 1u
+    };
+    const myds_metal_buffer_t *b_nan[] = {
+        scores, s->radix_row_meta, s->chunk_tmp_a, s->chunk_tmp_b, ids
+    };
+    if (!dispatch("kernel_myds_topk_radix_nan_fallback", &na, sizeof(na), b_nan, 5u,
+                  n_tokens, 1u, 1u, 1024u, 1u, 1u, 0u)) {
+        return -1;
+    }
+    if (!myds_metal_get_auto_barrier()) {
+        const myds_metal_buffer_t *exit_deps[] = {ids, s->chunk_tmp_a, s->chunk_tmp_b};
+        myds_metal_barrier_buffers(exit_deps, 3u);
+    }
+    return 1;
+}
+
+int myds_v41_gpu_indexer_l20_compact_topk_scoped(
+    myds_v41_gpu_scratch_t *s, myds_metal_buffer_t *ids,
+    myds_metal_buffer_t *mask, const myds_metal_buffer_t *scores,
+    uint32_t n_comp, uint32_t n_tokens, uint32_t causal_start,
+    uint32_t causal_ratio, uint32_t mask_stride, bool mask_bits,
+    uint32_t top_blocks, bool ordinary_prefill_allowed) {
+    atomic_fetch_add_explicit(&topk_radix_causal_cnt[TRC_L20_REQUESTS], 1u, memory_order_relaxed);
+    const int mode = myds_v41_gpu_topk_radix_causal_enabled();
+    if (mode < 0) {
+        atomic_fetch_add_explicit(&topk_radix_causal_cnt[TRC_FAILURES], 1u, memory_order_relaxed);
+        return -1;
+    }
+    const uint32_t max_glen = myds_v41_gpu_indexer_prefill_compact_max_glen(s);
+    if (!mode || !ordinary_prefill_allowed || !s || !max_glen ||
+        top_blocks != 2048u || n_comp <= 16384u || n_comp > 1048576u ||
+        !n_tokens || n_tokens > max_glen || n_tokens > MYDS_PT1_MAX_ROWS ||
+        (causal_ratio != 1u && causal_ratio != 2u) ||
+        causal_start == UINT32_MAX ||
+        ((causal_start + 1u) / causal_ratio) < 2048u ||
+        (uint64_t)n_tokens * n_comp > (uint64_t)s->batch_floats ||
+        !myds_metal_batch_active() || myds_metal_kprof_exclusive() ||
+        myds_v41_gpu_topk_nan_shuffle_enabled()) {
+        return 0;
+    }
+
+    const int rc = indexer_l20_compact_topk_encode(
+        s, ids, mask, scores, n_comp, n_tokens, causal_start, causal_ratio,
+        mask_stride, mask_bits, ordinary_prefill_allowed);
+    if (rc < 0) {
+        atomic_fetch_add_explicit(&topk_radix_causal_cnt[TRC_FAILURES], 1u, memory_order_relaxed);
+        return -1;
+    }
+    if (rc == 0) {
+        atomic_fetch_add_explicit(&topk_radix_causal_cnt[TRC_L20_FALLBACKS], 1u, memory_order_relaxed);
+        return 0;
+    }
+
+    atomic_fetch_add_explicit(&topk_radix_causal_cnt[TRC_L20_ENCODED], 1u, memory_order_relaxed);
+    atomic_fetch_add_explicit(&topk_radix_causal_cnt[TRC_L20_ROWS], n_tokens, memory_order_relaxed);
+    return 1;
 }
 int myds_v41_gpu_gather(myds_metal_buffer_t *out,const myds_metal_buffer_t *cache,
     const myds_metal_buffer_t *ids,uint32_t source_rows,uint32_t selected_rows) {

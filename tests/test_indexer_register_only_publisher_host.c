@@ -37,6 +37,19 @@ int myds_v41_gpu_candidates_rows(myds_metal_buffer_t*a,const myds_metal_buffer_t
 int myds_v41_gpu_filter_rows(myds_metal_buffer_t*a,const myds_metal_buffer_t*b,uint32_t c,uint32_t d,uint32_t e,uint32_t f,uint32_t g){after_scorer_calls++;return 1;}
 int myds_v41_gpu_filter_rows_bits(myds_metal_buffer_t*a,const myds_metal_buffer_t*b,uint32_t c,uint32_t d,uint32_t e,uint32_t f,uint32_t g){after_scorer_calls++;return 1;}
 int myds_v41_gpu_topk_causal(myds_metal_buffer_t*a,const myds_metal_buffer_t*b,uint32_t c,uint32_t d,uint32_t e,uint32_t f,uint32_t g,myds_v41_gpu_scratch_t*s){after_scorer_calls++;return 1;}
+static int l20_compact_ret=0;
+static unsigned l20_compact_calls,radix_scoped_calls;
+int myds_v41_gpu_topk_radix_causal_scoped(myds_v41_gpu_scratch_t*s,myds_metal_buffer_t*a,const myds_metal_buffer_t*b,uint32_t c,uint32_t d,uint32_t e,uint32_t f,uint32_t g,bool ord){
+    assert(ord==!trace_on);
+    radix_scoped_calls++;
+    after_scorer_calls++;
+    return 1;
+}
+int myds_v41_gpu_indexer_l20_compact_topk_scoped(myds_v41_gpu_scratch_t*s,myds_metal_buffer_t*ids,myds_metal_buffer_t*mask,const myds_metal_buffer_t*scores,uint32_t nc,uint32_t nt,uint32_t start,uint32_t ratio,uint32_t ms,bool mb,uint32_t tb,bool ord){
+    assert(nc>16384u&&tb==2048u&&ord==!trace_on);
+    l20_compact_calls++;
+    return l20_compact_ret;
+}
 int myds_v41_gpu_maskbits_rows(myds_metal_buffer_t*a,const myds_metal_buffer_t*b,uint32_t c,uint32_t d,uint32_t e,uint32_t f){after_scorer_calls++;return 1;}
 int myds_v41_gpu_topkmask_rows(myds_metal_buffer_t*a,const myds_metal_buffer_t*b,uint32_t c,uint32_t d,uint32_t e,uint32_t f){after_scorer_calls++;return 1;}
 static int compact_ret=0;
@@ -109,5 +122,19 @@ int main(void) {
     rope_calls=scoped_calls=after_scorer_calls=compact_calls=0;compact_ret=-1;
     assert(publish_indexer_chunk(&ctx,24,0,2048,129024,&q,&w,&selected,2048,&mask,65536,true,&qv,&wv,&sv,&mv)==-1);
     assert(rope_calls==1&&compact_calls==1&&!scoped_calls&&!after_scorer_calls);
-    puts("{\"actual_publisher_scorer_failure_is_minus1\":true,\"trace_scope_forwarded\":true,\"no_repeat_rope_or_consumers\":true,\"p_i1_gt_512k_no_fallback\":true,\"p_l1_publisher_verified\":true,\"gpu_work\":false}");return 0;
+
+    /* [P-T1] Verify L20 compact post-scorer path: adopted (1), graceful fallback (0), fail-closed (-1). */
+    rope_calls=scoped_calls=after_scorer_calls=l20_compact_calls=radix_scoped_calls=0;
+    sum_scoped_nt=0;min_scoped_nt=UINT32_MAX;max_scoped_nt=0;
+    expected_start=129024u;expected_ratio=1u;scorer_ret=1;l20_compact_ret=1;
+    assert(publish_indexer_chunk(&ctx,20,0,2048,129024,&q,&w,&selected,2048,&mask,65536,true,&qv,&wv,&sv,&mv)==1);
+    assert(rope_calls==1&&l20_compact_calls==scoped_calls&&sum_scoped_nt==2048u&&!after_scorer_calls);
+
+    rope_calls=scoped_calls=after_scorer_calls=l20_compact_calls=radix_scoped_calls=0;
+    sum_scoped_nt=0;min_scoped_nt=UINT32_MAX;max_scoped_nt=0;l20_compact_ret=-1;
+    assert(publish_indexer_chunk(&ctx,20,0,2048,129024,&q,&w,&selected,2048,&mask,65536,true,&qv,&wv,&sv,&mv)==-1);
+    assert(rope_calls==1&&scoped_calls==1&&l20_compact_calls==1&&!after_scorer_calls);
+    l20_compact_ret=0;
+
+    puts("{\"actual_publisher_scorer_failure_is_minus1\":true,\"trace_scope_forwarded\":true,\"no_repeat_rope_or_consumers\":true,\"p_i1_gt_512k_no_fallback\":true,\"p_l1_publisher_verified\":true,\"p_t1_publisher_verified\":true,\"gpu_work\":false}");return 0;
 }

@@ -3959,9 +3959,22 @@ static int publish_indexer_chunk(myds_context_t *ctx, uint32_t il, uint32_t c_st
              * ⇒ blocks ≤ 2048 ⇒ top = blocks = 全选，行内顺序不影响结果。 */
             const uint32_t blocks=(nc+7u)/8u;
             const uint32_t top_blocks=block_budget_cap(blocks<2048u?blocks:2048u);
+#ifndef MYDS_INDEXER_CAPTURE
+            if (nc > 16384u && top_blocks == 2048u) {
+                const int l20_rc = myds_v41_gpu_indexer_l20_compact_topk_scoped(
+                    g->gpu, sel_view, mask_view, scores_buf, nc, glen, g_start, ratio,
+                    mask_bits ? mask_units : mask_stride, mask_bits, top_blocks,
+                    !myds_trace_active());
+                if (l20_rc < 0) return -1;
+                if (l20_rc > 0) {
+                    off += glen;
+                    continue;
+                }
+            }
+#endif
             if (!myds_v41_gpu_candidates_rows(blocks_buf,scores_buf,nc,glen,g_start,ratio,mask_stride)) return -1;
-            if (!myds_v41_gpu_topk_causal(block_sel_buf,blocks_buf,blocks,top_blocks,glen,
-                    g_start,ratio,g->gpu)) return -1;
+            if (!myds_v41_gpu_topk_radix_causal_scoped(g->gpu,block_sel_buf,blocks_buf,blocks,top_blocks,glen,
+                    g_start,ratio,!myds_trace_active())) return -1;
             if (mask_bits) {
                 /* 位打包：每条目 = 1 块 = 1 bit；mask_units 是每行 word 数 */
                 if (!myds_v41_gpu_maskbits_rows(mask_view,block_sel_buf,blk_units,top_blocks,glen,mask_units)) return -1;
@@ -3980,11 +3993,12 @@ static int publish_indexer_chunk(myds_context_t *ctx, uint32_t il, uint32_t c_st
         extern int myds_indexer_capture_topk_begin(void);
         extern int myds_indexer_capture_selected(const myds_metal_buffer_t *,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
         if(!myds_indexer_capture_topk_begin())return -1;
-#endif
         if (!myds_v41_gpu_topk_causal(sel_view,scores_buf,nc,nc<V41_TOPK?nc:V41_TOPK,
                 glen,g_start,ratio,g->gpu)) return -1;
-#ifdef MYDS_INDEXER_CAPTURE
         if(!myds_indexer_capture_selected(sel_view,nc,glen,g_start,ratio,nc<V41_TOPK?nc:V41_TOPK))return -1;
+#else
+        if (!myds_v41_gpu_topk_radix_causal_scoped(g->gpu,sel_view,scores_buf,nc,nc<V41_TOPK?nc:V41_TOPK,
+                glen,g_start,ratio,!myds_trace_active())) return -1;
 #endif
         off+=glen;
     }

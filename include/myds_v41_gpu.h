@@ -241,6 +241,34 @@ int myds_v41_gpu_indexer_prefill_compact_scoped(
     uint32_t n_comp, uint32_t n_tokens, uint32_t causal_start,
     uint32_t causal_ratio, uint32_t mask_units, uint32_t top_blocks_cap,
     bool ordinary_prefill_allowed);
+/* [P-T1] Strict 0-ULP batched causal 2-pass radix/histogram Top-K
+ * + 1024-partition bitonic tie-replay & L20 block-mask self-compact score
+ * gather (MYDS_INDEXER_TOPK_RADIX_CAUSAL: absent/0=off, 1=on, else -1).
+ * Generic myds_v41_gpu_topk_causal remains unchanged for reference/capture. */
+#define MYDS_V41_GPU_HAS_TOPK_RADIX_CAUSAL 1
+int myds_v41_gpu_topk_radix_causal_enabled(void);
+typedef struct {
+    uint64_t requests, encoded, fallbacks, failures, rows;
+    uint64_t l20_compact_requests, l20_compact_encoded, l20_compact_fallbacks, l20_compact_rows;
+} myds_v41_gpu_topk_radix_causal_counters_t;
+void myds_v41_gpu_topk_radix_causal_counters(
+    myds_v41_gpu_topk_radix_causal_counters_t *out, bool reset);
+enum {
+    MYDS_TOPK_RADIX_CAUSAL_UNAVAILABLE_RADIX = 1u,
+    MYDS_TOPK_RADIX_CAUSAL_UNAVAILABLE_L20   = 2u
+};
+void myds_v41_gpu_inject_topk_radix_causal_unavailable(uint32_t mask);
+int myds_v41_gpu_topk_radix_causal_scoped(
+    myds_v41_gpu_scratch_t *scratch, myds_metal_buffer_t *ids,
+    const myds_metal_buffer_t *scores, uint32_t n_cols, uint32_t top,
+    uint32_t n_rows, uint32_t causal_start, uint32_t causal_ratio,
+    bool ordinary_prefill_allowed);
+int myds_v41_gpu_indexer_l20_compact_topk_scoped(
+    myds_v41_gpu_scratch_t *scratch, myds_metal_buffer_t *ids,
+    myds_metal_buffer_t *mask, const myds_metal_buffer_t *scores,
+    uint32_t n_comp, uint32_t n_tokens, uint32_t causal_start,
+    uint32_t causal_ratio, uint32_t mask_stride, bool mask_bits,
+    uint32_t top_blocks, bool ordinary_prefill_allowed);
 /* Default-on prefill-only register-only scorer (MYDS_INDEXER_REGISTER_ONLY:
  * absent/1=on, 0=off; MYDS_INDEXER_RO_SMEM_Q: absent/1=4KB Q-smem, 0=0B baseline).
  * Parse after configuration loading. Original public chunk APIs below always
