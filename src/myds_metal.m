@@ -2101,6 +2101,8 @@ int myds_metal_init(const char *shader_dir) {
                         @"kernel_myds_mask_chunk_scatter",
                         @"kernel_myds_attn_gather_comp",
                         @"kernel_myds_attn_gather_comp_bf16",
+                        @"kernel_myds_attn_gather_comp_512",
+                        @"kernel_myds_attn_gather_comp_512_bf16",
                         @"kernel_dsv41_candidate_filter",
                         @"kernel_dsv41_candidate_blocks",
                         @"kernel_dsv41_quantize",

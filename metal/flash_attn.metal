@@ -969,7 +969,9 @@ template<
     short Q,
     short C,
     short NSG,
-    bool HEAD_BATCH = true>
+    bool HEAD_BATCH = true,
+    bool MASKLESS = false,
+    bool DIRECT_SLAB = false>
 void kernel_myds_flash_attn_heads_reg_o_impl(
         constant ds4_metal_args_flash_attn_ext & args,
         device const char * q,
@@ -1007,19 +1009,19 @@ void kernel_myds_flash_attn_heads_reg_o_impl(
     constexpr short NO_COL = PV8/NSG;
     static_assert(QB * NO_COL == 16, "exactly 16 simdgroup_float8x8 (32 floats/lane)");
 
-    constexpr short SH = 2*C;
+    constexpr short SH = MASKLESS ? C : 2*C;
     constexpr short TS = 2*SH;
 
     // Shared memory layout (no `so`, no `sk/sv`):
     //   [0 .. Q*DK)                : sq      (Q*DK halves = 8 KiB @ Q=8, 16 KiB @ Q=16)
-    //   [Q*DK .. Q*(DK+TS))        : ss+sm2  (Q*256 halves = 4 KiB @ Q=8, 8 KiB @ Q=16)
+    //   [Q*DK .. Q*(DK+TS))        : ss+sm2  (Q*256 halves = 4 KiB @ Q=8) or ss only (2 KiB @ MASKLESS)
     //   [Q*(DK+TS) .. +2*Q)        : s_ms    (Q floats = 32 B @ Q=8, 64 B @ Q=16)
-    // Total dynamic smem: 12,320 B (Q=8, NSG=4) or 24,640 B (Q=16, NSG=8).
+    // Total dynamic smem: 12,320 B (Q=8, NSG=4), 10,272 B (Q=8, NSG=4, MASKLESS -> 3 TGs/core), or 24,640 B (Q=16).
     threadgroup half   * sq   = shmem_f16;
     threadgroup half4  * sq4  = (threadgroup half4 *) shmem_f16;
     threadgroup float  * ss   = (threadgroup float *) (shmem_f16 + Q*DK);
     threadgroup float2 * ss2  = (threadgroup float2 *) (shmem_f16 + Q*DK);
-    threadgroup half2  * sm2  = (threadgroup half2 *) (shmem_f16 + Q*DK + 2*C);
+    threadgroup half2  * sm2  = MASKLESS ? nullptr : (threadgroup half2 *) (shmem_f16 + Q*DK + 2*C);
     threadgroup float  * s_ms = (threadgroup float *) (shmem_f16 + Q*(DK + TS));
 
     const short lo_row = ((tiisg >> 2) & 4) | ((tiisg >> 1) & 3);
@@ -1027,18 +1029,21 @@ void kernel_myds_flash_attn_heads_reg_o_impl(
 
     device const half2 * pm2[NQ];
 
-    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
-        const short j = jj*NSG + sgitg;
+    if (!MASKLESS) {
+        FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+            const short j = jj*NSG + sgitg;
 
-        pm2[jj] = (device const half2 *) ((device const char *) mask + (iq1 + j)*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
-    }
+            pm2[jj] = (device const half2 *) ((device const char *) mask + (iq1 + j)*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
+        }
 
-    {
         const int32_t nblk1 = ((args.ne01 + Q - 1)/Q);
         const int32_t nblk0 = ((args.ne11 + C - 1)/C);
 
         blk += (((iq3%args.ne33)*args.ne32 + (iq2%args.ne32))*nblk1 + iq1/Q)*nblk0;
     }
+
+    device const char * slab_k = DIRECT_SLAB ? (pad + (uint64_t)iq2*args.nb11) : nullptr;
+    device const char * slab_v = DIRECT_SLAB ? (pad + (uint64_t)iq2*args.nb21) : nullptr;
 
     {
         q += iq1*args.nb01 + iq2*args.nb02 + iq3*args.nb03;
@@ -1099,7 +1104,7 @@ void kernel_myds_flash_attn_heads_reg_o_impl(
                 break;
             }
 
-            if (FC_flash_attn_ext_has_kvpad && ic + C > args.ne11) {
+            if (!MASKLESS && FC_flash_attn_ext_has_kvpad && ic + C > args.ne11) {
                 k    = pad;
                 v    = k + args.nb11*C*args.ne_12_2*args.ne_12_3;
                 mask = v + args.nb21*C*args.ne_12_2*args.ne_12_3;
@@ -1136,9 +1141,9 @@ void kernel_myds_flash_attn_heads_reg_o_impl(
                 ic = 0;
             }
 
-            char blk_cur = 1;
+            char blk_cur = MASKLESS ? 2 : 1;
 
-            if (FC_flash_attn_ext_has_mask) {
+            if (!MASKLESS && FC_flash_attn_ext_has_mask) {
                 blk_cur = blk[ic0];
 
                 if (blk_cur == 0) {
@@ -1169,7 +1174,10 @@ void kernel_myds_flash_attn_heads_reg_o_impl(
             }
 
             {
-                device      const half  * pk = (device const half *) (k + ic*args.nb11) + sgitg*(8*NS10);
+                device const char * k_src = (DIRECT_SLAB && ic < 128)
+                    ? (slab_k + (uint64_t)ic*args.nb11)
+                    : (k + (uint64_t)(DIRECT_SLAB ? (ic - 128) : ic)*args.nb11);
+                device      const half  * pk = (device const half *) k_src + sgitg*(8*NS10);
                 threadgroup       float * ps = ss + sgitg*8;
 
                 constexpr short NC_QK = (C/8)/NSG;
@@ -1223,7 +1231,7 @@ void kernel_myds_flash_attn_heads_reg_o_impl(
                     s2 = args.logit_softcap*precise::tanh(s2);
                 }
 
-                if (blk_cur != 2) {
+                if (!MASKLESS && blk_cur != 2) {
                     if (FC_flash_attn_ext_has_bias) {
                         s2 += float2(sm2[j*SH + tiisg])*slope;
                     } else {
@@ -1259,7 +1267,10 @@ void kernel_myds_flash_attn_heads_reg_o_impl(
             }
 
             {
-                device const half * pv = (device const half *) (v + ic*args.nb21) + 8*sgitg;
+                device const char * v_src = (DIRECT_SLAB && ic < 128)
+                    ? (slab_v + (uint64_t)ic*args.nb21)
+                    : (v + (uint64_t)(DIRECT_SLAB ? (ic - 128) : ic)*args.nb21);
+                device const half * pv = (device const half *) v_src + 8*sgitg;
 
                 constexpr short NC_PV = (C/8)/2;
 
@@ -1365,7 +1376,9 @@ template<
     short Q,
     short C,
     short NSG,
-    bool HEAD_BATCH = true>
+    bool HEAD_BATCH = true,
+    bool MASKLESS = false,
+    bool DIRECT_SLAB = false>
 kernel void kernel_myds_flash_attn_heads_reg_o(
         constant ds4_metal_args_flash_attn_ext & args,
         device const char * q,
@@ -1381,16 +1394,22 @@ kernel void kernel_myds_flash_attn_heads_reg_o(
         ushort  tiisg[[thread_index_in_simdgroup]],
         ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
     if (FC_flash_attn_ext_nsg == NSG) {
-        kernel_myds_flash_attn_heads_reg_o_impl<DK, DV, Q, C, NSG, HEAD_BATCH>(
+        kernel_myds_flash_attn_heads_reg_o_impl<DK, DV, Q, C, NSG, HEAD_BATCH, MASKLESS, DIRECT_SLAB>(
             args, q, k, v, mask, sinks, pad, blk, dst, shmem_f16, tgpig, tiisg, sgitg);
     }
 }
 
 typedef decltype(kernel_myds_flash_attn_heads_reg_o<512, 512, 8, 64, 4, true>) flash_attn_heads_reg_o_t;
+typedef decltype(kernel_myds_flash_attn_heads_reg_o<512, 512, 8, 64, 4, true, true, true>) flash_attn_heads_reg_o_fast_t;
 
 // Step 1 (Q=8, C=64, NSG=4 Reg-O): 12,320 B smem (2 TGs = 256 threads/core).
 template [[host_name("kernel_myds_flash_attn_heads_f16_dk512_dv512")]]
 kernel flash_attn_heads_reg_o_t kernel_myds_flash_attn_heads_reg_o<512, 512, 8, 64, 4, true>;
+
+// [P-NEW-3] Maskless + Direct Window Slab Reg-O (Q=8, C=64, NSG=4):
+// SH=C=64 => 10,272 B smem (3 TGs = 384 threads/core, +50% occupancy).
+template [[host_name("kernel_myds_flash_attn_heads_maskless_slab_f16_dk512_dv512")]]
+kernel flash_attn_heads_reg_o_fast_t kernel_myds_flash_attn_heads_reg_o<512, 512, 8, 64, 4, true, true, true>;
 
 // Step 2 (Q=16, C=64, NSG=8 Reg-O): 24,640 B smem (1 TG = 256 threads/core).
 template [[host_name("kernel_myds_flash_attn_heads_q16_f16_dk512_dv512")]]

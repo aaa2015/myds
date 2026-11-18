@@ -104,8 +104,10 @@ kernel void kernel_myds_attn_gather_window(
     if (tiitg == 0u) mask[(ulong)q * args.mask_stride + d] = vis ? 0u : 0xfc00u;
 }
 
-/* 每个线程组 = (query q, 第 j 个 pick)，同样 128 线程 × half4。 */
-template<bool BF16>
+/* 每个线程组 = (query q, 第 j 个 pick)，同样 128 线程 × half4。
+ * COMPACT512=true ([P-NEW-3]): 滑窗由 attention 核直读 slab，此处仅紧凑写出
+ * 512 个压缩键（stride=512，缩 20% 体积）且不写 mask（全可见无掩码路径）。 */
+template<bool BF16, bool COMPACT512 = false>
 kernel void kernel_myds_attn_gather_comp_storage(
         constant myds_attn_gather_args &args,
         device half          *dst,
@@ -121,7 +123,9 @@ kernel void kernel_myds_attn_gather_comp_storage(
     int idx = -1;
     if (j < args.top_k && j < count) idx = ids[(ulong)q * args.top_k + j];
     const bool vis = (idx >= 0) && ((uint)idx < args.n_comp);
-    device half4 *o = (device half4 *)(dst + ((ulong)q * 640u + 128u + j) * 512u);
+    device half4 *o = COMPACT512
+        ? (device half4 *)(dst + ((ulong)q * 512u + j) * 512u)
+        : (device half4 *)(dst + ((ulong)q * 640u + 128u + j) * 512u);
     if (vis) {
         float4 x;
         if(BF16){
@@ -136,10 +140,14 @@ kernel void kernel_myds_attn_gather_comp_storage(
     } else {
         o[tiitg] = half4(0.0h);
     }
-    if (tiitg == 0u) mask[(ulong)q * args.mask_stride + 128u + j] = vis ? 0u : 0xfc00u;
+    if (!COMPACT512 && tiitg == 0u) mask[(ulong)q * args.mask_stride + 128u + j] = vis ? 0u : 0xfc00u;
 }
-typedef decltype(kernel_myds_attn_gather_comp_storage<false>) myds_attn_gather_comp_t;
+typedef decltype(kernel_myds_attn_gather_comp_storage<false, false>) myds_attn_gather_comp_t;
 template [[host_name("kernel_myds_attn_gather_comp")]]
-kernel myds_attn_gather_comp_t kernel_myds_attn_gather_comp_storage<false>;
+kernel myds_attn_gather_comp_t kernel_myds_attn_gather_comp_storage<false, false>;
 template [[host_name("kernel_myds_attn_gather_comp_bf16")]]
-kernel myds_attn_gather_comp_t kernel_myds_attn_gather_comp_storage<true>;
+kernel myds_attn_gather_comp_t kernel_myds_attn_gather_comp_storage<true, false>;
+template [[host_name("kernel_myds_attn_gather_comp_512")]]
+kernel myds_attn_gather_comp_t kernel_myds_attn_gather_comp_storage<false, true>;
+template [[host_name("kernel_myds_attn_gather_comp_512_bf16")]]
+kernel myds_attn_gather_comp_t kernel_myds_attn_gather_comp_storage<true, true>;

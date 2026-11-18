@@ -70,7 +70,34 @@ struct myds_v41_gpu_scratch {
     myds_metal_buffer_t *compact_stage1, *compact_stage2;
     uint32_t compact_prepared_count;
     myds_metal_buffer_t *radix_row_meta; /* [P-T1] 72 KiB per-row radix/NaN metadata */
+    /* [P-NEW-3] Cross-layer gathered compressed KV reuse cache (MYDS_PREFILL_ATTN_FAST=1). */
+    bool     gathered_cache_valid;
+    bool     gathered_cache_comp_bf16;
+    bool     gathered_cache_compact512;
+    bool     gathered_cache_mask_valid;
+    const void *gathered_cache_dst_ptr;
+    const void *gathered_cache_comp_ptr;
+    const void *gathered_cache_ids_ptr;
+    uint32_t gathered_cache_c_len;
+    uint32_t gathered_cache_n_comp;
+    uint32_t gathered_cache_top_k;
+    uint32_t gathered_cache_base_pos;
+    uint32_t gathered_cache_c_start;
+    uint32_t gathered_cache_ratio;
+    uint32_t gathered_cache_mask_stride;
+    uint64_t gathered_cache_comp_gen;
 };
+static _Atomic uint64_t comp_kv_write_gen;
+static inline void gathered_cache_invalidate(myds_v41_gpu_scratch_t *s) {
+    if (s) {
+        s->gathered_cache_valid = false;
+        s->gathered_cache_mask_valid = false;
+    }
+}
+static int prefill_attn_fast_enabled(void) {
+    const char *v = getenv("MYDS_PREFILL_ATTN_FAST");
+    return (v && strcmp(v, "1") == 0) ? 1 : 0;
+}
 static uint32_t attn_matrix_test_failure;
 void myds_v41_gpu_inject_attention_matrix_failure(uint32_t kind) {
     attn_matrix_test_failure=kind;
@@ -251,6 +278,7 @@ int myds_v41_gpu_pack_bf16(myds_metal_buffer_t *dst,size_t dst_offset_words,
     if(!bf16s(dst,count)||!floats(src,count)||
        dst_offset_words>myds_metal_buffer_size(dst)/2-count||
        src_offset_floats>myds_metal_buffer_size(src)/4-count)return 0;
+    atomic_fetch_add_explicit(&comp_kv_write_gen, 1u, memory_order_relaxed);
     struct {uint64_t dst_offset,src_offset;uint32_t count,pad;} a={
         dst_offset_words,src_offset_floats,count,0};
     const myds_metal_buffer_t *b[]={src,dst};
@@ -549,6 +577,7 @@ int myds_v41_gpu_indexer_rope_quant_batch(myds_metal_buffer_t *x,
     const uint64_t total_elems=(uint64_t)128u*heads*rows;
     if(packed_dst&&(!bf16s(packed_dst,total_elems)||
        dst_offset_words>myds_metal_buffer_size(packed_dst)/2u-total_elems))return 0;
+    if(packed_dst) atomic_fetch_add_explicit(&comp_kv_write_gen, 1u, memory_order_relaxed);
     pthread_once(&rope_once,init_rope);
     struct {
         uint32_t heads,rows,start,stride,mode,pack_bf16;
@@ -590,6 +619,7 @@ int myds_v41_gpu_kv_rope_quant_batch(myds_metal_buffer_t *x,
     const uint64_t total_elems=(uint64_t)512u*rows;
     if(packed_dst&&(!bf16s(packed_dst,total_elems)||
        dst_offset_words>myds_metal_buffer_size(packed_dst)/2u-total_elems))return 0;
+    if(packed_dst) atomic_fetch_add_explicit(&comp_kv_write_gen, 1u, memory_order_relaxed);
     pthread_once(&rope_once,init_rope);
     struct {
         uint32_t heads,rows,start,stride,mode,pack_bf16;
@@ -1356,6 +1386,7 @@ int myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped_mode(
     const myds_metal_buffer_t *cache,uint32_t n_comp,uint32_t n_heads,
     uint32_t n_tokens,uint32_t causal_start,uint32_t causal_ratio,
     uint32_t cache_mode,bool ordinary_prefill_allowed) {
+    gathered_cache_invalidate(scratch);
     atomic_fetch_add_explicit(&indexer_register_only_counters[IRO_REQUESTS],1u,memory_order_relaxed);
     const int mode=myds_v41_gpu_indexer_register_only_enabled();
     if(mode<0)return indexer_register_only_failure("invalid configuration");
@@ -1524,6 +1555,7 @@ int myds_v41_gpu_indexer_prefill_compact_mode(
     const myds_metal_buffer_t *cache, const myds_metal_buffer_t *mask_bits,
     uint32_t n_comp, uint32_t n_tokens, uint32_t causal_start,
     uint32_t causal_ratio, uint32_t mask_units, uint32_t cache_mode) {
+    gathered_cache_invalidate(s);
     if (indexer_prefill_compact_test_unavailable) return 0;
     if (cache_mode != MYDS_INDEXER_CACHE_BF16 && cache_mode != MYDS_INDEXER_CACHE_FP4) return 0;
     const uint32_t max_glen = myds_v41_gpu_indexer_prefill_compact_max_glen(s);
@@ -2459,6 +2491,7 @@ static int threshold_encode(myds_metal_buffer_t *ids,const myds_metal_buffer_t *
 }
 int myds_v41_gpu_topk_threshold_candidate(myds_metal_buffer_t *ids,
     const myds_metal_buffer_t *scores,uint32_t cols,myds_v41_gpu_scratch_t *s) {
+    gathered_cache_invalidate(s);
     atomic_fetch_add_explicit(&threshold_host_requests,1u,memory_order_relaxed);
     const int ok=threshold_encode(ids,scores,cols,s);
     atomic_fetch_add_explicit(ok?&threshold_host_encoded:&threshold_host_errors,1u,memory_order_relaxed);
@@ -2466,18 +2499,21 @@ int myds_v41_gpu_topk_threshold_candidate(myds_metal_buffer_t *ids,
 }
 int myds_v41_gpu_topk_threshold(myds_metal_buffer_t *ids,const myds_metal_buffer_t *scores,
     uint32_t cols,uint32_t top,myds_v41_gpu_scratch_t *s) {
+    gathered_cache_invalidate(s);
     if(!myds_v41_gpu_topk_threshold_enabled()||top!=512u||cols<8192u||cols>262144u)
         return topk_rows_causal(ids,scores,cols,top,1,0,0,s);
     return myds_v41_gpu_topk_threshold_candidate(ids,scores,cols,s);
 }
 int myds_v41_gpu_topk(myds_metal_buffer_t *ids,const myds_metal_buffer_t *scores,
     uint32_t n_cols,uint32_t top,myds_v41_gpu_scratch_t *s) {
+    gathered_cache_invalidate(s);
     if(myds_v41_gpu_topk_nan_shuffle_enabled())return topk_rows_causal_nan_shuffle(ids,scores,n_cols,top,1,0,0,s);
     return topk_rows_causal(ids,scores,n_cols,top,1,0,0,s);
 }
 int myds_v41_gpu_topk_causal(myds_metal_buffer_t *ids,const myds_metal_buffer_t *scores,
     uint32_t n_cols,uint32_t top,uint32_t n_rows,uint32_t causal_start,uint32_t causal_ratio,
     myds_v41_gpu_scratch_t *s) {
+    gathered_cache_invalidate(s);
     if(myds_v41_gpu_topk_nan_shuffle_enabled())return topk_rows_causal_nan_shuffle(ids,scores,n_cols,top,n_rows,causal_start,causal_ratio,s);
     return topk_rows_causal(ids,scores,n_cols,top,n_rows,causal_start,causal_ratio,s);
 }
@@ -2722,6 +2758,7 @@ int myds_v41_gpu_topk_radix_causal_scoped(
     const myds_metal_buffer_t *scores, uint32_t n_cols, uint32_t top,
     uint32_t n_rows, uint32_t causal_start, uint32_t causal_ratio,
     bool ordinary_prefill_allowed) {
+    gathered_cache_invalidate(s);
     atomic_fetch_add_explicit(&topk_radix_causal_cnt[TRC_REQUESTS], 1u, memory_order_relaxed);
     const int mode = myds_v41_gpu_topk_radix_causal_enabled();
     if (mode < 0) {
@@ -2976,6 +3013,7 @@ int myds_v41_gpu_indexer_l20_compact_topk_scoped(
     uint32_t n_comp, uint32_t n_tokens, uint32_t causal_start,
     uint32_t causal_ratio, uint32_t mask_stride, bool mask_bits,
     uint32_t top_blocks, bool ordinary_prefill_allowed) {
+    gathered_cache_invalidate(s);
     atomic_fetch_add_explicit(&topk_radix_causal_cnt[TRC_L20_REQUESTS], 1u, memory_order_relaxed);
     const int mode = myds_v41_gpu_topk_radix_causal_enabled();
     if (mode < 0) {
@@ -3107,6 +3145,7 @@ static int build_chunk_mask_template(myds_v41_gpu_scratch_t *s,uint32_t c_len,ui
     if(!dispatch("kernel_myds_mask_chunk_window",a,sizeof(a),b,1,
                  (cols+63u)/64u,c_len,1,64,1,1,0))return 0;
     s->tmpl_len=c_len;s->tmpl_carry=carry;
+    s->gathered_cache_mask_valid=false;
     return 1;
 }
 
@@ -3128,6 +3167,7 @@ static int ensure_chunk_workspace(myds_v41_gpu_scratch_t *s,uint32_t rows) {
     myds_metal_buffer_free(s->kv_chunk);myds_metal_buffer_free(s->mask_chunk);
     s->kv_chunk=kv;s->mask_chunk=mask;s->slab_rows=full_rows;s->mask_u16=full_rows;
     s->tmpl_len=0;s->tmpl_carry=0;
+    s->gathered_cache_mask_valid=false;
     return 1;
 }
 
@@ -3224,21 +3264,107 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
         if(!dispatch("kernel_myds_mask_chunk_scatter",&ma,sizeof(ma),sb,2,
                      (top_k+63u)/64u,c_len,1,64,1,1,0))return 0;
     }
+    /* Window-only layers (L0/L1, n_comp==0) or slab-fallback chunks always
+     * invalidate the cross-layer gathered cache, guaranteeing a fresh cache
+     * at the start of every prefill request (including after kvdisk restore). */
+    gathered_cache_invalidate(s);
     }   /* !use_gather */
 
+    const int fast_enabled = prefill_attn_fast_enabled();
+    const char *hm=getenv("MYDS_ATTN_HEADS_MODE");
+    const int hm_smem=hm && !strcmp(hm,"smem");
+    const int hm_q16=hm && !strcmp(hm,"q16");
+    const int hm_q8=!hm_smem && !hm_q16;
+    const int all_visible = (p0 >= MYDS_CHUNK_CARRY) && (ratio > 0u) &&
+        ((p0 + 1u) / ratio >= 512u) && (top_k == 512u) && (n_comp >= 512u) &&
+        (s->keys_clamp == 0u);
+#ifdef MYDS_ATTENTION_MULTIHEAD_CAPTURE
+    const int use_fast_matrix = 0;
+#else
+    const int use_fast_matrix = fast_enabled && use_matrix && all_visible &&
+        hm_q8 && attn_matrix_test_failure == 0u;
+#endif
+
     if (use_gather) {
-        /* Both gather kernels overwrite the shared mask, even when their chunk
-         * has a different length. A later window-only layer must rebuild it. */
-        s->tmpl_len=0;s->tmpl_carry=0;
         struct myds_attn_gather_args ga={
             c_len,top_k,n_comp,MYDS_CHUNK_CARRY-carry,s->mask_u16,c_start,base_pos,ratio};
-        {   const myds_metal_buffer_t *g1[]={gathered,s->mask_chunk,s->kv_chunk};
-            if(!dispatch("kernel_myds_attn_gather_window",&ga,sizeof(ga),g1,3,
-                         128u,c_len,1,128,1,1,0))return 0; }
-        {   const myds_metal_buffer_t *g2[]={gathered,s->mask_chunk,comp_kv,ids};
-            if(!dispatch(comp_bf16?"kernel_myds_attn_gather_comp_bf16":
-                         "kernel_myds_attn_gather_comp",&ga,sizeof(ga),g2,4,
-                         512u,c_len,1,128,1,1,0))return 0; }
+        const uint64_t comp_gen = atomic_load_explicit(&comp_kv_write_gen, memory_order_relaxed);
+        const void *dst_ptr = myds_metal_buffer_data(gathered);
+        const void *comp_ptr = myds_metal_buffer_data((myds_metal_buffer_t *)comp_kv);
+        const void *ids_ptr = myds_metal_buffer_data((myds_metal_buffer_t *)ids);
+        const bool gather_comp_hit = fast_enabled && s->gathered_cache_valid &&
+            s->gathered_cache_comp_bf16 == comp_bf16 &&
+            s->gathered_cache_compact512 == (use_fast_matrix != 0) &&
+            (use_fast_matrix || (s->gathered_cache_mask_valid &&
+                                 s->gathered_cache_mask_stride == s->mask_u16)) &&
+            s->gathered_cache_dst_ptr == dst_ptr &&
+            s->gathered_cache_comp_ptr == comp_ptr &&
+            s->gathered_cache_ids_ptr == ids_ptr &&
+            s->gathered_cache_c_len == c_len &&
+            s->gathered_cache_n_comp == n_comp &&
+            s->gathered_cache_top_k == top_k &&
+            s->gathered_cache_base_pos == base_pos &&
+            s->gathered_cache_c_start == c_start &&
+            s->gathered_cache_ratio == ratio &&
+            s->gathered_cache_comp_gen == comp_gen;
+        if (use_fast_matrix) {
+            /* [P-NEW-3] Sliding window is read directly from s->kv_chunk (slab);
+             * only gather the 512 compressed keys in compact-512 layout (and skip
+             * across follower layers on single-chunk reuse hit). */
+            if (!gather_comp_hit) {
+                const myds_metal_buffer_t *g2[]={gathered,s->mask_chunk,comp_kv,ids};
+                if(!dispatch(comp_bf16?"kernel_myds_attn_gather_comp_512_bf16":
+                             "kernel_myds_attn_gather_comp_512",&ga,sizeof(ga),g2,4,
+                             512u,c_len,1,128,1,1,0))return 0;
+                s->gathered_cache_valid = true;
+                s->gathered_cache_comp_bf16 = comp_bf16;
+                s->gathered_cache_compact512 = true;
+                s->gathered_cache_mask_valid = false;
+                s->gathered_cache_dst_ptr = dst_ptr;
+                s->gathered_cache_comp_ptr = comp_ptr;
+                s->gathered_cache_ids_ptr = ids_ptr;
+                s->gathered_cache_c_len = c_len;
+                s->gathered_cache_n_comp = n_comp;
+                s->gathered_cache_top_k = top_k;
+                s->gathered_cache_base_pos = base_pos;
+                s->gathered_cache_c_start = c_start;
+                s->gathered_cache_ratio = ratio;
+                s->gathered_cache_mask_stride = 0u;
+                s->gathered_cache_comp_gen = comp_gen;
+            }
+        } else {
+            /* Both gather kernels overwrite the shared mask, even when their chunk
+             * has a different length. A later window-only layer must rebuild it. */
+            s->tmpl_len=0;s->tmpl_carry=0;
+            {   const myds_metal_buffer_t *g1[]={gathered,s->mask_chunk,s->kv_chunk};
+                if(!dispatch("kernel_myds_attn_gather_window",&ga,sizeof(ga),g1,3,
+                             128u,c_len,1,128,1,1,0))return 0; }
+            if (!gather_comp_hit) {
+                const myds_metal_buffer_t *g2[]={gathered,s->mask_chunk,comp_kv,ids};
+                if(!dispatch(comp_bf16?"kernel_myds_attn_gather_comp_bf16":
+                             "kernel_myds_attn_gather_comp",&ga,sizeof(ga),g2,4,
+                             512u,c_len,1,128,1,1,0))return 0;
+                if (fast_enabled) {
+                    s->gathered_cache_valid = true;
+                    s->gathered_cache_comp_bf16 = comp_bf16;
+                    s->gathered_cache_compact512 = false;
+                    s->gathered_cache_mask_valid = true;
+                    s->gathered_cache_dst_ptr = dst_ptr;
+                    s->gathered_cache_comp_ptr = comp_ptr;
+                    s->gathered_cache_ids_ptr = ids_ptr;
+                    s->gathered_cache_c_len = c_len;
+                    s->gathered_cache_n_comp = n_comp;
+                    s->gathered_cache_top_k = top_k;
+                    s->gathered_cache_base_pos = base_pos;
+                    s->gathered_cache_c_start = c_start;
+                    s->gathered_cache_ratio = ratio;
+                    s->gathered_cache_mask_stride = s->mask_u16;
+                    s->gathered_cache_comp_gen = comp_gen;
+                } else {
+                    gathered_cache_invalidate(s);
+                }
+            }
+        }
     }
 
     /* 2026-10-24 诊断（MYDS_PROFILE_ATTN_SUB=1）：把 gather 与 flash-attn 分开计时。
@@ -3277,50 +3403,82 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
         /* Keep a unchanged: an unavailable matrix PSO/32KiB workspace must fall
          * back with the original query/head axes and gathered-KV strides. */
         struct flash_vec_args ma=a;
-        int ready=1;
-        if(!s->attn_head_blocks){
-            s->attn_head_blocks=myds_metal_buffer_alloc((size_t)MYDS_CHUNK_MAXC*8u*10u);
-            if(!s->attn_head_blocks)ready=0;
-        }
         ma.ne01=64;ma.ne02=(int32_t)c_len;ma.nb01=2048u;ma.nb02=64u*2048u;
         ma.ne_12_2=(int32_t)c_len;ma.ne31=64;ma.ne32=(int32_t)c_len;
         ma.nb31=0;ma.nb32=(uint64_t)s->mask_u16*2u;
-        struct {int32_t ne01,ne30,ne31,ne32,ne33;uint64_t nb31,nb32,nb33;} ba={
-            64,640,64,(int32_t)c_len,1,0,(uint64_t)s->mask_u16*2u,
-            (uint64_t)s->mask_u16*2u*c_len};
-        _Static_assert(sizeof(ba)==48,"flash block scanner Metal ABI");
-        const char *hm=getenv("MYDS_ATTN_HEADS_MODE");
-        const int hm_smem=hm && !strcmp(hm,"smem");
-        const int hm_q16=hm && !strcmp(hm,"q16");
-        const int hm_q8=!hm_smem && !hm_q16;
-        (void)hm_q8;
-        const int32_t q_tile=hm_q16 ? 16 : 8;
-        const int32_t nsg=hm_q16 ? 8 : 4;
-        const uint32_t nblk1=(uint32_t)(64/q_tile);
-        const myds_metal_buffer_t *bb[]={s->mask_chunk,s->attn_head_blocks};
-        const myds_metal_constant_t bc[]={{224,false,q_tile},{225,false,64}};
-        if(ready)ready=specialized("kernel_flash_attn_ext_blk",&ba,sizeof(ba),bb,2,
-                                  10,nblk1,c_len,32,1,1,0,bc,2);
-        const myds_metal_buffer_t *mb[]={q,kv_sel,kv_sel,s->mask_chunk,sinks,s->pad,s->attn_head_blocks,heads};
-        const myds_metal_constant_t mc[]={{300,true,1},{301,true,1},{302,true,0},{303,true,0},
-            {304,true,0},{310,true,0},{320,false,512},{321,false,512},{322,false,nsg}};
-        /* Both diagnostic failures use the real PSO/dispatch validation path.
-         * It returns before encoding a matrix dispatch for absent functions or
-         * excessive shared memory. A prior scanner only modifies its flags. */
-        const char *kernel=attn_matrix_test_failure==1?
-            "kernel_myds_attention_test_missing_matrix_pso":
-            (hm_smem?"kernel_myds_flash_attn_heads_smem_f16_dk512_dv512":
-             hm_q16?"kernel_myds_flash_attn_heads_q16_f16_dk512_dv512":
-                    "kernel_myds_flash_attn_heads_f16_dk512_dv512");
-        const size_t smem=attn_matrix_test_failure==2?SIZE_MAX-15u:
-            (hm_smem?32768u:hm_q16?24640u:12320u);
-        if(ready)matrix_encoded=specialized(kernel,&ma,192,mb,8,nblk1,c_len,1,32,(uint32_t)nsg,1,smem,mc,9);
-        if(matrix_encoded){
-            matrix_kernel_used=kernel;
-            matrix_smem_used=smem;
-            attn_count(AC_MATRIX);
+        if (use_fast_matrix) {
+            /* [P-NEW-3] Maskless + Direct Window Slab Reg-O (Q=8, NSG=4, 10,272 B smem):
+             * skips kernel_flash_attn_ext_blk and reads ic0=0,1 directly from s->kv_chunk
+             * (passed in pad slot) and ic0=2..9 from compact-512 gathered KV. */
+            if (!myds_metal_get_auto_barrier()) {
+                const myds_metal_buffer_t *pre_deps[] = { s->kv_chunk, gathered };
+                myds_metal_barrier_buffers(pre_deps, 2u);
+            }
+            ma.nb12=512u*1024u;ma.nb13=512u*1024u;
+            ma.nb22=512u*1024u;ma.nb23=512u*1024u;
+            const myds_metal_buffer_t *mb[]={q,kv_sel,kv_sel,s->mask_chunk,sinks,s->kv_chunk,s->pad,heads};
+            const myds_metal_constant_t mc[]={{300,true,0},{301,true,1},{302,true,0},{303,true,0},
+                {304,true,0},{310,true,0},{320,false,512},{321,false,512},{322,false,4}};
+            const char *kernel="kernel_myds_flash_attn_heads_maskless_slab_f16_dk512_dv512";
+            const size_t smem=10272u;
+            matrix_encoded=specialized(kernel,&ma,192,mb,8,8u,c_len,1,32,4u,1,smem,mc,9);
+            if(matrix_encoded){
+                matrix_kernel_used=kernel;
+                matrix_smem_used=smem;
+                attn_count(AC_MATRIX);
+            } else {
+                /* Populate standard 640-stride gathered + mask before falling back to vec. */
+                gathered_cache_invalidate(s);
+                s->tmpl_len=0;s->tmpl_carry=0;
+                struct myds_attn_gather_args ga={
+                    c_len,top_k,n_comp,MYDS_CHUNK_CARRY-carry,s->mask_u16,c_start,base_pos,ratio};
+                const myds_metal_buffer_t *g1[]={gathered,s->mask_chunk,s->kv_chunk};
+                const myds_metal_buffer_t *g2[]={gathered,s->mask_chunk,comp_kv,ids};
+                if(!dispatch("kernel_myds_attn_gather_window",&ga,sizeof(ga),g1,3,
+                             128u,c_len,1,128,1,1,0))return 0;
+                if(!dispatch(comp_bf16?"kernel_myds_attn_gather_comp_bf16":
+                             "kernel_myds_attn_gather_comp",&ga,sizeof(ga),g2,4,
+                             512u,c_len,1,128,1,1,0))return 0;
+            }
+        } else {
+            int ready=1;
+            if(!s->attn_head_blocks){
+                s->attn_head_blocks=myds_metal_buffer_alloc((size_t)MYDS_CHUNK_MAXC*8u*10u);
+                if(!s->attn_head_blocks)ready=0;
+            }
+            struct {int32_t ne01,ne30,ne31,ne32,ne33;uint64_t nb31,nb32,nb33;} ba={
+                64,640,64,(int32_t)c_len,1,0,(uint64_t)s->mask_u16*2u,
+                (uint64_t)s->mask_u16*2u*c_len};
+            _Static_assert(sizeof(ba)==48,"flash block scanner Metal ABI");
+            const int32_t q_tile=hm_q16 ? 16 : 8;
+            const int32_t nsg=hm_q16 ? 8 : 4;
+            const uint32_t nblk1=(uint32_t)(64/q_tile);
+            const myds_metal_buffer_t *bb[]={s->mask_chunk,s->attn_head_blocks};
+            const myds_metal_constant_t bc[]={{224,false,q_tile},{225,false,64}};
+            if(ready)ready=specialized("kernel_flash_attn_ext_blk",&ba,sizeof(ba),bb,2,
+                                      10,nblk1,c_len,32,1,1,0,bc,2);
+            const myds_metal_buffer_t *mb[]={q,kv_sel,kv_sel,s->mask_chunk,sinks,s->pad,s->attn_head_blocks,heads};
+            const myds_metal_constant_t mc[]={{300,true,1},{301,true,1},{302,true,0},{303,true,0},
+                {304,true,0},{310,true,0},{320,false,512},{321,false,512},{322,false,nsg}};
+            /* Both diagnostic failures use the real PSO/dispatch validation path.
+             * It returns before encoding a matrix dispatch for absent functions or
+             * excessive shared memory. A prior scanner only modifies its flags. */
+            const char *kernel=attn_matrix_test_failure==1?
+                "kernel_myds_attention_test_missing_matrix_pso":
+                (hm_smem?"kernel_myds_flash_attn_heads_smem_f16_dk512_dv512":
+                 hm_q16?"kernel_myds_flash_attn_heads_q16_f16_dk512_dv512":
+                        "kernel_myds_flash_attn_heads_f16_dk512_dv512");
+            const size_t smem=attn_matrix_test_failure==2?SIZE_MAX-15u:
+                (hm_smem?32768u:hm_q16?24640u:12320u);
+            if(ready)matrix_encoded=specialized(kernel,&ma,192,mb,8,nblk1,c_len,1,32,(uint32_t)nsg,1,smem,mc,9);
+            if(matrix_encoded){
+                matrix_kernel_used=kernel;
+                matrix_smem_used=smem;
+                attn_count(AC_MATRIX);
+            }
         }
-        else{
+        if(!matrix_encoded){
+            gathered_cache_invalidate(s);
             if(s->prefill_attn_variant!=2){ /* explicit matrix is strict */
                 MYDS_LOG_E("attention: MYDS_PREFILL_ATTN=matrix could not encode "
                            "(c_len=%u n_comp=%u pos=%u); set MYDS_DEBUG_DISPATCH=1 for the reason",
@@ -3908,6 +4066,7 @@ static int attention_staged_impl(myds_metal_buffer_t *heads,const myds_metal_buf
 int myds_v41_gpu_attention(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *window,uint32_t n_raw,
     uint32_t raw_start,const myds_metal_buffer_t *selected_kv,uint32_t selected_rows,myds_v41_gpu_scratch_t *s) {
+    gathered_cache_invalidate(s);
     const int mode=myds_v41_gpu_attention_packed_register_enabled();
     if(mode) attention_register_count(AR_REQUESTS);
     if(mode<0) {attention_register_count(AR_FAILURES);return 0;}
@@ -3921,6 +4080,7 @@ static int attention_direct_impl(myds_metal_buffer_t *heads,const myds_metal_buf
     uint32_t raw_start,const myds_metal_buffer_t *comp_kv,const myds_metal_buffer_t *selected_ids,
     uint32_t source_rows,uint32_t selected_rows,myds_v41_gpu_scratch_t *s,int register_mode,
     const struct attention_rope_scope *rope) {
+    gathered_cache_invalidate(s);
     const int kv_reuse_mode = rope ? myds_v41_attn_kv_reuse_enabled() : 0;
     if (kv_reuse_mode < 0) return 0;
     const bool want_kv_reuse = (kv_reuse_mode == 1);
