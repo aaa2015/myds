@@ -1,0 +1,1617 @@
+{
+  "timestamp": "2026-11-19T08:30:52+0800",
+  "binary_sha256": "b2e1c2b13be7eaa2ede9fee6452c675d42aadafdd6b22098f2fdc2c2bc470cc2",
+  "metallib_sha256": "da5711cf5294a75b79bb4366d7398bf96f389c3d86cd73e7a20960d0a4fb5fd8",
+  "crashes_before": 0,
+  "arms": [
+    {
+      "arm": "armA_baseline",
+      "overrides": {
+        "MYDS_MOE_PREFILL_WIDE": "0",
+        "MYDS_PREFILL_ATTN_FAST": "0",
+        "MYDS_INDEXER_DECODE_MMA": "0",
+        "MYDS_MOE_PREFILL_TOPK": "0"
+      },
+      "conf_diff": "",
+      "avail_before_gb": 190.59,
+      "cases": {
+        "short_decode_0": {
+          "wall_s": 5.5534,
+          "content_bytes": 404,
+          "sha256": "a91b12613458d22a3fbf6d66ff2fba42124b46ea0e032f68c3564cc0c506ec43",
+          "preview": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31\n32\n33\n34\n35\n36\n37\n38\n39\n40\n41\n42\n43\n44\n45\n46\n47\n48\n49\n50\n51\n52\n53\n54\n55\n56\n5",
+          "usage": {
+            "prompt_tokens": 28,
+            "completion_tokens": 256,
+            "total_tokens": 284,
+            "prompt_tps": 70.15,
+            "completion_tps": 49.71,
+            "server_prompt_tps": 70.15,
+            "server_predicted_tps": 49.71,
+            "prompt_tokens_details": {
+              "cached_tokens": 1
+            },
+            "cache_hit_tokens": 1,
+            "cache_hit_rate": 3.57,
+            "timings": {
+              "prompt_n": 27,
+              "prompt_ms": 384.875,
+              "prompt_per_token_ms": 14.2546,
+              "prompt_per_second": 70.15,
+              "predicted_n": 255,
+              "predicted_ms": 5129.315,
+              "predicted_per_token_ms": 20.115,
+              "predicted_per_second": 49.71,
+              "cache_n": 1
+            }
+          },
+          "prompt_tok": 28,
+          "prefill_tok": 27,
+          "prefill_s": 0.4,
+          "prefill_tps": 70.2,
+          "cached_tok": 0,
+          "decode_tok": 256,
+          "decode_s": 5.1,
+          "decode_tps": 49.7,
+          "decode_ms_tok": 20.121
+        },
+        "short_decode_1": {
+          "wall_s": 5.5168,
+          "content_bytes": 404,
+          "sha256": "a91b12613458d22a3fbf6d66ff2fba42124b46ea0e032f68c3564cc0c506ec43",
+          "preview": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31\n32\n33\n34\n35\n36\n37\n38\n39\n40\n41\n42\n43\n44\n45\n46\n47\n48\n49\n50\n51\n52\n53\n54\n55\n56\n5",
+          "usage": {
+            "prompt_tokens": 28,
+            "completion_tokens": 256,
+            "total_tokens": 284,
+            "prompt_tps": 74.5,
+            "completion_tps": 49.7,
+            "server_prompt_tps": 74.5,
+            "server_predicted_tps": 49.7,
+            "prompt_tokens_details": {
+              "cached_tokens": 1
+            },
+            "cache_hit_tokens": 1,
+            "cache_hit_rate": 3.57,
+            "timings": {
+              "prompt_n": 27,
+              "prompt_ms": 362.392,
+              "prompt_per_token_ms": 13.4219,
+              "prompt_per_second": 74.5,
+              "predicted_n": 255,
+              "predicted_ms": 5130.319,
+              "predicted_per_token_ms": 20.1189,
+              "predicted_per_second": 49.7,
+              "cache_n": 1
+            }
+          },
+          "prompt_tok": 28,
+          "prefill_tok": 27,
+          "prefill_s": 0.4,
+          "prefill_tps": 74.5,
+          "cached_tok": 0,
+          "decode_tok": 256,
+          "decode_s": 5.1,
+          "decode_tps": 49.7,
+          "decode_ms_tok": 20.121
+        },
+        "short_decode_2": {
+          "wall_s": 5.5149,
+          "content_bytes": 404,
+          "sha256": "a91b12613458d22a3fbf6d66ff2fba42124b46ea0e032f68c3564cc0c506ec43",
+          "preview": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31\n32\n33\n34\n35\n36\n37\n38\n39\n40\n41\n42\n43\n44\n45\n46\n47\n48\n49\n50\n51\n52\n53\n54\n55\n56\n5",
+          "usage": {
+            "prompt_tokens": 28,
+            "completion_tokens": 256,
+            "total_tokens": 284,
+            "prompt_tps": 74.8,
+            "completion_tps": 49.71,
+            "server_prompt_tps": 74.8,
+            "server_predicted_tps": 49.71,
+            "prompt_tokens_details": {
+              "cached_tokens": 1
+            },
+            "cache_hit_tokens": 1,
+            "cache_hit_rate": 3.57,
+            "timings": {
+              "prompt_n": 27,
+              "prompt_ms": 360.986,
+              "prompt_per_token_ms": 13.3699,
+              "prompt_per_second": 74.8,
+              "predicted_n": 255,
+              "predicted_ms": 5130.207,
+              "predicted_per_token_ms": 20.1185,
+              "predicted_per_second": 49.71,
+              "cache_n": 1
+            }
+          },
+          "prompt_tok": 28,
+          "prefill_tok": 27,
+          "prefill_s": 0.4,
+          "prefill_tps": 74.8,
+          "cached_tok": 0,
+          "decode_tok": 256,
+          "decode_s": 5.1,
+          "decode_tps": 49.7,
+          "decode_ms_tok": 20.121
+        },
+        "cold_32k": {
+          "wall_s": 44.0787,
+          "content_bytes": 9,
+          "sha256": "0d99c08267aa96cb0876a946cf551dd35cfb56e0db16e63ce4cf5d6b2b0fcb43",
+          "preview": "齿轮箱",
+          "usage": {
+            "prompt_tokens": 32214,
+            "completion_tokens": 3,
+            "total_tokens": 32217,
+            "prompt_tps": 733.55,
+            "completion_tps": 44.99,
+            "server_prompt_tps": 733.55,
+            "server_predicted_tps": 44.99,
+            "prompt_tokens_details": {
+              "cached_tokens": 1
+            },
+            "cache_hit_tokens": 1,
+            "cache_hit_rate": 0.0,
+            "timings": {
+              "prompt_n": 32213,
+              "prompt_ms": 43913.571,
+              "prompt_per_token_ms": 1.3632,
+              "prompt_per_second": 733.55,
+              "predicted_n": 2,
+              "predicted_ms": 44.452,
+              "predicted_per_token_ms": 22.226,
+              "predicted_per_second": 44.99,
+              "cache_n": 1
+            }
+          },
+          "prompt_tok": 32214,
+          "prefill_tok": 32213,
+          "prefill_s": 43.9,
+          "prefill_tps": 733.6,
+          "cached_tok": 0,
+          "decode_tok": 2,
+          "decode_s": 0.0,
+          "decode_tps": 44.5,
+          "decode_ms_tok": 22.472
+        },
+        "cold_128k": {
+          "wall_s": 210.4518,
+          "content_bytes": 1069,
+          "sha256": "94b86eb47f3dcec957cab30c6d56149f803a9e23929294e797f14564d558f4ac",
+          "preview": "[00000] omicron buffer buffer omega register sigma chi.\n[00001] throughput gamma buffer offset grid bandwidth vector.\n[00002] block tau theta theta bias epsilon",
+          "usage": {
+            "prompt_tokens": 126995,
+            "completion_tokens": 256,
+            "total_tokens": 127251,
+            "prompt_tps": 620.96,
+            "completion_tps": 43.57,
+            "server_prompt_tps": 620.96,
+            "server_predicted_tps": 43.57,
+            "prompt_tokens_details": {
+              "cached_tokens": 1
+            },
+            "cache_hit_tokens": 1,
+            "cache_hit_rate": 0.0,
+            "timings": {
+              "prompt_n": 126994,
+              "prompt_ms": 204511.826,
+              "prompt_per_token_ms": 1.6104,
+              "prompt_per_second": 620.96,
+              "predicted_n": 255,
+              "predicted_ms": 5852.943,
+              "predicted_per_token_ms": 22.9527,
+              "predicted_per_second": 43.57,
+              "cache_n": 1
+            }
+          },
+          "prompt_tok": 126995,
+          "prefill_tok": 126994,
+          "prefill_s": 204.5,
+          "prefill_tps": 621.0,
+          "cached_tok": 0,
+          "decode_tok": 256,
+          "decode_s": 5.9,
+          "decode_tps": 43.6,
+          "decode_ms_tok": 22.936
+        },
+        "warm_128k_plus_2k_v0": {
+          "wall_s": 12.6664,
+          "content_bytes": 1272,
+          "sha256": "771e7c2f4363cb3dfda1905ae7d9716f253e678795e6b5f5642cab3749feca4e",
+          "preview": "Latency is the hidden tax on computation, the delay between a request and a response that shapes how systems feel. In the vocabulary of this ledger, latency app",
+          "usage": {
+            "prompt_tokens": 129147,
+            "completion_tokens": 256,
+            "total_tokens": 129403,
+            "prompt_tps": 323.98,
+            "completion_tps": 43.33,
+            "server_prompt_tps": 323.98,
+            "server_predicted_tps": 43.33,
+            "prompt_tokens_details": {
+              "cached_tokens": 126977
+            },
+            "cache_hit_tokens": 126977,
+            "cache_hit_rate": 98.32,
+            "timings": {
+              "prompt_n": 2170,
+              "prompt_ms": 6697.904,
+              "prompt_per_token_ms": 3.0866,
+              "prompt_per_second": 323.98,
+              "predicted_n": 255,
+              "predicted_ms": 5884.85,
+              "predicted_per_token_ms": 23.0778,
+              "predicted_per_second": 43.33,
+              "cache_n": 126977
+            }
+          },
+          "prompt_tok": 129147,
+          "prefill_tok": 2170,
+          "prefill_s": 6.7,
+          "prefill_tps": 324.0,
+          "cached_tok": 126976,
+          "decode_tok": 256,
+          "decode_s": 5.9,
+          "decode_tps": 43.3,
+          "decode_ms_tok": 23.095
+        },
+        "warm_128k_plus_2k_v1": {
+          "wall_s": 11.5304,
+          "content_bytes": 1096,
+          "sha256": "94365525d010f0e650a48797f9effe13081e74bf498d0f93688be1ec3b28883d",
+          "preview": "Latency is a fundamental concept in computing, defined as the time delay between a requested action and the moment its result becomes observable. In modern syst",
+          "usage": {
+            "prompt_tokens": 129147,
+            "completion_tokens": 209,
+            "total_tokens": 129356,
+            "prompt_tps": 326.97,
+            "completion_tps": 43.21,
+            "server_prompt_tps": 326.97,
+            "server_predicted_tps": 43.21,
+            "prompt_tokens_details": {
+              "cached_tokens": 126977
+            },
+            "cache_hit_tokens": 126977,
+            "cache_hit_rate": 98.32,
+            "timings": {
+              "prompt_n": 2170,
+              "prompt_ms": 6636.768,
+              "prompt_per_token_ms": 3.0584,
+              "prompt_per_second": 326.97,
+              "predicted_n": 208,
+              "predicted_ms": 4813.209,
+              "predicted_per_token_ms": 23.1404,
+              "predicted_per_second": 43.21,
+              "cache_n": 126977
+            }
+          },
+          "prompt_tok": 129147,
+          "prefill_tok": 2170,
+          "prefill_s": 6.6,
+          "prefill_tps": 327.0,
+          "cached_tok": 126976,
+          "decode_tok": 208,
+          "decode_s": 4.8,
+          "decode_tps": 43.2,
+          "decode_ms_tok": 23.148
+        },
+        "warm_128k_plus_2k_v2": {
+          "wall_s": 11.9763,
+          "content_bytes": 1308,
+          "sha256": "7ec4f6ddc4d69e7a85236417febd203b79bb46e33a276fc97f633ec5a79fa561",
+          "preview": "Latency is the hidden tax on every ambitious system. It is the delay between intention and outcome, the invisible queue where requests wait their turn. In moder",
+          "usage": {
+            "prompt_tokens": 129147,
+            "completion_tokens": 229,
+            "total_tokens": 129376,
+            "prompt_tps": 327.41,
+            "completion_tps": 43.3,
+            "server_prompt_tps": 327.41,
+            "server_predicted_tps": 43.3,
+            "prompt_tokens_details": {
+              "cached_tokens": 126977
+            },
+            "cache_hit_tokens": 126977,
+            "cache_hit_rate": 98.32,
+            "timings": {
+              "prompt_n": 2170,
+              "prompt_ms": 6627.843,
+              "prompt_per_token_ms": 3.0543,
+              "prompt_per_second": 327.41,
+              "predicted_n": 228,
+              "predicted_ms": 5265.153,
+              "predicted_per_token_ms": 23.0928,
+              "predicted_per_second": 43.3,
+              "cache_n": 126977
+            }
+          },
+          "prompt_tok": 129147,
+          "prefill_tok": 2170,
+          "prefill_s": 6.6,
+          "prefill_tps": 327.4,
+          "cached_tok": 126976,
+          "decode_tok": 228,
+          "decode_s": 5.3,
+          "decode_tps": 43.3,
+          "decode_ms_tok": 23.095
+        }
+      },
+      "avail_after_boot_gb": 33.13,
+      "debug_boot": {
+        "knobs_unread": 0,
+        "counters": {
+          "indexer_key_cache": {
+            "mode": 3,
+            "format": "FP4-E2M1+UE8M0",
+            "row_bytes": 68
+          },
+          "indexer_register_only": {
+            "requests": 0,
+            "encoded": 0,
+            "fallbacks": 0,
+            "failures": 0,
+            "f32_dispatches": 0,
+            "bf16_dispatches": 0
+          },
+          "indexer_prefill_compact": {
+            "requests": 0,
+            "encoded": 0,
+            "fallbacks": 0,
+            "failures": 0,
+            "rows_scored": 0,
+            "union_cap_blocks": 0,
+            "dense_blocks": 0
+          },
+          "indexer_topk_radix_causal": {
+            "requests": 0,
+            "encoded": 0,
+            "fallbacks": 0,
+            "failures": 0,
+            "rows": 0,
+            "l20_compact_requests": 0,
+            "l20_compact_encoded": 0,
+            "l20_compact_fallbacks": 0,
+            "l20_compact_rows": 0
+          },
+          "prefix_cache_len": 0
+        }
+      },
+      "startup_evidence": [
+        "[2026-11-19 08:30:52.891] [INFO] myds_metal: loaded precompiled library from /tmp/stepb_s178_src/bin/myds.metallib (all required V4.1 kernels verified)",
+        "[2026-11-19 08:30:59.079] [INFO] kvdisk: 发现模型伴侣指纹文件: 43948333c8eb0172613384abb5d5e1fe2fd02f40a1ede88afc1cbf22bef1cb68",
+        "[2026-11-19 08:30:59.083] [INFO] kvdisk: ./kv/kvsegments-v1-a08fd86768cca5da.bin 重建（identity 924b15d5755f54ea，336 槽 × 2.7 MiB，共 896 MiB）",
+        "[2026-11-19 08:30:59.083] [INFO] kvdisk: ./kv/kvlow-v3-a08fd86768cca5da.bin 重建（identity 61a8aedc331d1212，336 槽 × 10.0 MiB，共 3360 MiB）",
+        "[2026-11-19 08:30:59.083] [INFO] kvdisk: ./kv/kvends-v1-a08fd86768cca5da.bin 重建（identity 5d48f8945b602d46，64 槽 × 151.3 MiB，共 9684 MiB）",
+        "[2026-11-19 08:30:59.084] [INFO] kvdisk: ./kv/kvanchor-v1-5d48f8945b602d46.bin 重建（identity 58a2f919f8d62e47，16 槽 × 151.3 MiB，共 2421 MiB）",
+        "[2026-11-19 08:30:59.084] [INFO] kvdisk: prompt-cache store · 64 槽 × 65536 tok (151 MiB/槽) = 名义 9.5 GiB",
+        "[2026-11-19 08:30:59.084] [INFO] kvdisk: anchor store      · 16 槽 × 65536 tok (151 MiB/槽) = 名义 2.4 GiB",
+        "[2026-11-19 08:30:59.084] [INFO] kvdisk: 分段网格上限 11264 tok ⇒ 超过此值的 prompt 必须靠 tail 才能缓存",
+        "[2026-11-19 08:30:59.084] [INFO] kvdisk: 低位区落盘已启用 · 21 个位置组 × 16 way = 336 条 · 每条 10.0 MiB · 位置 1024..11264 · ./kv/kvlow-v3-a08fd86768cca5da.bin",
+        "[2026-11-19 08:30:59.084] [INFO] kvdisk: 同一位置可容纳 16 套不同的「system + tools」—— 它们的哈希不同，互不顶替；只有全部占满才淘汰最老的一条（FIFO）"
+      ],
+      "debug_end": {
+        "indexer_key_cache": {
+          "mode": 3,
+          "format": "FP4-E2M1+UE8M0",
+          "row_bytes": 68
+        },
+        "indexer_register_only": {
+          "requests": 2049,
+          "encoded": 2025,
+          "fallbacks": 0,
+          "failures": 0,
+          "f32_dispatches": 0,
+          "bf16_dispatches": 2025
+        },
+        "indexer_prefill_compact": {
+          "requests": 97,
+          "encoded": 97,
+          "fallbacks": 0,
+          "failures": 0,
+          "rows_scored": 39000,
+          "union_cap_blocks": 61703616,
+          "dense_blocks": 490360884
+        },
+        "indexer_topk_radix_causal": {
+          "requests": 2052,
+          "encoded": 1773,
+          "fallbacks": 0,
+          "failures": 0,
+          "rows": 316106,
+          "l20_compact_requests": 183,
+          "l20_compact_encoded": 183,
+          "l20_compact_fallbacks": 0,
+          "l20_compact_rows": 15288
+        },
+        "prefix_cache_len": 129375
+      }
+    },
+    {
+      "arm": "armB_pnew1_pnew3_0ulp",
+      "overrides": {
+        "MYDS_MOE_PREFILL_WIDE": "1",
+        "MYDS_PREFILL_ATTN_FAST": "1",
+        "MYDS_INDEXER_DECODE_MMA": "0",
+        "MYDS_MOE_PREFILL_TOPK": "0"
+      },
+      "conf_diff": "--- baseline.conf\n+++ armB_pnew1_pnew3_0ulp.conf\n@@ -235,7 +235,7 @@\n #MYDS_PHASE_SPLIT_ATTN=1\n #MYDS_PHASE_SPLIT_DECODE=16\n MYDS_RESP_STATE=./resp.idx\n-MYDS_MOE_PREFILL_WIDE=0\n-MYDS_PREFILL_ATTN_FAST=0\n+MYDS_MOE_PREFILL_WIDE=1\n+MYDS_PREFILL_ATTN_FAST=1\n MYDS_INDEXER_DECODE_MMA=0\n MYDS_MOE_PREFILL_TOPK=0\n",
+      "avail_before_gb": 190.3,
+      "cases": {
+        "short_decode_0": {
+          "wall_s": 5.5744,
+          "content_bytes": 404,
+          "sha256": "a91b12613458d22a3fbf6d66ff2fba42124b46ea0e032f68c3564cc0c506ec43",
+          "preview": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31\n32\n33\n34\n35\n36\n37\n38\n39\n40\n41\n42\n43\n44\n45\n46\n47\n48\n49\n50\n51\n52\n53\n54\n55\n56\n5",
+          "usage": {
+            "prompt_tokens": 28,
+            "completion_tokens": 256,
+            "total_tokens": 284,
+            "prompt_tps": 69.94,
+            "completion_tps": 49.53,
+            "server_prompt_tps": 69.94,
+            "server_predicted_tps": 49.53,
+            "prompt_tokens_details": {
+              "cached_tokens": 1
+            },
+            "cache_hit_tokens": 1,
+            "cache_hit_rate": 3.57,
+            "timings": {
+              "prompt_n": 27,
+              "prompt_ms": 386.032,
+              "prompt_per_token_ms": 14.2975,
+              "prompt_per_second": 69.94,
+              "predicted_n": 255,
+              "predicted_ms": 5148.864,
+              "predicted_per_token_ms": 20.1916,
+              "predicted_per_second": 49.53,
+              "cache_n": 1
+            }
+          },
+          "prompt_tok": 28,
+          "prefill_tok": 27,
+          "prefill_s": 0.4,
+          "prefill_tps": 69.9,
+          "cached_tok": 0,
+          "decode_tok": 256,
+          "decode_s": 5.1,
+          "decode_tps": 49.5,
+          "decode_ms_tok": 20.202
+        },
+        "short_decode_1": {
+          "wall_s": 5.5268,
+          "content_bytes": 404,
+          "sha256": "a91b12613458d22a3fbf6d66ff2fba42124b46ea0e032f68c3564cc0c506ec43",
+          "preview": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31\n32\n33\n34\n35\n36\n37\n38\n39\n40\n41\n42\n43\n44\n45\n46\n47\n48\n49\n50\n51\n52\n53\n54\n55\n56\n5",
+          "usage": {
+            "prompt_tokens": 28,
+            "completion_tokens": 256,
+            "total_tokens": 284,
+            "prompt_tps": 75.21,
+            "completion_tps": 49.57,
+            "server_prompt_tps": 75.21,
+            "server_predicted_tps": 49.57,
+            "prompt_tokens_details": {
+              "cached_tokens": 1
+            },
+            "cache_hit_tokens": 1,
+            "cache_hit_rate": 3.57,
+            "timings": {
+              "prompt_n": 27,
+              "prompt_ms": 358.994,
+              "prompt_per_token_ms": 13.2961,
+              "prompt_per_second": 75.21,
+              "predicted_n": 255,
+              "predicted_ms": 5143.796,
+              "predicted_per_token_ms": 20.1717,
+              "predicted_per_second": 49.57,
+              "cache_n": 1
+            }
+          },
+          "prompt_tok": 28,
+          "prefill_tok": 27,
+          "prefill_s": 0.4,
+          "prefill_tps": 75.2,
+          "cached_tok": 0,
+          "decode_tok": 256,
+          "decode_s": 5.1,
+          "decode_tps": 49.6,
+          "decode_ms_tok": 20.161
+        },
+        "short_decode_2": {
+          "wall_s": 5.5285,
+          "content_bytes": 404,
+          "sha256": "a91b12613458d22a3fbf6d66ff2fba42124b46ea0e032f68c3564cc0c506ec43",
+          "preview": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31\n32\n33\n34\n35\n36\n37\n38\n39\n40\n41\n42\n43\n44\n45\n46\n47\n48\n49\n50\n51\n52\n53\n54\n55\n56\n5",
+          "usage": {
+            "prompt_tokens": 28,
+            "completion_tokens": 256,
+            "total_tokens": 284,
+            "prompt_tps": 74.85,
+            "completion_tps": 49.58,
+            "server_prompt_tps": 74.85,
+            "server_predicted_tps": 49.58,
+            "prompt_tokens_details": {
+              "cached_tokens": 1
+            },
+            "cache_hit_tokens": 1,
+            "cache_hit_rate": 3.57,
+            "timings": {
+              "prompt_n": 27,
+              "prompt_ms": 360.727,
+              "prompt_per_token_ms": 13.3603,
+              "prompt_per_second": 74.85,
+              "predicted_n": 255,
+              "predicted_ms": 5143.456,
+              "predicted_per_token_ms": 20.1704,
+              "predicted_per_second": 49.58,
+              "cache_n": 1
+            }
+          },
+          "prompt_tok": 28,
+          "prefill_tok": 27,
+          "prefill_s": 0.4,
+          "prefill_tps": 74.8,
+          "cached_tok": 0,
+          "decode_tok": 256,
+          "decode_s": 5.1,
+          "decode_tps": 49.6,
+          "decode_ms_tok": 20.161
+        },
+        "cold_32k": {
+          "wall_s": 42.3693,
+          "content_bytes": 9,
+          "sha256": "0d99c08267aa96cb0876a946cf551dd35cfb56e0db16e63ce4cf5d6b2b0fcb43",
+          "preview": "齿轮箱",
+          "usage": {
+            "prompt_tokens": 32214,
+            "completion_tokens": 3,
+            "total_tokens": 32217,
+            "prompt_tps": 763.29,
+            "completion_tps": 45.03,
+            "server_prompt_tps": 763.29,
+            "server_predicted_tps": 45.03,
+            "prompt_tokens_details": {
+              "cached_tokens": 1
+            },
+            "cache_hit_tokens": 1,
+            "cache_hit_rate": 0.0,
+            "timings": {
+              "prompt_n": 32213,
+              "prompt_ms": 42202.881,
+              "prompt_per_token_ms": 1.3101,
+              "prompt_per_second": 763.29,
+              "predicted_n": 2,
+              "predicted_ms": 44.416,
+              "predicted_per_token_ms": 22.208,
+              "predicted_per_second": 45.03,
+              "cache_n": 1
+            }
+          },
+          "prompt_tok": 32214,
+          "prefill_tok": 32213,
+          "prefill_s": 42.2,
+          "prefill_tps": 763.3,
+          "cached_tok": 0,
+          "decode_tok": 2,
+          "decode_s": 0.0,
+          "decode_tps": 44.5,
+          "decode_ms_tok": 22.472
+        },
+        "cold_128k": {
+          "wall_s": 203.9314,
+          "content_bytes": 1069,
+          "sha256": "94b86eb47f3dcec957cab30c6d56149f803a9e23929294e797f14564d558f4ac",
+          "preview": "[00000] omicron buffer buffer omega register sigma chi.\n[00001] throughput gamma buffer offset grid bandwidth vector.\n[00002] block tau theta theta bias epsilon",
+          "usage": {
+            "prompt_tokens": 126995,
+            "completion_tokens": 256,
+            "total_tokens": 127251,
+            "prompt_tps": 641.46,
+            "completion_tps": 43.43,
+            "server_prompt_tps": 641.46,
+            "server_predicted_tps": 43.43,
+            "prompt_tokens_details": {
+              "cached_tokens": 1
+            },
+            "cache_hit_tokens": 1,
+            "cache_hit_rate": 0.0,
+            "timings": {
+              "prompt_n": 126994,
+              "prompt_ms": 197977.123,
+              "prompt_per_token_ms": 1.5589,
+              "prompt_per_second": 641.46,
+              "predicted_n": 255,
+              "predicted_ms": 5871.16,
+              "predicted_per_token_ms": 23.0242,
+              "predicted_per_second": 43.43,
+              "cache_n": 1
+            }
+          },
+          "prompt_tok": 126995,
+          "prefill_tok": 126994,
+          "prefill_s": 198.0,
+          "prefill_tps": 641.5,
+          "cached_tok": 0,
+          "decode_tok": 256,
+          "decode_s": 5.9,
+          "decode_tps": 43.4,
+          "decode_ms_tok": 23.041
+        },
+        "warm_128k_plus_2k_v0": {
+          "wall_s": 12.4213,
+          "content_bytes": 1272,
+          "sha256": "771e7c2f4363cb3dfda1905ae7d9716f253e678795e6b5f5642cab3749feca4e",
+          "preview": "Latency is the hidden tax on computation, the delay between a request and a response that shapes how systems feel. In the vocabulary of this ledger, latency app",
+          "usage": {
+            "prompt_tokens": 129147,
+            "completion_tokens": 256,
+            "total_tokens": 129403,
+            "prompt_tps": 334.56,
+            "completion_tps": 43.54,
+            "server_prompt_tps": 334.56,
+            "server_predicted_tps": 43.54,
+            "prompt_tokens_details": {
+              "cached_tokens": 126977
+            },
+            "cache_hit_tokens": 126977,
+            "cache_hit_rate": 98.32,
+            "timings": {
+              "prompt_n": 2170,
+              "prompt_ms": 6486.194,
+              "prompt_per_token_ms": 2.989,
+              "prompt_per_second": 334.56,
+              "predicted_n": 255,
+              "predicted_ms": 5856.092,
+              "predicted_per_token_ms": 22.9651,
+              "predicted_per_second": 43.54,
+              "cache_n": 126977
+            }
+          },
+          "prompt_tok": 129147,
+          "prefill_tok": 2170,
+          "prefill_s": 6.5,
+          "prefill_tps": 334.6,
+          "cached_tok": 126976,
+          "decode_tok": 256,
+          "decode_s": 5.9,
+          "decode_tps": 43.5,
+          "decode_ms_tok": 22.989
+        },
+        "warm_128k_plus_2k_v1": {
+          "wall_s": 11.2475,
+          "content_bytes": 1096,
+          "sha256": "94365525d010f0e650a48797f9effe13081e74bf498d0f93688be1ec3b28883d",
+          "preview": "Latency is a fundamental concept in computing, defined as the time delay between a requested action and the moment its result becomes observable. In modern syst",
+          "usage": {
+            "prompt_tokens": 129147,
+            "completion_tokens": 209,
+            "total_tokens": 129356,
+            "prompt_tps": 339.23,
+            "completion_tps": 43.61,
+            "server_prompt_tps": 339.23,
+            "server_predicted_tps": 43.61,
+            "prompt_tokens_details": {
+              "cached_tokens": 126977
+            },
+            "cache_hit_tokens": 126977,
+            "cache_hit_rate": 98.32,
+            "timings": {
+              "prompt_n": 2170,
+              "prompt_ms": 6396.911,
+              "prompt_per_token_ms": 2.9479,
+              "prompt_per_second": 339.23,
+              "predicted_n": 208,
+              "predicted_ms": 4769.732,
+              "predicted_per_token_ms": 22.9314,
+              "predicted_per_second": 43.61,
+              "cache_n": 126977
+            }
+          },
+          "prompt_tok": 129147,
+          "prefill_tok": 2170,
+          "prefill_s": 6.4,
+          "prefill_tps": 339.2,
+          "cached_tok": 126976,
+          "decode_tok": 208,
+          "decode_s": 4.8,
+          "decode_tps": 43.6,
+          "decode_ms_tok": 22.936
+        },
+        "warm_128k_plus_2k_v2": {
+          "wall_s": 11.7341,
+          "content_bytes": 1308,
+          "sha256": "7ec4f6ddc4d69e7a85236417febd203b79bb46e33a276fc97f633ec5a79fa561",
+          "preview": "Latency is the hidden tax on every ambitious system. It is the delay between intention and outcome, the invisible queue where requests wait their turn. In moder",
+          "usage": {
+            "prompt_tokens": 129147,
+            "completion_tokens": 229,
+            "total_tokens": 129376,
+            "prompt_tps": 339.11,
+            "completion_tps": 43.4,
+            "server_prompt_tps": 339.11,
+            "server_predicted_tps": 43.4,
+            "prompt_tokens_details": {
+              "cached_tokens": 126977
+            },
+            "cache_hit_tokens": 126977,
+            "cache_hit_rate": 98.32,
+            "timings": {
+              "prompt_n": 2170,
+              "prompt_ms": 6399.17,
+              "prompt_per_token_ms": 2.9489,
+              "prompt_per_second": 339.11,
+              "predicted_n": 228,
+              "predicted_ms": 5253.916,
+              "predicted_per_token_ms": 23.0435,
+              "predicted_per_second": 43.4,
+              "cache_n": 126977
+            }
+          },
+          "prompt_tok": 129147,
+          "prefill_tok": 2170,
+          "prefill_s": 6.4,
+          "prefill_tps": 339.1,
+          "cached_tok": 126976,
+          "decode_tok": 228,
+          "decode_s": 5.3,
+          "decode_tps": 43.4,
+          "decode_ms_tok": 23.041
+        }
+      },
+      "avail_after_boot_gb": 33.42,
+      "debug_boot": {
+        "knobs_unread": 0,
+        "counters": {
+          "indexer_key_cache": {
+            "mode": 3,
+            "format": "FP4-E2M1+UE8M0",
+            "row_bytes": 68
+          },
+          "indexer_register_only": {
+            "requests": 0,
+            "encoded": 0,
+            "fallbacks": 0,
+            "failures": 0,
+            "f32_dispatches": 0,
+            "bf16_dispatches": 0
+          },
+          "indexer_prefill_compact": {
+            "requests": 0,
+            "encoded": 0,
+            "fallbacks": 0,
+            "failures": 0,
+            "rows_scored": 0,
+            "union_cap_blocks": 0,
+            "dense_blocks": 0
+          },
+          "indexer_topk_radix_causal": {
+            "requests": 0,
+            "encoded": 0,
+            "fallbacks": 0,
+            "failures": 0,
+            "rows": 0,
+            "l20_compact_requests": 0,
+            "l20_compact_encoded": 0,
+            "l20_compact_fallbacks": 0,
+            "l20_compact_rows": 0
+          },
+          "prefix_cache_len": 0
+        }
+      },
+      "startup_evidence": [
+        "[2026-11-19 08:36:12.842] [INFO] myds_metal: loaded precompiled library from /tmp/stepb_s178_src/bin/myds.metallib (all required V4.1 kernels verified)",
+        "[2026-11-19 08:36:19.516] [INFO] kvdisk: 发现模型伴侣指纹文件: 43948333c8eb0172613384abb5d5e1fe2fd02f40a1ede88afc1cbf22bef1cb68",
+        "[2026-11-19 08:36:19.520] [INFO] kvdisk: ./kv/kvsegments-v1-a08fd86768cca5da.bin 重建（identity 924b15d5755f54ea，336 槽 × 2.7 MiB，共 896 MiB）",
+        "[2026-11-19 08:36:19.520] [INFO] kvdisk: ./kv/kvlow-v3-a08fd86768cca5da.bin 重建（identity 61a8aedc331d1212，336 槽 × 10.0 MiB，共 3360 MiB）",
+        "[2026-11-19 08:36:19.521] [INFO] kvdisk: ./kv/kvends-v1-a08fd86768cca5da.bin 重建（identity 5d48f8945b602d46，64 槽 × 151.3 MiB，共 9684 MiB）",
+        "[2026-11-19 08:36:19.521] [INFO] kvdisk: ./kv/kvanchor-v1-5d48f8945b602d46.bin 重建（identity 58a2f919f8d62e47，16 槽 × 151.3 MiB，共 2421 MiB）",
+        "[2026-11-19 08:36:19.521] [INFO] kvdisk: prompt-cache store · 64 槽 × 65536 tok (151 MiB/槽) = 名义 9.5 GiB",
+        "[2026-11-19 08:36:19.521] [INFO] kvdisk: anchor store      · 16 槽 × 65536 tok (151 MiB/槽) = 名义 2.4 GiB",
+        "[2026-11-19 08:36:19.521] [INFO] kvdisk: 分段网格上限 11264 tok ⇒ 超过此值的 prompt 必须靠 tail 才能缓存",
+        "[2026-11-19 08:36:19.521] [INFO] kvdisk: 低位区落盘已启用 · 21 个位置组 × 16 way = 336 条 · 每条 10.0 MiB · 位置 1024..11264 · ./kv/kvlow-v3-a08fd86768cca5da.bin",
+        "[2026-11-19 08:36:19.521] [INFO] kvdisk: 同一位置可容纳 16 套不同的「system + tools」—— 它们的哈希不同，互不顶替；只有全部占满才淘汰最老的一条（FIFO）"
+      ],
+      "debug_end": {
+        "indexer_key_cache": {
+          "mode": 3,
+          "format": "FP4-E2M1+UE8M0",
+          "row_bytes": 68
+        },
+        "indexer_register_only": {
+          "requests": 2049,
+          "encoded": 2025,
+          "fallbacks": 0,
+          "failures": 0,
+          "f32_dispatches": 0,
+          "bf16_dispatches": 2025
+        },
+        "indexer_prefill_compact": {
+          "requests": 97,
+          "encoded": 97,
+          "fallbacks": 0,
+          "failures": 0,
+          "rows_scored": 39000,
+          "union_cap_blocks": 61703616,
+          "dense_blocks": 490360884
+        },
+        "indexer_topk_radix_causal": {
+          "requests": 2052,
+          "encoded": 1773,
+          "fallbacks": 0,
+          "failures": 0,
+          "rows": 316106,
+          "l20_compact_requests": 183,
+          "l20_compact_encoded": 183,
+          "l20_compact_fallbacks": 0,
+          "l20_compact_rows": 15288
+        },
+        "prefix_cache_len": 129375
+      }
+    },
+    {
+      "arm": "armC_prod_winners",
+      "overrides": {
+        "MYDS_MOE_PREFILL_WIDE": "1",
+        "MYDS_PREFILL_ATTN_FAST": "1",
+        "MYDS_INDEXER_DECODE_MMA": "1",
+        "MYDS_MOE_PREFILL_TOPK": "0"
+      },
+      "conf_diff": "--- baseline.conf\n+++ armC_prod_winners.conf\n@@ -235,7 +235,7 @@\n #MYDS_PHASE_SPLIT_ATTN=1\n #MYDS_PHASE_SPLIT_DECODE=16\n MYDS_RESP_STATE=./resp.idx\n-MYDS_MOE_PREFILL_WIDE=0\n-MYDS_PREFILL_ATTN_FAST=0\n-MYDS_INDEXER_DECODE_MMA=0\n+MYDS_MOE_PREFILL_WIDE=1\n+MYDS_PREFILL_ATTN_FAST=1\n+MYDS_INDEXER_DECODE_MMA=1\n MYDS_MOE_PREFILL_TOPK=0\n",
+      "avail_before_gb": 190.47,
+      "cases": {
+        "short_decode_0": {
+          "wall_s": 5.5663,
+          "content_bytes": 404,
+          "sha256": "a91b12613458d22a3fbf6d66ff2fba42124b46ea0e032f68c3564cc0c506ec43",
+          "preview": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31\n32\n33\n34\n35\n36\n37\n38\n39\n40\n41\n42\n43\n44\n45\n46\n47\n48\n49\n50\n51\n52\n53\n54\n55\n56\n5",
+          "usage": {
+            "prompt_tokens": 28,
+            "completion_tokens": 256,
+            "total_tokens": 284,
+            "prompt_tps": 70.4,
+            "completion_tps": 49.57,
+            "server_prompt_tps": 70.4,
+            "server_predicted_tps": 49.57,
+            "prompt_tokens_details": {
+              "cached_tokens": 1
+            },
+            "cache_hit_tokens": 1,
+            "cache_hit_rate": 3.57,
+            "timings": {
+              "prompt_n": 27,
+              "prompt_ms": 383.539,
+              "prompt_per_token_ms": 14.2051,
+              "prompt_per_second": 70.4,
+              "predicted_n": 255,
+              "predicted_ms": 5143.823,
+              "predicted_per_token_ms": 20.1719,
+              "predicted_per_second": 49.57,
+              "cache_n": 1
+            }
+          },
+          "prompt_tok": 28,
+          "prefill_tok": 27,
+          "prefill_s": 0.4,
+          "prefill_tps": 70.4,
+          "cached_tok": 0,
+          "decode_tok": 256,
+          "decode_s": 5.1,
+          "decode_tps": 49.6,
+          "decode_ms_tok": 20.161
+        },
+        "short_decode_1": {
+          "wall_s": 5.5297,
+          "content_bytes": 404,
+          "sha256": "a91b12613458d22a3fbf6d66ff2fba42124b46ea0e032f68c3564cc0c506ec43",
+          "preview": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31\n32\n33\n34\n35\n36\n37\n38\n39\n40\n41\n42\n43\n44\n45\n46\n47\n48\n49\n50\n51\n52\n53\n54\n55\n56\n5",
+          "usage": {
+            "prompt_tokens": 28,
+            "completion_tokens": 256,
+            "total_tokens": 284,
+            "prompt_tps": 74.67,
+            "completion_tps": 49.57,
+            "server_prompt_tps": 74.67,
+            "server_predicted_tps": 49.57,
+            "prompt_tokens_details": {
+              "cached_tokens": 1
+            },
+            "cache_hit_tokens": 1,
+            "cache_hit_rate": 3.57,
+            "timings": {
+              "prompt_n": 27,
+              "prompt_ms": 361.605,
+              "prompt_per_token_ms": 13.3928,
+              "prompt_per_second": 74.67,
+              "predicted_n": 255,
+              "predicted_ms": 5144.236,
+              "predicted_per_token_ms": 20.1735,
+              "predicted_per_second": 49.57,
+              "cache_n": 1
+            }
+          },
+          "prompt_tok": 28,
+          "prefill_tok": 27,
+          "prefill_s": 0.4,
+          "prefill_tps": 74.7,
+          "cached_tok": 0,
+          "decode_tok": 256,
+          "decode_s": 5.1,
+          "decode_tps": 49.6,
+          "decode_ms_tok": 20.161
+        },
+        "short_decode_2": {
+          "wall_s": 5.5254,
+          "content_bytes": 404,
+          "sha256": "a91b12613458d22a3fbf6d66ff2fba42124b46ea0e032f68c3564cc0c506ec43",
+          "preview": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31\n32\n33\n34\n35\n36\n37\n38\n39\n40\n41\n42\n43\n44\n45\n46\n47\n48\n49\n50\n51\n52\n53\n54\n55\n56\n5",
+          "usage": {
+            "prompt_tokens": 28,
+            "completion_tokens": 256,
+            "total_tokens": 284,
+            "prompt_tps": 74.82,
+            "completion_tps": 49.6,
+            "server_prompt_tps": 74.82,
+            "server_predicted_tps": 49.6,
+            "prompt_tokens_details": {
+              "cached_tokens": 1
+            },
+            "cache_hit_tokens": 1,
+            "cache_hit_rate": 3.57,
+            "timings": {
+              "prompt_n": 27,
+              "prompt_ms": 360.847,
+              "prompt_per_token_ms": 13.3647,
+              "prompt_per_second": 74.82,
+              "predicted_n": 255,
+              "predicted_ms": 5140.999,
+              "predicted_per_token_ms": 20.1608,
+              "predicted_per_second": 49.6,
+              "cache_n": 1
+            }
+          },
+          "prompt_tok": 28,
+          "prefill_tok": 27,
+          "prefill_s": 0.4,
+          "prefill_tps": 74.8,
+          "cached_tok": 0,
+          "decode_tok": 256,
+          "decode_s": 5.1,
+          "decode_tps": 49.6,
+          "decode_ms_tok": 20.161
+        },
+        "cold_32k": {
+          "wall_s": 42.3509,
+          "content_bytes": 9,
+          "sha256": "0d99c08267aa96cb0876a946cf551dd35cfb56e0db16e63ce4cf5d6b2b0fcb43",
+          "preview": "齿轮箱",
+          "usage": {
+            "prompt_tokens": 32214,
+            "completion_tokens": 3,
+            "total_tokens": 32217,
+            "prompt_tps": 763.46,
+            "completion_tps": 46.06,
+            "server_prompt_tps": 763.46,
+            "server_predicted_tps": 46.06,
+            "prompt_tokens_details": {
+              "cached_tokens": 1
+            },
+            "cache_hit_tokens": 1,
+            "cache_hit_rate": 0.0,
+            "timings": {
+              "prompt_n": 32213,
+              "prompt_ms": 42193.529,
+              "prompt_per_token_ms": 1.3098,
+              "prompt_per_second": 763.46,
+              "predicted_n": 2,
+              "predicted_ms": 43.421,
+              "predicted_per_token_ms": 21.7105,
+              "predicted_per_second": 46.06,
+              "cache_n": 1
+            }
+          },
+          "prompt_tok": 32214,
+          "prefill_tok": 32213,
+          "prefill_s": 42.2,
+          "prefill_tps": 763.5,
+          "cached_tok": 0,
+          "decode_tok": 2,
+          "decode_s": 0.0,
+          "decode_tps": 45.6,
+          "decode_ms_tok": 21.93
+        },
+        "cold_128k": {
+          "wall_s": 203.7232,
+          "content_bytes": 1069,
+          "sha256": "94b86eb47f3dcec957cab30c6d56149f803a9e23929294e797f14564d558f4ac",
+          "preview": "[00000] omicron buffer buffer omega register sigma chi.\n[00001] throughput gamma buffer offset grid bandwidth vector.\n[00002] block tau theta theta bias epsilon",
+          "usage": {
+            "prompt_tokens": 126995,
+            "completion_tokens": 256,
+            "total_tokens": 127251,
+            "prompt_tps": 641.41,
+            "completion_tps": 45.19,
+            "server_prompt_tps": 641.41,
+            "server_predicted_tps": 45.19,
+            "prompt_tokens_details": {
+              "cached_tokens": 1
+            },
+            "cache_hit_tokens": 1,
+            "cache_hit_rate": 0.0,
+            "timings": {
+              "prompt_n": 126994,
+              "prompt_ms": 197991.831,
+              "prompt_per_token_ms": 1.5591,
+              "prompt_per_second": 641.41,
+              "predicted_n": 255,
+              "predicted_ms": 5642.328,
+              "predicted_per_token_ms": 22.1268,
+              "predicted_per_second": 45.19,
+              "cache_n": 1
+            }
+          },
+          "prompt_tok": 126995,
+          "prefill_tok": 126994,
+          "prefill_s": 198.0,
+          "prefill_tps": 641.4,
+          "cached_tok": 0,
+          "decode_tok": 256,
+          "decode_s": 5.6,
+          "decode_tps": 45.2,
+          "decode_ms_tok": 22.124
+        },
+        "warm_128k_plus_2k_v0": {
+          "wall_s": 12.2112,
+          "content_bytes": 1272,
+          "sha256": "771e7c2f4363cb3dfda1905ae7d9716f253e678795e6b5f5642cab3749feca4e",
+          "preview": "Latency is the hidden tax on computation, the delay between a request and a response that shapes how systems feel. In the vocabulary of this ledger, latency app",
+          "usage": {
+            "prompt_tokens": 129147,
+            "completion_tokens": 256,
+            "total_tokens": 129403,
+            "prompt_tps": 334.7,
+            "completion_tps": 45.15,
+            "server_prompt_tps": 334.7,
+            "server_predicted_tps": 45.15,
+            "prompt_tokens_details": {
+              "cached_tokens": 126977
+            },
+            "cache_hit_tokens": 126977,
+            "cache_hit_rate": 98.32,
+            "timings": {
+              "prompt_n": 2170,
+              "prompt_ms": 6483.442,
+              "prompt_per_token_ms": 2.9878,
+              "prompt_per_second": 334.7,
+              "predicted_n": 255,
+              "predicted_ms": 5647.84,
+              "predicted_per_token_ms": 22.1484,
+              "predicted_per_second": 45.15,
+              "cache_n": 126977
+            }
+          },
+          "prompt_tok": 129147,
+          "prefill_tok": 2170,
+          "prefill_s": 6.5,
+          "prefill_tps": 334.7,
+          "cached_tok": 126976,
+          "decode_tok": 256,
+          "decode_s": 5.6,
+          "decode_tps": 45.1,
+          "decode_ms_tok": 22.173
+        },
+        "warm_128k_plus_2k_v1": {
+          "wall_s": 11.1159,
+          "content_bytes": 1096,
+          "sha256": "94365525d010f0e650a48797f9effe13081e74bf498d0f93688be1ec3b28883d",
+          "preview": "Latency is a fundamental concept in computing, defined as the time delay between a requested action and the moment its result becomes observable. In modern syst",
+          "usage": {
+            "prompt_tokens": 129147,
+            "completion_tokens": 209,
+            "total_tokens": 129356,
+            "prompt_tps": 339.77,
+            "completion_tps": 44.76,
+            "server_prompt_tps": 339.77,
+            "server_predicted_tps": 44.76,
+            "prompt_tokens_details": {
+              "cached_tokens": 126977
+            },
+            "cache_hit_tokens": 126977,
+            "cache_hit_rate": 98.32,
+            "timings": {
+              "prompt_n": 2170,
+              "prompt_ms": 6386.705,
+              "prompt_per_token_ms": 2.9432,
+              "prompt_per_second": 339.77,
+              "predicted_n": 208,
+              "predicted_ms": 4647.11,
+              "predicted_per_token_ms": 22.3419,
+              "predicted_per_second": 44.76,
+              "cache_n": 126977
+            }
+          },
+          "prompt_tok": 129147,
+          "prefill_tok": 2170,
+          "prefill_s": 6.4,
+          "prefill_tps": 339.8,
+          "cached_tok": 126976,
+          "decode_tok": 208,
+          "decode_s": 4.6,
+          "decode_tps": 44.8,
+          "decode_ms_tok": 22.321
+        },
+        "warm_128k_plus_2k_v2": {
+          "wall_s": 11.5503,
+          "content_bytes": 1308,
+          "sha256": "7ec4f6ddc4d69e7a85236417febd203b79bb46e33a276fc97f633ec5a79fa561",
+          "preview": "Latency is the hidden tax on every ambitious system. It is the delay between intention and outcome, the invisible queue where requests wait their turn. In moder",
+          "usage": {
+            "prompt_tokens": 129147,
+            "completion_tokens": 229,
+            "total_tokens": 129376,
+            "prompt_tps": 340.14,
+            "completion_tps": 44.85,
+            "server_prompt_tps": 340.14,
+            "server_predicted_tps": 44.85,
+            "prompt_tokens_details": {
+              "cached_tokens": 126977
+            },
+            "cache_hit_tokens": 126977,
+            "cache_hit_rate": 98.32,
+            "timings": {
+              "prompt_n": 2170,
+              "prompt_ms": 6379.749,
+              "prompt_per_token_ms": 2.94,
+              "prompt_per_second": 340.14,
+              "predicted_n": 228,
+              "predicted_ms": 5083.966,
+              "predicted_per_token_ms": 22.2981,
+              "predicted_per_second": 44.85,
+              "cache_n": 126977
+            }
+          },
+          "prompt_tok": 129147,
+          "prefill_tok": 2170,
+          "prefill_s": 6.4,
+          "prefill_tps": 340.1,
+          "cached_tok": 126976,
+          "decode_tok": 228,
+          "decode_s": 5.1,
+          "decode_tps": 44.8,
+          "decode_ms_tok": 22.321
+        }
+      },
+      "avail_after_boot_gb": 33.77,
+      "debug_boot": {
+        "knobs_unread": 0,
+        "counters": {
+          "indexer_key_cache": {
+            "mode": 3,
+            "format": "FP4-E2M1+UE8M0",
+            "row_bytes": 68
+          },
+          "indexer_register_only": {
+            "requests": 0,
+            "encoded": 0,
+            "fallbacks": 0,
+            "failures": 0,
+            "f32_dispatches": 0,
+            "bf16_dispatches": 0
+          },
+          "indexer_prefill_compact": {
+            "requests": 0,
+            "encoded": 0,
+            "fallbacks": 0,
+            "failures": 0,
+            "rows_scored": 0,
+            "union_cap_blocks": 0,
+            "dense_blocks": 0
+          },
+          "indexer_topk_radix_causal": {
+            "requests": 0,
+            "encoded": 0,
+            "fallbacks": 0,
+            "failures": 0,
+            "rows": 0,
+            "l20_compact_requests": 0,
+            "l20_compact_encoded": 0,
+            "l20_compact_fallbacks": 0,
+            "l20_compact_rows": 0
+          },
+          "prefix_cache_len": 0
+        }
+      },
+      "startup_evidence": [
+        "[2026-11-19 08:41:24.839] [INFO] myds_metal: loaded precompiled library from /tmp/stepb_s178_src/bin/myds.metallib (all required V4.1 kernels verified)",
+        "[2026-11-19 08:41:31.532] [INFO] kvdisk: 发现模型伴侣指纹文件: 43948333c8eb0172613384abb5d5e1fe2fd02f40a1ede88afc1cbf22bef1cb68",
+        "[2026-11-19 08:41:31.536] [INFO] kvdisk: ./kv/kvsegments-v1-a08fd86768cca5da.bin 重建（identity 924b15d5755f54ea，336 槽 × 2.7 MiB，共 896 MiB）",
+        "[2026-11-19 08:41:31.536] [INFO] kvdisk: ./kv/kvlow-v3-a08fd86768cca5da.bin 重建（identity 61a8aedc331d1212，336 槽 × 10.0 MiB，共 3360 MiB）",
+        "[2026-11-19 08:41:31.536] [INFO] kvdisk: ./kv/kvends-v1-a08fd86768cca5da.bin 重建（identity 5d48f8945b602d46，64 槽 × 151.3 MiB，共 9684 MiB）",
+        "[2026-11-19 08:41:31.536] [INFO] kvdisk: ./kv/kvanchor-v1-5d48f8945b602d46.bin 重建（identity 58a2f919f8d62e47，16 槽 × 151.3 MiB，共 2421 MiB）",
+        "[2026-11-19 08:41:31.536] [INFO] kvdisk: prompt-cache store · 64 槽 × 65536 tok (151 MiB/槽) = 名义 9.5 GiB",
+        "[2026-11-19 08:41:31.536] [INFO] kvdisk: anchor store      · 16 槽 × 65536 tok (151 MiB/槽) = 名义 2.4 GiB",
+        "[2026-11-19 08:41:31.536] [INFO] kvdisk: 分段网格上限 11264 tok ⇒ 超过此值的 prompt 必须靠 tail 才能缓存",
+        "[2026-11-19 08:41:31.536] [INFO] kvdisk: 低位区落盘已启用 · 21 个位置组 × 16 way = 336 条 · 每条 10.0 MiB · 位置 1024..11264 · ./kv/kvlow-v3-a08fd86768cca5da.bin",
+        "[2026-11-19 08:41:31.536] [INFO] kvdisk: 同一位置可容纳 16 套不同的「system + tools」—— 它们的哈希不同，互不顶替；只有全部占满才淘汰最老的一条（FIFO）"
+      ],
+      "debug_end": {
+        "indexer_key_cache": {
+          "mode": 3,
+          "format": "FP4-E2M1+UE8M0",
+          "row_bytes": 68
+        },
+        "indexer_register_only": {
+          "requests": 2049,
+          "encoded": 2025,
+          "fallbacks": 0,
+          "failures": 0,
+          "f32_dispatches": 0,
+          "bf16_dispatches": 2025
+        },
+        "indexer_prefill_compact": {
+          "requests": 97,
+          "encoded": 97,
+          "fallbacks": 0,
+          "failures": 0,
+          "rows_scored": 39000,
+          "union_cap_blocks": 61703616,
+          "dense_blocks": 490360884
+        },
+        "indexer_topk_radix_causal": {
+          "requests": 2052,
+          "encoded": 1773,
+          "fallbacks": 0,
+          "failures": 0,
+          "rows": 316106,
+          "l20_compact_requests": 183,
+          "l20_compact_encoded": 183,
+          "l20_compact_fallbacks": 0,
+          "l20_compact_rows": 15288
+        },
+        "prefix_cache_len": 129375
+      }
+    },
+    {
+      "arm": "armD_winners_topk4",
+      "overrides": {
+        "MYDS_MOE_PREFILL_WIDE": "1",
+        "MYDS_PREFILL_ATTN_FAST": "1",
+        "MYDS_INDEXER_DECODE_MMA": "1",
+        "MYDS_MOE_PREFILL_TOPK": "4"
+      },
+      "conf_diff": "--- baseline.conf\n+++ armD_winners_topk4.conf\n@@ -235,7 +235,7 @@\n #MYDS_PHASE_SPLIT_ATTN=1\n #MYDS_PHASE_SPLIT_DECODE=16\n MYDS_RESP_STATE=./resp.idx\n-MYDS_MOE_PREFILL_WIDE=0\n-MYDS_PREFILL_ATTN_FAST=0\n-MYDS_INDEXER_DECODE_MMA=0\n-MYDS_MOE_PREFILL_TOPK=0\n+MYDS_MOE_PREFILL_WIDE=1\n+MYDS_PREFILL_ATTN_FAST=1\n+MYDS_INDEXER_DECODE_MMA=1\n+MYDS_MOE_PREFILL_TOPK=4\n",
+      "avail_before_gb": 190.08,
+      "cases": {
+        "short_decode_0": {
+          "wall_s": 5.5308,
+          "content_bytes": 404,
+          "sha256": "a91b12613458d22a3fbf6d66ff2fba42124b46ea0e032f68c3564cc0c506ec43",
+          "preview": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31\n32\n33\n34\n35\n36\n37\n38\n39\n40\n41\n42\n43\n44\n45\n46\n47\n48\n49\n50\n51\n52\n53\n54\n55\n56\n5",
+          "usage": {
+            "prompt_tokens": 28,
+            "completion_tokens": 256,
+            "total_tokens": 284,
+            "prompt_tps": 79.86,
+            "completion_tps": 49.48,
+            "server_prompt_tps": 79.86,
+            "server_predicted_tps": 49.48,
+            "prompt_tokens_details": {
+              "cached_tokens": 1
+            },
+            "cache_hit_tokens": 1,
+            "cache_hit_rate": 3.57,
+            "timings": {
+              "prompt_n": 27,
+              "prompt_ms": 338.106,
+              "prompt_per_token_ms": 12.5224,
+              "prompt_per_second": 79.86,
+              "predicted_n": 255,
+              "predicted_ms": 5153.41,
+              "predicted_per_token_ms": 20.2095,
+              "predicted_per_second": 49.48,
+              "cache_n": 1
+            }
+          },
+          "prompt_tok": 28,
+          "prefill_tok": 27,
+          "prefill_s": 0.3,
+          "prefill_tps": 79.9,
+          "cached_tok": 0,
+          "decode_tok": 256,
+          "decode_s": 5.2,
+          "decode_tps": 49.5,
+          "decode_ms_tok": 20.202
+        },
+        "cold_32k": {
+          "wall_s": 37.2826,
+          "content_bytes": 9,
+          "sha256": "0d99c08267aa96cb0876a946cf551dd35cfb56e0db16e63ce4cf5d6b2b0fcb43",
+          "preview": "齿轮箱",
+          "usage": {
+            "prompt_tokens": 32214,
+            "completion_tokens": 3,
+            "total_tokens": 32217,
+            "prompt_tps": 867.79,
+            "completion_tps": 46.04,
+            "server_prompt_tps": 867.79,
+            "server_predicted_tps": 46.04,
+            "prompt_tokens_details": {
+              "cached_tokens": 1
+            },
+            "cache_hit_tokens": 1,
+            "cache_hit_rate": 0.0,
+            "timings": {
+              "prompt_n": 32213,
+              "prompt_ms": 37120.601,
+              "prompt_per_token_ms": 1.1523,
+              "prompt_per_second": 867.79,
+              "predicted_n": 2,
+              "predicted_ms": 43.443,
+              "predicted_per_token_ms": 21.7215,
+              "predicted_per_second": 46.04,
+              "cache_n": 1
+            }
+          },
+          "prompt_tok": 32214,
+          "prefill_tok": 32213,
+          "prefill_s": 37.1,
+          "prefill_tps": 867.8,
+          "cached_tok": 0,
+          "decode_tok": 2,
+          "decode_s": 0.0,
+          "decode_tps": 45.5,
+          "decode_ms_tok": 21.978
+        },
+        "cold_128k": {
+          "wall_s": 185.7666,
+          "content_bytes": 1155,
+          "sha256": "31ca9510acbb67b341366324c6ee2f316bef35a9561724caee870dd19c0d1693",
+          "preview": "I'll analyze the content and structure of this conversation.\n\nThe conversation consists of a single user message containing a large block of text. The text is a",
+          "usage": {
+            "prompt_tokens": 126995,
+            "completion_tokens": 256,
+            "total_tokens": 127251,
+            "prompt_tps": 705.49,
+            "completion_tps": 45.01,
+            "server_prompt_tps": 705.49,
+            "server_predicted_tps": 45.01,
+            "prompt_tokens_details": {
+              "cached_tokens": 1
+            },
+            "cache_hit_tokens": 1,
+            "cache_hit_rate": 0.0,
+            "timings": {
+              "prompt_n": 126994,
+              "prompt_ms": 180007.314,
+              "prompt_per_token_ms": 1.4174,
+              "prompt_per_second": 705.49,
+              "predicted_n": 255,
+              "predicted_ms": 5665.126,
+              "predicted_per_token_ms": 22.2162,
+              "predicted_per_second": 45.01,
+              "cache_n": 1
+            }
+          },
+          "prompt_tok": 126995,
+          "prefill_tok": 126994,
+          "prefill_s": 180.0,
+          "prefill_tps": 705.5,
+          "cached_tok": 0,
+          "decode_tok": 256,
+          "decode_s": 5.7,
+          "decode_tps": 45.0,
+          "decode_ms_tok": 22.222
+        },
+        "warm_128k_plus_2k_v0": {
+          "wall_s": 11.6627,
+          "content_bytes": 1360,
+          "sha256": "e8695545d4b175d7000ca248f7ca7a7ec46fed45f8d11248260b346731931183",
+          "preview": "Latency is the hidden tax on computation, the silent interval between a request and a response. In the architecture of modern systems, it is the shadow that str",
+          "usage": {
+            "prompt_tokens": 129147,
+            "completion_tokens": 256,
+            "total_tokens": 129403,
+            "prompt_tps": 368.49,
+            "completion_tps": 44.81,
+            "server_prompt_tps": 368.49,
+            "server_predicted_tps": 44.81,
+            "prompt_tokens_details": {
+              "cached_tokens": 126977
+            },
+            "cache_hit_tokens": 126977,
+            "cache_hit_rate": 98.32,
+            "timings": {
+              "prompt_n": 2170,
+              "prompt_ms": 5888.84,
+              "prompt_per_token_ms": 2.7138,
+              "prompt_per_second": 368.49,
+              "predicted_n": 255,
+              "predicted_ms": 5690.254,
+              "predicted_per_token_ms": 22.3147,
+              "predicted_per_second": 44.81,
+              "cache_n": 126977
+            }
+          },
+          "prompt_tok": 129147,
+          "prefill_tok": 2170,
+          "prefill_s": 5.9,
+          "prefill_tps": 368.5,
+          "cached_tok": 126976,
+          "decode_tok": 256,
+          "decode_s": 5.7,
+          "decode_tps": 44.8,
+          "decode_ms_tok": 22.321
+        },
+        "warm_128k_plus_2k_v1": {
+          "wall_s": 11.4205,
+          "content_bytes": 1172,
+          "sha256": "61c77fbb374c1e158064134eba65069a19aec16a9a41dc7299b26278a4298fbb",
+          "preview": "Latency is the hidden tax on every system we build. In the vocabulary of computing, it appears as a quiet constant: a delay here, a stall there, the gap between",
+          "usage": {
+            "prompt_tokens": 129147,
+            "completion_tokens": 237,
+            "total_tokens": 129384,
+            "prompt_tps": 356.16,
+            "completion_tps": 45.01,
+            "server_prompt_tps": 356.16,
+            "server_predicted_tps": 45.01,
+            "prompt_tokens_details": {
+              "cached_tokens": 126977
+            },
+            "cache_hit_tokens": 126977,
+            "cache_hit_rate": 98.32,
+            "timings": {
+              "prompt_n": 2170,
+              "prompt_ms": 6092.731,
+              "prompt_per_token_ms": 2.8077,
+              "prompt_per_second": 356.16,
+              "predicted_n": 236,
+              "predicted_ms": 5242.702,
+              "predicted_per_token_ms": 22.2148,
+              "predicted_per_second": 45.01,
+              "cache_n": 126977
+            }
+          },
+          "prompt_tok": 129147,
+          "prefill_tok": 2170,
+          "prefill_s": 6.1,
+          "prefill_tps": 356.2,
+          "cached_tok": 126976,
+          "decode_tok": 236,
+          "decode_s": 5.2,
+          "decode_tps": 45.0,
+          "decode_ms_tok": 22.222
+        },
+        "warm_128k_plus_2k_v2": {
+          "wall_s": 10.8407,
+          "content_bytes": 1212,
+          "sha256": "ce6cf41eaadec1fc829df328cf3fe36fd7553ca3922b836a7d65acedbe94f5f1",
+          "preview": "Latency is the hidden tax on every system we build. In the vocabulary of this index, latency appears as a recurring token—sometimes a warning, sometimes a unit ",
+          "usage": {
+            "prompt_tokens": 129147,
+            "completion_tokens": 222,
+            "total_tokens": 129369,
+            "prompt_tps": 373.4,
+            "completion_tps": 44.7,
+            "server_prompt_tps": 373.4,
+            "server_predicted_tps": 44.7,
+            "prompt_tokens_details": {
+              "cached_tokens": 126977
+            },
+            "cache_hit_tokens": 126977,
+            "cache_hit_rate": 98.32,
+            "timings": {
+              "prompt_n": 2170,
+              "prompt_ms": 5811.536,
+              "prompt_per_token_ms": 2.6781,
+              "prompt_per_second": 373.4,
+              "predicted_n": 221,
+              "predicted_ms": 4943.995,
+              "predicted_per_token_ms": 22.371,
+              "predicted_per_second": 44.7,
+              "cache_n": 126977
+            }
+          },
+          "prompt_tok": 129147,
+          "prefill_tok": 2170,
+          "prefill_s": 5.8,
+          "prefill_tps": 373.4,
+          "cached_tok": 126976,
+          "decode_tok": 221,
+          "decode_s": 4.9,
+          "decode_tps": 44.7,
+          "decode_ms_tok": 22.371
+        }
+      },
+      "avail_after_boot_gb": 33.75,
+      "debug_boot": {
+        "knobs_unread": 0,
+        "counters": {
+          "indexer_key_cache": {
+            "mode": 3,
+            "format": "FP4-E2M1+UE8M0",
+            "row_bytes": 68
+          },
+          "indexer_register_only": {
+            "requests": 0,
+            "encoded": 0,
+            "fallbacks": 0,
+            "failures": 0,
+            "f32_dispatches": 0,
+            "bf16_dispatches": 0
+          },
+          "indexer_prefill_compact": {
+            "requests": 0,
+            "encoded": 0,
+            "fallbacks": 0,
+            "failures": 0,
+            "rows_scored": 0,
+            "union_cap_blocks": 0,
+            "dense_blocks": 0
+          },
+          "indexer_topk_radix_causal": {
+            "requests": 0,
+            "encoded": 0,
+            "fallbacks": 0,
+            "failures": 0,
+            "rows": 0,
+            "l20_compact_requests": 0,
+            "l20_compact_encoded": 0,
+            "l20_compact_fallbacks": 0,
+            "l20_compact_rows": 0
+          },
+          "prefix_cache_len": 0
+        }
+      },
+      "startup_evidence": [
+        "[2026-11-19 08:46:36.059] [INFO] myds_metal: loaded precompiled library from /tmp/stepb_s178_src/bin/myds.metallib (all required V4.1 kernels verified)",
+        "[2026-11-19 08:46:42.755] [INFO] kvdisk: 发现模型伴侣指纹文件: 43948333c8eb0172613384abb5d5e1fe2fd02f40a1ede88afc1cbf22bef1cb68",
+        "[2026-11-19 08:46:42.759] [INFO] kvdisk: ./kv/kvsegments-v1-9a4bc3d10a80fc61.bin 重建（identity 15a81e698fb1bfcd，336 槽 × 2.7 MiB，共 896 MiB）",
+        "[2026-11-19 08:46:42.760] [INFO] kvdisk: ./kv/kvlow-v3-9a4bc3d10a80fc61.bin 重建（identity 1aa5322175c68b65，336 槽 × 10.0 MiB，共 3360 MiB）",
+        "[2026-11-19 08:46:42.760] [INFO] kvdisk: ./kv/kvends-v1-9a4bc3d10a80fc61.bin 重建（identity 1ff2c3cf8babd891，64 槽 × 151.3 MiB，共 9684 MiB）",
+        "[2026-11-19 08:46:42.760] [INFO] kvdisk: ./kv/kvanchor-v1-1ff2c3cf8babd891.bin 重建（identity 0c90ec66edf82f64，16 槽 × 151.3 MiB，共 2421 MiB）",
+        "[2026-11-19 08:46:42.760] [INFO] kvdisk: prompt-cache store · 64 槽 × 65536 tok (151 MiB/槽) = 名义 9.5 GiB",
+        "[2026-11-19 08:46:42.760] [INFO] kvdisk: anchor store      · 16 槽 × 65536 tok (151 MiB/槽) = 名义 2.4 GiB",
+        "[2026-11-19 08:46:42.760] [INFO] kvdisk: 分段网格上限 11264 tok ⇒ 超过此值的 prompt 必须靠 tail 才能缓存",
+        "[2026-11-19 08:46:42.760] [INFO] kvdisk: 低位区落盘已启用 · 21 个位置组 × 16 way = 336 条 · 每条 10.0 MiB · 位置 1024..11264 · ./kv/kvlow-v3-9a4bc3d10a80fc61.bin",
+        "[2026-11-19 08:46:42.760] [INFO] kvdisk: 同一位置可容纳 16 套不同的「system + tools」—— 它们的哈希不同，互不顶替；只有全部占满才淘汰最老的一条（FIFO）"
+      ],
+      "debug_end": {
+        "indexer_key_cache": {
+          "mode": 3,
+          "format": "FP4-E2M1+UE8M0",
+          "row_bytes": 68
+        },
+        "indexer_register_only": {
+          "requests": 2033,
+          "encoded": 2025,
+          "fallbacks": 0,
+          "failures": 0,
+          "f32_dispatches": 0,
+          "bf16_dispatches": 2025
+        },
+        "indexer_prefill_compact": {
+          "requests": 97,
+          "encoded": 97,
+          "fallbacks": 0,
+          "failures": 0,
+          "rows_scored": 39000,
+          "union_cap_blocks": 61703616,
+          "dense_blocks": 490360884
+        },
+        "indexer_topk_radix_causal": {
+          "requests": 2034,
+          "encoded": 1773,
+          "fallbacks": 0,
+          "failures": 0,
+          "rows": 316106,
+          "l20_compact_requests": 183,
+          "l20_compact_encoded": 183,
+          "l20_compact_fallbacks": 0,
+          "l20_compact_rows": 15288
+        },
+        "prefix_cache_len": 129368
+      }
+    }
+  ],
+  "crashes_after": 0
+}
