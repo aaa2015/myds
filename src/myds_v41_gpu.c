@@ -210,6 +210,13 @@ int myds_v41_gpu_indexer_key_fp4_enabled(void) {
     MYDS_LOG_E("MYDS_INDEXER_KEY_FP4 must be exactly absent, 0 or 1");
     return -1;
 }
+int myds_v41_gpu_indexer_decode_mma_enabled(void) {
+    const char *v=getenv("MYDS_INDEXER_DECODE_MMA");
+    if(!v||!strcmp(v,"0"))return 0;
+    if(!strcmp(v,"1"))return 1;
+    MYDS_LOG_E("MYDS_INDEXER_DECODE_MMA must be exactly absent, 0 or 1");
+    return -1;
+}
 uint32_t myds_v41_gpu_indexer_key_cache_mode(void) {
     return myds_v41_gpu_indexer_key_fp4_enabled()==1
         ? MYDS_INDEXER_CACHE_FP4 : MYDS_INDEXER_CACHE_BF16;
@@ -281,6 +288,7 @@ size_t myds_v41_gpu_chunk_workspace_bytes(const myds_v41_gpu_scratch_t *s) {
 myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp) {
     if (myds_v41_gpu_indexer_register_only_enabled()<0 ||
         myds_v41_gpu_indexer_key_fp4_enabled()<0 ||
+        myds_v41_gpu_indexer_decode_mma_enabled()<0 ||
         myds_v41_gpu_indexer_decode_compact_enabled()<0 ||
         myds_v41_gpu_indexer_prefill_compact_enabled()<0 ||
         myds_v41_gpu_topk_radix_causal_enabled()<0 ||
@@ -768,13 +776,19 @@ static int indexscores_mode(myds_metal_buffer_t *scores,const myds_metal_buffer_
         n_comp,n_heads,128,cache_mode,1.0f/64.0f,mask?1u:0u,first_row};
     const myds_metal_buffer_t *b[]={q,weights,cache,scores,mask?mask:scores};
     if (n_heads == 32u) {
+        const int mma_mode = myds_v41_gpu_indexer_decode_mma_enabled();
+        if (mma_mode < 0) return 0;
         const bool rows4 = v41_gpu_indexer_score_rows4_enabled(n_comp);
-        const int ok = rows4
-            ? dispatch("kernel_glm_indexer_score_one_rows4",&a,sizeof(a),b,5,(n_comp+15u)/16u,1,1,32,4,1,0)
-            : dispatch("kernel_glm_indexer_score_one_direct",&a,sizeof(a),b,5,n_comp,1,1,32,4,1,132u*4);
+        const bool use_mma = (mma_mode == 1) && rows4;
+        const int ok = use_mma
+            ? dispatch("kernel_myds_indexer_score_one_mma",&a,sizeof(a),b,5,(n_comp+63u)/64u,1,1,32,4,1,0)
+            : (rows4
+                ? dispatch("kernel_glm_indexer_score_one_rows4",&a,sizeof(a),b,5,(n_comp+15u)/16u,1,1,32,4,1,0)
+                : dispatch("kernel_glm_indexer_score_one_direct",&a,sizeof(a),b,5,n_comp,1,1,32,4,1,132u*4));
         if (ok) {
             v41_gpu_log_indexer_which(0, "direct",
-                rows4 ? "kernel_glm_indexer_score_one_rows4" : "kernel_glm_indexer_score_one_direct",
+                use_mma ? "kernel_myds_indexer_score_one_mma"
+                        : (rows4 ? "kernel_glm_indexer_score_one_rows4" : "kernel_glm_indexer_score_one_direct"),
                 rows4, mask != NULL, cache_mode != 0u, first_row, n_comp, 0u);
         }
         return ok;
@@ -1000,13 +1014,21 @@ int myds_v41_gpu_indexscores_compact_decode_mode(myds_v41_gpu_scratch_t *s,
         q, weights, cache, s->compact_sorted_blocks,
         mask ? mask : s->compact_scores, s->compact_scores, s->compact_rows
     };
-    if (!dispatch("kernel_myds_indexer_score_compact_rows4", &a, sizeof(a), b, 7u,
-                  2048u, 1u, 1u, 32u, 2u, 1u, 0u)) {
+    const int mma_mode = myds_v41_gpu_indexer_decode_mma_enabled();
+    if (mma_mode < 0) {
+        atomic_fetch_add_explicit(&indexer_decode_compact_cnt[IDC_FAIL], 1u, memory_order_relaxed);
+        return 0;
+    }
+    const bool use_mma = (mma_mode == 1);
+    const char *ckernel = use_mma ? "kernel_myds_indexer_score_compact_mma"
+                                  : "kernel_myds_indexer_score_compact_rows4";
+    if (!dispatch(ckernel, &a, sizeof(a), b, 7u,
+                  use_mma ? 256u : 2048u, 1u, 1u, 32u, use_mma ? 4u : 2u, 1u, 0u)) {
         atomic_fetch_add_explicit(&indexer_decode_compact_cnt[IDC_FAIL], 1u, memory_order_relaxed);
         return 0;
     }
     atomic_fetch_add_explicit(&indexer_decode_compact_cnt[IDC_SCORE_ENC], 1u, memory_order_relaxed);
-    v41_gpu_log_indexer_which(3, "compact_decode", "kernel_myds_indexer_score_compact_rows4",
+    v41_gpu_log_indexer_which(3, "compact_decode", ckernel,
                               true, mask != NULL, true, first_row, n_comp, 2048u);
     return 1;
 }

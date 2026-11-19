@@ -166,12 +166,14 @@ TEST_INDEXER_DECODE_COMPACT = $(BIN_DIR)/test_indexer_decode_compact
 TEST_INDEXER_PREFILL_COMPACT = $(BIN_DIR)/test_indexer_prefill_compact
 TEST_INDEXER_TOPK_RADIX_PT1 = $(BIN_DIR)/test_indexer_topk_radix_pt1
 TEST_INDEXER_KEY_FP4 = $(BIN_DIR)/test_indexer_key_fp4
+TEST_INDEXER_DECODE_MMA = $(BIN_DIR)/test_indexer_decode_mma
 ALL_TESTS += $(TEST_STEER)
 ALL_TESTS += $(TEST_VISPRE)
 ALL_TESTS += $(TEST_INDEXER_DECODE_COMPACT)
 ALL_TESTS += $(TEST_INDEXER_PREFILL_COMPACT)
 ALL_TESTS += $(TEST_INDEXER_TOPK_RADIX_PT1)
 ALL_TESTS += $(TEST_INDEXER_KEY_FP4)
+ALL_TESTS += $(TEST_INDEXER_DECODE_MMA)
 
 $(TEST_STEER): tests/test_steer.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -Iinclude -o $@ tests/test_steer.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS)
@@ -190,6 +192,9 @@ $(TEST_INDEXER_TOPK_RADIX_PT1): tests/test_indexer_topk_radix_pt1.m $(BUILD_DIR)
 
 $(TEST_INDEXER_KEY_FP4): tests/test_indexer_key_fp4.m $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Iinclude -o $@ $< $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS)
+
+$(TEST_INDEXER_DECODE_MMA): tests/test_indexer_decode_mma.m $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) -Iinclude -o $@ $< $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS)
 
 # CPU-only: exercises the request_phases formatter. A printf whose argument types
 # drift from its format string compiles cleanly and emits unparsable JSON, which a

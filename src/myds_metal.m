@@ -171,6 +171,7 @@ static bool g_indexer_head_slots = false;
 static id<MTLComputePipelineState> g_pso_indexer_head_slots = nil;
 static bool g_indexer_score_rows4 = false;
 static id<MTLComputePipelineState> g_pso_indexer_score_rows4 = nil;
+static id<MTLComputePipelineState> g_pso_indexer_score_one_mma = nil;
 static uint32_t qkv_nr0(void);
 static uint32_t dense_q4_nr0(void);
 static uint32_t dense_q4_nsg(void);
@@ -215,6 +216,21 @@ static bool indexer_score_rows4_geometry(void) {
     return g_device && g_pso_indexer_score_rows4 && g_pso_indexer_score_rows4.device == g_device &&
         g_pso_indexer_score_rows4.threadExecutionWidth == 32u &&
         g_pso_indexer_score_rows4.maxTotalThreadsPerThreadgroup >= 128u &&
+        g_device.maxThreadsPerThreadgroup.width >= 32u &&
+        g_device.maxThreadsPerThreadgroup.height >= 4u &&
+        g_device.maxThreadsPerThreadgroup.depth >= 1u;
+}
+static int indexer_decode_mma_parse_mode(void) {
+    const char *value = getenv("MYDS_INDEXER_DECODE_MMA");
+    if (!value || strcmp(value, "0") == 0) return 0;
+    if (strcmp(value, "1") == 0) return 1;
+    fprintf(stderr, "myds_metal: MYDS_INDEXER_DECODE_MMA must be exactly absent, 0 or 1\n");
+    return -1;
+}
+static bool indexer_score_one_mma_geometry(void) {
+    return g_device && g_pso_indexer_score_one_mma && g_pso_indexer_score_one_mma.device == g_device &&
+        g_pso_indexer_score_one_mma.threadExecutionWidth == 32u &&
+        g_pso_indexer_score_one_mma.maxTotalThreadsPerThreadgroup >= 128u &&
         g_device.maxThreadsPerThreadgroup.width >= 32u &&
         g_device.maxThreadsPerThreadgroup.height >= 4u &&
         g_device.maxThreadsPerThreadgroup.depth >= 1u;
@@ -2676,6 +2692,17 @@ int myds_metal_init(const char *shader_dir) {
             }
             /* 这里只表示「PSO 可用」，具体每条请求用不用由 indexer_score_rows4_use() 决定。 */
             g_indexer_score_rows4 = indexer_score_rows4 != 0;
+            NSError *mma_error = nil;
+            id<MTLFunction> mma_fn = [g_library newFunctionWithName:@"kernel_myds_indexer_score_one_mma"];
+            if (mma_fn) g_pso_indexer_score_one_mma = [g_device newComputePipelineStateWithFunction:mma_fn error:&mma_error];
+            const int mma_mode = indexer_decode_mma_parse_mode();
+            if (mma_mode < 0 || (mma_mode == 1 && !indexer_score_one_mma_geometry())) {
+                fprintf(stderr, "myds_metal: indexer decode MMA PSO/geometry unavailable (%s); refusing fallback\n",
+                    mma_error.localizedDescription.UTF8String ?: "invalid knob or resource limit");
+                g_initialized = true;
+                myds_metal_cleanup();
+                return 0;
+            }
         }
         if(indexer_topk_threshold&&!myds_metal_indexer_topk_threshold_prepare()) {
             g_initialized=true;myds_metal_cleanup();return 0;
@@ -2759,6 +2786,7 @@ void myds_metal_cleanup(void) {
     g_pso_indexer_head_slots = nil;
     g_indexer_head_slots = false;
     g_pso_indexer_score_rows4 = nil;
+    g_pso_indexer_score_one_mma = nil;
     g_indexer_score_rows4 = false;
     g_indexer_topk_nan_shuffle = false;
     g_indexer_topk_threshold=false;
@@ -3344,9 +3372,13 @@ int myds_metal_indexer_head_slots_dispatch_mode(myds_metal_buffer_t *scores,
     bool *encoded,bool *unavailable) {
     if(encoded)*encoded=false;
     if(unavailable)*unavailable=false;
+    const int mma_mode = indexer_decode_mma_parse_mode();
+    if (mma_mode < 0) return 0;
     const bool use_rows4 = indexer_score_rows4_use(n_comp);
+    const bool use_mma = (mma_mode == 1) && use_rows4;
     if(!g_initialized || !g_indexer_head_slots || !indexer_head_slots_geometry() ||
-       (use_rows4 && !indexer_score_rows4_geometry())) {
+       (use_rows4 && !indexer_score_rows4_geometry()) ||
+       (use_mma && !indexer_score_one_mma_geometry())) {
         if(unavailable)*unavailable=true;
         return 0;
     }
@@ -3377,7 +3409,12 @@ int myds_metal_indexer_head_slots_dispatch_mode(myds_metal_buffer_t *scores,
         /* Preserve the original generic scorer bridge's auto1 pre/post barriers.
          * Auto0 callers retain the same upstream/score-consumer/reuse joins. */
         if(g_batch_cb && g_auto_barrier)[enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        if (use_rows4) {
+        if (use_mma) {
+            [enc setComputePipelineState:g_pso_indexer_score_one_mma];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            for(size_t i=0;i<5u;++i)[enc setBuffer:buffers[i]->mtl_buf offset:buffers[i]->offset atIndex:i+1];
+            metal_dispatch(enc,"kernel_myds_indexer_score_one_mma",MTLSizeMake((n_comp+63u)/64u,1u,1u),MTLSizeMake(32u,4u,1u));
+        } else if (use_rows4) {
             [enc setComputePipelineState:g_pso_indexer_score_rows4];
             [enc setBytes:&args length:sizeof(args) atIndex:0];
             for(size_t i=0;i<5u;++i)[enc setBuffer:buffers[i]->mtl_buf offset:buffers[i]->offset atIndex:i+1];

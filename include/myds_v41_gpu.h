@@ -51,6 +51,7 @@ static inline uint32_t myds_v41_indexer_cache_mode_row_bytes(uint32_t cache_mode
          : (cache_mode == MYDS_INDEXER_CACHE_BF16 ? 256u : 512u);
 }
 int myds_v41_gpu_indexer_key_fp4_enabled(void);
+int myds_v41_gpu_indexer_decode_mma_enabled(void);
 uint32_t myds_v41_gpu_indexer_key_cache_mode(void);
 uint32_t myds_v41_gpu_indexer_key_row_bytes(void);
 int myds_v41_gpu_pack_indexer_fp4(myds_metal_buffer_t *dst, size_t dst_row,

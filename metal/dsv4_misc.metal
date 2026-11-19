@@ -11939,3 +11939,328 @@ kernel void kernel_myds_l20_compact_topk_final(
 
 
 
+
+// =========================================================================
+// [D-I1] Decode Indexer simdgroup_float8x8 MMA Scorers
+// Q[32 x 128] split into two K=64 halves in 8 KB smem_q2 (4 TGs/core on M2 Ultra).
+// Each TG (4 SGs) scores 64 keys (16 keys/SG = 2 tiles of 8 keys), reducing
+// 32 heads with 6 simd_shuffle_xor ops per 8 keys (vs 1,280 shuffles in rows4).
+// Supports FP4 (cache_f16==3), BF16 (cache_f16==2), and F32 (cache_f16==0).
+// =========================================================================
+
+static inline void myds_decode_mma_load_k_half(
+        device const char *indexer_key_cache,
+        uint k0,
+        uint k1,
+        bool live0,
+        bool live1,
+        uint cache_f16,
+        uint kh,
+        short2 xy,
+        thread simdgroup_float8x8 mk[8]) {
+    const uint db_off = kh * 8u;
+    if (cache_f16 == 3u) {
+        device const uint *row0 = live0 ? (device const uint *)(indexer_key_cache + (ulong)k0 * 68u) : nullptr;
+        device const uint *row1 = live1 ? (device const uint *)(indexer_key_cache + (ulong)k1 * 68u) : nullptr;
+        const uint sc0_pack = row0 ? row0[16] : 0u;
+        const uint sc1_pack = row1 ? row1[16] : 0u;
+        const uint shift_a = kh * 16u;
+        const float sc0_a = as_type<float>(((sc0_pack >> shift_a) & 0xffu) << 23u);
+        const float sc0_b = as_type<float>(((sc0_pack >> (shift_a + 8u)) & 0xffu) << 23u);
+        const float sc1_a = as_type<float>(((sc1_pack >> shift_a) & 0xffu) << 23u);
+        const float sc1_b = as_type<float>(((sc1_pack >> (shift_a + 8u)) & 0xffu) << 23u);
+        const uint nib_shift = uint(xy.y) * 4u;
+        #pragma clang loop unroll(full)
+        for (uint db = 0u; db < 8u; db++) {
+            const float sc0 = (db < 4u) ? sc0_a : sc0_b;
+            const float sc1 = (db < 4u) ? sc1_a : sc1_b;
+            mk[db].thread_elements()[0] = row0
+                ? myds_fp4_dequant_elem((row0[db_off + db] >> nib_shift) & 0xfu, sc0) : 0.0f;
+            mk[db].thread_elements()[1] = row1
+                ? myds_fp4_dequant_elem((row1[db_off + db] >> nib_shift) & 0xfu, sc1) : 0.0f;
+        }
+    } else if (cache_f16 == 2u) {
+        device const ushort *row0 = live0 ? (device const ushort *)(indexer_key_cache + (ulong)k0 * 256u) : nullptr;
+        device const ushort *row1 = live1 ? (device const ushort *)(indexer_key_cache + (ulong)k1 * 256u) : nullptr;
+        #pragma clang loop unroll(full)
+        for (uint db = 0u; db < 8u; db++) {
+            const uint d = (db_off + db) * 8u + uint(xy.y);
+            mk[db].thread_elements()[0] = row0 ? as_type<float>(uint(row0[d]) << 16u) : 0.0f;
+            mk[db].thread_elements()[1] = row1 ? as_type<float>(uint(row1[d]) << 16u) : 0.0f;
+        }
+    } else {
+        device const float *row0 = live0 ? (device const float *)(indexer_key_cache + (ulong)k0 * 512u) : nullptr;
+        device const float *row1 = live1 ? (device const float *)(indexer_key_cache + (ulong)k1 * 512u) : nullptr;
+        #pragma clang loop unroll(full)
+        for (uint db = 0u; db < 8u; db++) {
+            const uint d = (db_off + db) * 8u + uint(xy.y);
+            mk[db].thread_elements()[0] = row0 ? row0[d] : 0.0f;
+            mk[db].thread_elements()[1] = row1 ? row1[d] : 0.0f;
+        }
+    }
+}
+
+static inline void myds_decode_mma_reduce_heads(
+        thread const simdgroup_float8x8 acc[4],
+        device const float *weights,
+        float scale,
+        short2 xy,
+        thread float &out0,
+        thread float &out1) {
+    float s0 = 0.0f;
+    float s1 = 0.0f;
+    #pragma clang loop unroll(full)
+    for (uint hb = 0u; hb < 4u; hb++) {
+        const float w = weights[hb * 8u + uint(xy.y)];
+        s0 += max(acc[hb].thread_elements()[0] * scale, 0.0f) * w;
+        s1 += max(acc[hb].thread_elements()[1] * scale, 0.0f) * w;
+    }
+    // dsv4_indexer_ro_0b_coord maps y to lane bits {1, 2, 4} and x to bits {0, 3}.
+    s0 += simd_shuffle_xor(s0, 2);
+    s0 += simd_shuffle_xor(s0, 4);
+    s0 += simd_shuffle_xor(s0, 16);
+    s1 += simd_shuffle_xor(s1, 2);
+    s1 += simd_shuffle_xor(s1, 4);
+    s1 += simd_shuffle_xor(s1, 16);
+    out0 = s0;
+    out1 = s1;
+}
+
+kernel void kernel_myds_indexer_score_one_mma(
+        constant ds4_metal_args_glm_indexer_score_one &args [[buffer(0)]],
+        device const char *q                                [[buffer(1)]],
+        device const float *weights                         [[buffer(2)]],
+        device const char *indexer_key_cache                [[buffer(3)]],
+        device float *scores                                [[buffer(4)]],
+        device const float *mask                            [[buffer(5)]],
+        uint tg     [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u || sg >= 4u) return;
+    const uint tg_base = tg * 64u;
+    if (tg_base >= args.n_rows) return;
+
+    const short2 xy = dsv4_indexer_ro_0b_coord(lane);
+    const uint sg_base = tg_base + uint(sg) * 16u;
+    const uint k0_a = sg_base + uint(xy.x);
+    const uint k1_a = k0_a + 1u;
+    const uint k0_b = sg_base + 8u + uint(xy.x);
+    const uint k1_b = k0_b + 1u;
+
+    const bool valid0_a = (k0_a < args.n_rows);
+    const bool valid1_a = (k1_a < args.n_rows);
+    const bool valid0_b = (k0_b < args.n_rows);
+    const bool valid1_b = (k1_b < args.n_rows);
+
+    const bool live0_a = valid0_a && k0_a >= args.first_row && (!args.has_mask || mask[k0_a >> 3u] == 0.0f);
+    const bool live1_a = valid1_a && k1_a >= args.first_row && (!args.has_mask || mask[k1_a >> 3u] == 0.0f);
+    const bool live0_b = valid0_b && k0_b >= args.first_row && (!args.has_mask || mask[k0_b >> 3u] == 0.0f);
+    const bool live1_b = valid1_b && k1_b >= args.first_row && (!args.has_mask || mask[k1_b >> 3u] == 0.0f);
+
+    const bool sg_any_a = simd_any(live0_a || live1_a);
+    const bool sg_any_b = simd_any(live0_b || live1_b);
+
+    // 8,192 B: Q[32 heads x 64 dims] as 1,024 float2 -> 4 TGs/core on M2 Ultra.
+    threadgroup float2 smem_q2[1024];
+    const uint tid = uint(sg) * 32u + uint(lane);
+    const uint ld_h0 = tid >> 5u;   // 0..3
+    const uint ld_c2 = tid & 31u;   // 0..31 (64 floats)
+    const uint rd_j = uint(xy.x) >> 1u;
+
+    simdgroup_float8x8 acc_a[4];
+    simdgroup_float8x8 acc_b[4];
+    #pragma clang loop unroll(full)
+    for (uint hb = 0u; hb < 4u; hb++) {
+        acc_a[hb] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        acc_b[hb] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    }
+
+    for (uint kh = 0u; kh < 2u; kh++) {
+        const uint dim_off2 = kh * 32u;
+        #pragma clang loop unroll(full)
+        for (uint u = 0u; u < 8u; u++) {
+            const uint h = u * 4u + ld_h0;
+            device const packed_float2 *qh2 = (device const packed_float2 *)(q + (ulong)h * 512u);
+            smem_q2[h * 32u + (ld_c2 ^ ((h & 7u) * 4u))] = float2(qh2[dim_off2 + ld_c2]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sg_any_a) {
+            simdgroup_float8x8 mk[8];
+            myds_decode_mma_load_k_half(indexer_key_cache, k0_a, k1_a, live0_a, live1_a, args.cache_f16, kh, xy, mk);
+            #pragma clang loop unroll(full)
+            for (uint hb = 0u; hb < 4u; hb++) {
+                const uint h = hb * 8u + uint(xy.y);
+                const uint swz = (h & 7u) * 4u;
+                const uint row_off = h * 32u;
+                #pragma clang loop unroll(full)
+                for (uint db = 0u; db < 8u; db++) {
+                    simdgroup_float8x8 mq;
+                    const float2 qp = smem_q2[row_off + ((db * 4u + rd_j) ^ swz)];
+                    mq.thread_elements()[0] = qp.x;
+                    mq.thread_elements()[1] = qp.y;
+                    simdgroup_multiply_accumulate(acc_a[hb], mq, mk[db], acc_a[hb]);
+                }
+            }
+        }
+        if (sg_any_b) {
+            simdgroup_float8x8 mk[8];
+            myds_decode_mma_load_k_half(indexer_key_cache, k0_b, k1_b, live0_b, live1_b, args.cache_f16, kh, xy, mk);
+            #pragma clang loop unroll(full)
+            for (uint hb = 0u; hb < 4u; hb++) {
+                const uint h = hb * 8u + uint(xy.y);
+                const uint swz = (h & 7u) * 4u;
+                const uint row_off = h * 32u;
+                #pragma clang loop unroll(full)
+                for (uint db = 0u; db < 8u; db++) {
+                    simdgroup_float8x8 mq;
+                    const float2 qp = smem_q2[row_off + ((db * 4u + rd_j) ^ swz)];
+                    mq.thread_elements()[0] = qp.x;
+                    mq.thread_elements()[1] = qp.y;
+                    simdgroup_multiply_accumulate(acc_b[hb], mq, mk[db], acc_b[hb]);
+                }
+            }
+        }
+        if (kh == 0u) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    float s0_a = -INFINITY, s1_a = -INFINITY;
+    float s0_b = -INFINITY, s1_b = -INFINITY;
+    if (sg_any_a) myds_decode_mma_reduce_heads(acc_a, weights, args.scale, xy, s0_a, s1_a);
+    if (sg_any_b) myds_decode_mma_reduce_heads(acc_b, weights, args.scale, xy, s0_b, s1_b);
+
+    if (xy.y == 0) {
+        if (valid0_a) scores[k0_a] = live0_a ? s0_a : -INFINITY;
+        if (valid1_a) scores[k1_a] = live1_a ? s1_a : -INFINITY;
+        if (valid0_b) scores[k0_b] = live0_b ? s0_b : -INFINITY;
+        if (valid1_b) scores[k1_b] = live1_b ? s1_b : -INFINITY;
+    }
+}
+
+// Compact decode MMA: 256 TGs x (32, 4, 1) -> 2048 sorted blocks (16,384 rows).
+// Each SG handles 2 blocks (16 rows).
+kernel void kernel_myds_indexer_score_compact_mma(
+        constant myds_indexer_compact_decode_args &args [[buffer(0)]],
+        device const char *q                            [[buffer(1)]],
+        device const float *weights                     [[buffer(2)]],
+        device const char *indexer_key_cache            [[buffer(3)]],
+        device const int32_t *compact_blocks            [[buffer(4)]],
+        device const float *mask                        [[buffer(5)]],
+        device float *compact_scores                    [[buffer(6)]],
+        device int32_t *compact_rows                    [[buffer(7)]],
+        uint tg     [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    if (tg >= 256u || sg >= 4u) return;
+
+    const uint blk_slot_a = tg * 8u + uint(sg) * 2u;
+    const uint blk_slot_b = blk_slot_a + 1u;
+    const int32_t blk_a = compact_blocks[blk_slot_a];
+    const int32_t blk_b = compact_blocks[blk_slot_b];
+    const uint n_blocks = (args.n_rows + 7u) / 8u;
+    const uint has_mask = args.has_mask & 1u;
+    const uint cache_f16 = (args.has_mask >> 8u) ? (args.has_mask >> 8u) : 2u;
+
+    const bool blk_a_ok = (blk_a >= 0 && uint(blk_a) < n_blocks && (!has_mask || mask[blk_a] == 0.0f));
+    const bool blk_b_ok = (blk_b >= 0 && uint(blk_b) < n_blocks && (!has_mask || mask[blk_b] == 0.0f));
+
+    const short2 xy = dsv4_indexer_ro_0b_coord(lane);
+    const uint k0_a = blk_a_ok ? (uint(blk_a) * 8u + uint(xy.x)) : args.n_rows;
+    const uint k1_a = k0_a + 1u;
+    const uint k0_b = blk_b_ok ? (uint(blk_b) * 8u + uint(xy.x)) : args.n_rows;
+    const uint k1_b = k0_b + 1u;
+
+    const bool live0_a = blk_a_ok && k0_a < args.n_rows && k0_a >= args.first_row;
+    const bool live1_a = blk_a_ok && k1_a < args.n_rows && k1_a >= args.first_row;
+    const bool live0_b = blk_b_ok && k0_b < args.n_rows && k0_b >= args.first_row;
+    const bool live1_b = blk_b_ok && k1_b < args.n_rows && k1_b >= args.first_row;
+
+    const bool sg_any_a = simd_any(live0_a || live1_a);
+    const bool sg_any_b = simd_any(live0_b || live1_b);
+
+    threadgroup float2 smem_q2[1024];
+    const uint tid = uint(sg) * 32u + uint(lane);
+    const uint ld_h0 = tid >> 5u;
+    const uint ld_c2 = tid & 31u;
+    const uint rd_j = uint(xy.x) >> 1u;
+
+    simdgroup_float8x8 acc_a[4];
+    simdgroup_float8x8 acc_b[4];
+    #pragma clang loop unroll(full)
+    for (uint hb = 0u; hb < 4u; hb++) {
+        acc_a[hb] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        acc_b[hb] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    }
+
+    for (uint kh = 0u; kh < 2u; kh++) {
+        const uint dim_off2 = kh * 32u;
+        #pragma clang loop unroll(full)
+        for (uint u = 0u; u < 8u; u++) {
+            const uint h = u * 4u + ld_h0;
+            device const packed_float2 *qh2 = (device const packed_float2 *)(q + (ulong)h * 512u);
+            smem_q2[h * 32u + (ld_c2 ^ ((h & 7u) * 4u))] = float2(qh2[dim_off2 + ld_c2]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sg_any_a) {
+            simdgroup_float8x8 mk[8];
+            myds_decode_mma_load_k_half(indexer_key_cache, k0_a, k1_a, live0_a, live1_a, cache_f16, kh, xy, mk);
+            #pragma clang loop unroll(full)
+            for (uint hb = 0u; hb < 4u; hb++) {
+                const uint h = hb * 8u + uint(xy.y);
+                const uint swz = (h & 7u) * 4u;
+                const uint row_off = h * 32u;
+                #pragma clang loop unroll(full)
+                for (uint db = 0u; db < 8u; db++) {
+                    simdgroup_float8x8 mq;
+                    const float2 qp = smem_q2[row_off + ((db * 4u + rd_j) ^ swz)];
+                    mq.thread_elements()[0] = qp.x;
+                    mq.thread_elements()[1] = qp.y;
+                    simdgroup_multiply_accumulate(acc_a[hb], mq, mk[db], acc_a[hb]);
+                }
+            }
+        }
+        if (sg_any_b) {
+            simdgroup_float8x8 mk[8];
+            myds_decode_mma_load_k_half(indexer_key_cache, k0_b, k1_b, live0_b, live1_b, cache_f16, kh, xy, mk);
+            #pragma clang loop unroll(full)
+            for (uint hb = 0u; hb < 4u; hb++) {
+                const uint h = hb * 8u + uint(xy.y);
+                const uint swz = (h & 7u) * 4u;
+                const uint row_off = h * 32u;
+                #pragma clang loop unroll(full)
+                for (uint db = 0u; db < 8u; db++) {
+                    simdgroup_float8x8 mq;
+                    const float2 qp = smem_q2[row_off + ((db * 4u + rd_j) ^ swz)];
+                    mq.thread_elements()[0] = qp.x;
+                    mq.thread_elements()[1] = qp.y;
+                    simdgroup_multiply_accumulate(acc_b[hb], mq, mk[db], acc_b[hb]);
+                }
+            }
+        }
+        if (kh == 0u) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    float s0_a = -INFINITY, s1_a = -INFINITY;
+    float s0_b = -INFINITY, s1_b = -INFINITY;
+    if (sg_any_a) myds_decode_mma_reduce_heads(acc_a, weights, args.scale, xy, s0_a, s1_a);
+    if (sg_any_b) myds_decode_mma_reduce_heads(acc_b, weights, args.scale, xy, s0_b, s1_b);
+
+    if (xy.y == 0) {
+        const uint slot0_a = blk_slot_a * 8u + uint(xy.x);
+        const uint slot0_b = blk_slot_b * 8u + uint(xy.x);
+        compact_scores[slot0_a + 0u] = live0_a ? s0_a : -INFINITY;
+        compact_scores[slot0_a + 1u] = live1_a ? s1_a : -INFINITY;
+        compact_rows[slot0_a + 0u]   = live0_a ? int32_t(k0_a) : -1;
+        compact_rows[slot0_a + 1u]   = live1_a ? int32_t(k1_a) : -1;
+
+        compact_scores[slot0_b + 0u] = live0_b ? s0_b : -INFINITY;
+        compact_scores[slot0_b + 1u] = live1_b ? s1_b : -INFINITY;
+        compact_rows[slot0_b + 0u]   = live0_b ? int32_t(k0_b) : -1;
+        compact_rows[slot0_b + 1u]   = live1_b ? int32_t(k1_b) : -1;
+    }
+}
