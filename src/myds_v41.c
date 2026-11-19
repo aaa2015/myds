@@ -1289,11 +1289,38 @@ static bool lowkv_read_companion_digest(const char *model_path, char *buf, size_
     return found;
 }
 
+/* [P-NEW-4] MYDS_MOE_PREFILL_TOPK: default 0 (keep model default 6).
+ * Accepts "0", "3", "4", "6"; any other value fails closed (-1). */
+static int v41_prefill_moe_topk_parse(void) {
+    const char *e = getenv("MYDS_MOE_PREFILL_TOPK");
+    if (!e || !*e || strcmp(e, "0") == 0) return 0;
+    if (strcmp(e, "3") == 0) return 3;
+    if (strcmp(e, "4") == 0) return 4;
+    if (strcmp(e, "6") == 0) return 6;
+    MYDS_LOG_E("MYDS_MOE_PREFILL_TOPK must be 0, 3, 4, or 6 (got '%s')", e);
+    return -1;
+}
+
+static uint32_t v41_prefill_moe_topk_effective(uint32_t model_k) {
+    const int parsed = v41_prefill_moe_topk_parse();
+    if (parsed <= 0) return model_k;
+    return (uint32_t)parsed < model_k ? (uint32_t)parsed : model_k;
+}
+
 static uint64_t lowkv_mix_idx_row_bytes(uint64_t id, uint32_t idx_row_bytes) {
     if (!id || !idx_row_bytes) return 0;
     if (idx_row_bytes == V41_INDEX_DIM * V41_CACHE_BYTES) return id;
     const uint64_t v[2] = { id, (uint64_t)idx_row_bytes };
     const uint64_t mixed = myds_kvdsk_identity("myds_idx_row_bytes", v, 2u);
+    return mixed ? mixed : 1ull;
+}
+
+static uint64_t lowkv_mix_prefill_moe_topk(uint64_t id, uint32_t model_k) {
+    if (!id) return 0;
+    const int ptopk = v41_prefill_moe_topk_parse();
+    if (ptopk <= 0 || (uint32_t)ptopk == model_k) return id;
+    const uint64_t v[2] = { id, (uint64_t)(uint32_t)ptopk };
+    const uint64_t mixed = myds_kvdsk_identity("myds_prefill_moe_topk", v, 2u);
     return mixed ? mixed : 1ull;
 }
 
@@ -1473,7 +1500,8 @@ static uint64_t lowkv_identity_mode(const myds_model_t *m, uint32_t idx_row_byte
     v[n++] = weight_digest;
 
     uint64_t id = myds_kvdsk_identity(m ? m->arch : "", v, n);
-    return lowkv_mix_idx_row_bytes(id ? id : 1ull, idx_row_bytes);
+    id = lowkv_mix_idx_row_bytes(id ? id : 1ull, idx_row_bytes);
+    return lowkv_mix_prefill_moe_topk(id, m ? m->n_activated_experts : 6u);
 }
 
 uint64_t myds_v41_model_identity(const myds_model_t *m) {
@@ -2735,7 +2763,9 @@ bool myds_v41_low_kv_fixture_enable(myds_v41_context_t *g, const char *path, uin
     if (myds_v41_gpu_indexer_key_fp4_enabled() < 0) return false;
     if (!g->index_cache_mode) g->index_cache_mode = myds_v41_gpu_indexer_key_cache_mode();
     const uint32_t idx_row_bytes = v41_index_row_bytes(g);
-    const uint64_t mode_identity = lowkv_mix_idx_row_bytes(identity, idx_row_bytes);
+    const uint64_t mode_identity = lowkv_mix_prefill_moe_topk(
+        lowkv_mix_idx_row_bytes(identity, idx_row_bytes),
+        g->model ? g->model->n_activated_experts : 6u);
     for (uint32_t o = 0; o < 4u; ++o) {
         const uint32_t r = lowkv_owner_ratio(o);
         const uint32_t rows = r ? (max_pos / r) + 1u : 1u;
@@ -7493,6 +7523,8 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     myds_v41_context_t *g = ctx->v41;
     myds_v41_model_t *v = m ? m->v41 : NULL;
     if (!m || !g || !v) return -1;
+    if (v41_prefill_moe_topk_parse() < 0) return -1;
+    const uint32_t prefill_moe_k = v41_prefill_moe_topk_effective(m->n_activated_experts);
     lowkv_join(g);   /* prefill 会写压缩 KV 与快照槽 */
     if (!myds_metal_commit_batch()) return -1;
 
@@ -8731,9 +8763,9 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                         !myds_metal_buffer_update_sub_view(cw->in_shared_view, cw->moe_shared_acc,
                             (size_t)moe_off * V41_DIM * sizeof(float), (size_t)c_len * V41_DIM * sizeof(float)) ||
                         !myds_metal_buffer_update_sub_view(cw->in_ids_view, cw->moe_ids_acc,
-                            (size_t)moe_off * 6 * sizeof(int32_t), (size_t)c_len * 6 * sizeof(int32_t)) ||
+                            (size_t)moe_off * prefill_moe_k * sizeof(int32_t), (size_t)c_len * prefill_moe_k * sizeof(int32_t)) ||
                         !myds_metal_buffer_update_sub_view(cw->in_weights_view, cw->moe_w_acc,
-                            (size_t)moe_off * 6 * sizeof(float), (size_t)c_len * 6 * sizeof(float))) {
+                            (size_t)moe_off * prefill_moe_k * sizeof(float), (size_t)c_len * prefill_moe_k * sizeof(float))) {
                         MYDS_LOG_E("V4.1 MoE acc input sub-view failed (moe_off=%u c_len=%u)", moe_off, c_len);
                         goto fail;
                     }
@@ -8820,7 +8852,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                   
                 /* Step 7b: Batched MoE routing for all tokens in chunk on GPU */
                 phase = "batched MoE routing";
-                uint32_t k = m->n_activated_experts;
+                uint32_t k = prefill_moe_k;
                 if (trace_on) {
                     for (uint32_t t = 0; t < c_len; t++) {
                         uint32_t pos = mb_base_pos + c_start + t;   /* TRACE 需要 pos */
@@ -8954,10 +8986,10 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 if (!direct_moe_acc && cw->moe_batch > cw->capacity) {
                     CHECK(myds_metal_buffer_copy(cw->moe_norm_acc, (size_t)moe_off * V41_DIM * sizeof(float),
                                                  cw->ffn_norm_buf, 0, (size_t)c_len * V41_DIM * sizeof(float)));
-                    CHECK(myds_metal_buffer_copy(cw->moe_ids_acc, (size_t)moe_off * 6 * sizeof(int32_t),
-                                                 cw->selected_ids_buf, 0, (size_t)c_len * 6 * sizeof(int32_t)));
-                    CHECK(myds_metal_buffer_copy(cw->moe_w_acc, (size_t)moe_off * 6 * sizeof(float),
-                                                 cw->selected_weights_buf, 0, (size_t)c_len * 6 * sizeof(float)));
+                    CHECK(myds_metal_buffer_copy(cw->moe_ids_acc, (size_t)moe_off * prefill_moe_k * sizeof(int32_t),
+                                                 cw->selected_ids_buf, 0, (size_t)c_len * prefill_moe_k * sizeof(int32_t)));
+                    CHECK(myds_metal_buffer_copy(cw->moe_w_acc, (size_t)moe_off * prefill_moe_k * sizeof(float),
+                                                 cw->selected_weights_buf, 0, (size_t)c_len * prefill_moe_k * sizeof(float)));
                     CHECK(myds_metal_buffer_copy(cw->moe_shared_acc, (size_t)moe_off * V41_DIM * sizeof(float),
                                                  cw->shared_out_buf, 0, (size_t)c_len * V41_DIM * sizeof(float)));
                     CHECK(myds_metal_buffer_copy(cw->moe_after_acc, (size_t)moe_off * 4 * V41_DIM * sizeof(float),
