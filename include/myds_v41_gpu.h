@@ -731,4 +731,16 @@ typedef struct {
 } myds_v41_gpu_prefill_attn_l01_mma_counters_t;
 void myds_v41_gpu_prefill_attn_l01_mma_counters(
     myds_v41_gpu_prefill_attn_l01_mma_counters_t *out, bool reset);
+
+/* [CAND-A2] Default-off direct-indirect compressed KV inside q8 heads_maskless_slab
+ * (MYDS_PREFILL_ATTN_DIRECT_COMP: absent/0=off, 1=on, else -1; strict 0-ULP). */
+int myds_v41_gpu_prefill_attn_direct_comp_enabled(void);
+typedef struct {
+    uint64_t requests;
+    uint64_t bf16_encoded;
+    uint64_t nvfp4_encoded;
+    uint64_t fallbacks;
+} myds_v41_gpu_prefill_attn_direct_comp_counters_t;
+void myds_v41_gpu_prefill_attn_direct_comp_counters(
+    myds_v41_gpu_prefill_attn_direct_comp_counters_t *out, bool reset);
 #endif

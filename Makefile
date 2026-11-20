@@ -179,6 +179,7 @@ TEST_DECODE_TOPK_FAST = $(BIN_DIR)/test_decode_topk_fast
 TEST_DENSE_PREFILL_WIDE = $(BIN_DIR)/test_dense_prefill_wide
 TEST_HC_MIX_FAST = $(BIN_DIR)/test_hc_mix_fast
 TEST_INDEXER_PREFILL_WIDE = $(BIN_DIR)/test_indexer_prefill_wide
+TEST_PREFILL_ATTN_DIRECT_COMP = $(BIN_DIR)/test_prefill_attn_direct_comp
 ALL_TESTS += $(TEST_STEER)
 ALL_TESTS += $(TEST_VISPRE)
 ALL_TESTS += $(TEST_INDEXER_DECODE_COMPACT)
@@ -195,6 +196,7 @@ ALL_TESTS += $(TEST_DECODE_TOPK_FAST)
 ALL_TESTS += $(TEST_DENSE_PREFILL_WIDE)
 ALL_TESTS += $(TEST_HC_MIX_FAST)
 ALL_TESTS += $(TEST_INDEXER_PREFILL_WIDE)
+ALL_TESTS += $(TEST_PREFILL_ATTN_DIRECT_COMP)
 
 $(TEST_STEER): tests/test_steer.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -Iinclude -o $@ tests/test_steer.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS)
@@ -233,6 +235,9 @@ $(TEST_HC_MIX_FAST): tests/test_hc_mix_fast.m $(BUILD_DIR)/myds_v41_gpu.o $(BUIL
 	$(CC) $(OBJCFLAGS) -Iinclude -o $@ $< $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS)
 
 $(TEST_INDEXER_PREFILL_WIDE): tests/test_indexer_prefill_wide.m $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) -Iinclude -o $@ $< $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS)
+
+$(TEST_PREFILL_ATTN_DIRECT_COMP): tests/test_prefill_attn_direct_comp.m $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Iinclude -o $@ $< $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS)
 # CPU-only: exercises the request_phases formatter. A printf whose argument types
 # drift from its format string compiles cleanly and emits unparsable JSON, which a
@@ -1113,6 +1118,7 @@ test: check-knobs $(ALL_TESTS) $(METALLIB)
 	@./$(TEST_DENSE_PREFILL_WIDE)
 	@./$(TEST_HC_MIX_FAST)
 	@./$(TEST_INDEXER_PREFILL_WIDE)
+	@./$(TEST_PREFILL_ATTN_DIRECT_COMP)
 	@./$(TEST_GGUF_BOUNDS)
 	@./$(TEST_GGUF_SPLIT)
 	@./$(TEST_GGUF_BYTE_SPLIT)

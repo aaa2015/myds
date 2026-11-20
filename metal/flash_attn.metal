@@ -1415,6 +1415,475 @@ kernel flash_attn_heads_reg_o_fast_t kernel_myds_flash_attn_heads_reg_o<512, 512
 template [[host_name("kernel_myds_flash_attn_heads_q16_f16_dk512_dv512")]]
 kernel flash_attn_heads_reg_o_t kernel_myds_flash_attn_heads_reg_o<512, 512, 16, 64, 8, true>;
 
+// [CAND-A2] Direct-Indirect Compressed KV inside q8 Maskless-Slab Reg-O
+// (Q=8, C=64, NSG=4, DK=512, DV=512, 10,272 B smem -> 3 TGs/core on Apple8).
+//
+// Eliminates gather_comp_512 (0 bytes written to kv_gathered, 0 gather dispatch)
+// by reading compressed KV rows directly from comp_kv via ids[iq2 * top_k + j]
+// for ic >= 128, while keeping ic < 128 direct-slab reads identical to
+// heads_maskless_slab. Explicitly scalarized lo0..lo15 eliminates the 288 B
+// Apple8 stack alloca spill of the array-indexed Reg-O path (92 VGPRs, 0 B spill,
+// Apple8 maxThr = 576, 3 TGs/core).
+//
+// Strict 0-ULP (memcmp == 0) vs gather_comp_512 + heads_maskless_slab:
+//   - STORAGE == 2u (NVFP4, 288 B/row, 32B aligned): Option A direct-to-register
+//     uint4 QK + uint2 PV with exact 16-entry E2M1FN x E4M3FN -> half bijection.
+//   - STORAGE == 1u (BF16, 1024 B/row, 2B aligned): Option B1 32x32 coalesced QK
+//     stage reusing ss (0 extra smem) + Option A 1-key PV.
+struct ds4_metal_args_flash_attn_direct_comp {
+    ds4_metal_args_flash_attn_ext ext;
+    uint32_t n_comp;
+    uint32_t top_k;
+};
+static_assert(sizeof(ds4_metal_args_flash_attn_direct_comp) == 200,
+              "ds4_metal_args_flash_attn_direct_comp must stay 200 bytes");
+static_assert(__builtin_offsetof(ds4_metal_args_flash_attn_direct_comp, n_comp) == 192,
+              "n_comp must live at offset 192");
+static_assert(__builtin_offsetof(ds4_metal_args_flash_attn_direct_comp, top_k) == 196,
+              "top_k must live at offset 196");
+
+constant static constexpr half k_myds_fa_e2m1_f16[16] = {
+     0.0h,  0.5h,  1.0h,  1.5h,  2.0h,  3.0h,  4.0h,  6.0h,
+    -0.0h, -0.5h, -1.0h, -1.5h, -2.0h, -3.0h, -4.0h, -6.0h
+};
+
+static inline half myds_fa_e4m3fn_to_f16(uint sc) {
+    const uint s = sc & 0x7fu;
+    const half norm = as_type<half>(ushort(0x2000u + (s << 7u)));
+    const half sub  = half(s) * half(0.001953125h);
+    return select(norm, sub, s < 8u);
+}
+
+static inline half2 myds_fa_nvfp4_qk_f16x2(uint c0, uint c1, half2 sc) {
+    #pragma clang fp contract(off)
+    return half2(k_myds_fa_e2m1_f16[c0], k_myds_fa_e2m1_f16[c1]) * sc;
+}
+
+static inline half2 myds_fa_nvfp4_pv_f16x2(uint byte8, half sc) {
+    #pragma clang fp contract(off)
+    return half2(k_myds_fa_e2m1_f16[byte8 & 0xfu],
+                 k_myds_fa_e2m1_f16[(byte8 >> 4u) & 0xfu]) * sc;
+}
+
+static inline half2 myds_fa_bf16x2_to_f16x2(ushort u0, ushort u1) {
+    return half2(as_type<float2>(uint2(u0, u1) << 16u));
+}
+
+template<uint STORAGE>
+void kernel_myds_flash_attn_heads_maskless_slab_direct_comp_impl(
+        constant ds4_metal_args_flash_attn_direct_comp & dargs,
+        device const char * q,
+        device const char * comp_kv,
+        device const int  * ids,
+        device const char * sinks,
+        device const char * slab,
+        device       char * dst,
+        threadgroup  half * shmem_f16,
+        uint3   tgpig,
+        ushort  tiisg,
+        ushort  sgitg) {
+    constant ds4_metal_args_flash_attn_ext & args = dargs.ext;
+    const ushort iq3 = tgpig[2];
+    const ushort iq2 = tgpig[1];
+    const ushort iq1 = tgpig[0] * 8;
+
+#define DC_NS10 (FC_flash_attn_ext_ns10)
+#define DC_NS20 (FC_flash_attn_ext_ns20)
+
+    constexpr short DK  = 512;
+    constexpr short DV  = 512;
+    constexpr short Q   = 8;
+    constexpr short C   = 64;
+    constexpr short NSG = 4;
+    constexpr short NW  = N_SIMDWIDTH;
+    constexpr short DK4 = DK / 4;
+    constexpr short DK8 = DK / 8;
+    constexpr short NQ  = Q / NSG;
+    constexpr short SH  = C;
+    constexpr short TS  = 2 * SH;
+
+    // Shared memory layout (10,272 B total, identical to heads_maskless_slab -> 3 TGs/core):
+    //   [0 .. 4096)        : sq   (8 * 512 halves = 8,192 B)
+    //   [4096 .. 5120)     : ss   (8 * 64 floats  = 2,048 B; also reused as 32x32 sk in BF16 QK^T)
+    //   [5120 .. 5136)     : s_ms (8 floats       =    32 B)
+    threadgroup half   * sq   = shmem_f16;
+    threadgroup half4  * sq4  = (threadgroup half4 *) shmem_f16;
+    threadgroup float  * ss   = (threadgroup float *) (shmem_f16 + Q * DK);
+    threadgroup float2 * ss2  = (threadgroup float2 *) (shmem_f16 + Q * DK);
+    threadgroup float  * s_ms = (threadgroup float *) (shmem_f16 + Q * (DK + TS));
+
+    const short lo_row = ((tiisg >> 2) & 4) | ((tiisg >> 1) & 3);
+    const short lo_col = ((tiisg >> 1) & 4) | ((tiisg & 1) << 1);
+
+    q += iq1 * args.nb01 + iq2 * args.nb02 + iq3 * args.nb03;
+    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+        const short j = jj * NSG + sgitg;
+        device const float4 * q4 = (device const float4 *) ((device const char *) q + j * args.nb01);
+        for (short i = tiisg; i < DK4; i += NW) {
+            if (iq1 + j < args.ne01) {
+                sq4[j * DK4 + i] = (half4) q4[i];
+            } else {
+                sq4[j * DK4 + i] = 0;
+            }
+        }
+    }
+
+    // Explicitly scalarized 16 x simdgroup_float8x8 output accumulators (32 floats/lane,
+    // 0 stack alloca / 0 B spill on Apple8 & Apple9). Partitioned as 16*sgitg + 64*jj + {0,8}
+    // so each (jj, sgitg) pair aligns 1:1 with a single 16-element NVFP4 scale block.
+    simdgroup_float8x8 lo0  = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 lo1  = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 lo2  = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 lo3  = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 lo4  = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 lo5  = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 lo6  = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 lo7  = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 lo8  = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 lo9  = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 lo10 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 lo11 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 lo12 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 lo13 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 lo14 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 lo15 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+#define DC_SCALE1(x, s) do { (x).thread_elements()[0] *= (s); (x).thread_elements()[1] *= (s); } while (0)
+#define DC_SCALE_ALL(s) do { \
+    DC_SCALE1(lo0,  s); DC_SCALE1(lo1,  s); DC_SCALE1(lo2,  s); DC_SCALE1(lo3,  s); \
+    DC_SCALE1(lo4,  s); DC_SCALE1(lo5,  s); DC_SCALE1(lo6,  s); DC_SCALE1(lo7,  s); \
+    DC_SCALE1(lo8,  s); DC_SCALE1(lo9,  s); DC_SCALE1(lo10, s); DC_SCALE1(lo11, s); \
+    DC_SCALE1(lo12, s); DC_SCALE1(lo13, s); DC_SCALE1(lo14, s); DC_SCALE1(lo15, s); \
+} while (0)
+
+#define DC_SOFTMAX_AND_SCALE() do { \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+    { \
+        const short j0 = sgitg; \
+        const float m = M0; \
+        float2 s2 = ss2[j0 * SH / 2 + tiisg] * args.scale; \
+        if (FC_flash_attn_ext_has_scap) { s2 = args.logit_softcap * precise::tanh(s2); } \
+        M0 = simd_max(max(M0, max(s2[0], s2[1]))); \
+        const float  ms  = exp(m  - M0); \
+        const float2 vs2 = exp(s2 - M0); \
+        S0 = S0 * ms + simd_sum(vs2[0] + vs2[1]); \
+        ss2[j0 * SH / 2 + tiisg] = vs2; \
+        if (tiisg == 0) s_ms[j0] = ms; \
+    } \
+    { \
+        const short j1 = NSG + sgitg; \
+        const float m = M1; \
+        float2 s2 = ss2[j1 * SH / 2 + tiisg] * args.scale; \
+        if (FC_flash_attn_ext_has_scap) { s2 = args.logit_softcap * precise::tanh(s2); } \
+        M1 = simd_max(max(M1, max(s2[0], s2[1]))); \
+        const float  ms  = exp(m  - M1); \
+        const float2 vs2 = exp(s2 - M1); \
+        S1 = S1 * ms + simd_sum(vs2[0] + vs2[1]); \
+        ss2[j1 * SH / 2 + tiisg] = vs2; \
+        if (tiisg == 0) s_ms[j1] = ms; \
+    } \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+    { \
+        _Pragma("clang fp contract(off)") \
+        const float ms_r = s_ms[lo_row]; \
+        DC_SCALE_ALL(ms_r); \
+    } \
+} while (0)
+
+#define DC_PV_SLAB_PAIR(jj, a, b) do { \
+    simdgroup_half8x8 mv0, mv1; \
+    simdgroup_load(mv0, pv + (jj) * 64 + 0, DC_NS20, 0, false); \
+    simdgroup_load(mv1, pv + (jj) * 64 + 8, DC_NS20, 0, false); \
+    simdgroup_multiply_accumulate(a, vs, mv0, a); \
+    simdgroup_multiply_accumulate(b, vs, mv1, b); \
+} while (0)
+
+#define DC_PV_NVFP4_PAIR(jj, a, b) do { \
+    const uint blk = (jj) * 4u + sgitg; \
+    const half sc = vis ? myds_fa_e4m3fn_to_f16(uint(row288[256u + blk])) : 0.0h; \
+    const uint2 w = vis ? ((device const uint2 *)row288)[blk] : uint2(0u, 0u); \
+    const half2 v0 = myds_fa_nvfp4_pv_f16x2(w.x >> col_sh, sc); \
+    const half2 v1 = myds_fa_nvfp4_pv_f16x2(w.y >> col_sh, sc); \
+    simdgroup_half8x8 mv0, mv1; \
+    mv0.thread_elements()[0] = v0.x; mv0.thread_elements()[1] = v0.y; \
+    mv1.thread_elements()[0] = v1.x; mv1.thread_elements()[1] = v1.y; \
+    simdgroup_multiply_accumulate(a, vs, mv0, a); \
+    simdgroup_multiply_accumulate(b, vs, mv1, b); \
+} while (0)
+
+#define DC_PV_BF16_PAIR(jj, a, b) do { \
+    const uint base = (jj) * 64u + sgitg * 16u + uint(lo_col); \
+    const half2 v0 = vis ? myds_fa_bf16x2_to_f16x2(row_bf16[base + 0u], row_bf16[base + 1u]) : half2(0.0h); \
+    const half2 v1 = vis ? myds_fa_bf16x2_to_f16x2(row_bf16[base + 8u], row_bf16[base + 9u]) : half2(0.0h); \
+    simdgroup_half8x8 mv0, mv1; \
+    mv0.thread_elements()[0] = v0.x; mv0.thread_elements()[1] = v0.y; \
+    mv1.thread_elements()[0] = v1.x; mv1.thread_elements()[1] = v1.y; \
+    simdgroup_multiply_accumulate(a, vs, mv0, a); \
+    simdgroup_multiply_accumulate(b, vs, mv1, b); \
+} while (0)
+
+#define DC_STORE_PAIR(jj, a, b) do { \
+    const short c0 = ((jj) * 64 + 16 * sgitg + 0 + lo_col) / 2; \
+    const short c1 = ((jj) * 64 + 16 * sgitg + 8 + lo_col) / 2; \
+    dst2[c0] = float2((a).thread_elements()[0] * scale, (a).thread_elements()[1] * scale); \
+    dst2[c1] = float2((b).thread_elements()[0] * scale, (b).thread_elements()[1] * scale); \
+} while (0)
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float S0 = 0.0f, S1 = 0.0f;
+    float M0 = -FLT_MAX / 2, M1 = -FLT_MAX / 2;
+
+    // Phase 1: Sliding-window slab (ic = 0, 64 -> 128 keys)
+    {
+        device const char * slab_k = slab + (uint64_t)iq2 * args.nb11;
+        device const char * slab_v = slab + (uint64_t)iq2 * args.nb21;
+        for (short ic0 = 0; ic0 < 2; ++ic0) {
+            const int ic = ic0 * C;
+            if (ic >= args.ne11) break;
+            {
+                device const half * pk = (device const half *)(slab_k + (uint64_t)ic * args.nb11) + sgitg * (8 * DC_NS10);
+                threadgroup float * ps = ss + sgitg * 8;
+                FOR_UNROLL (short cc = 0; cc < 2; ++cc) {
+                    simdgroup_float8x8 mqk = make_filled_simdgroup_matrix<float, 8>(0.0f);
+                    for (short i = 0; i < DK8 / 2; ++i) {
+                        simdgroup_half8x8 mk0, mk1, mq0, mq1;
+                        simdgroup_load(mk0, pk + 0 + 16 * i, DC_NS10, 0, true);
+                        simdgroup_load(mk1, pk + 8 + 16 * i, DC_NS10, 0, true);
+                        simdgroup_load(mq0, sq + 0 + 16 * i, DK);
+                        simdgroup_load(mq1, sq + 8 + 16 * i, DK);
+                        simdgroup_multiply_accumulate(mqk, mq0, mk0, mqk);
+                        simdgroup_multiply_accumulate(mqk, mq1, mk1, mqk);
+                    }
+                    simdgroup_store(mqk, ps, SH, 0, false);
+                    pk += 8 * (NSG * DC_NS10);
+                    ps += 8 * NSG;
+                }
+            }
+            DC_SOFTMAX_AND_SCALE();
+            {
+                device const half * pv = (device const half *)(slab_v + (uint64_t)ic * args.nb21) + 16 * sgitg;
+                for (short cc = 0; cc < 8; ++cc) {
+                    simdgroup_float8x8 vs;
+                    simdgroup_load(vs, ss + 8 * cc, SH, 0, false);
+                    DC_PV_SLAB_PAIR(0, lo0,  lo1);  DC_PV_SLAB_PAIR(1, lo2,  lo3);
+                    DC_PV_SLAB_PAIR(2, lo4,  lo5);  DC_PV_SLAB_PAIR(3, lo6,  lo7);
+                    DC_PV_SLAB_PAIR(4, lo8,  lo9);  DC_PV_SLAB_PAIR(5, lo10, lo11);
+                    DC_PV_SLAB_PAIR(6, lo12, lo13); DC_PV_SLAB_PAIR(7, lo14, lo15);
+                    pv += 8 * DC_NS20;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    // Phase 2: Direct-Indirect Compressed KV (ic = 128 .. ne11, typically 8 tiles x 64 = 512 keys)
+    {
+        device const int * row_ids = ids + (uint64_t)iq2 * dargs.top_k;
+        const uint row_sh = (uint)lo_row * 4u;
+        const uint col_sh = (uint)lo_col * 4u;
+        const int n_comp_tiles = (args.ne11 > 128) ? ((args.ne11 - 128) / C) : 0;
+        for (int ic0 = 0; ic0 < n_comp_tiles; ++ic0) {
+            const uint comp_base = (uint)ic0 * 64u;
+            if (STORAGE == 2u) {
+                // NVFP4 (288 B/row): Option A Direct-to-Register QK^T (128-bit uint4 broadcast loads)
+                threadgroup float * ps = ss + sgitg * 8;
+                FOR_UNROLL (short cc = 0; cc < 2; ++cc) {
+                    const uint k_off = comp_base + (uint)cc * 32u + (uint)sgitg * 8u + (uint)lo_col;
+                    const int id0 = row_ids[k_off + 0u];
+                    const int id1 = row_ids[k_off + 1u];
+                    const bool v0 = (id0 >= 0) && ((uint)id0 < dargs.n_comp);
+                    const bool v1 = (id1 >= 0) && ((uint)id1 < dargs.n_comp);
+                    device const uchar * r0 = (device const uchar *)(comp_kv + (uint64_t)(v0 ? id0 : 0) * 288u);
+                    device const uchar * r1 = (device const uchar *)(comp_kv + (uint64_t)(v1 ? id1 : 0) * 288u);
+                    simdgroup_float8x8 mqk = make_filled_simdgroup_matrix<float, 8>(0.0f);
+                    for (short i2 = 0; i2 < 16; ++i2) {
+                        const ushort sc0p = v0 ? ((device const ushort *)(r0 + 256u))[i2] : 0u;
+                        const ushort sc1p = v1 ? ((device const ushort *)(r1 + 256u))[i2] : 0u;
+                        const uint4 w0 = v0 ? ((device const uint4 *)r0)[i2] : uint4(0u);
+                        const uint4 w1 = v1 ? ((device const uint4 *)r1)[i2] : uint4(0u);
+                        {
+                            const half2 sc = half2(v0 ? myds_fa_e4m3fn_to_f16(uint(sc0p) & 0xffu) : 0.0h,
+                                                   v1 ? myds_fa_e4m3fn_to_f16(uint(sc1p) & 0xffu) : 0.0h);
+                            const half2 k0 = myds_fa_nvfp4_qk_f16x2((w0.x >> row_sh) & 0xfu, (w1.x >> row_sh) & 0xfu, sc);
+                            const half2 k1 = myds_fa_nvfp4_qk_f16x2((w0.y >> row_sh) & 0xfu, (w1.y >> row_sh) & 0xfu, sc);
+                            simdgroup_half8x8 mk0, mk1, mq0, mq1;
+                            mk0.thread_elements()[0] = k0.x; mk0.thread_elements()[1] = k0.y;
+                            mk1.thread_elements()[0] = k1.x; mk1.thread_elements()[1] = k1.y;
+                            simdgroup_load(mq0, sq + 32 * i2 + 0, DK);
+                            simdgroup_load(mq1, sq + 32 * i2 + 8, DK);
+                            simdgroup_multiply_accumulate(mqk, mq0, mk0, mqk);
+                            simdgroup_multiply_accumulate(mqk, mq1, mk1, mqk);
+                        }
+                        {
+                            const half2 sc = half2(v0 ? myds_fa_e4m3fn_to_f16(uint(sc0p) >> 8u) : 0.0h,
+                                                   v1 ? myds_fa_e4m3fn_to_f16(uint(sc1p) >> 8u) : 0.0h);
+                            const half2 k0 = myds_fa_nvfp4_qk_f16x2((w0.z >> row_sh) & 0xfu, (w1.z >> row_sh) & 0xfu, sc);
+                            const half2 k1 = myds_fa_nvfp4_qk_f16x2((w0.w >> row_sh) & 0xfu, (w1.w >> row_sh) & 0xfu, sc);
+                            simdgroup_half8x8 mk0, mk1, mq0, mq1;
+                            mk0.thread_elements()[0] = k0.x; mk0.thread_elements()[1] = k0.y;
+                            mk1.thread_elements()[0] = k1.x; mk1.thread_elements()[1] = k1.y;
+                            simdgroup_load(mq0, sq + 32 * i2 + 16, DK);
+                            simdgroup_load(mq1, sq + 32 * i2 + 24, DK);
+                            simdgroup_multiply_accumulate(mqk, mq0, mk0, mqk);
+                            simdgroup_multiply_accumulate(mqk, mq1, mk1, mqk);
+                        }
+                    }
+                    simdgroup_store(mqk, ps, SH, 0, false);
+                    ps += 8 * NSG;
+                }
+            } else {
+                // BF16 (1024 B/row): Option B1 32x32 coalesced QK^T stage reusing ss (2,048 B, 0 extra smem)
+                const ushort tiitg = sgitg * 32u + tiisg;
+                const uint k_local = tiitg >> 2;
+                const uint sub4 = tiitg & 3u;
+                threadgroup half * sk = (threadgroup half *)ss;
+                threadgroup half4 * dst_sk = (threadgroup half4 *)(sk + k_local * 32u + sub4 * 8u);
+                simdgroup_float8x8 mqk0 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+                simdgroup_float8x8 mqk1 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+                FOR_UNROLL (short cc = 0; cc < 2; ++cc) {
+                    const int kid = row_ids[comp_base + (uint)cc * 32u + k_local];
+                    const bool kvis = (kid >= 0) && ((uint)kid < dargs.n_comp);
+                    device const ushort * krow = (device const ushort *)(comp_kv + (uint64_t)(kvis ? kid : 0) * 1024u);
+                    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+                    for (short dblk = 0; dblk < 16; ++dblk) {
+                        const uint d0 = (uint)dblk * 32u;
+                        if (kvis) {
+                            device const ushort * s = krow + d0 + sub4 * 8u;
+                            dst_sk[0] = half4(as_type<float4>(uint4(s[0], s[1], s[2], s[3]) << 16u));
+                            dst_sk[1] = half4(as_type<float4>(uint4(s[4], s[5], s[6], s[7]) << 16u));
+                        } else {
+                            dst_sk[0] = half4(0.0h);
+                            dst_sk[1] = half4(0.0h);
+                        }
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+                        threadgroup const half * pk_s = sk + sgitg * (8 * 32);
+                        FOR_UNROLL (short kstep = 0; kstep < 4; ++kstep) {
+                            simdgroup_half8x8 mk, mq;
+                            simdgroup_load(mk, pk_s + kstep * 8, 32, 0, true);
+                            simdgroup_load(mq, sq + d0 + kstep * 8, DK);
+                            simdgroup_multiply_accumulate(acc, mq, mk, acc);
+                        }
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+                    }
+                    if (cc == 0) mqk0 = acc; else mqk1 = acc;
+                }
+                simdgroup_store(mqk0, ss + sgitg * 8, SH, 0, false);
+                simdgroup_store(mqk1, ss + sgitg * 8 + 32, SH, 0, false);
+            }
+
+            DC_SOFTMAX_AND_SCALE();
+
+            // P x V: Option A 1-key direct-to-register (16*sgitg + 64*jj layout)
+            for (short cc = 0; cc < 8; ++cc) {
+                simdgroup_float8x8 vs;
+                simdgroup_load(vs, ss + 8 * cc, SH, 0, false);
+                const int idv = row_ids[comp_base + (uint)cc * 8u + (uint)lo_row];
+                const bool vis = (idv >= 0) && ((uint)idv < dargs.n_comp);
+                if (STORAGE == 2u) {
+                    device const uchar * row288 = (device const uchar *)(comp_kv + (uint64_t)(vis ? idv : 0) * 288u);
+                    DC_PV_NVFP4_PAIR(0, lo0,  lo1);  DC_PV_NVFP4_PAIR(1, lo2,  lo3);
+                    DC_PV_NVFP4_PAIR(2, lo4,  lo5);  DC_PV_NVFP4_PAIR(3, lo6,  lo7);
+                    DC_PV_NVFP4_PAIR(4, lo8,  lo9);  DC_PV_NVFP4_PAIR(5, lo10, lo11);
+                    DC_PV_NVFP4_PAIR(6, lo12, lo13); DC_PV_NVFP4_PAIR(7, lo14, lo15);
+                } else {
+                    device const ushort * row_bf16 = (device const ushort *)(comp_kv + (uint64_t)(vis ? idv : 0) * 1024u);
+                    DC_PV_BF16_PAIR(0, lo0,  lo1);  DC_PV_BF16_PAIR(1, lo2,  lo3);
+                    DC_PV_BF16_PAIR(2, lo4,  lo5);  DC_PV_BF16_PAIR(3, lo6,  lo7);
+                    DC_PV_BF16_PAIR(4, lo8,  lo9);  DC_PV_BF16_PAIR(5, lo10, lo11);
+                    DC_PV_BF16_PAIR(6, lo12, lo13); DC_PV_BF16_PAIR(7, lo14, lo15);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (FC_flash_attn_ext_has_sinks) {
+        {
+            const short j0 = sgitg;
+            const float m = M0;
+            const float s = (tiisg == 0 && iq1 + j0 < args.ne01)
+                ? ((device const float *) sinks)[iq1 + j0] : -FLT_MAX / 2;
+            M0 = simd_max(max(M0, s));
+            const float ms = exp(m - M0);
+            const float vs = exp(s - M0);
+            S0 = S0 * ms + simd_sum(vs);
+            if (tiisg == 0) s_ms[j0] = ms;
+        }
+        {
+            const short j1 = NSG + sgitg;
+            const float m = M1;
+            const float s = (tiisg == 0 && iq1 + j1 < args.ne01)
+                ? ((device const float *) sinks)[iq1 + j1] : -FLT_MAX / 2;
+            M1 = simd_max(max(M1, s));
+            const float ms = exp(m - M1);
+            const float vs = exp(s - M1);
+            S1 = S1 * ms + simd_sum(vs);
+            if (tiisg == 0) s_ms[j1] = ms;
+        }
+    }
+
+    threadgroup float * s_scale = ss;
+    if (tiisg == 0) {
+        s_scale[sgitg]       = S0 == 0.0f ? 0.0f : 1.0f / S0;
+        s_scale[NSG + sgitg] = S1 == 0.0f ? 0.0f : 1.0f / S1;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (FC_flash_attn_ext_has_sinks) {
+        #pragma clang fp contract(off)
+        const float ms_sink = s_ms[lo_row];
+        DC_SCALE_ALL(ms_sink);
+    }
+
+    if (iq1 + lo_row < args.ne01) {
+        #pragma clang fp contract(off)
+        const float scale = s_scale[lo_row];
+        const uint64_t rid = (uint64_t)iq2 * args.ne1 + iq1 + lo_row;
+        device float2 * dst2 = (device float2 *) ((device float *) dst + rid * DV);
+        DC_STORE_PAIR(0, lo0,  lo1);  DC_STORE_PAIR(1, lo2,  lo3);
+        DC_STORE_PAIR(2, lo4,  lo5);  DC_STORE_PAIR(3, lo6,  lo7);
+        DC_STORE_PAIR(4, lo8,  lo9);  DC_STORE_PAIR(5, lo10, lo11);
+        DC_STORE_PAIR(6, lo12, lo13); DC_STORE_PAIR(7, lo14, lo15);
+    }
+
+#undef DC_NS10
+#undef DC_NS20
+#undef DC_SCALE1
+#undef DC_SCALE_ALL
+#undef DC_SOFTMAX_AND_SCALE
+#undef DC_PV_SLAB_PAIR
+#undef DC_PV_NVFP4_PAIR
+#undef DC_PV_BF16_PAIR
+#undef DC_STORE_PAIR
+}
+
+template<uint STORAGE>
+kernel void kernel_myds_flash_attn_heads_maskless_slab_direct_comp(
+        constant ds4_metal_args_flash_attn_direct_comp & args,
+        device const char * q,
+        device const char * comp_kv,
+        device const int  * ids,
+        device const char * sinks,
+        device const char * slab,
+        device       char * dst,
+        threadgroup  half * shmem_f16 [[threadgroup(0)]],
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort  tiisg [[thread_index_in_simdgroup]],
+        ushort  sgitg [[simdgroup_index_in_threadgroup]]) {
+    if (FC_flash_attn_ext_nsg == 4) {
+        kernel_myds_flash_attn_heads_maskless_slab_direct_comp_impl<STORAGE>(
+            args, q, comp_kv, ids, sinks, slab, dst, shmem_f16, tgpig, tiisg, sgitg);
+    }
+}
+
+typedef decltype(kernel_myds_flash_attn_heads_maskless_slab_direct_comp<2u>) flash_attn_heads_direct_comp_t;
+template [[host_name("kernel_myds_flash_attn_heads_maskless_slab_direct_bf16_dk512_dv512")]]
+kernel flash_attn_heads_direct_comp_t kernel_myds_flash_attn_heads_maskless_slab_direct_comp<1u>;
+template [[host_name("kernel_myds_flash_attn_heads_maskless_slab_direct_nvfp4_dk512_dv512")]]
+kernel flash_attn_heads_direct_comp_t kernel_myds_flash_attn_heads_maskless_slab_direct_comp<2u>;
+
 constant bool FC_flash_attn_ext_vec_has_mask  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 0)]];
 constant bool FC_flash_attn_ext_vec_has_sinks [[function_constant(FC_FLASH_ATTN_EXT_VEC + 1)]];
 constant bool FC_flash_attn_ext_vec_has_bias  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 2)]];

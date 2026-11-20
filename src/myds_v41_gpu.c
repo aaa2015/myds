@@ -123,6 +123,32 @@ void myds_v41_gpu_prefill_attn_l01_mma_counters(
         .encoded = v[PAL01_ENCODED]
     };
 }
+enum { PADC_REQUESTS, PADC_BF16_ENCODED, PADC_NVFP4_ENCODED, PADC_FALLBACKS, PADC_COUNT };
+static _Atomic uint64_t prefill_attn_direct_comp_counters[PADC_COUNT];
+static inline void prefill_attn_direct_comp_count(unsigned k) {
+    atomic_fetch_add_explicit(&prefill_attn_direct_comp_counters[k], 1u, memory_order_relaxed);
+}
+int myds_v41_gpu_prefill_attn_direct_comp_enabled(void) {
+    const char *v = getenv("MYDS_PREFILL_ATTN_DIRECT_COMP");
+    if (!v || !strcmp(v, "0")) return 0;
+    if (!strcmp(v, "1")) return 1;
+    MYDS_LOG_E("MYDS_PREFILL_ATTN_DIRECT_COMP must be absent, 0, or 1");
+    return -1;
+}
+void myds_v41_gpu_prefill_attn_direct_comp_counters(
+    myds_v41_gpu_prefill_attn_direct_comp_counters_t *out, bool reset) {
+    uint64_t v[PADC_COUNT];
+    for (unsigned k = 0; k < PADC_COUNT; ++k)
+        v[k] = reset ? atomic_exchange_explicit(&prefill_attn_direct_comp_counters[k], 0u, memory_order_relaxed)
+                     : atomic_load_explicit(&prefill_attn_direct_comp_counters[k], memory_order_relaxed);
+    if (!out) return;
+    *out = (myds_v41_gpu_prefill_attn_direct_comp_counters_t){
+        .requests      = v[PADC_REQUESTS],
+        .bf16_encoded  = v[PADC_BF16_ENCODED],
+        .nvfp4_encoded = v[PADC_NVFP4_ENCODED],
+        .fallbacks     = v[PADC_FALLBACKS]
+    };
+}
 static uint32_t attn_matrix_test_failure;
 void myds_v41_gpu_inject_attention_matrix_failure(uint32_t kind) {
     attn_matrix_test_failure=kind;
@@ -466,6 +492,7 @@ myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp) {
         myds_v41_gpu_indexer_prefill_compact_enabled()<0 ||
         myds_v41_gpu_topk_radix_causal_enabled()<0 ||
         myds_v41_gpu_prefill_attn_l01_mma_enabled()<0 ||
+        myds_v41_gpu_prefill_attn_direct_comp_enabled()<0 ||
         myds_v41_gpu_attention_packed_register_enabled()<0 || myds_v41_attention_rope_fuse_enabled()<0 ||
         myds_v41_gpu_attention_decode_mma_enabled()<0 ||
         myds_v41_gpu_attention_direct_pack_fuse_enabled()<0) return NULL;
@@ -3684,6 +3711,16 @@ struct flash_vec_args {
 _Static_assert(sizeof(struct flash_vec_args) == 200,
                "flash_vec_args 尺寸变了 —— 内核侧 struct ds4_metal_args_flash_attn_ext_vec 必须同步");
 _Static_assert(sizeof(struct flash_vec_args) - 8 == 192, "nb_kvq 必须在尾部偏移 192");
+struct flash_direct_comp_args {
+    int32_t ne01,ne02,ne03;uint64_t nb01,nb02,nb03;int32_t ne11,ne_12_2,ne_12_3,ns10;
+    uint64_t nb11,nb12,nb13;int32_t ns20;uint64_t nb21,nb22,nb23;
+    int32_t ne31,ne32,ne33;uint64_t nb31,nb32,nb33;int32_t ne1,ne2,ne3;
+    float scale,max_bias,m0,m1;int32_t n_head_log2;float logit_softcap;uint32_t _pad_ext;
+    uint32_t n_comp, top_k;
+};
+_Static_assert(sizeof(struct flash_direct_comp_args) == 200u, "flash_direct_comp_args Metal ABI");
+_Static_assert(offsetof(struct flash_direct_comp_args, n_comp) == 192u, "n_comp offset ABI");
+_Static_assert(offsetof(struct flash_direct_comp_args, top_k) == 196u, "top_k offset ABI");
 struct attention_rope_fuse_args {
     struct flash_vec_args attention;
     uint32_t pos, inverse;
@@ -3776,6 +3813,8 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
     myds_v41_gpu_attn_kv_reuse_reset(s);
     const int l01_mma_env = myds_v41_gpu_prefill_attn_l01_mma_enabled();
     if(l01_mma_env < 0) return 0;
+    const int direct_comp_env = myds_v41_gpu_prefill_attn_direct_comp_enabled();
+    if(direct_comp_env < 0) return 0;
     if(!s||!heads||!q||!chunk_kv||c_len==0||c_len>MYDS_CHUNK_MAXC||top_k>512u||
        n_comp>s->key_comp_max||
        !floats(heads,(uint64_t)c_len*64u*512)||!floats(q,(uint64_t)c_len*64u*512)||
@@ -3891,13 +3930,29 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
         ((p0 + 1u) / ratio >= 512u) && (top_k == 512u) && (n_comp >= 512u) &&
         (s->keys_clamp == 0u);
 #ifdef MYDS_ATTENTION_MULTIHEAD_CAPTURE
+    const int use_direct_comp = 0;
     const int use_fast_matrix = 0;
 #else
-    const int use_fast_matrix = fast_enabled && use_matrix && all_visible &&
+    const int use_direct_comp = (direct_comp_env == 1) && use_matrix && all_visible &&
+        (c_len >= 32u) && hm_q8 && (attn_matrix_test_failure == 0u) &&
+        (comp_cache_mode == MYDS_KV_COMP_CACHE_BF16 ||
+         comp_cache_mode == MYDS_KV_COMP_CACHE_NVFP4);
+    const int use_fast_matrix = !use_direct_comp && fast_enabled && use_matrix && all_visible &&
         hm_q8 && attn_matrix_test_failure == 0u;
 #endif
+    if (direct_comp_env == 1 && use_gather) {
+        prefill_attn_direct_comp_count(PADC_REQUESTS);
+        if (!use_direct_comp) prefill_attn_direct_comp_count(PADC_FALLBACKS);
+    }
 
     if (use_gather) {
+        if (use_direct_comp) {
+            /* [CAND-A2] Direct-indirect compressed KV inside maskless-slab Reg-O:
+             * completely skip gather_comp_512 (0 bytes written to kv_gathered,
+             * 0 gather dispatch, 0 gather barrier). Invalidate gathered_cache so
+             * any subsequent fallback chunk refreshes cleanly. */
+            gathered_cache_invalidate(s);
+        } else {
         struct myds_attn_gather_args ga={
             c_len,top_k,n_comp,MYDS_CHUNK_CARRY-carry,s->mask_u16,c_start,base_pos,ratio};
         const uint64_t comp_gen = atomic_load_explicit(&comp_kv_write_gen, memory_order_relaxed);
@@ -3982,12 +4037,13 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
                 atomic_fetch_add_explicit(&prefill_attn_fast_cnt[PAF_GATHER_COMP_HITS], 1u, memory_order_relaxed);
             }
         }
+        } /* !use_direct_comp */
     }
 
     /* 2026-10-24 诊断（MYDS_PROFILE_ATTN_SUB=1）：把 gather 与 flash-attn 分开计时。
      * gather 写完 gathered 本就要被 flash 读，此处 commit 不改变数值；
      * 但会引入一次 CB 边界，属插桩失真 ⇒ 只能看【相对比例】。 */
-    if (opt_prof_attn_sub && use_gather) {
+    if (opt_prof_attn_sub && use_gather && !use_direct_comp) {
         if (!myds_metal_commit_batch()) return 0;
         myds_v41_gpu_attn_sub_add(0, myds_metal_host_time() - t_sub0);
         if (!myds_metal_begin_batch()) return 0;
@@ -4023,7 +4079,54 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
         ma.ne01=64;ma.ne02=(int32_t)c_len;ma.nb01=2048u;ma.nb02=64u*2048u;
         ma.ne_12_2=(int32_t)c_len;ma.ne31=64;ma.ne32=(int32_t)c_len;
         ma.nb31=0;ma.nb32=(uint64_t)s->mask_u16*2u;
-        if (use_fast_matrix || use_l01_mma) {
+        if (use_direct_comp) {
+            /* [CAND-A2] Direct-Indirect Compressed KV inside q8 Maskless-Slab Reg-O:
+             * ic0=0,1 read sliding-window s->kv_chunk; ic0=2..9 read comp_kv directly via ids
+             * with 0 bytes written to kv_gathered and 0 gather_comp_512 dispatch. */
+            if (!myds_metal_get_auto_barrier()) {
+                const myds_metal_buffer_t *pre_deps[] = { s->kv_chunk, comp_kv, ids, q };
+                myds_metal_barrier_buffers(pre_deps, 4u);
+            }
+            struct flash_direct_comp_args da;
+            memcpy(&da, &ma, 192u);
+            da.n_comp = n_comp;
+            da.top_k = top_k;
+            const myds_metal_buffer_t *mb[] = { q, comp_kv, ids, sinks, s->kv_chunk, heads };
+            const myds_metal_constant_t mc[] = {
+                {300,true,0},{301,true,1},{302,true,0},{303,true,0},
+                {304,true,0},{310,true,0},{320,false,512},{321,false,512},{322,false,4}
+            };
+            const bool is_nvfp4 = (comp_cache_mode == MYDS_KV_COMP_CACHE_NVFP4);
+            const char *kernel = is_nvfp4
+                ? "kernel_myds_flash_attn_heads_maskless_slab_direct_nvfp4_dk512_dv512"
+                : "kernel_myds_flash_attn_heads_maskless_slab_direct_bf16_dk512_dv512";
+            const size_t smem = 10272u;
+            matrix_encoded = specialized(kernel, &da, sizeof(da), mb, 6, 8, c_len, 1, 32, 4, 1, smem, mc, 9);
+            if (matrix_encoded) {
+                matrix_kernel_used = kernel;
+                matrix_smem_used = smem;
+                attn_count(AC_MATRIX);
+                prefill_attn_direct_comp_count(is_nvfp4 ? PADC_NVFP4_ENCODED : PADC_BF16_ENCODED);
+            } else {
+                /* Populate standard 640-stride gathered + mask before falling back to vec. */
+                prefill_attn_direct_comp_count(PADC_FALLBACKS);
+                gathered_cache_invalidate(s);
+                s->tmpl_len = 0; s->tmpl_carry = 0;
+                struct myds_attn_gather_args ga = {
+                    c_len, top_k, n_comp, MYDS_CHUNK_CARRY - carry, s->mask_u16, c_start, base_pos, ratio
+                };
+                const myds_metal_buffer_t *g1[] = { gathered, s->mask_chunk, s->kv_chunk };
+                const myds_metal_buffer_t *g2[] = { gathered, s->mask_chunk, comp_kv, ids };
+                if (!dispatch("kernel_myds_attn_gather_window", &ga, sizeof(ga), g1, 3,
+                              128u, c_len, 1, 128, 1, 1, 0)) return 0;
+                if (!dispatch(gather_comp_kernel_name(comp_cache_mode, false), &ga, sizeof(ga), g2, 4,
+                              512u, c_len, 1, 128, 1, 1, 0)) return 0;
+                if (!myds_metal_get_auto_barrier()) {
+                    const myds_metal_buffer_t *fb_deps[] = { gathered, s->mask_chunk };
+                    myds_metal_barrier_buffers(fb_deps, 2u);
+                }
+            }
+        } else if (use_fast_matrix || use_l01_mma) {
             /* [P-NEW-3] / [CAND-A3] Maskless + Direct Window Slab Reg-O:
              * reads ic0=0,1 directly from s->kv_chunk (passed in pad slot). For L0/L1
              * window-only (use_l01_mma), ne11=128 terminates after those 2 C=64 tiles;
