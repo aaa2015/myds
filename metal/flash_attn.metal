@@ -3382,3 +3382,462 @@ kernel void kernel_myds_attention_flash_dec_reduce_f16_512(
     }
 }
 
+/* ==========================================================================
+ * [D-A1] Single-Pass MQA-64 MMA Decode Attention with Fused RoPE
+ *
+ * Tiles 64 query heads x 1 shared KV head as Q=8 heads x C=64 keys, NSG=4
+ * (128 threads/TG, 10,272 B dynamic smem -> 3 TGs/core on 32 KiB TG memory).
+ * Grid = (8 head_tiles, D_SPLIT, 1) = 16 / 32 / 64 TGs.
+ * Each TG owns DV_SLICE = 512 / D_SPLIT output columns (NO_COL = 8 / 4 / 2
+ * simdgroup_float8x8 accumulators per simdgroup -> tiny register footprint,
+ * zero VGPR spill, zero 2nd pass, zero partial buffer, zero pad kernel).
+ * ========================================================================== */
+
+template<short D_SPLIT, bool FP16_P, bool FUSE_ROPE>
+static inline void myds_attention_decode_mma_rope_fuse_impl(
+        constant myds_attention_rope_fuse_args & fused,
+        device const char * q,
+        device const char * k,
+        device const char * v,
+        device const char * mask,
+        device const char * sinks,
+        device       char * dst,
+        threadgroup  half * shmem_f16,
+        uint3   tgpig,
+        ushort  tiisg,
+        ushort  sgitg) {
+    constant ds4_metal_args_flash_attn_ext_vec & args = fused.attention;
+    if (fused.pos >= 1048576u ||
+        args.ne01 != 1 || args.ne02 != 64 || args.ne03 != 1 ||
+        args.ne_12_2 != 1 || args.ne_12_3 != 1 ||
+        args.ne31 != 1 || args.ne32 != 1 || args.ne33 != 1 ||
+        args.ne11 <= 0 || args.ne11 > 1024 ||
+        tgpig.x >= 8u || tgpig.y >= (uint)D_SPLIT ||
+        args.nb02 != 2048 || args.nb11 != 1024 || args.nb21 != 1024) {
+        return;
+    }
+
+    constexpr short NW        = 32;
+    constexpr short DK        = 512;
+    constexpr short DV        = 512;
+    constexpr short DK4       = DK / 4;                  // 128
+    constexpr short DK8       = DK / 8;                  // 64
+    constexpr short Q         = 8;
+    constexpr short C         = 64;
+    constexpr short NSG       = 4;
+    constexpr short NQ        = Q / NSG;                 // 2
+    constexpr short SH        = C;                       // 64 floats/row = 256 B
+    constexpr short SP_STRIDE = 2 * SH;                  // 128 halfs/row = 256 B
+    constexpr short DV_SLICE  = DV / D_SPLIT;            // 256 / 128 / 64
+    constexpr short NO_COL    = DV_SLICE / (8 * NSG);    // 8 / 4 / 2
+    constexpr float NEG_LARGE = -FLT_MAX / 2.0f;
+
+    const short head_base = (short)(tgpig.x * (uint)Q);
+    const short dv_base   = (short)(tgpig.y * (uint)DV_SLICE);
+
+    // 10,272 B total dynamic smem (16-byte aligned):
+    //   sq:   8 * 512 * 2 B = 8,192 B
+    //   ss:   8 *  64 * 4 B = 2,048 B  (sp overlays first 128 B of each 256 B row)
+    //   s_ms: 8 *       4 B =    32 B
+    threadgroup half   * sq   = shmem_f16;
+    threadgroup half4  * sq4  = (threadgroup half4 *) shmem_f16;
+    threadgroup float  * ss   = (threadgroup float *) (shmem_f16 + Q * DK);
+    threadgroup float2 * ss2  = (threadgroup float2 *) ss;
+    threadgroup half   * sp   = (threadgroup half *) ss;
+    threadgroup float  * s_ms = ss + Q * SH;
+
+    const short lo_row = ((tiisg >> 2) & 4) | ((tiisg >> 1) & 3);
+    const short lo_col = ((tiisg >> 1) & 4) | ((tiisg & 1) << 1);
+
+    // Load 8 query heads [head_base .. head_base + 7] from F32 -> F16 into sq.
+    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+        const short j = jj * NSG + sgitg;
+        device const float4 * q4 =
+            (device const float4 *)(q + (uint64_t)(head_base + j) * args.nb02);
+        for (short i = (short)tiisg; i < DK4; i += NW) {
+            sq4[j * DK4 + i] = (half4)q4[i];
+        }
+    }
+
+    simdgroup_float8x8 lo[NO_COL];
+    FOR_UNROLL (short ii = 0; ii < NO_COL; ++ii) {
+        lo[ii] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float S[NQ] = { 0.0f, 0.0f };
+    float M[NQ] = { NEG_LARGE, NEG_LARGE };
+
+    device const half * pm = (device const half *)mask;
+    const short c0 = (short)(2 * tiisg);
+    const short c1 = c0 + 1;
+    const int full_end = args.ne11 & ~((int)C - 1);
+
+    // ---- Hot Loop: Full 64-key tiles (zero tail branches, zero register bloat) ----
+    for (int ic = 0; ic < full_end; ic += C) {
+        const half m0 = pm[ic + c0];
+        const half m1 = pm[ic + c1];
+        if (simd_max(max(m0, m1)) <= -MAXHALF) {
+            continue;
+        }
+
+        // Step 1: Q[8, 512] * K[64, 512]^T -> ss[8, 64]
+        // Contiguous 16-row K pairs per SG (sgitg*16, sgitg*16+8) share sq loads
+        // across both 8-key blocks with zero compiler-blocking simdgroup_barriers.
+        const short k0_off = (short)(sgitg * 16);
+        const short k1_off = k0_off + 8;
+        device const half * pk0 = (device const half *)(k + (uint64_t)(ic + k0_off) * args.nb11);
+        device const half * pk1 = pk0 + (8 * DK);
+
+        simdgroup_float8x8 mqk0 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 mqk1 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+        #pragma unroll 16
+        for (short i = 0; i < DK8 / 2; ++i) {
+            simdgroup_half8x8 mq0, mq1, mka0, mka1, mkb0, mkb1;
+            simdgroup_load(mq0,  sq  + 16 * i + 0, DK);
+            simdgroup_load(mq1,  sq  + 16 * i + 8, DK);
+            simdgroup_load(mka0, pk0 + 16 * i + 0, DK, 0, true);
+            simdgroup_load(mkb0, pk1 + 16 * i + 0, DK, 0, true);
+            simdgroup_load(mka1, pk0 + 16 * i + 8, DK, 0, true);
+            simdgroup_load(mkb1, pk1 + 16 * i + 8, DK, 0, true);
+            simdgroup_multiply_accumulate(mqk0, mq0, mka0, mqk0);
+            simdgroup_multiply_accumulate(mqk1, mq0, mkb0, mqk1);
+            simdgroup_multiply_accumulate(mqk0, mq1, mka1, mqk0);
+            simdgroup_multiply_accumulate(mqk1, mq1, mkb1, mqk1);
+        }
+
+        simdgroup_store(mqk0, ss + k0_off, SH, 0, false);
+        simdgroup_store(mqk1, ss + k1_off, SH, 0, false);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Step 2: Online Softmax (2 rows/SG, -ffast-math safe finite guards)
+        const bool v0 = (m0 > -MAXHALF);
+        const bool v1 = (m1 > -MAXHALF);
+
+        FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+            const short j = jj * NSG + sgitg;
+            const float old_m = M[jj];
+
+            float2 s2 = ss2[j * (SH / 2) + tiisg];
+            s2.x = v0 ? fma(s2.x, args.scale, float(m0)) : NEG_LARGE;
+            s2.y = v1 ? fma(s2.y, args.scale, float(m1)) : NEG_LARGE;
+
+            const float new_m = simd_max(max(old_m, max(s2.x, s2.y)));
+            const float ms = (old_m > -1e37f) ? exp(old_m - new_m) : 0.0f;
+            float2 vs2;
+            vs2.x = v0 ? exp(s2.x - new_m) : 0.0f;
+            vs2.y = v1 ? exp(s2.y - new_m) : 0.0f;
+
+            M[jj] = new_m;
+            S[jj] = S[jj] * ms + simd_sum(vs2.x + vs2.y);
+
+            if (FP16_P) {
+                ((threadgroup half2 *)(ss + j * SH))[tiisg] = (half2)vs2;
+            } else {
+                ss2[j * (SH / 2) + tiisg] = vs2;
+            }
+
+            if (tiisg == 0) {
+                s_ms[j] = ms;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Step 3: Rescale running O accumulator
+        if (ic > 0) {
+            #pragma clang fp contract(off)
+            const float ms_r = s_ms[lo_row];
+            FOR_UNROLL (short ii = 0; ii < NO_COL; ++ii) {
+                lo[ii].thread_elements()[0] *= ms_r;
+                lo[ii].thread_elements()[1] *= ms_r;
+            }
+        }
+
+        // Step 4: P[8, 64] * V[64, DV_SLICE] -> lo[NO_COL]
+        device const half * pv =
+            (device const half *)(v + (uint64_t)ic * args.nb21) + dv_base + 8 * sgitg;
+
+        constexpr short NC_PV = (C / 8) / 2;
+        FOR_UNROLL (short cc = 0; cc < NC_PV; ++cc) {
+            if (FP16_P) {
+                simdgroup_half8x8 vp0, vp1;
+                simdgroup_load(vp0, sp + 16 * cc + 0, SP_STRIDE, 0, false);
+                simdgroup_load(vp1, sp + 16 * cc + 8, SP_STRIDE, 0, false);
+
+                FOR_UNROLL (short ii = 0; ii < NO_COL / 2; ++ii) {
+                    simdgroup_half8x8 mv0, mv1, mv2, mv3;
+                    simdgroup_load(mv0, pv + 0 * 8 * NSG + 16 * ii * NSG + 0 * 8 * DV, DV, 0, false);
+                    simdgroup_load(mv1, pv + 1 * 8 * NSG + 16 * ii * NSG + 0 * 8 * DV, DV, 0, false);
+                    simdgroup_load(mv2, pv + 0 * 8 * NSG + 16 * ii * NSG + 1 * 8 * DV, DV, 0, false);
+                    simdgroup_load(mv3, pv + 1 * 8 * NSG + 16 * ii * NSG + 1 * 8 * DV, DV, 0, false);
+
+                    simdgroup_multiply_accumulate(lo[2 * ii + 0], vp0, mv0, lo[2 * ii + 0]);
+                    simdgroup_multiply_accumulate(lo[2 * ii + 1], vp0, mv1, lo[2 * ii + 1]);
+                    simdgroup_multiply_accumulate(lo[2 * ii + 0], vp1, mv2, lo[2 * ii + 0]);
+                    simdgroup_multiply_accumulate(lo[2 * ii + 1], vp1, mv3, lo[2 * ii + 1]);
+                }
+            } else {
+                simdgroup_float8x8 vp0, vp1;
+                simdgroup_load(vp0, ss + 16 * cc + 0, SH, 0, false);
+                simdgroup_load(vp1, ss + 16 * cc + 8, SH, 0, false);
+
+                FOR_UNROLL (short ii = 0; ii < NO_COL / 2; ++ii) {
+                    simdgroup_half8x8 mv0, mv1, mv2, mv3;
+                    simdgroup_load(mv0, pv + 0 * 8 * NSG + 16 * ii * NSG + 0 * 8 * DV, DV, 0, false);
+                    simdgroup_load(mv1, pv + 1 * 8 * NSG + 16 * ii * NSG + 0 * 8 * DV, DV, 0, false);
+                    simdgroup_load(mv2, pv + 0 * 8 * NSG + 16 * ii * NSG + 1 * 8 * DV, DV, 0, false);
+                    simdgroup_load(mv3, pv + 1 * 8 * NSG + 16 * ii * NSG + 1 * 8 * DV, DV, 0, false);
+
+                    simdgroup_multiply_accumulate(lo[2 * ii + 0], vp0, mv0, lo[2 * ii + 0]);
+                    simdgroup_multiply_accumulate(lo[2 * ii + 1], vp0, mv1, lo[2 * ii + 1]);
+                    simdgroup_multiply_accumulate(lo[2 * ii + 0], vp1, mv2, lo[2 * ii + 0]);
+                    simdgroup_multiply_accumulate(lo[2 * ii + 1], vp1, mv3, lo[2 * ii + 1]);
+                }
+            }
+            pv += 2 * 8 * DV;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ---- Optional Single Tail Tile (1 <= rem <= 63, zero OOB reads) ----
+    if (full_end < args.ne11) {
+        const int ic = full_end;
+        const short rem = (short)(args.ne11 - ic);
+
+        const half m0 = (c0 < rem) ? pm[ic + c0] : -MAXHALF;
+        const half m1 = (c1 < rem) ? pm[ic + c1] : -MAXHALF;
+        if (simd_max(max(m0, m1)) > -MAXHALF) {
+            // Interleaved 8-row MMA blocks keep all 4 SGs busy for rem >= 32.
+            const short tail_start = rem & ~7;
+            for (short cc = 0; cc < 2; ++cc) {
+                const short k_off = cc * 32 + sgitg * 8;
+                if (k_off + 8 <= rem) {
+                    device const half * pk =
+                        (device const half *)(k + (uint64_t)(ic + k_off) * args.nb11);
+                    simdgroup_float8x8 mqk = make_filled_simdgroup_matrix<float, 8>(0.0f);
+                    for (short i = 0; i < DK8 / 2; ++i) {
+                        simdgroup_half8x8 mk0, mk1, mq0, mq1;
+                        simdgroup_load(mk0, pk + 16 * i + 0, DK, 0, true);
+                        simdgroup_load(mk1, pk + 16 * i + 8, DK, 0, true);
+                        simdgroup_load(mq0, sq + 16 * i + 0, DK);
+                        simdgroup_load(mq1, sq + 16 * i + 8, DK);
+                        simdgroup_multiply_accumulate(mqk, mq0, mk0, mqk);
+                        simdgroup_multiply_accumulate(mqk, mq1, mk1, mqk);
+                    }
+                    simdgroup_store(mqk, ss + k_off, SH, 0, false);
+                }
+            }
+            // Remaining 1..7 partial rows: all 4 SGs share the 8 query heads (2 heads/SG,
+            // single streaming K load per row -> 4x parallel + 4x fewer K loads, low regs).
+            if (tail_start < rem) {
+                const short qh0 = (short)sgitg;
+                const short qh1 = qh0 + NSG;
+                for (short r = tail_start; r < rem; ++r) {
+                    device const half4 * pk4 =
+                        (device const half4 *)(k + (uint64_t)(ic + r) * args.nb11);
+                    float acc0 = 0.0f;
+                    float acc1 = 0.0f;
+                    for (short d = (short)tiisg; d < DK4; d += NW) {
+                        const float4 kv = (float4)pk4[d];
+                        acc0 += dot(kv, (float4)sq4[qh0 * DK4 + d]);
+                        acc1 += dot(kv, (float4)sq4[qh1 * DK4 + d]);
+                    }
+                    acc0 = simd_sum(acc0);
+                    acc1 = simd_sum(acc1);
+                    if (tiisg == 0) {
+                        ss[qh0 * SH + r] = acc0;
+                        ss[qh1 * SH + r] = acc1;
+                    }
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const bool v0 = (c0 < rem) && (m0 > -MAXHALF);
+            const bool v1 = (c1 < rem) && (m1 > -MAXHALF);
+
+            FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+                const short j = jj * NSG + sgitg;
+                const float old_m = M[jj];
+
+                float2 s2 = ss2[j * (SH / 2) + tiisg];
+                s2.x = v0 ? fma(s2.x, args.scale, float(m0)) : NEG_LARGE;
+                s2.y = v1 ? fma(s2.y, args.scale, float(m1)) : NEG_LARGE;
+
+                const float new_m = simd_max(max(old_m, max(s2.x, s2.y)));
+                const float ms = (old_m > -1e37f) ? exp(old_m - new_m) : 0.0f;
+                float2 vs2;
+                vs2.x = v0 ? exp(s2.x - new_m) : 0.0f;
+                vs2.y = v1 ? exp(s2.y - new_m) : 0.0f;
+
+                M[jj] = new_m;
+                S[jj] = S[jj] * ms + simd_sum(vs2.x + vs2.y);
+
+                if (FP16_P) {
+                    ((threadgroup half2 *)(ss + j * SH))[tiisg] = (half2)vs2;
+                } else {
+                    ss2[j * (SH / 2) + tiisg] = vs2;
+                }
+
+                if (tiisg == 0) {
+                    s_ms[j] = ms;
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (ic > 0) {
+                #pragma clang fp contract(off)
+                const float ms_r = s_ms[lo_row];
+                FOR_UNROLL (short ii = 0; ii < NO_COL; ++ii) {
+                    lo[ii].thread_elements()[0] *= ms_r;
+                    lo[ii].thread_elements()[1] *= ms_r;
+                }
+            }
+
+            device const half * pv =
+                (device const half *)(v + (uint64_t)ic * args.nb21) + dv_base + 8 * sgitg;
+            const short full8 = rem >> 3;
+            for (short c8 = 0; c8 < full8; ++c8) {
+                if (FP16_P) {
+                    simdgroup_half8x8 vp;
+                    simdgroup_load(vp, sp + 8 * c8, SP_STRIDE, 0, false);
+                    FOR_UNROLL (short ii = 0; ii < NO_COL; ++ii) {
+                        simdgroup_half8x8 mv;
+                        simdgroup_load(mv, pv + ii * 8 * NSG, DV, 0, false);
+                        simdgroup_multiply_accumulate(lo[ii], vp, mv, lo[ii]);
+                    }
+                } else {
+                    simdgroup_float8x8 vp;
+                    simdgroup_load(vp, ss + 8 * c8, SH, 0, false);
+                    FOR_UNROLL (short ii = 0; ii < NO_COL; ++ii) {
+                        simdgroup_half8x8 mv;
+                        simdgroup_load(mv, pv + ii * 8 * NSG, DV, 0, false);
+                        simdgroup_multiply_accumulate(lo[ii], vp, mv, lo[ii]);
+                    }
+                }
+                pv += 8 * DV;
+            }
+            for (short r = full8 * 8; r < rem; ++r) {
+                const float p_val = FP16_P ? float(sp[lo_row * SP_STRIDE + r]) : ss[lo_row * SH + r];
+                device const half * pv_row =
+                    (device const half *)(v + (uint64_t)(ic + r) * args.nb21);
+                FOR_UNROLL (short ii = 0; ii < NO_COL; ++ii) {
+                    const short col = dv_base + 8 * sgitg + ii * 8 * NSG + lo_col;
+                    const half2 v2 = *(device const half2 *)(pv_row + col);
+                    lo[ii].thread_elements()[0] = fma(p_val, float(v2.x), lo[ii].thread_elements()[0]);
+                    lo[ii].thread_elements()[1] = fma(p_val, float(v2.y), lo[ii].thread_elements()[1]);
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    // ---- Step 5: Attention Sinks + Final Normalization Scale ----
+    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+        const short j = jj * NSG + sgitg;
+        const float old_m = M[jj];
+        const float sink = ((device const float *)sinks)[head_base + j];
+        const bool old_valid = (old_m > -1e37f);
+        const bool sink_valid = (sink > -1e37f);
+        const float new_m = max(old_m, sink);
+        const float ms = old_valid ? exp(old_m - new_m) : 0.0f;
+        const float vs = sink_valid ? exp(sink - new_m) : 0.0f;
+        const float s_total = S[jj] * ms + vs;
+        const float scale = (s_total == 0.0f) ? 0.0f : (ms / s_total);
+        if (tiisg == 0) {
+            s_ms[j] = scale;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Step 6: Epilogue (Scale + BF16 Round + Fused RoPE on cols 448..511) ----
+    {
+        #pragma clang fp contract(off)
+        const short head = head_base + lo_row;
+        const float scale = s_ms[lo_row];
+        device float2 * dst2 =
+            (device float2 *)((device float *)dst + (uint64_t)head * (uint64_t)DV);
+        FOR_UNROLL (short ii = 0; ii < NO_COL; ++ii) {
+            const short col = dv_base + 8 * sgitg + ii * 8 * NSG + lo_col;
+            const short c2 = col >> 1;
+            float re = lo[ii].thread_elements()[0] * scale;
+            float im = lo[ii].thread_elements()[1] * scale;
+            if (FUSE_ROPE) {
+                re = myds_attention_rope_bf16(re);
+                im = myds_attention_rope_bf16(im);
+                if (c2 >= 224) {
+                    const uint pair = (uint)(c2 - 224);
+                    const float theta = float(fused.pos) * fused.frequencies[pair];
+                    const float c = precise::cos(theta);
+                    const float s = fused.inverse ? -precise::sin(theta) : precise::sin(theta);
+                    const float r_re = myds_attention_rope_bf16(re * c - im * s);
+                    const float r_im = myds_attention_rope_bf16(precise::fma(im, c, re * s));
+                    re = r_re;
+                    im = r_im;
+                }
+            }
+            dst2[c2] = float2(re, im);
+        }
+    }
+}
+
+template<short D_SPLIT, bool FP16_P>
+kernel void kernel_myds_attention_decode_mma_rope_fuse_tmpl(
+        constant myds_attention_rope_fuse_args & fused [[buffer(0)]],
+        device const char * q                         [[buffer(1)]],
+        device const char * k                         [[buffer(2)]],
+        device const char * v                         [[buffer(3)]],
+        device const char * mask                      [[buffer(4)]],
+        device const char * sinks                     [[buffer(5)]],
+        device       char * dst                       [[buffer(6)]],
+        threadgroup  half * shmem_f16                 [[threadgroup(0)]],
+        uint3   tgpig                                 [[threadgroup_position_in_grid]],
+        ushort  tiisg                                 [[thread_index_in_simdgroup]],
+        ushort  sgitg                                 [[simdgroup_index_in_threadgroup]]) {
+    myds_attention_decode_mma_rope_fuse_impl<D_SPLIT, FP16_P, true>(
+        fused, q, k, v, mask, sinks, dst, shmem_f16, tgpig, tiisg, sgitg);
+}
+
+typedef decltype(kernel_myds_attention_decode_mma_rope_fuse_tmpl<2, false>) attn_decode_mma_t;
+
+// FP32-P (simdgroup_float8x8 x half8x8 -> float8x8) instantiations:
+template [[host_name("kernel_myds_attention_decode_mma_rope_fuse_f16_512_d2")]]
+kernel attn_decode_mma_t kernel_myds_attention_decode_mma_rope_fuse_tmpl<2, false>;
+template [[host_name("kernel_myds_attention_decode_mma_rope_fuse_f16_512_d4")]]
+kernel attn_decode_mma_t kernel_myds_attention_decode_mma_rope_fuse_tmpl<4, false>;
+template [[host_name("kernel_myds_attention_decode_mma_rope_fuse_f16_512_d8")]]
+kernel attn_decode_mma_t kernel_myds_attention_decode_mma_rope_fuse_tmpl<8, false>;
+
+// FP16-P (simdgroup_half8x8 x half8x8 -> float8x8) instantiations:
+template [[host_name("kernel_myds_attention_decode_mma_rope_fuse_f16_512_d2_p16")]]
+kernel attn_decode_mma_t kernel_myds_attention_decode_mma_rope_fuse_tmpl<2, true>;
+template [[host_name("kernel_myds_attention_decode_mma_rope_fuse_f16_512_d4_p16")]]
+kernel attn_decode_mma_t kernel_myds_attention_decode_mma_rope_fuse_tmpl<4, true>;
+template [[host_name("kernel_myds_attention_decode_mma_rope_fuse_f16_512_d8_p16")]]
+kernel attn_decode_mma_t kernel_myds_attention_decode_mma_rope_fuse_tmpl<8, true>;
+
+// Canonical default entry point (D_SPLIT=4, FP32-P).
+kernel void kernel_myds_attention_decode_mma_rope_fuse_f16_512(
+        constant myds_attention_rope_fuse_args & fused [[buffer(0)]],
+        device const char * q                         [[buffer(1)]],
+        device const char * k                         [[buffer(2)]],
+        device const char * v                         [[buffer(3)]],
+        device const char * mask                      [[buffer(4)]],
+        device const char * sinks                     [[buffer(5)]],
+        device       char * dst                       [[buffer(6)]],
+        threadgroup  half * shmem_f16                 [[threadgroup(0)]],
+        uint3   tgpig                                 [[threadgroup_position_in_grid]],
+        ushort  tiisg                                 [[thread_index_in_simdgroup]],
+        ushort  sgitg                                 [[simdgroup_index_in_threadgroup]]) {
+    myds_attention_decode_mma_rope_fuse_impl<4, false, true>(
+        fused, q, k, v, mask, sinks, dst, shmem_f16, tgpig, tiisg, sgitg);
+}
+

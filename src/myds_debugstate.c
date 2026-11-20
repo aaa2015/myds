@@ -204,6 +204,9 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
     myds_v41_gpu_indexer_decode_mma_counters_t idm;
     memset(&idm, 0, sizeof(idm));
     myds_v41_gpu_indexer_decode_mma_counters(&idm, false);
+    myds_v41_gpu_attention_decode_mma_counters_t adm;
+    memset(&adm, 0, sizeof(adm));
+    myds_v41_gpu_attention_decode_mma_counters(&adm, false);
 
     /* Knob accounting, reusing the same inventory --print-config reports. */
     static myds_knob_seen_t seen[1024];
@@ -253,7 +256,8 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          "\"prefill_attn_fast\":{\"fast_matrix_encoded\":%llu,\"gather_comp_512_encoded\":%llu,"
          "\"gather_comp_hits\":%llu,\"gather_comp_misses\":%llu},"
          "\"indexer_decode_mma\":{\"score_one_encoded\":%llu,\"score_compact_encoded\":%llu},"
-         "\"prefix_cache_len\":%u},",
+         "\"attn_decode_mma\":{\"requests\":%llu,\"encoded\":%llu,"
+         "\"fallbacks\":%llu,\"d_split\":%u},\"prefix_cache_len\":%u},",
          (unsigned)idx_mode, idx_fmt, (unsigned)idx_row_bytes,
          (unsigned long long)ro.requests, (unsigned long long)ro.encoded,
          (unsigned long long)ro.fallbacks, (unsigned long long)ro.failures,
@@ -272,6 +276,8 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          (unsigned long long)paf.fast_matrix_encoded, (unsigned long long)paf.gather_comp_512_encoded,
          (unsigned long long)paf.gather_comp_hits, (unsigned long long)paf.gather_comp_misses,
          (unsigned long long)idm.score_one_encoded, (unsigned long long)idm.score_compact_encoded,
+         (unsigned long long)adm.requests, (unsigned long long)adm.encoded,
+         (unsigned long long)adm.fallbacks, (unsigned)adm.d_split,
          ctx ? myds_context_get_pcache_len(ctx) : 0u);
 
     const myds_steer_t *st = ctx ? myds_context_get_steer(ctx) : NULL;

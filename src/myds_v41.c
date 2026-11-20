@@ -3049,6 +3049,7 @@ void myds_v41_engram_project_round_counters(
 myds_v41_context_t *myds_v41_context_create(myds_context_t *ctx) {
     const int round_skip = engram_round_parse_mode();
     if (round_skip < 0 || myds_v41_gpu_indexer_key_fp4_enabled() < 0 ||
+        myds_v41_gpu_attention_decode_mma_enabled() < 0 ||
         myds_v41_moe_hc_overlap_parse_mode()<0 ||
         myds_v41_moe_decode_topk_parse_mode()<0 ||
         myds_v41_attn_hc_overlap_parse_mode()<0 ||

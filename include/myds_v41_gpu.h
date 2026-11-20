@@ -531,6 +531,17 @@ int myds_v41_attention_rope_fuse_enabled(void);
 void myds_v41_attention_rope_fuse_counters(myds_metal_decode_candidate_counters_t *out,bool reset);
 #define MYDS_V41_GPU_HAS_ATTN_FLASH_DEC 1
 int myds_v41_gpu_attention_flash_dec_enabled(void);
+/* [D-A1] Single-pass MQA-64 MMA decode attention with fused inverse RoPE.
+ * MYDS_ATTN_DECODE_MMA defaults to 0 (fail-closed): absent/"0" -> 0,
+ * "1" -> 1 (auto default D_SPLIT=4), "2" -> 2, "4" -> 4, "8" -> 8, else -1. */
+#define MYDS_V41_GPU_HAS_ATTN_DECODE_MMA 1
+int myds_v41_gpu_attention_decode_mma_enabled(void);
+typedef struct {
+    uint64_t requests, encoded, fallbacks;
+    uint32_t d_split;
+} myds_v41_gpu_attention_decode_mma_counters_t;
+void myds_v41_gpu_attention_decode_mma_counters(
+    myds_v41_gpu_attention_decode_mma_counters_t *out, bool reset);
 #define MYDS_V41_GPU_HAS_ATTN_KV_REUSE 1
 int myds_v41_attn_kv_reuse_parse_mode(void);
 int myds_v41_attn_kv_reuse_enabled(void);
