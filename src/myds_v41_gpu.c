@@ -4097,7 +4097,8 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
                         ? "kernel_myds_flash_attn_heads_maskless_slab_q32_f16_dk512_dv512"
                         : "kernel_myds_flash_attn_heads_maskless_slab_q16_f16_dk512_dv512")
                     : "kernel_myds_flash_attn_heads_maskless_slab_f16_dk512_dv512");
-            const size_t smem = use_q16_fast ? ((q16_mode == 32) ? 8320u : 4160u) : 10272u;
+            const size_t base_smem = use_q16_fast ? ((q16_mode == 32) ? 8320u : 4160u) : 10272u;
+            const size_t smem = base_smem + ((want_rope_fuse && use_q16_fast) ? 256u : 0u);
             if (want_rope_fuse) {
                 pthread_once(&rope_once, init_rope);
                 struct flash_prefill_rope_args ra;

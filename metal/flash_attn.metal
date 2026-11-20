@@ -1015,9 +1015,7 @@ void kernel_myds_flash_attn_heads_reg_o_impl(
         uint3   tgpig,
         ushort  tiisg,
         ushort  sgitg,
-        uint    rope_start_pos = 0u,
-        uint    rope_inverse = 0u,
-        constant float * rope_freqs = nullptr) {
+        constant myds_prefill_attn_rope_args * rope_args = nullptr) {
     const ushort iq3 = tgpig[2];
     const ushort iq2 = tgpig[1];
     const ushort iq1 = tgpig[0]*Q;
@@ -1052,19 +1050,31 @@ void kernel_myds_flash_attn_heads_reg_o_impl(
     constexpr int SQ_H = ZERO_SQ ? 0 : (Q * DK);
 
     // Shared memory layout (no `so`, no `sk/sv`; ZERO_SQ also omits `sq` and loads packed half Q from L1):
-    //   [0 .. SQ_H)                : sq      (8 KiB @ Q=8, 0 B @ ZERO_SQ)
-    //   [SQ_H .. SQ_H + Q*TS)      : ss+sm2  (or ss only @ MASKLESS: 2 KiB @ Q=8, 4 KiB @ Q=16, 8 KiB @ Q=32)
-    //   [SQ_H + Q*TS .. +2*Q)      : s_ms    (32 B @ Q=8, 64 B @ Q=16, 128 B @ Q=32)
+    //   [0 .. SQ_H)                : sq        (8 KiB @ Q=8, 0 B @ ZERO_SQ)
+    //   [SQ_H .. SQ_H + Q*TS)      : ss+sm2    (or ss only @ MASKLESS: 2 KiB @ Q=8, 4 KiB @ Q=16, 8 KiB @ Q=32)
+    //   [SQ_H + Q*TS .. +2*Q)      : s_ms      (32 B @ Q=8, 64 B @ Q=16, 128 B @ Q=32)
+    //   [s_ms + Q .. +64)          : s_rope_cs (256 B when FUSE_ROPE: 32 float2(cos,sin) computed in prologue!)
     // Total dynamic smem:
-    //   12,320 B (Q=8, NSG=4), 10,272 B (Q=8, NSG=4, MASKLESS -> 3 TGs/core),
-    //    4,160 B (Q=16, NSG=8, MASKLESS+ZERO_SQ -> 3-4 TGs/core),
-    //    8,320 B (Q=32, NSG=16, MASKLESS+ZERO_SQ -> 2 TGs/core).
+    //   12,320 B (Q=8, NSG=4), 10,272 B (Q=8, NSG=4, MASKLESS w/ or w/o FUSE_ROPE -> 3 TGs/core),
+    //    4,160 B (Q=16, NSG=8, MASKLESS+ZERO_SQ -> 4 TGs/core; +256 B = 4,416 B w/ FUSE_ROPE -> 4 TGs/core),
+    //    8,320 B (Q=32, NSG=16, MASKLESS+ZERO_SQ -> 2 TGs/core; +256 B = 8,576 B w/ FUSE_ROPE -> 2 TGs/core).
+    constexpr bool PROLOGUE_ROPE_CS = FUSE_ROPE && ZERO_SQ;
     threadgroup half   * sq   = ZERO_SQ ? nullptr : shmem_f16;
     threadgroup half4  * sq4  = ZERO_SQ ? nullptr : (threadgroup half4 *) shmem_f16;
     threadgroup float  * ss   = (threadgroup float *) (shmem_f16 + SQ_H);
     threadgroup float2 * ss2  = (threadgroup float2 *) (shmem_f16 + SQ_H);
     threadgroup half2  * sm2  = MASKLESS ? nullptr : (threadgroup half2 *) (shmem_f16 + SQ_H + 2*C);
     threadgroup float  * s_ms = (threadgroup float *) (shmem_f16 + SQ_H + Q*TS);
+    threadgroup float2 * s_rope_cs = PROLOGUE_ROPE_CS ? (threadgroup float2 *) (s_ms + Q) : nullptr;
+
+    if (PROLOGUE_ROPE_CS && sgitg == 0) {
+        // Compute all 32 (cos, sin) pairs once per TG before lo[][] is live (zero main-loop VGPR impact!).
+        const uint pos = rope_args->start_pos + (uint)iq2;
+        const float theta = float(pos) * rope_args->frequencies[tiisg];
+        const float rc = precise::cos(theta);
+        const float rs = rope_args->inverse ? -precise::sin(theta) : precise::sin(theta);
+        s_rope_cs[tiisg] = float2(rc, rs);
+    }
 
     const short lo_row = ((tiisg >> 2) & 4) | ((tiisg >> 1) & 3);
     const short lo_col = ((tiisg >> 1) & 4) | ((tiisg & 1) << 1);
@@ -1436,30 +1446,80 @@ void kernel_myds_flash_attn_heads_reg_o_impl(
     }
 
     if (FUSE_ROPE) {
-        const uint pos = rope_start_pos + (uint)iq2;
-        FOR_UNROLL (short ii = 0; ii < NO_COL; ++ii) {
-            const short c2 = (8*sgitg + ii*8*NSG + lo_col) / 2;
-            const bool do_rope = (c2 >= 224);
-            float rc = 1.0f, rs = 0.0f;
-            if (do_rope) {
-                const float theta = float(pos) * rope_freqs[c2 - 224];
-                rc = precise::cos(theta);
-                rs = rope_inverse ? -precise::sin(theta) : precise::sin(theta);
-            }
+        constexpr short ROPE_II0 = 448 / (8 * NSG);
+        if (PROLOGUE_ROPE_CS) {
+            // s_rope_cs[0..31] was precomputed by sgitg==0 in the prologue (visible after the
+            // s_scale threadgroup_barrier above). Zero trig instructions & zero extra VGPRs here.
             FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
                 const short j = qb*8 + lo_row;
                 if (iq1 + j < args.ne01) {
-                    float2 raw;
-                    {
-                        #pragma clang fp contract(off)
-                        const float scale = s_scale[j];
-                        raw = float2(lo[qb][ii].thread_elements()[0] * scale,
-                                     lo[qb][ii].thread_elements()[1] * scale);
-                    }
+                    const float scale = s_scale[j];
                     const uint64_t rid = HEAD_BATCH ? (uint64_t)iq2*args.ne1 + iq1 + j :
                         (uint64_t)iq3*args.ne2*args.ne1 + iq2 + (uint64_t)(iq1 + j)*args.ne1;
                     device float2 * dst2 = (device float2 *) ((device float *) dst + rid*DV);
-                    dst2[c2] = myds_prefill_rope_bf16_apply(raw, do_rope, rc, rs);
+                    FOR_UNROLL (short ii = 0; ii < NO_COL; ++ii) {
+                        const short c2 = (8*sgitg + ii*8*NSG + lo_col) / 2;
+                        float2 raw;
+                        {
+                            #pragma clang fp contract(off)
+                            raw = float2(lo[qb][ii].thread_elements()[0] * scale,
+                                         lo[qb][ii].thread_elements()[1] * scale);
+                        }
+                        if (ii >= ROPE_II0 && ((8 * NSG <= 64) || c2 >= 224)) {
+                            const float2 cs = s_rope_cs[c2 - 224];
+                            dst2[c2] = myds_prefill_rope_bf16_apply(raw, true, cs.x, cs.y);
+                        } else {
+                            dst2[c2] = float2(myds_prefill_attn_bf16(raw.x),
+                                              myds_prefill_attn_bf16(raw.y));
+                        }
+                    }
+                }
+            }
+        } else {
+            // Q=8 (10,272 B smem): keep exact 10,272 B smem (0 extra smem -> preserves 3 TGs/core).
+            // Pass 1 drains 14/16 (87.5%) of lo[][] first so trig reuses freed VGPRs.
+            FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
+                const short j = qb*8 + lo_row;
+                if (iq1 + j < args.ne01) {
+                    const float scale = s_scale[j];
+                    const uint64_t rid = HEAD_BATCH ? (uint64_t)iq2*args.ne1 + iq1 + j :
+                        (uint64_t)iq3*args.ne2*args.ne1 + iq2 + (uint64_t)(iq1 + j)*args.ne1;
+                    device float2 * dst2 = (device float2 *) ((device float *) dst + rid*DV);
+                    FOR_UNROLL (short ii = 0; ii < ROPE_II0; ++ii) {
+                        const short c2 = (8*sgitg + ii*8*NSG + lo_col) / 2;
+                        float2 raw;
+                        {
+                            #pragma clang fp contract(off)
+                            raw = float2(lo[qb][ii].thread_elements()[0] * scale,
+                                         lo[qb][ii].thread_elements()[1] * scale);
+                        }
+                        dst2[c2] = float2(myds_prefill_attn_bf16(raw.x),
+                                          myds_prefill_attn_bf16(raw.y));
+                    }
+                }
+            }
+            const uint pos = rope_args->start_pos + (uint)iq2;
+            const uint inv = rope_args->inverse;
+            FOR_UNROLL (short ii = ROPE_II0; ii < NO_COL; ++ii) {
+                const short c2 = (8*sgitg + ii*8*NSG + lo_col) / 2;
+                const float theta = float(pos) * rope_args->frequencies[c2 - 224];
+                const float rc = precise::cos(theta);
+                const float rs = inv ? -precise::sin(theta) : precise::sin(theta);
+                FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
+                    const short j = qb*8 + lo_row;
+                    if (iq1 + j < args.ne01) {
+                        float2 raw;
+                        {
+                            #pragma clang fp contract(off)
+                            const float scale = s_scale[j];
+                            raw = float2(lo[qb][ii].thread_elements()[0] * scale,
+                                         lo[qb][ii].thread_elements()[1] * scale);
+                        }
+                        const uint64_t rid = HEAD_BATCH ? (uint64_t)iq2*args.ne1 + iq1 + j :
+                            (uint64_t)iq3*args.ne2*args.ne1 + iq2 + (uint64_t)(iq1 + j)*args.ne1;
+                        device float2 * dst2 = (device float2 *) ((device float *) dst + rid*DV);
+                        dst2[c2] = myds_prefill_rope_bf16_apply(raw, true, rc, rs);
+                    }
                 }
             }
         }
@@ -1572,7 +1632,7 @@ kernel void kernel_myds_flash_attn_heads_reg_o_rope(
     if (FC_flash_attn_ext_nsg == NSG) {
         kernel_myds_flash_attn_heads_reg_o_impl<DK, DV, Q, C, NSG, HEAD_BATCH, MASKLESS, DIRECT_SLAB, ZERO_SQ, true>(
             rope_args.attention, q, k, v, mask, sinks, pad, blk, dst, shmem_f16, tgpig, tiisg, sgitg,
-            rope_args.start_pos, rope_args.inverse, rope_args.frequencies);
+            &rope_args);
     }
 }
 
