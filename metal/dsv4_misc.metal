@@ -9283,6 +9283,459 @@ kernel void kernel_myds_indexer_scores_register_only_0b_fp4(
 }
 
 // ============================================================================
+// [CAND-I1] Strict 0-ULP Wide Prefill IRO Scorers (MYDS_INDEXER_PREFILL_WIDE):
+// Packed BF16 Q (8 KB/token) + double-buffered XOR-swizzled 8 KB smem_q + 8 SGs
+// (M=16 tokens x N=64 keys, 256 thr/TG -> 2x MMA ILP, 2x fewer K loads & FP4
+// unpacks, 8x fewer barriers per (tok,key) pair, 4x lower Q L2/SLC traffic) +
+// hoisted weights[head]. Tuned to <=68 VGPRs on Apple8 (M2 Ultra maxThr>=768,
+// 3 TGs/core = 768 thr/core) and 1024 on Apple9 (M4, 4 TGs/core = 1024 thr/core).
+// Kept in dsv4_misc.metal so metal/myds_indexer_register_only.metal retains
+// its frozen APPROVED_SHADER_SHA.
+// ============================================================================
+template <bool IS_FP4>
+static inline void myds_indexer_ro_wide_m16_impl(
+        constant ds4_metal_args_dsv4_indexer_scores_fused &args,
+        device const char *q,
+        device const char *weights,
+        device const char *index_comp,
+        device char *scores,
+        threadgroup uint2 (*smem_q_raw)[512],
+        uint2 tgpig,
+        ushort lane,
+        ushort sg) {
+    if (args.n_head != 32u || args.head_dim != 128u ||
+        (args.ratio != 1u && args.ratio != 2u) ||
+        args.n_comp <= 512u || args.n_comp > 1048576u ||
+        args.n_tokens < 8u || args.n_tokens > 2048u ||
+        args.pos0 > 1048576u - args.n_tokens || args.scale != 1.0f / 64.0f ||
+        args.q_token_stride != 8192u || args.q_head_stride != 256u ||
+        (IS_FP4 ? (args.index_row_stride != 68u) : (args.index_row_stride < 256u)) ||
+        sg >= 8u) return;
+
+    const uint token_base = tgpig.y * 16u;
+    const uint tg_comp_base = tgpig.x * 64u;
+    if (token_base >= args.n_tokens || tg_comp_base >= args.n_comp) return;
+
+    const uint comp_base = tg_comp_base + uint(sg) * 8u;
+    const short2 xy = dsv4_indexer_ro_0b_coord(lane);
+    const uint token0 = token_base + uint(xy.y);
+    const uint comp0 = comp_base + uint(xy.x);
+    const uint last_token = min(token_base + 16u, args.n_tokens);
+    const uint max_visible = min((args.pos0 + last_token) / args.ratio, args.n_comp);
+
+    // TG-uniform causal invisibility check: zero barriers for invisible tiles.
+    if (tg_comp_base >= max_visible) {
+        if (token0 < args.n_tokens) {
+            device float *dst0 = (device float *)(scores + (ulong)token0 * args.score_token_stride);
+            if (comp0 < args.n_comp) dst0[comp0] = -INFINITY;
+            if (comp0 + 1u < args.n_comp) dst0[comp0 + 1u] = -INFINITY;
+        }
+        if (token0 + 8u < args.n_tokens) {
+            device float *dst1 = (device float *)(scores + (ulong)(token0 + 8u) * args.score_token_stride);
+            if (comp0 < args.n_comp) dst1[comp0] = -INFINITY;
+            if (comp0 + 1u < args.n_comp) dst1[comp0 + 1u] = -INFINITY;
+        }
+        return;
+    }
+
+    // 8 KB double-buffered BF16 Q staging: 2 x (16 tokens x 32 uint2 = 4096 B).
+    // XOR swizzle (lane ^ ((t & 7u) * 2u)) eliminates bank conflicts on both
+    // uint2 stores and uint reads.
+    const uint wr_t0 = uint(sg);
+    const uint wr_idx0 = wr_t0 * 32u + (uint(lane) ^ (wr_t0 * 2u));
+    const uint wr_tok0 = token_base + wr_t0;
+    const bool wr_live0 = wr_tok0 < args.n_tokens;
+    const bool wr_live1 = (wr_tok0 + 8u) < args.n_tokens;
+    device const char *q_wr0 = q + (ulong)wr_tok0 * 8192u;
+
+    // Stage head 0 into smem_q_raw[0] before K load so temporaries die early.
+    smem_q_raw[0][wr_idx0] = wr_live0 ? ((device const uint2 *)q_wr0)[lane] : uint2(0u);
+    smem_q_raw[0][wr_idx0 + 256u] = wr_live1 ? ((device const uint2 *)(q_wr0 + 65536u))[lane] : uint2(0u);
+
+    const bool sg_active = comp_base < max_visible;
+    simdgroup_float8x8 resident_k[16];
+    if (sg_active) {
+        if (IS_FP4) {
+            device const uint *row0 = (comp0 < args.n_comp)
+                ? (device const uint *)(index_comp + (ulong)comp0 * 68u) : nullptr;
+            device const uint *row1 = (comp0 + 1u < args.n_comp)
+                ? (device const uint *)(index_comp + (ulong)(comp0 + 1u) * 68u) : nullptr;
+            const uint sc0_pack = row0 ? row0[16] : 0u;
+            const uint sc1_pack = row1 ? row1[16] : 0u;
+            const float sc0_f[4] = {
+                as_type<float>((sc0_pack & 0xffu) << 23u),
+                as_type<float>(((sc0_pack >> 8u) & 0xffu) << 23u),
+                as_type<float>(((sc0_pack >> 16u) & 0xffu) << 23u),
+                as_type<float>((sc0_pack >> 24u) << 23u),
+            };
+            const float sc1_f[4] = {
+                as_type<float>((sc1_pack & 0xffu) << 23u),
+                as_type<float>(((sc1_pack >> 8u) & 0xffu) << 23u),
+                as_type<float>(((sc1_pack >> 16u) & 0xffu) << 23u),
+                as_type<float>((sc1_pack >> 24u) << 23u),
+            };
+            const uint nib_shift = uint(xy.y) * 4u;
+            #pragma clang loop unroll(full)
+            for (uint db = 0; db < 16u; db++) {
+                const uint blk = db >> 2u;
+                const float k0 = row0
+                    ? myds_fp4_dequant_elem((row0[db] >> nib_shift) & 0xfu, sc0_f[blk])
+                    : 0.0f;
+                const float k1 = row1
+                    ? myds_fp4_dequant_elem((row1[db] >> nib_shift) & 0xfu, sc1_f[blk])
+                    : 0.0f;
+                resident_k[db].thread_elements()[0] = k0;
+                resident_k[db].thread_elements()[1] = k1;
+            }
+        } else {
+            #pragma clang loop unroll(full)
+            for (uint db = 0; db < 16u; db++) {
+                const uint d = db * 8u + uint(xy.y);
+                float k0 = 0.0f, k1 = 0.0f;
+                if (comp0 < args.n_comp) {
+                    device const ushort *row = (device const ushort *)(index_comp +
+                        (ulong)comp0 * args.index_row_stride);
+                    k0 = as_type<float>(uint(row[d]) << 16u);
+                }
+                if (comp0 + 1u < args.n_comp) {
+                    device const ushort *row = (device const ushort *)(index_comp +
+                        (ulong)(comp0 + 1u) * args.index_row_stride);
+                    k1 = as_type<float>(uint(row[d]) << 16u);
+                }
+                resident_k[db].thread_elements()[0] = k0;
+                resident_k[db].thread_elements()[1] = k1;
+            }
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint rd_t = uint(xy.y);
+    const uint rd_j = uint(xy.x) >> 1u;
+    const uint swiz_rd = rd_t * 4u;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    for (uint head = 0; head < 32u; head++) {
+        const uint cur = head & 1u;
+        const uint nxt = cur ^ 1u;
+        if (head + 1u < 32u) {
+            const ulong h_off = (ulong)(head + 1u) * 256u;
+            device const char *qb = q_wr0 + h_off;
+            smem_q_raw[nxt][wr_idx0] = wr_live0 ? ((device const uint2 *)qb)[lane] : uint2(0u);
+            smem_q_raw[nxt][wr_idx0 + 256u] = wr_live1 ? ((device const uint2 *)(qb + 65536u))[lane] : uint2(0u);
+        }
+
+        if (sg_active) {
+            const threadgroup uint *cur_q = (const threadgroup uint *)smem_q_raw[cur];
+            simdgroup_float8x8 mdot0 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            simdgroup_float8x8 mdot1 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            #pragma clang loop unroll(full)
+            for (uint db = 0; db < 16u; db++) {
+                const uint col = (db * 4u + rd_j) ^ swiz_rd;
+                simdgroup_float8x8 mq;
+                const uint p0 = cur_q[rd_t * 64u + col];
+                mq.thread_elements()[0] = as_type<float>(p0 << 16u);
+                mq.thread_elements()[1] = as_type<float>(p0 & 0xffff0000u);
+                simdgroup_multiply_accumulate(mdot0, mq, resident_k[db], mdot0);
+                const uint p1 = cur_q[512u + rd_t * 64u + col];
+                mq.thread_elements()[0] = as_type<float>(p1 << 16u);
+                mq.thread_elements()[1] = as_type<float>(p1 & 0xffff0000u);
+                simdgroup_multiply_accumulate(mdot1, mq, resident_k[db], mdot1);
+            }
+            if (token0 < args.n_tokens) {
+                #pragma clang fp contract(off) reassociate(off)
+                device const float *w0 = (device const float *)(weights +
+                    (ulong)token0 * args.weights_token_stride);
+                const float wh0 = w0[head];
+                if (comp0 < args.n_comp) {
+                    const float weighted = max(mdot0.thread_elements()[0], 0.0f) * wh0;
+                    const float scaled = weighted * args.scale;
+                    acc0 = scaled + acc0;
+                }
+                if (comp0 + 1u < args.n_comp) {
+                    const float weighted = max(mdot0.thread_elements()[1], 0.0f) * wh0;
+                    const float scaled = weighted * args.scale;
+                    acc1 = scaled + acc1;
+                }
+            }
+            if (token0 + 8u < args.n_tokens) {
+                #pragma clang fp contract(off) reassociate(off)
+                device const float *w1 = (device const float *)(weights +
+                    (ulong)(token0 + 8u) * args.weights_token_stride);
+                const float wh1 = w1[head];
+                if (comp0 < args.n_comp) {
+                    const float weighted = max(mdot1.thread_elements()[0], 0.0f) * wh1;
+                    const float scaled = weighted * args.scale;
+                    acc2 = scaled + acc2;
+                }
+                if (comp0 + 1u < args.n_comp) {
+                    const float weighted = max(mdot1.thread_elements()[1], 0.0f) * wh1;
+                    const float scaled = weighted * args.scale;
+                    acc3 = scaled + acc3;
+                }
+            }
+        }
+
+        if (head + 1u < 32u) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (sg_active) {
+        if (token0 < args.n_tokens) {
+            const uint visible0 = min((args.pos0 + token0 + 1u) / args.ratio, args.n_comp);
+            device float *dst0 = (device float *)(scores + (ulong)token0 * args.score_token_stride);
+            if (comp0 < args.n_comp) dst0[comp0] = comp0 < visible0 ? acc0 : -INFINITY;
+            if (comp0 + 1u < args.n_comp) dst0[comp0 + 1u] = (comp0 + 1u) < visible0 ? acc1 : -INFINITY;
+        }
+        if (token0 + 8u < args.n_tokens) {
+            const uint visible1 = min((args.pos0 + token0 + 9u) / args.ratio, args.n_comp);
+            device float *dst1 = (device float *)(scores + (ulong)(token0 + 8u) * args.score_token_stride);
+            if (comp0 < args.n_comp) dst1[comp0] = comp0 < visible1 ? acc2 : -INFINITY;
+            if (comp0 + 1u < args.n_comp) dst1[comp0 + 1u] = (comp0 + 1u) < visible1 ? acc3 : -INFINITY;
+        }
+    } else {
+        if (token0 < args.n_tokens) {
+            device float *dst0 = (device float *)(scores + (ulong)token0 * args.score_token_stride);
+            if (comp0 < args.n_comp) dst0[comp0] = -INFINITY;
+            if (comp0 + 1u < args.n_comp) dst0[comp0 + 1u] = -INFINITY;
+        }
+        if (token0 + 8u < args.n_tokens) {
+            device float *dst1 = (device float *)(scores + (ulong)(token0 + 8u) * args.score_token_stride);
+            if (comp0 < args.n_comp) dst1[comp0] = -INFINITY;
+            if (comp0 + 1u < args.n_comp) dst1[comp0 + 1u] = -INFINITY;
+        }
+    }
+}
+
+template <bool IS_FP4, bool PREFETCH_REGS>
+static inline void myds_indexer_ro_wide_m8_impl(
+        constant ds4_metal_args_dsv4_indexer_scores_fused &args,
+        device const char *q,
+        device const char *weights,
+        device const char *index_comp,
+        device char *scores,
+        threadgroup uint2 (*smem_q_raw)[256],
+        uint2 tgpig,
+        ushort lane,
+        ushort sg) {
+    if (args.n_head != 32u || args.head_dim != 128u ||
+        (args.ratio != 1u && args.ratio != 2u) ||
+        args.n_comp <= 512u || args.n_comp > 1048576u ||
+        args.n_tokens < 8u || args.n_tokens > 2048u ||
+        args.pos0 > 1048576u - args.n_tokens || args.scale != 1.0f / 64.0f ||
+        args.q_token_stride != 8192u || args.q_head_stride != 256u ||
+        (IS_FP4 ? (args.index_row_stride != 68u) : (args.index_row_stride < 256u)) ||
+        sg >= 8u) return;
+
+    const uint token_base = tgpig.y * 8u;
+    const uint tg_comp_base = tgpig.x * 64u;
+    if (token_base >= args.n_tokens || tg_comp_base >= args.n_comp) return;
+
+    const uint comp_base = tg_comp_base + uint(sg) * 8u;
+    const short2 xy = dsv4_indexer_ro_0b_coord(lane);
+    const uint token = token_base + uint(xy.y);
+    const uint comp0 = comp_base + uint(xy.x);
+    const uint comp1 = comp0 + 1u;
+    const bool live = token < args.n_tokens;
+    const uint last_token = min(token_base + 8u, args.n_tokens);
+    const uint max_visible = min((args.pos0 + last_token) / args.ratio, args.n_comp);
+
+    if (tg_comp_base >= max_visible) {
+        if (live) {
+            device float *dst = (device float *)(scores + (ulong)token * args.score_token_stride);
+            if (comp0 < args.n_comp) dst[comp0] = -INFINITY;
+            if (comp1 < args.n_comp) dst[comp1] = -INFINITY;
+        }
+        return;
+    }
+
+    const uint rd_t = uint(xy.y);
+    const uint rd_j = uint(xy.x) >> 1u;
+    const uint swiz_rd = rd_t * 4u;
+    const uint wr_t = uint(sg);
+    const uint wr_idx = wr_t * 32u + (uint(lane) ^ (wr_t * 2u));
+    const uint wr_tok = token_base + wr_t;
+    const bool wr_live = wr_tok < args.n_tokens;
+    device const char *q_wr = wr_live ? (q + (ulong)wr_tok * 8192u) : nullptr;
+
+    smem_q_raw[0][wr_idx] = wr_live ? ((device const uint2 *)q_wr)[lane] : uint2(0u);
+
+    const bool sg_active = comp_base < max_visible;
+    simdgroup_float8x8 resident_k[16];
+    if (sg_active) {
+        if (IS_FP4) {
+            device const uint *row0 = (comp0 < args.n_comp)
+                ? (device const uint *)(index_comp + (ulong)comp0 * 68u) : nullptr;
+            device const uint *row1 = (comp1 < args.n_comp)
+                ? (device const uint *)(index_comp + (ulong)comp1 * 68u) : nullptr;
+            const uint sc0_pack = row0 ? row0[16] : 0u;
+            const uint sc1_pack = row1 ? row1[16] : 0u;
+            const float sc0_f[4] = {
+                as_type<float>((sc0_pack & 0xffu) << 23u),
+                as_type<float>(((sc0_pack >> 8u) & 0xffu) << 23u),
+                as_type<float>(((sc0_pack >> 16u) & 0xffu) << 23u),
+                as_type<float>((sc0_pack >> 24u) << 23u),
+            };
+            const float sc1_f[4] = {
+                as_type<float>((sc1_pack & 0xffu) << 23u),
+                as_type<float>(((sc1_pack >> 8u) & 0xffu) << 23u),
+                as_type<float>(((sc1_pack >> 16u) & 0xffu) << 23u),
+                as_type<float>((sc1_pack >> 24u) << 23u),
+            };
+            const uint nib_shift = uint(xy.y) * 4u;
+            #pragma clang loop unroll(full)
+            for (uint db = 0; db < 16u; db++) {
+                const uint blk = db >> 2u;
+                const float k0 = row0
+                    ? myds_fp4_dequant_elem((row0[db] >> nib_shift) & 0xfu, sc0_f[blk])
+                    : 0.0f;
+                const float k1 = row1
+                    ? myds_fp4_dequant_elem((row1[db] >> nib_shift) & 0xfu, sc1_f[blk])
+                    : 0.0f;
+                resident_k[db].thread_elements()[0] = k0;
+                resident_k[db].thread_elements()[1] = k1;
+            }
+        } else {
+            #pragma clang loop unroll(full)
+            for (uint db = 0; db < 16u; db++) {
+                const uint d = db * 8u + uint(xy.y);
+                float k0 = 0.0f, k1 = 0.0f;
+                if (comp0 < args.n_comp) {
+                    device const ushort *row = (device const ushort *)(index_comp +
+                        (ulong)comp0 * args.index_row_stride);
+                    k0 = as_type<float>(uint(row[d]) << 16u);
+                }
+                if (comp1 < args.n_comp) {
+                    device const ushort *row = (device const ushort *)(index_comp +
+                        (ulong)comp1 * args.index_row_stride);
+                    k1 = as_type<float>(uint(row[d]) << 16u);
+                }
+                resident_k[db].thread_elements()[0] = k0;
+                resident_k[db].thread_elements()[1] = k1;
+            }
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float acc0 = 0.0f, acc1 = 0.0f;
+    for (uint head = 0; head < 32u; head++) {
+        const uint cur = head & 1u;
+        const uint nxt = cur ^ 1u;
+        uint2 nv0 = uint2(0u);
+        if (head + 1u < 32u) {
+            const ulong h_off = (ulong)(head + 1u) * 256u;
+            if (PREFETCH_REGS) {
+                if (wr_live) nv0 = ((device const uint2 *)(q_wr + h_off))[lane];
+            } else {
+                smem_q_raw[nxt][wr_idx] = wr_live ? ((device const uint2 *)(q_wr + h_off))[lane] : uint2(0u);
+            }
+        }
+
+        if (sg_active) {
+            const threadgroup uint *cur_q = (const threadgroup uint *)smem_q_raw[cur];
+            simdgroup_float8x8 mdot = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            #pragma clang loop unroll(full)
+            for (uint db = 0; db < 16u; db++) {
+                const uint p0 = cur_q[rd_t * 64u + ((db * 4u + rd_j) ^ swiz_rd)];
+                simdgroup_float8x8 mq;
+                mq.thread_elements()[0] = as_type<float>(p0 << 16u);
+                mq.thread_elements()[1] = as_type<float>(p0 & 0xffff0000u);
+                simdgroup_multiply_accumulate(mdot, mq, resident_k[db], mdot);
+            }
+            if (live) {
+                #pragma clang fp contract(off) reassociate(off)
+                device const float *w = (device const float *)(weights +
+                    (ulong)token * args.weights_token_stride);
+                const float wh = w[head];
+                if (comp0 < args.n_comp) {
+                    const float weighted = max(mdot.thread_elements()[0], 0.0f) * wh;
+                    const float scaled = weighted * args.scale;
+                    acc0 = scaled + acc0;
+                }
+                if (comp1 < args.n_comp) {
+                    const float weighted = max(mdot.thread_elements()[1], 0.0f) * wh;
+                    const float scaled = weighted * args.scale;
+                    acc1 = scaled + acc1;
+                }
+            }
+        }
+
+        if (head + 1u < 32u) {
+            if (PREFETCH_REGS) {
+                smem_q_raw[nxt][wr_idx] = nv0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (sg_active) {
+        if (live) {
+            const uint visible = min((args.pos0 + token + 1u) / args.ratio, args.n_comp);
+            device float *dst = (device float *)(scores + (ulong)token * args.score_token_stride);
+            if (comp0 < args.n_comp) dst[comp0] = comp0 < visible ? acc0 : -INFINITY;
+            if (comp1 < args.n_comp) dst[comp1] = comp1 < visible ? acc1 : -INFINITY;
+        }
+    } else if (live) {
+        device float *dst = (device float *)(scores + (ulong)token * args.score_token_stride);
+        if (comp0 < args.n_comp) dst[comp0] = -INFINITY;
+        if (comp1 < args.n_comp) dst[comp1] = -INFINITY;
+    }
+}
+
+kernel void kernel_myds_indexer_scores_register_only_fp4_wide(
+        constant ds4_metal_args_dsv4_indexer_scores_fused &args [[buffer(0)]],
+        device const char *q                                  [[buffer(1)]],
+        device const char *weights                            [[buffer(2)]],
+        device const char *index_comp                         [[buffer(3)]],
+        device char *scores                                   [[buffer(4)]],
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    threadgroup uint2 smem_q_raw[2][512];
+    myds_indexer_ro_wide_m16_impl<true>(args, q, weights, index_comp, scores, smem_q_raw, tgpig, lane, sg);
+}
+
+kernel void kernel_myds_indexer_scores_register_only_bf16_wide(
+        constant ds4_metal_args_dsv4_indexer_scores_fused &args [[buffer(0)]],
+        device const char *q                                  [[buffer(1)]],
+        device const char *weights                            [[buffer(2)]],
+        device const char *index_comp                         [[buffer(3)]],
+        device char *scores                                   [[buffer(4)]],
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    threadgroup uint2 smem_q_raw[2][512];
+    myds_indexer_ro_wide_m16_impl<false>(args, q, weights, index_comp, scores, smem_q_raw, tgpig, lane, sg);
+}
+
+kernel void kernel_myds_indexer_scores_register_only_fp4_wide_m8(
+        constant ds4_metal_args_dsv4_indexer_scores_fused &args [[buffer(0)]],
+        device const char *q                                  [[buffer(1)]],
+        device const char *weights                            [[buffer(2)]],
+        device const char *index_comp                         [[buffer(3)]],
+        device char *scores                                   [[buffer(4)]],
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    threadgroup uint2 smem_q_raw[2][256];
+    myds_indexer_ro_wide_m8_impl<true, true>(args, q, weights, index_comp, scores, smem_q_raw, tgpig, lane, sg);
+}
+
+kernel void kernel_myds_indexer_scores_register_only_bf16_wide_m8(
+        constant ds4_metal_args_dsv4_indexer_scores_fused &args [[buffer(0)]],
+        device const char *q                                  [[buffer(1)]],
+        device const char *weights                            [[buffer(2)]],
+        device const char *index_comp                         [[buffer(3)]],
+        device char *scores                                   [[buffer(4)]],
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    threadgroup uint2 smem_q_raw[2][256];
+    myds_indexer_ro_wide_m8_impl<false, true>(args, q, weights, index_comp, scores, smem_q_raw, tgpig, lane, sg);
+}
+
+// ============================================================================
 // [D-L1] Long-context single-step Decode (il > 20, count > 16384) 0-ULP
 // Compact <=16K Scorer + Compact <=16K Top-512 Pipeline (overlap-compatible).
 // ============================================================================
@@ -10606,6 +11059,242 @@ kernel void kernel_myds_indexer_scores_prefill_compact_ro_0b_fp4(
             }
         }
     }
+}
+
+// ============================================================================
+// [CAND-I1] Strict 0-ULP Wide [P-L1] Prefill YoCo Compact Register-Only Scorers:
+// Preserves exact M=8 block-union tile (zero union inflation!), widens to N=64
+// (8 SGs = 256 thr/TG, u_base = tgpig.x * 8u), stages packed BF16 Q into 4 KB
+// double-buffered XOR-swizzled smem_q (1 uint2 load/thread/head, 32 barriers/TG),
+// and hoists weights[head] once per head.
+// ============================================================================
+template <bool IS_FP4, bool PREFETCH_REGS>
+static inline void myds_indexer_prefill_compact_ro_wide_impl(
+        constant myds_indexer_prefill_compact_score_args &args,
+        device const char *q,
+        device const char *weights,
+        device const char *index_comp,
+        device char *scores,
+        device const uint32_t *meta_u32,
+        device const ushort *tile_dst_col,
+        threadgroup uint2 (*smem_q_raw)[256],
+        uint2 tgpig,
+        ushort lane,
+        ushort sg) {
+    if (args.n_head != 32u || args.head_dim != 128u ||
+        (args.ratio != 1u && args.ratio != 2u) ||
+        args.n_comp <= 512u || args.n_comp > 1048576u ||
+        args.n_tokens < 1u || args.n_tokens > 2048u ||
+        args.pos0 > 1048576u - args.n_tokens || args.scale != 1.0f / 64.0f ||
+        args.q_token_stride != 8192u || args.q_head_stride != 256u ||
+        (IS_FP4 ? (args.index_row_stride != 68u) : (args.index_row_stride < 256u)) ||
+        sg >= 8u) return;
+
+    const uint token_base = tgpig.y * 8u;
+    if (token_base >= args.n_tokens) return;
+
+    device const uint32_t *union_blocks = meta_u32 + args.union_blk_off;
+    device const uint32_t *union_counts = meta_u32 + args.union_cnt_off;
+    const uint u_cnt = union_counts[tgpig.y];
+    const uint u_base = tgpig.x * 8u;
+    if (u_base >= u_cnt) return;
+
+    const uint u_idx = u_base + uint(sg);
+    const bool sg_in_union = (u_idx < u_cnt);
+    const uint comp_base = sg_in_union
+        ? (union_blocks[(ulong)tgpig.y * args.u_stride + u_idx] * 8u)
+        : args.n_comp;
+
+    const short2 xy = dsv4_indexer_ro_0b_coord(lane);
+    const uint token = token_base + uint(xy.y);
+    const uint comp0 = comp_base + uint(xy.x);
+    const uint comp1 = comp0 + 1u;
+    const bool live = token < args.n_tokens;
+    const uint last_token = min(token_base + 8u, args.n_tokens);
+    const uint max_visible = min((args.pos0 + last_token) / args.ratio, args.n_comp);
+
+    const uint tg_min_comp_base = union_blocks[(ulong)tgpig.y * args.u_stride + u_base] * 8u;
+    if (tg_min_comp_base >= max_visible) {
+        if (sg_in_union && live) {
+            const ushort dst_blk = tile_dst_col[((ulong)tgpig.y * args.u_stride + u_idx) * 8u + uint(xy.y)];
+            if (dst_blk < 2048u) {
+                device float *dst = (device float *)(scores + (ulong)token * args.score_token_stride);
+                const uint dst0 = uint(dst_blk) * 8u + uint(xy.x);
+                dst[dst0] = -INFINITY;
+                dst[dst0 + 1u] = -INFINITY;
+            }
+        }
+        return;
+    }
+
+    // 4 KB double-buffered BF16 Q staging: 2 x (8 tokens x 32 uint2 = 2048 B).
+    const uint rd_t = uint(xy.y);
+    const uint rd_j = uint(xy.x) >> 1u;
+    const uint swiz_rd = rd_t * 4u;
+    const uint wr_t = uint(sg);
+    const uint wr_idx = wr_t * 32u + (uint(lane) ^ (wr_t * 2u));
+    const uint wr_tok = token_base + wr_t;
+    const bool wr_live = wr_tok < args.n_tokens;
+    device const char *q_wr = wr_live ? (q + (ulong)wr_tok * 8192u) : nullptr;
+
+    smem_q_raw[0][wr_idx] = wr_live ? ((device const uint2 *)q_wr)[lane] : uint2(0u);
+
+    const bool sg_active = sg_in_union && (comp_base < max_visible);
+    simdgroup_float8x8 resident_k[16];
+    if (sg_active) {
+        if (IS_FP4) {
+            device const uint *row0 = (comp0 < args.n_comp)
+                ? (device const uint *)(index_comp + (ulong)comp0 * 68u) : nullptr;
+            device const uint *row1 = (comp1 < args.n_comp)
+                ? (device const uint *)(index_comp + (ulong)comp1 * 68u) : nullptr;
+            const uint sc0_pack = row0 ? row0[16] : 0u;
+            const uint sc1_pack = row1 ? row1[16] : 0u;
+            const float sc0_f[4] = {
+                as_type<float>((sc0_pack & 0xffu) << 23u),
+                as_type<float>(((sc0_pack >> 8u) & 0xffu) << 23u),
+                as_type<float>(((sc0_pack >> 16u) & 0xffu) << 23u),
+                as_type<float>((sc0_pack >> 24u) << 23u),
+            };
+            const float sc1_f[4] = {
+                as_type<float>((sc1_pack & 0xffu) << 23u),
+                as_type<float>(((sc1_pack >> 8u) & 0xffu) << 23u),
+                as_type<float>(((sc1_pack >> 16u) & 0xffu) << 23u),
+                as_type<float>((sc1_pack >> 24u) << 23u),
+            };
+            const uint nib_shift = uint(xy.y) * 4u;
+            #pragma clang loop unroll(full)
+            for (uint db = 0; db < 16u; db++) {
+                const uint blk = db >> 2u;
+                const float k0 = row0
+                    ? myds_fp4_dequant_elem((row0[db] >> nib_shift) & 0xfu, sc0_f[blk])
+                    : 0.0f;
+                const float k1 = row1
+                    ? myds_fp4_dequant_elem((row1[db] >> nib_shift) & 0xfu, sc1_f[blk])
+                    : 0.0f;
+                resident_k[db].thread_elements()[0] = k0;
+                resident_k[db].thread_elements()[1] = k1;
+            }
+        } else {
+            #pragma clang loop unroll(full)
+            for (uint db = 0; db < 16u; db++) {
+                const uint d = db * 8u + uint(xy.y);
+                float k0 = 0.0f, k1 = 0.0f;
+                if (comp0 < args.n_comp) {
+                    device const ushort *row = (device const ushort *)(index_comp +
+                        (ulong)comp0 * args.index_row_stride);
+                    k0 = as_type<float>(uint(row[d]) << 16u);
+                }
+                if (comp1 < args.n_comp) {
+                    device const ushort *row = (device const ushort *)(index_comp +
+                        (ulong)comp1 * args.index_row_stride);
+                    k1 = as_type<float>(uint(row[d]) << 16u);
+                }
+                resident_k[db].thread_elements()[0] = k0;
+                resident_k[db].thread_elements()[1] = k1;
+            }
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float acc0 = 0.0f, acc1 = 0.0f;
+    for (uint head = 0; head < 32u; head++) {
+        const uint cur = head & 1u;
+        const uint nxt = cur ^ 1u;
+        uint2 nv0 = uint2(0u);
+        if (head + 1u < 32u) {
+            const ulong h_off = (ulong)(head + 1u) * 256u;
+            if (PREFETCH_REGS) {
+                if (wr_live) nv0 = ((device const uint2 *)(q_wr + h_off))[lane];
+            } else {
+                smem_q_raw[nxt][wr_idx] = wr_live ? ((device const uint2 *)(q_wr + h_off))[lane] : uint2(0u);
+            }
+        }
+
+        if (sg_active) {
+            const threadgroup uint *cur_q = (const threadgroup uint *)smem_q_raw[cur];
+            simdgroup_float8x8 mdot = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            #pragma clang loop unroll(full)
+            for (uint db = 0; db < 16u; db++) {
+                const uint p0 = cur_q[rd_t * 64u + ((db * 4u + rd_j) ^ swiz_rd)];
+                simdgroup_float8x8 mq;
+                mq.thread_elements()[0] = as_type<float>(p0 << 16u);
+                mq.thread_elements()[1] = as_type<float>(p0 & 0xffff0000u);
+                simdgroup_multiply_accumulate(mdot, mq, resident_k[db], mdot);
+            }
+            if (live) {
+                #pragma clang fp contract(off) reassociate(off)
+                device const float *w = (device const float *)(weights +
+                    (ulong)token * args.weights_token_stride);
+                const float wh = w[head];
+                if (comp0 < args.n_comp) {
+                    const float weighted = max(mdot.thread_elements()[0], 0.0f) * wh;
+                    const float scaled = weighted * args.scale;
+                    acc0 = scaled + acc0;
+                }
+                if (comp1 < args.n_comp) {
+                    const float weighted = max(mdot.thread_elements()[1], 0.0f) * wh;
+                    const float scaled = weighted * args.scale;
+                    acc1 = scaled + acc1;
+                }
+            }
+        }
+
+        if (head + 1u < 32u) {
+            if (PREFETCH_REGS) {
+                smem_q_raw[nxt][wr_idx] = nv0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (sg_in_union && live) {
+        const ushort dst_blk = tile_dst_col[((ulong)tgpig.y * args.u_stride + u_idx) * 8u + uint(xy.y)];
+        if (dst_blk < 2048u) {
+            device float *dst = (device float *)(scores + (ulong)token * args.score_token_stride);
+            const uint dst0 = uint(dst_blk) * 8u + uint(xy.x);
+            if (sg_active) {
+                const uint visible = min((args.pos0 + token + 1u) / args.ratio, args.n_comp);
+                dst[dst0] = (comp0 < args.n_comp && comp0 < visible) ? acc0 : -INFINITY;
+                dst[dst0 + 1u] = (comp1 < args.n_comp && comp1 < visible) ? acc1 : -INFINITY;
+            } else {
+                dst[dst0] = -INFINITY;
+                dst[dst0 + 1u] = -INFINITY;
+            }
+        }
+    }
+}
+
+kernel void kernel_myds_indexer_scores_prefill_compact_ro_fp4_wide(
+        constant myds_indexer_prefill_compact_score_args &args [[buffer(0)]],
+        device const char *q                                   [[buffer(1)]],
+        device const char *weights                             [[buffer(2)]],
+        device const char *index_comp                          [[buffer(3)]],
+        device char *scores                                    [[buffer(4)]],
+        device const uint32_t *meta_u32                        [[buffer(5)]],
+        device const ushort *tile_dst_col                      [[buffer(6)]],
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    threadgroup uint2 smem_q_raw[2][256];
+    myds_indexer_prefill_compact_ro_wide_impl<true, true>(
+        args, q, weights, index_comp, scores, meta_u32, tile_dst_col, smem_q_raw, tgpig, lane, sg);
+}
+
+kernel void kernel_myds_indexer_scores_prefill_compact_ro_bf16_wide(
+        constant myds_indexer_prefill_compact_score_args &args [[buffer(0)]],
+        device const char *q                                   [[buffer(1)]],
+        device const char *weights                             [[buffer(2)]],
+        device const char *index_comp                          [[buffer(3)]],
+        device char *scores                                    [[buffer(4)]],
+        device const uint32_t *meta_u32                        [[buffer(5)]],
+        device const ushort *tile_dst_col                      [[buffer(6)]],
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    threadgroup uint2 smem_q_raw[2][256];
+    myds_indexer_prefill_compact_ro_wide_impl<false, true>(
+        args, q, weights, index_comp, scores, meta_u32, tile_dst_col, smem_q_raw, tgpig, lane, sg);
 }
 
 // Stage 3a: (16, n_tokens, 1) TGs x 512 threads (8 KB smem -> 4 TGs/core).

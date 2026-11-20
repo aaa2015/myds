@@ -40,6 +40,14 @@ int myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped_mode(myds_v41_gp
     assert(cache_mode==expected_cache_mode);
     return myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped(s,y,q,w,k,nc,nh,nt,start,ratio,cache_mode!=MYDS_INDEXER_CACHE_F32,ordinary);
 }
+static int stub_wide_mode=0;
+static unsigned wide_iro_calls,wide_compact_calls;
+int myds_v41_gpu_indexer_prefill_wide_enabled(void){return stub_wide_mode;}
+int myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped_mode_qbf16(myds_v41_gpu_scratch_t*s,myds_metal_buffer_t*y,const myds_metal_buffer_t*q,const myds_metal_buffer_t*q_bf16,const myds_metal_buffer_t*w,const myds_metal_buffer_t*k,uint32_t nc,uint32_t nh,uint32_t nt,uint32_t start,uint32_t ratio,uint32_t cache_mode,bool ordinary){
+    assert(q_bf16!=NULL&&q_bf16->size==(size_t)nt*32u*128u*2u);
+    wide_iro_calls++;
+    return myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped_mode(s,y,q,w,k,nc,nh,nt,start,ratio,cache_mode,ordinary);
+}
 int myds_v41_gpu_candidates_rows(myds_metal_buffer_t*a,const myds_metal_buffer_t*b,uint32_t c,uint32_t d,uint32_t e,uint32_t f,uint32_t g){after_scorer_calls++;return 1;}
 int myds_v41_gpu_filter_rows(myds_metal_buffer_t*a,const myds_metal_buffer_t*b,uint32_t c,uint32_t d,uint32_t e,uint32_t f,uint32_t g){after_scorer_calls++;return 1;}
 int myds_v41_gpu_filter_rows_bits(myds_metal_buffer_t*a,const myds_metal_buffer_t*b,uint32_t c,uint32_t d,uint32_t e,uint32_t f,uint32_t g){after_scorer_calls++;return 1;}
@@ -76,6 +84,11 @@ int myds_v41_gpu_indexer_prefill_compact_scoped(myds_v41_gpu_scratch_t*s,myds_me
 int myds_v41_gpu_indexer_prefill_compact_scoped_mode(myds_v41_gpu_scratch_t*s,myds_metal_buffer_t*ids,const myds_metal_buffer_t*q,const myds_metal_buffer_t*w,const myds_metal_buffer_t*k,const myds_metal_buffer_t*m,uint32_t nc,uint32_t nt,uint32_t start,uint32_t ratio,uint32_t mu,uint32_t tb,uint32_t cache_mode,bool ord){
     assert(cache_mode==expected_cache_mode);
     return myds_v41_gpu_indexer_prefill_compact_scoped(s,ids,q,w,k,m,nc,nt,start,ratio,mu,tb,ord);
+}
+int myds_v41_gpu_indexer_prefill_compact_scoped_mode_qbf16(myds_v41_gpu_scratch_t*s,myds_metal_buffer_t*ids,const myds_metal_buffer_t*q,const myds_metal_buffer_t*q_bf16,const myds_metal_buffer_t*w,const myds_metal_buffer_t*k,const myds_metal_buffer_t*m,uint32_t nc,uint32_t nt,uint32_t start,uint32_t ratio,uint32_t mu,uint32_t tb,uint32_t cache_mode,bool ord){
+    assert(q_bf16!=NULL&&q_bf16->size==(size_t)nt*32u*128u*2u);
+    wide_compact_calls++;
+    return myds_v41_gpu_indexer_prefill_compact_scoped_mode(s,ids,q,w,k,m,nc,nt,start,ratio,mu,tb,cache_mode,ord);
 }
 int main(void) {
     myds_context_t ctx={0};myds_v41_context_t g={0};ctx.v41=&g;int opaque;g.gpu=(void*)&opaque;
@@ -162,5 +175,20 @@ int main(void) {
     assert(publish_indexer_chunk(&ctx,24,0,2048,129024,&q,&w,&selected,2048,&mask,65536,true,&qv,&wv,&sv,&mv)==1);
     assert(rope_calls==1&&compact_calls==4&&sum_compact_nt==2048u&&!scoped_calls);
 
-    puts("{\"actual_publisher_scorer_failure_is_minus1\":true,\"trace_scope_forwarded\":true,\"no_repeat_rope_or_consumers\":true,\"p_i1_gt_512k_no_fallback\":true,\"p_l1_publisher_verified\":true,\"p_t1_publisher_verified\":true,\"fp4_publisher_verified\":true,\"gpu_work\":false}");return 0;
+    /* [CAND-I1] Verify wide_mode=1 forwards disjoint q_bf16 views through L20 root and L24 compact, and invalid wide_mode=-1 fails closed. */
+    struct myds_metal_buffer q_bf16={2048u*8192u}, qbv={0};
+    stub_wide_mode=-1;
+    assert(publish_indexer_chunk_ex(&ctx,20,0,2048,129024,&q,&q_bf16,&w,&selected,2048,&mask,65536,true,&qv,&qbv,&wv,&sv,&mv)==-1);
+    stub_wide_mode=1;
+    rope_calls=scoped_calls=after_scorer_calls=l20_compact_calls=compact_calls=wide_iro_calls=wide_compact_calls=0;
+    sum_scoped_nt=0;min_scoped_nt=UINT32_MAX;max_scoped_nt=0;
+    assert(publish_indexer_chunk_ex(&ctx,20,0,2048,129024,&q,&q_bf16,&w,&selected,2048,&mask,65536,true,&qv,&qbv,&wv,&sv,&mv)==1);
+    assert(rope_calls==1&&wide_iro_calls==scoped_calls&&wide_iro_calls>0&&sum_scoped_nt==2048u);
+    rope_calls=scoped_calls=after_scorer_calls=compact_calls=wide_iro_calls=wide_compact_calls=0;
+    sum_compact_nt=0;min_compact_nt=UINT32_MAX;max_compact_nt=0;compact_ret=1;
+    assert(publish_indexer_chunk_ex(&ctx,24,0,2048,129024,&q,&q_bf16,&w,&selected,2048,&mask,65536,true,&qv,&qbv,&wv,&sv,&mv)==1);
+    assert(rope_calls==1&&wide_compact_calls==4&&compact_calls==4&&sum_compact_nt==2048u&&!scoped_calls);
+    stub_wide_mode=0;
+
+    puts("{\"actual_publisher_scorer_failure_is_minus1\":true,\"trace_scope_forwarded\":true,\"no_repeat_rope_or_consumers\":true,\"p_i1_gt_512k_no_fallback\":true,\"p_l1_publisher_verified\":true,\"p_t1_publisher_verified\":true,\"fp4_publisher_verified\":true,\"wide_publisher_verified\":true,\"gpu_work\":false}");return 0;
 }

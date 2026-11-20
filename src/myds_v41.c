@@ -4022,15 +4022,19 @@ static uint32_t indexer_group_len(uint32_t c_len, uint32_t off, uint32_t base_po
  *
  * 返回值：1 = 已批量完成；0 = 前提不满足（调用方回退到逐 token，此时【未做任何修改】）；
  *        -1 = 已经开始 dispatch 后失败（rope/quant 是原地改写，不能回退重复做）——致命。 */
-static int publish_indexer_chunk(myds_context_t *ctx, uint32_t il, uint32_t c_start, uint32_t c_len,
-                                 uint32_t base_pos, myds_metal_buffer_t *index_q_buf,
-                                 const myds_metal_buffer_t *index_weights_buf,
-                                 myds_metal_buffer_t *prompt_selected, size_t sel_bytes,
-                                 myds_metal_buffer_t *prompt_block_mask, size_t mask_bytes,
-                                 bool mask_bits,
-                                 myds_metal_buffer_t *q_view, myds_metal_buffer_t *w_view,
-                                 myds_metal_buffer_t *sel_view, myds_metal_buffer_t *mask_view) {
+static int publish_indexer_chunk_ex(myds_context_t *ctx, uint32_t il, uint32_t c_start, uint32_t c_len,
+                                    uint32_t base_pos, myds_metal_buffer_t *index_q_buf,
+                                    myds_metal_buffer_t *index_q_bf16_buf,
+                                    const myds_metal_buffer_t *index_weights_buf,
+                                    myds_metal_buffer_t *prompt_selected, size_t sel_bytes,
+                                    myds_metal_buffer_t *prompt_block_mask, size_t mask_bytes,
+                                    bool mask_bits,
+                                    myds_metal_buffer_t *q_view, myds_metal_buffer_t *q_bf16_view,
+                                    myds_metal_buffer_t *w_view,
+                                    myds_metal_buffer_t *sel_view, myds_metal_buffer_t *mask_view) {
     myds_v41_context_t *g=ctx->v41;
+    const int wide_mode = myds_v41_gpu_indexer_prefill_wide_enabled();
+    if (wide_mode < 0) return -1;
     const uint32_t ratio=ratio_for(il), owner=owner_for(il);
     const uint32_t mask_stride=(uint32_t)(mask_bytes/4u);
     const uint32_t batch_floats=myds_v41_gpu_indexer_batch_floats(g->gpu);
@@ -4088,9 +4092,24 @@ static int publish_indexer_chunk(myds_context_t *ctx, uint32_t il, uint32_t c_st
         rope_q_buf = q_view;
     }
     /* 1) index_q 的 rope + quant：逐 token 版本在 publish_and_select 里逐行做，参数
-     *    完全相同（start_pos = 该位置、heads = 32、width = 128、compressed = true）。 */
-    if (!myds_v41_gpu_indexer_rope_quant_batch(rope_q_buf, NULL, 0, V41_INDEX_HEADS,
-                                               base_pos + c_start, c_len, 1u, true)) {
+     *    完全相同（start_pos = 该位置、heads = 32、width = 128、compressed = true）。
+     *    [CAND-I1] MYDS_INDEXER_PREFILL_WIDE=1 时在同一次 kernel pass 里额外写出
+     *    packed BF16 Q 到独立的 index_q_bf16_buf（零额外 VRAM，复用于 attn_heads_buf
+     *    正交区段），保留 FP32 index_q_buf 完好无损，确保所有 fallback 路径零损坏。 */
+    bool want_q_bf16 = (wide_mode == 1 && index_q_bf16_buf != NULL && q_bf16_view != NULL &&
+                        myds_metal_buffer_size(index_q_bf16_buf) >=
+                            (size_t)(input_skip + c_len) * V41_INDEX_HEADS * 128u * sizeof(uint16_t));
+#ifdef MYDS_INDEXER_CAPTURE
+    want_q_bf16 = false;
+#endif
+    bool has_q_bf16 = false;
+    if (myds_v41_gpu_indexer_rope_quant_batch(
+            rope_q_buf,
+            want_q_bf16 ? index_q_bf16_buf : NULL,
+            want_q_bf16 ? (size_t)input_skip * V41_INDEX_HEADS * 128u : 0u,
+            V41_INDEX_HEADS, base_pos + c_start, c_len, 1u, true)) {
+        has_q_bf16 = want_q_bf16;
+    } else {
         if (!myds_v41_gpu_rope_batch(rope_q_buf,128,V41_INDEX_HEADS,base_pos + c_start,c_len,true,false)) return -1;
         if (!myds_v41_gpu_quant(rope_q_buf,128,V41_INDEX_HEADS*c_len,2)) return -1;
     }
@@ -4116,6 +4135,9 @@ static int publish_indexer_chunk(myds_context_t *ctx, uint32_t il, uint32_t c_st
             if (!myds_metal_buffer_update_sub_view(q_view,index_q_buf,
                     (size_t)(input_skip+off)*V41_INDEX_HEADS*128u*sizeof(float),
                     (size_t)c_glen*V41_INDEX_HEADS*128u*sizeof(float)) ||
+                (has_q_bf16 && !myds_metal_buffer_update_sub_view(q_bf16_view,index_q_bf16_buf,
+                    (size_t)(input_skip+off)*V41_INDEX_HEADS*128u*sizeof(uint16_t),
+                    (size_t)c_glen*V41_INDEX_HEADS*128u*sizeof(uint16_t))) ||
                 !myds_metal_buffer_update_sub_view(w_view,index_weights_buf,
                     (size_t)(input_skip+off)*V41_INDEX_HEADS*sizeof(float),
                     (size_t)c_glen*V41_INDEX_HEADS*sizeof(float)) ||
@@ -4123,10 +4145,15 @@ static int publish_indexer_chunk(myds_context_t *ctx, uint32_t il, uint32_t c_st
                     (size_t)(c_start+off)*sel_bytes,(size_t)c_glen*sel_bytes) ||
                 !myds_metal_buffer_update_sub_view(mask_view,prompt_block_mask,
                     (size_t)(c_start+off)*mask_bytes,(size_t)c_glen*mask_bytes)) return -1;
-            const int crc = myds_v41_gpu_indexer_prefill_compact_scoped_mode(
-                g->gpu, sel_view, q_view, w_view, g->index_cache[owner], mask_view,
-                c_nc, c_glen, g_start_cand, ratio, c_mask_units, compact_top_blocks,
-                idx_mode, !myds_trace_active());
+            const int crc = has_q_bf16
+                ? myds_v41_gpu_indexer_prefill_compact_scoped_mode_qbf16(
+                      g->gpu, sel_view, q_view, q_bf16_view, w_view, g->index_cache[owner], mask_view,
+                      c_nc, c_glen, g_start_cand, ratio, c_mask_units, compact_top_blocks,
+                      idx_mode, !myds_trace_active())
+                : myds_v41_gpu_indexer_prefill_compact_scoped_mode(
+                      g->gpu, sel_view, q_view, w_view, g->index_cache[owner], mask_view,
+                      c_nc, c_glen, g_start_cand, ratio, c_mask_units, compact_top_blocks,
+                      idx_mode, !myds_trace_active());
             if (crc < 0) return -1;
             if (crc > 0) {
                 off += c_glen;
@@ -4146,6 +4173,9 @@ static int publish_indexer_chunk(myds_context_t *ctx, uint32_t il, uint32_t c_st
         if (!myds_metal_buffer_update_sub_view(q_view,index_q_buf,
                 (size_t)(input_skip+off)*V41_INDEX_HEADS*128u*sizeof(float),
                 (size_t)glen*V41_INDEX_HEADS*128u*sizeof(float)) ||
+            (has_q_bf16 && !myds_metal_buffer_update_sub_view(q_bf16_view,index_q_bf16_buf,
+                (size_t)(input_skip+off)*V41_INDEX_HEADS*128u*sizeof(uint16_t),
+                (size_t)glen*V41_INDEX_HEADS*128u*sizeof(uint16_t))) ||
             !myds_metal_buffer_update_sub_view(w_view,index_weights_buf,
                 (size_t)(input_skip+off)*V41_INDEX_HEADS*sizeof(float),
                 (size_t)glen*V41_INDEX_HEADS*sizeof(float)) ||
@@ -4158,8 +4188,13 @@ static int publish_indexer_chunk(myds_context_t *ctx, uint32_t il, uint32_t c_st
         extern void myds_indexer_capture_set_group(uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
         myds_indexer_capture_set_group(il,base_pos,c_start,c_len,off,batch_floats);
 #endif
-        if (!myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped_mode(g->gpu,scores_buf,q_view,w_view,g->index_cache[owner],
-                nc,V41_INDEX_HEADS,glen,g_start,ratio,idx_mode,!myds_trace_active())) return -1;
+        if (!(has_q_bf16
+                ? myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped_mode_qbf16(
+                      g->gpu,scores_buf,q_view,q_bf16_view,w_view,g->index_cache[owner],
+                      nc,V41_INDEX_HEADS,glen,g_start,ratio,idx_mode,!myds_trace_active())
+                : myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped_mode(
+                      g->gpu,scores_buf,q_view,w_view,g->index_cache[owner],
+                      nc,V41_INDEX_HEADS,glen,g_start,ratio,idx_mode,!myds_trace_active()))) return -1;
         if (il==20) {
             /* 块掩码：只要本行的块【全部被选中】，掩码前缀就与逐 token 一致
              * （前 blocks_t 列先清成不可见、再被 scatter 打开）。这里 nc ≤ 16384
@@ -4210,6 +4245,20 @@ static int publish_indexer_chunk(myds_context_t *ctx, uint32_t il, uint32_t c_st
         off+=glen;
     }
     return 1;
+}
+
+static __attribute__((unused)) int publish_indexer_chunk(myds_context_t *ctx, uint32_t il, uint32_t c_start, uint32_t c_len,
+                                 uint32_t base_pos, myds_metal_buffer_t *index_q_buf,
+                                 const myds_metal_buffer_t *index_weights_buf,
+                                 myds_metal_buffer_t *prompt_selected, size_t sel_bytes,
+                                 myds_metal_buffer_t *prompt_block_mask, size_t mask_bytes,
+                                 bool mask_bits,
+                                 myds_metal_buffer_t *q_view, myds_metal_buffer_t *w_view,
+                                 myds_metal_buffer_t *sel_view, myds_metal_buffer_t *mask_view) {
+    return publish_indexer_chunk_ex(ctx, il, c_start, c_len, base_pos, index_q_buf, NULL,
+                                    index_weights_buf, prompt_selected, sel_bytes,
+                                    prompt_block_mask, mask_bytes, mask_bits,
+                                    q_view, NULL, w_view, sel_view, mask_view);
 }
 
 static inline bool check_logits_finite(const float *logits, uint32_t n) {
@@ -7082,6 +7131,7 @@ struct v41_chunk_workspace_s {
     myds_metal_buffer_t *comp_latent_buf;
     myds_metal_buffer_t *comp_index_k_buf;
     myds_metal_buffer_t *index_q_buf;
+    myds_metal_buffer_t *index_q_bf16_buf;
     myds_metal_buffer_t *index_weights_buf;
     myds_metal_buffer_t *moe_gate_buf;
     myds_metal_buffer_t *moe_up_buf;
@@ -7144,6 +7194,7 @@ struct v41_chunk_workspace_s {
     myds_metal_buffer_t *cur_mask_view;
     /* 批量 indexer 用的分组视图（整 chunk 缓冲 / 提示缓冲按子组切片） */
     myds_metal_buffer_t *cur_index_q_view;
+    myds_metal_buffer_t *cur_index_q_bf16_view;
     myds_metal_buffer_t *cur_index_weights_view;
     myds_metal_buffer_t *moe_view;
     myds_metal_buffer_t *shared_view;
@@ -7244,6 +7295,7 @@ static void v41_chunk_workspace_free(v41_chunk_workspace_t *cw) {
     if (cw->comp_latent_buf) myds_metal_buffer_free(cw->comp_latent_buf);
     if (cw->comp_index_k_buf) myds_metal_buffer_free(cw->comp_index_k_buf);
     if (cw->index_q_buf) myds_metal_buffer_free(cw->index_q_buf);
+    if (cw->index_q_bf16_buf) myds_metal_buffer_free(cw->index_q_bf16_buf);
     if (cw->index_weights_buf) myds_metal_buffer_free(cw->index_weights_buf);
     if (cw->moe_gate_buf) myds_metal_buffer_free(cw->moe_gate_buf);
     if (cw->moe_up_buf) myds_metal_buffer_free(cw->moe_up_buf);
@@ -7259,6 +7311,7 @@ static void v41_chunk_workspace_free(v41_chunk_workspace_t *cw) {
     if (cw->cur_selected_view) myds_metal_buffer_free(cw->cur_selected_view);
     if (cw->cur_mask_view) myds_metal_buffer_free(cw->cur_mask_view);
     if (cw->cur_index_q_view) myds_metal_buffer_free(cw->cur_index_q_view);
+    if (cw->cur_index_q_bf16_view) myds_metal_buffer_free(cw->cur_index_q_bf16_view);
     if (cw->cur_index_weights_view) myds_metal_buffer_free(cw->cur_index_weights_view);
     if (cw->moe_view) myds_metal_buffer_free(cw->moe_view);
     if (cw->shared_view) myds_metal_buffer_free(cw->shared_view);
@@ -7336,10 +7389,18 @@ static v41_chunk_workspace_t *v41_chunk_workspace_create(uint32_t capacity, uint
     ALLOC_BUF(pool_score_buf, C * 512 * sizeof(float));
     ALLOC_BUF(comp_latent_buf, C * 512 * sizeof(float));
     ALLOC_BUF(comp_index_k_buf, C * 128 * sizeof(float));
-    /* 复用注意力输出缓冲：attn_heads_buf (C*32768*4) 在 indexer 完成后才由 attention_chunk 写入，
-     * 生命周期与 index_q_buf (C*4096*4) 完全正交，直接作为 sub_view 复用，省去 32 MiB 独占显存。 */
+    /* 复用注意力输出缓冲：attn_heads_buf (C*32768*4 = 256 MiB) 在 indexer 完成后才由 attention_chunk 写入，
+     * 生命周期与 index_q_buf (C*4096*4 = 32 MiB) 及 index_q_bf16_buf (C*4096*2 = 16 MiB) 完全正交，
+     * 两者作为互不重叠的 sub_view 复用（[0..32MiB) 与 [32..48MiB)），省去 48 MiB 独占显存且保证 fallback 零损坏。 */
+    _Static_assert((size_t)V41_INDEX_HEADS * 128u * (sizeof(float) + sizeof(uint16_t)) <=
+                   (size_t)V41_HEADS * 512u * sizeof(float),
+                   "attn_heads_buf must fit disjoint FP32 + BF16 index_q views");
     cw->index_q_buf = myds_metal_buffer_sub_view(cw->attn_heads_buf, 0, C * V41_INDEX_HEADS * 128 * sizeof(float));
-    if (!cw->index_q_buf) goto fail;
+    cw->index_q_bf16_buf = myds_metal_buffer_sub_view(
+        cw->attn_heads_buf,
+        C * V41_INDEX_HEADS * 128 * sizeof(float),
+        C * V41_INDEX_HEADS * 128 * sizeof(uint16_t));
+    if (!cw->index_q_buf || !cw->index_q_bf16_buf) goto fail;
     ALLOC_BUF(index_weights_buf, C * V41_INDEX_HEADS * sizeof(float));
     ALLOC_BUF(moe_gate_buf, B * 6 * exp_dim * sizeof(float));
     ALLOC_BUF(moe_up_buf, B * 6 * exp_dim * sizeof(float));
@@ -7440,6 +7501,7 @@ static v41_chunk_workspace_t *v41_chunk_workspace_create(uint32_t capacity, uint
     cw->cur_selected_view = myds_metal_buffer_create_view();
     cw->cur_mask_view = myds_metal_buffer_create_view();
     cw->cur_index_q_view = myds_metal_buffer_create_view();
+    cw->cur_index_q_bf16_view = myds_metal_buffer_create_view();
     cw->cur_index_weights_view = myds_metal_buffer_create_view();
     cw->moe_view = myds_metal_buffer_create_view();
     cw->shared_view = myds_metal_buffer_create_view();
@@ -7454,7 +7516,7 @@ static v41_chunk_workspace_t *v41_chunk_workspace_create(uint32_t capacity, uint
     cw->in_weights_view = myds_metal_buffer_create_view();
     if (!cw->cur_res_view || !cw->cur_pre_view || !cw->cur_engram_view[0] || !cw->cur_engram_view[1] ||
         !cw->cur_selected_view || !cw->cur_mask_view ||
-        !cw->cur_index_q_view || !cw->cur_index_weights_view ||
+        !cw->cur_index_q_view || !cw->cur_index_q_bf16_view || !cw->cur_index_weights_view ||
         !cw->moe_view || !cw->shared_view || !cw->after_view || !cw->split_view || !cw->epilogue_res_view ||
         !cw->in_after_view || !cw->in_norm_view || !cw->in_split_view ||
         !cw->in_shared_view || !cw->in_ids_view || !cw->in_weights_view) goto fail;
@@ -8721,10 +8783,12 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 if (index_source(il) && !kv_only) {
                     int batched = 0;
                     if (!opt_idx_per_token) {
-                        batched = publish_indexer_chunk(ctx, il, c_start, c_len, mb_base_pos,
-                            cw->index_q_buf, cw->index_weights_buf, prompt_selected, sel_bytes,
+                        batched = publish_indexer_chunk_ex(ctx, il, c_start, c_len, mb_base_pos,
+                            cw->index_q_buf, cw->index_q_bf16_buf,
+                            cw->index_weights_buf, prompt_selected, sel_bytes,
                             prompt_block_mask, mask_bytes, mask_bits_mode != 0,
-                            cw->cur_index_q_view, cw->cur_index_weights_view,
+                            cw->cur_index_q_view, cw->cur_index_q_bf16_view,
+                            cw->cur_index_weights_view,
                             cw->cur_selected_view, cw->cur_mask_view);
                         if (batched < 0) {
                             MYDS_LOG_E("V4.1 chunk indexer failed mid-flight (layer %u chunk %u)", il, c_start);

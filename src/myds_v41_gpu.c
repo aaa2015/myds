@@ -306,6 +306,26 @@ void myds_v41_gpu_suffix_shrink_final_mb_counters(
     }
     if (out) *out = (myds_v41_gpu_suffix_shrink_final_mb_counters_t){v[0], v[1], v[2], v[3]};
 }
+enum { IPW_IRO_WIDE_ENCODED, IPW_COMPACT_WIDE_ENCODED, IPW_FALLBACKS, IPW_COUNT };
+static _Atomic uint64_t indexer_prefill_wide_cnt[IPW_COUNT];
+int myds_v41_gpu_indexer_prefill_wide_enabled(void) {
+    const char *v=getenv("MYDS_INDEXER_PREFILL_WIDE");
+    if(!v||!strcmp(v,"0"))return 0;
+    if(!strcmp(v,"1"))return 1;
+    MYDS_LOG_E("MYDS_INDEXER_PREFILL_WIDE must be exactly absent, 0 or 1");
+    return -1;
+}
+void myds_v41_gpu_indexer_prefill_wide_counters(
+    myds_v41_gpu_indexer_prefill_wide_counters_t *out, bool reset) {
+    uint64_t v[IPW_COUNT];
+    for(unsigned i=0;i<IPW_COUNT;++i) {
+        v[i]=reset?atomic_exchange_explicit(&indexer_prefill_wide_cnt[i],0u,memory_order_relaxed)
+                  :atomic_load_explicit(&indexer_prefill_wide_cnt[i],memory_order_relaxed);
+    }
+    if(out)*out=(myds_v41_gpu_indexer_prefill_wide_counters_t){
+        v[IPW_IRO_WIDE_ENCODED],v[IPW_COMPACT_WIDE_ENCODED],v[IPW_FALLBACKS]
+    };
+}
 uint32_t myds_v41_gpu_indexer_key_cache_mode(void) {
     return myds_v41_gpu_indexer_key_fp4_enabled()==1
         ? MYDS_INDEXER_CACHE_FP4 : MYDS_INDEXER_CACHE_BF16;
@@ -377,6 +397,7 @@ size_t myds_v41_gpu_chunk_workspace_bytes(const myds_v41_gpu_scratch_t *s) {
 }
 myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp) {
     if (myds_v41_gpu_indexer_register_only_enabled()<0 ||
+        myds_v41_gpu_indexer_prefill_wide_enabled()<0 ||
         myds_v41_gpu_indexer_key_fp4_enabled()<0 ||
         myds_v41_gpu_indexer_decode_mma_enabled()<0 ||
         myds_v41_gpu_suffix_shrink_final_mb_only_enabled()<0 ||
@@ -1680,19 +1701,24 @@ _Static_assert(offsetof(struct indexer_register_only_args,n_comp)==0u &&
                offsetof(struct indexer_register_only_args,index_row_stride)==48u &&
                offsetof(struct indexer_register_only_args,score_token_stride)==56u &&
                offsetof(struct indexer_register_only_args,scale)==64u,"register-only original tiled offsets");
-int myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped_mode(
+int myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped_mode_qbf16(
     myds_v41_gpu_scratch_t *scratch,myds_metal_buffer_t *scores,
-    const myds_metal_buffer_t *q,const myds_metal_buffer_t *weights,
-    const myds_metal_buffer_t *cache,uint32_t n_comp,uint32_t n_heads,
-    uint32_t n_tokens,uint32_t causal_start,uint32_t causal_ratio,
-    uint32_t cache_mode,bool ordinary_prefill_allowed) {
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *q_bf16,
+    const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,
+    uint32_t n_comp,uint32_t n_heads,uint32_t n_tokens,
+    uint32_t causal_start,uint32_t causal_ratio,uint32_t cache_mode,
+    bool ordinary_prefill_allowed) {
     gathered_cache_invalidate(scratch);
     atomic_fetch_add_explicit(&indexer_register_only_counters[IRO_REQUESTS],1u,memory_order_relaxed);
     const int mode=myds_v41_gpu_indexer_register_only_enabled();
-    if(mode<0)return indexer_register_only_failure("invalid configuration");
-    if(!mode||!ordinary_prefill_allowed)
+    const int wide_mode=myds_v41_gpu_indexer_prefill_wide_enabled();
+    if(mode<0||wide_mode<0)return indexer_register_only_failure("invalid configuration");
+    if(!mode||!ordinary_prefill_allowed) {
+        if(wide_mode==1&&ordinary_prefill_allowed)
+            atomic_fetch_add_explicit(&indexer_prefill_wide_cnt[IPW_FALLBACKS],1u,memory_order_relaxed);
         return indexscores_chunk_mode(scores,q,weights,cache,n_comp,n_heads,n_tokens,
                                       causal_start,causal_ratio,cache_mode);
+    }
     const uint64_t end=(uint64_t)causal_start+n_tokens;
     const char *sgbar=getenv("MYDS_INDEXER_SGBAR");
     _Static_assert(MYDS_CHUNK_MAXC==2048u,"sync shader args.n_tokens<=2048u guard");
@@ -1701,15 +1727,21 @@ int myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped_mode(
        (causal_ratio!=1u&&causal_ratio!=2u)||n_comp<=512u||n_comp>1048576u||n_tokens<8u||
        n_tokens>MYDS_CHUNK_MAXC||end>1048576u||!myds_metal_batch_active()||
        myds_metal_kprof_exclusive()||indexer_key_window()||
-       (sgbar&&strcmp(sgbar,"0")!=0))
+       (sgbar&&strcmp(sgbar,"0")!=0)) {
+        if(wide_mode==1)
+            atomic_fetch_add_explicit(&indexer_prefill_wide_cnt[IPW_FALLBACKS],1u,memory_order_relaxed);
         return indexscores_chunk_mode(scores,q,weights,cache,n_comp,n_heads,n_tokens,
                                       causal_start,causal_ratio,cache_mode);
+    }
     if(!scratch||n_comp>scratch->max_comp||n_comp>scratch->key_comp_max||
        !scratch->batch_floats||(uint64_t)n_comp*n_tokens>scratch->batch_floats||
-       n_comp!=end/causal_ratio||(uint64_t)causal_start+1u<causal_ratio)
+       n_comp!=end/causal_ratio||(uint64_t)causal_start+1u<causal_ratio) {
+        if(wide_mode==1)
+            atomic_fetch_add_explicit(&indexer_prefill_wide_cnt[IPW_FALLBACKS],1u,memory_order_relaxed);
         return indexer_register_only_fallback_mode(scores,q,weights,cache,n_comp,n_heads,n_tokens,
                                                    causal_start,causal_ratio,cache_mode,
                                                    "ordinary group bounds/budget/causal tuple");
+    }
     const uint64_t row_bytes=myds_v41_indexer_cache_mode_row_bytes(cache_mode);
     const size_t cache_align=cache_mode==MYDS_INDEXER_CACHE_BF16?2u:4u;
     const uint64_t score_bytes=(uint64_t)n_comp*n_tokens*4u;
@@ -1723,14 +1755,51 @@ int myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped_mode(
        !myds_metal_buffer_native_range(cache,cache_bytes,cache_align)||
        buffer_ranges_overlap(scores,(size_t)score_bytes,q,(size_t)q_bytes)||
        buffer_ranges_overlap(scores,(size_t)score_bytes,weights,(size_t)w_bytes)||
-       buffer_ranges_overlap(scores,(size_t)score_bytes,cache,(size_t)cache_bytes))
+       buffer_ranges_overlap(scores,(size_t)score_bytes,cache,(size_t)cache_bytes)) {
+        if(wide_mode==1)
+            atomic_fetch_add_explicit(&indexer_prefill_wide_cnt[IPW_FALLBACKS],1u,memory_order_relaxed);
         return indexer_register_only_fallback_mode(scores,q,weights,cache,n_comp,n_heads,n_tokens,
                                                    causal_start,causal_ratio,cache_mode,
                                                    "complete native ranges/alignment/writer alias");
-    const uint32_t threads[]={32u,4u,1u};
-    const size_t smem=0u;
+    }
     const char *selected=myds_v41_gpu_indexer_register_only_selected_kernel_mode(cache_mode);
     if(!selected)return indexer_register_only_failure("invalid MYDS_INDEXER_RO_SMEM_Q configuration");
+    if(wide_mode==1) {
+        const int sq=indexer_register_only_smem_q_selected();
+        const uint64_t q_bf16_bytes=(uint64_t)n_tokens*32u*128u*2u;
+        const uint32_t tiles8=(n_tokens+7u)/8u;
+        const bool use_m16=(tiles8>=2u&&((tiles8&1u)==0u||tiles8>5u));
+        const char *wide_kernel=(cache_mode==MYDS_INDEXER_CACHE_FP4)
+            ? (use_m16?"kernel_myds_indexer_scores_register_only_fp4_wide"
+                      :"kernel_myds_indexer_scores_register_only_fp4_wide_m8")
+            : (use_m16?"kernel_myds_indexer_scores_register_only_bf16_wide"
+                      :"kernel_myds_indexer_scores_register_only_bf16_wide_m8");
+        const uint32_t threads_wide[]={32u,8u,1u};
+        if(sq==1&&q_bf16&&q_bf16_bytes<=SIZE_MAX&&
+           myds_metal_buffer_native_range(q_bf16,q_bf16_bytes,8u)&&
+           !buffer_ranges_overlap(scores,(size_t)score_bytes,q_bf16,(size_t)q_bf16_bytes)&&
+           myds_metal_kernel_constants_preflight(wide_kernel,threads_wide,0u,NULL,0u)) {
+            struct indexer_register_only_args wa;
+            memset(&wa,0,sizeof(wa));
+            wa.n_comp=n_comp;wa.n_tokens=n_tokens;wa.n_head=32u;wa.head_dim=128u;
+            wa.pos0=causal_start;wa.ratio=causal_ratio;
+            wa.q_token_stride=32u*128u*2u;wa.q_head_stride=128u*2u;
+            wa.weights_token_stride=32u*4u;wa.index_row_stride=row_bytes;
+            wa.score_token_stride=(uint64_t)n_comp*4u;wa.scale=1.0f/64.0f;
+            const myds_metal_buffer_t *wb[]={q_bf16,weights,cache,scores};
+            const uint32_t wy=use_m16?(n_tokens+15u)/16u:(n_tokens+7u)/8u;
+            if(dispatch(wide_kernel,&wa,sizeof(wa),wb,4u,(n_comp+63u)/64u,wy,1u,
+                        32u,8u,1u,0u)) {
+                atomic_fetch_add_explicit(&indexer_register_only_counters[IRO_ENCODED],1u,memory_order_relaxed);
+                atomic_fetch_add_explicit(&indexer_register_only_counters[IRO_BF16],1u,memory_order_relaxed);
+                atomic_fetch_add_explicit(&indexer_prefill_wide_cnt[IPW_IRO_WIDE_ENCODED],1u,memory_order_relaxed);
+                return 1;
+            }
+        }
+        atomic_fetch_add_explicit(&indexer_prefill_wide_cnt[IPW_FALLBACKS],1u,memory_order_relaxed);
+    }
+    const uint32_t threads[]={32u,4u,1u};
+    const size_t smem=0u;
     if(!myds_metal_kernel_constants_preflight(selected,threads,smem,NULL,0u))
         return indexer_register_only_fallback_mode(scores,q,weights,cache,n_comp,n_heads,n_tokens,
                                                    causal_start,causal_ratio,cache_mode,selected);
@@ -1750,6 +1819,16 @@ int myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped_mode(
     atomic_fetch_add_explicit(&indexer_register_only_counters[IRO_ENCODED],1u,memory_order_relaxed);
     atomic_fetch_add_explicit(&indexer_register_only_counters[IRO_BF16],1u,memory_order_relaxed);
     return 1;
+}
+int myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped_mode(
+    myds_v41_gpu_scratch_t *scratch,myds_metal_buffer_t *scores,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *cache,uint32_t n_comp,uint32_t n_heads,
+    uint32_t n_tokens,uint32_t causal_start,uint32_t causal_ratio,
+    uint32_t cache_mode,bool ordinary_prefill_allowed) {
+    return myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped_mode_qbf16(
+        scratch,scores,q,NULL,weights,cache,n_comp,n_heads,n_tokens,
+        causal_start,causal_ratio,cache_mode,ordinary_prefill_allowed);
 }
 int myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped(
     myds_v41_gpu_scratch_t *scratch,myds_metal_buffer_t *scores,
@@ -1849,13 +1928,17 @@ static const char *prefill_compact_selected_score_kernel(uint32_t cache_mode) {
     return NULL;
 }
 
-int myds_v41_gpu_indexer_prefill_compact_mode(
+static int prefill_compact_mode_qbf16_internal(
     myds_v41_gpu_scratch_t *s, myds_metal_buffer_t *ids,
-    const myds_metal_buffer_t *q, const myds_metal_buffer_t *weights,
-    const myds_metal_buffer_t *cache, const myds_metal_buffer_t *mask_bits,
-    uint32_t n_comp, uint32_t n_tokens, uint32_t causal_start,
-    uint32_t causal_ratio, uint32_t mask_units, uint32_t cache_mode) {
+    const myds_metal_buffer_t *q, const myds_metal_buffer_t *q_bf16,
+    const myds_metal_buffer_t *weights, const myds_metal_buffer_t *cache,
+    const myds_metal_buffer_t *mask_bits, uint32_t n_comp, uint32_t n_tokens,
+    uint32_t causal_start, uint32_t causal_ratio, uint32_t mask_units,
+    uint32_t cache_mode, bool *used_wide_out) {
+    if (used_wide_out) *used_wide_out = false;
     gathered_cache_invalidate(s);
+    const int wide_mode = myds_v41_gpu_indexer_prefill_wide_enabled();
+    if (wide_mode < 0) return -1;
     if (indexer_prefill_compact_test_unavailable) return 0;
     if (cache_mode != MYDS_INDEXER_CACHE_BF16 && cache_mode != MYDS_INDEXER_CACHE_FP4) return 0;
     const uint32_t max_glen = myds_v41_gpu_indexer_prefill_compact_max_glen(s);
@@ -1917,11 +2000,31 @@ int myds_v41_gpu_indexer_prefill_compact_mode(
     }
 
     const uint32_t th_1024[] = {1024u, 1u, 1u};
-    const uint32_t th_score[] = {32u, 4u, 1u};
+    const uint32_t th_score_4[] = {32u, 4u, 1u};
+    const uint32_t th_score_8[] = {32u, 8u, 1u};
     const uint32_t th_512[] = {512u, 1u, 1u};
+
+    bool use_wide = false;
+    const char *active_score_kernel = score_kernel;
+    if (wide_mode == 1 && q_bf16) {
+        const int sq = indexer_register_only_smem_q_selected();
+        const uint64_t q_bf16_bytes = (uint64_t)n_tokens * 32u * 128u * sizeof(uint16_t);
+        const char *wide_kernel = (cache_mode == MYDS_INDEXER_CACHE_FP4)
+            ? "kernel_myds_indexer_scores_prefill_compact_ro_fp4_wide"
+            : "kernel_myds_indexer_scores_prefill_compact_ro_bf16_wide";
+        if (sq == 1 && q_bf16_bytes <= SIZE_MAX &&
+            myds_metal_buffer_native_range(q_bf16, q_bf16_bytes, 8u) &&
+            !buffer_ranges_overlap(ids, (size_t)ids_bytes, q_bf16, (size_t)q_bf16_bytes) &&
+            !buffer_ranges_overlap(s->chunk_scores, (size_t)compact_score_bytes, q_bf16, (size_t)q_bf16_bytes) &&
+            myds_metal_kernel_constants_preflight(wide_kernel, th_score_8, 0u, NULL, 0u)) {
+            use_wide = true;
+            active_score_kernel = wide_kernel;
+        }
+    }
+
     if (myds_metal_kernel_max_threads("kernel_argsort_f32_i32_desc_causal") != 1024u ||
         !myds_metal_kernel_constants_preflight("kernel_myds_indexer_prefill_compact_prep", th_1024, 0u, NULL, 0u) ||
-        !myds_metal_kernel_constants_preflight(score_kernel, th_score, 0u, NULL, 0u) ||
+        (!use_wide && !myds_metal_kernel_constants_preflight(score_kernel, th_score_4, 0u, NULL, 0u)) ||
         !myds_metal_kernel_constants_preflight("kernel_myds_prefill_compact_topk_stage1", th_512, 0u, NULL, 0u) ||
         !myds_metal_kernel_constants_preflight("kernel_myds_prefill_compact_topk_stage2", th_512, 0u, NULL, 0u) ||
         !myds_metal_kernel_constants_preflight("kernel_myds_prefill_compact_topk_final", th_1024, 0u, NULL, 0u)) {
@@ -1942,9 +2045,10 @@ int myds_v41_gpu_indexer_prefill_compact_mode(
         return 0;
     }
 
+    const myds_metal_buffer_t *q_score = use_wide ? q_bf16 : q;
     if (!myds_metal_get_auto_barrier()) {
         const myds_metal_buffer_t *score_deps[] = {
-            q, weights, cache, s->chunk_block_sel, s->chunk_blocks, s->chunk_scores
+            q_score, weights, cache, s->chunk_block_sel, s->chunk_blocks, s->chunk_scores
         };
         myds_metal_barrier_buffers(score_deps, 6u);
     }
@@ -1953,17 +2057,18 @@ int myds_v41_gpu_indexer_prefill_compact_mode(
         .pos0 = causal_start, .ratio = causal_ratio, .u_stride = u_stride,
         .union_blk_off = union_blk_off, .union_cnt_off = union_cnt_off,
         .scale = 1.0f / 64.0f,
-        .q_token_stride = 32u * 128u * sizeof(float),
-        .q_head_stride = 128u * sizeof(float),
+        .q_token_stride = use_wide ? (32u * 128u * sizeof(uint16_t)) : (32u * 128u * sizeof(float)),
+        .q_head_stride = use_wide ? (128u * sizeof(uint16_t)) : (128u * sizeof(float)),
         .weights_token_stride = 32u * sizeof(float),
         .index_row_stride = row_bytes,
         .score_token_stride = 16384u * sizeof(float)
     };
     const myds_metal_buffer_t *b_score[] = {
-        q, weights, cache, s->chunk_scores, s->chunk_block_sel, s->chunk_blocks
+        q_score, weights, cache, s->chunk_scores, s->chunk_block_sel, s->chunk_blocks
     };
-    if (!dispatch(score_kernel, &sa, sizeof(sa), b_score, 6u,
-                  (u_stride + 3u) / 4u, n_tiles, 1u, 32u, 4u, 1u, 0u)) {
+    if (!dispatch(active_score_kernel, &sa, sizeof(sa), b_score, 6u,
+                  use_wide ? ((u_stride + 7u) / 8u) : ((u_stride + 3u) / 4u),
+                  n_tiles, 1u, 32u, use_wide ? 8u : 4u, 1u, 0u)) {
         return 0;
     }
 
@@ -2004,7 +2109,31 @@ int myds_v41_gpu_indexer_prefill_compact_mode(
     if (!myds_metal_get_auto_barrier()) {
         myds_metal_barrier_buffer(ids);
     }
+    if (used_wide_out) *used_wide_out = use_wide;
     return 1;
+}
+
+int myds_v41_gpu_indexer_prefill_compact_mode_qbf16(
+    myds_v41_gpu_scratch_t *s, myds_metal_buffer_t *ids,
+    const myds_metal_buffer_t *q, const myds_metal_buffer_t *q_bf16,
+    const myds_metal_buffer_t *weights, const myds_metal_buffer_t *cache,
+    const myds_metal_buffer_t *mask_bits, uint32_t n_comp, uint32_t n_tokens,
+    uint32_t causal_start, uint32_t causal_ratio, uint32_t mask_units,
+    uint32_t cache_mode) {
+    return prefill_compact_mode_qbf16_internal(
+        s, ids, q, q_bf16, weights, cache, mask_bits,
+        n_comp, n_tokens, causal_start, causal_ratio, mask_units, cache_mode, NULL);
+}
+
+int myds_v41_gpu_indexer_prefill_compact_mode(
+    myds_v41_gpu_scratch_t *s, myds_metal_buffer_t *ids,
+    const myds_metal_buffer_t *q, const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *cache, const myds_metal_buffer_t *mask_bits,
+    uint32_t n_comp, uint32_t n_tokens, uint32_t causal_start,
+    uint32_t causal_ratio, uint32_t mask_units, uint32_t cache_mode) {
+    return prefill_compact_mode_qbf16_internal(
+        s, ids, q, NULL, weights, cache, mask_bits,
+        n_comp, n_tokens, causal_start, causal_ratio, mask_units, cache_mode, NULL);
 }
 
 int myds_v41_gpu_indexer_prefill_compact_bf16(
@@ -2018,17 +2147,18 @@ int myds_v41_gpu_indexer_prefill_compact_bf16(
         causal_ratio, mask_units, MYDS_INDEXER_CACHE_BF16);
 }
 
-int myds_v41_gpu_indexer_prefill_compact_scoped_mode(
+int myds_v41_gpu_indexer_prefill_compact_scoped_mode_qbf16(
     myds_v41_gpu_scratch_t *s, myds_metal_buffer_t *ids,
-    const myds_metal_buffer_t *q, const myds_metal_buffer_t *weights,
-    const myds_metal_buffer_t *cache, const myds_metal_buffer_t *mask_bits,
-    uint32_t n_comp, uint32_t n_tokens, uint32_t causal_start,
-    uint32_t causal_ratio, uint32_t mask_units, uint32_t top_blocks_cap,
-    uint32_t cache_mode, bool ordinary_prefill_allowed) {
+    const myds_metal_buffer_t *q, const myds_metal_buffer_t *q_bf16,
+    const myds_metal_buffer_t *weights, const myds_metal_buffer_t *cache,
+    const myds_metal_buffer_t *mask_bits, uint32_t n_comp, uint32_t n_tokens,
+    uint32_t causal_start, uint32_t causal_ratio, uint32_t mask_units,
+    uint32_t top_blocks_cap, uint32_t cache_mode, bool ordinary_prefill_allowed) {
     atomic_fetch_add_explicit(&indexer_prefill_compact_cnt[IPC_REQUESTS], 1u, memory_order_relaxed);
     const int mode = myds_v41_gpu_indexer_prefill_compact_enabled();
     const int ro_mode = myds_v41_gpu_indexer_register_only_enabled();
-    if (mode < 0 || ro_mode < 0) {
+    const int wide_mode = myds_v41_gpu_indexer_prefill_wide_enabled();
+    if (mode < 0 || ro_mode < 0 || wide_mode < 0) {
         atomic_fetch_add_explicit(&indexer_prefill_compact_cnt[IPC_FAILURES], 1u, memory_order_relaxed);
         return -1;
     }
@@ -2051,15 +2181,19 @@ int myds_v41_gpu_indexer_prefill_compact_scoped_mode(
         return -1;
     }
 
-    const int rc = myds_v41_gpu_indexer_prefill_compact_mode(
-        s, ids, q, weights, cache, mask_bits,
-        n_comp, n_tokens, causal_start, causal_ratio, mask_units, cache_mode);
+    bool used_wide = false;
+    const int rc = prefill_compact_mode_qbf16_internal(
+        s, ids, q, q_bf16, weights, cache, mask_bits,
+        n_comp, n_tokens, causal_start, causal_ratio, mask_units, cache_mode, &used_wide);
     if (rc < 0) {
         atomic_fetch_add_explicit(&indexer_prefill_compact_cnt[IPC_FAILURES], 1u, memory_order_relaxed);
         return -1;
     }
     if (rc == 0) {
         atomic_fetch_add_explicit(&indexer_prefill_compact_cnt[IPC_FALLBACKS], 1u, memory_order_relaxed);
+        if (wide_mode == 1) {
+            atomic_fetch_add_explicit(&indexer_prefill_wide_cnt[IPW_FALLBACKS], 1u, memory_order_relaxed);
+        }
         return 0;
     }
 
@@ -2075,7 +2209,25 @@ int myds_v41_gpu_indexer_prefill_compact_scoped_mode(
                               (uint64_t)n_tiles * u_stride, memory_order_relaxed);
     atomic_fetch_add_explicit(&indexer_prefill_compact_cnt[IPC_DENSE_BLOCKS],
                               (uint64_t)n_tokens * n_blocks, memory_order_relaxed);
+    if (used_wide) {
+        atomic_fetch_add_explicit(&indexer_prefill_wide_cnt[IPW_COMPACT_WIDE_ENCODED], 1u, memory_order_relaxed);
+    } else if (wide_mode == 1) {
+        atomic_fetch_add_explicit(&indexer_prefill_wide_cnt[IPW_FALLBACKS], 1u, memory_order_relaxed);
+    }
     return 1;
+}
+
+int myds_v41_gpu_indexer_prefill_compact_scoped_mode(
+    myds_v41_gpu_scratch_t *s, myds_metal_buffer_t *ids,
+    const myds_metal_buffer_t *q, const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *cache, const myds_metal_buffer_t *mask_bits,
+    uint32_t n_comp, uint32_t n_tokens, uint32_t causal_start,
+    uint32_t causal_ratio, uint32_t mask_units, uint32_t top_blocks_cap,
+    uint32_t cache_mode, bool ordinary_prefill_allowed) {
+    return myds_v41_gpu_indexer_prefill_compact_scoped_mode_qbf16(
+        s, ids, q, NULL, weights, cache, mask_bits, n_comp, n_tokens,
+        causal_start, causal_ratio, mask_units, top_blocks_cap, cache_mode,
+        ordinary_prefill_allowed);
 }
 
 int myds_v41_gpu_indexer_prefill_compact_scoped(

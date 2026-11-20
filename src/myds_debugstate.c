@@ -193,6 +193,9 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
     myds_v41_gpu_indexer_prefill_compact_counters_t pc;
     memset(&pc, 0, sizeof(pc));
     myds_v41_gpu_indexer_prefill_compact_counters(&pc, false);
+    myds_v41_gpu_indexer_prefill_wide_counters_t pw;
+    memset(&pw, 0, sizeof(pw));
+    myds_v41_gpu_indexer_prefill_wide_counters(&pw, false);
     myds_v41_gpu_topk_radix_causal_counters_t trc;
     memset(&trc, 0, sizeof(trc));
     myds_v41_gpu_topk_radix_causal_counters(&trc, false);
@@ -273,7 +276,9 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          "\"fallbacks\":%llu,\"failures\":%llu,\"f32_dispatches\":%llu,"
          "\"bf16_dispatches\":%llu},\"indexer_prefill_compact\":{\"requests\":%llu,"
          "\"encoded\":%llu,\"fallbacks\":%llu,\"failures\":%llu,\"rows_scored\":%llu,"
-         "\"union_cap_blocks\":%llu,\"dense_blocks\":%llu},\"indexer_topk_radix_causal\":{"
+         "\"union_cap_blocks\":%llu,\"dense_blocks\":%llu},\"indexer_prefill_wide\":{"
+         "\"iro_wide_encoded\":%llu,\"compact_wide_encoded\":%llu,\"fallbacks\":%llu},"
+         "\"indexer_topk_radix_causal\":{"
          "\"requests\":%llu,\"encoded\":%llu,\"fallbacks\":%llu,\"failures\":%llu,"
          "\"rows\":%llu,\"l20_compact_requests\":%llu,\"l20_compact_encoded\":%llu,"
          "\"l20_compact_fallbacks\":%llu,\"l20_compact_rows\":%llu},"
@@ -310,6 +315,9 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          (unsigned long long)pc.fallbacks, (unsigned long long)pc.failures,
          (unsigned long long)pc.rows_scored, (unsigned long long)pc.union_cap_blocks,
          (unsigned long long)pc.dense_blocks,
+         (unsigned long long)pw.iro_wide_encoded,
+         (unsigned long long)pw.compact_wide_encoded,
+         (unsigned long long)pw.fallbacks,
          (unsigned long long)trc.requests, (unsigned long long)trc.encoded,
          (unsigned long long)trc.fallbacks, (unsigned long long)trc.failures,
          (unsigned long long)trc.rows, (unsigned long long)trc.l20_compact_requests,

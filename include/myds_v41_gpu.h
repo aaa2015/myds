@@ -327,6 +327,13 @@ int myds_v41_gpu_indexer_prefill_compact_mode(
     const myds_metal_buffer_t *cache, const myds_metal_buffer_t *mask_bits,
     uint32_t n_comp, uint32_t n_tokens, uint32_t causal_start,
     uint32_t causal_ratio, uint32_t mask_units, uint32_t cache_mode);
+int myds_v41_gpu_indexer_prefill_compact_mode_qbf16(
+    myds_v41_gpu_scratch_t *scratch, myds_metal_buffer_t *ids,
+    const myds_metal_buffer_t *q, const myds_metal_buffer_t *q_bf16,
+    const myds_metal_buffer_t *weights, const myds_metal_buffer_t *cache,
+    const myds_metal_buffer_t *mask_bits, uint32_t n_comp, uint32_t n_tokens,
+    uint32_t causal_start, uint32_t causal_ratio, uint32_t mask_units,
+    uint32_t cache_mode);
 int myds_v41_gpu_indexer_prefill_compact_scoped(
     myds_v41_gpu_scratch_t *scratch, myds_metal_buffer_t *ids,
     const myds_metal_buffer_t *q, const myds_metal_buffer_t *weights,
@@ -341,6 +348,13 @@ int myds_v41_gpu_indexer_prefill_compact_scoped_mode(
     uint32_t n_comp, uint32_t n_tokens, uint32_t causal_start,
     uint32_t causal_ratio, uint32_t mask_units, uint32_t top_blocks_cap,
     uint32_t cache_mode, bool ordinary_prefill_allowed);
+int myds_v41_gpu_indexer_prefill_compact_scoped_mode_qbf16(
+    myds_v41_gpu_scratch_t *scratch, myds_metal_buffer_t *ids,
+    const myds_metal_buffer_t *q, const myds_metal_buffer_t *q_bf16,
+    const myds_metal_buffer_t *weights, const myds_metal_buffer_t *cache,
+    const myds_metal_buffer_t *mask_bits, uint32_t n_comp, uint32_t n_tokens,
+    uint32_t causal_start, uint32_t causal_ratio, uint32_t mask_units,
+    uint32_t top_blocks_cap, uint32_t cache_mode, bool ordinary_prefill_allowed);
 /* [P-T1] Strict 0-ULP batched causal 2-pass radix/histogram Top-K
  * + 1024-partition bitonic tie-replay & L20 block-mask self-compact score
  * gather (MYDS_INDEXER_TOPK_RADIX_CAUSAL: absent/0=off, 1=on, else -1).
@@ -404,6 +418,22 @@ int myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped_mode(
     const myds_metal_buffer_t *cache,uint32_t n_comp,uint32_t n_heads,
     uint32_t n_tokens,uint32_t causal_start,uint32_t causal_ratio,
     uint32_t cache_mode,bool ordinary_prefill_allowed);
+int myds_v41_gpu_indexscores_register_only_prefill_chunk_scoped_mode_qbf16(
+    myds_v41_gpu_scratch_t *scratch,myds_metal_buffer_t *scores,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *q_bf16,
+    const myds_metal_buffer_t *weights,const myds_metal_buffer_t *cache,
+    uint32_t n_comp,uint32_t n_heads,uint32_t n_tokens,
+    uint32_t causal_start,uint32_t causal_ratio,uint32_t cache_mode,
+    bool ordinary_prefill_allowed);
+/* [CAND-I1] Strict 0-ULP wide prefill Indexer scorers (MYDS_INDEXER_PREFILL_WIDE:
+ * absent/0=off, 1=on, else -1 fail-closed). Uses packed BF16 Q (8 KB/token) with
+ * double-buffered smem_q and 8 SGs (N=64), keeping FP32 Q intact for fallbacks. */
+int myds_v41_gpu_indexer_prefill_wide_enabled(void);
+typedef struct {
+    uint64_t iro_wide_encoded, compact_wide_encoded, fallbacks;
+} myds_v41_gpu_indexer_prefill_wide_counters_t;
+void myds_v41_gpu_indexer_prefill_wide_counters(
+    myds_v41_gpu_indexer_prefill_wide_counters_t *out, bool reset);
 /* 整 chunk 批量版（n_tokens 行 × n_comp 列，行主序，行步长 n_comp）。只支持
  * n_heads == 32；每行的因果宽度 = (causal_start + row + 1) / causal_ratio，
  * 与逐 token 的 count 相同；行数不够的格子写 -INFINITY。 */
