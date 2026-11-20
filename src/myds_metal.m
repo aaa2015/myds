@@ -141,7 +141,6 @@ static id<MTLComputePipelineState> g_pso_moe_mm_q2_k_f16 = nil;
 static id<MTLComputePipelineState> g_pso_moe_mm_q2_k_f16_tail_cull = nil;
 static id<MTLComputePipelineState> g_pso_moe_mm_q2_k_f16_tail_cull_fast = nil;
 static id<MTLComputePipelineState> g_pso_moe_mm_q2_k_f16_wide = nil;
-static id<MTLComputePipelineState> g_pso_moe_mm_q2_k_f16_wide_m1 = nil;
 static id<MTLComputePipelineState> g_pso_moe_mm_q2_k_f32 = nil;
 static bool                        g_moe_prefill_wide = false;
 static _Atomic uint64_t            g_moe_prefill_wide_encoded = 0;
@@ -2742,15 +2741,13 @@ int myds_metal_init(const char *shader_dir) {
                 if (fn) g_pso_moe_mm_map0_wide_m1_ne20_3 = [g_device newComputePipelineStateWithFunction:fn error:nil];
                 fn = [g_library newFunctionWithName:@"kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16_compact_tail_fast"];
                 if (fn) g_pso_moe_mm_iq2_pair_swiglu_f16_compact_tail_fast = [g_device newComputePipelineStateWithFunction:fn error:nil];
-                fn = [g_library newFunctionWithName:@"kernel_mul_mm_id_q2_K_f16_wide_m1"];
-                if (fn) g_pso_moe_mm_q2_k_f16_wide_m1 = [g_device newComputePipelineStateWithFunction:fn error:nil];
-                if (!g_pso_moe_mm_map0_wide_m1_ne20_6 || !g_pso_moe_mm_iq2_pair_swiglu_f16_compact_tail_fast || !g_pso_moe_mm_q2_k_f16_wide_m1) {
+                if (!g_pso_moe_mm_map0_wide_m1_ne20_6 || !g_pso_moe_mm_iq2_pair_swiglu_f16_compact_tail_fast) {
                     fprintf(stderr, "myds_metal: MYDS_MOE_PREFILL_M1=1 requested but M1 PSOs unavailable\n");
                     g_initialized = true;
                     myds_metal_cleanup();
                     return 0;
                 }
-                MYDS_LOG_I("MoE prefill M1 enabled (8KB compact_tail narrow + dequant_q2_K u32 + down_wide_m1 + scatter map0)");
+                MYDS_LOG_I("MoE prefill M1 enabled (8KB compact_tail narrow + tail_cull_fast u32 + scatter map0; wide down on prod q2_K_f16_wide)");
             }
         }
 
@@ -3220,7 +3217,6 @@ void myds_metal_cleanup(void) {
     g_pso_moe_mm_q2_k_f16_tail_cull = nil;
     g_pso_moe_mm_q2_k_f16_tail_cull_fast = nil;
     g_pso_moe_mm_q2_k_f16_wide = nil;
-    g_pso_moe_mm_q2_k_f16_wide_m1 = nil;
     g_pso_moe_mm_q2_k_f32 = nil;
     g_moe_prefill_wide = false;
     g_moe_prefill_m1 = false;
@@ -7562,7 +7558,6 @@ static int routed_moe_batch_impl(
         const bool use_wide_m1 = use_wide_mm && g_moe_prefill_m1 &&
                                  pso_map0_wide_m1 &&
                                  g_pso_moe_mm_iq2_pair_swiglu_f16_compact_tail_fast &&
-                                 g_pso_moe_mm_q2_k_f16_wide_m1 &&
                                  g_pso_moe_mm_q2_k_f16_tail_cull_fast;
 
         if ((iq2_v41_allowed || shared_down) && can_use_mm) return 0;
@@ -7853,9 +7848,12 @@ static int routed_moe_batch_impl(
                 [enc memoryBarrierWithResources:&res count:1];
             }
 
-            /* Step 3: Down Projection dispatch */
+            /* Step 3: Down Projection dispatch
+             * Wide down stays on prod kernel_mul_mm_id_q2_K_f16_wide (Apple8 maxThr=704 vs
+             * wide_m1 maxThr=576 which regressed -1.2% on M2 Ultra #54); M1 keeps scatter
+             * map0_wide_m1, 8KB compact_tail_fast, and u32 tail_cull_fast (maxThr=896). */
             if (use_wide_mm) {
-                [enc setComputePipelineState:use_wide_m1 ? g_pso_moe_mm_q2_k_f16_wide_m1 : g_pso_moe_mm_q2_k_f16_wide];
+                [enc setComputePipelineState:g_pso_moe_mm_q2_k_f16_wide];
                 [enc setBytes:&down_mm_args length:sizeof(down_mm_args) atIndex:0];
                 [enc setBuffer:down_exps->mtl_buf offset:down_exps->offset atIndex:1];
                 [enc setBuffer:scratch_mid->mtl_buf offset:scratch_mid->offset atIndex:2];
@@ -7864,13 +7862,10 @@ static int routed_moe_batch_impl(
                 [enc setBuffer:scratch_down->mtl_buf offset:scratch_down->offset atIndex:5];
                 [enc setBuffer:g_moe_id_map_buffer offset:work_offset atIndex:6];
                 [enc setThreadgroupMemoryLength:8192u atIndex:0];
-                metal_dispatch(enc, use_wide_m1 ? "moe_down_q2_k_wide_m1" : "moe_down_q2_k_wide", MTLSizeMake((NSUInteger)wide_cap,
+                metal_dispatch(enc, "moe_down_q2_k_wide", MTLSizeMake((NSUInteger)wide_cap,
                                                       ((NSUInteger)dim + 63u) / 64u,
                                                       1),
                     MTLSizeMake(128, 1, 1));
-                if (use_wide_m1) {
-                    atomic_fetch_add_explicit(&g_moe_prefill_m1_counters[3], 1u, memory_order_relaxed);
-                }
 
                 [enc setComputePipelineState:use_wide_m1 ? g_pso_moe_mm_q2_k_f16_tail_cull_fast : (g_pso_moe_mm_q2_k_f16_tail_cull ?: g_pso_moe_mm_q2_k_f16)];
                 [enc setBytes:&down_mm_args length:sizeof(down_mm_args) atIndex:0];

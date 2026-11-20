@@ -267,7 +267,8 @@ static void verify_case_0ulp(const char *metallib_path, const char *tag,
             REQUIRE(c.calls == 1u);
             REQUIRE(c.map0_m1_encoded == 1u);
             REQUIRE(c.narrow_compact_encoded == 1u);
-            REQUIRE(c.down_wide_m1_encoded == 1u);
+            /* Wide down stays on prod q2_K_f16_wide (Apple8 maxThr=704 vs wide_m1 576, #54). */
+            REQUIRE(c.down_wide_m1_encoded == 0u);
             REQUIRE(c.down_narrow_m1_encoded == 1u);
         }
 
