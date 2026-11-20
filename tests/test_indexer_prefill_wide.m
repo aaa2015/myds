@@ -393,7 +393,7 @@ static void test_0ulp_and_fallbacks(myds_v41_gpu_scratch_t *scratch,
 
         /* Verify /debug/state JSON exposes indexer_prefill_wide counters cleanly */
         setenv("MYDS_INDEXER_PREFILL_WIDE", "0", 1);
-        char dbg[2048];
+        char dbg[4096];
         myds_debug_state_json(dbg, sizeof(dbg), NULL);
         CHECK(strstr(dbg, "\"indexer_prefill_wide\":{") != NULL);
         CHECK(strstr(dbg, "\"iro_wide_encoded\":0") != NULL);
