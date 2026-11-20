@@ -243,6 +243,10 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
     memset(&parf, 0, sizeof(parf));
     myds_v41_gpu_prefill_attn_rope_fuse_counters(&parf, false);
     const int parf_enabled = myds_v41_gpu_prefill_attn_rope_fuse_enabled();
+    myds_v41_gpu_prefill_attn_l01_mma_counters_t pal01;
+    memset(&pal01, 0, sizeof(pal01));
+    myds_v41_gpu_prefill_attn_l01_mma_counters(&pal01, false);
+    const int pal01_enabled = myds_v41_gpu_prefill_attn_l01_mma_enabled();
 
     /* Knob accounting, reusing the same inventory --print-config reports. */
     static myds_knob_seen_t seen[1024];
@@ -317,7 +321,9 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          "\"prefill_attn_q16\":{\"mode\":%d,\"q16_encoded\":%llu,\"q32_encoded\":%llu,"
          "\"q_rope_f16_encoded\":%llu},"
          "\"prefill_attn_rope_fuse\":{\"enabled\":%d,\"q8_encoded\":%llu,\"q16_encoded\":%llu,"
-         "\"q32_encoded\":%llu,\"l01_encoded\":%llu},\"prefix_cache_len\":%u},",
+         "\"q32_encoded\":%llu,\"l01_encoded\":%llu},"
+         "\"prefill_attn_l01_mma\":{\"enabled\":%d,\"encoded\":%llu,\"q16_encoded\":%llu,"
+         "\"q32_encoded\":%llu,\"rope_fuse_encoded\":%llu},\"prefix_cache_len\":%u},",
          (unsigned)idx_mode, idx_fmt, (unsigned)idx_row_bytes,
          (unsigned long long)ro.requests, (unsigned long long)ro.encoded,
          (unsigned long long)ro.fallbacks, (unsigned long long)ro.failures,
@@ -385,6 +391,11 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          (unsigned long long)parf.q16_encoded,
          (unsigned long long)parf.q32_encoded,
          (unsigned long long)parf.l01_encoded,
+         pal01_enabled,
+         (unsigned long long)pal01.encoded,
+         (unsigned long long)pal01.q16_encoded,
+         (unsigned long long)pal01.q32_encoded,
+         (unsigned long long)pal01.rope_fuse_encoded,
          ctx ? myds_context_get_pcache_len(ctx) : 0u);
 
     const myds_steer_t *st = ctx ? myds_context_get_steer(ctx) : NULL;

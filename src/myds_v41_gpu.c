@@ -151,6 +151,32 @@ void myds_v41_gpu_prefill_attn_rope_fuse_counters(
         .l01_encoded = v[PARF_L01_ENCODED]
     };
 }
+enum { PAL01_ENCODED, PAL01_Q16_ENCODED, PAL01_Q32_ENCODED, PAL01_ROPE_FUSE_ENCODED, PAL01_COUNT };
+static _Atomic uint64_t prefill_attn_l01_mma_counters[PAL01_COUNT];
+static inline void prefill_attn_l01_mma_count(unsigned k) {
+    atomic_fetch_add_explicit(&prefill_attn_l01_mma_counters[k], 1u, memory_order_relaxed);
+}
+int myds_v41_gpu_prefill_attn_l01_mma_enabled(void) {
+    const char *v = getenv("MYDS_PREFILL_ATTN_L01_MMA");
+    if (!v || !strcmp(v, "0")) return 0;
+    if (!strcmp(v, "1")) return 1;
+    MYDS_LOG_E("MYDS_PREFILL_ATTN_L01_MMA must be absent, 0, or 1");
+    return -1;
+}
+void myds_v41_gpu_prefill_attn_l01_mma_counters(
+    myds_v41_gpu_prefill_attn_l01_mma_counters_t *out, bool reset) {
+    uint64_t v[PAL01_COUNT];
+    for (unsigned k = 0; k < PAL01_COUNT; ++k)
+        v[k] = reset ? atomic_exchange_explicit(&prefill_attn_l01_mma_counters[k], 0u, memory_order_relaxed)
+                     : atomic_load_explicit(&prefill_attn_l01_mma_counters[k], memory_order_relaxed);
+    if (!out) return;
+    *out = (myds_v41_gpu_prefill_attn_l01_mma_counters_t){
+        .encoded = v[PAL01_ENCODED],
+        .q16_encoded = v[PAL01_Q16_ENCODED],
+        .q32_encoded = v[PAL01_Q32_ENCODED],
+        .rope_fuse_encoded = v[PAL01_ROPE_FUSE_ENCODED]
+    };
+}
 static uint32_t attn_matrix_test_failure;
 void myds_v41_gpu_inject_attention_matrix_failure(uint32_t kind) {
     attn_matrix_test_failure=kind;
@@ -458,6 +484,7 @@ myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp) {
         myds_v41_gpu_topk_radix_causal_enabled()<0 ||
         myds_v41_gpu_prefill_attn_q16_mode()<0 ||
         myds_v41_gpu_prefill_attn_rope_fuse_enabled()<0 ||
+        myds_v41_gpu_prefill_attn_l01_mma_enabled()<0 ||
         myds_v41_gpu_attention_packed_register_enabled()<0 || myds_v41_attention_rope_fuse_enabled()<0 ||
         myds_v41_gpu_attention_decode_mma_enabled()<0 ||
         myds_v41_gpu_attention_direct_pack_fuse_enabled()<0) return NULL;
@@ -3736,6 +3763,9 @@ bool myds_v41_gpu_prefill_attn_wants_q_f16(const myds_v41_gpu_scratch_t *s,
     if (p0 < MYDS_CHUNK_CARRY) return false;
     const int use_gather = attn_gather_enabled() && gathered != NULL && n_comp != 0u &&
                            n_comp >= s->gather_min_keys;
+    if (!use_gather && ratio == 0u && n_comp == 0u) {
+        return (myds_v41_gpu_prefill_attn_l01_mma_enabled() == 1 && !s->attn_matrix_unavailable);
+    }
     const int use_matrix = use_gather && (s->prefill_attn_variant == 1u ||
         (s->prefill_attn_variant == 2u && !s->attn_matrix_unavailable &&
          c_len >= 32u && ratio > 0u && p0 / ratio >= 256u && n_comp >= 512u));
@@ -3757,7 +3787,8 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
     if (opts && opts->rope_consumed) *opts->rope_consumed = false;
     const int q16_mode = myds_v41_gpu_prefill_attn_q16_mode();
     const int rope_fuse_env = myds_v41_gpu_prefill_attn_rope_fuse_enabled();
-    if(q16_mode < 0 || rope_fuse_env < 0) return 0;
+    const int l01_mma_env = myds_v41_gpu_prefill_attn_l01_mma_enabled();
+    if(q16_mode < 0 || rope_fuse_env < 0 || l01_mma_env < 0) return 0;
     const myds_metal_buffer_t *q_f16 = opts ? opts->q_f16 : NULL;
     if(!s||!heads||!chunk_kv||c_len==0||c_len>MYDS_CHUNK_MAXC||top_k>512u||
        n_comp>s->key_comp_max||
@@ -3803,9 +3834,24 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
        myds_metal_buffer_size(gathered)<(size_t)c_len*640u*512u*2u))return 0;
     attn_count(AC_CALLS);attn_count(use_gather?AC_GATHER:AC_SLAB);
 
+    const char *hm=getenv("MYDS_ATTN_HEADS_MODE");
+    const int hm_smem=hm && !strcmp(hm,"smem");
+    const int hm_q16=hm && !strcmp(hm,"q16");
+    const int hm_q8=!hm_smem && !hm_q16;
+#ifdef MYDS_ATTENTION_MULTIHEAD_CAPTURE
+    const int use_l01_mma = 0;
+#else
+    /* [CAND-A3] L0/L1 window-only direct-slab MMA: when p0>=127 and c_len>=32,
+     * all 128 sliding-window keys live contiguously in s->kv_chunk[q..q+127].
+     * Skips build_chunk_mask_template, mask_chunk_fill, and scalar vec. */
+    const int use_l01_mma = (l01_mma_env == 1) && !use_gather && (ratio == 0u) && (n_comp == 0u) &&
+        (p0 >= MYDS_CHUNK_CARRY) && (c_len >= 32u) && hm_q8 &&
+        !s->attn_matrix_unavailable && (attn_matrix_test_failure == 0u);
+#endif
+
     if(!use_gather&&!ensure_chunk_workspace(s,MYDS_CHUNK_CARRY+c_len+n_comp))return 0;
 
-    if(!use_gather && (s->tmpl_len!=c_len||s->tmpl_carry!=carry))
+    if(!use_gather && !use_l01_mma && (s->tmpl_len!=c_len||s->tmpl_carry!=carry))
         if(!build_chunk_mask_template(s,c_len,carry))return 0;
 
     const uint32_t comp_base=MYDS_CHUNK_CARRY+c_len;
@@ -3821,6 +3867,7 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
        stage_f16(s->kv_chunk,(size_t)comp_base*1024u,comp_kv,0,n_comp*512u,s)))return 0;
 
     if(!use_gather) {
+    if (!use_l01_mma) {
     /* 填充覆盖 [comp_base, keys_pad)：n_comp 只是【本 chunk 真实的压缩键数】，而内核读的
      * 是 32 对齐后的 keys_pad，多出来那几列必须显式置为不可见
      * （以前靠模板的清尾巴兜底，现在模板不再清 —— 见 build_chunk_mask_template）。 */
@@ -3845,6 +3892,7 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
         if(!dispatch("kernel_myds_mask_chunk_scatter",&ma,sizeof(ma),sb,2,
                      (top_k+63u)/64u,c_len,1,64,1,1,0))return 0;
     }
+    } /* !use_l01_mma */
     /* Window-only layers (L0/L1, n_comp==0) or slab-fallback chunks always
      * invalidate the cross-layer gathered cache, guaranteeing a fresh cache
      * at the start of every prefill request (including after kvdisk restore). */
@@ -3852,10 +3900,6 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
     }   /* !use_gather */
 
     const int fast_enabled = prefill_attn_fast_enabled();
-    const char *hm=getenv("MYDS_ATTN_HEADS_MODE");
-    const int hm_smem=hm && !strcmp(hm,"smem");
-    const int hm_q16=hm && !strcmp(hm,"q16");
-    const int hm_q8=!hm_smem && !hm_q16;
     const int all_visible = (p0 >= MYDS_CHUNK_CARRY) && (ratio > 0u) &&
         ((p0 + 1u) / ratio >= 512u) && (top_k == 512u) && (n_comp >= 512u) &&
         (s->keys_clamp == 0u);
@@ -3867,7 +3911,7 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
     const int use_fast_matrix = (fast_enabled || use_q16_fast) && use_matrix && all_visible &&
         hm_q8 && attn_matrix_test_failure == 0u;
 #endif
-    if (q_f16 != NULL && !(use_fast_matrix && use_q16_fast)) {
+    if (q_f16 != NULL && !((use_fast_matrix || use_l01_mma) && use_q16_fast)) {
         MYDS_LOG_E("attention: packed q_f16 supplied on non-q16-eligible chunk (c_len=%u n_comp=%u pos=%u ratio=%u)",
                    c_len, n_comp, p0, ratio);
         return 0;
@@ -3995,30 +4039,44 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
     int matrix_encoded=0;
     const char *matrix_kernel_used="none";
     size_t matrix_smem_used=0;
-    if(use_matrix){
+    if(use_matrix || use_l01_mma){
         /* Keep a unchanged: an unavailable matrix PSO/32KiB workspace must fall
          * back with the original query/head axes and gathered-KV strides. */
         struct flash_vec_args ma=a;
         ma.ne01=64;ma.ne02=(int32_t)c_len;ma.nb01=2048u;ma.nb02=64u*2048u;
         ma.ne_12_2=(int32_t)c_len;ma.ne31=64;ma.ne32=(int32_t)c_len;
         ma.nb31=0;ma.nb32=(uint64_t)s->mask_u16*2u;
-        if (use_fast_matrix) {
-            /* [P-NEW-3] / [CAND-A1 S1-S2] Maskless + Direct Window Slab Reg-O:
-             * skips kernel_flash_attn_ext_blk and reads ic0=0,1 directly from s->kv_chunk
-             * (passed in pad slot) and ic0=2..9 from compact-512 gathered KV.
+        if (use_fast_matrix || use_l01_mma) {
+            /* [P-NEW-3] / [CAND-A1 S1-S2] / [CAND-A3] Maskless + Direct Window Slab Reg-O:
+             * reads ic0=0,1 directly from s->kv_chunk (passed in pad slot). For L0/L1
+             * window-only (use_l01_mma), ne11=128 terminates after those 2 C=64 tiles;
+             * for compressed layers (use_fast_matrix), ic0=2..9 read compact-512 gathered KV.
              * When use_q16_fast is active, reads packed half q_f16 directly from L1 (zero sq). */
             const myds_metal_buffer_t *q_sel = use_q16_fast ? q_f16 : q;
             if (!myds_metal_get_auto_barrier()) {
-                const myds_metal_buffer_t *pre_deps[] = { s->kv_chunk, gathered, q_sel };
-                myds_metal_barrier_buffers(pre_deps, 3u);
+                if (use_l01_mma) {
+                    const myds_metal_buffer_t *pre_deps[] = { s->kv_chunk, q_sel };
+                    myds_metal_barrier_buffers(pre_deps, 2u);
+                } else {
+                    const myds_metal_buffer_t *pre_deps[] = { s->kv_chunk, gathered, q_sel };
+                    myds_metal_barrier_buffers(pre_deps, 3u);
+                }
             }
             if (use_q16_fast) {
                 ma.nb01 = 1024u;
                 ma.nb02 = 64u * 1024u;
                 ma.nb03 = 64u * 1024u;
             }
-            ma.nb12=512u*1024u;ma.nb13=512u*1024u;
-            ma.nb22=512u*1024u;ma.nb23=512u*1024u;
+            if (use_l01_mma) {
+                ma.ne11 = 128;
+                ma.nb12 = 128u * 1024u;
+                ma.nb13 = 128u * 1024u;
+                ma.nb22 = 128u * 1024u;
+                ma.nb23 = 128u * 1024u;
+            } else {
+                ma.nb12=512u*1024u;ma.nb13=512u*1024u;
+                ma.nb22=512u*1024u;ma.nb23=512u*1024u;
+            }
             const int32_t q_tile = use_q16_fast ? ((q16_mode == 32) ? 32 : 16) : 8;
             const int32_t nsg = use_q16_fast ? ((q16_mode == 32) ? 16 : 8) : 4;
             const uint32_t nblk1 = (uint32_t)(64 / q_tile);
@@ -4061,7 +4119,17 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
                 if (use_q16_fast) {
                     prefill_attn_q16_count(q16_mode == 32 ? PAQ_Q32_ENCODED : PAQ_Q16_ENCODED);
                 }
-                if (want_rope_fuse) {
+                if (use_l01_mma) {
+                    prefill_attn_l01_mma_count(PAL01_ENCODED);
+                    if (use_q16_fast) {
+                        prefill_attn_l01_mma_count(q16_mode == 32 ? PAL01_Q32_ENCODED : PAL01_Q16_ENCODED);
+                    }
+                    if (want_rope_fuse) {
+                        *opts->rope_consumed = true;
+                        prefill_attn_l01_mma_count(PAL01_ROPE_FUSE_ENCODED);
+                        prefill_attn_rope_fuse_count(PARF_L01_ENCODED);
+                    }
+                } else if (want_rope_fuse) {
                     *opts->rope_consumed = true;
                     prefill_attn_rope_fuse_count(use_q16_fast
                         ? (q16_mode == 32 ? PARF_Q32_ENCODED : PARF_Q16_ENCODED)
@@ -4073,6 +4141,19 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
                 MYDS_LOG_E("attention: MYDS_PREFILL_ATTN_Q16=%d kernel %s failed to encode",
                            q16_mode, kernel);
                 return 0;
+            } else if (use_l01_mma) {
+                /* Rebuild window mask + tail fill before falling back to scalar vec. */
+                if ((s->tmpl_len != c_len || s->tmpl_carry != carry) &&
+                    !build_chunk_mask_template(s, c_len, carry)) return 0;
+                const uint32_t pad_cols = keys_pad - comp_base;
+                const uint32_t fill_groups = (pad_cols + 63u) / 64u;
+                if (fill_groups) {
+                    struct {uint32_t base,stride,n_comp,top_k,rows,c_start,base_pos,ratio;} mf={
+                        comp_base,s->mask_u16,pad_cols,top_k,c_len,c_start,base_pos,ratio};
+                    const myds_metal_buffer_t *fb[]={s->mask_chunk};
+                    if(!dispatch("kernel_myds_mask_chunk_fill",&mf,sizeof(mf),fb,1,
+                                 fill_groups,c_len,1,64,1,1,0))return 0;
+                }
             } else {
                 /* Populate standard 640-stride gathered + mask before falling back to vec. */
                 gathered_cache_invalidate(s);
@@ -4126,7 +4207,7 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
         }
         if(!matrix_encoded){
             gathered_cache_invalidate(s);
-            if(s->prefill_attn_variant!=2){ /* explicit matrix is strict */
+            if(!use_l01_mma && s->prefill_attn_variant!=2){ /* explicit matrix is strict */
                 MYDS_LOG_E("attention: MYDS_PREFILL_ATTN=matrix could not encode "
                            "(c_len=%u n_comp=%u pos=%u); set MYDS_DEBUG_DISPATCH=1 for the reason",
                            c_len,n_comp,p0);

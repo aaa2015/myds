@@ -705,6 +705,17 @@ typedef struct {
 } myds_v41_gpu_prefill_attn_rope_fuse_counters_t;
 void myds_v41_gpu_prefill_attn_rope_fuse_counters(
     myds_v41_gpu_prefill_attn_rope_fuse_counters_t *out, bool reset);
+/* [CAND-A3] Default-off L0/L1 window-only direct-slab MMA prefill attention
+ * (MYDS_PREFILL_ATTN_L01_MMA: absent/0=off, 1=on, else -1; Track 2 num-equiv). */
+int myds_v41_gpu_prefill_attn_l01_mma_enabled(void);
+typedef struct {
+    uint64_t encoded;
+    uint64_t q16_encoded;
+    uint64_t q32_encoded;
+    uint64_t rope_fuse_encoded;
+} myds_v41_gpu_prefill_attn_l01_mma_counters_t;
+void myds_v41_gpu_prefill_attn_l01_mma_counters(
+    myds_v41_gpu_prefill_attn_l01_mma_counters_t *out, bool reset);
 typedef struct {
     const myds_metal_buffer_t *q_f16;
     bool     fuse_rope;
