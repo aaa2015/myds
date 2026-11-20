@@ -207,6 +207,9 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
     myds_v41_gpu_attention_decode_mma_counters_t adm;
     memset(&adm, 0, sizeof(adm));
     myds_v41_gpu_attention_decode_mma_counters(&adm, false);
+    myds_v41_gpu_suffix_shrink_final_mb_counters_t ssfm;
+    memset(&ssfm, 0, sizeof(ssfm));
+    myds_v41_gpu_suffix_shrink_final_mb_counters(&ssfm, false);
 
     /* Knob accounting, reusing the same inventory --print-config reports. */
     static myds_knob_seen_t seen[1024];
@@ -257,7 +260,9 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          "\"gather_comp_hits\":%llu,\"gather_comp_misses\":%llu},"
          "\"indexer_decode_mma\":{\"score_one_encoded\":%llu,\"score_compact_encoded\":%llu},"
          "\"attn_decode_mma\":{\"requests\":%llu,\"encoded\":%llu,"
-         "\"fallbacks\":%llu,\"d_split\":%u},\"prefix_cache_len\":%u},",
+         "\"fallbacks\":%llu,\"d_split\":%u},"
+         "\"suffix_shrink_final_mb\":{\"requests\":%llu,\"deferred_mbs\":%llu,"
+         "\"final_mbs\":%llu,\"anchor_mbs\":%llu},\"prefix_cache_len\":%u},",
          (unsigned)idx_mode, idx_fmt, (unsigned)idx_row_bytes,
          (unsigned long long)ro.requests, (unsigned long long)ro.encoded,
          (unsigned long long)ro.fallbacks, (unsigned long long)ro.failures,
@@ -278,6 +283,8 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          (unsigned long long)idm.score_one_encoded, (unsigned long long)idm.score_compact_encoded,
          (unsigned long long)adm.requests, (unsigned long long)adm.encoded,
          (unsigned long long)adm.fallbacks, (unsigned)adm.d_split,
+         (unsigned long long)ssfm.requests, (unsigned long long)ssfm.deferred_mbs,
+         (unsigned long long)ssfm.final_mbs, (unsigned long long)ssfm.anchor_mbs,
          ctx ? myds_context_get_pcache_len(ctx) : 0u);
 
     const myds_steer_t *st = ctx ? myds_context_get_steer(ctx) : NULL;

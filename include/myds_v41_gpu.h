@@ -602,4 +602,17 @@ int myds_v41_gpu_attention_chunk_bf16(myds_metal_buffer_t *heads,const myds_meta
     myds_metal_buffer_t *gathered,
     uint32_t c_len,uint32_t n_comp,uint32_t top_k,
     uint32_t base_pos,uint32_t c_start,uint32_t ratio,myds_v41_gpu_scratch_t *s);
+
+/* [CAND-KV2-P1] MYDS_SUFFIX_SHRINK_FINAL_MB_ONLY (default 0, fail-closed). */
+#define MYDS_V41_GPU_HAS_SUFFIX_SHRINK_FINAL_MB 1
+typedef struct {
+    uint64_t requests;
+    uint64_t deferred_mbs;
+    uint64_t final_mbs;
+    uint64_t anchor_mbs;
+} myds_v41_gpu_suffix_shrink_final_mb_counters_t;
+int myds_v41_gpu_suffix_shrink_final_mb_only_enabled(void);
+void myds_v41_gpu_suffix_shrink_final_mb_record(bool is_final_mb, bool mb_has_anchor);
+void myds_v41_gpu_suffix_shrink_final_mb_counters(
+    myds_v41_gpu_suffix_shrink_final_mb_counters_t *out, bool reset);
 #endif

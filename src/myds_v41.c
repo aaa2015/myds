@@ -299,6 +299,104 @@ static bool prefill_grid_guarded_starts(uint32_t begin, uint32_t end,
     return true;
 }
 
+/* [CAND-KV2-P1] Check whether any registered system-prompt anchor falls strictly
+ * inside (mb_base_pos, mb_end]. When both ctx->anchor_tokens[i] and ctx->pcache_tokens
+ * are populated, verify the prefix matches the active request so a stale anchor from
+ * another session does not falsely disable non-final macroblock deferral. */
+static bool v41_mb_has_anchor(const myds_context_t *ctx, uint32_t mb_base_pos, uint32_t mb_end) {
+    if (!ctx || mb_end <= mb_base_pos) return false;
+    const uint32_t nslots = ctx->anchor_slots < MYDS_ANCHOR_SLOTS_MAX
+                            ? ctx->anchor_slots : MYDS_ANCHOR_SLOTS_MAX;
+    for (uint32_t i = 0; i < nslots; ++i) {
+        const uint32_t ap = ctx->anchor_len[i];
+        if (ap <= mb_base_pos || ap > mb_end) continue;
+        if (ctx->anchor_tokens[i] && ctx->pcache_tokens && ctx->pcache_len >= ap) {
+            if (memcmp(ctx->anchor_tokens[i], ctx->pcache_tokens,
+                       (size_t)ap * sizeof(int32_t)) != 0) {
+                continue;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+typedef struct {
+    bool     mb_deferred;
+    uint32_t total_eff;
+} v41_mb_shrink_plan_t;
+
+static v41_mb_shrink_plan_t v41_suffix_shrink_mb_plan(
+    uint32_t base_pos, uint32_t n_tokens,
+    uint32_t mb_start, uint32_t mb_len,
+    uint32_t shrink_shift, bool opt_shrink_macroblock,
+    bool opt_shrink_final_mb_only, bool mb_has_anchor) {
+    const uint32_t mb_base_pos = base_pos + mb_start;
+    const uint32_t mb_end = mb_base_pos + mb_len;
+    const bool is_final_mb = (mb_start + mb_len == n_tokens);
+    const bool mb_deferred = opt_shrink_final_mb_only &&
+                             shrink_shift > 0u &&
+                             !opt_shrink_macroblock &&
+                             !is_final_mb &&
+                             !mb_has_anchor;
+    const bool use_prompt_end = (shrink_shift == 0u && !opt_shrink_macroblock) || mb_deferred;
+    v41_mb_shrink_plan_t plan;
+    plan.mb_deferred = mb_deferred;
+    plan.total_eff = use_prompt_end ? (base_pos + n_tokens) : mb_end;
+    return plan;
+}
+
+typedef struct {
+    uint32_t sh_s_global;
+    uint32_t sh_full_rel;
+    uint32_t sh_loop_rel;
+} v41_layer_shrink_bounds_t;
+
+static v41_layer_shrink_bounds_t v41_suffix_shrink_layer_bounds(
+    uint32_t il, uint32_t mb_base_pos, uint32_t mb_len,
+    uint32_t total_eff, uint32_t cone_shift,
+    uint32_t shrink_shift, bool mb_deferred,
+    bool opt_yoco_compact, uint32_t yoco_keep_tokens,
+    bool guarded_grid_active, uint32_t guarded_full_il) {
+    v41_layer_shrink_bounds_t out = {0u, 0u, 0u};
+    const uint32_t mb_end = mb_base_pos + mb_len;
+    const uint32_t sh_need = opt_yoco_compact
+                             ? yoco_keep_tokens
+                             : (1u + (V41_LAYERS - 1u - il) * 127u);
+    const uint32_t sub = sh_need + cone_shift;
+    const uint32_t s_global = (total_eff > sub) ? total_eff - sub : 0u;
+    out.sh_s_global = s_global;
+    uint32_t s = s_global;
+    if (s < mb_base_pos) s = mb_base_pos;
+    if (s > mb_end) s = mb_end;
+    out.sh_full_rel = s - mb_base_pos;
+    if (guarded_grid_active && !opt_yoco_compact) {
+        out.sh_full_rel = guarded_full_il - mb_base_pos;
+        out.sh_s_global = guarded_full_il;
+    }
+    if (shrink_shift == 0u || mb_deferred) {
+        if (opt_yoco_compact) {
+            /* YOCO Compact: Layer 20 从 0 跑 kv_only，生产全序列压缩 KV；
+             * Layer 21..39 无需在 s 之前跑 127 行 kv_only 预热，直接从 sh_full_rel 开始。 */
+            out.sh_loop_rel = (il == 20u) ? 0u : out.sh_full_rel;
+        } else {
+            const uint32_t skv_global = (s_global > 127u) ? s_global - 127u : 0u;
+            uint32_t skv = skv_global;
+            if (skv < mb_base_pos) skv = mb_base_pos;
+            if (skv > mb_end) skv = mb_end;
+            out.sh_loop_rel = (il == 20u) ? 0u : (skv - mb_base_pos);
+        }
+    }
+    return out;
+}
+
+static inline bool v41_kv_only_skip_win(bool kv_only, bool trace_on,
+                                        uint32_t mb_base_pos, uint32_t c_start,
+                                        uint32_t c_len, uint32_t sh_s_global) {
+    return kv_only && !trace_on &&
+           ((uint64_t)mb_base_pos + c_start + c_len + V41_WINDOW <= (uint64_t)sh_s_global);
+}
+
 /* 处理完位置 p 之后，记下 engram 的滚动状态。在 engram 循环里调用（层循环之前）。
  * ★ 事务契约：这里仅暂存 engram 状态与目标位置到 staged 槽，绝不提前置 snap_pos，
  * 避免在各层窗口环拷贝完成前被 snapshot_best 抢先选出半状态。
@@ -7525,6 +7623,9 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     myds_v41_model_t *v = m ? m->v41 : NULL;
     if (!m || !g || !v) return -1;
     if (v41_prefill_moe_topk_parse() < 0) return -1;
+    const int shrink_final_mb_mode = myds_v41_gpu_suffix_shrink_final_mb_only_enabled();
+    if (shrink_final_mb_mode < 0) return -1;
+    const bool opt_shrink_final_mb_only = (shrink_final_mb_mode == 1);
     const uint32_t prefill_moe_k = v41_prefill_moe_topk_effective(m->n_activated_experts);
     lowkv_join(g);   /* prefill 会写压缩 KV 与快照槽 */
     if (!myds_metal_commit_batch()) return -1;
@@ -8029,8 +8130,18 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
         if (mb_len > macroblock_size) mb_len = macroblock_size;
         const uint32_t mb_base_pos = base_pos + mb_start;
         const uint32_t mb_end = mb_base_pos + mb_len;
-        const uint32_t total_eff = (shrink_shift == 0u && !opt_shrink_macroblock)
-                                   ? (base_pos + n_tokens) : mb_end;
+        const bool is_final_mb = (mb_start + mb_len == n_tokens);
+        const bool mb_has_anchor = opt_shrink_final_mb_only &&
+                                   v41_mb_has_anchor(ctx, mb_base_pos, mb_end);
+        const v41_mb_shrink_plan_t mb_plan = v41_suffix_shrink_mb_plan(
+            base_pos, n_tokens, mb_start, mb_len,
+            shrink_shift, opt_shrink_macroblock,
+            opt_shrink_final_mb_only, mb_has_anchor);
+        const bool mb_deferred = mb_plan.mb_deferred;
+        const uint32_t total_eff = mb_plan.total_eff;
+        if (opt_shrink_final_mb_only && suffix_shrink && shrink_shift > 0u && !opt_shrink_macroblock) {
+            myds_v41_gpu_suffix_shrink_final_mb_record(is_final_mb, mb_has_anchor);
+        }
         uint32_t cone_shift = opt_guarded_grid && suffix_shrink
             ? prefill_snapshot_grid_shift(total_eff, shrink_shift) : shrink_shift;
         uint32_t guarded_old_full[40], guarded_full[40];
@@ -8218,38 +8329,18 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
              *     - 在早期的 macroblock（SKV_global(il) >= B）中，层 21..39 整块跳过（sh_loop_rel = mb_len）；
              *     - 层 20 仍从 sh_loop_rel = 0 跑 kv_only 以填充全局压缩 KV 与索引缓存；
              *     - 跨 macroblock 边界时，上一块末尾与下一块开头的 kv_only 段精确拼接满 127 行窗口环。 */
-            const uint32_t sh_need = (opt_yoco_compact && suffix_shrink)
-                                     ? yoco_keep_tokens
-                                     : (1u + (V41_LAYERS - 1u - il) * 127u);
             const bool shrink_layer = suffix_shrink && il >= 20u;
             const uint32_t sh_valid_from = (total_eff > cone_shift) ? total_eff - cone_shift : 0u;
             uint32_t sh_loop_rel = 0, sh_full_rel = 0, sh_s_global = 0;
             if (shrink_layer) {
-                const uint32_t sub = sh_need + cone_shift;
-                const uint32_t s_global = (total_eff > sub) ? total_eff - sub : 0u;
-                sh_s_global = s_global;
-                uint32_t s = s_global;
-                if (s < mb_base_pos) s = mb_base_pos;
-                if (s > mb_end) s = mb_end;
-                sh_full_rel = s - mb_base_pos;
-                if (guarded_grid_active && !opt_yoco_compact) {
-                    sh_full_rel=guarded_full[il]-mb_base_pos;
-                    sh_s_global=guarded_full[il];
-                }
-                if (shrink_shift == 0u) {
-                    if (opt_yoco_compact) {
-                        /* YOCO Compact: Layer 20 从 0 跑 kv_only，生产全序列压缩 KV；
-                         * Layer 21..39 无需在 s 之前跑 127 行 kv_only 预热，直接从 sh_full_rel 开始。 */
-                        sh_loop_rel = (il == 20u) ? 0u : sh_full_rel;
-                    } else {
-                        const uint32_t skv_global = (s_global > 127u) ? s_global - 127u : 0u;
-                        uint32_t skv = skv_global;
-                        if (skv < mb_base_pos) skv = mb_base_pos;
-                        if (skv > mb_end) skv = mb_end;
-                        sh_loop_rel = (il == 20u) ? 0u : (skv - mb_base_pos);
-                    }
-                }
-                /* shift>0：sh_loop_rel = 0 ⇒ 前置段从 A 起跑；A 是 STRIDE 的倍数，
+                const v41_layer_shrink_bounds_t sb = v41_suffix_shrink_layer_bounds(
+                    il, mb_base_pos, mb_len, total_eff, cone_shift,
+                    shrink_shift, mb_deferred, opt_yoco_compact, yoco_keep_tokens,
+                    guarded_grid_active, guarded_grid_active ? guarded_full[il] : 0u);
+                sh_s_global = sb.sh_s_global;
+                sh_full_rel = sb.sh_full_rel;
+                sh_loop_rel = sb.sh_loop_rel;
+                /* shift>0（非 deferred）：sh_loop_rel = 0 ⇒ 前置段从 A 起跑；A 是 STRIDE 的倍数，
                  * 所以各层 chunk 末端都落在 512 网格上（否则中途快照点根本无法发布）。 */
             }
             if (shrink_layer && il == 20u) {
@@ -8267,9 +8358,10 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                                               ? yoco_keep_tokens - (V41_WINDOW - 1u) : 0u),
                                    base_pos + n_tokens, sh_s_global);
                     } else {
-                        MYDS_LOG_I("V4.1 suffix shrink[snapshot-guard v2]: front=%s shift=%u valid_from=%u "
+                        MYDS_LOG_I("V4.1 suffix shrink[snapshot-guard v2]: front=%s shift=%u final_mb_only=%u valid_from=%u "
                                    "(total=%u, layer20 rows=%u..%u of %u)",
-                                   shrink_shift ? "all" : "skv", shrink_shift, sh_valid_from,
+                                   (shrink_shift && !mb_deferred) ? "all" : "skv", shrink_shift,
+                                   opt_shrink_final_mb_only ? 1u : 0u, sh_valid_from,
                                    base_pos + n_tokens, sh_full_rel, mb_len, mb_len);
                     }
                 }
@@ -8311,8 +8403,8 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                  * 不做 Q_A/Q_B 投影、attention / 输出 / FFN / MoE，也不累加 moe_off。
                  * 注意窗口环拷贝对两条路径都要做 —— 它正是前置段存在的目的。 */
                 const bool kv_only = shrink_layer && (c_start + c_len <= sh_full_rel);
-                const bool kv_only_skip_win = kv_only && !trace_on &&
-                                              (mb_base_pos + c_start + c_len + V41_WINDOW <= sh_s_global);
+                const bool kv_only_skip_win = v41_kv_only_skip_win(
+                    kv_only, trace_on, mb_base_pos, c_start, c_len, sh_s_global);
                 /* These prefix rows produce neither retained window KV nor compressed KV.
                  * Their HC norm is never consumed: Q/indexer/attention/FFN are all skipped,
                  * and sp <= sh_full_rel rejects their snapshots. Keep the near-prefix rows

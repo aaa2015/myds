@@ -277,6 +277,34 @@ int myds_v41_gpu_indexer_decode_mma_enabled(void) {
     MYDS_LOG_E("MYDS_INDEXER_DECODE_MMA must be exactly absent, 0 or 1");
     return -1;
 }
+static _Atomic uint64_t g_suffix_shrink_final_mb_counters[4];
+int myds_v41_gpu_suffix_shrink_final_mb_only_enabled(void) {
+    const char *v = getenv("MYDS_SUFFIX_SHRINK_FINAL_MB_ONLY");
+    if (!v || !strcmp(v, "0")) return 0;
+    if (!strcmp(v, "1")) return 1;
+    MYDS_LOG_E("MYDS_SUFFIX_SHRINK_FINAL_MB_ONLY must be exactly absent, 0 or 1");
+    return -1;
+}
+void myds_v41_gpu_suffix_shrink_final_mb_record(bool is_final_mb, bool mb_has_anchor) {
+    atomic_fetch_add_explicit(&g_suffix_shrink_final_mb_counters[0], 1u, memory_order_relaxed);
+    if (is_final_mb) {
+        atomic_fetch_add_explicit(&g_suffix_shrink_final_mb_counters[2], 1u, memory_order_relaxed);
+    } else if (mb_has_anchor) {
+        atomic_fetch_add_explicit(&g_suffix_shrink_final_mb_counters[3], 1u, memory_order_relaxed);
+    } else {
+        atomic_fetch_add_explicit(&g_suffix_shrink_final_mb_counters[1], 1u, memory_order_relaxed);
+    }
+}
+void myds_v41_gpu_suffix_shrink_final_mb_counters(
+    myds_v41_gpu_suffix_shrink_final_mb_counters_t *out, bool reset) {
+    uint64_t v[4];
+    for (unsigned i = 0; i < 4u; ++i) {
+        v[i] = reset
+            ? atomic_exchange_explicit(&g_suffix_shrink_final_mb_counters[i], 0u, memory_order_relaxed)
+            : atomic_load_explicit(&g_suffix_shrink_final_mb_counters[i], memory_order_relaxed);
+    }
+    if (out) *out = (myds_v41_gpu_suffix_shrink_final_mb_counters_t){v[0], v[1], v[2], v[3]};
+}
 uint32_t myds_v41_gpu_indexer_key_cache_mode(void) {
     return myds_v41_gpu_indexer_key_fp4_enabled()==1
         ? MYDS_INDEXER_CACHE_FP4 : MYDS_INDEXER_CACHE_BF16;
@@ -350,6 +378,7 @@ myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp) {
     if (myds_v41_gpu_indexer_register_only_enabled()<0 ||
         myds_v41_gpu_indexer_key_fp4_enabled()<0 ||
         myds_v41_gpu_indexer_decode_mma_enabled()<0 ||
+        myds_v41_gpu_suffix_shrink_final_mb_only_enabled()<0 ||
         myds_v41_gpu_indexer_decode_compact_enabled()<0 ||
         myds_v41_gpu_indexer_prefill_compact_enabled()<0 ||
         myds_v41_gpu_topk_radix_causal_enabled()<0 ||
