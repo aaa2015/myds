@@ -12032,6 +12032,502 @@ kernel void kernel_myds_l20_compact_topk_final(
     }
 }
 
+// =========================================================================
+// [D-T2] Strict 0-ULP Decode L20 Self-Compact Top-512 (MYDS_DECODE_TOPK_FAST=1)
+// Eliminates L20's redundant 2nd full 128K/256K argsort with:
+//   1. kernel_myds_l20_decode_candidate_blocks_nan: exact candidate_blocks +
+//      per-TG visible/hidden IEEE NaN detection (zero clear dispatch, zero atomics).
+//   2. kernel_myds_l20_decode_compact_topk_stage1: fused gather+stage1 over
+//      compact_sorted_blocks[0..2047] directly from dense_scores (16 TGs x 512).
+//   3. Reuses kernel_myds_compact_topk_stage2 (4 TGs x 512).
+//   4. kernel_myds_l20_decode_compact_topk_final (1 TG x 1024): merges 4x513,
+//      replays affected 1024-partitions on raw dense_scores on ties/<512 valid,
+//      and runs exact single-row dense fallback in-kernel if any NaN was flagged.
+// =========================================================================
+
+struct myds_l20_decode_cand_args {
+    uint32_t width;
+    uint32_t start;
+    uint32_t ratio;
+    uint32_t pad;
+};
+
+kernel void kernel_myds_l20_decode_candidate_blocks_nan(
+        constant myds_l20_decode_cand_args &args [[buffer(0)]],
+        device const float *scores               [[buffer(1)]],
+        device float *blocks                     [[buffer(2)]],
+        device uint32_t *nan_tg_flags            [[buffer(3)]],
+        uint tgpig [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    const uint count = (args.width + 7u) >> 3u;
+    const uint blk = tgpig * 256u + uint(tid);
+    const uint visible = args.ratio ? min(args.width, (args.start + 1u) / args.ratio) : 0u;
+    uint has_nan = 0u;
+    if (blk < count) {
+        float best = -INFINITY;
+        const uint i0 = blk * 8u;
+        const uint i_end = min(visible, i0 + 8u);
+        const uint i_nan_end = min(args.width, i0 + 8u);
+        if (((args.width & 3u) == 0u) && i0 + 8u <= visible) {
+            const float4 v0 = *((device const float4 *)(scores + i0));
+            const float4 v1 = *((device const float4 *)(scores + i0 + 4u));
+            const float vals[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+            #pragma clang loop unroll(full)
+            for (uint m = 0u; m < 8u; m++) {
+                has_nan |= myds_pt1_is_nan_raw(as_type<uint>(vals[m])) ? 1u : 0u;
+                best = max(best, vals[m]);
+            }
+        } else {
+            for (uint i = i0; i < i_end; i++) {
+                const float sc = scores[i];
+                has_nan |= myds_pt1_is_nan_raw(as_type<uint>(sc)) ? 1u : 0u;
+                best = max(best, sc);
+            }
+            for (uint i = i_end; i < i_nan_end; i++) {
+                has_nan |= myds_pt1_is_nan_raw(as_type<uint>(scores[i])) ? 1u : 0u;
+            }
+        }
+        if (visible && blk == (visible - 1u) / 8u) best = INFINITY;
+        blocks[blk] = best;
+    }
+    threadgroup uint sg_nan[8];
+    const uint sg_any = simd_or(has_nan);
+    if (lane == 0u) sg_nan[sg] = sg_any;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        uint any = 0u;
+        for (uint s = 0u; s < 8u; s++) any |= sg_nan[s];
+        nan_tg_flags[tgpig] = any;
+    }
+}
+
+kernel void kernel_myds_l20_decode_compact_topk_stage1(
+        constant uint32_t &n_comp               [[buffer(0)]],
+        device const float *dense_scores        [[buffer(1)]],
+        device const int32_t *compact_blocks    [[buffer(2)]],
+        device myds_compact_pair *stage1_out    [[buffer(3)]],
+        uint tg    [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]]) {
+    if (tg >= 16u) return;
+    threadgroup myds_compact_pair s_p[1024];
+    const uint base = tg * 1024u;
+    const uint i0 = uint(tid);
+    const uint i1 = i0 + 512u;
+    {
+        const uint slot = base + i0;
+        const int32_t blk = compact_blocks[slot >> 3u];
+        myds_compact_pair p = {-INFINITY, -1};
+        if (blk >= 0) {
+            const uint cand = uint(blk) * 8u + (slot & 7u);
+            if (cand < n_comp) {
+                const float sc = dense_scores[cand];
+                const uint bits = as_type<uint>(sc);
+                if (!myds_pt1_is_nan_raw(bits) && bits != 0xff800000u) {
+                    p = {sc, int32_t(cand)};
+                }
+            }
+        }
+        s_p[i0] = p;
+    }
+    {
+        const uint slot = base + i1;
+        const int32_t blk = compact_blocks[slot >> 3u];
+        myds_compact_pair p = {-INFINITY, -1};
+        if (blk >= 0) {
+            const uint cand = uint(blk) * 8u + (slot & 7u);
+            if (cand < n_comp) {
+                const float sc = dense_scores[cand];
+                const uint bits = as_type<uint>(sc);
+                if (!myds_pt1_is_nan_raw(bits) && bits != 0xff800000u) {
+                    p = {sc, int32_t(cand)};
+                }
+            }
+        }
+        s_p[i1] = p;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint k = 2u; k <= 1024u; k <<= 1u) {
+        for (uint j = k >> 1u; j > 0u; j >>= 1u) {
+            const uint low = i0 & (j - 1u);
+            const uint ix0 = ((i0 - low) << 1u) + low;
+            const uint ix1 = ix0 | j;
+            const bool desc_dir = ((ix0 & k) == 0u);
+            const myds_compact_pair pa = s_p[ix0];
+            const myds_compact_pair pb = s_p[ix1];
+            bool a_before_b;
+            if (pa.row < 0 && pb.row < 0) a_before_b = (ix0 < ix1);
+            else a_before_b = myds_compact_pair_better(pa, pb);
+            if (a_before_b != desc_dir) {
+                s_p[ix0] = pb;
+                s_p[ix1] = pa;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    device myds_compact_pair *dst = stage1_out + tg * 513u;
+    dst[i0] = s_p[i0];
+    if (i0 == 0u) dst[512u] = s_p[512u];
+}
+
+struct myds_l20_decode_final_args {
+    uint32_t n_comp;
+    uint32_t n_nan_tgs;
+};
+
+kernel void kernel_myds_l20_decode_compact_topk_final(
+        constant myds_l20_decode_final_args &args [[buffer(0)]],
+        device const myds_compact_pair *stage2_in [[buffer(1)]],
+        device const int32_t *compact_blocks      [[buffer(2)]],
+        device const float *dense_scores          [[buffer(3)]],
+        device const uint32_t *nan_tg_flags       [[buffer(4)]],
+        device int32_t *tmp_a                     [[buffer(5)]],
+        device int32_t *tmp_b                     [[buffer(6)]],
+        device int32_t *selected                  [[buffer(7)]],
+        ushort tid  [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    threadgroup myds_compact_pair s_m0[513];
+    threadgroup myds_compact_pair s_m1[513];
+    threadgroup myds_compact_pair s_top[513];
+    threadgroup int32_t shmem_i32[1024];
+    threadgroup float   shmem_f32[1024];
+    threadgroup uint32_t s_sg_u32[32];
+    threadgroup uint32_t s_cmd_u[6];
+    threadgroup float    s_cmd_f;
+
+    // 0. Check per-TG NaN flags from candidate_blocks_nan. Any visible or hidden
+    //    IEEE NaN anywhere in dense_scores[0..n_comp-1] runs the exact full
+    //    non-causal dense bitonic + pairwise merge fallback right here (0-ULP).
+    uint local_nan = 0u;
+    for (uint t = uint(tid); t < args.n_nan_tgs; t += 1024u) {
+        local_nan |= nan_tg_flags[t];
+    }
+    const uint sg_nan = simd_or(local_nan);
+    if (lane == 0u) s_sg_u32[sg] = sg_nan;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        uint any = 0u;
+        for (uint s = 0u; s < 32u; s++) any |= s_sg_u32[s];
+        s_cmd_u[0] = any;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (s_cmd_u[0] != 0u) {
+        const int width = int(args.n_comp);
+        const int nth = 1024;
+        const int npr = int((args.n_comp + 1023u) / 1024u);
+        const int blocktop = 512;
+        const int last = width - (npr - 1) * nth;
+        const int work = (npr == 1) ? 512 : ((npr - 1) * blocktop + min(last, blocktop));
+        const int col = int(tid);
+
+        for (int ib = 0; ib < npr; ib++) {
+            const int i00 = ib * nth;
+            if (i00 >= width) break;
+            shmem_i32[col] = i00 + col;
+            if (i00 + col < width) {
+                shmem_f32[col] = dense_scores[i00 + col];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int k = 2; k <= nth; k <<= 1) {
+                for (int j = k >> 1; j > 0; j >>= 1) {
+                    const int ixj = col ^ j;
+                    if (ixj > col) {
+                        if ((col & k) == 0) {
+                            if (shmem_i32[col] >= width ||
+                                (shmem_i32[ixj] < width &&
+                                 shmem_f32[shmem_i32[col] - i00] < shmem_f32[shmem_i32[ixj] - i00])) {
+                                const int tmp_i = shmem_i32[col];
+                                shmem_i32[col] = shmem_i32[ixj];
+                                shmem_i32[ixj] = tmp_i;
+                            }
+                        } else {
+                            if (shmem_i32[ixj] >= width ||
+                                (shmem_i32[col] < width &&
+                                 shmem_f32[shmem_i32[col] - i00] > shmem_f32[shmem_i32[ixj] - i00])) {
+                                const int tmp_i = shmem_i32[col];
+                                shmem_i32[col] = shmem_i32[ixj];
+                                shmem_i32[ixj] = tmp_i;
+                            }
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+            }
+            const int i0 = ib * blocktop;
+            device int32_t *pass0_dst = (npr == 1) ? selected : tmp_a;
+            if (i0 + col < work && col < blocktop) {
+                pass0_dst[i0 + col] = shmem_i32[col];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (npr == 1) return;
+        threadgroup_barrier(mem_flags::mem_device);
+
+        device int32_t *cur = tmp_a;
+        device int32_t *nxt = tmp_b;
+        for (int len = blocktop; len < work; len <<= 1) {
+            const int nm = (work + 2 * len - 1) / (2 * len);
+            const int ntg_m = min(len, 512);
+            const int out_limit = (nm == 1) ? 512 : work;
+            device int32_t *stage_dst = (nm == 1) ? selected : nxt;
+            if (col < ntg_m) {
+                for (int im = 0; im < nm; im++) {
+                    const int start = im * (2 * len);
+                    const int len0 = min(len, max(0, work - start));
+                    const int len1 = min(len, max(0, work - (start + len)));
+                    const int total = len0 + len1;
+                    if (total == 0) continue;
+                    device const int32_t *tmp0 = cur + start;
+                    device const int32_t *tmp1 = tmp0 + len;
+                    device int32_t *dst_m = stage_dst + start;
+                    const int chunk = (total + ntg_m - 1) / ntg_m;
+                    const int k0 = col * chunk;
+                    const int k1 = min(min(k0 + chunk, total), out_limit);
+                    if (k0 >= out_limit || k0 >= total) continue;
+                    int low = k0 > len1 ? (k0 - len1) : 0;
+                    int high = min(k0, len0);
+                    while (low < high) {
+                        const int mid = (low + high) >> 1;
+                        const float val0 = dense_scores[tmp0[mid]];
+                        const float val1 = dense_scores[tmp1[k0 - mid - 1]];
+                        if (val0 >= val1) low = mid + 1;
+                        else high = mid;
+                    }
+                    int i = low, j = k0 - i;
+                    int32_t idx0 = 0, idx1 = 0;
+                    float val0 = 0.0f, val1 = 0.0f;
+                    if (i < len0) { idx0 = tmp0[i]; val0 = dense_scores[idx0]; }
+                    if (j < len1) { idx1 = tmp1[j]; val1 = dense_scores[idx1]; }
+                    for (int k = k0; k < k1; ++k) {
+                        if (i >= len0) {
+                            while (k < k1) dst_m[k++] = tmp1[j++];
+                            break;
+                        } else if (j >= len1) {
+                            while (k < k1) dst_m[k++] = tmp0[i++];
+                            break;
+                        } else if (val0 >= val1) {
+                            dst_m[k] = idx0;
+                            ++i;
+                            if (i < len0) { idx0 = tmp0[i]; val0 = dense_scores[idx0]; }
+                        } else {
+                            dst_m[k] = idx1;
+                            ++j;
+                            if (j < len1) { idx1 = tmp1[j]; val1 = dense_scores[idx1]; }
+                        }
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_device);
+            device int32_t *tmp_swap = cur;
+            cur = nxt;
+            nxt = tmp_swap;
+        }
+        return;
+    }
+
+    const uint width = args.n_comp;
+    device const myds_compact_pair *r0 = stage2_in + 0u * 513u;
+    device const myds_compact_pair *r1 = stage2_in + 1u * 513u;
+    device const myds_compact_pair *r2 = stage2_in + 2u * 513u;
+    device const myds_compact_pair *r3 = stage2_in + 3u * 513u;
+
+    if (tid < 512u) {
+        const int k = int(tid);
+        s_m0[k] = myds_compact_merge2_at_dev(r0, 513, r1, 513, k);
+        if (tid == 0u) s_m0[512] = myds_compact_merge2_at_dev(r0, 513, r1, 513, 512);
+    } else {
+        const int k = int(tid - 512u);
+        s_m1[k] = myds_compact_merge2_at_dev(r2, 513, r3, 513, k);
+        if (tid == 512u) s_m1[512] = myds_compact_merge2_at_dev(r2, 513, r3, 513, 512);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < 513u) {
+        s_top[tid] = myds_compact_merge2_at_tg(s_m0, 513, s_m1, 513, int(tid));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint local_same_part_tie = 0u;
+    if (tid < 511u) {
+        const myds_compact_pair p0 = s_top[tid];
+        const myds_compact_pair p1 = s_top[tid + 1u];
+        if (p0.row >= 0 && p1.row >= 0 && p0.score == p1.score &&
+            (uint(p0.row) >> 10u) == (uint(p1.row) >> 10u)) {
+            local_same_part_tie = 1u;
+        }
+    }
+    const uint sg_tie = simd_or(local_same_part_tie);
+    if (lane == 0u) s_sg_u32[sg] = sg_tie;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0u) {
+        uint any_tie = 0u;
+        for (uint s = 0u; s < 16u; s++) any_tie |= s_sg_u32[s];
+        const bool all_valid = (s_top[511].row >= 0);
+        const bool boundary_tie = all_valid && (s_top[512].row >= 0) &&
+                                  (s_top[512].score == s_top[511].score);
+        s_cmd_u[0] = (all_valid && !boundary_tie && !any_tie) ? 1u : 0u;
+        s_cmd_u[1] = boundary_tie ? 1u : 0u;
+        uint k_fin = 512u;
+        if (!all_valid) {
+            k_fin = 0u;
+            while (k_fin < 512u && s_top[k_fin].row >= 0) k_fin++;
+        }
+        uint k_gt = k_fin;
+        if (boundary_tie) {
+            const float tau = s_top[511].score;
+            k_gt = 0u;
+            while (k_gt < 512u && s_top[k_gt].score > tau) k_gt++;
+            s_cmd_f = tau;
+        }
+        s_cmd_u[2] = k_fin;
+        s_cmd_u[3] = k_gt;
+        s_cmd_u[4] = 0u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (s_cmd_u[0] != 0u) {
+        if (tid < 512u) selected[tid] = s_top[tid].row;
+        return;
+    }
+
+    // 1. Repair any interior same-partition ties against raw dense_scores.
+    const uint limit_strict = (s_cmd_u[1] != 0u) ? s_cmd_u[3] : s_cmd_u[2];
+    for (;;) {
+        if (tid == 0u) {
+            uint cur = s_cmd_u[4];
+            uint found = 0u;
+            while (cur + 1u < limit_strict) {
+                const float sc = s_top[cur].score;
+                const uint pt = uint(s_top[cur].row) >> 10u;
+                uint end = cur + 1u;
+                while (end < limit_strict && s_top[end].score == sc &&
+                       (uint(s_top[end].row) >> 10u) == pt) {
+                    end++;
+                }
+                if (end - cur > 1u) {
+                    s_cmd_u[5] = pt;
+                    s_cmd_u[4] = end;
+                    s_sg_u32[0] = cur;
+                    s_sg_u32[1] = end - cur;
+                    s_sg_u32[2] = as_type<uint>(sc);
+                    found = 1u;
+                    break;
+                }
+                cur = end;
+            }
+            if (!found) s_cmd_u[4] = limit_strict;
+            s_sg_u32[3] = found;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (s_sg_u32[3] == 0u) break;
+
+        const uint pt = s_cmd_u[5];
+        const uint out_pos = s_sg_u32[0];
+        const uint need_cnt = s_sg_u32[1];
+        const float target_sc = as_type<float>(s_sg_u32[2]);
+
+        myds_dense_replay_partition_1024(pt, width, dense_scores, shmem_i32, shmem_f32, tid);
+        if (tid == 0u) {
+            const int i00 = int(pt * 1024u);
+            uint written = 0u;
+            for (uint c = 0u; c < 512u && written < need_cnt; c++) {
+                const int idx = shmem_i32[c];
+                if (uint(idx) < width && shmem_f32[idx - i00] == target_sc) {
+                    s_top[out_pos + written] = {target_sc, idx};
+                    written++;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // 2. Repair boundary ties at tau across ascending partitions against raw dense_scores.
+    if (s_cmd_u[1] != 0u) {
+        const float tau = s_cmd_f;
+        if (tid == 0u) {
+            s_cmd_u[4] = s_cmd_u[3];
+            s_cmd_u[5] = 0u;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        while (s_cmd_u[4] < 512u) {
+            const uint next_part = s_cmd_u[5];
+            uint min_p = 0xffffffffu;
+            #pragma clang loop unroll(full)
+            for (uint m = 0u; m < 16u; m++) {
+                const uint slot = uint(tid) + m * 1024u;
+                const int32_t blk = compact_blocks[slot >> 3u];
+                if (blk >= 0) {
+                    const uint cand = uint(blk) * 8u + (slot & 7u);
+                    if (cand < width) {
+                        const uint p = cand >> 10u;
+                        if (p >= next_part) {
+                            const float sc = dense_scores[cand];
+                            if (as_type<uint>(sc) != 0xff800000u && sc == tau) {
+                                min_p = min(min_p, p);
+                            }
+                        }
+                    }
+                }
+            }
+            const uint sg_min = simd_min(min_p);
+            if (lane == 0u) s_sg_u32[sg] = sg_min;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (sg == 0u) {
+                const uint v = simd_min(s_sg_u32[lane]);
+                if (lane == 0u) s_cmd_u[5] = v;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const uint p_cur = s_cmd_u[5];
+            if (p_cur == 0xffffffffu) break;
+
+            myds_dense_replay_partition_1024(p_cur, width, dense_scores, shmem_i32, shmem_f32, tid);
+            if (tid == 0u) {
+                const int i00 = int(p_cur * 1024u);
+                uint fill_pos = s_cmd_u[4];
+                for (uint c = 0u; c < 512u && fill_pos < 512u; c++) {
+                    const int idx = shmem_i32[c];
+                    if (uint(idx) < width && shmem_f32[idx - i00] == tau) {
+                        s_top[fill_pos++] = {tau, idx};
+                    }
+                }
+                s_cmd_u[4] = fill_pos;
+                s_cmd_u[5] = p_cur + 1u;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    // 3. Fill <512 non-(-INFINITY) tail from raw dense_scores partitions in ascending order.
+    for (uint p_inf = 0u; s_cmd_u[2] < 512u && p_inf * 1024u < width; p_inf++) {
+        myds_dense_replay_partition_1024(p_inf, width, dense_scores, shmem_i32, shmem_f32, tid);
+        if (tid == 0u) {
+            const int i00 = int(p_inf * 1024u);
+            uint fill_pos = s_cmd_u[2];
+            for (uint c = 0u; c < 512u && fill_pos < 512u; c++) {
+                const int idx = shmem_i32[c];
+                if (uint(idx) < width && as_type<uint>(shmem_f32[idx - i00]) == 0xff800000u) {
+                    s_top[fill_pos++] = {-INFINITY, idx};
+                }
+            }
+            s_cmd_u[2] = fill_pos;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid < 512u) {
+        selected[tid] = s_top[tid].row;
+    }
+}
+
 
 
 

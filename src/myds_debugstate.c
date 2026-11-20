@@ -216,6 +216,9 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
     myds_metal_moe_epilogue_fuse_counters_t epc;
     memset(&epc, 0, sizeof(epc));
     myds_metal_moe_epilogue_fuse_counters(&epc, false);
+    myds_v41_gpu_decode_topk_fast_counters_t dtf;
+    memset(&dtf, 0, sizeof(dtf));
+    myds_v41_gpu_decode_topk_fast_counters(&dtf, false);
 
     /* Knob accounting, reusing the same inventory --print-config reports. */
     static myds_knob_seen_t seen[1024];
@@ -272,7 +275,11 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          "\"moe_prefill_m1\":{\"calls\":%llu,\"map0\":%llu,\"narrow_compact\":%llu,"
          "\"down_wide\":%llu,\"down_narrow\":%llu},"
          "\"moe_epilogue_fuse\":{\"calls\":%llu,\"fused_mm\":%llu,\"fused_mv\":%llu,"
-         "\"fallbacks\":%llu,\"tokens\":%llu},\"prefix_cache_len\":%u},",
+         "\"fallbacks\":%llu,\"tokens\":%llu},"
+         "\"decode_topk_fast\":{\"overlap_prefix_encoded\":%llu,"
+         "\"prefix_top2048_encoded\":%llu,\"l20_self_compact_requests\":%llu,"
+         "\"l20_self_compact_encoded\":%llu,\"l20_self_compact_fallbacks\":%llu,"
+         "\"l20_self_compact_failures\":%llu},\"prefix_cache_len\":%u},",
          (unsigned)idx_mode, idx_fmt, (unsigned)idx_row_bytes,
          (unsigned long long)ro.requests, (unsigned long long)ro.encoded,
          (unsigned long long)ro.fallbacks, (unsigned long long)ro.failures,
@@ -302,6 +309,12 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          (unsigned long long)epc.calls, (unsigned long long)epc.fused_mm_encoded,
          (unsigned long long)epc.fused_mv_encoded, (unsigned long long)epc.fallbacks,
          (unsigned long long)epc.tokens_fused,
+         (unsigned long long)dtf.overlap_prefix_encoded,
+         (unsigned long long)dtf.prefix_top2048_encoded,
+         (unsigned long long)dtf.l20_self_compact_requests,
+         (unsigned long long)dtf.l20_self_compact_encoded,
+         (unsigned long long)dtf.l20_self_compact_fallbacks,
+         (unsigned long long)dtf.l20_self_compact_failures,
          ctx ? myds_context_get_pcache_len(ctx) : 0u);
 
     const myds_steer_t *st = ctx ? myds_context_get_steer(ctx) : NULL;

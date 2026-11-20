@@ -276,6 +276,32 @@ int myds_v41_gpu_indexscores_compact_decode_mode(myds_v41_gpu_scratch_t *scratch
     uint32_t n_comp, uint32_t cache_mode, uint32_t first_row);
 int myds_v41_gpu_topk_compact_decode(myds_metal_buffer_t *ids,
     uint32_t n_comp, myds_v41_gpu_scratch_t *scratch);
+/* [D-T2] Strict 0-ULP decode Top-K fast path (MYDS_DECODE_TOPK_FAST:
+ * absent/0=off, 1=on, else -1 fail-closed):
+ *   (a) keeps overlap_topk_qb active under MYDS_INDEXER_TOPK_PREFIX_MERGE=1;
+ *   (b) enables overlap_topk_qb on L20;
+ *   (c) raises prefix_merge cap from top<=512 to top<=2048;
+ *   (d) replaces L20's redundant 2nd full argsort with lean self-compact Top-512. */
+#define MYDS_V41_GPU_HAS_DECODE_TOPK_FAST 1
+int myds_v41_gpu_decode_topk_fast_enabled(void);
+typedef struct {
+    uint64_t overlap_prefix_encoded;
+    uint64_t prefix_top2048_encoded;
+    uint64_t l20_self_compact_requests;
+    uint64_t l20_self_compact_encoded;
+    uint64_t l20_self_compact_fallbacks;
+    uint64_t l20_self_compact_failures;
+} myds_v41_gpu_decode_topk_fast_counters_t;
+void myds_v41_gpu_decode_topk_fast_counters(
+    myds_v41_gpu_decode_topk_fast_counters_t *out, bool reset);
+bool myds_v41_gpu_topk_l20_self_compact_eligible(
+    const myds_v41_gpu_scratch_t *scratch, uint32_t n_comp);
+int myds_v41_gpu_l20_decode_candidates_nan(myds_metal_buffer_t *blocks,
+    const myds_metal_buffer_t *scores, uint32_t width, uint32_t pos,
+    uint32_t ratio, myds_v41_gpu_scratch_t *scratch);
+int myds_v41_gpu_topk_l20_self_compact_decode(myds_metal_buffer_t *ids,
+    const myds_metal_buffer_t *dense_scores, uint32_t n_comp,
+    myds_v41_gpu_scratch_t *scratch);
 /* [P-L1] Default-on 0-ULP prefill YoCo (il>20, ratio==1, mask_bits, nc>16384,
  * pos0>=16384) 8-row tile-union register-only scorer + batched <=16K Top-512
  * (MYDS_INDEXER_PREFILL_COMPACT: absent/1=on, 0=off, else -1). */
@@ -562,7 +588,11 @@ int myds_v41_gpu_rope_heads_slice(myds_v41_gpu_scratch_t *scratch,
 void myds_v41_gpu_attn_kv_reuse_bind_topk_qb(myds_v41_gpu_scratch_t *scratch,
     const myds_metal_buffer_t *qb_weight,const myds_metal_buffer_t *qb_input,
     uint32_t pos,uint32_t qb_done_heads);
+void myds_v41_gpu_attn_kv_reuse_rebind_topk_qb(myds_v41_gpu_scratch_t *scratch,
+    const myds_metal_buffer_t *qb_weight,const myds_metal_buffer_t *qb_input,
+    uint32_t pos);
 uint32_t myds_v41_gpu_attn_kv_reuse_qb_done(const myds_v41_gpu_scratch_t *scratch);
+uint32_t myds_v41_gpu_attn_kv_reuse_rope_done(const myds_v41_gpu_scratch_t *scratch);
 const myds_metal_buffer_t *myds_v41_gpu_scratch_kv_f16(const myds_v41_gpu_scratch_t *scratch);
 const myds_metal_buffer_t *myds_v41_gpu_scratch_pad(const myds_v41_gpu_scratch_t *scratch);
 myds_metal_buffer_t *myds_v41_gpu_scratch_partial(const myds_v41_gpu_scratch_t *scratch);

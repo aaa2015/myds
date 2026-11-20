@@ -2827,6 +2827,8 @@ int myds_v41_decode_attn_indexer_scoped(myds_context_t *ctx,
     }
 
     if (count > 0u) {
+        const int decode_topk_fast = myds_v41_gpu_decode_topk_fast_enabled();
+        STAGE_CHECK(decode_topk_fast >= 0);
         const uint32_t idx_mode = args->index_cache_mode
             ? args->index_cache_mode : MYDS_INDEXER_CACHE_BF16;
         const uint32_t blocks = (count + 7u) / 8u;
@@ -2837,8 +2839,15 @@ int myds_v41_decode_attn_indexer_scoped(myds_context_t *ctx,
         const bool use_decode_compact = (il > 20u) && need_block_mask &&
             ordinary_decode_allowed && !trace_on &&
             myds_v41_gpu_indexer_decode_compact_ready(args->gpu_scratch, count);
+        const bool use_l20_self_compact = (decode_topk_fast == 1) && (il == 20u) &&
+            need_block_mask && prep_decode_compact && blocks > 2048u &&
+            count > 16384u && count <= 1048576u &&
+            ratio > 0u && ((pos + 1u) / ratio) >= count &&
+            myds_v41_gpu_topk_l20_self_compact_eligible(args->gpu_scratch, count);
         const bool overlap_topk_qb = defer_idx_qb && (count < 512u || count > 1024u) &&
-            !(il == 20u && need_block_mask);
+            (!(il == 20u && need_block_mask) || decode_topk_fast == 1);
+        const bool l20_early_qb = overlap_topk_qb && (il == 20u) && need_block_mask;
+        bool attn_hc_dispatched = false;
         const uint32_t qb_c5_heads = kv_commit ? 16u : 4u;
         const uint32_t qb_c6_heads = !overlap_topk_qb ? 16u
             : (count > 1024u ? (kv_commit ? 16u : 28u) : (kv_commit ? 17u : 29u));
@@ -2896,9 +2905,31 @@ int myds_v41_decode_attn_indexer_scoped(myds_context_t *ctx,
             }
             if (il == 20u && need_block_mask) {
                 const uint32_t top_blocks = blocks < 2048u ? blocks : 2048u;
-                STAGE_CHECK(myds_v41_gpu_candidates(args->block_scores, args->index_scores, count, pos, ratio));
+                if (l20_early_qb) {
+                    if (want_attn_hc) {
+                        STAGE_CHECK(myds_metal_v41_hc_mix_split_stage(args->attn_split, args->mix,
+                            args->attn_scale, args->attn_base, 5120u, args->hc_eps));
+                        atomic_fetch_add_explicit(&attn_hc_overlap_encoded, 1, memory_order_relaxed);
+                        attn_hc_dispatched = true;
+                    }
+                    myds_v41_gpu_attn_kv_reuse_defer_q_rope(args->gpu_scratch, ctx->q, compressed);
+                    myds_v41_gpu_attn_kv_reuse_bind_topk_qb(args->gpu_scratch, base->attn_q_b,
+                        ctx->qr_norm, pos, qb_c5_heads + qb_c6_heads);
+                }
+                if (use_l20_self_compact) {
+                    STAGE_CHECK(myds_v41_gpu_l20_decode_candidates_nan(args->block_scores,
+                        args->index_scores, count, pos, ratio, args->gpu_scratch));
+                } else {
+                    STAGE_CHECK(myds_v41_gpu_candidates(args->block_scores, args->index_scores, count, pos, ratio));
+                }
                 myds_metal_barrier_buffer(args->block_scores);
                 STAGE_CHECK(myds_v41_gpu_topk(args->block_selected, args->block_scores, blocks, top_blocks, args->gpu_scratch));
+                if (l20_early_qb) {
+                    /* topk skips trailing ids barrier while direct_deferred_q is set,
+                     * and may have written Q_B heads on its final merge pass. */
+                    const myds_metal_buffer_t *blk_q_deps[] = { args->block_selected, ctx->q };
+                    myds_metal_barrier_buffers(blk_q_deps, 2u);
+                }
                 if (prep_decode_compact) {
                     STAGE_CHECK(myds_v41_gpu_indexer_prepare_compact_blocks(args->gpu_scratch,
                         args->block_selected, blocks, top_blocks, count));
@@ -2911,20 +2942,28 @@ int myds_v41_decode_attn_indexer_scoped(myds_context_t *ctx,
             }
         }
         if (defer_idx_qb) {
-            if (want_attn_hc) {
+            if (want_attn_hc && !attn_hc_dispatched) {
                 STAGE_CHECK(myds_metal_v41_hc_mix_split_stage(args->attn_split, args->mix,
                     args->attn_scale, args->attn_base, 5120u, args->hc_eps));
                 atomic_fetch_add_explicit(&attn_hc_overlap_encoded, 1, memory_order_relaxed);
             }
-            myds_v41_gpu_attn_kv_reuse_defer_q_rope(args->gpu_scratch, ctx->q, compressed);
-            if (overlap_topk_qb) {
-                myds_v41_gpu_attn_kv_reuse_bind_topk_qb(args->gpu_scratch, base->attn_q_b,
-                    ctx->qr_norm, pos, qb_c5_heads + qb_c6_heads);
+            if (l20_early_qb) {
+                myds_v41_gpu_attn_kv_reuse_rebind_topk_qb(args->gpu_scratch, base->attn_q_b,
+                    ctx->qr_norm, pos);
+            } else {
+                myds_v41_gpu_attn_kv_reuse_defer_q_rope(args->gpu_scratch, ctx->q, compressed);
+                if (overlap_topk_qb) {
+                    myds_v41_gpu_attn_kv_reuse_bind_topk_qb(args->gpu_scratch, base->attn_q_b,
+                        ctx->qr_norm, pos, qb_c5_heads + qb_c6_heads);
+                }
             }
         }
         const uint32_t top_k = count < 512u ? count : 512u;
         if (use_decode_compact) {
             STAGE_CHECK(myds_v41_gpu_topk_compact_decode(args->selected, count, args->gpu_scratch));
+        } else if (use_l20_self_compact) {
+            STAGE_CHECK(myds_v41_gpu_topk_l20_self_compact_decode(args->selected,
+                args->index_scores, count, args->gpu_scratch));
         } else {
             STAGE_CHECK(myds_v41_gpu_topk(args->selected, args->index_scores, count, top_k, args->gpu_scratch));
         }

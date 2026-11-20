@@ -173,6 +173,7 @@ TEST_INDEXER_TOPK_RADIX_PT1 = $(BIN_DIR)/test_indexer_topk_radix_pt1
 TEST_INDEXER_KEY_FP4 = $(BIN_DIR)/test_indexer_key_fp4
 TEST_INDEXER_DECODE_MMA = $(BIN_DIR)/test_indexer_decode_mma
 TEST_ATTN_DECODE_MMA = $(BIN_DIR)/test_attention_decode_mma
+TEST_DECODE_TOPK_FAST = $(BIN_DIR)/test_decode_topk_fast
 ALL_TESTS += $(TEST_STEER)
 ALL_TESTS += $(TEST_VISPRE)
 ALL_TESTS += $(TEST_INDEXER_DECODE_COMPACT)
@@ -184,6 +185,7 @@ ALL_TESTS += $(TEST_ATTN_DECODE_MMA)
 ALL_TESTS += $(TEST_SUFFIX_SHRINK_FINAL_MB)
 ALL_TESTS += $(TEST_MOE_PREFILL_M1)
 ALL_TESTS += $(TEST_MOE_EPILOGUE_FUSE)
+ALL_TESTS += $(TEST_DECODE_TOPK_FAST)
 
 $(TEST_STEER): tests/test_steer.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -Iinclude -o $@ tests/test_steer.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS)
@@ -207,6 +209,9 @@ $(TEST_INDEXER_DECODE_MMA): tests/test_indexer_decode_mma.m $(BUILD_DIR)/myds_v4
 	$(CC) $(OBJCFLAGS) -Iinclude -o $@ $< $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS)
 
 $(TEST_ATTN_DECODE_MMA): tests/test_attention_decode_mma.m $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) -Iinclude -o $@ $< $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS)
+
+$(TEST_DECODE_TOPK_FAST): tests/test_decode_topk_fast.m $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Iinclude -o $@ $< $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS)
 
 # CPU-only: exercises the request_phases formatter. A printf whose argument types
@@ -1073,6 +1078,7 @@ test: check-knobs $(ALL_TESTS) $(METALLIB)
 	@./$(TEST_INDEXER_TOPK_RADIX_PT1)
 	@./$(TEST_INDEXER_KEY_FP4)
 	@./$(TEST_ATTN_DECODE_MMA)
+	@./$(TEST_DECODE_TOPK_FAST)
 	@./$(TEST_GGUF_BOUNDS)
 	@./$(TEST_GGUF_SPLIT)
 	@./$(TEST_GGUF_BYTE_SPLIT)
