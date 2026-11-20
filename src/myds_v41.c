@@ -3464,8 +3464,15 @@ static int project_batch(myds_metal_buffer_t *out, const myds_metal_buffer_t *w,
         if (mm_min && rows < mm_min) use_mm = 0;   /* 小 M：MM 的 64 行 tile 会退化成单块 */
     }
     int ok = 0;
+    int fused_bf16 = 0;
     if (use_mm) {
-        ok = myds_metal_mul_mm(out, w, in, rows, width, n_tok, type);
+        if (round && type == GGML_TYPE_Q4_K && myds_metal_dense_prefill_wide_enabled()) {
+            ok = myds_metal_mul_mm_bf16(out, w, in, rows, width, n_tok, type);
+            if (ok) fused_bf16 = 1;
+        }
+        if (!ok) {
+            ok = myds_metal_mul_mm(out, w, in, rows, width, n_tok, type);
+        }
     }
     if (!ok) {
         ok = ((type == GGML_TYPE_F16 || type == GGML_TYPE_F32)
@@ -3473,7 +3480,7 @@ static int project_batch(myds_metal_buffer_t *out, const myds_metal_buffer_t *w,
             : myds_metal_gemv_batch(out, w, in, rows, width, n_tok, type));
     }
     if (!ok) return 0;
-    if (round) {
+    if (round && !fused_bf16) {
         if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(out);
         if (!myds_metal_v41_bf16(out, rows * n_tok)) return 0;
     }
@@ -8621,12 +8628,35 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 TIME_START();
                 if (kv_only) { /* 前端只喂窗口环，Q 完全不用算 */ }
                 else {
-                if (!opt_skip_q_b)
-                    CHECK(project_batch(cw->q_buf, base->attn_q_b, cw->qr_norm_buf, V41_HEADS * 512, 1280, c_len, base->attn_q_b_type, false));
+                bool qb_bf16_fused = false;
+                if (!opt_skip_q_b) {
+                    if (!opt_skip_q_rope &&
+                        myds_metal_dense_prefill_wide_enabled() &&
+                        base->attn_q_b_type == GGML_TYPE_Q4_K &&
+                        c_len >= 32 && !is_mul_mm_disabled() &&
+                        (!mm_min_m() || (V41_HEADS * 512u) >= mm_min_m())) {
+                        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(cw->qr_norm_buf);
+                        if (myds_metal_mul_mm_bf16(cw->q_buf, base->attn_q_b, cw->qr_norm_buf,
+                                                   V41_HEADS * 512u, 1280u, c_len, base->attn_q_b_type)) {
+                            if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(cw->q_buf);
+                            qb_bf16_fused = true;
+                        }
+                    }
+                    if (!qb_bf16_fused)
+                        CHECK(project_batch(cw->q_buf, base->attn_q_b, cw->qr_norm_buf, V41_HEADS * 512, 1280, c_len, base->attn_q_b_type, false));
+                }
 
-                /* Batched RoPE + BF16 rounding for Q */
-                if (!opt_skip_q_rope)
-                    CHECK(myds_v41_gpu_rope_batch_round(cw->q_buf, 512, V41_HEADS, mb_base_pos + c_start, c_len, compressed, false));
+                /* Batched RoPE (+ BF16 rounding when Q_B did not fuse BF16 in-register).
+                 * [P-R1] Site 1: Q_B fused BF16 already rounded all 512 dims, so dispatch
+                 * 64-dim-only kernel_dsv41_rope (skips 87.5% DRAM traffic, strict 0-ULP). */
+                if (!opt_skip_q_rope) {
+                    if (qb_bf16_fused) {
+                        CHECK(myds_v41_gpu_rope_batch(cw->q_buf, 512, V41_HEADS, mb_base_pos + c_start, c_len, compressed, false));
+                        myds_metal_dense_prefill_wide_note_qb_rope64();
+                    } else {
+                        CHECK(myds_v41_gpu_rope_batch_round(cw->q_buf, 512, V41_HEADS, mb_base_pos + c_start, c_len, compressed, false));
+                    }
+                }
 
                 if (trace_on) {
                     for (uint32_t t = 0; t < c_len; t++) {
@@ -8834,14 +8864,27 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 
                 if (!myds_metal_get_auto_barrier()) myds_metal_barrier();
                 int a_ok = 0;
-                if (!opt_disable_mm_attn_a)
-                    a_ok = myds_metal_mul_mm_grouped(cw->attn_low_buf, base->attn_output_a,
-                            cw->attn_heads_buf, 1024, 4096, 8, c_len, base->attn_output_a_type);
+                int a_bf16_fused = 0;
+                if (!opt_disable_mm_attn_a) {
+                    if (myds_metal_dense_prefill_wide_enabled() &&
+                        base->attn_output_a_type == GGML_TYPE_Q4_K) {
+                        a_ok = myds_metal_mul_mm_grouped_bf16(cw->attn_low_buf, base->attn_output_a,
+                                cw->attn_heads_buf, 1024, 4096, 8, c_len, base->attn_output_a_type);
+                        if (a_ok) a_bf16_fused = 1;
+                    }
+                    if (!a_ok) {
+                        a_ok = myds_metal_mul_mm_grouped(cw->attn_low_buf, base->attn_output_a,
+                                cw->attn_heads_buf, 1024, 4096, 8, c_len, base->attn_output_a_type);
+                    }
+                }
                 if (!a_ok)
                     a_ok = myds_metal_attn_output_a_batch(cw->attn_low_buf, base->attn_output_a,
                             cw->attn_heads_buf, 8, 4096, 1024, c_len, base->attn_output_a_type);
                 CHECK(a_ok);
-                CHECK(myds_metal_v41_bf16(cw->attn_low_buf, 8192 * c_len));
+                if (!a_bf16_fused)
+                    CHECK(myds_metal_v41_bf16(cw->attn_low_buf, 8192 * c_len));
+                else if (!myds_metal_get_auto_barrier())
+                    myds_metal_barrier_buffer(cw->attn_low_buf);
                 TIME_ACC(prof_step4);
                 PHASE_BOUNDARY(MYDS_PH_TAG_ATTN_OUT);
                 if (do_prof) { disp_mark4 = myds_metal_dispatch_count(); disp_step14 += disp_mark4 - disp_layer0; }  /* 诊断 */
@@ -8966,9 +9009,25 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 phase = "batched MoE shared and router";
                 uint32_t width = m->moe_expert_dim;
                 CHECK(project_batch(cw->router_logits_buf, base->router_gate, cur_norm, m->n_routed_experts, V41_DIM, c_len, base->router_gate_type, false));
-                CHECK(project_batch(cw->shared_gate_buf, base->shared_gate, cur_norm, width, V41_DIM, c_len, base->shared_gate_type, true));
-                CHECK(project_batch(cw->shared_up_buf, base->shared_up, cur_norm, width, V41_DIM, c_len, base->shared_up_type, true));
-                CHECK(myds_v41_shared_swiglu(cw->shared_swiglu_buf, cw->shared_gate_buf, cw->shared_up_buf, width * c_len, m->swiglu_clamp_exp));
+                int shared_pair_ok = 0;
+                if (myds_metal_dense_prefill_wide_enabled() &&
+                    base->shared_gate_type == GGML_TYPE_Q4_K &&
+                    base->shared_up_type == GGML_TYPE_Q4_K &&
+                    c_len >= 32 && !is_mul_mm_disabled() &&
+                    (!mm_min_m() || width >= mm_min_m())) {
+                    if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(cur_norm);
+                    shared_pair_ok = myds_metal_mul_mm_q4_k_pair_swiglu_bf16(
+                        cw->shared_swiglu_buf, base->shared_gate, base->shared_up, cur_norm,
+                        width, V41_DIM, c_len, m->swiglu_clamp_exp);
+                    if (shared_pair_ok && !myds_metal_get_auto_barrier()) {
+                        myds_metal_barrier_buffer(cw->shared_swiglu_buf);
+                    }
+                }
+                if (!shared_pair_ok) {
+                    CHECK(project_batch(cw->shared_gate_buf, base->shared_gate, cur_norm, width, V41_DIM, c_len, base->shared_gate_type, true));
+                    CHECK(project_batch(cw->shared_up_buf, base->shared_up, cur_norm, width, V41_DIM, c_len, base->shared_up_type, true));
+                    CHECK(myds_v41_shared_swiglu(cw->shared_swiglu_buf, cw->shared_gate_buf, cw->shared_up_buf, width * c_len, m->swiglu_clamp_exp));
+                }
                 CHECK(project_batch(cur_shared, base->shared_down, cw->shared_swiglu_buf, V41_DIM, width, c_len, base->shared_down_type, true));
 
                   if (do_prof && opt_prof_shared) {

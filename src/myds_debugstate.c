@@ -226,6 +226,9 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
     myds_engram_async_t1_counters_t eat1;
     memset(&eat1, 0, sizeof(eat1));
     myds_engram_async_t1_counters(&eat1, false);
+    myds_metal_dense_prefill_wide_counters_t dpw;
+    memset(&dpw, 0, sizeof(dpw));
+    myds_metal_dense_prefill_wide_counters(&dpw, false);
 
     /* Knob accounting, reusing the same inventory --print-config reports. */
     static myds_knob_seen_t seen[1024];
@@ -290,6 +293,9 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          "\"decode_iq2_fast\":{\"requests\":%llu,\"encoded\":%llu,\"failures\":%llu},"
          "\"engram_async_t1\":{\"requests\":%llu,\"dispatched\":%llu,\"joined\":%llu,"
          "\"cancelled\":%llu,\"failures\":%llu},"
+         "\"dense_prefill_wide\":{\"enabled\":%d,\"requests\":%llu,\"wide_encoded\":%llu,"
+         "\"narrow_bf16_encoded\":%llu,\"grouped_wide_encoded\":%llu,\"shared_pair_encoded\":%llu,"
+         "\"qb_rope64_encoded\":%llu,\"fallbacks\":%llu,\"failures\":%llu},"
          "\"prefix_cache_len\":%u},",
          (unsigned)idx_mode, idx_fmt, (unsigned)idx_row_bytes,
          (unsigned long long)ro.requests, (unsigned long long)ro.encoded,
@@ -334,6 +340,15 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          (unsigned long long)eat1.joined,
          (unsigned long long)eat1.cancelled,
          (unsigned long long)eat1.failures,
+         myds_metal_dense_prefill_wide_enabled(),
+         (unsigned long long)dpw.requests,
+         (unsigned long long)dpw.wide_encoded,
+         (unsigned long long)dpw.narrow_bf16_encoded,
+         (unsigned long long)dpw.grouped_wide_encoded,
+         (unsigned long long)dpw.shared_pair_encoded,
+         (unsigned long long)dpw.qb_rope64_encoded,
+         (unsigned long long)dpw.fallbacks,
+         (unsigned long long)dpw.failures,
          ctx ? myds_context_get_pcache_len(ctx) : 0u);
 
     const myds_steer_t *st = ctx ? myds_context_get_steer(ctx) : NULL;

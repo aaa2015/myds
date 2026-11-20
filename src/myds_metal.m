@@ -189,6 +189,20 @@ static id<MTLComputePipelineState> g_pso_mul_mm_q8_0 = nil;
 static id<MTLComputePipelineState> g_pso_mul_mm_q8_0_bco = nil;
 static id<MTLComputePipelineState> g_pso_mul_mm_q4_K = nil;
 static id<MTLComputePipelineState> g_pso_mul_mm_q4_K_bco = nil;
+static bool                        g_dense_prefill_wide = false;
+static id<MTLComputePipelineState> g_pso_mul_mm_q4_K_f32_wide = nil;
+static id<MTLComputePipelineState> g_pso_mul_mm_q4_K_bf16_wide = nil;
+static id<MTLComputePipelineState> g_pso_mul_mm_q4_K_f32_u4 = nil;
+static id<MTLComputePipelineState> g_pso_mul_mm_q4_K_bf16_u4 = nil;
+static id<MTLComputePipelineState> g_pso_mul_mm_q4_K_pair_swiglu_bf16 = nil;
+static _Atomic uint64_t            g_dpw_requests = 0;
+static _Atomic uint64_t            g_dpw_wide_encoded = 0;
+static _Atomic uint64_t            g_dpw_narrow_bf16_encoded = 0;
+static _Atomic uint64_t            g_dpw_grouped_wide_encoded = 0;
+static _Atomic uint64_t            g_dpw_shared_pair_encoded = 0;
+static _Atomic uint64_t            g_dpw_qb_rope64_encoded = 0;
+static _Atomic uint64_t            g_dpw_fallbacks = 0;
+static _Atomic uint64_t            g_dpw_failures = 0;
 static id<MTLComputePipelineState> g_pso_mul_mm_f16 = nil;
 static id<MTLComputePipelineState> g_pso_mul_mm_f16_bco = nil;
 static id<MTLComputePipelineState> g_pso_mul_mm_f32 = nil;
@@ -1954,8 +1968,10 @@ int myds_metal_init(const char *shader_dir) {
     const int dense_q4_v41_nb = decode_candidate_parse("MYDS_DENSE_Q4_V41_NB");
     const int dense_q4_v41_head_reference = decode_candidate_parse("MYDS_DENSE_Q4_V41_HEAD_REFERENCE");
     const int shared_q4_v41_nb = decode_candidate_parse("MYDS_SHARED_Q4_V41_NB");
+    const int dense_prefill_wide = decode_candidate_parse("MYDS_DENSE_PREFILL_WIDE");
     if (moe_down_overlap < 0 || moe_iq2_v41 < 0 || dense_q4_v41 < 0 ||
-        dense_q4_v41_nb < 0 || dense_q4_v41_head_reference < 0 || shared_q4_v41_nb < 0) return 0;
+        dense_q4_v41_nb < 0 || dense_q4_v41_head_reference < 0 ||
+        shared_q4_v41_nb < 0 || dense_prefill_wide < 0) return 0;
     if ((dense_q4_v41_nb || dense_q4_v41_head_reference) && !dense_q4_v41) {
         fprintf(stderr,"myds_metal: Q4 provider ablations require MYDS_DENSE_Q4_V41=1\n");
         return 0;
@@ -2828,6 +2844,44 @@ int myds_metal_init(const char *shader_dir) {
         fn = [g_library newFunctionWithName:@"kernel_mul_mm_q4_K_f32" constantValues:mm_c_bco1 error:nil];
         if (fn) g_pso_mul_mm_q4_K_bco = [g_device newComputePipelineStateWithFunction:fn error:nil];
 
+        /* [P-D1] MYDS_DENSE_PREFILL_WIDE: default 0 (fail-closed on invalid/missing PSO). */
+        g_dense_prefill_wide = (dense_prefill_wide == 1);
+        if (g_dense_prefill_wide) {
+            fn = [g_library newFunctionWithName:@"kernel_mul_mm_q4_K_f32_wide"];
+            if (fn) g_pso_mul_mm_q4_K_f32_wide = [g_device newComputePipelineStateWithFunction:fn error:nil];
+            fn = [g_library newFunctionWithName:@"kernel_mul_mm_q4_K_bf16_wide"];
+            if (fn) g_pso_mul_mm_q4_K_bf16_wide = [g_device newComputePipelineStateWithFunction:fn error:nil];
+            fn = [g_library newFunctionWithName:@"kernel_mul_mm_q4_K_f32_u4"];
+            if (fn) g_pso_mul_mm_q4_K_f32_u4 = [g_device newComputePipelineStateWithFunction:fn error:nil];
+            fn = [g_library newFunctionWithName:@"kernel_mul_mm_q4_K_bf16_u4"];
+            if (fn) g_pso_mul_mm_q4_K_bf16_u4 = [g_device newComputePipelineStateWithFunction:fn error:nil];
+            fn = [g_library newFunctionWithName:@"kernel_mul_mm_q4_K_pair_swiglu_bf16"];
+            if (fn) g_pso_mul_mm_q4_K_pair_swiglu_bf16 = [g_device newComputePipelineStateWithFunction:fn error:nil];
+            id<MTLComputePipelineState> dpw_psos[5] = {
+                g_pso_mul_mm_q4_K_f32_wide,
+                g_pso_mul_mm_q4_K_bf16_wide,
+                g_pso_mul_mm_q4_K_f32_u4,
+                g_pso_mul_mm_q4_K_bf16_u4,
+                g_pso_mul_mm_q4_K_pair_swiglu_bf16,
+            };
+            bool dpw_ok = (g_device.maxThreadgroupMemoryLength >= 8192u);
+            for (int i = 0; i < 5 && dpw_ok; i++) {
+                id<MTLComputePipelineState> p = dpw_psos[i];
+                if (!p || p.threadExecutionWidth != 32u ||
+                    p.maxTotalThreadsPerThreadgroup < 128u ||
+                    p.staticThreadgroupMemoryLength > g_device.maxThreadgroupMemoryLength - 8192u) {
+                    dpw_ok = false;
+                }
+            }
+            if (!dpw_ok) {
+                fprintf(stderr, "myds_metal: MYDS_DENSE_PREFILL_WIDE=1 requested but wide Q4_K PSOs unavailable\n");
+                g_initialized = true;
+                myds_metal_cleanup();
+                return 0;
+            }
+            MYDS_LOG_I("Dense Q4_K prefill wide enabled (NR0=64/NR1=64 smem=8KB, uint4 dequant, fused BF16 + shared SwiGLU + Q_B 64-dim RoPE)");
+        }
+
         fn = [g_library newFunctionWithName:@"kernel_mul_mm_f16_f32" constantValues:mm_c_bco0 error:nil];
         if (fn) g_pso_mul_mm_f16 = [g_device newComputePipelineStateWithFunction:fn error:nil];
         fn = [g_library newFunctionWithName:@"kernel_mul_mm_f16_f32" constantValues:mm_c_bco1 error:nil];
@@ -3119,6 +3173,12 @@ void myds_metal_cleanup(void) {
     g_pso_mul_mm_q8_0_bco = nil;
     g_pso_mul_mm_q4_K = nil;
     g_pso_mul_mm_q4_K_bco = nil;
+    g_dense_prefill_wide = false;
+    g_pso_mul_mm_q4_K_f32_wide = nil;
+    g_pso_mul_mm_q4_K_bf16_wide = nil;
+    g_pso_mul_mm_q4_K_f32_u4 = nil;
+    g_pso_mul_mm_q4_K_bf16_u4 = nil;
+    g_pso_mul_mm_q4_K_pair_swiglu_bf16 = nil;
     g_pso_mul_mm_f16 = nil;
     g_pso_mul_mm_f16_bco = nil;
     g_pso_mul_mm_f32 = nil;
@@ -6523,16 +6583,68 @@ struct ds4_metal_args_mul_mm {
     uint64_t nb_out_batch;
 };
 
-int myds_metal_mul_mm(
+struct ds4_metal_args_mul_mm_pair_swiglu {
+    int32_t  ne00;
+    int32_t  ne0;
+    int32_t  ne1;
+    int32_t  pad0;
+    uint64_t nb01_gate;
+    uint64_t nb01_up;
+    uint64_t nb11;
+    uint64_t nb_out;
+    float    clamp_value;
+    float    pad1;
+};
+_Static_assert(sizeof(struct ds4_metal_args_mul_mm_pair_swiglu) == 56u,
+               "ds4_metal_args_mul_mm_pair_swiglu host/shader ABI");
+
+int myds_metal_dense_prefill_wide_enabled(void) {
+    return g_dense_prefill_wide ? 1 : 0;
+}
+
+void myds_metal_dense_prefill_wide_note_qb_rope64(void) {
+    atomic_fetch_add_explicit(&g_dpw_qb_rope64_encoded, 1u, memory_order_relaxed);
+}
+
+void myds_metal_dense_prefill_wide_counters(
+    myds_metal_dense_prefill_wide_counters_t *out, bool reset) {
+    myds_metal_dense_prefill_wide_counters_t v;
+    v.requests             = reset ? atomic_exchange_explicit(&g_dpw_requests, 0, memory_order_relaxed)
+                                   : atomic_load_explicit(&g_dpw_requests, memory_order_relaxed);
+    v.wide_encoded         = reset ? atomic_exchange_explicit(&g_dpw_wide_encoded, 0, memory_order_relaxed)
+                                   : atomic_load_explicit(&g_dpw_wide_encoded, memory_order_relaxed);
+    v.narrow_bf16_encoded  = reset ? atomic_exchange_explicit(&g_dpw_narrow_bf16_encoded, 0, memory_order_relaxed)
+                                   : atomic_load_explicit(&g_dpw_narrow_bf16_encoded, memory_order_relaxed);
+    v.grouped_wide_encoded = reset ? atomic_exchange_explicit(&g_dpw_grouped_wide_encoded, 0, memory_order_relaxed)
+                                   : atomic_load_explicit(&g_dpw_grouped_wide_encoded, memory_order_relaxed);
+    v.shared_pair_encoded  = reset ? atomic_exchange_explicit(&g_dpw_shared_pair_encoded, 0, memory_order_relaxed)
+                                   : atomic_load_explicit(&g_dpw_shared_pair_encoded, memory_order_relaxed);
+    v.qb_rope64_encoded    = reset ? atomic_exchange_explicit(&g_dpw_qb_rope64_encoded, 0, memory_order_relaxed)
+                                   : atomic_load_explicit(&g_dpw_qb_rope64_encoded, memory_order_relaxed);
+    v.fallbacks            = reset ? atomic_exchange_explicit(&g_dpw_fallbacks, 0, memory_order_relaxed)
+                                   : atomic_load_explicit(&g_dpw_fallbacks, memory_order_relaxed);
+    v.failures             = reset ? atomic_exchange_explicit(&g_dpw_failures, 0, memory_order_relaxed)
+                                   : atomic_load_explicit(&g_dpw_failures, memory_order_relaxed);
+    if (out) *out = v;
+}
+
+static inline bool buf_aligned16_metal(const myds_metal_buffer_t *b) {
+    return b && b->mtl_buf && ((b->offset & 15u) == 0u) &&
+           (!b->ptr || (((uintptr_t)b->ptr & 15u) == 0u));
+}
+
+static int mul_mm_impl(
     myds_metal_buffer_t       *dst,
     const myds_metal_buffer_t *W,
     const myds_metal_buffer_t *src1,
     uint32_t                   out_dim,
     uint32_t                   in_dim,
     uint32_t                   n_tok,
-    ggml_type                  weight_type) {
+    ggml_type                  weight_type,
+    bool                       round_bf16) {
     if (!dst || !W || !src1 || out_dim == 0 || in_dim == 0 || n_tok == 0) return 0;
     if (n_tok == 1) {
+        if (round_bf16) return 0;
         return myds_metal_gemv(dst, W, src1, out_dim, in_dim, weight_type);
     }
 
@@ -6541,26 +6653,55 @@ int myds_metal_mul_mm(
 
     id<MTLComputePipelineState> pipeline = nil;
     uint64_t row_bytes = 0;
+    bool use_dpw = false;
+    bool use_wide = false;
 
-    if (weight_type == GGML_TYPE_Q8_0) {
-        pipeline = bc_out ? g_pso_mul_mm_q8_0_bco : g_pso_mul_mm_q8_0;
-        row_bytes = (in_dim / 32u) * 34u;
-    } else if (weight_type == GGML_TYPE_Q4_K) {
-        if (in_dim % 256u != 0) return 0;
-        pipeline = bc_out ? g_pso_mul_mm_q4_K_bco : g_pso_mul_mm_q4_K;
-        row_bytes = (in_dim / 256u) * 144u;
-    } else if (weight_type == GGML_TYPE_F16) {
-        pipeline = bc_out ? g_pso_mul_mm_f16_bco : g_pso_mul_mm_f16;
-        row_bytes = in_dim * sizeof(uint16_t);
-    } else if (weight_type == GGML_TYPE_F32) {
-        pipeline = bc_out ? g_pso_mul_mm_f32_bco : g_pso_mul_mm_f32;
-        row_bytes = in_dim * sizeof(float);
+    if (weight_type == GGML_TYPE_Q4_K && g_dense_prefill_wide && !bc_inp && (in_dim % 256u) == 0) {
+        row_bytes = (uint64_t)(in_dim / 256u) * 144u;
+        if (W->size / row_bytes < out_dim ||
+            src1->size / sizeof(float) / in_dim < n_tok ||
+            dst->size / sizeof(float) / out_dim < n_tok) return 0;
+        atomic_fetch_add_explicit(&g_dpw_requests, 1u, memory_order_relaxed);
+        if (buf_aligned16_metal(W) && buf_aligned16_metal(src1) && buf_aligned16_metal(dst)) {
+            use_wide = (n_tok >= 64u);
+            pipeline = use_wide
+                ? (round_bf16 ? g_pso_mul_mm_q4_K_bf16_wide : g_pso_mul_mm_q4_K_f32_wide)
+                : (round_bf16 ? g_pso_mul_mm_q4_K_bf16_u4   : g_pso_mul_mm_q4_K_f32_u4);
+            if (pipeline) {
+                use_dpw = true;
+            } else {
+                atomic_fetch_add_explicit(&g_dpw_fallbacks, 1u, memory_order_relaxed);
+            }
+        } else {
+            /* Unaligned buffer: safely fall back to scalar baseline path. */
+            atomic_fetch_add_explicit(&g_dpw_fallbacks, 1u, memory_order_relaxed);
+        }
+        if (round_bf16 && !use_dpw) return 0;
+    } else if (round_bf16) {
+        return 0;
     }
 
-    if (row_bytes == 0 ||
-        W->size / row_bytes < out_dim ||
-        src1->size / sizeof(float) / in_dim < n_tok ||
-        dst->size / sizeof(float) / out_dim < n_tok) return 0;
+    if (!use_dpw) {
+        if (weight_type == GGML_TYPE_Q8_0) {
+            pipeline = bc_out ? g_pso_mul_mm_q8_0_bco : g_pso_mul_mm_q8_0;
+            row_bytes = (in_dim / 32u) * 34u;
+        } else if (weight_type == GGML_TYPE_Q4_K) {
+            if (in_dim % 256u != 0) return 0;
+            pipeline = bc_out ? g_pso_mul_mm_q4_K_bco : g_pso_mul_mm_q4_K;
+            row_bytes = (in_dim / 256u) * 144u;
+        } else if (weight_type == GGML_TYPE_F16) {
+            pipeline = bc_out ? g_pso_mul_mm_f16_bco : g_pso_mul_mm_f16;
+            row_bytes = in_dim * sizeof(uint16_t);
+        } else if (weight_type == GGML_TYPE_F32) {
+            pipeline = bc_out ? g_pso_mul_mm_f32_bco : g_pso_mul_mm_f32;
+            row_bytes = in_dim * sizeof(float);
+        }
+
+        if (row_bytes == 0 ||
+            W->size / row_bytes < out_dim ||
+            src1->size / sizeof(float) / in_dim < n_tok ||
+            dst->size / sizeof(float) / out_dim < n_tok) return 0;
+    }
 
     if (pipeline && W->mtl_buf && src1->mtl_buf && dst->mtl_buf && !bc_inp) {
         @autoreleasepool {
@@ -6588,12 +6729,33 @@ int myds_metal_mul_mm(
             [enc setBuffer:W->mtl_buf offset:(W ? W->offset : 0) atIndex:1];
             [enc setBuffer:src1->mtl_buf offset:(src1 ? src1->offset : 0) atIndex:2];
             [enc setBuffer:dst->mtl_buf offset:(dst ? dst->offset : 0) atIndex:3];
-            uint32_t tg_mem = (weight_type == GGML_TYPE_F32) ? 12288u : (bc_out ? 8192u : 6144u);
+            uint32_t tg_mem;
+            NSUInteger grid_x;
+            const char *tag;
+            if (use_dpw) {
+                tg_mem = use_wide ? 8192u : ((round_bf16 || bc_out) ? 8192u : 6144u);
+                grid_x = use_wide ? (((NSUInteger)n_tok + 63u) / 64u)
+                                  : (((NSUInteger)n_tok + 31u) / 32u);
+                tag = use_wide ? (round_bf16 ? "gemm_q4k_wide_bf16" : "gemm_q4k_wide")
+                               : (round_bf16 ? "gemm_q4k_u4_bf16"   : "gemm_q4k_u4");
+            } else {
+                tg_mem = (weight_type == GGML_TYPE_F32) ? 12288u : (bc_out ? 8192u : 6144u);
+                grid_x = ((NSUInteger)n_tok + 31u) / 32u;
+                tag = "gemm_batch";
+            }
             [enc setThreadgroupMemoryLength:tg_mem atIndex:0];
-            metal_dispatch(enc, "gemm_batch", MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
-                                                  ((NSUInteger)out_dim + 63u) / 64u,
-                                                  1),
+            metal_dispatch(enc, tag, MTLSizeMake(grid_x,
+                                                 ((NSUInteger)out_dim + 63u) / 64u,
+                                                 1),
                  MTLSizeMake(128, 1, 1));
+
+            if (use_dpw) {
+                if (use_wide) {
+                    atomic_fetch_add_explicit(&g_dpw_wide_encoded, 1u, memory_order_relaxed);
+                } else if (round_bf16) {
+                    atomic_fetch_add_explicit(&g_dpw_narrow_bf16_encoded, 1u, memory_order_relaxed);
+                }
+            }
 
             if (g_batch_cb) {
                 if (g_auto_barrier) {
@@ -6602,11 +6764,16 @@ int myds_metal_mul_mm(
             } else {
                 [enc endEncoding];
                 [cb commit];
-                if (!wait_command_buffer(cb)) return 0;
+                if (!wait_command_buffer(cb)) {
+                    if (use_dpw) atomic_fetch_add_explicit(&g_dpw_failures, 1u, memory_order_relaxed);
+                    return 0;
+                }
             }
             return 1;
         }
     }
+
+    if (round_bf16) return 0;
 
     /* Fallback to per-vector GEMV */
     for (uint32_t t = 0; t < n_tok; t++) {
@@ -6627,6 +6794,28 @@ int myds_metal_mul_mm(
     return 1;
 }
 
+int myds_metal_mul_mm(
+    myds_metal_buffer_t       *dst,
+    const myds_metal_buffer_t *W,
+    const myds_metal_buffer_t *src1,
+    uint32_t                   out_dim,
+    uint32_t                   in_dim,
+    uint32_t                   n_tok,
+    ggml_type                  weight_type) {
+    return mul_mm_impl(dst, W, src1, out_dim, in_dim, n_tok, weight_type, false);
+}
+
+int myds_metal_mul_mm_bf16(
+    myds_metal_buffer_t       *dst,
+    const myds_metal_buffer_t *W,
+    const myds_metal_buffer_t *src1,
+    uint32_t                   out_dim,
+    uint32_t                   in_dim,
+    uint32_t                   n_tok,
+    ggml_type                  weight_type) {
+    return mul_mm_impl(dst, W, src1, out_dim, in_dim, n_tok, weight_type, true);
+}
+
 /* 分组矩阵乘：一组一个权重矩阵，所有组在【一次】派发里完成。
  *
  * 布局（DS4 的 attention 输出投影就是这种）：
@@ -6637,11 +6826,11 @@ int myds_metal_mul_mm(
  * 这和逐 (组, token) 的 matvec 是同一个数学，区别只在重用方式：
  * matvec 那条路每个 threadgroup 都完整读一遍该组的权重，权重被读 n_tok 遍
  * （本模型是 512 遍，17 GB / layer-chunk）；这里权重按块读进 threadgroup 后
- * 同时服务 32 个 token。
+ * 同时服务 32（或宽变体 64）个 token。
  *
  * 各组之间的偏移分别落在 nb13（输入）、nb03（权重）、nb_out_batch（输出）上，
  * 因此 tgpig.z 就是组号，内核本身不需要循环。 */
-int myds_metal_mul_mm_grouped(
+static int mul_mm_grouped_impl(
     myds_metal_buffer_t       *dst,
     const myds_metal_buffer_t *W,
     const myds_metal_buffer_t *src1,
@@ -6649,7 +6838,8 @@ int myds_metal_mul_mm_grouped(
     uint32_t                   in_dim,
     uint32_t                   n_groups,
     uint32_t                   n_tok,
-    ggml_type                  weight_type) {
+    ggml_type                  weight_type,
+    bool                       round_bf16) {
     if (!dst || !W || !src1 || !out_dim || !in_dim || !n_groups || !n_tok) return 0;
 
     const bool bc_inp = (in_dim % 32u) != 0;
@@ -6657,27 +6847,55 @@ int myds_metal_mul_mm_grouped(
 
     id<MTLComputePipelineState> pipeline = nil;
     uint64_t row_bytes = 0;
+    bool use_dpw = false;
+    bool use_wide = false;
 
-    if (weight_type == GGML_TYPE_Q8_0) {
-        pipeline = bc_out ? g_pso_mul_mm_q8_0_bco : g_pso_mul_mm_q8_0;
-        row_bytes = (in_dim / 32u) * 34u;
-    } else if (weight_type == GGML_TYPE_Q4_K) {
-        if (in_dim % 256u != 0) return 0;
-        pipeline = bc_out ? g_pso_mul_mm_q4_K_bco : g_pso_mul_mm_q4_K;
-        row_bytes = (in_dim / 256u) * 144u;
-    } else if (weight_type == GGML_TYPE_F16) {
-        pipeline = bc_out ? g_pso_mul_mm_f16_bco : g_pso_mul_mm_f16;
-        row_bytes = in_dim * sizeof(uint16_t);
-    } else if (weight_type == GGML_TYPE_F32) {
-        pipeline = bc_out ? g_pso_mul_mm_f32_bco : g_pso_mul_mm_f32;
-        row_bytes = in_dim * sizeof(float);
+    if (weight_type == GGML_TYPE_Q4_K && g_dense_prefill_wide && !bc_inp && (in_dim % 256u) == 0) {
+        row_bytes = (uint64_t)(in_dim / 256u) * 144u;
+        if (W->size / row_bytes / out_dim < n_groups ||
+            src1->size / sizeof(float) / in_dim / n_groups < n_tok ||
+            dst->size / sizeof(float) / out_dim / n_groups < n_tok) return 0;
+        atomic_fetch_add_explicit(&g_dpw_requests, 1u, memory_order_relaxed);
+        if (buf_aligned16_metal(W) && buf_aligned16_metal(src1) && buf_aligned16_metal(dst)) {
+            use_wide = (n_tok >= 64u);
+            pipeline = use_wide
+                ? (round_bf16 ? g_pso_mul_mm_q4_K_bf16_wide : g_pso_mul_mm_q4_K_f32_wide)
+                : (round_bf16 ? g_pso_mul_mm_q4_K_bf16_u4   : g_pso_mul_mm_q4_K_f32_u4);
+            if (pipeline) {
+                use_dpw = true;
+            } else {
+                atomic_fetch_add_explicit(&g_dpw_fallbacks, 1u, memory_order_relaxed);
+            }
+        } else {
+            atomic_fetch_add_explicit(&g_dpw_fallbacks, 1u, memory_order_relaxed);
+        }
+        if (round_bf16 && !use_dpw) return 0;
+    } else if (round_bf16) {
+        return 0;
     }
 
-    if (!pipeline || !W->mtl_buf || !src1->mtl_buf || !dst->mtl_buf || bc_inp) return 0;
-    if (row_bytes == 0 ||
-        W->size / row_bytes / out_dim < n_groups ||
-        src1->size / sizeof(float) / in_dim / n_groups < n_tok ||
-        dst->size / sizeof(float) / out_dim / n_groups < n_tok) return 0;
+    if (!use_dpw) {
+        if (weight_type == GGML_TYPE_Q8_0) {
+            pipeline = bc_out ? g_pso_mul_mm_q8_0_bco : g_pso_mul_mm_q8_0;
+            row_bytes = (in_dim / 32u) * 34u;
+        } else if (weight_type == GGML_TYPE_Q4_K) {
+            if (in_dim % 256u != 0) return 0;
+            pipeline = bc_out ? g_pso_mul_mm_q4_K_bco : g_pso_mul_mm_q4_K;
+            row_bytes = (in_dim / 256u) * 144u;
+        } else if (weight_type == GGML_TYPE_F16) {
+            pipeline = bc_out ? g_pso_mul_mm_f16_bco : g_pso_mul_mm_f16;
+            row_bytes = in_dim * sizeof(uint16_t);
+        } else if (weight_type == GGML_TYPE_F32) {
+            pipeline = bc_out ? g_pso_mul_mm_f32_bco : g_pso_mul_mm_f32;
+            row_bytes = in_dim * sizeof(float);
+        }
+
+        if (!pipeline || !W->mtl_buf || !src1->mtl_buf || !dst->mtl_buf || bc_inp) return 0;
+        if (row_bytes == 0 ||
+            W->size / row_bytes / out_dim < n_groups ||
+            src1->size / sizeof(float) / in_dim / n_groups < n_tok ||
+            dst->size / sizeof(float) / out_dim / n_groups < n_tok) return 0;
+    }
 
     @autoreleasepool {
         struct ds4_metal_args_mul_mm args;
@@ -6706,12 +6924,33 @@ int myds_metal_mul_mm_grouped(
         [enc setBuffer:W->mtl_buf offset:W->offset atIndex:1];
         [enc setBuffer:src1->mtl_buf offset:src1->offset atIndex:2];
         [enc setBuffer:dst->mtl_buf offset:dst->offset atIndex:3];
-        uint32_t tg_mem = (weight_type == GGML_TYPE_F32) ? 12288u : (bc_out ? 8192u : 6144u);
+        uint32_t tg_mem;
+        NSUInteger grid_x;
+        const char *tag;
+        if (use_dpw) {
+            tg_mem = use_wide ? 8192u : ((round_bf16 || bc_out) ? 8192u : 6144u);
+            grid_x = use_wide ? (((NSUInteger)n_tok + 63u) / 64u)
+                              : (((NSUInteger)n_tok + 31u) / 32u);
+            tag = use_wide ? (round_bf16 ? "gemm_grouped_q4k_wide_bf16" : "gemm_grouped_q4k_wide")
+                           : (round_bf16 ? "gemm_grouped_q4k_u4_bf16"   : "gemm_grouped_q4k_u4");
+        } else {
+            tg_mem = (weight_type == GGML_TYPE_F32) ? 12288u : (bc_out ? 8192u : 6144u);
+            grid_x = ((NSUInteger)n_tok + 31u) / 32u;
+            tag = "gemm_grouped";
+        }
         [enc setThreadgroupMemoryLength:tg_mem atIndex:0];
-        metal_dispatch(enc, "gemm_grouped", MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
-                                              ((NSUInteger)out_dim + 63u) / 64u,
-                                              (NSUInteger)n_groups),
+        metal_dispatch(enc, tag, MTLSizeMake(grid_x,
+                                             ((NSUInteger)out_dim + 63u) / 64u,
+                                             (NSUInteger)n_groups),
              MTLSizeMake(128, 1, 1));
+
+        if (use_dpw) {
+            if (use_wide) {
+                atomic_fetch_add_explicit(&g_dpw_grouped_wide_encoded, 1u, memory_order_relaxed);
+            } else if (round_bf16) {
+                atomic_fetch_add_explicit(&g_dpw_narrow_bf16_encoded, 1u, memory_order_relaxed);
+            }
+        }
 
         if (g_batch_cb) {
             if (g_auto_barrier) {
@@ -6720,7 +6959,110 @@ int myds_metal_mul_mm_grouped(
         } else {
             [enc endEncoding];
             [cb commit];
-            if (!wait_command_buffer(cb)) return 0;
+            if (!wait_command_buffer(cb)) {
+                if (use_dpw) atomic_fetch_add_explicit(&g_dpw_failures, 1u, memory_order_relaxed);
+                return 0;
+            }
+        }
+        return 1;
+    }
+}
+
+int myds_metal_mul_mm_grouped(
+    myds_metal_buffer_t       *dst,
+    const myds_metal_buffer_t *W,
+    const myds_metal_buffer_t *src1,
+    uint32_t                   out_dim,
+    uint32_t                   in_dim,
+    uint32_t                   n_groups,
+    uint32_t                   n_tok,
+    ggml_type                  weight_type) {
+    return mul_mm_grouped_impl(dst, W, src1, out_dim, in_dim, n_groups, n_tok, weight_type, false);
+}
+
+int myds_metal_mul_mm_grouped_bf16(
+    myds_metal_buffer_t       *dst,
+    const myds_metal_buffer_t *W,
+    const myds_metal_buffer_t *src1,
+    uint32_t                   out_dim,
+    uint32_t                   in_dim,
+    uint32_t                   n_groups,
+    uint32_t                   n_tok,
+    ggml_type                  weight_type) {
+    return mul_mm_grouped_impl(dst, W, src1, out_dim, in_dim, n_groups, n_tok, weight_type, true);
+}
+
+int myds_metal_mul_mm_q4_k_pair_swiglu_bf16(
+    myds_metal_buffer_t       *dst_mid,
+    const myds_metal_buffer_t *W_gate,
+    const myds_metal_buffer_t *W_up,
+    const myds_metal_buffer_t *src1,
+    uint32_t                   out_dim,
+    uint32_t                   in_dim,
+    uint32_t                   n_tok,
+    float                      clamp_value) {
+    if (!g_dense_prefill_wide || !g_pso_mul_mm_q4_K_pair_swiglu_bf16) return 0;
+    if (!dst_mid || !W_gate || !W_up || !src1 ||
+        !out_dim || !in_dim || !n_tok || (in_dim % 256u) != 0 ||
+        !isfinite(clamp_value) || clamp_value < 0.0f) return 0;
+
+    atomic_fetch_add_explicit(&g_dpw_requests, 1u, memory_order_relaxed);
+
+    if (!buf_aligned16_metal(W_gate) || !buf_aligned16_metal(W_up) ||
+        !buf_aligned16_metal(src1) || !dst_mid->mtl_buf || (dst_mid->offset & 3u) != 0u) {
+        atomic_fetch_add_explicit(&g_dpw_fallbacks, 1u, memory_order_relaxed);
+        return 0;
+    }
+
+    const uint64_t row_bytes = (uint64_t)(in_dim / 256u) * 144u;
+    if (W_gate->size / row_bytes < out_dim ||
+        W_up->size / row_bytes < out_dim ||
+        src1->size / sizeof(float) / in_dim < n_tok ||
+        dst_mid->size / sizeof(float) / out_dim < n_tok) {
+        atomic_fetch_add_explicit(&g_dpw_failures, 1u, memory_order_relaxed);
+        return 0;
+    }
+
+    @autoreleasepool {
+        struct ds4_metal_args_mul_mm_pair_swiglu args;
+        memset(&args, 0, sizeof(args));
+        args.ne00        = (int32_t)in_dim;
+        args.ne0         = (int32_t)out_dim;
+        args.ne1         = (int32_t)n_tok;
+        args.nb01_gate   = row_bytes;
+        args.nb01_up     = row_bytes;
+        args.nb11        = (uint64_t)in_dim * sizeof(float);
+        args.nb_out      = (uint64_t)out_dim;
+        args.clamp_value = clamp_value;
+
+        id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
+        [enc setComputePipelineState:g_pso_mul_mm_q4_K_pair_swiglu_bf16];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:W_gate->mtl_buf offset:W_gate->offset atIndex:1];
+        [enc setBuffer:W_up->mtl_buf offset:W_up->offset atIndex:2];
+        [enc setBuffer:src1->mtl_buf offset:src1->offset atIndex:3];
+        [enc setBuffer:dst_mid->mtl_buf offset:dst_mid->offset atIndex:4];
+        [enc setThreadgroupMemoryLength:8192u atIndex:0];
+        metal_dispatch(enc, "gemm_q4k_pair_swiglu_bf16",
+                       MTLSizeMake(((NSUInteger)n_tok + 63u) / 64u,
+                                   ((NSUInteger)out_dim + 31u) / 32u,
+                                   1),
+                       MTLSizeMake(128, 1, 1));
+
+        atomic_fetch_add_explicit(&g_dpw_shared_pair_encoded, 1u, memory_order_relaxed);
+
+        if (g_batch_cb) {
+            if (g_auto_barrier) {
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            }
+        } else {
+            [enc endEncoding];
+            [cb commit];
+            if (!wait_command_buffer(cb)) {
+                atomic_fetch_add_explicit(&g_dpw_failures, 1u, memory_order_relaxed);
+                return 0;
+            }
         }
         return 1;
     }

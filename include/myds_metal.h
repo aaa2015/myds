@@ -553,6 +553,54 @@ int myds_metal_mul_mm_grouped(
     uint32_t                   n_tok,
     ggml_type                  weight_type);
 
+/* [P-D1] + [P-R1] Site 1: MYDS_DENSE_PREFILL_WIDE (default 0, fail-closed).
+ * Strict 0-ULP wide (NR0=64, NR1=64, 8 KB smem / 4 TGs/core) Q4_K prefill GEMM
+ * with 128-bit uint4 dequant, fused BF16 epilogue, fused Shared Gate+Up+SwiGLU,
+ * and Q_B 64-dim RoPE dispatch. */
+typedef struct {
+    uint64_t requests;
+    uint64_t wide_encoded;
+    uint64_t narrow_bf16_encoded;
+    uint64_t grouped_wide_encoded;
+    uint64_t shared_pair_encoded;
+    uint64_t qb_rope64_encoded;
+    uint64_t fallbacks;
+    uint64_t failures;
+} myds_metal_dense_prefill_wide_counters_t;
+int myds_metal_dense_prefill_wide_enabled(void);
+void myds_metal_dense_prefill_wide_counters(
+    myds_metal_dense_prefill_wide_counters_t *out, bool reset);
+void myds_metal_dense_prefill_wide_note_qb_rope64(void);
+
+int myds_metal_mul_mm_bf16(
+    myds_metal_buffer_t       *dst,
+    const myds_metal_buffer_t *W,
+    const myds_metal_buffer_t *src1,
+    uint32_t                   out_dim,
+    uint32_t                   in_dim,
+    uint32_t                   n_tok,
+    ggml_type                  weight_type);
+
+int myds_metal_mul_mm_grouped_bf16(
+    myds_metal_buffer_t       *dst,
+    const myds_metal_buffer_t *W,
+    const myds_metal_buffer_t *src1,
+    uint32_t                   out_dim,
+    uint32_t                   in_dim,
+    uint32_t                   n_groups,
+    uint32_t                   n_tok,
+    ggml_type                  weight_type);
+
+int myds_metal_mul_mm_q4_k_pair_swiglu_bf16(
+    myds_metal_buffer_t       *dst_mid,
+    const myds_metal_buffer_t *W_gate,
+    const myds_metal_buffer_t *W_up,
+    const myds_metal_buffer_t *src1,
+    uint32_t                   out_dim,
+    uint32_t                   in_dim,
+    uint32_t                   n_tok,
+    float                      clamp_value);
+
 /* SwiGLU activation: out = (x0 / (1 + exp(-x0))) * x1 */
 int myds_metal_swiglu(
     myds_metal_buffer_t       *out,
