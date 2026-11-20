@@ -6,6 +6,7 @@
 #include "myds_knobs.h"
 #include "myds_v41_gpu.h"
 #include "myds_metal.h"
+#include "myds_engram.h"
 #include "myds_log.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -222,6 +223,9 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
     myds_metal_decode_iq2_fast_counters_t iq2f;
     memset(&iq2f, 0, sizeof(iq2f));
     myds_metal_decode_iq2_fast_counters(&iq2f, false);
+    myds_engram_async_t1_counters_t eat1;
+    memset(&eat1, 0, sizeof(eat1));
+    myds_engram_async_t1_counters(&eat1, false);
 
     /* Knob accounting, reusing the same inventory --print-config reports. */
     static myds_knob_seen_t seen[1024];
@@ -284,6 +288,8 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          "\"l20_self_compact_encoded\":%llu,\"l20_self_compact_fallbacks\":%llu,"
          "\"l20_self_compact_failures\":%llu},"
          "\"decode_iq2_fast\":{\"requests\":%llu,\"encoded\":%llu,\"failures\":%llu},"
+         "\"engram_async_t1\":{\"requests\":%llu,\"dispatched\":%llu,\"joined\":%llu,"
+         "\"cancelled\":%llu,\"failures\":%llu},"
          "\"prefix_cache_len\":%u},",
          (unsigned)idx_mode, idx_fmt, (unsigned)idx_row_bytes,
          (unsigned long long)ro.requests, (unsigned long long)ro.encoded,
@@ -323,6 +329,11 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          (unsigned long long)iq2f.requests,
          (unsigned long long)iq2f.encoded,
          (unsigned long long)iq2f.failures,
+         (unsigned long long)eat1.requests,
+         (unsigned long long)eat1.dispatched,
+         (unsigned long long)eat1.joined,
+         (unsigned long long)eat1.cancelled,
+         (unsigned long long)eat1.failures,
          ctx ? myds_context_get_pcache_len(ctx) : 0u);
 
     const myds_steer_t *st = ctx ? myds_context_get_steer(ctx) : NULL;

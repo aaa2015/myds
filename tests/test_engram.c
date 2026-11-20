@@ -329,7 +329,7 @@ static void test_parallel_disk(void) {
         }
     assert(myds_engram_reader_read_token(NULL, tables, ids, actual));
     assert(memcmp(expected, actual, sizeof(actual)) == 0);
-    static const unsigned workers[] = {1, 2, 4, 8, 16};
+    static const unsigned workers[] = {1, 2, 4, 8, 16, 24, 48};
     for (size_t w = 0; w < sizeof(workers) / sizeof(workers[0]); ++w) {
         myds_engram_reader_t *reader = myds_engram_reader_create(workers[w]);
         assert(reader);
@@ -389,7 +389,7 @@ static void test_parallel_disk(void) {
         myds_engram_reader_free(reader);
     }
     assert(!myds_engram_reader_create(0) && errno == EINVAL);
-    assert(!myds_engram_reader_create(17) && errno == EINVAL);
+    assert(!myds_engram_reader_create(49) && errno == EINVAL);
     myds_engram_reader_free(NULL);
     /* Repeated lifecycle coverage catches stale requests and unjoined worker
      * access to freed storage under ASan/TSan, without timing-based assertions. */
@@ -401,7 +401,7 @@ static void test_parallel_disk(void) {
     }
     myds_engram_table_close(&tables[0]); myds_engram_table_close(&tables[1]);
     close(fd); unlink(path);
-    puts("Engram: serial/1/2/4/8/16-worker byte parity, repeated IDs, ordered errors, EOF/EBADF recovery and lifecycle passed");
+    puts("Engram: serial/1/2/4/8/16/24/48-worker byte parity, repeated IDs, ordered errors, EOF/EBADF recovery and lifecycle passed");
 }
 
 static void test_gate(void) {
@@ -435,14 +435,14 @@ static void test_model_readers(const gguf_file_t *gf, const char *path, int fd) 
     assert(serial && myds_engram_set_io_threads(serial, 1));
     write_patterned_tables(fd, serial->table);
     static const int32_t tokens[] = {1, 2, 3, 4, 4, 0, 1, 3, 2, 0, 4, 1};
-    static const unsigned workers[] = {1, 2, 4, 8, 16};
+    static const unsigned workers[] = {1, 2, 4, 8, 16, 24, 48};
     for (size_t w = 0; w < sizeof(workers) / sizeof(workers[0]); ++w) {
         myds_engram_t *parallel = myds_engram_clone(serial);
         assert(parallel && myds_engram_set_io_threads(parallel, workers[w]));
         myds_engram_reader_t *saved_reader = parallel->reader;
         assert(!myds_engram_set_io_threads(parallel, 0) && errno == EINVAL);
         assert(parallel->io_threads == workers[w] && parallel->reader == saved_reader);
-        assert(!myds_engram_set_io_threads(parallel, 17) && errno == EINVAL);
+        assert(!myds_engram_set_io_threads(parallel, 49) && errno == EINVAL);
         assert(parallel->io_threads == workers[w] && parallel->reader == saved_reader);
         for (unsigned pass = 0; pass < 3; ++pass) {
             myds_engram_reset(serial); myds_engram_reset(parallel);
@@ -523,7 +523,15 @@ static void test_io_configuration(const gguf_file_t *gf, const char *path) {
     e = myds_engram_create(gf, path, 5, 1);
     assert(e && e->io_threads == 1 && !e->reader);
     myds_engram_free(e);
-    static const char *invalid[] = {"0", "17", "-1", "abc", "8x"};
+    assert(setenv("MYDS_ENGRAM_IO_THREADS", "24", 1) == 0);
+    e = myds_engram_create(gf, path, 5, 1);
+    assert(e && e->io_threads == 24 && !e->reader);
+    myds_engram_free(e);
+    assert(setenv("MYDS_ENGRAM_IO_THREADS", "48", 1) == 0);
+    e = myds_engram_create(gf, path, 5, 1);
+    assert(e && e->io_threads == 48 && !e->reader);
+    myds_engram_free(e);
+    static const char *invalid[] = {"0", "49", "-1", "abc", "8x"};
     for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
         assert(setenv("MYDS_ENGRAM_IO_THREADS", invalid[i], 1) == 0);
         assert(!myds_engram_create(gf, path, 5, 1) && errno == EINVAL);
@@ -579,6 +587,127 @@ static void test_model(void) {
     gguf_file_t gf = {.fd=fd, .kvs=kvs, .metadata_kv_count=8, .tensors=tensors, .tensor_count=8};
     test_io_configuration(&gf, path);
     test_model_readers(&gf, path, fd);
+    /* [D-E1] Strict knob parsing, 0-ULP split T0 + async T1 parity, error rollback,
+     * counter tracking, and clean teardown/lifecycle across 1..48 workers. */
+    {
+        const char *prev_env = getenv("MYDS_ENGRAM_ASYNC_T1");
+        char *saved_env = prev_env ? strdup(prev_env) : NULL;
+        assert(unsetenv("MYDS_ENGRAM_ASYNC_T1") == 0);
+        assert(myds_engram_async_t1_enabled() == 0);
+        assert(setenv("MYDS_ENGRAM_ASYNC_T1", "0", 1) == 0);
+        assert(myds_engram_async_t1_enabled() == 0);
+        assert(setenv("MYDS_ENGRAM_ASYNC_T1", "1", 1) == 0);
+        assert(myds_engram_async_t1_enabled() == 1);
+        static const char *bad_vals[] = {"", "2", "-1", "true", "false", " 1", "1 ", "yes"};
+        for (size_t i = 0; i < sizeof(bad_vals) / sizeof(bad_vals[0]); ++i) {
+            assert(setenv("MYDS_ENGRAM_ASYNC_T1", bad_vals[i], 1) == 0);
+            assert(myds_engram_async_t1_enabled() == -1);
+        }
+        if (saved_env) { assert(setenv("MYDS_ENGRAM_ASYNC_T1", saved_env, 1) == 0); free(saved_env); }
+        else assert(unsetenv("MYDS_ENGRAM_ASYNC_T1") == 0);
+
+        myds_engram_t *oracle = myds_engram_create(&gf, path, 5, 1);
+        assert(oracle && myds_engram_set_io_threads(oracle, 1));
+        write_patterned_tables(fd, oracle->table);
+        static const int32_t seq[] = {1, 2, 3, 4, 4, 0, 1, 3, 2, 0, 4, 1};
+        static const unsigned wlist[] = {1, 2, 4, 8, 16, 24, 48};
+        for (size_t wi = 0; wi < sizeof(wlist) / sizeof(wlist[0]); ++wi) {
+            myds_engram_t *async_e = myds_engram_clone(oracle);
+            assert(async_e && myds_engram_set_io_threads(async_e, wlist[wi]));
+            myds_engram_reset(oracle);
+            myds_engram_reset(async_e);
+            myds_engram_async_t1_counters(NULL, true);
+
+            for (size_t p = 0; p < sizeof(seq) / sizeof(seq[0]); ++p) {
+                assert(myds_engram_prepare_token(oracle, seq[p], p));
+                assert(myds_engram_prepare_token_t0(async_e, seq[p], p));
+                /* Table 0 must already be bit-exact; history/position must not advance yet. */
+                assert(!async_e->prepared && async_e->position == p);
+                assert(memcmp(oracle->row_values[0], async_e->row_values[0],
+                              sizeof(oracle->row_values[0])) == 0);
+                assert(myds_engram_dispatch_t1_async(async_e));
+                /* Dedicated non-contending async reader must never alias e->reader. */
+                assert(async_e->async_t1_reader != NULL);
+                assert(async_e->async_t1_reader != async_e->reader);
+                /* Double-dispatch while already dispatched must fail-closed with EINVAL. */
+                assert(!myds_engram_dispatch_t1_async(async_e) && errno == EINVAL);
+                assert(myds_engram_join_t1(async_e));
+                assert_prepared_equal(oracle, async_e);
+            }
+            myds_engram_async_t1_counters_t cnt;
+            myds_engram_async_t1_counters(&cnt, false);
+            assert(cnt.requests == sizeof(seq) / sizeof(seq[0]));
+            assert(cnt.dispatched == sizeof(seq) / sizeof(seq[0]));
+            assert(cnt.joined == sizeof(seq) / sizeof(seq[0]));
+            assert(cnt.cancelled == 0u);
+            assert(cnt.failures == sizeof(seq) / sizeof(seq[0])); /* double-dispatch checks */
+
+            /* Error handling: Table 1 truncated (EIO) and corrupt E4M3 (EDOM) must NOT
+             * advance history/position, and recovery at the same position must match oracle. */
+            const uint64_t pos_err = async_e->position;
+            const int32_t tok_err = 3;
+            myds_engram_history_t saved_hist = async_e->history, next_h = saved_hist;
+            uint32_t r_ids[2][MYDS_ENGRAM_COLS];
+            assert(myds_engram_hash(&async_e->layout, &next_h, &tok_err, NULL, 1, &r_ids[0][0]));
+
+            assert(ftruncate(fd, (off_t)(async_e->table[1].offset +
+                (uint64_t)r_ids[1][0] * MYDS_ENGRAM_ROW_BYTES + 80)) == 0);
+            assert(myds_engram_prepare_token_t0(async_e, tok_err, pos_err));
+            assert(myds_engram_dispatch_t1_async(async_e));
+            assert(!myds_engram_join_t1(async_e) && errno == EIO);
+            assert(!async_e->prepared && !async_e->t1_pending && async_e->position == pos_err);
+            assert(memcmp(&saved_hist, &async_e->history, sizeof(saved_hist)) == 0);
+            write_patterned_tables(fd, async_e->table);
+
+            uint8_t raw[MYDS_ENGRAM_ROW_BYTES];
+            patterned_row(raw, 1, r_ids[1][0]); raw[255] = 127;
+            assert(pwrite(fd, raw, sizeof(raw), (off_t)(async_e->table[1].offset +
+                (uint64_t)r_ids[1][0] * sizeof(raw))) == (ssize_t)sizeof(raw));
+            assert(myds_engram_prepare_token_t0(async_e, tok_err, pos_err));
+            assert(myds_engram_dispatch_t1_async(async_e));
+            assert(!myds_engram_join_t1(async_e) && errno == EDOM);
+            assert(!async_e->prepared && !async_e->t1_pending && async_e->position == pos_err);
+            assert(memcmp(&saved_hist, &async_e->history, sizeof(saved_hist)) == 0);
+            write_patterned_tables(fd, async_e->table);
+
+            /* Cancel mid-flight must drain cleanly without advancing history/position. */
+            assert(myds_engram_prepare_token_t0(async_e, tok_err, pos_err));
+            assert(myds_engram_dispatch_t1_async(async_e));
+            myds_engram_cancel_t1(async_e);
+            assert(!async_e->prepared && !async_e->t1_pending && async_e->position == pos_err);
+            assert(memcmp(&saved_hist, &async_e->history, sizeof(saved_hist)) == 0);
+
+            /* Retry at exact pos_err succeeds bit-identically with oracle. */
+            assert(myds_engram_prepare_token(oracle, tok_err, pos_err));
+            assert(myds_engram_prepare_token_t0(async_e, tok_err, pos_err));
+            assert(myds_engram_dispatch_t1_async(async_e));
+            assert(myds_engram_join_t1(async_e));
+            assert_prepared_equal(oracle, async_e);
+
+            /* Direct join without dispatch (sync fallback path) also matches oracle. */
+            assert(myds_engram_prepare_token(oracle, 2, pos_err + 1));
+            assert(myds_engram_prepare_token_t0(async_e, 2, pos_err + 1));
+            assert(myds_engram_join_t1(async_e));
+            assert_prepared_equal(oracle, async_e);
+
+            /* Clean teardown while T1 is actively in-flight: reset, set_io_threads, and free. */
+            assert(myds_engram_prepare_token_t0(async_e, 1, pos_err + 2));
+            assert(myds_engram_dispatch_t1_async(async_e));
+            myds_engram_reset(async_e);
+            assert(async_e->position == 0 && !async_e->t1_pending);
+
+            assert(myds_engram_prepare_token_t0(async_e, 1, 0));
+            assert(myds_engram_dispatch_t1_async(async_e));
+            assert(myds_engram_set_io_threads(async_e, 2));
+            assert(!async_e->t1_pending && async_e->async_t1_reader == NULL);
+
+            assert(myds_engram_prepare_token_t0(async_e, 1, 0));
+            assert(myds_engram_dispatch_t1_async(async_e));
+            myds_engram_free(async_e); /* must drain + join workers before closing fds */
+        }
+        myds_engram_free(oracle);
+        puts("Engram: [D-E1] MYDS_ENGRAM_ASYNC_T1 strict knob, 0-ULP parity (1..48 workers), rollback, cancel & in-flight teardown passed");
+    }
     myds_engram_t *e = myds_engram_create(&gf, path, 5, 1);
     assert(e && !e->prepared && e->position == 0);
     assert(myds_engram_prepare_token(e, 1, 0) && e->prepared && e->position == 1);

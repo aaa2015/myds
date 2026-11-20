@@ -310,6 +310,42 @@ int main(void) {
     atomic_store(&short_reads, false);
     test_retry_errno(e, fd);
     test_concurrent_callers(e, fd);
+
+    /* [D-E1] Fault-inject async T1 pool creation failure, short-reads/EINTR,
+     * and in-flight free under ASan/TSan resource balance checks. */
+    {
+        myds_engram_t *async_e = myds_engram_clone(e);
+        myds_engram_t *oracle = myds_engram_clone(e);
+        assert(async_e && oracle && myds_engram_set_io_threads(oracle, 1));
+        for (unsigned attempt = 1; attempt <= 4; ++attempt) {
+            reset_attempts(); fail_create = attempt;
+            assert(myds_engram_prepare_token_t0(async_e, 1, 0));
+            assert(!myds_engram_dispatch_t1_async(async_e) && errno == EAGAIN);
+            assert(!async_e->t1_pending && !async_e->async_t1_reader && async_e->position == 0);
+        }
+        reset_attempts();
+        atomic_store(&short_reads, true);
+        for (unsigned p = 0; p < 12; ++p) {
+            int32_t tok = (int32_t)(p % 5);
+            if ((p & 1u) == 0u) atomic_store(&interrupt_once, true);
+            assert(myds_engram_prepare_token(oracle, tok, p));
+            assert(myds_engram_prepare_token_t0(async_e, tok, p));
+            assert(myds_engram_dispatch_t1_async(async_e));
+            assert(myds_engram_join_t1(async_e));
+            assert(async_e->prepared && async_e->position == oracle->position);
+            assert(memcmp(&async_e->history, &oracle->history, sizeof(oracle->history)) == 0);
+            assert(memcmp(async_e->row_ids, oracle->row_ids, sizeof(oracle->row_ids)) == 0);
+            assert(memcmp(async_e->row_values, oracle->row_values, sizeof(oracle->row_values)) == 0);
+        }
+        /* Free while async T1 is actively in flight (must drain + join cleanly). */
+        assert(myds_engram_prepare_token_t0(async_e, 2, 12));
+        assert(myds_engram_dispatch_t1_async(async_e));
+        myds_engram_free(async_e);
+        myds_engram_free(oracle);
+        atomic_store(&short_reads, false);
+        puts("Engram pool: [D-E1] async T1 creation rollback, short-read/EINTR parity and in-flight free passed");
+    }
+
     myds_engram_free(e); close(fd); unlink(path);
     assert_empty();
     puts("Engram pool: positive short reads/EINTR retry, exact duplicate-row I/O and final resource balance passed");

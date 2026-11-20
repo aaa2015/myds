@@ -3077,7 +3077,7 @@ myds_v41_model_t *myds_v41_model_create(myds_model_t *m, const char *path) {
 #undef W
     v->engram = myds_engram_create(gf,path,m->vocab_size,m->dim);
     if (v->engram)
-        MYDS_LOG_I("Engram SSD I/O: %s%s (MYDS_ENGRAM_IO_THREADS: auto adapts, 1 serial, 2..16 pinned)",
+        MYDS_LOG_I("Engram SSD I/O: %s%s (MYDS_ENGRAM_IO_THREADS: auto adapts, 1 serial, 2..48 pinned)",
                    v->engram->io_adaptive ? "adaptive" : "fixed",
                    v->engram->io_adaptive ? "" :
                        (v->engram->io_threads > 1 ? ", persistent raw-read pool" : ", serial"));
@@ -4502,9 +4502,19 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
     myds_v41_decode_qkv_scope_t qkv_scope = {0};
 #define CHECK(x) do { if (!(x)) goto fail; } while (0)
 #define TRACE(stage,buf,n) do { if (trace_on) CHECK(myds_trace_f32(stage,il,pos,buf,n)); } while (0)
-    CHECK(myds_engram_prepare_token(g->engram,token,pos));
-    for (uint32_t i=0;i<2;i++) CHECK(myds_metal_buffer_write(g->engram_rows[i],0,
-        g->engram->row_values[i],MYDS_ENGRAM_INPUT_DIM*4u));
+    const int engram_async_t1_mode = myds_engram_async_t1_enabled();
+    if (engram_async_t1_mode < 0) goto fail;
+    const bool use_engram_async_t1 = (engram_async_t1_mode == 1);
+    bool engram_t1_joined = !use_engram_async_t1;
+    if (use_engram_async_t1) {
+        CHECK(myds_engram_prepare_token_t0(g->engram, token, pos));
+        CHECK(myds_metal_buffer_write(g->engram_rows[0], 0,
+            g->engram->row_values[0], MYDS_ENGRAM_INPUT_DIM * 4u));
+    } else {
+        CHECK(myds_engram_prepare_token(g->engram,token,pos));
+        for (uint32_t i=0;i<2;i++) CHECK(myds_metal_buffer_write(g->engram_rows[i],0,
+            g->engram->row_values[i],MYDS_ENGRAM_INPUT_DIM*4u));
+    }
     float *res=myds_metal_buffer_data(g->residual);
     if (v41_image_embedding_at(ctx,pos,res,V41_DIM)) {
         /* 图片块：该位置用注入向量（已填进 res） */
@@ -4542,7 +4552,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
             myds_metal_set_concurrent(1);
         }
         const myds_metal_buffer_t *init_deps[] = {
-            g->residual, g->pre, g->engram_rows[0], g->engram_rows[1]
+            g->residual, g->pre, g->engram_rows[0], use_engram_async_t1 ? NULL : g->engram_rows[1]
         };
         myds_metal_barrier_buffers(init_deps, 4);
     }
@@ -4657,7 +4667,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
                       myds_metal_buffer_copy(ctx->kv_act, 0, base->attn_qkv_out,
                                              1280u * sizeof(float), 512u * sizeof(float)))) {
                     MYDS_LOG_E("V4.1 merged qkv projection failed at layer %u", il);
-                    return -1;
+                    goto fail;
                 }
                 if (getenv("MYDS_QKV_DEBUG") && il == 0 && ctx->pos < 3) {
                     if (!myds_metal_get_auto_barrier()) myds_metal_barrier();
@@ -4871,6 +4881,20 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
             base->attn_output_a_type));
 #endif
         CHECK(myds_metal_attn_output_a_bf16(ctx->attn_low,base->attn_output_a,ctx->attn_heads,8,4096,1024,base->attn_output_a_type));
+        if (il == 13 && use_engram_async_t1 && !engram_t1_joined) {
+            /* Join Table 1 async I/O right before il==13 prestage (or il==14 add
+             * when prestage is off). Current CB has not committed yet, so writing
+             * Shared buffer g->engram_rows[1] here is coherent with il==13/14 GPU ops. */
+            phase = "engram async T1 join";
+            CHECK(myds_engram_join_t1(g->engram));
+            CHECK(myds_metal_buffer_write(g->engram_rows[1], 0,
+                g->engram->row_values[1], MYDS_ENGRAM_INPUT_DIM * 4u));
+            if (fine_pipeline) {
+                myds_metal_barrier_buffer(g->engram_rows[1]);
+            }
+            engram_t1_joined = true;
+            phase = "attention reduction";
+        }
         const bool prestage_engram = engram_prestage_enabled && (il == 0 || il == 13);
         /* 2026-10-21 实验（MYDS_ENGRAM_CPU=1）：engram_kv 的 F16 GEMV 交给 CPU。
          * 数据流已就绪：engram_rows[e] 在 token 起始由 CPU 写入；权重 projection[e]->data
@@ -5009,6 +5033,13 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
                     (int)(seg < segcap ? seg : segcap - 1u));
             }
         }
+        if (use_engram_async_t1 && il == 1) {
+            /* Table 0 was just consumed at L1; dispatch Table 1 asynchronously
+             * right after il==1 flush onto dedicated non-contending workers so
+             * its 24 preads overlap L2..L12 execution and encoding. */
+            phase = "engram async T1 dispatch";
+            CHECK(myds_engram_dispatch_t1_async(g->engram));
+        }
     }
     /* head 与 lm_head 单独成桶：它是一次大 GEMV + 采样，
      * 混进最后一段会让「最后一段总是最慢」变成假象。 */
@@ -5053,6 +5084,7 @@ static int32_t v41_forward_impl(myds_context_t *ctx, int32_t token, uint32_t pos
     return need_logits ? next_tok : 0;
 fail:
     MYDS_LOG_E("V4.1 native graph failed at pos %u layer %u: %s",pos,il,phase);
+    if (g && g->engram) myds_engram_cancel_t1(g->engram);
     if (g) myds_v41_gpu_attn_kv_reuse_reset(g->gpu);
     myds_v41_decode_qkv_scope_end(&qkv_scope);
     (void)myds_metal_commit_batch();

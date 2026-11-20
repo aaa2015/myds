@@ -100,9 +100,18 @@ typedef struct {
     uint32_t layer_ids[MYDS_ENGRAM_LAYERS], width;
     uint64_t position;
     bool prepared;
-    unsigned io_threads;              /* fixed 1..16; 1 while adaptive is idle */
+    unsigned io_threads;              /* fixed 1..48; 1 while adaptive is idle */
     bool io_adaptive;                 /* MYDS_ENGRAM_IO_THREADS=auto */
     myds_engram_reader_t *reader;
+    /* Dedicated non-contending async Table 1 reader + pending transaction state
+     * (MYDS_ENGRAM_ASYNC_T1=1). async_t1_reader is created lazily on first async
+     * dispatch so Table 1 I/O never contends with Table 0's e->reader. */
+    myds_engram_reader_t *async_t1_reader;
+    bool t1_pending;
+    bool t1_dispatched;
+    bool t1_invalid;
+    myds_engram_history_t t1_next_history;
+    unsigned t1_map[MYDS_ENGRAM_COLS];
     /* Adaptive raw-read controller. Contexts are single-threaded, so these
      * counters need no locking; a switch is only ever performed between
      * lookups, never while a reader is in flight. */
@@ -122,11 +131,11 @@ myds_engram_t *myds_engram_create(const gguf_file_t *gf, const char *path,
 /* Clone model's immutable template into a context. Each clone owns duplicate
  * pread descriptors and fresh history, so contexts cannot share hash state. */
 myds_engram_t *myds_engram_clone(const myds_engram_t *engram);
-/* 1 selects serial I/O; 2..16 create a private persistent pool. Failure leaves
+/* 1 selects serial I/O; 2..48 create a private persistent pool. Failure leaves
  * the previous configuration intact. Like prepare/reset/free, this requires
  * exclusive access to the context. Model load reads MYDS_ENGRAM_IO_THREADS:
  * `auto` selects the adaptive controller, `1` forces the serial path, and
- * `2`..`16` pin the worker count. An explicit call here overrides the
+ * `2`..`48` pin the worker count. An explicit call here overrides the
  * adaptive controller's current engagement. */
 bool myds_engram_set_io_threads(myds_engram_t *engram, unsigned workers);
 /* Reject overlapping/non-tail layouts; unmap only page-aligned disk-only tail.
@@ -145,6 +154,33 @@ void myds_engram_reset(myds_engram_t *engram);
  * BF16 rounded, followed by the native Metal Engram gate/add at layers 1/14. */
 bool myds_engram_prepare_token(myds_engram_t *engram, int32_t token,
                               uint64_t position);
+/* Strict knob parser for MYDS_ENGRAM_ASYNC_T1 (default 0; fail-closed -1 on
+ * any value other than absent/"0"/"1"). */
+int myds_engram_async_t1_enabled(void);
+typedef struct {
+    uint64_t requests;
+    uint64_t dispatched;
+    uint64_t joined;
+    uint64_t cancelled;
+    uint64_t failures;
+} myds_engram_async_t1_counters_t;
+void myds_engram_async_t1_counters(myds_engram_async_t1_counters_t *out, bool reset);
+/* Split-table async prepare (MYDS_ENGRAM_ASYNC_T1=1):
+ *   1. myds_engram_prepare_token_t0: validates position, hashes both tables,
+ *      reads & decodes Table 0 into row_values[0]. Does NOT advance history
+ *      or position until myds_engram_join_t1 succeeds (transactional).
+ *   2. myds_engram_dispatch_t1_async: submits Table 1's <=24 deduplicated
+ *      preads to dedicated non-contending async_t1_reader without blocking.
+ *   3. myds_engram_join_t1: waits for Table 1 I/O, decodes row_values[1] on
+ *      the calling thread in exact column order (0-ULP + exact errno/FP flags),
+ *      and commits history/position. Failure leaves history/position unchanged.
+ *   4. myds_engram_cancel_t1: drains any in-flight async T1 workers cleanly
+ *      and discards pending transaction state without advancing history. */
+bool myds_engram_prepare_token_t0(myds_engram_t *engram, int32_t token,
+                                  uint64_t position);
+bool myds_engram_dispatch_t1_async(myds_engram_t *engram);
+bool myds_engram_join_t1(myds_engram_t *engram);
+void myds_engram_cancel_t1(myds_engram_t *engram);
 bool myds_engram_prepare_batch(myds_engram_t *engram, const int32_t *tokens,
                               size_t count, uint64_t start_position,
                               float *out_layer0, float *out_layer1);

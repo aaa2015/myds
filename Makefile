@@ -232,9 +232,11 @@ $(TEST_REQUEST_PHASES_JSON): tests/test_request_phases_json.c src/myds_server.c 
 # 所以这个测试要多链接那一个 TU。
 $(TEST_DEBUG_STATE): tests/test_debug_state.c src/myds_debugstate.c src/myds_debug_acl.c $(wildcard include/*.h) \
 		$(BUILD_DIR)/myds_knobs.o $(BUILD_DIR)/myds_log.o $(BUILD_DIR)/myds_v41_gpu.o \
-		$(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_steer.o $(BUILD_DIR)/myds_metal.o | $(BIN_DIR)
+		$(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_steer.o $(BUILD_DIR)/myds_metal.o \
+		$(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_gguf.o | $(BIN_DIR)
 	$(CC) $(CFLAGS) $< src/myds_debug_acl.c $(BUILD_DIR)/myds_knobs.o $(BUILD_DIR)/myds_log.o \
 		$(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_engine.o $(BUILD_DIR)/myds_steer.o $(BUILD_DIR)/myds_metal.o \
+		$(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_gguf.o \
 		$(LDFLAGS) -Wl,-dead_strip -o $@
 
 .PHONY: all test clean bench check-toolchain metallib build-tail-init test-tail-init test-indexer-register-only-host test-register-only-http-bridge test-register-only-service-window audit-ledger gen-ledger bench-register-only corpus-check verify-register-only check-knobs

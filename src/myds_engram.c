@@ -34,6 +34,7 @@
 #include <limits.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -320,7 +321,7 @@ bool myds_engram_read(const myds_engram_table_t *table, const uint32_t *rows,
 }
 
 enum {
-    ENGRAM_IO_MAX_THREADS = 16,
+    ENGRAM_IO_MAX_THREADS = 48,
     ENGRAM_BATCH_MAX = 64,
     ENGRAM_IO_JOBS = MYDS_ENGRAM_LAYERS * MYDS_ENGRAM_COLS,
     ENGRAM_IO_BATCH_JOBS = ENGRAM_BATCH_MAX * ENGRAM_IO_JOBS,
@@ -340,6 +341,7 @@ typedef struct {
 struct myds_engram_reader {
     unsigned workers, started, remaining, job_count;
     bool stopping;
+    bool has_sync;
     uint64_t generation;
     /* submit serializes callers through decoding; state protects dispatch and
      * the barrier. A worker owns each strided raw/error slot until the barrier. */
@@ -427,13 +429,14 @@ static void *engram_io_worker(void *opaque) {
     return NULL;
 }
 
-myds_engram_reader_t *myds_engram_reader_create(unsigned workers) {
+static myds_engram_reader_t *engram_reader_create_impl(unsigned workers, bool force_threads) {
     if (!workers || workers > ENGRAM_IO_MAX_THREADS) { errno = EINVAL; return NULL; }
     const int saved_errno = errno;
     myds_engram_reader_t *r = calloc(1, sizeof(*r));
     if (!r) return NULL;
     r->workers = workers;
-    if (workers == 1) { errno = saved_errno; return r; }
+    if (workers == 1 && !force_threads) { errno = saved_errno; return r; }
+    r->has_sync = true;
     int error = pthread_mutex_init(&r->submit, NULL);
     if (error) goto allocation;
     error = pthread_mutex_init(&r->state, NULL);
@@ -470,9 +473,13 @@ allocation:
     return NULL;
 }
 
+myds_engram_reader_t *myds_engram_reader_create(unsigned workers) {
+    return engram_reader_create_impl(workers, false);
+}
+
 void myds_engram_reader_free(myds_engram_reader_t *r) {
     if (!r) return;
-    if (r->workers > 1) {
+    if (r->has_sync) {
         pthread_mutex_lock(&r->state);
         r->stopping = true;
         pthread_cond_broadcast(&r->work);
@@ -559,10 +566,66 @@ bool myds_engram_reader_read_token(myds_engram_reader_t *r,
     return ok;
 }
 
+static bool engram_reader_read_single_layer(myds_engram_reader_t *r,
+    const myds_engram_table_t *table,
+    const uint32_t rows[MYDS_ENGRAM_COLS],
+    float out[MYDS_ENGRAM_INPUT_DIM]) {
+    if (!table || !rows || !out) return fail(EINVAL);
+    if (!r || r->workers == 1 || table->fd < 0)
+        return myds_engram_read(table, rows, MYDS_ENGRAM_COLS, out);
+    for (int col = 0; col < MYDS_ENGRAM_COLS; ++col)
+        if (rows[col] >= table->rows)
+            return myds_engram_read(table, rows, MYDS_ENGRAM_COLS, out);
+    pthread_mutex_lock(&r->submit);
+    unsigned map[MYDS_ENGRAM_COLS];
+    unsigned jobs = 0;
+    for (int col = 0; col < MYDS_ENGRAM_COLS; ++col) {
+        int previous = 0;
+        while (previous < col && rows[previous] != rows[col]) ++previous;
+        if (previous < col) { map[col] = map[previous]; continue; }
+        map[col] = jobs;
+        r->jobs[jobs].fd = table->fd;
+        r->jobs[jobs].map = table->map;
+        r->jobs[jobs].offset = table->offset + (uint64_t)rows[col] * MYDS_ENGRAM_ROW_BYTES;
+        r->jobs[jobs].error = 0;
+        r->jobs[jobs].retry_errno = 0;
+        ++jobs;
+    }
+    pthread_mutex_lock(&r->state);
+    r->job_count = jobs;
+    r->remaining = r->workers;
+    ++r->generation;
+    pthread_cond_broadcast(&r->work);
+    while (r->remaining) pthread_cond_wait(&r->done, &r->state);
+    pthread_mutex_unlock(&r->state);
+    bool ok = true;
+    for (int col = 0; col < MYDS_ENGRAM_COLS; ++col) {
+        engram_io_job_t *job = &r->jobs[map[col]];
+        if (job->error) { errno = job->error; ok = false; break; }
+        int previous = 0;
+        while (previous < col && map[previous] != map[col]) ++previous;
+        if (previous < col)
+            memcpy(out + col * MYDS_ENGRAM_DIM,
+                   out + previous * MYDS_ENGRAM_DIM, MYDS_ENGRAM_DIM * sizeof(float));
+        else {
+            if (job->retry_errno) errno = job->retry_errno;
+            if (!myds_engram_decode_row(job->raw, out + col * MYDS_ENGRAM_DIM)) {
+                ok = false;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&r->submit);
+    return ok;
+}
+
 bool myds_engram_set_io_threads(myds_engram_t *e, unsigned workers) {
     if (!e || !workers || workers > ENGRAM_IO_MAX_THREADS) return fail(EINVAL);
     myds_engram_reader_t *next = workers == 1 ? NULL : myds_engram_reader_create(workers);
     if (workers > 1 && !next) return false;
+    myds_engram_cancel_t1(e);
+    myds_engram_reader_free(e->async_t1_reader);
+    e->async_t1_reader = NULL;
     myds_engram_reader_free(e->reader);
     e->reader = next;
     e->io_threads = workers;
@@ -673,7 +736,7 @@ myds_engram_t *myds_engram_create(const gguf_file_t *gf, const char *path,
     }
     e->io_threads = e->io_adaptive ? 1u : configured_io_threads();
     if (!e->io_threads) {
-        fputs("Invalid MYDS_ENGRAM_IO_THREADS: expected an integer in 1..16\n", stderr);
+        fputs("Invalid MYDS_ENGRAM_IO_THREADS: expected an integer in 1..48\n", stderr);
         goto invalid;
     }
     const char *encoding = gguf_get_str(gf, "deepseek41.engram.encoding", "");
@@ -743,6 +806,9 @@ error: {
 
 void myds_engram_free(myds_engram_t *e) {
     if (!e) return;
+    myds_engram_cancel_t1(e);
+    myds_engram_reader_free(e->async_t1_reader);
+    e->async_t1_reader = NULL;
     myds_engram_reader_free(e->reader);
     for (int i = 0; i < MYDS_ENGRAM_LAYERS; ++i) myds_engram_table_close(&e->table[i]);
     free(e);
@@ -757,6 +823,10 @@ myds_engram_t *myds_engram_clone(const myds_engram_t *source) {
     if (!copy) return NULL;
     memcpy(copy, source, sizeof(*copy));
     copy->reader = NULL;
+    copy->async_t1_reader = NULL;
+    copy->t1_pending = false;
+    copy->t1_dispatched = false;
+    copy->t1_invalid = false;
     /* map 指针随结构体 memcpy 复制，指向同一段映射（生命周期由 gguf_file_t 持有）。 */
     for (int i = 0; i < MYDS_ENGRAM_LAYERS; ++i) copy->table[i].fd = -1;
     for (int i = 0; i < MYDS_ENGRAM_LAYERS; ++i) {
@@ -822,6 +892,7 @@ bool myds_engram_unmap_tables(gguf_file_t *gf, const myds_engram_t *e) {
 
 void myds_engram_reset(myds_engram_t *e) {
     if (!e) return;
+    myds_engram_cancel_t1(e);
     myds_engram_history_reset(&e->history);
     e->position = 0;
     e->prepared = false;
@@ -832,8 +903,201 @@ void myds_engram_reset(myds_engram_t *e) {
     e->adapt_up = e->adapt_down = 0;
 }
 
+static _Atomic uint64_t g_engram_async_t1_requests = 0;
+static _Atomic uint64_t g_engram_async_t1_dispatched = 0;
+static _Atomic uint64_t g_engram_async_t1_joined = 0;
+static _Atomic uint64_t g_engram_async_t1_cancelled = 0;
+static _Atomic uint64_t g_engram_async_t1_failures = 0;
+
+int myds_engram_async_t1_enabled(void) {
+    const char *v = getenv("MYDS_ENGRAM_ASYNC_T1");
+    if (!v || strcmp(v, "0") == 0) return 0;
+    if (strcmp(v, "1") == 0) return 1;
+    fputs("myds_engram: MYDS_ENGRAM_ASYNC_T1 must be exactly absent, 0 or 1\n", stderr);
+    return -1;
+}
+
+void myds_engram_async_t1_counters(myds_engram_async_t1_counters_t *out, bool reset) {
+    uint64_t req = reset ? atomic_exchange_explicit(&g_engram_async_t1_requests, 0, memory_order_relaxed)
+                         : atomic_load_explicit(&g_engram_async_t1_requests, memory_order_relaxed);
+    uint64_t dsp = reset ? atomic_exchange_explicit(&g_engram_async_t1_dispatched, 0, memory_order_relaxed)
+                         : atomic_load_explicit(&g_engram_async_t1_dispatched, memory_order_relaxed);
+    uint64_t jnd = reset ? atomic_exchange_explicit(&g_engram_async_t1_joined, 0, memory_order_relaxed)
+                         : atomic_load_explicit(&g_engram_async_t1_joined, memory_order_relaxed);
+    uint64_t cnc = reset ? atomic_exchange_explicit(&g_engram_async_t1_cancelled, 0, memory_order_relaxed)
+                         : atomic_load_explicit(&g_engram_async_t1_cancelled, memory_order_relaxed);
+    uint64_t fls = reset ? atomic_exchange_explicit(&g_engram_async_t1_failures, 0, memory_order_relaxed)
+                         : atomic_load_explicit(&g_engram_async_t1_failures, memory_order_relaxed);
+    if (out) {
+        out->requests = req;
+        out->dispatched = dsp;
+        out->joined = jnd;
+        out->cancelled = cnc;
+        out->failures = fls;
+    }
+}
+
+void myds_engram_cancel_t1(myds_engram_t *e) {
+    if (!e || !e->t1_pending) return;
+    if (e->t1_dispatched && !e->t1_invalid && e->async_t1_reader) {
+        myds_engram_reader_t *r = e->async_t1_reader;
+        pthread_mutex_lock(&r->state);
+        while (r->remaining) pthread_cond_wait(&r->done, &r->state);
+        pthread_mutex_unlock(&r->state);
+    }
+    e->t1_pending = false;
+    e->t1_dispatched = false;
+    e->t1_invalid = false;
+    atomic_fetch_add_explicit(&g_engram_async_t1_cancelled, 1, memory_order_relaxed);
+}
+
+bool myds_engram_prepare_token_t0(myds_engram_t *e, int32_t token, uint64_t position) {
+    if (!e) return fail(EINVAL);
+    if (e->t1_pending) myds_engram_cancel_t1(e);
+    atomic_fetch_add_explicit(&g_engram_async_t1_requests, 1, memory_order_relaxed);
+    e->prepared = false;
+    if (position != e->position || position == UINT64_MAX) {
+        atomic_fetch_add_explicit(&g_engram_async_t1_failures, 1, memory_order_relaxed);
+        return fail(EINVAL);
+    }
+    myds_engram_history_t next = e->history;
+    if (!myds_engram_hash(&e->layout, &next, &token, NULL, 1, &e->row_ids[0][0])) {
+        atomic_fetch_add_explicit(&g_engram_async_t1_failures, 1, memory_order_relaxed);
+        return false;
+    }
+    if (e->io_threads > 1 && !e->reader &&
+        !myds_engram_set_io_threads(e, e->io_threads)) {
+        atomic_fetch_add_explicit(&g_engram_async_t1_failures, 1, memory_order_relaxed);
+        return false;
+    }
+    if (!engram_reader_read_single_layer(e->reader, &e->table[0], e->row_ids[0], e->row_values[0])) {
+        atomic_fetch_add_explicit(&g_engram_async_t1_failures, 1, memory_order_relaxed);
+        return false;
+    }
+    e->t1_next_history = next;
+    e->t1_pending = true;
+    e->t1_dispatched = false;
+    e->t1_invalid = false;
+    return true;
+}
+
+bool myds_engram_dispatch_t1_async(myds_engram_t *e) {
+    if (!e || !e->t1_pending || e->t1_dispatched) {
+        atomic_fetch_add_explicit(&g_engram_async_t1_failures, 1, memory_order_relaxed);
+        return fail(EINVAL);
+    }
+    bool valid = (e->table[1].fd >= 0);
+    for (int col = 0; valid && col < MYDS_ENGRAM_COLS; ++col) {
+        if (e->row_ids[1][col] >= e->table[1].rows) valid = false;
+    }
+    if (!valid) {
+        /* Defer validation error to myds_engram_join_t1 via scalar oracle so
+         * errno matches myds_engram_prepare_token identically. */
+        e->t1_invalid = true;
+        e->t1_dispatched = true;
+        return true;
+    }
+    if (!e->async_t1_reader) {
+        unsigned workers = e->io_threads ? e->io_threads : 1u;
+        if (workers > MYDS_ENGRAM_COLS) workers = MYDS_ENGRAM_COLS;
+        e->async_t1_reader = engram_reader_create_impl(workers, true);
+        if (!e->async_t1_reader) {
+            int saved = errno;
+            e->t1_pending = false;
+            atomic_fetch_add_explicit(&g_engram_async_t1_failures, 1, memory_order_relaxed);
+            errno = saved;
+            return false;
+        }
+    }
+    myds_engram_reader_t *r = e->async_t1_reader;
+    unsigned jobs = 0;
+    for (int col = 0; col < MYDS_ENGRAM_COLS; ++col) {
+        int previous = 0;
+        while (previous < col && e->row_ids[1][previous] != e->row_ids[1][col]) ++previous;
+        if (previous < col) { e->t1_map[col] = e->t1_map[previous]; continue; }
+        e->t1_map[col] = jobs;
+        r->jobs[jobs].fd = e->table[1].fd;
+        r->jobs[jobs].map = e->table[1].map;
+        r->jobs[jobs].offset = e->table[1].offset +
+                               (uint64_t)e->row_ids[1][col] * MYDS_ENGRAM_ROW_BYTES;
+        r->jobs[jobs].error = 0;
+        r->jobs[jobs].retry_errno = 0;
+        ++jobs;
+    }
+    pthread_mutex_lock(&r->state);
+    r->job_count = jobs;
+    r->remaining = r->workers;
+    ++r->generation;
+    pthread_cond_broadcast(&r->work);
+    pthread_mutex_unlock(&r->state);
+    e->t1_dispatched = true;
+    atomic_fetch_add_explicit(&g_engram_async_t1_dispatched, 1, memory_order_relaxed);
+    return true;
+}
+
+bool myds_engram_join_t1(myds_engram_t *e) {
+    if (!e || !e->t1_pending) {
+        atomic_fetch_add_explicit(&g_engram_async_t1_failures, 1, memory_order_relaxed);
+        return fail(EINVAL);
+    }
+    if (!e->t1_dispatched) {
+        e->t1_pending = false;
+        if (!engram_reader_read_single_layer(e->reader, &e->table[1], e->row_ids[1], e->row_values[1])) {
+            atomic_fetch_add_explicit(&g_engram_async_t1_failures, 1, memory_order_relaxed);
+            return false;
+        }
+        e->history = e->t1_next_history;
+        ++e->position;
+        e->prepared = true;
+        atomic_fetch_add_explicit(&g_engram_async_t1_joined, 1, memory_order_relaxed);
+        return true;
+    }
+    if (e->t1_invalid) {
+        e->t1_pending = false;
+        e->t1_dispatched = false;
+        e->t1_invalid = false;
+        atomic_fetch_add_explicit(&g_engram_async_t1_failures, 1, memory_order_relaxed);
+        return myds_engram_read(&e->table[1], e->row_ids[1], MYDS_ENGRAM_COLS, e->row_values[1]);
+    }
+    myds_engram_reader_t *r = e->async_t1_reader;
+    pthread_mutex_lock(&r->state);
+    while (r->remaining) pthread_cond_wait(&r->done, &r->state);
+    pthread_mutex_unlock(&r->state);
+    e->t1_pending = false;
+    e->t1_dispatched = false;
+    /* Decode on calling thread in exact column order: 0-ULP + exact errno/FP flags. */
+    bool ok = true;
+    for (int col = 0; col < MYDS_ENGRAM_COLS; ++col) {
+        engram_io_job_t *job = &r->jobs[e->t1_map[col]];
+        if (job->error) { errno = job->error; ok = false; break; }
+        int previous = 0;
+        while (previous < col && e->t1_map[previous] != e->t1_map[col]) ++previous;
+        if (previous < col) {
+            memcpy(e->row_values[1] + col * MYDS_ENGRAM_DIM,
+                   e->row_values[1] + previous * MYDS_ENGRAM_DIM,
+                   MYDS_ENGRAM_DIM * sizeof(float));
+        } else {
+            if (job->retry_errno) errno = job->retry_errno;
+            if (!myds_engram_decode_row(job->raw, e->row_values[1] + col * MYDS_ENGRAM_DIM)) {
+                ok = false;
+                break;
+            }
+        }
+    }
+    if (!ok) {
+        atomic_fetch_add_explicit(&g_engram_async_t1_failures, 1, memory_order_relaxed);
+        return false;
+    }
+    e->history = e->t1_next_history;
+    ++e->position;
+    e->prepared = true;
+    atomic_fetch_add_explicit(&g_engram_async_t1_joined, 1, memory_order_relaxed);
+    return true;
+}
+
 static bool prepare_token_step(myds_engram_t *e, int32_t token, uint64_t position) {
     if (!e) return fail(EINVAL);
+    if (e->t1_pending) myds_engram_cancel_t1(e);
     e->prepared = false;
     if (position != e->position || position == UINT64_MAX) return fail(EINVAL);
     myds_engram_history_t next = e->history;
@@ -862,6 +1126,7 @@ static bool prepare_batch_step(myds_engram_t *e, const int32_t *tokens,
                               size_t count, uint64_t start_position,
                               float *out_layer0, float *out_layer1) {
     if (!e || (count && (!tokens || !out_layer0 || !out_layer1))) return fail(EINVAL);
+    if (e->t1_pending) myds_engram_cancel_t1(e);
     if (!count) return true;
     if (start_position != e->position || count > UINT64_MAX - start_position) {
         e->prepared = false;
