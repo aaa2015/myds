@@ -4524,11 +4524,29 @@ static inline const char *attention_decode_mma_kernel_name(uint32_t d_split) {
     }
 }
 #define MYDS_ATTN_DECODE_MMA_MIN_KEYS 1u
+#define MYDS_ATTN_DECODE_MMA_SPLITK_MIN_KEYS 129u
 #define MYDS_ATTN_DECODE_MMA_SMEM_BYTES 10272u
-static int attention_decode_mma_preflight(uint32_t d_split) {
-    const char *kname = attention_decode_mma_kernel_name(d_split);
-    if (!kname) return 0;
-    const uint32_t threads[] = {32u, 4u, 1u};
+static inline const char *attention_decode_mma_select_kernel(
+    uint32_t d_split, uint32_t keys, uint32_t *out_grid_y, uint32_t *out_nsg) {
+    /* For keys > 128 on D_SPLIT >= 4 (modes 1/4/8), dispatch single-pass in-TG
+     * Split-K (KSG=8, grid_y=8 -> 64 TGs x 256 thr, 0 B spill, maxThr=832 on
+     * Apple8 M2 Ultra, 100% balanced at keys in {128,256,512,640}). For
+     * keys <= 128 (or D_SPLIT=2), keep the 4-SG kernel already proven
+     * 1.10-3.85x faster on M2 Ultra and 1.59-2.50x on M4. */
+    if (keys >= MYDS_ATTN_DECODE_MMA_SPLITK_MIN_KEYS && d_split >= 4u) {
+        if (out_grid_y) *out_grid_y = 8u;
+        if (out_nsg) *out_nsg = 8u;
+        return "kernel_myds_attention_decode_mma_sk8_f16_512_d8";
+    }
+    if (out_grid_y) *out_grid_y = d_split;
+    if (out_nsg) *out_nsg = 4u;
+    return attention_decode_mma_kernel_name(d_split);
+}
+static int attention_decode_mma_preflight(uint32_t d_split, uint32_t keys) {
+    uint32_t grid_y = 0u, nsg = 0u;
+    const char *kname = attention_decode_mma_select_kernel(d_split, keys, &grid_y, &nsg);
+    if (!kname || !grid_y || !nsg) return 0;
+    const uint32_t threads[] = {32u, nsg, 1u};
     return myds_metal_kernel_constants_preflight(kname, threads, MYDS_ATTN_DECODE_MMA_SMEM_BYTES, NULL, 0u);
 }
 void myds_v41_gpu_attention_decode_mma_counters(
@@ -4820,7 +4838,7 @@ static int attention_rope_validate(myds_metal_buffer_t *heads,const myds_metal_b
     if (decode_mma < 0) return 0;
     const uint32_t keys=n_raw+selected_rows;
     if (decode_mma > 0 && flash_dec == 0 && keys >= MYDS_ATTN_DECODE_MMA_MIN_KEYS) {
-        if (attention_decode_mma_preflight(attention_decode_mma_d_split(decode_mma))) {
+        if (attention_decode_mma_preflight(attention_decode_mma_d_split(decode_mma), keys)) {
             return 1;
         }
     }
@@ -4878,14 +4896,16 @@ static int dispatch_decode_mma_attention(
     const myds_metal_buffer_t *q, myds_v41_gpu_scratch_t *s,
     const struct flash_vec_args *a, const struct attention_rope_scope *rope,
     uint32_t d_split) {
-    const char *kname = attention_decode_mma_kernel_name(d_split);
-    if (!kname || !rope) return 0;
+    uint32_t grid_y = 0u, nsg = 0u;
+    const uint32_t keys = (a && a->ne11 > 0) ? (uint32_t)a->ne11 : 0u;
+    const char *kname = attention_decode_mma_select_kernel(d_split, keys, &grid_y, &nsg);
+    if (!kname || !grid_y || !nsg || !rope) return 0;
     struct attention_rope_fuse_args fused = {.attention = *a, .pos = rope->pos, .inverse = 1u};
     memcpy(fused.frequencies, rope_frequencies[rope->compressed ? 1 : 0], sizeof(fused.frequencies));
     const myds_metal_buffer_t *mb[] = {q, s->kv_f16, s->kv_f16, s->mask, sinks, heads};
     const uint64_t before = myds_metal_dispatch_count();
     const int ok = dispatch(kname, &fused, sizeof(fused), mb, 6,
-                            8u, d_split, 1u, 32u, 4u, 1u, MYDS_ATTN_DECODE_MMA_SMEM_BYTES);
+                            8u, grid_y, 1u, 32u, nsg, 1u, MYDS_ATTN_DECODE_MMA_SMEM_BYTES);
     if (ok && myds_metal_dispatch_count() > before) {
         attention_decode_mma_count(ADM_ENCODED);
     }
@@ -4952,7 +4972,7 @@ static uint32_t resolve_decode_mma_d_split(uint32_t keys, const struct attention
     const int flash_dec = myds_v41_gpu_attention_flash_dec_enabled();
     if (flash_dec == 0 && keys >= MYDS_ATTN_DECODE_MMA_MIN_KEYS) {
         const uint32_t ds = attention_decode_mma_d_split(mode);
-        if (attention_decode_mma_preflight(ds)) {
+        if (attention_decode_mma_preflight(ds, keys)) {
             return ds;
         }
     }

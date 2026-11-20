@@ -214,16 +214,23 @@ typedef struct {
     const char *label;
     const char *kernel;
     uint32_t d_split;
+    uint32_t nsg;
     bool fp16_p;
 } variant_t;
 
-static const variant_t kVariants[6] = {
-    {"D2-FP32P", "kernel_myds_attention_decode_mma_rope_fuse_f16_512_d2",     2u, false},
-    {"D4-FP32P", "kernel_myds_attention_decode_mma_rope_fuse_f16_512_d4",     4u, false},
-    {"D8-FP32P", "kernel_myds_attention_decode_mma_rope_fuse_f16_512_d8",     8u, false},
-    {"D2-FP16P", "kernel_myds_attention_decode_mma_rope_fuse_f16_512_d2_p16", 2u, true},
-    {"D4-FP16P", "kernel_myds_attention_decode_mma_rope_fuse_f16_512_d4_p16", 4u, true},
-    {"D8-FP16P", "kernel_myds_attention_decode_mma_rope_fuse_f16_512_d8_p16", 8u, true},
+enum { kNumBaseVariants = 6, kNumSplitKVariants = 4, kNumVariants = 10 };
+
+static const variant_t kVariants[kNumVariants] = {
+    {"D2-FP32P", "kernel_myds_attention_decode_mma_rope_fuse_f16_512_d2",     2u,  4u, false},
+    {"D4-FP32P", "kernel_myds_attention_decode_mma_rope_fuse_f16_512_d4",     4u,  4u, false},
+    {"D8-FP32P", "kernel_myds_attention_decode_mma_rope_fuse_f16_512_d8",     8u,  4u, false},
+    {"D2-FP16P", "kernel_myds_attention_decode_mma_rope_fuse_f16_512_d2_p16", 2u,  4u, true},
+    {"D4-FP16P", "kernel_myds_attention_decode_mma_rope_fuse_f16_512_d4_p16", 4u,  4u, true},
+    {"D8-FP16P", "kernel_myds_attention_decode_mma_rope_fuse_f16_512_d8_p16", 8u,  4u, true},
+    {"SK4-D8",   "kernel_myds_attention_decode_mma_sk4_f16_512_d8",           8u,  4u, false},
+    {"SK8-D8",   "kernel_myds_attention_decode_mma_sk8_f16_512_d8",           8u,  8u, false},
+    {"SK10-D8",  "kernel_myds_attention_decode_mma_sk10_f16_512_d8",          8u, 10u, false},
+    {"SK16-D8",  "kernel_myds_attention_decode_mma_sk16_f16_512_d8",          8u, 16u, false},
 };
 
 static id<MTLComputePipelineState> build_base_pso(id<MTLDevice> dev, id<MTLLibrary> lib, bool has_kvpad) {
@@ -327,7 +334,7 @@ static void run_baseline(id<MTLCommandQueue> queue,
 }
 
 static void run_mma(id<MTLCommandQueue> queue,
-                    id<MTLComputePipelineState> mma_pso, uint32_t d_split,
+                    id<MTLComputePipelineState> mma_pso, uint32_t d_split, uint32_t nsg,
                     const struct test_rope_fuse_args *args,
                     id<MTLBuffer> qbuf, id<MTLBuffer> kbuf, id<MTLBuffer> vbuf,
                     id<MTLBuffer> mbuf, id<MTLBuffer> sbuf, id<MTLBuffer> dstbuf) {
@@ -342,7 +349,7 @@ static void run_mma(id<MTLCommandQueue> queue,
     [enc setBuffer:sbuf offset:0 atIndex:5];
     [enc setBuffer:dstbuf offset:0 atIndex:6];
     [enc setThreadgroupMemoryLength:10272 atIndex:0];
-    [enc dispatchThreadgroups:MTLSizeMake(8, d_split, 1) threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+    [enc dispatchThreadgroups:MTLSizeMake(8, d_split, 1) threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     [enc endEncoding];
     [cb commit];
     [cb waitUntilCompleted];
@@ -387,7 +394,7 @@ static void test_knob_parsing(void) {
 
 /* 2. Print PSO residency for all variants */
 static void inspect_psos(id<MTLDevice> dev, id<MTLLibrary> lib,
-                         id<MTLComputePipelineState> __strong mma_psos[6],
+                         id<MTLComputePipelineState> __strong mma_psos[kNumVariants],
                          id<MTLComputePipelineState> base_pso) {
     printf("[2/5] PSO Residency on %s (maxTGMem=%lu B):\n",
            dev.name.UTF8String, (unsigned long)dev.maxThreadgroupMemoryLength);
@@ -411,9 +418,9 @@ static void inspect_psos(id<MTLDevice> dev, id<MTLLibrary> lib,
            10272u,
            (unsigned long)(max_mem / (10272u + canon.staticThreadgroupMemoryLength)));
 
-    for (int v = 0; v < 6; v++) {
+    for (int v = 0; v < kNumVariants; v++) {
         id<MTLComputePipelineState> p = mma_psos[v];
-        REQUIRE(p.maxTotalThreadsPerThreadgroup >= 128u);
+        REQUIRE(p.maxTotalThreadsPerThreadgroup >= 32u * kVariants[v].nsg);
         REQUIRE(p.threadExecutionWidth == 32u);
         REQUIRE(p.staticThreadgroupMemoryLength + 10272u <= max_mem);
         NSUInteger tgs = max_mem / (10272u + p.staticThreadgroupMemoryLength);
@@ -432,10 +439,10 @@ static void test_accuracy_suite(id<MTLDevice> dev, id<MTLCommandQueue> queue,
                                 id<MTLComputePipelineState> pad_pso,
                                 id<MTLComputePipelineState> base_pso_nopad,
                                 id<MTLComputePipelineState> base_pso_pad,
-                                id<MTLComputePipelineState> __strong mma_psos[6]) {
+                                id<MTLComputePipelineState> __strong mma_psos[kNumVariants]) {
     printf("[3/5] Running numerical accuracy & edge-case suite vs register_rope_fuse...\n");
 
-    const uint32_t keys_list[] = {1, 7, 31, 32, 64, 127, 128, 129, 256, 512, 639, 640};
+    const uint32_t keys_list[] = {1, 7, 15, 16, 17, 31, 32, 64, 127, 128, 129, 192, 256, 512, 639, 640};
     const uint32_t pos_list[]  = {0, 1, 127, 847, 16384};
 
     id<MTLBuffer> qbuf   = [dev newBufferWithLength:64u * 512u * 4u options:MTLResourceStorageModeShared];
@@ -447,9 +454,10 @@ static void test_accuracy_suite(id<MTLDevice> dev, id<MTLCommandQueue> queue,
     id<MTLBuffer> refbuf = [dev newBufferWithLength:64u * 512u * 4u options:MTLResourceStorageModeShared];
     id<MTLBuffer> outbuf = [dev newBufferWithLength:64u * 512u * 4u options:MTLResourceStorageModeShared];
 
-    double worst_abs[6] = {0}, worst_rel[6] = {0}, worst_l2[6] = {0}, min_cos[6] = {1, 1, 1, 1, 1, 1};
-    double worst_rp_abs[6] = {0}, worst_rp_rel[6] = {0}, min_rp_cos[6] = {1, 1, 1, 1, 1, 1};
-    uint32_t worst_ulps[6] = {0};
+    double worst_abs[kNumVariants] = {0}, worst_rel[kNumVariants] = {0}, worst_l2[kNumVariants] = {0};
+    double min_cos[kNumVariants], worst_rp_abs[kNumVariants] = {0}, worst_rp_rel[kNumVariants] = {0}, min_rp_cos[kNumVariants];
+    uint32_t worst_ulps[kNumVariants] = {0};
+    for (int v = 0; v < kNumVariants; v++) { min_cos[v] = 1.0; min_rp_cos[v] = 1.0; }
 
     /* 3a. Sweep all required key counts + stale-tail NaN/Inf poisoning + RoPE dims */
     for (size_t ki = 0; ki < sizeof(keys_list) / sizeof(keys_list[0]); ki++) {
@@ -493,9 +501,9 @@ static void test_accuracy_suite(id<MTLDevice> dev, id<MTLCommandQueue> queue,
             ? [dev newBufferWithBytes:mp length:(size_t)keys * 2u options:MTLResourceStorageModeShared]
             : mbuf;
 
-        for (int v = 0; v < 6; v++) {
+        for (int v = 0; v < kNumVariants; v++) {
             memset(outbuf.contents, 0xa5, 64u * 512u * 4u);
-            run_mma(queue, mma_psos[v], kVariants[v].d_split, &fargs,
+            run_mma(queue, mma_psos[v], kVariants[v].d_split, kVariants[v].nsg, &fargs,
                     qbuf, kbuf, vbuf, mbuf, sbuf, outbuf);
             err_metrics_t m = compute_metrics((const float *)refbuf.contents, (const float *)outbuf.contents);
             REQUIRE(m.non_finite == 0u);
@@ -521,15 +529,15 @@ static void test_accuracy_suite(id<MTLDevice> dev, id<MTLCommandQueue> queue,
             /* Verify exact unpadded buffers match poisoned-tail buffers bit-for-bit */
             if (keys % 64u != 0) {
                 id<MTLBuffer> out2 = [dev newBufferWithLength:64u * 512u * 4u options:MTLResourceStorageModeShared];
-                run_mma(queue, mma_psos[v], kVariants[v].d_split, &fargs,
+                run_mma(queue, mma_psos[v], kVariants[v].d_split, kVariants[v].nsg, &fargs,
                         qbuf, exact_k, exact_v, exact_m, sbuf, out2);
                 REQUIRE(memcmp(outbuf.contents, out2.contents, 64u * 512u * 4u) == 0);
             }
         }
     }
 
-    printf("  Sweep keys={1,7,31,32,64,127,128,129,256,512,639,640} + NaN-tail + exact-bounds + RoPE(448..511):\n");
-    for (int v = 0; v < 6; v++) {
+    printf("  Sweep keys={1,7,15,16,17,31,32,64,127,128,129,192,256,512,639,640} + NaN-tail + exact-bounds + RoPE(448..511):\n");
+    for (int v = 0; v < kNumVariants; v++) {
         printf("    %-8s | max_abs=%.3e max_rel=%.3e l2_rel=%.3e max_bf16_ulps=%u min_cos=%.8f | RoPE: max_abs=%.3e min_cos=%.8f\n",
                kVariants[v].label, worst_abs[v], worst_rel[v], worst_l2[v], worst_ulps[v],
                min_cos[v], worst_rp_abs[v], min_rp_cos[v]);
@@ -594,8 +602,8 @@ static void test_accuracy_suite(id<MTLDevice> dev, id<MTLCommandQueue> queue,
         run_baseline(queue, (keys % 32u) ? base_pso_pad : base_pso_nopad,
                      &fargs, qbuf, kbuf, vbuf, mbuf, sbuf, padbuf, refbuf);
 
-        for (int v = 0; v < 6; v++) {
-            run_mma(queue, mma_psos[v], kVariants[v].d_split, &fargs,
+        for (int v = 0; v < kNumVariants; v++) {
+            run_mma(queue, mma_psos[v], kVariants[v].d_split, kVariants[v].nsg, &fargs,
                     qbuf, kbuf, vbuf, mbuf, sbuf, outbuf);
             err_metrics_t m = compute_metrics((const float *)refbuf.contents, (const float *)outbuf.contents);
             REQUIRE(m.non_finite == 0u);
@@ -753,17 +761,18 @@ static int cmp_double(const void *a, const void *b) {
     return (da < db) ? -1 : (da > db) ? 1 : 0;
 }
 
-/* 5. Batched 40-layer-in-1-CB M4 microbenchmark */
+/* 5. Batched 40-layer-in-1-CB GPU microbenchmark (Serial-K + Single-Pass In-TG Split-K) */
 static void run_m4_benchmark(id<MTLDevice> dev, id<MTLCommandQueue> queue,
                              id<MTLComputePipelineState> pad_pso,
                              id<MTLComputePipelineState> base_pso_nopad,
                              id<MTLComputePipelineState> base_pso_pad,
-                             id<MTLComputePipelineState> __strong mma_psos[6]) {
-    printf("\n[5/5] M4 Decode Attention Microbenchmark (40 layers batched in 1 CB, median of 7 runs, us/layer):\n");
+                             id<MTLComputePipelineState> __strong mma_psos[kNumVariants]) {
+    printf("\n[5/5] Decode Attention Microbenchmark (40 layers batched in 1 CB, median of 7 runs, us/layer):\n");
     printf("  Device: %s\n", dev.name.UTF8String);
-    printf("  %-6s | %-9s | %-9s | %-9s | %-9s | %-9s | %-9s | %-9s | Best\n",
-           "keys", "Base(us)", "D2-F32P", "D4-F32P", "D8-F32P", "D2-F16P", "D4-F16P", "D8-F16P");
-    printf("  -------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+---------------------\n");
+    printf("  %-6s | %-9s | %-9s | %-9s | %-9s | %-9s | %-9s | %-9s | %-9s | %-9s | %-9s | Best\n",
+           "keys", "Base(us)", "D2-F32P", "D4-F32P", "D8-F32P", "D8-F16P",
+           "SK4-D8", "SK8-D8", "SK10-D8", "SK16-D8", "D2-F16P");
+    printf("  -------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+---------------------\n");
 
     const uint32_t bench_keys[] = {1, 7, 16, 31, 32, 64, 128, 256, 512, 639, 640};
     enum { kBenchLayers = 40, kBenchRuns = 7 };
@@ -792,7 +801,6 @@ static void run_m4_benchmark(id<MTLDevice> dev, id<MTLCommandQueue> queue,
 
         id<MTLComputePipelineState> bpso = (keys % 32u) ? base_pso_pad : base_pso_nopad;
 
-        /* Warmup + measure baseline (40 serial layers in 1 CB) */
         double base_samples[kBenchRuns];
         for (int run = -2; run < n_runs; run++) {
             id<MTLCommandBuffer> cb = [queue commandBuffer];
@@ -822,10 +830,10 @@ static void run_m4_benchmark(id<MTLDevice> dev, id<MTLCommandQueue> queue,
         qsort(base_samples, n_runs, sizeof(double), cmp_double);
         const double base_us = base_samples[n_runs / 2];
 
-        double var_us[6];
+        double var_us[kNumVariants];
         int best_idx = -1;
         double best_us = base_us;
-        for (int v = 0; v < 6; v++) {
+        for (int v = 0; v < kNumVariants; v++) {
             double samples[kBenchRuns];
             for (int run = -2; run < n_runs; run++) {
                 id<MTLCommandBuffer> cb = [queue commandBuffer];
@@ -841,7 +849,7 @@ static void run_m4_benchmark(id<MTLDevice> dev, id<MTLCommandQueue> queue,
                 [enc setThreadgroupMemoryLength:10272 atIndex:0];
                 for (int l = 0; l < n_layers; l++) {
                     [enc dispatchThreadgroups:MTLSizeMake(8, kVariants[v].d_split, 1)
-                        threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+                        threadsPerThreadgroup:MTLSizeMake(32, kVariants[v].nsg, 1)];
                     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
                 }
                 [enc endEncoding];
@@ -862,9 +870,10 @@ static void run_m4_benchmark(id<MTLDevice> dev, id<MTLCommandQueue> queue,
 
         const char *best_name = (best_idx >= 0) ? kVariants[best_idx].label : "Baseline";
         const double speedup = base_us / best_us;
-        printf("  %-6u | %9.2f | %9.2f | %9.2f | %9.2f | %9.2f | %9.2f | %9.2f | %-8s (%.2fx)\n",
+        printf("  %-6u | %9.2f | %9.2f | %9.2f | %9.2f | %9.2f | %9.2f | %9.2f | %9.2f | %9.2f | %9.2f | %-8s (%.2fx)\n",
                keys, base_us,
-               var_us[0], var_us[1], var_us[2], var_us[3], var_us[4], var_us[5],
+               var_us[0], var_us[1], var_us[2], var_us[5],
+               var_us[6], var_us[7], var_us[8], var_us[9], var_us[3],
                best_name, speedup);
     }
     printf("\n");
@@ -894,8 +903,8 @@ int main(int argc, char **argv) {
         id<MTLComputePipelineState> pad_pso = build_pad_pso(dev, lib);
         id<MTLComputePipelineState> base_pso_nopad = build_base_pso(dev, lib, false);
         id<MTLComputePipelineState> base_pso_pad   = build_base_pso(dev, lib, true);
-        id<MTLComputePipelineState> mma_psos[6];
-        for (int v = 0; v < 6; v++) {
+        id<MTLComputePipelineState> mma_psos[kNumVariants];
+        for (int v = 0; v < kNumVariants; v++) {
             mma_psos[v] = build_plain_pso(dev, lib, kVariants[v].kernel);
         }
 
