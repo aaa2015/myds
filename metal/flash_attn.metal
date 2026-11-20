@@ -971,7 +971,8 @@ template<
     short NSG,
     bool HEAD_BATCH = true,
     bool MASKLESS = false,
-    bool DIRECT_SLAB = false>
+    bool DIRECT_SLAB = false,
+    bool ZERO_SQ = false>
 void kernel_myds_flash_attn_heads_reg_o_impl(
         constant ds4_metal_args_flash_attn_ext & args,
         device const char * q,
@@ -995,7 +996,6 @@ void kernel_myds_flash_attn_heads_reg_o_impl(
 
     static_assert(DK == 512 && DV == 512, "Reg-O heads expects DK=512, DV=512");
     static_assert(Q % 8 == 0 && Q % NSG == 0, "Q must be multiple of 8 and NSG");
-    static_assert((C / 8) % NSG == 0 && (C / 8) % 2 == 0, "C/8 must be divisible by NSG and 2");
 
     constexpr short DK4    = DK/4;
     constexpr short DK8    = DK/8;
@@ -1009,20 +1009,31 @@ void kernel_myds_flash_attn_heads_reg_o_impl(
     constexpr short NO_COL = PV8/NSG;
     static_assert(QB * NO_COL == 16, "exactly 16 simdgroup_float8x8 (32 floats/lane)");
 
+    constexpr short NSG_C  = (NSG < C/8) ? NSG : (C/8);
+    constexpr short NSG_Q  = NSG / NSG_C;
+    constexpr short QB_QK  = QB / NSG_Q;
+    static_assert(NSG % NSG_C == 0 && (C / 8) % NSG_C == 0 && (C / 8) % 2 == 0,
+                  "C/8 and NSG QK split must divide evenly");
+    static_assert(QB % NSG_Q == 0, "QB must be divisible by NSG_Q");
+
     constexpr short SH = MASKLESS ? C : 2*C;
     constexpr short TS = 2*SH;
+    constexpr int SQ_H = ZERO_SQ ? 0 : (Q * DK);
 
-    // Shared memory layout (no `so`, no `sk/sv`):
-    //   [0 .. Q*DK)                : sq      (Q*DK halves = 8 KiB @ Q=8, 16 KiB @ Q=16)
-    //   [Q*DK .. Q*(DK+TS))        : ss+sm2  (Q*256 halves = 4 KiB @ Q=8) or ss only (2 KiB @ MASKLESS)
-    //   [Q*(DK+TS) .. +2*Q)        : s_ms    (Q floats = 32 B @ Q=8, 64 B @ Q=16)
-    // Total dynamic smem: 12,320 B (Q=8, NSG=4), 10,272 B (Q=8, NSG=4, MASKLESS -> 3 TGs/core), or 24,640 B (Q=16).
-    threadgroup half   * sq   = shmem_f16;
-    threadgroup half4  * sq4  = (threadgroup half4 *) shmem_f16;
-    threadgroup float  * ss   = (threadgroup float *) (shmem_f16 + Q*DK);
-    threadgroup float2 * ss2  = (threadgroup float2 *) (shmem_f16 + Q*DK);
-    threadgroup half2  * sm2  = MASKLESS ? nullptr : (threadgroup half2 *) (shmem_f16 + Q*DK + 2*C);
-    threadgroup float  * s_ms = (threadgroup float *) (shmem_f16 + Q*(DK + TS));
+    // Shared memory layout (no `so`, no `sk/sv`; ZERO_SQ also omits `sq` and loads packed half Q from L1):
+    //   [0 .. SQ_H)                : sq      (8 KiB @ Q=8, 0 B @ ZERO_SQ)
+    //   [SQ_H .. SQ_H + Q*TS)      : ss+sm2  (or ss only @ MASKLESS: 2 KiB @ Q=8, 4 KiB @ Q=16, 8 KiB @ Q=32)
+    //   [SQ_H + Q*TS .. +2*Q)      : s_ms    (32 B @ Q=8, 64 B @ Q=16, 128 B @ Q=32)
+    // Total dynamic smem:
+    //   12,320 B (Q=8, NSG=4), 10,272 B (Q=8, NSG=4, MASKLESS -> 3 TGs/core),
+    //    4,160 B (Q=16, NSG=8, MASKLESS+ZERO_SQ -> 3-4 TGs/core),
+    //    8,320 B (Q=32, NSG=16, MASKLESS+ZERO_SQ -> 2 TGs/core).
+    threadgroup half   * sq   = ZERO_SQ ? nullptr : shmem_f16;
+    threadgroup half4  * sq4  = ZERO_SQ ? nullptr : (threadgroup half4 *) shmem_f16;
+    threadgroup float  * ss   = (threadgroup float *) (shmem_f16 + SQ_H);
+    threadgroup float2 * ss2  = (threadgroup float2 *) (shmem_f16 + SQ_H);
+    threadgroup half2  * sm2  = MASKLESS ? nullptr : (threadgroup half2 *) (shmem_f16 + SQ_H + 2*C);
+    threadgroup float  * s_ms = (threadgroup float *) (shmem_f16 + SQ_H + Q*TS);
 
     const short lo_row = ((tiisg >> 2) & 4) | ((tiisg >> 1) & 3);
     const short lo_col = ((tiisg >> 1) & 4) | ((tiisg & 1) << 1);
@@ -1055,21 +1066,30 @@ void kernel_myds_flash_attn_heads_reg_o_impl(
         v += ikv2*args.nb22 + ikv3*args.nb23;
     }
 
-    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
-        const short j = jj*NSG + sgitg;
+    if (!ZERO_SQ) {
+        FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+            const short j = jj*NSG + sgitg;
 
-        device const float4 * q4 = (device const float4 *) ((device const char *) q + j*args.nb01);
+            device const float4 * q4 = (device const float4 *) ((device const char *) q + j*args.nb01);
 
-        for (short i = tiisg; i < DK4; i += NW) {
-            if (iq1 + j < args.ne01) {
-                sq4[j*DK4 + i] = (half4) q4[i];
-            } else {
-                sq4[j*DK4 + i] = 0;
+            for (short i = tiisg; i < DK4; i += NW) {
+                if (iq1 + j < args.ne01) {
+                    sq4[j*DK4 + i] = (half4) q4[i];
+                } else {
+                    sq4[j*DK4 + i] = 0;
+                }
+            }
+
+            for (short i = tiisg; i < SH; i += NW) {
+                ss[j*SH + i] = 0.0f;
             }
         }
-
-        for (short i = tiisg; i < SH; i += NW) {
-            ss[j*SH + i] = 0.0f;
+    } else if (!MASKLESS) {
+        FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+            const short j = jj*NSG + sgitg;
+            for (short i = tiisg; i < SH; i += NW) {
+                ss[j*SH + i] = 0.0f;
+            }
         }
     }
 
@@ -1080,7 +1100,9 @@ void kernel_myds_flash_attn_heads_reg_o_impl(
         }
     }
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!ZERO_SQ || !MASKLESS) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 
     float S[NQ] = { [0 ... NQ-1] = 0.0f };
 
@@ -1177,15 +1199,17 @@ void kernel_myds_flash_attn_heads_reg_o_impl(
                 device const char * k_src = (DIRECT_SLAB && ic < 128)
                     ? (slab_k + (uint64_t)ic*args.nb11)
                     : (k + (uint64_t)(DIRECT_SLAB ? (ic - 128) : ic)*args.nb11);
-                device      const half  * pk = (device const half *) k_src + sgitg*(8*NS10);
-                threadgroup       float * ps = ss + sgitg*8;
+                const short sg_c = (NSG_Q == 1) ? sgitg : (sgitg % NSG_C);
+                const short sg_q = (NSG_Q == 1) ? 0     : (sgitg / NSG_C);
+                device      const half  * pk = (device const half *) k_src + sg_c*(8*NS10);
+                threadgroup       float * ps = ss + sg_q*(QB_QK*8)*SH + sg_c*8;
 
-                constexpr short NC_QK = (C/8)/NSG;
+                constexpr short NC_QK = (C/8)/NSG_C;
 
                 FOR_UNROLL (short cc = 0; cc < NC_QK; ++cc) {
-                    simdgroup_float8x8 mqk[QB];
-                    FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
-                        mqk[qb] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+                    simdgroup_float8x8 mqk[QB_QK];
+                    FOR_UNROLL (short lqb = 0; lqb < QB_QK; ++lqb) {
+                        mqk[lqb] = make_filled_simdgroup_matrix<float, 8>(0.0f);
                     }
 
                     #pragma unroll 16
@@ -1196,25 +1220,32 @@ void kernel_myds_flash_attn_heads_reg_o_impl(
                         simdgroup_load(mk[0], pk + 0*8 + 16*i, NS10, 0, true);
                         simdgroup_load(mk[1], pk + 1*8 + 16*i, NS10, 0, true);
 
-                        FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
+                        FOR_UNROLL (short lqb = 0; lqb < QB_QK; ++lqb) {
+                            const short qb = sg_q*QB_QK + lqb;
                             simdgroup_half8x8 mq[2];
-                            threadgroup const half * pq = sq + qb*8*DK;
-                            simdgroup_load(mq[0], pq + 0*8 + 16*i, DK);
-                            simdgroup_load(mq[1], pq + 1*8 + 16*i, DK);
+                            if (ZERO_SQ) {
+                                device const half * pq = ((device const half *) q) + qb*8*DK;
+                                simdgroup_load(mq[0], pq + 0*8 + 16*i, DK, 0, false);
+                                simdgroup_load(mq[1], pq + 1*8 + 16*i, DK, 0, false);
+                            } else {
+                                threadgroup const half * pq = sq + qb*8*DK;
+                                simdgroup_load(mq[0], pq + 0*8 + 16*i, DK);
+                                simdgroup_load(mq[1], pq + 1*8 + 16*i, DK);
+                            }
 
                             simdgroup_barrier(mem_flags::mem_none);
 
-                            simdgroup_multiply_accumulate(mqk[qb], mq[0], mk[0], mqk[qb]);
-                            simdgroup_multiply_accumulate(mqk[qb], mq[1], mk[1], mqk[qb]);
+                            simdgroup_multiply_accumulate(mqk[lqb], mq[0], mk[0], mqk[lqb]);
+                            simdgroup_multiply_accumulate(mqk[lqb], mq[1], mk[1], mqk[lqb]);
                         }
                     }
 
-                    FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
-                        simdgroup_store(mqk[qb], ps + qb*8*SH, SH, 0, false);
+                    FOR_UNROLL (short lqb = 0; lqb < QB_QK; ++lqb) {
+                        simdgroup_store(mqk[lqb], ps + lqb*8*SH, SH, 0, false);
                     }
 
-                    pk += 8*(NSG*NS10);
-                    ps += 8*NSG;
+                    pk += 8*(NSG_C*NS10);
+                    ps += 8*NSG_C;
                 }
             }
 
@@ -1272,33 +1303,56 @@ void kernel_myds_flash_attn_heads_reg_o_impl(
                     : (v + (uint64_t)(DIRECT_SLAB ? (ic - 128) : ic)*args.nb21);
                 device const half * pv = (device const half *) v_src + 8*sgitg;
 
-                constexpr short NC_PV = (C/8)/2;
-
-                FOR_UNROLL (short cc = 0; cc < NC_PV; ++cc) {
-                    simdgroup_float8x8 vs[QB][2];
-
-                    FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
-                        simdgroup_load(vs[qb][0], ss + qb*8*SH + 16*cc + 0, SH, 0, false);
-                        simdgroup_load(vs[qb][1], ss + qb*8*SH + 16*cc + 8, SH, 0, false);
+                if (QB >= 4) {
+                    // For Q=32 (QB=4), step 8 keys at a time to keep vs[4]+mv[2] at 10 regs
+                    // (matching Q=16's register footprint for Apple8 static-regfile 2 TGs/core),
+                    // with identical key accumulation order (strict 0-ULP).
+                    constexpr short NC_PV8 = C/8;
+                    FOR_UNROLL (short c8 = 0; c8 < NC_PV8; ++c8) {
+                        simdgroup_float8x8 vs[QB];
+                        FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
+                            simdgroup_load(vs[qb], ss + qb*8*SH + 8*c8, SH, 0, false);
+                        }
+                        FOR_UNROLL (short ii = 0; ii < NO_COL/2; ++ii) {
+                            simdgroup_half8x8 mv[2];
+                            simdgroup_load(mv[0], pv + 0*NSG + 16*ii*NSG, NS20, 0, false);
+                            simdgroup_load(mv[1], pv + 8*NSG + 16*ii*NSG, NS20, 0, false);
+                            FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
+                                simdgroup_multiply_accumulate(lo[qb][2*ii + 0], vs[qb], mv[0], lo[qb][2*ii + 0]);
+                                simdgroup_multiply_accumulate(lo[qb][2*ii + 1], vs[qb], mv[1], lo[qb][2*ii + 1]);
+                            }
+                        }
+                        pv += 8*NS20;
                     }
+                } else {
+                    constexpr short NC_PV = (C/8)/2;
 
-                    FOR_UNROLL (short ii = 0; ii < NO_COL/2; ++ii) {
-                        simdgroup_half8x8 mv[4];
-
-                        simdgroup_load(mv[0], pv + 0*NSG + 16*ii*NSG + 0*8*NS20, NS20, 0, false);
-                        simdgroup_load(mv[1], pv + 8*NSG + 16*ii*NSG + 0*8*NS20, NS20, 0, false);
-                        simdgroup_load(mv[2], pv + 0*NSG + 16*ii*NSG + 1*8*NS20, NS20, 0, false);
-                        simdgroup_load(mv[3], pv + 8*NSG + 16*ii*NSG + 1*8*NS20, NS20, 0, false);
+                    FOR_UNROLL (short cc = 0; cc < NC_PV; ++cc) {
+                        simdgroup_float8x8 vs[QB][2];
 
                         FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
-                            simdgroup_multiply_accumulate(lo[qb][2*ii + 0], vs[qb][0], mv[0], lo[qb][2*ii + 0]);
-                            simdgroup_multiply_accumulate(lo[qb][2*ii + 1], vs[qb][0], mv[1], lo[qb][2*ii + 1]);
-                            simdgroup_multiply_accumulate(lo[qb][2*ii + 0], vs[qb][1], mv[2], lo[qb][2*ii + 0]);
-                            simdgroup_multiply_accumulate(lo[qb][2*ii + 1], vs[qb][1], mv[3], lo[qb][2*ii + 1]);
+                            simdgroup_load(vs[qb][0], ss + qb*8*SH + 16*cc + 0, SH, 0, false);
+                            simdgroup_load(vs[qb][1], ss + qb*8*SH + 16*cc + 8, SH, 0, false);
                         }
-                    }
 
-                    pv += 2*8*NS20;
+                        FOR_UNROLL (short ii = 0; ii < NO_COL/2; ++ii) {
+                            simdgroup_half8x8 mv[4];
+
+                            simdgroup_load(mv[0], pv + 0*NSG + 16*ii*NSG + 0*8*NS20, NS20, 0, false);
+                            simdgroup_load(mv[1], pv + 8*NSG + 16*ii*NSG + 0*8*NS20, NS20, 0, false);
+                            simdgroup_load(mv[2], pv + 0*NSG + 16*ii*NSG + 1*8*NS20, NS20, 0, false);
+                            simdgroup_load(mv[3], pv + 8*NSG + 16*ii*NSG + 1*8*NS20, NS20, 0, false);
+
+                            FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
+                                simdgroup_multiply_accumulate(lo[qb][2*ii + 0], vs[qb][0], mv[0], lo[qb][2*ii + 0]);
+                                simdgroup_multiply_accumulate(lo[qb][2*ii + 1], vs[qb][0], mv[1], lo[qb][2*ii + 1]);
+                                simdgroup_multiply_accumulate(lo[qb][2*ii + 0], vs[qb][1], mv[2], lo[qb][2*ii + 0]);
+                                simdgroup_multiply_accumulate(lo[qb][2*ii + 1], vs[qb][1], mv[3], lo[qb][2*ii + 1]);
+                            }
+                        }
+
+                        pv += 2*8*NS20;
+                    }
                 }
             }
 
@@ -1378,7 +1432,8 @@ template<
     short NSG,
     bool HEAD_BATCH = true,
     bool MASKLESS = false,
-    bool DIRECT_SLAB = false>
+    bool DIRECT_SLAB = false,
+    bool ZERO_SQ = false>
 kernel void kernel_myds_flash_attn_heads_reg_o(
         constant ds4_metal_args_flash_attn_ext & args,
         device const char * q,
@@ -1394,13 +1449,15 @@ kernel void kernel_myds_flash_attn_heads_reg_o(
         ushort  tiisg[[thread_index_in_simdgroup]],
         ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
     if (FC_flash_attn_ext_nsg == NSG) {
-        kernel_myds_flash_attn_heads_reg_o_impl<DK, DV, Q, C, NSG, HEAD_BATCH, MASKLESS, DIRECT_SLAB>(
+        kernel_myds_flash_attn_heads_reg_o_impl<DK, DV, Q, C, NSG, HEAD_BATCH, MASKLESS, DIRECT_SLAB, ZERO_SQ>(
             args, q, k, v, mask, sinks, pad, blk, dst, shmem_f16, tgpig, tiisg, sgitg);
     }
 }
 
 typedef decltype(kernel_myds_flash_attn_heads_reg_o<512, 512, 8, 64, 4, true>) flash_attn_heads_reg_o_t;
 typedef decltype(kernel_myds_flash_attn_heads_reg_o<512, 512, 8, 64, 4, true, true, true>) flash_attn_heads_reg_o_fast_t;
+typedef decltype(kernel_myds_flash_attn_heads_reg_o<512, 512, 16, 64, 8, true, true, true, true>) flash_attn_heads_reg_o_q16_fast_t;
+typedef decltype(kernel_myds_flash_attn_heads_reg_o<512, 512, 32, 64, 16, true, true, true, true>) flash_attn_heads_reg_o_q32_fast_t;
 
 // Step 1 (Q=8, C=64, NSG=4 Reg-O): 12,320 B smem (2 TGs = 256 threads/core).
 template [[host_name("kernel_myds_flash_attn_heads_f16_dk512_dv512")]]
@@ -1410,6 +1467,16 @@ kernel flash_attn_heads_reg_o_t kernel_myds_flash_attn_heads_reg_o<512, 512, 8, 
 // SH=C=64 => 10,272 B smem (3 TGs = 384 threads/core, +50% occupancy).
 template [[host_name("kernel_myds_flash_attn_heads_maskless_slab_f16_dk512_dv512")]]
 kernel flash_attn_heads_reg_o_fast_t kernel_myds_flash_attn_heads_reg_o<512, 512, 8, 64, 4, true, true, true>;
+
+// [CAND-A1 S1-S2] Zero-sq Maskless + Direct Window Slab Reg-O (Q=16, C=64, NSG=8):
+// Packed half Q loaded directly from L1 => 4,160 B smem (3-4 TGs/core), 2x K+V reuse.
+template [[host_name("kernel_myds_flash_attn_heads_maskless_slab_q16_f16_dk512_dv512")]]
+kernel flash_attn_heads_reg_o_q16_fast_t kernel_myds_flash_attn_heads_reg_o<512, 512, 16, 64, 8, true, true, true, true>;
+
+// [CAND-A1 S1-S2] Zero-sq Maskless + Direct Window Slab Reg-O (Q=32, C=64, NSG=16):
+// 2x8 SG split in QK^T, packed half Q from L1 => 8,320 B smem (2 TGs/core), 4x K+V reuse.
+template [[host_name("kernel_myds_flash_attn_heads_maskless_slab_q32_f16_dk512_dv512")]]
+kernel flash_attn_heads_reg_o_q32_fast_t kernel_myds_flash_attn_heads_reg_o<512, 512, 32, 64, 16, true, true, true, true>;
 
 // Step 2 (Q=16, C=64, NSG=8 Reg-O): 24,640 B smem (1 TG = 256 threads/core).
 template [[host_name("kernel_myds_flash_attn_heads_q16_f16_dk512_dv512")]]

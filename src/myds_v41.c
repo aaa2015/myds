@@ -7101,6 +7101,7 @@ struct v41_chunk_workspace_s {
     myds_metal_buffer_t *qr_buf;
     myds_metal_buffer_t *qr_norm_buf;
     myds_metal_buffer_t *q_buf;
+    myds_metal_buffer_t *q_f16_buf; /* [CAND-A1 S1] packed half Q, lazy on MYDS_PREFILL_ATTN_Q16>0 */
     myds_metal_buffer_t *kv_act_buf;
     myds_metal_buffer_t *attn_heads_buf;
     /* B 方案：每 query 640 个可见键的紧凑段（f16）。只在 MYDS_ATTN_GATHER=1 时分配，
@@ -7268,6 +7269,7 @@ static void v41_chunk_workspace_free(v41_chunk_workspace_t *cw) {
     if (cw->qr_buf) myds_metal_buffer_free(cw->qr_buf);
     if (cw->qr_norm_buf) myds_metal_buffer_free(cw->qr_norm_buf);
     if (cw->q_buf) myds_metal_buffer_free(cw->q_buf);
+    if (cw->q_f16_buf) myds_metal_buffer_free(cw->q_f16_buf);
     if (cw->kv_act_buf) myds_metal_buffer_free(cw->kv_act_buf);
     if (cw->attn_heads_buf) myds_metal_buffer_free(cw->attn_heads_buf);
     if (cw->attn_low_buf) myds_metal_buffer_free(cw->attn_low_buf);
@@ -7357,6 +7359,12 @@ static v41_chunk_workspace_t *v41_chunk_workspace_create(uint32_t capacity, uint
     ALLOC_BUF(qr_buf, C * 1280 * sizeof(float));
     ALLOC_BUF(qr_norm_buf, C * 1280 * sizeof(float));
     ALLOC_BUF(q_buf, C * V41_HEADS * 512 * sizeof(float));
+    {
+        const int q16_mode = myds_v41_gpu_prefill_attn_q16_mode();
+        if (q16_mode < 0) goto fail;
+        if (q16_mode > 0)
+            ALLOC_BUF(q_f16_buf, C * V41_HEADS * 512 * sizeof(uint16_t));
+    }
     ALLOC_BUF(kv_act_buf, C * 512 * sizeof(float));
     ALLOC_BUF(attn_heads_buf, C * V41_HEADS * 512 * sizeof(float));
     /* B 方案（gather）默认开：仅当显式 MYDS_ATTN_GATHER=0 时跳过分配。 */
@@ -8689,11 +8697,17 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
 
                 /* Step 3: Batched Q_B projection (reads 21 MB weight ONCE for all c_len tokens) */
                 TIME_START();
+                bool chunk_q_is_f16 = false;
                 if (kv_only) { /* 前端只喂窗口环，Q 完全不用算 */ }
                 else {
+                const uint32_t step3_ratio = ratio_for(il);
+                const uint32_t step3_n_comp = compressed ? (mb_base_pos + c_start + c_len) / step3_ratio : 0u;
+                const bool wants_q_f16 = !opt_skip_q_rope && !trace_on && cw->q_f16_buf &&
+                    myds_v41_gpu_prefill_attn_wants_q_f16(g->gpu, cw->kv_gathered, c_len, step3_n_comp,
+                                                          V41_TOPK, mb_base_pos, c_start, step3_ratio);
                 bool qb_bf16_fused = false;
                 if (!opt_skip_q_b) {
-                    if (!opt_skip_q_rope &&
+                    if (!opt_skip_q_rope && !wants_q_f16 &&
                         myds_metal_dense_prefill_wide_enabled() &&
                         base->attn_q_b_type == GGML_TYPE_Q4_K &&
                         c_len >= 32 && !is_mul_mm_disabled() &&
@@ -8709,11 +8723,18 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                         CHECK(project_batch(cw->q_buf, base->attn_q_b, cw->qr_norm_buf, V41_HEADS * 512, 1280, c_len, base->attn_q_b_type, false));
                 }
 
-                /* Batched RoPE (+ BF16 rounding when Q_B did not fuse BF16 in-register).
-                 * [P-R1] Site 1: Q_B fused BF16 already rounded all 512 dims, so dispatch
-                 * 64-dim-only kernel_dsv41_rope (skips 87.5% DRAM traffic, strict 0-ULP). */
+                /* Batched RoPE (+ BF16 rounding / packed f16):
+                 * - When wants_q_f16 (MYDS_PREFILL_ATTN_Q16=1/16/32): pack directly to half via
+                 *   kernel_dsv41_rope_round_f16 ONCE (Q_B already ran wide Q4_K f32 via project_batch).
+                 * - Otherwise when qb_bf16_fused ([P-R1] Site 1 under MYDS_DENSE_PREFILL_WIDE=1):
+                 *   Q_B fused BF16 already rounded all 512 dims, so dispatch 64-dim-only kernel_dsv41_rope.
+                 * - Otherwise: standard kernel_dsv41_rope_round. */
                 if (!opt_skip_q_rope) {
-                    if (qb_bf16_fused) {
+                    if (wants_q_f16) {
+                        CHECK(myds_v41_gpu_rope_batch_round_f16(cw->q_f16_buf, cw->q_buf, 512, V41_HEADS,
+                                                                mb_base_pos + c_start, c_len, compressed, false));
+                        chunk_q_is_f16 = true;
+                    } else if (qb_bf16_fused) {
                         CHECK(myds_v41_gpu_rope_batch(cw->q_buf, 512, V41_HEADS, mb_base_pos + c_start, c_len, compressed, false));
                         myds_metal_dense_prefill_wide_note_qb_rope64();
                     } else {
@@ -8900,12 +8921,15 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     extern void myds_attention_multihead_capture_set_layer(uint32_t);
                     myds_attention_multihead_capture_set_layer(il);
 #endif
-                    if (!myds_v41_gpu_attention_chunk_bf16(cw->attn_heads_buf, base->attn_sinks, cw->q_buf,
+                    const myds_v41_gpu_attention_chunk_opts_t attn_opts = {
+                        .q_f16 = chunk_q_is_f16 ? cw->q_f16_buf : NULL,
+                    };
+                    if (!myds_v41_gpu_attention_chunk_ex(cw->attn_heads_buf, base->attn_sinks, cw->q_buf,
                             cw->kv_act_buf,
                             n_comp ? g->compressed[owner_for(il)] : NULL,
                             n_comp ? cw->cur_selected_view : NULL,
                             cw->kv_gathered,
-                            c_len, n_comp, V41_TOPK, mb_base_pos, c_start, ratio, g->gpu)) {
+                            c_len, n_comp, V41_TOPK, mb_base_pos, c_start, ratio, g->gpu, true, &attn_opts)) {
                         MYDS_LOG_E("chunked attention failed (c_len=%u n_comp=%u)", c_len, n_comp);
                         goto fail;
                     }

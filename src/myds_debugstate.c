@@ -235,6 +235,10 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
     myds_metal_hc_mix_fast_counters_t hcm;
     memset(&hcm, 0, sizeof(hcm));
     myds_metal_hc_mix_fast_counters(&hcm, false);
+    myds_v41_gpu_prefill_attn_q16_counters_t paq;
+    memset(&paq, 0, sizeof(paq));
+    myds_v41_gpu_prefill_attn_q16_counters(&paq, false);
+    const int paq_mode = myds_v41_gpu_prefill_attn_q16_mode();
 
     /* Knob accounting, reusing the same inventory --print-config reports. */
     static myds_knob_seen_t seen[1024];
@@ -306,6 +310,8 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          "\"qb_rope64_encoded\":%llu,\"fallbacks\":%llu,\"failures\":%llu},"
          "\"hc_mix_fast\":{\"gemv_nr24_encoded\":%llu,\"rmsnorm_single_read_encoded\":%llu,"
          "\"expand4_vec_encoded\":%llu},"
+         "\"prefill_attn_q16\":{\"mode\":%d,\"q16_encoded\":%llu,\"q32_encoded\":%llu,"
+         "\"q_rope_f16_encoded\":%llu},"
          "\"prefix_cache_len\":%u},",
          (unsigned)idx_mode, idx_fmt, (unsigned)idx_row_bytes,
          (unsigned long long)ro.requests, (unsigned long long)ro.encoded,
@@ -365,6 +371,10 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          (unsigned long long)hcm.gemv_nr24_encoded,
          (unsigned long long)hcm.rmsnorm_single_read_encoded,
          (unsigned long long)hcm.expand4_vec_encoded,
+         paq_mode,
+         (unsigned long long)paq.q16_encoded,
+         (unsigned long long)paq.q32_encoded,
+         (unsigned long long)paq.q_rope_f16_encoded,
          ctx ? myds_context_get_pcache_len(ctx) : 0u);
 
     const myds_steer_t *st = ctx ? myds_context_get_steer(ctx) : NULL;

@@ -2209,6 +2209,7 @@ int myds_metal_init(const char *shader_dir) {
                         @"kernel_dsv41_engram_add",
                         @"kernel_dsv41_rope",
                         @"kernel_dsv41_rope_round",
+                        @"kernel_dsv41_rope_round_f16",
                         @"kernel_compute_copy_u8",
                         @"kernel_compute_copy_u32",
                         @"kernel_compute_copy_u32x4",
