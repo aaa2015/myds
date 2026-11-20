@@ -3484,7 +3484,9 @@ static inline void myds_attention_decode_mma_rope_fuse_impl(
 
         // Step 1: Q[8, 512] * K[64, 512]^T -> ss[8, 64]
         // Contiguous 16-row K pairs per SG (sgitg*16, sgitg*16+8) share sq loads
-        // across both 8-key blocks with zero compiler-blocking simdgroup_barriers.
+        // across both 8-key blocks. Keep unroll bounded to 2 with mem_none fences
+        // so Apple8 (M2 Ultra, static VGPR file, no Dynamic Caching) never hoists
+        // loads across 16 iterations and spills to DRAM (~56-68 VGPRs, 0 B spill).
         const short k0_off = (short)(sgitg * 16);
         const short k1_off = k0_off + 8;
         device const half * pk0 = (device const half *)(k + (uint64_t)(ic + k0_off) * args.nb11);
@@ -3493,8 +3495,9 @@ static inline void myds_attention_decode_mma_rope_fuse_impl(
         simdgroup_float8x8 mqk0 = make_filled_simdgroup_matrix<float, 8>(0.0f);
         simdgroup_float8x8 mqk1 = make_filled_simdgroup_matrix<float, 8>(0.0f);
 
-        #pragma unroll 16
+        #pragma unroll 2
         for (short i = 0; i < DK8 / 2; ++i) {
+            simdgroup_barrier(mem_flags::mem_none);
             simdgroup_half8x8 mq0, mq1, mka0, mka1, mkb0, mkb1;
             simdgroup_load(mq0,  sq  + 16 * i + 0, DK);
             simdgroup_load(mq1,  sq  + 16 * i + 8, DK);
@@ -3502,6 +3505,7 @@ static inline void myds_attention_decode_mma_rope_fuse_impl(
             simdgroup_load(mkb0, pk1 + 16 * i + 0, DK, 0, true);
             simdgroup_load(mka1, pk0 + 16 * i + 8, DK, 0, true);
             simdgroup_load(mkb1, pk1 + 16 * i + 8, DK, 0, true);
+            simdgroup_barrier(mem_flags::mem_none);
             simdgroup_multiply_accumulate(mqk0, mq0, mka0, mqk0);
             simdgroup_multiply_accumulate(mqk1, mq0, mkb0, mqk1);
             simdgroup_multiply_accumulate(mqk0, mq1, mka1, mqk0);
@@ -3562,7 +3566,8 @@ static inline void myds_attention_decode_mma_rope_fuse_impl(
             (device const half *)(v + (uint64_t)ic * args.nb21) + dv_base + 8 * sgitg;
 
         constexpr short NC_PV = (C / 8) / 2;
-        FOR_UNROLL (short cc = 0; cc < NC_PV; ++cc) {
+        #pragma clang loop unroll(disable)
+        for (short cc = 0; cc < NC_PV; ++cc) {
             if (FP16_P) {
                 simdgroup_half8x8 vp0, vp1;
                 simdgroup_load(vp0, sp + 16 * cc + 0, SP_STRIDE, 0, false);
@@ -3614,18 +3619,22 @@ static inline void myds_attention_decode_mma_rope_fuse_impl(
         if (simd_max(max(m0, m1)) > -MAXHALF) {
             // Interleaved 8-row MMA blocks keep all 4 SGs busy for rem >= 32.
             const short tail_start = rem & ~7;
+            #pragma clang loop unroll(disable)
             for (short cc = 0; cc < 2; ++cc) {
                 const short k_off = cc * 32 + sgitg * 8;
                 if (k_off + 8 <= rem) {
                     device const half * pk =
                         (device const half *)(k + (uint64_t)(ic + k_off) * args.nb11);
                     simdgroup_float8x8 mqk = make_filled_simdgroup_matrix<float, 8>(0.0f);
+                    #pragma clang loop unroll(disable)
                     for (short i = 0; i < DK8 / 2; ++i) {
+                        simdgroup_barrier(mem_flags::mem_none);
                         simdgroup_half8x8 mk0, mk1, mq0, mq1;
                         simdgroup_load(mk0, pk + 16 * i + 0, DK, 0, true);
                         simdgroup_load(mk1, pk + 16 * i + 8, DK, 0, true);
                         simdgroup_load(mq0, sq + 16 * i + 0, DK);
                         simdgroup_load(mq1, sq + 16 * i + 8, DK);
+                        simdgroup_barrier(mem_flags::mem_none);
                         simdgroup_multiply_accumulate(mqk, mq0, mk0, mqk);
                         simdgroup_multiply_accumulate(mqk, mq1, mk1, mqk);
                     }
@@ -3703,6 +3712,7 @@ static inline void myds_attention_decode_mma_rope_fuse_impl(
             device const half * pv =
                 (device const half *)(v + (uint64_t)ic * args.nb21) + dv_base + 8 * sgitg;
             const short full8 = rem >> 3;
+            #pragma clang loop unroll(disable)
             for (short c8 = 0; c8 < full8; ++c8) {
                 if (FP16_P) {
                     simdgroup_half8x8 vp;
@@ -3765,6 +3775,7 @@ static inline void myds_attention_decode_mma_rope_fuse_impl(
         const float scale = s_ms[lo_row];
         device float2 * dst2 =
             (device float2 *)((device float *)dst + (uint64_t)head * (uint64_t)DV);
+        const bool is_rope_slice = (tgpig.y == (uint)(D_SPLIT - 1));
         FOR_UNROLL (short ii = 0; ii < NO_COL; ++ii) {
             const short col = dv_base + 8 * sgitg + ii * 8 * NSG + lo_col;
             const short c2 = col >> 1;
@@ -3773,7 +3784,7 @@ static inline void myds_attention_decode_mma_rope_fuse_impl(
             if (FUSE_ROPE) {
                 re = myds_attention_rope_bf16(re);
                 im = myds_attention_rope_bf16(im);
-                if (c2 >= 224) {
+                if (is_rope_slice && c2 >= 224) {
                     const uint pair = (uint)(c2 - 224);
                     const float theta = float(fused.pos) * fused.frequencies[pair];
                     const float c = precise::cos(theta);
