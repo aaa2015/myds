@@ -225,6 +225,13 @@ typedef struct { uint64_t requests, encoded, failures; } myds_metal_lm_head_q8_c
 int myds_metal_lm_head_q8_nr0(void);
 void myds_metal_lm_head_q8_counters(myds_metal_lm_head_q8_counters_t *out, bool reset);
 
+/* [P-NEW-1] MYDS_MOE_PREFILL_WIDE runtime dispatch counters (host-encoded). */
+typedef struct {
+    uint64_t wide_encoded, narrow_encoded;
+} myds_metal_moe_prefill_wide_counters_t;
+void myds_metal_moe_prefill_wide_counters(
+    myds_metal_moe_prefill_wide_counters_t *out, bool reset);
+
 /* Buffer allocation and memory mapping */
 myds_metal_buffer_t *myds_metal_buffer_alloc(size_t bytes);
 myds_metal_buffer_t *myds_metal_buffer_from_ptr(const void *ptr, size_t bytes);

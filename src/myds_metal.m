@@ -127,6 +127,8 @@ static id<MTLComputePipelineState> g_pso_moe_mm_q2_k_f16_tail_cull = nil;
 static id<MTLComputePipelineState> g_pso_moe_mm_q2_k_f16_wide = nil;
 static id<MTLComputePipelineState> g_pso_moe_mm_q2_k_f32 = nil;
 static bool                        g_moe_prefill_wide = false;
+static _Atomic uint64_t            g_moe_prefill_wide_encoded = 0;
+static _Atomic uint64_t            g_moe_prefill_narrow_encoded = 0;
 static id<MTLBuffer>               g_moe_id_map_buffer = nil;
 static NSUInteger                  g_moe_id_map_bytes = 0;
 static int                         g_moe_nsg = 2;
@@ -750,6 +752,22 @@ void myds_metal_lm_head_q8_counters(myds_metal_lm_head_q8_counters_t *out, bool 
         .requests = LM_COUNT(requests), .encoded = LM_COUNT(encoded), .failures = LM_COUNT(failures)};
     if (out) *out = value;
 #undef LM_COUNT
+}
+
+void myds_metal_moe_prefill_wide_counters(
+    myds_metal_moe_prefill_wide_counters_t *out, bool reset) {
+    const uint64_t wide = reset
+        ? atomic_exchange_explicit(&g_moe_prefill_wide_encoded, 0u, memory_order_relaxed)
+        : atomic_load_explicit(&g_moe_prefill_wide_encoded, memory_order_relaxed);
+    const uint64_t narrow = reset
+        ? atomic_exchange_explicit(&g_moe_prefill_narrow_encoded, 0u, memory_order_relaxed)
+        : atomic_load_explicit(&g_moe_prefill_narrow_encoded, memory_order_relaxed);
+    if (out) {
+        *out = (myds_metal_moe_prefill_wide_counters_t){
+            .wide_encoded = wide,
+            .narrow_encoded = narrow
+        };
+    }
 }
 
 static id<MTLComputePipelineState> lm_head_q8_nr4_pipeline(void) {
@@ -7050,6 +7068,12 @@ static int routed_moe_batch_impl(
             }
             /* 求和之后的 kernel（HC expand 等）仍归原来的 MoE 阶段。 */
             if (g_moe_tag_split) moe_tag_point(&cb, &enc, moe_prev_tag);
+
+            if (use_wide_mm) {
+                atomic_fetch_add_explicit(&g_moe_prefill_wide_encoded, 1u, memory_order_relaxed);
+            } else {
+                atomic_fetch_add_explicit(&g_moe_prefill_narrow_encoded, 1u, memory_order_relaxed);
+            }
 
             if (g_batch_cb) {
                 if (g_auto_barrier) {

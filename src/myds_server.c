@@ -537,7 +537,7 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             close(client_fd);
             return;
         }
-        char state[2048];
+        char state[4096];
         g_debug_state_provider(state, sizeof(state), ctx);
         MYDS_LOG_I("[%s:%d] GET /debug/state -> 200 OK", client_ip, client_port);
         send_response(client_fd, 200, "OK", "application/json", state);

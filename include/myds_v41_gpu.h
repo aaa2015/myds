@@ -52,6 +52,19 @@ static inline uint32_t myds_v41_indexer_cache_mode_row_bytes(uint32_t cache_mode
 }
 int myds_v41_gpu_indexer_key_fp4_enabled(void);
 int myds_v41_gpu_indexer_decode_mma_enabled(void);
+/* [D-I1] MYDS_INDEXER_DECODE_MMA runtime dispatch counters (host-encoded). */
+typedef struct {
+    uint64_t score_one_encoded, score_compact_encoded;
+} myds_v41_gpu_indexer_decode_mma_counters_t;
+void myds_v41_gpu_indexer_decode_mma_counters(
+    myds_v41_gpu_indexer_decode_mma_counters_t *out, bool reset);
+/* [P-NEW-3] MYDS_PREFILL_ATTN_FAST runtime dispatch counters (host-encoded). */
+typedef struct {
+    uint64_t fast_matrix_encoded, gather_comp_512_encoded;
+    uint64_t gather_comp_hits, gather_comp_misses;
+} myds_v41_gpu_prefill_attn_fast_counters_t;
+void myds_v41_gpu_prefill_attn_fast_counters(
+    myds_v41_gpu_prefill_attn_fast_counters_t *out, bool reset);
 uint32_t myds_v41_gpu_indexer_key_cache_mode(void);
 uint32_t myds_v41_gpu_indexer_key_row_bytes(void);
 int myds_v41_gpu_pack_indexer_fp4(myds_metal_buffer_t *dst, size_t dst_row,

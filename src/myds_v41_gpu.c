@@ -131,6 +131,39 @@ void myds_v41_gpu_attention_counters(myds_v41_gpu_attention_counters_t *out, boo
         .original_vec_encoded = v[AC_ORIGINAL], .matrix_encoded = v[AC_MATRIX],
         .matrix_fallbacks = v[AC_MATRIX_FALLBACKS]};
 }
+/* [P-NEW-3] Prefill attention fast path counters (host-encoded, relaxed). */
+enum {
+    PAF_FAST_MATRIX_ENC, PAF_GATHER_COMP_512_ENC,
+    PAF_GATHER_COMP_HITS, PAF_GATHER_COMP_MISSES, PAF_COUNT
+};
+static _Atomic uint64_t prefill_attn_fast_cnt[PAF_COUNT];
+void myds_v41_gpu_prefill_attn_fast_counters(
+    myds_v41_gpu_prefill_attn_fast_counters_t *out, bool reset) {
+    uint64_t v[PAF_COUNT];
+    for (unsigned k = 0; k < PAF_COUNT; ++k)
+        v[k] = reset ? atomic_exchange_explicit(&prefill_attn_fast_cnt[k], 0u, memory_order_relaxed)
+                     : atomic_load_explicit(&prefill_attn_fast_cnt[k], memory_order_relaxed);
+    if (!out) return;
+    *out = (myds_v41_gpu_prefill_attn_fast_counters_t){
+        .fast_matrix_encoded = v[PAF_FAST_MATRIX_ENC],
+        .gather_comp_512_encoded = v[PAF_GATHER_COMP_512_ENC],
+        .gather_comp_hits = v[PAF_GATHER_COMP_HITS],
+        .gather_comp_misses = v[PAF_GATHER_COMP_MISSES]};
+}
+/* [D-I1] Decode Indexer MMA scorer counters (host-encoded, relaxed). */
+enum { IDM_SCORE_ONE_ENC, IDM_SCORE_COMPACT_ENC, IDM_COUNT };
+static _Atomic uint64_t indexer_decode_mma_cnt[IDM_COUNT];
+void myds_v41_gpu_indexer_decode_mma_counters(
+    myds_v41_gpu_indexer_decode_mma_counters_t *out, bool reset) {
+    uint64_t v[IDM_COUNT];
+    for (unsigned k = 0; k < IDM_COUNT; ++k)
+        v[k] = reset ? atomic_exchange_explicit(&indexer_decode_mma_cnt[k], 0u, memory_order_relaxed)
+                     : atomic_load_explicit(&indexer_decode_mma_cnt[k], memory_order_relaxed);
+    if (!out) return;
+    *out = (myds_v41_gpu_indexer_decode_mma_counters_t){
+        .score_one_encoded = v[IDM_SCORE_ONE_ENC],
+        .score_compact_encoded = v[IDM_SCORE_COMPACT_ENC]};
+}
 /* Register-only prefill scorer: policy is immutable after the first
  * getter, which must run after config load. No PSO is touched by this getter. */
 enum { IRO_REQUESTS,IRO_ENCODED,IRO_FALLBACKS,IRO_FAILURES,IRO_F32,IRO_BF16,IRO_COUNT };
@@ -779,6 +812,9 @@ int myds_v41_gpu_indexscores_head_slots_mode(myds_metal_buffer_t *scores,
     if(encoded) {
         atomic_fetch_add_explicit(&indexer_head_slots_encoded,1u,memory_order_relaxed);
         const bool rows4 = v41_gpu_indexer_score_rows4_enabled(n_comp);
+        if (rows4 && myds_v41_gpu_indexer_decode_mma_enabled() == 1) {
+            atomic_fetch_add_explicit(&indexer_decode_mma_cnt[IDM_SCORE_ONE_ENC],1u,memory_order_relaxed);
+        }
         v41_gpu_log_indexer_which(1, "head_slots",
             rows4 ? "kernel_glm_indexer_score_one_rows4" : "kernel_myds_indexer_score_one_head_slots",
             rows4, mask != NULL, cache_mode != 0u, first_row, n_comp, 0u);
@@ -816,6 +852,9 @@ static int indexscores_mode(myds_metal_buffer_t *scores,const myds_metal_buffer_
                 ? dispatch("kernel_glm_indexer_score_one_rows4",&a,sizeof(a),b,5,(n_comp+15u)/16u,1,1,32,4,1,0)
                 : dispatch("kernel_glm_indexer_score_one_direct",&a,sizeof(a),b,5,n_comp,1,1,32,4,1,132u*4));
         if (ok) {
+            if (use_mma) {
+                atomic_fetch_add_explicit(&indexer_decode_mma_cnt[IDM_SCORE_ONE_ENC],1u,memory_order_relaxed);
+            }
             v41_gpu_log_indexer_which(0, "direct",
                 use_mma ? "kernel_myds_indexer_score_one_mma"
                         : (rows4 ? "kernel_glm_indexer_score_one_rows4" : "kernel_glm_indexer_score_one_direct"),
@@ -1058,6 +1097,9 @@ int myds_v41_gpu_indexscores_compact_decode_mode(myds_v41_gpu_scratch_t *s,
         return 0;
     }
     atomic_fetch_add_explicit(&indexer_decode_compact_cnt[IDC_SCORE_ENC], 1u, memory_order_relaxed);
+    if (use_mma) {
+        atomic_fetch_add_explicit(&indexer_decode_mma_cnt[IDM_SCORE_COMPACT_ENC], 1u, memory_order_relaxed);
+    }
     v41_gpu_log_indexer_which(3, "compact_decode", ckernel,
                               true, mask != NULL, true, first_row, n_comp, 2048u);
     return 1;
@@ -3316,6 +3358,8 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
                 if(!dispatch(comp_bf16?"kernel_myds_attn_gather_comp_512_bf16":
                              "kernel_myds_attn_gather_comp_512",&ga,sizeof(ga),g2,4,
                              512u,c_len,1,128,1,1,0))return 0;
+                atomic_fetch_add_explicit(&prefill_attn_fast_cnt[PAF_GATHER_COMP_512_ENC], 1u, memory_order_relaxed);
+                atomic_fetch_add_explicit(&prefill_attn_fast_cnt[PAF_GATHER_COMP_MISSES], 1u, memory_order_relaxed);
                 s->gathered_cache_valid = true;
                 s->gathered_cache_comp_bf16 = comp_bf16;
                 s->gathered_cache_compact512 = true;
@@ -3331,6 +3375,8 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
                 s->gathered_cache_ratio = ratio;
                 s->gathered_cache_mask_stride = 0u;
                 s->gathered_cache_comp_gen = comp_gen;
+            } else {
+                atomic_fetch_add_explicit(&prefill_attn_fast_cnt[PAF_GATHER_COMP_HITS], 1u, memory_order_relaxed);
             }
         } else {
             /* Both gather kernels overwrite the shared mask, even when their chunk
@@ -3345,6 +3391,7 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
                              "kernel_myds_attn_gather_comp",&ga,sizeof(ga),g2,4,
                              512u,c_len,1,128,1,1,0))return 0;
                 if (fast_enabled) {
+                    atomic_fetch_add_explicit(&prefill_attn_fast_cnt[PAF_GATHER_COMP_MISSES], 1u, memory_order_relaxed);
                     s->gathered_cache_valid = true;
                     s->gathered_cache_comp_bf16 = comp_bf16;
                     s->gathered_cache_compact512 = false;
@@ -3363,6 +3410,8 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
                 } else {
                     gathered_cache_invalidate(s);
                 }
+            } else {
+                atomic_fetch_add_explicit(&prefill_attn_fast_cnt[PAF_GATHER_COMP_HITS], 1u, memory_order_relaxed);
             }
         }
     }
@@ -3426,6 +3475,7 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
                 matrix_kernel_used=kernel;
                 matrix_smem_used=smem;
                 attn_count(AC_MATRIX);
+                atomic_fetch_add_explicit(&prefill_attn_fast_cnt[PAF_FAST_MATRIX_ENC], 1u, memory_order_relaxed);
             } else {
                 /* Populate standard 640-stride gathered + mask before falling back to vec. */
                 gathered_cache_invalidate(s);

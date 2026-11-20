@@ -131,6 +131,8 @@ BENCH_KPROF = $(BIN_DIR)/bench_kprof
 # decode 的 engram 行读取：串行 vs 线程池。不加载模型，只按真实偏移读行。
 BENCH_ENGRAM_ROWS = $(BIN_DIR)/bench_engram_rows
 BENCH_ENGRAM_IO = $(BIN_DIR)/bench_engram_io
+BENCH_APPLE8_MMA_RATES = $(BIN_DIR)/bench_apple8_mma_rates
+BENCH_HC_MIX_STEP16 = $(BIN_DIR)/bench_hc_mix_step16
 DUMP_TENSORS = $(BIN_DIR)/dump_tensors
 EVO_PSO_PROBE = $(BIN_DIR)/evo_pso_probe
 METALLIB = $(BIN_DIR)/myds.metallib
@@ -585,6 +587,18 @@ $(SCORE): $(OBJS_C) $(OBJS_M) $(BUILD_DIR)/score.o $(METALLIB) | $(BIN_DIR)
 $(BENCH_ENGRAM_ROWS): tools/bench_engram_rows.c $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o | $(BIN_DIR)
 	$(CC) $(CFLAGS) $< $(BUILD_DIR)/myds_engram.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o \
 		$(LDFLAGS) -o $@
+
+.PHONY: bench_engram_rows bench_apple8_mma_rates bench_hc_mix_step16
+bench_engram_rows: $(BENCH_ENGRAM_ROWS)
+
+# Standalone M4 / M2 Ultra hardware-gate microbench probes (build-only; never in ALL_TESTS).
+$(BENCH_APPLE8_MMA_RATES): tests/bench_apple8_mma_rates.m | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) $< $(LDFLAGS) -o $@
+bench_apple8_mma_rates: $(BENCH_APPLE8_MMA_RATES)
+
+$(BENCH_HC_MIX_STEP16): tests/bench_hc_mix_step16.m $(METALLIB) | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) $< $(LDFLAGS) -o $@
+bench_hc_mix_step16: $(BENCH_HC_MIX_STEP16)
 
 # Opt-in per-kernel GPU timing harness (serialized encoders; see tools/kprof_report.py).
 $(BENCH_KPROF): $(OBJS_C) $(OBJS_M) $(BUILD_DIR)/bench_kprof.o $(METALLIB) | $(BIN_DIR)

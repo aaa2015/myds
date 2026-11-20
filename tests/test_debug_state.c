@@ -39,7 +39,7 @@ int main(int argc, char **argv) {
 
     /* Shape with every source available. */
     ;
-    char state[2048];
+    char state[4096];
     myds_debug_state_json(state, sizeof(state), NULL);
     printf("{\"kind\":\"state\",\"payload\":%s}\n", state);
 
@@ -102,9 +102,13 @@ int main(int argc, char **argv) {
     printf("{\"kind\":\"truncation\",\"reports_instead_of_cutting\":%s,\"body\":\"%s\"}\n",
            trunc_ok ? "true" : "false", tiny);
     if (!trunc_ok) ++failures;
-    /* The payload must be non-empty and carry every top-level section. */
+    /* The payload must be non-empty and carry every top-level section and §178 counters. */
     const int shape_ok = state[0] == '{' && strstr(state, "\"build\"") &&
-                         strstr(state, "\"knobs\"") && strstr(state, "\"counters\"");
+                         strstr(state, "\"knobs\"") && strstr(state, "\"counters\"") &&
+                         strstr(state, "\"moe_prefill_wide\"") &&
+                         strstr(state, "\"prefill_attn_fast\"") &&
+                         strstr(state, "\"indexer_decode_mma\"") &&
+                         strstr(state, "truncated") == NULL;
     if (!shape_ok) ++failures;
     printf("{\"kind\":\"summary\",\"failures\":%d,\"pass\":%s}\n",
            failures, failures == 0 ? "true" : "false");
