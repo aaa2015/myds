@@ -963,6 +963,18 @@ int myds_metal_steer_vec(myds_metal_buffer_t *h,
 int myds_metal_steer_hc_residual(myds_metal_buffer_t *residual,
     const myds_metal_buffer_t *dir, float alpha, uint32_t dim, uint32_t n_tokens);
 
+/* [P-M1] MYDS_MOE_PREFILL_M1 (default 0, active when MYDS_MOE_PREFILL_WIDE=1 && MYDS_MOE_PREFILL_M1=1). */
+#define MYDS_METAL_HAS_MOE_PREFILL_M1 1
+typedef struct {
+    uint64_t calls;
+    uint64_t map0_m1_encoded;
+    uint64_t narrow_compact_encoded;
+    uint64_t down_wide_m1_encoded;
+    uint64_t down_narrow_m1_encoded;
+} myds_metal_moe_prefill_m1_counters_t;
+int myds_metal_moe_prefill_m1_enabled(void);
+void myds_metal_moe_prefill_m1_counters(myds_metal_moe_prefill_m1_counters_t *out, bool reset);
+
 #ifdef __cplusplus
 }
 #endif

@@ -65,6 +65,7 @@ TEST_PREFILL_SHORT_SNAPSHOT = $(BIN_DIR)/test_prefill_short_snapshot
 TEST_PREFILL_SHRINK_GRID = $(BIN_DIR)/test_prefill_shrink_grid
 TEST_PREFILL_SHRINK_GRID_GUARDED = $(BIN_DIR)/test_prefill_shrink_grid_guarded
 TEST_SUFFIX_SHRINK_FINAL_MB = $(BIN_DIR)/test_suffix_shrink_final_mb
+TEST_MOE_PREFILL_M1 = $(BIN_DIR)/test_moe_prefill_m1
 TEST_YOCO_COMPACT = $(BIN_DIR)/test_yoco_compact
 TEST_INDEXER_WINDOW = $(BIN_DIR)/test_indexer_window
 TEST_TOPK_THRESHOLD = $(BIN_DIR)/test_topk_threshold
@@ -180,6 +181,7 @@ ALL_TESTS += $(TEST_INDEXER_KEY_FP4)
 ALL_TESTS += $(TEST_INDEXER_DECODE_MMA)
 ALL_TESTS += $(TEST_ATTN_DECODE_MMA)
 ALL_TESTS += $(TEST_SUFFIX_SHRINK_FINAL_MB)
+ALL_TESTS += $(TEST_MOE_PREFILL_M1)
 
 $(TEST_STEER): tests/test_steer.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -Iinclude -o $@ tests/test_steer.c $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS)
@@ -724,6 +726,9 @@ $(TEST_PREFILL_SHRINK_GRID_GUARDED): tests/test_prefill_shrink_grid_guarded.c sr
 $(TEST_SUFFIX_SHRINK_FINAL_MB): tests/test_suffix_shrink_final_mb.c src/myds_v41.c $(wildcard include/*.h) $(filter-out $(BUILD_DIR)/myds_v41.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(filter %.o,$^) $(LDFLAGS) -Wl,-dead_strip
 
+$(TEST_MOE_PREFILL_M1): tests/test_moe_prefill_m1.m $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) -Iinclude -o $@ $< $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS)
+
 $(TEST_YOCO_COMPACT): tests/test_yoco_compact.c | $(BIN_DIR)
 	$(CC) $(CFLAGS) -Iinclude -o $@ $<
 
@@ -1076,6 +1081,7 @@ test: check-knobs $(ALL_TESTS) $(METALLIB)
 	@./$(TEST_ANCHOR_SLOTS)
 	@./$(TEST_VISPRE)
 	@./$(TEST_SUFFIX_SHRINK_FINAL_MB)
+	@./$(TEST_MOE_PREFILL_M1)
 	@echo "\n========================================================"
 	@echo "      ALL TEST SUITES PASSED CLEANLY & SUCCESSFULLY!    "
 	@echo "========================================================"

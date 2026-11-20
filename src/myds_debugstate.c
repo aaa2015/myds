@@ -210,6 +210,9 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
     myds_v41_gpu_suffix_shrink_final_mb_counters_t ssfm;
     memset(&ssfm, 0, sizeof(ssfm));
     myds_v41_gpu_suffix_shrink_final_mb_counters(&ssfm, false);
+    myds_metal_moe_prefill_m1_counters_t m1c;
+    memset(&m1c, 0, sizeof(m1c));
+    myds_metal_moe_prefill_m1_counters(&m1c, false);
 
     /* Knob accounting, reusing the same inventory --print-config reports. */
     static myds_knob_seen_t seen[1024];
@@ -262,7 +265,9 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          "\"attn_decode_mma\":{\"requests\":%llu,\"encoded\":%llu,"
          "\"fallbacks\":%llu,\"d_split\":%u},"
          "\"suffix_shrink_final_mb\":{\"requests\":%llu,\"deferred_mbs\":%llu,"
-         "\"final_mbs\":%llu,\"anchor_mbs\":%llu},\"prefix_cache_len\":%u},",
+         "\"final_mbs\":%llu,\"anchor_mbs\":%llu},"
+         "\"moe_prefill_m1\":{\"calls\":%llu,\"map0\":%llu,\"narrow_compact\":%llu,"
+         "\"down_wide\":%llu,\"down_narrow\":%llu},\"prefix_cache_len\":%u},",
          (unsigned)idx_mode, idx_fmt, (unsigned)idx_row_bytes,
          (unsigned long long)ro.requests, (unsigned long long)ro.encoded,
          (unsigned long long)ro.fallbacks, (unsigned long long)ro.failures,
@@ -285,6 +290,10 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          (unsigned long long)adm.fallbacks, (unsigned)adm.d_split,
          (unsigned long long)ssfm.requests, (unsigned long long)ssfm.deferred_mbs,
          (unsigned long long)ssfm.final_mbs, (unsigned long long)ssfm.anchor_mbs,
+         (unsigned long long)m1c.calls, (unsigned long long)m1c.map0_m1_encoded,
+         (unsigned long long)m1c.narrow_compact_encoded,
+         (unsigned long long)m1c.down_wide_m1_encoded,
+         (unsigned long long)m1c.down_narrow_m1_encoded,
          ctx ? myds_context_get_pcache_len(ctx) : 0u);
 
     const myds_steer_t *st = ctx ? myds_context_get_steer(ctx) : NULL;
