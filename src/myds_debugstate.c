@@ -242,6 +242,9 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
     myds_v41_gpu_prefill_attn_direct_comp_counters_t padc;
     memset(&padc, 0, sizeof(padc));
     myds_v41_gpu_prefill_attn_direct_comp_counters(&padc, false);
+    myds_v41_gpu_moe_prefill_topk_schedule_counters_t mpts;
+    memset(&mpts, 0, sizeof(mpts));
+    myds_v41_gpu_moe_prefill_topk_schedule_counters(&mpts, false);
 
     /* Knob accounting, reusing the same inventory --print-config reports. */
     static myds_knob_seen_t seen[1024];
@@ -321,7 +324,11 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          "\"expand4_vec_encoded\":%llu},"
          "\"prefill_attn_l01_mma\":{\"enabled\":%d,\"encoded\":%llu},"
          "\"prefill_attn_direct_comp\":{\"requests\":%llu,\"bf16_encoded\":%llu,"
-         "\"nvfp4_encoded\":%llu,\"fallbacks\":%llu},\"prefix_cache_len\":%u},",
+         "\"nvfp4_encoded\":%llu,\"fallbacks\":%llu},"
+         "\"moe_prefill_topk_schedule\":{\"enabled\":%d,\"preset\":%d,"
+         "\"k4_dispatches\":%llu,\"k6_protected_short\":%llu,"
+         "\"k6_protected_layer\":%llu,\"k6_protected_tail\":%llu},"
+         "\"prefix_cache_len\":%u},",
          (unsigned)idx_mode, idx_fmt, (unsigned)idx_row_bytes,
          (unsigned)kv_mode, kv_fmt, (unsigned)kv_row_bytes,
          (unsigned long long)ro.requests, (unsigned long long)ro.encoded,
@@ -389,6 +396,12 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          (unsigned long long)padc.bf16_encoded,
          (unsigned long long)padc.nvfp4_encoded,
          (unsigned long long)padc.fallbacks,
+         mpts.enabled,
+         mpts.preset,
+         (unsigned long long)mpts.k4_dispatches,
+         (unsigned long long)mpts.k6_protected_short,
+         (unsigned long long)mpts.k6_protected_layer,
+         (unsigned long long)mpts.k6_protected_tail,
          ctx ? myds_context_get_pcache_len(ctx) : 0u);
 
     const myds_steer_t *st = ctx ? myds_context_get_steer(ctx) : NULL;

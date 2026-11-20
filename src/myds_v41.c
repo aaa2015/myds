@@ -1417,16 +1417,9 @@ static bool lowkv_read_companion_digest(const char *model_path, char *buf, size_
     return found;
 }
 
-/* [P-NEW-4] MYDS_MOE_PREFILL_TOPK: default 0 (keep model default 6).
- * Accepts "0", "3", "4", "6"; any other value fails closed (-1). */
+/* [P-NEW-4] MYDS_MOE_PREFILL_TOPK: single-sourced in myds_v41_gpu.c. */
 static int v41_prefill_moe_topk_parse(void) {
-    const char *e = getenv("MYDS_MOE_PREFILL_TOPK");
-    if (!e || !*e || strcmp(e, "0") == 0) return 0;
-    if (strcmp(e, "3") == 0) return 3;
-    if (strcmp(e, "4") == 0) return 4;
-    if (strcmp(e, "6") == 0) return 6;
-    MYDS_LOG_E("MYDS_MOE_PREFILL_TOPK must be 0, 3, 4, or 6 (got '%s')", e);
-    return -1;
+    return myds_v41_gpu_moe_prefill_topk_parse();
 }
 
 static uint32_t v41_prefill_moe_topk_effective(uint32_t model_k) {
@@ -1454,6 +1447,13 @@ static uint64_t lowkv_mix_kv_comp_row_bytes(uint64_t id, uint32_t kv_row_bytes) 
 static uint64_t lowkv_mix_prefill_moe_topk(uint64_t id, uint32_t model_k) {
     if (!id) return 0;
     const int ptopk = v41_prefill_moe_topk_parse();
+    const int sched = myds_v41_gpu_moe_prefill_topk_schedule_mode();
+    if (ptopk < 0 || sched < 0) return 0;
+    if (sched > 0) {
+        const uint64_t v[2] = { id, (uint64_t)(uint32_t)sched };
+        const uint64_t mixed = myds_kvdsk_identity("myds_prefill_moe_topk_schedule", v, 2u);
+        return mixed ? mixed : 1ull;
+    }
     if (ptopk <= 0 || (uint32_t)ptopk == model_k) return id;
     const uint64_t v[2] = { id, (uint64_t)(uint32_t)ptopk };
     const uint64_t mixed = myds_kvdsk_identity("myds_prefill_moe_topk", v, 2u);
@@ -3205,10 +3205,13 @@ void myds_v41_engram_project_round_counters(
 
 myds_v41_context_t *myds_v41_context_create(myds_context_t *ctx) {
     const int round_skip = engram_round_parse_mode();
+    const int prefill_topk_sched = myds_v41_gpu_moe_prefill_topk_schedule_mode();
     if (round_skip < 0 || myds_v41_gpu_indexer_key_fp4_enabled() < 0 ||
         myds_v41_gpu_kv_comp_nvfp4_enabled() < 0 ||
         myds_v41_gpu_prefill_attn_direct_comp_enabled() < 0 ||
         myds_v41_gpu_attention_decode_mma_enabled() < 0 ||
+        myds_v41_gpu_moe_prefill_topk_parse() < 0 ||
+        prefill_topk_sched < 0 ||
         myds_v41_moe_hc_overlap_parse_mode()<0 ||
         myds_v41_moe_decode_topk_parse_mode()<0 ||
         myds_v41_attn_hc_overlap_parse_mode()<0 ||
@@ -3243,6 +3246,15 @@ myds_v41_context_t *myds_v41_context_create(myds_context_t *ctx) {
         myds_v41_moe_decode_topk_summary(ctx->model->n_activated_experts, topk_desc, sizeof(topk_desc));
         MYDS_LOG_I("MoE decode routed top-k: %s (prefill/model default: %u)",
                    topk_desc, ctx->model->n_activated_experts);
+    }
+    if (prefill_topk_sched > 0) {
+        myds_v41_moe_prefill_topk_schedule_cfg_t scfg;
+        if (myds_v41_gpu_moe_prefill_topk_schedule_config(prefill_topk_sched, &scfg)) {
+            MYDS_LOG_I("MoE prefill top-k schedule: preset=%u (interior k=%u, protect short<%u, layers<%u, tail=%u at k=%u)",
+                       scfg.preset, scfg.k_interior, scfg.min_prompt_tokens,
+                       scfg.protect_layers_lt, scfg.protect_tail_tokens,
+                       ctx->model->n_activated_experts);
+        }
     }
     g->model = ctx->model;
     g->capacity=ctx->cfg.max_seq_len;
@@ -3329,7 +3341,9 @@ myds_v41_context_t *myds_v41_context_create_for_model(const myds_model_t *model)
     if (!model) return NULL;
     const int round_skip = engram_round_parse_mode();
     if (round_skip < 0 || myds_v41_gpu_indexer_key_fp4_enabled() < 0 ||
-        myds_v41_gpu_kv_comp_nvfp4_enabled() < 0) return NULL;
+        myds_v41_gpu_kv_comp_nvfp4_enabled() < 0 ||
+        myds_v41_gpu_moe_prefill_topk_parse() < 0 ||
+        myds_v41_gpu_moe_prefill_topk_schedule_mode() < 0) return NULL;
     myds_v41_context_t *g = calloc(1, sizeof(*g));
     if (!g) return NULL;
     g->engram_project_round_skip = round_skip;
@@ -7733,6 +7747,55 @@ static inline bool myds_v41_should_flush_moe_batch(
     return (moe_off == moe_batch || next_rem == 0u || moe_off + next_chunk_max > moe_batch);
 }
 
+/* [P-L2] Pure chunk-length helper shared by the prefill chunk loop and the
+ * MoE top-k schedule lookahead, ensuring exact boundary parity with 512-grid
+ * alignment, guarded shrink cone splits, and kv_only/full seam splits. */
+static inline uint32_t v41_prefill_chunk_len(
+    uint32_t c_start,
+    uint32_t mb_len,
+    uint32_t chunk_size,
+    uint32_t mb_base_pos,
+    uint32_t shrink_shift,
+    bool     guarded_grid_active,
+    bool     shrink_layer,
+    uint32_t guarded_old_full_il,
+    uint32_t sh_full_rel) {
+    uint32_t c_len = mb_len - c_start;
+    if (c_len > chunk_size) c_len = chunk_size;
+    if (shrink_shift) {
+        const uint32_t abs0 = mb_base_pos + c_start;
+        const uint32_t grid = ((abs0 + c_len) / V41_SNAP_STRIDE) * V41_SNAP_STRIDE;
+        if (grid > abs0) c_len = grid - abs0;   /* 只在能缩短时对齐（不会变成 0） */
+    }
+    /* Preserve the OLD full/kv-only boundary too. Without this,
+     * a short baseline GEMV chunk could be merged into a prefix
+     * GEMM chunk, changing retained window KV before the new cone. */
+    if (guarded_grid_active && shrink_layer) {
+        const uint32_t old_rel = guarded_old_full_il - mb_base_pos;
+        if (c_start < old_rel && c_start + c_len > old_rel) c_len = old_rel - c_start;
+    }
+    /* 全量/前端的边界必须落在 chunk 边界上（一个 chunk 不能走两条路径） */
+    if (shrink_layer && c_start < sh_full_rel && c_start + c_len > sh_full_rel)
+        c_len = sh_full_rel - c_start;
+    return c_len;
+}
+
+/* [P-L2] Flush accumulated MoE batch whenever standard capacity/end rules fire
+ * OR the next chunk uses a different top-k (preventing mixed-stride packing in
+ * moe_ids_acc / moe_w_acc across the interior->tail boundary). */
+static inline bool myds_v41_should_flush_moe_batch_k(
+    uint32_t moe_off,
+    uint32_t moe_batch,
+    uint32_t c_start,
+    uint32_t c_len,
+    uint32_t mb_len,
+    uint32_t chunk_size,
+    uint32_t chunk_k,
+    uint32_t next_chunk_k) {
+    return myds_v41_should_flush_moe_batch(moe_off, moe_batch, c_start, c_len, mb_len, chunk_size) ||
+           (next_chunk_k != chunk_k);
+}
+
 
 /* ── prefill 的 engram 准备放到后台（MYDS_ENGRAM_PREFILL_ASYNC，默认开）──
  *
@@ -7817,6 +7880,8 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     myds_v41_model_t *v = m ? m->v41 : NULL;
     if (!m || !g || !v) return -1;
     if (v41_prefill_moe_topk_parse() < 0) return -1;
+    const int prefill_topk_sched_mode = myds_v41_gpu_moe_prefill_topk_schedule_mode();
+    if (prefill_topk_sched_mode < 0) return -1;
     const int shrink_final_mb_mode = myds_v41_gpu_suffix_shrink_final_mb_only_enabled();
     if (shrink_final_mb_mode < 0) return -1;
     const bool opt_shrink_final_mb_only = (shrink_final_mb_mode == 1);
@@ -7825,6 +7890,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
     if (!myds_metal_commit_batch()) return -1;
 
     uint32_t base_pos = ctx->pos;
+    const uint32_t total_prompt_len = base_pos + n_tokens;
     const bool trace_on = myds_trace_active();
     if (base_pos + n_tokens > g->capacity || base_pos + n_tokens > ctx->cfg.max_seq_len) {
         MYDS_LOG_E("V4.1 prefill prompt length exceeds context capacity (%u + %u > %u)",
@@ -8576,23 +8642,10 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     }
                 }
                 if (cancel_flag && *cancel_flag) goto cancelled;
-                uint32_t c_len = mb_len - c_start;
-                if (c_len > chunk_size) c_len = chunk_size;
-                if (shrink_shift) {
-                    const uint32_t abs0 = mb_base_pos + c_start;
-                    const uint32_t grid = ((abs0 + c_len) / V41_SNAP_STRIDE) * V41_SNAP_STRIDE;
-                    if (grid > abs0) c_len = grid - abs0;   /* 只在能缩短时对齐（不会变成 0） */
-                }
-                /* Preserve the OLD full/kv-only boundary too. Without this,
-                 * a short baseline GEMV chunk could be merged into a prefix
-                 * GEMM chunk, changing retained window KV before the new cone. */
-                if (guarded_grid_active && shrink_layer) {
-                    const uint32_t old_rel=guarded_old_full[il]-mb_base_pos;
-                    if (c_start<old_rel && c_start+c_len>old_rel) c_len=old_rel-c_start;
-                }
-                /* 全量/前端的边界必须落在 chunk 边界上（一个 chunk 不能走两条路径） */
-                if (shrink_layer && c_start < sh_full_rel && c_start + c_len > sh_full_rel)
-                    c_len = sh_full_rel - c_start;
+                uint32_t c_len = v41_prefill_chunk_len(
+                    c_start, mb_len, chunk_size, mb_base_pos, shrink_shift,
+                    guarded_grid_active, shrink_layer,
+                    guarded_grid_active ? guarded_old_full[il] : 0u, sh_full_rel);
                 /* kv_only：只做「窗口环需要的 KV 投影」（层 20 还要做压缩器），
                  * 不做 Q_A/Q_B 投影、attention / 输出 / FFN / MoE，也不累加 moe_off。
                  * 注意窗口环拷贝对两条路径都要做 —— 它正是前置段存在的目的。 */
@@ -9079,6 +9132,13 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 /* Step 6: HC FFN Input for all tokens in chunk */
                 TIME_START();
                 phase = "HC FFN input";
+                myds_v41_prefill_topk_reason_t chunk_k_reason = MYDS_PREFILL_TOPK_SCHED_DISABLED;
+                const uint32_t chunk_k = (prefill_topk_sched_mode > 0)
+                    ? myds_v41_gpu_moe_prefill_topk_schedule_select(
+                          prefill_topk_sched_mode, m->n_activated_experts, total_prompt_len,
+                          il, mb_base_pos + c_start, mb_base_pos + c_start + c_len,
+                          &chunk_k_reason)
+                    : prefill_moe_k;
                 const bool direct_moe_acc = (!trace_on && cw->moe_batch > cw->capacity);
                 if (direct_moe_acc) {
                     if (!myds_metal_buffer_update_sub_view(cw->in_after_view, cw->moe_after_acc,
@@ -9090,9 +9150,9 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                         !myds_metal_buffer_update_sub_view(cw->in_shared_view, cw->moe_shared_acc,
                             (size_t)moe_off * V41_DIM * sizeof(float), (size_t)c_len * V41_DIM * sizeof(float)) ||
                         !myds_metal_buffer_update_sub_view(cw->in_ids_view, cw->moe_ids_acc,
-                            (size_t)moe_off * prefill_moe_k * sizeof(int32_t), (size_t)c_len * prefill_moe_k * sizeof(int32_t)) ||
+                            (size_t)moe_off * chunk_k * sizeof(int32_t), (size_t)c_len * chunk_k * sizeof(int32_t)) ||
                         !myds_metal_buffer_update_sub_view(cw->in_weights_view, cw->moe_w_acc,
-                            (size_t)moe_off * prefill_moe_k * sizeof(float), (size_t)c_len * prefill_moe_k * sizeof(float))) {
+                            (size_t)moe_off * chunk_k * sizeof(float), (size_t)c_len * chunk_k * sizeof(float))) {
                         MYDS_LOG_E("V4.1 MoE acc input sub-view failed (moe_off=%u c_len=%u)", moe_off, c_len);
                         goto fail;
                     }
@@ -9195,7 +9255,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                   
                 /* Step 7b: Batched MoE routing for all tokens in chunk on GPU */
                 phase = "batched MoE routing";
-                uint32_t k = prefill_moe_k;
+                uint32_t k = chunk_k;
                 if (trace_on) {
                     for (uint32_t t = 0; t < c_len; t++) {
                         uint32_t pos = mb_base_pos + c_start + t;   /* TRACE 需要 pos */
@@ -9329,10 +9389,10 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 if (!direct_moe_acc && cw->moe_batch > cw->capacity) {
                     CHECK(myds_metal_buffer_copy(cw->moe_norm_acc, (size_t)moe_off * V41_DIM * sizeof(float),
                                                  cw->ffn_norm_buf, 0, (size_t)c_len * V41_DIM * sizeof(float)));
-                    CHECK(myds_metal_buffer_copy(cw->moe_ids_acc, (size_t)moe_off * prefill_moe_k * sizeof(int32_t),
-                                                 cw->selected_ids_buf, 0, (size_t)c_len * prefill_moe_k * sizeof(int32_t)));
-                    CHECK(myds_metal_buffer_copy(cw->moe_w_acc, (size_t)moe_off * prefill_moe_k * sizeof(float),
-                                                 cw->selected_weights_buf, 0, (size_t)c_len * prefill_moe_k * sizeof(float)));
+                    CHECK(myds_metal_buffer_copy(cw->moe_ids_acc, (size_t)moe_off * chunk_k * sizeof(int32_t),
+                                                 cw->selected_ids_buf, 0, (size_t)c_len * chunk_k * sizeof(int32_t)));
+                    CHECK(myds_metal_buffer_copy(cw->moe_w_acc, (size_t)moe_off * chunk_k * sizeof(float),
+                                                 cw->selected_weights_buf, 0, (size_t)c_len * chunk_k * sizeof(float)));
                     CHECK(myds_metal_buffer_copy(cw->moe_shared_acc, (size_t)moe_off * V41_DIM * sizeof(float),
                                                  cw->shared_out_buf, 0, (size_t)c_len * V41_DIM * sizeof(float)));
                     CHECK(myds_metal_buffer_copy(cw->moe_after_acc, (size_t)moe_off * 4 * V41_DIM * sizeof(float),
@@ -9368,7 +9428,19 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                  *   不能直接用 chunk_size 作上界，否则当 shrink_shift=512 将倒数第二个 chunk
                  *   对齐到 512 网格（例如 4993 tok 在 4096..4608 处切出 512 tok，仅剩 385 tok）时，
                  *   4608 + 2048 > 6144 会误判溢出，把单 macroblock 拆成两次全专家 MoE 调用。 */
-                if (myds_v41_should_flush_moe_batch(moe_off, cw->moe_batch, c_start, c_len, mb_len, chunk_size)) {
+                uint32_t next_chunk_k = chunk_k;
+                if (prefill_topk_sched_mode > 0 && c_start + c_len < mb_len) {
+                    const uint32_t next_c_start = c_start + c_len;
+                    const uint32_t next_c_len = v41_prefill_chunk_len(
+                        next_c_start, mb_len, chunk_size, mb_base_pos, shrink_shift,
+                        guarded_grid_active, shrink_layer,
+                        guarded_grid_active ? guarded_old_full[il] : 0u, sh_full_rel);
+                    next_chunk_k = myds_v41_gpu_moe_prefill_topk_schedule_select(
+                        prefill_topk_sched_mode, m->n_activated_experts, total_prompt_len,
+                        il, mb_base_pos + next_c_start, mb_base_pos + next_c_start + next_c_len,
+                        NULL);
+                }
+                if (myds_v41_should_flush_moe_batch_k(moe_off, cw->moe_batch, c_start, c_len, mb_len, chunk_size, chunk_k, next_chunk_k)) {
                     const uint32_t next_rem = (c_start + c_len < mb_len) ? (mb_len - (c_start + c_len)) : 0u;
                     if (next_rem > 0u) {
                         MYDS_LOG_D("prefill MoE mid-macroblock flush: il=%u moe_off=%u next_rem=%u moe_batch=%u",
@@ -9520,6 +9592,9 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                                                      sp_b, 0, (size_t)e_len * pre_tok_bytes));
                     }
                     moe_off = 0;
+                    }
+                    if (prefill_topk_sched_mode > 0) {
+                        myds_v41_gpu_moe_prefill_topk_schedule_record(chunk_k_reason);
                     }
                 }
                 }  /* !kv_only */

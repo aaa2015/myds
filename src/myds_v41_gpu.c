@@ -384,6 +384,137 @@ void myds_v41_gpu_suffix_shrink_final_mb_counters(
     }
     if (out) *out = (myds_v41_gpu_suffix_shrink_final_mb_counters_t){v[0], v[1], v[2], v[3]};
 }
+/* [P-NEW-4] MYDS_MOE_PREFILL_TOPK: default 0 (keep model default 6).
+ * Accepts absent/""/"0", "3", "4", "6"; any other value fails closed (-1). */
+int myds_v41_gpu_moe_prefill_topk_parse(void) {
+    const char *e = getenv("MYDS_MOE_PREFILL_TOPK");
+    if (!e || !*e || strcmp(e, "0") == 0) return 0;
+    if (strcmp(e, "3") == 0) return 3;
+    if (strcmp(e, "4") == 0) return 4;
+    if (strcmp(e, "6") == 0) return 6;
+    MYDS_LOG_E("MYDS_MOE_PREFILL_TOPK must be 0, 3, 4, or 6 (got '%s')", e);
+    return -1;
+}
+/* [P-L2] MYDS_MOE_PREFILL_TOPK_SCHEDULE: absent/"0" -> 0 (off), "1" -> safe preset,
+ * "2" -> suffix-shrink-tuned preset; any other value or conflict with non-zero
+ * MYDS_MOE_PREFILL_TOPK fails closed (-1). */
+static _Atomic uint64_t g_moe_prefill_topk_sched_counters[4];
+int myds_v41_gpu_moe_prefill_topk_schedule_mode(void) {
+    const char *v = getenv("MYDS_MOE_PREFILL_TOPK_SCHEDULE");
+    if (!v || strcmp(v, "0") == 0) return 0;
+    int preset = -1;
+    if (strcmp(v, "1") == 0) preset = 1;
+    else if (strcmp(v, "2") == 0) preset = 2;
+    else {
+        MYDS_LOG_E("MYDS_MOE_PREFILL_TOPK_SCHEDULE must be absent, 0, 1, or 2 (got '%s')", v);
+        return -1;
+    }
+    const int uniform_topk = myds_v41_gpu_moe_prefill_topk_parse();
+    if (uniform_topk < 0) return -1;
+    if (uniform_topk != 0) {
+        MYDS_LOG_E("MYDS_MOE_PREFILL_TOPK_SCHEDULE=%d conflicts with MYDS_MOE_PREFILL_TOPK=%d "
+                   "(unset MYDS_MOE_PREFILL_TOPK or set it to 0 when using a schedule)",
+                   preset, uniform_topk);
+        return -1;
+    }
+    return preset;
+}
+bool myds_v41_gpu_moe_prefill_topk_schedule_config(
+    int preset, myds_v41_moe_prefill_topk_schedule_cfg_t *out) {
+    myds_v41_moe_prefill_topk_schedule_cfg_t cfg;
+    if (preset == 1) {
+        cfg = (myds_v41_moe_prefill_topk_schedule_cfg_t){
+            .preset              = 1u,
+            .k_interior          = 4u,
+            .min_prompt_tokens   = 2048u,
+            .protect_layers_lt   = 4u,  /* L0..L3: first 4 MoE layers in V4.1 */
+            .protect_tail_tokens = 512u,
+        };
+    } else if (preset == 2) {
+        cfg = (myds_v41_moe_prefill_topk_schedule_cfg_t){
+            .preset              = 2u,
+            .k_interior          = 4u,
+            .min_prompt_tokens   = 2048u,
+            .protect_layers_lt   = 2u,  /* L0..L1: window-only + Engram-0 layers */
+            .protect_tail_tokens = 512u,
+        };
+    } else {
+        if (out) memset(out, 0, sizeof(*out));
+        return false;
+    }
+    if (out) *out = cfg;
+    return true;
+}
+uint32_t myds_v41_gpu_moe_prefill_topk_schedule_select(
+    int preset, uint32_t model_k, uint32_t total_prompt_len,
+    uint32_t layer, uint32_t chunk_abs_start, uint32_t chunk_abs_end,
+    myds_v41_prefill_topk_reason_t *out_reason) {
+    myds_v41_moe_prefill_topk_schedule_cfg_t cfg;
+    if (preset <= 0 || !myds_v41_gpu_moe_prefill_topk_schedule_config(preset, &cfg)) {
+        if (out_reason) *out_reason = MYDS_PREFILL_TOPK_SCHED_DISABLED;
+        return model_k;
+    }
+    if (total_prompt_len < cfg.min_prompt_tokens) {
+        if (out_reason) *out_reason = MYDS_PREFILL_TOPK_SCHED_SHORT;
+        return model_k;
+    }
+    if (layer < cfg.protect_layers_lt) {
+        if (out_reason) *out_reason = MYDS_PREFILL_TOPK_SCHED_LAYER;
+        return model_k;
+    }
+    if (cfg.protect_tail_tokens > 0u) {
+        const uint32_t tail_start = (total_prompt_len > cfg.protect_tail_tokens)
+            ? (total_prompt_len - cfg.protect_tail_tokens) : 0u;
+        if (chunk_abs_end > tail_start || chunk_abs_start >= tail_start) {
+            if (out_reason) *out_reason = MYDS_PREFILL_TOPK_SCHED_TAIL;
+            return model_k;
+        }
+    }
+    const uint32_t eff_k = (cfg.k_interior < model_k) ? cfg.k_interior : model_k;
+    if (eff_k < model_k) {
+        if (out_reason) *out_reason = MYDS_PREFILL_TOPK_SCHED_K4;
+        return eff_k;
+    }
+    if (out_reason) *out_reason = MYDS_PREFILL_TOPK_SCHED_DISABLED;
+    return model_k;
+}
+void myds_v41_gpu_moe_prefill_topk_schedule_record(
+    myds_v41_prefill_topk_reason_t reason) {
+    switch (reason) {
+        case MYDS_PREFILL_TOPK_SCHED_K4:
+            atomic_fetch_add_explicit(&g_moe_prefill_topk_sched_counters[0], 1u, memory_order_relaxed);
+            break;
+        case MYDS_PREFILL_TOPK_SCHED_SHORT:
+            atomic_fetch_add_explicit(&g_moe_prefill_topk_sched_counters[1], 1u, memory_order_relaxed);
+            break;
+        case MYDS_PREFILL_TOPK_SCHED_LAYER:
+            atomic_fetch_add_explicit(&g_moe_prefill_topk_sched_counters[2], 1u, memory_order_relaxed);
+            break;
+        case MYDS_PREFILL_TOPK_SCHED_TAIL:
+            atomic_fetch_add_explicit(&g_moe_prefill_topk_sched_counters[3], 1u, memory_order_relaxed);
+            break;
+        default:
+            break;
+    }
+}
+void myds_v41_gpu_moe_prefill_topk_schedule_counters(
+    myds_v41_gpu_moe_prefill_topk_schedule_counters_t *out, bool reset) {
+    uint64_t v[4];
+    for (unsigned i = 0; i < 4u; ++i) {
+        v[i] = reset
+            ? atomic_exchange_explicit(&g_moe_prefill_topk_sched_counters[i], 0u, memory_order_relaxed)
+            : atomic_load_explicit(&g_moe_prefill_topk_sched_counters[i], memory_order_relaxed);
+    }
+    if (out) {
+        const int mode = myds_v41_gpu_moe_prefill_topk_schedule_mode();
+        out->enabled = (mode > 0) ? 1 : 0;
+        out->preset  = (mode > 0) ? mode : 0;
+        out->k4_dispatches      = v[0];
+        out->k6_protected_short = v[1];
+        out->k6_protected_layer = v[2];
+        out->k6_protected_tail  = v[3];
+    }
+}
 enum { IPW_IRO_WIDE_ENCODED, IPW_COMPACT_WIDE_ENCODED, IPW_FALLBACKS, IPW_COUNT };
 static _Atomic uint64_t indexer_prefill_wide_cnt[IPW_COUNT];
 int myds_v41_gpu_indexer_prefill_wide_enabled(void) {
@@ -494,6 +625,8 @@ myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp) {
         myds_v41_gpu_decode_topk_fast_enabled()<0 ||
         myds_v41_gpu_decode_topk_fused_enabled()<0 ||
         myds_v41_gpu_suffix_shrink_final_mb_only_enabled()<0 ||
+        myds_v41_gpu_moe_prefill_topk_parse()<0 ||
+        myds_v41_gpu_moe_prefill_topk_schedule_mode()<0 ||
         myds_v41_gpu_indexer_decode_compact_enabled()<0 ||
         myds_v41_gpu_indexer_prefill_compact_enabled()<0 ||
         myds_v41_gpu_topk_radix_causal_enabled()<0 ||

@@ -789,4 +789,53 @@ typedef struct {
 } myds_v41_gpu_prefill_attn_direct_comp_counters_t;
 void myds_v41_gpu_prefill_attn_direct_comp_counters(
     myds_v41_gpu_prefill_attn_direct_comp_counters_t *out, bool reset);
+
+/* [P-L2] Protected-Layer / Tail-Protected Prefill MoE Top-K Schedule
+ * (MYDS_MOE_PREFILL_TOPK_SCHEDULE: absent/0=off, 1=safe preset, 2=high-coverage preset, else -1).
+ *
+ * DeepSeek-V4.1 has 40 MoE layers (L0..L39; no dense-only prefix layers):
+ *   - L0..L1: window-only attention (ratio=0) + Engram table 0 at L1
+ *   - L2..L19: ratio=2 compressed KV encoder layers (all tokens run full MoE)
+ *   - L20..L39: ratio=1 decoder layers (suffix shrink runs full MoE on causal cone)
+ *
+ * Presets (fail-closed; conflict with non-zero MYDS_MOE_PREFILL_TOPK returns -1):
+ *   preset 1 (default safe):        k=4, min_prompt=2048, protect_layers_lt=4 (L0..L3), protect_tail=512
+ *   preset 2 (suffix-shrink-tuned): k=4, min_prompt=2048, protect_layers_lt=2 (L0..L1), protect_tail=512 */
+typedef enum {
+    MYDS_PREFILL_TOPK_SCHED_DISABLED = 0,
+    MYDS_PREFILL_TOPK_SCHED_K4       = 1,
+    MYDS_PREFILL_TOPK_SCHED_SHORT    = 2,
+    MYDS_PREFILL_TOPK_SCHED_LAYER    = 3,
+    MYDS_PREFILL_TOPK_SCHED_TAIL     = 4,
+} myds_v41_prefill_topk_reason_t;
+
+typedef struct {
+    uint32_t preset;
+    uint32_t k_interior;
+    uint32_t min_prompt_tokens;
+    uint32_t protect_layers_lt;
+    uint32_t protect_tail_tokens;
+} myds_v41_moe_prefill_topk_schedule_cfg_t;
+
+typedef struct {
+    int      enabled;
+    int      preset;
+    uint64_t k4_dispatches;
+    uint64_t k6_protected_short;
+    uint64_t k6_protected_layer;
+    uint64_t k6_protected_tail;
+} myds_v41_gpu_moe_prefill_topk_schedule_counters_t;
+
+int myds_v41_gpu_moe_prefill_topk_parse(void);
+int myds_v41_gpu_moe_prefill_topk_schedule_mode(void);
+bool myds_v41_gpu_moe_prefill_topk_schedule_config(
+    int preset, myds_v41_moe_prefill_topk_schedule_cfg_t *out);
+uint32_t myds_v41_gpu_moe_prefill_topk_schedule_select(
+    int preset, uint32_t model_k, uint32_t total_prompt_len,
+    uint32_t layer, uint32_t chunk_abs_start, uint32_t chunk_abs_end,
+    myds_v41_prefill_topk_reason_t *out_reason);
+void myds_v41_gpu_moe_prefill_topk_schedule_record(
+    myds_v41_prefill_topk_reason_t reason);
+void myds_v41_gpu_moe_prefill_topk_schedule_counters(
+    myds_v41_gpu_moe_prefill_topk_schedule_counters_t *out, bool reset);
 #endif

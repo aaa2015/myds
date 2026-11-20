@@ -114,6 +114,8 @@ int main(int argc, char **argv) {
                          strstr(state, "\"hc_mix_fast\"") &&
                          strstr(state, "\"prefill_attn_direct_comp\":{\"requests\":") &&
                          strstr(state, "\"decode_topk_fused\":{\"requests\":") &&
+                         strstr(state, "\"moe_prefill_topk_schedule\":{\"enabled\":") &&
+                         strstr(state, "\"k6_protected_tail\":") &&
                          strstr(state, "truncated") == NULL;
     if (!shape_ok) ++failures;
     printf("{\"kind\":\"summary\",\"failures\":%d,\"pass\":%s}\n",

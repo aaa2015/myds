@@ -65,6 +65,7 @@ TEST_PREFILL_SHORT_SNAPSHOT = $(BIN_DIR)/test_prefill_short_snapshot
 TEST_PREFILL_SHRINK_GRID = $(BIN_DIR)/test_prefill_shrink_grid
 TEST_PREFILL_SHRINK_GRID_GUARDED = $(BIN_DIR)/test_prefill_shrink_grid_guarded
 TEST_SUFFIX_SHRINK_FINAL_MB = $(BIN_DIR)/test_suffix_shrink_final_mb
+TEST_MOE_PREFILL_TOPK_SCHEDULE = $(BIN_DIR)/test_moe_prefill_topk_schedule
 TEST_MOE_PREFILL_M1 = $(BIN_DIR)/test_moe_prefill_m1
 TEST_MOE_EPILOGUE_FUSE = $(BIN_DIR)/test_moe_epilogue_fuse
 TEST_YOCO_COMPACT = $(BIN_DIR)/test_yoco_compact
@@ -191,6 +192,7 @@ ALL_TESTS += $(TEST_KV_COMP_NVFP4)
 ALL_TESTS += $(TEST_INDEXER_DECODE_MMA)
 ALL_TESTS += $(TEST_ATTN_DECODE_MMA)
 ALL_TESTS += $(TEST_SUFFIX_SHRINK_FINAL_MB)
+ALL_TESTS += $(TEST_MOE_PREFILL_TOPK_SCHEDULE)
 ALL_TESTS += $(TEST_MOE_PREFILL_M1)
 ALL_TESTS += $(TEST_MOE_EPILOGUE_FUSE)
 ALL_TESTS += $(TEST_DECODE_TOPK_FAST)
@@ -770,6 +772,9 @@ $(TEST_PREFILL_SHRINK_GRID_GUARDED): tests/test_prefill_shrink_grid_guarded.c sr
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(filter %.o,$^) $(LDFLAGS) -Wl,-dead_strip
 
 $(TEST_SUFFIX_SHRINK_FINAL_MB): tests/test_suffix_shrink_final_mb.c src/myds_v41.c $(wildcard include/*.h) $(filter-out $(BUILD_DIR)/myds_v41.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(filter %.o,$^) $(LDFLAGS) -Wl,-dead_strip
+
+$(TEST_MOE_PREFILL_TOPK_SCHEDULE): tests/test_moe_prefill_topk_schedule.c src/myds_v41.c $(wildcard include/*.h) $(filter-out $(BUILD_DIR)/myds_v41.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(filter %.o,$^) $(LDFLAGS) -Wl,-dead_strip
 
 $(TEST_MOE_PREFILL_M1): tests/test_moe_prefill_m1.m $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
