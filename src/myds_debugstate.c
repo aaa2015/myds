@@ -219,6 +219,9 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
     myds_v41_gpu_decode_topk_fast_counters_t dtf;
     memset(&dtf, 0, sizeof(dtf));
     myds_v41_gpu_decode_topk_fast_counters(&dtf, false);
+    myds_metal_decode_iq2_fast_counters_t iq2f;
+    memset(&iq2f, 0, sizeof(iq2f));
+    myds_metal_decode_iq2_fast_counters(&iq2f, false);
 
     /* Knob accounting, reusing the same inventory --print-config reports. */
     static myds_knob_seen_t seen[1024];
@@ -279,7 +282,9 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          "\"decode_topk_fast\":{\"overlap_prefix_encoded\":%llu,"
          "\"prefix_top2048_encoded\":%llu,\"l20_self_compact_requests\":%llu,"
          "\"l20_self_compact_encoded\":%llu,\"l20_self_compact_fallbacks\":%llu,"
-         "\"l20_self_compact_failures\":%llu},\"prefix_cache_len\":%u},",
+         "\"l20_self_compact_failures\":%llu},"
+         "\"decode_iq2_fast\":{\"requests\":%llu,\"encoded\":%llu,\"failures\":%llu},"
+         "\"prefix_cache_len\":%u},",
          (unsigned)idx_mode, idx_fmt, (unsigned)idx_row_bytes,
          (unsigned long long)ro.requests, (unsigned long long)ro.encoded,
          (unsigned long long)ro.fallbacks, (unsigned long long)ro.failures,
@@ -315,6 +320,9 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          (unsigned long long)dtf.l20_self_compact_encoded,
          (unsigned long long)dtf.l20_self_compact_fallbacks,
          (unsigned long long)dtf.l20_self_compact_failures,
+         (unsigned long long)iq2f.requests,
+         (unsigned long long)iq2f.encoded,
+         (unsigned long long)iq2f.failures,
          ctx ? myds_context_get_pcache_len(ctx) : 0u);
 
     const myds_steer_t *st = ctx ? myds_context_get_steer(ctx) : NULL;

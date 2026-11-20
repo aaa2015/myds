@@ -12735,6 +12735,199 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_popcnt_f32(
         dst_gate, dst_up, dst_mid, ids, weights, shmem, tgpig, tiitg, tiisg, sgitg);
 }
 
+// ============================================================================
+// [D-M1] Strict 0-ULP Fast IQ2_XXS Decode Gate+Up+SwiGLU (MYDS_DECODE_IQ2_FAST)
+//   (a) Removes dead ssigns[128] smem table (2,176 -> 2,048 B dynamic smem);
+//   (b) Hoists 64-bit grid values svalues[aux8g[l]] / svalues[aux8u[l]] once
+//       per sub-block into uint2/uchar4 registers (replacing 16 byte smem
+//       loads and avoiding 64-bit shifts);
+//   (c) Replaces constant kmask LUT + ternary sign multiply (`* (s ? -1 : 1)`)
+//       with branchless FP-domain `select(p, -p, (sign & bit) != 0u)` under
+//       `#pragma clang fp contract(off)` (per red-team #11). Note: on Apple
+//       GPU (AGX), integer bit-XOR (`as_type<uint> ^ (bit << 31)`) forces
+//       FP<->INT domain transfers (+50% slower on M4), whereas FP-domain
+//       `select(p, -p, ...)` lowers to native `fcsel` + free `-` modifier
+//       while remaining bit-exact (`memcmp == 0`, including -0.0f/subnormals)
+//       against `kernel_mul_mv_id_iq2_xxs_pair_swiglu_popcnt_f32`.
+// ============================================================================
+static inline void ds4_iq2_pair_swiglu_popcnt_fast_impl(
+        constant ds4_metal_args_mul_mv_id & args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        device const char * ids,
+        device const char * weights,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiitg,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+    const int iid1 = tgpig.z / args.nei0;
+    const int idx  = tgpig.z % args.nei0;
+    tgpig.z = 0;
+    const int32_t i02 = ((device const int32_t *) (ids + iid1 * args.nbi1))[idx];
+    if (!ds4_tp_owns_expert(i02, args.ne02, args.tp_rank, args.tp_world)) return;
+    const int i02b = i02 - args.tp_expert_base;
+    const int64_t i11 = idx % args.ne11;
+    const int64_t i12 = iid1;
+    const int nb = args.ne00 / QK_K;
+    const int first_row = (tgpig.x * NSG + sgitg) * N_R0_IQ2_XXS;
+    const int nb32 = nb * (QK_K / 32);
+    device const block_iq2_xxs *xg =
+        (device const block_iq2_xxs *)(src0_gate + (int64_t)i02b * args.nb02 + (uint64_t)first_row * args.nb01);
+    device const block_iq2_xxs *xu =
+        (device const block_iq2_xxs *)(src0_up + (int64_t)i02b * args.nb02 + (uint64_t)first_row * args.nb01);
+    device const float *y =
+        (device const float *)(src1 + i11 * args.nb11 + i12 * args.nb12);
+    float yl[32];
+    float sumg[N_R0_IQ2_XXS] = {0.f};
+    float sumu[N_R0_IQ2_XXS] = {0.f};
+    // Only svalues[256] = 2,048 B (dead ssigns[128] removed).
+    threadgroup uint64_t *svalues = (threadgroup uint64_t *)(shmem);
+    {
+        const int linear_tid = 32 * sgitg + tiisg;
+        if (linear_tid < 64) {
+            const int pos = linear_tid * 4;
+            for (int i = 0; i < 4; ++i) svalues[pos + i] = ds4_metal_iq2xxs_grid[pos + i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const int ix = tiisg;
+    device const float *y4 = y + 32 * ix;
+    for (int ib32 = ix; ib32 < nb32; ib32 += 32) {
+        device const float4 *y4_f4 = (device const float4 *)y4;
+        thread float4 *yl_f4 = (thread float4 *)yl;
+        #pragma unroll
+        for (short i = 0; i < 8; ++i) yl_f4[i] = y4_f4[i];
+        const int ibl = ib32 / (QK_K / 32);
+        const int ib  = ib32 % (QK_K / 32);
+        device const block_iq2_xxs *xgr = xg + ibl;
+        device const block_iq2_xxs *xur = xu + ibl;
+        device const uint16_t *qg = xgr->qs + 4 * ib;
+        device const uint16_t *qu = xur->qs + 4 * ib;
+        device const half *dhg = &xgr->d;
+        device const half *dhu = &xur->d;
+        for (short row = 0; row < N_R0_IQ2_XXS; row++) {
+            device const uint8_t *aux8g = (device const uint8_t *)qg;
+            device const uint8_t *aux8u = (device const uint8_t *)qu;
+            const uint32_t aux32g = (uint32_t)qg[2] | ((uint32_t)qg[3] << 16u);
+            const uint32_t aux32u = (uint32_t)qu[2] | ((uint32_t)qu[3] << 16u);
+            const float dg = (float)dhg[0] * (0.5f + (aux32g >> 28));
+            const float du = (float)dhu[0] * (0.5f + (aux32u >> 28));
+            float sg = 0.0f;
+            float su = 0.0f;
+            {
+                #pragma clang fp contract(off)
+                for (short l = 0; l < 4; ++l) {
+                    const uint2 gv2 = as_type<uint2>(svalues[aux8g[l]]);
+                    const uint2 uv2 = as_type<uint2>(svalues[aux8u[l]]);
+                    const uchar4 g0 = as_type<uchar4>(gv2.x);
+                    const uchar4 g1 = as_type<uchar4>(gv2.y);
+                    const uchar4 u0 = as_type<uchar4>(uv2.x);
+                    const uchar4 u1 = as_type<uchar4>(uv2.y);
+                    const uint s7g = (aux32g >> (7u * (uint)l)) & 127u;
+                    const uint s7u = (aux32u >> (7u * (uint)l)) & 127u;
+                    const uint signg = s7g | ((popcount(s7g) & 1u) << 7u);
+                    const uint signu = s7u | ((popcount(s7u) & 1u) << 7u);
+                    #pragma unroll
+                    for (short j = 0; j < 4; ++j) {
+                        const float v = yl[8 * l + j];
+                        const float pg = v * (float)g0[j];
+                        const float pu = v * (float)u0[j];
+                        sg += select(pg, -pg, (signg & (1u << j)) != 0u);
+                        su += select(pu, -pu, (signu & (1u << j)) != 0u);
+                    }
+                    #pragma unroll
+                    for (short j = 0; j < 4; ++j) {
+                        const float v = yl[8 * l + 4 + j];
+                        const float pg = v * (float)g1[j];
+                        const float pu = v * (float)u1[j];
+                        sg += select(pg, -pg, (signg & (16u << j)) != 0u);
+                        su += select(pu, -pu, (signu & (16u << j)) != 0u);
+                    }
+                }
+            }
+            if (act.write_clamped == 0xFFu) {
+                const int dose = (int)act.clamp_value;
+                float pg = sg, pu = su;
+                for (int dz = 0; dz < dose; ++dz) {
+                    pg = fma(pg, 1.0000001f, 1e-9f);
+                    pu = fma(pu, 1.0000001f, 1e-9f);
+                }
+                if (pg == 1234567.0f) { sumg[row] += 0.0f; }
+                if (pu == 7654321.0f) { sumu[row] += 0.0f; }
+            }
+            sumg[row] += dg * sg;
+            sumu[row] += du * su;
+            dhg += args.nb01 / 2;
+            dhu += args.nb01 / 2;
+            qg  += args.nb01 / 2;
+            qu  += args.nb01 / 2;
+        }
+        y4 += 32 * 32;
+    }
+    device float *dst_gate_f32 =
+        (device float *)dst_gate + (uint64_t)i12 * args.ne0 * args.ne1 + (uint64_t)i11 * args.ne0;
+    device float *dst_up_f32 =
+        (device float *)dst_up + (uint64_t)i12 * args.ne0 * args.ne1 + (uint64_t)i11 * args.ne0;
+    const uint64_t pair_row = (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx;
+    device float *dst_mid_f32 =
+        (device float *)(dst_mid + pair_row * act.mid_row_stride);
+    device const float *route_w =
+        (device const float *)(weights + pair_row * act.weight_stride);
+    const float c = act.clamp_value;
+    const float route_weight = route_w[0];
+    float4 reduced_gate;
+    float4 reduced_up;
+    for (int row = 0; row < N_R0_IQ2_XXS; ++row) {
+        reduced_gate[row] = simd_sum(sumg[row]);
+        reduced_up[row] = simd_sum(sumu[row]);
+    }
+    if (tiisg < N_R0_IQ2_XXS && first_row + tiisg < args.ne0) {
+        const uint out_row = first_row + tiisg;
+        const float gate = reduced_gate[tiisg] * 0.25f;
+        const float up = reduced_up[tiisg] * 0.25f;
+        float g = gate;
+        float u = up;
+        if (c > 1.0e-6f) {
+            g = min(g, c);
+            u = clamp(u, -c, c);
+        }
+        if (act.write_clamped != 0) {
+            dst_gate_f32[out_row] = gate;
+            dst_up_f32[out_row] = up;
+        }
+        const float silu = g / (1.0f + exp(-g));
+        dst_mid_f32[out_row] = silu * u * route_weight;
+    }
+    (void)tiitg;
+}
+
+kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_popcnt_fast_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        device const char * ids,
+        device const char * weights,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    ds4_iq2_pair_swiglu_popcnt_fast_impl(args, act, src0_gate, src0_up, src1,
+        dst_gate, dst_up, dst_mid, ids, weights, shmem, tgpig, tiitg, tiisg, sgitg);
+}
+
 // Keep the restored macros local; later files must not see them.
 #undef QK_K
 #undef N_R0_IQ2_XXS
