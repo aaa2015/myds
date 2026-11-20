@@ -481,6 +481,13 @@ int myds_v41_gpu_pack_bf16(myds_metal_buffer_t *dst, size_t dst_elem_offset,
     return record(count == 128u ? "pack_index_cache" : "pack_compressed_kv");
 }
 
+int myds_v41_gpu_quant_pack_kv_nvfp4(myds_metal_buffer_t *dst, size_t dst_row,
+    myds_metal_buffer_t *src, size_t src_row, uint32_t n_rows) {
+    (void)dst; (void)dst_row; (void)src; (void)src_row;
+    assert(n_rows == 1u);
+    return record("quant_pack_compressed_kv_nvfp4");
+}
+
 int myds_v41_gpu_pack_indexer_key(myds_metal_buffer_t *dst, size_t dst_row,
     const myds_metal_buffer_t *src, size_t src_row,
     uint32_t n_rows, uint32_t cache_mode) {

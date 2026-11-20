@@ -282,8 +282,13 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
     const uint32_t idx_row_bytes = myds_v41_indexer_cache_mode_row_bytes(idx_mode);
     const char *idx_fmt = (idx_mode == MYDS_INDEXER_CACHE_FP4) ? "FP4-E2M1+UE8M0" :
                           (idx_mode == MYDS_INDEXER_CACHE_BF16) ? "BF16" : "F32";
+    const uint32_t kv_mode = myds_v41_gpu_kv_comp_cache_mode();
+    const uint32_t kv_row_bytes = myds_v41_kv_comp_cache_mode_row_bytes(kv_mode);
+    const char *kv_fmt = (kv_mode == MYDS_KV_COMP_CACHE_NVFP4) ? "NVFP4-E2M1+E4M3" :
+                         (kv_mode == MYDS_KV_COMP_CACHE_BF16) ? "BF16" : "F32";
 
     EMIT("\"counters\":{\"indexer_key_cache\":{\"mode\":%u,\"format\":\"%s\",\"row_bytes\":%u},"
+         "\"kv_comp_cache\":{\"mode\":%u,\"format\":\"%s\",\"row_bytes\":%u},"
          "\"indexer_register_only\":{\"requests\":%llu,\"encoded\":%llu,"
          "\"fallbacks\":%llu,\"failures\":%llu,\"f32_dispatches\":%llu,"
          "\"bf16_dispatches\":%llu},\"indexer_prefill_compact\":{\"requests\":%llu,"
@@ -325,6 +330,7 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          "\"prefill_attn_l01_mma\":{\"enabled\":%d,\"encoded\":%llu,\"q16_encoded\":%llu,"
          "\"q32_encoded\":%llu,\"rope_fuse_encoded\":%llu},\"prefix_cache_len\":%u},",
          (unsigned)idx_mode, idx_fmt, (unsigned)idx_row_bytes,
+         (unsigned)kv_mode, kv_fmt, (unsigned)kv_row_bytes,
          (unsigned long long)ro.requests, (unsigned long long)ro.encoded,
          (unsigned long long)ro.fallbacks, (unsigned long long)ro.failures,
          (unsigned long long)ro.f32_dispatches, (unsigned long long)ro.bf16_dispatches,

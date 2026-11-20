@@ -50,6 +50,7 @@ void myds_v41_indexer_decode_overlap_counters(myds_metal_decode_candidate_counte
 typedef struct {
     uint32_t layer, pos, capacity;
     uint32_t index_cache_mode;
+    uint32_t kv_comp_cache_mode;
     float hc_eps;
     myds_metal_buffer_t *residual;
     const myds_metal_buffer_t *hc_in_pre;

@@ -66,6 +66,7 @@ struct myds_v41_gpu_scratch {
     const myds_metal_buffer_t *direct_kv_comp_buf, *direct_kv_ids_buf;
     size_t direct_kv_comp_offset, direct_kv_ids_offset;
     uint32_t direct_kv_n_raw, direct_kv_source_rows, direct_kv_selected_rows, direct_kv_pos;
+    uint32_t direct_kv_comp_mode;
     myds_metal_buffer_t *compact_sorted_blocks, *compact_scores, *compact_rows;
     myds_metal_buffer_t *compact_stage1, *compact_stage2;
     myds_metal_buffer_t *l20_decode_nan_flags;
@@ -73,7 +74,7 @@ struct myds_v41_gpu_scratch {
     myds_metal_buffer_t *radix_row_meta; /* [P-T1] 72 KiB per-row radix/NaN metadata */
     /* [P-NEW-3] Cross-layer gathered compressed KV reuse cache (MYDS_PREFILL_ATTN_FAST=1). */
     bool     gathered_cache_valid;
-    bool     gathered_cache_comp_bf16;
+    uint32_t gathered_cache_comp_mode;
     bool     gathered_cache_compact512;
     bool     gathered_cache_mask_valid;
     const void *gathered_cache_dst_ptr;
@@ -342,12 +343,36 @@ static int cache_rows_valid(const myds_metal_buffer_t *b,uint64_t n_rows,uint32_
     if(cache_mode==MYDS_INDEXER_CACHE_F32)return floats(b,n_rows*128u);
     return 0;
 }
+static int kv_comp_nvfp4_rows(const myds_metal_buffer_t *b,uint64_t n_rows) {
+    return b && n_rows && n_rows<=myds_metal_buffer_size(b)/MYDS_KV_COMP_NVFP4_ROW_BYTES &&
+           myds_metal_buffer_offset(b)%32u==0u;
+}
+static int kv_comp_rows_valid(const myds_metal_buffer_t *b,uint64_t n_rows,uint32_t cache_mode) {
+    if(cache_mode==MYDS_KV_COMP_CACHE_NVFP4)return kv_comp_nvfp4_rows(b,n_rows);
+    if(cache_mode==MYDS_KV_COMP_CACHE_BF16)return bf16s(b,n_rows*512u);
+    if(cache_mode==MYDS_KV_COMP_CACHE_F32)return floats(b,n_rows*512u);
+    return 0;
+}
 int myds_v41_gpu_indexer_key_fp4_enabled(void) {
     const char *v=getenv("MYDS_INDEXER_KEY_FP4");
     if(!v||!strcmp(v,"0"))return 0;
     if(!strcmp(v,"1"))return 1;
     MYDS_LOG_E("MYDS_INDEXER_KEY_FP4 must be exactly absent, 0 or 1");
     return -1;
+}
+int myds_v41_gpu_kv_comp_nvfp4_enabled(void) {
+    const char *v=getenv("MYDS_KV_COMP_NVFP4");
+    if(!v||!strcmp(v,"0"))return 0;
+    if(!strcmp(v,"1"))return 1;
+    MYDS_LOG_E("MYDS_KV_COMP_NVFP4 must be exactly absent, 0 or 1");
+    return -1;
+}
+uint32_t myds_v41_gpu_kv_comp_cache_mode(void) {
+    return myds_v41_gpu_kv_comp_nvfp4_enabled()==1
+        ? MYDS_KV_COMP_CACHE_NVFP4 : MYDS_KV_COMP_CACHE_BF16;
+}
+uint32_t myds_v41_gpu_kv_comp_row_bytes(void) {
+    return myds_v41_kv_comp_cache_mode_row_bytes(myds_v41_gpu_kv_comp_cache_mode());
 }
 int myds_v41_gpu_indexer_decode_mma_enabled(void) {
     const char *v=getenv("MYDS_INDEXER_DECODE_MMA");
@@ -464,6 +489,18 @@ int myds_v41_gpu_pack_indexer_key(myds_metal_buffer_t *dst,size_t dst_row,
         return myds_v41_gpu_pack_bf16(dst,dst_row*128u,src,src_row*128u,n_rows*128u);
     return 0;
 }
+int myds_v41_gpu_quant_pack_kv_nvfp4(myds_metal_buffer_t *dst,size_t dst_row,
+    myds_metal_buffer_t *src,size_t src_row,uint32_t n_rows) {
+    if(!n_rows||!kv_comp_nvfp4_rows(dst,n_rows)||!floats(src,(uint64_t)n_rows*512u)||
+       dst_row>myds_metal_buffer_size(dst)/MYDS_KV_COMP_NVFP4_ROW_BYTES-n_rows||
+       src_row>myds_metal_buffer_size(src)/(512u*4u)-n_rows)return 0;
+    atomic_fetch_add_explicit(&comp_kv_write_gen, 1u, memory_order_relaxed);
+    struct {uint64_t dst_row,src_row;uint32_t n_rows,pad;} a={
+        (uint64_t)dst_row,(uint64_t)src_row,n_rows,0u};
+    const myds_metal_buffer_t *b[]={src,dst};
+    return dispatch("kernel_dsv41_quant_pack_kv_nvfp4",&a,sizeof(a),b,2u,
+                    8u,n_rows,1u,128u,1u,1u,0u);
+}
 uint32_t myds_v41_gpu_chunk_max_c(const myds_v41_gpu_scratch_t *s) {
     return s ? MYDS_CHUNK_MAXC : 0u;
 }
@@ -477,6 +514,7 @@ myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp) {
     if (myds_v41_gpu_indexer_register_only_enabled()<0 ||
         myds_v41_gpu_indexer_prefill_wide_enabled()<0 ||
         myds_v41_gpu_indexer_key_fp4_enabled()<0 ||
+        myds_v41_gpu_kv_comp_nvfp4_enabled()<0 ||
         myds_v41_gpu_indexer_decode_mma_enabled()<0 ||
         myds_v41_gpu_suffix_shrink_final_mb_only_enabled()<0 ||
         myds_v41_gpu_indexer_decode_compact_enabled()<0 ||
@@ -811,6 +849,29 @@ int myds_v41_gpu_kv_rope_quant_batch(myds_metal_buffer_t *x,
     memcpy(a.frequencies,rope_frequencies[compressed?1:0],sizeof(a.frequencies));
     const myds_metal_buffer_t *b[]={x,packed_dst?packed_dst:x};
     return dispatch("kernel_dsv41_kv_rope_quant_batch",&a,sizeof(a),b,2,1,rows,1,32,1,1,0);
+}
+int myds_v41_gpu_kv_rope_quant_batch_mode(myds_metal_buffer_t *x,
+    myds_metal_buffer_t *packed_dst,size_t dst_row,
+    uint32_t start_pos,uint32_t rows,uint32_t stride,bool compressed,uint32_t mode,
+    uint32_t cache_mode) {
+    if(!packed_dst||cache_mode==MYDS_KV_COMP_CACHE_BF16) {
+        return myds_v41_gpu_kv_rope_quant_batch(
+            x,packed_dst,packed_dst?dst_row*512u:0u,start_pos,rows,stride,compressed,mode);
+    }
+    if(cache_mode!=MYDS_KV_COMP_CACHE_NVFP4||mode!=3u||!rows||!stride||start_pos>=1048576u||
+       (uint64_t)start_pos+(uint64_t)(rows-1u)*stride>=1048576u||
+       !floats(x,(uint64_t)512u*rows)||!kv_comp_nvfp4_rows(packed_dst,rows)||
+       dst_row>myds_metal_buffer_size(packed_dst)/MYDS_KV_COMP_NVFP4_ROW_BYTES-rows)return 0;
+    atomic_fetch_add_explicit(&comp_kv_write_gen, 1u, memory_order_relaxed);
+    pthread_once(&rope_once,init_rope);
+    struct {
+        uint32_t heads,rows,start,stride,mode,pack_bf16;
+        uint64_t dst_offset;
+        float frequencies[32];
+    } a={1u,rows,start_pos,stride,3u,2u,(uint64_t)dst_row,{0}};
+    memcpy(a.frequencies,rope_frequencies[compressed?1:0],sizeof(a.frequencies));
+    const myds_metal_buffer_t *b[]={x,packed_dst};
+    return dispatch("kernel_dsv41_kv_rope_quant_batch",&a,sizeof(a),b,2u,1u,rows,1u,32u,1u,1u,0u);
 }
 static int buffer_ranges_overlap(const myds_metal_buffer_t *a,size_t a_bytes,
                                  const myds_metal_buffer_t *b,size_t b_bytes) {
@@ -3638,6 +3699,21 @@ int myds_v41_gpu_gather_bf16(myds_metal_buffer_t *out,const myds_metal_buffer_t 
     const myds_metal_buffer_t *b[]={cache,ids,out};
     return dispatch("kernel_dsv41_get_rows_bf16",a,sizeof(a),b,3,2,selected_rows,1,256,1,1,0);
 }
+int myds_v41_gpu_gather_mode(myds_metal_buffer_t *out,const myds_metal_buffer_t *cache,
+    const myds_metal_buffer_t *ids,uint32_t source_rows,uint32_t selected_rows,
+    uint32_t cache_mode) {
+    if(cache_mode==MYDS_KV_COMP_CACHE_BF16)
+        return myds_v41_gpu_gather_bf16(out,cache,ids,source_rows,selected_rows);
+    if(cache_mode==MYDS_KV_COMP_CACHE_F32)
+        return myds_v41_gpu_gather(out,cache,ids,source_rows,selected_rows);
+    if(cache_mode!=MYDS_KV_COMP_CACHE_NVFP4)return 0;
+    if(!selected_rows||selected_rows>512||selected_rows>source_rows||
+       !floats(out,(uint64_t)selected_rows*512)||!kv_comp_nvfp4_rows(cache,source_rows)||
+       !floats(ids,selected_rows))return 0;
+    const uint32_t a[]={source_rows,selected_rows};
+    const myds_metal_buffer_t *b[]={cache,ids,out};
+    return dispatch("kernel_dsv41_get_rows_nvfp4",a,sizeof(a),b,3,1,selected_rows,1,128,1,1,0);
+}
 
 /* Use transient subviews only as binding handles; Metal retains the underlying
  * resources until queued dispatches finish. No CPU readback or synchronization. */
@@ -3654,6 +3730,15 @@ static int stage_bf16_f16(myds_metal_buffer_t *dst,size_t dstoff,const myds_meta
     const myds_metal_buffer_t *b[]={s->sv_view,s->dv_view};
     return dispatch("kernel_dsv41_stage_bf16_f16",&count,sizeof(count),b,2,
                     (count+255u)/256u,1,1,256,1,1,0);
+}
+static int stage_nvfp4_f16(myds_metal_buffer_t *dst,size_t dstoff,const myds_metal_buffer_t *src,
+    uint32_t n_rows,myds_v41_gpu_scratch_t *s) {
+    if(!s||!src||!dst||!n_rows||
+       !myds_metal_buffer_update_sub_view(s->sv_view,src,0,(size_t)n_rows*MYDS_KV_COMP_NVFP4_ROW_BYTES)||
+       !myds_metal_buffer_update_sub_view(s->dv_view,dst,dstoff,(size_t)n_rows*512u*2u))return 0;
+    const myds_metal_buffer_t *b[]={s->sv_view,s->dv_view};
+    return dispatch("kernel_dsv41_stage_nvfp4_f16",&n_rows,sizeof(n_rows),b,2,
+                    1u,n_rows,1u,128u,1u,1u,0u);
 }
 struct flash_pad_args {
     int32_t ne11,ne_12_2,ne_12_3;uint64_t nb11,nb12,nb13,nb21,nb22,nb23;
@@ -3775,13 +3860,26 @@ bool myds_v41_gpu_prefill_attn_wants_q_f16(const myds_v41_gpu_scratch_t *s,
 #endif
 }
 
+static inline const char *gather_comp_kernel_name(uint32_t comp_cache_mode, bool compact512) {
+    if (comp_cache_mode == MYDS_KV_COMP_CACHE_NVFP4) {
+        return compact512 ? "kernel_myds_attn_gather_comp_512_nvfp4"
+                          : "kernel_myds_attn_gather_comp_nvfp4";
+    }
+    if (comp_cache_mode == MYDS_KV_COMP_CACHE_BF16) {
+        return compact512 ? "kernel_myds_attn_gather_comp_512_bf16"
+                          : "kernel_myds_attn_gather_comp_bf16";
+    }
+    return compact512 ? "kernel_myds_attn_gather_comp_512"
+                      : "kernel_myds_attn_gather_comp";
+}
+
 /* 整个 chunk 的 attention，一次 dispatch。省掉的正是每 token 的 staging/gather/pad/vec/reduce。 */
 static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *chunk_kv,
     const myds_metal_buffer_t *comp_kv,const myds_metal_buffer_t *ids,
     myds_metal_buffer_t *gathered,
     uint32_t c_len,uint32_t n_comp,uint32_t top_k,
-    uint32_t base_pos,uint32_t c_start,uint32_t ratio,myds_v41_gpu_scratch_t *s,bool comp_bf16,
+    uint32_t base_pos,uint32_t c_start,uint32_t ratio,myds_v41_gpu_scratch_t *s,uint32_t comp_cache_mode,
     const myds_v41_gpu_attention_chunk_opts_t *opts) {
     myds_v41_gpu_attn_kv_reuse_reset(s);
     if (opts && opts->rope_consumed) *opts->rope_consumed = false;
@@ -3797,7 +3895,7 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
        !floats(sinks,64)||!floats(chunk_kv,(uint64_t)c_len*512)||
        (uint64_t)base_pos+c_start+c_len>UINT32_MAX||
        (n_comp&&!ratio)||
-       (n_comp&&(!comp_kv||!(comp_bf16?bf16s(comp_kv,(uint64_t)n_comp*512):floats(comp_kv,(uint64_t)n_comp*512))||
+       (n_comp&&(!comp_kv||!kv_comp_rows_valid(comp_kv,n_comp,comp_cache_mode)||
                  !ids||!floats(ids,(uint64_t)c_len*top_k))))return 0;
 
     /* 2026-10-24 诊断：gather 与 flash-attn 分段计时（MYDS_PROFILE_ATTN_SUB=1）。 */
@@ -3862,9 +3960,11 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
     const uint32_t keys_pad=(keys+31u)/32u*32u;
 
     if(!stage_f16(s->kv_chunk,(size_t)MYDS_CHUNK_CARRY*1024u,chunk_kv,0,c_len*512u,s))return 0;
-    if(!use_gather && n_comp && !(comp_bf16?
-       stage_bf16_f16(s->kv_chunk,(size_t)comp_base*1024u,comp_kv,0,n_comp*512u,s):
-       stage_f16(s->kv_chunk,(size_t)comp_base*1024u,comp_kv,0,n_comp*512u,s)))return 0;
+    if(!use_gather && n_comp && !(comp_cache_mode==MYDS_KV_COMP_CACHE_NVFP4?
+       stage_nvfp4_f16(s->kv_chunk,(size_t)comp_base*1024u,comp_kv,n_comp,s):
+       (comp_cache_mode==MYDS_KV_COMP_CACHE_BF16?
+        stage_bf16_f16(s->kv_chunk,(size_t)comp_base*1024u,comp_kv,0,n_comp*512u,s):
+        stage_f16(s->kv_chunk,(size_t)comp_base*1024u,comp_kv,0,n_comp*512u,s))))return 0;
 
     if(!use_gather) {
     if (!use_l01_mma) {
@@ -3926,7 +4026,7 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
         const void *ids_ptr = myds_metal_buffer_data((myds_metal_buffer_t *)ids);
         const bool gather_reuse_on = (fast_enabled || use_q16_fast) != 0;
         const bool gather_comp_hit = gather_reuse_on && s->gathered_cache_valid &&
-            s->gathered_cache_comp_bf16 == comp_bf16 &&
+            s->gathered_cache_comp_mode == comp_cache_mode &&
             s->gathered_cache_compact512 == (use_fast_matrix != 0) &&
             (use_fast_matrix || (s->gathered_cache_mask_valid &&
                                  s->gathered_cache_mask_stride == s->mask_u16)) &&
@@ -3946,13 +4046,12 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
              * across follower layers on single-chunk reuse hit). */
             if (!gather_comp_hit) {
                 const myds_metal_buffer_t *g2[]={gathered,s->mask_chunk,comp_kv,ids};
-                if(!dispatch(comp_bf16?"kernel_myds_attn_gather_comp_512_bf16":
-                             "kernel_myds_attn_gather_comp_512",&ga,sizeof(ga),g2,4,
+                if(!dispatch(gather_comp_kernel_name(comp_cache_mode, true),&ga,sizeof(ga),g2,4,
                              512u,c_len,1,128,1,1,0))return 0;
                 atomic_fetch_add_explicit(&prefill_attn_fast_cnt[PAF_GATHER_COMP_512_ENC], 1u, memory_order_relaxed);
                 atomic_fetch_add_explicit(&prefill_attn_fast_cnt[PAF_GATHER_COMP_MISSES], 1u, memory_order_relaxed);
                 s->gathered_cache_valid = true;
-                s->gathered_cache_comp_bf16 = comp_bf16;
+                s->gathered_cache_comp_mode = comp_cache_mode;
                 s->gathered_cache_compact512 = true;
                 s->gathered_cache_mask_valid = false;
                 s->gathered_cache_dst_ptr = dst_ptr;
@@ -3978,13 +4077,12 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
                              128u,c_len,1,128,1,1,0))return 0; }
             if (!gather_comp_hit) {
                 const myds_metal_buffer_t *g2[]={gathered,s->mask_chunk,comp_kv,ids};
-                if(!dispatch(comp_bf16?"kernel_myds_attn_gather_comp_bf16":
-                             "kernel_myds_attn_gather_comp",&ga,sizeof(ga),g2,4,
+                if(!dispatch(gather_comp_kernel_name(comp_cache_mode, false),&ga,sizeof(ga),g2,4,
                              512u,c_len,1,128,1,1,0))return 0;
                 if (fast_enabled) {
                     atomic_fetch_add_explicit(&prefill_attn_fast_cnt[PAF_GATHER_COMP_MISSES], 1u, memory_order_relaxed);
                     s->gathered_cache_valid = true;
-                    s->gathered_cache_comp_bf16 = comp_bf16;
+                    s->gathered_cache_comp_mode = comp_cache_mode;
                     s->gathered_cache_compact512 = false;
                     s->gathered_cache_mask_valid = true;
                     s->gathered_cache_dst_ptr = dst_ptr;
@@ -4165,8 +4263,7 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
                 const myds_metal_buffer_t *g2[]={gathered,s->mask_chunk,comp_kv,ids};
                 if(!dispatch("kernel_myds_attn_gather_window",&ga,sizeof(ga),g1,3,
                              128u,c_len,1,128,1,1,0))return 0;
-                if(!dispatch(comp_bf16?"kernel_myds_attn_gather_comp_bf16":
-                             "kernel_myds_attn_gather_comp",&ga,sizeof(ga),g2,4,
+                if(!dispatch(gather_comp_kernel_name(comp_cache_mode, false),&ga,sizeof(ga),g2,4,
                              512u,c_len,1,128,1,1,0))return 0;
             }
         } else {
@@ -4295,13 +4392,21 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
     }
     return 1;
 }
+int myds_v41_gpu_attention_chunk_mode(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *chunk_kv,
+    const myds_metal_buffer_t *comp_kv,const myds_metal_buffer_t *ids,myds_metal_buffer_t *gathered,
+    uint32_t c_len,uint32_t n_comp,uint32_t top_k,uint32_t base_pos,uint32_t c_start,
+    uint32_t ratio,myds_v41_gpu_scratch_t *s,uint32_t comp_cache_mode) {
+    return attention_chunk(heads,sinks,q,chunk_kv,comp_kv,ids,gathered,c_len,n_comp,top_k,
+                           base_pos,c_start,ratio,s,comp_cache_mode,NULL);
+}
 int myds_v41_gpu_attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *chunk_kv,
     const myds_metal_buffer_t *comp_kv,const myds_metal_buffer_t *ids,myds_metal_buffer_t *gathered,
     uint32_t c_len,uint32_t n_comp,uint32_t top_k,uint32_t base_pos,uint32_t c_start,
     uint32_t ratio,myds_v41_gpu_scratch_t *s) {
     return attention_chunk(heads,sinks,q,chunk_kv,comp_kv,ids,gathered,c_len,n_comp,top_k,
-                           base_pos,c_start,ratio,s,false,NULL);
+                           base_pos,c_start,ratio,s,MYDS_KV_COMP_CACHE_F32,NULL);
 }
 int myds_v41_gpu_attention_chunk_bf16(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *chunk_kv,
@@ -4309,7 +4414,7 @@ int myds_v41_gpu_attention_chunk_bf16(myds_metal_buffer_t *heads,const myds_meta
     uint32_t c_len,uint32_t n_comp,uint32_t top_k,uint32_t base_pos,uint32_t c_start,
     uint32_t ratio,myds_v41_gpu_scratch_t *s) {
     return attention_chunk(heads,sinks,q,chunk_kv,comp_kv,ids,gathered,c_len,n_comp,top_k,
-                           base_pos,c_start,ratio,s,true,NULL);
+                           base_pos,c_start,ratio,s,MYDS_KV_COMP_CACHE_BF16,NULL);
 }
 int myds_v41_gpu_attention_chunk_ex(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *chunk_kv,
@@ -4318,7 +4423,17 @@ int myds_v41_gpu_attention_chunk_ex(myds_metal_buffer_t *heads,const myds_metal_
     uint32_t ratio,myds_v41_gpu_scratch_t *s,bool comp_bf16,
     const myds_v41_gpu_attention_chunk_opts_t *opts) {
     return attention_chunk(heads,sinks,q,chunk_kv,comp_kv,ids,gathered,c_len,n_comp,top_k,
-                           base_pos,c_start,ratio,s,comp_bf16,opts);
+                           base_pos,c_start,ratio,s,
+                           comp_bf16 ? MYDS_KV_COMP_CACHE_BF16 : MYDS_KV_COMP_CACHE_F32,opts);
+}
+int myds_v41_gpu_attention_chunk_mode_ex(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *chunk_kv,
+    const myds_metal_buffer_t *comp_kv,const myds_metal_buffer_t *ids,myds_metal_buffer_t *gathered,
+    uint32_t c_len,uint32_t n_comp,uint32_t top_k,uint32_t base_pos,uint32_t c_start,
+    uint32_t ratio,myds_v41_gpu_scratch_t *s,uint32_t comp_cache_mode,
+    const myds_v41_gpu_attention_chunk_opts_t *opts) {
+    return attention_chunk(heads,sinks,q,chunk_kv,comp_kv,ids,gathered,c_len,n_comp,top_k,
+                           base_pos,c_start,ratio,s,comp_cache_mode,opts);
 }
 
 enum { AR_REQUESTS, AR_ENCODED, AR_FAILURES, AR_DIRECT, AR_STAGED, AR_COUNT };
@@ -4494,6 +4609,7 @@ void myds_v41_gpu_attn_kv_reuse_reset(myds_v41_gpu_scratch_t *s) {
     s->direct_kv_source_rows = 0;
     s->direct_kv_selected_rows = 0;
     s->direct_kv_pos = 0;
+    s->direct_kv_comp_mode = 0;
 }
 int myds_v41_gpu_attn_kv_reuse_prepare_layer(myds_v41_gpu_scratch_t *s,
     uint32_t layer, uint32_t count, bool is_index_source) {
@@ -4582,6 +4698,11 @@ static _Atomic uint64_t attention_pack_counters[AP_COUNT];
 static pthread_once_t attention_pack_once=PTHREAD_ONCE_INIT;
 static int attention_pack_mode;
 static const char attention_pack_kernel[]="kernel_myds_dsv41_direct_pack_fuse";
+static const char attention_pack_kernel_nvfp4[]="kernel_myds_dsv41_direct_pack_fuse_nvfp4";
+static inline const char *attention_direct_pack_kernel_for_mode(uint32_t comp_cache_mode) {
+    return (comp_cache_mode == MYDS_KV_COMP_CACHE_NVFP4)
+        ? attention_pack_kernel_nvfp4 : attention_pack_kernel;
+}
 static void attention_pack_init(void) {
     const char *value=getenv("MYDS_ATTN_DIRECT_PACK_FUSE");
     if (!value || !strcmp(value,"0")) return;
@@ -4605,7 +4726,8 @@ int myds_v41_gpu_attention_direct_pack_fuse_enabled(void) {
     return attention_pack_mode;
 }
 const char *myds_v41_gpu_attention_direct_pack_fuse_selected_kernel(void) {
-    return myds_v41_gpu_attention_direct_pack_fuse_enabled()==1 ? attention_pack_kernel : NULL;
+    return myds_v41_gpu_attention_direct_pack_fuse_enabled()==1
+        ? attention_direct_pack_kernel_for_mode(myds_v41_gpu_kv_comp_cache_mode()) : NULL;
 }
 void myds_v41_gpu_attention_direct_pack_fuse_counters(myds_metal_decode_candidate_counters_t *out,bool reset) {
     uint64_t v[AP_COUNT];
@@ -4626,33 +4748,38 @@ _Static_assert(sizeof(struct attention_direct_pack_args)==16u,"direct pack ABI")
 static int attention_direct_pack_preflight(const myds_metal_buffer_t *dst,
     const myds_metal_buffer_t *window,uint32_t n_raw,uint32_t raw_start,
     const myds_metal_buffer_t *comp,const myds_metal_buffer_t *ids,
-    uint32_t source_rows,uint32_t selected_rows) {
+    uint32_t source_rows,uint32_t selected_rows,uint32_t comp_cache_mode) {
     if(!n_raw||n_raw>128u||raw_start>=128u||selected_rows>512u||
        (selected_rows&&(!source_rows||selected_rows>source_rows)))return 0;
+    const uint32_t comp_row_bytes = myds_v41_kv_comp_cache_mode_row_bytes(comp_cache_mode);
+    if(comp_cache_mode!=MYDS_KV_COMP_CACHE_BF16 && comp_cache_mode!=MYDS_KV_COMP_CACHE_NVFP4) return 0;
     const uint64_t dn=(uint64_t)(n_raw+selected_rows)*512u*2u,wn=128u*512u*4u;
     if(!myds_metal_buffer_native_range(dst,dn,16u)||
        !myds_metal_buffer_native_range(window,wn,16u)||
        buffer_ranges_overlap(dst,(size_t)dn,window,(size_t)wn))return 0;
     if(selected_rows) {
-        const uint64_t cn=(uint64_t)source_rows*512u*2u,in=(uint64_t)selected_rows*4u;
-        if(!myds_metal_buffer_native_range(comp,cn,16u)||
+        const uint64_t cn=(uint64_t)source_rows*comp_row_bytes,in=(uint64_t)selected_rows*4u;
+        const size_t comp_align = (comp_cache_mode == MYDS_KV_COMP_CACHE_NVFP4) ? 32u : 16u;
+        if(!myds_metal_buffer_native_range(comp,cn,comp_align)||
            !myds_metal_buffer_native_range(ids,in,4u)||
            buffer_ranges_overlap(dst,(size_t)dn,comp,(size_t)cn)||
            buffer_ranges_overlap(dst,(size_t)dn,ids,(size_t)in))return 0;
     }
     const uint32_t threads[]={128u,1u,1u};
-    return myds_metal_kernel_constants_preflight(attention_pack_kernel,threads,0u,NULL,0u);
+    return myds_metal_kernel_constants_preflight(
+        attention_direct_pack_kernel_for_mode(comp_cache_mode),threads,0u,NULL,0u);
 }
 /* Counts this selected pack dispatch only. A later RF failure propagates from
  * the enclosing forward; it is not a pack failure after pack encoded success. */
 static int attention_direct_pack_encode(myds_metal_buffer_t *dst,
     const myds_metal_buffer_t *window,uint32_t n_raw,uint32_t raw_start,
     const myds_metal_buffer_t *comp,const myds_metal_buffer_t *ids,
-    uint32_t source_rows,uint32_t selected_rows) {
+    uint32_t source_rows,uint32_t selected_rows,uint32_t comp_cache_mode) {
     const struct attention_direct_pack_args a={n_raw,raw_start,source_rows,selected_rows};
     const myds_metal_buffer_t *b[]={window,selected_rows?comp:window,selected_rows?ids:window,dst};
     const uint64_t before=myds_metal_dispatch_count();
-    const int ok=dispatch(attention_pack_kernel,&a,sizeof(a),b,4,1,n_raw+selected_rows,1,128,1,1,0);
+    const int ok=dispatch(attention_direct_pack_kernel_for_mode(comp_cache_mode),
+                          &a,sizeof(a),b,4,1,n_raw+selected_rows,1,128,1,1,0);
     if(myds_metal_dispatch_count()>before)
         atomic_fetch_add_explicit(&attention_pack_counters[AP_ENCODED],1u,memory_order_relaxed);
     return ok ? 1 : attention_pack_failure();
@@ -4663,15 +4790,21 @@ static int attention_direct_pack_encode(myds_metal_buffer_t *dst,
 static int attention_rope_validate(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *window,uint32_t n_raw,uint32_t raw_start,
     const myds_metal_buffer_t *selected,const myds_metal_buffer_t *ids,uint32_t source_rows,
-    uint32_t selected_rows,myds_v41_gpu_scratch_t *s,uint32_t pos,bool direct,bool mma_only) {
+    uint32_t selected_rows,myds_v41_gpu_scratch_t *s,uint32_t pos,bool direct,bool mma_only,
+    uint32_t comp_cache_mode) {
     if (!s || pos>=1048576u || !n_raw || n_raw>128u || raw_start>=128u || selected_rows>512u ||
         (direct && selected_rows && selected_rows>source_rows)) return 0;
+    const uint32_t comp_row_bytes = direct
+        ? myds_v41_kv_comp_cache_mode_row_bytes(comp_cache_mode) : 2048u;
+    if (direct && comp_cache_mode != MYDS_KV_COMP_CACHE_BF16 &&
+        comp_cache_mode != MYDS_KV_COMP_CACHE_NVFP4) return 0;
     const myds_metal_buffer_t *writers[]={heads,s->kv_f16,s->pad,s->partial};
     const uint64_t wn[]={64u*512u*4u,640u*512u*2u,2u*32u*512u*2u+32u*2u,64u*(512u+2u)*32u*4u};
     const myds_metal_buffer_t *readers[]={sinks,q,window,s->mask,selected,ids};
     const uint64_t rn[]={64u*4u,64u*512u*4u,128u*512u*4u,640u*2u,
-        direct?(uint64_t)source_rows*512u*2u:(uint64_t)selected_rows*512u*4u,(uint64_t)selected_rows*4u};
-    const size_t align[]={4u,16u,16u,2u,16u,4u};
+        direct?(uint64_t)source_rows*comp_row_bytes:(uint64_t)selected_rows*512u*4u,(uint64_t)selected_rows*4u};
+    const size_t align[]={4u,16u,16u,2u,
+        (direct && comp_cache_mode == MYDS_KV_COMP_CACHE_NVFP4) ? 32u : 16u,4u};
     for (unsigned i=0;i<4u;i++) {
         if (!attention_rope_range(writers[i],wn[i],16u)) return 0;
         for (unsigned j=0;j<i;j++) if(buffer_ranges_overlap(writers[i],(size_t)wn[i],writers[j],(size_t)wn[j])) return 0;
@@ -4930,7 +5063,7 @@ static int attention_direct_impl(myds_metal_buffer_t *heads,const myds_metal_buf
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *window,uint32_t n_raw,
     uint32_t raw_start,const myds_metal_buffer_t *comp_kv,const myds_metal_buffer_t *selected_ids,
     uint32_t source_rows,uint32_t selected_rows,myds_v41_gpu_scratch_t *s,int register_mode,
-    const struct attention_rope_scope *rope) {
+    const struct attention_rope_scope *rope,uint32_t comp_cache_mode) {
     gathered_cache_invalidate(s);
     const int kv_reuse_mode = rope ? myds_v41_attn_kv_reuse_enabled() : 0;
     if (kv_reuse_mode < 0) return 0;
@@ -4941,8 +5074,9 @@ static int attention_direct_impl(myds_metal_buffer_t *heads,const myds_metal_buf
         atomic_fetch_add_explicit(&attn_kv_reuse_requests, 1u, memory_order_relaxed);
     }
     if(!s||!n_raw||n_raw>128||raw_start>=128||selected_rows>512||
+        (comp_cache_mode!=MYDS_KV_COMP_CACHE_BF16 && comp_cache_mode!=MYDS_KV_COMP_CACHE_NVFP4)||
         !floats(heads,64u*512)||!floats(q,64u*512)||!floats(sinks,64)||!floats(window,128u*512)||
-        (selected_rows&&(selected_rows>source_rows||!bf16s(comp_kv,(uint64_t)source_rows*512)||!floats(selected_ids,selected_rows)))) {
+        (selected_rows&&(selected_rows>source_rows||!kv_comp_rows_valid(comp_kv,source_rows,comp_cache_mode)||!floats(selected_ids,selected_rows)))) {
         if (want_kv_reuse) atomic_fetch_add_explicit(&attn_kv_reuse_failures, 1u, memory_order_relaxed);
         return 0;
     }
@@ -4975,7 +5109,7 @@ static int attention_direct_impl(myds_metal_buffer_t *heads,const myds_metal_buf
         atomic_fetch_add_explicit(&attention_pack_counters[AP_REQUESTS],1u,memory_order_relaxed);
         if(pack_fuse<0 || register_mode!=1 || want_kv_reuse ||
            !attention_direct_pack_preflight(s->kv_f16,window,n_raw,raw_start,
-                                            comp_kv,selected_ids,source_rows,selected_rows)) {
+                                            comp_kv,selected_ids,source_rows,selected_rows,comp_cache_mode)) {
             if (want_kv_reuse) atomic_fetch_add_explicit(&attn_kv_reuse_failures, 1u, memory_order_relaxed);
             return attention_pack_failure();
         }
@@ -5001,10 +5135,14 @@ static int attention_direct_impl(myds_metal_buffer_t *heads,const myds_metal_buf
     uint32_t keys=n_raw+selected_rows;uint64_t kvbytes=(uint64_t)keys*1024,maskbytes=(uint64_t)keys*2;
     const uint32_t mma_d_split = resolve_decode_mma_d_split(keys, rope, register_mode);
     if (register_mode == 2 && !mma_d_split) return 0;
+    const char *get_rows_to_f16_kernel = (comp_cache_mode == MYDS_KV_COMP_CACHE_NVFP4)
+        ? "kernel_dsv41_get_rows_nvfp4_to_f16"
+        : "kernel_dsv41_get_rows_bf16_to_f16";
     if (want_kv_reuse) {
         if (expect_kv_reuse) {
             const bool cache_hit = selected_rows > 0u &&
                 s->direct_kv_cache_valid &&
+                s->direct_kv_comp_mode == comp_cache_mode &&
                 s->direct_kv_comp_buf == comp_kv &&
                 s->direct_kv_comp_offset == myds_metal_buffer_offset(comp_kv) &&
                 s->direct_kv_ids_buf == selected_ids &&
@@ -5060,7 +5198,7 @@ static int attention_direct_impl(myds_metal_buffer_t *heads,const myds_metal_buf
                     uint32_t pad;
                 } g_args = {source_rows, selected_rows, n_raw, 0};
                 const myds_metal_buffer_t *gb[] = {comp_kv, selected_ids, s->kv_f16};
-                if (!dispatch("kernel_dsv41_get_rows_bf16_to_f16", &g_args, sizeof(g_args), gb, 3, 1, selected_rows, 1, 128, 1, 1, 0)) {
+                if (!dispatch(get_rows_to_f16_kernel, &g_args, sizeof(g_args), gb, 3, 1, selected_rows, 1, 128, 1, 1, 0)) {
                     myds_v41_gpu_attn_kv_reuse_reset(s);
                     atomic_fetch_add_explicit(&attn_kv_reuse_failures, 1u, memory_order_relaxed);
                     return 0;
@@ -5113,6 +5251,7 @@ static int attention_direct_impl(myds_metal_buffer_t *heads,const myds_metal_buf
             }
             if (populate_kv_cache && selected_rows > 0u) {
                 s->direct_kv_cache_valid = true;
+                s->direct_kv_comp_mode = comp_cache_mode;
                 s->direct_pad_cache_valid = (!mma_d_split) && (keys % 32u != 0u) && ((keys & ~31u) >= n_raw);
                 s->direct_kv_comp_buf = comp_kv;
                 s->direct_kv_comp_offset = myds_metal_buffer_offset(comp_kv);
@@ -5135,7 +5274,7 @@ static int attention_direct_impl(myds_metal_buffer_t *heads,const myds_metal_buf
             /* Unused inputs for selected_rows0 bind a valid window resource. The
              * shader's uniform raw-row branch never reads these dummy bindings. */
             if(!attention_direct_pack_encode(s->kv_f16,window,n_raw,raw_start,
-                                            comp_kv,selected_ids,source_rows,selected_rows))return 0;
+                                            comp_kv,selected_ids,source_rows,selected_rows,comp_cache_mode))return 0;
         } else {
             const uint32_t w_args[] = {n_raw, raw_start};
             const myds_metal_buffer_t *wb[] = {window, s->kv_f16};
@@ -5149,7 +5288,7 @@ static int attention_direct_impl(myds_metal_buffer_t *heads,const myds_metal_buf
                 uint32_t pad;
             } g_args = {source_rows, selected_rows, n_raw, 0};
             const myds_metal_buffer_t *gb[] = {comp_kv, selected_ids, s->kv_f16};
-                if(!dispatch("kernel_dsv41_get_rows_bf16_to_f16", &g_args, sizeof(g_args), gb, 3, 1, selected_rows, 1, 128, 1, 1, 0)) return 0;
+                if(!dispatch(get_rows_to_f16_kernel, &g_args, sizeof(g_args), gb, 3, 1, selected_rows, 1, 128, 1, 1, 0)) return 0;
             }
         }
         if(!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(s->kv_f16);
@@ -5220,16 +5359,22 @@ static int attention_direct_impl(myds_metal_buffer_t *heads,const myds_metal_buf
     return specialized("kernel_flash_attn_ext_vec_reduce",&nrows,sizeof(nrows),rb,2,64,1,1,1024,1,1,0,rc,2);
 }
 
+int myds_v41_gpu_attention_direct_mode(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *window,uint32_t n_raw,
+    uint32_t raw_start,const myds_metal_buffer_t *comp_kv,const myds_metal_buffer_t *selected_ids,
+    uint32_t source_rows,uint32_t selected_rows,myds_v41_gpu_scratch_t *s,uint32_t comp_cache_mode) {
+    const int mode=myds_v41_gpu_attention_packed_register_enabled();
+    if(mode) attention_register_count(AR_REQUESTS);
+    if(mode<0) {attention_register_count(AR_FAILURES);return 0;}
+    const int ok=attention_direct_impl(heads,sinks,q,window,n_raw,raw_start,comp_kv,selected_ids,source_rows,selected_rows,s,mode,NULL,comp_cache_mode);
+    if(mode && !ok) attention_register_count(AR_FAILURES);
+    return ok;
+}
 int myds_v41_gpu_attention_direct(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *window,uint32_t n_raw,
     uint32_t raw_start,const myds_metal_buffer_t *comp_kv,const myds_metal_buffer_t *selected_ids,
     uint32_t source_rows,uint32_t selected_rows,myds_v41_gpu_scratch_t *s) {
-    const int mode=myds_v41_gpu_attention_packed_register_enabled();
-    if(mode) attention_register_count(AR_REQUESTS);
-    if(mode<0) {attention_register_count(AR_FAILURES);return 0;}
-    const int ok=attention_direct_impl(heads,sinks,q,window,n_raw,raw_start,comp_kv,selected_ids,source_rows,selected_rows,s,mode,NULL);
-    if(mode && !ok) attention_register_count(AR_FAILURES);
-    return ok;
+    return myds_v41_gpu_attention_direct_mode(heads,sinks,q,window,n_raw,raw_start,comp_kv,selected_ids,source_rows,selected_rows,s,MYDS_KV_COMP_CACHE_BF16);
 }
 
 int myds_v41_gpu_attention_rope_fuse(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
@@ -5245,7 +5390,7 @@ int myds_v41_gpu_attention_rope_fuse(myds_metal_buffer_t *heads,const myds_metal
         if (!rope_consumed) return 0;
         if (!mode && decode_mma > 0 && ordinary_allowed && !trace_on) {
             if (attention_rope_validate(heads,sinks,q,window,n_raw,raw_start,
-                selected_kv,NULL,selected_rows,selected_rows,s,pos,false,true)) {
+                selected_kv,NULL,selected_rows,selected_rows,s,pos,false,true,MYDS_KV_COMP_CACHE_F32)) {
                 pthread_once(&rope_once,init_rope);
                 const struct attention_rope_scope rope={pos,compressed};
                 const int ok=attention_staged_impl(heads,sinks,q,window,n_raw,raw_start,selected_kv,selected_rows,s,2,&rope);
@@ -5259,7 +5404,7 @@ int myds_v41_gpu_attention_rope_fuse(myds_metal_buffer_t *heads,const myds_metal
     }
     attention_rope_count(RF_REQUESTS);
     if (mode<0 || !rope_consumed || !attention_rope_validate(heads,sinks,q,window,n_raw,raw_start,
-        selected_kv,NULL,selected_rows,selected_rows,s,pos,false,false)) return attention_rope_failure();
+        selected_kv,NULL,selected_rows,selected_rows,s,pos,false,false,MYDS_KV_COMP_CACHE_F32)) return attention_rope_failure();
     pthread_once(&rope_once,init_rope);
     const struct attention_rope_scope rope={pos,compressed};
     attention_register_count(AR_REQUESTS);
@@ -5268,11 +5413,12 @@ int myds_v41_gpu_attention_rope_fuse(myds_metal_buffer_t *heads,const myds_metal
     *rope_consumed=true;
     return 1;
 }
-int myds_v41_gpu_attention_direct_rope_fuse(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
+int myds_v41_gpu_attention_direct_rope_fuse_mode(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *window,uint32_t n_raw,
     uint32_t raw_start,const myds_metal_buffer_t *comp_kv,const myds_metal_buffer_t *selected_ids,
     uint32_t source_rows,uint32_t selected_rows,myds_v41_gpu_scratch_t *s,
-    uint32_t pos,bool compressed,bool ordinary_allowed,bool trace_on,bool *rope_consumed) {
+    uint32_t pos,bool compressed,bool ordinary_allowed,bool trace_on,bool *rope_consumed,
+    uint32_t comp_cache_mode) {
     const int mode=myds_v41_attention_rope_fuse_enabled();
     const int decode_mma=myds_v41_gpu_attention_decode_mma_enabled();
     const int kv_reuse_mode=myds_v41_attn_kv_reuse_enabled();
@@ -5287,21 +5433,21 @@ int myds_v41_gpu_attention_direct_rope_fuse(myds_metal_buffer_t *heads,const myd
         if (!rope_consumed) return 0;
         if (!mode && decode_mma > 0 && ordinary_allowed && !trace_on) {
             if (attention_rope_validate(heads,sinks,q,window,n_raw,raw_start,
-                comp_kv,selected_ids,source_rows,selected_rows,s,pos,true,true)) {
+                comp_kv,selected_ids,source_rows,selected_rows,s,pos,true,true,comp_cache_mode)) {
                 pthread_once(&rope_once,init_rope);
                 const struct attention_rope_scope rope={pos,compressed};
-                const int ok=attention_direct_impl(heads,sinks,q,window,n_raw,raw_start,comp_kv,selected_ids,source_rows,selected_rows,s,2,&rope);
+                const int ok=attention_direct_impl(heads,sinks,q,window,n_raw,raw_start,comp_kv,selected_ids,source_rows,selected_rows,s,2,&rope,comp_cache_mode);
                 if (ok) { *rope_consumed=true; return 1; }
                 return 0;
             }
             attention_decode_mma_count(ADM_REQUESTS);
             attention_decode_mma_count(ADM_FALLBACKS);
         }
-        return myds_v41_gpu_attention_direct(heads,sinks,q,window,n_raw,raw_start,comp_kv,selected_ids,source_rows,selected_rows,s);
+        return myds_v41_gpu_attention_direct_mode(heads,sinks,q,window,n_raw,raw_start,comp_kv,selected_ids,source_rows,selected_rows,s,comp_cache_mode);
     }
     attention_rope_count(RF_REQUESTS);
     if (mode<0 || !rope_consumed || !attention_rope_validate(heads,sinks,q,window,n_raw,raw_start,
-        comp_kv,selected_ids,source_rows,selected_rows,s,pos,true,false)) {
+        comp_kv,selected_ids,source_rows,selected_rows,s,pos,true,false,comp_cache_mode)) {
         if (kv_reuse_mode == 1) {
             myds_v41_gpu_attn_kv_reuse_reset(s);
             myds_v41_attn_kv_reuse_record_prestage_failure();
@@ -5311,10 +5457,17 @@ int myds_v41_gpu_attention_direct_rope_fuse(myds_metal_buffer_t *heads,const myd
     pthread_once(&rope_once,init_rope);
     const struct attention_rope_scope rope={pos,compressed};
     attention_register_count(AR_REQUESTS);
-    const int ok=attention_direct_impl(heads,sinks,q,window,n_raw,raw_start,comp_kv,selected_ids,source_rows,selected_rows,s,1,&rope);
+    const int ok=attention_direct_impl(heads,sinks,q,window,n_raw,raw_start,comp_kv,selected_ids,source_rows,selected_rows,s,1,&rope,comp_cache_mode);
     if (!ok) {attention_register_count(AR_FAILURES);return attention_rope_failure();}
     *rope_consumed=true;
     return 1;
+}
+int myds_v41_gpu_attention_direct_rope_fuse(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *window,uint32_t n_raw,
+    uint32_t raw_start,const myds_metal_buffer_t *comp_kv,const myds_metal_buffer_t *selected_ids,
+    uint32_t source_rows,uint32_t selected_rows,myds_v41_gpu_scratch_t *s,
+    uint32_t pos,bool compressed,bool ordinary_allowed,bool trace_on,bool *rope_consumed) {
+    return myds_v41_gpu_attention_direct_rope_fuse_mode(heads,sinks,q,window,n_raw,raw_start,comp_kv,selected_ids,source_rows,selected_rows,s,pos,compressed,ordinary_allowed,trace_on,rope_consumed,MYDS_KV_COMP_CACHE_BF16);
 }
 
 /* 2026-10-24：attention 分段计时的钩子原先只定义在 myds_v41.c 里，

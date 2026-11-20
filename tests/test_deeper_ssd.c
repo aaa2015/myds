@@ -324,11 +324,12 @@ static void test_deeper_prompt_end_snapshot(const char *path) {
             psc[k] = (float)(o * 3001u + k * 19u + 11u);
         }
         const uint32_t r = lk_ratio(o);
+        const size_t kv_u16 = myds_v41_gpu_kv_comp_row_bytes() / sizeof(uint16_t);
         const size_t idx_u16 = myds_v41_gpu_indexer_key_row_bytes() / sizeof(uint16_t);
         uint16_t *c = (uint16_t *)myds_metal_buffer_data(myds_v41_snapshot_get_compressed(g, o));
         uint16_t *x = (uint16_t *)myds_metal_buffer_data(myds_v41_snapshot_get_index_cache(g, o));
         for (uint32_t row = 2048u / r; row < (p_end + r - 1u) / r; ++row) {
-            for (size_t k = 0; k < 512; ++k) c[row * 512 + k] = (uint16_t)(0x5500u + (row * 31u + k) % 256u);
+            for (size_t k = 0; k < kv_u16; ++k) c[row * kv_u16 + k] = (uint16_t)(0x5500u + (row * 31u + k) % 256u);
             for (size_t k = 0; k < idx_u16; ++k) x[row * idx_u16 + k] = (uint16_t)(0xaa00u + (row * 37u + k) % 256u);
         }
     }
@@ -410,11 +411,12 @@ static void test_deeper_anchor_snapshot(const char *path) {
             psc[k] = (float)(o * 3119u + k * 29u + 5u);
         }
         const uint32_t r = lk_ratio(o);
+        const size_t kv_u16 = myds_v41_gpu_kv_comp_row_bytes() / sizeof(uint16_t);
         const size_t idx_u16 = myds_v41_gpu_indexer_key_row_bytes() / sizeof(uint16_t);
         uint16_t *c = (uint16_t *)myds_metal_buffer_data(myds_v41_snapshot_get_compressed(g, o));
         uint16_t *x = (uint16_t *)myds_metal_buffer_data(myds_v41_snapshot_get_index_cache(g, o));
         for (uint32_t row = 2048u / r; row < (p_anchor + r - 1u) / r; ++row) {
-            for (size_t k = 0; k < 512; ++k) c[row * 512 + k] = (uint16_t)(0x6600u + (row * 41u + k) % 256u);
+            for (size_t k = 0; k < kv_u16; ++k) c[row * kv_u16 + k] = (uint16_t)(0x6600u + (row * 41u + k) % 256u);
             for (size_t k = 0; k < idx_u16; ++k) x[row * idx_u16 + k] = (uint16_t)(0xbb00u + (row * 43u + k) % 256u);
         }
     }

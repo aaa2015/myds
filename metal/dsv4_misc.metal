@@ -8889,6 +8889,7 @@ kernel void kernel_dsv41_kv_rope_quant_batch(
             }
         }
     } else if (args.mode == 3u) {
+        uint sc_word = 0u;
         for (uint block = 0; block < 32u; ++block) {
             const uint pair = (block >= 28u) ? ((block - 28u) * 8u + (lane & 15u) / 2u) : 0u;
             const float r_re = simd_shuffle(rotated_re, pair);
@@ -8904,14 +8905,43 @@ kernel void kernel_dsv41_kv_rope_quant_batch(
             }
             const float value = valid ? dsv41_bf16(source) : 0.0f;
             const float amax = simd_max(abs(value));
-            const float scale = dsv4_e4m3fn_dequant(max(amax, 0.01171875f) / 6.0f);
-            const float result = copysign(dsv4_e2m1fn_dequant(abs(value) / scale), value) * scale;
-            if (valid) {
-                const float out_v = dsv41_bf16(result);
-                const ulong idx = base + block * 16u + lane;
-                x[idx] = out_v;
-                if (args.pack_bf16) {
-                    packed_dst[args.dst_offset + idx] = ushort(as_type<uint>(out_v) >> 16u);
+            if (args.pack_bf16 == 2u) {
+                const uint sc_idx = dsv4_e4m3fn_encode_pos(max(amax, 0.01171875f) / 6.0f);
+                const float scale = dsv4_e4m3fn_value(int(sc_idx));
+                const uint mag_idx = valid ? dsv41_e2m1fn_encode_mag(abs(value) / scale) : 0u;
+                const float result = copysign(dsv4_e2m1fn_values[mag_idx], value) * scale;
+                const float out_v = valid ? dsv41_bf16(result) : 0.0f;
+                if (valid) {
+                    const ulong idx = base + block * 16u + lane;
+                    x[idx] = out_v;
+                }
+                const uint sign_bit = (as_type<uint>(out_v) >> 28u) & 8u;
+                const uint code4 = valid ? (sign_bit | mag_idx) : 0u;
+                const uint sub = lane & 7u;
+                uint word = code4 << (sub * 4u);
+                word |= simd_shuffle_xor(word, 1u);
+                word |= simd_shuffle_xor(word, 2u);
+                word |= simd_shuffle_xor(word, 4u);
+                device uint *dst_r = ((device uint *)packed_dst) +
+                    (args.dst_offset + (ulong)group.y) * 72u;
+                if (valid && sub == 0u) {
+                    dst_r[block * 2u + (lane >> 3u)] = word;
+                }
+                const uint bpos = block & 3u;
+                sc_word = (bpos == 0u) ? sc_idx : (sc_word | (sc_idx << (bpos * 8u)));
+                if (lane == 0u && bpos == 3u) {
+                    dst_r[64u + (block >> 2u)] = sc_word;
+                }
+            } else {
+                const float scale = dsv4_e4m3fn_dequant(max(amax, 0.01171875f) / 6.0f);
+                const float result = copysign(dsv4_e2m1fn_dequant(abs(value) / scale), value) * scale;
+                if (valid) {
+                    const float out_v = dsv41_bf16(result);
+                    const ulong idx = base + block * 16u + lane;
+                    x[idx] = out_v;
+                    if (args.pack_bf16 == 1u) {
+                        packed_dst[args.dst_offset + idx] = ushort(as_type<uint>(out_v) >> 16u);
+                    }
                 }
             }
         }

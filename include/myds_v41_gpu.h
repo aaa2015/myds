@@ -71,6 +71,28 @@ int myds_v41_gpu_pack_indexer_fp4(myds_metal_buffer_t *dst, size_t dst_row,
     const myds_metal_buffer_t *src, size_t src_row, uint32_t n_rows);
 int myds_v41_gpu_pack_indexer_key(myds_metal_buffer_t *dst, size_t dst_row,
     const myds_metal_buffer_t *src, size_t src_row, uint32_t n_rows, uint32_t cache_mode);
+
+/* [CAND-KV1] Compressed KV cache storage format (512 elements / row):
+ *   MYDS_KV_COMP_CACHE_F32   = 0u (2048 B/row, reference F32)
+ *   MYDS_KV_COMP_CACHE_BF16  = 2u (1024 B/row, packed BF16, default)
+ *   MYDS_KV_COMP_CACHE_NVFP4 = 3u ( 288 B/row, lossless 0-ULP E2M1FN + E4M3FN) */
+enum {
+    MYDS_KV_COMP_CACHE_F32   = 0u,
+    MYDS_KV_COMP_CACHE_BF16  = 2u,
+    MYDS_KV_COMP_CACHE_NVFP4 = 3u
+};
+#define MYDS_KV_COMP_BF16_ROW_BYTES  1024u
+#define MYDS_KV_COMP_NVFP4_ROW_BYTES  288u
+static inline uint32_t myds_v41_kv_comp_cache_mode_row_bytes(uint32_t cache_mode) {
+    return cache_mode == MYDS_KV_COMP_CACHE_NVFP4 ? MYDS_KV_COMP_NVFP4_ROW_BYTES
+         : (cache_mode == MYDS_KV_COMP_CACHE_BF16 ? MYDS_KV_COMP_BF16_ROW_BYTES
+         : (cache_mode == MYDS_KV_COMP_CACHE_F32 ? 2048u : 0u));
+}
+int myds_v41_gpu_kv_comp_nvfp4_enabled(void);
+uint32_t myds_v41_gpu_kv_comp_cache_mode(void);
+uint32_t myds_v41_gpu_kv_comp_row_bytes(void);
+int myds_v41_gpu_quant_pack_kv_nvfp4(myds_metal_buffer_t *dst, size_t dst_row,
+    myds_metal_buffer_t *src, size_t src_row, uint32_t n_rows);
 /* chunk attention 的运行时几何量（由【配置的上下文】推出，见 scratch_create）。
  * 旧版把键上界写死成 16384，导致「配置 262144、实际 16384 就整个 prefill 失败」
  * （而且注释谎称会回退逐 token，代码里其实是 goto fail）。
@@ -162,6 +184,10 @@ int myds_v41_gpu_indexer_rope_quant_batch_mode(myds_metal_buffer_t *x,
 int myds_v41_gpu_kv_rope_quant_batch(myds_metal_buffer_t *x,
     myds_metal_buffer_t *packed_dst,size_t dst_offset_words,
     uint32_t start_pos,uint32_t rows,uint32_t stride,bool compressed,uint32_t mode);
+int myds_v41_gpu_kv_rope_quant_batch_mode(myds_metal_buffer_t *x,
+    myds_metal_buffer_t *packed_dst,size_t dst_row,
+    uint32_t start_pos,uint32_t rows,uint32_t stride,bool compressed,uint32_t mode,
+    uint32_t cache_mode);
 /* Even positions cache kv/scores; odd positions write the pooled output. */
 int myds_v41_gpu_pool2(myds_metal_buffer_t *out,const myds_metal_buffer_t *kv,
     const myds_metal_buffer_t *scores,myds_metal_buffer_t *previous_kv,
@@ -557,6 +583,9 @@ int myds_v41_gpu_gather(myds_metal_buffer_t *out,const myds_metal_buffer_t *cach
     const myds_metal_buffer_t *ids,uint32_t source_rows,uint32_t selected_rows);
 int myds_v41_gpu_gather_bf16(myds_metal_buffer_t *out,const myds_metal_buffer_t *cache,
     const myds_metal_buffer_t *ids,uint32_t source_rows,uint32_t selected_rows);
+int myds_v41_gpu_gather_mode(myds_metal_buffer_t *out,const myds_metal_buffer_t *cache,
+    const myds_metal_buffer_t *ids,uint32_t source_rows,uint32_t selected_rows,
+    uint32_t cache_mode);
 /* Fixed64 heads, width512, raw ring capacity128, selected_rows<=512.
  * Reference F16 staging + 32-way split-K FlashAttention, no output BF16/RoPE:
  * caller must round then inverse-RoPE the heads at the prescribed boundary. */
@@ -641,17 +670,28 @@ int myds_v41_gpu_attention_direct_rope_fuse(myds_metal_buffer_t *heads,const myd
     uint32_t raw_start,const myds_metal_buffer_t *comp_kv,const myds_metal_buffer_t *selected_ids,
     uint32_t source_rows,uint32_t selected_rows,myds_v41_gpu_scratch_t *scratch,
     uint32_t pos,bool compressed,bool ordinary_allowed,bool trace_on,bool *rope_consumed);
+int myds_v41_gpu_attention_direct_rope_fuse_mode(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *window,uint32_t n_raw,
+    uint32_t raw_start,const myds_metal_buffer_t *comp_kv,const myds_metal_buffer_t *selected_ids,
+    uint32_t source_rows,uint32_t selected_rows,myds_v41_gpu_scratch_t *scratch,
+    uint32_t pos,bool compressed,bool ordinary_allowed,bool trace_on,bool *rope_consumed,
+    uint32_t comp_cache_mode);
 int myds_v41_gpu_attention(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *window,uint32_t n_raw,
     uint32_t raw_start,const myds_metal_buffer_t *selected_kv,uint32_t selected_rows,
     myds_v41_gpu_scratch_t *scratch);
 /* Fused direct attention: single-dispatch vectorized circular window copy and
- * direct BF16->F16 gather, eliminating intermediate selected_kv staging buffer
+ * direct BF16/NVFP4->F16 gather, eliminating intermediate selected_kv staging buffer
  * and reducing decode attention dispatches. */
 int myds_v41_gpu_attention_direct(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *window,uint32_t n_raw,
     uint32_t raw_start,const myds_metal_buffer_t *comp_kv,const myds_metal_buffer_t *selected_ids,
     uint32_t source_rows,uint32_t selected_rows,myds_v41_gpu_scratch_t *scratch);
+int myds_v41_gpu_attention_direct_mode(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *window,uint32_t n_raw,
+    uint32_t raw_start,const myds_metal_buffer_t *comp_kv,const myds_metal_buffer_t *selected_ids,
+    uint32_t source_rows,uint32_t selected_rows,myds_v41_gpu_scratch_t *scratch,
+    uint32_t comp_cache_mode);
 /* 整个 chunk 一次算完的 attention（chunked prefill 用）。 */
 int myds_v41_gpu_attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *chunk_kv,
@@ -659,7 +699,7 @@ int myds_v41_gpu_attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buf
     myds_metal_buffer_t *gathered,
     uint32_t c_len,uint32_t n_comp,uint32_t top_k,
     uint32_t base_pos,uint32_t c_start,uint32_t ratio,myds_v41_gpu_scratch_t *s);
-/* These BF16 variants accept packed uint16 cache/comp_kv values; every other
+/* These BF16/NVFP4 variants accept packed cache/comp_kv values; every other
  * buffer and the arithmetic/reduction order matches the corresponding F32 API. */
 int myds_v41_gpu_attention_chunk_bf16(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *chunk_kv,
@@ -667,6 +707,13 @@ int myds_v41_gpu_attention_chunk_bf16(myds_metal_buffer_t *heads,const myds_meta
     myds_metal_buffer_t *gathered,
     uint32_t c_len,uint32_t n_comp,uint32_t top_k,
     uint32_t base_pos,uint32_t c_start,uint32_t ratio,myds_v41_gpu_scratch_t *s);
+int myds_v41_gpu_attention_chunk_mode(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *chunk_kv,
+    const myds_metal_buffer_t *comp_kv,const myds_metal_buffer_t *ids,
+    myds_metal_buffer_t *gathered,
+    uint32_t c_len,uint32_t n_comp,uint32_t top_k,
+    uint32_t base_pos,uint32_t c_start,uint32_t ratio,myds_v41_gpu_scratch_t *s,
+    uint32_t comp_cache_mode);
 
 /* [CAND-KV2-P1] MYDS_SUFFIX_SHRINK_FINAL_MB_ONLY (default 0, fail-closed). */
 #define MYDS_V41_GPU_HAS_SUFFIX_SHRINK_FINAL_MB 1
@@ -729,4 +776,11 @@ int myds_v41_gpu_attention_chunk_ex(myds_metal_buffer_t *heads,const myds_metal_
     uint32_t c_len,uint32_t n_comp,uint32_t top_k,
     uint32_t base_pos,uint32_t c_start,uint32_t ratio,myds_v41_gpu_scratch_t *s,
     bool comp_bf16,const myds_v41_gpu_attention_chunk_opts_t *opts);
+int myds_v41_gpu_attention_chunk_mode_ex(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
+    const myds_metal_buffer_t *q,const myds_metal_buffer_t *chunk_kv,
+    const myds_metal_buffer_t *comp_kv,const myds_metal_buffer_t *ids,
+    myds_metal_buffer_t *gathered,
+    uint32_t c_len,uint32_t n_comp,uint32_t top_k,
+    uint32_t base_pos,uint32_t c_start,uint32_t ratio,myds_v41_gpu_scratch_t *s,
+    uint32_t comp_cache_mode,const myds_v41_gpu_attention_chunk_opts_t *opts);
 #endif

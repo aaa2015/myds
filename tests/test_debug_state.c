@@ -109,6 +109,7 @@ int main(int argc, char **argv) {
                          strstr(state, "\"prefill_attn_fast\"") &&
                          strstr(state, "\"indexer_decode_mma\"") &&
                          strstr(state, "\"attn_decode_mma\":{\"requests\":") &&
+                         strstr(state, "\"kv_comp_cache\":{\"mode\":") &&
                          strstr(state, "\"d_split\":") &&
                          strstr(state, "\"hc_mix_fast\"") &&
                          strstr(state, "truncated") == NULL;

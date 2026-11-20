@@ -105,14 +105,15 @@ kernel void kernel_myds_attn_gather_window(
 }
 
 /* 每个线程组 = (query q, 第 j 个 pick)，同样 128 线程 × half4。
+ * STORAGE: 0u=F32 (2048 B/row), 1u=BF16 (1024 B/row), 2u=NVFP4 (288 B/row).
  * COMPACT512=true ([P-NEW-3]): 滑窗由 attention 核直读 slab，此处仅紧凑写出
  * 512 个压缩键（stride=512，缩 20% 体积）且不写 mask（全可见无掩码路径）。 */
-template<bool BF16, bool COMPACT512 = false>
+template<uint STORAGE, bool COMPACT512 = false>
 kernel void kernel_myds_attn_gather_comp_storage(
         constant myds_attn_gather_args &args,
         device half          *dst,
         device ushort        *mask,
-        device const char    *comp,     /* n_comp * 512 F32 or packed BF16 */
+        device const char    *comp,     /* n_comp * 512 F32/BF16 or 288 B/row NVFP4 */
         device const int     *ids,      /* rows * top_k */
         ushort2 tgpig [[threadgroup_position_in_grid]],
         ushort  tiitg [[thread_index_in_threadgroup]]) {
@@ -127,27 +128,36 @@ kernel void kernel_myds_attn_gather_comp_storage(
         ? (device half4 *)(dst + ((ulong)q * 512u + j) * 512u)
         : (device half4 *)(dst + ((ulong)q * 640u + 128u + j) * 512u);
     if (vis) {
-        float4 x;
-        if(BF16){
+        if (STORAGE == 2u) {
+            device const uchar *row288 = (device const uchar *)(comp + (ulong)idx * 288u);
+            const ushort packed4 = ((device const ushort *)row288)[tiitg];
+            const half scale = myds_e4m3fn_to_f16(uint(row288[256u + (tiitg >> 2u)]));
+            o[tiitg] = myds_nvfp4_dequant_f16x4(packed4, scale);
+        } else if (STORAGE == 1u) {
             /* Packed views require only ushort alignment, not ushort4 alignment. */
-            device const ushort *s=(device const ushort *)(comp+(ulong)idx*512u*2u)+4u*tiitg;
-            x=as_type<float4>(uint4(s[0],s[1],s[2],s[3])<<16u);
-        }else{
-            device const float4 *s=(device const float4 *)(comp+(ulong)idx*512u*4u);
-            x=s[tiitg];
+            device const ushort *s = (device const ushort *)(comp + (ulong)idx * 512u * 2u) + 4u * tiitg;
+            const float4 x = as_type<float4>(uint4(s[0], s[1], s[2], s[3]) << 16u);
+            o[tiitg] = half4((half)x.x, (half)x.y, (half)x.z, (half)x.w);
+        } else {
+            device const float4 *s = (device const float4 *)(comp + (ulong)idx * 512u * 4u);
+            const float4 x = s[tiitg];
+            o[tiitg] = half4((half)x.x, (half)x.y, (half)x.z, (half)x.w);
         }
-        o[tiitg] = half4((half)x.x, (half)x.y, (half)x.z, (half)x.w);
     } else {
         o[tiitg] = half4(0.0h);
     }
     if (!COMPACT512 && tiitg == 0u) mask[(ulong)q * args.mask_stride + 128u + j] = vis ? 0u : 0xfc00u;
 }
-typedef decltype(kernel_myds_attn_gather_comp_storage<false, false>) myds_attn_gather_comp_t;
+typedef decltype(kernel_myds_attn_gather_comp_storage<0u, false>) myds_attn_gather_comp_t;
 template [[host_name("kernel_myds_attn_gather_comp")]]
-kernel myds_attn_gather_comp_t kernel_myds_attn_gather_comp_storage<false, false>;
+kernel myds_attn_gather_comp_t kernel_myds_attn_gather_comp_storage<0u, false>;
 template [[host_name("kernel_myds_attn_gather_comp_bf16")]]
-kernel myds_attn_gather_comp_t kernel_myds_attn_gather_comp_storage<true, false>;
+kernel myds_attn_gather_comp_t kernel_myds_attn_gather_comp_storage<1u, false>;
+template [[host_name("kernel_myds_attn_gather_comp_nvfp4")]]
+kernel myds_attn_gather_comp_t kernel_myds_attn_gather_comp_storage<2u, false>;
 template [[host_name("kernel_myds_attn_gather_comp_512")]]
-kernel myds_attn_gather_comp_t kernel_myds_attn_gather_comp_storage<false, true>;
+kernel myds_attn_gather_comp_t kernel_myds_attn_gather_comp_storage<0u, true>;
 template [[host_name("kernel_myds_attn_gather_comp_512_bf16")]]
-kernel myds_attn_gather_comp_t kernel_myds_attn_gather_comp_storage<true, true>;
+kernel myds_attn_gather_comp_t kernel_myds_attn_gather_comp_storage<1u, true>;
+template [[host_name("kernel_myds_attn_gather_comp_512_nvfp4")]]
+kernel myds_attn_gather_comp_t kernel_myds_attn_gather_comp_storage<2u, true>;

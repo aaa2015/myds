@@ -1436,13 +1436,14 @@ static void lk_fill_state(myds_v41_context_t *g) {
 
 static void lk_simulate_decode(myds_v41_context_t *g) {
     const uint32_t q0 = LK_NTOK - 1u;
+    const size_t kv_u16 = myds_v41_gpu_kv_comp_row_bytes() / sizeof(uint16_t);
     const size_t idx_u16 = myds_v41_gpu_indexer_key_row_bytes() / sizeof(uint16_t);
     for (uint32_t o = 0; o < 4; o++) {
         const uint32_t r = lk_ratio(o);
         const uint32_t first = (r == 1u) ? q0 : ((q0 | 1u) - 1u) / 2u;   /* 第一个奇数 q >= q0 写的行 */
         uint16_t *c = myds_metal_buffer_data(myds_v41_snapshot_get_compressed(g, o));
         const size_t nc = myds_metal_buffer_size(myds_v41_snapshot_get_compressed(g, o)) / sizeof(uint16_t);
-        for (size_t k = (size_t)first * 512u; k < nc; k++) c[k] = 0x461cu;
+        for (size_t k = (size_t)first * kv_u16; k < nc; k++) c[k] = 0x461cu;
         uint16_t *x = myds_metal_buffer_data(myds_v41_snapshot_get_index_cache(g, o));
         const size_t nx = myds_metal_buffer_size(myds_v41_snapshot_get_index_cache(g, o)) / sizeof(uint16_t);
         for (size_t k = (size_t)first * idx_u16; k < nx; k++) x[k] = 0x461cu;
@@ -1536,9 +1537,10 @@ static void test_p2_lowkv_async_bit_identical(void) {
 
 static uint64_t lk_expected_segment_bytes(uint32_t start, uint32_t end) {
     uint64_t bytes = 64;
+    const uint64_t kv_row_bytes = (uint64_t)myds_v41_gpu_kv_comp_row_bytes();
     const uint64_t idx_row_bytes = (uint64_t)myds_v41_gpu_indexer_key_row_bytes();
     for (uint32_t o = 0; o < 4; ++o)
-        bytes += (uint64_t)((end - start) / lk_ratio(o)) * (512ull * sizeof(uint16_t) + idx_row_bytes);
+        bytes += (uint64_t)((end - start) / lk_ratio(o)) * (kv_row_bytes + idx_row_bytes);
     return bytes;
 }
 
@@ -1613,13 +1615,14 @@ static void lk_assert_restored(myds_v41_context_t *g, uint32_t end, bool forked)
             assert(window[k] == expected + (forked && end > 1024u ? 32.0f : 0.0f));
         }
     }
+    const size_t kv_u16 = myds_v41_gpu_kv_comp_row_bytes() / sizeof(uint16_t);
     const size_t idx_u16 = myds_v41_gpu_indexer_key_row_bytes() / sizeof(uint16_t);
     for (uint32_t o = 0; o < 4; ++o) {
         const uint16_t *c = myds_metal_buffer_data(myds_v41_snapshot_get_compressed(g, o));
         const uint16_t *x = myds_metal_buffer_data(myds_v41_snapshot_get_index_cache(g, o));
-        for (size_t k = 0; k < (size_t)(end / lk_ratio(o)) * 512u; ++k) {
+        for (size_t k = 0; k < (size_t)(end / lk_ratio(o)) * kv_u16; ++k) {
             uint16_t expected = (uint16_t)(0x3f00u + ((o * 7919u + k) % 1024u));
-            if (forked && k >= (size_t)(1024u / lk_ratio(o)) * 512u) expected ^= 0x0040u;
+            if (forked && k >= (size_t)(1024u / lk_ratio(o)) * kv_u16) expected ^= 0x0040u;
             assert(c[k] == expected);
         }
         for (size_t k = 0; k < (size_t)(end / lk_ratio(o)) * idx_u16; ++k) {
@@ -1635,12 +1638,13 @@ static void lk_assert_restored(myds_v41_context_t *g, uint32_t end, bool forked)
 }
 
 static void lk_make_fork_state(myds_v41_context_t *g) {
+    const size_t kv_u16 = myds_v41_gpu_kv_comp_row_bytes() / sizeof(uint16_t);
     const size_t idx_u16 = myds_v41_gpu_indexer_key_row_bytes() / sizeof(uint16_t);
     for (uint32_t o = 0; o < 4; ++o) {
         uint16_t *c = myds_metal_buffer_data(myds_v41_snapshot_get_compressed(g, o));
         uint16_t *x = myds_metal_buffer_data(myds_v41_snapshot_get_index_cache(g, o));
         const size_t rows = LK_NTOK / lk_ratio(o), first = 1024u / lk_ratio(o);
-        for (size_t k = first * 512u; k < rows * 512u; ++k) c[k] ^= 0x0040u;
+        for (size_t k = first * kv_u16; k < rows * kv_u16; ++k) c[k] ^= 0x0040u;
         for (size_t k = first * idx_u16; k < rows * idx_u16; ++k) x[k] ^= 0x0040u;
     }
     myds_v41_snapshot_set_engram_history(g, 404, 505, 606);

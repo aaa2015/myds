@@ -2226,9 +2226,12 @@ static bool decode_layer_buffers_valid(const myds_context_t *ctx,
             const uint32_t idx_mode = args->index_cache_mode
                 ? args->index_cache_mode : MYDS_INDEXER_CACHE_BF16;
             const uint32_t idx_row_bytes = myds_v41_indexer_cache_mode_row_bytes(idx_mode);
-            if (!idx_row_bytes) return false;
+            const uint32_t kv_mode = args->kv_comp_cache_mode
+                ? args->kv_comp_cache_mode : MYDS_KV_COMP_CACHE_BF16;
+            const uint32_t kv_row_bytes = myds_v41_kv_comp_cache_mode_row_bytes(kv_mode);
+            if (!idx_row_bytes || !kv_row_bytes) return false;
             const size_t rows = count > 0u ? (size_t)count : 1u;
-            ADD_SPAN(args->compressed_kv, rows * 1024u);
+            ADD_SPAN(args->compressed_kv, rows * kv_row_bytes);
             ADD_SPAN(args->index_cache, rows * idx_row_bytes);
         }
         if (is_idx && count > 0u) {
@@ -2313,9 +2316,15 @@ static int ref_publish_compressor_decode(const myds_context_t *ctx,
         if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(args->latent);
         CHECK(myds_v41_gpu_rope(args->latent, 512u, 1u, start, true, false));
         if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(args->latent);
-        CHECK(myds_v41_gpu_quant(args->latent, 512u, 1u, 3u));
-        if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(args->latent);
-        CHECK(myds_v41_gpu_pack_bf16(args->compressed_kv, (size_t)(count - 1u) * 512u, args->latent, 0, 512u));
+        const uint32_t kv_mode = args->kv_comp_cache_mode
+            ? args->kv_comp_cache_mode : MYDS_KV_COMP_CACHE_BF16;
+        if (kv_mode == MYDS_KV_COMP_CACHE_NVFP4) {
+            CHECK(myds_v41_gpu_quant_pack_kv_nvfp4(args->compressed_kv, (size_t)(count - 1u), args->latent, 0, 1u));
+        } else {
+            CHECK(myds_v41_gpu_quant(args->latent, 512u, 1u, 3u));
+            if (!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(args->latent);
+            CHECK(myds_v41_gpu_pack_bf16(args->compressed_kv, (size_t)(count - 1u) * 512u, args->latent, 0, 512u));
+        }
         if (!myds_metal_get_auto_barrier()) {
             const myds_metal_buffer_t *comp_out[] = { args->index_cache, args->compressed_kv };
             myds_metal_barrier_buffers(comp_out, 2);
@@ -2806,17 +2815,25 @@ int myds_v41_decode_attn_indexer_scoped(myds_context_t *ctx,
                 0u, 4u * 512u, true));
         }
         myds_metal_barrier_buffers(commit_deps, 2);
+        const uint32_t idx_mode = args->index_cache_mode
+            ? args->index_cache_mode : MYDS_INDEXER_CACHE_BF16;
+        const uint32_t kv_mode = args->kv_comp_cache_mode
+            ? args->kv_comp_cache_mode : MYDS_KV_COMP_CACHE_BF16;
         STAGE_CHECK(myds_v41_gpu_indexer_rope_quant(args->index_k_buf, 1u, start));
-        STAGE_CHECK(myds_v41_gpu_quant(args->latent, 512u, 1u, 3u));
+        if (kv_mode == MYDS_KV_COMP_CACHE_NVFP4) {
+            STAGE_CHECK(myds_v41_gpu_quant_pack_kv_nvfp4(args->compressed_kv, (size_t)(count - 1u), args->latent, 0, 1u));
+        } else {
+            STAGE_CHECK(myds_v41_gpu_quant(args->latent, 512u, 1u, 3u));
+        }
         if (defer_idx_qb) {
             STAGE_CHECK(myds_metal_dense_q4_v41_qb_slice(ctx->q, base->attn_q_b, ctx->qr_norm,
                 4u * 512u, 6u * 512u, false));
         }
-        const uint32_t idx_mode = args->index_cache_mode
-            ? args->index_cache_mode : MYDS_INDEXER_CACHE_BF16;
         myds_metal_barrier_buffers(commit_deps, 2);
         STAGE_CHECK(myds_v41_gpu_pack_indexer_key(args->index_cache, (size_t)(count - 1u), args->index_k_buf, 0, 1u, idx_mode));
-        STAGE_CHECK(myds_v41_gpu_pack_bf16(args->compressed_kv, (size_t)(count - 1u) * 512u, args->latent, 0, 512u));
+        if (kv_mode != MYDS_KV_COMP_CACHE_NVFP4) {
+            STAGE_CHECK(myds_v41_gpu_pack_bf16(args->compressed_kv, (size_t)(count - 1u) * 512u, args->latent, 0, 512u));
+        }
         if (defer_idx_qb) {
             STAGE_CHECK(myds_metal_dense_q4_v41_qb_slice(ctx->q, base->attn_q_b, ctx->qr_norm,
                 10u * 512u, 6u * 512u, false));

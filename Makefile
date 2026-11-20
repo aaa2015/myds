@@ -172,6 +172,7 @@ TEST_INDEXER_DECODE_COMPACT = $(BIN_DIR)/test_indexer_decode_compact
 TEST_INDEXER_PREFILL_COMPACT = $(BIN_DIR)/test_indexer_prefill_compact
 TEST_INDEXER_TOPK_RADIX_PT1 = $(BIN_DIR)/test_indexer_topk_radix_pt1
 TEST_INDEXER_KEY_FP4 = $(BIN_DIR)/test_indexer_key_fp4
+TEST_KV_COMP_NVFP4 = $(BIN_DIR)/test_kv_comp_nvfp4
 TEST_INDEXER_DECODE_MMA = $(BIN_DIR)/test_indexer_decode_mma
 TEST_ATTN_DECODE_MMA = $(BIN_DIR)/test_attention_decode_mma
 TEST_DECODE_TOPK_FAST = $(BIN_DIR)/test_decode_topk_fast
@@ -185,6 +186,7 @@ ALL_TESTS += $(TEST_INDEXER_DECODE_COMPACT)
 ALL_TESTS += $(TEST_INDEXER_PREFILL_COMPACT)
 ALL_TESTS += $(TEST_INDEXER_TOPK_RADIX_PT1)
 ALL_TESTS += $(TEST_INDEXER_KEY_FP4)
+ALL_TESTS += $(TEST_KV_COMP_NVFP4)
 ALL_TESTS += $(TEST_INDEXER_DECODE_MMA)
 ALL_TESTS += $(TEST_ATTN_DECODE_MMA)
 ALL_TESTS += $(TEST_SUFFIX_SHRINK_FINAL_MB)
@@ -212,6 +214,9 @@ $(TEST_INDEXER_TOPK_RADIX_PT1): tests/test_indexer_topk_radix_pt1.m $(BUILD_DIR)
 	$(CC) $(OBJCFLAGS) -Iinclude -o $@ $< $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS)
 
 $(TEST_INDEXER_KEY_FP4): tests/test_indexer_key_fp4.m $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) -Iinclude -o $@ $< $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS)
+
+$(TEST_KV_COMP_NVFP4): tests/test_kv_comp_nvfp4.m $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Iinclude -o $@ $< $(filter-out $(BUILD_DIR)/main.o,$(OBJS_C)) $(OBJS_M) $(LDFLAGS)
 
 $(TEST_INDEXER_DECODE_MMA): tests/test_indexer_decode_mma.m $(BUILD_DIR)/myds_v41_gpu.o $(BUILD_DIR)/myds_metal.o $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
@@ -1106,6 +1111,8 @@ test: check-knobs $(ALL_TESTS) $(METALLIB)
 	@./$(TEST_INDEXER_PREFILL_COMPACT)
 	@./$(TEST_INDEXER_TOPK_RADIX_PT1)
 	@./$(TEST_INDEXER_KEY_FP4)
+	@./$(TEST_KV_COMP_NVFP4)
+	@MYDS_ATTN_ROPE_FUSE=1 MYDS_ATTN_DIRECT_PACK_FUSE=1 ./$(TEST_KV_COMP_NVFP4) --pack-fuse-only
 	@./$(TEST_ATTN_DECODE_MMA)
 	@./$(TEST_DECODE_TOPK_FAST)
 	@./$(TEST_DECODE_IQ2_FAST)

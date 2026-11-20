@@ -310,6 +310,163 @@ kernel void kernel_dsv41_pack_indexer_fp4(
         dst_r[16] = sc_pack;
     }
 }
+
+// Lossless 0-ULP NVFP4 (E2M1FN + E4M3FN, 288 B/row, 32-byte aligned) Compressed KV Cache helpers.
+// Row layout (288 bytes = 72 x uint32_t = 9 x 32 bytes):
+//   bytes [  0..255] (words [ 0..63]): 512 linear little-endian 4-bit code4 nibbles
+//                                      ((sign << 3) | mag_idx in 0..7);
+//                                      block b in [0..31] occupies 8 B (uint2 = words [2b, 2b+1]).
+//   bytes [256..287] (words [64..71]): 32 x uint8_t E4M3FN positive scale codes (0..126).
+static inline uint dsv4_e4m3fn_encode_pos(float x) {
+    const float ax = min(abs(x), 448.0f);
+    int lo = 0;
+    int hi = 126;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (dsv4_e4m3fn_value(mid) <= ax) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    int best = lo;
+    if (best < 126) {
+        const float best_diff = abs(ax - dsv4_e4m3fn_value(best));
+        const float next_diff = abs(ax - dsv4_e4m3fn_value(best + 1));
+        if (next_diff < best_diff ||
+            (next_diff == best_diff && ((best + 1) & 1) == 0 && (best & 1) != 0)) {
+            best = best + 1;
+        }
+    }
+    return uint(best);
+}
+
+static inline float myds_e4m3fn_to_f32(uint sc) {
+    const uint s = sc & 0x7fu;
+    const float norm = as_type<float>(0x3c000000u + (s << 20u));
+    const float sub  = float(s) * 0.001953125f;
+    return select(norm, sub, s < 8u);
+}
+
+static inline half myds_e4m3fn_to_f16(uint sc) {
+    const uint s = sc & 0x7fu;
+    const half norm = as_type<half>(ushort(0x2000u + (s << 7u)));
+    const half sub  = half(s) * half(0.001953125h);
+    return select(norm, sub, s < 8u);
+}
+
+static inline float myds_nvfp4_dequant_f32(uint code4, float scale) {
+    #pragma clang fp contract(off)
+    const uint mag = code4 & 7u;
+    const uint sign_u32 = (code4 & 8u) << 28u;
+    const uint m = select(mag, 0u, mag == 1u);
+    const float prod = as_type<float>(0x3f000000u + (m << 22u)) * scale;
+    const uint abs_bits = select(as_type<uint>(prod), 0u, mag == 0u);
+    return as_type<float>(sign_u32 | abs_bits);
+}
+
+static inline half myds_nvfp4_dequant_f16(uint code4, half scale) {
+    #pragma clang fp contract(off)
+    const uint mag = code4 & 7u;
+    const ushort sign_u16 = ushort((code4 & 8u) << 12u);
+    const uint m = select(mag, 0u, mag == 1u);
+    const half prod = as_type<half>(ushort(0x3800u + (m << 9u))) * scale;
+    const ushort abs_bits = select(as_type<ushort>(prod), ushort(0u), mag == 0u);
+    return as_type<half>(ushort(sign_u16 | abs_bits));
+}
+
+static inline half4 myds_nvfp4_dequant_f16x4(ushort packed4, half scale) {
+    return half4(
+        myds_nvfp4_dequant_f16(uint(packed4) & 0xfu, scale),
+        myds_nvfp4_dequant_f16((uint(packed4) >> 4u) & 0xfu, scale),
+        myds_nvfp4_dequant_f16((uint(packed4) >> 8u) & 0xfu, scale),
+        myds_nvfp4_dequant_f16((uint(packed4) >> 12u) & 0xfu, scale));
+}
+
+struct dsv41_pack_kv_nvfp4_args {
+    ulong dst_row, src_row;
+    uint n_rows, pad;
+};
+// Fused mode-3 (E2M1FN + E4M3FN) quantize in-place on src + 288 B/row NVFP4 pack to dst.
+// Grid = (8, n_rows, 1), Threads = (128, 1, 1): 4 SIMDGs per TG own 4 consecutive 16-elem
+// blocks so every global store (nibbles and packed 4-byte scale words) is 32-bit aligned.
+kernel void kernel_dsv41_quant_pack_kv_nvfp4(
+        constant dsv41_pack_kv_nvfp4_args &args [[buffer(0)]],
+        device float *src                       [[buffer(1)]],
+        device uint  *dst                       [[buffer(2)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint  tiitg [[thread_index_in_threadgroup]],
+        uint  lane  [[thread_index_in_simdgroup]]) {
+    if (group.x >= 8u || group.y >= args.n_rows) return;
+    threadgroup uint tg_sc[4];
+    const uint sg = tiitg >> 5u;
+    const uint block = group.x * 4u + sg;
+    const bool valid = lane < 16u;
+    const ulong idx = (args.src_row + (ulong)group.y) * 512u + (ulong)block * 16u + lane;
+    const float value = valid ? dsv41_bf16(src[idx]) : 0.0f;
+    const float amax = simd_max(abs(value));
+    const uint sc_idx = dsv4_e4m3fn_encode_pos(max(amax, 0.01171875f) / 6.0f);
+    const float scale = dsv4_e4m3fn_value(int(sc_idx));
+    const uint mag_idx = valid ? dsv41_e2m1fn_encode_mag(abs(value) / scale) : 0u;
+    const float result = copysign(dsv4_e2m1fn_values[mag_idx], value) * scale;
+    const float out_v = valid ? dsv41_bf16(result) : 0.0f;
+    if (valid) {
+        src[idx] = out_v;
+    }
+    const uint sign_bit = (as_type<uint>(out_v) >> 28u) & 8u;
+    const uint code4 = valid ? (sign_bit | mag_idx) : 0u;
+    const uint sub = lane & 7u;
+    uint word = code4 << (sub * 4u);
+    word |= simd_shuffle_xor(word, 1u);
+    word |= simd_shuffle_xor(word, 2u);
+    word |= simd_shuffle_xor(word, 4u);
+    device uint *dst_r = dst + (args.dst_row + (ulong)group.y) * 72u;
+    if (valid && sub == 0u) {
+        dst_r[block * 2u + (lane >> 3u)] = word;
+    }
+    if (lane == 0u) {
+        tg_sc[sg] = sc_idx;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiitg == 0u) {
+        dst_r[64u + group.x] =
+            tg_sc[0] | (tg_sc[1] << 8u) | (tg_sc[2] << 16u) | (tg_sc[3] << 24u);
+    }
+}
+
+kernel void kernel_dsv41_stage_nvfp4_f16(
+        constant uint &n_rows,
+        device const uchar *src,
+        device half *dst,
+        uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= 128u || gid.y >= n_rows) return;
+    device const uchar *row288 = src + (ulong)gid.y * 288u;
+    const ushort packed4 = ((device const ushort *)row288)[gid.x];
+    const half scale = myds_e4m3fn_to_f16(uint(row288[256u + (gid.x >> 2u)]));
+    ((device half4 *)(dst + (ulong)gid.y * 512u))[gid.x] = myds_nvfp4_dequant_f16x4(packed4, scale);
+}
+
+kernel void kernel_dsv41_get_rows_nvfp4(
+        constant uint2 &args,
+        device const uchar *src, device const int *ids, device float *dst,
+        uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= 128u || gid.y >= args.y) return;
+    const int row = ids[gid.y];
+    device float4 *dst4 = (device float4 *)(dst + (ulong)gid.y * 512u);
+    if (row >= 0 && uint(row) < args.x) {
+        device const uchar *row288 = src + (ulong)row * 288u;
+        const ushort p = ((device const ushort *)row288)[gid.x];
+        const float scale = myds_e4m3fn_to_f32(uint(row288[256u + (gid.x >> 2u)]));
+        dst4[gid.x] = float4(
+            myds_nvfp4_dequant_f32(uint(p) & 0xfu, scale),
+            myds_nvfp4_dequant_f32((uint(p) >> 4u) & 0xfu, scale),
+            myds_nvfp4_dequant_f32((uint(p) >> 8u) & 0xfu, scale),
+            myds_nvfp4_dequant_f32((uint(p) >> 12u) & 0xfu, scale));
+    } else {
+        dst4[gid.x] = float4(0.0f);
+    }
+}
+
 kernel void kernel_dsv41_stage_bf16_f16(
         constant uint &count,
         device const ushort *src, device half *dst,
@@ -405,6 +562,54 @@ kernel void kernel_myds_dsv41_direct_pack_fuse(
                 as_type<float>(uint(u.w)<<16u));
             dst4[gid.x]=half4(f);
         } else dst4[gid.x]=half4(0.0h);
+    }
+}
+
+kernel void kernel_dsv41_get_rows_nvfp4_to_f16(
+        constant dsv41_get_rows_bf16_f16_args &args,
+        device const uchar *src,
+        device const int *ids,
+        device half *dst,
+        uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= 128u || gid.y >= args.selected_rows) return;
+    const int row = ids[gid.y];
+    const ulong dst_row = (ulong)(args.dst_row_offset + gid.y);
+    device half4 *dst4 = (device half4 *)(dst + dst_row * 512u);
+    if (row >= 0 && uint(row) < args.source_rows) {
+        device const uchar *row288 = src + (ulong)row * 288u;
+        const ushort packed4 = ((device const ushort *)row288)[gid.x];
+        const half scale = myds_e4m3fn_to_f16(uint(row288[256u + (gid.x >> 2u)]));
+        dst4[gid.x] = myds_nvfp4_dequant_f16x4(packed4, scale);
+    } else {
+        dst4[gid.x] = half4(0.0h);
+    }
+}
+
+kernel void kernel_myds_dsv41_direct_pack_fuse_nvfp4(
+        constant myds_dsv41_direct_pack_args &args,
+        device const float *window,
+        device const uchar *src,
+        device const int *ids,
+        device half *dst,
+        uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= 128u || gid.y >= args.n_raw + args.selected_rows) return;
+    if (gid.y < args.n_raw) {
+        const uint src_row = (args.raw_start + gid.y) % 128u;
+        device const float4 *w4 = (device const float4 *)(window + (ulong)src_row * 512u);
+        device half4 *dst4 = (device half4 *)(dst + (ulong)gid.y * 512u);
+        dst4[gid.x] = half4(w4[gid.x]);
+    } else {
+        const uint selected = gid.y - args.n_raw;
+        const int row = ids[selected];
+        device half4 *dst4 = (device half4 *)(dst + (ulong)gid.y * 512u);
+        if (row >= 0 && uint(row) < args.source_rows) {
+            device const uchar *row288 = src + (ulong)row * 288u;
+            const ushort packed4 = ((device const ushort *)row288)[gid.x];
+            const half scale = myds_e4m3fn_to_f16(uint(row288[256u + (gid.x >> 2u)]));
+            dst4[gid.x] = myds_nvfp4_dequant_f16x4(packed4, scale);
+        } else {
+            dst4[gid.x] = half4(0.0h);
+        }
     }
 }
 

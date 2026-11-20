@@ -345,6 +345,7 @@ int main(int argc, char *argv[]) {
     if (myds_metal_f16_gemv_bf16_fuse_parse_mode() < 0) return 1;
     if (myds_metal_indexer_rope_quant_fuse_parse_mode() < 0) return 1;
     if (myds_v41_gpu_indexer_key_fp4_enabled() < 0) return 1;
+    if (myds_v41_gpu_kv_comp_nvfp4_enabled() < 0) return 1;
     if (myds_v41_gpu_indexer_decode_mma_enabled() < 0) return 1;
     if (myds_v41_gpu_attention_decode_mma_enabled() < 0) return 1;
     if (myds_metal_hc_mix_fast_parse_mode() < 0) return 1;
