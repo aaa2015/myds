@@ -131,6 +131,75 @@ int myds_v41_gpu_topk_compact_decode(myds_metal_buffer_t *ids,
     stub_qb_done = 64u;
     return record("topk_compact_decode");
 }
+int myds_v41_gpu_decode_topk_fast_enabled(void) { return 0; }
+bool myds_v41_gpu_topk_l20_self_compact_eligible(const myds_v41_gpu_scratch_t *s, uint32_t n_comp) {
+    (void)s; (void)n_comp; return false;
+}
+int myds_v41_gpu_l20_decode_candidates_nan(myds_metal_buffer_t *blocks,
+    const myds_metal_buffer_t *scores, uint32_t width, uint32_t pos,
+    uint32_t ratio, myds_v41_gpu_scratch_t *s) {
+    (void)blocks; (void)scores; (void)width; (void)pos; (void)ratio; (void)s;
+    return record("l20_decode_candidates_nan");
+}
+int myds_v41_gpu_topk_l20_self_compact_decode(myds_metal_buffer_t *ids,
+    const myds_metal_buffer_t *dense_scores, uint32_t n_comp, myds_v41_gpu_scratch_t *s) {
+    (void)ids; (void)dense_scores; (void)n_comp; (void)s;
+    stub_qb_done = 64u;
+    return record("topk_l20_self_compact_decode");
+}
+int myds_v41_gpu_decode_topk_fused_enabled(void) {
+    const char *v = getenv("MYDS_INDEXER_DECODE_TOPK_FUSED");
+    if (!v || strcmp(v, "0") == 0) return 0;
+    if (strcmp(v, "1") == 0) return 1;
+    return -1;
+}
+void myds_v41_gpu_decode_topk_fused_record_fallback(void) {}
+bool myds_v41_gpu_decode_topk_fused_root_eligible(const myds_v41_gpu_scratch_t *s,
+    uint32_t n_comp, uint32_t cache_mode, bool has_mask) {
+    (void)cache_mode; (void)has_mask;
+    return s != NULL && n_comp >= 8192u && myds_v41_gpu_decode_topk_fused_enabled() == 1;
+}
+bool myds_v41_gpu_decode_topk_fused_l20_eligible(const myds_v41_gpu_scratch_t *s,
+    uint32_t n_comp, uint32_t cache_mode, uint32_t pos, uint32_t ratio) {
+    (void)cache_mode; (void)pos; (void)ratio;
+    return s != NULL && n_comp > 16384u && myds_v41_gpu_decode_topk_fused_enabled() == 1;
+}
+const myds_metal_buffer_t *myds_v41_gpu_scratch_decode_topk_hist(const myds_v41_gpu_scratch_t *s) {
+    (void)s; return &buffers[132];
+}
+const myds_metal_buffer_t *myds_v41_gpu_scratch_decode_topk_meta(const myds_v41_gpu_scratch_t *s) {
+    (void)s; return &buffers[133];
+}
+const myds_metal_buffer_t *myds_v41_gpu_scratch_decode_topk_subhist(const myds_v41_gpu_scratch_t *s) {
+    (void)s; return &buffers[134];
+}
+const myds_metal_buffer_t *myds_v41_gpu_scratch_l20_nan_flags(const myds_v41_gpu_scratch_t *s) {
+    (void)s; return &buffers[135];
+}
+int myds_v41_gpu_indexscores_fused_decode_mode(myds_v41_gpu_scratch_t *s,
+    myds_metal_buffer_t *scores, myds_metal_buffer_t *blocks,
+    const myds_metal_buffer_t *q, const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *cache, const myds_metal_buffer_t *mask,
+    uint32_t n_comp, uint32_t cache_mode, uint32_t first_row,
+    uint32_t visible, bool l20_mode) {
+    (void)s; (void)scores; (void)blocks; (void)q; (void)weights; (void)cache;
+    (void)mask; (void)n_comp; (void)cache_mode; (void)first_row; (void)visible;
+    return record(l20_mode ? "indexscores_fused_l20" : "indexscores_fused_root");
+}
+int myds_v41_gpu_topk_fused_decode(myds_v41_gpu_scratch_t *s,
+    myds_metal_buffer_t *ids, const myds_metal_buffer_t *scores,
+    uint32_t n_cols, uint32_t top, bool write_l20_extras, uint32_t l20_n_comp) {
+    (void)s; (void)ids; (void)scores; (void)n_cols; (void)top;
+    if (write_l20_extras) stub_compact_prepared_count = l20_n_comp;
+    stub_qb_done = 64u;
+    return record(write_l20_extras ? "topk_fused_l20_blocks" : "topk_fused_root");
+}
+int myds_v41_gpu_topk_l20_fused_self_compact_decode(myds_metal_buffer_t *ids,
+    const myds_metal_buffer_t *dense_scores, uint32_t n_comp, myds_v41_gpu_scratch_t *s) {
+    (void)ids; (void)dense_scores; (void)n_comp; (void)s;
+    stub_qb_done = 64u;
+    return record("topk_l20_fused_self_compact_decode");
+}
 static int kv_reuse = 0;
 int myds_v41_attn_kv_reuse_enabled(void) { return kv_reuse; }
 void myds_v41_attn_kv_reuse_record_prestage_failure(void) {}
@@ -158,6 +227,12 @@ void myds_v41_gpu_attn_kv_reuse_bind_topk_qb(myds_v41_gpu_scratch_t *s,
     (void)s; (void)qb_weight; (void)qb_input; (void)pos;
     stub_qb_done = qb_done_heads ? 64u : 0u;
     record("bind_topk_qb");
+}
+void myds_v41_gpu_attn_kv_reuse_rebind_topk_qb(myds_v41_gpu_scratch_t *s,
+    const myds_metal_buffer_t *qb_weight, const myds_metal_buffer_t *qb_input,
+    uint32_t pos) {
+    (void)s; (void)qb_weight; (void)qb_input; (void)pos;
+    record("rebind_topk_qb");
 }
 uint32_t myds_v41_gpu_attn_kv_reuse_qb_done(const myds_v41_gpu_scratch_t *s) {
     (void)s;

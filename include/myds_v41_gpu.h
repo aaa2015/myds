@@ -328,6 +328,52 @@ int myds_v41_gpu_l20_decode_candidates_nan(myds_metal_buffer_t *blocks,
 int myds_v41_gpu_topk_l20_self_compact_decode(myds_metal_buffer_t *ids,
     const myds_metal_buffer_t *dense_scores, uint32_t n_comp,
     myds_v41_gpu_scratch_t *scratch);
+/* [D-I2] Strict 0-ULP (vs Arm C [D-I1]) Fused Decode Indexer Score + 256-bin
+ * Histogram + L20 block_max + 2-Pass Decode Top-K (MYDS_INDEXER_DECODE_TOPK_FUSED:
+ * absent/0=off, 1=on, else -1 fail-closed). */
+#define MYDS_V41_GPU_HAS_DECODE_TOPK_FUSED 1
+int myds_v41_gpu_decode_topk_fused_enabled(void);
+typedef struct {
+    uint64_t requests;
+    uint64_t root_encoded;
+    uint64_t l20_encoded;
+    uint64_t fallbacks;
+    uint64_t failures;
+} myds_v41_gpu_decode_topk_fused_counters_t;
+void myds_v41_gpu_decode_topk_fused_counters(
+    myds_v41_gpu_decode_topk_fused_counters_t *out, bool reset);
+void myds_v41_gpu_decode_topk_fused_record_fallback(void);
+bool myds_v41_gpu_decode_topk_fused_root_eligible(
+    const myds_v41_gpu_scratch_t *scratch, uint32_t n_comp,
+    uint32_t cache_mode, bool has_mask);
+bool myds_v41_gpu_decode_topk_fused_l20_eligible(
+    const myds_v41_gpu_scratch_t *scratch, uint32_t n_comp,
+    uint32_t cache_mode, uint32_t pos, uint32_t ratio);
+const myds_metal_buffer_t *myds_v41_gpu_scratch_decode_topk_hist(
+    const myds_v41_gpu_scratch_t *scratch);
+const myds_metal_buffer_t *myds_v41_gpu_scratch_decode_topk_meta(
+    const myds_v41_gpu_scratch_t *scratch);
+const myds_metal_buffer_t *myds_v41_gpu_scratch_decode_topk_subhist(
+    const myds_v41_gpu_scratch_t *scratch);
+const myds_metal_buffer_t *myds_v41_gpu_scratch_l20_nan_flags(
+    const myds_v41_gpu_scratch_t *scratch);
+int myds_v41_gpu_indexscores_fused_decode_mode(myds_v41_gpu_scratch_t *scratch,
+    myds_metal_buffer_t *scores, myds_metal_buffer_t *blocks,
+    const myds_metal_buffer_t *q, const myds_metal_buffer_t *weights,
+    const myds_metal_buffer_t *cache, const myds_metal_buffer_t *mask,
+    uint32_t n_comp, uint32_t cache_mode, uint32_t first_row,
+    uint32_t visible, bool l20_mode);
+int myds_v41_gpu_topk_fused_decode(myds_v41_gpu_scratch_t *scratch,
+    myds_metal_buffer_t *ids, const myds_metal_buffer_t *scores,
+    uint32_t n_cols, uint32_t top, bool write_l20_extras, uint32_t l20_n_comp);
+int myds_v41_gpu_topk_l20_fused_self_compact_decode(myds_metal_buffer_t *ids,
+    const myds_metal_buffer_t *dense_scores, uint32_t n_comp,
+    myds_v41_gpu_scratch_t *scratch);
+/* Test/diagnostic helper: builds 256-bin histogram (+ optional L20 block_max)
+ * from an existing score array to torture-test 2-pass Top-K on arbitrary bits. */
+int myds_v41_gpu_decode_topk_hist_only(myds_v41_gpu_scratch_t *scratch,
+    const myds_metal_buffer_t *scores, myds_metal_buffer_t *blocks,
+    uint32_t n_comp, uint32_t visible, bool l20_mode);
 /* [P-L1] Default-on 0-ULP prefill YoCo (il>20, ratio==1, mask_bits, nc>16384,
  * pos0>=16384) 8-row tile-union register-only scorer + batched <=16K Top-512
  * (MYDS_INDEXER_PREFILL_COMPACT: absent/1=on, 0=off, else -1). */

@@ -113,6 +113,7 @@ int main(int argc, char **argv) {
                          strstr(state, "\"d_split\":") &&
                          strstr(state, "\"hc_mix_fast\"") &&
                          strstr(state, "\"prefill_attn_direct_comp\":{\"requests\":") &&
+                         strstr(state, "\"decode_topk_fused\":{\"requests\":") &&
                          strstr(state, "truncated") == NULL;
     if (!shape_ok) ++failures;
     printf("{\"kind\":\"summary\",\"failures\":%d,\"pass\":%s}\n",

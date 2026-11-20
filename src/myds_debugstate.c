@@ -223,6 +223,9 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
     myds_v41_gpu_decode_topk_fast_counters_t dtf;
     memset(&dtf, 0, sizeof(dtf));
     myds_v41_gpu_decode_topk_fast_counters(&dtf, false);
+    myds_v41_gpu_decode_topk_fused_counters_t dtfu;
+    memset(&dtfu, 0, sizeof(dtfu));
+    myds_v41_gpu_decode_topk_fused_counters(&dtfu, false);
     myds_engram_async_t1_counters_t eat1;
     memset(&eat1, 0, sizeof(eat1));
     myds_engram_async_t1_counters(&eat1, false);
@@ -307,6 +310,8 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          "\"prefix_top2048_encoded\":%llu,\"l20_self_compact_requests\":%llu,"
          "\"l20_self_compact_encoded\":%llu,\"l20_self_compact_fallbacks\":%llu,"
          "\"l20_self_compact_failures\":%llu},"
+         "\"decode_topk_fused\":{\"requests\":%llu,\"root_encoded\":%llu,"
+         "\"l20_encoded\":%llu,\"fallbacks\":%llu,\"failures\":%llu},"
          "\"engram_async_t1\":{\"requests\":%llu,\"dispatched\":%llu,\"joined\":%llu,"
          "\"cancelled\":%llu,\"failures\":%llu},"
          "\"dense_prefill_wide\":{\"enabled\":%d,\"requests\":%llu,\"wide_encoded\":%llu,"
@@ -356,6 +361,11 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          (unsigned long long)dtf.l20_self_compact_encoded,
          (unsigned long long)dtf.l20_self_compact_fallbacks,
          (unsigned long long)dtf.l20_self_compact_failures,
+         (unsigned long long)dtfu.requests,
+         (unsigned long long)dtfu.root_encoded,
+         (unsigned long long)dtfu.l20_encoded,
+         (unsigned long long)dtfu.fallbacks,
+         (unsigned long long)dtfu.failures,
          (unsigned long long)eat1.requests,
          (unsigned long long)eat1.dispatched,
          (unsigned long long)eat1.joined,
