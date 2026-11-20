@@ -4524,27 +4524,39 @@ static inline const char *attention_decode_mma_kernel_name(uint32_t d_split) {
     }
 }
 #define MYDS_ATTN_DECODE_MMA_MIN_KEYS 1u
-#define MYDS_ATTN_DECODE_MMA_SPLITK_MIN_KEYS 129u
+#define MYDS_ATTN_DECODE_MMA_SK8_MIN_KEYS 64u
+#define MYDS_ATTN_DECODE_MMA_SK16_MIN_KEYS 193u
 #define MYDS_ATTN_DECODE_MMA_SMEM_BYTES 10272u
 static inline const char *attention_decode_mma_select_kernel(
-    uint32_t d_split, uint32_t keys, uint32_t *out_grid_y, uint32_t *out_nsg) {
-    /* For keys > 128 on D_SPLIT >= 4 (modes 1/4/8), dispatch single-pass in-TG
-     * Split-K (KSG=8, grid_y=8 -> 64 TGs x 256 thr, 0 B spill, maxThr=832 on
-     * Apple8 M2 Ultra, 100% balanced at keys in {128,256,512,640}). For
-     * keys <= 128 (or D_SPLIT=2), keep the 4-SG kernel already proven
-     * 1.10-3.85x faster on M2 Ultra and 1.59-2.50x on M4. */
-    if (keys >= MYDS_ATTN_DECODE_MMA_SPLITK_MIN_KEYS && d_split >= 4u) {
+    int mode, uint32_t keys, uint32_t *out_grid_y, uint32_t *out_nsg) {
+    /* Adaptive single-pass MQA-64 MMA dispatch ladder (modes 1 auto & 8):
+     *   keys <  64 -> _d8     (64 TGs x 128 thr, 0 B spill, maxThr=896 on Apple8)
+     *   64..192    -> sk8_d8  (64 TGs x 256 thr, 0 B spill, maxThr=832 on Apple8)
+     *   keys > 192 -> sk16_d8 (64 TGs x 512 thr, 0 B spill, maxThr=832 on Apple8)
+     * Explicit D_SPLIT=2 / D_SPLIT=4 keep their 4-SG _d2 / _d4 kernels cleanly. */
+    if (mode == 1 || mode == 8) {
         if (out_grid_y) *out_grid_y = 8u;
-        if (out_nsg) *out_nsg = 8u;
-        return "kernel_myds_attention_decode_mma_sk8_f16_512_d8";
+        if (keys >= MYDS_ATTN_DECODE_MMA_SK16_MIN_KEYS) {
+            if (out_nsg) *out_nsg = 16u;
+            return "kernel_myds_attention_decode_mma_sk16_f16_512_d8";
+        }
+        if (keys >= MYDS_ATTN_DECODE_MMA_SK8_MIN_KEYS) {
+            if (out_nsg) *out_nsg = 8u;
+            return "kernel_myds_attention_decode_mma_sk8_f16_512_d8";
+        }
+        if (out_nsg) *out_nsg = 4u;
+        return "kernel_myds_attention_decode_mma_rope_fuse_f16_512_d8";
     }
-    if (out_grid_y) *out_grid_y = d_split;
-    if (out_nsg) *out_nsg = 4u;
-    return attention_decode_mma_kernel_name(d_split);
+    if (mode == 2 || mode == 4) {
+        if (out_grid_y) *out_grid_y = (uint32_t)mode;
+        if (out_nsg) *out_nsg = 4u;
+        return attention_decode_mma_kernel_name((uint32_t)mode);
+    }
+    return NULL;
 }
-static int attention_decode_mma_preflight(uint32_t d_split, uint32_t keys) {
+static int attention_decode_mma_preflight(int mode, uint32_t keys) {
     uint32_t grid_y = 0u, nsg = 0u;
-    const char *kname = attention_decode_mma_select_kernel(d_split, keys, &grid_y, &nsg);
+    const char *kname = attention_decode_mma_select_kernel(mode, keys, &grid_y, &nsg);
     if (!kname || !grid_y || !nsg) return 0;
     const uint32_t threads[] = {32u, nsg, 1u};
     return myds_metal_kernel_constants_preflight(kname, threads, MYDS_ATTN_DECODE_MMA_SMEM_BYTES, NULL, 0u);
@@ -4838,7 +4850,7 @@ static int attention_rope_validate(myds_metal_buffer_t *heads,const myds_metal_b
     if (decode_mma < 0) return 0;
     const uint32_t keys=n_raw+selected_rows;
     if (decode_mma > 0 && flash_dec == 0 && keys >= MYDS_ATTN_DECODE_MMA_MIN_KEYS) {
-        if (attention_decode_mma_preflight(attention_decode_mma_d_split(decode_mma), keys)) {
+        if (attention_decode_mma_preflight(decode_mma, keys)) {
             return 1;
         }
     }
@@ -4895,10 +4907,10 @@ static int dispatch_decode_mma_attention(
     myds_metal_buffer_t *heads, const myds_metal_buffer_t *sinks,
     const myds_metal_buffer_t *q, myds_v41_gpu_scratch_t *s,
     const struct flash_vec_args *a, const struct attention_rope_scope *rope,
-    uint32_t d_split) {
+    int mma_mode) {
     uint32_t grid_y = 0u, nsg = 0u;
     const uint32_t keys = (a && a->ne11 > 0) ? (uint32_t)a->ne11 : 0u;
-    const char *kname = attention_decode_mma_select_kernel(d_split, keys, &grid_y, &nsg);
+    const char *kname = attention_decode_mma_select_kernel(mma_mode, keys, &grid_y, &nsg);
     if (!kname || !grid_y || !nsg || !rope) return 0;
     struct attention_rope_fuse_args fused = {.attention = *a, .pos = rope->pos, .inverse = 1u};
     memcpy(fused.frequencies, rope_frequencies[rope->compressed ? 1 : 0], sizeof(fused.frequencies));
@@ -4916,9 +4928,9 @@ static int dispatch_register_attention(
     myds_metal_buffer_t *heads, const myds_metal_buffer_t *sinks,
     const myds_metal_buffer_t *q, myds_v41_gpu_scratch_t *s,
     const struct flash_vec_args *a, const myds_metal_constant_t c[10],
-    const struct attention_rope_scope *rope, uint32_t mma_d_split) {
-    if (mma_d_split && rope) {
-        return dispatch_decode_mma_attention(heads, sinks, q, s, a, rope, mma_d_split);
+    const struct attention_rope_scope *rope, int mma_mode) {
+    if (mma_mode > 0 && rope) {
+        return dispatch_decode_mma_attention(heads, sinks, q, s, a, rope, mma_mode);
     }
     const int flash_dec = myds_v41_gpu_attention_flash_dec_enabled();
     if (flash_dec < 0) return 0;
@@ -4964,20 +4976,19 @@ static int dispatch_register_attention(
                        a, sizeof(*a), register_buffers, 7, 64, 1, 1, 256, 1, 1, 22400, c, 10);
 }
 
-static uint32_t resolve_decode_mma_d_split(uint32_t keys, const struct attention_rope_scope *rope, int register_mode) {
-    if (!rope || !register_mode) return 0u;
+static int resolve_decode_mma_mode(uint32_t keys, const struct attention_rope_scope *rope, int register_mode) {
+    if (!rope || !register_mode) return 0;
     const int mode = myds_v41_gpu_attention_decode_mma_enabled();
-    if (mode <= 0) return 0u;
+    if (mode <= 0) return 0;
     attention_decode_mma_count(ADM_REQUESTS);
     const int flash_dec = myds_v41_gpu_attention_flash_dec_enabled();
     if (flash_dec == 0 && keys >= MYDS_ATTN_DECODE_MMA_MIN_KEYS) {
-        const uint32_t ds = attention_decode_mma_d_split(mode);
-        if (attention_decode_mma_preflight(ds, keys)) {
-            return ds;
+        if (attention_decode_mma_preflight(mode, keys)) {
+            return mode;
         }
     }
     attention_decode_mma_count(ADM_FALLBACKS);
-    return 0u;
+    return 0;
 }
 
 static int attention_staged_impl(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
@@ -4995,8 +5006,8 @@ static int attention_staged_impl(myds_metal_buffer_t *heads,const myds_metal_buf
         return 0;
     }
     uint32_t keys=n_raw+selected_rows;uint64_t kvbytes=(uint64_t)keys*1024,maskbytes=(uint64_t)keys*2;
-    const uint32_t mma_d_split = resolve_decode_mma_d_split(keys, rope, register_mode);
-    if (register_mode == 2 && !mma_d_split) return 0;
+    const int mma_mode = resolve_decode_mma_mode(keys, rope, register_mode);
+    if (register_mode == 2 && !mma_mode) return 0;
     if (!myds_metal_get_auto_barrier()) {
         /* The previous attention may still READ these shared buffers in a
          * concurrent encoder. Fence before staging/pad/partial writes (WAR). */
@@ -5008,7 +5019,7 @@ static int attention_staged_impl(myds_metal_buffer_t *heads,const myds_metal_buf
     if(n_raw>tail&&!stage_f16(s->kv_f16,(size_t)tail*1024,window,0,(n_raw-tail)*512,s))return 0;
     if(selected_rows&&!stage_f16(s->kv_f16,(size_t)n_raw*1024,selected_kv,0,selected_rows*512,s))return 0;
     if(!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(s->kv_f16);
-    if(!mma_d_split && (keys%32)) {
+    if(!mma_mode && (keys%32)) {
         struct flash_pad_args a={.ne11=keys,.ne_12_2=1,.ne_12_3=1,.nb11=1024,.nb12=kvbytes,.nb13=kvbytes,
             .nb21=1024,.nb22=kvbytes,.nb23=kvbytes,.ne31=1,.ne32=1,.ne33=1,.nb31=maskbytes,.nb32=maskbytes,.nb33=maskbytes};
         const myds_metal_buffer_t *b[]={s->kv_f16,s->kv_f16,s->mask,s->pad};
@@ -5026,7 +5037,7 @@ static int attention_staged_impl(myds_metal_buffer_t *heads,const myds_metal_buf
         {405,true,0},{420,false,512},{421,false,512},{422,false,1},{423,false,32}};
     if (register_mode) {
         const uint64_t dispatch_before=myds_metal_dispatch_count();
-        const int ok = dispatch_register_attention(heads, sinks, q, s, &a, c, rope, mma_d_split);
+        const int ok = dispatch_register_attention(heads, sinks, q, s, &a, c, rope, mma_mode);
         if(register_mode == 1 && myds_metal_dispatch_count()>dispatch_before) {
             if (rope) attention_rope_count(RF_ENCODED);
             attention_register_count(AR_ENCODED);
@@ -5153,8 +5164,8 @@ static int attention_direct_impl(myds_metal_buffer_t *heads,const myds_metal_buf
     }
 
     uint32_t keys=n_raw+selected_rows;uint64_t kvbytes=(uint64_t)keys*1024,maskbytes=(uint64_t)keys*2;
-    const uint32_t mma_d_split = resolve_decode_mma_d_split(keys, rope, register_mode);
-    if (register_mode == 2 && !mma_d_split) return 0;
+    const int mma_mode = resolve_decode_mma_mode(keys, rope, register_mode);
+    if (register_mode == 2 && !mma_mode) return 0;
     const char *get_rows_to_f16_kernel = (comp_cache_mode == MYDS_KV_COMP_CACHE_NVFP4)
         ? "kernel_dsv41_get_rows_nvfp4_to_f16"
         : "kernel_dsv41_get_rows_bf16_to_f16";
@@ -5186,7 +5197,7 @@ static int attention_direct_impl(myds_metal_buffer_t *heads,const myds_metal_buf
                 }
                 myds_metal_barrier_buffer(s->kv_f16);
             }
-            if (!mma_d_split && (keys % 32u)) {
+            if (!mma_mode && (keys % 32u)) {
                 if (!((keys & ~31u) >= n_raw && s->direct_pad_cache_valid)) {
                     struct flash_pad_args a={.ne11=keys,.ne_12_2=1,.ne_12_3=1,.nb11=1024,.nb12=kvbytes,.nb13=kvbytes,
                         .nb21=1024,.nb22=kvbytes,.nb23=kvbytes,.ne31=1,.ne32=1,.ne33=1,.nb31=maskbytes,.nb32=maskbytes,.nb33=maskbytes};
@@ -5226,7 +5237,7 @@ static int attention_direct_impl(myds_metal_buffer_t *heads,const myds_metal_buf
             }
             const uint32_t rem_rope = (deferred_q && deferred_q_rope_done < 64u)
                 ? (64u - deferred_q_rope_done) : 0u;
-            if (!mma_d_split && (keys % 32u)) {
+            if (!mma_mode && (keys % 32u)) {
                 if (!window_prestaged || selected_rows) {
                     myds_metal_barrier_buffer(s->kv_f16);
                 }
@@ -5272,7 +5283,7 @@ static int attention_direct_impl(myds_metal_buffer_t *heads,const myds_metal_buf
             if (populate_kv_cache && selected_rows > 0u) {
                 s->direct_kv_cache_valid = true;
                 s->direct_kv_comp_mode = comp_cache_mode;
-                s->direct_pad_cache_valid = (!mma_d_split) && (keys % 32u != 0u) && ((keys & ~31u) >= n_raw);
+                s->direct_pad_cache_valid = (!mma_mode) && (keys % 32u != 0u) && ((keys & ~31u) >= n_raw);
                 s->direct_kv_comp_buf = comp_kv;
                 s->direct_kv_comp_offset = myds_metal_buffer_offset(comp_kv);
                 s->direct_kv_ids_buf = selected_ids;
@@ -5313,7 +5324,7 @@ static int attention_direct_impl(myds_metal_buffer_t *heads,const myds_metal_buf
         }
         if(!myds_metal_get_auto_barrier()) myds_metal_barrier_buffer(s->kv_f16);
 
-        if(!mma_d_split && (keys%32)) {
+        if(!mma_mode && (keys%32)) {
             struct flash_pad_args a={.ne11=keys,.ne_12_2=1,.ne_12_3=1,.nb11=1024,.nb12=kvbytes,.nb13=kvbytes,
                 .nb21=1024,.nb22=kvbytes,.nb23=kvbytes,.ne31=1,.ne32=1,.ne33=1,.nb31=maskbytes,.nb32=maskbytes,.nb33=maskbytes};
             const myds_metal_buffer_t *b[]={s->kv_f16,s->kv_f16,s->mask,s->pad};
@@ -5332,7 +5343,7 @@ static int attention_direct_impl(myds_metal_buffer_t *heads,const myds_metal_buf
         {405,true,0},{420,false,512},{421,false,512},{422,false,1},{423,false,32}};
     if (register_mode) {
         const uint64_t dispatch_before=myds_metal_dispatch_count();
-        const int ok = dispatch_register_attention(heads, sinks, q, s, &a, c, rope, mma_d_split);
+        const int ok = dispatch_register_attention(heads, sinks, q, s, &a, c, rope, mma_mode);
         if(myds_metal_dispatch_count()>dispatch_before) {
             if (register_mode == 1) {
                 if (rope) attention_rope_count(RF_ENCODED);

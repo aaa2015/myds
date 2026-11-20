@@ -665,11 +665,11 @@ static void test_c_runtime_integration(void) {
     setenv("MYDS_ATTN_ROPE_FUSE", "1", 1);
     setenv("MYDS_ATTN_DECODE_MMA", "0", 1);
 
-    const uint32_t test_nraw[] = {7u, 128u, 128u};
-    const uint32_t test_sel[]  = {0u, 111u, 512u}; /* keys = 7, 239 (unaligned!), 640 */
-    const uint32_t test_pos[]  = {6u, 513u, 4095u};
+    const uint32_t test_nraw[] = {7u, 128u, 128u, 128u, 127u, 128u};
+    const uint32_t test_sel[]  = {0u,   0u,  63u, 111u, 512u, 512u}; /* keys = 7, 128, 191, 239, 639, 640 */
+    const uint32_t test_pos[]  = {6u, 127u, 190u, 513u, 4094u, 4095u};
 
-    for (size_t ci = 0; ci < 3; ci++) {
+    for (size_t ci = 0; ci < sizeof(test_nraw) / sizeof(test_nraw[0]); ci++) {
         bool ref_consumed = false;
         REQUIRE(myds_metal_begin_batch());
         REQUIRE(myds_v41_gpu_attention_direct_rope_fuse(
@@ -774,7 +774,7 @@ static void run_m4_benchmark(id<MTLDevice> dev, id<MTLCommandQueue> queue,
            "SK4-D8", "SK8-D8", "SK10-D8", "SK16-D8", "D2-F16P");
     printf("  -------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+---------------------\n");
 
-    const uint32_t bench_keys[] = {1, 7, 16, 31, 32, 64, 128, 256, 512, 639, 640};
+    const uint32_t bench_keys[] = {1, 7, 16, 31, 32, 64, 128, 192, 256, 512, 639, 640};
     enum { kBenchLayers = 40, kBenchRuns = 7 };
     const int n_layers = kBenchLayers;
     const int n_runs = kBenchRuns;
@@ -793,6 +793,33 @@ static void run_m4_benchmark(id<MTLDevice> dev, id<MTLCommandQueue> queue,
     for (uint32_t i = 0; i < 640u * 512u; i++) kp[i] = f32_to_f16_bits(rand_f(-1.0f, 1.0f));
     memset(mbuf.contents, 0, 640u * 2u);
     for (uint32_t h = 0; h < 64u; h++) sp[h] = ((int)h - 31) / 8.0f;
+
+    /* Warmup GPU P-state before benchmarking to prevent cold-start DVFS jitter. */
+    {
+        struct test_rope_fuse_args wargs = make_fused_args(640u, 1024u, false);
+        for (int w = 0; w < 8; w++) {
+            id<MTLCommandBuffer> cb = [queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:mma_psos[kNumVariants - 1]];
+            [enc setBytes:&wargs length:sizeof(wargs) atIndex:0];
+            [enc setBuffer:qbuf offset:0 atIndex:1];
+            [enc setBuffer:kbuf offset:0 atIndex:2];
+            [enc setBuffer:kbuf offset:0 atIndex:3];
+            [enc setBuffer:mbuf offset:0 atIndex:4];
+            [enc setBuffer:sbuf offset:0 atIndex:5];
+            [enc setBuffer:dstbuf offset:0 atIndex:6];
+            [enc setThreadgroupMemoryLength:10272 atIndex:0];
+            for (int l = 0; l < n_layers; l++) {
+                [enc dispatchThreadgroups:MTLSizeMake(8, kVariants[kNumVariants - 1].d_split, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, kVariants[kNumVariants - 1].nsg, 1)];
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            }
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            REQUIRE(cb.status == MTLCommandBufferStatusCompleted);
+        }
+    }
 
     for (size_t ki = 0; ki < sizeof(bench_keys) / sizeof(bench_keys[0]); ki++) {
         const uint32_t keys = bench_keys[ki];

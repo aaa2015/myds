@@ -4166,194 +4166,229 @@ static inline void myds_attention_decode_mma_splitk_impl(
     // Each row r in 0..7 spans 4 lanes differing in bit 0 (^1) and bit 3 (^8).
     const short lo_row  = ((tiisg >> 2) & 4) | ((tiisg >> 1) & 3);
     const short lo_col  = ((tiisg >> 1) & 4) | ((tiisg & 1) << 1); // 0, 2, 4, 6
-    const short col_idx = lo_col >> 1;                             // 0, 1, 2, 3
 
     float M_row = NEG_LARGE;
     float S_row = 0.0f;
 
     device const half * pm = (device const half *)mask;
     const int ne11 = args.ne11;
+    const int n_full16 = ne11 >> 4;
+    const int full_end = n_full16 << 4;
     const int stride_k = (int)KSG * 16;
 
-    // ---- Phase 1: Independent Per-SG K-Loop (ZERO threadgroup_barriers!) ----
-    for (int ic = (int)sgitg * 16; ic < ne11; ic += stride_k) {
-        const int rem = ne11 - ic;
-        if (rem >= 16) {
+    // ---- Phase 1A: Independent Per-SG Full 16-Key MMA Loop (ZERO barriers!) ----
+    for (int ic = (int)sgitg * 16; ic < full_end; ic += stride_k) {
+        const half m0 = pm[ic + lo_col + 0];
+        const half m1 = pm[ic + lo_col + 1];
+        const half m2 = pm[ic + 8 + lo_col + 0];
+        const half m3 = pm[ic + 8 + lo_col + 1];
+        if (simd_max(max(max(m0, m1), max(m2, m3))) <= -MAXHALF) {
+            continue;
+        }
+
+        device const half * pk0 = (device const half *)(k + (uint64_t)ic * args.nb11);
+        device const half * pk1 = pk0 + (8 * DK);
+
+        simdgroup_float8x8 mqk0 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 mqk1 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+        // Global K loads issued ahead of smem Q loads; #pragma unroll 2 +
+        // mem_none fences keep Apple8 VGPRs <= 64 with 0 B stack spill.
+        #pragma unroll 2
+        for (short i = 0; i < DK8 / 2; ++i) {
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_half8x8 mq0, mq1, mka0, mka1, mkb0, mkb1;
+            simdgroup_load(mka0, pk0 + 16 * i + 0, DK, 0, true);
+            simdgroup_load(mka1, pk0 + 16 * i + 8, DK, 0, true);
+            simdgroup_load(mkb0, pk1 + 16 * i + 0, DK, 0, true);
+            simdgroup_load(mkb1, pk1 + 16 * i + 8, DK, 0, true);
+            simdgroup_load(mq0,  sq  + 16 * i + 0, DK);
+            simdgroup_load(mq1,  sq  + 16 * i + 8, DK);
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(mqk0, mq0, mka0, mqk0);
+            simdgroup_multiply_accumulate(mqk1, mq0, mkb0, mqk1);
+            simdgroup_multiply_accumulate(mqk0, mq1, mka1, mqk0);
+            simdgroup_multiply_accumulate(mqk1, mq1, mkb1, mqk1);
+        }
+
+        // In-register 4-lane online softmax per lo_row (-ffast-math safe)
+        const bool v0 = (m0 > -MAXHALF);
+        const bool v1 = (m1 > -MAXHALF);
+        const bool v2 = (m2 > -MAXHALF);
+        const bool v3 = (m3 > -MAXHALF);
+
+        const float s0 = v0 ? fma(mqk0.thread_elements()[0], args.scale, float(m0)) : NEG_LARGE;
+        const float s1 = v1 ? fma(mqk0.thread_elements()[1], args.scale, float(m1)) : NEG_LARGE;
+        const float s2 = v2 ? fma(mqk1.thread_elements()[0], args.scale, float(m2)) : NEG_LARGE;
+        const float s3 = v3 ? fma(mqk1.thread_elements()[1], args.scale, float(m3)) : NEG_LARGE;
+
+        float tile_m = max(max(s0, s1), max(s2, s3));
+        tile_m = max(tile_m, simd_shuffle_xor(tile_m, 1));
+        tile_m = max(tile_m, simd_shuffle_xor(tile_m, 8));
+
+        const float old_m = M_row;
+        const float new_m = max(old_m, tile_m);
+        const float ms = (old_m > -1e37f) ? exp(old_m - new_m) : 0.0f;
+
+        const float p0 = v0 ? exp(s0 - new_m) : 0.0f;
+        const float p1 = v1 ? exp(s1 - new_m) : 0.0f;
+        const float p2 = v2 ? exp(s2 - new_m) : 0.0f;
+        const float p3 = v3 ? exp(s3 - new_m) : 0.0f;
+
+        float tile_s = (p0 + p1) + (p2 + p3);
+        tile_s += simd_shuffle_xor(tile_s, 1);
+        tile_s += simd_shuffle_xor(tile_s, 8);
+
+        M_row = new_m;
+        S_row = S_row * ms + tile_s;
+
+        if (old_m > -1e37f) {
+            #pragma clang fp contract(off)
+            FOR_UNROLL (short ii = 0; ii < NO_COL; ++ii) {
+                lo[ii].thread_elements()[0] *= ms;
+                lo[ii].thread_elements()[1] *= ms;
+            }
+        }
+
+        // Reuse mqk0/mqk1 in-place as P[8,16] operands for P*V MMA.
+        mqk0.thread_elements()[0] = p0;
+        mqk0.thread_elements()[1] = p1;
+        mqk1.thread_elements()[0] = p2;
+        mqk1.thread_elements()[1] = p3;
+
+        device const half * pv0 = (device const half *)(v + (uint64_t)ic * args.nb21) + dv_base;
+        device const half * pv1 = pv0 + (8 * DV);
+        FOR_UNROLL (short ii = 0; ii < NO_COL; ++ii) {
+            simdgroup_half8x8 mv0, mv1;
+            simdgroup_load(mv0, pv0 + ii * 8, DV, 0, false);
+            simdgroup_load(mv1, pv1 + ii * 8, DV, 0, false);
+            simdgroup_multiply_accumulate(lo[ii], mqk0, mv0, lo[ii]);
+            simdgroup_multiply_accumulate(lo[ii], mqk1, mv1, lo[ii]);
+        }
+    }
+
+    // ---- Phase 1B/1C: Balanced Distributed Tail (1..15 keys, zero OOB) ----
+    // Assign the optional 8-key MMA block to the first least-loaded SG
+    // (n_full16 % KSG), then distribute the remaining 1..7 scalar rows
+    // round-robin across subsequent SGs (1 row/SG for KSG >= 8) using
+    // 32-lane coalesced K reads (4 half4 loads/row shared across 8 heads).
+    int tail_base = full_end;
+    int tail_rem  = ne11 - full_end;
+    short sg_cur  = (short)((uint)n_full16 % (uint)KSG);
+    if (tail_rem >= 8) {
+        if ((short)sgitg == sg_cur) {
+            const int ic = tail_base;
             const half m0 = pm[ic + lo_col + 0];
             const half m1 = pm[ic + lo_col + 1];
-            const half m2 = pm[ic + 8 + lo_col + 0];
-            const half m3 = pm[ic + 8 + lo_col + 1];
-            if (simd_max(max(max(m0, m1), max(m2, m3))) <= -MAXHALF) {
-                continue;
-            }
-
-            device const half * pk0 = (device const half *)(k + (uint64_t)ic * args.nb11);
-            device const half * pk1 = pk0 + (8 * DK);
-
-            simdgroup_float8x8 mqk0 = make_filled_simdgroup_matrix<float, 8>(0.0f);
-            simdgroup_float8x8 mqk1 = make_filled_simdgroup_matrix<float, 8>(0.0f);
-
-            // Global K loads issued ahead of smem Q loads; #pragma unroll 2 +
-            // mem_none fences keep Apple8 VGPRs <= 64 with 0 B stack spill.
-            #pragma unroll 2
-            for (short i = 0; i < DK8 / 2; ++i) {
-                simdgroup_barrier(mem_flags::mem_none);
-                simdgroup_half8x8 mq0, mq1, mka0, mka1, mkb0, mkb1;
-                simdgroup_load(mka0, pk0 + 16 * i + 0, DK, 0, true);
-                simdgroup_load(mka1, pk0 + 16 * i + 8, DK, 0, true);
-                simdgroup_load(mkb0, pk1 + 16 * i + 0, DK, 0, true);
-                simdgroup_load(mkb1, pk1 + 16 * i + 8, DK, 0, true);
-                simdgroup_load(mq0,  sq  + 16 * i + 0, DK);
-                simdgroup_load(mq1,  sq  + 16 * i + 8, DK);
-                simdgroup_barrier(mem_flags::mem_none);
-                simdgroup_multiply_accumulate(mqk0, mq0, mka0, mqk0);
-                simdgroup_multiply_accumulate(mqk1, mq0, mkb0, mqk1);
-                simdgroup_multiply_accumulate(mqk0, mq1, mka1, mqk0);
-                simdgroup_multiply_accumulate(mqk1, mq1, mkb1, mqk1);
-            }
-
-            // In-register 4-lane online softmax per lo_row (-ffast-math safe)
-            const bool v0 = (m0 > -MAXHALF);
-            const bool v1 = (m1 > -MAXHALF);
-            const bool v2 = (m2 > -MAXHALF);
-            const bool v3 = (m3 > -MAXHALF);
-
-            const float s0 = v0 ? fma(mqk0.thread_elements()[0], args.scale, float(m0)) : NEG_LARGE;
-            const float s1 = v1 ? fma(mqk0.thread_elements()[1], args.scale, float(m1)) : NEG_LARGE;
-            const float s2 = v2 ? fma(mqk1.thread_elements()[0], args.scale, float(m2)) : NEG_LARGE;
-            const float s3 = v3 ? fma(mqk1.thread_elements()[1], args.scale, float(m3)) : NEG_LARGE;
-
-            float tile_m = max(max(s0, s1), max(s2, s3));
-            tile_m = max(tile_m, simd_shuffle_xor(tile_m, 1));
-            tile_m = max(tile_m, simd_shuffle_xor(tile_m, 8));
-
-            const float old_m = M_row;
-            const float new_m = max(old_m, tile_m);
-            const float ms = (old_m > -1e37f) ? exp(old_m - new_m) : 0.0f;
-
-            const float p0 = v0 ? exp(s0 - new_m) : 0.0f;
-            const float p1 = v1 ? exp(s1 - new_m) : 0.0f;
-            const float p2 = v2 ? exp(s2 - new_m) : 0.0f;
-            const float p3 = v3 ? exp(s3 - new_m) : 0.0f;
-
-            float tile_s = (p0 + p1) + (p2 + p3);
-            tile_s += simd_shuffle_xor(tile_s, 1);
-            tile_s += simd_shuffle_xor(tile_s, 8);
-
-            M_row = new_m;
-            S_row = S_row * ms + tile_s;
-
-            if (old_m > -1e37f) {
-                #pragma clang fp contract(off)
-                FOR_UNROLL (short ii = 0; ii < NO_COL; ++ii) {
-                    lo[ii].thread_elements()[0] *= ms;
-                    lo[ii].thread_elements()[1] *= ms;
+            if (simd_max(max(m0, m1)) > -MAXHALF) {
+                device const half * pk0 = (device const half *)(k + (uint64_t)ic * args.nb11);
+                simdgroup_float8x8 mqk0 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+                #pragma unroll 2
+                for (short i = 0; i < DK8 / 2; ++i) {
+                    simdgroup_barrier(mem_flags::mem_none);
+                    simdgroup_half8x8 mq0, mq1, mka0, mka1;
+                    simdgroup_load(mka0, pk0 + 16 * i + 0, DK, 0, true);
+                    simdgroup_load(mka1, pk0 + 16 * i + 8, DK, 0, true);
+                    simdgroup_load(mq0,  sq  + 16 * i + 0, DK);
+                    simdgroup_load(mq1,  sq  + 16 * i + 8, DK);
+                    simdgroup_barrier(mem_flags::mem_none);
+                    simdgroup_multiply_accumulate(mqk0, mq0, mka0, mqk0);
+                    simdgroup_multiply_accumulate(mqk0, mq1, mka1, mqk0);
                 }
-            }
+                const bool v0 = (m0 > -MAXHALF);
+                const bool v1 = (m1 > -MAXHALF);
+                const float s0 = v0 ? fma(mqk0.thread_elements()[0], args.scale, float(m0)) : NEG_LARGE;
+                const float s1 = v1 ? fma(mqk0.thread_elements()[1], args.scale, float(m1)) : NEG_LARGE;
 
-            // Reuse mqk0/mqk1 in-place as P[8,16] operands for P*V MMA.
-            mqk0.thread_elements()[0] = p0;
-            mqk0.thread_elements()[1] = p1;
-            mqk1.thread_elements()[0] = p2;
-            mqk1.thread_elements()[1] = p3;
+                float tile_m = max(s0, s1);
+                tile_m = max(tile_m, simd_shuffle_xor(tile_m, 1));
+                tile_m = max(tile_m, simd_shuffle_xor(tile_m, 8));
 
-            device const half * pv0 = (device const half *)(v + (uint64_t)ic * args.nb21) + dv_base;
-            device const half * pv1 = pv0 + (8 * DV);
-            FOR_UNROLL (short ii = 0; ii < NO_COL; ++ii) {
-                simdgroup_half8x8 mv0, mv1;
-                simdgroup_load(mv0, pv0 + ii * 8, DV, 0, false);
-                simdgroup_load(mv1, pv1 + ii * 8, DV, 0, false);
-                simdgroup_multiply_accumulate(lo[ii], mqk0, mv0, lo[ii]);
-                simdgroup_multiply_accumulate(lo[ii], mqk1, mv1, lo[ii]);
-            }
-        } else {
-            // Tail tile (1 <= rem <= 15, zero OOB reads; at most 1 SG enters).
-            short r_start = 0;
-            if (rem >= 8) {
-                const half m0 = pm[ic + lo_col + 0];
-                const half m1 = pm[ic + lo_col + 1];
-                if (simd_max(max(m0, m1)) > -MAXHALF) {
-                    device const half * pk0 = (device const half *)(k + (uint64_t)ic * args.nb11);
-                    simdgroup_float8x8 mqk0 = make_filled_simdgroup_matrix<float, 8>(0.0f);
-                    #pragma clang loop unroll(disable)
-                    for (short i = 0; i < DK8; ++i) {
-                        simdgroup_half8x8 mq, mka;
-                        simdgroup_load(mka, pk0 + 8 * i, DK, 0, true);
-                        simdgroup_load(mq,  sq  + 8 * i, DK);
-                        simdgroup_multiply_accumulate(mqk0, mq, mka, mqk0);
-                    }
-                    const bool v0 = (m0 > -MAXHALF);
-                    const bool v1 = (m1 > -MAXHALF);
-                    const float s0 = v0 ? fma(mqk0.thread_elements()[0], args.scale, float(m0)) : NEG_LARGE;
-                    const float s1 = v1 ? fma(mqk0.thread_elements()[1], args.scale, float(m1)) : NEG_LARGE;
-
-                    float tile_m = max(s0, s1);
-                    tile_m = max(tile_m, simd_shuffle_xor(tile_m, 1));
-                    tile_m = max(tile_m, simd_shuffle_xor(tile_m, 8));
-
-                    const float old_m = M_row;
-                    const float new_m = max(old_m, tile_m);
-                    const float ms = (old_m > -1e37f) ? exp(old_m - new_m) : 0.0f;
-                    const float p0 = v0 ? exp(s0 - new_m) : 0.0f;
-                    const float p1 = v1 ? exp(s1 - new_m) : 0.0f;
-
-                    float tile_s = p0 + p1;
-                    tile_s += simd_shuffle_xor(tile_s, 1);
-                    tile_s += simd_shuffle_xor(tile_s, 8);
-
-                    M_row = new_m;
-                    S_row = S_row * ms + tile_s;
-
-                    if (old_m > -1e37f) {
-                        #pragma clang fp contract(off)
-                        FOR_UNROLL (short ii = 0; ii < NO_COL; ++ii) {
-                            lo[ii].thread_elements()[0] *= ms;
-                            lo[ii].thread_elements()[1] *= ms;
-                        }
-                    }
-
-                    mqk0.thread_elements()[0] = p0;
-                    mqk0.thread_elements()[1] = p1;
-
-                    device const half * pv0 = (device const half *)(v + (uint64_t)ic * args.nb21) + dv_base;
-                    FOR_UNROLL (short ii = 0; ii < NO_COL; ++ii) {
-                        simdgroup_half8x8 mv0;
-                        simdgroup_load(mv0, pv0 + ii * 8, DV, 0, false);
-                        simdgroup_multiply_accumulate(lo[ii], mqk0, mv0, lo[ii]);
-                    }
-                }
-                r_start = 8;
-            }
-            for (short r = r_start; r < (short)rem; ++r) {
-                const half mr = pm[ic + r];
-                if (mr <= -MAXHALF) {
-                    continue;
-                }
-                device const half4 * pk4 = (device const half4 *)(k + (uint64_t)(ic + r) * args.nb11);
-                float acc = 0.0f;
-                for (short d = col_idx; d < DK4; d += 4) {
-                    acc += dot((float4)pk4[d], (float4)sq4[lo_row * DK4 + d]);
-                }
-                acc += simd_shuffle_xor(acc, 1);
-                acc += simd_shuffle_xor(acc, 8);
-
-                const float score = fma(acc, args.scale, float(mr));
                 const float old_m = M_row;
-                const float new_m = max(old_m, score);
+                const float new_m = max(old_m, tile_m);
                 const float ms = (old_m > -1e37f) ? exp(old_m - new_m) : 0.0f;
-                const float pr = exp(score - new_m);
-                M_row = new_m;
-                S_row = S_row * ms + pr;
+                const float p0 = v0 ? exp(s0 - new_m) : 0.0f;
+                const float p1 = v1 ? exp(s1 - new_m) : 0.0f;
 
-                device const half * pv_row = (device const half *)(v + (uint64_t)(ic + r) * args.nb21);
-                {
+                float tile_s = p0 + p1;
+                tile_s += simd_shuffle_xor(tile_s, 1);
+                tile_s += simd_shuffle_xor(tile_s, 8);
+
+                M_row = new_m;
+                S_row = S_row * ms + tile_s;
+
+                if (old_m > -1e37f) {
                     #pragma clang fp contract(off)
                     FOR_UNROLL (short ii = 0; ii < NO_COL; ++ii) {
-                        const short col = dv_base + ii * 8 + lo_col;
-                        const half2 v2 = *(device const half2 *)(pv_row + col);
-                        lo[ii].thread_elements()[0] = fma(pr, float(v2.x), lo[ii].thread_elements()[0] * ms);
-                        lo[ii].thread_elements()[1] = fma(pr, float(v2.y), lo[ii].thread_elements()[1] * ms);
+                        lo[ii].thread_elements()[0] *= ms;
+                        lo[ii].thread_elements()[1] *= ms;
                     }
+                }
+
+                mqk0.thread_elements()[0] = p0;
+                mqk0.thread_elements()[1] = p1;
+
+                device const half * pv0 = (device const half *)(v + (uint64_t)ic * args.nb21) + dv_base;
+                FOR_UNROLL (short ii = 0; ii < NO_COL; ++ii) {
+                    simdgroup_half8x8 mv0;
+                    simdgroup_load(mv0, pv0 + ii * 8, DV, 0, false);
+                    simdgroup_multiply_accumulate(lo[ii], mqk0, mv0, lo[ii]);
+                }
+            }
+        }
+        tail_base += 8;
+        tail_rem  -= 8;
+        sg_cur = (sg_cur + 1 < KSG) ? (sg_cur + 1) : 0;
+    }
+    if (tail_rem > 0) {
+        short r_off = (short)sgitg - sg_cur;
+        if (r_off < 0) {
+            r_off += KSG;
+        }
+        for (short r = r_off; r < (short)tail_rem; r += KSG) {
+            const int key_idx = tail_base + r;
+            const half mr = pm[key_idx];
+            if (mr <= -MAXHALF) {
+                continue;
+            }
+            device const half4 * pk4 =
+                (device const half4 *)(k + (uint64_t)key_idx * args.nb11);
+            const half4 kv0 = pk4[tiisg];
+            const half4 kv1 = pk4[32 + tiisg];
+            const half4 kv2 = pk4[64 + tiisg];
+            const half4 kv3 = pk4[96 + tiisg];
+
+            float my_acc = 0.0f;
+            #pragma clang loop unroll(disable)
+            for (short h = 0; h < Q; ++h) {
+                threadgroup const half4 * qh = sq4 + h * DK4;
+                float acc = dot((float4)kv0, (float4)qh[tiisg]);
+                acc += dot((float4)kv1, (float4)qh[32 + tiisg]);
+                acc += dot((float4)kv2, (float4)qh[64 + tiisg]);
+                acc += dot((float4)kv3, (float4)qh[96 + tiisg]);
+                acc = simd_sum(acc);
+                if (lo_row == h) {
+                    my_acc = acc;
+                }
+            }
+
+            const float score = fma(my_acc, args.scale, float(mr));
+            const float old_m = M_row;
+            const float new_m = max(old_m, score);
+            const float ms = (old_m > -1e37f) ? exp(old_m - new_m) : 0.0f;
+            const float pr = exp(score - new_m);
+            M_row = new_m;
+            S_row = S_row * ms + pr;
+
+            device const half * pv_row =
+                (device const half *)(v + (uint64_t)key_idx * args.nb21);
+            {
+                #pragma clang fp contract(off)
+                FOR_UNROLL (short ii = 0; ii < NO_COL; ++ii) {
+                    const short col = dv_base + ii * 8 + lo_col;
+                    const half2 v2 = *(device const half2 *)(pv_row + col);
+                    lo[ii].thread_elements()[0] = fma(pr, float(v2.x), lo[ii].thread_elements()[0] * ms);
+                    lo[ii].thread_elements()[1] = fma(pr, float(v2.y), lo[ii].thread_elements()[1] * ms);
                 }
             }
         }

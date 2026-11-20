@@ -3106,10 +3106,10 @@ int myds_metal_init(const char *shader_dir) {
         const int decode_mma = myds_v41_gpu_attention_decode_mma_enabled();
         MYDS_LOG_I("Attention decode MMA: %d (%s)",
                    decode_mma,
-                   decode_mma == 1 ? "single-pass MQA-64 MMA auto D_SPLIT=4 (D-A1)" :
+                   decode_mma == 1 ? "single-pass MQA-64 MMA auto (<64:d8, 64..192:sk8, >192:sk16; D-A1 v3)" :
                    decode_mma == 2 ? "single-pass MQA-64 MMA D_SPLIT=2 (D-A1)" :
                    decode_mma == 4 ? "single-pass MQA-64 MMA D_SPLIT=4 (D-A1)" :
-                   decode_mma == 8 ? "single-pass MQA-64 MMA D_SPLIT=8 (D-A1)" :
+                   decode_mma == 8 ? "single-pass MQA-64 MMA D_SPLIT=8 (<64:d8, 64..192:sk8, >192:sk16; D-A1 v3)" :
                    "reference (disabled)");
         const int fuse_hc_norm_mix = myds_fuse_hc_norm_mix_mode();
         MYDS_LOG_I("HC mix norm pre-fusion: %d (%s)",
