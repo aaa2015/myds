@@ -120,6 +120,7 @@ TEST_DSPINE_RUNTIME = $(BIN_DIR)/test_dspine_runtime
 TEST_BATCH2_PARITY = $(BIN_DIR)/test_batch2_parity
 TEST_BATCH2_E2E = $(BIN_DIR)/test_batch2_e2e
 TEST_Q4_BF16_PARITY = $(BIN_DIR)/test_q4_bf16_parity
+TEST_PREFILL_ATTN_WAVE2 = $(BIN_DIR)/test_prefill_attn_wave2
 BENCH_DENSE_Q4_SITES = $(BIN_DIR)/bench_dense_q4_sites
 TEST_TREE_SPEC = $(BIN_DIR)/test_tree_spec
 TEST_ENGINE_DEPTH2 = $(BIN_DIR)/test_engine_depth2
@@ -504,6 +505,13 @@ $(TEST_MOE_IQ2_LUT): tests/test_moe_iq2_lut.m src/myds_metal.m src/myds_decode_c
 
 $(TEST_ATTN_PACKED): tests/test_attention_packed.m src/myds_metal.m src/myds_decode_candidates.inc src/myds_v41_gpu.c $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
 	$(CC) $(OBJCFLAGS) -Isrc tests/test_attention_packed.m $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
+
+$(TEST_PREFILL_ATTN_WAVE2): tests/test_prefill_attn_wave2.m src/myds_metal.m src/myds_decode_candidates.inc src/myds_v41_gpu.c $(wildcard include/*.h) $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(METALLIB) | $(BIN_DIR)
+	$(CC) $(OBJCFLAGS) -Isrc tests/test_prefill_attn_wave2.m $(BUILD_DIR)/myds_gguf.o $(BUILD_DIR)/myds_log.o $(LDFLAGS) -o $@
+
+.PHONY: test_prefill_attn_wave2
+test_prefill_attn_wave2: $(TEST_PREFILL_ATTN_WAVE2)
+	./$(TEST_PREFILL_ATTN_WAVE2)
 
 # Compile only; debug-tap metallib is independently built outside the checkout
 # by tools/build_attention_rope_fuse_probe.py. Never execute GPU from make.
