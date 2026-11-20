@@ -7961,6 +7961,102 @@ kernel void kernel_dsv4_moe_add_hc_expand4_batch(
     }
 }
 
+struct ds4_metal_args_dsv4_moe_epilogue_fuse {
+    uint32_t dim;
+    uint32_t n_tokens;
+    uint32_t top_k;
+    uint32_t round_bf16;
+};
+
+// [P-E1] Strict 0-ULP float4-vectorized fused MoE epilogue:
+//   moe_sumk (K in {1, 3, 4, 6}) + dsv41_bf16(moe + shared) + 4-stream HC expand
+// writing directly to prompt_res sub-view. Eliminates moe_out_acc w+r and
+// layer_out_buf w+r plus the 8x chunked epilogue loop.
+template<uint32_t K>
+kernel void kernel_dsv4_moe_sumk_add_hc_expand4_f4_impl(
+        constant ds4_metal_args_dsv4_moe_epilogue_fuse & args [[buffer(0)]],
+        device  const float4 * scratch_down                   [[buffer(1)]],
+        device  const float4 * shared_out                     [[buffer(2)]],
+        device  const float4 * residual                       [[buffer(3)]],
+        device  const float4 * split                          [[buffer(4)]],
+        device        float4 * dst                            [[buffer(5)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint3 ntg_g [[threadgroups_per_grid]],
+        uint3 tpitg [[thread_position_in_threadgroup]],
+        uint3 ntg   [[threads_per_threadgroup]]) {
+    const uint32_t t = tgpig.y;
+    if (t >= args.n_tokens) return;
+    const uint32_t dim4 = args.dim >> 2u;
+
+    // split per token: 24 floats = 6 float4s:
+    //   sp4[0] = pre[0..3], sp4[1] = post[0..3], sp4[2..5] = comb[src=0..3, dst=0..3]
+    device const float4 * sp4 = split + (uint64_t)t * 6u;
+    const float4 post_v = sp4[1];
+    const float4 c0_v   = sp4[2];
+    const float4 c1_v   = sp4[3];
+    const float4 c2_v   = sp4[4];
+    const float4 c3_v   = sp4[5];
+
+    device const float4 * sd_tok  = scratch_down + (uint64_t)t * (uint64_t)K * (uint64_t)dim4;
+    device const float4 * sh_tok  = shared_out   + (uint64_t)t * (uint64_t)dim4;
+    device const float4 * res_tok = residual     + (uint64_t)t * 4u * (uint64_t)dim4;
+    device       float4 * dst_tok = dst          + (uint64_t)t * 4u * (uint64_t)dim4;
+
+    const uint32_t stride = ntg_g.x * ntg.x;
+    for (uint32_t d4 = tgpig.x * ntg.x + tpitg.x; d4 < dim4; d4 += stride) {
+        #pragma clang fp contract(off) reassociate(off)
+        float4 moe_v = sd_tok[d4];
+        if (K >= 2u) moe_v += sd_tok[1u * dim4 + d4];
+        if (K >= 3u) moe_v += sd_tok[2u * dim4 + d4];
+        if (K >= 4u) moe_v += sd_tok[3u * dim4 + d4];
+        if (K >= 5u) moe_v += sd_tok[4u * dim4 + d4];
+        if (K >= 6u) moe_v += sd_tok[5u * dim4 + d4];
+
+        const float4 ffn_val = dsv41_bf16_round_f32x4(moe_v + sh_tok[d4]);
+
+        const float4 r0 = res_tok[0u * dim4 + d4];
+        const float4 r1 = res_tok[1u * dim4 + d4];
+        const float4 r2 = res_tok[2u * dim4 + d4];
+        const float4 r3 = res_tok[3u * dim4 + d4];
+
+        // Match baseline kernel_dsv4_moe_add_hc_expand4_batch FMA contraction order:
+        //   acc = (ffn_val * post[dst_hc]) rounded, then sequential fma(comb[src, dst_hc], r_src, acc).
+        float4 acc0 = ffn_val * post_v[0];
+        acc0 = fma(c0_v[0], r0, acc0);
+        acc0 = fma(c1_v[0], r1, acc0);
+        acc0 = fma(c2_v[0], r2, acc0);
+        acc0 = fma(c3_v[0], r3, acc0);
+        dst_tok[0u * dim4 + d4] = args.round_bf16 ? dsv41_bf16_round_f32x4(acc0) : acc0;
+
+        float4 acc1 = ffn_val * post_v[1];
+        acc1 = fma(c0_v[1], r0, acc1);
+        acc1 = fma(c1_v[1], r1, acc1);
+        acc1 = fma(c2_v[1], r2, acc1);
+        acc1 = fma(c3_v[1], r3, acc1);
+        dst_tok[1u * dim4 + d4] = args.round_bf16 ? dsv41_bf16_round_f32x4(acc1) : acc1;
+
+        float4 acc2 = ffn_val * post_v[2];
+        acc2 = fma(c0_v[2], r0, acc2);
+        acc2 = fma(c1_v[2], r1, acc2);
+        acc2 = fma(c2_v[2], r2, acc2);
+        acc2 = fma(c3_v[2], r3, acc2);
+        dst_tok[2u * dim4 + d4] = args.round_bf16 ? dsv41_bf16_round_f32x4(acc2) : acc2;
+
+        float4 acc3 = ffn_val * post_v[3];
+        acc3 = fma(c0_v[3], r0, acc3);
+        acc3 = fma(c1_v[3], r1, acc3);
+        acc3 = fma(c2_v[3], r2, acc3);
+        acc3 = fma(c3_v[3], r3, acc3);
+        dst_tok[3u * dim4 + d4] = args.round_bf16 ? dsv41_bf16_round_f32x4(acc3) : acc3;
+    }
+}
+
+typedef decltype(kernel_dsv4_moe_sumk_add_hc_expand4_f4_impl<6u>) kernel_dsv4_moe_epilogue_fuse_t;
+template [[host_name("kernel_dsv4_moe_sum1_add_hc_expand4_f4")]] kernel kernel_dsv4_moe_epilogue_fuse_t kernel_dsv4_moe_sumk_add_hc_expand4_f4_impl<1u>;
+template [[host_name("kernel_dsv4_moe_sum3_add_hc_expand4_f4")]] kernel kernel_dsv4_moe_epilogue_fuse_t kernel_dsv4_moe_sumk_add_hc_expand4_f4_impl<3u>;
+template [[host_name("kernel_dsv4_moe_sum4_add_hc_expand4_f4")]] kernel kernel_dsv4_moe_epilogue_fuse_t kernel_dsv4_moe_sumk_add_hc_expand4_f4_impl<4u>;
+template [[host_name("kernel_dsv4_moe_sum6_add_hc_expand4_f4")]] kernel kernel_dsv4_moe_epilogue_fuse_t kernel_dsv4_moe_sumk_add_hc_expand4_f4_impl<6u>;
+
 kernel void kernel_dsv4_hc_expand4_batch(
         constant ds4_metal_args_dsv4_hc_expand & args [[buffer(0)]],
         device  const char * block_out                [[buffer(1)]],

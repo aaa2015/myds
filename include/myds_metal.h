@@ -975,6 +975,57 @@ typedef struct {
 int myds_metal_moe_prefill_m1_enabled(void);
 void myds_metal_moe_prefill_m1_counters(myds_metal_moe_prefill_m1_counters_t *out, bool reset);
 
+/* [P-E1] MYDS_MOE_EPILOGUE_FUSE (default 0, fail-closed):
+ * Fuses moe_sumk (k in {1,3,4,6}) + moe_add_hc_expand4_batch + direct prompt_res
+ * writeback in one float4-vectorized kernel with explicit concurrent-encoder barriers. */
+#define MYDS_METAL_HAS_MOE_EPILOGUE_FUSE 1
+typedef struct {
+    uint64_t calls;
+    uint64_t fused_mm_encoded;
+    uint64_t fused_mv_encoded;
+    uint64_t fallbacks;
+    uint64_t tokens_fused;
+} myds_metal_moe_epilogue_fuse_counters_t;
+int myds_metal_moe_epilogue_fuse_enabled(void);
+void myds_metal_moe_epilogue_fuse_counters(myds_metal_moe_epilogue_fuse_counters_t *out, bool reset);
+void myds_metal_moe_epilogue_fuse_record_fallback(void);
+
+int myds_metal_v41_moe_sumk_add_hc_expand_batch(
+    myds_metal_buffer_t       *dst_res,
+    const myds_metal_buffer_t *scratch_down,
+    const myds_metal_buffer_t *shared_out,
+    const myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *split,
+    uint32_t                   dim,
+    uint32_t                   top_k,
+    uint32_t                   n_tok);
+
+int myds_metal_routed_moe_batch_epilogue_fused(
+    myds_metal_buffer_t       *dst_res,
+    myds_metal_buffer_t       *moe_out_fallback,
+    const myds_metal_buffer_t *x_in,
+    const myds_metal_buffer_t *gate_exps,
+    const myds_metal_buffer_t *up_exps,
+    const myds_metal_buffer_t *down_exps,
+    const myds_metal_buffer_t *selected_ids,
+    const myds_metal_buffer_t *selected_weights,
+    const myds_metal_buffer_t *shared_out,
+    const myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *split,
+    myds_metal_buffer_t       *scratch_gate,
+    myds_metal_buffer_t       *scratch_up,
+    myds_metal_buffer_t       *scratch_mid,
+    myds_metal_buffer_t       *scratch_down,
+    uint32_t                   dim,
+    uint32_t                   expert_dim,
+    uint32_t                   n_routed_experts,
+    uint32_t                   n_activated_experts,
+    uint32_t                   n_tok,
+    ggml_type                  gate_type,
+    ggml_type                  up_type,
+    ggml_type                  down_type,
+    float                      clamp_val);
+
 #ifdef __cplusplus
 }
 #endif

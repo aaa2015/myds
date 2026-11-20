@@ -213,6 +213,9 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
     myds_metal_moe_prefill_m1_counters_t m1c;
     memset(&m1c, 0, sizeof(m1c));
     myds_metal_moe_prefill_m1_counters(&m1c, false);
+    myds_metal_moe_epilogue_fuse_counters_t epc;
+    memset(&epc, 0, sizeof(epc));
+    myds_metal_moe_epilogue_fuse_counters(&epc, false);
 
     /* Knob accounting, reusing the same inventory --print-config reports. */
     static myds_knob_seen_t seen[1024];
@@ -267,7 +270,9 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          "\"suffix_shrink_final_mb\":{\"requests\":%llu,\"deferred_mbs\":%llu,"
          "\"final_mbs\":%llu,\"anchor_mbs\":%llu},"
          "\"moe_prefill_m1\":{\"calls\":%llu,\"map0\":%llu,\"narrow_compact\":%llu,"
-         "\"down_wide\":%llu,\"down_narrow\":%llu},\"prefix_cache_len\":%u},",
+         "\"down_wide\":%llu,\"down_narrow\":%llu},"
+         "\"moe_epilogue_fuse\":{\"calls\":%llu,\"fused_mm\":%llu,\"fused_mv\":%llu,"
+         "\"fallbacks\":%llu,\"tokens\":%llu},\"prefix_cache_len\":%u},",
          (unsigned)idx_mode, idx_fmt, (unsigned)idx_row_bytes,
          (unsigned long long)ro.requests, (unsigned long long)ro.encoded,
          (unsigned long long)ro.fallbacks, (unsigned long long)ro.failures,
@@ -294,6 +299,9 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          (unsigned long long)m1c.narrow_compact_encoded,
          (unsigned long long)m1c.down_wide_m1_encoded,
          (unsigned long long)m1c.down_narrow_m1_encoded,
+         (unsigned long long)epc.calls, (unsigned long long)epc.fused_mm_encoded,
+         (unsigned long long)epc.fused_mv_encoded, (unsigned long long)epc.fallbacks,
+         (unsigned long long)epc.tokens_fused,
          ctx ? myds_context_get_pcache_len(ctx) : 0u);
 
     const myds_steer_t *st = ctx ? myds_context_get_steer(ctx) : NULL;

@@ -61,6 +61,12 @@ static int g_fuse_hc_norm_mix = -1;
 static id<MTLComputePipelineState> g_pso_v41_hc_expand = nil;
 static id<MTLComputePipelineState> g_pso_v41_moe_add_hc_expand = nil;
 static id<MTLComputePipelineState> g_pso_v41_moe_add_hc_expand_batch = nil;
+static id<MTLComputePipelineState> g_pso_v41_moe_epilogue_fuse_k1 = nil;
+static id<MTLComputePipelineState> g_pso_v41_moe_epilogue_fuse_k3 = nil;
+static id<MTLComputePipelineState> g_pso_v41_moe_epilogue_fuse_k4 = nil;
+static id<MTLComputePipelineState> g_pso_v41_moe_epilogue_fuse_k6 = nil;
+static bool                        g_moe_epilogue_fuse = false;
+static _Atomic uint64_t            g_moe_epilogue_fuse_counters[5];
 static id<MTLComputePipelineState> g_pso_v41_engram_add = nil;
 static id<MTLComputePipelineState> g_pso_swiglu = nil;
 static id<MTLComputePipelineState> g_pso_add = nil;
@@ -2342,6 +2348,14 @@ int myds_metal_init(const char *shader_dir) {
         if (fn) g_pso_v41_moe_add_hc_expand = [g_device newComputePipelineStateWithFunction:fn error:nil];
         fn = [g_library newFunctionWithName:@"kernel_dsv4_moe_add_hc_expand4_batch"];
         if (fn) g_pso_v41_moe_add_hc_expand_batch = [g_device newComputePipelineStateWithFunction:fn error:nil];
+        fn = [g_library newFunctionWithName:@"kernel_dsv4_moe_sum1_add_hc_expand4_f4"];
+        if (fn) g_pso_v41_moe_epilogue_fuse_k1 = [g_device newComputePipelineStateWithFunction:fn error:nil];
+        fn = [g_library newFunctionWithName:@"kernel_dsv4_moe_sum3_add_hc_expand4_f4"];
+        if (fn) g_pso_v41_moe_epilogue_fuse_k3 = [g_device newComputePipelineStateWithFunction:fn error:nil];
+        fn = [g_library newFunctionWithName:@"kernel_dsv4_moe_sum4_add_hc_expand4_f4"];
+        if (fn) g_pso_v41_moe_epilogue_fuse_k4 = [g_device newComputePipelineStateWithFunction:fn error:nil];
+        fn = [g_library newFunctionWithName:@"kernel_dsv4_moe_sum6_add_hc_expand4_f4"];
+        if (fn) g_pso_v41_moe_epilogue_fuse_k6 = [g_device newComputePipelineStateWithFunction:fn error:nil];
         fn = [g_library newFunctionWithName:@"kernel_dsv41_engram_add"];
         if (fn) g_pso_v41_engram_add = [g_device newComputePipelineStateWithFunction:fn error:nil];
         fn = [g_library newFunctionWithName:@"kernel_compute_copy_u8"];
@@ -2633,6 +2647,27 @@ int myds_metal_init(const char *shader_dir) {
                     return 0;
                 }
                 MYDS_LOG_I("MoE prefill M1 enabled (8KB compact_tail narrow + dequant_q2_K u32 + down_wide_m1 + scatter map0)");
+            }
+        }
+
+        /* [P-E1] MYDS_MOE_EPILOGUE_FUSE: default 0 (fail-closed on invalid). */
+        {
+            const int ep_mode = decode_candidate_parse("MYDS_MOE_EPILOGUE_FUSE");
+            if (ep_mode < 0) {
+                g_initialized = true;
+                myds_metal_cleanup();
+                return 0;
+            }
+            g_moe_epilogue_fuse = (ep_mode == 1);
+            if (g_moe_epilogue_fuse) {
+                if (!g_pso_v41_moe_epilogue_fuse_k1 || !g_pso_v41_moe_epilogue_fuse_k3 ||
+                    !g_pso_v41_moe_epilogue_fuse_k4 || !g_pso_v41_moe_epilogue_fuse_k6) {
+                    fprintf(stderr, "myds_metal: MYDS_MOE_EPILOGUE_FUSE=1 requested but fused epilogue PSOs unavailable\n");
+                    g_initialized = true;
+                    myds_metal_cleanup();
+                    return 0;
+                }
+                MYDS_LOG_I("MoE epilogue fuse enabled (float4 sumk+add+hc_expand4 direct to prompt_res)");
             }
         }
 
@@ -2944,6 +2979,11 @@ void myds_metal_cleanup(void) {
     g_pso_v41_hc_expand = nil;
     g_pso_v41_moe_add_hc_expand = nil;
     g_pso_v41_moe_add_hc_expand_batch = nil;
+    g_pso_v41_moe_epilogue_fuse_k1 = nil;
+    g_pso_v41_moe_epilogue_fuse_k3 = nil;
+    g_pso_v41_moe_epilogue_fuse_k4 = nil;
+    g_pso_v41_moe_epilogue_fuse_k6 = nil;
+    g_moe_epilogue_fuse = false;
     g_pso_v41_engram_add = nil;
     g_pso_swiglu = nil;
     g_pso_add = nil;
@@ -4578,6 +4618,138 @@ int myds_metal_v41_moe_add_hc_expand_batch(myds_metal_buffer_t *out,
         metal_dispatch(enc, "v41_moe_add_hc_expand_batch",
             MTLSizeMake((dim+nth-1)/nth, n_tok, 1), MTLSizeMake(nth, 1, 1));
         return v41_finish(cb, enc);
+    }
+}
+
+struct v41_moe_epilogue_fuse_args {
+    uint32_t dim;
+    uint32_t n_tokens;
+    uint32_t top_k;
+    uint32_t round_bf16;
+};
+
+static inline id<MTLComputePipelineState> moe_epilogue_fuse_pso_for_k(uint32_t top_k) {
+    if (top_k == 6u) return g_pso_v41_moe_epilogue_fuse_k6;
+    if (top_k == 4u) return g_pso_v41_moe_epilogue_fuse_k4;
+    if (top_k == 3u) return g_pso_v41_moe_epilogue_fuse_k3;
+    if (top_k == 1u) return g_pso_v41_moe_epilogue_fuse_k1;
+    return nil;
+}
+
+static inline bool v41_buf_overlaps_range(
+    const myds_metal_buffer_t *a, uint64_t a_bytes,
+    const myds_metal_buffer_t *b, uint64_t b_bytes) {
+    if (!a || !b || a->mtl_buf != b->mtl_buf) return false;
+    const uint64_t a0 = (uint64_t)a->offset, a1 = a0 + a_bytes;
+    const uint64_t b0 = (uint64_t)b->offset, b1 = b0 + b_bytes;
+    return a0 < b1 && b0 < a1;
+}
+
+static int validate_moe_epilogue_fuse_args(
+    const myds_metal_buffer_t *dst_res,
+    const myds_metal_buffer_t *scratch_down,
+    const myds_metal_buffer_t *shared_out,
+    const myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *split,
+    uint32_t dim, uint32_t top_k, uint32_t n_tok) {
+    if (!g_initialized || !n_tok || !dim || (dim & 3u) != 0u) return 0;
+    if (!moe_epilogue_fuse_pso_for_k(top_k)) return 0;
+    if (!v41_floats(dst_res, 4ull * dim * n_tok) ||
+        !v41_floats(scratch_down, (uint64_t)top_k * dim * n_tok) ||
+        !v41_floats(shared_out, (uint64_t)dim * n_tok) ||
+        !v41_floats(residual, 4ull * dim * n_tok) ||
+        !v41_floats(split, 24ull * n_tok)) {
+        return 0;
+    }
+    if ((dst_res->offset & 15u) != 0u || (scratch_down->offset & 15u) != 0u ||
+        (shared_out->offset & 15u) != 0u || (residual->offset & 15u) != 0u ||
+        (split->offset & 15u) != 0u) {
+        return 0;
+    }
+    const uint64_t dst_bytes = 16ull * dim * n_tok;
+    if (v41_buf_overlaps_range(dst_res, dst_bytes, scratch_down, 4ull * top_k * dim * n_tok) ||
+        v41_buf_overlaps_range(dst_res, dst_bytes, shared_out, 4ull * dim * n_tok) ||
+        v41_buf_overlaps_range(dst_res, dst_bytes, residual, 16ull * dim * n_tok) ||
+        v41_buf_overlaps_range(dst_res, dst_bytes, split, 96ull * n_tok)) {
+        return 0;
+    }
+    return 1;
+}
+
+static void encode_moe_epilogue_fuse(
+    id<MTLComputeCommandEncoder> enc,
+    id<MTLComputePipelineState> pso,
+    myds_metal_buffer_t *dst_res,
+    const myds_metal_buffer_t *scratch_down,
+    const myds_metal_buffer_t *shared_out,
+    const myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *split,
+    uint32_t dim, uint32_t top_k, uint32_t n_tok) {
+    struct v41_moe_epilogue_fuse_args args = {
+        .dim = dim,
+        .n_tokens = n_tok,
+        .top_k = top_k,
+        .round_bf16 = 1u,
+    };
+    const uint32_t dim4 = dim >> 2u;
+    NSUInteger nth = pso.maxTotalThreadsPerThreadgroup;
+    if (nth > 256u) nth = 256u;
+    if (nth > dim4) nth = dim4;
+    if (nth == 0u) nth = 1u;
+    NSUInteger gx = (dim4 + (uint32_t)nth - 1u) / (uint32_t)nth;
+    if (gx == 0u) gx = 1u;
+
+    [enc setComputePipelineState:pso];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:scratch_down->mtl_buf offset:scratch_down->offset atIndex:1];
+    [enc setBuffer:shared_out->mtl_buf offset:shared_out->offset atIndex:2];
+    [enc setBuffer:residual->mtl_buf offset:residual->offset atIndex:3];
+    [enc setBuffer:split->mtl_buf offset:split->offset atIndex:4];
+    [enc setBuffer:dst_res->mtl_buf offset:dst_res->offset atIndex:5];
+    metal_dispatch(enc, "v41_moe_epilogue_fuse",
+        MTLSizeMake(gx, (NSUInteger)n_tok, 1), MTLSizeMake(nth, 1, 1));
+}
+
+int myds_metal_v41_moe_sumk_add_hc_expand_batch(
+    myds_metal_buffer_t       *dst_res,
+    const myds_metal_buffer_t *scratch_down,
+    const myds_metal_buffer_t *shared_out,
+    const myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *split,
+    uint32_t                   dim,
+    uint32_t                   top_k,
+    uint32_t                   n_tok) {
+    if (!n_tok) return 1;
+    if (!validate_moe_epilogue_fuse_args(dst_res, scratch_down, shared_out, residual, split, dim, top_k, n_tok)) {
+        return 0;
+    }
+    id<MTLComputePipelineState> pso = moe_epilogue_fuse_pso_for_k(top_k);
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
+        if (!enc) return 0;
+        if (g_batch_cb) {
+            if (g_auto_barrier) {
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            } else {
+                const myds_metal_buffer_t *ins[4] = {scratch_down, shared_out, residual, split};
+                myds_metal_barrier_buffers(ins, 4);
+            }
+        }
+        encode_moe_epilogue_fuse(enc, pso, dst_res, scratch_down, shared_out, residual, split, dim, top_k, n_tok);
+        if (g_batch_cb) {
+            if (g_auto_barrier) {
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            } else {
+                id<MTLResource> out_res = dst_res->mtl_buf;
+                [enc memoryBarrierWithResources:&out_res count:1];
+            }
+            return 1;
+        }
+        [enc endEncoding];
+        [cb commit];
+        return wait_command_buffer(cb) ? 1 : 0;
     }
 }
 
@@ -6728,6 +6900,13 @@ static void moe_split_point(id<MTLCommandBuffer> *cbp,
     *encp = get_compute_encoder(*cbp);
 }
 
+typedef struct {
+    myds_metal_buffer_t       *dst_res;
+    const myds_metal_buffer_t *shared_out;
+    const myds_metal_buffer_t *residual;
+    const myds_metal_buffer_t *split;
+} moe_epilogue_fuse_job_t;
+
 static int routed_moe_batch_impl(
     myds_metal_buffer_t       *moe_out,
     const myds_metal_buffer_t *x_in,
@@ -6751,7 +6930,8 @@ static int routed_moe_batch_impl(
     float                      clamp_val,
     bool                       q2_v41_allowed,
     bool                       iq2_v41_allowed,
-    const shared_down_job_t    *shared_down) {
+    const shared_down_job_t    *shared_down,
+    const moe_epilogue_fuse_job_t *epilogue) {
     if (!moe_out || !x_in || !gate_exps || !up_exps || !down_exps ||
         !selected_ids || !selected_weights || !scratch_gate || !scratch_up ||
         !scratch_mid || !scratch_down || n_tok == 0) {
@@ -6766,6 +6946,19 @@ static int routed_moe_batch_impl(
     if (!q2_v41_allowed && (!g_pso_moe_mv_id_iq2_xxs || !g_pso_moe_mv_id_q2_k ||
         !g_pso_moe_swiglu_weight || !g_pso_moe_sum6)) {
         return 0;
+    }
+    if (epilogue) {
+        if (q2_v41_allowed || iq2_v41_allowed || shared_down) return 0;
+        if (!validate_moe_epilogue_fuse_args(epilogue->dst_res, scratch_down,
+                epilogue->shared_out, epilogue->residual, epilogue->split,
+                dim, n_activated_experts, n_tok)) {
+            return 0;
+        }
+        if (!validate_moe_epilogue_fuse_args(epilogue->dst_res, moe_out,
+                epilogue->shared_out, epilogue->residual, epilogue->split,
+                dim, 1u, n_tok)) {
+            return 0;
+        }
     }
     /* Candidate requires only its actually selected producer/down PSOs.
      * Reject before creating an encoder; unused reference providers need not
@@ -7170,17 +7363,27 @@ static int routed_moe_batch_impl(
                 [enc memoryBarrierWithResources:&res count:1];
             }
 
-            /* Step 4: Sum Experts dispatch */
-            NSUInteger nth = pso_sumk.maxTotalThreadsPerThreadgroup;
-            if (nth > 256u) nth = 256u;
-            if (nth > dim) nth = dim;
-            if (nth == 0) nth = 1u;
-            [enc setComputePipelineState:pso_sumk];
-            [enc setBytes:&sum_args length:sizeof(sum_args) atIndex:0];
-            [enc setBuffer:scratch_down->mtl_buf offset:scratch_down->offset atIndex:1];
-            [enc setBuffer:moe_out->mtl_buf offset:moe_out->offset atIndex:2];
-            metal_dispatch(enc, "moe_sumk", MTLSizeMake((NSUInteger)n_tok, 1, 1),
-                MTLSizeMake(nth, 1, 1));
+            /* Step 4: Sum Experts dispatch (or [P-E1] Fused sumk + add + HC expand4 direct to prompt_res) */
+            if (epilogue) {
+                id<MTLComputePipelineState> pso_ep = moe_epilogue_fuse_pso_for_k(n_activated_experts);
+                encode_moe_epilogue_fuse(enc, pso_ep, epilogue->dst_res, scratch_down,
+                    epilogue->shared_out, epilogue->residual, epilogue->split,
+                    dim, n_activated_experts, n_tok);
+                atomic_fetch_add_explicit(&g_moe_epilogue_fuse_counters[0], 1u, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_moe_epilogue_fuse_counters[1], 1u, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_moe_epilogue_fuse_counters[4], (uint64_t)n_tok, memory_order_relaxed);
+            } else {
+                NSUInteger nth = pso_sumk.maxTotalThreadsPerThreadgroup;
+                if (nth > 256u) nth = 256u;
+                if (nth > dim) nth = dim;
+                if (nth == 0) nth = 1u;
+                [enc setComputePipelineState:pso_sumk];
+                [enc setBytes:&sum_args length:sizeof(sum_args) atIndex:0];
+                [enc setBuffer:scratch_down->mtl_buf offset:scratch_down->offset atIndex:1];
+                [enc setBuffer:moe_out->mtl_buf offset:moe_out->offset atIndex:2];
+                metal_dispatch(enc, "moe_sumk", MTLSizeMake((NSUInteger)n_tok, 1, 1),
+                    MTLSizeMake(nth, 1, 1));
+            }
             if (g_moe_split) {
                 moe_split_point(&cb, &enc, &g_moe_t_sum);
                 g_moe_split_calls++;
@@ -7200,6 +7403,9 @@ static int routed_moe_batch_impl(
             if (g_batch_cb) {
                 if (g_auto_barrier) {
                     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                } else if (epilogue) {
+                    id<MTLResource> res = epilogue->dst_res->mtl_buf;
+                    [enc memoryBarrierWithResources:&res count:1];
                 }
             } else {
                 [enc endEncoding];
@@ -7424,11 +7630,26 @@ static int routed_moe_batch_impl(
                 atomic_fetch_add_explicit(&g_decode_candidates[DC_OVERLAP][1],1,memory_order_relaxed);
             }
 
-            if (g_batch_cb) {
+            if (epilogue) {
                 if (g_auto_barrier) {
                     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
                 } else {
                     id<MTLResource> res = moe_out->mtl_buf;
+                    [enc memoryBarrierWithResources:&res count:1];
+                }
+                encode_moe_epilogue_fuse(enc, g_pso_v41_moe_epilogue_fuse_k1, epilogue->dst_res,
+                    moe_out, epilogue->shared_out, epilogue->residual, epilogue->split,
+                    dim, 1u, n_tok);
+                atomic_fetch_add_explicit(&g_moe_epilogue_fuse_counters[0], 1u, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_moe_epilogue_fuse_counters[2], 1u, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_moe_epilogue_fuse_counters[4], (uint64_t)n_tok, memory_order_relaxed);
+            }
+
+            if (g_batch_cb) {
+                if (g_auto_barrier) {
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                } else {
+                    id<MTLResource> res = epilogue ? epilogue->dst_res->mtl_buf : moe_out->mtl_buf;
                     [enc memoryBarrierWithResources:&res count:1];
                 }
             } else {
@@ -7478,7 +7699,44 @@ int myds_metal_routed_moe_batch(
     return routed_moe_batch_impl(moe_out, x_in, gate_exps, up_exps, down_exps,
         selected_ids, selected_weights, scratch_gate, scratch_up, scratch_mid, scratch_down,
         dim, expert_dim, n_routed_experts, n_activated_experts, n_tok,
-        gate_type, up_type, down_type, clamp_val, false, false, NULL);
+        gate_type, up_type, down_type, clamp_val, false, false, NULL, NULL);
+}
+
+int myds_metal_routed_moe_batch_epilogue_fused(
+    myds_metal_buffer_t       *dst_res,
+    myds_metal_buffer_t       *moe_out_fallback,
+    const myds_metal_buffer_t *x_in,
+    const myds_metal_buffer_t *gate_exps,
+    const myds_metal_buffer_t *up_exps,
+    const myds_metal_buffer_t *down_exps,
+    const myds_metal_buffer_t *selected_ids,
+    const myds_metal_buffer_t *selected_weights,
+    const myds_metal_buffer_t *shared_out,
+    const myds_metal_buffer_t *residual,
+    const myds_metal_buffer_t *split,
+    myds_metal_buffer_t       *scratch_gate,
+    myds_metal_buffer_t       *scratch_up,
+    myds_metal_buffer_t       *scratch_mid,
+    myds_metal_buffer_t       *scratch_down,
+    uint32_t                   dim,
+    uint32_t                   expert_dim,
+    uint32_t                   n_routed_experts,
+    uint32_t                   n_activated_experts,
+    uint32_t                   n_tok,
+    ggml_type                  gate_type,
+    ggml_type                  up_type,
+    ggml_type                  down_type,
+    float                      clamp_val) {
+    moe_epilogue_fuse_job_t ep = {
+        .dst_res = dst_res,
+        .shared_out = shared_out,
+        .residual = residual,
+        .split = split,
+    };
+    return routed_moe_batch_impl(moe_out_fallback, x_in, gate_exps, up_exps, down_exps,
+        selected_ids, selected_weights, scratch_gate, scratch_up, scratch_mid, scratch_down,
+        dim, expert_dim, n_routed_experts, n_activated_experts, n_tok,
+        gate_type, up_type, down_type, clamp_val, false, false, NULL, &ep);
 }
 
 int myds_metal_routed_moe(
@@ -7819,7 +8077,7 @@ static int routed_moe_scoped_impl(
             const int ok = routed_moe_batch_impl(moe_out, x_in, gate_exps, up_exps, down_exps,
                 selected_ids, selected_weights, scratch_gate, scratch_up, scratch_mid, scratch_down,
                 dim, expert_dim, n_routed_experts, n_activated_experts, 1u,
-                gate_type, up_type, down_type, clamp_val, g_moe_q2_v41, g_moe_iq2_v41, shared_down);
+                gate_type, up_type, down_type, clamp_val, g_moe_q2_v41, g_moe_iq2_v41, shared_down, NULL);
             return ok ? 1 : scoped_moe_candidate_failure("encoding or standalone completion failed");
         }
     }
@@ -9140,6 +9398,26 @@ void myds_metal_moe_prefill_m1_counters(myds_metal_moe_prefill_m1_counters_t *ou
     }
     if (out) {
         *out = (myds_metal_moe_prefill_m1_counters_t){v[0], v[1], v[2], v[3], v[4]};
+    }
+}
+
+int myds_metal_moe_epilogue_fuse_enabled(void) {
+    return g_moe_epilogue_fuse ? 1 : 0;
+}
+
+void myds_metal_moe_epilogue_fuse_record_fallback(void) {
+    atomic_fetch_add_explicit(&g_moe_epilogue_fuse_counters[3], 1u, memory_order_relaxed);
+}
+
+void myds_metal_moe_epilogue_fuse_counters(myds_metal_moe_epilogue_fuse_counters_t *out, bool reset) {
+    uint64_t v[5];
+    for (unsigned i = 0; i < 5u; ++i) {
+        v[i] = reset
+            ? atomic_exchange_explicit(&g_moe_epilogue_fuse_counters[i], 0u, memory_order_relaxed)
+            : atomic_load_explicit(&g_moe_epilogue_fuse_counters[i], memory_order_relaxed);
+    }
+    if (out) {
+        *out = (myds_metal_moe_epilogue_fuse_counters_t){v[0], v[1], v[2], v[3], v[4]};
     }
 }
 

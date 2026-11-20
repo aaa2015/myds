@@ -7110,6 +7110,7 @@ struct v41_chunk_workspace_s {
     myds_metal_buffer_t *shared_view;
     myds_metal_buffer_t *after_view;
     myds_metal_buffer_t *split_view;
+    myds_metal_buffer_t *epilogue_res_view;
     myds_metal_buffer_t *in_after_view;
     myds_metal_buffer_t *in_norm_view;
     myds_metal_buffer_t *in_split_view;
@@ -7224,6 +7225,7 @@ static void v41_chunk_workspace_free(v41_chunk_workspace_t *cw) {
     if (cw->shared_view) myds_metal_buffer_free(cw->shared_view);
     if (cw->after_view) myds_metal_buffer_free(cw->after_view);
     if (cw->split_view) myds_metal_buffer_free(cw->split_view);
+    if (cw->epilogue_res_view) myds_metal_buffer_free(cw->epilogue_res_view);
     if (cw->in_after_view) myds_metal_buffer_free(cw->in_after_view);
     if (cw->in_norm_view) myds_metal_buffer_free(cw->in_norm_view);
     if (cw->in_split_view) myds_metal_buffer_free(cw->in_split_view);
@@ -7404,6 +7406,7 @@ static v41_chunk_workspace_t *v41_chunk_workspace_create(uint32_t capacity, uint
     cw->shared_view = myds_metal_buffer_create_view();
     cw->after_view = myds_metal_buffer_create_view();
     cw->split_view = myds_metal_buffer_create_view();
+    cw->epilogue_res_view = myds_metal_buffer_create_view();
     cw->in_after_view = myds_metal_buffer_create_view();
     cw->in_norm_view = myds_metal_buffer_create_view();
     cw->in_split_view = myds_metal_buffer_create_view();
@@ -7413,7 +7416,7 @@ static v41_chunk_workspace_t *v41_chunk_workspace_create(uint32_t capacity, uint
     if (!cw->cur_res_view || !cw->cur_pre_view || !cw->cur_engram_view[0] || !cw->cur_engram_view[1] ||
         !cw->cur_selected_view || !cw->cur_mask_view ||
         !cw->cur_index_q_view || !cw->cur_index_weights_view ||
-        !cw->moe_view || !cw->shared_view || !cw->after_view || !cw->split_view ||
+        !cw->moe_view || !cw->shared_view || !cw->after_view || !cw->split_view || !cw->epilogue_res_view ||
         !cw->in_after_view || !cw->in_norm_view || !cw->in_split_view ||
         !cw->in_shared_view || !cw->in_ids_view || !cw->in_weights_view) goto fail;
     return cw;
@@ -9145,6 +9148,39 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                         moe_solo_t0 = (double)tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
                     }
                     if (!myds_metal_get_auto_barrier()) myds_metal_barrier();
+                    const bool steer_active = (ctx->steer && ctx->steer->enabled &&
+                                               myds_steer_is_layer_active(ctx->steer, il));
+                    const bool ep_fuse_enabled = (myds_metal_moe_epilogue_fuse_enabled() != 0);
+                    const bool use_epilogue_fuse = ep_fuse_enabled &&
+                                                   direct_moe_acc && !trace_on && !steer_active &&
+                                                   !moe_solo && !(do_prof && opt_prof_moe) &&
+                                                   (k == 3u || k == 4u || k == 6u);
+                    if (use_epilogue_fuse) {
+                        if (!myds_metal_buffer_update_sub_view(cw->epilogue_res_view, prompt_res,
+                                (size_t)mb_moe_start * res_tok_bytes,
+                                (size_t)mb_moe_len * res_tok_bytes)) {
+                            MYDS_LOG_E("V4.1 MoE epilogue prompt_res sub-view failed (start=%u len=%u)",
+                                       mb_moe_start, mb_moe_len);
+                            goto fail;
+                        }
+                        CHECK(myds_metal_routed_moe_batch_epilogue_fused(
+                            cw->epilogue_res_view, cw->moe_out_acc, cw->moe_norm_acc,
+                            base->ffn_gate_exps, base->ffn_up_exps, base->ffn_down_exps,
+                            cw->moe_ids_acc, cw->moe_w_acc,
+                            cw->moe_shared_acc, cw->moe_after_acc, cw->moe_split_acc,
+                            cw->moe_gate_buf, cw->moe_up_buf, cw->moe_mid_buf, cw->moe_down_buf,
+                            V41_DIM, width, m->n_routed_experts, k, mb_moe_len,
+                            base->ffn_gate_exps_type, base->ffn_up_exps_type, base->ffn_down_exps_type,
+                            m->swiglu_clamp_exp));
+                        CHECK(myds_metal_buffer_copy(prompt_pre, (size_t)mb_moe_start * pre_tok_bytes,
+                                                     cw->moe_split_acc, 0,
+                                                     (size_t)mb_moe_len * pre_tok_bytes));
+                        if (!myds_metal_get_auto_barrier()) myds_metal_barrier();
+                        moe_off = 0;
+                    } else {
+                    if (ep_fuse_enabled) {
+                        myds_metal_moe_epilogue_fuse_record_fallback();
+                    }
                     CHECK(myds_metal_routed_moe_batch(cw->moe_out_acc, cw->moe_norm_acc,
                         base->ffn_gate_exps, base->ffn_up_exps, base->ffn_down_exps,
                         cw->moe_ids_acc, cw->moe_w_acc,
@@ -9226,7 +9262,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                             }
                         }
 
-                        if (ctx->steer && ctx->steer->enabled && myds_steer_is_layer_active(ctx->steer, il)) {
+                        if (steer_active) {
                             CHECK(myds_metal_steer_hc_residual(cw->layer_out_buf, ctx->steer->directions[il],
                                                                ctx->steer->alpha_effective, V41_DIM, e_len));
                         }
@@ -9237,6 +9273,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                                                      sp_b, 0, (size_t)e_len * pre_tok_bytes));
                     }
                     moe_off = 0;
+                    }
                 }
                 }  /* !kv_only */
                 /* ★ 前缀快照：本层在本 chunk 结束处的窗口环。时刻它正好含 [p-128, p-1]，
