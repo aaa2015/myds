@@ -117,45 +117,6 @@ kernel void kernel_dsv41_rope_round(
     x[i + 1u] = dsv41_bf16(re * s + im * c);
 }
 
-/* [CAND-A1 S1] Fused BF16-round + RoPE -> contiguous packed half Q.
- * Produces (half)dsv41_bf16(...) bit-identically to kernel_dsv41_rope_round
- * followed by flash_attn's (half4)q4 conversion, halving Q memory traffic
- * and allowing zero-sq maskless-slab Q=16/Q=32 kernels to load Q from L1. */
-kernel void kernel_dsv41_rope_round_f16(
-        constant ds4_metal_args_dsv41_rope &args,
-        device const float *src,
-        device half *dst,
-        uint2 group [[threadgroup_position_in_grid]],
-        uint lane [[thread_index_in_simdgroup]]) {
-    const ulong head_base = ((ulong)group.y * (ulong)args.heads + (ulong)group.x) * (ulong)args.width;
-    const uint unrotated = args.width >= 64u ? args.width - 64u : 0u;
-    if ((unrotated & 3u) == 0u && (head_base & 3u) == 0u) {
-        device const packed_float4 *src4 = (device const packed_float4 *)(src + head_base);
-        device packed_half4 *dst4 = (device packed_half4 *)(dst + head_base);
-        const uint unrot4 = unrotated >> 2u;
-        for (uint k4 = lane; k4 < unrot4; k4 += 32u) {
-            const float4 v = float4(src4[k4]);
-            dst4[k4] = packed_half4(
-                (half)dsv41_bf16(v.x),
-                (half)dsv41_bf16(v.y),
-                (half)dsv41_bf16(v.z),
-                (half)dsv41_bf16(v.w));
-        }
-    } else {
-        for (uint k = lane; k < unrotated; k += 32u) {
-            const ulong idx = head_base + (ulong)k;
-            dst[idx] = (half)dsv41_bf16(src[idx]);
-        }
-    }
-    const float theta = float(args.start + group.y * args.stride) * args.frequencies[lane];
-    const float c = precise::cos(theta);
-    const float s = args.inverse ? -precise::sin(theta) : precise::sin(theta);
-    const ulong i = head_base + (ulong)unrotated + 2u * (ulong)lane;
-    const float re = dsv41_bf16(src[i]), im = dsv41_bf16(src[i + 1u]);
-    dst[i] = (half)dsv41_bf16(re * c - im * s);
-    dst[i + 1u] = (half)dsv41_bf16(re * s + im * c);
-}
-
 /* Decode-only fused finish. Each Q head retains the original 32-pair RoPE
  * mapping. The other 16 groups process one 32-value KV quantization block.
  * KV tail pairs are read BEFORE any writes; paired elements always share a

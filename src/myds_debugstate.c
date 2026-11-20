@@ -223,9 +223,6 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
     myds_v41_gpu_decode_topk_fast_counters_t dtf;
     memset(&dtf, 0, sizeof(dtf));
     myds_v41_gpu_decode_topk_fast_counters(&dtf, false);
-    myds_metal_decode_iq2_fast_counters_t iq2f;
-    memset(&iq2f, 0, sizeof(iq2f));
-    myds_metal_decode_iq2_fast_counters(&iq2f, false);
     myds_engram_async_t1_counters_t eat1;
     memset(&eat1, 0, sizeof(eat1));
     myds_engram_async_t1_counters(&eat1, false);
@@ -235,14 +232,6 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
     myds_metal_hc_mix_fast_counters_t hcm;
     memset(&hcm, 0, sizeof(hcm));
     myds_metal_hc_mix_fast_counters(&hcm, false);
-    myds_v41_gpu_prefill_attn_q16_counters_t paq;
-    memset(&paq, 0, sizeof(paq));
-    myds_v41_gpu_prefill_attn_q16_counters(&paq, false);
-    const int paq_mode = myds_v41_gpu_prefill_attn_q16_mode();
-    myds_v41_gpu_prefill_attn_rope_fuse_counters_t parf;
-    memset(&parf, 0, sizeof(parf));
-    myds_v41_gpu_prefill_attn_rope_fuse_counters(&parf, false);
-    const int parf_enabled = myds_v41_gpu_prefill_attn_rope_fuse_enabled();
     myds_v41_gpu_prefill_attn_l01_mma_counters_t pal01;
     memset(&pal01, 0, sizeof(pal01));
     myds_v41_gpu_prefill_attn_l01_mma_counters(&pal01, false);
@@ -315,7 +304,6 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          "\"prefix_top2048_encoded\":%llu,\"l20_self_compact_requests\":%llu,"
          "\"l20_self_compact_encoded\":%llu,\"l20_self_compact_fallbacks\":%llu,"
          "\"l20_self_compact_failures\":%llu},"
-         "\"decode_iq2_fast\":{\"requests\":%llu,\"encoded\":%llu,\"failures\":%llu},"
          "\"engram_async_t1\":{\"requests\":%llu,\"dispatched\":%llu,\"joined\":%llu,"
          "\"cancelled\":%llu,\"failures\":%llu},"
          "\"dense_prefill_wide\":{\"enabled\":%d,\"requests\":%llu,\"wide_encoded\":%llu,"
@@ -323,12 +311,7 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          "\"qb_rope64_encoded\":%llu,\"fallbacks\":%llu,\"failures\":%llu},"
          "\"hc_mix_fast\":{\"gemv_nr24_encoded\":%llu,\"rmsnorm_single_read_encoded\":%llu,"
          "\"expand4_vec_encoded\":%llu},"
-         "\"prefill_attn_q16\":{\"mode\":%d,\"q16_encoded\":%llu,\"q32_encoded\":%llu,"
-         "\"q_rope_f16_encoded\":%llu},"
-         "\"prefill_attn_rope_fuse\":{\"enabled\":%d,\"q8_encoded\":%llu,\"q16_encoded\":%llu,"
-         "\"q32_encoded\":%llu,\"l01_encoded\":%llu},"
-         "\"prefill_attn_l01_mma\":{\"enabled\":%d,\"encoded\":%llu,\"q16_encoded\":%llu,"
-         "\"q32_encoded\":%llu,\"rope_fuse_encoded\":%llu},\"prefix_cache_len\":%u},",
+         "\"prefill_attn_l01_mma\":{\"enabled\":%d,\"encoded\":%llu},\"prefix_cache_len\":%u},",
          (unsigned)idx_mode, idx_fmt, (unsigned)idx_row_bytes,
          (unsigned)kv_mode, kv_fmt, (unsigned)kv_row_bytes,
          (unsigned long long)ro.requests, (unsigned long long)ro.encoded,
@@ -368,9 +351,6 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          (unsigned long long)dtf.l20_self_compact_encoded,
          (unsigned long long)dtf.l20_self_compact_fallbacks,
          (unsigned long long)dtf.l20_self_compact_failures,
-         (unsigned long long)iq2f.requests,
-         (unsigned long long)iq2f.encoded,
-         (unsigned long long)iq2f.failures,
          (unsigned long long)eat1.requests,
          (unsigned long long)eat1.dispatched,
          (unsigned long long)eat1.joined,
@@ -388,20 +368,8 @@ void myds_debug_state_json(char *out, size_t cap, const struct myds_context *ctx
          (unsigned long long)hcm.gemv_nr24_encoded,
          (unsigned long long)hcm.rmsnorm_single_read_encoded,
          (unsigned long long)hcm.expand4_vec_encoded,
-         paq_mode,
-         (unsigned long long)paq.q16_encoded,
-         (unsigned long long)paq.q32_encoded,
-         (unsigned long long)paq.q_rope_f16_encoded,
-         parf_enabled,
-         (unsigned long long)parf.q8_encoded,
-         (unsigned long long)parf.q16_encoded,
-         (unsigned long long)parf.q32_encoded,
-         (unsigned long long)parf.l01_encoded,
          pal01_enabled,
          (unsigned long long)pal01.encoded,
-         (unsigned long long)pal01.q16_encoded,
-         (unsigned long long)pal01.q32_encoded,
-         (unsigned long long)pal01.rope_fuse_encoded,
          ctx ? myds_context_get_pcache_len(ctx) : 0u);
 
     const myds_steer_t *st = ctx ? myds_context_get_steer(ctx) : NULL;

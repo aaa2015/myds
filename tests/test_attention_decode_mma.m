@@ -372,7 +372,7 @@ static void test_knob_parsing(void) {
 
     const char *valid_vals[] = {"1", "2", "4", "8"};
     const int expected_ret[] = {1, 2, 4, 8};
-    const uint32_t expected_ds[] = {4u, 2u, 4u, 8u};
+    const uint32_t expected_ds[] = {8u, 2u, 4u, 8u};
     for (size_t i = 0; i < 4; i++) {
         setenv("MYDS_ATTN_DECODE_MMA", valid_vals[i], 1);
         REQUIRE(myds_v41_gpu_attention_decode_mma_enabled() == expected_ret[i]);
@@ -389,7 +389,7 @@ static void test_knob_parsing(void) {
 
     unsetenv("MYDS_ATTN_DECODE_MMA");
     REQUIRE(myds_v41_gpu_attention_decode_mma_enabled() == 0);
-    printf("  PASS: absent/0->0, 1->1(d_split=4), 2/4/8->2/4/8, 12 invalid values fail-closed (-1).\n");
+    printf("  PASS: absent/0->0, 1->1(d_split=8), 2/4/8->2/4/8, 12 invalid values fail-closed (-1).\n");
 }
 
 /* 2. Print PSO residency for all variants */
@@ -680,7 +680,7 @@ static void test_c_runtime_integration(void) {
 
         /* Test all modes {1, 2, 4, 8} under RF=1 (production config) and RF=0 (standalone) */
         const char *modes[] = {"1", "2", "4", "8"};
-        const uint32_t exp_ds[] = {4u, 2u, 4u, 8u};
+        const uint32_t exp_ds[] = {8u, 2u, 4u, 8u};
         for (int rf = 1; rf >= 0; rf--) {
             setenv("MYDS_ATTN_ROPE_FUSE", rf ? "1" : "0", 1);
             for (size_t mi = 0; mi < 4; mi++) {

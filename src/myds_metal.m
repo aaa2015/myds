@@ -88,11 +88,6 @@ static id<MTLComputePipelineState> g_pso_moe_sum3 = nil;
 static id<MTLComputePipelineState> g_pso_moe_sum4 = nil;
 static id<MTLComputePipelineState> g_pso_moe_pair_swiglu_iq2_xxs = nil;
 static id<MTLComputePipelineState> g_pso_moe_pair_swiglu_popcnt_iq2_xxs = nil;
-static id<MTLComputePipelineState> g_pso_moe_pair_swiglu_popcnt_fast_iq2_xxs = nil;
-static bool                        g_decode_iq2_fast = false;
-static atomic_uint_fast64_t        g_decode_iq2_fast_requests = 0;
-static atomic_uint_fast64_t        g_decode_iq2_fast_encoded = 0;
-static atomic_uint_fast64_t        g_decode_iq2_fast_failures = 0;
 static id<MTLComputePipelineState> g_pso_moe_sum6_q2_k = nil;
 static id<MTLComputePipelineState> g_pso_moe_sum6_v41_q2_k = nil;
 /* 2026-10-21 D3 重做：专家进 grid.z + double-single 累加（顺序无关） */
@@ -634,16 +629,13 @@ static bool moe_q2_v41_geometry(void) {
 }
 
 static id<MTLComputePipelineState> moe_q2_v41_producer(void) {
-    if (g_decode_iq2_fast && g_pso_moe_pair_swiglu_popcnt_fast_iq2_xxs)
-        return g_pso_moe_pair_swiglu_popcnt_fast_iq2_xxs;
     return g_moe_iq2_popcnt_sign ? g_pso_moe_pair_swiglu_popcnt_iq2_xxs : g_pso_moe_pair_swiglu_iq2_xxs;
 }
 
 static bool moe_q2_v41_producer_geometry(bool constant_lut) {
     id<MTLComputePipelineState> pso = moe_q2_v41_producer();
     const NSUInteger threads = 32u * (NSUInteger)g_moe_nsg;
-    const NSUInteger dynamic_bytes = g_decode_iq2_fast ? 2048u
-        : (g_moe_iq2_popcnt_sign ? 2176u : (constant_lut ? 0u : 2176u));
+    const NSUInteger dynamic_bytes = g_moe_iq2_popcnt_sign ? 2176u : (constant_lut ? 0u : 2176u);
     return g_device && pso && pso.device == g_device &&
         pso.threadExecutionWidth == 32u && pso.maxTotalThreadsPerThreadgroup >= threads &&
         g_device.maxThreadsPerThreadgroup.width >= 32u &&
@@ -651,31 +643,6 @@ static bool moe_q2_v41_producer_geometry(bool constant_lut) {
         g_device.maxThreadsPerThreadgroup.depth >= 1u &&
         dynamic_bytes <= g_device.maxThreadgroupMemoryLength &&
         pso.staticThreadgroupMemoryLength <= g_device.maxThreadgroupMemoryLength - dynamic_bytes;
-}
-
-static int decode_iq2_fast_parse_mode(void) {
-    const char *v = getenv("MYDS_DECODE_IQ2_FAST");
-    if (!v || strcmp(v, "0") == 0) return 0;
-    if (strcmp(v, "1") == 0) return 1;
-    fprintf(stderr, "myds_metal: MYDS_DECODE_IQ2_FAST must be exactly absent, 0 or 1\n");
-    return -1;
-}
-
-int myds_metal_decode_iq2_fast_enabled(void) {
-    return decode_iq2_fast_parse_mode();
-}
-
-void myds_metal_decode_iq2_fast_counters(
-    myds_metal_decode_iq2_fast_counters_t *out, bool reset) {
-#define IQ2F_COUNT(field) (reset ? atomic_exchange_explicit(&g_decode_iq2_fast_##field, 0, memory_order_relaxed) \
-                                 : atomic_load_explicit(&g_decode_iq2_fast_##field, memory_order_relaxed))
-    const myds_metal_decode_iq2_fast_counters_t value = {
-        .requests = IQ2F_COUNT(requests),
-        .encoded  = IQ2F_COUNT(encoded),
-        .failures = IQ2F_COUNT(failures)
-    };
-    if (out) *out = value;
-#undef IQ2F_COUNT
 }
 
 static int moe_q2_sum_cache_parse_mode(void) {
@@ -2068,13 +2035,6 @@ int myds_metal_init(const char *shader_dir) {
         const char *pc = getenv("MYDS_MOE_IQ2_POPCNT_SIGN");
         g_moe_iq2_popcnt_sign = (pc && strcmp(pc, "1") == 0) ? 1 : 0;
     }
-    const int decode_iq2_fast = decode_iq2_fast_parse_mode();
-    if (decode_iq2_fast < 0) return 0;
-    if (decode_iq2_fast == 1 && (moe_iq2_constant_lut || moe_iq2_v41)) {
-        fprintf(stderr, "myds_metal: MYDS_DECODE_IQ2_FAST=1 is incompatible with constant-LUT or IQ2 V4.1\n");
-        return 0;
-    }
-    g_decode_iq2_fast = (decode_iq2_fast == 1);
     if (!moe_q2_sum_cache_modes_valid(moe_q2_sum_cache, moe_q2_sum_cache_fused, moe_iq2_constant_lut)) return 0;
     /* The existing popcount shader owns a threadgroup LUT even when another
      * experiment selected the constant-LUT provider. Their old combined host
@@ -2206,7 +2166,6 @@ int myds_metal_init(const char *shader_dir) {
                         @"kernel_dsv41_engram_add",
                         @"kernel_dsv41_rope",
                         @"kernel_dsv41_rope_round",
-                        @"kernel_dsv41_rope_round_f16",
                         @"kernel_compute_copy_u8",
                         @"kernel_compute_copy_u32",
                         @"kernel_compute_copy_u32x4",
@@ -2571,21 +2530,6 @@ int myds_metal_init(const char *shader_dir) {
             }
             if (!g_pso_moe_pair_swiglu_popcnt_iq2_xxs) {
                 fprintf(stderr, "myds_metal: explicitly requested IQ2 popcount-sign kernel unavailable\n");
-                g_initialized = true;
-                myds_metal_cleanup();
-                return 0;
-            }
-        }
-        if (g_decode_iq2_fast) {
-            pso_err = nil;
-            fn = [g_library newFunctionWithName:@"kernel_mul_mv_id_iq2_xxs_pair_swiglu_popcnt_fast_f32"
-                                 constantValues:moe_mv_id_constants error:&pso_err];
-            if (fn) {
-                g_pso_moe_pair_swiglu_popcnt_fast_iq2_xxs = [g_device newComputePipelineStateWithFunction:fn error:&pso_err];
-            }
-            if (!g_pso_moe_pair_swiglu_popcnt_fast_iq2_xxs) {
-                atomic_fetch_add_explicit(&g_decode_iq2_fast_failures, 1, memory_order_relaxed);
-                fprintf(stderr, "myds_metal: explicitly requested MYDS_DECODE_IQ2_FAST kernel unavailable\n");
                 g_initialized = true;
                 myds_metal_cleanup();
                 return 0;
@@ -3081,8 +3025,6 @@ int myds_metal_init(const char *shader_dir) {
         MYDS_LOG_I("Routed MoE IQ2 LUT: %s", g_moe_iq2_constant_lut ? "constant (explicit)" : "threadgroup (reference)");
         if (g_moe_iq2_popcnt_sign)
             MYDS_LOG_I("Routed MoE IQ2 gate/up sign: popcount (explicit, bit-exact)");
-        if (g_decode_iq2_fast)
-            MYDS_LOG_I("Routed MoE Decode IQ2 fast: 1 (2048 B smem, 64-bit grid hoist, branchless FP select, contract(off))");
         MYDS_LOG_I("Batch2 Q8 shared weights: %s", batch2_q8_shared ? "enabled (explicit; TAIL, SHARED, QKV)" : "disabled (scalar reference)");
         MYDS_LOG_I("LM-head Q8 rows per threadgroup: %d (%s; single token, large output, NSG8)",
                    g_lm_head_q8_nr0, lm_head_q8_nr0 == 4 ? "explicit candidate" : "reference");
@@ -3222,8 +3164,6 @@ void myds_metal_cleanup(void) {
     g_moe_iq2_constant_lut = false;
     g_moe_iq2_popcnt_sign = 0;
     g_pso_moe_pair_swiglu_popcnt_iq2_xxs = nil;
-    g_decode_iq2_fast = false;
-    g_pso_moe_pair_swiglu_popcnt_fast_iq2_xxs = nil;
     g_pso_attn_out_low_q8_0 = nil;
     g_pso_attn_out_low_q8_0_bf16_r4 = nil;
     g_pso_attn_out_low_q4_K = nil;
@@ -8101,15 +8041,7 @@ static int routed_moe_batch_impl(
                 /* Fused Gate + Up + SwiGLU + Scaling dispatch (IQ2_XXS) across all tokens */
                 id<MTLComputePipelineState> gate_up_pso = g_pso_moe_pair_swiglu_iq2_xxs;
                 const char *gate_up_name = "fused_moe_swiglu";
-                NSUInteger gate_up_smem = smem_iq2;
-                const bool use_decode_iq2_fast = !use_iq2_v41 && g_decode_iq2_fast &&
-                    g_pso_moe_pair_swiglu_popcnt_fast_iq2_xxs != nil;
-                if (use_decode_iq2_fast) {
-                    atomic_fetch_add_explicit(&g_decode_iq2_fast_requests, 1, memory_order_relaxed);
-                    gate_up_pso = g_pso_moe_pair_swiglu_popcnt_fast_iq2_xxs;
-                    gate_up_name = "fused_moe_swiglu_popcnt_fast";
-                    gate_up_smem = 2048u;
-                } else if (g_moe_iq2_popcnt_sign && g_pso_moe_pair_swiglu_popcnt_iq2_xxs) {
+                if (g_moe_iq2_popcnt_sign && g_pso_moe_pair_swiglu_popcnt_iq2_xxs) {
                     gate_up_pso = g_pso_moe_pair_swiglu_popcnt_iq2_xxs;
                     gate_up_name = "fused_moe_swiglu_popcnt";
                 }
@@ -8128,10 +8060,9 @@ static int routed_moe_batch_impl(
                 [enc setBuffer:scratch_mid->mtl_buf offset:scratch_mid->offset atIndex:7];
                 [enc setBuffer:selected_ids->mtl_buf offset:selected_ids->offset atIndex:8];
                 [enc setBuffer:selected_weights->mtl_buf offset:selected_weights->offset atIndex:9];
-                [enc setThreadgroupMemoryLength:gate_up_smem atIndex:0];
+                [enc setThreadgroupMemoryLength:smem_iq2 atIndex:0];
                 metal_dispatch(enc, gate_up_name, MTLSizeMake(row_groups_gate, 1, pairs),
                     MTLSizeMake(32, nsg_gate, 1));
-                if (use_decode_iq2_fast) atomic_fetch_add_explicit(&g_decode_iq2_fast_encoded, 1, memory_order_relaxed);
                 if (use_iq2_v41) atomic_fetch_add_explicit(&g_decode_candidates[DC_IQ2][1],1,memory_order_relaxed);
                 if (g_auto_barrier) {
                     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];

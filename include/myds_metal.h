@@ -655,17 +655,6 @@ typedef struct {
  * Later batch command completion remains the caller's responsibility. */
 void myds_metal_moe_q2_sum_cache_counters(
     myds_metal_moe_q2_sum_cache_counters_t *out, bool reset);
-/* [D-M1] Strict 0-ULP fast IQ2_XXS decode gate+up+SwiGLU kernel
- * (MYDS_DECODE_IQ2_FAST: absent/0=off, 1=on, else -1 fail-closed).
- * Removes dead ssigns[128] (2,176->2,048 B smem), hoists 64-bit grid values
- * per sub-block, and uses branchless IEEE-754 sign-bit XOR. */
-#define MYDS_METAL_HAS_DECODE_IQ2_FAST 1
-typedef struct {
-    uint64_t requests, encoded, failures;
-} myds_metal_decode_iq2_fast_counters_t;
-int  myds_metal_decode_iq2_fast_enabled(void);
-void myds_metal_decode_iq2_fast_counters(
-    myds_metal_decode_iq2_fast_counters_t *out, bool reset);
 /* MYDS_MOE_Q2_SUM_CACHE_FUSED is a separate init-time absent/0/1 setting
  * (default 0), mutually exclusive with MYDS_MOE_Q2_SUM_CACHE=1. Fused mode
  * requires MYDS_MOE_IQ2_CONSTANT_LUT=0/absent and IQ2 NSG2/4. cleanup + init

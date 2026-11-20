@@ -152,11 +152,6 @@ int myds_v41_gpu_rope_batch(myds_metal_buffer_t *x,uint32_t width,uint32_t heads
     uint32_t start_pos,uint32_t rows,bool compressed,bool inverse);
 int myds_v41_gpu_rope_batch_round(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
     uint32_t start_pos,uint32_t rows,bool compressed,bool inverse);
-/* [CAND-A1 S1] Fused BF16-round + RoPE writing contiguous packed half Q
- * (bit-identical to rope_batch_round followed by (half) conversion). */
-int myds_v41_gpu_rope_batch_round_f16(myds_metal_buffer_t *dst_f16,
-    const myds_metal_buffer_t *src_f32,uint32_t width,uint32_t heads,
-    uint32_t start_pos,uint32_t rows,bool compressed,bool inverse);
 /* 同上，但行间的位置步长可指定（stride=1 即 rope_batch）。压缩器批量路径用它：
  * ratio==2 的提交行位置是 first_pos + 2*row。内核算的是 theta=(start+row*stride)*freq。 */
 int myds_v41_gpu_rope_batch_stride(myds_metal_buffer_t *x,uint32_t width,uint32_t heads,
@@ -623,7 +618,7 @@ void myds_v41_attention_rope_fuse_counters(myds_metal_decode_candidate_counters_
 int myds_v41_gpu_attention_flash_dec_enabled(void);
 /* [D-A1] Single-pass MQA-64 MMA decode attention with fused inverse RoPE.
  * MYDS_ATTN_DECODE_MMA defaults to 0 (fail-closed): absent/"0" -> 0,
- * "1" -> 1 (auto default D_SPLIT=4), "2" -> 2, "4" -> 4, "8" -> 8, else -1. */
+ * "1" -> 1 (auto adaptive D_SPLIT=8 ladder), "2" -> 2, "4" -> 4, "8" -> 8, else -1. */
 #define MYDS_V41_GPU_HAS_ATTN_DECODE_MMA 1
 int myds_v41_gpu_attention_decode_mma_enabled(void);
 typedef struct {
@@ -728,59 +723,12 @@ void myds_v41_gpu_suffix_shrink_final_mb_record(bool is_final_mb, bool mb_has_an
 void myds_v41_gpu_suffix_shrink_final_mb_counters(
     myds_v41_gpu_suffix_shrink_final_mb_counters_t *out, bool reset);
 
-/* [CAND-A1 S1-S2] Default-off zero-sq high-reuse Q=16 / Q=32 maskless-slab prefill
- * attention (MYDS_PREFILL_ATTN_Q16: absent/0=off, 1/16=Q16, 32=Q32, else -1). */
-int myds_v41_gpu_prefill_attn_q16_mode(void);
-typedef struct {
-    uint64_t q16_encoded;
-    uint64_t q32_encoded;
-    uint64_t q_rope_f16_encoded;
-} myds_v41_gpu_prefill_attn_q16_counters_t;
-void myds_v41_gpu_prefill_attn_q16_counters(
-    myds_v41_gpu_prefill_attn_q16_counters_t *out, bool reset);
-bool myds_v41_gpu_prefill_attn_wants_q_f16(const myds_v41_gpu_scratch_t *s,
-    const myds_metal_buffer_t *gathered, uint32_t c_len, uint32_t n_comp,
-    uint32_t top_k, uint32_t base_pos, uint32_t c_start, uint32_t ratio);
-/* [P-R1 Site 2] Default-off in-register BF16 + inverse RoPE fusion in prefill
- * maskless-slab epilogue (MYDS_PREFILL_ATTN_ROPE_FUSE: absent/0=off, 1=on, else -1). */
-int myds_v41_gpu_prefill_attn_rope_fuse_enabled(void);
-typedef struct {
-    uint64_t q8_encoded;
-    uint64_t q16_encoded;
-    uint64_t q32_encoded;
-    uint64_t l01_encoded;
-} myds_v41_gpu_prefill_attn_rope_fuse_counters_t;
-void myds_v41_gpu_prefill_attn_rope_fuse_counters(
-    myds_v41_gpu_prefill_attn_rope_fuse_counters_t *out, bool reset);
 /* [CAND-A3] Default-off L0/L1 window-only direct-slab MMA prefill attention
  * (MYDS_PREFILL_ATTN_L01_MMA: absent/0=off, 1=on, else -1; Track 2 num-equiv). */
 int myds_v41_gpu_prefill_attn_l01_mma_enabled(void);
 typedef struct {
     uint64_t encoded;
-    uint64_t q16_encoded;
-    uint64_t q32_encoded;
-    uint64_t rope_fuse_encoded;
 } myds_v41_gpu_prefill_attn_l01_mma_counters_t;
 void myds_v41_gpu_prefill_attn_l01_mma_counters(
     myds_v41_gpu_prefill_attn_l01_mma_counters_t *out, bool reset);
-typedef struct {
-    const myds_metal_buffer_t *q_f16;
-    bool     fuse_rope;
-    bool     rope_compressed;
-    bool    *rope_consumed;
-} myds_v41_gpu_attention_chunk_opts_t;
-int myds_v41_gpu_attention_chunk_ex(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
-    const myds_metal_buffer_t *q,const myds_metal_buffer_t *chunk_kv,
-    const myds_metal_buffer_t *comp_kv,const myds_metal_buffer_t *ids,
-    myds_metal_buffer_t *gathered,
-    uint32_t c_len,uint32_t n_comp,uint32_t top_k,
-    uint32_t base_pos,uint32_t c_start,uint32_t ratio,myds_v41_gpu_scratch_t *s,
-    bool comp_bf16,const myds_v41_gpu_attention_chunk_opts_t *opts);
-int myds_v41_gpu_attention_chunk_mode_ex(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
-    const myds_metal_buffer_t *q,const myds_metal_buffer_t *chunk_kv,
-    const myds_metal_buffer_t *comp_kv,const myds_metal_buffer_t *ids,
-    myds_metal_buffer_t *gathered,
-    uint32_t c_len,uint32_t n_comp,uint32_t top_k,
-    uint32_t base_pos,uint32_t c_start,uint32_t ratio,myds_v41_gpu_scratch_t *s,
-    uint32_t comp_cache_mode,const myds_v41_gpu_attention_chunk_opts_t *opts);
 #endif
