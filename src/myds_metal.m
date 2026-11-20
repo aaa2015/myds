@@ -455,6 +455,38 @@ static atomic_uint_fast64_t g_f16_gemv_bf16_requests = 0;
 static atomic_uint_fast64_t g_f16_gemv_bf16_encoded = 0;
 static atomic_uint_fast64_t g_f16_gemv_bf16_failures = 0;
 
+static bool g_hc_mix_fast = false;
+static id<MTLComputePipelineState> g_pso_hc_mix_gemv_nr24_b1_nsg8 = nil;
+static id<MTLComputePipelineState> g_pso_hc_sum_rmsnorm_scale_batch_fast = nil;
+static id<MTLComputePipelineState> g_pso_hc_expand4_batch_vec = nil;
+static atomic_uint_fast64_t g_hc_mix_fast_gemv_nr24_encoded = 0;
+static atomic_uint_fast64_t g_hc_mix_fast_rmsnorm_single_read_encoded = 0;
+static atomic_uint_fast64_t g_hc_mix_fast_expand4_vec_encoded = 0;
+
+int myds_metal_hc_mix_fast_parse_mode(void) {
+    const char *value = getenv("MYDS_HC_MIX_FAST");
+    if (!value || strcmp(value, "0") == 0) return 0;
+    if (strcmp(value, "1") == 0) return 1;
+    fprintf(stderr, "myds_metal: MYDS_HC_MIX_FAST must be exactly absent, 0 or 1\n");
+    return -1;
+}
+
+int myds_metal_hc_mix_fast_enabled(void) {
+    return g_hc_mix_fast ? 1 : 0;
+}
+
+void myds_metal_hc_mix_fast_counters(myds_metal_hc_mix_fast_counters_t *out, bool reset) {
+#define HC_MIX_FAST_COUNT(field) (reset ? atomic_exchange_explicit(&g_hc_mix_fast_##field, 0, memory_order_relaxed) \
+                                        : atomic_load_explicit(&g_hc_mix_fast_##field, memory_order_relaxed))
+    myds_metal_hc_mix_fast_counters_t value = {
+        .gemv_nr24_encoded = HC_MIX_FAST_COUNT(gemv_nr24_encoded),
+        .rmsnorm_single_read_encoded = HC_MIX_FAST_COUNT(rmsnorm_single_read_encoded),
+        .expand4_vec_encoded = HC_MIX_FAST_COUNT(expand4_vec_encoded),
+    };
+    if (out) *out = value;
+#undef HC_MIX_FAST_COUNT
+}
+
 int myds_metal_f16_gemv_bf16_fuse_parse_mode(void) {
     const char *value = getenv("MYDS_F16_GEMV_BF16_FUSE");
     if (!value || strcmp(value, "0") == 0) return 0;
@@ -2742,6 +2774,44 @@ int myds_metal_init(const char *shader_dir) {
             }
         }
 
+        /* [P-H1] MYDS_HC_MIX_FAST: default 0 (fail-closed on invalid). */
+        {
+            const int hc_fast_mode = myds_metal_hc_mix_fast_parse_mode();
+            if (hc_fast_mode < 0) {
+                g_initialized = true;
+                myds_metal_cleanup();
+                return 0;
+            }
+            g_hc_mix_fast = (hc_fast_mode == 1);
+            if (g_hc_mix_fast) {
+                MTLFunctionConstantValues *fc_nsg8 = [MTLFunctionConstantValues new];
+                short short_nsg8 = 8;
+                [fc_nsg8 setConstantValue:&short_nsg8 type:MTLDataTypeShort atIndex:600];
+                id<MTLFunction> fn_gemv = [g_library newFunctionWithName:@"kernel_mul_mv_f16_f32_nr24_b1_scaled"
+                                                          constantValues:fc_nsg8 error:nil];
+                if (fn_gemv) g_pso_hc_mix_gemv_nr24_b1_nsg8 = [g_device newComputePipelineStateWithFunction:fn_gemv error:nil];
+
+                id<MTLFunction> fn_rms = [g_library newFunctionWithName:@"kernel_myds_v41_hc_sum_rmsnorm_scale_batch_fast"];
+                if (fn_rms) g_pso_hc_sum_rmsnorm_scale_batch_fast = [g_device newComputePipelineStateWithFunction:fn_rms error:nil];
+
+                id<MTLFunction> fn_exp = [g_library newFunctionWithName:@"kernel_dsv4_hc_expand4_batch_vec"];
+                if (fn_exp) g_pso_hc_expand4_batch_vec = [g_device newComputePipelineStateWithFunction:fn_exp error:nil];
+
+                if (!g_pso_hc_mix_gemv_nr24_b1_nsg8 ||
+                    g_pso_hc_mix_gemv_nr24_b1_nsg8.maxTotalThreadsPerThreadgroup < 256u ||
+                    !g_pso_hc_sum_rmsnorm_scale_batch_fast ||
+                    g_pso_hc_sum_rmsnorm_scale_batch_fast.maxTotalThreadsPerThreadgroup < 256u ||
+                    !g_pso_hc_expand4_batch_vec ||
+                    g_pso_hc_expand4_batch_vec.maxTotalThreadsPerThreadgroup < 256u) {
+                    fprintf(stderr, "myds_metal: MYDS_HC_MIX_FAST=1 requested but fast PSOs/geometry unavailable\n");
+                    g_initialized = true;
+                    myds_metal_cleanup();
+                    return 0;
+                }
+                MYDS_LOG_I("HC-Mix fast enabled (NR0=24 B=1 zero-reload GEMV, single-read RMSNorm, float4 expand4)");
+            }
+        }
+
         const char *moe_tail_env = getenv("MYDS_MOE_IQ2_TAIL_CULL");
         const bool moe_tail = !moe_tail_env || strcmp(moe_tail_env, "1") == 0;
         NSString *moe_pair_name = moe_tail ?
@@ -3195,6 +3265,10 @@ void myds_metal_cleanup(void) {
     g_lm_head_q8_nr0 = 2;
     g_f16_gemv_bf16_fuse = false;
     for (unsigned i = 0; i < 8u; ++i) g_pso_f16_gemv_bf16[i] = nil;
+    g_hc_mix_fast = false;
+    g_pso_hc_mix_gemv_nr24_b1_nsg8 = nil;
+    g_pso_hc_sum_rmsnorm_scale_batch_fast = nil;
+    g_pso_hc_expand4_batch_vec = nil;
     g_indexer_rope_quant_fuse = false;
     g_pso_indexer_rope_quant = nil;
     g_native_pipelines = nil;
@@ -4549,7 +4623,10 @@ int myds_metal_v41_hc_sum_rmsnorm_scale_batch(
 
     /* 只在 ntg 整除 ne00_t 时才能保证两遍循环的 reg_idx 映射一致，见上文。 */
     const NSUInteger ne00_t = dim / 4u;
-    id<MTLComputePipelineState> pipeline = resolve_kernel_pipeline("kernel_myds_v41_hc_sum_rmsnorm_scale_batch", NULL, 0);
+    const bool want_fast = g_hc_mix_fast && g_pso_hc_sum_rmsnorm_scale_batch_fast && (ne00_t == 1280u);
+    id<MTLComputePipelineState> pipeline = want_fast
+        ? g_pso_hc_sum_rmsnorm_scale_batch_fast
+        : resolve_kernel_pipeline("kernel_myds_v41_hc_sum_rmsnorm_scale_batch", NULL, 0);
     if (!pipeline) return 0;
     const NSUInteger max_th = MIN((NSUInteger)256, (NSUInteger)pipeline.maxTotalThreadsPerThreadgroup);
     NSUInteger nth = 0;
@@ -4569,6 +4646,7 @@ int myds_metal_v41_hc_sum_rmsnorm_scale_batch(
         }
     }
     if (nth > pipeline.maxTotalThreadsPerThreadgroup) return 0;
+    const bool use_fast_single_read = want_fast && (nth == 256u);
 
     @autoreleasepool {
         struct v41_hc_sum_rmsnorm_batch_args args = {
@@ -4593,7 +4671,11 @@ int myds_metal_v41_hc_sum_rmsnorm_scale_batch(
         [enc setBuffer:norm_out->mtl_buf offset:norm_out->offset atIndex:5];
         [enc setBuffer:flat_scale_out->mtl_buf offset:flat_scale_out->offset atIndex:6];
         [enc setThreadgroupMemoryLength:64 * sizeof(float) atIndex:0];
-        metal_dispatch(enc, "v41_hc_sum_rmsnorm_scale_batch", MTLSizeMake(n_tok, 1, 1), MTLSizeMake(nth, 1, 1));
+        metal_dispatch(enc, want_fast ? "v41_hc_sum_rmsnorm_scale_batch_fast" : "v41_hc_sum_rmsnorm_scale_batch",
+                       MTLSizeMake(n_tok, 1, 1), MTLSizeMake(nth, 1, 1));
+        if (use_fast_single_read) {
+            atomic_fetch_add_explicit(&g_hc_mix_fast_rmsnorm_single_read_encoded, 1, memory_order_relaxed);
+        }
         return v41_finish(cb, enc);
     }
 }
@@ -4909,10 +4991,16 @@ int myds_metal_v41_hc_expand_batch(myds_metal_buffer_t *out,
     const myds_metal_buffer_t *block, const myds_metal_buffer_t *residual,
     const myds_metal_buffer_t *split, uint32_t dim, uint32_t n_tok) {
     if (!n_tok) return 1;
-    if (n_tok == 1) return myds_metal_v41_hc_expand(out, block, residual, split, dim);
     if (!g_initialized || !g_pso_v41_hc_expand || !v41_floats(out, 4ull * dim * n_tok) ||
         !v41_floats(block, (uint64_t)dim * n_tok) || !v41_floats(residual, 4ull * dim * n_tok) ||
         !v41_floats(split, 24ull * n_tok)) return 0;
+    const bool use_vec = g_hc_mix_fast && g_pso_hc_expand4_batch_vec &&
+        (dim % 4u == 0u) &&
+        (out->offset % 16u == 0u) && (block->offset % 16u == 0u) &&
+        (residual->offset % 16u == 0u) && (split->offset % 16u == 0u) &&
+        (((uintptr_t)out->ptr % 16u) == 0u) && (((uintptr_t)block->ptr % 16u) == 0u) &&
+        (((uintptr_t)residual->ptr % 16u) == 0u) && (((uintptr_t)split->ptr % 16u) == 0u);
+    if (n_tok == 1 && !use_vec) return myds_metal_v41_hc_expand(out, block, residual, split, dim);
     @autoreleasepool {
         struct v41_hc_expand_args args = {
             .n_embd = dim, .n_hc = 4, .n_tokens = n_tok,
@@ -4929,6 +5017,24 @@ int myds_metal_v41_hc_expand_batch(myds_metal_buffer_t *out,
         id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
         if (!enc) return 0;
         if (g_batch_cb && g_auto_barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        if (use_vec) {
+            const NSUInteger dim4 = (NSUInteger)(dim / 4u);
+            /* 1 simdgroup (32 threads) = 512 B/stream x 9 streams = 4.5 KB/TG,
+             * staying L1D-resident (beats nth=256 by +16% on Apple GPU). */
+            const NSUInteger nth = MIN((NSUInteger)32, dim4);
+            [enc setComputePipelineState:g_pso_hc_expand4_batch_vec];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:block->mtl_buf offset:block->offset atIndex:1];
+            [enc setBuffer:residual->mtl_buf offset:residual->offset atIndex:2];
+            [enc setBuffer:split->mtl_buf offset:split->offset + 16 atIndex:3];
+            [enc setBuffer:split->mtl_buf offset:split->offset + 32 atIndex:4];
+            [enc setBuffer:block->mtl_buf offset:block->offset atIndex:5];
+            [enc setBuffer:out->mtl_buf offset:out->offset atIndex:6];
+            metal_dispatch(enc, "v41_hc_expand_batch_vec",
+                MTLSizeMake((dim4 + nth - 1u) / nth, n_tok, 1), MTLSizeMake(nth, 1, 1));
+            atomic_fetch_add_explicit(&g_hc_mix_fast_expand4_vec_encoded, 1, memory_order_relaxed);
+            return v41_finish(cb, enc);
+        }
         id<MTLComputePipelineState> pso_2d = resolve_kernel_pipeline("kernel_dsv4_hc_expand4_batch", NULL, 0);
         [enc setComputePipelineState:pso_2d ? pso_2d : g_pso_v41_hc_expand];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
@@ -5627,6 +5733,48 @@ int myds_metal_v41_gemv_batch_scaled(myds_metal_buffer_t *out,
     args.r2 = 1;
     args.r3 = 1;
     @autoreleasepool {
+        const bool use_nr24 = g_hc_mix_fast && (weight_type == GGML_TYPE_F16) &&
+                              (out_dim == 24u) && (in_dim % 32u == 0u);
+        if (use_nr24) {
+            args.nr0 = 24;
+            id<MTLComputePipelineState> pipeline = (nsg == 8u) ? g_pso_hc_mix_gemv_nr24_b1_nsg8 : nil;
+            if (!pipeline) {
+                NSString *funcName = @"kernel_mul_mv_f16_f32_nr24_b1_scaled";
+                NSString *key = [NSString stringWithFormat:@"%@_%u", funcName, nsg];
+                pipeline = g_native_pipelines[key];
+                if (!pipeline) {
+                    MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
+                    short short_nsg = (short)nsg;
+                    [values setConstantValue:&short_nsg type:MTLDataTypeShort atIndex:600];
+                    id<MTLFunction> fn = [g_library newFunctionWithName:funcName
+                                                           constantValues:values error:nil];
+                    if (!fn) { fprintf(stderr, "myds_metal: v41 %s function unavailable\n", [funcName UTF8String]); return 0; }
+                    pipeline = [g_device newComputePipelineStateWithFunction:fn error:nil];
+                    if (!pipeline) { fprintf(stderr, "myds_metal: v41 %s pipeline unavailable\n", [funcName UTF8String]); return 0; }
+                    if (!g_native_pipelines) g_native_pipelines = [NSMutableDictionary new];
+                    g_native_pipelines[key] = pipeline;
+                }
+            }
+            id<MTLCommandBuffer> cb = g_batch_cb ? g_batch_cb : [g_queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = get_compute_encoder(cb);
+            if (!enc || 32u * nsg > pipeline.maxTotalThreadsPerThreadgroup) {
+                fprintf(stderr, "myds_metal: v41 kernel_mul_mv_f16_f32_nr24_b1_scaled encoder unavailable (nsg=%u)\n", nsg);
+                return 0;
+            }
+            [enc setComputePipelineState:pipeline];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:weight->mtl_buf offset:weight->offset atIndex:1];
+            [enc setBuffer:input->mtl_buf offset:input->offset atIndex:2];
+            [enc setBuffer:out->mtl_buf offset:out->offset atIndex:3];
+            [enc setBuffer:scales->mtl_buf offset:scales->offset atIndex:4];
+            const NSUInteger shmem_len = (NSUInteger)(24u * nsg * sizeof(float));
+            [enc setThreadgroupMemoryLength:shmem_len atIndex:0];
+            metal_dispatch(enc, "kernel_mul_mv_f16_f32_nr24_b1_scaled", MTLSizeMake(1, n_tok, 1),
+                           MTLSizeMake(32, nsg, 1));
+            atomic_fetch_add_explicit(&g_hc_mix_fast_gemv_nr24_encoded, 1, memory_order_relaxed);
+            return v41_finish(cb, enc);
+        }
+
         const uint32_t b_size = (n_tok > 1u) ? get_gemv_batch_size() : 1u;
         const bool use_b4 = (b_size == 4u && n_tok > 1u);
         NSString *funcName = nil;

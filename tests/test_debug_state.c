@@ -110,6 +110,7 @@ int main(int argc, char **argv) {
                          strstr(state, "\"indexer_decode_mma\"") &&
                          strstr(state, "\"attn_decode_mma\":{\"requests\":") &&
                          strstr(state, "\"d_split\":") &&
+                         strstr(state, "\"hc_mix_fast\"") &&
                          strstr(state, "truncated") == NULL;
     if (!shape_ok) ++failures;
     printf("{\"kind\":\"summary\",\"failures\":%d,\"pass\":%s}\n",

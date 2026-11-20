@@ -8456,7 +8456,8 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     c_start += c_len;
                     continue;
                 }
-                const bool hc_mix_use_gemv = (c_len < 32u || is_mul_mm_disabled() || mm_min_m() > 24u);
+                const bool hc_mix_use_gemv = (c_len < 32u || is_mul_mm_disabled() || mm_min_m() > 24u ||
+                                              myds_metal_hc_mix_fast_enabled());
 
                 if (il == 1 || il == 14) {
                     uint32_t e = (il == 1 ? 0 : 1);

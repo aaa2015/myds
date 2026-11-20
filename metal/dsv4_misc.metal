@@ -8094,6 +8094,61 @@ kernel void kernel_dsv4_hc_expand4_batch(
     }
 }
 
+kernel void kernel_dsv4_hc_expand4_batch_vec(
+        constant ds4_metal_args_dsv4_hc_expand & args [[buffer(0)]],
+        device  const float4 * block_out              [[buffer(1)]],
+        device  const float4 * residual               [[buffer(2)]],
+        device  const char   * post                   [[buffer(3)]],
+        device  const char   * comb                   [[buffer(4)]],
+        device  const float4 * block_add              [[buffer(5)]],
+        device        float4 * dst                    [[buffer(6)]],
+        uint2 gid [[thread_position_in_grid]]) {
+    if (args.n_hc != 4) return;
+    const uint d4 = gid.x;
+    const uint t  = gid.y;
+    const uint dim4 = (uint)(args.n_embd >> 2);
+    if (d4 >= dim4 || t >= (uint)args.n_tokens) return;
+
+    const uint64_t tok_dim4 = (uint64_t)t * (uint64_t)dim4;
+    const uint64_t res_off  = (uint64_t)t * 4ull * (uint64_t)dim4 + (uint64_t)d4;
+
+    float4 block_v = block_out[tok_dim4 + d4];
+    if (args.has_add) {
+        block_v += block_add[tok_dim4 + d4];
+    }
+
+    const float4 r0 = residual[res_off];
+    const float4 r1 = residual[res_off + (uint64_t)dim4];
+    const float4 r2 = residual[res_off + 2ull * (uint64_t)dim4];
+    const float4 r3 = residual[res_off + 3ull * (uint64_t)dim4];
+
+    device const char * post_t = post + (uint64_t)t * args.nb_post1;
+    device const char * comb_t = comb + (uint64_t)t * args.nb_comb2;
+    const float4 pv = *((device const float4 *)post_t);
+    const float4 c0 = *((device const float4 *)(comb_t + 0ull * args.nb_comb1));
+    const float4 c1 = *((device const float4 *)(comb_t + 1ull * args.nb_comb1));
+    const float4 c2 = *((device const float4 *)(comb_t + 2ull * args.nb_comb1));
+    const float4 c3 = *((device const float4 *)(comb_t + 3ull * args.nb_comb1));
+
+    const bool rb = (args.round_bf16 != 0);
+
+    float4 a0 = block_v * pv.x;
+    a0 += c0.x * r0; a0 += c1.x * r1; a0 += c2.x * r2; a0 += c3.x * r3;
+    dst[res_off] = rb ? dsv41_bf16_round_f32x4(a0) : a0;
+
+    float4 a1 = block_v * pv.y;
+    a1 += c0.y * r0; a1 += c1.y * r1; a1 += c2.y * r2; a1 += c3.y * r3;
+    dst[res_off + (uint64_t)dim4] = rb ? dsv41_bf16_round_f32x4(a1) : a1;
+
+    float4 a2 = block_v * pv.z;
+    a2 += c0.z * r0; a2 += c1.z * r1; a2 += c2.z * r2; a2 += c3.z * r3;
+    dst[res_off + 2ull * (uint64_t)dim4] = rb ? dsv41_bf16_round_f32x4(a2) : a2;
+
+    float4 a3 = block_v * pv.w;
+    a3 += c0.w * r0; a3 += c1.w * r1; a3 += c2.w * r2; a3 += c3.w * r3;
+    dst[res_off + 3ull * (uint64_t)dim4] = rb ? dsv41_bf16_round_f32x4(a3) : a3;
+}
+
 kernel void kernel_myds_v41_hc_sum_rmsnorm_scale_batch(
         constant ds4_metal_args_hc_sum_rmsnorm_batch & args  [[buffer(0)]],
         device  const float * residual                 [[buffer(1)]],
@@ -8192,6 +8247,183 @@ kernel void kernel_myds_v41_hc_sum_rmsnorm_scale_batch(
     const bool round_bf16 = (args.round_bf16 != 0);
     for (uint i00 = tpitg.x; i00 < ne00_t; i00 += ntg.x) {
         const float4 v = (reg_idx < 5) ? v_reg[reg_idx] : (args.has_sum_out ? sum_out[i00] : float4(0.0f));
+        reg_idx++;
+        const float4 norm_v = (v * scale) * norm_w[i00];
+        dst[i00] = round_bf16 ? dsv41_bf16_round_f32x4(norm_v) : norm_v;
+    }
+}
+
+kernel void kernel_myds_v41_hc_sum_rmsnorm_scale_batch_fast(
+        constant ds4_metal_args_hc_sum_rmsnorm_batch & args  [[buffer(0)]],
+        device  const float * residual                 [[buffer(1)]],
+        device  const float * weights                  [[buffer(2)]],
+        device  const float * norm_weight              [[buffer(3)]],
+        device        float * sum_dst                  [[buffer(4)]],
+        device        float * norm_dst                 [[buffer(5)]],
+        device        float * flat_scale_dst           [[buffer(6)]],
+        threadgroup   float * shmem_f32                [[threadgroup(0)]],
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort3 tpitg [[thread_position_in_threadgroup]],
+        ushort  sgitg [[simdgroup_index_in_threadgroup]],
+        ushort  tiisg [[thread_index_in_simdgroup]],
+        ushort3 ntg   [[threads_per_threadgroup]]) {
+    if (sgitg == 0) {
+        shmem_f32[tiisg] = 0.0f;
+        shmem_f32[32u + tiisg] = 0.0f;
+    }
+
+    const uint dim = args.dim;
+    const uint ne00_t = dim / 4;
+    const uint64_t tok = (uint64_t)tgpig.x;
+    const uint64_t w_stride = args.weight_stride_bytes ? args.weight_stride_bytes : 16ull;
+
+    device const float *res_tok = residual + tok * 4ull * (uint64_t)dim;
+    device const float4 *r0 = (device const float4 *)(res_tok);
+    device const float4 *r1 = (device const float4 *)(res_tok + dim);
+    device const float4 *r2 = (device const float4 *)(res_tok + 2 * dim);
+    device const float4 *r3 = (device const float4 *)(res_tok + 3 * dim);
+
+    device const float *w_tok = (device const float *)((device const char *)weights + tok * w_stride);
+    const float w0 = w_tok[0];
+    const float w1 = w_tok[1];
+    const float w2 = w_tok[2];
+    const float w3 = w_tok[3];
+
+    device const float4 *norm_w = (device const float4 *)norm_weight;
+    device float4 *sum_out = (device float4 *)(sum_dst + tok * (uint64_t)dim);
+    device float4 *dst = (device float4 *)(norm_dst + tok * (uint64_t)dim);
+
+    if (ne00_t == 1280u && ntg.x == 256u) {
+        float sumf = 0.0f;
+        float4 v_reg[5];
+        float f0[5], f1[5], f2[5], f3[5];
+
+        FOR_UNROLL (uint k = 0; k < 5u; ++k) {
+            const uint i00 = (uint)tpitg.x + k * 256u;
+            const float4 x0 = r0[i00];
+            const float4 x1 = r1[i00];
+            const float4 x2 = r2[i00];
+            const float4 x3 = r3[i00];
+
+            float4 acc = 0.0f;
+            acc += x0 * w0;
+            acc += x1 * w1;
+            acc += x2 * w2;
+            acc += x3 * w3;
+
+            const float4 v = dsv41_bf16_round_f32x4(acc);
+            if (args.has_sum_out) {
+                sum_out[i00] = v;
+            }
+            v_reg[k] = v;
+
+            sumf += dot(v, v);
+            f0[k] = dot(x0, x0);
+            f1[k] = dot(x1, x1);
+            f2[k] = dot(x2, x2);
+            f3[k] = dot(x3, x3);
+        }
+
+        float flat_sumf = 0.0f;
+        {
+            #pragma clang fp reassociate(off)
+            FOR_UNROLL (uint k = 0; k < 5u; ++k) { flat_sumf += f0[k]; }
+            FOR_UNROLL (uint k = 0; k < 5u; ++k) { flat_sumf += f1[k]; }
+            FOR_UNROLL (uint k = 0; k < 5u; ++k) { flat_sumf += f2[k]; }
+            FOR_UNROLL (uint k = 0; k < 5u; ++k) { flat_sumf += f3[k]; }
+        }
+
+        sumf = simd_sum(sumf);
+        flat_sumf = simd_sum(flat_sumf);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tiisg == 0) {
+            shmem_f32[sgitg] = sumf;
+            shmem_f32[32u + sgitg] = flat_sumf;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        sumf = shmem_f32[tiisg];
+        sumf = simd_sum(sumf);
+
+        if (sgitg == 0) {
+            flat_sumf = shmem_f32[32u + tiisg];
+            flat_sumf = simd_sum(flat_sumf);
+            if (tiisg == 0) {
+                const float flat_mean = flat_sumf / float(dim * 4u);
+                flat_scale_dst[tok] = 1.0f / sqrt(flat_mean + args.eps);
+            }
+        }
+
+        const float mean = sumf / float(dim);
+        const float scale = 1.0f / sqrt(mean + args.eps);
+        const bool round_bf16 = (args.round_bf16 != 0);
+
+        FOR_UNROLL (uint k = 0; k < 5u; ++k) {
+            const uint i00 = (uint)tpitg.x + k * 256u;
+            const float4 norm_v = (v_reg[k] * scale) * norm_w[i00];
+            dst[i00] = round_bf16 ? dsv41_bf16_round_f32x4(norm_v) : norm_v;
+        }
+        return;
+    }
+
+    float sumf = 0.0f;
+    float4 v_reg_fb[5];
+    uint reg_idx = 0;
+
+    for (uint i00 = tpitg.x; i00 < ne00_t; i00 += ntg.x) {
+        float4 acc = 0.0f;
+        acc += r0[i00] * w0;
+        acc += r1[i00] * w1;
+        acc += r2[i00] * w2;
+        acc += r3[i00] * w3;
+
+        const float4 v = dsv41_bf16_round_f32x4(acc);
+        if (args.has_sum_out) {
+            sum_out[i00] = v;
+        }
+        if (reg_idx < 5) {
+            v_reg_fb[reg_idx] = v;
+        }
+        reg_idx++;
+
+        sumf += dot(v, v);
+    }
+
+    device const float4 *x_flat = (device const float4 *)res_tok;
+    const uint flat_ne00_t = ne00_t * 4u;
+    float flat_sumf = 0.0f;
+    for (uint i00 = tpitg.x; i00 < flat_ne00_t; i00 += ntg.x) {
+        flat_sumf += dot(x_flat[i00], x_flat[i00]);
+    }
+
+    sumf = simd_sum(sumf);
+    flat_sumf = simd_sum(flat_sumf);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        shmem_f32[sgitg] = sumf;
+        shmem_f32[32u + sgitg] = flat_sumf;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = shmem_f32[tiisg];
+    sumf = simd_sum(sumf);
+
+    if (sgitg == 0) {
+        flat_sumf = shmem_f32[32u + tiisg];
+        flat_sumf = simd_sum(flat_sumf);
+        if (tiisg == 0) {
+            const float flat_mean = flat_sumf / float(dim * 4u);
+            flat_scale_dst[tok] = 1.0f / sqrt(flat_mean + args.eps);
+        }
+    }
+
+    const float mean = sumf / float(dim);
+    const float scale = 1.0f / sqrt(mean + args.eps);
+
+    reg_idx = 0;
+    const bool round_bf16 = (args.round_bf16 != 0);
+    for (uint i00 = tpitg.x; i00 < ne00_t; i00 += ntg.x) {
+        const float4 v = (reg_idx < 5) ? v_reg_fb[reg_idx] : (args.has_sum_out ? sum_out[i00] : float4(0.0f));
         reg_idx++;
         const float4 norm_v = (v * scale) * norm_w[i00];
         dst[i00] = round_bf16 ? dsv41_bf16_round_f32x4(norm_v) : norm_v;
@@ -8439,6 +8671,111 @@ kernel void kernel_mul_mv_t_t_4_b4_scaled(
 typedef decltype(kernel_mul_mv_t_t_4_b4_scaled<half, half4, half, half4>) mul_mv_t_t_4_b4_scaled_t;
 template [[host_name("kernel_mul_mv_f32_f32_4_b4_scaled")]] kernel mul_mv_t_t_4_b4_scaled_t kernel_mul_mv_t_t_4_b4_scaled<float, float4, float, float4>;
 template [[host_name("kernel_mul_mv_f16_f32_4_b4_scaled")]] kernel mul_mv_t_t_4_b4_scaled_t kernel_mul_mv_t_t_4_b4_scaled<half,  half4,  float, float4>;
+
+// [P-H1] Zero-reload NR0=24, B=1 scaled F16×F32 GEMV for HC-Mix (ne01 == 24).
+// Reads src1 once per token (grid=(1, c_len, 1), 256 thr/TG at NSG=8) instead of
+// 12x across tgpig.x, preserving the exact ib K-loop, dot(float4,float4), and
+// simd_sum reduction order of kernel_mul_mv_f16_f32_4_b4_scaled (strict 0-ULP).
+kernel void kernel_mul_mv_f16_f32_nr24_b1_scaled(
+        constant ds4_metal_args_mul_mv & args,
+        device const char  * src0,
+        device const char  * src1,
+        device       char  * dst,
+        device const float * scales,
+        threadgroup  char  * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr short NW  = N_SIMDWIDTH;
+    constexpr short NB  = 32;
+    constexpr short NF  = 16;
+    constexpr short NF4 = NF / 4;
+    constexpr short NR0 = 24;
+
+    const int nb = args.ne00 / NB;
+
+    const int r0 = (int)tgpig.x * NR0;
+    const int r1 = (int)tgpig.y;
+    const int im = (int)tgpig.z;
+
+    if (r1 >= args.ne11) return;
+
+    const uint i12 = (uint)im % args.ne12;
+    const uint i13 = (uint)im / args.ne12;
+
+    const uint64_t offset1 = (uint64_t)r1 * args.nb11 + (uint64_t)i12 * args.nb12 + (uint64_t)i13 * args.nb13;
+    device const float  * y  = (device const float  *)(src1 + offset1);
+    device const float4 * y4 = (device const float4 *)(src1 + offset1);
+    const float scale = scales[r1];
+
+    const uint64_t base_offset0 = (uint64_t)r0 * args.nb01 + (uint64_t)(i12 / args.r2) * args.nb02 + (uint64_t)(i13 / args.r3) * args.nb03;
+    device const char * src0_base = src0 + base_offset0;
+
+    float sumf[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        sumf[row] = 0.f;
+    }
+
+    const short ix = tiisg / (NW / NF);
+    const short il = tiisg % (NW / NF);
+    const int ib0 = sgitg * NF + ix;
+
+    float4 yl4[NF4];
+    device const float4 * yb4 = y4 + (ib0 * NB + il * NF) / 4;
+
+    for (int ib = ib0; ib < nb; ib += NSG * NF) {
+        FOR_UNROLL (short i = 0; i < NF4; ++i) {
+            yl4[i] = yb4[i] * scale;
+        }
+
+        const uint64_t k_byte_off = (uint64_t)(ib * NB + il * NF) * sizeof(half);
+        device const char * row_ptr = src0_base + k_byte_off;
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            device const half4 * xb4 = (device const half4 *)row_ptr;
+            float sumq = 0.f;
+            FOR_UNROLL (short i = 0; i < NF4; ++i) {
+                sumq += dot(float4(xb4[i]), float4(yl4[i]));
+            }
+            sumf[row] += sumq;
+            row_ptr += args.nb01;
+        }
+
+        yb4 += NSG * NF * NW / 4;
+    }
+
+    for (int i = nb * NB + sgitg * NW + tiisg; i < args.ne00; i += NW * NSG) {
+        const float yv = y[i] * scale;
+        device const char * row_ptr = src0_base + (uint64_t)i * sizeof(half);
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            sumf[row] += (float)(*(device const half *)row_ptr) * yv;
+            row_ptr += args.nb01;
+        }
+    }
+
+    device float * dst_f32 = (device float *)dst + (uint64_t)im * args.ne0 * args.ne1 + (uint64_t)r1 * args.ne0;
+    threadgroup float * shmem_f32 = (threadgroup float *)shmem;
+
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const float sg_sum = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            shmem_f32[row * NSG + sgitg] = sg_sum;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short row = sgitg; row < NR0; row += NSG) {
+        if (r0 + row < args.ne01) {
+            const float val = (tiisg < (ushort)NSG) ? shmem_f32[row * NSG + tiisg] : 0.0f;
+            const float tot = simd_sum(val);
+            if (tiisg == 0) {
+                dst_f32[r0 + row] = tot;
+            }
+        }
+    }
+}
 
 struct ds4_metal_args_dsv41_rope_quant_batch {
     uint32_t heads;

@@ -1015,6 +1015,18 @@ int myds_metal_v41_hc_split_batch(myds_metal_buffer_t *split,
     const myds_metal_buffer_t *mix, const myds_metal_buffer_t *scale,
     const myds_metal_buffer_t *base, uint32_t n_tokens, float hc_eps);
 
+/* [P-H1] HC-Mix prefill fast pipeline (MYDS_HC_MIX_FAST=0|1, fail-closed, default 0):
+ * NR0=24 B=1 zero-reload scaled GEMV, single-read HC sum+RMSNorm+scale (ne00_t==1280),
+ * and float4-vectorized HC expand4 batch. */
+int myds_metal_hc_mix_fast_parse_mode(void);
+int myds_metal_hc_mix_fast_enabled(void);
+typedef struct {
+    uint64_t gemv_nr24_encoded;
+    uint64_t rmsnorm_single_read_encoded;
+    uint64_t expand4_vec_encoded;
+} myds_metal_hc_mix_fast_counters_t;
+void myds_metal_hc_mix_fast_counters(myds_metal_hc_mix_fast_counters_t *out, bool reset);
+
 /* GLP Control Vector / Activation Steering kernels */
 int myds_metal_steer_vec(myds_metal_buffer_t *h,
     const myds_metal_buffer_t *dir, float alpha, uint32_t dim, uint32_t n_tokens);
