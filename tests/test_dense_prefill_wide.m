@@ -501,8 +501,10 @@ static int test_part_c_qb_rope(const char *metallib) {
 
     myds_metal_dense_prefill_wide_counters_t c;
     myds_metal_dense_prefill_wide_counters(&c, false);
-    if (c.requests == 0 || c.wide_encoded == 0 || c.narrow_bf16_encoded == 0 ||
-        c.grouped_wide_encoded == 0 || c.shared_pair_encoded == 0 ||
+    /* v2 routes all MYDS_DENSE_PREFILL_WIDE=1 sites to Apple8-tuned NR1=32
+     * (wide_encoded == 0 && grouped_wide_encoded == 0) to eliminate 76-core grid starvation. */
+    if (c.requests == 0 || c.wide_encoded != 0 || c.grouped_wide_encoded != 0 ||
+        c.narrow_bf16_encoded == 0 || c.shared_pair_encoded == 0 ||
         c.qb_rope64_encoded == 0 || c.failures != 0) {
         fprintf(stderr, "FAIL: counters mismatch req=%llu wide=%llu narrow=%llu grp=%llu pair=%llu rope64=%llu fb=%llu fail=%llu\n",
                 (unsigned long long)c.requests, (unsigned long long)c.wide_encoded,

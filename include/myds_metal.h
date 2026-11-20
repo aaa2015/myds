@@ -553,10 +553,10 @@ int myds_metal_mul_mm_grouped(
     uint32_t                   n_tok,
     ggml_type                  weight_type);
 
-/* [P-D1] + [P-R1] Site 1: MYDS_DENSE_PREFILL_WIDE (default 0, fail-closed).
- * Strict 0-ULP wide (NR0=64, NR1=64, 8 KB smem / 4 TGs/core) Q4_K prefill GEMM
- * with 128-bit uint4 dequant, fused BF16 epilogue, fused Shared Gate+Up+SwiGLU,
- * and Q_B 64-dim RoPE dispatch. */
+/* [P-D1 v2] + [P-R1] Site 1: MYDS_DENSE_PREFILL_WIDE (default 0, fail-closed).
+ * Apple8-tuned strict 0-ULP NR1=32 (NR0=64/NR1=32 & Pair NR0=32/NR1=32, 6 KB smem /
+ * 5 TGs/core, 52 VGPR / Apple8 maxThr=1024) Q4_K prefill GEMM with 128-bit uint4 dequant,
+ * fused BF16 epilogue, fused Shared Gate+Up+SwiGLU, and Q_B 64-dim RoPE dispatch. */
 typedef struct {
     uint64_t requests;
     uint64_t wide_encoded;

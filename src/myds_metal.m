@@ -189,8 +189,6 @@ static id<MTLComputePipelineState> g_pso_mul_mm_q8_0_bco = nil;
 static id<MTLComputePipelineState> g_pso_mul_mm_q4_K = nil;
 static id<MTLComputePipelineState> g_pso_mul_mm_q4_K_bco = nil;
 static bool                        g_dense_prefill_wide = false;
-static id<MTLComputePipelineState> g_pso_mul_mm_q4_K_f32_wide = nil;
-static id<MTLComputePipelineState> g_pso_mul_mm_q4_K_bf16_wide = nil;
 static id<MTLComputePipelineState> g_pso_mul_mm_q4_K_f32_u4 = nil;
 static id<MTLComputePipelineState> g_pso_mul_mm_q4_K_bf16_u4 = nil;
 static id<MTLComputePipelineState> g_pso_mul_mm_q4_K_pair_swiglu_bf16 = nil;
@@ -2912,42 +2910,39 @@ int myds_metal_init(const char *shader_dir) {
         fn = [g_library newFunctionWithName:@"kernel_mul_mm_q4_K_f32" constantValues:mm_c_bco1 error:nil];
         if (fn) g_pso_mul_mm_q4_K_bco = [g_device newComputePipelineStateWithFunction:fn error:nil];
 
-        /* [P-D1] MYDS_DENSE_PREFILL_WIDE: default 0 (fail-closed on invalid/missing PSO). */
+        /* [P-D1 v2] MYDS_DENSE_PREFILL_WIDE: default 0 (fail-closed on invalid/missing PSO).
+         * Apple8-tuned NR1=32 (52 VGPR / maxThr=1024 / 6,144B dyn + 32B static = 5 TGs/core)
+         * eliminates 76-core M2 Ultra grid starvation while keeping uint4 dequant, fused BF16
+         * epilogue, NR0=32/NR1=32 shared SwiGLU, and Q_B 64-dim RoPE. */
         g_dense_prefill_wide = (dense_prefill_wide == 1);
         if (g_dense_prefill_wide) {
-            fn = [g_library newFunctionWithName:@"kernel_mul_mm_q4_K_f32_wide"];
-            if (fn) g_pso_mul_mm_q4_K_f32_wide = [g_device newComputePipelineStateWithFunction:fn error:nil];
-            fn = [g_library newFunctionWithName:@"kernel_mul_mm_q4_K_bf16_wide"];
-            if (fn) g_pso_mul_mm_q4_K_bf16_wide = [g_device newComputePipelineStateWithFunction:fn error:nil];
             fn = [g_library newFunctionWithName:@"kernel_mul_mm_q4_K_f32_u4"];
             if (fn) g_pso_mul_mm_q4_K_f32_u4 = [g_device newComputePipelineStateWithFunction:fn error:nil];
             fn = [g_library newFunctionWithName:@"kernel_mul_mm_q4_K_bf16_u4"];
             if (fn) g_pso_mul_mm_q4_K_bf16_u4 = [g_device newComputePipelineStateWithFunction:fn error:nil];
             fn = [g_library newFunctionWithName:@"kernel_mul_mm_q4_K_pair_swiglu_bf16"];
             if (fn) g_pso_mul_mm_q4_K_pair_swiglu_bf16 = [g_device newComputePipelineStateWithFunction:fn error:nil];
-            id<MTLComputePipelineState> dpw_psos[5] = {
-                g_pso_mul_mm_q4_K_f32_wide,
-                g_pso_mul_mm_q4_K_bf16_wide,
+            id<MTLComputePipelineState> dpw_psos[3] = {
                 g_pso_mul_mm_q4_K_f32_u4,
                 g_pso_mul_mm_q4_K_bf16_u4,
                 g_pso_mul_mm_q4_K_pair_swiglu_bf16,
             };
-            bool dpw_ok = (g_device.maxThreadgroupMemoryLength >= 8192u);
-            for (int i = 0; i < 5 && dpw_ok; i++) {
+            bool dpw_ok = (g_device.maxThreadgroupMemoryLength >= 6144u);
+            for (int i = 0; i < 3 && dpw_ok; i++) {
                 id<MTLComputePipelineState> p = dpw_psos[i];
                 if (!p || p.threadExecutionWidth != 32u ||
                     p.maxTotalThreadsPerThreadgroup < 128u ||
-                    p.staticThreadgroupMemoryLength > g_device.maxThreadgroupMemoryLength - 8192u) {
+                    p.staticThreadgroupMemoryLength > g_device.maxThreadgroupMemoryLength - 6144u) {
                     dpw_ok = false;
                 }
             }
             if (!dpw_ok) {
-                fprintf(stderr, "myds_metal: MYDS_DENSE_PREFILL_WIDE=1 requested but wide Q4_K PSOs unavailable\n");
+                fprintf(stderr, "myds_metal: MYDS_DENSE_PREFILL_WIDE=1 requested but Q4_K v2 PSOs unavailable\n");
                 g_initialized = true;
                 myds_metal_cleanup();
                 return 0;
             }
-            MYDS_LOG_I("Dense Q4_K prefill wide enabled (NR0=64/NR1=64 smem=8KB, uint4 dequant, fused BF16 + shared SwiGLU + Q_B 64-dim RoPE)");
+            MYDS_LOG_I("Dense Q4_K prefill v2 enabled (NR0=64/NR1=32 & Pair NR0=32/NR1=32 smem=6KB 5TGs/core, uint4 dequant, fused BF16 + shared SwiGLU + Q_B 64-dim RoPE)");
         }
 
         fn = [g_library newFunctionWithName:@"kernel_mul_mm_f16_f32" constantValues:mm_c_bco0 error:nil];
@@ -3241,8 +3236,6 @@ void myds_metal_cleanup(void) {
     g_pso_mul_mm_q4_K = nil;
     g_pso_mul_mm_q4_K_bco = nil;
     g_dense_prefill_wide = false;
-    g_pso_mul_mm_q4_K_f32_wide = nil;
-    g_pso_mul_mm_q4_K_bf16_wide = nil;
     g_pso_mul_mm_q4_K_f32_u4 = nil;
     g_pso_mul_mm_q4_K_bf16_u4 = nil;
     g_pso_mul_mm_q4_K_pair_swiglu_bf16 = nil;
@@ -6799,7 +6792,6 @@ static int mul_mm_impl(
     id<MTLComputePipelineState> pipeline = nil;
     uint64_t row_bytes = 0;
     bool use_dpw = false;
-    bool use_wide = false;
 
     if (weight_type == GGML_TYPE_Q4_K && g_dense_prefill_wide && !bc_inp && (in_dim % 256u) == 0) {
         row_bytes = (uint64_t)(in_dim / 256u) * 144u;
@@ -6808,10 +6800,9 @@ static int mul_mm_impl(
             dst->size / sizeof(float) / out_dim < n_tok) return 0;
         atomic_fetch_add_explicit(&g_dpw_requests, 1u, memory_order_relaxed);
         if (buf_aligned16_metal(W) && buf_aligned16_metal(src1) && buf_aligned16_metal(dst)) {
-            use_wide = (n_tok >= 64u);
-            pipeline = use_wide
-                ? (round_bf16 ? g_pso_mul_mm_q4_K_bf16_wide : g_pso_mul_mm_q4_K_f32_wide)
-                : (round_bf16 ? g_pso_mul_mm_q4_K_bf16_u4   : g_pso_mul_mm_q4_K_f32_u4);
+            /* Route all sites to Apple8-tuned NR1=32 (52 VGPR / maxThr=1024 / 6KB smem)
+             * to avoid 76-core grid starvation and maxThr=576 drop seen on NR1=64 (#62). */
+            pipeline = round_bf16 ? g_pso_mul_mm_q4_K_bf16_u4 : g_pso_mul_mm_q4_K_f32_u4;
             if (pipeline) {
                 use_dpw = true;
             } else {
@@ -6878,11 +6869,9 @@ static int mul_mm_impl(
             NSUInteger grid_x;
             const char *tag;
             if (use_dpw) {
-                tg_mem = use_wide ? 8192u : ((round_bf16 || bc_out) ? 8192u : 6144u);
-                grid_x = use_wide ? (((NSUInteger)n_tok + 63u) / 64u)
-                                  : (((NSUInteger)n_tok + 31u) / 32u);
-                tag = use_wide ? (round_bf16 ? "gemm_q4k_wide_bf16" : "gemm_q4k_wide")
-                               : (round_bf16 ? "gemm_q4k_u4_bf16"   : "gemm_q4k_u4");
+                tg_mem = 6144u;
+                grid_x = ((NSUInteger)n_tok + 31u) / 32u;
+                tag = round_bf16 ? "gemm_q4k_u4_bf16" : "gemm_q4k_u4";
             } else {
                 tg_mem = (weight_type == GGML_TYPE_F32) ? 12288u : (bc_out ? 8192u : 6144u);
                 grid_x = ((NSUInteger)n_tok + 31u) / 32u;
@@ -6894,12 +6883,8 @@ static int mul_mm_impl(
                                                  1),
                  MTLSizeMake(128, 1, 1));
 
-            if (use_dpw) {
-                if (use_wide) {
-                    atomic_fetch_add_explicit(&g_dpw_wide_encoded, 1u, memory_order_relaxed);
-                } else if (round_bf16) {
-                    atomic_fetch_add_explicit(&g_dpw_narrow_bf16_encoded, 1u, memory_order_relaxed);
-                }
+            if (use_dpw && round_bf16) {
+                atomic_fetch_add_explicit(&g_dpw_narrow_bf16_encoded, 1u, memory_order_relaxed);
             }
 
             if (g_batch_cb) {
@@ -6993,7 +6978,6 @@ static int mul_mm_grouped_impl(
     id<MTLComputePipelineState> pipeline = nil;
     uint64_t row_bytes = 0;
     bool use_dpw = false;
-    bool use_wide = false;
 
     if (weight_type == GGML_TYPE_Q4_K && g_dense_prefill_wide && !bc_inp && (in_dim % 256u) == 0) {
         row_bytes = (uint64_t)(in_dim / 256u) * 144u;
@@ -7002,10 +6986,8 @@ static int mul_mm_grouped_impl(
             dst->size / sizeof(float) / out_dim / n_groups < n_tok) return 0;
         atomic_fetch_add_explicit(&g_dpw_requests, 1u, memory_order_relaxed);
         if (buf_aligned16_metal(W) && buf_aligned16_metal(src1) && buf_aligned16_metal(dst)) {
-            use_wide = (n_tok >= 64u);
-            pipeline = use_wide
-                ? (round_bf16 ? g_pso_mul_mm_q4_K_bf16_wide : g_pso_mul_mm_q4_K_f32_wide)
-                : (round_bf16 ? g_pso_mul_mm_q4_K_bf16_u4   : g_pso_mul_mm_q4_K_f32_u4);
+            /* Route grouped Q4_K to Apple8-tuned NR1=32 (52 VGPR / maxThr=1024 / 6KB smem). */
+            pipeline = round_bf16 ? g_pso_mul_mm_q4_K_bf16_u4 : g_pso_mul_mm_q4_K_f32_u4;
             if (pipeline) {
                 use_dpw = true;
             } else {
@@ -7073,11 +7055,9 @@ static int mul_mm_grouped_impl(
         NSUInteger grid_x;
         const char *tag;
         if (use_dpw) {
-            tg_mem = use_wide ? 8192u : ((round_bf16 || bc_out) ? 8192u : 6144u);
-            grid_x = use_wide ? (((NSUInteger)n_tok + 63u) / 64u)
-                              : (((NSUInteger)n_tok + 31u) / 32u);
-            tag = use_wide ? (round_bf16 ? "gemm_grouped_q4k_wide_bf16" : "gemm_grouped_q4k_wide")
-                           : (round_bf16 ? "gemm_grouped_q4k_u4_bf16"   : "gemm_grouped_q4k_u4");
+            tg_mem = 6144u;
+            grid_x = ((NSUInteger)n_tok + 31u) / 32u;
+            tag = round_bf16 ? "gemm_grouped_q4k_u4_bf16" : "gemm_grouped_q4k_u4";
         } else {
             tg_mem = (weight_type == GGML_TYPE_F32) ? 12288u : (bc_out ? 8192u : 6144u);
             grid_x = ((NSUInteger)n_tok + 31u) / 32u;
@@ -7089,12 +7069,8 @@ static int mul_mm_grouped_impl(
                                              (NSUInteger)n_groups),
              MTLSizeMake(128, 1, 1));
 
-        if (use_dpw) {
-            if (use_wide) {
-                atomic_fetch_add_explicit(&g_dpw_grouped_wide_encoded, 1u, memory_order_relaxed);
-            } else if (round_bf16) {
-                atomic_fetch_add_explicit(&g_dpw_narrow_bf16_encoded, 1u, memory_order_relaxed);
-            }
+        if (use_dpw && round_bf16) {
+            atomic_fetch_add_explicit(&g_dpw_narrow_bf16_encoded, 1u, memory_order_relaxed);
         }
 
         if (g_batch_cb) {
@@ -7188,9 +7164,9 @@ int myds_metal_mul_mm_q4_k_pair_swiglu_bf16(
         [enc setBuffer:W_up->mtl_buf offset:W_up->offset atIndex:2];
         [enc setBuffer:src1->mtl_buf offset:src1->offset atIndex:3];
         [enc setBuffer:dst_mid->mtl_buf offset:dst_mid->offset atIndex:4];
-        [enc setThreadgroupMemoryLength:8192u atIndex:0];
+        [enc setThreadgroupMemoryLength:6144u atIndex:0];
         metal_dispatch(enc, "gemm_q4k_pair_swiglu_bf16",
-                       MTLSizeMake(((NSUInteger)n_tok + 63u) / 64u,
+                       MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
                                    ((NSUInteger)out_dim + 31u) / 32u,
                                    1),
                        MTLSizeMake(128, 1, 1));
