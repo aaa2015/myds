@@ -694,8 +694,22 @@ void myds_v41_gpu_prefill_attn_q16_counters(
 bool myds_v41_gpu_prefill_attn_wants_q_f16(const myds_v41_gpu_scratch_t *s,
     const myds_metal_buffer_t *gathered, uint32_t c_len, uint32_t n_comp,
     uint32_t top_k, uint32_t base_pos, uint32_t c_start, uint32_t ratio);
+/* [P-R1 Site 2] Default-off in-register BF16 + inverse RoPE fusion in prefill
+ * maskless-slab epilogue (MYDS_PREFILL_ATTN_ROPE_FUSE: absent/0=off, 1=on, else -1). */
+int myds_v41_gpu_prefill_attn_rope_fuse_enabled(void);
+typedef struct {
+    uint64_t q8_encoded;
+    uint64_t q16_encoded;
+    uint64_t q32_encoded;
+    uint64_t l01_encoded;
+} myds_v41_gpu_prefill_attn_rope_fuse_counters_t;
+void myds_v41_gpu_prefill_attn_rope_fuse_counters(
+    myds_v41_gpu_prefill_attn_rope_fuse_counters_t *out, bool reset);
 typedef struct {
     const myds_metal_buffer_t *q_f16;
+    bool     fuse_rope;
+    bool     rope_compressed;
+    bool    *rope_consumed;
 } myds_v41_gpu_attention_chunk_opts_t;
 int myds_v41_gpu_attention_chunk_ex(myds_metal_buffer_t *heads,const myds_metal_buffer_t *sinks,
     const myds_metal_buffer_t *q,const myds_metal_buffer_t *chunk_kv,

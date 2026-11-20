@@ -125,6 +125,32 @@ void myds_v41_gpu_prefill_attn_q16_counters(
         .q_rope_f16_encoded = v[PAQ_ROPE_F16_ENCODED]
     };
 }
+enum { PARF_Q8_ENCODED, PARF_Q16_ENCODED, PARF_Q32_ENCODED, PARF_L01_ENCODED, PARF_COUNT };
+static _Atomic uint64_t prefill_attn_rope_fuse_counters[PARF_COUNT];
+static inline void prefill_attn_rope_fuse_count(unsigned k) {
+    atomic_fetch_add_explicit(&prefill_attn_rope_fuse_counters[k], 1u, memory_order_relaxed);
+}
+int myds_v41_gpu_prefill_attn_rope_fuse_enabled(void) {
+    const char *v = getenv("MYDS_PREFILL_ATTN_ROPE_FUSE");
+    if (!v || !strcmp(v, "0")) return 0;
+    if (!strcmp(v, "1")) return 1;
+    MYDS_LOG_E("MYDS_PREFILL_ATTN_ROPE_FUSE must be absent, 0, or 1");
+    return -1;
+}
+void myds_v41_gpu_prefill_attn_rope_fuse_counters(
+    myds_v41_gpu_prefill_attn_rope_fuse_counters_t *out, bool reset) {
+    uint64_t v[PARF_COUNT];
+    for (unsigned k = 0; k < PARF_COUNT; ++k)
+        v[k] = reset ? atomic_exchange_explicit(&prefill_attn_rope_fuse_counters[k], 0u, memory_order_relaxed)
+                     : atomic_load_explicit(&prefill_attn_rope_fuse_counters[k], memory_order_relaxed);
+    if (!out) return;
+    *out = (myds_v41_gpu_prefill_attn_rope_fuse_counters_t){
+        .q8_encoded = v[PARF_Q8_ENCODED],
+        .q16_encoded = v[PARF_Q16_ENCODED],
+        .q32_encoded = v[PARF_Q32_ENCODED],
+        .l01_encoded = v[PARF_L01_ENCODED]
+    };
+}
 static uint32_t attn_matrix_test_failure;
 void myds_v41_gpu_inject_attention_matrix_failure(uint32_t kind) {
     attn_matrix_test_failure=kind;
@@ -431,6 +457,7 @@ myds_v41_gpu_scratch_t *myds_v41_gpu_scratch_create(uint32_t max_comp) {
         myds_v41_gpu_indexer_prefill_compact_enabled()<0 ||
         myds_v41_gpu_topk_radix_causal_enabled()<0 ||
         myds_v41_gpu_prefill_attn_q16_mode()<0 ||
+        myds_v41_gpu_prefill_attn_rope_fuse_enabled()<0 ||
         myds_v41_gpu_attention_packed_register_enabled()<0 || myds_v41_attention_rope_fuse_enabled()<0 ||
         myds_v41_gpu_attention_decode_mma_enabled()<0 ||
         myds_v41_gpu_attention_direct_pack_fuse_enabled()<0) return NULL;
@@ -3624,6 +3651,13 @@ struct attention_rope_fuse_args {
 };
 _Static_assert(sizeof(struct attention_rope_fuse_args)==336u,"attention+rope ABI");
 _Static_assert(offsetof(struct attention_rope_fuse_args,pos)==200u,"attention+rope position ABI");
+struct flash_prefill_rope_args {
+    uint64_t attention[24];
+    uint32_t start_pos, inverse;
+    float frequencies[32];
+};
+_Static_assert(sizeof(struct flash_prefill_rope_args)==328u,"prefill attention+rope ABI");
+_Static_assert(offsetof(struct flash_prefill_rope_args,start_pos)==192u,"prefill attention+rope start_pos ABI");
 _Static_assert(offsetof(struct attention_rope_fuse_args,inverse)==204u,"attention+rope inverse ABI");
 _Static_assert(offsetof(struct attention_rope_fuse_args,frequencies)==208u,"attention+rope frequency ABI");
 struct attention_rope_scope { uint32_t pos; bool compressed; };
@@ -3720,8 +3754,10 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
     uint32_t base_pos,uint32_t c_start,uint32_t ratio,myds_v41_gpu_scratch_t *s,bool comp_bf16,
     const myds_v41_gpu_attention_chunk_opts_t *opts) {
     myds_v41_gpu_attn_kv_reuse_reset(s);
+    if (opts && opts->rope_consumed) *opts->rope_consumed = false;
     const int q16_mode = myds_v41_gpu_prefill_attn_q16_mode();
-    if(q16_mode < 0) return 0;
+    const int rope_fuse_env = myds_v41_gpu_prefill_attn_rope_fuse_enabled();
+    if(q16_mode < 0 || rope_fuse_env < 0) return 0;
     const myds_metal_buffer_t *q_f16 = opts ? opts->q_f16 : NULL;
     if(!s||!heads||!chunk_kv||c_len==0||c_len>MYDS_CHUNK_MAXC||top_k>512u||
        n_comp>s->key_comp_max||
@@ -3989,13 +4025,34 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
             const myds_metal_buffer_t *mb[]={q_sel,kv_sel,kv_sel,s->mask_chunk,sinks,s->kv_chunk,s->pad,heads};
             const myds_metal_constant_t mc[]={{300,true,0},{301,true,1},{302,true,0},{303,true,0},
                 {304,true,0},{310,true,0},{320,false,512},{321,false,512},{322,false,nsg}};
-            const char *kernel = use_q16_fast
-                ? ((q16_mode == 32)
-                    ? "kernel_myds_flash_attn_heads_maskless_slab_q32_f16_dk512_dv512"
-                    : "kernel_myds_flash_attn_heads_maskless_slab_q16_f16_dk512_dv512")
-                : "kernel_myds_flash_attn_heads_maskless_slab_f16_dk512_dv512";
+            const bool want_rope_fuse = (rope_fuse_env == 1) && opts && opts->fuse_rope &&
+                (opts->rope_consumed != NULL) && (p0 < 1048576u) &&
+                ((uint64_t)p0 + (uint64_t)(c_len - 1u) < 1048576u);
+            const char *kernel = want_rope_fuse
+                ? (use_q16_fast
+                    ? ((q16_mode == 32)
+                        ? "kernel_myds_fa_maskless_slab_q32_rope_f16_dk512_dv512"
+                        : "kernel_myds_fa_maskless_slab_q16_rope_f16_dk512_dv512")
+                    : "kernel_myds_flash_attn_heads_maskless_slab_rope_f16_dk512_dv512")
+                : (use_q16_fast
+                    ? ((q16_mode == 32)
+                        ? "kernel_myds_flash_attn_heads_maskless_slab_q32_f16_dk512_dv512"
+                        : "kernel_myds_flash_attn_heads_maskless_slab_q16_f16_dk512_dv512")
+                    : "kernel_myds_flash_attn_heads_maskless_slab_f16_dk512_dv512");
             const size_t smem = use_q16_fast ? ((q16_mode == 32) ? 8320u : 4160u) : 10272u;
-            matrix_encoded=specialized(kernel,&ma,192,mb,8,nblk1,c_len,1,32,(uint32_t)nsg,1,smem,mc,9);
+            if (want_rope_fuse) {
+                pthread_once(&rope_once, init_rope);
+                struct flash_prefill_rope_args ra;
+                memcpy(ra.attention, &ma, 192u);
+                ra.start_pos = p0;
+                ra.inverse = 1u;
+                memcpy(ra.frequencies, rope_frequencies[opts->rope_compressed ? 1 : 0], sizeof(ra.frequencies));
+                matrix_encoded = specialized(kernel, &ra, sizeof(ra), mb, 8, nblk1, c_len, 1,
+                                             32, (uint32_t)nsg, 1, smem, mc, 9);
+            } else {
+                matrix_encoded = specialized(kernel, &ma, 192, mb, 8, nblk1, c_len, 1,
+                                             32, (uint32_t)nsg, 1, smem, mc, 9);
+            }
             if(matrix_encoded){
                 matrix_kernel_used=kernel;
                 matrix_smem_used=smem;
@@ -4003,6 +4060,12 @@ static int attention_chunk(myds_metal_buffer_t *heads,const myds_metal_buffer_t 
                 atomic_fetch_add_explicit(&prefill_attn_fast_cnt[PAF_FAST_MATRIX_ENC], 1u, memory_order_relaxed);
                 if (use_q16_fast) {
                     prefill_attn_q16_count(q16_mode == 32 ? PAQ_Q32_ENCODED : PAQ_Q16_ENCODED);
+                }
+                if (want_rope_fuse) {
+                    *opts->rope_consumed = true;
+                    prefill_attn_rope_fuse_count(use_q16_fast
+                        ? (q16_mode == 32 ? PARF_Q32_ENCODED : PARF_Q16_ENCODED)
+                        : PARF_Q8_ENCODED);
                 }
             } else if (use_q16_fast) {
                 /* Packed half Q cannot fall back silently to FP32 vec; fail closed. */

@@ -8901,6 +8901,7 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     if (run2 && !myds_metal_buffer_copy(g->window[il], 0, cw->kv_act_buf, (size_t)(t0 + run1) * 512 * 4u, (size_t)run2 * 512 * 4u)) goto fail;
                 }
 
+                bool attn_rope_consumed = false;
                 if (kv_only) { /* 前端：attention 整体跳过（下面 !kv_only 段） */ }
                 else {
                 {
@@ -8921,8 +8922,13 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                     extern void myds_attention_multihead_capture_set_layer(uint32_t);
                     myds_attention_multihead_capture_set_layer(il);
 #endif
+                    const int prefill_rope_fuse = myds_v41_gpu_prefill_attn_rope_fuse_enabled();
+                    if (prefill_rope_fuse < 0) goto fail;
                     const myds_v41_gpu_attention_chunk_opts_t attn_opts = {
                         .q_f16 = chunk_q_is_f16 ? cw->q_f16_buf : NULL,
+                        .fuse_rope = (prefill_rope_fuse == 1),
+                        .rope_compressed = compressed,
+                        .rope_consumed = &attn_rope_consumed,
                     };
                     if (!myds_v41_gpu_attention_chunk_ex(cw->attn_heads_buf, base->attn_sinks, cw->q_buf,
                             cw->kv_act_buf,
@@ -8945,8 +8951,9 @@ int myds_v41_prefill_tokens(myds_context_t *ctx, const int32_t *tokens,
                 }
 
                 PHASE_FINE(MYDS_PH_TAG_ATTN_TAIL);
-                /* Batched inverse RoPE + BF16 rounding */
-                CHECK(myds_v41_gpu_rope_batch_round(cw->attn_heads_buf, 512, V41_HEADS, mb_base_pos + c_start, c_len, compressed, true));
+                /* Batched inverse RoPE + BF16 rounding (skipped when fused in maskless-slab epilogue) */
+                if (!attn_rope_consumed)
+                    CHECK(myds_v41_gpu_rope_batch_round(cw->attn_heads_buf, 512, V41_HEADS, mb_base_pos + c_start, c_len, compressed, true));
                 disp_ringattn += myds_metal_dispatch_count() - dr0;   /* 诊断 */
 
                 if (do_prof) { disp_step4loop += myds_metal_dispatch_count() - disp_loop0; }  /* 诊断 */

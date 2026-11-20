@@ -963,6 +963,33 @@ kernel flash_attn_ext_dk256_t kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1,
 //   row  = ((tiisg >> 2) & 4) | ((tiisg >> 1) & 3)   in [0, 7]
 //   col0 = ((tiisg >> 1) & 4) | ((tiisg & 1) << 1)   in {0, 2, 4, 6}
 //   col1 = col0 + 1                                  in {1, 3, 5, 7}
+// [P-R1 Site 2] Prefill attention + fused BF16 round & inverse RoPE epilogue ABI.
+struct myds_prefill_attn_rope_args {
+    ds4_metal_args_flash_attn_ext attention;
+    uint  start_pos;
+    uint  inverse;
+    float frequencies[32];
+};
+static_assert(sizeof(myds_prefill_attn_rope_args) == 328, "prefill attention+rope ABI");
+
+static inline float myds_prefill_attn_bf16(float x) {
+    uint bits = as_type<uint>(x);
+    if ((bits & 0x7f800000u) != 0x7f800000u)
+        bits += 0x7fffu + ((bits >> 16u) & 1u);
+    return as_type<float>(bits & 0xffff0000u);
+}
+
+static inline float2 myds_prefill_rope_bf16_apply(float2 raw, bool do_rope, float rc, float rs) {
+    const float re = myds_prefill_attn_bf16(raw.x);
+    const float im = myds_prefill_attn_bf16(raw.y);
+    if (do_rope) {
+        const float out_re = myds_prefill_attn_bf16(re * rc - im * rs);
+        const float out_im = myds_prefill_attn_bf16(precise::fma(im, rc, re * rs));
+        return float2(out_re, out_im);
+    }
+    return float2(re, im);
+}
+
 template<
     short DK,
     short DV,
@@ -972,7 +999,8 @@ template<
     bool HEAD_BATCH = true,
     bool MASKLESS = false,
     bool DIRECT_SLAB = false,
-    bool ZERO_SQ = false>
+    bool ZERO_SQ = false,
+    bool FUSE_ROPE = false>
 void kernel_myds_flash_attn_heads_reg_o_impl(
         constant ds4_metal_args_flash_attn_ext & args,
         device const char * q,
@@ -986,7 +1014,10 @@ void kernel_myds_flash_attn_heads_reg_o_impl(
         threadgroup  half * shmem_f16,
         uint3   tgpig,
         ushort  tiisg,
-        ushort  sgitg) {
+        ushort  sgitg,
+        uint    rope_start_pos = 0u,
+        uint    rope_inverse = 0u,
+        constant float * rope_freqs = nullptr) {
     const ushort iq3 = tgpig[2];
     const ushort iq2 = tgpig[1];
     const ushort iq1 = tgpig[0]*Q;
@@ -1404,18 +1435,48 @@ void kernel_myds_flash_attn_heads_reg_o_impl(
         }
     }
 
-    FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
-        const short j = qb*8 + lo_row;
-        if (iq1 + j < args.ne01) {
-            #pragma clang fp contract(off)
-            const float scale = s_scale[j];
-            const uint64_t rid = HEAD_BATCH ? (uint64_t)iq2*args.ne1 + iq1 + j :
-                (uint64_t)iq3*args.ne2*args.ne1 + iq2 + (uint64_t)(iq1 + j)*args.ne1;
-            device float2 * dst2 = (device float2 *) ((device float *) dst + rid*DV);
-            FOR_UNROLL (short ii = 0; ii < NO_COL; ++ii) {
-                const short c2 = (8*sgitg + ii*8*NSG + lo_col) / 2;
-                dst2[c2] = float2(lo[qb][ii].thread_elements()[0] * scale,
-                                  lo[qb][ii].thread_elements()[1] * scale);
+    if (FUSE_ROPE) {
+        const uint pos = rope_start_pos + (uint)iq2;
+        FOR_UNROLL (short ii = 0; ii < NO_COL; ++ii) {
+            const short c2 = (8*sgitg + ii*8*NSG + lo_col) / 2;
+            const bool do_rope = (c2 >= 224);
+            float rc = 1.0f, rs = 0.0f;
+            if (do_rope) {
+                const float theta = float(pos) * rope_freqs[c2 - 224];
+                rc = precise::cos(theta);
+                rs = rope_inverse ? -precise::sin(theta) : precise::sin(theta);
+            }
+            FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
+                const short j = qb*8 + lo_row;
+                if (iq1 + j < args.ne01) {
+                    float2 raw;
+                    {
+                        #pragma clang fp contract(off)
+                        const float scale = s_scale[j];
+                        raw = float2(lo[qb][ii].thread_elements()[0] * scale,
+                                     lo[qb][ii].thread_elements()[1] * scale);
+                    }
+                    const uint64_t rid = HEAD_BATCH ? (uint64_t)iq2*args.ne1 + iq1 + j :
+                        (uint64_t)iq3*args.ne2*args.ne1 + iq2 + (uint64_t)(iq1 + j)*args.ne1;
+                    device float2 * dst2 = (device float2 *) ((device float *) dst + rid*DV);
+                    dst2[c2] = myds_prefill_rope_bf16_apply(raw, do_rope, rc, rs);
+                }
+            }
+        }
+    } else {
+        FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
+            const short j = qb*8 + lo_row;
+            if (iq1 + j < args.ne01) {
+                #pragma clang fp contract(off)
+                const float scale = s_scale[j];
+                const uint64_t rid = HEAD_BATCH ? (uint64_t)iq2*args.ne1 + iq1 + j :
+                    (uint64_t)iq3*args.ne2*args.ne1 + iq2 + (uint64_t)(iq1 + j)*args.ne1;
+                device float2 * dst2 = (device float2 *) ((device float *) dst + rid*DV);
+                FOR_UNROLL (short ii = 0; ii < NO_COL; ++ii) {
+                    const short c2 = (8*sgitg + ii*8*NSG + lo_col) / 2;
+                    dst2[c2] = float2(lo[qb][ii].thread_elements()[0] * scale,
+                                      lo[qb][ii].thread_elements()[1] * scale);
+                }
             }
         }
     }
@@ -1481,6 +1542,50 @@ kernel flash_attn_heads_reg_o_q32_fast_t kernel_myds_flash_attn_heads_reg_o<512,
 // Step 2 (Q=16, C=64, NSG=8 Reg-O): 24,640 B smem (1 TG = 256 threads/core).
 template [[host_name("kernel_myds_flash_attn_heads_q16_f16_dk512_dv512")]]
 kernel flash_attn_heads_reg_o_t kernel_myds_flash_attn_heads_reg_o<512, 512, 16, 64, 8, true>;
+
+// [P-R1 Site 2] Fused BF16-round + inverse RoPE epilogue variants (strict 0-ULP vs
+// heads_maskless_slab + kernel_dsv41_rope_round). All host names <= 63 chars for fast PSO cache.
+template<
+    short DK,
+    short DV,
+    short Q,
+    short C,
+    short NSG,
+    bool HEAD_BATCH = true,
+    bool MASKLESS = true,
+    bool DIRECT_SLAB = true,
+    bool ZERO_SQ = false>
+kernel void kernel_myds_flash_attn_heads_reg_o_rope(
+        constant myds_prefill_attn_rope_args & rope_args,
+        device const char * q,
+        device const char * k,
+        device const char * v,
+        device const char * mask,
+        device const char * sinks,
+        device const char * pad,
+        device const char * blk,
+        device       char * dst,
+        threadgroup  half * shmem_f16 [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+    if (FC_flash_attn_ext_nsg == NSG) {
+        kernel_myds_flash_attn_heads_reg_o_impl<DK, DV, Q, C, NSG, HEAD_BATCH, MASKLESS, DIRECT_SLAB, ZERO_SQ, true>(
+            rope_args.attention, q, k, v, mask, sinks, pad, blk, dst, shmem_f16, tgpig, tiisg, sgitg,
+            rope_args.start_pos, rope_args.inverse, rope_args.frequencies);
+    }
+}
+
+typedef decltype(kernel_myds_flash_attn_heads_reg_o_rope<512, 512, 8, 64, 4, true, true, true, false>) flash_attn_heads_reg_o_rope_t;
+
+template [[host_name("kernel_myds_flash_attn_heads_maskless_slab_rope_f16_dk512_dv512")]]
+kernel flash_attn_heads_reg_o_rope_t kernel_myds_flash_attn_heads_reg_o_rope<512, 512, 8, 64, 4, true, true, true, false>;
+
+template [[host_name("kernel_myds_fa_maskless_slab_q16_rope_f16_dk512_dv512")]]
+kernel flash_attn_heads_reg_o_rope_t kernel_myds_flash_attn_heads_reg_o_rope<512, 512, 16, 64, 8, true, true, true, true>;
+
+template [[host_name("kernel_myds_fa_maskless_slab_q32_rope_f16_dk512_dv512")]]
+kernel flash_attn_heads_reg_o_rope_t kernel_myds_flash_attn_heads_reg_o_rope<512, 512, 32, 64, 16, true, true, true, true>;
 
 constant bool FC_flash_attn_ext_vec_has_mask  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 0)]];
 constant bool FC_flash_attn_ext_vec_has_sinks [[function_constant(FC_FLASH_ATTN_EXT_VEC + 1)]];
