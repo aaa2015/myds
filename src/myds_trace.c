@@ -89,6 +89,10 @@ void myds_trace_rec_mark_unmeasured(myds_trace_rec_t *rec) {
     rec->prefill_tps = -1.0;
     rec->decode_tps = -1.0;
     rec->cache_hit_rate = -1.0;
+    rec->temperature = -1.0;
+    rec->thinking = -1;
+    rec->ablation = -1;
+    rec->max_ctx = 0u;
     rec->detail.prefill_gpu_s = -1.0;
     rec->detail.prefill_wait_s = -1.0;
     rec->detail.decode_gpu_s = -1.0;
@@ -289,6 +293,13 @@ static void jput_record(jbuf_t *b, const myds_trace_rec_t *r) {
           "\"out_tokens\":%u,\"stream\":%s",
           r->in_flight ? "true" : "false",
           r->prompt_tokens, r->cached_tokens, r->out_tokens, r->stream ? "true" : "false");
+    if (r->max_ctx > 0u) jputf(b, ",\"max_ctx\":%u", r->max_ctx);
+    else jput(b, ",\"max_ctx\":null");
+    jput(b, ",\"temperature\":");
+    jput_stage(b, r->temperature);
+    jputf(b, ",\"thinking\":%s,\"ablation\":%s",
+          r->thinking < 0 ? "null" : (r->thinking ? "true" : "false"),
+          r->ablation < 0 ? "null" : (r->ablation ? "true" : "false"));
     jput(b, ",\"cache_hit_rate\":");
     jput_stage(b, r->cache_hit_rate);
     jput(b, ",\"ttft\":");
@@ -404,15 +415,13 @@ const char *myds_trace_page_html(void) {
 "border-radius:3px;overflow:clip}"
 ".bar i{display:block;height:100%;background:var(--acc)}"
 "#wrap{display:flex;height:calc(100vh - 41px)}"
-/* 最大化：把另一侧收成 0 宽，这一侧吃掉全部宽度。
- * 用 display:none 而不是 width:0 —— 后者仍会保留边框与内边距，右边会留一条缝。 */
-"#wrap.max-left #detail{display:none}"
-"#wrap.max-left #list{width:100%}"
-"#wrap.max-right #list{display:none}"
-"#wrap.max-right #detail{flex:1}"
-".pmax{float:right;background:none;border:1px solid var(--line);color:var(--dim);"
-"cursor:pointer;font:inherit;font-size:11px;padding:1px 6px;border-radius:3px;margin-left:8px}"
-".pmax:hover{color:var(--fg);border-color:var(--acc)}"
+/* 收起详情面板：把右侧收成 display:none，左侧吃掉全部宽度。 */
+"#wrap.hide-detail #detail{display:none}"
+"#wrap.hide-detail #list{width:100%;border-right:none}"
+".fbtn{background:none;border:1px solid var(--line);color:var(--dim);cursor:pointer;"
+"font:inherit;font-size:12px;padding:2px 8px;border-radius:3px;white-space:nowrap}"
+".fbtn:hover{color:var(--fg);border-color:var(--acc)}"
+".fbtn.on{border-color:var(--acc);color:var(--fg);background:#1e2b38}"
 /* 树状明细：每级缩进 26px。14px 太窄，层级一多就分不清父子。 */
 ".tree{font-size:12.5px;line-height:1.9;margin:6px 0 18px}"
 ".tn{padding-left:0}"
@@ -429,7 +438,7 @@ const char *myds_trace_page_html(void) {
 "table{width:100%;border-collapse:collapse}"
 "th,td{padding:5px 8px;text-align:left;white-space:nowrap;border-bottom:1px solid var(--line)}"
 "th{position:sticky;top:0;background:#161a20;color:var(--dim);font-weight:500;z-index:1}"
-"td.num{text-align:right}"
+"#list th,#list td{text-align:right}"
 ".rid{max-width:210px;overflow:hidden;text-overflow:ellipsis}"
 "tbody tr{cursor:pointer}"
 "tbody tr:hover{background:#1a1f26}"
@@ -459,23 +468,25 @@ const char *myds_trace_page_html(void) {
 "background:#000;padding:2px 5px;border-radius:3px;white-space:nowrap;font-size:11px}"
 "</style></head><body>"
 "<header><h1>myds trace</h1>"
+"<button id=\"follow\" class=\"fbtn on\" title=\"自动跟随最新请求 (f)\">跟随</button>"
 "<span id=\"sys\"><span id=\"sysbox\"><span class=\"m\">采样中…</span></span></span></header>"
-"<div id=\"wrap\"><div id=\"list\">"
-"<div style=\"padding:6px 12px 0\">"
-"<button class=\"pmax\" id=\"maxL\" title=\"最大化左侧\">⛶ 左侧</button>"
-"<span class=\"meta\">请求列表</span></div>"
+"<div id=\"wrap\" class=\"hide-detail\"><div id=\"list\">"
 "<table><thead><tr>"
-"<th>#</th><th>时间</th><th>resp_id</th><th class=\"num\">prompt</th>"
-"<th class=\"num\">cache</th><th class=\"num\">out</th><th class=\"num\">TTFT</th>"
-"<th class=\"num\">prefill</th><th class=\"num\">decode</th>"
-"<th class=\"num\">总耗时</th><th>finish</th>"
-"</tr></thead><tbody id=\"rows\"><tr><td colspan=\"11\" class=\"empty\">loading…</td></tr>"
-"</tbody></table></div><div id=\"detail\"><div class=\"empty\">选择左侧任一请求</div></div></div>"
+"<th>#</th><th>time</th><th>resp_id</th><th class=\"num\">prompt</th>"
+"<th class=\"num\">cache</th><th class=\"num\">out</th>"
+"<th class=\"num\">ctx</th><th class=\"num\">max ctx</th><th class=\"num\">ctx %</th>"
+"<th class=\"num\">temp</th><th>think</th><th>ablation</th>"
+"<th class=\"num\">ttft</th>"
+"<th class=\"num\">prefill</th><th class=\"num\">prefill cost</th>"
+"<th class=\"num\">decode</th><th class=\"num\">decode cost</th>"
+"<th class=\"num\">total cost</th><th>finish</th>"
+"</tr></thead><tbody id=\"rows\"><tr><td colspan=\"19\" class=\"empty\">loading…</td></tr>"
+"</tbody></table></div><div id=\"detail\"></div></div>"
 "<script>"
 "const ST=[['queue','排队','--q'],['render','解析+渲染','--r'],['setup','进引擎前','--s'],"
 "['engine','引擎总','--e'],['prefill','prefill','--p'],['decode','decode','--d'],"
 "['unattributed','未归因','--u']];"
-"let SEL=null,RECS=[],LASTINFLIGHT=false;"
+"let SEL=null,RECS=[],LASTINFLIGHT=false,FOLLOW=true;"
 /* 时间固定成 YYYY-MM-DD HH:MM:SS。
  *
  * 不用 toLocaleString / toLocaleTimeString：它们跟随浏览器 locale，
@@ -501,16 +512,15 @@ const char *myds_trace_page_html(void) {
 "let j;"
 "try{const r=await fetch(api('/trace/api/requests'));"
 "if(!r.ok){document.getElementById('rows').innerHTML="
-"`<tr><td colspan=\"11\" class=\"empty\">API ${r.status} - token 可能已失效，或页面是旧的</td></tr>`;return;}"
+"`<tr><td colspan=\"19\" class=\"empty\">API ${r.status} - token 可能已失效，或页面是旧的</td></tr>`;return;}"
 "j=await r.json();}catch(e){"
-"document.getElementById('rows').innerHTML=`<tr><td colspan=\"11\" class=\"empty\">无法连接：${e}</td></tr>`;return;}"
+"document.getElementById('rows').innerHTML=`<tr><td colspan=\"19\" class=\"empty\">无法连接：${e}</td></tr>`;return;}"
 "RECS=j.records||[];"
 /* count/capacity 不再显示 —— 标题栏只放性能数据。容量信息仍然在 API 里。 */
 "const tb=document.getElementById('rows');"
-"if(!RECS.length){tb.innerHTML='<tr><td colspan=\"11\" class=\"empty\">"
-"暂无记录（先发一个请求）</td></tr>';return;}"
+"if(!RECS.length){tb.innerHTML='';return;}"
 "tb.innerHTML=RECS.map(rec=>{"
-"const p=rec.phases;const when=ts(rec.epoch_ms).slice(11);"
+"const p=rec.phases;const when=ts(rec.epoch_ms);"
 /* 进行中的请求没有 engine（阶段都是 null），用【墙上时间】算已耗时 ——
  * 这是唯一能在跑完之前拿到的数。它包含排队，与完成后的口径不同，
  * 所以单独标注，不冒充「总耗时」。 */
@@ -529,10 +539,18 @@ const char *myds_trace_page_html(void) {
 "const pfTitle=rec.prefill_tps===null?'整个 prompt 命中缓存，本次没有跑 prefill':"
 "(rec.cached_tokens>0?('增量 prefill '+pfTok+' tok · 复用 '+rec.cached_tokens+' tok'+(pfEff?' · 等效 '+pfEff+' t/s':'')):'引擎自报，不含排队与分词');"
 "const pfCell=rec.prefill_tps===null?'—':(rec.prefill_tps.toFixed(0)+' t/s'+(rec.cached_tokens>0?' (+'+pfTok+')':''));"
+"const pfCost=p.prefill===null||p.prefill<0?'—':f(p.prefill);"
 "const dcTitle=rec.decode_tps===null?'本次没有 decode 步':'生成阶段速率（每秒多少次前向）';"
+"const dcCost=p.decode===null||p.decode<0?'—':f(p.decode);"
 "const wall=rec.in_flight?(Date.now()-rec.epoch_ms)/1000:"
 "(p.engine===null?null:(p.queue<0?0:p.queue)+(p.render>0?p.render:0)+"
 "(p.setup>0?p.setup:0)+p.engine);"
+"const ctxUsed=(rec.in_flight&&!rec.prompt_tokens&&!rec.out_tokens)?null:((rec.prompt_tokens||0)+(rec.out_tokens||0));"
+"const ctxMax=(rec.max_ctx&&rec.max_ctx>0)?rec.max_ctx:null;"
+"const ctxPct=(ctxUsed!==null&&ctxMax!==null)?(100*ctxUsed/ctxMax):null;"
+"const tempCell=rec.temperature===null||rec.temperature===undefined||rec.temperature<0?'—':rec.temperature.toFixed(2);"
+"const thinkCell=rec.thinking===null||rec.thinking===undefined?'—':(rec.thinking?'1':'0');"
+"const ablCell=rec.ablation===null||rec.ablation===undefined?'—':(rec.ablation?'1':'0');"
 "return `<tr data-seq=\"${rec.seq}\"${rec.seq===SEL?' class=\"sel\"':''}>`"
 "+`<td>${rec.seq}</td><td>${when}</td>`"
 /* resp_id 比 path 长：列表里截断显示，完整值仍在详情与 API 里。
@@ -542,23 +560,48 @@ const char *myds_trace_page_html(void) {
 "+`<td class=\"num\" title=\"${esc(cacheTitle)}\">`"
 "+`${rec.cache_hit_rate===null?'—':rec.cache_hit_rate.toFixed(0)+'%'}</td>`"
 "+`<td class=\"num\">${rec.out_tokens}</td>`"
+"+`<td class=\"num\">${ctxUsed===null?'—':ctxUsed}</td>`"
+"+`<td class=\"num\">${ctxMax===null?'—':ctxMax}</td>`"
+"+`<td class=\"num\">${ctxPct===null?'—':ctxPct.toFixed(1)+'%'}</td>`"
+"+`<td class=\"num\">${tempCell}</td>`"
+"+`<td>${thinkCell}</td>`"
+"+`<td>${ablCell}</td>`"
 "+`<td class=\"num\" title=\"${esc(ttTitle)}\">${rec.ttft===null?'—':f(rec.ttft)}</td>`"
 "+`<td class=\"num\" title=\"${esc(pfTitle)}\">${pfCell}</td>`"
+"+`<td class=\"num\">${pfCost}</td>`"
 "+`<td class=\"num\" title=\"${esc(dcTitle)}\">${rec.decode_tps===null?'—':rec.decode_tps.toFixed(1)+' t/s'}</td>`"
+"+`<td class=\"num\">${dcCost}</td>`"
 "+`<td class=\"num\">${wall===null?'—':f(wall)}</td>`"
 "+`<td>${rec.in_flight?'<span class=\"pill run\">进行中</span>':"
 "`<span class=\"pill ${cls(rec.finish)}\">${esc(rec.finish)}</span>`}</td>`"
 "+`</tr>`;}).join('');"
 "tb.querySelectorAll('tr[data-seq]').forEach(tr=>{"
-"tr.onclick=()=>{SEL=+tr.dataset.seq;"
-"tb.querySelectorAll('tr').forEach(x=>x.classList.remove('sel'));"
-"tr.classList.add('sel');show(SEL);};});"
+"tr.onclick=()=>{document.getElementById('wrap').classList.remove('hide-detail');"
+"const seq=+tr.dataset.seq;if(RECS.length&&seq!==RECS[0].seq)setFollow(false);"
+"selectRow(seq);};});"
+"if(FOLLOW&&RECS.length&&SEL!==RECS[0].seq){selectRow(RECS[0].seq);return;}"
 /* 详情面板也要跟着刷新。原先只有 onclick 调 show()，而 load() 每 3 秒重画列表，
  * 于是一条进行中的请求跑完了、列表显示「已完成」，右侧却永远停在
  * 「进行中 —— 已耗时 1.2 s」。只在该条仍在跑、或刚从「进行中」变成完成时补画一次，
  * 之后不再动它 —— 否则每 3 秒重置一次滚动位置，没法读。 */
 "if(SEL!==null){const s=RECS.find(r=>r.seq===SEL);"
 "if(!s)SEL=null;else if(s.in_flight||LASTINFLIGHT)show(SEL);}"
+"}"
+"function setFollow(on){"
+"FOLLOW=!!on;"
+"const fb=document.getElementById('follow');"
+"if(fb)fb.classList.toggle('on',FOLLOW);"
+"if(FOLLOW&&RECS.length&&SEL!==RECS[0].seq)selectRow(RECS[0].seq);"
+"}"
+"function selectRow(seq){"
+"SEL=seq;"
+"const tb=document.getElementById('rows');"
+"tb.querySelectorAll('tr[data-seq]').forEach(x=>{"
+"const on=+x.dataset.seq===SEL;"
+"x.classList.toggle('sel',on);"
+"if(on)x.scrollIntoView({block:'nearest'});"
+"});"
+"show(SEL);"
 "}"
 "function show(seq){"
 "const rec=RECS.find(r=>r.seq===seq);if(!rec){return;}"
@@ -578,18 +621,29 @@ const char *myds_trace_page_html(void) {
 " return h+'</div>';};"
 "const bar=(v,mx,color)=>'<div class=tbar style=margin-left:26px><i style=width:'+"
 " Math.max(1,Math.min(100,100*v/(mx||1)))+'%;background:'+color+'></i></div>';"
-"let html='<div style=display:flex;align-items:center><h2 style=margin:0>请求 #'+rec.seq+' · '+esc(rec.path)+'</h2>';"
-"html+='<button class=pmax id=maxR style=margin-left:auto>⛶ 右侧</button></div>';"
+"let html='<h2>请求 #'+rec.seq+' · '+esc(rec.path)+'</h2>';"
 "if(rec.in_flight){html+='<div class=warn style=margin:8px 0>进行中 —— 已耗时 '+"
 " (Date.now()-rec.epoch_ms)/1000<1?'<1':((Date.now()-rec.epoch_ms)/1000).toFixed(1)+"
 " ' s（含排队）。阶段耗时尚未产出，完成后自动刷新。</div>';}"
+"const ctxUsed=(rec.in_flight&&!rec.prompt_tokens&&!rec.out_tokens)?null:((rec.prompt_tokens||0)+(rec.out_tokens||0));"
+"const ctxMax=(rec.max_ctx&&rec.max_ctx>0)?rec.max_ctx:null;"
+"const ctxPct=(ctxUsed!==null&&ctxMax!==null)?(100*ctxUsed/ctxMax).toFixed(1)+'%':'—';"
+"const tempStr=rec.temperature===null||rec.temperature===undefined||rec.temperature<0?'—':rec.temperature.toFixed(2);"
+"const thinkStr=rec.thinking===null||rec.thinking===undefined?'—':(rec.thinking?'1':'0');"
+"const ablStr=rec.ablation===null||rec.ablation===undefined?'—':(rec.ablation?'1':'0');"
 "html+='<table class=kv style=margin-top:8px>'"
-"+'<tr><td>时间</td><td>'+ts(rec.epoch_ms)+'</td></tr>'"
+"+'<tr><td>time</td><td>'+ts(rec.epoch_ms)+'</td></tr>'"
 "+'<tr><td>客户端</td><td>'+esc(rec.client)+'</td></tr>'"
 "+'<tr><td>finish</td><td><span class=pill '+cls(rec.finish)+'>'+esc(rec.finish)+'</span></td></tr>'"
 "+'<tr><td>stream</td><td>'+(rec.stream?'true':'false')+'</td></tr>'"
+"+'<tr><td>温度</td><td>'+tempStr+'</td></tr>'"
+"+'<tr><td>思考模式</td><td>'+thinkStr+'</td></tr>'"
+"+'<tr><td>消融</td><td>'+ablStr+'</td></tr>'"
 "+'<tr><td>prompt / cached</td><td>'+rec.prompt_tokens+' / '+rec.cached_tokens+'</td></tr>'"
-"+'<tr><td>输出</td><td>'+rec.out_tokens+' tok</td></tr></table>';"
+"+'<tr><td>输出</td><td>'+rec.out_tokens+' tok</td></tr>'"
+"+'<tr><td>当前使用上下文</td><td>'+(ctxUsed===null?'—':ctxUsed+' tok')+'</td></tr>'"
+"+'<tr><td>总上下文</td><td>'+(ctxMax===null?'—':ctxMax+' tok')+'</td></tr>'"
+"+'<tr><td>上下文占比</td><td>'+ctxPct+'</td></tr></table>';"
 "const pf=nn(p.prefill),pd=nn(p.decode),un=nn(p.unattributed),en=nn(p.engine);"
 "const pg=nn(d.prefill_gpu),pw=nn(d.prefill_wait);"
 "const dg=nn(d.decode_gpu),dw=nn(d.decode_wait),em=nn(d.emit);"
@@ -650,8 +704,6 @@ const char *myds_trace_page_html(void) {
 " '所以这里不默认开，也不画一条平线冒充。</div>';}"
 "html+='</div>';"
 "document.getElementById('detail').innerHTML=html;"
-"const mr=document.getElementById('maxR');"
-"if(mr)mr.onclick=()=>document.getElementById('wrap').classList.toggle('max-right');"
 "if(rec.layers&&rec.layers.length)drawLayers(rec.layers);"
 "}"
 "function drawLayers(v){"
@@ -686,8 +738,28 @@ const char *myds_trace_page_html(void) {
 "h+=`<span class=\"m\">RSS <b>${s.self_rss_gb===null?'—':s.self_rss_gb.toFixed(0)+'G'}</b></span>`;"
 "document.getElementById('sysbox').innerHTML=h;"
 "}catch(e){}}"
-"const ml=document.getElementById('maxL');"
-"if(ml)ml.onclick=()=>document.getElementById('wrap').classList.toggle('max-left');"
+"document.getElementById('follow').onclick=()=>setFollow(!FOLLOW);"
+"document.addEventListener('keydown',e=>{"
+"if(e.ctrlKey||e.metaKey||e.altKey)return;"
+"const t=e.target;"
+"if(t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.tagName==='SELECT'||t.isContentEditable))return;"
+"const k=e.key.toLowerCase();"
+"if(k==='j'||k==='k'){"
+"if(!RECS.length)return;"
+"e.preventDefault();"
+"let idx=RECS.findIndex(r=>r.seq===SEL);"
+"if(idx<0)idx=0;"
+"else idx=k==='j'?Math.min(RECS.length-1,idx+1):Math.max(0,idx-1);"
+"if(RECS[idx].seq!==RECS[0].seq)setFollow(false);"
+"selectRow(RECS[idx].seq);"
+"}else if(k==='d'){"
+"e.preventDefault();"
+"document.getElementById('wrap').classList.toggle('hide-detail');"
+"}else if(k==='f'){"
+"e.preventDefault();"
+"setFollow(!FOLLOW);"
+"}"
+"});"
 "load();sysload();setInterval(load,3000);setInterval(sysload,3000);"
 "</script></body></html>";
 }

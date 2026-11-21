@@ -74,7 +74,11 @@ typedef struct {
     uint32_t prompt_tokens;
     uint32_t cached_tokens;
     uint32_t out_tokens;
+    uint32_t max_ctx;       /* 总上下文窗口（0 = 未知 / 未测量） */
     int      stream;
+    double   temperature;   /* 实际生效温度；负值 = 未测量 */
+    int      thinking;      /* 1 = 思考模式，0 = 非思考，-1 = 未测量 */
+    int      ablation;      /* 1 = 开启消融（steer），0 = 关闭，-1 = 未测量 */
 
     /* 吞吐与延迟。同样遵守「未测量 = 负值 = null」：
      * 取消的请求没有 decode 速度，早退的请求没有 TTFT，

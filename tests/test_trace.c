@@ -414,10 +414,9 @@ static void test_page_script_refs_exist(void) {
         if (n == 0 || n >= sizeof(id)) continue;
         memcpy(id, p, n);
         id[n] = '\0';
-        /* 有少数元素是脚本运行时才建出来的（画布 lc、右栏最大化按钮 maxR 都在
-         * 选中请求后随详情面板重建）。把它们列成白名单，比放宽断言好：
-         * 放宽了，真正的漏 id 也会被放过。 */
-        static const char *const runtime_created[] = { "lc", "maxR" };
+        /* 有少数元素是脚本运行时才建出来的（画布 lc 在选中请求后随详情面板重建）。
+         * 把它们列成白名单，比放宽断言好：放宽了，真正的漏 id 也会被放过。 */
+        static const char *const runtime_created[] = { "lc" };
         bool skip = false;
         for (size_t k = 0; k < sizeof(runtime_created)/sizeof(runtime_created[0]); ++k)
             if (!strcmp(id, runtime_created[k])) { skip = true; break; }
@@ -642,6 +641,82 @@ static void test_list_json_worst_case_fits(void) {
     }
 }
 
+static void test_page_columns_and_shortcuts(void) {
+    const char *html = myds_trace_page_html();
+    CHECK(html != NULL);
+    if (!html) return;
+
+    /* 表头与时间格式 */
+    CHECK(strstr(html, "<th>time</th>") != NULL);
+    CHECK(strstr(html, "<th class=\"num\">ttft</th>") != NULL);
+    CHECK(strstr(html, "<th class=\"num\">prefill cost</th>") != NULL);
+    CHECK(strstr(html, "<th class=\"num\">decode cost</th>") != NULL);
+    CHECK(strstr(html, "<th class=\"num\">total cost</th>") != NULL);
+    CHECK(strstr(html, "<th class=\"num\">ctx</th>") != NULL);
+    CHECK(strstr(html, "<th class=\"num\">max ctx</th>") != NULL);
+    CHECK(strstr(html, "<th class=\"num\">ctx %</th>") != NULL);
+    CHECK(strstr(html, "<th class=\"num\">temp</th>") != NULL);
+    CHECK(strstr(html, "<th>think</th>") != NULL);
+    CHECK(strstr(html, "<th>ablation</th>") != NULL);
+    CHECK(strstr(html, "colspan=\"19\"") != NULL);
+    CHECK(strstr(html, "const when=ts(rec.epoch_ms);") != NULL);
+    CHECK(strstr(html, "ts(rec.epoch_ms).slice(11)") == NULL);
+    CHECK(strstr(html, "<td>温度</td>") != NULL);
+    CHECK(strstr(html, "<td>思考模式</td>") != NULL);
+    CHECK(strstr(html, "<td>消融</td>") != NULL);
+    CHECK(strstr(html, "rec.thinking?'1':'0'") != NULL);
+    CHECK(strstr(html, "rec.ablation?'1':'0'") != NULL);
+    CHECK(strstr(html, "'是':'否'") == NULL);
+    CHECK(strstr(html, "<td>当前使用上下文</td>") != NULL);
+    CHECK(strstr(html, "<td>总上下文</td>") != NULL);
+    CHECK(strstr(html, "<td>上下文占比</td>") != NULL);
+
+    /* 去掉请求列表标题行与左右最大化按钮 */
+    CHECK(strstr(html, "请求列表") == NULL);
+    CHECK(strstr(html, "暂无记录") == NULL);
+    CHECK(strstr(html, "选择左侧任一请求") == NULL);
+    CHECK(strstr(html, "id=\"maxL\"") == NULL);
+    CHECK(strstr(html, "id=maxR") == NULL);
+
+    /* 跟随按钮与 j/k/d/f 快捷键 */
+    CHECK(strstr(html, "id=\"follow\"") != NULL);
+    CHECK(strstr(html, "FOLLOW=true") != NULL);
+    CHECK(strstr(html, "k==='j'||k==='k'") != NULL);
+    CHECK(strstr(html, "k==='d'") != NULL);
+    CHECK(strstr(html, "k==='f'") != NULL);
+    CHECK(strstr(html, "hide-detail") != NULL);
+    CHECK(strstr(html, "<div id=\"wrap\" class=\"hide-detail\">") != NULL);
+    CHECK(strstr(html, "#list th,#list td{text-align:right}") != NULL);
+
+    /* JSON 序列化：温度 / 思考模式 / 消融 / 总上下文（含未测量 → null） */
+    myds_trace_reset();
+    myds_trace_init(8);
+    myds_trace_rec_t r;
+    fill(&r, "/v1/chat/completions", 1.0);
+    r.temperature = 0.6;
+    r.thinking = 1;
+    r.ablation = 1;
+    r.max_ctx = 131072u;
+    myds_trace_record(&r);
+    char buf[4096];
+    CHECK(myds_trace_list_json(buf, sizeof(buf)));
+    CHECK(strstr(buf, "\"temperature\":0.600000") != NULL);
+    CHECK(strstr(buf, "\"thinking\":true") != NULL);
+    CHECK(strstr(buf, "\"ablation\":true") != NULL);
+    CHECK(strstr(buf, "\"max_ctx\":131072") != NULL);
+
+    myds_trace_reset();
+    myds_trace_init(8);
+    fill(&r, "/v1/chat/completions", 1.0);
+    myds_trace_rec_mark_unmeasured(&r);
+    myds_trace_record(&r);
+    CHECK(myds_trace_list_json(buf, sizeof(buf)));
+    CHECK(strstr(buf, "\"temperature\":null") != NULL);
+    CHECK(strstr(buf, "\"thinking\":null") != NULL);
+    CHECK(strstr(buf, "\"ablation\":null") != NULL);
+    CHECK(strstr(buf, "\"max_ctx\":null") != NULL);
+}
+
 int main(void) {
     test_empty();
     test_unmeasured_is_null_not_zero();
@@ -664,6 +739,7 @@ int main(void) {
     test_page_is_html();
     test_sysbox_metrics_single_row_flex();
     test_cached_prefill_incremental_display();
+    test_page_columns_and_shortcuts();
     myds_trace_reset();
 
     if (failures) {

@@ -153,6 +153,28 @@ int server_vjob_gpu_last_error(void) {
     return t_vjob_slot_error;
 }
 
+/* 构造上下文超限（MYDS_STOP_CTX_FULL）的 OpenAI 规范错误载荷，供流式与非流式共用。 */
+static int format_ctx_full_error(char *buf, size_t cap, uint32_t prompt_tokens,
+                                 uint32_t max_seq_len, bool sse, bool responses_api) {
+    if (!buf || cap == 0) return -1;
+    if (!sse) {
+        return snprintf(buf, cap,
+            "{\"error\":{\"message\":\"Prompt length (%u tokens) exceeds maximum sequence context (%u)\","
+            "\"type\":\"invalid_request_error\",\"code\":\"context_length_exceeded\"}}",
+            prompt_tokens, max_seq_len);
+    }
+    if (responses_api) {
+        return snprintf(buf, cap,
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"Prompt length (%u tokens) exceeds maximum sequence context (%u)\","
+            "\"type\":\"invalid_request_error\",\"code\":\"context_length_exceeded\"}}\n\n",
+            prompt_tokens, max_seq_len);
+    }
+    return snprintf(buf, cap,
+        "data: {\"error\":{\"message\":\"Prompt length (%u tokens) exceeds maximum sequence context (%u)\","
+        "\"type\":\"invalid_request_error\",\"code\":\"context_length_exceeded\"}}\n\ndata: [DONE]\n\n",
+        prompt_tokens, max_seq_len);
+}
+
 static void handle_signal(int sig) {
     (void)sig;
     g_running = 0;
@@ -1347,8 +1369,18 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
              * cancel_flag 单独成案：标 cancelled，不标 error。 */
             if (!generated || sctx.failed) {
                 resp_id_invalidate_all();
-                stop_reason = sctx.cancel_flag ? MYDS_STOP_CANCELLED : MYDS_STOP_ERROR;
-                if (stop_reason == MYDS_STOP_ERROR) {
+                if (sctx.cancel_flag) {
+                    stop_reason = MYDS_STOP_CANCELLED;
+                } else if (!sctx.failed && stop_reason == MYDS_STOP_CTX_FULL) {
+                    char err_buf[384];
+                    int elen = format_ctx_full_error(err_buf, sizeof(err_buf), prompt_tokens,
+                                                     ctx ? ctx->cfg.max_seq_len : 0u,
+                                                     true, is_responses_endpoint);
+                    if (sctx.writer && elen > 0 && (size_t)elen < sizeof(err_buf)) {
+                        (void)myds_server_sse_send(&sctx, err_buf, (size_t)elen);
+                    }
+                } else {
+                    stop_reason = MYDS_STOP_ERROR;
                     const char *error_event = is_responses_endpoint
                         ? "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"Inference or response encoding failed\",\"type\":\"server_error\"}}\n\n"
                         : "data: {\"error\":{\"message\":\"Inference or response encoding failed\",\"type\":\"server_error\"}}\n\ndata: [DONE]\n\n";
@@ -1560,13 +1592,21 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
             emit_measured_s = ns.emit_s;
             if (!generated || ns.failed) {
                 resp_id_invalidate_all();
-                /* ★ 与流式分支保持一致：客户端断连不是服务端错误。
-                 * 2026-10-25：此前这里无条件写 MYDS_STOP_ERROR，于是非流式请求
-                 * 因客户端超时断开时会被记成 finish_reason=error，并向已关闭的
-                 * socket 再发一次 500。cancel_flag 单独成案。 */
-                stop_reason = ns.cancel_flag ? MYDS_STOP_CANCELLED : MYDS_STOP_ERROR;
+                /* ★ 与流式分支保持一致：客户端断连不是服务端错误，上下文超限返回 400。 */
                 transport_ok = false;
-                if (stop_reason == MYDS_STOP_ERROR) {
+                if (ns.cancel_flag) {
+                    stop_reason = MYDS_STOP_CANCELLED;
+                } else if (!ns.failed && stop_reason == MYDS_STOP_CTX_FULL) {
+                    char err_buf[384];
+                    int elen = format_ctx_full_error(err_buf, sizeof(err_buf), prompt_tokens,
+                                                     ctx ? ctx->cfg.max_seq_len : 0u,
+                                                     false, is_responses_endpoint);
+                    send_response(client_fd, 400, "Bad Request", "application/json",
+                                  (elen > 0 && (size_t)elen < sizeof(err_buf))
+                                  ? err_buf
+                                  : "{\"error\":{\"message\":\"Prompt exceeds maximum sequence context\",\"type\":\"invalid_request_error\",\"code\":\"context_length_exceeded\"}}");
+                } else {
+                    stop_reason = MYDS_STOP_ERROR;
                     send_response(client_fd, 500, "Internal Server Error", "application/json",
                                   "{\"error\":{\"message\":\"Inference or response allocation failed\",\"type\":\"server_error\"}}");
                 }
@@ -2016,6 +2056,10 @@ static void handle_client(int client_fd, myds_context_t *ctx, const char *model_
                 ? (double)pf.prefill_tokens / pf.prefill_seconds : -1.0;
             /* 与日志用同一个判定：有 decode 窗口就给数（含 out=1 的 EOS 步）。 */
             trec.decode_tps = (decode_s > 0.0 && decode_steps > 0.0) ? decode_tps : -1.0;
+            trec.temperature = (double)req_cfg.temperature;
+            trec.thinking = req_thinking_now ? 1 : 0;
+            trec.ablation = (ctx && ctx->steer && ctx->steer->enabled && ctx->steer->alpha_effective > 0.0f) ? 1 : 0;
+            trec.max_ctx = ctx ? ctx->cfg.max_seq_len : 0u;
             /* layer_count 保持 0：引擎不默认给逐层计时，见 myds_trace.h 的说明。 */
             myds_trace_complete(trace_seq, &trec);
 
